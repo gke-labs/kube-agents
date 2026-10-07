@@ -277,7 +277,7 @@ class TestUntargetedComputeClassWorkload(unittest.TestCase):
         hit = collect.check_untargeted_compute_class_workload(wl, ctx)
         self.assertIsNotNone(hit)
         self.assertEqual(hit["single_compute_class"], "")
-        self.assertTrue(hit["multiple_compute_classes"])
+        self.assertIn("multiple/unmatched untainted ComputeClasses", hit["excerpt"])
 
     def test_controller_cordon_taint_on_non_cc_node_does_not_cause_false_major(self):
         cordoned_non_cc_pool = pool(
@@ -308,7 +308,7 @@ class TestUntargetedComputeClassWorkload(unittest.TestCase):
         hit = collect.check_untargeted_compute_class_workload(wl, ctx)
         self.assertIsNotNone(hit)
         self.assertEqual(hit["single_compute_class"], "standard-cc")
-        self.assertFalse(hit["multiple_compute_classes"])
+        self.assertIn("target class: standard-cc", hit["excerpt"])
 
     def test_builtin_autopilot_classes_excluded(self):
         ap_cc = compute_class("autopilot")
@@ -323,7 +323,7 @@ class TestUntargetedComputeClassWorkload(unittest.TestCase):
         hit = collect.check_untargeted_compute_class_workload(wl, ctx)
         self.assertIsNotNone(hit)
         self.assertEqual(hit["single_compute_class"], "standard-cc")
-        self.assertFalse(hit["multiple_compute_classes"])
+        self.assertIn("target class: standard-cc", hit["excerpt"])
 
     def test_affinity_not_in_or_preferred_does_not_silence_check(self):
         negative_affinity = {
@@ -432,7 +432,7 @@ class TestUntargetedComputeClassWorkload(unittest.TestCase):
         hit = collect.check_untargeted_compute_class_workload(wl, ctx)
         self.assertIsNotNone(hit)
         self.assertEqual(hit["single_compute_class"], "standard-cc")
-        self.assertFalse(hit["multiple_compute_classes"])
+        self.assertIn("target class: standard-cc", hit["excerpt"])
 
     def test_compute_class_referencing_tainted_manual_nodepool_is_excluded(self):
         manual_pool_cc = compute_class("manual-pool-cc", priorities=[{"nodepools": ["pool-a"]}])
@@ -451,7 +451,7 @@ class TestUntargetedComputeClassWorkload(unittest.TestCase):
         hit = collect.check_untargeted_compute_class_workload(wl, ctx)
         self.assertIsNotNone(hit)
         self.assertEqual(hit["single_compute_class"], "standard-cc")
-        self.assertFalse(hit["multiple_compute_classes"])
+        self.assertIn("target class: standard-cc", hit["excerpt"])
 
     def test_compute_class_with_all_labeled_nodes_carrying_workload_taint_is_excluded(self):
         custom_cc = compute_class("custom-tainted")
@@ -470,7 +470,7 @@ class TestUntargetedComputeClassWorkload(unittest.TestCase):
         hit = collect.check_untargeted_compute_class_workload(wl, ctx)
         self.assertIsNotNone(hit)
         self.assertEqual(hit["single_compute_class"], "standard-cc")
-        self.assertFalse(hit["multiple_compute_classes"])
+        self.assertIn("target class: standard-cc", hit["excerpt"])
 
     def test_tolerations_keyless_exists_with_effect_distinction(self):
         dedicated_non_cc = pool(
@@ -555,7 +555,7 @@ class TestUntargetedComputeClassWorkload(unittest.TestCase):
         hit_constrained = collect.check_untargeted_compute_class_workload(wl_constrained, ctx)
         self.assertIsNotNone(hit_constrained)
         self.assertEqual(hit_constrained["single_compute_class"], "")
-        self.assertTrue(hit_constrained["multiple_compute_classes"])
+        self.assertIn("manual remediation: workload has scheduling constraints", hit_constrained["excerpt"])
 
         # Unconstrained workload (no selector, no tolerations) resolves to single class:
         wl_unpinned = collect.normalize_workloads({
@@ -564,7 +564,7 @@ class TestUntargetedComputeClassWorkload(unittest.TestCase):
         hit_unpinned = collect.check_untargeted_compute_class_workload(wl_unpinned, ctx)
         self.assertIsNotNone(hit_unpinned)
         self.assertEqual(hit_unpinned["single_compute_class"], "base")
-        self.assertFalse(hit_unpinned["multiple_compute_classes"])
+        self.assertIn("target class: base", hit_unpinned["excerpt"])
 
     def test_stopped_or_zero_sized_non_cc_pool_does_not_clear_cluster_capacity(self):
         cc_pool = pool("cc-pool", labels={"cloud.google.com/compute-class": "base"})
@@ -589,6 +589,7 @@ class TestUntargetedComputeClassWorkload(unittest.TestCase):
         hit = collect.check_untargeted_compute_class_workload(wl, ctx)
         self.assertIsNotNone(hit)
         self.assertEqual(hit["single_compute_class"], "base")
+        self.assertIn("target class: base", hit["excerpt"])
 
     def test_multiple_untainted_general_purpose_compute_classes_clears_single_compute_class(self):
         base_pool = pool("base-pool", labels={"cloud.google.com/compute-class": "base"})
@@ -604,7 +605,7 @@ class TestUntargetedComputeClassWorkload(unittest.TestCase):
         hit = collect.check_untargeted_compute_class_workload(wl, ctx)
         self.assertIsNotNone(hit)
         self.assertEqual(hit["single_compute_class"], "")
-        self.assertTrue(hit["multiple_compute_classes"])
+        self.assertIn("multiple/unmatched untainted ComputeClasses", hit["excerpt"])
 
     def test_workload_selecting_gke_nodepool_with_empty_config_labels_matches(self):
         base_pool = pool("base-pool", labels={"cloud.google.com/compute-class": "base"})
@@ -872,6 +873,52 @@ class TestUntargetedComputeClassWorkload(unittest.TestCase):
                 self.assertIn("untargeted-compute-class-workload", cc_context.context.get("unevaluated", {}))
                 self.assertNotIn("untargeted-compute-class-workload", cc_context.commands)
 
+    def test_collect_obtainability_node_pools_non_list_output_sets_unevaluated(self):
+        spec = collect.CheckSpec(
+            "untargeted-compute-class-workload",
+            "workload",
+            collect.check_untargeted_compute_class_workload,
+            "major",
+            None,
+            "impact description",
+        )
+        fake_dump = {"items": [deployment("api"), self.ns]}
+        tmp_dump = self._create_dump_file(fake_dump)
+        cc_stdout = json.dumps({"items": [self.cc]})
+        with patch.object(collect, "dump_state") as mock_dump:
+            mock_dump.return_value = (tmp_dump, MagicMock(rc=0, duration_s=0.1, stdout="{}"), True)
+
+            with patch.object(collect, "run_and_gate") as mock_run_and_gate:
+                # 1. Output is a dict instead of a list (rc=0)
+                mock_run_and_gate.side_effect = [
+                    ({"items": [self.cc]}, MagicMock(rc=0, duration_s=0.05, stdout=cc_stdout)),
+                    ({"error": "malformed payload"}, MagicMock(rc=0, stderr="")),
+                ]
+                cc_context = collect._collect_obtainability(
+                    {"name": "c1", "project": "p1", "location": "l1"},
+                    Path("/fake/kubeconfig"),
+                    (spec,),
+                    run=MagicMock(),
+                )
+                self.assertIn("untargeted-compute-class-workload", cc_context.context.get("unevaluated", {}))
+                self.assertIn("not a JSON list of node pools", cc_context.context["unevaluated"]["untargeted-compute-class-workload"])
+                self.assertNotIn("untargeted-compute-class-workload", cc_context.commands)
+
+                # 2. Output is a list containing non-dict items
+                mock_run_and_gate.side_effect = [
+                    ({"items": [self.cc]}, MagicMock(rc=0, duration_s=0.05, stdout=cc_stdout)),
+                    (["string-item-not-dict"], MagicMock(rc=0, stderr="")),
+                ]
+                cc_context2 = collect._collect_obtainability(
+                    {"name": "c1", "project": "p1", "location": "l1"},
+                    Path("/fake/kubeconfig"),
+                    (spec,),
+                    run=MagicMock(),
+                )
+                self.assertIn("untargeted-compute-class-workload", cc_context2.context.get("unevaluated", {}))
+                self.assertIn("not a JSON list of node pools", cc_context2.context["unevaluated"]["untargeted-compute-class-workload"])
+                self.assertNotIn("untargeted-compute-class-workload", cc_context2.commands)
+
     def test_non_cc_pool_in_running_with_error_clears_cluster_capacity(self):
         # A pool in RUNNING_WITH_ERROR provides active capacity, clearing untargeted workloads
         cc_pool = pool("cc-pool", labels={"cloud.google.com/compute-class": "standard-cc"})
@@ -941,7 +988,7 @@ class TestUntargetedComputeClassWorkload(unittest.TestCase):
         hit_sel = collect.check_untargeted_compute_class_workload(wl_sel, ctx)
         self.assertIsNotNone(hit_sel)
         self.assertEqual(hit_sel["single_compute_class"], "")
-        self.assertTrue(hit_sel["multiple_compute_classes"])
+        self.assertIn("manual remediation: workload has scheduling constraints", hit_sel["excerpt"])
 
         # 2. tolerations constraint
         wl_tol = collect.normalize_workloads({
@@ -950,7 +997,7 @@ class TestUntargetedComputeClassWorkload(unittest.TestCase):
         hit_tol = collect.check_untargeted_compute_class_workload(wl_tol, ctx)
         self.assertIsNotNone(hit_tol)
         self.assertEqual(hit_tol["single_compute_class"], "")
-        self.assertTrue(hit_tol["multiple_compute_classes"])
+        self.assertIn("manual remediation: workload has scheduling constraints", hit_tol["excerpt"])
 
         # 3. runtimeClassName constraint
         wl_rc = collect.normalize_workloads({
@@ -959,7 +1006,7 @@ class TestUntargetedComputeClassWorkload(unittest.TestCase):
         hit_rc = collect.check_untargeted_compute_class_workload(wl_rc, ctx)
         self.assertIsNotNone(hit_rc)
         self.assertEqual(hit_rc["single_compute_class"], "")
-        self.assertTrue(hit_rc["multiple_compute_classes"])
+        self.assertIn("manual remediation: workload has scheduling constraints", hit_rc["excerpt"])
 
         # 4. nodeAffinity constraint
         wl_aff = collect.normalize_workloads({
@@ -972,7 +1019,7 @@ class TestUntargetedComputeClassWorkload(unittest.TestCase):
         hit_aff = collect.check_untargeted_compute_class_workload(wl_aff, ctx)
         self.assertIsNotNone(hit_aff)
         self.assertEqual(hit_aff["single_compute_class"], "")
-        self.assertTrue(hit_aff["multiple_compute_classes"])
+        self.assertIn("manual remediation: workload has scheduling constraints", hit_aff["excerpt"])
 
         # 5. accelerator constraints (positive quantity)
         wl_gpu = collect.normalize_workloads({
@@ -981,7 +1028,7 @@ class TestUntargetedComputeClassWorkload(unittest.TestCase):
         hit_gpu = collect.check_untargeted_compute_class_workload(wl_gpu, ctx)
         self.assertIsNotNone(hit_gpu)
         self.assertEqual(hit_gpu["single_compute_class"], "")
-        self.assertTrue(hit_gpu["multiple_compute_classes"])
+        self.assertIn("manual remediation: workload has scheduling constraints", hit_gpu["excerpt"])
 
         wl_tpu = collect.normalize_workloads({
             "items": [deployment("api-tpu", resources={"requests": {"google.com/tpu": "2"}})]
@@ -989,7 +1036,7 @@ class TestUntargetedComputeClassWorkload(unittest.TestCase):
         hit_tpu = collect.check_untargeted_compute_class_workload(wl_tpu, ctx)
         self.assertIsNotNone(hit_tpu)
         self.assertEqual(hit_tpu["single_compute_class"], "")
-        self.assertTrue(hit_tpu["multiple_compute_classes"])
+        self.assertIn("manual remediation: workload has scheduling constraints", hit_tpu["excerpt"])
 
     def test_namespace_with_empty_default_compute_class_label_does_not_clear_workload(self):
         # Empty string label value `cloud.google.com/default-compute-class: ""` names no class

@@ -3745,9 +3745,6 @@ def _has_compute_class_affinity(node_affinity: dict) -> bool:
         for expr in term.get("matchExpressions") or []:
             if expr.get("key") == COMPUTE_CLASS_LABEL and expr.get("operator") in ("In", "Exists"):
                 return True
-        for expr in term.get("matchFields") or []:
-            if expr.get("key") == COMPUTE_CLASS_LABEL and expr.get("operator") in ("In", "Exists"):
-                return True
     return False
 
 
@@ -3974,7 +3971,8 @@ def check_untargeted_compute_class_workload(workload: dict, context: dict) -> di
     untainted_gp_ccs = [cc for cc in compute_classes if _is_untainted_gp_compute_class(cc, node_pools=node_pools)]
     untainted_gp_names = [cc.get("metadata", {}).get("name") for cc in untainted_gp_ccs if cc.get("metadata", {}).get("name")]
 
-    if not _workload_has_scheduling_constraints(template) and len(untainted_gp_names) == 1:
+    has_constraints = _workload_has_scheduling_constraints(template)
+    if not has_constraints and len(untainted_gp_names) == 1:
         candidate_cc = untainted_gp_names[0]
         cc_pool_labels = {
             ((p.get("config") or {}).get("labels") or {}).get(COMPUTE_CLASS_LABEL)
@@ -3987,14 +3985,20 @@ def check_untargeted_compute_class_workload(workload: dict, context: dict) -> di
     else:
         single_cc = ""
 
+    if single_cc:
+        reason_str = f" (target class: {single_cc})"
+    elif has_constraints:
+        reason_str = " (manual remediation: workload has scheduling constraints)"
+    else:
+        reason_str = " (multiple/unmatched untainted ComputeClasses)"
+
     return {
         "object": f"{workload['kind']}/{workload['name']}",
         "excerpt": (
             f"workload omits {COMPUTE_CLASS_LABEL} on ComputeClass-backed cluster"
-            + (f" (target class: {single_cc})" if single_cc else " (multiple/unmatched untainted ComputeClasses)")
+            + reason_str
         ),
         "single_compute_class": single_cc,
-        "multiple_compute_classes": not bool(single_cc),
     }
 
 
@@ -5508,14 +5512,6 @@ def check_public_control_plane(context: dict) -> list[dict]:
             "impact": impact,
         }
     ]
-
-
-def _namespace_labels(context: dict, ns: str) -> dict:
-    for item in context.get("namespaces") or []:
-        meta = item.get("metadata") or {}
-        if meta.get("name") == ns:
-            return meta.get("labels") or {}
-    return {}
 
 
 def check_podsecurity_gaps(workload: dict, context: dict) -> dict | None:
@@ -7566,16 +7562,21 @@ def _collect_obtainability(cluster: dict, kubeconfig: Path, checks: tuple[CheckS
                 "--format", "json",
             ]
             np_parsed, np_result = run_and_gate(np_argv, kubeconfig, run=run)
-            if np_parsed is None:
+            pools_listed = isinstance(np_parsed, list) and all(isinstance(p, dict) for p in np_parsed)
+            if not pools_listed:
                 commands.pop("untargeted-compute-class-workload", None)
                 stderr = np_result.stderr.strip()[:ERROR_EXCERPT_CHARS] or "no stderr"
+                what = (
+                    f"exited {np_result.rc}" if np_parsed is None
+                    else "returned output that is not a JSON list of node pools (rc=0)"
+                )
                 context.setdefault("unevaluated", {})["untargeted-compute-class-workload"] = (
-                    f"{UNDETERMINED_PREFIX} `gcloud container node-pools list` exited {np_result.rc} "
+                    f"{UNDETERMINED_PREFIX} `gcloud container node-pools list` {what} "
                     f"({stderr}), so node pool inventory could not be verified. "
                     "This check cleared nothing on this cluster."
                 )
             else:
-                context["node_pools"] = np_parsed if isinstance(np_parsed, list) else []
+                context["node_pools"] = np_parsed
         else:
             context["node_pools"] = []
     elif RESOURCE_TYPE_ABSENT_MARKER in cc_result.stderr:
