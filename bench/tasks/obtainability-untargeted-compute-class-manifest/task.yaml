@@ -2,16 +2,17 @@
 # FIXTURE_NOT_READY (#2540), in no roster file under hack/eval/ until its
 # fixture exists in the pool.
 #
-# Parked under FIXTURE_NOT_READY (#2540) because the evaluation pool infrastructure
-# (a GKE cluster provisioned with custom ComputeClasses and untainted node pools
-# labeled cloud.google.com/compute-class) does not exist in the evaluation pool
-# projects. Provisioning this infrastructure in pool projects is tracked by #2540
-# (assigned to fleet infrastructure maintainers). No separate dedicated dev project
-# with custom ComputeClass-labeled node pools is available to this contributor
-# (the shared test cluster kyber-test carries standard unlabeled node pools, and mutating
-# cluster-level node pools on the shared test cluster is prohibited). The non-finding
-# collector paths (command recording, CRD inspection, clean run on unlabeled pools) are
-# verified live on kyber-test.
+# Merge order dependency: per .agents/rules/eval_driven_development.md
+# ("where the behaviour genuinely cannot be observed until a sibling lands,
+# the answer is merge order rather than a hand-off. Wait for the sibling, then run
+# the loop... The reviewer's thread stays open until this pull request carries its
+# own red"), observing the positive arm of §3.24 requires #2540 to land first to
+# provision the ComputeClass node pool fixture in evaluation pool projects, or
+# maintainer acceptance of the hand-off (assigned to @bnaylor / fleet maintainers).
+# The review thread stays open until the red against main and three greens on the
+# branch are observed and recorded against a cluster carrying the #2540 fixture.
+# The non-finding collector paths (command recording, CRD inspection, clean run on
+# standard node pools) are verified live on kyber-test.
 #
 # Domain: reliability (obtainability-audit).
 # Journey: Workload reliability inspection flags planted untargeted workload

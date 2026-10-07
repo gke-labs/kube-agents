@@ -37,7 +37,7 @@ def node(name, labels=None, taints=None):
     }
 
 
-def pool(name, labels=None, taints=None, autoscaling=None, status="RUNNING", machine_type=None, image_type=None, initial_node_count=1, locations=None):
+def pool(name, labels=None, taints=None, autoscaling=None, status="RUNNING", machine_type=None, image_type=None, initial_node_count=1, locations=None, spot=None, preemptible=None, placement_policy=None):
     config = {}
     if labels is not None:
         config["labels"] = labels
@@ -47,11 +47,17 @@ def pool(name, labels=None, taints=None, autoscaling=None, status="RUNNING", mac
         config["machineType"] = machine_type
     if image_type is not None:
         config["imageType"] = image_type
+    if spot is not None:
+        config["spot"] = spot
+    if preemptible is not None:
+        config["preemptible"] = preemptible
     res = {"name": name, "status": status, "config": config, "initialNodeCount": initial_node_count}
     if autoscaling is not None:
         res["autoscaling"] = autoscaling
     if locations is not None:
         res["locations"] = locations
+    if placement_policy is not None:
+        res["placementPolicy"] = placement_policy
     return res
 
 
@@ -1074,17 +1080,23 @@ class TestUntargetedComputeClassWorkload(unittest.TestCase):
 
     def test_workload_with_node_affinity_match_fields_treated_as_unknown(self):
         base_pool = pool("base-pool", labels={"cloud.google.com/compute-class": "base"})
+        other_pool = pool("other-pool", labels={"cloud.google.com/compute-class": "other-cc"})
         cc_base = compute_class("base")
+        cc_other = compute_class("other-cc")
         ctx = {
-            "compute_classes": [cc_base],
-            "node_pools": [base_pool],
+            "compute_classes": [cc_base, cc_other],
+            "node_pools": [base_pool, other_pool],
             "namespaces": [self.ns],
-            "nodes": [node("node-base", labels={"cloud.google.com/gke-nodepool": "base-pool"})],
+            "nodes": [
+                node("node-base", labels={"cloud.google.com/gke-nodepool": "base-pool"}),
+                node("node-other", labels={"cloud.google.com/gke-nodepool": "other-pool"}),
+            ],
         }
         affinity = {
             "requiredDuringSchedulingIgnoredDuringExecution": {
                 "nodeSelectorTerms": [
-                    {"matchFields": [{"key": "metadata.name", "operator": "In", "values": ["node-1"]}]}
+                    {"matchFields": [{"key": "metadata.name", "operator": "In", "values": ["node-1"]}]},
+                    {"matchExpressions": [{"key": "cloud.google.com/gke-nodepool", "operator": "In", "values": ["base-pool"]}]},
                 ]
             }
         }
@@ -1239,7 +1251,7 @@ class TestUntargetedComputeClassWorkload(unittest.TestCase):
             "compute_classes": [cc_base],
             "node_pools": [base_pool],
             "namespaces": [self.ns],
-            "nodes": [self.base_node],
+            "nodes": [node("node-base", labels={"cloud.google.com/gke-nodepool": "base-pool"})],
         }
         affinity = {
             "requiredDuringSchedulingIgnoredDuringExecution": {
@@ -1254,17 +1266,23 @@ class TestUntargetedComputeClassWorkload(unittest.TestCase):
 
     def test_node_affinity_gt_lt_operator_treated_as_unknown(self):
         base_pool = pool("base-pool", labels={"cloud.google.com/compute-class": "base"})
+        other_pool = pool("other-pool", labels={"cloud.google.com/compute-class": "other-cc"})
         cc_base = compute_class("base")
+        cc_other = compute_class("other-cc")
         ctx = {
-            "compute_classes": [cc_base],
-            "node_pools": [base_pool],
+            "compute_classes": [cc_base, cc_other],
+            "node_pools": [base_pool, other_pool],
             "namespaces": [self.ns],
-            "nodes": [self.base_node],
+            "nodes": [
+                node("node-base", labels={"cloud.google.com/gke-nodepool": "base-pool"}),
+                node("node-other", labels={"cloud.google.com/gke-nodepool": "other-pool"}),
+            ],
         }
         affinity = {
             "requiredDuringSchedulingIgnoredDuringExecution": {
                 "nodeSelectorTerms": [
-                    {"matchExpressions": [{"key": "custom.io/score", "operator": "Gt", "values": ["5"]}]}
+                    {"matchExpressions": [{"key": "custom.io/score", "operator": "Gt", "values": ["5"]}]},
+                    {"matchExpressions": [{"key": "cloud.google.com/gke-nodepool", "operator": "In", "values": ["base-pool"]}]},
                 ]
             }
         }
@@ -1303,23 +1321,29 @@ class TestUntargetedComputeClassWorkload(unittest.TestCase):
         self.assertEqual(hit["single_compute_class"], "base")
 
     def test_node_affinity_does_not_exist_on_zone_key_fails_pool_with_locations(self):
-        # Required nodeAffinity DoesNotExist on topology.kubernetes.io/zone fails pool with locations
+        # Required nodeAffinity DoesNotExist on topology.kubernetes.io/zone fails pool with locations (evaluates to False, not None)
         base_pool = pool(
             "base-pool",
             labels={"cloud.google.com/compute-class": "base"},
             locations=["us-central1-a"],
         )
+        other_pool = pool("other-pool", labels={"cloud.google.com/compute-class": "other-cc"})
         cc_base = compute_class("base")
+        cc_other = compute_class("other-cc")
         ctx = {
-            "compute_classes": [cc_base],
-            "node_pools": [base_pool],
+            "compute_classes": [cc_base, cc_other],
+            "node_pools": [base_pool, other_pool],
             "namespaces": [self.ns],
-            "nodes": [node("node-base", labels={"cloud.google.com/gke-nodepool": "base-pool"})],
+            "nodes": [
+                node("node-base", labels={"cloud.google.com/gke-nodepool": "base-pool"}),
+                node("node-other", labels={"cloud.google.com/gke-nodepool": "other-pool"}),
+            ],
         }
         affinity = {
             "requiredDuringSchedulingIgnoredDuringExecution": {
                 "nodeSelectorTerms": [
-                    {"matchExpressions": [{"key": "topology.kubernetes.io/zone", "operator": "DoesNotExist"}]}
+                    {"matchExpressions": [{"key": "topology.kubernetes.io/zone", "operator": "DoesNotExist"}]},
+                    {"matchExpressions": [{"key": "cloud.google.com/gke-nodepool", "operator": "In", "values": ["other-pool"]}]},
                 ]
             }
         }
@@ -1327,7 +1351,8 @@ class TestUntargetedComputeClassWorkload(unittest.TestCase):
             "items": [deployment("no-zone-app", node_affinity=affinity)]
         })[0]
         hit = collect.check_untargeted_compute_class_workload(wl, ctx)
-        self.assertIsNone(hit)
+        self.assertIsNotNone(hit)
+        self.assertEqual(hit["single_compute_class"], "other-cc")
 
     def test_tpu_workload_matches_tpu_pool_preventing_false_clean(self):
         # Workload requesting google.com/tpu matches TPU pool (identified by TPU machine type,
@@ -1338,6 +1363,7 @@ class TestUntargetedComputeClassWorkload(unittest.TestCase):
             labels={"cloud.google.com/compute-class": "tpu-cc"},
             machine_type="ct5lp-hightpu-4t",
             taints=[{"key": "google.com/tpu", "value": "present", "effect": "NO_SCHEDULE"}],
+            placement_policy={"tpuTopology": "2x2"},
         )
         cc_base = compute_class("base")
         cc_tpu = compute_class("tpu-cc", priorities=[{"tpu": {"count": 4, "type": "v5litepod"}}])
@@ -1356,6 +1382,10 @@ class TestUntargetedComputeClassWorkload(unittest.TestCase):
                     "replicas": 1,
                     "template": {
                         "spec": {
+                            "nodeSelector": {
+                                "cloud.google.com/gke-tpu-accelerator": "tpu-v5-lite-podslice",
+                                "cloud.google.com/gke-tpu-topology": "2x2",
+                            },
                             "containers": [{
                                 "name": "trainer",
                                 "resources": {"limits": {"google.com/tpu": "4"}},
@@ -1502,7 +1532,8 @@ class TestUntargetedComputeClassWorkload(unittest.TestCase):
         affinity_not_in = {
             "requiredDuringSchedulingIgnoredDuringExecution": {
                 "nodeSelectorTerms": [
-                    {"matchExpressions": [{"key": "cloud.google.com/gke-provisioning", "operator": "NotIn", "values": ["spot"]}]}
+                    {"matchExpressions": [{"key": "custom.io/unresolvable-key", "operator": "NotIn", "values": ["spot"]}]},
+                    {"matchExpressions": [{"key": "cloud.google.com/gke-nodepool", "operator": "In", "values": ["base-pool"]}]},
                 ]
             }
         }
@@ -1515,7 +1546,8 @@ class TestUntargetedComputeClassWorkload(unittest.TestCase):
         affinity_dne = {
             "requiredDuringSchedulingIgnoredDuringExecution": {
                 "nodeSelectorTerms": [
-                    {"matchExpressions": [{"key": "cloud.google.com/gke-provisioning", "operator": "DoesNotExist"}]}
+                    {"matchExpressions": [{"key": "custom.io/unresolvable-key", "operator": "DoesNotExist"}]},
+                    {"matchExpressions": [{"key": "cloud.google.com/gke-nodepool", "operator": "In", "values": ["base-pool"]}]},
                 ]
             }
         }
@@ -1524,6 +1556,152 @@ class TestUntargetedComputeClassWorkload(unittest.TestCase):
         })[0]
         hit_dne = collect.check_untargeted_compute_class_workload(wl_dne, ctx)
         self.assertIsNone(hit_dne)
+
+    def test_workload_with_zero_gpu_or_tpu_limit_treated_as_cpu_workload(self):
+        # A zero-quantity nvidia.com/gpu or google.com/tpu limit is not an accelerator request.
+        base_pool = pool("base-pool", labels={"cloud.google.com/compute-class": "base"}, machine_type="e2-standard-4")
+        gpu_pool = pool(
+            "gpu-pool",
+            labels={"cloud.google.com/compute-class": "gpu-cc"},
+            machine_type="n1-standard-4",
+            taints=[{"key": "nvidia.com/gpu", "value": "present", "effect": "NO_SCHEDULE"}],
+        )
+        gpu_pool["config"]["accelerators"] = [{"acceleratorType": "nvidia-tesla-t4", "acceleratorCount": 1}]
+        cc_base = compute_class("base")
+        cc_gpu = compute_class("gpu-cc", priorities=[{"dimension": ["nvidia.com/gpu"]}])
+        ctx = {
+            "compute_classes": [cc_base, cc_gpu],
+            "node_pools": [base_pool, gpu_pool],
+            "namespaces": [self.ns],
+            "nodes": [
+                node("node-base", labels={"cloud.google.com/gke-nodepool": "base-pool"}),
+                node("node-gpu", labels={"cloud.google.com/gke-nodepool": "gpu-pool"}),
+            ],
+        }
+        wl_gpu_zero = collect.normalize_workloads({
+            "items": [{
+                "apiVersion": "apps/v1",
+                "kind": "Deployment",
+                "metadata": {"name": "zero-gpu-app", "namespace": "default"},
+                "spec": {
+                    "replicas": 1,
+                    "template": {
+                        "spec": {
+                            "containers": [{
+                                "name": "app",
+                                "resources": {"limits": {"nvidia.com/gpu": 0}},
+                            }],
+                        }
+                    }
+                }
+            }]
+        })[0]
+        hit_gpu_zero = collect.check_untargeted_compute_class_workload(wl_gpu_zero, ctx)
+        self.assertIsNotNone(hit_gpu_zero)
+        self.assertEqual(hit_gpu_zero["single_compute_class"], "base")
+
+        wl_tpu_zero = collect.normalize_workloads({
+            "items": [{
+                "apiVersion": "apps/v1",
+                "kind": "Deployment",
+                "metadata": {"name": "zero-tpu-app", "namespace": "default"},
+                "spec": {
+                    "replicas": 1,
+                    "template": {
+                        "spec": {
+                            "containers": [{
+                                "name": "app",
+                                "resources": {"limits": {"google.com/tpu": "0"}},
+                            }],
+                        }
+                    }
+                }
+            }]
+        })[0]
+        hit_tpu_zero = collect.check_untargeted_compute_class_workload(wl_tpu_zero, ctx)
+        self.assertIsNotNone(hit_tpu_zero)
+        self.assertEqual(hit_tpu_zero["single_compute_class"], "base")
+
+    def test_mixed_architecture_cluster_resolves_class_conditionally(self):
+        # On a mixed-architecture cluster with both x86 and Arm ComputeClasses,
+        # workload constraints resolve single_compute_class rather than clearing to "".
+        base_pool = pool("base-pool", labels={"cloud.google.com/compute-class": "base"}, machine_type="e2-standard-4")
+        axion_pool = pool(
+            "axion-pool",
+            labels={"cloud.google.com/compute-class": "axion-cc"},
+            machine_type="c4a-standard-4",
+            taints=[{"key": "kubernetes.io/arch", "value": "arm64", "effect": "NO_SCHEDULE"}],
+        )
+        cc_base = compute_class("base")
+        cc_axion = compute_class("axion-cc")
+        ctx = {
+            "compute_classes": [cc_base, cc_axion],
+            "node_pools": [base_pool, axion_pool],
+            "namespaces": [self.ns],
+            "nodes": [
+                node("node-base", labels={"cloud.google.com/gke-nodepool": "base-pool"}),
+                node("node-axion", labels={"cloud.google.com/gke-nodepool": "axion-pool"}),
+            ],
+        }
+        # Arm workload selects arm64 -> matches axion-pool only
+        wl_arm = collect.normalize_workloads({
+            "items": [{
+                "apiVersion": "apps/v1",
+                "kind": "Deployment",
+                "metadata": {"name": "arm-app", "namespace": "default"},
+                "spec": {
+                    "replicas": 1,
+                    "template": {
+                        "spec": {
+                            "nodeSelector": {"kubernetes.io/arch": "arm64"},
+                            "containers": [{"name": "app"}],
+                        }
+                    }
+                }
+            }]
+        })[0]
+        hit_arm = collect.check_untargeted_compute_class_workload(wl_arm, ctx)
+        self.assertIsNotNone(hit_arm)
+        self.assertEqual(hit_arm["single_compute_class"], "axion-cc")
+        self.assertFalse(hit_arm["multiple_compute_classes"])
+
+        # x86 workload has no selector -> matches base-pool only (fails axion-pool taint)
+        wl_x86 = collect.normalize_workloads({
+            "items": [deployment("x86-app")]
+        })[0]
+        hit_x86 = collect.check_untargeted_compute_class_workload(wl_x86, ctx)
+        self.assertIsNotNone(hit_x86)
+        self.assertEqual(hit_x86["single_compute_class"], "base")
+        self.assertFalse(hit_x86["multiple_compute_classes"])
+
+    def test_gke_provisioning_synthesis_and_anti_spot_idiom(self):
+        # cloud.google.com/gke-provisioning is synthesized (spot/preemptible/standard) and resolves anti-spot affinity.
+        base_pool = pool("base-pool", labels={"cloud.google.com/compute-class": "base"}, spot=False)
+        spot_pool = pool("spot-pool", labels={"cloud.google.com/compute-class": "spot-cc"}, spot=True)
+        cc_base = compute_class("base")
+        cc_spot = compute_class("spot-cc")
+        ctx = {
+            "compute_classes": [cc_base, cc_spot],
+            "node_pools": [base_pool, spot_pool],
+            "namespaces": [self.ns],
+            "nodes": [
+                node("node-base", labels={"cloud.google.com/gke-nodepool": "base-pool"}),
+                node("node-spot", labels={"cloud.google.com/gke-nodepool": "spot-pool"}),
+            ],
+        }
+        affinity = {
+            "requiredDuringSchedulingIgnoredDuringExecution": {
+                "nodeSelectorTerms": [
+                    {"matchExpressions": [{"key": "cloud.google.com/gke-provisioning", "operator": "NotIn", "values": ["spot"]}]}
+                ]
+            }
+        }
+        wl = collect.normalize_workloads({
+            "items": [deployment("anti-spot-app", node_affinity=affinity)]
+        })[0]
+        hit = collect.check_untargeted_compute_class_workload(wl, ctx)
+        self.assertIsNotNone(hit)
+        self.assertEqual(hit["single_compute_class"], "base")
 
 
 if __name__ == "__main__":

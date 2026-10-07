@@ -3906,6 +3906,25 @@ def check_untargeted_compute_class_workload(workload: dict, context: dict) -> di
     if template.get("runtimeClassName") == "gvisor":
         pod_tolerations.append({"key": "sandbox.gke.io/runtime", "value": "gvisor", "operator": "Equal"})
         node_selector["sandbox.gke.io/runtime"] = "gvisor"
+    def _quantity_positive(val: object) -> bool:
+        if val is None:
+            return False
+        if isinstance(val, (int, float)):
+            return val > 0
+        s = str(val).strip()
+        try:
+            return float(s) > 0
+        except (ValueError, TypeError):
+            pass
+        import re
+        m = re.match(r"^(\d+(?:\.\d+)?)", s)
+        if m:
+            try:
+                return float(m.group(1)) > 0
+            except ValueError:
+                pass
+        return False
+
     containers = list(template.get("containers") or []) + list(template.get("initContainers") or [])
     has_gpu_request = False
     has_tpu_request = False
@@ -3913,10 +3932,10 @@ def check_untargeted_compute_class_workload(workload: dict, context: dict) -> di
         res = c.get("resources") or {}
         reqs = res.get("requests") or {}
         limits = res.get("limits") or {}
-        if "nvidia.com/gpu" in reqs or "nvidia.com/gpu" in limits:
+        if _quantity_positive(reqs.get("nvidia.com/gpu")) or _quantity_positive(limits.get("nvidia.com/gpu")):
             pod_tolerations.append({"key": "nvidia.com/gpu", "operator": "Exists"})
             has_gpu_request = True
-        if "google.com/tpu" in reqs or "google.com/tpu" in limits:
+        if _quantity_positive(reqs.get("google.com/tpu")) or _quantity_positive(limits.get("google.com/tpu")):
             pod_tolerations.append({"key": "google.com/tpu", "operator": "Exists"})
             has_tpu_request = True
     required_terms = (node_affinity.get("requiredDuringSchedulingIgnoredDuringExecution") or {}).get("nodeSelectorTerms") or []
@@ -3966,6 +3985,7 @@ def check_untargeted_compute_class_workload(workload: dict, context: dict) -> di
         "cloud.google.com/gke-accelerator",
         "cloud.google.com/gke-spot",
         "cloud.google.com/gke-preemptible",
+        "cloud.google.com/gke-provisioning",
         "cloud.google.com/machine-family",
         "node.kubernetes.io/instance-type",
         "beta.kubernetes.io/instance-type",
@@ -3977,6 +3997,8 @@ def check_untargeted_compute_class_workload(workload: dict, context: dict) -> di
         "topology.gke.io/zone",
         "failure-domain.beta.kubernetes.io/zone",
         "sandbox.gke.io/runtime",
+        "cloud.google.com/gke-tpu-accelerator",
+        "cloud.google.com/gke-tpu-topology",
     })
 
     known_pool_label_keys = set(_GKE_KNOWN_POOL_LABEL_KEYS)
@@ -3994,12 +4016,20 @@ def check_untargeted_compute_class_workload(workload: dict, context: dict) -> di
             labels["cloud.google.com/gke-accelerator"] = accelerators[0]["acceleratorType"]
         if config.get("spot"):
             labels["cloud.google.com/gke-spot"] = "true"
+            labels["cloud.google.com/gke-provisioning"] = "spot"
         elif "spot" in config:
             labels["cloud.google.com/gke-spot"] = "false"
         if config.get("preemptible"):
             labels["cloud.google.com/gke-preemptible"] = "true"
+            labels["cloud.google.com/gke-provisioning"] = "preemptible"
         elif "preemptible" in config:
             labels["cloud.google.com/gke-preemptible"] = "false"
+        if "cloud.google.com/gke-provisioning" not in labels:
+            labels["cloud.google.com/gke-provisioning"] = "standard"
+        placement = p.get("placementPolicy") or {}
+        tpu_topology = placement.get("tpuTopology")
+        if tpu_topology:
+            labels["cloud.google.com/gke-tpu-topology"] = str(tpu_topology)
         machine_type = config.get("machineType") or ""
         if machine_type:
             labels["node.kubernetes.io/instance-type"] = machine_type
@@ -4012,6 +4042,16 @@ def check_untargeted_compute_class_workload(workload: dict, context: dict) -> di
             else:
                 labels["kubernetes.io/arch"] = "amd64"
                 labels["beta.kubernetes.io/arch"] = "amd64"
+            _TPU_ACCELERATOR_MAP = {
+                "ct5lp": "tpu-v5-lite-podslice",
+                "ct5p": "tpu-v5p-slice",
+                "ct6e": "tpu-v6e-slice",
+                "ct4p": "tpu-v4-podslice",
+            }
+            for prefix, accel_name in _TPU_ACCELERATOR_MAP.items():
+                if family.startswith(prefix):
+                    labels["cloud.google.com/gke-tpu-accelerator"] = accel_name
+                    break
         image_type = (config.get("imageType") or "").upper()
         if image_type.startswith("WINDOWS"):
             labels["kubernetes.io/os"] = "windows"
@@ -4199,8 +4239,28 @@ def check_untargeted_compute_class_workload(workload: dict, context: dict) -> di
 
     if len(schedulable_ccs) == 1:
         target_candidate = next(iter(schedulable_ccs))
+        cc_pool_bindings = {
+            ((p.get("config") or {}).get("labels") or {}).get(COMPUTE_CLASS_LABEL)
+            for p in node_pools
+        }
+        reachable_gp_ccs = set()
+        for cc in untainted_gp_ccs:
+            name = cc.get("metadata", {}).get("name")
+            if name in schedulable_ccs:
+                reachable_gp_ccs.add(name)
+            elif name not in cc_pool_bindings:
+                # NAP-only class: check if workload arch/os is excluded by cc spec
+                spec = cc.get("spec") or {}
+                np_cfg = spec.get("nodePoolConfig") or {}
+                cc_labels = np_cfg.get("labels") or {}
+                if sel_arch and cc_labels.get("kubernetes.io/arch") and cc_labels["kubernetes.io/arch"] != sel_arch:
+                    continue
+                if sel_os and cc_labels.get("kubernetes.io/os") and cc_labels["kubernetes.io/os"] != sel_os:
+                    continue
+                reachable_gp_ccs.add(name)
+
         if target_candidate in untainted_gp_names:
-            if len(untainted_gp_ccs) == 1:
+            if len(reachable_gp_ccs) <= 1:
                 single_cc = target_candidate
             else:
                 single_cc = ""
