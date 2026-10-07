@@ -299,6 +299,9 @@ data:
   managed-config.yaml: |
     approvals:
       cron_mode: approve
+    auxiliary:
+      title_generation:
+        enabled: false
     display:
       platforms:
         google_chat:

@@ -209,3 +209,14 @@ approvals:
 # Enable DuckDuckGo web search
 web:
   backend: "ddgs"
+
+# Auxiliary tasks. Disable Hermes auxiliary title generation (issue #2523).
+# run_agent.py fires a background _generate_session_title request after the first
+# turn with reasoning_config={"enabled": False}, which maps to reasoning_effort="minimal".
+# Routed through LiteLLM to Vertex AI Gemini 3.x Flash, LiteLLM maps this to
+# thinkingLevel="minimal" which Vertex rejects with HTTP 400.
+# Routed to Claude Sonnet/Opus, LiteLLM burns up to 1,024 reasoning tokens generating
+# a title that kube-agents does not display anywhere.
+auxiliary:
+  title_generation:
+    enabled: false

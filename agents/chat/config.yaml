@@ -408,3 +408,8 @@ plugins:
 # the same value. A key this file adds reaches an existing install through step
 # 2d's back-fill.
 context_file_max_chars: 100000
+
+# Auxiliary tasks. Disable Hermes auxiliary title generation (issue #2523).
+auxiliary:
+  title_generation:
+    enabled: false

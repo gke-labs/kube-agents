@@ -104,3 +104,8 @@ agent:
 # the next edit to it would start cutting its middle. Cluster profiles already on
 # the volume get this key from the entrypoint's back-fill in the cluster loop.
 context_file_max_chars: 100000
+
+# Auxiliary tasks. Disable Hermes auxiliary title generation (issue #2523).
+auxiliary:
+  title_generation:
+    enabled: false

@@ -279,6 +279,9 @@ data:
   managed-config.yaml: |
     approvals:
       cron_mode: approve
+    auxiliary:
+      title_generation:
+        enabled: false
     display: {}
     model:
       api_key: none
