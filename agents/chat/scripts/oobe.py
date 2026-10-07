@@ -312,6 +312,9 @@ def audit_holds(data_dir: Path) -> dict[str, str] | None:
         _log(f"cannot read {roster}: {e}")
         return None
     jobs = stored.get("jobs", []) if isinstance(stored, dict) else stored
+    if not isinstance(jobs, list):
+        _log(f"cannot read {roster}: its jobs are not a list")
+        return None
     by_id = {job.get("id"): job for job in jobs if isinstance(job, dict)}
     holds = {}
     for job_id in FIRST_RUN_AUDITS:
@@ -427,6 +430,10 @@ def advance_chain(data_dir: Path, state: dict, now: float) -> dict:
             # The last audit has started, or a scheduled run of it was already going; nothing is
             # left to mark.
             return save(done=True)
+        if job_id in audits_in_flight(runs, now):
+            # Kept as the mark awaiting its run until the run ends: a claim the store later closes
+            # as skipped for another reason then reads as never claimed and is marked again.
+            return save()
         current = None
 
     busy = audits_in_flight(runs, now)

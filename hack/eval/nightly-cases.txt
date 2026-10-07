@@ -132,8 +132,9 @@
 # it fifty-four (162) of sixty-eight (204), +3 more: the same shape on a
 # blocked card. oobe-first-run-audits (the last entry below) makes it
 # sixty-two (186) of seventy-six (228), counted from the lists with
-# upgrades-zonal-control-plane-outage-warned (2026-10-05, below), +3 more at its 2400s hint: a stack
-# that waits out the previous repetition's audits and the stage's chain, then a turn with no tools,
+# upgrades-zonal-control-plane-outage-warned (2026-10-05, below), +3 more at its 2400s hint: a unit
+# that waits out the previous repetition's audits (the runner's wait_platform_runs), a stack that
+# waits out the stage's chain, then a turn with no tools,
 # holding the four audit streams' locks throughout, so their audit cases queue behind it.
 # Whether the worst night fits is a question about the whole matrix, and the
 # six measured nights (2026-09-16 to 09-21, oss-test-infra#2707's table)

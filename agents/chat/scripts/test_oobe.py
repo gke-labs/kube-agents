@@ -477,6 +477,21 @@ class StageTest(unittest.TestCase):
         self._main(now=NOW_SETTLED + oobe.START_LIMIT_SECONDS + MINUTE)
         self.assertEqual(self._started_ids(), FIRST * 2)
 
+    def test_a_claim_later_closed_as_skipped_is_made_again(self):
+        # The store closes a claimed row as skipped in place when the worker loses the fire claim:
+        # that audit ran nothing, so it is marked again rather than counted and passed over.
+        self._file_scan()
+        _board(self.board, [_ranking("done")])
+        self._main(now=NOW_SETTLED)
+        self._ledger(FIRST[0], "claimed", NOW_SETTLED + MINUTE)
+        self._main(now=NOW_SETTLED + 2 * MINUTE)
+        self._ledger(FIRST[0], "skipped", NOW_SETTLED + MINUTE, skip_reason="fire_claim_lost")
+        self._main(now=NOW_SETTLED + 3 * MINUTE)
+        self.assertEqual(self._started_ids(), FIRST)
+        self._main(now=NOW_SETTLED + oobe.START_LIMIT_SECONDS)
+        self._main(now=NOW_SETTLED + oobe.START_LIMIT_SECONDS + MINUTE)
+        self.assertEqual(self._started_ids(), FIRST * 2)
+
     def test_a_mark_claimed_late_is_not_made_again(self):
         # The scheduler claims the mark after the start limit counted it as never started.
         self._file_scan()
@@ -625,15 +640,26 @@ class StageTest(unittest.TestCase):
         self._main(now=NOW_SETTLED + 10 * MINUTE)
         self.assertEqual(self._started_ids(), FIRST)
 
+    def test_a_roster_whose_jobs_are_not_a_list_is_unreadable(self):
+        # Not "every audit is missing": that would hold all four and retire having started none.
+        self._file_scan()
+        _board(self.board, [_ranking("done")])
+        roster = self.d / "profiles" / "platform" / "cron" / "jobs.json"
+        for shape in ({"jobs": {"compliance-audit": {}}}, "jobs"):
+            with self.subTest(shape=shape):
+                roster.write_text(json.dumps(shape))
+                self._main()
+                state = oobe.read_state(self.d)
+                self.assertEqual(self.started, [])
+                self.assertEqual((state[oobe.STATE_HELD], state[oobe.STATE_ATTEMPTS], state[oobe.STATE_DONE]), ({}, {}, False))
+
     def test_an_unreadable_ledger_is_not_nothing_running(self):
-        # Cost seen running clears `current`, so only the in-flight read holds the chain; a read
-        # that fails must hold it too, not mark compliance beside the live cost run.
+        # A read that fails must hold the chain, not mark compliance beside the live cost run.
         self._file_scan()
         _board(self.board, [_ranking("done")])
         self._main(now=NOW_SETTLED)
         self._ledger(FIRST[0], "running", NOW_SETTLED + MINUTE)
         self._main(now=NOW_SETTLED + 2 * MINUTE)
-        self.assertIsNone(oobe.read_state(self.d)[oobe.STATE_CURRENT])
         ledger = self.d / "profiles" / "platform" / "cron" / oobe.EXECUTIONS_DB
         rows = ledger.read_bytes()
         ledger.write_text("not a database")

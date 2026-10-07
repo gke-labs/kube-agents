@@ -1202,9 +1202,9 @@ release_inflight_note() { # <label> <audit-id>
 # ledger issue as the unit's own would, so resetting the ledger or clearing
 # the in-flight note under it would grade the unit against what two runs
 # wrote. hack/ci_platform_runs.py does the counting in the gateway (a mark not
-# yet claimed counts, so does an audit an `oobe` stage that
-# oobe-first-run-audits left armed has still to run, and a failed read counts
-# as busy) and stops after
+# yet claimed counts, so does the audit a pending `oobe` stage marks next and
+# every audit a stage oobe-first-run-audits left armed has still to run, and
+# a failed read counts as busy) and stops after
 # EVAL_PLATFORM_RUN_WAIT_SECONDS, failed execs retried inside it; the unit
 # then runs as it did before the wait. Pinned to AGENT_CLUSTER_CONTEXT and refused for a context that does
 # not name PROJECT_ID, as release_inflight_note is. Called once the unit holds

@@ -13,14 +13,15 @@ claimed, since the next profile-cron-tick starts it. A row claimed more than
 at running for good, and no audit takes that long. Anything it cannot read counts
 as busy, so a failed read is waited out rather than taken as idle.
 
-While the oobe-first-run-audits stack has the Chat Agent's `oobe` stage armed (its
-state file is there: the chain overran or the teardown could not disarm), an audit
-that stage has still to run counts too, from before it is marked. An audit has had
-its turn once the stage has marked it and moved on, or held or given up on it. The
-stage's audit list is read from the image's copy of oobe.py, not run. A fresh
-install's own stage is not waited on before it marks: the audit's in-flight note
-refuses a second `start` once one run holds it, and waiting out a whole chain would
-hold every audit case on those streams for most of an hour.
+While the Chat Agent's `oobe` stage is pending, the audit it marks next counts
+too, before it is marked: a unit that started then would have its own worker's
+`start` refused once the stage's run took the stream's in-flight note. Only the
+next one: waiting out the whole chain would hold every audit case on those streams
+for most of an hour. While the oobe-first-run-audits stack has the stage armed (its
+state file is there: the chain overran or the teardown could not disarm), every
+audit the stage has still to run counts. An audit has had its turn once the stage
+has marked it and its run has ended, or it was held or given up on. The stage's
+audit list and order are read from the image's copy of oobe.py, not run.
 
 Prints one line: how long it waited and what was still going when it stopped.
 """
@@ -92,6 +93,8 @@ def jobs_in(path):
     with open(path, encoding="utf-8") as fh:
         stored = json.load(fh)
     jobs = stored.get("jobs", []) if isinstance(stored, dict) else stored
+    if not isinstance(jobs, list):
+        raise ValueError(f"{path}: its jobs are not a list")
     return [job for job in jobs if isinstance(job, dict)]
 
 
@@ -99,7 +102,7 @@ def stage_audits():
     tree = ast.parse(open(STAGE_SOURCE, encoding="utf-8").read())
     for node in tree.body:
         if isinstance(node, ast.Assign) and any(getattr(t, "id", "") == STAGE_AUDITS for t in node.targets):
-            return set(ast.literal_eval(node.value))
+            return list(ast.literal_eval(node.value))
     raise ValueError(f"{STAGE_SOURCE} names no {STAGE_AUDITS}")
 
 
@@ -108,9 +111,7 @@ def runnable(job):
 
 
 def stage_pending():
-    """The audits asked about that a stack-armed `oobe` stage has still to run."""
-    if not os.path.exists(STACK_STATE):
-        return set()
+    """The audits asked about that a pending `oobe` stage holds, each with why."""
     try:
         if not any(job.get("id") == STAGE_JOB and runnable(job) for job in jobs_in(CHAT_ROSTER)):
             return set()
@@ -125,7 +126,10 @@ def stage_pending():
         return set()
     current = (state.get("current") or {}).get("job")
     had_turn = (set(state.get("fired", [])) | set(state.get("held", {})) | set(state.get("gave_up", []))) - {current}
-    return (stage_audits() & set(audits)) - had_turn
+    remaining = [audit for audit in stage_audits() if audit not in had_turn]
+    if os.path.exists(STACK_STATE):
+        return {f"{audit} (armed oobe stage)" for audit in remaining if audit in audits}
+    return {f"{audit} (oobe stage, next)" for audit in remaining[:1] if audit in audits}
 
 
 def running(now):
@@ -148,7 +152,7 @@ def running(now):
 def busy():
     now = datetime.now(timezone.utc)
     try:
-        return due(now) | running(now) | {f"{audit} (armed oobe stage)" for audit in stage_pending()}
+        return due(now) | running(now) | stage_pending()
     except Exception as exc:  # noqa: BLE001 - any failed read is not "nothing going"
         return {f"{UNREADABLE} ({exc})"}
 

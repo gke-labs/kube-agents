@@ -265,6 +265,13 @@ class PlantScriptsTest(unittest.TestCase):
         (self.home / ".oobe_audits_fired").unlink()
         self.assertEqual(self._run("own_stage.py", str(self.home)).stdout.strip(), "clear")
 
+    def test_own_stage_is_clear_for_a_job_that_cannot_run(self):
+        # A disabled or paused job never finishes, so the apply would wait out own_wait for nothing.
+        for job in ({**OOBE_JOB, "enabled": False}, {**OOBE_JOB, "state": "paused"}, {**OOBE_JOB, "paused_at": "x"}):
+            with self.subTest(job=job):
+                self.store.write_text(json.dumps([OTHER_JOB, job]))
+                self.assertEqual(self._run("own_stage.py", str(self.home)).stdout.strip(), "clear")
+
     # --- the chain wait ----------------------------------------------------------
 
     def test_the_wait_is_skipped_on_an_image_without_the_job(self):

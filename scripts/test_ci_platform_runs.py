@@ -154,10 +154,22 @@ class PlatformRunsTest(unittest.TestCase):
         if state is not None:
             (self.home / ".oobe_audits_fired").write_text(json.dumps(state))
 
-    def test_a_fresh_installs_own_stage_is_not_waited_on_before_it_marks(self):
-        # Its marks and runs are counted once made; the in-flight note keeps the runs apart.
+    def test_a_fresh_installs_own_stage_holds_only_the_audit_it_marks_next(self):
+        # Not started yet: cost is next. Once cost has run, compliance is.
         self._stage(armed=False)
-        self.assertEqual(self._wait(), "none going")
+        self.assertEqual(self._wait(), "still going after 0s, the run goes ahead: fleet-wide-cost-analysis (oobe stage, next)")
+        self.assertEqual(self._wait(audits=["compliance-audit"]), "none going")
+        self._stage({"fired": ["fleet-wide-cost-analysis"], "current": None}, armed=False)
+        self.assertEqual(self._wait(), "still going after 0s, the run goes ahead: compliance-audit (oobe stage, next)")
+
+    def test_the_audit_awaiting_its_run_is_the_one_next(self):
+        self._stage({"fired": ["fleet-wide-cost-analysis"], "current": {"job": "fleet-wide-cost-analysis", "marked_at": 1}}, armed=False)
+        self.assertEqual(self._wait(), "still going after 0s, the run goes ahead: fleet-wide-cost-analysis (oobe stage, next)")
+
+    def test_a_roster_whose_jobs_are_not_a_list_holds(self):
+        self._stage(armed=False)
+        (self.home / "cron" / "jobs.json").write_text(json.dumps({"jobs": {"oobe": {}}}))
+        self.assertIn("still going after 0s, the run goes ahead: unreadable", self._wait())
 
     def test_a_paused_or_disabled_stage_job_holds_nothing(self):
         for job in ({"id": "oobe", "enabled": False}, {"id": "oobe", "state": "paused"}, {"id": "oobe", "paused_at": "x"}):
