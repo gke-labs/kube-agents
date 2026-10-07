@@ -140,13 +140,17 @@ func reservedProfileServiceAccounts(agent *agentv1alpha1.PlatformAgent) map[stri
 type agentProfileResolution struct {
 	serviceAccount string
 	refused        error
+	// reason is the IdentityReady condition reason for a refusal: the
+	// profile itself is malformed, or its ServiceAccount is not usable.
+	reason string
 }
 
 // resolveAgentProfileIdentities decides every profile's ServiceAccount at once,
 // because two of the refusals are relative: two profiles naming one
 // ServiceAccount would be two map entries under one key, so the second by name
-// is refused and the first keeps it. Profiles are taken in name order so the
-// answer does not depend on list order. A terminating profile still holds its
+// is refused and the first keeps it. Profiles are taken oldest first (name
+// breaks ties), so an incumbent keeps its claim and the answer does not depend
+// on list order. A terminating profile still holds its
 // identity: its pods may still be running, and the finalizer removes the entry
 // only after its card is tombstoned.
 func resolveAgentProfileIdentities(agent *agentv1alpha1.PlatformAgent, profiles []agentv1alpha1.AgentProfile) map[string]agentProfileResolution {
@@ -160,8 +164,17 @@ func resolveAgentProfileIdentities(agent *agentv1alpha1.PlatformAgent, profiles 
 	for _, id := range calloutIdentities(agent) {
 		mapKeys[id.serviceAccount] = id.user
 	}
+	// Oldest first, so an incumbent keeps a contested ServiceAccount and a
+	// newcomer naming it is the one refused; name breaks ties, so the answer
+	// never depends on list order.
 	sorted := append([]agentv1alpha1.AgentProfile(nil), profiles...)
-	sort.Slice(sorted, func(i, j int) bool { return sorted[i].Name < sorted[j].Name })
+	sort.Slice(sorted, func(i, j int) bool {
+		ti, tj := sorted[i].CreationTimestamp, sorted[j].CreationTimestamp
+		if !ti.Equal(&tj) {
+			return ti.Before(&tj)
+		}
+		return sorted[i].Name < sorted[j].Name
+	})
 
 	out := make(map[string]agentProfileResolution, len(sorted))
 	claimedBy := map[string]string{}
@@ -173,27 +186,32 @@ func resolveAgentProfileIdentities(agent *agentv1alpha1.PlatformAgent, profiles 
 			// The CRD refuses these too. Refused here as well so that a
 			// profile admitted by an older or edited CRD drops out of the
 			// map instead of failing the whole render.
-			out[p.Name] = agentProfileResolution{refused: fmt.Errorf("profile name %q is not a dot-free DNS-1123 label", p.Name)}
+			out[p.Name] = agentProfileResolution{refused: fmt.Errorf("profile name %q is not a dot-free DNS-1123 label", p.Name), reason: reasonAgentProfileInvalid}
 		case malformedTopicGrant(p) != "":
-			out[p.Name] = agentProfileResolution{refused: fmt.Errorf("topic grant %q is not shared.{topic} or agent.{agent}.{topic}", malformedTopicGrant(p))}
+			out[p.Name] = agentProfileResolution{refused: fmt.Errorf("topic grant %q is not shared.{topic} or agent.{agent}.{topic}", malformedTopicGrant(p)), reason: reasonAgentProfileInvalid}
 		case foreignPublishTopic(p) != "":
-			out[p.Name] = agentProfileResolution{refused: fmt.Errorf("publish topic %q is another agent's: an agent-scoped topic has one writer, the agent it names, so a profile publishes only agent.%s.<topic>", foreignPublishTopic(p), p.Name)}
+			out[p.Name] = agentProfileResolution{refused: fmt.Errorf("publish topic %q is another agent's: an agent-scoped topic has one writer, the agent it names, so a profile publishes only agent.%s.<topic>", foreignPublishTopic(p), p.Name), reason: reasonAgentProfileInvalid}
+		case p.Spec.Identity.ServiceAccountName != "" && len(validation.IsDNS1123Subdomain(p.Spec.Identity.ServiceAccountName)) > 0:
+			// The CRD's pattern refuses this too; rechecked for the same
+			// reason as the name, since a malformed name makes a map key
+			// the whole render refuses.
+			out[p.Name] = agentProfileResolution{refused: fmt.Errorf("serviceAccountName %q is not a DNS-1123 subdomain", p.Spec.Identity.ServiceAccountName), reason: reasonAgentProfileRefused}
 		case p.Spec.Identity.ServiceAccountName != "" && strings.HasPrefix(p.Spec.Identity.ServiceAccountName, agentProfileServiceAccountPrefix):
 			// The operator-created ServiceAccounts belong to the profile
 			// they are named for. Without this a profile that sorts first
 			// could name another's and take its map entry over.
-			out[p.Name] = agentProfileResolution{refused: fmt.Errorf("serviceAccountName %q is an operator-created AgentProfile ServiceAccount", p.Spec.Identity.ServiceAccountName)}
+			out[p.Name] = agentProfileResolution{refused: fmt.Errorf("serviceAccountName %q is an operator-created AgentProfile ServiceAccount", p.Spec.Identity.ServiceAccountName), reason: reasonAgentProfileRefused}
 		case p.Name == a2aBridgeAddressee:
 			// The CRD refuses this name too; the operator does not rely
 			// on admission alone, because CRD validation can be
 			// bypassed by an older CRD left on the cluster.
-			out[p.Name] = agentProfileResolution{refused: fmt.Errorf("profile name %q is the Hermes bridge's addressee", p.Name)}
+			out[p.Name] = agentProfileResolution{refused: fmt.Errorf("profile name %q is the Hermes bridge's addressee", p.Name), reason: reasonAgentProfileInvalid}
 		case reserved[sa] != "":
-			out[p.Name] = agentProfileResolution{refused: fmt.Errorf("serviceAccountName %q is %s", sa, reserved[sa])}
+			out[p.Name] = agentProfileResolution{refused: fmt.Errorf("serviceAccountName %q is %s", sa, reserved[sa]), reason: reasonAgentProfileRefused}
 		case mapKeys[a2aServiceAccountName(agent.Namespace, sa)] != "":
-			out[p.Name] = agentProfileResolution{refused: fmt.Errorf("serviceAccountName %q is the bus principal %q's", sa, mapKeys[a2aServiceAccountName(agent.Namespace, sa)])}
+			out[p.Name] = agentProfileResolution{refused: fmt.Errorf("serviceAccountName %q is the bus principal %q's", sa, mapKeys[a2aServiceAccountName(agent.Namespace, sa)]), reason: reasonAgentProfileRefused}
 		case claimedBy[sa] != "":
-			out[p.Name] = agentProfileResolution{refused: fmt.Errorf("serviceAccountName %q is already AgentProfile %q's", sa, claimedBy[sa])}
+			out[p.Name] = agentProfileResolution{refused: fmt.Errorf("serviceAccountName %q is already AgentProfile %q's", sa, claimedBy[sa]), reason: reasonAgentProfileRefused}
 		default:
 			claimedBy[sa] = p.Name
 			out[p.Name] = agentProfileResolution{serviceAccount: sa}

@@ -34,7 +34,7 @@ spec:
     maxTurns: 50
   bus:
     publishTopics:
-      - agent.auditor.findings
+      - shared.annotations
     subscribeTopics:
       - shared.blueprint
   identity: {} # absent: the operator creates a ServiceAccount with no RBAC
@@ -47,7 +47,7 @@ spec:
     limits: { cpu: "1", memory: 2Gi }
 ```
 
-Topic grants are written without the `a2a.topics.` prefix, as `shared.{topic}` or `agent.{agent}.{topic}`. Nothing else is accepted. A profile may read any agent's topics, but the only agent-scoped topics it may publish are its own (`agent.<this profile's name>.{topic}`), because an agent's topics have one writer.
+Topic grants are written without the `a2a.topics.` prefix, as `shared.{topic}` or `agent.{agent}.{topic}`. Nothing else is accepted. A grant only works on a topic the install provisions, and the operator does not check that, so a grant on any other topic is refused by the bus at runtime. A profile may read any agent's topics, but the only agent-scoped topics it may publish are its own (`agent.<this profile's name>.{topic}`), because an agent's topics have one writer.
 
 ## What the operator renders
 
@@ -65,9 +65,9 @@ Nothing runs a pod from a profile yet. The dispatcher that turns a task into a J
 
 ## Status
 
-| Field                       | Meaning                                                                                                                                                                               |
-| --------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `status.agentRef`           | The PlatformAgent the profile is bound to.                                                                                                                                            |
-| `status.serviceAccountName` | The ServiceAccount its pods run as.                                                                                                                                                   |
-| `IdentityReady` condition   | The ServiceAccount and bus identity are rendered, or why not (`ModeNotNext`, `NoPlatformAgent`, `MultiplePlatformAgents`, `ServiceAccountRefused`, `ServiceAccountNotFound`).         |
-| `CardPublished` condition   | The agent card is on the directory, or why not (`BusUnavailable`, `OperatorBusIdentityUnconfigured`, `IdentityNotRendered`, or the same mode and binding reasons as `IdentityReady`). |
+| Field                       | Meaning                                                                                                                                                                                                              |
+| --------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `status.agentRef`           | The PlatformAgent the profile is bound to.                                                                                                                                                                           |
+| `status.serviceAccountName` | The ServiceAccount its pods run as.                                                                                                                                                                                  |
+| `IdentityReady` condition   | The ServiceAccount and bus identity are rendered, or why not (`ModeNotNext`, `ModeNotRecognized`, `NoPlatformAgent`, `MultiplePlatformAgents`, `InvalidProfile`, `ServiceAccountRefused`, `ServiceAccountNotFound`). |
+| `CardPublished` condition   | The agent card is on the directory, or why not (`BusUnavailable`, `OperatorBusIdentityUnconfigured`, `IdentityNotRendered`, or the same mode and binding reasons as `IdentityReady`).                                |

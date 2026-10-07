@@ -348,7 +348,10 @@ spec:
               rule:
                 self.metadata.name.matches('^[a-z0-9]([-a-z0-9]*[a-z0-9])?$') && self.metadata.name.size()
                 <= 63
-            - rule: self.metadata.name != 'platform'
+            - message:
+                "AgentProfile name 'platform' is reserved: the Hermes bridge
+                is the executor for that addressee"
+              rule: self.metadata.name != 'platform'
       served: true
       storage: true
       subresources:

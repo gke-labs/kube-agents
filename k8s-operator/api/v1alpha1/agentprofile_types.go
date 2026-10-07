@@ -247,7 +247,7 @@ type AgentProfileStatus struct {
 // +kubebuilder:validation:XValidation:rule="self.metadata.name.matches('^[a-z0-9]([-a-z0-9]*[a-z0-9])?$') && self.metadata.name.size() <= 63",message="AgentProfile name must be a dot-free DNS-1123 label of at most 63 characters: it is the addressee token on the task and directory subjects"
 // `platform` is the Hermes bridge's addressee: a profile under that name would put a
 // second executor on a2a.tasks.platform.*. The platform persona as a profile is not a goal.
-// +kubebuilder:validation:XValidation:rule="self.metadata.name != 'platform'"
+// +kubebuilder:validation:XValidation:rule="self.metadata.name != 'platform'",message="AgentProfile name 'platform' is reserved: the Hermes bridge is the executor for that addressee"
 
 // AgentProfile is the Schema for the agentprofiles API.
 type AgentProfile struct {

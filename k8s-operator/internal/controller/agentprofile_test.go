@@ -1090,3 +1090,98 @@ func TestTheNamespaceOnlyRequestDropsTheBusConnection(t *testing.T) {
 		t.Errorf("forget calls = %v, want [ns]", dir.forgot)
 	}
 }
+
+// A malformed serviceAccountName past admission is refused alone; the map
+// still renders for everyone else.
+func TestAMalformedServiceAccountNameDropsOutWithoutFailingTheMap(t *testing.T) {
+	withoutOperatorBusPrincipal(t)
+	agent := a2aTestAgent()
+	bad := testAgentProfile(agent.Namespace, "bad", func(p *agentv1alpha1.AgentProfile) { p.Spec.Identity.ServiceAccountName = "foo:bar" })
+	entries := renderedMapEntries(t, agent, []agentv1alpha1.AgentProfile{bad, testAgentProfile(agent.Namespace, "fine")})
+	if _, ok := entries["profile-bad"]; ok {
+		t.Error("a profile with a malformed serviceAccountName rendered")
+	}
+	if _, ok := entries["profile-fine"]; !ok {
+		t.Error("the good profile is missing")
+	}
+}
+
+// Of two profiles naming one ServiceAccount, the older keeps it, whatever the
+// names sort to.
+func TestTheIncumbentKeepsAContestedServiceAccount(t *testing.T) {
+	agent := a2aTestAgent()
+	old := testAgentProfile(agent.Namespace, "team", func(p *agentv1alpha1.AgentProfile) {
+		p.Spec.Identity.ServiceAccountName = "team-sa"
+		p.CreationTimestamp = metav1.NewTime(time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC))
+	})
+	newer := testAgentProfile(agent.Namespace, "aaa", func(p *agentv1alpha1.AgentProfile) {
+		p.Spec.Identity.ServiceAccountName = "team-sa"
+		p.CreationTimestamp = metav1.NewTime(time.Date(2026, 10, 1, 0, 0, 0, 0, time.UTC))
+	})
+	r := resolveAgentProfileIdentities(agent, []agentv1alpha1.AgentProfile{newer, old})
+	if r["team"].refused != nil || r["aaa"].refused == nil {
+		t.Errorf("team=%v aaa=%v; want the older team to keep team-sa", r["team"].refused, r["aaa"].refused)
+	}
+}
+
+// A malformed profile is reported as InvalidProfile, not as a ServiceAccount
+// problem.
+func TestAMalformedProfileIsReportedAsInvalid(t *testing.T) {
+	withOperatorBusPrincipal(t)
+	agent := a2aTestAgent()
+	p := testAgentProfile(agent.Namespace, "auditor", func(p *agentv1alpha1.AgentProfile) {
+		p.Spec.Bus.PublishTopics = []string{"agent.platform.upgrade-readiness"}
+	})
+	h := newProfileHarness(t, agent, &p)
+	h.reconcile(agent.Namespace, "auditor")
+	if c := condition(h.profile(agent.Namespace, "auditor"), agentv1alpha1.AgentProfileConditionIdentityReady); c.Reason != reasonAgentProfileInvalid {
+		t.Errorf("reason = %q, want %q", c.Reason, reasonAgentProfileInvalid)
+	}
+}
+
+// Under version skew the bus is frozen, not torn down: a deleting profile
+// still gets its tombstone and its finalizer released.
+func TestAProfileDeletedUnderVersionSkewIsStillFinalized(t *testing.T) {
+	withOperatorBusPrincipal(t)
+	agent := a2aTestAgent()
+	p := testAgentProfile(agent.Namespace, "auditor")
+	h := newProfileHarness(t, agent, &p)
+	h.reconcile(agent.Namespace, "auditor")
+
+	var live agentv1alpha1.PlatformAgent
+	if err := h.c.Get(context.Background(), types.NamespacedName{Namespace: agent.Namespace, Name: agent.Name}, &live); err != nil {
+		t.Fatal(err)
+	}
+	live.Spec.Mode = ptr.To("later")
+	if err := h.c.Update(context.Background(), &live); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.c.Delete(context.Background(), h.profile(agent.Namespace, "auditor")); err != nil {
+		t.Fatal(err)
+	}
+	h.reconcile(agent.Namespace, "auditor")
+	if e := h.dir.entries["auditor"]; e.kind != a2aKindAgentClosed {
+		t.Errorf("no tombstone under skew: %+v", e)
+	}
+	var gone agentv1alpha1.AgentProfile
+	if err := h.c.Get(context.Background(), types.NamespacedName{Namespace: agent.Namespace, Name: "auditor"}, &gone); !apierrors.IsNotFound(err) {
+		t.Errorf("the profile is still held under skew: %v", err)
+	}
+}
+
+// With no profile left in a namespace, an event there enqueues the
+// namespace-only request that drops the bus connection.
+func TestAnEmptyNamespaceEnqueuesTheConnectionDrop(t *testing.T) {
+	agent := a2aTestAgent()
+	h := newProfileHarness(t, agent)
+	got := agentProfileRequestsIn(context.Background(), h.c, agent.Namespace)
+	if len(got) != 1 || got[0].Name != "" || got[0].Namespace != agent.Namespace {
+		t.Errorf("requests = %v, want the one namespace-only request", got)
+	}
+	p := testAgentProfile(agent.Namespace, "auditor")
+	h2 := newProfileHarness(t, agent, &p)
+	got = agentProfileRequestsIn(context.Background(), h2.c, agent.Namespace)
+	if len(got) != 1 || got[0].Name != "auditor" {
+		t.Errorf("requests = %v, want the profile", got)
+	}
+}

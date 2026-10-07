@@ -83,6 +83,8 @@ const (
 	reasonAgentProfileNoAgent         = "NoPlatformAgent"
 	reasonAgentProfileManyAgents      = "MultiplePlatformAgents"
 	reasonAgentProfileRefused         = "ServiceAccountRefused"
+	reasonAgentProfileInvalid         = "InvalidProfile"
+	reasonAgentProfileModeUnknown     = "ModeNotRecognized"
 	reasonAgentProfileSANotFound      = "ServiceAccountNotFound"
 	reasonAgentProfilePublished       = "Published"
 	reasonAgentProfileBusUnconfigured = "OperatorBusIdentityUnconfigured"
@@ -131,8 +133,14 @@ func (r *AgentProfileReconciler) Reconcile(ctx context.Context, req ctrl.Request
 			reason, msg = reasonAgentProfileNotNext, "the PlatformAgent "+agent.Name+" does not run spec.mode: next; an AgentProfile renders nothing until it does"
 			if _, modeErr := resolveMode(agent); modeErr != nil {
 				// Version skew freezes the bus rather than tearing it
-				// down; freeze the profile's objects with it.
-				return ctrl.Result{}, r.writeStatus(ctx, &profile, agent, "", reason, modeErr.Error(), reason, modeErr.Error(), false)
+				// down; freeze the profile's objects with it. A deletion
+				// still runs: the frozen bus is running, so the tombstone
+				// can be tried, and holding the finalizer would hang the
+				// delete until the operator is rolled forward.
+				if !profile.DeletionTimestamp.IsZero() {
+					return r.finalize(ctx, &profile, agent)
+				}
+				return ctrl.Result{}, r.writeStatus(ctx, &profile, agent, "", reasonAgentProfileModeUnknown, modeErr.Error(), reasonAgentProfileModeUnknown, modeErr.Error(), false)
 			}
 		}
 		return ctrl.Result{}, r.renderNothing(ctx, &profile, agent, reason, msg)
@@ -159,7 +167,7 @@ func (r *AgentProfileReconciler) Reconcile(ctx context.Context, req ctrl.Request
 			return ctrl.Result{}, err
 		}
 		if foreign {
-			resolution = agentProfileResolution{refused: fmt.Errorf("ServiceAccount %s already exists and is not this profile's; the operator does not adopt it", agentProfileServiceAccountPrefix+profile.Name)}
+			resolution = agentProfileResolution{refused: fmt.Errorf("ServiceAccount %s already exists and is not this profile's; the operator does not adopt it", agentProfileServiceAccountPrefix+profile.Name), reason: reasonAgentProfileRefused}
 		}
 	}
 
@@ -168,7 +176,7 @@ func (r *AgentProfileReconciler) Reconcile(ctx context.Context, req ctrl.Request
 			return ctrl.Result{}, err
 		}
 		cardReason, cardMsg, busErr := r.withdrawCard(ctx, agent, &profile)
-		if err := r.writeStatus(ctx, &profile, agent, "", reasonAgentProfileRefused, resolution.refused.Error(), cardReason, cardMsg, false); err != nil {
+		if err := r.writeStatus(ctx, &profile, agent, "", resolution.reason, resolution.refused.Error(), cardReason, cardMsg, false); err != nil {
 			return ctrl.Result{}, err
 		}
 		return r.busResult(busErr)
@@ -459,27 +467,32 @@ func equalAgentProfileStatus(a, b *agentv1alpha1.AgentProfileStatus) bool {
 	return true
 }
 
+// agentProfileRequestsIn is what a PlatformAgent or AgentProfile event in a
+// namespace enqueues: every profile there, or, with none left, the
+// namespace-only request that tells Reconcile to drop the namespace's bus
+// connection.
+func agentProfileRequestsIn(ctx context.Context, c client.Reader, namespace string) []reconcile.Request {
+	var list agentv1alpha1.AgentProfileList
+	if err := c.List(ctx, &list, client.InNamespace(namespace)); err != nil {
+		return nil
+	}
+	if len(list.Items) == 0 {
+		return []reconcile.Request{{NamespacedName: types.NamespacedName{Namespace: namespace}}}
+	}
+	reqs := make([]reconcile.Request, 0, len(list.Items))
+	for _, p := range list.Items {
+		reqs = append(reqs, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: p.Namespace, Name: p.Name}})
+	}
+	return reqs
+}
+
 // SetupWithManager registers the reconciler. A PlatformAgent change (a mode
 // flip above all) re-reconciles every profile in its namespace, and so does any
 // profile change, because two profiles naming one ServiceAccount resolve
 // relative to each other.
 func (r *AgentProfileReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	enqueueProfilesIn := func(ctx context.Context, namespace string) []reconcile.Request {
-		var list agentv1alpha1.AgentProfileList
-		if err := mgr.GetClient().List(ctx, &list, client.InNamespace(namespace)); err != nil {
-			return nil
-		}
-		if len(list.Items) == 0 {
-			// Nothing to reconcile, but a connection may still be open
-			// for this namespace's agent: the namespace-only request
-			// tells Reconcile to drop it.
-			return []reconcile.Request{{NamespacedName: types.NamespacedName{Namespace: namespace}}}
-		}
-		reqs := make([]reconcile.Request, 0, len(list.Items))
-		for _, p := range list.Items {
-			reqs = append(reqs, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: p.Namespace, Name: p.Name}})
-		}
-		return reqs
+		return agentProfileRequestsIn(ctx, mgr.GetClient(), namespace)
 	}
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&agentv1alpha1.AgentProfile{}).

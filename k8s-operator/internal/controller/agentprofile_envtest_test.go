@@ -96,6 +96,20 @@ func TestTheAgentProfileCRDRefusesWhatTheLoaderRefused(t *testing.T) {
 	if err := c.Create(ctx, u); err == nil {
 		t.Error("an AgentProfile with no resources.requests was admitted; want refused")
 	}
+	for name, path := range map[string][]string{
+		"no-limits":     {"spec", "resources", "limits"},
+		"no-limits-cpu": {"spec", "resources", "limits", "cpu"},
+		"no-spec":       {"spec"},
+	} {
+		v := &unstructured.Unstructured{Object: runtime.DeepCopyJSON(raw)}
+		v.SetName(name)
+		v.SetResourceVersion("")
+		unstructured.RemoveNestedField(v.Object, "status")
+		unstructured.RemoveNestedField(v.Object, path...)
+		if err := c.Create(ctx, v); err == nil {
+			t.Errorf("%s: admitted; want refused", name)
+		}
+	}
 
 	for name, mutate := range cases {
 		p := valid.DeepCopy()
