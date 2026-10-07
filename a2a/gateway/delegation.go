@@ -541,11 +541,17 @@ func (g *Gateway) wakeSession(ctx context.Context, rec *SessionRecord, child Tas
 // not woken and why. Nothing is delivered: the child's result is the wake's
 // to digest, and it was posted to the conversation.
 func (g *Gateway) observeChildEnd(rec *SessionRecord, child TaskRef, state lib.TaskState, source TerminalSource, reason, why string) {
-	root := child.rootID()
-	if child.Canceled {
-		g.observeTaskTerminal(rec.Key, root, lib.StateCanceled, source, reason)
-		return
+	end := ChainEnd{State: lib.StateCanceled, Source: source, Reason: reason}
+	if !child.Canceled {
+		end = ChainEnd{State: lib.StateFailed, Source: source,
+			Reason: fmt.Sprintf("reason: %s - %s; the delegated task %s ended %s", reasonWakeNotStarted, why, child.ID, state)}
 	}
-	g.observeTaskTerminal(rec.Key, root, lib.StateFailed, source,
-		fmt.Sprintf("reason: %s - %s; the delegated task %s ended %s", reasonWakeNotStarted, why, child.ID, state))
+	// On the child's entry, so a read of the settled chain reports the same
+	// end (probeConversation); the caller writes the record.
+	for i := range rec.Tasks {
+		if rec.Tasks[i].ID == child.ID {
+			rec.Tasks[i].ChainEnd = &end
+		}
+	}
+	g.observeTaskTerminal(rec.Key, child.rootID(), end.State, end.Source, end.Reason)
 }

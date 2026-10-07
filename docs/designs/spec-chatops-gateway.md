@@ -398,7 +398,9 @@ no wake runs, the root ends `canceled` for a requester's `stop` and `failed` wit
 `reason: wake-not-started - …` otherwise, with nothing delivered. A heal composes with it: a healed
 child's result is not the root's deliverable, the heal's wake delivers as the relay's does. A
 cancel naming the root while the chain runs stops the running task, and the read route reads the
-root as the chain's running task. Chat backends read the posts, which are unchanged.
+root as the chain's running task, never final from a chain task's own terminal. Once the chain has
+settled it reports the end of the chain's last task as the root's: the wake's terminal and result,
+or, when no wake followed, the end the observers were told. Chat backends read the posts, which are unchanged.
 
 Transition. `platform` remains the default addressee until the session can hand platform
 topics on to the platform agent without the user noticing. The route is a deploy-time

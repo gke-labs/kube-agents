@@ -283,6 +283,18 @@ type TaskRef struct {
 	// (boundAskCopyAt). Empty on entries written before it existed, on a
 	// child, and once cleared.
 	Request string `json:"request,omitempty"`
+	// ChainEnd is set on a child whose end started no wake: the root
+	// terminal observeChildEnd announced, kept so the read route reports
+	// the same end for a settled chain (probeConversation). Nil otherwise.
+	ChainEnd *ChainEnd `json:"chainEnd,omitempty"`
+}
+
+// ChainEnd is a delegation chain's root terminal as the gateway announced it
+// when no wake followed the child.
+type ChainEnd struct {
+	State  lib.TaskState  `json:"state"`
+	Source TerminalSource `json:"source"`
+	Reason string         `json:"reason,omitempty"`
 }
 
 // rootID is the id the entry's chain is known by outside the gateway.
@@ -375,6 +387,37 @@ func (rec *SessionRecord) observedAs(taskID string) (id string, ends bool) {
 		return taskID, true
 	}
 	return ref.rootID(), ref.Role != taskRoleChild && len(ref.Children) == 0
+}
+
+// chainLast follows a delegation chain from the turn that started it to its
+// last task: down each turn's last child to the wake that child started, until
+// a turn that did not delegate (the wake that ends the chain) or a child no
+// wake followed. false when root did not delegate, or a link has fallen off
+// the history cap.
+func (rec *SessionRecord) chainLast(root TaskRef) (TaskRef, bool) {
+	cur := root
+	for steps := 0; len(cur.Children) > 0 && steps <= taskHistoryCap; steps++ {
+		child, ok := rec.TaskRefFor(cur.Children[len(cur.Children)-1])
+		if !ok {
+			return TaskRef{}, false
+		}
+		wake, ok := rec.wakeOf(child.ID)
+		if !ok {
+			return child, true
+		}
+		cur = wake
+	}
+	return cur, cur.ID != root.ID
+}
+
+// wakeOf is the wake a child's end started, if any.
+func (rec *SessionRecord) wakeOf(childID string) (TaskRef, bool) {
+	for _, ref := range rec.Tasks {
+		if ref.Role == taskRoleWake && ref.ParentTaskID == childID {
+			return ref, true
+		}
+	}
+	return TaskRef{}, false
 }
 
 // TaskCanceled reports whether a cancel for the task is on the stream (see

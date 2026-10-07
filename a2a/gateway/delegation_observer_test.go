@@ -498,3 +498,70 @@ func TestTheProbeNeverReportsTheRootFinalFromAChainTask(t *testing.T) {
 		})
 	}
 }
+
+// TestASettledChainProbesAsItsLastTask: once the chain has ended (no active
+// task), the root's own stream is the hand-off line. The probe follows the
+// chain to its last task and reports that end as the root's: the wake's
+// terminal and result, or, with no wake, the end the observer was told. A
+// turn that never delegated reads its own stream, as before.
+func TestASettledChainProbesAsItsLastTask(t *testing.T) {
+	settled := func(t *testing.T, r *rig, obs *recordingObserver, conv, root string) (ConversationState, observed) {
+		t.Helper()
+		waitFor(t, "the root's terminal", func() bool { _, ok := obs.terminalFor(root); return ok })
+		waitFor(t, "the chain settled on the record", func() bool {
+			rec, _ := r.g.reg.Get(context.Background(), conv)
+			return rec.ActiveTask == nil
+		})
+		st, err := r.g.probeConversation(context.Background(), conv, root)
+		if err != nil {
+			t.Fatal(err)
+		}
+		end, _ := obs.terminalFor(root)
+		return st, end
+	}
+	t.Run("a woken chain reads the wake", func(t *testing.T) {
+		r, spawn, obs := startObservedRig(t, doorDelegation(t))
+		conv := "a2a:agent-1001/ctx-settled"
+		origin, _, child := delegatedVia(t, r, spawn, conv, a2aBackend)
+		completeTask(t, r.execFor(t, child, targetPlatform), "fleet is green")
+		waitFor(t, "wake spawn", func() bool { return len(spawn.calls()) == 2 })
+		wakeSession := spawn.calls()[1].Session
+		wake := r.awaitTask(t, wakeSession)
+		wexec := r.execFor(t, wake, wakeSession)
+		_ = wexec.PublishStatus(context.Background(), lib.StateWorking, false)
+		completeTask(t, wexec, "the fleet is healthy")
+		st, _ := settled(t, r, obs, conv, origin.TaskID)
+		if st.Active || !st.Final || st.ExecutorState != lib.StateCompleted || st.Result != "the fleet is healthy" ||
+			st.TerminalSource != TerminalFromExecutor || st.TaskID != origin.TaskID {
+			t.Fatalf("settled probe of the root = %+v, want the wake's completed and its result", st)
+		}
+	})
+	t.Run("a chain no wake followed reads the observer's end", func(t *testing.T) {
+		r, spawn, obs := startObservedRig(t, doorDelegation(t))
+		conv := "a2a:agent-1001/ctx-settled-gone"
+		origin, _, child := delegatedVia(t, r, spawn, conv, a2aBackend)
+		putRecord(t, r, conv, func(rec *SessionRecord) {
+			for i := range rec.Tasks {
+				if rec.Tasks[i].ID == origin.TaskID {
+					rec.Tasks[i].Requester, rec.Tasks[i].Attribution = nil, nil
+				}
+			}
+		})
+		completeTask(t, r.execFor(t, child, targetPlatform), "fleet is green")
+		st, end := settled(t, r, obs, conv, origin.TaskID)
+		if !st.Final || st.ExecutorState != lib.StateFailed || st.Result != "" || st.Reason != end.text ||
+			!strings.HasPrefix(st.Reason, "reason: "+reasonWakeNotStarted+" - ") || st.TerminalSource != end.source {
+			t.Fatalf("settled probe of the root = %+v, want the observer's end %+v", st, end)
+		}
+	})
+	t.Run("a turn that never delegated reads its own stream", func(t *testing.T) {
+		r, spawn, obs := startObservedRig(t, doorDelegation(t))
+		conv := "a2a:agent-1001/ctx-settled-plain"
+		exec, origin, _ := sessionTurnVia(t, r, spawn, conv, a2aBackend, "hello")
+		completeTask(t, exec, "hi there")
+		st, _ := settled(t, r, obs, conv, origin.TaskID)
+		if !st.Final || st.ExecutorState != lib.StateCompleted || st.Result != "hi there" {
+			t.Fatalf("probe of a plain turn = %+v", st)
+		}
+	})
+}

@@ -1100,6 +1100,10 @@ func (g *Gateway) probeConversation(ctx context.Context, key, taskID string) (Co
 	// a wildcard is a miss, not a replay of the whole addressee. A task
 	// older than the history cap reads as unknown, which is the price.
 	var addressee string
+	// chainEnd, for a settled chain whose last task is a child no wake
+	// followed, is the root end the gateway announced for it; its zero
+	// value is a chain whose end has not been announced yet.
+	var chainEnd *ChainEnd
 	// The stream read: taskID's own, except that a delegation chain's root
 	// reads as the chain's running task while one runs - the root is the
 	// one id a program holds (observedAs), and the root's own stream is a
@@ -1128,6 +1132,19 @@ func (g *Gateway) probeConversation(ctx context.Context, key, taskID string) (Co
 			return state, nil
 		}
 		addressee = ref.Addressee
+		// A settled chain: the root's own stream is the turn that handed
+		// off ("delegated to platform"). Its end is the chain's last task's
+		// - the wake that ended it, or the child no wake followed, whose
+		// end is the one observeChildEnd announced (chainEnd, below).
+		if last, ok := rec.chainLast(ref); ok {
+			read, addressee = last.ID, last.Addressee
+			if last.Role == taskRoleChild {
+				chainEnd = last.ChainEnd
+				if chainEnd == nil {
+					chainEnd = &ChainEnd{} // not announced yet: running
+				}
+			}
+		}
 	}
 	task, terminalSubject, terr := g.client.TasksGetAttributed(ctx, addressee, read)
 	switch {
@@ -1189,6 +1206,18 @@ func (g *Gateway) probeConversation(ctx context.Context, key, taskID string) (Co
 		// executor": the caller learns that the gateway could not look,
 		// never that nothing is there.
 		return state, fmt.Errorf("reading task %s on %s: %w", read, addressee, terr)
+	}
+	if chainEnd != nil {
+		// The child's own stream is not the root's end: the wake that
+		// would have digested it never ran. Report what the observers
+		// were told, or running until they are.
+		state.Final, state.Result = chainEnd.State != "", ""
+		state.TerminalSource, state.Reason = chainEnd.Source, chainEnd.Reason
+		if state.Final {
+			state.ExecutorState = chainEnd.State
+		} else if state.ExecutorState != "" {
+			state.ExecutorState = lib.StateWorking
+		}
 	}
 	return state, nil
 }
