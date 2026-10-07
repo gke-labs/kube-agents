@@ -255,7 +255,11 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 	// replaying the stream to recover it would buy nothing. Checking here and
 	// not there is the difference between skipping the replay and paying for
 	// one whose result is then dropped.
-	needResult := result == "" && s.Status.State == lib.StateCompleted && !isConsoleConversation(rec.Key)
+	// A child's result feeds its wake as well as the room, so a child on a
+	// console conversation still has it replayed.
+	ref, _ := rec.TaskRefFor(taskID)
+	needResult := result == "" && s.Status.State == lib.StateCompleted &&
+		(!isConsoleConversation(rec.Key) || ref.Role == taskRoleChild)
 	// A session turn that ends completed may have asked to delegate in an
 	// event this process never ran: the artifact's delivery was acked and
 	// lost to a crash before its batch, and only the terminal was
