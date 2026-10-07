@@ -299,10 +299,13 @@ concurrent task therefore multiplexes over a single master connection.
 Teardown is per environment and not per connection. `cleanup()` runs
 `ssh -O exit` against that shared path, which drops the master and kills every
 session riding it. A sibling task that was mid-command loses it: exit 255, empty
-stderr, no indication that another task's teardown is what ended it. Three things
-call `cleanup()` — the idle reaper, `close_environment` when the agent closes,
-and the environment's `__del__` — and with `delegation.max_concurrent_children`
-at 3, the reaper reaches that state whenever one child idles while another works.
+stderr, no indication that another task's teardown is what ended it. Four things
+call `cleanup()` — the per-turn teardown at the end of every conversation (the
+ssh backend never marks itself persistent, so `cleanup_vm` runs for it), the idle
+reaper, `close_environment` when the agent closes, and the environment's
+`__del__`. The first is the frequent one: every kanban card, API-server request
+and delegate child is a conversation, so the master dies whenever any of them
+finishes while another is mid-command (#2174).
 
 The operator's managed terminal block sets `lifetime_seconds` to 30 days, which
 takes the reaper out of the picture. It is a number and not an off switch
@@ -319,12 +322,18 @@ root-owned file at the socket path so the socket can never be created fails
 because `cleanup()` unlinks that path, and the sandbox entrypoint runs as an
 unprivileged uid that cannot write a file the shell user could not then remove.
 
-What remains is the other two triggers. A process that exits still tears down
-its environment and still drops the shared master, so a delegated worker
-finishing while a sibling works can still cut the sibling's command — kanban
-workers are subprocesses that share the same socket directory, so they are the
-realistic case. Closing that needs a per-environment `ControlPath` in Hermes,
-which is an upstream change and not one this repository will carry as a patch.
+What remains is the teardown itself, and the agent image patches it
+(`deploy/docker/patches/apply_ssh_shared_master.py`): `cleanup()` keeps its
+sync-back and leaves the shared master alone, so a finishing turn or exiting
+process no longer cuts a sibling's command; `ControlPersist=300` reaps the master
+once nothing has used it for five minutes, and the eviction path after an
+infrastructure failure still closes a dead one. A prompt-time probe's master is
+its own and is closed as before. The terminal tool also labels the shape when it
+does occur: an ssh result with exit 255 and no cwd marker (the wrapper prints the
+marker after the command, so a command's own 255 carries one) gets a `hint`
+saying the connection was closed under the command and it may have run. A
+per-environment `ControlPath` would remove the sharing itself and is upstream's
+to make.
 
 ### What the credential proxy is for
 
