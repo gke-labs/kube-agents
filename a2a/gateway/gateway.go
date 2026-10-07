@@ -141,6 +141,10 @@ type Gateway struct {
 	// reapScanHook is an optional test hook invoked during reap passes on each visited record.
 	// Returning false halts the reap scan early.
 	reapScanHook func(rec *SessionRecord) bool
+	// terminalReplayHook is an optional test hook: a non-nil error from it
+	// fails relayTerminal's replay of the task's stream, as a transport
+	// error would.
+	terminalReplayHook func(taskID string) error
 	// taskSessions caches taskId -> session key; the KV task index is the
 	// durable copy a restart falls back to. Entries retire with the task.
 	taskSessions map[string]string
@@ -962,6 +966,13 @@ func (g *Gateway) healActiveTask(ctx context.Context, rec *SessionRecord) {
 		return
 	case err == nil && task.Final:
 		g.log.Info("healing stale active task", "taskId", active.TaskID, "state", task.State)
+		// The hand-off rule decides the turn's end as the relay's would
+		// (handOffEnd), from what this fold shows.
+		ev := delegateAbsent
+		if task.Artifact(lib.ArtifactDelegate) != nil {
+			ev = delegateSeen
+		}
+		g.settleHandOff(rec, active.TaskID, ev)
 		g.post(rec.Key, formatTaskStatus(task, active.Ask, active.SubmittedAt))
 		// The terminal the relay should have delivered, delivered to the
 		// adapter now, with whose word it is: the fold reads both of the
@@ -1274,8 +1285,16 @@ func (g *Gateway) probeConversation(ctx context.Context, key, taskID string) (Co
 		}
 	}
 	task, terminalSubject, terr := g.client.TasksGetAttributed(ctx, addressee, read)
+	// What the fold shows about a delegate request, for the hand-off rule
+	// below; nil when the read found nothing to fold.
+	var foldEvidence *delegateEvidence
 	switch {
 	case terr == nil:
+		ev := delegateAbsent
+		if task.Artifact(lib.ArtifactDelegate) != nil {
+			ev = delegateSeen
+		}
+		foldEvidence = &ev
 		state.ExecutorState = task.State
 		state.Final = task.Final
 		state.ReachedWorking = slices.Contains(task.StatusHistory, lib.StateWorking)
@@ -1334,12 +1353,14 @@ func (g *Gateway) probeConversation(ctx context.Context, key, taskID string) (Co
 		// never that nothing is there.
 		return state, fmt.Errorf("reading task %s on %s: %w", read, addressee, terr)
 	}
-	// A turn whose delegation the gateway refused: its own completed is
+	// A session turn whose request minted no child: its own completed is
 	// the hand-off line, and the observers were told the root failed with
-	// the refusal (observeEnded). Report the same.
-	if ref, ok := rec.TaskRefFor(read); ok && chainEnd == nil && state.Final {
-		if refused, why, ok := ref.refusedEnd(state.ExecutorState); ok {
-			state.ExecutorState, state.Result, state.Reason = refused, "", why
+	// the reason (observeEnded). Report the same, by the same rule, on a
+	// copy of the record this read never writes.
+	if chainEnd == nil && state.Final && foldEvidence != nil {
+		g.settleHandOff(rec, read, *foldEvidence)
+		if replaced, why, handOff := rec.handOffEnd(read, state.ExecutorState); handOff {
+			state.ExecutorState, state.Result, state.Reason = replaced, "", why
 		}
 	}
 	if chainEnd != nil {
@@ -1626,10 +1647,10 @@ func (g *Gateway) observeTaskTerminal(conversation, taskID string, state lib.Tas
 // a door submitted one task, so a delegation it never asked for must not
 // hand it a second task's start, an early "delegated to platform" as its
 // answer, or the end of a task it never heard of.
-// A turn whose delegation the gateway refused delivers nothing: its answer
-// is the hand-off line, not a result (TaskRef.refusedEnd).
+// A session turn whose request minted no child delivers nothing: its answer
+// is the hand-off line, not a result (SessionRecord.handOffEnd).
 func (g *Gateway) observeDelivered(rec *SessionRecord, taskID, result string) {
-	if ref, ok := rec.TaskRefFor(taskID); ok && ref.DelegationRefused != "" {
+	if _, _, handOff := rec.handOffEnd(taskID, lib.StateCompleted); handOff {
 		return
 	}
 	if id, ends := rec.observedAs(taskID); ends {
@@ -1637,14 +1658,12 @@ func (g *Gateway) observeDelivered(rec *SessionRecord, taskID, result string) {
 	}
 }
 
-// A turn whose delegation the gateway refused ends failed with the refusal
-// as its reason, where its own terminal says completed (TaskRef.refusedEnd).
+// A session turn whose request minted no child ends failed with the reason
+// recorded, where its own terminal says completed (SessionRecord.handOffEnd).
 func (g *Gateway) observeEnded(rec *SessionRecord, taskID string, state lib.TaskState, source TerminalSource, reason string) {
 	if id, ends := rec.observedAs(taskID); ends {
-		if ref, ok := rec.TaskRefFor(taskID); ok {
-			if refused, why, ok := ref.refusedEnd(state); ok {
-				state, reason = refused, why
-			}
+		if replaced, why, handOff := rec.handOffEnd(taskID, state); handOff {
+			state, reason = replaced, why
 		}
 		g.observeTaskTerminal(rec.Key, id, state, source, reason)
 	}

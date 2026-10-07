@@ -409,12 +409,15 @@ entry of the chain), and never names the child or the wake: no start, accept, de
 terminal under either id. The turn that delegated ends quietly, and the root's one deliverable and
 terminal come at the chain's end - the wake's result, then the wake's terminal, in that order; when
 no wake runs, the root ends `canceled` for a requester's `stop` and `failed` with
-`reason: wake-not-started - …` otherwise, with nothing delivered. A turn whose delegate request the
-gateway refused minted nothing, and its own `completed` answer is only the hand-off line, so the
-root ends `failed` with `reason: delegation-refused - <the room's notice>` and nothing delivered; the
-refusal is kept on the turn's history entry, so the read route reports the same end. A request the
-gateway ignored (a straggler, a repeat, a malformed part) is not a refusal, and the turn ends as its
-own terminal says. A heal composes with it: a healed
+`reason: wake-not-started - …` otherwise, with nothing delivered. The hand-off line
+(`delegated to <addressee>`) is never a deliverable: a session turn whose stream carries a delegate
+request and which minted no child ends the root `failed`, with nothing delivered -
+`reason: delegation-refused - <the room's notice>` when the gateway refused it, and
+`reason: delegation-not-started - <why>` otherwise (the child could not reach the bus, the turn was
+stopped, the request was malformed, or its outcome was lost or could not be read from the stream).
+The reason is kept on the turn's history entry when it is known, and the relay, the heal and the
+read route decide the end by the one rule, so all three report the same. A turn with no delegate
+request on its stream ends as its own terminal says. A heal composes with it: a healed
 child's result is not the root's deliverable, the heal's wake delivers as the relay's does. A
 cancel naming the root while the chain runs stops the running task, and the read route reads the
 root as the chain's running task, never final from a chain task's own terminal. Once the chain has

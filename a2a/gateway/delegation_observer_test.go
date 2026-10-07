@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -239,11 +240,40 @@ func TestARefusedDelegationEndsTheRootFailed(t *testing.T) {
 	}
 }
 
-// TestAnIgnoredDelegationLeavesTheParentsOwnEnd: a request the gateway
-// ignores (here, blank text: malformed) is not a refusal, so nothing is
-// withheld: the turn's own deliverable and terminal reach the observer as
-// any turn's do.
-func TestAnIgnoredDelegationLeavesTheParentsOwnEnd(t *testing.T) {
+// assertHandOffNotDelivered waits for the root's terminal and the turn's
+// release, then checks the hand-off rule from both readers: the observer was
+// told the root failed with reasonPrefix and handed nothing, and the settled
+// probe reports the same end.
+func assertHandOffNotDelivered(t *testing.T, r *rig, obs *recordingObserver, conv, root, reasonPrefix string) {
+	t.Helper()
+	waitFor(t, "the root's terminal", func() bool { _, ok := obs.terminalFor(root); return ok })
+	end, _ := obs.terminalFor(root)
+	if end.state != lib.StateFailed || !strings.HasPrefix(end.text, reasonPrefix) {
+		t.Fatalf("root terminal = %+v, want failed with a reason starting %q", end, reasonPrefix)
+	}
+	for _, e := range obs.events() {
+		if e.task == root && e.kind == "delivered" {
+			t.Fatalf("the hand-off line was delivered as the root's answer: %q", e.text)
+		}
+	}
+	waitFor(t, "the turn released", func() bool {
+		rec, _ := r.g.reg.Get(context.Background(), conv)
+		return rec.ActiveTask == nil || rec.ActiveTask.TaskID != root
+	})
+	st, err := r.g.probeConversation(context.Background(), conv, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !st.Final || st.ExecutorState != lib.StateFailed || st.Result != "" || st.Reason != end.text {
+		t.Fatalf("probe of the root = %+v, want the observer's end %+v", st, end)
+	}
+}
+
+// TestAnIgnoredDelegationEndsTheRootFailed: a request the gateway ignores
+// (here, blank text: malformed) minted no child either, so the turn's own
+// `completed` is only the hand-off line: the root ends failed with a
+// delegation-not-started reason naming why, and nothing is delivered.
+func TestAnIgnoredDelegationEndsTheRootFailed(t *testing.T) {
 	r, spawn, obs := startObservedRig(t, func(c *Config) { armInjectMap(t, c) })
 	conv := injectKeyPrefix + "case-ignored"
 	exec, origin, _ := sessionTurnVia(t, r, spawn, conv, injectBackend, "do a thing")
@@ -252,21 +282,106 @@ func TestAnIgnoredDelegationLeavesTheParentsOwnEnd(t *testing.T) {
 	}
 	waitFor(t, "ignore line", loggedContaining(r, "delegation ignored", "rule="+ruleDelegationMalformed))
 	completeTask(t, exec, "delegated to platform")
+	assertHandOffNotDelivered(t, r, obs, conv, origin.TaskID, notStartedEnd(whyRequestMalformed))
+}
+
+// TestAChildThatCannotReachTheBusEndsTheRootFailed: the request passed every
+// check and the child's publish failed. The delegating turn still ends
+// `completed` on the hand-off line, which is not an answer: the root ends
+// failed, the child could not reach the bus, and nothing is delivered.
+func TestAChildThatCannotReachTheBusEndsTheRootFailed(t *testing.T) {
+	r, spawn, obs := startObservedRig(t, func(c *Config) { armInjectMap(t, c) })
+	conv := injectKeyPrefix + "case-child-off-bus"
+	exec, origin, session := sessionTurnVia(t, r, spawn, conv, injectBackend, "how is the fleet?")
+	narrowTasksStream(t, r.url, session)
+	if err := exec.PublishArtifact(context.Background(), delegateArtifact(t, targetPlatform, "report fleet health")); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "publish failure", loggedContaining(r, "task publish failed"))
+	completeTask(t, exec, "delegated to platform")
+	assertHandOffNotDelivered(t, r, obs, conv, origin.TaskID, notStartedEnd(whyChildOffBus))
+}
+
+// TestAStoppedTurnsIgnoredDelegationEndsTheRootFailed: the human stopped the
+// turn and the gateway ignored its request, but the adapter ends a turn that
+// called the tool `completed` with the hand-off line. That is not an answer:
+// the root ends failed, the turn was stopped, and nothing is delivered.
+func TestAStoppedTurnsIgnoredDelegationEndsTheRootFailed(t *testing.T) {
+	r, spawn, obs := startObservedRig(t, func(c *Config) { armInjectMap(t, c) })
+	conv := injectKeyPrefix + "case-stopped"
+	exec, origin, _ := sessionTurnVia(t, r, spawn, conv, injectBackend, "how is the fleet?")
+	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001",
+		MessageID: "stop-1", Text: "stop", Backend: injectBackend}
+	waitFor(t, "cancel sent", postedContaining(r, "cancel sent"))
+	if err := exec.PublishArtifact(context.Background(), delegateArtifact(t, targetPlatform, "report fleet health")); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "ignore line", loggedContaining(r, "delegation ignored", "stopped=true", origin.TaskID))
+	completeTask(t, exec, "delegated to platform")
+	assertHandOffNotDelivered(t, r, obs, conv, origin.TaskID, notStartedEnd(whyTurnStopped))
+}
+
+// TestATerminalWhoseReplayFailsDoesNotDeliverTheHandOff: the delegate
+// artifact was acked and lost to a crash, and on the next gateway the
+// terminal's replay of the stream fails, so whether the turn asked to
+// delegate cannot be known. Its own result is not trusted as the answer: the
+// root ends failed, the request could not be read, and nothing is delivered.
+// The probe, reading the stream fine later, reports the same recorded end.
+func TestATerminalWhoseReplayFailsDoesNotDeliverTheHandOff(t *testing.T) {
+	r, spawn, _ := startObservedRig(t, func(c *Config) { armInjectMap(t, c) })
+	conv := injectKeyPrefix + "case-replay-fails"
+	exec, origin, _ := sessionTurnVia(t, r, spawn, conv, injectBackend, "how is the fleet?")
+	waitFor(t, "the turn working on the record", func() bool {
+		rec, _ := r.g.reg.Get(context.Background(), conv)
+		return rec != nil && rec.ActiveTask != nil && rec.ActiveTask.TaskID == origin.TaskID
+	})
+	var obs *recordingObserver
+	r2, _ := restartRigWrapped(t, r, func(a *fakeAdapter) Adapter {
+		obs = &recordingObserver{fakeAdapter: a}
+		return obs
+	}, func() {
+		if err := exec.PublishArtifact(context.Background(), delegateArtifact(t, targetPlatform, "report fleet health")); err != nil {
+			t.Fatal(err)
+		}
+		drainRelayDurable(t, r.url)
+	})
+	r2.g.terminalReplayHook = func(taskID string) error {
+		if taskID == origin.TaskID {
+			return errors.New("replay refused for the test")
+		}
+		return nil
+	}
+	completeTask(t, exec, "delegated to platform")
+	waitFor(t, "the replay failure", loggedContaining(r2, "terminal replay fallback failed", origin.TaskID))
+	assertHandOffNotDelivered(t, r2, obs, conv, origin.TaskID, notStartedEnd(whyRequestUnread))
+	if n := platformSubmissions(t, r2); n != 0 {
+		t.Fatalf("an unread request reached platform: %d", n)
+	}
+}
+
+// TestATurnThatNeverDelegatedKeepsItsOwnEnd: the hand-off rule touches only
+// a turn whose stream carries a delegate request; any other session turn's
+// answer and terminal reach the observer as before, and the probe agrees.
+func TestATurnThatNeverDelegatedKeepsItsOwnEnd(t *testing.T) {
+	r, spawn, obs := startObservedRig(t, func(c *Config) { armInjectMap(t, c) })
+	conv := injectKeyPrefix + "case-plain"
+	exec, origin, _ := sessionTurnVia(t, r, spawn, conv, injectBackend, "hello")
+	completeTask(t, exec, "hi there")
 	waitFor(t, "the turn's terminal", func() bool { _, ok := obs.terminalFor(origin.TaskID); return ok })
 	want := []string{"started:" + origin.TaskID, "accepted:" + origin.TaskID,
 		"delivered:" + origin.TaskID, "terminal:" + origin.TaskID}
 	if got := obs.kinds(); strings.Join(got, " ") != strings.Join(want, " ") {
 		t.Fatalf("observer calls = %v, want %v", got, want)
 	}
-	if ev := obs.events(); ev[2].text != "delegated to platform" || ev[3].state != lib.StateCompleted {
+	if ev := obs.events(); ev[2].text != "hi there" || ev[3].state != lib.StateCompleted {
 		t.Fatalf("deliverable %q, terminal %+v", ev[2].text, ev[3])
 	}
 	waitFor(t, "the turn released", func() bool {
 		rec, _ := r.g.reg.Get(context.Background(), conv)
 		return rec.ActiveTask == nil
 	})
-	if st, err := r.g.probeConversation(context.Background(), conv, origin.TaskID); err != nil || st.ExecutorState != lib.StateCompleted || st.Result != "delegated to platform" {
-		t.Fatalf("probe of an ignored delegation's turn = %+v %v", st, err)
+	if st, err := r.g.probeConversation(context.Background(), conv, origin.TaskID); err != nil || st.ExecutorState != lib.StateCompleted || st.Result != "hi there" {
+		t.Fatalf("probe of a plain turn = %+v %v", st, err)
 	}
 }
 
@@ -753,7 +868,7 @@ func TestARefusalIsOnTheStoreWhenItIsMade(t *testing.T) {
 	if err != nil || stored == nil {
 		t.Fatalf("stored record: %v %v", stored, err)
 	}
-	if pref, _ := stored.TaskRefFor(origin.TaskID); pref.DelegationRefused == "" {
+	if pref, _ := stored.TaskRefFor(origin.TaskID); pref.DelegationEnd == "" {
 		t.Fatalf("the refusal's own write does not carry the mark: %+v", pref)
 	}
 

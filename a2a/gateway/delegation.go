@@ -28,10 +28,31 @@ const (
 // terminal when the child ended and no wake could run (observeChildEnd).
 const reasonWakeNotStarted = "wake-not-started"
 
-// reasonDelegationRefused is the reason token on the root terminal an
-// observer is told for a turn whose delegate request the gateway refused
-// (TaskRef.refusedEnd).
-const reasonDelegationRefused = "delegation-refused"
+// reasonDelegationRefused and reasonDelegationNotStarted are the reason
+// tokens on the root terminal an observer is told for a session turn that
+// asked to delegate and minted no child (TaskRef.DelegationEnd,
+// SessionRecord.handOffEnd): the gateway refused the request, or the request
+// did not become a child for any other reason.
+const (
+	reasonDelegationRefused    = "delegation-refused"
+	reasonDelegationNotStarted = "delegation-not-started"
+)
+
+// The why of a delegation-not-started end, one per path that leaves a
+// session turn's request without a child.
+const (
+	whyChildOffBus      = "the delegated task could not reach the bus"
+	whyTurnStopped      = "the turn was stopped"
+	whyRequestMalformed = "the request was malformed"
+	whyNoChild          = "the request minted no child"
+	whyRequestUnread    = "the delegate request could not be read from the stream"
+)
+
+// notStartedEnd is the DelegationEnd for a request that minted no child for
+// why.
+func notStartedEnd(why string) string {
+	return "reason: " + reasonDelegationNotStarted + " - " + why
+}
 
 // delegateAddresseeLogCap bounds a delegate request's addressee in the audit
 // lines, in bytes. Addressees are agent names ("platform" today), so 64 keeps
@@ -87,27 +108,24 @@ func (g *Gateway) handleDelegateRequest(ctx context.Context, rec *SessionRecord,
 	ignore := func(rule string, extra ...any) {
 		log.Warn("delegation ignored", append(append([]any{"rule", rule}, audit...), extra...)...)
 	}
+	// noChild records on the turn's entry why its request minted no child,
+	// so the turn's own `completed` - only the hand-off line - is never
+	// handed to an observer as the answer (handOffEnd). Written now, under
+	// the session lock the caller holds, as startTaskWith writes a mint:
+	// left to the relay's end-of-batch write, a failed write would lose it.
+	noChild := func(reason string) {
+		rec.markDelegationEnd(taskID, reason)
+		if err := withRetry(kvRetryAttempts, func() error { return g.reg.Put(ctx, rec) }); err != nil {
+			g.log.Error("session record write failed after a delegation minted no child", "conversation", rec.Key, "err", err)
+		}
+	}
 	// A refusal's notice waits for the delegating turn's terminal, so the
 	// room reads the session's "delegated to platform" first and the
 	// refusal after it.
-	// The refusal is also marked on the turn's entry, durable, so the end
-	// an observer is told and the read route's report agree that the turn
-	// did not hand off (TaskRef.refusedEnd).
 	refuse := func(rule, notice string, extra ...any) {
 		log.Warn("delegation refused", append(append([]any{"rule", rule}, audit...), extra...)...)
 		g.deferNotice(taskID, notice)
-		for i := range rec.Tasks {
-			if rec.Tasks[i].ID == taskID {
-				rec.Tasks[i].DelegationRefused = notice
-			}
-		}
-		// Written now, under the session lock the caller holds, as
-		// startTaskWith writes a mint: left to the relay's end-of-batch
-		// write, a failed write would lose the mark, and the turn's
-		// terminal would then end the chain on the hand-off line.
-		if err := withRetry(kvRetryAttempts, func() error { return g.reg.Put(ctx, rec) }); err != nil {
-			g.log.Error("session record write failed after a delegation refusal", "conversation", rec.Key, "err", err)
-		}
+		noChild("reason: " + reasonDelegationRefused + " - " + notice)
 	}
 
 	// Only the task the gateway started, from the incarnation that owns it
@@ -137,12 +155,14 @@ func (g *Gateway) handleDelegateRequest(ctx context.Context, rec *SessionRecord,
 	// stop, and a notice about a delegation they stopped says nothing new.
 	if rec.ActiveTask.Detached || parent.Canceled {
 		ignore(ruleDelegationStale, "stopped", true)
+		noChild(notStartedEnd(whyTurnStopped))
 		return
 	}
 	// The adapter holds the same cap and refuses blank text; a request that
 	// breaks either reached the bus some other way.
 	if !parsed || strings.TrimSpace(req.Text) == "" || len(req.Text) > lib.DelegateTextCap {
 		ignore(ruleDelegationMalformed, "textBytes", len(req.Text))
+		noChild(notStartedEnd(whyRequestMalformed))
 		return
 	}
 
@@ -243,9 +263,56 @@ func (g *Gateway) handleDelegateRequest(ctx context.Context, rec *SessionRecord,
 		rec.Addressee, rec.ActiveTask = prevAddressee, prevActive
 		setParentLine(rec, taskID, "")
 		g.dropFailedChildren(ctx, rec, taskID)
+		noChild(notStartedEnd(whyChildOffBus))
 		return
 	}
 	log.Info("delegation minted", "parent", taskID, "child", childID, "addressee", addressee)
+}
+
+// delegateEvidence is what a reader of a task knows about a delegate request
+// on its stream.
+type delegateEvidence int
+
+const (
+	// delegateAbsent: the stream carries no delegate request.
+	delegateAbsent delegateEvidence = iota
+	// delegateSeen: the stream carries one (read in the fold, or run by
+	// this process's relay).
+	delegateSeen
+	// delegateUnknown: the stream could not be read, and this process never
+	// saw the task's events from the start.
+	delegateUnknown
+)
+
+// settleHandOff writes on a session turn's entry, from what the stream
+// shows, why its delegate request minted no child, when nothing on the
+// record says so yet: a request on the stream with no child and no reason
+// recorded (its outcome was lost with the relay's write), or a stream that
+// could not be read for a turn whose request may still be pending. Then
+// handOffEnd decides the turn's end the same way for every reader. A turn
+// with a child, a reason already, or no request on its stream is left
+// alone, as is a task that is not a session turn.
+func (g *Gateway) settleHandOff(rec *SessionRecord, taskID string, evidence delegateEvidence) {
+	ref, ok := rec.TaskRefFor(taskID)
+	if !ok || !g.sessionTurn(ref) || len(ref.Children) > 0 || ref.DelegationEnd != "" {
+		return
+	}
+	switch evidence {
+	case delegateSeen:
+		rec.markDelegationEnd(taskID, notStartedEnd(whyNoChild))
+	case delegateUnknown:
+		if rec.mayHaveUnhandledDelegate(taskID) {
+			rec.markDelegationEnd(taskID, notStartedEnd(whyRequestUnread))
+		}
+	}
+}
+
+// sessionTurn reports a task the conversation's own session ran: not a
+// child, and not addressed to a fixed executor (platform, or the
+// install's fixed default).
+func (g *Gateway) sessionTurn(ref TaskRef) bool {
+	return ref.Role != taskRoleChild && ref.Addressee != "" && ref.Addressee != targetPlatform &&
+		ref.Addressee != g.cfg.DefaultAddressee
 }
 
 // doorUnlisted reports a delegation to target checked against someone who

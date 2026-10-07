@@ -266,22 +266,40 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 	// read for it and the request runs first, every check applying, before
 	// the turn ends - otherwise the hand-off line would end the chain.
 	needDelegate := s.Status.State == lib.StateCompleted && !rs.local && !rs.sawDelegate && rec.mayHaveUnhandledDelegate(taskID)
+	evidence := delegateAbsent
 	if needResult || needDelegate {
 		// Render state is cache; if a restart lost it, the stream still has
 		// everything. Replay against the addressee the task's own subjects
 		// carried - after a Delegate re-home, rec.Addressee is not it.
 		addressee := rec.AddresseeFor(taskID)
-		if task, err := g.client.TasksGet(ctx, addressee, taskID); err == nil {
+		if task, err := g.replayForTerminal(ctx, addressee, taskID); err == nil {
 			if art := task.Artifact(lib.ArtifactResult); art != nil && needResult {
 				result = joinTextParts(art.Parts)
+			}
+			if task.Artifact(lib.ArtifactDelegate) != nil {
+				evidence = delegateSeen
 			}
 			if needDelegate {
 				g.runFoldedDelegate(ctx, rec, rs, taskID, addressee, task)
 			}
 		} else {
 			g.log.Error("relay: terminal replay fallback failed", "taskId", taskID, "err", err)
+			// The request this process never saw cannot be read: whether
+			// the turn asked to delegate is unknown, so its own result is
+			// not trusted as a deliverable (settleHandOff).
+			if needDelegate {
+				evidence = delegateUnknown
+			}
 		}
 	}
+	if rs.sawDelegate {
+		evidence = delegateSeen
+	}
+	// The hand-off line is never a deliverable: a session turn whose
+	// request minted no child ends failed toward the observers, with the
+	// reason on its entry (handOffEnd, read by observeDelivered and
+	// observeEnded below and by the read route).
+	g.settleHandOff(rec, taskID, evidence)
 
 	switch s.Status.State {
 	case lib.StateCompleted:
@@ -423,6 +441,16 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 			g.observeChildEnd(rec, ref, s.Status.State, source, reason, why)
 		}
 	}
+}
+
+// replayForTerminal is relayTerminal's read of the task's stream.
+func (g *Gateway) replayForTerminal(ctx context.Context, addressee, taskID string) (*lib.Task, error) {
+	if g.terminalReplayHook != nil {
+		if err := g.terminalReplayHook(taskID); err != nil {
+			return nil, err
+		}
+	}
+	return g.client.TasksGet(ctx, addressee, taskID)
 }
 
 // updateRollingLine edits the task's single status message in place. Under

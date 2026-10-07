@@ -287,26 +287,42 @@ type TaskRef struct {
 	// terminal observeChildEnd announced, kept so the read route reports
 	// the same end for a settled chain (probeConversation). Nil otherwise.
 	ChainEnd *ChainEnd `json:"chainEnd,omitempty"`
-	// DelegationRefused is the notice the room was posted when the gateway
-	// refused this turn's delegate request (handleDelegateRequest's refuse;
-	// an ignored request does not set it). The turn's own `completed`
-	// answer is then only the hand-off line, so toward an observer the
-	// turn ends failed with the refusal as its reason and no deliverable
-	// (refusedEnd), and the read route reports the same. Empty otherwise.
-	DelegationRefused string `json:"delegationRefused,omitempty"`
+	// DelegationEnd is the reason a session turn that asked to delegate
+	// minted no child: `reason: delegation-refused - <the room's notice>`
+	// for a refusal, `reason: delegation-not-started - <why>` otherwise
+	// (the child could not reach the bus, the turn was stopped, the request
+	// was malformed, lost or unreadable). Written when the outcome is known
+	// (handleDelegateRequest, settleHandOff). The turn's own `completed` is
+	// then only the hand-off line, which is never a deliverable: toward an
+	// observer the turn ends failed with this reason and delivers nothing
+	// (handOffEnd), and the read route reports the same. Empty otherwise.
+	DelegationEnd string `json:"delegationEnd,omitempty"`
 }
 
-// refusedEnd is the end an observer is told for a turn whose delegation
-// the gateway refused, given the turn's own terminal state: a `completed`
-// is only the hand-off line, so it is the root failed with a
-// reason: delegation-refused token and the notice. Any other state stands.
-// ok is false when the turn's delegation was not refused or its state
-// stands.
-func (ref TaskRef) refusedEnd(state lib.TaskState) (lib.TaskState, string, bool) {
-	if ref.DelegationRefused == "" || state != lib.StateCompleted {
+// handOffEnd is the one rule for a session turn's own end when it asked to
+// delegate: the hand-off line ("delegated to <addressee>") is never a
+// deliverable. For a turn with a DelegationEnd and no child, a `completed`
+// is replaced by failed with that reason, and nothing is delivered (the
+// caller skips the deliverable when ok). Any other state stands, and a turn
+// that minted a child ends quietly as the chain's parent (observedAs).
+// relayTerminal, the heal and the read route all decide through it, after
+// settleHandOff has written what the stream shows.
+func (rec *SessionRecord) handOffEnd(taskID string, state lib.TaskState) (lib.TaskState, string, bool) {
+	ref, ok := rec.TaskRefFor(taskID)
+	if !ok || ref.DelegationEnd == "" || len(ref.Children) > 0 || state != lib.StateCompleted {
 		return state, "", false
 	}
-	return lib.StateFailed, "reason: " + reasonDelegationRefused + " - " + ref.DelegationRefused, true
+	return lib.StateFailed, ref.DelegationEnd, true
+}
+
+// markDelegationEnd records why the task's delegate request minted no child,
+// keeping the first reason recorded.
+func (rec *SessionRecord) markDelegationEnd(taskID, reason string) {
+	for i := range rec.Tasks {
+		if rec.Tasks[i].ID == taskID && rec.Tasks[i].DelegationEnd == "" {
+			rec.Tasks[i].DelegationEnd = reason
+		}
+	}
 }
 
 // ChainEnd is a delegation chain's root terminal as the gateway announced it
@@ -410,13 +426,13 @@ func (rec *SessionRecord) observedAs(taskID string) (id string, ends bool) {
 }
 
 // delegationHandled reports whether the task's history entry shows a
-// delegate request of its was handled: a child linked, or a refusal marked.
-// Both are written to the record when they are made (startTaskWith's write
-// for a mint, handleDelegateRequest's for a refusal), so the record holds
-// either from the moment the request is decided.
+// delegate request of its was handled: a child linked, or a reason it
+// minted none (DelegationEnd). Both are written to the record when they are
+// made (startTaskWith's write for a mint, handleDelegateRequest's for the
+// rest), so the record holds either from the moment the request is decided.
 func (rec *SessionRecord) delegationHandled(taskID string) bool {
 	ref, ok := rec.TaskRefFor(taskID)
-	return ok && (len(ref.Children) > 0 || ref.DelegationRefused != "")
+	return ok && (len(ref.Children) > 0 || ref.DelegationEnd != "")
 }
 
 // mayHaveUnhandledDelegate reports whether the task is a session turn - not
@@ -426,7 +442,7 @@ func (rec *SessionRecord) delegationHandled(taskID string) bool {
 func (rec *SessionRecord) mayHaveUnhandledDelegate(taskID string) bool {
 	ref, ok := rec.TaskRefFor(taskID)
 	return ok && ref.Role != taskRoleChild && rec.BusSession != "" && ref.Addressee == rec.BusSession &&
-		len(ref.Children) == 0 && ref.DelegationRefused == ""
+		len(ref.Children) == 0 && ref.DelegationEnd == ""
 }
 
 // chainLast follows a delegation chain from the turn that started it to its
