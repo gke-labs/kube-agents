@@ -368,9 +368,12 @@ The commented-out registration — a `# ./tasks/<id>/task.yaml` line — is reti
 the parking state for a case whose fixture or blocker was not ready, and it was
 indistinguishable from a case nobody had decided about. A `#` line in a roster file is a
 comment, and the validator rejects a case path inside one. The one case that does not go
-in a roster file is one whose fixture does not exist at all: it is a `FIXTURE_NOT_READY`
-entry in `scripts/validate_bench_cases.py`, with the issue that plants the fixture, and it
-moves to the nightly file in the pull request that lands the fixture.
+in a roster file is one whose fixture is not on the pool: it is a `FIXTURE_NOT_READY`
+entry in `scripts/validate_bench_cases.py`, with the issue that plants the fixture. The
+pull request that lands the fixture leaves it there, because merging puts nothing on a
+cluster; the reconcile's postsubmit does (`docs/ci-pool-projects.md` 6.2). A later pull
+request moves it to the nightly file, citing a reconcile report that visited every pool
+project and a scan that reads the role healthy on all of them.
 
 Who approves follows the split: an edit to the presubmit file or to
 `hack/eval/blocking-roster.txt` needs an `eval-crew` approver (`hack/OWNERS`); the nightly

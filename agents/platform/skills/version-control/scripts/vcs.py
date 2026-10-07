@@ -201,7 +201,7 @@ def verb_proposal_create(arguments) -> dict:
     if not source or not target:
         session = client.resolve_session(arguments.repo)
         source = source or client.current_branch(session)
-        target = target or session["branch"]
+        target = target or session.get("baseBranch") or session["branch"]
     return _collaboration(
         arguments,
         "proposal-create",
@@ -471,7 +471,10 @@ def build_parser() -> argparse.ArgumentParser:
     publish = verbs.add_parser(
         "publish", aliases=["push"], help="send local revisions to the forge"
     )
-    publish.add_argument("--target", help="the branch to build on (default: cloned)")
+    publish.add_argument(
+        "--target",
+        help="the branch to build on (default: the base the broker pins, else cloned)",
+    )
     publish.add_argument(
         "--advance",
         action="store_true",
@@ -500,7 +503,10 @@ def build_parser() -> argparse.ArgumentParser:
     create.add_argument("--title", required=True)
     create.add_argument("--body", default="")
     create.add_argument("--source", help="the branch to merge (default: current)")
-    create.add_argument("--target", help="the branch to merge into (default: cloned)")
+    create.add_argument(
+        "--target",
+        help="the branch to merge into (default: the base the broker pins, else cloned)",
+    )
     create.add_argument("--draft", action="store_true")
     repo_option(create).set_defaults(run=verb_proposal_create)
 

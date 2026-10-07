@@ -1000,6 +1000,7 @@ platformAgent:
     #   - forge: github
     #     repository: infra       # URL, scp remote, namespace/path, or bare name
     #     role: gitops            # gitops (at most one), managed, or context
+    #     baseBranch: release     # optional; see below
     #   - forge: github
     #     repository: my-org/app
     #     role: managed           # read-write, like the gitops repository
@@ -1007,6 +1008,19 @@ platformAgent:
     #     repository: runbooks
     #     namespace: other-org    # qualifies a bare name, overriding the forge's namespace
     #     role: context           # read-only reference material
+    #
+    # baseBranch, on a gitops or managed repository, is the branch every pull
+    # request onto it must target. The credential broker refuses a proposal
+    # onto any other branch, and a clone that names no branch checks this one
+    # out. Unset means the repository's own default branch. Write the branch
+    # name, or refs/heads/ and the name: a value starting with heads/, or
+    # with refs/heads/ followed by refs/heads/ or heads/, is refused, since
+    # the broker would read it as another branch. A context
+    # repository may not set it: it is never written, and its branch pin is
+    # the ref in the gitops-state ConfigMap. The `github` alias below has no
+    # place for it, so a values file that sets one renders the lists. Needs
+    # the PlatformAgent CRD from this chart: helm upgrade does not update
+    # CRDs, so apply charts/kube-agents/crds/ first.
     repositories: []
     # Deprecated: use `forges` and `repositories` above. Kept so existing values files keep working.
     github:

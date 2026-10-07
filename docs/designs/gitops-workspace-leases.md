@@ -149,7 +149,8 @@ prints `{"workspace", "repo", "branch", "base", "started_from", "proposal"}`; th
 the printed `workspace`. Which branch the copy is taken of is decided by asking the forge rather than
 by inspecting refs: a branch carrying an **open proposal** is one this run is adding to, so the copy
 is of that branch and its revisions come with it, while a branch with no open proposal is one this
-run is starting, so the copy is of the default branch and the branch is cut from it. That is the same
+run is starting, so the copy is of the base branch (the configured `baseBranch`, else the default)
+and the branch is cut from it. That is the same
 outcome the `origin/<name>`-exists test reached for, decided on the question that actually matters —
 a branch reused after its proposal merged must not be added to.
 

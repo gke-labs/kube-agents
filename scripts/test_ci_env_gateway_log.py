@@ -58,7 +58,8 @@ def constant(name: str) -> int:
     return int(value)
 
 
-def run_collect(**stub_env: str) -> tuple[subprocess.CompletedProcess, pathlib.Path]:
+def run_collect(*then: str, **stub_env: str) -> tuple[subprocess.CompletedProcess, pathlib.Path]:
+    """Run the lifted function once, then each line of `then` in the same bash."""
     tmp = pathlib.Path(tempfile.mkdtemp(prefix="gwlog-"))
     stubs = tmp / "bin"
     stubs.mkdir()
@@ -72,6 +73,7 @@ def run_collect(**stub_env: str) -> tuple[subprocess.CompletedProcess, pathlib.P
             lifted(),
             f"{FUNCTION}",
             'echo "STATUS AFTER: $?"',
+            *then,
         ]
     )
     env = dict(
@@ -122,6 +124,17 @@ class GatewayLogCollectionTest(unittest.TestCase):
         proc, log = run_collect(AGENT_CLUSTER_CONTEXT="")
         first = log.read_text(encoding="utf-8").splitlines()[0]
         self.assertNotIn("--context", first, "no pin, no flag: the deploy script's failure path has only the ambient context")
+
+    def test_a_second_call_in_the_same_process_keeps_the_first_capture(self):
+        """ci-eval-pr.sh takes the log before the rollback round trip replaces
+        the agent pod; a later call in the same process (the EXIT trap's, or
+        the failure dumper's through it) must not overwrite the eval's log
+        with the replacement pod's."""
+        proc, log = run_collect(f"STUB_LINES=7 {FUNCTION}", 'echo "SECOND STATUS: $?"', STUB_LINES="3")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("SECOND STATUS: 0", proc.stdout)
+        # The ARGS line and the first call's three, not the second call's seven.
+        self.assertEqual(len(log.read_text(encoding="utf-8").splitlines()), 4)
 
     def test_the_eval_trap_and_the_failure_dumper_both_call_it(self):
         env_src = ENV_SCRIPT.read_text(encoding="utf-8")

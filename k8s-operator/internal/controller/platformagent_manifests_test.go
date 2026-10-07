@@ -1521,6 +1521,7 @@ func TestCredentialProxyOutputCapClearsTheLargestFleetDump(t *testing.T) {
 					Env: []corev1.EnvVar{
 						{Name: "CREDENTIAL_PROXY_MAX_OUTPUT_BYTES", Value: "1024"},
 						{Name: "CREDENTIAL_PROXY_MAX_CONCURRENT_COMMANDS", Value: "64"},
+						{Name: credentialProxyMemoryLimitEnv, Value: "1"},
 						{Name: "UNRESERVED_PASSENGER", Value: "arrived"},
 					},
 				},
@@ -1567,7 +1568,7 @@ func TestCredentialProxyOutputCapClearsTheLargestFleetDump(t *testing.T) {
 	// hold it. credential_proxy.py reads a command's output as it streams,
 	// keeps at most the cap per stream and bounds the decoded text to the
 	// same size, so what the broker holds per in-flight request is about six
-	// times the cap, transiently: the two capped stream buffers, their decoded
+	// times the cap (credentialProxyOutputCopiesPerCommand), transiently: the two capped stream buffers, their decoded
 	// text, and the JSON body and its encoding (measured at 48 MiB per request
 	// against the 8 MiB cap for text, 37 MiB for bytes that are not UTF-8).
 	// A request holds its slot until its response is written, and concurrency
@@ -1578,21 +1579,18 @@ func TestCredentialProxyOutputCapClearsTheLargestFleetDump(t *testing.T) {
 	// or an OOMKill takes gcloud, kubectl, gh and git away from every agent
 	// the proxy serves.
 	//
-	// The children -- one kubectl or gcloud per in-flight command -- are
-	// outside this arithmetic. A kubectl listing thousands of objects runs to
-	// hundreds of MiB on its own, and the rest of the limit is what holds it.
+	// The children are the second assertion below, in the broker's own terms.
 	//
 	// The resting footprint is the container's own memory request rather than
 	// a measured constant: the ~250Mi the old sidecar held steady was mostly
 	// the event watcher's informer caches, which stayed in the gateway Pod
 	// when #913 moved the proxy out, and the request is upstream's statement
 	// of what this pod holds with nothing in flight.
-	const copiesPerCommand = 6
 	inFlight, err := strconv.ParseInt(env["CREDENTIAL_PROXY_MAX_CONCURRENT_COMMANDS"], 10, 64)
 	if err != nil || inFlight < 1 {
 		t.Fatalf("proxy concurrency cap %q is not a positive integer", env["CREDENTIAL_PROXY_MAX_CONCURRENT_COMMANDS"])
 	}
-	burst := int64(capBytes) * copiesPerCommand * inFlight
+	burst := int64(capBytes) * credentialProxyOutputCopiesPerCommand * inFlight
 	steadyStateBytes := proxy.Resources.Requests.Memory().Value()
 	if steadyStateBytes == 0 {
 		t.Fatal("the proxy container declares no memory request, so the burst below has no resting footprint to add to")
@@ -1601,6 +1599,47 @@ func TestCredentialProxyOutputCapClearsTheLargestFleetDump(t *testing.T) {
 	if burst+steadyStateBytes > limit {
 		t.Errorf("proxy output cap %d bursts to %d bytes across %d in-flight commands (CREDENTIAL_PROXY_MAX_CONCURRENT_COMMANDS), which does not fit under the proxy container's %d-byte memory limit with %d bytes of steady state — raise the limit, or lower one of the two caps",
 			capBytes, burst, inFlight, limit, steadyStateBytes)
+	}
+
+	// The child term (docs/designs/credential-proxy-child-memory-budget.md
+	// §2.5), in the broker's own arithmetic: the limit, less the broker's
+	// two fixed reserves, has to admit at least two requests at once, each
+	// with its child reserve and its output allowance, or a listing phase
+	// cannot parallelise at all. The slot cap above is an upper bound on the
+	// count and enters this rule only as that. The four figures and the
+	// floor are declared in credential_proxy_manifests.go as copies of the
+	// broker's (credential_proxy.py: BROKER_RESIDENT_RESERVE_BYTES,
+	// CONTENT_WORKSPACE_RESERVE_BYTES, REQUEST_CHILD_MEMORY_RESERVE_BYTES,
+	// OUTPUT_COPIES_PER_COMMAND, BUDGET_MINIMUM_ADMITTED_REQUESTS), and
+	// tests/test_credential_proxy_sizing_parity.py fails when the two drift.
+	admitted := credentialProxyAdmittedRequests(limit, int64(capBytes))
+	if admitted < credentialProxyMinimumAdmittedRequests {
+		t.Errorf("the proxy's %d-byte limit admits %d requests at once under the child memory budget (%d MiB resident + %d MiB workspace reserves, %d MiB per request plus %d x %d-byte output); at least %d are needed — raise the limit or lower the output cap",
+			limit, admitted, credentialProxyResidentReserveBytes>>20, credentialProxyWorkspaceReserveBytes>>20, credentialProxyRequestReserveBytes>>20, credentialProxyOutputCopiesPerCommand, capBytes, credentialProxyMinimumAdmittedRequests)
+	}
+	if minimum := credentialProxyMinimumMemoryLimitBytes(int64(capBytes)); minimum > limit {
+		t.Errorf("the child memory budget's floor is %d bytes and the proxy's limit is %d", minimum, limit)
+	}
+
+	// The broker budgets against the limit it actually has, read once at start
+	// through the Downward API rather than copied from the Resources block, so
+	// a limit moved by whatever recreates the pod (no CR field sets it today)
+	// is the one it budgets against. A literal here would be the drift the
+	// design forbids.
+	var limitEnv *corev1.EnvVar
+	for i := range proxy.Env {
+		if proxy.Env[i].Name == credentialProxyMemoryLimitEnv {
+			limitEnv = &proxy.Env[i]
+		}
+	}
+	if limitEnv == nil {
+		t.Fatalf("the proxy container does not carry %s, so the broker cannot budget its children", credentialProxyMemoryLimitEnv)
+	}
+	if limitEnv.Value != "" || limitEnv.ValueFrom == nil || limitEnv.ValueFrom.ResourceFieldRef == nil {
+		t.Fatalf("%s must be a resourceFieldRef on the container's own limit, got %#v", credentialProxyMemoryLimitEnv, limitEnv)
+	}
+	if ref := limitEnv.ValueFrom.ResourceFieldRef; ref.ContainerName != credentialProxyContainerName || ref.Resource != containerMemoryLimitResource || ref.Divisor.String() != "1" {
+		t.Errorf("%s reads %s/%s with divisor %s; want %s/%s with divisor 1", credentialProxyMemoryLimitEnv, ref.ContainerName, ref.Resource, ref.Divisor.String(), credentialProxyContainerName, containerMemoryLimitResource)
 	}
 }
 

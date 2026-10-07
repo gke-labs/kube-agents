@@ -11,7 +11,9 @@
 # night). The registration lint (scripts/validate_bench_cases.py) reads this
 # file as well as the presubmit one; the domain-coverage lint reads only
 # blocking-roster.txt, so neither an entry here nor a held-out presubmit
-# seat counts as coverage.
+# seat counts as coverage. EVAL_NIGHTLY_PART in the script can split the
+# nightly matrix between two periodics (its comment says how); unset, one
+# job runs all of it, and the budget below prices that.
 #
 # WHO APPROVES. The normal approvers (root OWNERS). Only the presubmit files
 # beside this one carry the eval-crew rule (#1546, decided 2026-09-15).

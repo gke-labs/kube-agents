@@ -165,8 +165,9 @@ KNOWN_UNREGISTERED = {
 # rejects a case path inside one. A case belongs here only when nothing in the
 # repository can run it yet; a case the agent fails, or that a harness limit
 # blocks, runs in the nightly and shows that on its record. Every reason names
-# the issue; the entry goes when the fixture lands and the case moves to the
-# nightly file in the same pull request.
+# the issue; the entry stays through the pull request that lands the fixture
+# (merging plants nothing; the reconcile's postsubmit does) and goes in the
+# later pull request that moves the case to the nightly file.
 FIXTURE_NOT_READY = {
     "b-0011-gitops": (
         "#1307: the GitOps fix-cycle pilot; needs a leaderboard GitOps repository "
