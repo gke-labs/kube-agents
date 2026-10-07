@@ -1747,9 +1747,9 @@ func seededGitOpsEntry(agent *agentv1alpha1.PlatformAgent) *agentv1alpha1.Manage
 // Teardown is per environment and not per connection: cleanup() ran
 // `ssh -O exit` on that shared path, which dropped the master and killed every
 // session riding it. A sibling task lost its in-flight command with exit 255
-// and an empty stderr. At the 300s default and delegation.max_concurrent_children
-// of 3, the reaper reached that state whenever one child idled while another
-// worked. Nothing is reclaimed by reaping here — the far side is a StatefulSet pod
+// and an empty stderr. At the 300s default the reaper reached that state whenever
+// one session's environment idled while another's worked. Nothing is reclaimed by
+// reaping here — the far side is a StatefulSet pod
 // that stays up either way — so the timeout bought nothing and cost the race.
 // The agent image now patches cleanup() so it no longer closes the shared
 // master at all (deploy/docker/patches/apply_ssh_shared_master.py, #2174): a

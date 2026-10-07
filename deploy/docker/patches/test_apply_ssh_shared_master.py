@@ -133,6 +133,15 @@ class VerifierTest(unittest.TestCase):
         self.assertIn("no close_master()", joined)
         self.assertIn("carries no hint", joined)
 
+    def test_a_renamed_probe_only_parameter_fails_the_gate(self):
+        # The applier's __init__ anchor is the _socket_id line, which an upstream rename of
+        # probe_only leaves intact; the inserted mark then raises NameError on every construction.
+        root = stage(ssh=SSH_STUB.replace("probe_only=False", "probe=False").replace("if probe_only:", "if probe:"))
+        apply(root)
+        rc, failures = run_verifier(root)
+        self.assertEqual(rc, 1)
+        self.assertIn("reads probe_only, which its function no longer binds", "\n".join(failures))
+
     def test_a_hint_that_overrides_the_upstream_one_fails(self):
         root = stage()
         apply(root)

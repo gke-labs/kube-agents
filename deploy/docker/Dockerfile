@@ -1272,7 +1272,8 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/kanban-scheduling/apply_kanban_scheduling
 # worker process that had run a command exited normally, cutting any sibling's
 # running command (exit 255, no output). cleanup() now leaves the shared master
 # to ControlPersist, and a foreground ssh exit 255 without the cwd marker carries
-# a hint. See the module docstring in deploy/docker/patches/apply_ssh_shared_master.py.
+# a hint when upstream attached none. See the module docstring in
+# deploy/docker/patches/apply_ssh_shared_master.py.
 COPY --chmod=0644 deploy/docker/patches/kanban_guardrail_exit.py \
      deploy/docker/patches/rate_limit_retry_delay.py \
      /opt/hermes/hermes_cli/

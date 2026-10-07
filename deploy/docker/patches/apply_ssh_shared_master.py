@@ -6,11 +6,12 @@ master (a delegate child too, if it inherits the ssh backend). ``SSHEnvironment.
 ``ssh -O exit`` on it. The callers that reach the shared environment include the process-exit
 sweep (``cleanup_all_environments``, so a kanban worker subprocess that ran a command and exited
 normally), the environment's ``__del__`` and the idle reaper; the per-turn ``cleanup_vm`` pops the
-raw turn id or session id while the terminal tool registers the environment under
-``session:<key>`` or ``default``, so it misses. A command another environment is running when one
-of them fires dies as a mux client whose master went away: exit 255, nothing printed, no cwd
-marker. Hermes ``main`` still had the shared path on 2026-10-07; this patch goes when a Hermes
-bump derives ``ControlPath`` per environment.
+turn's task id (a fresh uuid in a worker, the session id in the gateway) while the terminal tool
+registers the environment under ``session:<key>`` or ``default``, so it misses. A command another
+environment is running when one of them fires dies as a mux client whose master went away: exit
+255, nothing printed, no cwd marker. Hermes ``main`` still had the shared path on 2026-10-07; the
+``cleanup()`` half of this patch goes when a Hermes bump derives ``ControlPath`` per environment,
+and the hint stays useful either way.
 
 Three anchored edits in two files:
 
@@ -21,9 +22,9 @@ Three anchored edits in two files:
 - ``terminal_tool_result.py``: a foreground ssh result with exit 255 and no cwd marker gets a ``hint``, the
   way exit 124 has one, unless upstream already attached a hint to the output (``Permission
   denied``). The wrapper prints the marker after the command and exits with its code, so a
-  command's own 255 carries the marker (unless the command text itself calls ``exit`` or ``exec``
-  at top level, which leaves the wrapper first) and a cut connection, or one ssh never opened,
-  does not.
+  command's own 255 carries the marker (unless the command text itself ends the wrapper shell
+  early: a top-level ``exit`` or ``exec``, ``set -e``, a closed stdout) and a cut connection, or
+  one ssh never opened, does not.
 
 The eviction path (``_evict_environment_for_task``) is left alone: at v2026.9.14 nothing reaches it
 with a registered ssh environment, because a connection failure during construction fires before

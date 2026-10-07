@@ -303,9 +303,9 @@ stderr, no indication that another task's teardown is what ended it. The callers
 of `cleanup()` that reach the shared environment include the process's atexit
 sweep (`cleanup_all_environments`), the environment's `__del__` and the idle
 reaper. The per-turn teardown (`turn_finalizer` → `cleanup_task_resources` →
-`cleanup_vm`) and `AIAgent.close()` pop the raw turn id or session id, while the
-terminal tool registers the environment under `session:<key>` or `default`, so
-they miss it. The first is the frequent one: kanban workers are subprocesses, so
+`cleanup_vm`) and `AIAgent.close()` pop the turn's task id (a fresh uuid in a
+worker, the session id in the gateway) or the session id, while the terminal tool
+registers the environment under `session:<key>` or `default`, so they miss it. The first is the frequent one: kanban workers are subprocesses, so
 the master died when a worker that had run a command exited normally while
 another was mid-command (#2174).
 
@@ -326,7 +326,8 @@ root-owned file at the socket path so the socket can never be created fails
 because `cleanup()` unlinks that path, and the sandbox entrypoint runs as an
 unprivileged uid that cannot write a file the shell user could not then remove.
 
-What remains is the teardown itself, and the agent image patches it
+What remains is the teardown itself, and with no sandbox-side lever left (above)
+the agent image patches it
 (`deploy/docker/patches/apply_ssh_shared_master.py`): `cleanup()` keeps its
 sync-back and leaves the shared master alone, so an exiting process no longer
 cuts a sibling's command; `ControlPersist=300` reaps the master once nothing has
@@ -337,7 +338,8 @@ foreground and background-spawn paths catch their own errors. A prompt-time
 probe's master is its own and is closed as before. The terminal tool also labels
 the shape when it does occur: a foreground ssh result with exit 255 and no cwd marker (the
 wrapper prints the marker after the command, so a command's own 255 carries one
-unless the command text itself calls `exit` or `exec` at top level) gets a
+unless the command text itself ends the wrapper shell early: a top-level `exit`
+or `exec`, `set -e`, a closed stdout) gets a
 `hint`, unless upstream already attached a hint to the output, saying the
 connection was closed under the command or never opened, and that it may have
 run. A per-environment `ControlPath` would remove the sharing itself and is

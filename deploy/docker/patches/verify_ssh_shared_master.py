@@ -5,7 +5,10 @@ Run by ``deploy/docker/Dockerfile`` from ``/opt/hermes`` after ``apply_ssh_share
 The applier proves its anchors matched once; this imports the patched modules and proves they
 behave: a shared environment's ``cleanup()`` runs no ``ssh -O exit`` and ``close_master()`` does,
 a probe's ``cleanup()`` still closes its private master, and the terminal result carries the hint
-only for an ssh exit 255 without the cwd marker.
+only for an ssh exit 255 without the cwd marker. The two inserted statements are also checked with
+``patchlib.unbound``: the ``__init__`` mark is never executed here (the instances are built with
+``__new__``), so an upstream rename of ``probe_only`` would otherwise pass this gate and raise
+``NameError`` on every construction.
 
 Usage::
 
@@ -14,6 +17,7 @@ Usage::
 
 from __future__ import annotations
 
+import ast
 import json
 import os
 import sys
@@ -21,9 +25,15 @@ import tempfile
 from pathlib import Path
 from unittest import mock
 
+import patchlib
+
 HERMES = Path(os.environ.get("HERMES_ROOT", "/opt/hermes"))
 FAILURES: list[str] = []
 MARKER = "kube-agents patch: ssh_shared_master"
+SSH_RELATIVE = "tools/environments/ssh.py"
+RESULT_RELATIVE = "tools/terminal_tool_result.py"
+SHARED_MASTER_ATTR = "_shared_master"
+HINT_EXIT_CODE = 255
 
 
 def fail(msg: str) -> None:
@@ -45,6 +55,44 @@ def _import(name: str):
 
 def _exit_calls(run_mock) -> list[list[str]]:
     return [c.args[0] for c in run_mock.call_args_list if "-O" in c.args[0] and "exit" in c.args[0]]
+
+
+def _bound(tree: ast.Module, node: ast.AST, label: str) -> None:
+    names = patchlib.unbound(tree, node)
+    if names:
+        fail(f"{label} reads {', '.join(names)}, which its function no longer binds")
+
+
+def check_ssh_source(path: Path) -> None:
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    inits = [
+        node
+        for cls in tree.body if isinstance(cls, ast.ClassDef) and cls.name == "SSHEnvironment"
+        for node in cls.body if isinstance(node, ast.FunctionDef) and node.name == "__init__"
+    ]
+    marks = [
+        stmt for init in inits for stmt in init.body
+        if isinstance(stmt, ast.Assign)
+        and any(isinstance(t, ast.Attribute) and t.attr == SHARED_MASTER_ATTR for t in stmt.targets)
+    ]
+    if len(marks) != 1:
+        fail(f"expected one {SHARED_MASTER_ATTR} assignment in SSHEnvironment.__init__, found {len(marks)}")
+        return
+    _bound(tree, marks[0], f"the {SHARED_MASTER_ATTR} mark in SSHEnvironment.__init__")
+
+
+def check_result_source(path: Path) -> None:
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    hints = [
+        stmt for fn in tree.body if isinstance(fn, ast.FunctionDef) and fn.name == "finalize_foreground_result"
+        for stmt in fn.body
+        if isinstance(stmt, ast.If)
+        and any(isinstance(c, ast.Constant) and c.value == HINT_EXIT_CODE for c in ast.walk(stmt.test))
+    ]
+    if len(hints) != 1:
+        fail(f"expected one exit-{HINT_EXIT_CODE} hint branch in finalize_foreground_result, found {len(hints)}")
+        return
+    _bound(tree, hints[0], f"the exit-{HINT_EXIT_CODE} hint branch in finalize_foreground_result")
 
 
 def check_ssh(ssh) -> None:
@@ -102,10 +150,14 @@ def check_result(result_mod) -> None:
 
 
 def main() -> int:
-    for rel in ("tools/environments/ssh.py", "tools/terminal_tool_result.py"):
+    for rel in (SSH_RELATIVE, RESULT_RELATIVE):
         path = HERMES / rel
         if not path.is_file() or MARKER not in path.read_text(encoding="utf-8"):
             fail(f"{rel} does not carry the patch marker")
+    if (HERMES / SSH_RELATIVE).is_file():
+        check_ssh_source(HERMES / SSH_RELATIVE)
+    if (HERMES / RESULT_RELATIVE).is_file():
+        check_result_source(HERMES / RESULT_RELATIVE)
     ssh = _import("tools.environments.ssh")
     result_mod = _import("tools.terminal_tool_result")
     if ssh is not None:
