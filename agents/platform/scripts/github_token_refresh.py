@@ -661,10 +661,19 @@ def refresh_git_credentials(
         # The sidecar manages bounded retries against Minty internally.
         # The client uses a 60s timeout to allow the sidecar's retry budget
         # to finish, and fails fast on any error without re-triggering retries.
-        url = proxy_url.rstrip("/") + "/v1/github/refresh"
+        # The forge-neutral route, naming the provider and the repository by
+        # its URL rather than as a bare slug: a broker serving more than one
+        # forge refuses a name without a host. `/v1/github/refresh` is kept on
+        # the broker as an alias for agent images older than this.
+        url = proxy_url.rstrip("/") + "/v1/forge/refresh"
         request = urllib.request.Request(
             url,
-            data=json.dumps({"repository": repository}).encode("utf-8"),
+            data=json.dumps(
+                {
+                    "provider": "github",
+                    "repository": f"https://{repo_ref.GITHUB_CANONICAL_HOST}/{repository}",
+                }
+            ).encode("utf-8"),
             # Empty in the sidecar deployment; carries the caller's projected
             # ServiceAccount token when the broker runs in its own Pod.
             headers={"Content-Type": "application/json", **authorization_headers()},

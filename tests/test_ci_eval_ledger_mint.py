@@ -34,6 +34,7 @@ from tests.testing.common import get_isolated_test_env
 
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 _CI_EVAL_PR = _REPO_ROOT / "hack" / "ci-eval-pr.sh"
+_LEDGER_MINT = _REPO_ROOT / "hack" / "ledger_token_mint.py"
 
 # What the stub reports, mirroring _ledger_token_mint's own contract: the
 # retryable code is read out of the script rather than written here, because a
@@ -202,7 +203,7 @@ class LedgerMintRetryTest(unittest.TestCase):
 
 
 # Installed through PYTHONPATH: python imports sitecustomize at startup, so the
-# heredoc's urllib.request.urlopen is replaced before the mint runs. The
+# mint module's urllib.request.urlopen is replaced before the mint runs. The
 # request it was handed is written out for the test to read.
 _FAKE_URLOPEN = textwrap.dedent(
     '''
@@ -234,14 +235,14 @@ _FAKE_URLOPEN = textwrap.dedent(
 
 
 class LedgerMintRequestTest(unittest.TestCase):
-    """The Python half of _ledger_token_mint, run for real against a faked GitHub.
+    """hack/ledger_token_mint.py, run for real through _ledger_token_mint against a faked GitHub.
 
     The retry tests above stub the mint in shell, so the lines that turn
     LEDGER_MINT_BODY into the POST's data and Content-Type never ran under
     test, and a regression there -- `data=mint_data` dropped, the `if
     mint_body:` inverted -- would mint the installation's whole grant (issues:
     write on every pool repository since the ledger reset's grant) and stay
-    green. Here the real heredoc signs with a throwaway RSA key and posts to
+    green. Here the real mint module signs with a throwaway RSA key and posts to
     a urlopen installed through sitecustomize, and the request is asserted.
     """
 
@@ -261,10 +262,16 @@ class LedgerMintRequestTest(unittest.TestCase):
         (self.tmp / "sitecustomize.py").write_text(_FAKE_URLOPEN, encoding="utf-8")
         self.capture = self.tmp / "request.json"
 
-    def _mint(self, call, expect_rc=0):
+    def _mint(self, call, expect_rc=0, ids=None):
+        """ids: the EVAL_LEDGER_APP_ID / EVAL_LEDGER_INSTALLATION_ID pair to export,
+        None for the ledger-reader App's, or {} to export neither."""
         script = "\n".join(
             [
                 "set -euo pipefail",
+                # The mint module lives beside the script; the extracted
+                # constant finds it through the same SCRIPT_DIR the script sets.
+                f'SCRIPT_DIR="{_CI_EVAL_PR.parent}"',
+                _extract(r"^LEDGER_MINT_SCRIPT=[^\n]*$", "LEDGER_MINT_SCRIPT"),
                 _extract(r"^LEDGER_MINT_RETRYABLE=\d+$", "LEDGER_MINT_RETRYABLE"),
                 _extract(r"^LEDGER_MINT_ATTEMPTS=\d+$", "LEDGER_MINT_ATTEMPTS"),
                 _extract(r"^LEDGER_RESET_MINT_ATTEMPTS=\d+$", "LEDGER_RESET_MINT_ATTEMPTS"),
@@ -277,6 +284,11 @@ class LedgerMintRequestTest(unittest.TestCase):
                 call,
             ]
         )
+        exported = (
+            {"EVAL_LEDGER_APP_ID": "4739812", "EVAL_LEDGER_INSTALLATION_ID": "157029058"}
+            if ids is None
+            else ids
+        )
         proc = subprocess.run(
             ["bash", "-c", script],
             capture_output=True,
@@ -286,10 +298,13 @@ class LedgerMintRequestTest(unittest.TestCase):
                     "PYTHONPATH": str(self.tmp),
                     "MINT_CAPTURE_FILE": str(self.capture),
                     "EVAL_LEDGER_APP_KEY_FILE": str(self.key),
-                    "EVAL_LEDGER_APP_ID": "4739812",
-                    "EVAL_LEDGER_INSTALLATION_ID": "157029058",
                     "BENCH_GITHUB_TOKEN": "the-mounted-pat",
-                }
+                    **exported,
+                },
+                # A shell that has run the harness exports both ids; an id the
+                # caller did not name must be absent, not inherited, or the
+                # default case asserts the shell's value.
+                absent=[key for key in ("EVAL_LEDGER_APP_ID", "EVAL_LEDGER_INSTALLATION_ID") if key not in exported],
             ),
         )
         self.assertEqual(expect_rc, proc.returncode, proc.stderr)
@@ -321,6 +336,24 @@ class LedgerMintRequestTest(unittest.TestCase):
         self.assertEqual("application/json", seen["content_type"])
         self.assertIn("RESET=ghs_minted", proc.stdout)
 
+    def test_the_ids_come_from_the_environment_when_it_sets_them(self):
+        seen, _ = self._mint(
+            'mint_ledger_token "unit-under-test"',
+            ids={"EVAL_LEDGER_APP_ID": "424242", "EVAL_LEDGER_INSTALLATION_ID": "515151"},
+        )
+        self.assertIn("/app/installations/515151/access_tokens", seen["url"])
+
+    def test_the_ids_default_to_the_ledger_reader_app(self):
+        """Step 0 (hack/ci-revalidate.sh) exports neither id and calls the
+        module with a body alone, so what it mints with is the module's own
+        default -- which test_verify_ci_pool_project holds to the verifier's
+        and the harness's copies. mint_ledger_token itself logs the exported
+        ids, so the step-0 shape is the module through _ledger_token_mint."""
+        seen, _ = self._mint(
+            'LEDGER_MINT_BODY="${LEDGER_GRADING_MINT_BODY}" _ledger_token_mint >/dev/null', ids={}
+        )
+        self.assertIn("/app/installations/157029058/access_tokens", seen["url"])
+
     def test_a_bodiless_mint_is_refused_rather_than_sent(self):
         # The endpoint's contract: no body, the installation's whole grant --
         # issues: write on every pool repository. A caller that forgets the
@@ -334,7 +367,7 @@ class LedgerMintRequestTest(unittest.TestCase):
 class LedgerMintContractTest(unittest.TestCase):
     """The two halves of the retry live in different languages.
 
-    The shell decides what it retries; the python inside _ledger_token_mint
+    The shell decides what it retries; the python in hack/ledger_token_mint.py
     decides what is retryable. A literal written twice would let them drift
     into a mint that retries a wrong PEM three times, or reports a network
     blip as a credential fault.
@@ -342,11 +375,11 @@ class LedgerMintContractTest(unittest.TestCase):
 
     def test_the_python_is_handed_the_retryable_code_rather_than_repeating_it(self):
         body = _extract(r"^_ledger_token_mint\(\) \{.*?^\}", "_ledger_token_mint")
-        self.assertIn('python3 - "${LEDGER_MINT_RETRYABLE}"', body)
-        self.assertIn("retryable = int(sys.argv[1])", body)
+        self.assertIn('python3 "${LEDGER_MINT_SCRIPT}" "${LEDGER_MINT_RETRYABLE}"', body)
+        self.assertIn("retryable = int(sys.argv[1])", _LEDGER_MINT.read_text(encoding="utf-8"))
 
     def test_a_credential_answer_from_github_is_terminal(self):
-        body = _extract(r"^_ledger_token_mint\(\) \{.*?^\}", "_ledger_token_mint")
+        body = _LEDGER_MINT.read_text(encoding="utf-8")
         branch = re.search(r"except urllib\.error\.HTTPError.*?^except", body, re.S | re.M)
         self.assertIsNotNone(branch, "could not find the HTTPError branch")
         # Server-side and rate-limited answers retry; every other status, which
@@ -356,7 +389,7 @@ class LedgerMintContractTest(unittest.TestCase):
         self.assertIn("sys.exit(message)", branch.group(0))
 
     def test_an_unreachable_api_is_retryable(self):
-        body = _extract(r"^_ledger_token_mint\(\) \{.*?^\}", "_ledger_token_mint")
+        body = _LEDGER_MINT.read_text(encoding="utf-8")
         branch = re.search(r"^except Exception as exc:.*?^print\(", body, re.S | re.M)
         self.assertIsNotNone(branch, "could not find the catch-all branch")
         self.assertIn("temporary(", branch.group(0))

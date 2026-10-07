@@ -1,0 +1,293 @@
+{
+  "t_0b3e2481": {
+    "cluster": "seeded-c",
+    "findings": [
+      {
+        "area": "reliability",
+        "issue": "Missing liveness/readiness probes in multiple workloads.",
+        "namespace": "kube-system",
+        "recommendation": "Configure liveness and readiness probes for event-exporter-gke, konnectivity-agent-autoscaler, and l7-default-backend.",
+        "severity": "medium"
+      },
+      {
+        "area": "reliability",
+        "issue": "Missing resource requests/limits in multiple workloads.",
+        "namespace": "kube-system",
+        "recommendation": "Define explicit CPU/memory requests and limits for event-exporter-gke, konnectivity-agent-autoscaler, and l7-default-backend.",
+        "severity": "medium"
+      }
+    ],
+    "gaps": [],
+    "location": "us-central1-a",
+    "namespace_governance": [
+      {
+        "limit_range": false,
+        "namespace": "default",
+        "network_policy": false,
+        "resource_quota": false
+      },
+      {
+        "limit_range": false,
+        "namespace": "gke-managed-cim",
+        "network_policy": false,
+        "resource_quota": true
+      },
+      {
+        "limit_range": false,
+        "namespace": "gke-managed-networking-dra-driver",
+        "network_policy": false,
+        "resource_quota": true
+      },
+      {
+        "limit_range": false,
+        "namespace": "gke-managed-system",
+        "network_policy": false,
+        "resource_quota": true
+      },
+      {
+        "limit_range": false,
+        "namespace": "kube-system",
+        "network_policy": false,
+        "resource_quota": true
+      }
+    ],
+    "project": "example-project",
+    "topology": {
+      "dataplane_v2": true,
+      "deployment_toolchain": "none observed",
+      "k8s_version": "v1.35.8-gke.1225000",
+      "node_pools": [
+        {
+          "autoscaling": "unknown",
+          "machine_type": "unknown",
+          "name": "default-pool",
+          "nodes": 1
+        }
+      ],
+      "observability": "gke-managed-otel",
+      "workload_identity": true
+    },
+    "workloads": [
+      {
+        "hpa": false,
+        "kind": "Deployment",
+        "name": "gmp-operator",
+        "namespace": "gmp-system",
+        "probes": {
+          "liveness": true,
+          "readiness": true,
+          "startup": false
+        },
+        "replicas": "1/1",
+        "resources": {
+          "limits": true,
+          "qos": "BestEffort",
+          "requests": true
+        },
+        "security_context": {
+          "added_capabilities": [],
+          "host_network": false,
+          "host_pid": false,
+          "privileged": false,
+          "read_only_root_fs": true,
+          "run_as_non_root": true
+        },
+        "telemetry": "none"
+      }
+    ]
+  },
+  "t_5ca49c4e": {
+    "cluster": "seeded-b",
+    "findings": [],
+    "gaps": [],
+    "location": "us-central1-a",
+    "namespace_governance": [],
+    "project": "example-project",
+    "topology": {
+      "dataplane_v2": true,
+      "deployment_toolchain": "none observed",
+      "k8s_version": "1.34.11-gke.1209000",
+      "node_pools": [
+        {
+          "autoscaling": "unknown",
+          "machine_type": "unknown",
+          "name": "default-pool",
+          "nodes": 1
+        }
+      ],
+      "observability": "gke-managed-otel",
+      "workload_identity": true
+    },
+    "workloads": []
+  },
+  "t_ccbfda55": {
+    "cluster": "seeded-a",
+    "findings": [
+      {
+        "area": "reliability",
+        "issue": "Workload 'inference-server' lacks liveness/readiness/startup probes.",
+        "namespace": "seeded-capacity",
+        "recommendation": "Configure comprehensive health probes.",
+        "severity": "medium"
+      },
+      {
+        "area": "reliability",
+        "issue": "Workload 'payments-api' lacks liveness/readiness/startup probes.",
+        "namespace": "seeded-debug",
+        "recommendation": "Configure comprehensive health probes.",
+        "severity": "medium"
+      },
+      {
+        "area": "reliability",
+        "issue": "Workload 'checkout-gateway' lacks liveness/readiness/startup probes.",
+        "namespace": "seeded-reliability",
+        "recommendation": "Configure comprehensive health probes.",
+        "severity": "medium"
+      }
+    ],
+    "gaps": [],
+    "location": "us-central1-a",
+    "namespace_governance": [
+      {
+        "limit_range": false,
+        "namespace": "default",
+        "network_policy": false,
+        "resource_quota": false
+      },
+      {
+        "limit_range": false,
+        "namespace": "gke-managed-cim",
+        "network_policy": false,
+        "resource_quota": false
+      },
+      {
+        "limit_range": false,
+        "namespace": "gke-managed-networking-dra-driver",
+        "network_policy": false,
+        "resource_quota": false
+      },
+      {
+        "limit_range": false,
+        "namespace": "gke-managed-system",
+        "network_policy": false,
+        "resource_quota": false
+      },
+      {
+        "limit_range": false,
+        "namespace": "gke-managed-volumepopulator",
+        "network_policy": false,
+        "resource_quota": false
+      },
+      {
+        "limit_range": false,
+        "namespace": "gmp-public",
+        "network_policy": false,
+        "resource_quota": false
+      },
+      {
+        "limit_range": false,
+        "namespace": "gmp-system",
+        "network_policy": false,
+        "resource_quota": false
+      },
+      {
+        "limit_range": false,
+        "namespace": "kube-node-lease",
+        "network_policy": false,
+        "resource_quota": false
+      },
+      {
+        "limit_range": false,
+        "namespace": "kube-public",
+        "network_policy": false,
+        "resource_quota": false
+      },
+      {
+        "limit_range": false,
+        "namespace": "kube-system",
+        "network_policy": false,
+        "resource_quota": false
+      },
+      {
+        "limit_range": false,
+        "namespace": "seeded-capacity",
+        "network_policy": true,
+        "resource_quota": false
+      },
+      {
+        "limit_range": false,
+        "namespace": "seeded-debug",
+        "network_policy": true,
+        "resource_quota": false
+      },
+      {
+        "limit_range": false,
+        "namespace": "seeded-deprecation",
+        "network_policy": true,
+        "resource_quota": false
+      },
+      {
+        "limit_range": false,
+        "namespace": "seeded-reliability",
+        "network_policy": true,
+        "resource_quota": false
+      },
+      {
+        "limit_range": false,
+        "namespace": "seeded-security",
+        "network_policy": false,
+        "resource_quota": false
+      }
+    ],
+    "project": "example-project",
+    "topology": {
+      "dataplane_v2": true,
+      "deployment_toolchain": "none observed",
+      "k8s_version": "v1.35.8-gke.1225000",
+      "node_pools": [
+        {
+          "autoscaling": "none",
+          "machine_type": "e2-medium",
+          "name": "default-pool",
+          "nodes": 1
+        },
+        {
+          "autoscaling": "none",
+          "machine_type": "e2-small",
+          "name": "pinned-inference-pool",
+          "nodes": 1
+        }
+      ],
+      "observability": "gke-managed-otel",
+      "workload_identity": true
+    },
+    "workloads": [
+      {
+        "hpa": false,
+        "kind": "Deployment",
+        "name": "gmp-operator",
+        "namespace": "gmp-system",
+        "probes": {
+          "liveness": true,
+          "readiness": true,
+          "startup": false
+        },
+        "replicas": "1/1",
+        "resources": {
+          "limits": true,
+          "qos": "Burstable",
+          "requests": true
+        },
+        "security_context": {
+          "added_capabilities": [],
+          "host_network": false,
+          "host_pid": false,
+          "privileged": false,
+          "read_only_root_fs": true,
+          "run_as_non_root": true
+        },
+        "telemetry": "none"
+      }
+    ]
+  }
+}

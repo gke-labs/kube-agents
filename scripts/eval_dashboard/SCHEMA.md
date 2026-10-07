@@ -116,8 +116,8 @@ the same layout and is collected from the moment it starts running.
 - `duration_s` — the `Total Duration` of the final
   `PR Smoke Test Evaluation Succeeded/Failed` line (eval loop only). A
   truncated log has no verdict line — and neither does a `SUCCESS` build that
-  `hack/ci-eval-pr.sh`'s step-0 revalidation ended before the eval loop; then
-  it falls back to `finished − started` (which also counts provisioning).
+  step 0 (`hack/ci-revalidate.sh`) ended before the eval loop; then
+  it falls back to `finished − started` (which also counts provisioning, when there was any).
 - `tasks[]` — one entry per `Task <name> Result:` line, in log order (a
   verdict outside the vocabulary below — `[EXPECTED_FAIL]`, which no
   `task.yaml` sets, and `[NOT_GRADED_ON_TRANSPORT]`, the inject lane's word

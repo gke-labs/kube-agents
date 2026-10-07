@@ -37,10 +37,12 @@ The shipped path is four stages, described in full by the
 [`bootstrap_onboarding` README](../../agents/chat/defaults/plugins/bootstrap_onboarding/README.md)
 and the site's [ChatOps concepts page](../site/src/content/docs/concepts/chatops.md), which are
 canonical for it. In outline: `bootstrap_scan_gate.py` files a kanban card to `platform`; that
-worker follows `inventory.md` and writes the complete findings to `/opt/data/INVENTORY.raw.md`; a
+worker follows `inventory.md` and lists the fleet, while the gate files one audit card per Cluster Agent; once their cards settle,
+`bootstrap_handoff.py` writes the complete findings to `/opt/data/INVENTORY.raw.md`; a
 second card follows `inventory_prioritize_sop.md`, collapsing duplicates and ranking everything
 before rendering at most five items to `/opt/data/INVENTORY.md`; `bootstrap_delivery.py` posts that
-file to chat verbatim. The cap has one exception, which matters to the argument below: when
+file to chat verbatim (on Slack with `KAGE_SLACK_UX` on, laid out again by a fixed script that keeps
+the top two findings and every critical one, or the whole list when it runs past five, each with its sentence as written). The cap has one exception, which matters to the argument below: when
 critical findings alone exceed five they are never capped and never rolled up, so the list is
 exactly those criticals. A fleet with six criticals gets all six; a fleet with one critical and
 forty gaps gets five.
@@ -428,8 +430,9 @@ over two of those fields and stays correct through a re-rank by construction. A 
 column would be a second copy of the same fact, free to disagree with the vector the moment §4.6's
 re-rank moves L.
 
-The threshold is load-bearing in one place. `critical` is one of the three conditions on the
-auto-promotion sweep in `finish`, which is what opens a pull request without being asked. It is
+The threshold is load-bearing in one place. A `critical` grade always clears the severity floor of
+the auto-promotion sweep in `finish`, which is what opens a pull request without being asked (`major`
+clears it only on the few checks `MAJOR_SWEEP_CHECKS` names). It is
 **not** a condition on `remediate`, which passes `auto_promote=False` and "opens what was named and
 nothing else" — and `remediate` is the call §9 puts on this path. So on the queue's own path the
 threshold decides nothing about promotion; it decides what the surfaced message calls the finding,
@@ -553,8 +556,8 @@ the raw file's prose and make the registration call itself, it lost findings thr
 for itself what counted as a finding, so two instrumented runs over the same nine-finding file
 registered seven and three, and not the same three; a batch rejected for one missing field came
 back one field at a time and was abandoned; and one accepted call read as done. Enumeration is not a
-judgement, so the sweep writes the findings as a machine-readable block
-(`inventory.md` Step 4) and `agents/platform/scripts/inventory_findings.py` owns both ends —
+judgement, so the findings travel as a machine-readable block, written by
+`bootstrap_handoff.py` from the Cluster Agents' structured results, and `agents/platform/scripts/inventory_findings.py` owns both ends —
 `extract` produces the numbered set, `register` refuses to send anything until every number carries
 a score. The stage's judgement is scoring, which is the part that needs a model.
 
@@ -1175,7 +1178,8 @@ the smaller change and leaves one vocabulary.
 
 It does not replace the audit ledgers. It builds no new remediation-PR machinery, reusing
 `remediate` wholesale. It leaves the shape of the first-time report alone — the delivered
-`INVENTORY.md` keeps its five-item cap and is still posted verbatim, and its `Also found: N items`
+`INVENTORY.md` keeps its five-item cap and is still posted verbatim (laid out again on Slack
+with `KAGE_SLACK_UX` on, down to the top two findings and every critical one, or the whole list past five, as written), and its `Also found: N items`
 line gains a link to the backlog (§5). What does change is which five: §5 renders the report from
 what the sweep registered, so §4's single scale decides the order and §4.2's thresholds supply the
 severity word, where `inventory_prioritize_sop.md` today preserves the severity each finding was

@@ -18,7 +18,8 @@ output "scoped_service_accounts" {
   description = <<-EOT
     Map from project id to the email of the pool member for it: one entry per
     project the plan listed in the scope while scoped_pool_enabled is true,
-    the host project included, and empty otherwise. The key is the same
+    the host project and each declared container's listed members
+    (scope_container_members) included, and empty otherwise. The key is the same
     string the credential broker looks up, so this output is directly
     comparable with the broker's mapping. The accounts hold no IAM grant; see
     scoped_pool.tf.

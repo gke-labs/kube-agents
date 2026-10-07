@@ -3102,9 +3102,9 @@ print_generate_only_handoff() {
   echo -e "  # schema lacks is otherwise pruned from the PlatformAgent for good."
   echo -e "  gcloud container clusters get-credentials ${cluster_name} --location ${region} --project ${project_id}"
   echo -e "  kubectl --context $(gke_context_name) apply --server-side --force-conflicts -f ${repo_dir}/charts/kube-agents/crds/"
-  if [[ "${SCOPE_SHARED_VPC_HOSTS:-}${SCOPE_METRICS_SCOPES:-}" == *[![:space:],]* ]]; then
-    echo -e "  # A Shared VPC host or Metrics Scope is declared: the plan resolves it by reading APIs the"
-    echo -e "  # apply below is what enables, so on a first install enable them first, or the plan is refused:"
+  if [ -n "$(scope_selector_apis)" ]; then
+    echo -e "  # The plan $(scope_selector_apis_reason) by reading APIs the apply below is what"
+    echo -e "  # enables, so on a first install enable them first, or the plan is refused:"
     echo -e "  gcloud services enable $(scope_selector_apis) --project=${project_id}"
   fi
   echo -e "  cd ${repo_dir}/terraform/examples/full-install"
@@ -5988,13 +5988,14 @@ main() {
           print_info "To remediate manually beforehand, update each legacy node pool:"
           print_info "  gcloud container node-pools update <pool-name> --cluster $cluster_name --location $region --project $project_id --workload-metadata=GKE_METADATA"
         fi
-      elif [[ "${SCOPE_SHARED_VPC_HOSTS:-}${SCOPE_METRICS_SCOPES:-}" == *[![:space:],]* ]] \
+      elif [ -n "$(scope_selector_apis)" ] \
         && missing_apis="$(scope_selector_apis_missing "$project_id")" && [ -n "$missing_apis" ]; then
-        # The plan resolves a declared Shared VPC host or Metrics Scope by
+        # The plan resolves a declared Shared VPC host or Metrics Scope, and
+        # lists a folder's or organisation's members for an armed pool, by
         # reading APIs a real run enables prior to apply; a dry run enables
         # nothing, so its plan would be refused for a reason the real run
         # does not have. A listing that failed runs the plan and lets it speak.
-        print_warning "Dry-run: skipping terraform plan because ${missing_apis// /, } is not enabled in project '$project_id', and the plan resolves the declared Shared VPC host or Metrics Scope through it (a real run enables it prior to apply)."
+        print_warning "Dry-run: skipping terraform plan because ${missing_apis// /, } is not enabled in project '$project_id', and the plan $(scope_selector_apis_reason) through it (a real run enables it prior to apply)."
         print_info "To preview anyway, enable it first: gcloud services enable ${missing_apis} --project=${project_id}"
       else
         # Reached with an unenforcing cluster only under --accept-no-network-policy,

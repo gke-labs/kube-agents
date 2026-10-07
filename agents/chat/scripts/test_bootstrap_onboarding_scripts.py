@@ -3,10 +3,10 @@
 Run: python3 -m unittest agents/chat/scripts/test_bootstrap_onboarding_scripts.py
 
 Covers the deterministic decision + I/O logic of:
-  - bootstrap_delivery.py  (no_agent delivery of INVENTORY.md, exactly once)
-  - bootstrap_scan_gate.py (files the sweep as a kanban task listing a
-                            kanban_create call for each ready Cluster Agent;
-                            stops re-filing)
+  - bootstrap_delivery.py  (no_agent delivery of INVENTORY.md, claimed once)
+  - bootstrap_scan_gate.py (files the sweep as a kanban task listing the
+                            ready Cluster Agents, whose cards the hand-off
+                            files; stops re-filing)
 
 The in-process job removal in bootstrap_delivery._retire_jobs imports
 cron.jobs, which is unavailable here; its import is guarded, so it is a no-op
@@ -549,20 +549,19 @@ class ScanGateTest(unittest.TestCase):
         self.assertEqual(self.filed, [])
         self.assertEqual(out, "")
 
-    def test_body_hands_ranking_to_a_separate_card(self):
-        """Ranking must not happen inside the sweep.
+    def test_body_leaves_the_raw_file_and_ranking_to_the_hand_off(self):
+        """The worker lists the fleet and completes; bootstrap_handoff.py does the rest.
 
-        The delivered report has to be produced from the raw findings alone. A
-        worker that ranks inline ranks against its own sweep transcript too, so
-        the same findings yield a different report depending on how the sweep
-        went — which is exactly what a fresh card prevents.
+        Asked to wait, compile and hand off, the worker had no tool that waits,
+        typed the raw file without its findings block, and filed the ranking card
+        without its key.
         """
         body = bootstrap_scan_gate._task_body()
-        self.assertIn(bootstrap_scan_gate.RAW_INVENTORY_PATH, body)
-        self.assertIn(bootstrap_scan_gate.PRIORITIZE_IDEMPOTENCY_KEY, body)
-        for path in bootstrap_scan_gate.PRIORITIZE_INSTRUCTIONS_PATHS:
-            self.assertIn(path, body)
-        self.assertIn("Do not rank the findings yourself", body)
+        self.assertIn(f"do not write `{bootstrap_scan_gate.RAW_INVENTORY_PATH}`", body)
+        self.assertIn("do not file a ranking card", body)
+        self.assertIn("Do not wait for the per-cluster cards", body)
+        self.assertNotIn("sleep 60", body)
+        self.assertNotIn(bootstrap_scan_gate.PRIORITIZE_IDEMPOTENCY_KEY, body)
 
     def test_child_cards_are_pointed_at_the_per_cluster_audit_sop(self):
         """Without the SOP path the child body is written freehand.
@@ -592,32 +591,28 @@ class ScanGateTest(unittest.TestCase):
         self.assertEqual(bootstrap_scan_gate.INVENTORY_PATH, "/opt/data/INVENTORY.md")
         self.assertIn("/opt/data/INVENTORY.md", bootstrap_scan_gate._task_body())
 
-    def test_body_drives_per_cluster_fan_out_and_leaves_no_cluster_uncovered(self):
-        """The sweep must scale per cluster and must not leave a hole.
+    def test_body_leaves_cluster_agents_to_the_gate_and_audits_the_rest(self):
+        """The sweep must not leave a hole.
 
         Cluster Agents are pinned read-only to one cluster each. Which clusters
-        get one is reconcile's decision, not this body's, so the body delegates
-        every cluster on the roster and audits only what the roster missed.
+        get one is reconcile's decision, and the gate files their cards, so the
+        body audits only what the roster missed.
         """
         body = bootstrap_scan_gate._task_body()
         self.assertIn(bootstrap_scan_gate.RECONCILE_SCRIPT_NAME, body)  # roster first
-        self.assertIn("did not cover yourself", body)  # no silent hole
-        self.assertIn("kanban_create", body)  # one child per cluster
-        # The sweep card waits for its children and synthesizes their results
-        # itself; completing on a dispatch receipt is the #1010 defect, and the
-        # retired aggregation-card handoff must not creep back into the body.
-        self.assertIn("wait for the children", body)
-        self.assertIn("kanban_show", body)
+        self.assertIn("audit the clusters the list does not cover", body)  # no silent hole
+        self.assertIn("do not fan out; the gate has", body)  # the gate files one card per cluster
+        # The fleet list is how the hand-off names a cluster nobody reported on.
+        self.assertIn("`fleet`", body)
         self.assertNotIn("aggregation card", body)
         self.assertIn("metadata", body)  # structured child results
 
-    def test_step_2_lists_one_exact_call_per_cluster_agent(self):
+    def test_step_2_lists_each_cluster_agent_the_gate_files(self):
         """The gate reads the roster because the sweep's worker cannot (#1872).
 
         The worker's terminal runs in the shell sandbox, which has no `hermes`,
-        and whose /opt/data/profiles is a mirror without any config.yaml. Sent to
-        read the roster there, the worker blocked on 0.6.0; on main it listed the
-        mirror's directories and fanned out from that.
+        and whose /opt/data/profiles is a mirror without any config.yaml: read
+        there, the roster is either an error or the mirror's directories.
         """
         short = self._cluster_agent("proj", "prod", "us-east4")
         # Long enough that profile_name() truncates and hashes it: the key is the
@@ -628,10 +623,13 @@ class ScanGateTest(unittest.TestCase):
         self.assertNotIn("us-central1-a", hashed)
         step2 = self._step_2(bootstrap_scan_gate._task_body())
         prefix = bootstrap_scan_gate.CLUSTER_IDEMPOTENCY_KEY_PREFIX
-        self.assertIn(f"kanban_create(assignee='{short}', idempotency_key='{prefix}{short}'", step2)
-        self.assertIn(f"kanban_create(assignee='{hashed}', idempotency_key='{prefix}{hashed}'", step2)
-        self.assertIn("title='Report cluster inventory: `prod` (`proj`, `us-east4`)'", step2)
-        self.assertEqual(step2.count("kanban_create("), 2)
+        agents = {a["name"]: a for a in bootstrap_scan_gate.cluster_agents()}
+        self.assertEqual(sorted(agents), sorted([short, hashed]))
+        self.assertEqual(agents[short]["key"], f"{prefix}{short}")
+        self.assertEqual(agents[hashed]["key"], f"{prefix}{hashed}")
+        self.assertEqual(agents[short]["title"], "Report cluster inventory: `prod` (`proj`, `us-east4`)")
+        self.assertIn(f"`{short}`", step2)
+        self.assertIn(f"`{hashed}`", step2)
         self.assertNotIn("/opt/hermes", step2)
         self.assertNotIn("profile list", step2)
 
@@ -640,8 +638,7 @@ class ScanGateTest(unittest.TestCase):
         # shared key hands the second Cluster Agent the first one's card.
         self._cluster_agent("proj-a", "prod", "us-central1")
         self._cluster_agent("proj-b", "prod", "us-central1")
-        step2 = self._step_2(bootstrap_scan_gate._task_body())
-        keys = re.findall(r"idempotency_key='([^']+)'", step2)
+        keys = [a["key"] for a in bootstrap_scan_gate.cluster_agents()]
         self.assertEqual(len(keys), 2)
         self.assertEqual(len(set(keys)), 2)
 
@@ -652,10 +649,9 @@ class ScanGateTest(unittest.TestCase):
         # directory name differs, which the key must follow.
         first = self._cluster_agent("proj-a", "b", "us-central1")
         second = self._cluster_agent("proj", "a-b", "us-central1", name="cluster-proj-a-b-us-central1-2")
-        step2 = self._step_2(bootstrap_scan_gate._task_body())
         prefix = bootstrap_scan_gate.CLUSTER_IDEMPOTENCY_KEY_PREFIX
         self.assertEqual(
-            re.findall(r"idempotency_key='([^']+)'", step2), [f"{prefix}{first}", f"{prefix}{second}"]
+            [a["key"] for a in bootstrap_scan_gate.cluster_agents()], [f"{prefix}{first}", f"{prefix}{second}"]
         )
 
     def test_step_2_leaves_out_what_is_not_a_cluster_agent(self):
@@ -674,20 +670,17 @@ class ScanGateTest(unittest.TestCase):
             (unstamped / marker).write_text("")
         with contextlib.redirect_stderr(io.StringIO()):
             step2 = self._step_2(bootstrap_scan_gate._task_body())
-        self.assertNotIn("kanban_create(", step2)
+            self.assertEqual(bootstrap_scan_gate.cluster_agents(), [])
         self.assertIn("    (none)", step2)
-        self.assertIn("If no calls are listed above", step2)
+        self.assertIn("If the list above is `(none)`", step2)
 
-    def test_the_fan_out_calls_carry_no_parents(self):
-        # A card whose parent is the sweep card cannot start until the sweep card
-        # completes, so the #1174 guard lets the sweep card complete over it: the
-        # sweep closed on a dispatch receipt and nothing read the audits (#1872).
+    def test_the_sweep_is_told_not_to_file_cluster_cards(self):
+        # The gate files them: asked to make the calls itself, the worker once
+        # completed saying it had fanned out to seven clusters and had filed none.
         self._cluster_agent("proj", "prod", "us-east4")
         step2 = self._step_2(bootstrap_scan_gate._task_body())
-        calls = [line for line in step2.splitlines() if "kanban_create(" in line]
-        self.assertEqual(len(calls), 1)
-        self.assertNotIn("parents", calls[0])
-        self.assertIn("Pass no `parents`", step2)
+        self.assertIn("Do not create cluster cards", step2)
+        self.assertNotIn("kanban_create(", step2)
 
     def test_step_2_leaves_out_a_profile_whose_scaffold_did_not_finish(self):
         # Hermes never registered the first, so a card assigned to it is never
@@ -698,10 +691,8 @@ class ScanGateTest(unittest.TestCase):
         half_built = self._cluster_agent("proj", "half", "us-east4", artifacts=())
         stderr = io.StringIO()
         with contextlib.redirect_stderr(stderr):
-            step2 = self._step_2(bootstrap_scan_gate._task_body())
-        calls = [line for line in step2.splitlines() if "kanban_create(" in line]
-        self.assertEqual(len(calls), 1)
-        self.assertIn(f"assignee='{ready}'", calls[0])
+            names = [a["name"] for a in bootstrap_scan_gate.cluster_agents()]
+        self.assertEqual(names, [ready])
         self.assertIn(f"{unregistered}: scaffold not finished", stderr.getvalue())
         self.assertIn(f"{half_built}: scaffold not finished", stderr.getvalue())
 
@@ -724,10 +715,8 @@ class ScanGateTest(unittest.TestCase):
         (bad / "config.yaml").write_text("- a\n")
         stderr = io.StringIO()
         with contextlib.redirect_stderr(stderr):
-            step2 = self._step_2(bootstrap_scan_gate._task_body())
-        calls = [line for line in step2.splitlines() if "kanban_create(" in line]
-        self.assertEqual(len(calls), 1)
-        self.assertIn(f"assignee='{good}'", calls[0])
+            names = [a["name"] for a in bootstrap_scan_gate.cluster_agents()]
+        self.assertEqual(names, [good])
         self.assertIn("cluster-broken: ", stderr.getvalue())
         self.assertNotIn("cluster-broken: scaffold not finished", stderr.getvalue())
 
@@ -747,17 +736,15 @@ class ScanGateTest(unittest.TestCase):
 
         stderr = io.StringIO()
         with mock.patch.object(Path, "is_file", _is_file), contextlib.redirect_stderr(stderr):
-            step2 = self._step_2(bootstrap_scan_gate._task_body())
-        calls = [line for line in step2.splitlines() if "kanban_create(" in line]
-        self.assertEqual(len(calls), 1)
-        self.assertIn(f"assignee='{good}'", calls[0])
+            names = [a["name"] for a in bootstrap_scan_gate.cluster_agents()]
+        self.assertEqual(names, [good])
         self.assertIn(f"skipping Cluster Agent {locked}: [Errno {errno.EACCES}] Permission denied", stderr.getvalue())
 
     def test_the_card_lists_the_roster_the_reconcile_left(self):
         """The roster is read after the gate's own reconcile, not before it.
 
         On a fresh install no profile exists until that reconcile creates it, so
-        a list taken any earlier is empty and the sweep fans out to nobody.
+        a list taken any earlier is empty and no Cluster Agent card is filed.
         """
         bootstrap_scan_gate.file_scan_task = self._orig
         script = self.d / "scripts" / bootstrap_scan_gate.RECONCILE_SCRIPT_NAME
@@ -779,7 +766,7 @@ class ScanGateTest(unittest.TestCase):
             self._run()
         self.assertEqual(len(filed), 1)
         args = shlex.split(filed[0])
-        self.assertIn(f"kanban_create(assignee='{created[0]}'", args[args.index("--body") + 1])
+        self.assertIn(f"`{created[0]}`", args[args.index("--body") + 1])
 
     def test_body_forbids_improvising_around_a_failed_step(self):
         """The 32-call roster loop is what this prevents.
@@ -792,10 +779,10 @@ class ScanGateTest(unittest.TestCase):
         body = bootstrap_scan_gate._task_body()
         self.assertIn("treat its answer as empty", body)
         self.assertIn("do not improvise", body.lower())
-        self.assertIn("exactly once", body)
+        self.assertIn("Discovery steps run ONCE", body)
 
     def test_reconcile_runs_before_the_sweep_is_filed(self):
-        """A sweep filed against a not-yet-reconciled roster fans out to nobody.
+        """A sweep filed against a not-yet-reconciled roster gets no Cluster Agent cards.
 
         `cluster-agent-reconcile` is on `11 * * * *` and this gate is on
         `* * * * *`, so on a fresh install the gate reaches an empty roster up to
@@ -1019,7 +1006,7 @@ class ScanGateTest(unittest.TestCase):
         self.assertIn("may be empty or incomplete", body)
         # The degradation has to reach the user: the report is delivered verbatim.
         self.assertIn("names each one as lacking an agent", body)
-        self.assertIn("file it anyway", body)
+        self.assertIn("complete the card anyway", body)
 
     def test_body_degrades_when_no_cluster_agents_exist(self):
         # A single-cluster install reconciles to an empty roster, and that is the
@@ -1027,7 +1014,7 @@ class ScanGateTest(unittest.TestCase):
         # than fanning out to an empty roster and writing nothing.
         body = bootstrap_scan_gate._task_body()
         self.assertIn("there are no Cluster Agents", body)
-        self.assertIn("do the whole sweep yourself", body)
+        self.assertIn("audit every cluster yourself in Step 3", body)
         # The workload checks live only in the single-cluster SOP now, so the solo
         # walk has to be sent there or it produces a topology table with empty
         # workload columns — the empty report this card exists to prevent.
@@ -1037,16 +1024,41 @@ class ScanGateTest(unittest.TestCase):
         # the one path where no Cluster Agent supplies them.
         self.assertIn("Steps 2 to 4 of the single-cluster audit SOP", body)
 
-    def test_body_propagates_idempotency_keys_to_the_fan_out(self):
-        # The root card is guarded by a marker and a key; the cards it spawns
-        # are guarded only by what these instructions tell the worker to set.
-        # (The aggregation card's key went with the fan-in shape, #1010: the
-        # sweep card now waits for its children and writes the findings itself,
-        # so the only spawned cards left are per-cluster and prioritize.)
+    def test_cluster_cards_are_keyed_by_profile_name(self):
+        # The gate re-files a missing card every tick until the hand-off; the
+        # key is what keeps a repeat from duplicating one.
         name = self._cluster_agent("proj", "prod", "us-east4")
-        body = bootstrap_scan_gate._task_body()
-        self.assertIn(f"{bootstrap_scan_gate.CLUSTER_IDEMPOTENCY_KEY_PREFIX}{name}", body)
-        self.assertIn(bootstrap_scan_gate.PRIORITIZE_IDEMPOTENCY_KEY, body)
+        keys = [a["key"] for a in bootstrap_scan_gate.cluster_agents()]
+        self.assertEqual(keys, [f"{bootstrap_scan_gate.CLUSTER_IDEMPOTENCY_KEY_PREFIX}{name}"])
+
+    def test_a_filed_sweep_runs_the_hand_off_instead_of_filing(self):
+        (self.d / SCAN_FILED).write_text("task_id=t_sweep\nfiled_at=1\n")
+        with mock.patch.object(bootstrap_scan_gate.bootstrap_handoff, "hand_off") as hand_off:
+            rc, out = self._run()
+        self.assertEqual((rc, out, self.filed), (0, "", []))
+        hand_off.assert_called_once_with(
+            self.d, self.d / SCAN_FILED, bootstrap_scan_gate._parse_task_id, roster=bootstrap_scan_gate.cluster_agents
+        )
+
+    def test_filing_the_sweep_files_the_cluster_cards_in_the_same_tick(self):
+        with mock.patch.object(bootstrap_scan_gate.bootstrap_handoff, "hand_off") as hand_off:
+            self._run()
+        self.assertEqual(len(self.filed), 1)
+        hand_off.assert_called_once()
+        self.assertIs(hand_off.call_args.kwargs["roster"], bootstrap_scan_gate.cluster_agents)
+
+    def test_a_failing_hand_off_does_not_fail_the_cron_run(self):
+        (self.d / SCAN_FILED).write_text("task_id=t_sweep\nfiled_at=1\n")
+        with mock.patch.object(bootstrap_scan_gate.bootstrap_handoff, "hand_off", side_effect=TypeError("bad metadata")):
+            rc, out = self._run()
+        self.assertEqual((rc, out), (0, ""))
+
+    def test_no_hand_off_once_the_report_is_delivered(self):
+        (self.d / SCAN_FILED).write_text("task_id=t_sweep\nfiled_at=1\n")
+        (self.d / COMPLETED).write_text("")
+        with mock.patch.object(bootstrap_scan_gate.bootstrap_handoff, "hand_off") as hand_off:
+            self._run()
+        hand_off.assert_not_called()
 
     def test_parses_task_id_from_either_response_shape(self):
         # --json is what we ask for, but run_slash hands back stdout and stderr
@@ -1157,7 +1169,7 @@ class ScopeGapParagraphTest(unittest.TestCase):
         with mock.patch.object(bootstrap_scan_gate, "_data_dir", return_value=data_dir):
             body = bootstrap_scan_gate._task_body()
         self.assertIn("`locked` (denied)", body)
-        # It sits between the roster caveat and Step 2, where the fan-out reads it.
+        # It sits between the roster caveat and Step 2, which lists the roster.
         self.assertLess(body.index("`locked` (denied)"), body.index("**Step 2"))
 
 

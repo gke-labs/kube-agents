@@ -226,14 +226,19 @@ def _event_id(prefix: str, *parts: object) -> str:
 
 
 def _logging_payload(row: dict[str, Any]) -> tuple[dict[str, Any], str]:
-    """The audit record in ``row`` and the Hermes line prefix it was written behind.
+    """The audit record in ``row`` and the Hermes line prefix it was written behind, if any.
 
-    A record reaches Logging in one of two shapes. Wrapped: the JSON object at the
-    end of a Hermes log line, under ``jsonPayload.log`` or ``textPayload``. Lifted:
-    the object's keys as ``jsonPayload`` fields of their own, the raw line still
-    under ``log``, which is what the fluent-bit sidecar in the gateway pod writes.
-    The prefix carries Hermes' ``[session]`` tag, the only attribution a cron job's
-    tool call has, so it is read from the raw line in both shapes.
+    A record reaches Logging in one of three shapes. Wrapped: the JSON object at
+    the end of a Hermes log line, under ``jsonPayload.log`` or ``textPayload``.
+    Lifted: the object's keys as ``jsonPayload`` fields of their own, the raw
+    line still under ``log``, which the fluent-bit sidecar in the gateway pod
+    wrote while it lifted records out of ``agent.log``. Tailed: the keys as
+    fields and no raw line at all, which the sidecar writes from the profile's
+    own audit file, and which the agent container itself writes, as one JSON
+    line on its stdout, for a record the emitter could not write to that file.
+    The prefix carries Hermes' ``[session]`` tag, the only attribution a cron
+    job's tool call had before the record carried its ``session_id`` itself,
+    so it is read from the raw line wherever there is one.
     """
     direct = row.get("jsonPayload")
     candidate = ""
@@ -286,7 +291,13 @@ def normalize_logging_row(
     )
     context_match = _CONTEXT.search(prefix)
     context = context_match.group("context") if context_match else ""
-    trigger, attribution = _logging_trigger(payload, context)
+    # The record's own session first: a record tailed from the audit file has
+    # no line prefix, and a text line's prefix can carry a bracket group that
+    # is not a session tag (`[Errno 28]`). A cron session names itself. Resolve
+    # it once, from either spelling of the key, so the trigger the session
+    # implies and the session_id on the event cannot disagree.
+    session_id = _first(payload, "session_id", "session.id") or context
+    trigger, attribution = _logging_trigger(payload, session_id)
     timestamp = _parse_time(
         payload.get("occurred_at"),
         _parse_time(row.get("timestamp"), datetime.now(UTC)),
@@ -294,7 +305,6 @@ def normalize_logging_row(
     insert_id = _first(row, "insertId") or _event_id(
         "log", timestamp.isoformat(), audit_event, payload
     )
-    session_id = _first(payload, "session_id", "session.id") or context
     task_id = _first(payload, "task_id")
     message_hash = _first(payload, "message_sha256")
     interaction_id = (

@@ -9459,13 +9459,44 @@ class ScopeCheckWiringTest(unittest.TestCase):
         # run, which enables them prior to apply, does not have: it skips the
         # plan with the command instead, beside the other known-postcondition
         # skips, and a listing that failed lets the plan speak.
-        branch = self.text.index('elif [[ "${SCOPE_SHARED_VPC_HOSTS:-}${SCOPE_METRICS_SCOPES:-}" == *[![:space:],]* ]] \\\n        && missing_apis="$(scope_selector_apis_missing "$project_id")" && [ -n "$missing_apis" ]; then')
+        # Gated on the helper that knows every read the plan makes, so a pool
+        # armed beside a folder (which reads the Asset API) is covered too.
+        branch = self.text.index('elif [ -n "$(scope_selector_apis)" ] \\\n        && missing_apis="$(scope_selector_apis_missing "$project_id")" && [ -n "$missing_apis" ]; then')
         node_pools = self.text.index('elif ! is_existing_cluster_node_pools_satisfied "$project_id" "$cluster_name" "$region"; then')
         plan = self.text.index('print_info "Previewing the resources a real run would create (terraform plan)..."')
         self.assertLess(node_pools, branch)
         self.assertLess(branch, plan)
         self.assertIn('print_warning "Dry-run: skipping terraform plan because ${missing_apis// /, } is not enabled in project', self.text[branch:plan])
+        self.assertIn('$(scope_selector_apis_reason)', self.text[branch:plan],
+                      "the dry-run warning does not take its reason from the helper, so it names only the selectors")
         self.assertIn('gcloud services enable ${missing_apis} --project=${project_id}', self.text[branch:plan])
+
+    def test_the_generate_only_handoff_names_the_asset_api_when_the_pool_is_armed_beside_a_folder(self):
+        # The plan lists a folder's members for the pool through the Asset
+        # API, which the apply is what enables, so the handoff names it like
+        # the selectors' APIs, and only then.
+        cmd_template = """
+{source}
+PROJECT_ID="test-proj"
+CLUSTER_NAME="test-cluster"
+INSTALL_ENV_FILE="/tmp/test/install.env"
+export SCOPE_FOLDERS="123456789012"
+export SCOPED_SA_POOL_ENABLED="{armed}"
+print_generate_only_handoff "/tmp/test-repo" "test-proj" "test-cluster" "us-central1" "/tmp/test-repo/terraform/examples/full-install/terraform.tfvars"
+"""
+        line = "gcloud services enable cloudasset.googleapis.com --project=test-proj"
+        with tempfile.TemporaryDirectory() as tmp:
+            empty = pathlib.Path(tmp) / "install.env"
+            empty.write_text("")
+            def run(armed):
+                setup = f'KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\n' + cmd_template.format(source=_SOURCE_INSTALLER_COMMON, armed=armed)
+                return _run_installer_bash(setup, get_isolated_test_env(overrides={"KUBE_AGENTS_INSTALL_ENV": str(empty)}), cwd=_REPO_ROOT)
+            proc = run("true")
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertIn(line, proc.stdout, proc.stderr)
+            self.assertIn("scoped service account pool", proc.stdout)
+            proc = run("false")
+            self.assertNotIn("cloudasset", proc.stdout, proc.stderr)
 
     def test_the_generate_only_handoff_names_the_selector_apis_only_when_a_selector_is_declared(self):
         cmd_template = """

@@ -11,6 +11,8 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -1377,4 +1379,401 @@ func TestNewDerivesTheBackendFromTheConfig(t *testing.T) {
 	if g.backend != gchatBackend {
 		t.Fatalf("backend = %q; a gchat-armed config must select the gchat identity path", g.backend)
 	}
+}
+
+// gchatLegibilityRelay is an httptest relay for the #2404 log lines: the
+// event route answers with events, then empty pulls naming subscription; the
+// API route answers apiStatus with apiBody; a pull answers pullStatus with
+// pullBody while pullStatus is non-zero.
+type gchatLegibilityRelay struct {
+	mu           sync.Mutex
+	events       []map[string]any
+	subscription string
+	pullStatus   int
+	pullBody     string
+	apiStatus    int
+	apiBody      string
+}
+
+func (f *gchatLegibilityRelay) start(t *testing.T) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/chat/a2a/events":
+			if f.pullStatus != 0 {
+				w.WriteHeader(f.pullStatus)
+				_, _ = w.Write([]byte(f.pullBody))
+				return
+			}
+			var ev map[string]any
+			if len(f.events) > 0 {
+				ev, f.events = f.events[0], f.events[1:]
+			}
+			body := map[string]any{"event": ev}
+			if f.subscription != "" {
+				body["subscription"] = f.subscription
+			}
+			_ = json.NewEncoder(w).Encode(body)
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/chat/a2a/events/ack":
+			_ = json.NewEncoder(w).Encode(map[string]any{"settled": true})
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/chat/api":
+			w.WriteHeader(f.apiStatus)
+			_, _ = w.Write([]byte(f.apiBody))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+func newLegibilityAdapter(t *testing.T, relayURL string) (*GoogleChatAdapter, *lockedBuffer) {
+	t.Helper()
+	tokenPath := filepath.Join(t.TempDir(), "token")
+	if err := os.WriteFile(tokenPath, []byte("tok-1"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	logs := &lockedBuffer{}
+	a, err := NewGoogleChatAdapter(relayURL, tokenPath, slog.New(slog.NewTextHandler(logs, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return a, logs
+}
+
+// runUntilLogged runs the adapter until every want substring is in its log
+// output, failing after five seconds, and returns the log.
+func runUntilLogged(t *testing.T, a *GoogleChatAdapter, logs *lockedBuffer, want ...string) string {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- a.Run(ctx, func(InboundMessage) {}) }()
+	defer func() {
+		cancel()
+		<-done
+	}()
+	deadline := time.After(5 * time.Second)
+	for {
+		out := logs.String()
+		missing := ""
+		for _, w := range want {
+			if !strings.Contains(out, w) {
+				missing = w
+				break
+			}
+		}
+		if missing == "" {
+			t.Logf("adapter log:\n%s", out)
+			return out
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("log never carried %q; log:\n%s", missing, out)
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+}
+
+// TestGchatRunNamesTheRelayAndTheSubscription pins #2404's startup line: an
+// install that Chat publishes nothing to pulls empty forever, so the log has
+// to say what is being pulled before it can say that nothing arrived.
+func TestGchatRunNamesTheRelayAndTheSubscription(t *testing.T) {
+	f := &gchatLegibilityRelay{subscription: "projects/kagents-dev/subscriptions/a2a-chat-sub"}
+	srv := f.start(t)
+	a, logs := newLegibilityAdapter(t, srv.URL)
+
+	out := runUntilLogged(t, a, logs,
+		`msg="gchat event pull starting" relay=`+srv.URL+`/v1/chat/a2a/events`,
+		`msg="gchat relay pulls subscription" subscription=projects/kagents-dev/subscriptions/a2a-chat-sub`)
+	if n := strings.Count(out, "gchat relay pulls subscription"); n != 1 {
+		t.Errorf("subscription logged %d times over repeated empty pulls; want once:\n%s", n, out)
+	}
+}
+
+// TestGchatRunRelogsAChangedSubscription: a proxy restarted onto another
+// subscription while the gateway keeps running is named again, once.
+func TestGchatRunRelogsAChangedSubscription(t *testing.T) {
+	f := &gchatLegibilityRelay{subscription: "projects/p/subscriptions/first"}
+	srv := f.start(t)
+	a, logs := newLegibilityAdapter(t, srv.URL)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- a.Run(ctx, func(InboundMessage) {}) }()
+	defer func() {
+		cancel()
+		<-done
+	}()
+
+	waitFor := func(want string) string {
+		t.Helper()
+		deadline := time.After(5 * time.Second)
+		for {
+			out := logs.String()
+			if strings.Contains(out, want) {
+				return out
+			}
+			select {
+			case <-deadline:
+				t.Fatalf("log never carried %q; log:\n%s", want, out)
+			case <-time.After(10 * time.Millisecond):
+			}
+		}
+	}
+	waitFor("subscription=projects/p/subscriptions/first")
+	f.mu.Lock()
+	f.subscription = "projects/p/subscriptions/second"
+	f.mu.Unlock()
+	waitFor("subscription=projects/p/subscriptions/second")
+	// Two more pulls on the new name, so a repeat would have had its chance.
+	time.Sleep(1200 * time.Millisecond)
+	out := logs.String()
+	if n := strings.Count(out, "gchat relay pulls subscription"); n != 2 {
+		t.Errorf("subscription logged %d times; want once per name:\n%s", n, out)
+	}
+}
+
+// TestGchatRunLogsTheEventCountEachInterval pins #2404's periodic line: the
+// count of events in the interval, zero included, which is how "nothing in
+// the last hour" becomes visible.
+func TestGchatRunLogsTheEventCountEachInterval(t *testing.T) {
+	turn := gchatMsg("spaces/D1", "DIRECT_MESSAGE", "", "", "spaces/D1/messages/M1", "hi", "", "u1@example.com", "HUMAN")
+	f := &gchatLegibilityRelay{
+		subscription: "projects/p/subscriptions/s",
+		events: []map[string]any{
+			{"receipt": "r1", "data": b64GchatEvent(t, turn), "messageId": "1"},
+			{"receipt": "r2", "data": "not!!!base64", "messageId": "2"},
+		},
+	}
+	srv := f.start(t)
+	a, logs := newLegibilityAdapter(t, srv.URL)
+	a.countInterval = 700 * time.Millisecond
+
+	out := runUntilLogged(t, a, logs,
+		`msg="gchat events received" events=2 `,
+		`msg="gchat events received" events=0 `)
+	if !strings.Contains(out, "subscription=projects/p/subscriptions/s") {
+		t.Errorf("summary does not name the subscription:\n%s", out)
+	}
+	if !strings.Contains(out, "summaryEvery=700ms") {
+		t.Errorf("startup line does not state the summary interval:\n%s", out)
+	}
+}
+
+// TestGchatEventCountIntervalIsTheNamedConstant keeps the production pacing
+// on the constant whose comment justifies it.
+func TestGchatEventCountIntervalIsTheNamedConstant(t *testing.T) {
+	a, _ := newLegibilityAdapter(t, "http://relay.invalid")
+	if a.countInterval != gchatEventCountInterval {
+		t.Errorf("countInterval = %v, want gchatEventCountInterval (%v)", a.countInterval, gchatEventCountInterval)
+	}
+}
+
+// TestGchatRelayErrorCarriesTheChatStatus pins #2404's relay error: the
+// proxy answers a refused Chat call 502 with the Chat status in the body,
+// and the error has to keep it, or a missing grant reads like an outage.
+func TestGchatRelayErrorCarriesTheChatStatus(t *testing.T) {
+	f := &gchatLegibilityRelay{
+		apiStatus: http.StatusBadGateway,
+		apiBody:   `{"error":"Google Chat operation failed","chat":{"status":403,"reason":"Forbidden"}}`,
+	}
+	srv := f.start(t)
+	a, _ := newLegibilityAdapter(t, srv.URL)
+
+	_, err := a.Post("gchat:space/spaces/S1", "hello")
+	if err == nil || err.Error() != "gchat: relay /v1/chat/api answered 502: chat 403 Forbidden" {
+		t.Fatalf("Post error = %v, want the Chat status carried", err)
+	}
+}
+
+// TestGchatRelayErrorBoundsAndSanitizesTheBody: what the error takes from
+// the body cannot break a log line or grow it without bound, and a body of
+// any other shape adds nothing.
+func TestGchatRelayErrorBoundsAndSanitizesTheBody(t *testing.T) {
+	long := strings.Repeat("x", 2000)
+	cases := []struct {
+		name, body, want string
+	}{
+		{"newline in reason", `{"chat":{"status":403,"reason":"Forbidden\nlevel=ERROR msg=forged"}}`,
+			"gchat: relay /v1/chat/api answered 502: chat 403 Forbiddenlevel=ERROR msg=forged"},
+		{"separator in reason", `{"chat":{"status":403,"reason":"a\u2028b\u0085c"}}`,
+			"gchat: relay /v1/chat/api answered 502: chat 403 abc"},
+		{"not json", `<html>bad gateway</html>`, "gchat: relay /v1/chat/api answered 502"},
+		{"no chat object", `{"error":"Google Chat operation failed"}`, "gchat: relay /v1/chat/api answered 502"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := gchatRelayError("gchat: relay /v1/chat/api answered 502", []byte(tc.body))
+			if err.Error() != tc.want {
+				t.Errorf("got %q, want %q", err.Error(), tc.want)
+			}
+		})
+	}
+	err := gchatRelayError("s", []byte(`{"chat":{"status":403,"reason":"`+long+`"}}`))
+	if n := len(err.Error()); n > len("s: chat 403 ")+gchatRelayDetailMaxBytes+len("…") {
+		t.Errorf("error is %d bytes; the reason must be cut at gchatRelayDetailMaxBytes", n)
+	}
+}
+
+// TestGchatPullFailureNamesTheSubscriptionAndTheRefusal: a refused pull's
+// warning carries what the proxy said about it, not only "answered 503".
+func TestGchatPullFailureNamesTheSubscriptionAndTheRefusal(t *testing.T) {
+	f := &gchatLegibilityRelay{
+		pullStatus: http.StatusServiceUnavailable,
+		pullBody: `{"error":"a2a chat event pull failed","subscription":"projects/p/subscriptions/s",` +
+			`"pubsub":{"type":"PermissionDenied","code":403}}`,
+	}
+	srv := f.start(t)
+	a, logs := newLegibilityAdapter(t, srv.URL)
+
+	runUntilLogged(t, a, logs,
+		`gchat: event pull answered 503: pubsub PermissionDenied 403, subscription projects/p/subscriptions/s`)
+}
+
+// TestGchatRefusedPullRecordsTheSubscription: in #2404's motivating case
+// every pull is refused (the proxy's credentials lack
+// pubsub.subscriptions.consume), and the proxy names the subscription on the
+// 503 as well. The gateway has to record it from that answer, or the summary
+// says "not reported" about a subscription every warning just named.
+func TestGchatRefusedPullRecordsTheSubscription(t *testing.T) {
+	f := &gchatLegibilityRelay{
+		pullStatus: http.StatusServiceUnavailable,
+		pullBody: `{"error":"a2a chat event pull failed","subscription":"projects/p/subscriptions/s",` +
+			`"pubsub":{"type":"PermissionDenied","code":403}}`,
+	}
+	srv := f.start(t)
+	a, logs := newLegibilityAdapter(t, srv.URL)
+	a.countInterval = 700 * time.Millisecond
+
+	out := runUntilLogged(t, a, logs,
+		`msg="gchat relay pulls subscription" subscription=projects/p/subscriptions/s`,
+		`msg="gchat events received"`)
+	for _, line := range strings.Split(out, "\n") {
+		if strings.Contains(line, `msg="gchat events received"`) &&
+			!strings.Contains(line, "subscription=projects/p/subscriptions/s") {
+			t.Errorf("summary after refused pulls does not name the subscription: %s", line)
+		}
+	}
+	// Every pull was refused, so every interval counts failed pulls and no
+	// empty ones: that split is what tells a refused proxy from a Chat that
+	// publishes nothing.
+	sums := gchatSummaries(t, out)
+	if len(sums) == 0 {
+		t.Fatalf("no parseable summary line:\n%s", out)
+	}
+	for _, c := range sums {
+		if c.failed == 0 || c.empty != 0 || c.events != 0 {
+			t.Errorf("summary over refused pulls = %+v; want failedPulls>0, emptyPulls=0, events=0", c)
+		}
+	}
+}
+
+// gchatSummaryCounts is one parsed "gchat events received" line.
+type gchatSummaryCounts struct{ events, empty, failed int }
+
+var gchatSummaryRE = regexp.MustCompile(
+	`msg="gchat events received" events=(\d+) emptyPulls=(\d+) failedPulls=(\d+) `)
+
+// gchatSummaries parses every summary line in out, in order. A line that
+// names the summary but does not match the pattern fails the test, so a
+// reworded line cannot leave the counter assertions checking nothing.
+func gchatSummaries(t *testing.T, out string) []gchatSummaryCounts {
+	t.Helper()
+	var sums []gchatSummaryCounts
+	for _, line := range strings.Split(out, "\n") {
+		if !strings.Contains(line, `msg="gchat events received"`) {
+			continue
+		}
+		m := gchatSummaryRE.FindStringSubmatch(line)
+		if m == nil {
+			t.Fatalf("summary line does not carry events=, emptyPulls=, failedPulls=: %s", line)
+		}
+		var c gchatSummaryCounts
+		c.events, _ = strconv.Atoi(m[1])
+		c.empty, _ = strconv.Atoi(m[2])
+		c.failed, _ = strconv.Atoi(m[3])
+		sums = append(sums, c)
+	}
+	return sums
+}
+
+// TestGchatEmptyPullsCountAsEmptyNotFailed: an install that Chat publishes
+// nothing to pulls empty forever, and the summary has to say so as
+// emptyPulls, not failedPulls. Run checks the interval before each pull, so
+// every summary window holds at least one pull: the assertion is >0 versus
+// =0, not an exact count, and does not depend on pacing.
+func TestGchatEmptyPullsCountAsEmptyNotFailed(t *testing.T) {
+	f := &gchatLegibilityRelay{subscription: "projects/p/subscriptions/s"}
+	srv := f.start(t)
+	a, logs := newLegibilityAdapter(t, srv.URL)
+	a.countInterval = 700 * time.Millisecond
+
+	out := runUntilLogged(t, a, logs, `msg="gchat events received"`)
+	sums := gchatSummaries(t, out)
+	if len(sums) == 0 {
+		t.Fatalf("no parseable summary line:\n%s", out)
+	}
+	for _, c := range sums {
+		if c.empty == 0 || c.failed != 0 || c.events != 0 {
+			t.Errorf("summary over empty pulls = %+v; want emptyPulls>0, failedPulls=0, events=0", c)
+		}
+	}
+}
+
+// TestGchatPullCountsResetEachInterval: each summary counts its own
+// interval. The relay goes empty, then refused, then empty again; after each
+// flip a summary has to show the old kind at zero, which a count carried
+// over from the previous interval never does.
+func TestGchatPullCountsResetEachInterval(t *testing.T) {
+	f := &gchatLegibilityRelay{subscription: "projects/p/subscriptions/s"}
+	srv := f.start(t)
+	a, logs := newLegibilityAdapter(t, srv.URL)
+	a.countInterval = 700 * time.Millisecond
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- a.Run(ctx, func(InboundMessage) {}) }()
+	defer func() {
+		cancel()
+		<-done
+	}()
+
+	refuse := func(on bool) {
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		if on {
+			f.pullStatus = http.StatusServiceUnavailable
+			f.pullBody = `{"error":"a2a chat event pull failed","pubsub":{"type":"PermissionDenied","code":403}}`
+		} else {
+			f.pullStatus, f.pullBody = 0, ""
+		}
+	}
+	// waitSummary waits for a summary after the first skip ones that
+	// matches ok, and returns how many summaries the log then holds.
+	waitSummary := func(skip int, what string, ok func(gchatSummaryCounts) bool) int {
+		t.Helper()
+		deadline := time.After(10 * time.Second)
+		for {
+			sums := gchatSummaries(t, logs.String())
+			for _, c := range sums[min(skip, len(sums)):] {
+				if ok(c) {
+					return len(sums)
+				}
+			}
+			select {
+			case <-deadline:
+				t.Fatalf("no summary with %s after the first %d; log:\n%s", what, skip, logs.String())
+			case <-time.After(10 * time.Millisecond):
+			}
+		}
+	}
+
+	n := waitSummary(0, "emptyPulls>0 failedPulls=0",
+		func(c gchatSummaryCounts) bool { return c.empty > 0 && c.failed == 0 })
+	refuse(true)
+	n = waitSummary(n, "failedPulls>0 emptyPulls=0",
+		func(c gchatSummaryCounts) bool { return c.failed > 0 && c.empty == 0 })
+	refuse(false)
+	waitSummary(n, "emptyPulls>0 failedPulls=0",
+		func(c gchatSummaryCounts) bool { return c.empty > 0 && c.failed == 0 })
 }

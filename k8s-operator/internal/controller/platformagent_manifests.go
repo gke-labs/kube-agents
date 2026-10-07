@@ -80,6 +80,25 @@ const (
 	// on the HERMES_HOME_MODE env var for why 0700 does not work here and why a chmod
 	// is not an alternative.
 	hermesHomeMode = "2770"
+	// auditFileName is the file the tool_call_audit plugin and the chat_message_audit
+	// hook append their records to under a profile's logs/ directory: AUDIT_FILE_NAME
+	// in agents/chat/defaults/plugins/common/audit_sink.py, which
+	// TestFluentBitAuditFileNameMatchesTheEmitters holds to this value. The sidecar
+	// tails it at fluentBitAuditTailPath.
+	auditFileName = "audit.jsonl"
+	// fluentBitDataMount is where the fluent-bit sidecar mounts the agent's data
+	// volume, read-only: the sidecar container's MountPath and the root of both tail
+	// paths, so the two cannot diverge. It is the path the agent mounts the same claim
+	// at by default (defaultAgentHome) and stays the sidecar's view of the volume root
+	// wherever a CR moves the agent's home: the files are at logs/ and
+	// profiles/<name>/logs/ relative to the claim either way.
+	fluentBitDataMount = defaultAgentHome
+	// fluentBitAuditTailPath is the Path of the sidecar's audit tail input: the front
+	// door's file, whose home is the volume root, and one per named profile under
+	// profiles/. Every profile's file is matched whether or not that profile emits
+	// records today, so turning an emitter on for a profile needs no change here.
+	fluentBitAuditTailPath = fluentBitDataMount + "/logs/" + auditFileName + "," +
+		fluentBitDataMount + "/profiles/*/logs/" + auditFileName
 	// agentDataStorageSize sizes the agent's own /opt/data claim, and through
 	// shell_sandbox_manifests.go the sandbox's claim at the same path.
 	//
@@ -4356,24 +4375,42 @@ func safeSandboxEnvOverrides(custom []corev1.EnvVar) []corev1.EnvVar {
 	// no path, URL, credential or image, and no value of it adds a destination
 	// or a credential. Its writes go only to Slack, in the channels and threads
 	// the gateway already serves, among them a reaction on an ask, a click's
-	// rewrite of the clicked message and its echo, and an incident alert's edit
-	// into its options. Each effect it switches, one per change that ships it:
+	// rewrite of the clicked message (or, when Slack refuses it, the same
+	// answered line posted in the thread), and an incident alert's edit into
+	// its options, apart from one: the title of an event alert's thread,
+	// recorded on that alert's own routing row in the local Session KV
+	// database. Each effect it switches, one per change that ships it:
 	//
 	//   - Clicks: a click on a choice runs as the clicker's turn under the
-	//     adapter's own authorization, echoed in the same thread.
-	//   - Incident alerts: an incident alert's triage options post as an edit
-	//     of the alert, with a button per option and the report folded; the
-	//     Session KV database is read, read-only, to tell an alert's thread
-	//     from any other; and before an option click counts, the alert's
+	//     adapter's own authorization, and the clicked message is rewritten to
+	//     name who chose what.
+	//   - Incident alerts: a crashloop alert posts to Slack as a one-line
+	//     headline, and the event watcher records a title for the alert's
+	//     thread on its routing row, which the thread status reads; an
+	//     incident alert's triage options post as an edit of the alert, with a
+	//     button per option and the report folded; the Session KV database is
+	//     otherwise read, read-only, to tell an alert's thread from any other
+	//     and to read that title; and before an option click counts, the alert's
 	//     thread is read once (conversations.replies, the existing token and
 	//     scopes) to see whether someone the agent answers typed apply since
 	//     the options appeared, which drops the click.
 	//   - Pull requests and questions: an opened pull request and a question a
 	//     card waits on post in the thread as messages of their own, with
 	//     buttons; the wake for a question already posted carries a note
-	//     telling the Planning Agent not to ask it again, the one effect that
-	//     reaches a model.
+	//     telling the Planning Agent not to ask it again, nor to reply after
+	//     carrying the answer to the card, the one effect that reaches a
+	//     model; once the card resumes, the question's thread is read once
+	//     (conversations.replies, the existing token and scopes) for the first
+	//     reply a person typed, and the names it shows are looked up with
+	//     users.info, cached per user, so the settled question shows who answered.
 	//   - Reactions: which reaction goes on an ask and when it settles.
+	//   - Reports: a fleet-audit cron report and the first inventory report
+	//     post as Block Kit, laid out again as a headline and the top findings
+	//     (the audit's rest counted and left to its ledger, the inventory's
+	//     behind a "See all" button), through the credential
+	//     proxy's Slack relay to the channel or thread the report was already
+	//     bound for; the audit's counts come from its ledger issue, read
+	//     through the forge broker.
 	//   - Thread status: less of a delegated card's delivery posts in the
 	//     thread, the thread's cards show as one plan message, and Slack shows
 	//     a session status and title on the thread.
@@ -4993,7 +5030,7 @@ func buildBaseContainers(agent *agentv1alpha1.PlatformAgent, image string, envVa
 		VolumeMounts: []corev1.VolumeMount{
 			{
 				Name:      "platform-agent-data-vol",
-				MountPath: "/opt/data",
+				MountPath: fluentBitDataMount,
 				ReadOnly:  true,
 			},
 			{
@@ -5315,25 +5352,33 @@ func getConfigMapHash(configMap *corev1.ConfigMap) (string, error) {
 
 // buildFluentBitConfigMap generates the ConfigMap manifest containing fluent-bit.conf.
 //
-// Three parser passes run over every line the sidecar tails. gchat_event lifts
-// the chat user and session out of the gateway's own lines. The other two are
-// the audit trail's: hermes_audit_line recognises a line the tool_call_audit
-// plugin or the chat_message_audit hook wrote — Hermes' timestamp, level and
-// logger name, then one JSON object — and captures the object as audit_json;
-// audit_json then decodes it into top-level fields and drops the capture. A
-// line neither parser matches passes through untouched, and the raw line stays
-// under `log` either way, so Cloud Logging carries the record's fields as its
-// own jsonPayload keys (event_type, tool, status, ...) beside the text every
-// existing reader still greps. The lift is what makes an audit record
-// filterable without a regex; the record's shape is common/audit_schema.py's.
+// Two tail inputs. agent.logs is Hermes' own log files under the front door's
+// logs/, read as text: gchat_event lifts the chat user and session out of the
+// gateway's lines, and a line it does not match passes through untouched under
+// `log`. agent.audit is the audit trail: the file the tool_call_audit plugin and
+// the chat_message_audit hook append to, one JSON object per line
+// (agents/chat/defaults/plugins/common/audit_sink.py), tailed with the audit_json
+// parser on the input itself. Each line arrives as the record's own fields —
+// event_type, tool, status, ... in the shape common/audit_schema.py gives it —
+// and Cloud Logging carries them as jsonPayload keys a SIEM filters on without a
+// regex. Path_Key names the file, and so the profile, a record came from.
 //
-// The line prefix the regex reads is Hermes' own log format, which this
-// repository does not own: `%(asctime)s %(levelname)s%(session_tag)s %(name)s:
-// %(message)s` in the pinned image's hermes_logging.py, where session_tag is
-// ` [<session id>]` on a record emitted on a thread that holds a session
-// context and empty otherwise. Both forms have to match, or the records of
-// tools Hermes runs inline on the turn thread would pass through unlifted and
-// silently. TestFluentBitLiftsAuditRecordsIntoFields carries a sample of each.
+// The trail used to be lifted out of agent.log with a regex over Hermes' line
+// prefix (timestamp, level, session tag, logger name). That prefix was Hermes'
+// to change — a bump that changed it would have left every record as text,
+// silently — and a logger writing untrusted text could have planted a line
+// shaped like a record. Tailing a file of the emitters' own, as JSON, removes
+// both for the trail: no audit record is lifted from a Hermes line, so a prefix
+// bump cannot silently drop one and logged text cannot forge one. gchat_event
+// still reads the gateway's lines, but only to enrich the agent.logs stream —
+// it matches agent.logs, never agent.audit, and builds no record. What remains
+// is a write to the file itself, which any process under the agent's uid with a
+// path to the profile's logs/ can make; that is the volume's boundary, not this
+// configuration's.
+//
+// The audit input matches every profile's file (fluentBitAuditTailPath), not
+// only the profiles that emit today. The agent.logs input is unchanged and still
+// reads the front door's logs/ alone.
 func buildFluentBitConfigMap(agent *agentv1alpha1.PlatformAgent) *corev1.ConfigMap {
 	return &corev1.ConfigMap{
 		TypeMeta: metav1.TypeMeta{
@@ -5354,8 +5399,21 @@ func buildFluentBitConfigMap(agent *agentv1alpha1.PlatformAgent) *corev1.ConfigM
 [INPUT]
     Name              tail
     Tag               agent.logs
-    Path              /opt/data/logs/*.log
+    Path              ` + fluentBitDataMount + `/logs/*.log
     DB                /fluent-bit/state/fluent-bit.db
+    Refresh_Interval  5
+    Rotate_Wait       30
+    Mem_Buf_Limit     20MB
+    Skip_Long_Lines   On
+    Read_from_Head    On
+    Path_Key          file_path
+
+[INPUT]
+    Name              tail
+    Tag               agent.audit
+    Path              ` + fluentBitAuditTailPath + `
+    Parser            audit_json
+    DB                /fluent-bit/state/fluent-bit-audit.db
     Refresh_Interval  5
     Rotate_Wait       30
     Mem_Buf_Limit     20MB
@@ -5372,41 +5430,20 @@ func buildFluentBitConfigMap(agent *agentv1alpha1.PlatformAgent) *corev1.ConfigM
     Preserve_Key  On
 
 [FILTER]
-    Name          parser
-    Match         agent.logs
-    Key_Name      log
-    Parser        hermes_audit_line
-    Reserve_Data  On
-    Preserve_Key  On
-
-[FILTER]
-    Name          parser
-    Match         agent.logs
-    Key_Name      audit_json
-    Parser        audit_json
-    Reserve_Data  On
-    Preserve_Key  Off
-
-[FILTER]
     Name              record_modifier
-    Match             agent.logs
+    Match             agent.*
     Record            app agent
     Record            log_source agent-file
 
 [OUTPUT]
     Name              stdout
-    Match             agent.logs
+    Match             agent.*
     Format            json_lines
 `,
 			"parsers.conf": `[PARSER]
     Name    gchat_event
     Format  regex
     Regex   User=(?<gchat_user>[^,\s]+),\s*Session=(?<gchat_session>[^,\s]+)
-
-[PARSER]
-    Name    hermes_audit_line
-    Format  regex
-    Regex   ^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d{3} [A-Z]+(?: \[[^\]]*\])? hermes\.(?:plugin\.tool_call_audit|hook\.chat_message_audit): (?<audit_json>\{.*\})$
 
 [PARSER]
     Name    audit_json

@@ -46,7 +46,7 @@ not a new cron entry. The consequences of dispatching through a card are in
 [`docs/designs/pr-comment-conversation.md`](../../../docs/designs/pr-comment-conversation.md) §2,
 and the env knobs that bound a sweep are in §§2 and 4 of the same document.
 
-## `stall-watch` hands a stall to a Cluster Agent card
+## `stall-watch` hands a stall to the AutoOps pipeline
 
 `stall-watch` is a `no_agent` script: the tick prompts no model. Every thirty
 minutes it lists the clusters of the management project and of every project a
@@ -55,38 +55,61 @@ Cluster Agent profile's `cluster_identity` names, which is how a project
 running or reconciling cluster that has a Cluster Agent profile and is not a
 system namespace, runs the Cluster Agent's `stall_report.py` over a bounded list
 of controller kinds, keeping a ledger of the rows it has seen. On a new stall
-episode it files one kanban card per cluster and namespace, assigned to that
-cluster's Cluster Agent profile, telling it to run `gke-stall-detection` on the
-namespace and record the finding. That is the same card, diagnosis and chat
-thread a user's own question produces, which is the point: one detector and one
-experience whether the cron or a person noticed first. The watch follows the
-reconciler's roster: a cluster with no profile, one `spec.scope.exclude.clusters`
-or `RECONCILE_EXCLUDE` pruned or one not yet scaffolded, is neither read nor filed for, because the exclusion
-is the operator keeping a model turn off that cluster and a card would hand its
-rows to another profile; a cluster, or a whole project, that leaves the roster
-has its rows cleared and its open card completed with a comment saying so. At most three cards open
-per tick (`MAX_CARDS_PER_TICK`, the default of the pull-request poller's
-`PR_AGENT_MAX_PER_TICK`), since each is a Cluster Agent turn and the number of
-namespaces with a new stall is chosen by whoever can create namespaces; the rest
-keep their rows and wait, oldest first sighting first, so a tenant filling three
-fresh namespaces every tick cannot keep an older stall from its card, and chat
-gets one line saying how many wait. A card the board refused leaves its
-namespace waiting the same way. A new object in
-a namespace whose card is still open is a comment on that card; when every
-object in the namespace has cleared, the card gets a closing comment and is
-completed. A `repeating-warnings` or `dangling-reference` row clears only after
-two consecutive scans without it, so a warning that recurs hourly or a referent
-listing that failed once does not close and reopen a card.
+episode it sends the Session KV server a `controller-stall` inject, the route
+`k8s-event-watcher` and the drift detector use
+([design](../../../docs/designs/stall-watch-inject.md)). The server posts the
+alert, records its chat thread, and starts a Planning Agent turn that files one
+card to that cluster's Cluster Agent, which runs `gke-stall-detection` and
+reports in the triage template. The report lands in the alert's thread and is
+saved, so a reply of "apply" there reaches the agent that opens the pull request
+with the report attached, rather than a bare word it has to investigate from
+scratch. The watch files no card itself: a card it filed would have no session,
+and so no thread. It finds the card later by `tasks.session_id`, the session that
+filed it. The watch follows the reconciler's roster: a cluster with no profile,
+one `spec.scope.exclude.clusters` or `RECONCILE_EXCLUDE` pruned or one not yet
+scaffolded, is neither read nor alerted for, because the exclusion is the
+operator keeping a model turn off that cluster and an alert would hand its rows
+to another profile; a cluster, or a whole project, that leaves the roster has its
+rows cleared and its open card completed with a comment saying so. At most three
+alerts are raised per tick (`MAX_ALERTS_PER_TICK`, the default of the
+pull-request poller's `PR_AGENT_MAX_PER_TICK`), since each starts a Planning
+Agent turn and a Cluster Agent turn and the number of namespaces with a new
+stall is chosen by whoever can create namespaces. A stall claims no alert quota
+on the Session KV server, so that cap is the only bound. The rest keep their
+rows and wait, oldest first sighting first, so a tenant filling three fresh
+namespaces every tick cannot keep an older stall from its alert, and chat gets
+one line saying how many wait. An alert the server refused, or a server that
+does not advertise the kind on `/healthz`, leaves the namespace with its rows
+for the next tick, and the tick stops trying the rest rather than spend a
+timeout on each; the "alerts not raised" line below reports them rather than
+the held count. A record the server refuses on its own merits (HTTP 400) skips
+only that namespace, and the next one in line still gets its alert. Object
+names longer than the server's 200-character limit are cut to it in the
+record. A new object in a namespace whose card is still open is a comment on that
+card; when every object in the namespace has cleared, the card gets a closing
+comment and is completed. A `repeating-warnings` or
+`dangling-reference` row clears only after two consecutive scans without it, so
+a warning that recurs hourly or a referent listing that failed once does not
+close and reopen an episode.
 
-The card's progress reaches chat because the script writes the card's
-`kanban_notify_subs` row itself: a cron child has no session identity for
-`kanban_create` to copy, and a card without a row is invisible to the gateway
-notifier. The row targets every shipped chat platform with a home channel in the agent home's `config.yaml` (`platforms.<p>.home_channel.chat_id`, the field the tick spawner reads, because Hermes strips every `*_HOME_CHANNEL` from a `no_agent` child's environment), with the same `notify+wake` delivery a user-filed card gets; `<PLATFORM>_HOME_CHANNEL` in the environment is read only for a platform the file does not settle, which is a run started by hand. A row the board refused is written on a later tick while the card is open. `deliver: chat` then carries three one-liners, "stall noticed in
-`<project>/<cluster>` (`<location>`) / `<namespace>`: `<objects>`; card `<id>` opened for
-`<profile>`", "stall cleared
-...; card `<id>` closed" and "stall noticed in `<n>` more namespaces; cards
-follow on later ticks", each naming at most eight objects, plus the sweep-failed
-and sweep-recovered lines every roster entry owes. A clean tick prints nothing. Anything a tick could not read (a
+`deliver: chat` carries the watch's own one-liners: "stall cleared in
+`<project>/<cluster>` (`<location>`) / `<namespace>`: `<objects>`; card `<id>`
+closed" (without the card clause when the alert produced no card; a card
+filed later still reports the recovery in the alert's thread), "stall
+noticed in `<n>` more namespaces; alerts follow on later ticks, 3 a tick", the
+cleared line naming at most eight objects, and an "alerts not raised" line when the Session
+KV server refuses an alert, said once until the reason changes, with a line
+when alerts are raised again. It also carries the sweep-failed and sweep-recovered lines
+every roster entry owes. A new stall's notice is the alert the Session KV server
+posts. A namespace whose alert has produced no card a day after it was raised
+(the Planning Agent's turn failed) has its alert raised again, and the new
+alert replaces the episode once it is sent; a shorter retry would post a fresh alert every hour or so
+for as long as the turns kept failing. Alerts are not raised at all on a board
+whose tasks table has no `session_id` column, since the card an alert produces
+could not be found. The watch saves its ledger before each inject and fails
+the tick, with no alert, when the ledger cannot be saved, so a ledger that keeps failing
+to save cannot raise the same alerts every tick. A clean tick prints nothing. Anything a tick
+could not read (a
 cluster that timed out, a namespace whose scan failed, the rows of a kind a scan skipped or the repeating-warnings rows of one that could not read the events, a project whose listing failed or that gcloud called incomplete, a cluster whose profile's `cluster_identity` could not be read and whose project nothing else lists, a sweep that hit its
 25-minute budget) keeps its rows and is recorded in the ledger, not posted, and
 an exhausted sweep resumes where it stopped. One project's listing failing holds
@@ -114,9 +137,9 @@ CR's `spec.deployment.env` never reaches the script. The k8s-event-watcher and
 this job split the work by signal: a Warning whose reason is on the watcher's
 list is the watcher's within seconds; a condition, a reference or an event the
 list never names is this job's within the half hour. It declares `risk: high`
-because every card it files starts a Cluster Agent turn over every namespace of
+because every alert it raises starts a Cluster Agent turn over every namespace of
 every cluster on the Cluster Agent roster, the management cluster included
-unless `spec.scope.exclude.clusters` or `RECONCILE_EXCLUDE` names it. The card body and chat lines carry object
+unless `spec.scope.exclude.clusters` or `RECONCILE_EXCLUDE` names it. The inject record and chat lines carry object
 names, heuristics and durations only, never a row's detail, since condition
 reasons, spec paths and event messages are text a tenant writes; the Cluster
 Agent reads that text again when it runs the skill, and its read-only skill and

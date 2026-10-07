@@ -6,11 +6,6 @@ design moves what it does with a new stall from filing a kanban card itself to s
 detector already use. The Cluster Agent still runs `gke-stall-detection`; what changes is where its
 report lands and whether a reply to it can be acted on.
 
-> **Status:** partly implemented. The Session KV server accepts and triages `controller-stall`
-> injects, and `autoops-controller-stall-triage` covers that path. The stall watch still files its
-> own Cluster Agent cards: wherever this design says what the watch does (the producer half of §2,
-> §3.1–§3.4, the producer tests in §6, the risks in §7), it describes the change still to land.
-
 ## 1. Why
 
 Before this design, `stall_watch.py` filed a card straight to the cluster's Cluster Agent and
@@ -56,7 +51,7 @@ stall-watch tick (no_agent, every 30 min)
 
 The payload carries what the old card body carried and nothing more: cluster, project, location,
 namespace, the Cluster Agent profile the watch resolved, when the watch first saw the stall, and one
-`{object, heuristic, stalled_for}` entry per ledger row. Row detail (condition reasons, spec paths,
+`{object, heuristic, stalled_for}` entry per ledger row, up to 500. Row detail (condition reasons, spec paths,
 event messages) stays out, for the reason it stayed out of the card: it is text a tenant writes, and
 the Cluster Agent reads it again when it runs the skill.
 
@@ -78,8 +73,10 @@ An episode stores the session id. The watch finds the card by `tasks.session_id`
 column Hermes stamps with the session that filed the card, the API session the Planning Agent's turn
 runs in) and from then on comments on and completes it exactly as
 before. An episode written by the old code carries `card` and no `session`, and keeps working
-unchanged. A session whose card never appears (the Planning Agent turn failed) ends its episode a day
-after the alert was raised, and the alert is raised again in that tick. A stall episode has no expiry
+unchanged. A session whose card never appears (the Planning Agent turn failed) has its alert raised
+again a day later, and the new alert replaces the episode only once it is sent. A re-alert the tick
+skips (a refusal, the cap, no profile) leaves the old episode in place, so a stall that clears first
+still gets its cleared line. A stall episode has no expiry
 of its own, so without the bound a failed turn would silence the namespace for as long as the stall
 lasted; a shorter one would post a fresh alert every hour or so for as long as turns kept failing.
 The watch raises no alert at all on a board whose tasks table lacks `session_id`, and says so once. An unreadable board is not counted as a missing card: the episode waits for a board that
@@ -96,7 +93,9 @@ cannot be written means no alert, rather than the same alert on every tick. A re
 server unreachable, not advertising the kind, or answering anything but `injected`) ends the tick's
 attempts and is said once in chat, with a line when alerts are raised again. The refusal text names
 no session, since every attempt opens a new one and the ledger compares the text to decide whether
-the refusal is new.
+the refusal is new. A record the server refuses with 400 is that record's fault, not the server's:
+it skips only that namespace. Object names longer than the server's 200-character limit are cut to
+it before the record is sent.
 
 ### 3.4 No alert limit
 
@@ -180,11 +179,12 @@ posted; no alert limit is claimed. The producer: a new episode creates a session
 the cap holds; the card is adopted by session id; comment, clear and complete work through it; an
 old-shape episode keeps working; a daemon that refuses or does not advertise the kind leaves the
 namespace waiting and is said once, at either step; a ledger that cannot be saved raises nothing; a
-session that files no card is raised again a day later; the record `stall_payload` builds is the one
+session that files no card is raised again a day later, and keeps its episode when that re-alert is refused or held; the record `stall_payload` builds is the one
 the daemon's route accepts. `test_triage_reply_roundtrip.py` drives a report cut from `_stall_task_body`
 through the real notifier, server and plugin, and shows the pre-inject stall report shape earns no row.
 
-**Eval.** `autoops-controller-stall-triage`, modelled on `gitops-drift-out-of-band-triage`. Its
+**Eval.** `autoops-controller-stall-triage`, modelled on `gitops-drift-out-of-band-triage`, covers the
+daemon end of the chain and everything after it, not the stall watch, which its unit tests cover. Its
 stack plants a Deployment gated on a pod readiness condition nothing sets, waits until the image's
 own `stall_report.py` reports it (its Deployment threshold is ten minutes, and the Cluster Agent
 runs the same scan when it works the card), posts the `controller-stall` inject built from that
@@ -219,6 +219,17 @@ cases do; the apply step is covered by the unit test above.
   platform. On a dual-platform install the other platform sees the watch's own "stall cleared" and
   "held" lines, which cron delivery fans out, and not the alert or the report. When the alert post
   fails outright the report has no route at all, the same failure the event path has.
+- **A lost ledger re-alerts every open stall.** The card path asked the board through its
+  idempotency key; the inject path asks only the ledger. A ledger that comes back empty (the volume
+  recreated, the file deleted, a `STATE_SCHEMA_VERSION` change) makes every stall still open new,
+  three alerts a tick, and leaves the earlier cards open. Matching open cards by title would be the
+  only guard, and a ledger loss is rare.
+- **An outage's lines can be missing or late.** The "alerts not raised" line is said once per refusal
+  text and forgotten only when an alert is sent. If an outage's stall clears before the server returns,
+  nothing marks the recovery: the "alerts are raised again" line posts with the next alert sent, which
+  can be days later and for an unrelated stall, and a second outage with the same text before then is
+  not said. Forgetting the refusal on a tick with nothing waiting was tried and repeated the line
+  whenever a sweep skipped the namespace.
 - **A kill between saving the ledger and sending the inject delays the alert a day.** The episode is
   saved with a session that never got the record, and the watch waits the day it gives any session
   that files no card. The window is the inject call itself, at most its 30-second timeout.

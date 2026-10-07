@@ -750,11 +750,13 @@ objects in the concepts above. GitHub's JSON stops at the broker.
 
 That decision is also the security boundary, which is why it is made there. A
 caller-supplied URL determines which host a minted credential is presented to,
-so `resolve_forge` matches the URL's host against an allowlist built from the
+so `Registry.resolve` matches the URL's host against an allowlist built from the
 configured forges and refuses anything else outright — there is no default for a
 URL with a host, because defaulting is how a token reaches a host nobody
-configured. A bare `owner/name` means GitHub, which is what every skill in this
-repository has always meant by it. Once the forge is chosen, the clone URL is
+configured. A host two configured forges claim is refused when the registry is
+built, for the same reason. A bare `owner/name` means the install's one forge,
+which is what every skill in this repository has always meant by it; with more
+than one forge it names nothing and is refused, and the caller names the host. Once the forge is chosen, the clone URL is
 composed from validated path segments rather than taken from the caller: the URL
 decided _which forge_, and it does not get to decide the host.
 
@@ -1129,22 +1131,27 @@ command composed inside a forge package, which
 interpolation would be an injection point, since `tokenPath` is operator-supplied
 CR content.
 
-So the forge declares the strategy and the executor renders the config, which is
-the same three-role split the rest of the credential plane uses. The forge
-returns a description, never a command string:
+So the strategy chooses the helper and the executor applies it, which is the
+same three-role split the rest of the credential plane uses. The helper is a
+program at a fixed absolute path in the broker image, never one the
+configuration names, and the value handed to git is that literal plus two
+arguments the strategy has checked against a character set with nothing a shell
+treats specially:
 
 ```python
 def git_config(self, repo: str) -> tuple[tuple[str, str], ...]:
-    # The executor substitutes the helper path; the forge names no command.
-    return (("credential.helper", GIT_CREDENTIAL_HELPER_TOKENFILE),)
+    return (
+        ("credential.helper", ""),  # no helper another forge installed is asked
+        (f"credential.https://{host}.helper", f"{TOKEN_FILE_HELPER} {token_path} {username}"),
+    )
 ```
 
-`GIT_CREDENTIAL_HELPER_TOKENFILE` resolves to a fixed absolute path in the
-broker image — a small program that reads the token from the file named by an
-environment variable the executor sets, and writes `username=oauth2` and the
-token to stdout in git's credential protocol. It is a literal the executor owns,
-with nothing interpolated into it, so the shell it is handed to has nothing to
-act on. Applied through the existing `GIT_CONFIG_COUNT` layer, which
+The program reads the token from that file when git asks, and writes the
+username and the token to stdout in git's credential protocol, so the token is
+never in git's argv, environment or config. The empty `credential.helper` first
+clears every helper configured below it, and the second key is scoped to the
+forge's own host, so git asks this program for that host and nothing else.
+Applied through the existing `GIT_CONFIG_COUNT` layer, which
 `credential_proxy.py` already builds for `GIT_FORCED_CONFIG` and which outranks
 system, global and repo-local config.
 
@@ -1400,7 +1407,9 @@ is built once at broker construction:
 def build_forges(config: ForgeConfig) -> tuple[Forge, ...]
 ```
 
-`GitHubForge` yields exactly one instance, unconditionally. `GitLabForge` yields
+`GitHubForge` yields one instance when no forge configuration is mounted, or
+when the configuration names a `github` forge, and none otherwise; a configured
+host it does not serve is refused. `GitLabForge` yields
 one per configured host, and none when none is configured — in which case
 `gitlab.com` resolves to the `StubForge`, so an install that has not set GitLab
 up gets a named refusal rather than a confusing authentication failure. The host
@@ -1419,7 +1428,8 @@ is only what the broker has to receive, in whatever form that surface renders it
 
 One caveat on hostnames, inherited rather than introduced: a schemeless
 repository value names a host only when `repo_ref.parse` already knows that
-host, so a bare `owner/name` resolves to GitHub, and an in-cluster GitLab
+host, so a bare `owner/name` resolves to the install's one forge (and is refused
+when there are several), and an in-cluster GitLab
 reached as `gitlab` with no scheme is read as a repository named `gitlab` until
 the configured host joins the parser's known set. Registering it there is part
 of wiring the provider up; the misreading is otherwise silent and confusing.
@@ -1565,7 +1575,7 @@ agents/platform/scripts/
   repo_ref.py              # repository identity: RepoRef, parse — already on main, shared with the agent side
   vcs_broker.py            # broker verbs, clone/publish, scratch, routes
   providers/
-    __init__.py            # the public surface: Forge, ForgeUnsupported, resolve_forge
+    __init__.py            # the public surface: Forge, ForgeUnsupported, Registry
     base.py                # Forge ABC, ForgeUnsupported, StubForge, normalised shapes
     validate.py            # the seven validators
     errors.py              # the status-to-guidance table, forge_error(status, detail)
@@ -1618,7 +1628,8 @@ def build_forges(config) -> tuple[Forge, ...]:
 ```
 
 `for_config` is a classmethod returning zero or more instances.
-`GitHubForge.for_config` returns exactly one, always, ignoring its argument.
+`GitHubForge.for_config` returns one, or none when a mounted forge configuration
+leaves GitHub out.
 `GitLabForge.for_config` returns one per configured host and an empty tuple when
 none are configured. Adding Bitbucket is the import line and the tuple entry;
 `build_forges` does not change, and neither does anything downstream of it.
@@ -1849,7 +1860,7 @@ this document is the one assumption it breaks, because that assumption is cheap
 to avoid now and expensive to unpick later.
 
 Everything above assumes **one repository resolves to one provider that answers
-every verb**. `resolve_forge(repository)` returns a single object; the routing
+every verb**. `Registry.resolve(repository)` returns a single object; the routing
 key is the repository's host; `parse` returns a repository. All three are false
 for an issue tracker:
 
@@ -1953,9 +1964,10 @@ by GitHub's host check, which accepting GitLab relaxes under dispatch rather tha
 
 The operator writes each repository into the state ConfigMap as a `ManagedRepoEntry` whose `type`
 is its forge's provider, which is how the discriminator reaches the agent: written down by the
-operator, rather than inferred from the URL's text. What the agent side does not yet do is select
-a provider from it — an administrator who writes a non-GitHub entry straight into the ConfigMap
-gets one the operator preserves and the agent discards. Entries already in the ConfigMap are kept
+operator, rather than inferred from the URL's text. The broker's repository gate reads every
+typed entry, keyed by its `type`, host and path, so an entry counts for the provider it names and
+no other. The agent's skills read only `github` entries — an administrator who writes a
+non-GitHub entry straight into the ConfigMap gets one the broker gates on and the skills discard. Entries already in the ConfigMap are kept
 as written, including fields the operator does not model, such as a context repository's `ref`.
 
 The gateway's FQDN egress policy takes its forge hosts from the declared forges, and always
@@ -2124,7 +2136,7 @@ next to the HTTPS round trip.
 GitHub.** Minty enforces a per-repository permission policy at mint time, so the
 token the broker holds is already narrowed. A group access token is narrowed to
 its group at creation and nothing narrows it further. Two repositories in the
-same group are both reachable with it, and `resolve_forge`'s host allowlist does
+same group are both reachable with it, and `Registry.resolve`'s host allowlist does
 not care which project inside the host a call names.
 
 So `GitLabForge` carries `allowed_paths`, a tuple of namespace prefixes, and
@@ -2523,14 +2535,15 @@ case that will arrive first — are named in
 
 ---
 
-**Reads of repositories the install does not manage.** The broker's own gate
-covers write verbs, and the intent is that reading a repository this install
-does not write to should work — a public upstream, read with no credential. On
-GitHub it does not: every verb that spends the credential makes it current
-first, the credential is minted per managed repository, and the refresh refuses
-an unmanaged one before any call is made, so `clone` and the list and view verbs
-refuse it as surely as `publish` does; only `capabilities` answers. Opening those
-reads needs a credential-less path — a clone with no token, a read API call with
+**Reads of repositories the install does not manage.** The broker refuses every
+verb but `capabilities` at the route for a repository the install does not
+manage, reads included, so the managed list is a visibility control as well as
+a write one on every forge, whatever its credential strategy. A token an
+administrator stored is one token for every repository it can see, so nothing
+downstream of the route would refuse on its behalf. The intent that reading a
+repository this install does not write to should work — a public upstream, read
+with no credential — is real and not served. Opening those reads needs a
+credential-less path — a clone with no token, a read API call with
 none — that the provider can take when the repository is public, which is a
 change to the credential strategy and not to the verbs, and is not designed
 here.
@@ -2551,8 +2564,9 @@ repository's own minter policy, which the operator renders per context
 repository; a forge without a read-only credential answers `NoCredential` and
 the clone proceeds as before.
 The write gate does not consult the role, so a context repository stays refused
-by `commit`, `push`, the collaboration verbs and the refresh route; the verbs'
-credential-less read path for public repositories remains open as above.
+by every `/v1/vcs` verb but `capabilities`, by `commit` and `push`, and by the
+refresh route; the verbs' credential-less read path for public repositories
+remains open as above.
 
 ## 11. Open questions
 
