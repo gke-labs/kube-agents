@@ -188,9 +188,12 @@ validatingwebhookconfigurations,mutatingwebhookconfigurations,services,endpoints
   API group, API version, operation, resource (with the API's `*`, `*/*` and `pods/*` semantics)
   and scope, as the API server matches them: a rule's `apiVersions` must carry `*` or the version
   the server serves the write at (`v1` for every write on the list), so a rule pinned to a version
-  the server no longer serves (`policy/v1beta1`, `certificates.k8s.io/v1beta1`) matches nothing and
-  is an outage, not a blocker, whose cell says the server sends it no request at a served version
-  rather than that its requests fail now; `namespaceSelector`, `objectSelector` and `matchConditions` are not
+  the server no longer serves (`policy/v1beta1`, `certificates.k8s.io/v1beta1`) matches nothing. The
+  pin is judged per rule: a webhook whose every rule is so pinned is an outage, not a blocker, whose
+  cell says the server sends it no request at a served version rather than that its requests fail
+  now, and one that pairs such a rule with a rule the server does serve off the path is an outage
+  whose cell names the live rules as failing their requests now and the pinned rule alone as sent
+  nothing; `namespaceSelector`, `objectSelector` and `matchConditions` are not
   evaluated, so a webhook they narrow is reported as able to match. The cell names the
   configuration, the webhook, the reason and what it matches (an outage cell lists the webhook's
   own rules, with their `apiVersions` when a rule pins any); each JSON finding carries

@@ -176,11 +176,14 @@ WILDCARD = "*"
 # The version the API server serves each write at, carried on its row: the matcher reads a
 # rule's `apiVersions` as the API server does (`*` or the request's version), so a rule pinned
 # to a version the server no longer serves (`policy/v1beta1`, `certificates.k8s.io/v1beta1`,
-# `storage.k8s.io/v1beta1`) matches nothing and is an outage, not a blocker, whose cell says
-# the server sends it no request at a served version (`WEBHOOK_PINNED_MATCHES`). Every write on
-# the list is served at `v1` alone on any GKE version in support; under the default
-# `matchPolicy: Equivalent` a rule naming another served version of the same resource would
-# also match, and no resource here has one.
+# `storage.k8s.io/v1beta1`) matches nothing. The pin is judged per rule (`_rule_version_pinned`):
+# a webhook whose every rule is pinned is an outage, not a blocker, whose cell says the server
+# sends it no request at a served version (`WEBHOOK_PINNED_MATCHES`); one that pairs a pinned
+# rule with a rule the server does serve off the path fails that rule's requests now, and its
+# cell names the live rules as failing and the pinned rule alone as sent nothing
+# (`WEBHOOK_MIXED_MATCHES`). Every write on the list is served at `v1` alone on any GKE version
+# in support; under the default `matchPolicy: Equivalent` a rule naming another served version
+# of the same resource would also match, and no resource here has one.
 VERSION_V1 = "v1"
 GROUP_CORE = ""
 GROUP_POLICY = "policy"
@@ -265,6 +268,10 @@ WEBHOOK_OUTAGE_MATCHES = "none of the operations this rule reads as the upgrade'
 # does not serve: the server sends the webhook none of those requests, so nothing fails now,
 # and the cell says so rather than reporting a live outage.
 WEBHOOK_PINNED_MATCHES = "no request the server sends at a served version (its rules: {rules}; the server serves {pinned} at {served} alone, so it sends this webhook none of them); it is reported, not graded"
+# The off-path cell for a webhook that pairs such a pinned rule with a rule the server does
+# serve: the live rules' requests fail now and are named, and the pinned rule alone is the one
+# the server sends nothing.
+WEBHOOK_MIXED_MATCHES = "none of the operations this rule reads as the upgrade's path (its rules: {rules}); it fails now the requests matched by {live}, and is reported, not graded; the server serves {pinned} at {served} alone, so it sends the rule {pinned_rules} nothing"
 # A webhook's rules, rendered for the cell so the operator can judge an outage: operations
 # joined by `/`, resources by `,`, with the API groups named when any is not the core group,
 # and the core group then named `core` beside the others rather than dropped (a rule on
@@ -820,8 +827,11 @@ def _rule_reaches(rule: dict, group: str, version: str | None, resource: str, op
     return any(isinstance(spec, str) and _resource_matches(spec, resource) for spec in rule.get("resources") or [])
 
 
-def _upgrade_path_labels(hook: dict, *, read_version: bool) -> list[str]:
-    rules = [rule for rule in hook.get("rules") or [] if isinstance(rule, dict)]
+def _rules(hook: dict) -> list[dict]:
+    return [rule for rule in hook.get("rules") or [] if isinstance(rule, dict)]
+
+
+def _upgrade_path_labels(rules: list[dict], *, read_version: bool) -> list[str]:
     matched = []
     for group, version, resource, operation, scope in UPGRADE_PATH_TARGETS:
         if any(_rule_reaches(rule, group, version if read_version else None, resource, operation, scope) for rule in rules):
@@ -831,15 +841,31 @@ def _upgrade_path_labels(hook: dict, *, read_version: bool) -> list[str]:
 
 def upgrade_path_matches(hook: dict) -> list[str]:
     """The operations a node upgrade needs that this webhook's rules can match, as labels."""
-    return _upgrade_path_labels(hook, read_version=True)
+    return _upgrade_path_labels(_rules(hook), read_version=True)
 
 
-def upgrade_path_version_pinned(hook: dict) -> list[str]:
-    """The upgrade-path writes this webhook's rules name only at a version the server does not
-    serve: the rules would match them but for `apiVersions`. The server sends the webhook none
-    of them, so its cell reports the pin rather than a current outage."""
-    served = set(upgrade_path_matches(hook))
-    return [label for label in _upgrade_path_labels(hook, read_version=False) if label not in served]
+def _rule_version_pinned(rule: dict) -> bool:
+    """Whether the server sends this rule nothing because of its `apiVersions`: it names a
+    write on the upgrade's path (it would reach one with the version check off) at a version
+    other than the one the server serves it at, and names nothing the list cannot vouch for,
+    so no wildcard group or resource and no resource off the list, whose served versions this
+    rule does not know. Decided per rule, so a webhook that pairs a pinned rule with a live
+    one is described as failing the live rule's requests, not as sent nothing."""
+    if {WILDCARD, VERSION_V1} & set(rule.get("apiVersions") or []):
+        return False
+    groups = rule.get("apiGroups") or []
+    specs = [spec for spec in rule.get("resources") or [] if isinstance(spec, str)]
+    if not groups or not specs or WILDCARD in groups or any(WILDCARD in spec for spec in specs):
+        return False
+    on_path = {(group, resource) for group, _, resource, _, _ in UPGRADE_PATH_TARGETS}
+    if not all((group, spec) in on_path for group in groups for spec in specs):
+        return False
+    return bool(_upgrade_path_labels([rule], read_version=False))
+
+
+def version_pinned_rules(hook: dict) -> list[dict]:
+    """The rules of this webhook the server sends nothing (`_rule_version_pinned`)."""
+    return [rule for rule in _rules(hook) if _rule_version_pinned(rule)]
 
 
 def grade_webhooks(configs: list[dict], services: list[dict], slices: list[dict]) -> dict:
@@ -852,7 +878,9 @@ def grade_webhooks(configs: list[dict], services: list[dict], slices: list[dict]
     what it does match named so the operator can judge it, because the list is what this
     rule knows of the path, not a proof of safety. An outage finding whose rules name a
     path write only at a version the server does not serve carries those writes in
-    `version_pinned`: the server sends it none of them, and the cell says so.
+    `version_pinned` and those rules in `pinned_rules`, the rest in `live_rules`: the server
+    sends the pinned rules none of them, and the cell says so of the webhook when every rule
+    is pinned, and of the pinned rule alone when a live rule sits beside it.
     Fail-open webhooks are counted
     (`fail_open`), and so are fail-closed webhooks with a URL backend (`url_backends`),
     which nothing read here can check.
@@ -876,6 +904,7 @@ def grade_webhooks(configs: list[dict], services: list[dict], slices: list[dict]
             if reason is None:
                 continue
             matches = upgrade_path_matches(hook)
+            pinned = [] if matches else version_pinned_rules(hook)
             finding = {
                 "webhook": WEBHOOK_NAME_FORMAT.format(config=config_name, webhook=hook.get("name", "")),
                 "config_kind": config_kind,
@@ -884,38 +913,48 @@ def grade_webhooks(configs: list[dict], services: list[dict], slices: list[dict]
                 "service": WEBHOOK_SERVICE_FORMAT.format(namespace=service_ref.get("namespace", ""), name=service_ref.get("name", "")),
                 "reason": reason,
                 "upgrade_path": matches,
-                "version_pinned": [] if matches else upgrade_path_version_pinned(hook),
+                "version_pinned": _upgrade_path_labels(pinned, read_version=False),
                 "rules": describe_rules(hook),
+                "pinned_rules": [describe_rule(rule) for rule in pinned],
+                "live_rules": [describe_rule(rule) for rule in _rules(hook) if not any(rule is p for p in pinned)],
             }
             result["blocking" if matches else "outage"].append(finding)
     return result
 
 
+def describe_rule(rule: dict) -> str:
+    """One rule as `OP/OP resource,resource[ in group,group][ at version,version]`, so a cell
+    that says the webhook is outside the upgrade's path also says what it does match, and at
+    which versions when the rule pins them."""
+    operations = RULE_OPERATION_JOIN.join(str(o) for o in rule.get("operations") or [])
+    resources = RULE_RESOURCE_JOIN.join(str(r) for r in rule.get("resources") or [])
+    text = RULE_FORMAT.format(operations=operations, resources=resources).strip()
+    groups = [str(g) for g in rule.get("apiGroups") or []]
+    if any(groups):
+        text = RULE_GROUP_FORMAT.format(rule=text, groups=RULE_RESOURCE_JOIN.join(g or RULE_CORE_GROUP_NAME for g in groups))
+    versions = [str(v) for v in rule.get("apiVersions") or []]
+    if versions and versions != [WILDCARD]:
+        text = RULE_VERSIONS_FORMAT.format(rule=text, versions=RULE_RESOURCE_JOIN.join(versions))
+    return text
+
+
 def describe_rules(hook: dict) -> list[str]:
-    """Each of the webhook's rules as `OP/OP resource,resource[ in group,group][ at version,version]`,
-    so a cell that says the webhook is outside the upgrade's path also says what it does
-    match, and at which versions when the rule pins them."""
-    out = []
-    for rule in hook.get("rules") or []:
-        if not isinstance(rule, dict):
-            continue
-        operations = RULE_OPERATION_JOIN.join(str(o) for o in rule.get("operations") or [])
-        resources = RULE_RESOURCE_JOIN.join(str(r) for r in rule.get("resources") or [])
-        text = RULE_FORMAT.format(operations=operations, resources=resources).strip()
-        groups = [str(g) for g in rule.get("apiGroups") or []]
-        if any(groups):
-            text = RULE_GROUP_FORMAT.format(rule=text, groups=RULE_RESOURCE_JOIN.join(g or RULE_CORE_GROUP_NAME for g in groups))
-        versions = [str(v) for v in rule.get("apiVersions") or []]
-        if versions and versions != [WILDCARD]:
-            text = RULE_VERSIONS_FORMAT.format(rule=text, versions=RULE_RESOURCE_JOIN.join(versions))
-        out.append(text)
-    return out
+    """Each of the webhook's rules, as `describe_rule` renders it."""
+    return [describe_rule(rule) for rule in _rules(hook)]
 
 
 def describe_webhook_finding(finding: dict) -> str:
     rules = LIST_SEPARATOR.join(finding.get("rules") or []) or RULE_NONE
     if finding["upgrade_path"]:
         matches = LIST_SEPARATOR.join(finding["upgrade_path"])
+    elif finding.get("version_pinned") and finding.get("live_rules"):
+        matches = WEBHOOK_MIXED_MATCHES.format(
+            rules=rules,
+            live=LIST_SEPARATOR.join(finding["live_rules"]),
+            pinned=LIST_SEPARATOR.join(finding["version_pinned"]),
+            served=VERSION_V1,
+            pinned_rules=LIST_SEPARATOR.join(finding.get("pinned_rules") or []),
+        )
     elif finding.get("version_pinned"):
         matches = WEBHOOK_PINNED_MATCHES.format(rules=rules, pinned=LIST_SEPARATOR.join(finding["version_pinned"]), served=VERSION_V1)
     else:

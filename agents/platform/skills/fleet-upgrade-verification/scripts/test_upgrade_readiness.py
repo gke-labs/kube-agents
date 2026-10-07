@@ -710,11 +710,47 @@ class WebhookScopeTest(unittest.TestCase):
         # A pinned rule beside a served one is a blocker, with nothing pinned.
         graded = grade([hook("mixed.example.com", [rule(["certificatesigningrequests"], groups=("certificates.k8s.io",), versions=("v1beta1",)), rule(["pods"])], policy="Fail")])
         self.assertEqual([f["version_pinned"] for f in graded["blocking"]], [[]])
+        self.assertEqual([f["pinned_rules"] for f in graded["blocking"]], [[]])
+        self.assertIn("matches CREATE pods", r.describe_webhook_finding(graded["blocking"][0]))
         # A rule on `*` or on the served version alone carries no version suffix.
         for versions in (("*",), ("v1",)):
             with self.subTest(versions=versions):
                 graded = grade([hook("live.example.com", [rule(["certificatesigningrequests"], groups=("certificates.k8s.io",), versions=versions)], policy="Fail")])
                 self.assertEqual([f["rules"] for f in graded["blocking"]], [["CREATE certificatesigningrequests in certificates.k8s.io"]] if versions == ("*",) else [["CREATE certificatesigningrequests in certificates.k8s.io at v1"]])
+
+    def test_a_pinned_rule_beside_a_live_off_path_rule_fails_the_live_rule_now(self):
+        # The pin is judged per rule. A webhook pairing a CSR rule at v1beta1 with a ConfigMap
+        # rule at v1 refuses every ConfigMap creation now: the cell names that rule as failing
+        # and the pinned rule alone as sent nothing, rather than saying the server sends the
+        # webhook none of its requests.
+        pinned = rule(["certificatesigningrequests"], groups=("certificates.k8s.io",), versions=("v1beta1",))
+        graded = grade([hook("mixed.example.com", [pinned, rule(["configmaps"], versions=("v1",))], policy="Fail")])
+        self.assertEqual(graded["blocking"], [])
+        finding = graded["outage"][0]
+        self.assertEqual(finding["version_pinned"], ["CREATE certificatesigningrequests"])
+        self.assertEqual(finding["pinned_rules"], ["CREATE certificatesigningrequests in certificates.k8s.io at v1beta1"])
+        self.assertEqual(finding["live_rules"], ["CREATE configmaps at v1"])
+        cell = r.describe_webhook_finding(finding)
+        self.assertIn("matches none of the operations this rule reads as the upgrade's path (its rules: CREATE certificatesigningrequests in certificates.k8s.io at v1beta1, CREATE configmaps at v1); it fails now the requests matched by CREATE configmaps at v1, and is reported, not graded; the server serves CREATE certificatesigningrequests at v1 alone, so it sends the rule CREATE certificatesigningrequests in certificates.k8s.io at v1beta1 nothing", cell)
+        self.assertNotIn("sends this webhook none of them", cell)
+        self.assertNotIn("fails its own requests now", cell)
+        # The order of the rules does not change which is named as failing.
+        graded = grade([hook("mixed.example.com", [rule(["configmaps"]), pinned], policy="Fail")])
+        self.assertEqual((graded["outage"][0]["live_rules"], graded["outage"][0]["pinned_rules"]), (["CREATE configmaps"], ["CREATE certificatesigningrequests in certificates.k8s.io at v1beta1"]))
+        # Only a rule the list can vouch for is pinned: a wildcard at v1beta1 and a path
+        # resource named beside one off the list at v1beta1 may still be served, so both keep
+        # the failing-now sentence with nothing pinned.
+        for rules in (
+            [rule(["*"], groups=("*",), operations=("*",), versions=("v1beta1",))],
+            [rule(["certificatesigningrequests", "clustertrustbundles"], groups=("certificates.k8s.io",), versions=("v1beta1",))],
+            [rule(["certificatesigningrequests"], groups=("certificates.k8s.io", "*"), versions=("v1beta1",))],
+        ):
+            with self.subTest(rules=rules):
+                graded = grade([hook("wide.example.com", rules, policy="Fail")])
+                finding = graded["outage"][0]
+                self.assertEqual((finding["version_pinned"], finding["pinned_rules"]), ([], []))
+                self.assertEqual(finding["live_rules"], finding["rules"])
+                self.assertIn("it fails its own requests now", r.describe_webhook_finding(finding))
 
     def test_monitoring_resources_are_outside_the_path(self):
         # GKE's managed Prometheus operator gates its own resources fail-closed.
