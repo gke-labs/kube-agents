@@ -1210,11 +1210,13 @@ class _TransportError(RuntimeError):
         status_code: int | None = None,
         headers: Any = None,
         retryable: bool = False,
+        failure_reason: str | None = None,
     ) -> None:
         super().__init__(message)
         self.status_code = status_code
         self.headers = headers
         self.retryable = retryable
+        self.failure_reason = failure_reason
 
 
 # Gateway statuses a proxy in front of the agent emits when the upstream is
@@ -1231,8 +1233,9 @@ class _TransportError(RuntimeError):
 # answer about the request itself and repeating the request cannot change it:
 # a handler that raised will raise again, so those remain graded agent errors.
 # When the server attaches X-Hermes-Failure-Reason, the turn executed; a
-# rate-limit or billing reason is routed to infrastructure, while any other
-# failure reason is graded without retrying.
+# rate-limit or billing reason is routed to infrastructure on opening turns
+# or delegation status turns, while any other failure reason (or a failure
+# reason on answer turns) is graded without retrying.
 _RETRYABLE_STATUSES = frozenset({429, 502, 503, 504})
 
 
@@ -1272,11 +1275,16 @@ def _post_turn(
             payload = json.loads(response.read().decode("utf-8"))
             session_id = response.headers.get(_SESSION_ID_HEADER, "")
     except urllib.error.HTTPError as exc:
+        failure_reason = (
+            exc.headers.get(_FAILURE_REASON_HEADER) if exc.headers else None
+        )
+        retryable = exc.code in _RETRYABLE_STATUSES and not failure_reason
         raise _TransportError(
             f"HTTP {exc.code} from agent endpoint: {_http_error_detail(exc)}",
             status_code=exc.code,
             headers=exc.headers,
-            retryable=exc.code in _RETRYABLE_STATUSES,
+            retryable=retryable,
+            failure_reason=failure_reason,
         ) from exc
     except (OSError, http.client.HTTPException, ValueError) as exc:
         # Timeouts, resets, a mid-read protocol failure, and a body that is
@@ -1559,18 +1567,14 @@ class KubeAgentsHarness(AgentHarness):
                 # If the server response carried X-Hermes-Failure-Reason, an
                 # agent turn executed and produced a classified outcome.
                 # When the reason indicates an infrastructure condition
-                # (token budget exhausted on billing or provider rate limit),
-                # it is classified as infrastructure. Otherwise (such as a
-                # tool error or agent failure), it returns an errored result
-                # directly ahead of any gateway transport retry so the executed
-                # and billed turn remains graded.
-                failure_reason = (
-                    exc.headers.get(_FAILURE_REASON_HEADER)
-                    if exc.headers
-                    else None
-                )
-                if failure_reason:
-                    if failure_reason in ("rate_limit", "billing"):
+                # (token budget exhausted on billing or provider rate limit)
+                # and this is the opening turn, it is classified as
+                # infrastructure. On subsequent answer turns (e.g. card-wake)
+                # or for agent errors (such as tool error), it returns an
+                # errored result directly ahead of any gateway transport retry
+                # so the executed and billed turn remains graded and preserved.
+                if exc.failure_reason:
+                    if exc.failure_reason in ("rate_limit", "billing") and opening_turn:
                         return _infra_failure(str(exc))
                     return AgentResult.errored(str(exc))
                 # A 500, a 4xx other than 429, or a body that is not JSON says a handler
@@ -2301,8 +2305,8 @@ class KubeAgentsHarness(AgentHarness):
 
         Raises:
             _DelegationTransportExhausted: Every retry died without reaching
-                an agent -- no HTTP answer at all, or a 429 refused at the
-                admission door; the run is infrastructure, not a gradable
+                an agent, or a status turn hit an infrastructure limit
+                (rate limit or billing); the run is infrastructure, not a gradable
                 result.
         """
         # The delegating turn may already have shown a card done, in which case
@@ -2384,6 +2388,19 @@ class KubeAgentsHarness(AgentHarness):
             try:
                 status_turn, turn_session = turn(poll, min(timeout, remaining))
             except _TransportError as exc:
+                if exc.failure_reason in ("rate_limit", "billing"):
+                    _purge_card_state(awaited, _EXEC_TIMEOUT)
+                    raise _DelegationTransportExhausted(
+                        f"status turn hit infrastructure failure ({exc.failure_reason}): {exc}"
+                    ) from exc
+                if exc.failure_reason:
+                    result.errors.append(
+                        f"status turn failed with agent error ({exc.failure_reason}): {exc}; "
+                        "still waiting on: " + ", ".join(outstanding) + "; "
+                        f"tunnel log: {_tail(_pf_log_path(local_port))}"
+                    )
+                    timed_out = False
+                    break
                 transport_failures += 1
                 _log.warning(
                     "status turn failed (%d/%d): %s",

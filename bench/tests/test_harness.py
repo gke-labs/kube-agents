@@ -2528,6 +2528,46 @@ def test_status_turns_the_endpoint_answered_still_grade_the_partial_record(
     assert recorded_pf_resets == []
 
 
+def test_a_status_turn_502_with_tool_error_is_graded_without_retrying(
+    stub_agent: _StubAgentServer, instant_polls: None, recorded_pf_resets: list[int]
+) -> None:
+    """A status turn 502 with an agent failure reason is graded on the first attempt."""
+    stub_agent.turns = [_create_turn(), _show_turn("done")]
+    stub_agent.fail_on = frozenset({2})
+    stub_agent.fail_on_status = 502
+    stub_agent.fail_headers = {"X-Hermes-Failure-Reason": "tool_error"}
+
+    result = KubeAgentsHarness().run("Find the root cause.")
+
+    assert result.has_errors()
+    assert harness.INFRA_FAILURE_MARKER not in result.errors[0]
+    assert "agent error (tool_error)" in result.errors[0]
+    assert len(stub_agent.requests) == 2
+    assert recorded_pf_resets == []
+
+
+def test_a_status_turn_502_with_rate_limit_is_infra_without_retrying(
+    stub_agent: _StubAgentServer,
+    instant_polls: None,
+    recorded_pf_resets: list[int],
+    no_cluster_exec: list[str],
+) -> None:
+    """A status turn 502 with rate_limit or billing exits immediately as infrastructure."""
+    stub_agent.turns = [_create_turn(), _show_turn("done")]
+    stub_agent.fail_on = frozenset({2})
+    stub_agent.fail_on_status = 502
+    stub_agent.fail_headers = {"X-Hermes-Failure-Reason": "rate_limit"}
+
+    result = KubeAgentsHarness().run("Find the root cause.")
+
+    assert result.has_errors()
+    assert result.errors[0].startswith(harness.INFRA_FAILURE_MARKER)
+    assert len(stub_agent.requests) == 2
+    purges = [s for s in no_cluster_exec if "rm -rf" in s]
+    assert len(purges) == 1
+    assert _TASK_ID in purges[0]
+
+
 # --- cumulative (replayed) payloads ------------------------------------------
 #
 # This endpoint is stateful: on a reused conversation id it returns the whole
@@ -3370,6 +3410,26 @@ def test_a_card_wake_answer_turn_500_is_an_agent_error_not_infra(
     assert result.has_errors()
     assert harness.INFRA_FAILURE_MARKER not in result.errors[0]
     assert "HTTP 500" in result.errors[0]
+    assert len(stub_agent.requests) == 2
+    assert result.output == _FINAL_TEXT
+    assert _archived(scripts)
+
+
+def test_a_card_wake_answer_turn_502_with_rate_limit_is_an_agent_error_not_infra(
+    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer
+) -> None:
+    """A 502 with rate_limit on an answer turn remains an agent error, preserving the wake reply."""
+    scripts: list[str] = []
+    monkeypatch.setattr(harness, "_agent_shell", _replay_shell(scripts))
+    stub_agent.fail_on = frozenset({2})
+    stub_agent.fail_on_status = 502
+    stub_agent.fail_headers = {"X-Hermes-Failure-Reason": "rate_limit"}
+
+    result = KubeAgentsHarness().run(_REPLAY_PROMPT)
+
+    assert result.has_errors()
+    assert harness.INFRA_FAILURE_MARKER not in result.errors[0]
+    assert "HTTP 502" in result.errors[0]
     assert len(stub_agent.requests) == 2
     assert result.output == _FINAL_TEXT
     assert _archived(scripts)
