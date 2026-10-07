@@ -915,7 +915,13 @@ ALLOW_ALL_SHAPE_KIND = "NetworkPolicy"
 # the pod — a ReplicationController or a pod-owning custom resource as readily
 # as a Deployment — so for those two only the scope spellings are refused.
 COST_CONTROLLER_CHECKS = frozenset({"overrequest", "idle-workload"})
-SCOPE_KIND_SPELLINGS = frozenset({"project", "projects", "cluster", "clusters", "namespace", "namespaces", "ns"})
+# A namespace owns no pods, so under the controller checks these spellings are
+# a roll-up whatever the item says. `Cluster/` and `Project/` are a roll-up
+# only in the roll-up's shape, an empty namespace: a controller always carries
+# its namespace, and a pod-owning custom resource may be called `Cluster`
+# (CloudNativePG's is), so the name alone cannot decide.
+NAMESPACE_KIND_SPELLINGS = frozenset({"namespace", "namespaces", "ns"})
+UNNAMESPACED_SCOPE_SPELLINGS = frozenset({"project", "projects", "cluster", "clusters"})
 COST_DECLARABLE_OBJECT_KINDS: dict[str, frozenset[str]] = {
     "unconsumed-pvc": frozenset({"persistentvolumeclaim"}),
     "unattached-disk": frozenset({"disk"}),
@@ -3564,7 +3570,7 @@ def validate_findings(data: object, audit_id: str) -> dict:
                     f"{', '.join(sorted(SHARED_ACCOUNT_WORKLOAD_KINDS))}); the namespace or the "
                     "account covers no workload"
                 )
-            scope_reason = _rollup_scope_reason(check, str(entry["object"]))
+            scope_reason = _rollup_scope_reason(check, str(entry["object"]), str(entry.get("namespace") or ""))
             if scope_reason:
                 raise ValidationError(
                     f"{where}.object: {str(entry['object'])!r} {scope_reason}; a declaration "
@@ -4983,7 +4989,7 @@ def parse_declarations(
             log(f"WARNING: {item_where}: object must be Kind/name, got {raw_object!r}; skipped.")
             continue
         obj = f"{kind}/{name}"
-        scope_reason = _rollup_scope_reason(check, obj)
+        scope_reason = _rollup_scope_reason(check, obj, item["namespace"])
         if scope_reason:
             # Said here, where every item passes: `finish` refuses the item
             # on the join too, but only where a finding meets its key, and
@@ -5321,7 +5327,7 @@ def _declaration_covers(item: dict, scoped: dict, fleet_wide: dict, declarable) 
         return None
     if check == NAMESPACE_SHAPE_CHECK and not _is_namespace_object(str(item.get("object", ""))):
         return None
-    if _rollup_scope_reason(check, str(item.get("object", ""))):
+    if _rollup_scope_reason(check, str(item.get("object", "")), str(item.get("namespace") or "")):
         return None
     return match
 
@@ -5359,10 +5365,17 @@ def declare_collector_candidates(data: dict, declarations: list[dict], manifest:
     known = {derive_finding_id(f) for f in data.get("findings") or []} | {
         derive_finding_id(e) for e in declared
     }
+    # A cost entry the worker moved itself carries the worker's title; the
+    # Declared intent row owes the collector's measured size and grade on
+    # every route, so the candidate it meets here rewrites that title.
+    worker_declared = {derive_finding_id(e): e for e in declared}
     added: list[str] = []
     for entry, candidate in _candidates(manifest):
         keyed = {**candidate, "cluster": str(candidate.get("cluster") or entry.get("name") or "")}
         identity = derive_finding_id(keyed)
+        own = worker_declared.get(identity)
+        if own is not None and _is_cost_declarable(str(own.get("check", ""))):
+            own["title"] = cost_declared_title(str(own.get("check", "")), str(own.get("object", "")), str(keyed.get("severity", "")), str(keyed.get("excerpt", "")))
         if identity in known or keyed["cluster"] not in audited:
             continue
         match = _declaration_covers(keyed, scoped, fleet_wide, declarable)
@@ -5417,19 +5430,22 @@ def fold_unnamespaced_check(entry: dict) -> None:
         entry["namespace"] = ""
 
 
-def _rollup_scope_reason(check: str, obj: str) -> str | None:
+def _rollup_scope_reason(check: str, obj: str, namespace: str = "") -> str | None:
     """Why `obj` is not an object `check` names — a roll-up's scope, or a kind the check never files — or None.
 
-    A cost declarable check accepts only the kinds its finding names
-    (`COST_DECLARABLE_OBJECT_KINDS`): `Project/` and `Cluster/` are scopes
-    under every one of them, a `Namespace/` under anything but 3.10 is §5's
-    collapse, and `ns/payments` is a spelling of it a denylist would admit.
-    Another stream's check is not judged here.
+    A cost check with fixed object kinds accepts only those
+    (`COST_DECLARABLE_OBJECT_KINDS`). The two controller checks file whatever
+    kind owns the pod, so they refuse a namespace spelling always and a
+    `Cluster/` or `Project/` only with an empty namespace, the roll-up's
+    shape: a controller carries its namespace, a §5 collapse or the 3.5
+    roll-up does not. Another stream's check is not judged here.
     """
     kind = _object_kind_segment(obj)
     if check in COST_CONTROLLER_CHECKS:
-        if kind in SCOPE_KIND_SPELLINGS:
-            return f"names a roll-up's scope (`{kind}/`), not a controller a {check} finding names"
+        if kind in NAMESPACE_KIND_SPELLINGS:
+            return f"names a namespace (`{kind}/`), which owns no pod a {check} finding names"
+        if kind in UNNAMESPACED_SCOPE_SPELLINGS and not str(namespace or "").strip():
+            return f"names a roll-up's scope (`{kind}/` with no namespace), not a controller a {check} finding names"
         return None
     allowed = COST_DECLARABLE_OBJECT_KINDS.get(check)
     if allowed is not None and kind not in allowed:
@@ -5517,7 +5533,7 @@ def apply_declarations(data: dict, declarations: list[dict]) -> list[dict]:
                 f"{match.get('repo', '')}:{match.get('path', '')} stands and the finding publishes."
             )
             match = None
-        scope_reason = _rollup_scope_reason(check, str(finding.get("object", ""))) if match is not None else None
+        scope_reason = _rollup_scope_reason(check, str(finding.get("object", "")), str(finding.get("namespace") or "")) if match is not None else None
         if scope_reason:
             # A roll-up carries no object identity of its own; a note that
             # names its scope would silence every member at once.

@@ -6102,6 +6102,12 @@ class TestCostDeclaredShapes(HarnessTestCase):
         ]}]}
         self.assertEqual(len(audit_report.declare_collector_candidates(again, declarations, manifest)), 1)
         self.assertEqual(again["declared"][0]["title"], "NodePool/gpu-warm — idle-nodepool, MAJOR: 20 nodes (a2-highgpu-1g) at <=3% allocation")
+        # A row the worker moved itself carries the worker's title until the
+        # candidate it meets on the manifest route rewrites it the same way.
+        own = self._doc([])
+        own["declared"] = [make_declared(check="idle-nodepool", cluster="prod-us-east", namespace="", obj="NodePool/gpu-warm", title="warm pool, declared by hand")]
+        self.assertEqual(audit_report.declare_collector_candidates(own, declarations, manifest), [])
+        self.assertEqual(own["declared"][0]["title"], "NodePool/gpu-warm — idle-nodepool, MAJOR: 20 nodes (a2-highgpu-1g) at <=3% allocation")
         # Another stream's row keeps the finding's own title.
         other = audit_report.validate_findings(make_doc(findings=[make_finding(check="netpol-missing", title="Namespace has no NetworkPolicy", obj="Namespace/payments")], audit=AUDIT), AUDIT)
         audit_report.apply_declarations(other, [{"check": "netpol-missing", "namespace": "payments", "object": "Namespace/payments", "repo": "acme/fleet", "path": "knowledge/p.md", "excerpt": "x"}])
@@ -6122,9 +6128,13 @@ class TestCostDeclaredShapes(HarnessTestCase):
         short = make_finding(fid="short", severity="major", check="overrequest", obj="ns/payments")
         plural = make_finding(fid="plural", severity="major", check="idle-address", cluster=self.PROJECT, namespace="", obj="projects/acme-prod")
         # 3.1 names whatever controller owns the pod, so a pod-owning custom
-        # resource is an object it files and a declaration for it joins.
+        # resource is an object it files and a declaration for it joins — a
+        # CloudNativePG `Cluster/pg-main` in its namespace included; the same
+        # kind with no namespace is a §5 collapse and is refused.
         crd = make_finding(fid="crd", severity="minor", check="overrequest", obj="StrimziPodSet/kafka")
-        doc = self._doc([addresses, claims, requests, short, plural, crd])
+        pg = make_finding(fid="pg", severity="minor", check="overrequest", namespace="db", obj="Cluster/pg-main")
+        collapse = make_finding(fid="collapse", severity="major", check="overrequest", namespace="", obj="Cluster/prod-us-east")
+        doc = self._doc([addresses, claims, requests, short, plural, crd, pg, collapse])
         declarations = [
             self._declaration("idle-address", "Project/acme-prod"),
             self._declaration("unconsumed-pvc", "Cluster/prod-us-east"),
@@ -6132,21 +6142,23 @@ class TestCostDeclaredShapes(HarnessTestCase):
             self._declaration("overrequest", "ns/payments", namespace="payments"),
             self._declaration("idle-address", "projects/acme-prod"),
             self._declaration("overrequest", "StrimziPodSet/kafka", namespace="payments"),
+            self._declaration("overrequest", "Cluster/pg-main", namespace="db"),
+            self._declaration("overrequest", "Cluster/prod-us-east"),
         ]
         err = io.StringIO()
         with contextlib.redirect_stderr(err):
-            self.assertEqual([f["object"] for f in audit_report.apply_declarations(doc, declarations)], ["StrimziPodSet/kafka"])
-        self.assertEqual(len(doc["findings"]), 5)
-        self.assertEqual(err.getvalue().count("DECLARATION NOT APPLIED"), 5)
+            self.assertEqual([f["object"] for f in audit_report.apply_declarations(doc, declarations)], ["StrimziPodSet/kafka", "Cluster/pg-main"])
+        self.assertEqual(len(doc["findings"]), 6)
+        self.assertEqual(err.getvalue().count("DECLARATION NOT APPLIED"), 6)
         self.assertIn("roll-up", err.getvalue())
         scoped, fleet_wide = audit_report._declaration_lookup(declarations)
-        for finding in (addresses, claims, requests, short, plural):
+        for finding in (addresses, claims, requests, short, plural, collapse):
             with self.subTest(finding["object"]):
                 self.assertIsNone(audit_report._declaration_covers(finding, scoped, fleet_wide, audit_report.audit_declarable_checks(self.COST)))
         # A 3.10 namespace is the object itself and still joins.
         namespace = make_finding(fid="ns", severity="minor", check="idle-namespace", namespace="", obj="Namespace/demo-q1")
         self.assertIsNotNone(audit_report._declaration_covers(namespace, *audit_report._declaration_lookup([self._declaration("idle-namespace", "Namespace/demo-q1")]), audit_report.audit_declarable_checks(self.COST)))
-        for check, obj, namespace_field in (("idle-address", "Project/acme-prod", ""), ("unconsumed-pvc", "Cluster/prod-us-east", ""), ("overrequest", "Namespace/payments", "payments"), ("overrequest", "ns/payments", "payments"), ("idle-address", "projects/acme-prod", "")):
+        for check, obj, namespace_field in (("idle-address", "Project/acme-prod", ""), ("unconsumed-pvc", "Cluster/prod-us-east", ""), ("overrequest", "Namespace/payments", "payments"), ("overrequest", "ns/payments", "payments"), ("idle-address", "projects/acme-prod", ""), ("overrequest", "Cluster/prod-us-east", "")):
             with self.subTest(obj):
                 written = self._doc([])
                 written["declared"] = [make_declared(check=check, cluster=self.PROJECT if check == "idle-address" else "prod-us-east", namespace=namespace_field, obj=obj)]
