@@ -42,7 +42,7 @@ def _board(path: Path, cards: list[tuple[str, str, str, int]]) -> None:
     conn.close()
 
 
-def _ranking(status: str, key: str = oobe.PRIORITIZE_KEY, created_at: int = SWEEP_CREATED_AT + 60, tid: str = "t_rank"):
+def _ranking(status: str, key: str = oobe.bootstrap_handoff.PRIORITIZE_KEY, created_at: int = SWEEP_CREATED_AT + 60, tid: str = "t_rank"):
     return (tid, status, key, created_at)
 
 
@@ -50,7 +50,7 @@ class StageTest(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
         self.d = Path(self._tmp.name)
-        self.board = self.d / oobe.BOARD_FILE
+        self.board = self.d / "kanban.db"
         self.started: list[tuple[list[str], dict]] = []
         self.failing: set[str] = set()
         self.repos: list[str] | Exception = list(REPOS)
@@ -115,8 +115,54 @@ class StageTest(unittest.TestCase):
         self._main()
         self.assertEqual(self.started, [])
 
+    def test_a_failed_or_cancelled_ranking_card_fires(self):
+        # The hand-off counts both as settled, and so does the stage.
+        for status in ("failed", "cancelled"):
+            with self.subTest(status=status):
+                self.started.clear()
+                (self.d / oobe.AUDITS_MARKER).unlink(missing_ok=True)
+                self.board.unlink(missing_ok=True)
+                self._file_scan()
+                _board(self.board, [_ranking(status)])
+                self._main()
+                self.assertEqual(self._started_ids(), list(oobe.FIRST_RUN_AUDITS))
+
+    def test_the_hand_offs_no_ranking_record_fires_at_once(self):
+        # No cluster audited: the hand-off wrote the report itself and files no ranking card.
+        self._file_scan()
+        _board(self.board, [])
+        (self.d / ".bootstrap_handoff_filed").write_text(f"sweep={SWEEP_ID}\ntask_id=none\nfiled_at={FILED_AT}\n")
+        self._main()
+        self.assertEqual(self._started_ids(), list(oobe.FIRST_RUN_AUDITS))
+
+    def test_the_hand_offs_recorded_card_decides(self):
+        # Only the card the hand-off filed counts, whatever else sits under the key.
+        (self.d / ".bootstrap_handoff_filed").write_text(f"sweep={SWEEP_ID}\ntask_id=t_real\nfiled_at={FILED_AT}\n")
+        self._file_scan()
+        _board(self.board, [_ranking("done", tid="t_stray"), _ranking("running", tid="t_real")])
+        self._main()
+        self.assertEqual(self.started, [])
+        self.board.unlink()
+        _board(self.board, [_ranking("running", tid="t_stray"), _ranking("done", tid="t_real")])
+        self._main()
+        self.assertEqual(self._started_ids(), list(oobe.FIRST_RUN_AUDITS))
+
+    def test_a_record_for_another_sweep_is_ignored(self):
+        self._file_scan()
+        _board(self.board, [_ranking("running")])
+        (self.d / ".bootstrap_handoff_filed").write_text("sweep=t_older\ntask_id=none\nfiled_at=1\n")
+        self._main()
+        self.assertEqual(self.started, [])
+
+    def test_a_scan_marker_typed_by_hand_is_read(self):
+        # The re-arm runbook has an operator write this file; the hand-off accepts `key = value`.
+        (self.d / oobe.SCAN_FILED_MARKER).write_text(f"task_id = {SWEEP_ID}\nfiled_at = {FILED_AT}\n")
+        _board(self.board, [_ranking("done")])
+        self._main()
+        self.assertEqual(self._started_ids(), list(oobe.FIRST_RUN_AUDITS))
+
     def test_a_blocked_ranking_card_waits_for_the_fallback(self):
-        # A card out of retries ends blocked; Hermes has no failed status.
+        # A card a person may still unblock.
         self._file_scan()
         _board(self.board, [_ranking("blocked")])
         self._main()
@@ -126,20 +172,20 @@ class StageTest(unittest.TestCase):
 
     def test_waits_while_a_retry_still_runs(self):
         self._file_scan()
-        _board(self.board, [_ranking("done"), _ranking("running", key=oobe.PRIORITIZE_KEY + "-retry-1", tid="t_retry")])
+        _board(self.board, [_ranking("done"), _ranking("running", key=oobe.bootstrap_handoff.PRIORITIZE_KEY + "-retry-1", tid="t_retry")])
         self._main()
         self.assertEqual(self.started, [])
 
     def test_a_finished_retry_counts(self):
         self._file_scan()
-        _board(self.board, [_ranking("done", key=oobe.PRIORITIZE_KEY + "-retry-1")])
+        _board(self.board, [_ranking("done", key=oobe.bootstrap_handoff.PRIORITIZE_KEY + "-retry-1")])
         self._main()
         self.assertEqual(self._started_ids(), list(oobe.FIRST_RUN_AUDITS))
 
     def test_an_archived_ranking_card_counts(self):
         # How the eval stack presents a settled scan (bench/tf/prebuilt/oobe-first-run-audits).
         self._file_scan()
-        _board(self.board, [_ranking("archived", key=oobe.PRIORITIZE_KEY + "-oobe-eval-20261006")])
+        _board(self.board, [_ranking("archived", key=oobe.bootstrap_handoff.PRIORITIZE_KEY + "-oobe-eval-20261006")])
         self._main()
         self.assertEqual(self._started_ids(), list(oobe.FIRST_RUN_AUDITS))
 

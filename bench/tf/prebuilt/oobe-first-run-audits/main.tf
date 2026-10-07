@@ -23,7 +23,9 @@
 # one: an install that finished onboarding before the job existed never got it.
 # An image without the job gets nothing put back, so nothing starts the audits.
 #
-# Before it arms, the apply waits until none of the four audits is still running
+# Before it arms, the apply waits for the install's own first-run stage to finish
+# (a fresh install has the job pending until its own scan settles), failing after
+# `own_wait`. It then waits until none of the four audits is still running
 # from an earlier repetition, since an audit already in flight is not started
 # again when it is marked due; it fails if they are still running after
 # `busy_wait`. An earlier run's arm left behind is disarmed first. After the arm it
@@ -56,7 +58,11 @@ locals {
   arm_b64    = base64encode(file("${path.module}/arm.py"))
   disarm_b64 = base64encode(file("${path.module}/disarm.py"))
   busy_b64   = base64encode(file("${path.module}/in_flight.py"))
-  ran_b64    = base64encode(file("${path.module}/oobe_ran.py"))
+  own_b64    = base64encode(file("${path.module}/own_stage.py"))
+  # One infra-lock deadline (hack/ci-eval-pr.sh): a fresh install's own scan usually settles
+  # inside it, and holding the lock longer stalls every other stack-bearing case.
+  own_wait = 1800
+  ran_b64  = base64encode(file("${path.module}/oobe_ran.py"))
   # arm.py prints this when the image ships no oobe job.
   no_job   = "ships no oobe job"
   ran_wait = 300
@@ -139,7 +145,20 @@ resource "null_resource" "oobe" {
       # ---- 1. Finish an earlier run's teardown ----------------------------
       disarm
 
-      # ---- 2. Wait for an earlier repetition's audits ---------------------
+      # ---- 2. Wait for the install's own first-run stage ------------------
+      # Arming over it would point the job at the stand-in cards, start the
+      # audits beside the real scan and use up the install's own first run.
+      elapsed=0
+      until own="$(printf '%s' '${local.own_b64}' | base64 -d | agent_py "${local.home}")" && [ "$own" = clear ]; do
+        if [ "$elapsed" -ge ${local.own_wait} ]; then
+          echo "ERROR: the install's own first-run stage on ${var.host_cluster_name} is still $${own:-unreadable} after $${elapsed}s: its onboarding scan has not settled, and this case would cut across it." >&2
+          exit 1
+        fi
+        sleep ${local.poll}
+        elapsed=$((elapsed + ${local.poll}))
+      done
+
+      # ---- 3. Wait for an earlier repetition's audits ---------------------
       # Only a count is used: a failed exec or query prints nothing, and that
       # is not "none running".
       elapsed=0
@@ -152,12 +171,12 @@ resource "null_resource" "oobe" {
         elapsed=$((elapsed + ${local.poll}))
       done
 
-      # ---- 3. Arm ---------------------------------------------------------
+      # ---- 4. Arm ---------------------------------------------------------
       arming=1
       armed="$(printf '%s' '${local.arm_b64}' | base64 -d | agent_py "${local.home}" "${local.hermes}" "$(date -u +%Y%m%d%H%M%S)")"
       printf '%s\n' "$armed"
 
-      # ---- 4. Wait for the job's first run --------------------------------
+      # ---- 5. Wait for the job's first run --------------------------------
       # Whether or not it ends in time, the verifier decides; this only keeps
       # its window from opening before the stage has had its turn.
       if [[ "$armed" != *"${local.no_job}"* ]]; then

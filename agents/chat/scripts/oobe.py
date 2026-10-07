@@ -50,6 +50,8 @@ AUDITS_MARKER = ".oobe_audits_fired"
 SCAN_FILED_MARKER = ".bootstrap_scan_filed"
 MARKER_TASK_ID = "task_id"
 MARKER_FILED_AT = "filed_at"
+# The hand-off's marker (bootstrap_handoff._record): `sweep=`, and `task_id=` its ranking card.
+HANDOFF_SWEEP = "sweep"
 
 # The four audits #1866 names, by their ids in agents/platform/cron/jobs.json.
 FIRST_RUN_AUDITS = (
@@ -65,17 +67,18 @@ ROSTER_FILE = "jobs.json"
 # Hermes' pause marker on a job record (cron.jobs: is_job_runnable).
 PAUSED_STATE = "paused"
 
-# The ranking card the hand-off files last (bootstrap_handoff.PRIORITIZE_KEY). Hermes retries it
-# in place; a re-run by hand adds a suffix (bootstrap_onboarding/README.md), so the prefix
-# counts too.
-PRIORITIZE_KEY = "bootstrap-inventory-prioritize"
-PRIORITIZE_RETRY_PATTERN = PRIORITIZE_KEY + "-%"
-# Statuses a card does not leave on its own (hermes_cli/kanban_db.py VALID_STATUSES). A card
-# that runs out of retries ends blocked, which a person may still unblock, so it is not here:
-# the fallback covers one nobody does.
-FINISHED_STATUSES = ("done", "archived")
-BOARD_FILE = "kanban.db"
-SQLITE_BUSY_TIMEOUT_SECONDS = 10
+# Without the hand-off's own record of its ranking card (an install the hand-off has not reached,
+# or the eval stack's stand-in), the card is found by key. Hermes retries it in place; a re-run by
+# hand adds a suffix (bootstrap_onboarding/README.md), so the prefix counts too.
+PRIORITIZE_RETRY_PATTERN = bootstrap_handoff.PRIORITIZE_KEY + "-%"
+# The statuses the hand-off itself counts as settled, less blocked and triage: a person may still
+# unblock a card, and the fallback covers one nobody does.
+FINISHED_STATUSES = (
+    bootstrap_handoff.DONE,
+    bootstrap_handoff.FAILED,
+    bootstrap_handoff.CANCELLED,
+    bootstrap_handoff.ARCHIVED,
+)
 
 # The fallback waits out the hand-off's own deadline for this sweep's cluster cards
 # (bootstrap_handoff.deadline), after which it files the ranking card, plus this long for the
@@ -135,40 +138,47 @@ def write_state(data_dir: Path, state: dict) -> None:
 
 
 def scan_filed(data_dir: Path) -> tuple[str, float] | None:
-    """The sweep card's id and when it was filed, or None before the scan has started."""
-    try:
-        text = (data_dir / SCAN_FILED_MARKER).read_text(encoding="utf-8")
-    except OSError:
+    """The sweep card's id and when it was filed, or None before the scan has started.
+
+    Read with the hand-off's own parser, which takes a marker typed by hand as `key = value`.
+    """
+    marker = data_dir / SCAN_FILED_MARKER
+    if not marker.is_file():
         return None
-    fields = dict(line.split("=", 1) for line in text.splitlines() if "=" in line)
-    task_id = fields.get(MARKER_TASK_ID, "").strip()
+    fields = bootstrap_handoff._read_marker(marker)
     try:
         filed_at = float(fields.get(MARKER_FILED_AT, ""))
     except ValueError:
         # Hand-written or truncated: the marker's own age is the next best clock.
-        filed_at = (data_dir / SCAN_FILED_MARKER).stat().st_mtime
-    return task_id, filed_at
+        filed_at = marker.stat().st_mtime
+    return fields.get(MARKER_TASK_ID, ""), filed_at
 
 
 def board_path(data_dir: Path) -> Path:
-    try:
-        from hermes_cli.kanban_db import kanban_db_path
-
-        return Path(kanban_db_path())
-    except Exception:  # noqa: BLE001 - outside the pod, or an older board
-        return data_dir / BOARD_FILE
+    return bootstrap_handoff._board_path(data_dir)
 
 
-def read_scan(board: Path, sweep_id: str) -> tuple[bool, int] | None:
+def handoff_ranking(data_dir: Path, sweep_id: str) -> str | None:
+    """The ranking card the hand-off filed for this sweep, its ``NO_RANKING``, or None if it has not."""
+    fields = bootstrap_handoff._read_marker(data_dir / bootstrap_handoff.HANDOFF_MARKER)
+    if not sweep_id or fields.get(HANDOFF_SWEEP) != sweep_id:
+        return None
+    return fields.get(MARKER_TASK_ID) or None
+
+
+def read_scan(board: Path, sweep_id: str, ranking: str | None = None) -> tuple[bool, int] | None:
     """Whether this sweep's ranking cards have all finished, and how many cluster cards it has.
 
-    None when the board cannot say. Only cards created after the sweep card count, so an
-    earlier run's cards, left on the board after onboarding was re-armed, cannot fire this one.
+    ``ranking`` is the card the hand-off recorded for this sweep. Without it, every card under the
+    ranking key created after the sweep card counts, so an earlier run's cards, left on the board
+    after onboarding was re-armed, cannot fire this one. None when the board cannot say.
     """
     if not sweep_id:
         return None
     try:
-        conn = sqlite3.connect(f"file:{board}?mode=ro", uri=True, timeout=SQLITE_BUSY_TIMEOUT_SECONDS)
+        conn = sqlite3.connect(
+            f"file:{board}?mode=ro", uri=True, timeout=bootstrap_handoff.SQLITE_BUSY_TIMEOUT_SECONDS
+        )
     except sqlite3.Error as e:
         _log(f"cannot open the board: {e}")
         return None
@@ -176,14 +186,17 @@ def read_scan(board: Path, sweep_id: str) -> tuple[bool, int] | None:
         row = conn.execute("SELECT created_at FROM tasks WHERE id = ?", (sweep_id,)).fetchone()
         if row is None:
             return None
-        statuses = [
-            status
-            for (status,) in conn.execute(
-                "SELECT status FROM tasks WHERE (idempotency_key = ? OR idempotency_key LIKE ?) "
-                "AND created_at >= ?",
-                (PRIORITIZE_KEY, PRIORITIZE_RETRY_PATTERN, row[0]),
-            ).fetchall()
-        ]
+        if ranking is not None:
+            statuses = [status for (status,) in conn.execute("SELECT status FROM tasks WHERE id = ?", (ranking,))]
+        else:
+            statuses = [
+                status
+                for (status,) in conn.execute(
+                    "SELECT status FROM tasks WHERE (idempotency_key = ? OR idempotency_key LIKE ?) "
+                    "AND created_at >= ?",
+                    (bootstrap_handoff.PRIORITIZE_KEY, PRIORITIZE_RETRY_PATTERN, row[0]),
+                ).fetchall()
+            ]
         (clusters,) = conn.execute(
             "SELECT count(*) FROM tasks WHERE idempotency_key LIKE ? AND created_at >= ?",
             (bootstrap_handoff.CLUSTER_KEY_PREFIX + "%", row[0]),
@@ -207,7 +220,11 @@ def scan_settled(data_dir: Path, now: float) -> bool:
     if filed is None:
         return False
     sweep_id, filed_at = filed
-    scan = read_scan(board_path(data_dir), sweep_id)
+    ranking = handoff_ranking(data_dir, sweep_id)
+    if ranking == bootstrap_handoff.NO_RANKING:
+        # No cluster was audited: the hand-off wrote the report itself and filed no ranking card.
+        return True
+    scan = read_scan(board_path(data_dir), sweep_id, ranking)
     if scan is not None and scan[0]:
         return True
     wait = fallback_seconds(scan[1] if scan is not None else 0)

@@ -211,6 +211,18 @@ class PlantScriptsTest(unittest.TestCase):
         self.assertEqual(self._run("disarm.py", str(self.home)).returncode, 0)
         self.assertIn("oobe", self._jobs())
 
+    def test_disarm_puts_back_a_job_that_was_there_and_removed_itself(self):
+        # A fresh install's own job, used up by the stage on the stand-in cards.
+        self.store.write_text(json.dumps([OTHER_JOB, {**OOBE_JOB, "fire_claim": "x"}]))
+        self.assertEqual(self._arm().returncode, 0)
+        self.assertEqual(self._state()["job_present"]["id"], "oobe")
+        self.store.write_text(json.dumps([OTHER_JOB]))
+        done = self._run("disarm.py", str(self.home))
+        self.assertEqual(done.returncode, 0, done.stderr)
+        oobe = next(j for j in json.loads(self.store.read_text()) if j["id"] == "oobe")
+        self.assertNotIn("fire_claim", oobe)
+        self.assertEqual(oobe["next_run_at"], "next:* * * * *")
+
     def test_disarm_tolerates_a_job_that_already_removed_itself(self):
         self.assertEqual(self._arm().returncode, 0)
         self.store.write_text(json.dumps([OTHER_JOB]))
@@ -221,6 +233,22 @@ class PlantScriptsTest(unittest.TestCase):
         done = self._run("disarm.py", str(self.home))
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertEqual((self.home / ".bootstrap_scan_filed").read_text(), "task_id=t_real\n")
+
+    # --- the install's own stage -------------------------------------------------
+
+    def test_own_stage_is_pending_while_the_job_waits_on_its_scan(self):
+        self.store.write_text(json.dumps([OTHER_JOB, OOBE_JOB]))
+        self.assertEqual(self._run("own_stage.py", str(self.home)).stdout.strip(), "pending")
+        (self.home / ".oobe_audits_fired").write_text('{"fired": ["compliance-audit"]}')
+        self.assertEqual(self._run("own_stage.py", str(self.home)).stdout.strip(), "pending")
+
+    def test_own_stage_is_clear_once_done_or_gone(self):
+        self.store.write_text(json.dumps([OTHER_JOB, OOBE_JOB]))
+        (self.home / ".oobe_audits_fired").write_text('{"done": true}')
+        self.assertEqual(self._run("own_stage.py", str(self.home)).stdout.strip(), "clear")
+        self.store.write_text(json.dumps([OTHER_JOB]))
+        (self.home / ".oobe_audits_fired").unlink()
+        self.assertEqual(self._run("own_stage.py", str(self.home)).stdout.strip(), "clear")
 
     # --- in flight --------------------------------------------------------------
 

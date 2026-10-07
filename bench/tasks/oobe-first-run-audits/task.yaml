@@ -10,8 +10,9 @@
 # stores, and the safeguard holds the turn to that, so the grade comes from what
 # the stack set up and the verifier read.
 #
-# bench/tf/prebuilt/oobe-first-run-audits waits until none of the four audits is
-# still running from an earlier repetition, then files an archived stand-in sweep
+# bench/tf/prebuilt/oobe-first-run-audits waits for the install's own first-run
+# stage to finish, then until none of the four audits is still running from an
+# earlier repetition, then files an archived stand-in sweep
 # card and an archived ranking card after it, points `.bootstrap_scan_filed` at
 # the sweep, removes `.oobe_audits_fired`, and puts back the `oobe` job if the
 # deployed image ships one (an install that onboarded before the job existed never
@@ -53,8 +54,9 @@ domain: fleet-audits
 # Who answers when this case flakes -- see bench/CONTRIBUTING.md.
 owner: maintainers
 
-# A turn that needs no tools. The session this reaches is the Platform Agent's,
-# which can mark a job due itself; a run it started would be graded as the stage's.
+# A turn that needs no tools. The session this reaches is the Planning Agent's,
+# which could ask the Platform Agent to start an audit; a run that started would be
+# graded as the stage's.
 prompt: |
   In one or two sentences, say what you do on this install. Answer from what you
   already know: do not call any tool, and do not run, trigger or schedule
@@ -73,7 +75,9 @@ verification_spec:
     check:
       type: oobe_audits_started
   # The turn must not start an audit itself: the verifier cannot tell a run the
-  # session started from one the stage started.
+  # session started from one the stage started. The turn reaches the Planning
+  # Agent, which holds no cron or terminal tool; its one route to an audit is a
+  # card for the Platform Agent.
   - name: turn-starts-no-job
     role: safeguard
     severity: catastrophic
@@ -84,4 +88,4 @@ verification_spec:
       type: none
       checks:
         - type: tool_called
-          tool_names: ["terminal", "cronjob", "execute_code"]
+          tool_names: ["kanban_create"]

@@ -92,6 +92,9 @@ state = {
     "scan_marker": read(SCAN_MARKER),
     "audits_marker": read(AUDITS_MARKER),
     "job_added": False,
+    # A job already in the store at arm time: the stage will remove it once it has fired, and the
+    # disarm puts this record back.
+    "job_present": None,
     "cards": [],
 }
 save(state)
@@ -115,7 +118,10 @@ if job is None:
 else:
     with _jobs_lock():
         jobs = load_jobs()
-        if not any(j.get("id") == JOB_ID for j in jobs):
+        present = next((j for j in jobs if j.get("id") == JOB_ID), None)
+        if present is not None:
+            state["job_present"] = present
+        else:
             job = dict(job)
             job["next_run_at"] = compute_next_run(job["schedule"])
             save_jobs(jobs + [job])

@@ -1007,8 +1007,9 @@ fi
 # deployment that finished onboarding before this existed has no record that
 # bootstrap_delivery.py:_retire_jobs retired the two onboarding jobs, so they would look new and
 # be reinstalled. .bootstrap_completed is that record. `oobe` is seeded on the same record for a
-# different reason: an install that onboarded before the job existed must never get it, or its
-# first boot on this image would start four fleet audits it is not owed.
+# different reason: an install that onboarded before the job existed must never get it. oobe.py
+# skips a sweep more than a day old, but one that onboarded recently would start four fleet audits
+# it is not owed.
 CRON_SYNC="/opt/defaults/scripts/cron_jobs_sync.py"
 if [ -f "$CRON_SYNC" ] && [ -f "/opt/defaults/cron/jobs.json" ]; then
     ASSUME_RETIRED=""

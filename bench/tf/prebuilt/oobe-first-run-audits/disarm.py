@@ -16,8 +16,9 @@
 
 Usage: python3 - <home> < disarm.py
 
-Puts both markers back as they were, and removes the `oobe` job when arm.py put it
-there and it has not already removed itself. The stand-in cards were archived when
+Puts both markers back as they were. Removes the `oobe` job when arm.py put it there
+and it has not already removed itself, and puts back the job arm.py found in the store
+when the stage has since removed it. The stand-in cards were archived when
 they were filed. Audits the stage started are left to finish: they are real runs,
 and stopping one part-way leaves its ledger issue half-written.
 """
@@ -26,7 +27,7 @@ import json
 import os
 import sys
 
-from cron.jobs import remove_job
+from cron.jobs import _jobs_lock, compute_next_run, load_jobs, remove_job, save_jobs
 
 home = sys.argv[1]
 STATE = os.path.join(home, ".bench-oobe.json")
@@ -34,6 +35,8 @@ SCAN_MARKER = os.path.join(home, ".bootstrap_scan_filed")
 AUDITS_MARKER = os.path.join(home, ".oobe_audits_fired")
 JOB_ID = "oobe"
 TMP_SUFFIX = ".tmp"
+# Scheduler bookkeeping a put-back record must not carry over.
+RUN_STATE_KEYS = ("fire_claim", "pending_slot")
 
 
 def restore(path, text):
@@ -57,7 +60,15 @@ with open(STATE, encoding="utf-8") as fh:
 # The job first: once the markers are back, a run of it could act on them.
 if state.get("job_added"):
     remove_job(JOB_ID)
+saved = state.get("job_present")
+if saved:
+    with _jobs_lock():
+        jobs = load_jobs()
+        if not any(j.get("id") == JOB_ID for j in jobs):
+            job = {k: v for k, v in saved.items() if k not in RUN_STATE_KEYS}
+            job["next_run_at"] = compute_next_run(job["schedule"])
+            save_jobs(jobs + [job])
 restore(SCAN_MARKER, state.get("scan_marker"))
 restore(AUDITS_MARKER, state.get("audits_marker"))
 os.remove(STATE)
-print("disarmed: markers restored" + (f", {JOB_ID} removed" if state.get("job_added") else ""))
+print("disarmed: markers restored" + (f", {JOB_ID} removed" if state.get("job_added") else "") + (f", {JOB_ID} put back" if saved else ""))

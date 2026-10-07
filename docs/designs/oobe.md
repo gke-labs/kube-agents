@@ -73,11 +73,15 @@ sandbox's volume when the shell sandbox is on. `bootstrap-inventory-delivery`
 
 ### 4.1 Trigger
 
-The stage fires when the scan has settled: every ranking card filed after the sweep card (key
-`bootstrap-inventory-prioritize`, or the suffixed key of a re-run by hand) is `done` or `archived`. A ranking card that
-runs out of retries ends `blocked`, which a person may still unblock, so that case waits for the
-fallback below. The card status is read from the board's SQLite file in the agent pod; it costs no
-call into the sandbox.
+The stage fires when the scan has settled. The hand-off records the ranking card it filed for this
+sweep in `.bootstrap_handoff_filed`; when that card is `done`, `failed`, `cancelled` or `archived`
+(the statuses the hand-off itself counts as settled, less `blocked` and `triage`), the stage fires.
+When the record says no cluster was audited (`task_id=none`), the hand-off has written the report
+itself and the stage fires at once. Before the hand-off has recorded anything, every card under the
+ranking key (or the suffixed key of a re-run by hand) filed after the sweep card counts instead. A
+card a person may still unblock waits for the fallback below. The marker files are read with the
+hand-off's own parser and the card status from the board's SQLite file in the agent pod; neither
+costs a call into the sandbox.
 
 Two things the trigger must not be:
 
@@ -194,7 +198,7 @@ times. It rides with the audits stage, whose eval case covers both.
 | Situation              | What the operator sees                                                                                   | Recovery                                                                                              |
 | ---------------------- | -------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------- |
 | Audits running         | Nothing in chat until each posts its summary; `hermes cron list` in the platform profile shows them      | None needed                                                                                           |
-| Marking an audit fails | Nothing; `oobe` logs and retries the missing ids each minute                                             | Automatic                                                                                             |
+| Marking an audit fails | Nothing; `oobe` logs and retries the missing ids each minute, five tries per audit                       | Automatic                                                                                             |
 | An audit run fails     | The audit's own failure path; `chat-delivery-watch` opens a GitHub issue when reports stop reaching chat | As today                                                                                              |
 | No GitOps repository   | One line in the interactive installer's output, later one line in the report                             | Re-run the installer with `--gitops-org` and `--gitops-repo` (INSTALL.md), then wait for the schedule |
 | No home channel        | Ledger issues and pull requests appear in the repository with no chat summary                            | Set one (`/sethome`)                                                                                  |
@@ -227,9 +231,11 @@ times. It rides with the audits stage, whose eval case covers both.
 
 Eval case `oobe-first-run-audits` (domain `fleet-audits`, in `hack/eval/nightly-cases.txt`: each
 repetition waits for the previous one's four audits to finish). The stack
-(`bench/tf/prebuilt/oobe-first-run-audits`) re-arms the stage on a long-lived install: it files an
+(`bench/tf/prebuilt/oobe-first-run-audits`) first waits for the install's own first-run stage to
+finish, so it never cuts across a fresh install's real scan, then re-arms the stage: it files an
 archived stand-in sweep card and an archived ranking card after it, points `.bootstrap_scan_filed`
-at the sweep, clears `.oobe_audits_fired`, and puts back the `oobe` job when the image ships one.
+at the sweep, clears `.oobe_audits_fired`, and puts back the `oobe` job when the image ships one;
+the teardown restores both markers and the job as it found them.
 The stack then waits for the put-back job's first run to end, so the verifier's two-minute window
 opens after the stage has had its turn. The verifier reads the Platform Agent's cron run records and
 passes when all four audits have a run claimed since the arm that is running or completed. Red: on
