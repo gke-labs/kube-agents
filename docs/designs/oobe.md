@@ -238,7 +238,7 @@ at the sweep, clears `.oobe_audits_fired`, and puts back the `oobe` job when the
 the teardown restores both markers and the job as it found them.
 The stack then waits for the put-back job's first run to end, so the verifier's two-minute window
 opens after the stage has had its turn. The verifier reads the Platform Agent's cron run records and
-passes when all four audits have a run claimed since the arm that is running or completed. Red: on
+passes when the stage's `.oobe_audits_fired` lists all four audits as marked due and each has a run claimed since the arm that is running or completed, so a scheduled run that falls in the window does not count. Red: on
 an image without the job, no audit runs. Green: four, in three repetitions. The no-repository skip is unit-tested,
 not evaluated: the shared install has a repository, and removing it mid-run would break concurrent
 cases.

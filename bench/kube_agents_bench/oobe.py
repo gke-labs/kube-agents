@@ -41,6 +41,9 @@ from kube_agents_bench.worker_trajectory import DATA_ROOT, FALLBACK_PYTHON, HERM
 FIRST_RUN_AUDITS = ("compliance-audit", "obtainability-audit", "fleet-wide-cost-analysis", "stockout-prevention")
 # bench/tf/prebuilt/oobe-first-run-audits/arm.py: STATE.
 STATE_FILE = f"{DATA_ROOT}/.bench-oobe.json"
+# agents/chat/scripts/oobe.py: AUDITS_MARKER and its STATE_FIRED list, what the stage marked due.
+# Still in place when the verifier runs; the teardown restores it.
+AUDITS_MARKER = f"{DATA_ROOT}/.oobe_audits_fired"
 PLATFORM_EXECUTIONS_DB = f"{DATA_ROOT}/profiles/platform/cron/executions.db"
 STARTS_READ = "__OOBE_STARTS_READ__"
 # A run that got going: the scheduler has it, or it ended without being skipped or lost.
@@ -51,22 +54,29 @@ STARTED_STATUSES = ("running", "completed")
 # gateway that has none of its containers.
 DEFAULT_AGENT_DEPLOYMENT = "platform-agent-gateway"
 
-# Prints the arm time and each audit's newest run claimed at or after it. A missing
+# Prints the arm time, the audits the stage recorded marking due, and each audit's newest run
+# claimed at or after the arm. A run the stage did not mark is a scheduled one that fell in the
+# window, not the stage's. A missing
 # state file, a sqlite failure or a timestamp that does not parse is printed as an
 # error rather than raised, so the verdict names it instead of reading as an
 # unreachable pod.
 _STARTS_SCRIPT = """
 import json, os, sqlite3, sys
 from datetime import datetime
-state, db, sentinel, audits = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4:]
+state, marker, db, sentinel, audits = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5:]
 SQLITE_BUSY_TIMEOUT = 10
-out = {"applied_at": None, "runs": {}, "error": None}
+out = {"applied_at": None, "marked": [], "runs": {}, "error": None}
 try:
     out["applied_at"] = json.load(open(state))["applied_at"]
 except FileNotFoundError:
     pass
 except (OSError, ValueError, KeyError, TypeError) as exc:
     out["error"] = "%s: %s" % (state, exc)
+try:
+    fired = json.load(open(marker)).get("fired", [])
+    out["marked"] = [a for a in fired if isinstance(a, str)]
+except (OSError, ValueError, AttributeError, TypeError):
+    pass
 if out["applied_at"] and not out["error"]:
     try:
         armed = datetime.fromisoformat(out["applied_at"]).timestamp()
@@ -93,7 +103,9 @@ def agent_shell(script: str, timeout: float) -> str:
 
 def starts_command() -> str:
     """The ``sh -c`` line that runs the read in the agent container."""
-    args = " ".join(shlex.quote(a) for a in [STATE_FILE, PLATFORM_EXECUTIONS_DB, STARTS_READ, *FIRST_RUN_AUDITS])
+    args = " ".join(
+        shlex.quote(a) for a in [STATE_FILE, AUDITS_MARKER, PLATFORM_EXECUTIONS_DB, STARTS_READ, *FIRST_RUN_AUDITS]
+    )
     return (
         f'PY={shlex.quote(HERMES_PYTHON)}; [ -x "$PY" ] || PY={shlex.quote(FALLBACK_PYTHON)}; '
         f'"$PY" -c {shlex.quote(_STARTS_SCRIPT)} {args}'
@@ -117,10 +129,13 @@ def read_starts(shell: Callable[[str, float], str], timeout: float) -> dict[str,
 
 @VERIFIERS.register("oobe_audits_started")
 class OobeAuditsStartedVerifier(_OnboardingPollVerifier):
-    """Passes once every first-run audit has a run since the arm that is running or completed.
+    """Passes once the stage marked every first-run audit due and each has a run since the arm
+    that is running or completed.
 
     A row only claimed, skipped or failed does not count: a run cut off at its start leaves
-    exactly that. Past running, the outcome is the audit's own, graded by the audit cases.
+    exactly that. Nor does a run the stage did not mark: a scheduled run that falls in the
+    window is not the stage's. Past running, the outcome is the audit's own, graded by the audit
+    cases.
     The agent pod unreadable, or a state file or cron store the read cannot use, is
     ``status="error"``.
     """
@@ -136,17 +151,21 @@ class OobeAuditsStartedVerifier(_OnboardingPollVerifier):
         if not read.get("applied_at"):
             return "error", f"there is no {STATE_FILE}: the stack did not arm the stage", read
         armed = datetime.fromisoformat(read["applied_at"]).isoformat()
-        runs = read["runs"]
-        started = [a for a in FIRST_RUN_AUDITS if runs.get(a, {}).get("status") in STARTED_STATUSES]
+        runs, marked = read["runs"], set(read.get("marked") or [])
+        running = [a for a in FIRST_RUN_AUDITS if runs.get(a, {}).get("status") in STARTED_STATUSES]
+        started = [a for a in running if a in marked]
         if len(started) == len(FIRST_RUN_AUDITS):
-            return "pass", f"all {len(FIRST_RUN_AUDITS)} first-run audits are running or done since {armed}", read
-        stalled = [f"{a} ({runs[a].get('status')})" for a in FIRST_RUN_AUDITS if a in runs and a not in started]
+            return "pass", f"all {len(FIRST_RUN_AUDITS)} first-run audits were marked due by the stage and are running or done since {armed}", read
+        stalled = [f"{a} ({runs[a].get('status')})" for a in FIRST_RUN_AUDITS if a in runs and a not in running]
         missing = [a for a in FIRST_RUN_AUDITS if a not in runs]
+        unmarked = [a for a in running if a not in marked]
         parts = []
         if missing:
             parts.append(f"no run claimed since {armed} for {', '.join(missing)}")
         if stalled:
             parts.append(f"a run that did not get going for {', '.join(stalled)}")
-        if not started and not stalled:
+        if unmarked:
+            parts.append(f"a run the stage did not mark due (a scheduled one) for {', '.join(unmarked)}")
+        if not started and not stalled and not unmarked:
             parts.append("nothing started the first-run audits")
         return "fail", "; ".join(parts), read

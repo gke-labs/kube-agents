@@ -71,13 +71,15 @@ def _local_shell(script: str, timeout: float) -> str:
 class Store:
     def __init__(self, root: Path) -> None:
         self.state = root / ".bench-oobe.json"
+        self.marker = root / ".oobe_audits_fired"
         self.db = root / "executions.db"
         with sqlite3.connect(self.db) as con:
             con.execute(SCHEMA)
         self.rows = 0
 
-    def arm(self, at: datetime = ARMED) -> None:
+    def arm(self, at: datetime = ARMED, marked=oobe.FIRST_RUN_AUDITS) -> None:
         self.state.write_text(json.dumps({"applied_at": at.isoformat()}))
+        self.marker.write_text(json.dumps({"fired": list(marked)}))
 
     def run(self, job: str, claimed: datetime, status: str = "running") -> None:
         self.rows += 1
@@ -93,6 +95,7 @@ class Store:
 def store(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Store:
     s = Store(tmp_path)
     monkeypatch.setattr(oobe, "STATE_FILE", str(s.state))
+    monkeypatch.setattr(oobe, "AUDITS_MARKER", str(s.marker))
     monkeypatch.setattr(oobe, "PLATFORM_EXECUTIONS_DB", str(s.db))
     monkeypatch.setattr(oobe, "HERMES_PYTHON", sys.executable)
     monkeypatch.setattr(oobe, "agent_shell", _local_shell)
@@ -169,6 +172,30 @@ def test_a_run_that_did_not_get_going_does_not_count(store: Store, status: str) 
     result = _verify()
     assert result.status == "fail"
     assert f"({status})" in result.reason
+
+
+def test_a_run_the_stage_did_not_mark_does_not_count(store: Store) -> None:
+    # The 06:20 compliance run landing in the window is not the stage's.
+    store.arm(marked=oobe.FIRST_RUN_AUDITS[1:])
+    for audit in oobe.FIRST_RUN_AUDITS:
+        store.run(audit, ARMED + timedelta(minutes=2))
+    result = _verify()
+    assert result.status == "fail"
+    assert f"did not mark due (a scheduled one) for {oobe.FIRST_RUN_AUDITS[0]}" in result.reason
+
+
+def test_no_marker_means_nothing_was_marked(store: Store) -> None:
+    store.arm()
+    store.marker.unlink()
+    for audit in oobe.FIRST_RUN_AUDITS:
+        store.run(audit, ARMED + timedelta(minutes=2))
+    assert _verify().status == "fail"
+
+
+def test_the_marker_is_the_one_the_stage_writes() -> None:
+    assert Path(oobe.AUDITS_MARKER).name == '.oobe_audits_fired'
+    assert 'AUDITS_MARKER = ".oobe_audits_fired"' in STAGE.read_text()
+    assert 'STATE_FIRED = "fired"' in STAGE.read_text()
 
 
 def test_another_jobs_run_does_not_count(store: Store) -> None:
