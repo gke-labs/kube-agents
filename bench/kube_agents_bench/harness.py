@@ -1205,8 +1205,9 @@ class _TransportError(RuntimeError):
     succeed. It is False by default so a new raise site has to opt in.
 
     ``answered`` says whether an agent handler answered the request (an HTTP response
-    outside retryable gateway drops, a classified failure reason, or non-object JSON)
-    as opposed to transport-level loss (timeouts, dropped connections, protocol errors).
+    outside retryable gateway drops, a classified failure reason, a non-JSON body,
+    or non-object JSON) as opposed to transport-level loss (timeouts, dropped connections,
+    protocol errors).
     """
 
     def __init__(
@@ -1291,13 +1292,20 @@ def _post_turn(
             failure_reason=failure_reason,
             answered=answered,
         ) from exc
-    except (OSError, http.client.HTTPException, ValueError) as exc:
-        # Timeouts, resets, a mid-read protocol failure, and a body that is
-        # neither UTF-8 nor JSON: transport, not agent, bugs.
+    except (OSError, http.client.HTTPException) as exc:
+        # Timeouts, resets, and mid-read protocol failures: transport bugs.
         raise _TransportError(
             f"{type(exc).__name__}: {exc}",
             retryable=_connection_dropped(exc),
             answered=False,
+        ) from exc
+    except ValueError as exc:
+        # A body that is neither UTF-8 nor JSON: a handler answered, so this
+        # is an answered agent turn, not an unreached transport drop.
+        raise _TransportError(
+            f"{type(exc).__name__}: {exc}",
+            retryable=False,
+            answered=True,
         ) from exc
 
     if not isinstance(payload, dict):

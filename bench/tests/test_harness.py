@@ -207,7 +207,13 @@ class _StubAgentHandler(BaseHTTPRequestHandler):
                 len(self.server.requests), self.server.fail_headers
             )
         )
-        if len(self.server.requests) in self.server.fail_on:
+        if len(self.server.requests) in self.server.raw_body_by_request:
+            self._respond(
+                200,
+                self.server.raw_body_by_request[len(self.server.requests)],
+                headers,
+            )
+        elif len(self.server.requests) in self.server.fail_on:
             self._respond(
                 self.server.fail_on_status,
                 json.dumps({"error": {"message": "agent went away"}}).encode(),
@@ -269,6 +275,7 @@ class _StubAgentServer(ThreadingHTTPServer):
     fail_headers: dict[str, str] = {}
     fail_headers_by_request: dict[int, dict[str, str]] = {}
     raw_body: bytes | None = None
+    raw_body_by_request: dict[int, bytes] = {}
     session_id: str | None = _SESSION_ID
     session_row: dict[str, Any] = _SESSION_ROW
     session_fail_with: int | None = None
@@ -289,6 +296,7 @@ def stub_agent(monkeypatch: pytest.MonkeyPatch) -> Generator[_StubAgentServer, N
     server.turns = []
     server.fail_headers = {}
     server.fail_headers_by_request = {}
+    server.raw_body_by_request = {}
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     monkeypatch.setenv("AGENT_LOCAL_PORT", str(server.server_address[1]))
@@ -1089,6 +1097,16 @@ def test_non_object_json_becomes_errored_result(stub_agent: _StubAgentServer) ->
 
     assert result.has_errors()
     assert "non-object JSON" in result.errors[0]
+
+
+def test_non_json_body_becomes_errored_result(stub_agent: _StubAgentServer) -> None:
+    stub_agent.raw_body = b"<html>not json</html>"
+
+    result = KubeAgentsHarness().run("prompt")
+
+    assert result.has_errors()
+    assert harness.INFRA_FAILURE_MARKER not in result.errors[0]
+    assert "JSONDecodeError" in result.errors[0]
 
 
 def test_unreachable_endpoint_is_infra_not_an_answer(
@@ -2673,6 +2691,56 @@ def test_status_turns_with_answered_then_transport_failures_settle_and_grade(
     assert result.has_errors()
     assert harness.INFRA_FAILURE_MARKER not in result.errors[0]
     assert "status turns failed with 2 answered (tool_error), 1 in transport" in result.errors[0]
+    assert len(stub_agent.requests) == 4
+    assert len(recorded_pf_resets) == 0
+
+
+def test_status_turns_with_subset_of_answered_reasons_settle_and_grade(
+    stub_agent: _StubAgentServer, instant_polls: None, recorded_pf_resets: list[int]
+) -> None:
+    """When some answered status turns carry failure reasons and others do not, format ({count} with {reasons})."""
+    stub_agent.turns = [_create_turn(), _show_turn("done")]
+    stub_agent.fail_on = frozenset({2, 3, 4})
+    stub_agent.fail_on_status = 500
+    # Three 500s: all answered=True (500 not in _RETRYABLE_STATUSES).
+    # Request 2 carries X-Hermes-Failure-Reason: tool_error; requests 3 and 4 do not.
+    stub_agent.fail_headers_by_request = {
+        2: {"X-Hermes-Failure-Reason": "tool_error"},
+        3: {},
+        4: {},
+    }
+
+    result = KubeAgentsHarness().run("Find the root cause.")
+
+    assert result.has_errors()
+    assert harness.INFRA_FAILURE_MARKER not in result.errors[0]
+    assert (
+        "status turns failed with 3 answered (1 with tool_error), 0 in transport"
+        in result.errors[0]
+    )
+    assert len(stub_agent.requests) == 4
+    assert len(recorded_pf_resets) == 0
+
+
+def test_status_turns_with_consecutive_non_json_bodies_settle_and_grade(
+    stub_agent: _StubAgentServer, instant_polls: None, recorded_pf_resets: list[int]
+) -> None:
+    """Consecutive status turns answering 200 with non-JSON bodies are answered turns that settle and grade."""
+    stub_agent.turns = [_create_turn(), _show_turn("done")]
+    stub_agent.raw_body_by_request = {
+        2: b"<html>proxy error</html>",
+        3: b"<html>proxy error</html>",
+        4: b"<html>proxy error</html>",
+    }
+
+    result = KubeAgentsHarness().run("Find the root cause.")
+
+    assert result.has_errors()
+    assert harness.INFRA_FAILURE_MARKER not in result.errors[0]
+    assert (
+        "status turns failed with 3 answered, 0 in transport"
+        in result.errors[0]
+    )
     assert len(stub_agent.requests) == 4
     assert len(recorded_pf_resets) == 0
 
