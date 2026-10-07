@@ -456,7 +456,12 @@ class A3TheGatewaysSlackPrincipalComesFromSlackOrTheMap(unittest.TestCase):
             "the Slack ingress no longer refuses a member of another workspace before admission",
         )
         foreign = h.go_function_body(source, "foreignSender")
-        self.assertIn('if m.UserTeam == "" || (s.teamID != "" && m.UserTeam == s.teamID) {', foreign)
+        self.assertIn(
+            "if !s.otherWorkspace(m.UserTeam) && (m.Message == nil || !s.otherWorkspace(m.Message.Team)) {",
+            foreign,
+        )
+        other = h.go_function_body(source, "otherWorkspace")
+        self.assertIn('return team != "" && (s.teamID == "" || team != s.teamID)', other)
 
     def test_A3_the_slack_map_cannot_assert_a_member_id_principal(self) -> None:
         body = h.go_function_body(h.text("a2a_slack_identity"), "resolveSlackPrincipal")

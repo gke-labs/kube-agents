@@ -749,6 +749,27 @@ func TestSlackRefusesAnotherWorkspacesMember(t *testing.T) {
 	if _, ok := a.inbound(ctx, slackMsg("im", "D2", "U2", "hello", "4.0", "")); !ok {
 		t.Error("a DM that names no sender workspace was refused")
 	}
+	// A shape that names the sender's workspace only in the message's own
+	// team field is still checked.
+	teamOnly := slackMsg("im", "D4", "UGUEST", "drain node 4", "4.5", "")
+	teamOnly.Message = &slack.Msg{Team: "T0THER"}
+	if _, ok := a.inbound(ctx, teamOnly); ok {
+		t.Error("a message naming another workspace in its team field alone was delivered")
+	}
+	// A guest's reply in a thread the gateway already holds as a session
+	// thread, which needs no mention, and a guest's file share, take the
+	// same refusal.
+	a.sessionThreads["C1/100.1"] = true
+	reply := slackMsg("channel", "C1", "UGUEST", "and node 5", "6.0", "100.1")
+	reply.UserTeam = "T0THER"
+	if _, ok := a.inbound(ctx, reply); ok {
+		t.Error("another workspace's member steered a session thread")
+	}
+	share := slackMsg("im", "D5", "UGUEST", "see attached", "7.0", "")
+	share.SubType, share.UserTeam = "file_share", "T0THER"
+	if _, ok := a.inbound(ctx, share); ok {
+		t.Error("another workspace's member's file share was delivered")
+	}
 	// No team id from auth.test: a message that names a sender workspace
 	// cannot be shown to be ours, so it is refused.
 	a.teamID = ""
@@ -771,6 +792,14 @@ func TestSlackConnectedRecordsTheTeam(t *testing.T) {
 	a.connected(auth)
 	if a.teamID != "T0URS" {
 		t.Errorf("teamID = %q, want auth.test's T0URS", a.teamID)
+	}
+	// No team id: the check fails closed, and says so once at WARN.
+	logs := &recordingHandler{}
+	b := newTestSlackAdapter(&fakeSlackAPI{})
+	b.log = slog.New(logs)
+	b.connected(&slack.AuthTestResponse{UserID: "UBOT"})
+	if lvl, found := logs.level("auth.test returned no team id"); !found || lvl != slog.LevelWarn {
+		t.Errorf("no team id: warning found=%t level=%v, want WARN", found, lvl)
 	}
 }
 

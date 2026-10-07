@@ -293,7 +293,7 @@ SOURCES: dict[str, Source] = {
     # overrides, and the member id is the principal otherwise.
     "a2a_slack_ingress": Source(
         "a2a/gateway/slack.go",
-        ("func (s *SlackAdapter) inbound(", "func (s *SlackAdapter) foreignSender("),
+        ("func (s *SlackAdapter) inbound(", "func (s *SlackAdapter) foreignSender(", "func (s *SlackAdapter) otherWorkspace("),
     ),
     "a2a_slack_identity": Source(
         "a2a/gateway/gchat.go",

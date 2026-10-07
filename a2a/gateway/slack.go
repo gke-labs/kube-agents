@@ -863,14 +863,21 @@ func (s *SlackAdapter) connected(auth *slack.AuthTestResponse) {
 	s.botUserID = auth.UserID
 	s.teamID = auth.TeamID
 	s.log.Info("slack connected", "user", auth.User, "botUserID", auth.UserID, "team", auth.TeamID)
+	if auth.TeamID == "" {
+		// foreignSender fails closed without it, so a message that names any
+		// workspace is refused; said once, loudly, rather than discovered as
+		// a bot that has gone quiet.
+		s.log.Warn("slack auth.test returned no team id; every message that names a workspace will be refused as another workspace's")
+	}
 }
 
 // foreignSender reports a message whose sender belongs to a workspace other
-// than the bot's. Slack names the sender's workspace (user_team) only on a
-// message in a channel shared between workspaces, so a message that names
-// none came from a channel only our members can post in. One that names
-// another workspace is a Slack Connect guest's, and is refused before the
-// allowlist is consulted: the member id is the principal for an unmapped
+// than the bot's. Slack names the sender's workspace as user_team on a
+// message in a channel shared between workspaces, and a message's own team
+// field names the workspace it was posted from; both are read, so a shape
+// that carries only one is still checked. A message that names a workspace
+// other than ours in either is a Slack Connect guest's, and is refused
+// before the allowlist is consulted: the member id is the principal for an unmapped
 // sender, so admission must not reach past the install's own workspace, and
 // under allow-all nothing else would stop it. Fail-closed when auth.test
 // gave no team id. Silent to the sender, as a bot's or an edit's drop is;
@@ -879,7 +886,7 @@ func (s *SlackAdapter) connected(auth *slack.AuthTestResponse) {
 // shared channel is refused too, since the event does not carry the
 // sender's enterprise.
 func (s *SlackAdapter) foreignSender(m *slackevents.MessageEvent) bool {
-	if m.UserTeam == "" || (s.teamID != "" && m.UserTeam == s.teamID) {
+	if !s.otherWorkspace(m.UserTeam) && (m.Message == nil || !s.otherWorkspace(m.Message.Team)) {
 		return false
 	}
 	if m.ChannelType == slackChannelTypeIM || slackMentionsBot(m.Text, s.botUserID) {
@@ -887,6 +894,12 @@ func (s *SlackAdapter) foreignSender(m *slackevents.MessageEvent) bool {
 			"senderTeam", m.UserTeam, "team", s.teamID, "channel", m.Channel)
 	}
 	return true
+}
+
+// otherWorkspace reports a workspace id that is named and is not the bot's.
+// Unnamed is not other; named with no team id of our own to compare is.
+func (s *SlackAdapter) otherWorkspace(team string) bool {
+	return team != "" && (s.teamID == "" || team != s.teamID)
 }
 
 // inbound normalizes one message event, or reports it not-a-turn. The
