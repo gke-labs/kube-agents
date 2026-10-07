@@ -1,0 +1,41 @@
+# FIXTURE NOT READY -- an entry in scripts/validate_bench_cases.py
+# FIXTURE_NOT_READY (#2527), in no roster file under hack/eval/ until its
+# fixture exists in the pool.
+#
+# Domain: reliability (obtainability-audit).
+# Journey: Workload reliability inspection flags workload missing
+# cloud.google.com/compute-class selector on ComputeClass-backed cluster
+# and proposes a manifest fix.
+#
+# Planted defect required: untargeted workload on ComputeClass-backed cluster
+# without default ComputeClass.
+# Isolation class: read-only.
+id: obtainability-untargeted-compute-class-manifest
+name: Reliability audit flags workload missing compute-class selector and proposes manifest fix
+prompt: >-
+  Run the workload reliability audit against the fleet, following the
+  obtainability-audit SOP.
+expected_output: >-
+  The ledger issue carries an untargeted-compute-class-workload finding against
+  the workload on the ComputeClass-backed cluster, noting the missing selector
+  for the cluster's custom ComputeClass.
+infrastructure:
+  deployer: noop
+validated: false
+
+domain: reliability
+
+owner: maintainers
+
+fixtures:
+  - untargeted-compute-class-workload
+
+verification_spec:
+  - name: a-finding-was-filed-against-the-untargeted-workload
+    role: objective
+    mode: assert
+    check:
+      type: ledger_issue_contains
+      audit: obtainability-audit
+      scope: finding_ids
+      required_phrases: ["untargeted-compute-class-workload"]

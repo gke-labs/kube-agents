@@ -197,15 +197,13 @@ class TestUntargetedComputeClassWorkload(unittest.TestCase):
         hit = collect.check_untargeted_compute_class_workload(wl, ctx)
         self.assertIsNone(hit)
 
-    def test_remediation_manifest_when_declared_and_single_untainted_compute_class(self):
+    def test_single_compute_class_emitted_on_candidate_when_matching(self):
         wl = collect.normalize_workloads({"items": [deployment("api")]})[0]
         ctx = {
             "compute_classes": [self.cc],
             "nodes": [self.base_node],
             "namespaces": [self.ns],
         }
-        # In emit, spec.slug == "untargeted-compute-class-workload"
-        # with declaration present and single_compute_class present
         spec = collect.CheckSpec(
             "untargeted-compute-class-workload",
             "workload",
@@ -214,30 +212,125 @@ class TestUntargetedComputeClassWorkload(unittest.TestCase):
             None,
             "impact description",
         )
+        declarations = {("test-cluster", "Deployment", "default", "api"): {"clusters/test-cluster/workloads/api.yaml"}}
+        collected = collect.CollectedContext(ctx, [wl], {"untargeted-compute-class-workload": {}})
+        result = collect.collect_cluster(
+            {"name": "test-cluster", "project": "proj", "location": "loc"},
+            checks=(spec,),
+            collected=collected,
+            declarations=declarations,
+        )
+        candidates = result.get("candidates") or []
+        self.assertEqual(len(candidates), 1)
+        self.assertEqual(candidates[0]["single_compute_class"], "standard-cc")
+        self.assertNotIn("remediation", candidates[0])
+
+    def test_node_and_compute_class_name_divergence_clears_single_compute_class(self):
+        burst_cc = compute_class("burst")
+        wl = collect.normalize_workloads({"items": [deployment("api")]})[0]
+        ctx = {
+            "compute_classes": [burst_cc],
+            "nodes": [self.base_node],  # labeled standard-cc
+            "namespaces": [self.ns],
+        }
+        hit = collect.check_untargeted_compute_class_workload(wl, ctx)
+        self.assertIsNotNone(hit)
+        self.assertEqual(hit["single_compute_class"], "")
+        self.assertTrue(hit["multiple_compute_classes"])
+
+    def test_controller_cordon_taint_on_non_cc_node_does_not_cause_false_major(self):
+        cordoned_non_cc_node = node(
+            "non-cc-1",
+            labels={"node-role": "worker"},
+            taints=[{"key": "node.kubernetes.io/unschedulable", "effect": "NoSchedule"}],
+        )
+        wl = collect.normalize_workloads({"items": [deployment("api")]})[0]
+        ctx = {
+            "compute_classes": [self.cc],
+            "nodes": [self.base_node, cordoned_non_cc_node],
+            "namespaces": [self.ns],
+        }
+        hit = collect.check_untargeted_compute_class_workload(wl, ctx)
+        self.assertIsNone(hit)
+
+    def test_accelerator_compute_class_with_gpu_or_tpu_excluded(self):
+        gpu_cc = compute_class("gpu-l4", priorities=[{"gpu": {"count": 1, "type": "nvidia-l4"}}])
+        tpu_cc = compute_class("tpu-v5e", priorities=[{"tpu": {"count": 1, "type": "v5e"}}])
+        wl = collect.normalize_workloads({"items": [deployment("api")]})[0]
+        ctx = {
+            "compute_classes": [self.cc, gpu_cc, tpu_cc],
+            "nodes": [self.base_node],
+            "namespaces": [self.ns],
+        }
+        hit = collect.check_untargeted_compute_class_workload(wl, ctx)
+        self.assertIsNotNone(hit)
+        self.assertEqual(hit["single_compute_class"], "standard-cc")
+        self.assertFalse(hit["multiple_compute_classes"])
+
+    def test_builtin_autopilot_classes_excluded(self):
+        ap_cc = compute_class("autopilot")
+        ap_spot_cc = compute_class("autopilot-spot")
+        wl = collect.normalize_workloads({"items": [deployment("api")]})[0]
+        ctx = {
+            "compute_classes": [self.cc, ap_cc, ap_spot_cc],
+            "nodes": [self.base_node],
+            "namespaces": [self.ns],
+        }
+        hit = collect.check_untargeted_compute_class_workload(wl, ctx)
+        self.assertIsNotNone(hit)
+        self.assertEqual(hit["single_compute_class"], "standard-cc")
+        self.assertFalse(hit["multiple_compute_classes"])
+
+    def test_affinity_not_in_or_preferred_does_not_silence_check(self):
+        negative_affinity = {
+            "requiredDuringSchedulingIgnoredDuringExecution": {
+                "nodeSelectorTerms": [
+                    {
+                        "matchExpressions": [
+                            {
+                                "key": "cloud.google.com/compute-class",
+                                "operator": "NotIn",
+                                "values": ["standard-cc"],
+                            }
+                        ]
+                    }
+                ]
+            }
+        }
+        wl = collect.normalize_workloads({
+            "items": [deployment("api", node_affinity=negative_affinity)]
+        })[0]
+        ctx = {
+            "compute_classes": [self.cc],
+            "nodes": [self.base_node],
+            "namespaces": [self.ns],
+        }
         hit = collect.check_untargeted_compute_class_workload(wl, ctx)
         self.assertIsNotNone(hit)
 
-        # Candidate when declared
-        declarations = {("test-cluster", "Deployment", "default", "api"): {"clusters/test-cluster/workloads/api.yaml"}}
-        collected = collect.CollectedContext(ctx, [wl], {"untargeted-compute-class-workload": {}})
-        result = collect.collect_cluster(
-            {"name": "test-cluster", "project": "proj", "location": "loc"},
-            checks=(spec,),
-            collected=collected,
-            declarations=declarations,
-        )
-        candidates = result.get("candidates") or []
-        self.assertEqual(len(candidates), 1)
-        self.assertEqual(candidates[0]["remediation"]["kind"], "manifest")
-        self.assertEqual(candidates[0]["remediation"]["path"], "clusters/test-cluster/workloads/api.yaml")
-
-    def test_remediation_manual_when_undeclared(self):
-        wl = collect.normalize_workloads({"items": [deployment("api")]})[0]
-        ctx = {
-            "compute_classes": [self.cc],
-            "nodes": [self.base_node],
-            "namespaces": [self.ns],
+        preferred_affinity = {
+            "preferredDuringSchedulingIgnoredDuringExecution": [
+                {
+                    "weight": 1,
+                    "preference": {
+                        "matchExpressions": [
+                            {
+                                "key": "cloud.google.com/compute-class",
+                                "operator": "In",
+                                "values": ["standard-cc"],
+                            }
+                        ]
+                    },
+                }
+            ]
         }
+        wl_pref = collect.normalize_workloads({
+            "items": [deployment("api-pref", node_affinity=preferred_affinity)]
+        })[0]
+        hit_pref = collect.check_untargeted_compute_class_workload(wl_pref, ctx)
+        self.assertIsNotNone(hit_pref)
+
+    def test_collect_obtainability_crd_absent_sets_not_applicable(self):
         spec = collect.CheckSpec(
             "untargeted-compute-class-workload",
             "workload",
@@ -246,25 +339,32 @@ class TestUntargetedComputeClassWorkload(unittest.TestCase):
             None,
             "impact description",
         )
-        collected = collect.CollectedContext(ctx, [wl], {"untargeted-compute-class-workload": {}})
-        result = collect.collect_cluster(
-            {"name": "test-cluster", "project": "proj", "location": "loc"},
-            checks=(spec,),
-            collected=collected,
-            declarations={},
-        )
-        candidates = result.get("candidates") or []
-        self.assertEqual(len(candidates), 1)
-        self.assertEqual(candidates[0]["remediation"]["kind"], "manual")
-
-    def test_remediation_manual_when_multiple_untainted_compute_classes(self):
-        cc2 = compute_class("second-cc")
-        wl = collect.normalize_workloads({"items": [deployment("api")]})[0]
-        ctx = {
-            "compute_classes": [self.cc, cc2],
-            "nodes": [self.base_node],
-            "namespaces": [self.ns],
+        fake_dump = {
+            "items": [deployment("api"), self.base_node, self.ns]
         }
+        import json
+        from unittest.mock import patch, MagicMock
+
+        with patch.object(collect, "dump_state") as mock_dump:
+            tmp_dump = Path("/tmp/test_dump.json")
+            tmp_dump.write_text(json.dumps(fake_dump), encoding="utf-8")
+            mock_dump.return_value = (tmp_dump, MagicMock(rc=0, duration_s=0.1, stdout="{}"), True)
+
+            with patch.object(collect, "run_and_gate") as mock_run_and_gate:
+                mock_run_and_gate.return_value = (
+                    None,
+                    MagicMock(rc=1, stderr="error: the server doesn't have a resource type 'computeclasses'"),
+                )
+                cc_context = collect._collect_obtainability(
+                    {"name": "c1", "project": "p1", "location": "l1"},
+                    Path("/fake/kubeconfig"),
+                    (spec,),
+                    run=MagicMock(),
+                )
+                self.assertIn("untargeted-compute-class-workload", cc_context.context.get("not_applicable", {}))
+            tmp_dump.unlink(missing_ok=True)
+
+    def test_collect_obtainability_timeout_sets_unevaluated(self):
         spec = collect.CheckSpec(
             "untargeted-compute-class-workload",
             "workload",
@@ -273,17 +373,30 @@ class TestUntargetedComputeClassWorkload(unittest.TestCase):
             None,
             "impact description",
         )
-        declarations = {("test-cluster", "Deployment", "default", "api"): {"clusters/test-cluster/workloads/api.yaml"}}
-        collected = collect.CollectedContext(ctx, [wl], {"untargeted-compute-class-workload": {}})
-        result = collect.collect_cluster(
-            {"name": "test-cluster", "project": "proj", "location": "loc"},
-            checks=(spec,),
-            collected=collected,
-            declarations=declarations,
-        )
-        candidates = result.get("candidates") or []
-        self.assertEqual(len(candidates), 1)
-        self.assertEqual(candidates[0]["remediation"]["kind"], "manual")
+        fake_dump = {
+            "items": [deployment("api"), self.base_node, self.ns]
+        }
+        import json
+        from unittest.mock import patch, MagicMock
+
+        with patch.object(collect, "dump_state") as mock_dump:
+            tmp_dump = Path("/tmp/test_dump.json")
+            tmp_dump.write_text(json.dumps(fake_dump), encoding="utf-8")
+            mock_dump.return_value = (tmp_dump, MagicMock(rc=0, duration_s=0.1, stdout="{}"), True)
+
+            with patch.object(collect, "run_and_gate") as mock_run_and_gate:
+                mock_run_and_gate.return_value = (
+                    None,
+                    MagicMock(rc=124, stderr="command timed out after 60s"),
+                )
+                cc_context = collect._collect_obtainability(
+                    {"name": "c1", "project": "p1", "location": "l1"},
+                    Path("/fake/kubeconfig"),
+                    (spec,),
+                    run=MagicMock(),
+                )
+                self.assertIn("untargeted-compute-class-workload", cc_context.context.get("unevaluated", {}))
+            tmp_dump.unlink(missing_ok=True)
 
 
 if __name__ == "__main__":

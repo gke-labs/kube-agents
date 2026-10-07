@@ -3708,23 +3708,34 @@ _IMPACT_UNTARGETED_COMPUTE_CLASS = (
 )
 
 
+_CONTROLLER_NODE_TAINT_KEYS = {
+    "node.kubernetes.io/unschedulable",
+    "node.kubernetes.io/not-ready",
+    "node.kubernetes.io/unreachable",
+    "node.kubernetes.io/memory-pressure",
+    "node.kubernetes.io/disk-pressure",
+    "node.kubernetes.io/pid-pressure",
+    "node.kubernetes.io/network-unavailable",
+}
+
+
+def _node_has_workload_taints(node: dict) -> bool:
+    for t in (node.get("spec", {}).get("taints") or []):
+        if t.get("effect") in ("NoSchedule", "NoExecute"):
+            key = t.get("key", "")
+            if key not in _CONTROLLER_NODE_TAINT_KEYS and not key.startswith("node.kubernetes.io/"):
+                return True
+    return False
+
+
 def _has_compute_class_affinity(node_affinity: dict) -> bool:
     required = node_affinity.get("requiredDuringSchedulingIgnoredDuringExecution") or {}
     for term in required.get("nodeSelectorTerms") or []:
         for expr in term.get("matchExpressions") or []:
-            if expr.get("key") == COMPUTE_CLASS_LABEL:
+            if expr.get("key") == COMPUTE_CLASS_LABEL and expr.get("operator") in ("In", "Exists"):
                 return True
         for expr in term.get("matchFields") or []:
-            if expr.get("key") == COMPUTE_CLASS_LABEL:
-                return True
-    preferred = node_affinity.get("preferredDuringSchedulingIgnoredDuringExecution") or []
-    for pref in preferred:
-        term = pref.get("preference") or {}
-        for expr in term.get("matchExpressions") or []:
-            if expr.get("key") == COMPUTE_CLASS_LABEL:
-                return True
-        for expr in term.get("matchFields") or []:
-            if expr.get("key") == COMPUTE_CLASS_LABEL:
+            if expr.get("key") == COMPUTE_CLASS_LABEL and expr.get("operator") in ("In", "Exists"):
                 return True
     return False
 
@@ -3751,15 +3762,45 @@ def _namespace_has_default_compute_class(context: dict, ns_name: str) -> bool:
     return False
 
 
-def _is_untainted_gp_compute_class(cc: dict) -> bool:
+def _is_untainted_gp_compute_class(cc: dict, nodes: list[dict] | None = None) -> bool:
+    name = cc.get("metadata", {}).get("name", "")
+    if name in ("autopilot", "autopilot-spot", "default"):
+        return False
+    annotations = cc.get("metadata", {}).get("annotations") or {}
+    if annotations.get("computeclass.cloud.google.com/is-default-class") == "true":
+        return False
+
     spec = cc.get("spec") or {}
     taints = (spec.get("nodePoolConfig") or {}).get("taints") or []
     if any(t.get("effect") in ("NoSchedule", "NoExecute") for t in taints):
         return False
+
     for prio in spec.get("priorities") or []:
+        if prio.get("gpu") or prio.get("tpu"):
+            return False
         for dim in prio.get("dimension") or []:
-            if "nvidia.com/gpu" in dim or "tpu" in dim:
+            if "nvidia.com/gpu" in str(dim) or "tpu" in str(dim):
                 return False
+
+    if nodes:
+        manual_pools = set()
+        for prio in spec.get("priorities") or []:
+            manual_pools.update(prio.get("nodepools") or [])
+        if manual_pools:
+            pool_nodes = [
+                n for n in nodes
+                if (n.get("metadata", {}).get("labels") or {}).get("cloud.google.com/gke-nodepool") in manual_pools
+            ]
+            if pool_nodes and all(_node_has_workload_taints(n) for n in pool_nodes):
+                return False
+
+        cc_nodes = [
+            n for n in nodes
+            if (n.get("metadata", {}).get("labels") or {}).get(COMPUTE_CLASS_LABEL) == name
+        ]
+        if cc_nodes and all(_node_has_workload_taints(n) for n in cc_nodes):
+            return False
+
     return True
 
 
@@ -3802,18 +3843,18 @@ def check_untargeted_compute_class_workload(workload: dict, context: dict) -> di
     if not nodes:
         return None
 
-    untainted_nodes = [
-        n for n in nodes
-        if not any(t.get("effect") in ("NoSchedule", "NoExecute") for t in (n.get("spec", {}).get("taints") or []))
-    ]
+    untainted_nodes = [n for n in nodes if not _node_has_workload_taints(n)]
     if not untainted_nodes:
         return None
 
     # Every untainted general-purpose node in the cluster carries cloud.google.com/compute-class=<name>
+    node_ccs: set[str] = set()
     for n in untainted_nodes:
         labels = n.get("metadata", {}).get("labels") or {}
-        if COMPUTE_CLASS_LABEL not in labels:
+        val = labels.get(COMPUTE_CLASS_LABEL)
+        if not val:
             return None
+        node_ccs.add(val)
 
     # Workload pod spec must not tolerate the taints on the remaining non-ComputeClass pools
     non_cc_nodes = [
@@ -3839,7 +3880,12 @@ def check_untargeted_compute_class_workload(workload: dict, context: dict) -> di
         return False
 
     def _tolerates_node(tolerations: list[dict], node: dict) -> bool:
-        taints = [t for t in (node.get("spec", {}).get("taints") or []) if t.get("effect") in ("NoSchedule", "NoExecute")]
+        taints = [
+            t for t in (node.get("spec", {}).get("taints") or [])
+            if t.get("effect") in ("NoSchedule", "NoExecute")
+            and t.get("key") not in _CONTROLLER_NODE_TAINT_KEYS
+            and not t.get("key", "").startswith("node.kubernetes.io/")
+        ]
         if not taints:
             return True
         return all(_tolerates_taint(tolerations, t) for t in taints)
@@ -3847,14 +3893,21 @@ def check_untargeted_compute_class_workload(workload: dict, context: dict) -> di
     if non_cc_nodes and any(_tolerates_node(pod_tolerations, n) for n in non_cc_nodes):
         return None
 
-    untainted_gp_ccs = [cc for cc in compute_classes if _is_untainted_gp_compute_class(cc)]
-    single_cc = untainted_gp_ccs[0].get("metadata", {}).get("name", "") if len(untainted_gp_ccs) == 1 else ""
+    node_target_cc = next(iter(node_ccs)) if len(node_ccs) == 1 else ""
+    untainted_gp_ccs = [cc for cc in compute_classes if _is_untainted_gp_compute_class(cc, nodes=nodes)]
+    if len(untainted_gp_ccs) == 1 and node_target_cc and untainted_gp_ccs[0].get("metadata", {}).get("name") == node_target_cc:
+        single_cc = node_target_cc
+    else:
+        single_cc = ""
 
     return {
         "object": f"{workload['kind']}/{workload['name']}",
-        "excerpt": f"workload omits {COMPUTE_CLASS_LABEL} on ComputeClass-backed cluster without default ComputeClass",
+        "excerpt": (
+            f"workload omits {COMPUTE_CLASS_LABEL} on ComputeClass-backed cluster"
+            + (f" (target class: {single_cc})" if single_cc else " (multiple/unmatched untainted ComputeClasses)")
+        ),
         "single_compute_class": single_cc,
-        "multiple_compute_classes": len(untainted_gp_ccs) > 1,
+        "multiple_compute_classes": not bool(single_cc),
     }
 
 
@@ -7395,13 +7448,29 @@ def _collect_obtainability(cluster: dict, kubeconfig: Path, checks: tuple[CheckS
     if not gate_ok:
         raise GateFailure(f"dump gate failed (rc={dump_run.rc}): {dump_run.stderr.strip()[:ERROR_EXCERPT_CHARS]}")
     dump = json.loads(dump_path.read_text(encoding="utf-8"))
-    cc_argv = ["kubectl", "get", "computeclasses", "-A", "-o", "json"]
-    cc_parsed, _ = run_and_gate(cc_argv, kubeconfig, run=run)
-    if cc_parsed and isinstance(cc_parsed.get("items"), list):
-        dump.setdefault("items", []).extend(cc_parsed["items"])
     workloads = normalize_workloads(dump)
     record = _record(f"KUBECONFIG={kubeconfig} kubectl get {DUMP_COMMAND_KINDS} -A -o json", dump_run)
-    return CollectedContext(build_context(dump, workloads), workloads, {spec.slug: record for spec in checks})
+
+    cc_argv = ["kubectl", "get", "computeclasses", "-A", "-o", "json"]
+    cc_parsed, cc_result = run_and_gate(cc_argv, kubeconfig, run=run)
+    context = build_context(dump, workloads)
+    if cc_parsed is not None and isinstance(cc_parsed.get("items"), list):
+        dump.setdefault("items", []).extend(cc_parsed["items"])
+        context["compute_classes"] = cc_parsed["items"]
+    elif RESOURCE_TYPE_ABSENT_MARKER in cc_result.stderr:
+        context.setdefault("not_applicable", {})["untargeted-compute-class-workload"] = (
+            "ComputeClass CRD is not installed on this cluster: "
+            f"`kubectl get computeclasses -A` answered that the server does not serve the type."
+        )
+    else:
+        stderr = cc_result.stderr.strip()[:ERROR_EXCERPT_CHARS] or "no stderr"
+        context.setdefault("unevaluated", {})["untargeted-compute-class-workload"] = (
+            f"{UNDETERMINED_PREFIX} `kubectl get computeclasses -A` exited {cc_result.rc} "
+            f"without saying the type is unserved ({stderr}), so whether ComputeClasses "
+            "are configured was not established. This check cleared nothing on this cluster."
+        )
+
+    return CollectedContext(context, workloads, {spec.slug: record for spec in checks})
 
 
 # check slug -> which named collection(s) it reads. Only the keys are used:
@@ -8656,6 +8725,8 @@ def collect_cluster(
             emitted["namespace_pdbs"] = hit["namespace_pdbs"]
         if hit.get("pod_selector_withheld"):
             emitted["pod_selector_withheld"] = hit["pod_selector_withheld"]
+        if hit.get("single_compute_class"):
+            emitted["single_compute_class"] = hit["single_compute_class"]
         # Where the GitOps repo declares this object, when it does. Absent
         # means unannotated, never "no declaration exists": the index is empty
         # without `--workspace` or when content mode could not copy the whole
@@ -8708,14 +8779,6 @@ def collect_cluster(
         reconciler = (workload or {}).get("reconciler") or hit.get("reconciler")
         if reconciler:
             emitted["reconciler"] = reconciler
-        if spec.slug == "untargeted-compute-class-workload":
-            if "declaration" in emitted and hit.get("single_compute_class"):
-                emitted["remediation"] = {
-                    "kind": "manifest",
-                    "path": emitted["declaration"]["path"],
-                }
-            else:
-                emitted["remediation"] = {"kind": "manual"}
         return emitted
 
     candidates = []
