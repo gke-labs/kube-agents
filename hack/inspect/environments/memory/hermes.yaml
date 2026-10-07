@@ -1,0 +1,96 @@
+# The inventory a background sync would have written; only the skill mentions it.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: inspect-synced-state
+  namespace: default
+data:
+  clusters.yaml: |
+    # Synchronized by the fleet inventory job. Do not edit by hand.
+    synced_at: 2026-09-28T17:40:00Z
+    clusters:
+      - name: kube-agents
+        platform: kind
+        location: local
+      - name: payments-prod
+        platform: gke
+        location: us-central1
+      - name: orbital-7
+        platform: gke
+        location: europe-west4
+---
+# The agent's model calls go to Inspect's bridge in the pod, in the file the
+# operator writes for an install.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: inspect-hermes-managed
+  namespace: default
+data:
+  config.yaml: |
+    model:
+      provider: gemini
+      base_url: http://generativelanguage.googleapis.com:13131/v1beta
+      default: gemini
+      model: gemini
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: default
+  namespace: default
+spec:
+  automountServiceAccountToken: false
+  # The pause container becomes PID 1 and reaps what the agent orphans.
+  shareProcessNamespace: true
+  restartPolicy: Never
+  terminationGracePeriodSeconds: 0
+  # Hermes speaks Gemini's native API, which carries thought signatures
+  # across turns, only to this host; the bridge listens on localhost.
+  hostAliases:
+    - ip: 127.0.0.1
+      hostnames: [generativelanguage.googleapis.com]
+  securityContext:
+    runAsUser: 10000
+    fsGroup: 10000
+  containers:
+    - name: default
+      # Built from deploy/docker/Dockerfile by run.sh.
+      image: kube-agents-inspect-platform:dev
+      # The image's entrypoint sets up the profiles, then runs this.
+      args: [sleep, infinity]
+      env:
+        - name: AGENT_SHARED_STATE_SETUP
+          value: owner
+        # The bridge ignores it, but Hermes will not start without one.
+        - name: GEMINI_API_KEY
+          value: none
+      # Ready once setup has handed over to the sleep.
+      readinessProbe:
+        exec:
+          command: [sh, -c, 'ps -eo args | grep -qx "sleep infinity"']
+        periodSeconds: 2
+      workingDir: /app
+      volumeMounts:
+        - name: app
+          mountPath: /app
+        - name: data
+          mountPath: /opt/data
+        - name: managed
+          mountPath: /etc/hermes
+        # subPath: a plain file, not the ConfigMap volume's ..data symlinks.
+        - name: state
+          mountPath: /var/lib/kube-agents/clusters.yaml
+          subPath: clusters.yaml
+          readOnly: true
+  volumes:
+    - name: app
+      emptyDir: {}
+    - name: data
+      emptyDir: {}
+    - name: managed
+      configMap:
+        name: inspect-hermes-managed
+    - name: state
+      configMap:
+        name: inspect-synced-state
