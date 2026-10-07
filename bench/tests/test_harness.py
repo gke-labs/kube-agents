@@ -2552,6 +2552,28 @@ def test_status_turns_the_endpoint_answered_still_grade_the_partial_record(
     assert recorded_pf_resets == []
 
 
+def test_a_status_turn_502_with_rate_limit_is_infra_without_retrying(
+    stub_agent: _StubAgentServer,
+    instant_polls: None,
+    recorded_pf_resets: list[int],
+    no_cluster_exec: list[str],
+) -> None:
+    """A status turn 502 with rate_limit on an opening turn exits immediately as infra."""
+    stub_agent.turns = [_create_turn(), _show_turn("done")]
+    stub_agent.fail_on = frozenset({2})
+    stub_agent.fail_on_status = 502
+    stub_agent.fail_headers = {"X-Hermes-Failure-Reason": "rate_limit"}
+
+    result = KubeAgentsHarness().run("Find the root cause.")
+
+    assert result.has_errors()
+    assert result.errors[0].startswith(harness.INFRA_FAILURE_MARKER)
+    assert len(stub_agent.requests) == 2
+    purges = [s for s in no_cluster_exec if "rm -rf" in s]
+    assert len(purges) == 1
+    assert _TASK_ID in purges[0]
+
+
 # --- cumulative (replayed) payloads ------------------------------------------
 #
 # This endpoint is stateful: on a reused conversation id it returns the whole
