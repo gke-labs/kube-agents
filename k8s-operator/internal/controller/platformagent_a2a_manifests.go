@@ -540,6 +540,13 @@ const (
 	// `hermes send` (agents/platform/scripts/chat_notify.py).
 	a2aNotifyPlatformEnvVar = "A2A_NOTIFY_PLATFORM"
 	a2aNotifyPlatformGchat  = "google_chat"
+	a2aNotifyPlatformSlack  = "slack"
+	// The Slack home channel the same route posts to on a Slack-armed
+	// gateway, from slack.homeChannel.
+	a2aSlackHomeChannelEnvVar = "A2A_SLACK_HOME_CHANNEL"
+	// The shortest Slack channel id a2aSlackHomeChannel takes: the prefix
+	// letter and at least two characters after it, as the gateway checks.
+	a2aSlackMinChannelIDLen = 3
 	// The prefix of a Chat space resource name.
 	a2aGchatSpacePrefix      = "spaces/"
 	a2aChatDisplayModeEnvVar = "A2A_CHAT_DISPLAY_MODE"
@@ -1132,6 +1139,27 @@ func a2aGchatHomeSpace(agent *agentv1alpha1.PlatformAgent) string {
 	id, ok := strings.CutPrefix(home, a2aGchatSpacePrefix)
 	if !ok || id == "" || strings.Contains(id, "/") {
 		return ""
+	}
+	return home
+}
+
+// a2aSlackHomeChannel is slack.homeChannel trimmed, when it is a public
+// ("C...") or private ("G...") channel id, and "" otherwise: the same test
+// the gateway arms its Slack chat.notify route on (a2a/gateway/notify.go,
+// NewSlackNotifier), so the agent is told to route proactive posts there
+// exactly when something will answer them.
+func a2aSlackHomeChannel(agent *agentv1alpha1.PlatformAgent) string {
+	if !slackEnabled(agent) {
+		return ""
+	}
+	home := strings.TrimSpace(agent.Spec.Integration.Slack.HomeChannel)
+	if len(home) < a2aSlackMinChannelIDLen || (home[0] != 'C' && home[0] != 'G') {
+		return ""
+	}
+	for _, r := range home[1:] {
+		if (r < 'A' || r > 'Z') && (r < '0' || r > '9') {
+			return ""
+		}
 	}
 	return home
 }
@@ -4306,6 +4334,11 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 			// refused under next as under today.
 			{Name: a2aSlackAllowedUsersEnvVar, Value: strings.Join(a2aAllowlist(slack.AllowedUsers), ",")},
 			{Name: a2aSlackAllowAllUsersEnvVar, Value: strconv.FormatBool(allowAllUsers(slack.AllowedUsers))},
+		}
+		// Proactive posts land here (the chat.notify route), as on Chat.
+		// Unset leaves the route unarmed: nowhere to post, as under today.
+		if home := strings.TrimSpace(slack.HomeChannel); home != "" {
+			backendEnv = append(backendEnv, corev1.EnvVar{Name: a2aSlackHomeChannelEnvVar, Value: home})
 		}
 	}
 	var chatEnv []corev1.EnvVar

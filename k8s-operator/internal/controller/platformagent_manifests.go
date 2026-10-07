@@ -3062,6 +3062,11 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 	// post would go to a subject nobody answers.
 	if a2aAgentSurface(agent) && a2aChatArmed(agent) && a2aGchatHomeSpace(agent) != "" {
 		envVars = append(envVars, corev1.EnvVar{Name: a2aNotifyPlatformEnvVar, Value: a2aNotifyPlatformGchat})
+	} else if a2aAgentSurface(agent) && a2aSlackArmed(agent) && a2aSlackHomeChannel(agent) != "" {
+		// Slack's half of the same rule: the Hermes slack platform is off
+		// when the gateway holds Slack (legacySlackConsumer), and Chat wins
+		// the single-backend gateway, so at most one platform is routed.
+		envVars = append(envVars, corev1.EnvVar{Name: a2aNotifyPlatformEnvVar, Value: a2aNotifyPlatformSlack})
 	}
 	if a2aActivityHookWanted(agent) {
 		envVars = append(envVars, a2aActivitySecretEnv(agent))
