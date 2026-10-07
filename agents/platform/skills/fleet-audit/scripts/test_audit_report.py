@@ -18450,6 +18450,9 @@ class TestFinishManifestFlag(HarnessTestCase):
         self.harness.replies["proposal-list"] = proposals_view([
             pr(9, "platform-agent/fix-default-sa", body=audit_report.delta_block([api_id, worker_id])),
             pr(8, "platform-agent/fix-x-gone", body=audit_report.delta_block(["gone"])),
+            # Another check's fix in the declared namespace: the shield is
+            # about the shared account, so this one stays open too.
+            pr(7, "platform-agent/fix-netpol", body=audit_report.delta_block([derived_id(obj="Namespace/payments")])),
         ])
         self.touch(path)
         # start filed the declaration: a close over partial coverage rests on

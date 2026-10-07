@@ -330,7 +330,7 @@ The ledger renders each finding in exactly one state. Transitions are computed p
 | -------------------- | ----------------------------------------------------- | ------------------------------------- | ------------------------------------------------------- |
 | `open`               | reproduces; no PR on its branch                       | `open`                                | none, unless it qualifies for auto-promotion            |
 | `pr-open`            | reproduces; branch has an open PR                     | `fix proposed` + link                 | **labels re-asserted** — the PR itself is untouched     |
-| `pr-merged-persists` | reproduces; branch PR is merged                       | `⚠ fix merged, still reproduces`     | comment once on the merged PR; never reopen it          |
+| `pr-merged-persists` | reproduces; branch PR is merged                       | `⚠ fix merged, still reproduces`      | comment once on the merged PR; never reopen it          |
 | `refused`            | reproduces; branch PR closed unmerged by a **person** | `fix refused` + link                  | none — the close stands until someone says `/remediate` |
 | `withdrawn`          | reproduces; branch PR closed unmerged by the harness  | `fix withdrawn, awaiting re-proposal` | eligible for promotion again, exactly as if it had none |
 | `resolved`           | no longer reproduces; PR open or absent               | not rendered — see below              | close any open PR (§3.3), keep the branch               |
