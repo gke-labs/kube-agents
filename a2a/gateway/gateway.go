@@ -742,10 +742,22 @@ func (g *Gateway) routeTurn(ctx context.Context, msg InboundMessage, backend, pr
 	// A program holds a delegation chain's root id only (observedAs), so a
 	// cancel naming the root while the chain runs is a cancel of the task
 	// that is running: the child, or the wake. Published at the root's own
-	// task, it would land on a turn that has already ended.
-	if stopping && msg.TaskID != "" && active != nil && active.TaskID != msg.TaskID {
-		if ref, ok := rec.TaskRefFor(active.TaskID); ok && ref.rootID() == msg.TaskID {
+	// task, it would land on a turn that has already ended. With nothing of
+	// the chain active - the heal above may just have released a child no
+	// executor took, on this very turn (cancelNamedTask's case) - it is a
+	// cancel of the chain's last task, whose submission may still be on its
+	// in subject.
+	if stopping && msg.TaskID != "" && (active == nil || active.TaskID != msg.TaskID) {
+		var activeRef TaskRef
+		if active != nil {
+			activeRef, _ = rec.TaskRefFor(active.TaskID)
+		}
+		if active != nil && activeRef.ID != "" && activeRef.rootID() == msg.TaskID {
 			msg.TaskID = active.TaskID
+		} else if root, ok := rec.TaskRefFor(msg.TaskID); ok && root.rootID() == root.ID {
+			if last, ok := rec.chainLast(root); ok {
+				msg.TaskID = last.ID
+			}
 		}
 	}
 	switch {

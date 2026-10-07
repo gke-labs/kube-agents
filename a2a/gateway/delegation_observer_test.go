@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -327,6 +328,53 @@ func TestACancelNamingTheRootStopsTheActiveChild(t *testing.T) {
 		}
 		return false
 	})
+	for _, e := range obs.events() {
+		if e.kind == "cancel" && e.task != origin.TaskID {
+			t.Fatalf("the cancel was announced under %s, want the root %s", e.task, origin.TaskID)
+		}
+	}
+}
+
+// TestACancelNamingTheRootAfterTheHealStopsTheChild: the inject door's
+// cancel names the root, and the turn it arrives on is the heal that
+// releases a child no executor took (cancelNamedTask's own case). The
+// cancel goes to the child's pending submission on platform, not to the
+// parent's turn, which ended when it delegated, and is announced under the
+// root.
+func TestACancelNamingTheRootAfterTheHealStopsTheChild(t *testing.T) {
+	const grace = 500 * time.Millisecond
+	r, spawn, obs := startObservedRig(t, func(c *Config) {
+		armInjectMap(t, c)
+		c.FirstEventGrace = grace
+	})
+	conv := injectKeyPrefix + "case-heal-cancel"
+	origin, session, child := delegated(t, r, spawn, conv, injectBackend)
+	time.Sleep(grace + 100*time.Millisecond)
+	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001",
+		MessageID: "c-heal", Text: "stop", Backend: injectBackend, Intent: IntentCancel, TaskID: origin.TaskID}
+	waitFor(t, "never-started notice", postedContaining(r, fmt.Sprintf(neverStartedNotice, child.TaskID, grace)))
+	waitFor(t, "a cancel on the child's subject", func() bool {
+		for _, e := range inSubjectEnvelopes(t, r.url, targetPlatform) {
+			if e.Kind == lib.KindCancel && e.TaskID == child.TaskID {
+				return true
+			}
+		}
+		return false
+	})
+	for _, e := range inSubjectEnvelopes(t, r.url, session) {
+		if e.Kind == lib.KindCancel {
+			t.Fatalf("the cancel went to the delegating turn: %+v", e)
+		}
+	}
+	waitFor(t, "the cancel on the record", func() bool {
+		rec, _ := r.g.reg.Get(context.Background(), conv)
+		cref, _ := rec.TaskRefFor(child.TaskID)
+		return cref.Canceled
+	})
+	rec, _ := r.g.reg.Get(context.Background(), conv)
+	if pref, _ := rec.TaskRefFor(origin.TaskID); pref.Canceled {
+		t.Fatalf("the parent's ended turn was marked canceled: %+v", pref)
+	}
 	for _, e := range obs.events() {
 		if e.kind == "cancel" && e.task != origin.TaskID {
 			t.Fatalf("the cancel was announced under %s, want the root %s", e.task, origin.TaskID)
