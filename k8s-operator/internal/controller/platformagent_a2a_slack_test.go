@@ -26,6 +26,7 @@ import (
 	networkingv1 "k8s.io/api/networking/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/utils/ptr"
@@ -470,7 +471,9 @@ func TestNoRenderedRoleReachesASecret(t *testing.T) {
 // Socket Mode websocket and the Web API), and the gateway pod carries no
 // egress fence - any policy that selects it (the inject door fence and the
 // A2A door fence) is ingress-only - so no rule has to admit those hosts, and
-// none could name them: the repository's policies are selector and CIDR based.
+// none could name them: the repository's standard policies are selector and CIDR
+// based (with the exception of buildFQDNNetworkPolicy, which fences the legacy
+// gateway pod rather than the A2A gateway pod).
 // Pinned here so the day a deny-default egress fence is put on the gateway, this
 // test is what says Slack's egress must come with it.
 func TestNoEgressPolicySelectsTheGatewayPod(t *testing.T) {
@@ -507,6 +510,19 @@ func TestNoEgressPolicySelectsTheGatewayPod(t *testing.T) {
 		for _, pt := range pol.Spec.PolicyTypes {
 			if pt == networkingv1.PolicyTypeEgress {
 				t.Errorf("%s fences the gateway pod's egress; Slack's websocket and Web API need admitting in it", pol.Name)
+			}
+		}
+	}
+	fqdnPolicy := buildFQDNNetworkPolicy(agent)
+	if fqdnPolicy != nil {
+		matchLabels, ok, err := unstructured.NestedStringMap(fqdnPolicy.Object, "spec", "podSelector", "matchLabels")
+		if err != nil {
+			t.Fatalf("buildFQDNNetworkPolicy matchLabels: %v", err)
+		}
+		if ok {
+			sel := labels.SelectorFromSet(labels.Set(matchLabels))
+			if sel.Matches(gatewayPod) {
+				t.Errorf("%s fences the gateway pod's egress; Slack's websocket and Web API need admitting in it", fqdnPolicy.GetName())
 			}
 		}
 	}
