@@ -254,8 +254,8 @@ through the sandbox rather than by reading:
   pod](#kanban_completeartifacts-checks-the-file-on-the-wrong-pod), where the quiet
   half is now closed and the loud one is not.
 
-A fourth is a different shape, and worse, because it fails work that was
-otherwise succeeding — see [One connection under every
+A fourth is a different shape, and worse, because it failed work that was
+otherwise succeeding until the agent image patched its trigger — see [One connection under every
 environment](#one-connection-under-every-environment) below.
 
 Three workarounds carry the design past them. The sandbox image's
@@ -299,13 +299,15 @@ concurrent task therefore multiplexes over a single master connection.
 Teardown is per environment and not per connection. `cleanup()` runs
 `ssh -O exit` against that shared path, which drops the master and kills every
 session riding it. A sibling task that was mid-command loses it: exit 255, empty
-stderr, no indication that another task's teardown is what ended it. Four things
-call `cleanup()` — the per-turn teardown at the end of every conversation (the
-ssh backend never marks itself persistent, so `cleanup_vm` runs for it), the idle
-reaper, `close_environment` when the agent closes, and the environment's
-`__del__`. The first is the frequent one: every kanban card, API-server request
-and delegate child is a conversation, so the master dies whenever any of them
-finishes while another is mid-command (#2174).
+stderr, no indication that another task's teardown is what ended it. The callers
+of `cleanup()` are the per-turn teardown at the end of every turn (`turn_finalizer`
+→ `cleanup_task_resources` → `cleanup_vm`; the ssh backend never marks itself
+persistent, so it runs for it), the idle reaper, `AIAgent.close()` via
+`cleanup_vm`, the eviction path after an infrastructure failure, and the
+environment's `__del__`. The first is the frequent one: every kanban card and
+API-server request is one or more turns (and a delegate child, if it inherits
+the ssh backend — see [What is still unproven](#what-is-still-unproven)), so the
+master died whenever any of them finished while another was mid-command (#2174).
 
 The operator's managed terminal block sets `lifetime_seconds` to 30 days, which
 takes the reaper out of the picture. It is a number and not an off switch
@@ -313,7 +315,9 @@ because Hermes takes an int here and has no sentinel for never; at that size the
 only environments the reaper can still collect are ones whose process has
 outlived a month of rollouts, which nothing here does. Nothing is reclaimed by
 reaping in this topology anyway — the far side is a StatefulSet pod that stays up
-either way — so the timeout was buying nothing and costing the race.
+either way — so the timeout was buying nothing and costing the race. With
+`cleanup()` patched below, the reaper no longer reaches the master; the value
+stays because reaping reclaims nothing.
 
 Two ways of breaking the sharing itself were tried and rejected. Pointing
 `ControlPath` at somewhere unbindable fails hard rather than falling back to a
@@ -326,14 +330,16 @@ What remains is the teardown itself, and the agent image patches it
 (`deploy/docker/patches/apply_ssh_shared_master.py`): `cleanup()` keeps its
 sync-back and leaves the shared master alone, so a finishing turn or exiting
 process no longer cuts a sibling's command; `ControlPersist=300` reaps the master
-once nothing has used it for five minutes, and the eviction path after an
-infrastructure failure still closes a dead one. A prompt-time probe's master is
-its own and is closed as before. The terminal tool also labels the shape when it
-does occur: an ssh result with exit 255 and no cwd marker (the wrapper prints the
-marker after the command, so a command's own 255 carries one) gets a `hint`
-saying the connection was closed under the command and it may have run. A
-per-environment `ControlPath` would remove the sharing itself and is upstream's
-to make.
+once nothing has used it for five minutes, and the eviction path after a
+connection failure still closes it, live or not — a registered environment only
+gets there when its connection failed, and a failure through the shared master is
+failing every sibling too. A prompt-time probe's master is its own and is closed
+as before. The terminal tool also labels the shape when it does occur: an ssh
+result with exit 255 and no cwd marker (the wrapper prints the marker after the
+command, so a command's own 255 carries one) gets a `hint`, unless upstream
+already explained the output, saying the connection was closed under the command
+or never opened, and that it may have run. A per-environment `ControlPath` would
+remove the sharing itself and is upstream's to make.
 
 ### What the credential proxy is for
 

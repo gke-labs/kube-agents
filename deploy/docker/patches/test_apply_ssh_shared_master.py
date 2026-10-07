@@ -97,6 +97,8 @@ RESULT_STUB = (
     "\n"
     "\n"
     "def _failure_hint(command, returncode, output, exit_note):\n"
+    '    if "Permission denied" in output:\n'
+    '        return "Permission denied. Check ownership/mode of the target path."\n'
     "    return _EXIT_CODE_HINTS.get(returncode)\n"
     "\n"
     "\n"
@@ -141,8 +143,11 @@ class ApplierTest(unittest.TestCase):
         self.assertIn("self._shared_master = not probe_only", ssh)
         self.assertIn("def close_master(self):", ssh)
         self.assertNotIn(SSH_CLEANUP_ANCHOR, ssh)
-        self.assertIn('getattr(env, "close_master", lambda: None)()', (root / LIFECYCLE_RELATIVE).read_text())
-        self.assertIn('returncode == 255 and not (result or {}).get("cwd_observed")', (root / RESULT_RELATIVE).read_text())
+        lifecycle = (root / LIFECYCLE_RELATIVE).read_text()
+        self.assertIn('getattr(env, "close_master", lambda: None)()', lifecycle)
+        self.assertEqual(lifecycle.count("with _quiet("), 2)
+        self.assertIn('returncode == 255 and failure_hint is None and not (result or {}).get("cwd_observed")',
+                      (root / RESULT_RELATIVE).read_text())
         for rel in (SSH_RELATIVE, LIFECYCLE_RELATIVE, RESULT_RELATIVE):
             self.assertIn(MARKER, (root / rel).read_text(), rel)
 
@@ -158,7 +163,8 @@ class ApplierTest(unittest.TestCase):
             "failure_hint = _failure_hint(command, returncode, output)"))
         with self.assertRaises(SystemExit):
             apply(root)
-        self.assertNotIn(MARKER, (root / RESULT_RELATIVE).read_text())
+        for rel in (SSH_RELATIVE, LIFECYCLE_RELATIVE, RESULT_RELATIVE):
+            self.assertNotIn(MARKER, (root / rel).read_text(), rel)
 
 
 class VerifierTest(unittest.TestCase):
@@ -176,6 +182,27 @@ class VerifierTest(unittest.TestCase):
         self.assertIn("no close_master()", joined)
         self.assertIn("eviction called ['cleanup']", joined)
         self.assertIn("carries no hint", joined)
+
+    def test_an_eviction_close_inside_the_cleanup_block_fails(self):
+        root = stage()
+        apply(root)
+        path = root / LIFECYCLE_RELATIVE
+        path.write_text(path.read_text().replace(
+            '        with _quiet("closing the degraded environment\'s ssh master failed"):  # ' + MARKER + '\n'
+            '            getattr(env, "close_master", lambda: None)()\n',
+            '            getattr(env, "close_master", lambda: None)()  # ' + MARKER + '\n'))
+        rc, failures = run_verifier(root)
+        self.assertEqual(rc, 1)
+        self.assertIn("eviction with a raising cleanup() called ['cleanup']", "\n".join(failures))
+
+    def test_a_hint_that_overrides_the_upstream_one_fails(self):
+        root = stage()
+        apply(root)
+        path = root / RESULT_RELATIVE
+        path.write_text(path.read_text().replace("returncode == 255 and failure_hint is None and", "returncode == 255 and"))
+        rc, failures = run_verifier(root)
+        self.assertEqual(rc, 1)
+        self.assertIn("Permission denied hint lost", "\n".join(failures))
 
     def test_a_cleanup_that_still_closes_the_master_fails(self):
         root = stage()

@@ -1,12 +1,13 @@
 """Stop one environment's teardown from closing the ssh master every environment shares (#2174).
 
 Hermes derives the ssh ``ControlPath`` from ``sha256(user@host:port)`` and this install publishes
-one of each, so the front door, every kanban worker, every delegate child and every cron turn in
-the pod ride one master. ``SSHEnvironment.cleanup()`` runs ``ssh -O exit`` on it, and the per-turn
-teardown (``turn_finalizer`` -> ``cleanup_task_resources`` -> ``cleanup_vm``) calls ``cleanup()``
-at the end of every conversation, because the ssh backend never marks itself persistent. A
-command another environment is running at that moment dies as a mux client whose master went
-away: exit 255, nothing printed, no cwd marker. Hermes ``main`` still has the shared path.
+one of each, so the front door, every kanban worker and every cron turn in the pod ride one
+master (a delegate child too, if it inherits the ssh backend). ``SSHEnvironment.cleanup()`` runs
+``ssh -O exit`` on it, and the per-turn teardown (``turn_finalizer`` -> ``cleanup_task_resources``
+-> ``cleanup_vm``) calls ``cleanup()`` at the end of every turn, because the ssh backend never
+marks itself persistent. A command another environment is running at that moment dies as a mux
+client whose master went away: exit 255, nothing printed, no cwd marker. Hermes ``main`` still has
+the shared path.
 
 Four anchored edits in three files:
 
@@ -15,10 +16,17 @@ Four anchored edits in three files:
   StatefulSet pod, so nothing is lost. A prompt-time probe's master is private (its own socket)
   and ``cleanup()`` still closes that one.
 - ``terminal_tool_lifecycle.py``: ``_evict_environment_for_task()``, the path after an
-  infrastructure failure, calls ``close_master()`` after ``cleanup()`` so a dead master is dropped.
+  ``EnvironmentConnectionError``, calls ``close_master()`` after ``cleanup()``, in its own
+  ``_quiet`` block so a raising ``cleanup()`` does not skip it. It closes whatever master is at the
+  socket, live or not: a registered environment only reaches eviction when its connection failed,
+  and a failure through the shared master is failing every sibling too.
 - ``terminal_tool_result.py``: an ssh result with exit 255 and no cwd marker gets a ``hint``, the
-  way exit 124 has one. The wrapper prints the marker after the command and exits with its code,
-  so a command's own 255 carries the marker and a cut connection does not.
+  way exit 124 has one, unless upstream already explained the output (``Permission denied``). The
+  wrapper prints the marker after the command and exits with its code, so a command's own 255
+  carries the marker and a cut connection, or one ssh never opened, does not.
+
+The three files are substituted first and written last, so a moved anchor leaves none of them
+changed.
 """
 
 from __future__ import annotations
@@ -83,39 +91,41 @@ LIFECYCLE_ANCHOR = (
     "            env.cleanup()\n"
 )
 LIFECYCLE_PATCHED = LIFECYCLE_ANCHOR + (
-    f'            getattr(env, "close_master", lambda: None)()  # {MARKER}\n'
+    f'        with _quiet("closing the degraded environment\'s ssh master failed"):  # {MARKER}\n'
+    '            getattr(env, "close_master", lambda: None)()\n'
 )
 
 HINT = (
-    "Exit 255 with no exit marker: the sandbox ssh connection was closed under this command "
-    "by another task's teardown, not by the command. It may have run to completion; check its "
-    "effect before retrying."
+    "Exit 255 with no exit marker: the sandbox ssh connection was closed under this command, or "
+    "never opened. If the output is an ssh error (connection refused, timed out) the command did "
+    "not run; otherwise it may have run to completion, so check its effect before retrying."
 )
 RESULT_ANCHOR = (
     "    failure_hint = _failure_hint(command, returncode, output, exit_note)\n"
 )
 RESULT_PATCHED = RESULT_ANCHOR + (
-    f'    if env_type == "ssh" and returncode == 255 and not (result or {{}}).get("cwd_observed"):  # {MARKER}\n'
+    f'    if env_type == "ssh" and returncode == 255 and failure_hint is None and not (result or {{}}).get("cwd_observed"):  # {MARKER}\n'
     f"        failure_hint = {HINT!r}\n"
 )
 
 
 def apply(root: Path) -> None:
-    patch = patchlib.Patch(root, SSH_RELATIVE, prefix="ssh-shared-master")
-    patch.refuse_if_patched(MARKER)
-    patch.substitute(SSH_INIT_ANCHOR, SSH_INIT_PATCHED, label="shared-master mark in __init__")
-    patch.substitute(SSH_CLEANUP_ANCHOR, SSH_CLEANUP_PATCHED, label="cleanup() exit loop")
-    patch.commit("cleanup() leaves the shared master to ControlPersist; close_master() closes it")
+    ssh = patchlib.Patch(root, SSH_RELATIVE, prefix="ssh-shared-master")
+    ssh.refuse_if_patched(MARKER)
+    ssh.substitute(SSH_INIT_ANCHOR, SSH_INIT_PATCHED, label="shared-master mark in __init__")
+    ssh.substitute(SSH_CLEANUP_ANCHOR, SSH_CLEANUP_PATCHED, label="cleanup() exit loop")
 
-    patch = patchlib.Patch(root, LIFECYCLE_RELATIVE, prefix="ssh-shared-master")
-    patch.refuse_if_patched(MARKER)
-    patch.substitute(LIFECYCLE_ANCHOR, LIFECYCLE_PATCHED, label="eviction cleanup loop")
-    patch.commit("eviction after an infrastructure failure also closes the master")
+    lifecycle = patchlib.Patch(root, LIFECYCLE_RELATIVE, prefix="ssh-shared-master")
+    lifecycle.refuse_if_patched(MARKER)
+    lifecycle.substitute(LIFECYCLE_ANCHOR, LIFECYCLE_PATCHED, label="eviction cleanup loop")
 
-    patch = patchlib.Patch(root, RESULT_RELATIVE, prefix="ssh-shared-master")
-    patch.refuse_if_patched(MARKER)
-    patch.substitute(RESULT_ANCHOR, RESULT_PATCHED, label="failure hint assignment")
-    patch.commit("an ssh exit 255 without the cwd marker carries a hint")
+    result = patchlib.Patch(root, RESULT_RELATIVE, prefix="ssh-shared-master")
+    result.refuse_if_patched(MARKER)
+    result.substitute(RESULT_ANCHOR, RESULT_PATCHED, label="failure hint assignment")
+
+    ssh.commit("cleanup() leaves the shared master to ControlPersist; close_master() closes it")
+    lifecycle.commit("eviction after an infrastructure failure also closes the master")
+    result.commit("an ssh exit 255 without the cwd marker carries a hint")
 
 
 if __name__ == "__main__":

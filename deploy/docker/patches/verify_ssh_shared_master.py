@@ -5,7 +5,7 @@ Run by ``deploy/docker/Dockerfile`` from ``/opt/hermes`` after ``apply_ssh_share
 The applier proves its anchors matched once; this imports the patched modules and proves they
 behave: a shared environment's ``cleanup()`` runs no ``ssh -O exit`` and ``close_master()`` does,
 a probe's ``cleanup()`` still closes its private master, eviction calls ``close_master()`` after
-``cleanup()``, and the terminal result carries the hint only for an ssh exit 255 without the cwd
+``cleanup()`` even when ``cleanup()`` raises, and the terminal result carries the hint only for an ssh exit 255 without the cwd
 marker.
 
 Usage::
@@ -98,6 +98,22 @@ def check_lifecycle(lifecycle, terminal_tool) -> None:
     if calls != ["cleanup", "close_master"]:
         fail(f"eviction called {calls}, expected cleanup then close_master")
 
+    class RaisingEnv(Env):
+        def cleanup(self):
+            calls.append("cleanup")
+            raise RuntimeError("sync_back failed")
+
+    calls.clear()
+    with terminal_tool._env_lock:
+        terminal_tool._active_environments[task] = RaisingEnv()
+    try:
+        lifecycle._evict_environment_for_task(task)
+    finally:
+        with terminal_tool._env_lock:
+            terminal_tool._active_environments.pop(task, None)
+    if calls != ["cleanup", "close_master"]:
+        fail(f"eviction with a raising cleanup() called {calls}, expected cleanup then close_master")
+
 
 def check_result(result_mod) -> None:
     def hint(res: dict, env_type: str = "ssh") -> str | None:
@@ -119,6 +135,9 @@ def check_result(result_mod) -> None:
     timeout = hint({"output": "", "returncode": 124})
     if not timeout or "Exit 124" not in timeout:
         fail(f"the upstream exit 124 hint is gone: {timeout!r}")
+    denied = hint({"output": "agent@sandbox: Permission denied (publickey).", "returncode": 255})
+    if not denied or "Permission denied" not in denied:
+        fail(f"the upstream Permission denied hint lost to the ssh 255 hint: {denied!r}")
 
 
 def main() -> int:
