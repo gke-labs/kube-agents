@@ -242,10 +242,32 @@ class SlackRouteTest(unittest.TestCase):
             post = self.skv._post_audit_blocks_via_gateway("platform", "fleet-audit", blocks, "3 findings", thread, 30)
         return post, seen, blocks
 
+    def test_the_gateway_card_carries_nothing_to_click(self):
+        blocks = [
+            {"type": "section", "text": {"type": "mrkdwn", "text": "*3 findings*"},
+             "accessory": {"type": "button", "action_id": "x", "text": {"type": "plain_text", "text": "Act"}}},
+            {"type": "actions", "elements": [
+                {"type": "button", "action_id": "kage_audit.choice.0", "text": {"type": "plain_text", "text": "Look at the first one"}},
+                {"type": "button", "text": {"type": "plain_text", "text": "Ledger issue #7 ↗"}, "url": "https://github.com/o/r/issues/7"},
+            ]},
+        ]
+        out = self.skv._without_interaction(blocks)
+        self.assertNotIn("actions", [b["type"] for b in out])
+        self.assertNotIn("accessory", out[0])
+        self.assertEqual(out[-1]["type"], "context")
+        self.assertIn("<https://github.com/o/r/issues/7|Ledger issue #7 ↗>", out[-1]["elements"][0]["text"])
+        self.assertNotIn("kage_audit.choice.0", json.dumps(out))
+
+    def test_the_cli_gives_up_before_the_subprocess_bound(self):
+        _post, seen, _ = self._gateway_post(0, json.dumps({"message_id": "1.5", "thread_id": "1.5"}))
+        argv = seen["argv"]
+        self.assertIn("--timeout", argv)
+        self.assertLess(int(argv[argv.index("--timeout") + 1].rstrip("s")), 30)
+
     def test_audit_blocks_go_through_the_gateway_and_thread_on_its_answer(self):
         post, seen, blocks = self._gateway_post(0, json.dumps({"message_id": "1.5", "thread_id": "1.5"}))
         self.assertEqual(post, self.skv.AuditPost("1.5"))
-        self.assertEqual(seen["blocks"], blocks)
+        self.assertEqual(seen["blocks"], self.skv._without_interaction(blocks))
         self.assertEqual(seen["argv"][:4], ["a2a", "notify", "--platform", "slack"])
         self.assertFalse(os.path.exists(seen["path"]), "the blocks file was left behind")
 

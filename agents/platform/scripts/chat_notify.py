@@ -77,7 +77,7 @@ def command(target: str, message: str, json_output: bool = True, hermes_bin: str
     return argv + ["--", message]
 
 
-def blocks_command(platform: str, thread: str, text: str, blocks_path: str) -> list[str]:
+def blocks_command(platform: str, thread: str, text: str, blocks_path: str, timeout_s: float = 0) -> list[str]:
     """The argv that posts a Slack Block Kit message through the gateway.
 
     ``blocks_path`` names a file holding the JSON array of blocks; ``text`` is
@@ -88,6 +88,11 @@ def blocks_command(platform: str, thread: str, text: str, blocks_path: str) -> l
     argv = [A2A_CLI, "notify", "--platform", platform, "--blocks-file", blocks_path]
     if thread:
         argv += ["--thread", thread]
+    if timeout_s > 0:
+        # The CLI's own wait, shorter than the caller's subprocess bound, so
+        # an answer that does not come in time ends as the CLI's
+        # outcome-unknown exit rather than a killed child.
+        argv += ["--timeout", f"{int(timeout_s)}s"]
     return argv + ["--", text]
 
 

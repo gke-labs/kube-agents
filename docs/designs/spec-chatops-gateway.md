@@ -1099,8 +1099,15 @@ also takes Block Kit: a request may carry `blocks`, a JSON array posted as one m
 `text` as its notification and fallback (the fleet audit's report card,
 `a2a notify --blocks-file`). A backend without blocks, Chat today, refuses such a request
 rather than dropping them, and Slack's own refusal (`invalid_blocks`) comes back as the
-`error`, so the caller falls back to text. The blocks are the agent's, posted as written, as
-the broker's Slack relay posted them under `today`.
+`error`, so the caller falls back to text. Blocks cannot be escaped the way text is, so the
+gateway refuses any block that carries a mention (`<!channel>`, `<!here>`, `<!subteam^…>`,
+`<@U…>`, or a rich_text `broadcast`, `user` or `usergroup` element), and the caller posts the
+escaped text instead. The gateway acks no Slack interaction, so a button on such a card would
+be clicked into a timeout: on this path the agent sends the card without its buttons, a link
+button turned into a plain link. The blocks are decoded into slack-go's types and sent again,
+so a block type it does not know travels as written and a field it does not model may not. A
+home channel that is not a channel id leaves the route unarmed; the gateway logs
+"chat.notify route not armed" at start.
 
 A notify is not a task. It mints no capability, starts no executor, opens no session and
 carries no `authority` block; the requester rules above do not apply, because nobody
@@ -1138,11 +1145,11 @@ normalized the way the gateway reads it, with `A2A_SLACK_ALLOW_ALL_USERS` from t
 consumer's rule on the raw list (absent, or a single empty string, is everyone), so one CR
 means one thing in both modes. The gateway then admits a Slack sender only if the list
 admits them (exact `user_id` match, no case fold) AND the principal map below resolves
-them; allow-all lifts the list, never the map. Two things do not carry over on the flip:
+them; allow-all lifts the list, never the map. One thing does not carry over on the flip:
 the broker reads `SLACK_BOT_TOKEN` as a comma-separated list, one token per workspace,
 where the gateway's adapter takes one token, so a multi-workspace install stays on
-`today`; and `homeChannel` goes with the Hermes slack platform, so proactive alerts have no
-Slack target under `next`, the cost the Chat section states for Chat.
+`today`. `homeChannel` does carry over, as the home channel the gateway's chat.notify route
+posts proactive alerts into (below); `/sethome` no longer reaches it.
 
 Nothing enforces the multi-workspace rule. The arm reads the CR alone and never opens the
 token Secret, so an install already on `next` whose bot-token Secret holds a list is flipped

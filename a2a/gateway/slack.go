@@ -441,11 +441,16 @@ func (s *SlackAdapter) Run(ctx context.Context, handler func(InboundMessage)) er
 				// slash_commands and interactive carry a real, non-empty one
 				// that this continue throws away.
 				//
-				// Which is fine only because the app subscribes to neither,
-				// so neither ever arrives. Turning on slash commands or
-				// interactivity means acking them here first: Slack wants the
-				// envelope acked inside three seconds, and an unacked one
-				// redelivers and shows the user a timeout.
+				// The same app serves the legacy consumer under today, which
+				// does answer interactions, so an install may well have
+				// interactivity on and these envelopes do arrive. Nothing the
+				// gateway posts carries an interactive element - the agent
+				// sends the audit card through the notify route with its
+				// buttons removed - so the only clicks that land here are on
+				// messages posted under today. Answering interactions means
+				// acking them here first: Slack wants the envelope acked
+				// inside three seconds, and an unacked one redelivers and
+				// shows the user a timeout.
 				continue
 			}
 			// Ack before parsing, not after: unacked envelopes redeliver in

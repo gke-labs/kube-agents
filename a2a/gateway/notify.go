@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -47,6 +48,14 @@ const (
 	// post because it is stopping. A refusal (exit 1 at the CLI), never
 	// silence: silence reads as "may have posted" and is not retried.
 	notifyStoppingRefusal = "the gateway is stopping; not posted"
+)
+
+// notifyMentionTokens and notifyMentionElements are what blocksMention
+// refuses: the mrkdwn spellings that ping, and the rich_text element types
+// that do.
+var (
+	notifyMentionTokens   = []string{"<!", "<@"}
+	notifyMentionElements = []string{"broadcast", "user", "usergroup"}
 )
 
 // notifyPoster is the backend half: post text into a space, new thread or
@@ -240,9 +249,12 @@ func (n *Notifier) validate(data []byte) (lib.NotifyRequest, *lib.NotifyReply) {
 		if _, ok := n.poster.(notifyBlocksPoster); !ok {
 			return refuse("this backend posts text only; send the request without blocks")
 		}
-		var blocks []json.RawMessage
+		var blocks []any
 		if err := json.Unmarshal(req.Blocks, &blocks); err != nil || len(blocks) == 0 {
 			return refuse("blocks must be a non-empty JSON array of Block Kit blocks")
+		}
+		if why := blocksMention(blocks); why != "" {
+			return refuse("blocks carry a mention (" + why + "); the notify route posts no mentions, send them as text")
 		}
 	}
 	return req, nil
@@ -278,6 +290,40 @@ func (n *Notifier) post(req lib.NotifyRequest, answer func(lib.NotifyReply)) {
 		}
 	}
 	n.log.Info("notify posted", "home", n.home, "thread", thread, "message", first)
+}
+
+// blocksMention reports a mention anywhere in decoded Block Kit, or "": a
+// mrkdwn token that pings (<!channel>, <!here>, <!everyone>, <!subteam^…>,
+// <@U…>) in any string, or a rich_text element that does (broadcast, user,
+// usergroup). The text path escapes < and > so none of these can render
+// (toMrkdwn); blocks are posted as Block Kit, so the same bound is a refusal
+// instead, and the caller falls back to the escaped text. A link (<https://…>)
+// is not a mention and passes.
+func blocksMention(v any) string {
+	switch node := v.(type) {
+	case string:
+		for _, token := range notifyMentionTokens {
+			if strings.Contains(node, token) {
+				return token
+			}
+		}
+	case []any:
+		for _, item := range node {
+			if why := blocksMention(item); why != "" {
+				return why
+			}
+		}
+	case map[string]any:
+		if kind, _ := node["type"].(string); slices.Contains(notifyMentionElements, kind) {
+			return "a " + kind + " element"
+		}
+		for _, item := range node {
+			if why := blocksMention(item); why != "" {
+				return why
+			}
+		}
+	}
+	return ""
 }
 
 // postBlocks writes a Block Kit request as one message: blocks are not

@@ -201,5 +201,32 @@ func TestNotifyRefusesBlocksABackendCannotRender(t *testing.T) {
 	}
 }
 
+// TestSlackNotifyRefusesMentionsInBlocks: the text path escapes every
+// mention; blocks cannot be escaped, so a block carrying one is refused and
+// the caller posts the escaped text instead. A link is not a mention.
+func TestSlackNotifyRefusesMentionsInBlocks(t *testing.T) {
+	adapter, stub := startSlackStubAdapter(t)
+	n := newTestSlackNotifier(t, adapter)
+	for name, blocks := range map[string]string{
+		"channel":   `[{"type":"section","text":{"type":"mrkdwn","text":"<!channel> drift"}}]`,
+		"here":      `[{"type":"section","text":{"type":"mrkdwn","text":"see <!here>"}}]`,
+		"subteam":   `[{"type":"context","elements":[{"type":"mrkdwn","text":"<!subteam^S1> look"}]}]`,
+		"user":      `[{"type":"section","fields":[{"type":"mrkdwn","text":"<@U123>"}]}]`,
+		"broadcast": `[{"type":"rich_text","elements":[{"type":"rich_text_section","elements":[{"type":"broadcast","range":"channel"}]}]}]`,
+		"rich user": `[{"type":"rich_text","elements":[{"type":"rich_text_section","elements":[{"type":"user","user_id":"U1"}]}]}]`,
+	} {
+		if got := serveJSON(t, n, lib.NotifyRequest{Text: "x", Blocks: json.RawMessage(blocks)}); got.Error == "" {
+			t.Errorf("%s: blocks with a mention were accepted", name)
+		}
+	}
+	if len(stub.forms) != 0 {
+		t.Errorf("a refused request posted: %d posts", len(stub.forms))
+	}
+	link := `[{"type":"section","text":{"type":"mrkdwn","text":"<https://github.com/o/r/issues/1|ledger #1>"}}]`
+	if got := serveJSON(t, n, lib.NotifyRequest{Text: "x", Blocks: json.RawMessage(link)}); got.Error != "" {
+		t.Errorf("a link was refused as a mention: %+v", got)
+	}
+}
+
 var _ notifyPoster = (*SlackAdapter)(nil)
 var _ notifyBlocksPoster = (*SlackAdapter)(nil)
