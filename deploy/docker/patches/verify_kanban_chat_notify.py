@@ -54,6 +54,9 @@ class _Runner:
     def _owns_kanban_dispatcher_lock(self):
         return True
 
+    def _active_profile_name(self):
+        return "default"
+
     def _primary_message_handler(self):
         runner = self
 
@@ -95,6 +98,15 @@ def main() -> None:
           "routed: a connected platform still resolves to its own adapter")
     check(adapter._message_handler is not None, "the stand-in carries the runner's message handler for wakes")
     check(GCHAT not in runner.adapters, "the stand-in is not registered in runner.adapters")
+    threadless = dict(sub, thread_id="")
+    check(notifier._adapter_for_subscription(runner, GCHAT, threadless, None) is None,
+          "routed: a subscription with no thread gets no stand-in (it would land in the home channel)")
+    runner.config.multiplex_profiles = True
+    check(notifier._adapter_for_subscription(runner, GCHAT, sub, None) is None,
+          "routed: no stand-in under multiplex_profiles")
+    runner.config.multiplex_profiles = False
+    check(notifier._Collector._claim_for_sub.__name__ == "_kage_claim_for_sub",
+          "the collector's claim is wrapped to drop stale events")
 
     with tempfile.TemporaryDirectory() as tmp:
         fake = Path(tmp) / "a2a"
@@ -108,7 +120,7 @@ def main() -> None:
         result = asyncio.run(adapter.send("spaces/H", "- done", metadata={"thread_id": "spaces/H/threads/T"}))
         argv = log.read_text().splitlines()
         check(result.success, "send: exit 0 is a successful send")
-        check(argv == ["notify", "--platform", "google_chat", "--thread", "spaces/H/threads/T", "--", "- done"],
+        check(argv == ["notify", "--platform", "google_chat", "--timeout", "60s", "--thread", "spaces/H/threads/T", "--", "- done"],
               f"send: argv carries the thread and ends the flags before the text ({argv})")
 
         os.environ["A2A_EXIT"] = "1"
@@ -116,6 +128,17 @@ def main() -> None:
         os.environ["A2A_EXIT"] = "3"
         check(asyncio.run(adapter.send("spaces/H", "x")).success,
               "send: exit 3 (outcome unknown) is not reported as a failure, so it is not re-sent")
+        os.environ["A2A_EXIT"] = "4"
+        check(not asyncio.run(adapter.send("spaces/H", "x")).success, "send: exit 4 (route unavailable) is a failed send")
+        check(notifier._adapter_for_subscription(runner, GCHAT, sub, None) is None,
+              "route down: no adapter, so the notifier skips without spending the failure budget")
+        adapter._route_down_until = 0.0
+        check(notifier._adapter_for_subscription(runner, GCHAT, sub, None) is adapter,
+              "route back: the stand-in answers again after the backoff")
+        log.unlink(missing_ok=True)
+        os.environ["A2A_EXIT"] = "0"
+        media = asyncio.run(adapter.send_document("spaces/H", "/opt/data/report.pdf", metadata={"thread_id": "spaces/H/threads/T"}))
+        check(not media.success and not log.exists(), "attachments are not posted (no notice per file)")
 
         # The failure wake: the notifier admits a synthetic internal event on
         # the adapter. It must be accepted (not WakeNotAccepted), reach the

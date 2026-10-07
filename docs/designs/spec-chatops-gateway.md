@@ -1082,10 +1082,14 @@ treats that as sent rather than sending again. The agent-side callers
 renders exactly when `a2aChatArmed` holds and `homeChannel` is a space name (the condition
 the gateway arms the route on), and send to every other platform through `hermes send` as
 before. The Hermes kanban notifier, which posts a card's events into the thread the card
-subscribes to and wakes its creator on a failure, reaches the same route through a send-only
-stand-in adapter that exists only inside the notifier
+subscribes to and wakes its creator when a card blocks or fails, reaches the same route
+through a send-only stand-in adapter that exists only inside the notifier
 (`deploy/docker/patches/kanban_chat_notify.py`); nothing else in the Hermes gateway treats
-the platform as connected.
+the platform as connected. Only the subscription's thread is forwarded, so the home-space
+rule applies: a thread of another space is refused, and a subscription with no thread is not
+delivered. While the route is unavailable (the gateway restarting) the notifier holds
+deliveries rather than spending a subscription's failure budget, and events older than six
+hours are advanced past without posting.
 
 A notify is not a task. It mints no capability, starts no executor, opens no session and
 carries no `authority` block; the requester rules above do not apply, because nobody

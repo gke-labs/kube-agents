@@ -12,12 +12,21 @@ The anchor is ``_Collector``'s ``active_platforms``: the coarse filter
 ``_claim_for_sub`` applies before anything else, so a routed platform has to be
 in it or its subscriptions are never looked at.
 
-The trailer rebinds the module-level ``_adapter_for_subscription`` to a wrapper
-that falls back to the stand-in adapter. A rebinding rather than an anchor at
-each call site, because both callers (``_claim_for_sub``'s authorization and
-``_KanbanNotification.deliver``) look the name up in module globals at call
-time, and the wrapper only acts when upstream returned no adapter, so every
-other subscription resolves exactly as before.
+The trailer makes two rebindings:
+
+- the module-level ``_adapter_for_subscription`` becomes a wrapper that falls
+  back to the stand-in adapter. A rebinding rather than an anchor at each call
+  site, because both callers (``_claim_for_sub``'s authorization and
+  ``_KanbanNotification.deliver``) look the name up in module globals at call
+  time. It acts only when upstream returned no adapter, for the routed
+  platform, for a subscription with a thread, and never under
+  ``multiplex_profiles`` (where upstream's ``None`` can be a deliberate
+  refusal), so every other subscription resolves exactly as before. It takes
+  upstream's arguments through ``*args``/``**kwargs`` so a signature change in
+  a base bump cannot turn every call into a ``TypeError``.
+- ``_Collector._claim_for_sub`` is wrapped so a claim for the routed platform
+  loses its events older than the module's stale cutoff (the cursor still
+  advances past them).
 
 Ordering. Runs after ``apply_kanban_notify_delivery.py``, which rewrites the
 claim in ``_claim_for_sub`` but leaves the ``active_platforms`` assignment and
@@ -56,16 +65,27 @@ TRAILER = (
     "\n\n# kube-agents patch: see gateway/kanban_chat_notify.py\n"
     "from gateway.kanban_chat_notify import (  # noqa: E402\n"
     "    active_platforms as _kage_chat_notify_active,\n"
+    "    fresh_events as _kage_chat_notify_fresh,\n"
     "    resolve as _kage_chat_notify_resolve,\n"
     ")\n"
     "\n"
     "_kage_upstream_adapter_for_subscription = _adapter_for_subscription\n"
     "\n"
     "\n"
-    "def _adapter_for_subscription(runner, platform, sub, owner_profile):  # noqa: F811\n"
+    "def _adapter_for_subscription(runner, platform, sub, *args, **kwargs):  # noqa: F811\n"
     "    return _kage_chat_notify_resolve(\n"
-    "        runner, platform, _kage_upstream_adapter_for_subscription(runner, platform, sub, owner_profile),\n"
+    "        runner, platform, _kage_upstream_adapter_for_subscription(runner, platform, sub, *args, **kwargs), sub,\n"
     "    )\n"
+    "\n"
+    "\n"
+    "_kage_upstream_claim_for_sub = _Collector._claim_for_sub\n"
+    "\n"
+    "\n"
+    "def _kage_claim_for_sub(self, *args, **kwargs):\n"
+    "    return _kage_chat_notify_fresh(_kage_upstream_claim_for_sub(self, *args, **kwargs))\n"
+    "\n"
+    "\n"
+    "_Collector._claim_for_sub = _kage_claim_for_sub\n"
 )
 
 SENTINELS = (
