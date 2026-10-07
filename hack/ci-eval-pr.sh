@@ -140,7 +140,8 @@ readonly EVAL_INFLIGHT_POLL_STEP_SECONDS=5
 # Platform Agent's cron store, how long a unit waits for a run the install started on
 # one of its streams, and how often it looks. The wait outlasts one audit run
 # (9-15 minutes, #985) started just before the unit, with room for the
-# scheduler to claim a mark first.
+# scheduler to claim a mark first. A stage oobe-first-run-audits left armed can
+# have more of its chain to run than that; the bound caps the wait either way.
 readonly EVAL_GATEWAY_CONTAINER="platform-agent"
 readonly EVAL_GATEWAY_PYTHON="/opt/hermes/.venv/bin/python3"
 readonly EVAL_GATEWAY_HOME="/opt/data"
@@ -1201,8 +1202,9 @@ release_inflight_note() { # <label> <audit-id>
 # ledger issue as the unit's own would, so resetting the ledger or clearing
 # the in-flight note under it would grade the unit against what two runs
 # wrote. hack/ci_platform_runs.py does the counting in the gateway (a mark not
-# yet claimed counts, so does an audit a pending `oobe` stage has still to
-# run, and a failed read counts as busy) and stops after
+# yet claimed counts, so does an audit an `oobe` stage that
+# oobe-first-run-audits left armed has still to run, and a failed read counts
+# as busy) and stops after
 # EVAL_PLATFORM_RUN_WAIT_SECONDS, failed execs retried inside it; the unit
 # then runs as it did before the wait. Pinned to AGENT_CLUSTER_CONTEXT and refused for a context that does
 # not name PROJECT_ID, as release_inflight_note is. Called once the unit holds

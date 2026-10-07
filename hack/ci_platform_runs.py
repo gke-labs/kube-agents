@@ -10,13 +10,17 @@ unit's own, so the unit waits for it rather than resetting the ledger under it.
 Counts a run claimed or running, and an audit marked due (or overdue) and not yet
 claimed, since the next profile-cron-tick starts it. A row claimed more than
 ``STALE_SECONDS`` ago is not counted: a gateway restart leaves a cut-off run's row
-at running for good, and no audit takes that long. An audit the Chat Agent's `oobe`
-stage has still to run counts too, from before it is marked: the stage is pending
-while its job is on the Chat Agent's roster and `.oobe_audits_fired` is not done,
-and an audit has had its turn once the stage has marked it and moved on, or held or
-given up on it. The stage's audit list is read from the image's copy of oobe.py,
-not run. Anything it cannot read counts as busy, so a failed read is waited out
-rather than taken as idle.
+at running for good, and no audit takes that long. Anything it cannot read counts
+as busy, so a failed read is waited out rather than taken as idle.
+
+While the oobe-first-run-audits stack has the Chat Agent's `oobe` stage armed (its
+state file is there: the chain overran or the teardown could not disarm), an audit
+that stage has still to run counts too, from before it is marked. An audit has had
+its turn once the stage has marked it and moved on, or held or given up on it. The
+stage's audit list is read from the image's copy of oobe.py, not run. A fresh
+install's own stage is not waited on before it marks: the audit's in-flight note
+refuses a second `start` once one run holds it, and waiting out a whole chain would
+hold every audit case on those streams for most of an hour.
 
 Prints one line: how long it waited and what was still going when it stopped.
 """
@@ -34,6 +38,8 @@ LEDGER = os.path.join(home, "profiles", "platform", "cron", "executions.db")
 ROSTER = os.path.join(home, "profiles", "platform", "cron", "jobs.json")
 CHAT_ROSTER = os.path.join(home, "cron", "jobs.json")
 STAGE_MARKER = os.path.join(home, ".oobe_audits_fired")
+# bench/tf/prebuilt/oobe-first-run-audits/arm.py writes it; disarm.py removes it.
+STACK_STATE = os.path.join(home, ".bench-oobe.json")
 # The image's copy, not the volume's: the volume is the agent's to write.
 STAGE_SOURCE = os.environ.get("OOBE_STAGE_SOURCE", "/opt/defaults/scripts/oobe.py")
 STAGE_JOB = "oobe"
@@ -71,7 +77,7 @@ def due(now):
     for job in jobs:
         if job.get("id") not in audits:
             continue
-        if not job.get("enabled", True) or job.get("state") == PAUSED_STATE or job.get("paused_at"):
+        if not runnable(job):
             continue
         next_run = job.get("next_run_at")
         if not isinstance(next_run, str) or not next_run:
@@ -97,10 +103,16 @@ def stage_audits():
     raise ValueError(f"{STAGE_SOURCE} names no {STAGE_AUDITS}")
 
 
+def runnable(job):
+    return job.get("enabled", True) and job.get("state") != PAUSED_STATE and not job.get("paused_at")
+
+
 def stage_pending():
-    """The audits asked about that a pending `oobe` stage has still to run."""
+    """The audits asked about that a stack-armed `oobe` stage has still to run."""
+    if not os.path.exists(STACK_STATE):
+        return set()
     try:
-        if not any(job.get("id") == STAGE_JOB for job in jobs_in(CHAT_ROSTER)):
+        if not any(job.get("id") == STAGE_JOB and runnable(job) for job in jobs_in(CHAT_ROSTER)):
             return set()
     except FileNotFoundError:
         return set()
@@ -136,7 +148,7 @@ def running(now):
 def busy():
     now = datetime.now(timezone.utc)
     try:
-        return due(now) | running(now) | {f"{audit} (oobe stage pending)" for audit in stage_pending()}
+        return due(now) | running(now) | {f"{audit} (armed oobe stage)" for audit in stage_pending()}
     except Exception as exc:  # noqa: BLE001 - any failed read is not "nothing going"
         return {f"{UNREADABLE} ({exc})"}
 

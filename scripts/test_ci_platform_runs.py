@@ -143,20 +143,37 @@ class PlatformRunsTest(unittest.TestCase):
         self.assertEqual(self._wait(bound=30), "ended after 1s")
 
 
-    # --- a pending oobe stage ------------------------------------------------
+    # --- an oobe stage the eval stack left armed ----------------------------
 
-    def _stage(self, state=None, job=True):
+    def _stage(self, state=None, job=True, armed=True, oobe=None):
         (self.home / "cron").mkdir(exist_ok=True)
-        jobs = [{"id": "oobe"}] if job else []
+        if armed:
+            (self.home / ".bench-oobe.json").write_text("{}")
+        jobs = [oobe or {"id": "oobe"}] if job else []
         (self.home / "cron" / "jobs.json").write_text(json.dumps({"jobs": jobs + [{"id": "bootstrap-inventory-scan"}]}))
         if state is not None:
             (self.home / ".oobe_audits_fired").write_text(json.dumps(state))
+
+    def test_a_fresh_installs_own_stage_is_not_waited_on_before_it_marks(self):
+        # Its marks and runs are counted once made; the in-flight note keeps the runs apart.
+        self._stage(armed=False)
+        self.assertEqual(self._wait(), "none going")
+
+    def test_a_paused_or_disabled_stage_job_holds_nothing(self):
+        for job in ({"id": "oobe", "enabled": False}, {"id": "oobe", "state": "paused"}, {"id": "oobe", "paused_at": "x"}):
+            with self.subTest(job=job):
+                self._stage(oobe=job)
+                self.assertEqual(self._wait(), "none going")
+
+    def test_an_audit_the_stage_gave_up_on_no_longer_holds(self):
+        self._stage({"fired": [], "gave_up": ["compliance-audit"], "current": None})
+        self.assertEqual(self._wait(audits=["compliance-audit"]), "none going")
 
     def test_a_stage_not_yet_started_holds_every_audit_it_runs(self):
         self._stage()
         self.assertEqual(
             self._wait(audits=["compliance-audit", "gce-compute-fleet-audit"]),
-            "still going after 0s, the run goes ahead: compliance-audit (oobe stage pending)",
+            "still going after 0s, the run goes ahead: compliance-audit (armed oobe stage)",
         )
 
     def test_an_audit_the_stage_has_marked_and_left_no_longer_holds(self):
@@ -165,12 +182,12 @@ class PlatformRunsTest(unittest.TestCase):
         self._stage({"fired": ["fleet-wide-cost-analysis"], "held": {"compliance-audit": "disabled"}, "current": None})
         self.assertEqual(
             self._wait(),
-            "still going after 0s, the run goes ahead: obtainability-audit (oobe stage pending), stockout-prevention (oobe stage pending)",
+            "still going after 0s, the run goes ahead: obtainability-audit (armed oobe stage), stockout-prevention (armed oobe stage)",
         )
 
     def test_the_audit_in_flight_holds_until_the_stage_moves_on(self):
         self._stage({"fired": ["fleet-wide-cost-analysis"], "current": {"job": "fleet-wide-cost-analysis", "marked_at": 1}})
-        self.assertIn("fleet-wide-cost-analysis (oobe stage pending)", self._wait(audits=["fleet-wide-cost-analysis"]))
+        self.assertIn("fleet-wide-cost-analysis (armed oobe stage)", self._wait(audits=["fleet-wide-cost-analysis"]))
 
     def test_a_done_or_absent_stage_holds_nothing(self):
         self._stage({"done": True})
@@ -217,6 +234,32 @@ class PlatformRunsTest(unittest.TestCase):
         self.assertEqual(count.read_text().strip(), "3")
         self.assertEqual(done.stderr.count("trying again"), 2, done.stderr)
         self.assertIn("Platform runs (case rep 1) on compliance-audit: none going", done.stdout)
+
+    def test_an_exec_that_keeps_failing_stops_at_the_bound(self):
+        fn = re.search(r"^wait_platform_runs\(\) \{.*?^\}$", RUNNER.read_text(), re.S | re.M).group(0)
+        bin_dir = self.home / "bin"
+        bin_dir.mkdir()
+        kubectl = bin_dir / "kubectl"
+        kubectl.write_text('#!/bin/sh\ncat > /dev/null\necho "error: forbidden"\nexit 1\n')
+        kubectl.chmod(0o755)
+        body = "\n".join(
+            [
+                "set -euo pipefail",
+                f'SCRIPT_DIR="{REPO / "hack"}"',
+                "EVAL_PLATFORM_RUN_WAIT_SECONDS=2 EVAL_PLATFORM_RUN_POLL_SECONDS=1 EVAL_SANDBOX_EXEC_ROUND_TRIP_SECONDS=5",
+                'EVAL_SANDBOX_EXEC_TIMEOUT=30s EVAL_GATEWAY_CONTAINER=c EVAL_GATEWAY_PYTHON=p EVAL_GATEWAY_HOME=/h',
+                "PROJECT_ID=proj AGENT_CLUSTER_CONTEXT=gke_proj_us_c TARGET_NAMESPACE=ns AGENT_SERVICE_NAME=platform-agent",
+                fn,
+                'wait_platform_runs "case rep 1" "compliance-audit"',
+                'echo "returned $?"',
+            ]
+        )
+        done = subprocess.run(
+            ["bash", "-c", body], capture_output=True, text=True, check=False, timeout=60,
+            env={**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}"},
+        )
+        self.assertIn("returned 0", done.stdout, done.stderr)
+        self.assertIn("stopped waiting on compliance-audit after 2s", done.stderr)
 
 
 if __name__ == "__main__":
