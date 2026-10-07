@@ -731,6 +731,13 @@ class LogHead(unittest.TestCase):
         self.assertGreaterEqual(len(head), pp.BUILD_LOG_HEAD_BYTES - 2)
         self.assertIsNotNone(pp.lease_window(head)[0])
 
+    def test_a_banner_after_a_bare_carriage_return_still_starts_a_line(self):
+        """run_cmd's text mode read a lone \r as a line end; the bytes-mode
+        read has to do the same or BANNER_PATTERN's ^ misses the banner."""
+        head = self._read(b"pulling 100%\r" + self.LEASE_BANNER.encode("utf-8"))
+        self.assertNotIn("\r", head)
+        self.assertIsNotNone(pp.lease_window(head)[0])
+
 
 class SweepUnreadable(unittest.TestCase):
     """A build whose read raises is named and skipped; the sweep goes on.
@@ -744,8 +751,14 @@ class SweepUnreadable(unittest.TestCase):
     BAD = BUILDS[1]
     AS_OF = datetime(2026, 8, 27, tzinfo=timezone.utc)
 
-    def _sweep(self, bad=(BAD,), pending=()):
-        entries = {build: f"gs://bucket/{build}" for build in self.BUILDS}
+    @staticmethod
+    def _build(moment: datetime) -> int:
+        """A build ID whose snowflake encodes `moment`."""
+        millis = int(moment.timestamp() * pp.MILLIS_PER_SECOND) - pp.SNOWFLAKE_EPOCH_MS
+        return millis << pp.SNOWFLAKE_TIMESTAMP_SHIFT
+
+    def _sweep(self, bad=(BAD,), pending=(), builds=BUILDS, days=1):
+        entries = {build: f"gs://bucket/{build}" for build in builds}
 
         def wait_for(path):
             build = int(path.rsplit("/", 1)[1])
@@ -760,7 +773,7 @@ class SweepUnreadable(unittest.TestCase):
                 unittest.mock.patch.object(pp, "_index_entries_from_gcs",
                                            return_value=(entries, None)), \
                 unittest.mock.patch.object(pp, "_wait_from_gcs", side_effect=wait_for):
-            return pp.collect_waits(self.AS_OF - timedelta(days=1), self.AS_OF)
+            return pp.collect_waits(self.AS_OF - timedelta(days=days), self.AS_OF)
 
     def test_the_other_builds_are_still_measured(self):
         sweep = self._sweep().value
@@ -786,6 +799,19 @@ class SweepUnreadable(unittest.TestCase):
         self.assertFalse(source.ok)
         self.assertIn("3 of 3", source.error)
         self.assertIn("UnicodeDecodeError", source.error)
+        # The counts and the list travel with the error, not only one example.
+        self.assertEqual(3, source.value.builds_read)
+        self.assertEqual(sorted(str(b) for b in self.BUILDS),
+                         sorted(u["build_id"] for u in source.value.unreadable))
+        summary = pp.summarise(
+            self.AS_OF - timedelta(days=1), self.AS_OF, 15, 45, 45,
+            source, pp.Source(error="not read"), pp.Source(error="not read"),
+        )
+        self.assertEqual(pp.VERDICT_UNMEASURED, summary["verdict"])
+        self.assertEqual(0, summary["trend"]["runs"])
+        self.assertEqual(3, summary["trend"]["builds_read"])
+        self.assertEqual(3, len(summary["trend"]["unreadable"]))
+        self.assertIn(str(self.BUILDS[2]), pp.render(summary))
 
     def test_most_builds_unreadable_is_not_measured_even_with_one_run(self):
         """One run out of three is a percentile over almost nothing, which the
@@ -793,6 +819,32 @@ class SweepUnreadable(unittest.TestCase):
         source = self._sweep(bad=self.BUILDS[:2])
         self.assertFalse(source.ok)
         self.assertIn("2 of 3", source.error)
+
+    def test_a_failure_that_starts_on_the_newest_day_is_not_measured(self):
+        """Three of ten builds raising is under the floor for the window, but
+        they are every build of the newest day, the one the alert reads."""
+        older = [self._build(self.AS_OF - timedelta(days=1, hours=h)) for h in range(1, 8)]
+        newest = [self._build(self.AS_OF - timedelta(hours=h)) for h in range(1, 4)]
+        source = self._sweep(bad=newest, builds=older + newest, days=2)
+        self.assertFalse(source.ok)
+        self.assertIn("3 of 3 builds on 2026-08-26", source.error)
+        self.assertEqual(10, source.value.builds_read)
+        self.assertEqual(3, len(source.value.unreadable))
+
+    def test_a_failure_confined_to_an_older_day_still_names_that_day(self):
+        older = [self._build(self.AS_OF - timedelta(days=1, hours=h)) for h in range(1, 4)]
+        newest = [self._build(self.AS_OF - timedelta(hours=h)) for h in range(1, 8)]
+        source = self._sweep(bad=older, builds=older + newest, days=2)
+        self.assertFalse(source.ok)
+        self.assertIn("3 of 3 builds on 2026-08-25", source.error)
+
+    def test_one_bad_build_on_the_newest_day_among_many_is_measured(self):
+        older = [self._build(self.AS_OF - timedelta(days=1, hours=h)) for h in range(1, 4)]
+        newest = [self._build(self.AS_OF - timedelta(hours=h)) for h in range(1, 8)]
+        source = self._sweep(bad=newest[:1], builds=older + newest, days=2)
+        self.assertTrue(source.ok)
+        self.assertEqual(9, len(source.value.waits))
+        self.assertEqual([str(newest[0])], [u["build_id"] for u in source.value.unreadable])
 
     def test_one_bad_build_among_builds_still_starting_is_not_a_read_failure(self):
         """A build with no prowjob.json yet was read and had nothing to say; it
