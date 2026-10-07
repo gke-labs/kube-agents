@@ -214,8 +214,8 @@ FIXTURE_NOT_READY = {
     ),
     "obtainability-untargeted-compute-class-manifest": (
         "#2540: needs a ComputeClass cluster without default ComputeClass and with "
-        "an untargeted workload declared in GitOps in each pool project, so 3.24's "
-        "manifest fix is verifiable end-to-end"
+        "an untargeted workload (untargeted-worker) in each pool project, so 3.24's "
+        "finding on the planted workload is verifiable"
     ),
     "cluster-agent-stalled-controller-diagnosis": (
         "#1873: needs the stalled-controller role applied to every pool "

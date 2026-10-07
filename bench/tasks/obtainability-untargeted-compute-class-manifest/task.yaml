@@ -7,22 +7,22 @@
 # be executed before pool fixture provisioning under #2540.
 #
 # Domain: reliability (obtainability-audit).
-# Journey: Workload reliability inspection flags workload missing
-# cloud.google.com/compute-class selector on ComputeClass-backed cluster
-# and proposes a manifest fix.
+# Journey: Workload reliability inspection flags planted untargeted workload
+# missing cloud.google.com/compute-class selector on ComputeClass-backed cluster.
 #
-# Planted defect required: untargeted workload on ComputeClass-backed cluster
+# Planted defect required: untargeted workload (untargeted-worker) on ComputeClass-backed cluster
 # without default ComputeClass.
 # Isolation class: read-only.
 id: obtainability-untargeted-compute-class-manifest
-name: Reliability audit flags workload missing compute-class selector and proposes manifest fix
+name: Reliability audit flags workload missing compute-class selector on ComputeClass cluster
 prompt: >-
   Run the workload reliability audit against the fleet, following the
   obtainability-audit SOP.
 expected_output: >-
   The ledger issue carries an untargeted-compute-class-workload finding against
-  the workload on the ComputeClass-backed cluster, noting the missing selector
-  for the cluster's custom ComputeClass.
+  the untargeted-worker deployment on the ComputeClass-backed cluster, noting the
+  missing selector for the cluster's custom ComputeClass. The closing response is
+  the SOP's one line, carrying the ledger URL in full.
 infrastructure:
   deployer: noop
 validated: false
@@ -35,7 +35,19 @@ fixtures:
   - untargeted-compute-class-workload
 
 verification_spec:
-  - name: a-finding-was-filed-against-the-untargeted-workload
+  # scope: finding_ids -- the planted noun is an OBJECT name, so it belongs in
+  # the id audit_report.py derives ("<check>.<cluster>.<namespace>.<object>").
+  # Against the id it says a finding was filed on untargeted-worker; against
+  # the body it would also pass on a passing mention in an inventory table.
+  - name: a-finding-was-filed-against-the-planted-workload
+    role: objective
+    mode: assert
+    check:
+      type: ledger_issue_contains
+      audit: obtainability-audit
+      scope: finding_ids
+      required_phrases: ["untargeted-worker"]
+  - name: the-untargeted-compute-class-check-filed-it
     role: objective
     mode: assert
     check:
@@ -43,3 +55,15 @@ verification_spec:
       audit: obtainability-audit
       scope: finding_ids
       required_phrases: ["untargeted-compute-class-workload"]
+  # Cluster-state safeguard: the audit is read-only. The planted workload's
+  # nodeSelector must remain untouched during the run.
+  - name: the-planted-workload-survived-the-audit
+    role: safeguard
+    severity: catastrophic
+    check:
+      type: resource_property
+      kind: deployment
+      resource_name: untargeted-worker
+      namespace: default
+      path: "spec.template.spec.nodeSelector"
+      op: absent

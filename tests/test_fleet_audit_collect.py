@@ -1,8 +1,11 @@
 """Unit tests for the untargeted-compute-class-workload fleet-audit check."""
 
+import json
+import sys
+import tempfile
 import unittest
 from pathlib import Path
-import sys
+from unittest.mock import MagicMock, patch
 
 # Ensure collect.py is importable
 scripts_dir = Path(__file__).resolve().parent.parent / "agents/platform/skills/fleet-audit/scripts"
@@ -478,6 +481,13 @@ class TestUntargetedComputeClassWorkload(unittest.TestCase):
         }
         self.assertIsNotNone(collect.check_untargeted_compute_class_workload(wl, ctx_win))
 
+    def _create_dump_file(self, fake_dump):
+        tmp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp_dir.cleanup)
+        dump_path = Path(tmp_dir.name) / "test_dump.json"
+        dump_path.write_text(json.dumps(fake_dump), encoding="utf-8")
+        return dump_path
+
     def test_collect_obtainability_crd_absent_sets_not_applicable(self):
         spec = collect.CheckSpec(
             "untargeted-compute-class-workload",
@@ -490,12 +500,8 @@ class TestUntargetedComputeClassWorkload(unittest.TestCase):
         fake_dump = {
             "items": [deployment("api"), self.base_node, self.ns]
         }
-        import json
-        from unittest.mock import patch, MagicMock
-
+        tmp_dump = self._create_dump_file(fake_dump)
         with patch.object(collect, "dump_state") as mock_dump:
-            tmp_dump = Path("/tmp/test_dump.json")
-            tmp_dump.write_text(json.dumps(fake_dump), encoding="utf-8")
             mock_dump.return_value = (tmp_dump, MagicMock(rc=0, duration_s=0.1, stdout="{}"), True)
 
             with patch.object(collect, "run_and_gate") as mock_run_and_gate:
@@ -512,7 +518,6 @@ class TestUntargetedComputeClassWorkload(unittest.TestCase):
                 self.assertIn("untargeted-compute-class-workload", cc_context.context.get("not_applicable", {}))
                 self.assertEqual([self.base_node], cc_context.context.get("nodes"))
                 self.assertEqual([self.ns], cc_context.context.get("namespaces"))
-            tmp_dump.unlink(missing_ok=True)
 
     def test_collect_obtainability_timeout_sets_unevaluated(self):
         spec = collect.CheckSpec(
@@ -526,12 +531,8 @@ class TestUntargetedComputeClassWorkload(unittest.TestCase):
         fake_dump = {
             "items": [deployment("api"), self.base_node, self.ns]
         }
-        import json
-        from unittest.mock import patch, MagicMock
-
+        tmp_dump = self._create_dump_file(fake_dump)
         with patch.object(collect, "dump_state") as mock_dump:
-            tmp_dump = Path("/tmp/test_dump.json")
-            tmp_dump.write_text(json.dumps(fake_dump), encoding="utf-8")
             mock_dump.return_value = (tmp_dump, MagicMock(rc=0, duration_s=0.1, stdout="{}"), True)
 
             with patch.object(collect, "run_and_gate") as mock_run_and_gate:
@@ -548,7 +549,6 @@ class TestUntargetedComputeClassWorkload(unittest.TestCase):
                 self.assertIn("untargeted-compute-class-workload", cc_context.context.get("unevaluated", {}))
                 self.assertEqual([self.base_node], cc_context.context.get("nodes"))
                 self.assertEqual([self.ns], cc_context.context.get("namespaces"))
-            tmp_dump.unlink(missing_ok=True)
 
     def test_collect_obtainability_success_records_computeclasses_command(self):
         spec = collect.CheckSpec(
@@ -562,18 +562,15 @@ class TestUntargetedComputeClassWorkload(unittest.TestCase):
         fake_dump = {
             "items": [deployment("api"), self.base_node, self.ns]
         }
-        import json
-        from unittest.mock import patch, MagicMock
-
+        tmp_dump = self._create_dump_file(fake_dump)
+        cc_stdout = json.dumps({"items": [self.cc]})
         with patch.object(collect, "dump_state") as mock_dump:
-            tmp_dump = Path("/tmp/test_dump.json")
-            tmp_dump.write_text(json.dumps(fake_dump), encoding="utf-8")
             mock_dump.return_value = (tmp_dump, MagicMock(rc=0, duration_s=0.1, stdout="{}"), True)
 
             with patch.object(collect, "run_and_gate") as mock_run_and_gate:
                 mock_run_and_gate.return_value = (
                     {"items": [self.cc]},
-                    MagicMock(rc=0, duration_s=0.05, stdout="{}"),
+                    MagicMock(rc=0, duration_s=0.05, stdout=cc_stdout),
                 )
                 cc_context = collect._collect_obtainability(
                     {"name": "c1", "project": "p1", "location": "l1"},
@@ -588,7 +585,8 @@ class TestUntargetedComputeClassWorkload(unittest.TestCase):
                 self.assertIsNotNone(cmd_rec)
                 self.assertIn("kubectl get computeclasses -A -o json", cmd_rec["command"])
                 self.assertEqual(0, cmd_rec["rc"])
-            tmp_dump.unlink(missing_ok=True)
+                self.assertEqual(0.05, cmd_rec["duration_s"])
+                self.assertEqual(cmd_rec["output_sha256"], collect.output_digest(cc_stdout))
 
 
 if __name__ == "__main__":
