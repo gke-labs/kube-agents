@@ -475,7 +475,31 @@ func TestADelegateIsIgnoredAndLogged(t *testing.T) {
 			if got := r.adapter.postTexts()[posts:]; len(got) != 0 {
 				t.Fatalf("an ignored request posted %v", got)
 			}
+			// A refusal's notice would wait for the turn's terminal
+			// (deferNotice), so end the turn and look again once its
+			// route is retired, which is after any held notice posts.
+			assertNoNoticeAtTheEnd(t, r, exec, origin.TaskID, lib.StateCompleted, posts)
 		})
+	}
+}
+
+// assertNoNoticeAtTheEnd ends the turn with state, waits until its terminal
+// has been relayed to the end (its route retired, after any notice held for
+// it was flushed), and fails if a delegation notice was posted since posts.
+func assertNoNoticeAtTheEnd(t *testing.T, r *rig, exec *lib.TaskExecution, taskID string, state lib.TaskState, posts int) {
+	t.Helper()
+	ctx := context.Background()
+	if err := exec.PublishStatus(ctx, state, true); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "the turn's terminal relayed", func() bool {
+		key, err := r.g.reg.SessionForTask(ctx, taskID)
+		return err == nil && key == ""
+	})
+	for _, p := range r.adapter.postTexts()[posts:] {
+		if strings.Contains(p, "refused") || strings.Contains(p, "not allowed") {
+			t.Fatalf("an ignored request posted a notice at the turn's end: %q", p)
+		}
 	}
 }
 
@@ -544,15 +568,14 @@ func TestADelegateAfterTheTerminalMintsNothing(t *testing.T) {
 // way the relay finds the turn detached and canceled, ignores the request
 // as stale, posts nothing about it, and nothing reaches platform.
 func TestAStoppedTurnDoesNotDelegate(t *testing.T) {
-	assertIgnored := func(t *testing.T, r *rig, taskID string) {
+	assertIgnored := func(t *testing.T, r *rig, exec *lib.TaskExecution, taskID string) {
 		t.Helper()
 		waitFor(t, "ignore line", loggedContaining(r, "delegation ignored", "rule="+ruleDelegationStale, "stopped=true", taskID))
 		if n := platformSubmissions(t, r); n != 0 {
 			t.Fatalf("a stopped turn minted %d children", n)
 		}
-		if postedContaining(r, "delegation refused")() {
-			t.Fatalf("a stopped turn's delegation posted a refusal: %v", r.adapter.postTexts())
-		}
+		// The stopped turn ends canceled; a refusal's notice would post then.
+		assertNoNoticeAtTheEnd(t, r, exec, taskID, lib.StateCanceled, 0)
 	}
 	t.Run("stop first", func(t *testing.T) {
 		r, spawn := startRigWithSpawner(t)
@@ -564,7 +587,7 @@ func TestAStoppedTurnDoesNotDelegate(t *testing.T) {
 		if err := exec.PublishArtifact(ctx, delegateArtifact(t, "platform", "report fleet health")); err != nil {
 			t.Fatal(err)
 		}
-		assertIgnored(t, r, origin.TaskID)
+		assertIgnored(t, r, exec, origin.TaskID)
 	})
 	t.Run("artifact first", func(t *testing.T) {
 		r, spawn := startRigWithSpawner(t)
@@ -603,7 +626,7 @@ func TestAStoppedTurnDoesNotDelegate(t *testing.T) {
 			}
 			return false
 		})
-		assertIgnored(t, r, origin.TaskID)
+		assertIgnored(t, r, exec, origin.TaskID)
 	})
 }
 
@@ -742,9 +765,10 @@ func TestARefusalFollowsTheDelegatingTurnsAnswer(t *testing.T) {
 	}
 }
 
-// narrowTasksStream takes the platform agent's in subject off TASKS while
-// leaving the events and supervisor subjects (the relay's) and the named
-// session's in subject on it, so a submission to platform fails for real.
+// narrowTasksStream leaves on TASKS only the events and supervisor subjects
+// (the relay's) and the named addressee's in subject, so a submission to any
+// other addressee fails for real: given the delegating session, the child's
+// submission to platform; given platform, a wake's on a fresh incarnation.
 func narrowTasksStream(t *testing.T, url, session string) {
 	t.Helper()
 	nc, err := nats.Connect(url)
@@ -2217,5 +2241,23 @@ func TestAskTTLClearsTheRequestCopy(t *testing.T) {
 	fresh, _ := r.g.reg.Get(ctx, conv)
 	if fresh.Tasks[0].Request != "" {
 		t.Fatalf("request survived the TTL: %q", fresh.Tasks[0].Request)
+	}
+}
+
+// TestTheWakesAskStaysWithinItsCapAfterRunsAreBroken: breaking a backtick
+// run adds a zero-width space, so the ask is capped after the runs are
+// broken; capped first, an ask of long runs comes out over wakeAskCap.
+func TestTheWakesAskStaysWithinItsCapAfterRunsAreBroken(t *testing.T) {
+	ask := strings.Repeat(strings.Repeat("`", 2*wakeFenceMax)+"x", 2*wakeAskCap/(2*wakeFenceMax))
+	text := wakeText(lib.StateCompleted, "task-x", ask, "fine", "")
+	got, _, ok := splitWakeAsk(text)
+	if !ok {
+		t.Fatalf("no ask block in %q", text)
+	}
+	if len(got) > wakeAskCap {
+		t.Fatalf("the ask in the wake is %d bytes, over wakeAskCap %d", len(got), wakeAskCap)
+	}
+	if !strings.HasSuffix(got, wakeAskTruncatedNote) {
+		t.Fatalf("the cut ask is not marked: %q", got[len(got)-40:])
 	}
 }

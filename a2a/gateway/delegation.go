@@ -10,7 +10,7 @@ import (
 )
 
 // The rules a delegation is refused or ignored under, as the audit line
-// names them (phase-2 delegation spec §8).
+// names them (spec-chatops-gateway.md, "Sessions by default").
 const (
 	ruleDelegationAllowedUsers  = "delegation.allowed-users"
 	ruleDelegationTarget        = "delegation.target"
@@ -89,7 +89,7 @@ func (g *Gateway) handleDelegateRequest(ctx context.Context, rec *SessionRecord,
 	}
 	// A refusal's notice waits for the delegating turn's terminal, so the
 	// room reads the session's "delegated to platform" first and the
-	// refusal after it (spec §3).
+	// refusal after it.
 	// The refusal is also marked on the turn's entry, durable, so the end
 	// an observer is told and the read route's report agree that the turn
 	// did not hand off (TaskRef.refusedEnd).
@@ -118,7 +118,7 @@ func (g *Gateway) handleDelegateRequest(ctx context.Context, rec *SessionRecord,
 		ignore(ruleDelegationStale, "busSession", rec.BusSession)
 		return
 	}
-	// One child at a time (decision 3), and a request is accepted once per
+	// One child at a time, and a request is accepted once per
 	// task. A slice, so fan-out is one condition here later. Checked before
 	// the active task, so a repeat from the parent logs as what it is.
 	if len(parent.Children) > 0 {
@@ -150,7 +150,7 @@ func (g *Gateway) handleDelegateRequest(ctx context.Context, rec *SessionRecord,
 		refuse(ruleDelegationTarget, "⚠️ delegation refused: only platform can be delegated to today")
 		return
 	}
-	// One live child per conversation (decision 3), whichever turn asked
+	// One live child per conversation, whichever turn asked
 	// for it: a stop detaches a child without ending it.
 	if live := g.liveChild(ctx, rec); live != "" {
 		refuse(ruleDelegationBusy, fmt.Sprintf("⚠️ delegation refused: a delegated task is still running (task %s)", live), "child", live)
@@ -320,7 +320,7 @@ func capAsk(text string) string {
 	return truncateRunes(text, wakeAskCap-len("…")-len(wakeAskTruncatedNote)) + wakeAskTruncatedNote
 }
 
-// wakeText is the wake turn's prompt (spec §4). With the delegating turn's
+// wakeText is the wake turn's prompt. With the delegating turn's
 // request on record it opens with the label and the request fenced - the
 // human's text, untrusted like the result, so it is fenced the same way and
 // no line of it can close the block and pass for the gateway's own - then
@@ -341,7 +341,9 @@ func wakeText(state lib.TaskState, childID, ask, result, reason string) string {
 	}
 	var text string
 	if ask = strings.TrimSpace(ask); ask != "" {
-		ask = breakBacktickRuns(capAsk(ask), wakeFenceMax-1)
+		// Runs broken first, then the cap: each break adds a zero-width
+		// space, so capping first could leave the ask over wakeAskCap.
+		ask = capAsk(breakBacktickRuns(ask, wakeFenceMax-1))
 		fence := wakeFence(ask)
 		text = wakeAskLabel + "\n" + fence + "\n" + ask + "\n" + fence + "\n" +
 			fmt.Sprintf("You delegated to %s (task %s), which %s.", targetPlatform, childID, outcome)
@@ -502,8 +504,9 @@ func (g *Gateway) flushNotices(conversation string, rs *relayState) {
 }
 
 // wakeSession starts the session's next turn on a delegated child's terminal
-// (spec §4): a fresh incarnation and the ordinary spawn, as a human turn
-// gets, with gateway-authored text carrying the outcome and the delegating
+// (spec-chatops-gateway.md, "Sessions by default"): a fresh incarnation and
+// the ordinary spawn, as a human turn gets, with gateway-authored text
+// carrying the outcome and the delegating
 // turn's stored attribution, so the wake runs under the requester who asked.
 // Called under the session lock, after the child's result or failure is
 // posted and its ActiveTask released: from relayTerminal on the child's

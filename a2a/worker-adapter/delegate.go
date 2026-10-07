@@ -41,9 +41,11 @@ func startDelegateListener(path string, log *slog.Logger) (<-chan delegateAsk, f
 		log = slog.Default()
 	}
 	// The socket's directory exists in the pod (/scratch, an emptyDir the
-	// image also creates) but not on a host running the adapter by hand;
-	// created here, private, so a local run keeps working. A listen that
-	// still fails fails the turn (Adapter.Run).
+	// image also creates). Off-cluster it is created here, private, when
+	// its parent is writable; the default under / usually is not, so a run
+	// by hand sets A2A_DELEGATE_SOCKET to a writable path or turns the tool
+	// off with A2A_DELEGATE_TOOL=off. A listen that still fails fails the
+	// turn (Adapter.Run).
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return nil, nil, err
 	}

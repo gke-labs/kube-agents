@@ -122,7 +122,10 @@ func run() int {
 	}
 
 	// The harness works out of the pod's scratch emptyDir; falling back to
-	// the current directory keeps local runs working.
+	// the current directory keeps the workdir working for a run by hand. The
+	// delegate tool's socket defaults under /scratch too and has no such
+	// fallback: a run by hand sets A2A_DELEGATE_SOCKET to a writable path or
+	// A2A_DELEGATE_TOOL=off.
 	workdir := os.Getenv("A2A_WORKDIR")
 	if workdir == "" {
 		workdir = defaultWorkdir

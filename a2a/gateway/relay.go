@@ -417,7 +417,7 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 	// from observeChildEnd below.
 	g.observeEnded(rec, taskID, s.Status.State, source, reason)
 
-	// A delegated child's end wakes the session that asked (spec §4).
+	// A delegated child's end wakes the session that asked.
 	if ref, ok := rec.TaskRefFor(taskID); ok && ref.Role == taskRoleChild {
 		if woken, why := g.wakeSession(ctx, rec, ref, s.Status.State, result, reason); !woken {
 			g.observeChildEnd(rec, ref, s.Status.State, source, reason, why)

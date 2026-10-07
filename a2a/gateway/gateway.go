@@ -907,7 +907,10 @@ func (g *Gateway) principalMapFor(backend string) *PrincipalMap {
 // per-conversation lock inside the keyed queue with the rest of a turn. It
 // looks at the active task's stream once and, when the task is already
 // terminal or has produced nothing past FirstEventGrace, releases the
-// conversation and writes the record.
+// conversation and writes the record. The exception is a delegating turn
+// whose delegate request the relay has not run: inside the relay-lag grace
+// it is left to the relay, untouched; past it the heal runs the request and
+// relays the terminal itself (relayUnrelayedDelegation).
 //
 // A record with no active task, or a detached one, is left alone: there is
 // nothing to heal and, for a detached task, the cancel already published is
@@ -1046,7 +1049,7 @@ func (g *Gateway) healActiveTask(ctx context.Context, rec *SessionRecord) {
 			rec.LastTaskActivity = now
 		}
 		// A child's terminal found on the stream wakes the session as the
-		// relay would have (spec §4), with the same guards and text, after
+		// relay would have, with the same guards and text, after
 		// the card, the end's announcement and the route's retirement. A
 		// child that never started does not: the room has the never-started
 		// notice, and there is no outcome to hand the session. The turn
@@ -1798,7 +1801,7 @@ type taskStart struct {
 	// what the history entry keeps.
 	Authority Authority
 	// CorrelationID empty mints a fresh one, which is a human turn: the
-	// originating user interaction. A child rides its parent's (spec §3).
+	// originating user interaction. A child rides its parent's.
 	CorrelationID string
 	// Role, ParentTaskID and Depth go onto the history entry as the
 	// delegation chain; all zero for a human turn.
