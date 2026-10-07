@@ -515,6 +515,69 @@ class SweepProjectTest(unittest.TestCase):
         self.assertIn("bench-addr-west", deleted_names)
         self.assertNotIn("bench-addr-east", deleted_names)
 
+    def test_aged_plant_resources_under_non_plant_parent_are_deleted(self):
+        """Proves that stamped subnets/addresses under non-plant parents (e.g. default VPC) are deleted by age."""
+        commands_run = []
+
+        def mock_runner(cmd, capture_output=True, text=True, check=False):
+            commands_run.append(cmd)
+            if "list" in cmd:
+                if "networks" in cmd and "subnets" not in cmd:
+                    return mock.Mock(
+                        returncode=0,
+                        stdout=json.dumps([{
+                            "name": "default",
+                            "description": "Default network for project",
+                            "creationTimestamp": self.old_ts,
+                        }]),
+                        stderr="",
+                    )
+                if "subnets" in cmd:
+                    return mock.Mock(
+                        returncode=0,
+                        stdout=json.dumps([
+                            {
+                                "name": "bench-sub",
+                                "description": self.plant_desc,
+                                "creationTimestamp": self.old_ts,
+                                "network": "https://www.googleapis.com/compute/v1/projects/p/global/networks/default",
+                                "region": "https://www.googleapis.com/compute/v1/projects/p/regions/us-west4",
+                            },
+                            {
+                                "name": "standing-sub",
+                                "description": "Standing non-plant subnet",
+                                "creationTimestamp": self.old_ts,
+                                "network": "https://www.googleapis.com/compute/v1/projects/p/global/networks/default",
+                                "region": "https://www.googleapis.com/compute/v1/projects/p/regions/us-west4",
+                            },
+                        ]),
+                        stderr="",
+                    )
+                if "addresses" in cmd:
+                    return mock.Mock(
+                        returncode=0,
+                        stdout=json.dumps([{
+                            "name": "bench-addr-in-standing-sub",
+                            "description": self.plant_desc,
+                            "creationTimestamp": self.old_ts,
+                            "subnetwork": "https://www.googleapis.com/compute/v1/projects/p/regions/us-west4/subnetworks/standing-sub",
+                            "region": "https://www.googleapis.com/compute/v1/projects/p/regions/us-west4",
+                        }]),
+                        stderr="",
+                    )
+            return mock.Mock(returncode=0, stdout="", stderr="")
+
+        res = sweep.sweep_project("my-project", max_age_hours=4.0, runner=mock_runner, now=self.now)
+        self.assertEqual(res["addresses"], ["bench-addr-in-standing-sub"])
+        self.assertEqual(res["subnets"], ["bench-sub"])
+        self.assertEqual(res["networks"], [])
+
+        delete_cmds = [cmd for cmd in commands_run if "delete" in cmd]
+        self.assertTrue(any("bench-addr-in-standing-sub" in cmd for cmd in delete_cmds))
+        self.assertTrue(any("bench-sub" in cmd for cmd in delete_cmds))
+        self.assertFalse(any("default" in cmd for cmd in delete_cmds))
+        self.assertFalse(any("standing-sub" in cmd for cmd in delete_cmds))
+
     def test_sweep_project_terminated_attaches_partial_deletions(self):
         """Proves that a SIGTERM mid-sweep attaches accumulated deletions to Terminated."""
         def mock_runner(cmd, capture_output=True, text=True, check=False):
@@ -948,6 +1011,43 @@ class MainCliTest(unittest.TestCase):
             code = sweep.main(["--pool", "--max-age-hours", "4.0"])
             self.assertEqual(code, 0)
             self.assertTrue(mock_pool.called)
+
+    def test_parse_max_age_hours_valid(self):
+        self.assertEqual(sweep.parse_max_age_hours("2.0"), 2.0)
+        self.assertEqual(sweep.parse_max_age_hours("2.5"), 2.5)
+        self.assertEqual(sweep.parse_max_age_hours("4.0"), 4.0)
+
+    def test_parse_max_age_hours_rejects_sub_minimum_negatives_nan_and_inf(self):
+        for val in ["0", "-1", "nan", "NaN", "inf", "Infinity", "1.9"]:
+            with self.subTest(val=val):
+                with self.assertRaises(sweep.argparse.ArgumentTypeError):
+                    sweep.parse_max_age_hours(val)
+
+    def test_main_rejects_invalid_max_age_hours(self):
+        for val in ["0", "-1", "nan", "inf", "1.9"]:
+            with self.subTest(val=val):
+                with self.assertRaises(SystemExit) as ctx:
+                    with mock.patch("sys.stderr", io.StringIO()):
+                        sweep.main(["--project", "p1", "--max-age-hours", val])
+                self.assertEqual(ctx.exception.code, 2)
+
+    def test_main_fault_outside_visit_returns_1_without_traceback(self):
+        with tempfile.NamedTemporaryFile("w", delete=False) as tf:
+            report_path = tf.name
+
+        try:
+            err = sweep.SweepError("could not read ci-deploy.sh")
+            with mock.patch.object(sweep, "pool_projects", side_effect=err):
+                with mock.patch("sys.stderr", io.StringIO()) as fake_stderr:
+                    code = sweep.main(["--pool", "--report", report_path])
+                self.assertEqual(code, 1)
+                self.assertIn("SweepError", fake_stderr.getvalue())
+                data = json.loads(pathlib.Path(report_path).read_text(encoding="utf-8"))
+                self.assertEqual(data["exit"], "failed")
+                self.assertEqual(data["exit_code"], 1)
+                self.assertIn("could not read ci-deploy.sh", data["error"])
+        finally:
+            pathlib.Path(report_path).unlink(missing_ok=True)
 
 
 if __name__ == "__main__":

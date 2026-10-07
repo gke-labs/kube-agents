@@ -2,7 +2,7 @@
 """Sweep leftover Compute networks, subnets and addresses planted by killed bench runs.
 
 A bench stack that plants project-level Compute resources (such as
-`prebuilt/subnet-range-exhaustion` proposed in #2468) creates a VPC network, subnet,
+prebuilt subnet exhaustion stacks) creates a VPC network, subnet,
 and internal addresses. A run killed hard between `tofu apply` and
 `tofu destroy` (e.g. deadline, node loss, SIGKILL) leaves those project-level
 resources behind.
@@ -19,13 +19,12 @@ Leftover VPCs and subnets count against project quotas and cause subsequent
 networking audit evaluations (SOP 2.1) to file false positive critical
 `subnet-ip-exhaustion` findings.
 
-This script provides out-of-band cleanup (manually via `--project`
-or `--pool`, and designed for a future Prow periodic on `main`) to sweep Compute
-addresses, subnets, and networks whose `description` starts with
-`kube-agents-bench plant`. Gating is rooted on the VPC network: plant networks
-older than `max_age_hours` (default: 4 hours) are selected along with their matching
-child subnets and internal addresses. Note: this sweeper is currently inert
-until bench planter stacks in #2468 land with the matching description prefix.
+This script sweeps Compute addresses, subnets, and networks whose
+`description` starts with `kube-agents-bench plant`. Gating is rooted on the
+VPC network: plant networks older than `max_age_hours` (default: 4 hours) are
+selected along with their child plant subnets and internal addresses, while
+plant subnets and addresses attached to non-plant networks (or orphaned) are
+gated on their own creation timestamp.
 
 Deletion order is strictly dependency-ordered:
 1. Addresses go first (releasing in-use IP reservations on the subnet).
@@ -36,6 +35,7 @@ Deletion order is strictly dependency-ordered:
 import argparse
 from datetime import datetime, timezone
 import json
+import math
 import os
 import pathlib
 import re
@@ -49,6 +49,7 @@ import boskos_pool  # noqa: E402
 
 PLANT_DESCRIPTION_PREFIX = "kube-agents-bench plant"
 DEFAULT_MAX_AGE_HOURS = 4.0
+MIN_MAX_AGE_HOURS = 2.0
 SECONDS_PER_HOUR = 3600.0
 
 REPORT_FILE = "compute-sweep.json"
@@ -184,6 +185,10 @@ def sweep_project(
 
     # 1. Inspect networks first (root of dependency chain)
     raw_networks = list_compute_resources(project, "networks", runner=runner)
+    plant_network_names = {
+        net.get("name") for net in raw_networks
+        if net.get("name") and matches_plant_description(net.get("description"))
+    }
     networks_to_delete = [
         net for net in raw_networks
         if matches_plant_description(net.get("description"))
@@ -192,9 +197,6 @@ def sweep_project(
     selected_network_names = {
         net.get("name") for net in networks_to_delete if net.get("name")
     }
-    raw_network_names = {
-        net.get("name") for net in raw_networks if net.get("name")
-    }
 
     # 2. Inspect subnets
     raw_subnets = list_compute_resources(project, "networks subnets", runner=runner)
@@ -202,14 +204,17 @@ def sweep_project(
     for sub in raw_subnets:
         if not matches_plant_description(sub.get("description")):
             continue
+        sub_name = sub.get("name", "")
         net_name = resource_name(sub.get("network"))
         if net_name and net_name in selected_network_names:
             subnets_to_delete.append(sub)
-        elif not net_name and is_older_than(sub.get("creationTimestamp"), max_age_hours, now=now):
-            # Standalone or mock subnets without network field
-            subnets_to_delete.append(sub)
-        elif net_name and net_name not in raw_network_names and is_older_than(sub.get("creationTimestamp"), max_age_hours, now=now):
-            # Orphaned subnet whose network was already deleted
+        elif net_name and net_name in plant_network_names and net_name not in selected_network_names:
+            # Parent is a plant network younger than max_age_hours: protect it
+            print(f"  skipping subnet {sub_name}: parent plant network {net_name} is younger than {max_age_hours}h")
+        elif is_older_than(sub.get("creationTimestamp"), max_age_hours, now=now):
+            # Parent is not a plant network (e.g. standalone/mock without network,
+            # parent already deleted, or parent is a standing non-plant network like default):
+            # gate on the subnet's own age
             subnets_to_delete.append(sub)
 
     selected_subnet_keys = {
@@ -220,10 +225,15 @@ def sweep_project(
     selected_subnet_self_links = {
         sub.get("selfLink") for sub in subnets_to_delete if sub.get("selfLink")
     }
-    raw_subnet_keys = {
+    plant_subnet_keys = {
         (resource_name(sub.get("region")), sub.get("name"))
         for sub in raw_subnets
-        if sub.get("name")
+        if sub.get("name") and matches_plant_description(sub.get("description"))
+    }
+    plant_subnet_self_links = {
+        sub.get("selfLink")
+        for sub in raw_subnets
+        if sub.get("selfLink") and matches_plant_description(sub.get("description"))
     }
 
     # 3. Inspect addresses
@@ -232,13 +242,14 @@ def sweep_project(
     for addr in raw_addresses:
         if not matches_plant_description(addr.get("description")):
             continue
+        addr_name = addr.get("name", "")
         sub_ref = addr.get("subnetwork")
         sub_name = resource_name(sub_ref)
         addr_region = resource_name(addr.get("region"))
         net_name = resource_name(addr.get("network"))
 
-        # If the address explicitly references a known active (unselected) network, leave it alone
-        if net_name and net_name in raw_network_names and net_name not in selected_network_names:
+        if net_name and net_name in selected_network_names:
+            addresses_to_delete.append(addr)
             continue
 
         subnet_matches = False
@@ -250,15 +261,32 @@ def sweep_project(
             # Standalone or mock fixtures where neither specifies region
             subnet_matches = True
 
-        if subnet_matches or (net_name and net_name in selected_network_names):
+        if subnet_matches:
             addresses_to_delete.append(addr)
-        elif not sub_name and not net_name and is_older_than(addr.get("creationTimestamp"), max_age_hours, now=now):
-            # Standalone address without subnet or network fields
+            continue
+
+        # If the address explicitly references an active (unselected) plant network, protect it
+        if net_name and net_name in plant_network_names and net_name not in selected_network_names:
+            print(f"  skipping address {addr_name}: parent plant network {net_name} is younger than {max_age_hours}h")
+            continue
+
+        # If the address explicitly references an active (unselected) plant subnet, protect it
+        is_young_plant_subnet = False
+        if sub_ref and sub_ref in plant_subnet_self_links:
+            is_young_plant_subnet = True
+        elif sub_name and (addr_region, sub_name) in plant_subnet_keys:
+            is_young_plant_subnet = True
+        elif sub_name and not addr_region and any(k[1] == sub_name for k in plant_subnet_keys):
+            is_young_plant_subnet = True
+
+        if is_young_plant_subnet:
+            print(f"  skipping address {addr_name}: parent plant subnet {sub_name} is younger than {max_age_hours}h")
+            continue
+
+        # Otherwise (parent is a non-plant network/subnet, or parent deleted, or standalone):
+        # gate on the address's own age
+        if is_older_than(addr.get("creationTimestamp"), max_age_hours, now=now):
             addresses_to_delete.append(addr)
-        elif is_older_than(addr.get("creationTimestamp"), max_age_hours, now=now):
-            # Orphaned address whose subnet/network was already deleted
-            if (not sub_name or (addr_region, sub_name) not in raw_subnet_keys) and (not net_name or net_name not in raw_network_names):
-                addresses_to_delete.append(addr)
 
     deleted = {"addresses": [], "subnets": [], "networks": []}
     failed = {"addresses": [], "subnets": [], "networks": []}
@@ -383,9 +411,6 @@ def sweep_pool(
             print(f"skipping {name}: not in mapped pool projects")
             unmapped.append(name)
             return
-        if report.get("ended_early"):
-            skipped.append(name)
-            return
         print(f"sweeping {name}")
         try:
             res = sweep_project(name, max_age_hours=max_age_hours, dry_run=dry_run, runner=runner, now=now)
@@ -471,6 +496,20 @@ def write_report(path: str | None, args: argparse.Namespace, run: dict, code: in
         print(f"could not write report to {path}: {exc}", file=sys.stderr)
 
 
+def parse_max_age_hours(val: str) -> float:
+    """Parse and validate --max-age-hours: positive, finite, at or above MIN_MAX_AGE_HOURS."""
+    try:
+        v = float(val)
+    except (ValueError, TypeError):
+        raise argparse.ArgumentTypeError(f"invalid float value: {val!r}")
+    if math.isnan(v) or math.isinf(v) or v < MIN_MAX_AGE_HOURS:
+        raise argparse.ArgumentTypeError(
+            f"--max-age-hours must be a finite number >= {MIN_MAX_AGE_HOURS} (got {val!r}): "
+            "a lower threshold risks sweeping active runs"
+        )
+    return v
+
+
 def main(argv=None) -> int:
     description = (__doc__ or "").splitlines()[0]
     parser = argparse.ArgumentParser(description=description)
@@ -479,9 +518,9 @@ def main(argv=None) -> int:
     mode.add_argument("--project", help="sweep one project, without asking Boskos")
     parser.add_argument(
         "--max-age-hours",
-        type=float,
+        type=parse_max_age_hours,
         default=DEFAULT_MAX_AGE_HOURS,
-        help=f"minimum age in hours of plant networks to sweep (default: {DEFAULT_MAX_AGE_HOURS})",
+        help=f"minimum age in hours of plant networks to sweep (default: {DEFAULT_MAX_AGE_HOURS}, min: {MIN_MAX_AGE_HOURS})",
     )
     parser.add_argument("--dry-run", action="store_true", help="report what would be deleted, delete nothing")
     parser.add_argument(
@@ -561,6 +600,10 @@ def main(argv=None) -> int:
     except Terminated as exc:
         code = TERMINATED_EXIT_CODE
         error = f"terminated ({exc})"
+        print(f"ERROR: {error}", file=sys.stderr)
+    except Exception as exc:
+        code = 1
+        error = f"{type(exc).__name__}: {exc}"
         print(f"ERROR: {error}", file=sys.stderr)
     except BaseException as exc:
         code = 1
