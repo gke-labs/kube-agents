@@ -58,6 +58,7 @@ class _ConfigCase(unittest.TestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
         os.environ.pop(registry_module.FORGES_CONFIG_ENV, None)
+        os.environ.pop(registry_module.FORGES_INLINE_ENV, None)
 
     def configure(self, document):
         path = self.dir / "forges.json"
@@ -157,12 +158,30 @@ class UnclaimedProviderTest(_ConfigCase):
     def test_a_provider_no_forge_class_serves_stops_the_build(self):
         # Review finding: a misspelt provider, or one this image predates,
         # built a broker with no forges that refused everything at runtime.
-        for provider in ("githib", "gitlab"):
+        for provider in ("githib", "gitlab", "gitea"):
             with self.subTest(provider=provider):
                 self.configure({"forges": [{"provider": provider, "host": "git.example.test"}]})
                 with self.assertRaises(ValueError) as caught:
                     providers.Registry()
                 self.assertIn(provider, str(caught.exception))
+
+    def test_inline_forges_env_builds_gitea_with_scheme_and_port(self):
+        os.environ[registry_module.FORGES_INLINE_ENV] = json.dumps([
+            {
+                "name": "gitea",
+                "provider": "gitea",
+                "host": "gitea.example.test",
+                "scheme": "http",
+                "port": 3000,
+                "tokenFile": "/var/run/secrets/kubeagents/forges/gitea/token",
+            }
+        ])
+        registry = providers.Registry()
+        self.assertEqual(["gitea"], [f.name for f in registry.forges])
+        self.assertIs(registry.default, registry.forges[0])
+        forge, repo = registry.resolve("acme/infra")
+        self.assertEqual(("gitea", "acme/infra"), (forge.name, repo))
+        self.assertEqual("http://gitea.example.test:3000/acme/infra.git", forge.clone_url(repo))
 
 
 class TwoForgesTest(_ConfigCase):

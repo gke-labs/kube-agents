@@ -1,0 +1,9 @@
+{
+  "forges": [
+    {
+      "provider": "gitea",
+      "host": "gitea.example.test",
+      "token_path": "/var/run/secrets/kubeagents/forges/gitea/token"
+    }
+  ]
+}

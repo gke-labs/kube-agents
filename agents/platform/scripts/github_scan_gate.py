@@ -56,6 +56,13 @@ open by design and a sweep may add to it without a change here.
 
 Consolidating did take something away: an operator could previously stop one
 poller by disabling its roster entry. ``GITHUB_WATCHER_SWEEPS`` gives that back.
+
+Despite the job's name, the pull-request sweep is not GitHub-only. It reads
+every managed repository on a forge the credential broker serves
+(``gitops_workspace.get_managed_forge_repos``) and drives each through the
+same forge-neutral verbs, so an agent pull request on a self-managed Gitea
+forge gets the same replies one on GitHub does. The issues sweep is still
+GitHub-only, because ``resolver.py`` is.
 """
 
 from collections import defaultdict
@@ -117,6 +124,12 @@ PR_MAX_PER_TICK_DEFAULT = 3
 # spend again.
 PR_MAX_REFUSALS_ENV = pr_triggers.MAX_REFUSALS_ENV
 PR_MAX_REFUSALS_DEFAULT = pr_triggers.MAX_REFUSALS_DEFAULT
+
+# The forge type a pull-request card names nothing extra for. A GitHub card
+# reads as it always has, so its body and its idempotency key are unchanged;
+# a card for any other forge says which one, because the repository's name
+# alone does not tell the worker which forge `--repo` will reach.
+GITHUB_FORGE_TYPE = "github"
 
 
 @dataclass
@@ -406,7 +419,7 @@ def _forge_detail(error: Exception) -> str:
 
 
 def _forge_warning(error: Exception) -> str:
-    return f"⚠️ **GitHub PR watcher is not running:** {_forge_detail(error)}"
+    return f"⚠️ **PR watcher is not running:** {_forge_detail(error)}"
 
 
 def _int_env(name: str, default: int) -> int:
@@ -453,7 +466,13 @@ def _post_body(provider, repo: str, pr, body: str) -> None:
     provider.post_comment(repo, pr, body)
 
 
-def _pr_card(pr, triggers: list, repo: str, now: datetime | None = None) -> Card:
+def _pr_card(
+    pr,
+    triggers: list,
+    repo: str,
+    now: datetime | None = None,
+    forge_type: str = GITHUB_FORGE_TYPE,
+) -> Card:
     """The card that hands one pull request's unanswered requests to the agent.
 
     Every trigger accepted on this pull request in this tick rides on one card:
@@ -466,6 +485,10 @@ def _pr_card(pr, triggers: list, repo: str, now: datetime | None = None) -> Card
     from a card body this script assembled — a card is not a transcript, and
     treating it as one is how a paraphrase becomes the instruction.
 
+    A card for a forge other than GitHub names the forge and the `--repo`
+    value to pass, because its `repo` is host-qualified and the skill takes
+    the name exactly as the card spells it. A GitHub card is unchanged.
+
     ``now`` is injected so the bucketing below is testable.
     """
     refs = [t.trigger.ref for t in triggers]
@@ -475,11 +498,17 @@ def _pr_card(pr, triggers: list, repo: str, now: datetime | None = None) -> Card
         f"{t.trigger.summary}"
         for t in triggers
     )
+    on_forge = (
+        ""
+        if forge_type == GITHUB_FORGE_TYPE
+        else f"Forge: `{forge_type}`. Pass `--repo {repo}` to every pr-conversation command.\n\n"
+    )
     return Card(
         title=f"Answer review comments on {repo}#{pr.number}"[:200],
         body=(
             f"A reviewer addressed you on **{repo}#{pr.number}** "
             f"(head branch `{pr.head_ref}`).\n\n"
+            f"{on_forge}"
             f"Unanswered requests:\n\n{asks}\n\n"
             "Run the **pr-conversation** skill and follow its procedure. Read the "
             "full conversation from the forge first — the summary above is a "
@@ -537,14 +566,22 @@ def sweep_pr_comments(dry_run: bool = False) -> SweepResult:
     warnings: list[str] = []
 
     try:
-        from gitops_workspace import get_managed_github_repos
-        repos = get_managed_github_repos()
+        # Every forge the broker serves, not GitHub alone: a GitHub entry is
+        # its bare slug as before, any other is `host/owner/name`, which the
+        # broker routes to that host's forge. See get_managed_forge_repos.
+        from gitops_workspace import get_managed_forge_repos
+        entries = get_managed_forge_repos()
     except Exception as error:
         return SweepResult(warnings=[_forge_warning(error if isinstance(error, forge.ForgeError) else forge.ForgeError("DISCOVERY_FAILED", str(error)))])
-    if not repos:
+    if not entries:
         # No GitOps repository configured. A supported install with nothing to
         # watch, not a fault — same reading as the issues sweep's NOT_CONFIGURED.
         return SweepResult()
+    repos = [entry["repo"] for entry in entries]
+    # The forge's own spelling of each repository, which is what a pull
+    # request reports as its head repository, and its forge type for the card.
+    paths = {entry["repo"]: entry["path"] for entry in entries}
+    forge_types = {entry["repo"]: entry["type"] for entry in entries}
 
     provider = forge.provider_for()
     prs: list[tuple[str, forge.PullRequest]] = []
@@ -579,7 +616,7 @@ def sweep_pr_comments(dry_run: bool = False) -> SweepResult:
                 nameless.append(r)
                 continue
             for pr in provider.list_open_prs(r):
-                if forge.is_agent_pull_request(pr, r, viewer) and not pr.is_ignored:
+                if forge.is_agent_pull_request(pr, r, viewer, path=paths[r]) and not pr.is_ignored:
                     prs.append((r, pr))
         except forge.ForgeError as error:
             refused.append((r, error))
@@ -687,7 +724,7 @@ def sweep_pr_comments(dry_run: bool = False) -> SweepResult:
         )
     if unreadable:
         warnings.append(
-            "⚠️ **GitHub PR watcher could not read** "
+            "⚠️ **PR watcher could not read** "
             + ", ".join(f"{repo}#{n} ({reason})" for repo, n, reason in sorted(unreadable))
             + " — those conversations were skipped this tick."
         )
@@ -707,7 +744,7 @@ def sweep_pr_comments(dry_run: bool = False) -> SweepResult:
     truncated = provider.truncations()
     if truncated:
         warnings.append(
-            f"⚠️ **GitHub PR watcher read only the first {forge.LISTING_CEILING} of** "
+            f"⚠️ **PR watcher read only the first {forge.LISTING_CEILING} of** "
             + ", ".join(f"{note}" for note in sorted(set(truncated)))
             + " — anything past that was not swept this tick."
         )
@@ -786,7 +823,7 @@ def sweep_pr_comments(dry_run: bool = False) -> SweepResult:
         by_pr[(item.repo, item.pr.number)].append(item)
 
     cards = [
-        _pr_card(items[0].pr, items, repo)
+        _pr_card(items[0].pr, items, repo, forge_type=forge_types.get(repo, GITHUB_FORGE_TYPE))
         for (repo, _number), items in sorted(by_pr.items(), key=lambda x: x[0])
     ]
     return SweepResult(cards=cards, warnings=warnings)

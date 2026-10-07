@@ -367,7 +367,7 @@ def normalise_login(login: str) -> str:
     return text
 
 
-def is_agent_pull_request(pr: PullRequest, repo: str, viewer: str) -> bool:
+def is_agent_pull_request(pr: PullRequest, repo: str, viewer: str, path: str = "") -> bool:
     """Did the agent open this pull request, from a branch it wrote, here?
 
     All three conditions, because each one alone is something a stranger can
@@ -395,13 +395,20 @@ def is_agent_pull_request(pr: PullRequest, repo: str, viewer: str) -> bool:
     the fork a proposal came from has been deleted: the branch is then nobody's
     that anyone can name, and the agent's own is something it must be able to
     name before it pushes to it.
+
+    `path` is the repository as its forge spells it, for a `repo` that is
+    host-qualified (`gitea.example/acme/live`, from
+    `gitops_workspace.get_managed_forge_repos`). A forge reports the head
+    repository as `acme/live`, so comparing it with the host-qualified name
+    would refuse every one of the agent's own pull requests there. Empty means
+    `repo` is already the forge's spelling, which a GitHub slug is.
     """
     if not viewer or not pr.head_repo:
         return False
     return (
         normalise_login(pr.author) == normalise_login(viewer)
         and pr.head_ref.startswith(AGENT_BRANCH_PREFIX)
-        and pr.head_repo.lower() == repo.lower()
+        and pr.head_repo.lower() == (path or repo).lower()
     )
 
 

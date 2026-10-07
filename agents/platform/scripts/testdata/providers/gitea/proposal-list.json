@@ -1,0 +1,274 @@
+{
+  "payload": {},
+  "responses": [
+    [
+      {
+        "id": 3,
+        "url": "https://gitea.example.test/acme/infra/pulls/3",
+        "number": 3,
+        "user": {
+          "id": 1,
+          "login": "kube-agents",
+          "full_name": "",
+          "email": "kube-agents@example.test",
+          "avatar_url": "https://gitea.example.test/avatars/a4278dd55a17b2a7c5c87e52eba6e386",
+          "html_url": "https://gitea.example.test/kube-agents",
+          "is_admin": true
+        },
+        "title": "Merged three",
+        "body": "Merged proposal body.",
+        "labels": [],
+        "milestone": null,
+        "assignee": null,
+        "assignees": null,
+        "requested_reviewers": null,
+        "requested_reviewers_teams": null,
+        "state": "closed",
+        "draft": false,
+        "is_locked": false,
+        "comments": 0,
+        "html_url": "https://gitea.example.test/acme/infra/pulls/3",
+        "diff_url": "https://gitea.example.test/acme/infra/pulls/3.diff",
+        "patch_url": "https://gitea.example.test/acme/infra/pulls/3.patch",
+        "mergeable": true,
+        "merged": true,
+        "merged_at": "2026-10-04T14:20:45Z",
+        "merge_commit_sha": "9a8b7c6d5e4f3a2b1c0d9e8f7a6b5c4d3e2f1a0b",
+        "merged_by": null,
+        "allow_maintainer_edit": false,
+        "base": {
+          "label": "main",
+          "ref": "main",
+          "sha": "e23e22aa8f36faf6bd6140d53f8823cf3aa4fc17",
+          "repo_id": 3,
+          "repo": {
+            "id": 3,
+            "name": "infra",
+            "full_name": "acme/infra",
+            "owner": {
+              "id": 3,
+              "login": "acme",
+              "full_name": "",
+              "email": "",
+              "avatar_url": "https://gitea.example.test/avatars/53bce4f1dfa0fe8e7ca126f91b35d3a6",
+              "html_url": "https://gitea.example.test/acme",
+              "is_admin": false
+            },
+            "private": false,
+            "fork": false,
+            "default_branch": "main",
+            "html_url": "https://gitea.example.test/acme/infra"
+          }
+        },
+        "head": {
+          "label": "platform-agent/live-three",
+          "ref": "platform-agent/live-three",
+          "sha": "7c5c8c5a58de37e482aa2c56e81121690cd4e199",
+          "repo_id": 3,
+          "repo": {
+            "id": 3,
+            "name": "infra",
+            "full_name": "acme/infra",
+            "owner": {
+              "id": 3,
+              "login": "acme",
+              "full_name": "",
+              "email": "",
+              "avatar_url": "https://gitea.example.test/avatars/53bce4f1dfa0fe8e7ca126f91b35d3a6",
+              "html_url": "https://gitea.example.test/acme",
+              "is_admin": false
+            },
+            "private": false,
+            "fork": false,
+            "default_branch": "main",
+            "html_url": "https://gitea.example.test/acme/infra"
+          }
+        },
+        "merge_base": "e23e22aa8f36faf6bd6140d53f8823cf3aa4fc17",
+        "due_date": null,
+        "created_at": "2026-10-04T14:20:42Z",
+        "updated_at": "2026-10-04T14:20:45Z",
+        "closed_at": "2026-10-04T14:20:45Z",
+        "pin_order": 0
+      },
+      {
+        "id": 2,
+        "url": "https://gitea.example.test/acme/infra/pulls/2",
+        "number": 2,
+        "user": {
+          "id": 1,
+          "login": "kube-agents",
+          "full_name": "",
+          "email": "kube-agents@example.test",
+          "avatar_url": "https://gitea.example.test/avatars/a4278dd55a17b2a7c5c87e52eba6e386",
+          "html_url": "https://gitea.example.test/kube-agents",
+          "is_admin": true
+        },
+        "title": "WIP: Add two",
+        "body": "Draft proposal body.",
+        "labels": [],
+        "milestone": null,
+        "assignee": null,
+        "assignees": null,
+        "requested_reviewers": null,
+        "requested_reviewers_teams": null,
+        "state": "closed",
+        "draft": true,
+        "is_locked": false,
+        "comments": 0,
+        "html_url": "https://gitea.example.test/acme/infra/pulls/2",
+        "diff_url": "https://gitea.example.test/acme/infra/pulls/2.diff",
+        "patch_url": "https://gitea.example.test/acme/infra/pulls/2.patch",
+        "mergeable": false,
+        "merged": false,
+        "merged_at": null,
+        "merge_commit_sha": null,
+        "merged_by": null,
+        "allow_maintainer_edit": false,
+        "base": {
+          "label": "main",
+          "ref": "main",
+          "sha": "e23e22aa8f36faf6bd6140d53f8823cf3aa4fc17",
+          "repo_id": 3,
+          "repo": {
+            "id": 3,
+            "name": "infra",
+            "full_name": "acme/infra",
+            "owner": {
+              "id": 3,
+              "login": "acme",
+              "full_name": "",
+              "email": "",
+              "avatar_url": "https://gitea.example.test/avatars/53bce4f1dfa0fe8e7ca126f91b35d3a6",
+              "html_url": "https://gitea.example.test/acme",
+              "is_admin": false
+            },
+            "private": false,
+            "fork": false,
+            "default_branch": "main",
+            "html_url": "https://gitea.example.test/acme/infra"
+          }
+        },
+        "head": {
+          "label": "platform-agent/live-two",
+          "ref": "platform-agent/live-two",
+          "sha": "3d5c8c5a58de37e482aa2c56e81121690cd4e198",
+          "repo_id": 3,
+          "repo": {
+            "id": 3,
+            "name": "infra",
+            "full_name": "acme/infra",
+            "owner": {
+              "id": 3,
+              "login": "acme",
+              "full_name": "",
+              "email": "",
+              "avatar_url": "https://gitea.example.test/avatars/53bce4f1dfa0fe8e7ca126f91b35d3a6",
+              "html_url": "https://gitea.example.test/acme",
+              "is_admin": false
+            },
+            "private": false,
+            "fork": false,
+            "default_branch": "main",
+            "html_url": "https://gitea.example.test/acme/infra"
+          }
+        },
+        "merge_base": "e23e22aa8f36faf6bd6140d53f8823cf3aa4fc17",
+        "due_date": null,
+        "created_at": "2026-10-04T14:20:40Z",
+        "updated_at": "2026-10-04T14:20:41Z",
+        "closed_at": "2026-10-04T14:20:41Z",
+        "pin_order": 0
+      },
+      {
+        "id": 1,
+        "url": "https://gitea.example.test/acme/infra/pulls/1",
+        "number": 1,
+        "user": {
+          "id": 1,
+          "login": "kube-agents",
+          "full_name": "",
+          "email": "kube-agents@example.test",
+          "avatar_url": "https://gitea.example.test/avatars/a4278dd55a17b2a7c5c87e52eba6e386",
+          "html_url": "https://gitea.example.test/kube-agents",
+          "is_admin": true
+        },
+        "title": "Add one",
+        "body": "First proposal body.",
+        "labels": [],
+        "milestone": null,
+        "assignee": null,
+        "assignees": null,
+        "requested_reviewers": null,
+        "requested_reviewers_teams": null,
+        "state": "open",
+        "draft": false,
+        "is_locked": false,
+        "comments": 0,
+        "html_url": "https://gitea.example.test/acme/infra/pulls/1",
+        "diff_url": "https://gitea.example.test/acme/infra/pulls/1.diff",
+        "patch_url": "https://gitea.example.test/acme/infra/pulls/1.patch",
+        "mergeable": true,
+        "merged": false,
+        "merged_at": null,
+        "merge_commit_sha": null,
+        "merged_by": null,
+        "allow_maintainer_edit": false,
+        "base": {
+          "label": "main",
+          "ref": "main",
+          "sha": "e23e22aa8f36faf6bd6140d53f8823cf3aa4fc17",
+          "repo_id": 3,
+          "repo": {
+            "id": 3,
+            "name": "infra",
+            "full_name": "acme/infra",
+            "owner": {
+              "id": 3,
+              "login": "acme",
+              "full_name": "",
+              "email": "",
+              "avatar_url": "https://gitea.example.test/avatars/53bce4f1dfa0fe8e7ca126f91b35d3a6",
+              "html_url": "https://gitea.example.test/acme",
+              "is_admin": false
+            },
+            "private": false,
+            "fork": false,
+            "default_branch": "main",
+            "html_url": "https://gitea.example.test/acme/infra"
+          }
+        },
+        "head": {
+          "label": "platform-agent/live-one",
+          "ref": "platform-agent/live-one",
+          "sha": "e1c50cb5a53b3b91235cdb8aa3331aa202011f6b",
+          "repo_id": 3,
+          "repo": {
+            "id": 3,
+            "name": "infra",
+            "full_name": "acme/infra",
+            "owner": {
+              "id": 3,
+              "login": "acme",
+              "full_name": "",
+              "email": "",
+              "avatar_url": "https://gitea.example.test/avatars/53bce4f1dfa0fe8e7ca126f91b35d3a6",
+              "html_url": "https://gitea.example.test/acme",
+              "is_admin": false
+            },
+            "private": false,
+            "fork": false,
+            "default_branch": "main",
+            "html_url": "https://gitea.example.test/acme/infra"
+          }
+        },
+        "merge_base": "e23e22aa8f36faf6bd6140d53f8823cf3aa4fc17",
+        "due_date": null,
+        "created_at": "2026-10-04T14:20:40Z",
+        "updated_at": "2026-10-04T14:20:40Z",
+        "closed_at": null,
+        "pin_order": 0
+      }
+    ]
+  ]
+}

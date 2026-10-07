@@ -48,6 +48,17 @@ helper = _load_helper()
 
 SELF = "kube-agents-bot"
 REPO = "acme/toolkit"
+
+
+def _github_entries(slugs):
+    """`get_managed_forge_repos` answers for repositories named the way these tests name them.
+
+    `path` is the name itself, which is what every pre-existing test's pull
+    requests report as their head repository.
+    """
+    return [{"type": "github", "repo": s, "path": s} for s in slugs]
+
+
 #: A second managed repository, deliberately on another host. Identity is a
 #: property of a forge, so a two-repository test on one forge would not notice a
 #: sweep that asked once and reused the answer.
@@ -218,8 +229,16 @@ class _Harness(unittest.TestCase):
             if provider_error
             else mock.Mock(return_value=provider)
         )
+        # The bare `poll` reads every forge's entries; the GitHub list is what
+        # `--repo` is checked against. Both answer from the same names.
+        forge_mock = (
+            mock.Mock(side_effect=repo_error)
+            if repo_error
+            else mock.Mock(return_value=_github_entries(managed))
+        )
         buf = StringIO()
         with mock.patch("gitops_workspace.get_managed_github_repos", managed_mock), \
+             mock.patch("gitops_workspace.get_managed_forge_repos", forge_mock), \
              mock.patch.object(forge, "provider_for", selector), \
              redirect_stdout(buf):
             rc = helper.main(argv)
@@ -422,7 +441,9 @@ class PollTest(_Harness):
 
         provider = MultiRepoFakeProvider()
         managed_mock = mock.Mock(return_value=["acme/repo1", "acme/repo2"])
+        forge_mock = mock.Mock(return_value=_github_entries(["acme/repo1", "acme/repo2"]))
         with mock.patch("gitops_workspace.get_managed_github_repos", managed_mock), \
+             mock.patch("gitops_workspace.get_managed_forge_repos", forge_mock), \
              mock.patch.object(forge, "provider_for", return_value=provider), \
              redirect_stdout(StringIO()) as buf:
             helper.main(["poll"])
@@ -1531,6 +1552,55 @@ class RepoValidationTest(_Harness):
         self.assertEqual(payload["status"], "ERROR")
         self.assertEqual(payload["reason"], "INVALID_REPOSITORY")
         self.assertIn("not in the managed repositories list", payload["value"])
+
+
+class GiteaRepoTest(unittest.TestCase):
+    """`--repo` takes a managed repository on another forge as the card names it."""
+
+    GITEA = "gitea.lab/acme/live"
+    ENTRIES = [
+        {"type": "github", "repo": REPO, "path": REPO},
+        {"type": "gitea", "repo": GITEA, "path": "acme/live"},
+    ]
+
+    def patched(self):
+        return mock.patch("gitops_workspace.get_managed_forge_repos", mock.Mock(return_value=self.ENTRIES))
+
+    def test_a_managed_gitea_repo_is_accepted(self):
+        with self.patched(), mock.patch("gitops_workspace.get_managed_github_repos", return_value=[REPO]):
+            self.assertEqual(helper.validate_repo(self.GITEA), self.GITEA)
+
+    def test_an_unmanaged_host_qualified_repo_is_refused(self):
+        with self.patched(), mock.patch("gitops_workspace.get_managed_github_repos", return_value=[REPO]):
+            with self.assertRaises(ValueError):
+                helper.validate_repo("gitea.lab/acme/other")
+            with self.assertRaises(ValueError):
+                helper.validate_repo("evil.example/acme/live")
+
+    def test_the_ownership_check_uses_the_forge_path(self):
+        with self.patched():
+            self.assertEqual(helper._forge_path(self.GITEA), "acme/live")
+            self.assertEqual(helper._forge_path(REPO), "")
+
+    def test_poll_without_repo_reads_the_gitea_entry(self):
+        gitea_pr = make_pr(number=3, head_repo="acme/live")
+
+        class OnlyGitea(FakeProvider):
+            def list_open_prs(self, repo):
+                return [gitea_pr] if repo == GiteaRepoTest.GITEA else []
+
+            def list_comments(self, repo, pr):
+                return [make_comment("IC_3", f"@{SELF} please fix")]
+
+        buf = StringIO()
+        with self.patched(), \
+             mock.patch("gitops_workspace.get_managed_github_repos", return_value=[REPO]), \
+             mock.patch.object(forge, "provider_for", return_value=OnlyGitea()), \
+             redirect_stdout(buf):
+            helper.main(["poll"])
+        payload = json.loads(buf.getvalue())
+        self.assertEqual(payload["status"], "FOUND")
+        self.assertEqual([conv["repo"] for conv in payload["conversations"]], [self.GITEA])
 
 
 if __name__ == "__main__":

@@ -252,6 +252,7 @@ class StaticFileCredential:
         header_format: str = "{token}",
         username: str = "oauth2",
         helper: str = TOKEN_FILE_HELPER,
+        scheme: str = "https",
     ) -> None:
         for name, value in (("token path", token_path), ("username", username)):
             if not _HELPER_ARGUMENT_RE.fullmatch(value or "") or ".." in value:
@@ -260,12 +261,15 @@ class StaticFileCredential:
             raise ValueError(f"the token path {token_path!r} is not absolute")
         if not _HOST_RE.fullmatch(host or ""):
             raise ValueError(f"the host {host!r} is not a hostname")
+        if scheme not in ("https", "http"):
+            raise ValueError(f"the scheme {scheme!r} must be https or http")
         self._token_path = token_path
         self._host = host
         self._header = header
         self._format = header_format
         self._username = username
         self._helper = helper
+        self._scheme = scheme
 
     def ensure(self, repo: str) -> None:
         return None
@@ -306,7 +310,7 @@ class StaticFileCredential:
         return (
             (CREDENTIAL_HELPER_KEY, ""),
             (
-                f"credential.https://{self._host}.helper",
+                f"credential.{self._scheme}://{self._host}.helper",
                 f"{self._helper} {self._token_path} {self._username}",
             ),
         )

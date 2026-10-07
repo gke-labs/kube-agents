@@ -990,11 +990,16 @@ platformAgent:
     #
     # forges:
     #   - name: github            # what repositories[].forge refers to
-    #     provider: github        # the only registered provider; default github
-    #     host: ""                # empty is the provider's default (github.com)
+    #     provider: github        # github (default) or gitea
+    #     host: ""                # empty is the provider's default (github.com);
+    #                             # required for gitea, which has none
+    #     scheme: https           # https (default); http only for gitea, meant
+    #                             # for a forge inside the cluster
+    #     port: 3000              # gitea only, when not the scheme's default port
     #     namespace: my-org       # default owner for this forge's repositories
-    #     credentialsRef:         # Secret for providers that need one; ignored
-    #       name: ""              # for github, which uses the GitHub App
+    #     credentialsRef:         # Secret for providers that need one (gitea:
+    #       name: ""              # API token under key `token`); ignored for
+    #                             # github, which uses the GitHub App
     forges: []
     # repositories:
     #   - forge: github

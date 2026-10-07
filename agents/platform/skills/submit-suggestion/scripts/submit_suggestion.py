@@ -160,15 +160,85 @@ def check_branch(branch_name: str, base_branch: str | None = None) -> str:
 
 
 def validate_repo(repo: str) -> str:
-    """Ensure repo is formatted as owner/name and is in the managed repos allowlist if configured."""
+    """The managed repository `repo` names, spelled the way the broker routes it.
+
+    A GitHub repository is an `owner/name` slug, checked as it always was and
+    returned unchanged. A repository on another declared forge (Gitea) is
+    returned host-qualified, `host/owner/name`, because the broker sends a bare
+    slug to its default forge, which is always GitHub: a bare
+    `demo/gke-fleet-iac` on a Gitea-only install would otherwise be cloned and
+    proposed against github.com and fail there.
+
+    Accepted for another forge: its host-qualified name exactly as
+    `get_managed_forge_repos` gives it, or its bare `owner/name` path when no
+    managed GitHub repository has that slug and exactly one managed entry on
+    another forge has that path. The managed list stays the allowlist either
+    way, so nothing here reaches a repository nobody registered.
+    """
+    forge_entry = _managed_other_forge_entry(repo)
+    if forge_entry is not None:
+        return forge_entry["repo"]
     if not repo or not gitops_workspace.is_valid_repo_slug(repo):
-        raise ValueError(f"Invalid repository format: {repo!r}. Expected 'owner/name'.")
+        raise ValueError(
+            f"Invalid repository format: {repo!r}. Expected 'owner/name', or "
+            "'host/owner/name' for a managed repository on another forge."
+        )
     managed = gitops_workspace.get_managed_github_repos()
     if managed and repo not in managed:
         raise ValueError(
             f"Repository {repo!r} is not in the managed repositories list: {managed}"
         )
     return gitops_workspace.validate_repo_org(repo)
+
+
+def _managed_other_forge_entry(repo: str) -> dict | None:
+    """The managed non-GitHub entry `repo` names, or None for anything else.
+
+    None leaves `repo` to the GitHub checks, which is every repository on a
+    GitHub-only install. A bare slug that is also a managed GitHub repository
+    stays GitHub's; one that matches the path of two entries on other forges is
+    refused rather than guessed.
+    """
+    if not repo:
+        return None
+    others = [
+        entry
+        for entry in gitops_workspace.get_managed_forge_repos()
+        if entry["type"] != gitops_workspace.GITHUB_REPO_TYPE
+    ]
+    for entry in others:
+        if entry["repo"] == repo:
+            return entry
+    by_path = [entry for entry in others if entry["path"] == repo]
+    if not by_path or repo in gitops_workspace.get_managed_github_repos():
+        return None
+    if len(by_path) > 1:
+        names = ", ".join(entry["repo"] for entry in by_path)
+        raise ValueError(
+            f"Repository {repo!r} is managed on more than one forge ({names}); "
+            "pass the host-qualified name."
+        )
+    return by_path[0] if by_path else None
+
+
+def default_repo() -> str:
+    """The repository a run that names none targets.
+
+    `gitops_workspace.resolve_repo` reads only the managed GitHub list, so on
+    an install whose one managed repository is on another forge it found
+    nothing and fell back to the working directory's remote, which a kanban
+    workspace does not have. That single entry is the answer there, as the
+    single GitHub repository is on a GitHub install.
+    """
+    if not gitops_workspace.get_managed_github_repos():
+        others = [
+            entry
+            for entry in gitops_workspace.get_managed_forge_repos()
+            if entry["type"] != gitops_workspace.GITHUB_REPO_TYPE
+        ]
+        if len(others) == 1:
+            return others[0]["repo"]
+    return gitops_workspace.resolve_repo()
 
 
 #: How far back the branch-name history is read. What is wanted is the newest
@@ -514,8 +584,7 @@ def handle_prepare(args) -> int:
     # opened the default repository under a flag that named another one, and a
     # fleet whose cards target several GitOps repositories writes every
     # suggestion to whichever one `resolve_repo` happens to answer with.
-    repo = args.repo or gitops_workspace.resolve_repo()
-    validate_repo(repo)
+    repo = validate_repo(args.repo or default_repo())
 
     proposal = open_proposal(repo, branch)
     if proposal:
@@ -588,6 +657,10 @@ def handle_submit(args) -> int:
             "--keep-description is given."
         )
     branch = check_branch(args.branch)
+    # The name `prepare` cloned under, so a bare slug for a repository on
+    # another forge finds the copy `prepare` made for its host-qualified name.
+    if args.repo:
+        args.repo = validate_repo(args.repo)
 
     # Keyed on the branch: one repository can be cloned twice here, once per
     # card. When nothing is keyed on it, resolve without the key -- the refusal
@@ -626,8 +699,7 @@ def handle_submit(args) -> int:
     # inside a prepared tree, standing on the right branch under another key,
     # got past the check below and then died on "no local copy".
     copy_key = vcs_client.key_of(session)
-    repo = args.repo or session["spec"]
-    validate_repo(repo)
+    repo = validate_repo(args.repo or session["spec"])
 
     current = vcs_client.current_branch(session)
     if current != branch:

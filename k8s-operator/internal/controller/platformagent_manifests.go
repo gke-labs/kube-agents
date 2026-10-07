@@ -4133,6 +4133,8 @@ func buildCredentialProxyEnv(agent *agentv1alpha1.PlatformAgent) []corev1.EnvVar
 		corev1.EnvVar{Name: "CREDENTIAL_PROXY_KUBE_TOKEN_FILE", Value: kubeAPIAccessMountPath + "/token"},
 		corev1.EnvVar{Name: "CREDENTIAL_PROXY_CONTENT_WORKSPACE", Value: "1"},
 	)
+	// The self-managed forges and their token files, when any are declared.
+	envVars = append(envVars, buildForgeDeclarationsEnv(agent)...)
 	if harness := agent.Spec.Harness; harnessOnKind(harness) {
 		// kind: the proxy serves the cluster it runs in. Write its kubeconfig from the pod's service account mount --
 		// `tokenFile` rather than `--token`, since the kubelet rotates the
@@ -4338,6 +4340,8 @@ func mergeCredentialProxyEnv(managed, custom []corev1.EnvVar) []corev1.EnvVar {
 		// one edit that stops an operator setting it through
 		// spec.deployment.env from reaching the detector at all, and nothing
 		// in the render would fail to say so.
+		credentialProxyForgesEnv,
+		"VCS_FORGES_CONFIG",
 		"KSA_TOKEN_FILE",
 		"TOKEN_BROKER_URL",
 	} {

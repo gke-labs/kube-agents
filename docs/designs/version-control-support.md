@@ -1,11 +1,11 @@
 # Version control and issue tracking
 
-> **STATUS — design of record; the seam, the provider layer with GitHub behind
-> it, the sandbox's own git, the consumer migration and the declarative surface
-> are in.** On `main`, repository identity runs
+> **STATUS — design of record; the seam, the provider layer with GitHub, GitLab
+> and Gitea behind it, the sandbox's own git, the consumer migration and the
+> declarative surface are in.** On `main`, repository identity runs
 > through one parser (`repo_ref.py`); the broker serves the version-control verbs
 > over `/v1/vcs/*` from a forge-neutral `providers/` layer with
-> `providers/github/` and `providers/gitlab/` behind it; the `version-control` skill drives those verbs from a
+> `providers/github/`, `providers/gitlab/` and `providers/gitea/` behind it; the `version-control` skill drives those verbs from a
 > sandbox that holds a credential-free git; and the consumers reach the forge
 > through those verbs rather than by naming GitHub. The sandbox carries no `gh`
 > and no credential shim named `git`. One thing is deliberately left behind and
@@ -14,8 +14,8 @@
 > repositories this install does not manage and does it with a shallow clone —
 > neither of which the verbs offer, the second on purpose
 > ([The seam](#3-the-seam)). The CRD declares forges and repositories in `spec.integration.forges`
-> and `spec.integration.repositories` with only `github` registered, so a GitLab
-> forge is not yet declared through the CR.
+> and `spec.integration.repositories` with `github` and `gitea` registered (a GitLab
+> forge is not yet declared through the CR).
 > This is the design for driving any forge, and the order the rest has to
 > happen in.
 
@@ -2617,11 +2617,10 @@ to any agent that can reach the read verbs, so an install that wants an agent to
 without being able to write to a forge has no way to say so. A read-only mode is
 the smallest thing that would fix it, and it is not designed here.
 
-Until GitLab and Bitbucket ship, this is a forge-neutral design with one forge
-in it — and an abstraction with one implementation is a hypothesis. The measure
-of it is not that GitLab works but how much shared code has to change to make it
-work. [Modularity](#5-modularity) states what that budget is and what enforces
-it, so the hypothesis is falsifiable rather than judged afterwards.
+Gitea (`providers/gitea/`) and GitLab (`providers/gitlab/`) sit beside GitHub
+behind `providers/base.py`, confirming the modularity hypothesis ([Modularity](#5-modularity))
+across both hosted (GitHub App installation token minter) and self-managed
+(Kubernetes Secret token mount across `https` and `http`) forge credential models.
 
 Issue trackers that are not part of a forge — Jira alongside Bitbucket being the
 case that will arrive first — are named in

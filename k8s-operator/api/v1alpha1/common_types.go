@@ -142,11 +142,13 @@ var SensitiveEnvVars = map[string]struct{}{
 	// refuses at connect. What the reservation buys is that the operator never
 	// sets this variable, so a spec.deployment.env entry naming it is never
 	// anything but an override of the projection.
-	"A2A_BUS_TOKEN_FILE": {},
-	"A2A_BUS_USER":       {},
-	"NATS_URL":           {},
-	"NATS_USER":          {},
-	"NATS_PASSWORD":      {},
+	"A2A_BUS_TOKEN_FILE":      {},
+	"A2A_BUS_USER":            {},
+	"NATS_URL":                {},
+	"NATS_USER":               {},
+	"NATS_PASSWORD":           {},
+	"CREDENTIAL_PROXY_FORGES": {},
+	"VCS_FORGES_CONFIG":       {},
 }
 
 // ReservedVolumeNames defines pod volume names the operator renders itself and
@@ -1399,9 +1401,9 @@ type ForgeSpec struct {
 	// the agent reads which forge was declared rather than guessing from the
 	// URL's text.
 	//
-	// Only "github" is registered today; the enum grows with each agent-side
-	// provider. Defaults to "github".
-	// +kubebuilder:validation:Enum=github
+	// "github" and "gitea" are registered; the enum grows with each
+	// agent-side provider. Defaults to "github".
+	// +kubebuilder:validation:Enum=github;gitea
 	// +kubebuilder:default=github
 	// +optional
 	Provider string `json:"provider,omitempty"`
@@ -1409,7 +1411,9 @@ type ForgeSpec struct {
 	// Host is the forge hostname. Omit it for the provider's default
 	// ("github.com" for GitHub). A host the declared provider does not serve is
 	// rejected, and an alternative spelling of one it does serve resolves to the
-	// provider's canonical host.
+	// provider's canonical host. A self-managed provider such as "gitea" has no
+	// default, so the host is required there, and any DNS name is accepted; a
+	// repository on that forge may name this host and no other.
 	//
 	// The pattern is a DNS name, which every forge's host is; it is here rather
 	// than only in the webhook so the API server still refuses whitespace and
@@ -1442,11 +1446,31 @@ type ForgeSpec struct {
 	// +optional
 	Namespace string `json:"namespace,omitempty"`
 
+	// Scheme is how the forge is reached: "https", the default, or "http".
+	// Only a provider that allows plain http accepts it, and only when it is
+	// written out; GitHub is https only. Over http the token and repository
+	// contents cross the network unencrypted, so admission warns, and it is
+	// meant for a forge inside the cluster.
+	// +kubebuilder:validation:Enum=https;http
+	// +optional
+	Scheme string `json:"scheme,omitempty"`
+
+	// Port is the forge's port, for a self-managed forge not on the scheme's
+	// default port. It is refused for a hosted provider such as GitHub.
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=65535
+	// +optional
+	Port int32 `json:"port,omitempty"`
+
 	// CredentialsRef names a Secret in the PlatformAgent's namespace holding
 	// the credentials for this forge. It is for providers whose credentials an
 	// administrator supplies. GitHub's come from the install's GitHub App
 	// through the token minter, so it is ignored for provider "github", and
 	// admission warns when it is set there.
+	//
+	// For provider "gitea" it is required. The Secret holds an API token under
+	// the key "token". It is mounted into the credential proxy only; the
+	// agent's shell never sees it.
 	// +optional
 	CredentialsRef *corev1.LocalObjectReference `json:"credentialsRef,omitempty"`
 }

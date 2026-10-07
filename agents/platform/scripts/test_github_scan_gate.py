@@ -696,6 +696,15 @@ REPO = "acme/toolkit"
 OTHER_REPO = "gitlab.example/acme/toolkit"
 
 
+def _github_entries(slugs):
+    """`get_managed_forge_repos` answers for repositories named the way these tests name them.
+
+    `path` is the name itself, which is what every pre-existing test's pull
+    requests report as their head repository.
+    """
+    return [{"type": "github", "repo": s, "path": s} for s in slugs]
+
+
 def make_pr(
     number=12,
     head_ref="platform-agent/x",
@@ -744,8 +753,8 @@ class PrCommentsSweepTest(unittest.TestCase):
             managed = list(repo)
         else:
             managed = [repo] if repo else []
-        managed_mock = mock.Mock(side_effect=repo_error) if repo_error else mock.Mock(return_value=managed)
-        with mock.patch("gitops_workspace.get_managed_github_repos", managed_mock), \
+        managed_mock = mock.Mock(side_effect=repo_error) if repo_error else mock.Mock(return_value=_github_entries(managed))
+        with mock.patch("gitops_workspace.get_managed_forge_repos", managed_mock), \
              mock.patch.object(forge, "provider_for", return_value=provider), \
              mock.patch.dict("os.environ", env or {}, clear=False):
             import os
@@ -932,8 +941,8 @@ class PrCommentsSweepTest(unittest.TestCase):
                 return []
 
         provider = MultiRepoFakeProvider()
-        managed_mock = mock.Mock(return_value=["acme/repo1", "acme/repo2"])
-        with mock.patch("gitops_workspace.get_managed_github_repos", managed_mock), \
+        managed_mock = mock.Mock(return_value=_github_entries(["acme/repo1", "acme/repo2"]))
+        with mock.patch("gitops_workspace.get_managed_forge_repos", managed_mock), \
              mock.patch.object(forge, "provider_for", return_value=provider):
             res = gate.sweep_pr_comments()
             self.assertEqual(len(res.cards), 2)
@@ -1535,6 +1544,71 @@ class ResolverPathTest(unittest.TestCase):
                  mock.patch.object(gate, "PLATFORM_TEMPLATE_DIR", str(Path(tmpdir) / "nonexistent")), \
                  mock.patch.object(gate, "__file__", nonexistent):
                 self.assertEqual(gate._resolver_path(), expected)
+
+
+class PrCommentsSweepOnGiteaTest(unittest.TestCase):
+    """The sweep reaches a Gitea forge through the same verbs, by its host."""
+
+    GITEA = "gitea.lab/acme/live"
+    ENTRIES = [
+        {"type": "github", "repo": REPO, "path": REPO},
+        {"type": "gitea", "repo": GITEA, "path": "acme/live"},
+    ]
+
+    def sweep(self, provider):
+        with mock.patch("gitops_workspace.get_managed_forge_repos", mock.Mock(return_value=self.ENTRIES)), \
+             mock.patch.object(forge, "provider_for", return_value=provider):
+            return gate.sweep_pr_comments()
+
+    def provider(self):
+        github_pr = make_pr(number=12)
+        gitea_pr = make_pr(number=3, head_repo="acme/live")
+
+        class TwoForges(FakeProvider):
+            def list_open_prs(self, repo):
+                return [github_pr] if repo == REPO else [gitea_pr]
+
+            def list_comments(self, repo, pr):
+                return [make_comment(f"IC_{pr.number}", f"@{SELF} please fix")]
+
+        return TwoForges()
+
+    def test_an_agent_pull_request_on_gitea_gets_a_card(self):
+        provider = self.provider()
+        result = self.sweep(provider)
+        self.assertEqual(result.warnings, [])
+        titles = sorted(card.title for card in result.cards)
+        self.assertEqual(
+            titles,
+            [f"Answer review comments on {REPO}#12", f"Answer review comments on {self.GITEA}#3"],
+        )
+        self.assertIn(self.GITEA, provider.viewer_lookups)
+        self.assertIn((3, "IC_3"), provider.acknowledged)
+
+    def test_only_the_gitea_card_names_its_forge(self):
+        cards = {card.title: card for card in self.sweep(self.provider()).cards}
+        gitea = cards[f"Answer review comments on {self.GITEA}#3"]
+        github = cards[f"Answer review comments on {REPO}#12"]
+        self.assertIn("Forge: `gitea`", gitea.body)
+        self.assertIn(f"`--repo {self.GITEA}`", gitea.body)
+        self.assertNotIn("Forge:", github.body)
+
+    def test_the_github_card_key_is_unchanged(self):
+        cards = {card.title: card for card in self.sweep(self.provider()).cards}
+        key = cards[f"Answer review comments on {REPO}#12"].idempotency_key
+        self.assertTrue(key.startswith(f"pr-conv-{gate._slug(REPO)}-12-"), key)
+
+    def test_a_fork_on_gitea_is_not_swept(self):
+        fork_pr = make_pr(number=4, head_repo="stranger/live")
+
+        class Fork(FakeProvider):
+            def list_open_prs(self, repo):
+                return [fork_pr] if repo == PrCommentsSweepOnGiteaTest.GITEA else []
+
+            def list_comments(self, repo, pr):
+                return [make_comment("IC_4", f"@{SELF} please fix")]
+
+        self.assertEqual(self.sweep(Fork()).cards, [])
 
 
 if __name__ == "__main__":

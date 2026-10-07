@@ -23,10 +23,11 @@ import repo_ref
 from workspace_paths import WorkspaceError
 
 from .base import Forge, ForgeUnsupported, StubForge
+from .gitea import GiteaForge
 from .github import GitHubForge
 from .gitlab import GitLabForge
 
-AVAILABLE: tuple[type[Forge], ...] = (GitHubForge, GitLabForge)
+AVAILABLE: tuple[type[Forge], ...] = (GitHubForge, GitLabForge, GiteaForge)
 
 
 # Hosts this design has a name and a shape for but no implementation of yet.
@@ -46,47 +47,58 @@ _UNIMPLEMENTED: tuple[tuple[str, tuple[str, ...], str, tuple[str, ...]], ...] = 
 )
 
 
-# Where the operator mounts the forges this install was configured with. Unset
-# means the install predates per-forge configuration, and each forge class
-# decides what that means for it (see `Forge.for_config`). Set, the file is the
-# whole answer: a forge it does not list is not built.
+# Where the operator mounts or passes the forges this install was configured
+# with. Unset means the install predates per-forge configuration, and each
+# forge class decides what that means for it (see `Forge.for_config`). Set, the
+# list is the whole answer: a forge it does not list is not built.
 FORGES_CONFIG_ENV = "VCS_FORGES_CONFIG"
-# A hostname and nothing else. A port is refused rather than accepted: the
-# repository parser reads a URL's host without its port, so a forge declared at
-# `host:8443` would load and then match no request; until ports are carried
-# through resolution end to end, the misconfiguration stops the build.
+FORGES_INLINE_ENV = "CREDENTIAL_PROXY_FORGES"
+# A hostname and nothing else. A port is refused in `host` rather than
+# accepted: the repository parser reads a URL's host without its port, so a
+# forge declared at `host:8443` would load and then match no request; use the
+# explicit `port` field instead.
 _HOST_RE = re.compile(r"[a-z0-9]([a-z0-9.-]*[a-z0-9])?")
 
 
 def load_forge_entries(path: str | None = None) -> list[dict[str, Any]] | None:
     """The configured forges, normalised, or None when nothing configures them.
 
-    The file is `{"forges": [{"provider", "host", "tokenPath"?, "allowedPaths"?}]}`.
-    Read at registry construction, never cached across it, so a test or a
-    remount sees the file it names. A file that is named and cannot be read
-    raises: a broker that does not know which forges it serves must not start
-    on a guess.
+    Read from `VCS_FORGES_CONFIG` (`{"forges": [...]}`) or `CREDENTIAL_PROXY_FORGES`
+    (a JSON list or `{"forges": [...]}`) at registry construction, never cached
+    across it, so a test or a remount sees the configuration it names. A source
+    that is named and cannot be read raises: a broker that does not know which
+    forges it serves must not start on a guess.
     """
     path = path if path is not None else os.environ.get(FORGES_CONFIG_ENV, "").strip()
-    if not path:
+    inline = "" if path else os.environ.get(FORGES_INLINE_ENV, "").strip()
+    if not path and not inline:
         return None
+    source = path or FORGES_INLINE_ENV
     try:
-        with open(path, encoding="utf-8") as handle:
-            document = json.load(handle)
+        if path:
+            with open(path, encoding="utf-8") as handle:
+                document = json.load(handle)
+        else:
+            document = json.loads(inline)
     except (OSError, json.JSONDecodeError) as exc:
-        raise ValueError(f"the forge configuration {path} could not be read: {exc}") from exc
-    raw = document.get("forges") if isinstance(document, dict) else None
+        raise ValueError(f"the forge configuration {source} could not be read: {exc}") from exc
+    if isinstance(document, dict):
+        raw = document.get("forges")
+    elif not path and isinstance(document, list):
+        raw = document
+    else:
+        raw = None
     if not isinstance(raw, list):
-        raise ValueError(f"the forge configuration {path} has no `forges` list")
+        raise ValueError(f"the forge configuration {source} has no `forges` list")
     entries = []
     for index, item in enumerate(raw):
         if not isinstance(item, dict):
-            raise ValueError(f"forges[{index}] in {path} is not an object")
+            raise ValueError(f"forges[{index}] in {source} is not an object")
         provider = str(item.get("provider") or "").strip().lower()
         host = str(item.get("host") or "").strip().lower()
         if not provider or not _HOST_RE.fullmatch(host):
             raise ValueError(
-                f"forges[{index}] in {path} needs a provider and a hostname "
+                f"forges[{index}] in {source} needs a provider and a hostname "
                 "(no scheme, path or port)"
             )
         # Absent is kept apart from empty: a forge whose credential reaches a
@@ -96,17 +108,28 @@ def load_forge_entries(path: str | None = None) -> list[dict[str, Any]] | None:
         if allowed is not None and (
             not isinstance(allowed, list) or not all(isinstance(p, str) for p in allowed)
         ):
-            raise ValueError(f"forges[{index}].allowedPaths in {path} must be a list of paths")
-        entries.append(
-            {
-                "provider": provider,
-                "host": host,
-                "token_path": str(item.get("tokenPath") or "").strip(),
-                # Passed through unfiltered: an entry that trims to nothing is
-                # the forge's to refuse, not the loader's to drop.
-                "allowed_paths": None if allowed is None else tuple(allowed),
-            }
-        )
+            raise ValueError(f"forges[{index}].allowedPaths in {source} must be a list of paths")
+        entry: dict[str, Any] = {
+            "provider": provider,
+            "host": host,
+            "token_path": str(item.get("tokenPath") or item.get("tokenFile") or "").strip(),
+            # Passed through unfiltered: an entry that trims to nothing is
+            # the forge's to refuse, not the loader's to drop.
+            "allowed_paths": None if allowed is None else tuple(allowed),
+        }
+        if item.get("name") is not None:
+            entry["name"] = str(item["name"]).strip().lower()
+        if item.get("scheme") is not None:
+            scheme = str(item["scheme"]).strip().lower()
+            if scheme not in ("https", "http"):
+                raise ValueError(f"forges[{index}].scheme in {source} must be https or http")
+            entry["scheme"] = scheme
+        if item.get("port") not in (None, "", 0):
+            port = item["port"]
+            if isinstance(port, bool) or not isinstance(port, int) or not (1 <= port <= 65535):
+                raise ValueError(f"forges[{index}].port in {source} must be an integer in 1..65535")
+            entry["port"] = port
+        entries.append(entry)
     return entries
 
 

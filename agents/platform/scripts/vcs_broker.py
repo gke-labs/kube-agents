@@ -353,6 +353,7 @@ class VcsBroker:
                 whoami_route=forge.whoami_route,
                 opener=self._http_opener,
                 outer_deadline=self._request_deadline,
+                allow_http=(getattr(forge, "scheme", "https") == "http"),
             )
         raise ForgeUnsupported(
             f"{forge.name} declares the {forge.transport!r} transport, which "

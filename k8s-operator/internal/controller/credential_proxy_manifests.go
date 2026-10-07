@@ -408,7 +408,8 @@ func buildCredentialProxyVolumeMounts(agent *agentv1alpha1.PlatformAgent) []core
 			ReadOnly:  true,
 		})
 	}
-	return mounts
+	// Each self-managed forge's token, read by the broker at every call.
+	return append(mounts, buildForgeCredentialMounts(agent)...)
 }
 
 // buildCredentialProxyFederationEnv points the proxy's Google clients at a token
@@ -601,6 +602,7 @@ var (
 func buildCredentialProxyRuntimeVolumes(agent *agentv1alpha1.PlatformAgent) []corev1.Volume {
 	volumes := filterVolumes(buildCredentialProxyVolumes(agent), credentialProxyRuntimeVolumeNames)
 	volumes = append(volumes, buildGitopsStateVolume(agent))
+	volumes = append(volumes, buildForgeCredentialVolumes(agent)...)
 	return append(volumes, buildCredentialProxyFederationVolume(agent)...)
 }
 
@@ -634,8 +636,21 @@ func validateExtraVolumeMounts(agent *agentv1alpha1.PlatformAgent) string {
 	}
 	var forbidden []string
 	for _, mount := range agent.Spec.Deployment.ExtraVolumeMounts {
-		if agentForbiddenVolumeNames[mount.Name] {
+		if agentForbiddenVolumeNames[mount.Name] || isForgeCredentialVolume(mount.Name) {
 			forbidden = append(forbidden, fmt.Sprintf("%s (at %s)", mount.Name, mount.MountPath))
+		}
+	}
+	for _, volumes := range [][]corev1.Volume{agent.Spec.Deployment.ExtraVolumes, agent.Spec.Deployment.SidecarVolumes} {
+		for _, vol := range volumes {
+			if isForgeCredentialVolume(vol.Name) {
+				forbidden = append(forbidden, vol.Name)
+				continue
+			}
+			if agent.Spec.Integration != nil {
+				for _, route := range agent.Spec.Integration.ForgeCredentialRoutes(vol) {
+					forbidden = append(forbidden, fmt.Sprintf("%s (Secret %s)", vol.Name, route.Secret))
+				}
+			}
 		}
 	}
 	if len(forbidden) == 0 {

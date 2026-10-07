@@ -31,10 +31,14 @@ package v1alpha1
 // a table entry rather than widening a shared check.
 // `docs/designs/version-control-support.md` §6 is the design.
 //
-// Only GitHub is registered. The dispatch is what this file delivers; the
-// GitLab entry lands with the agent-side `GitLabProvider` it needs to be honest,
-// because a provider the CRD accepts and the agent discards is a
-// worse failure than one the CRD refuses.
+// GitHub and Gitea are registered. Each entry lands with the agent-side
+// provider it needs to be honest, because a provider the CRD accepts and the
+// agent discards is a worse failure than one the CRD refuses.
+//
+// Gitea is the first self-managed forge: it has no default host, it serves
+// whatever host the administrator declares and no other, it may be reached
+// over plain http when that is declared, and its credential is a token the
+// administrator supplies in a Secret rather than one the minter issues.
 
 import (
 	"fmt"
@@ -47,6 +51,32 @@ const (
 	// GitProviderGitHub is the `provider` value naming GitHub, and the `type` of
 	// a `managed_repos` entry the agent has a provider for.
 	GitProviderGitHub = "github"
+
+	// GitProviderGitea is the `provider` value naming a self-managed Gitea.
+	GitProviderGitea = "gitea"
+
+	// ForgeSchemeHTTPS and ForgeSchemeHTTP are the `scheme` values a forge may
+	// declare. HTTPS is the default; HTTP is accepted only where the provider
+	// allows it and only when written out.
+	ForgeSchemeHTTPS = "https"
+	ForgeSchemeHTTP  = "http"
+
+	// DefaultForgeScheme is assumed when a forge's `scheme` is omitted.
+	DefaultForgeScheme = ForgeSchemeHTTPS
+
+	// MinForgePort and MaxForgePort bound a forge's declared `port`.
+	MinForgePort = 1
+	MaxForgePort = 65535
+
+	// ForgeTokenSecretKey is the key a self-managed forge's credentialsRef
+	// Secret holds its API token under.
+	ForgeTokenSecretKey = "token" // #nosec G101 -- Secret key name, not a credential
+
+	// MaxGiteaNamespaceLength is Gitea's limit on a user or organisation name.
+	MaxGiteaNamespaceLength = 40
+
+	// giteaPathDepth is Gitea's rule: a repository is exactly `owner/name`.
+	giteaPathDepth = 2
 
 	// DefaultGitProvider is assumed when a forge's `provider` is
 	// omitted, and is what the deprecated `spec.integration.github` alias means.
@@ -104,6 +134,35 @@ type GitProvider struct {
 	// its clone endpoints, and any host it serves content from. They cover
 	// every entry in Hosts, so a declaration naming one of those adds nothing.
 	Egress []string
+	// SelfManaged marks a forge an administrator runs at a hostname of their
+	// choosing. It has no DefaultHost, so a declaration must name a host; any
+	// DNS name outside the hosted providers' reserved domains is accepted, and
+	// a repository may name that host and no other. A port may be declared,
+	// and the credential is administrator-supplied, so a declaration without
+	// credentialsRef is refused.
+	SelfManaged bool
+	// Schemes are the `scheme` values a declaration may use. An empty scheme
+	// is always DefaultForgeScheme, which every provider must list.
+	Schemes map[string]bool
+}
+
+// giteaNamespaceRegex is Gitea's user and organisation name grammar: letters,
+// digits, `_`, `-` and `.`, not starting or ending with `-` or `.`.
+var giteaNamespaceRegex = regexp.MustCompile(`^[A-Za-z0-9_]([A-Za-z0-9_.-]*[A-Za-z0-9_])?$`)
+
+// selfManagedHostRegex is a lowercase DNS name, the only kind of host a
+// self-managed forge declaration names. An address literal is refused: the
+// egress policy is FQDN-based and could not admit it.
+var selfManagedHostRegex = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)*$`)
+
+// reservedHostedForgeDomains are well-known hosted forge domains that a
+// self-managed provider may not claim as its host.
+var reservedHostedForgeDomains = map[string]string{
+	"github.com":     GitProviderGitHub,
+	"www.github.com": GitProviderGitHub,
+	"ssh.github.com": GitProviderGitHub,
+	"gitlab.com":     "gitlab",
+	"www.gitlab.com": "gitlab",
 }
 
 // gitProviders is the registry. Adding a forge is adding an entry here and the
@@ -120,7 +179,19 @@ var gitProviders = map[string]*GitProvider{
 		// raw.githubusercontent.com and the release/archive download hosts
 		// sit under githubusercontent.com; api.github.com and codeload under
 		// the wildcard.
-		Egress: []string{"github.com", "*.github.com", "*.githubusercontent.com"},
+		Egress:  []string{"github.com", "*.github.com", "*.githubusercontent.com"},
+		Schemes: map[string]bool{ForgeSchemeHTTPS: true},
+	},
+	GitProviderGitea: {
+		Name:               GitProviderGitea,
+		NamespacePattern:   giteaNamespaceRegex,
+		MaxNamespaceLength: MaxGiteaNamespaceLength,
+		MinPathDepth:       giteaPathDepth,
+		MaxPathDepth:       giteaPathDepth,
+		// The API and the clone endpoint are both on the declared host,
+		// which EgressPatterns adds as a literal.
+		SelfManaged: true,
+		Schemes:     map[string]bool{ForgeSchemeHTTPS: true, ForgeSchemeHTTP: true},
 	},
 }
 
@@ -160,16 +231,72 @@ func lookupGitProvider(name string, table map[string]*GitProvider) (*GitProvider
 }
 
 // ValidateHost reports whether a declared host is one this provider serves.
-// An empty host is the provider's default and is always allowed.
+// An empty host is the provider's default, allowed wherever there is one. A
+// self-managed forge has none, so it requires a host, and serves any DNS name
+// outside the hosted providers' reserved domains.
 func (p *GitProvider) ValidateHost(host string) error {
 	trimmed := lowerASCII(strings.TrimSpace(host))
 	if trimmed == "" {
+		if p.DefaultHost == "" {
+			return fmt.Errorf("%s has no default host; host is required", p.Name)
+		}
+		return nil
+	}
+	if p.SelfManaged {
+		if !selfManagedHostRegex.MatchString(trimmed) {
+			return fmt.Errorf("host %q is not a DNS name", host)
+		}
+		if owner, reserved := reservedHostedForgeDomains[trimmed]; reserved {
+			return fmt.Errorf("host %q is a hosted %s domain and cannot be used for self-managed provider %s", host, owner, p.Name)
+		}
 		return nil
 	}
 	if !p.Hosts[trimmed] {
 		return fmt.Errorf("host %q is not a %s host", host, p.Name)
 	}
 	return nil
+}
+
+// ValidateScheme reports whether a declared scheme is one this provider may be
+// reached over. An empty scheme is DefaultForgeScheme.
+func (p *GitProvider) ValidateScheme(scheme string) error {
+	trimmed := lowerASCII(strings.TrimSpace(scheme))
+	if trimmed == "" || p.Schemes[trimmed] {
+		return nil
+	}
+	allowed := make([]string, 0, len(p.Schemes))
+	for s := range p.Schemes {
+		allowed = append(allowed, s)
+	}
+	sort.Strings(allowed)
+	return fmt.Errorf("scheme %q is not supported for %s; must be one of %s",
+		scheme, p.Name, strings.Join(allowed, ", "))
+}
+
+// ValidatePort reports whether a declared port is allowed. Zero means none
+// was declared. Only a self-managed forge may declare one: a hosted forge's
+// endpoints are fixed, and a port on them would be a clone URL nobody serves.
+func (p *GitProvider) ValidatePort(port int32) error {
+	if port == 0 {
+		return nil
+	}
+	if !p.SelfManaged {
+		return fmt.Errorf("%s serves fixed endpoints; port may not be set", p.Name)
+	}
+	if port < MinForgePort || port > MaxForgePort {
+		return fmt.Errorf("port %d is outside %d-%d", port, MinForgePort, MaxForgePort)
+	}
+	return nil
+}
+
+// canonicalHost is the host a declaration on host resolves to: the declared
+// one on a self-managed forge, DefaultHost on any other, which every spelling
+// in Hosts folds to.
+func (p *GitProvider) canonicalHost(host string) string {
+	if trimmed := lowerASCII(strings.TrimSpace(host)); p.SelfManaged && trimmed != "" {
+		return trimmed
+	}
+	return p.DefaultHost
 }
 
 // ValidateNamespace applies this forge's grammar to an owning organisation,
@@ -207,10 +334,10 @@ func (p *GitProvider) ValidateNamespace(namespace string) error {
 // agree, where before the declared spelling was carried through verbatim and
 // seeded a clone URL git cannot fetch over HTTPS.
 //
-// ValidateHost admits only a host in Hosts, so every host resolves to
-// DefaultHost. A provider for a self-managed forge at a customer-chosen
-// hostname will need its own rule here, and it must not let the declared host
-// replace one the repository names.
+// On a hosted forge ValidateHost admits only a host in Hosts, so every host
+// resolves to DefaultHost. On a self-managed forge the canonical host is the
+// declared one, and a repository naming any other host is refused: the
+// declared host never replaces one the repository names.
 //
 // The namespace this produces is checked against the provider's grammar
 // wherever it came from. Checking only the declared `namespace` field would
@@ -221,7 +348,7 @@ func (p *GitProvider) Resolve(host, repository, namespace string) (RepoRef, erro
 	if err := p.ValidateHost(host); err != nil {
 		return RepoRef{}, err
 	}
-	canonical := p.DefaultHost
+	canonical := p.canonicalHost(host)
 
 	// Every spelling of this provider's host lifts out of a schemeless path,
 	// not just DefaultHost. The parser this replaces stripped both
@@ -230,7 +357,7 @@ func (p *GitProvider) Resolve(host, repository, namespace string) (RepoRef, erro
 	// a namespace, because each contains a dot and GitHub's owner grammar
 	// allows none. repo_ref.py's KNOWN_HOSTS is narrower, and the Go side is
 	// the one bound by what the CRD already admitted.
-	ref, err := parseRepoRef(repository, p.schemelessHosts())
+	ref, err := parseRepoRef(repository, p.schemelessHosts(canonical))
 	if err != nil {
 		return RepoRef{}, err
 	}
@@ -248,7 +375,7 @@ func (p *GitProvider) Resolve(host, repository, namespace string) (RepoRef, erro
 	// `/github.com` and `github.com.git/` spell that name as `/infra` and
 	// `infra.git/` spell `infra`.
 	if raw := strings.TrimSpace(repository); bare && strings.HasSuffix(raw, pathSeparator) &&
-		p.schemelessHosts()[lowerASCII(strings.Trim(raw, pathSeparator))] {
+		p.schemelessHosts(canonical)[lowerASCII(strings.Trim(raw, pathSeparator))] {
 		return RepoRef{}, fmt.Errorf("repository %q names the host %q and no repository", repository, strings.Trim(raw, pathSeparator))
 	}
 	// A dotted first segment the namespace grammar refuses is a host, most
@@ -294,13 +421,20 @@ func (p *GitProvider) Resolve(host, repository, namespace string) (RepoRef, erro
 // this provider's rules: a schemeless first segment spelling one of its hosts
 // is lifted out, so `github.com//o/r` reads as host github.com and path
 // `o/r`, as it does to the agent. The package-level ParseRepoRef lifts none.
+// A self-managed forge has no host of its own until one is declared, so it
+// lifts none here either.
 func (p *GitProvider) ParseRepoRef(value string) (RepoRef, error) {
-	return parseRepoRef(value, p.schemelessHosts())
+	return parseRepoRef(value, p.schemelessHosts(p.DefaultHost))
 }
 
-// schemelessHosts is DefaultHost plus every alternative spelling in Hosts.
-func (p *GitProvider) schemelessHosts() map[string]bool {
-	hosts := map[string]bool{p.DefaultHost: true}
+// schemelessHosts is the canonical host plus every alternative spelling in
+// Hosts. The canonical host is DefaultHost on a hosted forge and the declared
+// host on a self-managed one; an empty one lifts nothing.
+func (p *GitProvider) schemelessHosts(canonical string) map[string]bool {
+	hosts := map[string]bool{}
+	if canonical != "" {
+		hosts[canonical] = true
+	}
 	for host := range p.Hosts {
 		hosts[host] = true
 	}

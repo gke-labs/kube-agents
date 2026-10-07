@@ -1,0 +1,28 @@
+{
+  "payload": {
+    "number": 1,
+    "body": "Thanks, looking now."
+  },
+  "responses": [
+    {
+      "id": 8,
+      "html_url": "https://gitea.example.test/acme/infra/pulls/1#issuecomment-8",
+      "pull_request_url": "https://gitea.example.test/acme/infra/pulls/1",
+      "issue_url": "",
+      "user": {
+        "id": 1,
+        "login": "kube-agents",
+        "full_name": "",
+        "email": "kube-agents@noreply.gitea.example.test",
+        "avatar_url": "https://gitea.example.test/avatars/a4278dd55a17b2a7c5c87e52eba6e386",
+        "html_url": "https://gitea.example.test/kube-agents",
+        "is_admin": false
+      },
+      "original_author": "",
+      "original_author_id": 0,
+      "body": "Thanks, looking now.",
+      "created_at": "2026-10-04T14:20:41Z",
+      "updated_at": "2026-10-04T14:20:41Z"
+    }
+  ]
+}

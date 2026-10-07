@@ -1,0 +1,149 @@
+{
+  "payload": {},
+  "responses": [
+    [
+      {
+        "id": 4,
+        "url": "https://gitea.example.test/api/v1/repos/acme/infra/issues/4",
+        "html_url": "https://gitea.example.test/acme/infra/issues/4",
+        "number": 4,
+        "user": {
+          "id": 1,
+          "login": "kube-agents",
+          "full_name": "",
+          "email": "kube-agents@example.test",
+          "avatar_url": "https://gitea.example.test/avatars/a4278dd55a17b2a7c5c87e52eba6e386",
+          "html_url": "https://gitea.example.test/kube-agents",
+          "is_admin": true
+        },
+        "original_author": "",
+        "original_author_id": 0,
+        "title": "Claimed issue",
+        "body": "Already taken.",
+        "ref": "",
+        "labels": [
+          {
+            "id": 3,
+            "name": "status:in-progress",
+            "exclusive": false,
+            "is_archived": false,
+            "color": "ededed",
+            "description": "",
+            "url": "https://gitea.example.test/api/v1/repos/acme/infra/labels/3"
+          }
+        ],
+        "milestone": null,
+        "assignee": null,
+        "assignees": null,
+        "state": "open",
+        "is_locked": false,
+        "comments": 0,
+        "created_at": "2026-10-04T14:20:42Z",
+        "updated_at": "2026-10-04T14:20:42Z",
+        "closed_at": null,
+        "due_date": null,
+        "pull_request": null,
+        "repository": {
+          "id": 3,
+          "name": "infra",
+          "owner": "acme",
+          "full_name": "acme/infra"
+        },
+        "pin_order": 0
+      },
+      {
+        "id": 1,
+        "url": "https://gitea.example.test/api/v1/repos/acme/infra/issues/1",
+        "html_url": "https://gitea.example.test/acme/infra/pulls/1",
+        "number": 1,
+        "user": {
+          "id": 1,
+          "login": "kube-agents",
+          "full_name": "",
+          "email": "kube-agents@example.test",
+          "avatar_url": "https://gitea.example.test/avatars/a4278dd55a17b2a7c5c87e52eba6e386",
+          "html_url": "https://gitea.example.test/kube-agents",
+          "is_admin": true
+        },
+        "original_author": "",
+        "original_author_id": 0,
+        "title": "Add one",
+        "body": "First proposal body.",
+        "ref": "",
+        "labels": [],
+        "milestone": null,
+        "assignee": null,
+        "assignees": null,
+        "state": "open",
+        "is_locked": false,
+        "comments": 0,
+        "created_at": "2026-10-04T14:20:40Z",
+        "updated_at": "2026-10-04T14:20:40Z",
+        "closed_at": null,
+        "due_date": null,
+        "pull_request": {
+          "merged": false,
+          "merged_at": null,
+          "draft": false,
+          "html_url": "https://gitea.example.test/acme/infra/pulls/1"
+        },
+        "repository": {
+          "id": 3,
+          "name": "infra",
+          "owner": "acme",
+          "full_name": "acme/infra"
+        },
+        "pin_order": 0
+      },
+      {
+        "id": 3,
+        "url": "https://gitea.example.test/api/v1/repos/acme/infra/issues/3",
+        "html_url": "https://gitea.example.test/acme/infra/issues/3",
+        "number": 3,
+        "user": {
+          "id": 1,
+          "login": "kube-agents",
+          "full_name": "",
+          "email": "kube-agents@example.test",
+          "avatar_url": "https://gitea.example.test/avatars/a4278dd55a17b2a7c5c87e52eba6e386",
+          "html_url": "https://gitea.example.test/kube-agents",
+          "is_admin": true
+        },
+        "original_author": "",
+        "original_author_id": 0,
+        "title": "Drift in prod",
+        "body": "Something drifted.",
+        "ref": "",
+        "labels": [
+          {
+            "id": 1,
+            "name": "status:triage",
+            "exclusive": false,
+            "is_archived": false,
+            "color": "fbca04",
+            "description": "Needs a closer look.",
+            "url": "https://gitea.example.test/api/v1/repos/acme/infra/labels/1"
+          }
+        ],
+        "milestone": null,
+        "assignee": null,
+        "assignees": null,
+        "state": "open",
+        "is_locked": false,
+        "comments": 0,
+        "created_at": "2026-10-04T14:20:42Z",
+        "updated_at": "2026-10-04T14:20:42Z",
+        "closed_at": null,
+        "due_date": null,
+        "pull_request": null,
+        "repository": {
+          "id": 3,
+          "name": "infra",
+          "owner": "acme",
+          "full_name": "acme/infra"
+        },
+        "pin_order": 0
+      }
+    ]
+  ]
+}

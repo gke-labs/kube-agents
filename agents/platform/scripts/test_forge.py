@@ -1436,5 +1436,27 @@ class ProtocolConformanceTest(unittest.TestCase):
         self.assertNotIn("_host_of", source)
 
 
+class AgentPullRequestOnAHostQualifiedRepoTest(unittest.TestCase):
+    """A host-qualified repo is matched on its forge path, never on the raw name."""
+
+    REPO = "gitea.lab/acme/live"
+
+    def pr(self, head_repo):
+        return forge.PullRequest(
+            number=1, head_ref="platform-agent/x", author="bot", labels=(), head_repo=head_repo
+        )
+
+    def test_the_forge_path_matches(self):
+        self.assertTrue(forge.is_agent_pull_request(self.pr("acme/live"), self.REPO, "bot", path="acme/live"))
+
+    def test_without_the_path_the_host_qualified_name_matches_nothing(self):
+        self.assertFalse(forge.is_agent_pull_request(self.pr("acme/live"), self.REPO, "bot"))
+
+    def test_a_fork_is_still_refused(self):
+        self.assertFalse(
+            forge.is_agent_pull_request(self.pr("stranger/live"), self.REPO, "bot", path="acme/live")
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1,0 +1,57 @@
+{
+  "payload": {
+    "number": 3,
+    "reason": "completed"
+  },
+  "responses": [
+    {
+      "id": 3,
+      "url": "https://gitea.example.test/api/v1/repos/acme/infra/issues/3",
+      "html_url": "https://gitea.example.test/acme/infra/issues/3",
+      "number": 3,
+      "user": {
+        "id": 1,
+        "login": "kube-agents",
+        "full_name": "",
+        "email": "kube-agents@example.test",
+        "avatar_url": "https://gitea.example.test/avatars/a4278dd55a17b2a7c5c87e52eba6e386",
+        "html_url": "https://gitea.example.test/kube-agents",
+        "is_admin": true
+      },
+      "original_author": "",
+      "original_author_id": 0,
+      "title": "Drift in prod (confirmed)",
+      "body": "Confirmed drift.",
+      "ref": "",
+      "labels": [
+        {
+          "id": 3,
+          "name": "status:in-progress",
+          "exclusive": false,
+          "is_archived": false,
+          "color": "ededed",
+          "description": "",
+          "url": "https://gitea.example.test/api/v1/repos/acme/infra/labels/3"
+        }
+      ],
+      "milestone": null,
+      "assignee": null,
+      "assignees": null,
+      "state": "closed",
+      "is_locked": false,
+      "comments": 2,
+      "created_at": "2026-10-04T14:20:42Z",
+      "updated_at": "2026-10-04T14:20:43Z",
+      "closed_at": "2026-10-04T14:20:43Z",
+      "due_date": null,
+      "pull_request": null,
+      "repository": {
+        "id": 3,
+        "name": "infra",
+        "owner": "acme",
+        "full_name": "acme/infra"
+      },
+      "pin_order": 0
+    }
+  ]
+}

@@ -60,6 +60,7 @@ const DefaultPort = 10250
 const (
 	busTokenAudienceForbiddenFmt = "volume %q projects a serviceAccountToken for audience %q, which is the A2A bus token audience; the operator projects that token for the platform-agent container alone" // #nosec G101 -- Error message format, not a credential
 	busCredsSecretForbiddenFmt   = "volume %q mounts Secret %q, which the operator renders with A2A bus credentials for its own workloads; it may not be mounted by the CR"
+	forgeCredsSecretForbiddenFmt = "volume %q mounts Secret %q, which is declared as a forge credentialsRef Secret for the credential proxy alone; it may not be mounted by the CR"
 )
 
 // restrictedServiceAccounts is the set of high-privilege service account names forbidden in PlatformAgent spec.
@@ -197,6 +198,7 @@ func (v *PlatformAgentCustomValidator) validatePlatformAgent(ctx context.Context
 			}
 			allErrs = append(allErrs, validateReservedVolumeName(vol.Name, depPath.Child("extraVolumes").Index(i).Child("name"))...)
 			allErrs = append(allErrs, validateBusCredentialSource(vol, platformAgent.Name, depPath.Child("extraVolumes").Index(i))...)
+			allErrs = append(allErrs, validateForgeCredentialSource(vol, platformAgent.Spec.Integration, depPath.Child("extraVolumes").Index(i))...)
 		}
 		for i, vol := range platformAgent.Spec.Deployment.SidecarVolumes {
 			if vol.HostPath != nil {
@@ -207,6 +209,7 @@ func (v *PlatformAgentCustomValidator) validatePlatformAgent(ctx context.Context
 			}
 			allErrs = append(allErrs, validateReservedVolumeName(vol.Name, depPath.Child("sidecarVolumes").Index(i).Child("name"))...)
 			allErrs = append(allErrs, validateBusCredentialSource(vol, platformAgent.Name, depPath.Child("sidecarVolumes").Index(i))...)
+			allErrs = append(allErrs, validateForgeCredentialSource(vol, platformAgent.Spec.Integration, depPath.Child("sidecarVolumes").Index(i))...)
 		}
 
 		// 2da. The fifth user-authored mount surface. Unlike the four above it
@@ -299,7 +302,8 @@ func (v *PlatformAgentCustomValidator) validatePlatformAgent(ctx context.Context
 func validateReservedVolumeMounts(mounts []corev1.VolumeMount, path *field.Path) field.ErrorList {
 	var errs field.ErrorList
 	for i, m := range mounts {
-		if _, reserved := agentv1alpha1.ReservedVolumeNames[m.Name]; !reserved {
+		_, reserved := agentv1alpha1.ReservedVolumeNames[m.Name]
+		if !reserved && !agentv1alpha1.IsForgeCredentialVolumeName(m.Name) {
 			continue
 		}
 		errs = append(errs, field.Forbidden(
@@ -315,12 +319,28 @@ func validateReservedVolumeMounts(mounts []corev1.VolumeMount, path *field.Path)
 // rejects outright, so this is a wedged-reconcile guard as much as a credential
 // one.
 func validateReservedVolumeName(name string, path *field.Path) field.ErrorList {
-	if _, reserved := agentv1alpha1.ReservedVolumeNames[name]; !reserved {
+	_, reserved := agentv1alpha1.ReservedVolumeNames[name]
+	if !reserved && !agentv1alpha1.IsForgeCredentialVolumeName(name) {
 		return nil
 	}
 	return field.ErrorList{field.Forbidden(
 		path, fmt.Sprintf("volume name %q is reserved by the operator", name),
 	)}
+}
+
+func validateForgeCredentialSource(vol corev1.Volume, integration *agentv1alpha1.PlatformAgentIntegrationSpec, path *field.Path) field.ErrorList {
+	if integration == nil {
+		return nil
+	}
+	var errs field.ErrorList
+	for _, route := range integration.ForgeCredentialRoutes(vol) {
+		at := path.Child("secret", "secretName")
+		if route.Source != agentv1alpha1.BusCredentialRouteVolumeSource {
+			at = path.Child("projected", "sources").Index(route.Source).Child("secret", "name")
+		}
+		errs = append(errs, field.Forbidden(at, fmt.Sprintf(forgeCredsSecretForbiddenFmt, vol.Name, route.Secret)))
+	}
+	return errs
 }
 
 // validateBusCredentialSource refuses a user-supplied volume whose SOURCE

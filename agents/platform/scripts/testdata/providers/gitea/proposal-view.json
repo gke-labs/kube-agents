@@ -1,0 +1,256 @@
+{
+  "payload": {
+    "number": 1,
+    "comments": true,
+    "diff": true
+  },
+  "responses": [
+    {
+      "id": 1,
+      "url": "https://gitea.example.test/acme/infra/pulls/1",
+      "number": 1,
+      "user": {
+        "id": 1,
+        "login": "kube-agents",
+        "full_name": "",
+        "email": "kube-agents@example.test",
+        "avatar_url": "https://gitea.example.test/avatars/a4278dd55a17b2a7c5c87e52eba6e386",
+        "html_url": "https://gitea.example.test/kube-agents",
+        "is_admin": true
+      },
+      "title": "Add one",
+      "body": "First proposal body.",
+      "labels": [],
+      "milestone": null,
+      "assignee": null,
+      "assignees": [],
+      "requested_reviewers": [
+        {
+          "id": 2,
+          "login": "reviewer",
+          "full_name": "",
+          "email": "reviewer@noreply.gitea.example.test",
+          "avatar_url": "https://gitea.example.test/avatars/f852808db5853b1dc466547f294f1560",
+          "html_url": "https://gitea.example.test/reviewer",
+          "is_admin": false
+        }
+      ],
+      "requested_reviewers_teams": [],
+      "state": "open",
+      "draft": false,
+      "is_locked": false,
+      "comments": 4,
+      "review_comments": 2,
+      "additions": 4,
+      "deletions": 0,
+      "changed_files": 2,
+      "html_url": "https://gitea.example.test/acme/infra/pulls/1",
+      "diff_url": "https://gitea.example.test/acme/infra/pulls/1.diff",
+      "patch_url": "https://gitea.example.test/acme/infra/pulls/1.patch",
+      "mergeable": true,
+      "merged": false,
+      "merged_at": null,
+      "merge_commit_sha": null,
+      "merged_by": null,
+      "allow_maintainer_edit": false,
+      "base": {
+        "label": "main",
+        "ref": "main",
+        "sha": "e23e22aa8f36faf6bd6140d53f8823cf3aa4fc17",
+        "repo_id": 3,
+        "repo": {
+          "id": 3,
+          "name": "infra",
+          "full_name": "acme/infra",
+          "owner": {
+            "id": 3,
+            "login": "acme",
+            "full_name": "",
+            "email": "",
+            "avatar_url": "https://gitea.example.test/avatars/53bce4f1dfa0fe8e7ca126f91b35d3a6",
+            "html_url": "https://gitea.example.test/acme",
+            "is_admin": false
+          },
+          "private": false,
+          "fork": false,
+          "default_branch": "main",
+          "html_url": "https://gitea.example.test/acme/infra"
+        }
+      },
+      "head": {
+        "label": "platform-agent/live-one",
+        "ref": "platform-agent/live-one",
+        "sha": "e1c50cb5a53b3b91235cdb8aa3331aa202011f6b",
+        "repo_id": 3,
+        "repo": {
+          "id": 3,
+          "name": "infra",
+          "full_name": "acme/infra",
+          "owner": {
+            "id": 3,
+            "login": "acme",
+            "full_name": "",
+            "email": "",
+            "avatar_url": "https://gitea.example.test/avatars/53bce4f1dfa0fe8e7ca126f91b35d3a6",
+            "html_url": "https://gitea.example.test/acme",
+            "is_admin": false
+          },
+          "private": false,
+          "fork": false,
+          "default_branch": "main",
+          "html_url": "https://gitea.example.test/acme/infra"
+        }
+      },
+      "merge_base": "e23e22aa8f36faf6bd6140d53f8823cf3aa4fc17",
+      "due_date": null,
+      "created_at": "2026-10-04T14:20:40Z",
+      "updated_at": "2026-10-04T14:20:45Z",
+      "closed_at": null,
+      "pin_order": 0
+    },
+    [
+      {
+        "id": 6,
+        "html_url": "https://gitea.example.test/acme/infra/pulls/1#issuecomment-6",
+        "pull_request_url": "https://gitea.example.test/acme/infra/pulls/1",
+        "issue_url": "",
+        "user": {
+          "id": 2,
+          "login": "reviewer",
+          "full_name": "",
+          "email": "reviewer@noreply.gitea.example.test",
+          "avatar_url": "https://gitea.example.test/avatars/f852808db5853b1dc466547f294f1560",
+          "html_url": "https://gitea.example.test/reviewer",
+          "is_admin": false
+        },
+        "original_author": "",
+        "original_author_id": 0,
+        "body": "Conversation comment from the reviewer.",
+        "created_at": "2026-10-04T14:20:41Z",
+        "updated_at": "2026-10-04T14:20:41Z"
+      },
+      {
+        "id": 8,
+        "html_url": "https://gitea.example.test/acme/infra/pulls/1#issuecomment-8",
+        "pull_request_url": "https://gitea.example.test/acme/infra/pulls/1",
+        "issue_url": "",
+        "user": {
+          "id": 1,
+          "login": "kube-agents",
+          "full_name": "",
+          "email": "kube-agents@noreply.gitea.example.test",
+          "avatar_url": "https://gitea.example.test/avatars/a4278dd55a17b2a7c5c87e52eba6e386",
+          "html_url": "https://gitea.example.test/kube-agents",
+          "is_admin": false
+        },
+        "original_author": "",
+        "original_author_id": 0,
+        "body": "Thanks, looking now.",
+        "created_at": "2026-10-04T14:20:45Z",
+        "updated_at": "2026-10-04T14:20:45Z"
+      }
+    ],
+    [
+      {
+        "id": 1,
+        "user": {
+          "id": 2,
+          "login": "reviewer",
+          "full_name": "",
+          "email": "rev@example.test",
+          "avatar_url": "https://gitea.example.test/avatars/f852808db5853b1dc466547f294f1560",
+          "html_url": "https://gitea.example.test/reviewer",
+          "is_admin": false
+        },
+        "team": null,
+        "state": "COMMENT",
+        "body": "Please look at these two lines.",
+        "commit_id": "e1c50cb5a53b3b91235cdb8aa3331aa202011f6b",
+        "stale": false,
+        "official": false,
+        "dismissed": false,
+        "comments_count": 2,
+        "submitted_at": "2026-10-04T14:20:42Z",
+        "updated_at": "2026-10-04T14:20:42Z",
+        "html_url": "https://gitea.example.test/acme/infra/pulls/1#issuecomment-5",
+        "pull_request_url": "https://gitea.example.test/acme/infra/pulls/1"
+      },
+      {
+        "id": 2,
+        "user": {
+          "id": 2,
+          "login": "reviewer",
+          "full_name": "",
+          "email": "rev@example.test",
+          "avatar_url": "https://gitea.example.test/avatars/f852808db5853b1dc466547f294f1560",
+          "html_url": "https://gitea.example.test/reviewer",
+          "is_admin": false
+        },
+        "team": null,
+        "state": "APPROVED",
+        "body": "",
+        "commit_id": "e1c50cb5a53b3b91235cdb8aa3331aa202011f6b",
+        "stale": false,
+        "official": true,
+        "dismissed": false,
+        "comments_count": 0,
+        "submitted_at": "2026-10-04T14:20:46Z",
+        "updated_at": "2026-10-04T14:20:46Z",
+        "html_url": "https://gitea.example.test/acme/infra/pulls/1#issuecomment-7",
+        "pull_request_url": "https://gitea.example.test/acme/infra/pulls/1"
+      }
+    ],
+    [
+      {
+        "id": 3,
+        "body": "Inline remark on line one.",
+        "user": {
+          "id": 2,
+          "login": "reviewer",
+          "full_name": "",
+          "email": "rev@example.test",
+          "avatar_url": "https://gitea.example.test/avatars/f852808db5853b1dc466547f294f1560",
+          "html_url": "https://gitea.example.test/reviewer",
+          "is_admin": false
+        },
+        "resolver": null,
+        "pull_request_review_id": 1,
+        "created_at": "2026-10-04T14:20:43Z",
+        "updated_at": "2026-10-04T14:20:43Z",
+        "path": "one.txt",
+        "commit_id": "880c1b3fd060ffa9f1b17942b046f271c948bc2c",
+        "original_commit_id": "",
+        "diff_hunk": "@@ -0,0 +1 @@\n+one",
+        "position": 1,
+        "original_position": 0,
+        "html_url": "https://gitea.example.test/acme/infra/pulls/1#issuecomment-3",
+        "pull_request_url": "https://gitea.example.test/acme/infra/pulls/1"
+      },
+      {
+        "id": 4,
+        "body": "Inline remark on second.",
+        "user": {
+          "id": 2,
+          "login": "reviewer",
+          "full_name": "",
+          "email": "rev@example.test",
+          "avatar_url": "https://gitea.example.test/avatars/f852808db5853b1dc466547f294f1560",
+          "html_url": "https://gitea.example.test/reviewer",
+          "is_admin": false
+        },
+        "resolver": null,
+        "pull_request_review_id": 1,
+        "created_at": "2026-10-04T14:20:44Z",
+        "updated_at": "2026-10-04T14:20:44Z",
+        "path": "second.txt",
+        "commit_id": "e1c50cb5a53b3b91235cdb8aa3331aa202011f6b",
+        "original_commit_id": "",
+        "diff_hunk": "@@ -0,0 +1,3 @@\n+one\n+",
+        "position": 2,
+        "original_position": 0,
+        "html_url": "https://gitea.example.test/acme/infra/pulls/1#issuecomment-4",
+        "pull_request_url": "https://gitea.example.test/acme/infra/pulls/1"
+      }
+    ]
+  ]
+}

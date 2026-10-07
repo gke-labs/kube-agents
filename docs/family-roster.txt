@@ -51,6 +51,7 @@ agents/platform/governance/*.md
   agents/platform/governance/stockout_prevention_sop.md
 
 agents/platform/scripts/testdata/providers/*/README.md
+  agents/platform/scripts/testdata/providers/gitea/README.md
   agents/platform/scripts/testdata/providers/github/README.md
   agents/platform/scripts/testdata/providers/gitlab/README.md
 

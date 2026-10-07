@@ -9593,6 +9593,10 @@ spec:
                               administrator supplies. GitHub's come from the install's GitHub App
                               through the token minter, so it is ignored for provider "github", and
                               admission warns when it is set there.
+
+                              For provider "gitea" it is required. The Secret holds an API token under
+                              the key "token". It is mounted into the credential proxy only; the
+                              agent's shell never sees it.
                             properties:
                               name:
                                 default: ""
@@ -9610,7 +9614,9 @@ spec:
                               Host is the forge hostname. Omit it for the provider's default
                               ("github.com" for GitHub). A host the declared provider does not serve is
                               rejected, and an alternative spelling of one it does serve resolves to the
-                              provider's canonical host.
+                              provider's canonical host. A self-managed provider such as "gitea" has no
+                              default, so the host is required there, and any DNS name is accepted; a
+                              repository on that forge may name this host and no other.
 
                               The pattern is a DNS name, which every forge's host is; it is here rather
                               than only in the webhook so the API server still refuses whitespace and
@@ -9649,6 +9655,14 @@ spec:
                             maxLength: 255
                             pattern: ^$|^[A-Za-z0-9][A-Za-z0-9._/-]*$
                             type: string
+                          port:
+                            description: |-
+                              Port is the forge's port, for a self-managed forge not on the scheme's
+                              default port. It is refused for a hosted provider such as GitHub.
+                            format: int32
+                            maximum: 65535
+                            minimum: 1
+                            type: integer
                           provider:
                             default: github
                             description: |-
@@ -9657,10 +9671,22 @@ spec:
                               the agent reads which forge was declared rather than guessing from the
                               URL's text.
 
-                              Only "github" is registered today; the enum grows with each agent-side
-                              provider. Defaults to "github".
+                              "github" and "gitea" are registered; the enum grows with each
+                              agent-side provider. Defaults to "github".
                             enum:
                               - github
+                              - gitea
+                            type: string
+                          scheme:
+                            description: |-
+                              Scheme is how the forge is reached: "https", the default, or "http".
+                              Only a provider that allows plain http accepts it, and only when it is
+                              written out; GitHub is https only. Over http the token and repository
+                              contents cross the network unencrypted, so admission warns, and it is
+                              meant for a forge inside the cluster.
+                            enum:
+                              - https
+                              - http
                             type: string
                         required:
                           - name

@@ -19,9 +19,11 @@ it.
 See docs/designs/version-control-support.md §6.
 """
 
+import os
 import pathlib
 import shutil
 import subprocess
+import tempfile
 import unittest
 
 import yaml
@@ -492,11 +494,10 @@ class ChartGitIntegrationTest(unittest.TestCase):
     def test_the_minter_never_renders_without_a_github_forge(self):
         """Asserts the outcome, not which guard produced it.
 
-        With `github` the only registered provider,
-        `kube-agents.forgeProviders` refuses `gitlab` before
-        `github-minter.yaml`'s own check can fire. Both guards must hold: the
-        minter one is what keeps a GitLab-only install from provisioning a
-        GitHub App token minter once the registry widens.
+        `kube-agents.forgeProviders` refuses the unregistered `gitlab` before
+        `github-minter.yaml`'s own check can fire; for a registered non-GitHub
+        provider the minter guard fires instead
+        (`ChartGiteaForgeTest.test_the_minter_refuses_a_gitea_only_install`).
         """
         result = _render(
             _MINTER_TEMPLATE,
@@ -533,6 +534,139 @@ class ChartGitIntegrationTest(unittest.TestCase):
                 result = _render(_MINTER_TEMPLATE, *_MINTER, *extra)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertIn("name: github-token-minter", result.stdout)
+
+
+# A self-managed Gitea inside the cluster, declared the way an install with
+# no external forge declares it: plain http on the Service's own port.
+_GITEA_FORGE = {
+    "name": "in-cluster-gitea",
+    "provider": "gitea",
+    "host": "gitea-http.gitea.svc.cluster.local",
+    "scheme": "http",
+    "port": 3000,
+    "namespace": "demo",
+    "credentialsRef": {"name": "gitea-token"},
+}
+_GITEA_REPO = {"forge": "in-cluster-gitea", "repository": "gke-fleet-iac", "role": "gitops"}
+
+
+def _render_values(template: str, values: dict) -> subprocess.CompletedProcess:
+    """Renders from a values file, not --set: a number in a values file reaches
+    the template as a float, which is the path a real install takes."""
+    with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as handle:
+        yaml.safe_dump(values, handle)
+        path = handle.name
+    try:
+        args = ["helm", "template", "t", str(_CHART), "--show-only", template, "-f", path]
+        for value in _HARNESS:
+            args += ["--set", value]
+        return subprocess.run(args, capture_output=True, text=True)
+    finally:
+        os.unlink(path)
+
+
+def _gitea_values(**overrides) -> dict:
+    forge = {**_GITEA_FORGE, **overrides}
+    forge = {k: v for k, v in forge.items() if v is not None}
+    return {"platformAgent": {"integration": {"forges": [forge], "repositories": [_GITEA_REPO]}}}
+
+
+@unittest.skipUnless(shutil.which("helm"), "helm is not installed")
+class ChartGiteaForgeTest(unittest.TestCase):
+    """The schema and the forge helper both have to admit what the CRD admits
+    for gitea, or `helm install` installs nothing and names a key the
+    administrator wrote correctly."""
+
+    def test_a_gitea_forge_over_http_with_a_port_reaches_the_cr(self):
+        result = _render_values(_CR_TEMPLATE, _gitea_values())
+        self.assertEqual(result.returncode, 0, result.stderr)
+        integration = yaml.safe_load(result.stdout)["spec"]["integration"]
+        self.assertNotIn("github", integration)
+        self.assertEqual(
+            integration["forges"],
+            [
+                {
+                    "name": "in-cluster-gitea",
+                    "provider": "gitea",
+                    "host": "gitea-http.gitea.svc.cluster.local",
+                    "scheme": "http",
+                    "port": 3000,
+                    "namespace": "demo",
+                    "credentialsRef": {"name": "gitea-token"},
+                }
+            ],
+        )
+        self.assertEqual(integration["repositories"], [_GITEA_REPO])
+
+    def test_the_minter_refuses_a_gitea_only_install(self):
+        values = _gitea_values()
+        values["githubMinter"] = {
+            "enabled": True, "org": "gke-labs", "repo": "gke-labs/kube-agents",
+        }
+        result = _render_values(_MINTER_TEMPLATE, values)
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("declares no github forge", result.stderr)
+
+    def test_a_gitea_forge_without_a_host_fails_naming_it(self):
+        result = _render_values(_CR_TEMPLATE, _gitea_values(host=None))
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn(f"{_P}forges[0].host is required", result.stderr)
+
+    def test_a_gitea_forge_without_credentials_ref_fails_naming_it(self):
+        result = _render_values(_CR_TEMPLATE, _gitea_values(credentialsRef=None))
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn(f"{_P}forges[0].credentialsRef.name is required", result.stderr)
+
+    def test_a_gitea_forge_with_reserved_saas_host_fails_naming_it(self):
+        result = _render_values(_CR_TEMPLATE, _gitea_values(host="github.com"))
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn(f"{_P}forges[0].host is \"github.com\"", result.stderr)
+
+    def test_duplicate_gitea_forge_hosts_fail_naming_it(self):
+        values = _gitea_values()
+        second = {**_GITEA_FORGE, "name": "second-gitea"}
+        values["platformAgent"]["integration"]["forges"].append(second)
+        result = _render_values(_CR_TEMPLATE, values)
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn(f"{_P}forges[1].host", result.stderr)
+
+    def test_a_repository_naming_only_the_gitea_host_is_not_a_bare_name(self):
+        """The host-only test reads the forge's own host. Read against
+        GitHub's spellings, `<gitea-host>/` would be called a bare name."""
+        values = _gitea_values(namespace=None)
+        values["platformAgent"]["integration"]["repositories"] = [
+            {"forge": "in-cluster-gitea",
+             "repository": "gitea-http.gitea.svc.cluster.local/", "role": "gitops"},
+        ]
+        result = _render_values(_CR_TEMPLATE, values)
+        self.assertNotIn("a bare name", result.stderr)
+
+    def test_scheme_and_port_outside_the_crd_fail_the_schema(self):
+        for label, overrides in (
+            ("scheme", {"scheme": "ftp"}),
+            ("port zero", {"port": 0}),
+            ("port too high", {"port": 65536}),
+        ):
+            with self.subTest(case=label):
+                result = _render_values(_CR_TEMPLATE, _gitea_values(**overrides))
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertRegex(result.stderr, r"forges[./]0")
+
+    def test_github_refuses_a_port_and_plain_http(self):
+        for field, value in (("port", "3000"), ("scheme", "http")):
+            with self.subTest(field=field):
+                result = _render(
+                    _CR_TEMPLATE,
+                    *_forge(0, name="github", namespace="gke-labs", **{field: value}),
+                )
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertIn(f"{_P}forges[0].{field}", result.stderr)
+
+    def test_an_unknown_provider_names_every_registered_one(self):
+        result = _render(_CR_TEMPLATE, *_forge(0, name="gitlab", provider="gitlab"))
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn(f'{_P}forges[0].provider is "gitlab"; must be one of github, gitea',
+                      result.stderr)
 
 
 if __name__ == "__main__":

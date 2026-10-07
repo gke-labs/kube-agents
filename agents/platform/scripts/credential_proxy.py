@@ -5619,6 +5619,8 @@ class CommandExecutor:
                     )
                 )
             )
+            if any(key.startswith("credential.http://") for key, _ in extra_config):
+                command_environment["GIT_ALLOW_PROTOCOL"] = "https:http"
         if kubeconfig_path is not None:
             command_environment["KUBECONFIG"] = str(kubeconfig_path)
         effective_timeout: float = (

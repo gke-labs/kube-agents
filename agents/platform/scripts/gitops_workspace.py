@@ -153,6 +153,16 @@ LOGGER = logging.getLogger(__name__)
 #: there.
 GITHUB_REPO_TYPE = "github"
 
+#: The `type` of a self-managed Gitea forge's `managed_repos` entries.
+GITEA_REPO_TYPE = "gitea"
+
+#: The entry types `get_managed_forge_repos` returns: the forges a provider in
+#: this image serves through the credential broker. Named here rather than
+#: read from `providers.registry`, because the agent pod does not import the
+#: provider modules (test_providers_boundary); an entry of any other type is
+#: logged and skipped, as `_github_entries` does for every non-GitHub entry.
+SWEEPABLE_REPO_TYPES = (GITHUB_REPO_TYPE, GITEA_REPO_TYPE)
+
 #: The optional `ref` on a `context_repos` entry: the branch the declared-intent
 #: search reads instead of the remote's HEAD. Held to the shape of a git branch
 #: name and, above all, never allowed to begin with `-`, because the value is
@@ -976,12 +986,13 @@ def _github_entries(
     for entry in entries:
         url = entry.get("url", "")
         if entry.get("type") != GITHUB_REPO_TYPE:
-            LOGGER.warning(
-                "Skipping %s repository %r: no provider for type %r.",
-                key,
-                url,
-                entry.get("type"),
-            )
+            if entry.get("type") not in SWEEPABLE_REPO_TYPES:
+                LOGGER.warning(
+                    "Skipping %s repository %r: no provider for type %r.",
+                    key,
+                    url,
+                    entry.get("type"),
+                )
             continue
         slug = extract_github_slug(url)
         if not slug:
@@ -1092,6 +1103,72 @@ def get_managed_github_repos() -> list[str]:
     context list existed: every reader of this list compares the spelling.
     """
     return _github_slugs(get_managed_repo_entries(), MANAGED_REPOS_KEY, fold_case=False)
+
+
+def get_managed_forge_repos() -> list[dict[str, str]]:
+    """Every managed repository on a forge this image serves, as `{type, repo, path}`.
+
+    `repo` is what the credential broker is handed. A GitHub entry keeps the
+    bare `owner/name` slug `get_managed_github_repos` returns, so a GitHub-only
+    install sees the same names, cards and idempotency keys as before. Any
+    other entry is host-qualified, `host/owner/name` with no scheme or port:
+    the broker's registry resolves that host against the forges the operator
+    declared, and a bare slug would land on the install's default forge
+    whichever forge the entry is on.
+
+    `path` is the repository as its own forge spells it, `owner/name`. It is
+    what a forge reports as a pull request's head repository, so ownership
+    checks compare against it rather than against `repo`.
+
+    Kept apart from `get_managed_github_repos` rather than widening it: that
+    list's readers compare GitHub slugs and mint GitHub tokens for them.
+    """
+    res: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for entry in get_managed_repo_entries():
+        kind = entry.get("type") or ""
+        url = entry.get("url", "")
+        if kind not in SWEEPABLE_REPO_TYPES:
+            LOGGER.warning(
+                "Skipping %s repository %r: no provider for type %r.",
+                MANAGED_REPOS_KEY,
+                url,
+                kind,
+            )
+            continue
+        if kind == GITHUB_REPO_TYPE:
+            slug = extract_github_slug(url)
+            if not slug:
+                LOGGER.warning(
+                    "Skipping %s repository %r: not a GitHub repository URL.",
+                    MANAGED_REPOS_KEY,
+                    url,
+                )
+                continue
+            repo, path = slug, slug
+        else:
+            ref = repo_ref.try_parse(url)
+            if ref is None or not ref.host:
+                LOGGER.warning(
+                    "Skipping %s repository %r: a %s entry must be a URL naming its host.",
+                    MANAGED_REPOS_KEY,
+                    url,
+                    kind,
+                )
+                continue
+            repo, path = str(ref), ref.path
+        if repo not in seen:
+            seen.add(repo)
+            res.append({"type": kind, "repo": repo, "path": path})
+    return res
+
+
+def managed_forge_repo(repo: str) -> dict[str, str] | None:
+    """The `get_managed_forge_repos` entry whose `repo` is exactly `repo`, if any."""
+    for entry in get_managed_forge_repos():
+        if entry["repo"] == repo:
+            return entry
+    return None
 
 
 def get_context_github_repos() -> list[str]:

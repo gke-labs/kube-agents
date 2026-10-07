@@ -1438,18 +1438,26 @@ func sameManagedRepo(existing, seeded agentv1alpha1.ManagedRepoEntry) bool {
 			return false
 		}
 	}
+	host := provider.DefaultHost
+	if provider.SelfManaged {
+		seededParsed, err := provider.ParseRepoRef(seeded.URL)
+		if err != nil || seededParsed.Host == "" {
+			return false
+		}
+		host = seededParsed.Host
+	}
 	parsed, err := provider.ParseRepoRef(existing.URL)
 	if err != nil {
 		return false
 	}
-	if parsed.Host != "" && parsed.Host != provider.DefaultHost {
+	if parsed.Host != "" && parsed.Host != host {
 		return false
 	}
-	existingRef, err := provider.Resolve("", existing.URL, "")
+	existingRef, err := provider.Resolve(host, existing.URL, "")
 	if err != nil {
 		return false
 	}
-	seededRef, err := provider.Resolve("", seeded.URL, "")
+	seededRef, err := provider.Resolve(host, seeded.URL, "")
 	if err != nil {
 		return false
 	}

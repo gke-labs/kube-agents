@@ -459,14 +459,20 @@ func TestValidationDispatchesOnTheDeclaredProvider(t *testing.T) {
 	}
 }
 
-func TestOnlyGitHubIsRegistered(t *testing.T) {
+func TestRegisteredProviders(t *testing.T) {
 	// A provider the CRD accepts and the agent has no implementation for is a
 	// worse failure than one the CRD refuses, so the registry and the enum in
 	// ForgeSpec.Provider grow together with the agent-side provider. If this
 	// fails, check that the CRD enum was widened to match.
 	names := GitProviderNames()
-	if len(names) != 1 || names[0] != GitProviderGitHub {
-		t.Errorf("GitProviderNames() = %v, expected only %q", names, GitProviderGitHub)
+	expected := []string{GitProviderGitea, GitProviderGitHub}
+	if len(names) != len(expected) {
+		t.Fatalf("GitProviderNames() = %v, expected %v", names, expected)
+	}
+	for i, name := range names {
+		if name != expected[i] {
+			t.Errorf("GitProviderNames()[%d] = %q, expected %q", i, name, expected[i])
+		}
 	}
 }
 
@@ -951,5 +957,128 @@ func TestEgressPatternsAddAForeignHostAsALiteral(t *testing.T) {
 	got[0] = "mutated"
 	if provider.Egress[0] == "mutated" {
 		t.Error("EgressPatterns returned the registry's own slice")
+	}
+}
+
+func TestGiteaForgeValidationAndResolution(t *testing.T) {
+	giteaForge := func(host, scheme string, port int32, secret string) ForgeSpec {
+		var ref *corev1.LocalObjectReference
+		if secret != "" {
+			ref = &corev1.LocalObjectReference{Name: secret}
+		}
+		return ForgeSpec{
+			Name:           "gitea",
+			Provider:       GitProviderGitea,
+			Host:           host,
+			Namespace:      "platform.team",
+			Scheme:         scheme,
+			Port:           port,
+			CredentialsRef: ref,
+		}
+	}
+
+	validSpec := &IntegrationSpec{
+		Forges: []ForgeSpec{giteaForge("gitea.gitea.svc.cluster.local", ForgeSchemeHTTP, 3000, "gitea-token")},
+		Repositories: []RepositorySpec{
+			repo("gitea", "gitops", RepositoryRoleGitOps),
+			repo("gitea", "http://gitea.gitea.svc.cluster.local:3000/platform.team/apps.git", RepositoryRoleManaged),
+		},
+	}
+	if err := validSpec.ValidateGit(); err != nil {
+		t.Fatalf("ValidateGit() on valid Gitea spec = %v", err)
+	}
+	resolved, err := validSpec.ResolveGit()
+	if err != nil {
+		t.Fatalf("ResolveGit() = %v", err)
+	}
+	if got := len(resolved.SelfManagedForges()); got != 1 {
+		t.Fatalf("SelfManagedForges() = %d, want 1", got)
+	}
+	entry, err := resolved.GitOps().ManagedRepoEntry()
+	if err != nil {
+		t.Fatalf("ManagedRepoEntry() = %v", err)
+	}
+	wantEntry := ManagedRepoEntry{
+		Type: GitProviderGitea,
+		URL:  "http://gitea.gitea.svc.cluster.local:3000/platform.team/gitops",
+	}
+	if entry != wantEntry {
+		t.Errorf("ManagedRepoEntry() = %+v, want %+v", entry, wantEntry)
+	}
+	warnings := resolved.Warnings()
+	if len(warnings) != 1 || !strings.Contains(warnings[0], "spec.integration.forges[0].scheme is http") {
+		t.Errorf("Warnings() = %v, expected http warning on forges[0].scheme", warnings)
+	}
+	egress := ForgeEgressPatterns(validSpec)
+	if egress[len(egress)-1] != "gitea.gitea.svc.cluster.local" {
+		t.Errorf("ForgeEgressPatterns() = %v, expected gitea.gitea.svc.cluster.local at the end", egress)
+	}
+
+	refusalCases := []struct {
+		name string
+		spec *IntegrationSpec
+		want []string
+	}{
+		{
+			name: "missing host on gitea",
+			spec: &IntegrationSpec{Forges: []ForgeSpec{giteaForge("", ForgeSchemeHTTPS, 0, "gitea-token")}},
+			want: []string{"forges[0].host"},
+		},
+		{
+			name: "reserved github host on gitea",
+			spec: &IntegrationSpec{Forges: []ForgeSpec{giteaForge("github.com", ForgeSchemeHTTPS, 0, "gitea-token")}},
+			want: []string{"forges[0].host"},
+		},
+		{
+			name: "reserved gitlab host on gitea",
+			spec: &IntegrationSpec{Forges: []ForgeSpec{giteaForge("gitlab.com", ForgeSchemeHTTPS, 0, "gitea-token")}},
+			want: []string{"forges[0].host"},
+		},
+		{
+			name: "missing credentialsRef on gitea",
+			spec: &IntegrationSpec{Forges: []ForgeSpec{giteaForge("gitea.example.com", ForgeSchemeHTTPS, 0, "")}},
+			want: []string{"forges[0].credentialsRef"},
+		},
+		{
+			name: "http scheme on github",
+			spec: &IntegrationSpec{Forges: []ForgeSpec{{Name: "gh", Provider: GitProviderGitHub, Scheme: ForgeSchemeHTTP}}},
+			want: []string{"forges[0].scheme"},
+		},
+		{
+			name: "port on github",
+			spec: &IntegrationSpec{Forges: []ForgeSpec{{Name: "gh", Provider: GitProviderGitHub, Port: 8443}}},
+			want: []string{"forges[0].port"},
+		},
+		{
+			name: "duplicate self-managed host across two forges",
+			spec: &IntegrationSpec{
+				Forges: []ForgeSpec{
+					giteaForge("gitea.example.com", ForgeSchemeHTTPS, 0, "token-a"),
+					{
+						Name:           "gitea-two",
+						Provider:       GitProviderGitea,
+						Host:           "Gitea.Example.COM",
+						CredentialsRef: &corev1.LocalObjectReference{Name: "token-b"},
+					},
+				},
+				Repositories: []RepositorySpec{repo("gitea-two", "org/repo", RepositoryRoleGitOps)},
+			},
+			want: []string{"forges[1].host"},
+		},
+	}
+	for _, tc := range refusalCases {
+		t.Run(tc.name, func(t *testing.T) {
+			res, err := tc.spec.ResolveGit()
+			if err != nil {
+				t.Fatalf("ResolveGit() = %v", err)
+			}
+			var got []string
+			for _, p := range res.Problems() {
+				got = append(got, p.Path.String())
+			}
+			if strings.Join(got, " ") != strings.Join(tc.want, " ") {
+				t.Errorf("Problems() = %v, want %v", got, tc.want)
+			}
+		})
 	}
 }

@@ -1,0 +1,91 @@
+{
+  "payload": {
+    "number": 1
+  },
+  "responses": [
+    [
+      {
+        "url": "https://gitea.example.test/api/v1/repos/acme/infra/git/commits/e1c50cb5a53b3b91235cdb8aa3331aa202011f6b",
+        "sha": "e1c50cb5a53b3b91235cdb8aa3331aa202011f6b",
+        "created": "2026-10-04T10:20:39-04:00",
+        "html_url": "https://gitea.example.test/acme/infra/commit/e1c50cb5a53b3b91235cdb8aa3331aa202011f6b",
+        "commit": {
+          "url": "https://gitea.example.test/api/v1/repos/acme/infra/git/commits/e1c50cb5a53b3b91235cdb8aa3331aa202011f6b",
+          "author": {
+            "name": "ka",
+            "email": "ka@example.test",
+            "date": "2026-10-04T10:20:39-04:00"
+          },
+          "committer": {
+            "name": "ka",
+            "email": "ka@example.test",
+            "date": "2026-10-04T10:20:39-04:00"
+          },
+          "message": "second commit on platform-agent/live-one\n",
+          "tree": {
+            "url": "https://gitea.example.test/api/v1/repos/acme/infra/git/trees/e1c50cb5a53b3b91235cdb8aa3331aa202011f6b",
+            "sha": "e1c50cb5a53b3b91235cdb8aa3331aa202011f6b",
+            "created": "2026-10-04T10:20:39-04:00"
+          },
+          "verification": null
+        },
+        "author": null,
+        "committer": null,
+        "parents": [
+          {
+            "url": "https://gitea.example.test/api/v1/repos/acme/infra/git/commits/880c1b3fd060ffa9f1b17942b046f271c948bc2c",
+            "sha": "880c1b3fd060ffa9f1b17942b046f271c948bc2c",
+            "created": "0001-01-01T00:00:00Z"
+          }
+        ],
+        "files": null,
+        "stats": {
+          "total": 3,
+          "additions": 3,
+          "deletions": 0
+        }
+      },
+      {
+        "url": "https://gitea.example.test/api/v1/repos/acme/infra/git/commits/880c1b3fd060ffa9f1b17942b046f271c948bc2c",
+        "sha": "880c1b3fd060ffa9f1b17942b046f271c948bc2c",
+        "created": "2026-10-04T10:20:38-04:00",
+        "html_url": "https://gitea.example.test/acme/infra/commit/880c1b3fd060ffa9f1b17942b046f271c948bc2c",
+        "commit": {
+          "url": "https://gitea.example.test/api/v1/repos/acme/infra/git/commits/880c1b3fd060ffa9f1b17942b046f271c948bc2c",
+          "author": {
+            "name": "ka",
+            "email": "ka@example.test",
+            "date": "2026-10-04T10:20:38-04:00"
+          },
+          "committer": {
+            "name": "ka",
+            "email": "ka@example.test",
+            "date": "2026-10-04T10:20:38-04:00"
+          },
+          "message": "add one.txt\n",
+          "tree": {
+            "url": "https://gitea.example.test/api/v1/repos/acme/infra/git/trees/880c1b3fd060ffa9f1b17942b046f271c948bc2c",
+            "sha": "880c1b3fd060ffa9f1b17942b046f271c948bc2c",
+            "created": "2026-10-04T10:20:38-04:00"
+          },
+          "verification": null
+        },
+        "author": null,
+        "committer": null,
+        "parents": [
+          {
+            "url": "https://gitea.example.test/api/v1/repos/acme/infra/git/commits/e23e22aa8f36faf6bd6140d53f8823cf3aa4fc17",
+            "sha": "e23e22aa8f36faf6bd6140d53f8823cf3aa4fc17",
+            "created": "0001-01-01T00:00:00Z"
+          }
+        ],
+        "files": null,
+        "stats": {
+          "total": 1,
+          "additions": 1,
+          "deletions": 0
+        }
+      }
+    ]
+  ]
+}

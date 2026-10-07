@@ -1661,6 +1661,7 @@ func TestExtraVolumeMountsCannotNameTheBrokersVolumes(t *testing.T) {
 		"credential-proxy-policy",
 		"credential-proxy-runtime",
 		"credential-proxy-ksa-token",
+		"forge-token-0",
 	} {
 		t.Run(name, func(t *testing.T) {
 			agent := federatedTestAgent()
@@ -1677,6 +1678,159 @@ func TestExtraVolumeMountsCannotNameTheBrokersVolumes(t *testing.T) {
 				t.Errorf("the degraded message must name the offending volume; got %q", msg)
 			}
 		})
+	}
+
+	t.Run("extraVolumes or sidecarVolumes mounting a forge credentialsRef Secret", func(t *testing.T) {
+		for _, tc := range []struct {
+			name string
+			dep  *agentv1alpha1.DeploymentSpec
+		}{
+			{
+				name: "extraVolumes secret",
+				dep: &agentv1alpha1.DeploymentSpec{
+					ExtraVolumes: []corev1.Volume{{
+						Name:         "custom-gitea",
+						VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{SecretName: "gitea-token"}},
+					}},
+				},
+			},
+			{
+				name: "sidecarVolumes projected secret",
+				dep: &agentv1alpha1.DeploymentSpec{
+					SidecarVolumes: []corev1.Volume{{
+						Name: "custom-gitea-projected",
+						VolumeSource: corev1.VolumeSource{Projected: &corev1.ProjectedVolumeSource{
+							Sources: []corev1.VolumeProjection{{Secret: &corev1.SecretProjection{
+								LocalObjectReference: corev1.LocalObjectReference{Name: "gitea-token"},
+							}}},
+						}},
+					}},
+				},
+			},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				agent := federatedTestAgent()
+				agent.Spec.Integration = &agentv1alpha1.PlatformAgentIntegrationSpec{
+					IntegrationSpec: agentv1alpha1.IntegrationSpec{
+						Forges: []agentv1alpha1.ForgeSpec{{
+							Name:           "gitea",
+							Provider:       agentv1alpha1.GitProviderGitea,
+							Host:           "gitea.example.com",
+							CredentialsRef: &corev1.LocalObjectReference{Name: "gitea-token"},
+						}},
+					},
+				}
+				agent.Spec.Deployment = tc.dep
+				msg := validateExtraVolumeMounts(agent)
+				if msg == "" || !strings.Contains(msg, "gitea-token") {
+					t.Fatalf("expected validateExtraVolumeMounts to reject Secret gitea-token, got %q", msg)
+				}
+			})
+		}
+	})
+}
+
+func TestCredentialProxyMountsSelfManagedForgeTokens(t *testing.T) {
+	agent := federatedTestAgent()
+	agent.Spec.Integration = &agentv1alpha1.PlatformAgentIntegrationSpec{
+		IntegrationSpec: agentv1alpha1.IntegrationSpec{
+			Forges: []agentv1alpha1.ForgeSpec{
+				{
+					Name:      "github",
+					Provider:  agentv1alpha1.GitProviderGitHub,
+					Namespace: "gke-labs",
+				},
+				{
+					Name:           "gitea",
+					Provider:       agentv1alpha1.GitProviderGitea,
+					Host:           "Gitea.Gitea.svc.cluster.local",
+					Scheme:         agentv1alpha1.ForgeSchemeHTTP,
+					Port:           3000,
+					CredentialsRef: &corev1.LocalObjectReference{Name: "gitea-token"},
+				},
+			},
+		},
+	}
+	agent.Spec.Deployment = &agentv1alpha1.DeploymentSpec{
+		Env: []corev1.EnvVar{
+			{Name: credentialProxyForgesEnv, Value: "[]"},
+			{Name: "VCS_FORGES_CONFIG", Value: "/tmp/evil.json"},
+		},
+	}
+
+	container := buildCredentialProxyContainer(agent)
+	var forgesEnv string
+	for _, e := range container.Env {
+		if e.Name == credentialProxyForgesEnv {
+			forgesEnv = e.Value
+		}
+		if e.Name == "VCS_FORGES_CONFIG" {
+			t.Fatalf("VCS_FORGES_CONFIG must be reserved and dropped from the credential proxy env, got %q", e.Value)
+		}
+	}
+	wantEnv := `[{"name":"github","provider":"github","host":"github.com","scheme":"https"},{"name":"gitea","provider":"gitea","host":"gitea.gitea.svc.cluster.local","scheme":"http","port":3000,"tokenFile":"/var/run/secrets/kubeagents/forges/gitea/token"}]`
+	if forgesEnv != wantEnv {
+		t.Errorf("CREDENTIAL_PROXY_FORGES = %s, want %s", forgesEnv, wantEnv)
+	}
+
+	var mount *corev1.VolumeMount
+	for i := range container.VolumeMounts {
+		if container.VolumeMounts[i].Name == "forge-token-1" {
+			mount = &container.VolumeMounts[i]
+		}
+	}
+	if mount == nil || !mount.ReadOnly || mount.MountPath != "/var/run/secrets/kubeagents/forges/gitea" {
+		t.Fatalf("expected read-only mount forge-token-1 at /var/run/secrets/kubeagents/forges/gitea, got %+v", mount)
+	}
+
+	volumes := buildCredentialProxyRuntimeVolumes(agent)
+	var vol *corev1.Volume
+	for i := range volumes {
+		if volumes[i].Name == "forge-token-1" {
+			vol = &volumes[i]
+		}
+	}
+	if vol == nil || vol.Projected == nil || len(vol.Projected.Sources) != 1 || vol.Projected.Sources[0].Secret == nil {
+		t.Fatalf("expected projected secret volume forge-token-1, got %+v", vol)
+	}
+	sec := vol.Projected.Sources[0].Secret
+	if sec.Name != "gitea-token" || len(sec.Items) != 1 || sec.Items[0].Key != "token" || sec.Items[0].Path != "token" {
+		t.Errorf("unexpected secret projection: %+v", sec)
+	}
+
+	// Gateway pod must never mount the forge token volume.
+	gatewayPod := buildPodTemplateSpec(agent, "", "", "", "", nil, renderOptions{}).Spec
+	for _, v := range gatewayPod.Volumes {
+		if isForgeCredentialVolume(v.Name) {
+			t.Errorf("gateway pod must not carry forge credential volume %q", v.Name)
+		}
+	}
+}
+
+func TestSameManagedRepoMatchesSelfManagedGiteaEntries(t *testing.T) {
+	seeded := agentv1alpha1.ManagedRepoEntry{
+		Type: agentv1alpha1.GitProviderGitea,
+		URL:  "http://gitea.gitea.svc.cluster.local:3000/platform-team/gitops",
+	}
+	for _, match := range []string{
+		"http://gitea.gitea.svc.cluster.local:3000/platform-team/gitops",
+		"http://gitea.gitea.svc.cluster.local:3000/platform-team/gitops.git",
+		"https://gitea.gitea.svc.cluster.local/platform-team/gitops.git",
+		"git@gitea.gitea.svc.cluster.local:platform-team/gitops.git",
+	} {
+		existing := agentv1alpha1.ManagedRepoEntry{Type: agentv1alpha1.GitProviderGitea, URL: match}
+		if !sameManagedRepo(existing, seeded) {
+			t.Errorf("sameManagedRepo(%q, %q) = false, want true", match, seeded.URL)
+		}
+	}
+	for _, different := range []string{
+		"http://other.gitea.svc.cluster.local:3000/platform-team/gitops",
+		"http://gitea.gitea.svc.cluster.local:3000/platform-team/other",
+	} {
+		existing := agentv1alpha1.ManagedRepoEntry{Type: agentv1alpha1.GitProviderGitea, URL: different}
+		if sameManagedRepo(existing, seeded) {
+			t.Errorf("sameManagedRepo(%q, %q) = true, want false", different, seeded.URL)
+		}
 	}
 }
 

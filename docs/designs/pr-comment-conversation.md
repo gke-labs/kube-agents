@@ -319,6 +319,13 @@ No new cron job and no new script: the watcher from §2 grows a `pr_comments` en
 reusing its repo resolution, its credential check, its per-sweep isolation, and its card filing. Everything
 deterministic lives here, so an idle tick still costs no model at all.
 
+The sweep covers every repository the workspace declares on a forge it can sweep — GitHub and
+Gitea — through `gitops_workspace.get_managed_forge_repos()`, not only the GitHub ones. A GitHub
+repository is named by its `owner/name` slug; any other is named host-qualified, `host/owner/name`,
+so the provider registry resolves it to its own forge, and its card says which forge it is on and to
+pass that name as `--repo`. The fork check compares the head repository with the forge's
+`owner/name` path, not the host-qualified name.
+
 - **Scope.** Open pull requests that satisfy all three of: authored by the account the credential
   authenticates as, a head branch starting with `platform-agent/` — written in code only by
   `audit_report.group_branch_for`, and instructed rather than enforced for `submit-suggestion`,

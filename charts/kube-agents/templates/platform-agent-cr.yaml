@@ -403,6 +403,12 @@ spec:
         {{- with .host }}
         host: {{ . | quote }}
         {{- end }}
+        {{- with .scheme }}
+        scheme: {{ . | quote }}
+        {{- end }}
+        {{- with .port }}
+        port: {{ . | int }}
+        {{- end }}
         {{- with .namespace }}
         namespace: {{ . | quote }}
         {{- end }}

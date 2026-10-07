@@ -601,12 +601,17 @@ this, and the minter guard is the reason it has to be one answer.
 It also carries the checks the chart can make before the API server does, so
 the failure names the values key: the two spellings are exclusive, forge names
 are unique, a provider must be registered, a GitHub forge's host must be one GitHub serves and its
-namespace a GitHub organisation or user name, and a repository must name a
+namespace a GitHub organisation or user name, a self-managed forge (gitea) must
+name its host and credentialsRef, only a self-managed forge may declare a port or plain http, and a repository must name a
 declared forge, be neither empty nor the alias's `None`, and be qualified by a
 namespace if it is a bare name; and at most one repository has role gitops. The namespace checks matter beyond the error
 text: a single-forge declaration renders as the alias, so without them the
 refusal would name `github.org` or `github.gitRepo`, keys the values file never
 set.
+
+A self-managed forge has no fixed host list: the host it serves is the one its
+declaration names, so the "host and no repository" test below compares a
+repository against that host rather than against GitHub's spellings.
 
 Renders the empty string when no forge is declared at all, which is a valid
 install: repositories can be registered in the gitops-state ConfigMap later.
@@ -615,12 +620,16 @@ declares nothing -- reading it as a declaration would make it collide with the
 `forges` list that replaces it, which is the migration every install has to
 make.
 
-The provider list mirrors the CRD's enum on ForgeSpec.Provider, and the host
-list mirrors githubHosts, both in k8s-operator/api/v1alpha1.
+The provider list mirrors the CRD's enum on ForgeSpec.Provider, the
+self-managed list mirrors the providers with SelfManaged set, and the host
+list mirrors githubHosts, all in k8s-operator/api/v1alpha1.
 */}}
 {{- define "kube-agents.forgeProviders" -}}
-{{- $registered := list "github" -}}
+{{- $registered := list "github" "gitea" -}}
+{{- $selfManaged := list "gitea" -}}
+{{- $defaultScheme := "https" -}}
 {{- $githubHosts := list "github.com" "www.github.com" "ssh.github.com" -}}
+{{- $reservedHosted := list "github.com" "www.github.com" "ssh.github.com" "gitlab.com" "www.gitlab.com" -}}
 {{- $integ := .Values.platformAgent.integration -}}
 {{- $forges := $integ.forges | default list -}}
 {{- $repos := $integ.repositories | default list -}}
@@ -633,6 +642,8 @@ list mirrors githubHosts, both in k8s-operator/api/v1alpha1.
 {{- $names := list -}}
 {{- $providers := list -}}
 {{- $namespaces := dict -}}
+{{- $forgeHosts := dict -}}
+{{- $selfManagedHosts := dict -}}
 {{- range $i, $f := $forges -}}
 {{- if not $f.name -}}
 {{- fail (printf "platformAgent.integration.forges[%d].name is required" $i) -}}
@@ -648,6 +659,35 @@ list mirrors githubHosts, both in k8s-operator/api/v1alpha1.
 {{- /* ASCII only before `lower`, which is Unicode: `gİthub.com` lowers to github.com, and the operator folds ASCII only, so it is another host. */ -}}
 {{- if and (eq $provider "github") $host (not (and (regexMatch "^[A-Za-z0-9.-]+$" $host) (has (lower $host) $githubHosts))) -}}
 {{- fail (printf "platformAgent.integration.forges[%d].host is %q, which provider github does not serve" $i $f.host) -}}
+{{- end -}}
+{{- $isSelfManaged := has $provider $selfManaged -}}
+{{- if and $isSelfManaged (not $host) -}}
+{{- fail (printf "platformAgent.integration.forges[%d].host is required: provider %s is self-managed and has no default host" $i $provider) -}}
+{{- end -}}
+{{- if and $isSelfManaged (has (lower $host) $reservedHosted) -}}
+{{- fail (printf "platformAgent.integration.forges[%d].host is %q, which is a hosted SaaS domain and cannot be targeted by self-managed provider %s" $i $f.host $provider) -}}
+{{- end -}}
+{{- if and $isSelfManaged (not ($f.credentialsRef | default dict).name) -}}
+{{- fail (printf "platformAgent.integration.forges[%d].credentialsRef.name is required: provider %s is self-managed and requires an API token Secret" $i $provider) -}}
+{{- end -}}
+{{- if and $f.port (not $isSelfManaged) -}}
+{{- fail (printf "platformAgent.integration.forges[%d].port is set, but provider %s serves fixed endpoints" $i $provider) -}}
+{{- end -}}
+{{- if and $f.scheme (ne $f.scheme $defaultScheme) (not $isSelfManaged) -}}
+{{- fail (printf "platformAgent.integration.forges[%d].scheme is %q, but provider %s is %s only" $i $f.scheme $provider $defaultScheme) -}}
+{{- end -}}
+{{- if $isSelfManaged -}}
+{{- $canonHost := lower $host -}}
+{{- if $f.port -}}
+{{- $canonHost = printf "%s:%d" $canonHost (int $f.port) -}}
+{{- end -}}
+{{- if hasKey $selfManagedHosts $canonHost -}}
+{{- fail (printf "platformAgent.integration.forges[%d].host %q duplicates forge %q; self-managed forge hosts must be unique" $i $canonHost (get $selfManagedHosts $canonHost)) -}}
+{{- end -}}
+{{- $_ := set $selfManagedHosts $canonHost $f.name -}}
+{{- $_ := set $forgeHosts $f.name (list (lower $host)) -}}
+{{- else -}}
+{{- $_ := set $forgeHosts $f.name $githubHosts -}}
 {{- end -}}
 {{- $namespace := $f.namespace | default "" -}}
 {{- if and (eq $provider "github") $namespace (not (regexMatch "^[a-zA-Z0-9]([a-zA-Z0-9-]{0,37}[a-zA-Z0-9])?$" $namespace)) -}}
@@ -681,8 +721,8 @@ list mirrors githubHosts, both in k8s-operator/api/v1alpha1.
 {{- if and $name (not (hasSuffix "/" $name)) -}}
 {{- $trimmed = trimAll "/" $name -}}
 {{- end -}}
-{{- /* A GitHub host followed only by `/` names no repository, which a namespace would not fix; the operator refuses it against this entry. */ -}}
-{{- $hostOnly := and (hasSuffix "/" $repository) (regexMatch "^[A-Za-z0-9./-]+$" $repository) (has (lower (trimAll "/" $repository)) $githubHosts) -}}
+{{- /* A forge's own host followed only by `/` names no repository, which a namespace would not fix; the operator refuses it against this entry. */ -}}
+{{- $hostOnly := and (hasSuffix "/" $repository) (regexMatch "^[A-Za-z0-9./-]+$" $repository) (has (lower (trimAll "/" $repository)) (get $forgeHosts $r.forge)) -}}
 {{- if and (not (contains "/" $trimmed)) (not (contains ":" $repository)) (not $hostOnly) (not $r.namespace) (not (get $namespaces $r.forge)) -}}
 {{- fail (printf "platformAgent.integration.repositories[%d].repository is %q, a bare name, but neither the entry nor forge %q declares a namespace to qualify it" $i $repository $r.forge) -}}
 {{- end -}}

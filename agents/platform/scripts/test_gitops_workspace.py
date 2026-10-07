@@ -1582,5 +1582,54 @@ def seed_empty_origin(tmp_path: Path, branch: str = "main") -> Path:
     return origin
 
 
+class TestManagedForgeRepos(unittest.TestCase):
+    """`get_managed_forge_repos`: every forge the broker serves, named for it."""
+
+    ENTRIES = [
+        {"type": "github", "url": "https://github.com/acme/live"},
+        {"type": "gitea", "url": "http://gitea-http.gitea.svc.cluster.local:3000/demo/gke-fleet-iac"},
+        {"type": "gitea", "url": "https://gitea-http.gitea.svc.cluster.local/demo/gke-fleet-iac.git"},
+        {"type": "gitlab", "url": "https://gitlab.example/group/proj"},
+        {"type": "gitea", "url": "demo/no-host"},
+        {"type": "github", "url": "https://gitlab.example/not/github"},
+    ]
+
+    def entries(self):
+        with patch.object(gitops_workspace, "get_managed_repo_entries", return_value=self.ENTRIES):
+            return gitops_workspace.get_managed_forge_repos()
+
+    def test_github_keeps_its_slug_and_gitea_is_host_qualified(self):
+        self.assertEqual(
+            self.entries(),
+            [
+                {"type": "github", "repo": "acme/live", "path": "acme/live"},
+                {
+                    "type": "gitea",
+                    "repo": "gitea-http.gitea.svc.cluster.local/demo/gke-fleet-iac",
+                    "path": "demo/gke-fleet-iac",
+                },
+            ],
+        )
+
+    def test_unserved_types_and_hostless_entries_are_skipped_with_a_warning(self):
+        with self.assertLogs(gitops_workspace.LOGGER, level="WARNING") as logs:
+            self.entries()
+        joined = "\n".join(logs.output)
+        self.assertIn("gitlab", joined)
+        self.assertIn("demo/no-host", joined)
+        self.assertIn("not a GitHub repository URL", joined)
+
+    def test_managed_forge_repo_matches_exactly(self):
+        with patch.object(gitops_workspace, "get_managed_repo_entries", return_value=self.ENTRIES):
+            found = gitops_workspace.managed_forge_repo("gitea-http.gitea.svc.cluster.local/demo/gke-fleet-iac")
+            self.assertEqual(found["path"], "demo/gke-fleet-iac")
+            self.assertIsNone(gitops_workspace.managed_forge_repo("gitea-http.gitea.svc.cluster.local/demo/other"))
+            self.assertIsNone(gitops_workspace.managed_forge_repo("demo/gke-fleet-iac"))
+
+    def test_the_github_list_is_unchanged(self):
+        with patch.object(gitops_workspace, "get_managed_repo_entries", return_value=self.ENTRIES):
+            self.assertEqual(gitops_workspace.get_managed_github_repos(), ["acme/live"])
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

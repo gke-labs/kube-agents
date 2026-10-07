@@ -84,6 +84,11 @@ CONTEXT_MAX_BODY_CHARS = 4000
 CONTEXT_MAX_REQUEST_CHARS = pr_triggers.MAX_REQUEST_CHARS
 CONTEXT_MAX_REQUESTS = 10
 
+# The fewest path segments a host-qualified repository has: `host/owner/name`.
+# A GitHub slug has two, so a name this short is never looked up in the
+# managed-forge list, and a malformed `--repo` never costs a state read.
+HOST_QUALIFIED_MIN_SEGMENTS = 3
+
 
 def _fail(message: str):
     print(f"Error: {message}", file=sys.stderr)
@@ -91,16 +96,62 @@ def _fail(message: str):
 
 
 def validate_repo(repo: str) -> str:
-    """Ensure repo is formatted as owner/name and is in the managed repos allowlist if configured."""
-    from gitops_workspace import get_managed_github_repos, is_valid_repo_slug, validate_repo_org
+    """Ensure repo names a managed repository, as the sweep's card spells it.
+
+    A GitHub repository is an `owner/name` slug, checked as it always was. A
+    repository on another forge the broker serves is host-qualified
+    (`host/owner/name`), and is accepted only when it is exactly the name
+    `get_managed_forge_repos` gives a managed entry: that list is the
+    allowlist, so a reviewer's comment cannot point a reply at a repository
+    nobody registered.
+    """
+    from gitops_workspace import (
+        GITHUB_REPO_TYPE,
+        get_managed_github_repos,
+        is_valid_repo_slug,
+        managed_forge_repo,
+        validate_repo_org,
+    )
+    if _host_qualified(repo):
+        entry = managed_forge_repo(repo)
+        if entry is not None and entry["type"] != GITHUB_REPO_TYPE:
+            return repo
     if not repo or not is_valid_repo_slug(repo):
-        raise ValueError(f"Invalid repository format: {repo!r}. Expected 'owner/name'.")
+        raise ValueError(
+            f"Invalid repository format: {repo!r}. Expected 'owner/name', or "
+            "'host/owner/name' for a managed repository on another forge."
+        )
     managed = get_managed_github_repos()
     if managed and repo not in managed:
         raise ValueError(
             f"Repository {repo!r} is not in the managed repositories list: {managed}"
         )
     return validate_repo_org(repo)
+
+
+def _host_qualified(repo: str) -> bool:
+    """Whether `repo` has the `host/owner/name` shape a non-GitHub entry takes."""
+    import repo_ref
+    ref = repo_ref.try_parse(repo)
+    return ref is not None and len(ref.segments) >= HOST_QUALIFIED_MIN_SEGMENTS
+
+
+def _forge_path(repo: str) -> str:
+    """`repo` as its forge spells it, for `forge.is_agent_pull_request`.
+
+    The managed entry's `path` for a host-qualified repository, and empty for
+    a GitHub slug, which is already the forge's spelling. Empty, too, when the
+    list cannot be read: the ownership check then compares against `repo` and
+    refuses a host-qualified one, which is the safe direction.
+    """
+    if not _host_qualified(repo):
+        return ""
+    from gitops_workspace import managed_forge_repo
+    try:
+        entry = managed_forge_repo(repo)
+    except Exception:
+        return ""
+    return entry["path"] if entry else ""
 
 
 def _resolve_repo(args=None) -> str:
@@ -130,7 +181,7 @@ def _find_pr(provider, repo: str, number: int, viewer: str):
     for pr in provider.list_open_prs(repo):
         if pr.number != number:
             continue
-        if not forge.is_agent_pull_request(pr, repo, viewer):
+        if not forge.is_agent_pull_request(pr, repo, viewer, path=_forge_path(repo)):
             _fail(f"{repo}#{number} is not one of this agent's pull requests.")
         if pr.is_ignored:
             _fail(
@@ -298,11 +349,16 @@ def handle_poll(args) -> int:
     operator-facing glossary covers both halves of the watcher.
     """
     try:
-        from gitops_workspace import get_managed_github_repos
+        from gitops_workspace import get_managed_forge_repos
         if getattr(args, "repo", None):
             repos = [validate_repo(args.repo)]
+            paths = {repos[0]: _forge_path(repos[0])}
         else:
-            repos = get_managed_github_repos()
+            # Every forge the broker serves, as the sweep reads them, so a
+            # bare `poll` finds the requests the sweep filed cards for.
+            entries = get_managed_forge_repos()
+            repos = [entry["repo"] for entry in entries]
+            paths = {entry["repo"]: entry["path"] for entry in entries}
     except ValueError as error:
         print(json.dumps({"status": "ERROR", "reason": "INVALID_REPOSITORY", "value": str(error)}))
         return 0
@@ -350,7 +406,7 @@ def handle_poll(args) -> int:
                     nameless.append(r)
                     continue
                 for pr in provider.list_open_prs(r):
-                    if forge.is_agent_pull_request(pr, r, viewer) and not pr.is_ignored:
+                    if forge.is_agent_pull_request(pr, r, viewer, path=paths.get(r, "")) and not pr.is_ignored:
                         if not args.pr or pr.number == args.pr:
                             prs.append((r, pr))
             except forge.ForgeError as error:

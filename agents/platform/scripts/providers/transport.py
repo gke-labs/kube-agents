@@ -406,8 +406,10 @@ class HttpTransport:
         whoami_route: tuple[str, str] | None = None,
         opener: Callable[..., Any] | None = None,
         outer_deadline: Callable[[], float | None] | None = None,
+        allow_http: bool = False,
     ) -> None:
-        if not base_url.startswith("https://"):
+        allowed_schemes = ("https://", "http://") if allow_http else ("https://",)
+        if not base_url.startswith(allowed_schemes):
             raise ValueError("a forge API is reached over https only")
         self._base = base_url.rstrip("/")
         self._headers = headers
