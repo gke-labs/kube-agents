@@ -3720,6 +3720,8 @@ _CONTROLLER_NODE_TAINT_KEYS = {
     "node.cloudprovider.kubernetes.io/uninitialized",
 }
 
+_AUDITABLE_NODE_POOL_STATUSES = frozenset({"RUNNING", "RUNNING_WITH_ERROR", "RECONCILING"})
+
 
 def _normalize_taint_effect(effect: str | None) -> str:
     return (effect or "").upper().replace("_", "")
@@ -3847,18 +3849,11 @@ def check_untargeted_compute_class_workload(workload: dict, context: dict) -> di
 
     def _pool_is_active_capacity(p: dict) -> bool:
         status = p.get("status", "RUNNING")
-        if status not in AUDITABLE_STATUSES:
+        if status not in _AUDITABLE_NODE_POOL_STATUSES:
             return False
         autoscaling = p.get("autoscaling")
         if autoscaling and autoscaling.get("enabled"):
             return True
-        if context.get("nodes"):
-            return any(
-                (n.get("metadata", {}).get("labels") or {}).get("cloud.google.com/gke-nodepool") == p.get("name")
-                for n in context["nodes"]
-            )
-        if "currentNodeCount" in p:
-            return p["currentNodeCount"] > 0
         if "initialNodeCount" in p:
             return p["initialNodeCount"] > 0
         if autoscaling is not None and not autoscaling.get("enabled"):
@@ -3930,6 +3925,10 @@ def check_untargeted_compute_class_workload(workload: dict, context: dict) -> di
         "kubernetes.io/arch",
     })
 
+    known_pool_label_keys = set(_GKE_KNOWN_POOL_LABEL_KEYS)
+    for p in node_pools:
+        known_pool_label_keys.update(((p.get("config") or {}).get("labels") or {}).keys())
+
     def _pool_effective_labels(p: dict) -> dict[str, str]:
         config = p.get("config") or {}
         labels = dict(config.get("labels") or {})
@@ -3947,18 +3946,23 @@ def check_untargeted_compute_class_workload(workload: dict, context: dict) -> di
             labels["cloud.google.com/gke-preemptible"] = "true"
         elif "preemptible" in config:
             labels["cloud.google.com/gke-preemptible"] = "false"
-        machine_type = config.get("machineType")
+        machine_type = config.get("machineType") or ""
         if machine_type:
             labels["node.kubernetes.io/instance-type"] = machine_type
-            family = machine_type.split("-")[0]
+            family = machine_type.split("-")[0].lower()
             labels["cloud.google.com/machine-family"] = family
-        os_name = config.get("operatingSystem") or "linux"
-        labels["kubernetes.io/os"] = os_name
-        arch = config.get("architecture")
-        if not arch and machine_type:
-            arch = "arm64" if "arm" in machine_type.lower() or machine_type.startswith("t2a-") else "amd64"
-        if arch:
-            labels["kubernetes.io/arch"] = arch
+            if family in ("t2a", "c4a", "n4a") or "arm" in family:
+                labels["kubernetes.io/arch"] = "arm64"
+            elif family in (
+                "n1", "n2", "n2d", "c2", "c2d", "c3", "c3d",
+                "m1", "m2", "m3", "a2", "a3", "g2", "e2"
+            ):
+                labels["kubernetes.io/arch"] = "amd64"
+        image_type = (config.get("imageType") or "").upper()
+        if image_type.startswith("WINDOWS"):
+            labels["kubernetes.io/os"] = "windows"
+        elif image_type or "imageType" in config or not config.get("operatingSystem"):
+            labels["kubernetes.io/os"] = "linux"
         return labels
 
     def _pool_matches_selector(pool: dict, selector: dict[str, str]) -> bool | None:
@@ -3977,28 +3981,106 @@ def check_untargeted_compute_class_workload(workload: dict, context: dict) -> di
                         return False
                 else:
                     has_unknown = True
-            elif k in _GKE_KNOWN_POOL_LABEL_KEYS:
+            elif k in known_pool_label_keys:
                 return False
             else:
                 has_unknown = True
         return None if has_unknown else True
 
+    def _pool_matches_node_affinity(pool: dict, node_affinity: dict) -> bool | None:
+        required = node_affinity.get("requiredDuringSchedulingIgnoredDuringExecution") or {}
+        terms = required.get("nodeSelectorTerms") or []
+        if not terms:
+            return True
+        effective_labels = _pool_effective_labels(pool)
+        locations = pool.get("locations") or []
+        term_results: list[bool | None] = []
+        for term in terms:
+            exprs = term.get("matchExpressions") or []
+            term_match = True
+            term_unknown = False
+            for expr in exprs:
+                k = expr.get("key")
+                op = expr.get("operator")
+                vals = set(expr.get("values") or [])
+                pool_val = effective_labels.get(k)
+                if op == "In":
+                    if k in effective_labels:
+                        if pool_val not in vals:
+                            term_match = False
+                            break
+                    elif k in ("topology.kubernetes.io/zone", "topology.gke.io/zone"):
+                        if locations and not any(loc in vals for loc in locations):
+                            term_match = False
+                            break
+                        elif not locations:
+                            term_unknown = True
+                    elif k in known_pool_label_keys:
+                        term_match = False
+                        break
+                    else:
+                        term_unknown = True
+                elif op == "NotIn":
+                    if k in effective_labels:
+                        if pool_val in vals:
+                            term_match = False
+                            break
+                    elif k in ("topology.kubernetes.io/zone", "topology.gke.io/zone"):
+                        if locations and all(loc in vals for loc in locations):
+                            term_match = False
+                            break
+                elif op == "Exists":
+                    if k in effective_labels:
+                        pass
+                    elif k in known_pool_label_keys:
+                        term_match = False
+                        break
+                    else:
+                        term_unknown = True
+                elif op == "DoesNotExist":
+                    if k in effective_labels:
+                        term_match = False
+                        break
+            if not term_match:
+                term_results.append(False)
+            elif term_unknown:
+                term_results.append(None)
+            else:
+                term_results.append(True)
+        if any(res is True for res in term_results):
+            return True
+        if any(res is None for res in term_results):
+            return None
+        return False
+
+    def _pool_matches_placement(pool: dict) -> bool | None:
+        sel_match = _pool_matches_selector(pool, node_selector)
+        if sel_match is False:
+            return False
+        aff_match = _pool_matches_node_affinity(pool, node_affinity)
+        if aff_match is False:
+            return False
+        if sel_match is None or aff_match is None:
+            return None
+        return True
+
     # If the workload can schedule on any non-ComputeClass pool with active capacity, non-CC capacity is available
     if non_cc_pools and any(
-        _pool_matches_selector(p, node_selector) is not False and _tolerates_pool(pod_tolerations, p)
+        _pool_matches_placement(p) is not False and _tolerates_pool(pod_tolerations, p)
         for p in non_cc_pools
     ):
         return None
 
     # Treat selector keys the inventory cannot resolve as unknown; do not manufacture a false major
-    if any(_pool_matches_selector(p, node_selector) is None for p in node_pools):
+    active_candidate_pools = [p for p in node_pools if _pool_is_active_capacity(p)]
+    if any(_pool_matches_placement(p) is None for p in active_candidate_pools):
         return None
 
     # Workload-conditional ComputeClass determination:
     schedulable_pools = [
         p for p in node_pools
         if _pool_is_active_capacity(p)
-        and _pool_matches_selector(p, node_selector) is True
+        and _pool_matches_placement(p) is True
         and _tolerates_pool(pod_tolerations, p)
     ]
     if not schedulable_pools:

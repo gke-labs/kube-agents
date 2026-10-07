@@ -37,13 +37,17 @@ def node(name, labels=None, taints=None):
     }
 
 
-def pool(name, labels=None, taints=None, autoscaling=None):
+def pool(name, labels=None, taints=None, autoscaling=None, status="RUNNING", machine_type=None, image_type=None):
     config = {}
     if labels is not None:
         config["labels"] = labels
     if taints is not None:
         config["taints"] = taints
-    res = {"name": name, "config": config}
+    if machine_type is not None:
+        config["machineType"] = machine_type
+    if image_type is not None:
+        config["imageType"] = image_type
+    res = {"name": name, "status": status, "config": config}
     if autoscaling is not None:
         res["autoscaling"] = autoscaling
     return res
@@ -305,7 +309,7 @@ class TestUntargetedComputeClassWorkload(unittest.TestCase):
                             {
                                 "key": "cloud.google.com/compute-class",
                                 "operator": "NotIn",
-                                "values": ["standard-cc"],
+                                "values": ["other-cc"],
                             }
                         ]
                     }
@@ -351,7 +355,7 @@ class TestUntargetedComputeClassWorkload(unittest.TestCase):
                     {
                         "matchExpressions": [
                             {
-                                "key": "cloud.google.com/compute-class",
+                                "key": "cloud.google.com/gke-spot",
                                 "operator": "DoesNotExist",
                             }
                         ]
@@ -827,6 +831,105 @@ class TestUntargetedComputeClassWorkload(unittest.TestCase):
                 # A failure on node-pools list does not gate-fail the cluster; it sets unevaluated
                 self.assertIn("untargeted-compute-class-workload", cc_context.context.get("unevaluated", {}))
                 self.assertNotIn("untargeted-compute-class-workload", cc_context.commands)
+
+    def test_non_cc_pool_in_running_with_error_clears_cluster_capacity(self):
+        # A pool in RUNNING_WITH_ERROR provides active capacity, clearing untargeted workloads
+        cc_pool = pool("cc-pool", labels={"cloud.google.com/compute-class": "standard-cc"})
+        err_pool = pool("err-pool", status="RUNNING_WITH_ERROR", labels={})
+        wl = collect.normalize_workloads({"items": [deployment("api")]})[0]
+        ctx = {
+            "compute_classes": [self.cc],
+            "node_pools": [cc_pool, err_pool],
+            "namespaces": [self.ns],
+        }
+        hit = collect.check_untargeted_compute_class_workload(wl, ctx)
+        self.assertIsNone(hit)
+
+    def test_workload_selecting_user_label_present_on_one_pool_and_absent_on_another_flags_matching_pool(self):
+        # When a user label is present on one pool and absent on another, the absent pool is a definite mismatch,
+        # not an unknown key, allowing the matching pool to be flagged with single_compute_class.
+        base_pool = pool("base", labels={"cloud.google.com/compute-class": "base", "workload-tier": "web"})
+        gpu_pool = pool("gpu", labels={}, taints=[{"key": "nvidia.com/gpu", "value": "present", "effect": "NO_SCHEDULE"}])
+        cc_base = compute_class("base")
+        wl = collect.normalize_workloads({
+            "items": [deployment("web", node_selector={"workload-tier": "web"})]
+        })[0]
+        ctx = {
+            "compute_classes": [cc_base],
+            "node_pools": [base_pool, gpu_pool],
+            "namespaces": [self.ns],
+        }
+        hit = collect.check_untargeted_compute_class_workload(wl, ctx)
+        self.assertIsNotNone(hit)
+        self.assertEqual(hit["single_compute_class"], "base")
+
+    def test_workload_pinned_by_required_node_affinity_resolves_to_pinned_compute_class(self):
+        # Required nodeAffinity pointing at a specific pool resolves single_compute_class
+        base_pool = pool("base-pool", labels={"cloud.google.com/compute-class": "base"})
+        batch_pool = pool(
+            "batch-pool",
+            labels={"cloud.google.com/compute-class": "batch"},
+            taints=[{"key": "cloud.google.com/compute-class", "value": "batch", "effect": "NO_SCHEDULE"}],
+        )
+        cc_base = compute_class("base")
+        cc_batch = compute_class("batch")
+        affinity = {
+            "requiredDuringSchedulingIgnoredDuringExecution": {
+                "nodeSelectorTerms": [
+                    {
+                        "matchExpressions": [
+                            {
+                                "key": "cloud.google.com/gke-nodepool",
+                                "operator": "In",
+                                "values": ["batch-pool"],
+                            }
+                        ]
+                    }
+                ]
+            }
+        }
+        tolerations = [{"key": "cloud.google.com/compute-class", "value": "batch", "operator": "Equal"}]
+        wl = collect.normalize_workloads({
+            "items": [deployment("batch-job", node_affinity=affinity, tolerations=tolerations)]
+        })[0]
+        ctx = {
+            "compute_classes": [cc_base, cc_batch],
+            "node_pools": [base_pool, batch_pool],
+            "namespaces": [self.ns],
+        }
+        hit = collect.check_untargeted_compute_class_workload(wl, ctx)
+        self.assertIsNotNone(hit)
+        self.assertEqual(hit["single_compute_class"], "batch")
+
+    def test_workload_selecting_arm64_on_axion_pool_is_flagged_with_matching_class(self):
+        axion_pool = pool("axion-pool", machine_type="c4a-standard-4", labels={"cloud.google.com/compute-class": "axion-cc"})
+        cc_axion = compute_class("axion-cc")
+        wl = collect.normalize_workloads({
+            "items": [deployment("arm-api", node_selector={"kubernetes.io/arch": "arm64"})]
+        })[0]
+        ctx = {
+            "compute_classes": [cc_axion],
+            "node_pools": [axion_pool],
+            "namespaces": [self.ns],
+        }
+        hit = collect.check_untargeted_compute_class_workload(wl, ctx)
+        self.assertIsNotNone(hit)
+        self.assertEqual(hit["single_compute_class"], "axion-cc")
+
+    def test_windows_pool_derives_os_from_image_type(self):
+        win_pool = pool("win-pool", image_type="WINDOWS_LTSC_CONTAINERD", labels={"cloud.google.com/compute-class": "win-cc"})
+        cc_win = compute_class("win-cc")
+        wl = collect.normalize_workloads({
+            "items": [deployment("win-app", node_selector={"kubernetes.io/os": "windows"})]
+        })[0]
+        ctx = {
+            "compute_classes": [cc_win],
+            "node_pools": [win_pool],
+            "namespaces": [self.ns],
+        }
+        hit = collect.check_untargeted_compute_class_workload(wl, ctx)
+        self.assertIsNotNone(hit)
+        self.assertEqual(hit["single_compute_class"], "win-cc")
 
 
 if __name__ == "__main__":
