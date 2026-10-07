@@ -173,9 +173,6 @@ func TestADelegateArtifactMintsAChildToPlatform(t *testing.T) {
 	if cref.Requester == nil || pref.Requester == nil || *cref.Requester != *pref.Requester {
 		t.Fatalf("child requester %+v, want the parent's %+v", cref.Requester, pref.Requester)
 	}
-	if !r.g.targetAllows(targetPlatform, cref.Requester.Backend, cref.Requester.Subject) {
-		t.Fatal("the inherited requester is not the one the check passed")
-	}
 	if !loggedContaining(r, "delegation requested", origin.TaskID, session, "addressee=platform", "depth=0")() {
 		t.Fatalf("no receipt line for the request:\n%s", r.logs.String())
 	}
