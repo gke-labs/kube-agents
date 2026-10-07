@@ -212,6 +212,13 @@ while true; do sleep 1; done
 	if out.err != nil || out.res.State != lib.StateCanceled {
 		t.Fatalf("run: state=%q err=%v", out.res.State, out.err)
 	}
+	assertNoDelegateArtifact(t, url, session, taskID)
+}
+
+// assertNoDelegateArtifact fails if the task's stream carries a delegate
+// artifact.
+func assertNoDelegateArtifact(t *testing.T, url, session, taskID string) {
+	t.Helper()
 	for _, ev := range replayEvents(t, url, session, taskID) {
 		if ev.Kind != lib.KindArtifactUpdate {
 			continue
@@ -221,9 +228,60 @@ while true; do sleep 1; done
 			t.Fatalf("artifact payload: %v", err)
 		}
 		if u.Artifact.Name == lib.ArtifactDelegate {
-			t.Fatalf("a delegate artifact was published after cancel: %s", ev.Payload)
+			t.Fatalf("a delegate artifact was published after the turn ended: %s", ev.Payload)
 		}
 	}
+}
+
+// TestADelegateCallAfterTheDeadlineIsRefused: the deadline ends the turn when
+// it fires, as cancel does, even though the harness is still dying. A
+// delegate call in that window must not publish a child request, nor turn
+// the deadline-exceeded task into a completed one. The stub traps TERM and
+// records it, so the test knows the deadline has been acted on, and lives
+// until the SIGKILL KillGrace later.
+func TestADelegateCallAfterTheDeadlineIsRefused(t *testing.T) {
+	url := startServer(t)
+	c := testClient(t, url)
+	const session, taskID = "chat-test-del5", "task-del-5"
+	submit(t, c, session, taskID, "find out how the fleet is")
+	sock := delegateSock(t)
+	marker := filepath.Join(filepath.Dir(sock), "termed")
+	harness := stub(t, `
+trap 'touch `+marker+`' TERM
+echo '{"type":"system","subtype":"init","session_id":"stub-1"}'
+read first || exit 1
+while true; do sleep 1; done
+`)
+	cfg := adapterConfig(url, taskID, session, harness)
+	cfg.DelegateSocket = sock
+	cfg.TaskDeadline = 2 * time.Second
+	cfg.KillGrace = 10 * time.Second
+	done := runAdapter(context.Background(), cfg)
+
+	deadline := time.Now().Add(waitDeadline)
+	for {
+		if _, err := os.Stat(marker); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("harness never received SIGTERM from the deadline")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	reply := askDelegate(t, sock, lib.DelegateRequest{Addressee: "platform", Text: "how is the fleet?"})
+	if reply.OK || !strings.Contains(reply.Message, "already ended") {
+		t.Fatalf("delegate after the deadline: %+v", reply)
+	}
+	out := waitOutcome(t, done, 45*time.Second)
+	if out.err != nil || out.res.State != lib.StateFailed {
+		t.Fatalf("run: state=%q err=%v", out.res.State, out.err)
+	}
+	task := foldTask(t, c, session, taskID)
+	if task.State != lib.StateFailed || finalText(task) != "reason: deadline-exceeded" {
+		t.Fatalf("terminal = %q (%s), want failed with reason: deadline-exceeded", task.State, finalText(task))
+	}
+	assertNoDelegateArtifact(t, url, session, taskID)
 }
 
 // TestAnEvictionAfterADelegateCallCompletesTheTurn: once a delegate request is
