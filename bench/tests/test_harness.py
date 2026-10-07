@@ -201,7 +201,10 @@ class _StubAgentHandler(BaseHTTPRequestHandler):
         headers = {}
         if self.server.session_id:
             headers["X-Hermes-Session-Id"] = self.server.session_id
-        if self.server.fail_headers:
+        req_num = len(self.server.requests)
+        if self.server.fail_headers_by_request is not None and req_num in self.server.fail_headers_by_request:
+            headers.update(self.server.fail_headers_by_request[req_num])
+        elif self.server.fail_headers:
             headers.update(self.server.fail_headers)
         if len(self.server.requests) in self.server.fail_on:
             self._respond(
@@ -252,6 +255,7 @@ class _StubAgentServer(ThreadingHTTPServer):
     last_auth: str | None = None
     fail_with: int | None = None
     fail_headers: dict[str, str] | None = None
+    fail_headers_by_request: dict[int, dict[str, str]] | None = None
     # Serve normally for this many requests, then 503 every later one.
     fail_after: int | None = None
     # 1-based request ordinals that fail; every other request serves normally.
@@ -2572,6 +2576,58 @@ def test_a_status_turn_502_with_rate_limit_is_infra_without_retrying(
     purges = [s for s in no_cluster_exec if "rm -rf" in s]
     assert len(purges) == 1
     assert _TASK_ID in purges[0]
+
+
+def test_a_status_turn_502_with_tool_error_is_graded_after_max_failures(
+    stub_agent: _StubAgentServer,
+    instant_polls: None,
+    recorded_pf_resets: list[int],
+    no_cluster_exec: list[str],
+) -> None:
+    """A status turn 502 with tool_error is not retryable, skips resets, and settles for grading."""
+    stub_agent.turns = [_create_turn(), _show_turn("done")]
+    stub_agent.fail_on = frozenset(range(2, 2 + harness._MAX_TRANSPORT_FAILURES))
+    stub_agent.fail_on_status = 502
+    stub_agent.fail_headers = {"X-Hermes-Failure-Reason": "tool_error"}
+
+    result = KubeAgentsHarness().run("Find the root cause.")
+
+    assert result.has_errors()
+    assert harness.INFRA_FAILURE_MARKER not in result.errors[0]
+    assert "answered" in result.errors[0]
+    assert recorded_pf_resets == []
+    # Trajectory from turn 1 survives and is settled for grading
+    assert len(result.trajectory) >= 1
+    assert len(stub_agent.requests) == 1 + harness._MAX_TRANSPORT_FAILURES
+
+
+@pytest.mark.parametrize(
+    "tool_error_ordinal",
+    [2, 4],  # first failure in streak (ordinal 2) vs last failure in streak (ordinal 4)
+)
+def test_mixed_status_turn_streak_settles_and_grades_regardless_of_order(
+    stub_agent: _StubAgentServer,
+    instant_polls: None,
+    recorded_pf_resets: list[int],
+    no_cluster_exec: list[str],
+    tool_error_ordinal: int,
+) -> None:
+    """A mixed streak of bare 502s and tool_error settles and grades regardless of failure order."""
+    stub_agent.turns = [_create_turn(), _show_turn("done")]
+    stub_agent.fail_on = frozenset(range(2, 2 + harness._MAX_TRANSPORT_FAILURES))
+    stub_agent.fail_on_status = 502
+    stub_agent.fail_headers = {}
+    stub_agent.fail_headers_by_request = {
+        tool_error_ordinal: {"X-Hermes-Failure-Reason": "tool_error"}
+    }
+
+    result = KubeAgentsHarness().run("Find the root cause.")
+
+    assert result.has_errors()
+    assert harness.INFRA_FAILURE_MARKER not in result.errors[0]
+    assert "answered" in result.errors[0]
+    assert len(result.trajectory) >= 1
+    assert len(stub_agent.requests) == 1 + harness._MAX_TRANSPORT_FAILURES
 
 
 # --- cumulative (replayed) payloads ------------------------------------------

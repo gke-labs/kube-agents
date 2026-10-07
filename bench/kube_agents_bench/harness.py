@@ -2352,6 +2352,7 @@ class KubeAgentsHarness(AgentHarness):
         session_id = ""
         silent = 0
         transport_failures = 0
+        had_answered_failure = False
         timed_out = True
         # The freshest status seen for each card, from whichever source read
         # it last -- the board or a status turn -- for the deadline report.
@@ -2409,6 +2410,8 @@ class KubeAgentsHarness(AgentHarness):
                     raise _DelegationTransportExhausted(
                         f"status turn hit infrastructure failure ({exc.failure_reason}): {exc}"
                     ) from exc
+                if not exc.retryable:
+                    had_answered_failure = True
                 transport_failures += 1
                 _log.warning(
                     "status turn failed (%d/%d): %s",
@@ -2439,7 +2442,7 @@ class KubeAgentsHarness(AgentHarness):
                                 "port-forward respawn failed before retry: %s", pf_exc
                             )
                     continue
-                if exc.retryable:
+                if not had_answered_failure:
                     # Classified, not graded: appending here used to leave the
                     # run validating with the delegation receipt graded as the
                     # answer -- the exact failure this wait exists to prevent.
@@ -2453,19 +2456,20 @@ class KubeAgentsHarness(AgentHarness):
                         "running; still waiting on: " + ", ".join(outstanding) + "; "
                         f"tunnel log: {_tail(_pf_log_path(local_port))}"
                     ) from exc
-                # A handler answered every time (a non-429 4xx, a 500,
-                # non-JSON): that is the agent's own failure, so it stays in
-                # front of the judge as before -- recorded, not just logged,
-                # which is what stops devops-bench promoting the partial
-                # record.
+                # At least one turn reached a handler (a non-429 4xx, a 500,
+                # non-JSON, or a 5xx with a non-infrastructure failure reason):
+                # that is the agent's own failure, so it stays in front of the
+                # judge as before -- recorded, not just logged, which is what
+                # stops devops-bench promoting the partial record.
                 result.errors.append(
-                    f"status turns failed in transport {transport_failures} times running; "
+                    f"status turns failed in transport {transport_failures} times running (answered); "
                     "still waiting on: " + ", ".join(outstanding) + "; "
                     f"tunnel log: {_tail(_pf_log_path(local_port))}"
                 )
                 timed_out = False
                 break
             transport_failures = 0
+            had_answered_failure = False
             # Freshness comes off the turn's *new* calls, not the whole
             # replayed episode. Every earlier board reading comes back on every
             # poll, so the cumulative view would let an agent that has stopped
