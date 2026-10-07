@@ -1676,6 +1676,12 @@ type taskStart struct {
 	// Request is the entry's request copy (TaskRef.Request) for a wake: its
 	// delegating turn's. A human turn's is its own Text; a child stores none.
 	Request string
+	// LinkParent appends the new task's id to the Children of the entry
+	// ParentTaskID names, before the record is written: a child's link
+	// reaches the KV in the same write as the child's own entry, so no
+	// stored record holds the child without its parent's link (observedAs
+	// and chainLast read the link). Set for a child only.
+	LinkParent bool
 }
 
 // startTask opens a turn for a human message.
@@ -1797,6 +1803,13 @@ func (g *Gateway) startTaskWith(ctx context.Context, rec *SessionRecord, ts task
 	}
 	ref.carrySteerAuthors(TaskRef{SteerAuthors: ts.SteerAuthors, SteerAuthorsOverflow: ts.SteerAuthorsOverflow})
 	rec.Tasks = append(rec.Tasks, ref)
+	if ts.LinkParent {
+		for i := range rec.Tasks {
+			if rec.Tasks[i].ID == ts.ParentTaskID {
+				rec.Tasks[i].Children = append(rec.Tasks[i].Children, taskID)
+			}
+		}
+	}
 	// Text published to the conversation's own incarnation joins its author
 	// set; a child to platform does not reach the incarnation.
 	if rec.AddressedToOwnSession() {

@@ -241,6 +241,55 @@ func TestADelegateArtifactMintsAChildToPlatform(t *testing.T) {
 	}
 }
 
+// TestTheParentsLinkIsWrittenWithTheChild: the mint's own record write
+// carries the parent's link to the child, not only the relay's end-of-batch
+// write after it. The mint runs here as the relay runs it, under the session
+// lock, and the stored record is read before anything else writes it: a
+// restart or a failed relay write at that point must not leave the child on
+// record with a parent that looks like it never delegated.
+func TestTheParentsLinkIsWrittenWithTheChild(t *testing.T) {
+	r, spawn := startRigWithSpawner(t)
+	ctx := context.Background()
+	conv := "discord:g1/t-link"
+	_, origin, session := sessionTurn(t, r, spawn, conv, "x")
+	waitFor(t, "the parent's working state folded", func() bool {
+		rec, _ := r.g.reg.Get(ctx, conv)
+		return rec != nil && rec.ActiveTask != nil && rec.ActiveTask.TaskID == origin.TaskID
+	})
+
+	l := r.g.lockSession(conv)
+	l.Lock()
+	rec, err := r.g.reg.Get(ctx, conv)
+	if err != nil || rec == nil {
+		l.Unlock()
+		t.Fatalf("record: %v %v", rec, err)
+	}
+	art := delegateArtifact(t, targetPlatform, "report fleet health")
+	r.g.handleDelegateRequest(ctx, rec, lib.TaskEventsSubject(session, origin.TaskID), origin.TaskID, art.Parts)
+	stored, err := r.g.reg.Get(ctx, conv)
+	l.Unlock()
+	if err != nil || stored == nil {
+		t.Fatalf("stored record: %v %v", stored, err)
+	}
+
+	var childID string
+	for _, ref := range stored.Tasks {
+		if ref.Role == taskRoleChild && ref.ParentTaskID == origin.TaskID {
+			childID = ref.ID
+		}
+	}
+	if childID == "" {
+		t.Fatalf("the mint wrote no child entry: %+v", stored.Tasks)
+	}
+	pref, _ := stored.TaskRefFor(origin.TaskID)
+	if len(pref.Children) != 1 || pref.Children[0] != childID {
+		t.Fatalf("the mint's write holds child %s without the parent's link: children=%v", childID, pref.Children)
+	}
+	if id, ends := stored.observedAs(origin.TaskID); id != origin.TaskID || ends {
+		t.Fatalf("the stored record reads the delegating turn as the root's end: observedAs = %s, %v", id, ends)
+	}
+}
+
 // TestDelegateAllowlist: the check against the platform agent's list for the
 // requester's backend. The rig's backend is discord and its author 1001.
 func TestDelegateAllowlist(t *testing.T) {

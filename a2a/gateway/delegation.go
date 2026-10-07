@@ -190,20 +190,21 @@ func (g *Gateway) handleDelegateRequest(ctx context.Context, rec *SessionRecord,
 		SteerAuthors:         parent.SteerAuthors,
 		SteerAuthorsOverflow: parent.SteerAuthorsOverflow,
 		RootTaskID:           parent.rootID(),
+		// The parent's link goes into the same record write as the child's
+		// entry: written after, a restart or a failed relay write in
+		// between would leave the child on record with a parent that looks
+		// like it never delegated.
+		LinkParent: true,
 	})
 	if !ok {
 		// startTaskWith has said why, in the log and to the room; the
 		// parent is still the conversation's task, and a child that never
-		// reached the bus leaves no entry in the chain and no route.
+		// reached the bus leaves no entry in the chain, no link on the
+		// parent and no route.
 		rec.Addressee, rec.ActiveTask = prevAddressee, prevActive
 		setParentLine(rec, taskID, "")
 		g.dropFailedChildren(ctx, rec, taskID)
 		return
-	}
-	for i := range rec.Tasks {
-		if rec.Tasks[i].ID == taskID {
-			rec.Tasks[i].Children = append(rec.Tasks[i].Children, childID)
-		}
 	}
 	log.Info("delegation minted", "parent", taskID, "child", childID, "addressee", addressee)
 }
@@ -400,9 +401,10 @@ func setParentLine(rec *SessionRecord, taskID, statusMsgID string) {
 	}
 }
 
-// dropFailedChildren removes the entry and the index of a child of taskID
-// whose submission never reached the bus. The parent has no child on record
-// yet (the busy check), so any child entry naming it is the failed one.
+// dropFailedChildren removes the entry, the index and the parent's link of a
+// child of taskID whose submission never reached the bus. The parent had no
+// child on record before (the busy check), so any child entry naming it is
+// the failed one, and so is every link it holds.
 func (g *Gateway) dropFailedChildren(ctx context.Context, rec *SessionRecord, taskID string) {
 	kept := rec.Tasks[:0]
 	for _, ref := range rec.Tasks {
@@ -413,6 +415,11 @@ func (g *Gateway) dropFailedChildren(ctx context.Context, rec *SessionRecord, ta
 		g.retireTaskRoute(ctx, ref.ID)
 	}
 	rec.Tasks = kept
+	for i := range rec.Tasks {
+		if rec.Tasks[i].ID == taskID {
+			rec.Tasks[i].Children = nil
+		}
+	}
 }
 
 // deferNotice holds a notice for the task until its terminal relays
