@@ -1203,11 +1203,6 @@ class _TransportError(RuntimeError):
 
     ``retryable`` says whether issuing the same request again could plausibly
     succeed. It is False by default so a new raise site has to opt in.
-
-    ``answered`` says whether an agent handler answered the request (an HTTP response
-    outside retryable gateway drops, a classified failure reason, a non-JSON body,
-    or non-object JSON) as opposed to transport-level loss (timeouts, dropped connections,
-    protocol errors).
     """
 
     def __init__(
@@ -1216,12 +1211,10 @@ class _TransportError(RuntimeError):
         *,
         retryable: bool = False,
         failure_reason: str | None = None,
-        answered: bool = False,
     ) -> None:
         super().__init__(message)
         self.retryable = retryable
         self.failure_reason = failure_reason
-        self.answered = answered
 
 
 # Gateway statuses a proxy in front of the agent emits when the upstream is
@@ -1284,20 +1277,18 @@ def _post_turn(
         failure_reason = (
             exc.headers.get(_FAILURE_REASON_HEADER) if exc.headers else None
         )
+        if failure_reason is not None:
+            failure_reason = failure_reason.strip()
         retryable = exc.code in _RETRYABLE_STATUSES and failure_reason is None
-        answered = exc.code not in _RETRYABLE_STATUSES or failure_reason is not None
         raise _TransportError(
             f"HTTP {exc.code} from agent endpoint: {_http_error_detail(exc)}",
             retryable=retryable,
             failure_reason=failure_reason,
-            answered=answered,
         ) from exc
     except (OSError, http.client.HTTPException) as exc:
         # Timeouts, resets, and mid-read protocol failures: transport bugs.
         raise _TransportError(
-            f"{type(exc).__name__}: {exc}",
-            retryable=_connection_dropped(exc),
-            answered=False,
+            f"{type(exc).__name__}: {exc}", retryable=_connection_dropped(exc)
         ) from exc
     except ValueError as exc:
         # A body that is neither UTF-8 nor JSON: a handler answered, so this
@@ -1305,13 +1296,11 @@ def _post_turn(
         raise _TransportError(
             f"{type(exc).__name__}: {exc}",
             retryable=False,
-            answered=True,
         ) from exc
 
     if not isinstance(payload, dict):
         raise _TransportError(
-            f"agent endpoint returned non-object JSON: {type(payload).__name__}",
-            answered=True,
+            f"agent endpoint returned non-object JSON: {type(payload).__name__}"
         )
     return parse_response(payload), session_id
 
@@ -1652,7 +1641,6 @@ class KubeAgentsHarness(AgentHarness):
                         timeout=timeout,
                         delegation_timeout=delegation_timeout,
                         poll_interval=poll_interval,
-                        opening_turn=opening_turn,
                     )
                     or session_id
                 )
@@ -2258,7 +2246,6 @@ class KubeAgentsHarness(AgentHarness):
                     raise _TransportError(
                         f"{exc}{_abandon(follow)}",
                         retryable=exc.retryable,
-                        answered=exc.answered,
                     ) from exc
                 if turn_exchange.outcome == inject.OUTCOME_NOT_ACCEPTED:
                     # Retryable, and therefore infrastructure once the wait's
@@ -2303,7 +2290,6 @@ class KubeAgentsHarness(AgentHarness):
         timeout: float,
         delegation_timeout: float,
         poll_interval: float,
-        opening_turn: bool = True,
     ) -> str:
         """Poll the agent until every card it filed settles.
 
@@ -2327,25 +2313,20 @@ class KubeAgentsHarness(AgentHarness):
         stderr (:func:`_pf_log_path`) the transport-failure messages quote.
         Cards filed *during* a status turn join the wait.
 
-        A turn that fails in transport or answers with an error is retried up to
+        A turn that fails in transport is retried up to
         :data:`_MAX_TRANSPORT_FAILURES` times running -- through a fresh
-        tunnel each time on transport loss, or directly on the next poll when
-        the agent answered -- while on an opening turn an infrastructure failure
-        reason (rate limit or billing) ends the wait immediately. A turn
-        reporting no outstanding card is tolerated up to :data:`_MAX_SILENT_TURNS`.
+        tunnel each time, like the opening turn -- and one reporting no
+        outstanding card is tolerated up to :data:`_MAX_SILENT_TURNS`.
 
         Returns:
             The session id from the last status turn, or ``""`` when no status
             turn ran or the header was absent.
 
         Raises:
-            _DelegationTransportExhausted: Every retry died with a retryable transport
-                drop (no HTTP answer at all, or a 429 refused at the admission door); or
-                -- on an opening turn only -- a status turn hit an infrastructure limit
-                (rate limit or billing). The caller replaces the record wholesale with
-                :func:`_infra_failure`. When any status turn was answered or hit a
-                non-retryable failure (such as a timeout), the wait settles instead, so
-                the partial record stays graded.
+            _DelegationTransportExhausted: Every retry died without reaching
+                an agent -- no HTTP answer at all, or a 429 refused at the
+                admission door; the run is infrastructure, not a gradable
+                result.
         """
         # The delegating turn may already have shown a card done, in which case
         # there is nothing to wait on and no reason to sleep a poll interval.
@@ -2373,7 +2354,7 @@ class KubeAgentsHarness(AgentHarness):
         deadline = time.monotonic() + delegation_timeout
         session_id = ""
         silent = 0
-        failures: list[_TransportError] = []
+        transport_failures = 0
         timed_out = True
         # The freshest status seen for each card, from whichever source read
         # it last -- the board or a status turn -- for the deadline report.
@@ -2426,19 +2407,14 @@ class KubeAgentsHarness(AgentHarness):
             try:
                 status_turn, turn_session = turn(poll, min(timeout, remaining))
             except _TransportError as exc:
-                if exc.failure_reason in _INFRA_FAILURE_REASONS and opening_turn:
-                    _purge_card_state(awaited, _EXEC_TIMEOUT)
-                    raise _DelegationTransportExhausted(
-                        f"status turn hit infrastructure failure ({exc.failure_reason}): {exc}"
-                    ) from exc
-                failures.append(exc)
+                transport_failures += 1
                 _log.warning(
                     "status turn failed (%d/%d): %s",
-                    len(failures),
+                    transport_failures,
                     _MAX_TRANSPORT_FAILURES,
                     exc,
                 )
-                if len(failures) < _MAX_TRANSPORT_FAILURES:
+                if transport_failures < _MAX_TRANSPORT_FAILURES:
                     # Back off one poll interval and ask again: the loop top
                     # re-checks the deadline, so retries cannot outlive it.
                     # A retryable failure usually means the endpoint never
@@ -2461,45 +2437,33 @@ class KubeAgentsHarness(AgentHarness):
                                 "port-forward respawn failed before retry: %s", pf_exc
                             )
                     continue
-                if all(e.retryable for e in failures):
-                    # Every status turn in the streak was a retryable transport drop
-                    # (gateway 502/503/504, connection drop, or admission 429 without
-                    # failure reason): classified as infrastructure, not graded. The cards'
-                    # on-disk state still has to go (nothing is settled into
-                    # a record that is about to be replaced, but a rerun must
-                    # not find this attempt's leavings), then the run becomes
-                    # infrastructure, mirroring the opening turn.
+                if exc.retryable:
+                    # Classified, not graded: appending here used to leave the
+                    # run validating with the delegation receipt graded as the
+                    # answer -- the exact failure this wait exists to prevent.
+                    # The cards' on-disk state still has to go (nothing is
+                    # settled into a record that is about to be replaced, but
+                    # a rerun must not find this attempt's leavings), then the
+                    # run becomes infrastructure, mirroring the opening turn.
                     _purge_card_state(awaited, _EXEC_TIMEOUT)
                     raise _DelegationTransportExhausted(
-                        f"status turns failed in transport {len(failures)} times "
+                        f"status turns failed in transport {transport_failures} times "
                         "running; still waiting on: " + ", ".join(outstanding) + "; "
                         f"tunnel log: {_tail(_pf_log_path(local_port))}"
                     ) from exc
-                # At least one turn reached a handler (a non-429 4xx, a 500,
-                # non-JSON, or repeated classified failures): that is the
-                # agent's own failure, so it stays in front of the judge as
-                # before -- recorded, not just logged, which is what stops
-                # devops-bench promoting the partial record.
-                answered = [e for e in failures if e.answered]
-                with_reasons = [e for e in answered if e.failure_reason is not None]
-                if with_reasons:
-                    reasons = sorted({(e.failure_reason or "unknown") for e in with_reasons})
-                    if len(with_reasons) == len(answered):
-                        reason_detail = f" ({', '.join(reasons)})"
-                    else:
-                        reason_detail = f" ({len(with_reasons)} with {', '.join(reasons)})"
-                else:
-                    reason_detail = ""
-                report = (
-                    f"status turns failed with {len(answered)} answered{reason_detail}, "
-                    f"{len(failures) - len(answered)} in transport; "
+                # A handler answered every time (a non-429 4xx, a 500,
+                # non-JSON): that is the agent's own failure, so it stays in
+                # front of the judge as before -- recorded, not just logged,
+                # which is what stops devops-bench promoting the partial
+                # record.
+                result.errors.append(
+                    f"status turns failed in transport {transport_failures} times running; "
                     "still waiting on: " + ", ".join(outstanding) + "; "
                     f"tunnel log: {_tail(_pf_log_path(local_port))}"
                 )
-                result.errors.append(report)
                 timed_out = False
                 break
-            failures.clear()
+            transport_failures = 0
             # Freshness comes off the turn's *new* calls, not the whole
             # replayed episode. Every earlier board reading comes back on every
             # poll, so the cumulative view would let an agent that has stopped
