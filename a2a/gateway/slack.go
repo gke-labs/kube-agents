@@ -102,6 +102,9 @@ const (
 	// joined that id to a principal. Both halves, because either alone
 	// would overstate it.
 	slackVerifiedBy = "slack-socket-mode+principal-map"
+	// slackMinChannelIDLen is the shortest id slackIsHomeChannelID takes:
+	// the prefix letter and at least two characters after it.
+	slackMinChannelIDLen = 3
 )
 
 // Slack token prefixes, checked at construction so a swapped pair fails at
@@ -561,6 +564,62 @@ func (s *SlackAdapter) Post(conversation, text string) (string, error) {
 	}
 	_, ts, err := s.api.PostMessage(channel, opts...)
 	return ts, err
+}
+
+// PostNotify writes text into channel, top-level when thread is empty or as a
+// reply on thread (a thread root's ts), and returns the posted message's ts
+// and the thread it landed in: the given one, or the new message's own ts,
+// which is the root a later notify replies on. It is Post for a caller with
+// no conversation key (the chat.notify route, notify.go).
+func (s *SlackAdapter) PostNotify(channel, thread, text string) (message, landed string, err error) {
+	if !slackIsHomeChannelID(channel) {
+		return "", "", fmt.Errorf("slack: not a channel id: %q", channel)
+	}
+	opts := []slack.MsgOption{slack.MsgOptionText(toMrkdwn(text), false)}
+	if thread != "" {
+		opts = append(opts, slack.MsgOptionTS(thread))
+	}
+	_, ts, err := s.api.PostMessage(channel, opts...)
+	if err != nil {
+		return "", "", err
+	}
+	if thread == "" {
+		thread = ts
+	}
+	return ts, thread, nil
+}
+
+// slackIsHomeChannelID reports a public ("C...") or private ("G...")
+// channel id: a prefix letter and upper-case letters or digits after it. A
+// DM ("D...") is not a home channel.
+func slackIsHomeChannelID(id string) bool {
+	if len(id) < slackMinChannelIDLen || (id[0] != 'C' && id[0] != 'G') {
+		return false
+	}
+	for _, r := range id[1:] {
+		if (r < 'A' || r > 'Z') && (r < '0' || r > '9') {
+			return false
+		}
+	}
+	return true
+}
+
+// slackIsTS reports a Slack message ts: digits, one dot, digits.
+func slackIsTS(ts string) bool {
+	secs, frac, ok := strings.Cut(ts, ".")
+	return ok && allDigits(secs) && allDigits(frac)
+}
+
+func allDigits(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 // Edit replaces a previously posted message — the rolling progress line.

@@ -38,6 +38,10 @@ const defaultGchatTokenPath = "/var/run/secrets/a2a-chat-relay/token"
 // to (notify.go); the operator renders it from googleChat.homeChannel.
 const envGchatHomeChannel = "A2A_GCHAT_HOME_CHANNEL"
 
+// envSlackHomeChannel carries the Slack home channel's id the chat.notify
+// route posts to; the operator renders it from slack.homeChannel.
+const envSlackHomeChannel = "A2A_SLACK_HOME_CHANNEL"
+
 // defaultInjectPrincipalMapPath is where the operator mounts the inject
 // door's own principal map when the door is armed. A file of "id principal"
 // lines rather than a directory of one file per id, because every key carries
@@ -122,6 +126,10 @@ type Config struct {
 	// one place a chat.notify post may land (notify.go). Empty leaves the
 	// notify route unarmed.
 	GchatHomeChannel string
+	// SlackHomeChannel is the install's Slack home channel id ("C0123"),
+	// the one place a Slack chat.notify post may land (notify.go). Empty
+	// leaves the Slack notify route unarmed.
+	SlackHomeChannel string
 	// SlackAllowedUsers is the Slack backend's ingress allowlist, carried
 	// from spec.integration.slack.allowedUsers the way GchatAllowedUsers is
 	// from Chat's: the gate the legacy path enforces as SLACK_ALLOWED_USERS.
@@ -460,6 +468,7 @@ func FromEnv() (*Config, error) {
 	}
 	cfg.GchatAllowAllUsers = os.Getenv("A2A_GCHAT_ALLOW_ALL_USERS") == "true"
 	cfg.GchatHomeChannel = strings.TrimSpace(os.Getenv(envGchatHomeChannel))
+	cfg.SlackHomeChannel = strings.TrimSpace(os.Getenv(envSlackHomeChannel))
 	for _, u := range strings.Split(os.Getenv("A2A_SLACK_ALLOWED_USERS"), ",") {
 		if u = strings.TrimSpace(u); u != "" {
 			cfg.SlackAllowedUsers = append(cfg.SlackAllowedUsers, u)

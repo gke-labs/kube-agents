@@ -166,6 +166,20 @@ func realMain(ctx context.Context, log *slog.Logger) error {
 			defer sub.Stop()
 		}
 	}
+	// Slack's arm, the same way: its adapter, its home channel.
+	if _, ok := adapter.(*gateway.SlackAdapter); ok && cfg.SlackHomeChannel == "" {
+		log.Info("chat.notify route not armed: no Slack home channel configured")
+	}
+	if slackAdapter, ok := adapter.(*gateway.SlackAdapter); ok && cfg.SlackHomeChannel != "" {
+		notifier, err := gateway.NewSlackNotifier(slackAdapter, cfg.SlackHomeChannel, log)
+		if err != nil {
+			log.Error("chat.notify route not armed", "err", err)
+		} else if sub, err := notifier.Start(client); err != nil {
+			log.Error("chat.notify route not armed", "err", err)
+		} else {
+			defer sub.Stop()
+		}
+	}
 	// The door is a side door, not a backend: it can be armed beside either
 	// of the above, and the composite routes by conversation key. Dev and
 	// eval installs only; the operator renders A2A_INJECT_LISTEN and the

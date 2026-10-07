@@ -61,9 +61,15 @@ type Notifier struct {
 	subject string
 	home    string
 	poster  notifyPoster
-	log     *slog.Logger
-	jobs    chan notifyJob
-	done    chan struct{}
+	// threadOK is the backend's test that a requested thread may be
+	// replied on. The home channel is the bound either way: Chat's thread
+	// names its space, so it is checked against the home space (inHome);
+	// a Slack thread ts names no channel, so it is only checked for shape
+	// and is always posted into the home channel.
+	threadOK func(string) bool
+	log      *slog.Logger
+	jobs     chan notifyJob
+	done     chan struct{}
 
 	// mu orders handle's enqueue against Stop's close of jobs: a request that
 	// arrives while Stop runs is refused under the lock rather than sent on a
@@ -82,7 +88,25 @@ func NewGchatNotifier(poster notifyPoster, home string, log *slog.Logger) (*Noti
 	if log == nil {
 		log = slog.Default()
 	}
-	return &Notifier{subject: lib.NotifySubjectGchat, home: home, poster: poster, log: log}, nil
+	n := &Notifier{subject: lib.NotifySubjectGchat, home: home, poster: poster, log: log}
+	n.threadOK = n.inHome
+	return n, nil
+}
+
+// NewSlackNotifier builds the Slack notifier. home is the configured home
+// channel's id ("C0123" or a private channel's "G0123"); anything else is
+// refused here, at start. A reply thread is a thread root's ts and names no
+// channel, so the notifier posts every request into home: the channel is
+// the whole authority bound, and a ts from some other channel can only ever
+// thread (or fail to thread) inside home.
+func NewSlackNotifier(poster notifyPoster, home string, log *slog.Logger) (*Notifier, error) {
+	if !slackIsHomeChannelID(home) {
+		return nil, fmt.Errorf("notify: home channel %q is not a Slack channel id (C... or G...)", home)
+	}
+	if log == nil {
+		log = slog.Default()
+	}
+	return &Notifier{subject: lib.NotifySubjectSlack, home: home, poster: poster, log: log, threadOK: slackIsTS}, nil
 }
 
 // Start subscribes the notifier on client and starts the worker that posts.
@@ -202,7 +226,7 @@ func (n *Notifier) validate(data []byte) (lib.NotifyRequest, *lib.NotifyReply) {
 	if strings.TrimSpace(req.Text) == "" {
 		return refuse("text is empty")
 	}
-	if req.Thread != "" && !n.inHome(req.Thread) {
+	if req.Thread != "" && !n.threadOK(req.Thread) {
 		return refuse(fmt.Sprintf("thread %q is not a thread of the home channel", req.Thread))
 	}
 	return req, nil
