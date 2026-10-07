@@ -49,6 +49,9 @@ import time
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import boskos_pool  # noqa: E402
 
+# Fixed description prefix set by bench plant stacks (e.g.
+# bench/tf/prebuilt/subnet-range-exhaustion/main.tf) so leftovers from killed runs
+# can be safely identified and swept.
 PLANT_DESCRIPTION_PREFIX = "kube-agents-bench plant"
 DEFAULT_MAX_AGE_HOURS = 4.0
 MIN_MAX_AGE_HOURS = 2.0
@@ -384,6 +387,21 @@ def sweep_project(
     return deleted
 
 
+def _counts(resources: dict | None, allow_empty: bool = False) -> dict | None:
+    """Extract address/subnet/network counts from a resources or deleted dict.
+
+    If allow_empty is False, returns None when all counts are zero.
+    """
+    if not resources and not allow_empty:
+        return None
+    counts = {
+        "addresses": len((resources or {}).get("addresses", [])),
+        "subnets": len((resources or {}).get("subnets", [])),
+        "networks": len((resources or {}).get("networks", [])),
+    }
+    return counts if (allow_empty or any(counts.values())) else None
+
+
 def boskos_reset_stranded(server: str):
     """Return projects left in BOSKOS_SWEEP_STATE by an earlier dead sweep run to free."""
     return boskos_pool.reset_stranded(server, BOSKOS_SWEEP_STATE, BOSKOS_STRANDED_AFTER, "sweep")
@@ -419,31 +437,19 @@ def sweep_pool(
         print(f"sweeping {name}")
         try:
             res = sweep_project(name, max_age_hours=max_age_hours, dry_run=dry_run, runner=runner, now=now)
-            deleted[name] = {
-                "addresses": len(res.get("addresses", [])),
-                "subnets": len(res.get("subnets", [])),
-                "networks": len(res.get("networks", [])),
-            }
+            deleted[name] = _counts(res, allow_empty=True)
         except Terminated as exc:
             report["ended_early"] = str(exc)
-            del_counts = getattr(exc, "deleted", None)
-            if del_counts and (del_counts.get("addresses") or del_counts.get("subnets") or del_counts.get("networks")):
-                deleted[name] = {
-                    "addresses": len(del_counts.get("addresses", [])),
-                    "subnets": len(del_counts.get("subnets", [])),
-                    "networks": len(del_counts.get("networks", [])),
-                }
+            c = _counts(getattr(exc, "deleted", None))
+            if c:
+                deleted[name] = c
             failures[name] = str(exc)
             raise
         except Exception as exc:
             print(f"  {name}: {boskos_pool.describe(exc)}", file=sys.stderr)
-            del_counts = getattr(exc, "deleted", None)
-            if del_counts and (del_counts.get("addresses") or del_counts.get("subnets") or del_counts.get("networks")):
-                deleted[name] = {
-                    "addresses": len(del_counts.get("addresses", [])),
-                    "subnets": len(del_counts.get("subnets", [])),
-                    "networks": len(del_counts.get("networks", [])),
-                }
+            c = _counts(getattr(exc, "deleted", None))
+            if c:
+                deleted[name] = c
             failures[name] = boskos_pool.describe(exc)
 
     boskos_pool.walk(
@@ -568,63 +574,46 @@ def main(argv=None) -> int:
     try:
         if args.project is not None:
             boskos_reset_stranded(args.boskos_server)
-            release_failures = {}
 
-            def visit(p):
-                res = sweep_project(p, max_age_hours=args.max_age_hours, dry_run=args.dry_run)
-                run["deleted"][p] = {
-                    "addresses": len(res.get("addresses", [])),
-                    "subnets": len(res.get("subnets", [])),
-                    "networks": len(res.get("networks", [])),
-                }
+            def visit(p: str):
+                print(f"sweeping {p}")
+                try:
+                    res = sweep_project(p, max_age_hours=args.max_age_hours, dry_run=args.dry_run)
+                    run["deleted"][p] = _counts(res, allow_empty=True)
+                except Terminated as exc:
+                    run["ended_early"] = str(exc)
+                    c = _counts(getattr(exc, "deleted", None))
+                    if c:
+                        run["deleted"][p] = c
+                    run["failures"][p] = str(exc)
+                    raise
+                except Exception as exc:
+                    print(f"  {p}: {boskos_pool.describe(exc)}", file=sys.stderr)
+                    c = _counts(getattr(exc, "deleted", None))
+                    if c:
+                        run["deleted"][p] = c
+                    run["failures"][p] = boskos_pool.describe(exc)
 
-            outcome = None
-            try:
-                outcome = boskos_pool.acquire_and_hold(
-                    args.boskos_server,
-                    args.boskos_owner,
-                    BOSKOS_SWEEP_STATE,
-                    lambda: boskos_pool.acquire(
-                        args.boskos_server, args.boskos_owner, BOSKOS_SWEEP_STATE, name=args.project
-                    ),
-                    visit,
-                    release_failures,
-                    heartbeat=True,
-                )
-            except SweepError as exc:
-                code = 1
-                error = str(exc)
-                del_counts = getattr(exc, "deleted", None)
-                if del_counts and (del_counts.get("addresses") or del_counts.get("subnets") or del_counts.get("networks")):
-                    run["deleted"][args.project] = {
-                        "addresses": len(del_counts.get("addresses", [])),
-                        "subnets": len(del_counts.get("subnets", [])),
-                        "networks": len(del_counts.get("networks", [])),
-                    }
-                run["failures"][args.project] = str(exc)
-                print(f"ERROR: {exc}", file=sys.stderr)
-            except Terminated as exc:
-                del_counts = getattr(exc, "deleted", None)
-                if del_counts and (del_counts.get("addresses") or del_counts.get("subnets") or del_counts.get("networks")):
-                    run["deleted"][args.project] = {
-                        "addresses": len(del_counts.get("addresses", [])),
-                        "subnets": len(del_counts.get("subnets", [])),
-                        "networks": len(del_counts.get("networks", [])),
-                    }
-                run["failures"][args.project] = str(exc)
-                raise
-            finally:
-                if args.project in release_failures:
-                    code = 1
-                    before = run["failures"].get(args.project)
-                    run["failures"][args.project] = ("%s; " % before if before else "") + release_failures[args.project]
-                    if not error:
-                        error = release_failures[args.project]
+            outcome = boskos_pool.acquire_and_hold(
+                args.boskos_server,
+                args.boskos_owner,
+                BOSKOS_SWEEP_STATE,
+                lambda: boskos_pool.acquire(
+                    args.boskos_server, args.boskos_owner, BOSKOS_SWEEP_STATE, name=args.project
+                ),
+                visit,
+                run["failures"],
+                heartbeat=True,
+            )
 
             if outcome is boskos_pool.NOT_ACQUIRED:
                 code = 1
                 error = f"project {args.project} is not free in Boskos (leased, busy, or not registered there)"
                 run["failures"][args.project] = error
+                print(f"ERROR: {error}", file=sys.stderr)
+            elif args.project in run["failures"]:
+                code = 1
+                error = run["failures"][args.project]
                 print(f"ERROR: {error}", file=sys.stderr)
         else:
             projects = pool_projects(args.ci_deploy_script)

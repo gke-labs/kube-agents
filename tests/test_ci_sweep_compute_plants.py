@@ -17,6 +17,7 @@ import importlib.util
 import io
 import json
 import pathlib
+import re
 import sys
 import tempfile
 import unittest
@@ -34,6 +35,20 @@ _spec.loader.exec_module(sweep)
 
 
 class MatchesPlantDescriptionTest(unittest.TestCase):
+    def test_planter_main_tf_description_matches_prefix(self):
+        """Proves the planter stack's plant_description matches PLANT_DESCRIPTION_PREFIX."""
+        planter_tf = _REPO_ROOT / "bench" / "tf" / "prebuilt" / "subnet-range-exhaustion" / "main.tf"
+        self.assertTrue(planter_tf.is_file(), f"{planter_tf} must exist")
+        content = planter_tf.read_text(encoding="utf-8")
+        match = re.search(r'(?m)^\s*plant_description\s*=\s*"([^"]+)"', content)
+        self.assertIsNotNone(match, "plant_description must be defined in main.tf")
+        assert match is not None
+        plant_desc = match.group(1)
+        self.assertTrue(
+            sweep.matches_plant_description(plant_desc),
+            f"Planter description {plant_desc!r} does not match prefix {sweep.PLANT_DESCRIPTION_PREFIX!r}",
+        )
+
     def test_exact_prefix_matches(self):
         desc = "kube-agents-bench plant (networking-audit-subnet-range-exhaustion); safe to delete"
         self.assertTrue(sweep.matches_plant_description(desc))
@@ -1161,6 +1176,31 @@ class MainCliTest(unittest.TestCase):
                 self.assertEqual(data["exit"], "failed")
                 self.assertEqual(data["failures"]["p1"], "p1: networks: net-1 (inUse); release failed: release rejected")
                 self.assertNotIn("release failed: release failed", data["failures"]["p1"])
+        finally:
+            pathlib.Path(report_path).unlink(missing_ok=True)
+
+    def test_project_mode_sweep_fault_and_release_termination_preserves_both(self):
+        """Proves termination during release preserves both the sweep fault and partial deletions."""
+        with tempfile.NamedTemporaryFile("w", delete=False) as tf:
+            report_path = tf.name
+
+        try:
+            sweep_err = sweep.SweepError(
+                "p1: networks: net-1 (inUse)",
+                deleted={"addresses": ["addr-1"], "subnets": [], "networks": []},
+            )
+            with (
+                mock.patch.object(sweep.boskos_pool, "acquire", return_value="p1"),
+                mock.patch.object(sweep.boskos_pool, "release_settled", side_effect=sweep.Terminated("signal 15")),
+                mock.patch.object(sweep, "sweep_project", side_effect=sweep_err),
+            ):
+                code = sweep.main(["--project", "p1", "--report", report_path])
+                self.assertEqual(code, sweep.TERMINATED_EXIT_CODE)
+                data = json.loads(pathlib.Path(report_path).read_text(encoding="utf-8"))
+                self.assertEqual(data["exit"], "terminated")
+                self.assertEqual(data["deleted"]["p1"]["addresses"], 1)
+                self.assertEqual(data["failures"]["p1"], "p1: networks: net-1 (inUse)")
+                self.assertIn("signal 15", data["error"])
         finally:
             pathlib.Path(report_path).unlink(missing_ok=True)
 
