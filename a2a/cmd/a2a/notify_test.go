@@ -3,6 +3,8 @@ package main
 import (
 	"encoding/json"
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -210,5 +212,21 @@ func TestNotifyARefusedPublishIsARefusalNotAnUnknown(t *testing.T) {
 	}
 	if elapsed := time.Since(started); elapsed > 5*time.Second {
 		t.Errorf("took %s; a refusal should not wait out the timeout", elapsed)
+	}
+}
+
+// TestNotifyBlocksFileMustBeReadableJSON: --blocks-file is refused before
+// anything reaches the bus when it is missing or is not JSON.
+func TestNotifyBlocksFileMustBeReadableJSON(t *testing.T) {
+	dir := t.TempDir()
+	bad := filepath.Join(dir, "bad.json")
+	if err := os.WriteFile(bad, []byte("[{not json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for name, path := range map[string]string{"missing": filepath.Join(dir, "none.json"), "not JSON": bad} {
+		err := runNotify([]string{"--platform", "slack", "--blocks-file", path, "--", "x"})
+		if err == nil || !strings.Contains(err.Error(), "--blocks-file") && !strings.Contains(err.Error(), "not JSON") {
+			t.Errorf("%s: err = %v, want a --blocks-file refusal", name, err)
+		}
 	}
 }

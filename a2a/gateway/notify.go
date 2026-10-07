@@ -56,6 +56,13 @@ type notifyPoster interface {
 	PostNotify(space, thread, text string) (message, landed string, err error)
 }
 
+// notifyBlocksPoster is the optional half a backend that renders Block Kit
+// adds: one message, blocks with text as the fallback. SlackAdapter is the
+// one implementation; a request with blocks to any other backend is refused.
+type notifyBlocksPoster interface {
+	PostNotifyBlocks(home, thread, text string, blocks json.RawMessage) (message, landed string, err error)
+}
+
 // Notifier answers chat.notify requests for one backend.
 type Notifier struct {
 	subject string
@@ -229,6 +236,15 @@ func (n *Notifier) validate(data []byte) (lib.NotifyRequest, *lib.NotifyReply) {
 	if req.Thread != "" && !n.threadOK(req.Thread) {
 		return refuse(fmt.Sprintf("thread %q is not a thread of the home channel", req.Thread))
 	}
+	if len(req.Blocks) > 0 {
+		if _, ok := n.poster.(notifyBlocksPoster); !ok {
+			return refuse("this backend posts text only; send the request without blocks")
+		}
+		var blocks []json.RawMessage
+		if err := json.Unmarshal(req.Blocks, &blocks); err != nil || len(blocks) == 0 {
+			return refuse("blocks must be a non-empty JSON array of Block Kit blocks")
+		}
+	}
 	return req, nil
 }
 
@@ -238,6 +254,10 @@ func (n *Notifier) validate(data []byte) (lib.NotifyRequest, *lib.NotifyReply) {
 // is logged, since the caller already holds its answer and the start of the
 // text is in the channel.
 func (n *Notifier) post(req lib.NotifyRequest, answer func(lib.NotifyReply)) {
+	if len(req.Blocks) > 0 {
+		n.postBlocks(req, answer)
+		return
+	}
 	thread := req.Thread
 	var first string
 	for i, chunk := range chatChunks(req.Text, discordChunk) {
@@ -258,6 +278,21 @@ func (n *Notifier) post(req lib.NotifyRequest, answer func(lib.NotifyReply)) {
 		}
 	}
 	n.log.Info("notify posted", "home", n.home, "thread", thread, "message", first)
+}
+
+// postBlocks writes a Block Kit request as one message: blocks are not
+// chunked, so the text is only the notification and fallback, cut to one
+// chunk. validate has already refused blocks to a backend without them.
+func (n *Notifier) postBlocks(req lib.NotifyRequest, answer func(lib.NotifyReply)) {
+	poster := n.poster.(notifyBlocksPoster)
+	message, landed, err := poster.PostNotifyBlocks(n.home, req.Thread, truncateRunes(req.Text, discordChunk), req.Blocks)
+	if err != nil {
+		n.log.Error("notify blocks post failed", "home", n.home, "thread", req.Thread, "err", err)
+		answer(lib.NotifyReply{Error: "post failed: " + err.Error()})
+		return
+	}
+	answer(lib.NotifyReply{MessageID: message, ThreadID: landed})
+	n.log.Info("notify posted", "home", n.home, "thread", landed, "message", message, "blocks", true)
 }
 
 // inHome reports whether thread is a thread resource of the home space

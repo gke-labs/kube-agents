@@ -72,6 +72,7 @@ func runNotify(args []string) error {
 	platform := fs.String("platform", "", "chat platform: "+strings.Join(notifyPlatforms(), ", "))
 	thread := fs.String("thread", "", "thread to reply on (default: a new thread in the home channel)")
 	timeout := fs.Duration("timeout", notifyDefaultTimeout, "how long to wait for the gateway's answer")
+	blocksFile := fs.String("blocks-file", "", "a JSON array of Slack Block Kit blocks to post as one message, with the text as its fallback (Slack only)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -85,7 +86,18 @@ func runNotify(args []string) error {
 	if err != nil {
 		return err
 	}
-	body, err := json.Marshal(lib.NotifyRequest{Text: text, Thread: *thread})
+	req := lib.NotifyRequest{Text: text, Thread: *thread}
+	if *blocksFile != "" {
+		raw, err := os.ReadFile(*blocksFile)
+		if err != nil {
+			return fmt.Errorf("notify: --blocks-file: %w", err)
+		}
+		if !json.Valid(raw) {
+			return fmt.Errorf("notify: --blocks-file %s is not JSON", *blocksFile)
+		}
+		req.Blocks = raw
+	}
+	body, err := json.Marshal(req)
 	if err != nil {
 		return err
 	}

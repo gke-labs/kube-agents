@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -576,6 +577,32 @@ func (s *SlackAdapter) PostNotify(channel, thread, text string) (message, landed
 		return "", "", fmt.Errorf("slack: not a channel id: %q", channel)
 	}
 	opts := []slack.MsgOption{slack.MsgOptionText(toMrkdwn(text), false)}
+	if thread != "" {
+		opts = append(opts, slack.MsgOptionTS(thread))
+	}
+	_, ts, err := s.api.PostMessage(channel, opts...)
+	if err != nil {
+		return "", "", err
+	}
+	if thread == "" {
+		thread = ts
+	}
+	return ts, thread, nil
+}
+
+// PostNotifyBlocks is PostNotify for a Block Kit message: blocks as given,
+// text as the notification and fallback. The blocks are decoded into
+// slack-go's types to be sent; one it does not know travels as Slack wrote
+// it, and Slack's own refusal (invalid_blocks) comes back as the error.
+func (s *SlackAdapter) PostNotifyBlocks(channel, thread, text string, raw json.RawMessage) (message, landed string, err error) {
+	if !slackIsHomeChannelID(channel) {
+		return "", "", fmt.Errorf("slack: not a channel id: %q", channel)
+	}
+	var blocks slack.Blocks
+	if err := json.Unmarshal(raw, &blocks); err != nil {
+		return "", "", fmt.Errorf("slack: blocks: %w", err)
+	}
+	opts := []slack.MsgOption{slack.MsgOptionText(toMrkdwn(text), false), slack.MsgOptionBlocks(blocks.BlockSet...)}
 	if thread != "" {
 		opts = append(opts, slack.MsgOptionTS(thread))
 	}

@@ -1,5 +1,7 @@
 package lib
 
+import "encoding/json"
+
 // The chat.notify wire contract, shared by the gateway that answers it
 // (a2a/gateway/notify.go) and the `a2a notify` command that sends it from the
 // agent container. The grants that bound who may do either are rendered by
@@ -37,6 +39,11 @@ type NotifyRequest struct {
 	// which names no channel, so the gateway posts it into the home
 	// channel and nowhere else.
 	Thread string `json:"thread,omitempty"`
+	// Blocks, when set, is a Slack Block Kit array posted as one message
+	// with Text as its notification and fallback text (the fleet audit's
+	// report card). Only a backend that renders blocks takes it; any other
+	// refuses the request rather than dropping the blocks.
+	Blocks json.RawMessage `json:"blocks,omitempty"`
 }
 
 // NotifyReply is the answer: the first message posted and the thread it
