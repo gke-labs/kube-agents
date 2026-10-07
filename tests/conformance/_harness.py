@@ -117,6 +117,7 @@ SOURCES: dict[str, Source] = {
             "os.umask(0o177)",
             "DESTRUCTIVE_SLACK_VERBS",
             "SLACK_REMOVE_ALLOWLIST",
+            "SLACK_METHOD_SHAPE",
         ),
     ),
     "session_kv_server": Source(

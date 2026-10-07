@@ -502,6 +502,15 @@ Mutation(
         "allowlist beside it",
     ),
     Mutation(
+        "B1-slack-method-shape-dropped",
+        "agents/platform/scripts/credential_proxy.py",
+        ("        if not SLACK_METHOD_SHAPE.fullmatch(method):\n",
+         "        if not method:\n"),
+        "test_B1_the_slack_relay_removes_nothing_but_its_own_reaction",
+        "drop the shape check as redundant beside the verb rule, which reads "
+        "only the text after the last dot and so forwards `chat.delete#x`",
+    ),
+    Mutation(
         "B2-second-pull-requests-write",
         ".github/workflows/conformance.yml",
         ("permissions:\n  contents: read\n\njobs:\n  conformance:\n",

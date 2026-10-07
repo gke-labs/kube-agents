@@ -328,7 +328,9 @@ class B1NoAgentCredentialCausesAProductionChange(unittest.TestCase):
         removed pin cannot be put back by sending another. `reactions.remove`
         is the one exemption: Slack lets it take off only the calling token's
         own reaction, which adding it again restores. The exemption is the
-        exact name, so a case variant of it is refused like the rest.
+        exact name, so a case variant of it is refused like the rest. The
+        verb is read after the last dot, so a name that is not dotted words
+        (`chat.delete#x`, whose fragment the URL drops) is refused before it.
         """
         relay = h.credential_proxy.SlackRelay.__new__(h.credential_proxy.SlackRelay)
         forwarded: list[str] = []
@@ -356,6 +358,9 @@ class B1NoAgentCredentialCausesAProductionChange(unittest.TestCase):
             "reminders.delete",
             "usergroups.users.remove",
             "admin.conversations.delete",
+            "chat.delete#x",
+            "chat.delete?x",
+            "chat.delete.",
         ):
             try:
                 relay.api_call("T123", method, {})
