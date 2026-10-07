@@ -97,18 +97,31 @@ class StageTest(unittest.TestCase):
     def _started_ids(self) -> list[str]:
         return [argv[-1] for argv, _env in self.started]
 
-    def _ledger(self, job_id: str, status: str, claimed_at: float, replace: bool = True) -> None:
-        """A run row in the Platform Agent's cron store, as profile-cron-tick leaves one."""
+    def _ledger(
+        self, job_id: str, status: str, claimed_at: float, replace: bool = True, skip_reason: str | None = None
+    ) -> None:
+        """A run row in the Platform Agent's cron store, as profile-cron-tick leaves one.
+
+        The skip ledger's ``skip_reason`` column is added only for a row that carries one, so the
+        other tests read a store without it.
+        """
         db = self.d / "profiles" / "platform" / "cron" / oobe.EXECUTIONS_DB
         with sqlite3.connect(db) as conn:
             conn.execute("CREATE TABLE IF NOT EXISTS executions (id INTEGER PRIMARY KEY, job_id TEXT, status TEXT, claimed_at TEXT)")
+            if skip_reason is not None:
+                with contextlib.suppress(sqlite3.OperationalError):
+                    conn.execute("ALTER TABLE executions ADD COLUMN skip_reason TEXT")
             # A run's row is updated in place as it ends; a new status replaces the job's in-flight row.
             if replace:
                 conn.execute("DELETE FROM executions WHERE job_id = ? AND status IN ('claimed', 'running')", (job_id,))
-            conn.execute(
-                "INSERT INTO executions (job_id, status, claimed_at) VALUES (?, ?, ?)",
-                (job_id, status, datetime.fromtimestamp(claimed_at, timezone.utc).isoformat()),
-            )
+            claimed = datetime.fromtimestamp(claimed_at, timezone.utc).isoformat()
+            if skip_reason is None:
+                conn.execute("INSERT INTO executions (job_id, status, claimed_at) VALUES (?, ?, ?)", (job_id, status, claimed))
+            else:
+                conn.execute(
+                    "INSERT INTO executions (job_id, status, claimed_at, skip_reason) VALUES (?, ?, ?, ?)",
+                    (job_id, status, claimed, skip_reason),
+                )
 
     def _drive(self, now: float = NOW_SETTLED, ticks: int = 20) -> float:
         """Tick the stage, completing each audit's run a minute after it is marked, until done."""
@@ -418,12 +431,38 @@ class StageTest(unittest.TestCase):
         second = oobe.FIRST_RUN_AUDITS[1]
         self.assertEqual(self._started_ids()[-1], second)
         self._ledger(second, "running", NOW_SETTLED + MINUTE)
-        self._ledger(second, "skipped", NOW_SETTLED + 3 * MINUTE, replace=False)
+        self._ledger(second, "skipped", NOW_SETTLED + 3 * MINUTE, replace=False, skip_reason=oobe.SKIP_ALREADY_RUNNING)
         self._main(now=NOW_SETTLED + 4 * MINUTE)
         self.assertEqual(self._started_ids(), list(oobe.FIRST_RUN_AUDITS[:2]))
         self._ledger(second, "completed", NOW_SETTLED + MINUTE)
         self._main(now=NOW_SETTLED + 5 * MINUTE)
         self.assertEqual(self._started_ids(), list(oobe.FIRST_RUN_AUDITS[:3]))
+
+    def test_a_skip_for_another_reason_is_no_claim(self):
+        # A mark skipped as the gateway shut down ran nothing; it is made again at the start limit.
+        self._file_scan()
+        _board(self.board, [_ranking("done")])
+        self._main(now=NOW_SETTLED)
+        self._ledger(FIRST[0], "skipped", NOW_SETTLED + MINUTE, skip_reason="interpreter_shutdown")
+        self._main(now=NOW_SETTLED + 2 * MINUTE)
+        self.assertEqual(self._started_ids(), FIRST)
+        self._main(now=NOW_SETTLED + oobe.START_LIMIT_SECONDS)
+        self._main(now=NOW_SETTLED + oobe.START_LIMIT_SECONDS + MINUTE)
+        self.assertEqual(self._started_ids(), FIRST * 2)
+
+    def test_a_mark_claimed_late_is_not_made_again(self):
+        # The scheduler claims the mark after the start limit counted it as never started.
+        self._file_scan()
+        _board(self.board, [_ranking("done")])
+        self._main(now=NOW_SETTLED)
+        self._main(now=NOW_SETTLED + oobe.START_LIMIT_SECONDS)
+        late = NOW_SETTLED + oobe.START_LIMIT_SECONDS + MINUTE
+        self._ledger(FIRST[0], "running", late)
+        self._main(now=late + MINUTE)
+        self.assertEqual(self._started_ids(), FIRST)
+        self._ledger(FIRST[0], "completed", late)
+        self._main(now=late + 2 * MINUTE)
+        self.assertEqual(self._started_ids(), list(oobe.FIRST_RUN_AUDITS[:2]))
 
     def test_each_mark_time_is_recorded(self):
         self._file_scan()

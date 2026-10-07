@@ -19,7 +19,7 @@
 # deployed image ships one (an install that onboarded before the job existed never
 # got it), then waits up to an hour for the stage to finish its chain. The verifier
 # reads the stage's .oobe_audits_fired and the Platform Agent's cron/executions.db,
-# and passes once the stage marked all four audits due, each has a run since the arm
+# and passes once the stage marked all four audits due, each has a run since its mark
 # that is running or completed, and each started only after the one before it
 # ended. On an image without the job nothing starts them, which is this case's red.
 #

@@ -124,12 +124,13 @@ has ended, whatever its outcome. The shipped schedule staggers the audits for th
 (`autonomous-watchdogs.md`: "Stagger start minutes so two audits never contend for the same
 session"). Four started in the same minute put a fresh CI install's gateway pod under memory
 pressure for the best part of an hour and broke the cluster reads of a case running beside them.
-For the same reason the chain waits while any of the four is running on its schedule, before the
-first mark and between marks; a mark that finds its audit already running counts that run as its
-own.
+For the same reason the chain waits while any of the four has a run going, whatever started it,
+before the first mark and between marks; a mark that finds its audit already running counts that
+run as its own, and one the store skipped for any other reason counts as not claimed.
 A mark the scheduler has not claimed after `START_LIMIT_SECONDS` (10 minutes) is made again, as a
-failed attempt; a run still going after `RUN_LIMIT_SECONDS` (an hour), or a row a gateway restart
-left at running, stops holding the chain. The stage is done once the last audit's run has started.
+failed attempt, unless the scheduler claims it late first, in which case that run is the audit's.
+A run still going after `RUN_LIMIT_SECONDS` (an hour), or a row a gateway restart left at running,
+stops holding the chain. The stage is done once the last audit's run has started.
 
 For each audit in turn, `oobe.py` calls Hermes' `cron.jobs.trigger_job(<id>)` in a subprocess of the
 gateway's own interpreter with `HERMES_HOME=<agent home>/profiles/platform`, which is where
@@ -142,8 +143,8 @@ calling process (`hermes_cli/cron.py`, `_job_action` forces it), so a per-minute
 a model run open, outside the tick's environment, until it times out. `cronjob(action='run')` does
 the same on some runtimes (`agents/platform/AGENTS.md`).
 
-`.oobe_audits_fired` records each id once it is marked due, and the one in flight with when it was
-marked. A failed mark is retried on the next tick, and only that one: marking an audit due again
+`.oobe_audits_fired` records each id once it is marked due, with when it was marked, and which
+one is in flight. A failed mark is retried on the next tick, and only that one: marking an audit due again
 after it has run starts a second full run.
 
 `trigger_job` also sets the job's `enabled` back to true and clears a pause, so an
@@ -251,7 +252,7 @@ archived stand-in sweep card and an archived ranking card after it, points `.boo
 at the sweep, clears `.oobe_audits_fired`, and puts back the `oobe` job when the image ships one;
 the teardown restores both markers and the job as it found them.
 The stack then waits, up to an hour, for the stage to finish its chain, so the verifier's two-minute window opens after the last audit has started. The verifier reads the Platform Agent's cron run records and
-passes when the stage's `.oobe_audits_fired` lists all four audits as marked due and each has a run claimed since the stage marked it that is running or completed (a skipped row is passed over), so a scheduled run that falls in the window does not count, and each started only after the one before it in the chain ended. Red: on
+passes when the stage's `.oobe_audits_fired` lists all four audits as marked due and each has a run claimed since the stage marked it that is running or completed (a skipped row is passed over), so a scheduled run that falls in the window does not count, and each started only after the one before it in the chain ended. That is stricter than the stage: a mark that lands on a scheduled run it did not see start, a race the stack's wait for running audits makes rare, reads as no run. Red: on
 an image without the job, no audit runs. Green: four, in three repetitions. The no-repository skip is unit-tested,
 not evaluated: the shared install has a repository, and removing it mid-run would break concurrent
 cases.

@@ -66,9 +66,14 @@ FIRST_RUN_AUDITS = (
     "stockout-prevention",
 )
 EXECUTIONS_DB = "executions.db"
-# A run row in either is still going; any other status has ended, including the `skipped` row a
-# mark leaves when the audit was already running on its schedule.
+# A run row in either is still going; any other status has ended.
 IN_FLIGHT_STATUSES = ("claimed", "running")
+# The cron store's skip ledger (deploy/docker/patches/cron_skip_ledger.py) writes a skipped row with
+# its reason. A mark skipped because the audit was already running is answered by that run; a skip
+# for any other reason (a shutdown, a lost claim) ran nothing and is read as no claim at all.
+SKIPPED_STATUS = "skipped"
+SKIP_REASON_COLUMN = "skip_reason"
+SKIP_ALREADY_RUNNING = "already_running_elsewhere"
 PLATFORM_PROFILE = "platform"
 PROFILES_DIR = "profiles"
 CRON_DIR = "cron"
@@ -332,15 +337,16 @@ def _runs(data_dir: Path, jobs: tuple[str, ...]) -> list[tuple[str, str, float]]
     ledger = data_dir / PROFILES_DIR / PLATFORM_PROFILE / CRON_DIR / EXECUTIONS_DB
     if not ledger.is_file():
         return []
-    marks = ",".join("?" * len(jobs))
+    placeholders = ",".join("?" * len(jobs))
     try:
         conn = sqlite3.connect(
             f"file:{ledger}?mode=ro", uri=True, timeout=bootstrap_handoff.SQLITE_BUSY_TIMEOUT_SECONDS
         )
         try:
+            has_reason = any(row[1] == SKIP_REASON_COLUMN for row in conn.execute("PRAGMA table_info(executions)"))
             rows = conn.execute(
-                f"SELECT job_id, status, claimed_at FROM executions WHERE job_id IN ({marks}) "
-                "AND claimed_at IS NOT NULL ORDER BY claimed_at",
+                f"SELECT job_id, status, claimed_at, {SKIP_REASON_COLUMN if has_reason else 'NULL'} "
+                f"FROM executions WHERE job_id IN ({placeholders}) AND claimed_at IS NOT NULL ORDER BY claimed_at",
                 jobs,
             ).fetchall()
         finally:
@@ -349,7 +355,9 @@ def _runs(data_dir: Path, jobs: tuple[str, ...]) -> list[tuple[str, str, float]]
         _log(f"cannot read {ledger}: {e}")
         return []
     runs = []
-    for job_id, status, claimed in rows:
+    for job_id, status, claimed, skip_reason in rows:
+        if status == SKIPPED_STATUS and skip_reason != SKIP_ALREADY_RUNNING:
+            continue
         try:
             runs.append((job_id, status, datetime.fromisoformat(claimed).timestamp()))
         except (TypeError, ValueError):
@@ -411,17 +419,20 @@ def advance_chain(data_dir: Path, state: dict, now: float) -> dict:
             # The last audit has started, or a scheduled run of it was already going; nothing is
             # left to mark.
             return save(done=True)
-        if status in IN_FLIGHT_STATUSES and now - marked_at < RUN_LIMIT_SECONDS:
-            return save()
         current = None
 
     busy = audits_in_flight(data_dir, now)
     if busy:
-        # One of the four is running on its schedule (a mark that found its audit already running
-        # leaves a skipped row and lands here); the chain waits its turn, as the schedule does.
+        # One of the four has a run going, whatever started it, including the run a mark found
+        # already going; the chain waits its turn, as the schedule does.
         return save()
     holds = audit_holds(data_dir)
     for job_id in pending:
+        if job_id in marks and run_status(data_dir, job_id, marks[job_id]) is not None:
+            # A mark the scheduler claimed only after it was counted as never started: that run
+            # was this audit's, and marking it again would start a second.
+            fired.append(job_id)
+            continue
         if holds is not None and job_id in holds:
             _log(f"not starting {job_id}: {holds[job_id]}")
             held[job_id] = holds[job_id]

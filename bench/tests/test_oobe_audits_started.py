@@ -203,10 +203,12 @@ def test_the_run_after_each_mark_is_graded(store: Store) -> None:
 
 
 def test_a_skipped_row_is_passed_over(store: Store) -> None:
+    # A skipped row between each mark and its run, the first one graded if it were not passed over.
     store.arm()
-    for audit in oobe.FIRST_RUN_AUDITS:
-        store.run(audit, ARMED + timedelta(minutes=1), "skipped")
-    store.chain(ARMED + timedelta(minutes=2))
+    start = ARMED + timedelta(minutes=2)
+    store.chain(start)
+    for i, audit in enumerate(oobe.FIRST_RUN_AUDITS):
+        store.run(audit, start + timedelta(minutes=4 * i, seconds=-20), "skipped")
     result = _verify()
     assert result.status == "pass", result.reason
 

@@ -367,7 +367,7 @@ CHECK_ASSERTIONS: dict[str, tuple[str, ...]] = {
     # CLUSTER_READING_TYPES below.
     "sandbox_tree_matches_image": (),
     # This repository, agent-disk-reading. No field: whether every first-run audit has a run
-    # claimed since the stack armed the stage is the whole assertion.
+    # claimed since the stage marked it is the whole assertion.
     "oobe_audits_started": (),
 }
 
