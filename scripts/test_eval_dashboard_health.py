@@ -1582,6 +1582,14 @@ class PoolNote(unittest.TestCase):
         artifact["trend"]["days"][-1]["judged"] = True
         self.assertEqual(health.pool_wait_p50_s(artifact, T0), 2400)
 
+    def test_the_digest_wait_is_withheld_when_the_producer_could_not_measure(self):
+        # The producer reports the days that did read under an UNMEASURED
+        # verdict; the headline must not print a typical wait above the note
+        # that says the wait is unknown.
+        artifact = pressure(verdict="UNMEASURED", today_p50=40.0)
+        self.assertTrue(artifact["trend"]["days"][-1]["judged"])
+        self.assertIsNone(health.pool_wait_p50_s(artifact, T0))
+
     def test_a_quiet_night_falls_back_to_the_last_day_the_producer_judged(self):
         # A night with no runs at all already prints yesterday's median, because
         # the producer emits no row for an empty day. Three overnight runs must

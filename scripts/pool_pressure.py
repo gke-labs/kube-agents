@@ -904,15 +904,15 @@ def collect_waits(
         if not entries:
             return Source(error=f"the build index at {GCS_BUILD_INDEX} is empty")
 
-        candidates: Dict[str, List[str]] = {}
-        for build_id, path in entries.items():
+        candidates: Dict[str, List[int]] = {}
+        for build_id in entries:
             moment = snowflake_time(build_id)
             if (
                 window_start - SNOWFLAKE_SLACK
                 <= moment
                 <= window_end + SNOWFLAKE_SLACK
             ):
-                candidates.setdefault(moment.strftime(DATE_FORMAT), []).append(path)
+                candidates.setdefault(moment.strftime(DATE_FORMAT), []).append(build_id)
         if not candidates:
             return Source(
                 value=Sweep([], 0, time.monotonic() - began, window_start)
@@ -928,13 +928,12 @@ def collect_waits(
                 if time.monotonic() - began > deadline_seconds:
                     truncated = True
                     break
-                paths = sorted(candidates[day])
-                for path, (wait, error) in zip(paths, pool.map(_read_wait, paths)):
+                builds = sorted(candidates[day])
+                paths = [entries[build] for build in builds]
+                for build, (wait, error) in zip(builds, pool.map(_read_wait, paths)):
                     read += 1
                     if error is not None:
-                        unreadable.append(
-                            {"build_id": path.rsplit("/", 1)[-1], "error": error}
-                        )
+                        unreadable.append({"build_id": str(build), "error": error})
                     elif wait is not None:
                         collected.append(wait)
                 done.append(day)
@@ -958,13 +957,14 @@ def collect_waits(
     # Before the per-build catch this input crashed the job red; it must not
     # come out as a quiet window. The sweep travels with the error so what did
     # read is still reported, under the unmeasured verdict.
+    # Builds after the window are read for the slack and dropped above; on an
+    # --as-of replay they would otherwise be the newest ten.
     errors = {u["build_id"]: u["error"] for u in unreadable}
     newest = sorted(
-        (path.rsplit("/", 1)[-1] for day in done for path in candidates[day]),
-        key=int,
+        (b for day in done for b in candidates[day] if snowflake_time(b) <= window_end),
         reverse=True,
     )[:UNREADABLE_SAMPLE_BUILDS]
-    bad = [build for build in newest if build in errors]
+    bad = [str(build) for build in newest if str(build) in errors]
     if len(bad) > len(newest) * UNREADABLE_SHARE_LIMIT:
         return Source(
             value=sweep,
@@ -1472,7 +1472,13 @@ def render(summary: dict) -> str:
     out.append(f" {summary['window_start']}  ->  {summary['window_end']}")
     out.append("=" * REPORT_WIDTH)
 
-    if not trend["read"]:
+    if not trend["read"] and trend["days"]:
+        out.append(
+            f"\n[?] The newest builds could not be read, so this run is not a"
+            f" measurement: {trend['error']}\n    The numbers below are over the"
+            " builds that did read."
+        )
+    elif not trend["read"]:
         out.append(f"\n[?] Trend not measured: {trend['error']}")
 
     if trend["truncated"]:
@@ -1614,8 +1620,13 @@ def render(summary: dict) -> str:
 
     out.append("\n" + "-" * REPORT_WIDTH)
     if summary["verdict"] == VERDICT_UNMEASURED:
-        out.append("COULD NOT MEASURE. The thresholds were not crossed because the wait")
-        out.append("was not measured. This is not a green run.")
+        if trend["days"]:
+            out.append("COULD NOT MEASURE. The newest builds could not be read, so the current")
+            out.append("wait is unknown; the numbers above are over the builds that did read.")
+        else:
+            out.append("COULD NOT MEASURE. The thresholds were not crossed because the wait")
+            out.append("was not measured.")
+        out.append("This is not a green run.")
         out.append("-" * REPORT_WIDTH)
         return "\n".join(out)
 

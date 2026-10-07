@@ -762,11 +762,11 @@ class SweepUnreadable(unittest.TestCase):
         return [self._build(self.AS_OF - timedelta(days=days_back, hours=h))
                 for h in range(1, count + 1)]
 
-    def _sweep(self, bad=(BAD,), pending=(), builds=BUILDS, days=1, slow=()):
-        entries = {build: f"gs://bucket/{build}" for build in builds}
+    def _sweep(self, bad=(BAD,), pending=(), builds=BUILDS, days=1, slow=(), suffix=""):
+        entries = {build: f"gs://bucket/{build}{suffix}" for build in builds}
 
         def wait_for(path):
-            build = int(path.rsplit("/", 1)[1])
+            build = int(path.rstrip("/").rsplit("/", 1)[1])
             if build in bad:
                 raise UnicodeDecodeError("utf-8", b"\xe2\x86", 0, 2, "unexpected end of data")
             if build in pending:
@@ -839,6 +839,10 @@ class SweepUnreadable(unittest.TestCase):
         out = pp.render(summary)
         self.assertIn("COULD NOT MEASURE", out)
         self.assertIn("2026-08-25", out)
+        # The table under the verdict is a measurement of what did read, and
+        # the lines around it say so rather than calling the trend unmeasured.
+        self.assertNotIn("Trend not measured", out)
+        self.assertEqual(2, out.count("builds that did read"))
 
     def test_unreadable_builds_older_than_the_newest_ten_do_not_fail_the_sweep(self):
         """Most of a past day raising is named and left out; it says nothing
@@ -858,6 +862,24 @@ class SweepUnreadable(unittest.TestCase):
         self.assertTrue(source.ok)
         self.assertEqual(10, len(source.value.waits))
         self.assertEqual(5, len(source.value.unreadable))
+
+    def test_an_index_path_not_ending_in_the_build_id_does_not_crash_the_sweep(self):
+        """The build ID comes from the index file's name, which the reader
+        checks; the body is whatever Prow wrote and is never parsed."""
+        source = self._sweep(suffix="/")
+        self.assertTrue(source.ok)
+        self.assertEqual([str(self.BAD)], [u["build_id"] for u in source.value.unreadable])
+
+    def test_builds_after_the_window_are_not_the_newest_ten_on_a_replay(self):
+        """An --as-of replay walks the slack slice after the window and drops
+        it from the numbers; it must not be the population the reader is
+        judged on either."""
+        after = [self._build(self.AS_OF + timedelta(hours=h)) for h in range(1, 7)]
+        newest = self._day(0, 12)
+        source = self._sweep(bad=after, builds=newest + after)
+        self.assertTrue(source.ok)
+        self.assertEqual(12, len(source.value.waits))
+        self.assertEqual(6, len(source.value.unreadable))
 
     def test_a_breach_among_the_readable_builds_outranks_could_not_measure(self):
         older, newest = self._day(1, 12), self._day(0, 10)

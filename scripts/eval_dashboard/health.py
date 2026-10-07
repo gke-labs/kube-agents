@@ -1584,6 +1584,10 @@ def pool_wait_p50_s(artifact: dict | None, now: datetime) -> int | None:
     measured = parse_iso(artifact.get("window_end"))
     if measured is None or now - measured > POOL_STALE_AFTER:
         return None
+    # An UNMEASURED artifact still carries the days that did read; the headline
+    # must not quote one above the note that says the wait is unknown.
+    if artifact.get("verdict") == POOL_UNMEASURED:
+        return None
     # The newest judged row, not the newest row. The producer withholds a
     # verdict below its sample floor, and at 13:00 UTC today's row holds only
     # the overnight runs -- one slow run would otherwise be the morning's
