@@ -713,7 +713,7 @@ variable "drift_pubsub_topic_publishers" {
 }
 
 variable "drift_pubsub_sink_writer_identity_override" {
-  description = "The principal to grant roles/pubsub.publisher on the drift topic, overriding the service-<project-number>@gcp-sa-logging.iam.gserviceaccount.com the drift-pubsub module derives. Include the \"serviceAccount:\" prefix. Only used when enable_drift_pubsub is true. Exists because the module derives that identity rather than reading it off the sink, so the grant can precede the sink: a project where Logging reports some other writer identity fails the sink's postcondition, and with nothing to set here it would fail it on every later plan of this composition too, taking the whole apply with it. Leave null unless an apply has told you to set it; the error names the value to use."
+  description = "The principal to grant roles/pubsub.publisher on the drift topic, overriding the service-<project-number>@gcp-sa-logging.iam.gserviceaccount.com the drift-pubsub module derives. Include the \"serviceAccount:\" prefix. Only used when enable_drift_pubsub is true. Exists because the module derives that identity rather than reading it off the sink, so the grant can precede the sink: a project where Logging reports some other writer identity fails the sink's postcondition, and with nothing to set here it would fail it on every later plan of this composition too, taking the whole apply with it. The failed apply leaves the sink created and exporting without the publish role, which mails every project owner until this is set or the sink is deleted, so it is the fix to reach for first rather than at leisure. Leave null unless an apply has told you to set it; the error names the value to use."
   type        = string
   default     = null
 }

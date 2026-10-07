@@ -776,16 +776,21 @@ not attach the publisher's identity to the message, so anything that can
 publish here can make the detector report a change nobody made, under any
 principal it names. Never list the agent's own GSA.
 
-Beyond the three names and that list, only the module's two required inputs are
-passed, so its defaults decide the 31-day retention and the cluster scope,
-which is every GKE cluster in the project; a caller that needs the module's
-other knobs instantiates it directly.
+Beyond the three names and that list, the module's two required inputs are
+passed and two more of its optional ones:
+`drift_pubsub_sink_writer_identity_override`, which the module's own
+postcondition tells an operator to set when a project's sink reports a writer
+identity the module did not derive, and `drift_pubsub_sink_drain_duration`,
+the destroy-time wait below. Everything else is left to the module's defaults,
+which decide the 31-day retention and the cluster scope, every GKE cluster in
+the project; a caller that needs the module's remaining knobs instantiates it
+directly.
 
-The module creates the sink after its publish grant and holds a two-minute
-wait between deleting the sink and deleting the topic, so that Cloud Logging
-never routes to a topic it cannot reach and mails every project owner about
-it. That wait is why a destroy of this configuration pauses once the sink is
-gone;
+The module creates the sink after its publish grant and holds a wait between
+deleting the sink and deleting the topic — `drift_pubsub_sink_drain_duration`,
+two minutes by default — so that Cloud Logging never routes to a topic it
+cannot reach and mails every project owner about it. That wait is why a
+destroy of this configuration pauses once the sink is gone;
 [the module's README](../../modules/drift-pubsub/README.md#why-the-sink-is-created-last-and-destroyed-first)
 is canonical for both orderings.
 

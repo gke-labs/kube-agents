@@ -252,10 +252,18 @@ resource "google_logging_project_sink" "drift_audit" {
   # would go green over a sink that cannot publish, which is the failure the
   # grant's comment calls the hardest one to see. Checking it here turns that
   # into a failed apply naming both identities.
+  #
+  # A postcondition is evaluated after the resource is created and does not
+  # roll it back, so when this fails the sink is live in GCP and exporting as
+  # an identity that holds no publisher role -- the owner-wide mail this
+  # module exists to prevent, now continuous rather than a sub-second window.
+  # The message has to say so and give the operator a way to stop it now,
+  # because an override they cannot apply immediately leaves them reading
+  # this text while the mail goes out.
   lifecycle {
     postcondition {
       condition     = self.writer_identity == local.expected_sink_writer_identity
-      error_message = "sink ${var.sink_name} publishes as ${self.writer_identity}, not the ${local.expected_sink_writer_identity} that roles/pubsub.publisher was granted to, so it cannot write to topic ${var.topic_name}. Set sink_writer_identity_override = \"${self.writer_identity}\" to move the grant and this check onto the identity Logging reported -- on the full-install composition the variable is drift_pubsub_sink_writer_identity_override, which it passes through. Granting the role by hand will not clear this, because the check compares identities rather than grants. Then open an issue: the module derives the identity from the project number and this project does not follow that form."
+      error_message = "sink ${var.sink_name} publishes as ${self.writer_identity}, not the ${local.expected_sink_writer_identity} that roles/pubsub.publisher was granted to, so it cannot write to topic ${var.topic_name}. The sink already exists and is exporting: this check runs after it is created and does not remove it, so until you resolve this every export fails with topic_permission_denied and Cloud Logging mails an \"[ACTION REQUIRED] sink configuration error\" to every principal holding roles/owner on ${var.project_id}. To stop that now, either delete the sink (gcloud logging sinks delete ${var.sink_name} --project=${var.project_id}) or grant roles/pubsub.publisher on ${var.topic_name} to ${self.writer_identity} by hand -- the hand grant stops the mail but will NOT clear this check, which compares identities rather than grants. The fix that clears it is sink_writer_identity_override = \"${self.writer_identity}\", which moves the grant and this check onto the identity Logging reported; on the full-install composition the variable is drift_pubsub_sink_writer_identity_override, which it passes through. Then open an issue: the module derives the identity from the project number and this project does not follow that form."
     }
   }
 

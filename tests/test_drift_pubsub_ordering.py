@@ -40,7 +40,18 @@ instead. Restoring that reference is the natural resolution of a merge conflict
 in this hunk and would re-invert the order while every edge above still reads
 correct.
 
-Terraform is not a dependency of this suite; the HCL is read as text.
+Terraform is not a dependency of this suite; the HCL is read through the
+tokenizer in `test_terraform_module_tests.py`, which drops comments and makes
+each string and heredoc a single token. Reading the file as text instead is
+not a smaller version of the same check, it is a broken one, in both
+directions: a commented-out `# depends_on = [time_sleep.sink_drain]` left
+behind by an author chasing a cycle satisfies a substring search while the
+edge is gone from the module, which is this file's own regression passing
+green, and an explanatory comment naming the old `writer_identity` reference
+-- the kind that already sits above the grant in `main.tf` -- fails the second
+test with the ordering intact. Both were measured on this file before it was
+changed to tokens. Most of the module's commentary lives inside the blocks
+this file reads, so neither shape is hypothetical.
 
 Run:
   python3 -m unittest discover -s tests -p 'test_drift_pubsub_ordering.py' -v
@@ -48,12 +59,27 @@ Run:
 
 from __future__ import annotations
 
-import re
+import sys
 import unittest
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 MODULE_MAIN = REPO_ROOT / "terraform" / "modules" / "drift-pubsub" / "main.tf"
+
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+try:
+    from tests.test_terraform_module_tests import _STR, _WORD, _blocks, _tokens
+except ImportError:  # run from inside tests/
+    from test_terraform_module_tests import _STR, _WORD, _blocks, _tokens
+
+_LIST_OPEN = "["
+_LIST_CLOSE = "]"
+_SEPARATORS = (",", "[")
+_DEPENDS_ON = "depends_on"
+_RESOURCE = "resource"
+_RESOURCE_LABELS = 2
 
 GRANT = ("google_pubsub_topic_iam_member", "sink_writer")
 DRAIN = ("time_sleep", "sink_drain")
@@ -75,39 +101,64 @@ REQUIRED_EDGES = (
 SINK_WRITER_ATTRIBUTE = f"{SINK[0]}.{SINK[1]}.writer_identity"
 
 
-def _resource_body(source: str, resource_type: str, name: str) -> str:
-    """Return the body of one top-level resource block.
+def _resource_body(tokens: list, resource_type: str, name: str) -> list:
+    """The tokenized body of one top-level resource block, as (token, depth)."""
+    for labels, body in _blocks(tokens, _RESOURCE, _RESOURCE_LABELS):
+        if labels == [resource_type, name]:
+            return body
+    raise AssertionError(
+        f"terraform/modules/drift-pubsub/main.tf declares no "
+        f'resource "{resource_type}" "{name}"'
+    )
 
-    Blocks in this file open at column zero and close on a brace at column
-    zero, so the body is everything between -- nested braces included, since
-    none of them is unindented.
+
+def _depends_on_references(body: list) -> list | None:
+    """The addresses in a block's `depends_on = [...]`, or None if it has none.
+
+    The list's elements are dotted references, which the tokenizer splits into
+    word and `.` tokens, so each element is rejoined from the tokens between
+    its separators.
     """
-    opening = f'resource "{resource_type}" "{name}" {{'
-    start = source.find(opening)
-    if start < 0:
-        raise AssertionError(
-            f"terraform/modules/drift-pubsub/main.tf declares no "
-            f'resource "{resource_type}" "{name}"'
-        )
-    rest = source[start + len(opening) :]
-    end = re.search(r"^\}", rest, re.MULTILINE)
-    if end is None:
-        raise AssertionError(f'resource "{resource_type}" "{name}" is not closed')
-    return rest[: end.start()]
+    flat = [token for token, depth in body if depth == 1]
+    for index in range(len(flat) - 2):
+        if flat[index] != (_WORD, _DEPENDS_ON) or flat[index + 2][1] != _LIST_OPEN:
+            continue
+        references, current = [], ""
+        for kind, value in flat[index + 2 :]:
+            if value in _SEPARATORS or value == _LIST_CLOSE:
+                if current:
+                    references.append(current)
+                current = ""
+                if value == _LIST_CLOSE:
+                    break
+            elif kind != _STR:
+                current += value
+        return references
+    return None
+
+
+def _code_text(body: list) -> str:
+    """A block's tokens rejoined, strings excluded.
+
+    Comments are already gone -- the tokenizer drops them -- and dropping
+    string contents too means a quoted identifier, as in the sink's
+    error_message, reads as prose rather than as a reference.
+    """
+    return "".join(value for (kind, value), _depth in body if kind != _STR)
 
 
 class DriftPubsubOrdering(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
-        cls.source = MODULE_MAIN.read_text(encoding="utf-8")
+        cls.tokens = _tokens(MODULE_MAIN.read_text(encoding="utf-8"))
 
     def test_the_sink_is_the_last_link_in_the_ordering_chain(self) -> None:
         for (dependent_type, dependent_name), (target_type, target_name) in REQUIRED_EDGES:
             with self.subTest(dependent=dependent_name, target=target_name):
-                body = _resource_body(self.source, dependent_type, dependent_name)
-                depends_on = re.search(r"depends_on\s*=\s*\[(.*?)\]", body, re.DOTALL)
+                body = _resource_body(self.tokens, dependent_type, dependent_name)
+                references = _depends_on_references(body)
                 self.assertIsNotNone(
-                    depends_on,
+                    references,
                     f"{dependent_type}.{dependent_name} declares no depends_on, so nothing "
                     f"orders it after {target_type}.{target_name}; Cloud Logging will export "
                     f"to a topic that does not exist or that it cannot publish to, and mail "
@@ -115,16 +166,17 @@ class DriftPubsubOrdering(unittest.TestCase):
                 )
                 self.assertIn(
                     f"{target_type}.{target_name}",
-                    depends_on.group(1),
+                    references,
                     f"{dependent_type}.{dependent_name} must depend on "
-                    f"{target_type}.{target_name}; see the comment above it in main.tf",
+                    f"{target_type}.{target_name}; see the comment above it in main.tf. "
+                    f"A commented-out edge does not count -- this reads tokens, not text",
                 )
 
     def test_the_grant_does_not_read_the_identity_off_the_sink(self) -> None:
-        body = _resource_body(self.source, *GRANT)
+        body = _resource_body(self.tokens, *GRANT)
         self.assertNotIn(
             SINK_WRITER_ATTRIBUTE,
-            body,
+            _code_text(body),
             "the publish grant reads writer_identity off the sink again, which orders the "
             "grant after the sink and reopens the apply-side window; derive the identity "
             "from the project number instead (local.expected_sink_writer_identity)",
