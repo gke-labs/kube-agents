@@ -142,7 +142,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Sequence
 from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
@@ -1227,13 +1227,12 @@ class _TransportError(RuntimeError):
 # exhaustion both turn paths deliberately end in _infra_failure rather than
 # grading a partial record: see _DelegationTransportExhausted for why settling
 # the cards into a record that is about to be replaced wholesale is not a
-# rescue. A client error (non-429 4xx) or a body that is not JSON is an
+# rescue. A client error (non-429 4xx), a 500, or a body that is not JSON is an
 # answer about the request itself and repeating the request cannot change it:
 # a handler that raised will raise again, so those remain graded agent errors.
-# On the opening turn, an unretryable 5xx (such as 500) where the server failed
-# before running the agent turn and without setting X-Hermes-Failure-Reason is
-# classified as infrastructure rather than an agent answer (#2430); a 5xx that
-# carries a failure reason or occurs on subsequent turns remains graded.
+# When the server attaches X-Hermes-Failure-Reason, the turn executed; a
+# rate-limit or billing reason is routed to infrastructure, while any other
+# failure reason is graded without retrying.
 _RETRYABLE_STATUSES = frozenset({429, 502, 503, 504})
 
 
@@ -1557,28 +1556,24 @@ class KubeAgentsHarness(AgentHarness):
                 result, session_id = _post_turn(url, body, headers, timeout)
                 break
             except _TransportError as exc:
-                # An HTTP 5xx on the opening turn where the server failed
-                # before running the agent turn and without setting
-                # X-Hermes-Failure-Reason returns no reply envelope and no
-                # executed turn. Rather than grading the door crash as an
-                # agent answer, the gate treats this unexecuted 5xx as
-                # infrastructure (#2430). If the server set X-Hermes-Failure-Reason
-                # (meaning the agent turn ran and failed), or if this is a
-                # subsequent turn (such as a card-wake answer turn where the
-                # wake turn already replied and billed), the error follows the
-                # standard errored path so executed work remains graded.
-                has_failure_reason = bool(
-                    exc.headers and exc.headers.get(_FAILURE_REASON_HEADER)
+                # If the server response carried X-Hermes-Failure-Reason, an
+                # agent turn executed and produced a classified outcome.
+                # When the reason indicates an infrastructure condition
+                # (token budget exhausted on billing or provider rate limit),
+                # it is classified as infrastructure. Otherwise (such as a
+                # tool error or agent failure), it returns an errored result
+                # directly ahead of any gateway transport retry so the executed
+                # and billed turn remains graded.
+                failure_reason = (
+                    exc.headers.get(_FAILURE_REASON_HEADER)
+                    if exc.headers
+                    else None
                 )
-                if (
-                    opening_turn
-                    and exc.status_code is not None
-                    and 500 <= exc.status_code < 600
-                    and not has_failure_reason
-                ):
-                    if not exc.retryable:
+                if failure_reason:
+                    if failure_reason in ("rate_limit", "billing"):
                         return _infra_failure(str(exc))
-                # A 4xx other than 429, or a body that is not JSON says a handler
+                    return AgentResult.errored(str(exc))
+                # A 500, a 4xx other than 429, or a body that is not JSON says a handler
                 # answered; that is the agent's own failure and still belongs in
                 # front of the judge. Only a gateway status, an admission-control
                 # 429, or a dropped connection is worth a second attempt: see

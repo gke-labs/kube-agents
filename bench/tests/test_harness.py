@@ -201,7 +201,7 @@ class _StubAgentHandler(BaseHTTPRequestHandler):
         headers = {}
         if self.server.session_id:
             headers["X-Hermes-Session-Id"] = self.server.session_id
-        fail_headers = dict(getattr(self.server, "fail_headers", {}))
+        fail_headers = dict(self.server.fail_headers)
         if self.server.session_id:
             fail_headers.setdefault("X-Hermes-Session-Id", self.server.session_id)
         if len(self.server.requests) in self.server.fail_on:
@@ -1289,47 +1289,59 @@ def test_an_agent_side_error_is_still_graded(stub_agent: _StubAgentServer) -> No
     assert len(stub_agent.requests) == 1
 
 
-def test_an_opening_turn_500_is_infrastructure_not_an_answer(
+def test_an_opening_turn_500_is_an_agent_error_not_infra(
     stub_agent: _StubAgentServer,
 ) -> None:
-    """An HTTP 500 on the opening turn gives up as a run class, not an answer (#2430).
+    """An unretryable HTTP 500 without a failure reason remains a graded agent error.
 
-    An internal server error on the opening turn (e.g. the gateway .env race
-    described in #2430) means no agent turn ever ran. The harness classifies
-    it as an infrastructure failure (INFRA_FAILURE_MARKER) with empty output
-    rather than grading the server exception text as the agent's answer.
+    Without a server-side failure reason, a 500 cannot be proved to have
+    occurred before dispatch and remains an agent error in front of the judge.
     """
     stub_agent.fail_with = 500
-
-    result = KubeAgentsHarness().run("Provision operator agent in cluster mercury-09.")
-
-    assert result.has_errors()
-    assert result.errors[0].startswith(harness.INFRA_FAILURE_MARKER)
-    assert "HTTP 500" in result.errors[0]
-    assert "agent exploded" in result.errors[0]
-    assert result.output == ""
-    assert result.trajectory == []
-    assert len(stub_agent.requests) == 1
-
-
-def test_an_opening_turn_500_with_failure_reason_is_an_agent_error_not_infra(
-    stub_agent: _StubAgentServer,
-) -> None:
-    """An opening-turn 5xx carrying X-Hermes-Failure-Reason is graded, not infra.
-
-    When the agent turn ran and failed, the server sets X-Hermes-Failure-Reason
-    (via apply_api_failure_reason_header). Because a turn executed, the 5xx is
-    a graded agent failure rather than an unexecuted infrastructure crash.
-    """
-    stub_agent.fail_with = 500
-    stub_agent.fail_headers = {"X-Hermes-Failure-Reason": "tool_error"}
 
     result = KubeAgentsHarness().run("Provision operator agent in cluster mercury-09.")
 
     assert result.has_errors()
     assert harness.INFRA_FAILURE_MARKER not in result.errors[0]
     assert "HTTP 500" in result.errors[0]
+    assert "agent exploded" in result.errors[0]
     assert result.errors[0] in result.output
+    assert len(stub_agent.requests) == 1
+
+
+def test_an_opening_turn_502_with_failure_reason_is_an_agent_error_not_infra(
+    stub_agent: _StubAgentServer,
+) -> None:
+    """An opening-turn 502 carrying X-Hermes-Failure-Reason is graded, not retried.
+
+    When the agent turn ran and failed (e.g. tool error), the server answers 502
+    with X-Hermes-Failure-Reason. Because the turn already ran and was billed,
+    the harness returns an errored result on the first attempt rather than
+    retrying into transport failure exhaustion (_infra_failure).
+    """
+    stub_agent.fail_with = 502
+    stub_agent.fail_headers = {"X-Hermes-Failure-Reason": "tool_error"}
+
+    result = KubeAgentsHarness().run("Provision operator agent in cluster mercury-09.")
+
+    assert result.has_errors()
+    assert harness.INFRA_FAILURE_MARKER not in result.errors[0]
+    assert "HTTP 502" in result.errors[0]
+    assert result.errors[0] in result.output
+    assert len(stub_agent.requests) == 1
+
+
+def test_an_opening_turn_502_with_rate_limit_reason_is_infra(
+    stub_agent: _StubAgentServer,
+) -> None:
+    """An opening-turn 502 carrying rate_limit is classified as infrastructure."""
+    stub_agent.fail_with = 502
+    stub_agent.fail_headers = {"X-Hermes-Failure-Reason": "rate_limit"}
+
+    result = KubeAgentsHarness().run("Provision operator agent in cluster mercury-09.")
+
+    assert result.has_errors()
+    assert result.errors[0].startswith(harness.INFRA_FAILURE_MARKER)
     assert len(stub_agent.requests) == 1
 
 
