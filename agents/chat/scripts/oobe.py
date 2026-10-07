@@ -24,10 +24,11 @@ marks none.
 ``trigger_job`` also sets a job's ``enabled`` back to true, so an audit an operator
 has disabled or paused is left alone rather than started.
 
-An install whose sweep was filed more than ``NEW_INSTALL_SECONDS`` before the
-stage first looks is not new: it onboarded before this job existed but never
-reached delivery, so the entrypoint could not tell. Its audits run on their
-schedules.
+An install whose sweep was filed more than ``NEW_INSTALL_SECONDS`` ago while the
+stage has started nothing is not new: it onboarded before this job existed but
+never reached delivery, so the entrypoint could not tell. Its audits run on their
+schedules. A scan still unsettled after a day (a fleet of hundreds of clusters)
+is caught by the same rule.
 
 Once the stage is done, the next run removes the job. Stdout stays empty: the job
 delivers locally and never speaks to the user.
@@ -64,8 +65,8 @@ ROSTER_FILE = "jobs.json"
 # Hermes' pause marker on a job record (cron.jobs: is_job_runnable).
 PAUSED_STATE = "paused"
 
-# The ranking card the hand-off files last (bootstrap_handoff.PRIORITIZE_KEY). An automatic retry
-# reuses the key; a re-run by hand adds a suffix (bootstrap_onboarding/README.md), so the prefix
+# The ranking card the hand-off files last (bootstrap_handoff.PRIORITIZE_KEY). Hermes retries it
+# in place; a re-run by hand adds a suffix (bootstrap_onboarding/README.md), so the prefix
 # counts too.
 PRIORITIZE_KEY = "bootstrap-inventory-prioritize"
 PRIORITIZE_RETRY_PATTERN = PRIORITIZE_KEY + "-%"

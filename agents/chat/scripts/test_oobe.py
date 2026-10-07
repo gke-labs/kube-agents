@@ -235,6 +235,24 @@ class StageTest(unittest.TestCase):
         self.assertEqual(self._started_ids(), ["fleet-wide-cost-analysis"])
         self.assertTrue(oobe.read_state(self.d)[oobe.STATE_DONE])
 
+    def test_a_run_killed_partway_does_not_start_an_audit_twice(self):
+        self._file_scan()
+        _board(self.board, [_ranking("done")])
+        real_run = self._run
+
+        def killed_on_the_second(argv, env=None, **kwargs):
+            if len(self.started) == 1:
+                raise KeyboardInterrupt
+            return real_run(argv, env=env, **kwargs)
+
+        with mock.patch.object(oobe.subprocess, "run", killed_on_the_second):
+            with self.assertRaises(KeyboardInterrupt):
+                self._main()
+        self.assertEqual(oobe.read_state(self.d)[oobe.STATE_FIRED], [oobe.FIRST_RUN_AUDITS[0]])
+        self.started.clear()
+        self._main()
+        self.assertEqual(self._started_ids(), list(oobe.FIRST_RUN_AUDITS[1:]))
+
     def test_gives_up_on_an_audit_that_never_starts(self):
         self._file_scan()
         _board(self.board, [_ranking("done")])
@@ -367,6 +385,11 @@ class RosterTest(unittest.TestCase):
         roster = Path(__file__).resolve().parents[2] / "platform" / "cron" / "jobs.json"
         ids = {job["id"] for job in json.loads(roster.read_text(encoding="utf-8"))["jobs"] if job.get("enabled")}
         self.assertLessEqual(set(oobe.FIRST_RUN_AUDITS), ids)
+
+    def test_the_entrypoint_keeps_the_job_off_finished_installs(self):
+        entrypoint = (Path(__file__).resolve().parents[3] / "deploy" / "shared" / "docker-entrypoint.sh").read_text()
+        seeded = next(line for line in entrypoint.splitlines() if line.strip().startswith('ASSUME_RETIRED="bootstrap'))
+        self.assertIn(oobe.OOBE_JOB_ID, seeded.split('"')[1].split(","))
 
     def test_the_job_is_on_the_chat_roster(self):
         roster = Path(__file__).resolve().parent.parent / "defaults" / "cron" / "jobs.json"

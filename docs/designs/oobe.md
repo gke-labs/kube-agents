@@ -61,9 +61,9 @@ summaries, which assume a fleet the operator has already seen.
 lists the fleet, and records it in `.bootstrap_scan_filed`. On the same job's ticks the hand-off
 (`bootstrap_handoff.py`) files one card per Cluster Agent and, once those settle or its deadline of
 an hour plus five minutes per cluster card passes (`deadline`), files the ranking card, key
-`bootstrap-inventory-prioritize`, recorded in `.bootstrap_handoff_filed`. An automatic retry
-archives the old ranking card and files a new one under the same key; a re-run by hand uses a
-suffixed key (`bootstrap_onboarding/README.md`). When no cluster was audited the hand-off writes the
+`bootstrap-inventory-prioritize`, recorded in `.bootstrap_handoff_filed`. It files one ranking card
+per sweep, and Hermes retries that card in place; a re-run by hand uses a suffixed key
+(`bootstrap_onboarding/README.md`). When no cluster was audited the hand-off writes the
 report itself and files no ranking card. The ranking worker writes `/opt/data/INVENTORY.md`, on the
 sandbox's volume when the shell sandbox is on. `bootstrap-inventory-delivery`
 (`bootstrap_delivery.py`) posts it once a human has spoken (`.user_aligned`) and claims
@@ -93,7 +93,7 @@ minutes for a sweep with no cluster cards, longer by five minutes a card. A stuc
 ranking card or one never filed must not hold the audits back forever, and a shorter wait would
 start them beside a large fleet's ranking card.
 
-**Not a new install.** If the stage's first look finds a sweep filed more than
+**Not a new install.** If, before the stage has started anything, it finds a sweep filed more than
 `NEW_INSTALL_SECONDS` (24 hours) earlier, the install onboarded before this job existed but never
 reached delivery, so the entrypoint's `--assume-retired` entry (§5) could not tell it apart from a
 new one. The stage records the skip and starts nothing; the audits run on their schedules.
