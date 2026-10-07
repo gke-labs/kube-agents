@@ -579,19 +579,38 @@ def _cluster_placeholders(node: Any, where: str, problems: list[str], slots: set
         _cluster_placeholders(child, where, problems, slots, parked)
 
 
-def _strings_under(raw: Any, ancestors: frozenset[int] = frozenset()) -> list[str]:
+def _strings_under(raw: Any) -> list[str]:
     """Every string in a value: the scalar itself, a list's items, a mapping's
-    values, nested to any depth, in document order. A container already on the
-    path down to it is not entered again: `safe_load` builds a list or mapping
-    that a YAML anchor aliases from inside itself, and walking that cycle would
-    end in a RecursionError rather than a finding."""
+    values, nested to any depth, in document order. The tree is finite by the
+    time this runs: validate_case() refuses a file whose anchor is aliased from
+    inside its own value before any rule walks it (`_alias_cycle`)."""
     if isinstance(raw, str):
         return [raw]
-    if not isinstance(raw, (list, dict)) or id(raw) in ancestors:
+    if not isinstance(raw, (list, dict)):
         return []
-    below = ancestors | {id(raw)}
     items = raw if isinstance(raw, list) else raw.values()
-    return [s for item in items for s in _strings_under(item, below)]
+    return [s for item in items for s in _strings_under(item)]
+
+
+def _alias_cycle(raw: Any, path: str = "", ancestors: frozenset[int] = frozenset()) -> str | None:
+    """The key path of the first value that is a container already on the path
+    down to it, or None. `safe_load` builds such a value from a YAML anchor
+    aliased from inside itself (`checks: &c [*c]`, `expected_findings: &m
+    [{object: *m}]`); every rule here walks the tree, so one such file would
+    end any of them in a RecursionError, and devops-bench refuses the same file
+    at spec load, after the cluster lease. An anchor reused beside itself is a
+    shared value, not a cycle, and is not reported."""
+    if not isinstance(raw, (list, dict)):
+        return None
+    if id(raw) in ancestors:
+        return path
+    below = ancestors | {id(raw)}
+    for key, item in enumerate(raw) if isinstance(raw, list) else raw.items():
+        step = f"{path}[{key}]" if isinstance(raw, list) else (f"{path}.{key}" if path else str(key))
+        found = _alias_cycle(item, step, below)
+        if found is not None:
+            return found
+    return None
 
 
 def _catalog_roles(catalog: dict[str, Any]) -> dict[str, Any]:
@@ -848,6 +867,12 @@ def validate_case(name: str, path: pathlib.Path, *, registered: set[str] | None)
     spec = _load_yaml(path)
     if not isinstance(spec, dict):
         return [f"{path}: does not parse to a mapping"]
+    cycle = _alias_cycle(spec)
+    if cycle is not None:
+        return [
+            f"{path}: a YAML anchor is aliased from inside its own value, at {cycle}, "
+            "so the file has no finite shape to validate; break the cycle"
+        ]
 
     # The id key. devops-bench accepts task_id as an alias for id
     # (tasks/schema.py, from_dict) and prefers id when both are present, so a
@@ -1199,11 +1224,6 @@ def validate_all() -> dict[str, list[str]]:
             results[name] = validate_case(name, path, registered=registered)
         except CaseError as exc:
             results[name] = [str(exc)]
-        except RecursionError:
-            # A YAML anchor aliased from inside itself (`checks: &c [*c]`) gives a
-            # rule that walks the tree no bottom; one such file is a finding
-            # against that case, not a traceback that hides every other case's.
-            results[name] = [f"{path}: a YAML anchor is aliased from inside its own value, so the file has no finite shape to validate; break the cycle"]
     for name, problems in greet_phrase_collisions(cases).items():
         results[name].extend(problems)
     # The retired parking state: a case path inside a roster-file comment. It

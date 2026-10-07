@@ -809,22 +809,36 @@ class TestTheRulesReject(unittest.TestCase):
         # a mapping with no placeholder is not read as one
         self.assertEqual(self._validate(verification_spec=self._entry(check={"type": "bootstrap_findings", "expected_findings": [{"check": "x", "object": "y"}]})), [])
 
-    def test_a_recursive_anchor_in_a_check_field_is_walked_once(self):
+    def test_a_recursive_anchor_in_a_check_field_is_a_finding_that_names_where(self):
         # `safe_load` builds the cycle (`&m [{object: *m}]` is a list whose one mapping holds
-        # the list); the walker reads each container once on the way down and stops.
+        # the list). Without the refusal, `_populated` reads the entry as populated and the
+        # placeholder walker reads its one string, so the file validates with no finding and
+        # devops-bench refuses it at spec load instead, after the cluster lease.
         loop: list = []
         loop.append({"check": "{cluster:a}", "object": loop, "again": {"deep": loop, "s": "y"}})
-        self.assertEqual(validator._strings_under(loop), ["{cluster:a}", "y"])
+        self.assertEqual(validator._alias_cycle({"verification_spec": [{"check": {"expected_findings": loop}}]}), "verification_spec[0].check.expected_findings[0].object")
         text = yaml.safe_dump(self.VALID).replace(
             "verification_spec:",
             "verification_spec:\n- name: loops\n  role: objective\n  check:\n    type: bootstrap_findings\n    expected_findings: &m\n    - check: x\n      object: *m\n",
         )
-        problems = self._validate(text=text)  # no RecursionError; whatever else the shape earns is a finding
-        self.assertIsInstance(problems, list)
+        problem = self._only("aliased from inside its own value", text=text)
+        self.assertIn("at verification_spec[0].check.expected_findings[0].object", problem)
+        self.assertIn("break the cycle", problem)
+
+    def test_an_anchor_reused_beside_itself_is_a_shared_value_not_a_cycle(self):
+        shared = {"s": "y"}
+        self.assertIsNone(validator._alias_cycle({"a": shared, "b": [shared, shared]}))
+        self.assertEqual(validator._strings_under({"a": shared, "b": [shared, "z"]}), ["y", "y", "z"])
+        text = yaml.safe_dump(self.VALID).replace(
+            "verification_spec:",
+            "x_shared: &p\n  type: report_contains\n  required_phrases: [ok]\nverification_spec:\n- name: one\n  role: objective\n  check: *p\n- name: two\n  role: objective\n  check: *p\n",
+        )
+        self.assertNotIn("aliased from inside its own value", " ".join(self._validate(text=text)))
 
     def test_a_self_aliasing_checks_list_is_a_finding_not_a_traceback(self):
-        # The compound-check walker has no bottom on `checks: &c [*c]`; validate_all turns the
-        # RecursionError into that case's finding so the other cases still report.
+        # The compound-check walker would have no bottom on `checks: &c [*c]`; the refusal in
+        # validate_case names the alias, so validate_all and the CLI's validate_paths each report
+        # it as that case's one finding and the other cases still report.
         text = yaml.safe_dump(self.VALID).replace(
             "verification_spec:",
             "verification_spec:\n- name: loops\n  role: objective\n  check: &c\n    type: all_of\n    checks: [*c]\n",
@@ -833,12 +847,13 @@ class TestTheRulesReject(unittest.TestCase):
             path = pathlib.Path(tmp) / "made-up-case" / "task.yaml"
             path.parent.mkdir()
             path.write_text(text)
-            with self.assertRaises(RecursionError):
-                validator.validate_case("made-up-case", path, registered={"made-up-case"})
+            direct = validator.validate_case("made-up-case", path, registered={"made-up-case"})
             with unittest.mock.patch.object(validator, "bench_cases", return_value={"made-up-case": path}), unittest.mock.patch.object(validator, "registered_cases", return_value={"made-up-case"}):
                 results = validator.validate_all()
-        self.assertEqual(len(results["made-up-case"]), 1, results)
-        self.assertIn("aliased from inside its own value", results["made-up-case"][0])
+                by_path = validator.validate_paths([path])
+        for problems in (direct, results["made-up-case"], by_path["made-up-case"]):
+            self.assertEqual(len(problems), 1, problems)
+            self.assertIn("aliased from inside its own value, at verification_spec[0].check.checks[0]", problems[0])
 
     def test_a_malformed_cluster_placeholder_is_rejected(self):
         self._only(
