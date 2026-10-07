@@ -193,8 +193,7 @@ Rules:
 
 - **Do not hand-write a table that mirrors a machine-readable file.** The cron schedule, skill
   catalogue and image inventory are generated into `<!-- BEGIN GENERATED -->` regions by
-  `scripts/generate_docs.py`, which also writes `docs/family-roster.txt` whole. Edit the source,
-  then run `make docs-generate`.
+  `scripts/generate_docs.py`. Edit the source, then run `make docs-generate`.
 - **Do not restate the `make` targets.** `make help` prints them; new targets get a `## description`
   comment.
 - **Link rather than summarise** when another page already owns the topic. If you must summarise,
@@ -209,10 +208,9 @@ Rules:
   and a number tells the reader nothing they can act on.
 - **Verify identifiers against source, not against other docs.** GCP service account names live
   in `install.defaults.env`, the Go version in `k8s-operator/go.mod`.
-- **Add a document to the map (`docs/README.md`) with one line, and change nothing else there.**
-  Compact `| cell | cell |` rows, never re-aligned: the map is edited from several branches a
-  week, and a re-aligned table rewrites rows your PR did not author. `docs/README.md` §5 owns the
-  rest.
+- **Link a new document from the page that owns its topic; add no map entry.** `docs/README.md`
+  is the tree plus two compact tables, never re-aligned. `docs-check-links` fails a document no
+  reader reaches: do not grow its allowlist; argue a new family glob in the PR.
 - **Write it straight.** Lead with the fact; cut hype and self-assessment (`comprehensive`,
   `robust`, `seamless`); skip "not X, but Y" and rule-of-three padding; prefer prose to a
   `**Bold term:** explanation` list; claim first, caveat after. `SKILL.md` files are the
@@ -221,10 +219,9 @@ Rules:
   sections, no summary that repeats the section above it, no scaffolding a reader will skip.
   `.agents/rules/documentation.md` has the full form of both rules and their upstream guide.
 
-Run `make docs-check` before pushing. It checks generated regions, relative links, identifiers
-against source, map (`docs/README.md`) coverage of every Markdown document outside the root
-dot-directories, site pages for maintainer identifiers, and this file plus `CLAUDE.md` against
-the context budget — the six checks CI runs.
+Run `make docs-check` before pushing. It checks generated regions, relative links and that a
+reader reaches every document, identifiers against source, site pages for maintainer identifiers,
+and this file plus `CLAUDE.md` against the context budget — the five checks CI runs.
 
 ## Contributing as an agent
 
@@ -287,8 +284,8 @@ Agents with a user in the loop follow this file.
 - **Docs-drift review before opening a PR:** run the `review-docs-drift` skill
   (`.agents/skills/review-docs-drift/SKILL.md`) against your branch diff and address its
   Blocking findings. This is a required pre-PR step for AI agents working in this repository;
-  `make docs-check` enforces only the mechanical subset (generated regions, links, terminology,
-  map coverage, site audience, context budget), while the skill also verifies that doc prose still matches the
+  `make docs-check` enforces only the mechanical subset (generated regions, links, reachability,
+  terminology, site audience, context budget), while the skill also verifies that doc prose still matches the
   source. Its dispositions go in **Self-Review** with the adversarial pass's, not in a section of
   their own. `/pr-preflight` runs this pass alongside the adversarial one, each in its own context.
 - **Live-test the change before opening a PR, and describe it in the PR body.** Every pull

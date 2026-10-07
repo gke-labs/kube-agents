@@ -216,6 +216,10 @@ func startLiveHarness(t *testing.T) *liveHarness {
 	svc, err := NewService(store, validator, Config{
 		IssuerSeed: string(issuerSeed),
 		XKeySeed:   string(xkeySeed),
+		// The reserved names come from the same rendered file the server
+		// was started from, so the callout refuses exactly the static
+		// users this server authenticates by password.
+		ReservedPrincipals: renderedAuthUsers(t, string(rendered)),
 	}, log)
 	if err != nil {
 		t.Fatalf("NewService: %v", err)

@@ -533,7 +533,7 @@ ADVICE_LOST_PODS = (
 UNKNOWN_NODE = "(name unknown)"
 ADVICE_FIXTURE_DRIFT = (
     "A red on a case that depends on {roles} from a run that leased {projects} is the fixture, not your change;"
-    " retest once the fleet owner has re-applied bench/tf/fleet there (README, State and reconcile)."
+    " retest after the daily reconcile has re-applied bench/tf/fleet there (08:30 UTC) and the scan that follows reads it healthy."
 )
 ADVICE_POOL_DRIFT = (
     "A 403 or a missing-resource red from a run that leased {projects} is the pool project's shape, not your change"
@@ -1157,6 +1157,8 @@ def _scan_drift(state_doc: dict | None, now: datetime, scan: ScanKind) -> dict:
         "unknown": False,
         "scanned_at": None,
         "unread_units": 0,
+        "absent_units": 0,
+        "absent_projects": 0,
         "roles": [],
         "projects": [],
         "drift": {},
@@ -1190,6 +1192,10 @@ def _scan_drift(state_doc: dict | None, now: datetime, scan: ScanKind) -> dict:
     out["partial"] = bool(scope_key) and state_doc.get(scope_key) == getattr(module, "SCOPE_SELECTED", None)
     out["checked"] = module.checked_projects(state_doc)
     out["unread_units"] = module.unread_units(state_doc)
+    # The fleet scan tells a fixture the stack has not planted from a read
+    # that failed; the pool scan has no such state.
+    out["absent_units"] = module.absent_units(state_doc) if hasattr(module, "absent_units") else 0
+    out["absent_projects"] = module.absent_projects(state_doc) if hasattr(module, "absent_projects") else 0
     if scanned_at is None or now - scanned_at > FIXTURE_STATE_MAX_AGE:
         out["stale"] = True
         age = f"{int((now - scanned_at).total_seconds() // 3600)}h" if scanned_at else "of unknown age"
@@ -1605,6 +1611,10 @@ def pool_wait_p50_s(artifact: dict | None, now: datetime) -> int | None:
         return None
     measured = parse_iso(artifact.get("window_end"))
     if measured is None or now - measured > POOL_STALE_AFTER:
+        return None
+    # An UNMEASURED artifact still carries the days that did read; the headline
+    # must not quote one above the note that says the wait is unknown.
+    if artifact.get("verdict") == POOL_UNMEASURED:
         return None
     # The newest judged row, not the newest row. The producer withholds a
     # verdict below its sample floor, and at 13:00 UTC today's row holds only
@@ -2349,7 +2359,8 @@ def adjudicate(
     # and the poster, which keys on the verdict, does not re-announce one it
     # has told.
     streaks = periodics.streaks(readings, (prev or {}).get("periodics_streaks"))
-    watched = periodics.assess(readings, pool_clock, prev_notes, streaks=streaks if prev is not None else None)
+    superseded = periodics.superseded_jobs(readings, (prev or {}).get("periodics_superseded"))
+    watched = periodics.assess(readings, pool_clock, prev_notes, streaks=streaks if prev is not None else None, superseded=superseded)
     evidence.extend(periodics.evidence(note) for _, note in sorted(watched.items()))
     # Per job: a job read this tick keeps its start only while it is noted;
     # a job with no reading this tick keeps whatever start it had.
@@ -2385,6 +2396,7 @@ def adjudicate(
         "periodics": watched,
         "periodics_read": sorted(readings),
         "periodics_runs": periodics.runs(readings),
+        "periodics_superseded": superseded,
         "periodics_streaks": streaks,
         "periodics_since": periodics_since,
         "metrics": metrics([run for run in runs if run.finished <= now], now, fixtures, roster),
@@ -2421,6 +2433,8 @@ def scan_block(scan_result: dict) -> dict | None:
         "projects": scan_result["total"],
         "checked": scan_result["checked"],
         "unread_units": scan_result.get("unread_units", 0),
+        "absent_units": scan_result.get("absent_units", 0),
+        "absent_projects": scan_result.get("absent_projects", 0),
         "drifted": scan_result["current"],
         "passes_leases": scan_result.get("passes_leases", []),
         "reds_runs": scan_result.get("reds_runs", []),

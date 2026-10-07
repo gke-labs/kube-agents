@@ -811,8 +811,9 @@ honest — a quota that large cannot constrain this release either way.
 {{- end }}
 
 {{- define "kube-agents.parseCpuMillis" -}}
-{{- $raw := trim (toString .) -}}
+{{- $raw := include "kube-agents.normalizeQuantity" . -}}
 {{- $numeric := "^[0-9]+(\\.[0-9]+)?([eE][-+]?[0-9]+)?$" -}}
+{{- $binaryCores := dict "Ki" 1024.0 "Mi" 1048576.0 "Gi" 1073741824.0 "Ti" 1099511627776.0 "Pi" 1125899906842624.0 "Ei" 1152921504606846976.0 -}}
 {{- $decimalCores := dict "k" 1000.0 "M" 1000000.0 "G" 1000000000.0 "T" 1000000000000.0 "P" 1000000000000000.0 "E" 1000000000000000000.0 -}}
 {{- if or (eq $raw "") (eq $raw "<nil>") -}}
 0
@@ -836,6 +837,15 @@ honest — a quota that large cannot constrain this release either way.
 {{- include "kube-agents.clampInt64" (ceil (divf (float64 $n) 1000000.0)) -}}
 {{- else -}}
 {{- $out := "" -}}
+{{- range $unit, $mult := $binaryCores -}}
+{{- if and (eq $out "") (hasSuffix $unit $raw) -}}
+{{- $n := trimSuffix $unit $raw -}}
+{{- if not (regexMatch $numeric $n) -}}
+{{- fail (printf "quota preflight: cannot parse CPU quantity %q — set quotaPreflight.enabled=false to bypass, and please report it." $raw) -}}
+{{- end -}}
+{{- $out = include "kube-agents.clampInt64" (mulf (mulf (float64 $n) $mult) 1000.0) -}}
+{{- end -}}
+{{- end -}}
 {{- range $unit, $mult := $decimalCores -}}
 {{- if and (eq $out "") (hasSuffix $unit $raw) -}}
 {{- $n := trimSuffix $unit $raw -}}
@@ -855,8 +865,20 @@ honest — a quota that large cannot constrain this release either way.
 {{- end -}}
 {{- end }}
 
+{{- /* A quantity in the CRD's grammar rewritten into the one parseCpuMillis and
+       parseBytes read, which both call it first: trimmed, the leading "+" dropped,
+       `.5` written `0.5`, and `1.` written `1`. A "-" is left in place, so a negative
+       still fails the parse. */ -}}
+{{- define "kube-agents.normalizeQuantity" -}}
+{{- $raw := trimPrefix "+" (trim (toString .)) -}}
+{{- if hasPrefix "." $raw -}}
+{{- $raw = printf "0%s" $raw -}}
+{{- end -}}
+{{- regexReplaceAll "^([0-9]+)\\.([^0-9]|$)" $raw "${1}${2}" -}}
+{{- end }}
+
 {{- define "kube-agents.parseBytes" -}}
-{{- $raw := trim (toString .) -}}
+{{- $raw := include "kube-agents.normalizeQuantity" . -}}
 {{- $numeric := "^[0-9]+(\\.[0-9]+)?([eE][-+]?[0-9]+)?$" -}}
 {{- $binary := dict "Ki" 1024.0 "Mi" 1048576.0 "Gi" 1073741824.0 "Ti" 1099511627776.0 "Pi" 1125899906842624.0 "Ei" 1152921504606846976.0 -}}
 {{- $decimal := dict "k" 1000.0 "M" 1000000.0 "G" 1000000000.0 "T" 1000000000000.0 "P" 1000000000000000.0 "E" 1000000000000000000.0 -}}
@@ -868,6 +890,18 @@ honest — a quota that large cannot constrain this release either way.
 {{- fail (printf "quota preflight: cannot parse quantity %q (memory, storage or count) — set quotaPreflight.enabled=false to bypass, and please report it." $raw) -}}
 {{- end -}}
 {{- include "kube-agents.clampInt64" (ceil (divf (float64 $n) 1000.0)) -}}
+{{- else if hasSuffix "u" $raw -}}
+{{- $n := trimSuffix "u" $raw -}}
+{{- if not (regexMatch $numeric $n) -}}
+{{- fail (printf "quota preflight: cannot parse quantity %q (memory, storage or count) — set quotaPreflight.enabled=false to bypass, and please report it." $raw) -}}
+{{- end -}}
+{{- include "kube-agents.clampInt64" (ceil (divf (float64 $n) 1000000.0)) -}}
+{{- else if hasSuffix "n" $raw -}}
+{{- $n := trimSuffix "n" $raw -}}
+{{- if not (regexMatch $numeric $n) -}}
+{{- fail (printf "quota preflight: cannot parse quantity %q (memory, storage or count) — set quotaPreflight.enabled=false to bypass, and please report it." $raw) -}}
+{{- end -}}
+{{- include "kube-agents.clampInt64" (ceil (divf (float64 $n) 1000000000.0)) -}}
 {{- else -}}
 {{- $out := "" -}}
 {{- range $unit, $mult := $binary -}}
@@ -898,6 +932,113 @@ honest — a quota that large cannot constrain this release either way.
 {{- end -}}
 {{- $out -}}
 {{- end -}}
+{{- end }}
+
+{{- /* "true" when a byte quantity's value is at or past 2^63, which parseBytes saturates
+       to math.MaxInt64 and the operator refuses as unrepresentable. The quota sums want
+       the saturation; the credential-proxy render check wants the refusal, so it asks
+       this first. The arithmetic is parseBytes', so a value float64 rounds up to 2^63
+       from just below it (within 1024 of it) is refused too. Reads only what
+       parseBytes reads; call it after the quantity has passed the CRD's grammar. */ -}}
+{{- define "kube-agents.bytesExceedInt64" -}}
+{{- $raw := include "kube-agents.normalizeQuantity" . -}}
+{{- $scaled := dict "Ki" 1024.0 "Mi" 1048576.0 "Gi" 1073741824.0 "Ti" 1099511627776.0 "Pi" 1125899906842624.0 "Ei" 1152921504606846976.0 "k" 1000.0 "M" 1000000.0 "G" 1000000000.0 "T" 1000000000000.0 "P" 1000000000000000.0 "E" 1000000000000000000.0 -}}
+{{- $divided := dict "m" 1000.0 "u" 1000000.0 "n" 1000000000.0 -}}
+{{- $v := "" -}}
+{{- range $unit, $mult := $scaled -}}
+{{- if and (kindIs "string" $v) (hasSuffix $unit $raw) -}}
+{{- $v = mulf (float64 (trimSuffix $unit $raw)) $mult -}}
+{{- end -}}
+{{- end -}}
+{{- range $unit, $div := $divided -}}
+{{- if and (kindIs "string" $v) (hasSuffix $unit $raw) -}}
+{{- $v = divf (float64 (trimSuffix $unit $raw)) $div -}}
+{{- end -}}
+{{- end -}}
+{{- if kindIs "string" $v -}}
+{{- $v = float64 $raw -}}
+{{- end -}}
+{{- if ge (float64 $v) 9223372036854775808.0 -}}true{{- end -}}
+{{- end }}
+
+{{- /* "true" when a quantity's number is past float64's range. Sprig's float64 answers 0
+       for it rather than failing (strconv reports +Inf with ErrRange, and the cast drops
+       both), so `1e400` would read as zero and pass every check after it. The number
+       reads as 0 for one other reason, an underflow (1e-400), which is a real positive
+       quantity the operator rounds up rather than refuses; the two are told apart by the
+       number's order of magnitude: its integer digits, or minus the zeros leading its
+       fraction, plus its exponent. Call it after the quantity has passed the CRD's
+       grammar. */ -}}
+{{- define "kube-agents.quantityOverflowsFloat64" -}}
+{{- $num := regexReplaceAll "([KMGTPE]i|[numkMGTPE])$" (include "kube-agents.normalizeQuantity" .) "" -}}
+{{- $mantissa := regexReplaceAll "[eE].*$" $num "" -}}
+{{- if and (regexMatch "[1-9]" $mantissa) (eq (float64 $num) 0.0) -}}
+{{- $intDigits := regexReplaceAll "^0+" (regexReplaceAll "\\..*$" $mantissa "") "" -}}
+{{- $magnitude := len $intDigits -}}
+{{- if eq $magnitude 0 -}}
+{{- $fraction := regexReplaceAll "^[^.]*\\.?" $mantissa "" -}}
+{{- $magnitude = sub (len (regexReplaceAll "^0+" $fraction "")) (len $fraction) -}}
+{{- end -}}
+{{- $exponent := regexReplaceAll "^[^eE]*[eE]?" $num "" -}}
+{{- $negative := hasPrefix "-" $exponent -}}
+{{- $digits := regexReplaceAll "^0+" (trimPrefix "+" (trimPrefix "-" $exponent)) "" -}}
+{{- /* An exponent past 18 digits does not fit the int64 below, and decides alone. */ -}}
+{{- if gt (len $digits) 18 -}}
+{{- if not $negative -}}true{{- end -}}
+{{- else -}}
+{{- $e := $digits | default "0" | int64 -}}
+{{- if $negative -}}
+{{- $e = sub 0 $e -}}
+{{- end -}}
+{{- if gt (add $magnitude $e) 0 -}}true{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- end }}
+
+{{- /* A quantity's value as a float64, in millicores when "cpu" is true and bytes otherwise,
+       with no rounding of its own: parseCpuMillis and parseBytes truncate a bare or
+       suffixed value and ceil an m, u or n one, which suits the quota sums and would let
+       the credential-proxy crossed-pair check disagree with the operator's exact
+       resource.Quantity comparison (1.0004 against 1 would compare equal). Sprig's mulf
+       and divf compute in decimal and round once to float64, so a decimal quantity of at
+       most 15 significant digits (credentialProxyResourcesCheck refuses more) scales
+       exactly: 1.005 cores and 1005m both read as 1005 millicores, and a strict lt or gt
+       on two figures matches the operator's Quantity.Cmp for every decimal value the
+       chart admits that is a whole number of nano-units. Two residues remain. A binary-suffixed quantity (Ki to Ei) multiplies
+       the digits by a power of two and can land within float64 rounding, about one part
+       in 10^16, of a decimal one: 976562500000459Ki is 16 bytes above 100000000000047e4,
+       yet both read as the same float64, so the chart admits that crossed pair and the
+       operator decides. And the operator rounds a quantity up to whole nano-units, which
+       the chart does not, so two values that differ only below a nano-unit (1.5n against
+       1.2n) can compare differently here than there. A value whose scaled figure is past
+       float64's range (a CPU of 1e308, in millicores) fails the render naming "key"
+       rather than answering "", which a caller would read as zero.
+       Takes (dict "raw" <quantity> "cpu" <bool> "key" <values path>); call it after the
+       quantity has passed the CRD's grammar. */ -}}
+{{- define "kube-agents.quantityExact" -}}
+{{- $raw := include "kube-agents.normalizeQuantity" .raw -}}
+{{- $scale := ternary 1000.0 1.0 (eq .cpu true) -}}
+{{- $scaled := dict "Ki" 1024.0 "Mi" 1048576.0 "Gi" 1073741824.0 "Ti" 1099511627776.0 "Pi" 1125899906842624.0 "Ei" 1152921504606846976.0 "k" 1000.0 "M" 1000000.0 "G" 1000000000.0 "T" 1000000000000.0 "P" 1000000000000000.0 "E" 1000000000000000000.0 -}}
+{{- $divided := dict "m" 1000.0 "u" 1000000.0 "n" 1000000000.0 -}}
+{{- $v := "" -}}
+{{- range $unit, $mult := $scaled -}}
+{{- if and (kindIs "string" $v) (hasSuffix $unit $raw) -}}
+{{- $v = mulf (float64 (trimSuffix $unit $raw)) $mult $scale -}}
+{{- end -}}
+{{- end -}}
+{{- range $unit, $div := $divided -}}
+{{- if and (kindIs "string" $v) (hasSuffix $unit $raw) -}}
+{{- $v = divf (mulf (float64 (trimSuffix $unit $raw)) $scale) $div -}}
+{{- end -}}
+{{- end -}}
+{{- if kindIs "string" $v -}}
+{{- $v = mulf (float64 $raw) $scale -}}
+{{- end -}}
+{{- /* +Inf is the only float64 greater than the largest finite one. */ -}}
+{{- if gt (float64 $v) 1.7976931348623157e308 -}}
+{{- fail (printf "%s is %s, which is not a representable quantity: its value with the suffix applied is past the range of a float64, which the chart would read as zero and so could not check against the operator's rules" .key $raw) -}}
+{{- end -}}
+{{- $v | toJson -}}
 {{- end }}
 
 {{/*
@@ -1088,6 +1229,172 @@ the check needs `get`/`list` on `resourcequotas` in the release namespace, and a
 without it installs with `--set quotaPreflight.enabled=false`. Nothing here can soften that:
 a Go template cannot catch the error `lookup` raises.
 */}}
+{{/*
+The checks on platformAgent.deployment.credentialProxy.resources that need no parsed value:
+the keys under resources, the shape of limits and requests, each resource name, and each
+quantity's sign, grammar, significant digits (at most 15, the most float64 holds exactly, so
+the comparisons after these match the operator's for every decimal value admitted) and range: a byte count
+within an int64, a CPU within an int64 of millicores. Takes the resources map and renders
+nothing; a value that fails one fails the render naming its key. Both readers of the value call it first,
+the CR template (templates/platform-agent-cr.yaml) and kube-agents.credentialProxyFootprint
+for the quota preflight, because Helm renders quota-preflight.yaml before the CR template:
+without it the preflight's parseBytes refused `-1Gi` or `2GB` with a "cannot parse ...
+please report it" message before the CR template could name the key. The checks that
+compare parsed values (zero limit, floor, crossed pair) stay in the CR template, after
+these have passed.
+*/}}
+{{- define "kube-agents.credentialProxyResourcesCheck" -}}
+{{- $proxyResources := . | default dict -}}
+{{- $proxyPrefix := "platformAgent.deployment.credentialProxy.resources" -}}
+{{- $proxyUnknown := keys (omit $proxyResources "limits" "requests" "claims") | sortAlpha -}}
+{{- if $proxyUnknown -}}
+{{- fail (printf "%s carries %s, which the PlatformAgent CRD does not declare; the accepted keys are requests, limits and claims. The API server would prune it, and the override would be lost silently" $proxyPrefix (join ", " $proxyUnknown)) -}}
+{{- end -}}
+{{- if index $proxyResources "claims" -}}
+{{- fail (printf "%s.claims is not supported -- the credential-proxy pod declares no resourceClaims, so the operator refuses the key. Remove it." $proxyPrefix) -}}
+{{- end -}}
+{{- $proxyNames := list "cpu" "memory" "ephemeral-storage" -}}
+{{- /* The CRD's quantity grammar, the sign already stripped, with the
+       exponent narrowed to the integer form resource.ParseQuantity reads.
+       parseCpuMillis and parseBytes read every form this admits. */ -}}
+{{- $proxyQuantityPattern := "^(([0-9]+(\\.[0-9]*)?)|(\\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE][-+]?[0-9]+))?$" -}}
+{{- range $side := list "limits" "requests" -}}
+{{- $quantities := index $proxyResources $side -}}
+{{- /* `--set ...limits=2Gi` hands range a string, which it cannot walk, and a list
+       gives it integer names; either is a shape the CRD refuses. */ -}}
+{{- if not (or (empty $quantities) (kindIs "map" $quantities)) -}}
+{{- fail (printf "%s.%s is %v, which is not a map of resource name to quantity, for example `limits: {memory: 2Gi}`" $proxyPrefix $side $quantities) -}}
+{{- end -}}
+{{- range $name, $quantity := $quantities | default dict -}}
+{{- if not (or (kindIs "invalid" $quantity) (and (kindIs "string" $quantity) (eq $quantity ""))) -}}
+{{- $raw := toString $quantity | trim -}}
+{{- if not (has $name $proxyNames) -}}
+{{- fail (printf "%s.%s.%s: the credential-proxy container declares cpu, memory and ephemeral-storage only, and the operator refuses any other resource name" $proxyPrefix $side $name) -}}
+{{- end -}}
+{{- if hasPrefix "-" $raw -}}
+{{- fail (printf "%s.%s.%s is %s; a quantity must not be negative, and the operator refuses it" $proxyPrefix $side $name $raw) -}}
+{{- end -}}
+{{- if not (regexMatch $proxyQuantityPattern (trimPrefix "+" $raw)) -}}
+{{- fail (printf "%s.%s.%s is %q, which is not a Kubernetes quantity the operator can read (a number with an optional suffix: Ki, Mi, Gi, Ti, Pi, Ei, n, u, m, k, M, G, T, P, E, or an integer exponent such as e3)" $proxyPrefix $side $name $raw) -}}
+{{- end -}}
+{{- /* float64 holds 15 significant decimal digits exactly; a 16th lets two quantities
+       within one part in 10^16 of each other, or of a bound, read as equal, and the
+       render would pass what the operator's exact comparison refuses. Counted on the
+       mantissa: sign, exponent, suffix and dot stripped, then leading and trailing
+       zeros. */ -}}
+{{- $significand := regexReplaceAll "([KMGTPE]i|[numkMGTPE])$" (regexReplaceAll "[eE][-+]?[0-9]+$" (trimPrefix "+" $raw) "") "" -}}
+{{- $significand = regexReplaceAll "0+$" (regexReplaceAll "^0+" (replace "." "" $significand) "") "" -}}
+{{- if gt (len $significand) 15 -}}
+{{- fail (printf "%s.%s.%s is %s, which has more than 15 significant digits: the chart compares quantities as float64, which holds 15 exactly, so it cannot check this one against the operator's rules. Write it with a larger unit or fewer digits" $proxyPrefix $side $name $raw) -}}
+{{- end -}}
+{{- if include "kube-agents.quantityOverflowsFloat64" $raw -}}
+{{- if eq $name "cpu" -}}
+{{- fail (printf "%s.%s.%s is %s, which is not a representable quantity: it is past the range of a float64, which the chart would read as zero, and its millicore value exceeds the 9223372036854775807 an int64 holds, so the operator refuses it" $proxyPrefix $side $name $raw) -}}
+{{- else -}}
+{{- fail (printf "%s.%s.%s is %s, which is not a representable byte count: it exceeds the 9223372036854775807 bytes an int64 holds, which is what the Downward API hands the broker, and the operator refuses it" $proxyPrefix $side $name $raw) -}}
+{{- end -}}
+{{- end -}}
+{{- if and (ne $name "cpu") (include "kube-agents.bytesExceedInt64" $raw) -}}
+{{- fail (printf "%s.%s.%s is %s, which is not a representable byte count: it exceeds the 9223372036854775807 bytes an int64 holds, which is what the Downward API hands the broker, and the operator refuses it" $proxyPrefix $side $name $raw) -}}
+{{- end -}}
+{{- /* The operator reads a CPU quantity in millicores (MilliValue), which wraps past
+       2^63; it refuses one there, so the render does too. A suffix that carries a
+       finite number past float64's range (a 1 and 306 zeros, then k) fails inside
+       quantityExact, naming the key. */ -}}
+{{- if eq $name "cpu" -}}
+{{- $cores := include "kube-agents.quantityExact" (dict "raw" $raw "cpu" false "key" (printf "%s.%s.%s" $proxyPrefix $side $name)) | float64 -}}
+{{- if ge (mulf $cores 1000.0) 9223372036854775808.0 -}}
+{{- fail (printf "%s.%s.%s is %s, which is not a CPU count the scheduler can represent in millicores: its millicore value exceeds the 9223372036854775807 an int64 holds, and the operator refuses it" $proxyPrefix $side $name $raw) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+The credential proxy's footprint entry with platformAgent.deployment.credentialProxy.resources
+merged over it, per key, as resolveCredentialProxyResources does in the operator
+(k8s-operator/internal/controller/credential_proxy_manifests.go): a key the override
+carries replaces that number, a key it omits keeps footprint.yaml's -- with one exception
+that follows the API server rather than the operator. The operator renders a CPU and a
+memory request explicitly, so an override that raises only the limit leaves the request where
+the operator put it. It renders no ephemeral-storage request at all: the 2Gi request in
+footprint.yaml is the API server defaulting an absent request to the limit
+(scripts/generate_chart_footprint.py models the same rule), and that defaulting follows the
+override's limit, so `limits: {ephemeral-storage: 10Gi}` alone is a 10Gi request too. Summing
+it at 2Gi would pass a quota the pod is then refused on. kube-agents.workloadResources
+applies the request-follows-limit rule to every key, which is right for a chart workload
+whose requests the values own and wrong for the two the operator renders, so it is not
+reused here. Takes (dict "workload" <footprint entry> "override" <resources block>) and
+returns the entry's six numbers and pod count as JSON.
+*/}}
+{{- define "kube-agents.credentialProxyFootprint" -}}
+{{- $workload := .workload | default dict -}}
+{{- $override := .override | default dict -}}
+{{- include "kube-agents.credentialProxyResourcesCheck" $override -}}
+{{- $req := (index $override "requests") | default dict -}}
+{{- $lim := (index $override "limits") | default dict -}}
+{{- $cpuReq := $workload.cpuMillisRequest | default 0 | int64 -}}
+{{- $cpuLim := $workload.cpuMillisLimit | default 0 | int64 -}}
+{{- $memReq := $workload.memoryBytesRequest | default 0 | int64 -}}
+{{- $memLim := $workload.memoryBytesLimit | default 0 | int64 -}}
+{{- $ephReq := $workload.ephemeralStorageBytesRequest | default 0 | int64 -}}
+{{- $ephLim := $workload.ephemeralStorageBytesLimit | default 0 | int64 -}}
+{{- /* declaredQuantity with an empty fallback answers "" for an absent or null key, which
+       `with` skips, so `memory: null` keeps the default as it does on the CR. */ -}}
+{{- with include "kube-agents.declaredQuantity" (dict "value" (index $req "cpu") "fallback" "") -}}
+{{- $cpuReq = include "kube-agents.parseCpuMillis" . | int64 -}}
+{{- end -}}
+{{- with include "kube-agents.declaredQuantity" (dict "value" (index $lim "cpu") "fallback" "") -}}
+{{- $cpuLim = include "kube-agents.parseCpuMillis" . | int64 -}}
+{{- end -}}
+{{- with include "kube-agents.declaredQuantity" (dict "value" (index $req "memory") "fallback" "") -}}
+{{- $memReq = include "kube-agents.parseBytes" . | int64 -}}
+{{- end -}}
+{{- with include "kube-agents.declaredQuantity" (dict "value" (index $lim "memory") "fallback" "") -}}
+{{- $memLim = include "kube-agents.parseBytes" . | int64 -}}
+{{- end -}}
+{{- with include "kube-agents.declaredQuantity" (dict "value" (index $lim "ephemeral-storage") "fallback" "") -}}
+{{- $ephLim = include "kube-agents.parseBytes" . | int64 -}}
+{{- /* No operator-rendered request to keep: the API server sets it to this limit. */ -}}
+{{- $ephReq = $ephLim -}}
+{{- end -}}
+{{- with include "kube-agents.declaredQuantity" (dict "value" (index $req "ephemeral-storage") "fallback" "") -}}
+{{- $ephReq = include "kube-agents.parseBytes" . | int64 -}}
+{{- end -}}
+{{- dict
+      "cpuMillisRequest" $cpuReq "cpuMillisLimit" $cpuLim
+      "memoryBytesRequest" $memReq "memoryBytesLimit" $memLim
+      "ephemeralStorageBytesRequest" $ephReq "ephemeralStorageBytesLimit" $ephLim
+      "pods" ($workload.pods | default 1 | int64)
+   | toJson -}}
+{{- end }}
+
+{{/*
+The credential-proxy container's default requests and limits, and the smallest memory limit the
+operator accepts, for the CR template's static check of
+platformAgent.deployment.credentialProxy.resources. Copies of the operator's:
+credentialProxyCPURequest, credentialProxyMemoryRequest, credentialProxyCPULimit,
+credentialProxyMemoryLimit and credentialProxyEphemeralStorageLimit, and
+credentialProxyMemoryFloorBytesAtDefaultCap, credentialProxyMinimumMemoryLimitBytes at the
+default output cap, 672Mi (k8s-operator/internal/controller/credential_proxy_manifests.go).
+tests/test_credential_proxy_sizing_parity.py holds them equal, the floor to the operator's and
+the broker's declared copies; each side's own test holds its copy to its formula. Change all
+sides together.
+The defaults carry no ephemeral-storage request because the operator renders none.
+*/}}
+{{- define "kube-agents.credentialProxyDefaults" -}}
+{{- dict
+      "requests" (dict "cpu" "500m" "memory" "512Mi")
+      "limits" (dict "cpu" "1" "memory" "1Gi" "ephemeral-storage" "2Gi")
+   | toJson -}}
+{{- end }}
+
+{{- define "kube-agents.credentialProxyMemoryFloorBytes" -}}
+704643072
+{{- end }}
+
 {{- define "kube-agents.quotaRequirements" -}}
 {{- $footprint := .Files.Get "files/footprint.yaml" | fromYaml -}}
 {{- /* The footprint is the only source for the operator-rendered pods, which are most of
@@ -1257,8 +1564,19 @@ a Go template cannot catch the error `lookup` raises.
          generic keys here ensures that any workload summed into extract_footprint is
          automatically counted by the preflight without requiring manual template edits.
          agentPod and storage are handled separately above and below. */ -}}
+  {{- /* The one operator-rendered workload with a sizing override in values: the proxy's
+         footprint entry takes platformAgent.deployment.credentialProxy.resources over it
+         per key (kube-agents.credentialProxyFootprint) before it is summed, so a raised
+         memory limit is counted here as the pod the operator will write, rather than the
+         preflight passing a quota the release will not fit. An ephemeral-storage limit set
+         alone is counted as a request of that size too: the operator renders no
+         ephemeral-storage request and the API server defaults it to the limit. */ -}}
+  {{- $proxyOverride := (((.Values.platformAgent.deployment | default dict).credentialProxy | default dict).resources) | default dict -}}
   {{- range $key, $workload := $op -}}
     {{- if and (ne $key "agentPod") (ne $key "storage") -}}
+      {{- if and (eq $key "credentialProxy") $proxyOverride -}}
+        {{- $workload = include "kube-agents.credentialProxyFootprint" (dict "workload" $workload "override" $proxyOverride) | fromJson -}}
+      {{- end -}}
       {{- $reqPods = add $reqPods (include "kube-agents.replicaCount" $workload.pods | int64) -}}
       {{- $reqCpu = add $reqCpu ($workload.cpuMillisRequest | default 0 | int64) -}}
       {{- $limCpu = add $limCpu ($workload.cpuMillisLimit | default 0 | int64) -}}
