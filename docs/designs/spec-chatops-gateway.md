@@ -369,11 +369,19 @@ says so instead) or if another task already holds the conversation (waking would
 task's own pod); otherwise the wake is an ordinary session spawn and counts against
 `A2A_MAX_SESSIONS` like any other - refused at the cap, the child's result still stands as
 already relayed, and the room gets the standard cap notice rather than a second one. The wake
-inherits the child's chain depth, so depth counts delegations, not turns. Its text carries the
+inherits the child's chain depth, so depth counts delegations, not turns. The wake's pod starts
+with no memory of the turn that delegated, so its text opens with what the human asked: the label
+`You were asked:` and the human's message that started the chain, fenced. It is the root turn's
+message, carried down a longer chain, never an intermediate wake's gateway-authored text. Then
+`You delegated to platform (task …), which completed.` (or failed, or was rejected), then the
 result, capped at `lib.DelegateTextCap` and fenced under the label
 `Result from platform (not from the user):`, so the model reads the child's output as data, never
-as a new instruction from the user; a backtick run in the body that could close the fence early is
-broken before fencing. A heal that finds the child's terminal already on the stream, undelivered by
+as a new instruction from the user; a backtick run in either fenced body that could close its fence
+early is broken before fencing. The request is stored on the turn's history entry capped at 1 KiB
+(each of up to fifty entries carries one, and 16 KiB each would put a full record near the KV's
+message ceiling). It is user content at rest under the same posture as the active task's ask copy,
+cleared with the requester copy at `A2A_ASK_TTL`. An entry with none, written before the field,
+wakes with the outcome header alone. A heal that finds the child's terminal already on the stream, undelivered by
 the relay, wakes the session exactly as the relay would have, with the same guards, cap and fence; a
 child that never started has no terminal and does not wake. After a heal wakes the session this
 way, the message that triggered the heal is routed against the wake: a follow-up (not a status ask

@@ -1644,6 +1644,9 @@ type taskStart struct {
 	// parent's, a wake's its child's. Empty for a human turn, which is its
 	// own.
 	RootTaskID string
+	// Request is the entry's request copy (TaskRef.Request) for a wake: its
+	// delegating turn's. A human turn's is its own Text; a child stores none.
+	Request string
 }
 
 // startTask opens a turn for a human message.
@@ -1755,9 +1758,13 @@ func (g *Gateway) startTaskWith(ctx context.Context, rec *SessionRecord, ts task
 		ParentTaskID: ts.ParentTaskID,
 		Depth:        ts.Depth,
 		RootTaskID:   ts.RootTaskID,
+		Request:      ts.Request,
 	}
 	if ref.RootTaskID == "" {
 		ref.RootTaskID = taskID
+	}
+	if ts.Role == "" {
+		ref.Request = capAsk(strings.TrimSpace(ts.Text))
 	}
 	ref.carrySteerAuthors(TaskRef{SteerAuthors: ts.SteerAuthors, SteerAuthorsOverflow: ts.SteerAuthorsOverflow})
 	rec.Tasks = append(rec.Tasks, ref)

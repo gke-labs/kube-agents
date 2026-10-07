@@ -205,7 +205,8 @@ func (g *Gateway) boundAskCopyAt(ctx context.Context, rec *SessionRecord, now ti
 	}
 	// The requester copy on the task history is bounded the same way: the
 	// pseudonymized requester a later child task would be checked against,
-	// and the attribution it would inherit, outlive nothing past the TTL. The entry
+	// the attribution it would inherit, and the request text a wake would
+	// open with, outlive nothing past the TTL. The entry
 	// itself stays; a delegation from it is refused rather than guessed.
 	for i := range fresh.Tasks {
 		ref := &fresh.Tasks[i]
@@ -217,6 +218,7 @@ func (g *Gateway) boundAskCopyAt(ctx context.Context, rec *SessionRecord, now ti
 		}
 		ref.Requester, ref.Attribution = nil, nil
 		ref.SteerAuthors, ref.SteerAuthorsOverflow = nil, false
+		ref.Request = "" // user content, the ActiveTask.Ask posture
 		requesterIDs = append(requesterIDs, ref.ID)
 		changed = true
 	}
@@ -250,9 +252,11 @@ func (g *Gateway) sessionAuthorsExpired(rec *SessionRecord, now time.Time) bool 
 }
 
 // holdsRequesterCopy reports whether the entry holds any of the copies the
-// ask bound ages out: the requester, its attribution, the steer authors.
+// ask bound ages out: the requester, its attribution, the steer authors,
+// and the request text.
 func (ref TaskRef) holdsRequesterCopy() bool {
-	return ref.Requester != nil || ref.Attribution != nil || len(ref.SteerAuthors) > 0 || ref.SteerAuthorsOverflow
+	return ref.Requester != nil || ref.Attribution != nil || len(ref.SteerAuthors) > 0 || ref.SteerAuthorsOverflow ||
+		ref.Request != ""
 }
 
 // requesterExpired reports whether any history entry's requester copy is

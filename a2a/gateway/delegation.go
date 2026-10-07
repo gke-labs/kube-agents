@@ -255,13 +255,43 @@ const wakeFenceMax = 16
 // result: the text below is the addressee's output, not the user's ask.
 const wakeResultLabel = "Result from " + targetPlatform + " (not from the user):"
 
-// wakeText is the wake turn's prompt (spec §4): the header naming the child
-// and its outcome, then, when there is a result or reason, the label and the
-// body fenced. Everything after the header line is held to
+// wakeAskLabel opens the wake's text when the delegating turn's request is
+// on record: the wake's pod starts with no memory, so without it the session
+// reads a result to a question it never saw.
+const wakeAskLabel = "You were asked:"
+
+// wakeAskCap bounds the request copy on a history entry (TaskRef.Request), in
+// bytes, marker included. Smaller than lib.DelegateTextCap on purpose: every
+// human turn stores one, the record holds up to taskHistoryCap entries, and
+// 16 KiB each would put a full history near the KV's message-size ceiling,
+// where 1 KiB keeps it at 50 KiB. A question longer than that is rare, and
+// the wake needs the question, not every word of it.
+const wakeAskCap = 1024
+
+// wakeAskTruncatedNote follows the "…" truncateRunes leaves on an ask cut at
+// wakeAskCap.
+const wakeAskTruncatedNote = " (truncated)"
+
+// capAsk is text held to wakeAskCap bytes, cut on a rune boundary and marked.
+func capAsk(text string) string {
+	if len(text) <= wakeAskCap {
+		return text
+	}
+	return truncateRunes(text, wakeAskCap-len("…")-len(wakeAskTruncatedNote)) + wakeAskTruncatedNote
+}
+
+// wakeText is the wake turn's prompt (spec §4). With the delegating turn's
+// request on record it opens with the label and the request fenced - the
+// human's text, untrusted like the result, so it is fenced the same way and
+// no line of it can close the block and pass for the gateway's own - then
+// the header naming the child and its outcome; with none (a legacy entry) the
+// header alone opens it. Then, when there is a result or reason, the label
+// and the body fenced. Everything after the header line is held to
 // lib.DelegateTextCap bytes, label and fences included; the body is cut on a
-// rune boundary and marked. The relay has already posted the whole of it to
-// the conversation.
-func wakeText(state lib.TaskState, childID, result, reason string) string {
+// rune boundary and marked. The request is held to wakeAskCap before the
+// fence, so the whole text is bounded by the two caps and their fences. The
+// relay has already posted the whole result to the conversation.
+func wakeText(state lib.TaskState, childID, ask, result, reason string) string {
 	outcome, body := "completed", result
 	switch state {
 	case lib.StateFailed, lib.StateCanceled: // a canceled the gateway did not publish
@@ -269,7 +299,15 @@ func wakeText(state lib.TaskState, childID, result, reason string) string {
 	case lib.StateRejected:
 		outcome, body = "was rejected", reason
 	}
-	text := fmt.Sprintf("The task you delegated to %s (task %s) %s.", targetPlatform, childID, outcome)
+	var text string
+	if ask = strings.TrimSpace(ask); ask != "" {
+		ask = breakBacktickRuns(capAsk(ask), wakeFenceMax-1)
+		fence := wakeFence(ask)
+		text = wakeAskLabel + "\n" + fence + "\n" + ask + "\n" + fence + "\n" +
+			fmt.Sprintf("You delegated to %s (task %s), which %s.", targetPlatform, childID, outcome)
+	} else {
+		text = fmt.Sprintf("The task you delegated to %s (task %s) %s.", targetPlatform, childID, outcome)
+	}
 	if body = strings.TrimSpace(body); body != "" {
 		text += "\n" + fenceWakeBody(body)
 	}
@@ -446,7 +484,9 @@ func (g *Gateway) wakeSession(ctx context.Context, rec *SessionRecord, child Tas
 	// it ran on, which the mint checked was the record's bus session.
 	authority.Via = &AuthorityVia{TaskID: child.ID, Session: parent.Addressee}
 
-	text := wakeText(state, child.ID, result, reason)
+	// The delegating turn's request, carried down a longer chain: the
+	// human's question, not an intermediate wake's gateway-authored text.
+	text := wakeText(state, child.ID, parent.Request, result, reason)
 
 	if rec.Profile == "" {
 		rec.Profile = sessionProfile
@@ -484,6 +524,7 @@ func (g *Gateway) wakeSession(ctx context.Context, rec *SessionRecord, child Tas
 		SteerAuthors:         steered.SteerAuthors,
 		SteerAuthorsOverflow: steered.SteerAuthorsOverflow,
 		RootTaskID:           child.rootID(),
+		Request:              parent.Request,
 	})
 	if !ok {
 		return false, "the wake could not be started"

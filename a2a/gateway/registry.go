@@ -268,6 +268,21 @@ type TaskRef struct {
 	// the whole chain by it (observedAs). Empty on entries written before
 	// it existed, which read as their own root.
 	RootTaskID string `json:"rootTaskId,omitempty"`
+	// Request is the human's text that started the chain, capped at
+	// wakeAskCap: a human turn's own message, and a wake's copy of its
+	// delegating turn's, so a wake of a wake still reads the human's
+	// question rather than the gateway-authored text of the wake before
+	// it. The wake opens with it (wakeText), because its pod starts with
+	// no memory. This is user CONTENT at rest on the bus, deliberately,
+	// under the same posture as ActiveTask.Ask: the same text already rides
+	// the TASKS stream in the submission envelope for the whole retention
+	// window, the gateway is the only user granted $KV.session-state.>, and
+	// the bucket keeps one revision. It outlives the terminal event (the
+	// wake needs it after the turn ends), so the independent age bound is
+	// the whole bound: AskTTL clears it with the requester copy
+	// (boundAskCopyAt). Empty on entries written before it existed, on a
+	// child, and once cleared.
+	Request string `json:"request,omitempty"`
 }
 
 // rootID is the id the entry's chain is known by outside the gateway.
