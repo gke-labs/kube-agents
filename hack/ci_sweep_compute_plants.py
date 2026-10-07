@@ -211,11 +211,18 @@ def sweep_project(
             # Orphaned subnet whose network was already deleted
             subnets_to_delete.append(sub)
 
-    selected_subnet_names = {
-        sub.get("name") for sub in subnets_to_delete if sub.get("name")
+    selected_subnet_keys = {
+        (resource_name(sub.get("region")), sub.get("name"))
+        for sub in subnets_to_delete
+        if sub.get("name")
     }
-    raw_subnet_names = {
-        sub.get("name") for sub in raw_subnets if sub.get("name")
+    selected_subnet_self_links = {
+        sub.get("selfLink") for sub in subnets_to_delete if sub.get("selfLink")
+    }
+    raw_subnet_keys = {
+        (resource_name(sub.get("region")), sub.get("name"))
+        for sub in raw_subnets
+        if sub.get("name")
     }
 
     # 3. Inspect addresses
@@ -224,88 +231,108 @@ def sweep_project(
     for addr in raw_addresses:
         if not matches_plant_description(addr.get("description")):
             continue
-        sub_name = resource_name(addr.get("subnetwork"))
+        sub_ref = addr.get("subnetwork")
+        sub_name = resource_name(sub_ref)
+        addr_region = resource_name(addr.get("region"))
         net_name = resource_name(addr.get("network"))
-        if (sub_name and sub_name in selected_subnet_names) or (net_name and net_name in selected_network_names):
+
+        # If the address explicitly references a known active (unselected) network, leave it alone
+        if net_name and net_name in raw_network_names and net_name not in selected_network_names:
+            continue
+
+        subnet_matches = False
+        if sub_ref and sub_ref in selected_subnet_self_links:
+            subnet_matches = True
+        elif sub_name and (addr_region, sub_name) in selected_subnet_keys:
+            subnet_matches = True
+        elif sub_name and not addr_region and any(k[1] == sub_name for k in selected_subnet_keys):
+            # Standalone or mock fixtures where neither specifies region
+            subnet_matches = True
+
+        if subnet_matches or (net_name and net_name in selected_network_names):
             addresses_to_delete.append(addr)
         elif not sub_name and not net_name and is_older_than(addr.get("creationTimestamp"), max_age_hours, now=now):
-            # Standalone or mock addresses without subnet/network fields
+            # Standalone address without subnet or network fields
             addresses_to_delete.append(addr)
         elif is_older_than(addr.get("creationTimestamp"), max_age_hours, now=now):
             # Orphaned address whose subnet/network was already deleted
-            if (not sub_name or sub_name not in raw_subnet_names) and (not net_name or net_name not in raw_network_names):
+            if (not sub_name or (addr_region, sub_name) not in raw_subnet_keys) and (not net_name or net_name not in raw_network_names):
                 addresses_to_delete.append(addr)
 
     deleted = {"addresses": [], "subnets": [], "networks": []}
     failed = {"addresses": [], "subnets": [], "networks": []}
 
-    # Step 1: Delete addresses
-    for addr in addresses_to_delete:
-        name = addr.get("name", "")
-        region = addr.get("region")
-        if dry_run:
-            print(f"  would delete address {name} in {project}")
-            deleted["addresses"].append(name)
-            continue
+    try:
+        # Step 1: Delete addresses
+        for addr in addresses_to_delete:
+            name = addr.get("name", "")
+            region = addr.get("region")
+            if dry_run:
+                print(f"  would delete address {name} in {project}")
+                deleted["addresses"].append(name)
+                continue
 
-        cmd = ["gcloud", "compute", "addresses", "delete", name, f"--project={project}"]
-        if region:
-            region_name = region.split("/")[-1]
-            cmd.append(f"--region={region_name}")
-        else:
-            cmd.append("--global")
-        cmd.append("--quiet")
+            cmd = ["gcloud", "compute", "addresses", "delete", name, f"--project={project}"]
+            if region:
+                region_name = region.split("/")[-1]
+                cmd.append(f"--region={region_name}")
+            else:
+                cmd.append("--global")
+            cmd.append("--quiet")
 
-        del_proc = runner(cmd, capture_output=True, text=True, check=False)
-        if del_proc.returncode == 0:
-            print(f"  deleted address {name} in {project}")
-            deleted["addresses"].append(name)
-        else:
-            err = (del_proc.stderr or "").strip()
-            print(f"  could not delete address {name} in {project}: {err}", file=sys.stderr)
-            failed["addresses"].append((name, err))
+            del_proc = runner(cmd, capture_output=True, text=True, check=False)
+            if del_proc.returncode == 0:
+                print(f"  deleted address {name} in {project}")
+                deleted["addresses"].append(name)
+            else:
+                err = (del_proc.stderr or "").strip()
+                print(f"  could not delete address {name} in {project}: {err}", file=sys.stderr)
+                failed["addresses"].append((name, err))
 
-    # Step 2: Delete subnets
-    for sub in subnets_to_delete:
-        name = sub.get("name", "")
-        region = sub.get("region")
-        if dry_run:
-            print(f"  would delete subnet {name} in {project}")
-            deleted["subnets"].append(name)
-            continue
+        # Step 2: Delete subnets
+        for sub in subnets_to_delete:
+            name = sub.get("name", "")
+            region = sub.get("region")
+            if dry_run:
+                print(f"  would delete subnet {name} in {project}")
+                deleted["subnets"].append(name)
+                continue
 
-        cmd = ["gcloud", "compute", "networks", "subnets", "delete", name, f"--project={project}"]
-        if region:
-            region_name = region.split("/")[-1]
-            cmd.append(f"--region={region_name}")
-        cmd.append("--quiet")
+            cmd = ["gcloud", "compute", "networks", "subnets", "delete", name, f"--project={project}"]
+            if region:
+                region_name = region.split("/")[-1]
+                cmd.append(f"--region={region_name}")
+            cmd.append("--quiet")
 
-        del_proc = runner(cmd, capture_output=True, text=True, check=False)
-        if del_proc.returncode == 0:
-            print(f"  deleted subnet {name} in {project}")
-            deleted["subnets"].append(name)
-        else:
-            err = (del_proc.stderr or "").strip()
-            print(f"  could not delete subnet {name} in {project}: {err}", file=sys.stderr)
-            failed["subnets"].append((name, err))
+            del_proc = runner(cmd, capture_output=True, text=True, check=False)
+            if del_proc.returncode == 0:
+                print(f"  deleted subnet {name} in {project}")
+                deleted["subnets"].append(name)
+            else:
+                err = (del_proc.stderr or "").strip()
+                print(f"  could not delete subnet {name} in {project}: {err}", file=sys.stderr)
+                failed["subnets"].append((name, err))
 
-    # Step 3: Delete networks
-    for net in networks_to_delete:
-        name = net.get("name", "")
-        if dry_run:
-            print(f"  would delete network {name} in {project}")
-            deleted["networks"].append(name)
-            continue
+        # Step 3: Delete networks
+        for net in networks_to_delete:
+            name = net.get("name", "")
+            if dry_run:
+                print(f"  would delete network {name} in {project}")
+                deleted["networks"].append(name)
+                continue
 
-        cmd = ["gcloud", "compute", "networks", "delete", name, f"--project={project}", "--quiet"]
-        del_proc = runner(cmd, capture_output=True, text=True, check=False)
-        if del_proc.returncode == 0:
-            print(f"  deleted network {name} in {project}")
-            deleted["networks"].append(name)
-        else:
-            err = (del_proc.stderr or "").strip()
-            print(f"  could not delete network {name} in {project}: {err}", file=sys.stderr)
-            failed["networks"].append((name, err))
+            cmd = ["gcloud", "compute", "networks", "delete", name, f"--project={project}", "--quiet"]
+            del_proc = runner(cmd, capture_output=True, text=True, check=False)
+            if del_proc.returncode == 0:
+                print(f"  deleted network {name} in {project}")
+                deleted["networks"].append(name)
+            else:
+                err = (del_proc.stderr or "").strip()
+                print(f"  could not delete network {name} in {project}: {err}", file=sys.stderr)
+                failed["networks"].append((name, err))
+    except Terminated as exc:
+        setattr(exc, "deleted", deleted)
+        raise
 
     total_failed = len(failed["addresses"]) + len(failed["subnets"]) + len(failed["networks"])
     if total_failed > 0:
@@ -368,6 +395,13 @@ def sweep_pool(
             }
         except Terminated as exc:
             report["ended_early"] = str(exc)
+            del_counts = getattr(exc, "deleted", None)
+            if del_counts and (del_counts.get("addresses") or del_counts.get("subnets") or del_counts.get("networks")):
+                deleted[name] = {
+                    "addresses": len(del_counts.get("addresses", [])),
+                    "subnets": len(del_counts.get("subnets", [])),
+                    "networks": len(del_counts.get("networks", [])),
+                }
             failures[name] = str(exc)
             raise
         except Exception as exc:
@@ -499,6 +533,16 @@ def main(argv=None) -> int:
                     }
                 run["failures"][args.project] = str(exc)
                 print(f"ERROR: {exc}", file=sys.stderr)
+            except Terminated as exc:
+                del_counts = getattr(exc, "deleted", None)
+                if del_counts and (del_counts.get("addresses") or del_counts.get("subnets") or del_counts.get("networks")):
+                    run["deleted"][args.project] = {
+                        "addresses": len(del_counts.get("addresses", [])),
+                        "subnets": len(del_counts.get("subnets", [])),
+                        "networks": len(del_counts.get("networks", [])),
+                    }
+                run["failures"][args.project] = str(exc)
+                raise
         else:
             projects = pool_projects(args.ci_deploy_script)
             deleted, failures, unmapped = sweep_pool(

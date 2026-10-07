@@ -444,6 +444,125 @@ class SweepProjectTest(unittest.TestCase):
         delete_cmds = [cmd for cmd in commands_run if "delete" in cmd]
         self.assertEqual(len(delete_cmds), 0)
 
+    def test_addresses_differentiated_by_region_for_same_subnet_name(self):
+        """Proves that addresses matching a subnet name in a different region on an active VPC are preserved."""
+        commands_run = []
+
+        def mock_runner(cmd, capture_output=True, text=True, check=False):
+            commands_run.append(cmd)
+            if "list" in cmd:
+                if "networks" in cmd and "subnets" not in cmd:
+                    return mock.Mock(
+                        returncode=0,
+                        stdout=json.dumps([
+                            {"name": "bench-vpc-old", "description": self.plant_desc, "creationTimestamp": self.old_ts},
+                            {"name": "bench-vpc-active", "description": self.plant_desc, "creationTimestamp": self.recent_ts},
+                        ]),
+                        stderr="",
+                    )
+                if "subnets" in cmd:
+                    return mock.Mock(
+                        returncode=0,
+                        stdout=json.dumps([
+                            {
+                                "name": "bench-sub",
+                                "description": self.plant_desc,
+                                "creationTimestamp": self.old_ts,
+                                "network": "https://www.googleapis.com/compute/v1/projects/p/global/networks/bench-vpc-old",
+                                "region": "https://www.googleapis.com/compute/v1/projects/p/regions/us-west4",
+                            },
+                            {
+                                "name": "bench-sub",
+                                "description": self.plant_desc,
+                                "creationTimestamp": self.recent_ts,
+                                "network": "https://www.googleapis.com/compute/v1/projects/p/global/networks/bench-vpc-active",
+                                "region": "https://www.googleapis.com/compute/v1/projects/p/regions/us-east1",
+                            },
+                        ]),
+                        stderr="",
+                    )
+                if "addresses" in cmd:
+                    return mock.Mock(
+                        returncode=0,
+                        stdout=json.dumps([
+                            {
+                                "name": "bench-addr-west",
+                                "description": self.plant_desc,
+                                "creationTimestamp": self.recent_ts,
+                                "subnetwork": "https://www.googleapis.com/compute/v1/projects/p/regions/us-west4/subnetworks/bench-sub",
+                                "region": "https://www.googleapis.com/compute/v1/projects/p/regions/us-west4",
+                            },
+                            {
+                                "name": "bench-addr-east",
+                                "description": self.plant_desc,
+                                "creationTimestamp": self.recent_ts,
+                                "subnetwork": "https://www.googleapis.com/compute/v1/projects/p/regions/us-east1/subnetworks/bench-sub",
+                                "region": "https://www.googleapis.com/compute/v1/projects/p/regions/us-east1",
+                            },
+                        ]),
+                        stderr="",
+                    )
+            return mock.Mock(returncode=0, stdout="", stderr="")
+
+        res = sweep.sweep_project("my-project", max_age_hours=4.0, runner=mock_runner, now=self.now)
+        self.assertEqual(res["addresses"], ["bench-addr-west"])
+        self.assertEqual(res["subnets"], ["bench-sub"])
+        self.assertEqual(res["networks"], ["bench-vpc-old"])
+
+        delete_cmds = [cmd for cmd in commands_run if "delete" in cmd]
+        deleted_names = [cmd[4] for cmd in delete_cmds]
+        self.assertIn("bench-addr-west", deleted_names)
+        self.assertNotIn("bench-addr-east", deleted_names)
+
+    def test_sweep_project_terminated_attaches_partial_deletions(self):
+        """Proves that a SIGTERM mid-sweep attaches accumulated deletions to Terminated."""
+        def mock_runner(cmd, capture_output=True, text=True, check=False):
+            if "list" in cmd:
+                if "networks" in cmd and "subnets" not in cmd:
+                    return mock.Mock(
+                        returncode=0,
+                        stdout=json.dumps([{"name": "bench-vpc-1", "description": self.plant_desc, "creationTimestamp": self.old_ts}]),
+                        stderr="",
+                    )
+                if "subnets" in cmd:
+                    return mock.Mock(
+                        returncode=0,
+                        stdout=json.dumps([{
+                            "name": "bench-sub-1",
+                            "description": self.plant_desc,
+                            "creationTimestamp": self.old_ts,
+                            "network": "bench-vpc-1",
+                            "region": "us-west4",
+                        }]),
+                        stderr="",
+                    )
+                if "addresses" in cmd:
+                    return mock.Mock(
+                        returncode=0,
+                        stdout=json.dumps([{
+                            "name": "bench-addr-1",
+                            "description": self.plant_desc,
+                            "creationTimestamp": self.old_ts,
+                            "region": "us-west4",
+                        }]),
+                        stderr="",
+                    )
+            if "addresses" in cmd and "delete" in cmd:
+                return mock.Mock(returncode=0, stdout="", stderr="")
+            if "subnets" in cmd and "delete" in cmd:
+                raise sweep.Terminated("signal 15")
+            return mock.Mock(returncode=0, stdout="", stderr="")
+
+        with self.assertRaises(sweep.Terminated) as ctx:
+            sweep.sweep_project("my-project", max_age_hours=4.0, runner=mock_runner, now=self.now)
+
+        del_counts = getattr(ctx.exception, "deleted", None)
+        self.assertIsNotNone(del_counts)
+        assert del_counts is not None
+        self.assertEqual(del_counts["addresses"], ["bench-addr-1"])
+        self.assertEqual(del_counts["subnets"], [])
+        self.assertEqual(del_counts["networks"], [])
+
     def test_delete_failure_raises_sweep_error_at_end(self):
         def mock_runner(cmd, capture_output=True, text=True, check=False):
             if "list" in cmd and "addresses" in cmd:
@@ -593,6 +712,33 @@ class SweepPoolTest(unittest.TestCase):
             self.assertEqual(report.get("ended_early"), "signal 15")
             self.assertEqual(report.get("failures", {}).get("proj-1"), "signal 15")
 
+    def test_sweep_pool_termination_retains_partial_deletions_in_report(self):
+        def fake_walk(server, owner, state, limit, visit_callback, heartbeat=True, release_failures=None):
+            visit_callback("proj-1")
+
+        def fake_sweep_project(name, max_age_hours=4.0, dry_run=False, runner=None, now=None):
+            term = sweep.Terminated("signal 15")
+            setattr(term, "deleted", {"addresses": ["addr-1"], "subnets": [], "networks": []})
+            raise term
+
+        with (
+            mock.patch.object(sweep.boskos_pool, "walk", side_effect=fake_walk),
+            mock.patch.object(sweep, "boskos_reset_stranded"),
+            mock.patch.object(sweep, "sweep_project", side_effect=fake_sweep_project),
+        ):
+            report = {}
+            with self.assertRaises(sweep.Terminated):
+                sweep.sweep_pool(
+                    "http://fake-boskos",
+                    "test-owner",
+                    4.0,
+                    {"proj-1"},
+                    report=report,
+                )
+            self.assertEqual(report.get("ended_early"), "signal 15")
+            self.assertEqual(report.get("deleted", {}).get("proj-1", {}).get("addresses"), 1)
+            self.assertEqual(report.get("failures", {}).get("proj-1"), "signal 15")
+
     def test_sweep_pool_release_failure_joins_with_sweep_failure_without_prefix_doubling(self):
         def fake_walk(server, owner, state, limit, visit_callback, heartbeat=True, release_failures=None):
             visit_callback("proj-1")
@@ -658,6 +804,18 @@ class WriteReportTest(unittest.TestCase):
 
 
 class MainCliTest(unittest.TestCase):
+    def setUp(self):
+        super().setUp()
+        self._orig_signals = {
+            sig: sweep.signal.getsignal(sig)
+            for sig in sweep.boskos_pool.TERMINATION_SIGNALS
+        }
+
+    def tearDown(self):
+        for sig, handler in self._orig_signals.items():
+            sweep.signal.signal(sig, handler)
+        super().tearDown()
+
     def test_signals_installed(self):
         with (
             mock.patch.object(sweep.signal, "signal") as mock_signal,
@@ -740,6 +898,23 @@ class MainCliTest(unittest.TestCase):
                 self.assertEqual(data["exit"], "failed")
                 self.assertEqual(data["deleted"]["p1"]["addresses"], 1)
                 self.assertEqual(data["failures"]["p1"], str(err))
+        finally:
+            pathlib.Path(report_path).unlink(missing_ok=True)
+
+    def test_project_mode_termination_records_partial_deletions_in_report(self):
+        with tempfile.NamedTemporaryFile("w", delete=False) as tf:
+            report_path = tf.name
+
+        try:
+            term = sweep.Terminated("signal 15")
+            setattr(term, "deleted", {"addresses": ["addr-1"], "subnets": [], "networks": []})
+            with mock.patch.object(sweep, "sweep_project", side_effect=term):
+                code = sweep.main(["--project", "p1", "--report", report_path])
+                self.assertEqual(code, sweep.TERMINATED_EXIT_CODE)
+                data = json.loads(pathlib.Path(report_path).read_text(encoding="utf-8"))
+                self.assertEqual(data["exit"], "terminated")
+                self.assertEqual(data["deleted"]["p1"]["addresses"], 1)
+                self.assertEqual(data["failures"]["p1"], "signal 15")
         finally:
             pathlib.Path(report_path).unlink(missing_ok=True)
 
