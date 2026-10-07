@@ -300,11 +300,11 @@ Teardown is per environment and not per connection. `cleanup()` runs
 `ssh -O exit` against that shared path, which drops the master and kills every
 session riding it. A sibling task that was mid-command loses it: exit 255, empty
 stderr, no indication that another task's teardown is what ended it. The callers
-of `cleanup()` are the per-turn teardown at the end of every turn (`turn_finalizer`
+of `cleanup()` include the per-turn teardown at the end of every turn (`turn_finalizer`
 → `cleanup_task_resources` → `cleanup_vm`; the ssh backend never marks itself
 persistent, so it runs for it), the idle reaper, `AIAgent.close()` via
-`cleanup_vm`, the eviction path after an infrastructure failure, and the
-environment's `__del__`. The first is the frequent one: every kanban card and
+`cleanup_vm`, the process's atexit sweep, the eviction path after an
+infrastructure failure, and the environment's `__del__`. The first is the frequent one: every kanban card and
 API-server request is one or more turns (and a delegate child, if it inherits
 the ssh backend — see [What is still unproven](#what-is-still-unproven)), so the
 master died whenever any of them finished while another was mid-command (#2174).
@@ -330,16 +330,19 @@ What remains is the teardown itself, and the agent image patches it
 (`deploy/docker/patches/apply_ssh_shared_master.py`): `cleanup()` keeps its
 sync-back and leaves the shared master alone, so a finishing turn or exiting
 process no longer cuts a sibling's command; `ControlPersist=300` reaps the master
-once nothing has used it for five minutes, and the eviction path after a
-connection failure still closes it, live or not — a registered environment only
-gets there when its connection failed, and a failure through the shared master is
-failing every sibling too. A prompt-time probe's master is its own and is closed
-as before. The terminal tool also labels the shape when it does occur: an ssh
+once nothing has used it for five minutes. The eviction path after an
+`EnvironmentConnectionError` still closes it, live or not; the per-command sync
+raises that error for any failed remote step, a foreground command never reaches
+eviction because `_run_foreground` catches and retries, so only the
+background-process path does, and there it is the pre-patch behaviour kept
+rather than widened. A prompt-time probe's master is its own and is closed as
+before. The terminal tool also labels the shape when it does occur: an ssh
 result with exit 255 and no cwd marker (the wrapper prints the marker after the
-command, so a command's own 255 carries one) gets a `hint`, unless upstream
-already explained the output, saying the connection was closed under the command
-or never opened, and that it may have run. A per-environment `ControlPath` would
-remove the sharing itself and is upstream's to make.
+command, so a command's own 255 carries one unless the command text itself calls
+`exit` at top level) gets a `hint`, unless upstream already attached a hint to
+the output, saying the connection was closed under the command or never opened,
+and that it may have run. A per-environment `ControlPath` would remove the
+sharing itself and is upstream's to make.
 
 ### What the credential proxy is for
 

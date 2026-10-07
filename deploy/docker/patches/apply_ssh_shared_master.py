@@ -18,12 +18,15 @@ Four anchored edits in three files:
 - ``terminal_tool_lifecycle.py``: ``_evict_environment_for_task()``, the path after an
   ``EnvironmentConnectionError``, calls ``close_master()`` after ``cleanup()``, in its own
   ``_quiet`` block so a raising ``cleanup()`` does not skip it. It closes whatever master is at the
-  socket, live or not: a registered environment only reaches eviction when its connection failed,
-  and a failure through the shared master is failing every sibling too.
+  socket, live or not, and the per-command sync raises that error for any failed remote step, not
+  only a dead link. A foreground command never reaches it (``_run_foreground`` catches the error
+  and retries), so in practice only the background-process path does; it is the pre-patch
+  behaviour on that path, kept rather than widened.
 - ``terminal_tool_result.py``: an ssh result with exit 255 and no cwd marker gets a ``hint``, the
-  way exit 124 has one, unless upstream already explained the output (``Permission denied``). The
-  wrapper prints the marker after the command and exits with its code, so a command's own 255
-  carries the marker and a cut connection, or one ssh never opened, does not.
+  way exit 124 has one, unless upstream already attached a hint to the output (``Permission
+  denied``). The wrapper prints the marker after the command and exits with its code, so a
+  command's own 255 carries the marker (unless the command text itself calls ``exit`` at top
+  level, which leaves the wrapper first) and a cut connection, or one ssh never opened, does not.
 
 The three files are substituted first and written last, so a moved anchor leaves none of them
 changed.
@@ -37,6 +40,7 @@ from pathlib import Path
 import patchlib
 
 MARKER = "kube-agents patch: ssh_shared_master"
+PREFIX = "ssh-shared-master"
 
 SSH_RELATIVE = "tools/environments/ssh.py"
 LIFECYCLE_RELATIVE = "tools/terminal_tool_lifecycle.py"
@@ -110,16 +114,16 @@ RESULT_PATCHED = RESULT_ANCHOR + (
 
 
 def apply(root: Path) -> None:
-    ssh = patchlib.Patch(root, SSH_RELATIVE, prefix="ssh-shared-master")
+    ssh = patchlib.Patch(root, SSH_RELATIVE, prefix=PREFIX)
     ssh.refuse_if_patched(MARKER)
     ssh.substitute(SSH_INIT_ANCHOR, SSH_INIT_PATCHED, label="shared-master mark in __init__")
     ssh.substitute(SSH_CLEANUP_ANCHOR, SSH_CLEANUP_PATCHED, label="cleanup() exit loop")
 
-    lifecycle = patchlib.Patch(root, LIFECYCLE_RELATIVE, prefix="ssh-shared-master")
+    lifecycle = patchlib.Patch(root, LIFECYCLE_RELATIVE, prefix=PREFIX)
     lifecycle.refuse_if_patched(MARKER)
     lifecycle.substitute(LIFECYCLE_ANCHOR, LIFECYCLE_PATCHED, label="eviction cleanup loop")
 
-    result = patchlib.Patch(root, RESULT_RELATIVE, prefix="ssh-shared-master")
+    result = patchlib.Patch(root, RESULT_RELATIVE, prefix=PREFIX)
     result.refuse_if_patched(MARKER)
     result.substitute(RESULT_ANCHOR, RESULT_PATCHED, label="failure hint assignment")
 

@@ -1267,11 +1267,11 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/kanban-scheduling/apply_kanban_scheduling
 # X-Hermes-Failure-Reason. See the module docstring in
 # deploy/docker/patches/apply_api_failure_reason_header.py.
 #
-# ssh_shared_master rides it too (#2174): every environment in the pod shares one
-# ssh ControlMaster, and SSHEnvironment.cleanup() closed it at the end of every
-# turn, cutting any sibling's running command (exit 255, no output). cleanup()
-# now leaves the shared master to ControlPersist, eviction after a connection
-# failure still closes it, and an ssh exit 255 without the cwd marker carries a
+# ssh_shared_master rides it too (#2174): every working environment in the pod
+# shares one ssh ControlMaster, and SSHEnvironment.cleanup() closed it at the end
+# of every turn, cutting any sibling's running command (exit 255, no output).
+# cleanup() now leaves the shared master to ControlPersist, the background path's
+# eviction still closes it, and an ssh exit 255 without the cwd marker carries a
 # hint. See the module docstring in deploy/docker/patches/apply_ssh_shared_master.py.
 COPY --chmod=0644 deploy/docker/patches/kanban_guardrail_exit.py \
      deploy/docker/patches/rate_limit_retry_delay.py \
