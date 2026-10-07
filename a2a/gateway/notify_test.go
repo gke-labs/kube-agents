@@ -55,7 +55,7 @@ func newTestNotifier(t *testing.T, p *fakeNotifyPoster) *Notifier {
 	return n
 }
 
-func serveJSON(t *testing.T, n *Notifier, req NotifyRequest) NotifyReply {
+func serveJSON(t *testing.T, n *Notifier, req lib.NotifyRequest) lib.NotifyReply {
 	t.Helper()
 	body, err := json.Marshal(req)
 	if err != nil {
@@ -74,7 +74,7 @@ func TestNotifyRefusesAHomeThatIsNotASpace(t *testing.T) {
 
 func TestNotifyStartsANewThreadInTheHomeSpace(t *testing.T) {
 	p := &fakeNotifyPoster{landsIn: testHome + "/threads/T1"}
-	got := serveJSON(t, newTestNotifier(t, p), NotifyRequest{Text: "drift found"})
+	got := serveJSON(t, newTestNotifier(t, p), lib.NotifyRequest{Text: "drift found"})
 	if got.Error != "" {
 		t.Fatalf("refused: %s", got.Error)
 	}
@@ -90,7 +90,7 @@ func TestNotifyStartsANewThreadInTheHomeSpace(t *testing.T) {
 func TestNotifyRepliesOnAHomeThread(t *testing.T) {
 	p := &fakeNotifyPoster{}
 	thread := testHome + "/threads/T9"
-	got := serveJSON(t, newTestNotifier(t, p), NotifyRequest{Text: "follow-up", Thread: thread})
+	got := serveJSON(t, newTestNotifier(t, p), lib.NotifyRequest{Text: "follow-up", Thread: thread})
 	if got.Error != "" || got.ThreadID != thread {
 		t.Fatalf("reply = %+v, want it on %s", got, thread)
 	}
@@ -112,7 +112,7 @@ func TestNotifyRefusesAThreadOutsideTheHomeSpace(t *testing.T) {
 		"users/123",
 	} {
 		p := &fakeNotifyPoster{}
-		got := serveJSON(t, newTestNotifier(t, p), NotifyRequest{Text: "x", Thread: thread})
+		got := serveJSON(t, newTestNotifier(t, p), lib.NotifyRequest{Text: "x", Thread: thread})
 		if got.Error == "" {
 			t.Errorf("thread %q accepted; want refused", thread)
 		}
@@ -140,7 +140,7 @@ func TestNotifyRefusesMalformedRequests(t *testing.T) {
 func TestNotifyChunksALongReportIntoOneThread(t *testing.T) {
 	p := &fakeNotifyPoster{landsIn: testHome + "/threads/T1"}
 	text := strings.Repeat("line of a long audit report\n", 200)
-	got := serveJSON(t, newTestNotifier(t, p), NotifyRequest{Text: text})
+	got := serveJSON(t, newTestNotifier(t, p), lib.NotifyRequest{Text: text})
 	posts := p.all()
 	if len(posts) < 2 {
 		t.Fatalf("posted %d chunks; want the report split", len(posts))
@@ -160,7 +160,7 @@ func TestNotifyChunksALongReportIntoOneThread(t *testing.T) {
 
 func TestNotifyReportsAPartialPost(t *testing.T) {
 	p := &fakeNotifyPoster{landsIn: testHome + "/threads/T1", failAt: 2}
-	got := serveJSON(t, newTestNotifier(t, p), NotifyRequest{Text: strings.Repeat("x\n", 2000)})
+	got := serveJSON(t, newTestNotifier(t, p), lib.NotifyRequest{Text: strings.Repeat("x\n", 2000)})
 	if got.Error == "" || got.MessageID == "" || got.ThreadID == "" {
 		t.Errorf("reply = %+v, want the error and where the first part landed", got)
 	}
@@ -191,7 +191,7 @@ func TestNotifyAnswersOnlyInTheReplyNamespace(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer agent.Close()
-	body, _ := json.Marshal(NotifyRequest{Text: "alert"})
+	body, _ := json.Marshal(lib.NotifyRequest{Text: "alert"})
 
 	ask := func(reply string) (*nats.Msg, error) {
 		in, err := agent.SubscribeSync(reply)
@@ -199,22 +199,22 @@ func TestNotifyAnswersOnlyInTheReplyNamespace(t *testing.T) {
 			t.Fatal(err)
 		}
 		defer in.Unsubscribe()
-		if err := agent.PublishRequest(NotifySubjectGchat, reply, body); err != nil {
+		if err := agent.PublishRequest(lib.NotifySubjectGchat, reply, body); err != nil {
 			t.Fatal(err)
 		}
 		return in.NextMsg(2 * time.Second)
 	}
 
-	msg, err := ask(NotifyReplyPrefix + "r1")
+	msg, err := ask(lib.NotifyReplyPrefix + "r1")
 	if err != nil {
 		t.Fatalf("no answer in the reply namespace: %v", err)
 	}
-	var got NotifyReply
+	var got lib.NotifyReply
 	if err := json.Unmarshal(msg.Data, &got); err != nil || got.ThreadID != testHome+"/threads/T1" {
 		t.Fatalf("answer = %s (%v)", msg.Data, err)
 	}
 
-	for _, reply := range []string{"_INBOX.agent.r2", "chat.notify.reply.other.r3", NotifyReplyPrefix[:len(NotifyReplyPrefix)-1]} {
+	for _, reply := range []string{"_INBOX.agent.r2", "chat.notify.reply.other.r3", lib.NotifyReplyPrefix[:len(lib.NotifyReplyPrefix)-1]} {
 		if msg, err := ask(reply); err == nil {
 			t.Errorf("answered on %q (%s); want dropped", reply, msg.Data)
 		}

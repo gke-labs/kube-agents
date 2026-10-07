@@ -29,36 +29,9 @@ import (
 // not go to the requester's _INBOX for the reason the verifier's does not: the
 // agent reads its JetStream replies there, and a gateway able to publish into
 // it could forge them.
-const (
-	// NotifySubjectGchat is the subject a Google Chat notify is published on.
-	NotifySubjectGchat = "chat.notify.gchat"
-	// NotifyReplyPrefix is the namespace every notify's reply subject must
-	// sit under. A request whose reply subject is elsewhere is dropped
-	// unanswered: the gateway cannot publish anywhere else, and answering on
-	// a subject the requester chose freely would make the gateway a relay.
-	NotifyReplyPrefix = "chat.notify.reply.agent."
-	// notifyMaxBody bounds a request. A relayed audit report is the largest
-	// thing sent here; this is several of them.
-	notifyMaxBody = 256 << 10
-)
-
-// NotifyRequest is the body of a chat.notify request.
-type NotifyRequest struct {
-	// Text is the message, chunked under the backend cap on the way out.
-	Text string `json:"text"`
-	// Thread, when set, is the thread to reply on. It must be a thread of
-	// the home space; empty starts a new thread there.
-	Thread string `json:"thread,omitempty"`
-}
-
-// NotifyReply is the answer: the first message posted and the thread it
-// landed in, or the reason nothing was posted. Field names match what
-// `hermes send --json` prints, so the agent-side callers parse one shape.
-type NotifyReply struct {
-	MessageID string `json:"message_id,omitempty"`
-	ThreadID  string `json:"thread_id,omitempty"`
-	Error     string `json:"error,omitempty"`
-}
+// notifyMaxBody bounds a request. A relayed audit report is the largest
+// thing sent here; this is several of them.
+const notifyMaxBody = 256 << 10
 
 // notifyPoster is the backend half: post text into a space, new thread or
 // reply, and say where it landed. GoogleChatAdapter.PostNotify is the one
@@ -85,7 +58,7 @@ func NewGchatNotifier(poster notifyPoster, home string, log *slog.Logger) (*Noti
 	if log == nil {
 		log = slog.Default()
 	}
-	return &Notifier{subject: NotifySubjectGchat, home: home, poster: poster, log: log}, nil
+	return &Notifier{subject: lib.NotifySubjectGchat, home: home, poster: poster, log: log}, nil
 }
 
 // Start subscribes the notifier on client. The subscription survives
@@ -100,7 +73,7 @@ func (n *Notifier) Start(client *lib.Client) (lib.Subscription, error) {
 }
 
 func (n *Notifier) handle(m *nats.Msg) {
-	if !strings.HasPrefix(m.Reply, NotifyReplyPrefix) || len(m.Reply) == len(NotifyReplyPrefix) {
+	if !strings.HasPrefix(m.Reply, lib.NotifyReplyPrefix) || len(m.Reply) == len(lib.NotifyReplyPrefix) {
 		n.log.Warn("notify dropped: reply subject outside the notify reply namespace", "reply", m.Reply)
 		return
 	}
@@ -116,11 +89,11 @@ func (n *Notifier) handle(m *nats.Msg) {
 }
 
 // serve validates and posts one request.
-func (n *Notifier) serve(data []byte) NotifyReply {
+func (n *Notifier) serve(data []byte) lib.NotifyReply {
 	if len(data) > notifyMaxBody {
 		return n.refuse(fmt.Sprintf("request is %d bytes; the limit is %d", len(data), notifyMaxBody))
 	}
-	var req NotifyRequest
+	var req lib.NotifyRequest
 	if err := json.Unmarshal(data, &req); err != nil {
 		return n.refuse("request is not JSON: " + err.Error())
 	}
@@ -137,10 +110,10 @@ func (n *Notifier) serve(data []byte) NotifyReply {
 		if err != nil {
 			n.log.Error("notify post failed", "home", n.home, "thread", thread, "err", err)
 			if first == "" {
-				return NotifyReply{Error: "post failed: " + err.Error()}
+				return lib.NotifyReply{Error: "post failed: " + err.Error()}
 			}
 			// Part of the text is already in the channel; say where.
-			return NotifyReply{MessageID: first, ThreadID: thread, Error: "post failed partway: " + err.Error()}
+			return lib.NotifyReply{MessageID: first, ThreadID: thread, Error: "post failed partway: " + err.Error()}
 		}
 		if first == "" {
 			first = message
@@ -150,7 +123,7 @@ func (n *Notifier) serve(data []byte) NotifyReply {
 		}
 	}
 	n.log.Info("notify posted", "home", n.home, "thread", thread, "message", first)
-	return NotifyReply{MessageID: first, ThreadID: thread}
+	return lib.NotifyReply{MessageID: first, ThreadID: thread}
 }
 
 // inHome reports whether thread is a thread resource of the home space
@@ -160,7 +133,7 @@ func (n *Notifier) inHome(thread string) bool {
 	return ok && id != "" && !strings.Contains(id, "/")
 }
 
-func (n *Notifier) refuse(reason string) NotifyReply {
+func (n *Notifier) refuse(reason string) lib.NotifyReply {
 	n.log.Warn("notify refused", "reason", reason)
-	return NotifyReply{Error: reason}
+	return lib.NotifyReply{Error: reason}
 }

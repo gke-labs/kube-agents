@@ -34,6 +34,7 @@ usage:
   a2a topics list                  list the provisioned topics and their retention class
   a2a topics read <topic>          print the latest entry on a topic
   a2a topics write <topic> [flags] publish one entry to a topic
+  a2a notify --platform <p> [text] post to the chat home channel via the gateway
 
 <topic> is a bare name (upgrade-readiness), a scope-qualified name
 (shared.blueprint, agent.platform.upgrade-readiness), or a full subject. A bare
@@ -72,6 +73,8 @@ func run(args []string) error {
 	switch args[0] {
 	case "topics":
 		return runTopics(args[1:])
+	case "notify":
+		return runNotify(args[1:])
 	case "-h", "--help", "help":
 		fmt.Print(usage)
 		return nil
