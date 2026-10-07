@@ -153,6 +153,12 @@ class SessionKVCallersTest(unittest.TestCase):
                 mock.patch.dict(os.environ, {chat_notify.NOTIFY_PLATFORM_ENV: ""}):
             self.assertEqual(self.skv.enabled_chat_platforms(), ["slack"])
 
+    def test_a_non_object_answer_does_not_raise_into_the_relay(self):
+        for stdout in ('["m"]', '"m"', "7"):
+            with mock.patch.dict(os.environ, ROUTED), \
+                    mock.patch.object(self.skv.subprocess, "run", return_value=_completed(stdout)):
+                self.assertIsNone(self.skv._send_to_chat("google_chat", "report"), stdout)
+
     def test_today_still_runs_hermes_send(self):
         with mock.patch.dict(os.environ, {chat_notify.NOTIFY_PLATFORM_ENV: ""}), \
                 mock.patch.object(self.skv.subprocess, "run",

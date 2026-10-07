@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/nats-io/nats.go"
 
@@ -38,6 +39,14 @@ const (
 	// posts arrive a few at a time; a full queue is a sender in a loop, and
 	// is refused at once rather than left to time out.
 	notifyQueueDepth = 32
+	// notifyStopGrace bounds how long Stop waits for the worker to finish the
+	// post in flight and refuse the rest, inside the pod's 30s termination
+	// grace period.
+	notifyStopGrace = 20 * time.Second
+	// notifyStoppingRefusal is the answer to a request the gateway will not
+	// post because it is stopping. A refusal (exit 1 at the CLI), never
+	// silence: silence reads as "may have posted" and is not retried.
+	notifyStoppingRefusal = "the gateway is stopping; not posted"
 )
 
 // notifyPoster is the backend half: post text into a space, new thread or
@@ -54,6 +63,13 @@ type Notifier struct {
 	poster  notifyPoster
 	log     *slog.Logger
 	jobs    chan notifyJob
+	done    chan struct{}
+
+	// mu orders handle's enqueue against Stop's close of jobs: a request that
+	// arrives while Stop runs is refused under the lock rather than sent on a
+	// closed channel, which would panic.
+	mu       sync.Mutex
+	stopping bool
 }
 
 // NewGchatNotifier builds the Google Chat notifier. home is the configured
@@ -74,13 +90,14 @@ func NewGchatNotifier(poster notifyPoster, home string, log *slog.Logger) (*Noti
 // stopping it also stops the worker once the queue drains.
 func (n *Notifier) Start(client *lib.Client) (lib.Subscription, error) {
 	n.jobs = make(chan notifyJob, notifyQueueDepth)
+	n.done = make(chan struct{})
 	sub, err := client.SubscribeCore(n.subject, n.handle)
 	if err != nil {
 		return nil, fmt.Errorf("notify: %w", err)
 	}
 	go n.work()
 	n.log.Info("chat.notify route armed", "subject", n.subject, "home", n.home)
-	return &notifierSub{sub: sub, jobs: n.jobs}, nil
+	return &notifierSub{sub: sub, n: n}, nil
 }
 
 // notifyJob is one validated request waiting for the worker.
@@ -89,18 +106,29 @@ type notifyJob struct {
 	answer func(lib.NotifyReply)
 }
 
-// notifierSub stops the subscription and then closes the queue, so the
-// worker posts what was already accepted and exits.
+// notifierSub stops the subscription, closes the queue under the notifier's
+// lock, and waits for the worker: it finishes the post in flight and refuses
+// what is still queued, so every accepted request gets an answer while the
+// connection is still open. In cmd/gateway this Stop is deferred after the
+// client's Close, so it runs first.
 type notifierSub struct {
 	sub  lib.Subscription
-	jobs chan notifyJob
+	n    *Notifier
 	once sync.Once
 }
 
 func (s *notifierSub) Stop() {
 	s.once.Do(func() {
 		s.sub.Stop()
-		close(s.jobs)
+		s.n.mu.Lock()
+		s.n.stopping = true
+		close(s.n.jobs)
+		s.n.mu.Unlock()
+		select {
+		case <-s.n.done:
+		case <-time.After(notifyStopGrace):
+			s.n.log.Warn("chat.notify worker did not finish before shutdown", "grace", notifyStopGrace)
+		}
 	})
 }
 
@@ -128,6 +156,12 @@ func (n *Notifier) handle(m *nats.Msg) {
 		answer(*refusal)
 		return
 	}
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if n.stopping {
+		answer(n.refuse(notifyStoppingRefusal))
+		return
+	}
 	select {
 	case n.jobs <- notifyJob{req: req, answer: answer}:
 	default:
@@ -136,9 +170,20 @@ func (n *Notifier) handle(m *nats.Msg) {
 }
 
 func (n *Notifier) work() {
+	defer close(n.done)
 	for job := range n.jobs {
+		if n.isStopping() {
+			job.answer(n.refuse(notifyStoppingRefusal))
+			continue
+		}
 		n.post(job.req, job.answer)
 	}
+}
+
+func (n *Notifier) isStopping() bool {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return n.stopping
 }
 
 // validate decodes one request and refuses what may not be posted.

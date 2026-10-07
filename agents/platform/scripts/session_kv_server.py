@@ -1182,8 +1182,10 @@ def get_active_platform(platforms: Optional[list[str]] = None) -> str:
     return platforms[0]
 
 
-#: Returned by :func:`_post_initial_alert` when `hermes send` reported success
-#: but no message id could be read out of its `--json` stdout. Distinct from
+#: Returned by :func:`_post_initial_alert` when the send (`hermes send`, or
+#: `a2a notify` under next) reported success but no message id could be read
+#: out of its JSON stdout, or when `a2a notify` reported that the gateway took
+#: the request and did not answer in time. Distinct from
 #: `None`, which means the send itself failed. The caller must not try the next
 #: platform on this one: the alert IS in the first platform's channel, and
 #: falling through would post it a second time somewhere else. Deliberately not
@@ -1192,11 +1194,12 @@ ALERT_SENT_WITHOUT_THREAD = "\x00alert-sent-without-thread"
 
 
 def _post_initial_alert(active_platform: str, alert_msg: str) -> str | None:
-    """Send initial warning alert via hermes CLI and return the thread/message ID.
+    """Send the initial warning alert and return the thread/message ID.
 
-    Three outcomes, not two: a thread id, `None` when the send failed, and
-    :data:`ALERT_SENT_WITHOUT_THREAD` when it succeeded and the id could not be
-    parsed. The route's own docstring names that third case as one that has
+    Posts with `hermes send`, or with `a2a notify` for the platform the A2A
+    gateway holds under next (chat_notify.py). Three outcomes, not two: a thread
+    id, `None` when the send failed, and :data:`ALERT_SENT_WITHOUT_THREAD` when
+    it succeeded (or may have) and the id could not be read. The route's own docstring names that third case as one that has
     happened here, and it is the one where a retry does damage rather than good.
     """
     try:
@@ -2675,7 +2678,9 @@ def _send_to_chat(
     except Exception as exc:
         logger.error(f"Failed to parse message_id from the send: {exc}")
         return None
-    if not resp.get("message_id"):
+    if not isinstance(resp, dict) or not resp.get("message_id"):
+        # A send that printed something other than an object landed nowhere
+        # this caller can address; it must not raise into the relay loop.
         return None
     return chat_notify.thread_from_response(active_platform, resp) or None
 
