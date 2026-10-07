@@ -757,6 +757,11 @@ class SweepUnreadable(unittest.TestCase):
         millis = int(moment.timestamp() * pp.MILLIS_PER_SECOND) - pp.SNOWFLAKE_EPOCH_MS
         return millis << pp.SNOWFLAKE_TIMESTAMP_SHIFT
 
+    def _day(self, days_back: int, count: int) -> list:
+        """`count` builds in the last hours of the day `days_back` before AS_OF."""
+        return [self._build(self.AS_OF - timedelta(days=days_back, hours=h))
+                for h in range(1, count + 1)]
+
     def _sweep(self, bad=(BAD,), pending=(), builds=BUILDS, days=1):
         entries = {build: f"gs://bucket/{build}" for build in builds}
 
@@ -795,13 +800,14 @@ class SweepUnreadable(unittest.TestCase):
     def test_every_build_unreadable_is_not_measured_rather_than_quiet(self):
         """Before the per-build catch this input crashed the job red; the
         catch must not turn it into a green window with no runs."""
-        source = self._sweep(bad=self.BUILDS)
+        builds = self._day(0, 6)
+        source = self._sweep(bad=builds, builds=builds)
         self.assertFalse(source.ok)
-        self.assertIn("3 of 3", source.error)
+        self.assertIn("6 of 6", source.error)
         self.assertIn("UnicodeDecodeError", source.error)
         # The counts and the list travel with the error, not only one example.
-        self.assertEqual(3, source.value.builds_read)
-        self.assertEqual(sorted(str(b) for b in self.BUILDS),
+        self.assertEqual(6, source.value.builds_read)
+        self.assertEqual(sorted(str(b) for b in builds),
                          sorted(u["build_id"] for u in source.value.unreadable))
         summary = pp.summarise(
             self.AS_OF - timedelta(days=1), self.AS_OF, 15, 45, 45,
@@ -809,38 +815,46 @@ class SweepUnreadable(unittest.TestCase):
         )
         self.assertEqual(pp.VERDICT_UNMEASURED, summary["verdict"])
         self.assertEqual(0, summary["trend"]["runs"])
-        self.assertEqual(3, summary["trend"]["builds_read"])
-        self.assertEqual(3, len(summary["trend"]["unreadable"]))
-        self.assertIn(str(self.BUILDS[2]), pp.render(summary))
+        self.assertEqual(6, summary["trend"]["builds_read"])
+        self.assertEqual(6, len(summary["trend"]["unreadable"]))
+        self.assertIn(str(builds[-1]), pp.render(summary))
 
     def test_most_builds_unreadable_is_not_measured_even_with_one_run(self):
-        """One run out of three is a percentile over almost nothing, which the
+        """One run out of six is a percentile over almost nothing, which the
         daily floor would otherwise let through as a quiet green window."""
-        source = self._sweep(bad=self.BUILDS[:2])
+        builds = self._day(0, 6)
+        source = self._sweep(bad=builds[:5], builds=builds)
         self.assertFalse(source.ok)
-        self.assertIn("2 of 3", source.error)
+        self.assertIn("5 of 6", source.error)
 
     def test_a_failure_that_starts_on_the_newest_day_is_not_measured(self):
-        """Three of ten builds raising is under the floor for the window, but
-        they are every build of the newest day, the one the alert reads."""
-        older = [self._build(self.AS_OF - timedelta(days=1, hours=h)) for h in range(1, 8)]
-        newest = [self._build(self.AS_OF - timedelta(hours=h)) for h in range(1, 4)]
+        """Six of eighteen builds raising is under the floor for the window,
+        but they are every build of the newest day, the one the alert reads."""
+        older, newest = self._day(1, 12), self._day(0, 6)
         source = self._sweep(bad=newest, builds=older + newest, days=2)
         self.assertFalse(source.ok)
-        self.assertIn("3 of 3 builds on 2026-08-26", source.error)
-        self.assertEqual(10, source.value.builds_read)
-        self.assertEqual(3, len(source.value.unreadable))
+        self.assertIn("6 of 6 builds on 2026-08-26", source.error)
+        self.assertEqual(18, source.value.builds_read)
+        self.assertEqual(6, len(source.value.unreadable))
 
     def test_a_failure_confined_to_an_older_day_still_names_that_day(self):
-        older = [self._build(self.AS_OF - timedelta(days=1, hours=h)) for h in range(1, 4)]
-        newest = [self._build(self.AS_OF - timedelta(hours=h)) for h in range(1, 8)]
+        older, newest = self._day(1, 6), self._day(0, 12)
         source = self._sweep(bad=older, builds=older + newest, days=2)
         self.assertFalse(source.ok)
-        self.assertIn("3 of 3 builds on 2026-08-25", source.error)
+        self.assertIn("6 of 6 builds on 2026-08-25", source.error)
+
+    def test_fewer_raising_builds_than_the_daily_minimum_never_fail_the_sweep(self):
+        """A weekend day runs single-digit builds, and the slack slice before
+        the window can hold one. One build that raises the same way every hour
+        must not fail the sweep for the week it stays in the window."""
+        older, newest = self._day(1, 4), self._day(0, 12)
+        source = self._sweep(bad=older, builds=older + newest, days=2)
+        self.assertTrue(source.ok)
+        self.assertEqual(12, len(source.value.waits))
+        self.assertEqual(4, len(source.value.unreadable))
 
     def test_one_bad_build_on_the_newest_day_among_many_is_measured(self):
-        older = [self._build(self.AS_OF - timedelta(days=1, hours=h)) for h in range(1, 4)]
-        newest = [self._build(self.AS_OF - timedelta(hours=h)) for h in range(1, 8)]
+        older, newest = self._day(1, 3), self._day(0, 7)
         source = self._sweep(bad=newest[:1], builds=older + newest, days=2)
         self.assertTrue(source.ok)
         self.assertEqual(9, len(source.value.waits))

@@ -148,7 +148,9 @@ SEGMENT_MIN_COVERAGE = 0.5
 # unmeasured rather than as a percentile over the builds that did not. Judged
 # per day, not per window: the alert reads the newest day, and a failure that
 # starts today is a small share of seven days for days. Fewer, and the bad
-# builds are named and left out (#2477).
+# builds are named and left out (#2477). Under MIN_SAMPLES_FOR_DAILY_VERDICT
+# raising builds the floor never applies: a one-build weekend day, or the slack
+# slice before the window, must not fail the sweep for a week over one build.
 UNREADABLE_SHARE_LIMIT = 0.5
 
 # What a segment prints in place of a median, and the two column widths the
@@ -959,7 +961,10 @@ def collect_waits(
         # red; it must not come out as a quiet window over the builds that did
         # read. The sweep travels with the error so its counts are reported.
         bad = unreadable_by_day.get(day, [])
-        if len(bad) > len(candidates[day]) * UNREADABLE_SHARE_LIMIT:
+        if (
+            len(bad) >= MIN_SAMPLES_FOR_DAILY_VERDICT
+            and len(bad) > len(candidates[day]) * UNREADABLE_SHARE_LIMIT
+        ):
             return Source(
                 value=sweep,
                 error=f"{len(bad)} of {len(candidates[day])} builds on {day} could "
