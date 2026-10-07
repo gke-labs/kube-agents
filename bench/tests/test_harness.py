@@ -1275,21 +1275,43 @@ def test_an_exhausted_retry_is_infrastructure_and_not_an_answer(
 
 
 def test_an_agent_side_error_is_still_graded(stub_agent: _StubAgentServer) -> None:
-    """A 500 is the endpoint answering, so it keeps the old behaviour.
+    """A 4xx is the endpoint answering a bad request, so it keeps being graded.
 
-    The INFRA class is for turns that never reached the agent. Widening it to
-    every failed request would take real agent faults off the gate: they are
-    not retried, they are not marked, and their text still reaches the judge.
+    The INFRA class is for turns that never reached the agent or failed in
+    server/transport before running. Client-side errors (4xx) are not retried,
+    not marked as infra, and their text still reaches the judge.
+    """
+    stub_agent.fail_with = 400
+
+    result = KubeAgentsHarness().run("Provision operator agent in cluster mercury-09.")
+
+    assert result.has_errors()
+    assert harness.INFRA_FAILURE_MARKER not in result.errors[0]
+    assert "HTTP 400" in result.errors[0]
+    # Still in front of the judge, as before.
+    assert result.errors[0] in result.output
+    assert len(stub_agent.requests) == 1
+
+
+def test_an_opening_turn_500_is_infrastructure_not_an_answer(
+    stub_agent: _StubAgentServer,
+) -> None:
+    """An HTTP 500 on the opening turn gives up as a run class, not an answer (#2430).
+
+    An internal server error on the opening turn (e.g. the gateway .env race
+    described in #2430) means no agent turn ever ran. The harness classifies
+    it as an infrastructure failure (INFRA_FAILURE_MARKER) with empty output
+    rather than grading the server exception text as the agent's answer.
     """
     stub_agent.fail_with = 500
 
     result = KubeAgentsHarness().run("Provision operator agent in cluster mercury-09.")
 
     assert result.has_errors()
-    assert harness.INFRA_FAILURE_MARKER not in result.errors[0]
+    assert result.errors[0].startswith(harness.INFRA_FAILURE_MARKER)
     assert "HTTP 500" in result.errors[0]
-    # Still in front of the judge, as before.
-    assert result.errors[0] in result.output
+    assert result.output == ""
+    assert result.trajectory == []
     assert len(stub_agent.requests) == 1
 
 

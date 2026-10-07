@@ -1202,8 +1202,15 @@ class _TransportError(RuntimeError):
     succeed. It is False by default so a new raise site has to opt in.
     """
 
-    def __init__(self, message: str, *, retryable: bool = False) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int | None = None,
+        retryable: bool = False,
+    ) -> None:
         super().__init__(message)
+        self.status_code = status_code
         self.retryable = retryable
 
 
@@ -1219,7 +1226,8 @@ class _TransportError(RuntimeError):
 # the cards into a record that is about to be replaced wholesale is not a
 # rescue. Every other status is an answer about the request itself and
 # repeating the request cannot change it, 500 included: a handler that raised
-# will raise again.
+# will raise again. On the opening turn, an unretryable 5xx (such as 500)
+# ends immediately in _infra_failure (#2430) because no turn ran.
 _RETRYABLE_STATUSES = frozenset({429, 502, 503, 504})
 
 
@@ -1261,6 +1269,7 @@ def _post_turn(
     except urllib.error.HTTPError as exc:
         raise _TransportError(
             f"HTTP {exc.code} from agent endpoint: {_http_error_detail(exc)}",
+            status_code=exc.code,
             retryable=exc.code in _RETRYABLE_STATUSES,
         ) from exc
     except (OSError, http.client.HTTPException, ValueError) as exc:
@@ -1535,11 +1544,20 @@ class KubeAgentsHarness(AgentHarness):
                 result, session_id = _post_turn(url, body, headers, timeout)
                 break
             except _TransportError as exc:
-                # A 500, a 4xx other than 429, or a body that is not JSON
-                # says a handler answered; that is the agent's own failure and
-                # still belongs in front of the judge. Only a gateway status,
-                # an admission-control 429, or a dropped connection is worth a
-                # second attempt: see _RETRYABLE_STATUSES.
+                # An HTTP 5xx on the opening turn says the endpoint or gateway
+                # crashed before running an agent turn (#2430). The harness knows
+                # for a fact that no turn ran: classify as infrastructure failure
+                # so transient crashes (e.g. gateway .env races) do not fail
+                # presubmits as NOT_A_REAL_RUN. Client-side errors (4xx) and
+                # non-JSON bodies remain agent failures and still reach the judge.
+                if exc.status_code is not None and 500 <= exc.status_code < 600:
+                    if not exc.retryable:
+                        return _infra_failure(str(exc))
+                # A 4xx other than 429, or a body that is not JSON says a handler
+                # answered; that is the agent's own failure and still belongs in
+                # front of the judge. Only a gateway status, an admission-control
+                # 429, or a dropped connection is worth a second attempt: see
+                # _RETRYABLE_STATUSES.
                 if not exc.retryable:
                     return AgentResult.errored(str(exc))
                 transport_failures += 1
