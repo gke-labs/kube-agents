@@ -132,7 +132,9 @@ func run() int {
 	}
 
 	// SIGTERM is the eviction path: context cancellation tells the adapter
-	// to flush, publish terminal failed reason worker-evicted, and exit 143.
+	// to flush, publish terminal failed reason worker-evicted, and exit 143 -
+	// except on a turn that has already delegated, which completes with its
+	// one-line result and exits 0 (workeradapter.Run).
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer stop()
 
