@@ -985,25 +985,53 @@ func TestRejectionsCannotGrowTheChainPastTheBound(t *testing.T) {
 }
 
 // TestAHumanStopOnTheChildDoesNotWake: the gateway published the cancel, so
-// the child's canceled is the requester's word and the session stays asleep.
+// the session stays asleep whatever terminal the child then ends with: its
+// canceled, or a completed or failed that raced the stop. The root's one end
+// is canceled (observeChildEnd), and a result that raced the stop is never
+// delivered as the root's.
 func TestAHumanStopOnTheChildDoesNotWake(t *testing.T) {
-	r, spawn := startRigWithSpawner(t)
-	ctx := context.Background()
-	conv := "discord:g1/t-wake-stop"
-	_, _, child := delegated(t, r, spawn, conv, "")
-	sessionRigTurn(r, conv, "stop-1", "stop")
-	waitFor(t, "cancel sent", postedContaining(r, "cancel sent"))
-	_ = r.execFor(t, child, targetPlatform).PublishStatus(ctx, lib.StateCanceled, true)
-	waitFor(t, "canceled relayed", postedContaining(r, "🛑 canceled"))
-	waitFor(t, "no-wake line", loggedContaining(r, "no wake", child.TaskID))
-	if n := len(spawn.calls()); n != 1 {
-		t.Fatalf("a human stop woke the session: spawns = %d", n)
-	}
-	rec, _ := r.g.reg.Get(ctx, conv)
-	for _, ref := range rec.Tasks {
-		if ref.Role == taskRoleWake {
-			t.Fatalf("a wake entry after a human stop: %+v", ref)
-		}
+	for _, tc := range []struct {
+		name string
+		end  func(t *testing.T, r *rig, child *lib.Envelope)
+	}{
+		{"canceled", func(t *testing.T, r *rig, child *lib.Envelope) {
+			_ = r.execFor(t, child, targetPlatform).PublishStatus(context.Background(), lib.StateCanceled, true)
+			waitFor(t, "canceled relayed", postedContaining(r, "🛑 canceled"))
+		}},
+		{"completed", func(t *testing.T, r *rig, child *lib.Envelope) {
+			completeTask(t, r.execFor(t, child, targetPlatform), "fleet is green")
+			waitFor(t, "result relayed", postedContaining(r, "fleet is green"))
+		}},
+		{"failed", func(t *testing.T, r *rig, child *lib.Envelope) {
+			publishFinal(t, r, child, targetPlatform, lib.StateFailed, "the fleet is on fire")
+			waitFor(t, "failure relayed", postedContaining(r, "the fleet is on fire"))
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r, spawn, obs := startObservedRig(t, nil)
+			ctx := context.Background()
+			conv := "discord:g1/t-wake-stop-" + tc.name
+			origin, _, child := delegated(t, r, spawn, conv, "")
+			sessionRigTurn(r, conv, "stop-1", "stop")
+			waitFor(t, "cancel sent", postedContaining(r, "cancel sent"))
+			tc.end(t, r, child)
+			waitFor(t, "no-wake line", loggedContaining(r, "no wake", "stopped by its requester", child.TaskID))
+			waitFor(t, "the root's terminal", func() bool { _, ok := obs.terminalFor(origin.TaskID); return ok })
+			if n := len(spawn.calls()); n != 1 {
+				t.Fatalf("a human stop woke the session: spawns = %d", n)
+			}
+			rec, _ := r.g.reg.Get(ctx, conv)
+			for _, ref := range rec.Tasks {
+				if ref.Role == taskRoleWake {
+					t.Fatalf("a wake entry after a human stop: %+v", ref)
+				}
+			}
+			if end, _ := obs.terminalFor(origin.TaskID); end.state != lib.StateCanceled {
+				t.Fatalf("root terminal = %+v, want canceled", end)
+			}
+			assertOnlyRoot(t, obs, origin.TaskID)
+			assertNoDelivery(t, obs)
+		})
 	}
 }
 
