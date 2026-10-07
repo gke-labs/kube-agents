@@ -245,6 +245,7 @@ AUDITS: dict[str, AuditSpec] = {
             "rwo-claim-contended",
             "hpa-floors-at-one",
             "pdb-overlapping",
+            "untargeted-compute-class-workload",
         ),
         # §4a of the SOP: the four checks that judge a posture rather than a
         # fault, and so the only four a repository declaration may keep off the

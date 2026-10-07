@@ -7,7 +7,7 @@ docs/designs/fleet-audit-collector-manifest.md, which `audit_report.py finish
 --manifest-file` cross-checks the published document against.
 
 **Scope: three streams' check tables in full.** `obtainability-audit`'s
-twenty-three-check roster (§3.1–§3.23 of `governance/obtainability_audit_sop.md`),
+twenty-four-check roster (§3.1–§3.24 of `governance/obtainability_audit_sop.md`),
 `compliance-audit`'s sixteen-check roster (§2.1–§2.16 of
 `governance/compliance_audit_sop.md`), and `ai-security-audit`'s six-check
 roster (§3.1–§3.6 of `governance/ai_security_audit_sop.md`). Every check the
@@ -685,6 +685,8 @@ DUMP_COMMAND_KINDS = (
     # volume and no credential of any kind; a claim is a request for storage,
     # not the storage.
     ",persistentvolumeclaims"
+    # `nodes,namespaces` serve 3.24 (untargeted-compute-class-workload).
+    ",nodes,namespaces"
 )
 
 # How long a CronJob must have been firing without a success before 3.12 calls
@@ -1431,6 +1433,9 @@ def build_context(dump: dict, workloads: list[dict]) -> dict:
         "endpoint_zones_seen": zones_named_by_endpoints(dump),
         "workloads": workloads,
         "workload_keys": workload_keys(dump),
+        "compute_classes": [i for i in (dump.get("items") or []) if i.get("kind") == "ComputeClass"],
+        "nodes": [i for i in (dump.get("items") or []) if i.get("kind") == "Node"],
+        "namespaces": [i for i in (dump.get("items") or []) if i.get("kind") == "Namespace"],
     }
 
 
@@ -3691,6 +3696,166 @@ def check_service_port_unresolved(context: dict) -> list[dict]:
             }
         )
     return hits
+
+
+COMPUTE_CLASS_LABEL = "cloud.google.com/compute-class"
+DEFAULT_COMPUTE_CLASS_LABEL = "cloud.google.com/default-compute-class"
+DEFAULT_COMPUTE_CLASS_NON_DAEMONSET_LABEL = "cloud.google.com/default-compute-class-non-daemonset"
+_IMPACT_UNTARGETED_COMPUTE_CLASS = (
+    "Cluster Autoscaler pre-filtering skips ComputeClass-labeled node pools during "
+    "scale-up for workloads lacking cloud.google.com/compute-class, leaving pods "
+    "Pending once existing nodes are full."
+)
+
+
+def _has_compute_class_affinity(node_affinity: dict) -> bool:
+    required = node_affinity.get("requiredDuringSchedulingIgnoredDuringExecution") or {}
+    for term in required.get("nodeSelectorTerms") or []:
+        for expr in term.get("matchExpressions") or []:
+            if expr.get("key") == COMPUTE_CLASS_LABEL:
+                return True
+        for expr in term.get("matchFields") or []:
+            if expr.get("key") == COMPUTE_CLASS_LABEL:
+                return True
+    preferred = node_affinity.get("preferredDuringSchedulingIgnoredDuringExecution") or []
+    for pref in preferred:
+        term = pref.get("preference") or {}
+        for expr in term.get("matchExpressions") or []:
+            if expr.get("key") == COMPUTE_CLASS_LABEL:
+                return True
+        for expr in term.get("matchFields") or []:
+            if expr.get("key") == COMPUTE_CLASS_LABEL:
+                return True
+    return False
+
+
+def _namespace_has_default_compute_class(context: dict, ns_name: str) -> bool:
+    namespaces = context.get("namespaces")
+    if isinstance(namespaces, list):
+        for ns in namespaces:
+            if ns.get("metadata", {}).get("name") == ns_name:
+                labels = ns.get("metadata", {}).get("labels") or {}
+                if DEFAULT_COMPUTE_CLASS_LABEL in labels or DEFAULT_COMPUTE_CLASS_NON_DAEMONSET_LABEL in labels:
+                    return True
+    elif isinstance(namespaces, dict):
+        ns_val = namespaces.get(ns_name)
+        if isinstance(ns_val, dict):
+            labels = ns_val.get("metadata", {}).get("labels") or ns_val.get("labels") or ns_val
+            if DEFAULT_COMPUTE_CLASS_LABEL in labels or DEFAULT_COMPUTE_CLASS_NON_DAEMONSET_LABEL in labels:
+                return True
+
+    ns_labels = context.get("namespace_labels", {}).get(ns_name) or {}
+    if DEFAULT_COMPUTE_CLASS_LABEL in ns_labels or DEFAULT_COMPUTE_CLASS_NON_DAEMONSET_LABEL in ns_labels:
+        return True
+
+    return False
+
+
+def _is_untainted_gp_compute_class(cc: dict) -> bool:
+    spec = cc.get("spec") or {}
+    taints = (spec.get("nodePoolConfig") or {}).get("taints") or []
+    if any(t.get("effect") in ("NoSchedule", "NoExecute") for t in taints):
+        return False
+    for prio in spec.get("priorities") or []:
+        for dim in prio.get("dimension") or []:
+            if "nvidia.com/gpu" in dim or "tpu" in dim:
+                return False
+    return True
+
+
+def check_untargeted_compute_class_workload(workload: dict, context: dict) -> dict | None:
+    """A workload on a ComputeClass cluster omitting cloud.google.com/compute-class.
+
+    On GKE 1.35.6+, Cluster Autoscaler pre-filters node pools bound to a
+    ComputeClass and skips them during primary scale-up simulations unless the
+    pending pod explicitly requests that ComputeClass.
+    """
+    if workload.get("kind") not in SCALABLE_WORKLOAD_KINDS:
+        return None
+
+    template = workload.get("template") or {}
+    node_selector = template.get("nodeSelector") or {}
+    if COMPUTE_CLASS_LABEL in node_selector:
+        return None
+
+    affinity = template.get("affinity") or {}
+    node_affinity = affinity.get("nodeAffinity") or {}
+    if _has_compute_class_affinity(node_affinity):
+        return None
+
+    if _namespace_has_default_compute_class(context, workload.get("ns", "")):
+        return None
+
+    compute_classes = context.get("compute_classes") or []
+    if not compute_classes:
+        return None
+
+    # Check if there is a cluster-wide default ComputeClass
+    for cc in compute_classes:
+        if cc.get("metadata", {}).get("name") == "default":
+            return None
+        annotations = cc.get("metadata", {}).get("annotations") or {}
+        if annotations.get("computeclass.cloud.google.com/is-default-class") == "true":
+            return None
+
+    nodes = context.get("nodes") or []
+    if not nodes:
+        return None
+
+    untainted_nodes = [
+        n for n in nodes
+        if not any(t.get("effect") in ("NoSchedule", "NoExecute") for t in (n.get("spec", {}).get("taints") or []))
+    ]
+    if not untainted_nodes:
+        return None
+
+    # Every untainted general-purpose node in the cluster carries cloud.google.com/compute-class=<name>
+    for n in untainted_nodes:
+        labels = n.get("metadata", {}).get("labels") or {}
+        if COMPUTE_CLASS_LABEL not in labels:
+            return None
+
+    # Workload pod spec must not tolerate the taints on the remaining non-ComputeClass pools
+    non_cc_nodes = [
+        n for n in nodes
+        if COMPUTE_CLASS_LABEL not in (n.get("metadata", {}).get("labels") or {})
+    ]
+    pod_tolerations = template.get("tolerations") or []
+
+    def _tolerates_taint(tolerations: list[dict], taint: dict) -> bool:
+        for tol in tolerations:
+            op = tol.get("operator", "Equal")
+            key = tol.get("key")
+            if op == "Exists" and not key:
+                return True
+            if key == taint.get("key"):
+                effect = tol.get("effect")
+                if effect and effect != taint.get("effect"):
+                    continue
+                if op == "Exists":
+                    return True
+                if op == "Equal" and tol.get("value", "") == taint.get("value", ""):
+                    return True
+        return False
+
+    def _tolerates_node(tolerations: list[dict], node: dict) -> bool:
+        taints = [t for t in (node.get("spec", {}).get("taints") or []) if t.get("effect") in ("NoSchedule", "NoExecute")]
+        if not taints:
+            return True
+        return all(_tolerates_taint(tolerations, t) for t in taints)
+
+    if non_cc_nodes and any(_tolerates_node(pod_tolerations, n) for n in non_cc_nodes):
+        return None
+
+    untainted_gp_ccs = [cc for cc in compute_classes if _is_untainted_gp_compute_class(cc)]
+    single_cc = untainted_gp_ccs[0].get("metadata", {}).get("name", "") if len(untainted_gp_ccs) == 1 else ""
+
+    return {
+        "object": f"{workload['kind']}/{workload['name']}",
+        "excerpt": f"workload omits {COMPUTE_CLASS_LABEL} on ComputeClass-backed cluster without default ComputeClass",
+        "single_compute_class": single_cc,
+        "multiple_compute_classes": len(untainted_gp_ccs) > 1,
+    }
 
 
 # --------------------------------------------------------------------------- #
@@ -6953,6 +7118,14 @@ OBTAINABILITY_CHECKS: tuple[CheckSpec, ...] = (
         # placeholder would ship if an arm ever forgot its own.
         _IMPACT_RWO_ROLLOUT_DEADLOCK,
     ),
+    CheckSpec(
+        "untargeted-compute-class-workload",
+        "workload",
+        check_untargeted_compute_class_workload,
+        "major",
+        None,
+        _IMPACT_UNTARGETED_COMPUTE_CLASS,
+    ),
 )
 
 COMPLIANCE_CHECKS: tuple[CheckSpec, ...] = (
@@ -7222,6 +7395,10 @@ def _collect_obtainability(cluster: dict, kubeconfig: Path, checks: tuple[CheckS
     if not gate_ok:
         raise GateFailure(f"dump gate failed (rc={dump_run.rc}): {dump_run.stderr.strip()[:ERROR_EXCERPT_CHARS]}")
     dump = json.loads(dump_path.read_text(encoding="utf-8"))
+    cc_argv = ["kubectl", "get", "computeclasses", "-A", "-o", "json"]
+    cc_parsed, _ = run_and_gate(cc_argv, kubeconfig, run=run)
+    if cc_parsed and isinstance(cc_parsed.get("items"), list):
+        dump.setdefault("items", []).extend(cc_parsed["items"])
     workloads = normalize_workloads(dump)
     record = _record(f"KUBECONFIG={kubeconfig} kubectl get {DUMP_COMMAND_KINDS} -A -o json", dump_run)
     return CollectedContext(build_context(dump, workloads), workloads, {spec.slug: record for spec in checks})
@@ -8400,10 +8577,11 @@ def _withheld_clusters(root: Path | None) -> set[str]:
 
 def collect_cluster(
     cluster: dict,
-    audit_id: str,
-    checks: tuple[CheckSpec, ...],
+    audit_id: str = "obtainability-audit",
+    checks: tuple[CheckSpec, ...] | None = None,
     *,
     run: RunFn = default_run,
+    collected: CollectedContext | None = None,
     declarations: dict[tuple[str, str, str, str], set[str]] | None = None,
     releases: dict[tuple, dict] | None = None,
     namespaces: dict[tuple[str, str], dict] | None = None,
@@ -8411,29 +8589,32 @@ def collect_cluster(
     """One manifest `clusters[]` entry: every enumerated cluster gets
     one, whatever happened — `outcome` says which of the three shapes it is.
     """
+    if checks is None:
+        checks = OBTAINABILITY_CHECKS
     name, project, location = cluster["name"], cluster["project"], cluster["location"]
     # `name` is what gcloud and the GitOps tree call the cluster; `target` is
     # what the manifest does, and so every candidate's `cluster`.
     target = cluster.get("target") or target_name(project, location, name)
     autopilot = bool(cluster.get("autopilot"))
-    kubeconfig, cred_run = fetch_credentials(project, name, location, run=run)
-    if cred_run.rc != 0:
-        return {
-            "name": target, "project": project, "location": location,
-            "autopilot": autopilot,
-            "outcome": OUTCOME_UNREACHABLE,
-            "error": f"get-credentials rc={cred_run.rc}: {cred_run.stderr.strip()[:ERROR_EXCERPT_CHARS]}",
-        }
+    if collected is None:
+        kubeconfig, cred_run = fetch_credentials(project, name, location, run=run)
+        if cred_run.rc != 0:
+            return {
+                "name": target, "project": project, "location": location,
+                "autopilot": autopilot,
+                "outcome": OUTCOME_UNREACHABLE,
+                "error": f"get-credentials rc={cred_run.rc}: {cred_run.stderr.strip()[:ERROR_EXCERPT_CHARS]}",
+            }
 
-    try:
-        collected = _COLLECTORS[audit_id](cluster, kubeconfig, checks, run=run)
-    except GateFailure as exc:
-        return {
-            "name": target, "project": project, "location": location,
-            "autopilot": autopilot,
-            "outcome": OUTCOME_GATE_FAILED,
-            "error": str(exc),
-        }
+        try:
+            collected = _COLLECTORS[audit_id](cluster, kubeconfig, checks, run=run)
+        except GateFailure as exc:
+            return {
+                "name": target, "project": project, "location": location,
+                "autopilot": autopilot,
+                "outcome": OUTCOME_GATE_FAILED,
+                "error": str(exc),
+            }
 
     def emit(spec: CheckSpec, hit: dict, default_namespace: str, workload: dict | None = None) -> dict:
         severity = hit.get("severity") or spec.severity
@@ -8527,6 +8708,14 @@ def collect_cluster(
         reconciler = (workload or {}).get("reconciler") or hit.get("reconciler")
         if reconciler:
             emitted["reconciler"] = reconciler
+        if spec.slug == "untargeted-compute-class-workload":
+            if "declaration" in emitted and hit.get("single_compute_class"):
+                emitted["remediation"] = {
+                    "kind": "manifest",
+                    "path": emitted["declaration"]["path"],
+                }
+            else:
+                emitted["remediation"] = {"kind": "manual"}
         return emitted
 
     candidates = []
