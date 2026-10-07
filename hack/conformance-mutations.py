@@ -1382,6 +1382,16 @@ Mutation(
         "and silently stops the day someone edits only the constant",
     ),
     Mutation(
+        "C1-delegate-text-cap-shifted-in-delegation",
+        "a2a/gateway/delegation.go",
+        ('len(req.Text) > lib.DelegateTextCap {', 'len(req.Text) > 1<<14 {'),
+        "test_C1_the_delegate_text_cap_is_spelled_once",
+        "spell the gateway's cap as a shift the magic-number regex does not "
+        "name; only the positive check, scoped to handleDelegateRequest, "
+        "sees that the shared constant is gone from the check (the rest of "
+        "delegation.go still references it)",
+    ),
+    Mutation(
         "C1-delegate-text-cap-hand-spelled-in-worker-adapter",
         "a2a/worker-adapter/delegate.go",
         ('len(req.Text) > lib.DelegateTextCap:', 'len(req.Text) > 16*1024:'),

@@ -1203,13 +1203,16 @@ class C1IsolationIsStructural(unittest.TestCase):
             "lib.DelegateTextCap's definition moved; this test compared nothing",
         )
         magic_number = re.compile(r"\b16\s*\*\s*1024\b|\b16384\b")
-        for key, what in (
-            ("a2a_worker_adapter_delegate", "the worker-adapter's validateDelegate"),
-            ("a2a_gateway_delegation", "the gateway's handleDelegateRequest"),
+        # Scoped to the function that makes the check: elsewhere in
+        # delegation.go the wake's budget and two comments name the constant
+        # too, so a whole-file read passes whatever handleDelegateRequest does.
+        for key, function, what in (
+            ("a2a_worker_adapter_delegate", "validateDelegate", "the worker-adapter's validateDelegate"),
+            ("a2a_gateway_delegation", "handleDelegateRequest", "the gateway's handleDelegateRequest"),
         ):
-            src = h.text(key)
-            self.assertIn("lib.DelegateTextCap", src, f"{what} no longer references the shared cap")
-            self.assertNotRegex(src, magic_number, f"{what} hand-spells the delegate text cap")
+            body = h.go_function_body(h.text(key), function)
+            self.assertIn("lib.DelegateTextCap", body, f"{what} no longer references the shared cap")
+            self.assertNotRegex(body, magic_number, f"{what} hand-spells the delegate text cap")
 
     def test_C1_the_delegate_tool_schema_names_agree_with_the_wire_shape(self) -> None:
         """The MCP tool schema and `lib.DelegateRequest` spell the same two fields.
