@@ -116,6 +116,24 @@ run "an_override_without_the_serviceAccount_prefix_is_refused" {
   expect_failures = [var.sink_writer_identity_override]
 }
 
+# "" is how the override gets switched off again. The composition reaches this
+# variable through a TF_VAR_ line in install.env, and an operator who blanks
+# that line rather than deleting it exports "" -- so "" has to mean "no
+# override" and land back on the derived identity. Refusing it would answer
+# someone turning the override off by telling them to add a prefix to it.
+run "a_blanked_override_falls_back_to_the_derived_identity" {
+  command = plan
+
+  variables {
+    sink_writer_identity_override = ""
+  }
+
+  assert {
+    condition     = google_pubsub_topic_iam_member.sink_writer.member == "serviceAccount:service-123456789012@gcp-sa-logging.iam.gserviceaccount.com"
+    error_message = "a blanked override must switch the override off, not shift the grant to \"\": ${google_pubsub_topic_iam_member.sink_writer.member}"
+  }
+}
+
 # Paid once per destroy and never on apply, so it has to stay a destroy_duration.
 run "the_drain_waits_only_on_destroy" {
   command = plan

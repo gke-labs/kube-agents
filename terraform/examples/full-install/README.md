@@ -797,8 +797,13 @@ The module creates the sink after its publish grant and holds a wait between
 deleting the sink and deleting the topic — `drift_pubsub_sink_drain_duration`,
 two minutes by default — so that Cloud Logging never routes to a topic it
 cannot reach and mails every project owner about it. That wait is why a
-destroy of this configuration pauses once the sink is gone;
-[the module's README](../../modules/drift-pubsub/README.md#why-the-sink-is-created-last-and-destroyed-first)
+destroy of this configuration pauses once the sink is gone. Raising it takes
+an apply to land before the destroy that should honour it: `time_sleep` reads
+`destroy_duration` from state, since a provider's delete is handed prior state
+and no configuration, and `uninstall.sh` runs no apply of its own. Setting the
+variable and going straight to `uninstall.sh` waits whatever an earlier apply
+recorded, so run `upgrade.sh` in between.
+[The module's README](../../modules/drift-pubsub/README.md#why-the-sink-is-created-last-and-destroyed-first)
 is canonical for both orderings.
 
 Three outputs, each `null` while the flag is off: `drift_pubsub_topic`,

@@ -10,10 +10,16 @@ holding roles/owner on the project -- `topic_permission_denied` on apply,
 Three `depends_on` edges in the module are what prevent that, and together they
 are the whole of the fix:
 
-    google_pubsub_topic.drift_audit
+    google_project_service_identity.logging
       -> google_pubsub_topic_iam_member.sink_writer   (grant before sink)
         -> time_sleep.sink_drain                      (the destroy-side wait)
           -> google_logging_project_sink.drift_audit  (sink created last)
+
+Each arrow is one `depends_on`, and those three are what REQUIRED_EDGES pins.
+The chain roots at the service identity rather than at the topic because the
+grant has nothing to bind until Service Usage has minted the Logging agent;
+the topic is upstream of the grant too, but by reference rather than by
+`depends_on`, so it needs no pinning and is not one of the three.
 
 Terraform destroys in reverse dependency order, so the same chain deletes the
 sink first, waits, and only then removes the grant and the topic. Keeping the
