@@ -218,7 +218,7 @@ func TestTwoPodsOfOneProfileShareTheAddresseeAndNothingElse(t *testing.T) {
 
 // A profile with no topics (`bus: {}`) gets the task plane and nothing on the
 // blackboard: no topic subject either way, and not the topic-stream info
-// grant that only a subscriber needs. Both sides are still non-empty, which is
+// grant that any profile with a topic gets. Both sides are still non-empty, which is
 // what keeps the mint from reading an empty side as unrestricted.
 func TestAProfileWithNoTopicsReachesNoTopic(t *testing.T) {
 	g, err := profileGrants(cluster, clusterPod, TopicGrants{})

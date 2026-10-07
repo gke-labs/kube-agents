@@ -375,9 +375,11 @@ func (r *AgentProfileReconciler) ensureServiceAccount(ctx context.Context, p *ag
 	if !metav1.IsControlledBy(&existing, p) {
 		return errForeignServiceAccount
 	}
-	// Ours: keep it as rendered. No ForceOwnership, since nobody else
-	// should hold fields on a ServiceAccount this profile controls.
-	return r.Patch(ctx, sa, client.Apply, client.FieldOwner(agentProfileComponent))
+	// Ours: keep it as rendered. Forced, because the profile controls it:
+	// a hand edit (kubectl patch, edit, label --overwrite) hands a field to
+	// another manager, and an unforced apply would then conflict on every
+	// reconcile instead of putting the field back.
+	return r.Patch(ctx, sa, client.Apply, client.FieldOwner(agentProfileComponent), client.ForceOwnership)
 }
 
 // forgetBus drops the bus connection held for an agent in namespace, if the

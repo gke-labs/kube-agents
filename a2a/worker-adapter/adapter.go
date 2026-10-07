@@ -46,10 +46,12 @@ type Config struct {
 	// PodName is the pod's own name from the downward API, and under the
 	// callout it is the identity: the NATS user is named for it and the
 	// grants — subjects, consumer names, inbox prefix — are all built from
-	// it. It equals Session by construction (the gateway names the pod after
-	// the bus session), and the adapter checks that rather than trusting
-	// either, because a mismatch is silent: the connection succeeds and
-	// every reply goes to an inbox the grants do not cover.
+	// it. For a session pod it equals Session by construction (the gateway
+	// names the pod after the bus session), and the adapter checks that
+	// rather than trusting either, because a mismatch is silent: the
+	// connection succeeds and every reply goes to an inbox the grants do not
+	// cover. A profile pod (ProfileExecutor) has no Session; its pod name
+	// names its consumers and inbox, and its profile is the addressee.
 	PodName string
 
 	// ProfileExecutor marks a pod the dispatcher spawned for an AgentProfile

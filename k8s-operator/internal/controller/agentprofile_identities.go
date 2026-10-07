@@ -174,8 +174,10 @@ func resolveAgentProfileIdentities(agent *agentv1alpha1.PlatformAgent, profiles 
 			// profile admitted by an older or edited CRD drops out of the
 			// map instead of failing the whole render.
 			out[p.Name] = agentProfileResolution{refused: fmt.Errorf("profile name %q is not a dot-free DNS-1123 label", p.Name)}
-		case badTopicGrant(p) != "":
-			out[p.Name] = agentProfileResolution{refused: fmt.Errorf("topic grant %q is not shared.{topic} or agent.{agent}.{topic}", badTopicGrant(p))}
+		case malformedTopicGrant(p) != "":
+			out[p.Name] = agentProfileResolution{refused: fmt.Errorf("topic grant %q is not shared.{topic} or agent.{agent}.{topic}", malformedTopicGrant(p))}
+		case foreignPublishTopic(p) != "":
+			out[p.Name] = agentProfileResolution{refused: fmt.Errorf("publish topic %q is another agent's: an agent-scoped topic has one writer, the agent it names, so a profile publishes only agent.%s.<topic>", foreignPublishTopic(p), p.Name)}
 		case p.Spec.Identity.ServiceAccountName != "" && strings.HasPrefix(p.Spec.Identity.ServiceAccountName, agentProfileServiceAccountPrefix):
 			// The operator-created ServiceAccounts belong to the profile
 			// they are named for. Without this a profile that sorts first
@@ -200,15 +202,20 @@ func resolveAgentProfileIdentities(agent *agentv1alpha1.PlatformAgent, profiles 
 	return out
 }
 
-// badTopicGrant returns the first topic grant the CRD refuses, or "": one the
-// pattern refuses, or an agent-scoped publish topic that is not the profile's
-// own.
-func badTopicGrant(p *agentv1alpha1.AgentProfile) string {
+// malformedTopicGrant returns the first topic grant the CRD's pattern refuses,
+// or "".
+func malformedTopicGrant(p *agentv1alpha1.AgentProfile) string {
 	for _, t := range append(append([]string(nil), p.Spec.Bus.PublishTopics...), p.Spec.Bus.SubscribeTopics...) {
 		if !agentProfileTopicRE.MatchString(t) {
 			return t
 		}
 	}
+	return ""
+}
+
+// foreignPublishTopic returns the first agent-scoped publish topic that is not
+// the profile's own, or "".
+func foreignPublishTopic(p *agentv1alpha1.AgentProfile) string {
 	for _, t := range p.Spec.Bus.PublishTopics {
 		if !ownsAgentTopic(p.Name, t) {
 			return t

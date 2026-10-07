@@ -23,6 +23,8 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
@@ -78,6 +80,23 @@ func TestTheAgentProfileCRDRefusesWhatTheLoaderRefused(t *testing.T) {
 		"another profile's SA":     func(p *agentv1alpha1.AgentProfile) { p.Spec.Identity.ServiceAccountName = "agentprofile-other" },
 		"oversize description":     func(p *agentv1alpha1.AgentProfile) { p.Spec.Description = strings.Repeat("x", 4097) },
 	}
+	// The loader's resources check (cpu and memory, requests and limits) is
+	// required fields in the schema. A typed client cannot omit them (a zero
+	// Quantity is sent as "0"), so the missing-field case goes in
+	// unstructured.
+	raw, err := runtime.DefaultUnstructuredConverter.ToUnstructured(valid.DeepCopy())
+	if err != nil {
+		t.Fatal(err)
+	}
+	u := &unstructured.Unstructured{Object: raw}
+	u.SetName("no-requests")
+	u.SetResourceVersion("")
+	unstructured.RemoveNestedField(u.Object, "spec", "resources", "requests")
+	unstructured.RemoveNestedField(u.Object, "status")
+	if err := c.Create(ctx, u); err == nil {
+		t.Error("an AgentProfile with no resources.requests was admitted; want refused")
+	}
+
 	for name, mutate := range cases {
 		p := valid.DeepCopy()
 		p.ResourceVersion = ""

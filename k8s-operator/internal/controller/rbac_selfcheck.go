@@ -53,7 +53,7 @@ import (
 // the cause.
 //
 // The probe never runs on the reconcile worker. It is one
-// SelfSubjectAccessReview per (verb, resource) — 195 of them today — and the
+// SelfSubjectAccessReview per (verb, resource) — one per tuple in requiredPermissions below — and the
 // PlatformAgent controller has a single worker, so a reconcile that paid for
 // the round trips would stall every agent for their duration. The checker is
 // a manager Runnable that re-probes on its own ticker under a deadline;

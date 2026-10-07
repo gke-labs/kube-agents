@@ -38,6 +38,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	"sigs.k8s.io/yaml"
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
@@ -949,21 +950,47 @@ func TestWithoutABusIdentityTheCardConditionSaysWhy(t *testing.T) {
 }
 
 // A ServiceAccount created by hand under the operator-created name, landing
-// after the foreignness check, is not adopted: ensureServiceAccount creates
-// rather than applies, and refuses an existing ServiceAccount it does not
-// control.
+// after the foreignness check, is not adopted. The interceptor makes the race
+// exact: the Get misses (the cache has not seen it), and the Create collides
+// with the one that just landed. ensureServiceAccount must answer
+// errForeignServiceAccount there, not apply over it.
 func TestEnsureServiceAccountRefusesAForeignOneItDidNotSeeCreated(t *testing.T) {
 	agent := a2aTestAgent()
 	p := testAgentProfile(agent.Namespace, "auditor")
-	foreign := &corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: "agentprofile-auditor", Namespace: agent.Namespace}}
-	h := newProfileHarness(t, agent, &p, foreign)
-	live := h.profile(agent.Namespace, "auditor")
-	if err := h.r.ensureServiceAccount(context.Background(), live, "agentprofile-auditor"); !errors.Is(err, errForeignServiceAccount) {
+	scheme := setupScheme()
+	var created bool
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, &p).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Get: func(ctx context.Context, cl client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+				if _, ok := obj.(*corev1.ServiceAccount); ok && key.Name == "agentprofile-auditor" {
+					return apierrors.NewNotFound(corev1.Resource("serviceaccounts"), key.Name)
+				}
+				return cl.Get(ctx, key, obj, opts...)
+			},
+			Create: func(ctx context.Context, cl client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
+				if _, ok := obj.(*corev1.ServiceAccount); ok {
+					created = true
+					return apierrors.NewAlreadyExists(corev1.Resource("serviceaccounts"), obj.GetName())
+				}
+				return cl.Create(ctx, obj, opts...)
+			},
+			Patch: func(ctx context.Context, cl client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
+				if _, ok := obj.(*corev1.ServiceAccount); ok {
+					t.Error("ensureServiceAccount patched a ServiceAccount it did not control")
+				}
+				return cl.Patch(ctx, obj, patch, opts...)
+			},
+		}).Build()
+	r := &AgentProfileReconciler{Client: c, Scheme: scheme, Cards: newFakeDirectory()}
+	var live agentv1alpha1.AgentProfile
+	if err := c.Get(context.Background(), types.NamespacedName{Namespace: agent.Namespace, Name: "auditor"}, &live); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.ensureServiceAccount(context.Background(), &live, "agentprofile-auditor"); !errors.Is(err, errForeignServiceAccount) {
 		t.Fatalf("ensureServiceAccount = %v, want errForeignServiceAccount", err)
 	}
-	sa, _ := h.serviceAccount(agent.Namespace, "agentprofile-auditor")
-	if len(sa.OwnerReferences) != 0 || sa.AutomountServiceAccountToken != nil {
-		t.Errorf("the foreign ServiceAccount was written to: %+v", sa)
+	if !created {
+		t.Error("the Create path was never reached; the test is not exercising the race")
 	}
 }
 

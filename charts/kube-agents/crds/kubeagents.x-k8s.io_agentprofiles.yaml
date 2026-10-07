@@ -338,6 +338,8 @@ spec:
                     whether named in spec.identity or created by the operator.
                   type: string
               type: object
+          required:
+            - spec
           type: object
           x-kubernetes-validations:
             - message:

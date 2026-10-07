@@ -60,6 +60,10 @@ const (
 	// session, so this names who spoke rather than what for.
 	a2aCardSession = "operator"
 
+	// a2aEnvelopeIDPrefix starts every envelope id, as lib's constructors
+	// spell it; the id is also the JetStream dedup key.
+	a2aEnvelopeIDPrefix = "env-"
+
 	// a2aEnvelopeIDBytes is the random part of an envelope id, in bytes.
 	a2aEnvelopeIDBytes = 12
 
@@ -130,7 +134,7 @@ func renderDirectoryEnvelope(profile string, card *a2aAgentCard, now time.Time, 
 	}
 	return json.Marshal(a2aCardEnvelope{
 		Protocol:      a2aEnvelopeProtocol,
-		EnvelopeID:    "env-" + id,
+		EnvelopeID:    a2aEnvelopeIDPrefix + id,
 		CorrelationID: "agentprofile-" + profile,
 		TS:            now.UTC(),
 		From:          a2aCardParty{Session: a2aCardSession, Profile: profile},
@@ -300,7 +304,7 @@ func (n *natsCardPublisher) Publish(ctx context.Context, agent *agentv1alpha1.Pl
 	}
 	ctx, cancel := context.WithTimeout(ctx, cardBusTimeout)
 	defer cancel()
-	ack, err := js.Publish(ctx, agentCardSubject(profile), body, jetstream.WithMsgID("env-"+id))
+	ack, err := js.Publish(ctx, agentCardSubject(profile), body, jetstream.WithMsgID(a2aEnvelopeIDPrefix+id))
 	if err != nil {
 		return fmt.Errorf("publishing to %s: %w", agentCardSubject(profile), err)
 	}

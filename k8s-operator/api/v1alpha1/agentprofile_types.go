@@ -254,7 +254,8 @@ type AgentProfile struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata,omitempty"`
 
-	Spec   AgentProfileSpec   `json:"spec,omitempty"`
+	// +required
+	Spec   AgentProfileSpec   `json:"spec"`
 	Status AgentProfileStatus `json:"status,omitempty"`
 }
 
