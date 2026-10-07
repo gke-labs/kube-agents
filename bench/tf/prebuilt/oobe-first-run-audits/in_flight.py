@@ -32,8 +32,8 @@ home, audits = sys.argv[1], sys.argv[2:]
 LEDGER = os.path.join(home, "profiles", "platform", "cron", "executions.db")
 SQLITE_BUSY_TIMEOUT_SECONDS = 10
 IN_FLIGHT = ("claimed", "running")
-# audit_report.py's in-flight note lapses after this long too (INFLIGHT_TTL_SECONDS).
-STALE_SECONDS = 2 * 60 * 60
+# Several times the longest audit run (9-15 minutes, #985), so a live run always counts.
+STALE_SECONDS = 60 * 60
 
 if not os.path.exists(LEDGER):
     print(0)
