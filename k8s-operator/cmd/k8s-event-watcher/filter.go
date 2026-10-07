@@ -16,6 +16,7 @@ package main
 
 import (
 	"log"
+	"strings"
 	"time"
 )
 
@@ -89,6 +90,11 @@ type filterConfig struct {
 	// node-provision timeout, past which a pod still pending is stuck whatever
 	// the autoscaler last said, and the count backstop applies again.
 	scaleUpHold time.Duration
+	// autopilotScaleToZeroHold enables the hold on an Autopilot cluster that has
+	// scaled itself to zero nodes, where GKE's own system pods stay Pending by
+	// design and no autoscaler verdict is ever recorded against them. On by
+	// default; see autopilotScaleToZero for what it matches and why.
+	autopilotScaleToZeroHold bool
 }
 
 // filterThresholds carries the count debounces as a named group. They are all
@@ -104,6 +110,12 @@ type filterThresholds struct {
 	// as a fifth positional argument for the same reason the counts do, and
 	// zero means "the default", as it does for them.
 	scaleUpHold time.Duration
+	// disableAutopilotScaleToZeroHold switches the Autopilot scale-to-zero hold
+	// off. Phrased as a disable, against the grain of the flag that sets it, so
+	// that the zero value is the shipped default here as it is for every count
+	// above: a caller that fills in nothing gets the hold, not silence from a
+	// gate it never asked to turn off. newFilterConfig does the one negation.
+	disableAutopilotScaleToZeroHold bool
 }
 
 const (
@@ -146,6 +158,15 @@ const (
 	// whose mark has aged out of the hold. Three flush intervals, so a slow
 	// retry is not mistaken for a stale event.
 	failedSchedulingStaleAfter = 15 * time.Minute
+	// noNodesAvailableMessage is kube-scheduler's ErrNoNodesAvailable text,
+	// which it emits only when the cluster has no nodes at all. Every other
+	// FailedScheduling carries a fit error naming the nodes it rejected
+	// ("0/3 nodes are available: ..."), so this exact string is what separates
+	// an empty cluster from a full one. Compared whole rather than as a
+	// substring: the scheduler writes it as its own constant with nothing
+	// around it, and a substring match would also hold an event from some
+	// other writer that quoted it.
+	noNodesAvailableMessage = "no nodes available to schedule pods"
 )
 
 // newFilterConfig creates a new filterConfig, applying defaults for missing values.
@@ -176,6 +197,7 @@ func newFilterConfig(reasons []string, allowNamespaces, excludeNamespaces []stri
 		imagePullTransientMinCount: orDefault(th.imagePullTransientMinCount),
 		failedSchedulingMinCount:   failedSchedulingMinCount,
 		scaleUpHold:                scaleUpHold,
+		autopilotScaleToZeroHold:   !th.disableAutopilotScaleToZeroHold,
 	}
 }
 
@@ -250,6 +272,11 @@ const (
 	// re-emitting long enough ago that the pod is no longer pending; see
 	// failedSchedulingStaleAfter.
 	gateFailedSchedulingStale filterGate = "failedscheduling_stale"
+	// gateAutopilotScaleToZero is a FailedScheduling from the Autopilot
+	// scheduler on a cluster that has no nodes and no pod NAP has ruled on:
+	// the product scaled the cluster to zero and left its own system pods
+	// Pending, which is not an incident. See autopilotScaleToZero.
+	gateAutopilotScaleToZero filterGate = "autopilot_scale_to_zero"
 )
 
 // Decide applies the filtering rules in order and returns the first gate that
@@ -360,6 +387,13 @@ func (f *filter) Decide(ev TriageEvent) filterGate {
 //     event the sighting is the present, so the two readings are the same;
 //     a pod still pending past the hold is sighted again with a fresh
 //     timestamp and falls through to the count as before.
+//   - An Autopilot cluster that has scaled itself to zero nodes is held, on
+//     three things: the cluster is Autopilot, the message is kube-scheduler's
+//     no-nodes text, and no autoscaler verdict is on record
+//     (autopilotScaleToZero). Before the count backstop because the count is
+//     what it defeats — the scheduler retries these pods forever, so every GKE
+//     system pod on such a cluster crosses any threshold and reopens a
+//     Critical card on every master upgrade, which renames their UIDs.
 //   - Otherwise the count backstop applies, with the same fail-open on zero
 //     as the other debounces. The count is one event object's: both recorders
 //     start a new object at count 1 when the scheduler's message changes, so
@@ -374,7 +408,9 @@ func (f *filter) Decide(ev TriageEvent) filterGate {
 //
 // Not a settle timer: a live event is never delayed by wall-clock time, only
 // by what the autoscaler said or by how often the scheduler has repeated it.
-// Each decision logs one line, since the deployed install exposes no metrics.
+// Each decision logs one line naming the pod and what decided it, which is
+// what a reader has in the pod log; the gate labels on
+// k8s_event_watcher_events_filtered_total are the same decisions counted.
 func (f *filter) failedSchedulingGate(ev TriageEvent) filterGate {
 	now := f.clock()
 	if !ev.LastSeen.IsZero() && now.Sub(ev.LastSeen) > failedSchedulingStaleAfter {
@@ -408,12 +444,72 @@ func (f *filter) failedSchedulingGate(ev TriageEvent) filterGate {
 		log.Printf("%s pod=%s/%s (count=%d): the scale-up triggered %s ago was %s old at this sighting, past the %s hold; falling back to the count backstop",
 			ev.Key.Reason, ev.Namespace, ev.Name, ev.Count, now.Sub(ev.ScaleUp.At).Round(time.Second), sinceMark.Round(time.Second), f.cfg.scaleUpHold)
 	}
+	if f.cfg.autopilotScaleToZeroHold && autopilotScaleToZero(ev) {
+		log.Printf("held %s pod=%s/%s (count=%d): %q on Autopilot cluster %s with no autoscaler verdict — scaled to zero nodes, not a stuck pod",
+			ev.Key.Reason, ev.Namespace, ev.Name, ev.Count, ev.Message, ev.Cluster)
+		return gateAutopilotScaleToZero
+	}
 	if belowMinCount(ev.Count, f.cfg.failedSchedulingMinCount) {
 		log.Printf("held %s pod=%s/%s (count=%d < %d, no autoscaler verdict on record)",
 			ev.Key.Reason, ev.Namespace, ev.Name, ev.Count, f.cfg.failedSchedulingMinCount)
 		return gateFailedSchedulingMinCount
 	}
 	return gateAccepted
+}
+
+// autopilotScaleToZero reports whether a FailedScheduling is the one an
+// Autopilot cluster emits for GKE's own system pods once it has scaled itself
+// to zero nodes. Three conditions, none of them needing a pod lookup or any
+// state the filter does not already hold:
+//
+//   - the cluster is Autopilot, which the watcher knows from the describe call
+//     discovery already makes for every profile cluster. This is the condition
+//     that keeps the hold off a Standard cluster with no nodes, where zero
+//     nodes is a fault rather than the product working as designed;
+//
+//   - the message is kube-scheduler's no-nodes text, which it emits only with
+//     no nodes at all — a pod that does not fit the nodes there are gets a fit
+//     error instead and is unaffected;
+//
+//   - cluster-autoscaler has said nothing about the pod. This is the condition
+//     that bounds the hold, and it is deliberately a state rather than a count
+//     or a deadline: the scheduler retries these pods forever, so any ceiling
+//     would re-open the same card on a longer timescale. Node auto-provisioning
+//     rules on a real workload within seconds — measured on a zero-node
+//     Autopilot cluster, a user pod drew the same no-nodes message at one
+//     second and a TriggeredScaleUp at twenty-eight, had a node at sixty and
+//     was Running at ninety — so the pods it has said nothing about are the
+//     ones GKE itself has given up placing. A later NotTriggerScaleUp still
+//     passes the event at any count and a TriggeredScaleUp still holds it on
+//     its own terms: both reach this function with a verdict, and both miss
+//     it. The same measurement showed the system pods picking up verdicts of
+//     their own as soon as that node was on its way, so they leave this gate
+//     the moment the cluster stops being at zero.
+//
+//     What this does not cover is a restart: the verdict memo is in-process,
+//     so until the autoscaler re-emits, a pod whose verdict the watcher has
+//     forgotten reads as unruled and is held. That window is the autoscaler's
+//     scan interval, and it is the one direction this gate fails in that the
+//     others do not — losing a mark sends every other branch to the count
+//     backstop, which fires.
+//
+// Deliberately not keyed on the reporter, which is what the issue proposed and
+// what a first cut did. Autopilot runs two schedulers and the split does not
+// fall where the name suggests: measured on a real zero-node Autopilot cluster,
+// twelve of its fifteen pending system pods — kube-dns, metrics-server,
+// event-exporter-gke, l7-default-backend among them — are pinned to
+// "default-scheduler", and only the three outside kube-system report
+// "gke.io/optimize-utilization-scheduler". A reporter match would have held
+// three of the fifteen and left the rest opening a card each.
+//
+// Together the three are the product working as designed. The cost of being
+// wrong is bounded on the other side too: a user workload scheduled onto such
+// a cluster is exactly what makes NAP rule on a pod, so the first real pod to
+// arrive leaves this signature.
+func autopilotScaleToZero(ev TriageEvent) bool {
+	return ev.ScaleUp.Verdict == scaleUpNone &&
+		ev.Autopilot &&
+		strings.TrimSpace(ev.Message) == noNodesAvailableMessage
 }
 
 // belowMinCount reports whether an event's repeat count falls short of a debounce

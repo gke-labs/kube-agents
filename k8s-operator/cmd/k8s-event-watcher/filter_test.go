@@ -291,13 +291,42 @@ func TestFilterDecideFailedScheduling(t *testing.T) {
 		ev.LastSeen = at
 		return ev
 	}
+	// What an Autopilot cluster with no user workloads emits for GKE's own
+	// system pods: kube-scheduler's no-nodes text on a cluster discovery
+	// described as Autopilot, and whatever NAP has said about the pod —
+	// nothing, on a real one. The reporter is set to "default-scheduler"
+	// because that is what twelve of the fifteen pending system pods on a
+	// measured zero-node Autopilot cluster report, the kube-system addons
+	// being pinned to it; the gate must not depend on the other one.
+	autopilot := func(count int, mark scaleUpMark) TriageEvent {
+		ev := fs(count, mark)
+		ev.Namespace = "kube-system"
+		ev.Name = "kube-dns-5dd46df686-p68z4"
+		ev.Reporter = "default-scheduler"
+		ev.Message = noNodesAvailableMessage
+		ev.Autopilot = true
+		return ev
+	}
+	onStandard := func(ev TriageEvent) TriageEvent {
+		ev.Autopilot = false
+		return ev
+	}
+	reportedBy := func(ev TriageEvent, reporter string) TriageEvent {
+		ev.Reporter = reporter
+		return ev
+	}
+	saying := func(ev TriageEvent, message string) TriageEvent {
+		ev.Message = message
+		return ev
+	}
 
 	tests := []struct {
-		name     string
-		minCount int
-		hold     time.Duration
-		event    TriageEvent
-		wantGate filterGate
+		name        string
+		minCount    int
+		hold        time.Duration
+		disableHold bool
+		event       TriageEvent
+		wantGate    filterGate
 	}{
 		// The count backstop, with no autoscaler verdict on record.
 		{name: "count 1 is held", event: fs(1, scaleUpMark{}), wantGate: gateFailedSchedulingMinCount},
@@ -357,13 +386,54 @@ func TestFilterDecideFailedScheduling(t *testing.T) {
 		{name: "stale event is held at any count", event: stale, wantGate: gateFailedSchedulingStale},
 		{name: "stale event is held despite a decline", event: staleButDeclined, wantGate: gateFailedSchedulingStale},
 		{name: "unknown timestamp is not stale", event: untimed, wantGate: gateFailedSchedulingMinCount},
+
+		// An Autopilot cluster scaled to zero nodes. The scheduler retries
+		// GKE's own system pods forever, so the count backstop is what the
+		// hold has to beat: held at any count, including one past the
+		// threshold and one high enough that the cards on staging opened.
+		{name: "autopilot scale-to-zero is held past the count backstop", event: autopilot(50, scaleUpMark{}), wantGate: gateAutopilotScaleToZero},
+		{name: "autopilot scale-to-zero is held at the count backstop", event: autopilot(5, scaleUpMark{}), wantGate: gateAutopilotScaleToZero},
+		{name: "autopilot scale-to-zero is held below the count backstop", event: autopilot(1, scaleUpMark{}), wantGate: gateAutopilotScaleToZero},
+		{name: "autopilot scale-to-zero is held on an uncounted event", event: autopilot(0, scaleUpMark{}), wantGate: gateAutopilotScaleToZero},
+		{name: "surrounding whitespace does not defeat the message match", event: saying(autopilot(50, scaleUpMark{}), " "+noNodesAvailableMessage+"\n"), wantGate: gateAutopilotScaleToZero},
+
+		// All three conditions are required. Zero nodes on Standard is a fault
+		// and still fires; a pod that does not fit the nodes there are carries
+		// a fit error, not the no-nodes text.
+		{name: "a standard cluster with no nodes still fires", event: onStandard(autopilot(50, scaleUpMark{})), wantGate: gateAccepted},
+		{name: "a fit error on an autopilot cluster still fires", event: saying(autopilot(50, scaleUpMark{}), "0/3 nodes are available: 3 Insufficient cpu."), wantGate: gateAccepted},
+		{name: "a message that merely quotes the no-nodes text still fires", event: saying(autopilot(50, scaleUpMark{}), "scheduler said \"no nodes available to schedule pods\" earlier"), wantGate: gateAccepted},
+
+		// The reporter decides nothing here, which is the correction to the
+		// first cut: on Autopilot the kube-system addons are pinned to
+		// "default-scheduler" and only the pods outside it report the
+		// Autopilot scheduler, so keying on the reporter held three of the
+		// fifteen pods measured on a real cluster and passed the rest.
+		{name: "the autopilot scheduler's own pods are held", event: reportedBy(autopilot(50, scaleUpMark{}), "gke.io/optimize-utilization-scheduler"), wantGate: gateAutopilotScaleToZero},
+		{name: "an unreported no-nodes event on autopilot is held", event: reportedBy(autopilot(50, scaleUpMark{}), ""), wantGate: gateAutopilotScaleToZero},
+		{name: "the autopilot scheduler on a standard cluster still fires", event: reportedBy(onStandard(autopilot(50, scaleUpMark{})), "gke.io/optimize-utilization-scheduler"), wantGate: gateAccepted},
+
+		// The autoscaler's verdicts outrank the hold, because a verdict means
+		// NAP is managing the pod: the hold reaches only pods it has ignored.
+		{name: "a decline passes an autopilot no-nodes event", event: autopilot(1, declined(time.Minute)), wantGate: gateAccepted},
+		{name: "a live scale-up holds an autopilot no-nodes event on its own terms", event: autopilot(50, triggered(time.Minute)), wantGate: gateScaleUpHold},
+		{name: "an expired scale-up sends an autopilot no-nodes event to the count backstop", event: autopilot(50, triggered(defaultScaleUpHold+time.Second)), wantGate: gateAccepted},
+
+		// The staleness check runs first, so a replayed event from a cluster
+		// that has since scaled up is held as stale rather than as autopilot.
+		{name: "a stale autopilot event is held as stale", event: sightedAt(autopilot(50, scaleUpMark{}), now.Add(-failedSchedulingStaleAfter-time.Second)), wantGate: gateFailedSchedulingStale},
+
+		// The opt-out restores the count backstop and nothing else.
+		{name: "the opt-out fires an autopilot event past the backstop", disableHold: true, event: autopilot(50, scaleUpMark{}), wantGate: gateAccepted},
+		{name: "the opt-out still holds an autopilot event below the backstop", disableHold: true, event: autopilot(1, scaleUpMark{}), wantGate: gateFailedSchedulingMinCount},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			f := newFilter(newFilterConfig(nil, nil, nil, filterThresholds{
-				failedSchedulingMinCount: tc.minCount,
-				scaleUpHold:              tc.hold,
+				failedSchedulingMinCount:        tc.minCount,
+				scaleUpHold:                     tc.hold,
+				disableAutopilotScaleToZeroHold: tc.disableHold,
 			}))
 			f.now = func() time.Time { return now }
 			if gate := f.Decide(tc.event); gate != tc.wantGate {
