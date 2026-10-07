@@ -614,17 +614,14 @@ class CallSiteTest(unittest.TestCase):
         # turn on the stream before its own run, so a same-task successor has
         # to outlast the sibling case's unit as well as the predecessor's. Each
         # stream lock's is the same figure for that stream.
-        self.assertIn(
-            'lock_deadline="$(( $(stream_case_count "${audit_id}") * ($(unit_delegation_timeout "${name}") + 600 + EVAL_INFLIGHT_GRACE_SECONDS) + $(stream_stack_wait "${audit_id}") ))"',
-            unit,
-        )
+        self.assertIn('lock_deadline="$(stream_lock_deadline "${name}" "${audit_id}")"', unit)
         self.assertEqual(unit.count('"${lock_deadline}"'), 1)
         self.assertIn('"$(stream_lock_deadline "${name}" "${s}")"', unit)
         self.assertIn(
-            'echo $(( $(stream_case_count "$2") * ($(unit_delegation_timeout "$1") + 600 + EVAL_INFLIGHT_GRACE_SECONDS) + $(stream_stack_wait "$2") ))',
+            'echo $(( $(stream_case_count "$2") * ($(unit_delegation_timeout "$1") + UNIT_LOCK_ALLOWANCE_SECONDS + EVAL_INFLIGHT_GRACE_SECONDS) + $(stream_stack_wait "$2") ))',
             lifted("stream_lock_deadline"),
         )
-        self.assertLess(unit.index('lock_deadline="$(('), task_lock)
+        self.assertLess(unit.index('lock_deadline="$(stream_lock_deadline'), task_lock)
         # A stack-bearing case writing no ledger has no stream term, yet its
         # previous rep holds the task lock while queued on lock-infra, so the
         # task-lock deadline carries that queue itself.

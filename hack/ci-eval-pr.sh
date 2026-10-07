@@ -106,6 +106,9 @@ readonly EVAL_SANDBOX_EXEC_TIMEOUT="30s"
 readonly EVAL_SANDBOX_EXEC_ROUND_TRIP_SECONDS=60
 readonly EVAL_INFLIGHT_GRACE_SECONDS=300
 readonly EVAL_INFLIGHT_POLL_STEP_SECONDS=5
+# What a unit's lock deadline allows past its delegation timeout, for the
+# stack, the verifier and the state writes around the run.
+readonly UNIT_LOCK_ALLOWANCE_SECONDS=600
 
 # ─── Step 0: self-revalidation against this PR's own verdicts ──────────────
 # hack/ci-revalidate.sh, which the Prow job also runs before it leases an
@@ -2377,7 +2380,9 @@ STATE_DIR="$(mktemp -d)"
 #                 whichever unit opened it. Without this, one lane's ledger
 #                 reset closes the sibling's live ledger and the sibling's
 #                 finish lands in this lane's fresh one. Taken after the task
-#                 lock, keyed on the audit id, only by units that write one.
+#                 lock, keyed on the audit id, by units that write one and by
+#                 units that declare the streams their stack starts audits on
+#                 (audit_streams; oobe-first-run-audits holds four).
 #                 A task-lock holder on a shared stream waits its turn on
 #                 the stream before its own run, so both deadlines scale by
 #                 the cases on the stream (stream_case_count), as the infra
@@ -2400,8 +2405,9 @@ lock_acquire() { # <dir> [deadline-seconds]
 }
 lock_release() { rmdir "$1" 2>/dev/null || true; }
 
-# How many cases in this run write the given stream's ledger: 1 for an
-# empty id or a case alone on its stream, 2 for a stream two cases share.
+# How many cases in this run hold the given stream's lock, by writing its
+# ledger or declaring it (task_streams): 1 for an empty id or a case alone on
+# its stream, 2 for a stream two cases share.
 # A loop over TASKS rather than a map, since bash 3.2 (what `bash -n` runs
 # under on a contributor's Mac) has no associative arrays and TASKS is short.
 stream_case_count() { # <audit-id>
@@ -2433,9 +2439,9 @@ stream_stack_wait() { # <audit-id>
 
 # How long a unit waits for one stream's lock: the single-unit figure times the
 # cases holding the stream, plus the infra queue its stack-bearing ones may hold
-# it through. For the stream a case grades this is the task lock's deadline.
+# it through. For the stream a case grades, or none, it is the task lock's too.
 stream_lock_deadline() { # <task-name> <audit-id>
-  echo $(( $(stream_case_count "$2") * ($(unit_delegation_timeout "$1") + 600 + EVAL_INFLIGHT_GRACE_SECONDS) + $(stream_stack_wait "$2") ))
+  echo $(( $(stream_case_count "$2") * ($(unit_delegation_timeout "$1") + UNIT_LOCK_ALLOWANCE_SECONDS + EVAL_INFLIGHT_GRACE_SECONDS) + $(stream_stack_wait "$2") ))
 }
 
 release_streams() { # <space-separated audit ids>
@@ -2566,7 +2572,7 @@ run_one_unit() { # <task-path> <task-name> <rep> <reuse:true|empty> <has-stack:t
   # writes none, and the deadline for the locks below. The task lock is held
   # for the holder's whole unit, so the wait must outlast one: the unit's
   # delegation ceiling plus grading and teardown (about 300s on the record;
-  # 600s here), plus the grace a ledger-writing unit may spend before its
+  # UNIT_LOCK_ALLOWANCE_SECONDS here), plus the grace a ledger-writing unit may spend before its
   # run waiting for a live predecessor to release its in-flight note
   # (EVAL_INFLIGHT_GRACE_SECONDS; the 600 was sized before that wait
   # existed and did not include it). A fixed 1800s deadline under a 3000s ceiling would make a
@@ -2585,7 +2591,7 @@ run_one_unit() { # <task-path> <task-name> <rep> <reuse:true|empty> <has-stack:t
   local audit_id lock_deadline streams held="" s
   audit_id="$(ledger_audit_id_for_task "${task}")"
   streams="$(task_streams "${task}")"
-  lock_deadline="$(( $(stream_case_count "${audit_id}") * ($(unit_delegation_timeout "${name}") + 600 + EVAL_INFLIGHT_GRACE_SECONDS) + $(stream_stack_wait "${audit_id}") ))"
+  lock_deadline="$(stream_lock_deadline "${name}" "${audit_id}")"
   if [ -z "${audit_id}" ] && [ -n "${has_stack}" ]; then
     lock_deadline=$(( lock_deadline + INFRA_LOCK_DEADLINE ))
   fi
@@ -2596,9 +2602,10 @@ run_one_unit() { # <task-path> <task-name> <rep> <reuse:true|empty> <has-stack:t
   # A ledger-writing unit also holds the stream lock from here until its
   # state files are written, released with the task lock below: two cases on
   # one stream (the consistency pair, the patch pair, the obtainability pair)
-  # must not reset and rewrite each other's ledger mid-run. The same scaled
-  # deadline: a waiter here outlasts the other cases' units on the stream,
-  # infra queue included. Taken before the infra lock, not after: a stack-bearing unit that shares
+  # must not reset and rewrite each other's ledger mid-run. A unit holds every
+  # stream task_streams names, in its sorted order, the declared ones too.
+  # Each with its stream's scaled deadline: a waiter here outlasts the other
+  # cases' units on the stream, infra queue included. Taken before the infra lock, not after: a stack-bearing unit that shares
   # its stream with a stackless one would otherwise sit on the infra lock for
   # the whole of the other's audit, and every tofu unit behind it would run
   # out its INFRA_LOCK_DEADLINE waiting on a lane nothing is using.

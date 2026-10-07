@@ -35,8 +35,8 @@
 #
 # The teardown, and the exit trap on a failed apply, run disarm.py: both markers
 # go back as they were and the `oobe` job comes out if this stack put it there.
-# The teardown first waits, up to `busy_wait`, for the audits the stage started
-# to finish: the runner holds their four streams' locks until devops-bench returns
+# The teardown then waits, up to `busy_wait`, for the audits the stage started
+# to finish, marked ones not yet claimed included: the runner holds their four streams' locks until devops-bench returns
 # (the case's `audit_streams`), so an audit case on one of them never runs beside
 # them. Each writes its ledger issue in the install's GitOps repository and posts
 # its summary where it always does.
@@ -225,20 +225,22 @@ resource "null_resource" "oobe" {
           ${self.triggers.python} - "$@"
       }
 
-      # The runner releases the four streams' locks once this returns, so the
-      # audit still going when the chain finished ends first. A count that
-      # cannot be read is not "none running"; past the bound it disarms anyway.
+      # Disarmed first, so the oobe job marks nothing more; then the runner,
+      # which releases the four streams' locks once this returns, waits for
+      # the audit still going, or marked and not yet claimed, to end. A count
+      # that cannot be read is not "none running"; past the bound it stops
+      # waiting.
+      printf '%s' '${self.triggers.disarm_b64}' | base64 -d | agent_py "${self.triggers.home}" "${self.triggers.hermes}"
+
       elapsed=0
       until busy="$(printf '%s' '${self.triggers.busy_b64}' | base64 -d | agent_py "${self.triggers.home}" ${self.triggers.audits})" && [ "$busy" = 0 ]; do
         if [ "$elapsed" -ge ${self.triggers.busy_wait} ]; then
-          echo "WARNING: $${busy:-an unreadable count of} first-run audit(s) still running after $${elapsed}s; disarming anyway." >&2
+          echo "WARNING: $${busy:-an unreadable count of} first-run audit(s) still running after $${elapsed}s; releasing the locks anyway." >&2
           break
         fi
         sleep ${self.triggers.poll}
         elapsed=$((elapsed + ${self.triggers.poll}))
       done
-
-      printf '%s' '${self.triggers.disarm_b64}' | base64 -d | agent_py "${self.triggers.home}" "${self.triggers.hermes}"
     EOT
   }
 }

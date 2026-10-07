@@ -571,8 +571,9 @@ class CallSiteTest(unittest.TestCase):
         )
         self.assertIsNotNone(gate, "the gated call in run_one_unit")
         body = gate.group(1)
-        for lock in ("lock-stream-${audit_id}", "lock-infra", "lock-task-${name}"):
+        for lock in ("lock-infra", "lock-task-${name}"):
             self.assertIn(f'lock_release "${{STATE_DIR}}/{lock}"', body)
+        self.assertIn('release_streams "${streams}"', body)
         self.assertLess(unit.index('reset_audit_ledgers "${name} rep ${rep}"'), unit.index("reset_agent_pulls"), "after the ledger reset")
         self.assertLess(unit.index("reset_agent_pulls"), unit.index("uv run devops-bench"), "before devops-bench")
 

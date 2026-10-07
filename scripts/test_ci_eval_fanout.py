@@ -210,7 +210,7 @@ class DelegationCeilingTest(unittest.TestCase):
         # figure too, so a holder that spends it does not push its waiter past
         # the deadline.
         unit = lifted("run_one_unit")
-        deadline = 'lock_deadline="$(( $(stream_case_count "${audit_id}") * ($(unit_delegation_timeout "${name}") + 600 + EVAL_INFLIGHT_GRACE_SECONDS) + $(stream_stack_wait "${audit_id}") ))"'
+        deadline = 'lock_deadline="$(stream_lock_deadline "${name}" "${audit_id}")"'
         ledgerless_stack = (
             'if [ -z "${audit_id}" ] && [ -n "${has_stack}" ]; then\n'
             "    lock_deadline=$(( lock_deadline + INFRA_LOCK_DEADLINE ))\n"
@@ -220,12 +220,16 @@ class DelegationCeilingTest(unittest.TestCase):
         self.assertIn(ledgerless_stack, unit)
         grace = re.search(r"^readonly EVAL_INFLIGHT_GRACE_SECONDS=\d+$", SCRIPT.read_text(encoding="utf-8"), re.M)
         self.assertIsNotNone(grace)
+        allowance = re.search(r"^readonly UNIT_LOCK_ALLOWANCE_SECONDS=\d+$", SCRIPT.read_text(encoding="utf-8"), re.M)
+        self.assertIsNotNone(allowance)
         self.assertIn('lock_acquire "${STATE_DIR}/lock-task-${name}" "${lock_deadline}"', unit)
         computed = deadline + "; " + ledgerless_stack + '; echo "${lock_deadline}"'
         body = "\n".join(
             [
                 lifted("unit_delegation_timeout"),
+                lifted("stream_lock_deadline"),
                 grace.group(0),
+                allowance.group(0),
                 'export AGENT_DELEGATION_TIMEOUT="2700"',
                 "INFRA_LOCK_DEADLINE=900",
                 'stream_case_count() { echo "${CASES_ON_STREAM}"; }',

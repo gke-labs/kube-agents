@@ -29,8 +29,9 @@
 # it starts are real runs: each writes its ledger issue in the install's GitOps
 # repository and posts its summary wherever the install sends audit reports. The
 # runner holds their four streams' locks for the unit (`audit_streams` below) and
-# the teardown waits for the last run to end, so no audit case on those streams
-# runs beside them; other stack-bearing cases are kept apart by the infra lock.
+# the teardown waits up to 40 minutes for the last run to end, so no audit case on
+# those streams runs beside them; a failed apply disarms without waiting. Other
+# stack-bearing cases are kept apart by the infra lock.
 # Eligible tier: nightly -- each repetition runs the four audits one after another
 # and waits for the previous repetition's to finish.
 ---

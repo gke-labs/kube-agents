@@ -355,9 +355,10 @@ class NamesTest(unittest.TestCase):
         # A same-task waiter's deadline is the holder's ceiling plus grading
         # and teardown; a holder that spends the grace before its run must
         # not push the waiter past it, so the grace is in the deadline.
+        self.assertIn('lock_deadline="$(stream_lock_deadline "${name}" "${audit_id}")"', lifted("run_one_unit"))
         self.assertIn(
-            'lock_deadline="$(( $(stream_case_count "${audit_id}") * ($(unit_delegation_timeout "${name}") + 600 + EVAL_INFLIGHT_GRACE_SECONDS) + $(stream_stack_wait "${audit_id}") ))"',
-            lifted("run_one_unit"),
+            "($(unit_delegation_timeout \"$1\") + UNIT_LOCK_ALLOWANCE_SECONDS + EVAL_INFLIGHT_GRACE_SECONDS)",
+            lifted("stream_lock_deadline"),
         )
         self.assertEqual(grace_seconds(), 300)
 

@@ -291,6 +291,21 @@ class PlantScriptsTest(unittest.TestCase):
         done = self._run("in_flight.py", str(self.home), *AUDITS)
         self.assertEqual(done.stdout.strip(), "2", done.stderr)
 
+    def test_in_flight_counts_an_audit_marked_and_not_yet_claimed(self):
+        # The next profile-cron-tick starts it, so it is as good as running.
+        cron = self.home / "profiles" / "platform" / "cron"
+        cron.mkdir(parents=True)
+        roster = [
+            {"id": "compliance-audit", "enabled": True, "next_run_at": ago(MINUTE)},
+            {"id": "obtainability-audit", "enabled": True, "next_run_at": ago(-60 * MINUTE)},
+            {"id": "stockout-prevention", "enabled": False, "next_run_at": ago(MINUTE)},
+            {"id": "fleet-wide-cost-analysis", "enabled": True, "state": "paused", "next_run_at": ago(MINUTE)},
+            {"id": "gce-compute-fleet-audit", "enabled": True, "next_run_at": ago(MINUTE)},
+        ]
+        (cron / "jobs.json").write_text(json.dumps({"jobs": roster}))
+        done = self._run("in_flight.py", str(self.home), *AUDITS)
+        self.assertEqual(done.stdout.strip(), "1", done.stderr)
+
     def test_in_flight_with_no_store_is_zero(self):
         self.assertEqual(self._run("in_flight.py", str(self.home), *AUDITS).stdout.strip(), "0")
 
@@ -314,13 +329,14 @@ class PlantScriptsTest(unittest.TestCase):
             done = subprocess.run(["bash", "-n"], input=rendered, capture_output=True, text=True, check=False)
             self.assertEqual(done.returncode, 0, done.stderr)
 
-    def test_the_teardown_waits_for_the_audits_before_it_disarms(self):
+    def test_the_teardown_disarms_then_waits_for_the_audits(self):
         # The runner releases the four streams' locks when devops-bench returns, after the
-        # teardown; the audit still going when the chain finished must end inside them.
+        # teardown. Disarmed first, the oobe job marks nothing more; the audit still going,
+        # or marked and not yet claimed, then ends inside the locks.
         text = (STACK / "main.tf").read_text()
         teardown = re.findall(r"command\s+=\s+<<-EOT\n(.*?)\n\s*EOT", text, re.S)[1]
         wait = teardown.index("self.triggers.busy_b64")
-        self.assertLess(wait, teardown.index("self.triggers.disarm_b64"))
+        self.assertLess(teardown.index("self.triggers.disarm_b64"), wait)
         self.assertIn("self.triggers.busy_wait", teardown[wait:])
 
     def test_the_stack_names_the_audits_the_stage_starts(self):
