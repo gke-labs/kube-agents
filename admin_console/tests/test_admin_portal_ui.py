@@ -4,6 +4,7 @@ import ast
 import os
 import tempfile
 import unittest
+from concurrent.futures import wait
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -653,14 +654,19 @@ class AdminPortalFunctionalTest(unittest.TestCase):
         return app.session_state[CONNECTION_CONTROLLER_KEY]
 
     def finish_connection_job(self, app: AppTest) -> AppTest:
-        """Wait on the dependency itself, then let the UI consume its result."""
+        """Wait on the dependency itself, then let the UI consume its result.
+
+        A future that finished with an exception counts as done: the UI, not
+        the test, is what reads it, so the helper does not re-raise it.
+        """
         if CONNECTION_CONTROLLER_KEY not in app.session_state:
             app = app.run()
         controller = self.controller(app)
         if controller.job is None:
             return app
         job = controller.job
-        job.future.result(timeout=20)
+        done, _ = wait([job.future], timeout=20)
+        self.assertIn(job.future, done, "connection job did not finish in time")
         return app.run()
 
     def connect_project(self, app: AppTest) -> AppTest:
@@ -1018,6 +1024,7 @@ class AdminPortalFunctionalTest(unittest.TestCase):
             side_effect=RuntimeError("probe crashed"),
         ):
             app = app.run()
+            app = self.finish_connection_job(app)
 
         self.assertIsNone(self.controller(app).connected_target)
         saved = load_connection("admin@example.com")
