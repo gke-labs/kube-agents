@@ -64,6 +64,12 @@ const (
 
 	// githubPathDepth is GitHub's rule: a repository is exactly `owner/name`.
 	githubPathDepth = 2
+
+	// MaxGitHubRepoNameLength is GitHub's limit on a repository name. With
+	// the owner's 39 it also keeps the longest URL the operator renders,
+	// `https://github.com/` and `owner/name`, at 159 characters, inside the
+	// 256 repo_ref.py's MAX_REPO_LENGTH lets the broker read.
+	MaxGitHubRepoNameLength = 100
 )
 
 // githubHosts is every spelling of GitHub that can appear in a remote this
@@ -96,6 +102,9 @@ type GitProvider struct {
 	NamespacePattern *regexp.Regexp
 	// MaxNamespaceLength bounds a namespace under this forge's own rules.
 	MaxNamespaceLength int
+	// MaxNameLength bounds the repository name, the path's last segment,
+	// under this forge's own rules. 0 means unbounded.
+	MaxNameLength int
 	// MinPathDepth and MaxPathDepth bound the repository path in segments.
 	// MaxPathDepth of 0 means unbounded, for a forge with nested groups.
 	MinPathDepth int
@@ -115,6 +124,7 @@ var gitProviders = map[string]*GitProvider{
 		Hosts:              githubHosts,
 		NamespacePattern:   githubOrgRegex,
 		MaxNamespaceLength: MaxGitHubOrgLength,
+		MaxNameLength:      MaxGitHubRepoNameLength,
 		MinPathDepth:       githubPathDepth,
 		MaxPathDepth:       githubPathDepth,
 		// raw.githubusercontent.com and the release/archive download hosts
@@ -282,6 +292,19 @@ func (p *GitProvider) Resolve(host, repository, namespace string) (RepoRef, erro
 	if p.MaxPathDepth > 0 && len(segments) > p.MaxPathDepth {
 		return RepoRef{}, fmt.Errorf("repository %q has %d path segments; %s allows at most %d",
 			repository, len(segments), p.Name, p.MaxPathDepth)
+	}
+	// The agent and the broker read the URL this renders with repo_ref.py,
+	// which drops a trailing `.git` again, so a name that still ends in one
+	// after the parser's single strip would name another repository there:
+	// `foo.git.git` renders `.../foo.git`, which they read as `foo`.
+	name := segments[len(segments)-1]
+	if strings.HasSuffix(name, gitSuffix) {
+		return RepoRef{}, fmt.Errorf("repository %q names %q, which still ends in %q once one %q is dropped; the agent and the broker would read it as %q",
+			repository, name, gitSuffix, gitSuffix, strings.TrimSuffix(name, gitSuffix))
+	}
+	if p.MaxNameLength > 0 && len(name) > p.MaxNameLength {
+		return RepoRef{}, fmt.Errorf("repository %q names %q, which exceeds %s's maximum repository name length of %d characters",
+			repository, name, p.Name, p.MaxNameLength)
 	}
 	resolvedNamespace := strings.Join(segments[:len(segments)-1], pathSeparator)
 	if err := p.ValidateNamespace(resolvedNamespace); err != nil {

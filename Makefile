@@ -29,7 +29,7 @@ SANDBOX_IMAGE_ARGS := $(foreach v,$(SANDBOX_IMAGE_VARS),$(if $($(v)),--build-arg
 KUBE_AGENTS_VERSION ?= dev
 VERSION_ARG := --build-arg KUBE_AGENTS_VERSION=$(KUBE_AGENTS_VERSION)
 
-.PHONY: default help docker-build docker-build-agents docker-build-credential-proxy docker-build-sandbox docker-smoke-sandbox dev-rebuild-agent mirror-images images-check prettier-check prettier-write shellcheck lint-python test-python test-python-deps test-bench test-bench-deps bench-case-check e2e-tests test-e2e-deps validate prompt-check docs-generate docs-check docs-check-generated docs-check-links docs-check-terminology docs-check-map docs-check-audience docs-check-context-budget chart-sync chart-check iac-parity-check tfvar-check terraform-test tf-apply tf-destroy fleet-audit-view coverage coverage-check test-integration conformance
+.PHONY: default help docker-build docker-build-agents docker-build-credential-proxy docker-build-sandbox docker-smoke-sandbox dev-rebuild-agent mirror-images images-check prettier-check prettier-write shellcheck lint-python test-python test-python-deps test-bench test-bench-deps bench-case-check e2e-tests test-e2e-deps validate prompt-check docs-generate docs-check docs-check-generated docs-check-links docs-check-terminology docs-check-audience docs-check-context-budget chart-sync chart-check iac-parity-check tfvar-check terraform-test tf-apply tf-destroy fleet-audit-view coverage coverage-check test-integration conformance
 
 # The agent images this repository builds -- one per `--target` stage in
 # deploy/docker/Dockerfile, which is not the same thing as one per directory
@@ -648,17 +648,16 @@ test-integration: ## Run just the integration seam tests; CI reaches them throug
 # error. This is the compiler for that layer.
 #
 # Not folded into docs-check: these files are runtime assets rather than
-# documents (the docs map does not inventory them), and the resolution rules are
-# not the same either -- a path here resolves against a profile home and the
-# /opt/defaults layer the entrypoint copies over it, not against the file that
-# cites them. CI runs it as its own job in validate.yml, alongside the other
-# repository-structure invariants.
+# documents, and the resolution rules are not the same either -- a path here
+# resolves against a profile home and the /opt/defaults layer the entrypoint
+# copies over it, not against the file that cites them. CI runs it as its own
+# job in validate.yml, alongside the other repository-structure invariants.
 prompt-check: ## Verify the agent's instructions cite skills and files that exist.
 	@python3 scripts/check_prompt_assets.py
 
 # Documentation that mirrors a machine-readable source is generated rather than
 # hand-kept: the cron jobs, the skill catalogue and the image inventory as
-# <!-- BEGIN GENERATED --> regions, plus docs/family-roster.txt written whole.
+# <!-- BEGIN GENERATED --> regions.
 # The SOP line numbers each governance cron prompt cites are recomputed first,
 # so the cron-job-example regions below render the prompt with them current.
 docs-generate: ## Regenerate the generated doc regions and files from their sources.
@@ -666,7 +665,7 @@ docs-generate: ## Regenerate the generated doc regions and files from their sour
 	@python3 scripts/generate_docs.py
 
 # Everything CI enforces about the docs, in one command.
-docs-check: docs-check-generated docs-check-links docs-check-terminology docs-check-map docs-check-audience docs-check-context-budget ## Run every documentation check CI runs.
+docs-check: docs-check-generated docs-check-links docs-check-terminology docs-check-audience docs-check-context-budget ## Run every documentation check CI runs.
 
 docs-check-generated:
 	@python3 scripts/generate_sop_geography.py --check
@@ -677,9 +676,6 @@ docs-check-links:
 
 docs-check-terminology:
 	@./hack/check-docs-terminology.sh
-
-docs-check-map:
-	@python3 scripts/check_docs_map.py
 
 docs-check-audience: ## Fail when a published site page carries a maintainer identifier (shapes: scripts/docs_audience_denylist.txt).
 	@python3 scripts/check_docs_audience.py

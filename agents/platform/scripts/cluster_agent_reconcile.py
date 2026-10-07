@@ -52,6 +52,7 @@ import argparse
 import fcntl
 import fnmatch
 import json
+import math
 import os
 import re
 import subprocess
@@ -150,24 +151,27 @@ _denied_this_run: set[str] = set()
 _api_disabled_this_run: set[str] = set()
 # The listing phase is bounded: the management project lists first and alone, then the
 # containers resolve `workers` at a time, then the explicit projects `workers` at a time,
-# and a lookup still running when the listing budget is spent reads unreachable; both are
-# sized from the declared cap below (LIST_WORKERS and LIST_BUDGET_SECONDS at the default). The
+# and a lookup still running when the listing budget is spent reads unreachable; `workers`
+# is fixed at LIST_WORKERS and only the budget is sized from the declared cap
+# (`_list_budget_seconds`: LIST_BUDGET_SECONDS per default cap's worth of projects). The
 # bootstrap gate runs this script under its own ceiling (bootstrap_scan_gate.py: the listing
 # and prune budgets for the declared cap and the profiles on the volume, plus its settle
-# time; 240s at the default cap with few profiles) and kills it on expiry
-# with nothing written; two hanging projects listed in turn at LIST_TIMEOUT_SECONDS each
-# would already overrun it. Creates still run in the fixed order.
-# Sized for the default cap: the workers and the budget scale with the declared cap
-# (`_list_workers`, `_list_budget_seconds` below) so a run that may list twice the
-# projects keeps the same margin per project, workers first and the budget only once
-# the workers reach their ceiling; the bootstrap gate's ceiling follows the budget.
-LIST_WORKERS = 8
-# Every lookup is a gcloud process in the sandbox over ssh, and no install has measured
-# the sandbox at more than eight at once (#1913 is to): twice that covers the estate
-# behind #1354 and holds the ceiling until the measurement says otherwise.
-LIST_WORKERS_MAX = 16
+# time; 390s at the default cap with few profiles) and kills it on expiry
+# with nothing written. The listing budget caps the phase at LIST_BUDGET_SECONDS whatever
+# hangs, with the rest recorded unlisted, and the gate's 390s ceiling leaves the prune and
+# settle time after it. Creates still run in the fixed order.
+# Every lookup is a gcloud process the credential proxy runs, and the proxy admits four
+# requests at once under its child memory budget at the operator's default limit
+# (docs/designs/credential-proxy-child-memory-budget.md §2.2): credential_proxy.py's
+# children budget, 704 MiB of the 1 GiB limit after BROKER_RESIDENT_RESERVE_BYTES and
+# CONTENT_WORKSPACE_RESERVE_BYTES, over one request's cost, 176 MiB
+# (REQUEST_CHILD_MEMORY_RESERVE_BYTES plus OUTPUT_COPIES_PER_COMMAND of the 8 MiB output
+# cap). A wider pool only queues the rest at the proxy, where a lookup still waiting at its
+# 60s admission bound is refused busy and reads unlisted for the tick.
+LIST_WORKERS = 4
 LIST_TIMEOUT_SECONDS = 120
-LIST_BUDGET_SECONDS = 150
+# 12s per listing at four wide: the per-listing share the 150s budget gave at eight.
+LIST_BUDGET_SECONDS = 300
 LIST_GRACE_SECONDS = 5
 # PRUNE's per-profile `describe` runs under the same bounded map as the listing, with a
 # budget of its own, instead of a sequential walk at DESCRIBE_TIMEOUT_SECONDS each: at 200
@@ -224,19 +228,12 @@ _API_DISABLED_MARKERS = ("SERVICE_DISABLED", "accessNotConfigured", "API has not
 
 
 
-def _list_workers(cap: int) -> int:
-    """Workers for the bounded lookups: LIST_WORKERS per default cap's worth of projects,
-    up to LIST_WORKERS_MAX, so the per-project margin holds as the cap grows."""
-    return max(LIST_WORKERS, min(LIST_WORKERS_MAX, -(-cap * LIST_WORKERS // RESOLVED_SET_CAP)))
-
-
 def _list_budget_seconds(cap: int) -> float:
-    """The listing budget for a cap: LIST_BUDGET_SECONDS per round of projects-per-worker
-    the default cap needs, so it grows only once the workers have reached their ceiling.
-    The bootstrap gate's ceiling is this plus its settle time (bootstrap_scan_gate.py)."""
-    rounds_at_default = RESOLVED_SET_CAP / LIST_WORKERS
-    rounds = cap / _list_workers(cap)
-    return LIST_BUDGET_SECONDS * max(1, -(-rounds // rounds_at_default))
+    """The listing budget for a cap: LIST_BUDGET_SECONDS per default cap's worth of
+    projects, rounded up, and never less than LIST_BUDGET_SECONDS. The workers are
+    LIST_WORKERS at every cap, so the budget alone grows with it. The bootstrap gate's
+    ceiling is this plus the prune budget and its settle time (bootstrap_scan_gate.py)."""
+    return LIST_BUDGET_SECONDS * max(1, math.ceil(cap / RESOLVED_SET_CAP))
 
 
 def _prune_budget_seconds(cap: int, profiles: int = 0) -> float:
@@ -1448,9 +1445,10 @@ def reconcile(dry_run: bool = False) -> dict:
     # selectors together, one call each, and the naming of the monitored projects a Metrics
     # Scope returned by number; then the explicit and selector projects. Container members
     # arrive with their clusters, so no per-project listing follows for them (design §4).
-    # The cap the declaration carries sizes the run: the workers and the budget scale with it.
+    # The cap the declaration carries sizes the run's listing budget (the workers are
+    # LIST_WORKERS at every cap).
     cap = _cap_of(scope)
-    workers = _list_workers(cap)
+    workers = LIST_WORKERS
     list_budget = _list_budget_seconds(cap)
     report["maxProjects"] = cap
     listing_deadline = time.monotonic() + list_budget

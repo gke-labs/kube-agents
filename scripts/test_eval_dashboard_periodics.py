@@ -13,6 +13,7 @@ finished builds, read from the bucket they log to, and the notes health.py carri
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import pathlib
 import subprocess
@@ -31,8 +32,8 @@ REPO = pathlib.Path(__file__).resolve().parents[1]
 WORKFLOW = REPO / ".github" / "workflows" / "ci-health.yml"
 NOW = datetime(2026, 9, 30, 14, 0, tzinfo=timezone.utc)
 SWEEP = periodics.WATCHED_BY_JOB["ci-kube-agents-pull-sweep"]
-WEEKLY = periodics.WATCHED_BY_JOB["ci-kube-agents-fleet-reconcile-all"]
-HOURLY = periodics.WATCHED_BY_JOB["ci-kube-agents-fleet-reconcile"]
+DAILY = periodics.WATCHED_BY_JOB["ci-kube-agents-fleet-reconcile-daily"]
+POST = periodics.WATCHED_BY_JOB["post-kube-agents-fleet-reconcile"]
 
 
 def epoch(when: datetime) -> int:
@@ -83,22 +84,22 @@ def finished(when, passed=True):
 class FetchTest(unittest.TestCase):
     def test_the_latest_finished_build_is_read_with_its_artifact(self):
         report = {"schema_version": 1, "mode": "all", "dry_run": True, "exit": "failed", "outcomes": {"kube-agents-evals-3": {"outcome": "refused", "detail": "1 to add; not a create: delete x"}}}
-        objects = archive(WEEKLY.job, {"100": (finished(NOW - timedelta(hours=1), passed=False), report)})
+        objects = archive(DAILY.job, {"100": (finished(NOW - timedelta(hours=1), passed=False), report)})
         gsutil = FakeGsutil(objects)
         with tempfile.TemporaryDirectory() as tmp:
-            readings = periodics.fetch(pathlib.Path(tmp), watched=(WEEKLY,), runner=gsutil)
-            written = json.loads((pathlib.Path(tmp) / f"{WEEKLY.job}.json").read_text())
-        self.assertEqual(readings[WEEKLY.job], written)
+            readings = periodics.fetch(pathlib.Path(tmp), watched=(DAILY,), runner=gsutil)
+            written = json.loads((pathlib.Path(tmp) / f"{DAILY.job}.json").read_text())
+        self.assertEqual(readings[DAILY.job], written)
         self.assertEqual((written["build"], written["passed"], written["result"]), ("100", False, "FAILURE"))
         self.assertEqual(written["finished_at"], (NOW - timedelta(hours=1)).isoformat(timespec="seconds"))
         self.assertEqual(written["artifact"], report)
 
     def test_a_running_newest_build_falls_back_to_the_one_before_it(self):
-        objects = archive(HOURLY.job, {"101": (None, None), "100": (finished(NOW - timedelta(minutes=50)), None), "99": (finished(NOW - timedelta(hours=2)), None)})
+        objects = archive(POST.job, {"101": (None, None), "100": (finished(NOW - timedelta(minutes=50)), None), "99": (finished(NOW - timedelta(hours=2)), None)})
         with tempfile.TemporaryDirectory() as tmp:
-            readings = periodics.fetch(pathlib.Path(tmp), watched=(HOURLY,), runner=FakeGsutil(objects))
-        self.assertEqual(readings[HOURLY.job]["build"], "100")
-        self.assertIsNone(readings[HOURLY.job]["artifact"], "the hourly wrote no artifact for that build")
+            readings = periodics.fetch(pathlib.Path(tmp), watched=(POST,), runner=FakeGsutil(objects))
+        self.assertEqual(readings[POST.job]["build"], "100")
+        self.assertIsNone(readings[POST.job]["artifact"], "the postsubmit wrote no artifact for that build")
 
     def test_the_prefix_is_listed_only_when_the_newest_build_has_not_finished(self):
         # One listing per job per tick over a prefix that only grows, and the
@@ -114,24 +115,24 @@ class FetchTest(unittest.TestCase):
         # Prow's sidecar writes finished.json with result ABORTED when it
         # stops a pod (a drained node, a plank abort): not a run of the job.
         aborted = {"timestamp": epoch(NOW - timedelta(minutes=30)), "passed": False, "result": "ABORTED"}
-        objects = archive(WEEKLY.job, {"101": (aborted, None), "100": (finished(NOW - timedelta(days=1)), None)})
+        objects = archive(DAILY.job, {"101": (aborted, None), "100": (finished(NOW - timedelta(days=1)), None)})
         with tempfile.TemporaryDirectory() as tmp:
-            readings = periodics.fetch(pathlib.Path(tmp), watched=(WEEKLY,), runner=FakeGsutil(objects))
-        self.assertEqual((readings[WEEKLY.job]["build"], readings[WEEKLY.job]["passed"]), ("100", True))
+            readings = periodics.fetch(pathlib.Path(tmp), watched=(DAILY,), runner=FakeGsutil(objects))
+        self.assertEqual((readings[DAILY.job]["build"], readings[DAILY.job]["passed"]), ("100", True))
         self.assertEqual(periodics.assess(readings, NOW, {}), {})
         # Every build aborted: nothing to read, no note.
-        only_aborted = archive(WEEKLY.job, {"101": (aborted, None)})
+        only_aborted = archive(DAILY.job, {"101": (aborted, None)})
         with tempfile.TemporaryDirectory() as tmp:
-            self.assertEqual(periodics.fetch(pathlib.Path(tmp), watched=(WEEKLY,), runner=FakeGsutil(only_aborted)), {})
+            self.assertEqual(periodics.fetch(pathlib.Path(tmp), watched=(DAILY,), runner=FakeGsutil(only_aborted)), {})
 
     def test_a_job_that_never_ran_or_whose_pointer_is_denied_writes_nothing(self):
         objects = archive(SWEEP.job, {"7": (finished(NOW - timedelta(minutes=5)), None)})
         with tempfile.TemporaryDirectory() as tmp:
             out = pathlib.Path(tmp)
-            (out / f"{HOURLY.job}.json").write_text("stale from last tick")
-            readings = periodics.fetch(out, watched=(SWEEP, HOURLY), runner=FakeGsutil(objects))
+            (out / f"{POST.job}.json").write_text("stale from last tick")
+            readings = periodics.fetch(out, watched=(SWEEP, POST), runner=FakeGsutil(objects))
             self.assertEqual(sorted(readings), [SWEEP.job])
-            self.assertFalse((out / f"{HOURLY.job}.json").exists(), "last tick's file does not survive a job with no build")
+            self.assertFalse((out / f"{POST.job}.json").exists(), "last tick's file does not survive a job with no build")
             warnings = []
             denied = FakeGsutil(objects, denied={f"{periodics.LOGS_ROOT}/{SWEEP.job}/{periodics.POINTER}"})
             readings = periodics.fetch(out, watched=(SWEEP,), runner=denied, log=lambda *a, **k: warnings.append(a[0]))
@@ -142,11 +143,11 @@ class FetchTest(unittest.TestCase):
     def test_a_finished_json_that_cannot_be_read_is_a_blind_tick_not_an_older_build(self):
         # A 503 on the newest finished build must not walk back to last
         # week's and report that: nothing is written, with a warning.
-        objects = archive(WEEKLY.job, {"101": (finished(NOW - timedelta(days=1)), None), "100": (finished(NOW - timedelta(days=8, hours=1)), None)})
-        denied = FakeGsutil(objects, denied={f"{periodics.LOGS_ROOT}/{WEEKLY.job}/101/{periodics.FINISHED}"})
+        objects = archive(DAILY.job, {"101": (finished(NOW - timedelta(days=1)), None), "100": (finished(NOW - timedelta(days=8, hours=1)), None)})
+        denied = FakeGsutil(objects, denied={f"{periodics.LOGS_ROOT}/{DAILY.job}/101/{periodics.FINISHED}"})
         warnings = []
         with tempfile.TemporaryDirectory() as tmp:
-            readings = periodics.fetch(pathlib.Path(tmp), watched=(WEEKLY,), runner=denied, log=lambda *a, **k: warnings.append(a[0]))
+            readings = periodics.fetch(pathlib.Path(tmp), watched=(DAILY,), runner=denied, log=lambda *a, **k: warnings.append(a[0]))
         self.assertEqual(readings, {})
         self.assertEqual(len(warnings), 1)
         self.assertIn("101/finished.json", warnings[0])
@@ -154,7 +155,7 @@ class FetchTest(unittest.TestCase):
     def test_a_build_id_containing_404_in_an_error_is_not_read_as_absent(self):
         # gsutil echoes the failing URL; a 503 on .../1404/finished.json is
         # not a NotFound, and the walk must not report the build before it.
-        objects = archive(WEEKLY.job, {"1404": (finished(NOW - timedelta(hours=1), passed=False), None), "1400": (finished(NOW - timedelta(days=1)), None)})
+        objects = archive(DAILY.job, {"1404": (finished(NOW - timedelta(hours=1), passed=False), None), "1400": (finished(NOW - timedelta(days=1)), None)})
         class Flaky(FakeGsutil):
             def __call__(self, cmd, **kwargs):
                 if cmd[3].endswith("/1404/finished.json"):
@@ -162,7 +163,7 @@ class FetchTest(unittest.TestCase):
                 return super().__call__(cmd, **kwargs)
         warnings = []
         with tempfile.TemporaryDirectory() as tmp:
-            self.assertEqual(periodics.fetch(pathlib.Path(tmp), watched=(WEEKLY,), runner=Flaky(objects), log=lambda *a, **k: warnings.append(a[0])), {})
+            self.assertEqual(periodics.fetch(pathlib.Path(tmp), watched=(DAILY,), runner=Flaky(objects), log=lambda *a, **k: warnings.append(a[0])), {})
         self.assertEqual(len(warnings), 1)
         self.assertTrue(periodics._not_found("CommandException: No URLs matched: gs://x/y"))
         self.assertTrue(periodics._not_found("NotFoundException: 404 gs://x/y does not exist."))
@@ -171,54 +172,54 @@ class FetchTest(unittest.TestCase):
     def test_a_present_but_unparseable_finished_json_is_a_blind_tick(self):
         # An empty or truncated object is not "still running": walking past it
         # would report the build before as the latest finished run.
-        root = f"{periodics.LOGS_ROOT}/{WEEKLY.job}"
-        objects = archive(WEEKLY.job, {"101": (None, None), "100": (finished(NOW - timedelta(days=1), passed=True), None)})
+        root = f"{periodics.LOGS_ROOT}/{DAILY.job}"
+        objects = archive(DAILY.job, {"101": (None, None), "100": (finished(NOW - timedelta(days=1), passed=True), None)})
         objects[f"{root}/101/{periodics.FINISHED}"] = ""
         warnings = []
         with tempfile.TemporaryDirectory() as tmp:
-            readings = periodics.fetch(pathlib.Path(tmp), watched=(WEEKLY,), runner=FakeGsutil(objects), log=lambda *a, **k: warnings.append(a[0]))
+            readings = periodics.fetch(pathlib.Path(tmp), watched=(DAILY,), runner=FakeGsutil(objects), log=lambda *a, **k: warnings.append(a[0]))
         self.assertEqual(readings, {})
         self.assertEqual(len(warnings), 1)
         self.assertIn("101/finished.json: not JSON", warnings[0])
         objects[f"{root}/101/{periodics.FINISHED}"] = "[]"
         with tempfile.TemporaryDirectory() as tmp:
-            self.assertEqual(periodics.fetch(pathlib.Path(tmp), watched=(WEEKLY,), runner=FakeGsutil(objects), log=lambda *a, **k: None), {})
+            self.assertEqual(periodics.fetch(pathlib.Path(tmp), watched=(DAILY,), runner=FakeGsutil(objects), log=lambda *a, **k: None), {})
 
     def test_an_absurd_timestamp_is_no_finish_time_not_a_crash(self):
-        objects = archive(HOURLY.job, {"5": ({"timestamp": 10**20, "passed": True, "result": "SUCCESS"}, None)})
+        objects = archive(POST.job, {"5": ({"timestamp": 10**20, "passed": True, "result": "SUCCESS"}, None)})
         with tempfile.TemporaryDirectory() as tmp:
-            readings = periodics.fetch(pathlib.Path(tmp), watched=(HOURLY,), runner=FakeGsutil(objects))
-        self.assertIsNone(readings[HOURLY.job]["finished_at"])
-        self.assertEqual(periodics.assess(readings, NOW, {})[HOURLY.job]["verdict"], periodics.VERDICT_STALE)
+            readings = periodics.fetch(pathlib.Path(tmp), watched=(POST,), runner=FakeGsutil(objects))
+        self.assertIsNone(readings[POST.job]["finished_at"])
+        self.assertEqual(periodics.assess(readings, NOW, {})[POST.job]["verdict"], periodics.VERDICT_STALE)
 
     def test_load_readings_skips_a_file_it_cannot_read(self):
         with tempfile.TemporaryDirectory() as tmp:
             out = pathlib.Path(tmp)
             (out / f"{SWEEP.job}.json").write_text("{not json")
-            (out / f"{HOURLY.job}.json").write_text(json.dumps({"job": HOURLY.job, "build": "1", "finished_at": NOW.isoformat(), "passed": True, "result": "SUCCESS"}))
-            self.assertEqual(sorted(periodics.load_readings(out)), [HOURLY.job])
+            (out / f"{POST.job}.json").write_text(json.dumps({"job": POST.job, "build": "1", "finished_at": NOW.isoformat(), "passed": True, "result": "SUCCESS"}))
+            self.assertEqual(sorted(periodics.load_readings(out)), [POST.job])
         self.assertEqual(periodics.load_readings(None), {})
 
 
     def test_a_listed_build_is_read_under_the_name_that_was_listed(self):
         # A non-canonical decimal name is Prow's to never write; if one is
         # there, it is read as listed rather than rebuilt through int().
-        objects = archive(WEEKLY.job, {"200": (None, None), "0099": (finished(NOW - timedelta(hours=1), passed=False), None)})
+        objects = archive(DAILY.job, {"200": (None, None), "0099": (finished(NOW - timedelta(hours=1), passed=False), None)})
         with tempfile.TemporaryDirectory() as tmp:
-            readings = periodics.fetch(pathlib.Path(tmp), watched=(WEEKLY,), runner=FakeGsutil(objects))
-        self.assertEqual(readings[WEEKLY.job]["build"], "0099")
+            readings = periodics.fetch(pathlib.Path(tmp), watched=(DAILY,), runner=FakeGsutil(objects))
+        self.assertEqual(readings[DAILY.job]["build"], "0099")
 
     def test_a_passed_builds_unreadable_report_keeps_the_reading(self):
         # The report of a passed build is only the recovery's summary: a read
         # that fails for a reason other than NotFound warns and the reading
         # stands without it, where a failed build's would blind the tick.
-        root = f"{periodics.LOGS_ROOT}/{WEEKLY.job}"
-        objects = archive(WEEKLY.job, {"100": (finished(NOW - timedelta(hours=1), passed=True), {"summary": {"applied": 1}})})
+        root = f"{periodics.LOGS_ROOT}/{DAILY.job}"
+        objects = archive(DAILY.job, {"100": (finished(NOW - timedelta(hours=1), passed=True), {"summary": {"applied": 1}})})
         denied = FakeGsutil(objects, denied={f"{root}/100/{periodics.ARTIFACTS_DIR}/{periodics.RECONCILE_ARTIFACT}"})
         warnings = []
         with tempfile.TemporaryDirectory() as tmp:
-            readings = periodics.fetch(pathlib.Path(tmp), watched=(WEEKLY,), runner=denied, log=lambda *a, **k: warnings.append(a[0]))
-        self.assertEqual((readings[WEEKLY.job]["build"], readings[WEEKLY.job]["artifact"]), ("100", None))
+            readings = periodics.fetch(pathlib.Path(tmp), watched=(DAILY,), runner=denied, log=lambda *a, **k: warnings.append(a[0]))
+        self.assertEqual((readings[DAILY.job]["build"], readings[DAILY.job]["artifact"]), ("100", None))
         self.assertEqual(len(warnings), 1)
 
     def test_a_missing_bucket_is_warned_not_read_as_never_ran(self):
@@ -239,31 +240,223 @@ class AssessTest(unittest.TestCase):
         return reading
 
     def test_a_passed_fresh_build_is_no_note(self):
-        readings = {SWEEP.job: self.reading(SWEEP, NOW - timedelta(minutes=5)), WEEKLY.job: self.reading(WEEKLY, NOW - timedelta(days=3))}
+        readings = {SWEEP.job: self.reading(SWEEP, NOW - timedelta(minutes=5)), DAILY.job: self.reading(DAILY, NOW - timedelta(days=1)), POST.job: self.reading(POST, NOW - timedelta(days=40))}
         self.assertEqual(periodics.assess(readings, NOW, {}), {})
 
     def test_a_failed_build_is_a_note_naming_the_refused_projects(self):
         artifact = {"dry_run": False, "outcomes": {"kube-agents-evals-3": {"outcome": "refused", "detail": "not a create or an in-place update: delete google_container_cluster.seeded_b"}, "kube-agents-evals-4": {"outcome": "applied", "detail": "2 to add"}}, "error": "1 project(s) not reconciled: kube-agents-evals-3"}
-        readings = {WEEKLY.job: self.reading(WEEKLY, NOW - timedelta(hours=1), passed=False, artifact=artifact)}
+        readings = {DAILY.job: self.reading(DAILY, NOW - timedelta(hours=1), passed=False, artifact=artifact)}
         notes = periodics.assess(readings, NOW, {})
-        note = notes[WEEKLY.job]
+        note = notes[DAILY.job]
         self.assertEqual((note["verdict"], note["build"], note["since"], note["dry_run"]), (periodics.VERDICT_FAILED, "100", NOW.isoformat(timespec="seconds"), False))
-        self.assertEqual(note["detail"], ["kube-agents-evals-3: refused (not a create or an in-place update: delete google_container_cluster.seeded_b)", "run: 1 project(s) not reconciled: kube-agents-evals-3"])
-        self.assertEqual(note["history_url"], f"{periodics.JOB_HISTORY_ROOT}/{WEEKLY.job}")
+        self.assertEqual(note["detail"], ["kube-agents-evals-3: refused (not a create or an in-place update: delete google_container_cluster.seeded_b); next: a code change, or an entry in bench/tf/fleet/reconcile-allow.json", "run: 1 project(s) not reconciled: kube-agents-evals-3"])
+        self.assertEqual(note["history_url"], f"{periodics.JOB_HISTORY_ROOT}/{DAILY.job}")
         self.assertIn("build 100 failed", periodics.evidence(note))
         # The next tick keeps the episode's start.
         later = periodics.assess(readings, NOW + timedelta(hours=1), notes)
-        self.assertEqual(later[WEEKLY.job]["since"], note["since"])
+        self.assertEqual(later[DAILY.job]["since"], note["since"])
 
     def test_a_job_past_its_stale_window_is_stale_whatever_its_last_verdict(self):
-        readings = {WEEKLY.job: self.reading(WEEKLY, NOW - timedelta(days=9)), HOURLY.job: self.reading(HOURLY, NOW - timedelta(hours=2, minutes=59))}
+        readings = {DAILY.job: self.reading(DAILY, NOW - timedelta(hours=37)), POST.job: self.reading(POST, NOW - timedelta(days=30))}
         notes = periodics.assess(readings, NOW, {})
-        self.assertEqual(sorted(notes), [WEEKLY.job])
-        self.assertEqual(notes[WEEKLY.job]["verdict"], periodics.VERDICT_STALE)
-        self.assertIn("no finished run since", periodics.evidence(notes[WEEKLY.job]))
+        self.assertEqual(sorted(notes), [DAILY.job], "a postsubmit has no cadence, so no age makes it stale")
+        self.assertEqual(notes[DAILY.job]["verdict"], periodics.VERDICT_STALE)
+        self.assertIn("no finished run since", periodics.evidence(notes[DAILY.job]))
+        fresh = {DAILY.job: self.reading(DAILY, NOW - timedelta(hours=35))}
+        self.assertEqual(periodics.assess(fresh, NOW, {}), {})
+
+    def test_a_failed_postsubmit_is_retired_once_a_later_daily_has_dealt_with_its_projects(self):
+        # The postsubmit has no window to retire it. A later daily that
+        # reached the projects it failed on is the recovery; one that passed
+        # without reaching them is not; one that failed is the current story
+        # about the fleet, so the older failure is not news beside it.
+        failed = self.reading(POST, NOW - timedelta(days=2), passed=False, artifact={"fleet_tree": "t1", "summary": {"refused": 1}, "outcomes": {"kube-agents-evals-9": {"outcome": "failed", "detail": "lock"}}})
+        reached = self.reading(DAILY, NOW - timedelta(hours=1), artifact={"fleet_tree": "t1", "summary": {"converged": 35}, "outcomes": {"kube-agents-evals-9": {"outcome": "converged", "detail": ""}}})
+        decided = periodics.superseded_jobs({POST.job: failed, DAILY.job: reached})
+        # The run the recovery was decided on rides with it: what the clear
+        # cites, whether or not the tick that sends it read the daily.
+        by = {key: periodics.runs({DAILY.job: reached})[DAILY.job][key] for key in ("build", "finished_at", "summary")}
+        self.assertEqual(decided, {POST.job: {"build": "100", "recovery": True, "by": by}})
+        self.assertEqual(by["build"], "100")
+        self.assertEqual(periodics.assess({POST.job: failed, DAILY.job: reached}, NOW, {}, superseded=decided), {})
+        # Reached at another fleet tree is no recovery: a daily that applied
+        # evals-9 from the main it started on, before the merge the postsubmit
+        # failed on, says nothing about that merge; neither does a report
+        # with no tree.
+        other_tree = self.reading(DAILY, NOW - timedelta(hours=1), artifact={"fleet_tree": "t0", "summary": {"converged": 35}, "outcomes": {"kube-agents-evals-9": {"outcome": "converged", "detail": ""}}})
+        self.assertEqual(periodics.superseded_jobs({POST.job: failed, DAILY.job: other_tree}), {})
+        no_tree = self.reading(DAILY, NOW - timedelta(hours=1), artifact={"summary": {"converged": 35}, "outcomes": {"kube-agents-evals-9": {"outcome": "converged", "detail": ""}}})
+        self.assertEqual(periodics.superseded_jobs({POST.job: failed, DAILY.job: no_tree}), {})
+        self.assertEqual(periodics.superseded_jobs({POST.job: self.reading(POST, NOW - timedelta(days=2), passed=False, artifact={"outcomes": {"kube-agents-evals-9": {"outcome": "failed", "detail": "lock"}}}), DAILY.job: reached}), {})
+        missed = self.reading(DAILY, NOW - timedelta(hours=1), artifact={"fleet_tree": "t1", "summary": {"converged": 34, "not_reached": 1}, "outcomes": {"kube-agents-evals-9": {"outcome": "not_reached", "detail": "busy"}}})
+        self.assertEqual(periodics.superseded_jobs({POST.job: failed, DAILY.job: missed}), {})
+        self.assertIn(POST.job, periodics.assess({POST.job: failed, DAILY.job: missed}, NOW, {}, superseded={}))
+        # A project a whole pass no longer lists has left the pool (a stray
+        # registration removed, as the note's own next step says): dealt
+        # with. A pass that is not whole says nothing about it.
+        gone = self.reading(DAILY, NOW - timedelta(hours=1), artifact={"fleet_tree": "t1", "mode": "all", "visited": 1, "mapped": 1, "summary": {"converged": 1}, "outcomes": {"kube-agents-evals-3": {"outcome": "converged", "detail": ""}}})
+        self.assertEqual(periodics.superseded_jobs({POST.job: failed, DAILY.job: gone})[POST.job]["recovery"], True)
+        partial = self.reading(DAILY, NOW - timedelta(hours=1), artifact={"fleet_tree": "t1", "mode": "all", "visited": 1, "mapped": 2, "summary": {"converged": 1}, "outcomes": {"kube-agents-evals-3": {"outcome": "converged", "detail": ""}}})
+        self.assertEqual(periodics.superseded_jobs({POST.job: failed, DAILY.job: partial}), {})
+        # A failed build that names no project (the pool busy for its whole
+        # budget, a Boskos fault before the walk) reached nothing: only a
+        # whole pass at its tree recovers it, not any pass that reached
+        # something.
+        nameless = self.reading(POST, NOW - timedelta(days=2), passed=False, artifact={"fleet_tree": "t1", "outcomes": {}})
+        self.assertEqual(periodics.superseded_jobs({POST.job: nameless, DAILY.job: reached}), {})
+        self.assertEqual(periodics.superseded_jobs({POST.job: nameless, DAILY.job: partial}), {})
+        self.assertEqual(periodics.superseded_jobs({POST.job: nameless, DAILY.job: gone})[POST.job]["recovery"], True)
+        # A failed build whose report is unreadable names no project because
+        # nothing can be read: no later pass recovers it, a later failed
+        # daily still silences it.
+        unread = self.reading(POST, NOW - timedelta(days=2), passed=False, artifact={"error": periodics.REPORT_UNREADABLE})
+        self.assertEqual(periodics.superseded_jobs({POST.job: unread, DAILY.job: reached}), {})
+        self.assertEqual(periodics.superseded_jobs({POST.job: self.reading(POST, NOW - timedelta(days=2), passed=False, artifact=None), DAILY.job: reached}), {})
+        # A failed daily silences the older note but is no recovery.
+        daily_failed = self.reading(DAILY, NOW - timedelta(hours=1), passed=False, artifact={"summary": {"failed": 1}, "outcomes": {"kube-agents-evals-9": {"outcome": "failed", "detail": "lock"}}})
+        decided = periodics.superseded_jobs({POST.job: failed, DAILY.job: daily_failed})
+        self.assertEqual(decided, {POST.job: {"build": "100", "recovery": False}})
+        notes = periodics.assess({POST.job: failed, DAILY.job: daily_failed}, NOW, {}, superseded=decided)
+        self.assertEqual(sorted(notes), [DAILY.job], "the daily's own note is the current story")
+        earlier_daily = self.reading(DAILY, NOW - timedelta(days=3), artifact={"fleet_tree": "t1", "outcomes": {"kube-agents-evals-9": {"outcome": "converged", "detail": ""}}})
+        self.assertEqual(periodics.superseded_jobs({POST.job: failed, DAILY.job: earlier_daily}), {})
+        self.assertEqual(periodics.superseded_jobs({POST.job: failed}), {})
+        # Sticky for the same failed build: a tick blind to the daily, or a
+        # later failing daily, does not re-open a retired failure as news;
+        # a new failed build is decided afresh.
+        carried = {POST.job: {"build": "100", "recovery": True}}
+        self.assertEqual(periodics.superseded_jobs({POST.job: failed}, carried), carried)
+        self.assertEqual(periodics.superseded_jobs({POST.job: failed, DAILY.job: daily_failed}, carried), carried)
+        self.assertEqual(periodics.assess({POST.job: failed}, NOW, {}, superseded=carried), {})
+        newer = self.reading(POST, NOW - timedelta(hours=2), passed=False, build="101", artifact={"outcomes": {"kube-agents-evals-9": {"outcome": "failed", "detail": "lock"}}})
+        self.assertEqual(periodics.superseded_jobs({POST.job: newer}, carried), {})
+        # A tick blind to the postsubmit itself (its pointer, finished.json or
+        # report unreadable) carries the entry unchanged; a reading that shows
+        # the build passed, or a newer one, is what ends it.
+        self.assertEqual(periodics.superseded_jobs({}, carried), carried)
+        self.assertEqual(periodics.superseded_jobs({DAILY.job: daily_failed}, carried), carried)
+        passed_post = self.reading(POST, NOW - timedelta(hours=1), passed=True, build="102")
+        self.assertEqual(periodics.superseded_jobs({POST.job: passed_post}, carried), {})
+        # And a carried silence becomes a recovery once a later daily reaches the projects.
+        silenced = {POST.job: {"build": "100", "recovery": False}}
+        self.assertEqual(periodics.superseded_jobs({POST.job: failed, DAILY.job: reached}, silenced), {POST.job: {"build": "100", "recovery": True, "by": by}})
+        self.assertEqual(periodics.superseded_jobs({POST.job: unread, DAILY.job: daily_failed}), {POST.job: {"build": "100", "recovery": False}})
+        # A silence ends when the daily that cast it passes without reaching
+        # the projects: its own note clears, and the failure it hid is open
+        # again (not news: the told key still holds). A failed daily keeps it.
+        self.assertEqual(periodics.superseded_jobs({POST.job: failed, DAILY.job: missed}, silenced), {})
+        self.assertEqual(periodics.superseded_jobs({POST.job: failed, DAILY.job: daily_failed}, silenced), silenced)
+        # `by` rides through a tick blind to the daily and through a later
+        # failed daily; a recovery never cites a run other than its own.
+        with_by = {POST.job: {"build": "100", "recovery": True, "by": {"build": "9", "finished_at": "2026-09-14T08:40:00+00:00", "summary": "35 visited: 35 converged"}}}
+        self.assertEqual(periodics.superseded_jobs({POST.job: failed}, with_by), with_by)
+        self.assertEqual(periodics.superseded_jobs({POST.job: failed, DAILY.job: daily_failed}, with_by), with_by)
+
+    def test_a_postsubmit_build_with_no_finish_time_is_still_said_without_a_window(self):
+        readings = {POST.job: {"job": POST.job, "build": "9", "finished_at": None, "passed": True, "result": "SUCCESS", "artifact": None}}
+        note = periodics.assess(readings, NOW, {})[POST.job]
+        self.assertEqual((note["verdict"], note["stale_after_h"]), (periodics.VERDICT_STALE, None))
+        self.assertIn("finished.json does not give", periodics.evidence(note))
+        self.assertNotIn("None", periodics.evidence(note))
+
+    def test_the_reconcile_summary_reads_the_visited_count_and_plain_words(self):
+        artifact = {"visited": 35, "summary": {"applied": 2, "converged": 31, "unchanged": 0, "planned": 0, "busy": 0, "refused": 0, "failed": 0, "interrupted": 0, "not_reached": 2}}
+        self.assertEqual(periodics.run_summary(DAILY, artifact, passed=True), "35 visited: 2 applied, 31 converged, 2 not reached")
+        self.assertEqual(periodics.run_summary(DAILY, {"summary": {"applied": 3, "unchanged": 9}}, passed=True), "3 applied, 9 unchanged")
+        self.assertEqual(periodics.run_summary(DAILY, {"visited": 0, "summary": {"not_reached": 35}}, passed=True), "0 visited: 35 not reached")
+
+    def test_the_reconcile_detail_names_the_next_step_the_not_reached_and_the_unused_allowlist(self):
+        artifact = {
+            "outcomes": {
+                "kube-agents-evals-3": {"outcome": "refused", "detail": "1 refused: delete x", "allowlist_unused": ["google_compute_disk.gone"]},
+                "kube-agents-evals-4": {"outcome": "failed", "detail": "tofu apply exited 1: boom", "allowlist_unused": ["google_compute_disk.gone"]},
+                "kube-agents-evals-5": {"outcome": "interrupted", "detail": "terminated (signal 15) while tofu ran; ... the next run tells whether it needs force-unlock"},
+                "kube-agents-evals-6": {"outcome": "not_reached", "detail": "not started: 100s left in the run's budget, under the 3600s per-project ceiling; the next run takes it"},
+                "kube-agents-evals-7": {"outcome": "not_reached", "detail": "not started: 100s left in the run's budget, under the 3600s per-project ceiling; the next run takes it"},
+                "kube-agents-evals-8": {"outcome": "converged", "detail": "re-stamp", "allowlist_unused": ["google_compute_disk.gone"]},
+            },
+            "error": "2 project(s) not reconciled: kube-agents-evals-3, kube-agents-evals-4",
+        }
+        artifact["visited"] = 6
+        artifact["mapped"] = 6
+        artifact["mode"] = "all"
+        lines = periodics.reconcile_detail(artifact)
+        self.assertEqual(lines[0], "kube-agents-evals-3: refused (1 refused: delete x); next: a code change, or an entry in bench/tf/fleet/reconcile-allow.json")
+        self.assertEqual(lines[1], "kube-agents-evals-4: failed (tofu apply exited 1: boom); next: nothing by hand, the next run retries it")
+        # A failure the next run cannot clear names its hand step.
+        stray = {"outcomes": {"kube-agents-evals-99": {"outcome": "failed", "detail": "not a mapped pool project (gitops_repo_for_project in hack/ci-deploy.sh)"}}}
+        self.assertTrue(periodics.reconcile_detail(stray)[0].endswith(periodics.RECONCILE_NEXT_STEP_UNMAPPED))
+        no_tofu = {"outcomes": {"p": {"outcome": "failed", "detail": "could not run tofu (FileNotFoundError: [Errno 2] No such file or directory: 'tofu')"}}}
+        self.assertTrue(periodics.reconcile_detail(no_tofu)[0].endswith(periodics.RECONCILE_NEXT_STEP_RUNNER))
+        # tofu's own lock error counts as locked too, and a non-string detail does not crash the tick.
+        locked = {"outcomes": {"p": {"outcome": "failed", "detail": "tofu plan exited 1: Error acquiring the state lock: ConditionNotMet ... Lock Info: ID 1234"}}}
+        self.assertTrue(periodics.reconcile_detail(locked)[0].endswith(periodics.RECONCILE_NEXT_STEP_LOCKED))
+        # The 600-character tail the writer keeps can cut the header; the
+        # Lock Info block and the trailer survive it.
+        for tail in ("...  Lock Info:\n  ID: 1234\n  Path: gs://p-tf-state/seeded-fleet/default.tflock", "... OpenTofu acquires a state lock to protect the state from being written by multiple users at the same time."):
+            cut = {"outcomes": {"p": {"outcome": "failed", "detail": "tofu plan exited 1: " + tail}}}
+            self.assertTrue(periodics.reconcile_detail(cut)[0].endswith(periodics.RECONCILE_NEXT_STEP_LOCKED), tail)
+        odd = {"outcomes": {"p": {"outcome": "failed", "detail": 1}, "q": {"outcome": "refused", "detail": True}}}
+        self.assertEqual(len(periodics.reconcile_detail(odd)), 2)
+        # A ceiling cut is not yet a lock: the runbook says force-unlock only
+        # once the next run fails on it, and that run's message carries the
+        # lock ID the command needs.
+        ceiling = {"outcomes": {"p": {"outcome": "failed", "detail": "did not finish within 3600s; tofu was interrupted, and killed if it did not stop within 120s, which leaves the state locked; the next run tells whether it needs force-unlock"}}}
+        self.assertEqual(periodics.reconcile_detail(ceiling), ["p: failed (did not finish within 3600s; tofu was interrupted, and killed if it did not stop within 120s, which leaves the state locked; the next run tells whether it needs force-unlock); next: the next run retries it, and force-unlocks only if it fails on the lock"])
+        self.assertEqual(lines[2], "kube-agents-evals-5: interrupted (terminated (signal 15) while tofu ran; ... the next run tells whether it needs force-unlock); next: the next run retries it, and force-unlocks only if it fails on the lock")
+        self.assertEqual(lines[3], "2 not reached (not started: 100s left in the run's budget, under the 3600s per-project ceiling; the next run takes it)")
+        # The interrupted project carries no allowlist verdict, so this run
+        # says nothing about the entry the others did not need.
+        self.assertEqual(lines[4], "run: 2 project(s) not reconciled: kube-agents-evals-3, kube-agents-evals-4")
+        self.assertEqual(len(lines), 5)
+
+    def test_an_allowlist_entry_some_project_still_needed_is_not_called_unused(self):
+        artifact = {"outcomes": {"p1": {"outcome": "applied", "detail": "", "allowlist_unused": ["a"]}, "p2": {"outcome": "applied", "detail": "", "allowlist_unused": []}}}
+        self.assertEqual(periodics.reconcile_detail(artifact), [])
+        # A project whose plan was never read carries no verdict, and a run
+        # that did not reach every mapped project says nothing about the
+        # allowlist: the projects it missed are the ones that may still need
+        # the entry.
+        artifact = {"mode": "all", "visited": 1, "mapped": 2, "outcomes": {"p1": {"outcome": "applied", "detail": "", "allowlist_unused": ["a"]}, "p2": {"outcome": "busy", "detail": ""}}}
+        self.assertEqual(periodics.reconcile_detail(artifact), [])
+        # A visited project whose plan was never read (failed at init) carries
+        # no verdict, and that is the project that may still need the entry.
+        artifact = {"mode": "all", "visited": 2, "mapped": 2, "outcomes": {"p1": {"outcome": "applied", "detail": "", "allowlist_unused": ["a"]}, "p2": {"outcome": "failed", "detail": "init"}}}
+        self.assertFalse(any(line.startswith("allowlist:") for line in periodics.reconcile_detail(artifact)))
+        artifact = {"mode": "all", "visited": 2, "mapped": 2, "outcomes": {"p1": {"outcome": "applied", "detail": "", "allowlist_unused": ["a"]}, "p2": {"outcome": "converged", "detail": "", "allowlist_unused": ["a"]}}}
+        self.assertEqual(periodics.reconcile_detail(artifact), ["allowlist: 1 entry no plan needed, remove it: a"])
+        # A drifted or named run's `mapped` is its own list, not the pool: no claim.
+        for mode in ("drifted", "project"):
+            artifact["mode"] = mode
+            self.assertEqual(periodics.reconcile_detail(artifact), [], mode)
+        self.assertEqual(periodics.reconcile_detail({"mode": "all", "outcomes": {"p1": {"outcome": "applied", "detail": "", "allowlist_unused": ["a"]}}}), [], "no visited/mapped counts, no claim")
+        # A foreign artifact with non-string entries must not kill the tick:
+        # a list that is not all strings is no verdict at all.
+        for odd in ([["a"]], ["a", 1], [{"x": 1}]):
+            artifact = {"mode": "all", "visited": 2, "mapped": 2, "outcomes": {"p1": {"outcome": "applied", "detail": "", "allowlist_unused": odd}, "p2": {"outcome": "applied", "detail": "", "allowlist_unused": ["a"]}}}
+            self.assertEqual(periodics.reconcile_detail(artifact), [], odd)
+
+    def test_the_failed_markers_are_the_words_the_script_writes(self):
+        # The reader classifies a `failed` by words of the writer's reasons.
+        # Nothing else holds the two files together: a reason reworded in
+        # hack/fleet_reconcile.py and not here would restore "nothing by
+        # hand" beside a detail that names a hand step.
+        spec = importlib.util.spec_from_file_location("fleet_reconcile_markers", REPO / "hack" / "fleet_reconcile.py")
+        script = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(script)
+        self.assertIn(periodics.RECONCILE_UNMAPPED_MARKER, script.REASON_UNMAPPED)
+        self.assertIn(periodics.RECONCILE_CEILING_MARKER, script.REASON_CEILING)
+        self.assertIn(periodics.RECONCILE_CEILING_MARKER, script.REASON_INTERRUPTED)
+        self.assertIn(periodics.RECONCILE_RUNNER_MARKER, script.REASON_RUNNER)
+        # And the ceiling words are not an instruction the runbook forbids yet.
+        self.assertNotIn(": tofu force-unlock", script.REASON_CEILING + script.REASON_INTERRUPTED)
+
+    def test_runs_carry_whether_the_build_was_a_dry_run(self):
+        reading = self.reading(DAILY, NOW - timedelta(hours=1), artifact={"dry_run": True, "summary": {"planned": 3}})
+        self.assertEqual(periodics.runs({DAILY.job: reading})[DAILY.job]["dry_run"], True)
 
     def test_no_reading_writes_no_note(self):
-        self.assertEqual(periodics.assess({}, NOW, {WEEKLY.job: {"since": "x"}}), {})
+        self.assertEqual(periodics.assess({}, NOW, {DAILY.job: {"since": "x"}}), {})
 
     def test_the_detail_is_capped_on_projects_and_the_run_line_follows(self):
         outcomes = {f"kube-agents-evals-{i}": {"outcome": "failed", "detail": "x"} for i in range(1, 9)}
@@ -288,36 +481,36 @@ class AssessTest(unittest.TestCase):
         self.assertEqual(readings[SWEEP.job]["build"], "8")
 
     def test_an_unreadable_artifact_is_a_blind_tick_and_a_cut_one_is_said(self):
-        root = f"{periodics.LOGS_ROOT}/{WEEKLY.job}"
+        root = f"{periodics.LOGS_ROOT}/{DAILY.job}"
         report = {"outcomes": {"kube-agents-evals-3": {"outcome": "refused", "detail": "x"}}}
-        objects = archive(WEEKLY.job, {"100": (finished(NOW - timedelta(hours=1), passed=False), report)})
+        objects = archive(DAILY.job, {"100": (finished(NOW - timedelta(hours=1), passed=False), report)})
         denied = FakeGsutil(objects, denied={f"{root}/100/{periodics.ARTIFACTS_DIR}/{periodics.RECONCILE_ARTIFACT}"})
         warnings = []
         with tempfile.TemporaryDirectory() as tmp:
-            self.assertEqual(periodics.fetch(pathlib.Path(tmp), watched=(WEEKLY,), runner=denied, log=lambda *a, **k: warnings.append(a[0])), {})
+            self.assertEqual(periodics.fetch(pathlib.Path(tmp), watched=(DAILY,), runner=denied, log=lambda *a, **k: warnings.append(a[0])), {})
         self.assertEqual(len(warnings), 1)
         # Present but cut short: no later tick can read it either, so the
         # failure is a reading whose detail says the report was unreadable.
         objects[f"{root}/100/{periodics.ARTIFACTS_DIR}/{periodics.RECONCILE_ARTIFACT}"] = '{"outcomes": {'
         warnings.clear()
         with tempfile.TemporaryDirectory() as tmp:
-            readings = periodics.fetch(pathlib.Path(tmp), watched=(WEEKLY,), runner=FakeGsutil(objects), log=lambda *a, **k: warnings.append(a[0]))
+            readings = periodics.fetch(pathlib.Path(tmp), watched=(DAILY,), runner=FakeGsutil(objects), log=lambda *a, **k: warnings.append(a[0]))
         self.assertIn("not a JSON object", warnings[0])
-        self.assertEqual(periodics.reconcile_detail(readings[WEEKLY.job]["artifact"]), [f"run: {periodics.REPORT_UNREADABLE}"])
+        self.assertEqual(periodics.reconcile_detail(readings[DAILY.job]["artifact"]), [f"run: {periodics.REPORT_UNREADABLE}"])
         # A passed build's report is read too: the recovery message says what the run did.
-        passed = FakeGsutil(archive(WEEKLY.job, {"100": (finished(NOW - timedelta(hours=1), passed=True), report)}))
+        passed = FakeGsutil(archive(DAILY.job, {"100": (finished(NOW - timedelta(hours=1), passed=True), report)}))
         with tempfile.TemporaryDirectory() as tmp:
-            readings = periodics.fetch(pathlib.Path(tmp), watched=(WEEKLY,), runner=passed)
-        self.assertEqual(readings[WEEKLY.job]["artifact"], report)
+            readings = periodics.fetch(pathlib.Path(tmp), watched=(DAILY,), runner=passed)
+        self.assertEqual(readings[DAILY.job]["artifact"], report)
         # A run that wrote no artifact is a reading without one.
-        absent = archive(WEEKLY.job, {"100": (finished(NOW - timedelta(hours=1), passed=False), None)})
+        absent = archive(DAILY.job, {"100": (finished(NOW - timedelta(hours=1), passed=False), None)})
         with tempfile.TemporaryDirectory() as tmp:
-            readings = periodics.fetch(pathlib.Path(tmp), watched=(WEEKLY,), runner=FakeGsutil(absent))
-        self.assertIsNone(readings[WEEKLY.job]["artifact"])
+            readings = periodics.fetch(pathlib.Path(tmp), watched=(DAILY,), runner=FakeGsutil(absent))
+        self.assertIsNone(readings[DAILY.job]["artifact"])
 
     def test_a_stale_note_without_a_finish_time_says_the_window_cannot_be_measured(self):
-        readings = {HOURLY.job: {"job": HOURLY.job, "build": "5", "finished_at": None, "passed": True, "result": "SUCCESS"}}
-        note = periodics.assess(readings, NOW, {})[HOURLY.job]
+        readings = {DAILY.job: {"job": DAILY.job, "build": "5", "finished_at": None, "passed": True, "result": "SUCCESS"}}
+        note = periodics.assess(readings, NOW, {})[DAILY.job]
         self.assertEqual(note["verdict"], periodics.VERDICT_STALE)
         self.assertIn("cannot be measured", periodics.evidence(note))
         self.assertNotIn("finished nothing", periodics.evidence(note))
@@ -391,10 +584,10 @@ class AssessTest(unittest.TestCase):
         self.assertEqual(detail[-1], "7 write(s) left for the next run (the run's write budget)")
         self.assertEqual(len(detail), periodics.DETAIL_LIMIT + 2)
         # A reconcile's first failed build is news, with its own lines untouched.
-        weekly = {"job": WEEKLY.job, "build": "7", "finished_at": NOW.isoformat(timespec="seconds"), "passed": False, "result": "FAILURE",
+        weekly = {"job": DAILY.job, "build": "7", "finished_at": NOW.isoformat(timespec="seconds"), "passed": False, "result": "FAILURE",
                   "artifact": {"outcomes": {"kube-agents-evals-3": {"outcome": "refused", "detail": "delete x"}}}}
-        streaks = periodics.streaks({WEEKLY.job: weekly}, None)
-        self.assertEqual(periodics.assess({WEEKLY.job: weekly}, NOW, None, streaks=streaks)[WEEKLY.job]["detail"], ["kube-agents-evals-3: refused (delete x)"])
+        streaks = periodics.streaks({DAILY.job: weekly}, None)
+        self.assertEqual(periodics.assess({DAILY.job: weekly}, NOW, None, streaks=streaks)[DAILY.job]["detail"], [f"kube-agents-evals-3: refused (delete x); next: {periodics.RECONCILE_NEXT_STEP['refused']}"])
         # Without streaks (a caller that has none), a failed build is a note as before.
         self.assertIn(SWEEP.job, periodics.assess({SWEEP.job: reading("1", False, {"kube-agents-evals-3": fail})}, NOW, None))
 
@@ -434,14 +627,14 @@ class WorkflowWiring(unittest.TestCase):
         self.assertEqual(periodics.run_summary(SWEEP, above, passed=False), "the run failed after closing 7 pull request(s) across 7 project(s)")
         self.assertEqual(periodics.sweep_detail(above), ["run: could not reach a service (OSError: ...)"])
         self.assertEqual(periodics.sweep_detail(drained), ["30 write(s) left for the next run (the run's write budget)"])
-        self.assertEqual(periodics.run_summary(WEEKLY, {"summary": {"applied": 3, "unchanged": 9, "refused": 0}}, passed=True), "3 applied, 9 unchanged")
-        self.assertEqual(periodics.run_summary(WEEKLY, {"summary": {}}, passed=True), "nothing to do")
+        self.assertEqual(periodics.run_summary(DAILY, {"summary": {"applied": 3, "unchanged": 9, "refused": 0}}, passed=True), "3 applied, 9 unchanged")
+        self.assertEqual(periodics.run_summary(DAILY, {"summary": {}}, passed=True), "nothing to do")
         # A failed reconcile build never reads as success: the named failures
         # lead, or the run failed above the projects.
-        self.assertEqual(periodics.run_summary(WEEKLY, {"summary": {"unchanged": 9, "refused": 3, "failed": 1}}, passed=False), "3 refused, 1 failed, 9 unchanged")
-        self.assertEqual(periodics.run_summary(WEEKLY, {"summary": {"unchanged": 9}}, passed=False), "the run failed after 9 unchanged")
-        self.assertEqual(periodics.run_summary(WEEKLY, {"summary": {}}, passed=False), "the run failed before reaching a project")
-        self.assertIsNone(periodics.run_summary(WEEKLY, None, passed=True))
+        self.assertEqual(periodics.run_summary(DAILY, {"summary": {"unchanged": 9, "refused": 3, "failed": 1}}, passed=False), "3 refused, 1 failed, 9 unchanged")
+        self.assertEqual(periodics.run_summary(DAILY, {"summary": {"unchanged": 9}}, passed=False), "the run failed after 9 unchanged")
+        self.assertEqual(periodics.run_summary(DAILY, {"summary": {}}, passed=False), "the run failed before reaching a project")
+        self.assertIsNone(periodics.run_summary(DAILY, None, passed=True))
 
     def test_a_failed_sweep_note_carries_its_report_and_a_passed_one_its_summary(self):
         report = {"projects": 3, "closed": 1, "failed": 2, "left_for_next_run": 0, "ended_early": None, "outcomes": {"kube-agents-evals-2": {"error": "HTTP 403 Forbidden: x"}, "kube-agents-evals-3": {"closed": 1}, "kube-agents-evals-4": {"error": "HTTP 502 Bad Gateway"}}}
@@ -454,7 +647,7 @@ class WorkflowWiring(unittest.TestCase):
         self.assertTrue(note["runbook"].endswith("#55-the-repository-reset-and-the-sweep-behind-it"))
         passed = {"job": SWEEP.job, "build": "100", "finished_at": NOW.isoformat(timespec="seconds"), "passed": True, "result": "SUCCESS", "artifact": {"projects": 12, "closed": 241, "failed": 0, "left_for_next_run": 0, "outcomes": {}}}
         runs = periodics.runs({SWEEP.job: passed})
-        self.assertEqual(runs[SWEEP.job], {"build": "100", "finished_at": NOW.isoformat(timespec="seconds"), "passed": True, "summary": "closed 241 pull request(s) across 12 project(s)"})
+        self.assertEqual(runs[SWEEP.job], {"build": "100", "finished_at": NOW.isoformat(timespec="seconds"), "passed": True, "summary": "closed 241 pull request(s) across 12 project(s)", "dry_run": False})
 
     def test_every_watched_job_has_its_words_and_a_runbook_section_that_exists(self):
         headings = (pathlib.Path(__file__).resolve().parents[1] / "docs" / "ci-pool-projects.md").read_text().splitlines()
@@ -475,20 +668,31 @@ class WorkflowWiring(unittest.TestCase):
             self.assertTrue(periodic.runbook.startswith(periodics.RUNBOOK_ROOT + "docs/ci-pool-projects.md#"), periodic.runbook)
             self.assertIn(periodic.runbook.split("#", 1)[1], slugs, f"{periodic.job}'s runbook anchor names no heading")
 
-    def test_the_watched_jobs_are_the_three_periodics(self):
+    def test_the_watched_jobs_are_the_periodics_and_the_postsubmit(self):
         # The names are the Prow job names in oss-test-infra, which nothing here
         # can check; a rename there is a rename here.
-        self.assertEqual([p.job for p in periodics.WATCHED], ["ci-kube-agents-pull-sweep", "ci-kube-agents-fleet-reconcile", "ci-kube-agents-fleet-reconcile-all"])
+        # The hourly and the weekly stay watched until the oss-test-infra
+        # change retires them: the watch must not go dark between the merges.
+        self.assertEqual(
+            [p.job for p in periodics.WATCHED],
+            ["ci-kube-agents-pull-sweep", "ci-kube-agents-fleet-reconcile", "ci-kube-agents-fleet-reconcile-all", "ci-kube-agents-fleet-reconcile-daily", "post-kube-agents-fleet-reconcile"],
+        )
         for periodic in periodics.WATCHED:
-            self.assertTrue(periodic.stale_after >= timedelta(hours=1))
+            self.assertTrue(periodic.stale_after is None or periodic.stale_after >= timedelta(hours=1))
+        self.assertIsNone(POST.stale_after, "a job that runs on merges has no cadence to be late against")
+        for job in ("ci-kube-agents-fleet-reconcile", "ci-kube-agents-fleet-reconcile-all"):
+            # Their last build stays in the bucket after Prow drops them; a
+            # merely old one must not read as "stopped running".
+            self.assertIsNone(periodics.WATCHED_BY_JOB[job].stale_after, job)
+        self.assertEqual(DAILY.stale_after, timedelta(hours=36))
 
     def test_main_names_what_it_wrote(self):
         objects = archive(SWEEP.job, {"7": (finished(NOW - timedelta(minutes=5)), None)})
         with tempfile.TemporaryDirectory() as tmp, unittest.mock.patch("sys.stdout", new_callable=lambda: __import__("io").StringIO()) as out:
-            rc = periodics.main(["fetch", "--out-dir", tmp, "--job", SWEEP.job, "--job", HOURLY.job], runner=FakeGsutil(objects))
+            rc = periodics.main(["fetch", "--out-dir", tmp, "--job", SWEEP.job, "--job", POST.job], runner=FakeGsutil(objects))
         self.assertEqual(rc, 0)
         self.assertIn(f"{SWEEP.job}: build 7 SUCCESS", out.getvalue())
-        self.assertIn(f"{HOURLY.job}: no finished build", out.getvalue())
+        self.assertIn(f"{POST.job}: no finished build", out.getvalue())
         self.assertEqual(periodics.main(["fetch", "--out-dir", "/nonexistent", "--job", "nope"]), 2)
 
 
