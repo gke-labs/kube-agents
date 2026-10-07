@@ -1395,6 +1395,27 @@ Mutation(
         "infrastructure",
     ),
     Mutation(
+        "A3-bridge-sends-a-notify",
+        "k8s-operator/internal/controller/platformagent_a2a_identities.go",
+        ('\t\t"a2a.tasks." + a2aBridgeAddressee + ".*.events",\n\t\t"$KV.runtime-state.>",',
+         '\t\t"a2a.tasks." + a2aBridgeAddressee + ".*.events",\n\t\t"chat.notify.gchat",\n\t\t"$KV.runtime-state.>",'),
+        "test_A3_a_notify_has_one_writer_and_its_answer_has_one",
+        "grant the static bridge publish on the notify subject, so a task the "
+        "bridge runs can post its result to the home channel directly -- it "
+        "shares the agent's pod and reads as the same workload. The gateway "
+        "then posts as the install's bot for a second principal",
+    ),
+    Mutation(
+        "A3-agent-answers-its-own-notify",
+        "k8s-operator/internal/controller/platformagent_a2a_identities.go",
+        ("\tpublish = append(publish, a2aNotifySubjectGchat)\n",
+         "\tpublish = append(publish, a2aNotifySubjectGchat, a2aNotifyReplySubjects)\n"),
+        "test_A3_a_notify_has_one_writer_and_its_answer_has_one",
+        "give the agent publish on the notify reply namespace, the symmetric-"
+        "looking grant (it already reads there). The agent can then forge the "
+        "gateway's answer about where a post landed",
+    ),
+    Mutation(
         "A3-session-per-task-wildcard",
         "a2a/authcallout/session.go",
         ('\t\tPublish: []string{\n\t\t\tlib.TaskEventsSubject(pod, "*"),\n\t\t},',

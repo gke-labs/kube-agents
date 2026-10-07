@@ -208,8 +208,11 @@ const (
 	// spell the same two subjects - the modules cannot import each other).
 	// The agent publishes the first and reads the second; the gateway reads
 	// the first and publishes the second; no other principal holds either.
+	// Spelled whole rather than built from a2aAgentBusUser: tests/conformance
+	// reads grants out of this file's source and resolves a literal, not an
+	// expression.
 	a2aNotifySubjectGchat  = "chat.notify.gchat"
-	a2aNotifyReplySubjects = "chat.notify.reply." + a2aAgentBusUser + ".>"
+	a2aNotifyReplySubjects = "chat.notify.reply.agent.>"
 
 	// a2aBridgeUser is the Hermes bridge sidecar's principal. Static, not
 	// callout — see bridgeIdentity for why a token cannot separate it from

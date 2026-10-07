@@ -841,6 +841,32 @@ class A3TheTaskPlaneSubjectSaysWhoWroteIt(unittest.TestCase):
             "have the record read as infrastructure",
         )
 
+    NOTIFY_PROBE = "chat.notify.gchat"
+    NOTIFY_REPLY_PROBE = "chat.notify.reply.agent.r1"
+
+    def test_A3_a_notify_has_one_writer_and_its_answer_has_one(self) -> None:
+        """The chat.notify route: only the agent asks, only the gateway answers.
+
+        The gateway posts what arrives on `chat.notify.gchat` to the home
+        channel as the install's bot, so a second writer there is a second
+        principal that can make the bot speak; and the agent takes the answer
+        as the gateway's word on where the post landed, so a second writer on
+        the reply namespace -- the agent itself included -- can forge it. The
+        session pods' grants are derived per connection and must not reach
+        either subject.
+        """
+        grants = self._rendered_publish_grants()
+        for probe, want in ((self.NOTIFY_PROBE, ["agent"]), (self.NOTIFY_REPLY_PROBE, ["gateway"])):
+            writers = sorted(
+                builder for builder, allow in grants.items() if any(self._subject_matches(g, probe) for g in allow)
+            )
+            self.assertEqual(want, writers, f"principals whose publish grants reach {probe}")
+        self.assertNotIn(
+            "chat.notify",
+            self._session_publish_derivation(),
+            "the callout derives a session a publish grant on the notify route",
+        )
+
     def test_A3_the_supervisor_holds_no_publish_on_the_executors_events_subject(self) -> None:
         """The executor's subject has one writer class, and it is not the supervisor.
 
