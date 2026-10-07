@@ -1029,11 +1029,13 @@ def reconcile_pool(server, owner, runner=tofu_runner, dry_run=False, known=None,
     run.mapped_names = set(known)
     pending = sorted(known)
     seen_busy = set()
+    drained = []
 
     def drain(reason, outcome=OUTCOME_NOT_REACHED):
         # Under run.lock. A budget that ran out while a project was busy:
         # the project was busy, the budget only timed the wait, and the
         # report says the former, whichever worker drains.
+        drained.append(reason)
         while pending:
             project = pending.pop(0)
             why = REASON_NOT_REACHED_BUSY if project in seen_busy and _is_budget_reason(reason) else reason
@@ -1107,7 +1109,10 @@ def reconcile_pool(server, owner, runner=tofu_runner, dry_run=False, known=None,
         with run.lock:
             drain(run.stop_reason() or REASON_NOT_REACHED_RUN_ERROR % boskos_pool.describe(exc))
         raise
-    if not run.stop_reason():
+    # A pass that asked for every project makes the check even when the
+    # budget ran low during its last one: the check leases nothing for long
+    # and runs no tofu. A drain (budget, main moved) or a termination skips it.
+    if not drained and not terminating():
         _check_for_stray_registration(server, owner, runner, dry_run, run, outcomes)
     return outcomes
 

@@ -1336,6 +1336,19 @@ class PassTest(unittest.TestCase):
         self.assertEqual(sorted(boskos.released), [P7, P8])
         self.assertEqual({p: o for p, (o, _) in outcomes.items()}, {P7: reconcile.OUTCOME_APPLIED, P8: reconcile.OUTCOME_APPLIED})
 
+    def test_a_complete_pass_still_makes_the_stray_check_when_the_budget_ran_low_during_its_last_project(self):
+        # The budget stop is sticky and fires once room is under a ceiling,
+        # whether or not anything is left to start. The stray check leases
+        # nothing for long and runs no tofu, so a pass that asked for every
+        # project still makes it; only a drain or a termination skips it.
+        clock = _Clock()
+        tofu = _tofu_taking(10, clock, {P7: UPDATE_ONLY})
+        boskos = _Boskos(free=[P7])
+        with mock.patch.object(reconcile, "clock", clock), mock.patch.object(boskos_pool.urllib.request, "urlopen", boskos):
+            outcomes = reconcile.reconcile_pool(BOSKOS, OWNER, runner=tofu, known={P7}, run=reconcile.Run(budget_seconds=60, ceiling_seconds=60))
+        self.assertEqual(outcomes[P7][0], reconcile.OUTCOME_APPLIED)
+        self.assertEqual(boskos.walked, 1, "the stray check ran after the complete pass")
+
     def test_a_busy_project_is_asked_for_again_until_it_is_free(self):
         boskos = _Boskos(free=[P7])
         pauses = []

@@ -774,7 +774,8 @@ def _reached(artifact, projects: list[str]) -> bool:
 def _supersession(job: str, readings: dict[str, dict]) -> str | None:
     """How the superseding job's latest build relates to this job's failed
     one: SUPERSEDED_RECOVERY when it passed later having reached every
-    project the failed build named, at the same fleet tree, SUPERSEDED_SILENCE
+    project the failed build named (a build naming none needs a whole pass),
+    at the same fleet tree, SUPERSEDED_SILENCE
     when it failed later (its own note is the current story; nothing
     recovered), None otherwise. A later pass that never reached them (busy,
     not reached), or applied another tree, is None."""
@@ -801,7 +802,13 @@ def _supersession(job: str, readings: dict[str, dict]) -> str | None:
         # about this one; the same tree from main, or the next merge's own
         # build, does.
         return None
-    return SUPERSEDED_RECOVERY if _reached(theirs.get(KEY_ARTIFACT), _named_failures(mine.get(KEY_ARTIFACT))) else None
+    named = _named_failures(mine.get(KEY_ARTIFACT))
+    if not named:
+        # Failed above the projects (busy for its whole budget, a Boskos or
+        # mapping fault): nothing was reached, so only a whole pass at this
+        # tree has done what it did not.
+        return SUPERSEDED_RECOVERY if _whole_pass(theirs.get(KEY_ARTIFACT) or {}) else None
+    return SUPERSEDED_RECOVERY if _reached(theirs.get(KEY_ARTIFACT), named) else None
 
 
 def _fleet_tree(artifact) -> str | None:

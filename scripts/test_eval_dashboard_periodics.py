@@ -298,6 +298,14 @@ class AssessTest(unittest.TestCase):
         self.assertEqual(periodics.superseded_jobs({POST.job: failed, DAILY.job: gone})[POST.job]["recovery"], True)
         partial = self.reading(DAILY, NOW - timedelta(hours=1), artifact={"fleet_tree": "t1", "mode": "all", "visited": 1, "mapped": 2, "summary": {"converged": 1}, "outcomes": {"kube-agents-evals-3": {"outcome": "converged", "detail": ""}}})
         self.assertEqual(periodics.superseded_jobs({POST.job: failed, DAILY.job: partial}), {})
+        # A failed build that names no project (the pool busy for its whole
+        # budget, a Boskos fault before the walk) reached nothing: only a
+        # whole pass at its tree recovers it, not any pass that reached
+        # something.
+        nameless = self.reading(POST, NOW - timedelta(days=2), passed=False, artifact={"fleet_tree": "t1", "outcomes": {}})
+        self.assertEqual(periodics.superseded_jobs({POST.job: nameless, DAILY.job: reached}), {})
+        self.assertEqual(periodics.superseded_jobs({POST.job: nameless, DAILY.job: partial}), {})
+        self.assertEqual(periodics.superseded_jobs({POST.job: nameless, DAILY.job: gone})[POST.job]["recovery"], True)
         # A failed build whose report is unreadable names no project because
         # nothing can be read: no later pass recovers it, a later failed
         # daily still silences it.
@@ -409,7 +417,7 @@ class AssessTest(unittest.TestCase):
         # that did not reach every mapped project says nothing about the
         # allowlist: the projects it missed are the ones that may still need
         # the entry.
-        artifact = {"visited": 1, "mapped": 2, "outcomes": {"p1": {"outcome": "applied", "detail": "", "allowlist_unused": ["a"]}, "p2": {"outcome": "busy", "detail": ""}}}
+        artifact = {"mode": "all", "visited": 1, "mapped": 2, "outcomes": {"p1": {"outcome": "applied", "detail": "", "allowlist_unused": ["a"]}, "p2": {"outcome": "busy", "detail": ""}}}
         self.assertEqual(periodics.reconcile_detail(artifact), [])
         # A visited project whose plan was never read (failed at init) carries
         # no verdict, and that is the project that may still need the entry.
@@ -421,7 +429,7 @@ class AssessTest(unittest.TestCase):
         for mode in ("drifted", "project"):
             artifact["mode"] = mode
             self.assertEqual(periodics.reconcile_detail(artifact), [], mode)
-        self.assertEqual(periodics.reconcile_detail({"outcomes": {"p1": {"outcome": "applied", "detail": "", "allowlist_unused": ["a"]}}}), [], "no visited/mapped counts, no claim")
+        self.assertEqual(periodics.reconcile_detail({"mode": "all", "outcomes": {"p1": {"outcome": "applied", "detail": "", "allowlist_unused": ["a"]}}}), [], "no visited/mapped counts, no claim")
         # A foreign artifact with non-string entries must not kill the tick:
         # a list that is not all strings is no verdict at all.
         for odd in ([["a"]], ["a", 1], [{"x": 1}]):

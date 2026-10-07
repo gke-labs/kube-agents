@@ -1008,7 +1008,7 @@ whose latest failed build a later build of the job that supersedes them (the
 daily, for the on-merge reconcile) has dealt with: `recovery` true when the
 daily passed having reached every project the failed build named, at the same
 `fleet_tree` (a project a whole pass no longer lists has left the pool and
-counts), false when it
+counts; a failed build naming no project needs a whole pass), false when it
 failed itself, so its own note is the current story and nothing clears; `by`
 is the daily run a recovery was decided on (`build`, `finished_at`,
 `summary`), what the clear cites. A failed build whose report is absent or
