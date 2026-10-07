@@ -112,6 +112,13 @@ def matches_plant_description(description: str | None) -> bool:
     return description.strip().startswith(PLANT_DESCRIPTION_PREFIX)
 
 
+def resource_name(url_or_name: str | None) -> str:
+    """Extract trailing resource name from a full GCP URL, URI, or name."""
+    if not url_or_name or not isinstance(url_or_name, str):
+        return ""
+    return url_or_name.rstrip("/").split("/")[-1]
+
+
 def pool_projects(ci_deploy_script=CI_DEPLOY_SCRIPT) -> set[str]:
     """Set of project IDs mapped in gitops_repo_for_project() in hack/ci-deploy.sh."""
     projects = set()
@@ -160,6 +167,13 @@ def sweep_project(
 ) -> dict:
     """Sweep planted Compute resources in one project older than max_age_hours.
 
+    Gating is rooted on the VPC network: plant networks older than max_age_hours
+    are selected, and all plant subnets and addresses belonging to those networks
+    are selected regardless of their individual creation timestamp (avoiding
+    red runs when tofu apply creates the dependency chain oldest-first across
+    the age threshold). Standalone/orphaned subnets or addresses are gated by
+    their own creationTimestamp.
+
     Deletes addresses first, then subnets, then networks.
     Returns a dict with lists of deleted resources:
       {"addresses": [...], "subnets": [...], "networks": [...]}
@@ -167,29 +181,60 @@ def sweep_project(
     if now is None:
         now = datetime.now(timezone.utc)
 
-    # 1. Inspect addresses
-    raw_addresses = list_compute_resources(project, "addresses", runner=runner)
-    addresses_to_delete = [
-        addr for addr in raw_addresses
-        if matches_plant_description(addr.get("description"))
-        and is_older_than(addr.get("creationTimestamp"), max_age_hours, now=now)
-    ]
-
-    # 2. Inspect subnets
-    raw_subnets = list_compute_resources(project, "networks subnets", runner=runner)
-    subnets_to_delete = [
-        sub for sub in raw_subnets
-        if matches_plant_description(sub.get("description"))
-        and is_older_than(sub.get("creationTimestamp"), max_age_hours, now=now)
-    ]
-
-    # 3. Inspect networks
+    # 1. Inspect networks first (root of dependency chain)
     raw_networks = list_compute_resources(project, "networks", runner=runner)
     networks_to_delete = [
         net for net in raw_networks
         if matches_plant_description(net.get("description"))
         and is_older_than(net.get("creationTimestamp"), max_age_hours, now=now)
     ]
+    selected_network_names = {
+        net.get("name") for net in networks_to_delete if net.get("name")
+    }
+    raw_network_names = {
+        net.get("name") for net in raw_networks if net.get("name")
+    }
+
+    # 2. Inspect subnets
+    raw_subnets = list_compute_resources(project, "networks subnets", runner=runner)
+    subnets_to_delete = []
+    for sub in raw_subnets:
+        if not matches_plant_description(sub.get("description")):
+            continue
+        net_name = resource_name(sub.get("network"))
+        if net_name and net_name in selected_network_names:
+            subnets_to_delete.append(sub)
+        elif not net_name and is_older_than(sub.get("creationTimestamp"), max_age_hours, now=now):
+            # Standalone or mock subnets without network field
+            subnets_to_delete.append(sub)
+        elif net_name and net_name not in raw_network_names and is_older_than(sub.get("creationTimestamp"), max_age_hours, now=now):
+            # Orphaned subnet whose network was already deleted
+            subnets_to_delete.append(sub)
+
+    selected_subnet_names = {
+        sub.get("name") for sub in subnets_to_delete if sub.get("name")
+    }
+    raw_subnet_names = {
+        sub.get("name") for sub in raw_subnets if sub.get("name")
+    }
+
+    # 3. Inspect addresses
+    raw_addresses = list_compute_resources(project, "addresses", runner=runner)
+    addresses_to_delete = []
+    for addr in raw_addresses:
+        if not matches_plant_description(addr.get("description")):
+            continue
+        sub_name = resource_name(addr.get("subnetwork"))
+        net_name = resource_name(addr.get("network"))
+        if (sub_name and sub_name in selected_subnet_names) or (net_name and net_name in selected_network_names):
+            addresses_to_delete.append(addr)
+        elif not sub_name and not net_name and is_older_than(addr.get("creationTimestamp"), max_age_hours, now=now):
+            # Standalone or mock addresses without subnet/network fields
+            addresses_to_delete.append(addr)
+        elif is_older_than(addr.get("creationTimestamp"), max_age_hours, now=now):
+            # Orphaned address whose subnet/network was already deleted
+            if (not sub_name or sub_name not in raw_subnet_names) and (not net_name or net_name not in raw_network_names):
+                addresses_to_delete.append(addr)
 
     deleted = {"addresses": [], "subnets": [], "networks": []}
     failed = {"addresses": [], "subnets": [], "networks": []}
@@ -336,20 +381,15 @@ def sweep_pool(
                 }
             failures[name] = boskos_pool.describe(exc)
 
-    release_failures = {}
-    try:
-        boskos_pool.walk(
-            server,
-            owner,
-            BOSKOS_SWEEP_STATE,
-            len(projects),
-            visit,
-            heartbeat=True,
-            release_failures=release_failures,
-        )
-    finally:
-        for p, reason in release_failures.items():
-            failures[p] = f"release failed: {reason}"
+    boskos_pool.walk(
+        server,
+        owner,
+        BOSKOS_SWEEP_STATE,
+        len(projects),
+        visit,
+        heartbeat=True,
+        release_failures=failures,
+    )
 
     total_addr = sum(d.get("addresses", 0) for d in deleted.values())
     total_sub = sum(d.get("subnets", 0) for d in deleted.values())

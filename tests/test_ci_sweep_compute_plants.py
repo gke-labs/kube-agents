@@ -55,6 +55,23 @@ class MatchesPlantDescriptionTest(unittest.TestCase):
         self.assertFalse(sweep.matches_plant_description(123))  # type: ignore
 
 
+class ResourceNameTest(unittest.TestCase):
+    def test_extract_from_gcp_url(self):
+        self.assertEqual(
+            sweep.resource_name("https://www.googleapis.com/compute/v1/projects/p/global/networks/vpc-1"),
+            "vpc-1",
+        )
+        self.assertEqual(
+            sweep.resource_name("projects/p/regions/us-west4/subnetworks/sub-1"),
+            "sub-1",
+        )
+
+    def test_bare_name_and_empty(self):
+        self.assertEqual(sweep.resource_name("net-1"), "net-1")
+        self.assertEqual(sweep.resource_name(""), "")
+        self.assertEqual(sweep.resource_name(None), "")
+
+
 class TimestampAgeTest(unittest.TestCase):
     def setUp(self):
         self.now = datetime(2026, 10, 7, 12, 0, 0, tzinfo=timezone.utc)
@@ -323,6 +340,110 @@ class SweepProjectTest(unittest.TestCase):
         delete_cmds = [cmd for cmd in commands_run if "delete" in cmd]
         self.assertEqual(len(delete_cmds), 0)
 
+    def test_dependency_chain_age_skew_deletes_all_resources(self):
+        """Proves that younger addresses on an older plant network are swept together."""
+        commands_run = []
+
+        def mock_runner(cmd, capture_output=True, text=True, check=False):
+            commands_run.append(cmd)
+            if "list" in cmd:
+                if "networks" in cmd and "subnets" not in cmd:
+                    return mock.Mock(
+                        returncode=0,
+                        stdout=json.dumps([{
+                            "name": "bench-vpc-skew",
+                            "description": self.plant_desc,
+                            "creationTimestamp": self.old_ts,
+                        }]),
+                        stderr="",
+                    )
+                if "subnets" in cmd:
+                    return mock.Mock(
+                        returncode=0,
+                        stdout=json.dumps([{
+                            "name": "bench-subnet-skew",
+                            "description": self.plant_desc,
+                            "creationTimestamp": self.old_ts,
+                            "network": "https://www.googleapis.com/compute/v1/projects/p/global/networks/bench-vpc-skew",
+                            "region": "https://www.googleapis.com/compute/v1/projects/p/regions/us-west4",
+                        }]),
+                        stderr="",
+                    )
+                if "addresses" in cmd:
+                    return mock.Mock(
+                        returncode=0,
+                        stdout=json.dumps([{
+                            "name": "bench-addr-skew",
+                            "description": self.plant_desc,
+                            # Created 1 hour ago (younger than 4h threshold, but belonging to old network)
+                            "creationTimestamp": self.recent_ts,
+                            "subnetwork": "https://www.googleapis.com/compute/v1/projects/p/regions/us-west4/subnetworks/bench-subnet-skew",
+                            "region": "https://www.googleapis.com/compute/v1/projects/p/regions/us-west4",
+                        }]),
+                        stderr="",
+                    )
+            return mock.Mock(returncode=0, stdout="", stderr="")
+
+        res = sweep.sweep_project("my-project", max_age_hours=4.0, runner=mock_runner, now=self.now)
+        self.assertEqual(res["addresses"], ["bench-addr-skew"])
+        self.assertEqual(res["subnets"], ["bench-subnet-skew"])
+        self.assertEqual(res["networks"], ["bench-vpc-skew"])
+
+        delete_cmds = [cmd for cmd in commands_run if "delete" in cmd]
+        self.assertEqual(len(delete_cmds), 3)
+        self.assertIn("bench-addr-skew", delete_cmds[0])
+        self.assertIn("bench-subnet-skew", delete_cmds[1])
+        self.assertIn("bench-vpc-skew", delete_cmds[2])
+
+    def test_active_network_protects_child_subnets_and_addresses(self):
+        """Proves that a recent plant network keeps its subnets and addresses intact."""
+        commands_run = []
+
+        def mock_runner(cmd, capture_output=True, text=True, check=False):
+            commands_run.append(cmd)
+            if "list" in cmd:
+                if "networks" in cmd and "subnets" not in cmd:
+                    return mock.Mock(
+                        returncode=0,
+                        stdout=json.dumps([{
+                            "name": "active-vpc",
+                            "description": self.plant_desc,
+                            "creationTimestamp": self.recent_ts,
+                        }]),
+                        stderr="",
+                    )
+                if "subnets" in cmd:
+                    return mock.Mock(
+                        returncode=0,
+                        stdout=json.dumps([{
+                            "name": "active-subnet",
+                            "description": self.plant_desc,
+                            "creationTimestamp": self.recent_ts,
+                            "network": "https://www.googleapis.com/compute/v1/projects/p/global/networks/active-vpc",
+                            "region": "https://www.googleapis.com/compute/v1/projects/p/regions/us-west4",
+                        }]),
+                        stderr="",
+                    )
+                if "addresses" in cmd:
+                    return mock.Mock(
+                        returncode=0,
+                        stdout=json.dumps([{
+                            "name": "active-addr",
+                            "description": self.plant_desc,
+                            "creationTimestamp": self.recent_ts,
+                            "subnetwork": "https://www.googleapis.com/compute/v1/projects/p/regions/us-west4/subnetworks/active-subnet",
+                        }]),
+                        stderr="",
+                    )
+            return mock.Mock(returncode=0, stdout="", stderr="")
+
+        res = sweep.sweep_project("my-project", max_age_hours=4.0, runner=mock_runner, now=self.now)
+        self.assertEqual(res["addresses"], [])
+        self.assertEqual(res["subnets"], [])
+        self.assertEqual(res["networks"], [])
+        delete_cmds = [cmd for cmd in commands_run if "delete" in cmd]
+        self.assertEqual(len(delete_cmds), 0)
+
     def test_delete_failure_raises_sweep_error_at_end(self):
         def mock_runner(cmd, capture_output=True, text=True, check=False):
             if "list" in cmd and "addresses" in cmd:
@@ -472,6 +593,39 @@ class SweepPoolTest(unittest.TestCase):
             self.assertEqual(report.get("ended_early"), "signal 15")
             self.assertEqual(report.get("failures", {}).get("proj-1"), "signal 15")
 
+    def test_sweep_pool_release_failure_joins_with_sweep_failure_without_prefix_doubling(self):
+        def fake_walk(server, owner, state, limit, visit_callback, heartbeat=True, release_failures=None):
+            visit_callback("proj-1")
+            if release_failures is not None:
+                before = release_failures.get("proj-1")
+                release_failures["proj-1"] = ("%s; " % before if before else "") + "release failed: HTTP 500"
+
+        def fake_sweep_project(name, max_age_hours=4.0, dry_run=False, runner=None, now=None):
+            raise sweep.SweepError(
+                "proj-1: networks: net-1 (inUse)",
+                deleted={"addresses": ["addr-1"], "subnets": [], "networks": []},
+            )
+
+        with (
+            mock.patch.object(sweep.boskos_pool, "walk", side_effect=fake_walk),
+            mock.patch.object(sweep, "boskos_reset_stranded"),
+            mock.patch.object(sweep, "sweep_project", side_effect=fake_sweep_project),
+        ):
+            report = {}
+            deleted, failures, unmapped = sweep.sweep_pool(
+                "http://fake-boskos",
+                "test-owner",
+                4.0,
+                {"proj-1"},
+                report=report,
+            )
+            self.assertIn("proj-1", failures)
+            self.assertEqual(
+                failures["proj-1"],
+                "proj-1: networks: net-1 (inUse); release failed: HTTP 500",
+            )
+            self.assertNotIn("release failed: release failed:", failures["proj-1"])
+
 
 class WriteReportTest(unittest.TestCase):
     def test_report_structure(self):
@@ -510,9 +664,34 @@ class MainCliTest(unittest.TestCase):
             mock.patch.object(sweep, "sweep_project", return_value={"addresses": [], "subnets": [], "networks": []}),
         ):
             sweep.main(["--project", "p1"])
-            installed_sigs = [call.args[0] for call in mock_signal.call_args_list]
+            installed = {call.args[0]: call.args[1] for call in mock_signal.call_args_list}
             for sig in sweep.boskos_pool.TERMINATION_SIGNALS:
-                self.assertIn(sig, installed_sigs)
+                self.assertIs(installed.get(sig), sweep.boskos_pool.terminate)
+
+    def test_pool_walk_termination_releases_held_project_and_exits_143(self):
+        """Proves that a termination during pool walk releases the held project and exits 143."""
+        with tempfile.NamedTemporaryFile("w", delete=False) as tf:
+            report_path = tf.name
+
+        try:
+            with (
+                mock.patch.object(sweep, "pool_projects", return_value={"p1"}),
+                mock.patch.object(sweep, "boskos_reset_stranded"),
+                mock.patch.object(sweep.boskos_pool, "acquire", return_value="p1"),
+                mock.patch.object(sweep.boskos_pool, "release_settled") as mock_release_settled,
+                mock.patch.object(sweep, "sweep_project", side_effect=sweep.Terminated("signal 15")),
+            ):
+                code = sweep.main(["--pool", "--report", report_path])
+                self.assertEqual(code, sweep.TERMINATED_EXIT_CODE)
+                mock_release_settled.assert_called_once()
+                self.assertEqual(mock_release_settled.call_args[0][2], "p1")
+                data = json.loads(pathlib.Path(report_path).read_text(encoding="utf-8"))
+                self.assertEqual(data["exit"], "terminated")
+                self.assertEqual(data["exit_code"], sweep.TERMINATED_EXIT_CODE)
+                self.assertEqual(data["ended_early"], "signal 15")
+                self.assertEqual(data["failures"]["p1"], "signal 15")
+        finally:
+            pathlib.Path(report_path).unlink(missing_ok=True)
 
     def test_boskos_env_defaults(self):
         env = {"BOSKOS_SERVER": "http://env-boskos:8888", "BOSKOS_OWNER": "env-owner-user"}
