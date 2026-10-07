@@ -201,8 +201,9 @@ class TestUntargetedComputeClassWorkload(unittest.TestCase):
             labels={"accelerator": "nvidia-t4"},
             taints=[{"key": "nvidia.com/gpu", "value": "present", "effect": "NO_SCHEDULE"}],
         )
+        # Admission injects toleration for positive GPU resource limits
         wl = collect.normalize_workloads({
-            "items": [deployment("gpu-worker", tolerations=[{"key": "nvidia.com/gpu", "operator": "Exists"}])]
+            "items": [deployment("gpu-worker", resources={"limits": {"nvidia.com/gpu": "1"}}, tolerations=[])]
         })[0]
         ctx = {
             "compute_classes": [self.cc],
@@ -212,6 +213,72 @@ class TestUntargetedComputeClassWorkload(unittest.TestCase):
         }
         hit = collect.check_untargeted_compute_class_workload(wl, ctx)
         self.assertIsNone(hit)
+
+    def test_negative_workload_with_arm64_selector_tolerates_arm_tainted_pool(self):
+        arm_pool = pool(
+            "arm-pool",
+            taints=[{"key": "kubernetes.io/arch", "value": "arm64", "effect": "NO_SCHEDULE"}],
+        )
+        wl = collect.normalize_workloads({
+            "items": [deployment("arm-worker", node_selector={"kubernetes.io/arch": "arm64"}, tolerations=[])]
+        })[0]
+        ctx = {
+            "compute_classes": [self.cc],
+            "node_pools": [self.base_pool, arm_pool],
+            "namespaces": [self.ns],
+            "nodes": [self.base_node, node("node-arm", labels={"cloud.google.com/gke-nodepool": "arm-pool"})],
+        }
+        hit = collect.check_untargeted_compute_class_workload(wl, ctx)
+        self.assertIsNone(hit)
+
+    def test_negative_workload_with_arm64_affinity_tolerates_arm_tainted_pool(self):
+        arm_pool = pool(
+            "arm-pool",
+            taints=[{"key": "kubernetes.io/arch", "value": "arm64", "effect": "NO_SCHEDULE"}],
+        )
+        wl = collect.normalize_workloads({
+            "items": [deployment(
+                "arm-affinity-worker",
+                node_affinity={
+                    "requiredDuringSchedulingIgnoredDuringExecution": {
+                        "nodeSelectorTerms": [{
+                            "matchExpressions": [{
+                                "key": "kubernetes.io/arch",
+                                "operator": "In",
+                                "values": ["arm64"],
+                            }]
+                        }]
+                    }
+                },
+                tolerations=[],
+            )]
+        })[0]
+        ctx = {
+            "compute_classes": [self.cc],
+            "node_pools": [self.base_pool, arm_pool],
+            "namespaces": [self.ns],
+            "nodes": [self.base_node, node("node-arm", labels={"cloud.google.com/gke-nodepool": "arm-pool"})],
+        }
+        hit = collect.check_untargeted_compute_class_workload(wl, ctx)
+        self.assertIsNone(hit)
+
+    def test_positive_workload_with_amd64_selector_does_not_tolerate_arm_tainted_pool(self):
+        arm_pool = pool(
+            "arm-pool",
+            taints=[{"key": "kubernetes.io/arch", "value": "arm64", "effect": "NO_SCHEDULE"}],
+        )
+        wl = collect.normalize_workloads({
+            "items": [deployment("amd-worker", node_selector={"kubernetes.io/arch": "amd64"}, tolerations=[])]
+        })[0]
+        ctx = {
+            "compute_classes": [self.cc],
+            "node_pools": [self.base_pool, arm_pool],
+            "namespaces": [self.ns],
+            "nodes": [self.base_node, node("node-arm", labels={"cloud.google.com/gke-nodepool": "arm-pool"})],
+        }
+        hit = collect.check_untargeted_compute_class_workload(wl, ctx)
+        self.assertIsNotNone(hit)
+        self.assertIn("(manual remediation: workload has scheduling constraints)", hit["excerpt"])
 
     def test_negative_cluster_with_untainted_nodes_lacking_compute_class(self):
         general_pool = pool("standard-pool", labels={"node-role": "worker"}, taints=[])
@@ -1156,6 +1223,9 @@ class TestUntargetedComputeClassWorkload(unittest.TestCase):
                 )
                 self.assertNotIn("untargeted-compute-class-workload", cc_context.commands)
                 self.assertIn("untargeted-compute-class-workload", cc_context.context.get("unevaluated", {}))
+                reason = cc_context.context.get("unevaluated", {}).get("untargeted-compute-class-workload", "")
+                self.assertIn("returned output that is not a ComputeClass list (rc=0)", reason)
+                self.assertNotIn("exited 0", reason)
 
     def test_collect_obtainability_node_pools_rc0_empty_stdout_reports_not_json_list(self):
         # rc=0 with empty/truncated stdout reports 'returned output that is not a JSON list', not 'exited 0'

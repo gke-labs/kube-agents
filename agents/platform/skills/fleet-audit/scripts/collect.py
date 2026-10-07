@@ -3970,11 +3970,31 @@ def check_untargeted_compute_class_workload(workload: dict, context: dict) -> di
         for block in (resources.get("requests") or {}, resources.get("limits") or {}):
             for res_name in block:
                 if res_name in ("nvidia.com/gpu", "google.com/tpu"):
-                    pod_tolerations.append({"key": res_name, "operator": "Exists"})
+                    if _is_positive_resource_quantity(block.get(res_name)):
+                        pod_tolerations.append({"key": res_name, "operator": "Exists"})
     node_sel = template.get("nodeSelector") or {}
+    is_arm64 = False
     for arch_key in ("kubernetes.io/arch", "beta.kubernetes.io/arch"):
-        if arch_key in node_sel:
-            pod_tolerations.append({"key": "kubernetes.io/arch", "operator": "Exists"})
+        if node_sel.get(arch_key) == "arm64":
+            is_arm64 = True
+            break
+    if not is_arm64:
+        affinity = template.get("affinity") or {}
+        node_affinity = affinity.get("nodeAffinity") or {}
+        required = node_affinity.get("requiredDuringSchedulingIgnoredDuringExecution") or {}
+        for term in required.get("nodeSelectorTerms") or []:
+            for expr in term.get("matchExpressions") or []:
+                if (
+                    expr.get("key") in ("kubernetes.io/arch", "beta.kubernetes.io/arch")
+                    and expr.get("operator") in ("In", "Equal")
+                    and "arm64" in (expr.get("values") or [])
+                ):
+                    is_arm64 = True
+                    break
+            if is_arm64:
+                break
+    if is_arm64:
+        pod_tolerations.append({"key": "kubernetes.io/arch", "operator": "Equal", "value": "arm64"})
     if non_cc_pools and any(_tolerates_pool(pod_tolerations, p) for p in non_cc_pools):
         return None
 
@@ -7628,10 +7648,15 @@ def _collect_obtainability(cluster: dict, kubeconfig: Path, checks: tuple[CheckS
     else:
         commands.pop("untargeted-compute-class-workload", None)
         stderr = cc_result.stderr.strip()[:ERROR_EXCERPT_CHARS] or "no stderr"
+        what = (
+            f"exited {cc_result.rc} without saying the type is unserved"
+            if cc_result.rc != 0
+            else "returned output that is not a ComputeClass list (rc=0)"
+        )
         context.setdefault("unevaluated", {})["untargeted-compute-class-workload"] = (
-            f"{UNDETERMINED_PREFIX} `kubectl get computeclasses -A` exited {cc_result.rc} "
-            f"without saying the type is unserved ({stderr}), so whether ComputeClasses "
-            "are configured was not established. This check cleared nothing on this cluster."
+            f"{UNDETERMINED_PREFIX} `kubectl get computeclasses -A` {what} "
+            f"({stderr}), so whether ComputeClasses are configured was not established. "
+            "This check cleared nothing on this cluster."
         )
 
     return CollectedContext(context, workloads, commands)
