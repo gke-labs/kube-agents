@@ -57,6 +57,20 @@ class C1IsolationIsStructural(unittest.TestCase):
         {"envoy-credential-proxy", "agent-api-proxy", "credential-broker"}
     )
 
+    def _one_match(self, pattern: str, text: str, what: str) -> str:
+        """The one match of pattern in text, failing unless there is exactly one.
+
+        Zero matches means the anchor moved and the comparison it feeds would
+        compare nothing; two means the test cannot tell which one is meant.
+        """
+        found = re.findall(pattern, text)
+        self.assertEqual(
+            len(found),
+            1,
+            "%s is not a single match (%d); this test compared nothing" % (what, len(found)),
+        )
+        return found[0]
+
     def test_C1_the_sandbox_identity_carries_no_cloud_annotation(self) -> None:
         """The sharpest assertion in this set after #913, and the one F10 owns.
 
@@ -926,19 +940,9 @@ class C1IsolationIsStructural(unittest.TestCase):
         api = h.text("operator_bus_api")
         library = h.text("a2a_bus_credentials")
 
-        def one(pattern: str, text: str, what: str) -> str:
-            found = re.findall(pattern, text)
-            self.assertEqual(
-                len(found),
-                1,
-                "%s is not a single string constant (%d matches); this test "
-                "compared nothing" % (what, len(found)),
-            )
-            return found[0]
-
-        mount = one(r'a2aBusTokenPath\s*=\s*"([^"]+)"', operator, "a2aBusTokenPath")
-        filename = one(r'a2aBusTokenFile\s*=\s*"([^"]+)"', operator, "a2aBusTokenFile")
-        reader = one(r'BusTokenPath\s*=\s*"([^"]+)"', library, "lib.BusTokenPath")
+        mount = self._one_match(r'a2aBusTokenPath\s*=\s*"([^"]+)"', operator, "a2aBusTokenPath")
+        filename = self._one_match(r'a2aBusTokenFile\s*=\s*"([^"]+)"', operator, "a2aBusTokenFile")
+        reader = self._one_match(r'BusTokenPath\s*=\s*"([^"]+)"', library, "lib.BusTokenPath")
 
         self.assertEqual(
             mount.rstrip("/") + "/" + filename,
@@ -956,10 +960,10 @@ class C1IsolationIsStructural(unittest.TestCase):
         # spelling, which is what keeps the literal read here the one the
         # kubelet actually mints under. Comparing the controller constant to
         # the API constant instead would be the same value twice.
-        rendered_audience = one(
+        rendered_audience = self._one_match(
             r'A2ABusTokenAudience\s*=\s*"([^"]+)"', api, "A2ABusTokenAudience"
         )
-        controller_audience = one(
+        controller_audience = self._one_match(
             r"a2aBusTokenAudience\s*=\s*(\S+)", operator, "the controller's audience"
         )
         self.assertEqual(
@@ -970,7 +974,7 @@ class C1IsolationIsStructural(unittest.TestCase):
             "compared is not the one the projection mints under"
             % controller_audience,
         )
-        demanded_audience = one(
+        demanded_audience = self._one_match(
             r'BusTokenAudience\s*=\s*"([^"]+)"', library, "lib.BusTokenAudience"
         )
         self.assertEqual(
@@ -1033,19 +1037,10 @@ class C1IsolationIsStructural(unittest.TestCase):
         a2a_manifests = h.text("a2a_session_fence")
         spawner = h.text("a2a_spawner")
         config = h.text("a2a_gateway_config")
-        def one(pattern: str, text: str, what: str) -> str:
-            found = re.findall(pattern, text)
-            self.assertEqual(
-                len(found),
-                1,
-                "%s is not a single match (%d); this test compared nothing" % (what, len(found)),
-            )
-            return found[0]
-
-        rendered = one(
+        rendered = self._one_match(
             r'credentialProxySessionAudience\s*=\s*"([^"]+)"', operator, "the operator's session audience"
         )
-        projected = one(
+        projected = self._one_match(
             r'credentialProxySessionAudience\s*=\s*"([^"]+)"', spawner, "the spawner's session audience"
         )
         self.assertEqual(
@@ -1057,12 +1052,12 @@ class C1IsolationIsStructural(unittest.TestCase):
         )
         # Both halves use their constant where it matters, so the equality
         # above is about the strings that actually flow.
-        one(
+        self._one_match(
             r'Name:\s*"CREDENTIAL_PROXY_SESSION_AUDIENCE",\s*Value:\s*credentialProxySessionAudience',
             manifests,
             "the broker env render of the session audience",
         )
-        one(
+        self._one_match(
             r"Audience:\s+credentialProxySessionAudience,",
             spawner,
             "the spawner's projection of the session audience",
@@ -1070,8 +1065,8 @@ class C1IsolationIsStructural(unittest.TestCase):
 
         for name in ("A2A_SESSION_CLUSTER_VIEW", "A2A_CREDENTIAL_PROXY_URL"):
             with self.subTest(env=name):
-                one(r'Name:\s*"%s"' % name, a2a_manifests, "the operator's render of %s" % name)
-                one(r'os\.Getenv\("%s"\)' % name, config, "the gateway's read of %s" % name)
+                self._one_match(r'Name:\s*"%s"' % name, a2a_manifests, "the operator's render of %s" % name)
+                self._one_match(r'os\.Getenv\("%s"\)' % name, config, "the gateway's read of %s" % name)
 
         # The shim's half: the spawner sets three names and the client reads
         # three names, in a Go module and a Python script that share nothing.
@@ -1081,7 +1076,7 @@ class C1IsolationIsStructural(unittest.TestCase):
         shim = h.text("credential_proxy_client")
         for name in ("CREDENTIAL_PROXY_URL", "CREDENTIAL_PROXY_TOKEN_FILE", "HERMES_HOME"):
             with self.subTest(env=name):
-                one(r'Name:\s*"%s"' % name, spawner, "the spawner's render of %s" % name)
+                self._one_match(r'Name:\s*"%s"' % name, spawner, "the spawner's render of %s" % name)
                 self.assertTrue(
                     re.search(r'environ(?:\.get)?\(\s*"%s"' % name, shim) or re.search(r'getenv\(\s*"%s"' % name, shim),
                     "the shim no longer reads %s by that name" % name,
@@ -1103,30 +1098,21 @@ class C1IsolationIsStructural(unittest.TestCase):
         a2a_manifests = h.text("a2a_session_fence")
         allowlist = h.text("a2a_gateway_allowlist")
 
-        def one(pattern: str, text: str, what: str) -> str:
-            found = re.findall(pattern, text)
-            self.assertEqual(
-                len(found),
-                1,
-                "%s is not a single match (%d); this test compared nothing" % (what, len(found)),
-            )
-            return found[0]
-
         for const, env in (
             ("a2aTargetAllowedUsersGchatEnvVar", "EnvTargetAllowedUsersGchat"),
             ("a2aTargetAllowedUsersSlackEnvVar", "EnvTargetAllowedUsersSlack"),
         ):
             with self.subTest(pair=const):
-                rendered = one(r'%s\s*=\s*"([^"]+)"' % const, a2a_manifests, "the operator's %s" % const)
-                read = one(r'%s\s*=\s*"([^"]+)"' % env, allowlist, "the gateway's %s" % env)
+                rendered = self._one_match(r'%s\s*=\s*"([^"]+)"' % const, a2a_manifests, "the operator's %s" % const)
+                read = self._one_match(r'%s\s*=\s*"([^"]+)"' % env, allowlist, "the gateway's %s" % env)
                 self.assertEqual(
                     rendered,
                     read,
                     "the operator renders %r and the gateway reads %r: every delegation "
                     "is allowed on an install whose Go suites are green" % (rendered, read),
                 )
-                one(r"Name:\s*%s," % const, a2a_manifests, "the operator's render of %s" % const)
-                one(r"os\.(?:Getenv|LookupEnv)\(%s\)" % env, allowlist + h.text("a2a_gateway_config"), "the gateway's read of %s" % env)
+                self._one_match(r"Name:\s*%s," % const, a2a_manifests, "the operator's render of %s" % const)
+                self._one_match(r"os\.(?:Getenv|LookupEnv)\(%s\)" % env, allowlist + h.text("a2a_gateway_config"), "the gateway's read of %s" % env)
 
         # The absent-list branch is allow, stated in the function that answers.
         body = h.go_function_body(allowlist, "targetAllows")

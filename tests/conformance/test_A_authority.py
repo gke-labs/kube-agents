@@ -889,9 +889,10 @@ class A3TheTaskPlaneSubjectSaysWhoWroteIt(unittest.TestCase):
         `_session_publish_derivation` above reads only the function's initial
         `Publish: []string{...}` literal, because that is where the per-task
         wildcard mutation it exists to catch would land. It is blind to
-        anything appended to `g.Publish` afterward -- and the delegation
-        primitive's own grants (the capability verify subject, the inbox) are
-        built exactly that way. A line like
+        anything appended to `g.Publish` afterward -- and the per-session
+        consumer API grants and the capability path (the verify subject and
+        its reply namespace) are built exactly that way. None of those is the
+        delegation primitive's: delegation adds no session grant. A line like
         `g.Publish = append(g.Publish, lib.TaskInSubject("platform", "*"))`
         would hand the session a requester's grant on another addressee's
         task -- it could mint or steer that addressee's tasks as if from the
