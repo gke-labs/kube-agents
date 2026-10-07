@@ -353,7 +353,10 @@ grace period, and the adapter MUST trap it: flush the pending output buffer, pub
 terminal `failed` with `reason: worker-evicted`, exit 143. That keeps an infrastructure
 eviction distinguishable from an agent crash in the audit trail and in the breaker's
 failure classes - the same infra-vs-agent distinction the kanban board's forgiveness
-classes draw today.
+classes draw today. The one exception is a turn that has already delegated: its
+deliverable is decided (the one-line "delegated to" result), and the gateway retiring its
+pod for the wake is expected, so the adapter publishes `completed` with that result
+and exits 0 instead.
 
 **Orphaned.** A worker can die without a terminal event - OOM, node loss, image bug.
 The dispatcher doubles as the janitor: it watches the Jobs it created, and when a Job
