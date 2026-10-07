@@ -229,9 +229,9 @@ Four ways a workload breaks on a new version:
   selector can match `kube-system` or a cluster-scoped object can block the control plane's own
   writes during an upgrade, not just the pods being moved. Report the backend too — one replica with
   no liveness probe is what turns a slow webhook into a stuck one. `--readiness` already grades the
-  case where the backend is unreachable now, on the webhook's rules (pods with their binding,
-  status, eviction and token requests, nodes and their status, bootstrap certificate requests
-  with their approval and signing, CSINodes, leases and volume attachments); the selectors,
+  case where the backend is unreachable now, on the webhook's rules (the writes a node drain and a
+  node join make, listed with their sources as `UPGRADE_PATH_TARGETS` in
+  `agents/platform/skills/fleet-upgrade-verification/scripts/upgrade_readiness.py`); the selectors,
   `kube-system` reach and the
   would-fail-once-drained backend are still
   unread.

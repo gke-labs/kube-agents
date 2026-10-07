@@ -533,9 +533,79 @@ class WebhookScopeTest(unittest.TestCase):
         self.assertEqual(self._path([rule(["certificatesigningrequests/status"], operations=("UPDATE",), groups=("certificates.k8s.io",))]), ["UPDATE certificatesigningrequests/status"])
         self.assertEqual(self._path([rule(["certificatesigningrequests/*"], operations=("UPDATE",), groups=("certificates.k8s.io",))]), ["UPDATE certificatesigningrequests/approval", "UPDATE certificatesigningrequests/status"])
         self.assertEqual(self._path([rule(["certificatesigningrequests"], operations=("UPDATE",), groups=("certificates.k8s.io",))]), [])  # the object, not its subresources
-        # The CSINode the kubelet creates before it reports Ready.
-        self.assertEqual(self._path([rule(["csinodes"], groups=("storage.k8s.io",))]), ["CREATE csinodes"])
-        self.assertEqual(self._path([rule(["volumeattachments"], groups=("storage.k8s.io",))]), ["CREATE volumeattachments"])
+        # The eviction handler's budget-status write: the subresource, not the object.
+        self.assertEqual(self._path([rule(["poddisruptionbudgets/status"], operations=("UPDATE",), groups=("policy",))]), ["UPDATE poddisruptionbudgets/status"])
+        self.assertEqual(self._path([rule(["poddisruptionbudgets"], operations=("UPDATE",), groups=("policy",))]), [])
+        # The CSINode the kubelet creates before it reports Ready and updates as drivers register;
+        # its deletion is the garbage collector's, after the node is gone, and is not in the path.
+        self.assertEqual(self._path([rule(["csinodes"], operations=("CREATE", "UPDATE", "DELETE"), groups=("storage.k8s.io",))]), ["CREATE csinodes", "UPDATE csinodes"])
+        # The attachment's create and delete by the attach-detach controller, the external-attacher's
+        # finalizer and status writes, and its finalizer on the PersistentVolume.
+        self.assertEqual(self._path([rule(["volumeattachments"], operations=("CREATE", "UPDATE", "DELETE"), groups=("storage.k8s.io",))]), ["CREATE volumeattachments", "UPDATE volumeattachments", "DELETE volumeattachments"])
+        self.assertEqual(self._path([rule(["volumeattachments/status"], operations=("UPDATE",), groups=("storage.k8s.io",))]), ["UPDATE volumeattachments/status"])
+        self.assertEqual(self._path([rule(["volumeattachments/*"], operations=("UPDATE",), groups=("storage.k8s.io",))]), ["UPDATE volumeattachments", "UPDATE volumeattachments/status"])
+        self.assertEqual(self._path([rule(["persistentvolumes"], operations=("UPDATE",))]), ["UPDATE persistentvolumes"])
+        self.assertEqual(self._path([rule(["persistentvolumeclaims"], operations=("UPDATE",))]), [])
+        # Weighed and left off: events are dropped when they cannot be written, and Service routing
+        # is nothing the drain or the join waits on.
+        self.assertEqual(self._path([rule(["events"], operations=("CREATE", "UPDATE"))]), [])
+        self.assertEqual(self._path([rule(["events"], operations=("CREATE",), groups=("events.k8s.io",))]), [])
+        self.assertEqual(self._path([rule(["endpoints"], operations=("CREATE", "UPDATE"))]), [])
+        self.assertEqual(self._path([rule(["endpointslices"], operations=("CREATE", "UPDATE", "DELETE"), groups=("discovery.k8s.io",))]), [])
+
+    def test_the_upgrade_path_list_is_pinned(self):
+        # The one home of the list; a change here is a change to what the rule grades, and the
+        # module's comments carry the source of every row.
+        self.assertEqual(r.UPGRADE_PATH_TARGETS, (
+            ("", "pods/eviction", "CREATE", "Namespaced"),
+            ("policy", "poddisruptionbudgets/status", "UPDATE", "Namespaced"),
+            ("", "pods/status", "UPDATE", "Namespaced"),
+            ("", "pods", "DELETE", "Namespaced"),
+            ("", "pods", "CREATE", "Namespaced"),
+            ("", "pods/binding", "CREATE", "Namespaced"),
+            ("", "serviceaccounts/token", "CREATE", "Namespaced"),
+            ("", "nodes", "CREATE", "Cluster"),
+            ("", "nodes", "UPDATE", "Cluster"),
+            ("", "nodes/status", "UPDATE", "Cluster"),
+            ("", "nodes", "DELETE", "Cluster"),
+            ("coordination.k8s.io", "leases", "CREATE", "Namespaced"),
+            ("coordination.k8s.io", "leases", "UPDATE", "Namespaced"),
+            ("certificates.k8s.io", "certificatesigningrequests", "CREATE", "Cluster"),
+            ("certificates.k8s.io", "certificatesigningrequests/approval", "UPDATE", "Cluster"),
+            ("certificates.k8s.io", "certificatesigningrequests/status", "UPDATE", "Cluster"),
+            ("storage.k8s.io", "csinodes", "CREATE", "Cluster"),
+            ("storage.k8s.io", "csinodes", "UPDATE", "Cluster"),
+            ("storage.k8s.io", "volumeattachments", "CREATE", "Cluster"),
+            ("storage.k8s.io", "volumeattachments", "UPDATE", "Cluster"),
+            ("storage.k8s.io", "volumeattachments/status", "UPDATE", "Cluster"),
+            ("storage.k8s.io", "volumeattachments", "DELETE", "Cluster"),
+            ("", "persistentvolumes", "UPDATE", "Cluster"),
+        ))
+        self.assertEqual(len(set(r.UPGRADE_PATH_TARGETS)), len(r.UPGRADE_PATH_TARGETS))
+
+    def _each_alone_blocks(self, targets):
+        # A dead fail-closed gate whose one rule names exactly one target: blocked on that
+        # target alone, with nothing in the outage bucket.
+        for group, resource, operation, scope in targets:
+            with self.subTest(group=group, resource=resource, operation=operation):
+                graded = grade([hook("one.example.com", [rule([resource], operations=(operation,), groups=(group,), scope=scope)], policy="Fail")])
+                self.assertEqual([f["upgrade_path"] for f in graded["blocking"]], [[f"{operation} {resource}"]])
+                self.assertEqual(graded["outage"], [])
+
+    def test_a_gate_on_each_drain_write_alone_blocks(self):
+        self._each_alone_blocks(r.UPGRADE_PATH_DRAIN)
+
+    def test_a_gate_on_each_replacement_pod_write_alone_blocks(self):
+        self._each_alone_blocks(r.UPGRADE_PATH_REPLACEMENT_PODS)
+
+    def test_a_gate_on_each_node_write_alone_blocks(self):
+        self._each_alone_blocks(r.UPGRADE_PATH_NODES)
+
+    def test_a_gate_on_each_kubelet_identity_write_alone_blocks(self):
+        self._each_alone_blocks(r.UPGRADE_PATH_KUBELET_IDENTITY)
+
+    def test_a_gate_on_each_storage_write_alone_blocks(self):
+        self._each_alone_blocks(r.UPGRADE_PATH_STORAGE)
 
     def test_a_gate_on_csinodes_or_csr_approval_alone_blocks(self):
         # A new node stays NotReady without its CSINode; a bootstrap CSR nobody can approve or
@@ -561,9 +631,9 @@ class WebhookScopeTest(unittest.TestCase):
 
     def test_resource_wildcards(self):
         self.assertEqual(self._path([rule(["*"])]), ["CREATE pods", "CREATE nodes"])  # `*` covers resources, not subresources
-        self.assertEqual(self._path([rule(["*/*"])]), ["CREATE pods", "CREATE pods/binding", "CREATE pods/eviction", "CREATE nodes", "CREATE serviceaccounts/token"])
+        self.assertEqual(self._path([rule(["*/*"])]), ["CREATE pods/eviction", "CREATE pods", "CREATE pods/binding", "CREATE serviceaccounts/token", "CREATE nodes"])
         # `pods/*` is pods and its subresources, as the API server reads a `*` subresource.
-        self.assertEqual(self._path([rule(["pods/*"])]), ["CREATE pods", "CREATE pods/binding", "CREATE pods/eviction"])
+        self.assertEqual(self._path([rule(["pods/*"])]), ["CREATE pods/eviction", "CREATE pods", "CREATE pods/binding"])
         self.assertEqual(self._path([rule(["pods/*"], operations=("DELETE",))]), ["DELETE pods"])
         self.assertEqual(self._path([rule(["nodes/*"], operations=("CREATE", "UPDATE", "DELETE"))]), ["CREATE nodes", "UPDATE nodes", "UPDATE nodes/status", "DELETE nodes"])
         # A gate on `leases/*` with a dead backend refuses every kubelet heartbeat: a blocker, not an outage.
@@ -594,9 +664,9 @@ class WebhookScopeTest(unittest.TestCase):
 
     def test_operation_group_and_scope_must_all_match(self):
         self.assertEqual(self._path([rule(["pods"], operations=("UPDATE",))]), [])
-        self.assertEqual(self._path([rule(["pods"], operations=("*",))]), ["CREATE pods", "DELETE pods"])
+        self.assertEqual(self._path([rule(["pods"], operations=("*",))]), ["DELETE pods", "CREATE pods"])
         self.assertEqual(self._path([rule(["pods"], groups=("apps",))]), [])
-        self.assertEqual(self._path([rule(["*"], groups=("*",), operations=("*",))]), ["CREATE pods", "DELETE pods", "CREATE nodes", "UPDATE nodes", "DELETE nodes", "CREATE leases", "UPDATE leases", "CREATE certificatesigningrequests", "CREATE csinodes", "CREATE volumeattachments"])
+        self.assertEqual(self._path([rule(["*"], groups=("*",), operations=("*",))]), ["DELETE pods", "CREATE pods", "CREATE nodes", "UPDATE nodes", "DELETE nodes", "CREATE leases", "UPDATE leases", "CREATE certificatesigningrequests", "CREATE csinodes", "UPDATE csinodes", "CREATE volumeattachments", "UPDATE volumeattachments", "DELETE volumeattachments", "UPDATE persistentvolumes"])  # `*` is every resource and no subresource
         self.assertEqual(self._path([rule(["nodes"], scope="Namespaced")]), [])
         self.assertEqual(self._path([rule(["pods"], scope="Cluster")]), [])
 

@@ -1,9 +1,9 @@
 # The webhook source of fleet-upgrade-verification's --readiness table: a fail-closed
 # admission webhook whose backend the API server cannot reach. Such a webhook rejects every
 # request its rules match. The table grades the member blocked only when those rules reach
-# something a node upgrade needs (pods, evictions, nodes, leases, token and certificate
-# requests with their approval and signing, CSINodes, volume attachments); otherwise it names the
-# webhook as a current outage without grading on it. The upgrade-scenario campaign
+# a write a node drain or a node join makes (`UPGRADE_PATH_TARGETS` in the skill's
+# `scripts/upgrade_readiness.py` is the list, with the package behind each write); otherwise
+# it names the webhook as a current outage without grading on it. The upgrade-scenario campaign
 # reproduced the pod-gating form end to end on GKE (the drain's replacement pods refused
 # until the webhook was deleted).
 #

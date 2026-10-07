@@ -19,13 +19,11 @@ check yet and is stated here:
   a different major, blocks the control-plane upgrade until the pool moves;
 - a fail-closed admission webhook whose backend the API server cannot reach (no Service,
   no Service port for the webhook's port, or no ready endpoint behind that port), graded
-  on its rules: one that can match what a node upgrade needs (the replacement pods'
-  create, binding, status and token requests, the old pods' deletion, the eviction, the
-  nodes' create, cordon, status and deletion, the kubelet's bootstrap certificate request
-  and lease, the volume attachments a replacement pod's disks need) breaks the upgrade;
-  one that matches none of those is a current outage for what it does match and is
-  reported, not graded. The list is the rule's reading of the path, not a proof of the
-  upgrade's safety.
+  on its rules: one that can match a write a node drain or a node join makes
+  (`UPGRADE_PATH_TARGETS` below is the list, with the package behind each write) breaks
+  the upgrade; one that matches none of those is a current outage for what it does match
+  and is reported, not graded. The list is the rule's reading of the path, not a proof of
+  the upgrade's safety.
 """
 
 import re
@@ -153,47 +151,101 @@ DEFAULT_WEBHOOK_PORT = 443
 BACKEND_NO_SERVICE = "Service {service} does not exist"
 BACKEND_NO_PORT = "Service {service} has no port {port}"
 BACKEND_NO_ENDPOINTS = "Service {service} has no ready endpoints on port {port}"
-# What a node upgrade needs admitted, as (API group, resource, operation, scope). For the
-# pods: the replacement created, bound by the scheduler (`pods/binding`), its status written
-# by the kubelet (`pods/status`), and the old pod deleted once it terminates. The eviction the
-# drain issues. For the nodes: the new one registering and reporting status, the old one
-# cordoned and then deleted. The kubelet's heartbeat lease, created and renewed. The token
-# the kubelet requests for every projected service-account volume before a pod can start
-# (`serviceaccounts/token`), the certificate signing request a new node's kubelet files to
-# bootstrap its TLS identity together with its approval and its signing (the `approval` and
-# `status` subresources, written by the approver and the signer; an unsigned request leaves
-# the node without a client certificate), the CSINode the kubelet creates when it starts
-# (the kubelet holds its `Ready` condition on a storage error until the object exists, and
-# exits after about 140 s of retries), and the VolumeAttachment the attach controller
-# creates for a replacement pod's persistent disk. A rule that can match any of these puts
-# the webhook in
-# the upgrade's path; a rule that matches none of them is reported, not graded, because this
-# list is what the rule knows of the path rather than a proof the upgrade is unaffected.
+# What a node upgrade needs admitted, as (API group, resource, operation, scope): the
+# writes a node drain and a node join make through the API server, each one refused by a
+# fail-closed webhook whose backend is down, and none of which the drain or the join
+# proceeds without. This tuple is the list's one home: the docstrings, `SKILL.md`, the
+# design notes and the eval case state the rule and point here. Grouped by phase, with the
+# kubernetes package that makes each write; admission reads a PATCH as UPDATE, so UPDATE
+# covers both. A rule that can match any entry puts the webhook in the upgrade's path; a
+# rule that matches none is reported, not graded, because the list is what the rule knows
+# of the path rather than a proof the upgrade is unaffected. Weighed and left off, because
+# the upgrade completes without them: events (`client-go/tools/record` drops a record it
+# cannot write and the caller goes on); Endpoints and EndpointSlices
+# (`pkg/controller/endpointslice` repairs Service routing as pods move, and nothing the
+# drain, the node delete or the join waits on); the CSINode's deletion
+# (`pkg/controller/garbagecollector` removes it after its Node is gone, and an orphan stalls
+# nothing); PersistentVolumeClaims (a replacement pod reuses its bound claim).
 # `namespaceSelector`, `objectSelector` and `matchConditions` are not evaluated: a webhook
 # they narrow is still reported as able to match, which errs toward naming it.
 SCOPE_NAMESPACED = "Namespaced"
 SCOPE_CLUSTER = "Cluster"
 SCOPE_ANY = "*"
 WILDCARD = "*"
-UPGRADE_PATH_TARGETS = (
-    ("", "pods", "CREATE", SCOPE_NAMESPACED),
-    ("", "pods/binding", "CREATE", SCOPE_NAMESPACED),
-    ("", "pods/status", "UPDATE", SCOPE_NAMESPACED),
-    ("", "pods", "DELETE", SCOPE_NAMESPACED),
-    ("", "pods/eviction", "CREATE", SCOPE_NAMESPACED),
-    ("", "nodes", "CREATE", SCOPE_CLUSTER),
-    ("", "nodes", "UPDATE", SCOPE_CLUSTER),
-    ("", "nodes/status", "UPDATE", SCOPE_CLUSTER),
-    ("", "nodes", "DELETE", SCOPE_CLUSTER),
-    ("coordination.k8s.io", "leases", "CREATE", SCOPE_NAMESPACED),
-    ("coordination.k8s.io", "leases", "UPDATE", SCOPE_NAMESPACED),
-    ("", "serviceaccounts/token", "CREATE", SCOPE_NAMESPACED),
-    ("certificates.k8s.io", "certificatesigningrequests", "CREATE", SCOPE_CLUSTER),
-    ("certificates.k8s.io", "certificatesigningrequests/approval", "UPDATE", SCOPE_CLUSTER),
-    ("certificates.k8s.io", "certificatesigningrequests/status", "UPDATE", SCOPE_CLUSTER),
-    ("storage.k8s.io", "csinodes", "CREATE", SCOPE_CLUSTER),
-    ("storage.k8s.io", "volumeattachments", "CREATE", SCOPE_CLUSTER),
+GROUP_CORE = ""
+GROUP_POLICY = "policy"
+GROUP_COORDINATION = "coordination.k8s.io"
+GROUP_CERTIFICATES = "certificates.k8s.io"
+GROUP_STORAGE = "storage.k8s.io"
+OP_CREATE = "CREATE"
+OP_UPDATE = "UPDATE"
+OP_DELETE = "DELETE"
+# The drain. The eviction (`pkg/registry/core/pod/storage/eviction.go`), whose handler
+# decrements the budget's status before the pod goes and fails the eviction when it
+# cannot (`pkg/controller/disruption` recomputes it afterwards); the old pod's terminal
+# status and then its deletion, both by the kubelet's status manager (`pkg/kubelet/status`).
+UPGRADE_PATH_DRAIN = (
+    (GROUP_CORE, "pods/eviction", OP_CREATE, SCOPE_NAMESPACED),
+    (GROUP_POLICY, "poddisruptionbudgets/status", OP_UPDATE, SCOPE_NAMESPACED),
+    (GROUP_CORE, "pods/status", OP_UPDATE, SCOPE_NAMESPACED),
+    (GROUP_CORE, "pods", OP_DELETE, SCOPE_NAMESPACED),
 )
+# The replacement pods. Created by their controllers (`pkg/controller/replicaset`, and
+# `pkg/controller/daemon` for the new node's system pods), placed by the scheduler's
+# binding (`pkg/scheduler`), and started only once the kubelet has a token for each
+# projected service-account volume (`pkg/kubelet/token`).
+UPGRADE_PATH_REPLACEMENT_PODS = (
+    (GROUP_CORE, "pods", OP_CREATE, SCOPE_NAMESPACED),
+    (GROUP_CORE, "pods/binding", OP_CREATE, SCOPE_NAMESPACED),
+    (GROUP_CORE, "serviceaccounts/token", OP_CREATE, SCOPE_NAMESPACED),
+)
+# The nodes. The new one registers and reports status (`pkg/kubelet/kubelet_node_status.go`;
+# the attach-detach controller writes `volumesAttached` into the same status,
+# `pkg/controller/volume/attachdetach/statusupdater`); its spec is updated by the cordon
+# (`k8s.io/kubectl/pkg/drain`), by the cloud node controller that clears the
+# `uninitialized` taint (`k8s.io/cloud-provider/controllers/node`) and by the lifecycle
+# controller's taints (`pkg/controller/nodelifecycle`); the old one is deleted once its
+# VM is gone (`k8s.io/cloud-provider/controllers/nodelifecycle`). The kubelet's heartbeat
+# lease in kube-node-lease (`pkg/kubelet/nodelease`, through
+# `k8s.io/component-helpers/apimachinery/lease`) is what keeps the node Ready between
+# status reports.
+UPGRADE_PATH_NODES = (
+    (GROUP_CORE, "nodes", OP_CREATE, SCOPE_CLUSTER),
+    (GROUP_CORE, "nodes", OP_UPDATE, SCOPE_CLUSTER),
+    (GROUP_CORE, "nodes/status", OP_UPDATE, SCOPE_CLUSTER),
+    (GROUP_CORE, "nodes", OP_DELETE, SCOPE_CLUSTER),
+    (GROUP_COORDINATION, "leases", OP_CREATE, SCOPE_NAMESPACED),
+    (GROUP_COORDINATION, "leases", OP_UPDATE, SCOPE_NAMESPACED),
+)
+# The new kubelet's identity. It files a certificate signing request to bootstrap its
+# client certificate (`pkg/kubelet/certificate/bootstrap`); the approver writes the
+# `approval` subresource (`pkg/controller/certificates/approver`) and the signer the
+# `status` subresource (`pkg/controller/certificates/signer`). An unsigned request leaves
+# the node without a client certificate.
+UPGRADE_PATH_KUBELET_IDENTITY = (
+    (GROUP_CERTIFICATES, "certificatesigningrequests", OP_CREATE, SCOPE_CLUSTER),
+    (GROUP_CERTIFICATES, "certificatesigningrequests/approval", OP_UPDATE, SCOPE_CLUSTER),
+    (GROUP_CERTIFICATES, "certificatesigningrequests/status", OP_UPDATE, SCOPE_CLUSTER),
+)
+# A replacement pod's persistent disk. The kubelet creates its CSINode when it starts and
+# holds its Ready condition on the write, then updates it as each CSI driver registers
+# (`pkg/volume/csi/nodeinfomanager`); the external-attacher reads the driver's node id
+# from it. The attach-detach controller creates a VolumeAttachment for the new node and
+# deletes the drained node's (`pkg/controller/volume/attachdetach`, through
+# `pkg/volume/csi/csi_attacher.go`); a ReadWriteOnce disk attaches nowhere else until
+# that delete completes. The external-attacher (`kubernetes-csi/external-attacher`,
+# `pkg/controller/csi_handler.go`) writes its finalizer on the attachment and on the
+# PersistentVolume before it attaches, then `attached: true` into the attachment's status.
+UPGRADE_PATH_STORAGE = (
+    (GROUP_STORAGE, "csinodes", OP_CREATE, SCOPE_CLUSTER),
+    (GROUP_STORAGE, "csinodes", OP_UPDATE, SCOPE_CLUSTER),
+    (GROUP_STORAGE, "volumeattachments", OP_CREATE, SCOPE_CLUSTER),
+    (GROUP_STORAGE, "volumeattachments", OP_UPDATE, SCOPE_CLUSTER),
+    (GROUP_STORAGE, "volumeattachments/status", OP_UPDATE, SCOPE_CLUSTER),
+    (GROUP_STORAGE, "volumeattachments", OP_DELETE, SCOPE_CLUSTER),
+    (GROUP_CORE, "persistentvolumes", OP_UPDATE, SCOPE_CLUSTER),
+)
+UPGRADE_PATH_TARGETS = UPGRADE_PATH_DRAIN + UPGRADE_PATH_REPLACEMENT_PODS + UPGRADE_PATH_NODES + UPGRADE_PATH_KUBELET_IDENTITY + UPGRADE_PATH_STORAGE
 UPGRADE_PATH_LABEL = "{operation} {resource}"
 WEBHOOK_NAME_FORMAT = "{config}/{webhook}"
 WEBHOOK_SERVICE_FORMAT = "{namespace}/{name}"
@@ -757,13 +809,12 @@ def upgrade_path_matches(hook: dict) -> list[str]:
 def grade_webhooks(configs: list[dict], services: list[dict], slices: list[dict]) -> dict:
     """Fail-closed webhooks whose backend is unreachable, split by whether they break an upgrade.
 
-    `blocking`: the webhook's rules can match an operation a node upgrade needs, so the
-    upgrade cannot complete cleanly while its backend is down (replacement pods refused,
-    or left without a token or a volume, the eviction or the cordon refused, the new node
-    unable to register, get its certificate or heartbeat). `outage`: the backend is
-    unreachable but the rules match none of those; its requests fail now and the member is
-    not graded on it, with what it does match named so the operator can judge it, because
-    `UPGRADE_PATH_TARGETS` is what this rule knows of the path, not a proof of safety.
+    `blocking`: the webhook's rules can match a write in `UPGRADE_PATH_TARGETS`, one the
+    drain or the node join makes and does not proceed without, so the upgrade cannot
+    complete while its backend is down. `outage`: the backend is unreachable but the rules
+    match none of those; its requests fail now and the member is not graded on it, with
+    what it does match named so the operator can judge it, because the list is what this
+    rule knows of the path, not a proof of safety.
     Fail-open webhooks are counted
     (`fail_open`), and so are fail-closed webhooks with a URL backend (`url_backends`),
     which nothing read here can check.

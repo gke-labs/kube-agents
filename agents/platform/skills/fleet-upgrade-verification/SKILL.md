@@ -178,7 +178,7 @@ validatingwebhookconfigurations,mutatingwebhookconfigurations,services,endpoints
   when unset), or no ready endpoint sits behind that port in the Service's EndpointSlices (an
   endpoint without a `ready` condition counts as ready, as the API requires). Such a webhook
   rejects every request its rules match, and what it matches decides the grade. When a rule can
-  match something a node upgrade needs — the replacement pods' creation, scheduling (`pods/binding`), status and token requests (`serviceaccounts/token`), the old pods' deletion, the eviction the drain issues, the nodes' registration (with the kubelet's bootstrap certificate signing request, its approval and its signing, and the CSINode the kubelet creates before it reports Ready), cordon, status and deletion, the kubelet's lease, and the volume attachments a replacement pod's disks need — the
+  match a write the node drain or the node join makes through the API server — `UPGRADE_PATH_TARGETS` in `scripts/upgrade_readiness.py` is the list, grouped by phase with the kubelet or controller package behind each write — the
   member is `blocked`: the workloads it gates lose their pods on the drain and cannot get them
   back, a budget over one of them also stalls the drain, and a gate on evictions or nodes stops
   the drain itself. When no rule matches any of those, the webhook is still a current outage for
