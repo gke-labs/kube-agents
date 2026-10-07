@@ -214,12 +214,12 @@ export function parseSubject(subject: string): SubjectInfo {
   const t = subject.split(".");
   if (t[0] !== "a2a") return { plane: "other" };
   // All three classes, `supervisor` included. Nothing reads `dir`; what the
-  // rail gets out of this branch is `addressee`, and a class missing from the
-  // list falls through to `other`, where the addressee becomes "" -- so the
-  // `to`-vs-subject check (assertion 4) silently stops running on that class
-  // and a task first seen on it is filed against no addressee. The envelope
-  // is still folded either way, keyed on `taskId`, which is what makes the
-  // omission quiet.
+  // reducer gets out of this branch is `addressee`, and a class missing from
+  // the list falls through to `other`, where the addressee becomes "" -- so
+  // the `to`-vs-subject check (assertion 4) silently stops running on that
+  // class and a task first seen on it is filed against no addressee. The
+  // envelope is still folded either way, keyed on `taskId`, which is what
+  // makes the omission quiet.
   if (
     t[1] === "tasks" &&
     t.length === 5 &&
@@ -244,4 +244,39 @@ export function parseSubject(subject: string): SubjectInfo {
 export function partsText(parts: Part[] | undefined): string {
   if (!Array.isArray(parts)) return "";
   return parts.map((p) => (p && typeof p.text === "string" ? p.text : "")).join("");
+}
+
+/** The four streams the provisioning Job creates; the names are the contract. */
+export const STREAMS = ["TASKS", "DIRECTORY", "TOPICS-STATE", "TOPICS-JOURNAL"] as const;
+export type StreamName = (typeof STREAMS)[number];
+
+export interface AuthorityView {
+  backend?: string;
+  conversation?: string;
+}
+
+function stringField(obj: unknown, key: string): string | undefined {
+  if (typeof obj !== "object" || obj === null || Array.isArray(obj)) return undefined;
+  const v = (obj as Record<string, unknown>)[key];
+  return typeof v === "string" && v !== "" ? v : undefined;
+}
+
+/**
+ * The two fields the page reads from the gateway's authority block. The
+ * block is advisory (any publisher could invent one). The page displays
+ * both, and decides one thing on `conversation`: which of this tab's pending
+ * console turns a submission attaches to (model.ts). A forged block can only
+ * mislabel a line in this tab, and only TASKS writers can publish one.
+ * Everything else in it is pseudonymous hashes the page has no use for.
+ */
+export function authorityOf(env: Envelope): AuthorityView {
+  const a = env.authority;
+  if (typeof a !== "object" || a === null || Array.isArray(a)) return {};
+  const block = a as { requester?: unknown; audience?: unknown };
+  const view: AuthorityView = {};
+  const backend = stringField(block.requester, "backend");
+  const conversation = stringField(block.audience, "conversation");
+  if (backend !== undefined) view.backend = backend;
+  if (conversation !== undefined) view.conversation = conversation;
+  return view;
 }

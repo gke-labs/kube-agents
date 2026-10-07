@@ -1,0 +1,18 @@
+[
+  {
+    "name": "platform-agent/writes-mr",
+    "commit": {
+      "id": "9d96d99d7d17a64df51e6993613441d4a1329a49",
+      "committed_date": "2026-10-01T14:59:48.000+00:00"
+    },
+    "web_url": "https://gitlab.com/example-group/infra/-/tree/platform-agent/writes-mr"
+  },
+  {
+    "name": "platform-agent/writes-orphan",
+    "commit": {
+      "id": "cca1b30f1c2aa0430fbe00efafb34de3d9b81121",
+      "committed_date": "2026-10-01T14:59:50.000+00:00"
+    },
+    "web_url": "https://gitlab.com/example-group/infra/-/tree/platform-agent/writes-orphan"
+  }
+]

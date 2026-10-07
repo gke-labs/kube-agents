@@ -500,6 +500,12 @@ class NeedsYouTest(unittest.TestCase):
         self.assertEqual(settled, [b for b in blocks if b["type"] != "actions"][:-1])
         self.assertEqual(_contexts(settled), ["Two run it. Which?"])
 
+    def test_settled_ends_on_the_answered_line_when_there_is_one(self):
+        blocks, _ = m.needs_you("Which cluster?\n- seeded-a\n- seeded-b")
+        settled = m.needs_you_settled(blocks, "✓ Priya: seeded-b")
+        self.assertEqual(settled[:-1], m.needs_you_settled(blocks))
+        self.assertEqual(settled[-1], {"type": "context", "elements": [{"type": "mrkdwn", "text": "✓ Priya: seeded-b"}]})
+
     def test_settled_keeps_a_link_beside_the_choices(self):
         link = {"type": "button", "action_id": "kage.link.0", "url": "https://example.com"}
         choice = {"type": "button", "action_id": "kage_needs.choice.0"}

@@ -61,7 +61,8 @@ ever executed beside the credential.
 
 The script is `scripts/vcs.py`. Every subcommand prints one JSON object on
 stdout. `--repo` takes `owner/name` or a full URL, and the broker decides which
-forge that is.
+forge that is. On an install that serves more than one forge, `owner/name` is
+refused: name the repository by its URL.
 
 Verb names are the version-control concept; the spelling you know is an alias.
 `annotate`/`blame`, `log`/`history`, `files`/`manifest`, `grep`/`search`,
@@ -81,10 +82,10 @@ Verb names are the version-control concept; the spelling you know is an alias.
 
 ## When NOT to Use
 
-- **A repository this install does not manage.** Every verb that spends the
-  credential, `clone` and the list/view verbs included, is refused for a
-  repository outside the install's managed list, because the credential is
-  minted per repository; only `capabilities` answers for one. For "how does
+- **A repository this install does not manage.** Every verb, `clone` and the
+  list/view verbs included, is refused for a repository outside the install's
+  managed list, because the broker refuses every verb but `capabilities` for
+  one. For "how does
   upstream implement this", use **inspect-repository**.
 - **A one-off read of a large repository.** `clone` pulls a whole branch's
   history and there is no shallow option; **inspect-repository** pages a
@@ -228,9 +229,9 @@ python3 $V proposal comment 17 --body 'Rebased on main.'
   not the same answer as one that returned nothing because the file has no
   history.
 - **Say which repository and which branch** in anything you report.
-- **`capabilities` before assuming a non-GitHub forge works.** GitLab and
-  Bitbucket parse their specs and then tell you exactly what this install is
-  missing. That is the answer, not a bug to work around.
+- **`capabilities` before assuming a non-GitHub forge works.** Bitbucket, and
+  GitLab on an install that has not configured it, parse their specs and then
+  tell you exactly what this install is missing. That is the answer, not a bug to work around.
 
 ## Reference
 

@@ -23,7 +23,7 @@ If multiple repositories are registered in `$GITOPS_STATE_CONFIGMAP` (`managed_r
 
 Returns `{"issue": <int|null>, "repo":"org/repo", "workspace":"/opt/data/gitops/stockout-prevention/org__repo", "findings_path":"/opt/data/scratch/findings_stockout-prevention.json", "pending_remediation_requests":[…]}`. Keep `findings_path` and `workspace` from this call; you write into both.
 
-- `workspace` is the GitOps clone `start` made for you. The audit pod does not begin life inside a checkout, so this is the only tree that exists, and every `remediation.path` in Step 4 is resolved against it — a manifest written elsewhere is one the harness cannot find.
+- `workspace` is the GitOps clone `start` made for you. The audit pod does not begin life inside a checkout, so this is the only tree that exists, and every `remediation.path` in Step 4 is resolved against it — a manifest written elsewhere is one the harness cannot find, and for a fix the sweep would open, `finish` refuses until it is written or passed to `--decline-fix`.
 - `issue` is this stream's open ledger issue, or `null` when it has none. Either way you never create it — `finish` owns that.
 - `pending_remediation_requests` lists finding ids a repo writer asked for with a `/remediate` comment on the ledger. Write a manifest for each one while you inspect (Step 4), or the promotion fails for want of a file.
 - `start` creates and resets no branch. There is no report branch.
@@ -276,6 +276,7 @@ Each `project/<project-id>` entry is covered on the same terms. `gcloud compute 
 - Edit the manifest directly in `<workspace>`, adding the necessary fallback machine families, zones, or quota adjustments.
 - **Mandatory Remediation Comments**: For every modified line in YAML, append an inline `# Remediation: <reason>` comment.
 - Set `remediation.path` to the repo-relative file path, with `kind: manifest`.
+- `finish` opens a pull request unasked for a manifest finding graded `critical`, or `major` on `ccc-no-ondemand-floor` where the collector's candidate is at least `major`, unless the collector marked it `needs_triage` — so a missing On-Demand floor (at `major`, or `critical` for an inference workload) arrives as a pull request where the repo declares the class, and §3.11's new-ComputeClass fix, which the collector marks `needs_triage: new-computeclass`, does not. Every other `major` manifest here — a smaller replica shape, a Spot fallback, a raised zonal ceiling — waits for `/remediate`: each changes what the workload costs or where it runs.
 - Reviewers may comment `/remediate <finding-id>` or `/remediate all` on the ledger issue to promote findings into PRs.
 
 ### 5. Emit findings.json

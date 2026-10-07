@@ -55,6 +55,11 @@ import (
 // which of its three services start. See deploy/shared/start-services.sh, and
 // the design in docs/designs/agent-shell-sandboxing.md.
 
+// credentialProxyContainerName is the broker container, the one that opens the
+// credentialed and the metrics-only listeners; the usage counters poller reads
+// the metrics port off this container and no other.
+const credentialProxyContainerName = "envoy-credential-proxy" // #nosec G101 -- Container name, not a credential.
+
 const (
 	// Where the federated token and the ADC config derived from it live. Both
 	// are inside the proxy container's mount namespace and nowhere else — that
@@ -320,7 +325,7 @@ func buildCredentialProxyContainer(agent *agentv1alpha1.PlatformAgent) corev1.Co
 	// <state-dir>/workspace inside this pod's own emptyDir, which is where a
 	// `git clone` through the proxy lands and where nothing else can read it.
 	return corev1.Container{
-		Name:            "envoy-credential-proxy",
+		Name:            credentialProxyContainerName,
 		Image:           resolveCredentialProxyImage(agent.Spec.Deployment),
 		ImagePullPolicy: pullPolicy,
 		Command:         []string{"/usr/local/bin/start-services"},

@@ -1,4 +1,4 @@
 name: legacy_slash_commands
 version: 0.1.0
-description: Rewrites a typed "/hermes <subcommand>" message into the real gateway command, so commands like /hermes sethome work even when the chat app has no native slash commands registered.
+description: Rewrites a typed "/hermes <subcommand>" message into the real gateway command, so commands like /hermes sethome work even when the chat app has no native slash commands registered, and disables /undo on this profile.
 kind: standalone

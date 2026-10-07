@@ -336,7 +336,7 @@ func TestProcessBatchForwardsRecordsTheBudgetRanOutOn(t *testing.T) {
 	// being routed nowhere as another cluster's.
 	identity := clusterIdentity{Project: "example-project", Location: "us-central1", Cluster: "prod-1"}
 	var forwarded []DriftEvent
-	join := newJoiner(map[clusterIdentity]objectGetter{identity: getter}, nil, func(_ context.Context, e DriftEvent) {
+	join := newJoiner(map[clusterIdentity]objectGetter{identity: getter}, nil, nil, nil, func(_ context.Context, e DriftEvent) {
 		forwarded = append(forwarded, e)
 	})
 	// The joiner's own per-request timeout has to be the slower of the two, or

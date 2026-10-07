@@ -34,6 +34,29 @@ var testPort atomic.Int64
 
 func init() { testPort.Store(26222) }
 
+// The steer tests' stub waits for the steer itself, then for a quiet spell.
+//
+// steerArrivalWait is how long it waits for a line carrying STEERWORD. It is
+// a ceiling, not a window: a passing run reads the steer the moment it lands
+// and moves on, so the value only decides how long a genuine loss takes to
+// report. A fixed idle window measured from the opening prompt was the old
+// shape, and it flaked on slow runners whenever delivery -- or, in
+// TestSteerSurvivesTheInConsumerBeingDropped, the consumer rebuild ahead of
+// it -- took longer than the window.
+//
+// steerDuplicateDrain is the quiet spell after the steer, during which a
+// duplicate delivery would still be read and counted. That is what lets
+// "steers=1" mean exactly once, not merely at least once.
+//
+// steerTaskDeadline replaces adapterConfig's TaskDeadline in those tests: the
+// stub may legitimately run for steerArrivalWait plus steerDuplicateDrain,
+// and a deadline under that would kill it before it reports.
+const (
+	steerArrivalWait    = 30 * time.Second
+	steerDuplicateDrain = 5 * time.Second
+	steerTaskDeadline   = steerArrivalWait + steerDuplicateDrain + 15*time.Second
+)
+
 func startServerOpt(t *testing.T, withVerifier bool) string {
 	t.Helper()
 	opts := &server.Options{
@@ -187,6 +210,38 @@ func stub(t *testing.T, body string) []string {
 		t.Fatalf("write stub: %v", err)
 	}
 	return []string{"/bin/bash", path}
+}
+
+// steerCounterStub is a harness for the steer tests. It reads the opening
+// prompt, waits up to steerArrivalWait for a line carrying STEERWORD, reads
+// whatever else arrives until steerDuplicateDrain passes quietly, and then
+// answers one result per line read, the last one reporting
+// "turns=<lines> steers=<STEERWORD count>". A steer that never arrives
+// reports turns=1 steers=0 once the arrival wait runs out.
+func steerCounterStub(t *testing.T, sessionID string) []string {
+	t.Helper()
+	return stub(t, fmt.Sprintf(`
+echo '{"type":"system","subtype":"init","session_id":"%s"}'
+read first || exit 1
+count=1
+all="$first"
+while read -t %d line; do
+  count=$((count+1))
+  all="$all $line"
+  case "$line" in *STEERWORD*) break ;; esac
+done
+while read -t %d line; do
+  count=$((count+1))
+  all="$all $line"
+done
+steers=$(printf '%%s' "$all" | grep -o STEERWORD | wc -l | tr -d ' ')
+i=1
+while [ "$i" -lt "$count" ]; do
+  echo '{"type":"result","subtype":"success","result":"interim turn"}'
+  i=$((i+1))
+done
+printf '{"type":"result","subtype":"success","result":"turns=%%s steers=%%s"}\n' "$count" "$steers"
+`, sessionID, int(steerArrivalWait/time.Second), int(steerDuplicateDrain/time.Second)))
 }
 
 var gatewayParty = lib.Party{Session: "gateway", AgentType: "a2a-gateway"}
@@ -374,6 +429,7 @@ func TestLifecycle_HappyPath(t *testing.T) {
 
 	harness := stub(t, `
 echo '{"type":"system","subtype":"init","session_id":"stub-1"}'
+read first || exit 1
 echo '{"type":"assistant","message":{"content":[{"type":"thinking","thinking":"pondering buses"}]}}'
 echo '{"type":"assistant","message":{"content":[{"type":"text","text":"drafting the haiku now"},{"type":"tool_use","name":"Write","input":{"file_path":"haiku.txt"}}]}}'
 echo '{"type":"result","subtype":"success","result":"buses hum softly / envelopes drift downstream / an ack, then silence"}'
@@ -456,24 +512,9 @@ func TestAssertion21_SteerReachesStdinExactlyOnce(t *testing.T) {
 	// The stub reads its stdin (the opening prompt, then anything steered),
 	// counts lines and STEERWORD occurrences, and answers one result per
 	// turn so the adapter's turn accounting settles.
-	harness := stub(t, `
-echo '{"type":"system","subtype":"init","session_id":"stub-steer"}'
-read first || exit 1
-count=1
-all="$first"
-while read -t 3 line; do
-  count=$((count+1))
-  all="$all $line"
-done
-steers=$(printf '%s' "$all" | grep -o STEERWORD | wc -l | tr -d ' ')
-i=1
-while [ "$i" -lt "$count" ]; do
-  echo '{"type":"result","subtype":"success","result":"interim turn"}'
-  i=$((i+1))
-done
-printf '{"type":"result","subtype":"success","result":"turns=%s steers=%s"}\n' "$count" "$steers"
-`)
-	done := runAdapter(context.Background(), adapterConfig(url, taskID, session, harness))
+	cfg := adapterConfig(url, taskID, session, steerCounterStub(t, "stub-steer"))
+	cfg.TaskDeadline = steerTaskDeadline
+	done := runAdapter(context.Background(), cfg)
 	waitState(t, c, session, taskID, lib.StateWorking)
 
 	// Build one steer envelope and publish it twice with distinct JetStream
@@ -514,7 +555,7 @@ printf '{"type":"result","subtype":"success","result":"turns=%s steers=%s"}\n' "
 		}
 	}
 
-	out := waitOutcome(t, done, 45*time.Second)
+	out := waitOutcome(t, done, waitDeadline)
 	if out.err != nil || out.res.State != lib.StateCompleted {
 		t.Fatalf("run: state=%q err=%v", out.res.State, out.err)
 	}
@@ -725,6 +766,7 @@ func TestLifecycle_FailedWithEvidence(t *testing.T) {
 
 	harness := stub(t, `
 echo '{"type":"system","subtype":"init","session_id":"stub-fail"}'
+read first || exit 1
 echo "stub exploded spectacularly" >&2
 exit 3
 `)
@@ -754,6 +796,7 @@ func TestLifecycle_HarnessErrorResult(t *testing.T) {
 
 	harness := stub(t, `
 echo '{"type":"system","subtype":"init","session_id":"stub-err"}'
+read first || exit 1
 echo '{"type":"result","subtype":"error_max_turns","is_error":true,"result":"ran out of turns"}'
 `)
 	out := waitOutcome(t, runAdapter(context.Background(), adapterConfig(url, taskID, session, harness)), 30*time.Second)
@@ -887,24 +930,9 @@ func TestSteerSurvivesTheInConsumerBeingDropped(t *testing.T) {
 	const session, taskID = "chat-lynx-e5f6", "task-steer-recreate"
 	origin := submit(t, c, session, taskID, "opening prompt")
 
-	harness := stub(t, `
-echo '{"type":"system","subtype":"init","session_id":"stub-recreate"}'
-read first || exit 1
-count=1
-all="$first"
-while read -t 5 line; do
-  count=$((count+1))
-  all="$all $line"
-done
-steers=$(printf '%s' "$all" | grep -o STEERWORD | wc -l | tr -d ' ')
-i=1
-while [ "$i" -lt "$count" ]; do
-  echo '{"type":"result","subtype":"success","result":"interim turn"}'
-  i=$((i+1))
-done
-printf '{"type":"result","subtype":"success","result":"turns=%s steers=%s"}\n' "$count" "$steers"
-`)
-	done := runAdapter(context.Background(), adapterConfig(url, taskID, session, harness))
+	cfg := adapterConfig(url, taskID, session, steerCounterStub(t, "stub-recreate"))
+	cfg.TaskDeadline = steerTaskDeadline
+	done := runAdapter(context.Background(), cfg)
 	waitState(t, c, session, taskID, lib.StateWorking)
 
 	nc, err := nats.Connect(url)

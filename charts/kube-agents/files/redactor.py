@@ -4,7 +4,8 @@ Two independent jobs live here because both are needed by the same four call
 sites (the two audit hooks, the session store, and the OTel bridge):
 
 * :meth:`AuditRedactor.redact` / :meth:`AuditRedactor.redact_text` strip
-  credentials and e-mail addresses out of anything on its way to stdout.
+  credentials and e-mail addresses out of anything on its way to the audit
+  file or a log.
 * :meth:`AuditRedactor.hmac_hash` turns a user identity into a stable
   pseudonym, so session rows and span attributes carry a hash rather than the
   address itself.

@@ -940,6 +940,10 @@ class TestRuns(StoreTestCase):
         self.assertEqual(row["error"], payload["error"])
 
 
+class TestRefusalLiveness(StoreTestCase):
+    """A per-stream refusal carries the stream's liveness, and its reason
+    whenever that liveness is `error`."""
+
     def test_a_refusal_with_an_error_liveness_carries_the_reason(self):
         # A stream directory holding only a stray mixed-case repository has
         # no repository the reader can answer from; the refusal says that,
@@ -957,6 +961,7 @@ class TestRuns(StoreTestCase):
         payload = self.refused("show", AUDIT)
         self.assertEqual(payload["liveness"], "never")
         self.assertNotIn("stream_error", payload)
+
 
 class TestUnusableLeaseTimestamps(StoreTestCase):
     """A lease note's `started_at` is whatever the writer left. One out of

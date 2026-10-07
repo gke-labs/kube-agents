@@ -1,6 +1,6 @@
 ---
 name: fleet-audit-reports
-description: Answer a question about a past autonomous fleet audit from the on-pod report store — what a stream last found, how many criticals are open, what changed between two runs, which clusters were skipped or only partly covered, and when each stream last ran.
+description: Answer a question about a past autonomous fleet audit from the on-pod report store — what a stream last found, how many criticals are open, what changed between two runs, which clusters were skipped or only partly covered, and when each stream last ran. Never the answer to a request to run an audit: a run collects, publishes and opens its fixes through the fleet-audit skill.
 ---
 
 # fleet-audit-reports — Reading What the Audits Found
@@ -20,7 +20,7 @@ repository — a stream publishes one ledger per managed repository:
 
 An envelope carries `audit_id`, `repo`, `finished_at`, `status`, `issue_number`, `issue_url`,
 `partial`, `coverage_gaps`, `declared`, `unaccounted`, `unpublished_candidates`,
-`wholly_unpublished_checks`, `uncorroborated_findings`, `prs_opened`, `prs_closed`, `silent_ok`,
+`wholly_unpublished_checks`, `uncorroborated_findings`, `prs_opened`, `prs_still_open`, `prs_closed`, `silent_ok`,
 `ledger_held_open`, `delta_known`, `new_ids`, `resolved_ids`, `current_ids`, `id_scheme`, `ledger_body`,
 `document`, and sometimes `ledger_document`.
 

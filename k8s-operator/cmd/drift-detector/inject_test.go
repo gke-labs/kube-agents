@@ -454,6 +454,117 @@ func TestInjectStillLogsTheDriftLineWhenTheDaemonFails(t *testing.T) {
 	}
 }
 
+// A record from a cluster outside the install's scope is logged and held: no
+// session, no inject, so none of the day's drift budget goes on a card that
+// says a change happened on a cluster nobody profiled. The hold happens before
+// the seen set, because nothing was sent -- a later record for the same
+// insertId that is in scope still goes out, rather than being read as a
+// redelivery of a card that never existed.
+func TestInjectHoldsAnOutOfScopeRecord(t *testing.T) {
+	daemon, url := newFakeDaemon(t)
+	handler := handlerAgainst(t, url)
+
+	logs := captureLog(t)
+	held := driftEvent("insert-1")
+	held.Record.Cluster = "prod-b"
+	held.Outcome = joinUnreachable
+	held.Owners = nil
+	held.OutOfScope = true
+	handler.Handle(context.Background(), held)
+
+	sessions, injects := daemon.counts()
+	if sessions != 0 || injects != 0 {
+		t.Errorf("sessions=%d injects=%d, want 0 and 0 -- an out-of-scope record reached the daemon", sessions, injects)
+	}
+	if got := handler.Counts(); got.OutOfScope != 1 || got.Injected != 0 || got.Duplicate != 0 || got.Failed != 0 {
+		t.Errorf("Counts() = %+v, want out_of_scope=1 and everything else zero", got)
+	}
+	out := logs.String()
+	if !strings.Contains(out, "DRIFT cluster=prod-b") || !strings.Contains(out, injectHeldOutOfScopeMarker) {
+		t.Errorf("the DRIFT line with its held marker was not written for the out-of-scope record:\n%s", out)
+	}
+	if !strings.Contains(out, "cluster=prod-b") || !strings.Contains(out, "not sent") {
+		t.Errorf("the hold was not reported with the cluster's name:\n%s", out)
+	}
+
+	// The same insertId, now in scope: nothing was sent the first time, so this
+	// is not a duplicate of anything.
+	handler.Handle(context.Background(), driftEvent("insert-1"))
+
+	sessions, injects = daemon.counts()
+	if sessions != 1 || injects != 1 {
+		t.Errorf("sessions=%d injects=%d after an in-scope record with the held id, want 1 and 1 -- the hold marked the id seen", sessions, injects)
+	}
+	if got := handler.Counts(); got.Duplicate != 0 || got.Injected != 1 {
+		t.Errorf("Counts() = %+v, want injected=1 duplicate=0", got)
+	}
+}
+
+// A redelivered record whose card was already sent is a duplicate whatever the
+// scope says now: the seen set is asked before the hold. (The other direction,
+// a held record not being remembered, is TestInjectHoldsAnOutOfScopeRecord's.)
+// AlreadyInjected is the same answer offered to the joiner, and is true only
+// for an id this handler sent.
+func TestInjectOrdersTheHoldBetweenTheSeenCheckAndTheSeenMark(t *testing.T) {
+	daemon, url := newFakeDaemon(t)
+	handler := handlerAgainst(t, url)
+
+	handler.Handle(context.Background(), driftEvent("insert-1")) // in scope: sent
+	if !handler.AlreadyInjected("insert-1") || handler.AlreadyInjected("insert-9") {
+		t.Errorf("AlreadyInjected = (%v, %v) for a sent and an unseen id, want (true, false)", handler.AlreadyInjected("insert-1"), handler.AlreadyInjected("insert-9"))
+	}
+	redelivered := driftEvent("insert-1")
+	redelivered.OutOfScope = true
+	handler.Handle(context.Background(), redelivered)
+
+	sessions, injects := daemon.counts()
+	if sessions != 1 || injects != 1 {
+		t.Errorf("sessions=%d injects=%d, want 1 and 1", sessions, injects)
+	}
+	if got := handler.Counts(); got.Injected != 1 || got.Duplicate != 1 || got.OutOfScope != 0 {
+		t.Errorf("counts = %+v, want injected=1 duplicate=1 out_of_scope=0", got)
+	}
+	if off := newDriftInjectHandler(nil); off.AlreadyInjected("insert-1") {
+		t.Error("AlreadyInjected = true with the inject off, want false: nothing is ever sent")
+	}
+}
+
+// An unreachable record the joiner did not mark is one whose cluster a profile
+// names but the join could not read, or one judged with no scope to judge it
+// against, and it still goes out as it always has. The thin card is the
+// detector staying loud about a cluster it was meant to reach, which is better
+// than a Ready pod that injects nothing.
+
+func TestInjectStillSendsAnUnreachableRecordTheJoinDidNotMark(t *testing.T) {
+	daemon, url := newFakeDaemon(t)
+	handler := handlerAgainst(t, url)
+
+	event := driftEvent("insert-1")
+	event.Outcome = joinUnreachable
+	event.Owners = nil
+	handler.Handle(context.Background(), event)
+
+	sessions, injects := daemon.counts()
+	if sessions != 1 || injects != 1 {
+		t.Errorf("sessions=%d injects=%d, want 1 and 1 -- an unmarked unreachable record was held", sessions, injects)
+	}
+	if got := handler.Counts(); got.Injected != 1 || got.OutOfScope != 0 {
+		t.Errorf("Counts() = %+v, want injected=1 out_of_scope=0", got)
+	}
+}
+
+// The shutdown tally names the held records beside the sent ones, for the
+// reason joinCounts.String prints every outcome: a zero that is absent reads
+// as a category that did not apply.
+func TestInjectCountsStringNamesEveryDisposition(t *testing.T) {
+	got := injectCounts{}.String()
+	for _, field := range []string{"injected=", "suppressed=", "duplicate=", "failed=", "out_of_scope="} {
+		if !strings.Contains(got, field) {
+			t.Errorf("injectCounts.String() = %q, want it to name %q", got, field)
+		}
+	}
+}
+
 // No --daemon-url is a supported mode and the default, not a misconfiguration:
 // the detector logs and escalates nothing. A nil injector must therefore be
 // handled rather than dereferenced.

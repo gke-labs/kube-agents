@@ -13,6 +13,7 @@ file the agent wrote inside the shell sandbox.
 """
 
 import importlib
+import importlib._bootstrap
 import importlib.util
 import os
 import subprocess
@@ -25,6 +26,35 @@ from pathlib import Path
 
 SCRIPTS_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPTS_DIR))
+
+# How long the forced import race in FinderMustNotImportTest waits at each
+# checkpoint and for the two threads to return. Under the old hook neither
+# thread ever returns, so a genuine deadlock trips any finite deadline; a
+# healthy run finishes in milliseconds. Sixty seconds rather than five or ten
+# because the Python sweep runs one test process per core, and on a CI runner
+# with four of them the shorter deadlines expired without a hang.
+RACE_DEADLINE_SECONDS = 60
+# The parent's cap on the race subprocess. The child can spend the full
+# deadline at each of its three waits before it reports, so the cap sits
+# above their sum: a cap that fires first kills the child before it prints
+# which deadline passed and where the threads sat.
+RACE_SUBPROCESS_TIMEOUT_SECONDS = 4 * RACE_DEADLINE_SECONDS
+# How often the child looks at thread B while it decides which way the race
+# went. Both outcomes are reached in microseconds, so this only bounds how
+# long an answer sits unread.
+RACE_POLL_SECONDS = 0.01
+
+# The attribute name CPython gh-130094 left behind in ``_find_and_load_unlocked``
+# -- 857bdba0ac on the 3.14 line, backported as b0a181d8fc and first released in
+# 3.13.16. The change added:
+#
+#     if getattr(parent_spec, '_initializing', False):
+#         _call_with_frames_removed(import_, parent)
+#
+# so importing ``pkg.sub`` while ``pkg`` is still executing its ``__init__``
+# re-imports ``pkg`` and blocks on its module lock before any ``sys.meta_path``
+# finder is consulted. 3.13.15, 3.12 and 3.11 consult the finder first.
+INITIALIZING_PARENT_MARKER = "_initializing"
 
 # Loaded by path rather than by name, because `import sitecustomize` cannot
 # reach this one. CPython's `site.py` imports whatever `sitecustomize` it finds
@@ -44,6 +74,26 @@ _spec = importlib.util.spec_from_file_location(
 )
 sitecustomize = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(sitecustomize)
+
+
+def _waits_on_initializing_parent():
+    """Does this interpreter carry gh-130094's wait on an initializing parent?
+
+    Decides which of ``FinderMustNotImportTest``'s two orders is reachable.
+    Asked of the running interpreter's own ``importlib`` rather than of a table
+    of release numbers, because a distributor that backports the change into an
+    older patch release leaves the version it came with: a table would answer
+    for such an interpreter with its version's upstream behaviour instead of its
+    own. ``getattr``'s argument reaches the code object as a constant rather
+    than a name, but read both, so a rewrite to a plain ``parent_spec.``
+    attribute access still counts.
+
+    A wrong answer is loud rather than silent. Each of the two tests below
+    expects the outcome the other one does, so a misread here reds with
+    ``'RACED' != 'BLOCKED'`` rather than skipping the pair.
+    """
+    code = importlib._bootstrap._find_and_load_unlocked.__code__
+    return INITIALIZING_PARENT_MARKER in code.co_consts + code.co_names
 
 
 class InstallHookRegistrationTest(unittest.TestCase):
@@ -295,24 +345,41 @@ class FinderMustNotImportTest(unittest.TestCase):
         self.assertIsNotNone(spec.loader)
         self.assertNotIn("gateway", sys.modules)
 
-    @unittest.skipIf(
-        sys.version_info >= (3, 14),
-        "3.14 waits on the parent's module lock before it consults any finder, so the old "
-        "hook cannot deadlock there and this test would pass on both versions",
-    )
-    def test_two_threads_importing_the_package_and_the_trigger_both_finish(self):
-        # The losing order, forced: thread A is inside gateway/__init__ when
-        # thread B imports the trigger module through the hook, and A then
-        # needs the global import lock for a fresh module. Under the old hook
-        # neither thread ever returns (measured on 3.12 and 3.13), so this runs
-        # in a subprocess with a deadline rather than wedging the test process.
+    def _run_forced_race(self):
+        """Stage the losing order in a subprocess and report which way it went.
+
+        Thread A sits inside ``gateway/__init__`` while thread B imports the
+        trigger module, and A then needs the global import lock for a fresh
+        module. The child prints ``RACED`` when B reached the hook while A held
+        the package -- the order the old hook never returned from, measured on
+        3.12 and on 3.13 before 3.13.16 -- and ``BLOCKED`` when the interpreter
+        parked B on the package's module lock before any finder ran
+        (gh-130094, see ``INITIALIZING_PARENT_MARKER``). Either way it goes on
+        to release A and check that both threads return and that the trigger
+        module executed, so only the two callers' expectation of which order
+        was reachable differs.
+
+        That shared tail runs everywhere but can only catch a deadlock on the
+        interpreters that reach ``RACED``: where B parks on the package lock
+        it never meets the hook, so there is nothing for any hook to hang on.
+        On those, ``test_find_spec_does_not_import_the_parent_package`` is
+        what rejects a hook that imports the parent.
+
+        A subprocess rather than this process because under the old hook
+        neither thread ever returns, and a deadline can end a child.
+        """
         (self.root / "gateway" / "__init__.py").write_text(
             textwrap.dedent(
                 """
                 import sys
                 ctl = sys.modules["_deadlock_ctl"]
                 ctl.started.set()
-                ctl.go.wait(10)
+                # No deadline: A may only go on once B is inside the hook, or
+                # a slow B lets A finish before the race was forced and the
+                # run passes vacuously. The main thread's checkpoint on B
+                # bounds this wait and exits the process, taking this daemon
+                # thread with it.
+                ctl.go.wait()
                 import gateway_helper  # a new module: needs the global import lock
                 """
             )
@@ -320,7 +387,9 @@ class FinderMustNotImportTest(unittest.TestCase):
         (self.root / "gateway_helper.py").write_text("VALUE = 1\n")
         script = textwrap.dedent(
             f"""
-            import importlib, importlib.util, sys, threading, types
+            import faulthandler, importlib, importlib.util, sys, threading, time, traceback, types
+            DEADLINE = {RACE_DEADLINE_SECONDS}
+            POLL = {RACE_POLL_SECONDS}
             sys.path.insert(0, {str(self.root)!r})
             spec = importlib.util.spec_from_file_location(
                 "_sc", {str(SCRIPTS_DIR / "sitecustomize.py")!r}
@@ -331,6 +400,15 @@ class FinderMustNotImportTest(unittest.TestCase):
             ctl = types.ModuleType("_deadlock_ctl")
             ctl.started, ctl.go, ctl.in_finder = threading.Event(), threading.Event(), threading.Event()
             sys.modules["_deadlock_ctl"] = ctl
+
+            def fail(phase):
+                # Every thread's stack to stderr, which the parent appends to
+                # its assertion message, so the log says where A and B sat
+                # rather than only that a deadline passed.
+                sys.stdout.flush()
+                faulthandler.dump_traceback(all_threads=True)
+                print("FAILED:", phase, flush=True)
+                sys.exit(1)
 
             # Signals the moment thread B is inside the hook, so A is released
             # only then: the race is forced, not left to a sleep.
@@ -344,24 +422,122 @@ class FinderMustNotImportTest(unittest.TestCase):
             patch.install = lambda: None
             sys.modules["fake_patch"] = patch
             sys.meta_path.insert(0, Signalling(["fake_patch"]))
-            a = threading.Thread(target=lambda: importlib.import_module("gateway"), daemon=True)
+            # A thread that dies with an exception is as "not alive" as one
+            # that returned, so liveness alone would read a regression that
+            # raises in the hook as a pass. Each thread keeps its traceback
+            # for the verdict below.
+            errors = {{}}
+
+            def run(name, module):
+                try:
+                    importlib.import_module(module)
+                except BaseException:
+                    errors[name] = traceback.format_exc()
+
+            def parked_on_the_package_lock(thread):
+                # gh-130094's re-import of the initializing parent is the only
+                # path that nests a module-lock acquire *inside*
+                # _find_and_load_unlocked. Without it the only lock B takes is
+                # the trigger module's own, in _find_and_load, before that
+                # frame exists -- and the parent is already in sys.modules by
+                # the time A signalled, so the older re-import of a missing
+                # parent cannot produce the pair either. So the two frames
+                # together say B is waiting on the package, not passing
+                # through on its way to the hook.
+                frame = sys._current_frames().get(thread.ident)
+                names = set()
+                while frame is not None:
+                    names.add(frame.f_code.co_name)
+                    frame = frame.f_back
+                return {{"acquire", "_find_and_load_unlocked"}} <= names
+
+            def settle():
+                # Both outcomes arrive in microseconds; the deadline is only
+                # so a child that reaches neither reports rather than hangs.
+                # Checking the hook first keeps a B that is already through it
+                # from being read as blocked on the way in.
+                end = time.monotonic() + DEADLINE
+                while time.monotonic() < end:
+                    if ctl.in_finder.is_set():
+                        return "RACED"
+                    if parked_on_the_package_lock(b):
+                        return "BLOCKED"
+                    time.sleep(POLL)
+                fail(
+                    "thread B neither reached the hook nor parked on the package's "
+                    "module lock within %ds" % DEADLINE
+                )
+
+            a = threading.Thread(name="A", target=run, args=("A", "gateway"), daemon=True)
             b = threading.Thread(
-                target=lambda: importlib.import_module("gateway.platform_registry"), daemon=True
+                name="B", target=run, args=("B", sc.TRIGGER_MODULE), daemon=True
             )
             a.start()
-            assert ctl.started.wait(10)
+            if not ctl.started.wait(DEADLINE):
+                fail("thread A never entered gateway/__init__ within %ds" % DEADLINE)
             b.start()
-            assert ctl.in_finder.wait(10), "thread B never reached the hook"
+            outcome = settle()
             ctl.go.set()
-            a.join(5)
-            b.join(5)
-            print("OK" if not (a.is_alive() or b.is_alive()) else "DEADLOCK", flush=True)
+            # One deadline for both joins: a deadlocked pair is reported after
+            # DEADLINE, not after one per thread.
+            end = time.monotonic() + DEADLINE
+            for t in (a, b):
+                t.join(max(0, end - time.monotonic()))
+            alive = [t.name for t in (a, b) if t.is_alive()]
+            if alive:
+                fail(
+                    "deadlock: thread %s still alive %ds after release"
+                    % (" and ".join(alive), DEADLINE)
+                )
+            for name, tb in errors.items():
+                sys.stderr.write("thread %s raised:\\n%s" % (name, tb))
+            if errors:
+                fail("thread %s raised instead of finishing" % " and ".join(sorted(errors)))
+            # Both returned cleanly: the trigger module must also have run,
+            # or the hook handed back a spec that loaded nothing.
+            if not getattr(sys.modules.get(sc.TRIGGER_MODULE), "EXECUTED", False):
+                fail("the trigger module did not execute")
+            print(outcome, flush=True)
             """
         )
-        result = subprocess.run(
-            [sys.executable, "-c", script], capture_output=True, text=True, timeout=60
+        return subprocess.run(
+            [sys.executable, "-c", script],
+            capture_output=True,
+            text=True,
+            timeout=RACE_SUBPROCESS_TIMEOUT_SECONDS,
         )
-        self.assertEqual(result.stdout.strip(), "OK", result.stdout + result.stderr)
+
+    @unittest.skipIf(
+        _waits_on_initializing_parent(),
+        "this interpreter parks the trigger import on the package's module lock before any "
+        "finder runs, so the losing order cannot be staged on it and no hook can deadlock "
+        "here; test_the_trigger_import_waits_for_the_package_before_any_finder pins that "
+        "ordering, and test_find_spec_does_not_import_the_parent_package is what rejects a "
+        "hook that imports the parent",
+    )
+    def test_two_threads_importing_the_package_and_the_trigger_both_finish(self):
+        # The deadlock guard proper: B reaches the hook with A holding the
+        # package, which is the order the old hook never returned from.
+        result = self._run_forced_race()
+        self.assertEqual(result.stdout.strip(), "RACED", result.stdout + result.stderr)
+
+    @unittest.skipUnless(
+        _waits_on_initializing_parent(),
+        "only interpreters carrying gh-130094 wait on an initializing parent; the rest stage "
+        "the race itself in test_two_threads_importing_the_package_and_the_trigger_both_finish",
+    )
+    def test_the_trigger_import_waits_for_the_package_before_any_finder(self):
+        # The other half of the same subprocess, asserted the other way round.
+        # Here the import system -- not the hook -- is what keeps B out while A
+        # is inside gateway/__init__, so there is no order to force and nothing
+        # the old hook could deadlock on. Pinning that keeps the pair honest:
+        # an interpreter that drops gh-130094 lets B reach the hook, this test
+        # reds, and the deadlock guard above becomes reachable again rather
+        # than staying skipped on a stale read of the import system. Both
+        # threads must still return and the trigger must still execute once A
+        # is released, which is what the shared child also checks.
+        result = self._run_forced_race()
+        self.assertEqual(result.stdout.strip(), "BLOCKED", result.stdout + result.stderr)
 
 
 class StartupCostTest(unittest.TestCase):

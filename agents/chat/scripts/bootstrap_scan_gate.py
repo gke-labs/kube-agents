@@ -2,9 +2,11 @@
 """Dispatcher for the ``bootstrap-inventory-scan`` cron job.
 
 First-time onboarding needs a full GKE discovery sweep (control plane options,
-node pools, Workload Identity, running workloads): the sweep writes the
-complete findings to ``INVENTORY.raw.md``, and a second card ranks them into
-the short report the user receives. That is LLM work AND privileged work, and the
+node pools, Workload Identity, running workloads): ``bootstrap_handoff.py``
+files one audit card per Cluster Agent and writes their findings to
+``INVENTORY.raw.md``, the sweep card lists the fleet and audits clusters with
+no Cluster Agent, and a second card ranks it all into the short report the user
+receives. The audits are LLM work AND privileged work, and the
 profile this cron runs on can do neither: the Chat Agent's toolsets are
 deliberately stripped to ``mcp-router`` + ``kanban`` (no terminal, no gcloud,
 no kubectl), so it cannot run the sweep itself even as an LLM job.
@@ -19,8 +21,10 @@ longer the reason this lives here.)
 So this runs as a ``no_agent`` script — a plain subprocess, not bound by the
 Chat Agent's toolset denylist — and files the sweep as a **kanban task assigned
 to** ``platform``, the privileged specialist. The dispatcher spawns that worker
-with its full toolset; the worker writes the raw findings, files the
-prioritization card, and completes its own card.
+with its full toolset; the worker lists the fleet, audits any cluster with no
+Cluster Agent, and completes its own card. ``bootstrap_handoff.py``, on this
+job's ticks, files one audit card per Cluster Agent, waits for them, writes the
+raw findings, and files the prioritization card.
 
 Filing is once-only, and this job owns that guarantee locally: the id of the
 card it filed is recorded in ``.bootstrap_scan_filed``, and while that marker
@@ -39,22 +43,24 @@ per-cluster child cards plus an aggregation card and finished, so the board
 said "done" while the disk said "no report" for the whole sweep, which is
 indistinguishable from "never scanned" — and a 1-minute job with no memory of
 its own re-filed the sweep, once a minute, for as long as the real work took.
-The sweep card now stays open until it has waited out its children and
-written ``INVENTORY.raw.md`` itself (#1010 retired the complete-at-fan-out
-shape), which narrows that window without closing it: ``INVENTORY.md`` still
-appears minutes later, from the prioritization card the sweep files, and a
-crashed sweep still leaves board-done/disk-empty. Only a marker written at
+The sweep card completes long before the audits do, and the
+raw file and the prioritization card (or, with nothing audited, the report
+itself) come from the hand-off minutes later, so
+board-done/disk-empty is the normal middle of a sweep. Only a marker written at
 file time covers every case.
 
 Archiving the previous run's ``bootstrap-inventory-*`` cards and then deleting
 ``.bootstrap_scan_filed`` — together with ``INVENTORY.raw.md``, which nothing
-else ever removes and whose presence makes the sweep skip discovery
+else ever removes and which a reader would take for this run's findings
 (``should_skip`` checks it too, but sees it only with the shell sandbox off) —
 is the supported way
 to re-arm discovery after a sweep has genuinely failed (the runbook is
 bootstrap_onboarding/README.md §5). Deleting the marker alone leaves the gate
 closed; deleting it without archiving lets the board answer the new sweep card's
 create with the old card, so no sweep runs.
+
+While the marker exists and ``.bootstrap_completed`` does not, each tick runs
+the hand-off instead of filing; it is a no-op once it has filed its card.
 
 Output is intentionally empty: ``deliver: local`` plus empty stdout means the
 scheduler treats every run as silent. The report reaches the user through
@@ -70,21 +76,18 @@ import sys
 import time
 from pathlib import Path
 
+import bootstrap_handoff  # beside this script in the pod
+
 SCAN_TASK_TITLE = "First-time environment discovery: write the onboarding inventory report"
 # Second line of defence only — see the module docstring. The marker below is
 # the actual guarantee.
 SCAN_IDEMPOTENCY_KEY = "bootstrap-inventory-scan"
-# Propagated to the cards the worker fans out to, so a duplicate root card (if
-# one ever slips through) still cannot produce a duplicate sweep underneath it.
-# (The retired aggregation card's key, `bootstrap-inventory-aggregate`, is gone
-# with the fan-in shape it guarded: the sweep card now waits for its children
-# and writes the findings itself — issue #1010.)
+# The per-Cluster-Agent audit cards the hand-off files, so a retried create, or a
+# duplicate root card if one ever slips through, cannot file a second audit.
 CLUSTER_IDEMPOTENCY_KEY_PREFIX = "bootstrap-inventory-cluster-"
-# The sweep no longer writes the delivered report. It writes the complete findings
-# set, then files one card that ranks it down to the short report the user actually
-# receives. Ranking is a separate card so it runs in a fresh context that sees the
-# raw findings and nothing else — run inline, it would rank them against whatever
-# the sweep's own transcript happened to contain, which differs run to run.
+# The card that ranks the raw findings into the short report the user receives. It is
+# a separate card so it runs in a fresh context that sees the raw findings and nothing
+# else; bootstrap_handoff.py files it once the per-cluster cards settle.
 PRIORITIZE_IDEMPOTENCY_KEY = "bootstrap-inventory-prioritize"
 SCAN_ASSIGNEE = "platform"
 
@@ -93,14 +96,17 @@ SCAN_ASSIGNEE = "platform"
 # again. Delete it, after archiving the previous run's cards, to deliberately
 # re-arm discovery (bootstrap_onboarding/README.md §5).
 SCAN_FILED_MARKER = ".bootstrap_scan_filed"
+# Written by bootstrap_delivery.py once the report is delivered; past it there is
+# nothing left to hand off.
+COMPLETED_MARKER = ".bootstrap_completed"
 
 # The scan runs as a `platform` worker, whose HERMES_HOME is the platform profile
 # home, but the delivery job looks for the report at one absolute path: on the
 # sandbox pod when the shell sandbox is on, in the Chat Agent's home when it is
 # off. Pin the output to that path so both halves agree.
 INVENTORY_PATH = "/opt/data/INVENTORY.md"
-# What the sweep writes: every finding, no length limit, never delivered directly.
-# It stays on disk after delivery so the user can ask for the full inventory.
+# Every finding, no length limit, never delivered directly; bootstrap_handoff.py
+# writes it. It stays on disk after delivery so the user can ask for the full inventory.
 RAW_INVENTORY_PATH = "/opt/data/INVENTORY.raw.md"
 INSTRUCTIONS_PATHS = (
     "/opt/data/profiles/platform/governance/inventory.md",
@@ -115,7 +121,7 @@ CLUSTER_AUDIT_INSTRUCTIONS_PATHS = (
     "/opt/platform-template/governance/cluster_inventory_audit_sop.md",
 )
 # Present only where per-cluster agents are deployed. When absent, the sweep degrades to
-# a single-agent walk of the fleet; when present, the scan fans out one card per cluster.
+# a single-agent walk of the fleet; when present, the gate files one audit card per cluster.
 # Resolved under the data dir rather than hardcoded: `spec.harness.hermes.agentHome` moves
 # the whole tree, and a missing path here silently files the solo sweep.
 RECONCILE_SCRIPT_NAME = "cluster_agent_reconcile.py"
@@ -173,10 +179,11 @@ def _reconcile_script(data_dir: Path) -> Path:
     return data_dir / "scripts" / RECONCILE_SCRIPT_NAME
 
 
-def _cluster_agent_calls() -> list[str]:
-    """One exact ``kanban_create`` call per Cluster Agent, for Step 2 of the card.
+def cluster_agents() -> list[dict]:
+    """The ready Cluster Agents, one ``{name, key, title, cluster_label}`` each.
 
-    The gate reads the roster because the sweep's worker cannot. The worker's
+    The gate files one card per entry itself (``bootstrap_handoff``) and lists
+    them in the sweep card. It reads the roster because the sweep's worker cannot. The worker's
     ``terminal`` runs in the shell sandbox, which has no ``hermes``, and whose
     ``/opt/data/profiles`` is a mirror that leaves out every ``config.yaml``
     (so no ``cluster_identity``) and keeps profiles the reconcile has pruned.
@@ -192,12 +199,13 @@ def _cluster_agent_calls() -> list[str]:
     A profile is listed only when it meets ``platform_control``'s
     ``list_cluster_profiles`` rule: registered with Hermes and its scaffold
     finished. A card assigned to an unregistered directory is never dispatched
-    and the sweep waits on it forever; a profile without ``USER.md`` blocks at
-    preflight, and its cluster is better audited by the sweep itself in Step 4.
+    and the hand-off waits on it until its time limit; a profile without
+    ``USER.md`` blocks at preflight, and its cluster is better audited by the
+    sweep itself in Step 3.
 
     A profile without a readable ``cluster_identity`` is left out, as the
     reconcile neither counts nor prunes one: there is no cluster to name on its
-    card, and the card already sends every cluster the list misses to Step 4. A
+    card, and the card already sends every cluster the list misses to Step 3. A
     profile whose directory or config cannot be read is skipped the same way: a
     file like that is what keeps the reconcile failing until it gives up and
     files the sweep, so it must not take the other profiles with it. An entry
@@ -219,7 +227,7 @@ def _cluster_agent_calls() -> list[str]:
     except Exception as e:  # noqa: BLE001 - never fail the cron run; see the docstring
         sys.stderr.write(f"bootstrap_scan_gate: could not read the Cluster Agent roster: {e}\n")
         return []
-    calls = []
+    agents = []
     for name in names:
         home = cap.profile_home(name)
         # The probe is inside the try: the image's Python re-raises an is_file()
@@ -245,13 +253,14 @@ def _cluster_agent_calls() -> list[str]:
         # Keyed by the profile name: the identity fields all allow hyphens, so
         # joining them with hyphens gives two clusters one key, and the board
         # answers the second create with the first card.
-        calls.append(
-            f"kanban_create(assignee='{name}', "
-            f"idempotency_key='{CLUSTER_IDEMPOTENCY_KEY_PREFIX}{name}', "
-            f"title='Report cluster inventory: `{identity['cluster']}` (`{identity['project']}`, "
-            f"`{identity['location']}`)', body=<the instructions below>)"
-        )
-    return calls
+        label = f"`{identity['cluster']}` (`{identity['project']}`, `{identity['location']}`)"
+        agents.append({
+            "name": name,
+            "key": f"{CLUSTER_IDEMPOTENCY_KEY_PREFIX}{name}",
+            "title": f"Report cluster inventory: {label}",
+            "cluster_label": label,
+        })
+    return agents
 
 
 def _unlisted_projects(data_dir: Path) -> list[tuple[str, str]]:
@@ -356,8 +365,8 @@ def _scope_gap_paragraph(data_dir: Path) -> str:
         f"{container_note}{project_note}The roster holds only the "
         "clusters of theirs that already had a profile, and you cannot list them yourself. A "
         "project marked `over-cap` is reachable but past the reconcile's listing cap, and the "
-        "others the last run could not list. Name each one at the top of the report as not fully "
-        "covered, with its reason, so the sweep reads as partial rather than as a clean fleet.\n\n"
+        "others the last run could not list. Record each one in `gaps` as not fully covered, "
+        "with its reason, so the sweep reads as partial rather than as a clean fleet.\n\n"
     )
 
 
@@ -418,8 +427,8 @@ def ensure_cluster_agents(data_dir: Path) -> bool:
 
     Returns True when the sweep may be filed. False means "not yet, retry on the
     next tick" — the caller must not file the card, because a sweep filed against
-    an empty roster is a sweep with no fan-out, and the marker it writes makes that
-    permanent.
+    an empty roster tells its worker to audit every cluster itself, and the marker
+    it writes keeps that card's instructions for the whole run.
 
     Running the reconcile here rather than asking the sweep's worker to run it (as
     Step 1 of the card body used to) is what makes the result checkable. The worker
@@ -494,8 +503,9 @@ def should_skip(data_dir: Path) -> bool:
 
     - ``.bootstrap_scan_filed`` — a card exists. Covers the long middle of the
       sweep, when there is no report yet and nothing else says work is in
-      flight. This is the one that stops the every-60-seconds re-file.
-    - ``INVENTORY.raw.md`` — the sweep finished; prioritization may still be
+      flight. ``main`` checks it before calling this, to run the hand-off
+      instead, so here it only keeps this function's answer complete.
+    - ``INVENTORY.raw.md`` — the hand-off ran; prioritization may still be
       running. Checked separately from the report because the gap between the
       two is now a distinct stage, not an instant.
     - ``INVENTORY.md`` — the report landed.
@@ -507,7 +517,7 @@ def should_skip(data_dir: Path) -> bool:
         (data_dir / SCAN_FILED_MARKER).exists()
         or (data_dir / "INVENTORY.raw.md").exists()
         or (data_dir / "INVENTORY.md").exists()
-        or (data_dir / ".bootstrap_completed").exists()
+        or (data_dir / COMPLETED_MARKER).exists()
     )
 
 
@@ -517,15 +527,14 @@ def _task_body() -> str:
     cannot_list = "a project's clusters" if multi else "the project's clusters"
     lifecycle_holds = "the scope and its exclusions" if multi else "the `RECONCILE_EXCLUDE` opt-out"
     instruction_list = "\n".join(f"  - {p}" for p in INSTRUCTIONS_PATHS)
-    prioritize_list = "\n".join(f"  - {p}" for p in PRIORITIZE_INSTRUCTIONS_PATHS)
     cluster_audit_list = "\n".join(f"  - {p}" for p in CLUSTER_AUDIT_INSTRUCTIONS_PATHS)
-    calls = "\n".join(f"    {c}" for c in _cluster_agent_calls()) or "    (none)"
+    roster = "\n".join(f"    - `{a['name']}`: {a['cluster_label']}" for a in cluster_agents()) or "    (none)"
     return (
         "First-time onboarding discovery sweep. Follow the inventory SOP, reading whichever "
         "of these exists:\n"
         f"{instruction_list}\n\n"
         "Audit control plane options, node pools, Workload Identity settings, and running "
-        "workloads. Scale the work out per cluster rather than walking the fleet serially:\n\n"
+        "workloads. The Cluster Agents audit their own clusters; your part is below:\n\n"
         "**Discovery steps run ONCE. If a step does not answer, treat its answer as empty and "
         "move on — do not improvise a different way to get it.** Every step below names the "
         "exact command that answers it. If that command fails, returns nothing, or returns "
@@ -546,78 +555,34 @@ def _task_body() -> str:
         "**The roster may be empty or incomplete, and that is your finding to report, not "
         "yours to fix.** It says which clusters can audit themselves — not which clusters "
         f"count. Audit {every_cluster}: the ones with no Cluster Agent you take "
-        "yourself in Step 4, and the report names each one as lacking an agent. A fleet swept "
+        "yourself in Step 3, and the report names each one as lacking an agent. A fleet swept "
         "without Cluster Agents is a degraded sweep and must read as one, because this report "
         "is delivered to the user as the state of their environment. If you cannot list "
-        f"{cannot_list} at all, put that at the top of the report and file it anyway — "
+        f"{cannot_list} at all, put that in `gaps` and complete the card anyway — "
         "onboarding runs once, and a report saying discovery failed is worth more than a thin "
         "one that reads as a clean fleet.\n\n"
         f"{_scope_gap_paragraph(_data_dir())}"
-        "**Step 2 — fan out.** These are the Cluster Agents, one card each, read from the "
-        "profiles when this card was filed. Make every call below exactly once, all of them "
-        "up front:\n\n"
-        f"{calls}\n\n"
-        "This list is the roster. Do not look it up yourself: your terminal runs in a sandbox "
-        "that has neither `hermes` nor the profiles' configuration, so anything you list there "
-        "is incomplete. Pass no `parents` on these calls: a card with this one as its parent "
-        "cannot start until this card completes, and this card waits for them in Step 3. "
-        "**If no calls are listed above, there are no Cluster Agents: skip the rest of "
-        "this step and do the whole sweep yourself in Step 4, following Steps 2 to 4 of the "
-        "single-cluster audit SOP (its own numbering) for each cluster so the topology and the "
-        "workload checks both happen.** That is the normal case for a "
-        "single-cluster install and it is not an error.\n\n"
-        "Each card's body must "
-        "send that agent to the single-cluster audit SOP, reading whichever of these exists:\n"
-        f"{cluster_audit_list}\n\n"
-        "and tell it to complete its card with the structured `metadata` that SOP specifies. "
-        "**Point at the SOP; do not describe the checks in the card body.** Both the checks and "
-        "the `metadata` shape the aggregation stage reads are specific, and a body written "
-        "freehand loses them: what comes back is a topology listing with no findings in it. "
-        "Each Cluster Agent is read-only and pinned to its own "
-        "cluster, so these run in parallel and none can touch another's. "
-        "**Step 3 — wait for the children on this card.** Poll each child with "
-        "`kanban_show(<id>)`, running `sleep 60` between polling rounds (double it once the wait passes five minutes), until every one is "
-        "`done` or `archived`; their structured `metadata` is how you collect the results. Do "
-        "NOT complete this card while they are unfinished — completing is how a card hands back "
-        "its final result, a dispatch receipt is not the report, and the board refuses such a "
-        "completion — and do NOT `kanban_block` on them (that deadlocks; see the inventory SOP). "
-        "Steps 4 and 5 below are your job, in this same run, once the children settle; the "
-        "full mechanics are in Step 3 of the inventory SOP above.\n\n"
-        "**Use those exact idempotency keys.** This is onboarding: it must happen once. The "
-        "keys are what guarantees that a retry, a second dispatch, or a duplicate of this "
-        "card re-attaches to the sweep already in flight instead of launching a second "
-        "fleet-wide scan on top of it.\n\n"
-        "**Step 4 — write the raw findings** (here, once the children have settled — or "
-        "immediately if there were no Cluster Agents to fan out to). Audit any cluster the roster did not "
-        "cover yourself, and combine those findings "
-        "with every child's metadata into a COMPLETE, verbose findings file at "
-        f"`{RAW_INVENTORY_PATH}` — the full fleet and workload tables and the full set of SRE "
-        "remediation suggestions. Do not summarize and do not trim for length: this file is the "
-        "only record of what the sweep saw, and the next stage reads it and nothing else.\n\n"
-        f"**Step 5 — file the prioritization card, then complete this one.** "
-        f"`{RAW_INVENTORY_PATH}` is not what the user "
-        "receives. Once it is on disk, file exactly one card — "
-        f"`kanban_create(assignee='{SCAN_ASSIGNEE}', "
-        f"idempotency_key='{PRIORITIZE_IDEMPOTENCY_KEY}', "
-        "parents=[<this card's id>], ...)` — `parents` matters: it queues the ranking to run "
-        "after you finish, which is what lets your own `kanban_complete` close this card while "
-        "the ranking is still pending. Tell that worker to follow "
-        "the prioritization SOP, reading whichever of these exists:\n"
-        f"{prioritize_list}\n\n"
-        f"Its input is `{RAW_INVENTORY_PATH}` and its output is `{INVENTORY_PATH}`, the ranked "
-        "report a separate delivery job posts to the user **verbatim, with no further editing**. "
-        f"`{INVENTORY_PATH}` is the Chat Agent's home, not yours; writing it anywhere else means "
-        "the user never receives it.\n\n"
-        "**Do not rank the findings yourself, and do not write "
-        f"`{INVENTORY_PATH}` from this card.** Ranking runs separately so it sees the raw "
-        "findings and nothing else. Done inline it would rank them against your whole sweep "
-        "transcript instead, which changes the report depending on how the sweep went.\n\n"
-        "If a cluster's scan fails or its agent never reports, say so explicitly in the raw "
-        "findings rather than omitting the cluster — a silent gap reads as 'clean'.\n\n"
-        "Then finish by calling `kanban_complete`: `result` is a short factual account of the "
-        f"sweep (clusters audited, findings count, that the full findings are at "
-        f"`{RAW_INVENTORY_PATH}` and ranking is queued). Completing is what releases the "
-        "prioritization card to run.\n\n"
+        "**Step 2 — do not fan out; the gate has.** This gate files one audit card per Cluster "
+        "Agent itself, read from the profiles when this card was filed:\n\n"
+        f"{roster}\n\n"
+        "**Do not create cluster cards, and do not look the roster up yourself:** your terminal "
+        "runs in a sandbox that has neither `hermes` nor the profiles' configuration. **If the "
+        "list above is `(none)`, there are no Cluster Agents: audit every cluster yourself in "
+        "Step 3.** That is the normal case for a single-cluster install and it is not an "
+        "error.\n\n"
+        "**Step 3 — audit the clusters the list does not cover**, following Steps 2 to 4 of the "
+        "single-cluster audit SOP (its own numbering) for each, reading whichever of these "
+        f"exists:\n{cluster_audit_list}\n\n"
+        "and record each in that SOP's `metadata` shape. Usually there are none.\n\n"
+        "**Step 4 — complete this card now. Do not wait for the per-cluster cards, do not write "
+        f"`{RAW_INVENTORY_PATH}` or `{INVENTORY_PATH}`, and do not file a ranking card.** The "
+        "onboarding gate waits for the per-cluster cards, writes the raw findings from their "
+        "`metadata`, and files the ranking card itself. Call `kanban_complete` with a short "
+        "factual `result` and this `metadata`: `fleet` — one `{project, cluster, location, "
+        "status}` object per cluster Step 1 listed; `clusters` — the Step 3 audits, each in the "
+        "single-cluster SOP's shape (an empty list when every cluster had an agent); `telemetry` — "
+        "the PlatformAgent's `.status.telemetry`, one line; `gaps` — anything you could not do, and why. A cluster you could not reach goes in `gaps`, not "
+        "silently out of `fleet`.\n\n"
         "Do not message the user directly — delivery is handled for you."
     )
 
@@ -710,13 +675,27 @@ def _mark_filed(data_dir: Path, task_id: str) -> None:
 def main(data_dir: Path | None = None) -> int:
     if data_dir is None:
         data_dir = _data_dir()
+    marker = data_dir / SCAN_FILED_MARKER
+    if marker.exists():
+        if not (data_dir / COMPLETED_MARKER).exists():
+            _hand_off(data_dir, marker)
+        return 0
     if should_skip(data_dir):
         return 0  # silent no-op: already filed, scanned, or delivered
     if not ensure_cluster_agents(data_dir):
         return 0  # roster not ready; the next tick retries, no marker written
-    file_scan_task(data_dir)
+    if file_scan_task(data_dir):
+        # Files the Cluster Agents' cards now rather than a tick later.
+        _hand_off(data_dir, marker)
     # Stdout stays empty on purpose — this job never speaks to the user.
     return 0
+
+
+def _hand_off(data_dir: Path, marker: Path) -> None:
+    try:
+        bootstrap_handoff.hand_off(data_dir, marker, _parse_task_id, roster=cluster_agents)
+    except Exception as e:  # noqa: BLE001 - never fail the cron run; the next tick retries
+        sys.stderr.write(f"bootstrap_scan_gate: hand-off failed: {e!r}\n")
 
 
 if __name__ == "__main__":

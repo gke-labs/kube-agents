@@ -1006,6 +1006,85 @@ def _github_slugs(
     return [entry["repo"] for entry in _github_entries(entries, key, fold_case=fold_case)]
 
 
+def _repository_keys(entries: list[dict[str, str]], key: str) -> list[str]:
+    """Every typed entry in `entries` as `type:host/path`, in order.
+
+    The forge-neutral reading of a list, for the broker's managed-repository
+    gate: one key per registered repository, whatever its forge. The entry's
+    `type` leads the key exactly as written, because the gate matches it
+    against the provider of the forge a request resolved to -- an entry counts
+    for the provider it was registered as and no other, so one typed `GitHub`,
+    or typed for another forge while naming github.com, admits nothing, as it
+    did when only `type: github` entries were read. The host and path are
+    lowercased, since both forges this is written for compare names that way.
+
+    A GitHub entry may be written as a bare `owner/name`, as it always could,
+    and is keyed under its canonical host. Any other forge's entry must name
+    its host -- a self-managed instance has no canonical one -- and one that
+    does not is skipped with a warning, as an unreadable GitHub URL is.
+    """
+    keys: list[str] = []
+    for entry in entries:
+        url = entry.get("url", "")
+        kind = str(entry.get("type") or "")
+        if not kind:
+            LOGGER.warning("Skipping %s repository %r: no type.", key, url)
+            continue
+        if kind == GITHUB_REPO_TYPE:
+            slug = extract_github_slug(url)
+            item = f"{repo_ref.GITHUB_CANONICAL_HOST}/{slug}" if slug else None
+        else:
+            ref = repo_ref.try_parse(url)
+            item = f"{ref.host}/{'/'.join(ref.segments)}" if ref and ref.host else None
+            if item and len(ref.segments) < MIN_REPOSITORY_DEPTH:
+                # A group, not a project: no forge's `parse` answers with fewer
+                # than two segments, so the key could never be asked for and
+                # every project under it would be refused with nothing pointing
+                # here. The GitHub branch refuses the same shape above.
+                LOGGER.warning(
+                    "Skipping %s repository %r: it names a group or namespace, not a "
+                    "repository; register each repository by its own URL.",
+                    key, url,
+                )
+                continue
+        if not item and kind == GITHUB_REPO_TYPE:
+            # The URL may well have a host and a path; what it lacks is being
+            # a two-segment github.com repository -- most often another
+            # forge's URL typed `github` from habit.
+            LOGGER.warning(
+                "Skipping %s repository %r: it is typed github but is not a "
+                "github.com owner/name repository; correct its type or its URL.",
+                key, url,
+            )
+            continue
+        if not item:
+            LOGGER.warning(
+                "Skipping %s repository %r: no host and path to key it by. "
+                "Register a %s repository by its URL (https://<host>/<path>).",
+                key, url, kind,
+            )
+            continue
+        item = f"{kind}:{item.lower()}"
+        if item not in keys:
+            keys.append(item)
+    return keys
+
+
+#: The fewest path segments any forge's repository has: `owner/name` on
+#: GitHub, `group/project` on GitLab.
+MIN_REPOSITORY_DEPTH = 2
+
+
+def get_managed_repo_keys() -> list[str]:
+    """The `managed_repos` entries of every forge, as `host/path` keys."""
+    return _repository_keys(get_managed_repo_entries(), MANAGED_REPOS_KEY)
+
+
+def get_context_repo_keys() -> list[str]:
+    """The `context_repos` entries of every forge, as `host/path` keys."""
+    return _repository_keys(get_context_repo_entries(), CONTEXT_REPOS_KEY)
+
+
 def get_managed_github_repos() -> list[str]:
     """Extracts managed GitHub repositories ('owner/name' slugs) from the state ConfigMap.
 

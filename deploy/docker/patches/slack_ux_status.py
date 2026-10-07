@@ -25,13 +25,14 @@ costs a call or two rather than 30 a minute. Each open and close is logged at in
 free text and is left to upstream.
 
 **The session title.** Upstream titles only DM threads. With the flag on, a
-channel thread's first ask (or a clicked choice's label, offered by
+channel thread's first ask (or the question a clicked choice answers, offered by
 ``slack_ux_clicks`` before its turn runs) becomes its session title, set right after a
 ``processing`` lands: ``agents.sessions.rename`` refuses a thread with no
 session yet. A failed rename keeps the ask for the next ``processing`` sent;
 Slack's ``invalid_name`` refusal is logged at warning, once per thread and
 title, and any other failure at debug; once the title is set, a follow-up ask in the thread
-keeps it.
+keeps it. An event alert's thread takes the title the event watcher recorded for it instead
+(``slack_ux_incident.alert_title``), ahead of any ask.
 
 **One plan per thread.** ``kanban_progress_lines`` rolls each card's progress
 notes into one message per card. With the flag on, a Slack thread instead gets
@@ -236,6 +237,10 @@ _asks: OrderedDict[tuple, str] = OrderedDict()
 _titles: OrderedDict[tuple, str] = OrderedDict()
 #: ``(channel, thread) -> the title Slack refused``, so a retry every refresh warns once.
 _refused_titles: OrderedDict[tuple, str] = OrderedDict()
+#: ``(channel, thread) -> the alert title recorded for it``, "" for none, so a
+#: thread's routing row is read once. The watcher records it before the alert's
+#: first turn, so a miss stays a miss.
+_alert_titles: OrderedDict[tuple, str] = OrderedDict()
 #: ``(channel, thread) -> _Plan``.
 _plans: OrderedDict[tuple, _Plan] = OrderedDict()
 #: ``(channel, thread) -> [_Plan]`` the lapse set aside with a row still
@@ -244,6 +249,10 @@ _plans: OrderedDict[tuple, _Plan] = OrderedDict()
 _lapsed: OrderedDict[tuple, list] = OrderedDict()
 #: Lapse tasks in flight, held so the loop does not drop them mid-run.
 _lapsing: set = set()
+#: ``(channel, thread) -> suspended`` for a card waiting after a restart, with
+#: no plan to hold it: :func:`_settle_orphan` sends the legacy setter a clear,
+#: and :func:`set_thread_status` reads this once to send the wait instead.
+_orphan_waits: OrderedDict[tuple, str] = OrderedDict()
 
 
 def enabled() -> bool:
@@ -268,6 +277,20 @@ def _remember(store: OrderedDict, key: Any, value: Any, cap: int) -> None:
 
 
 # --- the session -----------------------------------------------------------
+
+
+def _alert_title(key: tuple) -> str:
+    """The title the event watcher recorded for the alert posted as this thread, else ""."""
+    if key not in _alert_titles:
+        try:
+            from gateway import slack_ux_incident
+
+            title = slack_ux_incident.alert_title(*key)
+        except Exception as exc:  # noqa: BLE001 — a title is cosmetic
+            logger.debug("slack_ux_status: no alert title for %s/%s: %s", *key, exc)
+            title = ""
+        _remember(_alert_titles, key, title, ASKS_MAX)
+    return _alert_titles[key]
 
 
 def note_ask(chat_id: str, thread_ts: str | None, text: Any) -> None:
@@ -298,15 +321,20 @@ async def set_thread_status(
     caller only hands over when the SDK has Agent Sessions.
     """
     wanted = _status.session_status(status)
+    key = (str(chat_id), str(thread_ts))
+    orphan = False
     if wanted == _status.SESSION_CLOSED:
         # A Planning Agent turn ends with a clear; the thread's plan outlives it.
-        wanted = _plan_session(str(chat_id), str(thread_ts)) or wanted
-    key = (str(chat_id), str(thread_ts))
+        planned = _plan_session(*key)
+        orphan = not planned and key in _orphan_waits
+        wanted = planned or _orphan_waits.get(key, "") or wanted
     sent = _sessions.get(key)
     now = time.monotonic()
     if sent and sent[0] == wanted and (
         wanted != _status.SESSION_PROCESSING or now - sent[1] < SESSION_REFRESH_SECONDS
     ):
+        if orphan:
+            _orphan_waits.pop(key, None)
         return
     try:
         client = adapter._get_client(chat_id, team_id=team_id)
@@ -314,12 +342,18 @@ async def set_thread_status(
     except Exception as exc:  # noqa: BLE001 — upstream debug-logs its own failures too
         logger.debug("[Slack] agents.sessions.setStatus %s: %s", fail_label, exc)
         return
+    if orphan:
+        # Read once, and only once sent, so a refused send leaves it for the retry.
+        _orphan_waits.pop(key, None)
     if not sent or sent[0] != wanted:
         logger.info("slack_ux_status: session %s in %s/%s", wanted, chat_id, thread_ts)
     _remember(_sessions, key, (wanted, now), SESSIONS_MAX)
-    if wanted != _status.SESSION_PROCESSING or key not in _asks:
+    if wanted != _status.SESSION_PROCESSING or key in _titles:
         return
-    title = _status.session_title(_asks[key])
+    ask = _alert_title(key) or _asks.get(key)
+    if not ask:
+        return
+    title = _status.session_title(ask)
     if title:
         try:
             await title_method(client)(channel_id=chat_id, thread_ts=thread_ts, title=title)
@@ -867,14 +901,21 @@ async def _settle_orphan(adapter: Any, sub: dict, key: tuple, status: str | None
     elif status == _status.TASK_PENDING:
         wanted = _status.SESSION_SUSPENDED
     else:
+        # The card runs again, so a wait whose send failed is over too.
+        _orphan_waits.pop(key, None)
         return
     sent = _sessions.get(key)
     setter = getattr(adapter, "_set_thread_status", None)
     if not (key[0] and key[1]) or setter is None or (sent and sent[0] == _status.SESSION_PROCESSING):
         return
     chat_id, thread_ts = key
-    phrase = "" if wanted == _status.SESSION_CLOSED else wanted
+    # The legacy setter takes free text, so it gets only a clear, as from
+    # :func:`_session`; the Agent Sessions path turns it back into the wait.
+    if wanted == _status.SESSION_SUSPENDED:
+        _remember(_orphan_waits, key, wanted, SESSIONS_MAX)
+    else:
+        _orphan_waits.pop(key, None)
     try:
-        await setter(chat_id, str(sub.get("team_id") or ""), thread_ts, phrase, PLAN_STATUS_LABEL)
+        await setter(chat_id, str(sub.get("team_id") or ""), thread_ts, "", PLAN_STATUS_LABEL)
     except Exception as exc:  # noqa: BLE001 — cosmetic
         logger.debug("slack_ux_status: setting the session status after a restart failed: %s", exc)

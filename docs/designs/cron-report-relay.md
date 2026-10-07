@@ -55,6 +55,8 @@ chat roster: profile-cron-tick  (no_agent, * * * * *)
                           │        message = the report, system_message = relay instructions
                           │
                           ├── hermes send                     → what the Chat Agent composed
+                          │   or slack_blocks_post            → a fleet-audit headline as Block Kit
+                          │                                     (Slack, KAGE_SLACK_UX on; below)
                           │
                           └── INSERT INTO incidents (chat_id, thread_id, report)
                                        │
@@ -68,6 +70,83 @@ an out-of-band signal starts an agent turn that investigates and reports; here
 the investigation already happened and the turn only presents. The three pieces
 that make an alert answerable — a thread, a session bound to it, and the report
 stored against that thread — are reused unchanged.
+
+With `KAGE_SLACK_UX` on, the Slack leg of a fleet-audit job's report sends a
+headline in place of the composed message (`slack_audit_report.py`, called from
+`relay_cron_report`), provided the Chat Agent composed it, a chat id or a Slack
+home channel is known, the job's `skills` (a list or one string, or the legacy `skill`) include
+`fleet-audit`, the message ends
+with a link to an issue in a managed repository, and enough of the posts' budget is
+left to read that issue. The headline reads that issue if it is open and labelled
+`agent:audit`: the title's critical count when the body lists a critical, the body's
+summary line for the other severities (the findings its sections list when it has none), the findings
+themselves, and the Scope section's skipped clusters. Held rows are not findings,
+a `#` line inside a finding's fenced evidence ends no section, and a finding title,
+a skipped cluster or the audit name keeps a link's text but not its target. It
+carries one number, the count of the most severe findings a section lists ("<Name>: 2
+critical findings", the name as the title writes it), and lists the critical
+findings (up to ten), or the top two of the highest severity listed when there is none, each
+row led by its severity and ending "· _new_" when fleet-audit marked the finding
+new since the last run (a `<!-- finding-new -->` line under its heading, written
+only when the run knows what the last one carried). Under the rows, a line counts
+the rest by severity ("5 more (1 major, 4 minor) are in the ledger issue."), left
+off when there are none; a line names the clusters the run skipped ("Couldn't
+reach seeded-c, so this run didn't check it." when every reason says the cluster
+was unreachable, "Didn't check seeded-c this run." otherwise, or a count past
+three names), or, when the body has no such table, gives the relayed line's own
+words for what was not scanned, since a silent gap reads as clean; then the
+ledger link. The relayed line itself, which alone carries resolved counts and
+remediation pull requests, is left off the headline and goes in its thread. The relayed line is the report's last line; when that line is only the ledger link,
+the last unindented, non-list line above it that reads as the audit line (its coverage, a
+findings total or a change count) stands in for it, else the last such line with any count. A closed issue is a clean run, which closes the ledger without rewriting its
+title, so the headline is "<Name>: clean. Ledger closed." and the link, unless the
+relayed line counts a finding. When the issue cannot be read or does not parse,
+the leg posts the relayed line in bold with the link. Not parsing includes a title
+of 0 findings, a body listing no finding, a "<n> new" above the
+title's count, a title whose count disagrees with the finding total the relayed
+line states, and a relayed line with no total that counts no non-zero new,
+resolved or severity count or calls the run clean, held, carried or nothing
+reproduced (a zero-finding partial or held run leaves the ledger open over its old
+title). A report whose last line is only the link and with no line carrying a
+count has no headline and goes out unchanged. A truncation notice leads the leg's
+message but is never read as the relayed line. The full report is also posted into the
+headline's thread whenever it is longer than one line or the headline does not show
+its line whole (always, for a headline built from the issue), and the incident row
+stores the full report either way, so a reply in the thread is answered with the whole report.
+Every other report (Google Chat, an unrelayed report, one that does not end with
+a managed-repository issue link, a job the scheduler already delivered to Slack
+itself when it also left another platform to the relay, or any report with the
+flag off) gets the composed message unchanged. A job whose `deliver` value claims
+every platform is relayed to all of them anyway, so its Slack leg gets the
+headline beside the scheduler's raw copy.
+
+When the credential proxy's Slack relay is also in the environment and the issue
+parses, the headline goes out as Block Kit instead of text. `_post_audit_blocks`
+builds it with `slack_audit_report.blocks_from_issue` (the same headline, rows and
+lines, a "Look at the first one" button when a finding is listed, and a link button
+to the ledger; nothing folds) and posts it once through `slack_blocks_post`
+to the relay's `chat.postMessage`, because `hermes send` takes text only. A click on
+a choice button runs as the clicker's turn in the thread, carrying the button's
+label, which is also its value. The leg posts the text headline
+through `hermes send` instead when there is no relay, when the report carries a
+truncation notice (the blocks have no place for it), when the issue was not read or
+does not parse, when Slack refuses the message for any reason, since
+nothing smaller is left to retry with, when too little of the posts' budget is left, and
+when the relay call fails. That last case includes a failure that may have posted,
+such as a timeout after the request was sent: nothing posts the report again, since
+a Slack leg that posts nothing is only recorded as undelivered (the route fails
+when it is the only leg, and answers 200 with Slack in `undelivered` beside another),
+so declining to post the text would trade a possible second headline for a missing
+report. A post Slack accepted without returning a message ts counts as delivered,
+with nothing threaded under it. The caller gives up after the relay plugin's
+`RELAY_TIMEOUT_SECONDS` (360 s), its clock starting first, and the relay turn alone
+can take most of that. So the ledger read, the Block Kit posts and the posts into
+the headline's thread share a budget of half that timeout from the route's start:
+the Block Kit posts stop short of it with room left for the text send, a thread
+post with too little of it left is skipped and logged, and when too little is left
+to read the ledger the composed message goes out as text in one send. A headline
+whose full report did not follow it, skipped, refused or with no ts to thread
+under, still counts as delivered, with `"relay": "degraded"`.
 
 ## Why the Chat Agent composes but does not send
 
@@ -208,7 +287,7 @@ flag re-homes the gateway onto the platform profile.
 
 Mechanically the relay route is unaffected: it is one more turn on one more
 gateway, the session is created the same way, and `hermes send` still does the
-posting. What changes is whether anything reaches the route at all, and who is
+posting, apart from a Slack fleet-audit headline posted as Block Kit (above). What changes is whether anything reaches the route at all, and who is
 composing when it does. Three things, all worth stating rather than discovering.
 
 - **The composer is no longer the locked-down one.** The Chat Agent's
@@ -567,8 +646,9 @@ every one of them is visible to a job author:
   unnoticed. So the degradation is stated twice: the posted message is prefixed
   `[unrelayed]`, naming the profile and job, and the response body carries
   `"relay": "degraded"` next to `"status": "delivered"`.
-  `relay` has one cause today, and both callers had hard-coded the sentence for
-  it, so the body also carries `relay_detail`: the route's own wording, which
+  The other cause is a Slack headline whose full report did not post under it.
+  Both callers had hard-coded the sentence for the first cause, so the body also
+  carries `relay_detail`: the route's own wording, which
   names the cause and never a platform, and which lets a second cause land in
   the route without a client change.
   A send that lands on one platform and not another is a different case, and not
@@ -687,12 +767,16 @@ agent container mounts no service-account token, the operator grants the agent
 identity no write on anything a watcher could use (the site's
 [security reference](../site/src/content/docs/reference/security-and-iam.md) is
 the canonical account of what it does grant), the credential proxy refuses
-every write verb before RBAC is consulted, and the operator reads nothing the
-pod writes, so a condition or an Event needs a new pod-to-operator path and a
-new grant first. The operator binds no metrics endpoint in the shipped deploy;
-the ones the agent's pods expose are the event watcher's and the credential
-broker's, scraped through the chart's `PodMonitoring`s beside LiteLLM's and
-Hindsight's, and neither carries anything about a report. Those are the next step, with this
+every write verb before RBAC is consulted, and the operator read nothing the
+pod wrote when this was designed, so a condition or an Event needed a new
+pod-to-operator path and a new grant first. One such path exists now: the
+operator reads the event watcher's and the credential broker's metrics
+listeners for the usage counters ([design](usage-counters-producer.md)), and it
+carries integer totals and nothing about a report, so the grant is still the
+missing piece. The operator binds no metrics endpoint of its own in the shipped
+deploy; the ones the agent's pods expose are the event watcher's and the
+credential broker's, scraped through the chart's `PodMonitoring`s beside
+LiteLLM's and Hindsight's, and neither carries anything about a report. Those are the next step, with this
 section as the record of why the first step took the channels it did.
 
 ## Related
