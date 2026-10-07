@@ -396,7 +396,11 @@ its own terminal not yet relayed, leaves both to the relay for `A2A_FIRST_EVENT_
 stream stored that terminal (the server's timestamp, never the session's own envelope time), the
 same window the never-started heal waits; past it the relay's delivery is taken as
 lost, and the heal runs the request itself, every check applying, then relays the turn's terminal,
-so the chain is minted or refused as the relay would have done it.
+so the chain is minted or refused as the relay would have done it. The relay does the same at the
+turn's terminal when the request's own event was lost before it ran (acked, then a gateway crash):
+a session turn's `completed` with neither a child nor a refusal on record runs the request read
+off the stream first. Both outcomes are written to the record when they are made - the child's
+link in the mint's own write, the refusal in its own - so neither path runs a request twice.
 
 **To a program behind a door, the chain is one task.** A caller through the A2A door (or the
 inject door) submitted one task, so the gateway tells the adapter's task observers about the chain
