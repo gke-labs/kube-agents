@@ -227,7 +227,7 @@ class SlackRouteTest(unittest.TestCase):
         )
         self.assertNotIn("--thread", chat_notify.blocks_command("slack", "", "x", "/tmp/b.json"))
 
-    def _gateway_post(self, returncode, stdout, thread=""):
+    def _gateway_post(self, returncode, stdout, thread="", blocks=None):
         seen = {}
 
         def run(argv, **_kwargs):
@@ -237,7 +237,7 @@ class SlackRouteTest(unittest.TestCase):
             seen["path"], seen["argv"] = path, argv
             return subprocess.CompletedProcess(args=argv, returncode=returncode, stdout=stdout, stderr="refused")
 
-        blocks = [{"type": "section", "text": {"type": "mrkdwn", "text": "*3 findings*"}}]
+        blocks = blocks or [{"type": "section", "text": {"type": "mrkdwn", "text": "*3 findings*"}}]
         with mock.patch.object(self.skv.subprocess, "run", side_effect=run):
             post = self.skv._post_audit_blocks_via_gateway("platform", "fleet-audit", blocks, "3 findings", thread, 30)
         return post, seen, blocks
@@ -257,6 +257,15 @@ class SlackRouteTest(unittest.TestCase):
         self.assertEqual(out[-1]["type"], "context")
         self.assertIn("<https://github.com/o/r/issues/7|Ledger issue #7 ↗>", out[-1]["elements"][0]["text"])
         self.assertNotIn("kage_audit.choice.0", json.dumps(out))
+
+    def test_the_gateway_path_sends_the_card_without_its_buttons(self):
+        card = [
+            {"type": "section", "text": {"type": "mrkdwn", "text": "*3 findings*"}},
+            {"type": "actions", "elements": [
+                {"type": "button", "action_id": "kage_audit.choice.0", "text": {"type": "plain_text", "text": "Look"}}]},
+        ]
+        _post, seen, _ = self._gateway_post(0, json.dumps({"message_id": "1.5", "thread_id": "1.5"}), blocks=card)
+        self.assertNotIn("actions", [b["type"] for b in seen["blocks"]])
 
     def test_the_cli_gives_up_before_the_subprocess_bound(self):
         _post, seen, _ = self._gateway_post(0, json.dumps({"message_id": "1.5", "thread_id": "1.5"}))
