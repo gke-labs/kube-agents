@@ -1184,6 +1184,38 @@ class C1IsolationIsStructural(unittest.TestCase):
             "across the module boundary is not the name the operator refuses",
         )
 
+    def test_C1_the_rendered_bridge_is_not_the_agent_principal(self) -> None:
+        """The operator renders the bridge from the agent container, and the
+        copy is where the A5 split could be undone without a grant changing.
+
+        The pod's ServiceAccount resolves to the `agent` principal at the
+        callout, so a bridge holding the projected bus token would be a second
+        workload wearing the agent's identity; and the agent's `A2A_BUS_USER`
+        names that principal's inbox, which the bridge's grants do not cover.
+        The bridge is the static `bridge` principal, with the password from its
+        own Secret key. This reads the three places the render decides that:
+        the mount filter, the dropped env names, and the env it adds.
+        """
+        src = h.text("a2a_bridge_render")
+        build = h.go_function_body(src, "buildA2ABridgeContainer")
+        self.assertIn(
+            "!a2aIsBusTokenMount(m)",
+            build,
+            "the rendered bridge copies the agent's mounts without dropping the "
+            "bus token; it would authenticate as the agent principal",
+        )
+        dropped = src[src.index("var a2aBridgeDroppedAgentEnv"):]
+        dropped = dropped[: dropped.index("\n}")]
+        self.assertIn(
+            "a2aBusUserEnv:",
+            dropped,
+            "the rendered bridge inherits the agent's A2A_BUS_USER, the agent "
+            "principal's name and inbox",
+        )
+        own = h.go_function_body(src, "a2aBridgeOwnEnv")
+        self.assertIn("a2aBridgePasswordKey", own, "the rendered bridge is not given the static bridge principal's password")
+        self.assertNotIn("a2aBusToken", own, "the rendered bridge's own env names the bus token")
+
     def test_C1_the_agent_principal_carries_no_static_bus_password(self) -> None:
         """The other half of the same change, and what it was for.
 

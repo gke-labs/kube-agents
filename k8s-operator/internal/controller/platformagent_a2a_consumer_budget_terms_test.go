@@ -505,10 +505,11 @@ func TestBridgeLookAheadIsInTheA2AModule(t *testing.T) {
 	}
 }
 
-// hack/ci-deploy.sh sizes the eval CR's maxSessions so that the sidecar
-// patch, which re-renders the provision Job with the bridge's worker count,
-// asks for a budget the TASKS the first provision created at the floor
-// already holds (gke-labs/kube-agents#2077). It computes that from four
+// hack/ci-deploy.sh sizes the eval CR's maxSessions so that the budget for
+// the bridge's worker count fits the TASKS the provision Job creates at the
+// floor (gke-labs/kube-agents#2077). The operator renders the bridge now and
+// counts its workers from the first render, so there is one provision Job,
+// and the sizing keeps that single budget at or under the floor. It computes that from four
 // numbers copied from this package -- the floor, the per-session count, and
 // the reserve table's intercept and slope -- because a shell script cannot
 // evaluate Go constants. This holds the four to the constants and the

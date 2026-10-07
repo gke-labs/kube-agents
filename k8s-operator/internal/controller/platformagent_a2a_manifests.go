@@ -934,10 +934,10 @@ const (
 	// the refusal and the status message offer only then: declare the
 	// sidecar with fewer workers, which re-renders the Job the way a
 	// maxSessions edit does. A literal above a2aBridgeConcurrencyMax (below)
-	// counts as the cap, and both surfaces say so. The mode-next step of
-	// hack/ci-deploy.sh is such an install: it declares the sidecar after
-	// the bus is up, so its second provision Job refuses against the first
-	// one's stream.
+	// counts as the cap, and both surfaces say so. A bridge the operator
+	// renders (platformagent_a2a_bridge.go) is counted from the first render,
+	// so it never takes this path; a sidecar declared after the bus is up
+	// still does.
 	a2aTasksStandingDurables     = 2
 	a2aTasksAuditDurableHeadroom = 1
 	a2aTasksIncarnationOverlap   = a2aSessionConsumersPerSession
@@ -3329,10 +3329,7 @@ func a2aBridgeConcurrency(agent *agentv1alpha1.PlatformAgent) int {
 // unset with API_SERVER_KEY taken through envFrom, gets no hook, and its
 // API tasks report that they carry no trace.
 func a2aBridgeDoorDeclared(agent *agentv1alpha1.PlatformAgent) bool {
-	if agent == nil || agent.Spec.Deployment == nil {
-		return false
-	}
-	for _, c := range agent.Spec.Deployment.Sidecars {
+	for _, c := range a2aBridgeSidecarsInPod(agent) {
 		if _, set := a2aBridgeConcurrencyValue(c); !set {
 			continue
 		}
@@ -3445,11 +3442,8 @@ func a2aActivitySecretEnv(agent *agentv1alpha1.PlatformAgent) corev1.EnvVar {
 // set when no sidecar sets the key: the default is then the count, not a
 // stand-in for one.
 func a2aBridgeWorkers(agent *agentv1alpha1.PlatformAgent) (count int, capped, defaulted bool) {
-	if agent == nil || agent.Spec.Deployment == nil {
-		return a2aBridgeDefaultConcurrency, false, false
-	}
 	total, declared := 0, false
-	for _, c := range agent.Spec.Deployment.Sidecars {
+	for _, c := range a2aBridgeSidecars(agent) {
 		value, set := a2aBridgeConcurrencyValue(c)
 		if !set {
 			continue

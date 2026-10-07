@@ -3169,6 +3169,18 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 	if a2aAgentSurface(agent) {
 		mountIntoContainer(containers, "platform-agent", a2aBusTokenVolumeMount())
 	}
+	// The bridge, rendered from the finished agent container (every mount
+	// above included, the bus token then dropped) when the CR declares none
+	// of its own, once the bus is provisioned (a2aBridgeInPod). It takes the executor environment every task-executing
+	// sidecar gets, like a declared bridge does. See platformagent_a2a_bridge.go.
+	if a2aBridgeInPod(agent) {
+		for _, c := range containers {
+			if c.Name == "platform-agent" {
+				sidecars = append(sidecars, a2aExecutorSidecarEnv([]corev1.Container{buildA2ABridgeContainer(agent, c)})...)
+				break
+			}
+		}
+	}
 
 	defaultAnnotations := map[string]string{
 		"kubeagents.x-k8s.io/config-hash":            configHash,

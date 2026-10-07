@@ -3,7 +3,7 @@
 > **STATUS — design of record; stage 1 built, off by default.** The gateway has the inject adapter
 > and the bench harness selects it with `AGENT_TRANSPORT=inject`; the operator renders the door
 > only under its eval flag; `EVAL_MODE_NEXT=1` on the presubmit scripts builds the bridge image,
-> flips the install, declares the sidecar and runs the matrix through the door (The CI flag). The
+> flips the install, hands the operator the bridge's settings and runs the matrix through the door (The CI flag). The
 > presubmit still runs `today` unless a job sets the flag, and stage 2's operator wiring is
 > rendered and its eval-install half is not started.
 > The measurement that motivates the document is on
@@ -426,7 +426,12 @@ why the patch pins `BRIDGE_EXECUTOR=cli` rather than leaving the choice to the k
 patch adds one more variable of its own, `A2A_ACTIVITY_SECRET` from the creds Secret's
 `bridge-activity-key`, because the agent container gains that entry only when the operator
 renders the sidecar the patch is declaring. The one mount not
-carried is the projected bus token, which the webhook reserves for the agent container. The
+carried is the projected bus token, which the webhook reserves for the agent container. Since
+gke-labs/kube-agents#2592 the operator renders the bridge itself under `next`, from the same copy
+of the agent container, and the deploy hands it the image, `BRIDGE_CONCURRENCY` and the `cli`
+pin as the operator settings `A2A_BRIDGE_IMAGE`, `A2A_BRIDGE_CONCURRENCY` and
+`A2A_BRIDGE_EXECUTOR`: the sidecar patch and the provision re-run it caused are gone, so the
+first provision already counts the bridge's workers, and the `maxSessions` sizing stays. The
 third piece was decided the same day and is built: a look-ahead in the bridge's worker that
 before it spawns replays the task's `in` subject for a trailing `cancel` and finalizes
 `canceled-before-start` when it finds one, so a cancel already in the stream is honoured without
@@ -585,7 +590,7 @@ it, and the wait goes.
 `EVAL_MODE_NEXT=1` in `hack/ci-deploy.sh` flips the presubmit's eval install to `next` after the
 today-mode install has passed its own readiness and connectivity checks. It records the agent
 Deployment's generation, merge-patches the CR (the mode, and the `maxSessions` sized for the
-sidecar to come), and waits for the generation to move before
+bridge's workers), and waits for the generation to move before
 asking any workload for status, because the flip is a rollout and a status read before it lands
 describes the old pods. It then gates, in order, on the NATS StatefulSet, the callout Deployment,
 the provisioning Job reaching `complete` (the Job depends on the callout; before the operator
@@ -593,17 +598,13 @@ ordered its creation after a serving callout replica it was measured at 19.5 min
 conditions, so its bound is generous), and the agent Deployment. Then
 the door and the executor. The deploy arms the gateway's inject door on the operator under the
 same flag (`A2A_INJECT_BACKEND=true` through the chart's `operator.extraEnv`, beside the A2A
-image overrides) and waits for the door's Service and token Secret; it then declares the bridge
-sidecar on the CR through `spec.deployment.sidecars` (the executor paragraph in stage 1 says
-what the sidecar carries), waits for the agent Deployment to roll once more and for the
-provisioning Job's re-run (the sidecar's `BRIDGE_CONCURRENCY` is an input to the `TASKS`
-budget, so the patch re-renders the Job; the mode patch carried the `maxSessions` that makes
-that run fit, and a refusal now fails the deploy on the CR's `Degraded` phase rather than
-being read past; the one `Degraded` it waits out, for up to five minutes, is a pod waiting
-for CPU or memory while Autopilot adds a node, in practice the rolled agent pod, #2414; when
-the pod is the agent's, it reads that pod as it waits (or, once that pod is gone or finished, the agent's live pods) and
-hands off to the agent Deployment's rollout gate once the pod is bound to a node, because the operator watches no Pods and the CR keeps the scheduler's
-message until its next pass), and ends on the
+image overrides) and waits for the door's Service and token Secret. The bridge sidecar is the
+operator's: it renders it into the agent pod from the mode patch on, with the image,
+`BRIDGE_CONCURRENCY` and executor pin the deploy sets on it the same way (`A2A_BRIDGE_IMAGE`,
+`A2A_BRIDGE_CONCURRENCY`, `A2A_BRIDGE_EXECUTOR`), so the one provisioning Job already budgets its
+workers. Before gke-labs/kube-agents#2592 the deploy declared it on the CR in a second patch,
+waited for the provisioning Job's re-run and read the CR's phase after it (#2077, #2414). The
+step ends on the
 bridge's own log line that it is consuming `platform` tasks, because a flip without a consuming
 bridge leaves a bus on which nobody answers. It reports the A2A gateway's state and last log
 lines and does not gate on it: the door gives the gateway the backend it lacked, so it now
@@ -635,8 +636,9 @@ they were, and the presubmit's own tests hold that.
 
 Under the flag the run also checks the rollback path once the suite verdict is computed and
 before the final line announces it: `hack/rollback-roundtrip.sh` flips the install to `today`
-and back to `next`, with `spec.deployment.sidecars` unset before the first flip and declared
-again after the second, and asserts that the JetStream PVC and the bus creds Secret keep their
+and back to `next`, with any CR-declared `spec.deployment.sidecars` unset before the first flip
+and declared again after the second (the lane declares none: the bridge the operator renders
+leaves and returns with the mode), and asserts that the JetStream PVC and the bus creds Secret keep their
 UIDs, that the agent answers a turn under `today`, and that a task completes over the bus
 afterwards. It is reported, not gated: its own section of the log and two artifacts
 (`rollback-roundtrip.log`, `rollback-roundtrip.txt`), no case in the matrix, and no effect
