@@ -610,10 +610,10 @@ def main(argv=None) -> int:
             finally:
                 if args.project in release_failures:
                     code = 1
-                    err_msg = f"release failed: {release_failures[args.project]}"
-                    run["failures"][args.project] = err_msg
+                    before = run["failures"].get(args.project)
+                    run["failures"][args.project] = ("%s; " % before if before else "") + release_failures[args.project]
                     if not error:
-                        error = err_msg
+                        error = release_failures[args.project]
 
             if outcome is boskos_pool.NOT_ACQUIRED:
                 code = 1

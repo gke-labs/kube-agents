@@ -409,7 +409,8 @@ class SweepProjectTest(unittest.TestCase):
                         stdout=json.dumps([{
                             "name": "bench-subnet-skew",
                             "description": self.plant_desc,
-                            "creationTimestamp": self.old_ts,
+                            # Created 1 hour ago (younger than 4h threshold, but belonging to old network)
+                            "creationTimestamp": self.recent_ts,
                             "network": "https://www.googleapis.com/compute/v1/projects/p/global/networks/bench-vpc-skew",
                             "region": "https://www.googleapis.com/compute/v1/projects/p/regions/us-west4",
                         }]),
@@ -464,7 +465,9 @@ class SweepProjectTest(unittest.TestCase):
                         stdout=json.dumps([{
                             "name": "active-subnet",
                             "description": self.plant_desc,
-                            "creationTimestamp": self.recent_ts,
+                            # Missing/None timestamp: would be treated as old if evaluated alone,
+                            # but protected because parent network is recent.
+                            "creationTimestamp": None,
                             "network": "https://www.googleapis.com/compute/v1/projects/p/global/networks/active-vpc",
                             "region": "https://www.googleapis.com/compute/v1/projects/p/regions/us-west4",
                         }]),
@@ -473,12 +476,20 @@ class SweepProjectTest(unittest.TestCase):
                 if "addresses" in cmd:
                     return mock.Mock(
                         returncode=0,
-                        stdout=json.dumps([{
-                            "name": "active-addr",
-                            "description": self.plant_desc,
-                            "creationTimestamp": self.recent_ts,
-                            "subnetwork": "https://www.googleapis.com/compute/v1/projects/p/regions/us-west4/subnetworks/active-subnet",
-                        }]),
+                        stdout=json.dumps([
+                            {
+                                "name": "active-addr",
+                                "description": self.plant_desc,
+                                "creationTimestamp": None,
+                                "subnetwork": "https://www.googleapis.com/compute/v1/projects/p/regions/us-west4/subnetworks/active-subnet",
+                            },
+                            {
+                                "name": "active-addr-net",
+                                "description": self.plant_desc,
+                                "creationTimestamp": None,
+                                "network": "https://www.googleapis.com/compute/v1/projects/p/global/networks/active-vpc",
+                            },
+                        ]),
                         stderr="",
                     )
             return mock.Mock(returncode=0, stdout="", stderr="")
@@ -1106,7 +1117,28 @@ class MainCliTest(unittest.TestCase):
                 self.assertEqual(code, 1)
                 data = json.loads(pathlib.Path(report_path).read_text(encoding="utf-8"))
                 self.assertEqual(data["exit"], "failed")
-                self.assertIn("release failed", data["failures"]["p1"])
+                self.assertEqual(data["failures"]["p1"], "release failed: release rejected")
+        finally:
+            pathlib.Path(report_path).unlink(missing_ok=True)
+
+    def test_project_mode_sweep_fault_and_release_failure_joined_without_double_prefix(self):
+        with tempfile.NamedTemporaryFile("w", delete=False) as tf:
+            report_path = tf.name
+
+        try:
+            err = sweep.boskos_pool.BoskosError("release rejected")
+            sweep_err = sweep.SweepError("p1: networks: net-1 (inUse)")
+            with (
+                mock.patch.object(sweep.boskos_pool, "acquire", return_value="p1"),
+                mock.patch.object(sweep.boskos_pool, "release_settled", side_effect=err),
+                mock.patch.object(sweep, "sweep_project", side_effect=sweep_err),
+            ):
+                code = sweep.main(["--project", "p1", "--report", report_path])
+                self.assertEqual(code, 1)
+                data = json.loads(pathlib.Path(report_path).read_text(encoding="utf-8"))
+                self.assertEqual(data["exit"], "failed")
+                self.assertEqual(data["failures"]["p1"], "p1: networks: net-1 (inUse); release failed: release rejected")
+                self.assertNotIn("release failed: release failed", data["failures"]["p1"])
         finally:
             pathlib.Path(report_path).unlink(missing_ok=True)
 
