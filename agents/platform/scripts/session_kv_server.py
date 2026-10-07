@@ -490,6 +490,23 @@ DRIFT_JOIN_ENRICHED = "enriched"
 # a gap in the record.
 DRIFT_UNKNOWN_FIELD = "unknown"
 
+# With KAGE_SLACK_UX on, a crashloop alert on Slack is one sentence naming the
+# workload and its cluster rather than the reason, the object path and the
+# kubelet's message, and the thread it starts is titled for the incident. The
+# reasons `canonicalizeReason` in k8s-operator/cmd/k8s-event-watcher/dedup.go
+# reads as a crashloop: CrashLoopBackOff, and a BackOff that is not pulling an
+# image. Every other reason keeps the alert as it was; "keeps crashing" would
+# misstate it. The title is stored on the session's routing row, where
+# gateway/slack_ux_incident.py reads it; Slack's rename refuses `·`, so " in ".
+SLACK_PLATFORM = "slack"
+CRASHLOOP_REASON = "CrashLoopBackOff"
+BACKOFF_REASON = "BackOff"
+IMAGE_PULL_MARKER = "pulling image"
+SLACK_CRASHLOOP_ALERT = "🚨 **{workload} in {cluster} keeps crashing.** Looking now."
+ALERT_TITLE = "{workload} crashloop"
+ALERT_TITLE_CLUSTER = " in {cluster}"
+ALERT_TITLE_KEY = "title"
+
 # The cluster name a drift card falls back to when the payload names none and
 # GKE_CLUSTER_NAME is unset -- the cluster the agent itself runs on. The event
 # path spells the same fallback inline in two places; this is named because the
@@ -879,6 +896,25 @@ def clean_event_message(message: str) -> str:
         clean_pdb = m.group(1)
         return f"Eviction would violate PDB {clean_pdb}"
     return msg
+
+
+def _is_crashloop(reason: str, message: str) -> bool:
+    return reason == CRASHLOOP_REASON or (reason == BACKOFF_REASON and IMAGE_PULL_MARKER not in message)
+
+
+def _slack_alert_message(workload: str, cluster: str, reason: str, message: str) -> str | None:
+    """The alert Slack gets for a crashloop with KAGE_SLACK_UX on; None keeps the usual alert."""
+    if not (slack_presenter.enabled() and workload and cluster and _is_crashloop(reason, message)):
+        return None
+    return SLACK_CRASHLOOP_ALERT.format(workload=workload, cluster=cluster)
+
+
+def _alert_session_title(workload: str, cluster: str, reason: str, message: str) -> str | None:
+    """The Slack session title for a crashloop alert's thread with KAGE_SLACK_UX on, else None."""
+    if not (slack_presenter.enabled() and workload and _is_crashloop(reason, message)):
+        return None
+    title = ALERT_TITLE.format(workload=workload)
+    return title + ALERT_TITLE_CLUSTER.format(cluster=cluster) if cluster else title
 
 
 def get_severity_details(event_type: str, reason: str) -> tuple[str, str]:
@@ -1318,6 +1354,33 @@ def _register_session_routing(session_id: str, platform: str, thread_id: str) ->
                 raise
     except Exception as exc:
         logger.error(f"Failed to update session metadata with thread_id: {exc}")
+
+
+def _record_alert_title(session_id: str, title: str) -> None:
+    """Add the Slack session title to the alert's routing row, for gateway/slack_ux_incident.py.
+
+    Cosmetic, so a failure is logged and the triage goes on without it.
+    """
+    try:
+        with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=5.0, isolation_level=None)) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = conn.execute(
+                    "SELECT metadata FROM session_metadata WHERE session_id = ?", (session_id,)
+                ).fetchone()
+                if row:
+                    meta = json.loads(row[0])
+                    meta[ALERT_TITLE_KEY] = title
+                    conn.execute(
+                        "UPDATE session_metadata SET metadata = ? WHERE session_id = ?",
+                        (json.dumps(meta), session_id),
+                    )
+                conn.execute("COMMIT")
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
+    except Exception as exc:
+        logger.warning(f"Failed to record the alert title for {session_id}: {exc}")
 
 
 def _create_gateway_session(api_url: str, session_id: str, headers: Dict[str, str]) -> bool:
@@ -2132,8 +2195,14 @@ def trigger_agent_troubleshooter(
     alert_msg: str,
     payload: Dict[str, Any],
     event_row_id: Optional[int] = None,
+    slack_alert_msg: Optional[str] = None,
+    alert_title: Optional[str] = None,
 ) -> None:
-    """Post warning alert to Chat, configure thread mapping, and trigger the agent loop in background."""
+    """Post warning alert to Chat, configure thread mapping, and trigger the agent loop in background.
+
+    ``slack_alert_msg`` replaces ``alert_msg`` when the alert goes to Slack, and
+    ``alert_title`` is recorded only for a Slack thread.
+    """
     # 1. Post initial warning notification to Google Chat or Slack.
     #
     #    One destination, but the first one is not the only one tried. This path
@@ -2160,7 +2229,9 @@ def trigger_agent_troubleshooter(
     active_platform = get_active_platform(platforms)
     thread_id = None
     for candidate in [active_platform] + [p for p in platforms if p != active_platform]:
-        thread_id = _post_initial_alert(candidate, alert_msg)
+        thread_id = _post_initial_alert(
+            candidate, slack_alert_msg if candidate == SLACK_PLATFORM and slack_alert_msg else alert_msg
+        )
         if thread_id == ALERT_SENT_WITHOUT_THREAD:
             # Delivered, and unthreadable. Stop: the reader has the alert, and
             # trying the next platform would post it to a second channel to
@@ -2183,6 +2254,8 @@ def trigger_agent_troubleshooter(
     #    deploy/docker/patches/kanban_event_routing.py).
     if thread_id:
         _register_session_routing(session_id, active_platform, thread_id)
+        if alert_title and active_platform == SLACK_PLATFORM:
+            _record_alert_title(session_id, alert_title)
     else:
         # The ledger row already says this alert was announced; it was written
         # before the post was attempted. Correct it now, or the daily recap
@@ -3610,7 +3683,15 @@ def inject_message(
     )
 
     # Delegate the heavy REST API call to FastAPI BackgroundTasks to keep response times sub-millisecond
-    background_tasks.add_task(trigger_agent_troubleshooter, session_id, alert_msg, payload, event_row_id)
+    background_tasks.add_task(
+        trigger_agent_troubleshooter,
+        session_id,
+        alert_msg,
+        payload,
+        event_row_id,
+        slack_alert_msg=_slack_alert_message(clean_name, event_cluster, event_reason, message),
+        alert_title=_alert_session_title(clean_name, event_cluster, event_reason, message),
+    )
 
     return {"status": "injected"}
 

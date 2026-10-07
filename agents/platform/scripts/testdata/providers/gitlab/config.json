@@ -1,0 +1,10 @@
+{
+  "forges": [
+    {
+      "provider": "gitlab",
+      "host": "gitlab.com",
+      "token_path": "/var/run/kube-agents/forge-credentials/gitlab/token",
+      "allowed_paths": []
+    }
+  ]
+}

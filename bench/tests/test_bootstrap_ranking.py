@@ -102,15 +102,15 @@ def test_the_stack_and_the_reader_spell_the_items_file_as_the_script_does() -> N
     assert "INVENTORY.items.json" in (RAW.parent / "main.tf").read_text()
 
 
-def test_the_stack_files_the_card_the_gate_and_the_sweep_sop_name() -> None:
+def test_the_stack_files_the_card_the_gate_and_the_hand_off_name() -> None:
     main_tf = (RAW.parent / "main.tf").read_text()
     gate = (REPO / "agents" / "chat" / "scripts" / "bootstrap_scan_gate.py").read_text()
-    sop = (REPO / "agents" / "platform" / "governance" / "inventory.md").read_text()
+    handoff = (REPO / "agents" / "chat" / "scripts" / "bootstrap_handoff.py").read_text()
     assert 'PRIORITIZE_IDEMPOTENCY_KEY = "bootstrap-inventory-prioritize"' in gate
     assert 'SCAN_ASSIGNEE = "platform"' in gate
     assert 'card_key      = "bootstrap-inventory-prioritize"' in main_tf
     assert 'card_assignee = "platform"' in main_tf
-    assert "Prioritize the onboarding inventory report" in sop
+    assert 'PRIORITIZE_TITLE = "Prioritize the onboarding inventory report"' in handoff
     assert 'card_title    = "Prioritize the onboarding inventory report"' in main_tf
 
 

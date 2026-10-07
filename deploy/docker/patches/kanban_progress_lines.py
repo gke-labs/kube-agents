@@ -771,7 +771,7 @@ async def deliver(
         # A failed post raises in the notifier, which rewinds its claim so the
         # next tick posts again, and that post settles. After the notifier's
         # MAX_SEND_FAILURES it drops the subscription instead, and the ask
-        # keeps its arrival reaction alone.
+        # never settles.
         if getattr(result, "success", True) is not False:
             await _settle_reaction(adapter, sub, kind, board)
         if kind == PR_REPORT_KIND:

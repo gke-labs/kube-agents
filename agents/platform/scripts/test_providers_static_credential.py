@@ -63,10 +63,15 @@ class CredentialTest(unittest.TestCase):
         for content in (
             None, "", "  \n", "glpat-a\nglpat-b\n", "glpat-a\rx",
             "\ufeffglpat-a\n", "glpat\u2011a", "glpat a",
+            # Review round 3: bytes that are not UTF-8 at all (a UTF-16
+            # export) escaped as a bare 500.
+            b"\xff\xfeg\x00l\x00",
         ):
             with self.subTest(content=content):
                 if content is None:
                     self.token.unlink(missing_ok=True)
+                elif isinstance(content, bytes):
+                    self.token.write_bytes(content)
                 else:
                     self.token.write_text(content)
                 with self.assertRaises(WorkspaceError) as caught:
@@ -158,11 +163,15 @@ class GitAsksTheHelperTest(unittest.TestCase):
     def test_a_token_the_api_side_refuses_gives_git_nothing_either(self):
         # Review round 2: the helper still passed a carriage return (and a
         # byte-order mark) that `_token()` refuses, splitting the two faces.
-        for content in ("glpat-a\rx\n", "\ufeffglpat-a\n"):
+        for content in ("glpat-a\rx\n", "\ufeffglpat-a\n", b"\xff\xfeg\x00l\x00"):
             with self.subTest(content=content):
-                self.token.write_text(content, encoding="utf-8")
+                if isinstance(content, bytes):
+                    self.token.write_bytes(content)
+                else:
+                    self.token.write_text(content, encoding="utf-8")
                 done = self.fill(HOST, ambient=False)
                 self.assertNotIn("password=", done.stdout)
+                self.assertNotIn("Traceback", done.stderr)
 
     def test_a_missing_file_gives_git_nothing_rather_than_a_traceback(self):
         self.token.unlink()

@@ -4,8 +4,9 @@ Pure functions only, like ``slack_presenter``, whose layout this reuses.
 ``gateway/slack_ux_moments.py`` decides when to post them.
 
 * A pull request the work opened (:func:`pr_opened`): a bold headline naming
-  the PR, the worker's own line below it as evidence, and "Open PR" and
-  "Files changed" url buttons. :func:`opened_pr` finds it in a progress note or a report, and
+  the PR, the worker's own line below it as evidence, and "Open PR" (the
+  primary button) and "Files changed" url buttons, beside a green side bar
+  (:data:`PR_SIDE_BAR`). :func:`opened_pr` finds it in a progress note or a report, and
   only where the line says it opened that PR, the verb in front of the url
   with the worker as its subject by the one rule in :func:`_ours`, so a note
   citing someone else's PR ("… pull/300, opened by bob", "Dependabot opened
@@ -19,7 +20,12 @@ Pure functions only, like ``slack_presenter``, whose layout this reuses.
   fits on a button, they end the reason, and the line right before them is a
   question that is not a yes/no ask to go on ("Shall I proceed?", whose list is
   the plan); otherwise, and with no thread for a click to answer in, the
-  question is text only and a typed reply is the answer.
+  question is text only and a typed reply is the answer. Beside it is a yellow
+  side bar (:data:`NEEDS_YOU_SIDE_BAR`), which stays once it is settled while
+  anything is left below the headline.
+
+Both lay out as one block list; ``slack_presenter.with_side_bar`` splits it
+into the headline and the attachment that carries the bar when it is posted.
 """
 
 from __future__ import annotations
@@ -136,6 +142,7 @@ PR_REF_SPAN = (
     r"(?:\(\s*{ref}\s*\)|{ref})(?P<close>[*_`]*)"
 )
 OPEN_PR = "Open PR ↗"
+PR_SIDE_BAR = _presenter.SIDE_BAR_GREEN
 FILES_CHANGED = "Files changed ↗"
 FILES_PATH = "/files"
 PR_ACTION_PREFIX = "kage_pr"
@@ -174,6 +181,7 @@ DETAIL_MAX = 2000
 DETAIL_BOLD = re.compile(r"(?<![\w*])\*\*(?=\S)([^*\n]+?)(?<=\S)\*\*(?![\w*])")
 NEEDS_YOU_ACTION_PREFIX = "kage_needs"
 WAITING = "⏸ waiting on you"
+NEEDS_YOU_SIDE_BAR = _presenter.SIDE_BAR_YELLOW
 
 
 def opened_pr(text: str) -> tuple[str, str, str, str] | None:
@@ -331,7 +339,7 @@ def pr_opened(url: str, repo: str, number: str, line: str) -> tuple[list[dict], 
     shortened = span.sub(lambda m: PR_REF.format(number=number) + _ref_markup(m), line)
     evidence = _presenter._clip(shortened.strip(), EVIDENCE_MAX)
     links = [(OPEN_PR, url), (FILES_CHANGED, url + FILES_PATH)]
-    blocks = _presenter.blocks_answer(headline, links=links, action_id_prefix=PR_ACTION_PREFIX)
+    blocks = _presenter.blocks_answer(headline, links=links, action_id_prefix=PR_ACTION_PREFIX, primary_link=True)
     first, *rest = _presenter.fallback_text(headline, links=links).split("\n")
     return _with_subline(blocks, evidence), "\n".join([_text(first, evidence), *rest])
 

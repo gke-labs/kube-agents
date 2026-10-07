@@ -202,9 +202,9 @@ def _unreadable_stream(root: str, audit_id: str, reason: str, **extra: object) -
 
 
 def _repos(root: str, audit_id: str) -> tuple[list[str], list[str]]:
-    """The stream's repositories, and a line per owner directory that could
-    not be listed: `repo_ids` drops those, and a repository hidden behind one
-    is unread, not absent."""
+    """The stream's lower-case repositories, as `project_stream` counts them,
+    and a line per owner directory that could not be listed: a repository
+    hidden behind one is unread, not absent."""
     try:
         dirs, unreadable = report_status.scan_repo_dirs(root, audit_id)
     except OSError as exc:

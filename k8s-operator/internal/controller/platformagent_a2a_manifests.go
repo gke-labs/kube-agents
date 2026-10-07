@@ -200,11 +200,12 @@ const (
 
 	a2aGatewayImageEnvVar = "A2A_GATEWAY_IMAGE"
 	// The first-party next-stack images the operator renders — this one, the
-	// worker below, the auth callout (platformagent_a2a_callout.go) and the
-	// capability verifier (platformagent_a2a_verifier.go) — are
-	// release surface: .github/workflows/docker-publish-ghcr.yml builds them
-	// beside the other first-party images, images.json carries them (as
-	// a2a-gateway, a2a-worker, a2a-authcallout and a2a-verifier), and
+	// worker below, the auth callout (platformagent_a2a_callout.go), the
+	// capability verifier (platformagent_a2a_verifier.go) and the console
+	// server (platformagent_a2a_console.go) — are release surface:
+	// .github/workflows/docker-publish-ghcr.yml builds them beside the other
+	// first-party images, images.json carries them (as a2a-gateway,
+	// a2a-worker, a2a-authcallout, a2a-verifier and a2a-console), and
 	// hack/check-image-inventory.sh holds these names to the inventory's
 	// entries (the name, and the repository as that name under the agent
 	// image's registry). Bare names, like shellSandboxRepositoryName: the
@@ -1017,8 +1018,9 @@ func a2aWorkerImage() string {
 // override if set; else the image name swapped into OPERATOR_IMAGE when it
 // carries a tag (a digest-only operator reference falls through),
 // the rung resolveShellSandboxImage uses and for the same reason - the
-// gateway, the callout and the worker consume what the operator renders (the
-// identity map, the env, the spawn spec), so their version contract is with
+// gateway, the callout, the worker and the console consume what the operator
+// renders (the identity map, the env, the spawn spec, the console's bus
+// login), so their version contract is with
 // the operator, and OPERATOR_IMAGE is set once per install by whoever
 // installed it: the chart sets it, and main.go discovers it from the pod
 // spec only when PLATFORM_AGENT_IMAGE is unset too, so a kustomize install
@@ -1031,7 +1033,7 @@ func a2aWorkerImage() string {
 // the matching build of each, and a mirror that carries the operator or the
 // agent image carries these under the same prefix. Never a CR's
 // spec.deployment.image: a custom agent image is that agent's choice, and the
-// bus components are not. The three env vars stay the override for an
+// bus components are not. The four env vars stay the override for an
 // install that pins one apart.
 func a2aReleaseImage(envVar, name string) string {
 	if override := os.Getenv(envVar); override != "" {
@@ -1812,41 +1814,38 @@ http: ` + strconv.Itoa(a2aNATSMonitorPort) + `
 # reads as the bus refusing a workload rather than as a size limit.
 max_control_line: 65536
 
-# Websocket listener for the web user (the read-only web rail reads the bus
-# over this).
+# Websocket listener for the console page and the read-only web user.
 #
 # Plain ws IS the playground posture, stated rather than implied, and stated
-# accurately: the CONNECT frame carries the web password in cleartext across
-# the pod network. The Service is ClusterIP, so nothing OUTSIDE the cluster
-# reaches this listener — and an ingress NetworkPolicy fences the pod network
-# too: 4222 from the enumerated bus clients only, and NO pod-network peer for
-# 8222 or 9222. The port-forward the demo uses and the kubelet's readiness
-# probe both enter from the node, which the policy does not govern, so the ws
-# surface is reachable through kubectl and through nothing else. Production
-# still terminates TLS in front of the bus, which is not a toggle that exists
-# yet.
+# accurately: the CONNECT frame carries a password in cleartext across the
+# pod network. The Service is ClusterIP, so nothing OUTSIDE the cluster
+# reaches this listener. An ingress NetworkPolicy fences the pod network too:
+# 4222 from the enumerated bus clients, 9222 from the console server alone,
+# and no pod-network peer for 8222. The console server is admitted because it
+# is the page's proxy. A browser reaches it through a kubectl port-forward and
+# it forwards the websocket here with the browser's headers intact. It is not
+# an in-cluster door for anything else. A port-forward straight to 9222 still
+# works for local tooling and the live tests, because it enters from the
+# node, which NetworkPolicy does not govern. Production still terminates TLS
+# in front of the bus, which is not a toggle that exists yet.
 #
-# The origin allow-list is the one thing here that is not posture. WebSockets
-# are exempt from CORS, and the demo transport is a kubectl port-forward to
-# 9222 on a workstation — for as long as that runs, every page the operator's
-# browser visits can open a socket to localhost:9222, with a credential that
-# lives in browser JS by construction.
+# The origin allow-list is the console server's origin as the browser sees it
+# through the documented port-forward. The proxy forwards Origin unchanged,
+# so the list still applies. WebSockets are exempt from CORS, and for as long
+# as a port-forward runs, every page the operator's browser visits can try to
+# open a socket through it.
 #
 # allowed_origins, NOT same_origin: same_origin compares the browser's Origin
-# against this listener's own host:port, and the UI is always a page on a
-# different port than the bus (vite on 5173, or an nginx port), so it can never
-# match. Measured in a real browser: same_origin gives every UI deployment a
-# 403 at the handshake. A CLI or Node client sends no Origin header at all,
-# which both settings permit — which is exactly why this needed a browser to
-# find.
+# against the Host this listener sees, and behind the proxy that is the bus's
+# own service name, which no browser page is served from. A CLI or Node client
+# sends no Origin header at all, which both settings permit.
 #
-# This is defense in depth and not a boundary: Origin is browser-asserted, so
-# anything that is not a browser simply omits it. The boundary is the web
-# user's grant list below.
+# Origin is browser-asserted, so this stops a browser page and nothing else.
+# The boundary is the grant lists below.
 websocket {
   port: ` + strconv.Itoa(a2aNATSWebSocketPort) + `
   no_tls: true
-  allowed_origins: ["http://localhost:5173", "http://127.0.0.1:5173"]
+  allowed_origins: [` + a2aConsoleOriginList() + `]
 }
 
 jetstream {
@@ -2297,16 +2296,21 @@ func buildA2ASessionNetworkPolicy(agent *agentv1alpha1.PlatformAgent, dnsCluster
 // buildA2ANATSNetworkPolicy governs ingress to the NATS pod. Without it every
 // pod in the cluster reaches 4222/8222/9222 while the deny-by-default bus
 // grants do the real refusing; with it the network layer agrees with the
-// grants: 4222 from exactly the enumerated bus clients, nothing else.
+// grants: 4222 from exactly the enumerated bus clients, 9222 from exactly the
+// console server, nothing else.
 //
-// 8222 (monitor) and 9222 (ws) get no pod-network peer at all, decided rather
-// than forgotten. Both surfaces are node-path consumers: the kubelet's
-// readiness probe on 8222 and the demo's kubectl port-forward on 9222 enter
-// from the node, which NetworkPolicy does not govern (Dataplane V2 exempts
-// host-local traffic), so denying every pod costs neither. An in-cluster ws
-// client would be the web rail deployed into the cluster — a peer to add to
-// this list when it exists, not a reason to leave the port open to every pod
-// now.
+// 8222 (monitor) gets no pod-network peer at all, decided rather than
+// forgotten. The kubelet's readiness probe enters from the node, which
+// NetworkPolicy does not govern (Dataplane V2 exempts host-local traffic), so
+// denying every pod costs nothing.
+//
+// 9222 (ws) gets one peer, the console server. The browser reaches the console
+// server through a port-forward and the server proxies the page's websocket to
+// here, so it is the one in-cluster ws client that exists. It is admitted by
+// its own pods' app label and nothing wider. It is not an in-cluster door for
+// anything else, and a new ws client is a peer to decide on here, not a reason
+// to widen this one. A port-forward straight to 9222 still enters from the
+// node and still works for local tooling and the live tests.
 func buildA2ANATSNetworkPolicy(agent *agentv1alpha1.PlatformAgent) *networkingv1.NetworkPolicy {
 	tcp := corev1.ProtocolTCP
 
@@ -2387,6 +2391,17 @@ func buildA2ANATSNetworkPolicy(agent *agentv1alpha1.PlatformAgent) *networkingv1
 					{PodSelector: &metav1.LabelSelector{MatchLabels: map[string]string{
 						labelPartOf:       a2aPartOf,
 						a2aComponentLabel: "seed",
+					}}},
+				},
+			}, {
+				// 9222 from the console server alone. See the doc comment
+				// for why it is the only one.
+				Ports: []networkingv1.NetworkPolicyPort{
+					{Protocol: &tcp, Port: ptr.To(intstr.FromInt32(a2aNATSWebSocketPort))},
+				},
+				From: []networkingv1.NetworkPolicyPeer{
+					{PodSelector: &metav1.LabelSelector{MatchLabels: map[string]string{
+						"app": a2aConsoleName(agent),
 					}}},
 				},
 			}},
@@ -3205,10 +3220,11 @@ const defaultA2AMaxSessions = 10
 // legitimately runs here: the rendered stack and its neighbors (operator,
 // agent pod, gateway, NATS, LiteLLM, dashboard), Job pods (provision, seed),
 // rollout surge doubling a Deployment for a moment, and the gateway's
-// count-then-create overshoot. Fifteen covers roughly ten standing pods plus
-// surge; if the base install grows past that, raise this before anything
-// user-visible starts failing admission.
-const a2aQuotaHeadroom = 15
+// count-then-create overshoot. Fifteen covered roughly ten standing pods plus
+// surge; the console server made it eleven, hence sixteen. If the base
+// install grows again, raise this before anything user-visible starts failing
+// admission.
+const a2aQuotaHeadroom = 16
 
 func resolveA2AMaxSessions(agent *agentv1alpha1.PlatformAgent) int {
 	if limits := agentTuning(agent); limits != nil && limits.MaxSessions != nil {
@@ -4438,6 +4454,7 @@ func (r *PlatformAgentReconciler) reconcileA2ANetworkFences(ctx context.Context,
 		buildA2ANATSNetworkPolicy(agent),
 		buildA2ASessionNetworkPolicy(agent, dnsClusterIPs),
 		buildA2AVerifierNetworkPolicy(agent, dnsClusterIPs),
+		buildA2AConsoleNetworkPolicy(agent),
 	}
 	// The gateway fence rides here with the others, for the reason this
 	// function exists: it is what withholds a task-submission endpoint from
@@ -4552,6 +4569,13 @@ func (r *PlatformAgentReconciler) reconcileA2A(ctx context.Context, agent *agent
 	// frozen, running bus keeps its ingress policy and the workers on it keep
 	// their egress one.
 	if err := r.reconcileA2ANetworkFences(ctx, agent); err != nil {
+		return state, err
+	}
+
+	// The console server: the page, its credential, and its websocket proxy.
+	// After the fences, so its pod never runs unfenced, and ahead of the
+	// gateway's hold, because serving the page doesn't need the gateway.
+	if err := r.reconcileA2AConsole(ctx, agent); err != nil {
 		return state, err
 	}
 
@@ -5265,6 +5289,12 @@ func (r *PlatformAgentReconciler) a2aPreBusTeardown(agent *agentv1alpha1.Platfor
 		{&corev1.ConfigMap{ObjectMeta: doorMeta}, r.Client},
 		{&networkingv1.NetworkPolicy{ObjectMeta: doorMeta}, r.Client},
 		{&corev1.Secret{ObjectMeta: doorMeta}, r.a2aReader()},
+		// The console server, with the gateway: both are front doors onto
+		// the bus, and both go before the bus they front. Its fence goes
+		// later, beside the session fence, for the same reason that one is
+		// late: the Delete above returns before the pod is gone.
+		{&appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: a2aConsoleName(agent), Namespace: agent.Namespace}}, r.Client},
+		{&corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: a2aConsoleName(agent), Namespace: agent.Namespace}}, r.Client},
 		// The auth callout, before the bus it authorizes for. Its Deployment
 		// goes first so its deletion is initiated while there is still a server to
 		// answer for; the keys Secret goes with it rather than surviving like
@@ -5347,6 +5377,14 @@ func (r *PlatformAgentReconciler) a2aBusTeardown(agent *agentv1alpha1.PlatformAg
 		// fence ABOVE this entry, not below it.
 		// TestTheSessionFenceIsTheLastFenceTheTeardownDeletes pins that.
 		{&networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: a2aVerifierNetpolName(agent), Namespace: agent.Namespace}}, r.Client},
+		// The console fence, as late as it can go for the session fence's
+		// reason: directly above the session fence, which has to stay last.
+		// The window matters more here: until the console pod exits, anything
+		// in the cluster that reaches it can read the console password off
+		// /config.json, and the creds Secret that password lives in survives
+		// the flip. The order shortens that window to the pod's exit; it does
+		// not remove it.
+		{&networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: a2aConsoleNetpolName(agent), Namespace: agent.Namespace}}, r.Client},
 		// The session fence goes after the gateway Deployment above, which is
 		// what stops new pods being spawned. It does not close the window:
 		// Delete returns as soon as the API server accepts it, and the pods
@@ -5421,6 +5459,10 @@ func (r *PlatformAgentReconciler) cleanupA2A(ctx context.Context, agent *agentv1
 	//   - the A2A door's fence, the same shape under the other flag: written
 	//     after the pair and deleted before it, left alone only by the hand,
 	//     removed on the today path by nothing but this walk,
+	//   - the console fence, for the same hand on an install without the
+	//     inject flag. It is the third fence reconcileA2ANetworkFences writes,
+	//     so the same two deletes leave it standing alone there, and nothing
+	//     on the today path but this walk removes it either,
 	//   - the callout keys Secret, which is the FIRST deletable object
 	//     reconcileA2A creates — the per-user creds Secret is created before it
 	//     and deliberately survives — so a render that died anywhere leaves this
@@ -5451,10 +5493,11 @@ func (r *PlatformAgentReconciler) cleanupA2A(ctx context.Context, agent *agentv1
 	// TestTheEarlyExitSeesTheResidueOfARenderThatDiedAnywhere walks every
 	// prefix of both renders and is what makes forgetting it red rather than
 	// silent: without the keys Secret below, its writes 3 and 4 fail, and
-	// without the fences every guardrail prefix does. The two door fences
-	// are the ones no prefix leaves alone;
-	// TestAHandDeletedPairLeavesTheInjectFenceToDriveTheFlip and its A2A
-	// door twin are what red without them.
+	// without the fences every guardrail prefix does. The inject, door and
+	// console fences are the ones no prefix leaves alone;
+	// TestAHandDeletedPairLeavesTheInjectFenceToDriveTheFlip, its A2A door
+	// twin and TestAHandDeletedPairLeavesTheConsoleFenceToDriveTheFlip are
+	// what red without them.
 	sentinels := []a2aTeardownEntry{
 		{&appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{Name: a2aNATSName(agent), Namespace: agent.Namespace}}, r.Client},
 		{&appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: a2aGatewayName(agent), Namespace: agent.Namespace}}, r.Client},
@@ -5462,6 +5505,7 @@ func (r *PlatformAgentReconciler) cleanupA2A(ctx context.Context, agent *agentv1
 		{&networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: a2aSessionNetpolName(agent), Namespace: agent.Namespace}}, r.Client},
 		{&networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: a2aInjectName(agent), Namespace: agent.Namespace}}, r.Client},
 		{&networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: a2aDoorName(agent), Namespace: agent.Namespace}}, r.Client},
+		{&networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: a2aConsoleNetpolName(agent), Namespace: agent.Namespace}}, r.Client},
 		{&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: a2aCalloutKeysName(agent), Namespace: agent.Namespace}}, r.a2aReader()},
 		{&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: a2aNATSConfigSecretName(agent), Namespace: agent.Namespace}}, r.a2aReader()},
 	}

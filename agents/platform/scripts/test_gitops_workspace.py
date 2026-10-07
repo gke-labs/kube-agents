@@ -927,6 +927,29 @@ class TestRepositoryKeys(unittest.TestCase):
             ),
         )
 
+    def test_a_github_typed_entry_on_another_forge_says_the_type_is_wrong(self):
+        # Review round 4: it has a host and a path, so "no host and path to key
+        # it by" sent the operator to rewrite a URL already in the asked form.
+        for url in ("https://gitlab.com/acme/infra", "https://github.com/acme/infra/sub"):
+            with self.subTest(url=url):
+                with self.assertLogs(gitops_workspace.LOGGER, level="WARNING") as logs:
+                    self.assertEqual([], self.keys([{"type": "github", "url": url}]))
+                out = "\n".join(logs.output)
+                self.assertIn("typed github but is not a github.com owner/name repository", out)
+                self.assertNotIn("no host and path", out)
+
+    def test_an_entry_naming_a_group_is_skipped_with_a_warning(self):
+        # Review round 3: `https://gitlab.com/acme` was keyed silently, and no
+        # forge's parse ever produces a one-segment path, so every project
+        # under the group was refused with nothing pointing at the entry.
+        with self.assertLogs(gitops_workspace.LOGGER, level="WARNING") as logs:
+            keys = self.keys([
+                {"type": "gitlab", "url": "https://gitlab.com/acme"},
+                {"type": "gitlab", "url": "https://gitlab.com/acme/infra"},
+            ])
+        self.assertEqual(["gitlab:gitlab.com/acme/infra"], keys)
+        self.assertIn("names a group or namespace", "\n".join(logs.output))
+
     def test_the_type_leads_the_key_as_written(self):
         # The gate matches it against a forge's provider, so `GitHub` is not
         # `github`, and a github.com URL under another type keys under that type.

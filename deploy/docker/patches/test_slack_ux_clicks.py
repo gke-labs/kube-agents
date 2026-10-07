@@ -12,6 +12,7 @@ runtime module is driven with a stub adapter.
 import ast
 import asyncio
 import importlib
+import json
 import os
 import re
 import shutil
@@ -74,6 +75,7 @@ class SlackAdapter:
         self._app = App()
         self._bot_user_id: str = ""
         self._team_bot_user_ids, self._other = {}, {}
+        self._user_name_cache = {}
 
     def _handle_clarify_action(self, ack, body, action):
         return None
@@ -571,6 +573,27 @@ class RuntimeTest(unittest.TestCase):
         )
         self.assertEqual(adapter.acks, 1)
 
+    def test_a_message_with_a_side_bar_is_answered_beside_the_same_bar(self):
+        # Slack echoes the colour without its "#"; chat.update keeps an attachment it is not sent.
+        body, action = _choice()
+        headline, *rest = body["message"]["blocks"]
+        body["message"].update(blocks=[headline], attachments=[{"id": 1, "color": "ECB22E", "blocks": rest}])
+        adapter = _Adapter()
+        self._answer(adapter, body, action)
+        update = adapter.log[0][1]
+        self.assertEqual(update["blocks"], [headline])
+        [attachment] = update["attachments"]
+        self.assertEqual(attachment["color"], "#ECB22E")
+        self.assertEqual(attachment["fallback"], update["text"])
+        actions = [b for b in attachment["blocks"] if b["type"] == "actions"]
+        self.assertEqual([[e["action_id"] for e in b["elements"]] for b in actions], [["kage.link.0"]])
+        self.assertEqual(attachment["blocks"][-1]["elements"][0]["text"], "✓ Jayanti: Leave it")
+
+    def test_a_message_without_a_side_bar_is_sent_no_attachments(self):
+        adapter = _Adapter()
+        self._answer(adapter, *_choice())
+        self.assertNotIn("attachments", adapter.log[0][1])
+
     def test_a_click_on_a_cards_question_names_the_card(self):
         moments = SimpleNamespace(
             question_card=lambda channel, ts: "t_e0c1" if (channel, ts) == (CHANNEL, MESSAGE_TS) else None
@@ -581,14 +604,36 @@ class RuntimeTest(unittest.TestCase):
         turn = adapter.log[-1][1]
         self.assertEqual(turn["text"], "Leave it\n\n" + runtime.CARD_NOTE.format(card="t_e0c1"))
 
-    def test_a_clicked_session_is_titled_from_the_label_not_the_card_note(self):
+    def test_a_clicked_session_is_titled_from_the_question_not_the_label(self):
+        adapter = _Adapter()
+        asks = []
+        status = SimpleNamespace(note_ask=lambda *args: asks.append(args))
+        body, action = _choice(value="Post it now")
+        body["message"]["text"] = "Post the release notes now?\n\nReply with one of: Post it now, Wait"
+        with mock.patch.dict(sys.modules, {"gateway": SimpleNamespace(slack_ux_status=status), "gateway.slack_ux_status": status}):
+            self._answer(adapter, body, action)
+        self.assertEqual(asks, [(CHANNEL, THREAD, "Post the release notes now?")])
+
+    def test_a_clicked_session_is_titled_from_the_question_as_it_reads(self):
+        adapter = _Adapter()
+        asks = []
+        status = SimpleNamespace(note_ask=lambda *args: asks.append(args))
+        body, action = _choice(value="Scale it")
+        body["message"]["text"] = "*Scale replicas &gt; 3 &amp; restart?*\n\nReply with one of: Scale it, Wait"
+        with mock.patch.dict(sys.modules, {"gateway": SimpleNamespace(slack_ux_status=status), "gateway.slack_ux_status": status}):
+            self._answer(adapter, body, action)
+        self.assertEqual(asks, [(CHANNEL, THREAD, "Scale replicas > 3 & restart?")])
+
+    def test_a_clicked_session_with_no_question_text_is_titled_from_the_label_not_the_card_note(self):
         adapter = _Adapter()
         status = SimpleNamespace(note_ask=lambda chat, thread, text: adapter.log.append(("note_ask", (chat, thread, text))))
         moments = SimpleNamespace(question_card=lambda channel, ts: "t_e0c1")
         gateway = SimpleNamespace(slack_ux_moments=moments, slack_ux_status=status)
         modules = {"gateway": gateway, "gateway.slack_ux_moments": moments, "gateway.slack_ux_status": status}
         with mock.patch.dict(sys.modules, modules):
-            self._answer(adapter, *_choice())
+            body, action = _choice()
+            body["message"]["text"] = ""
+            self._answer(adapter, body, action)
         self.assertEqual([entry[0] for entry in adapter.log], ["chat_update", "note_ask", "message"])
         self.assertEqual(adapter.log[1][1], (CHANNEL, THREAD, "Leave it"))
 
@@ -603,8 +648,8 @@ class RuntimeTest(unittest.TestCase):
         asks = []
         status = SimpleNamespace(note_ask=lambda *args: asks.append(args))
         with mock.patch.dict(sys.modules, {"gateway": SimpleNamespace(slack_ux_status=status), "gateway.slack_ux_status": status}):
-            _run(runtime._title_from_label(adapter, "D1", TEAM, THREAD, "Leave it"))
-            _run(runtime._title_from_label(adapter, CHANNEL, TEAM, THREAD, "Leave it"))
+            _run(runtime._offer_title(adapter, "D1", TEAM, THREAD, "Leave it"))
+            _run(runtime._offer_title(adapter, CHANNEL, TEAM, THREAD, "Leave it"))
         self.assertEqual(titles, [("D1", THREAD, "Leave it", TEAM)])
         # A DM's title is upstream's, set once; offering the label as its ask would rename it.
         self.assertEqual(asks, [(CHANNEL, THREAD, "Leave it")])
@@ -647,6 +692,22 @@ class RuntimeTest(unittest.TestCase):
                 with mock.patch.dict(sys.modules, {"gateway": SimpleNamespace(slack_ux_moments=moments), "gateway.slack_ux_moments": moments}):
                     self._answer(adapter, *_choice())
                 self.assertEqual(adapter.log[-1][1]["text"], "Leave it\n\n" + runtime.CARD_NOTE.format(card="t_e0c1"))
+
+    def test_the_card_is_looked_up_before_the_clickers_name(self):
+        cards = {(CHANNEL, MESSAGE_TS): "t_e0c1"}
+        moments = SimpleNamespace(question_card=lambda channel, ts: cards.get((channel, ts)))
+        adapter = _Adapter()
+        resolve = adapter._resolve_user_name
+
+        async def settle_then_resolve(*args, **kwargs):
+            cards.clear()  # the card settled while users.info was in flight
+            return await resolve(*args, **kwargs)
+
+        adapter._resolve_user_name = settle_then_resolve
+        with mock.patch.dict(sys.modules, {"gateway": SimpleNamespace(slack_ux_moments=moments), "gateway.slack_ux_moments": moments}):
+            self._answer(adapter, *_choice())
+        self.assertTrue(adapter.named)
+        self.assertEqual(adapter.log[-1][1]["text"], "Leave it\n\n" + runtime.CARD_NOTE.format(card="t_e0c1"))
 
     def test_a_click_on_any_other_message_is_the_label_alone(self):
         moments = SimpleNamespace(question_card=lambda channel, ts: None)
@@ -1041,6 +1102,9 @@ class RuntimeTest(unittest.TestCase):
             runtime.INCIDENT_CHOICE_PREFIX, f"{incident.ACTION_PREFIX}.{presenter.CHOICE_ACTION}."
         )
 
+    def test_the_recommended_suffix_is_the_one_the_alert_buttons_carry(self):
+        self.assertEqual(runtime.INCIDENT_RECOMMENDED_SUFFIX, incident.RECOMMENDED_SUFFIX)
+
     def test_a_typed_apply_strikes_the_buttons_and_drops_the_click(self):
         typed = {"type": "message", "user": "U2", "text": "apply Option B", "ts": "223.000"}
         adapter = _Adapter(replies=[{"type": "message", "bot_id": "B1", "text": "alert", "ts": MESSAGE_TS}, typed])
@@ -1216,12 +1280,21 @@ class RuntimeTest(unittest.TestCase):
                 self._incident(adapter)
                 check(adapter)
 
-    def _options_incident(self, adapter, *labels):
-        body, action = _alert_choice(1, labels[-1])
-        triage = {"headline": "Pod OOMKilled", "links": [], "fold_title": "Options", "choices": [
-            (label, False) for label in labels
-        ]}
+    def _options_incident(self, adapter, *replies, recommended=None, user=None):
+        """An alert whose option buttons send ``replies``, each showing its title, the last one clicked by ``user``."""
+        forms = [runtime.BUTTON_FORM.fullmatch(reply) for reply in replies]
+        choices = [
+            incident._option_choice(form.group(1), form.group(2), i == recommended)
+            if form.group(1) else (form.group(2), reply, i == recommended)
+            for i, (form, reply) in enumerate(zip(forms, replies))
+        ]
+        triage = {"headline": "Pod OOMKilled", "links": [], "fold_title": "Options", "choices": choices}
+        body, action = _alert_choice(len(replies) - 1, replies[-1])
+        if user is not None:
+            body["user"] = user
         body["message"]["blocks"] = incident.blocks_triage(triage, [])
+        clicked = body["message"]["blocks"][1]["elements"][len(replies) - 1]
+        action["text"] = clicked["text"]
         self._answer(adapter, body, action)
 
     def test_a_colon_counts_only_before_that_options_own_text(self):
@@ -1268,24 +1341,144 @@ class RuntimeTest(unittest.TestCase):
                     self._options_incident(adapter, *labels)
                     check(adapter)
 
-    def test_a_clipped_buttons_shown_text_counts_as_its_whole_text(self):
-        # The button shows "apply Option B: Roll back checkout-gateway to the last revision that…".
-        labels = (
-            "apply Option A: Raise the limit",
-            "apply Option B: Roll back checkout-gateway to the last revision that served without OOMKills in prod",
-        )
-        cases = (
-            (self._drops, "apply Option B: Roll back checkout-gateway to the last revision that…"),
-            (self._drops, "apply B: roll back checkout-gateway to the last revision that"),
-            (self._runs, "apply B: Roll back checkout-gateway to the last revision"),
-            (self._runs, "apply A: Roll back checkout-gateway to the last revision that"),
-        )
-        for check, text in cases:
+    def test_the_recommended_buttons_text_typed_with_its_suffix_counts(self):
+        labels = ("apply Option A: Raise the limit", "apply Option B: Restore the secret")
+        for text in (
+            f"apply B: Restore the secret{incident.RECOMMENDED_SUFFIX}",
+            f"apply Option B: Restore the secret{incident.RECOMMENDED_SUFFIX}",
+        ):
             with self.subTest(text=text):
                 importlib.reload(runtime)
                 adapter = _Adapter(replies=[{"type": "message", "user": "U2", "text": text, "ts": "223.000"}])
-                self._options_incident(adapter, *labels)
+                self._options_incident(adapter, *labels, recommended=1)
+                self._drops(adapter)
+
+    def test_a_clipped_buttons_shown_text_counts_as_its_whole_text(self):
+        title = (
+            "Roll back checkout-gateway to the last revision that served without OOMKills in prod "
+            "after the canary"
+        )
+        labels = ("apply Option A: Raise the limit", f"apply Option B: {title}")
+        for recommended in (None, 1):
+            # The button shows the title clipped, "(recommended)" after it on the recommended one.
+            room = presenter.BUTTON_TEXT_MAX - (len(incident.RECOMMENDED_SUFFIX) if recommended else 0)
+            shown = presenter._clip(title, room).removesuffix("…")
+            cases = (
+                (self._drops, f"apply Option B: {shown}…"),
+                (self._drops, f"apply B: {shown.lower()}"),
+                (self._runs, f"apply B: {shown.rsplit(' ', 1)[0]}"),
+                (self._runs, f"apply A: {shown}"),
+            ) + ((self._drops, f"apply B: {shown}…{incident.RECOMMENDED_SUFFIX}"),) * bool(recommended)
+            for check, text in cases:
+                with self.subTest(recommended=recommended, text=text):
+                    importlib.reload(runtime)
+                    adapter = _Adapter(replies=[{"type": "message", "user": "U2", "text": text, "ts": "223.000"}])
+                    self._options_incident(adapter, *labels, recommended=recommended)
+                    check(adapter)
+
+    def test_an_incident_click_sends_its_reply_and_shows_who_picked_what(self):
+        for recommended in (None, 1):
+            with self.subTest(recommended=recommended):
+                importlib.reload(runtime)
+                adapter = _Adapter()
+                self._options_incident(
+                    adapter, "apply Option A: Roll back to 14:02", "apply Option B: Restore the secret",
+                    recommended=recommended,
+                )
+                update = next(entry[1] for entry in adapter.log if entry[0] == "chat_update")
+                turn = next(entry[1] for entry in adapter.log if entry[0] == "message")
+                self.assertEqual(update["blocks"][-1]["elements"][0]["text"], "✓ Jayanti: Restore the secret")
+                self.assertEqual(turn["text"], "apply Option B: Restore the secret")
+
+    def test_an_incident_click_names_the_clicker_in_plain_text_and_never_by_id(self):
+        handle = {"id": USER, "username": "jpatil", "name": "jpatil"}
+        cases = (
+            ("the display name", {}, (), None, "Jayanti"),
+            ("users.info named nobody", {"names": {}}, (), handle, "jpatil"),
+            ("users.info failed", {}, ("names",), handle, "jpatil"),
+            ("no name anywhere", {"names": {}}, (), {"id": USER}, runtime.NAMELESS_CLICKER),
+            ("a failed lookup and no handle", {}, ("names",), None, runtime.NAMELESS_CLICKER),
+            ("a handle that is the id", {"names": {}}, (), {"id": USER, "name": USER}, runtime.NAMELESS_CLICKER),
+            ("a name that is mrkdwn", {"names": {USER: "<!here> & *co*"}}, (), None, "&lt;!here&gt; &amp; *co*"),
+        )
+        for why, kwargs, broken, user, name in cases:
+            with self.subTest(why):
+                importlib.reload(runtime)
+                adapter = _Adapter(broken=broken, **kwargs)
+                self._options_incident(
+                    adapter, "apply Option A: Roll back to 14:02", "apply Option B: Restore the secret", user=user,
+                )
+                update = next(entry[1] for entry in adapter.log if entry[0] == "chat_update")
+                line = update["blocks"][-1]["elements"][0]["text"]
+                self.assertEqual(line, f"✓ {name}: Restore the secret")
+                self.assertNotIn(USER, json.dumps(update))
+                self.assertEqual(adapter.named, [(USER, CHANNEL, TEAM)])
+
+    def test_an_incident_click_on_a_clipped_title_sends_the_whole_reply(self):
+        title = "Restore the secret payments-db-creds from the GitOps repository and restart the rollout"
+        adapter = _Adapter()
+        self._options_incident(adapter, "apply Option A: Roll back", f"apply Option B: {title}", recommended=1)
+        turn = next(entry[1] for entry in adapter.log if entry[0] == "message")
+        self.assertEqual(turn["text"], f"apply Option B: {title}")
+
+    def test_an_incident_value_naming_another_title_sends_the_title_shown(self):
+        body, action = _alert_choice(1, "apply Option B: Delete the namespace")
+        action["text"]["text"] = "Restore the secret (recommended)"
+        adapter = _Adapter()
+        self._answer(adapter, body, action)
+        turn = next(entry[1] for entry in adapter.log if entry[0] == "message")
+        self.assertEqual(turn["text"], "Restore the secret")
+
+    def test_a_button_from_before_titles_still_sends_what_it_shows(self):
+        reply = "apply Option B: Restore the secret"
+        for shown, sent in ((reply, reply), ("apply Option B: Restore the…", "apply Option B: Restore the…")):
+            with self.subTest(shown=shown):
+                runtime._answered.clear()
+                body, action = _alert_choice(1, reply)
+                action["text"]["text"] = shown
+                adapter = _Adapter()
+                self._answer(adapter, body, action)
+                turn = next(entry[1] for entry in adapter.log if entry[0] == "message")
+                self.assertEqual(turn["text"], sent)
+
+    def test_a_typed_apply_as_a_button_from_before_titles_showed_it_drops_the_click(self):
+        # An alert posted before buttons showed titles: its button shows the reply, clipped.
+        title = "Restore the secret payments-db-creds from the GitOps repository"
+        reply = f"apply Option B: {title}"
+        shown = presenter._clip(reply, presenter.BUTTON_TEXT_MAX)
+        typed_title = shown.removeprefix("apply Option B: ")
+        for typed, check in (
+            (f"apply B: {typed_title}", self._drops),
+            (f"apply B: {typed_title.removesuffix('…')}", self._drops),
+            ("apply B: Restore the secret", self._runs),
+        ):
+            with self.subTest(typed=typed):
+                importlib.reload(runtime)
+                adapter = _Adapter(replies=[{"type": "message", "user": "U2", "text": typed, "ts": "223.000"}])
+                body, action = _alert_choice(1, reply)
+                button = body["message"]["blocks"][1]["elements"][2]
+                button.update(
+                    action_id=action["action_id"], value=reply, text={"type": "plain_text", "text": shown, "emoji": True},
+                )
+                action["text"]["text"] = shown
+                self._answer(adapter, body, action)
                 check(adapter)
+
+    def test_an_incident_click_offers_the_title_as_the_threads_ask(self):
+        adapter = _Adapter()
+        with mock.patch.object(runtime, "_offer_title", wraps=runtime._offer_title) as title:
+            self._options_incident(
+                adapter, "apply Option A: Roll back to 14:02", "apply Option B: Restore the secret", recommended=1,
+            )
+        self.assertEqual(title.call_args.args[-1], "Restore the secret")
+
+    def test_an_incident_echo_names_the_title(self):
+        adapter = _Adapter(fail=("chat_update",))
+        self._options_incident(
+            adapter, "apply Option A: Roll back to 14:02", "apply Option B: Restore the secret", recommended=1,
+        )
+        echo = next(entry[1] for entry in adapter.log if entry[0] == "chat_postMessage")
+        self.assertEqual(echo["text"], "✓ Jayanti: Restore the secret")
 
     def test_a_colon_form_with_a_hostname_slack_linked_still_counts(self):
         # Slack sends a typed hostname as <http://host|host>, and a typed url as <url>.
@@ -1451,7 +1644,7 @@ class RuntimeTest(unittest.TestCase):
         triage = {
             "headline": "Pod OOMKilled",
             "links": [("Cloud Logs", "https://console.cloud.google.com/logs")],
-            "choices": [("Apply Option A", "raise"), ("Apply Option B", "roll back")],
+            "choices": [("Apply Option A", "raise", False), ("Apply Option B", "roll back", False)],
         }
         # The report's own line that reads like the call to action stays: only the fallback's goes.
         report = f"Option A: raise the limit\n{presenter.CHOICES_LEAD}apply Option A or apply Option B"

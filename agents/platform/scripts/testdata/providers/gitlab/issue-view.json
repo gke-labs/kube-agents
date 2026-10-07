@@ -1,0 +1,80 @@
+{
+  "payload": {
+    "number": 1,
+    "comments": true
+  },
+  "responses": [
+    {
+      "id": 50009960,
+      "iid": 1,
+      "project_id": 1001,
+      "title": "[audit] proto ledger",
+      "description": "ledger body",
+      "state": "opened",
+      "created_at": "2026-10-01T14:57:34.147Z",
+      "updated_at": "2026-10-01T14:57:35.497Z",
+      "closed_at": null,
+      "labels": [
+        "agent:audit",
+        "audit:proto",
+        "status:held"
+      ],
+      "author": {
+        "id": 50031807,
+        "username": "example-maintainer",
+        "name": "Example Maintainer",
+        "state": "active",
+        "avatar_url": "https://gitlab.com/uploads/-/system/user/avatar/2001/avatar.png",
+        "web_url": "https://gitlab.com/example-maintainer"
+      },
+      "assignees": [],
+      "web_url": "https://gitlab.com/acme/infra/-/work_items/1",
+      "user_notes_count": 1,
+      "type": "ISSUE"
+    },
+    [
+      {
+        "id": 50087905,
+        "type": null,
+        "body": "/remediate please",
+        "author": {
+          "id": 50031807,
+          "username": "example-maintainer",
+          "name": "Example Maintainer",
+          "state": "active",
+          "avatar_url": "https://gitlab.com/uploads/-/system/user/avatar/2001/avatar.png",
+          "web_url": "https://gitlab.com/example-maintainer"
+        },
+        "created_at": "2026-10-01T14:57:34.911Z",
+        "updated_at": "2026-10-01T14:57:34.911Z",
+        "system": false,
+        "noteable_id": 3001,
+        "noteable_type": "Issue",
+        "noteable_iid": 1,
+        "resolvable": false,
+        "internal": false
+      },
+      {
+        "id": 50087908,
+        "type": null,
+        "body": "added ~agent:proto label",
+        "author": {
+          "id": 50031807,
+          "username": "example-maintainer",
+          "name": "Example Maintainer",
+          "state": "active",
+          "avatar_url": "https://gitlab.com/uploads/-/system/user/avatar/2001/avatar.png",
+          "web_url": "https://gitlab.com/example-maintainer"
+        },
+        "created_at": "2026-10-01T15:40:00.000Z",
+        "updated_at": "2026-10-01T14:57:34.911Z",
+        "system": true,
+        "noteable_id": 3001,
+        "noteable_type": "Issue",
+        "noteable_iid": 1,
+        "resolvable": false,
+        "internal": false
+      }
+    ]
+  ]
+}

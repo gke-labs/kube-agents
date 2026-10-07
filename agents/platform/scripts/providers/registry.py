@@ -24,8 +24,9 @@ from workspace_paths import WorkspaceError
 
 from .base import Forge, ForgeUnsupported, StubForge
 from .github import GitHubForge
+from .gitlab import GitLabForge
 
-AVAILABLE: tuple[type[Forge], ...] = (GitHubForge,)
+AVAILABLE: tuple[type[Forge], ...] = (GitHubForge, GitLabForge)
 
 
 # Hosts this design has a name and a shape for but no implementation of yet.
@@ -33,15 +34,6 @@ AVAILABLE: tuple[type[Forge], ...] = (GitHubForge,)
 # instead of being told its URL is not a repository of some forge it did not
 # ask about. Each entry is dropped the moment its package joins `AVAILABLE`.
 _UNIMPLEMENTED: tuple[tuple[str, tuple[str, ...], str, tuple[str, ...]], ...] = (
-    (
-        "gitlab",
-        ("gitlab.com",),
-        "merge request",
-        (
-            "no credential is configured for gitlab.com",
-            "merge requests and issues need a GitLab client in the broker",
-        ),
-    ),
     (
         "bitbucket",
         ("bitbucket.org",),
@@ -97,15 +89,22 @@ def load_forge_entries(path: str | None = None) -> list[dict[str, Any]] | None:
                 f"forges[{index}] in {path} needs a provider and a hostname "
                 "(no scheme, path or port)"
             )
-        allowed = item.get("allowedPaths") or []
-        if not isinstance(allowed, list) or not all(isinstance(p, str) for p in allowed):
+        # Absent is kept apart from empty: a forge whose credential reaches a
+        # whole host may require the administrator to say so (`[]`) rather
+        # than get it by leaving the field out.
+        allowed = item.get("allowedPaths")
+        if allowed is not None and (
+            not isinstance(allowed, list) or not all(isinstance(p, str) for p in allowed)
+        ):
             raise ValueError(f"forges[{index}].allowedPaths in {path} must be a list of paths")
         entries.append(
             {
                 "provider": provider,
                 "host": host,
                 "token_path": str(item.get("tokenPath") or "").strip(),
-                "allowed_paths": tuple(p.strip("/") for p in allowed if p.strip("/")),
+                # Passed through unfiltered: an entry that trims to nothing is
+                # the forge's to refuse, not the loader's to drop.
+                "allowed_paths": None if allowed is None else tuple(allowed),
             }
         )
     return entries
@@ -118,11 +117,24 @@ def build_forges(config: Mapping[str, Any] | None = None) -> tuple[Forge, ...]:
 
 
 def build_stubs(forges: tuple[Forge, ...]) -> tuple[Forge, ...]:
-    """The named gaps, minus anything an actual forge already answers for."""
+    """The named gaps, minus anything an actual forge already answers for.
+
+    Two sources: forges this design names and has no package for yet, and
+    forges this image has a package for that the install did not configure,
+    which each class describes itself (`Forge.default_hosts`).
+    """
     taken = {host for forge in forges for host in forge.hosts}
+    gaps = [
+        *_UNIMPLEMENTED,
+        *(
+            (cls.name, cls.default_hosts, cls.proposal_noun, cls.unconfigured)
+            for cls in AVAILABLE
+            if cls.default_hosts
+        ),
+    ]
     return tuple(
         StubForge(name, hosts, noun, missing)
-        for name, hosts, noun, missing in _UNIMPLEMENTED
+        for name, hosts, noun, missing in gaps
         if not taken.intersection(hosts)
     )
 

@@ -172,7 +172,8 @@ func TestTheMixedVersionKnobLetsAnUncapabledSubmissionThrough(t *testing.T) {
 	submitWithAuthority(t, c, session, taskID, "do the thing", nil)
 
 	cfg := adapterConfig(url, taskID, session,
-		stub(t, `echo '{"type":"result","subtype":"success","result":"done"}'`))
+		stub(t, `read first || exit 1
+echo '{"type":"result","subtype":"success","result":"done"}'`))
 	cfg.CapabilityOptional = true
 	out := waitOutcome(t, runAdapter(context.Background(), cfg), 30*time.Second)
 	if out.res.State != lib.StateCompleted {
