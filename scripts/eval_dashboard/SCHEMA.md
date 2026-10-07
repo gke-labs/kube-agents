@@ -1117,7 +1117,7 @@ them on 2026-09-08 — and the fields the health adjudicator reads (`build_id`,
 carries one, the how-it-ended fields — `has_build_log`, the `pod_*` trio,
 `merge_conflict`, `eval_verdict` — when the source has them, and per task
 `name`, `result`, `reps[].result` and the first
-96 characters of `reps[].reason`);
+128 characters of `reps[].reason`);
 its `trimmed` key records the source and the cut. Six of its zero-task runs
 carry `result: "failure"` in lowercase, as Prow wrote them on 2026-09-05 —
 the one departure from the `result` vocabulary above seen in the wild, so

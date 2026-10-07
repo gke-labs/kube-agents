@@ -182,32 +182,32 @@ class RepKinds(unittest.TestCase):
         broken_reasons = (
             (
                 "the record is not evidence of a real agent run: "
-                "record status is 'error' (failure wake: RuntimeError: posted nothing); "
+                "record status is 'error', not 'success' (failure wake: RuntimeError: posted nothing); "
                 "the trajectory is empty: the agent made no tool calls, which for these tasks means no agent ran"
             ),
             (
                 "the record is not evidence of a real agent run: "
-                "record status is 'error' (question wake: reply is not JSON (Expecting value: line 1 column 1 (char 0))); "
+                "record status is 'error', not 'success' (question wake: reply is not JSON (Expecting value: line 1 column 1 (char 0))); "
                 "the trajectory is empty: the agent made no tool calls, which for these tasks means no agent ran"
             ),
             (
                 "the record is not evidence of a real agent run: "
-                "record status is 'error' (thread context: none in ''); "
+                "record status is 'error', not 'success' (thread context: none in ''); "
                 "the trajectory is empty: the agent made no tool calls, which for these tasks means no agent ran"
             ),
             (
                 "the record is not evidence of a real agent run: "
-                "record status is 'error' ([bench:card-failure-wake]: replay declares no options); "
+                "record status is 'error', not 'success' ([bench:card-failure-wake]: replay declares no options); "
                 "the trajectory is empty: the agent made no tool calls, which for these tasks means no agent ran"
             ),
             (
                 "the record is not evidence of a real agent run: "
-                "record status is 'error' (ReplayBroken: plant script failed in the image); "
+                "record status is 'error', not 'success' (ReplayBroken: plant script failed in the image); "
                 "the trajectory is empty: the agent made no tool calls, which for these tasks means no agent ran"
             ),
             (
                 "the record is not evidence of a real agent run: "
-                "record status is 'error' (ReplayMismatch: circuit breaker did not trip); "
+                "record status is 'error', not 'success' (ReplayMismatch: circuit breaker did not trip); "
                 "the trajectory is empty: the agent made no tool calls, which for these tasks means no agent ran"
             ),
         )
@@ -219,6 +219,19 @@ class RepKinds(unittest.TestCase):
         self.assertEqual(t.fails, 2)
         self.assertEqual(t.storms, 0)
         self.assertTrue(t.collapsed)
+
+    def test_infra_dropout_with_replay_phrase_is_a_storm_not_a_fail(self):
+        # A genuine infra failure (result == "infra" or KUBE_AGENTS_INFRA_FAILURE in reason)
+        # must remain a storm even when the reason carries a replay error phrase.
+        wake_reason = (
+            "the record is not evidence of a real agent run: "
+            "record status is 'error', not 'success' (failure wake: RuntimeError: connection lost); "
+            "the trajectory is empty: the agent made no tool calls, which for these tasks means no agent ran"
+        )
+        self.assertEqual(health.rep_kind({"result": "infra", "reason": wake_reason}), "storm")
+
+        infra_marker_reason = f"KUBE_AGENTS_INFRA_FAILURE: {wake_reason}"
+        self.assertEqual(health.rep_kind({"result": "fail", "reason": infra_marker_reason}), "storm")
 
     def test_collapse_ignores_storm_reps_and_needs_a_graded_fail(self):
         self.assertTrue(health.Task(task("x", "fff")).collapsed)
@@ -2270,6 +2283,18 @@ class CommandLine(unittest.TestCase):
             self.assertEqual(trimmed["runs"][0]["tasks"][0]["reps"][2]["reason"], EMPTY_RECORD[: health.TRIM_REASON_CHARS])
             self.assertNotIn("n", trimmed["runs"][0]["tasks"][0]["reps"][0])
             self.assertEqual(health.load_json(out)["runs"], trimmed["runs"])
+
+    def test_trim_preserves_card_wake_replay_error_phrase_for_rep_kind(self):
+        full_reason = (
+            "the record is not evidence of a real agent run: "
+            "record status is 'error', not 'success' (failure wake: RuntimeError: posted nothing); "
+            "the trajectory is empty: the agent made no tool calls, which for these tasks means no agent ran"
+        )
+        doc = data(run(1, 1, T0, tasks=[{"name": "card-wake-test", "result": "fail", "reps": [{"result": "fail", "reason": full_reason}]}]))
+        trimmed_doc = health.trim(doc, T0 - timedelta(hours=1), T0 + timedelta(hours=1), "test")
+        trimmed_rep = trimmed_doc["runs"][0]["tasks"][0]["reps"][0]
+        self.assertEqual(health.rep_kind(trimmed_rep), "fail")
+        self.assertLessEqual(len(trimmed_rep["reason"]), health.TRIM_REASON_CHARS)
 
 
 # --------------------------------------------------------------------------- #

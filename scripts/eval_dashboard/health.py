@@ -583,9 +583,9 @@ STEP_RE = re.compile(r"(\d+)([mh])")
 # fixture is a week of real data.json, ten times smaller compressed.
 GZIP_SUFFIX = ".gz"
 # How many characters of a repetition's reason the fixture trimmer keeps:
-# every phrase STORM_REASON_RE matches sits inside the first 96 characters
-# of the harness's phrasings, and the dashboard keeps 300.
-TRIM_REASON_CHARS = 96
+# every phrase STORM_REASON_RE and REPLAY_ERROR_RE matches sits inside the
+# first 128 characters of the harness's phrasings, and the dashboard keeps 300.
+TRIM_REASON_CHARS = 128
 # The optional run fields (SCHEMA.md) the trimmer carries when the source has
 # them; absent stays absent: how the build ended, and the eval's own verdict,
 # which is what tells a deadline kill from a long red.
