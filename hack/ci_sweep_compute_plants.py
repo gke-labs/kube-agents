@@ -2,7 +2,7 @@
 """Sweep leftover Compute networks, subnets and addresses planted by killed bench runs.
 
 A bench stack that plants project-level Compute resources (such as
-`prebuilt/subnet-range-exhaustion` in #2468) creates a VPC network, subnet,
+`prebuilt/subnet-range-exhaustion` proposed in #2468) creates a VPC network, subnet,
 and internal addresses. A run killed hard between `tofu apply` and
 `tofu destroy` (e.g. deadline, node loss, SIGKILL) leaves those project-level
 resources behind.
@@ -19,10 +19,12 @@ Leftover VPCs and subnets count against project quotas and cause subsequent
 networking audit evaluations (SOP 2.1) to file false positive critical
 `subnet-ip-exhaustion` findings.
 
-This script runs from a Prow periodic on `main` (or manually via `--project`
-or `--pool`) to sweep Compute addresses, subnets, and networks whose
-`description` starts with `kube-agents-bench plant` and whose creation
-timestamp is older than `max_age_hours` (default: 4 hours).
+This script provides out-of-band cleanup (manually via `--project`
+or `--pool`, and designed for a future Prow periodic on `main`) to sweep Compute
+addresses, subnets, and networks whose `description` starts with
+`kube-agents-bench plant` and whose creation timestamp is older than
+`max_age_hours` (default: 4 hours). Note: this sweeper is currently inert
+until bench planter stacks in #2468 land with the matching description prefix.
 
 Deletion order is strictly dependency-ordered:
 1. Addresses go first (releasing in-use IP reservations on the subnet).
@@ -36,6 +38,7 @@ import json
 import os
 import pathlib
 import re
+import signal
 import subprocess
 import sys
 import time
@@ -45,6 +48,7 @@ import boskos_pool  # noqa: E402
 
 PLANT_DESCRIPTION_PREFIX = "kube-agents-bench plant"
 DEFAULT_MAX_AGE_HOURS = 4.0
+SECONDS_PER_HOUR = 3600.0
 
 REPORT_FILE = "compute-sweep.json"
 REPORT_SCHEMA_VERSION = 1
@@ -58,9 +62,7 @@ ISO_UTC_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 ARTIFACTS_ENV = "ARTIFACTS"
 
 BOSKOS_DEFAULT_SERVER = boskos_pool.DEFAULT_SERVER
-BOSKOS_RESOURCE_TYPE = boskos_pool.RESOURCE_TYPE
 BOSKOS_SWEEP_STATE = "cleaning"
-BOSKOS_MAX_CONSECUTIVE_REPEATS = boskos_pool.MAX_CONSECUTIVE_REPEATS
 DEFAULT_BOSKOS_OWNER = "ci-kube-agents-compute-sweep"
 BOSKOS_STRANDED_AFTER = "5m"
 TERMINATED_EXIT_CODE = boskos_pool.TERMINATED_EXIT_CODE
@@ -73,6 +75,10 @@ MAPPING_LINE_RE = re.compile(r'^\s+([A-Za-z0-9-]+)\)\s+echo "([^"/]+/[^"]+)"\s+;
 
 class SweepError(Exception):
     """A sweep operation failed for a project."""
+
+    def __init__(self, message: str, deleted: dict | None = None):
+        super().__init__(message)
+        self.deleted = deleted or {"addresses": [], "subnets": [], "networks": []}
 
 
 def parse_timestamp(ts_str: str | None) -> datetime | None:
@@ -96,7 +102,7 @@ def is_older_than(ts_str: str | None, max_age_hours: float, now: datetime | None
         return False
     if now is None:
         now = datetime.now(timezone.utc)
-    return (now - dt).total_seconds() >= max_age_hours * 3600.0
+    return (now - dt).total_seconds() >= max_age_hours * SECONDS_PER_HOUR
 
 
 def matches_plant_description(description: str | None) -> bool:
@@ -262,7 +268,7 @@ def sweep_project(
         for kind, err_list in failed.items():
             if err_list:
                 fault_msgs.append(f"{kind}: {', '.join(f'{n} ({e})' for n, e in err_list)}")
-        raise SweepError(f"{project}: {'; '.join(fault_msgs)}")
+        raise SweepError(f"{project}: {'; '.join(fault_msgs)}", deleted=deleted)
 
     verb = "would delete" if dry_run else "deleted"
     print(
@@ -321,6 +327,13 @@ def sweep_pool(
             raise
         except Exception as exc:
             print(f"  {name}: {boskos_pool.describe(exc)}", file=sys.stderr)
+            del_counts = getattr(exc, "deleted", None)
+            if del_counts and (del_counts.get("addresses") or del_counts.get("subnets") or del_counts.get("networks")):
+                deleted[name] = {
+                    "addresses": len(del_counts.get("addresses", [])),
+                    "subnets": len(del_counts.get("subnets", [])),
+                    "networks": len(del_counts.get("networks", [])),
+                }
             failures[name] = boskos_pool.describe(exc)
 
     release_failures = {}
@@ -369,6 +382,7 @@ def write_report(path: str | None, args: argparse.Namespace, run: dict, code: in
         "exit": names.get(code, EXIT_NAME_ERROR),
         "exit_code": code,
         "error": error,
+        "ended_early": run.get("ended_early"),
         "deleted": run.get("deleted", {}),
         "failures": run.get("failures", {}),
         "unmapped": run.get("unmapped", []),
@@ -402,13 +416,13 @@ def main(argv=None) -> int:
     )
     parser.add_argument(
         "--boskos-server",
-        default=BOSKOS_DEFAULT_SERVER,
-        help=f"Boskos API endpoint (default: {BOSKOS_DEFAULT_SERVER})",
+        default=os.environ.get("BOSKOS_SERVER", BOSKOS_DEFAULT_SERVER),
+        help=f"Boskos API endpoint (default: $BOSKOS_SERVER, else {BOSKOS_DEFAULT_SERVER})",
     )
     parser.add_argument(
         "--boskos-owner",
-        default=DEFAULT_BOSKOS_OWNER,
-        help=f"owner identity when acquiring from Boskos (default: {DEFAULT_BOSKOS_OWNER})",
+        default=os.environ.get("BOSKOS_OWNER") or DEFAULT_BOSKOS_OWNER,
+        help=f"owner name the acquisitions are recorded under (default: $BOSKOS_OWNER, else {DEFAULT_BOSKOS_OWNER})",
     )
     parser.add_argument(
         "--report",
@@ -417,6 +431,8 @@ def main(argv=None) -> int:
     )
 
     args = parser.parse_args(argv)
+    for sig in boskos_pool.TERMINATION_SIGNALS:
+        signal.signal(sig, boskos_pool.terminate)
     started = time.time()
     run = {"deleted": {}, "failures": {}, "unmapped": [], "skipped": []}
     code = 0
@@ -434,6 +450,13 @@ def main(argv=None) -> int:
             except SweepError as exc:
                 code = 1
                 error = str(exc)
+                del_counts = getattr(exc, "deleted", None)
+                if del_counts and (del_counts.get("addresses") or del_counts.get("subnets") or del_counts.get("networks")):
+                    run["deleted"][args.project] = {
+                        "addresses": len(del_counts.get("addresses", [])),
+                        "subnets": len(del_counts.get("subnets", [])),
+                        "networks": len(del_counts.get("networks", [])),
+                    }
                 run["failures"][args.project] = str(exc)
                 print(f"ERROR: {exc}", file=sys.stderr)
         else:
@@ -454,10 +477,11 @@ def main(argv=None) -> int:
         code = TERMINATED_EXIT_CODE
         error = f"terminated ({exc})"
         print(f"ERROR: {error}", file=sys.stderr)
-    except Exception as exc:
+    except BaseException as exc:
         code = 1
         error = f"{type(exc).__name__}: {exc}"
         print(f"ERROR: {error}", file=sys.stderr)
+        raise
     finally:
         write_report(args.report, args, run, code, error, started)
 

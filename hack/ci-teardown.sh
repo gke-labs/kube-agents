@@ -20,8 +20,8 @@
 # script's to close: that takes a write credential, and a presubmit runs the
 # pull request's own code, so the sweep runs from a periodic that executes only
 # main (hack/ci_sweep_agent_pulls.py, #1755). Compute VPC networks, subnets and
-# addresses planted by killed bench runs are likewise swept by a periodic
-# executing only main (hack/ci_sweep_compute_plants.py, #2552).
+# addresses planted by killed bench runs can be swept out-of-band using
+# hack/ci_sweep_compute_plants.py (#2552).
 # ==============================================================================
 
 set -uo pipefail

@@ -346,6 +346,42 @@ class SweepProjectTest(unittest.TestCase):
         self.assertIn("locked-addr", str(ctx.exception))
         self.assertIn("resourceInUseByAnotherResource", str(ctx.exception))
 
+    def test_partial_deletion_failure_attaches_deleted_resources_to_sweep_error(self):
+        def mock_runner(cmd, capture_output=True, text=True, check=False):
+            if "list" in cmd and "addresses" in cmd:
+                return mock.Mock(
+                    returncode=0,
+                    stdout=json.dumps([{
+                        "name": "addr-1",
+                        "description": self.plant_desc,
+                        "creationTimestamp": self.old_ts,
+                    }]),
+                    stderr="",
+                )
+            if "list" in cmd and "networks" in cmd and "subnets" not in cmd:
+                return mock.Mock(
+                    returncode=0,
+                    stdout=json.dumps([{
+                        "name": "net-1",
+                        "description": self.plant_desc,
+                        "creationTimestamp": self.old_ts,
+                    }]),
+                    stderr="",
+                )
+            if "list" in cmd:
+                return mock.Mock(returncode=0, stdout="[]", stderr="")
+            if "delete" in cmd and "addresses" in cmd:
+                return mock.Mock(returncode=0, stdout="", stderr="")
+            if "delete" in cmd and "networks" in cmd:
+                return mock.Mock(returncode=1, stdout="", stderr="networkInUse")
+            return mock.Mock(returncode=0, stdout="", stderr="")
+
+        with self.assertRaises(sweep.SweepError) as ctx:
+            sweep.sweep_project("my-project", runner=mock_runner, now=self.now)
+        self.assertIn("net-1 (networkInUse)", str(ctx.exception))
+        self.assertEqual(ctx.exception.deleted["addresses"], ["addr-1"])
+        self.assertEqual(ctx.exception.deleted["networks"], [])
+
 
 class SweepPoolTest(unittest.TestCase):
     def test_sweep_pool_walks_boskos_and_cleans(self):
@@ -382,6 +418,60 @@ class SweepPoolTest(unittest.TestCase):
             self.assertEqual(deleted["proj-1"]["addresses"], 1)
             self.assertEqual(deleted["proj-1"]["networks"], 1)
 
+    def test_sweep_pool_partial_failure_retains_deleted_in_report(self):
+        def fake_walk(server, owner, state, limit, visit_callback, heartbeat=True, release_failures=None):
+            visit_callback("proj-1")
+
+        def fake_sweep_project(name, max_age_hours=4.0, dry_run=False, runner=None, now=None):
+            raise sweep.SweepError(
+                "proj-1: networks: net-1 (inUse)",
+                deleted={"addresses": ["addr-1"], "subnets": [], "networks": []},
+            )
+
+        with (
+            mock.patch.object(sweep.boskos_pool, "walk", side_effect=fake_walk),
+            mock.patch.object(sweep, "boskos_reset_stranded"),
+            mock.patch.object(sweep, "sweep_project", side_effect=fake_sweep_project),
+        ):
+            report = {}
+            deleted, failures, unmapped = sweep.sweep_pool(
+                "http://fake-boskos",
+                "test-owner",
+                4.0,
+                {"proj-1"},
+                report=report,
+            )
+            self.assertIn("proj-1", deleted)
+            self.assertEqual(deleted["proj-1"]["addresses"], 1)
+            self.assertEqual(deleted["proj-1"]["subnets"], 0)
+            self.assertEqual(deleted["proj-1"]["networks"], 0)
+            self.assertIn("proj-1", failures)
+            self.assertIn("net-1 (inUse)", failures["proj-1"])
+
+    def test_sweep_pool_termination_records_ended_early_and_re_raises(self):
+        def fake_walk(server, owner, state, limit, visit_callback, heartbeat=True, release_failures=None):
+            visit_callback("proj-1")
+
+        def fake_sweep_project(name, max_age_hours=4.0, dry_run=False, runner=None, now=None):
+            raise sweep.Terminated("signal 15")
+
+        with (
+            mock.patch.object(sweep.boskos_pool, "walk", side_effect=fake_walk),
+            mock.patch.object(sweep, "boskos_reset_stranded"),
+            mock.patch.object(sweep, "sweep_project", side_effect=fake_sweep_project),
+        ):
+            report = {}
+            with self.assertRaises(sweep.Terminated):
+                sweep.sweep_pool(
+                    "http://fake-boskos",
+                    "test-owner",
+                    4.0,
+                    {"proj-1"},
+                    report=report,
+                )
+            self.assertEqual(report.get("ended_early"), "signal 15")
+            self.assertEqual(report.get("failures", {}).get("proj-1"), "signal 15")
+
 
 class WriteReportTest(unittest.TestCase):
     def test_report_structure(self):
@@ -395,6 +485,7 @@ class WriteReportTest(unittest.TestCase):
                 "failures": {},
                 "unmapped": [],
                 "skipped": [],
+                "ended_early": None,
             }
             sweep.write_report(report_path, args, run, 0, None, 1000.0)
 
@@ -406,12 +497,73 @@ class WriteReportTest(unittest.TestCase):
             self.assertEqual(data["exit"], "ok")
             self.assertEqual(data["exit_code"], 0)
             self.assertIsNone(data["error"])
+            self.assertIsNone(data["ended_early"])
             self.assertEqual(data["deleted"]["p1"]["addresses"], 3)
         finally:
             pathlib.Path(report_path).unlink(missing_ok=True)
 
 
 class MainCliTest(unittest.TestCase):
+    def test_signals_installed(self):
+        with (
+            mock.patch.object(sweep.signal, "signal") as mock_signal,
+            mock.patch.object(sweep, "sweep_project", return_value={"addresses": [], "subnets": [], "networks": []}),
+        ):
+            sweep.main(["--project", "p1"])
+            installed_sigs = [call.args[0] for call in mock_signal.call_args_list]
+            for sig in sweep.boskos_pool.TERMINATION_SIGNALS:
+                self.assertIn(sig, installed_sigs)
+
+    def test_boskos_env_defaults(self):
+        env = {"BOSKOS_SERVER": "http://env-boskos:8888", "BOSKOS_OWNER": "env-owner-user"}
+        with (
+            mock.patch.dict(sweep.os.environ, env),
+            mock.patch.object(sweep, "pool_projects", return_value={"p1"}),
+            mock.patch.object(sweep, "sweep_pool", return_value=({}, {}, [])) as mock_pool,
+        ):
+            sweep.main(["--pool"])
+            mock_pool.assert_called_once()
+            args = mock_pool.call_args.args
+            self.assertEqual(args[0], "http://env-boskos:8888")
+            self.assertEqual(args[1], "env-owner-user")
+
+    def test_termination_returns_143_and_writes_report(self):
+        with tempfile.NamedTemporaryFile("w", delete=False) as tf:
+            report_path = tf.name
+
+        try:
+            with (
+                mock.patch.object(sweep, "pool_projects", return_value={"p1"}),
+                mock.patch.object(sweep, "sweep_pool", side_effect=sweep.Terminated("signal 15")),
+            ):
+                code = sweep.main(["--pool", "--report", report_path])
+                self.assertEqual(code, sweep.TERMINATED_EXIT_CODE)
+                data = json.loads(pathlib.Path(report_path).read_text(encoding="utf-8"))
+                self.assertEqual(data["exit"], "terminated")
+                self.assertEqual(data["exit_code"], sweep.TERMINATED_EXIT_CODE)
+                self.assertIn("signal 15", data["error"])
+        finally:
+            pathlib.Path(report_path).unlink(missing_ok=True)
+
+    def test_project_partial_failure_records_deleted_in_report(self):
+        with tempfile.NamedTemporaryFile("w", delete=False) as tf:
+            report_path = tf.name
+
+        try:
+            err = sweep.SweepError(
+                "p1: networks: net-1 (inUse)",
+                deleted={"addresses": ["addr-1"], "subnets": [], "networks": []},
+            )
+            with mock.patch.object(sweep, "sweep_project", side_effect=err):
+                code = sweep.main(["--project", "p1", "--report", report_path])
+                self.assertEqual(code, 1)
+                data = json.loads(pathlib.Path(report_path).read_text(encoding="utf-8"))
+                self.assertEqual(data["exit"], "failed")
+                self.assertEqual(data["deleted"]["p1"]["addresses"], 1)
+                self.assertEqual(data["failures"]["p1"], str(err))
+        finally:
+            pathlib.Path(report_path).unlink(missing_ok=True)
+
     def test_project_mode_invocation(self):
         with mock.patch.object(sweep, "sweep_project", return_value={"addresses": [], "subnets": [], "networks": []}) as mock_sp:
             code = sweep.main(["--project", "p1", "--dry-run", "--max-age-hours", "2.5"])
