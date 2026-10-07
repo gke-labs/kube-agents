@@ -3845,7 +3845,30 @@ def check_untargeted_compute_class_workload(workload: dict, context: dict) -> di
     if not node_pools:
         return None
 
-    untainted_pools = [p for p in node_pools if not _pool_has_workload_taints(p)]
+    def _pool_is_active_capacity(p: dict) -> bool:
+        status = p.get("status", "RUNNING")
+        if status not in AUDITABLE_STATUSES:
+            return False
+        autoscaling = p.get("autoscaling")
+        if autoscaling and autoscaling.get("enabled"):
+            return True
+        if context.get("nodes"):
+            return any(
+                (n.get("metadata", {}).get("labels") or {}).get("cloud.google.com/gke-nodepool") == p.get("name")
+                for n in context["nodes"]
+            )
+        if "currentNodeCount" in p:
+            return p["currentNodeCount"] > 0
+        if "initialNodeCount" in p:
+            return p["initialNodeCount"] > 0
+        if autoscaling is not None and not autoscaling.get("enabled"):
+            return False
+        return True
+
+    untainted_pools = [
+        p for p in node_pools
+        if _pool_is_active_capacity(p) and not _pool_has_workload_taints(p)
+    ]
     if not untainted_pools:
         return None
 
@@ -3858,10 +3881,11 @@ def check_untargeted_compute_class_workload(workload: dict, context: dict) -> di
             return None
         pool_ccs.add(val)
 
-    # Workload pod spec must not tolerate the taints on the remaining non-ComputeClass pools
+    # Workload pod spec must not tolerate the taints on the remaining non-ComputeClass pools with active capacity
     non_cc_pools = [
         p for p in node_pools
-        if not ((p.get("config") or {}).get("labels") or {}).get(COMPUTE_CLASS_LABEL)
+        if _pool_is_active_capacity(p)
+        and not ((p.get("config") or {}).get("labels") or {}).get(COMPUTE_CLASS_LABEL)
     ]
     pod_tolerations = template.get("tolerations") or []
 
@@ -3895,24 +3919,91 @@ def check_untargeted_compute_class_workload(workload: dict, context: dict) -> di
             return True
         return all(_tolerates_taint(tolerations, t) for t in taints)
 
-    def _pool_matches_selector(pool: dict, selector: dict[str, str]) -> bool:
+    _GKE_KNOWN_POOL_LABEL_KEYS = frozenset({
+        "cloud.google.com/gke-nodepool",
+        "cloud.google.com/gke-accelerator",
+        "cloud.google.com/gke-spot",
+        "cloud.google.com/gke-preemptible",
+        "cloud.google.com/machine-family",
+        "node.kubernetes.io/instance-type",
+        "kubernetes.io/os",
+        "kubernetes.io/arch",
+    })
+
+    def _pool_effective_labels(p: dict) -> dict[str, str]:
+        config = p.get("config") or {}
+        labels = dict(config.get("labels") or {})
+        pool_name = p.get("name")
+        if pool_name:
+            labels["cloud.google.com/gke-nodepool"] = pool_name
+        accelerators = config.get("accelerators") or []
+        if accelerators and isinstance(accelerators, list) and accelerators[0].get("acceleratorType"):
+            labels["cloud.google.com/gke-accelerator"] = accelerators[0]["acceleratorType"]
+        if config.get("spot"):
+            labels["cloud.google.com/gke-spot"] = "true"
+        elif "spot" in config:
+            labels["cloud.google.com/gke-spot"] = "false"
+        if config.get("preemptible"):
+            labels["cloud.google.com/gke-preemptible"] = "true"
+        elif "preemptible" in config:
+            labels["cloud.google.com/gke-preemptible"] = "false"
+        machine_type = config.get("machineType")
+        if machine_type:
+            labels["node.kubernetes.io/instance-type"] = machine_type
+            family = machine_type.split("-")[0]
+            labels["cloud.google.com/machine-family"] = family
+        os_name = config.get("operatingSystem") or "linux"
+        labels["kubernetes.io/os"] = os_name
+        arch = config.get("architecture")
+        if not arch and machine_type:
+            arch = "arm64" if "arm" in machine_type.lower() or machine_type.startswith("t2a-") else "amd64"
+        if arch:
+            labels["kubernetes.io/arch"] = arch
+        return labels
+
+    def _pool_matches_selector(pool: dict, selector: dict[str, str]) -> bool | None:
         if not selector:
             return True
-        labels = (pool.get("config") or {}).get("labels") or {}
-        return all(labels.get(k) == v for k, v in selector.items())
+        effective_labels = _pool_effective_labels(pool)
+        has_unknown = False
+        for k, v in selector.items():
+            if k in effective_labels:
+                if effective_labels[k] != v:
+                    return False
+            elif k in ("topology.kubernetes.io/zone", "topology.gke.io/zone"):
+                locations = pool.get("locations") or []
+                if locations:
+                    if v not in locations:
+                        return False
+                else:
+                    has_unknown = True
+            elif k in _GKE_KNOWN_POOL_LABEL_KEYS:
+                return False
+            else:
+                has_unknown = True
+        return None if has_unknown else True
 
-    # If the workload can schedule on any non-ComputeClass pool, non-CC capacity is available
+    # If the workload can schedule on any non-ComputeClass pool with active capacity, non-CC capacity is available
     if non_cc_pools and any(
-        _pool_matches_selector(p, node_selector) and _tolerates_pool(pod_tolerations, p)
+        _pool_matches_selector(p, node_selector) is not False and _tolerates_pool(pod_tolerations, p)
         for p in non_cc_pools
     ):
+        return None
+
+    # Treat selector keys the inventory cannot resolve as unknown; do not manufacture a false major
+    if any(_pool_matches_selector(p, node_selector) is None for p in node_pools):
         return None
 
     # Workload-conditional ComputeClass determination:
     schedulable_pools = [
         p for p in node_pools
-        if _pool_matches_selector(p, node_selector) and _tolerates_pool(pod_tolerations, p)
+        if _pool_is_active_capacity(p)
+        and _pool_matches_selector(p, node_selector) is True
+        and _tolerates_pool(pod_tolerations, p)
     ]
+    if not schedulable_pools:
+        return None
+
     schedulable_ccs = {
         ((p.get("config") or {}).get("labels") or {}).get(COMPUTE_CLASS_LABEL)
         for p in schedulable_pools
@@ -3920,17 +4011,16 @@ def check_untargeted_compute_class_workload(workload: dict, context: dict) -> di
     schedulable_ccs.discard(None)
     schedulable_ccs.discard("")
 
-    pool_target_cc = next(iter(pool_ccs)) if len(pool_ccs) == 1 else ""
     untainted_gp_ccs = [cc for cc in compute_classes if _is_untainted_gp_compute_class(cc, node_pools=node_pools)]
+    untainted_gp_names = {cc.get("metadata", {}).get("name") for cc in untainted_gp_ccs}
 
     if len(schedulable_ccs) == 1:
         target_candidate = next(iter(schedulable_ccs))
-        if (
-            target_candidate == pool_target_cc
-            and len(untainted_gp_ccs) == 1
-            and untainted_gp_ccs[0].get("metadata", {}).get("name") == pool_target_cc
-        ):
-            single_cc = pool_target_cc
+        if target_candidate in untainted_gp_names:
+            if len(untainted_gp_ccs) == 1:
+                single_cc = target_candidate
+            else:
+                single_cc = ""
         elif any(cc.get("metadata", {}).get("name") == target_candidate for cc in compute_classes):
             single_cc = target_candidate
         else:

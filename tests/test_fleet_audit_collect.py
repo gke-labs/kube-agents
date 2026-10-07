@@ -405,7 +405,7 @@ class TestUntargetedComputeClassWorkload(unittest.TestCase):
         manual_pool_cc = compute_class("manual-pool-cc", priorities=[{"nodepools": ["pool-a"]}])
         pool_a = pool(
             "pool-a",
-            labels={"cloud.google.com/gke-nodepool": "pool-a", "cloud.google.com/compute-class": "standard-cc"},
+            labels={"cloud.google.com/compute-class": "standard-cc"},
             taints=[{"key": "workload-specific", "value": "true", "effect": "NO_SCHEDULE"}],
         )
         wl = collect.normalize_workloads({"items": [deployment("api")]})[0]
@@ -491,11 +491,11 @@ class TestUntargetedComputeClassWorkload(unittest.TestCase):
     def test_workload_pinned_to_tainted_compute_class_pool_resolves_to_that_pool_class(self):
         base_pool = pool(
             "base-pool",
-            labels={collect.COMPUTE_CLASS_LABEL: "base", "cloud.google.com/gke-nodepool": "base-pool"},
+            labels={collect.COMPUTE_CLASS_LABEL: "base"},
         )
         batch_pool = pool(
             "batch-pool",
-            labels={collect.COMPUTE_CLASS_LABEL: "batch", "cloud.google.com/gke-nodepool": "batch-pool"},
+            labels={collect.COMPUTE_CLASS_LABEL: "batch"},
             taints=[{"key": collect.COMPUTE_CLASS_LABEL, "value": "batch", "effect": "NO_SCHEDULE"}],
         )
         cc_base = compute_class("base")
@@ -534,9 +534,86 @@ class TestUntargetedComputeClassWorkload(unittest.TestCase):
             )]
         })[0]
         hit_conflicted = collect.check_untargeted_compute_class_workload(wl_conflicted, ctx)
-        self.assertIsNotNone(hit_conflicted)
-        self.assertEqual(hit_conflicted["single_compute_class"], "")
-        self.assertTrue(hit_conflicted["multiple_compute_classes"])
+        self.assertIsNone(hit_conflicted)
+
+    def test_stopped_or_zero_sized_non_cc_pool_does_not_clear_cluster_capacity(self):
+        cc_pool = pool("cc-pool", labels={"cloud.google.com/compute-class": "base"})
+        stopped_pool = pool("stopped-pool", labels={}, autoscaling={"enabled": True})
+        stopped_pool["status"] = "STOPPING"
+        error_pool = pool("error-pool", labels={}, autoscaling={"enabled": True})
+        error_pool["status"] = "ERROR"
+        zero_pool = pool(
+            "parked-zero-pool",
+            labels={},
+            autoscaling={"enabled": False},
+        )
+        zero_pool["initialNodeCount"] = 0
+        cc = compute_class("base")
+        ctx = {
+            "compute_classes": [cc],
+            "node_pools": [cc_pool, stopped_pool, error_pool, zero_pool],
+            "namespaces": [self.ns],
+        }
+        wl = collect.normalize_workloads({"items": [deployment("api")]})[0]
+        hit = collect.check_untargeted_compute_class_workload(wl, ctx)
+        self.assertIsNotNone(hit)
+        self.assertEqual(hit["single_compute_class"], "base")
+
+    def test_multiple_untainted_general_purpose_compute_classes_clears_single_compute_class(self):
+        base_pool = pool("base-pool", labels={"cloud.google.com/compute-class": "base"})
+        cc_base = compute_class("base")
+        cc_burst = compute_class("burst")
+        ctx = {
+            "compute_classes": [cc_base, cc_burst],
+            "node_pools": [base_pool],
+            "namespaces": [self.ns],
+        }
+        wl = collect.normalize_workloads({"items": [deployment("api")]})[0]
+        hit = collect.check_untargeted_compute_class_workload(wl, ctx)
+        self.assertIsNotNone(hit)
+        self.assertEqual(hit["single_compute_class"], "")
+        self.assertTrue(hit["multiple_compute_classes"])
+
+    def test_workload_selecting_gke_nodepool_with_empty_config_labels_matches(self):
+        base_pool = pool("base-pool", labels={"cloud.google.com/compute-class": "base"})
+        gpu_pool = pool(
+            "gpu-pool",
+            labels={},
+            taints=[{"key": "nvidia.com/gpu", "value": "present", "effect": "NO_SCHEDULE"}],
+        )
+        cc_base = compute_class("base")
+        ctx = {
+            "compute_classes": [cc_base],
+            "node_pools": [base_pool, gpu_pool],
+            "namespaces": [self.ns],
+        }
+        wl = collect.normalize_workloads({
+            "items": [deployment(
+                "gpu-worker",
+                node_selector={"cloud.google.com/gke-nodepool": "gpu-pool"},
+                tolerations=[{"key": "nvidia.com/gpu", "value": "present", "effect": "NoSchedule"}],
+            )]
+        })[0]
+        # Pinned to non-CC gpu-pool with empty config.labels and tolerating its taint -> non-CC capacity available -> not flagged
+        hit = collect.check_untargeted_compute_class_workload(wl, ctx)
+        self.assertIsNone(hit)
+
+    def test_workload_with_unresolvable_unknown_selector_key_is_not_flagged(self):
+        base_pool = pool("base-pool", labels={"cloud.google.com/compute-class": "base"})
+        cc_base = compute_class("base")
+        ctx = {
+            "compute_classes": [cc_base],
+            "node_pools": [base_pool],
+            "namespaces": [self.ns],
+        }
+        wl = collect.normalize_workloads({
+            "items": [deployment(
+                "custom-worker",
+                node_selector={"custom.io/unverifiable-label": "special"},
+            )]
+        })[0]
+        hit = collect.check_untargeted_compute_class_workload(wl, ctx)
+        self.assertIsNone(hit)
 
     def test_transient_controller_and_cloud_provider_taints_on_non_cc_nodes(self):
         ca_pool = pool(
