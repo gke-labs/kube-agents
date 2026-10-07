@@ -167,8 +167,8 @@ the `secrets: inherit` gap
 [`scripts/release/README.md`](../scripts/release/README.md) describes for
 `GH_APP_ID`, which drops every secret the same way.
 
-`ENABLE_GKE_BACKUP_PLAN`, `ENABLE_GVISOR`, and `HERMES_DASHBOARD_ENABLED` are checked
-there too, for spelling rather than presence. All three reach `install.sh` as
+`ENABLE_GKE_BACKUP_PLAN`, `ENABLE_GVISOR`, `HERMES_DASHBOARD_ENABLED`, and `WEB_CONSOLE_ENABLED` are checked
+there too, for spelling rather than presence. All four reach `install.sh` as
 `--enable-*` flags, whose validator takes `true` or `false` and nothing else, while
 the same values travelling through `install.env` reach `is_truthy`, which also takes
 `True`/`yes`/`y`/`1`/`on`. `provision_environment.sh` folds the second list into

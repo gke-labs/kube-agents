@@ -901,6 +901,12 @@ resource "helm_release" "kube_agents" {
         gsaName = module.github_minter[0].service_account_id
       } : {}
     )
+    # The browser chat page for installs with no chat platform. Only the
+    # switch: its image follows platformAgent.deployment.image.tag and
+    # global.imageRegistry, and its Service is ClusterIP by construction.
+    webConsole = {
+      enabled = var.web_console_enabled
+    }
     plugins = {
       pubsubPlatform = merge(
         {

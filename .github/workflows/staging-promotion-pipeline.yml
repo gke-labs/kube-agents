@@ -312,6 +312,7 @@ jobs:
           MEMORY_PROVIDER: ${{ vars.MEMORY_PROVIDER }}
           USER_PROFILE_ENABLED: ${{ vars.USER_PROFILE_ENABLED }}
           HERMES_DASHBOARD_ENABLED: ${{ vars.HERMES_DASHBOARD_ENABLED }}
+          WEB_CONSOLE_ENABLED: ${{ vars.WEB_CONSOLE_ENABLED }}
           KMS_KEYRING: ${{ vars.KMS_KEYRING }}
           KMS_KEY: ${{ vars.KMS_KEY }}
           GITOPS_ORG: ${{ vars.GITOPS_ORG }}

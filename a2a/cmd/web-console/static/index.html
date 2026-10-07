@@ -1,0 +1,832 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Kube-Agents Operations Console</title>
+  <style>
+    :root {
+      --gcp-blue: #1a73e8;
+      --gcp-blue-hover: #1557b0;
+      --gcp-blue-light: #e8f0fe;
+      --text-primary: #202124;
+      --text-secondary: #5f6368;
+      --text-muted: #80868b;
+      --bg-page: #f8f9fa;
+      --bg-surface: #ffffff;
+      --border-color: #dadce0;
+      --border-subtle: #f1f3f4;
+      --green-bg: #e6f4ea;
+      --green-text: #137333;
+      --amber-bg: #fef7e0;
+      --amber-text: #b06000;
+      --red-bg: #fce8e6;
+      --red-text: #c5221f;
+      --font-sans: 'Google Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      --font-mono: 'Roboto Mono', monospace;
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: var(--font-sans);
+      background-color: var(--bg-page);
+      color: var(--text-primary);
+      height: 100vh;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+      -webkit-font-smoothing: antialiased;
+    }
+
+    /* Top App Header */
+    header {
+      background: var(--bg-surface);
+      border-bottom: 1px solid var(--border-color);
+      height: 56px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 0 20px;
+      flex-shrink: 0;
+      z-index: 10;
+    }
+
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+
+    .brand-logo {
+      height: 28px;
+      width: auto;
+    }
+
+    .brand-title {
+      font-size: 17px;
+      font-weight: 500;
+      color: var(--text-primary);
+      letter-spacing: -0.2px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .cluster-pill {
+      font-size: 11.5px;
+      font-weight: 500;
+      background: var(--gcp-blue-light);
+      color: var(--gcp-blue);
+      padding: 3px 8px;
+      border-radius: 12px;
+      margin-left: 8px;
+      font-family: var(--font-mono);
+    }
+
+    .header-actions {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 12px;
+      font-weight: 500;
+      padding: 4px 10px;
+      border-radius: 12px;
+    }
+
+    .badge-dot {
+      width: 7px;
+      height: 7px;
+      border-radius: 50%;
+    }
+
+    .badge-green { background: var(--green-bg); color: var(--green-text); }
+    .badge-green .badge-dot { background: var(--green-text); }
+    .badge-amber { background: var(--amber-bg); color: var(--amber-text); }
+    .badge-amber .badge-dot { background: var(--amber-text); }
+    .badge-red { background: var(--red-bg); color: var(--red-text); }
+    .badge-red .badge-dot { background: var(--red-text); }
+    .badge-grey { background: var(--border-subtle); color: var(--text-secondary); }
+    .badge-grey .badge-dot { background: var(--text-muted); }
+
+    /* Main Container */
+    /* min-height: 0 on main, its single row, and both columns keeps the
+       session list from growing the row past the window, which pushed the
+       message box off the bottom of the page. */
+    main {
+      flex: 1;
+      min-height: 0;
+      display: grid;
+      grid-template-columns: 1fr 380px;
+      grid-template-rows: minmax(0, 1fr);
+      overflow: hidden;
+    }
+
+    /* Left Column: Chat Console */
+    .chat-section {
+      display: flex;
+      flex-direction: column;
+      background: var(--bg-surface);
+      border-right: 1px solid var(--border-color);
+      height: 100%;
+      min-height: 0;
+      position: relative;
+    }
+
+    .prompt-chips-bar {
+      padding: 12px 20px;
+      border-bottom: 1px solid var(--border-subtle);
+      background: var(--bg-surface);
+      display: flex;
+      gap: 8px;
+      overflow-x: auto;
+      white-space: nowrap;
+      flex-shrink: 0;
+    }
+
+    .chip {
+      background: var(--bg-page);
+      border: 1px solid var(--border-color);
+      border-radius: 16px;
+      padding: 6px 14px;
+      font-size: 12.5px;
+      font-weight: 500;
+      color: var(--text-primary);
+      cursor: pointer;
+      transition: all 0.15s ease;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      font-family: var(--font-sans);
+    }
+
+    .chip:disabled {
+      cursor: not-allowed;
+      opacity: 0.5;
+    }
+
+    .chip:hover:not(:disabled) {
+      background: var(--gcp-blue-light);
+      color: var(--gcp-blue);
+      border-color: #aecbfa;
+    }
+
+    .chat-stream {
+      flex: 1;
+      overflow-y: auto;
+      padding: 24px;
+      display: flex;
+      flex-direction: column;
+      gap: 20px;
+    }
+
+    .message-row {
+      display: flex;
+      gap: 14px;
+      max-width: 860px;
+      margin: 0 auto;
+      width: 100%;
+    }
+
+    .avatar {
+      width: 32px;
+      height: 32px;
+      border-radius: 50%;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      flex-shrink: 0;
+      font-size: 15px;
+      font-weight: 700;
+    }
+
+    .avatar-agent {
+      background: linear-gradient(135deg, #4285f4, #34a853);
+      color: white;
+      box-shadow: 0 1px 3px rgba(0,0,0,0.12);
+    }
+
+    .avatar-user {
+      background: #70757a;
+      color: white;
+    }
+
+    .message-content {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+
+    .message-header {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .message-author {
+      font-size: 13px;
+      font-weight: 700;
+      color: var(--text-primary);
+    }
+
+    .message-time {
+      font-size: 11px;
+      color: var(--text-muted);
+    }
+
+    .source-tag {
+      font-size: 10px;
+      font-family: var(--font-mono);
+      background: var(--border-subtle);
+      color: var(--text-secondary);
+      padding: 2px 6px;
+      border-radius: 4px;
+    }
+
+    .message-bubble {
+      font-size: 14px;
+      line-height: 1.6;
+      color: var(--text-primary);
+      background: transparent;
+      word-break: break-word;
+    }
+
+    .message-bubble pre {
+      background: #202124;
+      color: #e8eaed;
+      padding: 12px 14px;
+      border-radius: 6px;
+      overflow-x: auto;
+      font-family: var(--font-mono);
+      font-size: 12.5px;
+      margin: 10px 0;
+    }
+
+    .message-bubble code {
+      font-family: var(--font-mono);
+      font-size: 12px;
+      background: #f1f3f4;
+      color: #b06000;
+      padding: 2px 5px;
+      border-radius: 3px;
+    }
+
+    .message-bubble pre code {
+      background: transparent;
+      color: inherit;
+      padding: 0;
+    }
+
+    .message-bubble p {
+      margin-bottom: 8px;
+    }
+
+    .message-bubble p:last-child {
+      margin-bottom: 0;
+    }
+
+    .message-bubble ul, .message-bubble ol {
+      margin-left: 20px;
+      margin-bottom: 8px;
+    }
+
+
+    .chat-input-bar {
+      padding: 16px 24px;
+      border-top: 1px solid var(--border-color);
+      background: var(--bg-surface);
+      display: flex;
+      gap: 12px;
+      align-items: flex-end;
+    }
+
+    .input-box {
+      flex: 1;
+      min-height: 48px;
+      max-height: 140px;
+      border: 1px solid var(--border-color);
+      border-radius: 8px;
+      padding: 12px 16px;
+      font-family: var(--font-sans);
+      font-size: 14px;
+      line-height: 1.4;
+      outline: none;
+      resize: none;
+      transition: border-color 0.15s ease;
+    }
+
+    .input-box:focus {
+      border-color: var(--gcp-blue);
+      box-shadow: 0 0 0 2px var(--gcp-blue-light);
+    }
+
+    .btn-send {
+      height: 48px;
+      padding: 0 24px;
+      background: var(--gcp-blue);
+      color: white;
+      border: none;
+      border-radius: 8px;
+      font-family: var(--font-sans);
+      font-size: 14px;
+      font-weight: 500;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      transition: background-color 0.15s ease;
+      flex-shrink: 0;
+    }
+
+    .btn-send:hover {
+      background: var(--gcp-blue-hover);
+    }
+
+    .btn-send:disabled {
+      background: #dadce0;
+      cursor: not-allowed;
+    }
+
+    /* Right Column: Recent Agent Sessions */
+    .sidebar {
+      background: var(--bg-page);
+      display: flex;
+      flex-direction: column;
+      height: 100%;
+      min-height: 0;
+    }
+
+    .sidebar-header {
+      padding: 14px 18px;
+      background: var(--bg-surface);
+      border-bottom: 1px solid var(--border-color);
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+
+    .sidebar-title {
+      font-size: 13.5px;
+      font-weight: 700;
+      color: var(--text-primary);
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+    }
+
+    .sidebar-content {
+      flex: 1;
+      overflow-y: auto;
+      padding: 16px;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+
+    .session-card {
+      background: var(--bg-surface);
+      border: 1px solid var(--border-color);
+      border-radius: 8px;
+      padding: 14px;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      transition: box-shadow 0.15s ease;
+    }
+
+    .session-card:hover {
+      box-shadow: 0 1px 4px rgba(60,64,67,0.12);
+    }
+
+    .session-top {
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-start;
+    }
+
+    .session-title {
+      font-size: 13px;
+      font-weight: 700;
+      color: var(--text-primary);
+    }
+
+    .session-meta {
+      display: flex;
+      justify-content: space-between;
+      font-size: 10.5px;
+      color: var(--text-muted);
+    }
+
+    .empty-state {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      height: 180px;
+      color: var(--text-muted);
+      text-align: center;
+      gap: 8px;
+      font-size: 13px;
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="brand">
+      <!-- Google Kubernetes Engine product icon, from cloud.google.com/icons. -->
+      <svg class="brand-logo" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Google Kubernetes Engine">
+        <polygon fill="#4285f4" fill-rule="evenodd" points="14.68 13.06 19.23 15.69 19.23 16.68 14.29 13.83 14.68 13.06"/>
+        <polygon fill="#669df6" fill-rule="evenodd" points="9.98 13.65 4.77 16.66 4.45 15.86 9.53 12.92 9.98 13.65"/>
+        <rect fill="#aecbfa" x="11.55" y="3.29" width="0.86" height="5.78"/>
+        <path fill="#aecbfa" fill-rule="evenodd" d="M3.25,7V17L12,22l8.74-5V7L12,2Zm15.63,8.89L12,19.78,5.12,15.89V8.11L12,4.22l6.87,3.89v7.78Z"/>
+        <polygon fill="#aecbfa" fill-rule="evenodd" points="11.98 11.5 15.96 9.21 11.98 6.91 8.01 9.21 11.98 11.5"/>
+        <polygon fill="#669df6" fill-rule="evenodd" points="11.52 12.3 7.66 10.01 7.66 14.6 11.52 16.89 11.52 12.3"/>
+        <polygon fill="#4285f4" fill-rule="evenodd" points="12.48 12.3 12.48 16.89 16.34 14.6 16.34 10.01 12.48 12.3"/>
+      </svg>
+      <div class="brand-title">
+        Kube-Agents Console
+        <span class="cluster-pill" id="cluster-tag" hidden></span>
+      </div>
+    </div>
+    <div class="header-actions">
+      <div class="badge badge-grey" id="agent-badge" title="">
+        <span class="badge-dot"></span>
+        <span id="agent-status-text">Checking agent&hellip;</span>
+      </div>
+    </div>
+  </header>
+
+  <main>
+    <section class="chat-section">
+      <div class="prompt-chips-bar">
+        <button type="button" class="chip" data-prompt="Audit cluster health and identify any failing pods">Cluster health</button>
+        <button type="button" class="chip" data-prompt="Summarise the recent Kubernetes warning events on this cluster">Recent warnings</button>
+        <button type="button" class="chip" data-prompt="Check GitOps configuration drift against live workloads">GitOps drift</button>
+        <button type="button" class="chip" data-prompt="Review cluster security posture, RBAC, and workload isolation">Security and RBAC</button>
+      </div>
+
+      <div class="chat-stream" id="chat-stream">
+        <div class="message-row">
+          <div class="avatar avatar-agent">i</div>
+          <div class="message-content">
+            <div class="message-header">
+              <span class="message-author">Web console</span>
+              <span class="source-tag">web-console</span>
+            </div>
+            <div class="message-bubble">
+              <p>Messages you send here go to the agent as turns in a session of their own. Each browser tab gets a new session.</p>
+              <p>A turn that calls tools can take a few minutes. The agent proposes changes as pull requests for you to review.</p>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="chat-input-bar">
+        <textarea class="input-box" id="prompt-input" rows="1"
+          placeholder="Ask the agent a question or describe an incident"></textarea>
+        <button type="button" class="btn-send" id="btn-send">Send</button>
+      </div>
+    </section>
+
+    <aside class="sidebar">
+      <div class="sidebar-header">
+        <span class="sidebar-title">Recent agent sessions</span>
+        <span class="source-tag" id="last-refresh">Loading&hellip;</span>
+      </div>
+      <div class="sidebar-content" id="sidebar-list">
+        <div class="empty-state"><div>Loading sessions&hellip;</div></div>
+      </div>
+    </aside>
+  </main>
+
+  <script>
+    const CONSOLE_HEADER = "X-Kube-Agents-Console";
+    const SESSION_KEY = "kube-agents-web-console-session";
+    const STATUS_POLL_MS = 15000;
+    const SESSIONS_POLL_MS = 15000;
+    // Results of work the agent delegated to a kanban card arrive later, as
+    // new messages on this tab's session. MARK_KEY holds the highest message
+    // ID this tab has accounted for, so a reload does not repeat them.
+    const MESSAGES_POLL_MS = 10000;
+    const MARK_KEY = "kube-agents-web-console-mark";
+
+    let currentSessionId = sessionStorage.getItem(SESSION_KEY) || "";
+    let turnInFlight = false;
+    let pollInFlight = false;
+    let markKnown = sessionStorage.getItem(MARK_KEY) !== null;
+    let lastSeenId = Number(sessionStorage.getItem(MARK_KEY)) || 0;
+
+    function advanceMark(id) {
+      if (typeof id !== "number" || id <= lastSeenId) return;
+      lastSeenId = id;
+      markKnown = true;
+      sessionStorage.setItem(MARK_KEY, String(lastSeenId));
+    }
+
+    function resetMark() {
+      lastSeenId = 0;
+      markKnown = false;
+      sessionStorage.removeItem(MARK_KEY);
+    }
+
+    // Returns {latest_id, messages} for this tab's session, or null.
+    async function fetchNewMessages() {
+      if (!currentSessionId) return null;
+      const after = markKnown ? `?after=${lastSeenId}` : "";
+      try {
+        const resp = await fetch(`/api/sessions/${encodeURIComponent(currentSessionId)}/messages${after}`);
+        if (!resp.ok) return null;
+        return await resp.json();
+      } catch (e) {
+        return null;
+      }
+    }
+
+    // Shows each agent message above the mark once, then moves the mark past
+    // it. User-role rows (this tab's own turns, and the wake that delivers a
+    // card's result) only move the mark.
+    function showUpdates(messages) {
+      (messages || []).forEach(m => {
+        if (m.id <= lastSeenId) return;
+        if (m.role === "assistant") appendMessage("agent", m.content, "update");
+        advanceMark(m.id);
+      });
+    }
+
+    // Periodic poll between turns. On a tab that has no mark yet (a reload
+    // of an older session), the first poll only sets the mark.
+    async function pollMessages() {
+      if (!currentSessionId || turnInFlight || pollInFlight) return;
+      pollInFlight = true;
+      try {
+        const data = await fetchNewMessages();
+        if (!data) return;
+        if (markKnown) showUpdates(data.messages);
+        advanceMark(data.latest_id);
+      } finally {
+        pollInFlight = false;
+      }
+    }
+
+    // Runs once a turn's reply is on screen. The session holds three runs of
+    // messages above the mark: results that landed before this turn started
+    // (shown), the turn itself from the typed message to its reply (already
+    // on screen, so only marked), and results that landed after the reply
+    // (shown). Even when the follow-up fetch fails, replyId from the turn
+    // response moves the mark past the reply so the next poll never replays it.
+    async function settleAfterReply(typed, reply, beforeId, replyId) {
+      const data = await fetchNewMessages();
+      if (!data) {
+        if (typeof replyId === "number" && replyId > 0) advanceMark(replyId);
+        return;
+      }
+      const messages = data.messages || [];
+      const same = (a, b) => (a || "").trim() === (b || "").trim();
+      let turnAt = -1;
+      messages.forEach((m, i) => {
+        if (m.role === "user" && same(m.content, typed) && (!beforeId || m.id > beforeId)) turnAt = i;
+      });
+      if (turnAt < 0 && typeof beforeId === "number" && beforeId > 0) {
+        turnAt = messages.findIndex(m => m.id > beforeId && m.role === "user");
+      }
+      let replyAt = -1;
+      if (typeof replyId === "number" && replyId > 0) {
+        replyAt = messages.findIndex((m, i) => i > turnAt && m.id === replyId);
+      }
+      if (replyAt < 0) {
+        messages.forEach((m, i) => { if (i > turnAt && m.role === "assistant" && same(m.content, reply)) replyAt = i; });
+      }
+      if (turnAt >= 0) showUpdates(messages.slice(0, turnAt));
+      // Hermes does not serialize turns on one session, so a card's wake can
+      // run during this turn and land inside its range. A user row other than
+      // the typed message starts such a wake; its agent reply is shown and
+      // ends the wake so later assistant rows of the typed turn are not shown.
+      if (turnAt >= 0 && replyAt > turnAt) {
+        let inWake = false;
+        messages.slice(turnAt + 1, replyAt).forEach(m => {
+          if (m.role === "user") {
+            inWake = true;
+          } else if (inWake && m.role === "assistant" && m.id > lastSeenId) {
+            appendMessage("agent", m.content, "update");
+            inWake = false;
+          }
+        });
+      }
+      if (replyAt >= 0) {
+        advanceMark(messages[replyAt].id);
+        showUpdates(messages.slice(replyAt + 1));
+      } else if (typeof replyId === "number" && replyId > 0) {
+        advanceMark(replyId);
+      }
+      advanceMark(data.latest_id);
+    }
+
+    function escapeHtml(text) {
+      const map = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#039;' };
+      return String(text).replace(/[&<>"']/g, m => map[m]);
+    }
+
+    function formatEpoch(seconds) {
+      if (typeof seconds !== "number") return "";
+      return new Date(seconds * 1000).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
+    }
+
+    // Inline formatting for text outside code fences.
+    function renderInline(text) {
+      let html = escapeHtml(text);
+      html = html.replace(/`([^`\n]+)`/g, '<code>$1</code>');
+      html = html.replace(/\*\*([^*\n]+)\*\*/g, '<strong>$1</strong>');
+      return html.split(/\n{2,}/).map(p => `<p>${p.replace(/\n/g, '<br>')}</p>`).join("");
+    }
+
+    // Splits on ``` fences first, so code keeps its blank lines and is never
+    // run through the inline rules; the info string after the opening fence
+    // (```yaml) is dropped rather than rendered as the first line.
+    function renderMarkdown(text) {
+      if (!text) return "";
+      const parts = text.split(/```/);
+      let html = "";
+      parts.forEach((part, i) => {
+        if (i % 2 === 1) {
+          const body = part.replace(/^[^\n]*\n/, "");
+          html += `<pre><code>${escapeHtml(body.replace(/\n$/, ""))}</code></pre>`;
+        } else if (part.trim()) {
+          html += renderInline(part.trim());
+        }
+      });
+      return html;
+    }
+
+    function appendMessage(role, text, tag) {
+      const stream = document.getElementById("chat-stream");
+      const row = document.createElement("div");
+      row.className = "message-row";
+      const isAgent = role === "agent";
+      const timeStr = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+      row.innerHTML = `
+        <div class="avatar ${isAgent ? "avatar-agent" : "avatar-user"}">${isAgent ? "A" : "Y"}</div>
+        <div class="message-content">
+          <div class="message-header">
+            <span class="message-author">${isAgent ? "Agent" : "You"}</span>
+            ${tag ? `<span class="source-tag">${escapeHtml(tag)}</span>` : ""}
+            <span class="message-time">${timeStr}</span>
+          </div>
+          <div class="message-bubble">${renderMarkdown(text)}</div>
+        </div>`;
+      stream.appendChild(row);
+      stream.scrollTop = stream.scrollHeight;
+      return row;
+    }
+
+    function setBusy(busy) {
+      turnInFlight = busy;
+      document.getElementById("btn-send").disabled = busy;
+      document.querySelectorAll(".chip").forEach(c => { c.disabled = busy; });
+    }
+
+    // Reads a response body that may not be JSON (a proxy error page, a
+    // port-forward that dropped) without reporting it as a network failure.
+    async function readBody(resp) {
+      const text = await resp.text();
+      try { return JSON.parse(text); } catch (e) { return { detail: text.trim() || resp.statusText }; }
+    }
+
+    async function submitMessage(text) {
+      if (turnInFlight) return;
+      text = (text || "").trim();
+      if (!text) return;
+      appendMessage("user", text);
+      setBusy(true);
+      const pending = appendMessage("agent", "Working on it…", "pending");
+      try {
+        const resp = await fetch("/api/chat", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", [CONSOLE_HEADER]: "1" },
+          body: JSON.stringify({ message: text, session_id: currentSessionId })
+        });
+        const data = await readBody(resp);
+        if (data.session_id && data.session_id !== currentSessionId) {
+          currentSessionId = data.session_id;
+          sessionStorage.setItem(SESSION_KEY, currentSessionId);
+          resetMark();
+        }
+        pending.remove();
+        if (resp.ok) {
+          appendMessage("agent", data.reply || "(The agent returned an empty reply.)");
+          await settleAfterReply(text, data.reply, data.before_id, data.reply_id);
+        } else {
+          appendMessage("agent", `Request failed (HTTP ${resp.status}): ${data.detail || data.error || "no detail"}`, "error");
+        }
+      } catch (err) {
+        pending.remove();
+        appendMessage("agent", "Could not reach the web console. Is the port-forward still running? " + err.message, "error");
+      } finally {
+        setBusy(false);
+        fetchSessions();
+      }
+    }
+
+    function sendFromInput() {
+      const input = document.getElementById("prompt-input");
+      if (turnInFlight) return;
+      const text = input.value;
+      input.value = "";
+      submitMessage(text);
+    }
+
+    function renderSessionsError(message) {
+      document.getElementById("last-refresh").innerText = "Error";
+      document.getElementById("sidebar-list").innerHTML =
+        `<div class="empty-state"><div>Could not load sessions.</div><div>${escapeHtml(message)}</div></div>`;
+    }
+
+    async function fetchSessions() {
+      let resp, data;
+      try {
+        resp = await fetch("/api/sessions/recent");
+        data = await readBody(resp);
+      } catch (e) {
+        renderSessionsError(e.message);
+        return;
+      }
+      if (!resp.ok) {
+        renderSessionsError(data.detail || `HTTP ${resp.status}`);
+        return;
+      }
+      document.getElementById("last-refresh").innerText = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+      const list = document.getElementById("sidebar-list");
+      const sessions = data.sessions || [];
+      if (sessions.length === 0) {
+        list.innerHTML = `<div class="empty-state"><div>No agent sessions recorded yet.</div></div>`;
+        return;
+      }
+      list.innerHTML = sessions.map(s => {
+        const isCurrent = s.id === currentSessionId;
+        const kind = isCurrent ? "this tab" : (s.console ? "web console" : (s.source || "agent"));
+        const count = typeof s.message_count === "number" ? `${s.message_count} messages` : "";
+        return `
+          <div class="session-card">
+            <div class="session-top">
+              <div class="session-title">${escapeHtml(s.title || s.id)}</div>
+              <span class="badge ${isCurrent ? "badge-green" : "badge-grey"}">${escapeHtml(kind)}</span>
+            </div>
+            <div class="session-meta">
+              <span>${escapeHtml(count)}</span>
+              <span>${escapeHtml(formatEpoch(s.last_active || s.started_at))}</span>
+            </div>
+          </div>`;
+      }).join("");
+    }
+
+    async function checkStatus() {
+      const badge = document.getElementById("agent-badge");
+      const label = document.getElementById("agent-status-text");
+      try {
+        const resp = await fetch("/api/status");
+        const data = await readBody(resp);
+        if (!resp.ok) throw new Error(data.detail || `HTTP ${resp.status}`);
+        if (data.cluster) {
+          const tag = document.getElementById("cluster-tag");
+          tag.innerText = data.cluster;
+          tag.hidden = false;
+        }
+        badge.title = data.agent ? data.agent.detail : "";
+        if (data.agent && data.agent.healthy) {
+          badge.className = "badge badge-green";
+          label.innerText = "Agent reachable";
+        } else {
+          badge.className = "badge badge-amber";
+          label.innerText = "Agent unreachable";
+        }
+      } catch (e) {
+        badge.className = "badge badge-red";
+        badge.title = e.message;
+        label.innerText = "Console unreachable";
+      }
+    }
+
+    document.getElementById("btn-send").addEventListener("click", sendFromInput);
+    document.getElementById("prompt-input").addEventListener("keydown", e => {
+      if (e.key === "Enter" && !e.shiftKey) {
+        e.preventDefault();
+        sendFromInput();
+      }
+    });
+    document.querySelectorAll(".chip").forEach(chip => {
+      chip.addEventListener("click", () => submitMessage(chip.dataset.prompt));
+    });
+
+    checkStatus();
+    fetchSessions();
+    setInterval(checkStatus, STATUS_POLL_MS);
+    setInterval(fetchSessions, SESSIONS_POLL_MS);
+    pollMessages();
+    setInterval(pollMessages, MESSAGES_POLL_MS);
+  </script>
+</body>
+</html>

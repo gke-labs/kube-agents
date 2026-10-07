@@ -26,6 +26,7 @@ MOCK_REQUIRED_RELEASE_IMAGES = [
     "a2a-verifier",
     "a2a-console",
     "hermes-bridge",
+    "web-console",
 ]
 
 # A list from before the growths: what a candidate or a release line cut

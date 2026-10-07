@@ -551,6 +551,14 @@ class PreflightDecisionTest(unittest.TestCase):
             base["requestsStorage"] + _HINDSIGHT_STORAGE_BYTES,
         )
 
+    def test_web_console_adds_its_pod_and_resources_to_the_totals(self) -> None:
+        """Enabling webConsole adds its one replica and resource requests."""
+        base = self._requirements()
+        with_console = self._requirements(["webConsole.enabled=true"])
+        self.assertEqual(with_console["pods"], base["pods"] + 1)
+        self.assertEqual(with_console["requestsCpu"], base["requestsCpu"] + 50)
+        self.assertEqual(with_console["requestsMemory"], base["requestsMemory"] + 32 * 1024**2)
+
     def test_a_workload_scaled_to_zero_is_not_charged(self) -> None:
         """`replicas | default 1` read a falsy 0 as absent and charged a full replica.
 

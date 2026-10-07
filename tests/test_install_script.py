@@ -5126,6 +5126,22 @@ class LitellmRedactionPersistsThroughInstallEnvTest(unittest.TestCase):
         self.assertIn("Set LITELLM_REDACTION_ENABLED=true in", out)
         self.assertIn("Set LITELLM_REDACTION_IP_ALLOW_CIDRS=10.0.0.0/8\\ fd00::/8 in", out)
 
+    def test_enable_web_console_over_a_file_that_does_not_record_it_warns(self):
+        # bootstrap_install_env_file never rewrites an existing install.env, so
+        # the flag holds for one run; upgrade.sh and --menu regenerate tfvars
+        # from the file and would remove the console again.
+        with tempfile.TemporaryDirectory() as tmp:
+            out = self._bootstrap_over(tmp, "PROJECT_ID=p\n", "PARAM_ENABLE_WEB_CONSOLE=true")
+        self.assertIn("--enable-web-console=true applies to this run only", out)
+        self.assertIn("records no WEB_CONSOLE_ENABLED", out)
+        self.assertIn(
+            "or repeat --enable-web-console on every later install.sh run.",
+            out,
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            quiet = self._bootstrap_over(tmp, "WEB_CONSOLE_ENABLED=true\n", "PARAM_ENABLE_WEB_CONSOLE=true")
+        self.assertNotIn("applies to this run only", quiet)
+
     def test_a_run_that_agrees_with_the_file_is_silent(self):
         # PARAM_* is seeded from the file, and a recorded yes reads as true.
         with tempfile.TemporaryDirectory() as tmp:
@@ -6942,6 +6958,7 @@ class DomainScopedFlagsTest(unittest.TestCase):
     TOGGLES = {
         "--enable-gvisor": "PARAM_ENABLE_GVISOR",
         "--enable-hermes-dashboard": "PARAM_ENABLE_WEBUI",
+        "--enable-web-console": "PARAM_ENABLE_WEB_CONSOLE",
         "--enable-gke-backup-plan": "PARAM_ENABLE_GKE_BACKUP_PLAN",
         "--enable-pubsub-platform": "PARAM_ENABLE_PUBSUB_PLATFORM",
         "--enable-stockout-investigator": "PARAM_ENABLE_STOCKOUT_INVESTIGATOR",
@@ -8699,6 +8716,7 @@ class ToggleValuesAreValidatedTest(unittest.TestCase):
         "--enable-stockout-investigator",
         "--enable-drift-detector",
         "--enable-hermes-dashboard",
+        "--enable-web-console",
         "--litellm-redaction",
         "--scoped-sa-pool-enabled",
     ]
@@ -8744,6 +8762,7 @@ class ToggleValuesAreValidatedTest(unittest.TestCase):
         "--enable-pubsub-platform": "ENABLE_PUBSUB_PLATFORM",
         "--enable-stockout-investigator": "ENABLE_STOCKOUT_INVESTIGATOR",
         "--enable-drift-detector": "ENABLE_DRIFT_DETECTOR",
+        "--enable-web-console": "WEB_CONSOLE_ENABLED",
         "--litellm-redaction": "LITELLM_REDACTION_ENABLED",
         "--scoped-sa-pool-enabled": "SCOPED_SA_POOL_ENABLED",
     }

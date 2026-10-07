@@ -556,6 +556,12 @@ variable "hermes_dashboard_enabled" {
   default     = null
 }
 
+variable "web_console_enabled" {
+  description = "Whether to deploy the in-cluster web console, a browser chat page for the Platform Agent reached by kubectl port-forward. Maps to the chart's webConsole.enabled."
+  type        = bool
+  default     = false
+}
+
 variable "memory_enabled" {
   description = "Whether agent memory persistence is enabled. null defers to the CRD default (false)."
   type        = bool

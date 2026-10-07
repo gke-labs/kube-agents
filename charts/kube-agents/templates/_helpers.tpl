@@ -1142,6 +1142,10 @@ a Go template cannot catch the error `lookup` raises.
 {{- if .Values.githubMinter.enabled -}}
   {{- $chartWorkloads = append $chartWorkloads (dict "values" .Values.githubMinter "pods" (include "kube-agents.replicaCount" .Values.githubMinter.replicaCount | int64) "surges" true) -}}
 {{- end -}}
+{{- if .Values.webConsole.enabled -}}
+  {{- /* templates/web-console.yaml renders exactly one replica; see the note there. */ -}}
+  {{- $chartWorkloads = append $chartWorkloads (dict "values" .Values.webConsole "pods" 1 "surges" true) -}}
+{{- end -}}
 {{- if and .Values.platformAgent.enabled .Values.platformAgent.cleanupHook.enabled -}}
   {{- /* Pre-delete hook Job in templates/platform-agent-cr-cleanup.yaml: runs at helm uninstall
          while every release pod still exists, so quota admission needs headroom for it. */ -}}

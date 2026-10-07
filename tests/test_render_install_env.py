@@ -365,11 +365,13 @@ class RenderingTest(unittest.TestCase):
             **_COORDS,
             "ENABLE_PUBSUB_PLATFORM": "true",
             "ENABLE_STOCKOUT_INVESTIGATOR": "false",
+            "WEB_CONSOLE_ENABLED": "true",
         })
         self.assertEqual(rc, 0, log)
         rendered = parse(text)
         self.assertEqual(rendered["ENABLE_PUBSUB_PLATFORM"], "true")
         self.assertEqual(rendered["ENABLE_STOCKOUT_INVESTIGATOR"], "false")
+        self.assertEqual(rendered["WEB_CONSOLE_ENABLED"], "true")
 
     def test_the_github_side_names_are_translated_to_installer_names(self):
         rc, log, text = render(dict(_COORDS))

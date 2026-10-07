@@ -522,6 +522,25 @@ class InstallerCommonTest(unittest.TestCase):
             self.assertIn("enable_drift_detector = true", content)
             self.assertNotIn("exported-project", content)
 
+    # ── the web console switch ───────────────────────────────────────────────
+
+    def test_tfvars_carries_the_web_console_switch(self):
+        # Off unless asked for, and on when install.env or the flag says so;
+        # main.tf maps web_console_enabled to the chart's webConsole.enabled.
+        for exported, want in ((None, "false"), ("true", "true"), ("false", "false")):
+            with self.subTest(WEB_CONSOLE_ENABLED=exported), tempfile.TemporaryDirectory() as out_dir:
+                dest = pathlib.Path(out_dir) / "terraform.tfvars"
+                env = {"API_SERVER_KEY": "k"}
+                if exported is not None:
+                    env["WEB_CONSOLE_ENABLED"] = exported
+                proc = self._run(
+                    f'write_tfvars_from_state "{dest}"; echo "rc=$?"',
+                    env=env,
+                    describe_stub=_autopilot_describe_stub(),
+                )
+                self.assertIn("rc=0", proc.stdout, proc.stderr)
+                self.assertIn(f"web_console_enabled      = {want}", dest.read_text())
+
     # ── the cert-manager probe: a Deployment alone cannot say whose it is ────
 
     def test_tfvars_keeps_cert_manager_when_the_state_manages_the_release(self):
