@@ -270,12 +270,23 @@ class PlanInspectionTest(unittest.TestCase):
         self.assertIn("tofu plan exited 1", detail)
 
     def test_a_tofu_that_hits_the_ceiling_is_a_failure(self):
-        tofu = _Tofu({}, fail={"init": subprocess.TimeoutExpired(["tofu"], 5)})
+        tofu = _Tofu({P7: UPDATE_ONLY}, fail={"apply": subprocess.TimeoutExpired(["tofu", "apply"], 5)})
         outcome, detail = reconcile.reconcile_project(P7, runner=tofu, timeout=5)
         self.assertEqual(outcome, reconcile.OUTCOME_FAILED)
         self.assertIn("did not finish within 5s", detail)
         self.assertIn("force-unlock", detail, "a kill at the ceiling leaves the lock; the line says so, and that the next run tells")
         self.assertNotIn(": tofu force-unlock", detail, "no instruction the runbook says not to follow yet")
+
+    def test_a_ceiling_cut_inside_init_says_nothing_is_locked(self):
+        # init touches no state, so the line must not carry the lock word the
+        # bot keys on: an operator is not sent to force-unlock.
+        tofu = _Tofu({}, fail={"init": subprocess.TimeoutExpired(["tofu", "init"], 5)})
+        outcome, detail = reconcile.reconcile_project(P7, runner=tofu, timeout=5)
+        self.assertEqual(outcome, reconcile.OUTCOME_FAILED)
+        self.assertIn("did not finish within 5s", detail)
+        self.assertIn("nothing is locked", detail)
+        self.assertNotIn("force-unlock", detail)
+        self.assertEqual(tofu.verbs(), ["init"])
 
     def test_a_show_that_is_not_json_is_a_failure(self):
         tofu = _Tofu({P7: "<html>"})
@@ -1710,10 +1721,12 @@ class ReportFieldsTest(unittest.TestCase):
             copies.append(argv)
             return subprocess.CompletedProcess(argv, 0, "", "")
 
-        for plan, dry in ((UPDATE_ONLY, True), (REPLACE, False)):
+        # The unchanged leg is the one the dry-run conjunct decides: planned
+        # is not an at-tree outcome, so without it the guard never reads dry_run.
+        for tofu, dry in ((_Tofu({P7: UPDATE_ONLY}), True), (_Tofu({}, plan_exit={P7: reconcile.PLAN_NO_CHANGES}), True), (_Tofu({P7: REPLACE}), False)):
             boskos = _Boskos(free=[P7])
             with mock.patch.object(reconcile, "gcloud_runner", gcloud), mock.patch.object(boskos_pool.urllib.request, "urlopen", boskos):
-                reconcile.reconcile_pool(BOSKOS, OWNER, runner=_Tofu({P7: plan}), known={P7}, dry_run=dry, run=reconcile.Run(commit="c", fleet_tree="t", publish=True))
+                reconcile.reconcile_pool(BOSKOS, OWNER, runner=tofu, known={P7}, dry_run=dry, run=reconcile.Run(commit="c", fleet_tree="t", publish=True))
         self.assertEqual(copies, [])
 
     def test_a_converged_or_unchanged_project_gets_the_marker_too(self):
@@ -1801,6 +1814,34 @@ class WorkersTest(unittest.TestCase):
         self.assertNotIn(None, {cache for _, _, cache in calls})
         (a0, a1), (b0, b1) = sorted(inits)
         self.assertLessEqual(a1, b0, "the second init started before the first ended")
+
+    def test_a_worker_queued_behind_a_slow_init_fails_on_its_own_ceiling_with_the_queue_named(self):
+        # Inits run one at a time, so a project's ceiling is charged the inits
+        # ahead of it. When the slot comes too late, its own init is cut at
+        # once: the line says how long it queued and that nothing is locked,
+        # not that an apply left the state locked.
+        order, lock = [], threading.Lock()
+
+        def tofu(argv, timeout=None, **_):
+            if argv[1] == "init":
+                with lock:
+                    order.append(argv)
+                    first = len(order) == 1
+                if first:
+                    time.sleep(1.3)
+                raise subprocess.TimeoutExpired(argv, timeout)
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+        boskos = _Boskos(free=[P7, P8])
+        with mock.patch.object(boskos_pool.urllib.request, "urlopen", boskos), mock.patch("sys.stdout", io.StringIO()):
+            outcomes = reconcile.reconcile_pool(BOSKOS, OWNER, runner=tofu, known=KNOWN, run=reconcile.Run(workers=2, ceiling_seconds=1))
+        self.assertEqual({p: o for p, (o, _) in outcomes.items()}, {P7: reconcile.OUTCOME_FAILED, P8: reconcile.OUTCOME_FAILED})
+        details = [d for _, d in outcomes.values()]
+        self.assertTrue(all("nothing is locked" in d and "force-unlock" not in d for d in details), details)
+        queued = sorted(int(re.search(r"after (\d+)s queued", d).group(1)) for d in details)
+        self.assertEqual(queued[0], 0, "the first init queued behind nothing")
+        self.assertGreaterEqual(queued[1], 1, "the second init queued behind the first")
+        self.assertEqual(sorted(boskos.released), [P7, P8])
 
     def test_a_child_is_interrupted_once_whichever_side_of_the_forward_it_registered_on(self):
         # Registered before the forward: the snapshot carries it, and the

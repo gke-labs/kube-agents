@@ -72,6 +72,7 @@ TOFU_ENV = {"TF_IN_AUTOMATION": "1", "TF_INPUT": "0"}
 # `init` at a time may write (the cache is not safe under concurrent inits).
 TOFU_DATA_DIR = ".terraform"
 _INIT_LOCK = threading.Lock()
+_CACHE_LOCK = threading.Lock()
 _PLUGIN_CACHE = []
 # `plan -detailed-exitcode`: 0 nothing to do, 2 changes planned, 1 an error.
 PLAN_NO_CHANGES = 0
@@ -205,6 +206,10 @@ REASON_BUSY = "not free in Boskos, or not registered there yet"
 # whether the state needs force-unlock; the bot keys on that word.
 REASON_INTERRUPTED = "terminated (%s) while tofu ran; an apply cut past its grace leaves the state locked, and the next run tells whether it needs force-unlock"
 REASON_CEILING = "did not finish within %ds; tofu was interrupted, and killed if it did not stop within %ds, which leaves the state locked; the next run tells whether it needs force-unlock"
+# A cut inside init: no state was touched, so no lock word for the bot to key
+# on. The queued seconds are the inits of other projects it waited behind
+# (they run one at a time), which its ceiling was charged for.
+REASON_CEILING_INIT = "did not finish within %ds: its init was cut after %ds queued for the init slot behind other projects' inits; nothing was changed and nothing is locked"
 REASON_RUNNER = "could not run tofu (%s: %s)"
 REASON_NOT_REACHED_BUDGET = "not started: %ds left in the run's budget, under the %ds per-project ceiling; the next run takes it"
 REASON_NOT_REACHED_BUDGET_MARK = "left in the run's budget"
@@ -250,7 +255,7 @@ def visited_count(outcomes, run=None):
 
 def _plugin_cache():
     """The run's provider cache directory, made on first use and removed at exit."""
-    with _INIT_LOCK:
+    with _CACHE_LOCK:
         if not _PLUGIN_CACHE:
             path = tempfile.mkdtemp(prefix="fleet-reconcile-providers-")
             atexit.register(shutil.rmtree, path, ignore_errors=True)
@@ -400,6 +405,12 @@ def _with_terminations_deferred(fn):
 def _tail(text):
     text = (text or "").strip()
     return text[-OUTPUT_TAIL_CHARS:] if text else "no output"
+
+
+def _step(exc):
+    """The tofu verb a subprocess exception names, or None."""
+    cmd = getattr(exc, "cmd", None)
+    return cmd[1] if isinstance(cmd, (list, tuple)) and len(cmd) > 1 else None
 
 
 class TerminatedBeforeTofu(boskos_pool.Terminated):
@@ -592,8 +603,10 @@ def reconcile_project(project, runner=tofu_runner, dry_run=False, timeout=PROJEC
     with tempfile.TemporaryDirectory(prefix="fleet-reconcile-") as tmp:
         plan_path = os.path.join(tmp, PLAN_FILE)
         env = _project_env(tmp)
+        queued, waited = clock(), 0
         try:
             with _INIT_LOCK:
+                waited = clock() - queued
                 _tofu(
                     [
                         "init",
@@ -646,7 +659,9 @@ def reconcile_project(project, runner=tofu_runner, dry_run=False, timeout=PROJEC
             return OUTCOME_APPLIED, summary
         except ReconcileError as exc:
             return OUTCOME_FAILED, str(exc)
-        except subprocess.TimeoutExpired:
+        except subprocess.TimeoutExpired as exc:
+            if _step(exc) == "init":
+                return OUTCOME_FAILED, REASON_CEILING_INIT % (timeout, int(waited))
             return OUTCOME_FAILED, REASON_CEILING % (timeout, INTERRUPT_GRACE_SECONDS)
         except (OSError, subprocess.SubprocessError) as exc:
             return OUTCOME_FAILED, REASON_RUNNER % (type(exc).__name__, exc)
