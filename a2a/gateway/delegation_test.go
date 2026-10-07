@@ -494,8 +494,17 @@ func TestARepeatDelegateMintsNoSecondChild(t *testing.T) {
 	if n := platformSubmissions(t, r); n != 1 {
 		t.Fatalf("platform received %d submissions, want 1", n)
 	}
+	// A refusal's notice waits for the delegating turn's terminal (deferNotice),
+	// so the check runs once that terminal is folded into the record, after
+	// any notice held for it has been flushed.
+	completeTask(t, exec, "delegated to platform")
+	waitFor(t, "the turn's terminal folded", func() bool {
+		rec, _ := r.g.reg.Get(ctx, conv)
+		pref, _ := rec.TaskRefFor(origin.TaskID)
+		return pref.StatusMsgID == ""
+	})
 	for _, p := range r.adapter.postTexts()[posts:] {
-		if strings.Contains(p, "delegat") {
+		if strings.Contains(p, "refused") || strings.Contains(p, "not allowed") {
 			t.Fatalf("a repeat posted a notice: %q", p)
 		}
 	}
@@ -808,7 +817,7 @@ func TestOneLiveChildPerConversation(t *testing.T) {
 	}
 }
 
-// ---- the wake-up turn (spec §4) -----------------------------------------
+// ---- the wake-up turn after the child's end ------------------------------
 
 // awaitSubmission waits for the nth (0-based) task submission on addressee.
 func awaitSubmission(t *testing.T, r *rig, addressee string, n int) *lib.Envelope {
@@ -1249,7 +1258,7 @@ func TestAnOverCapResultIsTruncatedInTheWake(t *testing.T) {
 	}
 }
 
-// ---- the child is the conversation's task (spec §3: steer, stop, status, heal)
+// ---- the child is the conversation's task: steer, stop, status, heal -----
 
 // TestHumanTextWhileTheChildRunsSteersTheChild: inside FirstEventGrace the
 // child is the active non-detached task, so a human's text is a steer on
@@ -1457,7 +1466,7 @@ func TestTheWakeFencesTheChildsResult(t *testing.T) {
 	}
 }
 
-// ---- steer authors (task 7b part 1) ----------------------------------------
+// ---- every steer author is checked as the requester is --------------------
 
 // steerAs sends text into conv as author, which, with a task running, is a
 // steer.
@@ -1620,7 +1629,7 @@ func TestSteerAuthorsPastTheCapRefuse(t *testing.T) {
 	}
 }
 
-// ---- a heal that finds a child's terminal (task 7b part 3) -----------------
+// ---- a heal that finds a child's terminal on the stream -------------------
 
 // drainRelayDurable acks everything pending on the gateway's relay durable,
 // so a gateway started next never sees it: the terminal the relay "never
@@ -1718,7 +1727,7 @@ func TestAHealThatFindsTheChildsTerminalWakesTheSession(t *testing.T) {
 	}
 }
 
-// ---- the session incarnation's authors (task 7b part 4) --------------------
+// ---- everyone whose text reached the incarnation is checked ---------------
 
 // incarnationAuthors is the record's author set when it is the current
 // incarnation's, else nil.
@@ -2054,7 +2063,7 @@ func TestTheInjectDoorWithNoListMayDelegate(t *testing.T) {
 	r.awaitTask(t, targetPlatform)
 }
 
-// ---- the wake carries the human's ask (fix wave 3) -------------------------
+// ---- the wake carries the human's ask -------------------------------------
 
 // askBlock is the wake's opening for a short ask with no backticks.
 func askBlock(ask string) string {
