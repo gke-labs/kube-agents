@@ -427,6 +427,33 @@ class A3TheA2ADoorIsDarkUnlessTheOperatorOpensIt(unittest.TestCase):
         )
 
 
+
+class A3TheGatewaysSlackPrincipalComesFromSlackOrTheMap(unittest.TestCase):
+    """A3 on the gateway's Slack backend under `next`: the allowlist is the
+    admission gate, and the principal is either the IdP identity the admin's
+    map joins to the member id, or the member id Slack asserted, qualified
+    `slack:`.  The map is an override and not a gate, so two things carry the
+    invariant: an unlisted sender resolves to nothing whatever the map says,
+    and the map cannot assert the reserved prefix, so a principal that claims
+    to be a bare member id always is one.
+    """
+
+    def test_A3_an_unlisted_slack_sender_resolves_to_nothing(self) -> None:
+        body = h.go_function_body(h.text("a2a_slack_identity"), "resolveSlackPrincipal")
+        self.assertRegex(
+            body,
+            r'if authorID == "" \|\| \(!g\.slackAllowAll && !g\.slackAllowed\[authorID\]\) \{\s*return ""',
+            "a Slack sender off the allowlist (or with no member id) is no longer refused",
+        )
+
+    def test_A3_the_slack_map_cannot_assert_a_member_id_principal(self) -> None:
+        body = h.go_function_body(h.text("a2a_slack_identity"), "resolveSlackPrincipal")
+        self.assertRegex(
+            body,
+            r"if strings\.HasPrefix\(principal, slackMemberPrincipalPrefix\) \{[^}]*return \"\"",
+            "a map value carrying the reserved slack: prefix is no longer refused",
+        )
+
 RBAC_GROUP = "rbac.authorization.k8s.io"
 
 # The ClusterRoles the operator is allowed to hold `bind` over, and why each is

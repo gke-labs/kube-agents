@@ -27,9 +27,9 @@ type PrincipalMap struct {
 // LoadPrincipalMap reads the map from a directory of files (a mounted
 // ConfigMap or Secret: one file per backend user id, content is the
 // principal) or from a single file of "id principal" lines. A missing path
-// yields an empty map — the gateway runs, and every message drops at
-// verification, which is the honest failure for an install without its
-// mapping table.
+// yields an empty map and the gateway runs: on Discord every message then
+// drops at verification, the honest failure for an install without its test
+// table, and on Slack every listed sender is attributed by member id.
 func LoadPrincipalMap(path string) (*PrincipalMap, error) {
 	pm := &PrincipalMap{m: map[string]string{}}
 	info, err := os.Stat(path)

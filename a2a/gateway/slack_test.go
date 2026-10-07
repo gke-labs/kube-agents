@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -243,13 +244,11 @@ func TestSlackRunAuthTestHonoursCancel(t *testing.T) {
 	}
 }
 
-// TestSlackEmptyPrincipalMapWarnsAtBoot: the boot-time warning for an empty
-// map fires for every backend whose identity join IS the map — Slack as
-// much as Discord — and not for gchat, which never reads it. The operator
-// projects the Slack map Secret as optional, so a Slack gateway on an
-// install that never created it has a missing map, and it must not pass
-// boot silently and then drop every sender.
-func TestSlackEmptyPrincipalMapWarnsAtBoot(t *testing.T) {
+// TestEmptyPrincipalMapBootNotice: an empty map is a WARN on Discord, whose
+// identity join IS the map and which drops every sender without it. On Slack
+// the map is an optional override, so an empty one is an INFO that says
+// listed senders are attributed by member id. gchat never reads it.
+func TestEmptyPrincipalMapBootNotice(t *testing.T) {
 	s := startServer(t)
 	url := s.ClientURL()
 	provision(t, url)
@@ -258,11 +257,13 @@ func TestSlackEmptyPrincipalMapWarnsAtBoot(t *testing.T) {
 
 	for _, tc := range []struct {
 		backend string
-		warns   bool
+		notice  string
+		level   slog.Level
+		found   bool
 	}{
-		{slackBackend, true},
-		{discordBackend, true},
-		{gchatBackend, false},
+		{slackBackend, "the Slack principal map is empty", slog.LevelInfo, true},
+		{discordBackend, "principal map is empty; every discord message", slog.LevelWarn, true},
+		{gchatBackend, "principal map is empty", 0, false},
 	} {
 		t.Run(tc.backend, func(t *testing.T) {
 			client, err := lib.Connect(ctx, url, lib.WithName("gateway-test-"+tc.backend), lib.WithAgreementPolicy(SupervisorAgreement(nil)))
@@ -281,12 +282,12 @@ func TestSlackEmptyPrincipalMapWarnsAtBoot(t *testing.T) {
 			if _, err := New(Options{Client: client, Adapter: newFakeAdapter(), Config: cfg, Backend: tc.backend, Logger: slog.New(logs)}); err != nil {
 				t.Fatalf("New: %v", err)
 			}
-			lvl, found := logs.level("principal map is empty")
-			if found != tc.warns {
-				t.Fatalf("backend %q: empty-map warning found=%t, want %t", tc.backend, found, tc.warns)
+			lvl, found := logs.level(tc.notice)
+			if found != tc.found {
+				t.Fatalf("backend %q: empty-map notice found=%t, want %t", tc.backend, found, tc.found)
 			}
-			if found && lvl != slog.LevelWarn {
-				t.Fatalf("backend %q: empty-map notice at %v, want WARN", tc.backend, lvl)
+			if found && lvl != tc.level {
+				t.Fatalf("backend %q: empty-map notice at %v, want %v", tc.backend, lvl, tc.level)
 			}
 		})
 	}
@@ -2167,8 +2168,8 @@ func TestSlackGatewayAdoptsThreadOnStartedTaskAndSurvivesRestart(t *testing.T) {
 		DefaultAddressee: "platform",
 		IdleTTL:          30 * time.Minute,
 		AttributionSalt:  []byte("test-salt"),
-		// The CR-level gate is not under test here; the map is.
-		SlackAllowAllUsers: true,
+		// U1 is listed; U9, below, is not, and is the unverified sender.
+		SlackAllowedUsers: []string{"U1"},
 	}
 	g, err := New(Options{Client: client, Adapter: a, Config: cfg, Backend: slackBackend, Logger: slog.Default()})
 	if err != nil {
@@ -2209,7 +2210,7 @@ func TestSlackGatewayAdoptsThreadOnStartedTaskAndSurvivesRestart(t *testing.T) {
 		t.Errorf("the registry was consulted %d times for the follow-up, want 1 — the cache was empty and it is the only source", consulted)
 	}
 
-	// An unmapped sender's ask starts nothing, so it marks nothing.
+	// An unlisted sender's ask starts nothing, so it marks nothing.
 	g.handleInbound(InboundMessage{Conversation: "slack:C1/300.1", Kind: "group", AuthorID: "U9", MessageID: "6.0", Text: "drain node 4"})
 	a.mu.Lock()
 	v, cached := a.sessionThreads["C1/300.1"]
@@ -2519,31 +2520,82 @@ func TestSlackMappedButDisallowedSenderDropsVisiblyOnce(t *testing.T) {
 	}
 }
 
-// TestSlackUnmappedButAllowedSenderGetsTheSameNotice: the other half of the
-// pair - listed but not mapped - drops with the identical notice, so the
-// notice does not tell a sender which of the two tables refused them.
-func TestSlackUnmappedButAllowedSenderGetsTheSameNotice(t *testing.T) {
+// TestSlackListedUnmappedSenderIsAttributedByMemberID: the map is an
+// override, not a gate. A listed sender it does not name is admitted and
+// attributed slack:<member id>, with the verifiedBy that says no map was
+// consulted, and they are in their own audience under that same principal.
+func TestSlackListedUnmappedSenderIsAttributedByMemberID(t *testing.T) {
 	r := startSlackGateRig(t, []string{"U1", "U9"}, false)
 	r.adapter.inbox <- InboundMessage{Conversation: "slack:D9", Kind: "dm", AuthorID: "U9", MessageID: "1.0", Text: "do a thing"}
-	waitFor(t, "the unverified-sender notice", func() bool { return len(r.adapter.postTexts()) >= 1 })
-	posts := r.adapter.postTexts()
-	want := "⛔ I can't verify who you are on slack (id U9), so I can't take asks from you yet — an admin has to add you to " + unverifiedRemedyFor(slackBackend) + "."
-	if posts[0] != want {
-		t.Errorf("notice = %q, want %q", posts[0], want)
+	auth := slackAuthorityOf(t, r)
+	ps := NewPseudonymizer([]byte("test-salt"))
+	if want := ps.Hash(slackMemberPrincipalPrefix + "U9"); auth.Requester.Principal != want {
+		t.Errorf("principal = %q, want the pseudonym of %q", auth.Requester.Principal, slackMemberPrincipalPrefix+"U9")
+	}
+	if auth.Requester.VerifiedBy != slackMemberVerifiedBy {
+		t.Errorf("verifiedBy = %q, want %q (no map was consulted)", auth.Requester.VerifiedBy, slackMemberVerifiedBy)
+	}
+	if !slices.Contains(auth.Audience.Roster, auth.Requester.Principal) {
+		t.Errorf("the requester's principal %q is not in their own audience %v", auth.Requester.Principal, auth.Audience.Roster)
 	}
 }
 
-// TestSlackAllowAllAdmitsEveryMappedSender: allow-all lifts the list, never
-// the map: a mapped sender is admitted, an unmapped one still drops.
-func TestSlackAllowAllAdmitsEveryMappedSender(t *testing.T) {
+// TestSlackPartialMapAttributesEachSenderItsOwnWay: with a map naming U1
+// and not U9, U1 is attributed by the map and U9 by member id, and each
+// authority block says which.
+func TestSlackPartialMapAttributesEachSenderItsOwnWay(t *testing.T) {
+	r := startSlackGateRig(t, []string{"U1", "U9"}, false)
+	for _, tc := range []struct{ id, principal, verifiedBy string }{
+		{"U1", "test:one", slackVerifiedBy},
+		{"U9", slackMemberPrincipalPrefix + "U9", slackMemberVerifiedBy},
+	} {
+		if got := r.g.resolvePrincipal(slackBackend, tc.id); got != tc.principal {
+			t.Errorf("%s resolved to %q, want %q", tc.id, got, tc.principal)
+		}
+		if got := r.g.verifiedByOf(slackBackend, tc.principal); got != tc.verifiedBy {
+			t.Errorf("%s: verifiedBy = %q, want %q", tc.id, got, tc.verifiedBy)
+		}
+	}
+	r.adapter.inbox <- InboundMessage{Conversation: "slack:D1", Kind: "dm", AuthorID: "U1", MessageID: "1.0", Text: "do a thing"}
+	auth := slackAuthorityOf(t, r)
+	if auth.Requester.Principal != NewPseudonymizer([]byte("test-salt")).Hash("test:one") || auth.Requester.VerifiedBy != slackVerifiedBy {
+		t.Errorf("the mapped sender's requester = %+v, want the map's principal and %q", auth.Requester, slackVerifiedBy)
+	}
+}
+
+// TestSlackMapCannotAssertTheMemberIDPrefix: a map value carrying the
+// reserved prefix is refused, so no principal a map entry made can claim to
+// be a bare member id, and the mistake is a lockout, not a grant.
+func TestSlackMapCannotAssertTheMemberIDPrefix(t *testing.T) {
+	mapFile := filepath.Join(t.TempDir(), "principal-map")
+	if err := os.WriteFile(mapFile, []byte("U5 "+slackMemberPrincipalPrefix+"U1\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	pm, err := LoadPrincipalMap(mapFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	g := &Gateway{pm: pm, slackAllowAll: true, log: slog.Default()}
+	if got := g.resolvePrincipal(slackBackend, "U5"); got != "" {
+		t.Errorf("a map value carrying %q resolved to %q; it must be refused", slackMemberPrincipalPrefix, got)
+	}
+	if got := g.resolvePrincipal(slackBackend, ""); got != "" {
+		t.Errorf("an empty member id resolved to %q", got)
+	}
+}
+
+// TestSlackAllowAllAdmitsEverySender: allow-all lifts the list, the only
+// gate: a mapped sender is attributed by the map, an unmapped one by member
+// id.
+func TestSlackAllowAllAdmitsEverySender(t *testing.T) {
 	r := startSlackGateRig(t, nil, true)
 	r.adapter.inbox <- InboundMessage{Conversation: "slack:D2", Kind: "dm", AuthorID: "U2", MessageID: "1.0", Text: "hello"}
 	auth := slackAuthorityOf(t, r)
 	if want := NewPseudonymizer([]byte("test-salt")).Hash("test:two"); auth.Requester.Principal != want {
 		t.Errorf("principal = %q, want %q", auth.Requester.Principal, want)
 	}
-	if p := r.g.resolvePrincipal(slackBackend, "U9"); p != "" {
-		t.Errorf("allow-all admitted an unmapped sender as %q; the map is still a gate", p)
+	if p := r.g.resolvePrincipal(slackBackend, "U9"); p != slackMemberPrincipalPrefix+"U9" {
+		t.Errorf("allow-all resolved an unmapped sender to %q, want %q", p, slackMemberPrincipalPrefix+"U9")
 	}
 }
 

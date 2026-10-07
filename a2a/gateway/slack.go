@@ -102,6 +102,15 @@ const (
 	// joined that id to a principal. Both halves, because either alone
 	// would overstate it.
 	slackVerifiedBy = "slack-socket-mode+principal-map"
+	// slackMemberVerifiedBy is the same check without the join: a listed
+	// sender the map does not name is attributed by the member id Slack
+	// asserted, and the authority block says no map was consulted.
+	slackMemberVerifiedBy = "slack-socket-mode"
+	// slackMemberPrincipalPrefix qualifies that member id as a principal,
+	// so it cannot be read as an email or another backend's id. It is
+	// reserved: a map entry whose value carries it is refused, so the map
+	// can never assert a principal that claims to be a bare member id.
+	slackMemberPrincipalPrefix = "slack:"
 )
 
 // Slack token prefixes, checked at construction so a swapped pair fails at

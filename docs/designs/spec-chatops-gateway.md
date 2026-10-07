@@ -558,9 +558,11 @@ How `principal` gets established depends on the backend, and the three are not e
   shape the mechanism is topic IAM, and the impersonation surface is exactly the set of
   identities holding `pubsub.publisher` on the topic. The Google Chat adapter section
   below names it precisely.)
-- **Slack:** join on the immutable `user_id` against a mapping table we maintain from our
-  own IdP. Never `profile.email` - whether that field is IdP-asserted or user-editable
-  depends on workspace config we don't control.
+- **Slack:** the immutable `user_id`, admitted by the allowed-users list. A mapping table
+  we maintain from our own IdP joins it to an IdP identity when it names the member;
+  otherwise the principal is the member id itself, `slack:<user_id>`, as Chat's is the
+  email Google asserts. Never `profile.email` - whether that field is IdP-asserted or
+  user-editable depends on workspace config we don't control.
 - **Discord:** a checked-in test mapping table from Discord user id to a test principal.
   Test-only, by construction: a Discord identity never maps to a real cloud principal,
   full stop.
@@ -1160,14 +1162,21 @@ applies; Discord's group DMs read as DMs, and the asymmetry is deliberate. The b
 only sees channels it has been invited to, so the invitation is the trust boundary for
 group ingress.
 
-**The mapping table - where it lives and who writes it.** The join is Slack's immutable
-`user_id` against a table sourced from our own IdP; never `profile.email` (the identity
-section above says why). The table is a Kubernetes Secret, mounted read-only at the
+**The mapping table - where it lives and who writes it.** The table is an optional
+override, not an admission gate: the allowed-users list admits, and the table joins an
+admitted sender's immutable `user_id` to an identity sourced from our own IdP; never
+`profile.email` (the identity section above says why). A sender the table does not name
+is attributed by member id, `slack:<user_id>`, with `verifiedBy`
+`slack-socket-mode`. The `slack:` prefix is reserved: a table value that carries it is
+refused (the sender drops, with an error in the gateway's log), so a principal that
+claims to be a bare member id always is one. On main the Slack principal decides
+attribution only: capability is minted from the install's tier for every sender,
+sessions have no owner, and the delegation allowlists key on the hashed member id. The table is a Kubernetes Secret, mounted read-only at the
 gateway's principal-map path, same file format the Discord ConfigMap uses.
 `a2a-slack-principal-map` is the name the operator mounts under `next`: alone at the
 gateway's one principal-map path, optional, so an install without its table is the
-gateway's own case (it runs, and every Slack sender drops at verification, with the
-warning the gateway logs when the map is empty). Alone because the gateway reads that
+gateway's own case (it runs, and every listed sender is attributed by member id, which
+the gateway notes in its log at start). Alone because the gateway reads that
 directory as one flat map and resolves a Slack sender against every key in it: the
 hand-made `principal-map` ConfigMap, Discord's table, mounted there too would let a
 ConfigMap write add a Slack `user_id`, so a Slack-armed gateway does not mount it. Every
@@ -1193,18 +1202,18 @@ conversation - a channel mention mints a fresh conversation every time, so a
 conversation-scoped dedupe would be no bound at all. The memory is capped and evicted
 wholesale at the cap, so the worst an unverified sender can do is make one notice
 repeat. This is gateway behavior, not Slack behavior, so Discord and Google Chat get
-it too - the notice names the remedy for whichever backend it fires on (here both the
-allowed-users list and the principal map, the allowed-users list on gchat). On Slack the
-notice is the same whichever of the two refused, so it does not tell a sender which table
-they are missing from.
+it too - the notice names the remedy for whichever backend it fires on (the allowed-users
+list on Slack and gchat). On Slack only the list refuses: a listed sender the table does
+not name is attributed by member id, not dropped.
 
 **Roster.** Channel membership via the members API, one page; past a page the roster
 reports incomplete rather than paging (the roster cap truncates far below it anyway).
 Slack has no per-thread membership, and anyone in the channel can read the thread, so
 channel membership is the honest answer to "who could have read this." Members are
-resolved through the same gate as the requester, the allowed-users list and then the map,
-so a mapped member the list refuses is recorded by their backend id, as an unmapped one
-is, never under the principal the gateway declined to grant them.
+resolved through the same rule as the requester, the allowed-users list and then the map,
+so a mapped member the list refuses is recorded by their raw backend id, never under the
+principal the gateway declined to grant them, and a listed member the map does not name
+as `slack:<user_id>`, the principal they get as a requester.
 
 **One backend per gateway process.** The relay binds one durable, and two gateways on
 one durable split event deliveries - so config counts the armed backends and refuses
@@ -1214,8 +1223,9 @@ second Deployment with its own durable, when we want one. The inject side door i
 in that count - it may sit beside any one of the three, for the reason the inject
 section gives - and neither is the console adapter, which has no durable to split.
 
-`verifiedBy` is `slack-socket-mode+principal-map`: Slack authenticated the sender over
-the socket and asserted the `user_id`, our table joined it to a principal. Rendering
+`verifiedBy` is `slack-socket-mode+principal-map` when our table joined the sender to a
+principal, and `slack-socket-mode` when it did not: either way Slack authenticated the
+sender over the socket and asserted the `user_id`. Rendering
 into mrkdwn is a narrow deterministic translation of the two forms the relay emits
 (bold, links); the legacy Hermes converter stays where it is. The translation leaves
 code spans as written, converts bold only on a closed `**` pair, never alters a

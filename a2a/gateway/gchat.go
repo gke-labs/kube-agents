@@ -174,7 +174,7 @@ func unverifiedRemedyFor(backend string) string {
 	case gchatBackend:
 		return "the allowed users list"
 	case slackBackend:
-		return "the allowed users list and the principal map"
+		return "the allowed users list"
 	case consoleBackend:
 		// Cannot happen from a real console frame; a spoofed author id can.
 		return "nothing - only the console credential's own frames are accepted here"
@@ -994,15 +994,46 @@ func (g *Gateway) resolvePrincipal(backend, authorID string) string {
 		}
 		return ""
 	case slackBackend:
-		// Chat's allowlist rule, carried to Slack (spec.integration.slack
-		// .allowedUsers), and then the map: a sender must be listed (or
-		// allow-all) AND mapped. Exact match, no case fold: a Slack member
-		// id is an opaque token, not an address.
-		if !g.slackAllowAll && !g.slackAllowed[authorID] {
-			return ""
-		}
+		return g.resolveSlackPrincipal(authorID)
 	}
 	return g.pm.Resolve(authorID)
+}
+
+// resolveSlackPrincipal is Chat's allowlist rule carried to Slack
+// (spec.integration.slack.allowedUsers), which is the only admission gate,
+// as on the legacy path. A listed sender (or any sender under allow-all) is
+// then attributed by the principal map when it names them - the IdP
+// identity an admin joined to the member id - and otherwise by the member id
+// itself, qualified slackMemberPrincipalPrefix, as Chat attributes by the
+// email Google asserts. The map is an optional override, not a second gate.
+// Exact match, no case fold: a Slack member id is an opaque token, not an
+// address. A map value carrying the reserved prefix is refused, which makes
+// a mistaken entry a lockout rather than a principal that misstates how it
+// was established. Empty means drop.
+func (g *Gateway) resolveSlackPrincipal(authorID string) string {
+	if authorID == "" || (!g.slackAllowAll && !g.slackAllowed[authorID]) {
+		return ""
+	}
+	if principal := g.pm.Resolve(authorID); principal != "" {
+		if strings.HasPrefix(principal, slackMemberPrincipalPrefix) {
+			g.log.Error("the Slack principal map maps a member to a principal carrying the reserved member-id prefix; refusing it",
+				"member", authorID, "prefix", slackMemberPrincipalPrefix)
+			return ""
+		}
+		return principal
+	}
+	return slackMemberPrincipalPrefix + authorID
+}
+
+// slackVerifiedByFor names the mechanism behind one Slack principal: the
+// map's join when the map named the sender, the member id alone when it did
+// not. The prefix decides, and it can only come from resolveSlackPrincipal,
+// which refuses a map value that carries it.
+func slackVerifiedByFor(principal string) string {
+	if strings.HasPrefix(principal, slackMemberPrincipalPrefix) {
+		return slackMemberVerifiedBy
+	}
+	return slackVerifiedBy
 }
 
 // resolveInjectPrincipal resolves an author the side door delivered, and it
