@@ -419,28 +419,38 @@ class SweepProjectTest(unittest.TestCase):
                 if "addresses" in cmd:
                     return mock.Mock(
                         returncode=0,
-                        stdout=json.dumps([{
-                            "name": "bench-addr-skew",
-                            "description": self.plant_desc,
-                            # Created 1 hour ago (younger than 4h threshold, but belonging to old network)
-                            "creationTimestamp": self.recent_ts,
-                            "subnetwork": "https://www.googleapis.com/compute/v1/projects/p/regions/us-west4/subnetworks/bench-subnet-skew",
-                            "region": "https://www.googleapis.com/compute/v1/projects/p/regions/us-west4",
-                        }]),
+                        stdout=json.dumps([
+                            {
+                                "name": "bench-addr-skew",
+                                "description": self.plant_desc,
+                                # Created 1 hour ago (younger than 4h threshold, but belonging to old network)
+                                "creationTimestamp": self.recent_ts,
+                                "subnetwork": "https://www.googleapis.com/compute/v1/projects/p/regions/us-west4/subnetworks/bench-subnet-skew",
+                                "region": "https://www.googleapis.com/compute/v1/projects/p/regions/us-west4",
+                            },
+                            {
+                                "name": "bench-addr-global-skew",
+                                "description": self.plant_desc,
+                                "creationTimestamp": self.recent_ts,
+                                "network": "https://www.googleapis.com/compute/v1/projects/p/global/networks/bench-vpc-skew",
+                            },
+                        ]),
                         stderr="",
                     )
             return mock.Mock(returncode=0, stdout="", stderr="")
 
         res = sweep.sweep_project("my-project", max_age_hours=4.0, runner=mock_runner, now=self.now)
-        self.assertEqual(res["addresses"], ["bench-addr-skew"])
+        self.assertEqual(res["addresses"], ["bench-addr-skew", "bench-addr-global-skew"])
         self.assertEqual(res["subnets"], ["bench-subnet-skew"])
         self.assertEqual(res["networks"], ["bench-vpc-skew"])
 
         delete_cmds = [cmd for cmd in commands_run if "delete" in cmd]
-        self.assertEqual(len(delete_cmds), 3)
+        self.assertEqual(len(delete_cmds), 4)
         self.assertIn("bench-addr-skew", delete_cmds[0])
-        self.assertIn("bench-subnet-skew", delete_cmds[1])
-        self.assertIn("bench-vpc-skew", delete_cmds[2])
+        self.assertIn("bench-addr-global-skew", delete_cmds[1])
+        self.assertIn("--global", delete_cmds[1])
+        self.assertIn("bench-subnet-skew", delete_cmds[2])
+        self.assertIn("bench-vpc-skew", delete_cmds[3])
 
     def test_active_network_protects_child_subnets_and_addresses(self):
         """Proves that a recent plant network keeps its subnets and addresses intact."""
@@ -778,6 +788,17 @@ class SweepPoolTest(unittest.TestCase):
             self.assertIn("proj-1", deleted)
             self.assertEqual(deleted["proj-1"]["addresses"], 1)
             self.assertEqual(deleted["proj-1"]["networks"], 1)
+
+    def test_boskos_reset_stranded_uses_sweep_label(self):
+        with mock.patch.object(sweep.boskos_pool, "reset_stranded", return_value=["p1"]) as mock_reset:
+            names = sweep.boskos_reset_stranded("http://fake-boskos")
+            self.assertEqual(names, ["p1"])
+            mock_reset.assert_called_once_with(
+                "http://fake-boskos",
+                sweep.BOSKOS_SWEEP_STATE,
+                sweep.BOSKOS_STRANDED_AFTER,
+                "sweep",
+            )
 
     def test_sweep_pool_partial_failure_retains_deleted_in_report(self):
         def fake_walk(server, owner, state, limit, visit_callback, heartbeat=True, release_failures=None):

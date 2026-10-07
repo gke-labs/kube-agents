@@ -386,7 +386,7 @@ def sweep_project(
 
 def boskos_reset_stranded(server: str):
     """Return projects left in BOSKOS_SWEEP_STATE by an earlier dead sweep run to free."""
-    return boskos_pool.reset_stranded(server, BOSKOS_SWEEP_STATE, BOSKOS_STRANDED_AFTER, "compute-sweep")
+    return boskos_pool.reset_stranded(server, BOSKOS_SWEEP_STATE, BOSKOS_STRANDED_AFTER, "sweep")
 
 
 def sweep_pool(
