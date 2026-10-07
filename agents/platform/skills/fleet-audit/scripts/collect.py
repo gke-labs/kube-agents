@@ -3791,7 +3791,7 @@ def _is_untainted_gp_compute_class(
     if any(
         _normalize_taint_effect(t.get("effect")) in ("NOSCHEDULE", "NOEXECUTE")
         and t.get("key") not in _CONTROLLER_NODE_TAINT_KEYS
-        and t.get("key") not in _GKE_MANAGED_TAINT_KEYS
+        and t.get("key") not in ("kubernetes.io/arch", "node.kubernetes.io/os")
         for t in taints
     ):
         return False
@@ -3816,7 +3816,12 @@ def _is_untainted_gp_compute_class(
             p for p in node_pools
             if ((p.get("config") or {}).get("labels") or {}).get(COMPUTE_CLASS_LABEL) == name
         ]
-        if cc_pools and all(_pool_has_workload_taints(p) for p in cc_pools):
+        if cc_pools and all(
+            _pool_has_workload_taints(p)
+            or (p.get("config") or {}).get("sandboxConfig", {}).get("type") == "GVISOR"
+            or any((t.get("key") in ("sandbox.gke.io/runtime", "nvidia.com/gpu", "google.com/tpu")) for t in ((p.get("config") or {}).get("taints") or []))
+            for p in cc_pools
+        ):
             return False
 
     return True
@@ -3833,7 +3838,7 @@ def check_untargeted_compute_class_workload(workload: dict, context: dict) -> di
         return None
 
     template = workload.get("template") or {}
-    node_selector = template.get("nodeSelector") or {}
+    node_selector = dict(template.get("nodeSelector") or {})
     if COMPUTE_CLASS_LABEL in node_selector:
         return None
 
@@ -3875,13 +3880,7 @@ def check_untargeted_compute_class_workload(workload: dict, context: dict) -> di
         autoscaling = p.get("autoscaling")
         if autoscaling and autoscaling.get("enabled"):
             return True
-        if "nodes" in context:
-            return live_nodes_by_pool.get(p.get("name", ""), 0) > 0
-        if "currentNodeCount" in p:
-            return p["currentNodeCount"] > 0
-        if "initialNodeCount" in p:
-            return p["initialNodeCount"] > 0
-        return False
+        return live_nodes_by_pool.get(p.get("name", ""), 0) > 0
 
     untainted_pools = [
         p for p in node_pools
@@ -3906,6 +3905,7 @@ def check_untargeted_compute_class_workload(workload: dict, context: dict) -> di
         pod_tolerations.append({"key": "node.kubernetes.io/os", "value": "windows", "operator": "Equal"})
     if template.get("runtimeClassName") == "gvisor":
         pod_tolerations.append({"key": "sandbox.gke.io/runtime", "value": "gvisor", "operator": "Equal"})
+        node_selector["sandbox.gke.io/runtime"] = "gvisor"
     containers = list(template.get("containers") or []) + list(template.get("initContainers") or [])
     has_gpu_request = False
     has_tpu_request = False
@@ -3976,6 +3976,7 @@ def check_untargeted_compute_class_workload(workload: dict, context: dict) -> di
         "topology.kubernetes.io/zone",
         "topology.gke.io/zone",
         "failure-domain.beta.kubernetes.io/zone",
+        "sandbox.gke.io/runtime",
     })
 
     known_pool_label_keys = set(_GKE_KNOWN_POOL_LABEL_KEYS)
@@ -4018,6 +4019,8 @@ def check_untargeted_compute_class_workload(workload: dict, context: dict) -> di
         elif image_type or "imageType" in config or not config.get("operatingSystem"):
             labels["kubernetes.io/os"] = "linux"
             labels["beta.kubernetes.io/os"] = "linux"
+        if (config.get("sandboxConfig") or {}).get("type") == "GVISOR":
+            labels["sandbox.gke.io/runtime"] = "gvisor"
         return labels
 
     def _pool_matches_selector(pool: dict, selector: dict[str, str]) -> bool | None:
@@ -4091,9 +4094,20 @@ def check_untargeted_compute_class_workload(workload: dict, context: dict) -> di
                         if locations and all(loc in vals for loc in locations):
                             term_match = False
                             break
+                        elif not locations:
+                            term_unknown = True
+                    elif k in known_pool_label_keys:
+                        pass
+                    else:
+                        term_unknown = True
                 elif op == "Exists":
                     if k in effective_labels:
                         pass
+                    elif k in ("topology.kubernetes.io/zone", "topology.gke.io/zone", "failure-domain.beta.kubernetes.io/zone"):
+                        if locations:
+                            pass
+                        else:
+                            term_unknown = True
                     elif k in known_pool_label_keys:
                         term_match = False
                         break
@@ -4103,6 +4117,16 @@ def check_untargeted_compute_class_workload(workload: dict, context: dict) -> di
                     if k in effective_labels:
                         term_match = False
                         break
+                    elif k in ("topology.kubernetes.io/zone", "topology.gke.io/zone", "failure-domain.beta.kubernetes.io/zone"):
+                        if locations:
+                            term_match = False
+                            break
+                        else:
+                            term_unknown = True
+                    elif k in known_pool_label_keys:
+                        pass
+                    else:
+                        term_unknown = True
                 else:
                     # Gt, Lt, or unsupported operators
                     term_unknown = True
@@ -4119,10 +4143,15 @@ def check_untargeted_compute_class_workload(workload: dict, context: dict) -> di
         return False
 
     def _pool_matches_placement(pool: dict) -> bool | None:
-        if has_gpu_request or has_tpu_request:
-            config = pool.get("config") or {}
+        config = pool.get("config") or {}
+        if has_gpu_request:
             accelerators = config.get("accelerators") or []
             if not accelerators:
+                return False
+        if has_tpu_request:
+            machine_type = (config.get("machineType") or "").lower()
+            is_tpu = machine_type.startswith(("ct", "tpu")) or "-tpu-" in machine_type
+            if not is_tpu:
                 return False
         sel_match = _pool_matches_selector(pool, node_selector)
         if sel_match is False:
