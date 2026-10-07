@@ -22,7 +22,7 @@ networking audit evaluations (SOP 2.1) to file false positive critical
 This script sweeps Compute addresses, subnets, and networks whose
 `description` starts with `kube-agents-bench plant`. In `--project` mode, it
 acquires the named project from Boskos out of `free` into `cleaning` and refuses
-if it is leased or busy, ensuring active evaluation runs are not swept. Gating is
+if it is leased, busy, or not registered there, ensuring active evaluation runs are not swept. Gating is
 rooted on the VPC network: plant networks older than `max_age_hours` (default: 4 hours,
 with unparseable or missing timestamps treated as old) are selected along with their
 child plant subnets and internal addresses, while plant subnets and addresses attached
@@ -283,8 +283,6 @@ def sweep_project(
             is_young_plant_subnet = True
         elif sub_name and (addr_region, sub_name) in plant_subnet_keys:
             is_young_plant_subnet = True
-        elif sub_name and not addr_region and any(k[1] == sub_name for k in plant_subnet_keys):
-            is_young_plant_subnet = True
 
         if is_young_plant_subnet:
             print(f"  skipping address {addr_name}: parent plant subnet {sub_name} is younger than {max_age_hours}h")
@@ -517,12 +515,20 @@ def parse_max_age_hours(val: str) -> float:
     return v
 
 
+def parse_project_name(val: str) -> str:
+    """Parse and validate --project: non-empty, non-whitespace project ID."""
+    cleaned = (val or "").strip()
+    if not cleaned:
+        raise argparse.ArgumentTypeError("project name cannot be empty")
+    return cleaned
+
+
 def main(argv=None) -> int:
     description = (__doc__ or "").splitlines()[0]
     parser = argparse.ArgumentParser(description=description)
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--pool", action="store_true", help="sweep every project Boskos reports free")
-    mode.add_argument("--project", help="sweep one project after acquiring it from Boskos")
+    mode.add_argument("--project", type=parse_project_name, help="sweep one project after acquiring it from Boskos")
     parser.add_argument(
         "--max-age-hours",
         type=parse_max_age_hours,
@@ -560,7 +566,7 @@ def main(argv=None) -> int:
     error = None
 
     try:
-        if args.project:
+        if args.project is not None:
             boskos_reset_stranded(args.boskos_server)
             release_failures = {}
 
@@ -617,7 +623,7 @@ def main(argv=None) -> int:
 
             if outcome is boskos_pool.NOT_ACQUIRED:
                 code = 1
-                error = f"project {args.project} is not free in Boskos (leased or busy)"
+                error = f"project {args.project} is not free in Boskos (leased, busy, or not registered there)"
                 run["failures"][args.project] = error
                 print(f"ERROR: {error}", file=sys.stderr)
         else:

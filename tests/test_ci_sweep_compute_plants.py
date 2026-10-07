@@ -482,6 +482,7 @@ class SweepProjectTest(unittest.TestCase):
                                 "description": self.plant_desc,
                                 "creationTimestamp": None,
                                 "subnetwork": "https://www.googleapis.com/compute/v1/projects/p/regions/us-west4/subnetworks/active-subnet",
+                                "region": "https://www.googleapis.com/compute/v1/projects/p/regions/us-west4",
                             },
                             {
                                 "name": "active-addr-net",
@@ -1085,7 +1086,7 @@ class MainCliTest(unittest.TestCase):
                 self.assertFalse(mock_sp.called)
                 data = json.loads(pathlib.Path(report_path).read_text(encoding="utf-8"))
                 self.assertEqual(data["exit"], "failed")
-                self.assertEqual(data["failures"]["p1"], "project p1 is not free in Boskos (leased or busy)")
+                self.assertEqual(data["failures"]["p1"], "project p1 is not free in Boskos (leased, busy, or not registered there)")
         finally:
             pathlib.Path(report_path).unlink(missing_ok=True)
 
@@ -1169,6 +1170,28 @@ class MainCliTest(unittest.TestCase):
                     with mock.patch("sys.stderr", io.StringIO()):
                         sweep.main(["--project", "p1", "--max-age-hours", val])
                 self.assertEqual(ctx.exception.code, 2)
+
+    def test_parse_project_name(self):
+        self.assertEqual(sweep.parse_project_name("my-project"), "my-project")
+        self.assertEqual(sweep.parse_project_name("  trimmed-project  "), "trimmed-project")
+        for val in ["", "   "]:
+            with self.subTest(val=val):
+                with self.assertRaises(sweep.argparse.ArgumentTypeError):
+                    sweep.parse_project_name(val)
+
+    def test_main_rejects_empty_project_name(self):
+        for val in ["", "   "]:
+            with self.subTest(val=val):
+                with (
+                    mock.patch.object(sweep, "pool_projects") as mock_pool_projects,
+                    mock.patch.object(sweep, "sweep_pool") as mock_sweep_pool,
+                    mock.patch("sys.stderr", io.StringIO()),
+                ):
+                    with self.assertRaises(SystemExit) as ctx:
+                        sweep.main(["--project", val])
+                    self.assertEqual(ctx.exception.code, 2)
+                    self.assertFalse(mock_pool_projects.called)
+                    self.assertFalse(mock_sweep_pool.called)
 
     def test_main_fault_outside_visit_returns_1_without_traceback(self):
         with tempfile.NamedTemporaryFile("w", delete=False) as tf:
