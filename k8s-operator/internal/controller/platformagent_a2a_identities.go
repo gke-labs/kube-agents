@@ -204,6 +204,13 @@ const (
 	// modules cannot see each other.
 	a2aAgentBusUser = "agent"
 
+	// The chat.notify route (a2a/gateway/notify.go, a2a/lib/notify.go, which
+	// spell the same two subjects - the modules cannot import each other).
+	// The agent publishes the first and reads the second; the gateway reads
+	// the first and publishes the second; no other principal holds either.
+	a2aNotifySubjectGchat  = "chat.notify.gchat"
+	a2aNotifyReplySubjects = "chat.notify.reply." + a2aAgentBusUser + ".>"
+
 	// a2aBridgeUser is the Hermes bridge sidecar's principal. Static, not
 	// callout — see bridgeIdentity for why a token cannot separate it from
 	// the container above.
@@ -336,6 +343,13 @@ func gatewayIdentity(agent *agentv1alpha1.PlatformAgent, ns string) a2aIdentity 
 		// The console adapter's notices (spec-chatops-gateway.md, "The
 		// console adapter"): core NATS, one subject per conversation.
 		"chat.console.*.out",
+		// The answer to a chat.notify request (a2a/gateway/notify.go): the
+		// first message posted and its thread, so the agent's next notify
+		// can reply on it. A namespace of its own rather than the agent's
+		// _INBOX, for the reason the verifier answers on a2a.cap.reply.>:
+		// the agent reads its JetStream replies on that inbox, and a grant
+		// reaching it would let the gateway forge them.
+		a2aNotifyReplySubjects,
 		// The capability the gateway mints for each task. One token after
 		// `root`, which is the request id, so this is the whole minting
 		// authority in one subject.
@@ -400,6 +414,8 @@ func gatewayIdentity(agent *agentv1alpha1.PlatformAgent, ns string) a2aIdentity 
 			"agents.hb.>",
 			"$KV.session-state.>",
 			"chat.console.*.in",
+			// Proactive posts from the agent to the home channel.
+			a2aNotifySubjectGchat,
 			"_INBOX.gateway.>",
 		},
 		// Defence in depth rather than a live subtraction. This deny was
@@ -640,6 +656,11 @@ func agentIdentity(agent *agentv1alpha1.PlatformAgent, ns string) a2aIdentity {
 		"a2a.topics.shared.annotations",
 	}
 	publish = append(publish, a2aAgentJetStreamGrants()...)
+	// Proactive posts (alerts, cron findings, audit reports) to the chat home
+	// channel, through the gateway that holds the chat credential. Not the
+	// task plane: a notify mints no capability and starts no executor, and
+	// the gateway posts it to the home channel and nowhere else.
+	publish = append(publish, a2aNotifySubjectGchat)
 	publish = append(publish, "_INBOX."+a2aAgentBusUser+".>")
 
 	return a2aIdentity{
@@ -656,6 +677,8 @@ func agentIdentity(agent *agentv1alpha1.PlatformAgent, ns string) a2aIdentity {
 		publish: publish,
 		subscribe: []string{
 			"a2a.topics.>",
+			// The gateway's answers to its notifies.
+			a2aNotifyReplySubjects,
 			"_INBOX." + a2aAgentBusUser + ".>",
 		},
 	}

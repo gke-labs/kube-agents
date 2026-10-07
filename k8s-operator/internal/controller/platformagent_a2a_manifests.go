@@ -506,7 +506,15 @@ const (
 	a2aGchatRelayURLEnvVar      = "A2A_GCHAT_RELAY_URL"
 	a2aGchatAllowedUsersEnvVar  = "A2A_GCHAT_ALLOWED_USERS"
 	a2aGchatAllowAllUsersEnvVar = "A2A_GCHAT_ALLOW_ALL_USERS"
-	a2aChatDisplayModeEnvVar    = "A2A_CHAT_DISPLAY_MODE"
+	// The home space the gateway's chat.notify route posts to
+	// (a2a/gateway/config.go, notify.go), from googleChat.homeChannel.
+	a2aGchatHomeChannelEnvVar = "A2A_GCHAT_HOME_CHANNEL"
+	// The agent container's half of the same route: which platform name
+	// the agent-side callers route through `a2a notify` instead of
+	// `hermes send` (agents/platform/scripts/chat_notify.py).
+	a2aNotifyPlatformEnvVar  = "A2A_NOTIFY_PLATFORM"
+	a2aNotifyPlatformGchat   = "google_chat"
+	a2aChatDisplayModeEnvVar = "A2A_CHAT_DISPLAY_MODE"
 	// The CR field's own default. The gateway's unset resolves to "debug"
 	// so Discord installs render as they always have; the operator is what
 	// makes the CR and the env agree, so unset on the CR renders this.
@@ -4161,6 +4169,12 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 			// Rendered explicitly at the gateway's default, like
 			// A2A_MAX_SESSIONS: the path and the mount below are one fact.
 			{Name: a2aGchatTokenPathEnvVar, Value: a2aGchatTokenPath},
+		}
+		// Proactive posts land here (the chat.notify route). Unset leaves
+		// the route unarmed, which is what an install with no home channel
+		// had under today too: nowhere to post.
+		if home := strings.TrimSpace(gchat.HomeChannel); home != "" {
+			chatEnv = append(chatEnv, corev1.EnvVar{Name: a2aGchatHomeChannelEnvVar, Value: home})
 		}
 		chatMounts = []corev1.VolumeMount{{Name: a2aGchatTokenVolume, MountPath: a2aGchatTokenDir, ReadOnly: true}}
 		chatVolumes = []corev1.Volume{{

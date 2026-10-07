@@ -144,9 +144,14 @@ var SensitiveEnvVars = map[string]struct{}{
 	// anything but an override of the projection.
 	"A2A_BUS_TOKEN_FILE": {},
 	"A2A_BUS_USER":       {},
-	"NATS_URL":           {},
-	"NATS_USER":          {},
-	"NATS_PASSWORD":      {},
+	// A2A_NOTIFY_PLATFORM turns the agent's proactive posts from Hermes to
+	// the gateway's chat.notify route. The operator renders it exactly when
+	// the next stack holds the chat backend; an override either way leaves
+	// posts going to a platform that is not there.
+	"A2A_NOTIFY_PLATFORM": {},
+	"NATS_URL":            {},
+	"NATS_USER":           {},
+	"NATS_PASSWORD":       {},
 }
 
 // ReservedVolumeNames defines pod volume names the operator renders itself and
