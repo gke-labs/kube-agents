@@ -1006,17 +1006,20 @@ class TestIndexDiscovery(_MergeBase):
 # test can tell a derived job from a hardcoded one.
 FAKE_NIGHTLY_JOB = "ci-fake-eval-nightly"
 FAKE_NIGHTLY_PREFIX = f"{FAKE_BUCKET}logs/{FAKE_NIGHTLY_JOB}/"
+# The writers periodic of a night split across two jobs, under its live job
+# name: nightly.py tells the parts apart by that name.
+FAKE_WRITERS_PREFIX = f"{FAKE_BUCKET}logs/{collect.DEFAULT_NIGHTLY_WRITERS_JOB}/"
 
 
 class TestNightlySource(_MergeBase):
     """The nightly periodic beside the presubmit: same parser, its own tier,
     no pull request, its own watermark, and never the refusal line."""
 
-    def place_nightly_build(self, build) -> pathlib.Path:
+    def place_nightly_build(self, build, periodic=FAKE_NIGHTLY_PREFIX) -> pathlib.Path:
         """Copy fixture `build` under the periodic's prefix (one directory per
         build, as Prow archives a periodic) and refresh latest-build.txt."""
         root = self.bucket_root()
-        prefix = root / FAKE_NIGHTLY_PREFIX[len(FAKE_BUCKET):]
+        prefix = root / periodic[len(FAKE_BUCKET):]
         prefix.mkdir(parents=True, exist_ok=True)
         dst = prefix / build
         shutil.copytree(TESTDATA / build, dst)
@@ -1217,6 +1220,88 @@ class TestNightlySource(_MergeBase):
             self.assertEqual(cases[name]["last3"], [])
         # And the pooled numbers a consumer used to read stay the presubmit's.
         self.assertEqual(sum(c["runs_on_record"] for c in cases.values()), 11)
+
+    def test_the_writers_prefix_is_collected_beside_the_main_one(self):
+        """A night split across two jobs: both prefixes are listed, both
+        builds are nightly runs, each with its own job and link."""
+        gsutil, log = self.fake_gsutil([])
+        self.place_nightly_build(BUILD_998_INFRA)
+        self.place_nightly_build(BUILD_998_FULL, periodic=FAKE_WRITERS_PREFIX)
+        data, stderr = self.quiet_collect(nightly_prefix=FAKE_NIGHTLY_PREFIX, nightly_writers_prefix=FAKE_WRITERS_PREFIX, gsutil=gsutil)
+        by_id = {run["build_id"]: run for run in data["runs"]}
+        self.assertEqual({b: (r["tier"], r["job"]) for b, r in by_id.items()}, {
+            BUILD_998_INFRA: ("nightly", FAKE_NIGHTLY_JOB),
+            BUILD_998_FULL: ("nightly", "ci-kube-agents-eval-nightly-writers"),
+        })
+        self.assertEqual(by_id[BUILD_998_FULL]["log_url"], f"https://oss.gprow.dev/view/gs/fake-prow/logs/ci-kube-agents-eval-nightly-writers/{BUILD_998_FULL}")
+        calls = log.read_text().splitlines()
+        self.assertEqual([c for c in calls if c.startswith("ls ")], [f"ls {FAKE_NIGHTLY_PREFIX}", f"ls {FAKE_WRITERS_PREFIX}"])
+        self.assertIsNone(WORKFLOW_REFUSAL.search(stderr))
+        self.assertEqual(collect.DEFAULT_NIGHTLY_WRITERS_JOB, nightly.NIGHTLY_WRITERS_JOB, "the collector and the report name one job")
+        self.assertEqual(collect.DEFAULT_NIGHTLY_WRITERS_PREFIX, "gs://kube-agents-evals-nightly-logs/logs/ci-kube-agents-eval-nightly-writers/")
+        self.assertNotIn("--nightly-writers-prefix", stderr)
+
+    def test_a_writers_prefix_naming_another_job_is_warned_about(self):
+        """nightly.py files a run as the writers part by the job name alone,
+        so a prefix ending in another job would be reported as main nights."""
+        gsutil, _ = self.fake_gsutil([])
+        other = f"{FAKE_BUCKET}logs/my-writers/"
+        _, stderr = self.quiet_collect(nightly_prefix=FAKE_NIGHTLY_PREFIX, nightly_writers_prefix=other, gsutil=gsutil)
+        self.assertIn(f"warning: --nightly-writers-prefix {other} names job my-writers, not ci-kube-agents-eval-nightly-writers", stderr)
+        self.assertIsNone(WORKFLOW_REFUSAL.search(stderr))
+
+    def test_each_nightly_job_resumes_above_its_own_watermark(self):
+        """Both jobs start at 00:00 UTC and the writers build finishes first:
+        its id on record must not lift the main job's watermark over a main
+        build the listing names later, nor the other way round."""
+        gsutil, _ = self.fake_gsutil([])
+        self.place_nightly_build(BUILD_956_TRUNCATED)  # main: below the writers id on record
+        self.place_nightly_build(BUILD_998_INFRA, periodic=FAKE_WRITERS_PREFIX)  # writers: above the main id on record
+        prior_data = json.loads(pathlib.Path(self.prior_with([])).read_text())
+        prior_data["runs"] = [
+            {"build_id": "1", "tier": "nightly", "job": FAKE_NIGHTLY_JOB, "pr": None, "tasks": []},
+            {"build_id": "2093040000000000000", "tier": "nightly", "job": "ci-kube-agents-eval-nightly-writers", "pr": None, "tasks": []},
+        ]
+        merged, stderr = self.quiet_collect(
+            nightly_prefix=FAKE_NIGHTLY_PREFIX, nightly_writers_prefix=FAKE_WRITERS_PREFIX,
+            merge_with=self.write_prior(prior_data), gsutil=gsutil, since_days=10000,
+        )
+        self.assertNotIn(BUILD_998_INFRA, {r["build_id"] for r in merged["runs"]}, "below the writers' own watermark")
+        self.assertIn(BUILD_956_TRUNCATED, {r["build_id"] for r in merged["runs"]}, "above the main job's own watermark")
+        self.assertIn("nightly scan resumed above build 1, 1 new", stderr)
+        self.assertIn("writers scan resumed above build 2093040000000000000, 0 new", stderr)
+
+    def test_a_writers_prefix_with_no_writers_on_record_is_a_note(self):
+        """Until a writers build is on record, its prefix failing to list is
+        the job not existing yet, whatever the main job has on record: a
+        note, never the refusal line."""
+        gsutil, _ = self.fake_gsutil([BUILD_998_FULL])
+        os.environ["FAKE_GSUTIL_DENY"] = FAKE_WRITERS_PREFIX
+        self.place_nightly_build(BUILD_998_INFRA)
+        prior_data = json.loads(pathlib.Path(self.prior_with([BUILD_998_INFRA])).read_text())
+        prior_data["runs"].append(dict(prior_data["runs"][0], build_id="1", tier="nightly", pr=None))
+        merged, stderr = self.quiet_collect(
+            pr_globs=[FAKE_GLOB], nightly_prefix=FAKE_NIGHTLY_PREFIX, nightly_writers_prefix=FAKE_WRITERS_PREFIX,
+            merge_with=self.write_prior(prior_data), gsutil=gsutil, index_prefix=FAKE_INDEX_PREFIX,
+        )
+        self.assertIn(f"note: nightly prefix {FAKE_WRITERS_PREFIX} did not list", stderr)
+        self.assertIsNone(WORKFLOW_REFUSAL.search(stderr))
+        # Once one is on record, the same failure is the refusal line.
+        prior_data["runs"].append(dict(prior_data["runs"][0], build_id="2", tier="nightly", pr=None, job="ci-kube-agents-eval-nightly-writers"))
+        _, stderr = self.quiet_collect(
+            pr_globs=[FAKE_GLOB], nightly_prefix=FAKE_NIGHTLY_PREFIX, nightly_writers_prefix=FAKE_WRITERS_PREFIX,
+            merge_with=self.write_prior(prior_data), gsutil=gsutil, index_prefix=FAKE_INDEX_PREFIX,
+        )
+        self.assertIn(f"warning: gsutil ls failed for {FAKE_WRITERS_PREFIX}", stderr)
+
+    def test_an_unfinished_writers_build_rides_pending_with_its_link(self):
+        gsutil, _ = self.fake_gsutil([])
+        built = self.place_nightly_build(BUILD_998_FULL, periodic=FAKE_WRITERS_PREFIX)
+        (built / "finished.json").unlink()
+        now = datetime(2026, 9, 10, 0, 5, tzinfo=timezone.utc)
+        data, _ = self.quiet_collect(nightly_writers_prefix=FAKE_WRITERS_PREFIX, gsutil=gsutil, now=now)
+        url = f"https://oss.gprow.dev/view/gs/fake-prow/logs/ci-kube-agents-eval-nightly-writers/{BUILD_998_FULL}"
+        self.assertEqual(data["pending_builds"], [{"build_id": BUILD_998_FULL, "first_seen": now.isoformat(), "tier": "nightly", "log_url": url}])
 
     def test_nightly_active_is_the_superset_matrix(self):
         data = collect.collect(from_dir=TESTDATA)
