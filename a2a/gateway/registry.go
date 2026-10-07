@@ -389,6 +389,12 @@ func (rec *SessionRecord) observedAs(taskID string) (id string, ends bool) {
 	return ref.rootID(), ref.Role != taskRoleChild && len(ref.Children) == 0
 }
 
+// hasChildren reports whether the task's history entry names a child.
+func (rec *SessionRecord) hasChildren(taskID string) bool {
+	ref, ok := rec.TaskRefFor(taskID)
+	return ok && len(ref.Children) > 0
+}
+
 // chainLast follows a delegation chain from the turn that started it to its
 // last task: down each turn's last child to the wake that child started, until
 // a turn that did not delegate (the wake that ends the chain) or a child no

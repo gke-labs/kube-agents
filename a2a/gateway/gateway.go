@@ -928,6 +928,18 @@ func (g *Gateway) healActiveTask(ctx context.Context, rec *SessionRecord) {
 	var healedSource TerminalSource
 	var healedTask *lib.Task // the terminal the heal found, shape (a) only
 	switch {
+	case err == nil && task.Final && task.Artifact(lib.ArtifactDelegate) != nil && !rec.hasChildren(active.TaskID):
+		// A turn that asked to delegate, whose request the relay has not
+		// reached yet: the stream holds the delegate artifact and the
+		// turn's own terminal ("delegated to platform"), and the record
+		// names no child. That terminal is not the root's end, and the
+		// relay is the one to settle it - it delivers the artifact and the
+		// terminal in order from its durable, minting the child or saying
+		// why not. Healed here, the root would be announced ended on the
+		// hand-off line and the relay's mint would then find no active task.
+		// probeConversation reads the same fold as the chain running.
+		g.log.Info("active task's delegate request not relayed yet; leaving it to the relay",
+			"conversation", rec.Key, "taskId", active.TaskID, "state", task.State)
 	case err == nil && task.Final:
 		g.log.Info("healing stale active task", "taskId", active.TaskID, "state", task.State)
 		g.post(rec.Key, formatTaskStatus(task, active.Ask, active.SubmittedAt))

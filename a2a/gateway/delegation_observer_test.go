@@ -303,6 +303,73 @@ func TestAHealedChildsResultIsNotTheRootsDeliverable(t *testing.T) {
 	}
 }
 
+// TestTheHealLeavesAnUnrelayedDelegationToTheRelay: the delegating turn's
+// delegate artifact and its own terminal are on the stream, and the relay
+// has not reached them, when a turn on the conversation runs the heal (a
+// relay behind on this conversation, or a restart before the durable
+// redelivers). The heal announces and delivers nothing and keeps the turn
+// active; the relay then mints the child, and the chain ends once, on the
+// wake's result. The heal runs here as routeTurn runs it, under the session
+// lock that holds the relay's batch back.
+func TestTheHealLeavesAnUnrelayedDelegationToTheRelay(t *testing.T) {
+	r, spawn, obs := startObservedRig(t, func(c *Config) { armInjectMap(t, c) })
+	ctx := context.Background()
+	conv := injectKeyPrefix + "case-heal-unrelayed"
+	exec, origin, session := sessionTurnVia(t, r, spawn, conv, injectBackend, "how is the fleet?")
+	waitFor(t, "the turn working on the record", func() bool {
+		rec, _ := r.g.reg.Get(ctx, conv)
+		return rec != nil && rec.ActiveTask != nil && rec.ActiveTask.TaskID == origin.TaskID
+	})
+
+	l := r.g.lockSession(conv)
+	l.Lock()
+	if err := exec.PublishArtifact(ctx, delegateArtifact(t, targetPlatform, "report fleet health")); err != nil {
+		l.Unlock()
+		t.Fatal(err)
+	}
+	completeTask(t, exec, "delegated to platform")
+	waitFor(t, "the turn final on the stream", func() bool {
+		task, err := r.g.client.TasksGet(ctx, session, origin.TaskID)
+		return err == nil && task.Final
+	})
+	rec, err := r.g.reg.Get(ctx, conv)
+	if err != nil || rec == nil {
+		l.Unlock()
+		t.Fatalf("record: %v %v", rec, err)
+	}
+	r.g.healActiveTask(ctx, rec)
+	stillActive := rec.ActiveTask != nil && rec.ActiveTask.TaskID == origin.TaskID
+	l.Unlock()
+	if !stillActive {
+		t.Fatalf("the heal released the delegating turn: active=%+v", rec.ActiveTask)
+	}
+	for _, e := range obs.events() {
+		if e.kind == "terminal" || e.kind == "delivered" {
+			t.Fatalf("the heal told the observer %v for a delegation the relay had not reached", obs.kinds())
+		}
+	}
+
+	child := awaitSubmission(t, r, targetPlatform, 0)
+	completeTask(t, r.execFor(t, child, targetPlatform), "fleet is green")
+	waitFor(t, "wake spawn", func() bool { return len(spawn.calls()) == 2 })
+	wakeSession := spawn.calls()[1].Session
+	wake := r.awaitTask(t, wakeSession)
+	wexec := r.execFor(t, wake, wakeSession)
+	_ = wexec.PublishStatus(ctx, lib.StateWorking, false)
+	completeTask(t, wexec, "the fleet is healthy")
+	waitFor(t, "the root's terminal", func() bool { _, ok := obs.terminalFor(origin.TaskID); return ok })
+	assertOnlyRoot(t, obs, origin.TaskID)
+	var delivered []string
+	for _, e := range obs.events() {
+		if e.kind == "delivered" {
+			delivered = append(delivered, e.text)
+		}
+	}
+	if len(delivered) != 1 || delivered[0] != "the fleet is healthy" {
+		t.Fatalf("root deliverables = %q, want the wake's result once", delivered)
+	}
+}
+
 // TestACancelNamingTheRootStopsTheActiveChild: a door caller holds only the
 // root's id, so tasks/cancel names it while the child runs. The cancel goes
 // to the child, the task that is running, and is announced under the root.
