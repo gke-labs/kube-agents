@@ -127,6 +127,7 @@ type Client struct {
 	nc      *nats.Conn
 	js      jetstream.JetStream
 	subs    []*durableSub
+	cores   []*coreSub
 	closing atomic.Bool
 
 	// rebuildMu serializes terminal-close rebuilds so a flapping server can
@@ -308,9 +309,10 @@ func (c *Client) rebuild() {
 		}
 		c.nc, c.js = nc, js
 		subs := append([]*durableSub(nil), c.subs...)
+		cores := append([]*coreSub(nil), c.cores...)
 		c.mu.Unlock()
 
-		if c.resubscribe(subs, js, nc) {
+		if c.resubscribe(subs, js, nc) && c.resubscribeCore(cores, nc) {
 			c.rebuilds.Add(1)
 			c.log.Info("nats rebuild complete")
 			return
