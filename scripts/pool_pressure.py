@@ -144,13 +144,13 @@ SEGMENT_LABELS = (
 # number attached.
 SEGMENT_MIN_COVERAGE = 0.5
 
-# Above this share of a day's builds raising, the window is reported as
-# unmeasured rather than as a percentile over the builds that did not. Judged
-# per day, not per window: the alert reads the newest day, and a failure that
-# starts today is a small share of seven days for days. Fewer, and the bad
-# builds are named and left out (#2477). Under MIN_SAMPLES_FOR_DAILY_VERDICT
-# raising builds the floor never applies: a one-build weekend day, or the slack
-# slice before the window, must not fail the sweep for a week over one build.
+# Whether the reader works now is judged on the newest builds the sweep saw,
+# not on a day or on the window: a day is empty at 01:00 and holds single
+# digits at a weekend, and a failure that starts today is a small share of a
+# week for days. Above this share of the newest UNREADABLE_SAMPLE_BUILDS
+# raising, the run is reported as unmeasured. Every unreadable build, however
+# old, is named and left out of the numbers (#2477).
+UNREADABLE_SAMPLE_BUILDS = 10
 UNREADABLE_SHARE_LIMIT = 0.5
 
 # What a segment prints in place of a median, and the two column widths the
@@ -919,7 +919,7 @@ def collect_waits(
             )
 
         collected: List[Wait] = []
-        unreadable_by_day: Dict[str, List[Dict[str, str]]] = {}
+        unreadable: List[Dict[str, str]] = []
         read = 0
         done: List[str] = []
         truncated = False
@@ -932,7 +932,7 @@ def collect_waits(
                 for path, (wait, error) in zip(paths, pool.map(_read_wait, paths)):
                     read += 1
                     if error is not None:
-                        unreadable_by_day.setdefault(day, []).append(
+                        unreadable.append(
                             {"build_id": path.rsplit("/", 1)[-1], "error": error}
                         )
                     elif wait is not None:
@@ -952,24 +952,25 @@ def collect_waits(
         )
 
     waits = [w for w in collected if measured_start <= w.created <= window_end]
-    unreadable = [u for day in done for u in unreadable_by_day.get(day, [])]
     sweep = Sweep(
         waits, read, time.monotonic() - began, measured_start, truncated, unreadable
     )
-    for day in done:
-        # Newest first. Before the per-build catch this input crashed the job
-        # red; it must not come out as a quiet window over the builds that did
-        # read. The sweep travels with the error so its counts are reported.
-        bad = unreadable_by_day.get(day, [])
-        if (
-            len(bad) >= MIN_SAMPLES_FOR_DAILY_VERDICT
-            and len(bad) > len(candidates[day]) * UNREADABLE_SHARE_LIMIT
-        ):
-            return Source(
-                value=sweep,
-                error=f"{len(bad)} of {len(candidates[day])} builds on {day} could "
-                f"not be read; first, build {bad[0]['build_id']}: {bad[0]['error']}",
-            )
+    # Before the per-build catch this input crashed the job red; it must not
+    # come out as a quiet window. The sweep travels with the error so what did
+    # read is still reported, under the unmeasured verdict.
+    errors = {u["build_id"]: u["error"] for u in unreadable}
+    newest = sorted(
+        (path.rsplit("/", 1)[-1] for day in done for path in candidates[day]),
+        key=int,
+        reverse=True,
+    )[:UNREADABLE_SAMPLE_BUILDS]
+    bad = [build for build in newest if build in errors]
+    if len(bad) > len(newest) * UNREADABLE_SHARE_LIMIT:
+        return Source(
+            value=sweep,
+            error=f"{len(bad)} of the newest {len(newest)} builds could not be read; "
+            f"first, build {bad[0]}: {errors[bad[0]]}",
+        )
     return Source(value=sweep)
 
 
@@ -1330,10 +1331,10 @@ def summarise(
     the split matters: a notification that says only "exit 1" makes the reader
     go and run the check again, so the numbers have to travel with it.
     """
-    # A sweep the share floor rejected travels with its error: its counts and
-    # its unreadable list are reported, its waits are not a measurement.
+    # A sweep whose newest builds could not be read travels with its error:
+    # the builds that did read are still reported, under that verdict.
     sweep: Optional[Sweep] = trend.value
-    waits = sweep.waits if sweep and trend.ok else []
+    waits = sweep.waits if sweep else []
     rows = daily_rows(waits)
     breached_days = [r for r in rows if r.breached(p50_limit, p95_limit)]
     minutes = [w.minutes for w in waits]
@@ -1614,7 +1615,7 @@ def render(summary: dict) -> str:
     out.append("\n" + "-" * REPORT_WIDTH)
     if summary["verdict"] == VERDICT_UNMEASURED:
         out.append("COULD NOT MEASURE. The thresholds were not crossed because the wait")
-        out.append("was never read. This is not a green run.")
+        out.append("was not measured. This is not a green run.")
         out.append("-" * REPORT_WIDTH)
         return "\n".join(out)
 

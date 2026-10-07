@@ -762,7 +762,7 @@ class SweepUnreadable(unittest.TestCase):
         return [self._build(self.AS_OF - timedelta(days=days_back, hours=h))
                 for h in range(1, count + 1)]
 
-    def _sweep(self, bad=(BAD,), pending=(), builds=BUILDS, days=1):
+    def _sweep(self, bad=(BAD,), pending=(), builds=BUILDS, days=1, slow=()):
         entries = {build: f"gs://bucket/{build}" for build in builds}
 
         def wait_for(path):
@@ -772,13 +772,20 @@ class SweepUnreadable(unittest.TestCase):
             if build in pending:
                 return None
             moment = pp.snowflake_time(build)
-            return pp.Wait(build, "1", moment, moment, 15)
+            waited = timedelta(minutes=60 if build in slow else 0)
+            return pp.Wait(build, "1", moment, moment + waited, 15)
 
         with unittest.mock.patch.object(pp.shutil, "which", return_value="/usr/bin/gcloud"), \
                 unittest.mock.patch.object(pp, "_index_entries_from_gcs",
                                            return_value=(entries, None)), \
                 unittest.mock.patch.object(pp, "_wait_from_gcs", side_effect=wait_for):
             return pp.collect_waits(self.AS_OF - timedelta(days=days), self.AS_OF)
+
+    def _summary(self, source, days=1):
+        return pp.summarise(
+            self.AS_OF - timedelta(days=days), self.AS_OF, 15, 45, 45,
+            source, pp.Source(error="not read"), pp.Source(error="not read"),
+        )
 
     def test_the_other_builds_are_still_measured(self):
         sweep = self._sweep().value
@@ -800,58 +807,65 @@ class SweepUnreadable(unittest.TestCase):
     def test_every_build_unreadable_is_not_measured_rather_than_quiet(self):
         """Before the per-build catch this input crashed the job red; the
         catch must not turn it into a green window with no runs."""
-        builds = self._day(0, 6)
+        builds = self._day(0, 12)
         source = self._sweep(bad=builds, builds=builds)
         self.assertFalse(source.ok)
-        self.assertIn("6 of 6", source.error)
+        self.assertIn(f"10 of the newest {pp.UNREADABLE_SAMPLE_BUILDS}", source.error)
         self.assertIn("UnicodeDecodeError", source.error)
         # The counts and the list travel with the error, not only one example.
-        self.assertEqual(6, source.value.builds_read)
+        self.assertEqual(12, source.value.builds_read)
         self.assertEqual(sorted(str(b) for b in builds),
                          sorted(u["build_id"] for u in source.value.unreadable))
-        summary = pp.summarise(
-            self.AS_OF - timedelta(days=1), self.AS_OF, 15, 45, 45,
-            source, pp.Source(error="not read"), pp.Source(error="not read"),
-        )
+        summary = self._summary(source)
         self.assertEqual(pp.VERDICT_UNMEASURED, summary["verdict"])
         self.assertEqual(0, summary["trend"]["runs"])
-        self.assertEqual(6, summary["trend"]["builds_read"])
-        self.assertEqual(6, len(summary["trend"]["unreadable"]))
+        self.assertEqual(12, summary["trend"]["builds_read"])
+        self.assertEqual(12, len(summary["trend"]["unreadable"]))
         self.assertIn(str(builds[-1]), pp.render(summary))
 
-    def test_most_builds_unreadable_is_not_measured_even_with_one_run(self):
-        """One run out of six is a percentile over almost nothing, which the
-        daily floor would otherwise let through as a quiet green window."""
-        builds = self._day(0, 6)
-        source = self._sweep(bad=builds[:5], builds=builds)
+    def test_a_failure_that_starts_now_is_not_measured_and_still_shows_the_rest(self):
+        """Seven of twenty-four builds raising is a small share of the window,
+        but they are most of the newest ten, so the reader is broken now. The
+        builds that did read are still reported, under that verdict."""
+        older, newest = self._day(1, 12), self._day(0, 12)
+        source = self._sweep(bad=newest[:7], builds=older + newest, days=2)
         self.assertFalse(source.ok)
-        self.assertIn("5 of 6", source.error)
+        self.assertIn(f"7 of the newest {pp.UNREADABLE_SAMPLE_BUILDS}", source.error)
+        summary = self._summary(source, days=2)
+        self.assertEqual(pp.VERDICT_UNMEASURED, summary["verdict"])
+        self.assertEqual(17, summary["trend"]["runs"])
+        self.assertEqual(["2026-08-25", "2026-08-26"], [d["day"] for d in summary["trend"]["days"]])
+        self.assertEqual(7, len(summary["trend"]["unreadable"]))
+        out = pp.render(summary)
+        self.assertIn("COULD NOT MEASURE", out)
+        self.assertIn("2026-08-25", out)
 
-    def test_a_failure_that_starts_on_the_newest_day_is_not_measured(self):
-        """Six of eighteen builds raising is under the floor for the window,
-        but they are every build of the newest day, the one the alert reads."""
-        older, newest = self._day(1, 12), self._day(0, 6)
-        source = self._sweep(bad=newest, builds=older + newest, days=2)
-        self.assertFalse(source.ok)
-        self.assertIn("6 of 6 builds on 2026-08-26", source.error)
-        self.assertEqual(18, source.value.builds_read)
-        self.assertEqual(6, len(source.value.unreadable))
-
-    def test_a_failure_confined_to_an_older_day_still_names_that_day(self):
-        older, newest = self._day(1, 6), self._day(0, 12)
-        source = self._sweep(bad=older, builds=older + newest, days=2)
-        self.assertFalse(source.ok)
-        self.assertIn("6 of 6 builds on 2026-08-25", source.error)
-
-    def test_fewer_raising_builds_than_the_daily_minimum_never_fail_the_sweep(self):
-        """A weekend day runs single-digit builds, and the slack slice before
-        the window can hold one. One build that raises the same way every hour
-        must not fail the sweep for the week it stays in the window."""
-        older, newest = self._day(1, 4), self._day(0, 12)
-        source = self._sweep(bad=older, builds=older + newest, days=2)
+    def test_unreadable_builds_older_than_the_newest_ten_do_not_fail_the_sweep(self):
+        """Most of a past day raising is named and left out; it says nothing
+        about whether the reader works now, so it must not keep the run red
+        for the week that day stays in the window."""
+        older, newest = self._day(1, 12), self._day(0, 12)
+        source = self._sweep(bad=older[:8], builds=older + newest, days=2)
         self.assertTrue(source.ok)
-        self.assertEqual(12, len(source.value.waits))
-        self.assertEqual(4, len(source.value.unreadable))
+        self.assertEqual(16, len(source.value.waits))
+        self.assertEqual(8, len(source.value.unreadable))
+
+    def test_half_of_the_newest_builds_raising_is_still_measured(self):
+        """Five of the newest ten is not more than half: the share, not only
+        the count, decides."""
+        older, newest = self._day(1, 3), self._day(0, 12)
+        source = self._sweep(bad=newest[2:7], builds=older + newest, days=2)
+        self.assertTrue(source.ok)
+        self.assertEqual(10, len(source.value.waits))
+        self.assertEqual(5, len(source.value.unreadable))
+
+    def test_a_breach_among_the_readable_builds_outranks_could_not_measure(self):
+        older, newest = self._day(1, 12), self._day(0, 10)
+        source = self._sweep(bad=newest, builds=older + newest, days=2, slow=older)
+        self.assertFalse(source.ok)
+        summary = self._summary(source, days=2)
+        self.assertEqual(pp.VERDICT_BREACH, summary["verdict"])
+        self.assertEqual(["2026-08-25"], summary["trend"]["breached_days"])
 
     def test_one_bad_build_on_the_newest_day_among_many_is_measured(self):
         older, newest = self._day(1, 3), self._day(0, 7)
