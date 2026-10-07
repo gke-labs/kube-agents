@@ -109,6 +109,11 @@ const (
 	a2aCalloutImageName   = "a2a-authcallout"
 	a2aCalloutImageEnvVar = "A2A_CALLOUT_IMAGE"
 
+	// a2aCalloutReservedPrincipalsEnvVar names the callout's list of static
+	// principal names (renderA2AReservedPrincipals). The callout refuses to
+	// start without it, so it and the image that reads it ship together.
+	a2aCalloutReservedPrincipalsEnvVar = "A2A_RESERVED_PRINCIPALS"
+
 	// a2aBusTokenAudience is the audience every bus token is bound to.
 	//
 	// Load-bearing rather than cosmetic. A TokenReview that requests no
@@ -671,6 +676,10 @@ func buildA2ACalloutDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 							{Name: "A2A_AUTHMAP_NAME", Value: a2aAuthMapName(agent)},
 							{Name: "A2A_AUTHMAP_KEY", Value: a2aAuthMapKey},
 							{Name: "A2A_TOKEN_AUDIENCE", Value: a2aBusTokenAudience},
+							// The static nats.conf users, which no identity map
+							// carries: a narrowed pod named after one would
+							// hold its inbox. Plain names, no password.
+							{Name: a2aCalloutReservedPrincipalsEnvVar, Value: renderA2AReservedPrincipals(agent)},
 							// The seeds. This Deployment is the only
 							// thing that reads them, and the issuer is the
 							// key that decides what every connection on

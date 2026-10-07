@@ -170,13 +170,12 @@ _log = logging.getLogger("kube_agents_bench.harness")
 
 SERVICE_API_PORT = 8642
 
-# Prefix on ``AgentResult.errors[0]`` that marks a run whose transport died on
-# every attempt: the agent tunnel never established, the opening turn never
-# reached the agent, or the delegation wait lost the endpoint on every
-# status-turn retry with cards still outstanding. ``scoring.py`` matches this
-# string on a record's error and classifies the repetition as infrastructure
-# rather than grading it. The literal is duplicated there (importing the
-# harness would drag ``devops_bench`` into the scorer), and ``test_scoring.py``
+# Prefix on ``AgentResult.errors[0]`` that marks a run when the harness
+# recorded a condition under which no answer can be graded: transport exhausted,
+# or the server reporting a provider rate limit or billing stop on the opening turn.
+# ``scoring.py`` matches this string on a record's error and classifies the repetition
+# as infrastructure rather than grading it. The literal is duplicated there (importing
+# the harness would drag ``devops_bench`` into the scorer), and ``test_scoring.py``
 # asserts the two strings agree: change it in both files or in neither.
 INFRA_FAILURE_MARKER = "KUBE_AGENTS_INFRA_FAILURE"
 
@@ -617,6 +616,8 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 _OPENER = urllib.request.build_opener(_NoRedirect, urllib.request.ProxyHandler({}))
 
 _SESSION_ID_HEADER = "X-Hermes-Session-Id"
+_FAILURE_REASON_HEADER = "X-Hermes-Failure-Reason"
+_INFRA_FAILURE_REASONS = frozenset({"rate_limit", "billing"})
 
 # The session lookup only refines accounting, so it never inherits the agent's
 # (minutes-long) budget: a hung route would be billed as the agent's latency.
@@ -1193,18 +1194,27 @@ def _http_error_detail(exc: urllib.error.HTTPError) -> str:
 
 
 class _TransportError(RuntimeError):
-    """A turn that never reached the agent, or came back unreadable.
+    """A turn that failed at the transport level or returned a server failure reason.
 
-    Distinct from an agent that answered badly: the message is ready for
-    ``AgentResult.errors``.
+    Covers turns that never reached the agent, came back unreadable, or returned
+    an HTTP error. When ``failure_reason`` is populated from ``X-Hermes-Failure-Reason``,
+    the turn reached the agent handler and was classified (e.g. rate limit, billing,
+    or tool error) rather than failing invisibly in transit.
 
     ``retryable`` says whether issuing the same request again could plausibly
     succeed. It is False by default so a new raise site has to opt in.
     """
 
-    def __init__(self, message: str, *, retryable: bool = False) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        retryable: bool = False,
+        failure_reason: str | None = None,
+    ) -> None:
         super().__init__(message)
         self.retryable = retryable
+        self.failure_reason = failure_reason
 
 
 # Gateway statuses a proxy in front of the agent emits when the upstream is
@@ -1214,12 +1224,17 @@ class _TransportError(RuntimeError):
 # true of an opening turn and of a status poll alike, where the delegating
 # turn already ran but this poll was refused at the door -- and the condition
 # clears when a slot frees, the same run class as a saturated gateway. On
-# exhaustion both turn paths deliberately end in _infra_failure rather than
+# pure transport exhaustion both turn paths deliberately end in _infra_failure rather than
 # grading a partial record: see _DelegationTransportExhausted for why settling
 # the cards into a record that is about to be replaced wholesale is not a
-# rescue. Every other status is an answer about the request itself and
-# repeating the request cannot change it, 500 included: a handler that raised
-# will raise again.
+# rescue. A client error (non-429 4xx), a 500, or a body that is not JSON is an
+# answer about the request itself and repeating the request cannot change it:
+# a handler that raised will raise again, so those remain graded agent errors.
+# When the server attaches X-Hermes-Failure-Reason on an opening request,
+# the turn executed; a rate-limit or billing reason is routed to infrastructure
+# on the opening turn, while any other failure reason (or any failure reason
+# on subsequent answer turns) returns an errored result directly ahead of any
+# transport retry so the executed turn is graded as an agent error.
 _RETRYABLE_STATUSES = frozenset({429, 502, 503, 504})
 
 
@@ -1259,30 +1274,46 @@ def _post_turn(
             payload = json.loads(response.read().decode("utf-8"))
             session_id = response.headers.get(_SESSION_ID_HEADER, "")
     except urllib.error.HTTPError as exc:
+        failure_reason = (
+            exc.headers.get(_FAILURE_REASON_HEADER) if exc.headers else None
+        )
+        if failure_reason is not None:
+            failure_reason = failure_reason.strip()
+        retryable = exc.code in _RETRYABLE_STATUSES and failure_reason is None
         raise _TransportError(
             f"HTTP {exc.code} from agent endpoint: {_http_error_detail(exc)}",
-            retryable=exc.code in _RETRYABLE_STATUSES,
+            retryable=retryable,
+            failure_reason=failure_reason,
         ) from exc
-    except (OSError, http.client.HTTPException, ValueError) as exc:
-        # Timeouts, resets, a mid-read protocol failure, and a body that is
-        # neither UTF-8 nor JSON: transport, not agent, bugs.
+    except (OSError, http.client.HTTPException) as exc:
+        # Timeouts, resets, and mid-read protocol failures: transport bugs.
         raise _TransportError(
             f"{type(exc).__name__}: {exc}", retryable=_connection_dropped(exc)
         ) from exc
+    except ValueError as exc:
+        # A body that is neither UTF-8 nor JSON: a handler answered, so this
+        # is an answered agent turn, not an unreached transport drop.
+        raise _TransportError(
+            f"{type(exc).__name__}: {exc}",
+            retryable=False,
+        ) from exc
 
     if not isinstance(payload, dict):
-        raise _TransportError(f"agent endpoint returned non-object JSON: {type(payload).__name__}")
+        raise _TransportError(
+            f"agent endpoint returned non-object JSON: {type(payload).__name__}"
+        )
     return parse_response(payload), session_id
 
 
 def _infra_failure(detail: str) -> AgentResult:
-    """A run whose transport died under it, recorded as infrastructure.
+    """A run where no answer can be graded, recorded as infrastructure.
 
-    ``output`` is deliberately left empty. ``AgentResult.errored`` copies its
-    message into ``output``, which the eval harness writes to results.json as
-    the "Actual Output" the LLM judge grades -- and on build
-    2092339233527173120 that is how a proxy's HTTP 502 error page came to be
-    graded as the agent's answer to ``gpu-stress-test-diagnosis``
+    Covers runs where transport was exhausted or the opening turn reported an
+    infrastructure failure (rate limit or billing). ``output`` is deliberately
+    left empty. ``AgentResult.errored`` copies its message into ``output``, which
+    the eval harness writes to results.json as the "Actual Output" the LLM judge
+    grades -- and on build 2092339233527173120 that is how a proxy's HTTP 502 error
+    page came to be graded as the agent's answer to ``gpu-stress-test-diagnosis``
     ("The Actual Output consists entirely of an HTTP 502 Bad Gateway",
     OutcomeValidity 0.0). A transport failure has to set a run class, not an
     output: the marker on ``errors[0]`` is what ``scoring.py`` reads.
@@ -1440,7 +1471,13 @@ class KubeAgentsHarness(AgentHarness):
         )
         return result
 
-    def _execute(self, prompt: str, workspace_path: Path | None = None) -> AgentResult:
+    def _execute(
+        self,
+        prompt: str,
+        workspace_path: Path | None = None,
+        *,
+        opening_turn: bool = True,
+    ) -> AgentResult:
         try:
             replay = card_wake.parse(prompt)
         except ValueError as exc:
@@ -1535,11 +1572,29 @@ class KubeAgentsHarness(AgentHarness):
                 result, session_id = _post_turn(url, body, headers, timeout)
                 break
             except _TransportError as exc:
-                # A 500, a 4xx other than 429, or a body that is not JSON
-                # says a handler answered; that is the agent's own failure and
-                # still belongs in front of the judge. Only a gateway status,
-                # an admission-control 429, or a dropped connection is worth a
-                # second attempt: see _RETRYABLE_STATUSES.
+                # If the server response carried X-Hermes-Failure-Reason, an
+                # agent turn executed and produced a classified outcome.
+                # When the reason indicates an infrastructure condition
+                # (token budget exhausted on billing or provider rate limit)
+                # and this is the opening turn, it is classified as
+                # infrastructure. On subsequent answer turns (e.g. card-wake)
+                # or for agent errors (such as tool error), it returns an
+                # errored result directly ahead of any gateway transport retry
+                # so the executed and billed turn remains graded and preserved.
+                if exc.failure_reason is not None:
+                    if exc.failure_reason in _INFRA_FAILURE_REASONS and opening_turn:
+                        return _infra_failure(
+                            f"opening turn hit infrastructure failure ({exc.failure_reason}): {exc}"
+                        )
+                    detail = exc.failure_reason or "unknown"
+                    return AgentResult.errored(
+                        f"agent turn failed with {detail}: {exc}"
+                    )
+                # A 500, a 4xx other than 429, or a body that is not JSON says a handler
+                # answered; that is the agent's own failure and still belongs in
+                # front of the judge. Only a gateway status, an admission-control
+                # 429, or a dropped connection is worth a second attempt: see
+                # _RETRYABLE_STATUSES.
                 if not exc.retryable:
                     return AgentResult.errored(str(exc))
                 transport_failures += 1
@@ -1582,6 +1637,7 @@ class KubeAgentsHarness(AgentHarness):
                         timeout=timeout,
                         delegation_timeout=delegation_timeout,
                         poll_interval=poll_interval,
+                        opening_turn=opening_turn,
                     )
                     or session_id
                 )
@@ -1657,11 +1713,11 @@ class KubeAgentsHarness(AgentHarness):
         pinned = _PINNED_RUN_ID.set(_run_id())
         answer_turn = None
         try:
-            wake_turn = self._execute(planted.wake, workspace_path)
+            wake_turn = self._execute(planted.wake, workspace_path, opening_turn=True)
             if not card_wake.no_reply(wake_turn) and not failure and replay.fresh:
                 answer_turn = self._execute_fresh_answer(replay, planted, wake_turn, workspace_path)
             elif not card_wake.no_reply(wake_turn) and not failure:
-                answer_turn = self._execute(planted.answer(replay), workspace_path)
+                answer_turn = self._execute(planted.answer(replay), workspace_path, opening_turn=False)
         finally:
             _PINNED_RUN_ID.reset(pinned)
             settled = card_wake.archive(_agent_shell, planted.key, _EXEC_TIMEOUT)
@@ -1701,7 +1757,7 @@ class KubeAgentsHarness(AgentHarness):
             return AgentResult.errored(str(exc))
         fresh = _PINNED_RUN_ID.set(_mint_run_id())
         try:
-            return self._execute(prompt, workspace_path)
+            return self._execute(prompt, workspace_path, opening_turn=False)
         finally:
             _PINNED_RUN_ID.reset(fresh)
 
@@ -2184,7 +2240,8 @@ class KubeAgentsHarness(AgentHarness):
                     turn_exchange = _exchange(follow, turn_timeout, opening=False)
                 except inject.InjectUnavailable as exc:
                     raise _TransportError(
-                        f"{exc}{_abandon(follow)}", retryable=exc.retryable
+                        f"{exc}{_abandon(follow)}",
+                        retryable=exc.retryable,
                     ) from exc
                 if turn_exchange.outcome == inject.OUTCOME_NOT_ACCEPTED:
                     # Retryable, and therefore infrastructure once the wait's
@@ -2229,6 +2286,7 @@ class KubeAgentsHarness(AgentHarness):
         timeout: float,
         delegation_timeout: float,
         poll_interval: float,
+        opening_turn: bool = True,
     ) -> str:
         """Poll the agent until every card it filed settles.
 
@@ -2294,6 +2352,7 @@ class KubeAgentsHarness(AgentHarness):
         session_id = ""
         silent = 0
         transport_failures = 0
+        had_answered_failure = False
         timed_out = True
         # The freshest status seen for each card, from whichever source read
         # it last -- the board or a status turn -- for the deadline report.
@@ -2346,6 +2405,13 @@ class KubeAgentsHarness(AgentHarness):
             try:
                 status_turn, turn_session = turn(poll, min(timeout, remaining))
             except _TransportError as exc:
+                if exc.failure_reason in _INFRA_FAILURE_REASONS and opening_turn:
+                    _purge_card_state(awaited, _EXEC_TIMEOUT)
+                    raise _DelegationTransportExhausted(
+                        f"status turn hit infrastructure failure ({exc.failure_reason}): {exc}"
+                    ) from exc
+                if not exc.retryable:
+                    had_answered_failure = True
                 transport_failures += 1
                 _log.warning(
                     "status turn failed (%d/%d): %s",
@@ -2376,7 +2442,7 @@ class KubeAgentsHarness(AgentHarness):
                                 "port-forward respawn failed before retry: %s", pf_exc
                             )
                     continue
-                if exc.retryable:
+                if not had_answered_failure:
                     # Classified, not graded: appending here used to leave the
                     # run validating with the delegation receipt graded as the
                     # answer -- the exact failure this wait exists to prevent.
@@ -2390,19 +2456,20 @@ class KubeAgentsHarness(AgentHarness):
                         "running; still waiting on: " + ", ".join(outstanding) + "; "
                         f"tunnel log: {_tail(_pf_log_path(local_port))}"
                     ) from exc
-                # A handler answered every time (a non-429 4xx, a 500,
-                # non-JSON): that is the agent's own failure, so it stays in
-                # front of the judge as before -- recorded, not just logged,
-                # which is what stops devops-bench promoting the partial
-                # record.
+                # At least one turn reached a handler (a non-429 4xx, a 500,
+                # non-JSON, or a 5xx with a non-infrastructure failure reason):
+                # that is the agent's own failure, so it stays in front of the
+                # judge as before -- recorded, not just logged, which is what
+                # stops devops-bench promoting the partial record.
                 result.errors.append(
-                    f"status turns failed in transport {transport_failures} times running; "
+                    f"status turns failed in transport {transport_failures} times running (answered); "
                     "still waiting on: " + ", ".join(outstanding) + "; "
                     f"tunnel log: {_tail(_pf_log_path(local_port))}"
                 )
                 timed_out = False
                 break
             transport_failures = 0
+            had_answered_failure = False
             # Freshness comes off the turn's *new* calls, not the whole
             # replayed episode. Every earlier board reading comes back on every
             # poll, so the cumulative view would let an agent that has stopped

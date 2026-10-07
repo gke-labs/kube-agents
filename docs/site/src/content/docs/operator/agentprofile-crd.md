@@ -21,7 +21,8 @@ An `AgentProfile` is not a Hermes profile. The platform agent's own profiles (th
 apiVersion: kubeagents.x-k8s.io/v1alpha1
 kind: AgentProfile
 metadata:
-  # A dot-free DNS-1123 label: it is the addressee on the bus. `platform` is reserved.
+  # A dot-free DNS-1123 label of at most 55 characters: it is the addressee on the bus.
+  # `platform` is reserved.
   name: auditor
   namespace: kubeagents-system
 spec:

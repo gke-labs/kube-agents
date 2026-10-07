@@ -344,10 +344,12 @@ spec:
           x-kubernetes-validations:
             - message:
                 "AgentProfile name must be a dot-free DNS-1123 label of at most
-                63 characters: it is the addressee token on the task and directory subjects"
+                55 characters: it is the addressee token on the task and directory subjects,
+                and profile-<name> is its bus identity, which must fit one 63-character
+                label"
               rule:
                 self.metadata.name.matches('^[a-z0-9]([-a-z0-9]*[a-z0-9])?$') && self.metadata.name.size()
-                <= 63
+                <= 55
             - message:
                 "AgentProfile name 'platform' is reserved: the Hermes bridge
                 is the executor for that addressee"

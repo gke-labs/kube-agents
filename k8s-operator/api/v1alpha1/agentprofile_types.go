@@ -244,7 +244,7 @@ type AgentProfileStatus struct {
 // +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
 // The name is the addressee token in a2a.tasks.{profile}.… and a2a.agents.{profile},
 // so it is a single subject token: a dot-free DNS-1123 label.
-// +kubebuilder:validation:XValidation:rule="self.metadata.name.matches('^[a-z0-9]([-a-z0-9]*[a-z0-9])?$') && self.metadata.name.size() <= 63",message="AgentProfile name must be a dot-free DNS-1123 label of at most 63 characters: it is the addressee token on the task and directory subjects"
+// +kubebuilder:validation:XValidation:rule="self.metadata.name.matches('^[a-z0-9]([-a-z0-9]*[a-z0-9])?$') && self.metadata.name.size() <= 55",message="AgentProfile name must be a dot-free DNS-1123 label of at most 55 characters: it is the addressee token on the task and directory subjects, and profile-<name> is its bus identity, which must fit one 63-character label"
 // `platform` is the Hermes bridge's addressee: a profile under that name would put a
 // second executor on a2a.tasks.platform.*. The platform persona as a profile is not a goal.
 // +kubebuilder:validation:XValidation:rule="self.metadata.name != 'platform'",message="AgentProfile name 'platform' is reserved: the Hermes bridge is the executor for that addressee"

@@ -294,6 +294,11 @@ func validateA2AAuthMapIdentities(identities []a2aAuthMapIdentity) error {
 		if id.User == "" {
 			return fmt.Errorf("identity %d: serviceAccount %q has no user", i, id.ServiceAccount)
 		}
+		// The callout's rule: the user becomes the _INBOX.<user>.> prefix,
+		// so it is one lowercase DNS-1123 label.
+		if !isDNS1123LabelToken(id.User) {
+			return fmt.Errorf("identity %d: user %q must be a single lowercase DNS-1123 label, because it becomes the _INBOX.<user>.> prefix", i, id.User)
+		}
 		if id.Account != a2aAccountApp {
 			return fmt.Errorf("identity %d: user %q names account %q, which the callout will not mint into (only %q is mintable)", i, id.User, id.Account, a2aAccountApp)
 		}

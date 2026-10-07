@@ -21,6 +21,8 @@ import (
 	"slices"
 	"sort"
 	"strings"
+
+	"github.com/gke-labs/kube-agents/a2a/lib"
 )
 
 // mintableAccounts is every NATS account the callout will issue a user into.
@@ -108,6 +110,13 @@ type Identity struct {
 type IdentityMap struct {
 	Version    string     `json:"version"`
 	Identities []Identity `json:"identities"`
+
+	// users is the set of names Users returns, built by ParseIdentityMap.
+	// It lives on the map rather than beside it so the Store's one pointer
+	// swap installs the map and its reserved names together: a connection
+	// that resolved its identity against this map is checked against this
+	// map's users, never an older map's (see Service.reservedAs).
+	users map[string]struct{}
 }
 
 // ParseIdentityMap decodes a rendered map and rejects one it cannot serve
@@ -124,6 +133,10 @@ func ParseIdentityMap(raw []byte) (*IdentityMap, error) {
 	}
 	if err := m.validate(); err != nil {
 		return nil, err
+	}
+	m.users = make(map[string]struct{}, len(m.Identities))
+	for _, u := range m.Users() {
+		m.users[u] = struct{}{}
 	}
 	return &m, nil
 }
@@ -171,6 +184,13 @@ func (id Identity) validate() error {
 	}
 	if id.User == "" {
 		return fmt.Errorf("serviceAccount %q has no user", id.ServiceAccount)
+	}
+	// The user becomes the `_INBOX.<user>.>` prefix, and reservedAs compares
+	// pod names against it byte for byte. A dotted user `a.b` would sit inside
+	// the inbox of a pod named `a` without matching it, so the user must be
+	// the same single lowercase label a pod name is.
+	if !lib.ValidSubjectToken(id.User) {
+		return fmt.Errorf("user %q must be a single lowercase DNS-1123 label, because it becomes the _INBOX.<user>.> prefix", id.User)
 	}
 	if id.Account == "" {
 		return fmt.Errorf("user %q has no account", id.User)
@@ -276,4 +296,22 @@ func (m *IdentityMap) Users() []string {
 	}
 	sort.Strings(users)
 	return users
+}
+
+// servesUser reports whether name is a user of one of this map's entries.
+// ParseIdentityMap builds the set, and Store.Update installs nothing else, but
+// a map built any other way (a test writing the store directly) has no set; it
+// falls back to scanning the entries rather than reporting no users, so the
+// refusal fails closed.
+func (m *IdentityMap) servesUser(name string) bool {
+	if m.users == nil {
+		for _, id := range m.Identities {
+			if id.User == name {
+				return true
+			}
+		}
+		return false
+	}
+	_, ok := m.users[name]
+	return ok
 }

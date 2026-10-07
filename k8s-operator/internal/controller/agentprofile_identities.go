@@ -63,6 +63,11 @@ const (
 	// it must be unique in the map.
 	agentProfileMapUserPrefix = "profile-"
 
+	// agentProfileNameMax keeps agentProfileMapUserPrefix plus the name
+	// within one 63-character DNS-1123 label. The CRD's name rule says the
+	// same number.
+	agentProfileNameMax = 63 - len(agentProfileMapUserPrefix)
+
 	// operatorNamespaceEnvVar and operatorServiceAccountEnvVar are the
 	// manager's own namespace and ServiceAccount, by the downward API. Both
 	// are needed to key the operator's map entry; with either unset the
@@ -182,6 +187,12 @@ func resolveAgentProfileIdentities(agent *agentv1alpha1.PlatformAgent, profiles 
 		p := &sorted[i]
 		sa := agentProfileServiceAccountName(p)
 		switch {
+		case !isDNS1123LabelToken(agentProfileMapUserPrefix + p.Name):
+			// The map entry's user is the prefix plus the name, and the
+			// callout refuses a user that is not one DNS-1123 label, so a
+			// name past 55 characters would fail the whole map. The CRD
+			// refuses it too.
+			out[p.Name] = agentProfileResolution{refused: fmt.Errorf("profile name %q is longer than %d characters, so its bus identity %q would not be a DNS-1123 label", p.Name, agentProfileNameMax, agentProfileMapUserPrefix+p.Name), reason: reasonAgentProfileInvalid}
 		case !isDNS1123LabelToken(p.Name):
 			// The CRD refuses these too. Refused here as well so that a
 			// profile admitted by an older or edited CRD drops out of the

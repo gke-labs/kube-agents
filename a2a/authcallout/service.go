@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"log/slog"
 	"math/rand/v2"
-	"slices"
 	"time"
 
 	"github.com/nats-io/jwt/v2"
@@ -89,6 +88,13 @@ type Config struct {
 	// expires means a map change never reaches anything already connected.
 	GrantTTL time.Duration
 
+	// ReservedPrincipals are the static nats.conf users a narrowed pod may
+	// not be named after (see reserved.go). Required: NewService refuses an
+	// empty list rather than serving a callout that reserves nothing. The
+	// identity map's own users are reserved too, but come from the map being
+	// served rather than from here.
+	ReservedPrincipals []string
+
 	// Now is injectable for tests.
 	Now func() time.Time
 }
@@ -100,6 +106,7 @@ type Service struct {
 	issuer    nkeys.KeyPair
 	xkey      nkeys.KeyPair
 	grantTTL  time.Duration
+	reserved  map[string]reservedKind
 	now       func() time.Time
 	log       *slog.Logger
 }
@@ -135,11 +142,17 @@ func NewService(store *Store, validator *TokenValidator, cfg Config, log *slog.L
 		return nil, fmt.Errorf("issuer seed: %w", err)
 	}
 
+	reserved, err := reservedSet(cfg.ReservedPrincipals)
+	if err != nil {
+		return nil, err
+	}
+
 	svc := &Service{
 		store:     store,
 		validator: validator,
 		issuer:    issuer,
 		grantTTL:  cfg.GrantTTL,
+		reserved:  reserved,
 		now:       cfg.Now,
 		log:       log,
 	}
@@ -354,27 +367,15 @@ func (s *Service) authorize(ctx context.Context, req *jwt.AuthorizationRequestCl
 			return "", nil, "", fmt.Errorf("%s names narrowing %q, which this callout does not implement", att.ServiceAccount, id.Narrowing)
 		}
 		// A narrowed user is named for its pod, and that name is also its
-		// inbox prefix. A pod named after a user this map serves (the
-		// operator, the verifier) would be granted that principal's
-		// inbox, and could read or forge its JetStream replies. Pod names
-		// the gateway and the dispatcher mint never collide; a pod someone
-		// named by hand might.
-		//
-		// This covers the callout's own principals only. The static users
-		// in nats.conf (gateway, web, console, bridge, seed) are not in
-		// the map, so a pod named `gateway` is not refused here. That gap
-		// predates profile narrowing (a session pod has it too) and closing
-		// it needs the static names carried to the callout.
-		if slices.Contains(m.Users(), user) {
-			return "", nil, "", fmt.Errorf("%s narrows on pod %q, which is the name of a mapped principal; its inbox is that principal's", att.ServiceAccount, user)
-		}
-		// A pod named after an AgentProfile would be that profile's
-		// addressee: a session pod's subjects are its pod name, so a
-		// session-ServiceAccount pod named `auditor` would be minted the
-		// auditor profile's events and input. Profile names come from the
-		// map's profile entries, so this follows a map reload.
-		if slices.Contains(m.Profiles(), user) {
-			return "", nil, "", fmt.Errorf("%s narrows on pod %q, which is an AgentProfile's addressee; its task subjects are that profile's", att.ServiceAccount, user)
+		// inbox prefix. A pod named after a static principal (the gateway,
+		// the bridge, web, console, seed) or after a user this map mints
+		// (the verifier, the agent, the provisioner) would be granted that
+		// principal's inbox, and could read or forge the JetStream replies
+		// delivered there. Checked after the switch so every narrowing is
+		// covered by one check, whatever derived the user, and against m,
+		// the snapshot the identity was resolved from.
+		if kind, ok := s.reservedAs(m, user); ok {
+			return "", nil, "", fmt.Errorf("%s narrows on pod %q, which is the name of %s; its inbox is that principal's", att.ServiceAccount, user, kind)
 		}
 	}
 

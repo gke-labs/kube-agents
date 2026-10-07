@@ -1185,3 +1185,28 @@ func TestAnEmptyNamespaceEnqueuesTheConnectionDrop(t *testing.T) {
 		t.Errorf("requests = %v, want the profile", got)
 	}
 }
+
+// A profile name past 55 characters would make its map user (profile-<name>)
+// longer than one DNS-1123 label, which the callout refuses for the whole map.
+// It is refused alone; the map still renders.
+func TestAProfileNameTooLongForItsBusIdentityDropsOut(t *testing.T) {
+	withoutOperatorBusPrincipal(t)
+	agent := a2aTestAgent()
+	long := testAgentProfile(agent.Namespace, strings.Repeat("a", agentProfileNameMax+1))
+	entries := renderedMapEntries(t, agent, []agentv1alpha1.AgentProfile{long, testAgentProfile(agent.Namespace, "fine")})
+	if _, ok := entries["profile-fine"]; !ok {
+		t.Error("the good profile is missing")
+	}
+	if len(entries) == 0 {
+		t.Fatal("the map did not render")
+	}
+	for user := range entries {
+		if len(user) > 63 {
+			t.Errorf("the map carries user %q, longer than a DNS-1123 label", user)
+		}
+	}
+	at := testAgentProfile(agent.Namespace, strings.Repeat("a", agentProfileNameMax))
+	if _, ok := renderedMapEntries(t, agent, []agentv1alpha1.AgentProfile{at})["profile-"+at.Name]; !ok {
+		t.Errorf("a %d-character profile name, the most that fits, was refused", agentProfileNameMax)
+	}
+}

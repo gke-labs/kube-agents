@@ -64,11 +64,6 @@ GH_TIMEOUT_RC = 124
 #: resolves there and is the one refresh_git_credentials forwards to.
 SANDBOX_REFRESH_SCRIPT = "/opt/data/scripts/github_token_refresh.py"
 
-#: Bounds the ssh hop around that forward. The broker's own retry budget bounds
-#: the work inside it; this is the 60s the in-pod HTTP branch allows plus room
-#: for the connection.
-SANDBOX_REFRESH_TIMEOUT_SECONDS = 90
-
 #: The two Minty scopes the rule ConfigMap declares (charts/kube-agents/templates/
 #: github-minter.yaml). The write scope is what every managed repository rides;
 #: the read scope grants `contents: read` alone and is minted per clone of a
@@ -146,6 +141,77 @@ identity_note = {"minted": "", "fell_through": ""}
 MINTY_MAX_ATTEMPTS = 3
 MINTY_INITIAL_DELAY_SECONDS = 0.5
 MINTY_BACKOFF_FACTOR = 2.0
+
+#: The worst case of the helper the broker runs for a refresh, once it starts,
+#: built from the bounds above so it moves when they do. The identity token is
+#: the slower of its two branches: federation's STS exchange and IAM call, or the
+#: metadata server's attempts followed by both gcloud forms gcloud_identity_token
+#: tries. Then the Minty attempts with their backoff, then the CLI steps
+#: (`gh auth login`, `git config --get-all`, `gh auth setup-git`), each under
+#: CLI_SETUP_TIMEOUT_SECONDS.
+WIF_IDENTITY_CALLS = 2
+GCLOUD_IDENTITY_FORMS = 2
+CLI_SETUP_STEPS = 3
+IDENTITY_TOKEN_BUDGET_SECONDS = max(
+    WIF_IDENTITY_CALLS * wif_credentials.TOKEN_REQUEST_TIMEOUT_SECONDS,
+    METADATA_MAX_ATTEMPTS * METADATA_TIMEOUT_SECONDS
+    + (METADATA_MAX_ATTEMPTS - 1) * METADATA_RETRY_DELAY_SECONDS
+    + GCLOUD_IDENTITY_FORMS * GCLOUD_TIMEOUT_SECONDS,
+)
+MINTY_RETRY_BUDGET_SECONDS = MINTY_MAX_ATTEMPTS * MINTY_REQUEST_TIMEOUT_SECONDS + sum(
+    MINTY_INITIAL_DELAY_SECONDS * MINTY_BACKOFF_FACTOR**retry
+    for retry in range(MINTY_MAX_ATTEMPTS - 1)
+)
+REFRESH_HELPER_BUDGET_SECONDS = (
+    IDENTITY_TOKEN_BUDGET_SECONDS
+    + MINTY_RETRY_BUDGET_SECONDS
+    + CLI_SETUP_STEPS * CLI_SETUP_TIMEOUT_SECONDS
+)
+
+#: How long the broker may hold a refresh at each of its two waits before the
+#: helper starts -- for the refresh lock, then for the child memory budget --
+#: each bounded by `COMMAND_SLOT_WAIT_SECONDS` in credential_proxy.py, which this
+#: mirrors. Declared here rather than imported because this script also runs in
+#: the sandbox image, which does not carry the broker.
+BROKER_ADMISSION_WAIT_SECONDS = 60
+
+#: The broker's wait after a refresh steps aside for a vcs verb's refresh: a
+#: route refresh holding the lock while it waits for the budget yields the lock,
+#: once, to a vcs request that needs a refresh, then waits for that request,
+#: re-takes the lock and, if its re-check is still stale, waits for the budget
+#: a second time without yielding -- all under one bound of
+#: `COMMAND_SLOT_WAIT_SECONDS` from the yield, which this mirrors.
+BROKER_YIELDED_WAIT_SECONDS = 60
+
+#: Room for the connection and the response on top of the waits.
+SIDECAR_REFRESH_MARGIN_SECONDS = 10
+
+#: The client's socket timeout on the refresh POST: every wait the broker may
+#: put a refresh through, then the helper, then the margin. Before its own
+#: helper starts, a refresh waits for the refresh lock behind another refresh,
+#: under a bound of COMMAND_SLOT_WAIT_SECONDS from arrival; then, holding the
+#: lock, for the child memory budget, under a bound of its own; and, if it steps
+#: aside for a vcs verb's refresh during that wait, which it does at most once,
+#: under a third bound counted from the yield, which covers the wait for the
+#: verb, re-taking the lock and any second budget wait. A refresh admitted late
+#: still runs the whole helper and answers 200 once the token has landed, so a
+#: client that gives up sooner reports a refresh that succeeded as failed. A
+#: refresher behind a helper that runs past the lock bound is told busy even
+#: though that helper lands the token seconds later; this client reports that
+#: as a failed refresh, and the next call coalesces on the fresh token.
+SIDECAR_REFRESH_TIMEOUT_SECONDS = (
+    BROKER_ADMISSION_WAIT_SECONDS
+    + BROKER_ADMISSION_WAIT_SECONDS
+    + BROKER_YIELDED_WAIT_SECONDS
+    + REFRESH_HELPER_BUDGET_SECONDS
+    + SIDECAR_REFRESH_MARGIN_SECONDS
+)
+
+#: Bounds the ssh hop around the gateway's forward to the sandbox, which runs
+#: this script there and so waits out the whole sidecar refresh; the margin is
+#: for the ssh connection.
+SANDBOX_HOP_MARGIN_SECONDS = 30
+SANDBOX_REFRESH_TIMEOUT_SECONDS = SIDECAR_REFRESH_TIMEOUT_SECONDS + SANDBOX_HOP_MARGIN_SECONDS
 
 # What `gh` prints when the credential is the problem, as opposed to the
 # repository, the network, or the rate limit. Matched case-insensitively
@@ -635,6 +701,23 @@ class RefreshToken(str):
         return obj
 
 
+def _http_error_detail(exc: urllib.error.HTTPError) -> str:
+    """`: <error>` from the broker's JSON refusal body, or nothing.
+
+    The broker's busy 503 says what held the request (the slot cap, the child
+    memory budget, another refresh); without it the cron log reads only the
+    code. A body that is empty, not JSON, names no error, or is cut short by
+    the connection dropping mid-read adds nothing.
+    """
+    try:
+        raw = exc.read()
+        body = json.loads(raw) if raw else None
+    except (OSError, ValueError, http.client.HTTPException):
+        return ""
+    error = body.get("error") if isinstance(body, dict) else None
+    return f": {error}" if isinstance(error, str) and error else ""
+
+
 def refresh_git_credentials(
     target_repo: str | None = None,
     *,
@@ -658,9 +741,12 @@ def refresh_git_credentials(
     proxy_url = os.getenv("CREDENTIAL_PROXY_URL", "").strip()
     if proxy_url:
         # In the agent sandbox: delegate to the credential sidecar.
-        # The sidecar manages bounded retries against Minty internally.
-        # The client uses a 60s timeout to allow the sidecar's retry budget
-        # to finish, and fails fast on any error without re-triggering retries.
+        # The sidecar manages bounded retries against Minty internally. The
+        # client waits SIDECAR_REFRESH_TIMEOUT_SECONDS, which covers the
+        # broker's wait for the refresh lock, its admission wait, its wait
+        # for a vcs verb's refresh it stepped aside for, and the helper's
+        # budget after them, and fails fast on any error without
+        # re-triggering retries.
         # The forge-neutral route, naming the provider and the repository by
         # its URL rather than as a bare slug: a broker serving more than one
         # forge refuses a name without a host. `/v1/github/refresh` is kept on
@@ -680,7 +766,7 @@ def refresh_git_credentials(
             method="POST",
         )
         try:
-            with urllib.request.urlopen(request, timeout=60) as response:
+            with urllib.request.urlopen(request, timeout=SIDECAR_REFRESH_TIMEOUT_SECONDS) as response:
                 if response.status == 200:
                     log(
                         f"GitHub credentials refreshed in credential sidecar for {repository}."
@@ -692,6 +778,7 @@ def refresh_git_credentials(
         except urllib.error.HTTPError as exc:
             raise RuntimeError(
                 f"Credential sidecar failed to refresh GitHub auth: HTTP {exc.code}"
+                f"{_http_error_detail(exc)}"
             ) from exc
         except Exception as exc:
             raise RuntimeError(

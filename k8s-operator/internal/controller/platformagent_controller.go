@@ -256,6 +256,12 @@ const (
 
 	conditionReasonInvalidGitRepoURL   = "InvalidGitRepoURL"
 	conditionReasonCorruptManagedRepos = "CorruptManagedRepos"
+	// conditionReasonInvalidCredentialProxyResources: the CR's
+	// spec.deployment.credentialProxy.resources fails
+	// ValidateCredentialProxyResources, so the override is ignored and the
+	// proxy Deployment is rendered at the operator's default resources.
+	conditionReasonInvalidCredentialProxyResources = "InvalidCredentialProxyResources"
+	invalidCredentialProxyResourcesMsgFmt          = "Invalid spec.deployment.credentialProxy.resources (%s); the override is ignored and the credential-proxy Deployment runs at the operator's default resources until it is corrected" // #nosec G101 -- Condition message, not a credential
 	// conditionReasonMinterPruningHeld: a GitHub repository entry the minter
 	// sync cannot read holds every tracked policy, so a repository removed
 	// from the lists keeps its write policy until the entry is fixed.
@@ -306,6 +312,12 @@ type PlatformAgentReconciler struct {
 	// next event. Keyed by ObjectKey, value time.Time; cleared by any write
 	// whose echo carries the field, and when the CR is deleted.
 	prunedUsageStatus sync.Map
+
+	// credentialProxyWarningsLogged records, per CR, the spec generation whose
+	// credential-proxy resources warnings reconcileCredentialProxy last logged,
+	// so each generation logs them once. Keyed by ObjectKey, value int64;
+	// cleared when the CR is deleted.
+	credentialProxyWarningsLogged sync.Map
 
 	// APIReader reads straight from the API server, bypassing the manager's cache.
 	// Collector discovery looks at Services in namespaces this operator otherwise never
@@ -1069,6 +1081,7 @@ func (r *PlatformAgentReconciler) handleDeletion(ctx context.Context, agent *age
 
 		// Resource is deleted. Safe to remove finalizer and update.
 		r.forgetUsageStatus(agent)
+		r.credentialProxyWarningsLogged.Delete(client.ObjectKeyFromObject(agent))
 		controllerutil.RemoveFinalizer(agent, platformAgentFinalizer)
 		if err := r.Update(ctx, agent); err != nil {
 			return ctrl.Result{}, err
@@ -2248,6 +2261,43 @@ func (r *PlatformAgentReconciler) awaitStatefulSetGone(ctx context.Context, key 
 // business knowing where the relays run. credential_proxy_manifests.go carries
 // the reasoning for why the pod is its own.
 func (r *PlatformAgentReconciler) reconcileCredentialProxy(ctx context.Context, agent *agentv1alpha1.PlatformAgent, policyHash string) error {
+	objs := []client.Object{buildCredentialProxyService(agent)}
+	// The resources override is checked here as well as at admission, because
+	// the chart installs with the webhook off. Rendered, an override under the
+	// floor runs the broker with its budget off, and a request above its limit
+	// is refused by the API server as Invalid, which
+	// applyCredentialProxyDeployment reads as an immutable-field change and
+	// answers by deleting the running proxy. Refused, the override is ignored
+	// rather than the Deployment withheld: the Deployment is rendered at the
+	// operator's default resources, so the image, the policy hash that rolls
+	// the pod for a pool-mapping change, the Secret env hash and the caller and
+	// egress env keep flowing, and updateStatusReady reports the refusal as
+	// Degraded.
+	refusal, warnings := credentialProxyResourcesRefusal(agent)
+	// The warnings are logged once per spec generation: every pass that follows
+	// reads the same spec and would repeat them indefinitely, with no way to
+	// acknowledge one, and the webhook, where it is on, has already said each
+	// once at apply. The gate is held in memory, keyed on the generation this
+	// step last logged, rather than on status.observedGeneration: the
+	// forbidden-mount, shell-sandbox and RuntimeClass refusals run before this
+	// step and record the generation as observed, so a generation that first
+	// went Degraded there would reach this step already observed and never log.
+	// The residue is that an operator restart logs each CR's warnings once more.
+	key := client.ObjectKeyFromObject(agent)
+	if logged, ok := r.credentialProxyWarningsLogged.Load(key); !ok || logged.(int64) != agent.Generation {
+		for _, warning := range warnings {
+			logf.FromContext(ctx).Info("WARNING: "+warning, "name", agent.Name, "namespace", agent.Namespace)
+		}
+		r.credentialProxyWarningsLogged.Store(key, agent.Generation)
+	}
+	rendered := agent
+	if refusal != "" {
+		logf.FromContext(ctx).Info("refusing spec.deployment.credentialProxy.resources; the credential-proxy Deployment is rendered at the operator's default resources",
+			"name", agent.Name, "namespace", agent.Namespace, "refusal", refusal)
+		r.recordEvent(agent, corev1.EventTypeWarning, conditionReasonInvalidCredentialProxyResources, refusal)
+		rendered = agent.DeepCopy()
+		rendered.Spec.Deployment.CredentialProxy = nil
+	}
 	// This pod, not the gateway, is where the Slack and Teams tokens and the
 	// model-provider keys are read out of a Secret as environment, so it needs
 	// the same digest — see platformagent_secret_hash.go. Stamping only the
@@ -2255,15 +2305,12 @@ func (r *PlatformAgentReconciler) reconcileCredentialProxy(ctx context.Context, 
 	// reaching a container that never restarts. (On a Slack-armed next install
 	// the Slack pair is read by the A2A gateway instead, which reconcileA2A
 	// stamps.)
-	proxy := buildCredentialProxyDeployment(agent, policyHash)
+	proxy := buildCredentialProxyDeployment(rendered, policyHash)
 	if err := r.stampSecretEnvHash(ctx, agent, proxy, &proxy.Spec.Template); err != nil {
 		return err
 	}
-	objs := []client.Object{
-		buildCredentialProxyService(agent),
-		proxy,
-		credentialProxyNetworkPolicyWithOperatorPeer(agent, r.OperatorNamespace),
-	}
+	objs = append(objs, proxy)
+	objs = append(objs, credentialProxyNetworkPolicyWithOperatorPeer(agent, r.OperatorNamespace))
 	for _, obj := range objs {
 		if err := ctrl.SetControllerReference(agent, obj, r.Scheme); err != nil {
 			return fmt.Errorf("failed to set controller reference on credential proxy %T %s/%s: %w", obj, obj.GetNamespace(), obj.GetName(), err)
@@ -3521,6 +3568,8 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 		}
 	}
 
+	proxyResourcesRefusal, _ := credentialProxyResourcesRefusal(agent)
+
 	degradedStatus := metav1.ConditionFalse
 	degradedReason := ""
 	// The Degraded message is the Ready one unless a branch says otherwise.
@@ -3565,6 +3614,17 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 		degradedStatus = metav1.ConditionTrue
 		degradedReason = conditionReasonMinterPruningHeld
 		degradedMsg = minterHeldMessage(agent.Name+gitopsStateConfigMapSuffix, minterHeld)
+	} else if proxyResourcesRefusal != "" {
+		// Same shape as the git refusal above: the spec is read here, on
+		// every pass, rather than carried from reconcileCredentialProxy, so
+		// the condition clears on the pass the override is corrected.
+		// Degraded only, as the held minter entry above: the proxy runs at
+		// the operator's defaults, so Ready and the phase keep what the
+		// workload says. Last, because the reasons above report lost
+		// function and must not be masked by it.
+		degradedStatus = metav1.ConditionTrue
+		degradedReason = conditionReasonInvalidCredentialProxyResources
+		degradedMsg = fmt.Sprintf(invalidCredentialProxyResourcesMsgFmt, proxyResourcesRefusal)
 	}
 	if degradedMsg == "" {
 		degradedMsg = condMsg

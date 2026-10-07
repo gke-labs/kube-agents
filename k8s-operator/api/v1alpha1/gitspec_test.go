@@ -17,7 +17,10 @@ limitations under the License.
 package v1alpha1
 
 import (
+	"os"
+	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -214,6 +217,87 @@ func TestGitHubResolveRefusesAGitSegment(t *testing.T) {
 	ref, err := provider.Resolve("", "gke-labs/infra.git/", "gke-labs")
 	if err != nil || ref.Path != "gke-labs/infra" {
 		t.Errorf("Resolve(gke-labs/infra.git/) = %q, %v, expected gke-labs/infra", ref, err)
+	}
+}
+
+// The agent and the broker drop a trailing `.git` again from the URL the
+// operator renders, so a name that keeps one after the single strip would be
+// another repository to them: `foo.git.git` renders `gke-labs/foo.git`, which
+// they read as `gke-labs/foo`.
+func TestGitHubResolveRefusesANameThatStillEndsInGit(t *testing.T) {
+	provider, _ := LookupGitProvider(GitProviderGitHub)
+	for _, repo := range []string{"foo.git.git", "gke-labs/foo.git.git", "https://github.com/gke-labs/foo.git.git/", "git@github.com:gke-labs/foo.git.git"} {
+		t.Run(repo, func(t *testing.T) {
+			if ref, err := provider.Resolve("", repo, "gke-labs"); err == nil {
+				t.Errorf("Resolve(%q) = %q, expected a refusal", repo, ref.URL())
+			}
+		})
+	}
+	for _, repo := range []string{"foo.git", "gke-labs/foo.git/", "gke-labs/foo.gitx", "gke-labs/foo.git-x"} {
+		t.Run(repo, func(t *testing.T) {
+			if _, err := provider.Resolve("", repo, "gke-labs"); err != nil {
+				t.Errorf("Resolve(%q) = %v, expected it accepted", repo, err)
+			}
+		})
+	}
+}
+
+// GitHub caps a repository name at 100 characters. Without the cap a name the
+// operator accepted rendered a URL longer than the broker's parser reads.
+func TestGitHubResolveCapsTheNameAtGitHubsLimit(t *testing.T) {
+	provider, _ := LookupGitProvider(GitProviderGitHub)
+	longest := strings.Repeat("a", MaxGitHubRepoNameLength)
+	over := longest + "a"
+	for _, repo := range []string{longest, "gke-labs/" + longest, "https://github.com/gke-labs/" + longest + ".git"} {
+		t.Run(repo[:20], func(t *testing.T) {
+			if ref, err := provider.Resolve("", repo, "gke-labs"); err != nil || ref.Path != "gke-labs/"+longest {
+				t.Errorf("Resolve(%q) = %q, %v, expected gke-labs/<%d characters>", repo, ref.Path, err, MaxGitHubRepoNameLength)
+			}
+		})
+	}
+	for _, repo := range []string{over, "gke-labs/" + over, "https://github.com/gke-labs/" + over + ".git"} {
+		t.Run(repo[:20]+"-over", func(t *testing.T) {
+			if ref, err := provider.Resolve("", repo, "gke-labs"); err == nil {
+				t.Errorf("Resolve(%q) = %q, expected a refusal", repo, ref.URL())
+			}
+		})
+	}
+}
+
+// brokerMaxRepoLength is repo_ref.py's MAX_REPO_LENGTH, read from the source
+// so the two cannot drift apart unnoticed.
+func brokerMaxRepoLength(t *testing.T) int {
+	t.Helper()
+	source, err := os.ReadFile(filepath.Join("..", "..", "..", "agents", "platform", "scripts", "repo_ref.py"))
+	if err != nil {
+		t.Fatalf("reading repo_ref.py: %v", err)
+	}
+	match := regexp.MustCompile(`(?m)^MAX_REPO_LENGTH = (\d+)$`).FindSubmatch(source)
+	if match == nil {
+		t.Fatalf("repo_ref.py defines no MAX_REPO_LENGTH")
+	}
+	limit, err := strconv.Atoi(string(match[1]))
+	if err != nil {
+		t.Fatalf("MAX_REPO_LENGTH = %q: %v", match[1], err)
+	}
+	return limit
+}
+
+// The broker refuses to start on a pinned URL its parser cannot read, so the
+// longest URL the operator can render has to fit inside the parser's bound:
+// `https://github.com/` (19), a 39-character owner, `/`, a 100-character name.
+func TestTheLongestRenderableURLFitsTheBrokersBound(t *testing.T) {
+	provider, _ := LookupGitProvider(GitProviderGitHub)
+	owner := strings.Repeat("o", MaxGitHubOrgLength)
+	ref, err := provider.Resolve("", strings.Repeat("a", MaxGitHubRepoNameLength), owner)
+	if err != nil {
+		t.Fatalf("Resolve(<longest name>, <longest owner>) = %v", err)
+	}
+	if got, want := len(ref.URL()), len("https://github.com/")+MaxGitHubOrgLength+1+MaxGitHubRepoNameLength; got != want {
+		t.Errorf("len(URL) = %d, expected %d", got, want)
+	}
+	if limit := brokerMaxRepoLength(t); len(ref.URL()) > limit {
+		t.Errorf("the longest renderable URL is %d characters, over the broker's MAX_REPO_LENGTH of %d", len(ref.URL()), limit)
 	}
 }
 
@@ -664,6 +748,22 @@ func TestProblemsNameTheFieldAtFault(t *testing.T) {
 		{name: "one repository in two roles", spec: &IntegrationSpec{Forges: gh, Repositories: []RepositorySpec{
 			repo("github", "infra", RepositoryRoleManaged),
 			repo("github", "https://github.com/GKE-Labs/infra.git", RepositoryRoleContext),
+		}}, want: []string{"repositories[1].repository"}},
+		// The agent and the broker read a URL the operator rendered with
+		// repo_ref.py, so a repository they would read differently is refused
+		// against the entry, and so withheld from the seed and the pins.
+		{name: "name over github's limit", spec: &IntegrationSpec{Forges: gh, Repositories: []RepositorySpec{
+			repo("github", strings.Repeat("a", MaxGitHubRepoNameLength+1), RepositoryRoleGitOps),
+		}}, want: []string{"repositories[0].repository"}},
+		{name: "a name that still ends in .git", spec: &IntegrationSpec{Forges: gh, Repositories: []RepositorySpec{
+			repo("github", "foo", RepositoryRoleManaged),
+			repo("github", "foo.git.git", RepositoryRoleManaged),
+		}}, want: []string{"repositories[1].repository"}},
+		// The broker keys its pins on host and path case-folded, and so does
+		// the duplicate check here.
+		{name: "one repository in two cases", spec: &IntegrationSpec{Forges: gh, Repositories: []RepositorySpec{
+			repo("github", "infra", RepositoryRoleGitOps),
+			repo("github", "GKE-LABS/INFRA", RepositoryRoleManaged),
 		}}, want: []string{"repositories[1].repository"}},
 		{name: "sentinel in a list", spec: &IntegrationSpec{Forges: gh,
 			Repositories: []RepositorySpec{repo("github", NoRepositorySentinel, RepositoryRoleGitOps)}},
