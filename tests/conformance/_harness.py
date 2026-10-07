@@ -458,8 +458,8 @@ SOURCES: dict[str, Source] = {
     ),
     # --- the delegation primitive ------------------------------------------
     # The reserved artifact name and its data shape, defined once so the
-    # worker-adapter and the gateway relay never spell either by hand (A3's
-    # "the delegate artifact is spelled once", C1 below).
+    # worker-adapter and the gateway relay never spell either by hand (C1's
+    # "the delegate artifact is spelled once").
     "a2a_payload": Source(
         "a2a/lib/payload.go",
         ('ArtifactDelegate = "delegate"', "type DelegateRequest struct {", "DelegateTextCap = "),

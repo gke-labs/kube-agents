@@ -1129,7 +1129,7 @@ class C1IsolationIsStructural(unittest.TestCase):
                 one(r"os\.(?:Getenv|LookupEnv)\(%s\)" % env, allowlist + h.text("a2a_gateway_config"), "the gateway's read of %s" % env)
 
         # The absent-list branch is allow, stated in the function that answers.
-        body = allowlist.split("func (g *Gateway) targetAllows")[1].split("\n}\n")[0]
+        body = h.go_function_body(allowlist, "targetAllows")
         self.assertIn("if set == nil {", body, "targetAllows lost its absent-list branch")
         self.assertIn("return true", body.split("if set == nil {")[1].split("}")[0],
                       "targetAllows answers an absent list with something other than allow")
