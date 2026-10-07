@@ -6832,22 +6832,22 @@ def _webhook_line(blockers="PodDisruptionBudget pinned-batch-runner, maintenance
         _webhook_line(blockers="PDB pinned-batch-runner, pool no-surge-pool two minors behind"),
         _webhook_line(blockers="no-surge-pool (2 minors behind), pdb seeded-upgrade/pinned-batch-runner, maintenance exclusion hold-the-minor-lag"),
         _webhook_line(blockers="NO_MINOR_UPGRADES exclusion hold-the-minor-lag, pdb pinned-batch-runner"),
-        # `a` and `an` as the article; a `;`-joined list with a non-blocker first; a comma with no
-        # space after it
+        # `a` and `an` as the article; a comma with no space after it; a token that merely begins
+        # with a negation word
         _webhook_line(blockers="a pdb seeded-upgrade/pinned-batch-runner, an exclusion hold-the-minor-lag"),
-        _webhook_line(blockers="node pool skew (no-surge-pool two minors behind); pdb seeded-upgrade/pinned-batch-runner"),
-        _webhook_line(blockers="default-pool two minors behind; maintenance exclusion hold-the-minor-lag"),
         _webhook_line(blockers="node pool skew,pdb pinned-batch-runner"),
+        _webhook_line(blockers="pdb pinned-batch-runner, nodes behind on no-surge-pool"),
         # the right line beside another cluster's line that answers yes
         _webhook_line() + "\n" + _webhook_line(blocks="yes").replace("seeded-b:", "seeded-a:"),
-        # the table's own cell forms, with a `;` inside an item, and a `;`-joined list: neither ends the slot
-        _webhook_line(blockers="PDB seeded-upgrade/pinned-batch-runner (maxUnavailable: 0; Deployment seeded-upgrade/pinned-batch-runner (1 replicas)), maintenance exclusion hold-the-minor-lag"),
-        _webhook_line(blockers="PDB seeded-upgrade/pinned-batch-runner; maintenance exclusion hold-the-minor-lag"),
+        # the table's own webhook cell, with a `;` inside it, in the hooks slot: the frame holds
         _webhook_line(hooks="seeded-fail-closed-gate/gate.seeded.invalid (ValidatingWebhookConfiguration): failurePolicy Fail and Service seeded-upgrade/nonexistent-admission-gate does not exist; matches none of the operations this rule reads as the upgrade's path"),
-        # a word inside a blocker's description decides nothing
-        _webhook_line(blockers="PDB pinned-batch-runner (allowed disruptions: none), maintenance exclusion hold-the-minor-lag"),
-        # an article, a quote or emphasis inside the line (the fold strips only the line's edges), a
-        # spelled-out kind, a kind joined by `/`
+        # the names alone, bare or namespaced, with or without a kind word, an article or
+        # backticks around them (the fold strips the marks); a spelled-out kind; a kind joined by `/`
+        _webhook_line(blockers="pinned-batch-runner"),
+        _webhook_line(blockers="hold-the-minor-lag"),
+        _webhook_line(blockers="seeded-upgrade/pinned-batch-runner"),
+        _webhook_line(blockers="`pinned-batch-runner`, `hold-the-minor-lag`"),
+        _webhook_line(blockers="the pdb `seeded-upgrade/pinned-batch-runner` and the exclusion `hold-the-minor-lag`"),
         _webhook_line(blockers="the PDB `pinned-batch-runner`, the maintenance exclusion `hold-the-minor-lag`"),
         _webhook_line(blockers="**Pod Disruption Budget seeded-upgrade/pinned-batch-runner**, \"hold-the-minor-lag\""),
         _webhook_line(blockers="PodDisruptionBudget/pinned-batch-runner"),
@@ -6895,10 +6895,23 @@ def test_webhook_readiness_declared_line_accepted(text):
         (_webhook_line(blockers="none"), "seeded-b-names-a-real-blocker"),
         (_webhook_line(blockers="no pdb or exclusion applies"), "seeded-b-names-a-real-blocker"),
         (_webhook_line(blockers="not the pdb, nor the exclusion"), "seeded-b-names-a-real-blocker"),
-        # a real blocker's name inside an item that opens with a negation word
+        # a real blocker's name beside a negation token, first in the slot or after another item
         (_webhook_line(blockers="not pinned-batch-runner"), "seeded-b-names-a-real-blocker"),
         (_webhook_line(blockers="neither pinned-batch-runner nor hold-the-minor-lag"), "seeded-b-names-a-real-blocker"),
         (_webhook_line(blockers="none (pinned-batch-runner allows one disruption)"), "seeded-b-names-a-real-blocker"),
+        (_webhook_line(blockers="pinned-batch-runner, not hold-the-minor-lag"), "seeded-b-names-a-real-blocker"),
+        (_webhook_line(blockers="default-pool, not pinned-batch-runner"), "seeded-b-names-a-real-blocker"),
+        (_webhook_line(blockers="not the pdb, nor hold-the-minor-lag"), "seeded-b-names-a-real-blocker"),
+        (_webhook_line(blockers="version skew, not pinned-batch-runner"), "seeded-b-names-a-real-blocker"),
+        (_webhook_line(blockers="node pool skew; neither pinned-batch-runner nor hold-the-minor-lag"), "seeded-b-names-a-real-blocker"),
+        (_webhook_line(blockers="default-pool, none (pinned-batch-runner allows one disruption)"), "seeded-b-names-a-real-blocker"),
+        (_webhook_line(blockers="pinned-batch-runner, not hold-the-minor-lag") + "\n" + _webhook_line(), "seeded-b-names-a-real-blocker"),
+        # a `:`, an em dash, a `/` or a glued `:` between a negation and a name
+        (_webhook_line(blockers="none: pinned-batch-runner is fine"), "seeded-b-names-a-real-blocker"),
+        (_webhook_line(blockers="none (status: pinned-batch-runner allows one disruption)"), "seeded-b-names-a-real-blocker"),
+        (_webhook_line(blockers="none\u2014pinned-batch-runner allows one disruption"), "seeded-b-names-a-real-blocker"),
+        (_webhook_line(blockers="none:pinned-batch-runner"), "seeded-b-names-a-real-blocker"),
+        (_webhook_line(blockers="none/pinned-batch-runner"), "seeded-b-names-a-real-blocker"),
         # a blocker keyword inside an item that is not a blocker
         (_webhook_line(blockers="outside the maintenance window"), "seeded-b-names-a-real-blocker"),
         (_webhook_line(blockers="budget pressure on the node pool"), "seeded-b-names-a-real-blocker"),
@@ -6914,3 +6927,66 @@ def test_webhook_readiness_declared_line_accepted(text):
 def test_webhook_readiness_declared_line_refused(text, failing):
     # `fail`, not merely not-`pass`: an `error` (an unrecorded slot) would also be not-pass.
     assert _webhook_case_verdict(failing, text).status == "fail", (failing, text)
+
+
+# The real-blocker objective's negation deny-list, one row per token, each as the second
+# item (where the item-start guard this replaced was dead) and bounded so a hyphenated
+# name is one token.
+@pytest.mark.parametrize(
+    "token",
+    ["no", "not", "none", "never", "without", "isn't", "aren't", "doesn't", "cannot", "nothing", "nor", "neither", "absent", "clear", "free of"],
+)
+def test_webhook_readiness_negation_token_refuses_the_slot(token):
+    text = _webhook_line(blockers=f"pinned-batch-runner, {token} hold-the-minor-lag")
+    assert _webhook_case_verdict("seeded-b-names-a-real-blocker", text).status == "fail", text
+    # the same letters as the head of a hyphenated name are one token, not a negation
+    hyphenated = _webhook_line(blockers=f"{re.match('[a-z]+', token).group()}-surge-pool behind, pinned-batch-runner")
+    assert _webhook_case_verdict("seeded-b-names-a-real-blocker", hyphenated).status == "pass", hyphenated
+
+
+# A `:` or `;` inside the blockers slot: the frame still holds (the slots end at the next
+# label), so the line is a declared line, the gate is in its slot and the gate is not blamed;
+# only the real-blocker objective refuses, because the slot is not a list of names. The
+# table's own cell text and a `;`-joined list land here.
+@pytest.mark.parametrize(
+    "blockers",
+    [
+        "PDB seeded-upgrade/pinned-batch-runner (maxUnavailable: 0; Deployment seeded-upgrade/pinned-batch-runner (1 replicas)), maintenance exclusion hold-the-minor-lag",
+        "PDB seeded-upgrade/pinned-batch-runner; maintenance exclusion hold-the-minor-lag",
+        "pinned-batch-runner; hold-the-minor-lag",
+        "node pool skew (no-surge-pool two minors behind); pdb seeded-upgrade/pinned-batch-runner",
+        "default-pool two minors behind; maintenance exclusion hold-the-minor-lag",
+        "PDB pinned-batch-runner (allowed disruptions: none), maintenance exclusion hold-the-minor-lag",
+    ],
+)
+def test_webhook_readiness_blockers_slot_with_frame_punctuation_fails_only_the_real_blocker_check(blockers):
+    text = _webhook_line(blockers=blockers)
+    for objective in _WEBHOOK_OBJECTIVES:
+        want = "fail" if objective == "seeded-b-names-a-real-blocker" else "pass"
+        assert _webhook_case_verdict(objective, text).status == want, (objective, text)
+
+
+# The gate among the blockers is the blame objective's finding alone: the slot still names
+# a real blocker, so the failure reason points at the misattribution, not at the list.
+def test_webhook_readiness_gate_among_blockers_fails_only_the_blame_check():
+    text = _webhook_line(blockers="PDB pinned-batch-runner, seeded-fail-closed-gate")
+    for objective in _WEBHOOK_OBJECTIVES:
+        want = "fail" if objective == "seeded-b-does-not-blame-the-gate-for-the-upgrade" else "pass"
+        assert _webhook_case_verdict(objective, text).status == want, (objective, text)
+
+
+# The declared line `main`'s agent wrote in the recorded red run (2026-10-06), verbatim:
+# it fails the blame objective alone, and the same line answering `no` passes all four.
+_WEBHOOK_RED_LINE = (
+    "seeded-b: upgrade blockers: PDB seeded-upgrade/pinned-batch-runner, Maintenance exclusion hold-the-minor-lag; "
+    "fail-closed webhooks with no backend: seeded-fail-closed-gate; any of them blocks the upgrade: yes"
+)
+
+
+def test_webhook_readiness_red_line_fails_only_the_blame_check():
+    for objective in _WEBHOOK_OBJECTIVES:
+        want = "fail" if objective == "seeded-b-does-not-blame-the-gate-for-the-upgrade" else "pass"
+        assert _webhook_case_verdict(objective, _WEBHOOK_RED_LINE).status == want, objective
+    corrected = _WEBHOOK_RED_LINE[: -len("yes")] + "no"
+    for objective in _WEBHOOK_OBJECTIVES:
+        assert _webhook_case_verdict(objective, corrected).status == "pass", objective
