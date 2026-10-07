@@ -38,7 +38,7 @@ from dataclasses import dataclass, replace
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Iterator, Mapping, TextIO
+from typing import Any, Callable, Iterator, Mapping, TextIO
 
 import api_policy
 import command_policy
@@ -139,12 +139,62 @@ PIPES_CLOSED_POLL_SECONDS = 0.5
 # A long-running command (`logs -f`, `wait`, `rollout`) holds its slot for as
 # long as it runs. The operator sets CREDENTIAL_PROXY_MAX_CONCURRENT_COMMANDS
 # from a constant of its own beside the output cap and reserves the name, and
-# its cap test sizes the container's memory limit against the two, so the
-# value an install runs moves with that limit rather than through the CR; this
+# the value an install runs is the operator's rather than the CR's; this
 # default is for a broker run outside the operator. `CommandExecutor.request_slot`
-# says which routes hold a slot and why the others take none.
+# says which routes hold a slot and why the others take none. Within the cap,
+# the child memory budget below decides how many are admitted at once; the cap
+# is the upper bound.
 DEFAULT_MAX_CONCURRENT_COMMANDS = 8
 ENV_MAX_CONCURRENT_COMMANDS = "CREDENTIAL_PROXY_MAX_CONCURRENT_COMMANDS"
+# The child memory budget (docs/designs/credential-proxy-child-memory-budget.md).
+# The slot cap above counts requests; the container's memory limit holds
+# processes, and the children a request spawns -- gcloud at about 102 MiB per
+# request across a listing burst, kubectl plus its auth-plugin helper at about
+# the same -- are most of what a wide-scope install's container holds. So a
+# request that runs commands also reserves this much for its children when it
+# is admitted, and the sum of reservations has to fit what is left of the
+# limit after the broker's own resident set and the content workspace's one
+# process tree at a time. One size for every route, because every route can
+# end up running the heavy case (§2.1). The operator's sizing test declares
+# the same four figures under matching names (credential_proxy_manifests.go)
+# and asserts the arithmetic against the rendered limit; change them together.
+# They, and BUDGET_MINIMUM_ADMITTED_REQUESTS below, are held equal by
+# tests/test_credential_proxy_sizing_parity.py.
+MEBIBYTE = 1024 * 1024
+REQUEST_CHILD_MEMORY_RESERVE_BYTES = 128 * MEBIBYTE
+# The broker process and Envoy: 168 MiB measured, with margin.
+BROKER_RESIDENT_RESERVE_BYTES = 192 * MEBIBYTE
+# The content workspace store serves one verb at a time under its own lock, so
+# at most one of its process trees exists at any moment; that is a fixed term
+# rather than a reservation per verb, and it is one request's worth.
+CONTENT_WORKSPACE_RESERVE_BYTES = 128 * MEBIBYTE
+# What the broker itself holds per admitted request, as a multiple of the
+# output cap: the two capped stream buffers, their decoded text, the JSON body
+# and its encoding. Charged for the slots in use, not for the cap.
+OUTPUT_COPIES_PER_COMMAND = 6
+# The fewest requests a budget may admit at once and still be used. Under
+# this the broker treats the budget as absent and admits by slot alone, as it
+# did before the budget existed: a listing phase that cannot run two at once
+# is slower than the OOM exposure the budget prevents, and the case is real --
+# GKE Autopilot without bursting sets a container's limits equal to its
+# requests, so the proxy's limit there is its 512Mi request. The operator's
+# sizing test holds the limit to the same floor
+# (credentialProxyMinimumAdmittedRequests in credential_proxy_manifests.go).
+BUDGET_MINIMUM_ADMITTED_REQUESTS = 2
+# child_memory_budget_floor_bytes at the 8 MiB output cap the operator sets
+# (CREDENTIAL_PROXY_MAX_OUTPUT_BYTES; the broker's own fallback is not the
+# deployed cap): 672 MiB. Declared as a literal so that the copies elsewhere can
+# be compared with it as text. test_credential_proxy.py holds it to the
+# function, and tests/test_credential_proxy_sizing_parity.py holds it equal to
+# the operator's credentialProxyMemoryFloorBytesAtDefaultCap and the chart's
+# kube-agents.credentialProxyMemoryFloorBytes.
+CHILD_MEMORY_BUDGET_FLOOR_BYTES_AT_DEFAULT_CAP = 704643072
+# Where the limit comes from, in order: the operator's Downward API variable,
+# then the cgroup v2 file for a broker whose Deployment predates the variable.
+# A value of `max` in the file means no limit, and no limit means no budget.
+ENV_MEMORY_LIMIT_BYTES = "CREDENTIAL_PROXY_MEMORY_LIMIT_BYTES"
+CGROUP_MEMORY_MAX_PATH = "/sys/fs/cgroup/memory.max"
+CGROUP_NO_LIMIT = "max"
 # The session role's own share of that pool. Session pods are opened by chat
 # conversations, and under the cluster-view flag all of them draw on the one
 # pool the platform agent's shell uses, so without a bound of their own a
@@ -155,7 +205,8 @@ ENV_MAX_CONCURRENT_COMMANDS = "CREDENTIAL_PROXY_MAX_CONCURRENT_COMMANDS"
 # knob, and the operator's spec.deployment.env reaches it.
 DEFAULT_SESSION_MAX_CONCURRENT_COMMANDS = 2
 ENV_SESSION_MAX_CONCURRENT_COMMANDS = "CREDENTIAL_PROXY_SESSION_MAX_CONCURRENT_COMMANDS"
-# How long a request waits for a slot before it is refused with 503. Long
+# How long a request waits for admission -- a slot under the slot cap and room
+# under the child memory budget alike -- before it is refused with 503. Long
 # enough to ride out a burst of one-shot reads, short enough that a queue held
 # up by long-running commands answers its callers rather than parking them.
 COMMAND_SLOT_WAIT_SECONDS = 60
@@ -211,6 +262,13 @@ AGENT_API_DRAIN_TIMEOUT_SECONDS = 10
 # match and the length guard both live there, at the same 256 this module
 # enforced before; the alias keeps the name this module's own tests use.
 MAX_REPOSITORY_LENGTH = repo_ref.MAX_REPO_LENGTH
+
+# The one ref prefix a pinned base may carry, removed once to give the branch's
+# canonical name, and the prefixes that may not follow it or start the value:
+# `heads/x` and a repeated `refs/heads/` would each be read as another branch
+# by some door. The operator's CRD rule refuses the same values.
+PINNED_BASE_REF_PREFIX = "refs/heads/"
+PINNED_BASE_REFUSED_PREFIXES = ("refs/heads/", "heads/")
 
 # The read-only Cloud API relay, `GET /v1/gcp/<host>/<path>?<query>`. The route
 # prefix itself is API_RELAY_PREFIX, imported above from the client module so
@@ -882,6 +940,22 @@ MANAGED_REPOSITORY_CACHE_SECONDS = 30.0
 # scope replaces the previous one's coalesce window entirely.
 FORGE_REFRESH_COALESCE_SECONDS = 30.0
 
+# Why a route refresher waiting for the refresh lock stopped waiting.
+REFRESH_LOCK_HUNG_UP_TEXT = "the caller disconnected while waiting for the refresh lock"
+REFRESH_LOCK_WAIT_TEXT = (
+    "a {provider} credential refresh waited {seconds}s for another refresh to finish; retry shortly"
+)
+REFRESH_YIELDED_WAIT_REASON = (
+    "a {provider} credential refresh waited {seconds}s, for the child memory budget and then for "
+    "a vcs request's refresh it stepped aside for"
+)
+REFRESH_YIELDED_WAIT_TEXT = REFRESH_YIELDED_WAIT_REASON + "; retry shortly"
+# Refused by the budget on the reservation after the yield: the same reason,
+# with the figures the budget refusal prints.
+REFRESH_YIELDED_BUDGET_WAIT_TEXT = (
+    REFRESH_YIELDED_WAIT_REASON + "; the child memory budget is {budget_in_use}; retry shortly"
+)
+
 # What `repository_role` answers. `managed` is a repository in `managed_repos`,
 # whatever else it is in; `context` is one in `context_repos` alone; the third
 # is neither. Only the content workspace's clone reads the answer.
@@ -1241,12 +1315,67 @@ class AuthenticationError(Exception):
     """
 
 
-class CommandSlotUnavailable(RuntimeError):
-    """A request waited COMMAND_SLOT_WAIT_SECONDS without reaching a free slot.
+def child_memory_limit_bytes(
+    environ: "Mapping[str, str] | None" = None,
+    cgroup_path: "str | Path" = CGROUP_MEMORY_MAX_PATH,
+) -> int | None:
+    """The container's memory limit in bytes, or None when the budget is off.
 
-    Slots go in arrival order, so this is the request that has waited longest,
-    whether the slots never freed or freed only for the requests ahead of it.
-    Answered 503 rather than run anyway: a request past the cap is the one that
+    Reads the operator's Downward API variable first, then the cgroup file. A
+    variable set to anything but a positive integer (`0`, `1Gi`, text) is
+    logged once and ignored, and the file is read as though it were unset. The
+    file answers None for anything that is not a positive integer: `max`, a
+    file that is not there. None is "admission by slot alone, as before this
+    budget", logged once by the executor; it is never an error, because a
+    broker that refuses to start over a sizing hint is worse than one that runs
+    unbudgeted.
+    """
+    source = os.environ if environ is None else environ
+    raw = (source.get(ENV_MEMORY_LIMIT_BYTES) or "").strip()
+    if raw:
+        limit = _positive_int(raw)
+        if limit is not None:
+            return limit
+        LOGGER.warning(
+            "%s=%r is not a positive integer byte count; ignoring it", ENV_MEMORY_LIMIT_BYTES, raw
+        )
+    try:
+        raw = Path(cgroup_path).read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    if raw == CGROUP_NO_LIMIT:
+        return None
+    return _positive_int(raw)
+
+
+def _positive_int(raw: str) -> int | None:
+    """`raw` as an int when it is a positive integer, else None."""
+    try:
+        value = int(raw)
+    except ValueError:
+        return None
+    return value if value > 0 else None
+
+
+def child_memory_budget_floor_bytes(max_output_bytes: int) -> int:
+    """The smallest container limit at which the budget admits
+    BUDGET_MINIMUM_ADMITTED_REQUESTS slot-taking requests at once."""
+    per_request = REQUEST_CHILD_MEMORY_RESERVE_BYTES + OUTPUT_COPIES_PER_COMMAND * max_output_bytes
+    return (
+        BROKER_RESIDENT_RESERVE_BYTES
+        + CONTENT_WORKSPACE_RESERVE_BYTES
+        + BUDGET_MINIMUM_ADMITTED_REQUESTS * per_request
+    )
+
+
+class CommandSlotUnavailable(RuntimeError):
+    """A request waited out its admission bound without being admitted.
+
+    Admission covers the slot cap and the child memory budget alike, and the
+    message names whichever held the request. Admission goes in arrival order,
+    so this is the request that has waited longest, whether the slots or the
+    budget never freed or freed only for the requests ahead of it. Answered
+    503 rather than run anyway: a request past either bound is the one that
     would take the container over its memory limit, and an OOM kill fails every
     request in flight for every caller, not just this one.
     """
@@ -1309,10 +1438,20 @@ class SessionSlots:
 
 
 class CallerHungUp(Exception):
-    """The caller closed its connection while its request waited for a slot.
+    """The caller closed its connection while its request waited for admission
+    (a slot, room under the child memory budget, or both).
 
     Nothing to run and nobody to answer: the route logs it and returns, and the
     slot goes to a caller that is still there.
+    """
+
+
+class AdmissionYielded(Exception):
+    """A queued request stepped aside for another caller that should go first.
+
+    Raised only to a caller that asked to be woken when that happens
+    (`_admit`'s `yield_when`), before it was admitted; never answered to a
+    client.
     """
 
 
@@ -3374,8 +3513,10 @@ def _detect_repo_default_branch(
     Reads refs/remotes/<remote>/HEAD directly without subprocess or network calls.
     On repositories with non-standard default trunks, this local detection acts as a
     cooperative guard against accidental pushes; authoritative protection against
-    deliberate workspace ref manipulation requires setting CREDENTIAL_PROXY_BASE_BRANCH
-    or GITOPS_BASE_BRANCH.
+    deliberate workspace ref manipulation comes from a configured base instead:
+    CREDENTIAL_PROXY_BASE_BRANCH or GITOPS_BASE_BRANCH, or a repository's pinned
+    base from --pinned-bases / CREDENTIAL_PROXY_PINNED_BASES, each of which is
+    protected on every push whatever the clone's refs say.
 
     `remote` comes from the agent's argv. Only a value that stays under
     `refs/remotes/` once joined is looked up. A URL in that slot never reached
@@ -3463,6 +3604,10 @@ def git_push_violation(argv: list[str], cwd: Path | str | None = None) -> str | 
         elif norm_override.startswith("heads/"):
             norm_override = norm_override[len("heads/"):]
         protected.add(norm_override)
+    # A pin is stored in its one canonical spelling (`parse_pinned_bases`), so
+    # it is protected under exactly the name proposals target.
+    pinned = getattr(CredentialProxyHandler, "pinned_bases", None) or {}
+    protected.update(configured.lower() for configured in pinned.values() if configured)
 
     has_tags = False
     positional: list[str] = []
@@ -3569,18 +3714,24 @@ def git_push_violation(argv: list[str], cwd: Path | str | None = None) -> str | 
                 "`git push` with bare 'HEAD' refspec is refused: specify an explicit "
                 "destination branch (e.g. 'HEAD:platform-agent/<name>')."
             )
-        norm_target = target.strip()
-        if norm_target.lower().startswith("refs/heads/"):
-            norm_target = norm_target[len("refs/heads/"):]
-        elif norm_target.lower().startswith("heads/"):
-            norm_target = norm_target[len("heads/"):]
+        # git matches a destination case-sensitively, so `Heads/x` is the
+        # branch `Heads/x` while `heads/x` may be `x`. The prefix is stripped
+        # in any case, as before, but the name as written is checked too, so a
+        # protected branch spelt with such a prefix is not read away to another.
+        written = target.strip()
+        candidates = [written]
+        if written.lower().startswith("refs/heads/"):
+            candidates.insert(0, written[len("refs/heads/"):])
+        elif written.lower().startswith("heads/"):
+            candidates.insert(0, written[len("heads/"):])
 
-        if norm_target.casefold() in protected or norm_target.casefold().startswith("run/"):
-            return (
-                f"`git push` to protected branch '{norm_target}' is refused: changes to "
-                "base or run branches must be proposed via pull request and merged through "
-                "the approved workflow."
-            )
+        for norm_target in candidates:
+            if norm_target.casefold() in protected or norm_target.casefold().startswith("run/"):
+                return (
+                    f"`git push` to protected branch '{norm_target}' is refused: changes to "
+                    "base or run branches must be proposed via pull request and merged through "
+                    "the approved workflow."
+                )
     return None
 
 
@@ -4276,6 +4427,15 @@ def _capture_output(
     )
 
 
+@dataclass(eq=False)
+class _AdmissionTicket:
+    """A request's place in the admission queue. Compared by identity; the
+    kind is kept so a slot-less reserver can tell whether only the slot cap
+    holds the tickets ahead of it (`CommandExecutor._admit`)."""
+
+    takes_slot: bool
+
+
 class CommandExecutor:
     ALLOWED_EXECUTABLES = broker_executables()
 
@@ -4287,6 +4447,7 @@ class CommandExecutor:
         scoped_pool: "scoped_sa_pool.ScopedServiceAccountPool | None | object" = _FROM_ENVIRONMENT,
         kubectl_timeout_seconds: int = DEFAULT_KUBECTL_TIMEOUT_SECONDS,
         max_concurrent_commands: int = DEFAULT_MAX_CONCURRENT_COMMANDS,
+        memory_limit_bytes: int | None = None,
     ) -> None:
         self.timeout_seconds = timeout_seconds
         self.kubectl_timeout_seconds = kubectl_timeout_seconds
@@ -4304,10 +4465,59 @@ class CommandExecutor:
         # refused as one that had just arrived.
         self._slot_condition = threading.Condition()
         self._slots_in_use = 0
-        self._slot_queue: collections.deque[object] = collections.deque()
+        self._slot_queue: collections.deque[_AdmissionTicket] = collections.deque()
         # The deadline the commands of the request on this thread share; set by
         # `request_slot` for as long as the slot is held, read by `_execute`.
         self._request_budget = threading.local()
+        # The child memory budget (design §2.2). None disables it: admission
+        # is then by slot alone, which is what every broker did before the
+        # budget and what a broker with no known limit still does. Derived in
+        # `serve` and handed in explicitly, never read here, so an executor a
+        # test constructs is budgeted only if the test says so.
+        self.memory_limit_bytes = memory_limit_bytes
+        self.children_budget_bytes: int | None = None
+        if memory_limit_bytes is not None:
+            self.children_budget_bytes = (
+                memory_limit_bytes - BROKER_RESIDENT_RESERVE_BYTES - CONTENT_WORKSPACE_RESERVE_BYTES
+            )
+        # Bytes reserved by admitted requests right now; guarded by
+        # `_slot_condition` like the slot count, because admission reads both.
+        self._reserved_bytes = 0
+        # The degenerate case (§2.3) warns once per process, not once per request.
+        self._budget_warned = False
+        floor = child_memory_budget_floor_bytes(max_output_bytes)
+        if memory_limit_bytes is not None and memory_limit_bytes < floor:
+            # Treated as absent: a budget that admits fewer than
+            # BUDGET_MINIMUM_ADMITTED_REQUESTS serialises every brokered
+            # command. `memory_limit_bytes` keeps the value read.
+            self.children_budget_bytes = None
+            LOGGER.warning(
+                "child memory budget disabled: the container limit of %d MiB is under the floor "
+                "of %d MiB at which the budget admits %d requests at once; admission is by slot "
+                "alone, as without a budget. Raise the proxy container's memory limit (on GKE "
+                "Autopilot without bursting, its memory request, which the limit follows).",
+                memory_limit_bytes // MEBIBYTE,
+                floor // MEBIBYTE,
+                BUDGET_MINIMUM_ADMITTED_REQUESTS,
+            )
+        elif self.children_budget_bytes is None:
+            LOGGER.info(
+                "child memory budget disabled: no container memory limit known (%s unset or not a "
+                "positive integer, and %s unreadable or unlimited); admission is by slot alone",
+                ENV_MEMORY_LIMIT_BYTES,
+                CGROUP_MEMORY_MAX_PATH,
+            )
+        else:
+            LOGGER.info(
+                "child memory budget enabled limit=%dMiB children=%dMiB child_reserve=%dMiB "
+                "request_cost=%dMiB (admits %d requests at once beside the slot cap of %d)",
+                memory_limit_bytes // MEBIBYTE,
+                self.children_budget_bytes // MEBIBYTE,
+                REQUEST_CHILD_MEMORY_RESERVE_BYTES // MEBIBYTE,
+                self._request_cost_bytes(takes_slot=True) // MEBIBYTE,
+                self.requests_the_budget_admits(),
+                max_concurrent_commands,
+            )
         self.state_dir = Path(state_dir)
         self.home_dir = self.state_dir / "home"
         self.workspace_dir = Path(
@@ -4404,6 +4614,9 @@ class CommandExecutor:
         # Serialises forge credential refreshes so concurrent callers do not
         # race on the global .gitconfig lock file or forge CLI state.
         self._forge_refresh_lock = threading.Lock()
+        # vcs verbs waiting for that lock, guarded by `_slot_condition`: a route
+        # refresher waiting for the budget under the lock yields it to them.
+        self._covered_refresh_waiter_count = 0
         self._last_forge_refresh: dict[str, tuple[float, frozenset[str]]] = {}
         self._last_forge_refresh_failure: dict[tuple[str, str], tuple[float, Exception]] = {}
         trusted_path = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
@@ -4543,8 +4756,47 @@ class CommandExecutor:
             return self._slots_in_use
 
     @property
+    def reserved_bytes(self) -> int:
+        """Bytes the admitted requests have reserved for their children right now."""
+        with self._slot_condition:
+            return self._reserved_bytes
+
+    def _request_cost_bytes(self, takes_slot: bool) -> int:
+        """What one more admitted request costs the budget: its child reserve,
+        plus the broker's own output allowance if it also takes a slot."""
+        cost = REQUEST_CHILD_MEMORY_RESERVE_BYTES
+        if takes_slot:
+            cost += OUTPUT_COPIES_PER_COMMAND * self.max_output_bytes
+        return cost
+
+    def _budget_in_use_text(self) -> str:
+        """The budget's use as `_fits_budget` counts it, for the refusal and
+        the wait log: reservations plus the output allowance of the slots in
+        use, so the figure printed is the figure the check compared. Called
+        under `_slot_condition`."""
+        output_allowance = OUTPUT_COPIES_PER_COMMAND * self.max_output_bytes * self._slots_in_use
+        return (
+            f"{(self._reserved_bytes + output_allowance) // MEBIBYTE} MiB in use of "
+            f"{(self.children_budget_bytes or 0) // MEBIBYTE} MiB: "
+            f"{self._reserved_bytes // MEBIBYTE} MiB reserved for children, "
+            f"{output_allowance // MEBIBYTE} MiB of output allowance for "
+            f"{self._slots_in_use} requests"
+        )
+
+    def requests_the_budget_admits(self) -> int | None:
+        """How many slot-taking requests fit the budget at once; None when it is off.
+
+        The number the startup line prints and the operator's sizing test
+        derives the same way, so the two can be compared.
+        """
+        if self.children_budget_bytes is None:
+            return None
+        return max(0, self.children_budget_bytes // self._request_cost_bytes(takes_slot=True))
+
+    @property
     def queued_requests(self) -> int:
-        """How many requests are waiting for a slot right now."""
+        """How many requests are waiting for admission right now, whether for a
+        slot or for room under the child memory budget."""
         with self._slot_condition:
             return len(self._slot_queue)
 
@@ -4562,7 +4814,13 @@ class CommandExecutor:
         callers rather than the cap. The other routes take no slot: the forge
         refresh is a short call to the minter, the content workspace's git is
         serialised by the store's own lock, and the Cloud API relay answers
-        from a bounded read of its own.
+        from a bounded read of its own. The forge refresh reserves child memory
+        without a slot when it will run its helper; the content workspace's git
+        takes neither a slot nor a reservation, because the store's lock
+        serialises it and the budget carries it as a fixed term
+        (`_outside_budget`). Admission also requires the request's child memory
+        reservation to fit the budget (`_fits_budget`), in the same queue and
+        under the same wait.
 
         Slots go in arrival order. The wait is woken every
         COMMAND_SLOT_POLL_SECONDS at the latest and `caller`, when given, is
@@ -4582,51 +4840,238 @@ class CommandExecutor:
         end to end -- longer than the idle time Envoy allows the stream in
         front of the broker, which is sized against this one.
         """
+        with self._admit(takes_slot=True, caller=caller):
+            yield
+
+    @contextlib.contextmanager
+    def reserve_child_memory(
+        self,
+        caller: socket.socket | None = None,
+        yield_when: Callable[[], bool] | None = None,
+        deadline: float | None = None,
+    ) -> Iterator[None]:
+        """Hold a child memory reservation without a slot, for a route that
+        spawns but holds no output (the forge refresh, §2.1). Same queue, same
+        wait, same refusal and hang-up handling as `request_slot` while the
+        budget is on, except that it is admitted past slot-takers the full
+        slot cap holds (`_admit`). With the budget off it takes no queue at all and only
+        marks the thread as covered, so `_execute` takes no transient
+        reservation; `caller`, `yield_when` and `deadline` are then unused.
+        `yield_when` and `deadline` are passed to `_admit`."""
+        with self._admit(
+            takes_slot=False, caller=caller, yield_when=yield_when, deadline=deadline
+        ):
+            yield
+
+    def _fits_budget(self, takes_slot: bool) -> bool:
+        """Whether one more request fits the child memory budget right now.
+
+        Called under `_slot_condition`. With the budget off, always. The
+        output term is charged for the slots that would be in use after this
+        admission, not for the cap, so two requests in flight are not billed
+        for eight. The degenerate case -- nothing admitted and this request
+        alone does not fit -- admits with a warning logged once per process:
+        otherwise a limit small enough to make the budget negative would
+        refuse every command forever, which is worse than the OOM it exists to
+        prevent (§2.3). The operator's sizing test keeps its own numbers off
+        this branch.
+        """
+        if self.children_budget_bytes is None:
+            return True
+        needed = (
+            self._reserved_bytes
+            + OUTPUT_COPIES_PER_COMMAND * self.max_output_bytes * self._slots_in_use
+            + self._request_cost_bytes(takes_slot)
+        )
+        if needed <= self.children_budget_bytes:
+            return True
+        if self._reserved_bytes == 0 and self._slots_in_use == 0:
+            if not self._budget_warned:
+                LOGGER.warning(
+                    "one request's cost of %d MiB exceeds the child memory budget of %d MiB "
+                    "(limit %d MiB); admitting it alone rather than refusing every command. "
+                    "Raise the container's memory limit.",
+                    needed // MEBIBYTE,
+                    self.children_budget_bytes // MEBIBYTE,
+                    (self.memory_limit_bytes or 0) // MEBIBYTE,
+                )
+                self._budget_warned = True
+            return True
+        return False
+
+    def _refusal_text(self, takes_slot: bool) -> str:
+        """Why a request still queued at the bound is refused, named for what
+        holds it now. Called under `_slot_condition`.
+
+        The budget when this request does not fit it; the slot cap when it
+        takes a slot and none is free. Otherwise this request fits and is
+        clear of the slot cap, and only the queue ahead of it holds it. With
+        the budget on, that queue is held by the budget: a slot-taker here has
+        a free slot, so what is ahead of it lacks only budget, and a slot-less
+        reserver is admitted past tickets the slot cap alone holds (`_admit`).
+        The text says so, and never that this request waited without fitting.
+        """
+        slots_full = self._slots_in_use >= self.max_concurrent_commands
+        # With nothing admitted `_fits_budget` would take its degenerate
+        # branch and log; this request fits trivially then anyway.
+        nothing_admitted = self._reserved_bytes == 0 and self._slots_in_use == 0
+        fits = nothing_admitted or self._fits_budget(takes_slot)
+        if not fits:
+            return (
+                f"the credential proxy is at its child memory budget "
+                f"({self._budget_in_use_text()}) and this request "
+                f"waited {COMMAND_SLOT_WAIT_SECONDS}s without fitting; retry shortly"
+            )
+        if takes_slot and slots_full:
+            # Worded for the queue: slots may well have freed in the meantime
+            # and gone to earlier arrivals, so "none finished" would be false
+            # for a request that was overtaken rather than starved.
+            return (
+                f"the credential proxy is at its limit of "
+                f"{self.max_concurrent_commands} concurrent commands and this "
+                f"request waited {COMMAND_SLOT_WAIT_SECONDS}s without reaching a "
+                f"free slot; retry shortly"
+            )
+        if self.children_budget_bytes is not None:
+            holder = f"waiting for its child memory budget ({self._budget_in_use_text()})"
+        else:
+            holder = f"waiting on its limit of {self.max_concurrent_commands} concurrent commands"
+        return (
+            f"the credential proxy's admission queue is held by requests {holder} and this "
+            f"request waited {COMMAND_SLOT_WAIT_SECONDS}s behind them; retry shortly"
+        )
+
+    @contextlib.contextmanager
+    def _outside_budget(self) -> Iterator[None]:
+        """Spawns inside this block are the content workspace's, covered by
+        the fixed CONTENT_WORKSPACE_RESERVE_BYTES term rather than a
+        reservation (§2.1): the store's lock is the bound and the reserve is
+        its size, and a wait for admission under that lock would stall every
+        verb behind it, reads included."""
+        previous = getattr(self._request_budget, "exempt", False)
+        self._request_budget.exempt = True
+        try:
+            yield
+        finally:
+            self._request_budget.exempt = previous
+
+    def _only_the_slot_cap_holds_ahead_of(self, ticket: _AdmissionTicket) -> bool:
+        """Whether every ticket ahead of `ticket` takes a slot while the slots
+        are full. Those wait on the slot cap, not the budget, so a slot-less
+        reserver admitted past them takes nothing they are waiting for (§2.3).
+        Called under `_slot_condition`."""
+        if self._slots_in_use < self.max_concurrent_commands:
+            return False
+        for ahead in self._slot_queue:
+            if ahead is ticket:
+                return True
+            if not ahead.takes_slot:
+                return False
+        return False
+
+    @contextlib.contextmanager
+    def _admit(
+        self,
+        takes_slot: bool,
+        caller: socket.socket | None,
+        yield_when: Callable[[], bool] | None = None,
+        deadline: float | None = None,
+    ) -> Iterator[None]:
+        """Admit one request: a slot if `takes_slot`, and a child memory
+        reservation whenever the budget is on. One arrival-order queue for
+        both kinds, with one exception: a slot-less reserver that fits the
+        budget is admitted past tickets ahead of it that are all slot-takers
+        held by a full slot cap, because it competes with them for nothing.
+        Behind a ticket the budget holds, order is kept, since a reserver
+        admitted first would take budget that ticket is waiting for. With the
+        budget off a slot-less reserver has nothing to wait for and skips the
+        queue, as the routes that take no slot always have.
+
+        `yield_when`, if given, is called under `_slot_condition` each time the
+        wait wakes; when it returns true the request leaves the queue
+        unadmitted with AdmissionYielded, before anything is reserved.
+        `deadline`, if given, is the monotonic time the wait is refused at, in
+        place of COMMAND_SLOT_WAIT_SECONDS from entry; the refusal text is the
+        same here, and the one caller that passes it, a route refresher's
+        reservation after its yield, rewords it (`_refresh_under_lock`)."""
+        if not takes_slot and self.children_budget_bytes is None:
+            previously_reserved = getattr(self._request_budget, "reserved", False)
+            try:
+                self._request_budget.reserved = True
+                yield
+            finally:
+                self._request_budget.reserved = previously_reserved
+            return
         queued_at = time.monotonic()
-        deadline = queued_at + COMMAND_SLOT_WAIT_SECONDS
-        ticket = object()
+        if deadline is None:
+            deadline = queued_at + COMMAND_SLOT_WAIT_SECONDS
+        ticket = _AdmissionTicket(takes_slot)
+        # Set if this slot-taking request ever found the slot cap full while it
+        # waited. The wait log names the slot cap only then; otherwise, with the
+        # budget on, what held it was the budget, directly or through the
+        # budget-held tickets ahead of it.
+        saw_slots_full = False
         with self._slot_condition:
             self._slot_queue.append(ticket)
             try:
-                while not (
-                    self._slot_queue[0] is ticket
-                    and self._slots_in_use < self.max_concurrent_commands
-                ):
+                while True:
+                    eligible = self._slot_queue[0] is ticket or (
+                        not takes_slot and self._only_the_slot_cap_holds_ahead_of(ticket)
+                    )
+                    slot_free = (not takes_slot) or self._slots_in_use < self.max_concurrent_commands
+                    if eligible and slot_free and self._fits_budget(takes_slot):
+                        break
+                    if takes_slot and self._slots_in_use >= self.max_concurrent_commands:
+                        saw_slots_full = True
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
-                        # Worded for the queue: slots may well have freed in
-                        # the meantime and gone to earlier arrivals, so "none
-                        # finished" would be false for a request that was
-                        # overtaken rather than starved.
-                        raise CommandSlotUnavailable(
-                            f"the credential proxy is at its limit of "
-                            f"{self.max_concurrent_commands} concurrent commands and this "
-                            f"request waited {COMMAND_SLOT_WAIT_SECONDS}s without reaching a "
-                            f"free slot; retry shortly"
-                        )
+                        raise CommandSlotUnavailable(self._refusal_text(takes_slot))
                     self._slot_condition.wait(min(COMMAND_SLOT_POLL_SECONDS, remaining))
                     if caller is not None and _caller_has_gone(caller):
-                        raise CallerHungUp("the caller disconnected while queued for a slot")
-                self._slots_in_use += 1
+                        held_by_slots = takes_slot and (
+                            saw_slots_full or self.children_budget_bytes is None
+                        )
+                        raise CallerHungUp(
+                            "the caller disconnected while queued for "
+                            + ("a slot" if held_by_slots else "the memory budget")
+                        )
+                    if yield_when is not None and yield_when():
+                        raise AdmissionYielded("another caller needs to go first")
+                if takes_slot:
+                    self._slots_in_use += 1
+                reserved = REQUEST_CHILD_MEMORY_RESERVE_BYTES if self.children_budget_bytes is not None else 0
+                self._reserved_bytes += reserved
             finally:
                 # Admitted or leaving, the ticket comes out and the next in
                 # line is woken to look again.
                 self._slot_queue.remove(ticket)
                 self._slot_condition.notify_all()
-        self._request_budget.deadline = time.monotonic() + self.timeout_seconds
+        previously_reserved = getattr(self._request_budget, "reserved", False)
         try:
+            if takes_slot:
+                self._request_budget.deadline = time.monotonic() + self.timeout_seconds
+            self._request_budget.reserved = True
             waited_ms = int((time.monotonic() - queued_at) * MILLISECONDS_PER_SECOND)
             if waited_ms >= COMMAND_SLOT_WAIT_LOG_MS:
-                LOGGER.info(
-                    "request waited %dms for a slot (all %d slots were busy)",
-                    waited_ms,
-                    self.max_concurrent_commands,
-                )
+                if self.children_budget_bytes is not None and not saw_slots_full:
+                    with self._slot_condition:
+                        in_use = self._budget_in_use_text()
+                    LOGGER.info("request waited %dms for memory budget (%s)", waited_ms, in_use)
+                else:
+                    LOGGER.info(
+                        "request waited %dms for a slot (all %d slots were busy)",
+                        waited_ms,
+                        self.max_concurrent_commands,
+                    )
             yield
         finally:
-            self._request_budget.deadline = None
+            self._request_budget.reserved = previously_reserved
+            if takes_slot:
+                self._request_budget.deadline = None
             with self._slot_condition:
-                self._slots_in_use -= 1
+                if takes_slot:
+                    self._slots_in_use -= 1
+                self._reserved_bytes -= reserved
                 self._slot_condition.notify_all()
 
     def bootstrap(self, command: str) -> None:
@@ -4801,8 +5246,13 @@ class CommandExecutor:
         Slots are a request's, not a command's (`request_slot`), so a helper
         takes none of its own: it runs inside whichever request needed it -- a
         vcs verb refreshing its credential -- or, from the refresh route and
-        the cron behind it, inside none. It is a short call to the minter
-        either way, not a listing.
+        the cron behind it, inside none. A call that no reservation covers
+        takes a transient one in `_execute` for the helper's lifetime; on the
+        refresh route, which the cron reaches over HTTP
+        (github_token_refresh.py), `refresh_forge_credential` takes the
+        refresh lock first, reserves under it for the helper it will run, and
+        yields the lock to a vcs verb that needs a refresh while it waits.
+        It is a short call to the minter either way, not a listing.
         """
         return self._execute(argv, cwd=cwd)
 
@@ -4824,7 +5274,7 @@ class CommandExecutor:
 
         Three things are enforced here rather than assumed:
 
-        * the subcommand is one of the twelve this product issues, checked
+        * the subcommand is one of `WORKSPACE_GIT_SUBCOMMANDS`, checked
           against the argv as parsed rather than as composed, so a later edit
           that threads a caller's string into one of these vectors is refused
           instead of run;
@@ -4857,12 +5307,13 @@ class CommandExecutor:
                 f"`git {subcommand}` is not one of the subcommands the broker "
                 "issues on its own behalf"
             )
-        return self._execute(
-            [executable_path, *argv[1:]],
-            cwd=str(cwd),
-            containment_root=self.content_workspace_root,
-            extra_config=tuple(config),
-        )
+        with self._outside_budget():
+            return self._execute(
+                [executable_path, *argv[1:]],
+                cwd=str(cwd),
+                containment_root=self.content_workspace_root,
+                extra_config=tuple(config),
+            )
 
     def execute_vcs_git(
         self,
@@ -4874,8 +5325,8 @@ class CommandExecutor:
         """git the version-control broker issues, in its own scratch tree.
 
         A third door rather than a widening of the second. The broker needs
-        `bundle`, `init`, `remote` and `ls-remote`, which content-passing does
-        not, and putting them on one list would grant each path the other's
+        `bundle`, `init` and `remote`, which content-passing does not, and
+        putting them on one list would grant each path the other's
         subcommands for no reason beyond sharing a method.
 
         `config` is what the forge's credential asked for on this invocation --
@@ -4965,6 +5416,18 @@ class CommandExecutor:
         return self._forge_refresh_lock
 
     @property
+    def _covered_refresh_waiters(self) -> int:
+        """vcs verbs waiting for `_refresh_lock`; read and written under
+        `_slot_condition`."""
+        if getattr(self, "_covered_refresh_waiter_count", None) is None:
+            self._covered_refresh_waiter_count = 0
+        return self._covered_refresh_waiter_count
+
+    @_covered_refresh_waiters.setter
+    def _covered_refresh_waiters(self, count: int) -> None:
+        self._covered_refresh_waiter_count = count
+
+    @property
     def _refresh_cache(self) -> dict[str, tuple[float, frozenset[str]]]:
         if getattr(self, "_last_forge_refresh", None) is None:
             self._last_forge_refresh = {}
@@ -4984,7 +5447,9 @@ class CommandExecutor:
         """
         return getattr(getattr(self, "_request_budget", None), "deadline", None)
 
-    def refresh_forge_credential(self, provider: str, repository: str) -> None:
+    def refresh_forge_credential(
+        self, provider: str, repository: str, caller: socket.socket | None = None
+    ) -> None:
         """Make this install's credential for `repository` current, or raise.
 
         The privileged operation a `BrokeredCredential` names and does not
@@ -4996,6 +5461,41 @@ class CommandExecutor:
         Whether the repository is one this install acts on is settled here too,
         for the reason `_repository_is_permitted` gives: this is the call that
         spends the token, so it is the call that has to ask.
+
+        Where the budget is charged (§2.1): called from inside a vcs request,
+        this runs under that request's reservation and takes none. It reads
+        the coalesce cache first without the lock, and otherwise waits for the
+        lock as long as it takes. Called from the refresh route, which
+        holds no slot, it reads the coalesce cache first without the lock --
+        the common case for the sandbox `gh` wrapper and the fleet-audit skill,
+        which call it before every credentialed step -- and re-raises a failure
+        recorded since it arrived. Otherwise it takes the lock first, watched
+        like admission: CommandSlotUnavailable once COMMAND_SLOT_WAIT_SECONDS
+        have passed since arrival, CallerHungUp when `caller`, the route's
+        connection, hangs up. Under the lock it repeats both checks, and only
+        then, with the budget on, reserves for the helper it is about to run,
+        on the reservation's own clock. So only the caller that runs the helper
+        ever holds a reservation; every other refresher waits on the lock
+        holding nothing and coalesces on the result. A route holder waiting for
+        the budget yields the lock to a vcs verb that needs a refresh: the
+        verb's reservation already covers the helper, so it runs it, while the
+        route caller waits for the verb to hold the lock, queues behind it, and
+        coalesces on its result -- both waits on one bound of
+        COMMAND_SLOT_WAIT_SECONDS from the yield, since the budget wait ran on
+        its own clock and may have spent the arrival bound. Otherwise the knot would hold until the route
+        caller's refusal: the verb waits on the lock, and the holder waits for
+        budget the verb holds. It yields once: a caller whose re-check is
+        still stale after the yield (the verb refreshed another org, or its
+        helper timed out) reserves on what remains of the yield bound and does
+        not yield again: a vcs verb that counts itself during that second wait
+        holds the budget the wait needs, so the caller steps aside for good,
+        told busy, and the verb runs the helper under its own reservation.
+        A second route refresher still waits on the lock unreserved. A route caller refused past that bound is told it stepped
+        aside, with the seconds it spent since arrival, not the lock-wait
+        text. A refresher behind a
+        helper that runs past the bound is told busy even though the helper
+        lands the token seconds later; the client reports a failed refresh,
+        and its next call coalesces on the fresh token.
         """
         helper = self._forge_helper(provider)
         forge = _provider_forge(provider)
@@ -5008,18 +5508,239 @@ class CommandExecutor:
         org = clean_repo.split("/", 1)[0] if "/" in clean_repo else clean_repo
         failure_key = (provider, org)
         queued_at = time.monotonic()
-        with self._refresh_lock:
-            now = time.monotonic()
-            current = self._refresh_cache.get(provider)
-            if current is not None:
-                last_refresh, cached_scoped = current
-                if clean_repo in cached_scoped and (now - last_refresh) < FORGE_REFRESH_COALESCE_SECONDS:
-                    return
-            failure = self._refresh_failure_cache.get(failure_key)
-            if failure is not None:
-                failed_at, exc = failure
-                if failed_at >= queued_at:
-                    raise exc
+        # getattr: an executor built without `__init__`, as the lock and caches
+        # below allow for, has no budget and nothing reserved.
+        request_budget = getattr(self, "_request_budget", None)
+        covered = getattr(request_budget, "reserved", False) or getattr(
+            request_budget, "exempt", False
+        )
+        if covered:
+            if self._refresh_is_current(provider, clean_repo):
+                return
+            # Counted while waiting, so a route holder parked in the budget
+            # wait yields the lock; uncounted only once acquired, so a count
+            # of zero means every such verb holds or has held it.
+            with self._slot_condition:
+                self._covered_refresh_waiters += 1
+                self._slot_condition.notify_all()
+            try:
+                self._refresh_lock.acquire()
+            finally:
+                with self._slot_condition:
+                    self._covered_refresh_waiters -= 1
+                    self._slot_condition.notify_all()
+            try:
+                self._refresh_under_lock(
+                    provider, helper, repository, clean_repo, failure_key, queued_at
+                )
+            finally:
+                self._refresh_lock.release()
+            return
+        if self._refresh_is_current(provider, clean_repo):
+            return
+        failure = self._refresh_failure_cache.get(failure_key)
+        if failure is not None and failure[0] >= queued_at:
+            raise failure[1]
+        budget_on = getattr(self, "children_budget_bytes", None) is not None
+        self._acquire_refresh_lock(provider, queued_at + COMMAND_SLOT_WAIT_SECONDS, caller)
+        holding = True
+        try:
+            if self._refresh_under_lock(
+                provider, helper, repository, clean_repo, failure_key, queued_at,
+                reserve=budget_on, caller=caller,
+            ):
+                # A vcs verb, admitted and covered, needs the lock: it runs the
+                # helper under its own reservation. Hand it the lock, wait until
+                # it holds it, and queue behind it to coalesce on its result,
+                # on a bound of its own from the yield: the budget wait ran on
+                # its own clock and may have spent the arrival bound.
+                self._refresh_lock.release()
+                holding = False
+                yield_deadline = time.monotonic() + COMMAND_SLOT_WAIT_SECONDS
+                self._await_covered_refreshers(
+                    provider, yield_deadline, caller, yielded_since=queued_at
+                )
+                self._acquire_refresh_lock(
+                    provider, yield_deadline, caller, yielded_since=queued_at
+                )
+                holding = True
+                # One yield. If the re-check is still stale -- the verb
+                # refreshed another org, or its helper timed out -- the second
+                # budget wait runs on what remains of the yield bound, so the
+                # whole wait stays inside the three bounds the client's timeout
+                # is derived from; and it does not yield again: a verb that
+                # counts itself during it holds the budget it needs, so the
+                # caller is refused as stepped aside and the lock goes to the
+                # verb, rather than being held against it to the deadline.
+                self._refresh_under_lock(
+                    provider, helper, repository, clean_repo, failure_key, queued_at,
+                    reserve=budget_on, caller=caller,
+                    deadline=yield_deadline, allow_yield=False,
+                )
+        finally:
+            if holding:
+                self._refresh_lock.release()
+
+    def _acquire_refresh_lock(
+        self,
+        provider: str,
+        deadline: float,
+        caller: socket.socket | None,
+        *,
+        yielded_since: float | None = None,
+    ) -> None:
+        """Take `_refresh_lock` for a route caller: in COMMAND_SLOT_POLL_SECONDS
+        pieces, raising CallerHungUp if `caller` hangs up and
+        CommandSlotUnavailable once `deadline` passes -- with the yielded text
+        when `yielded_since`, the arrival of a caller re-taking the lock after
+        stepping aside for a vcs verb, is set."""
+        if self._refresh_lock.acquire(blocking=False):
+            return
+        while not self._refresh_lock.acquire(
+            timeout=max(0.0, min(COMMAND_SLOT_POLL_SECONDS, deadline - time.monotonic()))
+        ):
+            if caller is not None and _caller_has_gone(caller):
+                raise CallerHungUp(REFRESH_LOCK_HUNG_UP_TEXT)
+            if time.monotonic() >= deadline:
+                raise CommandSlotUnavailable(self._refresh_lock_wait_text(provider, yielded_since))
+
+    @staticmethod
+    def _refresh_lock_wait_text(
+        provider: str,
+        yielded_since: float | None = None,
+        budget_in_use: str | None = None,
+    ) -> str:
+        """The refusal for a route refresher that waited out its bound: for the
+        refresh lock before reserving, or -- `yielded_since` set -- after
+        stepping aside for a vcs verb, a wait that also spent the budget wait,
+        so it names the seconds actually spent since that arrival. With
+        `budget_in_use` too, the post-yield reservation was what refused, and
+        the budget's figures follow."""
+        if yielded_since is not None:
+            seconds = int(time.monotonic() - yielded_since)
+            if budget_in_use is not None:
+                return REFRESH_YIELDED_BUDGET_WAIT_TEXT.format(
+                    provider=provider, seconds=seconds, budget_in_use=budget_in_use
+                )
+            return REFRESH_YIELDED_WAIT_TEXT.format(provider=provider, seconds=seconds)
+        return REFRESH_LOCK_WAIT_TEXT.format(provider=provider, seconds=COMMAND_SLOT_WAIT_SECONDS)
+
+    def _await_covered_refreshers(
+        self,
+        provider: str,
+        deadline: float,
+        caller: socket.socket | None,
+        *,
+        yielded_since: float | None = None,
+    ) -> None:
+        """Wait until every vcs verb counted in `_covered_refresh_waiters`
+        holds or has held `_refresh_lock`, so a route caller that yielded it
+        does not re-take it first. Bounded, watched and worded like
+        `_acquire_refresh_lock`."""
+        with self._slot_condition:
+            while self._covered_refresh_waiters > 0:
+                if caller is not None and _caller_has_gone(caller):
+                    raise CallerHungUp(REFRESH_LOCK_HUNG_UP_TEXT)
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise CommandSlotUnavailable(
+                        self._refresh_lock_wait_text(provider, yielded_since)
+                    )
+                self._slot_condition.wait(min(COMMAND_SLOT_POLL_SECONDS, remaining))
+
+    def _refresh_is_current(self, provider: str, clean_repo: str) -> bool:
+        """The coalesce check, readable without the lock: the cache entry is a
+        tuple replaced whole, so a reader sees the old one or the new one."""
+        now = time.monotonic()
+        current = self._refresh_cache.get(provider)
+        if current is None:
+            return False
+        last_refresh, cached_scoped = current
+        return clean_repo in cached_scoped and (now - last_refresh) < FORGE_REFRESH_COALESCE_SECONDS
+
+    def _budget_in_use_text_locked(self) -> str:
+        """`_budget_in_use_text` taken under `_slot_condition`, for a refusal
+        built outside it."""
+        with self._slot_condition:
+            return self._budget_in_use_text()
+
+    def _refresh_under_lock(
+        self,
+        provider: str,
+        helper: Path,
+        repository: str,
+        clean_repo: str,
+        failure_key: tuple[str, str],
+        queued_at: float,
+        reserve: bool = False,
+        caller: socket.socket | None = None,
+        deadline: float | None = None,
+        allow_yield: bool = True,
+    ) -> bool:
+        """The serialised part of `refresh_forge_credential`, called with
+        `_refresh_lock` held: re-check the coalesce cache, honour the failure
+        memo, and run the helper -- under a child memory reservation taken
+        here, after both checks, when `reserve` is set, refused at `deadline`
+        when given.
+
+        True when the reservation wait yielded to a vcs verb waiting for the
+        lock and the helper did not run; the caller hands that verb the lock.
+        With `allow_yield` false -- the reservation after the one yield -- a
+        verb counting itself ends the attempt instead: CommandSlotUnavailable,
+        the stepped-aside text, so the lock is never held across a budget
+        wait against a verb that holds the budget. False otherwise.
+
+        With `deadline` given -- the reservation after a yield -- a refusal
+        says the caller stepped aside, with the seconds since `queued_at` and
+        the budget's figures, rather than `_admit`'s text, which names
+        COMMAND_SLOT_WAIT_SECONDS: the wait on this leg was shorter."""
+        if self._refresh_is_current(provider, clean_repo):
+            return False
+        failure = self._refresh_failure_cache.get(failure_key)
+        if failure is not None:
+            failed_at, exc = failure
+            if failed_at >= queued_at:
+                raise exc
+        with contextlib.ExitStack() as admission:
+            if reserve:
+                try:
+                    admission.enter_context(
+                        self.reserve_child_memory(
+                            caller=caller,
+                            yield_when=lambda: self._covered_refresh_waiters > 0,
+                            deadline=deadline,
+                        )
+                    )
+                except AdmissionYielded as exc:
+                    # Raised only by `_admit`, before it admits, so this
+                    # catches the entry and nothing the helper raises.
+                    if allow_yield:
+                        return True
+                    # After the one yield: a vcs verb that holds the budget
+                    # this wait needs is waiting on the lock this caller
+                    # holds. Holding it to the deadline would be the knot the
+                    # yield exists to untie, so the caller steps aside for
+                    # good: the lock is released by the route, the verb runs
+                    # the helper under its own reservation, and the client is
+                    # told busy and retries, coalescing if the verb's token
+                    # was its own.
+                    raise CommandSlotUnavailable(
+                        self._refresh_lock_wait_text(
+                            provider,
+                            yielded_since=queued_at,
+                            budget_in_use=self._budget_in_use_text_locked(),
+                        )
+                    ) from exc
+                except CommandSlotUnavailable as exc:
+                    if deadline is None:
+                        raise
+                    raise CommandSlotUnavailable(
+                        self._refresh_lock_wait_text(
+                            provider,
+                            yielded_since=queued_at,
+                            budget_in_use=self._budget_in_use_text_locked(),
+                        )
+                    ) from exc
             try:
                 result = self._run_forge_helper(
                     provider, helper, [repository], "credential refresh", log_success=True
@@ -5041,6 +5762,7 @@ class CommandExecutor:
             if not scoped:
                 scoped = frozenset([clean_repo])
             self._refresh_cache[provider] = (time.monotonic(), scoped)
+        return False
 
     @staticmethod
     def _forge_helper(provider: str) -> Path:
@@ -5122,9 +5844,12 @@ class CommandExecutor:
             raise PermissionError(
                 f"{repository} is not a context repository of this install"
             )
-        result = self._run_forge_helper(
-            provider, helper, [FORGE_READ_ONLY_FLAG, repository], "read-only credential mint"
-        )
+        # Reached only from the store's `open` and `commit`, under its lock:
+        # the fixed workspace term covers it, as it does the store's git.
+        with self._outside_budget():
+            result = self._run_forge_helper(
+                provider, helper, [FORGE_READ_ONLY_FLAG, repository], "read-only credential mint"
+            )
         token = result.stdout.strip()
         if not token:
             raise RuntimeError("read-only credential mint returned no token")
@@ -5578,11 +6303,17 @@ class CommandExecutor:
         `caller` is the connection the command answers, if it answers one; see
         `_capture_output`. Internal callers leave it unset.
 
-        No concurrency slot is taken here. A slot is a request's, held by the
-        route from admission until the response is written (`request_slot`),
-        so every command a request runs -- the kubeconfig cache-fill made under
-        `_kubeconfig_lock` included -- is covered by the one its request holds,
-        and no lock is ever held while waiting for a slot.
+        No concurrency slot is taken here, and no reservation on a thread that
+        already holds one: a slot and a child memory reservation are a
+        request's, held by the route from admission until the response is
+        written (`request_slot`), so every command a request runs -- the
+        kubeconfig cache-fill made under `_kubeconfig_lock` included -- is
+        covered by the one its request holds, and no lock is held while waiting
+        for admission. The one exception is the refresh route, which holds
+        `_refresh_lock` across its budget wait and yields it to a vcs verb that
+        needs a refresh (`refresh_forge_credential`). While the budget is on, a thread that holds no
+        reservation and is not the store's takes a transient one for the
+        child's lifetime.
         """
         root = containment_root or self.workspace_dir
         command_cwd = root
@@ -5631,23 +6362,45 @@ class CommandExecutor:
             # back timed out rather than running past what the request was
             # allowed.
             effective_timeout = max(min(effective_timeout, request_deadline - time.monotonic()), 0)
-        started = time.monotonic()
-        process = subprocess.Popen(
-            argv,
-            cwd=command_cwd,
-            env=command_environment,
-            stdin=subprocess.PIPE if stdin is not None else subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            start_new_session=True,
+        # Every child the broker starts while serving comes through here, with
+        # two deliberate exemptions (design §2.1): the bootstrap command, which
+        # runs before the broker serves anything, and `_read_repo_alias`'s
+        # `git config`, a few hundred KB over in milliseconds. A thread that holds
+        # a reservation (a route admitted it) or runs the store's git (exempt,
+        # covered by the fixed term) spawns under that; any other thread takes
+        # a transient reservation for the child's lifetime, with the same wait
+        # and the same refusal, so a route that forgets to reserve is throttled
+        # rather than uncounted. A caller that reaches this point uncovered
+        # while holding a lock would wait for the budget under that lock,
+        # which is why every route reserves before it takes one -- except the
+        # refresh route, which reserves under the refresh lock and yields the
+        # lock to a vcs verb that needs it (`refresh_forge_credential`).
+        covered = getattr(self._request_budget, "reserved", False) or getattr(
+            self._request_budget, "exempt", False
         )
-        captured = _capture_output(
-            process,
-            stdin=stdin.encode("utf-8") if stdin is not None else None,
-            limit=self.max_output_bytes,
-            timeout=effective_timeout,
-            caller=caller,
+        admission = (
+            contextlib.nullcontext()
+            if covered or self.children_budget_bytes is None
+            else self.reserve_child_memory(caller=caller)
         )
+        with admission:
+            started = time.monotonic()
+            process = subprocess.Popen(
+                argv,
+                cwd=command_cwd,
+                env=command_environment,
+                stdin=subprocess.PIPE if stdin is not None else subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                start_new_session=True,
+            )
+            captured = _capture_output(
+                process,
+                stdin=stdin.encode("utf-8") if stdin is not None else None,
+                limit=self.max_output_bytes,
+                timeout=effective_timeout,
+                caller=caller,
+            )
         stdout_text, stdout_cut = _bounded_text(captured.stdout, self.max_output_bytes)
         stderr_text, stderr_cut = _bounded_text(captured.stderr, self.max_output_bytes)
         if captured.timed_out and argv and Path(argv[0]).name == "kubectl":
@@ -5680,7 +6433,11 @@ class CommandExecutor:
         return value[: self.max_output_bytes], True
 
 
-def build_workspace_store(executor: CommandExecutor, base_branch: str = ""):
+def build_workspace_store(
+    executor: CommandExecutor,
+    base_branch: str = "",
+    pinned_bases: Mapping[tuple[str, str], str] | None = None,
+):
     """The content-passing store, or None when the feature is off.
 
     Returning None rather than an inert object is deliberate: the handler tests
@@ -5711,12 +6468,17 @@ def build_workspace_store(executor: CommandExecutor, base_branch: str = ""):
         # `require_managed_workspace` gives: a bare name does not resolve once
         # the install serves a second forge.
         credential_for=lambda repository: _workspace_credential(registry, repository),
+        pinned_bases=pinned_bases,
     )
     LOGGER.info("content workspace enabled root=%s", executor.content_workspace_root)
     return store
 
 
-def build_vcs_broker(executor: CommandExecutor, base_branch: str = ""):
+def build_vcs_broker(
+    executor: CommandExecutor,
+    base_branch: str = "",
+    pinned_bases: Mapping[tuple[str, str], str] | None = None,
+):
     """The version-control broker. Always built; there is no switch.
 
     Unlike the content workspace this has no off state. It is the forge-neutral
@@ -5743,6 +6505,7 @@ def build_vcs_broker(executor: CommandExecutor, base_branch: str = ""):
         http_timeout=executor.timeout_seconds,
         http_max_bytes=executor.max_output_bytes,
         request_deadline=executor.request_deadline,
+        pinned_bases=pinned_bases,
     )
     LOGGER.info(
         "version control enabled root=%s forges=%s",
@@ -6410,6 +7173,10 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
     # answers 503.
     api_relay: GoogleApiRelay | None = None
     base_branch: str = ""
+    # (forge host, path) -> the base every proposal onto that repository must
+    # target, from `parse_pinned_bases`. Each pinned branch is also protected
+    # from a direct push, as `base_branch` is; see `providers.pinned_base`.
+    pinned_bases: Mapping[tuple[str, str], str] = {}
     # None unless CREDENTIAL_PROXY_CONTENT_WORKSPACE is on. While it is None the
     # /v1/workspace/* routes answer 404 — the same answer an older broker gives,
     # which is what lets a migrating client detect support by asking rather than
@@ -6955,19 +7722,21 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                 if result.kubeconfig:
                     response["kubeconfig"] = result.kubeconfig
                 self._json(HTTPStatus.OK, response)
-        except CallerHungUp:
+        except CallerHungUp as exc:
+            # The exception names what the request was queued for: a slot, or
+            # the child memory budget.
             self.metrics.record_tool(tool_label, subcommand_label, TOOL_STATUS_ABANDONED)
             LOGGER.info(
-                "command abandoned request_id=%s: the caller disconnected while queued "
-                "for a slot; the command was not started",
+                "command abandoned request_id=%s: %s; the command was not started",
                 request_id,
+                exc,
                 extra=audit(AUDIT_STATUS_ABANDONED),
             )
             return
         except CommandSlotUnavailable as exc:
             self.metrics.record_tool(tool_label, subcommand_label, TOOL_STATUS_BUSY)
             LOGGER.warning(
-                "command queued too long request_id=%s", request_id,
+                "command queued too long request_id=%s: %s", request_id, exc,
                 extra=audit(AUDIT_STATUS_BUSY),
             )
             self._busy(exc)
@@ -7482,7 +8251,27 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
             return
 
         try:
-            self.executor.refresh_forge_credential(forge.name, repository)
+            self.executor.refresh_forge_credential(
+                forge.name, repository, caller=getattr(self, "connection", None)
+            )
+        except CallerHungUp as exc:
+            # Queued for the refresh lock or the child memory budget, and
+            # gone before the helper ran: nothing to answer, as on the exec
+            # route. The exception names the wait.
+            LOGGER.info(
+                "%s credential refresh abandoned: %s; the helper was not started",
+                forge.name,
+                exc,
+            )
+            return
+        except CommandSlotUnavailable as exc:
+            # The bounded wait for the refresh lock, or the budget's refusal
+            # (§2.3): the same 503 the exec and vcs routes answer, rather than
+            # the generic branch's 502 that would read as a failed mint. The
+            # exception names which.
+            LOGGER.warning("%s credential refresh queued too long: %s", forge.name, exc)
+            self._busy(exc)
+            return
         except PermissionError:
             # `refresh_forge_credential` asks the managed list too, because the
             # in-process callers do not come through here. Reaching it from this
@@ -7593,10 +8382,9 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                         return
                 result = route(payload)
                 self._json(HTTPStatus.OK, result)
-        except CallerHungUp:
-            LOGGER.info(
-                "vcs %s abandoned: the caller disconnected while queued for a slot", verb
-            )
+        except CallerHungUp as exc:
+            # The exception names what the request was queued for.
+            LOGGER.info("vcs %s abandoned: %s", verb, exc)
             return
         except PermissionError:
             # `BrokeredCredential.ensure` lets this one through, and
@@ -7636,7 +8424,7 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
             # and the body is drained before the answer, or a caller still
             # sending a large one would see the connection reset in place of
             # the 503.
-            LOGGER.warning("command queued too long verb=%s", verb)
+            LOGGER.warning("command queued too long verb=%s: %s", verb, exc)
             drain_request_body(self, body_limit)
             self._busy(exc)
             return
@@ -7909,10 +8697,11 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
         return contextlib.nullcontext()
 
     def _busy(self, exc: CommandSlotUnavailable) -> None:
-        """Answer a broker at its concurrency cap, on whichever route asked.
+        """Answer a broker at its concurrency cap or child memory budget, on
+        whichever route asked.
 
-        Not a refusal of what was asked and not a fault: the command past the
-        cap is the one that would take the container over its memory limit.
+        Not a refusal of what was asked and not a fault: the command past
+        either bound is the one that would take the container over its memory limit.
         `error` is the key the shim prints, so the agent reads why rather than
         a bare exit 1, and `code` lets a caller tell "busy, retry" from a
         failure.
@@ -7958,6 +8747,106 @@ def reachable_off_pod(args: argparse.Namespace) -> bool:
         return True
     envoy_address = os.getenv("CREDENTIAL_PROXY_ENVOY_ADDRESS", "").strip()
     return bool(envoy_address) and envoy_address not in {"127.0.0.1", "::1", "localhost"}
+
+
+def parse_pinned_bases(raw: str) -> dict[tuple[str, str], str]:
+    """(forge host, path) -> pinned base, from --pinned-bases.
+
+    The operator renders the value from every repository in the PlatformAgent's
+    `spec.integration.repositories` that sets `baseBranch`, as a JSON array of
+    `{"repository": "https://<host>/<path>", "branch": "<name>"}`. A pin that
+    does not parse would match nothing and turn that repository's base off
+    without a word, so anything short of a clean parse is refused at boot like
+    any other bad boot value: malformed JSON, an entry without a stated host,
+    a repository no forge this install serves reads as one, a branch git would
+    not take, or one repository pinned twice.
+
+    Each repository is read the way a request for it is read: by the forge
+    whose hosts include the stated host, through that forge's own `parse`. It
+    is kept under that forge's canonical host and the path `parse` answers,
+    which is the pair `providers.pinned_base` is asked about, so another
+    spelling of the host (`www.github.com`) is the same pin and a path of a
+    depth the forge never reads (`https://github.com/acme`) is refused rather
+    than kept to match nothing. So is a path the forge reads as another
+    repository when it is asked for it (`foo.git.git`, which reads back as
+    `foo`).
+
+    The branch is kept in its one canonical spelling: a single leading
+    `refs/heads/` is removed, and a value that starts with `heads/`, or with
+    `refs/heads/` followed by `refs/heads/` or `heads/`, is refused. Every door
+    compares against the stored name as it is, so a pin is protected under
+    exactly the name proposals are told to target.
+    """
+    text = (raw or "").strip()
+    if not text:
+        return {}
+
+    def refuse(detail: str) -> RuntimeError:
+        return RuntimeError(
+            f"invalid --pinned-bases / CREDENTIAL_PROXY_PINNED_BASES: {detail}; "
+            'expected a JSON array of {"repository": "https://<host>/<path>", '
+            '"branch": "<name>"}'
+        )
+
+    try:
+        entries = json.loads(text)
+    except ValueError as exc:
+        raise refuse("not JSON") from exc
+    if not isinstance(entries, list):
+        raise refuse("not an array")
+    forges = providers.Registry().forges
+    pins: dict[tuple[str, str], str] = {}
+    seen: set[tuple[str, str]] = set()
+    for entry in entries:
+        if not isinstance(entry, dict):
+            raise refuse(f"{entry!r} is not an object")
+        repository, branch = entry.get("repository"), entry.get("branch")
+        ref = repo_ref.try_parse(repository)
+        if ref is None or not ref.host_stated:
+            raise refuse(f"{repository!r} is not a repository URL with a host")
+        host = ref.host.casefold()
+        forge = next(
+            (f for f in forges if host in (h.casefold() for h in f.hosts)), None
+        )
+        if forge is None:
+            raise refuse(
+                f"{repository!r} is on {ref.host}, which is not a host of any "
+                "forge this install serves"
+            )
+        canonical_host = forge.hosts[0]
+        try:
+            path = forge.parse(repository.strip())
+            again = forge.parse(f"https://{canonical_host}/{path}")
+        except providers.WorkspaceError as exc:
+            raise refuse(str(exc)) from exc
+        if again != path:
+            raise refuse(
+                f"{repository!r} names {path}, which {forge.name} reads as "
+                f"{again} when it is asked for, so no request could match it"
+            )
+        if isinstance(branch, str):
+            branch = branch.strip()
+            rest = (
+                branch[len(PINNED_BASE_REF_PREFIX):]
+                if branch.startswith(PINNED_BASE_REF_PREFIX)
+                else branch
+            )
+            if rest.startswith(PINNED_BASE_REFUSED_PREFIXES):
+                raise refuse(
+                    f"the branch of {repository}, {branch!r}, does not name one "
+                    "branch: give the bare name, or refs/heads/ once before it"
+                )
+            branch = rest
+        try:
+            branch = providers.validate_branch(branch, f"the branch of {repository}")
+        except providers.WorkspaceError as exc:
+            raise refuse(str(exc)) from exc
+        key = (canonical_host.casefold(), path.casefold())
+        if key in seen:
+            raise refuse(f"{repository} is pinned more than once")
+        seen.add(key)
+        pins[(canonical_host, path)] = branch
+    return pins
 
 
 def resolve_role() -> str:
@@ -8040,6 +8929,9 @@ def serve(args: argparse.Namespace) -> None:
         max_concurrent_commands=getattr(
             args, "max_concurrent_commands", DEFAULT_MAX_CONCURRENT_COMMANDS
         ),
+        # The container's limit, through the operator's Downward API variable
+        # or the cgroup file; None, and the budget is off (design §2.4).
+        memory_limit_bytes=child_memory_limit_bytes(cgroup_path=CGROUP_MEMORY_MAX_PATH),
     )
     executor.bootstrap(os.getenv("CREDENTIAL_PROXY_BOOTSTRAP_COMMAND", ""))
     CredentialProxyHandler.executor = executor
@@ -8049,11 +8941,20 @@ def serve(args: argparse.Namespace) -> None:
         or os.getenv("CREDENTIAL_PROXY_BASE_BRANCH", "")
         or os.getenv("GITOPS_BASE_BRANCH", "")
     ).strip()
+    CredentialProxyHandler.pinned_bases = parse_pinned_bases(
+        getattr(args, "pinned_bases", "") or ""
+    )
+    for (host, path), branch in CredentialProxyHandler.pinned_bases.items():
+        LOGGER.info("pinned base repository=https://%s/%s branch=%s", host, path, branch)
     CredentialProxyHandler.workspaces = build_workspace_store(
-        executor, base_branch=CredentialProxyHandler.base_branch
+        executor,
+        base_branch=CredentialProxyHandler.base_branch,
+        pinned_bases=CredentialProxyHandler.pinned_bases,
     )
     CredentialProxyHandler.vcs = build_vcs_broker(
-        executor, base_branch=CredentialProxyHandler.base_branch
+        executor,
+        base_branch=CredentialProxyHandler.base_branch,
+        pinned_bases=CredentialProxyHandler.pinned_bases,
     )
     CredentialProxyHandler.max_request_bytes = args.max_request_bytes
     CredentialProxyHandler.enforce_read_only = read_only_enforced()
@@ -8261,6 +9162,16 @@ def parse_args() -> argparse.Namespace:
             "CREDENTIAL_PROXY_BASE_BRANCH", os.getenv("GITOPS_BASE_BRANCH", "")
         ),
         help="Protected GitOps base branch that agents may not push to directly",
+    )
+    parser.add_argument(
+        "--pinned-bases",
+        default=os.getenv("CREDENTIAL_PROXY_PINNED_BASES", ""),
+        help=(
+            'JSON array of {"repository": "https://<host>/<path>", "branch": '
+            '"<name>"}: every proposal onto that repository must target that '
+            "branch, and no agent may push to it directly; unset leaves every "
+            "repository's own default in charge"
+        ),
     )
     return parser.parse_args()
 

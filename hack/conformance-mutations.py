@@ -1523,6 +1523,19 @@ Mutation(
         "next rename moves the constant and leaves the drop behind",
     ),
     Mutation(
+        "C1-reserved-principals-env-renamed-on-the-callout-side",
+        "a2a/cmd/authcallout/main.go",
+        ('envReservedPrincipals = "A2A_RESERVED_PRINCIPALS"',
+         'envReservedPrincipals = "A2A_STATIC_PRINCIPALS"'),
+        "test_C1_the_callouts_reserved_principals_env_is_spelled_the_same_in_both_modules",
+        "rename the callout's reserved-principals variable to say what the "
+        "names are, in the module that reads it. a2a builds and its tests set "
+        "the env by the same constant, so they stay green; the operator is not "
+        "rebuilt by this edit and goes on rendering A2A_RESERVED_PRINCIPALS. "
+        "The next callout rollout's pods exit with A2A_STATIC_PRINCIPALS is "
+        "required and never go Ready",
+    ),
+    Mutation(
         "C1-agent-principal-gets-a-static-password",
         "k8s-operator/internal/controller/platformagent_a2a_identities.go",
         ('\t\tuser:           a2aAgentBusUser,',

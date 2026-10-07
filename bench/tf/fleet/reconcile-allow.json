@@ -1,0 +1,7 @@
+[
+  {
+    "address": "google_container_node_pool.no_surge_pool",
+    "why": "seeded-b's no-surge pool is replaced, never updated in place, when the lagging minor rolls: an in-place update drains the node, the budget planted on it holds that drain for an hour and the provider times out at thirty minutes, while a delete does not respect the budget and the replace takes minutes (defects-b.tf, the pool's lifecycle comment; the README's pin paragraph)",
+    "standing": true
+  }
+]

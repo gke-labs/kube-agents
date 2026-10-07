@@ -902,6 +902,11 @@ type DeploymentSpec struct {
 	// +optional
 	Resources *corev1.ResourceRequirements `json:"resources,omitempty"`
 
+	// CredentialProxy configures the credential-proxy container, the broker that
+	// runs every credentialed command on the agent's behalf in a pod of its own.
+	// +optional
+	CredentialProxy *CredentialProxySpec `json:"credentialProxy,omitempty"`
+
 	// DefaultStorageClassName specifies the default storage class to use for the system and data PVCs.
 	// +optional
 	DefaultStorageClassName *string `json:"defaultStorageClassName,omitempty"`
@@ -911,6 +916,44 @@ type DeploymentSpec struct {
 	// +listMapKey=name
 	// +optional
 	Storages []StorageSpec `json:"storages,omitempty"`
+}
+
+// CredentialProxySpec configures the credential-proxy container.
+type CredentialProxySpec struct {
+	// Resources overrides the credential-proxy container's requests and limits.
+	// Each key set here replaces the operator's default for that key and the
+	// rest keep their defaults, unlike spec.deployment.resources, which replaces
+	// the agent container's block wholesale: a CR that sets only limits.memory
+	// keeps the default 500m CPU request, 1 CPU limit and 2Gi ephemeral-storage
+	// limit. The broker sizes how many commands it admits at once from the
+	// memory limit, so raising the limit is the one knob for an install whose
+	// fleet outgrows the default; the ephemeral-storage limit bounds the content
+	// workspace the broker clones into; the proxy's state and /tmp emptyDirs
+	// (sizeLimits 5Gi and 2Gi) follow it when it is raised above their
+	// defaults, so the kubelet does not evict the pod at the smaller figure.
+	// Only cpu, memory and ephemeral-storage
+	// are accepted, the quantities the container declares. The operator
+	// refuses a memory limit below what admits two commands at once, a request
+	// above its limit, a negative quantity and a zero limit; `claims` is refused, because the proxy
+	// pod declares no resourceClaims. A refused override, including an edit of
+	// one that was valid, renders the proxy Deployment at the operator's
+	// defaults, not at the last accepted override, until it is corrected,
+	// which on the proxy's Recreate Deployment restarts the proxy once; the
+	// operator reports Degraded with reason InvalidCredentialProxyResources
+	// when no higher-ranked Degraded cause is present, the agent staying
+	// Ready, whether or not the validating webhook is enabled. Where the
+	// webhook is on, it refuses the edit at apply and the running proxy is
+	// untouched. The webhook warns when memory per
+	// CPU on the requests pair leaves the band GKE Autopilot admits unchanged,
+	// because Autopilot then raises the smaller request into the band; it
+	// applies the band to requests only. It also warns for each of cpu and
+	// memory set under limits without the same key under requests, unless the
+	// limit equals the request it would be replaced by: Autopilot
+	// without bursting sets the limits equal to the requests, so there the
+	// proxy runs at the request and the limit has no effect. With bursting the
+	// declared limits stand.
+	// +optional
+	Resources *corev1.ResourceRequirements `json:"resources,omitempty"`
 }
 
 // StorageSpec defines custom PersistentVolumeClaim and volume mount configuration.
@@ -1458,6 +1501,7 @@ type ForgeSpec struct {
 
 // RepositorySpec declares one repository on a declared forge, and what the
 // agent does with it.
+// +kubebuilder:validation:XValidation:rule="!has(self.baseBranch) || size(self.baseBranch) == 0 || self.role != 'context'",message="baseBranch may not be set on a context repository: it is never written, and its branch pin is the ref in the gitops-state ConfigMap"
 type RepositorySpec struct {
 	// Forge is the name of the entry in Forges this repository lives on.
 	// +kubebuilder:validation:MinLength=1
@@ -1483,6 +1527,32 @@ type RepositorySpec struct {
 	// it writes to, "context" for one it only reads.
 	// +kubebuilder:validation:Enum=gitops;managed;context
 	Role string `json:"role"`
+
+	// BaseBranch is the branch every pull request onto this repository must
+	// target. The credential broker enforces it: it refuses a proposal onto
+	// any other branch, and a clone that names no branch checks it out. Empty
+	// means the repository's own default branch. It may be set on a "gitops"
+	// or a "managed" repository, not on a "context" one, which is never
+	// written and whose branch pin is the ref in the gitops-state ConfigMap.
+	// The deprecated GitHub alias has no place for it: pinning the GitOps
+	// repository's base takes Forges and Repositories.
+	//
+	// The schema holds it to the branch names the broker accepts
+	// (providers/validate.validate_branch), because the chart installs the
+	// operator with its webhook off. Like the broker, it also holds it to one
+	// spelling per branch, the name or refs/heads/ and the name: a value
+	// starting with heads/, or with refs/heads/ followed by refs/heads/ or
+	// heads/, is refused, because the broker would read it as another branch.
+	// +kubebuilder:validation:MaxLength=200
+	// +kubebuilder:validation:Pattern=`^$|^[A-Za-z0-9][A-Za-z0-9._/-]*$`
+	// +kubebuilder:validation:XValidation:rule="self != 'HEAD'",message="baseBranch may not be HEAD"
+	// +kubebuilder:validation:XValidation:rule="!self.startsWith('refs/heads/') || (self.matches('^refs/heads/[A-Za-z0-9]') && self != 'refs/heads/HEAD')",message="baseBranch after refs/heads/ must start with a letter or digit and may not be HEAD"
+	// +kubebuilder:validation:XValidation:rule="!self.startsWith('heads/')",message="baseBranch may not start with heads/: write the branch name, or refs/heads/ and the name"
+	// +kubebuilder:validation:XValidation:rule="!self.startsWith('refs/heads/refs/heads/') && !self.startsWith('refs/heads/heads/')",message="baseBranch may carry one refs/heads/ prefix, not refs/heads/ followed by refs/heads/ or heads/"
+	// +kubebuilder:validation:XValidation:rule="!self.contains('..') && !self.contains('/.') && !self.contains('//') && !self.contains('@{') && !self.contains('.lock/')",message="baseBranch must be a git branch name: no '..', '/.', '//', '@{' or '.lock/'"
+	// +kubebuilder:validation:XValidation:rule="!self.endsWith('/') && !self.endsWith('.') && !self.endsWith('.lock')",message="baseBranch must be a git branch name: it may not end in '/', '.' or '.lock'"
+	// +optional
+	BaseBranch string `json:"baseBranch,omitempty"`
 }
 
 // GitHubSpec contains the configuration for the GitHub integration.

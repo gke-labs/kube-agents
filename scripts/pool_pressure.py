@@ -108,6 +108,10 @@ FIXTURE_LOG_SUFFIX = ".txt"
 # cat -r` transfers only the range, so the head costs a round trip rather than a
 # download. Ten times that offset, for whatever the job prints before it leases.
 BUILD_LOG_HEAD_BYTES = 65536
+# The range ends on a byte count, so the cut can land inside a multi-byte
+# character (#2477). The banner lookup only needs the text before the cut.
+BUILD_LOG_ENCODING = "utf-8"
+BUILD_LOG_DECODE_ERRORS = "replace"
 
 # Every phase boundary in the presubmit's script prints a banner:
 #
@@ -139,6 +143,15 @@ SEGMENT_LABELS = (
 # than a median. A median over three of ninety runs is a wrong answer with a
 # number attached.
 SEGMENT_MIN_COVERAGE = 0.5
+
+# Whether the reader works now is judged on the newest builds the sweep saw,
+# not on a day or on the window: a day is empty at 01:00 and holds single
+# digits at a weekend, and a failure that starts today is a small share of a
+# week for days. Above this share of the newest UNREADABLE_SAMPLE_BUILDS
+# raising, the run is reported as unmeasured. Every unreadable build, however
+# old, is named and left out of the numbers (#2477).
+UNREADABLE_SAMPLE_BUILDS = 10
+UNREADABLE_SHARE_LIMIT = 0.5
 
 # What a segment prints in place of a median, and the two column widths the
 # breakdown is laid out on. The label column clears the longest label by a
@@ -533,7 +546,8 @@ class Source:
     Every source here is allowed to be missing. Conflating "read it, found
     nothing wrong" with "could not read it" is the specific mistake that turns a
     broken gauge into a green one, so the two are separate fields and the report
-    prints the second rather than skipping the line.
+    prints the second rather than skipping the line. Both can be set: a value
+    that is not a measurement, with the error saying why, keeps its counts.
     """
 
     def __init__(self, value=None, error: Optional[str] = None):
@@ -788,16 +802,23 @@ def _read_log_head(path: str) -> str:
     The return code is ignored here too, for a different reason: a log shorter
     than the range makes gcloud exit 1 with "Download not completed" after
     writing the whole object anyway. A build still running has no log at all.
+
+    Not run_cmd: its text mode decodes strictly, and a range cut inside a
+    character raised UnicodeDecodeError out of the sweep (#2477).
     """
-    _, out, _ = run_cmd(
-        [
-            "gcloud", "storage", "cat",
-            "-r", f"0-{BUILD_LOG_HEAD_BYTES - 1}",
-            f"{path}/{BUILD_LOG_ARTIFACT}",
-        ],
-        timeout=GCLOUD_TIMEOUT_SECONDS,
-    )
-    return out
+    cmd = [
+        "gcloud", "storage", "cat",
+        "-r", f"0-{BUILD_LOG_HEAD_BYTES - 1}",
+        f"{path}/{BUILD_LOG_ARTIFACT}",
+    ]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, timeout=GCLOUD_TIMEOUT_SECONDS)
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return ""
+    text = proc.stdout.decode(BUILD_LOG_ENCODING, errors=BUILD_LOG_DECODE_ERRORS)
+    # What text mode did: a bare \r ends a line, so a banner printed after a
+    # progress line still starts one for BANNER_PATTERN.
+    return text.replace("\r\n", "\n").replace("\r", "\n")
 
 
 def _wait_from_gcs(path: str) -> Optional[Wait]:
@@ -807,6 +828,18 @@ def _wait_from_gcs(path: str) -> Optional[Wait]:
     # The second round trip is only worth spending once the build is known to
     # have produced a usable prowjob.json.
     return wait_from_prowjob(prowjob, started, _read_log_head(path))
+
+
+def _read_wait(path: str) -> Tuple[Optional[Wait], Optional[str]]:
+    """_wait_from_gcs with a failing build reported rather than raised.
+
+    pool.map re-raises a worker's exception at the caller, so without this one
+    unreadable log ended the sweep with no output at all (#2477).
+    """
+    try:
+        return _wait_from_gcs(path), None
+    except Exception as exc:
+        return None, f"{type(exc).__name__}: {exc}"
 
 
 class Sweep:
@@ -824,12 +857,16 @@ class Sweep:
         elapsed_seconds: float,
         window_start: datetime,
         truncated: bool = False,
+        unreadable: Optional[List[Dict[str, str]]] = None,
     ):
         self.waits = waits
         self.builds_read = builds_read
         self.elapsed_seconds = elapsed_seconds
         self.window_start = window_start
         self.truncated = truncated
+        # Builds whose read raised, each as {"build_id", "error"}; counted in
+        # builds_read, left out of waits.
+        self.unreadable = unreadable or []
 
 
 def collect_waits(
@@ -867,21 +904,22 @@ def collect_waits(
         if not entries:
             return Source(error=f"the build index at {GCS_BUILD_INDEX} is empty")
 
-        candidates: Dict[str, List[str]] = {}
-        for build_id, path in entries.items():
+        candidates: Dict[str, List[int]] = {}
+        for build_id in entries:
             moment = snowflake_time(build_id)
             if (
                 window_start - SNOWFLAKE_SLACK
                 <= moment
                 <= window_end + SNOWFLAKE_SLACK
             ):
-                candidates.setdefault(moment.strftime(DATE_FORMAT), []).append(path)
+                candidates.setdefault(moment.strftime(DATE_FORMAT), []).append(build_id)
         if not candidates:
             return Source(
                 value=Sweep([], 0, time.monotonic() - began, window_start)
             )
 
         collected: List[Wait] = []
+        unreadable: List[Dict[str, str]] = []
         read = 0
         done: List[str] = []
         truncated = False
@@ -890,9 +928,13 @@ def collect_waits(
                 if time.monotonic() - began > deadline_seconds:
                     truncated = True
                     break
-                for wait in pool.map(_wait_from_gcs, sorted(candidates[day])):
+                builds = sorted(candidates[day])
+                paths = [entries[build] for build in builds]
+                for build, (wait, error) in zip(builds, pool.map(_read_wait, paths)):
                     read += 1
-                    if wait is not None:
+                    if error is not None:
+                        unreadable.append({"build_id": str(build), "error": error})
+                    elif wait is not None:
                         collected.append(wait)
                 done.append(day)
 
@@ -909,9 +951,27 @@ def collect_waits(
         )
 
     waits = [w for w in collected if measured_start <= w.created <= window_end]
-    return Source(
-        value=Sweep(waits, read, time.monotonic() - began, measured_start, truncated)
+    sweep = Sweep(
+        waits, read, time.monotonic() - began, measured_start, truncated, unreadable
     )
+    # Before the per-build catch this input crashed the job red; it must not
+    # come out as a quiet window. The sweep travels with the error so what did
+    # read is still reported, under the unmeasured verdict.
+    # Builds after the window are read for the slack and dropped above; on an
+    # --as-of replay they would otherwise be the newest ten.
+    errors = {u["build_id"]: u["error"] for u in unreadable}
+    newest = sorted(
+        (b for day in done for b in candidates[day] if snowflake_time(b) <= window_end),
+        reverse=True,
+    )[:UNREADABLE_SAMPLE_BUILDS]
+    bad = [str(build) for build in newest if str(build) in errors]
+    if len(bad) > len(newest) * UNREADABLE_SHARE_LIMIT:
+        return Source(
+            value=sweep,
+            error=f"{len(bad)} of the newest {len(newest)} builds could not be read; "
+            f"first, build {bad[0]}: {errors[bad[0]]}",
+        )
+    return Source(value=sweep)
 
 
 def _read_optional_json(path: Path) -> Optional[dict]:
@@ -923,7 +983,8 @@ def _read_optional_json(path: Path) -> Optional[dict]:
 
 def _read_optional_text(path: Path) -> str:
     try:
-        return path.read_text(encoding="utf-8")
+        # The same tolerance as _read_log_head: a fixture is cut at the same range.
+        return path.read_text(encoding=BUILD_LOG_ENCODING, errors=BUILD_LOG_DECODE_ERRORS)
     except OSError:
         return ""
 
@@ -1270,7 +1331,9 @@ def summarise(
     the split matters: a notification that says only "exit 1" makes the reader
     go and run the check again, so the numbers have to travel with it.
     """
-    sweep: Optional[Sweep] = trend.value if trend.ok else None
+    # A sweep whose newest builds could not be read travels with its error:
+    # the builds that did read are still reported, under that verdict.
+    sweep: Optional[Sweep] = trend.value
     waits = sweep.waits if sweep else []
     rows = daily_rows(waits)
     breached_days = [r for r in rows if r.breached(p50_limit, p95_limit)]
@@ -1335,6 +1398,7 @@ def summarise(
             ).strftime(TIMESTAMP_FORMAT),
             "truncated": bool(sweep and sweep.truncated),
             "builds_read": sweep.builds_read if sweep else 0,
+            "unreadable": sweep.unreadable if sweep else [],
             "elapsed_seconds": round(sweep.elapsed_seconds, 1) if sweep else 0.0,
             "segments": segment_breakdown(waits),
             "days": [
@@ -1408,7 +1472,13 @@ def render(summary: dict) -> str:
     out.append(f" {summary['window_start']}  ->  {summary['window_end']}")
     out.append("=" * REPORT_WIDTH)
 
-    if not trend["read"]:
+    if not trend["read"] and trend["days"]:
+        out.append(
+            f"\n[?] The newest builds could not be read, so this run is not a"
+            f" measurement: {trend['error']}\n    The numbers below are over the"
+            " builds that did read."
+        )
+    elif not trend["read"]:
         out.append(f"\n[?] Trend not measured: {trend['error']}")
 
     if trend["truncated"]:
@@ -1416,6 +1486,13 @@ def render(summary: dict) -> str:
             f"\n[!] The sweep ran out of time and covers {trend['window_start']}"
             " onward,\n    not the whole window above. Older days are missing"
             " from the table, not empty."
+        )
+
+    if trend["unreadable"]:
+        names = ", ".join(u["build_id"] for u in trend["unreadable"])
+        out.append(
+            f"\n[!] {len(trend['unreadable'])} build(s) could not be read and are"
+            f" left out of the numbers: {names}"
         )
 
     if trend["days"]:
@@ -1543,8 +1620,13 @@ def render(summary: dict) -> str:
 
     out.append("\n" + "-" * REPORT_WIDTH)
     if summary["verdict"] == VERDICT_UNMEASURED:
-        out.append("COULD NOT MEASURE. The thresholds were not crossed because the wait")
-        out.append("was never read. This is not a green run.")
+        if trend["days"]:
+            out.append("COULD NOT MEASURE. The newest builds could not be read, so the current")
+            out.append("wait is unknown; the numbers above are over the builds that did read.")
+        else:
+            out.append("COULD NOT MEASURE. The thresholds were not crossed because the wait")
+            out.append("was not measured.")
+        out.append("This is not a green run.")
         out.append("-" * REPORT_WIDTH)
         return "\n".join(out)
 
@@ -1881,7 +1963,7 @@ def main() -> int:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Exit codes:\n"
-            "  0  every wait measured, nothing over threshold\n"
+            "  0  the window measured, nothing over threshold\n"
             "  1  a threshold was crossed -- read the cause line before acting\n"
             "  2  the wait could not be measured; not a green run\n"
             " 64  bad command line\n"

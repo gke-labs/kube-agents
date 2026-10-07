@@ -63,7 +63,7 @@ from collections import Counter
 from datetime import datetime, timedelta, timezone
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationInfo, field_validator, model_validator
 
 from devops_bench.k8s import get_resource
 from devops_bench.verification.base import (
@@ -87,8 +87,11 @@ from kube_agents_bench import (
 from kube_agents_bench.fleet import (
     ROLE_PATTERN,
     FleetRoleUnresolved,
+    FleetSlotUnreached,
+    recorded_clusters,
     confirmed_subjects,
     kubeconfig_for_role,
+    slot_kubeconfig_for_role,
 )
 
 __all__ = [
@@ -114,6 +117,14 @@ _NO_TRANSCRIPT_REASON = (
     "agent execution (kube_agents_bench.transcript is empty), so this check "
     "could not be evaluated"
 )
+_UNREACHED_SLOT_REASON = (
+    "a seeded cluster this check's patterns require a line about was not reached before the run, "
+    "so a missing line about it is the environment's gap, not the agent's miss"
+)
+_UNRESOLVED_ROLES_REASON = (
+    "this check's fixture_roles could not be resolved to a seeded cluster, so the lines it "
+    "requires cannot be graded"
+)
 _NO_WORKER_CALLS_REASON = (
     "no delegated worker's tool calls are in the trajectory: either no card was "
     "delegated or the worker-trajectory capture did not run, so a check scoped to "
@@ -124,6 +135,46 @@ _ONBOARDING_READ_TIMEOUT_SEC = 60.0
 # The sandbox's report changes at most twice (written, then renamed), so at most
 # two of three sandbox re-reads can differ from the read before them.
 _REPORT_READ_ATTEMPTS = 3
+
+# `{cluster:<slot>}` in a `forbidden_patterns` or `any_of_patterns` entry
+# stands for the cluster the runner recorded for that slot, as a frame that
+# matches the name bare or as the last `-` or `/`-joined component of a
+# longer id (a project, a resource path; a kubeconfig context's `_` joins
+# only under `fold_decoration: true`, see _NAME_JOINERS), followed by
+# nothing or by `-<location>` as recorded. `{cluster:any}` is every recorded
+# slot. The case then says WHICH cluster, not what a cluster's name looks
+# like, so `seeded-a-us-west1` is slot a only where the runner recorded it.
+_CLUSTER_PLACEHOLDER = re.compile(r"\{cluster:([a-z0-9-]+)\}")
+# Anything that looks like the opener in any case or spacing is a placeholder
+# the author meant, so a near miss is refused rather than compiled literally.
+_CLUSTER_PLACEHOLDER_LOOSE = re.compile(r"\{\s*cluster\s*:", re.IGNORECASE)
+_CLUSTER_ANY = "any"
+# No `_` in either: `_normalize` deletes every underscore as Markdown emphasis,
+# and under the fold `_INNER_UNDERSCORE` has already made an inner one a `-`,
+# so none reaches the frame. A kubeconfig context (`gke_<project>_<location>_
+# <name>`) therefore matches only with `fold_decoration: true`.
+_NAME_CHARS = "[a-z0-9/.-]"
+_NAME_JOINERS = "[-/]"
+# The frame bounds the name itself, so a pattern need not: nothing word-like
+# before it (`unseeded-a` is not `seeded-a`), and after it nothing word-like
+# and no `-` that would make it a longer name (`seeded-a-canary`,
+# `seeded-a-us-west1`); `/`, `.`, a space and punctuation may follow.
+_NAME_LEFT_BOUND = "(?<![a-z0-9])"
+_NAME_RIGHT_BOUND = "(?![a-z0-9-])"
+# Records the spec-load compile check expands a pattern with, in place of the
+# runner's: two slots, so a `{cluster:any}` alternation takes the shape it
+# will have, and every slot the pattern names.
+_PLACEHOLDER_STAND_IN_RECORDS = {"stand-in-1": ("stand-in-1", "stand-in-location"), "stand-in-2": ("stand-in-2", "")}
+_UNRECORDED_SLOT_REASON = (
+    "a pattern names a seeded-fleet slot the runner recorded no cluster for, so the line it "
+    "requires cannot be told from a line about another cluster"
+)
+_NO_RECORDED_SLOT_REASON = (
+    "a pattern names every recorded seeded-fleet slot and the runner recorded none: no seeded "
+    "cluster was reached before the run"
+)
+_PATTERN_EXPANSION_REASON = "a pattern does not compile once its cluster placeholders are expanded"
+
 
 # Emphasis and code markers, dropped before matching. The agent answers in
 # Markdown, and a phrase spanning an emphasised word cannot match the raw
@@ -157,14 +208,166 @@ def _normalize(text: str) -> str:
     return collapsed.lower()
 
 
-def _normalize_lines(text: str) -> str:
-    """``_normalize`` applied per line, newlines kept.
+# A line's decoration, folded before the pattern clauses see it when the
+# check asks for it (``fold_decoration: true``). The lead is any run of
+# non-word characters (bullets, quotes, pipes, arrows, symbols, a checkbox),
+# list tokens (`1.`, `(1)`, `a)`, `ii.`, a circled digit, a keycap `1️⃣`,
+# `#1`), citation markers (`[1]`) and whitespace, up to the first word
+# character; a Markdown link around a name is kept as its text, and a quote
+# or bracket closing a name goes with the opener the lead took. The trail is
+# a run of the closers and affirming marks `_TRAIL_CLOSERS` names (a stop, a
+# list's comma or semicolon, quotes, pipes, a hard-break backslash, a check
+# mark), a `<br>`, or a footnote marker (`[1]`, `[^note]`, `(1)`, a
+# superscript digit, a linked `[1](url)`); any other trailing symbol stays.
+# A footnote marker before a `;`, `,` or `.` inside the line is folded too,
+# since a declared frame's values are separated by `;`; so is a wrap the
+# agent kept from the prompt's template around a value (`<unavailable>`,
+# `"unaffected"`), whitespace before a `:` or `;` or missing after one, and
+# invisible format characters anywhere. A pattern anchored
+# with ``^...$`` then spells a declared line once rather than once per
+# rendering -- the reason `_MARKDOWN_NOISE` exists, applied to the line's
+# edges. Other interior punctuation is untouched. Opt-in, because a case
+# may forbid the decoration
+# itself (a bulleted capability list, say), and that pattern needs the
+# markers left where they are.
+_LINE_LEAD_DECORATION = re.compile(
+    r"^(?:\[\s*[x ]?\s*\]|\[\^?\d{1,3}\]|\(?\d{1,3}[.)](?=\s)|\(?[ivx]{1,4}[.)](?=\s)|[a-z][.)](?=\s)"
+    r"|#?\d{1,3}(?:\ufe0f?\u20e3)?(?=\s)"
+    r"|[\u2460-\u2473\u24ea-\u24ff\u2776-\u2793]|[^\w\n])+"
+)
+# A footnote marker at the end of a line: `[1]`, `[^1]`, `[^note]` (a named
+# footnote needs the caret, so a bracketed word such as `[mostly]` is a
+# value, not a marker), `(1)`, a superscript digit, or a linked `[1](url)`.
+# The named-footnote alternative excludes what the numbered one already
+# matches, and the repeat is possessive: alternatives that overlap inside
+# `(...)+$` backtrack exponentially on a line that ends in many markers and
+# then a word, and this runs on every line of a report.
+_FOOTNOTE_MARKER = r"(?:\[\^?\d{1,3}\](?:\([^)\n]*\))?|\[\^(?!\d{1,3}\])[\w-]{1,20}\]|\(\d{1,3}\)|[\u00b9\u00b2\u00b3\u2070-\u2079])"
+_LINE_TRAIL_FOOTNOTE = re.compile(r"(?:\s*" + _FOOTNOTE_MARKER + r")++\s*$")
+# The same markers before a separator inside the line: a citation on a
+# value other than the last one.
+_LINE_INTERIOR_FOOTNOTE = re.compile(r"(?:\s*" + _FOOTNOTE_MARKER + r")++(?=\s*[;,.])")
+# What a line may end with and still be the same line: whitespace, closing
+# punctuation, quotes, brackets, pipes, a hard-break backslash, a `<br>`, and
+# the marks that affirm (a check, a thumbs up, a green circle, with the
+# variation selector and joiner emoji carry). The list is the whole of it: a
+# symbol it does not name stays on the line, so a mark that hedges or negates
+# the last word (`?`, `!`, an ellipsis, a cross, a stop sign, a warning sign,
+# a thumbs down, one nobody has thought of) makes a hedged value the wrong
+# value. A denylist of negating marks would turn every mark it forgot into a
+# pass.
+_TRAIL_CLOSERS = (
+    ".,;:\"'`*_~|/\\<>)]}"
+    "\u201c\u201d\u2018\u2019\u00ab\u00bb\u2039\u203a\u2013\u2014"
+    "\u2713\u2714\u2705\u2611\ufe0f\u200d\U0001f44d\U0001f7e2"
+)
+_LINE_TRAIL_DECORATION = re.compile(r"(?:[\s" + re.escape(_TRAIL_CLOSERS) + r"]|<br\s*/?>)+$")
+# The same without a closing bracket, so a closer after a footnote marker
+# ("[1].") is taken without eating the marker's own bracket.
+_LINE_TRAIL_CLOSER = re.compile(
+    r"(?:[\s" + re.escape(_TRAIL_CLOSERS.replace(")", "").replace("]", "")) + r"]|<br\s*/?>)+$"
+)
+_TRAIL_FOLD_PASSES = 3
+# A name the agent quotes or brackets instead of emphasising, with or without
+# a parenthetical inside the quotes: the lead fold has taken the opener, so
+# what is left is the name with its closer stuck to it before the colon or
+# slash that ends the name.
+_QUOTED_FIRST_NAME = re.compile(r"^([\w/._-]+(?:\s*\([^)\n]*\))?)[\"\u201c\u201d'\u2018\u2019\]>)}]+(?=[:/\s(])")
+_MARKDOWN_LINK = re.compile(r"\[([^\]\n]+)\]\([^)\n]*\)")
+# A value the agent kept inside the prompt's own delimiters (`<unavailable>`,
+# `"unaffected"`): a wrap that opens after whitespace and closes at the next
+# `;` or the end comes off; at the end the closer may already have gone with
+# the trail. Only a wrap on a whole value, so quotes inside a value stay.
+_VALUE_WRAP = re.compile(
+    r"(?<=\s)[\"'\u201c\u201d\u2018\u2019<]+([^;\n\"'\u201c\u201d\u2018\u2019<>]+?)"
+    r"(?:[\"'\u201c\u201d\u2018\u2019>]+(?=\s*(?:;|$))|(?=\s*$))",
+    re.M,
+)
+# Whitespace the agent put before a frame's separator (`seeded-a :`,
+# `zonal ;`), or left out after it before a word (`seeded-a:control`,
+# `zonal;api`): the separator is the frame's, so the spacing around it is
+# decoration. A `:` before anything but a letter (`12:30`, `https://`) is
+# left alone.
+_SEPARATOR_SPACE = re.compile(r"[ \t]+(?=[:;])")
+# A letter or digit on both sides, not `\w`, which includes `_` itself and
+# would rewrite the inner underscore of a doubled `__bold__` marker.
+# Case-insensitive because it runs on the raw line, before `_normalize`
+# lowercases: a capital beside the underscore is still a word character.
+_INNER_UNDERSCORE = re.compile(r"(?<=[a-z0-9])_(?=[a-z0-9])", re.IGNORECASE)
+_SEPARATOR_NO_SPACE = re.compile(r"([:;])(?=[a-z\"'\u201c\u2018<])")
+# Invisible format characters a model or a pasted document carries (a
+# zero-width space or joiner, a word joiner, a byte-order mark, a variation
+# selector, a soft hyphen), and the five skin-tone modifiers an emoji is
+# rendered with (U+1F3FB to U+1F3FF, which only change how a listed closer
+# looks): not whitespace to Python, not a word character, and not a value.
+# Removed from the raw line in `_normalize_lines`, before `_normalize`
+# collapses whitespace: one flanked by spaces (`is \u200b zonal`) would
+# otherwise leave a double space behind that no later fold closes, and the
+# frames read it as a wrong value. `_fold_line_decoration` strips the class
+# again for a caller that hands it a line directly.
+_INVISIBLE = re.compile("[\u200b-\u200f\u2060-\u2064\ufeff\ufe0e\ufe0f\u00ad\U0001f3fb-\U0001f3ff]")
 
-    ``forbidden_patterns`` need a boundary a Markdown bullet or heading can
-    end on; the whitespace collapse above would otherwise fuse a negated
-    bullet into its unnegated neighbour before the regex runs.
+
+def _fold_trail_markers(line: str) -> str:
+    # Markers and closers interleave ("unaffected [1].", "[1](url),"), so a
+    # closer strip that spares brackets alternates with the marker strip
+    # until the line stops changing. Brackets are spared so a link that is a
+    # value ("[unaffected](url).") keeps its closing parenthesis for the
+    # unwrap that follows.
+    for _ in range(_TRAIL_FOLD_PASSES):
+        folded = _LINE_TRAIL_FOOTNOTE.sub("", _LINE_TRAIL_CLOSER.sub("", line))
+        if folded == line:
+            break
+        line = folded
+    return line
+
+
+def _fold_trail(line: str) -> str:
+    return _LINE_TRAIL_DECORATION.sub("", _fold_trail_markers(line))
+
+
+def _fold_line_decoration(line: str) -> str:
+    # Trailing markers and closers first, whatever order they come in, so a
+    # linked marker is folded as a marker however the line ends; then every
+    # other link is kept as its text, so a linked value stays a value; then
+    # the lead, the quoted name, and the trail once more with the full
+    # closer class.
+    footnoted = _LINE_INTERIOR_FOOTNOTE.sub("", _fold_trail_markers(_INVISIBLE.sub("", line)))
+    unlinked = _MARKDOWN_LINK.sub(r"\1", footnoted)
+    led = _LINE_LEAD_DECORATION.sub("", unlinked, count=1)
+    unquoted = _QUOTED_FIRST_NAME.sub(r"\1", led, count=1)
+    # The separator's spacing is settled first, so a wrap glued to its
+    # separator (`pods:"unaffected"`) has the whitespace the wrap fold opens
+    # on; the value wrap then comes off before the trail fold (so a closing
+    # quote at the line's end is read as the wrap it is) and again after it
+    # (so a wrap followed by a stop is read once the stop is gone).
+    spaced = _SEPARATOR_NO_SPACE.sub(r"\1 ", _SEPARATOR_SPACE.sub("", unquoted))
+    trailed = _fold_trail(_VALUE_WRAP.sub(r"\1", spaced))
+    return _VALUE_WRAP.sub(r"\1", trailed)
+
+
+def _normalize_lines(text: str, *, fold_decoration: bool = False) -> str:
+    """``_normalize`` applied per line, newlines kept; with ``fold_decoration``
+    each line's decoration is folded as well.
+
+    ``forbidden_patterns`` and ``any_of_patterns`` need a boundary a Markdown
+    bullet or heading can end on; the whitespace collapse above would
+    otherwise fuse a negated bullet into its unnegated neighbour before the
+    regex runs. The fold, when asked for, means a line-anchored pattern
+    matches the line however the agent listed, linked or quoted it.
     """
-    return "\n".join(_normalize(line) for line in text.splitlines())
+    # `_normalize` deletes underscores as Markdown emphasis; under the fold
+    # an underscore between two word characters becomes a hyphen first, so
+    # a kubeconfig context (`gke_<project>_<location>_<name>`) keeps the
+    # boundary before its cluster name, while `_word_` emphasis, whose
+    # underscores sit at a token's edges, is still deleted.
+    lines = (
+        _normalize(_INNER_UNDERSCORE.sub("-", _INVISIBLE.sub("", line)) if fold_decoration else line)
+        for line in text.splitlines()
+    )
+    if fold_decoration:
+        lines = (_fold_line_decoration(line) for line in lines)
+    return "\n".join(lines)
 
 
 @VERIFIERS.register("report_contains")
@@ -174,16 +377,19 @@ class ReportContainsVerifier(BaseVerifier):
     Substring matching, deliberately: the task author chose the phrase (a
     planted defect's name, a required noun), so an exact match is fair.
     Anything fuzzier belongs to the judge, not to a blocking check.
-    ``forbidden_patterns`` is the first regex exception, for the shape a
-    substring cannot express: a banned word whose negated uses are
-    legitimate ("no guarantee"). Each is ``re.search``ed against a
+    ``forbidden_patterns`` and ``any_of_patterns`` are the regex exceptions,
+    for the shapes a substring cannot express: a banned word whose negated
+    uses are legitimate ("no guarantee"), a phrase a substring cannot bound
+    ("it stopped" also matches "limit stopped"), and a required claim whose
+    subject and verb an adverb or a tense can separate. Each is ``re.search``ed against a
     line-preserving variant of the same normalization — newlines survive,
     so a Markdown bullet or heading with no terminal punctuation is its own
     segment and a pattern may anchor on ``\\n``; the flat collapse would
     otherwise fuse a negated bullet into its unnegated neighbour before the
-    regex runs. ``any_of_patterns`` are alternatives to ``any_of_phrases``
-    for the phrase a substring cannot bound: "it stopped" also matches
-    "limit stopped". Each is ``re.search``ed against the flat normalization.
+    regex runs. A literal space in a pattern therefore does not cross a
+    line break; a phrase that may wrap says ``\\s+`` where it may.
+    ``any_of_patterns`` and ``any_of_phrases`` are one pool of
+    alternatives: at least one of either has to match.
 
     Both sides are normalized first, by ``_normalize`` above: lowercased,
     Markdown emphasis dropped, whitespace runs collapsed. These are the
@@ -211,19 +417,170 @@ class ReportContainsVerifier(BaseVerifier):
     # spellings ("HPA" / "HorizontalPodAutoscaler"), all-of required_phrases
     # would punish a correct report for choosing the other name.
     any_of_phrases: list[str] = Field(default_factory=list)
-    any_of_patterns: list[str] = Field(default_factory=list)
     forbidden_patterns: list[str] = Field(default_factory=list)
+    # The regex form of any_of_phrases, for a claim a phrase list cannot
+    # carry: a whole declared line, a phrase that must start at a word
+    # boundary, or a subject bound to its verb across an adverb. One pool
+    # with any_of_phrases (at least one of either must match), searched
+    # against the same line-preserving text as forbidden_patterns, so a
+    # pattern may anchor on a newline and should keep it out of its gaps,
+    # and a phrase that may wrap says `\s+` where a space would not cross
+    # the break. `{cluster:<slot>}` in either list stands for the cluster
+    # the runner recorded for that slot (see _CLUSTER_PLACEHOLDER).
+    any_of_patterns: list[str] = Field(default_factory=list)
+    # Fold each line's decoration (bullets, numbers, quotes, links, a trailing
+    # stop or an affirming mark; a mark that hedges or negates the last word
+    # stays) before the pattern clauses run, so a declared line is spelled
+    # once. Off by default: a case may forbid the decoration itself.
+    fold_decoration: bool = False
+    # The seeded-fleet roles whose clusters the patterns require a line
+    # about, one per slot. Each is resolved to its slot's own credential
+    # (``clusters/<slot>.kubeconfig``, which the runner writes for every
+    # seeded cluster it reached, before and apart from confirming the roles
+    # on it); a slot the runner did not reach makes the check an ``error``
+    # for the environment instead of charging the agent with a line about a
+    # cluster it could not see. Whether the role's fixture is planted is not
+    # read here.
+    fixture_roles: list[str] = Field(default_factory=list)
     scope: Literal["final", "full"] = "final"
+
+    @field_validator("fixture_roles")
+    @classmethod
+    def _roles_are_names(cls, roles: list[str]) -> list[str]:
+        # The same contract as the fleet verifier's `fixture_role`: the name
+        # reaches the catalogue and a path, so a bad one fails at spec load,
+        # before the run, not as an environment error after it.
+        for role in roles:
+            if not ROLE_PATTERN.fullmatch(role):
+                raise ValueError(
+                    f"fixture_roles entry {role!r} must be a lowercase-hyphen name "
+                    "(it names a catalogue role and a slot's file); see bench/tf/fleet/fixtures.json"
+                )
+        return roles
+
+    @field_validator("required_phrases", "forbidden_phrases", "any_of_phrases")
+    @classmethod
+    def _phrases_carry_no_placeholder(cls, phrases: list[str], info: ValidationInfo) -> list[str]:
+        # A phrase is matched as a substring, as written: a placeholder here
+        # is never expanded, so a forbid built on one never fires and a
+        # requirement fails every run. Refused at spec load, like a pattern
+        # that does not compile.
+        for phrase in phrases:
+            if _CLUSTER_PLACEHOLDER_LOOSE.search(phrase):
+                raise ValueError(
+                    f"{info.field_name} entry {phrase!r} carries a cluster placeholder, which only "
+                    "forbidden_patterns and any_of_patterns expand; as a phrase it is literal text that never matches"
+                )
+        return phrases
 
     @field_validator("forbidden_patterns", "any_of_patterns")
     @classmethod
-    def _forbidden_patterns_compile(cls, patterns: list[str]) -> list[str]:
+    def _patterns_compile(cls, patterns: list[str]) -> list[str]:
         for pattern in patterns:
-            re.compile(pattern)
+            # A placeholder the regex does not recognise (`{cluster: a}`,
+            # `{Cluster:a}`) would compile as literal text and never match:
+            # an inert forbid or a miss on every run, with no hint why.
+            if _CLUSTER_PLACEHOLDER_LOOSE.search(_CLUSTER_PLACEHOLDER.sub("", pattern)):
+                raise ValueError(
+                    f"pattern {pattern!r} carries a malformed cluster placeholder; the form is "
+                    f"{{cluster:<slot>}} or {{cluster:{_CLUSTER_ANY}}}, lowercase, no spaces"
+                )
+            # A placeholder expands to a frame at verify time, so what has to
+            # compile now is the pattern around a frame, not around a letter:
+            # a lookbehind or a character class that is legal around `x` is
+            # not around a variable-width group.
+            try:
+                re.compile(cls.expand_cluster_placeholders(pattern, cls._stand_in_records(pattern)))
+            except re.error as exc:
+                # Re-raised as the same type, so a caller that catches re.error
+                # for a pattern that does not compile still does.
+                raise re.error(f"pattern {pattern!r} does not compile once its cluster placeholders are expanded: {exc}") from exc
         return patterns
+
+    @staticmethod
+    def _stand_in_records(pattern: str) -> dict[str, tuple[str, str]]:
+        records = dict(_PLACEHOLDER_STAND_IN_RECORDS)
+        for slot in _CLUSTER_PLACEHOLDER.findall(pattern):
+            if slot != _CLUSTER_ANY:
+                records.setdefault(slot, (slot, ""))
+        return records
+
+    @staticmethod
+    def _cluster_frame(name: str, location: str) -> str:
+        """The regex for one recorded cluster, as one group: its name, bare or
+        as the last `-` or `/`-joined component of a longer id (a `_` join
+        only under the fold, which has made it a `-` by now), then
+        nothing or its recorded location, bounded on both sides by the frame
+        itself (nothing word-like before, nothing word-like and no `-` after),
+        so `unseeded-a`, `seeded-a-canary` and `seeded-a-us-west1` are not
+        slot a wherever the placeholder sits in a pattern."""
+        bare = re.escape(name.lower())
+        frame = f"{_NAME_LEFT_BOUND}(?:(?:(?!{bare}(?![a-z0-9])){_NAME_CHARS})*{_NAME_JOINERS})?{bare}"
+        if location:
+            frame += f"(?:-{re.escape(location.lower())})?"
+        return f"(?:{frame}{_NAME_RIGHT_BOUND})"
+
+    @classmethod
+    def expand_cluster_placeholders(cls, pattern: str, clusters: dict[str, tuple[str, str]]) -> str:
+        """``pattern`` with every ``{cluster:<slot>}`` replaced by the recorded
+        cluster's frame, ``{cluster:any}`` by every recorded slot's.
+
+        Raises:
+            KeyError: the pattern names a slot with no record (the message
+                names it; the caller turns that into ``status: error``).
+            LookupError: ``{cluster:any}`` with no slot recorded at all.
+        """
+        def frame_for(match: re.Match) -> str:
+            slot = match.group(1)
+            if slot == _CLUSTER_ANY:
+                if not clusters:
+                    raise LookupError(_NO_RECORDED_SLOT_REASON)
+                return "(?:" + "|".join(cls._cluster_frame(n, l) for n, l in clusters.values()) + ")"
+            if slot not in clusters:
+                raise KeyError(slot)
+            return cls._cluster_frame(*clusters[slot])
+        return _CLUSTER_PLACEHOLDER.sub(frame_for, pattern)
+
+    def _expanded_patterns(self) -> tuple[list[str], list[str], dict[str, tuple[str, str]] | None]:
+        """The two pattern lists with their cluster placeholders expanded from
+        the runner's record, and the record used (None when no pattern asked,
+        so the record is read only then)."""
+        if not any(_CLUSTER_PLACEHOLDER.search(p) for p in self.forbidden_patterns + self.any_of_patterns):
+            return self.forbidden_patterns, self.any_of_patterns, None
+        clusters = recorded_clusters()
+        return (
+            [self.expand_cluster_placeholders(p, clusters) for p in self.forbidden_patterns],
+            [self.expand_cluster_placeholders(p, clusters) for p in self.any_of_patterns],
+            clusters,
+        )
 
     def verify(self, timeout_sec: float) -> VerificationResult:
         start = time.monotonic()
+        for role in self.fixture_roles:
+            try:
+                slot_kubeconfig_for_role(role)
+            except FleetSlotUnreached as exc:
+                return VerificationResult(
+                    success=False, status="error", elapsed_time=time.monotonic() - start, reason=f"{_UNREACHED_SLOT_REASON}: {exc}"
+                )
+            except FleetRoleUnresolved as exc:
+                return VerificationResult(
+                    success=False, status="error", elapsed_time=time.monotonic() - start, reason=f"{_UNRESOLVED_ROLES_REASON}: {exc}"
+                )
+        try:
+            forbidden_patterns, any_of_patterns, clusters = self._expanded_patterns()
+        except KeyError as exc:
+            return VerificationResult(
+                success=False, status="error", elapsed_time=time.monotonic() - start,
+                reason=f"{_UNRECORDED_SLOT_REASON}: slot {exc.args[0]!r} has no cluster record in the runner's context file",
+            )
+        except (LookupError, FleetRoleUnresolved) as exc:
+            # `{cluster:any}` with nothing recorded, or no runner directory at
+            # all: neither names a slot, and each message already says what
+            # happened, so no slot-shaped prefix is put in front of it.
+            return VerificationResult(
+                success=False, status="error", elapsed_time=time.monotonic() - start, reason=str(exc)
+            )
         snap = transcript.get()
         if snap is None:
             return VerificationResult(
@@ -236,12 +593,19 @@ class ReportContainsVerifier(BaseVerifier):
         text = _normalize(raw)
         missing = [p for p in self.required_phrases if _normalize(p) not in text]
         present = [p for p in self.forbidden_phrases if _normalize(p) in text]
-        pattern_hits = [
-            p for p in self.forbidden_patterns if re.search(p, _normalize_lines(raw))
-        ]
+        lines = _normalize_lines(raw, fold_decoration=self.fold_decoration)
+        try:
+            # Reported in the case's own spelling: the expanded frame is not a
+            # thing a reader of results.json can recognise.
+            pattern_hits = [self.forbidden_patterns[i] for i, p in enumerate(forbidden_patterns) if re.search(p, lines)]
+            any_pattern_hit = any(re.search(p, lines) for p in any_of_patterns)
+        except re.error as exc:
+            return VerificationResult(
+                success=False, status="error", elapsed_time=time.monotonic() - start, reason=f"{_PATTERN_EXPANSION_REASON}: {exc}"
+            )
+        # One pool: a phrase or a pattern satisfies the clause.
         any_of_miss = bool(self.any_of_phrases or self.any_of_patterns) and not (
-            any(_normalize(p) in text for p in self.any_of_phrases)
-            or any(re.search(p, text) for p in self.any_of_patterns)
+            any(_normalize(p) in text for p in self.any_of_phrases) or any_pattern_hit
         )
         if missing or present or pattern_hits or any_of_miss:
             parts = []
@@ -254,10 +618,19 @@ class ReportContainsVerifier(BaseVerifier):
                     f"forbidden patterns matched in the report: {pattern_hits}"
                 )
             if any_of_miss:
-                parts.append(
-                    "none of the alternative phrasings present: "
-                    f"{self.any_of_phrases + self.any_of_patterns}"
-                )
+                if self.any_of_phrases:
+                    parts.append(
+                        f"none of the alternative phrasings present: {self.any_of_phrases}"
+                    )
+                if self.any_of_patterns:
+                    parts.append(
+                        f"none of the alternative patterns matched: {self.any_of_patterns}"
+                    )
+            if clusters is not None and (pattern_hits or any_of_miss):
+                # Which name each slot stood for in this project, so a miss
+                # can be read against what the agent wrote.
+                resolved = {slot: f"{name} ({location})" if location else name for slot, (name, location) in sorted(clusters.items())}
+                parts.append(f"cluster placeholders resolved to {resolved}")
             return VerificationResult(
                 success=False,
                 elapsed_time=time.monotonic() - start,
@@ -278,9 +651,13 @@ class ReportContainsVerifier(BaseVerifier):
                 f"none of {len(self.forbidden_patterns)} forbidden pattern(s)"
             )
         if self.any_of_phrases or self.any_of_patterns:
+            kinds = " or ".join(
+                kind
+                for kind, given in (("phrasing(s)", self.any_of_phrases), ("pattern(s)", self.any_of_patterns))
+                if given
+            )
             satisfied.append(
-                "at least one of "
-                f"{len(self.any_of_phrases) + len(self.any_of_patterns)} alternative phrasing(s)"
+                f"at least one of {len(self.any_of_phrases) + len(self.any_of_patterns)} alternative {kinds}"
             )
         return VerificationResult(
             success=True,
@@ -381,6 +758,14 @@ class ToolCalledVerifier(BaseVerifier):
         if pattern is not None:
             if not pattern:
                 raise ValueError("agent selector pattern cannot be empty")
+            # The selector is matched as written against the trajectory's
+            # agent tags; a cluster placeholder is never expanded here, so it
+            # would compile as literal braces that match no tag.
+            if _CLUSTER_PLACEHOLDER_LOOSE.search(pattern):
+                raise ValueError(
+                    f"agent selector pattern {pattern!r} carries a cluster placeholder, which only "
+                    "report_contains's forbidden_patterns and any_of_patterns expand"
+                )
             compiled = re.compile(pattern)
             if compiled.fullmatch(""):
                 raise ValueError(

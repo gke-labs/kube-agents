@@ -158,7 +158,7 @@ def replay(kanban_task: Path, tmp_path: Path, monkeypatch, capsys) -> dict[str, 
         rc = main([*argv, "--markdown-out", str(md), "--json-out", str(js)])
         artifacts[f"{name}.stdout"] = _captured(rc, capsys.readouterr())
         # `.md.txt`, not `.md`: a captured verdict is a test input, and the
-        # documentation map (`make docs-check`) inventories every `*.md`.
+        # link check (`make docs-check`) expects every `*.md` to be linked.
         artifacts[f"{name}.md.txt"] = _normalise(md.read_text(encoding="utf-8"))
         artifacts[f"{name}.json"] = _json_text(js)
 
