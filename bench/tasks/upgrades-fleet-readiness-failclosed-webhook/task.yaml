@@ -29,10 +29,12 @@
 # "yes" to whether any webhook blocks the upgrade. The two list slots are comma-separated
 # names, and the prompt says so; each slot is framed on the next field's label rather than
 # on `;`, so a `;` inside an item (the readiness table's own PDB and webhook cells carry
-# one) is content, not the end of the slot. The real-blocker objective reads item starts,
-# after the slot's `:` or after a `,` or `;` with or without a space: an item is a blocker
-# when it begins with the budget's or the exclusion's name, with or without its kind, an
-# article, its namespace and a quote, so a word inside a description decides nothing; its
+# one) is content, not the end of the slot. The real-blocker objective reads items, each
+# starting after the slot's `:` or after a `,` or `;` with or without a space and running
+# to the next `,` or `;`: an item is a blocker when it carries the budget's or the
+# exclusion's name and does not open with a negation word (no, not, none, neither, nor).
+# What sits before the name -- its kind in any spelling, an article, its namespace, a
+# quote or a bracket -- is not read, and a word inside another item decides nothing; the
 # negation is the same frame with no such item.
 #
 # Planted defect required: on slot b, the ValidatingWebhookConfiguration
@@ -141,17 +143,20 @@ verification_spec:
         - '(?m)^{cluster:b}(?:\s*\([^)\n]*\))?: upgrade blockers: (?:(?!; fail-closed webhooks with no backend: )[^\n])+; fail-closed webhooks with no backend: (?:(?!; any of them blocks the upgrade: )[^\n])+; any of them blocks the upgrade: yes$'
 
   # The blockers that do stop seeded-b are named: its drain-blocking budget and its minor
-  # hold are the readiness report's own findings. An item counts when it begins with the
-  # budget's or the exclusion's name, with or without its kind (PDB, PodDisruptionBudget,
-  # budget, maintenance exclusion, exclusion), an article (the, a, an), the seeded-upgrade/
-  # namespace and the quote or emphasis marks the fold leaves inside a line, so a word
-  # inside another item's description decides nothing in either direction. An item starts
-  # after the slot's own `:` or after a `,` or `;`, with or without the space: the prompt
-  # asks for commas, and a `;` between items or a dropped space is still a list. Either
-  # blocker is enough; the exclusion case grades them one by one. A slot with no such item
-  # -- "none", a negation ("no pdb or exclusion applies"), or other things altogether --
-  # has not read the report. A hyphenated name that begins with `no-` (the pool
-  # no-surge-pool, the folded exclusion scope no-minor-upgrades) is an item like any other.
+  # hold are the readiness report's own findings. An item starts after the slot's own `:`
+  # or after a `,` or `;`, with or without the space (the prompt asks for commas, and a `;`
+  # between items or a dropped space is still a list), and runs to the next `,` or `;`. It
+  # counts when it carries the budget's or the exclusion's name and does not open with a
+  # negation word (no, not, none, neither, nor, each followed by a space or a separator).
+  # The two names are specific enough that nothing before them is read: the kind in any
+  # spelling a tool emits (`pdb`, `poddisruptionbudget.policy/`, `poddisruptionbudgets/`,
+  # `maintenanceexclusion`, `maintenance-exclusion`), an article or a possessive, the
+  # namespace before or beside the kind, a quote or a bracket. A word inside another item
+  # decides nothing in either direction. Either blocker is enough; the exclusion case
+  # grades them one by one. A slot with no such item -- "none", a negation ("no pdb or
+  # exclusion applies", "not pinned-batch-runner"), or other things altogether -- has not
+  # read the report. A hyphenated name that begins with `no-` (the pool no-surge-pool, the
+  # folded exclusion scope no-minor-upgrades) is not a negation word.
   - name: seeded-b-names-a-real-blocker
     role: objective
     mode: assert
@@ -161,13 +166,13 @@ verification_spec:
       fixture_roles:
         - readiness-failclosed-webhook
       any_of_patterns:
-        - '(?m)^{cluster:b}(?:\s*\([^)\n]*\))?: upgrade blockers: (?:(?!; fail-closed webhooks with no backend: )[^\n])*(?:(?<=[:,;] )|(?<=[:,;]))[`"''*_]*(?:the |an? )?(?:(?:pdb|poddisruptionbudget|pod disruption budget|budget|maintenance exclusion|exclusion|maintenance)[ /])?[`"''*_]*(?:seeded-upgrade/)?(?:pinned-batch-runner|hold-the-minor-lag)\b(?:(?!; fail-closed webhooks with no backend: )[^\n])*; fail-closed webhooks with no backend: (?:(?!; any of them blocks the upgrade: )[^\n])+; any of them blocks the upgrade: (?:yes|no)$'
-      # The negation: seeded-b's frame whose blockers slot has no item that starts with a
-      # real blocker. The same item clause under a negative lookahead, so the two patterns
-      # are exact complements on one line: `none`, a negated slot and a list of other things
+        - '(?m)^{cluster:b}(?:\s*\([^)\n]*\))?: upgrade blockers: (?:(?!; fail-closed webhooks with no backend: )[^\n])*(?:(?<=[:,;] )|(?<=[:,;]))(?!(?:no|not|none|neither|nor)[ ,;])[^,;\n]*?\b(?:pinned-batch-runner|hold-the-minor-lag)\b(?:(?!; fail-closed webhooks with no backend: )[^\n])*; fail-closed webhooks with no backend: (?:(?!; any of them blocks the upgrade: )[^\n])+; any of them blocks the upgrade: (?:yes|no)$'
+      # The negation: seeded-b's frame whose blockers slot has no item that carries a real
+      # blocker. The same item clause under a negative lookahead, so the two patterns are
+      # exact complements on one line: `none`, a negated slot and a list of other things
       # all land here, and no spelling of a real blocker does.
       forbidden_patterns:
-        - '(?m)^{cluster:b}(?:\s*\([^)\n]*\))?: upgrade blockers: (?!(?:(?!; fail-closed webhooks with no backend: )[^\n])*(?:(?<=[:,;] )|(?<=[:,;]))[`"''*_]*(?:the |an? )?(?:(?:pdb|poddisruptionbudget|pod disruption budget|budget|maintenance exclusion|exclusion|maintenance)[ /])?[`"''*_]*(?:seeded-upgrade/)?(?:pinned-batch-runner|hold-the-minor-lag)\b)(?:(?!; fail-closed webhooks with no backend: )[^\n])+; fail-closed webhooks with no backend: (?:(?!; any of them blocks the upgrade: )[^\n])+; any of them blocks the upgrade: (?:yes|no)$'
+        - '(?m)^{cluster:b}(?:\s*\([^)\n]*\))?: upgrade blockers: (?!(?:(?!; fail-closed webhooks with no backend: )[^\n])*(?:(?<=[:,;] )|(?<=[:,;]))(?!(?:no|not|none|neither|nor)[ ,;])[^,;\n]*?\b(?:pinned-batch-runner|hold-the-minor-lag)\b)(?:(?!; fail-closed webhooks with no backend: )[^\n])+; fail-closed webhooks with no backend: (?:(?!; any of them blocks the upgrade: )[^\n])+; any of them blocks the upgrade: (?:yes|no)$'
 
   - name: no-invented-cves
     role: objective

@@ -6851,6 +6851,16 @@ def _webhook_line(blockers="PodDisruptionBudget pinned-batch-runner, maintenance
         _webhook_line(blockers="the PDB `pinned-batch-runner`, the maintenance exclusion `hold-the-minor-lag`"),
         _webhook_line(blockers="**Pod Disruption Budget seeded-upgrade/pinned-batch-runner**, \"hold-the-minor-lag\""),
         _webhook_line(blockers="PodDisruptionBudget/pinned-batch-runner"),
+        # the spellings the tools emit: `kubectl get -o name`, the plural, the gcloud field name and
+        # a hyphenated kind; a kind with the name in brackets or angle brackets; the namespace or a
+        # possessive before the kind
+        _webhook_line(blockers="poddisruptionbudget.policy/pinned-batch-runner, maintenanceexclusion hold-the-minor-lag"),
+        _webhook_line(blockers="poddisruptionbudgets/pinned-batch-runner"),
+        _webhook_line(blockers="maintenance-exclusion hold-the-minor-lag"),
+        _webhook_line(blockers="pdb (pinned-batch-runner), maintenance exclusion (hold-the-minor-lag)"),
+        _webhook_line(blockers="pdb <pinned-batch-runner>, exclusion hold-the-minor-lag"),
+        _webhook_line(blockers="seeded-upgrade pdb pinned-batch-runner"),
+        _webhook_line(blockers="its pdb pinned-batch-runner"),
     ],
 )
 def test_webhook_readiness_declared_line_accepted(text):
@@ -6885,6 +6895,10 @@ def test_webhook_readiness_declared_line_accepted(text):
         (_webhook_line(blockers="none"), "seeded-b-names-a-real-blocker"),
         (_webhook_line(blockers="no pdb or exclusion applies"), "seeded-b-names-a-real-blocker"),
         (_webhook_line(blockers="not the pdb, nor the exclusion"), "seeded-b-names-a-real-blocker"),
+        # a real blocker's name inside an item that opens with a negation word
+        (_webhook_line(blockers="not pinned-batch-runner"), "seeded-b-names-a-real-blocker"),
+        (_webhook_line(blockers="neither pinned-batch-runner nor hold-the-minor-lag"), "seeded-b-names-a-real-blocker"),
+        (_webhook_line(blockers="none (pinned-batch-runner allows one disruption)"), "seeded-b-names-a-real-blocker"),
         # a blocker keyword inside an item that is not a blocker
         (_webhook_line(blockers="outside the maintenance window"), "seeded-b-names-a-real-blocker"),
         (_webhook_line(blockers="budget pressure on the node pool"), "seeded-b-names-a-real-blocker"),
