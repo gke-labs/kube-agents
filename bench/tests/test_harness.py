@@ -1071,16 +1071,6 @@ def test_a_relative_api_path_is_rejected(monkeypatch: pytest.MonkeyPatch) -> Non
     assert "AGENT_API_PATH must start with '/'" in result.errors[0]
 
 
-def test_http_error_becomes_errored_result(stub_agent: _StubAgentServer) -> None:
-    stub_agent.fail_with = 500
-
-    result = KubeAgentsHarness().run("prompt")
-
-    assert result.has_errors()
-    assert "HTTP 500" in result.errors[0]
-    assert "agent exploded" in result.errors[0]
-
-
 def test_non_object_json_becomes_errored_result(stub_agent: _StubAgentServer) -> None:
     stub_agent.raw_body = json.dumps(["not", "an", "object"]).encode()
 
@@ -1310,6 +1300,7 @@ def test_an_opening_turn_500_is_infrastructure_not_an_answer(
     assert result.has_errors()
     assert result.errors[0].startswith(harness.INFRA_FAILURE_MARKER)
     assert "HTTP 500" in result.errors[0]
+    assert "agent exploded" in result.errors[0]
     assert result.output == ""
     assert result.trajectory == []
     assert len(stub_agent.requests) == 1
@@ -1557,8 +1548,8 @@ def test_an_ordinary_scored_record_is_still_graded(results_json: Any) -> None:
 
 
 def test_an_agent_error_without_the_marker_is_still_graded(results_json: Any) -> None:
-    """A 500 reaches the judge exactly as it did before this change."""
-    path = results_json(AgentResult.errored("HTTP 500 from agent endpoint: agent exploded"))
+    """A 4xx reaches the judge exactly as it did before this change."""
+    path = results_json(AgentResult.errored("HTTP 400 from agent endpoint: bad request"))
 
     assert _classify(path, "opentofu").outcome != "infra"
 
@@ -3318,6 +3309,30 @@ def test_a_wake_turn_that_replied_with_a_parse_warning_still_gets_its_answer(
     assert [r["input"] for r in stub_agent.requests] == [_REPLAY_WAKE, "seeded-b"]
     assert result.output == "[SILENT]"
     assert result.trajectory[-1]["args"]["answer_reply"] == "Passed seeded-b to the card."
+
+
+def test_a_card_wake_answer_turn_500_is_an_agent_error_not_infra(
+    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer
+) -> None:
+    """A 5xx on a card-wake answer turn remains an agent error, not infra.
+
+    On a question-wake repetition, the wake turn has already executed,
+    replied, and been billed. A subsequent 500 on the answer turn does not
+    discard the graded wake reply as infrastructure; it returns an errored
+    turn so the wake reply remains graded.
+    """
+    scripts: list[str] = []
+    monkeypatch.setattr(harness, "_agent_shell", _replay_shell(scripts))
+    stub_agent.fail_on = frozenset({2})
+    stub_agent.fail_on_status = 500
+
+    result = KubeAgentsHarness().run(_REPLAY_PROMPT)
+
+    assert result.has_errors()
+    assert harness.INFRA_FAILURE_MARKER not in result.errors[0]
+    assert "HTTP 500" in result.errors[0]
+    assert len(stub_agent.requests) == 2
+    assert _archived(scripts)
 
 
 def test_a_question_wake_missing_its_answer_errors_without_planting(

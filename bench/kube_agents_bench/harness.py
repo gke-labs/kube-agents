@@ -1224,10 +1224,12 @@ class _TransportError(RuntimeError):
 # exhaustion both turn paths deliberately end in _infra_failure rather than
 # grading a partial record: see _DelegationTransportExhausted for why settling
 # the cards into a record that is about to be replaced wholesale is not a
-# rescue. Every other status is an answer about the request itself and
+# Every other status is an answer about the request itself and
 # repeating the request cannot change it, 500 included: a handler that raised
-# will raise again. On the opening turn, an unretryable 5xx (such as 500)
-# ends immediately in _infra_failure (#2430) because no turn ran.
+# will raise again. On the opening turn, where no envelope came back, an
+# unretryable 5xx (such as 500) is classified as infrastructure rather than
+# an answer (#2430), following the inject lane's door-500 precedent
+# (test_inject_transport.py).
 _RETRYABLE_STATUSES = frozenset({429, 502, 503, 504})
 
 
@@ -1449,7 +1451,13 @@ class KubeAgentsHarness(AgentHarness):
         )
         return result
 
-    def _execute(self, prompt: str, workspace_path: Path | None = None) -> AgentResult:
+    def _execute(
+        self,
+        prompt: str,
+        workspace_path: Path | None = None,
+        *,
+        opening_turn: bool = True,
+    ) -> AgentResult:
         try:
             replay = card_wake.parse(prompt)
         except ValueError as exc:
@@ -1544,13 +1552,14 @@ class KubeAgentsHarness(AgentHarness):
                 result, session_id = _post_turn(url, body, headers, timeout)
                 break
             except _TransportError as exc:
-                # An HTTP 5xx on the opening turn says the endpoint or gateway
-                # crashed before running an agent turn (#2430). The harness knows
-                # for a fact that no turn ran: classify as infrastructure failure
-                # so transient crashes (e.g. gateway .env races) do not fail
-                # presubmits as NOT_A_REAL_RUN. Client-side errors (4xx) and
-                # non-JSON bodies remain agent failures and still reach the judge.
-                if exc.status_code is not None and 500 <= exc.status_code < 600:
+                # An HTTP 5xx on the opening turn returns no reply envelope.
+                # Rather than grading the door crash as an agent answer, the gate
+                # treats an opening-turn 5xx as infrastructure (#2430), mirroring
+                # the inject lane's door-500 precedent (test_inject_transport.py).
+                # Subsequent turns (such as a card-wake answer turn where the
+                # wake turn already replied and billed) follow the standard
+                # errored path so executed work remains graded.
+                if opening_turn and exc.status_code is not None and 500 <= exc.status_code < 600:
                     if not exc.retryable:
                         return _infra_failure(str(exc))
                 # A 4xx other than 429, or a body that is not JSON says a handler
@@ -1675,11 +1684,11 @@ class KubeAgentsHarness(AgentHarness):
         pinned = _PINNED_RUN_ID.set(_run_id())
         answer_turn = None
         try:
-            wake_turn = self._execute(planted.wake, workspace_path)
+            wake_turn = self._execute(planted.wake, workspace_path, opening_turn=True)
             if not card_wake.no_reply(wake_turn) and not failure and replay.fresh:
                 answer_turn = self._execute_fresh_answer(replay, planted, wake_turn, workspace_path)
             elif not card_wake.no_reply(wake_turn) and not failure:
-                answer_turn = self._execute(planted.answer(replay), workspace_path)
+                answer_turn = self._execute(planted.answer(replay), workspace_path, opening_turn=False)
         finally:
             _PINNED_RUN_ID.reset(pinned)
             settled = card_wake.archive(_agent_shell, planted.key, _EXEC_TIMEOUT)
@@ -1719,7 +1728,7 @@ class KubeAgentsHarness(AgentHarness):
             return AgentResult.errored(str(exc))
         fresh = _PINNED_RUN_ID.set(_mint_run_id())
         try:
-            return self._execute(prompt, workspace_path)
+            return self._execute(prompt, workspace_path, opening_turn=False)
         finally:
             _PINNED_RUN_ID.reset(fresh)
 
