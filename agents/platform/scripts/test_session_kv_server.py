@@ -4905,6 +4905,42 @@ class TestStallInject(unittest.TestCase):
                 (session_kv_server.STALL_LEDGER_REASON,),
             ).fetchall()
 
+    @patch("session_kv_server.trigger_agent_troubleshooter")
+    def test_the_record_the_stall_watch_builds_is_one_the_route_takes(self, trigger):
+        # The watch's real builder against the real route: a field renamed on
+        # one side alone would otherwise be a refused alert on every tick with
+        # every test green.
+        import sqlite3
+
+        import stall_watch
+
+        def row(obj, heuristic, detail, stalled_for):
+            return {"object": obj, "namespace": "checkout", "heuristic": heuristic, "detail": detail, "stalled_for": stalled_for}
+
+        # Longer than either side's limit: the watch must cut it to a length
+        # the route keeps rather than drops.
+        long_name = "Job/" + "j" * session_kv_server.DRIFT_MAX_FIELD_CHARS
+        rows = [
+            row("Deployment/checkout-api", "dangling-reference", "envFrom -> ConfigMap/x not found", "26m"),
+            row("Gateway/edge", "stale-condition", "Programmed=False", "6h11m"),
+            row(long_name, "stale-condition", "Complete=False", "26m"),
+        ]
+        payload = stall_watch.stall_payload("proj", "c", "us-central1", "checkout", "cluster-proj-c-us-central1", rows, "2026-10-02T12:30:00+00:00")
+        response = self.client.post(
+            f"{stall_watch.SESSIONS_PATH}/s{stall_watch.INJECT_SUFFIX}", json={stall_watch.MESSAGE_KEY: json.dumps(payload)}
+        )
+        self.assertEqual(response.json().get(stall_watch.STATUS_KEY), stall_watch.INJECTED_STATUS, response.text)
+        delivered = trigger.call_args.args[2]
+        card = session_kv_server._stall_task_body(delivered)
+        self.assertIn("- Deployment/checkout-api: dangling-reference (26m)", card)
+        self.assertIn("- Gateway/edge: stale-condition (6h11m)", card)
+        self.assertIn(f"- {long_name[: session_kv_server.DRIFT_MAX_FIELD_CHARS]}: stale-condition (26m)", card)
+        self.assertEqual(stall_watch.MAX_NAME_CHARS, session_kv_server.DRIFT_MAX_FIELD_CHARS)
+        self.assertIn("`assignee`: `cluster-proj-c-us-central1`", session_kv_server._build_agent_query(delivered))
+        with sqlite3.connect(temp_db_path) as conn:
+            count = conn.execute("SELECT COUNT(*) FROM intercepted_events WHERE reason = ?", (session_kv_server.STALL_LEDGER_REASON,)).fetchone()[0]
+        self.assertEqual(count, 1)
+
     def test_healthz_advertises_the_kind(self):
         response = self.client.get("/healthz")
         self.assertIn(session_kv_server.INJECT_KIND_STALL, response.json()["inject_kinds"])

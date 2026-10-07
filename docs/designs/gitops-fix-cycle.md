@@ -3,8 +3,10 @@
 Status: pilot, written from the code that ran from 2026-09-10 to 2026-09-18 (gke-labs/kube-agents#1307; the isolated campaign is gke-labs/kube-agents#1773).
 Scope: two devops-bench tasks, `b-0011` and `b-0022b`, each on a per-run GKE cluster,
 against one GitOps repository on GitHub, through one parameterised stack. Everything here
-exists and was exercised end to end at least once; the "Findings" section says which parts
-held and which did not.
+exists and was exercised end to end at least once; pinned-base mode and the run wrapper's
+pull-request listing were added after the pilot and first ran end to end in
+`b-0022b-gitops-pinned-base`'s runs (red against `main`, kept below, and green on an operator
+that declares the base field). The "Findings" section says which parts held and which did not.
 
 ## Why this exists
 
@@ -74,7 +76,9 @@ The broken base is a commit SHA the stack is given (`gitops_broken_base_sha`; th
 passes `GITOPS_BROKEN_BASE_SHA`, or the repository's default-branch head for a per-run
 repository). The
 repository's default branch holds it; no run writes the default branch's content (the
-pilot-only default-branch mode below moves the default-branch pointer, not its content).
+pilot-only default-branch mode below moves the default-branch pointer, not its content),
+except pinned-base mode below, which fast-forwards it from the base onto the run branch's
+starting commit.
 
 b-0011's clue is history, not state: its blueprint is "the request inflated two revisions
 back", and the original stack seeds it as an in-place rollout (64Mi, then 256Mi, then the
@@ -104,14 +108,15 @@ are disabled org-wide. Both shaped the design below.
 Run branch: `run/<cluster_name>/<task>`, where `<cluster_name>` is the per-run task
 cluster name devops-bench already generates and `<task>` is the stack's `gitops_task`. The
 prompt names the branch through the `{{CLUSTER_NAME}}` placeholder because prompt
-templating has no other per-run value; the stack's `locals.run_branch` and each
-`bench/tasks/<task>-gitops/task.yaml` must stay in step.
+templating has no other per-run value; the stack's `locals.run_branch` and each GitOps
+case whose prompt names the run branch must stay in step.
 
 The branch is a Terraform resource (`null_resource.run_branch` in the stack) with a create
 provisioner that force-points `refs/heads/<run branch>` at the broken base through the
 GitHub REST API (an existing branch is reset, so reruns are safe) and a destroy provisioner
 that deletes it. devops-bench's teardown runs `tofu destroy`, so the branch lives exactly
-as long as the cluster. The script refuses any branch outside `run/**`.
+as long as the cluster. The script refuses any branch outside `run/**`, except the
+pinned-base fast-forward of the default branch (above).
 
 The agent's PR branches are `platform-agent/<change>-<target>`, as submit-suggestion
 already names them. The check workflow deletes them on merge.
@@ -131,7 +136,9 @@ rendered bases. The staged history's commit messages are the shape a build pipel
 not a title. Repositories are archived after the campaign, not deleted, so handoff links
 keep resolving. The agent side of the same isolation is the wrapper's
 `AGENT_STATE_RESET`, which re-creates the `PlatformAgent` on fresh volumes with the run's
-repository as its managed repository and refuses to run unless its stores are empty,
+repository as its managed repository (as a `gitops` entry of `spec.integration.repositories`
+for a case that pins its base on a CRD that has the lists form, or a spec already in that
+form; as the `github` alias otherwise) and refuses to run unless its stores are empty,
 the first-boot discovery card and its inventory work excepted.
 
 ## What the stack installs (`bench/tf/prebuilt/gitops-fix-cycle`)
@@ -145,8 +152,9 @@ defaults: a repository of yours and a commit in it); `gitops_task_path` (empty =
 `tasks/<task>`); `gitops_history_parent_sha` (required for b-0011, whose task_version 3 names the staged
 history as its seeding; other tasks start at the base; a per-run repository passes its
 root); `gitops_run_branch` (empty = derived); `gitops_token_file`, `argocd_version`, `agent_host_context`/`agent_namespace`
-(onboarding, below), and the pilot-only
-`gitops_switch_default_branch`/`gitops_restore_default_branch`.
+(onboarding, below), the pilot-only
+`gitops_switch_default_branch`/`gitops_restore_default_branch`, and
+`gitops_pin_agent_base_branch` (pinned-base mode, below).
 
 `scripts/setup.sh`, in order:
 
@@ -201,7 +209,9 @@ cluster and project and a paragraph after it naming the repository, path and run
 (the style `tasks/gcp/multi-region-failover` already uses for its repo) and saying that
 changes reach that branch only through a pull request against it (b-0011-gitops added
 that sentence at task_version 2; b-0022b-gitops has it from its first version; see the
-direct-push finding below for why).
+direct-push finding below for why). The exception is `b-0022b-gitops-pinned-base`, whose
+paragraph names the repository and path but not the branch, so the base can only come from
+the install (pinned-base mode, below).
 
 The PR base. `submit-suggestion` resolves it as `CREDENTIAL_PROXY_BASE_BRANCH`, else
 `GITOPS_BASE_BRANCH`, else the remote's advertised default branch (`git remote set-head
@@ -211,6 +221,60 @@ measured runs. The pilot makes that the run branch in **default-branch mode** (p
 for runs 14 onward): the stack makes the run branch the repository's default branch for
 the run and restores the original on destroy. Works because the skill re-asks the remote
 before every PR; one run at a time.
+
+**Pinned-base mode** (`gitops_pin_agent_base_branch`, set in the case's own variables; used
+by `b-0022b-gitops-pinned-base`, which grades only b-0022b's search-api objectives and the
+safeguards, since it asks where the pull request lands rather than how much of b-0022b the
+agent repairs) gives the base through the install instead. After the
+seed, `scripts/agent-base-branch.sh` sets `baseBranch` on the PlatformAgent's
+`spec.integration.repositories[]` entry with role `gitops` for `GITOPS_REPO` to the run
+branch, and refuses when the install already sets another base there. The entry is the one
+the operator accepts (only the first with role `gitops`, and not one whose own namespace
+GitHub's grammar refuses or whose repository an earlier entry declares), found as the
+operator resolves a repository (any spelling of the github.com host, a URL, an scp remote or
+a bare name qualified by the entry's or its forge's namespace, surrounding `/` and one `.git`
+dropped, compared case-insensitively), by `scripts/gitops_repo.py`, which `run-branch.sh`
+and the wrapper use for `GITOPS_REPO` too. The wrapper then hands `GITOPS_REPO` on as
+`https://github.com/<owner>/<name>`, the one spelling the harness reads. The write is a JSON
+patch that tests the entry and the resourceVersion, so a concurrent change fails it rather
+than being overwritten; any write to the PlatformAgent moves the resourceVersion, so a
+failed patch is read again and retried a few times, and a base that appeared in between is
+refused. The deprecated `github` alias carries no base, so on a CRD that
+declares the field a PlatformAgent without that entry is refused; the wrapper's agent state
+reset (`AGENT_STATE_RESET=true`) writes the lists form (`forges` and a `gitops` repository)
+for a case that pins its base, on a CRD that has it, and keeps an existing base of that
+repository's entry. The wrapper refuses both cases before anything is built, on a CRD that
+declares the field: a base the install already sets on that entry, and a PlatformAgent
+without the entry when `AGENT_STATE_RESET` is not set to write it. On
+an operator whose CRD declares `spec.integration.repositories[].baseBranch`, the operator
+renders the pin into the credential broker's `CREDENTIAL_PROXY_PINNED_BASES` (the
+repository as `https://<host>/<path>`, and the branch), the broker checks a branch-less clone
+out on it and refuses a proposal onto that repository that targets any other branch, and the
+stack waits until the broker's Deployment holds this repository's pin and has rolled. On an operator
+whose CRD does not declare the field, the API server would drop it, so the stack writes
+nothing (on a CRD from before the lists form the PlatformAgent also stays on the alias),
+logs that, and the broker pins nothing, so the agent's base falls back to the default branch unless it finds the
+run branch on its own; a pull request onto the default is never merged. The wrapper's
+pull-request list tells the outcomes apart (see the comment at the top of
+[the case](../../bench/tasks/b-0022b-gitops-pinned-base/task.yaml)). The stack clears the field on destroy, and after a
+failed pin, when it still names the run branch. On destroy, the removal itself (after a few
+tries) and the waits for the broker to roll off it only warn, so a slow API server or broker does
+not keep the task cluster alive; destroy can then finish with the pin still set. The wrapper's
+leak check is how such a leftover pin surfaces: it warns that a repository entry's
+`baseBranch` still names the run branch, or reports it as unknown when it cannot read the
+PlatformAgent, and the next run's wrapper refuses to start while any entry carries a
+`run/**` base other than its own. The repository's default stays `main` (it
+is not switched), and `run-branch.sh` fast-forwards `main` onto the run branch's starting
+commit, so both branches carry the same broken task directory and only the configured base
+tells them apart. The mode excludes `gitops_switch_default_branch` and needs
+`agent_host_context`. It also needs a task without staged history (refused at plan time:
+`run-branch.sh` does not seed the default for one, so b-0011 cannot use it), a per-run repository whose
+default-branch head is the broken base commit and that commit its root (`run-branch.sh`
+refuses to move the default from a base with parents), and an install whose accepted GitOps
+repository is `GITOPS_REPO` (otherwise the pin step's wait for the operator to render the
+base into the broker (`RENDER_TIMEOUT_SEC` in `scripts/agent-base-branch.sh`) fails). It
+changes the PlatformAgent for the whole install, so one run at a time per
+install.
 
 Runs 1 to 13 used **env mode** instead: `GITOPS_BASE_BRANCH` set on the PlatformAgent's
 `spec.deployment.env`, on a 0.4.0 install whose operator was rebuilt to copy the variable
@@ -222,20 +286,25 @@ variable reaches the gateway container and never the process that opens the PR. 
 per-run base is the credential broker's to enforce (#1498; its direct-push half landed as
 #1669, the base-branch half is #1848).
 
-Both modes were advisory from the agent's point of view: in run 7 a session ran
+Both of those modes (env and default-branch) were advisory from the agent's point of view:
+in run 7 a session ran
 `export GITOPS_BASE_BRANCH=main` and opened a PR against `main`. See Findings.
 
 The run wrapper `bench/hack/run-gitops-pilot.sh` wires all of this for a laptop run:
 venv (optionally another devops-bench through `DEVOPS_BENCH_PIN`, with the case rendered
 to `mode: hold` and the verification budget sized to the entry count when that
 devops-bench accepts hold), the repository URL from `GITOPS_REPO` rendered into the task
-copy over the prompt's `{{GITOPS_REPO}}` placeholder, the stack asked to make the run branch the
-repository's default for the run, tokens from the install's Secret, `AGENT_MODEL` resolved
+copy over the prompt's `{{GITOPS_REPO}}` placeholder, the case from `CASE` for a variant such
+as `b-0022b-gitops-pinned-base` (with `TASK` defaulting to its `gitops_task`), the stack
+asked to make the run branch the repository's default for the run unless the case sets
+`gitops_pin_agent_base_branch`, tokens from the install's Secret, `AGENT_MODEL` resolved
 from the install's LiteLLM config so the result row names the model behind the agent,
 `TF_VAR_*` for the stack, `GITOPS_*` for the harness, `--no-sync` so `uv run` does not
-undo a pin, and the removal of the rendered task copy on exit.
+undo a pin, the pull requests opened during the run listed with their bases (in the log and
+in `campaign.json`, since the harness records `no_pr` for a pull request onto any branch but
+the run branch), and the removal of the rendered task copy on exit.
 Run records (`manifest.json`, `results.json`, `rows.json`) are kept under
-`bench/tasks/<task>-gitops/evidence/<run id>/`, the layout devops-bench PR #244 uses for its
+`bench/tasks/<case>/evidence/<run id>/`, the layout devops-bench PR #244 uses for its
 own evidence; `rows.json` is the artifact the devops-bench leaderboard ingests. Only the
 isolated campaign runs (gke-labs/kube-agents#1773: one repository per run, the agent's state
 reset before each task-run) are kept there, each with its `campaign.json` version stamp,
@@ -244,7 +313,11 @@ reset before each task-run) are kept there, each with its `campaign.json` versio
 b-0022b on `claude-opus-5` (`run_20260918_185657_889776`). The b-0022b cell on
 `gemini-3.7-flash` has no record: its one campaign attempt (2026-09-18) ended in the
 harness's status-turn transport failure with an empty trajectory and a null row, and is
-not kept. The shared-install runs are summarised in the Findings below and in
+not kept. `b-0022b-gitops-pinned-base` (task_version 2) keeps its red run against `main` on
+`gemini-3.7-flash` (`run_20261005_215541_763063`, a per-run repository and a reset agent,
+without the integrity sweep): both search-api objectives failed and the agent's one pull
+request went onto `main`. Its addresses were mapped to documentation ranges for the fixture
+sanitizer. The shared-install runs are summarised in the Findings below and in
 gke-labs/kube-agents#1307's comments; their records are not in the tree (b-0011 run 11 has
 none: its results directory was removed by hand during teardown; b-0011 run 14 and b-0022b
 run 1 failed in the seed).
@@ -279,10 +352,14 @@ health, elapsed) go into `result.metadata["gitops"]` and, because devops-bench p
 The verifiers run only after this wait returns, so they grade the synced cluster (or the
 still-broken one). The pilot records the outcome and does not score it.
 
-Order of one run, end to end: wrapper asks the stack to switch the repository default ->
-devops-bench `tofu apply` (cluster, run branch, Argo, seed, onboarding) -> agent turn and
-delegated cards -> GitOps wait -> verifiers -> `tofu destroy` (cluster and run branch, and
-the default branch restored).
+Order of one run, end to end, in default-branch mode: wrapper asks the stack to switch the
+repository default -> devops-bench `tofu apply` (cluster, run branch, Argo, seed,
+onboarding) -> agent turn and delegated cards -> GitOps wait -> verifiers -> `tofu destroy`
+(cluster and run branch, and the default branch restored). In pinned-base mode: `tofu apply`
+(cluster, run branch and the fast-forward of `main`, Argo, seed, onboarding, then the pin
+and the broker roll) -> agent turn and delegated cards -> GitOps wait -> verifiers ->
+`tofu destroy` (unpin first, then cluster and run branch; the default branch is not
+restored).
 
 ## Repository-side check
 
@@ -338,7 +415,7 @@ wait, which is now 15.
   The harness recorded `no_pr`, since nothing to find. Both halves of #1498 in one run: the
   push the broker should refuse, and the outcome only a live safeguard sees. Run 15, on the
   0.5.0 install, repeated it exactly (violation at 320.3s). The agent's tool-call audit
-  (`hermes.plugin.tool_call_audit` lines in `/opt/data/logs/agent.log` in the gateway pod;
+  (`hermes.plugin.tool_call_audit` lines in `/opt/data/logs/agent.log` in the gateway pod on that release; on today's images, `/opt/data/profiles/platform/logs/audit.jsonl`;
   not part of the run record) shows the mechanism: it calls submit-suggestion with
   `--branch run/<cluster>/b-0011`, the branch the prompt names, so the skill's "branch to
   create" is the base itself and the submit step pushes onto it. The presubmit and nightly

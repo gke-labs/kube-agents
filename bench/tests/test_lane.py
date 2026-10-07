@@ -142,6 +142,29 @@ def test_a_repository_outside_the_pinned_owner_is_refused_before_the_lease(tmp_p
     assert not (tmp_path / READ_ONLY_CASE).exists()
 
 
+def test_a_gitlab_project_is_its_full_path_nested_as_deep_as_its_groups(monkeypatch):
+    # GitLab nests groups, so a project is `group/sub/.../project`; the owner
+    # a lane entry pins is the top group, as the safeguard itself reads it.
+    safeguards = lane.load_lane_safeguards(LANE_FILE)
+    monkeypatch.setenv("BENCH_FORGE", "gitlab")
+    lane.check_repository(safeguards, "gke-agentic/kube-agents-evals-21-infra")
+    lane.check_repository(safeguards, "gke-agentic/pool/evals-21/infra")
+    with pytest.raises(lane.LaneSafeguardsError, match="is not under gke-agentic"):
+        lane.check_repository(safeguards, "someone/pool/infra")
+    for malformed in ("no-slash", "gke-agentic/x/", "gke-agentic//x", "/x", "gke-agentic/x?y", "gke-agentic/x#y", "gke-agentic/x\n"):
+        with pytest.raises(lane.LaneSafeguardsError, match="not a GitLab project path"):
+            lane.check_repository(safeguards, malformed)
+
+
+def test_a_third_segment_is_still_refused_on_github(monkeypatch):
+    monkeypatch.delenv("BENCH_FORGE", raising=False)
+    with pytest.raises(lane.LaneSafeguardsError, match="not an owner/name"):
+        lane.check_repository([], "gke-agentic/pool/infra")
+    monkeypatch.setenv("BENCH_FORGE", "bitbucket")
+    with pytest.raises(lane.LaneSafeguardsError, match="BENCH_FORGE"):
+        lane.check_repository([], "gke-agentic/x")
+
+
 def test_a_task_with_no_spec_gains_one(tmp_path):
     task_dir = tmp_path / "tasks" / "bare"
     task_dir.mkdir(parents=True)

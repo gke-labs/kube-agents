@@ -73,8 +73,10 @@ install without the interview.
   ingress ([`drift-pubsub`](../../modules/drift-pubsub) module): a Log Router
   sink exporting GKE audit logs (`drift_pubsub_sink`), the drift-audit Pub/Sub
   topic (`drift_pubsub_topic`) and pull subscription
-  (`drift_pubsub_subscription`), and the sink-writer and agent-GSA IAM on
-  them; and, with `enable_drift_detector = true` alongside it, the
+  (`drift_pubsub_subscription`), the sink-writer and agent-GSA IAM on
+  them, and publisher on the topic for anything
+  `drift_pubsub_topic_publishers` names; and, with
+  `enable_drift_detector = true` alongside it, the
   `spec.harness.driftDetector.enabled` field that starts the consumer. See
   [Drift audit-log ingress](#drift-audit-log-ingress).
 - Optionally (`model_provider = "vertex_ai"`) the Vertex AI / Model Garden path:
@@ -601,7 +603,7 @@ whose attached service projects are in scope, and the scoping project of a Cloud
 Metrics Scope, whose monitored projects are. Neither is a Resource Manager container, so nothing
 is inherited through them. The composition resolves each at plan time through the
 [`kube-agents-scope-resolver`](../../modules/kube-agents-scope-resolver/README.md) module, with the
-same three reads the reconcile makes each run (the Compute API for a host's service projects, the
+same three selector reads the reconcile makes each run (the Compute API for a host's service projects, the
 Monitoring API for a scope's monitored projects, Resource Manager to name each of those, which the
 Monitoring API returns by number), made with the google provider's own token so they are answered
 for the identity that applies, and hands the members to the IAM module, which binds the allowlist
@@ -635,13 +637,22 @@ the snapshot's `containers` array uses.
 
 `scoped_pool_enabled` arms the scoped service account pool from the same `scope` object: the
 IAM module provisions one reader service account in `project_id` per project the plan listed
-(the management project, `scope.projects` less an exact `exclude.projects` entry, and each
-selector's members; a folder's or organisation's members are not listed at plan time yet, so a
-cluster under a declared container is refused while the pool is armed), keyed on the project id,
+(the management project, `scope.projects` less an exact `exclude.projects` entry, each
+selector's members, and each declared folder's and organisation's members, which the resolver
+lists at plan time with the reconcile's own Cloud Asset Inventory search while the pool is armed
+and never while it is off), keyed on the project id,
 and the chart renders the mapping into the CR as `spec.security.scopedServiceAccountPool` with
 `enabled` set from the same variable, so the broker is armed by this switch alone and never by
 declaring projects. Two clusters in one project share an account by design
 ([`docs/designs/multi-project-scope.md`](../../../docs/designs/multi-project-scope.md) §6).
+A container's member gets a pool account on that apply and nothing else: its grant is the
+container's, inherited, and it is not counted toward `scope.max_projects`. Pool membership under a
+container therefore lags where the grant and discovery do not: a project created beneath a declared
+folder since the last apply is discovered and readable, but refused by the broker until the next
+apply lists it. Listing needs `cloudasset.googleapis.com` on in `project_id` before the first plan
+that arms the pool beside a container, which `install.sh` enables, and
+`roles/cloudasset.viewer` on the container for the planning identity. An exact `exclude.projects`
+entry drops a member from the pool; a glob is the reconcile's alone.
 `scoped_pool_max_accounts` bounds how many the plan may create and refuses a pool past it at plan;
 its default of 100 is GCP's default service-account quota, which the agent's own accounts share, so
 set it to the headroom the project has free rather than leaving a large pool at the default. Off by default, and it should stay off
@@ -755,10 +766,20 @@ subscription (`drift_pubsub_subscription`, default
 `platform-agent-drift-audit-sub`), `roles/pubsub.publisher` on the topic for
 the sink's writer identity, and `roles/pubsub.subscriber` plus
 `roles/pubsub.viewer` on the subscription for the agent's GSA. It also adds
-`pubsub.googleapis.com` to the enabled APIs. Beyond the three names, only the
-module's two required inputs are passed, so its defaults decide the 31-day
-retention and the cluster scope, which is every GKE cluster in the project; a
-caller that needs the module's other knobs instantiates it directly.
+`pubsub.googleapis.com` to the enabled APIs.
+
+`drift_pubsub_topic_publishers` (default `[]`) grants `roles/pubsub.publisher`
+on the topic to each member it lists, on top of the sink's writer identity.
+Leave it empty unless a test harness has to inject synthetic audit records: the
+detector classifies on the `principalEmail` inside each record and Pub/Sub does
+not attach the publisher's identity to the message, so anything that can
+publish here can make the detector report a change nobody made, under any
+principal it names. Never list the agent's own GSA.
+
+Beyond the three names and that list, only the module's two required inputs are
+passed, so its defaults decide the 31-day retention and the cluster scope,
+which is every GKE cluster in the project; a caller that needs the module's
+other knobs instantiates it directly.
 
 Three outputs, each `null` while the flag is off: `drift_pubsub_topic`,
 `drift_pubsub_subscription`, and `drift_pubsub_subscription_id`, the

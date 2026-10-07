@@ -15,6 +15,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -24,6 +25,44 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import chat_platforms  # noqa: E402
 import cluster_agent_profile as cap  # noqa: E402
 import cluster_agent_reconcile as rec  # noqa: E402
+
+# The ScopeTest timing tests prove "these lookups overlapped" and "the run went on without
+# this one" by synchronising with the stubbed lookups rather than timing them: a stub meets
+# its peers at a Barrier, or blocks on an Event the test releases only after reconcile()
+# has returned. Only a regression reaches either bound, so a loaded runner cannot fail a
+# passing test; a sequential map breaks the barrier and a map that waits for a stalled
+# lookup returns after it, both inside this ceiling rather than hanging the suite.
+SYNC_FAILURE_TIMEOUT_SECONDS = 10.0
+# How long a released worker gets to leave threading.enumerate() once the stub it was
+# running has returned, before the test calls it a leaked thread.
+THREAD_EXIT_DEADLINE_SECONDS = 5.0
+
+
+class _Stall:
+    """A stubbed lookup the test holds until after reconcile() has returned.
+
+    ``hold()`` is the stub's body: it blocks on ``release`` and sets ``finished`` on the way
+    out. The test releases it only once reconcile() has returned (``assert_run_went_on``),
+    and cleanup releases it on a failing path so a failed assertion does not hold the worker
+    into the next test. ``finished`` still unset at return is the proof the run went on
+    without the lookup; a map that waited for it returns only after
+    SYNC_FAILURE_TIMEOUT_SECONDS, with ``finished`` set and the lookup's result read.
+    """
+
+    def __init__(self, case: unittest.TestCase):
+        self._case = case
+        self.release = threading.Event()
+        self.finished = threading.Event()
+        case.addCleanup(self.release.set)
+
+    def hold(self) -> None:
+        self.release.wait(SYNC_FAILURE_TIMEOUT_SECONDS)
+        self.finished.set()
+
+    def assert_run_went_on(self, what: str) -> None:
+        """Called once reconcile() has returned: the lookup is still held, then released."""
+        self._case.assertFalse(self.finished.is_set(), f"the run waited out {what}")
+        self.release.set()
 
 
 def _identity(project="p", cluster="c", location="us-central1"):
@@ -1096,20 +1135,23 @@ class ScopeTest(HomesMixin):
         self.assertEqual(self._snapshot()["declared"], rec._empty_scope())
 
     def test_projects_are_listed_concurrently_and_created_in_the_fixed_order(self):
-        import threading, time
-        delay = 0.4
+        # The three explicit listings meet at a barrier, so each is held until all three are
+        # in flight: a map that ran them in turn, or fewer than three at a time, would never
+        # fill it, and the barrier breaks at the failure timeout (BrokenBarrierError out of
+        # the lookup, which reconcile() raises) instead of the test timing the overlap.
+        # The management listing runs alone before the pool and does not take part.
         seen: list[str] = []
         lock = threading.Lock()
+        all_in_flight = threading.Barrier(3, timeout=SYNC_FAILURE_TIMEOUT_SECONDS)
 
-        def slow_list(project, timeout=None):
+        def meeting_list(project, timeout=None):
             with lock:
                 seen.append(project)
-            time.sleep(delay)
+            if project != self.MGMT:
+                all_in_flight.wait()
             return [(project, "c", "us-central1")], rec.OUTCOME_OK
-        start = time.monotonic()
-        report, created, _ = self._run({"projects": ["b", "a", "c"]}, slow_list)
-        elapsed = time.monotonic() - start
-        self.assertLess(elapsed, delay * 4 * 0.7, f"listings ran sequentially ({elapsed:.2f}s)")
+        report, created, _ = self._run({"projects": ["b", "a", "c"]}, meeting_list)
+        self.assertFalse(all_in_flight.broken)
         self.assertEqual(sorted(seen), ["a", "b", "c", self.MGMT])
         self.assertEqual([c[0] for c in created], [self.MGMT, "a", "b", "c"])
 
@@ -1142,24 +1184,20 @@ class ScopeTest(HomesMixin):
         self.assertLessEqual(spans[self.MGMT][1], min(spans["a"][0], spans["b"][0]))
 
     def test_a_listing_still_running_at_the_budget_reads_unreachable_and_the_run_goes_on(self):
-        import time
         self._write_previous([{"id": "gone", "state": rec.STATE_RETIRING}])
-
-        import threading
         cuts: dict[str, float] = {}
+        stall = _Stall(self)
 
         def lister(project, timeout=None):
             cuts[project] = timeout
             if project == "slow":
-                # Honours the timeout the way gcloud's would: sleeps no longer than it.
-                time.sleep(min(1.5, timeout if timeout is not None else 1.5))
+                stall.hold()
             return [], rec.OUTCOME_OK
         before = set(threading.enumerate())
-        start = time.monotonic()
         with mock.patch.object(rec, "LIST_BUDGET_SECONDS", 0.3), mock.patch.object(rec, "LIST_GRACE_SECONDS", 0.05):
             report, _, deleted = self._run({"projects": ["slow", "quick"]}, lister,
                                            profiles=["cluster-g"], identities={"cluster-g": _identity("gone", "g")})
-        self.assertLess(time.monotonic() - start, 1.2)
+        stall.assert_run_went_on("a listing that was still running at the budget")
         self.assertEqual(report["projects"], {self.MGMT: rec.OUTCOME_OK, "quick": rec.OUTCOME_OK, "slow": rec.OUTCOME_UNREACHABLE})
         # Unreachable switches the scope prune off; the snapshot is still written.
         self.assertEqual((deleted, report["retiring"]), ([], ["gone"]))
@@ -1167,9 +1205,14 @@ class ScopeTest(HomesMixin):
         # The worker's own timeout was cut to the budget left, so no thread outlives the run
         # by more than the grace: the interpreter joins the pool's threads at exit.
         self.assertLessEqual(cuts["slow"], 1.0)
-        time.sleep(1.2)
-        # Threads, not a count: an earlier test's pool worker can still be exiting when this starts.
-        self.assertEqual([t for t in threading.enumerate() if t not in before], [])
+        # And once its lookup has returned (it was released above), the worker leaves: no
+        # thread the run started is still alive at the deadline. Threads, not a count: an
+        # earlier test's pool worker can still be exiting when this starts.
+        leftover = [t for t in threading.enumerate() if t not in before]
+        exit_deadline = time.monotonic() + THREAD_EXIT_DEADLINE_SECONDS
+        for thread in leftover:
+            thread.join(max(0.0, exit_deadline - time.monotonic()))
+        self.assertEqual([t for t in leftover if t.is_alive()], [])
 
     # ---- phase 2: folders and organisations through Cloud Asset Inventory ----
 
@@ -1317,24 +1360,22 @@ class ScopeTest(HomesMixin):
                 self.assertEqual(report["maxProjects"], rec.RESOLVED_SET_CAP)
                 self.assertEqual(self._snapshot()[rec.SCOPE_MAX_PROJECTS_KEY], rec.RESOLVED_SET_CAP)
 
-    def test_the_workers_and_the_budget_scale_with_the_cap(self):
-        # Workers first, up to their ceiling, then the budget: a cap of 200 lists with twice
-        # the workers in the same budget; past 400 the workers are capped and the budget
-        # grows a round at a time.
-        per_default = rec.LIST_WORKERS
-        self.assertEqual(rec._list_workers(rec.RESOLVED_SET_CAP), per_default)
-        self.assertEqual(rec._list_workers(rec.RESOLVED_SET_CAP // 2), per_default)
-        self.assertEqual(rec._list_workers(2 * rec.RESOLVED_SET_CAP), 2 * per_default)
-        self.assertEqual(2 * per_default, rec.LIST_WORKERS_MAX, "the ceiling is twice the default until #1913 measures the sandbox")
-        self.assertEqual(rec._list_workers(4 * rec.RESOLVED_SET_CAP), rec.LIST_WORKERS_MAX)
-        self.assertEqual(rec._list_workers(50 * rec.RESOLVED_SET_CAP), rec.LIST_WORKERS_MAX)
+    def test_the_workers_are_fixed_and_the_budget_scales_with_the_cap(self):
+        # The pool is the credential proxy's admitted count at every cap, so a larger cap
+        # lists with the same workers and the budget grows per default cap's worth of
+        # projects; a smaller cap keeps the default budget.
+        self.assertEqual(rec.LIST_WORKERS, 4)
         budget = rec.LIST_BUDGET_SECONDS
+        self.assertEqual(budget, 300)
+        self.assertEqual(rec._list_budget_seconds(1), budget)
+        self.assertEqual(rec._list_budget_seconds(rec.RESOLVED_SET_CAP // 2), budget)
         self.assertEqual(rec._list_budget_seconds(rec.RESOLVED_SET_CAP), budget)
-        self.assertEqual(rec._list_budget_seconds(2 * rec.RESOLVED_SET_CAP), budget)
-        self.assertEqual(rec._list_budget_seconds(4 * rec.RESOLVED_SET_CAP), 2 * budget)
-        self.assertEqual(rec._list_budget_seconds(5 * rec.RESOLVED_SET_CAP), 3 * budget)
-        self.assertEqual(rec._list_budget_seconds(10 * rec.RESOLVED_SET_CAP), 5 * budget)
-        self.assertEqual(rec._prune_budget_seconds(5 * rec.RESOLVED_SET_CAP), 3 * rec.PRUNE_BUDGET_SECONDS)
+        self.assertEqual(rec._list_budget_seconds(rec.RESOLVED_SET_CAP + 1), 2 * budget)
+        self.assertEqual(rec._list_budget_seconds(2 * rec.RESOLVED_SET_CAP), 2 * budget)
+        self.assertEqual(rec._list_budget_seconds(5 * rec.RESOLVED_SET_CAP), 5 * budget)
+        self.assertEqual(rec._list_budget_seconds(50 * rec.RESOLVED_SET_CAP), 50 * budget)
+        self.assertEqual(rec._prune_budget_seconds(rec.RESOLVED_SET_CAP), rec.PRUNE_BUDGET_SECONDS)
+        self.assertEqual(rec._prune_budget_seconds(5 * rec.RESOLVED_SET_CAP), 5 * rec.PRUNE_BUDGET_SECONDS, "the prune floor scales with the list budget")
         # The prune's budget follows the profiles too, per describe rather than per round
         # of workers: the sandbox's CPU serialises the describes, so 120 profiles get the
         # sequential walk's time whatever the worker count, and eight stay on the floor.
@@ -1374,19 +1415,18 @@ class ScopeTest(HomesMixin):
         # wait out the stall (the walk used to be sequential at 30 s per stalled cluster).
         ids = {"cluster-a": _identity(self.MGMT, "a"), "cluster-b": _identity(self.MGMT, "b"),
                "cluster-c": _identity(self.MGMT, "c")}
+        stall = _Stall(self)
 
         def exists(project, cluster, location, timeout=None):
             if cluster == "a":
-                time.sleep(0.6)
+                stall.hold()
             return True if cluster != "c" else False
 
         listings = {self.MGMT: [(self.MGMT, "b", "us-central1")]}
-        started = time.monotonic()
         with mock.patch.object(rec, "PRUNE_BUDGET_SECONDS", 0.2), mock.patch.object(rec, "PRUNE_SECONDS_PER_DESCRIBE", 0.05), \
                 mock.patch.object(rec, "LIST_GRACE_SECONDS", 0.05):
             report, _, deleted = self._run({}, listings, profiles=list(ids), identities=ids, exists=exists)
-        elapsed = time.monotonic() - started
-        self.assertLess(elapsed, 0.55, "the run waited out a stalled describe")
+        stall.assert_run_went_on("a stalled describe")
         self.assertEqual(report["skipped_error"], ["cluster-a"])
         self.assertEqual(report["kept"], ["cluster-b"])
         self.assertEqual(deleted, ["cluster-c"])
@@ -1527,24 +1567,23 @@ class ScopeTest(HomesMixin):
         self.assertEqual(report["projects"][self.MGMT], rec.OUTCOME_OK)
 
     def test_container_searches_share_the_listing_budget_and_the_management_listing_comes_first(self):
-        import time
         calls: dict[str, float] = {}
         order: list[str] = []
+        stall = _Stall(self)
 
         def search(container, timeout=None):
             order.append(container)
             calls[container] = timeout
-            time.sleep(min(1.5, timeout if timeout is not None else 1.5))
+            stall.hold()
             return None, rec.OUTCOME_UNREACHABLE
 
         def lister(project, timeout=None):
             order.append(project)
             calls[project] = timeout
             return [], rec.OUTCOME_OK
-        start = time.monotonic()
         with mock.patch.object(rec, "LIST_BUDGET_SECONDS", 0.3), mock.patch.object(rec, "LIST_GRACE_SECONDS", 0.05):
             report, _, _ = self._run({"projects": ["p2"], "folders": ["111111111111"]}, lister, searches=search)
-        self.assertLess(time.monotonic() - start, 1.5)
+        stall.assert_run_went_on("a container search still running at the budget")
         # Management first, with its full timeout; the container and the explicit project are
         # cut to the budget left, which is the floor once the container has spent it.
         self.assertEqual(order[0], self.MGMT)
@@ -2932,22 +2971,23 @@ class ScopeTest(HomesMixin):
         self.assertEqual(self._snapshot()["resolver"], rec.RESOLVER_ASSET_INVENTORY)
 
     def test_selector_lookups_share_the_listing_budget_with_the_containers(self):
-        import time
         calls: dict[str, float] = {}
+        # One stall for the container search and the selector lookup both: `finished` unset
+        # at return proves the run waited for neither.
+        stall = _Stall(self)
 
-        def slow(group, timeout=None):
+        def stalled(group, timeout=None):
             calls[group] = timeout
-            time.sleep(min(1.5, timeout if timeout is not None else 1.5))
+            stall.hold()
             return None, rec.OUTCOME_UNREACHABLE
 
         def lister(project, timeout=None):
             calls[project] = timeout
             return [], rec.OUTCOME_OK
-        start = time.monotonic()
         with mock.patch.object(rec, "LIST_BUDGET_SECONDS", 0.3), mock.patch.object(rec, "LIST_GRACE_SECONDS", 0.05):
             report, _, _ = self._run({"projects": ["p2"], "folders": ["111111111111"], "metricsScopes": ["mon-proj"]},
-                                     lister, searches=slow, selectors=slow)
-        self.assertLess(time.monotonic() - start, 1.5)
+                                     lister, searches=stalled, selectors=stalled)
+        stall.assert_run_went_on("a lookup still running at the budget")
         self.assertIsNone(calls[self.MGMT])
         self.assertLessEqual(calls["folders/111111111111"], 1.0)
         self.assertLessEqual(calls[self.SCOPE], 1.0)

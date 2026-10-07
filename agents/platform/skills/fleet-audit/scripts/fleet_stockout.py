@@ -137,7 +137,7 @@ AUTOSCALER_STOCKOUT_MESSAGE_IDS = {
 }
 # The `needs_triage` marker on a §3.11 out-of-resources finding whose fix is
 # a new ComputeClass: two files, the class and the workload that selects it,
-# where a finding carries one path. Read by `triage_marked_findings` in
+# where a finding carries one path. Read by `triage_markers` in
 # audit_report.py, which withholds these from the automatic sweep -- so the
 # string has to match the one that file names, and the two files carry it
 # separately because neither imports the other.

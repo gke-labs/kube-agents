@@ -49,6 +49,52 @@ class D1Attributable(unittest.TestCase):
         # front of the principal is the property, not the arity.
         self.assertIn("_sanitize_for_logging(principal.describe()", body)
 
+    def test_D1_no_product_role_can_write_the_identity_table(self) -> None:
+        """A write to the Slack principal map grants a principal.
+
+        The A2A gateway joins a Slack `user_id` to a principal through the
+        admin-owned `a2a-slack-principal-map` Secret, so write access to that
+        table is an impersonation primitive, and spec-chatops-gateway.md says
+        no product ServiceAccount gets it. The operator reaches that Secret by the
+        kubelet's mount alone: this asserts that no Role or ClusterRole it
+        mints names `secrets` at all, or a wildcard that would.
+
+        Two reads, because the rendered `mode: next` object set is in no
+        golden (C5's auth-delegator test records that gap): every Role in the
+        five goldens, which is the legacy product set, and the Go builders of
+        the two Roles the next stack adds, read by function body with a
+        precondition that each body carries the rule it is known to grant, so
+        a rename or a reshape cannot turn this into a scan of nothing.
+
+        Outside this assertion: the operator's own ClusterRole holds
+        `secrets` write by design (it mints the bus credentials, the callout
+        keys and the inject token), and the gateway's `create` on pods can
+        mount a Secret into a pod it builds, which buildA2AGatewayRole's
+        comment records as the admission policy it owes. Neither is a product
+        ServiceAccount writing its identity table through RBAC.
+        """
+        checked = 0
+        for name, documents in h.golden_documents().items():
+            for kind in ("Role", "ClusterRole"):
+                for role in h.objects_of_kind(documents, kind):
+                    checked += 1
+                    for rule in role.get("rules") or []:
+                        resources = set(rule.get("resources") or [])
+                        with self.subTest(fixture=name, role=role["metadata"]["name"], rule=rule):
+                            self.assertNotIn("secrets", resources)
+                            self.assertNotIn("*", resources)
+        self.assertGreater(checked, 0, "no rendered Role was examined")
+
+        for source, builder, known_rule in (
+            ("a2a_gateway_role", "buildA2AGatewayRole", '"pods"'),
+            ("a2a_callout_role", "buildA2ACalloutRole", '"configmaps"'),
+        ):
+            body = h.go_function_body(h.text(source), builder)
+            with self.subTest(builder=builder):
+                self.assertIn(known_rule, body, f"{builder} no longer grants its known rule; the read is misaimed")
+                self.assertNotIn('"secrets"', body)
+                self.assertNotIn('Resources: []string{"*"}', body)
+
     def test_D1_a_log_hint_cannot_forge_a_record(self) -> None:
         """Untrusted bytes reach the log, so the log has one sanitiser in front of it.
 

@@ -614,6 +614,31 @@ drift_detector_enabled() {
   esac
 }
 
+# Whether to pass --log-dropped, which prints one line per record the classifier
+# refuses (logDroppedRecord, k8s-operator/cmd/drift-detector/subscriber.go).
+# Off unless asked for, and the flag's own default says why: the post-sink
+# stream runs 1 to 10 records a second and is about 98% system tier, so leaving
+# it on copies very nearly the whole audit stream into the pod log.
+#
+# Two readers want it on for a shift rather than forever. An operator working
+# out why a change of theirs never arrived needs the reason the filter gave;
+# the eval install needs it to tell "the classifier refused this record" from
+# "nothing reached the detector at all", which are the same silence otherwise
+# and which a drift eval has to report differently — the first is the pipeline
+# regressing, the second is the ingress down. A per-install variable rather
+# than a PlatformAgent field for that reason: it is a log level someone turns
+# up and back down, not a property of the agent the operator reconciles.
+#
+# Unlike DRIFT_DETECTOR_ENABLED this fails towards off silently on a value it
+# does not recognise. The cost of being wrong is log volume, and a warning
+# about it on every pod start would be noisier than the mistake.
+drift_detector_log_dropped() {
+  case "${DRIFT_DETECTOR_LOG_DROPPED:-false}" in
+    [Tt][Rr][Uu][Ee] | 1 | [Yy][Ee][Ss] | [Oo][Nn]) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 # Block until the Session KV server accepts a connection, or the deadline
 # passes. A plain TCP connect rather than a GET /healthz: the detector makes
 # that request itself and acts on the answer, and what is being waited for here
@@ -708,6 +733,13 @@ start_drift_detector() {
   # it reads like a manager named "".
   if [[ -n "${DRIFT_DETECTOR_GITOPS_MANAGERS:-}" ]]; then
     detector_args+=(--gitops-managers="${DRIFT_DETECTOR_GITOPS_MANAGERS}")
+  fi
+
+  # A bare flag rather than a value, so it is appended or omitted rather than
+  # passed false. drift_detector_log_dropped above has the cost of leaving it
+  # on and the two reasons to turn it on.
+  if drift_detector_log_dropped; then
+    detector_args+=(--log-dropped)
   fi
 
   (

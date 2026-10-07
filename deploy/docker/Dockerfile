@@ -779,7 +779,8 @@ RUN cp /tmp/channel-directory/channel_directory_threads.py /opt/hermes/gateway/c
 # deploy/docker/patches/slack_ux_status.py.
 #
 # Slack: with KAGE_SLACK_UX on, a click on one of our choice buttons runs as the
-# clicker's own reply in the thread, echoed and marked answered; it passes the
+# clicker's own reply in the thread, the clicked message rewritten to name who
+# chose what; it passes the
 # same authorization as a typed message. Registered after the plugin action
 # handlers by gateway/slack_ux_clicks.py; with the flag off nothing is
 # registered. Also rides this COPY and RUN. See deploy/docker/patches/slack_ux_clicks.py.
@@ -2210,10 +2211,12 @@ RUN set -eu; \
       HERMES_HOME="${scratch}" /opt/hermes/.venv/bin/python3 -c "\
 import pathlib, sys; \
 from agent.prompt_builder import _get_context_file_max_chars; \
+from agent.title_generator import _auto_title_enabled; \
 soul, config = sys.argv[1], sys.argv[2]; \
 size = len(pathlib.Path(soul).read_text(encoding='utf-8').strip()); \
 cap = _get_context_file_max_chars(); \
-assert size <= cap, '%s is %d chars, over the %d-char context-file cap Hermes takes from %s, so the prompt would carry it truncated' % (soul, size, cap, config)" \
+assert size <= cap, '%s is %d chars, over the %d-char context-file cap Hermes takes from %s, so the prompt would carry it truncated' % (soul, size, cap, config); \
+assert not _auto_title_enabled(), '%s leaves Hermes auto-titling enabled, risking 400 on Vertex minimal thinking (#2523)' % config" \
         "${soul}" "${config_dir}/config.yaml"; \
       rm -rf "${scratch}"; \
     done

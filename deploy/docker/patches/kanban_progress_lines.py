@@ -141,6 +141,7 @@ ROLLING_KINDS = ("heartbeat", "status")
 #: With ``KAGE_SLACK_UX`` on, the blocked kind that may post a question, and
 #: the terminal kind whose report may announce a PR (see ``slack_ux_moments``).
 NEEDS_YOU_KIND = "blocked"
+UNBLOCKED_KIND = "unblocked"
 PR_REPORT_KIND = "completed"
 
 #: With ``KAGE_SLACK_UX`` on, a card beneath a fan-out folds its report into
@@ -608,13 +609,13 @@ def _asked(moments: Any, sub: dict, event_id: int) -> bool:
         return False
 
 
-async def _settle_question(moments: Any, adapter: Any, sub: dict, kind: str) -> None:
-    """Take the buttons off the card's open question: any event means it was answered,
-    since a card blocks again only once unblocked. A new question posts after this."""
+async def _settle_question(moments: Any, adapter: Any, sub: dict, kind: str, event_id: int = 0) -> None:
+    """Take the buttons off the card's open question: any event moves it on, and ``kind``
+    says whether that event means it was answered. A new question posts after this."""
     if moments is None:
         return
     try:
-        await moments.settle_question(adapter, sub)
+        await moments.settle_question(adapter, sub, kind, event_id)
     except Exception as exc:  # noqa: BLE001 — cosmetic; the card has moved on
         logger.debug("kanban progress: settling the question for %s failed: %s", sub.get("task_id"), exc)
 
@@ -626,6 +627,12 @@ async def _pr_opened(moments: Any, adapter: Any, sub: dict, text: str, result: A
         await moments.pr_opened(adapter, sub, text)
     except Exception as exc:  # noqa: BLE001 — the line or report already went out
         logger.debug("kanban progress: the PR message for %s failed: %s", sub.get("task_id"), exc)
+
+
+def _replayed(notification: Any, ev: Any) -> bool:
+    """Whether a silent event is at or behind the card's recorded ``last_ping_event_id``."""
+    event_id = int(getattr(ev, "id", 0) or 0)
+    return bool(event_id) and event_id <= int(notification.sub.get("last_ping_event_id") or 0)
 
 
 def _overtaken(notification: Any, ev: Any) -> bool:
@@ -641,7 +648,7 @@ def _overtaken(notification: Any, ev: Any) -> bool:
     ``last_ping_event_id`` lags it; a note or a retried failure does not.
     """
     event_id = int(getattr(ev, "id", 0) or 0)
-    if event_id and event_id <= int(notification.sub.get("last_ping_event_id") or 0):
+    if _replayed(notification, ev):
         return True
     batch = getattr(notification, "d", None)
     events = batch.get("events") if isinstance(batch, dict) else None
@@ -663,11 +670,17 @@ async def silent_event(notification: Any, ev: Any) -> None:
     keep its ⏸️ (``gateway/slack_ux_reactions.py``). Only
     :data:`SILENT_PLAN_KINDS`, never one replayed or overtaken
     (:func:`_overtaken`), only with ``KAGE_SLACK_UX`` on for a Slack card,
-    and never raises: it runs inside the send loop.
+    and never raises: it runs inside the send loop. An ``unblocked`` overtaken
+    in its batch, not replayed, still settles the question it answered, which
+    the later event would settle as unanswered; one posted for that later
+    event is newer than the unblock and left alone.
     """
     try:
         kind = str(getattr(ev, "kind", "") or "")
-        if kind not in SILENT_PLAN_KINDS or _overtaken(notification, ev):
+        if kind not in SILENT_PLAN_KINDS:
+            return
+        overtaken = _overtaken(notification, ev)
+        if overtaken and (kind != UNBLOCKED_KIND or _replayed(notification, ev)):
             return
         sub = notification.sub
         adapter = getattr(notification, "adapter", None)
@@ -679,9 +692,9 @@ async def silent_event(notification: Any, ev: Any) -> None:
         return
     if adapter is None:
         return
-    if plan is not None:
+    if plan is not None and not overtaken:
         await _settle_plan_row(plan, adapter, sub, kind)
-    await _settle_question(moments, adapter, sub, kind)
+    await _settle_question(moments, adapter, sub, kind, int(getattr(ev, "id", 0) or 0))
     # An unblocked card no longer waits on the user, so its ask loses its pause.
     await _settle_reaction(adapter, sub, kind, getattr(notification, "board_slug", None))
 
@@ -827,7 +840,7 @@ async def deliver(
             # An at-least-once replay of the block whose question is up: settling
             # it would take its buttons off and posting would repeat it.
             return None
-        await _settle_question(moments, adapter, sub, kind)
+        await _settle_question(moments, adapter, sub, kind, event_id)
         if kind == NEEDS_YOU_KIND and moments is not None and await _needs_you(moments, adapter, sub, ev):
             await _settle_reaction(adapter, sub, kind, board)
             return None
@@ -855,7 +868,7 @@ async def deliver(
     payload = getattr(ev, "payload", None)
     line = rolling_line(kind, payload) or message
     moments = _slack_moments(quiet)
-    await _settle_question(moments, adapter, sub, kind)
+    await _settle_question(moments, adapter, sub, kind, event_id)
     result = await _roll(
         adapter, sub, metadata, header, title, line, _moved_to(kind, payload),
         _slack_plan(quiet), event_id, tracked,

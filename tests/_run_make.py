@@ -19,7 +19,7 @@ REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 INHERITED_MAKE_VARS = ("MAKEFLAGS", "MAKELEVEL")
 
 
-def run_make(args, timeout, cwd=None, extra_env=None):
+def run_make(args, timeout, cwd=None, extra_env=None, drop_env=()):
     """Run `make <args>` and return the CompletedProcess.
 
     Defaults to the repository root, which is what the callers driving the root
@@ -31,9 +31,14 @@ def run_make(args, timeout, cwd=None, extra_env=None):
     a `VAR=value` argument: a test that shadows a binary on PATH has to reach
     the environment, and doing that by hand means rebuilding the scrubbing
     above at the call site.
+
+    `drop_env` names variables to remove from the environment before make
+    runs. A `?=` default yields to an exported variable, so a test that wants
+    to observe the Makefile's own default has to make sure the developer's
+    shell is not supplying one; `extra_env` can only add.
     """
     env = dict(os.environ)
-    for name in INHERITED_MAKE_VARS:
+    for name in (*INHERITED_MAKE_VARS, *drop_env):
         env.pop(name, None)
     env.update(extra_env or {})
     return subprocess.run(

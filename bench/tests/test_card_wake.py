@@ -29,6 +29,7 @@ from kube_agents_bench import card_wake
 
 REPO = Path(__file__).resolve().parents[2]
 MOMENTS = REPO / "deploy" / "docker" / "patches" / "slack_ux_moments.py"
+CLICKS = REPO / "deploy" / "docker" / "patches" / "slack_ux_clicks.py"
 SCRIPTS = REPO / "agents" / "platform" / "scripts"
 WORKER_CASES = {
     "chat-voice-retry-says-it-is-retried": card_wake.OUTCOME_CRASHED,
@@ -349,7 +350,7 @@ def _moments_note() -> str:
         spec.loader.exec_module(module)
     finally:
         sys.path.remove(str(SCRIPTS))
-    return module.WAKE_NOTE
+    return f"{module.WAKE_NOTE} {module.WAKE_NOTE_ANSWERED}"
 
 
 def test_parse_reads_the_replay_fields() -> None:
@@ -554,6 +555,128 @@ def test_archive_is_best_effort() -> None:
     assert settled == card_wake.Settled("ready", ())
     assert not settled.archived
 
+
+
+# --- An answer by button (answer_by: click) ----------------------------------
+
+CLICK_PROMPT = PROMPT + "answer_by: click\n"
+
+
+def _with_clicks(root: Path) -> Path:
+    shutil.copy(CLICKS, root / "gateway" / "slack_ux_clicks.py")
+    return _with_moments(root)
+
+
+def test_parse_reads_an_answer_by_click() -> None:
+    assert card_wake.parse(CLICK_PROMPT).clicked
+    assert not card_wake.parse(PROMPT).clicked
+
+
+def test_an_answer_by_anything_but_click_is_an_authoring_error() -> None:
+    with pytest.raises(ValueError, match="answer_by"):
+        card_wake.parse(PROMPT + "answer_by: typing\n")
+
+
+@pytest.mark.parametrize("line", ["Answer_by: click", "answer-by: click", "answer by click"])
+def test_a_line_that_is_not_a_field_is_an_authoring_error(line: str) -> None:
+    with pytest.raises(ValueError, match="is not one of"):
+        card_wake.parse(PROMPT + line + "\n")
+
+
+def test_an_empty_answer_by_is_an_authoring_error() -> None:
+    with pytest.raises(ValueError, match="answer_by"):
+        card_wake.parse(PROMPT + "answer_by:\n")
+
+
+def test_an_empty_session_is_an_authoring_error() -> None:
+    with pytest.raises(ValueError, match="session"):
+        card_wake.parse(PROMPT + "session:\n")
+
+
+def test_a_click_answer_that_is_not_an_option_is_an_authoring_error() -> None:
+    with pytest.raises(ValueError, match="options a click can press"):
+        card_wake.parse(CLICK_PROMPT.replace("answer: seeded-b", "answer: seeded-c"))
+
+
+@needs_moments
+@pytest.mark.skipif(not CLICKS.exists(), reason="main has no deploy/docker/patches/slack_ux_clicks.py")
+def test_a_click_plant_builds_the_turn_the_images_button_sends(hermes_root: Path, tmp_path: Path) -> None:
+    planted = _plant(_shell_for(_with_clicks(hermes_root), tmp_path, CLICK_PROMPT), CLICK_PROMPT)
+
+    assert planted.click is not None and planted.click.startswith("seeded-b")
+    assert planted.card in planted.click
+    assert planted.answer(card_wake.parse(CLICK_PROMPT)) == planted.click
+    assert planted.answer(card_wake.parse(PROMPT)) == "seeded-b"
+
+
+@needs_moments
+@pytest.mark.skipif(not CLICKS.exists(), reason="main has no deploy/docker/patches/slack_ux_clicks.py")
+@pytest.mark.parametrize("option", ["[seeded-b](https://example.com/b)", "`seeded-b`", "**seeded-b**"])
+def test_a_click_plant_presses_a_marked_up_option_by_the_label_its_button_shows(
+    hermes_root: Path, tmp_path: Path, option: str
+) -> None:
+    prompt = CLICK_PROMPT.replace("| seeded-b", f"| {option}").replace("answer: seeded-b", f"answer: {option}")
+
+    planted = _plant(_shell_for(_with_clicks(hermes_root), tmp_path, prompt), prompt)
+
+    assert planted.click is not None and planted.click.startswith("seeded-b")
+
+
+@needs_moments
+@pytest.mark.skipif(not CLICKS.exists(), reason="main has no deploy/docker/patches/slack_ux_clicks.py")
+def test_a_click_plant_on_a_question_shown_without_buttons_names_the_case(hermes_root: Path, tmp_path: Path) -> None:
+    # No question mark before the options, so slack_moments leaves them as text.
+    prompt = CLICK_PROMPT.replace("Which should I look at?", "Pick one to look at.")
+
+    with pytest.raises(card_wake.ReplayBroken, match="shows no buttons"):
+        _plant(_shell_for(_with_clicks(hermes_root), tmp_path, prompt), prompt)
+
+
+@needs_moments
+def test_a_click_plant_on_an_image_without_the_clicks_module_is_broken(hermes_root: Path, tmp_path: Path) -> None:
+    with pytest.raises(card_wake.ReplayBroken, match="slack_ux_clicks"):
+        _plant(_shell_for(_with_moments(hermes_root), tmp_path, CLICK_PROMPT), CLICK_PROMPT)
+    assert [card["status"] for card in _board(tmp_path)["tasks"].values()] == ["archived"]
+
+
+def test_a_click_plant_on_an_image_without_moments_is_broken(hermes_root: Path, tmp_path: Path) -> None:
+    with pytest.raises(card_wake.ReplayBroken, match="slack_ux_moments"):
+        _plant(_shell_for(hermes_root, tmp_path, CLICK_PROMPT), CLICK_PROMPT)
+
+
+def test_a_click_plant_that_built_no_turn_is_broken() -> None:
+    reply = f'{card_wake.REPLAY_PRESENT}\n{{"card": "t_1", "wake": "[kanban] Task t_1 blocked.", "click": null}}'
+    with pytest.raises(card_wake.ReplayBroken, match="no click turn"):
+        card_wake.plant(lambda command, timeout: reply, card_wake.parse(CLICK_PROMPT), 30)
+
+
+def test_merge_carries_the_answer_reply_for_the_verifier() -> None:
+    merged = card_wake.merge(_PLANTED, _result("[SILENT]", [], {}), _result("Unblocked it.", [], {}))
+
+    assert merged.trajectory[-1]["args"]["answer_reply"] == "Unblocked it."
+    assert merged.metadata["final_message"] == "[SILENT]"
+
+
+def test_merge_records_no_answer_reply_for_an_errored_answer_turn() -> None:
+    answer = AgentResult.errored("HTTP 500 from agent endpoint: upstream")
+
+    merged = card_wake.merge(_PLANTED, _result("[SILENT]", [], {}), answer)
+
+    assert "answer_reply" not in merged.trajectory[-1]["args"]
+
+
+def test_merge_keeps_the_reply_of_an_answer_turn_that_parsed_with_warnings() -> None:
+    # No tool call parsed, so only final_message says the turn replied.
+    answer = AgentResult(
+        output="[SILENT]",
+        trajectory=[],
+        errors=["tool output without a matching call"],
+        metadata={"final_message": "[SILENT]"},
+    )
+
+    merged = card_wake.merge(_PLANTED, _result("[SILENT]", [], {}), answer)
+
+    assert merged.trajectory[-1]["args"]["answer_reply"] == "[SILENT]"
 
 
 # --- A typed answer in a fresh session (session: fresh) -----------------------
@@ -793,7 +916,7 @@ def test_a_failure_prompt_reads_a_worker_outcome(outcome: str) -> None:
     assert isinstance(replay, card_wake.Failure)
     assert replay.outcome == outcome
     assert card_wake.plant_command(replay, KEY).endswith(
-        f" {outcome} {card_wake.WORKER_ASSIGNEE} {KEY} '' {card_wake.REPLAY_KEY_PREFIX}"
+        f" {outcome} {card_wake.WORKER_ASSIGNEE} {KEY} '' '' {card_wake.REPLAY_KEY_PREFIX}"
         f" {card_wake.STALE_REPLAY_SECONDS}"
     )
 
@@ -1018,10 +1141,27 @@ def test_merge_sums_tokens_across_sessions_and_keeps_an_empty_reply_empty() -> N
 
 
 def test_merge_keeps_both_turns_errors() -> None:
-    wake = AgentResult(output="a", trajectory=[], errors=["first"])
-    answer = AgentResult(output="b", trajectory=[], errors=["second"])
+    wake = AgentResult(output="a", trajectory=[], errors=["first"], metadata={"final_message": "a"})
+    answer = AgentResult(
+        output="b", trajectory=[], errors=["second"], metadata={"final_message": "b"}
+    )
 
     assert card_wake.merge(_PLANTED, wake, answer).errors == ["first", "second"]
+
+
+def test_merge_leads_with_an_answer_turn_that_failed_after_a_wake_that_warned() -> None:
+    # Scoring reads only errors[0], so the wake's warning would hide the answer's infra marker.
+    wake = AgentResult(
+        output="[SILENT]",
+        trajectory=[],
+        errors=["skipped an item"],
+        metadata={"final_message": "[SILENT]"},
+    )
+    answer = AgentResult.errored("KUBE_AGENTS_INFRA_FAILURE: 429")
+
+    errors = card_wake.merge(_PLANTED, wake, answer).errors
+
+    assert errors == ["KUBE_AGENTS_INFRA_FAILURE: 429", "skipped an item"]
 
 
 def test_merge_records_the_card_as_the_run_left_it() -> None:
@@ -1114,7 +1254,7 @@ def test_the_settled_card_rides_on_the_trajectory_for_the_verifier() -> None:
 
     assert merged.trajectory[-1] == {
         "name": card_wake.SETTLED_ENTRY,
-        "args": {"card": "t_1"},
+        "args": {"card": "t_1", "answer_reply": ""},
         "result": {"status": "ready", "comments": [{"author": "default", "body": "seeded-b"}]},
         "status": "harness",
     }

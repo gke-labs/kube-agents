@@ -149,7 +149,7 @@ class TestProjection(ReportStatusTestCase):
         self.assertEqual(stream["repos"][REPO]["latest"]["findings"], 2)
         self.assertEqual(stream["liveness"], "error")
         self.assertIn("zeta/: ", stream["error"])
-        self.assertEqual(report_status.repo_ids(str(self.root), AUDIT), [REPO])
+        self.assertEqual(report_status.scan_repo_dirs(str(self.root), AUDIT)[0], [REPO])
 
     @unittest.skipIf(hasattr(os, "geteuid") and os.geteuid() == 0, "root reads a mode-000 directory")
     def test_an_unreadable_scratch_is_an_error_not_nothing_in_flight(self):

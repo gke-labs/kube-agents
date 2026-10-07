@@ -48,6 +48,7 @@ on:
       - Operator Tests
       - Prettier Check
       - Python Unit Tests
+      - Step 0 on bash 3.2
       - Validate Repo Structure
     types: [completed]
 

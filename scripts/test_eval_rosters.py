@@ -109,10 +109,12 @@ ADDED_AFTER_THE_SPLIT = [
     "compliance-declared-intent-no-finding",  # the compliance stream's declared-intent step over the same fixture (#1408)
     "compliance-declared-token-shields-siblings",  # the compliance stream's other posture, over the declared-token-workload fixture (#1408)
     "patch-declared-intent-no-finding",  # the patch stream's declared-intent step, over seeded-c's missing upgrade notifications (#1408)
+    "cost-declared-intent-no-finding",  # the waste stream's declared-intent step, over the declared-overrequest-workload fixture (#1408)
 ]
 # Appended at the tail of the nightly file.
 ADDED_AT_THE_TAIL = [
     "chat-routing-own-cluster-namespaces",
+    "chat-reset-history-names-the-command",  # the front door's reset-request reply, #2189
 ]
 MOVED_TO_NIGHTLY = [
     "cluster-agent-pending-replicas-capped-pool",
@@ -153,6 +155,7 @@ ADDED_AFTER_THE_MOVE = [
     "bootstrap-inventory-ranking-delivery",  # the onboarding prioritization stage, #2143
     "chat-question-wake-stays-silent",  # SOUL §2 step 5's already-posted rule
     "chat-question-typed-answer-fresh-session",  # a typed answer from a new thread session
+    "chat-question-click-answer-stays-silent",  # SOUL §1.5 Unblock: silent after a button answer
     "platform-worker-shell-edit-of-shipped-skill",  # the sandbox's image trees, #2096
     "autoops-controller-stall-triage",  # the stall watch on the inject path
     "chat-voice-retry-says-it-is-retried",  # the front door's reply to a crashed card
@@ -348,6 +351,7 @@ INJECT_LANE_EXCLUDED = [
     "chat-voice-failure-leads-with-fact",  # #2039: grades the front door's reply to a blocked card's wake; same door
     "chat-question-wake-stays-silent",  # #2039: grades the front door's silence on a posted question's wake; same door
     "chat-question-typed-answer-fresh-session",  # the same for a typed answer in a session the wake never reached
+    "chat-question-click-answer-stays-silent",  # the same for an answer given by clicking the question's button
     "chat-fanout-fleet-restarts-rows",  # #2039: grades the front door's ack and the fan-out under its one card; same door
 ]
 # The directives a case's prompt opens with to replay a wake into the chat
@@ -363,6 +367,7 @@ INJECT_LANE_EXCLUDED_TIER = {
     "chat-voice-failure-leads-with-fact": "nightly",
     "chat-question-wake-stays-silent": "nightly",
     "chat-question-typed-answer-fresh-session": "nightly",
+    "chat-question-click-answer-stays-silent": "nightly",
     "chat-fanout-fleet-restarts-rows": "nightly",
 }
 

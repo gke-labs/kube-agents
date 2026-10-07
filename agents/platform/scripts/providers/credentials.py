@@ -29,7 +29,10 @@ from __future__ import annotations
 
 import base64
 import logging
+import re
 from typing import Callable, Protocol
+
+from workspace_paths import WorkspaceError
 
 LOGGER = logging.getLogger("credential-proxy.vcs")
 
@@ -195,6 +198,117 @@ class MintedReadCredential:
         return (
             (HTTP_EXTRAHEADER_KEY.format(host=self._host), f"AUTHORIZATION: basic {basic}"),
             helper_cleared,
+        )
+
+
+# The git credential helper a StaticFileCredential points git at, at the fixed
+# path the broker image installs every script under. Git runs a helper value
+# that starts with an absolute path through the shell, with `get` appended, so
+# the value is composed from this literal and two arguments that are checked
+# against _HELPER_ARGUMENT_RE first; nothing a caller sent reaches it.
+TOKEN_FILE_HELPER = "/opt/defaults/scripts/git_credential_token_file.py"
+_HELPER_ARGUMENT_RE = re.compile(r"[A-Za-z0-9._/-]+")
+_HOST_RE = re.compile(r"[a-z0-9]([a-z0-9.-]*[a-z0-9])?(:[0-9]+)?")
+
+
+
+def is_token(token: str) -> bool:
+    """Whether a token file's stripped contents can be a token at all.
+
+    One line of printable ASCII with no spaces: what every forge issues, and
+    the only thing an HTTP header carries unchanged. Kept in step by hand with
+    `git_credential_token_file.py`, which cannot import it.
+    """
+    return bool(token) and token.isascii() and token.isprintable() and " " not in token
+
+class StaticFileCredential:
+    """A long-lived token an administrator put in a Secret, read from its file.
+
+    Nothing to acquire and nothing to refresh, so `ensure` does nothing -- the
+    strategy says the token does not need it rather than implementing a step
+    that returns at once. The file is read on every call instead of once at
+    construction: a rotated Secret updates the projected file, and the next
+    call presents the new token with no restart.
+
+    The API sees it as one header, named and formatted by the forge. Git sees
+    it through a credential helper scoped to the forge's host, which reads the
+    same file, so the token never appears in git's argv, environment or
+    config. The layer first clears `credential.helper`, so for these
+    invocations the ambient helper another forge's CLI installed is never
+    asked -- this host's credential is this file or nothing.
+
+    A missing or empty file is refused, not sent as an unauthenticated call: a
+    request without the token reaches the forge as an anonymous read, which
+    answers a private repository with 404 and reads like the repository is
+    gone.
+    """
+
+    def __init__(
+        self,
+        token_path: str,
+        host: str,
+        *,
+        header: str,
+        header_format: str = "{token}",
+        username: str = "oauth2",
+        helper: str = TOKEN_FILE_HELPER,
+    ) -> None:
+        for name, value in (("token path", token_path), ("username", username)):
+            if not _HELPER_ARGUMENT_RE.fullmatch(value or "") or ".." in value:
+                raise ValueError(f"the {name} {value!r} is not one git may be handed")
+        if not token_path.startswith("/"):
+            raise ValueError(f"the token path {token_path!r} is not absolute")
+        if not _HOST_RE.fullmatch(host or ""):
+            raise ValueError(f"the host {host!r} is not a hostname")
+        self._token_path = token_path
+        self._host = host
+        self._header = header
+        self._format = header_format
+        self._username = username
+        self._helper = helper
+
+    def ensure(self, repo: str) -> None:
+        return None
+
+    def _token(self) -> str:
+        try:
+            with open(self._token_path, encoding="utf-8") as handle:
+                token = handle.read().strip()
+        except UnicodeDecodeError:
+            # Bytes that are not text at all -- a UTF-16 export from Windows
+            # tooling -- are no more a token than a second line is, and get
+            # the same refusal below rather than escaping as a bare 500.
+            token = ""
+        except OSError as exc:
+            raise WorkspaceError(
+                f"the forge credential for {self._host} could not be read: {type(exc).__name__}",
+                status=503,
+                code="FORGE_CREDENTIAL_UNAVAILABLE",
+            ) from exc
+        if not is_token(token):
+            # Empty, more than one line, or carrying a character no forge
+            # token has -- a byte-order mark, a smart quote from a copy-paste.
+            # None is a token, and each splits the credential's two faces: an
+            # invalid header on the API side, a 401 or nothing from the git
+            # helper on the other. Refused here, by the same rule the helper
+            # applies, so both faces say the same thing.
+            raise WorkspaceError(
+                f"the forge credential for {self._host} is empty or is not one line of printable ASCII",
+                status=503,
+                code="FORGE_CREDENTIAL_UNAVAILABLE",
+            )
+        return token
+
+    def headers(self, repo: str) -> dict[str, str]:
+        return {self._header: self._format.format(token=self._token())}
+
+    def git_config(self, repo: str) -> tuple[tuple[str, str], ...]:
+        return (
+            (CREDENTIAL_HELPER_KEY, ""),
+            (
+                f"credential.https://{self._host}.helper",
+                f"{self._helper} {self._token_path} {self._username}",
+            ),
         )
 
 

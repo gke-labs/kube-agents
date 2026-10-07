@@ -5,8 +5,10 @@ Tide credits a presubmit only against the base SHA it ran on. Crier writes that
 SHA into the commit status as a `BaseSHA:<sha>` suffix, and Tide reads it back
 (`prowJobsFromContexts`) so a result outlives the ProwJob object -- as long as
 the SHA still names the head of `main`. Every merge to `main` therefore turns
-every other pull request's green smoke run stale, and Tide re-runs the 1.5-3.5h
-job for a pull request whose head has not changed (#1179, #1202).
+every other pull request's green smoke run stale, and Tide re-runs the job for a
+pull request whose head has not changed (#1179, #1202). Step 0 of that job,
+hack/ci-revalidate.sh, answers such a retest in minutes from the head's own green
+where it once cost the 1.5-3.5h matrix; the re-pin spares even that.
 
 This re-pins the suffix. On every push to `main` it sweeps the open pull
 requests and re-posts each green smoke status with `BaseSHA:` set to the new
@@ -36,10 +38,15 @@ success ProwJob the plugin creates; whichever is the latest, Tide reads it the
 way it reads a green, and so does this (a bare one has no base, which is a
 stale one). So a plain `/override` holds for the head it was given until a
 push whenever the sweep wins the race above, instead of having to be repeated
-after every merge to `main` (#1202). A lost race costs an override more than
-it costs a green: the retest is of a job that was overridden because it cannot
-pass, so it comes back red and the override has to be given again. Upstream's
-`/override-sticky` sentinel has no race, which is one more reason to switch.
+after every merge to `main` (#1202). A lost race no longer costs the override:
+the retest's step 0 (hack/ci-revalidate.sh) reads the status the Prow bot
+posts for the admin's `/override`, the one pointing at that comment, and
+reuses it as it does a green, so the retest exits green in
+seconds instead of running the job that was overridden because it cannot
+pass; the override then holds until a push (step 0 would honour an
+`/override-cancel`, which this Prow build lacks). Upstream's
+`/override-sticky` sentinel has no race at all, which is one more reason to
+switch.
 
 What it will not do: touch a status that is not `success`, pin a pull request
 that does not target `main` (Tide keys the base SHA on the pull request's own
@@ -76,7 +83,7 @@ SUCCESS = "success"
 MAIN_BRANCH = "main"
 MAIN_REF = f"heads/{MAIN_BRANCH}"
 USER_AGENT = "kube-agents-smoke-test-sticky"
-#: Tide's pool wants both; a pull request carrying them is the one a stale base costs hours.
+#: Tide's pool wants both; a pull request carrying them is the one a stale base costs a retest.
 POOL_LABELS = frozenset({"lgtm", "approved"})
 HOLD_LABEL_PREFIX = "do-not-merge"
 SHORT_SHA = 8
@@ -197,7 +204,7 @@ def pin_head(api, sha, main_sha, status_id=None, dry_run=False, check_base=True,
 
 
 def in_tide_pool(pull_request):
-    """Carries the labels Tide merges on and no hold: the ones a stale base costs hours."""
+    """Carries the labels Tide merges on and no hold: the ones a stale base costs a retest."""
     labels = {label.get("name") for label in pull_request.get("labels") or []}
     return POOL_LABELS <= labels and not any(str(name).startswith(HOLD_LABEL_PREFIX) for name in labels)
 
@@ -207,7 +214,7 @@ def sweep(api, main_sha, dry_run=False):
 
     Returns (outcomes, failures). One pull request's failure does not end the
     sweep -- every pull request after it would otherwise wait for the next
-    merge, and a lost pin costs a 1.5-3.5h retest -- but it is counted, so the
+    merge, and a lost pin costs a retest -- but it is counted, so the
     run can exit non-zero and be seen. Each outcome is logged as it happens,
     not after the loop: the log is the only record of the writes this makes,
     and a runner killed mid-sweep must not take the record of the ones already

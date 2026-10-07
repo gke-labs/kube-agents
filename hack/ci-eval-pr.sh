@@ -107,282 +107,23 @@ readonly EVAL_SANDBOX_EXEC_ROUND_TRIP_SECONDS=60
 readonly EVAL_INFLIGHT_GRACE_SECONDS=300
 readonly EVAL_INFLIGHT_POLL_STEP_SECONDS=5
 
-# ─── Step 0: self-revalidation against this PR's own green history (#1179) ───
-# A push that changes only inert files re-runs this whole job and aborts the
-# run in flight -- #1127's comment-only push cost a 123-minute re-run. Prow's
-# skip_if_only_changed filter cannot help: it sees the PR's whole diff against
-# the base, not the delta since the last green build. This step applies the
-# same kind of path predicate to the DELTAS instead: find this PR's newest
-# green build in the job history on GCS, recover that build's head and base
-# SHAs, and if everything that changed since -- on the PR side AND on main's
-# side -- matches the inert list, reuse the green verdict and exit 0 before
-# any cluster work.
-#
-# FAIL-CLOSED THROUGHOUT: every doubt -- no history, unreadable GCS, an
-# unparsable record, a commit the checkout does not have, any file escaping
-# the inert list -- is one log line and a full run. The first run on a PR has
-# no green history, so it is always a full run. EVAL_SKIP_REVALIDATION=1 is
-# the escape hatch: it forces a full run for debugging a suspect reuse.
-#
-# One asymmetry is deliberate: the NEWEST GREEN wins, so a newer red full run
-# at inert distance from an older green is overridden on the next inert
-# trigger. That is the same judgement a passing /retest would render -- an
-# inert delta cannot feed the eval, so the red was flake or infrastructure by
-# construction -- but it does mean reproducing such a red needs either a
-# non-inert push or EVAL_SKIP_REVALIDATION=1 in the job env.
-#
-# What it saves, honestly: the Boskos lease, ci-deploy.sh and ci-teardown.sh
-# run BEFORE and AFTER this script in the Prow job wrapper, so a revalidated
-# run still pays the lease + image build + deploy + teardown (~20-30min of a
-# saturated pool's time), not zero -- what it skips is the eval matrix, the
-# ~2h that dominates the job. Hoisting the check ahead of the lease would be
-# an oss-test-infra change; this one is deliberately kube-agents-side only.
-#
-# Trust surface. For the SELF case, subsumption: a pull request that wants
-# its own context green can already edit this script to `exit 0` -- its own
-# code IS the job -- and a PR that edits the revalidation logic touches
-# hack/, which is not inert, so its own run goes full. That argument does
-# NOT cover the CROSS-PR case: the job history under gs://kube-agents-prow
-# is written by pod utilities that may share the test container's identity,
-# so a hostile PR's run could conceivably plant a fabricated "green" record
-# under a VICTIM PR's history path (kube-agents-bot's review of #1186 built
-# the full attack). The GCS records are therefore never trusted alone: a
-# candidate green build counts only when GitHub holds a SUCCESS status
-# event for this job's context on the recovered head whose target URL names
-# that same build id. Statuses are posted by Prow's reporter with
-# repository write permission -- google-oss-prow[bot] -- which no pull
-# request holds, and the events are append-only per build (a later aborted
-# run does not erase an earlier build's success event; verified against
-# #1127's head 50e0f44f). The SHAs are also required to be 40-hex before
-# any git command sees them, so a forged record cannot smuggle arguments.
-#
-# Downstream note: a revalidated run's build log carries no per-task result
-# lines and no final-verdict line. scripts/eval_dashboard/collect.py already
-# tolerates that shape -- aborted runs produce taskless builds today -- and
-# keys nothing on this job exiting through its normal tail.
+# ─── Step 0: self-revalidation against this PR's own verdicts ──────────────
+# hack/ci-revalidate.sh, which the Prow job also runs before it leases an
+# evaluation project (kube-agents-presubmits.yaml in oss-test-infra). Run
+# here too, first, so a job definition that has not yet hoisted it still
+# saves the eval matrix, and so the next-mode lane that runs this script
+# under its own JOB_NAME is covered the same way. The script's header owns
+# the rules: a green at this head, whatever main has done since (#1202),
+# or at an earlier head when everything since is inert (#1179), is reused;
+# failing both, an admin /override of this head; and every doubt is a full
+# run. EVAL_SKIP_REVALIDATION=1 is the
+# escape hatch. Run through bash rather than by mode: a script that lost its
+# executable bit would otherwise exit 126 with no "Step 0: full run:" line
+# and every run would go full in silence.
+REVALIDATION_SCRIPT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/ci-revalidate.sh"
+readonly REVALIDATION_SCRIPT
 
-# The inert-path predicate. This list may be STRICTER than the Prow yaml's
-# skip_if_only_changed (prow/prowjobs/gke-labs/kube-agents/
-# kube-agents-presubmits.yaml in GoogleCloudPlatform/oss-test-infra), and it
-# deliberately lives here rather than being fetched from there: the worst
-# case of the two diverging is an unnecessary full run, never a wrongly
-# skipped one. Keep it root-anchored -- `docs-evil.go` must not match the
-# docs/ branch, `bench/OWNERS` must not match the OWNERS one, and a .md file
-# below the root (agents/**/*.md is prompt content shipped in the image)
-# must still run the eval.
-readonly REVALIDATION_INERT_PATHS='^((docs|\.github|examples)/|[^/]+\.md$|(LICENSE|OWNERS|OWNERS_ALIASES)$)'
-# Where the job history lives and how a human opens a build from the log.
-readonly REVALIDATION_HISTORY_PREFIX="gs://kube-agents-prow/pr-logs/pull/gke-labs_kube-agents"
-# The job whose history and status context step 0 reads: the running job's
-# own name, which Prow exports as JOB_NAME. Every presubmit that runs this
-# script has its own history path and its own status context, so keying the
-# reuse on a fixed name would let a second job (the next-mode lane runs this
-# same script under EVAL_MODE_NEXT=1) find the today job's green build at
-# the same head and run nothing. Outside Prow the default keeps the log
-# lines and the tests naming the job that exists.
-readonly REVALIDATION_DEFAULT_JOB_NAME="pull-kube-agents-smoke-test"
-readonly REVALIDATION_JOB_NAME="${JOB_NAME:-${REVALIDATION_DEFAULT_JOB_NAME}}"
-readonly REVALIDATION_SPYGLASS_PREFIX="https://oss.gprow.dev/view/gs/kube-agents-prow/pr-logs/pull/gke-labs_kube-agents"
-# The started.json repos key naming this repository's clone record, and the
-# base ref assumed when the decoration did not export PULL_BASE_REF.
-readonly REVALIDATION_REPO_KEY="gke-labs/kube-agents"
-readonly REVALIDATION_DEFAULT_BASE_REF="main"
-# Where the Prow-posted status events live: the attestation that a claimed
-# green build really ran and really passed (see the trust-surface note
-# above). Read with BENCH_GITHUB_TOKEN when the job mounts one, falling back
-# to an anonymous read of the public repo.
-readonly REVALIDATION_STATUS_API="https://api.github.com/repos/gke-labs/kube-agents/commits"
-# How many of the newest builds to inspect for a green one. Each costs one
-# gsutil cat (~1s); an active PR rarely stacks this many pushes between
-# greens, and a bound keeps the fall-through path seconds long.
-readonly REVALIDATION_HISTORY_LIMIT=20
-
-_revalidation_print_delta() { # <label> <range> <files-or-empty>
-  echo "${1} (${2}):"
-  if [ -n "${3}" ]; then
-    printf '%s\n' "${3}" | sed 's/^/    /'
-  else
-    echo "    (empty -- identical trees, trivially inert)"
-  fi
-}
-
-# Returns 0 when the previous green verdict still stands (caller exits 0) and
-# 1 for a full run. Every fall-through path logs exactly one "Step 0: full
-# run:" line naming its reason.
-revalidate_against_green_history() {
-  local repo_dir
-  repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-  if [ "${EVAL_SKIP_REVALIDATION:-}" = "1" ]; then
-    echo "Step 0: full run: EVAL_SKIP_REVALIDATION=1 (escape hatch)"
-    return 1
-  fi
-  if [ -z "${PULL_NUMBER:-}" ] || [ -z "${PULL_PULL_SHA:-}" ] || [ -z "${PULL_BASE_SHA:-}" ]; then
-    echo "Step 0: full run: not a decorated Prow presubmit (PULL_NUMBER, PULL_PULL_SHA or PULL_BASE_SHA unset)"
-    return 1
-  fi
-  if ! command -v gsutil >/dev/null 2>&1; then
-    echo "Step 0: full run: no gsutil on PATH to read the job history with"
-    return 1
-  fi
-  # Preflighted like gsutil so a missing interpreter logs its own reason
-  # instead of every finished.json silently classifying as not-green.
-  if ! command -v python3 >/dev/null 2>&1; then
-    echo "Step 0: full run: no python3 on PATH to parse the job records with"
-    return 1
-  fi
-  if ! command -v curl >/dev/null 2>&1; then
-    echo "Step 0: full run: no curl on PATH to read the GitHub status attestation with"
-    return 1
-  fi
-
-  local history_dir="${REVALIDATION_HISTORY_PREFIX}/${PULL_NUMBER}/${REVALIDATION_JOB_NAME}"
-  local listing
-  if ! listing="$(gsutil ls "${history_dir}/*/finished.json" 2>/dev/null)"; then
-    echo "Step 0: full run: no finished ${REVALIDATION_JOB_NAME} build for PR #${PULL_NUMBER} (first run on this PR, or GCS unreadable)"
-    return 1
-  fi
-
-  # Newest first: build IDs are numeric and monotonically increasing.
-  local candidates
-  candidates="$(printf '%s\n' "${listing}" | sed -n 's|.*/\([0-9][0-9]*\)/finished\.json$|\1|p' | sort -rn | head -n "${REVALIDATION_HISTORY_LIMIT}")"
-  if [ -z "${candidates}" ]; then
-    echo "Step 0: full run: the job history listing held no parseable build ids"
-    return 1
-  fi
-
-  local build prev_green="" finished
-  while read -r build; do
-    [ -n "${build}" ] || continue
-    finished="$(gsutil cat "${history_dir}/${build}/finished.json" 2>/dev/null)" || continue
-    if printf '%s' "${finished}" | python3 -c 'import json,sys; sys.exit(0 if json.load(sys.stdin).get("passed") is True else 1)' 2>/dev/null; then
-      prev_green="${build}"
-      break
-    fi
-  done <<EOF_REVALIDATION_CANDIDATES
-${candidates}
-EOF_REVALIDATION_CANDIDATES
-  if [ -z "${prev_green}" ]; then
-    echo "Step 0: full run: no green build among the newest ${REVALIDATION_HISTORY_LIMIT} ${REVALIDATION_JOB_NAME} builds for PR #${PULL_NUMBER}"
-    return 1
-  fi
-
-  # That build's head and base SHAs, from its started.json clone record:
-  # repos["gke-labs/kube-agents"] reads "main:<base_sha>,<pr>:<head_sha>".
-  local started shas prev_base prev_head
-  if ! started="$(gsutil cat "${history_dir}/${prev_green}/started.json" 2>/dev/null)"; then
-    echo "Step 0: full run: green build ${prev_green} has no readable started.json"
-    return 1
-  fi
-  if ! shas="$(printf '%s' "${started}" | python3 -c '
-import json
-import sys
-
-base_ref, pull, repo_key = sys.argv[1], sys.argv[2], sys.argv[3]
-refs = json.load(sys.stdin)["repos"][repo_key]
-parts = dict(part.split(":", 1) for part in refs.split(","))
-base, head = parts.get(base_ref), parts.get(pull)
-if not base or not head:
-    raise SystemExit(1)
-print(base, head)
-' "${PULL_BASE_REF:-${REVALIDATION_DEFAULT_BASE_REF}}" "${PULL_NUMBER}" "${REVALIDATION_REPO_KEY}" 2>/dev/null)"; then
-    echo "Step 0: full run: could not recover base/head SHAs from green build ${prev_green}'s started.json"
-    return 1
-  fi
-  prev_base="${shas%% *}"
-  prev_head="${shas##* }"
-
-  # Nothing recovered from GCS is trusted yet -- see the trust-surface note
-  # in the header. Three bindings, all fail-closed:
-  #   1. well-formed SHAs, so a forged record cannot smuggle git arguments;
-  #   2. the build's two records agree on the head they claim;
-  #   3. GitHub holds a Prow-posted SUCCESS status event for this job's
-  #      context on that head whose target URL names this very build.
-  local sha
-  for sha in "${prev_base}" "${prev_head}"; do
-    if ! printf '%s' "${sha}" | grep -Eq '^[0-9a-f]{40}$'; then
-      echo "Step 0: full run: build ${prev_green}'s started.json holds a malformed SHA"
-      return 1
-    fi
-  done
-  local finished_revision
-  finished_revision="$(printf '%s' "${finished}" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("revision") or "")' 2>/dev/null)" || finished_revision=""
-  if [ "${finished_revision}" != "${prev_head}" ]; then
-    echo "Step 0: full run: build ${prev_green}'s finished.json revision (${finished_revision:-unreadable}) does not match its started.json head (${prev_head})"
-    return 1
-  fi
-  local statuses curl_auth=()
-  [ -n "${BENCH_GITHUB_TOKEN:-}" ] && curl_auth=(-H "Authorization: Bearer ${BENCH_GITHUB_TOKEN}")
-  statuses="$(curl -fsS --max-time 30 ${curl_auth[@]+"${curl_auth[@]}"} "${REVALIDATION_STATUS_API}/${prev_head}/statuses?per_page=100" 2>/dev/null)" \
-    || statuses="$(curl -fsS --max-time 30 "${REVALIDATION_STATUS_API}/${prev_head}/statuses?per_page=100" 2>/dev/null)" \
-    || { echo "Step 0: full run: could not read GitHub statuses for ${prev_head} to attest green build ${prev_green}"; return 1; }
-  if ! printf '%s' "${statuses}" | python3 -c '
-import json
-import sys
-
-context, build = sys.argv[1], sys.argv[2]
-needle = "/" + context + "/" + build
-for status in json.load(sys.stdin):
-    if (
-        status.get("context") == context
-        and status.get("state") == "success"
-        and needle in (status.get("target_url") or "")
-    ):
-        sys.exit(0)
-sys.exit(1)
-' "${REVALIDATION_JOB_NAME}" "${prev_green}" 2>/dev/null; then
-    echo "Step 0: full run: GitHub holds no ${REVALIDATION_JOB_NAME} success status on ${prev_head} naming build ${prev_green} -- refusing to trust the GCS record alone"
-    return 1
-  fi
-
-  # Both previous SHAs must exist locally. The decorated checkout normally
-  # has them (they are ancestors of the current base and head); a force-push
-  # can orphan prev_head, so try one fetch from origin -- the clonerefs
-  # remote for this repository, never anywhere else -- then fail closed.
-  for sha in "${prev_base}" "${prev_head}"; do
-    if ! git -C "${repo_dir}" cat-file -e "${sha}^{commit}" 2>/dev/null; then
-      git -C "${repo_dir}" fetch --quiet origin "${sha}" 2>/dev/null || true
-      if ! git -C "${repo_dir}" cat-file -e "${sha}^{commit}" 2>/dev/null; then
-        echo "Step 0: full run: commit ${sha} from green build ${prev_green} is not in this checkout"
-        return 1
-      fi
-    fi
-  done
-
-  # --no-renames is load-bearing: with rename detection (git's default) a
-  # `git mv hack/tool.sh docs/tool.md` lists ONLY the inert destination, and
-  # the deletion of the non-inert source becomes invisible to the predicate.
-  # Disabling it makes every rename a delete + add, so the non-inert side
-  # always surfaces.
-  local head_delta base_delta
-  if ! head_delta="$(git -C "${repo_dir}" diff --no-renames --name-only "${prev_head}" "${PULL_PULL_SHA}" 2>/dev/null)"; then
-    echo "Step 0: full run: git diff ${prev_head}..${PULL_PULL_SHA} failed"
-    return 1
-  fi
-  if ! base_delta="$(git -C "${repo_dir}" diff --no-renames --name-only "${prev_base}" "${PULL_BASE_SHA}" 2>/dev/null)"; then
-    echo "Step 0: full run: git diff ${prev_base}..${PULL_BASE_SHA} failed"
-    return 1
-  fi
-
-  # The predicate: EVERY file in BOTH deltas matches the inert list. An empty
-  # delta (identical SHAs) is trivially inert -- nothing changed on that side.
-  local survivors
-  survivors="$(printf '%s\n%s\n' "${head_delta}" "${base_delta}" | grep -v '^$' | grep -Ev "${REVALIDATION_INERT_PATHS}" || true)"
-  if [ -n "${survivors}" ]; then
-    echo "Step 0: full run: files outside REVALIDATION_INERT_PATHS changed since green build ${prev_green}:"
-    printf '%s\n' "${survivors}" | sed 's/^/    /'
-    return 1
-  fi
-
-  echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Step 0: REVALIDATED against green build ${prev_green} -- every change since is inert, skipping the eval matrix ==="
-  echo "Reused verdict: ${REVALIDATION_SPYGLASS_PREFIX}/${PULL_NUMBER}/${REVALIDATION_JOB_NAME}/${prev_green}"
-  echo "Attested by the Prow-posted ${REVALIDATION_JOB_NAME} success status on ${prev_head}"
-  _revalidation_print_delta "head delta" "${prev_head}..${PULL_PULL_SHA}" "${head_delta}"
-  _revalidation_print_delta "base delta" "${prev_base}..${PULL_BASE_SHA}" "${base_delta}"
-  echo "Predicate: every file above matches REVALIDATION_INERT_PATHS ${REVALIDATION_INERT_PATHS}"
-  return 0
-}
-
-if revalidate_against_green_history; then
+if bash "${REVALIDATION_SCRIPT}"; then
   exit 0
 fi
 
@@ -1048,117 +789,18 @@ LEDGER_GRADING_MINT_BODY='{"permissions":{"issues":"read","pull_requests":"read"
 # before its close. Narrowed to the leased repository at mint, as the ledger
 # reset's issues: write is (docs/ci-pool-projects.md 5.3).
 AGENT_PULLS_RESET_PERMISSIONS='{"pull_requests":"write","contents":"write","issues":"write"}'
+# The mint itself, shared with step 0 (hack/ci-revalidate.sh); see
+# _ledger_token_mint below.
+LEDGER_MINT_SCRIPT="${SCRIPT_DIR}/ledger_token_mint.py"
 
 # Emits "<token> <expires_at>" on stdout, diagnostics on stderr, non-zero on
 # any failure -- LEDGER_MINT_RETRYABLE when another attempt could survive it,
-# 1 when it could not. Its own function rather than inline in the command
-# substitution below: bash 3.2, which is what macOS ships and what a
-# contributor runs `bash -n` with, mis-parses a heredoc inside $( ).
+# 1 when it could not. The Python is hack/ledger_token_mint.py rather than a
+# heredoc here so that step 0 (hack/ci-revalidate.sh) mints the same way from
+# the same file: the key path, the ids and the body reach it through the
+# environment, and argv carries the retryable code alone.
 _ledger_token_mint() {
-  python3 - "${LEDGER_MINT_RETRYABLE}" <<'PY'
-import base64
-import json
-import os
-import subprocess
-import sys
-import time
-import urllib.error
-import urllib.request
-
-# Passed in rather than duplicated, so the two halves of the contract cannot
-# drift: the shell decides what it retries, this decides what is retryable.
-retryable = int(sys.argv[1])
-
-
-def temporary(message):
-    sys.stderr.write(message + "\n")
-    sys.exit(retryable)
-
-
-key_file = os.environ["EVAL_LEDGER_APP_KEY_FILE"]
-app_id = os.environ["EVAL_LEDGER_APP_ID"]
-installation_id = os.environ["EVAL_LEDGER_INSTALLATION_ID"]
-# What the token may reach. The grading mint asks for its three reads
-# (LEDGER_GRADING_MINT_BODY) and the ledger reset asks for one repository and
-# `issues: write` (ledger_reset_token). An empty body would mean the
-# installation's whole grant -- issues: write on every pool repository -- so
-# it is refused here rather than sent: a caller that forgets the body fails
-# to mint instead of silently holding the widest token there is. A token
-# narrowed at mint cannot be widened by whoever holds it afterwards.
-mint_body = os.environ.get("LEDGER_MINT_BODY", "").strip()
-if not mint_body:
-    sys.exit(
-        "LEDGER_MINT_BODY is empty; refusing to mint for App %s: a mint without a body "
-        "receives the installation's whole grant, and every caller names what it asks for"
-        % app_id
-    )
-
-
-def b64(raw):
-    return base64.urlsafe_b64encode(raw).rstrip(b"=")
-
-
-# GitHub rejects an App JWT whose exp is more than ten minutes out; nine leaves
-# room for clock skew, and the backdated iat covers a runner that is slow.
-now = int(time.time())
-header = b64(json.dumps({"alg": "RS256", "typ": "JWT"}, separators=(",", ":")).encode())
-payload = b64(
-    json.dumps(
-        {"iat": now - 60, "exp": now + 540, "iss": app_id}, separators=(",", ":")
-    ).encode()
-)
-signing_input = header + b"." + payload
-
-signed = subprocess.run(
-    ["openssl", "dgst", "-sha256", "-sign", key_file],
-    input=signing_input,
-    stdout=subprocess.PIPE,
-    stderr=subprocess.PIPE,
-)
-if signed.returncode != 0:
-    sys.exit(
-        "openssl could not sign with %s: %s" % (key_file, signed.stderr.decode()[:300])
-    )
-jwt = (signing_input + b"." + b64(signed.stdout)).decode("ascii")
-
-mint_headers = {"Authorization": "Bearer " + jwt, "Accept": "application/vnd.github+json", "Content-Type": "application/json", "User-Agent": "kube-agents-ci-eval-pr"}
-request = urllib.request.Request(
-    "https://api.github.com/app/installations/%s/access_tokens" % installation_id,
-    method="POST",
-    headers=mint_headers,
-    data=mint_body.encode(),
-)
-try:
-    with urllib.request.urlopen(request, timeout=30) as response:
-        body = json.load(response)
-except urllib.error.HTTPError as exc:
-    # 401: the PEM is not App app_id's. 404: the installation id is wrong, or
-    # the App was uninstalled from the org. Neither survives another attempt,
-    # and a caller holding two locks should hear about them on the first.
-    # 403 stays terminal with them: on this endpoint it is a suspended
-    # installation as often as a secondary rate limit, and the two read alike
-    # from here. 422 is terminal too: with a body it means the installation
-    # does not hold a permission or repository the body asked for, which is
-    # an organisation-settings change, not something a retry reaches.
-    message = "GitHub answered HTTP %d (%s) minting for App %s installation %s" % (
-        exc.code,
-        exc.reason,
-        app_id,
-        installation_id,
-    )
-    if exc.code >= 500 or exc.code == 429:
-        temporary(message)
-    sys.exit(message)
-except Exception as exc:
-    # A timeout, a reset connection, DNS: api.github.com was not reached, which
-    # says nothing about the credential.
-    temporary(
-        "could not reach api.github.com to mint for App %s (%s: %s)"
-        % (app_id, type(exc).__name__, exc)
-    )
-
-print(body["token"] + " " + body["expires_at"])
-PY
+  python3 "${LEDGER_MINT_SCRIPT}" "${LEDGER_MINT_RETRYABLE}"
 }
 
 # Puts a fresh token in the CALLING shell's BENCH_GITHUB_TOKEN and prints where
@@ -1789,7 +1431,8 @@ check_case_entries "${PRESUBMIT_CASES_FILE}" "${TASKS[@]}"
 PRESUBMIT_CASE_NAMES="$(for ENTRY in "${TASKS[@]}"; do basename "$(dirname "${ENTRY}")"; done)"
 
 # ─── The nightly tier (#1021, the catch-all; #1023/#1024 consume it) ─────────
-# The nightly periodic runs the FULL catalog: every presubmit case above,
+# The nightly periodic runs the FULL catalog (or one part of it, under
+# EVAL_NIGHTLY_PART below): every presubmit case above,
 # identically -- same repetitions, same gate, same reporting order -- PLUS
 # the entries of nightly-cases.txt. That file is the default home of a new
 # case (decided 2026-09-15 on #1546/#1564): it lands there, builds its record
@@ -1840,6 +1483,30 @@ case "${EVAL_TIER}" in
     ;;
   *)
     echo "ERROR: EVAL_TIER must be 'presubmit' or 'nightly', got '${EVAL_TIER}'." >&2
+    exit 1
+    ;;
+esac
+
+# Which part of the nightly matrix this run takes, so the nightly can run as
+# two periodics on two leased projects: the cases that request a pull request
+# run one unit at a time after every other unit (unit_phase, below), and on
+# one project that phase and the infra lock's stretch did not fit the 480m
+# deadline together. "all", the default, is the whole matrix; "main" leaves
+# those cases out and "writers" runs them alone. The split is applied after
+# the lane step, which is what names them. A part outside the nightly would
+# silently run a subset of the presubmit, so it stops the job, as does any
+# other value.
+EVAL_NIGHTLY_PART="${EVAL_NIGHTLY_PART:-all}"
+case "${EVAL_NIGHTLY_PART}" in
+  all) ;;
+  main | writers)
+    if [ "${EVAL_TIER}" != "nightly" ]; then
+      echo "ERROR: EVAL_NIGHTLY_PART=${EVAL_NIGHTLY_PART} selects part of the nightly matrix, but EVAL_TIER=${EVAL_TIER}; unset it, or set it to 'all', outside the nightly." >&2
+      exit 1
+    fi
+    ;;
+  *)
+    echo "ERROR: EVAL_NIGHTLY_PART must be 'all', 'main' or 'writers', got '${EVAL_NIGHTLY_PART}'." >&2
     exit 1
     ;;
 esac
@@ -2000,6 +1667,47 @@ unit_task_path() { # <task-path> <task-name>
     echo "$1"
   fi
 }
+
+# ─── The nightly part ────────────────────────────────────────────────────────
+# EVAL_NIGHTLY_PART (validated at the tier switch) applied to TASKS: after
+# the lane step, which is what names the cases that request a pull request
+# (its log line lists them before this split), and before TASK_NAMES, the
+# stack count, the lock deadlines and the unit queues are built from TASKS,
+# so the run grades and reports only its part. The match is unit_phase's,
+# below. The names left out are kept in NIGHTLY_PART_DROPPED for the
+# BOOTSTRAP_ADMITTED export, as the lane's are.
+# The "Nightly part:" line is the record of which part a night ran, and
+# names the cases the part left out.
+NIGHTLY_PART_DROPPED=""
+if [ "${EVAL_TIER}" = "nightly" ]; then
+  NIGHTLY_MATRIX_SIZE="${#TASKS[@]}"
+  if [ "${EVAL_NIGHTLY_PART}" != "all" ]; then
+    NIGHTLY_PART_KEPT=()
+    for ENTRY in "${TASKS[@]}"; do
+      NAME="$(basename "$(dirname "${ENTRY}")")"
+      case ",${INJECT_LANE_REQUESTING}," in
+        *",${NAME},"*) ENTRY_PART="writers" ;;
+        *) ENTRY_PART="main" ;;
+      esac
+      if [ "${ENTRY_PART}" = "${EVAL_NIGHTLY_PART}" ]; then
+        NIGHTLY_PART_KEPT+=("${ENTRY}")
+      else
+        NIGHTLY_PART_DROPPED="${NIGHTLY_PART_DROPPED}${NAME}
+"
+      fi
+    done
+    TASKS=(${NIGHTLY_PART_KEPT[@]+"${NIGHTLY_PART_KEPT[@]}"})
+    if [ "${#TASKS[@]}" -eq 0 ]; then
+      echo "ERROR: EVAL_NIGHTLY_PART=${EVAL_NIGHTLY_PART} selects no case of the ${NIGHTLY_MATRIX_SIZE}-case nightly matrix (cases that request a pull request: ${INJECT_LANE_REQUESTING:-none}); the run would grade nothing and report green." >&2
+      exit 1
+    fi
+  fi
+  NIGHTLY_PART_LINE="Nightly part: ${EVAL_NIGHTLY_PART} (${#TASKS[@]} of ${NIGHTLY_MATRIX_SIZE} cases)"
+  if [ -n "${NIGHTLY_PART_DROPPED}" ]; then
+    NIGHTLY_PART_LINE="${NIGHTLY_PART_LINE}; left out: $(printf '%s' "${NIGHTLY_PART_DROPPED}" | paste -sd, -)"
+  fi
+  echo "${NIGHTLY_PART_LINE}"
+fi
 
 # Floor for VerificationCorrectness on a repetition of a task that declares a
 # verification_spec. 1.0 while every declared objective is meant to hold
@@ -2293,6 +2001,7 @@ if [ -z "${BLOCKING_ROSTER_ENTRIES}" ]; then
   exit 1
 fi
 BLOCKING_ROSTER_DEFAULT=""
+BLOCKING_ROSTER_ON_LANE=""
 while IFS= read -r NAME; do
   if [ -z "${NAME}" ]; then continue; fi
   if ! grep -qxF -- "${NAME}" <<< "${PRESUBMIT_CASE_NAMES}"; then
@@ -2309,6 +2018,13 @@ while IFS= read -r NAME; do
   if [ -n "${INJECT_LANE_DROPPED:-}" ] && grep -qxF -- "${NAME}" <<< "${INJECT_LANE_DROPPED:-}"; then
     continue
   fi
+  BLOCKING_ROSTER_ON_LANE="true"
+  # A roster case outside this night's part (NIGHTLY_PART_DROPPED, empty
+  # unless EVAL_NIGHTLY_PART names one) leaves the export for the same
+  # reason: the other part's run grades it.
+  if [ -n "${NIGHTLY_PART_DROPPED:-}" ] && grep -qxF -- "${NAME}" <<< "${NIGHTLY_PART_DROPPED:-}"; then
+    continue
+  fi
   BLOCKING_ROSTER_DEFAULT="${BLOCKING_ROSTER_DEFAULT:+${BLOCKING_ROSTER_DEFAULT},}${NAME}"
 done <<< "${BLOCKING_ROSTER_ENTRIES}"
 # The file guard above cannot see the lane's drop: an exclusion list that
@@ -2319,7 +2035,9 @@ done <<< "${BLOCKING_ROSTER_ENTRIES}"
 # the normal approvers, and it must not be able to do what the roster file
 # is guarded against. An explicit BOOTSTRAP_ADMITTED in the job's
 # environment, empty included, is the stated way to mean it, and wins below.
-if [ -z "${BLOCKING_ROSTER_DEFAULT}" ] && [ -n "${INJECT_LANE_DROPPED:-}" ] && [ -z "${BOOTSTRAP_ADMITTED+set}" ]; then
+# Read before the nightly part's drop, which empties the export by design
+# when the part holds no roster case, and is not the lane's doing.
+if [ -z "${BLOCKING_ROSTER_ON_LANE}" ] && [ -n "${INJECT_LANE_DROPPED:-}" ] && [ -z "${BOOTSTRAP_ADMITTED+set}" ]; then
   echo "ERROR: every case in ${BLOCKING_ROSTER_FILE} is excluded on the inject lane (${EVAL_INJECT_LANE_EXCLUSIONS_FILE}); the lane would run with rung 4 disarmed for every case. Trim the exclusion list, or set BOOTSTRAP_ADMITTED explicitly if that is the intent." >&2
   exit 1
 fi
@@ -2427,11 +2145,12 @@ unit_cost_hint() {
     # record and then waits for the card. 1040-1080s a repetition on a dev
     # install on 2026-10-02.
     autoops-controller-stall-triage) echo 1100 ;;
-    # Tofu too: the plant waits for the cron job to file the sweep and for the
-    # sweep's worker to file its cards and end its run (up to the stack's
-    # run_wait, 900s), and the agent turn is a board read. 340-520s a
-    # repetition on 2026-09-28.
-    bootstrap-discovery-fanout) echo 600 ;;
+    # Tofu too: the plant waits for the cron job to file the sweep, then for
+    # the gate's hand-off to file the ranking card or for the sweep's Cluster
+    # Agent cards to settle (up to the stack's handoff_wait, 1800s), and the
+    # agent turn is a board read. About 960s a repetition on a dev install on
+    # 2026-10-05; 340-520s when it waited only for the fan-out (2026-09-28).
+    bootstrap-discovery-fanout) echo 1000 ;;
     # Tofu too: the plant files one card and waits for its worker to run the
     # prioritization SOP and end its run (up to the stack's run_wait, 900s),
     # and the agent turn is a board read. Unmeasured; priced below the band

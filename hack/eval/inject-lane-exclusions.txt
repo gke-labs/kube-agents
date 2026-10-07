@@ -64,6 +64,9 @@ chat-question-wake-stays-silent
 # #2039: the same for a typed answer to that question in a session the wake
 # never reached (session: fresh).
 chat-question-typed-answer-fresh-session
+# #2039: the same for an answer to that question given by clicking its button
+# (answer_by: click).
+chat-question-click-answer-stays-silent
 
 # #2039: grades the chat front door's ack for a fleet question and the
 # platform worker's fan-out beneath the one card it files. The inject door

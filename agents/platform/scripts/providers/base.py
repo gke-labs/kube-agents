@@ -141,6 +141,20 @@ class Forge:
     # CLI-backed forge grants no forge CLI.
     transport = "http"
     cli = ""
+    # The second half of an "http" declaration: the API root every path is
+    # relative to, per instance because one package serves several hosts, and
+    # the "current user" route with the field that names the login (None when
+    # the forge has no such route). Both are read by the broker, which builds
+    # the transport; nothing here makes a call.
+    api_url = ""
+    whoami_route: tuple[str, str] | None = None
+    # The well-known host this forge answers for when an install has not
+    # configured it, and what is missing then. The registry turns them into a
+    # named gap -- "no credential is configured for <host>" -- rather than a
+    # bare "not a forge this install serves", for a forge configured per host
+    # that builds nothing until it is.
+    default_hosts: tuple[str, ...] = ()
+    unconfigured: tuple[str, ...] = ()
     # The few statuses whose shared guidance this forge disagrees with.
     error_overrides: Mapping[int, Override] = {}
     # Whether `proposal-acknowledge` does anything here. A capability rather
@@ -151,6 +165,17 @@ class Forge:
 
     def __init__(self) -> None:
         self.credential: Credential = NoCredential()
+
+    def reach(self, api: Callable) -> tuple[list[str], bool] | None:
+        """The repositories this forge's credential can reach, and whether the
+        list was cut short; None when the forge cannot say.
+
+        Asked once, when the broker starts, so an install can see a token that
+        reaches further than the repositories it manages. A token minted per
+        repository reaches exactly what it was minted for, and its forge has
+        nothing to report.
+        """
+        return None
 
     def read_credential(self, repo: str) -> Credential:
         """A credential that can only read `repo`, for one clone of it.

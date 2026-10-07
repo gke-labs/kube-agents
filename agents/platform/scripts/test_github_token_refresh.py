@@ -1,5 +1,7 @@
 import email.message
+import http.client
 import io
+import json
 import os
 import socket
 import subprocess
@@ -12,6 +14,7 @@ from unittest.mock import MagicMock, call, patch
 
 sys.path.insert(0, str(Path(__file__).parent.absolute()))
 
+import credential_proxy
 import github_token_refresh
 from github_token_refresh import (
     get_current_git_repo,
@@ -192,8 +195,98 @@ class GitHubTokenRefreshTest(unittest.TestCase):
         run.assert_not_called()
         request = urlopen.call_args.args[0]
         self.assertEqual(
-            "http://127.0.0.1:8765/v1/github/refresh", request.full_url
+            "http://127.0.0.1:8765/v1/forge/refresh", request.full_url
         )
+        # Named with its host and provider: a broker serving more than one
+        # forge refuses a bare owner/name.
+        self.assertEqual(
+            {"provider": "github", "repository": "https://github.com/owner/repository"},
+            json.loads(request.data),
+        )
+
+    def _refused(self, urlopen, body, read_error=None):
+        refusal = urllib.error.HTTPError(
+            "http://127.0.0.1:8765/v1/forge/refresh",
+            503,
+            "Service Unavailable",
+            email.message.Message(),
+            io.BytesIO(body),
+        )
+        if read_error is not None:
+            refusal.read = MagicMock(side_effect=read_error)
+        urlopen.side_effect = refusal
+        with patch.dict(
+            os.environ,
+            {"CREDENTIAL_PROXY_URL": "http://127.0.0.1:8765"},
+            clear=False,
+        ):
+            with self.assertRaises(RuntimeError) as cm:
+                refresh_git_credentials("owner/repository")
+        return str(cm.exception)
+
+    @patch("github_token_refresh.subprocess.run")
+    @patch("github_token_refresh.urllib.request.urlopen")
+    def test_sandbox_reports_the_brokers_refusal_text_after_the_code(self, urlopen, run):
+        why = "the credential proxy is at its child memory budget (512 MiB in use of 512 MiB)"
+        message = self._refused(
+            urlopen, json.dumps({"error": why, "code": "CREDENTIAL_PROXY_BUSY"}).encode()
+        )
+        self.assertEqual(
+            f"Credential sidecar failed to refresh GitHub auth: HTTP 503: {why}", message
+        )
+
+    @patch("github_token_refresh.subprocess.run")
+    @patch("github_token_refresh.urllib.request.urlopen")
+    def test_sandbox_reports_the_bare_code_for_a_body_that_is_not_json(self, urlopen, run):
+        message = self._refused(urlopen, b"<html>upstream connect error</html>")
+        self.assertEqual("Credential sidecar failed to refresh GitHub auth: HTTP 503", message)
+
+    @patch("github_token_refresh.subprocess.run")
+    @patch("github_token_refresh.urllib.request.urlopen")
+    def test_sandbox_reports_the_bare_code_for_a_body_cut_short(self, urlopen, run):
+        # IncompleteRead is an HTTPException, neither OSError nor ValueError;
+        # escaping the HTTPError clause it would replace the client's message.
+        message = self._refused(urlopen, b"", read_error=http.client.IncompleteRead(b"{"))
+        self.assertEqual("Credential sidecar failed to refresh GitHub auth: HTTP 503", message)
+
+    @patch("github_token_refresh.subprocess.run")
+    @patch("github_token_refresh.urllib.request.urlopen")
+    def test_sandbox_waits_out_the_brokers_admission_and_the_helper(self, urlopen, run):
+        # Before the helper starts, the broker may hold a refresh on the
+        # refresh lock behind another refresh, queue it behind its child
+        # memory budget, then, if it stepped aside for a vcs verb, wait for
+        # that verb's refresh, each for COMMAND_SLOT_WAIT_SECONDS; a client that
+        # gives up sooner reports a token that landed as a failed refresh.
+        response = MagicMock()
+        response.__enter__.return_value.status = 200
+        urlopen.return_value = response
+
+        with patch.dict(
+            os.environ,
+            {"CREDENTIAL_PROXY_URL": "http://127.0.0.1:8765"},
+            clear=False,
+        ):
+            refresh_git_credentials("owner/repository")
+
+        timeout = urlopen.call_args.kwargs["timeout"]
+        self.assertEqual(github_token_refresh.SIDECAR_REFRESH_TIMEOUT_SECONDS, timeout)
+        # The bound on the wait for the refresh lock, the admission wait, the
+        # wait for a vcs verb's refresh after stepping aside, each
+        # COMMAND_SLOT_WAIT_SECONDS; then its own helper (20 identity, 16.5
+        # Minty, 3 x 15 CLI) and the margin.
+        self.assertEqual(
+            3 * credential_proxy.COMMAND_SLOT_WAIT_SECONDS
+            + github_token_refresh.REFRESH_HELPER_BUDGET_SECONDS
+            + github_token_refresh.SIDECAR_REFRESH_MARGIN_SECONDS,
+            timeout,
+        )
+        self.assertEqual(81.5, github_token_refresh.REFRESH_HELPER_BUDGET_SECONDS)
+        for mirrored in (
+            github_token_refresh.BROKER_ADMISSION_WAIT_SECONDS,
+            github_token_refresh.BROKER_YIELDED_WAIT_SECONDS,
+        ):
+            self.assertEqual(credential_proxy.COMMAND_SLOT_WAIT_SECONDS, mirrored)
+        self.assertGreater(github_token_refresh.SANDBOX_REFRESH_TIMEOUT_SECONDS, timeout)
 
     @patch("github_token_refresh.wif_credentials.fetch_identity_token")
     @patch("github_token_refresh.subprocess.run")
@@ -362,7 +455,7 @@ class GitHubTokenRefreshTest(unittest.TestCase):
     def test_sandbox_fails_immediately_on_sidecar_502(self, urlopen, sleep):
         # The sidecar has already executed retries internally; client fails fast
         err_502 = urllib.error.HTTPError(
-            "http://127.0.0.1:8765/v1/github/refresh",
+            "http://127.0.0.1:8765/v1/forge/refresh",
             502,
             "Bad Gateway",
             email.message.Message(),
@@ -406,7 +499,7 @@ class GitHubTokenRefreshTest(unittest.TestCase):
     @patch("github_token_refresh.urllib.request.urlopen")
     def test_sandbox_fails_immediately_on_4xx_without_retry(self, urlopen, sleep):
         err_403 = urllib.error.HTTPError(
-            "http://127.0.0.1:8765/v1/github/refresh",
+            "http://127.0.0.1:8765/v1/forge/refresh",
             403,
             "Forbidden",
             email.message.Message(),

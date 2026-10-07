@@ -1,0 +1,22 @@
+{
+  "payload": {
+    "number": 1,
+    "comment": {
+      "id": 50084468,
+      "kind": "issue"
+    }
+  },
+  "responses": [
+    {
+      "id": 61000001,
+      "name": "eyes",
+      "user": {
+        "id": 2001,
+        "username": "example-maintainer"
+      },
+      "created_at": "2026-10-01T15:31:02.000Z",
+      "awardable_id": 50084468,
+      "awardable_type": "Note"
+    }
+  ]
+}

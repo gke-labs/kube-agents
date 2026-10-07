@@ -901,6 +901,81 @@ class TestResolveRepo(WorkspaceTestCase):
 # --------------------------------------------------------------------------- #
 
 
+class TestRepositoryKeys(unittest.TestCase):
+    """The forge-neutral reading the broker's managed-repository gate keys on."""
+
+    def keys(self, entries):
+        return gitops_workspace._repository_keys(entries, "managed_repos")
+
+    def test_a_github_entry_is_keyed_under_its_canonical_host_however_written(self):
+        self.assertEqual(
+            ["github:github.com/acme/fleet", "github:github.com/acme/other"],
+            self.keys(
+                [
+                    {"type": "github", "url": "https://github.com/Acme/Fleet"},
+                    {"type": "github", "url": "acme/fleet"},
+                    {"type": "github", "url": "git@github.com:acme/other.git"},
+                ]
+            ),
+        )
+
+    def test_another_forges_entry_keeps_its_host_and_its_nested_path(self):
+        self.assertEqual(
+            ["gitlab:gitlab.example.com/acme/platform/infra"],
+            self.keys(
+                [{"type": "gitlab", "url": "https://gitlab.example.com/acme/platform/infra.git"}]
+            ),
+        )
+
+    def test_a_github_typed_entry_on_another_forge_says_the_type_is_wrong(self):
+        # Review round 4: it has a host and a path, so "no host and path to key
+        # it by" sent the operator to rewrite a URL already in the asked form.
+        for url in ("https://gitlab.com/acme/infra", "https://github.com/acme/infra/sub"):
+            with self.subTest(url=url):
+                with self.assertLogs(gitops_workspace.LOGGER, level="WARNING") as logs:
+                    self.assertEqual([], self.keys([{"type": "github", "url": url}]))
+                out = "\n".join(logs.output)
+                self.assertIn("typed github but is not a github.com owner/name repository", out)
+                self.assertNotIn("no host and path", out)
+
+    def test_an_entry_naming_a_group_is_skipped_with_a_warning(self):
+        # Review round 3: `https://gitlab.com/acme` was keyed silently, and no
+        # forge's parse ever produces a one-segment path, so every project
+        # under the group was refused with nothing pointing at the entry.
+        with self.assertLogs(gitops_workspace.LOGGER, level="WARNING") as logs:
+            keys = self.keys([
+                {"type": "gitlab", "url": "https://gitlab.com/acme"},
+                {"type": "gitlab", "url": "https://gitlab.com/acme/infra"},
+            ])
+        self.assertEqual(["gitlab:gitlab.com/acme/infra"], keys)
+        self.assertIn("names a group or namespace", "\n".join(logs.output))
+
+    def test_the_type_leads_the_key_as_written(self):
+        # The gate matches it against a forge's provider, so `GitHub` is not
+        # `github`, and a github.com URL under another type keys under that type.
+        self.assertEqual(
+            ["GitHub:github.com/acme/secret", "gitlab:github.com/acme/other"],
+            self.keys(
+                [
+                    {"type": "GitHub", "url": "https://github.com/acme/secret"},
+                    {"type": "gitlab", "url": "https://github.com/Acme/Other"},
+                ]
+            ),
+        )
+
+    def test_an_entry_with_no_host_to_key_by_or_no_type_is_skipped(self):
+        with self.assertLogs(gitops_workspace.LOGGER, level="WARNING"):
+            self.assertEqual(
+                [],
+                self.keys(
+                    [
+                        {"type": "gitlab", "url": "acme/infra"},
+                        {"url": "https://github.com/acme/fleet"},
+                    ]
+                ),
+            )
+
+
 class TestContextRepos(WorkspaceTestCase):
     """`context_repos` is a second key in the same ConfigMap, and a different list.
 

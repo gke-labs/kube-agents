@@ -124,9 +124,11 @@ variable "scoped_pool_enabled" {
   description = <<-EOT
     Arms the scoped service account pool: one reader service account per
     project the plan can list in `scope` (project_id, scope.projects less an
-    exact exclude.projects entry, and each selector's members; a folder's or
-    organisation's members are not listed at plan time yet), created in
-    project_id by the kube-agents-iam module and keyed on the project id.
+    exact exclude.projects entry, each selector's members, and, while this is
+    true, each folder's and organisation's members as the scope resolver
+    lists them through Cloud Asset Inventory), created in project_id by the
+    kube-agents-iam module and keyed on the project id. A project created
+    under a declared folder since the last apply gets its account on the next.
     False, the default, provisions no pool and leaves the agent's single
     identity in place, whatever `scope` declares.
 
@@ -702,6 +704,12 @@ variable "drift_pubsub_sink" {
   description = "Log Router sink exporting mutating GKE audit-log calls to the drift topic. Only used when enable_drift_pubsub is true. Guarded by name the way drift_pubsub_topic is, so a second install in the project names its own."
   type        = string
   default     = "platform-agent-drift-audit-sink"
+}
+
+variable "drift_pubsub_topic_publishers" {
+  description = "IAM members granted roles/pubsub.publisher on the drift topic, on top of the sink's own writer identity. Only used when enable_drift_pubsub is true, and empty on an install: the Log Router is what should be putting audit records on this topic, and a member here can make the detector report a change nobody made. The evaluation pool sets it to its CI runners so a bench case can publish synthetic records and exercise the classifier, which it cannot reach any other way — every identity a bench run can authenticate as is a service account the classifier is right to drop. The agent's own service account does not belong here; it already reads this stream."
+  type        = list(string)
+  default     = []
 }
 
 variable "enable_drift_detector" {

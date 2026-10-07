@@ -166,6 +166,17 @@ def _safe_segment(segment: str) -> bool:
     )
 
 
+def is_safe_segment(segment: str) -> bool:
+    """`_safe_segment`, for a caller that checks a segment it did not parse.
+
+    A forge that narrows itself to path prefixes checks them with this, so a
+    prefix it accepts is one `parse` could produce, and a prefix `parse` could
+    never produce is refused where it is configured rather than matching
+    nothing at request time.
+    """
+    return _safe_segment(segment)
+
+
 def _trim(path: str) -> str:
     """Drop surrounding slashes and one trailing `.git`, in either order.
 

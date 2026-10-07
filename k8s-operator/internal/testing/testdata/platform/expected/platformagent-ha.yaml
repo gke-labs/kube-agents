@@ -411,6 +411,19 @@ data:
         Read_from_Head    On
         Path_Key          file_path
 
+    [INPUT]
+        Name              tail
+        Tag               agent.audit
+        Path              /opt/data/logs/audit.jsonl,/opt/data/profiles/*/logs/audit.jsonl
+        Parser            audit_json
+        DB                /fluent-bit/state/fluent-bit-audit.db
+        Refresh_Interval  5
+        Rotate_Wait       30
+        Mem_Buf_Limit     20MB
+        Skip_Long_Lines   On
+        Read_from_Head    On
+        Path_Key          file_path
+
     [FILTER]
         Name          parser
         Match         agent.logs
@@ -420,41 +433,20 @@ data:
         Preserve_Key  On
 
     [FILTER]
-        Name          parser
-        Match         agent.logs
-        Key_Name      log
-        Parser        hermes_audit_line
-        Reserve_Data  On
-        Preserve_Key  On
-
-    [FILTER]
-        Name          parser
-        Match         agent.logs
-        Key_Name      audit_json
-        Parser        audit_json
-        Reserve_Data  On
-        Preserve_Key  Off
-
-    [FILTER]
         Name              record_modifier
-        Match             agent.logs
+        Match             agent.*
         Record            app agent
         Record            log_source agent-file
 
     [OUTPUT]
         Name              stdout
-        Match             agent.logs
+        Match             agent.*
         Format            json_lines
   parsers.conf: |
     [PARSER]
         Name    gchat_event
         Format  regex
         Regex   User=(?<gchat_user>[^,\s]+),\s*Session=(?<gchat_session>[^,\s]+)
-
-    [PARSER]
-        Name    hermes_audit_line
-        Format  regex
-        Regex   ^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d{3} [A-Z]+(?: \[[^\]]*\])? hermes\.(?:plugin\.tool_call_audit|hook\.chat_message_audit): (?<audit_json>\{.*\})$
 
     [PARSER]
         Name    audit_json
@@ -1008,6 +1000,12 @@ spec:
               value: "8388608"
             - name: CREDENTIAL_PROXY_MAX_CONCURRENT_COMMANDS
               value: "8"
+            - name: CREDENTIAL_PROXY_MEMORY_LIMIT_BYTES
+              valueFrom:
+                resourceFieldRef:
+                  containerName: envoy-credential-proxy
+                  divisor: "1"
+                  resource: limits.memory
             - name: CREDENTIAL_PROXY_STATE_DIR
               value: /var/lib/credential-proxy
             - name: CREDENTIAL_PROXY_UNIX_SOCKET
@@ -1211,6 +1209,16 @@ spec:
         - namespaceSelector:
             matchLabels:
               kubernetes.io/metadata.name: gke-gmp-system
+      ports:
+        - port: 8766
+          protocol: TCP
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kubeagents-system
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: kube-agents-operator
       ports:
         - port: 8766
           protocol: TCP
@@ -1999,6 +2007,16 @@ spec:
         - namespaceSelector:
             matchLabels:
               kubernetes.io/metadata.name: gke-gmp-system
+      ports:
+        - port: 9095
+          protocol: TCP
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kubeagents-system
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: kube-agents-operator
       ports:
         - port: 9095
           protocol: TCP

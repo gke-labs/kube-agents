@@ -19,12 +19,28 @@
 #
 # What the plan can list is what gets an account: the host project, each
 # `scope.projects` entry less an exact `exclude.projects` entry, and each
-# selector's members (`local.scope_listed_projects`). A folder's or
-# organisation's members are not listed at plan time yet, so a cluster under a
-# declared container is refused by the broker while the pool is armed, until
-# the follow-up that lists them with the reconcile's own Asset Inventory
-# search lands. The pool is armed by `scoped_pool_enabled` alone, off by
-# default and independent of the scope, so declaring `projects` arms nothing.
+# selector's members (`local.scope_listed_projects`), plus each declared
+# folder's and organisation's members, which the kube-agents-scope-resolver
+# module lists at plan time with the same Asset Inventory search the reconcile
+# runs, only while the pool is armed, and the composition hands in as
+# `scope_container_members` (design §6). A container's member gets an account
+# on that apply and nothing else: no per-project binding, because the
+# container-level grant (scope.tf) is inherited, and no place in the
+# resolved-set count, because containers come last in the reconcile's order
+# and are not counted at plan. So the container grant and discovery stay
+# zero-touch while pool membership under a container lags: a project created
+# beneath it since the last apply is refused by the broker until the next
+# apply lists it. The listing is one answer from an eventually consistent
+# index, and the plan carries no state to grace it with, unlike the
+# reconcile's day for a member the index omits: a project the index leaves
+# out on one plan loses its account on that apply and gets a new one, under
+# a new unique ID, on the next (the resolver warns when a container answers
+# no member at all, the shape an index gap most often takes); a project
+# pinned in `scope.projects` does not depend on the index. An exact
+# `exclude.projects` entry drops a member from the pool; a glob is the
+# reconcile's alone. The pool is armed by
+# `scoped_pool_enabled` alone, off by default and independent of the scope, so
+# declaring `projects` arms nothing.
 #
 # UPDATE 2026-08-12: the accounts hold no IAM grant. The IAM Condition that was
 # supposed to scope them grants nothing for Kubernetes object operations, and
@@ -46,16 +62,42 @@
 # loop the agent is supposed to be bounded by.
 
 locals {
+  # The keys the resolver's container_members output uses, one per declared
+  # container; the precondition in main.tf requires each in
+  # scope_container_members while the pool is armed.
+  scoped_pool_container_keys = concat(
+    [for folder in local.scope_folders : "folders/${folder}"],
+    [for organization in local.scope_organizations : "organizations/${organization}"],
+  )
+  scoped_pool_containers_listed = alltrue([for key in local.scoped_pool_container_keys : contains(keys(var.scope_container_members), key)])
+
+  # The containers' members, less the host project (listed already) and an
+  # exact exclude.projects entry. Only the declared containers' entries are
+  # read, so a stale key in the input adds nothing.
+  scoped_pool_container_members = toset([
+    for project in flatten([for key in local.scoped_pool_container_keys : lookup(var.scope_container_members, key, [])]) : project
+    if project != var.project_id && !contains(var.scope.exclude.projects, project)
+  ])
+
+  # The pool's set: what the plan lists for the resolved-set count plus the
+  # containers' members, which join the pool and nothing else.
+  # `tests/test_scoped_sa_pool_iam.py` pins this union, so a member cannot
+  # reach the pool another way.
+  scoped_pool_projects = setunion(
+    local.scope_listed_projects,
+    local.scoped_pool_container_members,
+  )
+
   # Keyed on the bare project id, which is the key the credential broker looks
   # the account up by (`scoped_sa_pool.py` keys its members on `projectId`).
   # One string, spelled once: every Critical this project has found came from
   # a checker and an enforcer parsing the same input differently, and the
   # cheapest defence is to give them nothing to disagree about.
   # `tests/test_scoped_sa_pool_iam.py` pins that the for_each iterates the
-  # listed projects and keys on the id, so a change here fails a test rather
+  # pool's projects and keys on the id, so a change here fails a test rather
   # than silently filing an account under a key no request will ever produce.
   scoped_pool = var.scoped_pool_enabled ? {
-    for project_id in local.scope_listed_projects :
+    for project_id in local.scoped_pool_projects :
     project_id => {
       project_id = project_id
 

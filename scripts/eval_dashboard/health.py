@@ -213,6 +213,24 @@ STORM_COOLDOWN = timedelta(minutes=30)
 # in a run are background noise on any day and must not hold GREEN off.
 STORM_RUN_SIGNATURE_REPS = 5
 
+# --- Replay errors (#2328) ---------------------------------------------------
+# A card-wake replay whose plant or turn failed in the image (ReplayBroken) or
+# whose directive/prompt was invalid returns an errored result; at bench-gate
+# it blocks at rung 3. The reason carries "the record is not evidence of a real
+# agent run" and "trajectory is empty", which STORM_REASON_RE matches;
+# recognised before the storm check so a broken replay is classified as a
+# graded fail rather than a storm repetition.
+REPLAY_ERROR_RE = re.compile(
+    r"ReplayBroken"
+    r"|ReplayMismatch"
+    r"|failure wake:"
+    r"|question wake:"
+    r"|thread context:"
+    r"|replay declares"
+    r"|\[bench:(?:card-failure|slack-question)-wake\]",
+    re.IGNORECASE,
+)
+
 # --- Rule 2b: delegation ceiling -> DEGRADED (#1874, #1879) -------------------
 # Incident: the platform agent's kanban dispatcher stalls under load ("ready
 # queue non-empty ... 0 workers spawned", 23 warnings on the 2026-09-21
@@ -565,9 +583,9 @@ STEP_RE = re.compile(r"(\d+)([mh])")
 # fixture is a week of real data.json, ten times smaller compressed.
 GZIP_SUFFIX = ".gz"
 # How many characters of a repetition's reason the fixture trimmer keeps:
-# every phrase STORM_REASON_RE matches sits inside the first 96 characters
-# of the harness's phrasings, and the dashboard keeps 300.
-TRIM_REASON_CHARS = 96
+# every phrase STORM_REASON_RE and REPLAY_ERROR_RE matches sits inside the
+# first 128 characters of the harness's phrasings, and the dashboard keeps 300.
+TRIM_REASON_CHARS = 128
 # The optional run fields (SCHEMA.md) the trimmer carries when the source has
 # them; absent stays absent: how the build ended, and the eval's own verdict,
 # which is what tells a deadline kill from a long red.
@@ -620,15 +638,19 @@ def rep_kind(rep: dict) -> str:
     `storm` is what the harness could not grade: an `infra` verdict, or a
     `fail` whose reason is one of the never-ran phrasings (graded `fail`
     before #1184, classified `infra` after it -- the text is the same).
+    A harness-declared replay error (#2328) is a graded fail, not a storm.
     """
     result = rep.get("result")
     if result == REP_RESULT_PASS:
         return REP_PASS
-    if DELEGATION_CEILING_MARKER in (rep.get("reason") or ""):
+    reason = rep.get("reason") or ""
+    if DELEGATION_CEILING_MARKER in reason:
         return REP_CEILING
+    if result != REP_RESULT_INFRA and "KUBE_AGENTS_INFRA_FAILURE" not in reason and REPLAY_ERROR_RE.search(reason):
+        return REP_FAIL
     if result == REP_RESULT_INFRA:
         return REP_STORM
-    if STORM_REASON_RE.search(rep.get("reason") or ""):
+    if STORM_REASON_RE.search(reason):
         return REP_STORM
     return REP_FAIL
 
@@ -1583,6 +1605,10 @@ def pool_wait_p50_s(artifact: dict | None, now: datetime) -> int | None:
         return None
     measured = parse_iso(artifact.get("window_end"))
     if measured is None or now - measured > POOL_STALE_AFTER:
+        return None
+    # An UNMEASURED artifact still carries the days that did read; the headline
+    # must not quote one above the note that says the wait is unknown.
+    if artifact.get("verdict") == POOL_UNMEASURED:
         return None
     # The newest judged row, not the newest row. The producer withholds a
     # verdict below its sample floor, and at 13:00 UTC today's row holds only

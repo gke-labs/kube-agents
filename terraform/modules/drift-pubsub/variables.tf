@@ -31,6 +31,17 @@ variable "topic_name" {
   default     = "platform-agent-drift-audit"
 }
 
+variable "topic_publishers" {
+  description = "Extra members granted roles/pubsub.publisher on the topic, beyond the sink's own writer identity. Empty on a real install: the Log Router is the only thing that should be able to put an audit record on this topic, and anything that can publish here can make the detector report drift that never happened. The evaluation pool sets it to its CI runners, whose drift cases publish synthetic records so the detector's classifier is exercised end to end rather than bypassed -- a bench fixture cannot reach the classifier any other way, because every identity it can authenticate as is a service account the classifier is right to drop. Do not add the agent's own service account: the detector would then be reading a stream its own pod can write."
+  type        = list(string)
+  default     = []
+
+  validation {
+    condition     = alltrue([for member in var.topic_publishers : can(regex("^(serviceAccount|user|group|principal|principalSet):", member))])
+    error_message = "each topic_publishers entry must be a fully qualified IAM member (serviceAccount:, user:, group:, principal: or principalSet:)."
+  }
+}
+
 variable "subscription_name" {
   description = "Pub/Sub subscription the drift detector pulls audit entries from"
   type        = string
