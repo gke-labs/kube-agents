@@ -809,23 +809,25 @@ func completeTask(t *testing.T, exec *lib.TaskExecution, text string) {
 	}
 }
 
-// delegated runs a session turn that delegates, waits for the chain on the
-// record, and ends the delegating turn as the adapter does. It returns the
-// parent's submission, its bus session and the child's submission (the nth
-// on platform).
-func delegated(t *testing.T, r *rig, spawn *fakeSpawner, conv string, nth int) (*lib.Envelope, string, *lib.Envelope) {
+// delegated runs a session turn that delegates, stamped as arriving through
+// backend ("" is the rig's own; sessionTurnVia), waits for the chain on the
+// record, and ends the delegating turn as the adapter does, waiting for its
+// terminal to relay. It returns the parent's submission, its bus session and
+// the child's submission (the first on platform).
+func delegated(t *testing.T, r *rig, spawn *fakeSpawner, conv, backend string) (*lib.Envelope, string, *lib.Envelope) {
 	t.Helper()
-	exec, origin, session := sessionTurn(t, r, spawn, conv, "how is the fleet?")
+	exec, origin, session := sessionTurnVia(t, r, spawn, conv, backend, "how is the fleet?")
 	if err := exec.PublishArtifact(context.Background(), delegateArtifact(t, "platform", "report fleet health")); err != nil {
 		t.Fatal(err)
 	}
-	child := awaitSubmission(t, r, targetPlatform, nth)
+	child := awaitSubmission(t, r, targetPlatform, 0)
 	waitFor(t, "chain on the record", func() bool {
 		rec, _ := r.g.reg.Get(context.Background(), conv)
 		pref, _ := rec.TaskRefFor(origin.TaskID)
 		return len(pref.Children) == 1
 	})
 	completeTask(t, exec, "delegated to platform")
+	waitFor(t, "parent terminal relayed", postedContaining(r, "delegated to platform"))
 	return origin, session, child
 }
 
@@ -836,7 +838,7 @@ func TestTheChildsTerminalWakesTheSessionWithTheResult(t *testing.T) {
 	r, spawn := startRigWithSpawner(t)
 	ctx := context.Background()
 	conv := "discord:g1/t-wake"
-	origin, session, child := delegated(t, r, spawn, conv, 0)
+	origin, session, child := delegated(t, r, spawn, conv, "")
 	completeTask(t, r.execFor(t, child, targetPlatform), "fleet is green")
 
 	waitFor(t, "child result relayed", postedContaining(r, "fleet is green"))
@@ -913,7 +915,7 @@ func TestAChildsEndWakesWithTheOutcome(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			r, spawn := startRigWithSpawner(t)
 			ctx := context.Background()
-			_, _, child := delegated(t, r, spawn, "discord:g1/t-wake-end", 0)
+			_, _, child := delegated(t, r, spawn, "discord:g1/t-wake-end", "")
 			if tc.supervisor {
 				if err := r.g.publishSupervisorTerminal(ctx, targetPlatform, child.TaskID, child.ContextID, child.CorrelationID, tc.state, tc.reason); err != nil {
 					t.Fatal(err)
@@ -938,7 +940,7 @@ func TestRejectionsCannotGrowTheChainPastTheBound(t *testing.T) {
 	r, spawn := startRigWithSpawner(t)
 	ctx := context.Background()
 	conv := "discord:g1/t-wake-loop"
-	_, _, child := delegated(t, r, spawn, conv, 0)
+	_, _, child := delegated(t, r, spawn, conv, "")
 	for depth := 1; depth <= defaultDelegationDepthMax; depth++ {
 		publishFinal(t, r, child, targetPlatform, lib.StateRejected, "capability refused")
 		waitFor(t, "wake spawn", func() bool { return len(spawn.calls()) == depth+1 })
@@ -988,7 +990,7 @@ func TestAHumanStopOnTheChildDoesNotWake(t *testing.T) {
 	r, spawn := startRigWithSpawner(t)
 	ctx := context.Background()
 	conv := "discord:g1/t-wake-stop"
-	_, _, child := delegated(t, r, spawn, conv, 0)
+	_, _, child := delegated(t, r, spawn, conv, "")
 	sessionRigTurn(r, conv, "stop-1", "stop")
 	waitFor(t, "cancel sent", postedContaining(r, "cancel sent"))
 	_ = r.execFor(t, child, targetPlatform).PublishStatus(ctx, lib.StateCanceled, true)
@@ -1012,7 +1014,7 @@ func TestTheWakeHonoursTheCapAndTheResultStands(t *testing.T) {
 	r, spawn := startRigWithSpawnerCap(t, "platform", 1, nil)
 	ctx := context.Background()
 	conv := "discord:g1/t-wake-cap"
-	_, _, child := delegated(t, r, spawn, conv, 0)
+	_, _, child := delegated(t, r, spawn, conv, "")
 	// The parent's pod is still on the record, so the wake is a replacing
 	// spawn (limit cap+1): cap+1 live is what refuses it.
 	spawn.setLive(2)
@@ -1043,7 +1045,7 @@ func TestTheWakeHonoursTheCapAndTheResultStands(t *testing.T) {
 func TestNoWakeWhenTheRequesterAgedOut(t *testing.T) {
 	r, spawn := startRigWithSpawner(t)
 	conv := "discord:g1/t-wake-ttl"
-	origin, _, child := delegated(t, r, spawn, conv, 0)
+	origin, _, child := delegated(t, r, spawn, conv, "")
 	waitFor(t, "parent terminal folded", postedContaining(r, "delegated to platform"))
 	putRecord(t, r, conv, func(rec *SessionRecord) {
 		for i := range rec.Tasks {
@@ -1101,7 +1103,7 @@ func TestChildBeforeParentTerminalStillClosesTheParentsLine(t *testing.T) {
 func TestAWakeAfterAGatewayRestartStillCarriesTheRequester(t *testing.T) {
 	r, spawn := startRigWithSpawner(t)
 	conv := "discord:g1/t-wake-restart"
-	origin, session, child := delegated(t, r, spawn, conv, 0)
+	origin, session, child := delegated(t, r, spawn, conv, "")
 	waitFor(t, "parent terminal relayed", postedContaining(r, "delegated to platform"))
 	r2, spawn2 := restartRig(t, r)
 	completeTask(t, r2.execFor(t, child, targetPlatform), "done")
@@ -1123,7 +1125,7 @@ func TestAWakeAfterAGatewayRestartStillCarriesTheRequester(t *testing.T) {
 // marked, while the conversation still gets the whole result.
 func TestAnOverCapResultIsTruncatedInTheWake(t *testing.T) {
 	r, spawn := startRigWithSpawner(t)
-	_, _, child := delegated(t, r, spawn, "discord:g1/t-wake-big", 0)
+	_, _, child := delegated(t, r, spawn, "discord:g1/t-wake-big", "")
 	big := strings.Repeat("é", lib.DelegateTextCap) // two bytes a rune: twice the cap
 	completeTask(t, r.execFor(t, child, targetPlatform), big)
 	waitFor(t, "wake spawn", func() bool { return len(spawn.calls()) == 2 })
@@ -1161,7 +1163,7 @@ func TestHumanTextWhileTheChildRunsSteersTheChild(t *testing.T) {
 	r, spawn := startRigWithSpawner(t)
 	ctx := context.Background()
 	conv := "discord:g1/t-steer"
-	_, _, child := delegated(t, r, spawn, conv, 0)
+	_, _, child := delegated(t, r, spawn, conv, "")
 	waitFor(t, "parent terminal relayed", postedContaining(r, "delegated to platform"))
 	cexec := r.execFor(t, child, targetPlatform)
 	if err := cexec.PublishStatus(ctx, lib.StateWorking, false); err != nil {
@@ -1190,7 +1192,7 @@ func TestAStopOnTheChildCancelsItOnPlatform(t *testing.T) {
 	r, spawn := startRigWithSpawner(t)
 	ctx := context.Background()
 	conv := "discord:g1/t-stop-child"
-	_, session, child := delegated(t, r, spawn, conv, 0)
+	_, session, child := delegated(t, r, spawn, conv, "")
 	sessionRigTurn(r, conv, "stop-1", "stop")
 	waitFor(t, "cancel on platform's in subject", func() bool {
 		for _, e := range inSubjectEnvelopes(t, r.url, targetPlatform) {
@@ -1219,7 +1221,7 @@ func TestHealAfterRestartSeesTheChildAsActive(t *testing.T) {
 	r, spawn := startRigWithSpawner(t)
 	ctx := context.Background()
 	conv := "discord:g1/t-heal"
-	_, _, child := delegated(t, r, spawn, conv, 0)
+	_, _, child := delegated(t, r, spawn, conv, "")
 	waitFor(t, "parent terminal relayed", postedContaining(r, "delegated to platform"))
 	if err := r.execFor(t, child, targetPlatform).PublishStatus(ctx, lib.StateWorking, false); err != nil {
 		t.Fatal(err)
@@ -1250,7 +1252,7 @@ func TestAHealedChildNoLongerBlocksADelegation(t *testing.T) {
 	r, spawn := startRigWithSpawnerCap(t, "platform", 0, func(c *Config) { c.FirstEventGrace = grace })
 	ctx := context.Background()
 	conv := "discord:g1/t-heal-child"
-	_, _, child := delegated(t, r, spawn, conv, 0)
+	_, _, child := delegated(t, r, spawn, conv, "")
 	waitFor(t, "parent terminal relayed", postedContaining(r, "delegated to platform"))
 	time.Sleep(grace + 100*time.Millisecond)
 
@@ -1454,7 +1456,7 @@ func TestASteerIntoTheChildIsCheckedAtTheWakesDelegation(t *testing.T) {
 	})
 	ctx := context.Background()
 	conv := "discord:g1/t-steer-child"
-	_, _, child := delegated(t, r, spawn, conv, 0)
+	_, _, child := delegated(t, r, spawn, conv, "")
 	waitFor(t, "parent terminal relayed", postedContaining(r, "delegated to platform"))
 	cexec := r.execFor(t, child, targetPlatform)
 	_ = cexec.PublishStatus(ctx, lib.StateWorking, false)
@@ -1569,7 +1571,7 @@ func TestAHealThatFindsTheChildsTerminalWakesTheSession(t *testing.T) {
 	r, spawn := startRigWithSpawner(t)
 	ctx := context.Background()
 	conv := "discord:g1/t-heal-wake"
-	_, _, child := delegated(t, r, spawn, conv, 0)
+	_, _, child := delegated(t, r, spawn, conv, "")
 	waitFor(t, "parent terminal relayed", postedContaining(r, "delegated to platform"))
 	cexec := r.execFor(t, child, targetPlatform)
 	r2, spawn2 := restartRig(t, r, func() {
@@ -2033,7 +2035,7 @@ func TestTheTurnsAskIsOnItsEntryAndAWakeWithoutOneFallsBack(t *testing.T) {
 	r, spawn := startRigWithSpawner(t)
 	ctx := context.Background()
 	conv := "discord:g1/t-wake-noask"
-	origin, _, child := delegated(t, r, spawn, conv, 0)
+	origin, _, child := delegated(t, r, spawn, conv, "")
 	rec, _ := r.g.reg.Get(ctx, conv)
 	if pref, _ := rec.TaskRefFor(origin.TaskID); pref.Request != "how is the fleet?" {
 		t.Fatalf("the turn's entry carries request %q", pref.Request)

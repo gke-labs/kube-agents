@@ -118,24 +118,6 @@ func doorDelegation(t *testing.T) func(*Config) {
 	}
 }
 
-// delegatedVia is delegated for a turn stamped with backend.
-func delegatedVia(t *testing.T, r *rig, spawn *fakeSpawner, conv, backend string) (*lib.Envelope, string, *lib.Envelope) {
-	t.Helper()
-	exec, origin, session := sessionTurnVia(t, r, spawn, conv, backend, "how is the fleet?")
-	if err := exec.PublishArtifact(context.Background(), delegateArtifact(t, "platform", "report fleet health")); err != nil {
-		t.Fatal(err)
-	}
-	child := awaitSubmission(t, r, targetPlatform, 0)
-	waitFor(t, "chain on the record", func() bool {
-		rec, _ := r.g.reg.Get(context.Background(), conv)
-		pref, _ := rec.TaskRefFor(origin.TaskID)
-		return len(pref.Children) == 1
-	})
-	completeTask(t, exec, "delegated to platform")
-	waitFor(t, "parent terminal relayed", postedContaining(r, "delegated to platform"))
-	return origin, session, child
-}
-
 // TestADelegatingTurnIsOneTaskToTheObserver: through the A2A door, the inject
 // door and a chat backend alike, a turn that delegates and is woken is told
 // to the observer as its own task alone: one start, one deliverable (the
@@ -155,7 +137,7 @@ func TestADelegatingTurnIsOneTaskToTheObserver(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			r, spawn, obs := startObservedRig(t, tc.tweak(t))
-			origin, _, child := delegatedVia(t, r, spawn, tc.conv, tc.backend)
+			origin, _, child := delegated(t, r, spawn, tc.conv, tc.backend)
 			if _, ended := obs.terminalFor(origin.TaskID); ended {
 				t.Fatalf("the delegating turn's own end reached the observer: %v", obs.kinds())
 			}
@@ -214,7 +196,7 @@ func TestAChainThatEndsWithoutAWakeEndsTheRoot(t *testing.T) {
 	t.Run("a human stop", func(t *testing.T) {
 		r, spawn, obs := startObservedRig(t, doorDelegation(t))
 		conv := "a2a:agent-1001/ctx-stop"
-		origin, _, child := delegatedVia(t, r, spawn, conv, a2aBackend)
+		origin, _, child := delegated(t, r, spawn, conv, a2aBackend)
 		r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001",
 			MessageID: "stop-1", Text: "stop", Backend: a2aBackend}
 		waitFor(t, "cancel sent", postedContaining(r, "cancel sent"))
@@ -230,7 +212,7 @@ func TestAChainThatEndsWithoutAWakeEndsTheRoot(t *testing.T) {
 	t.Run("a wake that cannot run", func(t *testing.T) {
 		r, spawn, obs := startObservedRig(t, doorDelegation(t))
 		conv := "a2a:agent-1001/ctx-gone"
-		origin, _, child := delegatedVia(t, r, spawn, conv, a2aBackend)
+		origin, _, child := delegated(t, r, spawn, conv, a2aBackend)
 		putRecord(t, r, conv, func(rec *SessionRecord) {
 			for i := range rec.Tasks {
 				if rec.Tasks[i].ID == origin.TaskID {
@@ -281,7 +263,7 @@ func assertNoDelivery(t *testing.T, obs *recordingObserver) {
 func TestAHealedChildsResultIsNotTheRootsDeliverable(t *testing.T) {
 	r, spawn, _ := startObservedRig(t, doorDelegation(t))
 	conv := "a2a:agent-1001/ctx-heal"
-	origin, _, child := delegatedVia(t, r, spawn, conv, a2aBackend)
+	origin, _, child := delegated(t, r, spawn, conv, a2aBackend)
 	cexec := r.execFor(t, child, targetPlatform)
 	var obs *recordingObserver
 	r2, spawn2 := restartRigWrapped(t, r, func(a *fakeAdapter) Adapter {
@@ -326,7 +308,7 @@ func TestAHealedChildsResultIsNotTheRootsDeliverable(t *testing.T) {
 func TestACancelNamingTheRootStopsTheActiveChild(t *testing.T) {
 	r, spawn, obs := startObservedRig(t, doorDelegation(t))
 	conv := "a2a:agent-1001/ctx-cancel"
-	origin, _, child := delegatedVia(t, r, spawn, conv, a2aBackend)
+	origin, _, child := delegated(t, r, spawn, conv, a2aBackend)
 	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001",
 		MessageID: "c-1", Text: "stop", Backend: a2aBackend, Intent: IntentCancel, TaskID: origin.TaskID}
 	waitFor(t, "a cancel on the child's subject", func() bool {
@@ -358,7 +340,7 @@ func TestACancelNamingTheRootStopsTheActiveChild(t *testing.T) {
 func TestTheProbeReadsTheRootAsTheChainsActiveTask(t *testing.T) {
 	r, spawn, _ := startObservedRig(t, doorDelegation(t))
 	conv := "a2a:agent-1001/ctx-probe"
-	origin, _, child := delegatedVia(t, r, spawn, conv, a2aBackend)
+	origin, _, child := delegated(t, r, spawn, conv, a2aBackend)
 	if err := r.execFor(t, child, targetPlatform).PublishStatus(context.Background(), lib.StateWorking, false); err != nil {
 		t.Fatal(err)
 	}
@@ -522,7 +504,7 @@ func TestASettledChainProbesAsItsLastTask(t *testing.T) {
 	t.Run("a woken chain reads the wake", func(t *testing.T) {
 		r, spawn, obs := startObservedRig(t, doorDelegation(t))
 		conv := "a2a:agent-1001/ctx-settled"
-		origin, _, child := delegatedVia(t, r, spawn, conv, a2aBackend)
+		origin, _, child := delegated(t, r, spawn, conv, a2aBackend)
 		completeTask(t, r.execFor(t, child, targetPlatform), "fleet is green")
 		waitFor(t, "wake spawn", func() bool { return len(spawn.calls()) == 2 })
 		wakeSession := spawn.calls()[1].Session
@@ -539,7 +521,7 @@ func TestASettledChainProbesAsItsLastTask(t *testing.T) {
 	t.Run("a chain no wake followed reads the observer's end", func(t *testing.T) {
 		r, spawn, obs := startObservedRig(t, doorDelegation(t))
 		conv := "a2a:agent-1001/ctx-settled-gone"
-		origin, _, child := delegatedVia(t, r, spawn, conv, a2aBackend)
+		origin, _, child := delegated(t, r, spawn, conv, a2aBackend)
 		putRecord(t, r, conv, func(rec *SessionRecord) {
 			for i := range rec.Tasks {
 				if rec.Tasks[i].ID == origin.TaskID {
