@@ -642,6 +642,27 @@ class SeededFleetFixturesTest(unittest.TestCase):
         self.assertEqual("reader@p.iam.gserviceaccount.com", env["FLEET_READONLY_SA"])
         self.assertNotIn("FLEET_ALLOW_RUNNER_CREDENTIAL", env)
 
+    def test_a_role_the_runner_could_not_read_is_unverified_not_a_failure(self):
+        # The runner counts a role whose presence probe failed for a reason
+        # other than NotFound into the unresolved count and says why; the
+        # check reads that line as a cluster it could not reach, so the
+        # project is not failed for a fixture nobody looked at.
+        warning = (
+            "WARNING: deployment/inventory-api could not be read from a.kubeconfig in kube-agents-evals-5 "
+            "(Error from server (Forbidden): deployments.apps is forbidden), so fixture role 'stalled-controller' "
+            "could not be checked. Its checks will report status=error rather than blaming the run."
+        )
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [
+                _ok("v1.30.0"),
+                (0, "", warning + "\n" + self._summary(self._roles() - 1, unresolved=1)),
+                (0, "", self._state(self._roles() - 1, unchecked=1)),
+            ]
+            result = checker.check_seeded_fleet_fixtures("kube-agents-evals-5")
+        self.assertTrue(result.passed, result.details)
+        self.assertIn("not checked", result.message)
+        self.assertTrue(any("could not be reached" in w for w in result.warnings), result.warnings)
+
     def test_a_reader_the_operator_cannot_mint_is_unverified_not_a_failure(self):
         # The runner's exit 3 carries gcloud's own refusal, which the denial
         # patterns read as an unperformed read: the project is not failed for
@@ -1122,7 +1143,7 @@ class SeededFleetFixturesTest(unittest.TestCase):
         wrong = checker._FLEET_LOOKED_AND_FOUND_WRONG.pattern.split("|")
         unreachable = checker._FLEET_UNREACHABLE.pattern.split("|")
         self.assertEqual(5, len(wrong))
-        self.assertEqual(3, len(unreachable))
+        self.assertEqual(4, len(unreachable))
         for phrase in [*wrong, *unreachable, checker._FLEET_COULD_NOT_LOOK.pattern]:
             with self.subTest(phrase=phrase):
                 self.assertRegex(text, phrase)

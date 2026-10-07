@@ -82,6 +82,50 @@ func TestIntegrationSchemaRulesEnvtest(t *testing.T) {
 				{Forge: "github", Repository: "infra2", Role: "gitops"}},
 		}, "at most one repository may have role gitops"},
 	}
+	// baseBranch is held to the branch names the broker's
+	// providers/validate.validate_branch accepts: the pattern and the length
+	// for the characters and the leading one, the CEL rules for HEAD and the
+	// sequences git refuses.
+	gitops := func(base string) []agentv1alpha1.RepositorySpec {
+		return []agentv1alpha1.RepositorySpec{{Forge: "github", Repository: "infra", Role: "gitops", BaseBranch: base}}
+	}
+	for name, tc := range map[string]struct{ base, message string }{
+		"base-leading-dash":   {"-main", "spec.integration.repositories[0].baseBranch"},
+		"base-space":          {"my branch", "spec.integration.repositories[0].baseBranch"},
+		"base-leading-under":  {"_release", "spec.integration.repositories[0].baseBranch"},
+		"base-at":             {"release@2026", "spec.integration.repositories[0].baseBranch"},
+		"base-too-long":       {strings.Repeat("a", 201), "spec.integration.repositories[0].baseBranch"},
+		"base-head":           {"HEAD", "may not be HEAD"},
+		"base-dotdot":         {"a..b", "no '..'"},
+		"base-slash-dot":      {"a/.b", "no '..'"},
+		"base-double-slash":   {"a//b", "no '..'"},
+		"base-lock-component": {"a.lock/b", "no '..'"},
+		"base-lock":           {"main.lock", "may not end in"},
+		"base-trailing-slash": {"main/", "may not end in"},
+		"base-trailing-dot":   {"main.", "may not end in"},
+		"base-ref-under":      {"refs/heads/_release", "after refs/heads/"},
+		"base-ref-head":       {"refs/heads/HEAD", "after refs/heads/"},
+		"base-ref-empty":      {"refs/heads/", "may not end in"},
+		// One spelling per branch, as the broker reads it: the name, or
+		// refs/heads/ and the name.
+		"base-heads":        {"heads/x", "may not start with heads/"},
+		"base-ref-ref":      {"refs/heads/refs/heads/x", "one refs/heads/ prefix"},
+		"base-ref-ref-head": {"refs/heads/refs/heads/HEAD", "one refs/heads/ prefix"},
+		"base-ref-heads":    {"refs/heads/heads/x", "one refs/heads/ prefix"},
+	} {
+		refused[name] = struct {
+			integration agentv1alpha1.IntegrationSpec
+			message     string
+		}{agentv1alpha1.IntegrationSpec{Forges: gh, Repositories: gitops(tc.base)}, tc.message}
+	}
+	// A context repository is never written: its branch pin is the ref in the
+	// gitops-state ConfigMap, so a base on it is refused.
+	refused["base-context"] = struct {
+		integration agentv1alpha1.IntegrationSpec
+		message     string
+	}{agentv1alpha1.IntegrationSpec{Forges: gh, Repositories: []agentv1alpha1.RepositorySpec{
+		{Forge: "github", Repository: "kubernetes/kubernetes", Role: "context", BaseBranch: "main"}}},
+		"baseBranch may not be set on a context repository"}
 	for name, tc := range refused {
 		err := cl.Create(ctx, newAgent(name, tc.integration))
 		if !apierrors.IsInvalid(err) || !strings.Contains(err.Error(), tc.message) {
@@ -96,6 +140,16 @@ func TestIntegrationSchemaRulesEnvtest(t *testing.T) {
 			{Forge: "github", Repository: "kubernetes/kubernetes", Role: "context"}}},
 		"forge-only": {Forges: gh},
 		"alias":      {GitHub: &agentv1alpha1.GitHubSpec{GitRepo: "gke-labs/kube-agents"}},
+		"base":       {Forges: gh, Repositories: gitops("release/2026")},
+		"base-max":   {Forges: gh, Repositories: gitops(strings.Repeat("a", 200))},
+		"base-ref":   {Forges: gh, Repositories: gitops("refs/heads/main")},
+		// A name that only contains heads/ or refs/heads/ is a branch name.
+		"base-ref-nested":  {Forges: gh, Repositories: gitops("refs/heads/release/heads/x")},
+		"base-heads-inner": {Forges: gh, Repositories: gitops("team/heads/x")},
+		"base-managed": {Forges: gh, Repositories: []agentv1alpha1.RepositorySpec{
+			{Forge: "github", Repository: "apps", Role: "managed", BaseBranch: "main"}}},
+		"base-context-empty": {Forges: gh, Repositories: []agentv1alpha1.RepositorySpec{
+			{Forge: "github", Repository: "kubernetes/kubernetes", Role: "context", BaseBranch: ""}}},
 	} {
 		if err := cl.Create(ctx, newAgent(name, integration)); err != nil {
 			t.Errorf("creating a PlatformAgent (%s) = %v, want it admitted", name, err)

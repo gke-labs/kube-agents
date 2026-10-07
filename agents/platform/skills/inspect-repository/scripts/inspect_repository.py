@@ -368,7 +368,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     def add_repo(sub):
         sub.add_argument("--repo", required=True, help="owner/name")
-        sub.add_argument("--ref", help="branch to read; defaults to the remote's HEAD")
+        sub.add_argument("--ref", help="branch to read; defaults to the base the broker pins the repository to, else the remote's HEAD")
         sub.add_argument(
             "--depth",
             type=int,

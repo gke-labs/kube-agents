@@ -131,7 +131,8 @@
 # attempt. chat-voice-failure-leads-with-fact (after it) makes
 # it fifty-four (162) of sixty-eight (204), +3 more: the same shape on a
 # blocked card. oobe-first-run-audits (the last entry below) makes it
-# sixty-one (183) of seventy-five (225), counted from the lists, +3 more at its 2400s hint: a stack
+# sixty-two (186) of seventy-six (228), counted from the lists with
+# upgrades-zonal-control-plane-outage-warned (2026-10-05, below), +3 more at its 2400s hint: a stack
 # that waits out the previous repetition's audits and the stage's chain, then a turn with no tools,
 # holding the four audit streams' locks throughout, so their audit cases queue behind it.
 # Whether the worst night fits is a question about the whole matrix, and the
@@ -199,6 +200,15 @@
 # runs measured about 960s), ~20 more serial minutes on the infra lock: the
 # eleven tofu cases come to ~453 serial minutes against the 480m deadline. The
 # case count is unchanged.
+#
+# 2026-10-05 adds upgrades-zonal-control-plane-outage-warned: one case,
+# three units at the 200s default (a read-only chat turn, measured 3-8
+# minutes a repetition on the dev install). Counted from the lists rather
+# than the paragraphs above (the chat-voice trio and the declared-intent
+# trio landed beside each other, each counted without the other, and two
+# chat cases registered since without a paragraph): this case, the entry
+# before oobe-first-run-audits below, makes it sixty-one cases (183 units) of a
+# seventy-five-case, 225-unit matrix.
 
 # ── The four full audits recast out of the presubmit on 2026-08-26 ──────────
 # Spec-ready, each domain covered in the presubmit by its probe:
@@ -674,6 +684,13 @@
 # (bench/kube_agents_bench/card_wake.py), so one front-door turn and no
 # worker: filing or unblocking a card fails the case's catastrophic fence.
 ./tasks/chat-voice-failure-leads-with-fact/task.yaml
+
+# The first of the upgrade-failure catalogue's scenario cases (entry 11, the
+# zonal control plane's API gap during its own upgrade). Read-only chat prompt
+# against the seeded clusters' own zonal shape; no planted fixture, nothing to
+# mutate. Nightly from its first merge; a presubmit seat is a later pull
+# request that cites its record.
+./tasks/upgrades-zonal-control-plane-outage-warned/task.yaml
 
 # The oobe job's first-run audits stage (docs/designs/oobe.md): once the
 # onboarding scan settles, four fleet audits start instead of waiting for their

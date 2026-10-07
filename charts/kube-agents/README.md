@@ -497,6 +497,15 @@ Use `telemetry.otlpEndpoint` instead when you do have a collector to point at.
   declared and none is GitHub fails the render, since minty issues GitHub App
   tokens only.
   GitOps repositories can also be registered in the ConfigMap by cluster administrators.
+  `platformAgent.integration.repositories[].baseBranch`, on a gitops or
+  managed repository, names the branch every pull request onto it must
+  target, enforced by the credential broker; unset means the repository's
+  own default branch. A context repository may not set it. The alias has no
+  place for it, so a repository that sets one renders as the lists, and on a
+  live install the render fails unless the installed CRD has the field. A
+  repository registered only in the ConfigMap is not pinned. The
+  [PlatformAgent CRD reference](https://gke-labs.github.io/kube-agents/operator/platformagent-crd/)
+  describes what the broker does with it.
 
 Chat, Slack, and Teams each need a one-time manual registration that no install
 automation can perform (the Chat app on the Chat API console page pointed at

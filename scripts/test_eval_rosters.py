@@ -161,6 +161,7 @@ ADDED_AFTER_THE_MOVE = [
     "chat-voice-retry-says-it-is-retried",  # the front door's reply to a crashed card
     "chat-voice-final-attempt-is-not-retried",  # the front door's reply to a card's last attempt
     "chat-voice-failure-leads-with-fact",  # the front door's reply to a blocked card
+    "upgrades-zonal-control-plane-outage-warned",  # upgrade-failure catalogue entry 11, the first scenario case
     "oobe-first-run-audits",  # the oobe job's first-run audits stage
 ]
 

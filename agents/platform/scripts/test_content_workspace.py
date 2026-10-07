@@ -381,6 +381,12 @@ class CheckBranchTest(unittest.TestCase):
             with self.assertRaises(ContentWorkspaceError):
                 check_branch("custom-broker-base")
 
+        # Every pinned base, in any of the spellings that name it.
+        for name in ("release/q3", "Release/Q3", "refs/heads/release/q3", "heads/release/q3"):
+            with self.subTest(pinned=name):
+                with self.assertRaises(ContentWorkspaceError):
+                    check_branch(name, pinned=["main-line", "release/q3"])
+
         # Paired ordinary use: the branch names the product actually authors.
         self.assertEqual(
             "platform-agent/provision-mercury-09",
@@ -1178,6 +1184,68 @@ class RealGitTest(unittest.TestCase):
             self.store.push(handle, "run/test-cluster/b-0011")
         self.assertIn("is a rollout, base, or run branch", str(ctx.exception))
 
+    def test_commit_and_push_to_a_pinned_base_are_refused(self):
+        # Pinned for another repository, and still not authored here: every
+        # pinned name is protected on every repository, as `base_branch` is.
+        self.store.pinned_bases = {("github.com", "acme/apps"): "release/q3"}
+        for branch in ("release/q3", "refs/heads/release/q3", "heads/release/q3"):
+            with self.subTest(branch=branch):
+                with self.assertRaises(ContentWorkspaceError) as ctx:
+                    self.store.commit(
+                        self.workspace.handle,
+                        branch,
+                        "feat: direct to a pinned base",
+                        [Change(repo_relative("manifests/new.yaml"), b"kind: ConfigMap\n")],
+                    )
+                self.assertIn("is a rollout, base, or run branch", str(ctx.exception))
+                with self.assertRaises(ContentWorkspaceError) as ctx:
+                    self.store.push(self.workspace.handle, branch)
+                self.assertIn("is a rollout, base, or run branch", str(ctx.exception))
+
+    def test_a_full_open_reads_the_base_not_the_remote_default(self):
+        # `open` composes an https URL by design; this runner points that one
+        # URL at the local remote, so the open itself runs against real git.
+        seed = self.base / "seed-release"
+        real_git_runner(["git", "clone", str(self.remote), str(seed)], self.base)
+        real_git_runner(["git", "switch", "-c", "release"], seed)
+        (seed / "manifests" / "existing.yaml").write_text("kind: Secret\n")
+        real_git_runner(["git", "commit", "-am", "release"], seed)
+        real_git_runner(["git", "push", "origin", "release"], seed)
+        url = "https://github.com/acme/fleet.git"
+
+        def runner(argv, cwd):
+            return real_git_runner([str(self.remote) if a == url else a for a in argv], cwd)
+
+        for name, pins, base in (
+            ("pinned", {("github.com", "acme/fleet"): "release"}, None),
+            ("named", None, "release"),
+        ):
+            with self.subTest(name):
+                store = ContentWorkspaceStore(
+                    self.base / f"trees-{name}", self.agent, runner, pinned_bases=pins
+                )
+                workspace = store.open("acme/fleet", base)
+                self.assertEqual("release", workspace.base)
+                self.assertEqual(b"kind: Secret\n", store.read(workspace.handle, "manifests/existing.yaml"))
+
+    def test_a_pin_is_protected_under_the_name_it_is_stored_by(self):
+        # The stored pin is the branch proposals are told to target, so it is
+        # protected as it is, not read again as another branch. Boot refuses
+        # a `heads/` pin; one set here directly shows no door re-reads it as
+        # `x` and leaves `refs/heads/heads/x`, the pinned branch, open.
+        self.store.pinned_bases = {("github.com", "acme/apps"): "heads/x"}
+        with self.assertRaises(ContentWorkspaceError) as ctx:
+            self.store.commit(
+                self.workspace.handle,
+                "refs/heads/heads/x",
+                "feat: direct to a pinned base",
+                [Change(repo_relative("manifests/new.yaml"), b"kind: ConfigMap\n")],
+            )
+        self.assertIn("is a rollout, base, or run branch", str(ctx.exception))
+        with self.assertRaises(ContentWorkspaceError) as ctx:
+            self.store.push(self.workspace.handle, "refs/heads/heads/x")
+        self.assertIn("is a rollout, base, or run branch", str(ctx.exception))
+
     def test_a_commit_lands_the_bytes_and_nothing_else(self):
         result = self.commit(
             [
@@ -1759,6 +1827,107 @@ class ShallowAndBranchOpenTest(unittest.TestCase):
         # And the branch is a name in an argv like any other.
         with self.assertRaises(ContentWorkspaceError):
             store.open("acme/fleet", "main", "--upload-pack=/bin/sh")
+
+
+class PinnedBaseOpenTest(unittest.TestCase):
+    """`open` with no base named, on a repository whose base is pinned."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.base = Path(self.tmp.name)
+        self.agent = self.base / "data"
+        self.agent.mkdir()
+        self.addCleanup(self.tmp.cleanup)
+
+    PINS = {("github.com", "Acme/Fleet"): "gitops-base"}
+
+    def store(self, responses=None, pins=PINS, base_branch=""):
+        self.runner = RecordingRunner(responses)
+        return ContentWorkspaceStore(
+            self.base / "trees",
+            self.agent,
+            self.runner,
+            base_branch=base_branch,
+            pinned_bases=pins,
+        )
+
+    def test_no_base_named_opens_on_the_pinned_base(self):
+        workspace = self.store().open("acme/fleet")
+        self.assertEqual("gitops-base", workspace.base)
+        self.assertEqual("origin/gitops-base", workspace.started_from)
+        resolved = [argv for argv, _ in self.runner.calls if argv[1] == "rev-parse"]
+        self.assertIn(["git", "rev-parse", "--verify", "origin/gitops-base"], resolved)
+
+        # Paired ordinary use: a base the caller names is still the base.
+        named = self.store().open("acme/fleet", "release")
+        self.assertEqual("release", named.base)
+
+    def test_a_repository_the_pin_does_not_name_opens_as_before(self):
+        # The fake answers `origin/HEAD` with nothing, so the default is the
+        # local HEAD's answer, which is also nothing, and then `main`.
+        for kwargs in (
+            {"pins": {("github.com", "acme/other"): "gitops-base"}},
+            # The same path on another host is another repository.
+            {"pins": {("gitlab.com", "acme/fleet"): "gitops-base"}},
+            {"pins": {}},
+            # `base_branch` alone is the older, protection-only setting.
+            {"pins": {}, "base_branch": "gitops-base"},
+        ):
+            with self.subTest(**kwargs), mock.patch.dict(os.environ, {}, clear=True):
+                workspace = self.store(**kwargs).open("acme/fleet")
+                self.assertEqual("main", workspace.base)
+
+    def test_a_pinned_base_the_remote_lacks_is_refused_with_a_code(self):
+        store = self.store({"refs/remotes/origin/gitops-base": FakeResult(exit_code=1)})
+        with self.assertRaises(ContentWorkspaceError) as caught:
+            store.open("acme/fleet")
+        self.assertEqual(409, caught.exception.status)
+        self.assertEqual("workspace.base-branch-missing", caught.exception.code)
+        self.assertIn("gitops-base", str(caught.exception))
+        # Nothing is left behind for a handle nobody holds.
+        self.assertEqual([], list((self.base / "trees").iterdir()))
+
+    def test_an_open_of_a_pinned_base_the_remote_lacks_is_refused_before_any_clone(self):
+        # A shallow clone names the base with --branch, and git fails it for a
+        # missing branch; a full clone would fetch the whole repository to be
+        # thrown away. Either way the remote is asked before anything is cloned.
+        for depth in (1, None):
+            with self.subTest(depth=depth):
+                store = self.store({"ls-remote": FakeResult(exit_code=2)})
+                with self.assertRaises(ContentWorkspaceError) as caught:
+                    store.open("acme/fleet", depth=depth)
+                self.assertEqual(409, caught.exception.status)
+                self.assertEqual("workspace.base-branch-missing", caught.exception.code)
+                self.assertIn("gitops-base", str(caught.exception))
+                self.assertEqual(
+                    ["git", "ls-remote", "--exit-code", "--heads",
+                     "https://github.com/acme/fleet.git", "refs/heads/gitops-base"],
+                    self.runner.calls[0][0],
+                )
+                self.assertNotIn("clone", self.runner.subcommands)
+                self.assertEqual([], list((self.base / "trees").iterdir()))
+
+        # Paired ordinary use: a base the remote has, or a probe that could not
+        # ask, goes on to the shallow clone of the base.
+        for exit_code in (0, 128):
+            with self.subTest(exit_code=exit_code):
+                store = self.store({"ls-remote": FakeResult(exit_code=exit_code)})
+                workspace = store.open("acme/fleet", depth=1)
+                self.assertEqual("gitops-base", workspace.base)
+                clone = next(argv for argv, _ in self.runner.calls if argv[1] == "clone")
+                self.assertIn("--branch", clone)
+                self.assertIn("gitops-base", clone)
+
+
+    def test_each_pinned_repository_opens_on_its_own_base(self):
+        store = self.store(
+            pins={
+                ("github.com", "acme/fleet"): "gitops-base",
+                ("github.com", "acme/apps"): "release",
+            }
+        )
+        self.assertEqual("gitops-base", store.open("acme/fleet").base)
+        self.assertEqual("release", store.open("acme/apps").base)
 
 
 class GrepTest(unittest.TestCase):

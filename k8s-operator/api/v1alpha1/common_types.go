@@ -1453,6 +1453,7 @@ type ForgeSpec struct {
 
 // RepositorySpec declares one repository on a declared forge, and what the
 // agent does with it.
+// +kubebuilder:validation:XValidation:rule="!has(self.baseBranch) || size(self.baseBranch) == 0 || self.role != 'context'",message="baseBranch may not be set on a context repository: it is never written, and its branch pin is the ref in the gitops-state ConfigMap"
 type RepositorySpec struct {
 	// Forge is the name of the entry in Forges this repository lives on.
 	// +kubebuilder:validation:MinLength=1
@@ -1478,6 +1479,32 @@ type RepositorySpec struct {
 	// it writes to, "context" for one it only reads.
 	// +kubebuilder:validation:Enum=gitops;managed;context
 	Role string `json:"role"`
+
+	// BaseBranch is the branch every pull request onto this repository must
+	// target. The credential broker enforces it: it refuses a proposal onto
+	// any other branch, and a clone that names no branch checks it out. Empty
+	// means the repository's own default branch. It may be set on a "gitops"
+	// or a "managed" repository, not on a "context" one, which is never
+	// written and whose branch pin is the ref in the gitops-state ConfigMap.
+	// The deprecated GitHub alias has no place for it: pinning the GitOps
+	// repository's base takes Forges and Repositories.
+	//
+	// The schema holds it to the branch names the broker accepts
+	// (providers/validate.validate_branch), because the chart installs the
+	// operator with its webhook off. Like the broker, it also holds it to one
+	// spelling per branch, the name or refs/heads/ and the name: a value
+	// starting with heads/, or with refs/heads/ followed by refs/heads/ or
+	// heads/, is refused, because the broker would read it as another branch.
+	// +kubebuilder:validation:MaxLength=200
+	// +kubebuilder:validation:Pattern=`^$|^[A-Za-z0-9][A-Za-z0-9._/-]*$`
+	// +kubebuilder:validation:XValidation:rule="self != 'HEAD'",message="baseBranch may not be HEAD"
+	// +kubebuilder:validation:XValidation:rule="!self.startsWith('refs/heads/') || (self.matches('^refs/heads/[A-Za-z0-9]') && self != 'refs/heads/HEAD')",message="baseBranch after refs/heads/ must start with a letter or digit and may not be HEAD"
+	// +kubebuilder:validation:XValidation:rule="!self.startsWith('heads/')",message="baseBranch may not start with heads/: write the branch name, or refs/heads/ and the name"
+	// +kubebuilder:validation:XValidation:rule="!self.startsWith('refs/heads/refs/heads/') && !self.startsWith('refs/heads/heads/')",message="baseBranch may carry one refs/heads/ prefix, not refs/heads/ followed by refs/heads/ or heads/"
+	// +kubebuilder:validation:XValidation:rule="!self.contains('..') && !self.contains('/.') && !self.contains('//') && !self.contains('@{') && !self.contains('.lock/')",message="baseBranch must be a git branch name: no '..', '/.', '//', '@{' or '.lock/'"
+	// +kubebuilder:validation:XValidation:rule="!self.endsWith('/') && !self.endsWith('.') && !self.endsWith('.lock')",message="baseBranch must be a git branch name: it may not end in '/', '.' or '.lock'"
+	// +optional
+	BaseBranch string `json:"baseBranch,omitempty"`
 }
 
 // GitHubSpec contains the configuration for the GitHub integration.

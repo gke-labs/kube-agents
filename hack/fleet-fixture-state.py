@@ -102,8 +102,9 @@ MARKER_FILE = ".kube-agents-fleet-kubeconfigs"
 # carry control-plane defects that no in-cluster object shows.
 CLUSTER_SUBJECT = "cluster"
 
-# Keys in `.fleet-context`, as the runner writes them: `project=<id>` and, per
-# discovered slot, `cluster.<slot>=<name>` and `location.<slot>=<location>`.
+# Keys in `.fleet-context`, as the runner writes them: `project=<id>`; per
+# discovered slot, `cluster.<slot>=<name>` and `location.<slot>=<location>`;
+# and per catalog role, `slot.<role>=<slot>` (read by the verifier, not here).
 CONTEXT_PROJECT_KEY = "project"
 CONTEXT_CLUSTER_PREFIX = "cluster."
 CONTEXT_LOCATION_PREFIX = "location."

@@ -316,6 +316,13 @@ class ChartGitIntegrationTest(unittest.TestCase):
             "gke-labs/.git",
             "gke-labs/..git",
             "gke-labs/.git.git",
+            # GitHub caps a name at 100 characters, and a name that still
+            # ends in .git once one is dropped is read by the agent and the
+            # broker as the name without it; the operator refuses both.
+            "gke-labs/" + "a" * 101,
+            "a" * 101,
+            "gke-labs/foo.git.git",
+            "https://github.com/gke-labs/foo.git.git",
             # The operator accepts a port; the fold does not carry one, so the
             # lists render and the operator reads it as written.
             "https://github.com:443/gke-labs/infra",
@@ -407,8 +414,12 @@ class ChartGitIntegrationTest(unittest.TestCase):
             "/github.com",
             "github.com.git/",
             "https://user:p%40ss@github.com/gke-labs/infra",
+            # GitHub's longest name, and one .git suffix, which is dropped.
+            "gke-labs/" + "a" * 100,
+            "a" * 100 + ".git",
+            "gke-labs/foo.git",
         ):
-            with self.subTest(repo=repo):
+            with self.subTest(repo=repo[:80]):
                 integration = _integration(
                     *_forge(0, name="github", namespace="gke-labs"),
                     *_repo(0, forge="github", repository=repo, role="gitops"),
@@ -479,6 +490,79 @@ class ChartGitIntegrationTest(unittest.TestCase):
         integration = _integration()
         for key in ("github", "forges", "repositories"):
             self.assertNotIn(key, integration)
+
+    def test_a_base_branch_renders_on_its_repository(self):
+        """baseBranch is per repository, on a gitops or a managed one, and
+        reaches the CR on the entry that set it and no other."""
+        integration = _integration(
+            *_forge(0, name="github", namespace="gke-labs"),
+            *_repo(0, forge="github", repository="infra", role="gitops",
+                   baseBranch="release/2026"),
+            *_repo(1, forge="github", repository="app", role="managed",
+                   baseBranch="main"),
+            *_repo(2, forge="github", repository="tools", role="managed"),
+        )
+        self.assertEqual(
+            [r.get("baseBranch") for r in integration["repositories"]],
+            ["release/2026", "main", None],
+        )
+        self.assertNotIn("baseBranch", integration)
+
+    def test_a_base_branch_keeps_a_foldable_declaration_as_the_lists(self):
+        """One GitHub forge and its gitops repository would fold into the
+        alias, which has nowhere to put a base; with one set they render as
+        the lists."""
+        integration = _integration(
+            *_forge(0, name="github", namespace="gke-labs"),
+            *_repo(0, forge="github", repository="infra", role="gitops",
+                   baseBranch="release"),
+        )
+        self.assertNotIn("github", integration)
+        self.assertEqual(
+            integration["repositories"],
+            [{"forge": "github", "repository": "infra", "role": "gitops",
+              "baseBranch": "release"}],
+        )
+
+    def test_no_base_branch_renders_no_key(self):
+        integration = _integration(
+            *_forge(0, name="github", namespace="gke-labs"),
+            *_repo(0, forge="github", repository="app", role="managed"),
+        )
+        self.assertNotIn("baseBranch", integration["repositories"][0])
+
+    def test_a_base_branch_the_schema_refuses_fails_the_render(self):
+        result = _render(
+            _CR_TEMPLATE,
+            *_forge(0, name="github", namespace="gke-labs"),
+            *_repo(0, forge="github", repository="infra", role="gitops",
+                   baseBranch="-main"),
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("baseBranch", result.stderr)
+
+    def test_a_base_branch_takes_one_spelling_per_branch(self):
+        """The name, or refs/heads/ and the name, as the CRD and the broker
+        read it: a second prefix after refs/heads/, or a leading heads/,
+        would be read as another branch, so the render refuses it."""
+        for base in ("heads/x", "refs/heads/refs/heads/x", "refs/heads/heads/x"):
+            with self.subTest(base=base):
+                result = _render(
+                    _CR_TEMPLATE,
+                    *_forge(0, name="github", namespace="gke-labs"),
+                    *_repo(0, forge="github", repository="infra", role="gitops",
+                           baseBranch=base),
+                )
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertIn("baseBranch", result.stderr)
+        for base in ("refs/heads/x", "x", "team/heads/x", "refs/heads/release/heads/x"):
+            with self.subTest(base=base):
+                integration = _integration(
+                    *_forge(0, name="github", namespace="gke-labs"),
+                    *_repo(0, forge="github", repository="infra", role="gitops",
+                           baseBranch=base),
+                )
+                self.assertEqual(integration["repositories"][0]["baseBranch"], base)
 
     def test_an_unregistered_provider_fails_the_render(self):
         """The CRD's enum would reject it at apply; the chart names the values

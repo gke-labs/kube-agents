@@ -1347,7 +1347,9 @@ echo "✓ Rollout verification finished in $((SECONDS - STEP_START))s"
 # tasks; until then the bus has an executor for nobody and every case on the
 # inject transport ends as infrastructure. The teardown's `helm uninstall`
 # removes the CR whole, so the flip-back-with-sidecar failure the bridge doc
-# names never arises here.
+# names never arises here; the one flip back the lane makes is
+# hack/rollback-roundtrip.sh, after the matrix, which unsets
+# spec.deployment.sidecars first.
 #
 # The verifier is gated too, and gated LAST of everything here, which is not
 # where its dependency would put it. Its precondition is the provisioning Job
