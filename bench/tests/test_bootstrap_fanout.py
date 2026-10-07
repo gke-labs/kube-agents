@@ -15,8 +15,8 @@
 """The discovery fan-out read and the ``bootstrap_fanout`` verifier.
 
 ``fixtures/bootstrap_fanout/boards.json`` holds the board rows two live
-discovery sweeps left on one install -- ``main``, whose worker filed no
-Cluster Agent card, and ``branch``, whose worker filed one per profile -- with
+discovery sweeps left on one install -- ``main``, with no Cluster Agent card
+after it, and ``branch``, with one per profile -- with
 the project id replaced and the Cluster Agent cards keyed by profile name, as
 the gate keys them. The in-pod script runs here under the test
 interpreter against a data root rebuilt from them; each failure case mutates
@@ -159,7 +159,8 @@ def test_the_read_returns_the_sweep_its_children_and_the_roster(tmp_path: Path) 
     assert payload["unidentified"] == []
     keys = sorted(c["key"] for c in payload["children"])
     assert keys[0] == "bootstrap-inventory-cluster-cluster-example-project-agent-harness-dev-cluster--1d9f820d"
-    assert "bootstrap-inventory-prioritize" in keys
+    # Found by key and time, so a card under any other key is not a cluster card.
+    assert all(k.startswith(discovery.CLUSTER_KEY_PREFIX) for k in keys)
 
 
 def test_the_read_skips_the_reserved_profiles(tmp_path: Path) -> None:
@@ -231,7 +232,6 @@ def test_the_stack_waits_out_the_longest_gate_run() -> None:
 def test_the_stack_spells_the_mirrored_names_as_their_sources_do() -> None:
     gate = REPO / "agents" / "chat" / "scripts" / "bootstrap_scan_gate.py"
     delivery = REPO / "agents" / "chat" / "scripts" / "bootstrap_delivery.py"
-    guardrail = REPO / "deploy" / "docker" / "patches" / "kanban_guardrail_exit.py"
     jobs = json.loads((REPO / "agents" / "chat" / "defaults" / "cron" / "jobs.json").read_text())["jobs"]
     stack = (REPO / "bench" / "tf" / "prebuilt" / "bootstrap-discovery" / "main.tf").read_text()
 
@@ -245,7 +245,6 @@ def test_the_stack_spells_the_mirrored_names_as_their_sources_do() -> None:
     for key in ("SCAN_IDEMPOTENCY_KEY", "CLUSTER_IDEMPOTENCY_KEY_PREFIX", "PRIORITIZE_IDEMPOTENCY_KEY"):
         assert _module_constant(gate, key).startswith(local("key_like").removesuffix("%")), key
     assert local("cluster_key_like") == _module_constant(gate, "CLUSTER_IDEMPOTENCY_KEY_PREFIX") + "%"
-    assert local("rate_limit_block") == _module_constant(guardrail, "RATE_LIMIT_REASON_PREFIX")
 
 
 def test_a_failed_exec_is_a_failed_read() -> None:
@@ -277,20 +276,25 @@ def test_the_main_sweep_filed_none_and_fails(pod) -> None:
     assert "filed 0 cluster card(s) for 4 Cluster Agent(s)" in result.reason
 
 
-def test_a_board_where_no_worker_has_filed_yet_fails_rather_than_errors(pod) -> None:
-    board = _board("main")
-    board["kanban_worker_children"] = []
-    pod(board, schema=tuple(ddl for ddl in _SCHEMA if "kanban_worker_children" not in ddl))
+def _without(board: dict, *ids: str) -> dict:
+    board["tasks"] = [t for t in board["tasks"] if t["id"] not in ids]
+    board["kanban_worker_children"] = [w for w in board["kanban_worker_children"] if w[0] not in ids]
+    return board
+
+
+def test_a_board_with_no_cluster_card_yet_fails_rather_than_errors(pod) -> None:
+    board = _board("branch")
+    cluster_ids = [t["id"] for t in board["tasks"] if str(t.get("idempotency_key") or "").startswith(discovery.CLUSTER_KEY_PREFIX)]
+    pod(_without(board, *cluster_ids))
     result = _verify("one_card_per_cluster_agent")
     assert result.status == "fail", result.reason
     assert "filed 0 cluster card(s) for 4 Cluster Agent(s)" in result.reason
-    assert _verify("no_card_waits_on_the_sweep").status == "pass"
 
 
 def test_a_missing_card_is_named(pod) -> None:
     board = _board("branch")
     dropped = _card(board, "cluster-example-project-platform-agent-host")
-    board["kanban_worker_children"] = [w for w in board["kanban_worker_children"] if w[0] != dropped["id"]]
+    _without(board, dropped["id"])
     pod(board)
     result = _verify("one_card_per_cluster_agent")
     assert result.status == "fail"
@@ -331,7 +335,7 @@ def test_a_card_keyed_by_the_cluster_identity_fails(pod) -> None:
 def test_a_profile_without_an_identity_is_not_on_the_roster(pod) -> None:
     board = _board("branch")
     dropped = _card(board, "cluster-example-project-platform-agent-host")
-    board["kanban_worker_children"] = [w for w in board["kanban_worker_children"] if w[0] != dropped["id"]]
+    _without(board, dropped["id"])
     roster = dict(BOARDS["roster"])
     roster["cluster-example-project-platform-agent-host-us-east4"] = None
     pod(board, roster)
@@ -381,26 +385,6 @@ def test_a_fail_outranks_a_final_read_that_errors(pod, monkeypatch: pytest.Monke
 def test_an_unreadable_pod_is_an_error(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(verifiers, "_agent_shell", lambda s, t: "")
     assert _verify("one_card_per_cluster_agent").status == "error"
-    assert _verify("no_card_waits_on_the_sweep").status == "error"
-
-
-# --- the safeguard --------------------------------------------------------
-
-
-def test_the_prioritize_card_may_wait_on_the_sweep(pod) -> None:
-    pod(_board("branch"))
-    result = _verify("no_card_waits_on_the_sweep")
-    assert result.status == "pass", result.reason
-
-
-def test_a_cluster_card_waiting_on_the_sweep_fails(pod) -> None:
-    board = _board("branch")
-    waiting = _card(board, "cluster-example-project-agent-harness")
-    board["task_links"].append([board["sweep"], waiting["id"]])
-    pod(board)
-    result = _verify("no_card_waits_on_the_sweep")
-    assert result.status == "fail"
-    assert waiting["id"] in result.reason
 
 
 # --- registration ---------------------------------------------------------
@@ -414,7 +398,7 @@ def test_the_verifier_is_published_as_an_entry_point() -> None:
 
 
 def test_parse_node_builds_it_like_a_task_yaml_would() -> None:
-    node = parse_node({"type": "bootstrap_fanout", "require": "no_card_waits_on_the_sweep"})
+    node = parse_node({"type": "bootstrap_fanout", "require": "one_card_per_cluster_agent"})
     assert isinstance(node, BootstrapFanoutVerifier)
     assert VERIFIERS.get("bootstrap_fanout") is BootstrapFanoutVerifier
 

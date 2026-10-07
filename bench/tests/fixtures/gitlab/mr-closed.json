@@ -1,0 +1,20 @@
+{
+  "id": 50000001,
+  "iid": 1,
+  "project_id": 40000001,
+  "source_project_id": 40000001,
+  "target_project_id": 40000001,
+  "source_branch": "platform-agent/proto-1",
+  "target_branch": "main",
+  "sha": "7d462311fd849dfae2341381a114157772bffd24",
+  "state": "closed",
+  "title": "Draft: proto: draft at creation",
+  "draft": true,
+  "author": {
+    "username": "eval-maintainer",
+    "bot": false
+  },
+  "created_at": "2026-10-01T14:57:05.286Z",
+  "updated_at": "2026-10-01T14:57:48.610Z",
+  "web_url": "https://gitlab.com/example-group/infra/-/merge_requests/1"
+}

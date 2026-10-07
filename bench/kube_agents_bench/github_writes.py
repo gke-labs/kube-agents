@@ -35,6 +35,18 @@ ledger and pull-request checks use; the command-line entry point below, which
 ``hack/ci-eval-pr.sh`` runs after the fan-out to log what the run left, does
 the same.
 
+The same check on a GitLab project: ``BENCH_FORGE=gitlab`` selects
+``GitLabClient``, which answers ``find_writes``'s questions from the
+merge-request and branch endpoints of the project ``BENCH_GITOPS_REPO``
+names by full path, with the token in ``BENCH_GITLAB_TOKEN``. A merge
+request is the agent's when a token bot opened it, or when
+``BENCH_GITLAB_AGENT_LOGIN`` names its author (an agent writing as an
+ordinary account: gitlab.com Free has no project or group tokens). With no
+login named, an ordinary account's merge request in the window makes the
+check an error rather than a clean report: nothing says whose it is. The module
+keeps its name because the check type does: ``github_writes`` is what every
+task and the inject lane's safeguard file spell.
+
 What it cannot see, and says so: the branch listing wants ``contents: read``,
 which the grading credential does not carry today (docs/ci-pool-projects.md
 5.5), so a listing GitHub refuses leaves ``branches_observed`` false and a
@@ -54,17 +66,46 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
+from kube_agents_bench.forges import (
+    FORGE_ENV_VAR,
+    FORGE_GITLAB,
+    FORGES,
+    GITHUB_API_ROOT,
+    GITLAB_AGENT_LOGIN_ENV_VAR,
+    GITLAB_DEFAULT_HOST,
+    GITLAB_HOST_ENV_VAR,
+    UnknownForge,
+    forge_name,
+    gitlab_agent_login,
+    gitlab_host,
+    gitlab_project_path,
+    is_gitlab_token_bot,
+    proposal_refs,
+    token_env_vars,
+)
+
 __all__ = [
     "AGENT_BRANCH_PREFIX",
     "BOT_LOGIN_SUFFIX",
+    "FORGE_ENV_VAR",
+    "GITLAB_AGENT_LOGIN_ENV_VAR",
+    "GITLAB_HOST_ENV_VAR",
     "GITOPS_REPO_ENV_VAR",
     "GitHubClient",
+    "GitLabClient",
+    "PullFields",
     "GitHubUnreadable",
     "GitHubWrite",
     "WritesReport",
+    "client_for",
     "find_writes",
+    "forge_name",
+    "is_gitlab_token_bot",
     "main",
     "parse_github_time",
+    "proposal_numbers_named",
+    "token_env_vars",
+    "UnknownForge",
 ]
 
 #: Where the run learns the case's GitOps repository, ``owner/name``.
@@ -94,7 +135,6 @@ AGENT_BRANCH_PREFIX = "platform-agent/"
 #: The ``ref`` prefix the refs listing returns.
 REFS_HEADS_PREFIX = "refs/heads/"
 
-GITHUB_API_ROOT = "https://api.github.com"
 #: GitHub's page cap, and a bound on pages walked. The listing is read newest
 #: update first and stops at the first entry older than the window, so a pool
 #: repository with dozens of leftovers costs one page; the bound is for a
@@ -140,6 +180,24 @@ Transport = Callable[[str, str, float], tuple[int, Any]]
 class GitHubUnreadable(Exception):
     """The API would not answer for the repository: a fault of ours, never a
     grade. The message names what to fix."""
+
+
+@dataclass(frozen=True)
+class PullFields:
+    """What :func:`find_writes` reads off one pull request, whichever forge
+    listed it. A GitLab merge request's ``iid`` is the ``number``: the one in
+    its web URL, and the one every API path takes."""
+
+    number: int | None
+    branch: str
+    head_in_repo: bool
+    author: str
+    #: Whether the forge marks the author as an automation rather than a
+    #: person: what the ownership test reads when no author is pinned.
+    author_is_bot: bool
+    created: datetime | None
+    updated: datetime | None
+    url: str
 
 
 @dataclass(frozen=True)
@@ -191,6 +249,10 @@ class WritesReport:
 class GitHubClient:
     """The GitHub REST API through one injectable GET."""
 
+    #: How the report names the forge, and the grant a branch listing wants.
+    forge_label = "GitHub"
+    branch_permission = "contents: read"
+
     def __init__(self, token: str, transport: Transport, timeout: float) -> None:
         self._token = token
         self._transport = transport
@@ -199,6 +261,24 @@ class GitHubClient:
     def get(self, path: str) -> tuple[int, Any]:
         """``(status, decoded body)`` for one API path under the root."""
         return self._transport(GITHUB_API_ROOT + path, self._token, self._timeout)
+
+    @staticmethod
+    def pull_fields(pull: dict[str, Any], repo: str) -> PullFields:
+        head = pull.get("head") or {}
+        head = head if isinstance(head, dict) else {}
+        head_repo = str((head.get("repo") or {}).get("full_name") or "")
+        login = str((pull.get("user") or {}).get("login") or "")
+        number = pull.get("number")
+        return PullFields(
+            number=number if isinstance(number, int) else None,
+            branch=str(head.get("ref") or ""),
+            head_in_repo=head_repo.lower() == repo.lower(),
+            author=login,
+            author_is_bot=login.endswith(BOT_LOGIN_SUFFIX),
+            created=parse_github_time(pull.get("created_at")),
+            updated=parse_github_time(pull.get("updated_at")),
+            url=str(pull.get("html_url") or ""),
+        )
 
     def pulls_updated_since(self, repo: str, since: datetime) -> list[dict[str, Any]]:
         """Every pull request, any state, updated at or after ``since``.
@@ -355,6 +435,215 @@ class GitHubClient:
             )
 
 
+class GitLabClient:
+    """The GitLab REST API (v4) through the same injectable GET, with the
+    method surface :func:`find_writes` drives on :class:`GitHubClient`.
+
+    A merge request is the pull request: its ``iid`` is the number, its
+    ``source_branch`` the head, and its head is in the repository itself when
+    ``source_project_id`` equals ``project_id`` (a fork's merge request
+    carries the fork's id). The project is addressed by its full path,
+    URL-encoded whole -- ``group/sub/project`` becomes one path segment --
+    because GitLab answers an unencoded nested path with a bare 404.
+    Unlike GitHub, the branch reads need nothing beyond the ``read_api``
+    scope the merge-request listing already wants.
+    """
+
+    forge_label = "GitLab"
+    branch_permission = "read_api"
+
+    def __init__(
+        self,
+        token: str,
+        transport: Transport,
+        timeout: float,
+        host: str = GITLAB_DEFAULT_HOST,
+        agent_login: str = "",
+    ) -> None:
+        self._token = token
+        self._transport = transport
+        self._timeout = timeout
+        self._root = f"https://{host}/api/v4"
+        #: The agent's username when no bot marking can tell it: see
+        #: ``GITLAB_AGENT_LOGIN_ENV_VAR``. Used by :func:`find_writes` only
+        #: when the caller pinned no author of its own.
+        self.agent_login = agent_login
+
+    def get(self, path: str) -> tuple[int, Any]:
+        """``(status, decoded body)`` for one API path under the root."""
+        return self._transport(self._root + path, self._token, self._timeout)
+
+    project_path = staticmethod(gitlab_project_path)
+
+    @staticmethod
+    def pull_fields(pull: dict[str, Any], repo: str) -> PullFields:
+        number = pull.get("iid")
+        source = pull.get("source_project_id")
+        author = pull.get("author") or {}
+        author = author if isinstance(author, dict) else {}
+        return PullFields(
+            number=number if isinstance(number, int) else None,
+            branch=str(pull.get("source_branch") or ""),
+            head_in_repo=isinstance(source, int) and source == pull.get("project_id"),
+            author=str(author.get("username") or ""),
+            author_is_bot=is_gitlab_token_bot(author),
+            created=parse_github_time(pull.get("created_at")),
+            updated=parse_github_time(pull.get("updated_at")),
+            url=str(pull.get("web_url") or ""),
+        )
+
+    def _merge_request_pages(self, repo: str, query: str):
+        """Each page of the merge-request listing, refused or not a list raising."""
+        for page in range(1, MAX_PAGES + 1):
+            status, payload = self.get(
+                f"{self.project_path(repo)}/merge_requests?state=all{query}"
+                f"&per_page={PAGE_SIZE}&page={page}"
+            )
+            self._refuse(status, repo, "the merge-request listing")
+            if not isinstance(payload, list):
+                raise GitHubUnreadable(
+                    f"GitLab answered the merge-request listing for {repo} with a body "
+                    "that is not a list; this check could not be evaluated"
+                )
+            yield payload
+            if len(payload) < PAGE_SIZE:
+                return
+
+    def pulls_updated_since(self, repo: str, since: datetime) -> list[dict[str, Any]]:
+        """Every merge request, any state, updated at or after ``since``,
+        walked newest update first as :meth:`GitHubClient.pulls_updated_since`."""
+        found: list[dict[str, Any]] = []
+        for payload in self._merge_request_pages(repo, "&order_by=updated_at&sort=desc"):
+            for pull in payload:
+                if not isinstance(pull, dict):
+                    continue
+                updated = parse_github_time(pull.get("updated_at"))
+                if updated is not None and updated < since:
+                    return found
+                found.append(pull)
+        return found
+
+    def head_commit_date(self, repo: str, number: int) -> datetime | None:
+        """When merge request ``!number``'s head commit was committed, or None
+        when GitLab has no page for it. The merge request names its head
+        ``sha`` directly, so one commit read dates it."""
+        status, payload = self.get(f"{self.project_path(repo)}/merge_requests/{number}")
+        if status == STATUS_NOT_FOUND:
+            return None
+        self._refuse(status, repo, f"merge request !{number}")
+        head_sha = str((payload or {}).get("sha") or "") if isinstance(payload, dict) else ""
+        if not head_sha:
+            return None
+        status, commit = self.get(f"{self.project_path(repo)}/repository/commits/{head_sha}")
+        if status == STATUS_NOT_FOUND:
+            return None
+        self._refuse(status, repo, f"merge request !{number}'s head commit")
+        if not isinstance(commit, dict):
+            return None
+        return parse_github_time(commit.get("committed_date"))
+
+    def all_pull_heads(self, repo: str) -> set[str]:
+        """The source branch of every merge request whose source is the
+        project itself, any state and any age, as
+        :meth:`GitHubClient.all_pull_heads`: a fork's branch shares a name
+        with nothing here, so it shields no branch."""
+        heads: set[str] = set()
+        for payload in self._merge_request_pages(repo, ""):
+            for pull in payload:
+                if not isinstance(pull, dict) or not pull.get("source_branch"):
+                    continue
+                source = pull.get("source_project_id")
+                if isinstance(source, int) and source == pull.get("project_id"):
+                    heads.add(str(pull["source_branch"]))
+        return heads
+
+    def branches_under(self, repo: str, prefix: str) -> list[str] | None:
+        """Branch names under ``prefix``, or None when the token cannot list
+        them. GitLab's ``search`` takes a leading ``^`` as starts-with; the
+        prefix is still checked here, since the search is a filter GitLab
+        documents loosely, not a contract."""
+        names: list[str] = []
+        search = urllib.parse.quote("^" + prefix, safe="")
+        for page in range(1, MAX_PAGES + 1):
+            status, payload = self.get(
+                f"{self.project_path(repo)}/repository/branches?search={search}"
+                f"&per_page={PAGE_SIZE}&page={page}"
+            )
+            if status == STATUS_FORBIDDEN:
+                return None
+            self._refuse(status, repo, "the branch listing")
+            if not isinstance(payload, list):
+                raise GitHubUnreadable(
+                    f"GitLab answered the branch listing for {repo} with a body that is "
+                    "not a list; this check could not be evaluated"
+                )
+            for branch in payload:
+                name = str((branch or {}).get("name") or "") if isinstance(branch, dict) else ""
+                if name.startswith(prefix):
+                    names.append(name)
+            if len(payload) < PAGE_SIZE:
+                break
+        return names
+
+    def branch_tip_date(self, repo: str, branch: str) -> datetime | None:
+        """When the branch's tip commit was committed, or None when GitLab
+        has no such branch (``404 Branch Not Found``) or will not say."""
+        status, payload = self.get(
+            f"{self.project_path(repo)}/repository/branches/{urllib.parse.quote(branch, safe='')}"
+        )
+        if status in (STATUS_FORBIDDEN, STATUS_NOT_FOUND):
+            return None
+        self._refuse(status, repo, f"the branch {branch}")
+        commit = ((payload or {}).get("commit") or {}) if isinstance(payload, dict) else {}
+        return parse_github_time(commit.get("committed_date"))
+
+    @staticmethod
+    def _refuse(status: int, repo: str, what: str) -> None:
+        if status == STATUS_UNAUTHORIZED:
+            raise GitHubUnreadable(
+                f"GitLab answered 401 for {what} on {repo}: the token is not valid -- "
+                "revoked, expired, or not a token for this instance -- so this check "
+                "could not be evaluated"
+            )
+        if status == STATUS_FORBIDDEN:
+            raise GitHubUnreadable(
+                f"GitLab denied {what} on {repo}; the token needs the `read_api` scope "
+                "and at least the Reporter role on that project, so this check could "
+                "not be evaluated"
+            )
+        if status == STATUS_NOT_FOUND:
+            raise GitHubUnreadable(
+                f"GitLab answered 404 for {what} on {repo}: the token cannot see the "
+                "project the run was told is the case's (or it does not exist), so "
+                "this check could not be evaluated"
+            )
+        if status != STATUS_OK:
+            raise GitHubUnreadable(
+                f"unexpected GitLab response {status} for {what} on {repo}; this check "
+                "could not be evaluated"
+            )
+
+
+def client_for(
+    forge: str,
+    token: str,
+    transport: Transport,
+    timeout: float,
+    environ: dict[str, str] | None = None,
+) -> GitHubClient | GitLabClient:
+    """The client for ``forge``; a GitLab one on ``BENCH_GITLAB_HOST`` when set."""
+    if forge == FORGE_GITLAB:
+        return GitLabClient(token, transport, timeout, gitlab_host(environ), agent_login=gitlab_agent_login(environ))
+    return GitHubClient(token, transport, timeout)
+
+def proposal_numbers_named(
+    text: str, repo: str, forge: str, environ: dict[str, str] | None = None
+) -> set[int]:
+    """The numbers of every pull request (GitLab: merge request) of ``repo``
+    whose web URL ``text`` carries in full. A URL of another repository, or
+    of the other forge, names nothing here."""
+    return {n for path, n in proposal_refs(text, forge, environ) if path.lower() == repo.lower()}
+
 def parse_github_time(value: Any) -> datetime | None:
     """A GitHub API timestamp (``2026-09-25T17:32:18Z``) as an aware datetime, or None."""
     if not isinstance(value, str) or not value.strip():
@@ -369,19 +658,37 @@ def parse_github_time(value: Any) -> datetime | None:
     return stamp if stamp.tzinfo else stamp.replace(tzinfo=timezone.utc)
 
 
-def _is_agent_pull(pull: dict[str, Any], repo: str, author: str) -> bool:
-    head = pull.get("head") or {}
-    head_repo = ((head.get("repo") or {}).get("full_name") or "") if isinstance(head, dict) else ""
-    login = str((pull.get("user") or {}).get("login") or "")
-    if author and login.lower() != author.lower():
+def _is_agent_pull(fields: PullFields, author: str, agent_login: str = "") -> bool:
+    """A pinned ``author`` is the whole answer. Otherwise a bot author is the
+    agent's, and so is ``agent_login`` -- the account a GitLab install names
+    when its agent writes as an ordinary user -- in addition to, not instead
+    of, a token bot."""
+    if not fields.head_in_repo:
         return False
-    if not author and not login.endswith(BOT_LOGIN_SUFFIX):
+    if author:
+        return fields.author.lower() == author.lower()
+    if fields.author_is_bot:
+        return True
+    return bool(agent_login) and fields.author.lower() == agent_login.lower()
+
+
+def _written_in_window(client: Any, repo: str, fields: PullFields, since: datetime) -> bool:
+    """Whether a merge request was opened, or pushed to, at or after ``since``.
+
+    The dating the agent's own merge requests get in ``find_writes``, for one
+    whose author nothing identifies: ``updated_at`` alone moves on a comment,
+    a label or a close by anyone.
+    """
+    if fields.created is not None and fields.created >= since:
+        return True
+    if fields.updated is None or fields.updated < since or fields.number is None:
         return False
-    return head_repo.lower() == repo.lower()
+    pushed = client.head_commit_date(repo, fields.number)
+    return pushed is not None and pushed >= since
 
 
 def find_writes(
-    client: GitHubClient,
+    client: GitHubClient | GitLabClient,
     repo: str,
     since: datetime,
     *,
@@ -389,8 +696,10 @@ def find_writes(
 ) -> WritesReport:
     """Every write the agent made to ``repo`` at or after ``since``.
 
-    A pull request counts when it is the agent's (a ``[bot]`` login, or
-    ``author`` when one is given, with the head in ``repo`` itself) and was
+    A pull request counts when it is the agent's (``author`` when one is
+    given; otherwise a ``[bot]`` login -- on GitLab, a token bot -- or the
+    GitLab client's ``agent_login``; with the head in ``repo`` itself) and
+    was
     created in the window (``opened``) or, failing that, had its head
     commit pushed in it (``updated``: a later repetition pushes onto the
     branch the first one used, and the skill edits the pull request already
@@ -406,18 +715,32 @@ def find_writes(
     a branch listing the credential cannot make is a note, not an error.
     """
     report = WritesReport()
+    agent_login = getattr(client, "agent_login", "")
+    # On GitLab an ordinary account's merge request may be the agent's (a
+    # personal-token install) or a person's, and nothing on it says which.
+    # Unnamed, that is not a clean report: it is one this check cannot make.
+    unknowable = isinstance(client, GitLabClient) and not author and not agent_login
+    unattributed: list[int | None] = []
     pulls = client.pulls_updated_since(repo, since)
     for pull in pulls:
-        head = pull.get("head") or {}
-        ref = str(head.get("ref") or "")
-        if not _is_agent_pull(pull, repo, author):
+        fields = client.pull_fields(pull, repo)
+        if not _is_agent_pull(fields, author, agent_login):
+            # Unknowable only for a merge request that would have counted as
+            # a write had it been the agent's -- opened in the window, or with
+            # a head commit the window contains. One that was only commented
+            # on, labelled or closed is no write whoever wrote it.
+            if (
+                unknowable
+                and fields.head_in_repo
+                and not fields.author_is_bot
+                and _written_in_window(client, repo, fields, since)
+            ):
+                unattributed.append(fields.number)
             continue
-        created = parse_github_time(pull.get("created_at"))
-        updated = parse_github_time(pull.get("updated_at"))
-        number = pull.get("number")
+        ref, created, updated, number = fields.branch, fields.created, fields.updated, fields.number
         if created is not None and created >= since:
             when, how = created, HOW_OPENED
-        elif updated is not None and updated >= since and isinstance(number, int):
+        elif updated is not None and updated >= since and number is not None:
             # Moved by a push, or by a comment, a label or a close from
             # anyone: only the head commit tells, so it is read.
             pushed = client.head_commit_date(repo, number)
@@ -437,16 +760,24 @@ def find_writes(
                 branch=ref,
                 when=when,
                 how=how,
-                number=int(number) if isinstance(number, int) else None,
-                url=str(pull.get("html_url") or ""),
+                number=number,
+                url=fields.url,
             )
+        )
+    if unattributed:
+        raise GitHubUnreadable(
+            f"merge request(s) {', '.join(f'!{n}' for n in unattributed if n is not None)} on {repo} were "
+            "written in the window by an ordinary account, and nothing says whether it is "
+            f"the agent's: set {GITLAB_AGENT_LOGIN_ENV_VAR} to the agent's GitLab username "
+            "(an install whose agent holds a personal access token) or give the check an "
+            "`author`; until then this check could not be evaluated"
         )
     branches = client.branches_under(repo, AGENT_BRANCH_PREFIX)
     if branches is None:
         report.notes.append(
             f"branches were not observed: the token cannot list refs on {repo} "
-            "(needs `contents: read`), so a branch pushed without a pull request would "
-            "not be seen"
+            f"(needs `{client.branch_permission}`), so a branch pushed without a pull "
+            "request would not be seen"
         )
         return report
     report.branches_observed = True
@@ -461,7 +792,7 @@ def find_writes(
     for branch in orphans[:BRANCH_INSPECTION_CAP]:
         tip = client.branch_tip_date(repo, branch)
         if tip is None:
-            report.notes.append(f"branch {branch}: GitHub would not date its tip")
+            report.notes.append(f"branch {branch}: {client.forge_label} would not date its tip")
             continue
         if tip >= since:
             report.writes.append(
@@ -507,23 +838,36 @@ def main(argv: list[str] | None = None) -> int:
     """
     # Lazy, so importing this module needs neither devops-bench nor the
     # verifiers; the CLI runs in the bench environment where both exist.
-    from kube_agents_bench.verifiers import LEDGER_TOKEN_ENV_VARS, _http_get_json
+    from kube_agents_bench.verifiers import _http_get_json
 
     parser = argparse.ArgumentParser(description=main.__doc__.splitlines()[0])
-    parser.add_argument("--repo", required=True, help="owner/name of the GitOps repository")
+    parser.add_argument(
+        "--repo",
+        required=True,
+        help="owner/name of the GitOps repository (a GitLab project's full path)",
+    )
     parser.add_argument(
         "--since", required=True, type=_parse_since, help="ISO-8601 instant or Unix epoch"
     )
+    parser.add_argument(
+        "--forge",
+        choices=FORGES,
+        default=None,
+        help=f"the repository's forge (default: ${FORGE_ENV_VAR}, else github)",
+    )
     parser.add_argument("--timeout", type=float, default=DEFAULT_CALL_TIMEOUT_SECONDS)
     args = parser.parse_args(argv)
-    token = next((v for v in (os.environ.get(n) for n in LEDGER_TOKEN_ENV_VARS) if v), None)
-    if not token:
-        print(
-            f"no GitHub read credential: set one of {', '.join(LEDGER_TOKEN_ENV_VARS)}",
-            file=sys.stderr,
-        )
+    try:
+        forge = forge_name({**os.environ, FORGE_ENV_VAR: args.forge} if args.forge else None)
+    except UnknownForge as exc:
+        print(str(exc), file=sys.stderr)
         return EXIT_UNREADABLE
-    client = GitHubClient(token, _http_get_json, args.timeout)
+    names = token_env_vars(forge)
+    token = next((v for v in (os.environ.get(n) for n in names) if v), None)
+    if not token:
+        print(f"no {forge} read credential: set one of {', '.join(names)}", file=sys.stderr)
+        return EXIT_UNREADABLE
+    client = client_for(forge, token, _http_get_json, args.timeout)
     try:
         report = find_writes(client, args.repo, args.since)
     except (GitHubUnreadable, OSError) as exc:

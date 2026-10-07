@@ -506,6 +506,59 @@ class SessionTest(_RuntimeCase):
         self.assertEqual(runtime._titles[(CHANNEL, THREAD)], "why is payments slow?")
         self.assertNotIn((CHANNEL, THREAD), runtime._asks)
 
+    def _alerts(self, titles):
+        """``gateway.slack_ux_incident`` with ``alert_title`` answering from ``titles``, counting its reads."""
+        reads = []
+
+        def alert_title(chat_id, thread_id):
+            reads.append((chat_id, thread_id))
+            return titles.get((chat_id, thread_id), "")
+
+        gateway = SimpleNamespace()
+        gateway.slack_ux_incident = SimpleNamespace(alert_title=alert_title)
+        patcher = mock.patch.dict(sys.modules, {"gateway": gateway, "gateway.slack_ux_incident": gateway.slack_ux_incident})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return reads
+
+    def test_an_alert_thread_takes_the_title_the_watcher_recorded(self):
+        self._alerts({(CHANNEL, THREAD): "payments-api crashloop in seeded-debug"})
+        adapter = _Adapter()
+        self._status(adapter, PHRASE)
+        self.assertEqual(
+            adapter.calls, [("setStatus", "processing"), ("rename", "payments-api crashloop in seeded-debug")],
+        )
+        self.assertEqual(runtime._titles[(CHANNEL, THREAD)], "payments-api crashloop in seeded-debug")
+
+    def test_an_alert_title_comes_before_the_threads_ask(self):
+        self._alerts({(CHANNEL, THREAD): "payments-api crashloop in seeded-debug"})
+        adapter = _Adapter()
+        runtime.note_ask(CHANNEL, THREAD, "Restore the secret")
+        self._status(adapter, PHRASE)
+        self.assertEqual([v for n, v in adapter.calls if n == "rename"], ["payments-api crashloop in seeded-debug"])
+        self.assertNotIn((CHANNEL, THREAD), runtime._asks)
+
+    def test_a_thread_with_no_alert_title_takes_its_ask_and_is_read_once(self):
+        reads = self._alerts({})
+        adapter = _Adapter()
+        self._status(adapter, PHRASE)
+        self._status(adapter, "")
+        runtime.note_ask(CHANNEL, THREAD, "why is payments slow?")
+        self._status(adapter, PHRASE)
+        self.assertEqual([v for n, v in adapter.calls if n == "rename"], ["why is payments slow?"])
+        self.assertEqual(reads, [(CHANNEL, THREAD)])
+
+    def test_an_alert_title_that_cannot_be_read_falls_back_to_the_ask(self):
+        gateway = SimpleNamespace()
+        gateway.slack_ux_incident = SimpleNamespace(alert_title=mock.Mock(side_effect=OSError("locked")))
+        patcher = mock.patch.dict(sys.modules, {"gateway": gateway, "gateway.slack_ux_incident": gateway.slack_ux_incident})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        adapter = _Adapter()
+        runtime.note_ask(CHANNEL, THREAD, "why is payments slow?")
+        self._status(adapter, PHRASE)
+        self.assertEqual([v for n, v in adapter.calls if n == "rename"], ["why is payments slow?"])
+
     def test_flag_off_keeps_no_ask(self):
         env = _flag("")
         self.addCleanup(env.stop)

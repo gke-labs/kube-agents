@@ -188,6 +188,12 @@
 # unit_cost_hint figures and three repetitions (~378 without it), against the
 # 480m deadline. Whether that fits is the eval crew's call, on the first nights'
 # record.
+# 2026-10-05 extends bootstrap-discovery-fanout to wait for the gate's
+# hand-off to ranking and grade it, rather than adding a second tofu case that
+# would re-arm a second sweep. Its hint goes from 600s to 1000s (dev-install
+# runs measured about 960s), ~20 more serial minutes on the infra lock: the
+# eleven tofu cases come to ~453 serial minutes against the 480m deadline. The
+# case count is unchanged.
 
 # ── The four full audits recast out of the presubmit on 2026-08-26 ──────────
 # Spec-ready, each domain covered in the presubmit by its probe:
@@ -558,11 +564,13 @@
 ./tasks/obtainability-design-quota-vs-capacity/task.yaml
 ./tasks/obtainability-window-planning-probe/task.yaml
 
-# The onboarding discovery sweep's fan-out (#1872): re-arms the
-# bootstrap-inventory-scan gate on the install under test and grades the
-# cards the sweep's worker files against the Cluster Agent roster. Nightly
-# rather than presubmit because the fan-out's cards take dispatcher slots
-# from whatever else is running.
+# The onboarding discovery sweep's fan-out (#1872) and the gate's hand-off to
+# ranking: re-arms the bootstrap-inventory-scan gate on the install under test,
+# grades the cluster cards filed for the sweep against the Cluster Agent roster,
+# then the raw report's findings block (parsed by the sandbox's own
+# inventory_findings.py) and the keyed bootstrap-inventory-prioritize card.
+# Nightly rather than presubmit because the sweep's cards take dispatcher slots
+# from whatever else is running, for up to the stack's 1800s handoff_wait.
 ./tasks/bootstrap-discovery-fanout/task.yaml
 
 # The first-install hello, both variants: the greeting's shape (one message,

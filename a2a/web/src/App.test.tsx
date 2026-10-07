@@ -1,46 +1,68 @@
 // @vitest-environment jsdom
 /**
  * App-level wiring the component tests below it can't see: the send gate
- * that withholds `onSend`/`onCommand` from the `web` user (M8), the refusal
- * to publish while the bus link is down (I1), and the connect form carrying
- * `?user=` through to the credential it actually submits (M4). `./bus.ts` is
- * mocked throughout — this file is not a live test.
+ * that withholds `onSend`/`onCommand` from the `web` user, the refusal
+ * to publish while the bus link is down, and how the page finds its
+ * bus - a URL or stored config, the console server's `/config.json`, or the
+ * port-forward guidance when neither is there. `./bus.ts` is mocked
+ * throughout - this file is not a live test.
  */
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import type { BusEvent } from "./model.ts";
 
-const { startBusMock } = vi.hoisted(() => ({ startBusMock: vi.fn() }));
+const { startBus } = vi.hoisted(() => ({ startBus: vi.fn() }));
 
 vi.mock("./bus.ts", async (importOriginal) => {
   const actual = await importOriginal<typeof import("./bus.ts")>();
-  return { ...actual, startBus: startBusMock, durablesFor: () => [] };
+  return { ...actual, startBus, durablesFor: () => [] };
 });
 
 import App from "./App.tsx";
 
+const STORAGE_KEY = "a2a-web-config";
+
 let captured: { dispatch: (e: BusEvent) => void } | null = null;
 
-startBusMock.mockImplementation(async (_config: unknown, dispatch: (e: BusEvent) => void) => {
-  captured = { dispatch };
+function handle() {
   return {
-    probeReadOnly: vi.fn(),
+    close: vi.fn(async () => {}),
     send: vi.fn(),
     setConversation: vi.fn(),
-    close: vi.fn().mockResolvedValue(undefined),
+    probeReadOnly: vi.fn(async () => {}),
   };
-});
+}
+
+function respond(status: number, contentType: string, body: string) {
+  return vi.fn(async () => ({
+    ok: status >= 200 && status < 300,
+    status,
+    headers: { get: (name: string) => (name.toLowerCase() === "content-type" ? contentType : null) },
+    json: async () => JSON.parse(body),
+    text: async () => body,
+  }));
+}
+
+const flush = () => new Promise((resolve) => setTimeout(resolve, 0));
 
 function setLocation(query: string): void {
   window.history.replaceState(null, "", `/${query}`);
 }
 
+beforeEach(() => {
+  startBus.mockReset();
+  startBus.mockImplementation(async (_config: unknown, dispatch: (e: BusEvent) => void) => {
+    captured = { dispatch };
+    return handle();
+  });
+});
+
 afterEach(() => {
   cleanup();
-  startBusMock.mockClear();
+  vi.unstubAllGlobals();
   captured = null;
-  window.sessionStorage.clear();
+  sessionStorage.clear();
   setLocation("");
 });
 
@@ -54,7 +76,7 @@ describe("App", () => {
   it("withholds the input box and commands from the web user", async () => {
     setLocation("?user=web&pass=secret");
     render(<App />);
-    await waitFor(() => expect(startBusMock).toHaveBeenCalled());
+    await waitFor(() => expect(startBus).toHaveBeenCalled());
     expect(screen.queryByRole("textbox")).toBeNull();
     expect(screen.getByText(/read-only/)).toBeTruthy();
   });
@@ -63,13 +85,13 @@ describe("App", () => {
     setLocation("?pass=secret");
     render(<App />);
     await waitFor(() => expect(captured).not.toBeNull());
-    const handle = await startBusMock.mock.results[0]!.value;
+    const handleResult = await startBus.mock.results[0]!.value;
     act(() => captured!.dispatch({ type: "connection", state: "down" }));
 
     const box = (await screen.findByRole("textbox")) as HTMLTextAreaElement;
     await userEvent.type(box, "hello{Enter}");
 
-    expect(handle.send).not.toHaveBeenCalled();
+    expect(handleResult.send).not.toHaveBeenCalled();
     expect(box.value).toBe("hello");
     expect(screen.getByText(/the bus link is down/)).toBeTruthy();
   });
@@ -78,13 +100,13 @@ describe("App", () => {
     setLocation("?pass=secret");
     render(<App />);
     await waitFor(() => expect(captured).not.toBeNull());
-    const handle = await startBusMock.mock.results[0]!.value;
+    const handleResult = await startBus.mock.results[0]!.value;
     act(() => captured!.dispatch({ type: "connection", state: "up" }));
 
     const box = (await screen.findByRole("textbox")) as HTMLTextAreaElement;
     await userEvent.type(box, "hello{Enter}");
 
-    expect(handle.send).toHaveBeenCalledWith("hello");
+    expect(handleResult.send).toHaveBeenCalledWith("hello");
     expect(box.value).toBe("");
   });
 
@@ -97,7 +119,7 @@ describe("App", () => {
       close: vi.fn().mockResolvedValue(undefined),
     };
     let finish: () => void = () => {};
-    startBusMock.mockImplementationOnce(
+    startBus.mockImplementationOnce(
       (_config: unknown, dispatch: (e: BusEvent) => void) =>
         new Promise((resolve) => {
           finish = () => {
@@ -107,8 +129,8 @@ describe("App", () => {
         }),
     );
     render(<App />);
-    await waitFor(() => expect(startBusMock).toHaveBeenCalled());
-    const [, , opts] = startBusMock.mock.calls[0]!;
+    await waitFor(() => expect(startBus).toHaveBeenCalled());
+    const [, , opts] = startBus.mock.calls[0]!;
     const first = (opts as { conversation: string }).conversation;
 
     const box = (await screen.findByRole("textbox")) as HTMLTextAreaElement;
@@ -122,14 +144,118 @@ describe("App", () => {
     expect(screen.getByText(new RegExp(`new conversation ${linked}`))).toBeTruthy();
   });
 
-  it("carries ?user=web through the connect form to the credential it submits", async () => {
+  it("carries ?user=web from the URL straight through, with no server round trip", async () => {
+    const fetch = vi.fn();
+    vi.stubGlobal("fetch", fetch);
+    setLocation("?user=web&pass=the-web-password");
+    render(<App />);
+    await waitFor(() => expect(startBus).toHaveBeenCalled());
+    const [config] = startBus.mock.calls[0]!;
+    expect(config).toEqual({ url: "ws://localhost:9222", user: "web", pass: "the-web-password" });
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it("shows read-only guidance for a bare ?user=web, and never falls through to the served console credential", async () => {
+    const fetch = vi.fn();
+    vi.stubGlobal("fetch", fetch);
     setLocation("?user=web");
     render(<App />);
-    const passInput = screen.getByLabelText(/web password/i);
-    await userEvent.type(passInput, "the-web-password");
-    await userEvent.click(screen.getByRole("button", { name: /connect/i }));
-    await waitFor(() => expect(startBusMock).toHaveBeenCalled());
-    const [config] = startBusMock.mock.calls[0]!;
-    expect((config as { user: string }).user).toBe("web");
+    expect(await screen.findByText(/user=web&pass=/)).toBeTruthy();
+    expect(fetch).not.toHaveBeenCalled();
+    expect(startBus).not.toHaveBeenCalled();
+  });
+});
+
+describe("App finds its bus", () => {
+  it("connects with the served credential, to /bus on its own origin, and never stores it", async () => {
+    const fetch = respond(200, "application/json", '{"user":"console","pass":"served"}');
+    vi.stubGlobal("fetch", fetch);
+    render(<App />);
+    await waitFor(() => expect(startBus).toHaveBeenCalledTimes(1));
+    expect(startBus.mock.calls[0]![0]).toEqual({
+      url: `ws://${window.location.host}/bus`,
+      user: "console",
+      pass: "served",
+    });
+    expect(fetch).toHaveBeenCalledWith("/config.json", expect.objectContaining({ cache: "no-store" }));
+    await flush();
+    expect(sessionStorage.getItem(STORAGE_KEY)).toBeNull();
+  });
+
+  it("lets a URL override win without asking the server", async () => {
+    const fetch = respond(200, "application/json", '{"user":"console","pass":"served"}');
+    vi.stubGlobal("fetch", fetch);
+    setLocation("?ws=ws://localhost:9222&user=console&pass=dev-console");
+    render(<App />);
+    await waitFor(() => expect(startBus).toHaveBeenCalledTimes(1));
+    expect(startBus.mock.calls[0]![0]).toEqual({ url: "ws://localhost:9222", user: "console", pass: "dev-console" });
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it("shows the port-forward guidance under Vite, and doesn't connect", async () => {
+    vi.stubGlobal("fetch", respond(200, "text/html", "<!doctype html>"));
+    render(<App />);
+    expect(await screen.findByText(/port-forward svc\/platform-agent-a2a-console 8080:8080/)).toBeTruthy();
+    expect(screen.queryByRole("alert")).toBeNull();
+    expect(startBus).not.toHaveBeenCalled();
+  });
+
+  it("shows the server's sentence when the credential is missing", async () => {
+    const body = "no console credential at /var/run/secrets/a2a-console/console-password\n";
+    vi.stubGlobal("fetch", respond(503, "text/plain; charset=utf-8", body));
+    render(<App />);
+    const alert = await screen.findByRole("alert");
+    expect(alert.textContent).toContain("503: no console credential at /var/run/secrets/a2a-console/console-password");
+    expect(alert.textContent).not.toContain("Error:");
+    expect(screen.getByText(/has no credential yet/)).toBeTruthy();
+    expect(screen.queryByText(/port-forward svc\/platform-agent-a2a-console/)).toBeNull();
+    expect(startBus).not.toHaveBeenCalled();
+  });
+
+  it("forgets a config that failed to connect, and Retry asks the server again", async () => {
+    startBus.mockReset();
+    startBus.mockImplementationOnce(() => Promise.reject(new Error("websocket refused: 403")));
+    startBus.mockImplementation(async (_config: unknown, dispatch: (e: BusEvent) => void) => {
+      captured = { dispatch };
+      return handle();
+    });
+    const fetch = respond(200, "application/json", '{"user":"console","pass":"served"}');
+    vi.stubGlobal("fetch", fetch);
+    // A stored config, not a URL one: a URL config is never saved (config.ts's
+    // saveConfig only runs when `remember` is set), so sessionStorage would be
+    // null here either way and the assertion below couldn't fail. Seeding
+    // storage directly is what actually exercises clearConfig().
+    sessionStorage.setItem(STORAGE_KEY, JSON.stringify({ url: "ws://localhost:9222", user: "console", pass: "wrong" }));
+    render(<App />);
+    expect((await screen.findByRole("alert")).textContent).toContain("websocket refused: 403");
+    expect(sessionStorage.getItem(STORAGE_KEY)).toBeNull();
+    expect(fetch).not.toHaveBeenCalled();
+
+    await userEvent.click(screen.getByRole("button", { name: "Retry" }));
+    await waitFor(() => expect(startBus).toHaveBeenCalledTimes(2));
+    expect(startBus.mock.calls[1]![0].url).toBe(`ws://${window.location.host}/bus`);
+  });
+
+  it("keeps the named-user screen on Retry when the URL still names a user, and doesn't ask the server", async () => {
+    startBus.mockRejectedValueOnce(new Error("websocket refused: 403"));
+    const fetch = vi.fn();
+    vi.stubGlobal("fetch", fetch);
+    // scrubPasswordFromUrl only removes `pass`; `user=console` is still in the
+    // address bar after the failed connect, and Retry must not read that as
+    // "no user named" and quietly ask the server for the console credential.
+    setLocation("?user=console&pass=wrong");
+    render(<App />);
+    expect((await screen.findByRole("alert")).textContent).toContain("websocket refused: 403");
+    expect(fetch).not.toHaveBeenCalled();
+
+    await userEvent.click(screen.getByRole("button", { name: "Retry" }));
+    expect(await screen.findByText(/user=console&pass=<password>/)).toBeTruthy();
+    expect(fetch).not.toHaveBeenCalled();
+    expect(startBus).toHaveBeenCalledTimes(1);
+    // Removing `user` from the URL is what actually lets the page ask the
+    // server; Retry itself does not, and must not claim to.
+    expect(screen.getByText(/removing.*user.*from the url/i)).toBeTruthy();
+    expect(screen.getByText(/re-reads this address/i)).toBeTruthy();
+    expect(screen.queryByText(/asks the server/i)).toBeNull();
   });
 });

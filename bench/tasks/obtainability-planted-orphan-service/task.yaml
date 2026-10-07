@@ -20,9 +20,10 @@
 #
 # Isolation class: namespace-scoped plant on the host cluster, read-only
 # fleet sweep, GitOps-repo write (the ledger, on the same throwaway-repo terms
-# as every audit). The finding is `major` for a ClusterIP, below the
-# `critical` auto-promotion floor, so the run opens no remediation pull
-# request.
+# as every audit). The run opens no remediation pull request, for two reasons
+# either of which suffices: the plant is not declared in the GitOps repo, so
+# its remediation is `manual` (SOP 3.16), and 3.16 is off the checks the sweep
+# opens at `major` and is marked `needs_triage: service-selector` besides.
 #
 # Expected cost bracket: the full-audit shape, 600-1300s a repetition, as
 # obtainability-planted-pdb (962s measured).

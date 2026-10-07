@@ -121,10 +121,16 @@ def fixtures_dir(forge_class: type) -> Path:
 
 
 class Recorded:
-    """The transport's `api`, answering from a fixture instead of the network."""
+    """The transport's `api`, answering from a fixture instead of the network.
 
-    def __init__(self, responses: list) -> None:
+    `repeat`, when given, answers every call past the recorded ones: the
+    probe below uses it to say "the forge holds more of the same" to a forge
+    that reads on past a full page.
+    """
+
+    def __init__(self, responses: list, repeat: Any = None) -> None:
         self.responses = list(responses)
+        self.repeat = repeat
         self.calls: list[tuple] = []
 
     def __call__(self, method, path, *, params=None, body=None, raw=None) -> Any:
@@ -134,6 +140,8 @@ class Recorded:
             # models a diff, and none needs to -- it is returned unparsed.
             return "diff --git a/x b/x\n"
         if not self.responses:
+            if self.repeat is not None:
+                return self.repeat
             raise AssertionError(f"the forge made an unfixtured call: {method} {path}")
         answer = self.responses.pop(0)
         # A recorded *refusal*: `{"__status__": 404}` is what the transport
@@ -163,16 +171,31 @@ class ContractTest(unittest.TestCase):
     def instances(self) -> list[tuple[str, Any, Path]]:
         built = []
         for name, cls in forge_cases():
-            for forge in cls.for_config({}):
+            # A forge configured per host builds nothing from an empty
+            # configuration -- by design, since an install that never set it up
+            # must not grow a second forge -- so it ships the configuration it
+            # is tested under beside its recordings, in the shape the registry
+            # hands `for_config`. A forge that needs none ships none.
+            config_file = fixtures_dir(cls) / "config.json"
+            config = json.loads(config_file.read_text()) if config_file.is_file() else {}
+            from_this = list(cls.for_config(config))
+            # Per forge, not on the whole list: one forge building is no
+            # evidence that another did, and a forge that built nothing would
+            # drop out of every property below without a failure.
+            self.assertTrue(
+                from_this,
+                f"{name} built no instance from "
+                f"{'its config.json' if config_file.is_file() else 'an empty configuration and ships no config.json'}",
+            )
+            for forge in from_this:
                 built.append((name, forge, fixtures_dir(cls)))
-        self.assertTrue(built, "no forge in AVAILABLE built an instance")
         return built
 
     def load(self, directory: Path, verb: str) -> dict:
         return json.loads((directory / f"{verb}.json").read_text())
 
-    def invoke(self, forge, verb: str, fixture: dict) -> tuple[Any, Recorded]:
-        api = Recorded(fixture["responses"])
+    def invoke(self, forge, verb: str, fixture: dict, repeat: Any = None) -> tuple[Any, Recorded]:
+        api = Recorded(fixture["responses"], repeat)
         method = getattr(forge, verb.replace("-", "_"))
         return method(api, "acme/infra", dict(fixture["payload"])), api
 
@@ -347,6 +370,11 @@ class ContractTest(unittest.TestCase):
         a page after filtering its rows -- a bodiless review is not an
         utterance, but it is still a row the forge sent -- fails on the page
         that holds one.
+
+        A forge may read on past a full page whose rows were not utterances --
+        GitLab's bookkeeping notes fill most of a long merge request's pages.
+        One that does is answered with the filled page again, the forge holding
+        more of the same, and the flag still has to be set.
         """
         for name, forge, directory in self.instances():
             for verb in ("proposal-view", "issue-view"):
@@ -376,6 +404,7 @@ class ContractTest(unittest.TestCase):
                                 "payload": dict(fixture["payload"], limit=limit),
                                 "responses": responses,
                             },
+                            repeat=fixture["responses"][filled],
                         )
                         self.assertTrue(answer["commentsTruncated"])
 
@@ -405,7 +434,13 @@ class ContractTest(unittest.TestCase):
                         self.assertIn(method, {"GET", "POST", "PATCH", "PUT", "DELETE"})
                         self.assertNotIn("://", path)
                         self.assertFalse(path.startswith("/"))
-                        self.assertIn("acme/infra", path)
+                        # The repository, in the form the forge's API keys
+                        # it by: GitLab's takes the whole path as one
+                        # URL-encoded segment.
+                        self.assertTrue(
+                            "acme/infra" in path or "acme%2Finfra" in path,
+                            f"{path} does not name the repository",
+                        )
                         self.assertIsInstance(params, (dict, type(None)))
                         self.assertIsInstance(body, (dict, type(None)))
 

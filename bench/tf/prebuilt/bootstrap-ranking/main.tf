@@ -15,7 +15,7 @@
 # The scenario driver for bench/tasks/bootstrap-inventory-ranking-delivery:
 # plant a fixed INVENTORY.raw.md (inventory-raw.txt beside this file) on the
 # shell sandbox's data volume, file the `bootstrap-inventory-prioritize` card
-# the discovery sweep's worker files once it has written that file, wait until
+# the onboarding gate's hand-off files once it has written that file, wait until
 # the card's worker has ended its run itself, or `run_wait` has passed, and
 # then arm the delivery job by touching `.user_aligned`, the marker the
 # onboarding plugin touches when a person first chats. The delivery job then
@@ -23,8 +23,8 @@
 # if no worker has picked the card up by then or no read of the board has
 # succeeded.
 #
-# The raw report goes on the sandbox because that is where the sweep's worker
-# writes it: a kanban worker's terminal and file tools both run there. Its
+# The raw report goes on the sandbox because that is where the hand-off writes
+# it and where the ranking card's terminal and file tools run. Its
 # owner is set to the data volume's, the user those tools run as.
 #
 # It refuses an install where a person has connected (`.user_aligned`) or
@@ -34,7 +34,8 @@
 # the ranked report this produces is the one onboarding delivers, and arming
 # delivery with a chat bound would post it there. It also refuses one whose
 # gate has not filed its sweep (no `.bootstrap_scan_filed`), because a sweep
-# filed during the run writes its own INVENTORY.raw.md over the planted one.
+# filed during the run gets its audit cards filed beside the planted card and
+# its hand-off files a ranking card of its own.
 # Open `bootstrap-inventory-*` cards are archived before the plant, so an
 # earlier sweep still running cannot do that either; the sweep marker stays,
 # so the gate files no other.
@@ -84,8 +85,8 @@ locals {
   # untouched.
   raw_b64 = base64encode(file("${path.module}/inventory-raw.txt"))
   # bootstrap_scan_gate.py's PRIORITIZE_IDEMPOTENCY_KEY and SCAN_ASSIGNEE, and
-  # the card agents/platform/governance/inventory.md Step 5 tells the sweep's
-  # worker to file, without the parent: this plant stands in for that worker.
+  # the card agents/chat/scripts/bootstrap_handoff.py files: this plant stands
+  # in for the hand-off.
   card_key      = "bootstrap-inventory-prioritize"
   card_assignee = "platform"
   card_title    = "Prioritize the onboarding inventory report"
@@ -384,7 +385,7 @@ resource "null_resource" "ranking" {
           echo "ERROR: onboarding already delivered on ${var.host_cluster_name} (${local.home}/.bootstrap_completed). Clearing the INVENTORY files would delete the report that was delivered." >&2
           exit 1 ;;
         unfiled)
-          echo "ERROR: the onboarding gate on ${var.host_cluster_name} has not filed its discovery sweep (no ${local.home}/.bootstrap_scan_filed). A sweep filed during this case writes its own INVENTORY.raw.md over the planted one; wait for the gate to file, or run the case elsewhere." >&2
+          echo "ERROR: the onboarding gate on ${var.host_cluster_name} has not filed its discovery sweep (no ${local.home}/.bootstrap_scan_filed). A sweep filed during this case writes its own INVENTORY.raw.md over the planted one once its cards settle, and files a ranking card of its own; wait for the gate to file, or run the case elsewhere." >&2
           exit 1 ;;
         nojobs)
           echo "ERROR: ${local.scan_job} or ${local.delivery_job} is not in the cron store on ${var.host_cluster_name}, so nothing would deliver the report this case grades." >&2

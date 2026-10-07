@@ -4574,8 +4574,9 @@ class ForgeRefreshExecutorTest(unittest.TestCase):
             credential_proxy.CommandExecutor
         )
         executor.execute_internal = lambda argv: self.fail("helper was run")
+        brokered = mock.Mock(credential=providers.BrokeredCredential("gitlab", None))
         with mock.patch.object(credential_proxy, "repository_is_managed", return_value=True), \
-                mock.patch.object(credential_proxy, "_provider_forge"):
+                mock.patch.object(credential_proxy, "_provider_forge", return_value=brokered):
             with self.assertRaises(RuntimeError) as raised:
                 executor.refresh_forge_credential("gitlab", "gke-agentic/infra")
         self.assertIn("gitlab", str(raised.exception))
@@ -7068,12 +7069,216 @@ class VcsRouteTest(unittest.TestCase):
         broker = credential_proxy.build_vcs_broker(self.executor)
         self.assertIsNotNone(broker)
         self.assertTrue(broker.registry.forges)
+        # Review round 3: the request slot's deadline is what the broker
+        # hands every HTTP forge call; nothing pinned that it is handed over.
+        self.assertEqual(self.executor.request_deadline, broker._request_deadline)
 
         overlapping = CommandExecutor.__new__(CommandExecutor)
         overlapping.vcs_root = self.executor.workspace_dir / "vcs"
         overlapping.workspace_dir = self.executor.workspace_dir
         with self.assertRaises(RuntimeError):
             credential_proxy.build_vcs_broker(overlapping)
+
+
+class TwoForgeInstallTest(unittest.TestCase):
+    """Review: an install serving GitHub and GitLab has no one forge to default
+    to, and the callers that held a bare GitHub name stopped working on it."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        path = Path(tmp.name) / "forges.json"
+        path.write_text(json.dumps({"forges": [
+            {"provider": "github", "host": "github.com"},
+            {"provider": "gitlab", "host": "gitlab.com", "tokenPath": "/t", "allowedPaths": []},
+        ]}))
+        for patcher in (
+            mock.patch.dict(os.environ, {"VCS_FORGES_CONFIG": str(path)}),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.registry = credential_proxy.providers.Registry()
+        self.assertIsNone(self.registry.default)
+        for patcher in (
+            mock.patch.object(credential_proxy, "forge_registry", return_value=self.registry),
+            mock.patch.object(
+                credential_proxy, "managed_repositories",
+                return_value=frozenset({"github:github.com/acme/infra"}),
+            ),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def test_a_workspace_write_to_a_managed_github_repository_still_passes(self):
+        store = mock.Mock()
+        store.get.return_value = mock.Mock(repo="acme/infra")
+        credential_proxy.require_managed_workspace(store, "h")
+        store.get.return_value = mock.Mock(repo="acme/other")
+        with self.assertRaises(Exception) as caught:
+            credential_proxy.require_managed_workspace(store, "h")
+        self.assertEqual("RepositoryNotManaged", type(caught.exception).__name__)
+
+    def test_the_workspace_credential_resolves_a_bare_github_name_through_the_seam(self):
+        # Review round 4: the cases above call `_hosted` directly, so dropping
+        # it from `_workspace_credential` kept the suite green. Driven through
+        # the production seam on the two-forge registry, the bare name has to
+        # reach the role lookup on the GitHub forge.
+        seen = []
+
+        def role(repository, forge=None):
+            seen.append((repository, forge.name if forge else None))
+            return credential_proxy.ROLE_UNREGISTERED
+
+        with mock.patch.object(credential_proxy, "repository_role", side_effect=role):
+            credential_proxy._workspace_credential(self.registry, "acme/infra")
+        self.assertEqual([("acme/infra", "github")], seen)
+
+    def test_the_github_refresh_alias_accepts_an_older_images_bare_slug(self):
+        # Review round 4: the alias branch was driven by no test. An older
+        # agent image posts `{"repository": "owner/name"}` to
+        # `/v1/github/refresh`; on a two-forge broker it has to refresh, not
+        # be refused as hostless.
+        handler = CredentialProxyHandler.__new__(CredentialProxyHandler)
+        handler.max_request_bytes = 10 * 1024 * 1024
+        encoded = json.dumps({"repository": "acme/infra"}).encode()
+        handler.headers = {"Content-Length": str(len(encoded))}
+        handler.rfile = io.BytesIO(encoded)
+        calls = []
+        handler.executor = types.SimpleNamespace(
+            refresh_forge_credential=lambda provider, repository: calls.append((provider, repository))
+        )
+        replies = []
+        handler._json = lambda status, payload: replies.append((status, payload))
+        handler.log_message = lambda *args: None
+        handler._handle_forge_refresh(provider="github")
+        self.assertEqual([("github", "acme/infra")], calls)
+        self.assertEqual(HTTPStatus.OK, replies[-1][0])
+
+    def test_the_forge_neutral_refresh_lifts_a_bare_name_the_body_places(self):
+        # Review (#2439): only the alias lifted; `/v1/forge/refresh` with
+        # `{"provider": "github"}` in the body was refused as hostless.
+        handler = CredentialProxyHandler.__new__(CredentialProxyHandler)
+        handler.max_request_bytes = 10 * 1024 * 1024
+        encoded = json.dumps({"provider": "github", "repository": "acme/infra"}).encode()
+        handler.headers = {"Content-Length": str(len(encoded))}
+        handler.rfile = io.BytesIO(encoded)
+        calls = []
+        handler.executor = types.SimpleNamespace(
+            refresh_forge_credential=lambda provider, repository: calls.append((provider, repository))
+        )
+        replies = []
+        handler._json = lambda status, payload: replies.append((status, payload))
+        handler.log_message = lambda *args: None
+        handler._handle_forge_refresh()
+        self.assertEqual([("github", "acme/infra")], calls)
+        self.assertEqual(HTTPStatus.OK, replies[-1][0])
+
+    def _gitlab_only(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        path = Path(tmp.name) / "forges.json"
+        path.write_text(json.dumps({"forges": [
+            {"provider": "gitlab", "host": "gitlab.com", "tokenPath": "/t", "allowedPaths": []},
+        ]}))
+        with mock.patch.dict(os.environ, {"VCS_FORGES_CONFIG": str(path)}):
+            return credential_proxy.providers.Registry()
+
+    def test_an_install_with_no_github_forge_refuses_a_workspace_write_as_not_managed(self):
+        # Review round 2: it answered 503 "list unavailable", which is false
+        # and invites a retry; the workspace has no forge to write through.
+        store = mock.Mock()
+        store.get.return_value = mock.Mock(repo="acme/infra")
+        with mock.patch.object(credential_proxy, "forge_registry", return_value=self._gitlab_only()):
+            with self.assertRaises(Exception) as caught:
+                credential_proxy.require_managed_workspace(store, "h")
+        self.assertEqual("RepositoryNotManaged", type(caught.exception).__name__)
+        self.assertIn("serves github repositories only", str(caught.exception))
+
+    def test_an_install_with_no_github_forge_clones_the_workspace_without_a_credential(self):
+        with mock.patch.object(credential_proxy, "forge_registry", return_value=self._gitlab_only()), \
+                self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs:
+            credential = credential_proxy._workspace_credential(self._gitlab_only(), "acme/infra")
+        self.assertIsInstance(credential, providers.NoCredential)
+        self.assertIn("serves no github forge", "\n".join(logs.output))
+
+    def test_a_host_with_no_forge_answers_its_gap_not_nothing_to_refresh(self):
+        # Review round 3: a GitHub-only install's placeholder for gitlab.com
+        # carries no credential, and the route answered 200 "nothing to
+        # refresh" for it.
+        with mock.patch.dict(os.environ):
+            os.environ.pop("VCS_FORGES_CONFIG", None)
+            github_only = credential_proxy.providers.Registry()
+        handler = CredentialProxyHandler.__new__(CredentialProxyHandler)
+        handler.max_request_bytes = 1 << 20
+        body = json.dumps({"provider": "gitlab", "repository": "https://gitlab.com/acme/infra"}).encode()
+        handler.headers = {"Content-Length": str(len(body))}
+        handler.rfile = io.BytesIO(body)
+        handler.executor = types.SimpleNamespace(
+            refresh_forge_credential=lambda *a: self.fail("no refresh for a placeholder")
+        )
+        replies = []
+        handler._json = lambda status, payload: replies.append((status, payload))
+        with mock.patch.object(credential_proxy, "forge_registry", return_value=github_only), \
+                mock.patch.object(
+                    credential_proxy, "managed_repositories",
+                    return_value=frozenset({"gitlab:gitlab.com/acme/infra"}),
+                ):
+            handler._handle_forge_refresh()
+        self.assertEqual(1, len(replies))
+        status, payload = replies[0]
+        self.assertEqual(HTTPStatus.NOT_IMPLEMENTED, status)
+        self.assertEqual("FORGE_UNSUPPORTED", payload["code"])
+
+    def test_a_forge_with_nothing_to_refresh_says_so_instead_of_failing(self):
+        # Review round 2: the route ran a helper GitLab does not ship and
+        # answered 502 "credential refresh failed" on every call.
+        handler = CredentialProxyHandler.__new__(CredentialProxyHandler)
+        handler.max_request_bytes = 1 << 20
+        body = json.dumps({"provider": "gitlab", "repository": "https://gitlab.com/acme/infra"}).encode()
+        handler.headers = {"Content-Length": str(len(body))}
+        handler.rfile = io.BytesIO(body)
+        handler.executor = types.SimpleNamespace(
+            refresh_forge_credential=lambda *a: self.fail("no refresh for a stored token")
+        )
+        replies = []
+        handler._json = lambda status, payload: replies.append((status, payload))
+        with mock.patch.object(
+            credential_proxy, "managed_repositories",
+            return_value=frozenset({"gitlab:gitlab.com/acme/infra"}),
+        ), self.assertNoLogs(credential_proxy.LOGGER, level="WARNING"):
+            handler._handle_forge_refresh()
+        self.assertEqual([(HTTPStatus.OK, {"status": "nothing to refresh", "forge": "gitlab"})], replies)
+        executor = credential_proxy.CommandExecutor.__new__(credential_proxy.CommandExecutor)
+        executor.execute_internal = lambda argv: self.fail("helper was run")
+        with mock.patch.object(
+            credential_proxy, "managed_repositories",
+            return_value=frozenset({"gitlab:gitlab.com/acme/infra"}),
+        ):
+            executor.refresh_forge_credential("gitlab", "acme/infra")
+
+    def test_an_entry_typed_for_no_forge_here_is_named_once(self):
+        # Review round 2: `GitLab` or `gitlab-selfmanaged` keyed silently and
+        # admitted nothing, with nothing pointing at the entry.
+        with mock.patch.object(credential_proxy, "_warned_repository_types", set()):
+            with self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs:
+                credential_proxy._warn_on_unserved_types(
+                    frozenset({"github:github.com/a/b", "GitLab:gitlab.com/a/b"})
+                )
+            self.assertEqual(1, len(logs.output))
+            self.assertIn("'GitLab' match no forge", logs.output[0])
+            with self.assertNoLogs(credential_proxy.LOGGER, level="WARNING"):
+                credential_proxy._warn_on_unserved_types(frozenset({"GitLab:gitlab.com/c/d"}))
+
+    def test_a_bare_name_the_caller_knows_the_forge_of_still_resolves(self):
+        # The content workspace's read credential and the older images'
+        # `/v1/github/refresh` both hold a bare GitHub name.
+        lifted = credential_proxy._hosted("acme/infra", "github")
+        self.assertEqual("https://github.com/acme/infra", lifted)
+        forge, repo = self.registry.resolve(lifted)
+        self.assertEqual(("github", "acme/infra"), (forge.name, repo))
+        for unchanged in ("https://gitlab.com/a/b/c", "a/b/c", None):
+            self.assertEqual(unchanged, credential_proxy._hosted(unchanged, "github"))
+        self.assertEqual("acme/infra", credential_proxy._hosted("acme/infra", "bitbucket"))
 
 
 class WorkspaceRouteTest(unittest.TestCase):
@@ -7203,7 +7408,7 @@ class WorkspaceRouteTest(unittest.TestCase):
         with mock.patch.object(
             credential_proxy,
             "repository_is_managed",
-            side_effect=lambda repo: seen.append(repo) or True,
+            side_effect=lambda repo, forge=None: seen.append(repo) or True,
         ):
             credential_proxy.require_managed_workspace(store, "h")
         self.assertEqual(["acme/unmanaged"], seen)
@@ -8316,6 +8521,93 @@ class RolePermitsTest(unittest.TestCase):
                 status, payload = handler.replies[0]
                 self.assertEqual(HTTPStatus.FORBIDDEN, status)
                 self.assertEqual("CALLER_ROLE_FORBIDDEN", payload["code"])
+
+
+class CredentialReachTest(unittest.TestCase):
+    """The startup diagnostic for a token that reaches further than the install."""
+
+    def _broker(self, answer):
+        forge = mock.Mock(hosts=("gitlab.example.com",))
+        forge.name = "gitlab"
+        broker = mock.Mock()
+        broker.registry.forges = [forge]
+        if isinstance(answer, Exception):
+            broker.credential_reach.side_effect = answer
+        else:
+            broker.credential_reach.return_value = answer
+        return broker
+
+    def test_unmanaged_repositories_the_token_reaches_are_named(self):
+        broker = self._broker((["acme/infra", "acme/payroll", "team/secret"], False))
+        with mock.patch.object(
+            credential_proxy, "managed_repositories",
+            return_value=frozenset({"gitlab:gitlab.example.com/acme/infra"}),
+        ), self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs:
+            credential_proxy.warn_on_credential_reach(broker)
+        line = "\n".join(logs.output)
+        self.assertIn("reaches 2 repositories this install does not manage", line)
+        self.assertIn("acme/payroll, team/secret", line)
+        self.assertNotIn("acme/infra,", line)
+
+    def test_a_token_that_reaches_only_managed_repositories_is_quiet(self):
+        broker = self._broker((["acme/infra"], False))
+        with mock.patch.object(
+            credential_proxy, "managed_repositories",
+            return_value=frozenset({"gitlab:gitlab.example.com/acme/infra"}),
+        ), self.assertNoLogs(credential_proxy.LOGGER, level="WARNING"):
+            credential_proxy.warn_on_credential_reach(broker)
+
+    def test_a_token_that_reaches_nothing_is_named_not_reassured(self):
+        # Review: an empty membership logged "reaches 0 repositories, all of
+        # them managed" at INFO, for a token that cannot reach the managed
+        # repositories either.
+        with mock.patch.object(
+            credential_proxy, "managed_repositories",
+            return_value=frozenset({"gitlab:gitlab.example.com/acme/infra"}),
+        ), self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs:
+            credential_proxy.warn_on_credential_reach(self._broker(([], False)))
+        self.assertIn("reaches no repositories at all", "\n".join(logs.output))
+
+    def test_an_all_managed_count_cut_short_says_at_least(self):
+        # Review: the "at least" the unmanaged branch carries was dropped on
+        # the all-managed one, the branch that reassures.
+        with mock.patch.object(
+            credential_proxy, "managed_repositories",
+            return_value=frozenset({"gitlab:gitlab.example.com/acme/infra"}),
+        ), self.assertLogs(credential_proxy.LOGGER, level="INFO") as logs:
+            credential_proxy.warn_on_credential_reach(self._broker((["acme/infra"], True)))
+        self.assertIn("reaches at least 1 repositories, all of them managed", "\n".join(logs.output))
+
+    def test_an_unreachable_forge_logs_the_reason_not_only_the_type(self):
+        # Review round 2: a TLS or DNS failure logged as `type=WorkspaceError`
+        # alone left the operator nothing to act on.
+        refusal = providers.WorkspaceError(
+            "x", status=502, code="FORGE_CALL_FAILED",
+            detail="the forge's TLS certificate is not trusted by this image",
+        )
+        with self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs:
+            credential_proxy.warn_on_credential_reach(self._broker(refusal))
+        self.assertIn("TLS certificate is not trusted", "\n".join(logs.output))
+
+    def test_a_missing_token_logs_its_reason_and_code(self):
+        # Review (#2439): the token-file refusal carries no detail, and the
+        # log line read `type=WorkspaceError` alone for the routine case of
+        # a Secret not mounted yet.
+        refusal = providers.WorkspaceError(
+            "the forge credential for gitlab.com could not be read: FileNotFoundError",
+            status=503, code="FORGE_CREDENTIAL_UNAVAILABLE",
+        )
+        with self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs:
+            credential_proxy.warn_on_credential_reach(self._broker(refusal))
+        out = "\n".join(logs.output)
+        self.assertIn("FORGE_CREDENTIAL_UNAVAILABLE", out)
+        self.assertIn("could not be read: FileNotFoundError", out)
+
+    def test_a_forge_that_cannot_say_or_cannot_answer_never_raises(self):
+        credential_proxy.warn_on_credential_reach(self._broker(None))
+        with self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs:
+            credential_proxy.warn_on_credential_reach(self._broker(RuntimeError("down")))
+        self.assertIn("could not ask what the gitlab credential", "\n".join(logs.output))
 
 
 class ManagedRepositoryGateTest(unittest.TestCase):

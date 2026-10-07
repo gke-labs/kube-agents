@@ -80,13 +80,23 @@ class NoConfigurationTest(_ConfigCase):
 
 class ConfigurationFileTest(_ConfigCase):
     def test_entries_are_normalised(self):
+        # The provider and host are normalised here; `allowedPaths` is handed
+        # to the forge as written, for it to trim and to refuse what it must.
         self.configure(
-            {"forges": [{"provider": "GitHub", "host": "GitHub.com", "allowedPaths": ["/acme/"]}]}
+            {"forges": [{"provider": "TestForge", "host": "Git.Example.com", "allowedPaths": ["/acme/"]}]}
         )
         self.assertEqual(
-            [{"provider": "github", "host": "github.com", "token_path": "", "allowed_paths": ("acme",)}],
+            [{"provider": "testforge", "host": "git.example.com", "token_path": "", "allowed_paths": ("/acme/",)}],
             registry_module.load_forge_entries(),
         )
+
+    def test_github_refuses_allowed_paths_rather_than_ignoring_them(self):
+        # Review round 2: accepted and never enforced, it read as narrowing
+        # the installation token beside a forge where it does.
+        self.configure({"forges": [{"provider": "github", "host": "github.com", "allowedPaths": ["acme"]}]})
+        with self.assertRaises(ValueError) as caught:
+            providers.Registry()
+        self.assertIn("not supported for github", str(caught.exception))
 
     def test_a_configuration_that_lists_github_builds_it(self):
         self.configure({"forges": [{"provider": "github", "host": "github.com"}]})
@@ -103,6 +113,14 @@ class ConfigurationFileTest(_ConfigCase):
         # Review round 2: the placeholders for unconfigured forges were
         # listed as configured, pointing the operator at the wrong thing.
         self.assertIn("Configured: none", str(caught.exception))
+
+    def test_absent_allowed_paths_are_kept_apart_from_an_empty_list(self):
+        self.configure({"forges": [
+            {"provider": "github", "host": "github.com"},
+            {"provider": "testforge", "host": "a.example.com", "allowedPaths": []},
+        ]})
+        entries = registry_module.load_forge_entries()
+        self.assertEqual([None, ()], [e["allowed_paths"] for e in entries])
 
     def test_an_enterprise_host_is_refused_until_it_is_served(self):
         self.configure({"forges": [{"provider": "github", "host": "github.example.com"}]})

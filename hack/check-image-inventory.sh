@@ -146,7 +146,7 @@ check_base_image python examples/inference-replay/replay-proxy/Dockerfile PYTHON
 check_base_image python deploy/sandbox/Dockerfile PYTHON_IMAGE PYTHON_VERSION
 # The a2a images. All parameterize their builder bases: the auth callout and
 # the gateway already did, the worker arrived with #1334, and the capability
-# verifier is added here.
+# verifier and the console are added here.
 check_base_image golang a2a/Dockerfile.authcallout GOLANG_IMAGE GOLANG_VERSION
 check_base_image distroless-static a2a/Dockerfile.authcallout DISTROLESS_IMAGE DISTROLESS_VERSION
 check_base_image golang a2a/Dockerfile.gateway GOLANG_IMAGE GOLANG_VERSION
@@ -155,11 +155,14 @@ check_base_image golang a2a/Dockerfile.verifier GOLANG_IMAGE GOLANG_VERSION
 check_base_image distroless-static a2a/Dockerfile.verifier DISTROLESS_IMAGE DISTROLESS_VERSION
 check_base_image golang a2a/Dockerfile.worker GOLANG_IMAGE GOLANG_VERSION
 check_base_image node a2a/Dockerfile.worker NODE_IMAGE NODE_VERSION
+check_base_image node a2a/Dockerfile.console NODE_IMAGE NODE_VERSION
+check_base_image golang a2a/Dockerfile.console GOLANG_IMAGE GOLANG_VERSION
+check_base_image distroless-static a2a/Dockerfile.console DISTROLESS_IMAGE DISTROLESS_VERSION
 # The Hermes bridge sidecar (a2a/Dockerfile.hermes-bridge) has only its
 # builder base to compare: its runtime base is the platform-agent image of the
 # same build, passed as a build arg with no default, so there is no runtime
 # pin in the Dockerfile. The image itself is a first-party inventory entry
-# (hermes-bridge), published by the release workflow beside the three A2A
+# (hermes-bridge), published by the release workflow beside the four A2A
 # images.
 check_base_image golang a2a/Dockerfile.hermes-bridge GOLANG_IMAGE GOLANG_VERSION
 
@@ -216,6 +219,7 @@ check_go_directive a2a/Dockerfile.gateway GOLANG_VERSION a2a/go.mod
 check_go_directive a2a/Dockerfile.verifier GOLANG_VERSION a2a/go.mod
 check_go_directive a2a/Dockerfile.worker GOLANG_VERSION a2a/go.mod
 check_go_directive a2a/Dockerfile.hermes-bridge GOLANG_VERSION a2a/go.mod
+check_go_directive a2a/Dockerfile.console GOLANG_VERSION a2a/go.mod
 
 # hermes-agent is the one base image whose tag lives outside the Dockerfile —
 # the release workflows read tags.env — so the inventory points at that file
@@ -246,10 +250,10 @@ jq -r '.images[] | select(.tagFrom) | "\(.name)\t\(.tagFrom.file)\t\(.tagFrom.ke
 #    is the string the operator renders into the pod template; the comparison
 #    is on the normalised form, the same way check 1 reads a Dockerfile ARG.
 #    The first-party next defaults (gateway, worker, callout, capability
-#    verifier) are release images with no fixed tag in the inventory, so the
-#    operator compiles in the bare image name and takes registry and tag from
-#    its own or the agent image; the second check below holds each name to the
-#    inventory's entry, and that entry's repository to the name under the
+#    verifier, console) are release images with no fixed tag in the inventory,
+#    so the operator compiles in the bare image name and takes registry and tag
+#    from its own or the agent image; the second check below holds each name to
+#    the inventory's entry, and that entry's repository to the name under the
 #    agent image's registry, which is what the operator renders when nothing
 #    overrides it.
 # ---------------------------------------------------------------------------
@@ -301,6 +305,7 @@ check_compiled_image_name a2a-gateway k8s-operator/internal/controller/platforma
 check_compiled_image_name a2a-worker k8s-operator/internal/controller/platformagent_a2a_manifests.go a2aWorkerImageName
 check_compiled_image_name a2a-authcallout k8s-operator/internal/controller/platformagent_a2a_callout.go a2aCalloutImageName
 check_compiled_image_name a2a-verifier k8s-operator/internal/controller/platformagent_a2a_verifier.go a2aVerifierImageName
+check_compiled_image_name a2a-console k8s-operator/internal/controller/platformagent_a2a_console.go a2aConsoleImageName
 check_compiled_repository a2a-worker a2a/gateway/config.go defaultWorkerRepository
 
 # ---------------------------------------------------------------------------

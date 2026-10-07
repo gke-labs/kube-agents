@@ -25,13 +25,14 @@ costs a call or two rather than 30 a minute. Each open and close is logged at in
 free text and is left to upstream.
 
 **The session title.** Upstream titles only DM threads. With the flag on, a
-channel thread's first ask (or a clicked choice's label, offered by
+channel thread's first ask (or the question a clicked choice answers, offered by
 ``slack_ux_clicks`` before its turn runs) becomes its session title, set right after a
 ``processing`` lands: ``agents.sessions.rename`` refuses a thread with no
 session yet. A failed rename keeps the ask for the next ``processing`` sent;
 Slack's ``invalid_name`` refusal is logged at warning, once per thread and
 title, and any other failure at debug; once the title is set, a follow-up ask in the thread
-keeps it.
+keeps it. An event alert's thread takes the title the event watcher recorded for it instead
+(``slack_ux_incident.alert_title``), ahead of any ask.
 
 **One plan per thread.** ``kanban_progress_lines`` rolls each card's progress
 notes into one message per card. With the flag on, a Slack thread instead gets
@@ -236,6 +237,10 @@ _asks: OrderedDict[tuple, str] = OrderedDict()
 _titles: OrderedDict[tuple, str] = OrderedDict()
 #: ``(channel, thread) -> the title Slack refused``, so a retry every refresh warns once.
 _refused_titles: OrderedDict[tuple, str] = OrderedDict()
+#: ``(channel, thread) -> the alert title recorded for it``, "" for none, so a
+#: thread's routing row is read once. The watcher records it before the alert's
+#: first turn, so a miss stays a miss.
+_alert_titles: OrderedDict[tuple, str] = OrderedDict()
 #: ``(channel, thread) -> _Plan``.
 _plans: OrderedDict[tuple, _Plan] = OrderedDict()
 #: ``(channel, thread) -> [_Plan]`` the lapse set aside with a row still
@@ -272,6 +277,20 @@ def _remember(store: OrderedDict, key: Any, value: Any, cap: int) -> None:
 
 
 # --- the session -----------------------------------------------------------
+
+
+def _alert_title(key: tuple) -> str:
+    """The title the event watcher recorded for the alert posted as this thread, else ""."""
+    if key not in _alert_titles:
+        try:
+            from gateway import slack_ux_incident
+
+            title = slack_ux_incident.alert_title(*key)
+        except Exception as exc:  # noqa: BLE001 — a title is cosmetic
+            logger.debug("slack_ux_status: no alert title for %s/%s: %s", *key, exc)
+            title = ""
+        _remember(_alert_titles, key, title, ASKS_MAX)
+    return _alert_titles[key]
 
 
 def note_ask(chat_id: str, thread_ts: str | None, text: Any) -> None:
@@ -329,9 +348,12 @@ async def set_thread_status(
     if not sent or sent[0] != wanted:
         logger.info("slack_ux_status: session %s in %s/%s", wanted, chat_id, thread_ts)
     _remember(_sessions, key, (wanted, now), SESSIONS_MAX)
-    if wanted != _status.SESSION_PROCESSING or key not in _asks:
+    if wanted != _status.SESSION_PROCESSING or key in _titles:
         return
-    title = _status.session_title(_asks[key])
+    ask = _alert_title(key) or _asks.get(key)
+    if not ask:
+        return
+    title = _status.session_title(ask)
     if title:
         try:
             await title_method(client)(channel_id=chat_id, thread_ts=thread_ts, title=title)

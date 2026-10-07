@@ -60,6 +60,11 @@ card's next settle, and one whose card resumed before a failed settle still read
 its answer on the retry, whatever event brings it. The open questions are held in process, so a restart
 leaves the buttons of any it forgot.
 
+Each moment carries a side bar, green for a PR and yellow for a question: a
+legacy attachment holding every block below the headline. A settle sends the
+attachment again, since ``chat.update`` would otherwise keep the old one, buttons
+and all; a question settled down to its headline alone loses the bar.
+
 Fail-soft: a moment that cannot be posted is logged, and the caller falls back
 to what it did before.
 """
@@ -196,8 +201,9 @@ def _remember(mapping: OrderedDict, key: tuple, value: Any) -> None:
         mapping.popitem(last=False)
 
 
-async def _post(adapter: Any, sub: dict, blocks: list[dict], text: str) -> str | None:
-    """Post in the card's thread; the message's ts ("" if Slack gave none), None on failure."""
+async def _post(adapter: Any, sub: dict, blocks: list[dict], text: str, color: str) -> str | None:
+    """Post in the card's thread beside a ``color`` side bar; the message's ts ("" if
+    Slack gave none), None on failure."""
     chat_id = str(sub.get("chat_id") or "")
     if not (chat_id and hasattr(adapter, "_get_client")):
         return None
@@ -207,7 +213,7 @@ async def _post(adapter: Any, sub: dict, blocks: list[dict], text: str) -> str |
             channel=chat_id,
             thread_ts=sub.get("thread_id") or None,
             text=text,
-            blocks=blocks,
+            **_presenter.with_side_bar(blocks, color, text),
         )
     except Exception as exc:  # noqa: BLE001 — the caller falls back
         logger.warning("slack_ux_moments: posting in %s failed: %s", chat_id, exc)
@@ -226,7 +232,7 @@ async def pr_opened(adapter: Any, sub: dict, text: str) -> bool:
         if key in _announced:
             continue
         blocks, fallback = _moments.pr_opened(url, repo, number, line)
-        if await _post(adapter, sub, blocks, fallback) is None:
+        if await _post(adapter, sub, blocks, fallback, _moments.PR_SIDE_BAR) is None:
             continue
         _remember(_announced, key, None)
         posted = True
@@ -254,7 +260,7 @@ async def needs_you(adapter: Any, sub: dict, payload: Any, event_id: int = 0) ->
     earlier = _questions.get(key)
     blocks, text = moment
     text = _with_card(text, key[0], any(b.get("type") == "actions" for b in blocks))
-    ts = await _post(adapter, sub, blocks, text)
+    ts = await _post(adapter, sub, blocks, text, _moments.NEEDS_YOU_SIDE_BAR)
     if ts is None:
         # The earlier question keeps its slot, so it is settled once, from there.
         return False
@@ -477,11 +483,14 @@ async def _settled(adapter: Any, sub: dict, entry: tuple, kind: str = UNBLOCKED_
             # One whose rewrite failed posted its line in the thread, and is the answer.
             note = ""
         settled_text = _without_choices(text)
+        question_text = f"{note}\n\n{settled_text}" if note else settled_text
         await client.chat_update(
             channel=channel,
             ts=ts,
-            text=f"{note}\n\n{settled_text}" if note else settled_text,
-            blocks=_moments.needs_you_settled(blocks, note),
+            text=question_text,
+            **_presenter.with_side_bar(
+                _moments.needs_you_settled(blocks, note), _moments.NEEDS_YOU_SIDE_BAR, question_text
+            ),
         )
         shown = bool(note)
     except Exception as exc:  # noqa: BLE001 — cosmetic; the next event retries

@@ -229,9 +229,9 @@ python3 $V proposal comment 17 --body 'Rebased on main.'
   not the same answer as one that returned nothing because the file has no
   history.
 - **Say which repository and which branch** in anything you report.
-- **`capabilities` before assuming a non-GitHub forge works.** GitLab and
-  Bitbucket parse their specs and then tell you exactly what this install is
-  missing. That is the answer, not a bug to work around.
+- **`capabilities` before assuming a non-GitHub forge works.** Bitbucket, and
+  GitLab on an install that has not configured it, parse their specs and then
+  tell you exactly what this install is missing. That is the answer, not a bug to work around.
 
 ## Reference
 

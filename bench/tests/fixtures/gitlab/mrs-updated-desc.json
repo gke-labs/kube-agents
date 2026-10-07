@@ -1,0 +1,62 @@
+[
+  {
+    "id": 50000003,
+    "iid": 3,
+    "project_id": 40000001,
+    "source_project_id": 40000001,
+    "target_project_id": 40000001,
+    "source_branch": "platform-agent/writes-mr",
+    "target_branch": "main",
+    "sha": "9d96d99d7d17a64df51e6993613441d4a1329a49",
+    "state": "opened",
+    "title": "proto writes",
+    "draft": false,
+    "author": {
+      "username": "eval-maintainer",
+      "bot": false
+    },
+    "created_at": "2026-10-01T14:59:51.560Z",
+    "updated_at": "2026-10-01T14:59:52.865Z",
+    "web_url": "https://gitlab.com/example-group/infra/-/merge_requests/3"
+  },
+  {
+    "id": 50000002,
+    "iid": 2,
+    "project_id": 40000001,
+    "source_project_id": 40000001,
+    "target_project_id": 40000001,
+    "source_branch": "platform-agent/proto-2",
+    "target_branch": "main",
+    "sha": "14cfb396a068b76091a30ad5d0d536b514855b52",
+    "state": "closed",
+    "title": "Draft: proto title prefix",
+    "draft": true,
+    "author": {
+      "username": "eval-maintainer",
+      "bot": false
+    },
+    "created_at": "2026-10-01T14:57:21.643Z",
+    "updated_at": "2026-10-01T14:57:49.692Z",
+    "web_url": "https://gitlab.com/example-group/infra/-/merge_requests/2"
+  },
+  {
+    "id": 50000001,
+    "iid": 1,
+    "project_id": 40000001,
+    "source_project_id": 40000001,
+    "target_project_id": 40000001,
+    "source_branch": "platform-agent/proto-1",
+    "target_branch": "main",
+    "sha": "7d462311fd849dfae2341381a114157772bffd24",
+    "state": "closed",
+    "title": "Draft: proto: draft at creation",
+    "draft": true,
+    "author": {
+      "username": "eval-maintainer",
+      "bot": false
+    },
+    "created_at": "2026-10-01T14:57:05.286Z",
+    "updated_at": "2026-10-01T14:57:48.610Z",
+    "web_url": "https://gitlab.com/example-group/infra/-/merge_requests/1"
+  }
+]

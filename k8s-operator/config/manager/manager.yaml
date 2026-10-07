@@ -75,8 +75,8 @@ spec:
             # Private-registry installs: uncomment (or patch via kustomize) to
             # point the images the operator deploys at your own registry.
             # OPERATOR_IMAGE is this container's own image; the A2A next-stack
-            # images (gateway, worker, auth callout) take their registry and
-            # tag from it, else from PLATFORM_AGENT_IMAGE. The manager
+            # images (gateway, worker, auth callout, console) take their
+            # registry and tag from it, else from PLATFORM_AGENT_IMAGE. The manager
             # discovers it from its pod spec only when PLATFORM_AGENT_IMAGE is
             # unset too, so name both when you name the agent image.
             # PLATFORM_AGENT_IMAGE is the default agent image when a

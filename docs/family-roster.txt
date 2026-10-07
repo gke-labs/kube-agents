@@ -52,6 +52,7 @@ agents/platform/governance/*.md
 
 agents/platform/scripts/testdata/providers/*/README.md
   agents/platform/scripts/testdata/providers/github/README.md
+  agents/platform/scripts/testdata/providers/gitlab/README.md
 
 agents/platform/skills/*/SKILL.md
   agents/platform/skills/capacity-obtainability/SKILL.md
