@@ -962,6 +962,38 @@ function releasesHtml() {
   return `<div class="sec" id="releases"><h2>Release candidates</h2>${body}</div>`;
 }
 
+/* ---- the GitLab lane (SCHEMA.md: brief.json's gitlab block) ---- */
+// The lane's runs are nobody's gate verdict: tier gitlab (tiers.py) keeps
+// them out of every count above, so this section is the only place they
+// show. Each row links Spyglass under the lane's own job name.
+const laneBuildUrl = (run) => (run.pr == null || !run.job ? null : `${PAGE.spyglass}/${enc(run.pr)}/${enc(run.job)}/${enc(run.build)}`);
+function laneRow(run) {
+  const url = laneBuildUrl(run);
+  const build = url ? `<a href="${esc(url)}" rel="noopener">${esc(run.build)}</a>` : esc(run.build);
+  const pr = run.pr == null ? "—" : `<a href="${PAGE.prUrl}/${enc(run.pr)}" rel="noopener">#${esc(run.pr)}</a>`;
+  const t = run.tasks || {};
+  const cases = `${t.pass || 0} passed · ${t.fail || 0} failed${t.infra ? ` · ${t.infra} infra` : ""}`;
+  const verdict = run.eval_verdict ? esc(run.eval_verdict) : `<span class="mut">no eval banner</span>`;
+  const when = run.started ? et(parseIso(run.started)) : "—";
+  return `<tr><td>${build}</td><td>${pr}</td><td><span class="${run.green ? "p-pass" : "p-fail"}">${esc(run.result || "unknown")}</span></td><td>${verdict}</td><td>${esc(cases)}</td><td class="mut">${esc(when)}</td><td class="mut">${run.duration_s != null ? esc(minutesText(run.duration_s * 1000)) : "—"}</td></tr>`;
+}
+function gitlabLaneHtml() {
+  const lane = brief.gitlab && typeof brief.gitlab === "object" ? brief.gitlab : null;
+  const job = lane && lane.job || "pull-kube-agents-smoke-test-gitlab";
+  const runs = lane && Array.isArray(lane.runs) ? lane.runs.filter((r) => r && typeof r === "object" && r.build != null) : [];
+  const inFlight = lane && Array.isArray(lane.running) ? lane.running.length : 0;
+  const flight = inFlight ? `<p class="mut small">${plural(inFlight, "build")} of the lane in flight, not yet recorded.</p>` : "";
+  let body;
+  if (!runs.length) {
+    body = `<p class="mut">No GitLab run on record. <code>${esc(job)}</code> runs the smoke matrix against a pool project's GitLab repository (<code>EVAL_FORGE=gitlab</code>), on demand with <code>/test ${esc(job)}</code>; its runs are listed here and counted nowhere else.</p>${flight}`;
+  } else {
+    const c = lane.counts || {};
+    body = `<p class="mut small">${plural(c.on_record || runs.length, "run")} on record: ${c.green || 0} green, ${c.red || 0} not. These runs are the lane's own and sit outside the gate's numbers above.</p>` +
+      `<table class="rel"><thead><tr><th>Build</th><th>PR</th><th>Job</th><th>Eval verdict</th><th>Cases</th><th>Started</th><th>Took</th></tr></thead><tbody>${runs.map(laneRow).join("")}</tbody></table>${flight}`;
+  }
+  return `<div class="sec" id="gitlab"><h2>GitLab lane</h2>${body}</div>`;
+}
+
 function briefHtml(link) {
   const inc = resolveIncident(link);
   const anchor = nowMs();
@@ -992,7 +1024,7 @@ function briefHtml(link) {
       `<div class="sec" id="agent"><h2>Last 24 hours</h2>${numbersHtml(sinceMs, null)}</div>` +
       (healthy || noVerdict ? `<div class="sec"><h2>Last incident</h2>${lastIncidentHtml()}</div>` : "") +
       runsListHtml(windowRuns(sinceMs, null), inc, "Runs in the last 24 hours") +
-      nightlyBriefHtml() + releasesHtml() + footHtml();
+      nightlyBriefHtml() + gitlabLaneHtml() + releasesHtml() + footHtml();
   }
   const inWindow = windowRuns(incidentStartMs(inc), inc.untilMs);
   if (!inWindow.some(measured) && !inWindow.some((r) => r.setup_death || r.cls === "deadline-kill")) {
@@ -1014,7 +1046,7 @@ function briefHtml(link) {
     changedBeforeHtml(inc, inWindow) +
     beingDoneHtml(inc) +
     runsListHtml(inWindow, inc, "Runs in this window") +
-    nightlyBriefHtml() + releasesHtml() + footHtml();
+    nightlyBriefHtml() + gitlabLaneHtml() + releasesHtml() + footHtml();
 }
 
 function footHtml() {

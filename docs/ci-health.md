@@ -186,7 +186,11 @@ Only presubmit runs reach these rules and the digest's numbers. `data.json`
 also carries the nightly periodics' runs (`runs[].tier`, see
 `scripts/eval_dashboard/SCHEMA.md`); a nightly has no pull request to count
 towards a distinct-PR floor, and a nightly collapsing is a case's record on
-`main`, not a gate incident.
+`main`, not a gate incident. It carries the GitLab lane's runs too
+(`pull-kube-agents-smoke-test-gitlab`, `tier: gitlab`): the same matrix
+against a pool project's GitLab repository, listed in the Brief's "GitLab
+lane" section with its own counts and links, and in no gate number, case
+history or digest line.
 
 ## Hysteresis
 
@@ -377,9 +381,12 @@ latest builds` step reads each job's `latest-build.txt` from
 identities cannot write the Prow archive),
 walks back to a build with a `finished.json` (the newest is often still
 running), keeps the job's report when the build wrote one (the reconcile's
-`fleet-reconcile.json`, the sweep's `pull-sweep.json`; the sweep's GitLab pass
-writes `pull-sweep-gitlab.json`, which is not read), and hands the readings
-to `health.py --periodics-dir`.
+`fleet-reconcile.json`, the sweep's `pull-sweep.json`, and beside it the
+sweep's GitLab pass's `pull-sweep-gitlab.json` when the build wrote one: its
+failed projects, its run error and every GitLab token that is due, dead or
+unreadable join the note's detail, marked `gitlab`, and its counts join the
+summary as a `GitLab:` clause), and hands the readings to
+`health.py --periodics-dir`.
 
 Like the pool note it rides beside the state and never becomes one. A job whose
 latest finished build failed is a `FAILED` note, once it is news: the sweep runs

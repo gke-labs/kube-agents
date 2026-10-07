@@ -94,6 +94,24 @@ class FetchTest(unittest.TestCase):
         self.assertEqual(written["finished_at"], (NOW - timedelta(hours=1)).isoformat(timespec="seconds"))
         self.assertEqual(written["artifact"], report)
 
+    def test_the_sweeps_gitlab_report_is_read_as_an_extra_and_its_absence_is_fine(self):
+        github = {"schema_version": 1, "mode": "pool", "exit": "failed", "projects": 3, "failed": 1, "closed": 2, "outcomes": {"kube-agents-evals-3": {"error": "left 1 branch(es): stray"}}, "error": "1 project(s) not fully swept: kube-agents-evals-3"}
+        gitlab = {"schema_version": 1, "forge": "gitlab", "mode": "pool", "exit": "failed", "projects": 3, "failed": 0, "closed": 1, "outcomes": {}, "error": "token due", "gitlab_tokens": [{"name": "kube-agents-evals-agent", "secret": "kube-agents-prow/gitlab-agent-token", "expires_at": "2026-11-01", "days_left": 25, "active": True, "warn": True, "urgent": False}]}
+        objects = archive(SWEEP.job, {"100": (finished(NOW - timedelta(minutes=5), passed=False), github)})
+        objects[f"{periodics.LOGS_ROOT}/{SWEEP.job}/100/{periodics.ARTIFACTS_DIR}/{periodics.GITLAB_SWEEP_ARTIFACT}"] = json.dumps(gitlab)
+        with tempfile.TemporaryDirectory() as tmp:
+            readings = periodics.fetch(pathlib.Path(tmp), watched=(SWEEP,), runner=FakeGsutil(objects))
+        reading = readings[SWEEP.job]
+        self.assertEqual(reading["artifact"], github)
+        self.assertEqual(reading["extra_artifacts"], {periodics.GITLAB_SWEEP_ARTIFACT: gitlab})
+        # Without the GitLab report the reading has no extras key and no warning is logged.
+        logged = []
+        objects = archive(SWEEP.job, {"100": (finished(NOW - timedelta(minutes=5), passed=False), github)})
+        with tempfile.TemporaryDirectory() as tmp:
+            readings = periodics.fetch(pathlib.Path(tmp), watched=(SWEEP,), runner=FakeGsutil(objects), log=lambda *a, **k: logged.append(a))
+        self.assertNotIn("extra_artifacts", readings[SWEEP.job])
+        self.assertEqual(logged, [])
+
     def test_a_running_newest_build_falls_back_to_the_one_before_it(self):
         objects = archive(POST.job, {"101": (None, None), "100": (finished(NOW - timedelta(minutes=50)), None), "99": (finished(NOW - timedelta(hours=2)), None)})
         with tempfile.TemporaryDirectory() as tmp:
@@ -109,7 +127,7 @@ class FetchTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             readings = periodics.fetch(pathlib.Path(tmp), watched=(SWEEP,), runner=gsutil)
         self.assertEqual(readings[SWEEP.job]["build"], "8")
-        self.assertEqual([c[2] for c in gsutil.calls], ["cat", "cat", "cat"], "pointer, finished.json and the report; no ls")
+        self.assertEqual([c[2] for c in gsutil.calls], ["cat", "cat", "cat", "cat"], "pointer, finished.json, the report and the GitLab report; no ls")
 
     def test_an_aborted_newest_build_is_walked_past_not_reported_as_failed(self):
         # Prow's sidecar writes finished.json with result ABORTED when it
@@ -255,6 +273,33 @@ class AssessTest(unittest.TestCase):
         # The next tick keeps the episode's start.
         later = periodics.assess(readings, NOW + timedelta(hours=1), notes)
         self.assertEqual(later[DAILY.job]["since"], note["since"])
+
+    def test_the_gitlab_pass_rides_in_the_sweeps_note_and_summary(self):
+        github = {"dry_run": False, "exit": "ok", "projects": 3, "failed": 0, "closed": 0, "outcomes": {}}
+        gitlab = {"forge": "gitlab", "exit": "failed", "projects": 3, "failed": 1, "closed": 2, "outcomes": {"kube-agents-evals-5": {"closed": 1, "error": "left 1 merge request(s) open: !4"}}, "error": "1 project(s) not fully swept: kube-agents-evals-5; ledger token due", "gitlab_tokens": [
+            {"name": "kube-agents-evals-agent", "secret": "kube-agents-prow/gitlab-agent-token", "expires_at": "2027-10-05", "days_left": 363, "active": True, "warn": False, "urgent": False},
+            {"name": "kube-agents-evals-ledger", "secret": "kube-agents-prow/gitlab-ledger-token", "expires_at": "2026-11-01", "days_left": 25, "active": True, "warn": True, "urgent": False},
+        ]}
+        reading = self.reading(SWEEP, NOW - timedelta(minutes=5), passed=False, artifact=github)
+        reading["extra_artifacts"] = {periodics.GITLAB_SWEEP_ARTIFACT: gitlab}
+        streaks = {SWEEP.job: {"build": "100", "projects": {}, "runs": periodics.SWEEP_RUN_ALERT_AFTER}}
+        note = periodics.assess({SWEEP.job: reading}, NOW, {}, streaks=streaks)[SWEEP.job]
+        self.assertEqual(note["detail"], [
+            "gitlab kube-agents-evals-5: left 1 merge request(s) open: !4",
+            "gitlab token kube-agents-prow/gitlab-ledger-token: expires 2026-11-01, in 25 day(s); rotate it (docs/ci-pool-projects.md 5.6)",
+            "gitlab run: 1 project(s) not fully swept: kube-agents-evals-5; ledger token due",
+        ])
+        self.assertEqual(note["summary"], "the run failed after closing 0 pull request(s) across 3 project(s); GitLab: closed 2 merge request(s) across 3 project(s), 1 failed, 1 token(s) to rotate")
+        self.assertIn("gitlab token kube-agents-prow/gitlab-ledger-token", periodics.evidence(note))
+        # A dead token is named by its error line, and runs() carries the GitLab clause for the recovery message.
+        gitlab["gitlab_tokens"][1] = {"name": "gitlab-ledger-token", "secret": "kube-agents-prow/gitlab-ledger-token", "active": False, "warn": True, "urgent": True, "error": "the token in kube-agents-prow/gitlab-ledger-token no longer authenticates (HTTP 401)"}
+        note = periodics.assess({SWEEP.job: reading}, NOW, {}, streaks=streaks)[SWEEP.job]
+        self.assertIn("gitlab token kube-agents-prow/gitlab-ledger-token: the token in kube-agents-prow/gitlab-ledger-token no longer authenticates (HTTP 401)", note["detail"])
+        self.assertIn("GitLab: closed 2 merge request(s)", periodics.runs({SWEEP.job: reading})[SWEEP.job]["summary"])
+        # Past DETAIL_LIMIT failed projects the cap line is marked as the pass's, so the thresholded detail keeps it.
+        gitlab["outcomes"] = {f"kube-agents-evals-{n}": {"closed": 0, "error": "left 1 merge request(s) open"} for n in range(periodics.DETAIL_LIMIT + 2)}
+        note = periodics.assess({SWEEP.job: reading}, NOW, {}, streaks=streaks)[SWEEP.job]
+        self.assertIn("gitlab: and 2 more", note["detail"])
 
     def test_a_job_past_its_stale_window_is_stale_whatever_its_last_verdict(self):
         readings = {DAILY.job: self.reading(DAILY, NOW - timedelta(hours=37)), POST.job: self.reading(POST, NOW - timedelta(days=30))}

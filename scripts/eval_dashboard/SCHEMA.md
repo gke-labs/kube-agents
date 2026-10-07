@@ -61,24 +61,29 @@ only — anything that renames, removes or re-types a field bumps
 
 Parsed from `build-log.txt` plus Prow's `started.json`/`finished.json`.
 A build with no `finished.json` is still running and is skipped entirely.
-One job feeds it today, the presubmit gate (`pull-kube-agents-smoke-test`,
-one build per pull-request push). The collector also reads a second, the
-nightly periodic (`ci-kube-agents-eval-nightly`, `EVAL_TIER=nightly` in the
-same `hack/ci-eval-pr.sh`, against `main`, no pull request), which archives
-the same layout and is collected from the moment it starts running. A
-night split across two pool projects adds the nightly's writers periodic
-(`ci-kube-agents-eval-nightly-writers`, the cases that request a pull
-request): its runs are `nightly` runs too, told apart by `job`.
+Three jobs feed it, each a source with a watermark of its own: the
+presubmit gate (`pull-kube-agents-smoke-test`, one build per pull-request
+push), the nightly periodic (`ci-kube-agents-eval-nightly`,
+`EVAL_TIER=nightly` in the same `hack/ci-eval-pr.sh`, against `main`, no
+pull request; a night split across two pool projects adds the nightly's
+writers periodic, `ci-kube-agents-eval-nightly-writers`, the cases that
+request a pull request, whose runs are `nightly` runs too, told apart by
+`job`) and the GitLab lane (`pull-kube-agents-smoke-test-gitlab`, a
+pull-request build against a GitLab repository). All archive the same
+layout and are collected from the moment they start running.
 
 - `build_id` — the Prow build directory name, as a **string** (the ids
   overflow 53-bit JSON-consumer integers).
-- `tier` — **optional, additive**: `"presubmit"` or `"nightly"`, from the
+- `tier` — **optional, additive**: `"presubmit"`, `"nightly"` or `"gitlab"`, from the
   source the build was discovered through, never from the build's own
   metadata. **Absent means `presubmit`** — every run written before the
   field existed was one — and consumers read it through `tiers.py`'s
-  `run_tier` / `presubmit_runs` / `nightly_runs`. A value outside the two
-  is neither tier and counts nowhere: a run tagged some new way is never
-  the gate's by default. Every gate verdict — the
+  `run_tier` / `presubmit_runs` / `nightly_runs` / `gitlab_runs`. A value
+  outside the three is no tier and counts nowhere: a run tagged some new
+  way is never the gate's by default. A `gitlab` run is the GitLab lane's
+  (`pull-kube-agents-smoke-test-gitlab`, `--gitlab-pr-glob`): listed in
+  `brief.json`'s `gitlab` block and the Brief's "GitLab lane" section,
+  in no case history and no gate number. Every gate verdict — the
   health adjudicator's rules and 24-hour metrics, `classify.py`'s "is this
   mine?" (other PRs, the only-this-PR passes, the 30-day pass rate), the
   red comment's "runs from other PRs" count (`gate_comment.py`), the
@@ -294,7 +299,7 @@ never an error. A task line whose name matches nothing under `bench/tasks/`
 on the current checkout still parses; only its domain lookup degrades (see
 below).
 
-### `cases[]` — one entry per task name seen in any run of either tier, sorted by name
+### `cases[]` — one entry per task name seen in any presubmit or nightly run, sorted by name
 
 The per-case fields are the **presubmit's** record, exactly as they were
 before the nightly existed; the nightly's record sits beside them under
@@ -356,10 +361,11 @@ Additive, optional, and safe to omit — consumers must default them.
   `{"build_id": "<id>", "first_seen": "<iso8601>"}`, plus `"tier": "nightly"`
   and `"log_url"` (Spyglass's page for the build directory, as for
   `runs[].log_url`) when either nightly periodic's listing (the main or
-  the writers job) named the build (absent: the presubmit's, as for
-  `runs[].tier`; both are kept across scans). `nightly.py` reads a running
-  nightly build's part from the job segment of its `log_url`; an entry
-  without one counts as the main part. Lowest
+  the writers job) named the build, or `"tier": "gitlab"` when the GitLab
+  lane's did (absent: the presubmit's, as for `runs[].tier`; all are kept
+  across scans, and each source retries its own). `nightly.py` reads a
+  running nightly build's part from the job segment of its `log_url`; an
+  entry without one counts as the main part. Lowest
   id first; `first_seen` is when the collector first listed the build. The next
   incremental scan re-reads exactly these ids even though they sit at or
   below the watermark, and drops an entry once it is recorded or once
@@ -538,6 +544,18 @@ what the renderer does with them.
   build deferred to `pending_builds`. The refresh workflow greps for either
   line and does not publish, so a stall is never republished under a fresh
   `generated_at`.
+- `--gitlab-pr-glob <gs glob>` (repeatable) — the GitLab lane's build-dir
+  glob (`.../pull-kube-agents-smoke-test-gitlab/*`), read as `--pr-glob` is
+  (the job's directory index above its own watermark, the glob without
+  one), every run tagged `tier: "gitlab"` and its unfinished builds tagged
+  the same on `pending_builds`. The presubmit's watermark ignores the
+  lane's ids and the lane's ignores the presubmit's, as the nightly's does.
+  An explicit `--index-prefix` is the presubmit's; the lane's index is
+  always derived from its own glob. With no lane run on record the glob is
+  listed, and a glob matching no objects (a lane that has not run yet) is a
+  `note: glob ... did not list` line and nothing from it, **not** the
+  refusal line: the lane, like the nightly, must never stop the gate's
+  dashboard publishing.
 - `--nightly-prefix [<gs prefix>]` — the nightly periodic's Prow log
   prefix, `gs://<bucket>/logs/<job>/`. For a periodic that prefix **is**
   the directory index: one `<build_id>/` directory per build beside a
@@ -629,7 +647,7 @@ America/Toronto ("ET"), formatted in the browser with
 
 | Page           | What it is                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
 | -------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `index.html`   | **The Brief**: the gate's state and why, what the agent saw, what changed right before, what is being done, the runs in the window with a "See it in the grid" link, and the last release-candidate eval runs (`releases[]`). Healthy: the last 24 hours in numbers and the last incident.                                                                                                                                                                                                                                                  |
+| `index.html`   | **The Brief**: the gate's state and why, what the agent saw, what changed right before, what is being done, the runs in the window with a "See it in the grid" link, the GitLab lane's last runs (`brief.json` `gitlab`), and the last release-candidate eval runs (`releases[]`). Healthy: the last 24 hours in numbers and the last incident.                                                                                                                                                                                             |
 | `run.html`     | **The PR view**, `run.html#build=<prow build id>`: one run, each failed gate case tagged `failing on N other PRs` / `only your PR` / `quota storm` / `unexplained` with its check reason, 30-day pass rate, transcript link, a link to its row on the Cases page and a one-line Do; a "what to do" box.                                                                                                                                                                                                                                     |
 | `grid.html`    | **The Grid**: one row per case (blocking cases by domain, then the held-out ones, folded away when they passed everything in the window), one column per presubmit run in a window of 6 h, 24 h, 36 h or 7 days (header: PR # and ET start; a green run that recorded no cases gets no column); cells passed / failed all reps / failed some / quota-infra / died before the cases / still running (`pending_builds`); merges to main and incident starts and ends marked between the columns; a cell opens that run's detail for the case. |
 | `cases.html`   | **The Cases page** ("How reliable is each test?"): one row per case by domain — its last `STRIP_RUNS` presubmit outcomes, pass rate over reps at 7 and 30 days for the presubmit and the nightly apart (`—` when a tier has no graded run), its roster status (blocking / held out / demoted with its date / nightly only / not in any matrix), its last failure with the grader's reason, and its issues from `case-notes.yaml`.                                                                                                           |
@@ -720,7 +738,7 @@ gate comment, the tracking issue) and `briefHref` / `gridHref` / `runHref`
 
 `{schema_version, generated_at, stale_after_s, run_days, rate_windows_days,
 strip_runs, admitted[], health, history, merges, catches, cases{}, runs[],
-pending[], releases[], nightly{}, trend{}}`. `runs[]` is the **presubmit's** last `run_days` of
+pending[], releases[], nightly{}, gitlab{}, trend{}}`. `runs[]` is the **presubmit's** last `run_days` of
 `data.json`, oldest first — a nightly run is nobody's pull request and is
 not listed — each carrying its identity and timing plus
 `classify.classify_run(...)`: `verdict` (`red` = looks like the PR, `green`,
@@ -858,6 +876,17 @@ first seen inside `RUNNING_MAX_AGE` (9 hours: the periodic's 8-hour budget
 and Prow's time to write `finished.json`) of `generated_at`, oldest first,
 each `{build, first_seen, log_url}` — a night in flight, which the Brief's
 block, the report page and the digest say instead of "no night".
+
+`gitlab` is `{job, runs[], running[], counts{on_record, green, red}}` from
+`forge_lane.py`: the GitLab lane's runs (`runs[].tier == "gitlab"`) **newest
+first**, the last `RUNS_LISTED` (20), each `{build, job, pr, head_sha,
+project, started, finished, duration_s, result, eval_verdict, green,
+tasks{pass, fail, infra}}` (`green` is Prow's `SUCCESS`; `tasks` counts the
+run's task rows by result); `running[]` the lane's `pending_builds` as
+`{build, first_seen}`; `counts` over every lane run on record. `job` is the
+name the newest lane run carries, else the default. The Brief's "GitLab
+lane" section is this block and nothing else reads it: the lane's runs are
+in no gate number, no case history and no digest line.
 
 `trend` is `null` in the published `brief.json` (every page polls that
 file every minute and only the Trend page reads the block, which grows a
