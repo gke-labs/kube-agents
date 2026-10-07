@@ -425,6 +425,7 @@ Identity is only as stable as those four fields, so **never** let a timestamp, r
 **A workload without a compute-class selector runs fine until the cluster needs to scale.** On GKE 1.35.6+, Cluster Autoscaler pre-filters node pools bound to a Custom Compute Class (`cloud.google.com/compute-class=<name>`) and skips them during primary scale-up simulations unless the pending pod explicitly requests that ComputeClass (via pod `nodeSelector`/`nodeAffinity` on `cloud.google.com/compute-class` or a namespace `cloud.google.com/default-compute-class` label).
 
 When a base node pool is labeled `cloud.google.com/compute-class=<name>` without a matching `NoSchedule` taint:
+
 1. Workloads that omit `cloud.google.com/compute-class` schedule onto existing nodes in that pool whenever spare CPU/memory exists, making the cluster appear healthy during steady state.
 2. As soon as existing nodes fill during a burst, Cluster Autoscaler pre-filtering skips the `ComputeClass`-labeled node pool for those untargeted pods, leaving them `Pending` (`noDecisionStatus.noScaleUp.unhandledPodGroups`).
 
