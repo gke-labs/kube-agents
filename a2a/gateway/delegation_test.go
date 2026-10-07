@@ -607,6 +607,37 @@ func TestAStoppedTurnDoesNotDelegate(t *testing.T) {
 	})
 }
 
+// TestAnOversizedAddresseeIsCappedInTheAuditLines: nothing upstream bounds a
+// delegate request's addressee, so a session can name one of any length; the
+// audit lines carry it cut to delegateAddresseeLogCap, and the request is
+// refused under the target rule as any other addressee would be.
+func TestAnOversizedAddresseeIsCappedInTheAuditLines(t *testing.T) {
+	r, spawn := startRigWithSpawner(t)
+	ctx := context.Background()
+	conv := "discord:g1/t-long-addressee"
+	exec, origin, _ := sessionTurn(t, r, spawn, conv, "x")
+	long := strings.Repeat("p", 64*1024)
+	if err := exec.PublishArtifact(ctx, delegateArtifact(t, long, "report fleet health")); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "refusal line", loggedContaining(r, "delegation refused", "rule="+ruleDelegationTarget, origin.TaskID))
+	want := truncateRunes(long, delegateAddresseeLogCap)
+	for _, line := range strings.Split(r.logs.String(), "\n") {
+		if !strings.Contains(line, origin.TaskID) || !strings.Contains(line, "delegation") {
+			continue
+		}
+		if strings.Contains(line, strings.Repeat("p", delegateAddresseeLogCap+1)) {
+			t.Fatalf("an audit line carries the addressee past the cap (%d bytes)", len(line))
+		}
+		if strings.Contains(line, "addressee=") && !strings.Contains(line, want) {
+			t.Fatalf("an audit line does not carry the capped addressee: %.200s", line)
+		}
+	}
+	if n := platformSubmissions(t, r); n != 0 {
+		t.Fatalf("platform received %d submissions", n)
+	}
+}
+
 // TestADelegateFromAFixedRoutePlatformTaskIsIgnored: platform may not
 // delegate to itself; only the conversation's own session may ask.
 func TestADelegateFromAFixedRoutePlatformTaskIsIgnored(t *testing.T) {

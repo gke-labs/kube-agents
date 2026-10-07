@@ -33,6 +33,11 @@ const reasonWakeNotStarted = "wake-not-started"
 // (TaskRef.refusedEnd).
 const reasonDelegationRefused = "delegation-refused"
 
+// delegateAddresseeLogCap bounds a delegate request's addressee in the audit
+// lines, in bytes. Addressees are agent names ("platform" today), so 64 keeps
+// every real one whole and a pathological one readable.
+const delegateAddresseeLogCap = 64
+
 // delegatedLineNote suffixes a child's rolling line, so the room can tell the
 // task the session handed on from one a human asked for.
 const delegatedLineNote = "(delegated to platform)"
@@ -68,10 +73,14 @@ func (g *Gateway) handleDelegateRequest(ctx context.Context, rec *SessionRecord,
 	addressee := strings.TrimSpace(req.Addressee)
 
 	log := g.log.With("task", taskID, "session", session, "conversation", rec.Key)
-	log.Info("delegation requested", "addressee", addressee, "depth", parent.Depth)
+	// The addressee is the session's to write and nothing upstream bounds
+	// its length (only the text has a cap), so the audit lines carry it cut
+	// to delegateAddresseeLogCap: a valid one is a single short name.
+	logAddressee := truncateRunes(addressee, delegateAddresseeLogCap)
+	log.Info("delegation requested", "addressee", logAddressee, "depth", parent.Depth)
 	// Every refusal and ignore line carries the rule, the backend and the
 	// requester as the record stores it: already hashed.
-	audit := []any{"addressee", addressee, "depth", parent.Depth}
+	audit := []any{"addressee", logAddressee, "depth", parent.Depth}
 	if parent.Requester != nil {
 		audit = append(audit, "backend", parent.Requester.Backend, "requester", parent.Requester.Subject)
 	}
