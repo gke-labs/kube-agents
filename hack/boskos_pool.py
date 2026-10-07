@@ -155,9 +155,9 @@ def acquire(server, owner, hold_state, name=None):
     ret_name = (resource or {}).get("name") or None
     if name is not None and ret_name is not None and ret_name != name:
         try:
-            release(server, owner, ret_name)
-        except Exception:
-            pass
+            release_settled(server, owner, ret_name, clock())
+        except (BoskosError,) + REACH_ERRORS as exc:
+            print("  %s: release of the unexpected resource failed (%s); the next run's reset returns it" % (ret_name, describe(exc)), file=sys.stderr)
         raise BoskosError("acquire requested %r but Boskos returned %r" % (name, ret_name))
     return ret_name
 

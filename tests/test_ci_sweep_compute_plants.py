@@ -1392,12 +1392,43 @@ class BoskosAcquireByNameTest(unittest.TestCase):
     def test_boskos_acquire_mismatched_name_raises_boskos_error(self):
         with (
             mock.patch.object(sweep.boskos_pool, "_call", return_value=[{"name": "proj-other"}]),
+            mock.patch.object(sweep.boskos_pool, "pause") as mock_pause,
             mock.patch.object(sweep.boskos_pool, "release") as mock_release,
         ):
             with self.assertRaises(sweep.boskos_pool.BoskosError) as ctx:
                 sweep.boskos_pool.acquire("http://fake-boskos", "owner", "cleaning", name="proj-1")
             self.assertIn("acquire requested 'proj-1' but Boskos returned 'proj-other'", str(ctx.exception))
             mock_release.assert_called_once_with("http://fake-boskos", "owner", "proj-other")
+            mock_pause.assert_called_once()
+
+    def test_boskos_acquire_mismatched_name_settled_release_retries_on_401(self):
+        err_401 = sweep.boskos_pool.urllib.error.HTTPError(
+            "http://fake-boskos/release", 401, "Unauthorized", {}, io.BytesIO(b"owner mismatch")
+        )
+        with (
+            mock.patch.object(sweep.boskos_pool, "_call", return_value=[{"name": "proj-other"}]),
+            mock.patch.object(sweep.boskos_pool, "pause") as mock_pause,
+            mock.patch.object(sweep.boskos_pool, "release", side_effect=[err_401, None]) as mock_release,
+            mock.patch("sys.stderr", io.StringIO()) as mock_stderr,
+        ):
+            with self.assertRaises(sweep.boskos_pool.BoskosError) as ctx:
+                sweep.boskos_pool.acquire("http://fake-boskos", "owner", "cleaning", name="proj-1")
+            self.assertIn("acquire requested 'proj-1' but Boskos returned 'proj-other'", str(ctx.exception))
+            self.assertEqual(mock_release.call_count, 2)
+            self.assertEqual(mock_pause.call_count, 2)
+            self.assertIn("releasing again", mock_stderr.getvalue())
+
+    def test_boskos_acquire_mismatched_name_release_failure_logs_to_stderr_and_raises_boskos_error(self):
+        with (
+            mock.patch.object(sweep.boskos_pool, "_call", return_value=[{"name": "proj-other"}]),
+            mock.patch.object(sweep.boskos_pool, "pause"),
+            mock.patch.object(sweep.boskos_pool, "release", side_effect=sweep.boskos_pool.BoskosError("release rejected")),
+            mock.patch("sys.stderr", io.StringIO()) as mock_stderr,
+        ):
+            with self.assertRaises(sweep.boskos_pool.BoskosError) as ctx:
+                sweep.boskos_pool.acquire("http://fake-boskos", "owner", "cleaning", name="proj-1")
+            self.assertIn("acquire requested 'proj-1' but Boskos returned 'proj-other'", str(ctx.exception))
+            self.assertIn("proj-other: release of the unexpected resource failed (release rejected)", mock_stderr.getvalue())
 
 
 if __name__ == "__main__":
