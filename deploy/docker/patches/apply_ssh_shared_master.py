@@ -3,12 +3,14 @@
 Hermes derives the ssh ``ControlPath`` from ``sha256(user@host:port)`` and this install publishes
 one of each, so the front door, every kanban worker and every cron turn in the pod ride one
 master (a delegate child too, if it inherits the ssh backend). ``SSHEnvironment.cleanup()`` runs
-``ssh -O exit`` on it. The callers that reach the shared environment are the process-exit sweep
-(``cleanup_all_environments``, so a kanban worker subprocess finishing), the environment's
-``__del__`` and the idle reaper; the per-turn ``cleanup_vm(task_id)`` pops the raw turn id while
-the terminal tool registers the environment under ``session:<key>`` or ``default``, so it misses.
-A command another environment is running when one of them fires dies as a mux client whose master
-went away: exit 255, nothing printed, no cwd marker. Hermes ``main`` still has the shared path.
+``ssh -O exit`` on it. The callers that reach the shared environment include the process-exit
+sweep (``cleanup_all_environments``, so a kanban worker subprocess that ran a command and exited
+normally), the environment's ``__del__`` and the idle reaper; the per-turn ``cleanup_vm`` pops the
+raw turn id or session id while the terminal tool registers the environment under
+``session:<key>`` or ``default``, so it misses. A command another environment is running when one
+of them fires dies as a mux client whose master went away: exit 255, nothing printed, no cwd
+marker. Hermes ``main`` still had the shared path on 2026-10-07; this patch goes when a Hermes
+bump derives ``ControlPath`` per environment.
 
 Three anchored edits in two files:
 
@@ -16,7 +18,7 @@ Three anchored edits in two files:
   becomes ``close_master()``. ``ControlPersist=300`` reaps an idle master and the far side is a
   StatefulSet pod, so nothing is lost. A prompt-time probe's master is private (its own socket)
   and ``cleanup()`` still closes that one.
-- ``terminal_tool_result.py``: an ssh result with exit 255 and no cwd marker gets a ``hint``, the
+- ``terminal_tool_result.py``: a foreground ssh result with exit 255 and no cwd marker gets a ``hint``, the
   way exit 124 has one, unless upstream already attached a hint to the output (``Permission
   denied``). The wrapper prints the marker after the command and exits with its code, so a
   command's own 255 carries the marker (unless the command text itself calls ``exit`` or ``exec``

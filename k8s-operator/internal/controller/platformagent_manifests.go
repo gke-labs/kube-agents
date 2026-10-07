@@ -1744,18 +1744,18 @@ func seededGitOpsEntry(agent *agentv1alpha1.PlatformAgent) *agentv1alpha1.Manage
 // reaper from firing at all. Hermes gives every task its own SSHEnvironment but
 // derives the ssh ControlPath from sha256(user@host:port) — all three fixed by
 // this block — so every concurrent task multiplexes over ONE master connection.
-// Teardown is per environment and not per connection: cleanup() runs
-// `ssh -O exit` on that shared path, which drops the master and kills every
-// session riding it. A sibling task loses its in-flight command with exit 255
+// Teardown is per environment and not per connection: cleanup() ran
+// `ssh -O exit` on that shared path, which dropped the master and killed every
+// session riding it. A sibling task lost its in-flight command with exit 255
 // and an empty stderr. At the 300s default and delegation.max_concurrent_children
-// of 3, the reaper reaches that state whenever one child idles while another
-// works. Nothing is reclaimed by reaping here — the far side is a StatefulSet pod
-// that stays up either way — so the timeout buys nothing and costs the race.
-// The agent image also patches cleanup() so it no longer closes the shared
+// of 3, the reaper reached that state whenever one child idled while another
+// worked. Nothing is reclaimed by reaping here — the far side is a StatefulSet pod
+// that stays up either way — so the timeout bought nothing and cost the race.
+// The agent image now patches cleanup() so it no longer closes the shared
 // master at all (deploy/docker/patches/apply_ssh_shared_master.py, #2174): a
-// worker process exiting was the frequent caller, and the reaper's cleanup()
-// no longer reaches the master either. The value stays because reaping
-// reclaims nothing here.
+// worker process exiting normally was the frequent caller, and the reaper's
+// cleanup() no longer reaches the master either. The value stays because
+// reaping reclaims nothing here.
 //
 // `workspace_root` is the sixth and is NOT Hermes'. Hermes ignores it; the reader
 // is agents/platform/scripts/sandbox_exec.py, which already parses this block for

@@ -300,13 +300,14 @@ Teardown is per environment and not per connection. `cleanup()` ran
 `ssh -O exit` against that shared path, which dropped the master and killed every
 session riding it. A sibling task that was mid-command lost it: exit 255, empty
 stderr, no indication that another task's teardown is what ended it. The callers
-of `cleanup()` that reach the shared environment are the process's atexit sweep
-(`cleanup_all_environments`), the environment's `__del__` and the idle reaper.
-The per-turn teardown (`turn_finalizer` → `cleanup_task_resources` → `cleanup_vm`)
-and `AIAgent.close()` pop the raw turn id, while the terminal tool registers the
-environment under `session:<key>` or `default`, so they miss it. The first is the
-frequent one: kanban workers are subprocesses, so the master died whenever one of
-them exited while another was mid-command (#2174).
+of `cleanup()` that reach the shared environment include the process's atexit
+sweep (`cleanup_all_environments`), the environment's `__del__` and the idle
+reaper. The per-turn teardown (`turn_finalizer` → `cleanup_task_resources` →
+`cleanup_vm`) and `AIAgent.close()` pop the raw turn id or session id, while the
+terminal tool registers the environment under `session:<key>` or `default`, so
+they miss it. The first is the frequent one: kanban workers are subprocesses, so
+the master died when a worker that had run a command exited normally while
+another was mid-command (#2174).
 
 The operator's managed terminal block sets `lifetime_seconds` to 30 days, which
 takes the reaper out of the picture. It is a number and not an off switch
@@ -334,7 +335,7 @@ is left as it is: nothing reaches it with a registered ssh environment, because 
 connection failure during construction fires before registration and the sync,
 foreground and background-spawn paths catch their own errors. A prompt-time
 probe's master is its own and is closed as before. The terminal tool also labels
-the shape when it does occur: an ssh result with exit 255 and no cwd marker (the
+the shape when it does occur: a foreground ssh result with exit 255 and no cwd marker (the
 wrapper prints the marker after the command, so a command's own 255 carries one
 unless the command text itself calls `exit` or `exec` at top level) gets a
 `hint`, unless upstream already attached a hint to the output, saying the
