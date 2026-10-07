@@ -111,6 +111,19 @@ class FetchTest(unittest.TestCase):
             readings = periodics.fetch(pathlib.Path(tmp), watched=(SWEEP,), runner=FakeGsutil(objects), log=lambda *a, **k: logged.append(a))
         self.assertNotIn("extra_artifacts", readings[SWEEP.job])
         self.assertEqual(logged, [])
+        # A GitLab report that fails to read for a reason other than NotFound
+        # follows the main report's rule: on a failed build the tick is blind
+        # on the job (the note is posted once, so it goes out whole or not
+        # yet); on a passed build the reading stands.
+        gitlab_path = f"{periodics.LOGS_ROOT}/{SWEEP.job}/100/{periodics.ARTIFACTS_DIR}/{periodics.GITLAB_SWEEP_ARTIFACT}"
+        with tempfile.TemporaryDirectory() as tmp:
+            readings = periodics.fetch(pathlib.Path(tmp), watched=(SWEEP,), runner=FakeGsutil(objects, denied=(gitlab_path,)), log=lambda *a, **k: logged.append(a))
+        self.assertNotIn(SWEEP.job, readings, "blind on the job this tick")
+        self.assertEqual(len(logged), 1)
+        objects = archive(SWEEP.job, {"100": (finished(NOW - timedelta(minutes=5), passed=True), github)})
+        with tempfile.TemporaryDirectory() as tmp:
+            readings = periodics.fetch(pathlib.Path(tmp), watched=(SWEEP,), runner=FakeGsutil(objects, denied=(gitlab_path,)), log=lambda *a, **k: None)
+        self.assertIn(SWEEP.job, readings, "a passed build's reading stands without it")
 
     def test_a_running_newest_build_falls_back_to_the_one_before_it(self):
         objects = archive(POST.job, {"101": (None, None), "100": (finished(NOW - timedelta(minutes=50)), None), "99": (finished(NOW - timedelta(hours=2)), None)})

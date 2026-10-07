@@ -1560,6 +1560,19 @@ def discovery_index(glob: str, index_prefix: str | None) -> str | None:
     return f"{m.group('root')}/{INDEX_DIRECTORY_SEGMENT}/{m.group('job')}/"
 
 
+def _unlisted_is_note(allowed: bool, after_build: int | None, stderr: str | None) -> bool:
+    """The nightly's rule (runs_from_periodic), for a source that must never
+    stop the gate's dashboard publishing: with nothing of it on record any
+    failed listing is a note (the job may not exist yet); with a watermark,
+    only a listing that matched no objects is (its index purged or moved,
+    the job renamed, while a run from before sits on record) -- any other
+    failure is the bucket or the grant failing, the warning line. A timeout
+    is the warning line either way, from _gsutil_call."""
+    if not allowed:
+        return False
+    return after_build is None or bool(_NO_OBJECTS.search(stderr or ""))
+
+
 def runs_from_index(
     index_prefix: str,
     gsutil: str = "gsutil",
@@ -1568,6 +1581,7 @@ def runs_from_index(
     retry_builds: frozenset[str] = frozenset(),
     unfinished: set[str] | None = None,
     tier: str = tiers.TIER_PRESUBMIT,
+    unlisted_is_note: bool = False,
 ) -> list[dict]:
     """Discover builds through Prow's per-job directory index, then read them.
 
@@ -1575,12 +1589,16 @@ def runs_from_index(
     names, one pointer read per admitted build (concurrent), then the same
     per-build reads as the glob path. A failed listing is a warning and an
     empty result -- the refresh workflow greps for that warning and refuses
-    to publish, so a stall never republishes old runs as fresh.
+    to publish, so a stall never republishes old runs as fresh -- unless
+    `unlisted_is_note` and the listing is the kind _unlisted_note allows.
     """
     prefix = index_prefix.rstrip("/") + "/"
-    listing = _gsutil(["ls", prefix], gsutil)
+    listing, stderr = _gsutil_call(["ls", prefix], gsutil)
     if listing is None:
-        print(f"warning: gsutil ls failed for {prefix}; nothing new this scan", file=sys.stderr)
+        if _unlisted_is_note(unlisted_is_note, after_build, stderr):
+            print(f"note: directory index {prefix} did not list (no builds yet, or moved); nothing from it this scan", file=sys.stderr)
+        else:
+            print(f"warning: gsutil ls failed for {prefix}; nothing new this scan", file=sys.stderr)
         return []
     wanted = sorted(
         (b for b in _index_build_ids(listing) if _admitted(b, after_build, retry_builds)),
@@ -1619,16 +1637,13 @@ def runs_from_gcs(
     ~1700 builds, so this is the cold-sweep path; an incremental scan goes
     through runs_from_index. A glob that does not list is the `warning:
     gsutil ls ... failed` line the refresh workflow refuses on, unless
-    `unlisted_is_note`: a lane with nothing on record may simply not have
-    run yet (`gsutil ls` exits non-zero on a glob matching no objects), and
-    that must not stop the gate's dashboard publishing, so it is a note (a
-    timeout is the warning line either way, from _gsutil_call).
+    `unlisted_is_note` and the listing is the kind _unlisted_note allows.
     """
     runs = []
     for glob in pr_globs:
-        listing, _ = _gsutil_call(["ls", glob], gsutil)
+        listing, stderr = _gsutil_call(["ls", glob], gsutil)
         if listing is None:
-            if unlisted_is_note:
+            if _unlisted_is_note(unlisted_is_note, after_build, stderr):
                 print(f"note: glob {glob} did not list (no builds yet, or unreadable); nothing from it this scan", file=sys.stderr)
             else:
                 print(f"warning: gsutil ls failed for {glob}; skipping", file=sys.stderr)
@@ -2142,21 +2157,23 @@ def collect(
                 gitlab_glob_only.append(glob)
             elif prefix not in gitlab_indexes:
                 gitlab_indexes.append(prefix)
+        # A lane that has not run yet, or whose index was purged or moved
+        # while a run sits on record, lists nothing: a note on either path,
+        # never the refusal line (_unlisted_is_note).
         for prefix in gitlab_indexes:
             gitlab_fresh.extend(
                 runs_from_index(
                     prefix, gsutil, after_build=gitlab_after, since_cutoff=since_cutoff,
                     retry_builds=gitlab_retry, unfinished=unfinished, tier=tiers.TIER_GITLAB,
+                    unlisted_is_note=True,
                 )
             )
         if gitlab_glob_only:
-            # The glob is listed only with no lane run on record, and a lane
-            # that has not run yet lists nothing: a note, never the refusal line.
             gitlab_fresh.extend(
                 runs_from_gcs(
                     gitlab_glob_only, gsutil, after_build=gitlab_after, since_cutoff=since_cutoff,
                     retry_builds=gitlab_retry, unfinished=unfinished, tier=tiers.TIER_GITLAB,
-                    unlisted_is_note=gitlab_after is None,
+                    unlisted_is_note=True,
                 )
             )
         gitlab_pending |= unfinished - listed_before

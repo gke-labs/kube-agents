@@ -551,11 +551,14 @@ what the renderer does with them.
   the same on `pending_builds`. The presubmit's watermark ignores the
   lane's ids and the lane's ignores the presubmit's, as the nightly's does.
   An explicit `--index-prefix` is the presubmit's; the lane's index is
-  always derived from its own glob. With no lane run on record the glob is
-  listed, and a glob matching no objects (a lane that has not run yet) is a
-  `note: glob ... did not list` line and nothing from it, **not** the
-  refusal line: the lane, like the nightly, must never stop the gate's
-  dashboard publishing.
+  always derived from its own glob. The lane, like the nightly, must never
+  stop the gate's dashboard publishing, so it follows the nightly's rule:
+  with no lane run on record any listing that fails is a `note: glob ...
+did not list` line and nothing from it (the job may not exist yet); with
+  one, a listing that matched no objects (the index purged or moved, the
+  job renamed, while a run from before sits on record) is a `note:
+directory index ... did not list` line, and any other failure is the
+  refusal line, as it is for the presubmit.
 - `--nightly-prefix [<gs prefix>]` — the nightly periodic's Prow log
   prefix, `gs://<bucket>/logs/<job>/`. For a periodic that prefix **is**
   the directory index: one `<build_id>/` directory per build beside a

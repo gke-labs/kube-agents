@@ -410,9 +410,9 @@ def read_job(periodic: Periodic, runner=subprocess.run, log=print) -> dict | Non
         extras = {}
         for name in periodic.extra_artifacts:
             # Absent is a pass that did not run (not every build writes it);
-            # unreadable or not an object is said in its own lines; a read
-            # that fails for another reason is logged and the reading stands,
-            # since the main report is what the note is built on.
+            # not an object is said in its own lines; a read that fails for
+            # another reason follows the main report's rule above: a failed
+            # build's note is posted once, so it goes out whole or not yet.
             out, err = collect._gsutil_call(["-q", "cat", f"{LOGS_ROOT}/{periodic.job}/{build}/{ARTIFACTS_DIR}/{name}"], runner=runner)
             if out is not None:
                 try:
@@ -422,6 +422,8 @@ def read_job(periodic: Periodic, runner=subprocess.run, log=print) -> dict | Non
                 extras[name] = loaded if isinstance(loaded, dict) else {REPORT_KEY_ERROR: REPORT_UNREADABLE}
             elif not _not_found(err):
                 log(f"{WARNING_PREFIX}could not read {periodic.job}'s {build}/{name}: {err.strip()}", file=sys.stderr)
+                if not reading[KEY_PASSED]:
+                    return None
         if extras:
             reading[KEY_EXTRA_ARTIFACTS] = extras
         return reading

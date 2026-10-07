@@ -2383,6 +2383,31 @@ class TestGitLabLane(_MergeBase):
         data, stderr = self.quiet_collect(pr_globs=[FAKE_BUCKET + "pull/gke-labs_kube-agents/1/nowhere/*"], gsutil=gsutil)
         self.assertIn("warning: gsutil ls failed for", stderr)
 
+    def test_a_known_but_empty_lane_index_is_a_note_and_a_denied_one_the_warning(self):
+        """The nightly's rule: once a lane run is on record its index is
+        listed, and an index that matched no objects (purged or moved while
+        the on-demand lane sat idle) must not stop the gate's dashboard
+        publishing for the weeks until the lane next builds; a listing that
+        fails any other way is the bucket or the grant, the refusal line."""
+        gsutil, log = self.fake_gsutil([BUILD_998_FULL])
+        prior_data = json.loads(pathlib.Path(self.prior_with([BUILD_998_FULL])).read_text())
+        prior_data["runs"].append(dict(prior_data["runs"][0], build_id="1", tier="gitlab", job=FAKE_GITLAB_JOB))
+        prior = self.write_prior(prior_data)
+        merged, stderr = self.quiet_collect(pr_globs=[FAKE_GLOB], gitlab_globs=[FAKE_GITLAB_INDEXED_GLOB], merge_with=prior, gsutil=gsutil, index_prefix=FAKE_INDEX_PREFIX)
+        self.assertIn(f"ls {FAKE_GITLAB_INDEX_PREFIX}", log.read_text(), "the index path, not the glob")
+        self.assertIn(f"note: directory index {FAKE_GITLAB_INDEX_PREFIX} did not list", stderr)
+        self.assertNotRegex(stderr, r"warning: gsutil (ls|cat) .*(failed|timed out)")
+        self.assertEqual(len(merged["runs"]), 2, "the old lane run stays on record")
+        # The glob path with a watermark (index disabled) is the same note.
+        _, stderr = self.quiet_collect(pr_globs=[FAKE_GLOB], gitlab_globs=[FAKE_GITLAB_GLOB], merge_with=prior, gsutil=gsutil, index_prefix="")
+        self.assertIn(f"note: glob {FAKE_GITLAB_GLOB} did not list", stderr)
+        self.assertNotRegex(stderr, r"warning: gsutil (ls|cat) .*(failed|timed out)")
+        # Denied is not "no objects": with a run on record that is the warning line.
+        os.environ["FAKE_GSUTIL_DENY"] = FAKE_GITLAB_INDEX_PREFIX
+        self.addCleanup(os.environ.pop, "FAKE_GSUTIL_DENY", None)
+        _, stderr = self.quiet_collect(pr_globs=[FAKE_GLOB], gitlab_globs=[FAKE_GITLAB_INDEXED_GLOB], merge_with=prior, gsutil=gsutil, index_prefix=FAKE_INDEX_PREFIX)
+        self.assertIn(f"warning: gsutil ls failed for {FAKE_GITLAB_INDEX_PREFIX}", stderr)
+
     def test_with_a_lane_run_on_record_the_lane_lists_its_own_index_not_the_presubmits(self):
         """`--index-prefix` names the presubmit's index; handed to the lane it
         would list every presubmit build above the lane's low watermark and
