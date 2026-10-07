@@ -578,6 +578,10 @@ class FlagSetIsNextTest(unittest.TestCase):
                 "statefulset/${PLATFORM_AGENT_CR_NAME}-a2a-nats",
                 "deployment/${PLATFORM_AGENT_CR_NAME}-a2a-callout",
                 "deployment/${AGENT_DEPLOYMENT_NAME}",
+                # Twice: the operator adds the bridge to the agent pod only
+                # once the bus is provisioned, so the agent rolls a second
+                # time after the Job, and that roll is gated like the first.
+                "deployment/${AGENT_DEPLOYMENT_NAME}",
                 # Last, not after the Job its bucket comes from: see the
                 # step header. A verifier still in its crash-loop backoff
                 # when the eval starts submitting refuses every case
@@ -589,6 +593,8 @@ class FlagSetIsNextTest(unittest.TestCase):
         markers = [
             'gate_mode_next_rollout "deployment/${PLATFORM_AGENT_CR_NAME}-a2a-callout"',
             'wait_provision_job "the mode patch"',
+            'gate_mode_next_rollout "deployment/${AGENT_DEPLOYMENT_NAME}"',
+            '*" ${BRIDGE_SIDECAR_NAME} "*) break ;;',
             'gate_mode_next_rollout "deployment/${AGENT_DEPLOYMENT_NAME}"',
             'kubectl get "service/${A2A_INJECT_NAME}" "secret/${A2A_INJECT_NAME}"',
             'grep -F "${BRIDGE_CONSUMING_LOG_MSG}" | grep -F "${BRIDGE_CONSUMING_LOG_PROFILE}"',
@@ -602,8 +608,7 @@ class FlagSetIsNextTest(unittest.TestCase):
                 position = found + len(marker)
         # One patch, one provision run: the bridge is the operator's from the
         # first render (#2592), so nothing declares it and nothing waits for a
-        # re-run. The Degraded gate is not read after the one run either: the
-        # rendered bridge's restarts before the bus is up read as Degraded.
+        # re-run, so there is no refusal for the Degraded gate to read.
         self.assertEqual(block.count("kubectl patch platformagent"), 1)
         self.assertEqual(block.count("wait_provision_job \""), 1)
         self.assertNotIn('gate_cr_not_degraded "', block)

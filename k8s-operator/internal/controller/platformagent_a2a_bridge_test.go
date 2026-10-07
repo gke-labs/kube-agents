@@ -18,6 +18,7 @@ package controller
 
 import (
 	"reflect"
+	"strings"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
@@ -133,7 +134,10 @@ func TestANextInstallWithNoDeclaredBridgeGetsOne(t *testing.T) {
 // Under today nothing is rendered, which is also what ends the rollback
 // crash-loop: there is no bridge left behind to dial a torn-down bus.
 func TestATodayInstallGetsNoBridge(t *testing.T) {
-	agent := a2aTestAgent()
+	// Provisioned first: on the pass that flips to today the CR still carries
+	// BusProvisioned (the end-of-pass status write removes it), so the mode
+	// check is the only thing keeping the bridge out.
+	agent := provisionedAgent()
 	agent.Spec.Mode = ptr.To("today")
 	if got := containersNamed(bridgeTestPod(agent), a2aBridgeContainerName); len(got) != 0 {
 		t.Errorf("a today install renders %d bridge containers", len(got))
@@ -220,5 +224,36 @@ func TestTheRenderedBridgeWaitsForTheBusButIsBudgetedFromTheStart(t *testing.T) 
 	}
 	if a2aProvisionScript(agent) != before {
 		t.Error("the provision script changed when the bridge arrived; the Job would re-render")
+	}
+}
+
+// The bridge image is swapped in beside the agent's only for the release
+// platform-agent repository by tag; a custom repository or a digest pin falls
+// back to the image the other release A2A images resolve to.
+func TestTheBridgeImageFollowsTheAgentOnlyWhereItCan(t *testing.T) {
+	t.Setenv(operatorImageEnvVar, "registry.example/kube-agents/k8s-operator:v9")
+	cases := map[string]string{
+		"ghcr.io/gke-labs/kube-agents/platform-agent:abc":      "ghcr.io/gke-labs/kube-agents/hermes-bridge:abc",
+		"registry.example/mirror/my-agent:v1":                  "registry.example/kube-agents/hermes-bridge:v9",
+		"ghcr.io/gke-labs/kube-agents/platform-agent@sha256:0": "registry.example/kube-agents/hermes-bridge:v9",
+	}
+	for agentImage, want := range cases {
+		if got := a2aBridgeImage(agentImage); got != want {
+			t.Errorf("a2aBridgeImage(%q) = %q, want %q", agentImage, got, want)
+		}
+	}
+}
+
+// A refusal for a rendered bridge points at the operator setting that sized it,
+// not at a CR sidecar nobody declared.
+func TestARefusalForARenderedBridgeNamesTheOperatorSetting(t *testing.T) {
+	t.Setenv(a2aBridgeConcurrencyOperatorEnvVar, "8")
+	agent := a2aTestAgent()
+	status := a2aProvisionRefusalStatus(agent)
+	if !strings.Contains(status, a2aBridgeConcurrencyOperatorEnvVar) || strings.Contains(status, "spec.deployment.sidecars") {
+		t.Errorf("refusal status = %q; want it to name %s and not a CR sidecar", status, a2aBridgeConcurrencyOperatorEnvVar)
+	}
+	if !strings.Contains(a2aProvisionScript(agent), a2aBridgeConcurrencyOperatorEnvVar) {
+		t.Error("the provision script's notes do not name the operator setting for a rendered bridge")
 	}
 }

@@ -1329,9 +1329,9 @@ echo "✓ Rollout verification finished in $((SECONDS - STEP_START))s"
 # patch and the first provisioning Job already budgets the bridge's workers:
 # no second render re-measures that budget against the stream the Job
 # created, so the refusal #2077 guarded against cannot arise. The bridge
-# starts beside NATS rather than after it, and restarts until the bus and its
-# streams are there; the agent Deployment's rollout gate, after the Job,
-# waits that out. Then the step ends on the bridge's own word that it is
+# enters the agent pod only once the bus is provisioned (BusProvisioned), so
+# the agent Deployment rolls twice: once for the mode patch and once, after
+# the Job, for the bridge. The step gates both rolls. Then the step ends on the bridge's own word that it is
 # consuming `platform` tasks; until then the bus has an executor for nobody
 # and every case on the inject transport ends as infrastructure. A rendered
 # bridge leaves with the mode, so a flip back to today needs no CR edit for
@@ -1545,10 +1545,8 @@ wait_provision_job() {
 # not show: phase Degraded, or Ready carrying the reason a refused provision is
 # given. Step 6b does not call it since the operator renders the bridge
 # (#2592): the one provision Job already counts the bridge's workers, so no
-# later render can be refused, and the rendered bridge's restarts before the
-# bus is up read as a Degraded CrashLoopBackOff in the very window this gate
-# would read. It is kept, with its tests, for a step that re-renders the Job
-# again.
+# later render can be refused. It is kept, with its tests, for a step that
+# re-renders the Job again.
 # A refusal is already written when the Job is done, not a lag, so it fails
 # on the first read that answers, and so does every other Degraded but one: a
 # pod waiting for CPU or memory (CR_READY_REASON_POD_UNSCHEDULABLE with a
@@ -1711,12 +1709,32 @@ if [ "${EVAL_MODE_NEXT:-}" = "1" ]; then
   # the bridge's workers, since the operator renders the bridge from this
   # render on, so no later render re-measures it against the stream it
   # creates and there is no refusal for gate_cr_not_degraded to catch
-  # (#2077). Not read here for the other Degraded either: the rendered bridge
-  # restarts until the bus and its streams exist, so at this point the CR
-  # can read Degraded on its CrashLoopBackOff with nothing wrong. The agent
-  # rollout gate below waits the restart backoff out.
+  # (#2077).
   wait_provision_job "the mode patch"
 
+  gate_mode_next_rollout "deployment/${AGENT_DEPLOYMENT_NAME}"
+
+  # The second roll: the operator adds the bridge to the agent pod once it has
+  # recorded the bus provisioned, a reconcile or two after the Job completes.
+  # Wait for the template to carry it, then gate that rollout like the first,
+  # so the bridge log loop below starts against a pod that has the container
+  # rather than spending its budget on scheduling (#2414) and image pulls.
+  BRIDGE_TEMPLATE_START=$SECONDS
+  for _ in $(seq 1 "${MODE_NEXT_GENERATION_ATTEMPTS}"); do
+    case " $(kubectl get "deployment/${AGENT_DEPLOYMENT_NAME}" -n "${NAMESPACE}" -o jsonpath='{.spec.template.spec.containers[*].name}') " in
+      *" ${BRIDGE_SIDECAR_NAME} "*) break ;;
+    esac
+    sleep "${MODE_NEXT_POLL_SECONDS}"
+  done
+  case " $(kubectl get "deployment/${AGENT_DEPLOYMENT_NAME}" -n "${NAMESPACE}" -o jsonpath='{.spec.template.spec.containers[*].name}') " in
+    *" ${BRIDGE_SIDECAR_NAME} "*) ;;
+    *)
+      echo "ERROR: the operator never added the ${BRIDGE_SIDECAR_NAME} container to deployment/${AGENT_DEPLOYMENT_NAME} after the bus was provisioned" >&2
+      dump_mode_next_state
+      exit 1
+      ;;
+  esac
+  echo "✓ ${BRIDGE_SIDECAR_NAME} in the agent pod template $((BRIDGE_TEMPLATE_START - MODE_NEXT_START))s..$((SECONDS - MODE_NEXT_START))s after the patch"
   gate_mode_next_rollout "deployment/${AGENT_DEPLOYMENT_NAME}"
 
   # The inject door. The operator renders its Service and token Secret on the

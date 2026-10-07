@@ -19,6 +19,7 @@ package controller
 import (
 	"os"
 	"strconv"
+	"strings"
 
 	corev1 "k8s.io/api/core/v1"
 
@@ -63,6 +64,10 @@ const (
 	// so it takes the agent image's registry and tag.
 	a2aBridgeImageEnvVar = "A2A_BRIDGE_IMAGE"
 	a2aBridgeImageName   = "hermes-bridge"
+
+	// platformAgentImageName is the release agent image's repository name,
+	// the one the bridge image is published beside.
+	platformAgentImageName = "platform-agent"
 
 	// a2aBridgeConcurrencyOperatorEnvVar sets the rendered bridge's
 	// BRIDGE_CONCURRENCY: an operator setting, like the other next-only
@@ -175,13 +180,34 @@ func a2aBridgeSidecarsWhen(agent *agentv1alpha1.PlatformAgent, withRendered bool
 	return out
 }
 
-// a2aBridgeImage is the rendered bridge's image: the operator override, or the
-// agent container's image with its last path segment swapped for the bridge's.
+// a2aBridgeImage is the rendered bridge's image: the operator override; or,
+// when the agent runs the release platform-agent image by tag, that image with
+// its last path segment swapped for the bridge's (same registry, same commit);
+// or else the image the other release A2A images resolve to
+// (a2aReleaseImage). The swap is only sound for the stock repository name and
+// a tag: a custom repository has no bridge published beside it, and a digest
+// names one build the swap cannot carry over (it would fall back to :latest).
 func a2aBridgeImage(agentImage string) string {
 	if override := os.Getenv(a2aBridgeImageEnvVar); override != "" {
 		return override
 	}
-	return deriveImageFromOperator(agentImage, a2aBridgeImageName)
+	if imageRepositoryName(agentImage) == platformAgentImageName && imageRefHasTag(agentImage) {
+		return deriveImageFromOperator(agentImage, a2aBridgeImageName)
+	}
+	return a2aReleaseImage(a2aBridgeImageEnvVar, a2aBridgeImageName)
+}
+
+// imageRepositoryName is a reference's last path segment without its tag or
+// digest: "platform-agent" for ghcr.io/x/platform-agent:v1.
+func imageRepositoryName(ref string) string {
+	name := ref
+	if i := strings.LastIndex(name, "/"); i >= 0 {
+		name = name[i+1:]
+	}
+	if i := strings.IndexAny(name, ":@"); i >= 0 {
+		name = name[:i]
+	}
+	return name
 }
 
 // a2aBridgeOwnEnv is what the bridge sets for itself, on top of the agent's
