@@ -204,10 +204,12 @@ The tier and the scope are **deliberately not on the wire**. Putting them there 
 a consumer authorize on content it did not verify, in the shape that looks most like
 working code - and that is the one thing 09 forbids.
 
-`authority.via` (added 10/5) is attribution of a third kind: on a task the gateway minted on a
-session's request, and on the wake-up turn after it, `via` names the task and session that asked
-(`{"taskId": "...", "session": "..."}`). Like `requester` and `audience` it is populated by the
-gateway only and advisory; absent on a task a human turn started.
+`authority.via` (added 10/5) is attribution of a third kind: `{"taskId": "...", "session":
+"..."}`. On a task the gateway minted on a session's request, it names the session turn that
+asked and that turn's session. On the wake-up turn after it, `taskId` is the minted task whose
+end woke the session (not the turn that asked), and `session` is still the session that asked.
+Like `requester` and `audience` it is populated by the gateway only and advisory; absent on a
+task a human turn started.
 
 **The rule.** A consumer MAY treat `authority.grants` as decision-grade, subject to all
 four of:
