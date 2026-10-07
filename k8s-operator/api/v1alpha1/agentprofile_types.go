@@ -46,6 +46,7 @@ const AgentProfileTopicPattern = `^(shared\.[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?|a
 type AgentProfileSpec struct {
 	// Description is the routing blurb, rendered into the A2A agent card.
 	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=4096
 	// +kubebuilder:validation:XValidation:rule="self.trim().size() > 0",message="description is the routing blurb the agent card is rendered from and must not be blank"
 	// +required
 	Description string `json:"description"`
@@ -246,7 +247,7 @@ type AgentProfileStatus struct {
 // +kubebuilder:validation:XValidation:rule="self.metadata.name.matches('^[a-z0-9]([-a-z0-9]*[a-z0-9])?$') && self.metadata.name.size() <= 63",message="AgentProfile name must be a dot-free DNS-1123 label of at most 63 characters: it is the addressee token on the task and directory subjects"
 // `platform` is the Hermes bridge's addressee: a profile under that name would put a
 // second executor on a2a.tasks.platform.*. The platform persona as a profile is not a goal.
-// +kubebuilder:validation:XValidation:rule="self.metadata.name != 'platform'",message="AgentProfile name 'platform' is reserved: the Hermes bridge is the executor for that addressee"
+// +kubebuilder:validation:XValidation:rule="self.metadata.name != 'platform'"
 
 // AgentProfile is the Schema for the agentprofiles API.
 type AgentProfile struct {

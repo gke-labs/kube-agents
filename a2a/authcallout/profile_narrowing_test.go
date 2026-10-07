@@ -397,3 +397,32 @@ func TestANarrowedPodNamedAfterAMappedPrincipalIsRefused(t *testing.T) {
 		t.Fatal("a pod named after a mapped principal connected; it would hold that principal's inbox")
 	}
 }
+
+// A profile that only publishes still opens the topic streams: `a2a topics
+// write` resolves through TopicRegistry before it publishes.
+func TestAPublishOnlyProfileCanResolveItsTopic(t *testing.T) {
+	g, err := profileGrants(auditor, auditorPod1, TopicGrants{Publish: []string{auditorPublishTopic}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"$JS.API.STREAM.INFO." + lib.StreamTopicsState, "$JS.API.STREAM.INFO." + lib.StreamTopicsJournal, "a2a.topics." + auditorPublishTopic} {
+		if !containsString(g.Publish, want) {
+			t.Errorf("a publish-only profile lacks %s", want)
+		}
+	}
+}
+
+// An agent-scoped topic has one writer, the agent it names. A profile may read
+// another agent's topic but not publish on it, refused at parse and at mint.
+func TestAProfileMayNotPublishAnotherAgentsTopic(t *testing.T) {
+	if _, err := profileGrants(auditor, auditorPod1, TopicGrants{Publish: []string{"agent.platform.upgrade-readiness"}}); err == nil {
+		t.Error("profileGrants minted a publish on the platform agent's topic for the auditor profile")
+	}
+	if _, err := profileGrants(auditor, auditorPod1, TopicGrants{Subscribe: []string{"agent.platform.upgrade-readiness"}, Publish: []string{"shared.blueprint", auditorPublishTopic}}); err != nil {
+		t.Errorf("reading another agent's topic or publishing a shared or own topic was refused: %v", err)
+	}
+	raw := `{"version":"v","identities":[{"serviceAccount":"` + auditorSA + `","user":"profile-auditor","account":"APP","narrowing":"profile","profile":"auditor","topics":{"publish":["agent.platform.upgrade-readiness"]},"grants":{}}]}`
+	if _, err := ParseIdentityMap([]byte(raw)); err == nil {
+		t.Error("the map parsed a profile entry publishing another agent's topic")
+	}
+}

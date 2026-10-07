@@ -63,9 +63,6 @@ const (
 	// it must be unique in the map.
 	agentProfileMapUserPrefix = "profile-"
 
-	// a2aOperatorBusUser is the operator's NATS user and inbox owner.
-	a2aOperatorBusUser = "operator"
-
 	// operatorNamespaceEnvVar and operatorServiceAccountEnvVar are the
 	// manager's own namespace and ServiceAccount, by the downward API. Both
 	// are needed to key the operator's map entry; with either unset the
@@ -79,11 +76,6 @@ const (
 	// and the kustomize manager both stamp it.
 	a2aOperatorBusClientLabel      = "kubeagents.x-k8s.io/a2a-bus-client"
 	a2aOperatorBusClientLabelValue = "operator"
-
-	// a2aDirectoryStream is the stream behind a2a.agents.>, and
-	// a2aDirectorySubjectPrefix the subject space it carries.
-	a2aDirectoryStream        = "DIRECTORY"
-	a2aDirectorySubjectPrefix = "a2a.agents."
 )
 
 // agentProfileTopicRE is the CRD's topic-grant pattern, rechecked when the map
@@ -104,39 +96,6 @@ func operatorBusPrincipal() (namespace, serviceAccount string, ok bool) {
 	namespace = os.Getenv(operatorNamespaceEnvVar)
 	serviceAccount = os.Getenv(operatorServiceAccountEnvVar)
 	return namespace, serviceAccount, namespace != "" && serviceAccount != ""
-}
-
-// operatorIdentity is the operator as a bus principal: publish a card or a
-// tombstone on a2a.agents.<profile>, read one back, and its own inbox. The
-// subject is a wildcard over the profile token because a callout grant is
-// fixed for the life of a connection: a profile created after the operator
-// connected must still be publishable without a reconnect. Nothing else: no
-// task plane, no topics, no stream verb beyond the one direct read.
-//
-// The read is DIRECT.GET by subject, which nats.go spells as the subject's
-// trailing tokens, so it is scoped to the directory's own subjects; it is how
-// reconcile tells a missing or stale card from a current one without holding
-// STREAM.INFO.
-func operatorIdentity() (a2aIdentity, bool) {
-	ns, sa, ok := operatorBusPrincipal()
-	if !ok {
-		return a2aIdentity{}, false
-	}
-	inbox := "_INBOX." + a2aOperatorBusUser + ".>"
-	return a2aIdentity{
-		user:           a2aOperatorBusUser,
-		account:        a2aAccountApp,
-		auth:           a2aAuthCallout,
-		serviceAccount: a2aServiceAccountName(ns, sa),
-		comment: "the operator. Publishes each AgentProfile's agent card and its tombstone\n" +
-			"on the directory, and reads one back to tell a missing card from a current\n" +
-			"one. Nothing on the task plane or the blackboard.",
-		publish: []string{
-			a2aDirectorySubjectPrefix + "*",
-			"$JS.API.DIRECT.GET." + a2aDirectoryStream + "." + a2aDirectorySubjectPrefix + "*",
-		},
-		subscribe: []string{inbox},
-	}, true
 }
 
 // agentProfileServiceAccountName is the ServiceAccount a profile's pods run as:
@@ -241,14 +200,31 @@ func resolveAgentProfileIdentities(agent *agentv1alpha1.PlatformAgent, profiles 
 	return out
 }
 
-// badTopicGrant returns the first topic grant the CRD's pattern refuses, or "".
+// badTopicGrant returns the first topic grant the CRD refuses, or "": one the
+// pattern refuses, or an agent-scoped publish topic that is not the profile's
+// own.
 func badTopicGrant(p *agentv1alpha1.AgentProfile) string {
 	for _, t := range append(append([]string(nil), p.Spec.Bus.PublishTopics...), p.Spec.Bus.SubscribeTopics...) {
 		if !agentProfileTopicRE.MatchString(t) {
 			return t
 		}
 	}
+	for _, t := range p.Spec.Bus.PublishTopics {
+		if !ownsAgentTopic(p.Name, t) {
+			return t
+		}
+	}
 	return ""
+}
+
+// ownsAgentTopic reports whether a publish topic is the profile's to write: a
+// shared topic, or agent.<profile>.<topic>. The callout applies the same rule
+// at parse and at mint. The CRD does not: a root-level CEL rule comparing each
+// topic with metadata.name exceeds the API server's rule cost budget, so the
+// CRD would not install. An offending profile is admitted and then refused
+// here, with a condition.
+func ownsAgentTopic(profile, topic string) bool {
+	return !strings.HasPrefix(topic, "agent.") || strings.HasPrefix(topic, "agent."+profile+".")
 }
 
 // agentProfileMapEntries renders one narrowed map entry per profile that

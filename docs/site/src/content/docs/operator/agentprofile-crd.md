@@ -47,7 +47,7 @@ spec:
     limits: { cpu: "1", memory: 2Gi }
 ```
 
-Topic grants are written without the `a2a.topics.` prefix, as `shared.{topic}` or `agent.{agent}.{topic}`. Nothing else is accepted.
+Topic grants are written without the `a2a.topics.` prefix, as `shared.{topic}` or `agent.{agent}.{topic}`. Nothing else is accepted. A profile may read any agent's topics, but the only agent-scoped topics it may publish are its own (`agent.<this profile's name>.{topic}`), because an agent's topics have one writer.
 
 ## What the operator renders
 
@@ -59,7 +59,7 @@ A profile binds to the PlatformAgent in its own namespace. With that agent on `m
 
 A profile may not run as `default`, as a ServiceAccount the operator already uses (for the PlatformAgent or for itself), or as one another `AgentProfile` already holds. Such a profile renders nothing, and its `IdentityReady` condition says why.
 
-Writing an `AgentProfile` grants a bus identity, so treat create and update on `agentprofiles` like create on RoleBindings in that namespace.
+Writing an `AgentProfile` grants a bus identity, so treat create and update on `agentprofiles` like create on RoleBindings in that namespace. A profile's name is its addressee on the task subjects, the same space the gateway's session pods use. A profile named exactly like a live session pod could write that session's task events, so nobody who can't already act as that session should be able to create profiles.
 
 Nothing runs a pod from a profile yet. The dispatcher that turns a task into a Job for its profile comes later.
 

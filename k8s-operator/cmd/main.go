@@ -45,6 +45,7 @@ import (
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
 	"github.com/gke-labs/kube-agents/k8s-operator/internal/controller"
 	agentwebhook "github.com/gke-labs/kube-agents/k8s-operator/internal/webhook"
+	"k8s.io/apimachinery/pkg/api/meta"
 	// +kubebuilder:scaffold:imports
 )
 
@@ -291,9 +292,15 @@ func main() {
 	}
 
 	// The AgentProfile reconciler, when the CRD is installed. An operator
-	// upgraded ahead of its CRDs keeps running everything else.
+	// upgraded ahead of its CRDs keeps running everything else. Only a real
+	// "no such kind" skips it: any other discovery error (an API server
+	// timeout during a control-plane upgrade, say) exits, so the restart
+	// tries again instead of running without the controller until the next
+	// one.
 	profileGVK := agentv1alpha1.GroupVersion.WithKind("AgentProfile")
-	if _, err := mgr.GetRESTMapper().RESTMapping(profileGVK.GroupKind(), profileGVK.Version); err == nil {
+	_, mapErr := mgr.GetRESTMapper().RESTMapping(profileGVK.GroupKind(), profileGVK.Version)
+	switch {
+	case mapErr == nil:
 		if err := (&controller.AgentProfileReconciler{
 			Client: mgr.GetClient(),
 			Scheme: mgr.GetScheme(),
@@ -301,8 +308,11 @@ func main() {
 			setupLog.Error(err, "Failed to create controller", "controller", "agentprofile")
 			os.Exit(1)
 		}
-	} else {
-		setupLog.Info("AgentProfile CRD is not installed on cluster; skipping the AgentProfile controller")
+	case meta.IsNoMatchError(mapErr):
+		setupLog.Info("AgentProfile CRD is not installed on cluster; skipping the AgentProfile controller. Restart the operator after installing the CRD to enable it.")
+	default:
+		setupLog.Error(mapErr, "Failed to discover the AgentProfile kind")
+		os.Exit(1)
 	}
 
 	if os.Getenv("ENABLE_WEBHOOKS") != "false" {

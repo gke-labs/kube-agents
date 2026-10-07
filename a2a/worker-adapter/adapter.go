@@ -354,8 +354,9 @@ func Run(ctx context.Context, cfg Config) (Result, error) {
 	}
 	switch {
 	case cfg.BusTokenFile != "":
-		// The per-session credential. The inbox owner is the pod name, which
-		// validate() has already checked against A2A_SESSION.
+		// The pod-bound credential. The inbox owner is the pod name: for a
+		// session pod validate() has checked it against A2A_SESSION, and a
+		// profile pod (ProfileExecutor) has no session to check it against.
 		tokenOpts, err := lib.KSATokenNATSOptions(cfg.BusTokenFile, cfg.PodName)
 		if err != nil {
 			return Result{}, err

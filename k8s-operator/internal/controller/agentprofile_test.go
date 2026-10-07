@@ -947,3 +947,119 @@ func TestWithoutABusIdentityTheCardConditionSaysWhy(t *testing.T) {
 		t.Errorf("published %v without a bus identity", h.dir.publishes)
 	}
 }
+
+// A ServiceAccount created by hand under the operator-created name, landing
+// after the foreignness check, is not adopted: ensureServiceAccount creates
+// rather than applies, and refuses an existing ServiceAccount it does not
+// control.
+func TestEnsureServiceAccountRefusesAForeignOneItDidNotSeeCreated(t *testing.T) {
+	agent := a2aTestAgent()
+	p := testAgentProfile(agent.Namespace, "auditor")
+	foreign := &corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: "agentprofile-auditor", Namespace: agent.Namespace}}
+	h := newProfileHarness(t, agent, &p, foreign)
+	live := h.profile(agent.Namespace, "auditor")
+	if err := h.r.ensureServiceAccount(context.Background(), live, "agentprofile-auditor"); !errors.Is(err, errForeignServiceAccount) {
+		t.Fatalf("ensureServiceAccount = %v, want errForeignServiceAccount", err)
+	}
+	sa, _ := h.serviceAccount(agent.Namespace, "agentprofile-auditor")
+	if len(sa.OwnerReferences) != 0 || sa.AutomountServiceAccountToken != nil {
+		t.Errorf("the foreign ServiceAccount was written to: %+v", sa)
+	}
+}
+
+// An agent-scoped publish topic must be the profile's own; reading another
+// agent's topic is fine.
+func TestAProfileMayPublishOnlyItsOwnAgentTopics(t *testing.T) {
+	withoutOperatorBusPrincipal(t)
+	agent := a2aTestAgent()
+	thief := testAgentProfile(agent.Namespace, "auditor", func(p *agentv1alpha1.AgentProfile) {
+		p.Spec.Bus.PublishTopics = []string{"agent.platform.upgrade-readiness"}
+	})
+	reader := testAgentProfile(agent.Namespace, "reader", func(p *agentv1alpha1.AgentProfile) {
+		p.Spec.Bus.PublishTopics = []string{"agent.reader.findings", "shared.blueprint"}
+		p.Spec.Bus.SubscribeTopics = []string{"agent.platform.upgrade-readiness"}
+	})
+	resolved := resolveAgentProfileIdentities(agent, []agentv1alpha1.AgentProfile{thief, reader})
+	if resolved["auditor"].refused == nil {
+		t.Error("a profile publishing the platform agent's topic was not refused")
+	}
+	if resolved["reader"].refused != nil {
+		t.Errorf("a profile publishing its own and a shared topic was refused: %v", resolved["reader"].refused)
+	}
+	bad := a2aAuthMapIdentity{ServiceAccount: "system:serviceaccount:ns:sa", User: "profile-auditor", Account: a2aAccountApp, Narrowing: a2aNarrowingProfile, Profile: "auditor",
+		Topics: &a2aAuthMapTopics{Publish: []string{"agent.platform.upgrade-readiness"}}}
+	if err := validateA2AAuthMapIdentities([]a2aAuthMapIdentity{bad}); err == nil {
+		t.Error("the render-time check accepted a publish on another agent's topic")
+	}
+}
+
+// A profile whose name is not a subject token (only reachable past
+// admission) is deleted without any directory call, so a bus that cannot be
+// asked about it does not hold the finalizer.
+func TestAProfileWithAnInvalidNameIsDeletedWithoutTheBus(t *testing.T) {
+	withOperatorBusPrincipal(t)
+	agent := a2aTestAgent()
+	p := testAgentProfile(agent.Namespace, "a.b", func(p *agentv1alpha1.AgentProfile) {
+		p.Finalizers = []string{agentProfileFinalizer}
+	})
+	h := newProfileHarness(t, agent, &p)
+	h.dir.down = true
+	if err := h.c.Delete(context.Background(), h.profile(agent.Namespace, "a.b")); err != nil {
+		t.Fatal(err)
+	}
+	h.reconcile(agent.Namespace, "a.b")
+	var gone agentv1alpha1.AgentProfile
+	if err := h.c.Get(context.Background(), types.NamespacedName{Namespace: agent.Namespace, Name: "a.b"}, &gone); !apierrors.IsNotFound(err) {
+		t.Errorf("the profile with an invalid name is still held: %v", err)
+	}
+}
+
+// An entry that does not decode is content, not an outage: the card replaces
+// it, and deletion tombstones it.
+func TestAnUndecodableDirectoryEntryIsOverwritten(t *testing.T) {
+	for _, raw := range []string{"not json", `{"kind":"agent-card","payload":"x"}`} {
+		entry, err := parseDirectoryEntry([]byte(raw))
+		if err != nil || !entry.present || entry.current(a2aAgentCard{Name: "auditor"}) {
+			t.Errorf("%q: entry=%+v err=%v; want present, not current, no error", raw, entry, err)
+		}
+	}
+	withOperatorBusPrincipal(t)
+	agent := a2aTestAgent()
+	p := testAgentProfile(agent.Namespace, "auditor")
+	h := newProfileHarness(t, agent, &p)
+	h.dir.entries["auditor"] = directoryEntry{present: true}
+	h.reconcile(agent.Namespace, "auditor")
+	if !h.dir.entries["auditor"].current(desiredAgentCard(&p)) {
+		t.Errorf("the undecodable entry was not replaced by the card: %+v", h.dir.entries["auditor"])
+	}
+	h.dir.entries["auditor"] = directoryEntry{present: true}
+	if err := h.c.Delete(context.Background(), h.profile(agent.Namespace, "auditor")); err != nil {
+		t.Fatal(err)
+	}
+	h.reconcile(agent.Namespace, "auditor")
+	if e := h.dir.entries["auditor"]; e.kind != a2aKindAgentClosed {
+		t.Errorf("deletion left the undecodable entry instead of a tombstone: %+v", e)
+	}
+}
+
+// forgettingDirectory records forget calls.
+type forgettingDirectory struct {
+	*fakeDirectory
+	forgot []string
+}
+
+func (f *forgettingDirectory) forget(namespace string) { f.forgot = append(f.forgot, namespace) }
+
+// The namespace-only request (a PlatformAgent changed and no profile is left)
+// drops the namespace's bus connection.
+func TestTheNamespaceOnlyRequestDropsTheBusConnection(t *testing.T) {
+	h := newProfileHarness(t)
+	dir := &forgettingDirectory{fakeDirectory: newFakeDirectory()}
+	h.r.Cards = dir
+	if _, err := h.r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "ns"}}); err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(dir.forgot, []string{"ns"}) {
+		t.Errorf("forget calls = %v, want [ns]", dir.forgot)
+	}
+}

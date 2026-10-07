@@ -66,14 +66,20 @@ const (
 	// cardBusTimeout bounds one directory read or publish.
 	cardBusTimeout = 10 * time.Second
 
-	// operatorBusTokenPathEnvVar overrides where the manager reads its own
+	// operatorBusAuthFileEnvVar overrides where the manager reads its own
 	// projected bus token; the default is the path every bus client uses.
-	operatorBusTokenPathEnvVar = "A2A_BUS_TOKEN_FILE"
+	operatorBusAuthFileEnvVar = "A2A_BUS_TOKEN_FILE"
 
 	// natsStatusHeader and natsStatusNotFound are how a direct get says
-	// "no message on that subject".
-	natsStatusHeader   = "Status"
-	natsStatusNotFound = "404"
+	// "no message on that subject", and natsDescriptionHeader carries the
+	// reason for any other status.
+	natsStatusHeader      = "Status"
+	natsStatusNotFound    = "404"
+	natsDescriptionHeader = "Description"
+
+	// jsDirectGetPrefix is the JetStream API's direct-get-by-subject request:
+	// $JS.API.DIRECT.GET.<stream>.<subject>.
+	jsDirectGetPrefix = "$JS.API.DIRECT.GET."
 )
 
 // a2aCardEnvelope is the envelope's wire shape, field for field with
@@ -178,8 +184,8 @@ func newNATSCardPublisher() *natsCardPublisher {
 	return &natsCardPublisher{conns: map[string]*nats.Conn{}}
 }
 
-func operatorBusTokenFile() string {
-	if p := os.Getenv(operatorBusTokenPathEnvVar); p != "" {
+func operatorBusAuthFile() string {
+	if p := os.Getenv(operatorBusAuthFileEnvVar); p != "" {
 		return p
 	}
 	return filepath.Join(a2aBusTokenPath, a2aBusTokenFile)
@@ -199,7 +205,7 @@ func (n *natsCardPublisher) conn(agent *agentv1alpha1.PlatformAgent) (*nats.Conn
 		}
 		delete(n.conns, key)
 	}
-	tokenFile := operatorBusTokenFile()
+	tokenFile := operatorBusAuthFile()
 	nc, err := nats.Connect(url,
 		nats.Name("kubeagents-operator"),
 		nats.TokenHandler(func() string {
@@ -242,7 +248,7 @@ func (n *natsCardPublisher) Read(ctx context.Context, agent *agentv1alpha1.Platf
 	}
 	ctx, cancel := context.WithTimeout(ctx, cardBusTimeout)
 	defer cancel()
-	msg, err := nc.RequestWithContext(ctx, "$JS.API.DIRECT.GET."+a2aDirectoryStream+"."+agentCardSubject(profile), nil)
+	msg, err := nc.RequestWithContext(ctx, jsDirectGetPrefix+a2aDirectoryStream+"."+agentCardSubject(profile), nil)
 	if err != nil {
 		return directoryEntry{}, fmt.Errorf("reading %s: %w", agentCardSubject(profile), err)
 	}
@@ -250,20 +256,24 @@ func (n *natsCardPublisher) Read(ctx context.Context, agent *agentv1alpha1.Platf
 		return directoryEntry{}, nil
 	}
 	if status := msg.Header.Get(natsStatusHeader); status != "" {
-		return directoryEntry{}, fmt.Errorf("reading %s: status %s %s", agentCardSubject(profile), status, msg.Header.Get("Description"))
+		return directoryEntry{}, fmt.Errorf("reading %s: status %s %s", agentCardSubject(profile), status, msg.Header.Get(natsDescriptionHeader))
 	}
 	return parseDirectoryEntry(msg.Data)
 }
 
+// parseDirectoryEntry reads one directory message. An entry it cannot decode
+// is an answer about the content, not about the bus: it is present and it is
+// not this profile's card, so the caller overwrites it (with the card, or with
+// a tombstone on deletion) instead of waiting on an outage that is not there.
 func parseDirectoryEntry(data []byte) (directoryEntry, error) {
 	var env a2aCardEnvelope
 	if err := json.Unmarshal(data, &env); err != nil {
-		return directoryEntry{}, fmt.Errorf("decoding the directory entry: %w", err)
+		return directoryEntry{present: true}, nil
 	}
 	entry := directoryEntry{present: true, kind: env.Kind}
 	if env.Kind == a2aKindAgentCard {
 		if err := json.Unmarshal(env.Payload, &entry.card); err != nil {
-			return directoryEntry{}, fmt.Errorf("decoding the card payload: %w", err)
+			return directoryEntry{present: true}, nil
 		}
 	}
 	return entry, nil

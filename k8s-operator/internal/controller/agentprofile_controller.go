@@ -18,6 +18,7 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -105,6 +106,14 @@ type AgentProfileReconciler struct {
 func (r *AgentProfileReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
 
+	// The namespace-only request SetupWithManager sends when a PlatformAgent
+	// changes and no profile is left to reconcile: drop the bus connection
+	// held for that namespace, which nothing else would reach.
+	if req.Name == "" {
+		r.forgetBus(req.Namespace)
+		return ctrl.Result{}, nil
+	}
+
 	var profile agentv1alpha1.AgentProfile
 	if err := r.Get(ctx, req.NamespacedName, &profile); err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)
@@ -117,9 +126,7 @@ func (r *AgentProfileReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	if agent == nil || !a2aStackRendering(agent) {
 		// No bus to talk to: drop any connection held for this namespace's
 		// agent rather than let it reconnect to a dead Service forever.
-		if f, ok := r.Cards.(interface{ forget(namespace string) }); ok {
-			f.forget(profile.Namespace)
-		}
+		r.forgetBus(profile.Namespace)
 		if agent != nil {
 			reason, msg = reasonAgentProfileNotNext, "the PlatformAgent "+agent.Name+" does not run spec.mode: next; an AgentProfile renders nothing until it does"
 			if _, modeErr := resolveMode(agent); modeErr != nil {
@@ -169,7 +176,15 @@ func (r *AgentProfileReconciler) Reconcile(ctx context.Context, req ctrl.Request
 
 	idReason, idMsg := reasonAgentProfileRendered, "ServiceAccount "+resolution.serviceAccount+" and its bus identity are rendered"
 	if profile.Spec.Identity.ServiceAccountName == "" {
-		if err := r.applyServiceAccount(ctx, &profile, resolution.serviceAccount); err != nil {
+		err := r.ensureServiceAccount(ctx, &profile, resolution.serviceAccount)
+		if errors.Is(err, errForeignServiceAccount) {
+			cardReason, cardMsg, busErr := r.withdrawCard(ctx, agent, &profile)
+			if err := r.writeStatus(ctx, &profile, agent, "", reasonAgentProfileRefused, err.Error(), cardReason, cardMsg, false); err != nil {
+				return ctrl.Result{}, err
+			}
+			return r.busResult(busErr)
+		}
+		if err != nil {
 			return ctrl.Result{}, err
 		}
 	} else {
@@ -270,6 +285,9 @@ func (r *AgentProfileReconciler) cards() cardPublisher {
 // publishCard makes the directory entry the card the profile renders, writing
 // only when the entry is missing, a tombstone, or a different card.
 func (r *AgentProfileReconciler) publishCard(ctx context.Context, agent *agentv1alpha1.PlatformAgent, p *agentv1alpha1.AgentProfile) (string, string, error) {
+	if !isDNS1123LabelToken(p.Name) {
+		return reasonAgentProfileIdentityMissing, "the profile's name is not a subject token, so it has no directory entry", nil
+	}
 	if _, _, ok := operatorBusPrincipal(); !ok {
 		return reasonAgentProfileBusUnconfigured, "the operator was deployed without " + operatorNamespaceEnvVar + " and " + operatorServiceAccountEnvVar + ", so it has no bus identity to publish cards with", nil
 	}
@@ -287,10 +305,15 @@ func (r *AgentProfileReconciler) publishCard(ctx context.Context, agent *agentv1
 	return reasonAgentProfilePublished, "the agent card is on " + agentCardSubject(p.Name), nil
 }
 
-// withdrawCard makes the directory entry a tombstone if it is a card. An
-// absent entry stays absent: a tombstone for a card nobody published says
-// nothing.
+// withdrawCard makes the directory entry a tombstone if anything but a
+// tombstone is there: a card, or an entry that does not decode. An absent entry
+// stays absent: a tombstone for a card nobody published says nothing. A profile
+// whose name is not a subject token has no directory subject at all, so there
+// is nothing to read or withdraw (and the operator's grant could not reach it).
 func (r *AgentProfileReconciler) withdrawCard(ctx context.Context, agent *agentv1alpha1.PlatformAgent, p *agentv1alpha1.AgentProfile) (string, string, error) {
+	if !isDNS1123LabelToken(p.Name) {
+		return reasonAgentProfileIdentityMissing, "the profile's name is not a subject token, so it has no directory entry", nil
+	}
 	if _, _, ok := operatorBusPrincipal(); !ok {
 		return reasonAgentProfileBusUnconfigured, "the operator has no bus identity; it published no card to withdraw", nil
 	}
@@ -298,7 +321,7 @@ func (r *AgentProfileReconciler) withdrawCard(ctx context.Context, agent *agentv
 	if err != nil {
 		return reasonAgentProfileBusError, err.Error(), err
 	}
-	if entry.present && entry.kind == a2aKindAgentCard {
+	if entry.present && entry.kind != a2aKindAgentClosed {
 		if err := r.cards().Publish(ctx, agent, p.Name, nil); err != nil {
 			return reasonAgentProfileBusError, err.Error(), err
 		}
@@ -306,10 +329,21 @@ func (r *AgentProfileReconciler) withdrawCard(ctx context.Context, agent *agentv
 	return reasonAgentProfileIdentityMissing, "no card is published while the profile's identity is not rendered", nil
 }
 
-// applyServiceAccount renders the operator-created ServiceAccount: owned by the
-// profile, no token automount, and no RoleBinding anywhere. Its token exists to
-// authenticate to the bus, through a projected volume the pod names.
-func (r *AgentProfileReconciler) applyServiceAccount(ctx context.Context, p *agentv1alpha1.AgentProfile, name string) error {
+// errForeignServiceAccount is ensureServiceAccount's refusal: a ServiceAccount
+// under the operator-created name exists and is not this profile's.
+var errForeignServiceAccount = errors.New("a ServiceAccount under the operator-created name already exists and is not this profile's; the operator does not adopt it")
+
+// ensureServiceAccount renders the operator-created ServiceAccount: owned by
+// the profile, no token automount, and no RoleBinding anywhere. Its token
+// exists to authenticate to the bus, through a projected volume the pod names.
+//
+// It creates rather than applies. Server-side apply onto an existing object
+// merges, so an apply would adopt a ServiceAccount someone created by hand
+// (with whatever RoleBindings they gave it) whenever it landed between the
+// foreignness check and the write. Create refuses that case outright with
+// AlreadyExists, and an existing ServiceAccount is only ever updated when the
+// profile already controls it.
+func (r *AgentProfileReconciler) ensureServiceAccount(ctx context.Context, p *agentv1alpha1.AgentProfile, name string) error {
 	sa := &corev1.ServiceAccount{
 		TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "ServiceAccount"},
 		ObjectMeta: metav1.ObjectMeta{
@@ -326,10 +360,32 @@ func (r *AgentProfileReconciler) applyServiceAccount(ctx context.Context, p *age
 	if err := ctrl.SetControllerReference(p, sa, r.Scheme); err != nil {
 		return err
 	}
-	// No ForceOwnership: a foreign ServiceAccount under this name has
-	// already been refused (agentProfileServiceAccountIsForeign), so a field
-	// conflict here is a surprise worth an error, not something to take over.
+	var existing corev1.ServiceAccount
+	err := r.Get(ctx, types.NamespacedName{Namespace: p.Namespace, Name: name}, &existing)
+	if apierrors.IsNotFound(err) {
+		err = r.Create(ctx, sa)
+		if apierrors.IsAlreadyExists(err) {
+			return errForeignServiceAccount
+		}
+		return err
+	}
+	if err != nil {
+		return err
+	}
+	if !metav1.IsControlledBy(&existing, p) {
+		return errForeignServiceAccount
+	}
+	// Ours: keep it as rendered. No ForceOwnership, since nobody else
+	// should hold fields on a ServiceAccount this profile controls.
 	return r.Patch(ctx, sa, client.Apply, client.FieldOwner(agentProfileComponent))
+}
+
+// forgetBus drops the bus connection held for an agent in namespace, if the
+// directory is the NATS publisher (tests substitute their own).
+func (r *AgentProfileReconciler) forgetBus(namespace string) {
+	if f, ok := r.Cards.(interface{ forget(namespace string) }); ok {
+		f.forget(namespace)
+	}
 }
 
 // deleteOwnServiceAccount removes the ServiceAccount the operator created for
@@ -410,6 +466,12 @@ func (r *AgentProfileReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		var list agentv1alpha1.AgentProfileList
 		if err := mgr.GetClient().List(ctx, &list, client.InNamespace(namespace)); err != nil {
 			return nil
+		}
+		if len(list.Items) == 0 {
+			// Nothing to reconcile, but a connection may still be open
+			// for this namespace's agent: the namespace-only request
+			// tells Reconcile to drop it.
+			return []reconcile.Request{{NamespacedName: types.NamespacedName{Namespace: namespace}}}
 		}
 		reqs := make([]reconcile.Request, 0, len(list.Items))
 		for _, p := range list.Items {

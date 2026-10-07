@@ -354,11 +354,17 @@ func (s *Service) authorize(ctx context.Context, req *jwt.AuthorizationRequestCl
 			return "", nil, "", fmt.Errorf("%s names narrowing %q, which this callout does not implement", att.ServiceAccount, id.Narrowing)
 		}
 		// A narrowed user is named for its pod, and that name is also its
-		// inbox prefix. A pod named after a user the map serves (the
+		// inbox prefix. A pod named after a user this map serves (the
 		// operator, the verifier) would be granted that principal's
 		// inbox, and could read or forge its JetStream replies. Pod names
 		// the gateway and the dispatcher mint never collide; a pod someone
 		// named by hand might.
+		//
+		// This covers the callout's own principals only. The static users
+		// in nats.conf (gateway, web, console, bridge, seed) are not in
+		// the map, so a pod named `gateway` is not refused here. That gap
+		// predates profile narrowing (a session pod has it too) and closing
+		// it needs the static names carried to the callout.
 		if slices.Contains(m.Users(), user) {
 			return "", nil, "", fmt.Errorf("%s narrows on pod %q, which is the name of a mapped principal; its inbox is that principal's", att.ServiceAccount, user)
 		}

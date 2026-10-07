@@ -310,6 +310,11 @@ tombstone, because there is no bus to publish one on. The directory survives a f
 Nothing sweeps directory entries that have no profile. Fixing that means either holding
 deletion on a `today` install or giving the operator a read of the whole directory.
 
+Profile names and session names share the addressee space on `a2a.tasks.>`. A profile named
+exactly like a live session pod (`<profile>-<animal>-<hex>`) would get that session's events
+subject. Only `platform` is reserved. Matching the session shape would mean a regex that has
+to track how the gateway mints names, and creating an AgentProfile is already a privileged act.
+
 The CR binds to the PlatformAgent in its namespace. The field table has no agentRef, and with
 two agents in one namespace (only possible with the singleton webhook off) a profile renders
 nothing. The name `platform` is reserved: it is the Hermes bridge's addressee.

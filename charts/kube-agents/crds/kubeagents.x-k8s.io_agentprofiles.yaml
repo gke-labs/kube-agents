@@ -110,6 +110,7 @@ spec:
                   description:
                     Description is the routing blurb, rendered into the A2A
                     agent card.
+                  maxLength: 4096
                   minLength: 1
                   type: string
                   x-kubernetes-validations:
@@ -345,10 +346,7 @@ spec:
               rule:
                 self.metadata.name.matches('^[a-z0-9]([-a-z0-9]*[a-z0-9])?$') && self.metadata.name.size()
                 <= 63
-            - message:
-                "AgentProfile name 'platform' is reserved: the Hermes bridge
-                is the executor for that addressee"
-              rule: self.metadata.name != 'platform'
+            - rule: self.metadata.name != 'platform'
       served: true
       storage: true
       subresources:

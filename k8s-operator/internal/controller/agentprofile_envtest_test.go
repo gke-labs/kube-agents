@@ -18,6 +18,7 @@ package controller
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
@@ -75,6 +76,7 @@ func TestTheAgentProfileCRDRefusesWhatTheLoaderRefused(t *testing.T) {
 		"clusterRef missing field": func(p *agentv1alpha1.AgentProfile) { p.Spec.ClusterRef.Location = "" },
 		"bad serviceAccountName":   func(p *agentv1alpha1.AgentProfile) { p.Spec.Identity.ServiceAccountName = "Not_A_Name" },
 		"another profile's SA":     func(p *agentv1alpha1.AgentProfile) { p.Spec.Identity.ServiceAccountName = "agentprofile-other" },
+		"oversize description":     func(p *agentv1alpha1.AgentProfile) { p.Spec.Description = strings.Repeat("x", 4097) },
 	}
 	for name, mutate := range cases {
 		p := valid.DeepCopy()

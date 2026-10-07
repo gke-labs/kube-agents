@@ -60,13 +60,20 @@ const topicPrefix = "a2a.topics."
 // task plane for the profile's addressee with the pod's own consumers and
 // inbox, plus the profile's topics.
 //
-// A topic the profile publishes is a plain publish; the JetStream ack comes
-// back on the pod's inbox. A topic it subscribes to gets the core subscribe and
-// the two reads lib.ReadTopicLatest makes: STREAM.INFO on each topic stream
-// (the js.Stream handle) and DIRECT.GET scoped to the topic's own subject.
-// STREAM.INFO on a topic stream is the one grant here wider than its topic: an
-// info call with a subjects filter lists the topic names the stream holds.
-// Names, not contents, and the platform agent's own grant has the same reach.
+// Any profile with a topic gets STREAM.INFO on both topic streams, a writer as
+// much as a reader: `a2a topics write` resolves the topic through
+// Client.TopicRegistry, which opens a js.Stream handle on each stream before it
+// publishes. A topic the profile publishes is then the publish itself (the
+// JetStream ack comes back on the pod's inbox). A topic it subscribes to adds
+// the core subscribe and DIRECT.GET scoped to the topic's own subject, which is
+// lib.ReadTopicLatest's read. STREAM.INFO on a topic stream is the one grant
+// here wider than its topic: an info call with a subjects filter lists the
+// topic names the stream holds. Names, not contents, and the platform agent's
+// own grant has the same reach.
+//
+// An agent-scoped topic the profile publishes must be its own,
+// agent.<profile>.<topic>: the payload spec gives each agent namespace one
+// writer. Another agent's topic, or a shared one, is fine to read.
 func profileGrants(profile, pod string, topics TopicGrants) (Grants, error) {
 	g := executorGrants(profile, pod)
 	for _, t := range topics.Publish {
@@ -74,9 +81,12 @@ func profileGrants(profile, pod string, topics TopicGrants) (Grants, error) {
 		if err != nil {
 			return Grants{}, err
 		}
+		if err := ownsAgentTopic(profile, t); err != nil {
+			return Grants{}, err
+		}
 		g.Publish = append(g.Publish, subject)
 	}
-	if len(topics.Subscribe) > 0 {
+	if len(topics.Publish) > 0 || len(topics.Subscribe) > 0 {
 		for _, stream := range topicStreams {
 			g.Publish = append(g.Publish, "$JS.API.STREAM.INFO."+stream)
 		}
@@ -106,6 +116,16 @@ func topicSubject(grant string) (string, error) {
 	return subject, nil
 }
 
+// ownsAgentTopic refuses a publish grant on another agent's topic. Shared
+// topics have no owner and pass.
+func ownsAgentTopic(profile, grant string) error {
+	_, agent, _, _ := lib.ParseTopicSubject(topicPrefix + grant)
+	if agent != "" && agent != profile {
+		return fmt.Errorf("profile %q may not publish agent.%s topic %q: an agent-scoped topic has one writer, the agent it names", profile, agent, grant)
+	}
+	return nil
+}
+
 // validateProfileEntry is the map-time check for a NarrowingProfile entry. The
 // mint repeats the topic check, so a map that got past this function by some
 // other route still cannot mint a non-topic subject.
@@ -118,6 +138,11 @@ func validateProfileEntry(id Identity) error {
 	}
 	for _, t := range append(append([]string{}, id.Topics.Publish...), id.Topics.Subscribe...) {
 		if _, err := topicSubject(t); err != nil {
+			return fmt.Errorf("user %q: %w", id.User, err)
+		}
+	}
+	for _, t := range id.Topics.Publish {
+		if err := ownsAgentTopic(id.Profile, t); err != nil {
 			return fmt.Errorf("user %q: %w", id.User, err)
 		}
 	}

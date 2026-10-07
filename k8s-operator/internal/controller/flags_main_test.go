@@ -12,7 +12,7 @@ import (
 // opposite. Tests that want a flag on set it with
 // t.Setenv, which restores this cleared state when they finish.
 func TestMain(m *testing.M) {
-	for _, name := range []string{a2aInjectBackendEnvVar, a2aAgentDoorEnvVar, a2aSessionClusterViewEnvVar} {
+	for _, name := range []string{a2aInjectBackendEnvVar, a2aAgentDoorEnvVar, a2aSessionClusterViewEnvVar, operatorNamespaceEnvVar, operatorServiceAccountEnvVar} {
 		_ = os.Unsetenv(name)
 	}
 	os.Exit(m.Run())

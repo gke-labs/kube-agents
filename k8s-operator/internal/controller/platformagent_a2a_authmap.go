@@ -334,6 +334,11 @@ func validateA2AAuthMapIdentities(identities []a2aAuthMapIdentity) error {
 						return fmt.Errorf("identity %d: user %q: topic grant %q is not shared.{topic} or agent.{agent}.{topic}", i, id.User, t)
 					}
 				}
+				for _, t := range id.Topics.Publish {
+					if !ownsAgentTopic(id.Profile, t) {
+						return fmt.Errorf("identity %d: user %q may not publish %q: an agent-scoped topic has one writer, the agent it names", i, id.User, t)
+					}
+				}
 			}
 		default:
 			return fmt.Errorf("identity %d: user %q names narrowing %q, which the callout does not implement", i, id.User, id.Narrowing)

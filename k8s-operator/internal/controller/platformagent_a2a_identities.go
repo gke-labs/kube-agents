@@ -265,6 +265,48 @@ const (
 // publish for an addressee this grant does not name.
 const a2aBridgeAddressee = "platform"
 
+// The operator's own bus principal: its NATS user and inbox owner, and the
+// directory it writes AgentProfile cards to (agentprofile_card.go).
+const (
+	a2aOperatorBusUser        = "operator"
+	a2aDirectoryStream        = "DIRECTORY"
+	a2aDirectorySubjectPrefix = "a2a.agents."
+)
+
+// operatorIdentity is the operator as a bus principal: publish a card or a
+// tombstone on a2a.agents.<profile>, read one back, and its own inbox. The
+// subject is a wildcard over the profile token because a callout grant is
+// fixed for the life of a connection: a profile created after the operator
+// connected must still be publishable without a reconnect. Nothing else: no
+// task plane, no topics, no stream verb beyond the one direct read.
+//
+// The read is DIRECT.GET by subject, which nats.go spells as the subject's
+// trailing tokens, so it is scoped to the directory's own subjects; it is how
+// reconcile tells a missing or stale card from a current one without holding
+// STREAM.INFO.
+//
+// ok is false when the manager was deployed without its own namespace and
+// ServiceAccount in the environment (agentprofile_identities.go); the caller
+// renders no entry then rather than guessing a name.
+func operatorIdentity() (a2aIdentity, bool) {
+	ns, sa, ok := operatorBusPrincipal()
+	id := a2aIdentity{
+		user:           a2aOperatorBusUser,
+		account:        a2aAccountApp,
+		auth:           a2aAuthCallout,
+		serviceAccount: a2aServiceAccountName(ns, sa),
+		comment: "the operator. Publishes each AgentProfile's agent card and its tombstone\n" +
+			"on the directory, and reads one back to tell a missing card from a current\n" +
+			"one. Nothing on the task plane or the blackboard.",
+		publish: []string{
+			a2aDirectorySubjectPrefix + "*",
+			"$JS.API.DIRECT.GET." + a2aDirectoryStream + "." + a2aDirectorySubjectPrefix + "*",
+		},
+		subscribe: []string{"_INBOX." + a2aOperatorBusUser + ".>"},
+	}
+	return id, ok
+}
+
 // a2aServiceAccountName spells a KSA the way the Kubernetes TokenReview API
 // reports it, which is how the callout's map is keyed. Built here rather than
 // in the map renderer so the operator and the callout cannot disagree about the
