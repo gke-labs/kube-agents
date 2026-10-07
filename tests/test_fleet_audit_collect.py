@@ -1264,3 +1264,74 @@ class TestUntargetedComputeClassWorkload(unittest.TestCase):
                 reason = cc_context.context.get("unevaluated", {}).get("untargeted-compute-class-workload", "")
                 self.assertIn("returned output that is not a JSON list of node pools (rc=0)", reason)
                 self.assertNotIn("exited 0", reason)
+
+    def test_workload_pinned_away_from_tolerated_non_cc_pool_is_flagged_for_manual_remediation(self):
+        # When a workload carries a nodeSelector or required nodeAffinity pinning it to a CC pool,
+        # tolerating a tainted non-CC pool's taints must not clear the workload: the workload cannot
+        # schedule on the non-CC pool, so it is flagged and routes to manual remediation.
+        cc_base = compute_class("base")
+        pool1 = pool("pool-1", labels={"cloud.google.com/compute-class": "base"})
+        gvisor_pool = pool(
+            "gvisor-pool",
+            labels={},
+            taints=[{"key": "sandbox.gke.io/runtime", "value": "gvisor", "effect": "NO_SCHEDULE"}],
+        )
+        ctx = {
+            "compute_classes": [cc_base],
+            "node_pools": [pool1, gvisor_pool],
+            "namespaces": [self.ns],
+            "nodes": [
+                node("n1", labels={"cloud.google.com/gke-nodepool": "pool-1"}),
+                node("n2", labels={"cloud.google.com/gke-nodepool": "gvisor-pool"}),
+            ],
+        }
+
+        # 1. Blanket Exists toleration + selector pinning away from gvisor-pool to pool-1
+        wl_blanket = collect.normalize_workloads({
+            "items": [deployment(
+                "app-blanket",
+                node_selector={"cloud.google.com/gke-nodepool": "pool-1"},
+                tolerations=[{"operator": "Exists"}],
+            )]
+        })[0]
+        hit_blanket = collect.check_untargeted_compute_class_workload(wl_blanket, ctx)
+        self.assertIsNotNone(hit_blanket)
+        self.assertEqual(hit_blanket["single_compute_class"], "")
+        self.assertIn("manual remediation: workload has scheduling constraints", hit_blanket["excerpt"])
+
+        # 2. Specific Equal toleration + selector pinning to pool-1
+        wl_specific = collect.normalize_workloads({
+            "items": [deployment(
+                "app-specific",
+                node_selector={"cloud.google.com/gke-nodepool": "pool-1"},
+                tolerations=[{"key": "sandbox.gke.io/runtime", "operator": "Equal", "value": "gvisor", "effect": "NoSchedule"}],
+            )]
+        })[0]
+        hit_specific = collect.check_untargeted_compute_class_workload(wl_specific, ctx)
+        self.assertIsNotNone(hit_specific)
+        self.assertEqual(hit_specific["single_compute_class"], "")
+        self.assertIn("manual remediation: workload has scheduling constraints", hit_specific["excerpt"])
+
+        # 3. Required nodeAffinity pinning away from gvisor-pool to pool-1
+        wl_aff = collect.normalize_workloads({
+            "items": [deployment(
+                "app-aff",
+                node_affinity={
+                    "requiredDuringSchedulingIgnoredDuringExecution": {
+                        "nodeSelectorTerms": [{
+                            "matchExpressions": [{
+                                "key": "cloud.google.com/gke-nodepool",
+                                "operator": "In",
+                                "values": ["pool-1"],
+                            }]
+                        }]
+                    }
+                },
+                tolerations=[{"operator": "Exists"}],
+            )]
+        })[0]
+        hit_aff = collect.check_untargeted_compute_class_workload(wl_aff, ctx)
+        self.assertIsNotNone(hit_aff)
+        self.assertEqual(hit_aff["single_compute_class"], "")
+        self.assertIn("manual remediation: workload has scheduling constraints", hit_aff["excerpt"])
+

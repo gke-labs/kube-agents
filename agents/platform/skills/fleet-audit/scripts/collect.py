@@ -3871,6 +3871,65 @@ def _workload_has_scheduling_constraints(template: dict) -> bool:
     return False
 
 
+def _pool_satisfies_scheduling_selectors(template: dict, pool: dict) -> bool:
+    pool_name = pool.get("name") or ""
+    pool_labels = dict((pool.get("config") or {}).get("labels") or {})
+    if pool_name:
+        pool_labels["cloud.google.com/gke-nodepool"] = pool_name
+
+    for taint in (pool.get("config") or {}).get("taints") or []:
+        t_key = taint.get("key", "")
+        t_val = taint.get("value", "")
+        if t_key in ("kubernetes.io/arch", "beta.kubernetes.io/arch") and t_val:
+            pool_labels["kubernetes.io/arch"] = t_val
+            pool_labels["beta.kubernetes.io/arch"] = t_val
+
+    node_sel = template.get("nodeSelector") or {}
+    for k, v in node_sel.items():
+        if k not in pool_labels or pool_labels[k] != v:
+            return False
+
+    affinity = template.get("affinity") or {}
+    node_affinity = affinity.get("nodeAffinity") or {}
+    required = node_affinity.get("requiredDuringSchedulingIgnoredDuringExecution") or {}
+    terms = required.get("nodeSelectorTerms") or []
+    if terms:
+        terms_matched = False
+        for term in terms:
+            exprs = term.get("matchExpressions") or []
+            if not exprs:
+                terms_matched = True
+                break
+            exprs_ok = True
+            for expr in exprs:
+                key = expr.get("key")
+                op = expr.get("operator")
+                values = expr.get("values") or []
+                if op in ("In", "Equal"):
+                    if key not in pool_labels or pool_labels[key] not in values:
+                        exprs_ok = False
+                        break
+                elif op == "Exists":
+                    if key not in pool_labels:
+                        exprs_ok = False
+                        break
+                elif op in ("NotIn", "NotEqual"):
+                    if key in pool_labels and pool_labels[key] in values:
+                        exprs_ok = False
+                        break
+                elif op == "DoesNotExist":
+                    if key in pool_labels:
+                        exprs_ok = False
+                        break
+            if exprs_ok:
+                terms_matched = True
+                break
+        if not terms_matched:
+            return False
+
+    return True
+
+
 def check_untargeted_compute_class_workload(workload: dict, context: dict) -> dict | None:
     """A workload on a ComputeClass cluster omitting cloud.google.com/compute-class.
 
@@ -3976,7 +4035,10 @@ def check_untargeted_compute_class_workload(workload: dict, context: dict) -> di
                 break
     if is_arm64:
         pod_tolerations.append({"key": "kubernetes.io/arch", "operator": "Equal", "value": "arm64"})
-    if non_cc_pools and any(_tolerates_pool(pod_tolerations, p) for p in non_cc_pools):
+    if non_cc_pools and any(
+        _tolerates_pool(pod_tolerations, p) and _pool_satisfies_scheduling_selectors(template, p)
+        for p in non_cc_pools
+    ):
         return None
 
     # Determine single_compute_class:
