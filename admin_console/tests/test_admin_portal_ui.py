@@ -1012,6 +1012,12 @@ class AdminPortalFunctionalTest(unittest.TestCase):
         )
 
     def test_revalidation_exception_retains_suspended_target(self):
+        release_check = Event()
+
+        def crashed_check(*args, **kwargs):
+            release_check.wait(timeout=20)
+            raise RuntimeError("probe crashed")
+
         app = self.app(connected=True)
         self.controller(app).verified_at = datetime(2020, 1, 1, tzinfo=UTC)
         save_connection(
@@ -1021,9 +1027,11 @@ class AdminPortalFunctionalTest(unittest.TestCase):
         )
         with patch(
             "admin_console.connections.run_connection_checks",
-            side_effect=RuntimeError("probe crashed"),
+            side_effect=crashed_check,
         ):
             app = app.run()
+            self.assertIsNotNone(self.controller(app).job)
+            release_check.set()
             app = self.finish_connection_job(app)
 
         self.assertIsNone(self.controller(app).connected_target)
