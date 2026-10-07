@@ -630,6 +630,39 @@ whole list - the shared `worker` credential reborn under a new name, and it woul
 correct in review. The callout refuses such an entry at parse. No claim, no grants, no
 connection.
 
+A narrowed user is named for its pod, and that name is also its inbox prefix, so a pod
+named after another principal would be granted that principal's `_INBOX.<user>.>` and
+could read or forge the JetStream replies delivered there. The gateway never mints such a
+name, but anyone who can create a pod under a narrowed ServiceAccount can. The callout
+therefore refuses a narrowed pod whose name is one of the static `nats.conf` users: the
+callout's own user and every static identity, the same list `auth_users` is rendered from.
+No identity map carries those names, so the operator renders them into the callout's
+`A2A_RESERVED_PRINCIPALS` environment variable as a comma-separated list. The callout does
+not read `nats.conf`, which carries every static user's password. It refuses to start if
+the variable is missing, empty, or holds anything but dot-free DNS-1123 labels; a smaller
+set would quietly admit a pod named after the dropped user. The list is fixed for the life
+of the process, and that is enough: it changes only when the operator's render does, and a
+changed value changes the pod template, which rolls the callout. The same check also
+refuses a narrowed pod named after a user in the callout's own identity map (`provision`,
+`agent`, `verifier`, `session`, and any user the map gains), because the callout mints
+each entry that is not narrowed under its `user` and that entry's grants carry
+`_INBOX.<user>.>`; the narrowed entry's own user, `session`, is never minted and is
+reserved with the rest because one check covers every map user. Those names
+come from the map being served, not from the variable: they are built when the map is
+parsed and installed with it, so a reload that adds or removes a user moves the reserved
+set in the same step, and a connection is checked against the users of the map its
+identity was resolved from. The callout refuses a map whose users are not dot-free DNS-1123
+labels too, because the check compares pod names byte for byte: a map user `a.b` would sit
+inside the `_INBOX.a.>` grant of a pod named `a` without matching it. A removed user's name is released at once, but the reload
+revokes nothing: connections the removed principal already holds keep its inbox until
+their user JWT expires, at most the callout's grant lifetime (one hour by default; the
+operator does not set `A2A_GRANT_TTL_SECONDS`), and a narrowed pod named after it can be
+minted the same inbox inside that window. Only an operator re-render removes a map user,
+and the window is accepted. The refusal reason says which kind of name the pod copies.
+The pod name is also the session's task addressee, consumer stem and capability caller,
+so the same collision exists in the addressee namespace: a narrowed pod named `platform`,
+the bridge's addressee, is not refused by this check.
+
 A reaped session's credential stops working because the pod object is gone, not because
 the token expired: measured on envtest 1.36, a zero-grace pod delete invalidated the token
 10.1 seconds later, the API server's successful-authentication cache being the delay. The

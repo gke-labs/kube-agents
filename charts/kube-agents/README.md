@@ -525,6 +525,31 @@ to `null`/`""`, which **omits** the field and lets the CRD's own default apply
 — setting `false` is therefore distinct from leaving it unset, and `replicas: 0`
 means zero rather than unset.
 
+`platformAgent.deployment.credentialProxy.resources` sizes the credential-proxy
+container, the broker that runs every credentialed command in a pod of its own.
+It is forwarded to the CR's `spec.deployment.credentialProxy.resources` when any
+key is set, and the operator merges it over its defaults per key, so
+`limits: {memory: 2Gi}` raises the memory limit and keeps the rest. The
+[`spec.deployment` section of the CRD reference](https://gke-labs.github.io/kube-agents/operator/platformagent-crd/#specdeployment)
+is canonical for the defaults, what the operator refuses and how it reports it,
+and the Autopilot warnings;
+[the child memory budget design](../../docs/designs/credential-proxy-child-memory-budget.md)
+has the arithmetic behind the memory floor. The chart fails the render on an
+override the operator would refuse, on a quantity it cannot read, and on any key
+under `resources` other than `requests`, `limits` and `claims` (`limit:` for
+`limits:`), which the CRD would prune silently. A quantity with more than 15
+significant digits is refused at render as well: the chart compares quantities as
+float64, scaled in decimal arithmetic, so `1005m` equals `1.005` and the
+comparison matches the operator's for every decimal value within the cap. A
+binary-suffixed value within float64 rounding (about one part in 10^16) of a
+decimal one can compare equal to it; the operator decides that pair. The quota
+preflight sums the
+override merged over the operator's defaults. On an existing install, apply the
+chart's `crds/` before setting the value (`helm upgrade` does not, `upgrade.sh`
+does): against a CRD that predates `spec.deployment.credentialProxy`, the API
+server would prune the value silently while the release record kept it, so the
+chart looks up the installed CRD and fails the upgrade instead.
+
 #### PlatformAgent annotations
 
 `platformAgent.annotations` is copied onto the CR's `metadata.annotations`, and
@@ -709,7 +734,12 @@ have no replica count to multiply, and the pre-delete cleanup hook Job (one pod,
 sizes come from `files/footprint.yaml` because the chart cannot render them itself. The agent
 pod is multiplied by `platformAgent.deployment.availability.replicas`; the shell sandbox, the
 credential proxy and the PersistentVolumeClaims are not, because they do not scale with
-it. A replica count of `0` costs nothing, and a `resources` key you have pruned
+it. The credential proxy is counted with `platformAgent.deployment.credentialProxy.resources`
+merged over its footprint entry per key, as the operator renders it, so a raised limit is
+summed at the raised figure, and an override setting only `limits.ephemeral-storage` is counted
+as a request of that size too, because the operator renders no ephemeral-storage request and
+the API server defaults it to the limit; a `PlatformAgent` edited by hand after the install is
+outside what the chart can see. A replica count of `0` costs nothing, and a `resources` key you have pruned
 (`--set litellm.resources.limits=null`) counts as zero rather than failing the render —
 though note that if a namespace ResourceQuota restricts that compute resource (such as
 `limits.cpu` or `limits.memory`), Kubernetes quota admission requires every container to

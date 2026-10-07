@@ -45,6 +45,16 @@ const (
 	a2aSubjectListIndent = a2aUserBlockIndent + "    "
 )
 
+// The separators the two renders of the static principal names join with.
+// auth_users is nats.conf syntax and its spacing is hashed into
+// a2aConfigRolloutHash, so it keeps the spacing it always had; the callout's
+// list is parsed by authcallout.ParseReservedPrincipals, which splits on a bare
+// comma.
+const (
+	a2aAuthUsersSeparator          = ", "
+	a2aReservedPrincipalsSeparator = ","
+)
+
 // renderA2AStaticUsers renders the user blocks for one account.
 //
 // pw rather than the creds Secret, and that is a constraint rather than a
@@ -186,9 +196,25 @@ func renderA2ASubjectList(indent, kind string, subjects []string) string {
 // block is the quiet one: the server accepts the config, and the exemption
 // simply covers nothing.
 func renderA2AAuthUsers(agent *agentv1alpha1.PlatformAgent) string {
+	return strings.Join(a2aStaticPrincipalNames(agent), a2aAuthUsersSeparator)
+}
+
+// a2aStaticPrincipalNames is every user nats.conf authenticates by password,
+// in render order: the callout's own user, then the static identities. It is
+// the one list both auth_users and the callout's reserved principal names are
+// rendered from, so the two cannot disagree.
+func a2aStaticPrincipalNames(agent *agentv1alpha1.PlatformAgent) []string {
 	names := []string{a2aCalloutConfUser}
 	for _, id := range staticIdentities(agent) {
 		names = append(names, id.user)
 	}
-	return strings.Join(names, ", ")
+	return names
+}
+
+// renderA2AReservedPrincipals is the callout's A2A_RESERVED_PRINCIPALS value:
+// the static principal names a narrowed pod may not be named after, because a
+// narrowed user's name is its inbox prefix. Plain env rather than a mount of
+// nats.conf, which carries every static user's password.
+func renderA2AReservedPrincipals(agent *agentv1alpha1.PlatformAgent) string {
+	return strings.Join(a2aStaticPrincipalNames(agent), a2aReservedPrincipalsSeparator)
 }

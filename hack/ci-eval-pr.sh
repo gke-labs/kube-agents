@@ -322,6 +322,19 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 profile_begin "bootstrap: source ci-env.sh"
 source "${SCRIPT_DIR}/ci-env.sh"
 
+# EVAL_FORGE=gitlab deploys against the pool project's GitLab repository
+# (hack/ci-deploy.sh), but everything below -- the ledger resets, the
+# pull-request reset, grading with BENCH_GITHUB_TOKEN -- still reads and
+# writes the GitHub one. Until those have their GitLab halves (#2394), a
+# GitLab run would close GitHub ledgers while the agent wrote elsewhere, so
+# this script refuses before any of them runs. (The lease and the deploy are
+# already behind it: the Prow wrapper leases, hack/ci-deploy.sh deploys, and
+# this script runs third; its own provider gate stops a GitLab run first today.)
+if [ "${EVAL_FORGE:-github}" = "gitlab" ]; then
+  echo "ERROR: EVAL_FORGE=gitlab: the eval's grading and resets have no GitLab half yet (gke-labs/kube-agents#2394); only hack/ci-deploy.sh knows the forge." >&2
+  exit 1
+fi
+
 # ─── Eval dashboard publish hook (dashboard PR 4/4) ─────────────────────────
 # Re-renders and republishes the eval dashboard at the very end of every
 # MAIN-BRANCH run, red or green, from the EXIT trap below. FAIL-SAFE BY
