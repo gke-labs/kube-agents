@@ -2,7 +2,7 @@
 
 - **Author:** [@bnaylor]
 - **Date:** 2026-08-24
-- **Status:** merged design of record; the gateway program is implemented (`a2a/gateway`: session registry, authority block, interceptors, supervisor duties, Discord, Google Chat and Slack adapters, the console adapter, and the A2A door); the operator renders the gateway Deployment, its env and the `A2A_SPAWN_SESSIONS` arming under `mode: next` (`platformagent_a2a_manifests.go`) plus, under its own eval flag, the inject backend below and its Service, principal map, token Secret and gateway fence, and under its own flag the A2A door and the same four objects; and, when `spec.integration.googleChat` is enabled under `next`, the Google Chat adapter's env, its projected relay token, and the broker's side of it (the A2A relay instance on the install's one subscription, `CREDENTIAL_PROXY_A2A_CHAT_AUDIENCE`, the gateway's ServiceAccount on `CREDENTIAL_PROXY_ALLOWED_CALLERS`, and the broker NetworkPolicy admitting the A2A gateway pod); the legacy Hermes consumer is not rendered under `next`, so the composition's one Chat subscription is the whole of the Pub/Sub the install needs - and not yet the Slack adapter's env or the `a2a-slack-principal-map` mount either; of the pieces "Sessions by default" names as transition work, the `/session` opt-in is built (`a2a/gateway`: `/session`, `/session <text>`, `/session off`); not yet the gateway-minted child task and the session's grant to request one, the `chat` profile's skills, or the default flip; the session pod's temporary read-only cluster view (a third broker caller under the operator's `A2A_SESSION_CLUSTER_VIEW` flag, off by default, retired by declarative profiles or by gateway-side `AllowedUsers` enforcement, whichever lands first) is built
+- **Status:** merged design of record; the gateway program is implemented (`a2a/gateway`: session registry, authority block, interceptors, supervisor duties, Discord, Google Chat and Slack adapters, the console adapter, and the A2A door); the operator renders the gateway Deployment, its env and the `A2A_SPAWN_SESSIONS` arming under `mode: next` (`platformagent_a2a_manifests.go`) plus, under its own eval flag, the inject backend below and its Service, principal map, token Secret and gateway fence, and under its own flag the A2A door and the same four objects; and, when `spec.integration.googleChat` is enabled under `next`, the Google Chat adapter's env (the home channel the chat.notify route posts to included), its projected relay token, and the broker's side of it (the A2A relay instance on the install's one subscription, `CREDENTIAL_PROXY_A2A_CHAT_AUDIENCE`, the gateway's ServiceAccount on `CREDENTIAL_PROXY_ALLOWED_CALLERS`, and the broker NetworkPolicy admitting the A2A gateway pod); the legacy Hermes consumer is not rendered under `next`, so the composition's one Chat subscription is the whole of the Pub/Sub the install needs - and not yet the Slack adapter's env or the `a2a-slack-principal-map` mount either; of the pieces "Sessions by default" names as transition work, the `/session` opt-in is built (`a2a/gateway`: `/session`, `/session <text>`, `/session off`); not yet the gateway-minted child task and the session's grant to request one, the `chat` profile's skills, or the default flip; the session pod's temporary read-only cluster view (a third broker caller under the operator's `A2A_SESSION_CLUSTER_VIEW` flag, off by default, retired by declarative profiles or by gateway-side `AllowedUsers` enforcement, whichever lands first) is built
 
 ## Purpose
 
@@ -986,9 +986,9 @@ second one for the A2A path, because the unacked backlog then follows the live c
 across a flip in either direction, where a second subscription would hold up to seven days
 of stale asks for the legacy consumer to drain on a rollback. The per-install choice of a
 different pairing is the mode switch's per-component override, sketched and not built; the
-predicate the operator consults (`a2aChatArmed`) is where it would be read. What this costs:
-under `next` the Hermes platform is off, so cron findings addressed to the Chat home channel
-have no target until the bus carries them. And the handover is not instantaneous: the pass
+predicate the operator consults (`a2aChatArmed`) is where it would be read. With the Hermes
+platform off, the agent's proactive posts (alerts, cron findings, audit reports) go to the
+gateway instead, over the chat.notify route below. And the handover is not instantaneous: the pass
 that flips a Chat install to `next` turns the Hermes consumer off while the gateway may still
 be held (the callout gate, a provisioning Job, an image pull), so until the gateway is up
 nobody consumes the subscription - messages wait in it rather than being lost, and the CR
@@ -1064,6 +1064,34 @@ plus admin approval, so the fallback is refused too. The adapter therefore resol
 email to the immutable `users/{id}` it learned from that person's own event, which
 `findDirectMessage` does accept; a person who has never spoken cannot be opened. Ships
 as the primitive, unused, like the other backends.
+
+**Proactive posts: the chat.notify route.** A message the agent raises with nobody asking
+(an alert, a cron finding, an audit report) has no conversation to answer, and under `next`
+the Hermes platform that used to post it is off. So the agent asks the gateway, which holds
+the Chat credential, to post it. The agent container runs `a2a notify`, which publishes a
+core NATS request on `chat.notify.gchat` carrying `{"text", "thread"?}` with its reply subject
+under `chat.notify.reply.agent.`; the gateway posts the text into the home space
+(`googleChat.homeChannel`, carried as `A2A_GCHAT_HOME_CHANNEL`), as a new thread or as a reply
+on a thread of that space, and answers with the first message's name and the thread it
+landed in, the shape `hermes send --json` prints. The agent-side callers
+(`agents/platform/scripts/chat_notify.py`) switch on `A2A_NOTIFY_PLATFORM`, which the operator
+renders exactly when `a2aChatArmed` holds, and send to every other platform through
+`hermes send` as before.
+
+A notify is not a task. It mints no capability, starts no executor, opens no session and
+carries no `authority` block; the requester rules above do not apply, because nobody
+requested it. What bounds it is where it may land and who may send it. Where: the home space
+only, and a thread of another space, or anything that is not a thread of the home space, is
+refused before any post. Who: the agent principal alone publishes `chat.notify.gchat` and
+reads `chat.notify.reply.agent.>`; the gateway alone reads the first and publishes the
+second. The answer does not go to the agent's `_INBOX` for the reason the verifier's does not:
+the agent reads its JetStream replies there, and a gateway able to publish into it could
+forge them; a request whose reply subject is outside the namespace is dropped unanswered.
+The agent could already post the same text to the same channel through `hermes send` under
+`today`, so the route moves the post to the process holding the credential rather than adding
+a reach. A reply a human types in a notify's thread arrives at the gateway as an ordinary
+message from that human, through the usual ingress checks, and starts a conversation of its
+own: nothing binds it to the investigation that raised the alert.
 
 ## The Slack adapter (added 9/4)
 

@@ -554,6 +554,14 @@ Layout:
   `console` password from the creds Secret, and proxies the page's websocket to 9222. It is
   the one pod-network peer the NATS fence admits on 9222, by label, and its own pod carries
   a deny-all ingress policy, so it too is reachable only through `kubectl port-forward`.
+
+- **The notify route.** The agent's proactive posts to the chat home channel under `next`
+  (spec-chatops-gateway.md, "Proactive posts: the chat.notify route"). The `agent` user gains
+  publish on `chat.notify.gchat` and subscribe on `chat.notify.reply.agent.>`; the gateway
+  user gains the matching pair (subscribe on the first, publish on the second). No other
+  principal holds either subject. The reply namespace is its own rather than the agent's
+  `_INBOX`, so the gateway cannot publish into the inbox where the agent reads its JetStream
+  replies. Core NATS, like the console subjects: the provision Job is untouched.
   The origin allow-list moves to `http://localhost:8080` and `http://127.0.0.1:8080`, the
   console server's forwarded address, and the proxy passes the browser's `Origin` through,
   so the check still sees the page. `same_origin` would still never match, because the bus
