@@ -2,7 +2,7 @@
 
 Run: python3 -m unittest discover -s deploy/docker/patches -p 'test_*.py' -t deploy/docker/patches
 
-The applier's contract against miniature copies of the three Hermes files, and the verifier
+The applier's contract against miniature copies of the two Hermes files, and the verifier
 against the same stubs patched and unpatched: it imports them as ``tools.*`` from the staged root.
 """
 
@@ -13,8 +13,7 @@ from unittest import mock
 
 import verify_ssh_shared_master as verify
 from apply_ssh_shared_master import (
-    LIFECYCLE_ANCHOR, LIFECYCLE_RELATIVE, MARKER, RESULT_ANCHOR, RESULT_RELATIVE, SSH_CLEANUP_ANCHOR,
-    SSH_INIT_ANCHOR, SSH_RELATIVE, apply,
+    MARKER, RESULT_ANCHOR, RESULT_RELATIVE, SSH_CLEANUP_ANCHOR, SSH_INIT_ANCHOR, SSH_RELATIVE, apply,
 )
 
 # tools/environments/ssh.py at v2026.9.14: the two anchored regions, nothing else of the class.
@@ -46,49 +45,6 @@ SSH_STUB = (
     + SSH_CLEANUP_ANCHOR
 )
 
-# tools/terminal_tool_lifecycle.py: _evict_environment_for_task and the names it uses.
-LIFECYCLE_STUB = (
-    "import contextlib\n"
-    "from typing import Optional\n"
-    "\n"
-    "\n"
-    "@contextlib.contextmanager\n"
-    "def _quiet(what):\n"
-    "    try:\n"
-    "        yield\n"
-    "    except Exception:\n"
-    "        pass\n"
-    "\n"
-    "\n"
-    "def _evict_environment_for_task(task_id: Optional[str]) -> None:\n"
-    "    from tools.terminal_tool import (\n"
-    "        _active_environments, _env_lock, _last_activity, _resolve_container_task_id,\n"
-    "    )\n"
-    "    keys = {_resolve_container_task_id(task_id)}\n"
-    "    if task_id:\n"
-    "        keys.add(task_id)\n"
-    "    evicted = []\n"
-    "    with _env_lock:\n"
-    "        for key in keys:\n"
-    "            env = _active_environments.pop(key, None)\n"
-    "            _last_activity.pop(key, None)\n"
-    "            if env is not None:\n"
-    "                evicted.append(env)\n"
-    + LIFECYCLE_ANCHOR
-)
-
-TERMINAL_TOOL_STUB = (
-    "import threading\n"
-    "\n"
-    "_active_environments = {}\n"
-    "_last_activity = {}\n"
-    "_env_lock = threading.RLock()\n"
-    "\n"
-    "\n"
-    "def _resolve_container_task_id(task_id):\n"
-    '    return task_id or "default"\n'
-)
-
 # tools/terminal_tool_result.py: finalize_foreground_result down to the anchor and the JSON tail.
 RESULT_STUB = (
     "import json\n"
@@ -115,15 +71,13 @@ RESULT_STUB = (
 )
 
 
-def stage(ssh=SSH_STUB, lifecycle=LIFECYCLE_STUB, result=RESULT_STUB):
+def stage(ssh=SSH_STUB, result=RESULT_STUB):
     root = Path(tempfile.mkdtemp())
     for rel in ("tools/__init__.py", "tools/environments/__init__.py"):
         (root / rel).parent.mkdir(parents=True, exist_ok=True)
         (root / rel).write_text("")
     (root / SSH_RELATIVE).write_text(ssh)
-    (root / LIFECYCLE_RELATIVE).write_text(lifecycle)
     (root / RESULT_RELATIVE).write_text(result)
-    (root / "tools/terminal_tool.py").write_text(TERMINAL_TOOL_STUB)
     return root
 
 
@@ -136,19 +90,16 @@ def run_verifier(root):
 
 
 class ApplierTest(unittest.TestCase):
-    def test_the_three_files_are_patched(self):
+    def test_the_two_files_are_patched(self):
         root = stage()
         apply(root)
         ssh = (root / SSH_RELATIVE).read_text()
         self.assertIn("self._shared_master = not probe_only", ssh)
         self.assertIn("def close_master(self):", ssh)
         self.assertNotIn(SSH_CLEANUP_ANCHOR, ssh)
-        lifecycle = (root / LIFECYCLE_RELATIVE).read_text()
-        self.assertIn('getattr(env, "close_master", lambda: None)()', lifecycle)
-        self.assertEqual(lifecycle.count("with _quiet("), 2)
         self.assertIn('returncode == 255 and failure_hint is None and not (result or {}).get("cwd_observed")',
                       (root / RESULT_RELATIVE).read_text())
-        for rel in (SSH_RELATIVE, LIFECYCLE_RELATIVE, RESULT_RELATIVE):
+        for rel in (SSH_RELATIVE, RESULT_RELATIVE):
             self.assertIn(MARKER, (root / rel).read_text(), rel)
 
     def test_a_second_apply_is_refused(self):
@@ -163,7 +114,7 @@ class ApplierTest(unittest.TestCase):
             "failure_hint = _failure_hint(command, returncode, output)"))
         with self.assertRaises(SystemExit):
             apply(root)
-        for rel in (SSH_RELATIVE, LIFECYCLE_RELATIVE, RESULT_RELATIVE):
+        for rel in (SSH_RELATIVE, RESULT_RELATIVE):
             self.assertNotIn(MARKER, (root / rel).read_text(), rel)
 
 
@@ -180,20 +131,7 @@ class VerifierTest(unittest.TestCase):
         joined = "\n".join(failures)
         self.assertIn("does not carry the patch marker", joined)
         self.assertIn("no close_master()", joined)
-        self.assertIn("eviction called ['cleanup']", joined)
         self.assertIn("carries no hint", joined)
-
-    def test_an_eviction_close_inside_the_cleanup_block_fails(self):
-        root = stage()
-        apply(root)
-        path = root / LIFECYCLE_RELATIVE
-        path.write_text(path.read_text().replace(
-            '        with _quiet("closing the degraded environment\'s ssh master failed"):  # ' + MARKER + '\n'
-            '            getattr(env, "close_master", lambda: None)()\n',
-            '            getattr(env, "close_master", lambda: None)()  # ' + MARKER + '\n'))
-        rc, failures = run_verifier(root)
-        self.assertEqual(rc, 1)
-        self.assertIn("eviction with a raising cleanup() called ['cleanup']", "\n".join(failures))
 
     def test_a_hint_that_overrides_the_upstream_one_fails(self):
         root = stage()

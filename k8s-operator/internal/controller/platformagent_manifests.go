@@ -1752,10 +1752,10 @@ func seededGitOpsEntry(agent *agentv1alpha1.PlatformAgent) *agentv1alpha1.Manage
 // works. Nothing is reclaimed by reaping here — the far side is a StatefulSet pod
 // that stays up either way — so the timeout buys nothing and costs the race.
 // The agent image also patches cleanup() so it no longer closes the shared
-// master at all (deploy/docker/patches/apply_ssh_shared_master.py, #2174): the
-// per-turn teardown was the frequent caller, and the reaper's cleanup() no
-// longer reaches the master either. The value stays because reaping reclaims
-// nothing here.
+// master at all (deploy/docker/patches/apply_ssh_shared_master.py, #2174): a
+// worker process exiting was the frequent caller, and the reaper's cleanup()
+// no longer reaches the master either. The value stays because reaping
+// reclaims nothing here.
 //
 // `workspace_root` is the sixth and is NOT Hermes'. Hermes ignores it; the reader
 // is agents/platform/scripts/sandbox_exec.py, which already parses this block for

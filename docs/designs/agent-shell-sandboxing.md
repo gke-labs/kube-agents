@@ -296,18 +296,17 @@ task its own `SSHEnvironment`, but derives the `ssh` `ControlPath` from
 operator publishes one host, one user and one port for the whole agent. Every
 concurrent task therefore multiplexes over a single master connection.
 
-Teardown is per environment and not per connection. `cleanup()` runs
-`ssh -O exit` against that shared path, which drops the master and kills every
-session riding it. A sibling task that was mid-command loses it: exit 255, empty
+Teardown is per environment and not per connection. `cleanup()` ran
+`ssh -O exit` against that shared path, which dropped the master and killed every
+session riding it. A sibling task that was mid-command lost it: exit 255, empty
 stderr, no indication that another task's teardown is what ended it. The callers
-of `cleanup()` include the per-turn teardown at the end of every turn (`turn_finalizer`
-→ `cleanup_task_resources` → `cleanup_vm`; the ssh backend never marks itself
-persistent, so it runs for it), the idle reaper, `AIAgent.close()` via
-`cleanup_vm`, the process's atexit sweep, the eviction path after an
-infrastructure failure, and the environment's `__del__`. The first is the frequent one: every kanban card and
-API-server request is one or more turns (and a delegate child, if it inherits
-the ssh backend — see [What is still unproven](#what-is-still-unproven)), so the
-master died whenever any of them finished while another was mid-command (#2174).
+of `cleanup()` that reach the shared environment are the process's atexit sweep
+(`cleanup_all_environments`), the environment's `__del__` and the idle reaper.
+The per-turn teardown (`turn_finalizer` → `cleanup_task_resources` → `cleanup_vm`)
+and `AIAgent.close()` pop the raw turn id, while the terminal tool registers the
+environment under `session:<key>` or `default`, so they miss it. The first is the
+frequent one: kanban workers are subprocesses, so the master died whenever one of
+them exited while another was mid-command (#2174).
 
 The operator's managed terminal block sets `lifetime_seconds` to 30 days, which
 takes the reaper out of the picture. It is a number and not an off switch
@@ -328,21 +327,20 @@ unprivileged uid that cannot write a file the shell user could not then remove.
 
 What remains is the teardown itself, and the agent image patches it
 (`deploy/docker/patches/apply_ssh_shared_master.py`): `cleanup()` keeps its
-sync-back and leaves the shared master alone, so a finishing turn or exiting
-process no longer cuts a sibling's command; `ControlPersist=300` reaps the master
-once nothing has used it for five minutes. The eviction path after an
-`EnvironmentConnectionError` still closes it, live or not; the per-command sync
-raises that error for any failed remote step, a foreground command never reaches
-eviction because `_run_foreground` catches and retries, so only the
-background-process path does, and there it is the pre-patch behaviour kept
-rather than widened. A prompt-time probe's master is its own and is closed as
-before. The terminal tool also labels the shape when it does occur: an ssh
-result with exit 255 and no cwd marker (the wrapper prints the marker after the
-command, so a command's own 255 carries one unless the command text itself calls
-`exit` at top level) gets a `hint`, unless upstream already attached a hint to
-the output, saying the connection was closed under the command or never opened,
-and that it may have run. A per-environment `ControlPath` would remove the
-sharing itself and is upstream's to make.
+sync-back and leaves the shared master alone, so an exiting process no longer
+cuts a sibling's command; `ControlPersist=300` reaps the master once nothing has
+used it for five minutes. The eviction path after an `EnvironmentConnectionError`
+is left as it is: nothing reaches it with a registered ssh environment, because a
+connection failure during construction fires before registration and the sync,
+foreground and background-spawn paths catch their own errors. A prompt-time
+probe's master is its own and is closed as before. The terminal tool also labels
+the shape when it does occur: an ssh result with exit 255 and no cwd marker (the
+wrapper prints the marker after the command, so a command's own 255 carries one
+unless the command text itself calls `exit` or `exec` at top level) gets a
+`hint`, unless upstream already attached a hint to the output, saying the
+connection was closed under the command or never opened, and that it may have
+run. A per-environment `ControlPath` would remove the sharing itself and is
+upstream's to make.
 
 ### What the credential proxy is for
 

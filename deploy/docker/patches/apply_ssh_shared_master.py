@@ -3,32 +3,31 @@
 Hermes derives the ssh ``ControlPath`` from ``sha256(user@host:port)`` and this install publishes
 one of each, so the front door, every kanban worker and every cron turn in the pod ride one
 master (a delegate child too, if it inherits the ssh backend). ``SSHEnvironment.cleanup()`` runs
-``ssh -O exit`` on it, and the per-turn teardown (``turn_finalizer`` -> ``cleanup_task_resources``
--> ``cleanup_vm``) calls ``cleanup()`` at the end of every turn, because the ssh backend never
-marks itself persistent. A command another environment is running at that moment dies as a mux
-client whose master went away: exit 255, nothing printed, no cwd marker. Hermes ``main`` still has
-the shared path.
+``ssh -O exit`` on it. The callers that reach the shared environment are the process-exit sweep
+(``cleanup_all_environments``, so a kanban worker subprocess finishing), the environment's
+``__del__`` and the idle reaper; the per-turn ``cleanup_vm(task_id)`` pops the raw turn id while
+the terminal tool registers the environment under ``session:<key>`` or ``default``, so it misses.
+A command another environment is running when one of them fires dies as a mux client whose master
+went away: exit 255, nothing printed, no cwd marker. Hermes ``main`` still has the shared path.
 
-Four anchored edits in three files:
+Three anchored edits in two files:
 
 - ``ssh.py``: ``cleanup()`` keeps ``sync_back`` and no longer closes the master; the exit loop
   becomes ``close_master()``. ``ControlPersist=300`` reaps an idle master and the far side is a
   StatefulSet pod, so nothing is lost. A prompt-time probe's master is private (its own socket)
   and ``cleanup()`` still closes that one.
-- ``terminal_tool_lifecycle.py``: ``_evict_environment_for_task()``, the path after an
-  ``EnvironmentConnectionError``, calls ``close_master()`` after ``cleanup()``, in its own
-  ``_quiet`` block so a raising ``cleanup()`` does not skip it. It closes whatever master is at the
-  socket, live or not, and the per-command sync raises that error for any failed remote step, not
-  only a dead link. A foreground command never reaches it (``_run_foreground`` catches the error
-  and retries), so in practice only the background-process path does; it is the pre-patch
-  behaviour on that path, kept rather than widened.
 - ``terminal_tool_result.py``: an ssh result with exit 255 and no cwd marker gets a ``hint``, the
   way exit 124 has one, unless upstream already attached a hint to the output (``Permission
   denied``). The wrapper prints the marker after the command and exits with its code, so a
-  command's own 255 carries the marker (unless the command text itself calls ``exit`` at top
-  level, which leaves the wrapper first) and a cut connection, or one ssh never opened, does not.
+  command's own 255 carries the marker (unless the command text itself calls ``exit`` or ``exec``
+  at top level, which leaves the wrapper first) and a cut connection, or one ssh never opened,
+  does not.
 
-The three files are substituted first and written last, so a moved anchor leaves none of them
+The eviction path (``_evict_environment_for_task``) is left alone: at v2026.9.14 nothing reaches it
+with a registered ssh environment, because a connection failure during construction fires before
+registration and the sync, foreground and background-spawn paths catch their own errors.
+
+The two files are substituted first and written last, so a moved anchor leaves none of them
 changed.
 """
 
@@ -43,7 +42,6 @@ MARKER = "kube-agents patch: ssh_shared_master"
 PREFIX = "ssh-shared-master"
 
 SSH_RELATIVE = "tools/environments/ssh.py"
-LIFECYCLE_RELATIVE = "tools/terminal_tool_lifecycle.py"
 RESULT_RELATIVE = "tools/terminal_tool_result.py"
 
 SSH_INIT_ANCHOR = (
@@ -89,16 +87,6 @@ SSH_CLEANUP_PATCHED = (
     "                socket.unlink()\n"
 )
 
-LIFECYCLE_ANCHOR = (
-    "    for env in evicted:\n"
-    '        with _quiet("cleanup of degraded environment failed"):\n'
-    "            env.cleanup()\n"
-)
-LIFECYCLE_PATCHED = LIFECYCLE_ANCHOR + (
-    f'        with _quiet("closing the degraded environment\'s ssh master failed"):  # {MARKER}\n'
-    '            getattr(env, "close_master", lambda: None)()\n'
-)
-
 HINT = (
     "Exit 255 with no exit marker: the sandbox ssh connection was closed under this command, or "
     "never opened. If the output is an ssh error (connection refused, timed out) the command did "
@@ -119,16 +107,11 @@ def apply(root: Path) -> None:
     ssh.substitute(SSH_INIT_ANCHOR, SSH_INIT_PATCHED, label="shared-master mark in __init__")
     ssh.substitute(SSH_CLEANUP_ANCHOR, SSH_CLEANUP_PATCHED, label="cleanup() exit loop")
 
-    lifecycle = patchlib.Patch(root, LIFECYCLE_RELATIVE, prefix=PREFIX)
-    lifecycle.refuse_if_patched(MARKER)
-    lifecycle.substitute(LIFECYCLE_ANCHOR, LIFECYCLE_PATCHED, label="eviction cleanup loop")
-
     result = patchlib.Patch(root, RESULT_RELATIVE, prefix=PREFIX)
     result.refuse_if_patched(MARKER)
     result.substitute(RESULT_ANCHOR, RESULT_PATCHED, label="failure hint assignment")
 
     ssh.commit("cleanup() leaves the shared master to ControlPersist; close_master() closes it")
-    lifecycle.commit("eviction after an infrastructure failure also closes the master")
     result.commit("an ssh exit 255 without the cwd marker carries a hint")
 
 

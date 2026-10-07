@@ -4,9 +4,8 @@
 Run by ``deploy/docker/Dockerfile`` from ``/opt/hermes`` after ``apply_ssh_shared_master.py``.
 The applier proves its anchors matched once; this imports the patched modules and proves they
 behave: a shared environment's ``cleanup()`` runs no ``ssh -O exit`` and ``close_master()`` does,
-a probe's ``cleanup()`` still closes its private master, eviction calls ``close_master()`` after
-``cleanup()`` even when ``cleanup()`` raises, and the terminal result carries the hint only for an ssh exit 255 without the cwd
-marker.
+a probe's ``cleanup()`` still closes its private master, and the terminal result carries the hint
+only for an ssh exit 255 without the cwd marker.
 
 Usage::
 
@@ -77,44 +76,6 @@ def check_ssh(ssh) -> None:
                 fail("a probe's cleanup() no longer closes its private master")
 
 
-def check_lifecycle(lifecycle, terminal_tool) -> None:
-    calls: list[str] = []
-
-    class Env:
-        def cleanup(self):
-            calls.append("cleanup")
-
-        def close_master(self):
-            calls.append("close_master")
-
-    task = "verify-ssh-shared-master"
-    with terminal_tool._env_lock:
-        terminal_tool._active_environments[task] = Env()
-    try:
-        lifecycle._evict_environment_for_task(task)
-    finally:
-        with terminal_tool._env_lock:
-            terminal_tool._active_environments.pop(task, None)
-    if calls != ["cleanup", "close_master"]:
-        fail(f"eviction called {calls}, expected cleanup then close_master")
-
-    class RaisingEnv(Env):
-        def cleanup(self):
-            calls.append("cleanup")
-            raise RuntimeError("sync_back failed")
-
-    calls.clear()
-    with terminal_tool._env_lock:
-        terminal_tool._active_environments[task] = RaisingEnv()
-    try:
-        lifecycle._evict_environment_for_task(task)
-    finally:
-        with terminal_tool._env_lock:
-            terminal_tool._active_environments.pop(task, None)
-    if calls != ["cleanup", "close_master"]:
-        fail(f"eviction with a raising cleanup() called {calls}, expected cleanup then close_master")
-
-
 def check_result(result_mod) -> None:
     def hint(res: dict, env_type: str = "ssh") -> str | None:
         out = result_mod.finalize_foreground_result(
@@ -141,25 +102,21 @@ def check_result(result_mod) -> None:
 
 
 def main() -> int:
-    for rel in ("tools/environments/ssh.py", "tools/terminal_tool_lifecycle.py", "tools/terminal_tool_result.py"):
+    for rel in ("tools/environments/ssh.py", "tools/terminal_tool_result.py"):
         path = HERMES / rel
         if not path.is_file() or MARKER not in path.read_text(encoding="utf-8"):
             fail(f"{rel} does not carry the patch marker")
     ssh = _import("tools.environments.ssh")
-    lifecycle = _import("tools.terminal_tool_lifecycle")
-    terminal_tool = _import("tools.terminal_tool")
     result_mod = _import("tools.terminal_tool_result")
     if ssh is not None:
         check_ssh(ssh)
-    if lifecycle is not None and terminal_tool is not None:
-        check_lifecycle(lifecycle, terminal_tool)
     if result_mod is not None:
         check_result(result_mod)
     if FAILURES:
         for msg in FAILURES:
             print(f"verify_ssh_shared_master: {msg}", file=sys.stderr)
         return 1
-    print("verify_ssh_shared_master: ok (cleanup leaves the shared master; close_master, eviction and the 255 hint behave)")
+    print("verify_ssh_shared_master: ok (cleanup leaves the shared master; close_master and the 255 hint behave)")
     return 0
 
 
