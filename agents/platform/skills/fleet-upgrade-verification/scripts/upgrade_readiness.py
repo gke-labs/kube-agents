@@ -167,11 +167,20 @@ BACKEND_NO_ENDPOINTS = "Service {service} has no ready endpoints on port {port}"
 # (`pkg/controller/garbagecollector` removes it after its Node is gone, and an orphan stalls
 # nothing); PersistentVolumeClaims (a replacement pod reuses its bound claim).
 # `namespaceSelector`, `objectSelector` and `matchConditions` are not evaluated: a webhook
-# they narrow is still reported as able to match, which errs toward naming it.
+# they narrow is still reported as able to match, which errs toward naming it. `apiVersions`
+# is evaluated, against the served version on each row (`VERSION_V1` below).
 SCOPE_NAMESPACED = "Namespaced"
 SCOPE_CLUSTER = "Cluster"
 SCOPE_ANY = "*"
 WILDCARD = "*"
+# The version the API server serves each write at, carried on its row: the matcher reads a
+# rule's `apiVersions` as the API server does (`*` or the request's version), so a rule pinned
+# to a version the server no longer serves (`policy/v1beta1`, `certificates.k8s.io/v1beta1`,
+# `storage.k8s.io/v1beta1`) matches nothing and is an outage, not a blocker. Every write on
+# the list is served at `v1` alone on any GKE version in support; under the default
+# `matchPolicy: Equivalent` a rule naming another served version of the same resource would
+# also match, and no resource here has one.
+VERSION_V1 = "v1"
 GROUP_CORE = ""
 GROUP_POLICY = "policy"
 GROUP_COORDINATION = "coordination.k8s.io"
@@ -185,19 +194,19 @@ OP_DELETE = "DELETE"
 # cannot (`pkg/controller/disruption` recomputes it afterwards); the old pod's terminal
 # status and then its deletion, both by the kubelet's status manager (`pkg/kubelet/status`).
 UPGRADE_PATH_DRAIN = (
-    (GROUP_CORE, "pods/eviction", OP_CREATE, SCOPE_NAMESPACED),
-    (GROUP_POLICY, "poddisruptionbudgets/status", OP_UPDATE, SCOPE_NAMESPACED),
-    (GROUP_CORE, "pods/status", OP_UPDATE, SCOPE_NAMESPACED),
-    (GROUP_CORE, "pods", OP_DELETE, SCOPE_NAMESPACED),
+    (GROUP_CORE, VERSION_V1, "pods/eviction", OP_CREATE, SCOPE_NAMESPACED),
+    (GROUP_POLICY, VERSION_V1, "poddisruptionbudgets/status", OP_UPDATE, SCOPE_NAMESPACED),
+    (GROUP_CORE, VERSION_V1, "pods/status", OP_UPDATE, SCOPE_NAMESPACED),
+    (GROUP_CORE, VERSION_V1, "pods", OP_DELETE, SCOPE_NAMESPACED),
 )
 # The replacement pods. Created by their controllers (`pkg/controller/replicaset`, and
 # `pkg/controller/daemon` for the new node's system pods), placed by the scheduler's
 # binding (`pkg/scheduler`), and started only once the kubelet has a token for each
 # projected service-account volume (`pkg/kubelet/token`).
 UPGRADE_PATH_REPLACEMENT_PODS = (
-    (GROUP_CORE, "pods", OP_CREATE, SCOPE_NAMESPACED),
-    (GROUP_CORE, "pods/binding", OP_CREATE, SCOPE_NAMESPACED),
-    (GROUP_CORE, "serviceaccounts/token", OP_CREATE, SCOPE_NAMESPACED),
+    (GROUP_CORE, VERSION_V1, "pods", OP_CREATE, SCOPE_NAMESPACED),
+    (GROUP_CORE, VERSION_V1, "pods/binding", OP_CREATE, SCOPE_NAMESPACED),
+    (GROUP_CORE, VERSION_V1, "serviceaccounts/token", OP_CREATE, SCOPE_NAMESPACED),
 )
 # The nodes. The new one registers and reports status (`pkg/kubelet/kubelet_node_status.go`;
 # the attach-detach controller writes `volumesAttached` into the same status,
@@ -210,12 +219,12 @@ UPGRADE_PATH_REPLACEMENT_PODS = (
 # `k8s.io/component-helpers/apimachinery/lease`) is what keeps the node Ready between
 # status reports.
 UPGRADE_PATH_NODES = (
-    (GROUP_CORE, "nodes", OP_CREATE, SCOPE_CLUSTER),
-    (GROUP_CORE, "nodes", OP_UPDATE, SCOPE_CLUSTER),
-    (GROUP_CORE, "nodes/status", OP_UPDATE, SCOPE_CLUSTER),
-    (GROUP_CORE, "nodes", OP_DELETE, SCOPE_CLUSTER),
-    (GROUP_COORDINATION, "leases", OP_CREATE, SCOPE_NAMESPACED),
-    (GROUP_COORDINATION, "leases", OP_UPDATE, SCOPE_NAMESPACED),
+    (GROUP_CORE, VERSION_V1, "nodes", OP_CREATE, SCOPE_CLUSTER),
+    (GROUP_CORE, VERSION_V1, "nodes", OP_UPDATE, SCOPE_CLUSTER),
+    (GROUP_CORE, VERSION_V1, "nodes/status", OP_UPDATE, SCOPE_CLUSTER),
+    (GROUP_CORE, VERSION_V1, "nodes", OP_DELETE, SCOPE_CLUSTER),
+    (GROUP_COORDINATION, VERSION_V1, "leases", OP_CREATE, SCOPE_NAMESPACED),
+    (GROUP_COORDINATION, VERSION_V1, "leases", OP_UPDATE, SCOPE_NAMESPACED),
 )
 # The new kubelet's identity. It files a certificate signing request to bootstrap its
 # client certificate (`pkg/kubelet/certificate/bootstrap`); the approver writes the
@@ -223,9 +232,9 @@ UPGRADE_PATH_NODES = (
 # `status` subresource (`pkg/controller/certificates/signer`). An unsigned request leaves
 # the node without a client certificate.
 UPGRADE_PATH_KUBELET_IDENTITY = (
-    (GROUP_CERTIFICATES, "certificatesigningrequests", OP_CREATE, SCOPE_CLUSTER),
-    (GROUP_CERTIFICATES, "certificatesigningrequests/approval", OP_UPDATE, SCOPE_CLUSTER),
-    (GROUP_CERTIFICATES, "certificatesigningrequests/status", OP_UPDATE, SCOPE_CLUSTER),
+    (GROUP_CERTIFICATES, VERSION_V1, "certificatesigningrequests", OP_CREATE, SCOPE_CLUSTER),
+    (GROUP_CERTIFICATES, VERSION_V1, "certificatesigningrequests/approval", OP_UPDATE, SCOPE_CLUSTER),
+    (GROUP_CERTIFICATES, VERSION_V1, "certificatesigningrequests/status", OP_UPDATE, SCOPE_CLUSTER),
 )
 # A replacement pod's persistent disk. The kubelet creates its CSINode when it starts and
 # holds its Ready condition on the write, then updates it as each CSI driver registers
@@ -237,13 +246,13 @@ UPGRADE_PATH_KUBELET_IDENTITY = (
 # `pkg/controller/csi_handler.go`) writes its finalizer on the attachment and on the
 # PersistentVolume before it attaches, then `attached: true` into the attachment's status.
 UPGRADE_PATH_STORAGE = (
-    (GROUP_STORAGE, "csinodes", OP_CREATE, SCOPE_CLUSTER),
-    (GROUP_STORAGE, "csinodes", OP_UPDATE, SCOPE_CLUSTER),
-    (GROUP_STORAGE, "volumeattachments", OP_CREATE, SCOPE_CLUSTER),
-    (GROUP_STORAGE, "volumeattachments", OP_UPDATE, SCOPE_CLUSTER),
-    (GROUP_STORAGE, "volumeattachments/status", OP_UPDATE, SCOPE_CLUSTER),
-    (GROUP_STORAGE, "volumeattachments", OP_DELETE, SCOPE_CLUSTER),
-    (GROUP_CORE, "persistentvolumes", OP_UPDATE, SCOPE_CLUSTER),
+    (GROUP_STORAGE, VERSION_V1, "csinodes", OP_CREATE, SCOPE_CLUSTER),
+    (GROUP_STORAGE, VERSION_V1, "csinodes", OP_UPDATE, SCOPE_CLUSTER),
+    (GROUP_STORAGE, VERSION_V1, "volumeattachments", OP_CREATE, SCOPE_CLUSTER),
+    (GROUP_STORAGE, VERSION_V1, "volumeattachments", OP_UPDATE, SCOPE_CLUSTER),
+    (GROUP_STORAGE, VERSION_V1, "volumeattachments/status", OP_UPDATE, SCOPE_CLUSTER),
+    (GROUP_STORAGE, VERSION_V1, "volumeattachments", OP_DELETE, SCOPE_CLUSTER),
+    (GROUP_CORE, VERSION_V1, "persistentvolumes", OP_UPDATE, SCOPE_CLUSTER),
 )
 UPGRADE_PATH_TARGETS = UPGRADE_PATH_DRAIN + UPGRADE_PATH_REPLACEMENT_PODS + UPGRADE_PATH_NODES + UPGRADE_PATH_KUBELET_IDENTITY + UPGRADE_PATH_STORAGE
 UPGRADE_PATH_LABEL = "{operation} {resource}"
@@ -258,6 +267,9 @@ WEBHOOK_OUTAGE_MATCHES = "none of the operations this rule reads as the upgrade'
 RULE_FORMAT = "{operations} {resources}"
 RULE_GROUP_FORMAT = "{rule} in {groups}"
 RULE_CORE_GROUP_NAME = "core"
+# A rule's `apiVersions` is rendered only when it pins one (anything but `*` alone): a cell
+# that names a path write at a version the server does not serve then says why it is an outage.
+RULE_VERSIONS_FORMAT = "{rule} at {versions}"
 RULE_OPERATION_JOIN = "/"
 RULE_RESOURCE_JOIN = ","
 RULE_NONE = "no rules"
@@ -791,7 +803,7 @@ def _resource_matches(spec: str, target: str) -> bool:
 def upgrade_path_matches(hook: dict) -> list[str]:
     """The operations a node upgrade needs that this webhook's rules can match, as labels."""
     matched = []
-    for group, resource, operation, scope in UPGRADE_PATH_TARGETS:
+    for group, version, resource, operation, scope in UPGRADE_PATH_TARGETS:
         for rule in hook.get("rules") or []:
             if not isinstance(rule, dict):
                 continue
@@ -799,6 +811,8 @@ def upgrade_path_matches(hook: dict) -> list[str]:
             if rule_scope not in (SCOPE_ANY, scope):
                 continue
             if not ({WILDCARD, group} & set(rule.get("apiGroups") or [])):
+                continue
+            if not ({WILDCARD, version} & set(rule.get("apiVersions") or [])):
                 continue
             if not ({WILDCARD, operation} & set(rule.get("operations") or [])):
                 continue
@@ -856,8 +870,9 @@ def grade_webhooks(configs: list[dict], services: list[dict], slices: list[dict]
 
 
 def describe_rules(hook: dict) -> list[str]:
-    """Each of the webhook's rules as `OP/OP resource,resource[ in group,group]`, so a cell
-    that says the webhook is outside the upgrade's path also says what it does match."""
+    """Each of the webhook's rules as `OP/OP resource,resource[ in group,group][ at version,version]`,
+    so a cell that says the webhook is outside the upgrade's path also says what it does
+    match, and at which versions when the rule pins them."""
     out = []
     for rule in hook.get("rules") or []:
         if not isinstance(rule, dict):
@@ -868,6 +883,9 @@ def describe_rules(hook: dict) -> list[str]:
         groups = [str(g) for g in rule.get("apiGroups") or []]
         if any(groups):
             text = RULE_GROUP_FORMAT.format(rule=text, groups=RULE_RESOURCE_JOIN.join(g or RULE_CORE_GROUP_NAME for g in groups))
+        versions = [str(v) for v in rule.get("apiVersions") or []]
+        if versions and versions != [WILDCARD]:
+            text = RULE_VERSIONS_FORMAT.format(rule=text, versions=RULE_RESOURCE_JOIN.join(versions))
         out.append(text)
     return out
 

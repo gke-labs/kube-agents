@@ -401,8 +401,8 @@ def webhook_config(kind, name, hooks):
     return {"kind": kind, "metadata": {"name": name}, "webhooks": hooks}
 
 
-def rule(resources, operations=("CREATE",), groups=("",), scope=None):
-    record = {"apiGroups": list(groups), "apiVersions": ["*"], "operations": list(operations), "resources": list(resources)}
+def rule(resources, operations=("CREATE",), groups=("",), scope=None, versions=("*",)):
+    record = {"apiGroups": list(groups), "apiVersions": list(versions), "operations": list(operations), "resources": list(resources)}
     if scope is not None:
         record["scope"] = scope
     return record
@@ -563,40 +563,42 @@ class WebhookScopeTest(unittest.TestCase):
         # The one home of the list; a change here is a change to what the rule grades, and the
         # module's comments carry the source of every row.
         self.assertEqual(r.UPGRADE_PATH_TARGETS, (
-            ("", "pods/eviction", "CREATE", "Namespaced"),
-            ("policy", "poddisruptionbudgets/status", "UPDATE", "Namespaced"),
-            ("", "pods/status", "UPDATE", "Namespaced"),
-            ("", "pods", "DELETE", "Namespaced"),
-            ("", "pods", "CREATE", "Namespaced"),
-            ("", "pods/binding", "CREATE", "Namespaced"),
-            ("", "serviceaccounts/token", "CREATE", "Namespaced"),
-            ("", "nodes", "CREATE", "Cluster"),
-            ("", "nodes", "UPDATE", "Cluster"),
-            ("", "nodes/status", "UPDATE", "Cluster"),
-            ("", "nodes", "DELETE", "Cluster"),
-            ("coordination.k8s.io", "leases", "CREATE", "Namespaced"),
-            ("coordination.k8s.io", "leases", "UPDATE", "Namespaced"),
-            ("certificates.k8s.io", "certificatesigningrequests", "CREATE", "Cluster"),
-            ("certificates.k8s.io", "certificatesigningrequests/approval", "UPDATE", "Cluster"),
-            ("certificates.k8s.io", "certificatesigningrequests/status", "UPDATE", "Cluster"),
-            ("storage.k8s.io", "csinodes", "CREATE", "Cluster"),
-            ("storage.k8s.io", "csinodes", "UPDATE", "Cluster"),
-            ("storage.k8s.io", "volumeattachments", "CREATE", "Cluster"),
-            ("storage.k8s.io", "volumeattachments", "UPDATE", "Cluster"),
-            ("storage.k8s.io", "volumeattachments/status", "UPDATE", "Cluster"),
-            ("storage.k8s.io", "volumeattachments", "DELETE", "Cluster"),
-            ("", "persistentvolumes", "UPDATE", "Cluster"),
+            ("", "v1", "pods/eviction", "CREATE", "Namespaced"),
+            ("policy", "v1", "poddisruptionbudgets/status", "UPDATE", "Namespaced"),
+            ("", "v1", "pods/status", "UPDATE", "Namespaced"),
+            ("", "v1", "pods", "DELETE", "Namespaced"),
+            ("", "v1", "pods", "CREATE", "Namespaced"),
+            ("", "v1", "pods/binding", "CREATE", "Namespaced"),
+            ("", "v1", "serviceaccounts/token", "CREATE", "Namespaced"),
+            ("", "v1", "nodes", "CREATE", "Cluster"),
+            ("", "v1", "nodes", "UPDATE", "Cluster"),
+            ("", "v1", "nodes/status", "UPDATE", "Cluster"),
+            ("", "v1", "nodes", "DELETE", "Cluster"),
+            ("coordination.k8s.io", "v1", "leases", "CREATE", "Namespaced"),
+            ("coordination.k8s.io", "v1", "leases", "UPDATE", "Namespaced"),
+            ("certificates.k8s.io", "v1", "certificatesigningrequests", "CREATE", "Cluster"),
+            ("certificates.k8s.io", "v1", "certificatesigningrequests/approval", "UPDATE", "Cluster"),
+            ("certificates.k8s.io", "v1", "certificatesigningrequests/status", "UPDATE", "Cluster"),
+            ("storage.k8s.io", "v1", "csinodes", "CREATE", "Cluster"),
+            ("storage.k8s.io", "v1", "csinodes", "UPDATE", "Cluster"),
+            ("storage.k8s.io", "v1", "volumeattachments", "CREATE", "Cluster"),
+            ("storage.k8s.io", "v1", "volumeattachments", "UPDATE", "Cluster"),
+            ("storage.k8s.io", "v1", "volumeattachments/status", "UPDATE", "Cluster"),
+            ("storage.k8s.io", "v1", "volumeattachments", "DELETE", "Cluster"),
+            ("", "v1", "persistentvolumes", "UPDATE", "Cluster"),
         ))
         self.assertEqual(len(set(r.UPGRADE_PATH_TARGETS)), len(r.UPGRADE_PATH_TARGETS))
 
     def _each_alone_blocks(self, targets):
         # A dead fail-closed gate whose one rule names exactly one target: blocked on that
-        # target alone, with nothing in the outage bucket.
-        for group, resource, operation, scope in targets:
-            with self.subTest(group=group, resource=resource, operation=operation):
-                graded = grade([hook("one.example.com", [rule([resource], operations=(operation,), groups=(group,), scope=scope)], policy="Fail")])
-                self.assertEqual([f["upgrade_path"] for f in graded["blocking"]], [[f"{operation} {resource}"]])
-                self.assertEqual(graded["outage"], [])
+        # target alone, with nothing in the outage bucket, whether the rule's `apiVersions`
+        # is `*` or the served version on the row.
+        for group, version, resource, operation, scope in targets:
+            for versions in (("*",), (version,)):
+                with self.subTest(group=group, resource=resource, operation=operation, versions=versions):
+                    graded = grade([hook("one.example.com", [rule([resource], operations=(operation,), groups=(group,), scope=scope, versions=versions)], policy="Fail")])
+                    self.assertEqual([f["upgrade_path"] for f in graded["blocking"]], [[f"{operation} {resource}"]])
+                    self.assertEqual(graded["outage"], [])
 
     def test_a_gate_on_each_drain_write_alone_blocks(self):
         self._each_alone_blocks(r.UPGRADE_PATH_DRAIN)
@@ -675,6 +677,32 @@ class WebhookScopeTest(unittest.TestCase):
         self.assertEqual(self._path([rule(["*"], groups=("*",), operations=("*",))]), ["DELETE pods", "CREATE pods", "CREATE nodes", "UPDATE nodes", "DELETE nodes", "CREATE leases", "UPDATE leases", "CREATE certificatesigningrequests", "CREATE csinodes", "UPDATE csinodes", "CREATE volumeattachments", "UPDATE volumeattachments", "DELETE volumeattachments", "UPDATE persistentvolumes"])  # `*` is every resource and no subresource
         self.assertEqual(self._path([rule(["nodes"], scope="Namespaced")]), [])
         self.assertEqual(self._path([rule(["pods"], scope="Cluster")]), [])
+
+    def test_api_versions_must_match_as_the_api_server_reads_them(self):
+        # k8s.io/apiserver's rules.Matcher also requires `apiVersions` to carry `*` or the
+        # request's version. A rule pinned to a version the server does not serve matches
+        # nothing, so a dead gate left behind by pre-1.19 tooling is an outage, not a blocker.
+        self.assertEqual(self._path([rule(["certificatesigningrequests"], groups=("certificates.k8s.io",), versions=("v1beta1",))]), [])
+        self.assertEqual(self._path([rule(["poddisruptionbudgets/status"], operations=("UPDATE",), groups=("policy",), versions=("v1beta1",))]), [])
+        self.assertEqual(self._path([rule(["csinodes", "volumeattachments"], groups=("storage.k8s.io",), versions=("v1beta1",))]), [])
+        self.assertEqual(self._path([rule(["pods"], versions=())]), [])
+        # `*`, the served version alone, or the served version among others, all match.
+        self.assertEqual(self._path([rule(["certificatesigningrequests"], groups=("certificates.k8s.io",), versions=("*",))]), ["CREATE certificatesigningrequests"])
+        self.assertEqual(self._path([rule(["certificatesigningrequests"], groups=("certificates.k8s.io",), versions=("v1",))]), ["CREATE certificatesigningrequests"])
+        self.assertEqual(self._path([rule(["certificatesigningrequests"], groups=("certificates.k8s.io",), versions=("v1beta1", "v1"))]), ["CREATE certificatesigningrequests"])
+        # Every row on the list is served at v1.
+        self.assertEqual({row[1] for row in r.UPGRADE_PATH_TARGETS}, {"v1"})
+
+    def test_a_dead_gate_pinned_to_an_unserved_version_is_an_outage_that_names_the_version(self):
+        graded = grade([hook("stale.example.com", [rule(["certificatesigningrequests"], groups=("certificates.k8s.io",), versions=("v1beta1",))], policy="Fail")])
+        self.assertEqual(graded["blocking"], [])
+        self.assertEqual([f["rules"] for f in graded["outage"]], [["CREATE certificatesigningrequests in certificates.k8s.io at v1beta1"]])
+        self.assertIn("at v1beta1", r.describe_webhook_finding(graded["outage"][0]))
+        # A rule on `*` or on the served version alone carries no version suffix.
+        for versions in (("*",), ("v1",)):
+            with self.subTest(versions=versions):
+                graded = grade([hook("live.example.com", [rule(["certificatesigningrequests"], groups=("certificates.k8s.io",), versions=versions)], policy="Fail")])
+                self.assertEqual([f["rules"] for f in graded["blocking"]], [["CREATE certificatesigningrequests in certificates.k8s.io"]] if versions == ("*",) else [["CREATE certificatesigningrequests in certificates.k8s.io at v1"]])
 
     def test_monitoring_resources_are_outside_the_path(self):
         # GKE's managed Prometheus operator gates its own resources fail-closed.

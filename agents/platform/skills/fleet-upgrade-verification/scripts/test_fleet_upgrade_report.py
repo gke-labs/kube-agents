@@ -1071,7 +1071,7 @@ class ReadinessTest(unittest.TestCase):
         self.assertIn("no exclusion in effect; no maintenance window", host_row)
         self.assertIn("n/a (Autopilot", host_row)
         b_row = next(l for l in lines if l.startswith("| p1 | seeded-b |") and "| blocked |" in l)
-        self.assertIn("seeded-fail-closed-gate/gate.seeded.invalid (ValidatingWebhookConfiguration): failurePolicy Fail and Service seeded-upgrade/nonexistent-admission-gate does not exist; matches none of the operations this rule reads as the upgrade's path (its rules: CREATE configmaps); it fails its own requests now and is reported, not graded", b_row)
+        self.assertIn("seeded-fail-closed-gate/gate.seeded.invalid (ValidatingWebhookConfiguration): failurePolicy Fail and Service seeded-upgrade/nonexistent-admission-gate does not exist; matches none of the operations this rule reads as the upgrade's path (its rules: CREATE configmaps at v1); it fails its own requests now and is reported, not graded", b_row)
         self.assertIn("pod-gate/pods.example.com (ValidatingWebhookConfiguration): failurePolicy Fail and Service gate/pod-hook has no ready endpoints on port 443; matches CREATE pods", host_row)
         self.assertIn("exclusion hold-the-minor-lag (NO_MINOR_UPGRADES) blocks auto-upgrade to 1.35.1-gke.1000 until 2026-12-11T14:35Z", b_row)
         self.assertIn("window daily at 03:00Z for 4h: closed, next opening 2026-09-15T03:00Z", b_row)

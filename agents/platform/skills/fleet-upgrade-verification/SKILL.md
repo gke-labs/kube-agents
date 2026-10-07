@@ -185,10 +185,14 @@ validatingwebhookconfigurations,mutatingwebhookconfigurations,services,endpoints
   what it does match and the cell names it, but it does not grade the member; that list is what
   the rule knows of the upgrade's path, not a proof the upgrade is unaffected, which is why the
   cell names what the webhook does match. Rules are matched on
-  API group, operation, resource (with the API's `*`, `*/*` and `pods/*` semantics) and scope;
-  `namespaceSelector`, `objectSelector` and `matchConditions` are not evaluated, so a webhook they
-  narrow is reported as able to match. The cell names the configuration, the webhook, the reason
-  and what it matches (an outage cell lists the webhook's own rules); each JSON finding carries
+  API group, API version, operation, resource (with the API's `*`, `*/*` and `pods/*` semantics)
+  and scope, as the API server matches them: a rule's `apiVersions` must carry `*` or the version
+  the server serves the write at (`v1` for every write on the list), so a rule pinned to a version
+  the server no longer serves (`policy/v1beta1`, `certificates.k8s.io/v1beta1`) matches nothing and
+  is an outage, not a blocker; `namespaceSelector`, `objectSelector` and `matchConditions` are not
+  evaluated, so a webhook they narrow is reported as able to match. The cell names the
+  configuration, the webhook, the reason and what it matches (an outage cell lists the webhook's
+  own rules, with their `apiVersions` when a rule pins any); each JSON finding carries
   `reason`, `upgrade_path` and `rules`, split into `blocking` and `outage`. A fail-closed webhook with a URL backend is counted in the
   JSON (`url_backends`) and never graded, because nothing read here says whether the URL answers;
   GKE installs two on every cluster. Fail-open webhooks are counted in the JSON (`fail_open`).
