@@ -1234,8 +1234,8 @@ class _TransportError(RuntimeError):
 # a handler that raised will raise again, so those remain graded agent errors.
 # When the server attaches X-Hermes-Failure-Reason, the turn executed; a
 # rate-limit or billing reason is routed to infrastructure on opening turns
-# or delegation status turns, while any other failure reason (or a failure
-# reason on answer turns) is graded without retrying.
+# (including status turns during an opening turn), while any other failure
+# reason (or any failure reason on answer turns) is graded without retrying.
 _RETRYABLE_STATUSES = frozenset({429, 502, 503, 504})
 
 
@@ -1624,6 +1624,7 @@ class KubeAgentsHarness(AgentHarness):
                         timeout=timeout,
                         delegation_timeout=delegation_timeout,
                         poll_interval=poll_interval,
+                        opening_turn=opening_turn,
                     )
                     or session_id
                 )
@@ -1631,6 +1632,8 @@ class KubeAgentsHarness(AgentHarness):
                 # Not AgentResult.errored, and not the delegating turn's
                 # partial result either: see _infra_failure. The wait died in
                 # transport, so this is the run class, not an answer.
+                if not opening_turn:
+                    return AgentResult.errored(str(exc))
                 return _infra_failure(str(exc))
 
         # GitOps cases (GITOPS_RUN_BRANCH set): the agent's answer is a pull
@@ -2271,6 +2274,7 @@ class KubeAgentsHarness(AgentHarness):
         timeout: float,
         delegation_timeout: float,
         poll_interval: float,
+        opening_turn: bool = True,
     ) -> str:
         """Poll the agent until every card it filed settles.
 
@@ -2306,8 +2310,9 @@ class KubeAgentsHarness(AgentHarness):
         Raises:
             _DelegationTransportExhausted: Every retry died without reaching
                 an agent, or a status turn hit an infrastructure limit
-                (rate limit or billing); the run is infrastructure, not a gradable
-                result.
+                (rate limit or billing); on an opening turn the caller classifies
+                the run as infrastructure, while on an answer turn it is an agent error
+                preserving the wake reply.
         """
         # The delegating turn may already have shown a card done, in which case
         # there is nothing to wait on and no reason to sleep a poll interval.

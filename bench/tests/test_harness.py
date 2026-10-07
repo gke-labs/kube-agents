@@ -3460,6 +3460,63 @@ def test_a_fresh_session_replay_answer_turn_500_is_an_agent_error_not_infra(
     assert _archived(scripts)
 
 
+def test_a_fresh_session_replay_answer_turn_502_with_rate_limit_is_an_agent_error_not_infra(
+    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer
+) -> None:
+    """A 502 with rate_limit on a fresh-session answer turn remains an agent error, not infra.
+
+    When session: fresh is requested, the answer turn runs via
+    _execute_fresh_answer(..., opening_turn=False). A 502 carrying
+    X-Hermes-Failure-Reason: rate_limit on request 2 must return an errored
+    result rather than _infra_failure, preserving the wake reply and grading.
+    """
+    scripts: list[str] = []
+    monkeypatch.setattr(harness, "_agent_shell", _fresh_shell(scripts))
+    stub_agent.fail_on = frozenset({2})
+    stub_agent.fail_on_status = 502
+    stub_agent.fail_headers = {"X-Hermes-Failure-Reason": "rate_limit"}
+
+    result = KubeAgentsHarness().run(_FRESH_PROMPT)
+
+    assert result.has_errors()
+    assert harness.INFRA_FAILURE_MARKER not in result.errors[0]
+    assert "HTTP 502" in result.errors[0]
+    assert len(stub_agent.requests) == 2
+    assert result.output == _FINAL_TEXT
+    assert _archived(scripts)
+
+
+def test_a_status_turn_502_with_rate_limit_on_answer_turn_is_an_agent_error_not_infra(
+    monkeypatch: pytest.MonkeyPatch,
+    stub_agent: _StubAgentServer,
+    instant_polls: None,
+    no_cluster_exec: list[str],
+) -> None:
+    """A status turn rate_limit on an answer turn remains an agent error, not infra.
+
+    When a card-wake answer turn dispatches work and a status poll answers 502
+    carrying X-Hermes-Failure-Reason: rate_limit, _await_delegated_work raises
+    _DelegationTransportExhausted. On opening_turn=False, _execute converts
+    this into an errored result without INFRA_FAILURE_MARKER, preserving the
+    wake turn reply and grading.
+    """
+    scripts: list[str] = []
+    monkeypatch.setattr(harness, "_agent_shell", _replay_shell(scripts))
+    stub_agent.turns = [_turn(_text(_FINAL_TEXT)), _create_turn(), _show_turn("done")]
+    stub_agent.fail_on = frozenset({3})
+    stub_agent.fail_on_status = 502
+    stub_agent.fail_headers = {"X-Hermes-Failure-Reason": "rate_limit"}
+
+    result = KubeAgentsHarness().run(_REPLAY_PROMPT)
+
+    assert result.has_errors()
+    assert harness.INFRA_FAILURE_MARKER not in result.errors[0]
+    assert "status turn hit infrastructure failure (rate_limit)" in result.errors[0]
+    assert len(stub_agent.requests) == 3
+    assert result.output == _FINAL_TEXT
+    assert _archived(scripts)
+
+
 def test_a_question_wake_missing_its_answer_errors_without_planting(
     monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer
 ) -> None:
