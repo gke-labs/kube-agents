@@ -1278,8 +1278,9 @@ def test_an_exhausted_retry_is_infrastructure_and_not_an_answer(
 def test_an_agent_side_error_is_still_graded(stub_agent: _StubAgentServer) -> None:
     """A 4xx is the endpoint answering a bad request, so it keeps being graded.
 
-    The INFRA class is for turns that never reached the agent or failed in
-    server/transport before running. Client-side errors (4xx) are not retried,
+    The INFRA class is for runs where no answer can be graded: transport
+    exhausted, or the server reporting a rate limit or billing stop on the
+    opening turn. Client-side errors (4xx) are not retried,
     not marked as infra, and their text still reaches the judge.
     """
     stub_agent.fail_with = 400
@@ -2692,6 +2693,27 @@ def test_status_turns_with_pure_transport_failures_raise_infra(
     assert "status turns failed in transport 3 times running" in result.errors[0]
     assert len(stub_agent.requests) == 4
     assert len(recorded_pf_resets) == 2
+
+
+def test_status_turns_with_consecutive_timeouts_raise_infra(
+    stub_agent: _StubAgentServer, instant_polls: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When status turns fail with timeouts (which are non-retryable transport errors), it raises infra."""
+    stub_agent.turns = [_create_turn(), _show_turn("done")]
+    original_open = harness._OPENER.open
+
+    def mock_open(request: Any, timeout: float = 60.0) -> Any:
+        if len(stub_agent.requests) >= 1:
+            raise TimeoutError("timed out in test")
+        return original_open(request, timeout=timeout)
+
+    monkeypatch.setattr(harness._OPENER, "open", mock_open)
+
+    result = KubeAgentsHarness().run("Find the root cause.")
+
+    assert result.has_errors()
+    assert harness.INFRA_FAILURE_MARKER in result.errors[0]
+    assert "status turns failed in transport 3 times running" in result.errors[0]
 
 
 def test_a_status_turn_502_with_rate_limit_is_infra_without_retrying(

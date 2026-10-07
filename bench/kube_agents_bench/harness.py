@@ -170,13 +170,12 @@ _log = logging.getLogger("kube_agents_bench.harness")
 
 SERVICE_API_PORT = 8642
 
-# Prefix on ``AgentResult.errors[0]`` that marks a run whose transport died on
-# every attempt: the agent tunnel never established, the opening turn never
-# reached the agent, or the delegation wait lost the endpoint on every
-# status-turn retry with cards still outstanding. ``scoring.py`` matches this
-# string on a record's error and classifies the repetition as infrastructure
-# rather than grading it. The literal is duplicated there (importing the
-# harness would drag ``devops_bench`` into the scorer), and ``test_scoring.py``
+# Prefix on ``AgentResult.errors[0]`` that marks a run when the harness
+# recorded a condition under which no answer can be graded: transport exhausted,
+# or the server reporting a provider rate limit or billing stop on the opening turn.
+# ``scoring.py`` matches this string on a record's error and classifies the repetition
+# as infrastructure rather than grading it. The literal is duplicated there (importing
+# the harness would drag ``devops_bench`` into the scorer), and ``test_scoring.py``
 # asserts the two strings agree: change it in both files or in neither.
 INFRA_FAILURE_MARKER = "KUBE_AGENTS_INFRA_FAILURE"
 
@@ -1204,6 +1203,10 @@ class _TransportError(RuntimeError):
 
     ``retryable`` says whether issuing the same request again could plausibly
     succeed. It is False by default so a new raise site has to opt in.
+
+    ``answered`` says whether an agent handler answered the request (an HTTP response
+    outside retryable gateway drops, a classified failure reason, or non-object JSON)
+    as opposed to transport-level loss (timeouts, dropped connections, protocol errors).
     """
 
     def __init__(
@@ -1212,10 +1215,12 @@ class _TransportError(RuntimeError):
         *,
         retryable: bool = False,
         failure_reason: str | None = None,
+        answered: bool = False,
     ) -> None:
         super().__init__(message)
         self.retryable = retryable
         self.failure_reason = failure_reason
+        self.answered = answered
 
 
 # Gateway statuses a proxy in front of the agent emits when the upstream is
@@ -1279,20 +1284,27 @@ def _post_turn(
             exc.headers.get(_FAILURE_REASON_HEADER) if exc.headers else None
         )
         retryable = exc.code in _RETRYABLE_STATUSES and failure_reason is None
+        answered = exc.code not in _RETRYABLE_STATUSES or failure_reason is not None
         raise _TransportError(
             f"HTTP {exc.code} from agent endpoint: {_http_error_detail(exc)}",
             retryable=retryable,
             failure_reason=failure_reason,
+            answered=answered,
         ) from exc
     except (OSError, http.client.HTTPException, ValueError) as exc:
         # Timeouts, resets, a mid-read protocol failure, and a body that is
         # neither UTF-8 nor JSON: transport, not agent, bugs.
         raise _TransportError(
-            f"{type(exc).__name__}: {exc}", retryable=_connection_dropped(exc)
+            f"{type(exc).__name__}: {exc}",
+            retryable=_connection_dropped(exc),
+            answered=False,
         ) from exc
 
     if not isinstance(payload, dict):
-        raise _TransportError(f"agent endpoint returned non-object JSON: {type(payload).__name__}")
+        raise _TransportError(
+            f"agent endpoint returned non-object JSON: {type(payload).__name__}",
+            answered=True,
+        )
     return parse_response(payload), session_id
 
 
@@ -2438,7 +2450,7 @@ class KubeAgentsHarness(AgentHarness):
                                 "port-forward respawn failed before retry: %s", pf_exc
                             )
                     continue
-                if all(e.retryable for e in failures):
+                if all(not e.answered for e in failures):
                     # Every status turn in the streak failed in transport:
                     # classified as infrastructure, not graded. The cards'
                     # on-disk state still has to go (nothing is settled into
@@ -2456,9 +2468,16 @@ class KubeAgentsHarness(AgentHarness):
                 # agent's own failure, so it stays in front of the judge as
                 # before -- recorded, not just logged, which is what stops
                 # devops-bench promoting the partial record.
-                answered = [e for e in failures if not e.retryable]
-                reasons = sorted({(e.failure_reason or "unknown") for e in answered if e.failure_reason is not None})
-                reason_detail = f" ({', '.join(reasons)})" if reasons else ""
+                answered = [e for e in failures if e.answered]
+                with_reasons = [e for e in answered if e.failure_reason is not None]
+                if with_reasons:
+                    reasons = sorted({(e.failure_reason or "unknown") for e in with_reasons})
+                    if len(with_reasons) == len(answered):
+                        reason_detail = f" ({', '.join(reasons)})"
+                    else:
+                        reason_detail = f" ({len(with_reasons)} with {', '.join(reasons)})"
+                else:
+                    reason_detail = ""
                 report = (
                     f"status turns failed with {len(answered)} answered{reason_detail}, "
                     f"{len(failures) - len(answered)} in transport; "
