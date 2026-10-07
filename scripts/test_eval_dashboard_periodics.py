@@ -270,8 +270,8 @@ class AssessTest(unittest.TestCase):
         # reached the projects it failed on is the recovery; one that passed
         # without reaching them is not; one that failed is the current story
         # about the fleet, so the older failure is not news beside it.
-        failed = self.reading(POST, NOW - timedelta(days=2), passed=False, artifact={"summary": {"refused": 1}, "outcomes": {"kube-agents-evals-9": {"outcome": "failed", "detail": "lock"}}})
-        reached = self.reading(DAILY, NOW - timedelta(hours=1), artifact={"summary": {"converged": 35}, "outcomes": {"kube-agents-evals-9": {"outcome": "converged", "detail": ""}}})
+        failed = self.reading(POST, NOW - timedelta(days=2), passed=False, artifact={"fleet_tree": "t1", "summary": {"refused": 1}, "outcomes": {"kube-agents-evals-9": {"outcome": "failed", "detail": "lock"}}})
+        reached = self.reading(DAILY, NOW - timedelta(hours=1), artifact={"fleet_tree": "t1", "summary": {"converged": 35}, "outcomes": {"kube-agents-evals-9": {"outcome": "converged", "detail": ""}}})
         decided = periodics.superseded_jobs({POST.job: failed, DAILY.job: reached})
         # The run the recovery was decided on rides with it: what the clear
         # cites, whether or not the tick that sends it read the daily.
@@ -279,15 +279,24 @@ class AssessTest(unittest.TestCase):
         self.assertEqual(decided, {POST.job: {"build": "100", "recovery": True, "by": by}})
         self.assertEqual(by["build"], "100")
         self.assertEqual(periodics.assess({POST.job: failed, DAILY.job: reached}, NOW, {}, superseded=decided), {})
-        missed = self.reading(DAILY, NOW - timedelta(hours=1), artifact={"summary": {"converged": 34, "not_reached": 1}, "outcomes": {"kube-agents-evals-9": {"outcome": "not_reached", "detail": "busy"}}})
+        # Reached at another fleet tree is no recovery: a daily that applied
+        # evals-9 from the main it started on, before the merge the postsubmit
+        # failed on, says nothing about that merge; neither does a report
+        # with no tree.
+        other_tree = self.reading(DAILY, NOW - timedelta(hours=1), artifact={"fleet_tree": "t0", "summary": {"converged": 35}, "outcomes": {"kube-agents-evals-9": {"outcome": "converged", "detail": ""}}})
+        self.assertEqual(periodics.superseded_jobs({POST.job: failed, DAILY.job: other_tree}), {})
+        no_tree = self.reading(DAILY, NOW - timedelta(hours=1), artifact={"summary": {"converged": 35}, "outcomes": {"kube-agents-evals-9": {"outcome": "converged", "detail": ""}}})
+        self.assertEqual(periodics.superseded_jobs({POST.job: failed, DAILY.job: no_tree}), {})
+        self.assertEqual(periodics.superseded_jobs({POST.job: self.reading(POST, NOW - timedelta(days=2), passed=False, artifact={"outcomes": {"kube-agents-evals-9": {"outcome": "failed", "detail": "lock"}}}), DAILY.job: reached}), {})
+        missed = self.reading(DAILY, NOW - timedelta(hours=1), artifact={"fleet_tree": "t1", "summary": {"converged": 34, "not_reached": 1}, "outcomes": {"kube-agents-evals-9": {"outcome": "not_reached", "detail": "busy"}}})
         self.assertEqual(periodics.superseded_jobs({POST.job: failed, DAILY.job: missed}), {})
         self.assertIn(POST.job, periodics.assess({POST.job: failed, DAILY.job: missed}, NOW, {}, superseded={}))
         # A project a whole pass no longer lists has left the pool (a stray
         # registration removed, as the note's own next step says): dealt
         # with. A pass that is not whole says nothing about it.
-        gone = self.reading(DAILY, NOW - timedelta(hours=1), artifact={"mode": "all", "visited": 1, "mapped": 1, "summary": {"converged": 1}, "outcomes": {"kube-agents-evals-3": {"outcome": "converged", "detail": ""}}})
+        gone = self.reading(DAILY, NOW - timedelta(hours=1), artifact={"fleet_tree": "t1", "mode": "all", "visited": 1, "mapped": 1, "summary": {"converged": 1}, "outcomes": {"kube-agents-evals-3": {"outcome": "converged", "detail": ""}}})
         self.assertEqual(periodics.superseded_jobs({POST.job: failed, DAILY.job: gone})[POST.job]["recovery"], True)
-        partial = self.reading(DAILY, NOW - timedelta(hours=1), artifact={"mode": "all", "visited": 1, "mapped": 2, "summary": {"converged": 1}, "outcomes": {"kube-agents-evals-3": {"outcome": "converged", "detail": ""}}})
+        partial = self.reading(DAILY, NOW - timedelta(hours=1), artifact={"fleet_tree": "t1", "mode": "all", "visited": 1, "mapped": 2, "summary": {"converged": 1}, "outcomes": {"kube-agents-evals-3": {"outcome": "converged", "detail": ""}}})
         self.assertEqual(periodics.superseded_jobs({POST.job: failed, DAILY.job: partial}), {})
         # A failed build whose report is unreadable names no project because
         # nothing can be read: no later pass recovers it, a later failed
@@ -301,7 +310,7 @@ class AssessTest(unittest.TestCase):
         self.assertEqual(decided, {POST.job: {"build": "100", "recovery": False}})
         notes = periodics.assess({POST.job: failed, DAILY.job: daily_failed}, NOW, {}, superseded=decided)
         self.assertEqual(sorted(notes), [DAILY.job], "the daily's own note is the current story")
-        earlier_daily = self.reading(DAILY, NOW - timedelta(days=3), artifact={"outcomes": {"kube-agents-evals-9": {"outcome": "converged", "detail": ""}}})
+        earlier_daily = self.reading(DAILY, NOW - timedelta(days=3), artifact={"fleet_tree": "t1", "outcomes": {"kube-agents-evals-9": {"outcome": "converged", "detail": ""}}})
         self.assertEqual(periodics.superseded_jobs({POST.job: failed, DAILY.job: earlier_daily}), {})
         self.assertEqual(periodics.superseded_jobs({POST.job: failed}), {})
         # Sticky for the same failed build: a tick blind to the daily, or a

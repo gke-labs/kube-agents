@@ -35,11 +35,13 @@ summary), under $ARTIFACTS when Prow sets it, for the CI health bot
 """
 
 import argparse
+import atexit
 import collections
 import json
 import os
 import pathlib
 import re
+import shutil
 import signal
 import subprocess
 import sys
@@ -63,6 +65,14 @@ TOFU = "tofu"
 PLAN_FILE = "reconcile.tfplan"
 # Non-interactive, and tofu's own retries rather than a prompt on a held lock.
 TOFU_ENV = {"TF_IN_AUTOMATION": "1", "TF_INPUT": "0"}
+# `init` records the backend it was given in the data dir and `plan` and
+# `apply` read it back, so workers sharing bench/tf/fleet/.terraform would
+# bind one project's plan to another's state: one data dir per project, in
+# its temp dir. The providers come from one cache per run, which only one
+# `init` at a time may write (the cache is not safe under concurrent inits).
+TOFU_DATA_DIR = ".terraform"
+_INIT_LOCK = threading.Lock()
+_PLUGIN_CACHE = []
 # `plan -detailed-exitcode`: 0 nothing to do, 2 changes planned, 1 an error.
 PLAN_NO_CHANGES = 0
 PLAN_HAS_CHANGES = 2
@@ -238,7 +248,22 @@ def visited_count(outcomes, run=None):
     )
 
 
-def tofu_runner(argv, cwd=None, timeout=None, **_):
+def _plugin_cache():
+    """The run's provider cache directory, made on first use and removed at exit."""
+    with _INIT_LOCK:
+        if not _PLUGIN_CACHE:
+            path = tempfile.mkdtemp(prefix="fleet-reconcile-providers-")
+            atexit.register(shutil.rmtree, path, ignore_errors=True)
+            _PLUGIN_CACHE.append(path)
+        return _PLUGIN_CACHE[0]
+
+
+def _project_env(tmp):
+    """The tofu environment for one project: its own data dir, the run's provider cache."""
+    return {"TF_DATA_DIR": os.path.join(tmp, TOFU_DATA_DIR), "TF_PLUGIN_CACHE_DIR": _plugin_cache()}
+
+
+def tofu_runner(argv, cwd=None, timeout=None, env=None, **_):
     """subprocess.run for tofu, with a graceful stop.
 
     A killed tofu leaves the state locked and the next run failing on the lock,
@@ -247,7 +272,9 @@ def tofu_runner(argv, cwd=None, timeout=None, **_):
     and tofu sees one interrupt, the forwarded one: a second interrupt makes
     tofu exit at once, mid-operation.
     """
-    env = dict(os.environ, **TOFU_ENV)
+    merged = dict(os.environ)
+    merged.update(TOFU_ENV)
+    merged.update(env or {})
     proc = None
     try:
         # A termination while the child is being started would leave it
@@ -256,7 +283,7 @@ def tofu_runner(argv, cwd=None, timeout=None, **_):
         boskos_pool._hold_signals(True)
         try:
             proc = subprocess.Popen(
-                argv, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True
+                argv, cwd=cwd, env=merged, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True
             )
             # A termination whose forward ran before this registration missed
             # the child; it gets its one interrupt here, and exits on it
@@ -384,14 +411,14 @@ class TerminatedBeforeTofu(boskos_pool.Terminated):
         self.step = step
 
 
-def _tofu(args, runner, deadline, ok=(0,)):
+def _tofu(args, runner, deadline, ok=(0,), env=None):
     # A worker between two steps, or just out of its acquire, when the
     # termination landed: the forward reached only the children alive then,
     # so the next child is simply not started.
     if terminating():
         raise TerminatedBeforeTofu(args[0])
     timeout = max(1, deadline - clock())
-    result = runner([TOFU] + list(args), cwd=str(FLEET_DIR), timeout=timeout, capture_output=True, text=True)
+    result = runner([TOFU] + list(args), cwd=str(FLEET_DIR), env=env, timeout=timeout, capture_output=True, text=True)
     if result.returncode not in ok:
         raise ReconcileError("tofu %s exited %d: %s" % (args[0], result.returncode, _tail(result.stderr or result.stdout)))
     return result
@@ -564,22 +591,25 @@ def reconcile_project(project, runner=tofu_runner, dry_run=False, timeout=PROJEC
     allowed = _allowed(allow)
     with tempfile.TemporaryDirectory(prefix="fleet-reconcile-") as tmp:
         plan_path = os.path.join(tmp, PLAN_FILE)
+        env = _project_env(tmp)
         try:
-            _tofu(
-                [
-                    "init",
-                    "-reconfigure",
-                    # The committed lock file chooses the providers; a run
-                    # that could rewrite it would adopt a release unread.
-                    "-lockfile=readonly",
-                    "-input=false",
-                    "-no-color",
-                    "-backend-config=bucket=%s" % STATE_BUCKET_TEMPLATE.format(project=project),
-                    "-backend-config=prefix=%s" % STATE_PREFIX,
-                ],
-                runner,
-                deadline,
-            )
+            with _INIT_LOCK:
+                _tofu(
+                    [
+                        "init",
+                        "-reconfigure",
+                        # The committed lock file chooses the providers; a run
+                        # that could rewrite it would adopt a release unread.
+                        "-lockfile=readonly",
+                        "-input=false",
+                        "-no-color",
+                        "-backend-config=bucket=%s" % STATE_BUCKET_TEMPLATE.format(project=project),
+                        "-backend-config=prefix=%s" % STATE_PREFIX,
+                    ],
+                    runner,
+                    deadline,
+                    env=env,
+                )
             planned = _tofu(
                 [
                     "plan",
@@ -592,12 +622,13 @@ def reconcile_project(project, runner=tofu_runner, dry_run=False, timeout=PROJEC
                 runner,
                 deadline,
                 ok=(PLAN_NO_CHANGES, PLAN_HAS_CHANGES),
+                env=env,
             )
             if planned.returncode == PLAN_NO_CHANGES:
                 if extras is not None:
                     extras["allowlist_unused"] = unused_allowlist(allow, [])
                 return OUTCOME_UNCHANGED, "nothing to apply"
-            shown = _tofu(["show", "-json", plan_path], runner, deadline)
+            shown = _tofu(["show", "-json", plan_path], runner, deadline, env=env)
             changes = plan_changes(shown.stdout)
             if extras is not None:
                 extras["allowlist_unused"] = unused_allowlist(allow, changes)
@@ -609,7 +640,7 @@ def reconcile_project(project, runner=tofu_runner, dry_run=False, timeout=PROJEC
             if dry_run:
                 listed = ", ".join("%s %s" % ("+".join(c.actions), c.address) for c in changes)
                 return OUTCOME_PLANNED, "%s: %s" % (REASON_RESTAMP if restamp else summary, listed)
-            _tofu(["apply", "-input=false", "-no-color", "-auto-approve", plan_path], runner, deadline)
+            _tofu(["apply", "-input=false", "-no-color", "-auto-approve", plan_path], runner, deadline, env=env)
             if restamp:
                 return OUTCOME_CONVERGED, REASON_RESTAMP
             return OUTCOME_APPLIED, summary

@@ -1763,6 +1763,45 @@ class WorkersTest(unittest.TestCase):
         self.assertEqual(sorted(boskos.released), [P7, P8])
         self.assertEqual({p: o for p, (o, _) in outcomes.items()}, {P7: reconcile.OUTCOME_APPLIED, P8: reconcile.OUTCOME_APPLIED})
 
+    def test_workers_never_share_a_tofu_data_dir_and_their_inits_do_not_overlap(self):
+        # `init` records the backend it was given in the data dir, and `plan`
+        # and `apply` read it back: two workers sharing bench/tf/fleet's
+        # .terraform would bind one project's plan to the other's state. One
+        # data dir per project, under its own temp dir; the providers come
+        # from one cache per run, which only serialised inits may write.
+        calls, inits, lock = [], [], threading.Lock()
+
+        def tofu(argv, env=None, **_):
+            env = env or {}
+            with lock:
+                calls.append((argv[1], env.get("TF_DATA_DIR"), env.get("TF_PLUGIN_CACHE_DIR")))
+            if argv[1] == "init":
+                started = time.monotonic()
+                time.sleep(0.2)
+                with lock:
+                    inits.append((started, time.monotonic()))
+            if argv[1] == "plan":
+                return subprocess.CompletedProcess(argv, reconcile.PLAN_HAS_CHANGES, "", "")
+            if argv[1] == "show":
+                return subprocess.CompletedProcess(argv, 0, UPDATE_ONLY, "")
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+        boskos = _Boskos(free=[P7, P8])
+        with mock.patch.object(boskos_pool.urllib.request, "urlopen", boskos):
+            outcomes = reconcile.reconcile_pool(BOSKOS, OWNER, runner=tofu, known=KNOWN, run=reconcile.Run(workers=2))
+        self.assertEqual({p: o for p, (o, _) in outcomes.items()}, {P7: reconcile.OUTCOME_APPLIED, P8: reconcile.OUTCOME_APPLIED})
+        self.assertEqual([verb for verb, *_ in calls].count("init"), 2)
+        data_dirs = {data_dir for _, data_dir, _ in calls}
+        self.assertEqual(len(data_dirs), 2, "one data dir per project, on every call: %r" % calls)
+        self.assertNotIn(None, data_dirs)
+        for data_dir in data_dirs:
+            self.assertFalse(pathlib.Path(data_dir).is_relative_to(reconcile.FLEET_DIR), data_dir)
+            self.assertEqual(sorted(verb for verb, d, _ in calls if d == data_dir), ["apply", "init", "plan", "show"], "a project's four steps share its data dir")
+        self.assertEqual(len({cache for _, _, cache in calls}), 1, "one provider cache for the run")
+        self.assertNotIn(None, {cache for _, _, cache in calls})
+        (a0, a1), (b0, b1) = sorted(inits)
+        self.assertLessEqual(a1, b0, "the second init started before the first ended")
+
     def test_a_child_is_interrupted_once_whichever_side_of_the_forward_it_registered_on(self):
         # Registered before the forward: the snapshot carries it, and the
         # registration says "not missed". Registered after: the snapshot did
@@ -1956,23 +1995,27 @@ class WorkersTest(unittest.TestCase):
         self.assertEqual(calls, [], "no child was spawned")
 
     def test_a_worker_between_steps_when_the_termination_lands_records_interrupted_and_plans_nothing(self):
-        # P7 is mid-apply; P8 is still in its init when the signal fires. P8
-        # must come back interrupted with no plan run, and both released.
+        # Inits are serialised, so whichever project inits first is mid-apply
+        # while the other is still in its init when the signal fires. The
+        # late one must come back interrupted with no plan run, and both
+        # released.
         started = threading.Barrier(3)
         verbs = {P7: [], P8: []}
+        order = []
 
         def tofu(argv, **_):
             project = next(a.split("=", 2)[2].removesuffix("-tf-state") for a in argv if a.startswith("-backend-config=bucket=")) if argv[1] == "init" else tofu.current.get(threading.get_ident())
             if argv[1] == "init":
                 tofu.current[threading.get_ident()] = project
+                order.append(project)
             verbs[project].append(argv[1])
-            if project == P8 and argv[1] == "init":
+            if argv[1] == "init" and len(order) == 2:
                 started.wait(timeout=5)
                 while not reconcile.terminating():
                     time.sleep(0.02)
                 time.sleep(0.1)
                 return subprocess.CompletedProcess(argv, 0, "", "")
-            if project == P7 and argv[1] == "apply":
+            if argv[1] == "apply":
                 started.wait(timeout=5)
                 while not reconcile.terminating():
                     time.sleep(0.02)
@@ -2000,9 +2043,11 @@ class WorkersTest(unittest.TestCase):
         finally:
             signal.signal(signal.SIGINT, previous)
             reconcile._TERMINATING.clear()
-        self.assertEqual(verbs[P8], ["init"], "P8 ran nothing after the termination")
+        early, late = order
+        self.assertEqual(verbs[late], ["init"], "the late project ran nothing after the termination")
+        self.assertEqual(verbs[early][-1], "apply")
         self.assertEqual({p: o for p, (o, _) in outcomes.items()}, {P7: reconcile.OUTCOME_INTERRUPTED, P8: reconcile.OUTCOME_INTERRUPTED})
-        self.assertIn("nothing is locked", outcomes[P8][1])
+        self.assertIn("nothing is locked", outcomes[late][1])
         self.assertEqual(sorted(boskos.released), [P7, P8])
 
     def test_a_child_started_after_the_termination_landed_is_interrupted_at_once(self):

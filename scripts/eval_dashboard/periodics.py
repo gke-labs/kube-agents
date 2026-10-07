@@ -123,6 +123,7 @@ RECONCILE_OUTCOME_WORDS = {RECONCILE_OUTCOME_NOT_REACHED: "not reached"}
 REPORT_KEY_VISITED = "visited"
 REPORT_KEY_MAPPED = "mapped"
 REPORT_KEY_MODE = "mode"
+REPORT_KEY_FLEET_TREE = "fleet_tree"
 REPORT_MODE_ALL = "all"
 REPORT_KEY_ALLOWLIST_UNUSED = "allowlist_unused"
 # The Prow job names (oss-test-infra, kube-agents-periodics.yaml and
@@ -773,9 +774,10 @@ def _reached(artifact, projects: list[str]) -> bool:
 def _supersession(job: str, readings: dict[str, dict]) -> str | None:
     """How the superseding job's latest build relates to this job's failed
     one: SUPERSEDED_RECOVERY when it passed later having reached every
-    project the failed build named, SUPERSEDED_SILENCE when it failed later
-    (its own note is the current story; nothing recovered), None otherwise.
-    A later pass that never reached them (busy, not reached) is None."""
+    project the failed build named, at the same fleet tree, SUPERSEDED_SILENCE
+    when it failed later (its own note is the current story; nothing
+    recovered), None otherwise. A later pass that never reached them (busy,
+    not reached), or applied another tree, is None."""
     other = SUPERSEDED_BY.get(job)
     if not other:
         return None
@@ -792,7 +794,20 @@ def _supersession(job: str, readings: dict[str, dict]) -> str | None:
         # because nothing can be read, not because nothing failed: a later
         # pass cannot be shown to have reached what it does not name.
         return None
+    tree = _fleet_tree(mine.get(KEY_ARTIFACT))
+    if not tree or tree != _fleet_tree(theirs.get(KEY_ARTIFACT)):
+        # A daily that reached the project at another tree (one it started
+        # from before the merge the failed build applied) proves nothing
+        # about this one; the same tree from main, or the next merge's own
+        # build, does.
+        return None
     return SUPERSEDED_RECOVERY if _reached(theirs.get(KEY_ARTIFACT), _named_failures(mine.get(KEY_ARTIFACT))) else None
+
+
+def _fleet_tree(artifact) -> str | None:
+    """The bench/tf/fleet tree a run applied, from its report; None when it carries none."""
+    tree = artifact.get(REPORT_KEY_FLEET_TREE) if isinstance(artifact, dict) else None
+    return tree if isinstance(tree, str) and tree else None
 
 
 def superseded_jobs(readings: dict[str, dict], carried: dict | None = None) -> dict[str, dict]:

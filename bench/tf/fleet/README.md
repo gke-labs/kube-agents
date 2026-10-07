@@ -51,7 +51,9 @@ entries in `oss-test-infra` run `main` only: a postsubmit on every merge touchin
 directory, and a daily pass at 08:30 UTC (`docs/ci-pool-projects.md` §6.2, which also states
 the rule for a fixture pull request and for proving a branch on one leased project). A hand
 run goes through the script too (`--project <id>`), never `tofu apply` from a branch, and
-never from a laptop while a run holds the project. Its `init` runs with `-lockfile=readonly`, so the
+never from a laptop while a run holds the project. The two recovery replaces below (`seeded_b`'s
+cluster, `inventory_api`) are the exception: the script passes no `-replace`, so they run by hand
+from a `main` checkout, under a lease on the project. Its `init` runs with `-lockfile=readonly`, so the
 providers are the ones `.terraform.lock.hcl` pins; to move them, change `versions.tf` if the major
 changes and run `tofu providers lock -platform=linux_amd64 -platform=darwin_arm64 -platform=darwin_amd64`
 here, and commit the result. Detecting the drift is a separate job, and
