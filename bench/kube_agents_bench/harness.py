@@ -618,6 +618,7 @@ _OPENER = urllib.request.build_opener(_NoRedirect, urllib.request.ProxyHandler({
 
 _SESSION_ID_HEADER = "X-Hermes-Session-Id"
 _FAILURE_REASON_HEADER = "X-Hermes-Failure-Reason"
+_INFRA_FAILURE_REASONS = frozenset({"rate_limit", "billing"})
 
 # The session lookup only refines accounting, so it never inherits the agent's
 # (minutes-long) budget: a hung route would be billed as the agent's latency.
@@ -1197,7 +1198,7 @@ class _TransportError(RuntimeError):
     """A turn that failed at the transport level or returned a server failure reason.
 
     Covers turns that never reached the agent, came back unreadable, or returned
-    an HTTP 5xx. When ``failure_reason`` is populated from ``X-Hermes-Failure-Reason``,
+    an HTTP error. When ``failure_reason`` is populated from ``X-Hermes-Failure-Reason``,
     the turn reached the agent handler and was classified (e.g. rate limit, billing,
     or tool error) rather than failing invisibly in transit.
 
@@ -1209,14 +1210,10 @@ class _TransportError(RuntimeError):
         self,
         message: str,
         *,
-        status_code: int | None = None,
-        headers: Any = None,
         retryable: bool = False,
         failure_reason: str | None = None,
     ) -> None:
         super().__init__(message)
-        self.status_code = status_code
-        self.headers = headers
         self.retryable = retryable
         self.failure_reason = failure_reason
 
@@ -1237,7 +1234,8 @@ class _TransportError(RuntimeError):
 # When the server attaches X-Hermes-Failure-Reason, the turn executed; a
 # rate-limit or billing reason is routed to infrastructure on opening turns
 # (including status turns during an opening turn), while any other failure
-# reason (or any failure reason on answer turns) is graded without retrying.
+# reason (or any failure reason on answer turns) is retried across status polls
+# or graded directly.
 _RETRYABLE_STATUSES = frozenset({429, 502, 503, 504})
 
 
@@ -1283,8 +1281,6 @@ def _post_turn(
         retryable = exc.code in _RETRYABLE_STATUSES and failure_reason is None
         raise _TransportError(
             f"HTTP {exc.code} from agent endpoint: {_http_error_detail(exc)}",
-            status_code=exc.code,
-            headers=exc.headers,
             retryable=retryable,
             failure_reason=failure_reason,
         ) from exc
@@ -1301,13 +1297,14 @@ def _post_turn(
 
 
 def _infra_failure(detail: str) -> AgentResult:
-    """A run whose transport died under it, recorded as infrastructure.
+    """A run where no answer can be graded, recorded as infrastructure.
 
-    ``output`` is deliberately left empty. ``AgentResult.errored`` copies its
-    message into ``output``, which the eval harness writes to results.json as
-    the "Actual Output" the LLM judge grades -- and on build
-    2092339233527173120 that is how a proxy's HTTP 502 error page came to be
-    graded as the agent's answer to ``gpu-stress-test-diagnosis``
+    Covers runs where transport was exhausted or the opening turn reported an
+    infrastructure failure (rate limit or billing). ``output`` is deliberately
+    left empty. ``AgentResult.errored`` copies its message into ``output``, which
+    the eval harness writes to results.json as the "Actual Output" the LLM judge
+    grades -- and on build 2092339233527173120 that is how a proxy's HTTP 502 error
+    page came to be graded as the agent's answer to ``gpu-stress-test-diagnosis``
     ("The Actual Output consists entirely of an HTTP 502 Bad Gateway",
     OutcomeValidity 0.0). A transport failure has to set a run class, not an
     output: the marker on ``errors[0]`` is what ``scoring.py`` reads.
@@ -1580,7 +1577,7 @@ class KubeAgentsHarness(AgentHarness):
                 # errored result directly ahead of any gateway transport retry
                 # so the executed and billed turn remains graded and preserved.
                 if exc.failure_reason is not None:
-                    if exc.failure_reason in ("rate_limit", "billing") and opening_turn:
+                    if exc.failure_reason in _INFRA_FAILURE_REASONS and opening_turn:
                         return _infra_failure(
                             f"opening turn hit infrastructure failure ({exc.failure_reason}): {exc}"
                         )
@@ -1641,8 +1638,9 @@ class KubeAgentsHarness(AgentHarness):
                 )
             except _DelegationTransportExhausted as exc:
                 # Not AgentResult.errored, and not the delegating turn's
-                # partial result either: see _infra_failure. The wait died in
-                # transport, so this is the run class, not an answer.
+                # partial result either: see _infra_failure. No answer can be
+                # graded (transport died or opening turn hit an infrastructure
+                # condition), so this is the run class, not an answer.
                 return _infra_failure(str(exc))
 
         # GitOps cases (GITOPS_RUN_BRANCH set): the agent's answer is a pull
@@ -2352,7 +2350,7 @@ class KubeAgentsHarness(AgentHarness):
         deadline = time.monotonic() + delegation_timeout
         session_id = ""
         silent = 0
-        transport_failures = 0
+        failures: list[_TransportError] = []
         timed_out = True
         # The freshest status seen for each card, from whichever source read
         # it last -- the board or a status turn -- for the deadline report.
@@ -2405,19 +2403,19 @@ class KubeAgentsHarness(AgentHarness):
             try:
                 status_turn, turn_session = turn(poll, min(timeout, remaining))
             except _TransportError as exc:
-                if exc.failure_reason in ("rate_limit", "billing") and opening_turn:
+                if exc.failure_reason in _INFRA_FAILURE_REASONS and opening_turn:
                     _purge_card_state(awaited, _EXEC_TIMEOUT)
                     raise _DelegationTransportExhausted(
                         f"status turn hit infrastructure failure ({exc.failure_reason}): {exc}"
                     ) from exc
-                transport_failures += 1
+                failures.append(exc)
                 _log.warning(
                     "status turn failed (%d/%d): %s",
-                    transport_failures,
+                    len(failures),
                     _MAX_TRANSPORT_FAILURES,
                     exc,
                 )
-                if transport_failures < _MAX_TRANSPORT_FAILURES:
+                if len(failures) < _MAX_TRANSPORT_FAILURES:
                     # Back off one poll interval and ask again: the loop top
                     # re-checks the deadline, so retries cannot outlive it.
                     # A retryable failure usually means the endpoint never
@@ -2440,37 +2438,36 @@ class KubeAgentsHarness(AgentHarness):
                                 "port-forward respawn failed before retry: %s", pf_exc
                             )
                     continue
-                if exc.retryable:
-                    # Classified, not graded: appending here used to leave the
-                    # run validating with the delegation receipt graded as the
-                    # answer -- the exact failure this wait exists to prevent.
-                    # The cards' on-disk state still has to go (nothing is
-                    # settled into a record that is about to be replaced, but
-                    # a rerun must not find this attempt's leavings), then the
-                    # run becomes infrastructure, mirroring the opening turn.
+                if all(e.retryable for e in failures):
+                    # Every status turn in the streak failed in transport:
+                    # classified as infrastructure, not graded. The cards'
+                    # on-disk state still has to go (nothing is settled into
+                    # a record that is about to be replaced, but a rerun must
+                    # not find this attempt's leavings), then the run becomes
+                    # infrastructure, mirroring the opening turn.
                     _purge_card_state(awaited, _EXEC_TIMEOUT)
                     raise _DelegationTransportExhausted(
-                        f"status turns failed in transport {transport_failures} times "
+                        f"status turns failed in transport {len(failures)} times "
                         "running; still waiting on: " + ", ".join(outstanding) + "; "
                         f"tunnel log: {_tail(_pf_log_path(local_port))}"
                     ) from exc
-                # A handler answered every time (a non-429 4xx, a 500,
+                # At least one turn reached a handler (a non-429 4xx, a 500,
                 # non-JSON, or repeated classified failures): that is the
                 # agent's own failure, so it stays in front of the judge as
                 # before -- recorded, not just logged, which is what stops
                 # devops-bench promoting the partial record.
+                answered = [e for e in failures if not e.retryable]
+                reasons = sorted({e.failure_reason for e in answered if e.failure_reason})
+                reason_detail = f" ({', '.join(reasons)})" if reasons else ""
                 report = (
-                    f"status turns failed with answered errors {transport_failures} times running; "
+                    f"status turns failed with answered errors{reason_detail} {len(failures)} times running; "
                     "still waiting on: " + ", ".join(outstanding) + "; "
                     f"tunnel log: {_tail(_pf_log_path(local_port))}"
                 )
-                if not opening_turn and exc.failure_reason in ("rate_limit", "billing"):
-                    if not delivered_results(observed, awaited):
-                        report = f"{DELEGATION_CEILING_MARKER}: {report}"
                 result.errors.append(report)
                 timed_out = False
                 break
-            transport_failures = 0
+            failures.clear()
             # Freshness comes off the turn's *new* calls, not the whole
             # replayed episode. Every earlier board reading comes back on every
             # poll, so the cumulative view would let an agent that has stopped

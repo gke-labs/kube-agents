@@ -201,7 +201,11 @@ class _StubAgentHandler(BaseHTTPRequestHandler):
         headers = {}
         if self.server.session_id:
             headers["X-Hermes-Session-Id"] = self.server.session_id
-        fail_headers = dict(self.server.fail_headers)
+        fail_headers = dict(
+            self.server.fail_headers_by_request.get(
+                len(self.server.requests), self.server.fail_headers
+            )
+        )
         if self.server.session_id:
             fail_headers.setdefault("X-Hermes-Session-Id", self.server.session_id)
         if len(self.server.requests) in self.server.fail_on:
@@ -264,6 +268,7 @@ class _StubAgentServer(ThreadingHTTPServer):
     # dropped-keepalive tests read as they did before 502 became interesting.
     fail_on_status: int = 503
     fail_headers: dict[str, str] = {}
+    fail_headers_by_request: dict[int, dict[str, str]] = {}
     raw_body: bytes | None = None
     session_id: str | None = _SESSION_ID
     session_row: dict[str, Any] = _SESSION_ROW
@@ -284,6 +289,7 @@ def stub_agent(monkeypatch: pytest.MonkeyPatch) -> Generator[_StubAgentServer, N
     server.requests = []
     server.turns = []
     server.fail_headers = {}
+    server.fail_headers_by_request = {}
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     monkeypatch.setenv("AGENT_LOCAL_PORT", str(server.server_address[1]))
@@ -2523,12 +2529,12 @@ def test_status_turns_the_endpoint_answered_still_grade_the_partial_record(
 ) -> None:
     """A 500 storm is the endpoint answering, so it keeps the old behaviour.
 
-    The INFRA class is only for retries that never reached an agent -- no
-    HTTP answer at all, or a 429 refused at the admission door. An
-    endpoint that keeps answering badly is the agent's own failure: the wait
-    still ends, the error is recorded (which stops devops-bench promoting the
-    receipt as a validated deliverable), the first turn's work survives, and
-    the healthy tunnel is left alone.
+    The INFRA class is only for conditions under which no answer can be graded:
+    transport exhausted, or the server reporting a provider rate limit or billing
+    stop on the opening turn. An endpoint that keeps answering badly is the
+    agent's own failure: the wait still ends, the error is recorded (which stops
+    devops-bench promoting the receipt as a validated deliverable), the first
+    turn's work survives, and the healthy tunnel is left alone.
     """
     stub_agent.turns = [_create_turn(), _show_turn("done")]
     stub_agent.fail_on = frozenset(range(2, 2 + harness._MAX_TRANSPORT_FAILURES))
@@ -2576,7 +2582,7 @@ def test_a_status_turn_502_with_persistent_tool_error_is_graded_after_exhaustion
 
     assert result.has_errors()
     assert harness.INFRA_FAILURE_MARKER not in result.errors[0]
-    assert "status turns failed with answered errors 3 times running" in result.errors[0]
+    assert "status turns failed with answered errors (tool_error) 3 times running" in result.errors[0]
     assert len(stub_agent.requests) == 1 + harness._MAX_TRANSPORT_FAILURES
     assert recorded_pf_resets == []
 
@@ -2613,6 +2619,80 @@ def test_a_status_turn_502_with_persistent_empty_failure_reason_is_graded(
     assert "status turns failed with answered errors 3 times running" in result.errors[0]
     assert len(stub_agent.requests) == 1 + harness._MAX_TRANSPORT_FAILURES
     assert recorded_pf_resets == []
+
+
+def test_status_turns_with_mixed_transport_and_answered_failures_settle_and_grade(
+    stub_agent: _StubAgentServer, instant_polls: None, recorded_pf_resets: list[int]
+) -> None:
+    """A mixed streak of transport loss and answered failures settles and grades, rather than raising infra.
+
+    When status turns encounter both retryable transport losses (bare 502) and
+    answered errors (carrying X-Hermes-Failure-Reason), the streak is not pure
+    transport loss. It settles, grades the partial record, and reports what was answered.
+    """
+    stub_agent.turns = [_create_turn(), _show_turn("done")]
+    stub_agent.fail_on = frozenset({2, 3, 4})
+    stub_agent.fail_on_status = 502
+    # Request 2: bare 502 (retryable transport loss)
+    # Request 3: 502 + tool_error (answered)
+    # Request 4: bare 502 (retryable transport loss)
+    stub_agent.fail_headers_by_request = {
+        2: {},
+        3: {"X-Hermes-Failure-Reason": "tool_error"},
+        4: {},
+    }
+
+    result = KubeAgentsHarness().run("Find the root cause.")
+
+    assert result.has_errors()
+    assert harness.INFRA_FAILURE_MARKER not in result.errors[0]
+    assert "status turns failed with answered errors (tool_error) 3 times running" in result.errors[0]
+    assert len(stub_agent.requests) == 4
+    # Tunnel reset occurred on request 2 (retryable), not request 3 (answered) or request 4 (streak limit reached)
+    assert len(recorded_pf_resets) == 1
+
+
+def test_status_turns_with_answered_then_transport_failures_settle_and_grade(
+    stub_agent: _StubAgentServer, instant_polls: None, recorded_pf_resets: list[int]
+) -> None:
+    """Answered failures followed by transport loss settle and grade regardless of order."""
+    stub_agent.turns = [_create_turn(), _show_turn("done")]
+    stub_agent.fail_on = frozenset({2, 3, 4})
+    stub_agent.fail_on_status = 502
+    # Request 2: 502 + tool_error (answered)
+    # Request 3: 502 + tool_error (answered)
+    # Request 4: bare 502 (retryable transport loss)
+    stub_agent.fail_headers_by_request = {
+        2: {"X-Hermes-Failure-Reason": "tool_error"},
+        3: {"X-Hermes-Failure-Reason": "tool_error"},
+        4: {},
+    }
+
+    result = KubeAgentsHarness().run("Find the root cause.")
+
+    assert result.has_errors()
+    assert harness.INFRA_FAILURE_MARKER not in result.errors[0]
+    assert "status turns failed with answered errors (tool_error) 3 times running" in result.errors[0]
+    assert len(stub_agent.requests) == 4
+    assert len(recorded_pf_resets) == 0
+
+
+def test_status_turns_with_pure_transport_failures_raise_infra(
+    stub_agent: _StubAgentServer, instant_polls: None, recorded_pf_resets: list[int]
+) -> None:
+    """When all status turns fail with retryable transport losses, it raises infrastructure failure."""
+    stub_agent.turns = [_create_turn(), _show_turn("done")]
+    stub_agent.fail_on = frozenset({2, 3, 4})
+    stub_agent.fail_on_status = 502
+    stub_agent.fail_headers = {}
+
+    result = KubeAgentsHarness().run("Find the root cause.")
+
+    assert result.has_errors()
+    assert harness.INFRA_FAILURE_MARKER in result.errors[0]
+    assert "status turns failed in transport 3 times running" in result.errors[0]
+    assert len(stub_agent.requests) == 4
+    assert len(recorded_pf_resets) == 2
 
 
 def test_a_status_turn_502_with_rate_limit_is_infra_without_retrying(
@@ -3565,11 +3645,11 @@ def test_a_status_turn_502_with_rate_limit_on_answer_turn_is_an_agent_error_not_
 
     When a card-wake answer turn dispatches work and status polls answer 502
     carrying X-Hermes-Failure-Reason: rate_limit, _await_delegated_work treats it as
-    an answered failure. Once exhausted without delivered results, it attaches
-    DELEGATION_CEILING_MARKER and breaks to _settle without raising
-    _DelegationTransportExhausted. This preserves the answer turn's trajectory,
-    cards, and tokens while keeping the wake turn reply graded without
-    INFRA_FAILURE_MARKER.
+    an answered failure. Once exhausted without delivered results, it breaks to
+    _settle without raising _DelegationTransportExhausted and appends the answered
+    error directly. This preserves the answer turn's trajectory, cards, and tokens
+    while keeping the wake turn reply graded without INFRA_FAILURE_MARKER or
+    DELEGATION_CEILING_MARKER.
     """
     scripts: list[str] = []
     monkeypatch.setattr(harness, "_agent_shell", _replay_shell(scripts))
@@ -3582,8 +3662,8 @@ def test_a_status_turn_502_with_rate_limit_on_answer_turn_is_an_agent_error_not_
 
     assert result.has_errors()
     assert harness.INFRA_FAILURE_MARKER not in result.errors[0]
-    assert "status turns failed with answered errors 3 times running" in result.errors[0]
-    assert harness.DELEGATION_CEILING_MARKER in result.errors[0]
+    assert harness.DELEGATION_CEILING_MARKER not in result.errors[0]
+    assert "status turns failed with answered errors (rate_limit) 3 times running" in result.errors[0]
     assert len(stub_agent.requests) == 5
     assert result.output == _FINAL_TEXT
     assert _archived(scripts)
