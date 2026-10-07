@@ -690,6 +690,26 @@ func (h *recordingHandler) Handle(_ context.Context, r slog.Record) error {
 func (h *recordingHandler) WithAttrs([]slog.Attr) slog.Handler { return h }
 func (h *recordingHandler) WithGroup(string) slog.Handler      { return h }
 
+// has reports whether any record carries the attribute key with value.
+func (h *recordingHandler) has(key, value string) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for _, r := range h.records {
+		found := false
+		r.Attrs(func(a slog.Attr) bool {
+			if a.Key == key && a.Value.String() == value {
+				found = true
+				return false
+			}
+			return true
+		})
+		if found {
+			return true
+		}
+	}
+	return false
+}
+
 // level reports the level of the first record whose message contains sub.
 func (h *recordingHandler) level(sub string) (slog.Level, bool) {
 	h.mu.Lock()
@@ -753,9 +773,15 @@ func TestSlackRefusesAnotherWorkspacesMember(t *testing.T) {
 	// team field is still checked.
 	teamOnly := slackMsg("im", "D4", "UGUEST", "drain node 4", "4.5", "")
 	teamOnly.Message = &slack.Msg{Team: "T0THER"}
+	logs := &recordingHandler{}
+	a.log = slog.New(logs)
 	if _, ok := a.inbound(ctx, teamOnly); ok {
 		t.Error("a message naming another workspace in its team field alone was delivered")
 	}
+	if !logs.has("messageTeam", "T0THER") {
+		t.Error("the refusal's log line does not name the workspace from the team field")
+	}
+	a.log = slog.Default()
 	// A guest's reply in a thread the gateway already holds as a session
 	// thread, which needs no mention, and a guest's file share, take the
 	// same refusal.

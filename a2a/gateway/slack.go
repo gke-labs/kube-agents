@@ -136,8 +136,9 @@ type slackAPI interface {
 // Socket Mode — an outbound websocket, so no inbound endpoint on the
 // cluster and no ingress to secure, the property that made Discord cheap.
 // The sender is whatever user_id Slack's authenticated connection asserted;
-// joining it to a principal (or dropping it) is the session manager's job
-// against the install's mapping table. Never profile.email: whether that
+// admitting it (the allowlist) and attributing it (the install's mapping
+// table when it names the member, the member id otherwise) is the gateway's
+// job (resolveSlackPrincipal). Never profile.email: whether that
 // field is IdP-asserted or user-editable is workspace configuration we do
 // not control, and a user-editable field feeding a principal is an
 // impersonation primitive (gateway design, identity section).
@@ -890,8 +891,13 @@ func (s *SlackAdapter) foreignSender(m *slackevents.MessageEvent) bool {
 		return false
 	}
 	if m.ChannelType == slackChannelTypeIM || slackMentionsBot(m.Text, s.botUserID) {
+		messageTeam := ""
+		if m.Message != nil {
+			messageTeam = m.Message.Team
+		}
+		// Both fields: either can be the one that named the other workspace.
 		s.log.Info("slack: ignoring a message from another workspace's member",
-			"senderTeam", m.UserTeam, "team", s.teamID, "channel", m.Channel)
+			"userTeam", m.UserTeam, "messageTeam", messageTeam, "team", s.teamID, "channel", m.Channel)
 	}
 	return true
 }
