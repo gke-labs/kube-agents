@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"net"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -38,6 +39,13 @@ func startDelegateListener(path string, log *slog.Logger) (<-chan delegateAsk, f
 	}
 	if log == nil {
 		log = slog.Default()
+	}
+	// The socket's directory exists in the pod (/scratch, an emptyDir the
+	// image also creates) but not on a host running the adapter by hand;
+	// created here, private, so a local run keeps working. A listen that
+	// still fails fails the turn (Adapter.Run).
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return nil, nil, err
 	}
 	_ = os.Remove(path)
 	ln, err := net.Listen("unix", path)

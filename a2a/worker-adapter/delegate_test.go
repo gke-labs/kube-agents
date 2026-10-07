@@ -150,6 +150,31 @@ echo '{"type":"result","subtype":"success","result":"normal result"}'
 	}
 }
 
+// TestTheListenerCreatesTheSocketsDirectory: a host running the adapter by
+// hand has no /scratch, and the default socket lives there. The listener
+// creates the missing directory, private, rather than failing the turn.
+// Kept under delegateSock's short root for macOS's sun_path limit.
+func TestTheListenerCreatesTheSocketsDirectory(t *testing.T) {
+	sock := filepath.Join(filepath.Dir(delegateSock(t)), "missing", "d.sock")
+	ch, stop, err := startDelegateListener(sock, nil)
+	if err != nil {
+		t.Fatalf("listen under a directory that did not exist: %v", err)
+	}
+	defer stop()
+	if ch == nil {
+		t.Fatal("no ask channel")
+	}
+	info, err := os.Stat(filepath.Dir(sock))
+	if err != nil || !info.IsDir() || info.Mode().Perm() != 0o700 {
+		t.Fatalf("socket directory: %v %v", info, err)
+	}
+	c, err := net.Dial("unix", sock)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	_ = c.Close()
+}
+
 func TestNoSocketConfiguredMeansNoListener(t *testing.T) {
 	ch, stop, err := startDelegateListener(Config{}.DelegateSocket, nil)
 	if err != nil || ch != nil || stop == nil {
