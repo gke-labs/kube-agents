@@ -40,6 +40,10 @@ type relayState struct {
 	// notices wait for the task's terminal and post after its deliverable:
 	// a delegation refusal follows the turn's "delegated to platform".
 	notices []string
+	// lagSeen is when this gateway first saw the task final on the stream
+	// with its delegate request unrelayed, for a terminal the replay could
+	// not time (relayLagStart). Zero otherwise.
+	lagSeen time.Time
 }
 
 // relayItem is one queued event with the subject it arrived on. The relay's

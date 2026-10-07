@@ -76,10 +76,6 @@ type Task struct {
 	// detail]`), and a reader classifying a failed terminal needs it from
 	// the fold as much as from the live event.
 	FinalMessage *Message
-	// FinalAt is the terminal status-update's envelope timestamp, as its
-	// publisher stamped it; zero before the final event or when the
-	// envelope carried none.
-	FinalAt time.Time
 	// SubmittedMissing reports that the first event folded was not a
 	// `submitted` status-update — assertion 9's observation, the sibling of
 	// PostFinalDropped for assertion 10.
@@ -160,7 +156,6 @@ func FoldTask(taskID string, events []*Envelope) (*Task, error) {
 			task.StatusHistory = append(task.StatusHistory, s.Status.State)
 			if s.Final {
 				task.FinalMessage = s.Status.Message
-				task.FinalAt = env.TS
 			}
 		case KindArtifactUpdate:
 			var a ArtifactUpdate
@@ -258,31 +253,50 @@ func (c *Client) TasksGetOpened(ctx context.Context, addressee, taskID string) (
 // bare envelopes and the live fold and the replay must stay equal (assertion
 // 11); which subject carried the terminal is a fact about the replay.
 func (c *Client) TasksGetAttributed(ctx context.Context, addressee, taskID string) (*Task, string, error) {
-	task, subject, _, err := c.tasksGet(ctx, addressee, taskID)
-	return task, subject, err
+	task, terminal, _, err := c.tasksGet(ctx, addressee, taskID)
+	return task, terminal.subject, err
+}
+
+// TasksGetTerminal is TasksGetAttributed plus when the stream stored the
+// terminal: the JetStream server's timestamp on the message that carried
+// it, zero when the task is not final. Not the envelope's own `ts`, which
+// is the publisher's word and can say anything; a caller timing a window
+// from the terminal needs a clock the publisher does not control. Beside
+// the Task for the same reason as the subject (assertion 11).
+func (c *Client) TasksGetTerminal(ctx context.Context, addressee, taskID string) (*Task, string, time.Time, error) {
+	task, terminal, _, err := c.tasksGet(ctx, addressee, taskID)
+	return task, terminal.subject, terminal.storedAt, err
+}
+
+// replayTerminal is what the replay knows about the event that made the fold
+// final, beyond the envelope: the subject it arrived on and when the server
+// stored it.
+type replayTerminal struct {
+	subject  string
+	storedAt time.Time
 }
 
 // tasksGet's third result is replay's found: true from the moment the
 // ordered consumer was created, which is also when a later error leaves a
 // consumer live for the inactive threshold.
-func (c *Client) tasksGet(ctx context.Context, addressee, taskID string) (*Task, string, bool, error) {
-	events, eventSubjects, found, err := c.replay(ctx, TaskReplaySubjects(addressee, taskID), taskID)
+func (c *Client) tasksGet(ctx context.Context, addressee, taskID string) (*Task, replayTerminal, bool, error) {
+	events, eventMeta, found, err := c.replay(ctx, TaskReplaySubjects(addressee, taskID), taskID)
 	if err != nil {
-		return nil, "", found, err
+		return nil, replayTerminal{}, found, err
 	}
 	if !found {
 		// No events in the retention window: the A2A answer is
 		// TaskNotFound, not an empty Task indistinguishable from a broken
 		// one.
-		return nil, "", false, &A2AError{Code: CodeTaskNotFound, Message: fmt.Sprintf("task %q has no events in the retention window", taskID)}
+		return nil, replayTerminal{}, false, &A2AError{Code: CodeTaskNotFound, Message: fmt.Sprintf("task %q has no events in the retention window", taskID)}
 	}
 	task, err := FoldTask(taskID, events)
 	if err != nil {
-		return nil, "", true, err
+		return nil, replayTerminal{}, true, err
 	}
-	terminalSubject := ""
+	var terminal replayTerminal
 	if task.Final {
-		terminalSubject = finalSubject(events, eventSubjects)
+		terminal = finalEvent(events, eventMeta)
 	}
 	if task.PostFinalDropped > 0 {
 		c.protocolViolations.Add(int64(task.PostFinalDropped))
@@ -301,7 +315,7 @@ func (c *Client) tasksGet(ctx context.Context, addressee, taskID string) (*Task,
 		c.log.Warn("a2a task replayed without its submitted event",
 			"task", taskID, "events", len(events), "opensAt", opensAt)
 	}
-	return task, terminalSubject, true, nil
+	return task, terminal, true, nil
 }
 
 // TaskInReplay replays a task's `…in` subject in stream order — the
@@ -388,7 +402,7 @@ func IsFinalStatus(env *Envelope) bool {
 // inactive threshold, false when the error came before. The subjects share
 // the TASKS stream sequence, so the ordered consumer supplies their total
 // order and the caller needs no merge.
-func (c *Client) replay(ctx context.Context, subjects []string, taskID string) (events []*Envelope, eventSubjects []string, found bool, err error) {
+func (c *Client) replay(ctx context.Context, subjects []string, taskID string) (events []*Envelope, eventMeta []replayTerminal, found bool, err error) {
 	_, js := c.conn()
 	stream, err := js.Stream(ctx, TasksStream)
 	if err != nil {
@@ -436,9 +450,11 @@ func (c *Client) replay(ctx context.Context, subjects []string, taskID string) (
 	// unblocks it, so a canceled context cannot hang the replay.
 	stopWatch := context.AfterFunc(ctx, it.Stop)
 	defer stopWatch()
-	// One subject per envelope, in step with events: FoldTask sees only
-	// envelopes, and the subject of the terminal is what tells an executor's
-	// word from the supervisor's after the fold.
+	// One subject and server timestamp per envelope, in step with events:
+	// FoldTask sees only envelopes, the subject of the terminal is what
+	// tells an executor's word from the supervisor's after the fold, and the
+	// server's timestamp is when the terminal was stored, by a clock the
+	// publisher does not control.
 	for {
 		msg, err := it.Next()
 		if err != nil {
@@ -477,7 +493,7 @@ func (c *Client) replay(ctx context.Context, subjects []string, taskID string) (
 				c.log.Warn("a2a replay folding envelope whose writer disagrees with its subject (advisory)", "subject", subject, "err", aerr)
 			}
 			events = append(events, env)
-			eventSubjects = append(eventSubjects, subject)
+			eventMeta = append(eventMeta, replayTerminal{subject: subject, storedAt: meta.Timestamp})
 		}
 		// Two exits: the snapshotted horizon, or nothing left pending — the
 		// horizon message itself may have aged out between snapshot and
@@ -486,21 +502,22 @@ func (c *Client) replay(ctx context.Context, subjects []string, taskID string) (
 			break
 		}
 	}
-	return events, eventSubjects, true, nil
+	return events, eventMeta, true, nil
 }
 
-// finalSubject is the subject of the event that made the fold final: the
-// first final status-update in stream order, which is the one FoldTask
-// honoured (everything after it is a post-final drop). The envelopes were
-// already parsed once by FoldTask, which rejected any malformed one, so the
-// second parse here cannot fail on anything the fold accepted.
-func finalSubject(events []*Envelope, subjects []string) string {
+// finalEvent is the subject and stored time of the event that made the fold
+// final: the first final status-update in stream order, which is the one
+// FoldTask honoured (everything after it is a post-final drop). The
+// envelopes were already parsed once by FoldTask, which rejected any
+// malformed one, so the second parse here cannot fail on anything the fold
+// accepted.
+func finalEvent(events []*Envelope, meta []replayTerminal) replayTerminal {
 	for i, env := range events {
 		if IsFinalStatus(env) {
-			return subjects[i]
+			return meta[i]
 		}
 	}
-	return ""
+	return replayTerminal{}
 }
 
 // ValidateArtifacts enforces assertion 18: a completed task carries at least

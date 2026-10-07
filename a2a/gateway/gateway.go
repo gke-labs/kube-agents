@@ -923,7 +923,7 @@ func (g *Gateway) healActiveTask(ctx context.Context, rec *SessionRecord) {
 	// switch's default branch, which only a nil or detached active task
 	// reaches; reading it off the ref keeps the heal from depending on that.
 	addressee := rec.AddresseeFor(active.TaskID)
-	task, terminalSubject, err := g.client.TasksGetAttributed(ctx, addressee, active.TaskID)
+	task, terminalSubject, storedAt, err := g.client.TasksGetTerminal(ctx, addressee, active.TaskID)
 	healed := false
 	var healedSource TerminalSource
 	var healedTask *lib.Task // the terminal the heal found, shape (a) only
@@ -941,10 +941,10 @@ func (g *Gateway) healActiveTask(ctx context.Context, rec *SessionRecord) {
 		// (an ack on enqueue and a crash, or a failed end-of-batch write),
 		// and the heal does the relay's work itself rather than leave the
 		// conversation wedged on a turn nothing will release.
-		if !task.FinalAt.IsZero() && time.Since(task.FinalAt) <= g.relayLagGrace() {
+		if since := time.Since(g.relayLagStart(active.TaskID, storedAt, time.Now())); since <= g.relayLagGrace() {
 			g.log.Info("active task's delegate request not relayed yet; leaving it to the relay",
 				"conversation", rec.Key, "taskId", active.TaskID, "state", task.State,
-				"sinceTerminal", time.Since(task.FinalAt).Round(time.Second), "grace", g.relayLagGrace())
+				"sinceTerminal", since.Round(time.Second), "grace", g.relayLagGrace())
 			return
 		}
 		g.log.Info("healing an active task whose delegate request the relay never delivered",
@@ -1069,14 +1069,43 @@ func (g *Gateway) healActiveTask(ctx context.Context, rec *SessionRecord) {
 
 // relayLagGrace is how long after a delegating turn's terminal reached the
 // stream the heal leaves its delegate request to the relay
-// (healActiveTask). It reuses FirstEventGrace (10 minutes by default): both
-// bound how long the gateway waits on a delivery it expects before acting
-// on the stream itself, and a relay that is that far behind on one
-// conversation is as broken as an executor that has not started in that
-// long. One knob, so an install that shortens one for a fast eval loop
-// shortens both.
+// (healActiveTask), timed from relayLagStart. It reuses FirstEventGrace
+// (10 minutes by default): both bound how long the gateway waits on a
+// delivery it expects before acting on the stream itself, and a relay that
+// is that far behind on one conversation is as broken as an executor that
+// has not started in that long. One knob, so an install that shortens one
+// for a fast eval loop shortens both.
 func (g *Gateway) relayLagGrace() time.Duration {
 	return g.cfg.FirstEventGrace
+}
+
+// relayLagStart is when the relay-lag grace for a delegating turn's
+// unrelayed terminal starts, by clocks the gateway trusts: the server's
+// timestamp on the stream message that carried the terminal
+// (lib.Client.TasksGetTerminal), never the envelope's own `ts`, which the
+// session wrote and could set to anything. A stored time after now (a
+// server clock ahead of this one) counts as now, so the grace cannot be
+// stretched past its length. With no stored time, the start is the first
+// time this gateway saw the turn in that state, kept on the task's relay
+// state: the grace still runs, rather than reading as already over.
+func (g *Gateway) relayLagStart(taskID string, storedAt, now time.Time) time.Time {
+	if !storedAt.IsZero() {
+		if storedAt.After(now) {
+			return now
+		}
+		return storedAt
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	rs, ok := g.relays[taskID]
+	if !ok {
+		rs = &relayState{}
+		g.relays[taskID] = rs
+	}
+	if rs.lagSeen.IsZero() {
+		rs.lagSeen = now
+	}
+	return rs.lagSeen
 }
 
 // relayUnrelayedDelegation does for a delegating turn what the relay would

@@ -461,7 +461,7 @@ func TestTheHealLeavesAnUnrelayedDelegationToTheRelay(t *testing.T) {
 // root's end.
 func TestTheHealDoesTheRelaysWorkForALostDelegation(t *testing.T) {
 	const grace = time.Second
-	lost := func(t *testing.T, tweak func(*Config), conv string) (*rig, *fakeSpawner, *recordingObserver, *lib.Envelope) {
+	lost := func(t *testing.T, tweak func(*Config), conv string, forgeTS bool) (*rig, *fakeSpawner, *recordingObserver, *lib.Envelope) {
 		t.Helper()
 		r, spawn, _ := startObservedRig(t, func(c *Config) {
 			armInjectMap(t, c)
@@ -470,7 +470,7 @@ func TestTheHealDoesTheRelaysWorkForALostDelegation(t *testing.T) {
 				tweak(c)
 			}
 		})
-		exec, origin, _ := sessionTurnVia(t, r, spawn, conv, injectBackend, "how is the fleet?")
+		exec, origin, session := sessionTurnVia(t, r, spawn, conv, injectBackend, "how is the fleet?")
 		waitFor(t, "the turn working on the record", func() bool {
 			rec, _ := r.g.reg.Get(context.Background(), conv)
 			return rec != nil && rec.ActiveTask != nil && rec.ActiveTask.TaskID == origin.TaskID
@@ -483,7 +483,25 @@ func TestTheHealDoesTheRelaysWorkForALostDelegation(t *testing.T) {
 			if err := exec.PublishArtifact(context.Background(), delegateArtifact(t, targetPlatform, "report fleet health")); err != nil {
 				t.Fatal(err)
 			}
-			completeTask(t, exec, "delegated to platform")
+			if forgeTS {
+				// The session stamps its own envelopes: a terminal claiming
+				// to be from the far future must not hold the heal off.
+				ctx := context.Background()
+				if err := exec.PublishArtifact(ctx, lib.Artifact{ArtifactID: "a-r", Name: lib.ArtifactResult,
+					Parts: []lib.Part{{Kind: "text", Text: "delegated to platform"}}}); err != nil {
+					t.Fatal(err)
+				}
+				env, err := exec.StatusEnvelope(lib.StateCompleted, true)
+				if err != nil {
+					t.Fatal(err)
+				}
+				env.TS = time.Now().AddDate(100, 0, 0)
+				if err := r.bus.Publish(ctx, lib.TaskEventsSubject(session, origin.TaskID), env); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				completeTask(t, exec, "delegated to platform")
+			}
 			drainRelayDurable(t, r.url)
 		})
 		time.Sleep(grace + 200*time.Millisecond)
@@ -494,7 +512,7 @@ func TestTheHealDoesTheRelaysWorkForALostDelegation(t *testing.T) {
 
 	t.Run("it mints", func(t *testing.T) {
 		conv := injectKeyPrefix + "case-lost-mint"
-		r2, spawn2, obs, origin := lost(t, nil, conv)
+		r2, spawn2, obs, origin := lost(t, nil, conv, false)
 		waitFor(t, "the heal's write", func() bool {
 			rec, _ := r2.g.reg.Get(context.Background(), conv)
 			return rec.ActiveTask == nil || rec.ActiveTask.TaskID != origin.TaskID
@@ -534,11 +552,23 @@ func TestTheHealDoesTheRelaysWorkForALostDelegation(t *testing.T) {
 		}
 	})
 
+	t.Run("a terminal stamped in the future still heals", func(t *testing.T) {
+		conv := injectKeyPrefix + "case-lost-future"
+		r2, _, _, origin := lost(t, nil, conv, true)
+		child := awaitSubmission(t, r2, targetPlatform, 0)
+		if child == nil {
+			t.Fatal("no child")
+		}
+		if !loggedContaining(r2, "healing an active task whose delegate request the relay never delivered", origin.TaskID)() {
+			t.Fatal("the mint was not the heal's")
+		}
+	})
+
 	t.Run("it refuses", func(t *testing.T) {
 		conv := injectKeyPrefix + "case-lost-refuse"
 		r2, _, obs, origin := lost(t, func(c *Config) {
 			c.TargetAllowedUsers = map[string]map[string][]string{targetPlatform: {injectBackend: {"someone-else"}}}
-		}, conv)
+		}, conv, false)
 		waitFor(t, "the root's terminal", func() bool { _, ok := obs.terminalFor(origin.TaskID); return ok })
 		end, _ := obs.terminalFor(origin.TaskID)
 		if end.state != lib.StateFailed || !strings.HasPrefix(end.text, "reason: "+reasonDelegationRefused+" - ") {
@@ -573,6 +603,30 @@ func TestTheHealDoesTheRelaysWorkForALostDelegation(t *testing.T) {
 			t.Fatal("the heal did not run the request's checks")
 		}
 	})
+}
+
+// TestTheRelayLagGraceRunsOnTrustedClocks: the grace starts at the server's
+// stored time for the terminal, clamped to now when that is in the future;
+// with no stored time it starts at the gateway's first sight of the turn and
+// stays there, so the grace still runs instead of reading as already over.
+func TestTheRelayLagGraceRunsOnTrustedClocks(t *testing.T) {
+	r, _ := startRigWithSpawner(t)
+	now := time.Now()
+	stored := now.Add(-time.Minute)
+	if got := r.g.relayLagStart("task-stored", stored, now); !got.Equal(stored) {
+		t.Fatalf("start = %v, want the stored time %v", got, stored)
+	}
+	if got := r.g.relayLagStart("task-future", now.AddDate(1, 0, 0), now); !got.Equal(now) {
+		t.Fatalf("start for a future stored time = %v, want now %v", got, now)
+	}
+	first := r.g.relayLagStart("task-untimed", time.Time{}, now)
+	later := r.g.relayLagStart("task-untimed", time.Time{}, now.Add(time.Minute))
+	if !first.Equal(now) || !later.Equal(now) {
+		t.Fatalf("starts with no stored time = %v then %v, want the first sight %v both times", first, later, now)
+	}
+	if since := now.Add(time.Minute).Sub(later); since > r.g.relayLagGrace() {
+		t.Fatalf("a minute after first sight reads as past the %v grace", r.g.relayLagGrace())
+	}
 }
 
 // TestACancelNamingTheRootStopsTheActiveChild: a door caller holds only the
