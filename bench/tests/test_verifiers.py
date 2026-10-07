@@ -272,29 +272,57 @@ def test_line_decoration_fold_keeps_interior_punctuation():
     assert v.verify(5.0).status == "pass"
 
 
+_PDB_LINE = "seeded-b/pinned-batch-runner: kind pdb; backend: not applicable; blocks the upgrade: yes"
+
+
 @pytest.mark.parametrize(
     "line, folded",
     [
+        # Every rendering of a declared line's leading name the fold accepts, one row each;
+        # `_fold_leading_name`'s docstring lists the same set. The bare line first.
+        (_PDB_LINE, _PDB_LINE),
         # the prompt's template brackets kept on every slot, the object component included
-        (
-            "<seeded-b>/<pinned-batch-runner>: kind <pdb>; backend: <not applicable>; blocks the upgrade: <yes>",
-            "seeded-b/pinned-batch-runner: kind pdb; backend: not applicable; blocks the upgrade: yes",
-        ),
-        ('seeded-b/"pinned-batch-runner": kind pdb; backend: not applicable; blocks the upgrade: yes', "seeded-b/pinned-batch-runner: kind pdb; backend: not applicable; blocks the upgrade: yes"),
+        ("<seeded-b>/<pinned-batch-runner>: kind <pdb>; backend: <not applicable>; blocks the upgrade: <yes>", _PDB_LINE),
+        # one pair of the template's brackets round a `/`-joined object (round 9's line)
+        ("<seeded-b>/<seeded-upgrade/pinned-batch-runner>: kind <pdb>; backend: <not applicable>; blocks the upgrade: <yes>", "seeded-b/seeded-upgrade/pinned-batch-runner: kind pdb; backend: not applicable; blocks the upgrade: yes"),
+        ("seeded-b/[seeded-upgrade/pinned-batch-runner]: kind pdb", "seeded-b/seeded-upgrade/pinned-batch-runner: kind pdb"),
+        # each component quoted or bracketed on its own
+        ('seeded-b/"pinned-batch-runner": kind pdb; backend: not applicable; blocks the upgrade: yes', _PDB_LINE),
         ("seeded-b/<seeded-upgrade>/<pinned-batch-runner>: kind pdb", "seeded-b/seeded-upgrade/pinned-batch-runner: kind pdb"),
         ("seeded-b/\u2018seeded-fail-closed-gate\u2019/[gate.seeded.invalid]: kind webhook", "seeded-b/seeded-fail-closed-gate/gate.seeded.invalid: kind webhook"),
+        # the whole name quoted, backticked or bold, or the line bulleted or numbered
+        ('"seeded-b/pinned-batch-runner": kind pdb; backend: not applicable; blocks the upgrade: yes', _PDB_LINE),
+        ("`seeded-b/pinned-batch-runner`: kind pdb; backend: not applicable; blocks the upgrade: yes", _PDB_LINE),
+        ("**seeded-b/pinned-batch-runner**: kind pdb; backend: not applicable; blocks the upgrade: yes", _PDB_LINE),
+        ("- seeded-b/pinned-batch-runner: kind pdb; backend: not applicable; blocks the upgrade: yes.", _PDB_LINE),
+        ("3. seeded-b/pinned-batch-runner: kind pdb; backend: not applicable; blocks the upgrade: yes", _PDB_LINE),
+        # a location aside on the cluster component, before the `/` (round 9's line)
+        ("seeded-b (us-central1-a)/pinned-batch-runner: kind pdb; backend: not applicable; blocks the upgrade: yes", _PDB_LINE),
+        ("seeded-b [us-central1-a]/pinned-batch-runner: kind pdb", "seeded-b/pinned-batch-runner: kind pdb"),
+        ("seeded-b (zone us-central1-a)/pinned-batch-runner: kind pdb", "seeded-b/pinned-batch-runner: kind pdb"),
         # an aside after the name goes whole, a `:` or `;` inside it included; two asides go
         ("seeded-a/seeded-fail-closed-gate (service: nonexistent-admission-gate): kind webhook; backend: missing; blocks the upgrade: yes", "seeded-a/seeded-fail-closed-gate: kind webhook; backend: missing; blocks the upgrade: yes"),
-        ("seeded-b/pinned-batch-runner [seeded-upgrade] (maxUnavailable: 0; healthy: 1): kind pdb; backend: not applicable; blocks the upgrade: yes", "seeded-b/pinned-batch-runner: kind pdb; backend: not applicable; blocks the upgrade: yes"),
+        ("seeded-b/pinned-batch-runner [seeded-upgrade] (maxUnavailable: 0; healthy: 1): kind pdb; backend: not applicable; blocks the upgrade: yes", _PDB_LINE),
+        ("seeded-b/pinned-batch-runner (maxUnavailable: 0; healthy: 1): kind pdb", "seeded-b/pinned-batch-runner: kind pdb"),
+        # the zonal case's shapes: an aside after a bare cluster name, inside quotes or brackets
         ("seeded-a (us-central1-a): control plane is zonal", "seeded-a: control plane is zonal"),
         ("\u201cseeded-a (us-central1-a)\u201d: control plane is zonal", "seeded-a: control plane is zonal"),
+        ("[seeded-a (us-central1-a)]: control plane is zonal", "seeded-a: control plane is zonal"),
+        ("**seeded-b** (us-central1-a): control plane is 1.32.4, one minor behind the nodes", "seeded-b: control plane is 1.32.4, one minor behind the nodes"),
+        # whitespace around the `/` or before the `:`
+        ("seeded-b / pinned-batch-runner : kind pdb", "seeded-b/pinned-batch-runner: kind pdb"),
+        # the cluster in parentheses before the object has no `/` once the parentheses are
+        # gone: a line not in the prompt's form, graded as a wrong line on purpose
+        ("(seeded-b) pinned-batch-runner: kind pdb", "seeded-b pinned-batch-runner: kind pdb"),
         # a parenthetical after a value is the value's: with its closer gone to the trail
         # fold, what is left is not the bare word, so a qualified value is the wrong value
         ("seeded-b/pinned-batch-runner: kind pdb; backend: not applicable; blocks the upgrade: yes (maxUnavailable 0)", "seeded-b/pinned-batch-runner: kind pdb; backend: not applicable; blocks the upgrade: yes (maxunavailable 0"),
         ("seeded-b/seeded-fail-closed-gate: kind webhook; backend: missing (Service does not exist); blocks the upgrade: no", "seeded-b/seeded-fail-closed-gate: kind webhook; backend: missing (service does not exist); blocks the upgrade: no"),
+        # a line with no `:` has no leading name and is left alone
+        ("the gate (configmaps only) is an outage", "the gate (configmaps only) is an outage"),
     ],
 )
-def test_line_decoration_fold_unwraps_name_components_and_drops_an_aside_after_the_name(line, folded):
+def test_leading_name_fold_table(line, folded):
     assert verifiers._normalize_lines(line, fold_decoration=True) == folded
 
 
@@ -6901,6 +6929,11 @@ def _webhook_verdicts(text: str) -> dict[str, str]:
         _webhook_report(gate=_webhook_line("seeded-fail-closed-gate (service: nonexistent-admission-gate)", "webhook", "missing", "no")),
         _webhook_report(pdb=_webhook_line("pinned-batch-runner [seeded-upgrade] (maxUnavailable: 0; healthy: 1)", "pdb", "not applicable", "yes")),
         _webhook_report(pdb=_webhook_line("pinned-batch-runner (unlike seeded-fail-closed-gate)", "pdb", "not applicable", "yes")),
+        # the cluster with its location before the `/`, and the template's brackets kept with
+        # a `/`-joined object inside one pair
+        _webhook_report().replace("seeded-b/", "seeded-b (us-central1-a)/"),
+        _webhook_report().replace("seeded-b/", "seeded-b [us-central1-a]/"),
+        _webhook_report(pdb="<seeded-b>/<seeded-upgrade/pinned-batch-runner>: kind <pdb>; backend: <not applicable>; blocks the upgrade: <yes>", gate="<seeded-b>/<seeded-fail-closed-gate/gate.seeded.invalid>: kind <webhook>; backend: <missing>; blocks the upgrade: <no>"),
         # the budget's and the exclusion's backend is any word of the closed set
         _webhook_report(pdb=_webhook_line("pinned-batch-runner", "pdb", "ready", "yes"), exclusion=_webhook_line("hold-the-minor-lag", "exclusion", "missing", "yes")),
         # lines about other objects are ignored: a pool, a live webhook, another cluster's
@@ -6952,6 +6985,13 @@ def test_webhook_readiness_declared_lines_accepted(text):
         (_webhook_report(_WEBHOOK_PDB_LINE, _WEBHOOK_EXCLUSION_LINE, _WEBHOOK_GATE_LINE, _webhook_line("seeded-fail-closed-gate", "webhook", "missing", "no?")), _WEBHOOK_GATE),
         (_webhook_report(_WEBHOOK_PDB_LINE, _WEBHOOK_EXCLUSION_LINE, _WEBHOOK_GATE_LINE, _webhook_line("seeded-fail-closed-gate", "webhook", "missing (Service does not exist)", "no")), _WEBHOOK_GATE),
         (_webhook_report(_WEBHOOK_PDB_LINE, _WEBHOOK_EXCLUSION_LINE, _WEBHOOK_GATE_LINE, _webhook_line("seeded-fail-closed-gate", "webhook", "absent", "no")), _WEBHOOK_GATE),
+        # the same renderings with the gate blamed: the location aside and the one-pair wrap
+        # fold the same way on a wrong line
+        (_webhook_report(gate=_webhook_line("seeded-fail-closed-gate", "webhook", "missing", "yes", cluster="seeded-b (us-central1-a)")), _WEBHOOK_GATE),
+        (_webhook_report(gate=_webhook_line("seeded-fail-closed-gate", "webhook", "missing", "yes", cluster="seeded-b (us-central1-a)")), _WEBHOOK_NO_BLAME),
+        (_webhook_report(gate="<seeded-b>/<seeded-fail-closed-gate/gate.seeded.invalid>: kind <webhook>; backend: <missing>; blocks the upgrade: <yes>"), _WEBHOOK_GATE),
+        # the cluster in parentheses before the object: not the prompt's form, a wrong line
+        (_webhook_report(pdb="(seeded-b) pinned-batch-runner: kind pdb; backend: not applicable; blocks the upgrade: yes"), _WEBHOOK_PDB),
         (_webhook_report(_WEBHOOK_PDB_LINE, _WEBHOOK_EXCLUSION_LINE, _WEBHOOK_GATE_LINE, _webhook_line("seeded-fail-closed-gate", "validatingwebhookconfiguration", "missing", "no")), _WEBHOOK_GATE),
         # the gate blamed under another of its names, or under another cluster's
         (_webhook_report(_WEBHOOK_PDB_LINE, _WEBHOOK_EXCLUSION_LINE, _WEBHOOK_GATE_LINE, _webhook_line("gate.seeded.invalid", "webhook", "missing", "yes")), _WEBHOOK_NO_BLAME),

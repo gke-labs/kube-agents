@@ -219,8 +219,7 @@ def _normalize(text: str) -> str:
 # non-word characters (bullets, quotes, pipes, arrows, symbols, a checkbox),
 # list tokens (`1.`, `(1)`, `a)`, `ii.`, a circled digit, a keycap `1️⃣`,
 # `#1`), citation markers (`[1]`) and whitespace, up to the first word
-# character; a Markdown link around a name is kept as its text, and a quote
-# or bracket closing a name goes with the opener the lead took. The trail is
+# character; a Markdown link around a name is kept as its text. The trail is
 # a run of the closers and affirming marks `_TRAIL_CLOSERS` names (a stop, a
 # list's comma or semicolon, quotes, pipes, a hard-break backslash, a check
 # mark), a `<br>`, or a footnote marker (`[1]`, `[^note]`, `(1)`, a
@@ -228,11 +227,13 @@ def _normalize(text: str) -> str:
 # A footnote marker before a `;`, `,` or `.` inside the line is folded too,
 # since a declared frame's values are separated by `;`; so is a wrap the
 # agent kept from the prompt's template around a value (`<unavailable>`,
-# `"unaffected"`) or around a `/`-joined component of the leading name
-# (`seeded-b/<pinned-batch-runner>:`), a parenthetical or bracketed aside
-# between the leading name and its `:` (`seeded-a (us-central1-a):`,
-# `gate (service: x):`), whitespace before a `:` or `;` or missing after
-# one, and invisible format characters anywhere. A pattern anchored
+# `"unaffected"`), whitespace before a `:` or `;` or missing after one, and
+# invisible format characters anywhere. The leading name -- everything
+# before the first `:` outside a bracket -- is re-emitted bare by
+# `_fold_leading_name`: a wrap on the whole name or on any `/`-joined
+# component opened (`<seeded-b>/<ns/name>:`), a parenthetical or bracketed
+# aside after any component dropped whatever it holds (`seeded-b
+# (us-central1-a)/name:`, `gate (service: x):`). A pattern anchored
 # with ``^...$`` then spells a declared line once rather than once per
 # rendering -- the reason `_MARKDOWN_NOISE` exists, applied to the line's
 # edges. Other interior punctuation is untouched. Opt-in, because a case
@@ -277,31 +278,101 @@ _LINE_TRAIL_CLOSER = re.compile(
     r"(?:[\s" + re.escape(_TRAIL_CLOSERS.replace(")", "").replace("]", "")) + r"]|<br\s*/?>)+$"
 )
 _TRAIL_FOLD_PASSES = 3
-# A name the agent quotes or brackets instead of emphasising, with or without
-# a parenthetical inside the quotes: the lead fold has taken the opener, so
-# what is left is the name with its closer stuck to it before the colon or
-# slash that ends the name.
-_QUOTED_FIRST_NAME = re.compile(r"^([\w/._-]+(?:\s*\([^)\n]*\))?)[\"\u201c\u201d'\u2018\u2019\]>)}]+(?=[:/\s(])")
-# The same wrap on a later `/`-joined component of the name
-# (`seeded-b/<pinned-batch-runner>:`, `seeded-b/"pinned-batch-runner":`,
-# `seeded-b/<ns>/<name>:`): the prompt's template brackets `<object name>`
-# as it brackets each value, and a wrap kept there opens after the `/`,
-# which neither the lead fold (line start) nor `_VALUE_WRAP` (whitespace)
-# reaches. The component is a name, closed by the matching class and
-# followed by what ends a component: `:`, `/`, whitespace, a parenthetical,
-# or the line's end.
-_COMPONENT_WRAP = re.compile(
-    r"(?<=/)[\"'\u201c\u201d\u2018\u2019<\[{(]+([\w._-]+)[\"'\u201c\u201d\u2018\u2019>\]})]+(?=[:/\s(]|$)"
-)
-# A parenthetical or bracketed aside between the leading name and the `:`
-# that ends it (`seeded-a (us-central1-a):`, `pinned-batch-runner
-# [seeded-upgrade]:`, `seeded-fail-closed-gate (service: x):`): a gloss on
-# the name, decoration whatever it holds, so a `:` or `;` inside it is not
-# read as a field's separator and a name inside it is not read as the
-# line's. Only in the name position: a parenthetical after a value (`yes
-# (maxUnavailable 0)`) is the value's and stays, which is what makes a
-# qualified value the wrong value. Repeated, so `name [a] (b):` loses both.
-_NAME_ASIDE = re.compile(r"^([\w/._-]+)(?:\s*(?:\([^()\n]*\)|\[[^\[\]\n]*\]))+(?=\s*:)")
+# The leading name of a declared line (everything before the first `:` that
+# is not inside a parenthesis, bracket or brace), normalised by
+# `_fold_leading_name` below: what the function's docstring lists comes off,
+# and the name is re-emitted bare before its `:`. The brackets that nest a
+# `:` inside the name; angle brackets are not among them (they wrap a name
+# and never carry a `:`).
+_NAME_DEPTH_OPENERS = "([{"
+_NAME_DEPTH_CLOSERS = ")]}"
+# A bracket group with no bracket inside it, each kind closed by its own
+# closer, so the fold works inward from the innermost group outward.
+_NAME_INNER_GROUP = re.compile(r"\(([^()\[\]{}<>\n]*)\)|\[([^()\[\]{}<>\n]*)\]|\{([^()\[\]{}<>\n]*)\}|<([^()\[\]{}<>\n]*)>")
+# Every character a wrap or a stray closer can leave in a name once the asides
+# are gone: the brackets, straight and typographic quotes, guillemets, a
+# backtick. None is legal in a Kubernetes or GKE name, so deleting them all is
+# the unwrap.
+_NAME_WRAP_CHARS = re.compile("[()\\[\\]{}<>\"'`\u201c\u201d\u2018\u2019\u00ab\u00bb\u2039\u203a]")
+_NAME_SLASH_SPACE = re.compile(r"\s*/\s*")
+_NAME_SEPARATOR = ":"
+_NAME_JOINER = "/"
+
+
+def _name_end(line: str) -> int:
+    """Index of the `:` that ends the line's leading name, or -1.
+
+    The first `:` outside every parenthesis, bracket or brace, so a `:` inside
+    an aside (`gate (service: x):`) does not end the name early. Angle
+    brackets are not counted: they wrap a name and never carry a `:`.
+    """
+    depth = 0
+    for index, char in enumerate(line):
+        if char in _NAME_DEPTH_OPENERS:
+            depth += 1
+        elif char in _NAME_DEPTH_CLOSERS:
+            depth = max(0, depth - 1)
+        elif char == _NAME_SEPARATOR and depth == 0:
+            return index
+    return -1
+
+
+def _fold_leading_name(line: str) -> str:
+    """Re-emit a declared line as ``<bare name>: <rest>``.
+
+    The name is everything before the first ``:`` not inside a bracket. A
+    bracket group that opens where a component starts (at the name's start
+    or after a ``/``) is a wrap and is opened; one that follows a word is an
+    aside and goes whole, whatever it holds; both repeat from the innermost
+    group outward. Then every bracket, quote or backtick left is deleted (a
+    wrap the lead fold already opened leaves its closer behind), whitespace
+    around ``/`` is closed up and the rest collapsed, and the name is
+    lower-cased. The rest of the line is untouched: a parenthetical after a
+    value is the value's and makes a qualified value the wrong value.
+
+    The renderings this accepts, each a row of the fold table in
+    ``bench/tests/test_verifiers.py`` (``test_leading_name_fold_table``):
+
+    * the bare name: ``seeded-b/pinned-batch-runner:``
+    * the whole name quoted, backticked, bold or in the prompt's angle
+      brackets: ``"seeded-b/pinned-batch-runner":``, ``<seeded-a>:``
+    * each ``/``-joined component wrapped on its own:
+      ``<seeded-b>/<pinned-batch-runner>:``, ``seeded-b/"name":``,
+      ``seeded-b/<ns>/<name>:``
+    * one wrap round a ``/``-joined object: ``<seeded-b>/<ns/name>:``,
+      ``seeded-b/[ns/name]:``
+    * a parenthetical or bracketed aside after any component, a ``:`` or
+      ``;`` inside it included: ``seeded-b (us-central1-a)/name:``,
+      ``seeded-b [us-central1-a]/name:``, ``name (service: x):``,
+      ``name [ns] (maxUnavailable: 0; healthy: 1):``
+    * an aside inside a wrap: ``"seeded-a (us-central1-a)":``,
+      ``[seeded-a (us-central1-a)]:``
+    * whitespace around the ``/`` or before the ``:``: ``seeded-b / name :``
+    * any of these after a bullet, a number, a quote or a pipe the lead fold
+      has taken, with the closer it left behind: ``seeded-a]:``
+
+    Anything else is the agent writing the name some other way than the
+    prompt asks (``(seeded-b) name:`` loses its ``/`` and is a wrong line on
+    purpose).
+    """
+    end = _name_end(line)
+    if end < 0:
+        return line
+    name, rest = line[:end], line[end + 1 :]
+    while True:
+        match = _NAME_INNER_GROUP.search(name)
+        if match is None:
+            break
+        before = name[: match.start()].rstrip()
+        inner = next(group for group in match.groups() if group is not None)
+        at_component_start = before == "" or before.endswith(_NAME_JOINER)
+        replacement = inner if at_component_start else ""
+        name = name[: match.start()] + replacement + name[match.end() :]
+    name = _NAME_WRAP_CHARS.sub("", name)
+    name = " ".join(_NAME_SLASH_SPACE.sub(_NAME_JOINER, name).split()).lower()
+    return name + _NAME_SEPARATOR + rest
+
+
 _MARKDOWN_LINK = re.compile(r"\[([^\]\n]+)\]\([^)\n]*\)")
 # A value the agent kept inside the prompt's own delimiters (`<unavailable>`,
 # `"unaffected"`): a wrap that opens after whitespace and closes at the next
@@ -359,18 +430,18 @@ def _fold_line_decoration(line: str) -> str:
     # Trailing markers and closers first, whatever order they come in, so a
     # linked marker is folded as a marker however the line ends; then every
     # other link is kept as its text, so a linked value stays a value; then
-    # the lead, the quoted name and its wrapped components, the aside after
-    # the name, and the trail once more with the full closer class.
+    # the lead, the leading name (its wraps opened and its asides dropped),
+    # and the trail once more with the full closer class.
     footnoted = _LINE_INTERIOR_FOOTNOTE.sub("", _fold_trail_markers(_INVISIBLE.sub("", line)))
     unlinked = _MARKDOWN_LINK.sub(r"\1", footnoted)
     led = _LINE_LEAD_DECORATION.sub("", unlinked, count=1)
-    unquoted = _NAME_ASIDE.sub(r"\1", _COMPONENT_WRAP.sub(r"\1", _QUOTED_FIRST_NAME.sub(r"\1", led, count=1)), count=1)
+    named = _fold_leading_name(led)
     # The separator's spacing is settled first, so a wrap glued to its
     # separator (`pods:"unaffected"`) has the whitespace the wrap fold opens
     # on; the value wrap then comes off before the trail fold (so a closing
     # quote at the line's end is read as the wrap it is) and again after it
     # (so a wrap followed by a stop is read once the stop is gone).
-    spaced = _SEPARATOR_NO_SPACE.sub(r"\1 ", _SEPARATOR_SPACE.sub("", unquoted))
+    spaced = _SEPARATOR_NO_SPACE.sub(r"\1 ", _SEPARATOR_SPACE.sub("", named))
     trailed = _fold_trail(_VALUE_WRAP.sub(r"\1", spaced))
     return _VALUE_WRAP.sub(r"\1", trailed)
 

@@ -195,10 +195,11 @@ Nine read what the run produced, from this repository
 `report_contains` (phrases in the agent's answer; its `forbidden_patterns` and
 `any_of_patterns` are regular expressions searched against a line-preserving text, with each
 line's decoration folded when the check sets `fold_decoration: true` (indentation, bullets,
-numbers, headings, quotes, links, a quote or bracket kept around a value or around a `/`-joined
-component of the leading name, a parenthetical or bracketed aside between the leading name and
-its `:`, a trailing stop or an affirming mark; a mark that hedges or negates the last word stays,
-so it reads as a wrong value), so a pattern anchored at both ends
+numbers, headings, links, a quote or bracket kept around a value, a trailing stop or an affirming
+mark, and the leading name -- everything before the first `:` outside a bracket -- re-emitted
+bare: a wrap on the whole name or on any `/`-joined component opened, a parenthetical or
+bracketed aside after any component dropped whatever it holds; a mark that hedges or negates the
+last word stays, so it reads as a wrong value), so a pattern anchored at both ends
 spells a declared line once and should keep `\n` out of its gaps (a literal space does not cross a
 line break; a phrase that may wrap says `\s+`), for what no substring can
 express: a banned word whose negated uses are legitimate, a phrase that must start at a word

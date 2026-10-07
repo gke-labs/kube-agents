@@ -29,12 +29,17 @@
 # word the list had not anticipated (`pinned-batch-runner (unaffected)` passed; `(no minor
 # upgrades)` failed). Each objective below is a whole-line pattern anchored at
 # `^{cluster:b}/<object>:` with seeded-b's name bounded on both sides and the line's
-# rendering folded first (`fold_decoration`): the fold unwraps a quoted or bracketed name
-# component (`seeded-b/<pinned-batch-runner>:`) and drops a parenthetical or bracketed
-# aside between the name and its `:` whatever it holds (`(service: x)`), so a `:` there
-# cannot split a field and a name there is not the line's; the object may carry its
-# namespace before it, a webhook may carry its webhook name after its configuration's, and
-# a `:` after `kind` is decoration. The grammar of every value objective: accept = the
+# rendering folded first (`fold_decoration`): the fold re-emits the leading name (everything
+# before the first `:` outside a bracket) bare, a wrap on the whole name or on any `/`-joined
+# component opened (`<seeded-b>/<ns/name>:`) and a parenthetical or bracketed aside after any
+# component dropped whatever it holds (`seeded-b (us-central1-a)/name:`, `name (service:
+# x):`), so a `:` there cannot split a field and a name there is not the line's; the object
+# may carry its namespace before it, a webhook may carry its webhook name after its
+# configuration's, and a `:` after `kind` is decoration. The renderings the fold accepts are
+# the rows of `test_leading_name_fold_table` in `bench/tests/test_verifiers.py`, and the
+# prompt tells the agent to write each name as the API shows it with nothing around it: a
+# rendering outside that table is the agent departing from the contract, graded as a wrong
+# line on purpose, not a gap in the fold. The grammar of every value objective: accept = the
 # whole line with the value; forbid = the field with any other value. Each forbid is the
 # same anchor, any text, then one field's label under a negative lookahead for the
 # accepted value (`kind:? (?!pdb;)`, `backend: (?!missing;)`, `blocks the upgrade:
@@ -67,6 +72,8 @@ prompt: >-
   <pdb|exclusion|webhook>; backend: <ready|missing|not applicable>; blocks
   the upgrade: <yes|no>". Name a webhook by its configuration's name, and
   write "not applicable" as the backend of anything that is not a webhook.
+  Write each name exactly as the API shows it, with no brackets, quotes or
+  parentheses around it; put any aside on a line of its own.
 expected_output: >-
   A per-cluster readiness report read during this run. For seeded-b it names
   the validating webhook configuration seeded-fail-closed-gate (webhook
