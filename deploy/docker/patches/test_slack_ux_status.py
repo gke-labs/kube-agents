@@ -996,6 +996,19 @@ class PlanTest(_RuntimeCase):
         _run(runtime.settle_row(adapter, _sub("t_b"), "completed", "1.33.4 = default", "seeded-a"))
         self.assertEqual(self._kinds(adapter).count("post"), posts)
 
+    def test_a_card_that_blocks_without_a_note_on_a_fallen_back_plan_keeps_its_wait(self):
+        adapter = _Adapter(_Client(fail={"post"}))
+        self.assertFalse(self._note(adapter, 1, "reading logs"))
+        _run(runtime.settle_row(adapter, _sub("t_b"), "blocked", "", "seeded-a"))
+        plan = runtime._plans[(CHANNEL, THREAD)]
+        self.assertEqual((plan.rolling, plan.waiting), ({"t_a", "t_b"}, {"t_b"}))
+        _run(runtime.settle_row(adapter, _sub(), "completed", "done"))
+        self.assertIn((CHANNEL, THREAD), runtime._plans, "t_b still waits on you")
+        self.assertEqual(self._sent(adapter)[-1], "suspended")
+        _run(runtime.settle_row(adapter, _sub("t_b"), "completed", "1.33.4 = default"))
+        self.assertNotIn((CHANNEL, THREAD), runtime._plans)
+        self.assertEqual(self._sent(adapter)[-1], "closed")
+
     def test_a_settle_says_whether_the_plan_shows_the_card_complete(self):
         # True lets the report of a card beneath a fan-out fold into its row (kanban_progress_lines).
         adapter = _Adapter()
@@ -1078,6 +1091,13 @@ class PlanTest(_RuntimeCase):
         adapter = _Adapter()
         self.assertTrue(self._move(adapter, 1, "ready"))
         self.assertEqual((adapter.calls, runtime._plans), ([], {}))
+
+    def test_a_card_moved_before_any_note_gets_its_row_when_it_settles(self):
+        adapter = _Adapter()
+        self.assertTrue(self._move(adapter, 1, "ready"))
+        _run(runtime.settle_row(adapter, _sub(), "completed", "1.33.4 = default", "seeded-a"))
+        [task] = self._tasks(adapter)
+        self.assertEqual((task["status"], task["title"]), ("complete", "1.33.4 = default"))
 
     def test_a_move_is_never_the_rows_title_whatever_its_wording(self):
         # A status event with no status falls back to upstream's own move line, which has no "→ ".

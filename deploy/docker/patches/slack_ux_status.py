@@ -840,9 +840,10 @@ async def deliver_row(
     card = str(sub.get("task_id") or "")
     if not (key[0] and key[1] and card and hasattr(adapter, "_get_client")):
         return False
-    _remember(_seen, (*key, card), True, SEEN_MAX)
     if moved is not None:
+        # Not seen: a move opens no row, so the card's terminal event still must.
         return await _deliver_move(adapter, sub, key, card, event_id, line, moved)
+    _remember(_seen, (*key, card), True, SEEN_MAX)
     plan = _plans.get(key)
     if plan is None:
         plan = _Plan(str(sub.get("team_id") or ""))
@@ -945,7 +946,16 @@ async def _open_settled(
         plan = _Plan(str(sub.get("team_id") or ""))
         await _keep(adapter, key, plan)
     elif plan.fallback:
-        return None  # the thread is on rolling lines until its cards settle
+        # The thread is on rolling lines until its cards settle. A card waiting
+        # on the user rolls there, as on a refused render, so the plan keeps its wait.
+        if status != _status.TASK_PENDING:
+            return None
+        plan.rolling.add(card)
+        plan.waiting.add(card)
+        plan.touched = time.monotonic()
+        _arm(adapter, key, plan)
+        await _session(adapter, key, plan)
+        return plan
     else:
         _plans.move_to_end(key)
     row = plan.rows[card] = _Row(card, title)

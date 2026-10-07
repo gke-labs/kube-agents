@@ -130,10 +130,10 @@
 # (159) of sixty-seven (201), +3 more: the same shape on the card's last
 # attempt. chat-voice-failure-leads-with-fact (the last entry below) makes
 # it fifty-four (162) of sixty-eight (204), +3 more: the same shape on a
-# blocked card. Counted from the lists again (fifty-seven here, fourteen in
-# the presubmit file, seventy-one cases and 213 units),
-# chat-fanout-fleet-restarts-rows makes it fifty-eight (174) of seventy-two
-# (216), +3 more: one front-door turn and a four-card fan-out.
+# blocked card. Counted from the lists again (sixty here, fourteen in
+# the presubmit file, seventy-four cases and 222 units),
+# chat-fanout-fleet-restarts-rows makes it sixty-one (183) of seventy-five
+# (225), +3 more: one front-door turn and a four-card fan-out.
 # Whether the worst night fits is a question about the whole matrix, and the
 # six measured nights (2026-09-16 to 09-21, oss-test-infra#2707's table)
 # answer it plainly: 1734-2693 serial minutes of work at a realised
