@@ -10,12 +10,18 @@ unit's own, so the unit waits for it rather than resetting the ledger under it.
 Counts a run claimed or running, and an audit marked due (or overdue) and not yet
 claimed, since the next profile-cron-tick starts it. A row claimed more than
 ``STALE_SECONDS`` ago is not counted: a gateway restart leaves a cut-off run's row
-at running for good, and no audit takes that long. A store it cannot read counts as
-busy, so a failed read is waited out rather than taken as idle.
+at running for good, and no audit takes that long. An audit the Chat Agent's `oobe`
+stage has still to run counts too, from before it is marked: the stage is pending
+while its job is on the Chat Agent's roster and `.oobe_audits_fired` is not done,
+and an audit has had its turn once the stage has marked it and moved on, or held or
+given up on it. The stage's audit list is read from the image's copy of oobe.py,
+not run. Anything it cannot read counts as busy, so a failed read is waited out
+rather than taken as idle.
 
 Prints one line: how long it waited and what was still going when it stopped.
 """
 
+import ast
 import json
 import os
 import sqlite3
@@ -26,6 +32,12 @@ from datetime import datetime, timedelta, timezone
 home, bound, poll, audits = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), sys.argv[4:]
 LEDGER = os.path.join(home, "profiles", "platform", "cron", "executions.db")
 ROSTER = os.path.join(home, "profiles", "platform", "cron", "jobs.json")
+CHAT_ROSTER = os.path.join(home, "cron", "jobs.json")
+STAGE_MARKER = os.path.join(home, ".oobe_audits_fired")
+# The image's copy, not the volume's: the volume is the agent's to write.
+STAGE_SOURCE = os.environ.get("OOBE_STAGE_SOURCE", "/opt/defaults/scripts/oobe.py")
+STAGE_JOB = "oobe"
+STAGE_AUDITS = "FIRST_RUN_AUDITS"
 PAUSED_STATE = "paused"
 SQLITE_BUSY_TIMEOUT_SECONDS = 10
 IN_FLIGHT = ("claimed", "running")
@@ -52,14 +64,12 @@ def due(now):
     run is not scheduled. A stamp that does not parse counts as due, as the tick reads it.
     """
     try:
-        with open(ROSTER, encoding="utf-8") as fh:
-            stored = json.load(fh)
+        jobs = jobs_in(ROSTER)
     except FileNotFoundError:
         return set()
-    jobs = stored.get("jobs", []) if isinstance(stored, dict) else stored
     found = set()
     for job in jobs:
-        if not isinstance(job, dict) or job.get("id") not in audits:
+        if job.get("id") not in audits:
             continue
         if not job.get("enabled", True) or job.get("state") == PAUSED_STATE or job.get("paused_at"):
             continue
@@ -70,6 +80,40 @@ def due(now):
         if when is None or when <= now:
             found.add(job["id"])
     return found
+
+
+def jobs_in(path):
+    with open(path, encoding="utf-8") as fh:
+        stored = json.load(fh)
+    jobs = stored.get("jobs", []) if isinstance(stored, dict) else stored
+    return [job for job in jobs if isinstance(job, dict)]
+
+
+def stage_audits():
+    tree = ast.parse(open(STAGE_SOURCE, encoding="utf-8").read())
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and any(getattr(t, "id", "") == STAGE_AUDITS for t in node.targets):
+            return set(ast.literal_eval(node.value))
+    raise ValueError(f"{STAGE_SOURCE} names no {STAGE_AUDITS}")
+
+
+def stage_pending():
+    """The audits asked about that a pending `oobe` stage has still to run."""
+    try:
+        if not any(job.get("id") == STAGE_JOB for job in jobs_in(CHAT_ROSTER)):
+            return set()
+    except FileNotFoundError:
+        return set()
+    try:
+        with open(STAGE_MARKER, encoding="utf-8") as fh:
+            state = json.load(fh)
+    except FileNotFoundError:
+        state = {}
+    if state.get("done"):
+        return set()
+    current = (state.get("current") or {}).get("job")
+    had_turn = (set(state.get("fired", [])) | set(state.get("held", {})) | set(state.get("gave_up", []))) - {current}
+    return (stage_audits() & set(audits)) - had_turn
 
 
 def running(now):
@@ -92,17 +136,17 @@ def running(now):
 def busy():
     now = datetime.now(timezone.utc)
     try:
-        return due(now) | running(now)
-    except (OSError, ValueError, sqlite3.Error) as exc:
+        return due(now) | running(now) | {f"{audit} (oobe stage pending)" for audit in stage_pending()}
+    except Exception as exc:  # noqa: BLE001 - any failed read is not "nothing going"
         return {f"{UNREADABLE} ({exc})"}
 
 
-waited = 0
+start = time.monotonic()
 going = busy()
-while going and waited < bound:
+while going and time.monotonic() - start + poll <= bound:
     time.sleep(poll)
-    waited += poll
     going = busy()
+waited = int(time.monotonic() - start)
 if going:
     print(f"still going after {waited}s, the run goes ahead: {', '.join(sorted(going))}")
 elif waited:

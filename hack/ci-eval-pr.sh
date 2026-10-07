@@ -1201,9 +1201,10 @@ release_inflight_note() { # <label> <audit-id>
 # ledger issue as the unit's own would, so resetting the ledger or clearing
 # the in-flight note under it would grade the unit against what two runs
 # wrote. hack/ci_platform_runs.py does the counting in the gateway (a mark not
-# yet claimed counts, an unreadable store counts as busy) and stops after
-# EVAL_PLATFORM_RUN_WAIT_SECONDS; the unit then runs as it did before the
-# wait. Pinned to AGENT_CLUSTER_CONTEXT and refused for a context that does
+# yet claimed counts, so does an audit a pending `oobe` stage has still to
+# run, and a failed read counts as busy) and stops after
+# EVAL_PLATFORM_RUN_WAIT_SECONDS, failed execs retried inside it; the unit
+# then runs as it did before the wait. Pinned to AGENT_CLUSTER_CONTEXT and refused for a context that does
 # not name PROJECT_ID, as release_inflight_note is. Called once the unit holds
 # its stream locks and before the infra lock, so no other unit on the stream
 # starts during the wait and no tofu unit queues behind it.
@@ -1223,18 +1224,32 @@ wait_platform_runs() { # <label> <space-separated audit ids>
       echo "WARNING: Platform runs (${label}): skipped, AGENT_CLUSTER_CONTEXT=${ctx} does not name PROJECT_ID=${PROJECT_ID}; not waiting on ${streams}" >&2
       return 0 ;;
   esac
-  local bound=(timeout --foreground "$((EVAL_PLATFORM_RUN_WAIT_SECONDS + EVAL_SANDBOX_EXEC_ROUND_TRIP_SECONDS))")
-  command -v timeout >/dev/null 2>&1 || bound=()
-  # shellcheck disable=SC2086 # audit ids carry no spaces or glob characters
-  out="$(${bound[@]+"${bound[@]}"} kubectl --context "${ctx}" -n "${ns}" exec -i "deployment/${AGENT_SERVICE_NAME}-gateway" \
-    -c "${EVAL_GATEWAY_CONTAINER}" --request-timeout="${EVAL_SANDBOX_EXEC_TIMEOUT}" -- \
-    "${EVAL_GATEWAY_PYTHON}" - "${EVAL_GATEWAY_HOME}" "${EVAL_PLATFORM_RUN_WAIT_SECONDS}" "${EVAL_PLATFORM_RUN_POLL_SECONDS}" ${streams} \
-    < "${SCRIPT_DIR}/ci_platform_runs.py" 2>&1)" || rc=$?
-  if [ "${rc}" -eq 0 ]; then
-    echo "Platform runs (${label}) on ${streams}: ${out}"
-  else
-    echo "WARNING: Platform runs (${label}): kubectl exec into ${ns}/${AGENT_SERVICE_NAME}-gateway exited ${rc} (${out}); not waiting on ${streams}" >&2
-  fi
+  # An exec that fails (a pod rolling, an API blip) is tried again inside the
+  # same bound rather than read as nothing going.
+  local deadline=$((SECONDS + EVAL_PLATFORM_RUN_WAIT_SECONDS)) left
+  while :; do
+    left=$((deadline - SECONDS))
+    [ "${left}" -gt 0 ] || left=0
+    local bound=(timeout --foreground "$((left + EVAL_SANDBOX_EXEC_ROUND_TRIP_SECONDS))")
+    command -v timeout >/dev/null 2>&1 || bound=()
+    rc=0
+    # shellcheck disable=SC2086 # audit ids carry no spaces or glob characters
+    out="$(${bound[@]+"${bound[@]}"} kubectl --context "${ctx}" -n "${ns}" exec -i "deployment/${AGENT_SERVICE_NAME}-gateway" \
+      -c "${EVAL_GATEWAY_CONTAINER}" --request-timeout="${EVAL_SANDBOX_EXEC_TIMEOUT}" -- \
+      "${EVAL_GATEWAY_PYTHON}" - "${EVAL_GATEWAY_HOME}" "${left}" "${EVAL_PLATFORM_RUN_POLL_SECONDS}" ${streams} \
+      < "${SCRIPT_DIR}/ci_platform_runs.py" 2>&1)" || rc=$?
+    if [ "${rc}" -eq 0 ]; then
+      echo "Platform runs (${label}) on ${streams}: ${out}"
+      return 0
+    fi
+    [ "${rc}" -eq 124 ] && out="timed out after $((left + EVAL_SANDBOX_EXEC_ROUND_TRIP_SECONDS))s${out:+; ${out}}"
+    if [ "$((deadline - SECONDS))" -le 0 ]; then
+      echo "WARNING: Platform runs (${label}): kubectl exec into ${ns}/${AGENT_SERVICE_NAME}-gateway exited ${rc} (${out}); stopped waiting on ${streams} after ${EVAL_PLATFORM_RUN_WAIT_SECONDS}s" >&2
+      return 0
+    fi
+    echo "WARNING: Platform runs (${label}): kubectl exec exited ${rc} (${out}); trying again in ${EVAL_PLATFORM_RUN_POLL_SECONDS}s" >&2
+    sleep "${EVAL_PLATFORM_RUN_POLL_SECONDS}"
+  done
   return 0
 }
 

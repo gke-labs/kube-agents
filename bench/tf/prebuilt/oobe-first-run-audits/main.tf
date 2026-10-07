@@ -32,10 +32,10 @@
 #
 # Waiting on running audits is the runner's job, not this stack's: it holds the
 # four streams' locks for the unit (the case's `audit_streams`), and every unit on
-# one of them, the next repetition of this case included, first waits out a run
-# the install started there (hack/ci-eval-pr.sh: wait_platform_runs). So an audit
-# still going from an earlier repetition is finished before this apply, and the
-# last one the stage starts is finished before an audit case on its stream runs.
+# one of them, the next repetition of this case included, first waits, up to its
+# bound, for a run the install started there or a pending stage has still to start
+# (hack/ci-eval-pr.sh: wait_platform_runs). Run by hand, without the runner, the
+# stage itself holds its first mark until an earlier repetition's audit has ended.
 #
 # The teardown, and the exit trap on a failed apply, run disarm.py: both markers
 # go back as they were and the `oobe` job comes out if this stack put it there.

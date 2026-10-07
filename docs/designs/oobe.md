@@ -151,7 +151,10 @@ trigger reported failing keeps its time, so a run of it that turns up is adopted
 `trigger_job` also sets the job's `enabled` back to true and clears a pause, so an
 audit an operator has disabled or paused, or one missing from the Platform Agent's roster, is
 recorded as held and not started. A start that fails is tried five times in all; after that the
-audit is left to its schedule, so the stage always finishes and the job always leaves.
+audit is left to its schedule, so the stage finishes and the job leaves. A tick that cannot read
+the Platform Agent's run ledger or roster marks nothing and spends no attempt: a failed read is not
+"nothing running", and a mark made on one can start an audit beside a live run. A ledger or roster
+that stays unreadable therefore keeps the job ticking without effect until it can be read.
 
 ### 4.4 No GitOps repository
 
@@ -256,11 +259,12 @@ The stack then waits, up to an hour, for the stage to finish its chain, so the v
 passes when the stage's `.oobe_audits_fired` lists all four audits as marked due and each has a run claimed since the stage marked it that is running or completed (a skipped row is passed over), so a scheduled run that falls in the window does not count, and each started only after the one before it in the chain ended. That is stricter than the stage: a mark that lands on a scheduled run it did not see start, a race the runner's wait for running audits makes rare, reads as no run. Red: on
 an image without the job, no audit runs. Green: four, in three repetitions. The case's runs are
 real audit runs on four streams, so it declares them (`audit_streams`) and the runner holds their
-locks for the unit. Every unit on an audit stream first waits, up to 40 minutes, for a run the
-install started there (`wait_platform_runs` in `hack/ci-eval-pr.sh`), so the nightly's audit cases
-do not run beside this case's last audit and grade its ledger, and the next repetition does not arm
-while it runs. The same wait covers the fresh CI install's own first-run audits and any scheduled
-run. A run still going past that bound can still overlap. The no-repository skip is unit-tested,
+locks for the unit. Every unit on an audit stream first waits, up to 40 minutes, while the install
+has a run of that audit claimed, running or marked due, or a pending `oobe` stage has still to run
+it (`wait_platform_runs` in `hack/ci-eval-pr.sh`). That keeps the nightly's audit cases from running
+beside this case's last audit or a fresh CI install's own chain, and holds the next repetition's
+arm until the last run ends. A scheduled run that starts after the wait, or a run still going past
+its bound, can still overlap. The no-repository skip is unit-tested,
 not evaluated: the shared install has a repository, and removing it mid-run would break concurrent
 cases.
 
