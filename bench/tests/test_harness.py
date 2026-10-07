@@ -2745,6 +2745,29 @@ def test_status_turns_with_consecutive_non_json_bodies_settle_and_grade(
     assert len(recorded_pf_resets) == 0
 
 
+def test_status_turns_with_consecutive_non_object_json_bodies_settle_and_grade(
+    stub_agent: _StubAgentServer, instant_polls: None, recorded_pf_resets: list[int]
+) -> None:
+    """Consecutive status turns answering 200 with non-object JSON bodies are answered turns that settle and grade."""
+    stub_agent.turns = [_create_turn(), _show_turn("done")]
+    stub_agent.raw_body_by_request = {
+        2: json.dumps(["not", "an", "object"]).encode(),
+        3: json.dumps(["not", "an", "object"]).encode(),
+        4: json.dumps(["not", "an", "object"]).encode(),
+    }
+
+    result = KubeAgentsHarness().run("Find the root cause.")
+
+    assert result.has_errors()
+    assert harness.INFRA_FAILURE_MARKER not in result.errors[0]
+    assert (
+        "status turns failed with 3 answered, 0 in transport"
+        in result.errors[0]
+    )
+    assert len(stub_agent.requests) == 4
+    assert recorded_pf_resets == []
+
+
 def test_status_turns_with_pure_transport_failures_raise_infra(
     stub_agent: _StubAgentServer, instant_polls: None, recorded_pf_resets: list[int]
 ) -> None:
@@ -2763,10 +2786,10 @@ def test_status_turns_with_pure_transport_failures_raise_infra(
     assert len(recorded_pf_resets) == 2
 
 
-def test_status_turns_with_consecutive_timeouts_raise_infra(
+def test_status_turns_with_consecutive_timeouts_settle_and_grade(
     stub_agent: _StubAgentServer, instant_polls: None, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """When status turns fail with timeouts (which are non-retryable transport errors), it raises infra."""
+    """When status turns fail with timeouts (which are non-retryable transport errors), it settles and grades."""
     stub_agent.turns = [_create_turn(), _show_turn("done")]
     original_open = harness._OPENER.open
 
@@ -2780,8 +2803,8 @@ def test_status_turns_with_consecutive_timeouts_raise_infra(
     result = KubeAgentsHarness().run("Find the root cause.")
 
     assert result.has_errors()
-    assert harness.INFRA_FAILURE_MARKER in result.errors[0]
-    assert "status turns failed in transport 3 times running" in result.errors[0]
+    assert harness.INFRA_FAILURE_MARKER not in result.errors[0]
+    assert "status turns failed with 0 answered, 3 in transport" in result.errors[0]
 
 
 def test_a_status_turn_502_with_rate_limit_is_infra_without_retrying(

@@ -2256,7 +2256,9 @@ class KubeAgentsHarness(AgentHarness):
                     turn_exchange = _exchange(follow, turn_timeout, opening=False)
                 except inject.InjectUnavailable as exc:
                     raise _TransportError(
-                        f"{exc}{_abandon(follow)}", retryable=exc.retryable
+                        f"{exc}{_abandon(follow)}",
+                        retryable=exc.retryable,
+                        answered=exc.answered,
                     ) from exc
                 if turn_exchange.outcome == inject.OUTCOME_NOT_ACCEPTED:
                     # Retryable, and therefore infrastructure once the wait's
@@ -2337,12 +2339,13 @@ class KubeAgentsHarness(AgentHarness):
             turn ran or the header was absent.
 
         Raises:
-            _DelegationTransportExhausted: Every retry died without reaching
-                an agent, or -- on an opening turn only -- a status turn hit an
-                infrastructure limit (rate limit or billing). The caller replaces
-                the record wholesale with :func:`_infra_failure`. On an answer
-                turn a failure reason never raises: the error is counted towards
-                answered failures and the wait settles, so the wake reply stays graded.
+            _DelegationTransportExhausted: Every retry died with a retryable transport
+                drop (no HTTP answer at all, or a 429 refused at the admission door); or
+                -- on an opening turn only -- a status turn hit an infrastructure limit
+                (rate limit or billing). The caller replaces the record wholesale with
+                :func:`_infra_failure`. When any status turn was answered or hit a
+                non-retryable failure (such as a timeout), the wait settles instead, so
+                the partial record stays graded.
         """
         # The delegating turn may already have shown a card done, in which case
         # there is nothing to wait on and no reason to sleep a poll interval.
@@ -2458,9 +2461,10 @@ class KubeAgentsHarness(AgentHarness):
                                 "port-forward respawn failed before retry: %s", pf_exc
                             )
                     continue
-                if all(not e.answered for e in failures):
-                    # Every status turn in the streak failed in transport:
-                    # classified as infrastructure, not graded. The cards'
+                if all(e.retryable for e in failures):
+                    # Every status turn in the streak was a retryable transport drop
+                    # (gateway 502/503/504, connection drop, or admission 429 without
+                    # failure reason): classified as infrastructure, not graded. The cards'
                     # on-disk state still has to go (nothing is settled into
                     # a record that is about to be replaced, but a rerun must
                     # not find this attempt's leavings), then the run becomes
