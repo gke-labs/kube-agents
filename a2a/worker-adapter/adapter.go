@@ -116,7 +116,8 @@ type Config struct {
 	// activeDeadlineSeconds so the failure is ours to report, not the
 	// enforcer's.
 	TaskDeadline time.Duration
-	// KillGrace is SIGTERM-to-SIGKILL escalation time.
+	// KillGrace is SIGTERM-to-SIGKILL escalation time. It also bounds how
+	// long a failed start waits for the killed harness's stderr to close.
 	KillGrace time.Duration
 
 	// DelegateSocket is the unix socket the session's delegate tool reaches
@@ -461,7 +462,7 @@ func Run(ctx context.Context, cfg Config) (Result, error) {
 	}
 	defer stopDelegate()
 
-	proc, err := startHarness(cfg.HarnessCommand, cfg.HarnessEnv, prompt, log)
+	proc, err := startHarness(cfg.HarnessCommand, cfg.HarnessEnv, prompt, cfg.KillGrace, log)
 	if err != nil {
 		state := lib.StateFailed
 		ferr := a.finalize(state, "reason: spawn-failed - "+err.Error(), "")
@@ -676,11 +677,7 @@ func (a *adapter) supervise(ctx context.Context, proc *harnessProc, steerCh <-ch
 		return Result{State: state}, a.finalize(state, "reason: canceled-by-request", "")
 	default:
 		state := lib.StateFailed
-		evidence := strings.TrimSpace(proc.stderr.String())
-		reason := "reason: stream-ended-without-result"
-		if waitErr != nil {
-			reason += " - " + waitErr.Error()
-		}
+		reason := "reason: stream-ended-without-result" + exitEvidence(waitErr)
 		if serr := proc.scanErr(); serr != nil {
 			// Name the ceiling and its value rather than relaying
 			// "token too long", which says nothing an operator can act on.
@@ -697,9 +694,7 @@ func (a *adapter) supervise(ctx context.Context, proc *harnessProc, steerCh <-ch
 				reason += " - stdout: " + serr.Error()
 			}
 		}
-		if evidence != "" {
-			reason += "\nstderr tail:\n" + evidence
-		}
+		reason += proc.stderrEvidence()
 		return Result{State: state}, a.finalize(state, reason, "")
 	}
 }
