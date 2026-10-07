@@ -736,6 +736,8 @@ class CallSiteTest(unittest.TestCase):
             "inline": "audit_streams: [compliance-audit, stockout-prevention] # two\nowner: x\n",
             "wrapped": "audit_streams:\n  [\n    compliance-audit,\n    stockout-prevention,\n  ]\nowner: x\n",
             "block": "audit_streams:\n  - compliance-audit # first\n  - stockout-prevention\nowner: x\n",
+            # A whole-line comment at column 0 inside the list is legal YAML, not the next key.
+            "commented": "audit_streams:\n  - compliance-audit\n# the daily one\n\n  - stockout-prevention\nowner: x\n",
             "absent": "owner: x\n",
         }
         with tempfile.TemporaryDirectory() as tmp:
@@ -747,7 +749,7 @@ class CallSiteTest(unittest.TestCase):
             result = run_bash("\n".join(lines))
         got = dict(line.split("=", 1) for line in result.stdout.splitlines())
         both = "compliance-audit stockout-prevention"
-        self.assertEqual(got, {"inline": both, "wrapped": both, "block": both, "absent": ""}, result.stderr)
+        self.assertEqual(got, {"inline": both, "wrapped": both, "block": both, "commented": both, "absent": ""}, result.stderr)
 
     def test_two_units_on_one_stream_serialise_and_two_on_different_streams_do_not(self):
         # The lock helpers as shipped, with mkdir as the mutex: the second

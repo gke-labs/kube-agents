@@ -42,10 +42,22 @@ STALE_SECONDS = 60 * 60
 
 
 
+def stamp(value):
+    """An ISO timestamp as an aware datetime: a naive one predates Hermes' offset-aware
+    stamps and meant local time (profile_cron_tick.due_job_ids). None when it does not parse.
+    """
+    try:
+        when = datetime.fromisoformat(value)
+    except (TypeError, ValueError):
+        return None
+    return when.astimezone() if when.tzinfo is None else when
+
+
 def due(now):
     """Audits whose next run is already due: marked, or overdue, and not yet claimed.
 
-    A disabled or paused job is never claimed, so it is not waited on.
+    A disabled or paused job is never claimed, so it is not waited on; one with no next
+    run is not scheduled. A stamp that does not parse counts as due, as the tick reads it.
     """
     try:
         with open(ROSTER, encoding="utf-8") as fh:
@@ -60,7 +72,10 @@ def due(now):
         if not job.get("enabled", True) or job.get("state") == PAUSED_STATE or job.get("paused_at"):
             continue
         next_run = job.get("next_run_at")
-        if next_run and datetime.fromisoformat(next_run) <= now:
+        if not isinstance(next_run, str) or not next_run:
+            continue
+        when = stamp(next_run)
+        if when is None or when <= now:
             count += 1
     return count
 
@@ -76,7 +91,11 @@ if os.path.exists(LEDGER):
             f"SELECT claimed_at FROM executions WHERE job_id IN ({placeholders}) AND status IN (?, ?)",
             (*audits, *IN_FLIGHT),
         ).fetchall()
-        count += sum(1 for (claimed,) in rows if claimed and datetime.fromisoformat(claimed) >= since)
+        # A row whose stamp does not parse counts: it is claimed or running, and its age unknown.
+        for (claimed,) in rows:
+            when = stamp(claimed)
+            if when is None or when >= since:
+                count += 1
     finally:
         conn.close()
 print(count)

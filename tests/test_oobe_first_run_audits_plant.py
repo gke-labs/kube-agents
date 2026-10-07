@@ -306,6 +306,24 @@ class PlantScriptsTest(unittest.TestCase):
         done = self._run("in_flight.py", str(self.home), *AUDITS)
         self.assertEqual(done.stdout.strip(), "1", done.stderr)
 
+    def test_in_flight_reads_odd_timestamps_as_the_tick_does(self):
+        # A naive stamp is local time; one that does not parse is due; a missing one is not.
+        cron = self.home / "profiles" / "platform" / "cron"
+        cron.mkdir(parents=True)
+        naive_past = (datetime.now() - timedelta(minutes=1)).replace(microsecond=0).isoformat()
+        roster = [
+            {"id": "compliance-audit", "enabled": True, "next_run_at": naive_past},
+            {"id": "obtainability-audit", "enabled": True, "next_run_at": "not a time"},
+            {"id": "stockout-prevention", "enabled": True},
+            {"id": "fleet-wide-cost-analysis", "enabled": True, "next_run_at": None},
+        ]
+        (cron / "jobs.json").write_text(json.dumps({"jobs": roster}))
+        with sqlite3.connect(cron / "executions.db") as con:
+            con.execute("CREATE TABLE executions (id TEXT, job_id TEXT, status TEXT, claimed_at TEXT)")
+            con.execute("INSERT INTO executions VALUES ('1', 'stockout-prevention', 'running', 'garbled')")
+        done = self._run("in_flight.py", str(self.home), *AUDITS)
+        self.assertEqual(done.stdout.strip(), "3", done.stderr)
+
     def test_in_flight_with_no_store_is_zero(self):
         self.assertEqual(self._run("in_flight.py", str(self.home), *AUDITS).stdout.strip(), "0")
 
@@ -338,6 +356,9 @@ class PlantScriptsTest(unittest.TestCase):
         wait = teardown.index("self.triggers.busy_b64")
         self.assertLess(teardown.index("self.triggers.disarm_b64"), wait)
         self.assertIn("self.triggers.busy_wait", teardown[wait:])
+        # Under errexit a failed disarm would end the script before the wait.
+        disarm = teardown[teardown.index("self.triggers.disarm_b64"):wait]
+        self.assertIn("|| echo", disarm)
 
     def test_the_stack_names_the_audits_the_stage_starts(self):
         # Read both lists back from source, so a fifth audit added to either is caught.

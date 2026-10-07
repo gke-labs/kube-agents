@@ -984,6 +984,7 @@ declared_audit_streams_for_task() { # <task.yaml, relative to BENCH_DIR or absol
       gsub(/[^A-Za-z0-9_.-]+/, " ", line)
       out = out " " line
     }
+    /^[[:space:]]*(#|$)/ { next }
     reading && /^[^[:space:]]/ { exit }
     reading { take($0); next }
     /^audit_streams:/ { reading = 1; line = $0; sub(/^audit_streams:/, "", line); take(line) }

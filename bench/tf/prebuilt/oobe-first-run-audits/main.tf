@@ -230,7 +230,10 @@ resource "null_resource" "oobe" {
       # the audit still going, or marked and not yet claimed, to end. A count
       # that cannot be read is not "none running"; past the bound it stops
       # waiting.
-      printf '%s' '${self.triggers.disarm_b64}' | base64 -d | agent_py "${self.triggers.home}" "${self.triggers.hermes}"
+      # A failed disarm still waits: with the stage armed, the count below
+      # includes what it goes on marking, and the wait is bounded either way.
+      printf '%s' '${self.triggers.disarm_b64}' | base64 -d | agent_py "${self.triggers.home}" "${self.triggers.hermes}" \
+        || echo "WARNING: could not disarm the oobe stage; waiting for its audits anyway." >&2
 
       elapsed=0
       until busy="$(printf '%s' '${self.triggers.busy_b64}' | base64 -d | agent_py "${self.triggers.home}" ${self.triggers.audits})" && [ "$busy" = 0 ]; do

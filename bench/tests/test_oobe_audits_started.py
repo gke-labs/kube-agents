@@ -165,6 +165,9 @@ def test_the_audit_list_matches_the_stage(store: Store) -> None:
         if isinstance(node, ast.Assign) and any(getattr(t, "id", "") == "FIRST_RUN_AUDITS" for t in node.targets)
     )
     assert tuple(shipped) == oobe.FIRST_RUN_AUDITS
+    # The streams the case makes the runner lock: every audit the stage starts, and no other.
+    declared = yaml.safe_load(TASK.read_text().split("\n---\n", 1)[1])["audit_streams"]
+    assert sorted(declared) == sorted(shipped)
 
 
 def test_a_run_from_before_the_arm_does_not_count(store: Store) -> None:
