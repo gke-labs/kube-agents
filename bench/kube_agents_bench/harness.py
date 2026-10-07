@@ -1225,7 +1225,7 @@ class _TransportError(RuntimeError):
 # true of an opening turn and of a status poll alike, where the delegating
 # turn already ran but this poll was refused at the door -- and the condition
 # clears when a slot frees, the same run class as a saturated gateway. On
-# exhaustion both turn paths deliberately end in _infra_failure rather than
+# pure transport exhaustion both turn paths deliberately end in _infra_failure rather than
 # grading a partial record: see _DelegationTransportExhausted for why settling
 # the cards into a record that is about to be replaced wholesale is not a
 # rescue. A client error (non-429 4xx), a 500, or a body that is not JSON is an
@@ -2457,10 +2457,11 @@ class KubeAgentsHarness(AgentHarness):
                 # before -- recorded, not just logged, which is what stops
                 # devops-bench promoting the partial record.
                 answered = [e for e in failures if not e.retryable]
-                reasons = sorted({e.failure_reason for e in answered if e.failure_reason})
+                reasons = sorted({(e.failure_reason or "unknown") for e in answered if e.failure_reason is not None})
                 reason_detail = f" ({', '.join(reasons)})" if reasons else ""
                 report = (
-                    f"status turns failed with answered errors{reason_detail} {len(failures)} times running; "
+                    f"status turns failed with {len(answered)} answered{reason_detail}, "
+                    f"{len(failures) - len(answered)} in transport; "
                     "still waiting on: " + ", ".join(outstanding) + "; "
                     f"tunnel log: {_tail(_pf_log_path(local_port))}"
                 )

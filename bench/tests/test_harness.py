@@ -201,13 +201,12 @@ class _StubAgentHandler(BaseHTTPRequestHandler):
         headers = {}
         if self.server.session_id:
             headers["X-Hermes-Session-Id"] = self.server.session_id
-        fail_headers = dict(
+        fail_headers = dict(headers)
+        fail_headers.update(
             self.server.fail_headers_by_request.get(
                 len(self.server.requests), self.server.fail_headers
             )
         )
-        if self.server.session_id:
-            fail_headers.setdefault("X-Hermes-Session-Id", self.server.session_id)
         if len(self.server.requests) in self.server.fail_on:
             self._respond(
                 self.server.fail_on_status,
@@ -2543,7 +2542,7 @@ def test_status_turns_the_endpoint_answered_still_grade_the_partial_record(
     result = KubeAgentsHarness().run("Find the root cause.")
 
     assert result.has_errors()
-    assert "status turns failed with answered errors 3 times running" in result.errors[0]
+    assert "status turns failed with 3 answered, 0 in transport" in result.errors[0]
     assert _TASK_ID in result.errors[0]
     assert harness.INFRA_FAILURE_MARKER not in result.errors[0]
     # The delegation turn survived.
@@ -2582,7 +2581,7 @@ def test_a_status_turn_502_with_persistent_tool_error_is_graded_after_exhaustion
 
     assert result.has_errors()
     assert harness.INFRA_FAILURE_MARKER not in result.errors[0]
-    assert "status turns failed with answered errors (tool_error) 3 times running" in result.errors[0]
+    assert "status turns failed with 3 answered (tool_error), 0 in transport" in result.errors[0]
     assert len(stub_agent.requests) == 1 + harness._MAX_TRANSPORT_FAILURES
     assert recorded_pf_resets == []
 
@@ -2616,7 +2615,7 @@ def test_a_status_turn_502_with_persistent_empty_failure_reason_is_graded(
 
     assert result.has_errors()
     assert harness.INFRA_FAILURE_MARKER not in result.errors[0]
-    assert "status turns failed with answered errors 3 times running" in result.errors[0]
+    assert "status turns failed with 3 answered (unknown), 0 in transport" in result.errors[0]
     assert len(stub_agent.requests) == 1 + harness._MAX_TRANSPORT_FAILURES
     assert recorded_pf_resets == []
 
@@ -2646,7 +2645,7 @@ def test_status_turns_with_mixed_transport_and_answered_failures_settle_and_grad
 
     assert result.has_errors()
     assert harness.INFRA_FAILURE_MARKER not in result.errors[0]
-    assert "status turns failed with answered errors (tool_error) 3 times running" in result.errors[0]
+    assert "status turns failed with 1 answered (tool_error), 2 in transport" in result.errors[0]
     assert len(stub_agent.requests) == 4
     # Tunnel reset occurred on request 2 (retryable), not request 3 (answered) or request 4 (streak limit reached)
     assert len(recorded_pf_resets) == 1
@@ -2672,7 +2671,7 @@ def test_status_turns_with_answered_then_transport_failures_settle_and_grade(
 
     assert result.has_errors()
     assert harness.INFRA_FAILURE_MARKER not in result.errors[0]
-    assert "status turns failed with answered errors (tool_error) 3 times running" in result.errors[0]
+    assert "status turns failed with 2 answered (tool_error), 1 in transport" in result.errors[0]
     assert len(stub_agent.requests) == 4
     assert len(recorded_pf_resets) == 0
 
@@ -3663,7 +3662,7 @@ def test_a_status_turn_502_with_rate_limit_on_answer_turn_is_an_agent_error_not_
     assert result.has_errors()
     assert harness.INFRA_FAILURE_MARKER not in result.errors[0]
     assert harness.DELEGATION_CEILING_MARKER not in result.errors[0]
-    assert "status turns failed with answered errors (rate_limit) 3 times running" in result.errors[0]
+    assert "status turns failed with 3 answered (rate_limit), 0 in transport" in result.errors[0]
     assert len(stub_agent.requests) == 5
     assert result.output == _FINAL_TEXT
     assert _archived(scripts)
