@@ -254,6 +254,18 @@ func (m *IdentityMap) Lookup(serviceAccount string) (Identity, bool) {
 	return Identity{}, false
 }
 
+// Profiles returns the AgentProfile names the map's profile entries execute
+// for: addressees no narrowed pod may be named after.
+func (m *IdentityMap) Profiles() []string {
+	var profiles []string
+	for _, id := range m.Identities {
+		if id.Narrowing == NarrowingProfile {
+			profiles = append(profiles, id.Profile)
+		}
+	}
+	return profiles
+}
+
 // Users returns the NATS user names the map serves, sorted. The operator reads
 // this back when deciding whether the callout is serving the identity a
 // workload is about to need.

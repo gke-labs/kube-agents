@@ -426,3 +426,19 @@ func TestAProfileMayNotPublishAnotherAgentsTopic(t *testing.T) {
 		t.Error("the map parsed a profile entry publishing another agent's topic")
 	}
 }
+
+// A session-ServiceAccount pod named after a profile would be minted that
+// profile's events and input, since a session's subjects are its pod name. The
+// callout refuses it at connect; a real session name still connects.
+func TestASessionPodNamedAfterAProfileIsRefused(t *testing.T) {
+	const tokenSessionNamedAuditor = "token-for-a-session-sa-pod-named-like-the-auditor-profile-pad"
+	tokens := profileTokens()
+	tokens[tokenSessionNamedAuditor] = Attested{ServiceAccount: sessionSA, PodName: auditor, PodUID: "uid-s"}
+	h := startHarness(t, profileMap, tokens)
+	if nc, err := nats.Connect(h.url, nats.Token(tokenSessionNamedAuditor), nats.CustomInboxPrefix("_INBOX."+auditor)); err == nil {
+		nc.Close()
+		t.Fatal("a session pod named after the auditor profile connected; it would hold the profile's task plane")
+	}
+	nc, violations := h.connectAs(t, podA, tokenPodA)
+	checkPublish(t, nc, violations, map[string]bool{lib.TaskEventsSubject(podA, "t"): false})
+}

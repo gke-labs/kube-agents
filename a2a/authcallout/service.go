@@ -368,6 +368,14 @@ func (s *Service) authorize(ctx context.Context, req *jwt.AuthorizationRequestCl
 		if slices.Contains(m.Users(), user) {
 			return "", nil, "", fmt.Errorf("%s narrows on pod %q, which is the name of a mapped principal; its inbox is that principal's", att.ServiceAccount, user)
 		}
+		// A pod named after an AgentProfile would be that profile's
+		// addressee: a session pod's subjects are its pod name, so a
+		// session-ServiceAccount pod named `auditor` would be minted the
+		// auditor profile's events and input. Profile names come from the
+		// map's profile entries, so this follows a map reload.
+		if slices.Contains(m.Profiles(), user) {
+			return "", nil, "", fmt.Errorf("%s narrows on pod %q, which is an AgentProfile's addressee; its task subjects are that profile's", att.ServiceAccount, user)
+		}
 	}
 
 	// Deny-by-default is a property of a grant set with entries in it. An
