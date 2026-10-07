@@ -37,6 +37,18 @@ def node(name, labels=None, taints=None):
     }
 
 
+def pool(name, labels=None, taints=None, autoscaling=None):
+    config = {}
+    if labels is not None:
+        config["labels"] = labels
+    if taints is not None:
+        config["taints"] = taints
+    res = {"name": name, "config": config}
+    if autoscaling is not None:
+        res["autoscaling"] = autoscaling
+    return res
+
+
 def namespace(name, labels=None):
     return {
         "apiVersion": "v1",
@@ -353,9 +365,28 @@ class TestUntargetedComputeClassWorkload(unittest.TestCase):
         hit_dne = collect.check_untargeted_compute_class_workload(wl_dne, ctx)
         self.assertIsNotNone(hit_dne)
 
-    def test_the_dump_asks_for_nodes_and_namespaces(self):
-        self.assertIn("nodes", collect.DUMP_COMMAND_KINDS)
+    def test_the_dump_asks_for_namespaces_and_not_nodes(self):
+        self.assertNotIn("nodes", collect.DUMP_COMMAND_KINDS)
         self.assertIn("namespaces", collect.DUMP_COMMAND_KINDS)
+
+    def test_negative_non_cc_pool_autoscaled_to_zero_does_not_flag_workloads(self):
+        # A general-purpose pool with 0 live nodes (autoscaling min 0) provides untainted
+        # capacity outside ComputeClass, preventing false major findings.
+        cc_pool = pool("cc-pool", labels={"cloud.google.com/compute-class": "standard-cc"})
+        zero_pool = pool(
+            "general-pool",
+            labels={},
+            taints=[],
+            autoscaling={"enabled": True, "minNodeCount": 0, "maxNodeCount": 5},
+        )
+        wl = collect.normalize_workloads({"items": [deployment("api")]})[0]
+        ctx = {
+            "compute_classes": [self.cc],
+            "node_pools": [cc_pool, zero_pool],
+            "namespaces": [self.ns],
+        }
+        hit = collect.check_untargeted_compute_class_workload(wl, ctx)
+        self.assertIsNone(hit)
 
     def test_dedicated_taint_on_compute_class_is_excluded(self):
         dedicated_cc = compute_class("dedicated", taints=[{"key": "team", "effect": "NoSchedule"}])
@@ -498,7 +529,7 @@ class TestUntargetedComputeClassWorkload(unittest.TestCase):
             "impact description",
         )
         fake_dump = {
-            "items": [deployment("api"), self.base_node, self.ns]
+            "items": [deployment("api"), self.ns]
         }
         tmp_dump = self._create_dump_file(fake_dump)
         with patch.object(collect, "dump_state") as mock_dump:
@@ -516,7 +547,6 @@ class TestUntargetedComputeClassWorkload(unittest.TestCase):
                     run=MagicMock(),
                 )
                 self.assertIn("untargeted-compute-class-workload", cc_context.context.get("not_applicable", {}))
-                self.assertEqual([self.base_node], cc_context.context.get("nodes"))
                 self.assertEqual([self.ns], cc_context.context.get("namespaces"))
 
     def test_collect_obtainability_timeout_sets_unevaluated(self):
@@ -529,7 +559,7 @@ class TestUntargetedComputeClassWorkload(unittest.TestCase):
             "impact description",
         )
         fake_dump = {
-            "items": [deployment("api"), self.base_node, self.ns]
+            "items": [deployment("api"), self.ns]
         }
         tmp_dump = self._create_dump_file(fake_dump)
         with patch.object(collect, "dump_state") as mock_dump:
@@ -547,7 +577,6 @@ class TestUntargetedComputeClassWorkload(unittest.TestCase):
                     run=MagicMock(),
                 )
                 self.assertIn("untargeted-compute-class-workload", cc_context.context.get("unevaluated", {}))
-                self.assertEqual([self.base_node], cc_context.context.get("nodes"))
                 self.assertEqual([self.ns], cc_context.context.get("namespaces"))
 
     def test_collect_obtainability_success_records_computeclasses_command(self):
@@ -560,8 +589,46 @@ class TestUntargetedComputeClassWorkload(unittest.TestCase):
             "impact description",
         )
         fake_dump = {
-            "items": [deployment("api"), self.base_node, self.ns]
+            "items": [deployment("api"), self.ns]
         }
+        tmp_dump = self._create_dump_file(fake_dump)
+        cc_stdout = json.dumps({"items": [self.cc]})
+        test_pool = pool("base-pool", labels={"cloud.google.com/compute-class": "standard-cc"})
+        np_stdout = json.dumps([test_pool])
+        with patch.object(collect, "dump_state") as mock_dump:
+            mock_dump.return_value = (tmp_dump, MagicMock(rc=0, duration_s=0.1, stdout="{}"), True)
+
+            with patch.object(collect, "run_and_gate") as mock_run_and_gate:
+                mock_run_and_gate.side_effect = [
+                    ({"items": [self.cc]}, MagicMock(rc=0, duration_s=0.05, stdout=cc_stdout)),
+                    ([test_pool], MagicMock(rc=0, duration_s=0.08, stdout=np_stdout)),
+                ]
+                cc_context = collect._collect_obtainability(
+                    {"name": "c1", "project": "p1", "location": "l1"},
+                    Path("/fake/kubeconfig"),
+                    (spec,),
+                    run=MagicMock(),
+                )
+                self.assertEqual([self.ns], cc_context.context.get("namespaces"))
+                self.assertEqual([self.cc], cc_context.context.get("compute_classes"))
+                self.assertEqual([test_pool], cc_context.context.get("node_pools"))
+                cmd_rec = cc_context.commands.get("untargeted-compute-class-workload")
+                self.assertIsNotNone(cmd_rec)
+                self.assertIn("kubectl get computeclasses -A -o json", cmd_rec["command"])
+                self.assertEqual(0, cmd_rec["rc"])
+                self.assertEqual(0.05, cmd_rec["duration_s"])
+                self.assertEqual(cmd_rec["output_sha256"], collect.output_digest(cc_stdout))
+
+    def test_collect_obtainability_autopilot_skips_node_pools_list(self):
+        spec = collect.CheckSpec(
+            "untargeted-compute-class-workload",
+            "workload",
+            collect.check_untargeted_compute_class_workload,
+            "major",
+            None,
+            "impact description",
+        )
+        fake_dump = {"items": [deployment("api"), self.ns]}
         tmp_dump = self._create_dump_file(fake_dump)
         cc_stdout = json.dumps({"items": [self.cc]})
         with patch.object(collect, "dump_state") as mock_dump:
@@ -573,20 +640,14 @@ class TestUntargetedComputeClassWorkload(unittest.TestCase):
                     MagicMock(rc=0, duration_s=0.05, stdout=cc_stdout),
                 )
                 cc_context = collect._collect_obtainability(
-                    {"name": "c1", "project": "p1", "location": "l1"},
+                    {"name": "c1", "project": "p1", "location": "l1", "autopilot": True},
                     Path("/fake/kubeconfig"),
                     (spec,),
                     run=MagicMock(),
                 )
-                self.assertEqual([self.base_node], cc_context.context.get("nodes"))
-                self.assertEqual([self.ns], cc_context.context.get("namespaces"))
-                self.assertEqual([self.cc], cc_context.context.get("compute_classes"))
-                cmd_rec = cc_context.commands.get("untargeted-compute-class-workload")
-                self.assertIsNotNone(cmd_rec)
-                self.assertIn("kubectl get computeclasses -A -o json", cmd_rec["command"])
-                self.assertEqual(0, cmd_rec["rc"])
-                self.assertEqual(0.05, cmd_rec["duration_s"])
-                self.assertEqual(cmd_rec["output_sha256"], collect.output_digest(cc_stdout))
+                # On Autopilot, node-pools list is skipped because it returns 400
+                self.assertEqual(1, mock_run_and_gate.call_count)
+                self.assertEqual([], cc_context.context.get("node_pools"))
 
 
 if __name__ == "__main__":
