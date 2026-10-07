@@ -360,6 +360,23 @@ Deployment passes its readiness probe. The chart never imports it;
 `install.sh --github-pem-path` does, or you import it yourself Ahead-Of-Time —
 see the [Token minter guide](https://gke-labs.github.io/kube-agents/deploy/token-minter/).
 
+### Web console
+
+`webConsole.*` renders the web console's Deployment, a ClusterIP Service and a
+deny-all ingress NetworkPolicy. `enabled` defaults to `false`;
+`install.sh --enable-web-console` turns it on, and the render fails if it is set
+without `platformAgent.enabled`. The Service type is not configurable,
+because the console holds the agent's API key and has no login of its own:
+`kubectl port-forward` is the only way in. When `litellm.enabled`, the chart
+also renders a headless Service, `<release>-web-console-litellm-peers`, that
+selects the LiteLLM pods so the console can read each replica's token and spend
+counters. `webConsole.agentIdentity.gcpServiceAccount` and `.roles` record the
+agent's Google Cloud identity for the console's About panel; the Terraform
+composition fills them from the IAM module, and the console never reads IAM
+itself. The
+[Web console page](https://gke-labs.github.io/kube-agents/deploy/web-console/)
+is canonical for what it does and how it is reached.
+
 ### Telemetry
 
 `telemetry.otlpEndpoint` (default `""`) is the OTLP/HTTP collector base URL.
@@ -694,7 +711,8 @@ creation. `--set quotaPreflight.enabled=false` skips it.
 What it sums: the chart's own workloads from `values.yaml` — the operator, LiteLLM and
 the GitHub minter, each multiplied by its `replicaCount`, Hindsight's two pods, which
 have no replica count to multiply, and the pre-delete cleanup hook Job (one pod, when
-`platformAgent.cleanupHook.enabled` is true) — plus the pods the operator renders, whose
+`platformAgent.cleanupHook.enabled` is true) and the web console (one pod, when
+`webConsole.enabled` is true) — plus the pods the operator renders, whose
 sizes come from `files/footprint.yaml` because the chart cannot render them itself. The agent
 pod is multiplied by `platformAgent.deployment.availability.replicas`; the shell sandbox, the
 credential proxy and the PersistentVolumeClaims are not, because they do not scale with

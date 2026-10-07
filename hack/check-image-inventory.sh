@@ -153,6 +153,8 @@ check_base_image golang a2a/Dockerfile.gateway GOLANG_IMAGE GOLANG_VERSION
 check_base_image distroless-static a2a/Dockerfile.gateway DISTROLESS_IMAGE DISTROLESS_VERSION
 check_base_image golang a2a/Dockerfile.verifier GOLANG_IMAGE GOLANG_VERSION
 check_base_image distroless-static a2a/Dockerfile.verifier DISTROLESS_IMAGE DISTROLESS_VERSION
+check_base_image golang a2a/Dockerfile.web-console GOLANG_IMAGE GOLANG_VERSION
+check_base_image distroless-static a2a/Dockerfile.web-console DISTROLESS_IMAGE DISTROLESS_VERSION
 check_base_image golang a2a/Dockerfile.worker GOLANG_IMAGE GOLANG_VERSION
 check_base_image node a2a/Dockerfile.worker NODE_IMAGE NODE_VERSION
 # The Hermes bridge sidecar (a2a/Dockerfile.hermes-bridge) has only its
@@ -216,6 +218,7 @@ check_go_directive a2a/Dockerfile.gateway GOLANG_VERSION a2a/go.mod
 check_go_directive a2a/Dockerfile.verifier GOLANG_VERSION a2a/go.mod
 check_go_directive a2a/Dockerfile.worker GOLANG_VERSION a2a/go.mod
 check_go_directive a2a/Dockerfile.hermes-bridge GOLANG_VERSION a2a/go.mod
+check_go_directive a2a/Dockerfile.web-console GOLANG_VERSION a2a/go.mod
 
 # hermes-agent is the one base image whose tag lives outside the Dockerfile —
 # the release workflows read tags.env — so the inventory points at that file
@@ -534,6 +537,7 @@ check_mirror_prefix "$LABEL_MIRRORED" "$mirrored_images"
 check_mirror_names "$LABEL_MIRRORED" "$mirrored_images"
 
 check_toggle githubMinter "${MINTER_VALUES[@]}"
+check_toggle webConsole --set webConsole.enabled=true
 
 # ---------------------------------------------------------------------------
 # 4. The example manifests. They are applied by hand rather than rendered by

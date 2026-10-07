@@ -900,6 +900,18 @@ resource "helm_release" "kube_agents" {
         gsaName = module.github_minter[0].service_account_id
       } : {}
     )
+    # The browser chat page for installs with no chat platform. Its image
+    # follows platformAgent.deployment.image.tag and global.imageRegistry,
+    # and its Service is ClusterIP by construction. agentIdentity is what the
+    # console's identity box shows: the console holds no credentials to read
+    # IAM, so the agent's GSA and project roles are recorded here at apply.
+    webConsole = {
+      enabled = var.web_console_enabled
+      agentIdentity = {
+        gcpServiceAccount = module.kube_agents_iam.service_account_email
+        roles             = sort(module.kube_agents_iam.agent_project_roles)
+      }
+    }
     plugins = {
       pubsubPlatform = merge(
         {

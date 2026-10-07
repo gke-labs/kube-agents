@@ -1,0 +1,187 @@
+{{- /*
+The web console: a browser chat page for the Platform Agent, for installs with
+no chat platform configured. docs/site/src/content/docs/deploy/web-console.md
+is the user-facing page.
+
+Access is `kubectl port-forward` and nothing else, and three things here hold
+that line. The Service is ClusterIP with no way to change its type. The
+NetworkPolicy refuses all ingress from the pod network, so no other workload
+can reach the console and borrow the agent API key it holds — port-forwards
+enter from the node, which NetworkPolicy does not govern, and so do kubelet
+probes. And the binary refuses any Host that is not loopback, so a forwarded
+port cannot be reached through a rebinding DNS name in the operator's browser.
+
+One replica on purpose: a port-forward lands on one pod, and the console keeps
+which sessions have a turn in flight in memory.
+
+The metrics banner reads LiteLLM's Prometheus counters from every replica. The
+headless Service below gives the console their pod IPs through DNS, so it needs
+no Kubernetes API access. litellm-policy (this chart's copy, and the
+operator's) admits every pod in the namespace on 8080, and the console's own
+NetworkPolicy governs ingress only, so the fetch is allowed both ways. The
+model and the agent identity are passed in as env at install; the console has
+no credentials to read IAM.
+*/ -}}
+{{- if .Values.webConsole.enabled }}
+{{- if not .Values.platformAgent.enabled }}
+{{- fail "webConsole.enabled is set but platformAgent.enabled is false; the web console is a chat page for the Platform Agent and has nothing to talk to without it" }}
+{{- end }}
+{{- $agentName := .Values.platformAgent.name | default "platform-agent" }}
+{{- $secretName := .Values.platformAgent.credentials.secretName | default "platform-agent-secrets" }}
+{{- /* Same tag resolution as the plugin images: an install pinned to an agent image of one commit gets the console of that commit. */ -}}
+{{- $tag := .Values.webConsole.image.tag | default .Values.platformAgent.deployment.image.tag | default .Chart.AppVersion }}
+{{- $repo := include "kube-agents.imageRepository" (dict "repository" .Values.webConsole.image.repository "registry" (include "kube-agents.imageRegistry" .)) }}
+{{- $identity := .Values.webConsole.agentIdentity | default dict }}
+{{- /* A Service name is a DNS label: 63 characters at most. LITELLM_PEERS_HOST uses the same value. */ -}}
+{{- $peersName := printf "%s-web-console-litellm-peers" .Release.Name | trunc 63 | trimSuffix "-" }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Release.Name }}-web-console
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: web-console
+    app.kubernetes.io/component: web-console
+    {{- include "kube-agents.labels" . | nindent 4 }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: web-console
+      app.kubernetes.io/instance: {{ .Release.Name }}
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: web-console
+        app.kubernetes.io/instance: {{ .Release.Name }}
+        app.kubernetes.io/component: web-console
+        {{- include "kube-agents.labels" . | nindent 8 }}
+    spec:
+      {{- with include "kube-agents.imagePullSecrets" . }}
+      imagePullSecrets:
+        {{- . | nindent 8 }}
+      {{- end }}
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: web-console
+          image: {{ printf "%s:%s" $repo $tag | quote }}
+          {{- /* A cached `latest` never picks up a new build, so pull it every time. */}}
+          imagePullPolicy: {{ .Values.webConsole.image.pullPolicy | default (ternary "Always" "IfNotPresent" (eq $tag "latest")) }}
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          env:
+            - name: PORT
+              value: "8080"
+            - name: HERMES_URL
+              value: {{ printf "http://%s.%s.svc.cluster.local:8642" $agentName .Release.Namespace | quote }}
+            - name: CLUSTER_NAME
+              value: {{ .Values.platformAgent.harness.clusterName | default "" | quote }}
+            - name: PROJECT_ID
+              value: {{ .Values.platformAgent.harness.projectId | default "" | quote }}
+            - name: LOCATION
+              value: {{ .Values.platformAgent.harness.location | default "" | quote }}
+            {{- if .Values.litellm.enabled }}
+            - name: MODEL_NAME
+              value: {{ include "kube-agents.litellmModel" . | quote }}
+            - name: MODEL_PROVIDER
+              value: {{ .Values.litellm.modelProvider | quote }}
+            - name: LITELLM_PEERS_HOST
+              value: {{ printf "%s.%s.svc.cluster.local" $peersName .Release.Namespace | quote }}
+            {{- end }}
+            - name: AGENT_KSA
+              value: {{ .Values.platformAgent.security.serviceAccountName | default "" | quote }}
+            - name: AGENT_GSA
+              value: {{ $identity.gcpServiceAccount | default "" | quote }}
+            - name: AGENT_ROLES
+              value: {{ join "," ($identity.roles | default list) | quote }}
+            - name: API_SERVER_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $secretName | quote }}
+                  key: API_SERVER_KEY
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          resources:
+            {{- toYaml .Values.webConsole.resources | nindent 12 }}
+          securityContext:
+            {{- toYaml .Values.webConsole.securityContext | nindent 12 }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Release.Name }}-web-console
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: web-console
+    app.kubernetes.io/component: web-console
+    {{- include "kube-agents.labels" . | nindent 4 }}
+spec:
+  type: ClusterIP
+  ports:
+    - name: http
+      port: {{ .Values.webConsole.service.port | default 8080 }}
+      targetPort: http
+      protocol: TCP
+  selector:
+    app.kubernetes.io/name: web-console
+    app.kubernetes.io/instance: {{ .Release.Name }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ .Release.Name }}-web-console
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: web-console
+    app.kubernetes.io/component: web-console
+    {{- include "kube-agents.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: web-console
+      app.kubernetes.io/instance: {{ .Release.Name }}
+  policyTypes:
+    - Ingress
+  ingress: []
+{{- if .Values.litellm.enabled }}
+---
+{{- /* Headless: DNS answers with one A record per ready LiteLLM pod, which is
+       how the console finds every replica to read. */}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $peersName }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: web-console
+    app.kubernetes.io/component: web-console
+    {{- include "kube-agents.labels" . | nindent 4 }}
+spec:
+  clusterIP: None
+  ports:
+    - name: metrics
+      port: 8080
+      targetPort: 8080
+      protocol: TCP
+  selector:
+    app: litellm
+{{- end }}
+{{- end }}

@@ -1085,3 +1085,43 @@ plugins:
       sink: gke-stockout-alerts-sink
       thresholdCount: 1
       thresholdWindowSeconds: 300
+
+# Web console: a browser chat page for the Platform Agent, for installs with no
+# Slack or Google Chat configured. It talks to the Hermes gateway on the agent
+# Service with the agent's API_SERVER_KEY, which stays in the pod. It is
+# reachable only through `kubectl port-forward`: the Service is always
+# ClusterIP and a NetworkPolicy refuses ingress from every other pod. See
+# docs/site/src/content/docs/deploy/web-console.md.
+webConsole:
+  enabled: false
+  image:
+    repository: ghcr.io/gke-labs/kube-agents/web-console
+    tag: "" # defaults to platformAgent.deployment.image.tag, then Chart.appVersion
+    pullPolicy: "" # defaults to Always for the latest tag, IfNotPresent otherwise
+  service:
+    port: 8080
+  # The agent's Google identity, shown in the console's identity box. The
+  # console holds no credentials to read IAM, so these are recorded at
+  # install: the Terraform composition fills them from the kube-agents-iam
+  # module. A role granted later is not shown until the next install.
+  agentIdentity:
+    # The Google service account the agent's KSA maps to through Workload
+    # Identity.
+    gcpServiceAccount: ""
+    # Project-level IAM roles granted to that service account.
+    roles: []
+  resources:
+    limits:
+      cpu: 200m
+      memory: 128Mi
+    requests:
+      cpu: 50m
+      memory: 32Mi
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 65532
+    readOnlyRootFilesystem: true
+    allowPrivilegeEscalation: false
+    capabilities:
+      drop:
+        - ALL

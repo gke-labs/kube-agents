@@ -137,13 +137,13 @@ Both jobs fire every minute (`* * * * *`, see [Autonomous watchdogs](/kube-agent
 
 ## What's not here
 
-- **No user-facing web UI.** Chat is the primary surface. The one web UI the install can run is the Hermes dashboard, a per-pod debugging view the installer offers as `--enable-hermes-dashboard` (off by default there; the CRD's own default is on) that binds loopback inside the pod, so reaching it means a port-forward or the tunnel script — [PlatformAgent CRD](/kube-agents/operator/platformagent-crd/#specharness) is canonical. A local [admin console](/kube-agents/reference/admin-console/) runs from a repository checkout on your own machine, loopback only; the install does not deploy it.
+- **No user-facing web UI by default.** Chat is the primary surface. The install can run two web UIs, both off by default. The [web console](/kube-agents/deploy/web-console/) is a browser page, reached only through `kubectl port-forward`. Its threads reach the Planning Agent front door, and its channels show event triage and scheduled checks. The other is the Hermes dashboard, a per-pod debugging view the installer offers as `--enable-hermes-dashboard` (off by default there; the CRD's own default is on) that binds loopback inside the pod, so reaching it means a port-forward or the tunnel script — [PlatformAgent CRD](/kube-agents/operator/platformagent-crd/#specharness) is canonical. A local [admin console](/kube-agents/reference/admin-console/) runs from a repository checkout on your own machine, loopback only; the install does not deploy it.
 - **No CLI beyond the Hermes CLI inside the pod.** `kubectl exec` into the agent pod and run the Hermes CLI there — note the pod hosts several profiles, so a bare `hermes` command talks to the locked-down Planning Agent; use `hermes -p platform` to reach the Platform Agent (or `hermes -p <cluster-profile>` for a Cluster Agent). `kubectl port-forward` is not a way in on a GKE Sandbox (gVisor) node pool, which is the install default: the forward is established in the host-side netns and cannot see a listener inside the sandbox — [PlatformAgent CRD](/kube-agents/operator/platformagent-crd/#specharness) is canonical on that. `kubectl exec` has no such problem, because it enters the sandbox.
 - **No email, PagerDuty, or generic webhook ingress.** Chat channels only.
 
 ## When no chat platform is enabled
 
-Both channels are opt-in and default to disabled, so an install that enabled neither has no chat to talk to. The Hermes CLI above is one way in, and the installer prints these two commands when you choose "None" at its chat prompt and again when it finishes:
+Both channels are opt-in and default to disabled, so an install that enabled neither has no chat to talk to. The [web console](/kube-agents/deploy/web-console/) is a browser alternative you turn on with `install.sh --enable-web-console`. Its channels also show event triage and scheduled checks. The Hermes CLI above is the other way in, and the installer prints these two commands when you choose "None" at its chat prompt and again when it finishes:
 
 ```bash
 gcloud container clusters get-credentials <cluster> --location <region> --project <project> --dns-endpoint
@@ -154,7 +154,7 @@ Pass `--dns-endpoint` only on a cluster that publishes an externally reachable D
 
 This reaches the Platform Agent directly, bypassing the front door: a request typed here is executed by the profile that receives it rather than being planned and filed as a kanban card. A bare `hermes` reaches the Planning Agent instead, which is where a chat message would have landed and which delegates as described above.
 
-The other way in is the [admin console](/kube-agents/reference/admin-console/), started from a repository checkout on your own machine: its Chat page reaches the Planning Agent through the front door, so a request typed there is planned and delegated the way a chat message would be.
+A third way in is the [admin console](/kube-agents/reference/admin-console/), started from a repository checkout on your own machine: its Chat page reaches the Planning Agent through the front door, so a request typed there is planned and delegated the way a chat message would be.
 
 Two things a chat-less install does not exercise. Scheduled reports and alert-driven triage are delivered only to enabled chat platforms — the delivery resolver enumerates Google Chat and Slack and nothing else — so neither arrives anywhere. And `bootstrap-inventory-delivery` waits for a human to connect over chat before it posts the first-run inventory report, so that report stays at `/opt/data/INVENTORY.md` on the shell sandbox pod's volume; read it with `kubectl exec -n kubeagents-system platform-agent-shell-0 -c shell -- cat /opt/data/INVENTORY.md` rather than waiting for it.
 

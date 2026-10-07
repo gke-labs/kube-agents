@@ -106,6 +106,14 @@
       "description": "The platform-agent image of the same commit plus the bridge binary that runs the platform persona as the bus executor (a2a/Dockerfile.hermes-bridge)."
     },
     {
+      "name": "web-console",
+      "origin": "first-party",
+      "repository": "ghcr.io/gke-labs/kube-agents/web-console",
+      "tagPolicy": "release",
+      "pulledBy": "The web console Deployment the chart renders when webConsole.enabled is true, and nothing on a default install. The chart takes the tag from webConsole.image.tag, else the agent image's tag, else the chart's appVersion.",
+      "description": "A browser chat page for the Platform Agent, reached through kubectl port-forward, that talks to the Hermes gateway on the agent Service (a2a/Dockerfile.web-console)."
+    },
+    {
       "name": "litellm",
       "origin": "third-party",
       "repository": "ghcr.io/berriai/litellm",
@@ -243,7 +251,7 @@
       "repository": "docker.io/library/golang",
       "tag": "1.27-alpine",
       "buildArg": "GOLANG_IMAGE",
-      "pulledBy": "deploy/docker/Dockerfile, k8s-operator/Dockerfile, a2a/Dockerfile.authcallout, a2a/Dockerfile.gateway, a2a/Dockerfile.hermes-bridge, a2a/Dockerfile.verifier and a2a/Dockerfile.worker builder stages.",
+      "pulledBy": "deploy/docker/Dockerfile, k8s-operator/Dockerfile, a2a/Dockerfile.authcallout, a2a/Dockerfile.gateway, a2a/Dockerfile.hermes-bridge, a2a/Dockerfile.verifier, a2a/Dockerfile.web-console and a2a/Dockerfile.worker builder stages.",
       "description": "Go toolchain for the operator and k8s-event-watcher builds."
     },
     {
@@ -270,7 +278,7 @@
       "repository": "gcr.io/distroless/static",
       "tag": "nonroot",
       "buildArg": "DISTROLESS_IMAGE",
-      "pulledBy": "k8s-operator/Dockerfile, a2a/Dockerfile.authcallout, a2a/Dockerfile.gateway and a2a/Dockerfile.verifier runtime stages.",
+      "pulledBy": "k8s-operator/Dockerfile, a2a/Dockerfile.authcallout, a2a/Dockerfile.gateway, a2a/Dockerfile.verifier and a2a/Dockerfile.web-console runtime stages.",
       "description": "Runtime base for the operator image."
     },
     {

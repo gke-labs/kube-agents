@@ -1,0 +1,2488 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>kube-agents</title>
+  <style>
+    :root {
+      --gcp-blue: #1a73e8;
+      --gcp-blue-hover: #1557b0;
+      --gcp-blue-light: #e8f0fe;
+      --text-primary: #202124;
+      --text-secondary: #5f6368;
+      --text-muted: #80868b;
+      --bg-page: #f8f9fa;
+      --bg-surface: #ffffff;
+      --border-color: #dadce0;
+      --border-subtle: #f1f3f4;
+      --green-bg: #e6f4ea;
+      --green-text: #137333;
+      --amber-bg: #fef7e0;
+      --amber-text: #b06000;
+      --red-bg: #fce8e6;
+      --red-text: #c5221f;
+      --rail-bg: #1f2b3d;
+      --rail-text: #c9d1dc;
+      --rail-muted: #8a97a8;
+      --rail-hover: #2b3a50;
+      --rail-active: #1a73e8;
+      --font-sans: 'Google Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      --font-mono: 'Roboto Mono', monospace;
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: var(--font-sans);
+      background-color: var(--bg-page);
+      color: var(--text-primary);
+      height: 100vh;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+      -webkit-font-smoothing: antialiased;
+    }
+    button { font-family: var(--font-sans); }
+    [hidden] { display: none !important; }
+
+    /* The page is one row: the rail, then the workspace. min-height: 0 on
+       every flex and grid child down to each scrolling list keeps a long
+       list from growing its column past the window, which would push the
+       message boxes off the bottom of the page. */
+    .app {
+      flex: 1;
+      min-height: 0;
+      display: grid;
+      grid-template-columns: 240px minmax(0, 1fr);
+      grid-template-rows: minmax(0, 1fr);
+    }
+
+    /* Left rail: workspace, channels, threads, chat sessions. */
+    .rail {
+      background: var(--rail-bg);
+      color: var(--rail-text);
+      display: flex;
+      flex-direction: column;
+      min-height: 0;
+    }
+
+    .workspace-head {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 14px 16px;
+      border-bottom: 1px solid #2f3e55;
+      flex-shrink: 0;
+    }
+
+    .brand-logo { height: 28px; width: 28px; flex-shrink: 0; }
+    .workspace-text { min-width: 0; }
+    .workspace-name { font-size: 15px; font-weight: 700; color: #ffffff; }
+    .workspace-cluster {
+      font-size: 11.5px;
+      color: var(--rail-muted);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .rail-scroll {
+      flex: 1 1 auto;
+      min-height: 0;
+      overflow-y: auto;
+      padding: 10px 0;
+    }
+
+    .rail-section { margin-bottom: 14px; }
+
+    .rail-heading {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 4px 16px;
+      font-size: 12px;
+      font-weight: 500;
+      color: var(--rail-muted);
+    }
+
+    .rail-add {
+      background: transparent;
+      border: none;
+      color: var(--rail-text);
+      font-size: 12px;
+      cursor: pointer;
+      padding: 2px 6px;
+      border-radius: 4px;
+    }
+
+    .rail-add:hover { background: var(--rail-hover); color: #ffffff; }
+
+    .rail-item {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      width: 100%;
+      background: transparent;
+      border: none;
+      color: var(--rail-text);
+      text-align: left;
+      font-size: 14px;
+      padding: 5px 16px;
+      cursor: pointer;
+      min-width: 0;
+    }
+
+    .rail-item:hover { background: var(--rail-hover); }
+    .rail-item.active { background: var(--rail-active); color: #ffffff; }
+    .rail-item.unread { color: #ffffff; font-weight: 700; }
+    .rail-item.static { cursor: default; color: var(--rail-muted); font-size: 13px; }
+    .rail-item.static:hover { background: transparent; }
+
+    .rail-label {
+      flex: 1;
+      min-width: 0;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .rail-count {
+      background: #e8453c;
+      color: #ffffff;
+      font-size: 11px;
+      font-weight: 700;
+      border-radius: 9px;
+      padding: 1px 7px;
+      flex-shrink: 0;
+    }
+
+    .rail-time { font-size: 11px; color: var(--rail-muted); flex-shrink: 0; }
+    .rail-item.active .rail-time { color: #d2e3fc; }
+
+    .thread {
+      display: flex;
+      align-items: center;
+    }
+
+    .thread .rail-item { flex: 1; padding-right: 4px; background: transparent; }
+    .thread:hover { background: var(--rail-hover); }
+    .thread.active { background: var(--rail-active); }
+    .thread.active .thread-remove { color: #d2e3fc; }
+
+    .thread-remove {
+      background: transparent;
+      border: none;
+      color: var(--rail-muted);
+      font-size: 15px;
+      cursor: pointer;
+      padding: 0 10px;
+      visibility: hidden;
+    }
+
+    .thread:hover .thread-remove { visibility: visible; }
+    .thread-remove:disabled { cursor: not-allowed; opacity: 0.4; }
+
+    .thread-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      flex-shrink: 0;
+    }
+
+    .thread-dot.unread { background: #ffffff; }
+    .thread-dot.busy { background: #fbbc04; animation: pulse 1.2s ease-in-out infinite; }
+
+    @keyframes pulse { 50% { opacity: 0.35; } }
+
+    .rail-foot {
+      border-top: 1px solid #2f3e55;
+      padding: 10px 16px;
+      flex-shrink: 0;
+    }
+
+    .btn-rail {
+      width: 100%;
+      background: transparent;
+      border: 1px solid #3c4d66;
+      color: var(--rail-text);
+      border-radius: 6px;
+      padding: 6px 10px;
+      font-size: 12px;
+      cursor: pointer;
+    }
+
+    .btn-rail:hover:not(:disabled) { background: var(--rail-hover); }
+    .btn-rail:disabled { cursor: not-allowed; opacity: 0.6; }
+
+    /* Workspace: top bar, metrics banner, then the panes. */
+    .workspace {
+      display: flex;
+      flex-direction: column;
+      min-height: 0;
+      min-width: 0;
+    }
+
+    .topbar {
+      background: var(--bg-surface);
+      border-bottom: 1px solid var(--border-color);
+      height: 52px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      padding: 0 20px;
+      flex-shrink: 0;
+    }
+
+    .view-head { min-width: 0; }
+    .view-title {
+      font-size: 16px;
+      font-weight: 700;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .view-sub {
+      font-size: 12px;
+      color: var(--text-secondary);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .header-actions {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      flex-shrink: 0;
+    }
+
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 12px;
+      font-weight: 500;
+      padding: 4px 10px;
+      border-radius: 12px;
+    }
+
+    .badge-dot { width: 7px; height: 7px; border-radius: 50%; }
+    .badge-green { background: var(--green-bg); color: var(--green-text); }
+    .badge-green .badge-dot { background: var(--green-text); }
+    .badge-amber { background: var(--amber-bg); color: var(--amber-text); }
+    .badge-amber .badge-dot { background: var(--amber-text); }
+    .badge-red { background: var(--red-bg); color: var(--red-text); }
+    .badge-red .badge-dot { background: var(--red-text); }
+    .badge-grey { background: var(--border-subtle); color: var(--text-secondary); }
+    .badge-grey .badge-dot { background: var(--text-muted); }
+
+    .btn-secondary {
+      background: var(--bg-surface);
+      border: 1px solid var(--border-color);
+      border-radius: 6px;
+      padding: 5px 12px;
+      font-size: 12.5px;
+      color: var(--text-primary);
+      cursor: pointer;
+      flex-shrink: 0;
+    }
+
+    .btn-secondary:hover { background: var(--gcp-blue-light); border-color: #aecbfa; color: var(--gcp-blue); }
+
+    /* Metrics banner. It spans the centre and right panes. */
+    .insights {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      background: var(--bg-surface);
+      border-bottom: 1px solid var(--border-color);
+      flex-shrink: 0;
+    }
+
+    .tile {
+      padding: 8px 20px;
+      border-right: 1px solid var(--border-subtle);
+      min-width: 0;
+    }
+
+    .tile:last-child { border-right: none; }
+
+    .tile-label {
+      font-size: 10.5px;
+      font-weight: 700;
+      color: var(--text-secondary);
+      text-transform: uppercase;
+      letter-spacing: 0.4px;
+    }
+
+    .tile-value {
+      font-size: 15px;
+      font-weight: 500;
+      margin-top: 1px;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .tile-sub {
+      font-size: 11px;
+      color: var(--text-muted);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .tile-sub.warn { color: var(--amber-text); }
+
+    .panes {
+      flex: 1;
+      min-height: 0;
+      display: grid;
+      grid-template-columns: minmax(0, 1fr);
+      grid-template-rows: minmax(0, 1fr);
+    }
+
+    .panes.with-side { grid-template-columns: minmax(0, 1fr) 420px; }
+
+    .centre {
+      display: flex;
+      flex-direction: column;
+      min-height: 0;
+      background: var(--bg-surface);
+      position: relative;
+    }
+
+    .view {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      min-height: 0;
+    }
+
+    /* Channel feed: posts, newest at the bottom. */
+    .feed {
+      flex: 1 1 auto;
+      min-height: 0;
+      overflow-y: auto;
+      padding: 16px 20px;
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+
+    .post {
+      display: flex;
+      gap: 12px;
+      padding: 10px 12px;
+      border-radius: 8px;
+    }
+
+    .post:hover { background: var(--bg-page); }
+    .post.selected { background: var(--gcp-blue-light); }
+    .post.unread .post-subject { font-weight: 700; }
+
+    .post-main { flex: 1; min-width: 0; }
+    .post-head { display: flex; align-items: baseline; gap: 8px; }
+    .post-author { font-size: 13px; font-weight: 700; }
+    .post-time { font-size: 11px; color: var(--text-muted); }
+    .post-new {
+      font-size: 10px;
+      font-weight: 700;
+      color: #ffffff;
+      background: #e8453c;
+      border-radius: 4px;
+      padding: 0 5px;
+    }
+    .post-subject { font-size: 14px; margin-top: 2px; word-break: break-word; }
+    .post-subject.muted { color: var(--text-muted); font-style: italic; }
+    .post-reply {
+      font-size: 13px;
+      color: var(--text-secondary);
+      margin-top: 4px;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .post-reply b { color: var(--text-primary); font-weight: 500; }
+    .post-foot { display: flex; align-items: center; gap: 10px; margin-top: 6px; }
+
+    .post-open {
+      background: transparent;
+      border: 1px solid transparent;
+      color: var(--gcp-blue);
+      font-size: 12.5px;
+      font-weight: 500;
+      padding: 2px 6px;
+      margin-left: -6px;
+      border-radius: 4px;
+      cursor: pointer;
+    }
+
+    .post-open:hover { border-color: #aecbfa; background: var(--bg-surface); }
+    .post-last { font-size: 11px; color: var(--text-muted); }
+
+    .new-posts-pill {
+      position: absolute;
+      left: 50%;
+      bottom: 18px;
+      transform: translateX(-50%);
+      background: var(--gcp-blue);
+      color: #ffffff;
+      border: none;
+      border-radius: 16px;
+      padding: 6px 14px;
+      font-size: 12.5px;
+      font-weight: 500;
+      box-shadow: 0 2px 6px rgba(60, 64, 67, 0.3);
+      cursor: pointer;
+    }
+
+    .prompt-chips-bar {
+      padding: 10px 20px;
+      border-bottom: 1px solid var(--border-subtle);
+      display: flex;
+      gap: 8px;
+      overflow-x: auto;
+      white-space: nowrap;
+      flex-shrink: 0;
+    }
+
+    .chip {
+      background: var(--bg-page);
+      border: 1px solid var(--border-color);
+      border-radius: 16px;
+      padding: 5px 12px;
+      font-size: 12.5px;
+      font-weight: 500;
+      color: var(--text-primary);
+      cursor: pointer;
+    }
+
+    .chip:disabled { cursor: not-allowed; opacity: 0.5; }
+    .chip:hover:not(:disabled) { background: var(--gcp-blue-light); color: var(--gcp-blue); border-color: #aecbfa; }
+
+    .chat-stream {
+      flex: 1 1 auto;
+      min-height: 0;
+      overflow-y: auto;
+      padding: 20px 24px;
+      display: flex;
+      flex-direction: column;
+      gap: 18px;
+    }
+
+    .message-row {
+      display: flex;
+      gap: 12px;
+      max-width: 860px;
+      margin: 0 auto;
+      width: 100%;
+    }
+
+    .avatar {
+      width: 32px;
+      height: 32px;
+      border-radius: 6px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      flex-shrink: 0;
+      font-size: 14px;
+      font-weight: 700;
+      color: #ffffff;
+    }
+
+    .avatar-agent { background: linear-gradient(135deg, #4285f4, #34a853); }
+    .avatar-user { background: #70757a; }
+    .avatar-alert { background: #ea4335; }
+    .avatar-cron { background: #9334e6; }
+
+    .message-content { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 4px; }
+    .message-header { display: flex; align-items: center; gap: 8px; }
+    .message-author { font-size: 13px; font-weight: 700; }
+    .message-time { font-size: 11px; color: var(--text-muted); }
+
+    .source-tag {
+      font-size: 10px;
+      font-family: var(--font-mono);
+      background: var(--border-subtle);
+      color: var(--text-secondary);
+      padding: 2px 6px;
+      border-radius: 4px;
+    }
+
+    .message-bubble {
+      font-size: 14px;
+      line-height: 1.55;
+      word-break: break-word;
+    }
+
+    .message-bubble pre {
+      background: #202124;
+      color: #e8eaed;
+      padding: 10px 12px;
+      border-radius: 6px;
+      overflow-x: auto;
+      font-family: var(--font-mono);
+      font-size: 12px;
+      margin: 8px 0;
+    }
+
+    .message-bubble code {
+      font-family: var(--font-mono);
+      font-size: 12px;
+      background: #f1f3f4;
+      color: #b06000;
+      padding: 2px 5px;
+      border-radius: 3px;
+    }
+
+    .message-bubble pre code { background: transparent; color: inherit; padding: 0; }
+    .message-bubble p { margin-bottom: 8px; }
+    .message-bubble p:last-child { margin-bottom: 0; }
+
+    /* The one-line live status of a running turn, plus its steps timeline. */
+    .status-line {
+      font-size: 13px;
+      color: var(--text-secondary);
+      font-style: italic;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .status-line.status-in { animation: status-in 0.25s ease-out; }
+    @keyframes status-in { from { opacity: 0; transform: translateY(3px); } to { opacity: 1; transform: none; } }
+
+    .turn-steps,
+    .turn-steps-summary {
+      margin: 6px 0 8px;
+      border: 1px solid var(--border-color);
+      border-radius: 6px;
+      background: var(--bg-page);
+      padding: 6px 10px;
+      font-size: 12.5px;
+    }
+
+    .turn-steps-summary > summary {
+      cursor: pointer;
+      color: var(--text-secondary);
+      font-weight: 500;
+      user-select: none;
+    }
+
+    .turn-steps-summary[open] > summary {
+      margin-bottom: 6px;
+      padding-bottom: 4px;
+      border-bottom: 1px solid var(--border-color);
+    }
+
+    .step-row {
+      display: flex;
+      align-items: baseline;
+      gap: 7px;
+      padding: 2px 0;
+      line-height: 1.4;
+    }
+
+    .step-icon {
+      font-family: var(--font-mono);
+      font-size: 11px;
+      font-weight: 700;
+      flex-shrink: 0;
+      width: 14px;
+      text-align: center;
+    }
+
+    .step-icon.running { color: var(--gcp-blue); animation: pulse 1s ease-in-out infinite; }
+    .step-icon.done { color: var(--green-text); }
+    .step-icon.failed { color: var(--red-text); }
+
+    .step-title { font-weight: 500; color: var(--text-primary); flex-shrink: 0; }
+    .step-detail {
+      color: var(--text-secondary);
+      font-family: var(--font-mono);
+      font-size: 11.5px;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      min-width: 0;
+    }
+
+    .turn-stream { margin-top: 6px; }
+
+    /* Compact cards for event_watcher, scheduler, and kanban messages. */
+    .msg-card {
+      border: 1px solid var(--border-color);
+      border-left: 3px solid var(--gcp-blue);
+      border-radius: 6px;
+      background: var(--bg-page);
+      padding: 10px 12px;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+
+    .msg-card-alert { border-left-color: #ea4335; }
+    .msg-card-cron { border-left-color: #9334e6; }
+    .msg-card-kanban { border-left-color: #34a853; background: #f6fbf8; }
+
+    .msg-card-title { font-weight: 700; font-size: 13.5px; color: var(--text-primary); }
+    .msg-card-meta { font-size: 11.5px; color: var(--text-secondary); }
+    .msg-card-foot { font-size: 11px; color: var(--text-muted); }
+
+    .msg-card-grid {
+      display: grid;
+      grid-template-columns: auto minmax(0, 1fr);
+      gap: 3px 10px;
+      font-size: 12.5px;
+    }
+
+    .msg-card-grid dt { color: var(--text-secondary); font-weight: 500; }
+    .msg-card-grid dd { min-width: 0; word-break: break-word; }
+
+    .prompt-details {
+      margin-top: 4px;
+      font-size: 12px;
+    }
+
+    .prompt-details > summary {
+      cursor: pointer;
+      color: var(--gcp-blue);
+      font-weight: 500;
+      user-select: none;
+    }
+
+    .prompt-raw {
+      margin-top: 6px;
+      padding: 8px 10px;
+      border-radius: 6px;
+      background: var(--bg-surface);
+      border: 1px solid var(--border-color);
+      max-height: 260px;
+      overflow-y: auto;
+      font-size: 12px;
+    }
+
+    .composer {
+      padding: 12px 20px;
+      border-top: 1px solid var(--border-color);
+      display: flex;
+      gap: 10px;
+      align-items: flex-end;
+      flex-shrink: 0;
+      background: var(--bg-surface);
+    }
+
+    .input-box {
+      flex: 1;
+      min-height: 44px;
+      max-height: 120px;
+      border: 1px solid var(--border-color);
+      border-radius: 8px;
+      padding: 11px 14px;
+      font-family: var(--font-sans);
+      font-size: 14px;
+      line-height: 1.4;
+      outline: none;
+      resize: none;
+    }
+
+    .input-box:focus { border-color: var(--gcp-blue); box-shadow: 0 0 0 2px var(--gcp-blue-light); }
+
+    .btn-send {
+      height: 44px;
+      padding: 0 20px;
+      background: var(--gcp-blue);
+      color: #ffffff;
+      border: none;
+      border-radius: 8px;
+      font-size: 14px;
+      font-weight: 500;
+      cursor: pointer;
+      flex-shrink: 0;
+    }
+
+    .btn-send:hover { background: var(--gcp-blue-hover); }
+    .btn-send:disabled { background: #dadce0; cursor: not-allowed; }
+
+    /* Right pane: an opened post's thread, or About this agent. */
+    .side-pane {
+      display: flex;
+      flex-direction: column;
+      min-height: 0;
+      background: var(--bg-surface);
+      border-left: 1px solid var(--border-color);
+    }
+
+    .side-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      padding: 10px 16px;
+      border-bottom: 1px solid var(--border-color);
+      flex-shrink: 0;
+    }
+
+    .side-title { font-size: 14px; font-weight: 700; }
+    .side-sub {
+      font-size: 11.5px;
+      color: var(--text-secondary);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .side-head-text { min-width: 0; }
+
+    .btn-close {
+      background: transparent;
+      border: none;
+      font-size: 20px;
+      line-height: 1;
+      color: var(--text-secondary);
+      cursor: pointer;
+      padding: 2px 6px;
+      border-radius: 4px;
+      flex-shrink: 0;
+    }
+
+    .btn-close:hover { background: var(--border-subtle); }
+
+    .side-body {
+      flex: 1 1 auto;
+      min-height: 0;
+      overflow-y: auto;
+      padding: 16px;
+      display: flex;
+      flex-direction: column;
+      gap: 16px;
+    }
+
+    .side-body .message-bubble { font-size: 13px; }
+    .side-pane .composer { padding: 10px 16px; }
+
+    .about {
+      flex: 1 1 auto;
+      min-height: 0;
+      overflow-y: auto;
+      padding: 16px;
+      font-size: 13px;
+    }
+
+    .about h3 {
+      font-size: 11px;
+      font-weight: 700;
+      color: var(--text-secondary);
+      text-transform: uppercase;
+      letter-spacing: 0.4px;
+      margin: 14px 0 4px;
+    }
+
+    .about h3:first-child { margin-top: 0; }
+    .about dt { color: var(--text-muted); font-size: 11.5px; margin-top: 8px; }
+    .about dd { font-family: var(--font-mono); font-size: 12px; word-break: break-all; }
+
+    .role-chips { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 3px; }
+
+    .role-chip {
+      background: var(--gcp-blue-light);
+      color: var(--gcp-blue);
+      border-radius: 10px;
+      padding: 2px 8px;
+      font-size: 11px;
+    }
+
+    .about-caption { margin-top: 10px; font-size: 11.5px; color: var(--text-muted); line-height: 1.45; }
+
+    .empty-state {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      padding: 48px 16px;
+      color: var(--text-muted);
+      text-align: center;
+      gap: 6px;
+      font-size: 13px;
+    }
+  </style>
+</head>
+<body>
+  <div class="app">
+    <nav class="rail" aria-label="Channels and threads">
+      <div class="workspace-head">
+        <!-- Google Kubernetes Engine product icon, from cloud.google.com/icons. -->
+        <svg class="brand-logo" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Google Kubernetes Engine">
+          <polygon fill="#4285f4" fill-rule="evenodd" points="14.68 13.06 19.23 15.69 19.23 16.68 14.29 13.83 14.68 13.06"/>
+          <polygon fill="#669df6" fill-rule="evenodd" points="9.98 13.65 4.77 16.66 4.45 15.86 9.53 12.92 9.98 13.65"/>
+          <rect fill="#aecbfa" x="11.55" y="3.29" width="0.86" height="5.78"/>
+          <path fill="#aecbfa" fill-rule="evenodd" d="M3.25,7V17L12,22l8.74-5V7L12,2Zm15.63,8.89L12,19.78,5.12,15.89V8.11L12,4.22l6.87,3.89v7.78Z"/>
+          <polygon fill="#aecbfa" fill-rule="evenodd" points="11.98 11.5 15.96 9.21 11.98 6.91 8.01 9.21 11.98 11.5"/>
+          <polygon fill="#669df6" fill-rule="evenodd" points="11.52 12.3 7.66 10.01 7.66 14.6 11.52 16.89 11.52 12.3"/>
+          <polygon fill="#4285f4" fill-rule="evenodd" points="12.48 12.3 12.48 16.89 16.34 14.6 16.34 10.01 12.48 12.3"/>
+        </svg>
+        <div class="workspace-text">
+          <div class="workspace-name">kube-agents</div>
+          <div class="workspace-cluster" id="ws-cluster">&hellip;</div>
+        </div>
+      </div>
+
+      <div class="rail-scroll">
+        <div class="rail-section">
+          <div class="rail-heading"><span>Channels</span></div>
+          <button type="button" class="rail-item" data-channel="alerts" title="Event triage">
+            <span class="rail-label"># alerts</span><span class="rail-count" id="count-alerts" hidden></span>
+          </button>
+          <button type="button" class="rail-item" data-channel="scheduled" title="Scheduled checks">
+            <span class="rail-label"># scheduled</span><span class="rail-count" id="count-scheduled" hidden></span>
+          </button>
+        </div>
+
+        <div class="rail-section">
+          <div class="rail-heading">
+            <span>Threads</span>
+            <button type="button" class="rail-add" id="btn-new-chat" title="Start a new chat with the agent">+ New chat</button>
+          </div>
+          <div id="thread-list"></div>
+        </div>
+
+        <div class="rail-section" id="chat-section" hidden>
+          <div class="rail-heading"><span>Chat</span></div>
+          <div id="chat-list"></div>
+        </div>
+      </div>
+
+      <div class="rail-foot">
+        <button type="button" class="btn-rail" id="btn-notify" hidden>Turn on notifications</button>
+      </div>
+    </nav>
+
+    <div class="workspace">
+      <header class="topbar">
+        <div class="view-head">
+          <div class="view-title" id="view-title"># alerts</div>
+          <div class="view-sub" id="view-sub"></div>
+        </div>
+        <div class="header-actions">
+          <div class="badge badge-grey" id="agent-badge" title="">
+            <span class="badge-dot"></span>
+            <span id="agent-status-text">Checking agent&hellip;</span>
+          </div>
+          <button type="button" class="btn-secondary" id="btn-about">About this agent</button>
+        </div>
+      </header>
+
+      <section class="insights" aria-label="Agent metrics">
+        <div class="tile">
+          <div class="tile-label">Model</div>
+          <div class="tile-value" id="ins-model">&hellip;</div>
+          <div class="tile-sub" id="ins-provider"></div>
+        </div>
+        <div class="tile">
+          <div class="tile-label">Tokens</div>
+          <div class="tile-value" id="ins-tokens">&hellip;</div>
+          <div class="tile-sub" id="ins-tokens-split"></div>
+        </div>
+        <div class="tile">
+          <div class="tile-label">Estimated cost</div>
+          <div class="tile-value" id="ins-cost">&hellip;</div>
+          <div class="tile-sub" id="ins-usage-note"></div>
+        </div>
+        <div class="tile">
+          <div class="tile-label">Cluster</div>
+          <div class="tile-value" id="ins-cluster">&hellip;</div>
+          <div class="tile-sub" id="ins-project"></div>
+        </div>
+      </section>
+
+      <div class="panes" id="panes">
+        <main class="centre">
+          <section class="view" id="feed-view" aria-label="Channel posts">
+            <div class="feed" id="feed"></div>
+            <button type="button" class="new-posts-pill" id="new-posts" hidden>New posts &darr;</button>
+          </section>
+
+          <section class="view" id="thread-view" aria-label="Conversation" hidden>
+            <div class="prompt-chips-bar">
+              <button type="button" class="chip" data-prompt="Audit cluster health and identify any failing pods">Cluster health</button>
+              <button type="button" class="chip" data-prompt="Summarise the recent Kubernetes warning events on this cluster">Recent warnings</button>
+              <button type="button" class="chip" data-prompt="Check GitOps configuration drift against live workloads">GitOps drift</button>
+              <button type="button" class="chip" data-prompt="Review cluster security posture, RBAC, and workload isolation">Security and RBAC</button>
+            </div>
+            <div class="chat-stream" id="chat-stream"></div>
+            <div class="composer">
+              <textarea class="input-box" id="prompt-input" rows="1"
+                placeholder="Ask the agent a question or describe an incident"></textarea>
+              <button type="button" class="btn-send" id="btn-send">Send</button>
+            </div>
+          </section>
+        </main>
+
+        <aside class="side-pane" id="side-pane" hidden aria-labelledby="side-title">
+          <div class="side-head">
+            <div class="side-head-text">
+              <div class="side-title" id="side-title">Thread</div>
+              <div class="side-sub" id="side-sub"></div>
+            </div>
+            <button type="button" class="btn-close" id="side-close" title="Close (Escape)" aria-label="Close">&times;</button>
+          </div>
+
+          <div class="view" id="side-thread">
+            <div class="side-body" id="side-body"></div>
+            <div class="composer">
+              <textarea class="input-box" id="side-input" rows="1" placeholder="Reply in this thread"></textarea>
+              <button type="button" class="btn-send" id="side-send">Reply</button>
+            </div>
+          </div>
+
+          <div class="about" id="side-about" hidden>
+            <h3>Deployment</h3>
+            <dl>
+              <dt>Model</dt>
+              <dd id="about-model">&hellip;</dd>
+              <dt>Cluster</dt>
+              <dd id="about-cluster">&hellip;</dd>
+            </dl>
+            <h3>Identity</h3>
+            <dl>
+              <dt>Kubernetes service account</dt>
+              <dd id="id-ksa">&hellip;</dd>
+              <dt>Google Cloud service account (Workload Identity)</dt>
+              <dd id="id-gsa">&hellip;</dd>
+              <dt>Project IAM roles</dt>
+              <dd class="role-chips" id="id-roles"></dd>
+            </dl>
+            <p class="about-caption">The identity and roles were recorded at install. Changes made later in IAM are not shown here.</p>
+            <p class="about-caption">The agent opens a post in # alerts for each Kubernetes warning event it triages, and in # scheduled for each scheduled check. Replies you send there go into that session. Slack and Google Chat sessions are listed by title only and cannot be opened here.</p>
+          </div>
+        </aside>
+      </div>
+    </div>
+  </div>
+
+  <template id="intro-template">
+    <div class="message-row">
+      <div class="avatar avatar-agent">i</div>
+      <div class="message-content">
+        <div class="message-header">
+          <span class="message-author">Web console</span>
+          <span class="source-tag">new chat</span>
+        </div>
+        <div class="message-bubble">
+          <p>Messages you send here go to the agent as turns in a session of their own. Each thread is its own session.</p>
+          <p>A turn that calls tools can take a few minutes. The line under the reply shows what the agent is doing. The agent proposes changes as pull requests for you to review.</p>
+        </div>
+      </div>
+    </div>
+  </template>
+
+  <script>
+    const CONSOLE_HEADER = "X-Kube-Agents-Console";
+    const STATUS_POLL_MS = 15000;
+    const CHANNELS_POLL_MS = 15000;
+    const CHAT_LIST_POLL_MS = 30000;
+    const INSIGHTS_POLL_MS = 30000;
+    // An open post in the right pane is re-read at this interval.
+    const PANE_POLL_MS = 10000;
+    // Which channel or thread this tab shows, per tab.
+    const VIEW_KEY = "kube-agents-web-console-view";
+    // Set to "on" after you turn notifications on with the rail button.
+    const NOTIFY_KEY = "kube-agents-web-console-notify";
+    // At most this many notifications per poll; the rest are counted in one.
+    const NOTIFY_MAX_PER_POLL = 3;
+    // A feed or transcript scrolled within this distance of the bottom
+    // follows new posts; further up, a "New posts" pill appears instead.
+    const NEAR_BOTTOM_PX = 80;
+    const CHANNELS = {
+      alerts: {
+        title: "# alerts",
+        sub: "One post per Kubernetes warning event the agent triaged",
+        author: "Event watcher",
+        avatar: "!",
+        avatarClass: "avatar-alert",
+        empty: "No event triage sessions yet. The agent opens one when the event watcher forwards a warning event."
+      },
+      scheduled: {
+        title: "# scheduled",
+        sub: "One post per scheduled check the agent ran",
+        author: "Scheduler",
+        avatar: "\u21bb",
+        avatarClass: "avatar-cron",
+        empty: "No scheduled checks have run yet."
+      }
+    };
+
+    // ---- Thread state. No DOM access in this block: the node harness
+    // evaluates it with appendMessage, clearStream, threadsChanged and
+    // statusChanged stubbed. ----
+
+    // Results of work the agent delegated to a kanban card arrive later, as
+    // new messages on the thread's session. One loop polls every open thread
+    // at this interval.
+    const MESSAGES_POLL_MS = 10000;
+    // The thread list (IDs, titles, marks) lives in localStorage, so it
+    // survives a reload and is shared across tabs. A thread's mark is the
+    // highest message ID shown or accounted for, so nothing is shown twice.
+    const THREADS_KEY = "kube-agents-web-console-threads";
+    // Which thread this tab shows; per tab, so two tabs can show two threads.
+    const ACTIVE_KEY = "kube-agents-web-console-active";
+    // The keys an older console kept one session in, read once to migrate.
+    const LEGACY_SESSION_KEY = "kube-agents-web-console-session";
+    const LEGACY_MARK_KEY = "kube-agents-web-console-mark";
+    const MAX_THREADS = 12;
+    const THREAD_TITLE_CHARS = 60;
+    const SESSION_PREFIX = "web-console-";
+    const SESSION_ID_RE = /^web-console-[0-9a-f]{32}$/;
+    const SESSION_RAND_BYTES = 16;
+    // Per post, the message count when you last saw it. Shared across tabs.
+    const SEEN_KEY = "kube-agents-web-console-seen";
+    // Past this many entries, posts no longer in either channel are dropped.
+    const SEEN_MAX_ENTRIES = 300;
+    const CHANNEL_NAMES = ["alerts", "scheduled"];
+    const STATUS_SENDING = "Sending your message to the agent";
+    const APP_TITLE = "kube-agents";
+
+    let threads = [];
+    let activeId = "";
+    // What the centre pane shows: a channel name, or "thread" for activeId.
+    let view = "alerts";
+    // Per-session turn state, by session ID: {text, status}. A turn can run
+    // in one thread, or in a post's thread in the right pane, while you type
+    // in another.
+    const inflight = {};
+    // Errors from a turn that finished while its thread was in the
+    // background, shown when you switch to it.
+    const notices = {};
+    let pollRunning = false;
+
+    const channelPosts = { alerts: [], scheduled: [] };
+    const channelUnread = { alerts: 0, scheduled: 0 };
+    // The post IDs of each channel's previous poll; null before the first.
+    const knownPosts = { alerts: null, scheduled: null };
+    let seen = {};
+    // On a first visit (no seen map stored) each channel's first poll marks
+    // every post seen, so an existing install does not open with 50 unread.
+    const seedSeen = { alerts: false, scheduled: false };
+
+    function nowSeconds() { return Date.now() / 1000; }
+
+    function onScreen(id) { return view === "thread" && id === activeId; }
+
+    function newSessionId() {
+      const bytes = new Uint8Array(SESSION_RAND_BYTES);
+      crypto.getRandomValues(bytes);
+      return SESSION_PREFIX + Array.from(bytes, b => b.toString(16).padStart(2, "0")).join("");
+    }
+
+    function cleanThread(t) {
+      return {
+        id: t.id,
+        title: typeof t.title === "string" ? t.title : "",
+        mark: typeof t.mark === "number" ? t.mark : 0,
+        markKnown: !!t.markKnown,
+        updated: typeof t.updated === "number" ? t.updated : nowSeconds(),
+        unread: !!t.unread,
+        started: !!t.started
+      };
+    }
+
+    function parseThreads(raw) {
+      let list;
+      try { list = JSON.parse(raw || "[]"); } catch (e) { list = []; }
+      if (!Array.isArray(list)) return [];
+      return list.filter(t => t && SESSION_ID_RE.test(t.id)).map(cleanThread).slice(0, MAX_THREADS);
+    }
+
+    // Loads the list, folding in the single session an older console kept
+    // in sessionStorage, then drops the old keys.
+    function loadThreads() {
+      threads = parseThreads(localStorage.getItem(THREADS_KEY));
+      const legacy = sessionStorage.getItem(LEGACY_SESSION_KEY);
+      if (legacy && SESSION_ID_RE.test(legacy) && !findThread(legacy)) {
+        const mark = sessionStorage.getItem(LEGACY_MARK_KEY);
+        threads.unshift(cleanThread({ id: legacy, mark: Number(mark) || 0, markKnown: mark !== null, started: true }));
+        capThreads();
+        saveThreads();
+      }
+      sessionStorage.removeItem(LEGACY_SESSION_KEY);
+      sessionStorage.removeItem(LEGACY_MARK_KEY);
+      const active = sessionStorage.getItem(ACTIVE_KEY) || legacy || "";
+      activeId = findThread(active) ? active : (threads[0] ? threads[0].id : "");
+    }
+
+    function saveThreads() {
+      localStorage.setItem(THREADS_KEY, JSON.stringify(threads));
+    }
+
+    // Another tab saved the list. Take it, keeping the higher mark of any
+    // thread both tabs hold, so a tab never re-shows what it already showed.
+    function mergeStoredThreads(raw) {
+      const stored = parseThreads(raw);
+      stored.forEach(t => {
+        const mine = findThread(t.id);
+        if (mine && mine.mark > t.mark) { t.mark = mine.mark; t.markKnown = true; }
+        if (mine && onScreen(t.id)) t.unread = false;
+      });
+      threads = stored;
+      if (activeId && !findThread(activeId) && !inflight[activeId]) activeId = threads[0] ? threads[0].id : "";
+      threadsChanged();
+    }
+
+    function findThread(id) {
+      return threads.find(t => t.id === id) || null;
+    }
+
+    // Drops the least recently used threads past MAX_THREADS, never one
+    // with a turn running or the one on screen.
+    function capThreads() {
+      while (threads.length > MAX_THREADS) {
+        const idle = threads.filter(t => !inflight[t.id] && t.id !== activeId);
+        if (idle.length === 0) break;
+        const oldest = idle.reduce((a, b) => (a.updated <= b.updated ? a : b));
+        threads = threads.filter(t => t !== oldest);
+      }
+    }
+
+    function addThread(id, title, started) {
+      let t = findThread(id);
+      if (!t) {
+        t = cleanThread({ id, title: title || "", started });
+        threads.unshift(t);
+        capThreads();
+        saveThreads();
+      }
+      return t;
+    }
+
+    // Removes a thread from this list only. The agent's session stays.
+    function removeThread(id) {
+      if (inflight[id]) return false;
+      threads = threads.filter(t => t.id !== id);
+      delete notices[id];
+      if (activeId === id) activeId = threads[0] ? threads[0].id : "";
+      saveThreads();
+      threadsChanged();
+      return true;
+    }
+
+    function threadTitle(text) {
+      const line = (text || "").trim().split("\n")[0].trim();
+      return line.length > THREAD_TITLE_CHARS ? line.slice(0, THREAD_TITLE_CHARS).trim() + "…" : line;
+    }
+
+    function advanceMark(t, id) {
+      if (typeof id !== "number" || id <= t.mark) return;
+      t.mark = id;
+      t.markKnown = true;
+      saveThreads();
+    }
+
+    // Shows an agent message on its thread: in the centre pane when that
+    // thread is on screen, and as an unread dot in the rail when it is not.
+    function deliver(t, text, tag, msg, meta) {
+      if (onScreen(t.id)) {
+        const author = (msg && msg.author) || "agent";
+        appendMessage(author, text, tag, msg && msg.timestamp, msg && msg.card, meta);
+      } else {
+        t.unread = true;
+        saveThreads();
+      }
+      t.updated = nowSeconds();
+    }
+
+    // Returns {latest_id, messages} for a thread's session, or null.
+    async function fetchNewMessages(t) {
+      const after = t.markKnown ? `?after=${t.mark}` : "";
+      try {
+        const resp = await fetch(`/api/sessions/${encodeURIComponent(t.id)}/messages${after}`);
+        if (!resp.ok) return null;
+        return await resp.json();
+      } catch (e) {
+        return null;
+      }
+    }
+
+    // Shows each agent or kanban message above the mark once, then moves the
+    // mark past it. User-role rows from the thread's own turns only move the mark.
+    function showUpdates(t, messages) {
+      (messages || []).forEach(m => {
+        if (m.id <= t.mark) return;
+        if (m.author === "kanban") deliver(t, m.content, "Specialist report", m);
+        else if (m.role === "assistant") deliver(t, m.content, "update", m);
+        advanceMark(t, m.id);
+      });
+    }
+
+    // Polls one thread between its turns. On a thread with no mark yet (one
+    // migrated before it had any), the first poll only sets the mark.
+    async function pollThread(t) {
+      if (!t.started || inflight[t.id]) return;
+      const data = await fetchNewMessages(t);
+      // Removed, or a turn started, while this poll was out.
+      if (!data || findThread(t.id) !== t || inflight[t.id]) return;
+      if (t.markKnown) showUpdates(t, data.messages);
+      advanceMark(t, data.latest_id);
+    }
+
+    // The one poll loop: every open thread in turn, one request at a time.
+    async function pollAll() {
+      if (pollRunning) return;
+      pollRunning = true;
+      try {
+        for (const t of threads.slice()) await pollThread(t);
+      } finally {
+        pollRunning = false;
+        threadsChanged();
+      }
+    }
+
+    // Runs once a turn's reply has been delivered. The session holds three
+    // runs of messages above the mark: results that landed before this turn
+    // started (shown), the turn itself from the typed message to its reply
+    // (already delivered, so only marked), and results that landed after
+    // the reply (shown).
+    async function settleAfterReply(t, typed, reply) {
+      const data = await fetchNewMessages(t);
+      if (!data) return;
+      const messages = data.messages || [];
+      const same = (a, b) => (a || "").trim() === (b || "").trim();
+      let turnAt = -1;
+      messages.forEach((m, i) => { if (m.role === "user" && same(m.content, typed)) turnAt = i; });
+      let replyAt = -1;
+      messages.forEach((m, i) => { if (i > turnAt && m.role === "assistant" && same(m.content, reply)) replyAt = i; });
+      if (turnAt >= 0) showUpdates(t, messages.slice(0, turnAt));
+      // Hermes does not serialize turns on one session, so a card's wake can
+      // run during this turn and land inside its range. A user row other than
+      // the typed message starts such a wake; its agent replies are shown.
+      if (turnAt >= 0 && replyAt > turnAt) {
+        let inWake = false;
+        messages.slice(turnAt + 1, replyAt).forEach(m => {
+          if (m.role === "user") {
+            inWake = true;
+            if (m.author === "kanban" && m.id > t.mark) deliver(t, m.content, "Specialist report", m);
+          } else if (inWake && m.id > t.mark) {
+            deliver(t, m.content, "update", m);
+          }
+        });
+      }
+      if (replyAt >= 0) {
+        advanceMark(t, messages[replyAt].id);
+        showUpdates(t, messages.slice(replyAt + 1));
+      }
+      advanceMark(t, data.latest_id);
+    }
+
+    // Puts a thread on screen from its transcript: clears its dot, renders
+    // its messages, and moves its mark to the newest message so the poll
+    // does not repeat any of them.
+    function activateThread(t, transcript) {
+      activeId = t.id;
+      view = "thread";
+      t.unread = false;
+      clearStream();
+      const messages = (transcript && transcript.messages) || [];
+      if (!t.title) {
+        const first = messages.find(m => m.role === "user" && (!m.author || m.author === "user"));
+        if (first) t.title = threadTitle(first.content);
+      }
+      messages.forEach(m => {
+        const role = m.author || (m.role === "user" ? "user" : "agent");
+        appendMessage(role, m.content, "", m.timestamp, m.card);
+      });
+      if (transcript) advanceMark(t, transcript.latest_id);
+      saveThreads();
+      threadsChanged();
+    }
+
+    // Starts tracking a session's in-flight turn.
+    function startInflight(id, text) {
+      const now = nowSeconds();
+      inflight[id] = {
+        text,
+        status: STATUS_SENDING,
+        startedAt: now,
+        lastEventAt: now,
+        steps: [],
+        deltaText: ""
+      };
+      return inflight[id];
+    }
+
+    // Records a status line for a session's running turn.
+    function setStatus(id, text) {
+      if (!inflight[id]) return;
+      inflight[id].status = text;
+      inflight[id].lastEventAt = nowSeconds();
+      statusChanged(id);
+    }
+
+    // Records or updates a structured step (thinking or tool call) on a turn.
+    function addStep(id, step) {
+      const turn = inflight[id];
+      if (!turn || !step || !step.id) return;
+      if (!Array.isArray(turn.steps)) turn.steps = [];
+      const existing = turn.steps.find(s => s.id === step.id);
+      if (existing) {
+        existing.state = step.state || existing.state;
+        existing.title = step.title || existing.title;
+        if (step.detail) existing.detail = step.detail;
+      } else {
+        turn.steps.push({
+          id: step.id,
+          kind: step.kind || "tool",
+          title: step.title || step.id,
+          detail: step.detail || "",
+          state: step.state || "running"
+        });
+      }
+      turn.lastEventAt = nowSeconds();
+      statusChanged(id);
+    }
+
+    // Appends a streamed reply chunk to a running turn.
+    function appendDelta(id, text) {
+      const turn = inflight[id];
+      if (!turn || !text) return;
+      turn.deltaText = (turn.deltaText || "") + text;
+      turn.lastEventAt = nowSeconds();
+      statusChanged(id);
+    }
+
+    // Formats a running turn's status line with an elapsed timer, switching
+    // to "Waiting for the model" after 3s without an event between steps.
+    function formatStatusWithTimer(turn, now) {
+      if (!turn) return "Working on it…";
+      const t = typeof now === "number" ? now : nowSeconds();
+      const started = typeof turn.startedAt === "number" ? turn.startedAt : t;
+      const last = typeof turn.lastEventAt === "number" ? turn.lastEventAt : started;
+      const elapsed = Math.max(0, Math.floor(t - started));
+      const idle = t - last;
+      let base = turn.status || "Working on it…";
+      if (idle >= 3 && !turn.deltaText && (base === "The agent started working" || base.startsWith("Finished "))) {
+        base = "Waiting for the model";
+      }
+      return `${base} · ${elapsed} s`;
+    }
+
+    // Reads a server-sent event stream from a fetch body. Frames end with a
+    // blank line; a comment line (":") is skipped.
+    async function readSSE(body, onEvent) {
+      const reader = body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+      const dispatch = frame => {
+        let name = "message";
+        const data = [];
+        frame.split("\n").forEach(line => {
+          if (line.startsWith("event:")) name = line.slice(6).trim();
+          else if (line.startsWith("data:")) data.push(line.slice(5).replace(/^ /, ""));
+        });
+        if (data.length === 0) return;
+        let parsed;
+        try { parsed = JSON.parse(data.join("\n")); } catch (e) { return; }
+        onEvent(name, parsed);
+      };
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true }).replace(/\r\n/g, "\n");
+        let end;
+        while ((end = buffer.indexOf("\n\n")) >= 0) {
+          dispatch(buffer.slice(0, end));
+          buffer = buffer.slice(end + 2);
+        }
+      }
+      if (buffer.trim()) dispatch(buffer);
+    }
+
+    function loadSeen(raw) {
+      if (raw === null) {
+        seen = {};
+        CHANNEL_NAMES.forEach(n => { seedSeen[n] = true; });
+        return;
+      }
+      try { seen = JSON.parse(raw); } catch (e) { seen = {}; }
+      if (!seen || typeof seen !== "object" || Array.isArray(seen)) seen = {};
+    }
+
+    function saveSeen() {
+      const ids = Object.keys(seen);
+      if (ids.length > SEEN_MAX_ENTRIES) {
+        const keep = new Set();
+        CHANNEL_NAMES.forEach(n => channelPosts[n].forEach(p => keep.add(p.id)));
+        ids.forEach(id => { if (!keep.has(id)) delete seen[id]; });
+      }
+      localStorage.setItem(SEEN_KEY, JSON.stringify(seen));
+    }
+
+    function postCount(p) { return typeof p.message_count === "number" ? p.message_count : 0; }
+
+    // A post is unread when you have not seen it, or it has more messages
+    // than when you last did.
+    function postUnread(p) { return !(p.id in seen) || postCount(p) > seen[p.id]; }
+
+    function markPostsSeen(posts) {
+      let changed = false;
+      posts.forEach(p => {
+        if (postUnread(p)) { seen[p.id] = postCount(p); changed = true; }
+      });
+      if (changed) saveSeen();
+    }
+
+    // Counts each channel's unread posts; visibleName's are all on screen.
+    function recountChannels(visibleName) {
+      CHANNEL_NAMES.forEach(n => {
+        if (n === visibleName) markPostsSeen(channelPosts[n]);
+        channelUnread[n] = channelPosts[n].filter(postUnread).length;
+      });
+    }
+
+    // Takes a channel's posts, newest first as the server sends them.
+    // visible is true when the channel is on screen; openId is the post open
+    // in the right pane. Both count as seen. Returns the posts new since the
+    // previous poll, and the IDs that were unread before this call.
+    function updateChannel(name, posts, visible, openId) {
+      const prev = knownPosts[name];
+      const fresh = prev ? posts.filter(p => !prev.has(p.id)) : [];
+      knownPosts[name] = new Set(posts.map(p => p.id));
+      channelPosts[name] = posts;
+      if (seedSeen[name]) {
+        seedSeen[name] = false;
+        markPostsSeen(posts);
+      }
+      const unreadIds = posts.filter(postUnread).map(p => p.id);
+      markPostsSeen(visible ? posts : posts.filter(p => p.id === openId));
+      channelUnread[name] = posts.filter(postUnread).length;
+      return { fresh, unreadIds };
+    }
+
+    function unreadTotal() {
+      return channelUnread.alerts + channelUnread.scheduled + threads.filter(t => t.unread).length;
+    }
+
+    function pageTitle() {
+      const n = unreadTotal();
+      return n > 0 ? `(${n}) ${APP_TITLE}` : APP_TITLE;
+    }
+
+    // The headline a channel post shows. A session the agent has not
+    // started holds no messages, so there is no prompt to name it by:
+    // say so in a muted line instead of showing the bare session ID.
+    // Returns { text, muted, started }.
+    function postHeadline(p) {
+      const noun = p.kind === "scheduled" ? "Check" : "Event";
+      const subject = p.summary && p.summary.subject;
+      if (subject) return { text: subject, muted: false, started: true };
+      const empty = p.message_count === 0 || (p.summary && !p.summary.replies);
+      if (empty) {
+        return { text: `${noun} ${p.id}: the agent has not started on this yet`, muted: true, started: false };
+      }
+      return { text: `${noun} ${p.id}`, muted: true, started: true };
+    }
+
+    // ---- End of thread state. ----
+
+    const $ = id => document.getElementById(id);
+
+    function escapeHtml(text) {
+      const map = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#039;' };
+      return String(text).replace(/[&<>"']/g, m => map[m]);
+    }
+
+    function relativeTime(seconds) {
+      if (typeof seconds !== "number") return "";
+      const ago = Math.max(0, Date.now() / 1000 - seconds);
+      if (ago < 60) return "just now";
+      if (ago < 3600) return `${Math.floor(ago / 60)} min ago`;
+      if (ago < 86400) return `${Math.floor(ago / 3600)} h ago`;
+      return `${Math.floor(ago / 86400)} d ago`;
+    }
+
+    function formatCount(n) {
+      if (typeof n !== "number") return "0";
+      if (n >= 1e9) return `${(n / 1e9).toFixed(1)}B`;
+      if (n >= 1e6) return `${(n / 1e6).toFixed(1)}M`;
+      if (n >= 1e3) return `${(n / 1e3).toFixed(1)}k`;
+      return String(n);
+    }
+
+    function formatUSD(v) {
+      if (typeof v !== "number" || v <= 0) return "$0.00";
+      if (v < 0.01) return "< $0.01";
+      return `$${v.toFixed(2)}`;
+    }
+
+    // Inline formatting for text outside code fences.
+    function renderInline(text) {
+      let html = escapeHtml(text);
+      html = html.replace(/`([^`\n]+)`/g, '<code>$1</code>');
+      html = html.replace(/\*\*([^*\n]+)\*\*/g, '<strong>$1</strong>');
+      return html.split(/\n{2,}/).map(p => `<p>${p.replace(/\n/g, '<br>')}</p>`).join("");
+    }
+
+    // Splits on ``` fences first, so code keeps its blank lines and is never
+    // run through the inline rules; the info string after the opening fence
+    // (```yaml) is dropped rather than rendered as the first line.
+    function renderMarkdown(text) {
+      if (!text) return "";
+      const parts = text.split(/```/);
+      let html = "";
+      parts.forEach((part, i) => {
+        if (i % 2 === 1) {
+          const body = part.replace(/^[^\n]*\n/, "");
+          html += `<pre><code>${escapeHtml(body.replace(/\n$/, ""))}</code></pre>`;
+        } else if (part.trim()) {
+          html += renderInline(part.trim());
+        }
+      });
+      return html;
+    }
+
+    function renderStepsHtml(steps) {
+      if (!Array.isArray(steps) || steps.length === 0) return "";
+      return steps.map(s => {
+        const state = s.state || "running";
+        const icon = state === "done" ? "\u2713" : (state === "failed" ? "\u2717" : "\u25cf");
+        const detail = s.detail ? `<span class="step-detail" title="${escapeHtml(s.detail)}">${escapeHtml(s.detail)}</span>` : "";
+        return `<div class="step-row"><span class="step-icon ${escapeHtml(state)}">${icon}</span><span class="step-title">${escapeHtml(s.title || s.id)}</span>${detail}</div>`;
+      }).join("");
+    }
+
+    function renderStepsSummaryHtml(meta) {
+      if (!meta || !Array.isArray(meta.steps) || meta.steps.length === 0) return "";
+      const n = meta.steps.length;
+      const secs = Math.max(1, Math.round(meta.elapsed || 1));
+      return `<details class="turn-steps-summary"><summary>Worked for ${secs} s &middot; ${n} ${n === 1 ? "step" : "steps"}</summary>${renderStepsHtml(meta.steps)}</details>`;
+    }
+
+    function renderAuthorBody(role, text, card, meta) {
+      if (role === "event_watcher") {
+        const subject = (card && card.subject) || threadTitle(text);
+        const rows = [];
+        if (card && card.resource) rows.push(`<dt>Resource</dt><dd><code>${escapeHtml(card.resource)}</code></dd>`);
+        if (card && card.reason) rows.push(`<dt>Reason</dt><dd><code>${escapeHtml(card.reason)}</code></dd>`);
+        if (card && card.warning) rows.push(`<dt>Message</dt><dd>${escapeHtml(card.warning)}</dd>`);
+        const grid = rows.length ? `<dl class="msg-card-grid">${rows.join("")}</dl>` : "";
+        return `<div class="msg-card msg-card-alert">
+          <div class="msg-card-title">${escapeHtml(subject)}</div>
+          ${grid}
+          <details class="prompt-details"><summary>Show routing prompt</summary><div class="prompt-raw">${renderMarkdown(text)}</div></details>
+        </div>`;
+      }
+      if (role === "scheduler") {
+        const subject = (card && card.subject) || threadTitle(text);
+        return `<div class="msg-card msg-card-cron">
+          <div class="msg-card-title">${escapeHtml(subject)}</div>
+          <details class="prompt-details"><summary>Show scheduled prompt</summary><div class="prompt-raw">${renderMarkdown(text)}</div></details>
+        </div>`;
+      }
+      if (role === "kanban") {
+        const taskId = (card && card.task_id) || "task";
+        const status = (card && card.status) || "completed";
+        const title = (card && card.title) ? `<div class="msg-card-title">${escapeHtml(card.title)}</div>` : "";
+        const body = (card && card.summary) ? renderMarkdown(card.summary) : renderMarkdown(text);
+        return `<div class="msg-card msg-card-kanban">
+          <div class="msg-card-meta">Task <code>${escapeHtml(taskId)}</code> &middot; ${escapeHtml(status)}</div>
+          ${title}
+          <div class="msg-card-summary">${body}</div>
+          <div class="msg-card-foot">Summary from kanban task ${escapeHtml(taskId)}</div>
+        </div>`;
+      }
+      if (role === "user" && text && text.length > 1500) {
+        const preview = escapeHtml(text.slice(0, 300).trim()) + "\u2026";
+        return `<p>${preview}</p><details class="prompt-details"><summary>Show full message (${escapeHtml(formatCount(text.length))} chars)</summary><div class="prompt-raw">${renderMarkdown(text)}</div></details>`;
+      }
+      return renderStepsSummaryHtml(meta) + renderMarkdown(text);
+    }
+
+    // Builds one message row. at is the message's epoch seconds; a message
+    // typed or received now leaves it out.
+    function messageRow(role, text, tag, at, card, meta) {
+      const row = document.createElement("div");
+      row.className = "message-row";
+      let avatarClass = "avatar-user";
+      let avatarChar = "Y";
+      let authorName = "You";
+      let tagLabel = tag || "";
+      if (role === "agent") {
+        avatarClass = "avatar-agent";
+        avatarChar = "A";
+        authorName = "Agent";
+      } else if (role === "event_watcher") {
+        avatarClass = "avatar-alert";
+        avatarChar = "!";
+        authorName = "Event watcher";
+        tagLabel = tagLabel || "alert";
+      } else if (role === "scheduler") {
+        avatarClass = "avatar-cron";
+        avatarChar = "\u21bb";
+        authorName = "Scheduler";
+        tagLabel = tagLabel || "scheduled";
+      } else if (role === "kanban") {
+        avatarClass = "avatar-agent";
+        avatarChar = "K";
+        authorName = (card && card.assignee) || "Specialist agent";
+        tagLabel = tagLabel || "Specialist report";
+      }
+      const when = typeof at === "number" ? new Date(at * 1000) : new Date();
+      const timeStr = when.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+      row.innerHTML = `
+        <div class="avatar ${avatarClass}">${escapeHtml(avatarChar)}</div>
+        <div class="message-content">
+          <div class="message-header">
+            <span class="message-author">${escapeHtml(authorName)}</span>
+            ${tagLabel ? `<span class="source-tag">${escapeHtml(tagLabel)}</span>` : ""}
+            <span class="message-time">${escapeHtml(timeStr)}</span>
+          </div>
+          <div class="message-bubble">${renderAuthorBody(role, text, card, meta)}</div>
+        </div>`;
+      return row;
+    }
+
+    function appendTo(container, role, text, tag, at, card, meta) {
+      const row = messageRow(role, text, tag, at, card, meta);
+      container.appendChild(row);
+      container.scrollTop = container.scrollHeight;
+      return row;
+    }
+
+    function appendMessage(role, text, tag, at, card, meta) {
+      return appendTo($("chat-stream"), role, text, tag, at, card, meta);
+    }
+
+    function clearStream() {
+      $("chat-stream").replaceChildren();
+      pending.centre = null;
+    }
+
+    function showIntro() {
+      clearStream();
+      $("chat-stream").appendChild($("intro-template").content.cloneNode(true));
+    }
+
+    function nearBottom(el) {
+      return el.scrollHeight - el.scrollTop - el.clientHeight < NEAR_BOTTOM_PX;
+    }
+
+    // The working row of a running turn, with its one status line, steps
+    // timeline, and live delta stream, in the pane that started the turn.
+    const pending = { centre: null, side: null };
+    const lastTurnMeta = {};
+
+    function showPending(where, id) {
+      removePending(where);
+      const container = where === "side" ? $("side-body") : $("chat-stream");
+      const row = appendTo(container, "agent", "", "working");
+      const bubble = row.querySelector(".message-bubble");
+      const line = document.createElement("div");
+      line.className = "status-line";
+      const stepsEl = document.createElement("div");
+      stepsEl.className = "turn-steps";
+      stepsEl.hidden = true;
+      const streamEl = document.createElement("div");
+      streamEl.className = "turn-stream";
+      streamEl.hidden = true;
+      bubble.appendChild(line);
+      bubble.appendChild(stepsEl);
+      bubble.appendChild(streamEl);
+      pending[where] = { row, line, stepsEl, streamEl, id, lastStatus: "", lastStepsSig: "", lastDelta: "" };
+      statusChanged(id);
+    }
+
+    function removePending(where) {
+      if (pending[where]) pending[where].row.remove();
+      pending[where] = null;
+    }
+
+    // Updates the live status line, steps block, and streaming reply text.
+    function statusChanged(id) {
+      const turn = inflight[id];
+      if (!turn) return;
+      Object.values(pending).forEach(p => {
+        if (!p || p.id !== id) return;
+        p.line.innerText = formatStatusWithTimer(turn);
+        if (turn.status !== p.lastStatus) {
+          p.lastStatus = turn.status;
+          p.line.classList.remove("status-in");
+          void p.line.offsetWidth;
+          p.line.classList.add("status-in");
+        }
+        const steps = turn.steps || [];
+        const sig = JSON.stringify(steps);
+        if (sig !== p.lastStepsSig) {
+          p.lastStepsSig = sig;
+          p.stepsEl.hidden = steps.length === 0;
+          p.stepsEl.innerHTML = renderStepsHtml(steps);
+        }
+        const delta = turn.deltaText || "";
+        if (delta !== p.lastDelta) {
+          p.lastDelta = delta;
+          p.streamEl.hidden = !delta;
+          p.streamEl.innerHTML = renderMarkdown(delta);
+        }
+      });
+    }
+
+    function tickInflight() {
+      Object.keys(inflight).forEach(id => statusChanged(id));
+    }
+
+    function updateComposer() {
+      const busy = !!(activeId && inflight[activeId]);
+      $("btn-send").disabled = busy;
+      document.querySelectorAll(".chip").forEach(c => { c.disabled = busy; });
+    }
+
+    function updateSideComposer() {
+      $("side-send").disabled = pane.mode === "post" && !!inflight[pane.id];
+    }
+
+    function updateTitle() {
+      document.title = pageTitle();
+    }
+
+    function updateTopbar() {
+      if (view === "thread") {
+        const t = findThread(activeId);
+        $("view-title").innerText = (t && t.title) || "New chat";
+        $("view-sub").innerText = "Your thread with the agent. Threads are listed in this browser only.";
+      } else {
+        $("view-title").innerText = CHANNELS[view].title;
+        $("view-sub").innerText = CHANNELS[view].sub;
+      }
+    }
+
+    function threadsChanged() {
+      renderRail();
+      updateComposer();
+      updateTopbar();
+    }
+
+    function renderRail() {
+      document.querySelectorAll("[data-channel]").forEach(b => {
+        const name = b.dataset.channel;
+        const n = channelUnread[name];
+        b.classList.toggle("active", view === name);
+        b.classList.toggle("unread", n > 0 && view !== name);
+        const count = $(`count-${name}`);
+        count.hidden = n === 0 || view === name;
+        count.innerText = String(n);
+      });
+      renderThreads();
+      updateTitle();
+    }
+
+    function renderThreads() {
+      const list = $("thread-list");
+      if (threads.length === 0) {
+        list.innerHTML = `<div class="rail-item static">No threads yet</div>`;
+        return;
+      }
+      list.innerHTML = threads.map(t => {
+        const classes = ["rail-item"];
+        if (onScreen(t.id)) classes.push("active");
+        if (t.unread) classes.push("unread");
+        const busy = !!inflight[t.id];
+        const dot = busy ? `<span class="thread-dot busy" title="A turn is running"></span>`
+          : (t.unread ? `<span class="thread-dot unread" title="New messages"></span>` : "");
+        const title = t.title || "New chat";
+        return `
+          <div class="thread${onScreen(t.id) ? " active" : ""}">
+            <button type="button" class="${classes.join(" ")}" data-thread="${escapeHtml(t.id)}" title="${escapeHtml(title)}">
+              ${dot}<span class="rail-label">${escapeHtml(title)}</span>
+              <span class="rail-time">${escapeHtml(t.started ? relativeTime(t.updated) : "")}</span>
+            </button>
+            <button type="button" class="thread-remove" data-remove="${escapeHtml(t.id)}" title="Remove from this list. The agent keeps the session." ${busy ? "disabled" : ""}>&times;</button>
+          </div>`;
+      }).join("");
+    }
+
+    function showView(name) {
+      $("feed-view").hidden = name !== "feed";
+      $("thread-view").hidden = name !== "thread";
+    }
+
+    // ---- Channels ----
+
+    // Posts in the feed marked new: unread when you opened the channel or
+    // when they arrived while you watched it. Cleared when you leave.
+    let feedNew = new Set();
+    let feedIds = new Set();
+    let feedSig = "";
+    const channelErrors = {};
+
+    function postSubject(p) {
+      return postHeadline(p).text;
+    }
+
+    function postHtml(p, ch) {
+      const latest = p.summary && p.summary.latest;
+      const replies = p.summary ? p.summary.replies : null;
+      const classes = ["post"];
+      if (feedNew.has(p.id)) classes.push("unread");
+      if (pane.mode === "post" && pane.id === p.id) classes.push("selected");
+      const head = postHeadline(p);
+      const label = typeof replies === "number" && head.started
+        ? `${replies} ${replies === 1 ? "reply" : "replies"} · View thread`
+        : "View thread";
+      return `
+        <article class="${classes.join(" ")}">
+          <div class="avatar ${ch.avatarClass}" aria-hidden="true">${escapeHtml(ch.avatar)}</div>
+          <div class="post-main">
+            <div class="post-head">
+              <span class="post-author">${escapeHtml(ch.author)}</span>
+              <span class="post-time">${escapeHtml(relativeTime(p.started_at || p.last_active))}</span>
+              ${feedNew.has(p.id) ? `<span class="post-new">new</span>` : ""}
+            </div>
+            <div class="post-subject${head.muted ? " muted" : ""}">${escapeHtml(head.text)}</div>
+            ${latest ? `<div class="post-reply"><b>Agent:</b> ${escapeHtml(latest)}</div>` : ""}
+            <div class="post-foot">
+              <button type="button" class="post-open" data-post="${escapeHtml(p.id)}">${escapeHtml(label)}</button>
+              <span class="post-last">${p.last_active ? `Last activity ${escapeHtml(relativeTime(p.last_active))}` : ""}</span>
+            </div>
+          </div>
+        </article>`;
+    }
+
+    // Draws the channel on screen, newest post at the bottom. A feed at the
+    // bottom stays there; one scrolled up keeps its place and shows the
+    // "New posts" pill when a post arrives.
+    function renderFeed(toBottom) {
+      if (view === "thread") return;
+      const feed = $("feed");
+      const ch = CHANNELS[view];
+      const posts = channelPosts[view].slice().reverse();
+      const sig = JSON.stringify([view, Math.floor(Date.now() / 60000), pane.id, [...feedNew], channelErrors[view] || "",
+        posts.map(p => [p.id, p.message_count, p.last_active, p.summary])]);
+      if (!toBottom && sig === feedSig) return;
+      feedSig = sig;
+      const follow = toBottom || nearBottom(feed);
+      const top = feed.scrollTop;
+      if (posts.length === 0) {
+        const error = channelErrors[view];
+        feed.innerHTML = `<div class="empty-state"><div>${escapeHtml(error ? "Could not load posts." : ch.empty)}</div>
+          ${error ? `<div>${escapeHtml(error)}</div>` : ""}</div>`;
+      } else {
+        feed.innerHTML = posts.map(p => postHtml(p, ch)).join("");
+      }
+      const arrived = posts.some(p => !feedIds.has(p.id));
+      feedIds = new Set(posts.map(p => p.id));
+      if (follow) {
+        feed.scrollTop = feed.scrollHeight;
+        $("new-posts").hidden = true;
+      } else {
+        feed.scrollTop = top;
+        if (arrived) $("new-posts").hidden = false;
+      }
+    }
+
+    function selectChannel(name) {
+      view = name;
+      sessionStorage.setItem(VIEW_KEY, name);
+      showView("feed");
+      feedNew = new Set(channelPosts[name].filter(postUnread).map(p => p.id));
+      feedIds = new Set(channelPosts[name].map(p => p.id));
+      recountChannels(document.hidden ? "" : name);
+      renderFeed(true);
+      threadsChanged();
+    }
+
+    async function fetchChannel(name) {
+      try {
+        const resp = await fetch(`/api/channels/${name}/posts`);
+        const data = await readBody(resp);
+        if (!resp.ok) return { error: data.detail || data.error || `HTTP ${resp.status}` };
+        return { posts: data.posts || [] };
+      } catch (e) {
+        return { error: e.message };
+      }
+    }
+
+    async function pollChannels() {
+      for (const name of CHANNEL_NAMES) {
+        const result = await fetchChannel(name);
+        if (result.error) {
+          channelErrors[name] = result.error;
+        } else {
+          delete channelErrors[name];
+          const visible = view === name && !document.hidden;
+          const { fresh, unreadIds } = updateChannel(name, result.posts, visible, pane.mode === "post" ? pane.id : "");
+          if (view === name) unreadIds.forEach(id => feedNew.add(id));
+          if (name === "alerts") notifyNewAlerts(fresh);
+        }
+        if (view === name) renderFeed(false);
+      }
+      renderRail();
+    }
+
+    // ---- Notifications: only after you turn them on with the rail button.
+    // The page never asks for permission by itself. ----
+
+    function notificationsOn() {
+      return "Notification" in window && Notification.permission === "granted" && localStorage.getItem(NOTIFY_KEY) === "on";
+    }
+
+    function renderNotifyButton() {
+      const btn = $("btn-notify");
+      if (!("Notification" in window)) { btn.hidden = true; return; }
+      btn.hidden = false;
+      if (Notification.permission === "denied") {
+        btn.disabled = true;
+        btn.innerText = "Notifications are blocked in this browser";
+        return;
+      }
+      btn.disabled = false;
+      btn.innerText = notificationsOn() ? "Notifications on for # alerts. Turn off" : "Turn on notifications";
+    }
+
+    async function toggleNotifications() {
+      if (notificationsOn()) {
+        localStorage.setItem(NOTIFY_KEY, "off");
+      } else if ((await Notification.requestPermission()) === "granted") {
+        localStorage.setItem(NOTIFY_KEY, "on");
+      }
+      renderNotifyButton();
+    }
+
+    // Notifies new # alerts posts while this tab is in the background.
+    function notifyNewAlerts(fresh) {
+      if (!notificationsOn() || !document.hidden || fresh.length === 0) return;
+      fresh.slice(0, NOTIFY_MAX_PER_POLL).forEach(p => {
+        const n = new Notification("# alerts", { body: postSubject(p), tag: p.id });
+        n.onclick = () => {
+          window.focus();
+          selectChannel("alerts");
+          openPost(p.id);
+          n.close();
+        };
+      });
+      if (fresh.length > NOTIFY_MAX_PER_POLL) {
+        new Notification("# alerts", { body: `${fresh.length - NOTIFY_MAX_PER_POLL} more new posts`, tag: "alerts-more" });
+      }
+    }
+
+    // ---- Right pane: a post's thread, or About this agent. ----
+
+    const pane = { mode: null, id: "", latestId: null };
+    let paneToken = 0;
+
+    function openSide(mode) {
+      pane.mode = mode;
+      $("side-pane").hidden = false;
+      $("panes").classList.add("with-side");
+      $("side-thread").hidden = mode !== "post";
+      $("side-about").hidden = mode !== "about";
+    }
+
+    function closeSide() {
+      pane.mode = null;
+      pane.id = "";
+      paneToken++;
+      pending.side = null;
+      $("side-pane").hidden = true;
+      $("panes").classList.remove("with-side");
+      renderFeed(false);
+    }
+
+    function findPost(id) {
+      for (const n of CHANNEL_NAMES) {
+        const p = channelPosts[n].find(x => x.id === id);
+        if (p) return p;
+      }
+      return null;
+    }
+
+    async function openPost(id) {
+      const post = findPost(id);
+      openSide("post");
+      pane.id = id;
+      pane.latestId = null;
+      $("side-title").innerText = "Thread";
+      $("side-sub").innerText = post ? postSubject(post) : id;
+      $("side-body").replaceChildren(messageRow("agent", "Loading this thread…", "loading"));
+      pending.side = null;
+      if (post) markPostsSeen([post]);
+      recountChannels(view !== "thread" && !document.hidden ? view : "");
+      renderRail();
+      renderFeed(false);
+      updateSideComposer();
+      await refreshPane(true);
+    }
+
+    // Re-reads the open post's transcript and redraws it when it changed.
+    // Returns false when the read failed.
+    async function refreshPane(force) {
+      if (pane.mode !== "post") return false;
+      const id = pane.id;
+      const token = ++paneToken;
+      const result = await fetchTranscript(id);
+      if (token !== paneToken || pane.mode !== "post" || pane.id !== id) return true;
+      const body = $("side-body");
+      if (result.error) {
+        if (force) body.replaceChildren(messageRow("agent", `Could not load this thread: ${result.error}`, "error"));
+        return false;
+      }
+      const data = result.data;
+      if (!force && data.latest_id === pane.latestId) return true;
+      pane.latestId = data.latest_id;
+      const follow = force || nearBottom(body);
+      body.replaceChildren();
+      pending.side = null;
+      const messages = data.messages || [];
+      if (messages.length === 0) body.appendChild(messageRow("agent", "This session has no messages with text yet.", "empty"));
+      let lastAgentIdx = -1;
+      messages.forEach((m, i) => { if ((m.author || m.role) !== "user" && m.role === "assistant") lastAgentIdx = i; });
+      messages.forEach((m, i) => {
+        const role = m.author || (m.role === "user" ? "user" : "agent");
+        const meta = (i === lastAgentIdx && lastTurnMeta[id]) ? lastTurnMeta[id] : null;
+        body.appendChild(messageRow(role, m.content, "", m.timestamp, m.card, meta));
+      });
+      const turn = inflight[id];
+      if (turn) {
+        const users = messages.filter(m => m.role === "user" && (!m.author || m.author === "user"));
+        const last = users.length ? users[users.length - 1].content : "";
+        if ((last || "").trim() !== turn.text.trim()) body.appendChild(messageRow("user", turn.text));
+        showPending("side", id);
+      }
+      if (follow) body.scrollTop = body.scrollHeight;
+      return true;
+    }
+
+    function pollPane() {
+      if (pane.mode === "post" && !inflight[pane.id]) refreshPane(false);
+    }
+
+    // Sends a reply into the open post's session: the event triage or
+    // scheduled session itself, which the server checks before the turn.
+    async function sendFromSide() {
+      if (pane.mode !== "post" || inflight[pane.id]) return;
+      const input = $("side-input");
+      const text = input.value.trim();
+      if (!text) return;
+      input.value = "";
+      const id = pane.id;
+      const turn = startInflight(id, text);
+      appendTo($("side-body"), "user", text);
+      showPending("side", id);
+      updateSideComposer();
+
+      const outcome = await runTurn(id, text);
+      const meta = (turn.steps && turn.steps.length > 0)
+        ? { steps: turn.steps.slice(), elapsed: Math.max(1, Math.round(nowSeconds() - turn.startedAt)) }
+        : null;
+      if (meta && outcome.error === undefined) lastTurnMeta[id] = meta;
+      delete inflight[id];
+      if (pending.side && pending.side.id === id) removePending("side");
+      if (pane.mode === "post" && pane.id === id) {
+        if (outcome.error !== undefined) {
+          appendTo($("side-body"), "agent", outcome.error, "error");
+        } else if (!(await refreshPane(true))) {
+          appendTo($("side-body"), "agent", outcome.reply || "(The agent returned an empty reply.)", "", undefined, undefined, meta);
+        }
+      }
+      updateSideComposer();
+      pollChannels();
+    }
+
+    let lastInsights = null;
+
+    function openAbout() {
+      openSide("about");
+      pane.id = "";
+      paneToken++;
+      $("side-title").innerText = "About this agent";
+      $("side-sub").innerText = "Model, cluster and identity";
+      renderAbout();
+      renderFeed(false);
+    }
+
+    function renderAbout() {
+      const data = lastInsights || {};
+      const model = data.model || {};
+      $("about-model").innerText = model.name ? [model.name, model.provider && `via ${model.provider}`].filter(Boolean).join(" ") : "Not reported";
+      const c = data.cluster || {};
+      $("about-cluster").innerText = [c.name, c.location, c.project].filter(Boolean).join(" · ") || "Not reported";
+      const id = data.identity || {};
+      $("id-ksa").innerText = id.kubernetes_service_account || "Not recorded";
+      $("id-gsa").innerText = id.gcp_service_account || "Not recorded at install";
+      const roles = $("id-roles");
+      roles.replaceChildren();
+      const list = id.roles || [];
+      if (list.length === 0) {
+        const none = document.createElement("span");
+        none.innerText = "Not recorded at install";
+        roles.appendChild(none);
+      }
+      list.forEach(r => {
+        const chip = document.createElement("span");
+        chip.className = "role-chip";
+        chip.innerText = r;
+        roles.appendChild(chip);
+      });
+    }
+
+    // ---- Threads in the centre pane ----
+
+    // Each switch bumps this, so a slow transcript for a thread you already
+    // left does not replace the one you switched to.
+    let switchToken = 0;
+
+    async function selectThread(id) {
+      const t = findThread(id);
+      if (!t) return;
+      const token = ++switchToken;
+      activeId = id;
+      view = "thread";
+      sessionStorage.setItem(ACTIVE_KEY, id);
+      sessionStorage.setItem(VIEW_KEY, "thread");
+      feedNew = new Set();
+      showView("thread");
+      t.unread = false;
+      saveThreads();
+      threadsChanged();
+      if (!t.started) {
+        showIntro();
+        return;
+      }
+      clearStream();
+      appendMessage("agent", "Loading this chat…", "loading");
+      const result = await fetchTranscript(id);
+      if (token !== switchToken || !onScreen(id)) return;
+      if (result.error) {
+        clearStream();
+        appendMessage("agent", `Could not load this chat: ${result.error}`, "error");
+      } else {
+        activateThread(t, result.data);
+      }
+      const turn = inflight[id];
+      if (turn) {
+        const shown = ((result.data && result.data.messages) || []).filter(m => m.role === "user" && (!m.author || m.author === "user"));
+        const last = shown.length ? shown[shown.length - 1].content : "";
+        if ((last || "").trim() !== turn.text.trim()) appendMessage("user", turn.text);
+        showPending("centre", id);
+      }
+      (notices[id] || []).forEach(text => appendMessage("agent", text, "error"));
+      delete notices[id];
+    }
+
+    function newChat() {
+      const blank = threads.find(t => !t.started && !inflight[t.id]);
+      const t = blank || addThread(newSessionId(), "", false);
+      selectThread(t.id);
+      $("prompt-input").focus();
+    }
+
+    // Reads a response body that may not be JSON (a proxy error page, a
+    // port-forward that dropped) without reporting it as a network failure.
+    async function readBody(resp) {
+      const text = await resp.text();
+      try { return JSON.parse(text); } catch (e) { return { detail: text.trim() || resp.statusText }; }
+    }
+
+    // The text a refused turn shows. Another writer's turn running on an
+    // agent session is not a failure, so it reads as plain advice.
+    function failureText(status, data) {
+      if (status === 409 && data.error === "agent_busy") return data.detail;
+      return `Request failed (HTTP ${status}): ${data.detail || data.error || "no detail"}`;
+    }
+
+    // The turn without a live status, for a console older than the stream
+    // route.
+    async function runTurnPlain(body) {
+      try {
+        const resp = await fetch("/api/chat", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", [CONSOLE_HEADER]: "1" },
+          body
+        });
+        const data = await readBody(resp);
+        if (resp.ok) return { reply: data.reply || "" };
+        return { error: failureText(resp.status, data) };
+      } catch (err) {
+        return { error: "Could not reach the web console. Is the port-forward still running? " + err.message };
+      }
+    }
+
+    // Runs one turn on a session through the stream route, updating its
+    // status line as events arrive. Falls back to /api/chat when the stream
+    // route is not there or the request fails before any response.
+    async function runTurn(id, text) {
+      const body = JSON.stringify({ message: text, session_id: id });
+      let resp;
+      try {
+        resp = await fetch("/api/chat/stream", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", [CONSOLE_HEADER]: "1" },
+          body
+        });
+      } catch (err) {
+        return runTurnPlain(body);
+      }
+      if (resp.status === 404 || resp.status === 405) {
+        // An agent session the server does not know is also a 404, with a
+        // JSON body naming it. Only a missing route falls back.
+        const data = await readBody(resp);
+        if (data.error === "session_not_found") return { error: `Request failed (HTTP 404): ${data.detail}` };
+        return runTurnPlain(body);
+      }
+      if (!resp.ok || !(resp.headers.get("Content-Type") || "").startsWith("text/event-stream")) {
+        return { error: failureText(resp.status, await readBody(resp)) };
+      }
+      let result = null;
+      try {
+        await readSSE(resp.body, (name, data) => {
+          if (name === "status" && typeof data.text === "string") setStatus(id, data.text);
+          else if (name === "step" && data && typeof data.id === "string") addStep(id, data);
+          else if (name === "delta" && data && typeof data.text === "string") appendDelta(id, data.text);
+          else if (name === "reply") result = { reply: data.reply || "" };
+          else if (name === "error") result = { error: `Request failed: ${data.detail || data.error || "no detail"}` };
+        });
+      } catch (err) {
+        if (!result) {
+          // The console keeps reading the agent's turn after the page loses
+          // it, so the run finishes and its reply lands in the session.
+          result = { error: "The connection to the web console broke off. The agent is still finishing this turn; its reply will appear in this thread within a minute or so. " + err.message };
+        }
+      }
+      return result || { error: "The web console closed the stream without a reply." };
+    }
+
+    async function submitMessage(text) {
+      text = (text || "").trim();
+      if (!text) return;
+      let t = findThread(activeId);
+      if (!t) {
+        t = addThread(newSessionId(), "", false);
+        activeId = t.id;
+        sessionStorage.setItem(ACTIVE_KEY, t.id);
+        clearStream();
+      }
+      if (inflight[t.id]) return;
+      if (!t.started) clearStream();
+      if (!t.title) t.title = threadTitle(text);
+      t.started = true;
+      t.updated = nowSeconds();
+      const turn = startInflight(t.id, text);
+      saveThreads();
+      appendMessage("user", text);
+      showPending("centre", t.id);
+      threadsChanged();
+
+      const outcome = await runTurn(t.id, text);
+      const meta = (turn.steps && turn.steps.length > 0)
+        ? { steps: turn.steps.slice(), elapsed: Math.max(1, Math.round(nowSeconds() - turn.startedAt)) }
+        : null;
+      delete inflight[t.id];
+      if (pending.centre && pending.centre.id === t.id) removePending("centre");
+      if (findThread(t.id)) {
+        if (outcome.error === undefined) {
+          deliver(t, outcome.reply || "(The agent returned an empty reply.)", "", null, meta);
+          await settleAfterReply(t, text, outcome.reply);
+        } else if (onScreen(t.id)) {
+          appendMessage("agent", outcome.error, "error");
+        } else {
+          (notices[t.id] = notices[t.id] || []).push(outcome.error);
+          t.unread = true;
+          saveThreads();
+        }
+      }
+      threadsChanged();
+    }
+
+    function sendFromInput() {
+      const input = $("prompt-input");
+      if (activeId && inflight[activeId]) return;
+      const text = input.value;
+      input.value = "";
+      submitMessage(text);
+    }
+
+    async function fetchTranscript(id) {
+      try {
+        const resp = await fetch(`/api/sessions/${encodeURIComponent(id)}/transcript`);
+        const data = await readBody(resp);
+        if (!resp.ok) return { error: data.detail || data.error || `HTTP ${resp.status}` };
+        return { data };
+      } catch (e) {
+        return { error: e.message };
+      }
+    }
+
+    // Slack and Google Chat sessions, by title only. The server refuses
+    // their transcripts, so the rows are not links.
+    async function fetchChatList() {
+      let data;
+      try {
+        const resp = await fetch("/api/sessions/recent");
+        if (!resp.ok) return;
+        data = await resp.json();
+      } catch (e) {
+        return;
+      }
+      const chats = (data.sessions || []).filter(s => s.kind === "chat");
+      $("chat-section").hidden = chats.length === 0;
+      $("chat-list").innerHTML = chats.map(s => `
+        <div class="rail-item static" title="${escapeHtml(s.source || "")}">
+          <span class="rail-label">${escapeHtml(s.title || "Chat session")}</span>
+          <span class="rail-time">${escapeHtml(relativeTime(s.last_active))}</span>
+        </div>`).join("");
+    }
+
+    function setText(id, text, title) {
+      const el = $(id);
+      el.innerText = text;
+      el.title = title || "";
+      return el;
+    }
+
+    function renderInsights(data) {
+      lastInsights = data;
+      const model = data.model || {};
+      setText("ins-model", model.name || "Not reported", model.name);
+      setText("ins-provider", model.provider ? `via ${model.provider}` : "");
+
+      const u = data.usage || {};
+      if (!u.replicas_read) {
+        setText("ins-tokens", "Not available", u.error);
+        setText("ins-tokens-split", u.error || "", u.error);
+        setText("ins-cost", "Not available", u.error);
+        setText("ins-usage-note", "", u.error).classList.remove("warn");
+      } else {
+        setText("ins-tokens", `${formatCount(u.total_tokens)} total`);
+        setText("ins-tokens-split", `${formatCount(u.input_tokens)} in / ${formatCount(u.output_tokens)} out`);
+        setText("ins-cost", formatUSD(u.spend_usd), "Estimated by LiteLLM from its price table");
+        const partial = u.replicas_read < u.replicas_found;
+        const note = setText("ins-usage-note",
+          `Since LiteLLM last restarted · ${u.replicas_read} of ${u.replicas_found} replicas`, u.error);
+        note.classList.toggle("warn", partial);
+      }
+
+      const c = data.cluster || {};
+      const where = [c.name, c.location].filter(Boolean).join(" · ");
+      setText("ins-cluster", where || "Not reported");
+      setText("ins-project", c.project || "");
+      setText("ws-cluster", where || "Cluster not reported");
+      if (pane.mode === "about") renderAbout();
+    }
+
+    async function fetchInsights() {
+      try {
+        const resp = await fetch("/api/insights");
+        const data = await readBody(resp);
+        if (!resp.ok) throw new Error(data.detail || `HTTP ${resp.status}`);
+        renderInsights(data);
+      } catch (e) {
+        setText("ins-tokens", "Not available", e.message);
+        setText("ins-cost", "Not available", e.message);
+      }
+    }
+
+    async function checkStatus() {
+      const badge = $("agent-badge");
+      const label = $("agent-status-text");
+      try {
+        const resp = await fetch("/api/status");
+        const data = await readBody(resp);
+        if (!resp.ok) throw new Error(data.detail || `HTTP ${resp.status}`);
+        badge.title = data.agent ? data.agent.detail : "";
+        if (data.agent && data.agent.healthy) {
+          badge.className = "badge badge-green";
+          label.innerText = "Agent reachable";
+        } else {
+          badge.className = "badge badge-amber";
+          label.innerText = "Agent unreachable";
+        }
+      } catch (e) {
+        badge.className = "badge badge-red";
+        badge.title = e.message;
+        label.innerText = "Console unreachable";
+      }
+    }
+
+    function onEnter(input, send) {
+      input.addEventListener("keydown", e => {
+        if (e.key === "Enter" && !e.shiftKey) {
+          e.preventDefault();
+          send();
+        }
+      });
+    }
+
+    $("btn-send").addEventListener("click", sendFromInput);
+    onEnter($("prompt-input"), sendFromInput);
+    $("side-send").addEventListener("click", sendFromSide);
+    onEnter($("side-input"), sendFromSide);
+    document.querySelectorAll(".chip").forEach(chip => {
+      chip.addEventListener("click", () => submitMessage(chip.dataset.prompt));
+    });
+    $("btn-new-chat").addEventListener("click", newChat);
+    document.querySelectorAll("[data-channel]").forEach(b => {
+      b.addEventListener("click", () => selectChannel(b.dataset.channel));
+    });
+    $("thread-list").addEventListener("click", e => {
+      const remove = e.target.closest("[data-remove]");
+      if (remove) {
+        const wasActive = onScreen(remove.dataset.remove);
+        if (removeThread(remove.dataset.remove) && wasActive) {
+          if (activeId) selectThread(activeId);
+          else selectChannel("alerts");
+        }
+        return;
+      }
+      const open = e.target.closest("[data-thread]");
+      if (open && !onScreen(open.dataset.thread)) selectThread(open.dataset.thread);
+    });
+    $("feed").addEventListener("click", e => {
+      const open = e.target.closest("[data-post]");
+      if (open) openPost(open.dataset.post);
+    });
+    $("feed").addEventListener("scroll", () => {
+      if (nearBottom($("feed"))) $("new-posts").hidden = true;
+    });
+    $("new-posts").addEventListener("click", () => {
+      const feed = $("feed");
+      feed.scrollTop = feed.scrollHeight;
+      $("new-posts").hidden = true;
+    });
+    $("btn-about").addEventListener("click", () => (pane.mode === "about" ? closeSide() : openAbout()));
+    $("side-close").addEventListener("click", closeSide);
+    $("btn-notify").addEventListener("click", toggleNotifications);
+    document.addEventListener("keydown", e => {
+      if (e.key === "Escape" && pane.mode) closeSide();
+    });
+    document.addEventListener("visibilitychange", () => {
+      if (document.hidden || view === "thread") return;
+      recountChannels(view);
+      renderRail();
+    });
+    window.addEventListener("storage", e => {
+      if (e.key === THREADS_KEY) mergeStoredThreads(e.newValue);
+      if (e.key === SEEN_KEY) {
+        loadSeen(e.newValue === null ? "{}" : e.newValue);
+        recountChannels("");
+        renderRail();
+      }
+    });
+
+    loadThreads();
+    loadSeen(localStorage.getItem(SEEN_KEY));
+    const savedView = sessionStorage.getItem(VIEW_KEY);
+    if (savedView === "thread" && activeId) selectThread(activeId);
+    else selectChannel(CHANNEL_NAMES.includes(savedView) ? savedView : "alerts");
+    renderNotifyButton();
+    checkStatus();
+    pollChannels();
+    fetchInsights();
+    fetchChatList();
+    setInterval(checkStatus, STATUS_POLL_MS);
+    setInterval(pollChannels, CHANNELS_POLL_MS);
+    setInterval(fetchChatList, CHAT_LIST_POLL_MS);
+    setInterval(fetchInsights, INSIGHTS_POLL_MS);
+    setInterval(pollAll, MESSAGES_POLL_MS);
+    setInterval(pollPane, PANE_POLL_MS);
+    setInterval(tickInflight, 1000);
+  </script>
+</body>
+</html>

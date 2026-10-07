@@ -3,14 +3,10 @@
 {{- if eq $provider "chatgpt" }}
 {{- fail "litellm.modelProvider 'chatgpt' is not supported: a ChatGPT subscription needs an OAuth token store this chart does not ship. Use 'openai' with an API key, or see examples/litellm-chatgpt-subscription for a hand-applied subscription proxy." }}
 {{- end }}
-{{- /* Per-provider default model names mirror install.defaults.env (DEFAULT_MODEL_*);
-       a chart cannot source that file, and tests/test_installer_common.py pins the two equal. */}}
-{{- $defaultModels := dict "gemini" "gemini-3.5-flash" "anthropic" "claude-opus-5" "openai" "gpt-5.4" "vertex_ai" "gemini-3.5-flash" }}
-{{- if not (hasKey $defaultModels $provider) }}
-{{- fail (printf "litellm.modelProvider %q is not one of gemini, anthropic, openai, vertex_ai — a typo here would otherwise fail only at runtime" $provider) }}
-{{- end }}
+{{- /* The model resolution, and the per-provider defaults it falls back to, live in
+       kube-agents.litellmModel so the web console shows the model this serves. */}}
+{{- $model := include "kube-agents.litellmModel" . }}
 {{- $rollingUpdate := include "kube-agents.rollingUpdateFenceposts" (dict "rollingUpdate" .Values.litellm.rollingUpdate "defaultSurge" 1 "defaultUnavailable" 1 "scope" "litellm.rollingUpdate") | fromYaml }}
-{{- $model := .Values.litellm.modelDefaultName | default (get $defaultModels $provider) }}
 {{- $vertex := .Values.litellm.vertex | default dict }}
 {{- $vertexSA := $vertex.serviceAccountName | default "kubeagents-litellm" }}
 {{- $vertexProject := $vertex.projectId | default .Values.platformAgent.harness.projectId }}
