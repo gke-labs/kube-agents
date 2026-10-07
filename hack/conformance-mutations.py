@@ -1354,6 +1354,16 @@ Mutation(
         "anything",
     ),
     Mutation(
+        "C1-target-allowlist-membership-loosened-under-a-comment",
+        "a2a/gateway/allowlist.go",
+        ('return subject != "" && set[subject]',
+         'return subject == "" || set[subject] // was: return subject != "" && set[subject]'),
+        "test_C1_the_target_allowlist_env_names_agree_across_the_module_boundary",
+        "loosen the membership check and keep the old line in a trailing "
+        "comment; only a pin that reads the function's code without its "
+        "comments sees the check changed",
+    ),
+    Mutation(
         "C1-relay-spells-the-delegate-artifact-by-hand",
         "a2a/gateway/relay.go",
         ('case lib.ArtifactDelegate:', 'case "delegate":'),
@@ -1390,6 +1400,15 @@ Mutation(
         "name; only the positive check, scoped to handleDelegateRequest, "
         "sees that the shared constant is gone from the check (the rest of "
         "delegation.go still references it)",
+    ),
+    Mutation(
+        "C1-delegate-text-cap-shifted-under-a-comment-naming-it",
+        "a2a/gateway/delegation.go",
+        ('len(req.Text) > lib.DelegateTextCap {', 'len(req.Text) > 1<<14 { // lib.DelegateTextCap, as a shift'),
+        "test_C1_the_delegate_text_cap_is_spelled_once",
+        "spell the gateway's cap as a shift and leave the constant's name in "
+        "a comment on the same line; only a pin that reads the function's "
+        "code without its comments sees the constant gone",
     ),
     Mutation(
         "C1-delegate-text-cap-hand-spelled-in-worker-adapter",

@@ -1115,7 +1115,7 @@ class C1IsolationIsStructural(unittest.TestCase):
                 self._one_match(r"os\.(?:Getenv|LookupEnv)\(%s\)" % env, allowlist + h.text("a2a_gateway_config"), "the gateway's read of %s" % env)
 
         # The absent-list branch is allow, stated in the function that answers.
-        body = h.go_function_body(allowlist, "targetAllows")
+        body = _go_code(allowlist, "targetAllows")
         self.assertIn("if set == nil {", body, "targetAllows lost its absent-list branch")
         self.assertIn("return true", body.split("if set == nil {")[1].split("}")[0],
                       "targetAllows answers an absent list with something other than allow")
@@ -1189,14 +1189,15 @@ class C1IsolationIsStructural(unittest.TestCase):
             "lib.DelegateTextCap's definition moved; this test compared nothing",
         )
         magic_number = re.compile(r"\b16\s*\*\s*1024\b|\b16384\b")
-        # Scoped to the function that makes the check: elsewhere in
-        # delegation.go the wake's budget and two comments name the constant
-        # too, so a whole-file read passes whatever handleDelegateRequest does.
+        # Scoped to the function that makes the check, and to its code
+        # without comments (_go_code): elsewhere in delegation.go the wake's
+        # budget and two comments name the constant too, and a comment inside
+        # the function could name it beside a hand-spelled check.
         for key, function, what in (
             ("a2a_worker_adapter_delegate", "validateDelegate", "the worker-adapter's validateDelegate"),
             ("a2a_gateway_delegation", "handleDelegateRequest", "the gateway's handleDelegateRequest"),
         ):
-            body = h.go_function_body(h.text(key), function)
+            body = _go_code(h.text(key), function)
             self.assertIn("lib.DelegateTextCap", body, f"{what} no longer references the shared cap")
             self.assertNotRegex(body, magic_number, f"{what} hand-spells the delegate text cap")
 
