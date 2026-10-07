@@ -3721,10 +3721,14 @@ _CONTROLLER_NODE_TAINT_KEYS = {
 }
 
 
+def _normalize_taint_effect(effect: str | None) -> str:
+    return (effect or "").upper().replace("_", "")
+
+
 def _pool_has_workload_taints(pool: dict) -> bool:
     config = pool.get("config") or {}
     for t in (config.get("taints") or []):
-        effect = (t.get("effect") or "").upper().replace("_", "")
+        effect = _normalize_taint_effect(t.get("effect"))
         if effect in ("NOSCHEDULE", "NOEXECUTE"):
             key = t.get("key", "")
             if key not in _CONTROLLER_NODE_TAINT_KEYS:
@@ -3744,26 +3748,20 @@ def _has_compute_class_affinity(node_affinity: dict) -> bool:
     return False
 
 
+def _namespace_labels(context: dict, ns: str) -> dict:
+    for item in context.get("namespaces") or []:
+        meta = item.get("metadata") or {}
+        if meta.get("name") == ns:
+            return meta.get("labels") or {}
+    return {}
+
+
 def _namespace_has_default_compute_class(context: dict, ns_name: str) -> bool:
-    namespaces = context.get("namespaces")
-    if isinstance(namespaces, list):
-        for ns in namespaces:
-            if ns.get("metadata", {}).get("name") == ns_name:
-                labels = ns.get("metadata", {}).get("labels") or {}
-                if DEFAULT_COMPUTE_CLASS_LABEL in labels or DEFAULT_COMPUTE_CLASS_NON_DAEMONSET_LABEL in labels:
-                    return True
-    elif isinstance(namespaces, dict):
-        ns_val = namespaces.get(ns_name)
-        if isinstance(ns_val, dict):
-            labels = ns_val.get("metadata", {}).get("labels") or ns_val.get("labels") or ns_val
-            if DEFAULT_COMPUTE_CLASS_LABEL in labels or DEFAULT_COMPUTE_CLASS_NON_DAEMONSET_LABEL in labels:
-                return True
-
-    ns_labels = context.get("namespace_labels", {}).get(ns_name) or {}
-    if DEFAULT_COMPUTE_CLASS_LABEL in ns_labels or DEFAULT_COMPUTE_CLASS_NON_DAEMONSET_LABEL in ns_labels:
-        return True
-
-    return False
+    labels = _namespace_labels(context, ns_name)
+    return (
+        DEFAULT_COMPUTE_CLASS_LABEL in labels
+        or DEFAULT_COMPUTE_CLASS_NON_DAEMONSET_LABEL in labels
+    )
 
 
 def _is_untainted_gp_compute_class(
@@ -3863,7 +3861,7 @@ def check_untargeted_compute_class_workload(workload: dict, context: dict) -> di
     # Workload pod spec must not tolerate the taints on the remaining non-ComputeClass pools
     non_cc_pools = [
         p for p in node_pools
-        if COMPUTE_CLASS_LABEL not in ((p.get("config") or {}).get("labels") or {})
+        if not ((p.get("config") or {}).get("labels") or {}).get(COMPUTE_CLASS_LABEL)
     ]
     pod_tolerations = template.get("tolerations") or []
 
@@ -7458,45 +7456,46 @@ def _collect_obtainability(cluster: dict, kubeconfig: Path, checks: tuple[CheckS
     workloads = normalize_workloads(dump)
     record = _record(f"KUBECONFIG={kubeconfig} kubectl get {DUMP_COMMAND_KINDS} -A -o json", dump_run)
 
-    cc_argv = ["kubectl", "get", "computeclasses", "-A", "-o", "json"]
-    cc_parsed, cc_result = run_and_gate(cc_argv, kubeconfig, run=run)
     context = build_context(dump, workloads)
     commands = {spec.slug: record for spec in checks}
+    if cluster.get("autopilot"):
+        commands.pop("untargeted-compute-class-workload", None)
+        context.setdefault("not_applicable", {})["untargeted-compute-class-workload"] = (
+            "Autopilot clusters manage node provisioning automatically and do not support "
+            "user-managed node pools bound to custom ComputeClasses."
+        )
+        return CollectedContext(context, workloads, commands)
+
+    cc_argv = ["kubectl", "get", "computeclasses", "-A", "-o", "json"]
+    cc_parsed, cc_result = run_and_gate(cc_argv, kubeconfig, run=run)
     if cc_parsed is not None and isinstance(cc_parsed.get("items"), list):
         cc_items = [i for i in cc_parsed["items"] if i.get("kind") == "ComputeClass"]
         dump.setdefault("items", []).extend(cc_items)
         context["compute_classes"] = cc_items
-        if cluster.get("autopilot"):
-            commands.pop("untargeted-compute-class-workload", None)
-            context.setdefault("not_applicable", {})["untargeted-compute-class-workload"] = (
-                "Autopilot clusters manage node provisioning automatically and do not support "
-                "user-managed node pools bound to custom ComputeClasses."
-            )
-        else:
-            commands["untargeted-compute-class-workload"] = _record(
-                f"KUBECONFIG={kubeconfig} {shlex.join(cc_argv)}", cc_result
-            )
-            if cc_items:
-                np_argv = [
-                    "gcloud", "container", "node-pools", "list",
-                    "--cluster", cluster["name"],
-                    "--location", cluster["location"],
-                    "--project", cluster["project"],
-                    "--format", "json",
-                ]
-                np_parsed, np_result = run_and_gate(np_argv, kubeconfig, run=run)
-                if np_parsed is None:
-                    commands.pop("untargeted-compute-class-workload", None)
-                    stderr = np_result.stderr.strip()[:ERROR_EXCERPT_CHARS] or "no stderr"
-                    context.setdefault("unevaluated", {})["untargeted-compute-class-workload"] = (
-                        f"{UNDETERMINED_PREFIX} `gcloud container node-pools list` exited {np_result.rc} "
-                        f"({stderr}), so node pool inventory could not be verified. "
-                        "This check cleared nothing on this cluster."
-                    )
-                else:
-                    context["node_pools"] = np_parsed if isinstance(np_parsed, list) else []
+        commands["untargeted-compute-class-workload"] = _record(
+            f"KUBECONFIG={kubeconfig} {shlex.join(cc_argv)}", cc_result
+        )
+        if cc_items:
+            np_argv = [
+                "gcloud", "container", "node-pools", "list",
+                "--cluster", cluster["name"],
+                "--location", cluster["location"],
+                "--project", cluster["project"],
+                "--format", "json",
+            ]
+            np_parsed, np_result = run_and_gate(np_argv, kubeconfig, run=run)
+            if np_parsed is None:
+                commands.pop("untargeted-compute-class-workload", None)
+                stderr = np_result.stderr.strip()[:ERROR_EXCERPT_CHARS] or "no stderr"
+                context.setdefault("unevaluated", {})["untargeted-compute-class-workload"] = (
+                    f"{UNDETERMINED_PREFIX} `gcloud container node-pools list` exited {np_result.rc} "
+                    f"({stderr}), so node pool inventory could not be verified. "
+                    "This check cleared nothing on this cluster."
+                )
             else:
-                context["node_pools"] = []
+                context["node_pools"] = np_parsed if isinstance(np_parsed, list) else []
+        else:
+            context["node_pools"] = []
     elif RESOURCE_TYPE_ABSENT_MARKER in cc_result.stderr:
         commands.pop("untargeted-compute-class-workload", None)
         context.setdefault("not_applicable", {})["untargeted-compute-class-workload"] = (

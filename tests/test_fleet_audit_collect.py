@@ -462,6 +462,32 @@ class TestUntargetedComputeClassWorkload(unittest.TestCase):
         hit_nosched = collect.check_untargeted_compute_class_workload(wl_nosched, ctx)
         self.assertIsNone(hit_nosched)
 
+    def test_empty_string_compute_class_label_treated_as_non_cc_pool(self):
+        # A pool with cloud.google.com/compute-class: "" and a workload taint
+        dedicated_empty_cc = pool(
+            "dedicated-empty-cc",
+            labels={collect.COMPUTE_CLASS_LABEL: ""},
+            taints=[{"key": "team", "value": "x", "effect": "NO_SCHEDULE"}],
+        )
+        # Deployment tolerates team=x -> can run on dedicated_empty_cc -> should NOT be flagged
+        wl_tolerating = collect.normalize_workloads({
+            "items": [deployment("api-tol", tolerations=[{"key": "team", "value": "x", "operator": "Equal", "effect": "NoSchedule"}])]
+        })[0]
+        ctx = {
+            "compute_classes": [self.cc],
+            "node_pools": [self.base_pool, dedicated_empty_cc],
+            "namespaces": [self.ns],
+        }
+        hit = collect.check_untargeted_compute_class_workload(wl_tolerating, ctx)
+        self.assertIsNone(hit)
+
+        # Deployment does NOT tolerate team=x -> cannot run on dedicated_empty_cc -> flagged
+        wl_not_tolerating = collect.normalize_workloads({
+            "items": [deployment("api-nottol", tolerations=[])]
+        })[0]
+        hit_not_tol = collect.check_untargeted_compute_class_workload(wl_not_tolerating, ctx)
+        self.assertIsNotNone(hit_not_tol)
+
     def test_transient_controller_and_cloud_provider_taints_on_non_cc_nodes(self):
         ca_pool = pool(
             "non-cc-ca",
@@ -619,7 +645,7 @@ class TestUntargetedComputeClassWorkload(unittest.TestCase):
                 self.assertEqual(0.05, cmd_rec["duration_s"])
                 self.assertEqual(cmd_rec["output_sha256"], collect.output_digest(cc_stdout))
 
-    def test_collect_obtainability_autopilot_skips_node_pools_list(self):
+    def test_collect_obtainability_autopilot_skips_node_pools_and_computeclasses(self):
         spec = collect.CheckSpec(
             "untargeted-compute-class-workload",
             "workload",
@@ -630,23 +656,18 @@ class TestUntargetedComputeClassWorkload(unittest.TestCase):
         )
         fake_dump = {"items": [deployment("api"), self.ns]}
         tmp_dump = self._create_dump_file(fake_dump)
-        cc_stdout = json.dumps({"items": [self.cc]})
         with patch.object(collect, "dump_state") as mock_dump:
             mock_dump.return_value = (tmp_dump, MagicMock(rc=0, duration_s=0.1, stdout="{}"), True)
 
             with patch.object(collect, "run_and_gate") as mock_run_and_gate:
-                mock_run_and_gate.return_value = (
-                    {"items": [self.cc]},
-                    MagicMock(rc=0, duration_s=0.05, stdout=cc_stdout),
-                )
                 cc_context = collect._collect_obtainability(
                     {"name": "c1", "project": "p1", "location": "l1", "autopilot": True},
                     Path("/fake/kubeconfig"),
                     (spec,),
                     run=MagicMock(),
                 )
-                # On Autopilot, node-pools list is skipped because it returns 400; check is marked not_applicable
-                self.assertEqual(1, mock_run_and_gate.call_count)
+                # On Autopilot, neither computeclasses nor node-pools list is issued; check is marked not_applicable directly
+                self.assertEqual(0, mock_run_and_gate.call_count)
                 self.assertIn("untargeted-compute-class-workload", cc_context.context.get("not_applicable", {}))
                 self.assertNotIn("untargeted-compute-class-workload", cc_context.commands)
 
