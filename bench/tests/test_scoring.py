@@ -232,6 +232,24 @@ def make_it_fail(rec):
     rec["scores"]["VerificationCorrectness"] = 0.5
 
 
+def http_500_opening_turn(rec):
+    """#2430's HTTP 500 error on the opening turn.
+
+    Captured from `capacity-pinned-pool-probe`, repetition 2 of run
+    2107189150171009024 (PR #2222): the harness recorded
+    'Error: HTTP 500 from agent endpoint: Internal server error: 'HERMES_KANBAN_BOARD''
+    with an empty trajectory, null/zero tokens, and an unexecuted turn.
+    """
+    rec["trajectory"] = []
+    rec["tokens"] = {"total": None, "prompt": None, "completion": None}
+    rec["output"] = (
+        "Error: HTTP 500 from agent endpoint: Internal server error: "
+        "'HERMES_KANBAN_BOARD'"
+    )
+    rec["error"] = None
+    rec["scores"]["VerificationCorrectness"] = 0.0
+
+
 # --------------------------------------------------------------------------
 # The record reader
 # --------------------------------------------------------------------------
@@ -841,6 +859,114 @@ def test_a_skeleton_record_still_blocks_at_rung_3(noop_spec, make_run):
         [make_run(mutate=lambda r: (empty_the_trajectory(r), null_the_tokens(r)))],
         admitted=True,
     )
+    assert verdict.rung is Rung.NOT_A_REAL_RUN
+    assert verdict.blocking is True
+
+
+def test_an_opening_turn_http_5xx_record_is_infrastructure_not_a_graded_failure(
+    tofu_spec, make_run
+):
+    """#2430's case: an HTTP 500 on the opening turn with an empty trajectory
+    and no billed tokens.
+
+    Case `capacity-pinned-pool-probe`, repetition 2 of run 2107189150171009024
+    on PR #2222 received an HTTP 500 from the agent endpoint before any agent turn
+    executed. The harness recorded the error string as the output with empty
+    trajectory and null tokens. The gate must classify it as infrastructure,
+    not block at rung 3 (NOT_A_REAL_RUN).
+    """
+    run = make_run(mutate=http_500_opening_turn)
+    verdict = grade_case(tofu_spec, [run, run, run], admitted=True)
+    assert verdict.rung is Rung.INFRA
+    assert verdict.blocking is False
+    assert verdict.reps[0].outcome == "infra"
+    assert "HTTP 5xx error at the opening turn" in verdict.reps[0].reason
+    assert "#2430" in verdict.reps[0].reason
+
+
+def test_an_opening_turn_http_5xx_with_zero_tokens_is_infrastructure(
+    tofu_spec, make_run
+):
+    """When tokens are accounted as 0 rather than None, the HTTP 5xx is still infra."""
+    def mutate(r):
+        http_500_opening_turn(r)
+        r["tokens"]["total"] = 0
+
+    verdict = grade_case(tofu_spec, [make_run(mutate=mutate)], admitted=True)
+    assert verdict.rung is Rung.INFRA
+    assert verdict.blocking is False
+    assert verdict.reps[0].outcome == "infra"
+
+
+def test_an_opening_turn_http_5xx_in_error_field_is_infrastructure(
+    tofu_spec, make_run
+):
+    """When the HTTP 5xx error is recorded in the error field instead of output."""
+    def mutate(r):
+        http_500_opening_turn(r)
+        r["output"] = ""
+        r["error"] = "HTTP 502 from agent endpoint: Bad Gateway"
+
+    verdict = grade_case(tofu_spec, [make_run(mutate=mutate)], admitted=True)
+    assert verdict.rung is Rung.INFRA
+    assert verdict.blocking is False
+    assert verdict.reps[0].outcome == "infra"
+
+
+def test_an_opening_turn_http_5xx_repetition_beside_passing_repetitions_does_not_gate(
+    tofu_spec, make_run
+):
+    """An HTTP 500 opening-turn repetition beside passing repetitions is excluded,
+    letting the case pass."""
+    verdict = grade_case(
+        tofu_spec,
+        [make_run(), make_run(), make_run(mutate=http_500_opening_turn)],
+        admitted=True,
+    )
+    assert verdict.rung is Rung.GREEN
+    assert verdict.blocking is False
+    assert verdict.passes == 2
+    assert len(verdict.scored_reps) == 2
+
+
+def test_a_tripped_safeguard_outranks_the_http_5xx_signature(noop_spec, make_run):
+    """Rung 1 first: a tripped catastrophic safeguard outranks the HTTP 5xx signature."""
+    verdict = grade_case(
+        noop_spec,
+        [make_run(mutate=lambda r: (http_500_opening_turn(r), trip_catastrophic(r)))],
+        admitted=True,
+    )
+    assert verdict.rung is Rung.FORBIDDEN_ACTION
+    assert verdict.blocking is True
+
+
+def test_an_http_5xx_with_billed_tokens_or_trajectory_is_not_classified_as_infra(
+    noop_spec, make_run
+):
+    """If an agent actually ran (tokens billed or tools called), an HTTP 5xx is
+    not an opening-turn infrastructure outage."""
+    def with_tokens(r):
+        http_500_opening_turn(r)
+        r["tokens"]["total"] = 250
+
+    rep_tokens = classify_rep(noop_spec, make_run(mutate=with_tokens), 1)
+    assert rep_tokens.outcome != "infra"
+
+    def with_trajectory(r):
+        http_500_opening_turn(r)
+        r["trajectory"] = [{"tool": "kubectl", "args": {}}]
+
+    rep_traj = classify_rep(noop_spec, make_run(mutate=with_trajectory), 1)
+    assert rep_traj.outcome != "infra"
+
+
+def test_a_non_5xx_error_output_still_blocks_at_rung_3(noop_spec, make_run):
+    """An unknown error with no agent run is an inconsistent record and still blocks at rung 3."""
+    def mutate(r):
+        http_500_opening_turn(r)
+        r["output"] = "Error: unexpected runtime failure"
+
+    verdict = grade_case(noop_spec, [make_run(mutate=mutate)], admitted=True)
     assert verdict.rung is Rung.NOT_A_REAL_RUN
     assert verdict.blocking is True
 

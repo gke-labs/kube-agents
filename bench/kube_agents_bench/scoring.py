@@ -29,8 +29,11 @@ of a real agent run (rung 3). Rungs 1-3 are the reason the rate rules are safe
 happened. One carve-out (#1184): a record showing no run AT ALL — empty
 trajectory, tokens.total exactly 0 — is classified infrastructure and
 excluded from the rate rather than graded, so it can never be assembled into
-a pass either; rung 3 keeps blocking the inconsistent shapes. A second
-carve-out (#2039) is the inject lane's: on that transport's record, a check
+a pass either; rung 3 keeps blocking the inconsistent shapes. A similar
+carve-out (#2430) excludes an opening-turn HTTP 5xx error from the agent
+endpoint recorded with an empty trajectory and no tokens billed (e.g. an
+internal server error during startup or environment reload before turn
+execution). A third carve-out (#2039) is the inject lane's: on that transport's record, a check
 that reads what the record cannot show is set aside as not applicable
 before the rungs -- failed or errored, it is neither a graded failure nor a
 rung-2 block there -- and the rungs grade what remains (see
@@ -54,6 +57,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 from collections.abc import Sequence
 from dataclasses import dataclass, field, replace
 from enum import IntEnum
@@ -706,6 +710,25 @@ def _provision_death(error: Any, deployer: str) -> str | None:
     return None
 
 
+_HTTP_5XX_OUTPUT_RE = re.compile(r"^(?:Error:\s*)?HTTP\s*5\d\d\b", re.IGNORECASE)
+
+
+def _http_5xx_signature(output: str | None, error: Any) -> str | None:
+    """The HTTP 5xx line if output (or an empty output's error) records a 5xx, else None."""
+    candidates: list[str] = []
+    if output:
+        candidates.append(str(output))
+    if isinstance(error, (list, tuple)):
+        candidates.extend(str(e) for e in error if e)
+    elif error:
+        candidates.append(str(error))
+    for text in candidates:
+        first_line = text.strip().splitlines()[0] if text.strip() else ""
+        if _HTTP_5XX_OUTPUT_RE.match(first_line):
+            return first_line[:100]
+    return None
+
+
 def _inject_record(trajectory: list[Any]) -> bool:
     """Whether the trajectory is the inject transport's: it carries the
     transport's task marker. False for an api record and for an empty
@@ -1198,6 +1221,26 @@ def classify_rep(
             "tokens.total is 0, so no model call was billed. There is no "
             "answer in it to grade, whatever produced it -- infrastructure, "
             "not the pull request (#1184)",
+        )
+
+    # An HTTP 5xx recorded as the entire output (#2430): a 500 at the opening
+    # turn with an empty trajectory and zero or null tokens (no model call
+    # billed). The harness wrote the error string as the answer, but because
+    # no agent ever ran and no tokens were billed, the record is weather,
+    # not an agent regression. Checked BEFORE rungs 2-3 so liveness failures
+    # on the unexecuted turn do not red the run as NOT_A_REAL_RUN.
+    http_5xx = _http_5xx_signature(record.output, record.error)
+    if (
+        not record.trajectory
+        and not isinstance(total_tokens, bool)
+        and (total_tokens is None or _as_float(total_tokens) == 0)
+        and http_5xx is not None
+    ):
+        return rep(
+            "infra",
+            "the agent endpoint returned an HTTP 5xx error at the opening turn "
+            f"({http_5xx}): the trajectory is empty and no model call was "
+            "billed -- infrastructure, not the pull request (#2430)",
         )
 
     # --- Rung 2. A declared check that did not produce a verdict.
