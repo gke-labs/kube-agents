@@ -1230,11 +1230,11 @@ class _TransportError(RuntimeError):
 # rescue. A client error (non-429 4xx), a 500, or a body that is not JSON is an
 # answer about the request itself and repeating the request cannot change it:
 # a handler that raised will raise again, so those remain graded agent errors.
-# When the server attaches X-Hermes-Failure-Reason, the turn executed; a
-# rate-limit or billing reason is routed to infrastructure on opening turns
-# (including status turns during an opening turn), while any other failure
-# reason (or any failure reason on answer turns) is retried across status polls
-# or graded directly.
+# When the server attaches X-Hermes-Failure-Reason on an opening request,
+# the turn executed; a rate-limit or billing reason is routed to infrastructure
+# on the opening turn, while any other failure reason (or any failure reason
+# on subsequent answer turns) returns an errored result directly ahead of any
+# transport retry so the executed turn is graded as an agent error.
 _RETRYABLE_STATUSES = frozenset({429, 502, 503, 504})
 
 
@@ -1415,19 +1415,15 @@ def _inject_result(exchange: inject.Exchange, identity: dict[str, Any]) -> Agent
 
 
 class _DelegationTransportExhausted(Exception):
-    """The delegation wait encountered unretryable infrastructure failure or exhausted retries.
+    """The delegation wait lost its transport on every status-turn retry.
 
     Raised out of ``_await_delegated_work`` instead of appending to
     ``result.errors``: an appended error still reaches the judge with the
     delegation receipt graded as the answer (build 2093030474753511424:
     ``rca-remediation-pr`` scored 0.0 for a pod restart while its worker filed
-    the real remediation PR). Raised either when status-turn retries are exhausted
-    without reaching the agent, or immediately on an opening-turn status poll when
-    the server reports an unretryable provider infrastructure failure (such as
-    ``rate_limit`` or ``billing`` in ``X-Hermes-Failure-Reason``). ``_execute`` catches
-    this and replaces the graded result wholesale with :func:`_infra_failure`, the
-    same run class the opening turn returns on infrastructure failure or exhaustion.
-    Carries the marker detail as ``str``.
+    the real remediation PR). ``_execute`` catches this and replaces the graded
+    result wholesale with :func:`_infra_failure`, the same run class the
+    opening turn returns on exhaustion. Carries the marker detail as ``str``.
     """
 
 
@@ -1641,14 +1637,14 @@ class KubeAgentsHarness(AgentHarness):
                         timeout=timeout,
                         delegation_timeout=delegation_timeout,
                         poll_interval=poll_interval,
+                        opening_turn=opening_turn,
                     )
                     or session_id
                 )
             except _DelegationTransportExhausted as exc:
                 # Not AgentResult.errored, and not the delegating turn's
-                # partial result either: see _infra_failure. No answer can be
-                # graded (transport died or opening turn hit an infrastructure
-                # condition), so this is the run class, not an answer.
+                # partial result either: see _infra_failure. The wait died in
+                # transport, so this is the run class, not an answer.
                 return _infra_failure(str(exc))
 
         # GitOps cases (GITOPS_RUN_BRANCH set): the agent's answer is a pull
@@ -2290,6 +2286,7 @@ class KubeAgentsHarness(AgentHarness):
         timeout: float,
         delegation_timeout: float,
         poll_interval: float,
+        opening_turn: bool = True,
     ) -> str:
         """Poll the agent until every card it filed settles.
 
@@ -2407,6 +2404,11 @@ class KubeAgentsHarness(AgentHarness):
             try:
                 status_turn, turn_session = turn(poll, min(timeout, remaining))
             except _TransportError as exc:
+                if exc.failure_reason in _INFRA_FAILURE_REASONS and opening_turn:
+                    _purge_card_state(awaited, _EXEC_TIMEOUT)
+                    raise _DelegationTransportExhausted(
+                        f"status turn hit infrastructure failure ({exc.failure_reason}): {exc}"
+                    ) from exc
                 transport_failures += 1
                 _log.warning(
                     "status turn failed (%d/%d): %s",

@@ -1282,9 +1282,10 @@ def test_an_exhausted_retry_is_infrastructure_and_not_an_answer(
 def test_an_agent_side_error_is_still_graded(stub_agent: _StubAgentServer) -> None:
     """A 500 is the endpoint answering, so it keeps the old behaviour.
 
-    The INFRA class is for turns that never reached the agent. Widening it to
-    every failed request would take real agent faults off the gate: they are
-    not retried, they are not marked, and their text still reaches the judge.
+    The INFRA class is for turns where transport died or provider capacity
+    blocked the opening turn. Widening it to every failed request would take
+    real agent faults off the gate: they are not retried, they are not marked,
+    and their text still reaches the judge.
     """
     stub_agent.fail_with = 500
 
@@ -2527,12 +2528,12 @@ def test_status_turns_the_endpoint_answered_still_grade_the_partial_record(
 ) -> None:
     """A 500 storm is the endpoint answering, so it keeps the old behaviour.
 
-    The INFRA class is only for retries that never reached an agent -- no
-    HTTP answer at all, or a 429 refused at the admission door. An
-    endpoint that keeps answering badly is the agent's own failure: the wait
-    still ends, the error is recorded (which stops devops-bench promoting the
-    receipt as a validated deliverable), the first turn's work survives, and
-    the healthy tunnel is left alone.
+    The INFRA class is for turns where transport died, or the server reported
+    an opening-turn provider rate limit or billing stop. An endpoint that keeps
+    answering badly is the agent's own failure: the wait still ends, the error
+    is recorded (which stops devops-bench promoting the receipt as a validated
+    deliverable), the first turn's work survives, and the healthy tunnel is left
+    alone.
     """
     stub_agent.turns = [_create_turn(), _show_turn("done")]
     stub_agent.fail_on = frozenset(range(2, 2 + harness._MAX_TRANSPORT_FAILURES))
