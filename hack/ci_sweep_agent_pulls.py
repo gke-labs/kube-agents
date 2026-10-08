@@ -52,11 +52,13 @@ no open pull request is a leftover whatever its name.
 (kube-agents#2394): the closer is hack/ci_gitlab_forge.py, the credential the
 pool's one agent token read from Secret Manager, and the report
 pull-sweep-gitlab.json. That pass has a second job, the only rotation-related
-one anything automated does: it reads both tokens' expiry and fails the run,
-naming the token, from 30 days out, so the yearly human rotation is flagged
-while it can still be done with overlap (docs/ci-pool-projects.md 5.6). A
-periodic that runs this pass is what carries that failure to CI health; none
-does yet, and the bot's detail lines read pull-sweep.json only.
+one anything automated does: it reads both tokens' expiry into the report
+(gitlab_tokens) and warns from 30 days out, naming the token, so the yearly
+human rotation is flagged while it can still be done with overlap
+(docs/ci-pool-projects.md 5.6). A token that is merely due does not fail the
+run -- a month of red sweeps would read as failed projects -- but one that is
+dead or could not be checked does. CI health's read of the report is
+kube-agents#2571.
 """
 
 import argparse
@@ -1054,13 +1056,16 @@ def _due_lines(run):
 
 
 def _expiry_verdict(run):
-    """A clean sweep still fails the run when a token is due for rotation:
-    the failed build is what a periodic that runs this pass would show, and
-    the report names the token, so a yearly step is flagged with 30 days to spare."""
-    due = _due_lines(run)
-    if not due:
+    """A clean sweep stays clean while a token is merely due: the report and
+    the WARNING line at the start of the run name it, and CI health carries
+    the report's entry, so a yearly step does not read as thirty days of
+    failed sweeps. A token that is dead or could not be checked still fails
+    the run: nothing can grade or sweep with it."""
+    faults = [_expiry_line(e) for e in run.get("gitlab_tokens") or [] if e.get("error") or not e.get("active", True)]
+    faults = [line for line in faults if line]
+    if not faults:
         return 0, None
-    error = "; ".join(due)
+    error = "; ".join(faults)
     print("ERROR: %s" % error, file=sys.stderr)
     return 1, error
 

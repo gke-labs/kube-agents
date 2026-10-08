@@ -34,6 +34,7 @@ from __future__ import annotations
 import datetime
 import http.client
 import json
+import os
 import sys
 import time
 import urllib.error
@@ -464,3 +465,43 @@ def expiry_message(entry: dict, secret: str) -> str | None:
             f"rotate it {when}, with overlap (docs/ci-pool-projects.md 5.6)"
         )
     return None
+
+
+# --- the preflight's probe ------------------------------------------------------
+
+PROBE_TOKEN_ENV = "GITLAB_PROBE_TOKEN"
+
+
+def whoami_main(argv: list[str] | None = None) -> int:
+    """`python3 ci_gitlab_forge.py whoami [--host HOST]`: the eval preflight's
+    authentication probe. The token arrives in GITLAB_PROBE_TOKEN, never on
+    argv; the login it belongs to is printed on success, and a token that
+    reads from Secret Manager but no longer authenticates (expired, revoked,
+    replaced) is named on stderr with exit 1, so the run stops here instead of
+    spending the lease to meet the same 401 in the resets."""
+    import argparse
+
+    parser = argparse.ArgumentParser(prog="ci_gitlab_forge.py whoami")
+    parser.add_argument("--host", default=DEFAULT_HOST)
+    args = parser.parse_args(argv)
+    token = os.environ.get(PROBE_TOKEN_ENV, "")
+    if not token:
+        print("whoami: no token in %s" % PROBE_TOKEN_ENV, file=sys.stderr)
+        return 2
+    try:
+        print(current_login(token, host=args.host))
+        return 0
+    except urllib.error.HTTPError as exc:
+        why = "has expired or been revoked; create a new one" if exc.code == 401 else "cannot read its own user"
+        print("the token no longer authenticates at %s (HTTP %d): it %s (docs/ci-pool-projects.md 5.6)" % (args.host, exc.code, why), file=sys.stderr)
+        return 1
+    except (RateLimited, ResetError, OSError, http.client.HTTPException, ValueError) as exc:
+        print("the token could not be checked at %s: %s" % (args.host, exc), file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    if sys.argv[1:2] != ["whoami"]:
+        print("usage: ci_gitlab_forge.py whoami [--host HOST]  (the token in %s)" % PROBE_TOKEN_ENV, file=sys.stderr)
+        sys.exit(2)
+    sys.exit(whoami_main(sys.argv[2:]))

@@ -931,6 +931,22 @@ read_gitlab_tokens() {
     echo "       Grading a GitLab ledger needs the ledger token and the resets need the agent token; not running without them." >&2
     return 1
   fi
+  # A pair that reads but no longer authenticates (expired, revoked, replaced)
+  # would spend the whole lease to meet a 401 in the resets and the bench;
+  # prove both now, as the GitHub preflight proves the mint. The token goes
+  # to the probe in its environment, never on argv.
+  local which secret login
+  for which in agent ledger; do
+    [ "${which}" = "agent" ] && secret="${GITLAB_AGENT_SM_SECRET}" || secret="${GITLAB_LEDGER_SM_SECRET}"
+    if ! login="$(GITLAB_PROBE_TOKEN="${!which}" python3 "${SCRIPT_DIR}/ci_gitlab_forge.py" whoami --host "${GITLAB_FORGE_HOST}")"; then
+      echo "ERROR: preflight: the ${which} token in ${GITLAB_SECRETS_PROJECT}/${secret} does not authenticate at ${GITLAB_FORGE_HOST} (docs/ci-pool-projects.md 5.6: create a new one and store it); not running with it." >&2
+      return 1
+    fi
+    echo "Preflight: the ${which} token in ${GITLAB_SECRETS_PROJECT}/${secret} authenticates as ${login}"
+    if [ "${which}" = "agent" ] && [ "${login}" != "${GITLAB_BOT_LOGIN}" ]; then
+      echo "WARNING: preflight: the agent token belongs to ${login}, not ${GITLAB_BOT_LOGIN}; the bench grades the agent's ledgers and merge requests by the latter (GITLAB_BOT_LOGIN)." >&2
+    fi
+  done
   EVAL_GITLAB_AGENT_TOKEN="${agent}"
   # The job mounts BENCH_GITHUB_TOKEN for the GitHub path; unset under
   # gitlab so no check can fall back to the GitHub twin repository.

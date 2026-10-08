@@ -588,16 +588,46 @@ class SweepGitLabPassTest(unittest.TestCase):
             sweeper.gitlab_secret(sweeper.GITLAB_AGENT_SECRET, _runner(code=1, stderr=b"PERMISSION_DENIED"))
         self.assertIn("secretAccessor", str(caught.exception))
 
-    def test_the_sweep_fails_the_run_when_a_token_is_due(self):
+    def test_a_due_token_is_reported_not_failed_and_a_dead_one_fails_the_run(self):
+        # A month of red sweeps would read as failed projects to CI health;
+        # the due token is a warning line and a report entry (kube-agents#2571
+        # carries it), and only a token that is dead or unchecked fails the run.
         entry = {"name": "pool-agent", "secret": "kube-agents-prow/gitlab-agent-token", "expires_at": "2026-11-01", "days_left": 26, "active": True, "warn": True, "urgent": False, "scopes": ["api"]}
-        run = {"gitlab_tokens": [entry]}
         err = io.StringIO()
         with redirect_stderr(err):
-            code, error = sweeper._expiry_verdict(run)
+            self.assertEqual(sweeper._expiry_verdict({"gitlab_tokens": [entry]}), (0, None))
+            self.assertEqual(sweeper._expiry_verdict({"gitlab_tokens": [dict(entry, days_left=3, urgent=True)]}), (0, None))
+            code, error = sweeper._expiry_verdict({"gitlab_tokens": [entry, dict(entry, name="pool-ledger", active=False)]})
         self.assertEqual(code, 1)
-        self.assertIn("pool-agent", error)
-        self.assertIn("rotate it soon", err.getvalue())
-        self.assertEqual(sweeper._expiry_verdict({"gitlab_tokens": [dict(entry, warn=False)]}), (0, None))
+        self.assertIn("pool-ledger", error)
+        self.assertNotIn("pool-agent", error, "the due one is not in the failure")
+        self.assertIn("is not active", err.getvalue())
+        with redirect_stderr(io.StringIO()):
+            code, error = sweeper._expiry_verdict({"gitlab_tokens": [dict(entry, active=False, error="the token in kube-agents-prow/gitlab-ledger-token no longer authenticates (HTTP 401)")]})
+        self.assertEqual((code, "no longer authenticates" in error), (1, True))
+
+    def test_the_pool_walk_under_gitlab_runs_through_main_with_the_shared_token(self):
+        """`--forge gitlab --pool` as the periodic runs it: main reads the token
+        pair, and _run hands the forge and the token to the pool walk."""
+        seen = []
+
+        def fake_walk(server, owner, hold_state, pool_size, visit, heartbeat=False, release_failures=None):
+            visit(PROJECT)
+            return [PROJECT], {}
+
+        def fake_sweep(project, path, token, dry_run=False):
+            seen.append((project, path, token))
+            return 2
+
+        report = pathlib.Path(tempfile.mkdtemp()) / "pull-sweep-gitlab.json"
+        with mock.patch.object(sweeper, "gitlab_token_expiry", lambda runner, entries=None: ("glpat-pool", entries)), mock.patch.object(sweeper.boskos_pool, "walk", fake_walk), mock.patch.object(
+            sweeper.boskos_pool, "reset_stranded", lambda *a: None
+        ), mock.patch.object(sweeper, "sweep_gitlab_project", fake_sweep), mock.patch.object(sweeper, "sweep_repo", mock.Mock(side_effect=AssertionError("GitHub sweep was called"))), redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            rc = sweeper.main(["--forge", "gitlab", "--pool", "--boskos-server", "http://boskos", "--boskos-owner", "owner", "--report", str(report)])
+        self.assertEqual(rc, 0)
+        self.assertEqual(seen, [(PROJECT, PATH, "glpat-pool")])
+        document = json.loads(report.read_text())
+        self.assertEqual((document["forge"], document["projects"], document["closed"]), ("gitlab", 1, 2))
 
     def test_a_hand_run_on_one_project_uses_the_shared_token_and_the_gitlab_closer(self):
         seen = {}
@@ -705,7 +735,8 @@ class SweepGitLabPassTest(unittest.TestCase):
 
     def test_a_dead_ledger_token_is_a_due_entry_and_the_sweep_still_runs(self):
         # The sweep needs the agent token only; a ledger token that no longer
-        # authenticates is recorded and fails the run at the end, after the walk.
+        # authenticates is recorded as a dead entry and fails the run at the
+        # end, after the walk (_expiry_verdict).
         answers = iter([
             {"name": "pool-agent", "scopes": ["api", "write_repository"], "expires_at": "2027-10-05", "active": True, "revoked": False},
             urllib.error.HTTPError("/self", 401, "Unauthorized", {}, io.BytesIO(b"")),
@@ -821,6 +852,21 @@ def run_bash(body, env=None, bin_dir=None):
     return subprocess.run(["bash", "-c", "set -uo pipefail\n" + body], capture_output=True, text=True, check=False, env=environment)
 
 
+STUB_WHOAMI = textwrap.dedent(
+    """\
+    import json, os, sys
+    token = os.environ.get("GITLAB_PROBE_TOKEN", "")
+    with open(os.environ["WHOAMI_LOG"], "a") as log:
+        log.write("WHOAMI argv=" + json.dumps(sys.argv[2:]) + " token=" + token + "\\n")
+    if sys.argv[1:2] != ["whoami"]:
+        sys.exit(2)
+    if token in os.environ.get("WHOAMI_DEAD", "").split(","):
+        print("the token no longer authenticates at gitlab.com (HTTP 401)", file=sys.stderr)
+        sys.exit(1)
+    print(os.environ.get("WHOAMI_LOGIN", "kube-agents-eval-bot"))
+    """
+)
+
 STUB_HELPER = textwrap.dedent(
     """\
     import json, os, sys
@@ -840,7 +886,12 @@ class EvalScriptGitLabTest(unittest.TestCase):
         self.bin.mkdir()
         (self.dir / "ci_reset_audit_ledgers.py").write_text(STUB_HELPER)
         (self.dir / "ci_reset_agent_pulls.py").write_text(STUB_HELPER)
+        (self.dir / "ci_gitlab_forge.py").write_text(STUB_WHOAMI)
         (self.dir / "ci-deploy.sh").write_text(CI_DEPLOY.read_text(encoding="utf-8"))
+
+    def _run(self, body, dead=""):
+        """run_bash with the whoami stub's knobs: its log, and the token values it refuses."""
+        return run_bash(body, env={"WHOAMI_LOG": f"{self.dir}/whoami.log", "WHOAMI_DEAD": dead}, bin_dir=self.bin)
 
     def _gcloud(self, agent="glpat-agent", ledger="glpat-ledger", fail=""):
         stub = self.bin / "gcloud"
@@ -889,7 +940,7 @@ class EvalScriptGitLabTest(unittest.TestCase):
     def test_the_pair_is_read_once_and_exported_as_the_bench_reads_it(self):
         self._gcloud()
         body = self._preamble() + '\nexport BENCH_GITHUB_TOKEN=ghs_mounted GITHUB_TOKEN=ghp_ambient\nread_gitlab_tokens; echo "RC=$?"\necho "FORGE=${BENCH_FORGE} LEDGER=${BENCH_GITLAB_TOKEN} HOST=${BENCH_GITLAB_HOST} LOGIN=${BENCH_GITLAB_AGENT_LOGIN} AGENT=${EVAL_GITLAB_AGENT_TOKEN} GH=${BENCH_GITHUB_TOKEN:-unset}/${GITHUB_TOKEN:-unset}"\n'
-        proc = run_bash(body, bin_dir=self.bin)
+        proc = self._run(body)
         self.assertIn("RC=0", proc.stdout)
         # A bench without the GitLab checks must find no GitHub token to fall back on.
         self.assertIn("GH=unset/unset", proc.stdout)
@@ -898,10 +949,36 @@ class EvalScriptGitLabTest(unittest.TestCase):
         self.assertEqual(argv.count("secrets versions access latest"), 2)
         self.assertIn("--project=kube-agents-prow", argv)
         self.assertNotIn("glpat", argv)
+        # Both tokens are proven at the forge before anything runs, each in the probe's environment, never on its argv.
+        probes = (self.dir / "whoami.log").read_text().splitlines()
+        self.assertEqual(probes, ['WHOAMI argv=["--host", "gitlab.com"] token=glpat-agent', 'WHOAMI argv=["--host", "gitlab.com"] token=glpat-ledger'])
+        self.assertIn("the agent token in kube-agents-prow/gitlab-agent-token authenticates as kube-agents-eval-bot", proc.stdout)
+        self.assertNotIn("WARNING", proc.stderr)
+
+    def test_a_token_that_no_longer_authenticates_stops_the_run_at_preflight(self):
+        self._gcloud()
+        proc = self._run(self._preamble() + '\nread_gitlab_tokens; echo "RC=$?"\n', dead="glpat-ledger")
+        self.assertIn("RC=1", proc.stdout)
+        self.assertIn("the ledger token in kube-agents-prow/gitlab-ledger-token does not authenticate at gitlab.com", proc.stderr)
+        self.assertIn("create a new one", proc.stderr)
+        # An agent token owned by some other account is said, not refused: the resets follow the token, the bench the configured login.
+        proc = self._run(self._preamble() + '\nread_gitlab_tokens; echo "RC=$?"\n' , dead="")
+        self.assertIn("RC=0", proc.stdout)
+        proc = run_bash(self._preamble() + '\nread_gitlab_tokens; echo "RC=$?"\n', env={"WHOAMI_LOG": f"{self.dir}/whoami.log", "WHOAMI_DEAD": "", "WHOAMI_LOGIN": "someone-else"}, bin_dir=self.bin)
+        self.assertIn("RC=0", proc.stdout)
+        self.assertIn("the agent token belongs to someone-else, not kube-agents-eval-bot", proc.stderr)
+
+    def test_the_preflight_read_stops_the_run_and_precedes_the_lease_reset(self):
+        """The function's return code is one half; the other is the line that
+        turns it into a stopped run, under the gitlab branch of the preflight."""
+        src = SCRIPT.read_text(encoding="utf-8")
+        branch = src.index('if [ "${EVAL_FORGE}" = "gitlab" ]; then\n  read_gitlab_tokens || exit 1')
+        self.assertLess(branch, src.index('mint_ledger_token "preflight" || exit 1'), "the GitHub mint is the other branch of the same if")
+        self.assertLess(branch, src.index('reset_audit_ledgers "lease"'))
 
     def test_a_pair_that_cannot_be_read_stops_the_run(self):
         self._gcloud(fail="gitlab-ledger-token")
-        proc = run_bash(self._preamble() + '\nread_gitlab_tokens; echo "RC=$?"\n', bin_dir=self.bin)
+        proc = self._run(self._preamble() + '\nread_gitlab_tokens; echo "RC=$?"\n')
         self.assertIn("RC=1", proc.stdout)
         self.assertIn("could not read kube-agents-prow/gitlab-ledger-token as this runner", proc.stderr)
         self.assertNotIn("gitlab-agent-token", proc.stderr.split("could not read", 1)[1].split(" as this runner")[0])
@@ -918,7 +995,7 @@ class EvalScriptGitLabTest(unittest.TestCase):
                 'reset_agent_pulls "lease"; echo "PULLS_RC=$?"',
             ]
         )
-        proc = run_bash(body, bin_dir=self.bin)
+        proc = self._run(body)
         out = proc.stdout
         self.assertIn(f'HELPER argv=["--repo", "{PATH}", "--project", "{PROJECT}", "--build", "1", "--forge", "gitlab"]', out)
         self.assertIn(f'HELPER argv=["--repo", "{PATH}", "--project", "{PROJECT}", "--build", "1", "--forge", "gitlab", "--audit", "compliance-audit"]', out)
