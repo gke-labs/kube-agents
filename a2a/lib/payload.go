@@ -39,7 +39,7 @@ func validTaskState(s TaskState) bool {
 	return false
 }
 
-// Reserved artifact names. The set of names is open; only these four carry
+// Reserved artifact names. The set of names is open; only these six carry
 // reserved semantics.
 const (
 	ArtifactResult   = "result"
@@ -51,6 +51,13 @@ const (
 	// task events. Reserved so the relay and the adapter spell it once
 	// (spec-a2a-payloads.md, "Reserved artifact names").
 	ArtifactDelegate = "delegate"
+	// ArtifactTurn is one finished turn's answer on a task that has more
+	// turns to run: an executor that queues follow-ups (the hermes-bridge)
+	// publishes each earlier turn's answer under it, chunked like result,
+	// and the last turn's answer as result. Renderers post it as it
+	// completes; it is never the deliverable (spec-a2a-payloads.md,
+	// "Reserved artifact names").
+	ArtifactTurn = "turn"
 )
 
 // DelegateRequest is the ArtifactDelegate data part's shape: one child task
@@ -68,6 +75,70 @@ type DelegateRequest struct {
 // longer request before it reaches the bus and the gateway ignores one that
 // arrives anyway, so the two sides cannot disagree on the number.
 const DelegateTextCap = 16 * 1024
+
+// SteerNotice is the data part an executor that queues follow-ups puts on
+// the non-final status-update it publishes for each follow-up message it
+// receives on a running task: one per follow-up envelope, either queued or
+// refused with a reason. The gateway's relay reads it to word its posts
+// and to count what it promised the room; a reader that does not know it
+// sees the text part beside it.
+type SteerNotice struct {
+	Steer      string `json:"steer"`
+	EnvelopeID string `json:"envelopeId"`
+	Reason     string `json:"reason,omitempty"`
+}
+
+// SteerNotice.Steer values.
+const (
+	SteerQueued  = "queued"
+	SteerRefused = "refused"
+)
+
+// SteerNotice.Reason tokens, for a refusal.
+const (
+	SteerReasonQueueFull  = "queue-full"  // the executor's queue is at its bound
+	SteerReasonTaskEnding = "task-ending" // the deliverable was already chosen
+	SteerReasonTaskEnded  = "task-ended"  // the task ended before the follow-up's turn
+	SteerReasonNoText     = "no-text"     // nothing textual to ask
+	SteerReasonCapability = "capability"  // the follow-up's authority was refused
+	SteerReasonNoResume   = "no-resume"   // the executor could not continue the session
+)
+
+const steerNoticeKey = "steerNotice"
+
+// SteerNoticePart is n as the data part a status message carries.
+func SteerNoticePart(n SteerNotice) (Part, error) {
+	data, err := json.Marshal(map[string]SteerNotice{steerNoticeKey: n})
+	if err != nil {
+		return Part{}, err
+	}
+	return Part{Kind: "data", Data: data}, nil
+}
+
+// SteerNoticeOf finds the steer notice among parts. A data part that is not
+// one, or one with an unknown steer value or no envelope id, is skipped.
+func SteerNoticeOf(parts []Part) (SteerNotice, bool) {
+	for _, p := range parts {
+		if p.Kind != "data" || len(p.Data) == 0 {
+			continue
+		}
+		var wrap map[string]json.RawMessage
+		if json.Unmarshal(p.Data, &wrap) != nil {
+			continue
+		}
+		raw, ok := wrap[steerNoticeKey]
+		if !ok {
+			continue
+		}
+		var n SteerNotice
+		if json.Unmarshal(raw, &n) != nil || n.EnvelopeID == "" ||
+			(n.Steer != SteerQueued && n.Steer != SteerRefused) {
+			continue
+		}
+		return n, true
+	}
+	return SteerNotice{}, false
+}
 
 // The A2A object shapes below carry only the fields the library consults.
 // Payloads travel as raw bytes end to end (assertion 6); these views are for

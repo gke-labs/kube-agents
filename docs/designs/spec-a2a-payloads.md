@@ -351,11 +351,16 @@ calls and become properties of the stream:
 - Steering (added 8/24; refusal posture recorded 8/31): a follow-up `message` on `…in`
   while the task is `working` is legal. It is steering input - delivered to the
   executor, incorporated at its next turn boundary, no state transition implied. The
-  hard interrupt is `cancel`, not a steer. An executor that cannot absorb input
-  mid-turn (today's standing front door) refuses instead: a non-final `status-update`
-  carrying the task's CURRENT state, visible on the stream - never a silent drop, and
-  never a state change caused by the follow-up alone. Assertion 21's stdin delivery
-  applies to absorbing executors; a refusal satisfies its never-silently-dropped half.
+  hard interrupt is `cancel`, not a steer. An executor that cannot absorb input mid-turn
+  may queue it instead (the standing front door, 10/8): it answers each follow-up with a
+  non-final `status-update` carrying the task's CURRENT state and a `data` part
+  `{"steerNotice": {"steer": "queued"|"refused", "envelopeId", "reason"}}`, runs queued
+  follow-ups as further turns after the current one, publishes each earlier turn's
+  answer as a `turn` artifact and the last as the `result`. A refusal (`queue-full`,
+  `task-ending`, `task-ended`, `no-text`, `capability`, `no-resume`) is the refusal shape
+  below: never a silent drop, never a state change caused by the follow-up alone.
+  Assertion 21's stdin delivery applies to absorbing executors; a refusal satisfies its
+  never-silently-dropped half.
 - Turn accounting is the steering contract (amended 8/31, from the worker adapter). A
   harness driven over stream-json emits one `result` per user turn, so once steers
   exist, "the harness produced a result" no longer means "the task is done." The
@@ -402,7 +407,7 @@ calls and become properties of the stream:
 ### Reserved artifact names
 
 Added 8/24, ratified with the subagent framework. `artifact-update` payloads name their
-artifact, and five names are reserved so renderers and audit tooling can rely on them:
+artifact, and six names are reserved so renderers and audit tooling can rely on them:
 
 | Name       | Content                                                                                                                                                                                                                                                |
 | ---------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
@@ -411,9 +416,10 @@ artifact, and five names are reserved so renderers and audit tooling can rely on
 | `activity` | Tool-call trace, one entry per invocation. Always in the audit replay                                                                                                                                                                                  |
 | `progress` | Agent-authored milestones, renderable to chat at zero model cost. Stage 1 derives these from model narration; the subagent framework spec records the deviation                                                                                        |
 | `delegate` | The session's request to the gateway to mint a child task: one `data` part `{"addressee", "text"}` on the session's own task events. Consumed by the gateway's relay, never rendered to chat; reserved 10/5, used from the delegation primitive onward |
+| `turn`     | One finished turn's answer on a task with more turns queued (an executor that queues follow-ups). Chunked like `result`, posted by renderers as it completes, never the deliverable; the last turn's answer is the `result`. Reserved 10/8 (G22)       |
 
 Artifact names are data, so the set can grow without touching the envelope; only these
-five carry reserved semantics. An `activity` entry is one `data` part whose object carries
+six carry reserved semantics. An `activity` entry is one `data` part whose object carries
 `tool`, `input` when the call had one, and may carry `callId`, `status` (`completed`, `error`,
 `interrupted` for a call still open at the terminal, or `truncated` on the one entry an executor
 publishes in place of the calls missing from the trace: past its budget, failed to publish,
