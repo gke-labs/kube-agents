@@ -42,6 +42,10 @@ _WORKFLOWS = _REPO_ROOT / ".github" / "workflows"
 _NAMESPACE = "kubeagents-system"
 # PLATFORM_AGENT_MODE_GATE_TIMEOUT_SECONDS's default in platform_agent_mode.sh.
 _GATE_BUDGET_SECONDS = 1800
+# The readiness script's read of the installed CR's spec.mode.
+_INSTALLED_MODE_READ = (
+    f"kubectl get platformagent platform-agent -n {_NAMESPACE} -o jsonpath={{.spec.mode}}"
+)
 
 # The gate wait_for_gke_readiness.sh adds under `next`, in order: the CR's
 # Ready for its generation, the two bus conditions, each rollout, and the A2A
@@ -65,9 +69,9 @@ def _normalise(lines):
     for line in lines:
         if "-o jsonpath=" in line:
             tag = next(
-                (c for c in ("A2AGateway", "BusProvisioned", "BusCredentialsReady") if c in line),
+                (c for c in ("A2AGateway", "BusProvisioned", "BusCredentialsReady", ".spec.mode") if c in line),
                 "READ",
-            ).replace("A2AGateway", "GATEWAY")
+            ).replace("A2AGateway", "GATEWAY").replace(".spec.mode", "MODE")
             line = line.split("-o jsonpath=", 1)[0] + "-o jsonpath=" + tag
         match = re.search(r"--timeout=(\d+)s$", line)
         if match:
@@ -84,6 +88,8 @@ class ReadinessScriptModeTest(unittest.TestCase):
         tmp_dir = pathlib.Path(tmp.name)
         calls = tmp_dir / MOCK_CALLS_LOG
         bin_dir = tmp_dir / "bin"
+        # The CR matches the mode asked for unless a test says otherwise.
+        stub.setdefault("installed_mode", "next" if overrides.get("PLATFORM_AGENT_MODE") == "next" else "")
         write_mode_kubectl_stub(bin_dir, calls, **stub)
         write_recording_stub(bin_dir, "gcloud", calls)
         # Every child's view of the mode variable, recorded beside its call.
@@ -145,7 +151,43 @@ class ReadinessScriptModeTest(unittest.TestCase):
                 f"kubectl wait --for=condition=Available deployment/platform-agent-gateway -n {_NAMESPACE} --timeout=1500s",
             ],
         )
-        self.assertFalse(any("platformagent" in c for c in calls), calls)
+        # The one read of the CR: its installed spec.mode, checked against the input.
+        reads = [c for c in self._strip_env(calls) if "platformagent" in c]
+        self.assertEqual(reads, [_INSTALLED_MODE_READ])
+
+    def test_the_installed_mode_is_checked_before_any_gate(self):
+        _, calls = self._run({})
+        calls = self._strip_env(calls)
+        first_gate = next(i for i, c in enumerate(calls) if "rollout status" in c)
+        self.assertLess(calls.index(_INSTALLED_MODE_READ), first_gate)
+
+    def test_a_cr_with_no_mode_is_today(self):
+        for value in ({}, {"PLATFORM_AGENT_MODE": "today"}, {"PLATFORM_AGENT_MODE": ""}):
+            with self.subTest(value=value):
+                proc, _ = self._run(value, installed_mode="")
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        proc, _ = self._run({}, installed_mode="today")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+
+    def test_next_against_a_today_install_is_refused_before_any_gate(self):
+        for installed in ("", "today"):
+            with self.subTest(installed=installed):
+                proc, calls = self._run({"PLATFORM_AGENT_MODE": "next"}, installed_mode=installed)
+                self.assertEqual(proc.returncode, 1)
+                self.assertIn("::error title=Mode mismatch::", proc.stdout)
+                self.assertIn("mode next", proc.stdout)
+                self.assertIn("spec.mode today", proc.stdout)
+                self.assertFalse(any("rollout status" in c for c in calls), calls)
+
+    def test_today_against_a_next_install_is_refused_before_any_gate(self):
+        for value in ({}, {"PLATFORM_AGENT_MODE": "today"}):
+            with self.subTest(value=value):
+                proc, calls = self._run(value, installed_mode="next")
+                self.assertEqual(proc.returncode, 1)
+                self.assertIn("::error title=Mode mismatch::", proc.stdout)
+                self.assertIn("mode today", proc.stdout)
+                self.assertIn("spec.mode next", proc.stdout)
+                self.assertFalse(any("rollout status" in c for c in calls), calls)
 
     def test_next_adds_exactly_the_mode_gate_after_todays(self):
         _, today_calls = self._run({})

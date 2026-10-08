@@ -35,7 +35,9 @@ readonly LITELLM_READINESS_TIMEOUT="420s"
 readonly GATEWAY_READINESS_TIMEOUT="1500s"
 
 # PLATFORM_AGENT_MODE, refused before anything connects when it is not a mode.
-# Unset and `today` add nothing below; `next` adds the gate at the end.
+# Once connected, it is checked against the installed CR's spec.mode (one
+# read, whatever the mode); beyond that, unset and `today` add nothing below
+# and `next` adds the gate at the end.
 platform_agent_mode_resolve
 
 release_resolve_target
@@ -53,6 +55,9 @@ echo "Readiness Timeouts: litellm ${LITELLM_READINESS_TIMEOUT}, gateway ${GATEWA
 echo "======================================================================"
 
 release_connect_kubectl
+
+# Before any gate, so a run given the wrong mode stops at once and says so.
+platform_agent_mode_check_installed "${AGENT_NAMESPACE}"
 
 echo "🔑 Configuring Docker authentication for Artifact Registry (${REGION}-docker.pkg.dev)..."
 gcloud auth configure-docker "${REGION}-docker.pkg.dev" --quiet || true

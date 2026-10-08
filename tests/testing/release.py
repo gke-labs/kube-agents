@@ -579,7 +579,7 @@ MOCK_GATEWAY_DARK_REASON = "NoChatBackend"
 
 def write_mode_kubectl_stub(bin_dir, calls_log, ready_reads=(MOCK_CR_READY_AT_GENERATION_2,),
                             gateway_reason="", containers="", rollout_exit=0, condition_status="True",
-                            gateway_read_failures=0):
+                            gateway_read_failures=0, installed_mode=""):
     """A `kubectl` on PATH that records every call and answers the mode gate's reads.
 
     `ready_reads` is what successive reads of the CR's generation and Ready
@@ -587,7 +587,8 @@ def write_mode_kubectl_stub(bin_dir, calls_log, ready_reads=(MOCK_CR_READY_AT_GE
     A2AGateway condition's reason; `condition_status` what a read of any other
     condition's status returns; `containers` the pod template's container
     names. The first `gateway_read_failures` reads of the A2AGateway condition
-    fail, as an API server that drops a request would. Every other call succeeds silently, `rollout status` with
+    fail, as an API server that drops a request would. `installed_mode` is
+    the CR's spec.mode, empty for a CR that carries none. Every other call succeeds silently, `rollout status` with
     `rollout_exit`. Each call is one line of `calls_log`, prefixed `kubectl `.
     """
     bin_dir = pathlib.Path(bin_dir)
@@ -603,6 +604,7 @@ def write_mode_kubectl_stub(bin_dir, calls_log, ready_reads=(MOCK_CR_READY_AT_GE
 echo "kubectl $*" >> "{calls_log}"
 case "$*" in
   *"config current-context"*) echo "{MOCK_MODE_CONTEXT}"; exit 0 ;;
+  *"{{.spec.mode}}"*) printf '%s' "{installed_mode}"; exit 0 ;;
   *".metadata.generation"*)
     n="$(cat "{counter}")"
     echo $((n + 1)) > "{counter}"

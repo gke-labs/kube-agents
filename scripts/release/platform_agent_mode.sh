@@ -103,6 +103,31 @@ platform_agent_mode_refuse_long_lived() {
   return 1
 }
 
+# Refuses a run whose mode is not the one the cluster was installed with.
+# The deploy and E2E jobs each take the mode as an input, so nothing else ties
+# the gate to what was built: `next` against a `today` install would spend the
+# whole gate waiting on BusProvisioned, a condition `today` never carries, and
+# fail naming the condition rather than the mismatch; `today` against a `next`
+# install would run the suites without the gate. The CR's spec.mode is the
+# answer, and an absent one is `today` to the CRD. A read that fails stops the
+# run too: an unknown mode is not a match. Call after
+# platform_agent_mode_resolve.
+platform_agent_mode_check_installed() {
+  local namespace="$1" context="${2:-}"
+  local -a kc=(kubectl)
+  [ -z "${context}" ] || kc+=(--context "${context}")
+  local installed=""
+  if ! installed="$("${kc[@]}" get platformagent "${PLATFORM_AGENT_MODE_CR_NAME}" -n "${namespace}" -o jsonpath='{.spec.mode}')"; then
+    echo "::error title=Mode unreadable::Could not read PlatformAgent/${PLATFORM_AGENT_MODE_CR_NAME}'s spec.mode in ${namespace}, so whether this run's mode ${RELEASE_PLATFORM_AGENT_MODE} matches the install is unknown."
+    return 1
+  fi
+  installed="${installed:-${PLATFORM_AGENT_MODE_TODAY}}"
+  [ "${installed}" != "${RELEASE_PLATFORM_AGENT_MODE}" ] || return 0
+  echo "::error title=Mode mismatch::This run was given mode ${RELEASE_PLATFORM_AGENT_MODE}, but PlatformAgent/${PLATFORM_AGENT_MODE_CR_NAME} in ${namespace} was installed with spec.mode ${installed}. Pass the same mode the deploy job installed with."
+  echo "==> mode ${RELEASE_PLATFORM_AGENT_MODE} requested, spec.mode ${installed} installed." >&2
+  return 1
+}
+
 # What a failed gate leaves in the log: the CR's status and the A2A objects.
 platform_agent_mode_dump_state() {
   local namespace="$1" context="${2:-}"
