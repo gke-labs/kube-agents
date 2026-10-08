@@ -19,7 +19,9 @@ but only on a tick whose version table read every project: a partial table
 retires nothing, so a failed listing cannot erase a version and have it come
 back as new. A report whose readiness reads graded none of a version's
 pending clusters is written but not recorded, and the version is tried again
-the next day. A tick with nothing due prints nothing.
+the next day; a cluster the script graded ``unknown`` counts as graded, since
+that is a verdict with its reason in the table, and only a cluster the run
+returned nothing for is "not read". A tick with nothing due prints nothing.
 
 Which clusters. The projects come from this pod, not from the sandbox:
 ``UPGRADE_READINESS_PROJECTS`` when set, otherwise the management project
@@ -175,6 +177,7 @@ MEMBER_ID_KEYS = ("project", "location", "cluster")
 BEHIND_STATUSES = frozenset({"lagging", "patch-behind"})
 READINESS_BLOCKED = "blocked"
 READINESS_READY = "ready"
+READINESS_UNKNOWN = "unknown"
 MEMBER_KEY_SEPARATOR = "/"
 
 # Ledger vocabulary.
@@ -202,8 +205,9 @@ UNGRADED_LINE = (
     "{prefix}: {reason} {version}, {pending} cluster(s) pending ({names}): none graded ({detail}); "
     "report on the gateway pod at {path}; retrying tomorrow"
 )
-UNGRADED_COUNT = ", {count} not graded"
-READS_FAILED_DETAIL = "readiness reads failed"
+UNKNOWN_COUNT = ", {count} unknown"
+UNREAD_COUNT = ", {count} not read"
+READS_FAILED_DETAIL = "the readiness run returned none of them"
 PROJECT_RUN_FAILED_DETAIL = "readiness run for {project} failed: {error}"
 TIMED_OUT_DETAIL = "the sandbox run timed out after {seconds}s"
 DRY_RUN_WOULD_REPORT = "dry run: would report {version} ({reason}) for {names}"
@@ -227,8 +231,8 @@ def iso(moment: datetime) -> str:
     return moment.isoformat()
 
 
-def parse_iso(value: str | None) -> datetime | None:
-    if not value:
+def parse_iso(value: object) -> datetime | None:
+    if not value or not isinstance(value, str):
         return None
     try:
         parsed = datetime.fromisoformat(value)
@@ -468,23 +472,23 @@ def decide(
 # --- the report files ------------------------------------------------------
 
 
-def readiness_verdicts(report: dict, clusters: list[str]) -> tuple[list[str], list[str], list[str]]:
-    """The blocked, the ready and the ungraded clusters among ``clusters``, by
-    member key; a cluster the run did not reach or graded ``unknown`` is ungraded."""
+def readiness_verdicts(report: dict, clusters: list[str]) -> tuple[list[str], list[str], list[str], list[str]]:
+    """The blocked, ready, unknown and unread clusters among ``clusters``, by
+    member key. ``unknown`` is a verdict the script gave (an exclusion or a pool
+    it could not decide) and counts as graded; ``unread`` is a cluster the run
+    returned no member for, which is a failed or missing read."""
     wanted = set(clusters)
-    blocked: list[str] = []
-    ready: list[str] = []
+    buckets: dict[str, list[str]] = {READINESS_BLOCKED: [], READINESS_READY: [], READINESS_UNKNOWN: []}
     for member in report.get(MEMBERS_KEY) or []:
         key = member_key(member)
         if key not in wanted:
             continue
         status = (member.get(READINESS_KEY) or {}).get(STATUS_KEY)
-        if status == READINESS_BLOCKED:
-            blocked.append(key)
-        elif status == READINESS_READY:
-            ready.append(key)
-    ungraded = sorted(wanted - set(blocked) - set(ready))
-    return sorted(blocked), sorted(ready), ungraded
+        if status in buckets:
+            buckets[status].append(key)
+    seen = {k for keys in buckets.values() for k in keys}
+    unread = sorted(wanted - seen)
+    return sorted(buckets[READINESS_BLOCKED]), sorted(buckets[READINESS_READY]), sorted(buckets[READINESS_UNKNOWN]), unread
 
 
 def project_of(member_key_text: str) -> str:
@@ -527,7 +531,7 @@ def tables_without_the_output_line(tables: str) -> str:
 
 def render_markdown(version: str, reason: str, clusters: list[str], envelope: dict, now: datetime, days: int) -> str:
     report = envelope[ENVELOPE_REPORT_KEY]
-    blocked, ready, ungraded = readiness_verdicts(report, clusters)
+    blocked, ready, unknown, unread = readiness_verdicts(report, clusters)
     lines = [
         f"# Upgrade readiness for {version}",
         "",
@@ -536,7 +540,8 @@ def render_markdown(version: str, reason: str, clusters: list[str], envelope: di
         f"Of those the readiness check graded {len(blocked)} blocked"
         + (f" ({', '.join(blocked)})" if blocked else "")
         + f", {len(ready)} ready"
-        + (f" and {len(ungraded)} not graded ({', '.join(ungraded)}; their reads failed)" if ungraded else "")
+        + (f", {len(unknown)} unknown ({', '.join(unknown)}; the table says what it could not decide)" if unknown else "")
+        + (f" and {len(unread)} not read ({', '.join(unread)}; the run returned nothing for them)" if unread else "")
         + ". "
         f"The next scheduled refresh is after {(now + timedelta(days=days)).strftime(DATE_FORMAT)} "
         "while any cluster is still pending; ask the Platform Agent for the report at any time to refresh it sooner.",
@@ -610,8 +615,8 @@ def tick(dry_run: bool = False) -> list[str]:
                 path = write_report(home, version, reason, clusters, readiness, now, days)
             except OSError as exc:
                 raise WriteFailed(str(exc)) from exc
-            blocked, ready, ungraded = readiness_verdicts(readiness[ENVELOPE_REPORT_KEY], clusters)
-            if not blocked and not ready:
+            blocked, ready, unknown, unread = readiness_verdicts(readiness[ENVELOPE_REPORT_KEY], clusters)
+            if not blocked and not ready and not unknown:
                 failed_projects = sorted({project_of(k) for k in clusters} & set(failures))
                 detail = "; ".join(PROJECT_RUN_FAILED_DETAIL.format(project=p, error=failures[p]) for p in failed_projects) or READS_FAILED_DETAIL
                 lines.append(
@@ -632,7 +637,8 @@ def tick(dry_run: bool = False) -> list[str]:
                     blocked=len(blocked),
                     blocked_names=BLOCKED_NAMES.format(names=cluster_names(blocked)) if blocked else "",
                     ready=len(ready),
-                    ungraded=UNGRADED_COUNT.format(count=len(ungraded)) if ungraded else "",
+                    ungraded=(UNKNOWN_COUNT.format(count=len(unknown)) if unknown else "")
+                    + (UNREAD_COUNT.format(count=len(unread)) if unread else ""),
                     path=path,
                     next_date=(now + timedelta(days=days)).strftime(DATE_FORMAT),
                 )
