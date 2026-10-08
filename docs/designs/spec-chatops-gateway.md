@@ -1668,9 +1668,9 @@ never-started heal (`gateway-never-started`); `observeChildEnd` for a child whos
 and a submission that never reached the bus (`gateway`). A delegation chain is counted once under
 its root: `observedAs` keeps both the turn that delegated and its child from reaching `observeTaskTerminal`
 separately, and a session turn that asked to delegate but started no child is counted as failed (`handOffEnd`)
-even when the executor reported completed. The last two are failures the gateway declares itself, so a bus outage or an install
-with no executor shows `failed` rising under them rather than reading zero failed tasks while
-the chat shows ❌. The executor's reason token is not a label.
+even when the executor reported completed. The failures the gateway declares itself (`gateway-never-started`,
+`gateway`, and a delegated turn with no child) show `failed` rising under them during a bus outage or on an install
+with no executor, rather than reading zero failed tasks while the chat shows ❌. The executor's reason token is not a label.
 The gateway does not know the executors' tokens, which are theirs to define, so it has no closed
 list to draw one from, and an open one is the cardinality the labels exist to avoid.
 

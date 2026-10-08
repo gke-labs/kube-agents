@@ -227,10 +227,10 @@ func TestRelayedTerminalIsCountedOnce(t *testing.T) {
 
 // TestHealedStaleTerminalDeliversOnceEvenIfRelayQueued: if the stale-terminal
 // heal fires while the relay still has the same terminal queued (the two
-// share the session lock), the heal delivers the terminal and drops the
-// routing entries; the relay's later delivery must be a no-op so the user
-// does not see the answer posted twice and task_terminals_total is not
-// incremented twice.
+// share the session lock), the heal observes the terminal and marks it on
+// the record while preserving the task route; the relay's later delivery
+// delivers the final answer text but skips observeEnded so task_terminals_total
+// is incremented exactly once.
 func TestHealedStaleTerminalDeliversOnceEvenIfRelayQueued(t *testing.T) {
 	r := startRig(t)
 	m := r.g.Metrics()

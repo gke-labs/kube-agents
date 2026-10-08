@@ -199,13 +199,22 @@ func TestRunExitsNonZeroOnConfigError(t *testing.T) {
 // startTestServer starts an embedded, no-auth nats-server on a random port
 // for buildAdapters tests that need a real bus but no gateway config.
 func startTestServer(t *testing.T) *natsserver.Server {
+	return startTestServerWithOptions(t, false)
+}
+
+func startJetStreamTestServer(t *testing.T) *natsserver.Server {
+	return startTestServerWithOptions(t, true)
+}
+
+func startTestServerWithOptions(t *testing.T, jetStream bool) *natsserver.Server {
 	t.Helper()
 	opts := &natsserver.Options{
-		Host:     "127.0.0.1",
-		Port:     -1,
-		NoLog:    true,
-		NoSigs:   true,
-		StoreDir: t.TempDir(),
+		Host:      "127.0.0.1",
+		Port:      -1,
+		JetStream: jetStream,
+		NoLog:     true,
+		NoSigs:    true,
+		StoreDir:  t.TempDir(),
 	}
 	s, err := natsserver.NewServer(opts)
 	if err != nil {
@@ -446,28 +455,6 @@ func TestServeKeepsTheGatewayWhenTheMetricsListenerCannotStart(t *testing.T) {
 			}
 		})
 	}
-}
-
-func startJetStreamTestServer(t *testing.T) *natsserver.Server {
-	t.Helper()
-	opts := &natsserver.Options{
-		Host:      "127.0.0.1",
-		Port:      -1,
-		JetStream: true,
-		NoLog:     true,
-		NoSigs:    true,
-		StoreDir:  t.TempDir(),
-	}
-	s, err := natsserver.NewServer(opts)
-	if err != nil {
-		t.Fatalf("NewServer: %v", err)
-	}
-	go s.Start()
-	if !s.ReadyForConnections(startTestServerReadyTimeout) {
-		t.Fatal("nats-server not ready")
-	}
-	t.Cleanup(s.Shutdown)
-	return s
 }
 
 func provisionTasksStream(t *testing.T, url string) {
