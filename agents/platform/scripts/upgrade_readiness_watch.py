@@ -93,8 +93,10 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -174,6 +176,13 @@ ENVELOPE_REPORT_KEY = "report"
 WROTE_LINE_PREFIX = "Wrote "
 VERSION_TABLE_TIMEOUT_SECONDS = 600
 READINESS_TIMEOUT_SECONDS = 1500
+# Hermes kills a no_agent script at an hour (stall_watch.py records it); the
+# whole tick stays under this, so the readiness runs get what the version
+# table left, each capped at READINESS_TIMEOUT_SECONDS, and a project the
+# budget cannot reach is left unread and named rather than started.
+TICK_BUDGET_SECONDS = 2700
+MIN_PROJECT_RUN_SECONDS = 120
+BUDGET_EXHAUSTED_DETAIL = "tick budget exhausted before project {project} ran; retried tomorrow"
 STDERR_EXCERPT_CHARS = 300
 
 # The report's vocabulary this job reads (fleet_upgrade_report.py, upgrade_readiness.py).
@@ -190,6 +199,9 @@ READINESS_BLOCKED = "blocked"
 READINESS_READY = "ready"
 READINESS_UNKNOWN = "unknown"
 MEMBER_KEY_SEPARATOR = "/"
+# fleet_upgrade_report.VERSION_RE, which every target_version the report prints
+# has matched; a ledger key that does not is not a version and names no directory.
+VERSION_KEY_RE = re.compile(r"^\d+\.\d+\.\d+(?:-gke\.\d+)?$")
 
 # Ledger vocabulary.
 TARGETS_KEY = "targets"
@@ -200,6 +212,10 @@ LAST_TICK_KEY = "last_tick"
 ANNOUNCED_KEY = "announced"
 ANNOUNCED_PARTIAL_KEY = "partial"
 ANNOUNCED_UNGRADED_KEY = "ungraded"
+# A failed tick writes nothing to the ledger; the failure it announced is kept
+# in this file beside it, so the same failure is posted once and its recovery once.
+FAILURE_MARKER_FILE_NAME = "last-failure.txt"
+RECOVERED_LINE = "{prefix} watch: the tick runs again"
 DETAIL_KEY = "detail"
 ATTEMPTS_KEY = "attempts"
 REASON_NEW = "new target version"
@@ -416,10 +432,11 @@ def report_argv(names: list[str], readiness: bool) -> list[str]:
     return argv
 
 
-def run_report(names: list[str], readiness: bool) -> dict:
+def run_report(names: list[str], readiness: bool, timeout: float | None = None) -> dict:
     """Run the skill's report in the sandbox and return the envelope:
     ``{"exit": int, "tables": str, "report": dict | None}``."""
-    timeout = READINESS_TIMEOUT_SECONDS if readiness else VERSION_TABLE_TIMEOUT_SECONDS
+    if timeout is None:
+        timeout = READINESS_TIMEOUT_SECONDS if readiness else VERSION_TABLE_TIMEOUT_SECONDS
     try:
         completed = sandbox_exec.run(
             [PYTHON_EXECUTABLE, PYTHON_ISOLATED_FLAG, STDIN_SCRIPT_ARG],
@@ -460,16 +477,26 @@ def pending_targets(report: dict) -> dict[str, list[str]]:
 
 
 def carry_forward_unlisted(pending: dict[str, list[str]], ledger: dict, read_errors: list) -> None:
-    """A project whose ``clusters list`` failed (an error with no location)
-    contributed no members, so its clusters would drop out of every version's
+    """A project whose ``clusters list`` failed (an error with no location),
+    or a location whose ``get-server-config`` failed (an error with a location
+    and no cluster, which leaves its clusters with no target), contributed no
+    pending members, so those clusters would drop out of every version's
     pending set and rejoin a week later under a version already recorded.
     Keep them pending from the ledger instead; the readiness run then counts
     them as not read, and a version with nothing graded is not recorded."""
     unlisted = {error.get(MEMBER_ID_KEYS[0]) for error in read_errors if error.get(MEMBER_ID_KEYS[0]) and not error.get(MEMBER_ID_KEYS[1])}
-    if not unlisted:
+    unconfigured = {
+        (error.get(MEMBER_ID_KEYS[0]), error.get(MEMBER_ID_KEYS[1]))
+        for error in read_errors
+        if error.get(MEMBER_ID_KEYS[1]) and not error.get(MEMBER_ID_KEYS[-1])
+    }
+    if not unlisted and not unconfigured:
         return
     for version, entry in ledger[TARGETS_KEY].items():
-        kept = [key for key in entry.get(PENDING_KEY) or [] if project_of(key) in unlisted]
+        kept = [
+            key for key in entry.get(PENDING_KEY) or []
+            if project_of(key) in unlisted or tuple(key.split(MEMBER_KEY_SEPARATOR)[:2]) in unconfigured
+        ]
         if kept:
             merged = sorted(set(pending.get(version, [])) | set(kept))
             pending[version] = merged
@@ -494,7 +521,9 @@ def load_ledger(path: Path) -> dict:
         raise RuntimeError(f"ledger at {path} is not this job's ledger; refusing to overwrite it")
     for version, entry in data[TARGETS_KEY].items():
         shape_ok = (
-            isinstance(entry, dict)
+            isinstance(version, str)
+            and VERSION_KEY_RE.match(version) is not None
+            and isinstance(entry, dict)
             and isinstance(entry.get(PENDING_KEY), list)
             and all(isinstance(c, str) for c in entry[PENDING_KEY])
             and (entry.get(LAST_REPORT_KEY) is None or parse_iso(entry.get(LAST_REPORT_KEY)) is not None)
@@ -506,6 +535,10 @@ def load_ledger(path: Path) -> dict:
         data[ANNOUNCED_KEY] = {}
     elif not announced_shape_ok(block):
         raise RuntimeError(f"ledger at {path} has a malformed {ANNOUNCED_KEY} block; refusing to overwrite it")
+    # A null map is the absent one: ``setdefault`` and ``get`` would otherwise
+    # hand the None back on the next due or retired version.
+    if data[ANNOUNCED_KEY].get(ANNOUNCED_UNGRADED_KEY) is None:
+        data[ANNOUNCED_KEY][ANNOUNCED_UNGRADED_KEY] = {}
     return data
 
 
@@ -608,19 +641,32 @@ def project_of(member_key_text: str) -> str:
     return member_key_text.split(MEMBER_KEY_SEPARATOR, 1)[0]
 
 
-def readiness_by_project(pending: dict[str, list[str]], due: dict[str, str]) -> tuple[dict, dict[str, str]]:
+def readiness_by_project(
+    pending: dict[str, list[str]], due: dict[str, str], deadline: float, rotation: int = 0
+) -> tuple[dict, dict[str, str]]:
     """One readiness run per project that holds a due version's pending
-    clusters, each with its own timeout, merged into one envelope; a project
-    whose run failed leaves its clusters ungraded and is named in the second
-    value, so the other projects' versions still get their report."""
+    clusters, each capped by its own timeout and by what is left of the tick's
+    budget before ``deadline`` (a ``time.monotonic`` instant), merged into one
+    envelope; a project whose run failed, or that the budget could not reach,
+    leaves its clusters ungraded and is named in the second value, so the
+    other projects' versions still get their report. ``rotation`` (the day
+    number) turns the sorted order so a budget that never reaches the last
+    project does not leave the same project unread every day."""
     needed = sorted({project_of(key) for version in due for key in pending[version]})
+    if needed:
+        start = rotation % len(needed)
+        needed = needed[start:] + needed[:start]
     merged = {ENVELOPE_EXIT_KEY: EXIT_OK, ENVELOPE_TABLES_KEY: "", ENVELOPE_REPORT_KEY: {MEMBERS_KEY: [], ERRORS_KEY: []}}
     failures: dict[str, str] = {}
     for project in needed:
+        remaining = deadline - time.monotonic()
+        if remaining < MIN_PROJECT_RUN_SECONDS:
+            failures[project] = BUDGET_EXHAUSTED_DETAIL.format(project=project)
+            continue
         try:
-            envelope = run_report([project], readiness=True)
-        except RuntimeError as exc:
-            failures[project] = str(exc)
+            envelope = run_report([project], readiness=True, timeout=min(READINESS_TIMEOUT_SECONDS, remaining))
+        except (RuntimeError, ValueError, KeyError, TypeError) as exc:
+            failures[project] = f"{type(exc).__name__}: {exc}" if not isinstance(exc, RuntimeError) else str(exc)
             continue
         merged[ENVELOPE_TABLES_KEY] += envelope.get(ENVELOPE_TABLES_KEY, "")
         merged[ENVELOPE_REPORT_KEY][MEMBERS_KEY] += envelope[ENVELOPE_REPORT_KEY].get(MEMBERS_KEY) or []
@@ -702,6 +748,7 @@ def write_report(home: Path, version: str, reason: str, clusters: list[str], env
 
 
 def tick(dry_run: bool = False) -> list[str]:
+    started = time.monotonic()
     now = now_utc()
     days = refresh_days()
     home = watch_home()
@@ -731,7 +778,7 @@ def tick(dry_run: bool = False) -> list[str]:
         lines.append(PARTIAL_CLEARED_LINE.format(prefix=LINE_PREFIX))
     announced(ledger)[ANNOUNCED_PARTIAL_KEY] = partial_signature
     if due:
-        readiness, failures = readiness_by_project(pending, due)
+        readiness, failures = readiness_by_project(pending, due, started + TICK_BUDGET_SECONDS, rotation=now.toordinal())
         for version, reason in due.items():
             clusters = pending[version]
             try:
@@ -792,7 +839,27 @@ def tick(dry_run: bool = False) -> list[str]:
         save_ledger(ledger_path, ledger)
     except OSError as exc:
         raise WriteFailed(str(exc)) from exc
+    marker = home / FAILURE_MARKER_FILE_NAME
+    if marker.exists():
+        lines.insert(0, RECOVERED_LINE.format(prefix=LINE_PREFIX))
+        marker.unlink()
     return lines
+
+
+def announce_failure_once(detail: str) -> bool:
+    """A failure that persists is posted once per distinct detail and the next
+    clean tick posts a recovery line. The marker lives beside the ledger, which
+    a failed tick never writes; a marker that cannot be read or written leaves
+    the line posted every time, since nothing can remember it."""
+    try:
+        marker = watch_home() / FAILURE_MARKER_FILE_NAME
+        if marker.exists() and marker.read_text(encoding="utf-8") == detail:
+            return False
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text(detail, encoding="utf-8")
+    except (OSError, RuntimeError):
+        pass
+    return True
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -805,7 +872,9 @@ def main(argv: list[str] | None = None) -> int:
         print(FAILED_LINE.format(prefix=LINE_PREFIX, what=FAILED_WHAT_WRITE, detail=exc))
         return WRITE_FAILED_EXIT
     except Exception as exc:  # noqa: BLE001 - one line to chat, never a traceback
-        print(FAILED_LINE.format(prefix=LINE_PREFIX, what=FAILED_WHAT_TICK, detail=f"{type(exc).__name__}: {exc}"))
+        detail = f"{type(exc).__name__}: {exc}"
+        if announce_failure_once(detail):
+            print(FAILED_LINE.format(prefix=LINE_PREFIX, what=FAILED_WHAT_TICK, detail=detail))
         return 0
     for line in lines:
         print(line)
