@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -2156,7 +2157,7 @@ func TestFailureReason_SessionIDIsTheLastWholeLine(t *testing.T) {
 		{"nothing here\n", ""},
 	}
 	for _, c := range cases {
-		got := failureReason(err, "", c.stderr)
+		got := failureReason(err, "", c.stderr, 1)
 		if c.want == "" {
 			if strings.Contains(got, "session:") {
 				t.Errorf("stderr %q: reason reports a session id: %q", c.stderr, got)
@@ -2282,15 +2283,16 @@ echo done`, marker)), 1)
 	if task.State != lib.StateSubmitted {
 		t.Fatalf("folded state after steer = %s, want still submitted", task.State)
 	}
-	// Both tasks still finish clean. Nothing runs the queued follow-up as a
-	// turn yet, so the end refuses it task-ended, ahead of the terminal.
+	// Both tasks still finish clean. The stub prints no session id, so the
+	// queued follow-up cannot run as a resumed turn: it is refused
+	// no-resume, ahead of the terminal.
 	if got := waitTerminal(t, c, "task-queued"); got.State != lib.StateCompleted || got.PostFinalDropped != 0 {
 		t.Fatalf("queued task ended %s (post-final %d), want completed", got.State, got.PostFinalDropped)
 	}
 	ns := steerNotices(t, url, queued.TaskID)
-	if len(ns) != 2 || ns[1].Steer != lib.SteerRefused || ns[1].Reason != lib.SteerReasonTaskEnded ||
+	if len(ns) != 2 || ns[1].Steer != lib.SteerRefused || ns[1].Reason != lib.SteerReasonNoResume ||
 		ns[1].seq > finalSeq(t, url, queued.TaskID) {
-		t.Fatalf("notices %+v, want queued then refused task-ended before the terminal", ns)
+		t.Fatalf("notices %+v, want queued then refused no-resume before the terminal", ns)
 	}
 }
 
@@ -2471,4 +2473,374 @@ func TestChunkString_NeverSplitsARune(t *testing.T) {
 			}
 		})
 	}
+}
+
+// ---- follow-up turns (cli executor) ------------------------------------------
+
+func TestResumeArgv(t *testing.T) {
+	got, err := resumeArgv([]string{"hermes", "-p", "platform", "chat", "-Q", "-q"}, "sess-9", "and the west")
+	want := []string{"hermes", "-p", "platform", "chat", "-Q", "--resume", "sess-9", "-q", "and the west"}
+	if err != nil || !slices.Equal(got, want) {
+		t.Fatalf("resumeArgv = %q, %v; want %q", got, err, want)
+	}
+	if _, err := resumeArgv([]string{"/stub"}, "sess-9", "x"); err == nil {
+		t.Fatal("a command not ending in -q must be refused: there is nowhere to put --resume")
+	}
+}
+
+func TestLastSessionID(t *testing.T) {
+	if got := lastSessionID("noise\nsession_id: nested-1\nmore\nsession_id: sess-2\n"); got != "sess-2" {
+		t.Fatalf("got %q, want the last line's id", got)
+	}
+	if got := lastSessionID("session_id:\n"); got != "" {
+		t.Fatalf("an empty label yields %q, want none", got)
+	}
+}
+
+func TestTurnNote(t *testing.T) {
+	if got := turnNote(1); got != "" {
+		t.Fatalf("turnNote(1) = %q, want none on the first turn", got)
+	}
+	if got := turnNote(3); got != "; turn: 3" {
+		t.Fatalf("turnNote(3) = %q", got)
+	}
+	reason := failureReason(errors.New("exit status 1"), "out", "session_id: s-1\n", 2)
+	if !strings.Contains(reason, "; session: s-1; turn: 2; stdout tail: ") {
+		t.Fatalf("reason %q, want the turn note between the session and the tails", reason)
+	}
+}
+
+// artifactsNamed is each artifact of the given name on the task's events,
+// its chunks joined, in the order the artifacts first appeared.
+func artifactsNamed(t *testing.T, url, taskID, name string) []string {
+	t.Helper()
+	var ids []string
+	texts := map[string]string{}
+	for _, env := range replayEvents(t, url, taskID) {
+		if env.Kind != lib.KindArtifactUpdate {
+			continue
+		}
+		var a lib.ArtifactUpdate
+		if json.Unmarshal(env.Payload, &a) != nil || a.Artifact.Name != name {
+			continue
+		}
+		id := a.Artifact.ArtifactID
+		if _, ok := texts[id]; !ok {
+			ids = append(ids, id)
+		}
+		var sb strings.Builder
+		for _, p := range a.Artifact.Parts {
+			sb.WriteString(p.Text)
+		}
+		if a.Append {
+			texts[id] += sb.String()
+		} else {
+			texts[id] = sb.String()
+		}
+	}
+	out := make([]string, 0, len(ids))
+	for _, id := range ids {
+		out = append(out, texts[id])
+	}
+	return out
+}
+
+// resumeStub: turn 1 blocks until release, then every turn answers with its
+// own prompt and the session id; ARGS records each child's argv. resumeExit
+// is the --resume branch's exit code.
+func resumeStub(t *testing.T, resumeExit int, printSession bool) (cmd []string, started, release, args string) {
+	t.Helper()
+	dir := t.TempDir()
+	started, release, args = filepath.Join(dir, "started"), filepath.Join(dir, "release"), filepath.Join(dir, "args")
+	sess := `echo "session_id: sess-1" >&2`
+	if !printSession {
+		sess = ":"
+	}
+	body := fmt.Sprintf(`echo "$*" >> %[3]s
+for last; do :; done
+case "$*" in
+*--resume*) echo "answer to $last"; %[4]s; exit %[5]d ;;
+*) touch %[1]s; while [ ! -f %[2]s ]; do sleep 0.05; done; echo "answer to $last"; %[4]s ;;
+esac`, started, release, args, sess, resumeExit)
+	return append(script(t, body), "-q"), started, release, args
+}
+
+func TestCLI_FollowUpsRunAsResumedTurnsInOrder(t *testing.T) {
+	_, url := startServer(t)
+	cmd, started, release, args := resumeStub(t, 0, true)
+	startBridge(t, url, cmd)
+	c := gatewayClient(t, url)
+	origin := submit(t, c, "task-cli-turns", "long question")
+	waitStarted(t, started)
+	sendSteer(t, c, origin, "also east")
+	sendSteer(t, c, origin, "and west")
+	waitFor(t, 10*time.Second, "two queued", func() bool { return len(steerNotices(t, url, origin.TaskID)) == 2 })
+	if err := os.WriteFile(release, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	task := waitTerminal(t, c, origin.TaskID)
+	if task.State != lib.StateCompleted || task.PostFinalDropped != 0 {
+		t.Fatalf("state %s, post-final %d", task.State, task.PostFinalDropped)
+	}
+	if got := artifactsNamed(t, url, origin.TaskID, lib.ArtifactTurn); !slices.Equal(got, []string{"answer to long question\n", "answer to also east\n"}) {
+		t.Fatalf("turn answers = %q", got)
+	}
+	if got := artifactsNamed(t, url, origin.TaskID, lib.ArtifactResult); !slices.Equal(got, []string{"answer to and west\n"}) {
+		t.Fatalf("result = %q, want the last turn's answer only", got)
+	}
+	raw, _ := os.ReadFile(args)
+	want := "-q long question\n--resume sess-1 -q also east\n--resume sess-1 -q and west\n"
+	if string(raw) != want {
+		t.Fatalf("argv per child:\n%s\nwant:\n%s", raw, want)
+	}
+	for _, n := range steerNotices(t, url, origin.TaskID) {
+		if n.Steer != lib.SteerQueued {
+			t.Fatalf("a follow-up that ran was also refused: %+v", n)
+		}
+	}
+}
+
+func TestCLI_ResumeFailureFailsTheTaskAfterTheFirstAnswer(t *testing.T) {
+	_, url := startServer(t)
+	cmd, started, release, _ := resumeStub(t, 1, true)
+	startBridge(t, url, cmd)
+	c := gatewayClient(t, url)
+	origin := submit(t, c, "task-cli-resume-fail", "long question")
+	waitStarted(t, started)
+	sendSteer(t, c, origin, "also east")
+	sendSteer(t, c, origin, "and west")
+	waitFor(t, 10*time.Second, "two queued", func() bool { return len(steerNotices(t, url, origin.TaskID)) == 2 })
+	_ = os.WriteFile(release, nil, 0o600)
+	task := waitTerminal(t, c, origin.TaskID)
+	reason := terminalReason(t, task)
+	if task.State != lib.StateFailed || !strings.Contains(reason, "reason: hermes-exited-nonzero") || !strings.Contains(reason, "; turn: 2") {
+		t.Fatalf("state %s reason %q", task.State, reason)
+	}
+	if got := artifactsNamed(t, url, origin.TaskID, lib.ArtifactTurn); len(got) != 1 {
+		t.Fatalf("turn 1's answer must have gone out before turn 2 ran: %q", got)
+	}
+	ns := steerNotices(t, url, origin.TaskID)
+	if last := ns[len(ns)-1]; last.Steer != lib.SteerRefused || last.Reason != lib.SteerReasonTaskEnded {
+		t.Fatalf("the unrun follow-up: %+v, want refused task-ended", last)
+	}
+	if len(ns) != 3 || ns[len(ns)-1].seq > finalSeq(t, url, origin.TaskID) {
+		t.Fatalf("notices %+v, want two queued and one refusal, all before the terminal", ns)
+	}
+}
+
+func TestCLI_NoSessionIDRefusesFollowUpsAndCompletes(t *testing.T) {
+	_, url := startServer(t)
+	cmd, started, release, args := resumeStub(t, 0, false)
+	startBridge(t, url, cmd)
+	c := gatewayClient(t, url)
+	origin := submit(t, c, "task-cli-nosess", "long question")
+	waitStarted(t, started)
+	sendSteer(t, c, origin, "also east")
+	waitFor(t, 10*time.Second, "queued", func() bool { return len(steerNotices(t, url, origin.TaskID)) == 1 })
+	_ = os.WriteFile(release, nil, 0o600)
+	task := waitTerminal(t, c, origin.TaskID)
+	if task.State != lib.StateCompleted {
+		t.Fatalf("state %s", task.State)
+	}
+	ns := steerNotices(t, url, origin.TaskID)
+	if len(ns) != 2 || ns[1].Steer != lib.SteerRefused || ns[1].Reason != lib.SteerReasonNoResume {
+		t.Fatalf("notices = %+v, want queued then refused no-resume", ns)
+	}
+	if raw, _ := os.ReadFile(args); strings.Count(string(raw), "\n") != 1 {
+		t.Fatalf("a follow-up ran with no session to resume: %s", raw)
+	}
+	if got := artifactsNamed(t, url, origin.TaskID, lib.ArtifactResult); !slices.Equal(got, []string{"answer to long question\n"}) {
+		t.Fatalf("result = %q, want turn 1's answer", got)
+	}
+}
+
+func TestCLI_CancelDuringAFollowUpTurn(t *testing.T) {
+	_, url := startServer(t)
+	dir := t.TempDir()
+	turn2 := filepath.Join(dir, "turn2")
+	cmd := append(script(t, fmt.Sprintf(`case "$*" in
+*--resume*) touch %s; sleep 30 ;;
+*) echo first; echo "session_id: sess-1" >&2; sleep 1 ;;
+esac`, turn2)), "-q")
+	startBridge(t, url, cmd)
+	c := gatewayClient(t, url)
+	origin := submit(t, c, "task-cli-cancel2", "q")
+	time.Sleep(200 * time.Millisecond) // turn 1 is sleeping its 1s
+	sendSteer(t, c, origin, "second")
+	sendSteer(t, c, origin, "third")
+	waitFor(t, 10*time.Second, "turn 2 running", func() bool { _, err := os.Stat(turn2); return err == nil })
+	publishCancel(t, c, origin)
+	task := waitTerminal(t, c, origin.TaskID)
+	if task.State != lib.StateCanceled || terminalReason(t, task) != "reason: canceled-by-request" {
+		t.Fatalf("state %s reason %q", task.State, terminalReason(t, task))
+	}
+	ns := steerNotices(t, url, origin.TaskID)
+	if last := ns[len(ns)-1]; last.Reason != lib.SteerReasonTaskEnded {
+		t.Fatalf("the third follow-up: %+v, want refused task-ended", last)
+	}
+}
+
+// Once the worker has closed the queue (no follow-up to run), a follow-up is
+// refused task-ending, before the terminal.
+func TestCLI_FollowUpAfterTheQueueClosesIsRefused(t *testing.T) {
+	_, url := startServer(t)
+	cmd, started, release, args := resumeStub(t, 0, true)
+	b, _ := startBridgeConfig(t, Config{NATSURL: url, Command: cmd, KillGrace: 500 * time.Millisecond,
+		Scope: capability.NamespaceScope("")}, nil)
+	c := gatewayClient(t, url)
+	origin := submit(t, c, "task-cli-closed", "long question")
+	waitStarted(t, started)
+	run := runOf(b, origin.TaskID)
+	if s := b.nextSteer(run); s != nil { // the worker's decision, taken early
+		t.Fatalf("nextSteer = %v on an empty queue", s)
+	}
+	late := sendSteer(t, c, origin, "too late")
+	waitFor(t, 10*time.Second, "refusal", func() bool { return len(steerNotices(t, url, origin.TaskID)) == 1 })
+	if n := steerNotices(t, url, origin.TaskID)[0]; n.Reason != lib.SteerReasonTaskEnding || n.EnvelopeID != late.EnvelopeID {
+		t.Fatalf("notice = %+v, want refused task-ending", n)
+	}
+	_ = os.WriteFile(release, nil, 0o600)
+	task := waitTerminal(t, c, origin.TaskID)
+	if task.State != lib.StateCompleted || task.PostFinalDropped != 0 {
+		t.Fatalf("state %s post-final %d", task.State, task.PostFinalDropped)
+	}
+	if raw, _ := os.ReadFile(args); strings.Count(string(raw), "\n") != 1 {
+		t.Fatalf("the refused follow-up ran: %s", raw)
+	}
+}
+
+// A follow-up whose own authority does not pass is refused capability when
+// its turn comes and skipped; the next one runs.
+func TestCLI_FollowUpWithoutAuthorityIsRefusedAndSkipped(t *testing.T) {
+	_, url := startServer(t)
+	cmd, started, release, args := resumeStub(t, 0, true)
+	startBridge(t, url, cmd)
+	c := gatewayClient(t, url)
+	origin := submit(t, c, "task-cli-capability", "long question")
+	waitStarted(t, started)
+	bare, err := lib.NewFollowUpEnvelope(origin, gatewayParty,
+		messagePayload(t, origin.TaskID, origin.ContextID, "no authority"),
+		lib.WithTo(lib.Party{Session: "platform"}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Publish(testCtx(t), lib.TaskInSubject("platform", origin.TaskID), bare); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 10*time.Second, "bare queued", func() bool { return len(steerNotices(t, url, origin.TaskID)) == 1 })
+	sendSteer(t, c, origin, "and west")
+	waitFor(t, 10*time.Second, "two queued", func() bool { return len(steerNotices(t, url, origin.TaskID)) == 2 })
+	_ = os.WriteFile(release, nil, 0o600)
+	task := waitTerminal(t, c, origin.TaskID)
+	if task.State != lib.StateCompleted || task.PostFinalDropped != 0 {
+		t.Fatalf("state %s post-final %d", task.State, task.PostFinalDropped)
+	}
+	ns := steerNotices(t, url, origin.TaskID)
+	if len(ns) != 3 || ns[2].Reason != lib.SteerReasonCapability || ns[2].EnvelopeID != bare.EnvelopeID || ns[2].state != lib.StateWorking {
+		t.Fatalf("notices %+v, want the bare follow-up refused capability on a working status", ns)
+	}
+	raw, _ := os.ReadFile(args)
+	if want := "-q long question\n--resume sess-1 -q and west\n"; string(raw) != want {
+		t.Fatalf("argv per child:\n%s\nwant:\n%s", raw, want)
+	}
+	if got := artifactsNamed(t, url, origin.TaskID, lib.ArtifactResult); !slices.Equal(got, []string{"answer to and west\n"}) {
+		t.Fatalf("result = %q", got)
+	}
+}
+
+// idleRun is a running taskRun the bridge holds and no worker drives, with
+// one follow-up queued, for driving cliTurn by hand.
+func idleRun(t *testing.T, b *Bridge, taskID string) (*taskRun, *lib.Envelope) {
+	t.Helper()
+	origin, err := lib.NewMessageEnvelope(gatewayParty, taskID, "ctx-"+taskID, "corr-"+taskID,
+		messagePayload(t, taskID, "ctx-"+taskID, "q"), lib.WithTo(lib.Party{Session: "platform"}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	x, err := b.c.NewTaskExecution(origin, b.from, b.cfg.Profile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	steer, err := lib.NewFollowUpEnvelope(origin, gatewayParty,
+		messagePayload(t, taskID, origin.ContextID, "next"), lib.WithTo(lib.Party{Session: "platform"}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	run := &taskRun{origin: origin, exec: x, state: stateRunning, steers: []*lib.Envelope{steer}}
+	b.mu.Lock()
+	b.tasks[taskID] = run
+	b.mu.Unlock()
+	return run, steer
+}
+
+// Ruling: a follow-up turn never spawns once the task is canceled, past its
+// deadline (fired or not yet fired), or finalized; the follow-up it would
+// have run is refused task-ended exactly once, before the terminal.
+func TestCLI_FollowUpTurnDoesNotSpawnAfterTheTaskStops(t *testing.T) {
+	_, url := startServer(t)
+	marker := filepath.Join(t.TempDir(), "spawned")
+	b, _ := startBridgeConfig(t, Config{NATSURL: url, Command: []string{"/bin/true", "-q"},
+		TaskDeadline: 20 * time.Second, KillGrace: 500 * time.Millisecond, Scope: capability.NamespaceScope("")}, nil)
+	argv := script(t, "touch "+marker)
+	future := time.Now().Add(time.Hour)
+	cases := []struct {
+		name       string
+		prepare    func(run *taskRun)
+		deadlineAt time.Time
+		state      lib.TaskState
+		reason     string
+	}{
+		{"canceled", func(run *taskRun) { run.canceled.Store(true) }, future, lib.StateCanceled, "reason: canceled-by-request"},
+		{"deadline-fired", func(run *taskRun) { run.deadlineHit.Store(true) }, future, lib.StateFailed, "reason: deadline-exceeded"},
+		{"deadline-passed", func(*taskRun) {}, time.Now().Add(-time.Second), lib.StateFailed, "reason: deadline-exceeded"},
+		{"finalized", func(run *taskRun) { b.finalize(run, lib.StateFailed, shutdownReason, nil) }, future, lib.StateFailed, shutdownReason},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			taskID := "task-cli-nospawn-" + tc.name
+			run, steer := idleRun(t, b, taskID)
+			if got := b.nextSteer(run); got != steer { // the worker's pick, as runnableSteer makes it
+				t.Fatalf("nextSteer = %v, want the queued follow-up", got)
+			}
+			tc.prepare(run)
+			if _, _, _, spawned := b.cliTurn(run, argv, nil, nil, steer, tc.deadlineAt); spawned {
+				t.Fatal("a follow-up turn spawned after the task stopped")
+			}
+			if _, err := os.Stat(marker); err == nil {
+				t.Fatal("the follow-up's child ran")
+			}
+			var final *lib.StatusUpdate
+			for _, env := range replayEvents(t, url, taskID) {
+				if lib.IsFinalStatus(env) {
+					final = &lib.StatusUpdate{}
+					_ = json.Unmarshal(env.Payload, final)
+				}
+			}
+			if final == nil || final.Status.State != tc.state || final.Status.Message == nil ||
+				!strings.HasPrefix(final.Status.Message.Parts[0].Text, tc.reason) {
+				t.Fatalf("terminal %+v, want %s %q", final, tc.state, tc.reason)
+			}
+			ns := steerNotices(t, url, taskID)
+			if len(ns) != 1 || ns[0].EnvelopeID != steer.EnvelopeID || ns[0].Reason != lib.SteerReasonTaskEnded ||
+				ns[0].seq > finalSeq(t, url, taskID) {
+				t.Fatalf("notices %+v, want the follow-up refused task-ended once, before the terminal", ns)
+			}
+		})
+	}
+	// Control: with nothing stopping it, the same call spawns and the
+	// follow-up leaves the queue as its turn starts.
+	run, steer := idleRun(t, b, "task-cli-nospawn-control")
+	if _, _, err, spawned := b.cliTurn(run, argv, nil, nil, steer, future); !spawned || err != nil {
+		t.Fatalf("control: spawned %v err %v", spawned, err)
+	}
+	if _, err := os.Stat(marker); err != nil {
+		t.Fatal("control: the child did not run")
+	}
+	run.mu.Lock()
+	left := len(run.steers)
+	run.mu.Unlock()
+	if left != 0 {
+		t.Fatalf("control: %d follow-ups still queued after the turn started", left)
+	}
+	b.finalize(run, lib.StateCompleted, "", nil)
 }

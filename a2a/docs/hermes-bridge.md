@@ -282,7 +282,8 @@ session it continues it under a new session id, which the hook reports and the t
 not match, so the trace stops for that conversation while the answers keep arriving.
 
 **`cli`: a subprocess per task.** `hermes -p <BRIDGE_PROFILE> chat -Q -q <prompt>`, a fresh
-session for every task, with no memory of the thread's earlier tasks. The rest of this page
+session for every task, with no memory of the thread's earlier tasks. Within one task,
+follow-up turns resume the task's session (`--resume`). The rest of this page
 describes it where the two differ.
 
 ## Lifecycle, steering, cancel
@@ -291,9 +292,13 @@ Per task: `submitted` on accept (before the consumer ack, so a bridge death befo
 ack just redelivers), `working` when the subprocess spawns, the persona's tool calls as
 an `activity` artifact and a heartbeat as a `progress` artifact while it runs ("Activity"
 below), the stdout as a `result` artifact (chunked if large), one terminal
-`status-update` with `final: true`. A nonzero
+`status-update` with `final: true`. When follow-ups ran as further turns ("Steering" below), each
+earlier turn's stdout is a `turn` artifact of its own (`artifact-<taskId>-turn-<N>`), published
+just before the next turn starts, and the `result` is the last turn's stdout. A nonzero
 exit is terminal `failed` with the evidence in the status message: `reason: hermes-exited-nonzero -
-exit status N; session: <id>; stdout tail: …; stderr tail: …`. Both tails are bounded (2 KiB each),
+exit status N; session: <id>; stdout tail: …; stderr tail: …`, with `; turn: N` after the
+session when a follow-up turn (N ≥ 2) is the one that failed; the earlier turns' answers have
+already gone out as `turn` artifacts. Both tails are bounded (2 KiB each),
 and `session:` carries the id when `hermes chat -Q` printed its `session_id:` line on stderr (it
 is the last thing the CLI writes before exiting), so the transcript under the profile's session
 store can be found from the terminal alone. Exit 75 is Hermes's `EX_TEMPFAIL` for a turn that
@@ -314,20 +319,27 @@ constructible. The component that does NOT get this for free is the worker adapt
 terminal its own predecessor's supervisor declared. Anything on `…in` for a task with a
 terminal event is acked with a warning and nothing else.
 
-**Steering:** the bridge sends a task's instruction once: `hermes chat -Q -q` has no stdin to
-inject into, and the `api` executor's request is already sent. A
-follow-up message to a running task is acked and answered with a non-final status
-echoing the task's current state (`working` once the subprocess spawned, `submitted`
-while still queued) whose message says the input cannot be absorbed mid-run and cancel
-is available.
-Honest, never silent. This does not change task state (payload spec assertion 12). The
-`api` executor answers the same way.
+**Steering:** a running turn cannot take input (`hermes chat -Q -q` has no stdin to inject
+into, and the `api` executor's request is already sent), so a follow-up message to a running
+task is queued, not refused. The bridge answers each one with a non-final status carrying the
+task's current state (`submitted` while queued, `working` after) and a `steerNotice` data part:
+`queued`, or `refused` with `queue-full` (16 already waiting), `task-ending` (the answer was
+already chosen), `no-text`, `capability` (the follow-up's own authority was refused, checked on
+the worker before its turn), `no-resume` (no `session_id:` line to resume, or a command that
+does not end in `-q`), or `task-ended` (the task ended first: cancel, failure, deadline,
+shutdown). On the `cli` executor, when a turn exits 0 the queued follow-ups run in arrival order
+as further turns in the same Hermes session,
+`hermes -p <profile> chat -Q --resume <session_id> -q <text>`, with the turn artifacts and the
+result described above, then the one terminal. A follow-up does not change task state (payload
+spec assertion 12). The `api` executor queues follow-ups the same way but does not run them yet:
+each is refused `task-ended` ahead of the terminal.
 
 **Cancel:** SIGTERM to the subprocess's process group, SIGKILL after a grace period,
 then terminal `canceled` (`reason: canceled-by-request`). A task racing to completion may
 land `completed` first - both orders are legal and the terminal event wins. A per-task
-deadline (default 7200s, matching the profile's `activeDeadlineSeconds`) takes the same
-kill path and lands `failed`.
+deadline (default 7200s, matching the profile's `activeDeadlineSeconds`), which on the `cli`
+executor covers every turn of the task, takes the same kill path and lands `failed`; no
+follow-up turn starts once it has passed.
 
 A cancel for a task still queued finalizes it `canceled` with `reason: canceled-before-start`
 and nothing is spawned, and the worker looks for one itself before it spawns. The durable

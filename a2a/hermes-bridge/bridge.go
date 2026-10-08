@@ -755,6 +755,124 @@ func (b *Bridge) refuseQueued(ctx context.Context, run *taskRun, reason string) 
 	b.publishSteerNotices(ctx, run, ns)
 }
 
+// nextSteer is the follow-up to run next: the oldest queued one, left at the
+// head of the queue until its turn starts (takeSteerLocked), so a finalize
+// that comes first still finds it there and refuses it task-ended. With none
+// to run - the queue is empty, or the task was canceled, hit its deadline or
+// the bridge is stopping - it closes the queue and returns nil: the current
+// answer is the deliverable, and whatever is still queued is refused
+// task-ended by the caller's finalize. Closing and that finalize are two
+// critical sections; a follow-up between them sees turnsClosed and is
+// refused task-ending, still before the final event.
+func (b *Bridge) nextSteer(run *taskRun) *lib.Envelope {
+	run.mu.Lock()
+	defer run.mu.Unlock()
+	if run.state != stateRunning || run.canceled.Load() || run.deadlineHit.Load() || b.closing.Load() || len(run.steers) == 0 {
+		run.turnsClosed = true
+		return nil
+	}
+	return run.steers[0]
+}
+
+// takeSteerLocked removes steer from the head of the queue, where nextSteer
+// left it, and reports whether it was there: false means finalize has taken
+// the queue (and refused it). Caller holds run.mu. A follow-up leaves the
+// queue only here - when its turn starts, or when it is refused at the head -
+// so it is never out of the queue without its turn or its notice, and
+// nothing ever has to go back to the head.
+func takeSteerLocked(run *taskRun, steer *lib.Envelope) bool {
+	if len(run.steers) == 0 || run.steers[0] != steer {
+		return false
+	}
+	run.steers = run.steers[1:]
+	return true
+}
+
+// runnableSteer finds the follow-up to run next: its own authority must pass
+// the capability check, because it is a turn now, not a note. A refused one
+// is told so, taken off the queue and skipped. Runs on the worker, never on
+// the durable's callback, for capabilityPermits's reason. nil means there is
+// none to run and the caller's answer is the deliverable; anything still
+// queued is refused task-ended by the caller's finalize.
+func (b *Bridge) runnableSteer(ctx context.Context, run *taskRun) (*lib.Envelope, string) {
+	for {
+		steer := b.nextSteer(run)
+		if steer == nil {
+			return nil, ""
+		}
+		reason := b.capabilityRefusal(ctx, steer)
+		if reason == "" {
+			prompt, _ := promptFromMessage(steer.Payload) // text was checked when it was queued
+			return steer, prompt
+		}
+		if ctx.Err() != nil {
+			// Stopping, not refused (capabilityPermits says why the two
+			// differ): left queued, for finalize to refuse task-ended.
+			return nil, ""
+		}
+		run.noticeMu.Lock()
+		run.mu.Lock()
+		took := run.state == stateRunning && takeSteerLocked(run, steer)
+		run.mu.Unlock()
+		if took {
+			b.publishSteerNotices(ctx, run, []lib.SteerNotice{
+				{Steer: lib.SteerRefused, EnvelopeID: steer.EnvelopeID, Reason: lib.SteerReasonCapability}})
+		}
+		run.noticeMu.Unlock()
+		if !took {
+			return nil, "" // finalized meanwhile; it refused this one with the rest
+		}
+	}
+}
+
+// closeTurns closes the queue and refuses what it holds, for reason. A no-op
+// once the task is final: its finalize refused the queue already.
+func (b *Bridge) closeTurns(run *taskRun, reason string) {
+	run.noticeMu.Lock()
+	defer run.noticeMu.Unlock()
+	run.mu.Lock()
+	done := run.state == stateDone
+	run.mu.Unlock()
+	if !done {
+		b.refuseQueued(context.Background(), run, reason)
+	}
+}
+
+// publishTurnAnswer ships a finished turn's answer as a turn artifact,
+// because a follow-up is about to run after it. Under noticeMu with the run
+// still running, so it lands before the final event finalize writes behind
+// noticeMu. false means the task is final: it already was, or the publish
+// failed and this finalized it failed. Either way the follow-up is still at
+// the head of the queue, and that finalize refused it task-ended.
+func (b *Bridge) publishTurnAnswer(run *taskRun, turn int, text string) bool {
+	run.noticeMu.Lock()
+	run.mu.Lock()
+	running := run.state == stateRunning
+	run.mu.Unlock()
+	if !running {
+		run.noticeMu.Unlock()
+		return false
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), finalizePublishTimeout)
+	err := b.publishTextArtifact(ctx, run, fmt.Sprintf("artifact-%s-turn-%d", run.origin.TaskID, turn), lib.ArtifactTurn, text)
+	cancel()
+	run.noticeMu.Unlock()
+	if err != nil {
+		b.cfg.Logger.Error("turn answer publish failed", "task", run.origin.TaskID, "turn", turn, "err", err)
+		b.finalize(run, lib.StateFailed, fmt.Sprintf("reason: bus-publish-failed at turn %d - %s", turn, tail(err.Error(), publishErrTailBytes)), nil)
+		return false
+	}
+	return true
+}
+
+// turnNote names the turn in a failed terminal's reason after the first.
+func turnNote(turn int) string {
+	if turn <= 1 {
+		return ""
+	}
+	return fmt.Sprintf("; turn: %d", turn)
+}
+
 // noticeStateLocked is the task's current state for a non-final notice:
 // submitted while queued, or on the API executor while waiting for its
 // session's turn; working otherwise. Caller holds run.mu.
@@ -1081,16 +1199,11 @@ func (b *Bridge) runTask(ctx context.Context, run *taskRun) {
 		return
 	}
 
-	argv := append(append([]string(nil), b.cfg.Command...), prompt)
-	cmd := exec.Command(argv[0], argv[1:]...)
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	var stdout strings.Builder
-	stderr := newTailBuffer(stderrTailBytes)
-	cmd.Stdout = &stdout
-	cmd.Stderr = stderr
 	// The activity door's side of this task: a signing key in the child's
-	// environment when the door is open, and the heartbeat either way.
+	// environment when the door is open, and the heartbeat either way. One
+	// for the task: every turn's child carries the same key.
 	act := newActivityState(b.activityLn != nil)
+	var env []string // nil: the child inherits, as with the door closed
 	if b.activityLn != nil {
 		scope, err := b.childManagedScope(taskID)
 		if err != nil {
@@ -1104,32 +1217,11 @@ func (b *Bridge) runTask(ctx context.Context, run *taskRun) {
 				b.cfg.Logger.Warn("child scope not removed", "task", run.origin.TaskID, "scope", scope, "err", err)
 			}
 		}()
-		cmd.Env = append(os.Environ(), act.childEnv(b.ActivityURL(), scope)...)
+		env = append(os.Environ(), act.childEnv(b.ActivityURL(), scope)...)
 	}
-
-	run.mu.Lock()
-	if run.state != stateRunning {
-		// Shutdown or cancel finalized first.
-		run.mu.Unlock()
-		return
-	}
-	run.act.Store(act)
-	if err := cmd.Start(); err != nil {
-		// No child, so no publisher to join and nothing to drain.
-		run.act.Store(nil)
-		run.mu.Unlock()
-		b.finalize(run, lib.StateFailed, fmt.Sprintf("reason: spawn-failed - %v", err), nil)
-		return
-	}
-	run.proc = cmd
-	go b.runActivity(run)
-	// Cancel may have raced the spawn: its kill saw no process, so re-check
-	// under the same lock its kill path takes.
-	if run.canceled.Load() {
-		b.killGroup(run, cmd.Process.Pid)
-	}
-	run.mu.Unlock()
-
+	// One deadline for the task, every turn included: the profile's
+	// activeDeadlineSeconds is the task's, not a turn's.
+	deadlineAt := time.Now().Add(b.cfg.TaskDeadline)
 	deadline := time.AfterFunc(b.cfg.TaskDeadline, func() {
 		run.deadlineHit.Store(true)
 		run.mu.Lock()
@@ -1138,23 +1230,142 @@ func (b *Bridge) runTask(ctx context.Context, run *taskRun) {
 		}
 		run.mu.Unlock()
 	})
-	err := cmd.Wait()
-	deadline.Stop()
+	defer deadline.Stop()
+
+	argv := append(append([]string(nil), b.cfg.Command...), prompt)
+	var steer *lib.Envelope // the follow-up this turn runs; nil on turn 1
+	for turn := 1; ; turn++ {
+		out, stderr, err, spawned := b.cliTurn(run, argv, env, act, steer, deadlineAt)
+		if !spawned {
+			return
+		}
+		if err != nil {
+			b.finalizeCLIError(run, err, out, stderr, turn)
+			return
+		}
+		// Resumable at all? Asked before a follow-up is looked at, so a
+		// refusal covers every queued one and this answer is the result.
+		sessionID := lastSessionID(stderr)
+		if _, rerr := resumeArgv(b.cfg.Command, "x", "x"); sessionID == "" || rerr != nil {
+			b.closeTurns(run, lib.SteerReasonNoResume)
+			b.finalize(run, lib.StateCompleted, "", &out)
+			return
+		}
+		next, prompt := b.runnableSteer(ctx, run)
+		if next == nil {
+			// A canceled task whose turn finished anyway won the race:
+			// completed wins, per the payload spec's cancel mapping.
+			b.finalize(run, lib.StateCompleted, "", &out)
+			return
+		}
+		if !b.publishTurnAnswer(run, turn, out) {
+			return
+		}
+		steer = next
+		argv, _ = resumeArgv(b.cfg.Command, sessionID, prompt)
+	}
+}
+
+// resumeArgv is a follow-up turn's command: the configured command with
+// "--resume <id>" before its trailing -q, then the prompt. A command that
+// does not end in -q has no place for the flag; the follow-ups are refused
+// no-resume rather than guessed at.
+func resumeArgv(command []string, sessionID, prompt string) ([]string, error) {
+	n := len(command)
+	if n == 0 || command[n-1] != "-q" {
+		return nil, fmt.Errorf("command %q does not end in -q", command)
+	}
+	argv := append([]string(nil), command[:n-1]...)
+	return append(argv, "--resume", sessionID, "-q", prompt), nil
+}
+
+// lastSessionID is the id on the last "session_id:" line of a child's
+// stderr, or "": the CLI prints its own line last, after anything a tool's
+// nested run echoed, and a label with nothing after it matches nothing, so
+// no id is reported rather than the next line's first word.
+func lastSessionID(stderr string) string {
+	all := sessionIDLine.FindAllStringSubmatch(stderr, -1)
+	if len(all) == 0 {
+		return ""
+	}
+	return all[len(all)-1][1]
+}
+
+// cliTurn runs one hermes child for run and waits for it. steer is the
+// follow-up the turn runs, nil on turn 1; it leaves the queue as the child
+// starts. spawned is false when the task is final: it already was, or this
+// finalized it - the spawn failed, or a follow-up's turn found the task
+// canceled, past deadlineAt or the bridge stopping (no follow-up child
+// starts once the deadline has fired, or it would outlive the kill). The
+// activity state is stored and its publisher started on turn 1 only; later
+// children reuse the same key in env.
+func (b *Bridge) cliTurn(run *taskRun, argv, env []string, act *activityState, steer *lib.Envelope, deadlineAt time.Time) (stdout, stderr string, err error, spawned bool) {
+	first := steer == nil
+	cmd := exec.Command(argv[0], argv[1:]...)
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	var out strings.Builder
+	errTail := newTailBuffer(stderrTailBytes)
+	cmd.Stdout, cmd.Stderr, cmd.Env = &out, errTail, env
+	if !first && !time.Now().Before(deadlineAt) {
+		run.deadlineHit.Store(true) // due, its timer just has not run yet
+	}
+	run.mu.Lock()
+	if run.state != stateRunning {
+		// Shutdown or cancel finalized first.
+		run.mu.Unlock()
+		return "", "", nil, false
+	}
+	if !first && (run.canceled.Load() || run.deadlineHit.Load() || b.closing.Load()) {
+		// Checked under the lock the deadline timer and the cancel kill take,
+		// after each has stored its flag: one that lands after this check
+		// finds run.proc set and kills the child.
+		run.mu.Unlock()
+		b.finalizeCLIError(run, nil, "", "", 0)
+		return "", "", nil, false
+	}
+	if first {
+		run.act.Store(act)
+	}
+	if serr := cmd.Start(); serr != nil {
+		if first {
+			run.act.Store(nil) // no child, so no publisher to join
+		}
+		run.mu.Unlock()
+		b.finalize(run, lib.StateFailed, fmt.Sprintf("reason: spawn-failed - %v", serr), nil)
+		return "", "", nil, false
+	}
+	if !first {
+		takeSteerLocked(run, steer) // its turn has started: no notice owed now
+	}
+	run.proc = cmd
+	if first {
+		go b.runActivity(run)
+		// Cancel may have raced the spawn: its kill saw no process, so
+		// re-check under the same lock its kill path takes.
+		if run.canceled.Load() {
+			b.killGroup(run, cmd.Process.Pid)
+		}
+	}
+	run.mu.Unlock()
+	werr := cmd.Wait()
 	// The group is gone; stop any armed grace-period SIGKILLs before the
-	// pgid can be recycled onto an innocent process.
+	// pgid can be recycled onto an innocent process, and forget the child,
+	// so a deadline between turns signals nothing.
 	run.mu.Lock()
 	for _, t := range run.killTimers {
 		t.Stop()
 	}
 	run.killTimers = nil
+	run.proc = nil
 	run.mu.Unlock()
+	return out.String(), errTail.String(), werr, true
+}
 
+// finalizeCLIError names why a child's turn ended without an answer: the
+// deadline, a cancel, shutdown, else the child's non-zero exit and its
+// evidence.
+func (b *Bridge) finalizeCLIError(run *taskRun, err error, stdout, stderr string, turn int) {
 	switch {
-	case err == nil:
-		// A canceled task that finished anyway won the race: completed wins,
-		// per the payload spec's cancel mapping.
-		out := stdout.String()
-		b.finalize(run, lib.StateCompleted, "", &out)
 	case run.deadlineHit.Load():
 		b.finalize(run, lib.StateFailed,
 			fmt.Sprintf("reason: deadline-exceeded - killed after %s", b.cfg.TaskDeadline), nil)
@@ -1164,7 +1375,7 @@ func (b *Bridge) runTask(ctx context.Context, run *taskRun) {
 		// Killed by shutdownTasks; name the real cause, not the exit code.
 		b.finalize(run, lib.StateFailed, shutdownReason, nil)
 	default:
-		b.finalize(run, lib.StateFailed, failureReason(err, stdout.String(), stderr.String()), nil)
+		b.finalize(run, lib.StateFailed, failureReason(err, stdout, stderr, turn), nil)
 	}
 }
 
@@ -1172,9 +1383,10 @@ func (b *Bridge) runTask(ctx context.Context, run *taskRun) {
 // non-zero: the reason token, the exit error, the session id if hermes
 // printed one, and a bounded tail of each stream. Exit 75 (EX_TEMPFAIL) is
 // the rate-limit exit and gets its own token; everything else is
-// hermes-exited-nonzero. Newlines are kept: the message is a text part, and
+// hermes-exited-nonzero. After turn 1 the reason names the turn that failed
+// (turnNote), straight after the session. Newlines are kept: the message is a text part, and
 // the tails are read by a person.
-func failureReason(err error, stdout, stderr string) string {
+func failureReason(err error, stdout, stderr string, turn int) string {
 	token := "hermes-exited-nonzero"
 	var exit *exec.ExitError
 	if errors.As(err, &exit) && exit.ExitCode() == rateLimitedExitCode {
@@ -1182,12 +1394,10 @@ func failureReason(err error, stdout, stderr string) string {
 	}
 	var sb strings.Builder
 	fmt.Fprintf(&sb, "reason: %s - %v", token, err)
-	// The last match: the CLI prints its own line last, after anything a
-	// tool's nested run echoed; a label with nothing after it matches
-	// nothing, so no id is reported rather than the next line's first word.
-	if all := sessionIDLine.FindAllStringSubmatch(stderr, -1); len(all) > 0 {
-		fmt.Fprintf(&sb, "; session: %s", all[len(all)-1][1])
+	if id := lastSessionID(stderr); id != "" {
+		fmt.Fprintf(&sb, "; session: %s", id)
 	}
+	sb.WriteString(turnNote(turn))
 	fmt.Fprintf(&sb, "; stdout tail: %s; stderr tail: %s", tail(stdout, stdoutTailBytes), stderr)
 	return sb.String()
 }
@@ -1377,18 +1587,22 @@ func (b *Bridge) publishStatusParts(ctx context.Context, run *taskRun, state lib
 	return b.c.Publish(ctx, lib.TaskEventsSubject(b.cfg.Profile, origin.TaskID), env)
 }
 
-// publishResult ships stdout as the result artifact, chunked per A2A rules
-// so one huge answer never trips the max-message-size gate.
+// publishResult ships stdout as the result artifact.
 func (b *Bridge) publishResult(ctx context.Context, run *taskRun, output string) error {
-	chunks := chunkString(output, b.cfg.ResultChunkSize)
-	artifactID := "artifact-" + run.origin.TaskID + "-result"
+	return b.publishTextArtifact(ctx, run, "artifact-"+run.origin.TaskID+"-result", lib.ArtifactResult, output)
+}
+
+// publishTextArtifact ships text as one artifact, chunked per A2A rules so
+// one huge answer never trips the max-message-size gate.
+func (b *Bridge) publishTextArtifact(ctx context.Context, run *taskRun, artifactID, name, text string) error {
+	chunks := chunkString(text, b.cfg.ResultChunkSize)
 	for i, chunk := range chunks {
 		payload, err := json.Marshal(lib.ArtifactUpdate{
 			TaskID:    run.origin.TaskID,
 			ContextID: run.origin.ContextID,
 			Artifact: lib.Artifact{
 				ArtifactID: artifactID,
-				Name:       lib.ArtifactResult,
+				Name:       name,
 				Parts:      []lib.Part{{Kind: "text", Text: chunk}},
 			},
 			Append:    i > 0,
