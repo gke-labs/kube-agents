@@ -406,8 +406,10 @@ Part 4: a coordinator waiting on its children must not hold their slot
 ``dispatch_once`` caps concurrency by counting ``status='running'`` cards, and a
 card waiting on the work it fanned out is still ``running``. So the coordinator
 holds a slot for its whole wait and its own children compete for what is left.
-At the shipped ``max_in_progress`` of 2 (``agents/chat/config.yaml``, matching
-``defaultKanbanMaxInProgress``) two waiters wedge the board outright.
+At the ``max_in_progress`` of 2 this install first shipped, two waiters wedged
+the board outright. The shipped default is now 6 (``agents/chat/config.yaml``,
+matching ``defaultKanbanMaxInProgress``), so it takes six waiters to wedge it,
+and any fewer still crowd out the children they wait for.
 
 Neither exit from ``running`` is open. ``kanban_complete`` is refused while
 recorded children are unsettled (``tools/kanban_children_settled.py``, #1010) and

@@ -321,9 +321,10 @@ WAITING_BUILD_MARKER = (
 )
 
 # Written by every successful apply and by nothing else, one set per file.
-# Checked before any edit, because three of the six anchors survive their own
-# replacement (edits 1, 2 and 4 keep the anchor and insert around it), so
-# counting alone waves a re-run straight through: replayed against the running
+# Checked before any edit, because five of the eleven anchors survive their
+# own replacement (edits 1, 2, 4 and 7, and the second of edit 10's two
+# anchors, keep the anchor and insert around it), so counting alone waves a
+# re-run straight through: replayed against the running
 # gateway's kanban_db.py the unguarded dependency applier exited 0 three times
 # and left three copies of the call and three trailer imports behind.
 DB_ALREADY_PATCHED = (
