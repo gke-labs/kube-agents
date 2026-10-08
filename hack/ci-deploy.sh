@@ -411,10 +411,10 @@ readonly A2A_CALLOUT_IMAGE_ENV_VAR="A2A_CALLOUT_IMAGE"
 readonly A2A_WORKER_IMAGE_ENV_VAR="A2A_WORKER_IMAGE"
 readonly A2A_VERIFIER_IMAGE_ENV_VAR="A2A_VERIFIER_IMAGE"
 readonly A2A_CONSOLE_IMAGE_ENV_VAR="A2A_CONSOLE_IMAGE"
-# The rendered bridge's three operator settings (a2aBridgeImageEnvVar,
-# a2aBridgeConcurrencyOperatorEnvVar and a2aBridgeExecutorOperatorEnvVar in
-# platformagent_a2a_bridge.go): its image, its BRIDGE_CONCURRENCY and its
-# BRIDGE_EXECUTOR. The operator reads them from its own environment, as it
+# The rendered bridge's operator settings (a2aBridgeImageEnvVar,
+# a2aBridgeConcurrencyOperatorEnvVar, a2aBridgeExecutorOperatorEnvVar and
+# a2aBridgeResourcesOperatorEnvVar in platformagent_a2a_bridge.go): its image,
+# its BRIDGE_CONCURRENCY, its BRIDGE_EXECUTOR and its resources. The operator reads them from its own environment, as it
 # does the overrides above; no CR field carries them.
 readonly A2A_BRIDGE_IMAGE_ENV_VAR="A2A_BRIDGE_IMAGE"
 readonly A2A_BRIDGE_CONCURRENCY_ENV_VAR="A2A_BRIDGE_CONCURRENCY"

@@ -464,7 +464,9 @@ func TestTheBridgeResourcesSettingOverridesTheDefaults(t *testing.T) {
 
 	for _, bad := range []string{"lots", `{"requests":{"memory":"1Gi"},"limits":{"memory":"512Mi"}}`, `{"cpu":"1"}`, `{"request":{"memory":"1Gi"}}`, `{}`,
 		`{"requests":{"cpu":"-1"}}`, `{"limits":{"foo":"1"}}`, `{"requests":{"example.com/gpu":"1"}}`,
-		`{"limits":{"memory":"0"}}`, `{"limits":{"memory":"1Gi"},"claims":[{"name":"x"}]}`} {
+		`{"limits":{"memory":"0"}}`, `{"limits":{"memory":"1Gi"},"claims":[{"name":"x"}]}`,
+		`{"requests":{"cpu":"10E"}}`,
+		`{"requests":{"cpu":"500m"}}{"limits":{"memory":"5Gi"}}`, `{"requests":{"cpu":"500m"}} trailing`} {
 		t.Run(bad, func(t *testing.T) {
 			t.Setenv(a2aBridgeResourcesOperatorEnvVar, bad)
 			got := containersNamed(bridgeTestPod(provisionedAgent()), a2aBridgeContainerName)[0].Resources

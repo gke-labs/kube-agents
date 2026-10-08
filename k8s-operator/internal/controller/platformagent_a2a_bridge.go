@@ -53,7 +53,8 @@ import (
 // The rendered container is the agent container with the bridge's own settings
 // on top, exactly as ci-deploy.sh built the declared one: the agent's env and
 // mounts (it runs Hermes against the agent's profile state on the agent's PVC),
-// its securityContext, resources, pull policy and envFrom; then the bus address,
+// its securityContext, pull policy and envFrom (not its resources, which are
+// the bridge's own: a2aRenderedBridgeResources); then the bus address,
 // the static `bridge` principal's password, the concurrency, the activity
 // secret and AGENT_SHARED_STATE_SETUP=skip. It never gets the bus token: the
 // pod's ServiceAccount is the agent's principal, and the bridge authenticates
@@ -388,6 +389,11 @@ func a2aRenderedBridgeResources() corev1.ResourceRequirements {
 	dec := json.NewDecoder(strings.NewReader(raw))
 	dec.DisallowUnknownFields()
 	err := dec.Decode(&r)
+	if err == nil && dec.More() {
+		// One value only: Decode stops after the first, and a second object
+		// or stray text after it would otherwise be dropped unread.
+		err = fmt.Errorf("it has content after the first JSON value")
+	}
 	if err == nil {
 		err = a2aBridgeResourcesRefusal(r)
 	}
@@ -406,7 +412,8 @@ func a2aRenderedBridgeResources() corev1.ResourceRequirements {
 // bridge container, or why it would leave the bridge unsized, or nil. The
 // rules are the credential proxy override's (ValidateCredentialProxyResources):
 // cpu, memory and ephemeral-storage only, no negative quantity, no zero limit,
-// no claims, and no request above its limit. A value the server refuses would
+// no quantity past what an int64 carries, no claims, and no request above its
+// limit. The proxy's Autopilot warnings and floor are its own and not carried. A value the server refuses would
 // fail every agent Deployment update, so it is caught here and the defaults
 // stand instead.
 func a2aBridgeResourcesRefusal(r corev1.ResourceRequirements) error {
@@ -426,6 +433,14 @@ func a2aBridgeResourcesRefusal(r corev1.ResourceRequirements) error {
 			}
 			if side == "limit" && q.IsZero() {
 				return fmt.Errorf("the %s limit is zero", name)
+			}
+			// Past int64 the scheduler and kubelet read a wrapped figure,
+			// zero or negative, so the quantity isn't what was written.
+			if slices.Contains(byteCountResources, name) && q.Cmp(maxByteCount) > 0 {
+				return fmt.Errorf("the %s %s %s is more bytes than an int64 holds", name, side, q.String())
+			}
+			if name == corev1.ResourceCPU && q.Cmp(*maxCPUMilli) > 0 {
+				return fmt.Errorf("the cpu %s %s is more millicores than an int64 holds", side, q.String())
 			}
 		}
 	}
