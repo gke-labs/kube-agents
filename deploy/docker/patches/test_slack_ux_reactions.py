@@ -583,6 +583,22 @@ class RuntimeTest(unittest.TestCase):
         _run(runtime.settle_delegated(adapter, self._sub("t_b"), "completed"))
         self.assertEqual(len(adapter.calls), 3)
 
+    def test_a_card_archived_by_hand_comes_off_its_ask_without_failing_it(self):
+        # No later event names an archived card, so it cannot hold the ask open.
+        adapter = self._turn("fix it", {}, _cards("t_a"))
+        _run(runtime.settle_delegated(adapter, self._sub("t_a"), "blocked"))
+        _run(runtime.settle_delegated(adapter, self._sub("t_a"), "archived"))
+        self.assertEqual(adapter.calls[-2:], [("double_vertical_bar", True), ("hammer_and_wrench", True)])
+        self.assertNotIn(("x", False), adapter.calls)
+        self.assertNotIn((CHANNEL, THREAD), runtime._deferred)
+
+    def test_a_fan_out_with_an_archived_card_settles_on_the_rest(self):
+        adapter = self._turn("fix it", {}, _cards("t_a", "t_b"))
+        _run(runtime.settle_delegated(adapter, self._sub("t_a"), "archived"))
+        self.assertEqual(adapter.calls, [("hammer_and_wrench", False)])
+        _run(runtime.settle_delegated(adapter, self._sub("t_b"), "completed"))
+        self.assertEqual(adapter.calls, [("hammer_and_wrench", False), ("hammer_and_wrench", True)])
+
     def test_a_stale_blocked_card_in_the_thread_does_not_hold_the_settle(self):
         adapter = self._turn("fix it", _cards("t_old"), _cards("t_old", "t_a"))
         _run(runtime.settle_delegated(adapter, self._sub("t_a"), "completed"))

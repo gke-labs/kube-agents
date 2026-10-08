@@ -147,6 +147,12 @@ UNRESOLVED_PREFIX = "slug:"
 #: settles nothing (``slack_presenter.settle_for_kanban_kind``); it takes ⏸️ off.
 RESUME_KIND = "unblocked"
 
+#: The notifier event kind for a card archived by hand. It settles nothing in
+#: ``slack_presenter``, but no later event names the card, so it takes the
+#: card off each ask waiting on it as a final event does: no failure, and no
+#: read for follow-ups.
+ARCHIVED_KIND = "archived"
+
 #: Statuses a card runs from, or waits to be picked up in. A card that paused
 #: during a turn but sits in one of these at its end was resumed within it.
 RESUMED_STATUSES = frozenset({"todo", "ready", "scheduled", "running"})
@@ -488,7 +494,8 @@ async def settle_delegated(adapter: Any, sub: dict, kind: str, board: str | None
     once the card is unblocked or finishes and no other card of the ask waits
     on the user. A final event takes the card off each ask's set; an ask whose
     set empties has its arrival reaction taken off, gets ❌ if any of its cards
-    gave up, and is forgotten. A card no ask is waiting on is left alone. ``board`` is the notifier's slug for the card's board, which
+    gave up, and is forgotten. ``archived`` counts as final, and not as a failure.
+    A card no ask is waiting on is left alone. ``board`` is the notifier's slug for the card's board, which
     with the card's id is how an ask knows it.
 
     Before a completion takes a card off, the thread is read once for open
@@ -522,7 +529,7 @@ async def settle_delegated(adapter: Any, sub: dict, kind: str, board: str | None
                 await _resume(adapter, key[0], ask, card)
         return
     settle = _presenter.settle_for_kanban_kind(kind)
-    if settle is None:
+    if settle is None and kind != ARCHIVED_KIND:
         return
     provisional = settle in _presenter.PROVISIONAL_SETTLES
     for turn in _started.values():

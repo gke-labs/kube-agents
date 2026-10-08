@@ -1273,11 +1273,11 @@ class FanOutOpenTest(unittest.IsolatedAsyncioTestCase):
         conn = sqlite3.connect(self.path)
         conn.executescript(
             "CREATE TABLE tasks (id TEXT, status TEXT);"
-            "CREATE TABLE task_events (task_id TEXT, kind TEXT, payload TEXT);"
+            "CREATE TABLE task_events (id INTEGER PRIMARY KEY, task_id TEXT, kind TEXT, payload TEXT);"
             "CREATE TABLE kanban_notify_subs (task_id TEXT, platform TEXT, chat_id TEXT, thread_id TEXT);"
             "INSERT INTO tasks VALUES ('t_parent', 'running'), ('t_e0c1', 'done'), ('t_e0c2', 'running');"
-            "INSERT INTO task_events VALUES ('t_e0c1', 'created', '{\"creator_task_id\": \"t_parent\"}');"
-            "INSERT INTO task_events VALUES ('t_e0c2', 'created', '{\"creator_task_id\": \"t_parent\"}');"
+            "INSERT INTO task_events (task_id, kind, payload) VALUES ('t_e0c1', 'created', '{\"creator_task_id\": \"t_parent\"}');"
+            "INSERT INTO task_events (task_id, kind, payload) VALUES ('t_e0c2', 'created', '{\"creator_task_id\": \"t_parent\"}');"
         )
         conn.execute(
             "INSERT INTO kanban_notify_subs VALUES ('t_parent', 'Slack', ?, ?)",
@@ -1309,6 +1309,20 @@ class FanOutOpenTest(unittest.IsolatedAsyncioTestCase):
                 self._set("UPDATE tasks SET status = ? WHERE id = 't_parent'", status)
                 self.assertFalse(await kanban_progress_lines._folds(SLACK_SUB, None))
 
+    async def test_a_creator_parked_by_a_give_up_does_not_and_one_asking_a_question_does(self):
+        # A give-up's worker never runs again to carry the children's reports up, so they post;
+        # a question resumes on the answer, so its children still fold.
+        stop = "INSERT INTO task_events (task_id, kind, payload) VALUES ('t_parent', ?, '{}')"
+        self._set("UPDATE tasks SET status = 'blocked' WHERE id = 't_parent'")
+        self._set(stop, "blocked")
+        self.assertTrue(await kanban_progress_lines._folds(SLACK_SUB, None))
+        self._set(stop, "gave_up")
+        self.assertFalse(await kanban_progress_lines._folds(SLACK_SUB, None))
+        # Revived by an unblock, then blocked on a question again.
+        self._set(stop, "unblocked")
+        self._set(stop, "blocked")
+        self.assertTrue(await kanban_progress_lines._folds(SLACK_SUB, None))
+
     async def test_a_creators_only_child_does_not(self):
         # A single-cluster delegation: the Cluster Agent's whole report is the answer's evidence.
         self._set("DELETE FROM task_events WHERE task_id = 't_e0c2'")
@@ -1316,7 +1330,7 @@ class FanOutOpenTest(unittest.IsolatedAsyncioTestCase):
 
     def _grandchild(self, creator="t_e0c1"):
         self._set(
-            "INSERT INTO task_events VALUES ('t_g1', 'created', ?)", f'{{"creator_task_id": "{creator}"}}',
+            "INSERT INTO task_events (task_id, kind, payload) VALUES ('t_g1', 'created', ?)", f'{{"creator_task_id": "{creator}"}}',
         )
         return {**SLACK_SUB, "task_id": "t_g1"}
 
@@ -1330,10 +1344,22 @@ class FanOutOpenTest(unittest.IsolatedAsyncioTestCase):
         self._set("DELETE FROM task_events WHERE task_id = 't_e0c2'")
         self.assertFalse(await kanban_progress_lines._folds(self._grandchild(), None))
 
+    async def test_a_card_whose_middle_card_gave_up_posts(self):
+        # The per-cluster card gave up before its Cluster Agent card finished: nothing will
+        # carry the Cluster Agent's report up, so it posts. A question still folds.
+        sub = self._grandchild()
+        stop = "INSERT INTO task_events (task_id, kind, payload) VALUES ('t_e0c1', ?, '{}')"
+        self._set("UPDATE tasks SET status = 'blocked' WHERE id = 't_e0c1'")
+        self._set(stop, "blocked")
+        self.assertTrue(await kanban_progress_lines._folds(sub, None))
+        self._set(stop, "gave_up")
+        self.assertFalse(await kanban_progress_lines._folds(sub, None))
+        self.assertTrue(await kanban_progress_lines._folds({**SLACK_SUB, "task_id": "t_e0c2"}, None))
+
     async def test_the_nearest_fan_out_decides(self):
         # t_e0c1 fanned out in turn and has finished: its own answer stands, whatever its creator is doing.
         sub = self._grandchild()
-        self._set("INSERT INTO task_events VALUES ('t_g2', 'created', '{\"creator_task_id\": \"t_e0c1\"}')")
+        self._set("INSERT INTO task_events (task_id, kind, payload) VALUES ('t_g2', 'created', '{\"creator_task_id\": \"t_e0c1\"}')")
         self.assertFalse(await kanban_progress_lines._folds(sub, None))
         self._set("INSERT INTO kanban_notify_subs VALUES ('t_e0c1', 'slack', ?, ?)", SLACK_SUB["chat_id"], SLACK_SUB["thread_id"])
         self._set("UPDATE tasks SET status = 'running' WHERE id = 't_e0c1'")

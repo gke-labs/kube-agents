@@ -160,6 +160,15 @@ FOLDED_KIND = "completed"
 #: malformed chain from walking the board.
 FOLD_ANCESTOR_DEPTH = 8
 
+#: A card parked by a give-up: still ``blocked``, with a ``gave_up`` as its
+#: latest stop, as ``slack_ux_reactions.OPEN_CARDS_SQL`` reads it. ``{card}``
+#: is the alias of its ``tasks`` row.
+GAVE_UP_SQL = (
+    "({card}.status = 'blocked' AND COALESCE((SELECT g.kind FROM task_events g "
+    "WHERE g.task_id = {card}.id AND g.kind IN ('blocked', 'unblocked', 'gave_up') "
+    "ORDER BY g.id DESC LIMIT 1), '') = 'gave_up')"
+)
+
 #: One row when the card's nearest ancestor that created more than one card is
 #: still open and subscribed to the thread: the creators Hermes stamps on each
 #: ``created`` event (``hermes_cli/kanban_db.py``), walked up from the card,
@@ -168,6 +177,9 @@ FOLD_ANCESTOR_DEPTH = 8
 #: The cards between are not required open: ``kanban_children_settled`` closes
 #: each only after the card beneath it, and usually before its report is
 #: delivered, so requiring them open would post the report again.
+#: A card parked by a give-up, the fan-out or one between, is not open: its
+#: worker will not run again to carry the report up, so the report posts. One
+#: blocked on a question still counts; it resumes on the answer.
 FANNED_OUT_ANCESTOR_SQL = (
     "WITH RECURSIVE up(id, depth) AS ("
     "SELECT json_extract(payload, '$.creator_task_id'), 1 FROM task_events "
@@ -175,14 +187,17 @@ FANNED_OUT_ANCESTOR_SQL = (
     "UNION ALL "
     "SELECT json_extract(e.payload, '$.creator_task_id'), up.depth + 1 FROM task_events e "
     "JOIN up ON e.task_id = up.id WHERE e.kind = 'created' AND up.depth < ?"
-    "), fan(id) AS ("
-    "SELECT up.id FROM up WHERE up.id IS NOT NULL AND (SELECT count(*) FROM task_events o "
+    "), fan(id, depth) AS ("
+    "SELECT up.id, up.depth FROM up WHERE up.id IS NOT NULL AND (SELECT count(*) FROM task_events o "
     "WHERE o.kind = 'created' AND json_extract(o.payload, '$.creator_task_id') = up.id) > 1 "
     "ORDER BY up.depth LIMIT 1"
     ") "
     "SELECT 1 FROM fan JOIN tasks t ON t.id = fan.id "
     "JOIN kanban_notify_subs s ON s.task_id = t.id "
     "WHERE t.status NOT IN ('done', 'archived') "
+    "AND NOT " + GAVE_UP_SQL.format(card="t") + " "
+    "AND NOT EXISTS (SELECT 1 FROM up b JOIN tasks m ON m.id = b.id "
+    "WHERE b.depth < fan.depth AND " + GAVE_UP_SQL.format(card="m") + ") "
     "AND lower(s.platform) = ? AND s.chat_id = ? AND COALESCE(s.thread_id, '') = ? "
     "LIMIT 1"
 )
