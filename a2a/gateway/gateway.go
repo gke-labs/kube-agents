@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"cmp"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -8,7 +9,9 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -1085,8 +1088,8 @@ func (g *Gateway) healActiveTask(ctx context.Context, rec *SessionRecord) {
 		// that ran the heal then routes against the wake as its active task.
 		switch {
 		case child && healedTask != nil:
-			result, reason := healedChildOutcome(healedTask)
-			if woken, why := g.wakeSession(ctx, rec, ref, healedTask.State, result, reason); !woken {
+			turns, result, reason := healedChildOutcome(healedTask)
+			if woken, why := g.wakeSession(ctx, rec, ref, healedTask.State, turns, result, reason); !woken {
 				g.observeChildEnd(rec, ref, healedTask.State, healedSource, reason, why)
 			}
 		case child:
@@ -1185,17 +1188,47 @@ func (g *Gateway) runFoldedDelegate(ctx context.Context, rec *SessionRecord, rs 
 	g.handleDelegateRequest(ctx, rec, lib.TaskEventsSubject(addressee, taskID), taskID, art.Parts)
 }
 
-// healedChildOutcome is a healed child's result and reason as relayTerminal
-// hands them to wakeSession: the result artifact's text (the stand-in line
-// for a completed task with none) and the terminal message.
-func healedChildOutcome(task *lib.Task) (result, reason string) {
+// healedChildOutcome is a healed child's turns, result and reason as
+// relayTerminal hands them to wakeSession: the turn answers in turn order,
+// the result artifact's text (the stand-in line for a completed task with
+// none) and the terminal message.
+func healedChildOutcome(task *lib.Task) (turns []string, result, reason string) {
 	if art := task.Artifact(lib.ArtifactResult); art != nil {
 		result = joinTextParts(art.Parts)
 	}
 	if result == "" && task.State == lib.StateCompleted {
 		result = completedNonTextResult
 	}
-	return result, finalMessageText(task)
+	return turnAnswers(task), result, finalMessageText(task)
+}
+
+// turnAnswers is the text of a replayed task's turn artifacts, ordered by
+// the N in their artifact-<taskId>-turn-<N> ids; one without a readable N
+// keeps its stream place after those with one.
+func turnAnswers(task *lib.Task) []string {
+	type turn struct {
+		n    int
+		text string
+	}
+	var turns []turn
+	for _, a := range task.Artifacts {
+		if a.Name != lib.ArtifactTurn {
+			continue
+		}
+		n := math.MaxInt
+		if i := strings.LastIndex(a.ArtifactID, "-turn-"); i >= 0 {
+			if v, err := strconv.Atoi(a.ArtifactID[i+len("-turn-"):]); err == nil {
+				n = v
+			}
+		}
+		turns = append(turns, turn{n, joinTextParts(a.Parts)})
+	}
+	slices.SortStableFunc(turns, func(a, b turn) int { return cmp.Compare(a.n, b.n) })
+	texts := make([]string, len(turns))
+	for i, t := range turns {
+		texts[i] = t.text
+	}
+	return texts
 }
 
 // probeConversation is the ConversationProbe the gateway offers a ProbeSink:

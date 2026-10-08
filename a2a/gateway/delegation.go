@@ -401,13 +401,22 @@ func capAsk(text string) string {
 // rune boundary and marked. The request is held to wakeAskCap before the
 // fence, so the whole text is bounded by the two caps and their fences. The
 // relay has already posted the whole result to the conversation.
-func wakeText(state lib.TaskState, childID, ask, result, reason string) string {
-	outcome, body := "completed", result
+//
+// turns are the answers of the child's earlier turns, in order, when it ran
+// follow-ups (G22): the first answers the delegated request, and the result
+// answers the last follow-up. A completed wake's body is then every answer in
+// order, each follow-up's under wakeFollowUpMarker, so the session reads the
+// answer to what it asked and not only the last. With none the body is the
+// result alone, as before.
+func wakeText(state lib.TaskState, childID, ask string, turns []string, result, reason string) string {
+	outcome, earlier, body := "completed", "", result
 	switch state {
 	case lib.StateFailed, lib.StateCanceled: // a canceled the gateway did not publish
 		outcome, body = "failed", reason
 	case lib.StateRejected:
 		outcome, body = "was rejected", reason
+	default:
+		earlier, body = wakeAnswers(turns, result)
 	}
 	var text string
 	if ask = strings.TrimSpace(ask); ask != "" {
@@ -420,21 +429,63 @@ func wakeText(state lib.TaskState, childID, ask, result, reason string) string {
 	} else {
 		text = fmt.Sprintf("The task you delegated to %s (task %s) %s.", targetPlatform, childID, outcome)
 	}
-	if body = strings.TrimSpace(body); body != "" {
-		text += "\n" + fenceWakeBody(body)
+	if earlier != "" {
+		// wakeAnswers trimmed each answer; last opens with its separator.
+		text += "\n" + fenceWakeBody(earlier, body)
+	} else if body = strings.TrimSpace(body); body != "" {
+		text += "\n" + fenceWakeBody("", body)
 	}
 	return text
 }
 
-// fenceWakeBody is the label, the fence, the capped body and the fence.
-func fenceWakeBody(body string) string {
-	body = breakBacktickRuns(body, wakeFenceMax-1)
+// wakeFollowUpMarker opens each follow-up's answer in a wake body that
+// carries a child's turns, numbered from the first follow-up.
+const wakeFollowUpMarker = "(follow-up %d answer)"
+
+// nonTextTurnAnswer stands in, in a wake, for a turn answer with no text, so
+// the answers after it keep their numbers.
+const nonTextTurnAnswer = "(a non-text answer; see the stream)"
+
+// wakeAnswers splits a completed child's answers for fenceWakeBody: earlier,
+// every turn answer but the result's, each follow-up's under its marker, and
+// last, the result under the last follow-up's marker. With no turns earlier
+// is empty and last is the result untouched.
+func wakeAnswers(turns []string, result string) (earlier, last string) {
+	if len(turns) == 0 {
+		return "", result
+	}
+	var b strings.Builder
+	for i, t := range turns {
+		if t = strings.TrimSpace(t); t == "" {
+			t = nonTextTurnAnswer
+		}
+		if i > 0 {
+			b.WriteString("\n\n" + fmt.Sprintf(wakeFollowUpMarker, i) + "\n")
+		}
+		b.WriteString(t)
+	}
+	return b.String(), "\n\n" + fmt.Sprintf(wakeFollowUpMarker, len(turns)) + "\n" + strings.TrimSpace(result)
+}
+
+// fenceWakeBody is the label, the fence, the capped body and the fence. The
+// body is earlier then last. Over the cap, earlier is cut first, so the
+// newest answer arrives whole when it fits the cap alone; when it does not,
+// the joined body is cut from its end as a lone result is. Either cut is
+// marked.
+func fenceWakeBody(earlier, last string) string {
+	earlier = breakBacktickRuns(earlier, wakeFenceMax-1)
+	last = breakBacktickRuns(last, wakeFenceMax-1)
+	body := earlier + last
 	fence := wakeFence(body)
 	// label \n fence \n body \n fence
 	budget := lib.DelegateTextCap - len(wakeResultLabel) - 2*len(fence) - 3
 	if len(body) > budget {
-		body = truncateRunes(body, budget-len("…")-len(wakeTruncatedNote)) + wakeTruncatedNote
-		fence = wakeFence(body) // a prefix has no longer run: it can only shrink
+		if keep := budget - len(last) - len("…") - len(wakeTruncatedNote); earlier != "" && keep >= 0 {
+			body = truncateRunes(earlier, keep) + wakeTruncatedNote + last
+		} else {
+			body = truncateRunes(body, budget-len("…")-len(wakeTruncatedNote)) + wakeTruncatedNote
+		}
+		fence = wakeFence(body) // a cut has no longer run: it can only shrink
 	}
 	return wakeResultLabel + "\n" + fence + "\n" + body + "\n" + fence
 }
@@ -586,7 +637,7 @@ func (g *Gateway) flushNotices(conversation string, rs *relayState) {
 // It reports whether the wake reached the bus, and when it did not, why, in
 // a phrase for the chain root's terminal reason (observeChildEnd). A stop
 // the requester asked for reports false and no reason.
-func (g *Gateway) wakeSession(ctx context.Context, rec *SessionRecord, child TaskRef, state lib.TaskState, result, reason string) (bool, string) {
+func (g *Gateway) wakeSession(ctx context.Context, rec *SessionRecord, child TaskRef, state lib.TaskState, turns []string, result, reason string) (bool, string) {
 	log := g.log.With("child", child.ID, "conversation", rec.Key, "state", string(state))
 	// The gateway published a cancel for the child: the human said stop,
 	// and whatever the executor answered with, waking the session would act
@@ -620,7 +671,7 @@ func (g *Gateway) wakeSession(ctx context.Context, rec *SessionRecord, child Tas
 
 	// The delegating turn's request, carried down a longer chain: the
 	// human's question, not an intermediate wake's gateway-authored text.
-	text := wakeText(state, child.ID, parent.Request, result, reason)
+	text := wakeText(state, child.ID, parent.Request, turns, result, reason)
 
 	if rec.Profile == "" {
 		rec.Profile = sessionProfile

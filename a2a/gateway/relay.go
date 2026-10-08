@@ -79,6 +79,9 @@ type relayState struct {
 	// parts not yet posted.
 	turn        []lib.Part
 	turnPending bool
+	// turnAnswers are the turn answers flushTurn posted, in order, for a
+	// child's wake: the first answers the delegated request, not the result.
+	turnAnswers []string
 }
 
 // relayFor is the task's render state, created on first use.
@@ -309,6 +312,11 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 	ref, _ := rec.TaskRefFor(taskID)
 	needResult := result == "" && s.Status.State == lib.StateCompleted &&
 		(!isConsoleConversation(rec.Key) || ref.Role == taskRoleChild)
+	// A child's turn answers feed its wake too. The render state holds them
+	// when this process relayed every event (local); otherwise a restart may
+	// have lost some, and the stream has them all.
+	turns := rs.turnAnswers
+	needTurns := ref.Role == taskRoleChild && s.Status.State == lib.StateCompleted && !rs.local
 	// A session turn that ends completed may have asked to delegate in an
 	// event this process never ran: the artifact's delivery was acked and
 	// lost to a crash before its batch, and only the terminal was
@@ -320,7 +328,7 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 	// the turn ends - otherwise the hand-off line would end the chain.
 	needDelegate := s.Status.State == lib.StateCompleted && !rs.local && !rs.sawDelegate && rec.mayHaveUnhandledDelegate(taskID)
 	evidence := delegateAbsent
-	if needResult || needDelegate {
+	if needResult || needTurns || needDelegate {
 		// Render state is cache; if a restart lost it, the stream still has
 		// everything. Replay against the addressee the task's own subjects
 		// carried - after a Delegate re-home, rec.Addressee is not it.
@@ -328,6 +336,9 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 		if task, err := g.replayForTerminal(ctx, addressee, taskID); err == nil {
 			if art := task.Artifact(lib.ArtifactResult); art != nil && needResult {
 				result = joinTextParts(art.Parts)
+			}
+			if needTurns {
+				turns = turnAnswers(task)
 			}
 			if task.Artifact(lib.ArtifactDelegate) != nil {
 				evidence = delegateSeen
@@ -491,7 +502,7 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 
 	// A delegated child's end wakes the session that asked.
 	if ref, ok := rec.TaskRefFor(taskID); ok && ref.Role == taskRoleChild {
-		if woken, why := g.wakeSession(ctx, rec, ref, s.Status.State, result, reason); !woken {
+		if woken, why := g.wakeSession(ctx, rec, ref, s.Status.State, turns, result, reason); !woken {
 			g.observeChildEnd(rec, ref, s.Status.State, source, reason, why)
 		}
 	}
@@ -546,6 +557,7 @@ func (g *Gateway) flushTurn(rec *SessionRecord, rs *relayState) {
 	text := joinTextParts(rs.turn)
 	rs.turn, rs.turnPending = nil, false
 	rs.turnsStarted++
+	rs.turnAnswers = append(rs.turnAnswers, text)
 	if text != "" && !isConsoleConversation(rec.Key) {
 		g.post(rec.Key, text)
 	}

@@ -391,7 +391,10 @@ message, carried down a longer chain, never an intermediate wake's gateway-autho
 result, capped at `lib.DelegateTextCap` and fenced under the label
 `Result from platform (not from the user):`, so the model reads the child's output as data, never
 as a new instruction from the user; a backtick run in either fenced body that could close its fence
-early is broken before fencing. The request is stored on the turn's history entry capped at 1 KiB
+early is broken before fencing. A child that ran follow-up turns wakes with every turn's answer in
+order, the first being the delegated request's, then the result, each follow-up's answer under
+`(follow-up N answer)`; over the cap the earlier answers are cut first, so the newest arrives whole
+unless it alone is over the cap. The request is stored on the turn's history entry capped at 1 KiB
 (each of up to fifty entries carries one, and 16 KiB each would put a full record near the KV's
 message ceiling). It is user content at rest under the same posture as the active task's ask copy,
 cleared with the requester copy at `A2A_ASK_TTL`. An entry with none, written before the field,
