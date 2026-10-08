@@ -154,6 +154,12 @@ KNOWN_UNREGISTERED = {
     # nightly is a tier decision nobody has made; this entry is the record
     # that the omission is known rather than accidental.
     "cluster-provision-kanban": "cluster-scoped provisioning task, tier decision pending",
+    # Has its fixture (its own stack) and its eval record (#2468: red on main,
+    # three greens on the fix), and belongs in the nightly; held out only
+    # because the nightly's infra-lock chain has no room for another stack
+    # case. The entry goes when #2467 makes room, #2552 sweeps what a killed
+    # run leaves behind, and the case joins hack/eval/nightly-cases.txt.
+    "networking-audit-subnet-range-exhaustion": "#2467: stack case held out of the nightly for its infra-lock budget",
 }
 
 # Cases whose fixture does not exist at all, waiting on the issue that plants
@@ -441,6 +447,78 @@ def known_domains() -> set[str]:
     return {d["slug"] for d in data.get("domains") or []}
 
 
+# `{cluster:<slot>}` in a report_contains pattern, as bench/kube_agents_bench/
+# verifiers.py's _CLUSTER_PLACEHOLDER reads it (this script does not import
+# the bench package, so the regex is restated here; the verifier owns it).
+CLUSTER_PLACEHOLDER = re.compile(r"\{cluster:([a-z0-9-]+)\}")
+CLUSTER_PLACEHOLDER_LOOSE = re.compile(r"\{\s*cluster\s*:", re.IGNORECASE)
+CLUSTER_PLACEHOLDER_OPENER = "{cluster:"
+CLUSTER_PLACEHOLDER_ANY = "any"
+# The two lists report_contains expands a placeholder in; every other list on
+# every check (its phrase lists included) is searched or matched as written.
+EXPANDING_PATTERN_KEYS = ("forbidden_patterns", "any_of_patterns")
+REPORT_CHECK_TYPE = "report_contains"
+
+
+def _catalog_slots() -> set[str]:
+    """Cluster slots the catalogue declares, by its `cluster_slots` block and
+    by the slot every role names."""
+    try:
+        data = json.loads(ROLE_CATALOG.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise CaseError(f"{ROLE_CATALOG}: could not be parsed as JSON: {exc}") from exc
+    slots = set((data.get("cluster_slots") or {}).keys())
+    for spec in (data.get("roles") or {}).values():
+        if isinstance(spec, dict) and isinstance(spec.get("cluster_slot"), str):
+            slots.add(spec["cluster_slot"])
+    return slots
+
+
+def _cluster_placeholders(node: Any, where: str, problems: list[str], slots: set[str], parked: bool) -> None:
+    """Every `{cluster:...}` in a check subtree names a catalogue slot or
+    `any`, is well-formed, and sits in one of the two report_contains pattern
+    lists: the verifier expands it from the runner's record there and nowhere
+    else, so in a phrase list, another check's pattern list or any other
+    string list it is literal text that never matches (an inert forbid) or
+    fails every run (a requirement). Every string on the node is read, in a
+    list or on its own (`tool_called`'s `agent` is a scalar run as a regex),
+    not a fixed set of keys, so a new field is covered when it lands; a
+    scalar that carries no placeholder (`type`, `scope`, a role) is left
+    alone."""
+    if not isinstance(node, dict):
+        return
+    for key, raw in node.items():
+        values = raw if isinstance(raw, list) else [raw]
+        expands = node.get("type") == REPORT_CHECK_TYPE and key in EXPANDING_PATTERN_KEYS
+        for pattern in values:
+            if not isinstance(pattern, str):
+                continue
+            if not expands:
+                if CLUSTER_PLACEHOLDER_LOOSE.search(pattern):
+                    problems.append(
+                        f"{where}: {key!r} on a {node.get('type')!r} check carries {CLUSTER_PLACEHOLDER_OPENER}...}}, "
+                        f"which only {REPORT_CHECK_TYPE} expands, and only in its "
+                        f"{' and '.join(repr(k) for k in EXPANDING_PATTERN_KEYS)}; elsewhere it is literal text "
+                        "that never matches"
+                    )
+                continue
+            if CLUSTER_PLACEHOLDER_LOOSE.search(CLUSTER_PLACEHOLDER.sub("", pattern)):
+                problems.append(
+                    f"{where}: {key!r} carries a malformed cluster placeholder; the form is "
+                    f"{{cluster:<slot>}} or {{cluster:{CLUSTER_PLACEHOLDER_ANY}}}, lowercase, no spaces"
+                )
+            if not parked:
+                for slot in CLUSTER_PLACEHOLDER.findall(pattern):
+                    if slot != CLUSTER_PLACEHOLDER_ANY and slot not in slots:
+                        problems.append(
+                            f"{where}: {key!r} names {{cluster:{slot}}}, a slot the fleet catalogue does not "
+                            f"declare ({', '.join(sorted(slots))}); the runner records no cluster for it, so "
+                            "the check would error on every run"
+                        )
+    for child in node.get("checks") or []:
+        _cluster_placeholders(child, where, problems, slots, parked)
+
+
 def _catalog_roles() -> dict[str, Any]:
     """Roles in bench/tf/fleet/fixtures.json, which owns the vocabulary."""
     try:
@@ -558,6 +636,18 @@ def bench_cases() -> dict[str, pathlib.Path]:
     return {p.parent.name: p for p in sorted(TASKS_DIR.glob("*/task.yaml"))}
 
 
+def _fixture_roles_shape(node: Any, where: str, problems: list[str]) -> None:
+    """`fixture_roles:` is a list of role slugs; a scalar would otherwise be
+    walked character by character and reported as a dozen unknown roles."""
+    if not isinstance(node, dict):
+        return
+    roles = node.get("fixture_roles")
+    if roles is not None and (not isinstance(roles, list) or not all(isinstance(r, str) for r in roles)):
+        problems.append(f"{where}: 'fixture_roles:' must be a list of role slugs")
+    for child in node.get("checks") or []:
+        _fixture_roles_shape(child, where, problems)
+
+
 def _check_assertions(node: Any, where: str, problems: list[str]) -> None:
     """Walk one check subtree, reporting nodes that cannot fail."""
     if not isinstance(node, dict):
@@ -619,15 +709,26 @@ def _check_types(node: Any, found: set[str]) -> None:
         _check_types(child, found)
 
 
-def _fixture_roles(node: Any, found: set[str]) -> None:
-    """Every `fixture_role:` named anywhere in one check subtree."""
+def _fixture_roles(node: Any, found: set[str], plural: set[str] | None = None) -> None:
+    """Every `fixture_role:` (and `fixture_roles:` entry) named anywhere in
+    one check subtree. `plural` collects the `fixture_roles:` entries on
+    their own as well: the runner resolves those to a slot, so they are held
+    to the catalogue's slot-bearing roles, not to the widened vocabulary the
+    singular and `fixtures:` accept."""
     if not isinstance(node, dict):
         return
     role = node.get("fixture_role")
     if isinstance(role, str):
         found.add(role)
+    roles = node.get("fixture_roles")
+    if isinstance(roles, list):
+        for role in roles:
+            if isinstance(role, str):
+                found.add(role)
+                if plural is not None:
+                    plural.add(role)
     for child in node.get("checks") or []:
-        _fixture_roles(child, found)
+        _fixture_roles(child, found, plural)
 
 
 def _entry_vocabulary(entry: dict[str, Any], where: str, problems: list[str]) -> None:
@@ -788,6 +889,7 @@ def validate_case(name: str, path: pathlib.Path, *, registered: set[str] | None)
         seen: set[str] = set()
         used_types: set[str] = set()
         used_roles: set[str] = set()
+        slot_roles: set[str] = set()
         for index, entry in enumerate(entries):
             if not isinstance(entry, dict):
                 problems.append(f"verification_spec[{index}]: entry is not a mapping")
@@ -806,8 +908,24 @@ def validate_case(name: str, path: pathlib.Path, *, registered: set[str] | None)
                 problems.append(f"{where}: entry has no 'check:' subtree")
             else:
                 _check_assertions(entry["check"], where, problems)
+                _fixture_roles_shape(entry["check"], where, problems)
                 _check_types(entry["check"], used_types)
-                _fixture_roles(entry["check"], used_roles)
+                _fixture_roles(entry["check"], used_roles, slot_roles)
+                _cluster_placeholders(entry["check"], where, problems, _catalog_slots(), name in FIXTURE_NOT_READY)
+
+        # `fixture_roles:` asks whether a role's slot was reached, which the
+        # runner records for catalogue roles only; an overlay role with no
+        # slot (`orphan-disks`) passes `fixtures:` and errors every run.
+        # A case parked in FIXTURE_NOT_READY names the role its issue plants,
+        # which is not in the catalogue yet by definition; it is off every
+        # roster, so the plural is held to the catalogue only once it runs.
+        if name not in FIXTURE_NOT_READY:
+            for role in sorted(slot_roles - set(_catalog_roles())):
+                problems.append(
+                    f"'fixture_roles:' names {role!r}, which has no cluster slot "
+                    "in the fleet catalogue; the runner records a slot for "
+                    "catalogue roles only, so the check would error on every run"
+                )
 
         # The two ways a case names a fixture have to be the same name. A
         # check's `fixture_role:` is what the runner resolves to a kubeconfig;
@@ -824,11 +942,18 @@ def validate_case(name: str, path: pathlib.Path, *, registered: set[str] | None)
                     "own 'fixtures:' list does not declare"
                 )
 
-        if fixtures is None and used_types & CLUSTER_READING_TYPES:
+        if fixtures is None and (used_types & CLUSTER_READING_TYPES or used_roles):
+            reading = sorted(used_types & CLUSTER_READING_TYPES)
+            # A report check naming roles opens no cluster; it asks whether
+            # the role's slot was reached. Say which the case does.
+            lead = (
+                "reads live cluster state (" + ", ".join(reading) + ")"
+                if reading
+                else "names seeded-fleet roles (" + ", ".join(sorted(used_roles)) + ")"
+            )
             problems.append(
-                "reads live cluster state ("
-                + ", ".join(sorted(used_types & CLUSTER_READING_TYPES))
-                + ") and declares no 'fixtures:'. List the seeded-fleet roles "
+                lead
+                + " and declares no 'fixtures:'. List the seeded-fleet roles "
                 "it depends on, so the fleet owner replacing a cluster can "
                 "grep for the cases that go quiet, or declare 'fixtures: []' "
                 "for a case that plants its own state"

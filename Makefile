@@ -702,10 +702,15 @@ iac-parity-check: ## Verify DNS egress rule parity across static NetworkPolicy c
 tfvar-check: ## Run lifecycle.sh's tfvar() against a real terraform console for every variable it reads and fail on any unnormalised shape (CI runs this).
 	@./hack/check-tfvar-console.sh
 
-# The version mock_provider needs; the install floor the modules declare is
-# lower, and a binary below this reads two green suites as a parse error, so
+# The version the suites need; the install floor the modules declare is
+# lower, and a binary below this reads a green suite as a parse error, so
 # it is named up front, the way test-python names a missing import.
-TERRAFORM_TEST_MIN_VERSION := 1.7.0
+#
+# mock_provider put this at 1.7. drift-pubsub's suite raised it to 1.11, for
+# `override_during = plan`: a postcondition on a computed attribute is
+# unreachable without it, since the attribute is unknown at plan time and an
+# apply run leaves state behind that the runs after it silently reuse.
+TERRAFORM_TEST_MIN_VERSION := 1.11.0
 
 # Every module and composition that carries a tests/ directory -- the set
 # the validate job initialises -- against mocked providers, so a plan-time
@@ -718,14 +723,14 @@ TERRAFORM_TEST_MIN_VERSION := 1.7.0
 # fails and the failures are named again at the end, for the reason
 # test-python gives: a red run that hides the next suite's result costs a CI
 # round trip to discover.
-terraform-test: ## Run each terraform/{modules,examples}/*/tests suite under `terraform test` with mocked providers; no cloud call (CI runs this; needs terraform >= 1.7 for mock_provider).
-	@command -v terraform >/dev/null 2>&1 || { echo "terraform-test: terraform is required (>= $(TERRAFORM_TEST_MIN_VERSION), for mock_provider); none on PATH" >&2; exit 1; }; \
+terraform-test: ## Run each terraform/{modules,examples}/*/tests suite under `terraform test` with mocked providers; no cloud call (CI runs this; needs terraform >= 1.11, see TERRAFORM_TEST_MIN_VERSION).
+	@command -v terraform >/dev/null 2>&1 || { echo "terraform-test: terraform is required (>= $(TERRAFORM_TEST_MIN_VERSION), for mock_provider and override_during); none on PATH" >&2; exit 1; }; \
 	version="$$(terraform version 2>/dev/null | sed -n '1s/^Terraform v//p')"; \
 	if [ -z "$$version" ]; then \
 	  echo "terraform-test: could not read a Terraform version from \`terraform version\` (first line is not 'Terraform vX.Y.Z'); is PATH's terraform a shim or another binary?" >&2; exit 1; \
 	fi; \
 	if [ "$$(printf '%s\n' "$(TERRAFORM_TEST_MIN_VERSION)" "$$version" | sort -V | head -n1)" != "$(TERRAFORM_TEST_MIN_VERSION)" ]; then \
-	  echo "terraform-test: terraform $$version is too old; mock_provider needs >= $(TERRAFORM_TEST_MIN_VERSION) (the install floor is lower, the suites are not)" >&2; exit 1; \
+	  echo "terraform-test: terraform $$version is too old; the suites need >= $(TERRAFORM_TEST_MIN_VERSION) for mock_provider and override_during (the install floor is lower, the suites are not)" >&2; exit 1; \
 	fi; \
 	failed=""; for dir in terraform/modules/*/ terraform/examples/*/; do \
 	  if [ -d "$$dir/tests" ]; then \

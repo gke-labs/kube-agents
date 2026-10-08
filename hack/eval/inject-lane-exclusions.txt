@@ -67,3 +67,27 @@ chat-question-typed-answer-fresh-session
 # #2039: the same for an answer to that question given by clicking its button
 # (answer_by: click).
 chat-question-click-answer-stays-silent
+
+# #2039: a nightly-only case that grades the chat front door's own turn: its
+# delegation ack and the kanban_create behind it. The inject door addresses `platform` directly, so
+# no front door takes the turn and the specialist's reply is graded against
+# a premise it never had. Returns to the lane when the door routes through
+# the chat profile.
+chat-voice-ack-names-target
+# #2039: the same for the front door's answer to a reset request.
+chat-reset-history-names-the-command
+# #2039: the same for the front door's choice to read the board for a board
+# question rather than file a card.
+chat-routing-board-read
+# #2039: the same for the front door routing a fleet question to the
+# platform specialist through kanban_create.
+chat-routing-fleet-question
+
+# #2039: grades the greeting the chat profile's bootstrap_onboarding plugin
+# gives on a new user's first chat turn, which the stack arms for the API
+# server path. The inject door addresses `platform`, which carries no
+# onboarding greeting, so the case grades a turn no greeter takes. Returns
+# to the lane when the door routes through the chat profile.
+first-install-hello-running
+# #2039: the same for the greeting once the first-look scan has finished.
+first-install-hello-done

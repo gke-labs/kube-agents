@@ -756,6 +756,40 @@ platformAgent:
     # Prefer telemetry.otlpEndpoint when you do have a collector; this is the
     # off switch, not the way to point at one.
     env: []
+    # The credential-proxy container's requests and limits, forwarded to the CR as
+    # spec.deployment.credentialProxy.resources when any key is set. Each key
+    # merges over the operator's defaults (500m CPU and 512Mi requests; 1 CPU,
+    # 1Gi memory and 2Gi ephemeral-storage limits), so
+    #
+    #   credentialProxy:
+    #     resources:
+    #       limits:
+    #         memory: 2Gi
+    #
+    # raises the memory limit and keeps the rest. The broker sizes how many
+    # commands it admits at once from that limit, so it is the setting to raise
+    # when the proxy is OOM-killed under a large fleet. The quota preflight
+    # counts the override. The operator refuses a memory limit below 672Mi (two
+    # commands at once), a request above its limit, a negative quantity, a zero
+    # limit, claims, and any resource name other than cpu, memory and
+    # ephemeral-storage, whether or not its webhook is enabled: the reconciler
+    # ignores the override, renders the proxy Deployment at its defaults and
+    # reports Degraded with reason InvalidCredentialProxyResources, the agent
+    # staying Ready, and the webhook, where enabled, refuses the override at
+    # apply. The chart fails the render on the same override first, and on any
+    # key under resources other than requests, limits and claims, which the CRD
+    # would prune silently. The operator warns when memory per CPU on the
+    # requests pair leaves the 1 to 6.5 GiB per vCPU band Autopilot admits
+    # unchanged, because Autopilot then raises the smaller request into the
+    # band, and for each of cpu and memory set under limits without the same
+    # key under requests, because Autopilot without bursting sets the limits
+    # equal to the requests: the limits.memory example above runs at the 512Mi
+    # request there unless requests.memory is set to match or bursting is on.
+    # On an existing install the chart fails the upgrade
+    # when the installed CRD predates the field; apply crds/ first (upgrade.sh
+    # does).
+    credentialProxy:
+      resources: {}
   # pre-delete hook that removes the PlatformAgent CR and waits for the operator
   # to clear its finalizer, before Helm deletes the operator itself. Without it,
   # `helm uninstall` and `terraform destroy` strand the CR and hang the namespace

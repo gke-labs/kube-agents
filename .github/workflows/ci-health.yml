@@ -184,6 +184,11 @@ env:
   # ~2 missed ticks).
   PR_GLOB: gs://kube-agents-prow/pr-logs/pull/gke-labs_kube-agents/*/pull-kube-agents-smoke-test/*
   NIGHTLY_PREFIX: gs://kube-agents-evals-nightly-logs/logs/ci-kube-agents-eval-nightly/
+  # The nightly's writers periodic, the second job of a night split across
+  # two, in the same bucket. Until it has run the prefix holds no objects,
+  # and until a writers build is on record any other listing failure but a
+  # hang is a note too: it has a watermark of its own.
+  NIGHTLY_WRITERS_PREFIX: gs://kube-agents-evals-nightly-logs/logs/ci-kube-agents-eval-nightly-writers/
   # The release-candidate lane's archive. A postsubmit, so logs/ rather than
   # pr-logs/. Bounded by --rc-limit rather than by the presubmit watermark.
   RC_GLOB: gs://kube-agents-prow/logs/post-kube-agents-eval-rc/*
@@ -318,6 +323,7 @@ jobs:
           timeout "$COLLECT_TIMEOUT_S" python3 scripts/eval_dashboard/collect.py \
             --pr-glob "$PR_GLOB" \
             --nightly-prefix "$NIGHTLY_PREFIX" \
+            --nightly-writers-prefix "$NIGHTLY_WRITERS_PREFIX" \
             --rc-glob "$RC_GLOB" \
             --merge-with work/prior-data.json \
             --since-days "$SINCE_DAYS" \

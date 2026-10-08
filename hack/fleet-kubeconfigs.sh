@@ -16,8 +16,13 @@
 # names `fixture_role: crashloop-workload`; bench/tf/fleet/fixtures.json says
 # which SLOT of the fleet that role lives on; this script finds the leased
 # project's seeded clusters and matches each cluster to its slot. The catalog is the only
-# place the role->slot mapping exists -- the verifier never re-derives it, it
-# just opens "${BENCH_FLEET_KUBECONFIG_DIR}/<role>.kubeconfig".
+# place the role->slot mapping exists -- the verifier never re-derives it. It
+# opens "${BENCH_FLEET_KUBECONFIG_DIR}/<role>.kubeconfig" for a check on the
+# role's objects; a check that only needs the role's cluster to have been
+# reached (`fixture_roles` on report_contains) reads the slot this script
+# records for the role in .fleet-context (`slot.<role>=<slot>`) and opens
+# "${BENCH_FLEET_KUBECONFIG_DIR}/clusters/<slot>.kubeconfig", which is written
+# for every reached cluster before any role on it is confirmed.
 #
 # Clusters are DISCOVERED BY LABEL, not composed from a name:
 #
@@ -511,9 +516,14 @@ write_fleet_kubeconfigs() {
   # So a check that cannot resolve its role can name the project it was looking
   # in. "role X is unavailable" is a bug report nobody can act on; "role X is
   # unavailable in kube-agents-evals-3" is one sentence from the answer. The
-  # per-slot `cluster.<slot>=` / `location.<slot>=` lines are appended below
-  # as each slot resolves.
+  # `slot.<role>=` line per catalog role comes next, from the rows already
+  # parsed and before the cluster listing and every per-slot credential fetch
+  # below, so the record is complete the moment the file exists: a run that stops partway leaves a file whose missing
+  # lines are the per-slot `cluster.<slot>=` / `location.<slot>=` records
+  # appended below as each slot resolves, never a missing slot record a
+  # reader would take for an older runner or an uncatalogued role.
   printf 'project=%s\n' "$project" >"${dir}/.fleet-context"
+  printf '%s\n' "$rows" | awk 'NF >= 2 { printf "slot.%s=%s\n", $1, $2 }' >>"${dir}/.fleet-context"
   chmod 600 "${dir}/${_FLEET_MARKER}" "${dir}/.fleet-context"
 
   local slot cluster location slot_config listing discovered errors named
