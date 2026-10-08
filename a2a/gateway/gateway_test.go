@@ -2751,3 +2751,156 @@ func TestAskTTLBoundsTheIncarnationSet(t *testing.T) {
 		t.Fatalf("incarnation set past the TTL: %+v unknown=%v", fresh.SessionAuthors, fresh.SessionAuthorsUnknown)
 	}
 }
+
+// publishSteerNotice publishes the executor's non-final notice for a follow-up.
+func publishSteerNotice(t *testing.T, r *rig, origin *lib.Envelope, addressee string, n lib.SteerNotice) {
+	t.Helper()
+	part, err := lib.SteerNoticePart(n)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload, _ := json.Marshal(lib.StatusUpdate{TaskID: origin.TaskID, ContextID: origin.ContextID,
+		Status: lib.TaskStatus{State: lib.StateWorking, Message: &lib.Message{Role: "agent", MessageID: "msg-n-" + n.EnvelopeID + "-" + n.Steer,
+			Parts: []lib.Part{{Kind: "text", Text: "follow-up " + n.Steer}, part}}}})
+	env, err := lib.NewStatusUpdateEnvelope(lib.Party{Session: addressee, AgentType: "test-executor"},
+		origin.TaskID, origin.ContextID, origin.CorrelationID, payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := r.bus.Publish(context.Background(), lib.TaskEventsSubject(addressee, origin.TaskID), env); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// publishTurnAnswer publishes one finished turn's answer, one chunk, last.
+func publishTurnAnswer(t *testing.T, r *rig, origin *lib.Envelope, addressee string, turn int, text string) {
+	t.Helper()
+	payload, _ := json.Marshal(lib.ArtifactUpdate{TaskID: origin.TaskID, ContextID: origin.ContextID,
+		Artifact: lib.Artifact{ArtifactID: fmt.Sprintf("artifact-%s-turn-%d", origin.TaskID, turn), Name: lib.ArtifactTurn,
+			Parts: []lib.Part{{Kind: "text", Text: text}}},
+		LastChunk: true})
+	env, err := lib.NewArtifactUpdateEnvelope(lib.Party{Session: addressee, AgentType: "test-executor"},
+		origin.TaskID, origin.ContextID, origin.CorrelationID, payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := r.bus.Publish(context.Background(), lib.TaskEventsSubject(addressee, origin.TaskID), env); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// lastInSubject is the newest follow-up envelope on platform's in subject for origin.
+func lastInSubject(t *testing.T, r *rig, origin *lib.Envelope) *lib.Envelope {
+	t.Helper()
+	var last *lib.Envelope
+	for _, e := range inSubjectEnvelopes(t, r.url, "platform") {
+		if e.TaskID == origin.TaskID && e.Kind == lib.KindMessage && e.EnvelopeID != origin.EnvelopeID {
+			last = e
+		}
+	}
+	if last == nil {
+		t.Fatal("no follow-up on the in subject")
+	}
+	return last
+}
+
+func TestRelayPostsEachTurnAnswerThenTheDeliverable(t *testing.T) {
+	r := startRig(t)
+	conv := "discord:g1/thread-turns"
+	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: "tu-1", Text: "check the fleet"}
+	origin := r.awaitTask(t, "platform")
+	exec := r.execFor(t, origin, "platform")
+	_ = exec.PublishStatus(context.Background(), lib.StateWorking, false)
+	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: "tu-2", Text: "only prod"}
+	waitFor(t, "ack", postedContaining(r, ackSteerQueued))
+	steer := lastInSubject(t, r, origin)
+	publishSteerNotice(t, r, origin, "platform", lib.SteerNotice{Steer: lib.SteerQueued, EnvelopeID: steer.EnvelopeID})
+	publishTurnAnswer(t, r, origin, "platform", 1, "fleet: 3 clusters green")
+	waitFor(t, "turn 1 posted before the terminal", postedContaining(r, "fleet: 3 clusters green"))
+	completeTask(t, exec, "prod: green")
+	waitFor(t, "deliverable", postedContaining(r, "prod: green"))
+	if a, b := postIndex(r, "fleet: 3 clusters green"), postIndex(r, "prod: green"); a < 0 || a > b {
+		t.Fatalf("turn 1 at %d, deliverable at %d", a, b)
+	}
+	for _, p := range r.adapter.postTexts() {
+		if strings.Contains(p, "ℹ️") || strings.Contains(p, "⚠️") {
+			t.Fatalf("a queued notice or a shortfall line posted: %q", p)
+		}
+	}
+}
+
+func TestRelayRendersARefusedFollowUp(t *testing.T) {
+	r := startRig(t)
+	conv := "discord:g1/thread-refused"
+	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: "rf-1", Text: "check the fleet"}
+	origin := r.awaitTask(t, "platform")
+	_ = r.execFor(t, origin, "platform").PublishStatus(context.Background(), lib.StateWorking, false)
+	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: "rf-2", Text: "seventeenth"}
+	waitFor(t, "ack", postedContaining(r, ackSteerQueued))
+	steer := lastInSubject(t, r, origin)
+	publishSteerNotice(t, r, origin, "platform", lib.SteerNotice{Steer: lib.SteerRefused, EnvelopeID: steer.EnvelopeID, Reason: lib.SteerReasonQueueFull})
+	waitFor(t, "refusal", postedContaining(r, fmt.Sprintf(noticeSteerNotTaken, steerRefusalWhy[lib.SteerReasonQueueFull])))
+}
+
+// The follow-up reached the stream after the executor's terminal, so
+// nothing answered it; the room is told at the terminal.
+func TestRelayReportsAFollowUpNoExecutorAnswered(t *testing.T) {
+	r := startRig(t)
+	conv := "discord:g1/thread-missed"
+	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: "ms-1", Text: "check the fleet"}
+	origin := r.awaitTask(t, "platform")
+	exec := r.execFor(t, origin, "platform")
+	_ = exec.PublishStatus(context.Background(), lib.StateWorking, false)
+	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: "ms-2", Text: "only prod"}
+	waitFor(t, "ack", postedContaining(r, ackSteerQueued))
+	completeTask(t, exec, "fleet: green")
+	waitFor(t, "missed line", postedContaining(r, noticeSteerMissed))
+	if a, b := postIndex(r, "fleet: green"), postIndex(r, noticeSteerMissed); a < 0 || a > b {
+		t.Fatalf("deliverable at %d, missed line at %d: the missed line must follow the deliverable", a, b)
+	}
+}
+
+// Queued follow-ups that never started (refused task-ended at a cancel, or
+// lost to a crash with only a failed terminal) are one line at the
+// terminal, not one per follow-up.
+func TestRelayReportsQueuedFollowUpsThatNeverRan(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		refuseAtEnd bool
+		state       lib.TaskState
+	}{
+		{"refused task-ended at a cancel", true, lib.StateCanceled},
+		{"a crash: no refusals, a failed terminal", false, lib.StateFailed},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := startRig(t)
+			conv := "discord:g1/thread-unrun-" + string(tc.state)
+			r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: "ur-1", Text: "check the fleet"}
+			origin := r.awaitTask(t, "platform")
+			_ = r.execFor(t, origin, "platform").PublishStatus(context.Background(), lib.StateWorking, false)
+			var ids []string
+			for i, text := range []string{"one", "two"} {
+				r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: fmt.Sprintf("ur-s%d", i), Text: text}
+				waitFor(t, "steer published", func() bool { return len(inSubjectEnvelopes(t, r.url, "platform")) == i+2 })
+				ids = append(ids, lastInSubject(t, r, origin).EnvelopeID)
+			}
+			for _, id := range ids {
+				publishSteerNotice(t, r, origin, "platform", lib.SteerNotice{Steer: lib.SteerQueued, EnvelopeID: id})
+			}
+			if tc.refuseAtEnd {
+				for _, id := range ids {
+					publishSteerNotice(t, r, origin, "platform", lib.SteerNotice{Steer: lib.SteerRefused, EnvelopeID: id, Reason: lib.SteerReasonTaskEnded})
+				}
+			}
+			publishFinal(t, r, origin, "platform", tc.state, "reason: test")
+			want := fmt.Sprintf(noticeSteersUnrun, 2)
+			waitFor(t, "unrun line", postedContaining(r, want))
+			if n := strings.Count(strings.Join(r.adapter.postTexts(), "\n"), "did not run"); n != 1 {
+				t.Fatalf("%d did-not-run lines, want 1", n)
+			}
+			if strings.Contains(strings.Join(r.adapter.postTexts(), "\n"), "not taken") {
+				t.Fatal("a task-ended refusal posted its own line")
+			}
+		})
+	}
+}

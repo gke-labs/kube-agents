@@ -58,6 +58,20 @@ type relayState struct {
 	// task, under g.mu, for the relay to weigh against the executor's steer
 	// notices at the terminal.
 	steersSent int
+	// The executor's word on those follow-ups (G22): answered, the envelope
+	// ids it sent a steer notice for; queued, those it queued and has not
+	// refused since, except task-ended; turnsStarted, the turn answers
+	// posted, each the start of one queued follow-up's turn. At the
+	// terminal, steersSent - answered never reached a live run and queued -
+	// turnsStarted never ran (postSteerShortfall). Cache like the rest: a
+	// gateway restart forgets them, and the terminal then says nothing.
+	answered     map[string]bool
+	queued       map[string]bool
+	turnsStarted int
+	// turn is the turn answer being assembled; turnPending, that it has
+	// parts not yet posted.
+	turn        []lib.Part
+	turnPending bool
 }
 
 // relayFor is the task's render state, created on first use.
@@ -212,10 +226,13 @@ func (g *Gateway) applyStatus(ctx context.Context, rec *SessionRecord, rs *relay
 		g.post(rec.Key, "❓ "+ask)
 		g.updateRollingLine(rec, taskID, rs)
 	default:
-		// A non-final status message (eg W7's honest "Hermes cannot absorb
-		// mid-run input" answer to a steer) is worth the room seeing.
+		// A steer notice is the executor's word on one follow-up and is
+		// rendered by what it says (applySteerNotice), not as its text part.
+		// Any other non-final status message is worth the room seeing.
 		if s.Status.Message != nil {
-			if note := joinTextParts(s.Status.Message.Parts); note != "" {
+			if n, ok := lib.SteerNoticeOf(s.Status.Message.Parts); ok {
+				g.applySteerNotice(rec, rs, n)
+			} else if note := joinTextParts(s.Status.Message.Parts); note != "" {
 				g.post(rec.Key, "ℹ️ "+note)
 			}
 		}
@@ -242,6 +259,19 @@ func (g *Gateway) applyArtifact(ctx context.Context, rec *SessionRecord, rs *rel
 		} else {
 			rs.result = append([]lib.Part(nil), a.Artifact.Parts...)
 		}
+	case lib.ArtifactTurn:
+		// An earlier turn's answer: posted as it completes, never the
+		// deliverable, which stays the result. A non-append chunk starts
+		// the next turn's answer, so one whose last chunk never came is
+		// posted then.
+		if !a.Append {
+			g.flushTurn(rec, rs)
+		}
+		rs.turn = append(rs.turn, a.Artifact.Parts...)
+		rs.turnPending = true
+		if a.LastChunk {
+			g.flushTurn(rec, rs)
+		}
 	case lib.ArtifactDelegate:
 		// A request to the gateway, never rendered to chat.
 		rs.sawDelegate = true
@@ -260,6 +290,8 @@ const completedNonTextResult = "(completed with a non-text result; see the strea
 // the durable record; the index only exists to route live events. source is
 // whose word the terminal is, read off the subject it arrived on.
 func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *relayState, taskID string, s lib.StatusUpdate, source TerminalSource) {
+	// A turn answer still assembling posts before the deliverable it led to.
+	g.flushTurn(rec, rs)
 	result := joinTextParts(rs.result)
 	// The console never posts the deliverable (see the StateCompleted arm), so
 	// replaying the stream to recover it would buy nothing. Checking here and
@@ -367,6 +399,7 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 			g.post(rec.Key, "🚫 the executor rejected the task")
 		}
 	}
+	g.postSteerShortfall(rec, rs)
 	g.flushNotices(rec.Key, rs)
 
 	if active := rec.ActiveTask; active != nil && active.TaskID == taskID {
@@ -454,6 +487,65 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 		if woken, why := g.wakeSession(ctx, rec, ref, s.Status.State, result, reason); !woken {
 			g.observeChildEnd(rec, ref, s.Status.State, source, reason, why)
 		}
+	}
+}
+
+// applySteerNotice reads the executor's word on one follow-up. Queued posts
+// nothing: steerTask already acknowledged it. Refused posts why, except
+// task-ended, which the terminal reports in one line with any lost ones.
+func (g *Gateway) applySteerNotice(rec *SessionRecord, rs *relayState, n lib.SteerNotice) {
+	if rs.answered == nil {
+		rs.answered, rs.queued = make(map[string]bool), make(map[string]bool)
+	}
+	rs.answered[n.EnvelopeID] = true
+	switch {
+	case n.Steer == lib.SteerQueued:
+		rs.queued[n.EnvelopeID] = true
+	case n.Reason == lib.SteerReasonTaskEnded:
+		// Stays in queued (it was): counted at the terminal.
+	default:
+		delete(rs.queued, n.EnvelopeID)
+		g.post(rec.Key, steerNotTakenNotice(n.Reason))
+	}
+}
+
+// steerNotTakenNotice words a refusal for the room. A token this gateway
+// does not know is quoted, bounded, rather than dropped.
+func steerNotTakenNotice(reason string) string {
+	why, ok := steerRefusalWhy[reason]
+	if !ok {
+		why = "the executor said " + truncateRunes(reason, 64)
+	}
+	return fmt.Sprintf(noticeSteerNotTaken, why)
+}
+
+// flushTurn posts the assembled turn answer, once. Console conversations
+// read answers off TASKS (relayTerminal says why) and get no post.
+func (g *Gateway) flushTurn(rec *SessionRecord, rs *relayState) {
+	if !rs.turnPending {
+		return
+	}
+	text := joinTextParts(rs.turn)
+	rs.turn, rs.turnPending = nil, false
+	rs.turnsStarted++
+	if text != "" && !isConsoleConversation(rec.Key) {
+		g.post(rec.Key, text)
+	}
+}
+
+// postSteerShortfall tells the room, after the deliverable, about follow-ups
+// it was told would be taken and were not: ones the executor never answered
+// (they reached the stream after its terminal), and queued ones whose turn
+// never started (refused task-ended, or lost with the executor).
+func (g *Gateway) postSteerShortfall(rec *SessionRecord, rs *relayState) {
+	g.mu.Lock()
+	sent := rs.steersSent
+	g.mu.Unlock()
+	if sent-len(rs.answered) > 0 {
+		g.post(rec.Key, noticeSteerMissed)
+	}
+	if unrun := len(rs.queued) - rs.turnsStarted; unrun > 0 {
+		g.post(rec.Key, fmt.Sprintf(noticeSteersUnrun, unrun))
 	}
 }
 

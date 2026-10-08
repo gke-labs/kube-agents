@@ -1264,3 +1264,27 @@ func TestASettledChainProbesAsItsLastTask(t *testing.T) {
 		}
 	})
 }
+
+// The door's one deliverable is the last turn's answer; earlier turns are
+// history posts.
+func TestTurnAnswersPostAndOnlyTheLastIsDelivered(t *testing.T) {
+	r, _, obs := startObservedRig(t, nil)
+	conv := "discord:g1/obs-turns"
+	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: "ot-1", Text: "check the fleet"}
+	origin := r.awaitTask(t, "platform")
+	exec := r.execFor(t, origin, "platform")
+	_ = exec.PublishStatus(context.Background(), lib.StateWorking, false)
+	publishTurnAnswer(t, r, origin, "platform", 1, "first answer")
+	waitFor(t, "turn posted", postedContaining(r, "first answer"))
+	completeTask(t, exec, "last answer")
+	waitFor(t, "terminal", func() bool { _, ok := obs.terminalFor(origin.TaskID); return ok })
+	var delivered []string
+	for _, e := range obs.events() {
+		if e.kind == "delivered" {
+			delivered = append(delivered, e.text)
+		}
+	}
+	if len(delivered) != 1 || delivered[0] != "last answer" {
+		t.Fatalf("deliverables %q, want the last turn's answer once", delivered)
+	}
+}

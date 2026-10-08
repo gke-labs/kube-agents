@@ -2089,6 +2089,24 @@ const (
 	ackSteerSession = "✏️ steering sent — the worker picks it up at its next turn boundary if the task is still running"
 )
 
+// The relay's posts about follow-ups on the fixed route, from the
+// executor's steer notices and from what the relay counted at the terminal.
+const (
+	noticeSteerNotTaken = "⚠️ not taken: %s. Send it again after the answer."
+	noticeSteersUnrun   = "⚠️ %d queued follow-up(s) did not run before the task ended; send them again if they still matter"
+	noticeSteerMissed   = "⚠️ a follow-up arrived as the task finished and was not taken; send it again"
+)
+
+// steerRefusalWhy words an executor's refusal reason token for the room.
+// task-ended is absent on purpose: those are counted into noticeSteersUnrun.
+var steerRefusalWhy = map[string]string{
+	lib.SteerReasonQueueFull:  "too many follow-ups are already waiting",
+	lib.SteerReasonTaskEnding: "the task was already finishing",
+	lib.SteerReasonNoText:     "it had no text",
+	lib.SteerReasonCapability: "it was not authorized",
+	lib.SteerReasonNoResume:   "the executor could not continue this conversation's session",
+}
+
 // steerTask forwards a message that arrived while the task runs as a
 // follow-up on the same taskId — injected, absorbed at the executor's next
 // turn boundary (decided 8/24). It reuses the task's correlationId; the
