@@ -155,7 +155,9 @@ finishing again (the gateway log in a run's artifacts says whether the
 dispatcher stalled); for fixture drift, once the daily reconcile has re-applied
 the stack — a red on a case that depends on the drifted fixture, from a run
 that leased one of those projects, is the fixture's, not the change's; for pool
-drift, once the pool owner has run the repair the issue carries.
+drift, once the pool owner has run the repair the issue carries. Who the
+fleet owner, the pool owner and the person who owns the gate are is recorded
+in [`docs/ownership.md`](ownership.md).
 
 A pull request that will not merge into `main` dies in the same seconds with
 no tasks and is not a setup death either (`merge_conflict` in SCHEMA.md,
@@ -372,8 +374,7 @@ Three Prow jobs keep the pool in shape from outside any run, and until this
 rule existed they reported nowhere but TestGrid: `ci-kube-agents-pull-sweep`
 (the GitOps stale-pull-request sweep, every ten minutes) and the seeded-fleet
 reconcile, as a postsubmit on every merge that changes the stack and as a
-daily pass over every project (the hourly and weekly entries it replaces stay
-in the list, with no stale window, until the Prow change retires them). `scripts/eval_dashboard/periodics.py` lists them in `WATCHED`, one entry
+daily pass over every project. `scripts/eval_dashboard/periodics.py` lists them in `WATCHED`, one entry
 per job with its label, its stale window, the report it writes, and the words
 its messages are built from, so adding the next periodic is one entry. The 15-minute tick's `Fetch the watched periodics'
 latest builds` step reads each job's `latest-build.txt` from

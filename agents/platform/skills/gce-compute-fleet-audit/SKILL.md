@@ -1,32 +1,35 @@
 ---
 name: gce-compute-fleet-audit
-description: Audits standalone GCE virtual machines, Managed Instance Groups (MIGs), serial console boot failures, and guest OS daemon health.
+description: Audits standalone GCE virtual machines, Managed Instance Groups (MIGs), serial console boot failures, sole-tenant node group headroom, and orphaned disk snapshots.
 ---
 
 # Task
 
-Audit standalone GCE virtual machines, Managed Instance Groups (MIGs), serial console boot failures, and guest OS daemon health, emitting findings for the `fleet-audit` reporting harness.
+Audit standalone GCE virtual machines, Managed Instance Groups (MIGs), serial console boot failures, sole-tenant node group headroom, and orphaned disk snapshots, emitting findings for the `fleet-audit` reporting harness.
 
 # Workflow
 
-## 1. Execute Compute Inspection
+## 1. Open the Run, Then Execute Compute Inspection
 
-Run the profile-relative compute fleet runner to sweep target projects:
+Open the run first with the `fleet-audit` harness's `start` (SOP §0). `finish` refuses a manifest that finished before `start` did, as an earlier run's. Then run the profile-relative compute fleet collector to sweep target projects. It writes a collector manifest to stdout:
 
 ```bash
-./skills/gce-compute-fleet-audit/scripts/compute_fleet_audit.py --output /opt/data/scratch/compute_raw.json
+python3 ./skills/gce-compute-fleet-audit/scripts/compute_fleet_audit.py > /opt/data/scratch/manifest_gce-compute-fleet-audit.json
 ```
 
 ## 2. Evaluate Findings Against SOP Checks
 
-Filter and categorize collected metrics according to `governance/gce_compute_fleet_sop.md`:
+Read the manifest and follow `governance/gce_compute_fleet_sop.md` §2, which owns the copy rules for `commands`, `checks_not_applicable`, `checks_unevaluated`, `limitations` and `candidates`:
 
-- `gce-startup-script-status`: Flag serial console boot failures and startup script errors.
-- `mig-autoscaler-flapping`: Flag continuous autohealing recreation cycles.
-- `ops-agent-guest-health`: Flag instances with unmonitored or dead Ops Agent daemons.
-- `sole-tenant-headroom`: Flag sole-tenant node groups approaching capacity limits.
-- `orphaned-snapshots`: Flag Persistent Disk snapshots older than 90 days.
+All four roster checks are collector-verified; none is yours to hand-run.
+
+- `gce-startup-script-status`: serial console boot failures and startup script errors.
+- `mig-convergence-stalled`: MIGs creating and deleting at once (a resize loop).
+- `sole-tenant-headroom`: node group reservations at capacity with no failover host spare.
+- `orphaned-snapshots`: Persistent Disk snapshots of deleted disks older than 90 days.
+
+`ops-agent-guest-health` is not on the roster — SOP §2.3 says why, and `finish` rejects a `checks_run` or a `finding.check` naming it.
 
 ## 3. Hand Findings to Fleet Audit
 
-Emit findings using the `fleet-audit` harness lifecycle (`start` ... `finish`).
+Finish the run you opened in step 1 with the `fleet-audit` harness's `finish`, passing `--manifest-file` as the SOP's §5 directs, so it cross-checks `checks_run` against what the collector ran. This stream's `finish` requires that flag, or `--no-collector-manifest` with a reason.

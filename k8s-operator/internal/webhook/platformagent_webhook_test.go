@@ -1023,8 +1023,14 @@ func TestGitIntegrationAdmission(t *testing.T) {
 			// check has to hold too: a CR applied before the enum narrowed, or one
 			// reaching the webhook by another path, must not reconcile.
 			name: "a provider with no registered rules",
-			spec: agentv1alpha1.IntegrationSpec{Forges: []agentv1alpha1.ForgeSpec{{Name: "gl", Provider: "gitlab"}}},
+			spec: agentv1alpha1.IntegrationSpec{Forges: []agentv1alpha1.ForgeSpec{{Name: "bb", Provider: "bitbucket"}}},
 			path: "spec.integration.forges[0].provider",
+		},
+		{
+			// The broker would have no token to call GitLab with.
+			name: "a gitlab forge with no credentialsRef",
+			spec: agentv1alpha1.IntegrationSpec{Forges: []agentv1alpha1.ForgeSpec{{Name: "gl", Provider: "gitlab"}}},
+			path: "spec.integration.forges[0].credentialsRef",
 		},
 		{
 			name: "a namespace outside GitHub's grammar",
@@ -1071,7 +1077,7 @@ func TestGitIntegrationCredentialsRefOnGitHubWarns(t *testing.T) {
 			Integration: &agentv1alpha1.PlatformAgentIntegrationSpec{IntegrationSpec: agentv1alpha1.IntegrationSpec{
 				Forges: []agentv1alpha1.ForgeSpec{{
 					Name: "github", Namespace: "gke-labs",
-					CredentialsRef: &corev1.LocalObjectReference{Name: "forge-token"},
+					CredentialsRef: &agentv1alpha1.ForgeCredentialsRef{Name: "forge-token"},
 				}},
 			}},
 		},

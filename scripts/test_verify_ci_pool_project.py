@@ -3175,13 +3175,15 @@ class LedgerCredentialMatchesCiEvalPrTest(unittest.TestCase):
         mint = re.search(r"^mint_ledger_token\(\) \{.*?^\}", self.script, re.S | re.M)
         self.assertIsNotNone(mint, "could not find mint_ledger_token in hack/ci-eval-pr.sh")
         body = mint.group(0)
-        failure = re.search(r'^    if \[ "\$\{rc\}".*?^    fi', body, re.S | re.M)
+        failure = re.search(r'^    if \[ "\$\{rc\}" -ne .*?^    fi', body, re.S | re.M)
         self.assertIsNotNone(failure, "could not find the branch that gives up on the mint")
         self.assertNotIn("BENCH_GITHUB_TOKEN", failure.group(0))
         # Non-zero rather than `exit`: the unit call site holds two locks by the
         # time it mints, and exiting there would strand them for lock_acquire's
-        # full timeout. Each caller unwinds its own scope instead.
+        # full timeout. Each caller unwinds its own scope instead. Which
+        # non-zero says whether the last attempt was transient.
         self.assertIn("return 1", failure.group(0))
+        self.assertIn('return "${LEDGER_MINT_RETRYABLE}"', failure.group(0))
         self.assertIsNone(re.search(r"\bexit\b", body))
         # And the token is assigned once, below the retry loop rather than on
         # any path through it. tests/test_ci_eval_ledger_mint.py executes what
@@ -3209,15 +3211,20 @@ class LedgerCredentialMatchesCiEvalPrTest(unittest.TestCase):
     def test_a_unit_that_cannot_mint_releases_what_it_holds(self):
         # Returning without releasing would park every sibling for lock_acquire's
         # timeout and grade their repetitions MISSING.
+        # The branch hands skip_unit everything taken before the mint, and
+        # skip_unit releases it; tests/test_ci_eval_ledger_mint.py runs the
+        # pair.
         branch = re.search(
-            r"^  if ! mint_ledger_token .*?^  fi", self._unit(), re.S | re.M
+            r'^  if \[ "\$\{mint_rc\}" -ne 0 \]; then.*?^  fi', self._unit(), re.S | re.M
         )
         self.assertIsNotNone(branch, "could not find the unit's mint-failure branch")
-        # The task lock, the infra lock and every stream lock the case holds:
-        # everything taken before the mint.
-        self.assertEqual(2, branch.group(0).count("lock_release"))
-        self.assertIn('release_streams "${streams}"', branch.group(0))
+        self.assertIn('skip_unit "${task}" "${name}" "${rep}" "${streams}" "${has_stack}"', branch.group(0))
         self.assertIn("return 0", branch.group(0))
+        skip = re.search(r"^skip_unit\(\) \{.*?^\}", self.script, re.S | re.M)
+        self.assertIsNotNone(skip, "could not find skip_unit in hack/ci-eval-pr.sh")
+        # The task lock, the infra lock and every stream lock the case holds.
+        self.assertEqual(2, skip.group(0).count("lock_release"))
+        self.assertIn('release_streams "${streams}"', skip.group(0))
 
     def test_every_bench_invocation_is_preceded_by_a_mint(self):
         # #1057 rewrote the serial repetition loop into a fan-out of background
@@ -3937,7 +3944,7 @@ class FleetReconcilerRolesMatchGrantersTest(unittest.TestCase):
     """FLEET_RECONCILER_ROLES and its member must equal the provisioning loop and the runbook's repair block.
 
     Same silent drift as the runners': a role dropped from the script leaves a
-    project the verifier passes and the weekly reconcile fails in.
+    project the verifier passes and the daily reconcile fails in.
     """
 
     _VAR = "FLEET_RECONCILER_SA"

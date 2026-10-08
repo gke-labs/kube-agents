@@ -59,7 +59,8 @@ fallback, an opened pull request and a ``needs_input`` question post as
 messages of their own (``gateway/slack_ux_moments.py``), and any later event
 takes the buttons off the card's open question; :func:`silent_event` carries
 ``archived`` and ``unblocked``, which upstream never posts, to the plan and
-the question. See :func:`deliver`.
+the question, and opens a card's row when its first noteless heartbeat says
+it started. See :func:`deliver`.
 
 Three properties of the surrounding code make this nearly free:
 
@@ -91,6 +92,7 @@ lost message would become a stuttering one.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 import unicodedata
@@ -142,6 +144,64 @@ ROLLING_KINDS = ("heartbeat", "status")
 NEEDS_YOU_KIND = "blocked"
 UNBLOCKED_KIND = "unblocked"
 PR_REPORT_KIND = "completed"
+
+#: With ``KAGE_SLACK_UX`` on, a card beneath a fan-out folds its report into
+#: its row in the thread's plan rather than posting it, when its nearest
+#: ancestor that created more than one card is still open and subscribed to the
+#: same thread: that card's own completion is the answer, and
+#: ``kanban_children_settled`` holds it until its children settle. That covers
+#: a card a fanned-out card filed in turn, such as a Platform Agent card per
+#: cluster handing its cluster to the Cluster Agent. A chain with no fan-out
+#: above it, a single-cluster delegation, posts its whole report as before.
+#: Only a completion folds; a failure or a question posts.
+FOLDED_KIND = "completed"
+
+#: How many creators up the fold looks for a fan-out. Delegation runs three
+#: deep (Planning Agent, Platform Agent, Cluster Agent); the bound only stops a
+#: malformed chain from walking the board.
+FOLD_ANCESTOR_DEPTH = 8
+
+#: A card parked by a give-up: still ``blocked``, with a ``gave_up`` as its
+#: latest stop, as ``slack_ux_reactions.OPEN_CARDS_SQL`` reads it. ``{card}``
+#: is the alias of its ``tasks`` row.
+GAVE_UP_SQL = (
+    "({card}.status = 'blocked' AND COALESCE((SELECT g.kind FROM task_events g "
+    "WHERE g.task_id = {card}.id AND g.kind IN ('blocked', 'unblocked', 'gave_up') "
+    "ORDER BY g.id DESC LIMIT 1), '') = 'gave_up')"
+)
+
+#: One row when the card's nearest ancestor that created more than one card is
+#: still open and subscribed to the thread: the creators Hermes stamps on each
+#: ``created`` event (``hermes_cli/kanban_db.py``), walked up from the card,
+#: and the open statuses ``kanban_children_settled`` waits on. Parameters: the
+#: card, the depth bound, then the subscription's platform, chat and thread.
+#: The cards between are not required open: ``kanban_children_settled`` closes
+#: each only after the card beneath it, and usually before its report is
+#: delivered, so requiring them open would post the report again.
+#: A card parked by a give-up, the fan-out or one between, is not open: its
+#: worker will not run again to carry the report up, so the report posts. One
+#: blocked on a question still counts; it resumes on the answer.
+FANNED_OUT_ANCESTOR_SQL = (
+    "WITH RECURSIVE up(id, depth) AS ("
+    "SELECT json_extract(payload, '$.creator_task_id'), 1 FROM task_events "
+    "WHERE task_id = ? AND kind = 'created' "
+    "UNION ALL "
+    "SELECT json_extract(e.payload, '$.creator_task_id'), up.depth + 1 FROM task_events e "
+    "JOIN up ON e.task_id = up.id WHERE e.kind = 'created' AND up.depth < ?"
+    "), fan(id, depth) AS ("
+    "SELECT up.id, up.depth FROM up WHERE up.id IS NOT NULL AND (SELECT count(*) FROM task_events o "
+    "WHERE o.kind = 'created' AND json_extract(o.payload, '$.creator_task_id') = up.id) > 1 "
+    "ORDER BY up.depth LIMIT 1"
+    ") "
+    "SELECT 1 FROM fan JOIN tasks t ON t.id = fan.id "
+    "JOIN kanban_notify_subs s ON s.task_id = t.id "
+    "WHERE t.status NOT IN ('done', 'archived') "
+    "AND NOT " + GAVE_UP_SQL.format(card="t") + " "
+    "AND NOT EXISTS (SELECT 1 FROM up b JOIN tasks m ON m.id = b.id "
+    "WHERE b.depth < fan.depth AND " + GAVE_UP_SQL.format(card="m") + ") "
+    "AND lower(s.platform) = ? AND s.chat_id = ? AND COALESCE(s.thread_id, '') = ? "
+    "LIMIT 1"
+)
 
 #: Leading marker on the rolling message. ``IN_PROGRESS`` while the card runs;
 #: on a terminal event the message is re-rendered with one of the other two so
@@ -201,6 +261,14 @@ MARKER_MAX = 2
 #: them before any send. With ``KAGE_SLACK_UX`` on they still move a Slack
 #: card's row in the thread's plan; see :func:`silent_event`.
 SILENT_PLAN_KINDS = ("archived", "unblocked")
+
+#: The kind whose noteless events ``_fmt_heartbeat`` renders as ``None``, so
+#: ``_send_pings`` skips them too. With ``KAGE_SLACK_UX`` on, one opens a Slack
+#: card's row in the thread's plan, running, when the card has none yet: the
+#: worker's first automatic heartbeat, written on its first activity, is the
+#: earliest event of a run the notifier claims, since ``claimed`` and
+#: ``spawned`` are not among its kinds. See :func:`silent_event`.
+STARTED_KIND = "heartbeat"
 
 #: Kinds that settle a plan row past an earlier ``unblocked`` in the same
 #: batch: every kind ``slack_status.TASK_STATUS_BY_KIND`` maps to a status
@@ -488,11 +556,41 @@ async def _plan_row(
         return False
 
 
-async def _settle_plan_row(plan: Any, adapter: Any, sub: dict, kind: str, result: str = "") -> None:
+async def _settle_plan_row(
+    plan: Any, adapter: Any, sub: dict, kind: str, result: str = "", title: str = "",
+) -> bool:
+    """Settle the card's plan row; True when the plan now shows it complete."""
     try:
-        await plan.settle_row(adapter, sub, kind, result)
+        return bool(await plan.settle_row(adapter, sub, kind, result, title))
     except Exception as exc:  # noqa: BLE001 — cosmetic, like the rolling settle
         logger.debug("kanban progress: settling the plan row for %s failed: %s", sub.get("task_id"), exc)
+        return False
+
+
+def _fan_out_open(sub: dict, board: Optional[str]) -> bool:
+    from hermes_cli import kanban_db_connect
+
+    conn = kanban_db_connect.connect(board=board)
+    try:
+        params = (
+            sub["task_id"], FOLD_ANCESTOR_DEPTH,
+            str(sub.get("platform") or "").lower(), sub["chat_id"], sub.get("thread_id") or "",
+        )
+        return conn.execute(FANNED_OUT_ANCESTOR_SQL, params).fetchone() is not None
+    finally:
+        conn.close()
+
+
+async def _folds(sub: dict, board: Optional[str]) -> bool:
+    """Whether the report of a card beneath a fan-out folds into its plan row: see :data:`FOLDED_KIND`.
+
+    A read that fails posts the report, as it did before the plan.
+    """
+    try:
+        return await asyncio.to_thread(_fan_out_open, sub, board)
+    except Exception as exc:  # noqa: BLE001 — fail towards posting the report
+        logger.debug("kanban progress: reading the fan-out above %s failed: %s", sub.get("task_id"), exc)
+        return False
 
 
 def _slack_moments(quiet: Any) -> Any:
@@ -585,6 +683,41 @@ def _overtaken(notification: Any, ev: Any) -> bool:
     )
 
 
+def _noted_later(notification: Any, ev: Any) -> bool:
+    """Whether a heartbeat carrying a note follows this event in its batch."""
+    event_id = int(getattr(ev, "id", 0) or 0)
+    batch = getattr(notification, "d", None)
+    events = batch.get("events") if isinstance(batch, dict) else None
+    return any(
+        int(getattr(later, "id", 0) or 0) > event_id
+        and str(getattr(later, "kind", "") or "") == STARTED_KIND
+        and progress_note(getattr(later, "payload", None))
+        for later in events or ()
+    )
+
+
+async def _started(notification: Any, ev: Any) -> None:
+    """Open a Slack card's plan row, running, on a noteless heartbeat: see :data:`STARTED_KIND`.
+
+    Not for one replayed or overtaken in its batch (:func:`_overtaken`): the
+    later event opens the row settled. Nor for one a note follows in its
+    batch, which opens the row itself, in one post rather than a post and an
+    edit. Only with ``KAGE_SLACK_UX`` on for a Slack card, and never raises: it
+    runs inside the send loop.
+    """
+    try:
+        if _overtaken(notification, ev) or _noted_later(notification, ev):
+            return
+        sub = notification.sub
+        adapter = getattr(notification, "adapter", None)
+        plan = _slack_plan(_slack_quiet(sub))
+        if adapter is None or plan is None:
+            return
+        await plan.start_row(adapter, sub, str(getattr(notification, "title", "") or ""))
+    except Exception as exc:  # noqa: BLE001 — never fail a delivery on the plan
+        logger.debug("kanban progress: opening the plan row on a start failed: %s", exc)
+
+
 async def silent_event(notification: Any, ev: Any) -> None:
     """Move a Slack card's plan row on a kind upstream keeps silent.
 
@@ -592,16 +725,22 @@ async def silent_event(notification: Any, ev: Any) -> None:
     ``None``, before it skips the event. :func:`deliver` never sees these, so
     without this a card archived by hand would hold its row running, and the
     thread's Working…, and an unblocked card would stay waiting on you, with
-    its question's buttons still live, until its next note. Only
+    its question's buttons still live, until its next note, and its ask would
+    keep its ⏸️ (``gateway/slack_ux_reactions.py``). Only
     :data:`SILENT_PLAN_KINDS`, never one replayed or overtaken
     (:func:`_overtaken`), only with ``KAGE_SLACK_UX`` on for a Slack card,
     and never raises: it runs inside the send loop. An ``unblocked`` overtaken
     in its batch, not replayed, still settles the question it answered, which
     the later event would settle as unanswered; one posted for that later
-    event is newer than the unblock and left alone.
+    event is newer than the unblock and left alone. A noteless heartbeat
+    goes to :func:`_started` instead, and touches neither the question nor
+    the ask's reaction.
     """
     try:
         kind = str(getattr(ev, "kind", "") or "")
+        if kind == STARTED_KIND:
+            await _started(notification, ev)
+            return
         if kind not in SILENT_PLAN_KINDS:
             return
         overtaken = _overtaken(notification, ev)
@@ -620,6 +759,8 @@ async def silent_event(notification: Any, ev: Any) -> None:
     if plan is not None and not overtaken:
         await _settle_plan_row(plan, adapter, sub, kind)
     await _settle_question(moments, adapter, sub, kind, int(getattr(ev, "id", 0) or 0))
+    # An unblocked card no longer waits on the user, so its ask loses its pause.
+    await _settle_reaction(adapter, sub, kind, getattr(notification, "board_slug", None))
 
 
 def _explained_by_wake(quiet: Any, sub: dict, kind: str) -> bool:
@@ -717,7 +858,10 @@ async def deliver(
     rolling message of its own, with the rolling message as the fallback when
     the plan cannot be posted; ``title`` is the card's, which the row leads with
     in a plan of several or falls back to. See
-    ``gateway/slack_ux_status.py``. Every line it posts, holds or edits keeps
+    ``gateway/slack_ux_status.py``. A card beneath a fan-out still open on the
+    same thread completes into its row and posts nothing, returning
+    ``None``, once the plan shows that row complete (:data:`FOLDED_KIND`).
+    Every line it posts, holds or edits keeps
     the ``@assignee`` and drops the board tag and ``Kanban <id>``
     (:func:`slack_line`). A card blocked on ``needs_input``
     posts its question instead of the blocked line, once however often the
@@ -737,8 +881,10 @@ async def deliver(
 
     if kind not in ROLLING_KINDS:
         plan = _slack_plan(quiet)
+        shown = False
         if plan is not None:
-            await _settle_plan_row(plan, adapter, sub, kind, result_line(kind, getattr(ev, "payload", None)))
+            result = result_line(kind, getattr(ev, "payload", None))
+            shown = await _settle_plan_row(plan, adapter, sub, kind, result, title)
         if entry and entry["message_id"] and entry["lines"]:
             settled = entry["lines"][-1:] if quiet else entry["lines"]
             try:
@@ -761,6 +907,11 @@ async def deliver(
         await _settle_question(moments, adapter, sub, kind, event_id)
         if kind == NEEDS_YOU_KIND and moments is not None and await _needs_you(moments, adapter, sub, ev):
             await _settle_reaction(adapter, sub, kind, board)
+            return None
+        if kind == FOLDED_KIND and shown and await _folds(sub, board):
+            # The row says it; the creator's completion carries the answer.
+            await _settle_reaction(adapter, sub, kind, board)
+            await _pr_opened(moments, adapter, sub, message, None)
             return None
         if _explained_by_wake(quiet, sub, kind) and _hold(
             quiet, watcher, sub, kind, event_id, message, metadata,

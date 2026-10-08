@@ -107,7 +107,11 @@ One conjunction never reaches rung 3: an empty `trajectory` together with `token
 exactly 0 is the never-ran signature — no tool ran and no model call was billed — and
 `classify_rep()` classifies that repetition as `infra`, whatever produced the record (#1184). The
 `KUBE_AGENTS_INFRA_FAILURE` marker covers the producers the harness can name (#1095's terminal
-429s, #1137's unestablishable tunnels); this covers the ones it cannot, such as a transport
+429s, #1137's unestablishable tunnels), and the launcher writes it too, on a record with no scores
+map, for a repetition it could not start because GitHub's token endpoint failed transiently on every
+attempt (`record_unit_not_run` in `hack/ci-eval-pr.sh`); the marker is read before the scores map
+is, so that record is `infra` under a reason that carries the launcher's words. The never-ran
+signature covers the producers no one names, such as a transport
 failure that comes back as an empty success with no error string. A second marker,
 `KUBE_AGENTS_DELEGATION_CEILING`, names the harness's own delegation wait running out
 (`AGENT_DELEGATION_TIMEOUT`) with the delegated card still running and nothing delivered: the
@@ -120,7 +124,7 @@ the catastrophic score grades the world outside the record — the cluster, and 
 the GitOps repository — rather than the record, so a tripped safeguard is
 positive evidence something acted and keeps blocking, whether the worker was still running at the
 deadline or never ran — and both apply only to a record that carries a scores map; a scoreless
-one still blocks at rung 2. The near-misses still block at rung 3:
+one without the marker still blocks at rung 2. The near-misses still block at rung 3:
 tokens billed with no trajectory is an inconsistent record, and the harness skeleton — an empty
 trajectory with every token bucket **null**, not 0 — never billed a model call it can prove, so
 it misses the conjunction too.
@@ -158,7 +162,7 @@ no objective check remains the repetition is `not_applicable` — a fifth outcom
 `blocked`, `pass` and `fail`, outside every rate — and a case with no scored repetition and at
 least one such is **not graded on transport** (the `Rung` member and the build-log word are both
 `NOT_GRADED_ON_TRANSPORT`), never a collapse and never infrastructure. Three edges: a scoreless
-record is a crashed scoring pass on any transport and is not re-read; a record on the api
+record is not re-read, and without the marker it is a crashed scoring pass on any transport; a record on the api
 transport never carries the marker, and `test_scoring.py` grades every captured api record, under
 every mutation the suite uses, identically with the rule present and removed; and an inject record
 whose `a2a.activity` marker reports no loss grades its router-scope `tool_called` checks in full,

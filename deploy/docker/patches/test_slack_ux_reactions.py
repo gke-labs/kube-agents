@@ -295,15 +295,20 @@ class FlagOffIdentityTest(unittest.TestCase):
         ):
             _run(adapter.on_processing_start(event))
             _run(adapter.on_processing_complete(event, patched["ProcessingOutcome"].SUCCESS))
-            self.assertEqual(adapter.calls, [])
             adapter._reacting_message_ids = {"m"}
             _run(adapter.on_processing_start(event))
             _run(adapter.on_processing_complete(event, patched["ProcessingOutcome"].FAILURE))
-        self.assertEqual(adapter.calls, [(CHANNEL, ASK, "x", TEAM, False)])
+        kind = (CHANNEL, ASK, "hammer_and_wrench", TEAM)
+        self.assertEqual(
+            adapter.calls,
+            [(*kind, False), (*kind, True), (*kind, False), (CHANNEL, ASK, "x", TEAM, False), (*kind, True)],
+        )
 
 
 class DisplayTest(unittest.TestCase):
-    """What an ask shows as shipped: nothing on arrival or success, ❌ on failure."""
+    """What an ask shows: its kind until it is answered, ⏸️ while it waits on you, ❌ if it failed."""
+
+    SUB = {"platform": "slack", "chat_id": CHANNEL, "thread_id": THREAD, "task_id": "t_a"}
 
     def setUp(self):
         importlib.reload(runtime)
@@ -320,64 +325,134 @@ class DisplayTest(unittest.TestCase):
             patched.start()
             self.addCleanup(patched.stop)
 
-    def _turn(self, text, after, outcome):
-        adapter = _Stub()
+    def _turn(self, text, after, outcome, adapter=None):
+        adapter = adapter or _Stub()
         self.boards[:] = [{}, after]
         _run(runtime.on_processing_start(adapter, _event(text)))
         _run(runtime.on_processing_complete(adapter, _event(text), SimpleNamespace(value=outcome)))
         return adapter
 
-    def test_a_direct_answer_shows_nothing_on_arrival_or_success_and_x_on_failure(self):
-        for text in ("is seeded-a healthy?", "fix it", "board", "incident: payments-api down"):
+    def test_the_arrival_reaction_is_the_asks_kind(self):
+        for text, kind in (
+            ("why is checkout restarting?", "mag"),
+            ("which clusters have pods restarting right now?", "globe_with_meridians"),
+            ("what version is seeded-b on?", "arrow_up"),
+            ("what did seeded-a cost last month?", "moneybag"),
+            ("run a security audit on seeded-b", "shield"),
+            ("fix it", "hammer_and_wrench"),
+            ("board", "clipboard"),
+            ("payments-api is down", "rotating_light"),
+            ("thanks", "eyes"),
+        ):
             with self.subTest(text=text):
-                self.assertEqual(self._turn(text, {}, "success").calls, [])
-                self.assertEqual(self._turn(text, {}, "failure").calls, [("x", False)])
-                self.assertEqual(self._turn(text, {}, "cancelled").calls, [])
+                adapter = _Stub()
+                self.boards[:] = [{}]
+                _run(runtime.on_processing_start(adapter, _event(text)))
+                self.assertEqual(adapter.calls, [(kind, False)])
 
-    def test_a_delegated_answer_shows_x_only_when_its_work_fails(self):
+    def test_a_direct_answer_takes_the_arrival_off_and_leaves_x_only_on_failure(self):
+        for text, kind in (("is seeded-a healthy?", "eyes"), ("fix it", "hammer_and_wrench")):
+            with self.subTest(text=text):
+                self.assertEqual(self._turn(text, {}, "success").calls, [(kind, False), (kind, True)])
+                self.assertEqual(
+                    self._turn(text, {}, "failure").calls, [(kind, False), ("x", False), (kind, True)],
+                )
+                self.assertEqual(self._turn(text, {}, "cancelled").calls, [(kind, False), (kind, True)])
+
+    def test_a_delegated_answer_keeps_the_arrival_until_its_final_answer(self):
         card = (runtime.DEFAULT_BOARD, "t_a")
-        sub = {"platform": "slack", "chat_id": CHANNEL, "thread_id": THREAD, "task_id": "t_a"}
-        for kinds, expected in (
-            (("completed",), []),
-            (("blocked",), []),
-            (("blocked", "gave_up"), [("x", False)]),
+        arrival = ("hammer_and_wrench", False)
+        for kinds, settled in (
+            (("completed",), [("hammer_and_wrench", True)]),
+            (("gave_up",), [("x", False), ("hammer_and_wrench", True)]),
         ):
             with self.subTest(kinds=kinds):
                 runtime._deferred.clear()
                 adapter = self._turn("fix it", {card: runtime._Card("running")}, "success")
-                self.assertEqual(adapter.calls, [])
+                # The acknowledgement posted; the work has not answered yet.
+                self.assertEqual(adapter.calls, [arrival])
                 for kind in kinds:
-                    _run(runtime.settle_delegated(adapter, sub, kind))
-                self.assertEqual(adapter.calls, expected)
+                    _run(runtime.settle_delegated(adapter, self.SUB, kind))
+                self.assertEqual(adapter.calls, [arrival, *settled])
 
-    def test_a_card_waiting_on_you_shows_nothing_until_its_work_fails(self):
+    def test_pause_goes_on_while_a_card_waits_on_you_and_off_when_you_answer(self):
+        card = (runtime.DEFAULT_BOARD, "t_a")
+        adapter = self._turn("fix it", {card: runtime._Card("running")}, "success")
+        _run(runtime.settle_delegated(adapter, self.SUB, "blocked"))
+        # A replayed or repeated block does not stack a second ⏸️.
+        _run(runtime.settle_delegated(adapter, self.SUB, "review_requested"))
+        self.assertEqual(adapter.calls[1:], [("double_vertical_bar", False)])
+        _run(runtime.settle_delegated(adapter, self.SUB, "unblocked"))
+        self.assertEqual(adapter.calls[2:], [("double_vertical_bar", True)])
+        _run(runtime.settle_delegated(adapter, self.SUB, "completed"))
+        self.assertEqual(adapter.calls[3:], [("hammer_and_wrench", True)])
+
+    def test_a_card_that_finishes_while_paused_takes_the_pause_off_with_the_arrival(self):
+        card = (runtime.DEFAULT_BOARD, "t_a")
+        adapter = self._turn("fix it", {card: runtime._Card("running")}, "success")
+        _run(runtime.settle_delegated(adapter, self.SUB, "blocked"))
+        _run(runtime.settle_delegated(adapter, self.SUB, "gave_up"))
+        self.assertEqual(
+            adapter.calls,
+            [
+                ("hammer_and_wrench", False), ("double_vertical_bar", False),
+                ("x", False), ("double_vertical_bar", True), ("hammer_and_wrench", True),
+            ],
+        )
+
+    def test_the_pause_stays_while_another_card_of_the_ask_waits_on_you(self):
+        adapter = self._turn("fix it", _cards("t_a", "t_b"), "success")
+        _run(runtime.settle_delegated(adapter, self.SUB, "blocked"))
+        _run(runtime.settle_delegated(adapter, {**self.SUB, "task_id": "t_b"}, "blocked"))
+        _run(runtime.settle_delegated(adapter, self.SUB, "unblocked"))
+        self.assertEqual(adapter.calls[1:], [("double_vertical_bar", False)])
+        _run(runtime.settle_delegated(adapter, {**self.SUB, "task_id": "t_b"}, "unblocked"))
+        self.assertEqual(adapter.calls[2:], [("double_vertical_bar", True)])
+
+    def test_a_card_waiting_on_you_from_the_turn_or_a_follow_up_pauses_the_ask(self):
         # Both other ways an ask can wait on you: a card that blocks before the
         # turn ends, then a follow-up its worker files that blocks on you too.
         adapter = _Stub()
-        sub = {"platform": "slack", "chat_id": CHANNEL, "thread_id": THREAD, "task_id": "t_a"}
         self.boards[:] = [{}]
         _run(runtime.on_processing_start(adapter, _event("fix it")))
 
         async def block_then_read(chat_id, thread_id):
-            await runtime.settle_delegated(adapter, sub, "blocked")
+            await runtime.settle_delegated(adapter, self.SUB, "blocked")
             return _cards("t_a", status="blocked")
 
         with mock.patch.object(runtime, "open_cards", block_then_read):
             _run(runtime.on_processing_complete(adapter, _event("fix it"), SimpleNamespace(value="success")))
-        self.assertEqual(adapter.calls, [])
+        self.assertEqual(adapter.calls, [("hammer_and_wrench", False), ("double_vertical_bar", False)])
         self.boards[:] = [_cards("t_b", status="blocked", creator="t_a")]
-        _run(runtime.settle_delegated(adapter, sub, "completed"))
-        self.assertEqual(adapter.calls, [])
-        self.assertEqual(runtime._deferred[(CHANNEL, THREAD)][0].cards, {("default", "t_b")})
-        _run(runtime.settle_delegated(adapter, {**sub, "task_id": "t_b"}, "gave_up"))
-        self.assertEqual(adapter.calls, [("x", False)])
+        _run(runtime.settle_delegated(adapter, self.SUB, "completed"))
+        # t_a finished, t_b waits on you now: the pause stays on.
+        self.assertEqual(len(adapter.calls), 2)
+        self.assertEqual(runtime._deferred[(CHANNEL, THREAD)][0].blocked, {("default", "t_b")})
+        _run(runtime.settle_delegated(adapter, {**self.SUB, "task_id": "t_b"}, "gave_up"))
+        self.assertEqual(
+            adapter.calls[2:], [("x", False), ("double_vertical_bar", True), ("hammer_and_wrench", True)],
+        )
+
+    def test_a_removal_that_is_refused_leaves_the_reaction_and_the_answer_goes_on(self):
+        adapter = _Stub(refuse_removal=True)
+        with self.assertLogs(runtime.logger, "INFO") as logs:
+            self._turn("fix it", {}, "failure", adapter=adapter)
+        self.assertEqual(adapter.calls, [("hammer_and_wrench", False), ("x", False), ("hammer_and_wrench", True)])
+        self.assertIn("leaving it on", logs.output[0])
+
+    def test_an_arrival_that_never_went_on_is_not_removed(self):
+        adapter = _Stub(refuse_add=True)
+        self._turn("fix it", {}, "success", adapter=adapter)
+        self.assertEqual(adapter.calls, [("hammer_and_wrench", False)])
 
 
 class _Stub:
-    def __init__(self, ts=ASK, log=None):
+    def __init__(self, ts=ASK, log=None, refuse_removal=False, refuse_add=False):
         self.calls = []
         self.ts = ts
         self.log = log
+        self.refuse_removal = refuse_removal
+        self.refuse_add = refuse_add
         self._reacting_message_ids = {"m"}
 
     def _reacting_target(self, event):
@@ -386,15 +461,15 @@ class _Stub:
     async def _react(self, channel, ts, emoji, team_id, *, remove):
         self.calls.append((emoji, remove))
         if self.log is not None:
-            self.log.append((ts, emoji))
-        return True
+            self.log.append((ts, f"-{emoji}" if remove else emoji))
+        return not (self.refuse_removal if remove else self.refuse_add)
 
 
 class RuntimeTest(unittest.TestCase):
-    """The runtime module with the flag on, the board faked, and every reaction shown.
+    """The runtime module with the flag on and the board faked: which settle an ask reaches, and when.
 
-    Which settle an ask reaches is what these tests check, so the arrival
-    reaction, ✅ and ⏸️ are shown here; ``DisplayTest`` checks what ships.
+    A settle shows as the arrival reaction coming off (``(kind, True)``), with ❌
+    before it for a failure; ``DisplayTest`` checks the reactions themselves.
     """
 
     def setUp(self):
@@ -402,10 +477,6 @@ class RuntimeTest(unittest.TestCase):
         patcher = mock.patch.dict(os.environ, {"KAGE_SLACK_UX": "1"})
         patcher.start()
         self.addCleanup(patcher.stop)
-        for name, value in (("SHOW_ARRIVAL", True), ("SHOWN_SETTLES", frozenset(runtime._presenter.SETTLE_REACTIONS))):
-            shown = mock.patch.object(runtime, name, value)
-            shown.start()
-            self.addCleanup(shown.stop)
         self.boards = []
         self.board_args = []
 
@@ -427,6 +498,16 @@ class RuntimeTest(unittest.TestCase):
         lineage = mock.patch.object(runtime, "thread_lineage", thread_lineage)
         lineage.start()
         self.addCleanup(lineage.stop)
+        # slack_ux_status, faked: test_slack_ux_status.py covers the hold itself.
+        self.expected = []
+
+        async def expect_cards(adapter, chat_id, team_id, thread_ts, cards):
+            self.expected.append((chat_id, team_id, thread_ts, dict(sorted(cards.items()))))
+
+        status = SimpleNamespace(expect_cards=expect_cards)
+        modules = mock.patch.dict(sys.modules, {"gateway": SimpleNamespace(slack_ux_status=status), "gateway.slack_ux_status": status})
+        modules.start()
+        self.addCleanup(modules.stop)
 
     def _turn(self, text, before, after, outcome="success", adapter=None):
         adapter = adapter or _Stub()
@@ -440,18 +521,18 @@ class RuntimeTest(unittest.TestCase):
 
     def test_direct_answer_settles_now(self):
         adapter = self._turn("board", {}, {})
-        self.assertEqual(adapter.calls, [("clipboard", False), ("white_check_mark", False)])
+        self.assertEqual(adapter.calls, [("clipboard", False), ("clipboard", True)])
 
     def test_failed_turn(self):
         adapter = self._turn("checkout is down", {}, {}, "failure")
-        self.assertEqual(adapter.calls, [("rotating_light", False), ("x", False)])
+        self.assertEqual(adapter.calls, [("rotating_light", False), ("x", False), ("rotating_light", True)])
 
     def test_cancelled_turn_adds_nothing_more(self):
         adapter = _Stub()
         self.boards[:] = [{}]
         _run(runtime.on_processing_start(adapter, _event("hi")))
         _run(runtime.on_processing_complete(adapter, _event("hi"), SimpleNamespace(value="cancelled")))
-        self.assertEqual(adapter.calls, [("eyes", False)])
+        self.assertEqual(adapter.calls, [("eyes", False), ("eyes", True)])
 
     def test_untracked_event_is_left_alone(self):
         adapter = _Stub()
@@ -462,12 +543,12 @@ class RuntimeTest(unittest.TestCase):
 
     def test_old_open_card_does_not_defer(self):
         # A card from an earlier ask is still running; this turn answered directly.
-        adapter = self._turn("why?", _cards("t_old"), _cards("t_old"))
-        self.assertEqual(adapter.calls, [("eyes", False), ("white_check_mark", False)])
+        adapter = self._turn("what now?", _cards("t_old"), _cards("t_old"))
+        self.assertEqual(adapter.calls, [("eyes", False), ("eyes", True)])
 
     def test_unreadable_board_settles_now(self):
-        adapter = self._turn("why?", None, _cards("t_a"))
-        self.assertEqual(adapter.calls, [("eyes", False), ("white_check_mark", False)])
+        adapter = self._turn("what now?", None, _cards("t_a"))
+        self.assertEqual(adapter.calls, [("eyes", False), ("eyes", True)])
 
     def test_delegated_settles_when_the_last_card_does(self):
         adapter = self._turn("fix it", {}, _cards("t_a"))
@@ -481,25 +562,25 @@ class RuntimeTest(unittest.TestCase):
         _run(runtime.settle_delegated(adapter, self._sub("t_a"), "blocked"))
         self.assertEqual(adapter.calls[-1], ("double_vertical_bar", False))
         # Crashes are retried; status is bookkeeping.
-        for kind in ("crashed", "timed_out", "status", "unblocked"):
+        for kind in ("crashed", "timed_out", "status"):
             _run(runtime.settle_delegated(adapter, self._sub("t_a"), kind))
         self.assertEqual(len(adapter.calls), 2)
-        # It completes: ✅, and the ask is forgotten.
+        # It completes: ⏸️ and the arrival reaction off, and the ask is forgotten.
         _run(runtime.settle_delegated(adapter, self._sub("t_a"), "completed"))
-        self.assertEqual(adapter.calls[-1], ("white_check_mark", False))
+        self.assertEqual(adapter.calls[-2:], [("double_vertical_bar", True), ("hammer_and_wrench", True)])
         _run(runtime.settle_delegated(adapter, self._sub("t_a"), "completed"))
-        self.assertEqual(len(adapter.calls), 3)
+        self.assertEqual(len(adapter.calls), 4)
 
     def test_a_failed_turn_that_delegated_settles_failed(self):
         adapter = self._turn("fix it", {}, _cards("t_a"), "failure")
         self.assertEqual(adapter.calls, [("hammer_and_wrench", False)])
         _run(runtime.settle_delegated(adapter, self._sub("t_a"), "completed"))
-        self.assertEqual(adapter.calls[-1], ("x", False))
+        self.assertEqual(adapter.calls[-2:], [("x", False), ("hammer_and_wrench", True)])
 
     def test_delegated_failure(self):
         adapter = self._turn("fix it", {}, _cards("t_a"))
         _run(runtime.settle_delegated(adapter, self._sub("t_a"), "gave_up"))
-        self.assertEqual(adapter.calls[-1], ("x", False))
+        self.assertEqual(adapter.calls[-2:], [("x", False), ("hammer_and_wrench", True)])
 
     def test_fan_out_with_a_give_up_settles_once_as_failed(self):
         # Hermes leaves a gave-up card at status 'blocked', so it still reads as
@@ -508,14 +589,30 @@ class RuntimeTest(unittest.TestCase):
         _run(runtime.settle_delegated(adapter, self._sub("t_a"), "gave_up"))
         self.assertEqual(adapter.calls, [("hammer_and_wrench", False)])
         _run(runtime.settle_delegated(adapter, self._sub("t_b"), "completed"))
-        self.assertEqual(adapter.calls, [("hammer_and_wrench", False), ("x", False)])
+        self.assertEqual(adapter.calls, [("hammer_and_wrench", False), ("x", False), ("hammer_and_wrench", True)])
         _run(runtime.settle_delegated(adapter, self._sub("t_b"), "completed"))
-        self.assertEqual(len(adapter.calls), 2)
+        self.assertEqual(len(adapter.calls), 3)
+
+    def test_a_card_archived_by_hand_comes_off_its_ask_without_failing_it(self):
+        # No later event names an archived card, so it cannot hold the ask open.
+        adapter = self._turn("fix it", {}, _cards("t_a"))
+        _run(runtime.settle_delegated(adapter, self._sub("t_a"), "blocked"))
+        _run(runtime.settle_delegated(adapter, self._sub("t_a"), "archived"))
+        self.assertEqual(adapter.calls[-2:], [("double_vertical_bar", True), ("hammer_and_wrench", True)])
+        self.assertNotIn(("x", False), adapter.calls)
+        self.assertNotIn((CHANNEL, THREAD), runtime._deferred)
+
+    def test_a_fan_out_with_an_archived_card_settles_on_the_rest(self):
+        adapter = self._turn("fix it", {}, _cards("t_a", "t_b"))
+        _run(runtime.settle_delegated(adapter, self._sub("t_a"), "archived"))
+        self.assertEqual(adapter.calls, [("hammer_and_wrench", False)])
+        _run(runtime.settle_delegated(adapter, self._sub("t_b"), "completed"))
+        self.assertEqual(adapter.calls, [("hammer_and_wrench", False), ("hammer_and_wrench", True)])
 
     def test_a_stale_blocked_card_in_the_thread_does_not_hold_the_settle(self):
         adapter = self._turn("fix it", _cards("t_old"), _cards("t_old", "t_a"))
         _run(runtime.settle_delegated(adapter, self._sub("t_a"), "completed"))
-        self.assertEqual(adapter.calls[-1], ("white_check_mark", False))
+        self.assertEqual(adapter.calls[-1], ("hammer_and_wrench", True))
         # The stale card finishing later touches nothing.
         _run(runtime.settle_delegated(adapter, self._sub("t_old"), "gave_up"))
         self.assertEqual(len(adapter.calls), 2)
@@ -531,7 +628,37 @@ class RuntimeTest(unittest.TestCase):
         _run(runtime.settle_delegated(adapter, self._sub("t_other"), "completed"))
         self.assertEqual(adapter.calls, [("hammer_and_wrench", False)])
         _run(runtime.settle_delegated(adapter, self._sub("t_b"), "gave_up"))
-        self.assertEqual(adapter.calls, [("hammer_and_wrench", False), ("x", False)])
+        self.assertEqual(adapter.calls, [("hammer_and_wrench", False), ("x", False), ("hammer_and_wrench", True)])
+
+    def test_a_turn_that_opened_cards_holds_working_for_those_about_to_start(self):
+        board = {
+            **_cards("t_a"), **_cards("t_ready", status="ready"),
+            **_cards("t_b", status="todo"), **_cards("t_later", status="scheduled"),
+        }
+        self._turn("fix it", _cards("t_old"), {**_cards("t_old"), **board})
+        self.assertEqual(
+            self.expected,
+            [(CHANNEL, TEAM, THREAD, {"t_a": True, "t_b": False, "t_ready": True})],
+            "t_b waits on its parents",
+        )
+
+    def test_a_direct_answer_holds_nothing(self):
+        self._turn("what now?", _cards("t_old"), _cards("t_old"))
+        self.assertEqual(self.expected, [])
+
+    def test_a_follow_up_holds_working_until_it_starts(self):
+        adapter = self._turn("fix it", {}, _cards("t_a"))
+        self.boards[:] = [_cards("t_b", status="todo", creator="t_a")]
+        _run(runtime.settle_delegated(adapter, self._sub("t_a"), "completed"))
+        self.assertEqual(self.expected, [(CHANNEL, TEAM, THREAD, {"t_a": True}), (CHANNEL, TEAM, THREAD, {"t_b": False})])
+
+    def test_a_failed_hold_never_fails_the_turn(self):
+        async def boom(*args):
+            raise RuntimeError("slack down")
+
+        sys.modules["gateway.slack_ux_status"].expect_cards = boom
+        adapter = self._turn("fix it", {}, _cards("t_a"))
+        self.assertEqual(adapter.calls, [("hammer_and_wrench", False)])
 
     def test_a_follow_up_filed_under_a_completed_follow_up_holds_the_settle(self):
         # t_b, filed by t_a's worker, has completed; t_c, filed by t_b's worker,
@@ -542,7 +669,7 @@ class RuntimeTest(unittest.TestCase):
         _run(runtime.settle_delegated(adapter, self._sub("t_a"), "completed"))
         self.assertEqual(adapter.calls, [("hammer_and_wrench", False)])
         _run(runtime.settle_delegated(adapter, self._sub("t_c"), "completed"))
-        self.assertEqual(adapter.calls, [("hammer_and_wrench", False), ("white_check_mark", False)])
+        self.assertEqual(adapter.calls, [("hammer_and_wrench", False), ("hammer_and_wrench", True)])
 
     def test_a_card_under_a_parked_follow_up_does_not_hold_the_settle(self):
         adapter = self._turn("fix it", {}, _cards("t_a"))
@@ -551,7 +678,7 @@ class RuntimeTest(unittest.TestCase):
             **_cards("t_c", status="todo", creator="t_b"),
         }]
         _run(runtime.settle_delegated(adapter, self._sub("t_a"), "completed"))
-        self.assertEqual(adapter.calls, [("hammer_and_wrench", False), ("white_check_mark", False)])
+        self.assertEqual(adapter.calls, [("hammer_and_wrench", False), ("hammer_and_wrench", True)])
         self.assertEqual(runtime._deferred, {})
 
     def test_a_card_under_an_open_follow_up_waits_for_that_follow_up(self):
@@ -564,7 +691,7 @@ class RuntimeTest(unittest.TestCase):
         self.assertEqual(adapter.calls, [("hammer_and_wrench", False)])
         self.boards[:] = [_cards("t_g", status="blocked", creator="t_b", gave_up=True)]
         _run(runtime.settle_delegated(adapter, self._sub("t_b"), "completed"))
-        self.assertEqual(adapter.calls, [("hammer_and_wrench", False), ("white_check_mark", False)])
+        self.assertEqual(adapter.calls, [("hammer_and_wrench", False), ("hammer_and_wrench", True)])
 
     def test_a_card_under_an_open_follow_up_blocked_on_the_user_pauses_at_that_follow_up(self):
         adapter = self._turn("fix it", {}, _cards("t_a"))
@@ -587,7 +714,7 @@ class RuntimeTest(unittest.TestCase):
         self.lineage = {("default", f"t_{n}"): f"t_{n - 1}" for n in range(1, depth + 2)}
         self.boards[:] = [_cards(f"t_{depth + 1}", status="todo", creator=f"t_{depth}")]
         _run(runtime.settle_delegated(adapter, self._sub("t_0"), "completed"))
-        self.assertEqual(adapter.calls, [("hammer_and_wrench", False), ("white_check_mark", False)])
+        self.assertEqual(adapter.calls, [("hammer_and_wrench", False), ("hammer_and_wrench", True)])
         adapter = self._turn("fix it", {}, _cards("t_0"))
         self.boards[:] = [_cards(f"t_{depth}", status="todo", creator=f"t_{depth - 1}")]
         _run(runtime.settle_delegated(adapter, self._sub("t_0"), "completed"))
@@ -605,7 +732,7 @@ class RuntimeTest(unittest.TestCase):
         with mock.patch.object(runtime, "thread_lineage", thread_lineage):
             _run(runtime.settle_delegated(adapter, self._sub("t_a"), "completed"))
         self.assertEqual(reads, [])
-        self.assertEqual(adapter.calls[-1], ("white_check_mark", False))
+        self.assertEqual(adapter.calls[-1], ("hammer_and_wrench", True))
 
     def test_the_lineage_walk_stops_at_its_depth_cap_and_on_a_cycle(self):
         chain = {("default", f"t_{n}"): f"t_{n - 1}" for n in range(1, runtime.LINEAGE_DEPTH + 2)}
@@ -625,13 +752,15 @@ class RuntimeTest(unittest.TestCase):
         _run(runtime.settle_delegated(adapter, self._sub("t_a"), "completed"))
         self.assertEqual(adapter.calls, [("hammer_and_wrench", False), ("double_vertical_bar", False)])
         _run(runtime.settle_delegated(adapter, self._sub("t_b"), "gave_up"))
-        self.assertEqual(adapter.calls[-1], ("x", False))
+        self.assertEqual(
+            adapter.calls[-3:], [("x", False), ("double_vertical_bar", True), ("hammer_and_wrench", True)],
+        )
 
     def test_a_follow_up_parked_by_a_give_up_does_not_hold_the_settle(self):
         adapter = self._turn("fix it", {}, _cards("t_a"))
         self.boards[:] = [_cards("t_b", status="blocked", creator="t_a", gave_up=True)]
         _run(runtime.settle_delegated(adapter, self._sub("t_a"), "completed"))
-        self.assertEqual(adapter.calls, [("hammer_and_wrench", False), ("white_check_mark", False)])
+        self.assertEqual(adapter.calls, [("hammer_and_wrench", False), ("hammer_and_wrench", True)])
 
     def test_a_give_up_does_not_wait_on_a_follow_up_it_gates(self):
         # t_b waits on t_a reaching done, and a card that gave up is parked.
@@ -639,7 +768,7 @@ class RuntimeTest(unittest.TestCase):
         self.boards[:] = [_cards("t_b", status="todo", creator="t_a")]
         reads = len(self.board_args)
         _run(runtime.settle_delegated(adapter, self._sub("t_a"), "gave_up"))
-        self.assertEqual(adapter.calls, [("hammer_and_wrench", False), ("x", False)])
+        self.assertEqual(adapter.calls, [("hammer_and_wrench", False), ("x", False), ("hammer_and_wrench", True)])
         self.assertEqual(len(self.board_args), reads)
 
     def test_a_follow_up_whose_creator_closed_within_the_turn_is_its(self):
@@ -648,13 +777,13 @@ class RuntimeTest(unittest.TestCase):
         adapter = self._turn("fix it", {}, _cards("t_b", creator="t_a"))
         self.assertEqual(adapter.calls, [("hammer_and_wrench", False)])
         _run(runtime.settle_delegated(adapter, self._sub("t_b"), "gave_up"))
-        self.assertEqual(adapter.calls[-1], ("x", False))
+        self.assertEqual(adapter.calls[-2:], [("x", False), ("hammer_and_wrench", True)])
 
     def test_an_unreadable_board_at_the_finish_settles_as_before(self):
         adapter = self._turn("fix it", {}, _cards("t_a"))
         self.boards[:] = [None]
         _run(runtime.settle_delegated(adapter, self._sub("t_a"), "completed"))
-        self.assertEqual(adapter.calls[-1], ("white_check_mark", False))
+        self.assertEqual(adapter.calls[-1], ("hammer_and_wrench", True))
 
     def test_two_asks_in_one_thread_settle_on_their_own_cards(self):
         log = []
@@ -663,10 +792,10 @@ class RuntimeTest(unittest.TestCase):
         _run(runtime.settle_delegated(second, self._sub("t_b"), "blocked"))
         self.assertEqual(log[-1], ("111.002", "double_vertical_bar"))
         _run(runtime.settle_delegated(second, self._sub("t_b"), "completed"))
-        self.assertEqual(log[-1], ("111.002", "white_check_mark"))
+        self.assertEqual(log[-2:], [("111.002", "-double_vertical_bar"), ("111.002", "-hammer_and_wrench")])
         _run(runtime.settle_delegated(first, self._sub("t_a"), "gave_up"))
-        self.assertEqual(log[-1], ("111.001", "x"))
-        self.assertEqual(len(log), 5)
+        self.assertEqual(log[-2:], [("111.001", "x"), ("111.001", "-hammer_and_wrench")])
+        self.assertEqual(len(log), 7)
 
     def test_a_card_that_finishes_before_the_ask_is_deferred(self):
         # The notifier delivers the card's final event between the turn's board
@@ -681,7 +810,7 @@ class RuntimeTest(unittest.TestCase):
 
         with mock.patch.object(runtime, "open_cards", read_then_race):
             _run(runtime.on_processing_complete(adapter, _event("fix it"), SimpleNamespace(value="success")))
-        self.assertEqual(adapter.calls, [("hammer_and_wrench", False), ("x", False)])
+        self.assertEqual(adapter.calls, [("hammer_and_wrench", False), ("x", False), ("hammer_and_wrench", True)])
         self.assertFalse(runtime._deferred)
 
     def _turn_racing(self, text, before, after, events, adapter):
@@ -701,23 +830,23 @@ class RuntimeTest(unittest.TestCase):
         log = []
         first = self._turn("fix it", {}, _cards("t_a"), adapter=_Stub("111.001", log))
         _run(runtime.settle_delegated(first, self._sub("t_a"), "completed"))
-        self.assertEqual(log[-1], ("111.001", "white_check_mark"))
+        self.assertEqual(log[-1], ("111.001", "-hammer_and_wrench"))
         # The finished card is closed, so the next turn's start read misses it;
         # the turn reopens it. Its earlier finish does not settle this ask.
         self._turn("fix it again", {}, _cards("t_a"), adapter=_Stub("111.002", log))
         self.assertEqual([ts for ts, _ in log].count("111.002"), 1)
         self.assertEqual(runtime._deferred[(CHANNEL, THREAD)][0].cards, {("default", "t_a")})
         _run(runtime.settle_delegated(first, self._sub("t_a"), "completed"))
-        self.assertEqual(log[-1], ("111.002", "white_check_mark"))
+        self.assertEqual(log[-1], ("111.002", "-hammer_and_wrench"))
 
     def test_a_card_unblocked_by_someone_else_during_a_direct_answer_is_not_its(self):
-        # A CLI unblock lands while "why?" is answered; nothing names who did it.
+        # A CLI unblock lands while "what now?" is answered; nothing names who did it.
         adapter = _Stub()
-        self._turn_racing("why?", _cards("t_a", status="blocked"), _cards("t_a"), [], adapter)
-        self.assertEqual(adapter.calls, [("eyes", False), ("white_check_mark", False)])
+        self._turn_racing("what now?", _cards("t_a", status="blocked"), _cards("t_a"), [], adapter)
+        self.assertEqual(adapter.calls, [("eyes", False), ("eyes", True)])
         self.assertFalse(runtime._deferred)
         _run(runtime.settle_delegated(adapter, self._sub("t_a"), "gave_up"))
-        self.assertEqual(adapter.calls, [("eyes", False), ("white_check_mark", False)])
+        self.assertEqual(adapter.calls, [("eyes", False), ("eyes", True)])
 
     def test_a_blocked_card_that_gives_up_again_during_the_turn_does_not_fail_it(self):
         # Unblocked and parked again, or a give-up from before the ask reported
@@ -725,29 +854,29 @@ class RuntimeTest(unittest.TestCase):
         adapter = _Stub()
         blocked = _cards("t_a", status="blocked")
         self._turn_racing("try again", blocked, blocked, [("t_a", "gave_up")], adapter)
-        self.assertEqual(adapter.calls, [("eyes", False), ("white_check_mark", False)])
+        self.assertEqual(adapter.calls, [("eyes", False), ("eyes", True)])
         self.assertFalse(runtime._deferred)
 
     def test_a_blocked_card_that_blocks_again_during_the_turn_does_not_pause_it(self):
         adapter = _Stub()
         blocked = _cards("t_a", status="blocked")
         self._turn_racing("yes, go ahead", blocked, blocked, [("t_a", "blocked")], adapter)
-        self.assertEqual(adapter.calls, [("eyes", False), ("white_check_mark", False)])
+        self.assertEqual(adapter.calls, [("eyes", False), ("eyes", True)])
 
     def test_a_card_an_earlier_asks_worker_creates_is_not_the_turns(self):
-        # Ask 1's worker files a follow-up while "why?" is answered; the
+        # Ask 1's worker files a follow-up while "what now?" is answered; the
         # follow-up inherited the thread's subscription from t_a.
         adapter = _Stub()
         after = {**_cards("t_a"), **_cards("t_b", creator="t_a")}
-        self._turn_racing("why?", _cards("t_a"), after, [], adapter)
-        self.assertEqual(adapter.calls, [("eyes", False), ("white_check_mark", False)])
+        self._turn_racing("what now?", _cards("t_a"), after, [], adapter)
+        self.assertEqual(adapter.calls, [("eyes", False), ("eyes", True)])
         self.assertFalse(runtime._deferred)
 
     def test_a_card_created_under_a_left_out_card_is_left_out_too(self):
         adapter = _Stub()
         after = {**_cards("t_a"), **_cards("t_b", creator="t_a"), **_cards("t_c", creator="t_b")}
-        self._turn_racing("why?", _cards("t_a"), after, [], adapter)
-        self.assertEqual(adapter.calls, [("eyes", False), ("white_check_mark", False)])
+        self._turn_racing("what now?", _cards("t_a"), after, [], adapter)
+        self.assertEqual(adapter.calls, [("eyes", False), ("eyes", True)])
 
     def test_a_card_under_a_left_out_cards_follow_up_that_closed_within_the_turn_is_left_out(self):
         # Ask 1's t_c is running when ask 2 arrives. During ask 2's turn t_c's
@@ -760,28 +889,28 @@ class RuntimeTest(unittest.TestCase):
                 first = self._turn("fix it", {}, _cards("t_c"), adapter=_Stub("111.001", log))
                 self.lineage = {("default", "t_c"): None, ("default", "t_a"): "t_c", ("default", "t_b"): "t_a"}
                 second = _Stub("111.002", log)
-                self._turn_racing("why?", _cards("t_c"), {**_cards("t_c"), **_cards("t_b", creator="t_a")}, events, second)
-                self.assertEqual(second.calls, [("eyes", False), ("white_check_mark", False)])
+                self._turn_racing("what now?", _cards("t_c"), {**_cards("t_c"), **_cards("t_b", creator="t_a")}, events, second)
+                self.assertEqual(second.calls, [("eyes", False), ("eyes", True)])
                 # t_b is ask 1's: its follow-up's follow-up, held once t_c completes.
                 self.boards[:] = [_cards("t_b", creator="t_a")]
                 _run(runtime.settle_delegated(first, self._sub("t_c"), "completed"))
-                self.assertNotIn(("111.001", "white_check_mark"), log)
+                self.assertNotIn(("111.001", "-hammer_and_wrench"), log)
                 _run(runtime.settle_delegated(first, self._sub("t_b"), "completed"))
-                self.assertEqual(log[-1], ("111.001", "white_check_mark"))
+                self.assertEqual(log[-1], ("111.001", "-hammer_and_wrench"))
                 self.assertEqual([ts for ts, _ in log].count("111.002"), 2)
 
     def test_an_earlier_asks_follow_up_that_gave_up_within_the_turn_does_not_fail_it(self):
-        # t_c's worker files t_a while "why?" is answered, after the end read's
+        # t_c's worker files t_a while "what now?" is answered, after the end read's
         # snapshot, and t_a's give-up is delivered while that read awaits: t_a
         # is in neither read, so only the lineage shows its creator.
         adapter = _Stub()
         self.lineage = {("default", "t_c"): None, ("default", "t_a"): "t_c"}
-        self._turn_racing("why?", _cards("t_c"), _cards("t_c"), [("t_a", "gave_up")], adapter)
-        self.assertEqual(adapter.calls, [("eyes", False), ("white_check_mark", False)])
+        self._turn_racing("what now?", _cards("t_c"), _cards("t_c"), [("t_a", "gave_up")], adapter)
+        self.assertEqual(adapter.calls, [("eyes", False), ("eyes", True)])
         self.assertEqual(self.lineage_reads, 1)
 
     def test_the_turn_reads_the_lineage_only_for_a_creator_neither_read_shows(self):
-        self._turn("why?", _cards("t_old"), _cards("t_old"))
+        self._turn("what now?", _cards("t_old"), _cards("t_old"))
         self._turn("fix it", {}, {**_cards("t_a"), **_cards("t_b", creator="t_a")})
         self.assertEqual(self.lineage_reads, 0)
         self._turn("fix it", {}, _cards("t_b", creator="t_a"))
@@ -803,7 +932,7 @@ class RuntimeTest(unittest.TestCase):
     def test_a_blocked_card_that_completes_during_the_turn_is_not_its(self):
         adapter = _Stub()
         self._turn_racing("yes, go ahead", _cards("t_a", status="blocked"), {}, [("t_a", "completed")], adapter)
-        self.assertEqual(adapter.calls, [("eyes", False), ("white_check_mark", False)])
+        self.assertEqual(adapter.calls, [("eyes", False), ("eyes", True)])
         self.assertFalse(runtime._deferred)
 
     def test_a_card_that_blocks_before_the_turn_ends_pauses_the_ask(self):
@@ -811,7 +940,7 @@ class RuntimeTest(unittest.TestCase):
         self._turn_racing("fix it", {}, _cards("t_a", status="blocked"), [("t_a", "blocked")], adapter)
         self.assertEqual(adapter.calls, [("hammer_and_wrench", False), ("double_vertical_bar", False)])
         _run(runtime.settle_delegated(adapter, self._sub("t_a"), "completed"))
-        self.assertEqual(adapter.calls[-1], ("white_check_mark", False))
+        self.assertEqual(adapter.calls[-1], ("hammer_and_wrench", True))
 
     def test_a_card_that_blocks_and_resumes_within_the_turn_does_not_pause_the_ask(self):
         adapter = _Stub()
@@ -821,8 +950,8 @@ class RuntimeTest(unittest.TestCase):
 
     def test_a_card_running_at_the_start_that_finishes_is_not_the_turns(self):
         adapter = _Stub()
-        self._turn_racing("why?", _cards("t_a"), {}, [("t_a", "gave_up")], adapter)
-        self.assertEqual(adapter.calls, [("eyes", False), ("white_check_mark", False)])
+        self._turn_racing("what now?", _cards("t_a"), {}, [("t_a", "gave_up")], adapter)
+        self.assertEqual(adapter.calls, [("eyes", False), ("eyes", True)])
 
     def test_a_finish_in_another_thread_is_not_the_turns(self):
         adapter = _Stub()
@@ -841,25 +970,25 @@ class RuntimeTest(unittest.TestCase):
         first = self._turn("fix it", {}, _cards("t_a"), adapter=_Stub("111.001", log))
         _run(runtime.settle_delegated(first, self._sub("t_a"), "blocked"))
         self._turn("yes, go ahead", _cards("t_a", status="blocked"), _cards("t_a"), adapter=_Stub("111.002", log))
-        self.assertEqual(log[-2:], [("111.002", "eyes"), ("111.002", "white_check_mark")])
+        self.assertEqual(log[-2:], [("111.002", "eyes"), ("111.002", "-eyes")])
         _run(runtime.settle_delegated(first, self._sub("t_a"), "completed"))
-        self.assertEqual(log[-1], ("111.001", "white_check_mark"))
+        self.assertEqual(log[-2:], [("111.001", "-double_vertical_bar"), ("111.001", "-hammer_and_wrench")])
         self.assertEqual([ts for ts, _ in log].count("111.002"), 2)
 
     def test_a_retry_after_give_up_settles_on_its_own_turn(self):
         log = []
         first = self._turn("fix it", {}, _cards("t_a"), adapter=_Stub("111.001", log))
         _run(runtime.settle_delegated(first, self._sub("t_a"), "gave_up"))
-        self.assertEqual(log[-1], ("111.001", "x"))
+        self.assertEqual(log[-2:], [("111.001", "x"), ("111.001", "-hammer_and_wrench")])
         # Hermes parks the gave-up card at blocked; "try again" unblocks it.
         self._turn("try again", _cards("t_a", status="blocked"), _cards("t_a"), adapter=_Stub("111.002", log))
-        self.assertEqual(log[-1], ("111.002", "white_check_mark"))
+        self.assertEqual(log[-1], ("111.002", "-eyes"))
         _run(runtime.settle_delegated(first, self._sub("t_a"), "completed"))
-        self.assertEqual(len(log), 4)
+        self.assertEqual(len(log), 5)
 
     def test_a_card_still_blocked_after_the_turn_is_not_its(self):
-        adapter = self._turn("why?", _cards("t_a", status="blocked"), _cards("t_a", status="blocked"))
-        self.assertEqual(adapter.calls, [("eyes", False), ("white_check_mark", False)])
+        adapter = self._turn("what now?", _cards("t_a", status="blocked"), _cards("t_a", status="blocked"))
+        self.assertEqual(adapter.calls, [("eyes", False), ("eyes", True)])
 
     def test_a_card_on_another_board_settles_on_that_board_only(self):
         adapter = self._turn("fix it", {}, _cards("t_a", board="b2"))
@@ -867,7 +996,7 @@ class RuntimeTest(unittest.TestCase):
         _run(runtime.settle_delegated(adapter, self._sub("t_a"), "completed"))
         self.assertEqual(adapter.calls, [("hammer_and_wrench", False)])
         _run(runtime.settle_delegated(adapter, self._sub("t_a"), "completed", board="b2"))
-        self.assertEqual(adapter.calls[-1], ("white_check_mark", False))
+        self.assertEqual(adapter.calls[-1], ("hammer_and_wrench", True))
 
     def test_a_thread_keeps_only_its_newest_deferred_asks(self):
         for n in range(runtime.DEFERRED_PER_THREAD + 2):
@@ -883,13 +1012,14 @@ class RuntimeTest(unittest.TestCase):
         _run(runtime.settle_delegated(adapter, other, "completed"))
         self.assertEqual(adapter.calls, [("hammer_and_wrench", False)])
 
-    def test_nothing_is_ever_removed(self):
+    def test_only_reactions_this_process_put_on_are_removed(self):
         adapter = self._turn("fix it", {}, _cards("t_a"))
         _run(runtime.settle_delegated(adapter, self._sub("t_a"), "blocked"))
         self.boards[:] = [{}]
         _run(runtime.settle_delegated(adapter, self._sub("t_a"), "completed"))
-        self.assertTrue(adapter.calls)
-        self.assertTrue(all(remove is False for _emoji, remove in adapter.calls))
+        added = [emoji for emoji, remove in adapter.calls if not remove]
+        removed = [emoji for emoji, remove in adapter.calls if remove]
+        self.assertEqual(sorted(added), sorted(removed))
 
     def test_flag_off_settle_is_inert(self):
         adapter = self._turn("fix it", {}, _cards("t_a"))

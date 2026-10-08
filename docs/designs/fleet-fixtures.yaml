@@ -10,8 +10,8 @@
 #
 # What this file adds on top of that catalogue is the part fixtures.json does
 # not carry: the day-N availability gate below, and the fixtures that are not
-# on a cluster at all (`orphan-disks` is project-scoped, so it has no cluster
-# slot and no entry in a catalogue keyed by one).
+# on a cluster at all (`orphan-disks` and `startup-fail-vm` are project-scoped,
+# so they have no cluster slot and no entry in a catalogue keyed by one).
 #
 # A case names a fixture by role and never by a cluster name or a project id.
 # Each eval project carries its own set of clusters (`bench/tf/fleet/`,
@@ -179,6 +179,16 @@ fixtures:
       resource exposes no creation timestamp at all, so pool age is inferred
       from node boot-disk time and a rolling node recreation resets the gate.
       The least dependable fixture here.
+
+  - role: startup-fail-vm
+    slot: null # Project-scoped, in var.zone; not attached to any cluster.
+    available_from_day: 0
+    objects:
+      - instance/startup-fail-<prefix>
+    defect: >-
+      A standalone e2-micro, startup-fail-<prefix>, whose startup script
+      exits 1 on every boot, so the guest agent's failure line is on its
+      serial console from the first boot onward.
 
   - role: orphan-disks
     slot: null # Project-scoped, in var.zone; not attached to any cluster.

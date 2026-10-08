@@ -492,7 +492,7 @@ get_latest_validated_rc_tag() {
 # into the output on SUCCESS, not only on failure — and git warns on success for
 # an ambiguous refname, which is what a branch sharing a GA tag's name produces.
 # An empty range then captures `warning: refname '0.1.0' is ambiguous.`, reads as
-# non-empty, and an unattended run publishes a release for a week with nothing in
+# non-empty, and an unattended run publishes a release for a day with nothing in
 # it. The message is still reported, from the failure branch, where it belongs.
 #
 # Arguments: $1 = base GA tag, $2 = candidate commit-ish. Returns non-zero if the
