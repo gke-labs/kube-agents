@@ -320,8 +320,8 @@ def home_target_env(root_home: Path) -> dict[str, str]:
     Only the operator rendering a ``home_channel`` beside the ``enabled`` and
     ``typing_status_text`` it already writes covers both. On a writable file the
     ``bootstrap_onboarding`` plugin sets one on a fresh install's first chat
-    message; an install onboarded before that, or whose first turn was not on
-    chat, still has none.
+    message; an install onboarded before that, or the second platform on an
+    install with both, still has none.
 
     Two things to get right if you write that, both worse than the bug this
     function fixes. **The shape:** only ``chat_id`` is read here, but the whole

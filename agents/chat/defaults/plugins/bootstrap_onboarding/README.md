@@ -293,7 +293,7 @@ if left:
 PY
 ```
 
-Then remove the markers for the stages you want to repeat (`.bootstrap_scan_filed` to re-file the sweep, `.bootstrap_greeted` to re-greet, `.bootstrap_completed` to allow another delivery). **`INVENTORY.raw.md` on the sandbox pod must go too** — unlike the report, nothing ever cleans it up, and a stale one is what a person reading the sandbox takes for this run's findings until the hand-off writes the new one:
+Then remove the markers for the stages you want to repeat (`.bootstrap_scan_filed` to re-file the sweep, `.bootstrap_greeted` to re-greet, `.bootstrap_completed` to allow another delivery). Re-greeting does not move the home channel the first greeting set; use `/sethome` for that. **`INVENTORY.raw.md` on the sandbox pod must go too** — unlike the report, nothing ever cleans it up, and a stale one is what a person reading the sandbox takes for this run's findings until the hand-off writes the new one:
 
 ```bash
 kubectl exec -n kubeagents-system ${POD_NAME} -c platform-agent -- rm -f /opt/data/.bootstrap_scan_filed /opt/data/.bootstrap_greeted /opt/data/.bootstrap_completed /opt/data/.bootstrap_reconcile_attempts

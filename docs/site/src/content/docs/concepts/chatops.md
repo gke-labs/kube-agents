@@ -33,7 +33,7 @@ Google Chat ingress can be gated by `GOOGLE_CHAT_ALLOWED_USERS` (a comma-separat
 
 Unlike Slack's, this one is not covered by `/sethome`. That command writes the **Planning Agent** profile, which is enough for the gateway's own delivery, but a specialist runs as a kanban worker against its own profile and reads the value from the pod environment instead. Set `GOOGLE_CHAT_HOME_CHANNEL` in `install.env` (or pass `--google-chat-home-channel`), or configure `spec.integration.googleChat.homeChannel` on the `PlatformAgent` resource. If left unset, alert-driven reports have nowhere to go — the investigation still runs and still opens its remediation PR, so the only visible symptom is silence in chat.
 
-When no home channel is set, the first Google Chat message the install receives makes its space the Planning Agent's home channel, the same write `/sethome` makes, so scheduled `deliver: chat` reports reach that space from then on. That is often a one-person DM: send the first message from the space the team watches, or run `/sethome` there later. The specialists above still read only the pod environment. Like `/sethome`, the write also goes to the profile's `.env`, which outranks a `homeChannel` set on the CR afterwards, so move a home channel with `/sethome`, not the CR.
+When no home channel is set and the install's first chat message, on either platform, comes from Google Chat, it makes its space the Planning Agent's home channel, the same write `/sethome` makes, so scheduled `deliver: chat` reports reach that space from then on. That is often a one-person DM: send the first message from the space the team watches, or run `/sethome` there later. The specialists above still read only the pod environment. Like `/sethome`, the write also goes to the profile's `.env`, which outranks a `homeChannel` set on the CR afterwards, so move a home channel with `/sethome`, not the CR.
 
 ### What it looks like end to end
 
@@ -93,7 +93,7 @@ Paste the output into your app's **App Manifest** page in the Slack App Console 
 
 `SLACK_HOME_CHANNEL` designates the channel an unprompted message lands in when no user thread is involved. Set it to a monitoring/oncall channel your team already watches.
 
-It is optional at install time. Leave the prompt empty and the first Slack message the install receives makes its channel or DM the home channel; run `/sethome` (or `/hermes sethome`) in the channel you want to move it. That writes the value into the **Planning Agent** profile — the one that owns Slack ingress — which is why the command has to run through the gateway rather than being applied by an agent on its own profile.
+It is optional at install time. Leave the prompt empty and, if the install's first chat message on either platform comes from Slack, it makes its channel or DM the home channel. Otherwise Slack has none until you run `/sethome` (or `/hermes sethome`) in the channel you want, which is also how you move it. That writes the value into the **Planning Agent** profile — the one that owns Slack ingress — which is why the command has to run through the gateway rather than being applied by an agent on its own profile.
 
 A scheduled brief posts flat in that channel, never inside a thread. `/sethome` also records whichever thread it happened to be typed in, and threading every scheduled report under one ageing thread leaves only the first one visible — so cron delivery drops the thread deliberately. A job that wants its output in a thread names an explicit `deliver=` target instead.
 
