@@ -745,7 +745,7 @@
 ./tasks/findings-decision-covers-item/task.yaml
 # The weekly upgrade audit's check 3.11 (upgrade-blocked), graded in the
 # ledger: the audit runs, and its issue names seeded-b's drain-blocking budget
-# as the reason its upgrade would stall. Nightly from its first merge:
+# as the reason its upgrade would be held. Nightly from its first merge:
 # the ledger objectives need an install with a GitHub ledger (a token minter
 # and a registered GitOps repository), which the eval fleet's has.
 ./tasks/upgrades-audit-reports-upgrade-blocked/task.yaml

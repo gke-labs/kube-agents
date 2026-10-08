@@ -43,7 +43,7 @@ writes `checks_not_applicable`; see the comment above `collect_one_cluster`.
 
 The eleventh, `upgrade-blocked`, is the one check here that reads workload
 state, and the one that is inapplicable by construction on most clusters: it
-asks whether the upgrade a cluster needs would finish, so a cluster with no
+asks how the upgrade a cluster needs would go, so a cluster with no
 `master-behind` or `pool-skew` candidate -- current, or mid-upgrade with the
 version checks suppressed -- has no upgrade to schedule and gets a
 `checks_not_applicable` entry saying which; so does a behind cluster on no
@@ -180,7 +180,7 @@ VERSION_RE = re.compile(r"^(\d+)\.(\d+)\.(\d+)(?:-gke\.(\d+))?$")
 # version data is meaningless, and an alpha cluster cannot be upgraded and
 # expires on its own. The SOP leaves both out of either scope list.
 # 3.11 `upgrade-blocked`: the fleet-upgrade-verification reporter grades, per
-# member, whether the upgrade it needs would complete. It lives two
+# member, how the upgrade it needs would go. It lives two
 # directories over, in that skill's `scripts/`; `Path(__file__).parents[2]`
 # is the `skills/` directory both are installed under, in the image and in
 # the repository alike.
@@ -247,11 +247,16 @@ UNEVALUATED_TIMED_OUT = "the readiness reporter ran past its budget ({seconds}s)
 UNEVALUATED_REPORT_MALFORMED = "the readiness reporter's report was not in the shape this check reads ({error})"
 UNEVALUATED_STATUS_FORMAT = "status {status!r}{note}"
 UNEVALUATED_REPORT_MESSAGE_CHARS = 200
-# One tail per cause: a budget stalls the node drain; a skew ceiling has GKE
-# refuse the control-plane move before any drain starts.
+# One tail per cause. A budget does not stop the upgrade: a surge upgrade
+# respects it for up to an hour per node and then evicts the workload anyway
+# (the upgrade-failure catalogue's entry 1), so this arm warns of a held
+# drain that ends in a forced eviction, never of an upgrade that does not
+# finish. A skew ceiling does stop it: GKE refuses the control-plane move
+# before any drain starts, so only that arm says "would not complete".
 UPGRADE_BLOCKED_IMPACT_PDB_FORMAT = (
-    "{cluster} is {lag} and its upgrade would not complete: {cause}, so the node drain an upgrade performs stalls on it."
+    "{cluster} is {lag} and its upgrade would be held, not stopped: {cause}, so GKE holds each node's drain for up to an hour and then evicts {workloads} anyway."
 )
+UPGRADE_BLOCKED_PDB_WORKLOADS_FALLBACK = "the workload"
 UPGRADE_BLOCKED_IMPACT_SKEW_FORMAT = (
     "{cluster} is {lag} and its upgrade would not complete: {cause}, so GKE will not move the control plane until the pool moves."
 )
@@ -304,8 +309,9 @@ SEVERITY = {
 # stronger one: (a) says nothing patches this control plane, (b) and (c) say it is
 # behind while still being patched. `IMPACT` is per-check, so the branch that
 # earns this one carries it on the hit and `_emit` prefers it.
-# `upgrade-blocked`'s two arms make a different claim too: a budget stalls
-# the node drain, a skew ceiling has GKE refuse the control-plane move.
+# `upgrade-blocked`'s two arms make a different claim too: a budget holds
+# the node drain until GKE evicts the workload anyway, a skew ceiling has GKE
+# refuse the control-plane move.
 ARM_SPECIFIC_IMPACT_CHECKS = {"master-behind", UPGRADE_BLOCKED_CHECK}
 BEHIND_MASTER_IMPACT = "Control plane is behind its release channel's default {default} and carries whatever the intervening builds fixed until it moves; GKE is still patching it."
 UNSUPPORTED_MASTER_IMPACT = "Control plane runs a version no channel at this location offers; it is outside the supported window and receives no further patches."
@@ -321,7 +327,7 @@ IMPACT = {
     "blocking-exclusion": "A maintenance exclusion is currently suppressing upgrades on this cluster.",
     "stale-image-type": "This node pool's image type is no longer offered at this location and cannot take node-image patches.",
     "no-notifications": "This cluster publishes no GKE upgrade notifications; upgrade-available signals reach no one between audits.",
-    UPGRADE_BLOCKED_CHECK: "This cluster is behind, and the node drain its upgrade performs would stall, so the upgrade would not complete.",
+    UPGRADE_BLOCKED_CHECK: "This cluster is behind, and the upgrade it needs would not go through cleanly: a drain-blocking budget holds each node's drain for up to an hour before GKE evicts the workload anyway, or a version-skew ceiling has GKE refuse the control-plane move.",
 }
 
 
@@ -1203,21 +1209,24 @@ def _workload_name(workload: object) -> str:
     return str(workload)
 
 
-def _readiness_cause(readiness: dict, *, prefer_skew: bool = False) -> tuple[str, str] | None:
-    """Why the reporter graded a member blocked, as (impact format, cause) in
-    the two forms 3.11 flags; None for a block that rests on a maintenance
-    exclusion alone, which is 3.8's subject and not a drain that cannot
-    finish. A budget comes first unless the caller says the upgrade due is
-    the control plane's (`prefer_skew`), which no budget can block and a skew
-    ceiling can."""
+def _readiness_cause(readiness: dict, *, prefer_skew: bool = False) -> tuple[str, str, str] | None:
+    """Why the reporter graded a member blocked, as (impact format, cause,
+    workloads) in the two forms 3.11 flags; None for a block that rests on a
+    maintenance exclusion alone, which is 3.8's subject and neither a held
+    drain nor a refused move. `workloads` names what the budget arm's forced
+    eviction removes, every covered workload once in budget order, and is
+    empty for skew, whose tail names no workload. A budget comes first unless
+    the caller says the upgrade due is the control plane's (`prefer_skew`),
+    which no budget can block and a skew ceiling can."""
     pdbs = [p for p in (readiness.get("pdbs") or {}).get("blocking") or [] if isinstance(p, dict)]
     skew = (readiness.get("skew") or {}).get("blocking") or []
     if prefer_skew and skew:
-        return UPGRADE_BLOCKED_IMPACT_SKEW_FORMAT, UPGRADE_BLOCKED_SKEW_CAUSE_FORMAT.format(pools=", ".join(str(p) for p in skew))
+        return UPGRADE_BLOCKED_IMPACT_SKEW_FORMAT, UPGRADE_BLOCKED_SKEW_CAUSE_FORMAT.format(pools=", ".join(str(p) for p in skew)), ""
     if pdbs:
         # Every blocking budget, in name order: the reporter lists them in
         # the API's order, and a cause that named only the first would make
         # which budget the ledger shows depend on how the others sort.
+        ordered = sorted(pdbs, key=_pdb_name)
         clauses = [
             UPGRADE_BLOCKED_PDB_CAUSE_FORMAT.format(
                 pdb=_pdb_name(p),
@@ -1225,11 +1234,12 @@ def _readiness_cause(readiness: dict, *, prefer_skew: bool = False) -> tuple[str
                 allowed=p.get("disruptions_allowed"),
                 workloads=", ".join(_workload_name(w) for w in p.get("workloads") or []) or "its workload",
             )
-            for p in sorted(pdbs, key=_pdb_name)
+            for p in ordered
         ]
-        return UPGRADE_BLOCKED_IMPACT_PDB_FORMAT, "; ".join(clauses)
+        evicted = list(dict.fromkeys(_workload_name(w) for p in ordered for w in p.get("workloads") or []))
+        return UPGRADE_BLOCKED_IMPACT_PDB_FORMAT, "; ".join(clauses), ", ".join(evicted) or UPGRADE_BLOCKED_PDB_WORKLOADS_FALLBACK
     if skew:
-        return UPGRADE_BLOCKED_IMPACT_SKEW_FORMAT, UPGRADE_BLOCKED_SKEW_CAUSE_FORMAT.format(pools=", ".join(str(p) for p in skew))
+        return UPGRADE_BLOCKED_IMPACT_SKEW_FORMAT, UPGRADE_BLOCKED_SKEW_CAUSE_FORMAT.format(pools=", ".join(str(p) for p in skew)), ""
     return None
 
 
@@ -1270,14 +1280,14 @@ def _upgrade_blocked_hit(entry: dict, member: dict) -> dict | None:
     found = _readiness_cause(readiness, prefer_skew=lag == LAG_POOL_AHEAD)
     if found is None:
         return None
-    impact_format, cause = found
+    impact_format, cause, workloads = found
     if lag == LAG_POOL_AHEAD and impact_format is UPGRADE_BLOCKED_IMPACT_PDB_FORMAT:
         return None
     return {
         "object": f"Cluster/{entry['_bare_name']}",
         "excerpt": f"readiness.status={READINESS_BLOCKED}: {cause}",
         "severity": CRITICAL,
-        "impact": impact_format.format(cluster=entry["_bare_name"], lag=lag, cause=cause),
+        "impact": impact_format.format(cluster=entry["_bare_name"], lag=lag, cause=cause, workloads=workloads),
     }
 
 
@@ -1470,7 +1480,7 @@ def _join_readiness(project: str, behind: list[dict], argv: list[str], result: R
             # `blocked` for something that is neither a budget, skew, nor an
             # exclusion: a cause the reporter learned after this join was
             # written. Recording it as run-and-clean would publish an
-            # all-clear over an upgrade the reporter says will not complete;
+            # all-clear over an upgrade the reporter says is blocked;
             # it is ungraded until this check knows the cause.
             why = UNEVALUATED_UNRECOGNISED_BLOCK
         if why is not None:

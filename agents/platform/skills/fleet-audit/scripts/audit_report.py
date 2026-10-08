@@ -210,7 +210,7 @@ AUDITS: dict[str, AuditSpec] = {
         # a master behind its channel is the effect of an exclusion or a
         # rollout, a skewed pool and a withdrawn image can take no patches,
         # the spread is a fleet-wide signal no one object owns, and a blocked
-        # upgrade is a drain that would not finish.
+        # upgrade is a drain held to a forced eviction or a move GKE refuses.
         declarable=(
             "no-channel",
             "no-autoupgrade",

@@ -1665,7 +1665,7 @@ class UpgradeBlockedTest(unittest.TestCase):
         self.assertIn("1 minor(s) behind", hit["impact"])
         self.assertIn("refuses eviction of Deployment/pinned-batch-runner", hit["impact"])
         self.assertNotIn("{", hit["impact"])
-        self.assertIn("stalls", hit["impact"])
+        self.assertIn("evicts Deployment/pinned-batch-runner anyway", hit["impact"])
         self.assertNotIn("checks_not_applicable", entry)
 
     def test_the_recorded_command_names_the_reporter_with_rc_zero(self):
@@ -1906,10 +1906,16 @@ class UpgradeBlockedTest(unittest.TestCase):
         self.assertIn("will not move the control plane", hit["impact"])
         self.assertNotIn("node drain", hit["impact"])
 
-    def test_a_budget_block_names_the_stalled_drain(self):
+    def test_a_budget_block_names_the_held_drain_and_the_forced_eviction(self):
         by = self.collect([cluster(name="lag", master=self.BEHIND)], [self.member("lag", pdbs=[self.BUDGET])])
         hit = next(c for c in by["lag"]["candidates"] if c["check"] == pr.UPGRADE_BLOCKED_CHECK)
-        self.assertIn("node drain an upgrade performs stalls", hit["impact"])
+        # The catalogue's entry 1: a surge upgrade respects the budget for up
+        # to an hour per node and then evicts anyway, so the budget arm warns
+        # of a delay that ends in a forced eviction, never of an upgrade that
+        # does not finish; that claim is the skew arm's alone.
+        self.assertIn("would be held, not stopped", hit["impact"])
+        self.assertIn("holds each node's drain for up to an hour and then evicts Deployment/pinned-batch-runner anyway", hit["impact"])
+        self.assertNotIn("would not complete", hit["impact"])
         # Two arms, two claims: `finish` publishes the collector's sentence
         # over the model's, as it does for master-behind.
         self.assertTrue(hit["impact_authoritative"])
