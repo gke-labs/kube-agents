@@ -389,7 +389,9 @@ summary as a `GitLab:` clause), and hands the readings to
 `health.py --periodics-dir`. A sweep build that passed while that report names
 a token due, dead or unreadable is a `TOKEN` note of its own (the sweep stays
 green on a due token, so this is where it is said): posted once per episode
-with the token lines, cleared by the first passed build that names none.
+with the token lines, tracked apart from the sweep's own failed-and-recovered
+episode, and cleared by the first passed build whose report was read and
+names none.
 
 Like the pool note it rides beside the state and never becomes one. A job whose
 latest finished build failed is a `FAILED` note, once it is news: the sweep runs

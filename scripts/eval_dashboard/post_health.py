@@ -967,18 +967,34 @@ def periodic_key(note: dict) -> str:
     return str(note.get("verdict"))
 
 
+# The token episode is tracked apart from the job's own: a TOKEN note rides a
+# passed build, so it can alternate with the sweep's FAILED note inside one
+# rotation window, and each must be said once and cleared once.
+TOKEN_TOLD_SUFFIX = "#token"
+
+
+def told_key(job: str, note: dict) -> str:
+    """The poster's memory key for a note: the job, or the job's token episode."""
+    return f"{job}{TOKEN_TOLD_SUFFIX}" if note.get("verdict") == periodics.VERDICT_TOKEN else job
+
+
+def told_job(key: str) -> str:
+    return key[: -len(TOKEN_TOLD_SUFFIX)] if key.endswith(TOKEN_TOLD_SUFFIX) else key
+
+
 def periodic_news(health: dict, prev: dict | None) -> dict[str, dict]:
     """The notes not yet told this episode, by job: never told, told with
     another verdict, or told and since read clean (the clear's send failed,
-    so the told key stayed) and failing again."""
+    so the told key stayed) and failing again. A TOKEN note is its own
+    episode: a FAILED note between two sightings of the same due token does
+    not make the second one news."""
     told = (prev or {}).get("periodics_told") or {}
     clean_seen = set((prev or {}).get("periodics_clean_seen") or [])
     return {
         job: note
         for job, note in (health.get("periodics") or {}).items()
-        if told.get(job) != periodic_key(note) or job in clean_seen
+        if told.get(told_key(job, note)) != periodic_key(note) or told_key(job, note) in clean_seen
     }
-
 
 def _superseded_map(health: dict) -> dict:
     """health.json's `periodics_superseded`: `{job: {build, recovery}}`; an
@@ -988,9 +1004,12 @@ def _superseded_map(health: dict) -> dict:
 
 
 def periodic_clears(health: dict, prev: dict | None) -> list[str]:
-    """The jobs the space was told about whose latest read build passed. Read
-    and not noted is not enough: a failed build under the job's threshold
-    writes no note either, and is not a recovery."""
+    """The told keys whose episode ended: a job the space was told about whose
+    latest read build passed, or a token episode whose latest read build
+    passed with its GitLab report read and naming no token. Read and not noted
+    is not enough: a failed build under the job's threshold writes no note
+    either, and is not a recovery. A TOKEN note on the job does not keep the
+    job's own FAILED episode open, and a FAILED note does not end the token's."""
     told = (prev or {}).get("periodics_told") or {}
     current = health.get("periodics") or {}
     read = set(health.get("periodics_read") or [])
@@ -998,20 +1017,27 @@ def periodic_clears(health: dict, prev: dict | None) -> list[str]:
 
     superseded = _superseded_map(health)
 
-    def recovered(job):
+    def open_now(key):
+        note = current.get(told_job(key))
+        if not isinstance(note, dict):
+            return False
+        is_token = note.get("verdict") == periodics.VERDICT_TOKEN
+        return is_token == key.endswith(TOKEN_TOLD_SUFFIX)
+
+    def recovered(key):
         # Its own passed build, or the tick's decision that a later pass of
         # the job that supersedes it reached its projects. A silence (a
-        # later failed daily) is not a recovery and clears nothing. A TOKEN
-        # note is about the credential, so only a passed build whose GitLab
-        # report was read and names no token clears it: a build whose report
-        # was not read says nothing about the token.
+        # later failed daily) is not a recovery and clears nothing. The token
+        # episode is about the credential, so only a passed build whose
+        # GitLab report was read and names no token ends it: a build whose
+        # report was not read says nothing about the token.
+        job = told_job(key)
         run = runs.get(job) or {}
-        if told.get(job) == periodics.VERDICT_TOKEN:
+        if key.endswith(TOKEN_TOLD_SUFFIX):
             return bool(run.get("passed")) and run.get(periodics.KEY_TOKENS_CURRENT) is True
         return bool(run.get("passed")) or bool((superseded.get(job) or {}).get(periodics.SUPERSEDED_KEY_RECOVERY))
 
-    return sorted(job for job in told if job in read and job not in current and recovered(job))
-
+    return sorted(key for key in told if told_job(key) in read and not open_now(key) and recovered(key))
 
 def _job_words(job: str, note: dict | None = None) -> dict:
     """The message words for a job: from its note when there is one, else from
@@ -1080,7 +1106,8 @@ def render_periodic_clear(health: dict, prev: dict | None) -> str:
     lines = []
     runs = health.get("periodics_runs") or {}
     superseded = _superseded_map(health)
-    for job in periodic_clears(health, prev):
+    for key in periodic_clears(health, prev):
+        job = told_job(key)
         words = _job_words(job)
         run = runs.get(job) or {}
         if (superseded.get(job) or {}).get(periodics.SUPERSEDED_KEY_RECOVERY) and not run.get("passed"):
@@ -1095,7 +1122,7 @@ def render_periodic_clear(health: dict, prev: dict | None) -> str:
             lines.append(f"✅ *{words['place']}: {words['presence']}.* `{job}`'s build {run.get('build')} failure is cleared by `{other}`'s {when} run (build {theirs.get('build')}){did}.")
             continue
         when = clock(parse_iso(run.get("finished_at"))) if run.get("finished_at") else None
-        if (((prev or {}).get("periodics_told") or {}).get(job)) == periodics.VERDICT_TOKEN:
+        if key.endswith(TOKEN_TOLD_SUFFIX):
             # What was told was the credential, so what clears is the credential.
             lines.append(f"✅ *{words['place']}: {periodics.TOKEN_PRESENCE}.* `{job}`'s {when} run (build {run.get('build')}) names no token to rotate.")
             continue
@@ -1647,18 +1674,18 @@ def run(
     if KIND_PERIODIC_CLEAR in kinds and KIND_PERIODIC_CLEAR not in sent:
         clean_seen.update(cleared)
     if KIND_PERIODIC_CLEAR in sent:
-        for job in cleared:
-            periodics_told.pop(job, None)
-            clean_seen.discard(job)
+        for key in cleared:
+            periodics_told.pop(key, None)
+            clean_seen.discard(key)
     if KIND_PERIODIC in sent:
         for job, note in (health.get("periodics") or {}).items():
-            periodics_told[job] = periodic_key(note)
-            clean_seen.discard(job)
+            periodics_told[told_key(job, note)] = periodic_key(note)
+            clean_seen.discard(told_key(job, note))
     # A job no longer watched is never read again, so it would never clear.
-    for job in list(periodics_told):
-        if job not in periodics.WATCHED_BY_JOB:
-            periodics_told.pop(job)
-            clean_seen.discard(job)
+    for key in list(periodics_told):
+        if told_job(key) not in periodics.WATCHED_BY_JOB:
+            periodics_told.pop(key)
+            clean_seen.discard(key)
     source = health if told_state else before
     state = {
         "schema_version": STATE_SCHEMA_VERSION,
