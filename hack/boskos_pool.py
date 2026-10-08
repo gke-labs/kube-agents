@@ -83,7 +83,8 @@ def terminate(signum, frame):
     # Later terminations are held back until the next unblock at depth 0
     # (_hold_signals), which raises the first of them: the code unwinding from
     # this raise reaches its next deferred region without a second raise
-    # landing between the catch and the region's start.
+    # landing between the catch and the region's start. The unblock raises
+    # the same way, so every Terminated leaves later ones held.
     _defer_terminations()
     raise Terminated("signal %d" % signum)
 
@@ -220,9 +221,11 @@ def _heartbeat(server, owner, hold_state, name, stop):
 
 # Termination signals deferred while a hold is between its acquire and its
 # armed `finally`, or inside its release: the handler below records them and
-# the unblock raises the first as Terminated in the hold's own frame. Done
-# with Python-level handlers rather than a signal mask because the mask does
-# not stop a process-directed signal reaching another thread.
+# the unblock raises the first as Terminated in the hold's own frame, with
+# later ones held again until the next unblock, as a raise from `terminate`
+# leaves them. Done with Python-level handlers rather than a signal mask
+# because the mask does not stop a process-directed signal reaching another
+# thread.
 _DEFERRED = []
 _HOLD_DEPTH = 0
 
@@ -257,12 +260,18 @@ def _hold_signals(block):
     if _HOLD_DEPTH:
         return
     time.sleep(SIGNAL_SETTLE_SECONDS)
+    # Restored before the list is read: a signal arriving during the restore
+    # is either appended, and raised here, or raised by `terminate`, held.
     for sig in TERMINATION_SIGNALS:
         if signal.getsignal(sig) is _defer:
             signal.signal(sig, terminate)
     if _DEFERRED:
         signum = _DEFERRED[0]
         _DEFERRED.clear()
+        # Held again before the raise, as `terminate` does: the code catching
+        # this reaches its next deferred region, or the end of its drain,
+        # without a second raise landing between the catch and that point.
+        _defer_terminations()
         raise Terminated("signal %d" % signum)
 
 
