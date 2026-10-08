@@ -925,13 +925,18 @@ _WAITING_ON_CHILDREN_SQL = (
 )
 
 
-def count_waiting_on_children(conn) -> int:
+def count_waiting_on_children(conn, below_priority: Optional[int] = None) -> int:
     """``running`` cards that are only waiting for work they fanned out.
 
     Subtracted from ``count_running_tasks`` so a waiter does not hold the slot
     its children need. Waiting means holding an unsettled recorded child that is
     not gated behind this card — ``kanban_children_settled``'s test, so the two
     never disagree about whether a card is done waiting.
+
+    ``below_priority`` narrows the count to cards whose ``priority`` is below
+    it. ``kanban_priority`` passes its ``USER_PRIORITY`` to discount waiting
+    background coordinators from the background share, the same discount this
+    function gives the host-wide count (issue #2678).
 
     Fails open to 0, including for a board whose attribution table was never
     written. Zero is upstream's count, so an error here narrows dispatch rather
@@ -942,9 +947,15 @@ def count_waiting_on_children(conn) -> int:
     and recurs every tick until the writer installs, so it stays at debug.
     """
     try:
-        row = conn.execute(
-            _WAITING_ON_CHILDREN_SQL, CHILD_SETTLED_STATUSES
-        ).fetchone()
+        if below_priority is None:
+            row = conn.execute(
+                _WAITING_ON_CHILDREN_SQL, CHILD_SETTLED_STATUSES
+            ).fetchone()
+        else:
+            row = conn.execute(
+                _WAITING_ON_CHILDREN_SQL + " AND t.priority < ?",
+                (*CHILD_SETTLED_STATUSES, int(below_priority)),
+            ).fetchone()
         return int(row[0]) if row else 0
     except Exception as exc:  # noqa: BLE001 — never break the dispatch tick
         # Matched on the message rather than the type because the table is

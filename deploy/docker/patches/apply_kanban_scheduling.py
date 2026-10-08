@@ -2,7 +2,7 @@
 """Wire the kanban scheduling repairs into ``hermes_cli/kanban_db.py`` and
 ``hermes_cli/kanban_db_dispatch.py``.
 
-Six anchored edits across two files plus one import trailer per file. Most of
+Ten edits (eleven anchors) across two files plus one import trailer per file. Most of
 them used to be three separate appliers (``apply_kanban_dependency_repair``,
 ``apply_kanban_claim_fencing``, ``apply_kanban_breaker_counter``) rewriting the
 same source in sequence, each with its own idempotency story and two of them
@@ -63,11 +63,27 @@ origin module. The edits therefore land in two files:
        call sites because ``count_running_tasks_other_boards`` calls it per
        board and the cap is host-level. The text is unchanged from v2026.8.19;
        only the file moved.
+    7. ``DispatchResult`` — four fields for edits 8-10 to fill:
+       ``skipped_reserved``, ``saturation``, ``ready_left`` and
+       ``queued_noticed`` (gke-labs/kube-agents#2678).
+    8. ``_tick_spawn_budget`` cap branch — record what holds the slots before
+       the early return, which otherwise leaves nothing on the result for the
+       gateway's health check to tell "saturated" from "broken" with.
+    9. ``_dispatch_once_locked``'s ``if not may_spawn`` return — tell user
+       cards left waiting by a full cap that they are queued.
+   10. The ready loop, two anchors — build the tick's ``ReservedSlot`` at the
+       loop head; skip a background row once background cards hold
+       ``max_in_progress - 1`` slots and charge each spawn against that share
+       at the spawn; after the loop, record saturation and the queued
+       notices. Modelled on upstream's review-lane reservation a few lines
+       above it. The logic and the reasons are in ``kanban_priority.py``.
 
 Edits 2-4 must stay ordered before 5 for reading rather than for correctness:
 the fence decides which cards reach the breaker at all, and the charge it adds
 is a caller of the very function 5 rewrites. Edit 6 is independent of all of
-them. The anchors do not overlap. Both files are held in memory and compiled
+them; edits 7-10 read edit 6's counter (through ``count_running_tasks``) and
+its waiting-coordinator SQL (through ``count_waiting_on_children``) and touch
+none of the other edits' lines. The anchors do not overlap. Both files are held in memory and compiled
 before either is written, so a Hermes bump that moves one anchor in the second
 file leaves the first untouched rather than half of the patch applied.
 
@@ -183,7 +199,7 @@ COMPATIBILITY WITH ``apply_kanban_wake_nudge``
 That patch edits ``kanban_db.py`` too, at ``create_task``, ``complete_task`` and
 ``unblock_task``, and runs after this one. The one anchor here in that file is
 in ``block_task``, its replacement text contains none of the three wake anchors,
-and the other five edits are in a file that patch does not touch, so this
+and the other ten edits are in a file that patch does not touch, so this
 applier neither consumes nor invalidates them. ``test_kanban_scheduling.py``
 asserts that rather than leaving it to inspection, because the coupling is
 invisible from either file alone.
@@ -314,10 +330,16 @@ DB_ALREADY_PATCHED = (
     "from hermes_cli.kanban_scheduling import",
     "_kanban_repair_inverted_deps(conn, task_id, reason)",
 )
+# The same, for edits 7-10: the reservation check, which the Dockerfile greps
+# for. test_kanban_scheduling asserts the Dockerfile still greps for it.
+RESERVED_BUILD_MARKER = "if _kanban_slot.holds_back(row, result):"
+
 DISPATCH_ALREADY_PATCHED = (
     "from hermes_cli.kanban_scheduling import",
     "_kanban_claim_is_self(lock, _kanban_claimer)",
     BUILD_MARKER,
+    "from hermes_cli.kanban_priority import",
+    RESERVED_BUILD_MARKER,
 )
 
 # --- 1. block_task: repair inverted fan-out edges before declaring the wait ---
@@ -517,6 +539,125 @@ WAITING_PATCHED = (
     f"    {WAITING_BUILD_MARKER}\n"
 )
 
+# --- 7. DispatchResult: what edits 8-10 record ------------------------------
+#
+# After upstream's last field, so the new ones keep defaults like every other.
+# ``memory_pressure`` is upstream's precedent for a restriction recorded on the
+# result, and its docstring pins the anchor to this class.
+RESULT_FIELDS_ANCHOR = (
+    "    memory_pressure: Optional[str] = None\n"
+    '    """Memory pressure that restricted this tick: ``"critical"`` (no new\n'
+    '    workers), ``"elevated"`` (at most one), ``None`` (no restriction).\n'
+    '    Reclaim/promotion bookkeeping still ran; deferred tasks stay queued."""\n'
+)
+
+RESULT_FIELDS_PATCHED = RESULT_FIELDS_ANCHOR + (
+    "    # kube-agents patch: user cards ahead of background triage\n"
+    "    # (gke-labs/kube-agents#2678). See hermes_cli/kanban_priority.py.\n"
+    "    skipped_reserved: list[str] = field(default_factory=list)\n"
+    '    """Ready background task ids held back because background cards already\n'
+    "    hold every slot but the one reserved for user cards. Picked up on a\n"
+    '    later tick; NOT stuck."""\n'
+    "    saturation: Optional[dict] = None\n"
+    '    """What held the slots when this tick left cards waiting: running count,\n'
+    "    limit, background/user split, the first running cards, and how many\n"
+    '    user and background cards wait. ``None`` when nothing waited on a slot."""\n'
+    "    ready_left: Optional[int] = None\n"
+    '    """Ready, unclaimed rows left after the ready loop (``None``: the loop\n'
+    '    did not finish)."""\n'
+    "    queued_noticed: list[str] = field(default_factory=list)\n"
+    '    """User task ids that got a ``queued`` event this tick."""\n'
+)
+
+# --- 8. _tick_spawn_budget: say what filled the cap -------------------------
+#
+# The ``max_in_progress`` branch only: the ``max_spawn`` branch above it returns
+# the same ``False, None`` and is not set in this install. ``board`` is the
+# function's own parameter.
+SATURATION_ANCHOR = (
+    "        total_running = running_count + count_running_tasks_other_boards(board)\n"
+    "        if total_running >= max_in_progress:\n"
+    "            return False, None\n"
+)
+
+SATURATION_PATCHED = (
+    "        total_running = running_count + count_running_tasks_other_boards(board)\n"
+    "        if total_running >= max_in_progress:\n"
+    "            # kube-agents patch: record what holds the slots, so the gateway\n"
+    "            # logs saturation instead of \"stuck\". Never raises.\n"
+    "            # See hermes_cli/kanban_priority.py (#2678).\n"
+    "            _kanban_record_saturation(\n"
+    "                conn, result, total_running, max_in_progress, board\n"
+    "            )\n"
+    "            return False, None\n"
+)
+
+# --- 9. _dispatch_once_locked: a full cap still tells users they wait --------
+CAPPED_ANCHOR = (
+    "    may_spawn, spawn_budget = _tick_spawn_budget(\n"
+    "        conn, result, max_spawn=max_spawn, max_in_progress=max_in_progress, board=board,\n"
+    "    )\n"
+    "    if not may_spawn:\n"
+    "        return result\n"
+)
+
+CAPPED_PATCHED = (
+    "    may_spawn, spawn_budget = _tick_spawn_budget(\n"
+    "        conn, result, max_spawn=max_spawn, max_in_progress=max_in_progress, board=board,\n"
+    "    )\n"
+    "    if not may_spawn:\n"
+    "        # kube-agents patch: a full cap returns before any ready row is\n"
+    "        # read, so this is where a waiting user card is told it is queued.\n"
+    "        # Acts only when edit 8 recorded saturation (not memory pressure).\n"
+    "        # See hermes_cli/kanban_priority.py (#2678).\n"
+    "        _kanban_note_waiting(\n"
+    "            conn, result, max_in_progress=max_in_progress, board=board,\n"
+    "            dry_run=dry_run,\n"
+    "        )\n"
+    "        return result\n"
+)
+
+# --- 10. the ready loop: one slot held for user cards -------------------------
+#
+# Two anchors in the one loop: its head, where the tick's share is read, and
+# its spawn, where the share is checked and charged. The check sits after the
+# default-assignee handling so an unassigned row still lands in
+# ``skipped_unassigned`` rather than being reported as reserved. Upstream's
+# ``ORDER BY priority DESC`` already puts user rows first.
+RESERVE_HEAD_ANCHOR = (
+    "    spawned = 0\n"
+    "    for row in ready_rows:\n"
+    "        if ready_budget is not None and spawned >= ready_budget:\n"
+    "            break\n"
+)
+
+RESERVE_HEAD_PATCHED = (
+    "    spawned = 0\n"
+    "    # kube-agents patch: at a cap of 2 or more, background cards may hold\n"
+    "    # every slot but one, so a user card never waits behind triage.\n"
+    "    # See hermes_cli/kanban_priority.py (#2678).\n"
+    "    _kanban_slot = _kanban_reserved_slot(conn, max_in_progress, board)\n"
+    "    for row in ready_rows:\n"
+    "        if ready_budget is not None and spawned >= ready_budget:\n"
+    "            break\n"
+)
+
+RESERVE_SPAWN_ANCHOR = (
+    '        if _dispatch_lane_task(conn, row, row_assignee, result, lane="ready", **lane_kwargs):\n'
+    "            spawned += 1\n"
+)
+
+RESERVE_SPAWN_PATCHED = (
+    f"        {RESERVED_BUILD_MARKER}\n"
+    "            continue\n"
+    '        if _dispatch_lane_task(conn, row, row_assignee, result, lane="ready", **lane_kwargs):\n'
+    "            spawned += 1\n"
+    "            _kanban_slot.took(row)\n"
+    "    # kube-agents patch: record saturation and tell user cards still\n"
+    "    # waiting that they are queued, once per wait.\n"
+    "    _kanban_slot.finish(result, dry_run=dry_run)\n"
+)
+
 DB_TRAILER = (
     "\n\n# kube-agents patch: see hermes_cli/kanban_scheduling.py\n"
     "from hermes_cli.kanban_scheduling import (  # noqa: E402\n"
@@ -532,6 +673,12 @@ DISPATCH_TRAILER = (
     "    count_waiting_on_children as _kanban_count_waiting_on_children,\n"
     "    release_dead_foreign_claims as _kanban_release_dead_foreign_claims,\n"
     ")\n"
+    "\n# kube-agents patch: see hermes_cli/kanban_priority.py\n"
+    "from hermes_cli.kanban_priority import (  # noqa: E402\n"
+    "    note_waiting as _kanban_note_waiting,\n"
+    "    record_saturation as _kanban_record_saturation,\n"
+    "    reserved_slot as _kanban_reserved_slot,\n"
+    ")\n"
 )
 
 # ``(file, label, anchor, replacement)``. The file is part of the edit now that
@@ -544,6 +691,11 @@ EDITS = (
     (DISPATCH_RELATIVE, "reclaim charging", CHARGE_ANCHOR, CHARGE_PATCHED),
     (DISPATCH_RELATIVE, "_record_task_failure trip floor", TRIP_ANCHOR, TRIP_PATCHED),
     (DISPATCH_RELATIVE, "waiting-coordinator discount", WAITING_ANCHOR, WAITING_PATCHED),
+    (DISPATCH_RELATIVE, "DispatchResult reservation fields", RESULT_FIELDS_ANCHOR, RESULT_FIELDS_PATCHED),
+    (DISPATCH_RELATIVE, "_tick_spawn_budget saturation record", SATURATION_ANCHOR, SATURATION_PATCHED),
+    (DISPATCH_RELATIVE, "capped tick queued notice", CAPPED_ANCHOR, CAPPED_PATCHED),
+    (DISPATCH_RELATIVE, "ready loop reserved slot", RESERVE_HEAD_ANCHOR, RESERVE_HEAD_PATCHED),
+    (DISPATCH_RELATIVE, "ready loop spawn accounting", RESERVE_SPAWN_ANCHOR, RESERVE_SPAWN_PATCHED),
 )
 
 TRAILERS = (
@@ -558,7 +710,7 @@ ALREADY_PATCHED = (
 
 
 def apply(root: Path) -> None:
-    """Apply all six edits under ``root``, or raise SystemExit with the reason.
+    """Apply all ten edits under ``root``, or raise SystemExit with the reason.
 
     Nothing is written until every anchor in both files has matched exactly
     once and both results compile, so a Hermes bump that moves one anchor

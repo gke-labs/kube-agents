@@ -1124,9 +1124,19 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/kanban-result/apply_kanban_report_format.
 #
 # Must stay ahead of the kanban_wake_nudge block below, which anchors on
 # `create_task`, `complete_task` and `unblock_task` in hermes_cli/kanban_db.py.
-# The one anchor here in that file (`block_task`) and the five in
+# The one anchor here in that file (`block_task`) and the ten in
 # kanban_db_dispatch.py touch none of those three, and test_kanban_scheduling.py
 # asserts that rather than leaving it to a reader.
+#
+# Edits 7-10 hold one worker slot for user cards (gke-labs/kube-agents#2678):
+# at a cap of 2 or more, background cards (event triage, cron relays) may hold
+# every slot but one; a full cap records what holds the slots on the
+# DispatchResult; and a user card left waiting gets one `queued` event per
+# wait. Their runtime is hermes_cli/kanban_priority.py, installed here with
+# `install -m 0644` inside the RUN rather than by a COPY of its own, to add no
+# layer. The create-time priority stamp, the gateway's saturation warning and
+# the notifier's delivery of `queued` are wired by apply_kanban_priority.py in
+# the latency block further down. See deploy/docker/patches/kanban_priority.py.
 # See the module docstring in deploy/docker/patches/kanban_scheduling.py and the
 # applier docstring in deploy/docker/patches/apply_kanban_scheduling.py.
 COPY --chmod=0644 deploy/docker/patches/kanban_scheduling.py /opt/hermes/hermes_cli/kanban_scheduling.py
@@ -1138,9 +1148,11 @@ COPY deploy/docker/patches/apply_kanban_scheduling.py \
      deploy/docker/patches/verify_kanban_scheduling.py \
      deploy/docker/patches/kanban_scheduling.py \
      deploy/docker/patches/kanban_children_settled.py \
+     deploy/docker/patches/kanban_priority.py \
      deploy/docker/patches/patchlib.py \
      /tmp/kanban-scheduling/
-RUN /opt/hermes/.venv/bin/python3 /tmp/kanban-scheduling/apply_kanban_scheduling.py /opt/hermes && \
+RUN install -m 0644 /tmp/kanban-scheduling/kanban_priority.py /opt/hermes/hermes_cli/kanban_priority.py && \
+    /opt/hermes/.venv/bin/python3 /tmp/kanban-scheduling/apply_kanban_scheduling.py /opt/hermes && \
     grep -q "_kanban_repair_inverted_deps(conn, task_id, reason)" /opt/hermes/hermes_cli/kanban_db.py && \
     grep -q "conn, _kanban_claimer, _kb._pid_alive, _kb._resolve_crash_grace_seconds" /opt/hermes/hermes_cli/kanban_db_dispatch.py && \
     grep -q "_kanban_claim_is_self(lock, _kanban_claimer)" /opt/hermes/hermes_cli/kanban_db_dispatch.py && \
@@ -1154,6 +1166,13 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/kanban-scheduling/apply_kanban_scheduling
     test "$(grep -c '(retry_status, failures, error, task_id),' /opt/hermes/hermes_cli/kanban_db_dispatch.py)" = "1" && \
     test "$(grep -c 'from hermes_cli.kanban_scheduling import' /opt/hermes/hermes_cli/kanban_db.py)" = "1" && \
     test "$(grep -c 'from hermes_cli.kanban_scheduling import' /opt/hermes/hermes_cli/kanban_db_dispatch.py)" = "1" && \
+    grep -q "if _kanban_slot.holds_back(row, result):" /opt/hermes/hermes_cli/kanban_db_dispatch.py && \
+    grep -q "_kanban_slot = _kanban_reserved_slot(conn, max_in_progress, board)" /opt/hermes/hermes_cli/kanban_db_dispatch.py && \
+    grep -q "_kanban_slot.finish(result, dry_run=dry_run)" /opt/hermes/hermes_cli/kanban_db_dispatch.py && \
+    grep -q "skipped_reserved: list\[str\] = field(default_factory=list)" /opt/hermes/hermes_cli/kanban_db_dispatch.py && \
+    test "$(grep -c '_kanban_record_saturation(' /opt/hermes/hermes_cli/kanban_db_dispatch.py)" = "1" && \
+    test "$(grep -c '_kanban_note_waiting(' /opt/hermes/hermes_cli/kanban_db_dispatch.py)" = "1" && \
+    test "$(grep -c 'from hermes_cli.kanban_priority import' /opt/hermes/hermes_cli/kanban_db_dispatch.py)" = "1" && \
     cd /opt/hermes && /opt/hermes/.venv/bin/python3 /tmp/kanban-scheduling/verify_kanban_scheduling.py && \
     rm -rf /tmp/kanban-scheduling
 
