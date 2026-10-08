@@ -1097,9 +1097,9 @@ finished_at, exit, exit_code, error, mapped, visited, outcomes{project:
 {outcome, detail, started_at?, finished_at?, allowlist_unused[]?}}, summary}`
 (`mapped` is how many projects the run set out to visit and `visited` how
 many it held; a held project carries its times, and `allowlist_unused` only
-when its plan was read; `fleet_tree` is a hash of the stack's inputs under
-`bench/tf/fleet` (`*.tf`, `*.hcl`, `reconcile-allow.json`), not the directory's
-git tree; `main_check_error` is set when the moved-check could
+when its plan was read; `fleet_tree` is the hash `hack/fleet_reconcile.py` computes
+over the stack's inputs (`docs/ci-pool-projects.md` 6.2 names them), not the
+directory's git tree; `main_check_error` is set when the moved-check could
 not read main; outcomes are applied, converged, unchanged, planned, busy,
 refused, failed, interrupted, not_reached); the sweep's,
 `pull-sweep.json` from `hack/ci_sweep_agent_pulls.py --report`, is

@@ -151,7 +151,9 @@ FLEET_SUBDIR = "bench/tf/fleet"
 # The files that change what a run applies: the stack and its lock file, and
 # the allowlist the inspection reads. README.md and fixtures.json live beside
 # them and tofu never reads them, so they do not move the fleet tree: a
-# docs-only merge neither stops a running reconcile nor needs one.
+# docs-only merge neither stops a running reconcile nor needs one. A new input
+# kind (a tfvars file, a templatefile source) goes here and into the
+# postsubmit's run_if_changed in oss-test-infra together.
 FLEET_INPUT_SUFFIXES = (".tf", ".hcl")
 FLEET_INPUT_NAMES = ("reconcile-allow.json",)
 GIT_TIMEOUT_SECONDS = 120
@@ -220,7 +222,7 @@ REASON_CEILING_INIT = "did not finish within %ds: its init was cut after %ds que
 REASON_RUNNER = "could not run tofu (%s: %s)"
 REASON_NOT_REACHED_BUDGET = "not started: %ds left in the run's budget, under the %ds per-project ceiling; the next run takes it"
 REASON_NOT_REACHED_BUDGET_MARK = "left in the run's budget"
-REASON_NOT_REACHED_MOVED = "not started: bench/tf/fleet on %s is now %s and this run applies %s; the next run takes it"
+REASON_NOT_REACHED_MOVED = "not started: the fleet stack under bench/tf/fleet on %s is now %s and this run applies %s; the next run takes it"
 REASON_NOT_REACHED_BUSY = "not free in Boskos before the run's budget ran out; the next run takes it"
 REASON_NOT_REACHED_TERMINATED = "not started: the run was terminated; the next run takes it"
 REASON_NOT_REACHED_RUN_ERROR = "not started: the run stopped on an error (%s); the next run takes it"
@@ -741,9 +743,15 @@ def is_fleet_input(path):
 def fleet_tree(rev):
     """A hash over the stack's inputs under FLEET_SUBDIR at `rev`: each input's
     mode, blob and path from `git ls-tree`, so a change to any of them moves it
-    and a change to anything else there does not."""
-    listing = git_output(["ls-tree", "-r", "--full-tree", rev, "--", FLEET_SUBDIR])
-    lines = sorted(line for line in listing.splitlines() if "\t" in line and is_fleet_input(line.split("\t", 1)[1]))
+    and a change to anything else there does not. A rev with no inputs there
+    is an error, not a tree: a ref that resolves but lacks the stack must fail
+    the run, not read as "main moved" and drain it green."""
+    # -z: NUL-separated entries with the path unquoted, so a non-ASCII name is
+    # still matched by its suffix.
+    listing = git_output(["ls-tree", "-r", "-z", "--full-tree", rev, "--", FLEET_SUBDIR])
+    lines = sorted(entry for entry in listing.split("\0") if "\t" in entry and is_fleet_input(entry.split("\t", 1)[1]))
+    if not lines:
+        raise ReconcileError("no stack inputs (%s, %s) under %s at %s; not a kube-agents checkout, or the wrong ref" % ("/".join(FLEET_INPUT_SUFFIXES), "/".join(FLEET_INPUT_NAMES), FLEET_SUBDIR, rev))
     return hashlib.sha256("\n".join(lines).encode()).hexdigest()
 
 
@@ -1238,7 +1246,7 @@ def main(argv=None):
     parser.add_argument("--budget-seconds", type=int, help="how long the whole run may take; no project starts with less than the ceiling left (default: unbounded)")
     parser.add_argument("--project-ceiling-seconds", type=int, default=PROJECT_TIMEOUT_SECONDS, help="the most one project may take, init through apply (default: %(default)s)")
     parser.add_argument("--workers", type=int, default=DEFAULT_WORKERS, help="projects reconciled at once, each under its own lease (default: %(default)s)")
-    parser.add_argument("--stop-when-moved", metavar="REMOTE/BRANCH", help="stop, with the rest not reached, once this ref's bench/tf/fleet tree differs from the checkout's (the jobs pass origin/main)")
+    parser.add_argument("--stop-when-moved", metavar="REMOTE/BRANCH", help="stop, with the rest not reached, once this ref's fleet tree (a hash of the stack's files under bench/tf/fleet: *.tf, *.hcl, reconcile-allow.json) differs from the checkout's (the jobs pass origin/main)")
     parser.add_argument("--no-publish", action="store_true", help="do not write applied.json to the project's state bucket")
     parser.add_argument(
         "--report",
@@ -1328,7 +1336,7 @@ def _start(args, error):
         error.append(str(exc))
         print("ERROR: %s" % exc, file=sys.stderr)
         raise SystemExit(EXIT_FAILED)
-    commit, fleet_tree = _provenance()
+    commit, tree = _provenance()
     run = Run(
         budget_seconds=args.budget_seconds,
         ceiling_seconds=args.project_ceiling_seconds,
@@ -1336,7 +1344,7 @@ def _start(args, error):
         allow=allow,
         workers=args.workers,
         commit=commit,
-        fleet_tree=fleet_tree,
+        fleet_tree=tree,
         build=os.environ.get(BUILD_ID_ENV),
         job=os.environ.get(JOB_NAME_ENV),
         publish=not args.no_publish,

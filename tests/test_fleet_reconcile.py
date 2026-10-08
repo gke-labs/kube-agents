@@ -68,8 +68,8 @@ KNOWN = {P7, P8}
 # The fleet tree is a hash over the stack's inputs under bench/tf/fleet as
 # `git ls-tree` lists them; the recipe is pinned here, independent of the code:
 # sha256 over the sorted input lines, docs left out.
-LS_TREE_HEAD = ["ls-tree", "-r", "--full-tree", "HEAD", "--", "bench/tf/fleet"]
-LS_TREE_FETCHED = ["ls-tree", "-r", "--full-tree", "FETCH_HEAD", "--", "bench/tf/fleet"]
+LS_TREE_HEAD = ["ls-tree", "-r", "-z", "--full-tree", "HEAD", "--", "bench/tf/fleet"]
+LS_TREE_FETCHED = ["ls-tree", "-r", "-z", "--full-tree", "FETCH_HEAD", "--", "bench/tf/fleet"]
 FLEET_INPUTS = {"main.tf": "aaa1", "versions.tf": "aaa2", ".terraform.lock.hcl": "aaa3", "reconcile-allow.json": "aaa4"}
 FLEET_DOCS = {"README.md": "doc1", "fixtures.json": "fix1"}
 
@@ -79,7 +79,8 @@ def _fleet_lines(**blobs):
 
 
 def _fleet_listing(**blobs):
-    return "\n".join(_fleet_lines(**blobs))
+    # As `git ls-tree -z` prints it: NUL between entries, paths unquoted.
+    return "\0".join(_fleet_lines(**blobs))
 
 
 def _fleet_hash(**inputs):
@@ -744,6 +745,26 @@ class MainTest(unittest.TestCase):
         self.assertEqual(boskos.acquired, [])
         self.assertEqual((doc["exit"], doc["exit_code"]), ("terminated", boskos_pool.TERMINATED_EXIT_CODE))
         self.assertIn("terminated (signal 15) after 0 project(s)", stderr.getvalue())
+
+    def test_a_main_ref_without_the_stack_fails_the_run_before_anything_is_leased(self):
+        # The ref fetches and resolves, but its tree has no stack: the first
+        # check is fatal, as for a ref git cannot read, and nothing is leased.
+        def git(args):
+            if args[:1] == ["fetch"]:
+                return ""
+            if args == LS_TREE_FETCHED:
+                return _fleet_listing(**FLEET_DOCS)
+            return FLEET_A if args[:1] == ["ls-tree"] else "commit-111"
+
+        boskos = _Boskos(free=[P7])
+        stderr = io.StringIO()
+        with mock.patch.object(reconcile, "git_output", git), mock.patch.object(boskos_pool.urllib.request, "urlopen", boskos), mock.patch.object(
+            reconcile, "tofu_runner", _Tofu({})
+        ), mock.patch.object(reconcile.signal, "signal"), mock.patch.object(reconcile, "pool_projects", lambda *a, **k: {P7}), mock.patch("sys.stdout", io.StringIO()), mock.patch("sys.stderr", stderr):
+            rc = reconcile.main(["--all", "--stop-when-moved", "origin/main", "--boskos-server", BOSKOS, "--boskos-owner", OWNER])
+        self.assertEqual(rc, reconcile.EXIT_FAILED)
+        self.assertEqual(boskos.acquired, [])
+        self.assertIn("no stack inputs", stderr.getvalue())
 
     def test_a_main_that_moved_before_the_first_project_is_not_reached_and_not_blamed_on_boskos(self):
         def git(args):
@@ -1451,6 +1472,22 @@ class FleetTreeTest(unittest.TestCase):
             moved = _fleet_listing(**{**FLEET_INPUTS, name: "zzz"}, **FLEET_DOCS)
             self.assertNotEqual(self._tree(moved), TREE_A, name)
 
+    def test_a_rev_with_no_inputs_is_an_error_not_a_tree(self):
+        # A ref that resolves but lacks the stack (the wrong remote or branch)
+        # must fail the run, not read as "main moved" and drain it green.
+        with mock.patch.object(reconcile, "git_output", lambda args: ""):
+            with self.assertRaises(reconcile.ReconcileError) as caught:
+                reconcile.fleet_tree("FETCH_HEAD")
+        self.assertIn("no stack inputs", str(caught.exception))
+        with mock.patch.object(reconcile, "git_output", lambda args: _fleet_listing(**FLEET_DOCS)):
+            with self.assertRaises(reconcile.ReconcileError):
+                reconcile.fleet_tree("FETCH_HEAD")
+
+    def test_a_non_ascii_input_name_is_still_an_input(self):
+        # `ls-tree -z` prints the path unquoted, so the suffix test sees it.
+        listing = _fleet_listing(**FLEET_INPUTS, **{"caf\u00e9.tf": "cccc"}, **FLEET_DOCS)
+        self.assertNotEqual(self._tree(listing), TREE_A)
+
     def test_the_inputs_are_the_stack_its_lock_and_the_allowlist(self):
         self.assertTrue(all(reconcile.is_fleet_input("bench/tf/fleet/" + n) for n in ("main.tf", "defects-b.tf", ".terraform.lock.hcl", "reconcile-allow.json")))
         self.assertFalse(any(reconcile.is_fleet_input("bench/tf/fleet/" + n) for n in ("README.md", "fixtures.json", "notes.txt", "reconcile-allow.json.bak")))
@@ -1728,6 +1765,22 @@ class ReportFieldsTest(unittest.TestCase):
         if args == LS_TREE_HEAD:
             return FLEET_A
         raise AssertionError(args)
+
+    def test_provenance_names_what_git_could_not_answer(self):
+        # Each read fails on its own: the other value is still carried, and
+        # the warning names the one that is missing.
+        def failing(which):
+            def git(args):
+                if args[:1] == [which]:
+                    raise reconcile.ReconcileError("git %s: boom" % which)
+                return FLEET_A if args[:1] == ["ls-tree"] else "commit-111"
+            return git
+
+        for which, expected, missing in (("ls-tree", ("commit-111", None), "fleet tree"), ("rev-parse", (None, TREE_A), "commit")):
+            stderr = io.StringIO()
+            with mock.patch.object(reconcile, "git_output", failing(which)), mock.patch("sys.stderr", stderr):
+                self.assertEqual(reconcile._provenance(), expected, which)
+            self.assertIn("carry no %s" % missing, stderr.getvalue())
 
     def test_the_report_carries_the_commit_the_tree_the_times_and_the_visited_count(self):
         boskos = _Boskos(free=[P7])
