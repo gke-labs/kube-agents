@@ -90,7 +90,7 @@ RETURN_ANCHOR = (
 RETURN_PATCHED = (
     "        # kube-agents patch: say when the new card waits for a worker slot,\n"
     "        # so the creating turn can tell the user it is queued.\n"
-    "        # See hermes_cli/kanban_priority.py (#2678).\n"
+    "        # See hermes_cli/kanban_priority.py.\n"
     "        return _ok(\n"
     "            task_id=new_tid, **landed,\n"
     "            subscribed=_maybe_auto_subscribe(conn, new_tid),\n"
@@ -120,7 +120,7 @@ STUCK_PATCHED = (
     "                    ready_pending = await _to_thread_process_service(dispatcher.ready_nonempty)\n"
     "                    # kube-agents patch: every slot busy (or the one held for\n"
     "                    # user cards) is saturation, logged as such, and not a\n"
-    "                    # broken profile. See hermes_cli/kanban_priority.py (#2678).\n"
+    "                    # broken profile. See hermes_cli/kanban_priority.py.\n"
     "                    if _kanban_saturation_tick(\n"
     "                        logger, results, ready_pending, any_spawned, _HEALTH_WINDOW\n"
     "                    ):\n"
@@ -142,7 +142,7 @@ KINDS_COMMENT = (
     "# writes one per wait for a user card left without a worker slot; it\n"
     "# is claimed here so the notice reaches the card's thread, and it is\n"
     "# absent from _WAKE_KINDS so it costs no LLM turn.\n"
-    "# See hermes_cli/kanban_priority.py (#2678).\n"
+    "# See hermes_cli/kanban_priority.py.\n"
 )
 
 #: Kinds the filter must still carry for it to be the one this patch means.

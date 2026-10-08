@@ -1130,9 +1130,9 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/kanban-result/apply_kanban_report_format.
 # kanban_db_dispatch.py touch none of those three, and test_kanban_scheduling.py
 # asserts that rather than leaving it to a reader.
 #
-# Edits 7-10 hold one worker slot for user cards (gke-labs/kube-agents#2678):
-# at a cap of 2 or more, background cards (event triage, cron relays) may hold
-# every slot but one; a full cap records what holds the slots on the
+# Edits 7-10 hold one worker slot for each class of card, user and background:
+# at a cap of 2 or more, background cards (event triage, cron relays) and user
+# cards may each hold every slot but one; a full cap records what holds the slots on the
 # DispatchResult; and a user card left waiting gets one `queued` event per
 # wait. Their runtime is hermes_cli/kanban_priority.py, installed here with
 # `install -m 0644` inside the RUN rather than by a COPY of its own, to add no
@@ -1463,7 +1463,7 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/apply_state_db_sync
 # itself was installed by its own stage.
 # See the module docstring in deploy/docker/patches/kanban_children_settled.py.
 #
-# kanban_priority (gke-labs/kube-agents#2678): user cards ahead of background
+# kanban_priority: user cards ahead of background
 # triage. The dispatcher half (one slot held for user cards, the saturation
 # record, the `queued` events) is in the kanban-scheduling stage above, which
 # also installs hermes_cli/kanban_priority.py. This applier wires the rest:

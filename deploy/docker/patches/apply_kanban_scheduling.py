@@ -65,15 +65,15 @@ origin module. The edits therefore land in two files:
        only the file moved.
     7. ``DispatchResult`` — four fields for edits 8-10 to fill:
        ``skipped_reserved``, ``saturation``, ``ready_left`` and
-       ``queued_noticed`` (gke-labs/kube-agents#2678).
+       ``queued_noticed``, for the per-class slot floor.
     8. ``_tick_spawn_budget`` cap branch — record what holds the slots before
        the early return, which otherwise leaves nothing on the result for the
        gateway's health check to tell "saturated" from "broken" with.
     9. ``_dispatch_once_locked``'s ``if not may_spawn`` return — tell user
        cards left waiting by a full cap that they are queued.
    10. The ready loop, two anchors — build the tick's ``ReservedSlot`` at the
-       loop head; skip a background row once background cards hold
-       ``max_in_progress - 1`` slots and charge each spawn against that share
+       loop head; skip a row once its class (user or background) holds
+       ``max_in_progress - 1`` slots and charge each spawn against its class
        at the spawn; after the loop, record saturation and the queued
        notices. Modelled on upstream's review-lane reservation a few lines
        above it. The logic and the reasons are in ``kanban_priority.py``.
@@ -552,19 +552,20 @@ RESULT_FIELDS_ANCHOR = (
 )
 
 RESULT_FIELDS_PATCHED = RESULT_FIELDS_ANCHOR + (
-    "    # kube-agents patch: user cards ahead of background triage\n"
-    "    # (gke-labs/kube-agents#2678). See hermes_cli/kanban_priority.py.\n"
+    "    # kube-agents patch: user cards ahead of background triage, with\n"
+    "    # a slot held for each class. See hermes_cli/kanban_priority.py.\n"
     "    skipped_reserved: list[str] = field(default_factory=list)\n"
-    '    """Ready background task ids held back because background cards already\n'
-    "    hold every slot but the one reserved for user cards. Picked up on a\n"
-    '    later tick; NOT stuck."""\n'
+    '    """Ready task ids held back because their class already holds every\n'
+    "    slot but the one guaranteed to the other class (user or background).\n"
+    '    Picked up on a later tick; NOT stuck."""\n'
     "    saturation: Optional[dict] = None\n"
     '    """What held the slots when this tick left cards waiting: running count,\n'
     "    limit, background/user split, the first running cards, and how many\n"
     '    user and background cards wait. ``None`` when nothing waited on a slot."""\n'
     "    ready_left: Optional[int] = None\n"
-    '    """Ready, unclaimed rows left after the ready loop (``None``: the loop\n'
-    '    did not finish)."""\n'
+    '    """Ready, unclaimed rows left waiting for a slot after the ready loop,\n'
+    "    not counting rows the tick skipped for their own reasons (``None``: the\n"
+    '    loop did not finish)."""\n'
     "    queued_noticed: list[str] = field(default_factory=list)\n"
     '    """User task ids that got a ``queued`` event this tick."""\n'
 )
@@ -585,7 +586,7 @@ SATURATION_PATCHED = (
     "        if total_running >= max_in_progress:\n"
     "            # kube-agents patch: record what holds the slots, so the gateway\n"
     "            # logs saturation instead of \"stuck\". Never raises.\n"
-    "            # See hermes_cli/kanban_priority.py (#2678).\n"
+    "            # See hermes_cli/kanban_priority.py.\n"
     "            _kanban_record_saturation(\n"
     "                conn, result, total_running, max_in_progress, board\n"
     "            )\n"
@@ -609,7 +610,7 @@ CAPPED_PATCHED = (
     "        # kube-agents patch: a full cap returns before any ready row is\n"
     "        # read, so this is where a waiting user card is told it is queued.\n"
     "        # Acts only when edit 8 recorded saturation (not memory pressure).\n"
-    "        # See hermes_cli/kanban_priority.py (#2678).\n"
+    "        # See hermes_cli/kanban_priority.py.\n"
     "        _kanban_note_waiting(\n"
     "            conn, result, max_in_progress=max_in_progress, board=board,\n"
     "            dry_run=dry_run,\n"
@@ -633,9 +634,9 @@ RESERVE_HEAD_ANCHOR = (
 
 RESERVE_HEAD_PATCHED = (
     "    spawned = 0\n"
-    "    # kube-agents patch: at a cap of 2 or more, background cards may hold\n"
-    "    # every slot but one, so a user card never waits behind triage.\n"
-    "    # See hermes_cli/kanban_priority.py (#2678).\n"
+    "    # kube-agents patch: at a cap of 2 or more, each class of card (user,\n"
+    "    # background) may hold every slot but one, so neither starves the other.\n"
+    "    # See hermes_cli/kanban_priority.py.\n"
     "    _kanban_slot = _kanban_reserved_slot(conn, max_in_progress, board)\n"
     "    for row in ready_rows:\n"
     "        if ready_budget is not None and spawned >= ready_budget:\n"

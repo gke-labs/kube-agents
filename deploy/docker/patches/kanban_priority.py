@@ -5,7 +5,7 @@ Wired into the dispatcher (``hermes_cli/kanban_db_dispatch.py``) by edits 7-10
 of ``deploy/docker/patches/apply_kanban_scheduling.py``, and into the create
 tool, the dispatcher watcher and the notifier (``tools/kanban_tools.py``,
 ``gateway/kanban_watchers.py``, ``gateway/kanban_watchers_notifier.py``) by
-``deploy/docker/patches/apply_kanban_priority.py``. gke-labs/kube-agents#2678.
+``deploy/docker/patches/apply_kanban_priority.py``.
 
 Why
 ---
@@ -36,13 +36,16 @@ What
    toward the user: a background producer with a prefix this list does not
    know about is treated as a user, which costs triage speed and never a
    user's slot.
-2. **One slot reserved for user cards** (:class:`ReservedSlot`). At a cap of 2
-   or more, background cards may hold at most ``max_in_progress - 1`` slots
-   host-wide; the ready loop skips the rest into
-   ``DispatchResult.skipped_reserved``. Waiting background coordinators are
-   discounted the same way ``count_running_tasks`` discounts every waiting
-   coordinator (``kanban_scheduling`` part 4). At a cap of 1 nothing is
-   reserved; user cards still sort first.
+2. **One slot guaranteed to each class** (:class:`ReservedSlot`). At a cap of
+   2 or more, each class may hold at most ``max_in_progress - 1`` slots
+   host-wide: background cannot take the user's last slot, and user cards
+   (including a door's fan-out) cannot take triage's last slot, so alerts are
+   never silenced. The slots between go to whoever is first, and user cards
+   sort first. The ready loop skips a held row into
+   ``DispatchResult.skipped_reserved``. Waiting coordinators are discounted
+   the same way ``count_running_tasks`` discounts them
+   (``kanban_scheduling`` part 4). At a cap of 1 nothing is held; user cards
+   still sort first.
 3. **An honest warning** (:func:`saturation_tick`). The dispatcher records
    what filled the slots on ``DispatchResult.saturation`` and the watcher logs
    ``kanban dispatcher saturated: ...`` instead of "stuck" when every board is
@@ -61,6 +64,7 @@ point fails open to upstream's behaviour and logs why.
 from __future__ import annotations
 
 import logging
+import os
 import time
 from typing import Any, Callable, Iterable, Optional
 
@@ -176,7 +180,7 @@ def stamp_priority(requested: object, parent: Any = None, origin_session: object
 QUEUED_KIND = "queued"
 
 #: The line the user sees in the card's thread, and that ``kanban_create``
-#: hands the model. Worded by bnaylor (#2678): no counts in the user-facing
+#: hands the model. Worded by bnaylor: no counts in the user-facing
 #: line; the counts go to the gateway log's saturation warning.
 QUEUED_TEXT = "Queued: the system is busy. Your request will start when a worker frees up."
 QUEUED_MARKER = "⏳"
@@ -278,12 +282,15 @@ def count_running_host(conn, board: Optional[str]) -> int:
     )
 
 
-def background_cap(max_in_progress: Optional[int]) -> Optional[int]:
-    """How many slots background cards may hold, or None for no limit.
+def class_cap(max_in_progress: Optional[int]) -> Optional[int]:
+    """How many slots either class may hold, or None for no limit.
 
-    One slot is held for user cards at a cap of 2 or more. A cap of 1 cannot
-    hold one without stopping triage altogether, so nothing is reserved there
-    and user cards only sort first. No cap at all needs no reservation.
+    The same number for both: at a cap of 2 or more, background cards may hold
+    every slot but the one guaranteed to user cards, and user cards every slot
+    but the one guaranteed to background triage. The slots between go to
+    whoever is first, and user cards sort first. A cap of 1 cannot guarantee
+    either class a slot without stopping the other, so nothing is held there
+    and user cards only sort first. No cap at all needs no floor.
     """
     if max_in_progress is None:
         return None
@@ -292,6 +299,10 @@ def background_cap(max_in_progress: Optional[int]) -> Optional[int]:
     except (TypeError, ValueError):
         return None
     return cap - 1 if cap >= 2 else None
+
+
+#: The background share is the original name for the class cap.
+background_cap = class_cap
 
 
 def _ready_rows(conn) -> list:
@@ -310,7 +321,7 @@ def _cell(row: Any, key: str, index: int) -> Any:
 
 
 class ReservedSlot:
-    """The ready loop's view of the background share for one tick.
+    """The ready loop's view of each class's share for one tick.
 
     Built after ``spawned = 0``; :meth:`holds_back` is asked for every row the
     loop is about to dispatch, :meth:`took` is told about every spawn, and
@@ -322,20 +333,24 @@ class ReservedSlot:
         self.conn = conn
         self.board = board
         self.max_in_progress = max_in_progress
-        self.cap = background_cap(max_in_progress)
+        self.cap = class_cap(max_in_progress)
         self.background_running = 0
+        self.user_running = 0
         self.priorities: dict = {}
         if self.cap is None:
             return
         try:
             self.background_running = count_running_background_host(conn, board)
+            self.user_running = max(
+                0, count_running_host(conn, board) - self.background_running
+            )
             self.priorities = {
                 _cell(row, "id", 0): _cell(row, "priority", 1)
                 for row in _ready_rows(conn)
             }
         except Exception as exc:  # noqa: BLE001 — never break the dispatch tick
             logger.warning(
-                "kanban priority: reading the background share failed, no slot "
+                "kanban priority: reading the class shares failed, no slot "
                 "reserved this tick: %r", exc,
             )
             self.cap = None
@@ -349,14 +364,14 @@ class ReservedSlot:
         return int(self.priorities[task_id] or 0)
 
     def holds_back(self, row: Any, result: Any) -> bool:
-        """True when ``row`` is background and the background share is full."""
+        """True when ``row``'s class already holds every slot but the other's one."""
         if self.cap is None:
             return False
         try:
             task_id = _cell(row, "id", 0)
-            if is_user_priority(self._priority(task_id)):
-                return False
-            if self.background_running >= self.cap:
+            user = is_user_priority(self._priority(task_id))
+            running = self.user_running if user else self.background_running
+            if running >= self.cap:
                 result.skipped_reserved.append(task_id)
                 return True
         except Exception as exc:  # noqa: BLE001
@@ -364,11 +379,13 @@ class ReservedSlot:
         return False
 
     def took(self, row: Any) -> None:
-        """Count a spawn against the background share when it was background."""
+        """Count a spawn against its class's share."""
         if self.cap is None:
             return
         try:
-            if not is_user_priority(self._priority(_cell(row, "id", 0))):
+            if is_user_priority(self._priority(_cell(row, "id", 0))):
+                self.user_running += 1
+            else:
                 self.background_running += 1
         except Exception:  # noqa: BLE001
             pass
@@ -424,6 +441,8 @@ def record_saturation(
             "user_waiting": user_waiting,
             "background_waiting": background_waiting,
             "reserved": 0,
+            "reserved_user": 0,
+            "reserved_background": 0,
         }
     except Exception as exc:  # noqa: BLE001 — never break the dispatch tick
         logger.warning("kanban priority: recording saturation failed: %r", exc)
@@ -465,23 +484,30 @@ def note_waiting(
 
     A user card counts as waiting when it is still ``ready`` and unclaimed, the
     tick did not skip it for a reason of its own (no assignee, not a profile,
-    the per-profile cap, the respawn guard) and every slot is busy. Memory
-    pressure can also leave cards behind with slots free; those are not told
-    they are queued, because that is not what is holding them.
+    the per-profile cap, the respawn guard), and either every slot is busy or
+    the only free one is held for background triage. Memory pressure can also
+    leave cards behind with slots free; those are not told they are queued,
+    because that is not what is holding them.
+
+    ``result.ready_left`` counts only the rows left waiting for a slot, so a
+    board whose remaining rows the tick skipped for their own reasons reads as
+    having nothing left, not as stuck.
     """
     try:
         rows = _ready_rows(conn)
-        result.ready_left = len(rows)
-        if max_in_progress is None:
-            return
         skipped = _skipped_ids(result)
         waiting = [
             (_cell(row, "id", 0), _cell(row, "priority", 1))
             for row in rows
             if _cell(row, "id", 0) not in skipped
         ]
+        result.ready_left = len(waiting)
+        if max_in_progress is None:
+            return
         user_waiting = [tid for tid, priority in waiting if is_user_priority(priority)]
-        reserved = len(getattr(result, "skipped_reserved", ()) or ())
+        held = set(getattr(result, "skipped_reserved", ()) or ())
+        held_user = [tid for tid in user_waiting if tid in held]
+        reserved = len(held)
         if not user_waiting and not reserved and result.saturation is None:
             return
         if result.saturation is None:
@@ -492,9 +518,13 @@ def note_waiting(
         if result.saturation is None:
             return
         result.saturation["reserved"] = reserved
-        if int(result.saturation["running"]) < int(max_in_progress) or dry_run:
+        result.saturation["reserved_user"] = len(held_user)
+        result.saturation["reserved_background"] = reserved - len(held_user)
+        if dry_run:
             return
-        owed = [tid for tid in user_waiting if _queued_owed(conn, tid)]
+        full = int(result.saturation["running"]) >= int(max_in_progress)
+        candidates = user_waiting if full else held_user
+        owed = [tid for tid in candidates if _queued_owed(conn, tid)]
         if not owed:
             return
         payload_base = {
@@ -517,12 +547,6 @@ def note_waiting(
 # kanban_create's return value
 # ---------------------------------------------------------------------------
 
-QUEUE_NOTE = (
-    "No worker slot is free, so this card has not started. Tell the user: "
-    f"{QUEUED_MARKER} {QUEUED_TEXT}"
-)
-
-
 def _configured_cap() -> Optional[int]:
     kbd = _kbd()
     return kbd.resolve_max_in_progress(kbd.configured_max_in_progress())
@@ -532,13 +556,17 @@ def queue_fields(
     conn, task_id: str, board: Optional[str] = None,
     cap_reader: Optional[Callable[[], Optional[int]]] = None,
 ) -> dict:
-    """``{"queued": True, "queue_note": ...}`` when the new card will wait.
+    """``{"queued": True, "queue": {...}}`` when the new card will wait.
 
-    A snapshot taken as ``kanban_create`` returns, so the creating turn can
-    say so straight away; the dispatcher's ``queued`` event covers a card that
-    starts waiting later. Empty when the card has started, has no slot to wait
-    for, or anything cannot be read.
+    Machine-readable only. The thread hears about the wait once, from the
+    dispatcher's ``queued`` event, so this carries no text for the model to
+    relay. Empty when the card has started, has no slot to wait for, or
+    anything cannot be read, and in a dispatcher worker: the cap read here is
+    the calling profile's, which is the dispatcher's only in the gateway's own
+    turn (a worker's profile carries no ``kanban`` key).
     """
+    if os.environ.get("HERMES_KANBAN_TASK"):
+        return {}
     try:
         row = conn.execute(
             "SELECT status, priority, created_at, claim_lock FROM tasks WHERE id = ?",
@@ -553,10 +581,11 @@ def queue_fields(
         running = count_running_host(conn, board)
         free = limit - running
         user = is_user_priority(_cell(row, "priority", 1))
-        if not user:
-            cap = background_cap(limit)
-            if cap is not None:
-                free = min(free, cap - count_running_background_host(conn, board))
+        cap = class_cap(limit)
+        if cap is not None:
+            background = count_running_background_host(conn, board)
+            held_by_class = background if not user else max(0, running - background)
+            free = min(free, cap - held_by_class)
         ahead = 0
         for other in _ready_rows(conn):
             if _cell(other, "id", 0) == task_id:
@@ -564,7 +593,7 @@ def queue_fields(
             ahead += 1
         if ahead < free:
             return {}
-        return {"queued": True, "queue_note": QUEUE_NOTE}
+        return {"queued": True, "queue": {"running": running, "limit": limit, "ahead": ahead}}
     except Exception as exc:  # noqa: BLE001 — never fail kanban_create
         logger.debug("kanban priority: queue snapshot failed: %r", exc)
         return {}
@@ -625,7 +654,7 @@ def saturation_of(results: Optional[list]) -> Optional[dict]:
         return None
     merged = dict(sats[0])
     merged["cards"] = [card for sat in sats for card in sat.get("cards", ())][:CARDS_SHOWN]
-    for key in ("user_waiting", "background_waiting", "reserved"):
+    for key in ("user_waiting", "background_waiting", "reserved", "reserved_user", "reserved_background"):
         merged[key] = sum(int(sat.get(key, 0) or 0) for sat in sats)
     return merged
 
@@ -658,10 +687,21 @@ def saturation_message(sat: dict, now: Optional[float] = None) -> str:
         f"{_age(card.get('started_at'), now)} [{_origin(card)}]"
         for card in sat.get("cards", ())
     )
-    # A free slot held back for user cards is not saturation; say which it is.
+    # A free slot held for the other class is not saturation; say which class
+    # is being held back.
     running, limit = sat.get("running"), sat.get("limit")
     full = isinstance(running, int) and isinstance(limit, int) and running >= limit
-    state = "saturated" if full else "holding background cards"
+    held_user = int(sat.get("reserved_user", 0) or 0)
+    held_background = sat.get("reserved_background")
+    if held_background is None:
+        held_background = int(sat.get("reserved", 0) or 0) - held_user
+    held_background = int(held_background or 0)
+    if full:
+        state = "saturated"
+    elif held_user and not held_background:
+        state = "holding user cards"
+    else:
+        state = "holding background cards"
     text = (
         f"kanban dispatcher {state}: {running}/{limit} "
         f"worker slots busy ({sat.get('background_running', 0)} background, "
@@ -669,10 +709,15 @@ def saturation_message(sat: dict, now: Optional[float] = None) -> str:
         f"{sat.get('user_waiting', 0)} user card(s) and "
         f"{sat.get('background_waiting', 0)} background card(s) waiting"
     )
-    if sat.get("reserved"):
+    if held_background:
         text += (
-            f"; {sat['reserved']} background card(s) held back because one slot "
+            f"; {held_background} background card(s) held back because one slot "
             "is reserved for user cards"
+        )
+    if held_user:
+        text += (
+            f"; {held_user} user card(s) held back because one slot is reserved "
+            "for background triage"
         )
     return text
 

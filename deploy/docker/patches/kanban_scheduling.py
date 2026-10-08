@@ -936,7 +936,7 @@ def count_waiting_on_children(conn, below_priority: Optional[int] = None) -> int
     ``below_priority`` narrows the count to cards whose ``priority`` is below
     it. ``kanban_priority`` passes its ``USER_PRIORITY`` to discount waiting
     background coordinators from the background share, the same discount this
-    function gives the host-wide count (issue #2678).
+    function gives the host-wide count.
 
     Fails open to 0, including for a board whose attribution table was never
     written. Zero is upstream's count, so an error here narrows dispatch rather

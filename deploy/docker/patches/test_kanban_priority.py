@@ -1,4 +1,4 @@
-"""Unit tests for user cards ahead of background triage (gke-labs/kube-agents#2678).
+"""Unit tests for user cards ahead of background triage (kanban_priority.py).
 
 Covers ``kanban_priority.py`` (the runtime), edits 7-10 of
 ``apply_kanban_scheduling.py`` (driven through an upstream-shaped dispatcher
@@ -465,12 +465,41 @@ class ReservedSlotTest(unittest.TestCase):
         self.assertEqual(res.skipped_reserved, [])
         self.assertIsNone(res.saturation)
 
-    def test_user_cards_may_take_every_slot(self):
+    def test_cap_2_gives_one_slot_to_each_class(self):
         b = Board(self)
         b.card("u1", U)
         b.card("u2", U)
-        spawned, _ = b.tick(cap=2)
-        self.assertEqual(spawned, ["u1", "u2"])
+        b.card("bg1")
+        spawned, res = b.tick(cap=2)
+        self.assertEqual(spawned, ["u1", "bg1"])
+        self.assertEqual(res.skipped_reserved, ["u2"])
+
+    def test_cap_6_holds_the_sixth_user_card_and_triage_still_runs(self):
+        b = Board(self)
+        for n in range(6):
+            b.card(f"u{n}", U)
+        b.card("bg1")
+        spawned, res = b.tick(cap=6)
+        self.assertEqual(spawned, ["u0", "u1", "u2", "u3", "u4", "bg1"])
+        self.assertEqual(res.skipped_reserved, ["u5"])
+
+    def test_user_cards_alone_leave_triages_slot_free_and_say_so(self):
+        b = Board(self)
+        for n in range(6):
+            b.card(f"u{n}", U)
+        spawned, res = b.tick(cap=6)
+        self.assertEqual(spawned, [f"u{n}" for n in range(5)])
+        self.assertEqual(res.skipped_reserved, ["u5"])
+        self.assertEqual(res.saturation["reserved_user"], 1)
+        self.assertEqual(res.saturation["reserved_background"], 0)
+        self.assertEqual(res.queued_noticed, ["u5"], "a user held for triage's slot is told it waits")
+
+    def test_a_cap_of_1_holds_no_user_card(self):
+        b = Board(self)
+        b.card("u1", U)
+        spawned, res = b.tick(cap=1)
+        self.assertEqual(spawned, ["u1"])
+        self.assertEqual(res.skipped_reserved, [])
 
     def test_running_background_counts_against_the_share(self):
         b = Board(self)
@@ -563,14 +592,22 @@ class SaturationAndQueuedTest(unittest.TestCase):
 
     def test_a_ready_loop_that_runs_out_of_budget_queues_the_rest(self):
         b = Board(self)
+        b.card("bg-run", status="running")
         b.card("u1", U)
         b.card("u2", U)
         b.card("u3", U)
-        spawned, res = b.tick(cap=2)
+        spawned, res = b.tick(cap=3)
         self.assertEqual(spawned, ["u1", "u2"])
         self.assertEqual(res.queued_noticed, ["u3"])
-        self.assertEqual(res.saturation["running"], 2)
+        self.assertEqual(res.saturation["running"], 3)
         self.assertEqual(res.ready_left, 1)
+
+    def test_rows_skipped_for_their_own_reasons_are_not_left_waiting(self):
+        b = Board(self)
+        b.card("orphan", assignee=None)
+        _, res = b.tick(cap=4)
+        self.assertEqual(res.skipped_unassigned, ["orphan"])
+        self.assertEqual(res.ready_left, 0, "an unassigned row is not waiting for a slot")
 
     def test_memory_pressure_with_slots_free_is_not_reported_as_queued(self):
         b = Board(self)
@@ -611,8 +648,7 @@ class QueueFieldsTest(unittest.TestCase):
         b.card("u-run", U, status="running")
         b.card("new", U)
         out = kp.queue_fields(b.conn, "new", cap_reader=lambda: 2)
-        self.assertEqual(out, {"queued": True, "queue_note": kp.QUEUE_NOTE})
-        self.assertIn(QUEUED_LINE, out["queue_note"])
+        self.assertEqual(out, {"queued": True, "queue": {"running": 2, "limit": 2, "ahead": 0}})
 
     def test_a_user_card_with_the_reserved_slot_free_is_not_queued(self):
         b = Board(self)
@@ -632,7 +668,13 @@ class QueueFieldsTest(unittest.TestCase):
         b.card("ahead", U)
         b.card("new", U)
         self.assertTrue(kp.queue_fields(b.conn, "new", cap_reader=lambda: 2).get("queued"))
-        self.assertEqual(kp.queue_fields(b.conn, "new", cap_reader=lambda: 3), {})
+        self.assertEqual(kp.queue_fields(b.conn, "new", cap_reader=lambda: 4), {})
+
+    def test_a_user_card_beyond_the_user_share_is_queued(self):
+        b = Board(self)
+        b.card("u-run", U, status="running")
+        b.card("new", U)
+        self.assertTrue(kp.queue_fields(b.conn, "new", cap_reader=lambda: 2).get("queued"))
 
     def test_a_started_or_uncapped_card_gets_nothing(self):
         b = Board(self)
@@ -650,8 +692,25 @@ class QueueFieldsTest(unittest.TestCase):
         b.card("new", U)
         self.assertEqual(kp.queue_fields(b.conn, "new", cap_reader=broken), {})
 
-    def test_the_note_carries_no_counts(self):
-        self.assertFalse(any(ch.isdigit() for ch in kp.QUEUE_NOTE))
+    def test_the_return_carries_no_text_for_the_model_to_relay(self):
+        """The thread hears about a wait once, from the dispatcher's event."""
+        b = Board(self)
+        b.card("bg-run", status="running")
+        b.card("u-run", U, status="running")
+        b.card("new", U)
+        out = kp.queue_fields(b.conn, "new", cap_reader=lambda: 2)
+        self.assertNotIn("queue_note", out)
+        self.assertFalse(any(isinstance(v, str) for v in out["queue"].values()))
+        self.assertFalse(hasattr(kp, "QUEUE_NOTE"))
+
+    def test_a_dispatcher_worker_gets_nothing(self):
+        """A worker's profile has no kanban key, so its cap is not the dispatcher's."""
+        b = Board(self)
+        b.card("bg-run", status="running")
+        b.card("u-run", U, status="running")
+        b.card("new", U)
+        with mock.patch.dict("os.environ", {"HERMES_KANBAN_TASK": "t_parent"}):
+            self.assertEqual(kp.queue_fields(b.conn, "new", cap_reader=lambda: 2), {})
 
 
 # ---------------------------------------------------------------------------
@@ -785,6 +844,14 @@ class WarningTest(unittest.TestCase):
                 "kanban dispatcher holding background cards: 1/2 worker slots busy"
             )
         )
+
+    def test_a_tick_held_for_triage_says_user_cards_were_held(self):
+        sat = dict(SAT, running=5, limit=6, reserved=1, reserved_user=1, reserved_background=0)
+        text = kp.saturation_message(sat, now=1000)
+        self.assertTrue(text.startswith("kanban dispatcher holding user cards: 5/6"), text)
+        self.assertTrue(text.endswith(
+            "; 1 user card(s) held back because one slot is reserved for background triage"
+        ), text)
 
     def test_a_user_card_is_labelled_user(self):
         sat = dict(SAT, cards=[{"id": "t_1", "assignee": "a", "priority": U, "session_id": "2026_x", "started_at": 990}])

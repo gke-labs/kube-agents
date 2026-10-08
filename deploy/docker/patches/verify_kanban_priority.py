@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build gate for the user-card priority patch (gke-labs/kube-agents#2678).
+"""Build gate for the user-card priority patch (kanban_priority.py).
 
 Run by ``deploy/docker/Dockerfile`` from ``/opt/hermes`` after
 ``apply_kanban_priority.py``. The applier only proves its anchors matched. This
@@ -11,8 +11,8 @@ drives the real patched code:
      ``k8s-evt-...``) and a cron relay card stay background, a model-supplied
      priority or ``session_id`` cannot promote triage, and a dispatcher
      worker's child inherits its parent's class.
-  B. ``kanban_create``'s return says when the new card is queued, and says
-     nothing when a slot is free.
+  B. ``kanban_create``'s return flags a queued card with counts only, and
+     says nothing when a slot is free.
   C. The notifier claims ``queued`` without waking anyone, formats it as the
      agreed sentence, and ``kanban_progress_lines`` posts it bare and then
      rolls the worker's first note into the same message.
@@ -187,14 +187,14 @@ KP._configured_cap = lambda: 2
 session("slack", "C0EXAMPLE", "1700000000.000200")
 queued = tool_create(title="One more question")
 check(
-    "a user card filed into a full cap is reported queued",
-    queued.get("queued") is True and KP.QUEUED_TEXT in str(queued.get("queue_note")),
+    "a user card filed into a full cap is reported queued, machine-readably",
+    queued.get("queued") is True and queued.get("queue", {}).get("limit") == 2,
     f"{queued}",
 )
 check(
-    "the note carries no slot counts",
-    not any(ch.isdigit() for ch in str(queued.get("queue_note"))),
-    f"{queued.get('queue_note')}",
+    "the return carries no text for the model to relay (the thread hears it once)",
+    "queue_note" not in queued,
+    f"{queued}",
 )
 KP._configured_cap = lambda: 8
 free = tool_create(title="A question with slots to spare")

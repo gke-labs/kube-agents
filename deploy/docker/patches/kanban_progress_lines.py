@@ -138,7 +138,7 @@ def progress_note(payload: object, limit: int = DEFAULT_NOTE_LIMIT) -> str:
 #: posting upstream's ``🔄`` line as a message of its own.
 #:
 #: ``queued`` is the dispatcher's notice that a user card is waiting for a
-#: worker slot (``hermes_cli/kanban_priority.py``, #2678). It rolls so the
+#: worker slot (``hermes_cli/kanban_priority.py``). It rolls so the
 #: card's first progress note joins the queued line instead of posting under
 #: it, and so a card queued twice reads as one message.
 ROLLING_KINDS = ("heartbeat", "status", "queued")
@@ -148,7 +148,7 @@ NOTE_KINDS = ("heartbeat", "queued")
 
 #: A queued line that opens a card's rolling message is posted bare, without
 #: the card's header, because it is worded for the user as a whole sentence
-#: (bnaylor, #2678). The header joins once the worker's first note arrives.
+#: (bnaylor). The header joins once the worker's first note arrives.
 QUEUED_KIND = "queued"
 
 #: With ``KAGE_SLACK_UX`` on, the blocked kind that may post a question, and

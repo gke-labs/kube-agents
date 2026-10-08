@@ -109,7 +109,7 @@ from hermes_cli import kanban_db_dispatch as KD  # noqa: E402
 # discriminator's constants can be asserted by name rather than by string.
 from hermes_cli import kanban_scheduling as KS  # noqa: E402
 
-# Edits 7-10's runtime, installed beside it by the same stage (#2678).
+# Edits 7-10's runtime, installed beside it by the same stage.
 from hermes_cli import kanban_priority as KP  # noqa: E402
 
 TMP = Path(tempfile.mkdtemp())
@@ -1300,7 +1300,7 @@ check(
 
 conn.close()
 
-# --- G. One slot held for user cards (#2678) ----------------------------------
+# --- G. One slot held for each class of card -----------------------------------
 #
 # Driven through the real ``dispatch_once`` like section E, with E's
 # ``profile_exists`` stub still in place. Priority 0 is background, as every
@@ -1427,6 +1427,22 @@ check(
     "G5. at cap 1 a user card filed later still goes first",
     asked == [user],
     f"spawned {asked}",
+)
+conn.close()
+
+# G7. The floor is symmetric: at cap 2 two user cards get one slot, and a
+# background card still gets the other.
+conn = fresh()
+u_a = new_card(conn, "Question one", priority=KP.USER_PRIORITY)
+u_b = new_card(conn, "Question two", priority=KP.USER_PRIORITY)
+bg_c = new_card(conn, "Triage alongside")
+K.recompute_ready(conn)
+asked, res = tick(conn, cap=2)
+check(
+    "G7. at cap 2 one user card and one background card run",
+    len(asked) == 2 and bg_c in asked and len(set(asked) & {u_a, u_b}) == 1
+    and len(res.skipped_reserved) == 1,
+    f"spawned {asked}, reserved {res.skipped_reserved}",
 )
 conn.close()
 
