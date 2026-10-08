@@ -17,6 +17,7 @@ limitations under the License.
 package controller
 
 import (
+	"strconv"
 	"strings"
 	"testing"
 
@@ -200,9 +201,15 @@ func TestCredentialProxyBudgetArithmeticAtTheDefaults(t *testing.T) {
 		t.Errorf("the default limit admits %d requests, want 9", got)
 	}
 	// The kanban default runs six workers, each of which may hold a brokered
-	// command; the default limit has to admit at least that many.
-	if got := credentialProxyAdmittedRequests(defaultLimit.Value(), credentialProxyOutputCapBytes); got < defaultKanbanMaxInProgress {
-		t.Errorf("the default limit admits %d requests, fewer than the %d kanban workers the default cap runs", got, defaultKanbanMaxInProgress)
+	// command. What the proxy admits at once is the smaller of its memory
+	// budget and its slot cap, so both have to cover that many.
+	slotCap, err := strconv.ParseInt(credentialProxyMaxConcurrentCommands, 10, 64)
+	if err != nil {
+		t.Fatalf("credentialProxyMaxConcurrentCommands = %q is not an integer: %v", credentialProxyMaxConcurrentCommands, err)
+	}
+	admitted := min(credentialProxyAdmittedRequests(defaultLimit.Value(), credentialProxyOutputCapBytes), slotCap)
+	if admitted < defaultKanbanMaxInProgress {
+		t.Errorf("the proxy admits %d commands at once at its defaults (memory budget or slot cap of %d, whichever is smaller), fewer than the %d kanban workers the default cap runs", admitted, slotCap, defaultKanbanMaxInProgress)
 	}
 	if got := credentialProxyMinimumMemoryLimitBytes(credentialProxyOutputCapBytes); got != 672*mib {
 		t.Errorf("floor = %d MiB, want 672", got/mib)
