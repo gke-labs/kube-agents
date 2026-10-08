@@ -306,6 +306,13 @@ type taskRun struct {
 	// (publishWorking), under mu: a notice reads it for the task's current
 	// state, so none can say submitted after working.
 	workingSent bool
+	// answerHeld is set, under mu, while the API executor's worker holds a
+	// turn's finished answer that is not yet on the stream: from the
+	// response until the next turn's request is sent, or the answer goes
+	// out as the result. shutdownTasks leaves such a run to its worker,
+	// which publishes the answer before any terminal (the capability check
+	// and the turn artifact between two turns take time).
+	answerHeld bool
 
 	canceled    atomic.Bool
 	deadlineHit atomic.Bool
@@ -528,7 +535,8 @@ func (b *Bridge) Run(ctx context.Context) error {
 
 // shutdownTasks kills running subprocesses and finalizes every task still
 // open. A worker unblocked by the kill may finalize with the real outcome
-// first - finalize is idempotent and whoever wins writes exactly once.
+// first - finalize is idempotent and whoever wins writes exactly once. A
+// run whose worker holds a finished answer (answerHeld) is left to it.
 func (b *Bridge) shutdownTasks() {
 	b.mu.Lock()
 	runs := make([]*taskRun, 0, len(b.tasks))
@@ -538,6 +546,12 @@ func (b *Bridge) shutdownTasks() {
 	b.mu.Unlock()
 	for _, r := range runs {
 		r.mu.Lock()
+		if r.state == stateRunning && r.answerHeld {
+			// A finished answer is in the worker's hands; it sees closing
+			// and ends the task with that answer, and Run waits for it.
+			r.mu.Unlock()
+			continue
+		}
 		if r.state == stateRunning && r.proc != nil && r.proc.Process != nil {
 			_ = syscall.Kill(-r.proc.Process.Pid, syscall.SIGKILL)
 		}
@@ -830,6 +844,12 @@ func (b *Bridge) runnableSteer(ctx context.Context, run *taskRun) (*lib.Envelope
 		}
 		reason := b.capabilityRefusal(ctx, steer)
 		if reason == "" {
+			if b.nextSteer(run) != steer {
+				// Canceled, past the deadline or stopping during the
+				// check: the answer in hand is the deliverable, and the
+				// follow-up, still queued, is refused task-ended.
+				return nil, ""
+			}
 			prompt, _ := promptFromMessage(steer.Payload) // text was checked when it was queued
 			return steer, prompt
 		}

@@ -22,6 +22,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nuid"
 
 	lib "github.com/gke-labs/kube-agents/a2a/lib"
@@ -1276,6 +1277,90 @@ func TestAPI_BlankFollowUpIsRefusedNoText(t *testing.T) {
 	}
 	if got := artifactsNamed(t, url, origin.TaskID, lib.ArtifactResult); !slices.Equal(got, []string{"answer to long question"}) {
 		t.Fatalf("result %q", got)
+	}
+}
+
+// heldVerifier holds the verify subject and never replies, closing got when
+// the first check arrives: a Check against it blocks until its timeout or
+// its context ends.
+func heldVerifier(t *testing.T, url string) <-chan struct{} {
+	t.Helper()
+	nc, err := nats.Connect(url, nats.Name("cap-verifier-held"))
+	if err != nil {
+		t.Fatalf("held verifier connect: %v", err)
+	}
+	t.Cleanup(nc.Close)
+	got := make(chan struct{})
+	var once sync.Once
+	if _, err := nc.QueueSubscribe(capability.VerifySubscribe, capability.VerifyQueue,
+		func(*nats.Msg) { once.Do(func() { close(got) }) }); err != nil {
+		t.Fatalf("held verifier subscribe: %v", err)
+	}
+	return got
+}
+
+// A shutdown between a turn's answer and its publication keeps the answer.
+// The worker holds turn 1's answer across the follow-up's capability check;
+// shutdownTasks, landing then, must not write bridge-shutdown over it. The
+// answer is the result, the follow-up is refused task-ended, and the task
+// completes. shutdownTasks is called by hand while the check is parked on a
+// verifier that never answers, so the worker cannot finish first and hide
+// the race; the bridge's own shutdown follows and ends the check.
+func TestAPI_ShutdownWhileAnAnswerIsHeldKeepsTheAnswer(t *testing.T) {
+	_, url := startServerNoVerifier(t)
+	checked := heldVerifier(t, url)
+	stub, in, release := holdingStub(t)
+	b, stop := startBridgeConfig(t, Config{
+		NATSURL: url, Executor: ExecutorAPI, APIURL: stub.srv.URL + "/v1/chat/completions", APIKey: testAPIKey,
+		TaskDeadline: 20 * time.Second, KillGrace: 500 * time.Millisecond, Scope: capability.NamespaceScope(""),
+		// The opening runs unchecked, so the one check the verifier sees
+		// is the follow-up's.
+		CapabilityOptional: true,
+	}, nil)
+	c := gatewayClient(t, url)
+	const taskID = "task-api-held"
+	origin, err := lib.NewMessageEnvelope(gatewayParty, taskID, "ctx-held", "corr-"+taskID,
+		messagePayload(t, taskID, "ctx-held", "long question"), lib.WithTo(lib.Party{Session: "platform"}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Publish(testCtx(t), lib.TaskInSubject("platform", taskID), origin); err != nil {
+		t.Fatal(err)
+	}
+	<-in
+	steer, err := lib.NewFollowUpEnvelope(origin, gatewayParty, messagePayload(t, taskID, "ctx-held", "and the west"),
+		lib.WithTo(lib.Party{Session: "platform"}),
+		lib.WithAuthority(authorityFor(t, capability.Ref{Key: "root." + taskID, Revision: 1})))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Publish(testCtx(t), lib.TaskInSubject("platform", taskID), steer); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 10*time.Second, "queued", func() bool { return len(steerNotices(t, url, taskID)) == 1 })
+	release()
+	select {
+	case <-checked: // the worker holds turn 1's answer, parked in the follow-up's check
+	case <-time.After(10 * time.Second):
+		t.Fatal("the follow-up's capability check never reached the verifier")
+	}
+	b.closing.Store(true)
+	b.shutdownTasks()
+	stop()
+	task := waitTerminal(t, c, taskID)
+	if task.State != lib.StateCompleted {
+		t.Fatalf("state %s (%q), want completed: the shutdown wrote over a finished answer", task.State, terminalText(t, url, taskID))
+	}
+	if got := artifactsNamed(t, url, taskID, lib.ArtifactResult); !slices.Equal(got, []string{"answer to long question"}) {
+		t.Fatalf("result %q, want turn 1's answer", got)
+	}
+	ns := steerNotices(t, url, taskID)
+	if len(ns) != 2 || ns[1].EnvelopeID != steer.EnvelopeID || ns[1].Reason != lib.SteerReasonTaskEnded ||
+		ns[1].seq > finalSeq(t, url, taskID) {
+		t.Fatalf("notices %+v, want the follow-up refused task-ended before the terminal", ns)
+	}
+	if n := len(stub.seen()); n != 1 {
+		t.Fatalf("%d requests, want the opening one only", n)
 	}
 }
 

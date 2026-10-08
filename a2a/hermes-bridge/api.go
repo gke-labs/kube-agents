@@ -402,6 +402,9 @@ func (b *Bridge) apiTurn(run *taskRun, taskCtx context.Context, sessionID, promp
 				"task", run.origin.TaskID, "envelope", steer.EnvelopeID)
 			return "", false
 		}
+		// The last answer is on the stream as a turn artifact; from here
+		// a shutdown ends this request, and the worker names it.
+		run.answerHeld = false
 		run.mu.Unlock()
 	}
 
@@ -462,6 +465,14 @@ func (b *Bridge) apiTurn(run *taskRun, taskCtx context.Context, sessionID, promp
 			reason, resp.StatusCode, sessionID, turnNote(turn), tail(out.Hermes.Error, apiBodyTailBytes)), nil)
 		return "", false
 	}
+	run.mu.Lock()
+	defer run.mu.Unlock()
+	if run.state != stateRunning {
+		return "", false // finalized while the answer was read
+	}
+	// Held until it is on the stream: shutdownTasks leaves the run to this
+	// worker from here (answerHeld).
+	run.answerHeld = true
 	return out.Choices[0].Message.Content, true
 }
 
