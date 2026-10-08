@@ -2055,19 +2055,28 @@ class WorkersTest(unittest.TestCase):
         # A second SIGINT during the drain must also be deferred so the drain
         # finishes waiting and signaling children.
         orig_start = threading.Thread.start
-        fired = False
+        first_worker_seen = None
         second_fired = False
+        in_apply = threading.Event()
 
         def wrapped_start(thread_self):
-            nonlocal fired
-            orig_start(thread_self)
-            if not fired and thread_self.name.startswith("fleet-reconcile-"):
-                fired = True
+            nonlocal first_worker_seen
+            if thread_self.name.startswith("fleet-reconcile-"):
+                if first_worker_seen is None:
+                    first_worker_seen = thread_self.name
+                    orig_start(thread_self)
+                    return
+                # Wait until worker 0 is in apply before firing the startup SIGINT.
+                # This guarantees worker 0 is waiting in apply rather than racing
+                # startup against _begin_termination().
+                in_apply.wait(timeout=15)
                 os.kill(os.getpid(), signal.SIGINT)
+            orig_start(thread_self)
 
         def tofu(argv, **_):
             nonlocal second_fired
             if argv[1] == "apply":
+                in_apply.set()
                 deadline = time.monotonic() + 15
                 while not reconcile.terminating() and time.monotonic() < deadline:
                     time.sleep(0.02)
