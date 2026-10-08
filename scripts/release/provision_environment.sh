@@ -15,6 +15,10 @@ export CLOUDSDK_CORE_DISABLE_PROMPTS="${CLOUDSDK_CORE_DISABLE_PROMPTS:-1}"
 # once a run has passed. Both read the same three outcomes out of uninstall.sh.
 # shellcheck source=scripts/release/teardown_common.sh
 . "$(dirname "${BASH_SOURCE[0]}")/teardown_common.sh"
+# platform_agent_mode_resolve and the `next` patch and gate. Defines and runs
+# nothing; see the mode check below the install refusals.
+# shellcheck source=scripts/release/platform_agent_mode.sh
+. "$(dirname "${BASH_SOURCE[0]}")/platform_agent_mode.sh"
 
 # Verify required GCP/GKE inputs before executing any destructive teardown.
 teardown_require_inputs
@@ -171,6 +175,19 @@ fi
 
 [ "$INSTALL_REFUSAL_STATUS" -eq 0 ] || exit 1
 
+# The PlatformAgent's spec.mode, also above the teardown: a mode that is
+# neither `today` nor `next` is refused here rather than after the environment
+# is gone. Unset and `today` change nothing, down to the environment
+# uninstall.sh and install.sh inherit, which platform_agent_mode_resolve
+# clears of the variable. `next` is applied after the install, at the bottom.
+platform_agent_mode_resolve || exit 1
+# And `next` only on the ephemeral environments; the helper says why.
+# LONG_LIVED_ENVIRONMENT is the workflow's flag for autopush and staging,
+# read with the same truthiness as the allowlist guard above.
+if provision_is_truthy "${LONG_LIVED_ENVIRONMENT:-}"; then
+  platform_agent_mode_refuse_long_lived true "${GKE_CLUSTER_NAME:-}" || exit 1
+fi
+
 TEARDOWN_LOG="$(mktemp)"
 
 echo "==> Tearing down the existing environment (${TEARDOWN_TARGET}) via canonical uninstall.sh..."
@@ -234,7 +251,13 @@ INSTALL_ARGS=(
 # sourced with `set -a` and so beats an exported variable of the same name, and
 # these environments render an install.env from their GitHub variables -- so a
 # setting passed only by export is silently overridden by whatever the rendered
-# file happens to say. A flag is the one thing that wins for a single run.
+# file happens to say. A flag is the one thing that wins for a single run, except
+# the chat flags (the Slack and Google Chat ones below): install.sh refuses one
+# that disagrees with a key the rendered file sets, and appends the key when the
+# file lacks it. On autopush and staging, the install.env deploy-environment.yml
+# renders before calling this script names only the install, so each chat key is
+# appended from its flag; elsewhere there is no file, and the first install
+# writes one.
 if [ -n "${NAMESPACE:-}" ]; then
   INSTALL_ARGS+=(--agent-namespace="${NAMESPACE}")
 fi
@@ -357,3 +380,23 @@ fi
 
 echo "==> Provisioning the environment at the candidate commit via canonical install.sh..."
 ./install.sh "${INSTALL_ARGS[@]}"
+
+# spec.mode: next, set on the CR the install just created, then the gate that
+# waits for what the operator renders for it. install.sh on this tree takes no
+# mode, so the switch is the same merge patch the next-mode dev clusters were
+# installed with. The install's --mode flag (#2524) replaces the patch once it
+# merges: that installer takes PLATFORM_AGENT_MODE from the environment this
+# script leaves it exported in under `next` (only rc and nightly get here
+# with it; the long-lived environments are refused above), so the
+# platform_agent_mode_patch_next call below is then the one line to delete
+# (with this paragraph's patch sentences). The wait stays either way.
+#
+# install.sh has already pointed kubectl at the cluster and checked the
+# context; the context is still named on each call, so nothing here can reach
+# a different cluster.
+if [ "${RELEASE_PLATFORM_AGENT_MODE}" = "${PLATFORM_AGENT_MODE_NEXT}" ]; then
+  MODE_CONTEXT="gke_${GCP_PROJECT_ID}_${GCP_REGION}_${GKE_CLUSTER_NAME}"
+  MODE_NAMESPACE="${NAMESPACE:-$(. "$(dirname "${BASH_SOURCE[0]}")/../../install.defaults.env" && echo "${DEFAULT_NAMESPACE}")}"
+  platform_agent_mode_patch_next "${MODE_NAMESPACE}" "${MODE_CONTEXT}"
+  platform_agent_mode_wait_next "${MODE_NAMESPACE}" "${MODE_CONTEXT}"
+fi

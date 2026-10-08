@@ -224,8 +224,9 @@ func TestAnUnarmedGatewayRendersAsBefore(t *testing.T) {
 			for _, e := range c.Env {
 				names = append(names, e.Name)
 			}
-			want := []string{"NATS_URL", "NATS_USER", "NATS_PASSWORD", "DISCORD_TOKEN", "A2A_MAX_SESSIONS", "A2A_SPAWN_SESSIONS", "A2A_WORKER_IMAGE", a2aStrictEventsWriterEnvVar, a2aCapabilityRequiredEnvVar,
-				"POD_NAMESPACE", "SESSION_KV_SALT", "A2A_OWNER_DEPLOYMENT", "A2A_SESSION_SERVICE_ACCOUNT", a2aPrincipalMapEnvVar}
+			want := []string{"NATS_URL", "NATS_USER", "NATS_PASSWORD", "DISCORD_TOKEN", "A2A_MAX_SESSIONS",
+				a2aGatewayMetricsPortEnvVar, "A2A_SPAWN_SESSIONS", "A2A_WORKER_IMAGE", a2aStrictEventsWriterEnvVar, a2aCapabilityRequiredEnvVar, "POD_NAMESPACE",
+				"SESSION_KV_SALT", "A2A_OWNER_DEPLOYMENT", "A2A_SESSION_SERVICE_ACCOUNT", a2aPrincipalMapEnvVar}
 			// The delegation target allowlists render from the CR's lists
 			// whether or not Chat is armed; they are not the Chat adapter's
 			// env, so they sit at the tail wherever the CR carries a list.

@@ -39,8 +39,9 @@ import sandbox_exec  # noqa: E402 — needs the sys.path lines above
 import vcs_client  # noqa: E402 — needs the sys.path lines above
 from gitops_workspace import (  # noqa: E402 — needs the sys.path lines above
     GITOPS_STATE_READ_TIMEOUT_SECONDS,
-    get_managed_github_repos,
+    get_managed_repos,
     is_valid_repo_slug,
+    qualify,
 )
 
 SCRATCH_DIR = "/opt/data/scratch"
@@ -89,7 +90,7 @@ FORWARD_TIMEOUT_PER_REPO_S = 300
 # What the margin has to cover, and it is not a round number: the gate starts
 # its clock at `subprocess.run`, and everything this process does before
 # `sandbox_exec.run` is entered is spent inside that window. Nearly all of it is
-# one thing -- this process's own `get_managed_github_repos()`, the same
+# one thing -- this process's own `get_managed_repos()`, the same
 # ConfigMap read the gate already paid, bounded by the timeout below. A fixed 15
 # did not cover it: on a slow API server -- which is exactly when that read is
 # slow -- the gate's kill landed first, and an outer kill reaches this process
@@ -208,7 +209,7 @@ def _forward_timeout(argv) -> int:
     repos = 1
     if argv and argv[0] == "poll":
         try:
-            repos = max(1, len(get_managed_github_repos()))
+            repos = max(1, len(get_managed_repos()))
         except Exception:
             repos = 1
     return repos * FORWARD_TIMEOUT_PER_REPO_S - FORWARD_TIMEOUT_MARGIN_S
@@ -625,7 +626,7 @@ def _fetch_comments(repo: str, number) -> tuple[list, bool]:
 
 def handle_poll(args):
     try:
-        repos = get_managed_github_repos()
+        repos = get_managed_repos()
     except Exception as e:
         refuse("CONFIGMAP_READ_FAILED", str(e))
 
@@ -757,6 +758,10 @@ def handle_poll(args):
                 "status": "FOUND",
                 "repository": repo,
                 "issue_number": target["number"],
+                # The forge's own link, not one built here: GitLab's issues are
+                # `/-/work_items/<n>` and a self-managed host has no template.
+                # The broker composed it, so it is not the reporter's text.
+                "issue_url": str(target.get("url") or ""),
                 "priority": priority_label,
                 "title": f"<untrusted_title>{sanitized_title}</untrusted_title>",
                 "title_plain": sanitized_title,
@@ -773,23 +778,31 @@ def handle_poll(args):
     )
 
 
-def _validate_repo_or_exit(repo: str) -> None:
+def _validate_repo_or_exit(repo: str) -> str:
+    """`repo` as the managed list spells it, or a refusal and exit.
+
+    Returned rather than only checked: a bare `owner/name` is lifted to
+    `github.com/owner/name` once the list names a second forge, and that is
+    the spelling the broker then has to be sent.
+    """
     if not repo or not is_valid_repo_slug(repo):
         refuse("INVALID_REPOSITORY", f"Invalid repository format: {repo!r}")
     try:
-        managed = get_managed_github_repos()
+        managed = get_managed_repos()
     except Exception as e:
         refuse("CONFIGMAP_READ_FAILED", str(e))
+    repo = qualify(repo, managed)
     if repo not in managed:
         refuse(
             "UNMANAGED_REPOSITORY",
             f"Repository {repo!r} is not in the managed repositories list: {managed}",
         )
+    return repo
 
 
 def handle_claim(args):
     repo = args.repo
-    _validate_repo_or_exit(repo)
+    repo = _validate_repo_or_exit(repo)
     issue_num = int(args.issue)
     ensure_labels_exist(repo)
 
@@ -836,7 +849,7 @@ def handle_transition(args):
         )
         sys.exit(1)
 
-    _validate_repo_or_exit(repo)
+    repo = _validate_repo_or_exit(repo)
 
     # The report is read here and sent as the comment's body. A path would not
     # work: this file is on the sandbox's filesystem and the forge call is made

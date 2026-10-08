@@ -151,7 +151,7 @@ Every finding must conform to the full findings schema:
 ## Red Lines
 
 - **Read-only audit.** Never terminate Compute Engine instances, delete Persistent Disks, or modify live firewall rules.
-- **No hand-written issues or PRs.** `audit_report.py` owns the entire git/GitHub write path.
+- **No hand-written issues or PRs.** `audit_report.py` owns the entire git and forge write path.
 - **Never print raw credentials.** Secret tokens, certificates, private keys, or credentials in serial port output must never reach an excerpt.
 - **No unstable finding identity.** Name the durable resource identifier (`ComputeInstance/<name>`, `ManagedInstanceGroup/<name>`), never an ephemeral instance ID.
 - **Never emit a manifest that directly deletes a VM or disk.** Deletion remediations are `kind: manual` or `kind: gcloud` only.

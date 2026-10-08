@@ -112,6 +112,19 @@ misconfigurations:
   - id: KSV-0118
     paths:
       - "bench/tf/prebuilt/gitops-fix-cycle/manifests/**"
+  # Ignore KSV-0014 and KSV-0118 on the A2A gateway's conformance fixture
+  # only. It is a generated extract of the rendered gateway's ingress surface
+  # (its three NetworkPolicies, the pod's labels and the container's declared
+  # ports, nothing else) that tests/conformance reads, not a manifest anything applies; the
+  # Deployment it was cut from carries the hardened pod and container security
+  # contexts (buildA2AGatewayDeployment, hardenedSecurityContext), which the
+  # extract leaves out on purpose.
+  - id: KSV-0014
+    paths:
+      - "k8s-operator/internal/controller/testdata/a2a-gateway-ingress.yaml"
+  - id: KSV-0118
+    paths:
+      - "k8s-operator/internal/controller/testdata/a2a-gateway-ingress.yaml"
   # Ignore GCP-0053 and GCP-0061 on the seeded fleet only: the public control
   # plane with a 0.0.0.0/0 authorized-networks block (seeded-a/-b) and the
   # absent block (seeded-c) are deliberately planted eval fixtures -- the

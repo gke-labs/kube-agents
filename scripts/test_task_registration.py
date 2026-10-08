@@ -639,6 +639,30 @@ class TestTheRulesReject(unittest.TestCase):
     def test_a_login_owner_passes(self):
         self.assertEqual(self._validate(owner="some-one1"), [])
 
+    # -- audit_streams --
+
+    def test_declared_audit_streams_pass(self):
+        self.assertEqual(self._validate(audit_streams=["compliance-audit", "stockout-prevention"]), [])
+
+    def test_an_unknown_audit_stream_is_rejected(self):
+        self._only("does not define", audit_streams=["compliance-audit", "no-such-audit"])
+
+    def test_audit_streams_that_are_not_a_list_are_rejected(self):
+        # Blank, padded or newline-bearing ids are refused by the runner's own reader too.
+        for value in ([], "compliance-audit", [1], [""], ["  "], ["compliance-audit\n"]):
+            with self.subTest(value=value):
+                self._only("non-empty list", audit_streams=value)
+
+    def test_an_unreadable_platform_roster_is_a_case_error_naming_it(self):
+        # A CaseError, which the lint's per-case loop reports, not a traceback that hides every case.
+        for text in ("{trailing,}", "null", '{"jobs": {"compliance-audit": {}}}'):
+            with self.subTest(text=text), tempfile.TemporaryDirectory() as tmp:
+                roster = pathlib.Path(tmp) / "jobs.json"
+                roster.write_text(text)
+                with unittest.mock.patch.object(validator, "PLATFORM_JOBS_FILE", roster):
+                    with self.assertRaisesRegex(validator.CaseError, re.escape(str(roster))):
+                        validator.platform_job_ids()
+
     def test_a_quoted_expected_fail_is_rejected(self):
         # yaml.safe_dump quotes a string that would otherwise read as a bool,
         # which is exactly the file a contributor produces by typing quotes.

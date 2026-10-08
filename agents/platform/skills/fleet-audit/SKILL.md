@@ -1,6 +1,6 @@
 ---
 name: fleet-audit
-description: Publish the findings of an autonomous fleet audit as one continuously-rewritten GitHub issue per audit stream, and propose fixes as narrow remediation pull requests.
+description: Publish the findings of an autonomous fleet audit as one continuously-rewritten issue per audit stream on the GitOps repository's forge, and propose fixes as narrow remediation pull requests (merge requests on GitLab).
 ---
 
 # fleet-audit — Audit Findings to a Ledger Issue
@@ -8,7 +8,7 @@ description: Publish the findings of an autonomous fleet audit as one continuous
 Every autonomous audit watchdog ends the same way: findings must reach a human somewhere durable,
 reviewable, and de-duplicated. This skill is that ending, in two tiers:
 
-- **Tier 1 — the ledger.** Each audit stream owns **exactly one open GitHub issue**, rewritten in
+- **Tier 1 — the ledger.** Each audit stream owns **exactly one open issue** on the forge, rewritten in
   full on every run and closed as completed when the fleet comes back clean. An operator watches one
   issue per stream instead of drowning in chat logs.
 - **Tier 2 — the fixes.** When a finding's remediation is a file in this repository, it travels
@@ -181,11 +181,18 @@ Before inspecting anything, claim the workspace:
 ```
 
 This resolves the target repository (using `--repo` if specified, falling back to the single
-configured repo in `$GITOPS_STATE_CONFIGMAP`, or failing if ambiguous across multiple repos), mints
-a repo-scoped GitHub token, establishes a clean workspace, ensures the audit's labels exist, locates
+configured repo in `$GITOPS_STATE_CONFIGMAP`, or failing if ambiguous across multiple repos), makes
+the forge credential current, establishes a clean workspace, ensures the audit's labels exist, locates
 the stream's open ledger issue, and clears any findings document a crashed run left behind. If the
 user asked for a specific repository that is not yet registered, instruct the user or cluster
-administrator to add it to `$GITOPS_STATE_CONFIGMAP`. It creates **no branch** — there is no report
+administrator to add it to `$GITOPS_STATE_CONFIGMAP`. `--repo` takes the name as the managed list
+gives it: `owner/name` on GitHub, `<host>/<path>` for a repository on another forge
+(`gitlab.com/acme/platform/infra`). In content mode the broker's file workspace clones a repository
+from its own forge, so `fetch`, `list`, `grep`, the remediation step and the declared-intent search
+work the same way on every forge, and a remediation on GitLab is a merge request. Directory mode
+serves GitHub only: its local clone reaches no other forge, so `start` and `finish` on a repository
+elsewhere stop at the clone, with no ledger written. Run the audit in content mode for those. It
+creates **no branch** — there is no report
 branch. It prints exactly one JSON line:
 
 ```json
@@ -396,8 +403,8 @@ streams `collect.py` covers: compliance (`governance/compliance_audit_sop.md` §
 (`governance/obtainability_audit_sop.md` §2) and AI security (`governance/ai_security_audit_sop.md`
 §3), the cost stream (`fleet_waste.py`, `governance/fleet_wide_cost_analysis_sop.md` §2) and the
 stockout stream (`fleet_stockout.py`, `governance/stockout_prevention_sop.md` §3).
-The compliance, stockout and cost collectors may also give a target `checks_unevaluated`,
-`{check, reason}` for a check whose own read failed: it did not run and is not inapplicable, so it
+The compliance, obtainability, stockout and cost collectors may also give a target `checks_unevaluated`,
+`{check, reason}` for a check whose own read failed or whose inputs could not decide it: it did not run and is not inapplicable, so it
 goes in neither `checks_run` nor `checks_not_applicable` but in that target's `limitations`, which
 keeps the run partial and leaves open every finding that check filed there. `finish` rejects the
 slug anywhere else.
