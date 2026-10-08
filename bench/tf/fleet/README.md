@@ -31,7 +31,7 @@ window ahead of now). Presence alone passed on 2026-09-07 while every slot-a fix
 Pending (#1278); the state pass is what would have failed that project. A role on a cluster
 it could not reach usually reports as unchecked rather than absent; the warnings that
 override that default are in `docs/ci-pool-projects.md` §6.
-Project N+1 follows the same convention. The fleet owner creates the bucket once per project; switching projects means
+Project N+1 follows the same convention. The fleet owner ([`docs/ownership.md`](../../../docs/ownership.md) says who) creates the bucket once per project; switching projects means
 re-initializing against that project's bucket and naming the project on the apply:
 
     tofu init -reconfigure \

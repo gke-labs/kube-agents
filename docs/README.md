@@ -61,7 +61,7 @@ kube-agents/
 │   ├── designs/                                   per-feature design documents
 │   ├── ci-pool-projects.md, environment-reconcile.md,
 │   │   security-requirements.md, credential-isolation-design.md,
-│   │   eval-gate-roster.md, ci-health.md, testing-map.md,
+│   │   eval-gate-roster.md, ci-health.md, testing-map.md, ownership.md,
 │   │   pull-request-workflow.md                   standalone docs
 │   ├── chatops/, samples/                         the Teams integration and its
 │   │                                              sample manifests
@@ -208,6 +208,7 @@ identifier appears, add its source here.
 | Bundled Hermes platform plugins the image installs (no patch) | the plugin's own `adapter.py` docstring under `deploy/docker/plugins/`, plus the `COPY`/`RUN` list in `deploy/docker/Dockerfile` |
 | Slack bot token scopes an install must grant | upstream `_build_full_manifest` in `hermes_cli/slack_cli.py` as patched by `deploy/docker/patches/apply_slack_reactions_scope.py`; the one prose copy, in `INSTALL.md`, must match it (`scripts/installer/print_instructions_slack.sh` defers to `hermes slack manifest` and carries no copy) |
 | What pod start-up force-syncs from the image vs. preserves on the PV | `deploy/shared/docker-entrypoint.sh` |
+| GitHub logins named as area or service owners | `OWNERS` (approvers and reviewers); `scripts/test_ownership.py` pins `docs/ownership.md` to it |
 | Shared agent defaults (`approvals.*`, `security.*`) | `deploy/shared/defaults/config.yaml` and `renderConfigYAML()` in `k8s-operator/internal/controller/platformagent_manifests.go` |
 | Image defaults and override env vars (`PLATFORM_AGENT_IMAGE` et al.) | `k8s-operator/internal/controller/manifest_helpers.go` |
 | The `status.usage.activeInterfaces` vocabulary (`dashboard`, `googlechat`, `slack`, `teams`) and how each is resolved from the spec | `resolveActiveInterfaces` and the `interface*` constants in `k8s-operator/internal/controller/manifest_helpers.go` |

@@ -457,7 +457,9 @@ The two labels are the two people:
   change from someone in `OWNERS` starts with the `approved` half already satisfied and waits only
   on the `lgtm` (#1075).
 
-Everyone `.github/auto_request_review.yml` can assign is an `OWNERS` approver for what it assigns
+Who to ask about a particular area, as opposed to who may approve, is
+[`docs/ownership.md`](ownership.md). Everyone `.github/auto_request_review.yml` can assign is an
+`OWNERS` approver for what it assigns
 them: its `hack/eval/presubmit-cases.txt` and `hack/eval/blocking-roster.txt` entries send a
 change there to its own `eval-crew` group, so the reviewer the bot's green check summons can clear
 both labels in one action. Not every `eval-crew` member is a root approver, so a change that also touches root-owned
