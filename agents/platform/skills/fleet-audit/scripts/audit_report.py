@@ -434,10 +434,25 @@ AUDITS: dict[str, AuditSpec] = {
         "gce_compute_fleet_sop.md",
         (
             "gce-startup-script-status",
-            "mig-autoscaler-flapping",
-            "ops-agent-guest-health",
+            "mig-convergence-stalled",
             "sole-tenant-headroom",
             "orphaned-snapshots",
+        ),
+        # Every check reads Compute Engine objects that belong to a project, so
+        # the collector names one `project/<id>` entry per project and nothing
+        # else. Declaring the partition is what makes a run that enumerated
+        # some other kind of target -- and so ran none of these four anywhere --
+        # report a gap instead of passing silently.
+        scopes=(
+            (
+                "project",
+                (
+                    "gce-startup-script-status",
+                    "mig-convergence-stalled",
+                    "sole-tenant-headroom",
+                    "orphaned-snapshots",
+                ),
+            ),
         ),
     ),
 }
@@ -457,6 +472,7 @@ COLLECTOR_AUDITS = frozenset(
         "compliance-audit",
         "fleet-consistency-drift",
         "fleet-wide-cost-analysis",
+        "gce-compute-fleet-audit",
         "obtainability-audit",
         "security-patch-orchestrator",
         "stockout-prevention",
@@ -2431,10 +2447,11 @@ def release_in_flight(audit_id: str) -> None:
 def _ledger_key(repo: object) -> str:
     """One spelling per ledger: lowercased, with GitHub's host left off.
 
-    A memory written as `acme/gitops` before a second forge was configured is
-    the same ledger as `github.com/acme/gitops` after; comparing the raw
-    strings would read the first run after the upgrade as a different
-    repository and lose the delta.
+    A memory written as `acme/gitops` is the same ledger as one written as
+    `github.com/acme/gitops` -- the managed list's spelling where another
+    forge's entry shares the path, and every GitHub name's on a release that
+    qualified them all beside a second forge; comparing the raw strings would
+    read the next run as a different repository and lose the delta.
     """
     key = str(repo).lower()
     prefix = "github.com/"
@@ -3527,6 +3544,15 @@ def validate_findings(data: object, audit_id: str) -> dict:
         # run goes partial, so the ledger cannot close and nothing is announced
         # as resolved. What is refused is the *silent* zero, which is what
         # published five clean reports on a fleet that was not.
+        #
+        # A zero that is not silent either: a target whose whole roster sits in
+        # `checks_not_applicable`, each with its reason. Every check is
+        # accounted for there, so it needs no limitations note and adds no gap
+        # -- a GCP project holding no instance, MIG, node group or snapshot is
+        # the standing example, and a note would hold every run partial for as
+        # long as that project exists. Only on a stream whose collector can
+        # corroborate the declarations (`cross_check_manifest`): elsewhere
+        # nothing checks them, and this would be a command-free all-clear.
         checks_run = cluster.get("checks_run")
         cluster_label = str(cluster.get("name", "")) or "this cluster"
         if not isinstance(checks_run, list):
@@ -3537,7 +3563,17 @@ def validate_findings(data: object, audit_id: str) -> dict:
                 "Zero checks on a cluster you could read is not a clean result — "
                 f"it is an audit that did not run. {_sop_pointer(audit_id)}"
             )
-        if not checks_run and not str(cluster.get("limitations", "")).strip():
+        target_roster = set(audit_target_checks(audit_id, str(cluster.get("name", ""))))
+        every_check_inapplicable = (
+            audit_id in COLLECTOR_AUDITS
+            and bool(target_roster)
+            and target_roster <= set(checks_na(cluster))
+        )
+        if (
+            not checks_run
+            and not str(cluster.get("limitations", "")).strip()
+            and not every_check_inapplicable
+        ):
             raise ValidationError(
                 f"scope.clusters[{i}].checks_run: empty for {cluster_label}, which "
                 "claims the cluster was read and nothing was checked on it. That is "
@@ -3545,8 +3581,15 @@ def validate_findings(data: object, audit_id: str) -> dict:
                 "ran, or — if nothing could run there — say why in that cluster's "
                 "limitations, or move it to scope.skipped with a reason. A check "
                 "that cannot apply to this cluster goes in checks_not_applicable "
-                f"with its reason, but a cluster where nothing applies still owes "
-                f"a limitations note. {_sop_pointer(audit_id)}"
+                "with its reason"
+                + (
+                    "; a cluster where every check is listed there needs nothing more"
+                    if audit_id in COLLECTOR_AUDITS
+                    else "; this stream runs no collector to corroborate that, so a "
+                    "cluster where every check is listed there still owes a "
+                    "limitations note or a scope.skipped entry"
+                )
+                + f". {_sop_pointer(audit_id)}"
             )
         seen_checks: set[str] = set()
         for j, entry in enumerate(checks_run):
@@ -5015,6 +5058,32 @@ def cross_check_manifest(data: dict, manifest: dict) -> None:
                 "entry has it, verbatim."
             )
         if not manifest_cluster:
+            # A target the collector never named: nothing corroborates a claim
+            # that every check is inapplicable there, which `validate_findings`
+            # would otherwise accept as full coverage.
+            roster = set(audit_target_checks(audit_id, name))
+            if (
+                roster
+                and not checks_ran(cluster)
+                and roster <= set(checks_na(cluster))
+                and not str(cluster.get("limitations", "")).strip()
+            ):
+                named = next(
+                    (c for c in _manifest_clusters(manifest) if str(c.get("name", "")) == name),
+                    None,
+                )
+                if named and named.get("outcome") == MANIFEST_OUTCOME_OUT_OF_SCOPE:
+                    raise ValidationError(
+                        f"scope.clusters: {name!r} is out of scope for {audit_id} in the "
+                        f"collector manifest{_collector_error(named)}. It need not be "
+                        "listed at all; leave it out of both scope lists."
+                    )
+                raise ValidationError(
+                    f"scope.clusters: {name!r} declares every check inapplicable, but "
+                    f"the collector manifest for {audit_id} does not name it, so "
+                    "nothing corroborates that. Name the checks you ran there, say in "
+                    "its `limitations` why none could run, or leave it out."
+                )
             continue
         claimed = checks_ran(cluster)
         if manifest_cluster.get("outcome") != MANIFEST_OUTCOME_COLLECTED:
@@ -5027,6 +5096,21 @@ def cross_check_manifest(data: dict, manifest: dict) -> None:
             # `coverage_gaps` turns the limitation into a gap, so the run
             # reports itself partial and names the target whose coverage rests
             # on work the manifest cannot check.
+            # The same holds for a check declared inapplicable there: the
+            # collector read nothing, so nothing corroborates that a check
+            # cannot apply, and a target with every check declared so would
+            # otherwise publish as fully covered.
+            declared_na = checks_na(cluster)
+            if declared_na and not claimed and not str(cluster.get("limitations", "")).strip():
+                raise ValidationError(
+                    f"scope.clusters: {name!r} declares {len(declared_na)} check(s) "
+                    f"inapplicable, but the collector manifest for {audit_id} marks it "
+                    f"{str(manifest_cluster.get('outcome'))!r}"
+                    f"{_collector_error(manifest_cluster)}. Nothing was read there, so "
+                    "nothing shows a check cannot apply. Put it in scope.skipped with "
+                    "the collector's error as the reason, or say in this target's "
+                    "`limitations` what you checked by hand."
+                )
             if claimed and not str(cluster.get("limitations", "")).strip():
                 raise ValidationError(
                     f"scope.clusters: {name!r} claims {len(claimed)} check(s) ran, "
@@ -11692,10 +11776,9 @@ def _land_group_via_clone(
 def content_workspace_repo(repo: str) -> str:
     """`repo` as the broker's file workspace takes it: GitHub's bare `owner/name`.
 
-    The workspace keys GitHub's repositories by the bare slug, and an install
-    managing a second forge spells them `github.com/owner/name`
-    (`gitops_workspace.qualify`), so that spelling is put back to the slug at
-    the door. A repository on another forge is passed with its host, and the
+    The workspace keys GitHub's repositories by the bare slug, and the managed
+    list can spell one `github.com/owner/name` (`gitops_workspace.qualify`),
+    so that spelling is put back to the slug at the door. A repository on another forge is passed with its host, and the
     broker clones it from the forge that serves it.
     """
     import gitops_workspace
@@ -12337,9 +12420,9 @@ def read_declarations(audit_id: str, repo: str | None = None) -> list[dict]:
     if not isinstance(data, dict) or data.get("audit") != audit_id:
         return []
     recorded = data.get("repo")
-    # Compared as one ledger, for `read_run_record`'s reason: `start` records the
-    # lifted `github.com/owner/name` on an install with a second forge, and a
-    # dry run's bare `--repo owner/name` names the same repository.
+    # Compared as one ledger, for `read_run_record`'s reason: `start` can record
+    # `github.com/owner/name`, as the managed list spells it, and a dry run's
+    # bare `--repo owner/name` names the same repository.
     if repo and (not isinstance(recorded, str) or _ledger_key(recorded.strip()) != _ledger_key(repo.strip())):
         return []
     entries = data.get(DECLARATIONS_KEY)
@@ -12844,8 +12927,8 @@ def read_run_record(audit_id: str, repo: str | None = None) -> dict | None:
     context = data.get("context_repos")
     if not isinstance(recorded, str) or not recorded or not isinstance(context, list):
         return None
-    # Through `_ledger_key`: `start` records the name it resolved, which on an
-    # install with a second forge is `github.com/owner/name`, while a dry run
+    # Through `_ledger_key`: `start` records the name it resolved, which can be
+    # `github.com/owner/name` as the managed list spells it, while a dry run
     # takes `--repo` as given -- the bare `owner/name` the SKILL prescribes.
     if repo and _ledger_key(recorded.strip()) != _ledger_key(repo.strip()):
         return None

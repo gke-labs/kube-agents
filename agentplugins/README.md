@@ -158,3 +158,8 @@ renders an `AgentPlugin`, a `Dockerfile` over the files the agent loads, and an
   `spec.targetProfile` is loaded only by that profile; a skill it registers is addressed as
   `<plugin>:<skill>` and does not resolve anywhere else. See
   [the AgentPlugin CRD reference](../docs/site/src/content/docs/operator/agentplugin-crd.md).
+- **`make images-check` fences the `Dockerfile`.** After comment and blank lines it must be
+  exactly `FROM <the busybox reference images.json pins>` and `COPY <src> /`, and
+  `hack/check-image-inventory.sh` needs a `check_literal_from` line for it beside the existing
+  two, naming the inventory entry and the `COPY` source. The check fails, naming the file, for a
+  plugin `Dockerfile` that has no such line.

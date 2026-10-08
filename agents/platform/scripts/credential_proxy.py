@@ -1383,6 +1383,20 @@ DESTRUCTIVE_CHAT_METHODS = frozenset({"delete", "batchdelete", "remove", "purge"
 # list naming it.
 DESTRUCTIVE_SLACK_VERBS = frozenset({"delete", "remove", "kick", "archive"})
 
+# The one Slack method the verb rule above would refuse that the relay forwards.
+# Slack's `reactions.remove` takes off only the calling token's own reaction --
+# the bot's, never a person's -- and adding it again undoes it, so it is not in
+# the class the denylist exists for. The agent takes its arrival reaction off
+# when its answer posts. Matched exactly, before case-folding: `Reactions.Remove`
+# is not this method and stays refused, as every other `*.remove` does.
+SLACK_REMOVE_ALLOWLIST = frozenset({"reactions.remove"})
+
+# The shape a Slack method name must have before the verb rule reads it: dotted
+# words of letters and digits (`oauth.v2.access` carries one). The verb rule
+# reads only the text after the last dot, so without this `chat.delete#x`,
+# `chat.delete?x` and `chat.delete.` would pass it -- and slack_sdk joins the
+# string into the URL, where the fragment is dropped and the query ignored.
+SLACK_METHOD_SHAPE = re.compile(r"[A-Za-z][A-Za-z0-9]*(?:\.[A-Za-z][A-Za-z0-9]*)+")
 # The IAM permission a Pub/Sub pull spends on the subscription. A refused pull
 # names it in the log when the error's own ErrorInfo did not, so the line says
 # what to grant rather than only that something was refused.
@@ -2664,7 +2678,14 @@ class SlackRelay:
     ) -> dict[str, Any]:
         if not method or method.startswith("_"):
             raise ValueError("Slack API method is not available through the relay")
-        if method.rpartition(".")[2].lower() in DESTRUCTIVE_SLACK_VERBS:
+        if not SLACK_METHOD_SHAPE.fullmatch(method):
+            raise ValueError(
+                f"the Slack method {method!r} is not available through the relay"
+            )
+        if (
+            method not in SLACK_REMOVE_ALLOWLIST
+            and method.rpartition(".")[2].lower() in DESTRUCTIVE_SLACK_VERBS
+        ):
             raise ValueError(
                 f"the Slack method {method!r} is not available through the relay"
             )
