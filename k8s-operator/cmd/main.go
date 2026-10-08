@@ -334,7 +334,13 @@ func main() {
 	// one.
 	profileGVK := agentv1alpha1.GroupVersion.WithKind("AgentProfile")
 	_, mapErr := mgr.GetRESTMapper().RESTMapping(profileGVK.GroupKind(), profileGVK.Version)
+	profileDenied := controller.AgentProfileAccessDenied(rbacChecker)
 	switch {
+	case mapErr == nil && len(profileDenied) > 0:
+		// An informer the role cannot list never syncs, and a cache that
+		// fails to sync stops the manager, so registering it would crashloop
+		// the whole operator on an image deployed ahead of its ClusterRole.
+		setupLog.Error(nil, "The operator's role cannot read AgentProfiles; skipping the AgentProfile controller. Restart the operator after applying the current ClusterRole.", "denied", profileDenied)
 	case mapErr == nil:
 		if err := (&controller.AgentProfileReconciler{
 			Client: mgr.GetClient(),

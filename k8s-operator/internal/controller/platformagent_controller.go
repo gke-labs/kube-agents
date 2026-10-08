@@ -332,6 +332,12 @@ type PlatformAgentReconciler struct {
 	// supply; see rbac_selfcheck.go.
 	RBAC *RBACChecker
 
+	// agentProfilesUnreadable is set at setup when the role cannot read
+	// AgentProfiles (AgentProfileAccessDenied). The watch is skipped then, and
+	// the identity map renders no profiles rather than listing a kind whose
+	// informer would never sync.
+	agentProfilesUnreadable bool
+
 	// Recorder writes Events on the PlatformAgent. Nil records nothing, which
 	// is what tests and the golden harness supply (recordEvent).
 	//
@@ -4591,7 +4597,15 @@ func (r *PlatformAgentReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	// AgentPlugin's watch above.
 	profileGVK := agentv1alpha1.GroupVersion.WithKind("AgentProfile")
 	if mgr != nil && mgr.GetRESTMapper() != nil {
-		if _, err := mgr.GetRESTMapper().RESTMapping(profileGVK.GroupKind(), profileGVK.Version); err == nil {
+		_, err := mgr.GetRESTMapper().RESTMapping(profileGVK.GroupKind(), profileGVK.Version)
+		denied := AgentProfileAccessDenied(r.RBAC)
+		switch {
+		case err == nil && len(denied) > 0:
+			r.agentProfilesUnreadable = true
+			logf.Log.WithName("platformagent-controller").Info(
+				"The operator's role cannot read AgentProfiles; skipping the AgentProfile watch and rendering no profile identities. Restart the operator after applying the current ClusterRole.",
+				"denied", denied)
+		case err == nil:
 			bld = bld.Watches(
 				&agentv1alpha1.AgentProfile{},
 				handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []reconcile.Request {
@@ -4614,7 +4628,7 @@ func (r *PlatformAgentReconciler) SetupWithManager(mgr ctrl.Manager) error {
 					return strings.HasPrefix(obj.GetName(), agentProfileServiceAccountPrefix)
 				})),
 			)
-		} else {
+		default:
 			logf.Log.WithName("platformagent-controller").Info(
 				"AgentProfile CRD is not installed on cluster; skipping AgentProfile watch.")
 		}

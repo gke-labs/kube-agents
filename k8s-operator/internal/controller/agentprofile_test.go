@@ -487,6 +487,31 @@ func TestTheOperatorRendersNoBusIdentityWithoutItsOwnServiceAccount(t *testing.T
 	}
 }
 
+// A malformed pair takes the same path as a missing one. The pair is
+// process-wide, so a value that failed the map would stop every PlatformAgent's
+// render, not one namespace's.
+func TestAMalformedOperatorPrincipalRendersNoEntryAndFailsNothing(t *testing.T) {
+	for name, pair := range map[string][2]string{
+		"map-key spelling":   {testOperatorNamespace, "system:serviceaccount:ns:sa"},
+		"colon":              {testOperatorNamespace, "foo:bar"},
+		"namespace casing":   {"Kubeagents-System", testOperatorSA},
+		"dotted namespace":   {"kube.agents", testOperatorSA},
+		"serviceaccount gap": {testOperatorNamespace, "has space"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Setenv(operatorNamespaceEnvVar, pair[0])
+			t.Setenv(operatorServiceAccountEnvVar, pair[1])
+			agent := a2aTestAgent()
+			if _, ok := renderedMapEntries(t, agent, nil)[a2aOperatorBusUser]; ok {
+				t.Errorf("the operator rendered a map entry for %q/%q", pair[0], pair[1])
+			}
+			if peers := a2aOperatorNATSPeers(); len(peers) != 0 {
+				t.Errorf("the NATS fence admits an operator peer for namespace %q: %v", pair[0], peers)
+			}
+		})
+	}
+}
+
 // With them, its entry is the directory and its inbox, nothing else.
 func TestTheOperatorsBusIdentityIsTheDirectoryAndNothingElse(t *testing.T) {
 	withOperatorBusPrincipal(t)
@@ -621,7 +646,12 @@ type fakeDirectory struct {
 	entries   map[string]directoryEntry
 	publishes []string
 	down      bool
+	// forgets records each namespace whose connection the reconciler
+	// dropped, as forgetBus would on the NATS publisher.
+	forgets []string
 }
+
+func (f *fakeDirectory) forget(namespace string) { f.forgets = append(f.forgets, namespace) }
 
 func newFakeDirectory() *fakeDirectory { return &fakeDirectory{entries: map[string]directoryEntry{}} }
 
@@ -901,6 +931,10 @@ func TestAFlipToTodayRemovesTheProfilesServiceAccount(t *testing.T) {
 	if _, ok := h.serviceAccount(agent.Namespace, "agentprofile-auditor"); ok {
 		t.Error("the profile's ServiceAccount survived a flip to today")
 	}
+	// today tears the bus down, so the connection held for it goes too.
+	if !slices.Contains(h.dir.forgets, agent.Namespace) {
+		t.Errorf("the bus connection was kept after a flip to today: forgets = %v", h.dir.forgets)
+	}
 }
 
 // With no PlatformAgent, or two, a profile cannot bind and renders nothing.
@@ -1159,9 +1193,15 @@ func TestAProfileDeletedUnderVersionSkewIsStillFinalized(t *testing.T) {
 	if err := h.c.Delete(context.Background(), h.profile(agent.Namespace, "auditor")); err != nil {
 		t.Fatal(err)
 	}
+	h.dir.forgets = nil
 	h.reconcile(agent.Namespace, "auditor")
 	if e := h.dir.entries["auditor"]; e.kind != a2aKindAgentClosed {
 		t.Errorf("no tombstone under skew: %+v", e)
+	}
+	// The frozen bus is still running and the tombstone needs it, so the
+	// connection is kept; dropping it here redials on every retry.
+	if len(h.dir.forgets) != 0 {
+		t.Errorf("the bus connection was dropped under skew: %v", h.dir.forgets)
 	}
 	var gone agentv1alpha1.AgentProfile
 	if err := h.c.Get(context.Background(), types.NamespacedName{Namespace: agent.Namespace, Name: "auditor"}, &gone); !apierrors.IsNotFound(err) {
@@ -1183,6 +1223,22 @@ func TestAnEmptyNamespaceEnqueuesTheConnectionDrop(t *testing.T) {
 	got = agentProfileRequestsIn(context.Background(), h2.c, agent.Namespace)
 	if len(got) != 1 || got[0].Name != "auditor" {
 		t.Errorf("requests = %v, want the profile", got)
+	}
+}
+
+// Each malformed name gets the refusal that says what is wrong with it: a
+// dotted name (an older or edited CRD admitted it) is not a label, and only a
+// valid label that is too long once prefixed is refused on length.
+func TestAProfileNameRefusalSaysWhatIsWrong(t *testing.T) {
+	withoutOperatorBusPrincipal(t)
+	agent := a2aTestAgent()
+	dotted := testAgentProfile(agent.Namespace, "a.b")
+	long := testAgentProfile(agent.Namespace, strings.Repeat("a", agentProfileNameMax+1))
+	got := resolveAgentProfileIdentities(agent, []agentv1alpha1.AgentProfile{dotted, long})
+	for name, want := range map[string]string{dotted.Name: "not a dot-free DNS-1123 label", long.Name: "longer than"} {
+		if r := got[name]; r.refused == nil || !strings.Contains(r.refused.Error(), want) {
+			t.Errorf("profile %q refused with %v, want a message containing %q", name, r.refused, want)
+		}
 	}
 }
 

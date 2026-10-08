@@ -2484,7 +2484,8 @@ func buildA2ANATSNetworkPolicy(agent *agentv1alpha1.PlatformAgent) *networkingv1
 // agent's, so the peer pairs a namespace selector with the bus-client label the
 // manager's pod template carries; the callout, not this fence, is what decides
 // whether a pod there is the operator. No peer when the manager does not know
-// its own namespace: it renders no bus identity then either.
+// its own namespace, or holds one that is not a label value: it renders no bus
+// identity then either.
 func a2aOperatorNATSPeers() []networkingv1.NetworkPolicyPeer {
 	ns, _, ok := operatorBusPrincipal()
 	if !ok {
@@ -4679,9 +4680,12 @@ func (r *PlatformAgentReconciler) reconcileA2A(ctx context.Context, agent *agent
 	// it: the callout refuses connections until it is serving a map, so
 	// rendering the map first shortens the window in which a restarting bus
 	// has a callout with nothing to say.
-	profiles, err := boundAgentProfiles(ctx, r.Client, agent)
-	if err != nil {
-		return state, fmt.Errorf("failed to list AgentProfiles: %w", err)
+	var profiles []agentv1alpha1.AgentProfile
+	if !r.agentProfilesUnreadable {
+		var err error
+		if profiles, err = boundAgentProfiles(ctx, r.Client, agent); err != nil {
+			return state, fmt.Errorf("failed to list AgentProfiles: %w", err)
+		}
 	}
 	authMap, authMapVersion, err := buildA2AAuthMapConfigMap(agent, profiles)
 	if err != nil {

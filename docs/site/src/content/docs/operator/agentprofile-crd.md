@@ -58,7 +58,15 @@ A profile binds to the PlatformAgent in its own namespace. With that agent on `m
 - A bus identity for that ServiceAccount in the auth callout's identity map. Its pods may publish task events and read task input for this profile's tasks, and use the topics the profile names. Nothing else. The scope is the profile, not one task: two pods of the same profile can reach each other's task subjects.
 - An agent card on `a2a.agents.<name>`, rendered from `spec.description`. Deleting the profile on a `mode: next` install publishes a tombstone in its place before the profile is removed. A profile deleted while its PlatformAgent is on `today`, while its namespace holds no PlatformAgent or more than one, or while the operator has no bus identity, is removed without one.
 
+Deletion waits on the `kubeagents.x-k8s.io/agentprofile-finalizer` finalizer, which every profile reconciled on a `mode: next` install carries and which only the operator removes. Before rolling the operator back to a release without AgentProfiles, or uninstalling it, delete the profiles while the operator is still running. Otherwise `kubectl delete agentprofile` hangs, and so does deleting the CRD behind it. To clear one by hand (it publishes no tombstone, so the card stays on the directory):
+
+```bash
+kubectl patch agentprofile <name> -n <namespace> --type=merge -p '{"metadata":{"finalizers":null}}'
+```
+
 A profile may not run as `default`, as a ServiceAccount the operator already uses (for the PlatformAgent or for itself), or as one another `AgentProfile` already holds. Such a profile renders nothing, and its `IdentityReady` condition says why.
+
+The operator looks for AgentProfiles once, at startup. If the CRD isn't installed, or the operator's ClusterRole predates AgentProfiles (the RBAC self-check reports the missing `agentprofiles` permissions), it skips the AgentProfile controller, renders no profile identities, and keeps running everything else. Restart the operator after installing the CRD or applying the current role.
 
 Writing an `AgentProfile` grants a bus identity, so treat create and update on `agentprofiles` like create on RoleBindings in that namespace. A profile's name is its addressee on the task subjects, the same space the gateway's session pods use. A profile named exactly like a live session pod could write that session's task events, so nobody who can't already act as that session should be able to create profiles.
 

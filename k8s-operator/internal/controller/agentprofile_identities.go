@@ -96,11 +96,16 @@ func isDNS1123LabelToken(s string) bool {
 
 // operatorBusPrincipal is the manager's own ServiceAccount, as the downward API
 // reports it. ok is false when the manager was deployed without the two
-// variables, which is an install older than profiles.
+// variables, which is an install older than profiles, and when either is not
+// the shape the downward API yields (a DNS-1123 label namespace and a
+// DNS-1123 subdomain ServiceAccount). The pair keys a map entry and a fence
+// selector shared by every PlatformAgent, so a hand-edited value that is
+// neither renders no operator principal instead of failing every render.
 func operatorBusPrincipal() (namespace, serviceAccount string, ok bool) {
 	namespace = os.Getenv(operatorNamespaceEnvVar)
 	serviceAccount = os.Getenv(operatorServiceAccountEnvVar)
-	return namespace, serviceAccount, namespace != "" && serviceAccount != ""
+	ok = isDNS1123LabelToken(namespace) && len(validation.IsDNS1123Subdomain(serviceAccount)) == 0
+	return namespace, serviceAccount, ok
 }
 
 // agentProfileServiceAccountName is the ServiceAccount a profile's pods run as:
@@ -187,17 +192,17 @@ func resolveAgentProfileIdentities(agent *agentv1alpha1.PlatformAgent, profiles 
 		p := &sorted[i]
 		sa := agentProfileServiceAccountName(p)
 		switch {
-		case !isDNS1123LabelToken(agentProfileMapUserPrefix + p.Name):
-			// The map entry's user is the prefix plus the name, and the
-			// callout refuses a user that is not one DNS-1123 label, so a
-			// name past 55 characters would fail the whole map. The CRD
-			// refuses it too.
-			out[p.Name] = agentProfileResolution{refused: fmt.Errorf("profile name %q is longer than %d characters, so its bus identity %q would not be a DNS-1123 label", p.Name, agentProfileNameMax, agentProfileMapUserPrefix+p.Name), reason: reasonAgentProfileInvalid}
 		case !isDNS1123LabelToken(p.Name):
 			// The CRD refuses these too. Refused here as well so that a
 			// profile admitted by an older or edited CRD drops out of the
 			// map instead of failing the whole render.
 			out[p.Name] = agentProfileResolution{refused: fmt.Errorf("profile name %q is not a dot-free DNS-1123 label", p.Name), reason: reasonAgentProfileInvalid}
+		case !isDNS1123LabelToken(agentProfileMapUserPrefix + p.Name):
+			// A valid label can still be too long once prefixed: the map
+			// entry's user is the prefix plus the name, and the callout
+			// refuses a user that is not one DNS-1123 label, so a name past
+			// 55 characters would fail the whole map. The CRD refuses it too.
+			out[p.Name] = agentProfileResolution{refused: fmt.Errorf("profile name %q is longer than %d characters, so its bus identity %q would not be a DNS-1123 label", p.Name, agentProfileNameMax, agentProfileMapUserPrefix+p.Name), reason: reasonAgentProfileInvalid}
 		case malformedTopicGrant(p) != "":
 			out[p.Name] = agentProfileResolution{refused: fmt.Errorf("topic grant %q is not shared.{topic} or agent.{agent}.{topic}", malformedTopicGrant(p)), reason: reasonAgentProfileInvalid}
 		case foreignPublishTopic(p) != "":

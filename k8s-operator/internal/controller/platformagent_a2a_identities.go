@@ -292,8 +292,8 @@ const (
 // reconcile tells a missing or stale card from a current one without holding
 // STREAM.INFO.
 //
-// ok is false when the manager was deployed without its own namespace and
-// ServiceAccount in the environment (agentprofile_identities.go); the caller
+// ok is false when the manager's own namespace and ServiceAccount are missing
+// from the environment or malformed (agentprofile_identities.go); the caller
 // renders no entry then rather than guessing a name.
 func operatorIdentity() (a2aIdentity, bool) {
 	ns, sa, ok := operatorBusPrincipal()

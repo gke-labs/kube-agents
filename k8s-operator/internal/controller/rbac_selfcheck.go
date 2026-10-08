@@ -344,6 +344,26 @@ func (c *RBACChecker) Denied() []string {
 	return append([]string(nil), c.denied...)
 }
 
+// AgentProfileAccessDenied returns the boot probe's denials on agentprofiles
+// and its subresources. An informer on a kind the role cannot list never syncs,
+// and the manager exits when a cache fails to sync, so the callers registering
+// an AgentProfile informer skip it while this is non-empty. That keeps an
+// image deployed ahead of its ClusterRole running everything else, which is
+// the self-check's rule for an optional path. Restart after fixing the role.
+func AgentProfileAccessDenied(c *RBACChecker) []string {
+	denied := c.Denied()
+	if len(denied) == 0 {
+		return nil
+	}
+	var out []string
+	for _, tuple := range flattenRequiredPermissions() {
+		if tuple.resource == "agentprofiles" && slices.Contains(denied, tuple.label) {
+			out = append(out, tuple.label)
+		}
+	}
+	return out
+}
+
 // Start re-probes every interval until ctx is cancelled. It satisfies
 // manager.Runnable; main.go adds the checker to the manager after the boot
 // probe.

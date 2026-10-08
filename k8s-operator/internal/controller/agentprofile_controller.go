@@ -126,9 +126,6 @@ func (r *AgentProfileReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		return ctrl.Result{}, err
 	}
 	if agent == nil || !a2aStackRendering(agent) {
-		// No bus to talk to: drop any connection held for this namespace's
-		// agent rather than let it reconnect to a dead Service forever.
-		r.forgetBus(profile.Namespace)
 		if agent != nil {
 			reason, msg = reasonAgentProfileNotNext, "the PlatformAgent "+agent.Name+" does not run spec.mode: next; an AgentProfile renders nothing until it does"
 			if _, modeErr := resolveMode(agent); modeErr != nil {
@@ -143,6 +140,12 @@ func (r *AgentProfileReconciler) Reconcile(ctx context.Context, req ctrl.Request
 				return ctrl.Result{}, r.writeStatus(ctx, &profile, agent, "", reasonAgentProfileModeUnknown, modeErr.Error(), reasonAgentProfileModeUnknown, modeErr.Error(), false)
 			}
 		}
+		// No bus to talk to: drop any connection held for this namespace's
+		// agent rather than let it reconnect to a dead Service forever. Not
+		// under version skew above, where the bus is frozen and still
+		// running, and a deletion still needs the connection for its
+		// tombstone.
+		r.forgetBus(profile.Namespace)
 		return ctrl.Result{}, r.renderNothing(ctx, &profile, agent, reason, msg)
 	}
 
@@ -297,7 +300,7 @@ func (r *AgentProfileReconciler) publishCard(ctx context.Context, agent *agentv1
 		return reasonAgentProfileIdentityMissing, "the profile's name is not a subject token, so it has no directory entry", nil
 	}
 	if _, _, ok := operatorBusPrincipal(); !ok {
-		return reasonAgentProfileBusUnconfigured, "the operator was deployed without " + operatorNamespaceEnvVar + " and " + operatorServiceAccountEnvVar + ", so it has no bus identity to publish cards with", nil
+		return reasonAgentProfileBusUnconfigured, "the operator's " + operatorNamespaceEnvVar + " and " + operatorServiceAccountEnvVar + " are unset or are not a namespace and ServiceAccount name, so it has no bus identity to publish cards with", nil
 	}
 	want := desiredAgentCard(p)
 	entry, err := r.cards().Read(ctx, agent, p.Name)
@@ -387,6 +390,13 @@ func (r *AgentProfileReconciler) ensureServiceAccount(ctx context.Context, p *ag
 	// a hand edit (kubectl patch, edit, label --overwrite) hands a field to
 	// another manager, and an unforced apply would then conflict on every
 	// reconcile instead of putting the field back.
+	//
+	// Accepted risk (decided on gke-labs#2469): the apply goes by name after
+	// a cached ownership check, so a ServiceAccount deleted and re-created
+	// under this name inside the informer lag could be adopted. Doing that
+	// swap already takes ServiceAccount create in the namespace. The delete
+	// below is held to the UID it checked, so the destructive direction is
+	// closed.
 	return r.Patch(ctx, sa, client.Apply, client.FieldOwner(agentProfileComponent), client.ForceOwnership)
 }
 
@@ -413,7 +423,12 @@ func (r *AgentProfileReconciler) deleteOwnServiceAccount(ctx context.Context, p 
 	if !metav1.IsControlledBy(&sa, p) {
 		return nil
 	}
-	return client.IgnoreNotFound(r.Delete(ctx, &sa))
+	// The ownership verdict is on the cached copy, so the delete is held to
+	// that copy's UID: a ServiceAccount deleted and re-created under the same
+	// name inside the informer lag is someone else's, and the precondition
+	// fails rather than deleting it. The next pass reads the new one, which
+	// is not controlled by the profile, and leaves it.
+	return client.IgnoreNotFound(r.Delete(ctx, &sa, client.Preconditions{UID: &sa.UID}))
 }
 
 // writeStatus records both conditions.
