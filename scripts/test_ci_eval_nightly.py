@@ -604,7 +604,7 @@ class NightlyPartTest(unittest.TestCase):
         src = SCRIPT.read_text(encoding="utf-8")
         tier = src.index('EVAL_TIER="${EVAL_TIER:-presubmit}"')
         check = src.index('EVAL_NIGHTLY_PART="${EVAL_NIGHTLY_PART:-all}"')
-        lane = src.index("# ─── The inject lane's safeguards")
+        lane = src.index("# ─── The lanes' safeguards")
         step = src.index("# ─── The nightly part")
         roster = src.index("\nBLOCKING_ROSTER_ENTRIES=")
         names = src.index("\nTASK_NAMES=()")

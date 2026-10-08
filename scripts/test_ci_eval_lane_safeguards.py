@@ -1,14 +1,11 @@
-"""The inject lane's safeguards step in hack/ci-eval-pr.sh (#2079).
+"""The lane safeguards step in hack/ci-eval-pr.sh (#2079, #2611).
 
-Under AGENT_TRANSPORT=inject the step exports BENCH_GITOPS_REPO from the
+On every transport -- the api lane as well as the inject lane, so both are
+graded against the same bar -- the step exports BENCH_GITOPS_REPO from the
 leased project's mapping, materialises every task in the matrix as
 `<scratch>/<case>/task.yaml` with hack/eval/inject-lane-safeguards.yaml's
-entries appended, and `unit_task_path` hands devops-bench that copy; on any
-other transport the step exports nothing, copies nothing and the helper is
-the identity, so the api lane's matrix and task files are byte for byte what
-they were -- it only reads the same file for which cases request a pull
-request, since #2260 runs those in the second phase on both lanes for the
-repository reset's sake. The step is lifted out of the shipped script and run under bash
+entries appended, and `unit_task_path` hands devops-bench that copy. The
+step is lifted out of the shipped script and run under bash
 over the real files, with `uv run python -m kube_agents_bench.lane` answered
 by the real module under python3, so the assertions are against the code
 that ships rather than a copy of it.
@@ -77,7 +74,7 @@ def constants() -> str:
 
 def safeguards_step() -> str:
     """The step and the helper after it, up to the correctness-floor comment."""
-    return lifted_block(r"^# ─── The inject lane's safeguards.*?^unit_task_path\(\) \{.*?^\}$")
+    return lifted_block(r"^# ─── The lanes' safeguards.*?^unit_task_path\(\) \{.*?^\}$")
 
 
 def presubmit_tasks() -> list[str]:
@@ -147,43 +144,20 @@ def spec_names(task_yaml: pathlib.Path) -> list[str]:
     return [e["name"] for e in doc.get("verification_spec") or []]
 
 
-class ApiLaneUntouchedTest(unittest.TestCase):
-    """The api lane's task files and matrix are what they were; what it
-    shares with the inject lane since #2260 is the second phase, so it reads
-    the lane file for the requesting list and nothing else."""
-
-    def test_no_export_no_copy_and_the_helper_is_the_identity(self):
-        for env in ({}, {"AGENT_TRANSPORT": "api"}):
-            with self.subTest(env=env):
-                result = run_step(env)
-                self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertEqual(value(result, "REPO"), "<unset>")
-                self.assertEqual(value(result, "REQUESTING"), requesting_among(presubmit_tasks()))
-                self.assertEqual(value(result, "DIR"), "")
-                for line in tagged(result, "PATH"):
-                    name, path = line.split(" ", 1)
-                    self.assertEqual(path, f"./tasks/{name}/task.yaml")
-                self.assertNotIn("carries the lane's safeguards", result.stdout)
-                self.assertIn("each after the repository is reset", result.stdout)
-                # The writer phase on this lane grades no window, so its units
-                # keep the launch stagger, not the inject lane's settle.
-                self.assertEqual(value(result, "PAUSE"), "5")
-                self.assertEqual(value(result, "PAUSE"), lifted_block(r"^readonly EVAL_UNIT_LAUNCH_STAGGER_SECONDS=(\d+)\n").split("=")[1].strip())
-
-    def test_a_lane_file_that_cannot_be_read_stops_the_api_lane_too(self):
-        # The requesting list is what orders the second phase, and the reset
-        # before a writer unit is only safe inside it: no list, no run.
-        result = run_step({"AGENT_TRANSPORT": "api"}, lane_file=pathlib.Path("/nonexistent/lane.yaml"))
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("could not read which cases request a pull request", result.stderr)
-
-
 class InjectLaneTest(unittest.TestCase):
+    """The step under AGENT_TRANSPORT=inject; ApiLaneTest below runs every
+    test here again on the api lane, where the step does the same."""
+
+    TRANSPORT = {"AGENT_TRANSPORT": "inject"}
+
+    def lane(self, **env: str) -> dict:
+        return {**self.TRANSPORT, **env}
+
     def test_every_task_gets_a_copy_with_the_lane_entries_appended(self):
-        result = run_step({"AGENT_TRANSPORT": "inject", "EVAL_LEDGER_REPO_FOR_TEST": "gke-agentic/kube-agents-evals-21-infra"})
+        result = run_step(self.lane(EVAL_LEDGER_REPO_FOR_TEST="gke-agentic/kube-agents-evals-21-infra"))
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(value(result, "REPO"), "gke-agentic/kube-agents-evals-21-infra")
-        # This lane's writer units wait the safeguard's settle, not the stagger.
+        # The writer units wait the safeguard's settle, not the stagger.
         self.assertEqual(value(result, "PAUSE"), "120")
         scratch = pathlib.Path(value(result, "DIR"))
         self.assertTrue(scratch.is_dir())
@@ -194,7 +168,7 @@ class InjectLaneTest(unittest.TestCase):
                 self.assertEqual(path, str(scratch / name / "task.yaml"))
                 original = spec_names(BENCH_DIR / "tasks" / name / "task.yaml")
                 self.assertEqual(spec_names(pathlib.Path(path)), original + [LANE_ENTRY])
-        self.assertIn("every task in the matrix carries the lane's safeguards", result.stdout)
+        self.assertIn("every task in the matrix carries the lane safeguards", result.stdout)
         self.assertIn("BENCH_GITOPS_REPO=gke-agentic/kube-agents-evals-21-infra", result.stdout)
         # The presubmit cases that request a pull request, by their own
         # checks or the file's `requesting:` list: the second phase holds
@@ -206,34 +180,34 @@ class InjectLaneTest(unittest.TestCase):
         self.assertNotIn("obtainability-remediation-proposal", requesting.split(","))
         self.assertIn("pdb-remediation-pr", requesting.split(","))
         self.assertEqual(value(result, "REQUESTING"), requesting)
-        self.assertIn(f"run after every other unit: {requesting}\n", result.stdout)
+        self.assertIn(f"each after the repository is reset: {requesting}\n", result.stdout)
 
     def test_the_requesting_cases_are_named_for_the_second_phase(self):
         # Every pinned requesting case the presubmit matrix does not seat,
         # added to it: each is named once, in matrix order.
         seated = {pathlib.Path(t).parent.name for t in presubmit_tasks()}
         tasks = presubmit_tasks() + [f"./tasks/{c}/task.yaml" for c in INJECT_LANE_REQUESTING if c not in seated]
-        result = run_step({"AGENT_TRANSPORT": "inject", "EVAL_LEDGER_REPO_FOR_TEST": "gke-agentic/kube-agents-evals-21-infra"}, tasks=tasks)
+        result = run_step(self.lane(EVAL_LEDGER_REPO_FOR_TEST="gke-agentic/kube-agents-evals-21-infra"), tasks=tasks)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(sorted(value(result, "REQUESTING").split(",")), sorted(INJECT_LANE_REQUESTING))
         self.assertEqual(value(result, "REQUESTING"), requesting_among(tasks))
-        self.assertIn(f"run after every other unit: {requesting_among(tasks)}\n", result.stdout)
+        self.assertIn(f"each after the repository is reset: {requesting_among(tasks)}\n", result.stdout)
 
     def test_the_task_files_under_bench_tasks_are_not_written(self):
         before = {p: p.read_bytes() for p in (BENCH_DIR / "tasks").glob("*/task.yaml")}
-        result = run_step({"AGENT_TRANSPORT": "inject", "EVAL_LEDGER_REPO_FOR_TEST": "gke-agentic/kube-agents-evals-21-infra"})
+        result = run_step(self.lane(EVAL_LEDGER_REPO_FOR_TEST="gke-agentic/kube-agents-evals-21-infra"))
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual({p: p.read_bytes() for p in before}, before)
 
     def test_a_local_runs_own_repository_stands_in_for_the_mapping(self):
-        result = run_step({"AGENT_TRANSPORT": "inject", "EVAL_GITOPS_REPO": "gke-agentic/throwaway-infra"})
+        result = run_step(self.lane(EVAL_GITOPS_REPO="gke-agentic/throwaway-infra"))
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(value(result, "REPO"), "gke-agentic/throwaway-infra")
 
     def test_a_repository_the_lane_entry_pins_another_owner_for_stops_the_lane(self):
         """The safeguard's `owner: gke-agentic` would error on every repetition
         over a repository elsewhere; the step refuses before the lease."""
-        result = run_step({"AGENT_TRANSPORT": "inject", "EVAL_GITOPS_REPO": "someone/throwaway-infra"})
+        result = run_step(self.lane(EVAL_GITOPS_REPO="someone/throwaway-infra"))
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("is not under gke-agentic", result.stderr)
         self.assertIn("BENCH_GITOPS_REPO=someone/throwaway-infra is not a repository they can grade", result.stderr)
@@ -244,13 +218,13 @@ class InjectLaneTest(unittest.TestCase):
         set, so that is the repository the safeguard has to read; Prow
         refuses the override at deploy time, so in CI this is the mapping."""
         result = run_step(
-            {"AGENT_TRANSPORT": "inject", "EVAL_LEDGER_REPO_FOR_TEST": "gke-agentic/kube-agents-evals-21-infra", "EVAL_GITOPS_REPO": "gke-agentic/throwaway-infra"}
+            self.lane(EVAL_LEDGER_REPO_FOR_TEST="gke-agentic/kube-agents-evals-21-infra", EVAL_GITOPS_REPO="gke-agentic/throwaway-infra")
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(value(result, "REPO"), "gke-agentic/throwaway-infra")
 
     def test_no_repository_stops_the_lane_before_anything_runs(self):
-        for env in ({"AGENT_TRANSPORT": "inject"}, {"AGENT_TRANSPORT": "inject", "EVAL_GITOPS_REPO": "none"}):
+        for env in (self.lane(), self.lane(EVAL_GITOPS_REPO="none")):
             with self.subTest(env=env):
                 result = run_step(env)
                 self.assertNotEqual(result.returncode, 0)
@@ -266,12 +240,12 @@ class InjectLaneTest(unittest.TestCase):
                 f"id: clash\nprompt: hi\nverification_spec:\n  - name: {LANE_ENTRY}\n    role: objective\n    check:\n      type: report_contains\n      required_phrases: [x]\n"
             )
             result = run_step(
-                {"AGENT_TRANSPORT": "inject", "EVAL_LEDGER_REPO_FOR_TEST": "gke-agentic/kube-agents-evals-21-infra"},
+                self.lane(EVAL_LEDGER_REPO_FOR_TEST="gke-agentic/kube-agents-evals-21-infra"),
                 tasks=[str(task_dir / "task.yaml")],
             )
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("lane safeguard's name", result.stderr)
-        self.assertIn("could not append the inject lane's safeguards", result.stderr)
+        self.assertIn("could not append the lane safeguards", result.stderr)
 
     def test_a_missing_or_malformed_lane_file_stops_the_lane(self):
         with tempfile.TemporaryDirectory() as scratch:
@@ -279,9 +253,21 @@ class InjectLaneTest(unittest.TestCase):
             bad.write_text("safeguards: {}\n")
             for lane_file in (pathlib.Path(scratch) / "missing.yaml", bad):
                 with self.subTest(lane_file=lane_file.name):
-                    result = run_step({"AGENT_TRANSPORT": "inject", "EVAL_LEDGER_REPO_FOR_TEST": "gke-agentic/kube-agents-evals-21-infra"}, lane_file=lane_file)
+                    result = run_step(self.lane(EVAL_LEDGER_REPO_FOR_TEST="gke-agentic/kube-agents-evals-21-infra"), lane_file=lane_file)
                     self.assertNotEqual(result.returncode, 0)
-                    self.assertIn("could not append the inject lane's safeguards", result.stderr)
+                    self.assertIn("could not append the lane safeguards", result.stderr)
+
+
+class ApiLaneTest(InjectLaneTest):
+    """The api lane (`today`) carries the same safeguards as the inject lane
+    (`next`), so the two modes face the same bar (#2611): every test above,
+    with the transport the api lane exports, and with none at all."""
+
+    TRANSPORT = {"AGENT_TRANSPORT": "api"}
+
+
+class NoTransportTest(InjectLaneTest):
+    TRANSPORT: dict = {}
 
 
 class TwoPhaseFanOutTest(unittest.TestCase):
@@ -313,7 +299,7 @@ class TwoPhaseFanOutTest(unittest.TestCase):
                 "set -euo pipefail",
                 self.STUBS,
                 f'INJECT_LANE_REQUESTING="{requesting}"',
-                lifted_block(r"^# Two phases on the inject lane.*?^fi$"),
+                lifted_block(r"^# Two phases on both lanes.*?^fi$"),
                 'echo "TOTAL=$((UNIT_TOTAL + WRITER_TOTAL))"',
             ]
         )
@@ -361,7 +347,7 @@ class WiringTest(unittest.TestCase):
     def test_the_step_sits_after_the_exclusions_and_before_the_task_names(self):
         src = SCRIPT.read_text(encoding="utf-8")
         exclusions = src.index("# ─── The inject lane's exclusions")
-        step = src.index("# ─── The inject lane's safeguards")
+        step = src.index("# ─── The lanes' safeguards")
         names = src.index("TASK_NAMES=()")
         self.assertLess(exclusions, step)
         self.assertLess(step, names)
@@ -376,10 +362,11 @@ class WiringTest(unittest.TestCase):
         # the record's report.
         self.assertIn('finish_case "${task}" "${name}"', unit)
 
-    def test_the_leftovers_report_runs_after_the_fanout_on_the_inject_lane_only(self):
+    def test_the_leftovers_report_runs_after_the_fanout_on_every_lane(self):
         src = SCRIPT.read_text(encoding="utf-8")
         report = re.search(r"^report_github_leftovers\(\) \{.*?^\}$", src, re.DOTALL | re.MULTILINE).group(0)
-        self.assertIn('[ "${AGENT_TRANSPORT:-}" != "${EVAL_INJECT_TRANSPORT}" ]', report)
+        self.assertNotIn("AGENT_TRANSPORT", report)
+        self.assertIn('[ -z "${BENCH_GITOPS_REPO:-}" ]', report)
         self.assertIn("python -m kube_agents_bench.github_writes", report)
         self.assertIn('--since "${EVAL_RUN_STARTED_AT}"', report)
         self.assertIn('mint_ledger_token "leftovers"', report)

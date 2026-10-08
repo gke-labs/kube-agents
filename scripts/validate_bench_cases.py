@@ -353,8 +353,8 @@ CHECK_ASSERTIONS: dict[str, tuple[str, ...]] = {
     # field only narrows it. See the empty-tuple rule in _check_assertions.
     "pull_request_opened": (),
     # Likewise: "the run wrote to the GitOps repository since it started" is
-    # the assertion, and every field narrows it. The inject lane appends it
-    # to every case it runs (hack/eval/inject-lane-safeguards.yaml); a case
+    # the assertion, and every field narrows it. Both lanes append it to
+    # every case they run (hack/eval/inject-lane-safeguards.yaml); a case
     # may also declare it.
     "github_writes": (),
     "tool_called": ("tool_names",),

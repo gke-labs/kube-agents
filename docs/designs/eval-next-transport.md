@@ -450,11 +450,13 @@ the platform persona's, and parity in [#2007](https://github.com/gke-labs/kube-a
 runs, not the api lane's numbers; the first run's 94.4% against 77.8% is withdrawn as a
 like-for-like comparison. Two things follow for the lane. A case that grades the delegation
 composition rather than the executor's answer gets a persona-aware check or leaves the lane
-through the exclusion list with its reason. And the lane carries a safeguard of its own, applied
-by the CI flag's script to every case it runs (`hack/eval/inject-lane-safeguards.yaml`, a
-none-wrapped `github_writes` at catastrophic severity over the leased project's GitOps
-repository), because the persona can open a pull request where the cluster safeguards see
-nothing, and the first run left several on the pool repository that no case had asked for. The
+through the exclusion list with its reason. And every case carries a GitHub-write safeguard,
+applied by the CI script to every case it runs on both lanes so the two face the same bar
+(`hack/eval/inject-lane-safeguards.yaml`, a none-wrapped `github_writes` at catastrophic
+severity over the leased project's GitOps repository, charging a write only to the repetition
+whose own reply or calls name it), because the persona can open a pull request where the cluster
+safeguards see nothing, and the first run left several on the pool repository that no case had
+asked for. The
 lane moves to the session agent's front door when the delegation primitive lands, and the
 classification says which cases regain their delegation checks then.
 
@@ -617,16 +619,16 @@ pull from. Under the same flag
 `AGENT_INJECT_TOKEN`, read from the token Secret the operator renders beside the door, and
 changes nothing else about the run except what hangs off that transport switch: the inject
 lane's exclusion list (`hack/eval/inject-lane-exclusions.txt`, keyed on `AGENT_TRANSPORT` rather
-than on this flag) leaves out the cases whose premise needs the chat front door; the lane's
-safeguards (`hack/eval/inject-lane-safeguards.yaml`) are appended to a scratch copy of every
-remaining task file, which the unit hands devops-bench, over the leased project's GitOps
-repository exported as `BENCH_GITOPS_REPO` (the lane refuses to start without one), with the
-cases that request a pull request run in a second phase after every other unit, one at a time
-and each after a settle, so no repetition that requests nothing shares the repository with one
-that writes by design and no window reaches back into the unit before; and after the
-fan-out the script lists in the job log what the run left on that repository, closing nothing.
-With the flag unset both scripts are byte for byte what
-they were, and the presubmit's own tests hold that.
+than on this flag) leaves out the cases whose premise needs the chat front door. The lane
+safeguards (`hack/eval/inject-lane-safeguards.yaml`) hang off neither the flag nor the
+transport: on both lanes they are appended to a scratch copy of every remaining task file, which
+the unit hands devops-bench, over the leased project's GitOps repository exported as
+`BENCH_GITOPS_REPO` (the run refuses to start without one), with the cases that request a pull
+request run in a second phase after every other unit, one at a time and each after a settle, so
+no repetition that requests nothing shares the repository with one that writes by design and no
+window reaches back into the unit before; and after the fan-out the script lists in the job log
+what the run left on that repository, closing nothing. With the flag unset, the transport,
+the exclusion list and the rollback check below are off; the lane safeguards still apply.
 
 Under the flag the run also checks the rollback path once the suite verdict is computed and
 before the final line announces it: `hack/rollback-roundtrip.sh` flips the install to `today`
