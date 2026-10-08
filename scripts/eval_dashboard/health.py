@@ -637,8 +637,7 @@ def rep_kind(rep: dict) -> str:
 
     `storm` is what the harness could not grade: an `infra` verdict, or a
     `fail` whose reason is one of the never-ran phrasings (graded `fail`
-    before #1184, classified `infra` after it, and opening-turn non-retryable
-    5xx errors before model calls under #2430 -- the text is the same).
+    before #1184, classified `infra` after it -- the text is the same).
     A harness-declared replay error (#2328) is a graded fail, not a storm.
     """
     result = rep.get("result")
@@ -963,12 +962,7 @@ def shared_break(full_runs, now: datetime, roster: Roster) -> dict:
 
 
 def storm(full_runs, now: datetime) -> dict:
-    """Rule 2. Returns {fires, reps, prs, start, end, evidence, signature_runs}.
-
-    Storm repetitions count transient infrastructure failures: 429 rate limits,
-    never-ran empty records (#1184), and opening-turn non-retryable 5xx errors
-    before any model call is billed (#2430).
-    """
+    """Rule 2. Returns {fires, reps, prs, start, end, evidence, signature_runs}."""
     window = _in_window(full_runs, now, STORM_WINDOW)
     hit = [run for run in window if run.storm_reps > 0]
     reps = sum(run.storm_reps for run in hit)

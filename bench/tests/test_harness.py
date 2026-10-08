@@ -1283,23 +1283,29 @@ def test_an_exhausted_retry_is_infrastructure_and_not_an_answer(
     assert len(recorded_pf_resets) == harness._MAX_TRANSPORT_FAILURES - 1
 
 
-def test_an_agent_side_error_is_still_graded(stub_agent: _StubAgentServer) -> None:
-    """A 500 is the endpoint answering, recorded by the harness as an errored result.
-
-    The INFRA_FAILURE_MARKER class is for turns where transport was exhausted
-    or provider capacity blocked the opening turn. The harness records a
-    non-retryable opening-turn 500 as an errored result (not retried, not marked);
-    scoring.py classifies that record as infrastructure when it carries an empty
-    trajectory and null tokens under #2430.
-    """
+def test_an_opening_turn_500_is_classified_as_infra(stub_agent: _StubAgentServer) -> None:
+    """An opening turn 500 without failure reason is routed to _infra_failure (#2430)."""
     stub_agent.fail_with = 500
 
     result = KubeAgentsHarness().run("Provision operator agent in cluster mercury-09.")
 
     assert result.has_errors()
-    assert harness.INFRA_FAILURE_MARKER not in result.errors[0]
+    assert harness.INFRA_FAILURE_MARKER in result.errors[0]
     assert "HTTP 500" in result.errors[0]
-    # Still in front of the judge, as before.
+    assert result.output == ""
+    assert result.trajectory == []
+    assert len(stub_agent.requests) == 1
+
+
+def test_an_opening_turn_client_error_is_still_graded(stub_agent: _StubAgentServer) -> None:
+    """A client error (non-429 4xx) on the opening turn is an answered turn, not infra."""
+    stub_agent.fail_with = 400
+
+    result = KubeAgentsHarness().run("Provision operator agent in cluster mercury-09.")
+
+    assert result.has_errors()
+    assert harness.INFRA_FAILURE_MARKER not in result.errors[0]
+    assert "HTTP 400" in result.errors[0]
     assert result.errors[0] in result.output
     assert len(stub_agent.requests) == 1
 
@@ -1616,17 +1622,23 @@ def test_an_ordinary_scored_record_is_still_graded(results_json: Any) -> None:
 
 
 def test_an_agent_error_without_the_marker_is_still_graded(results_json: Any) -> None:
-    """A non-5xx agent error reaches the judge without being excused as infra."""
-    path = results_json(AgentResult.errored("agent exploded: internal tool failure"))
+    """A 500 reaches the judge exactly as it did before this change."""
+    path = results_json(AgentResult.errored("HTTP 500 from agent endpoint: agent exploded"))
 
     assert _classify(path, "opentofu").outcome != "infra"
 
 
-def test_an_opening_turn_500_without_trajectory_is_classified_as_infra(
+def test_an_opening_turn_500_harness_result_is_classified_as_infra(
     results_json: Any,
 ) -> None:
-    """An HTTP 500 on the opening turn with empty trajectory and no tokens is infra (#2430)."""
-    path = results_json(AgentResult.errored("HTTP 500 from agent endpoint: agent exploded"))
+    """An opening turn 500 routed through _infra_failure is classified as infra (#2430)."""
+    path = results_json(
+        AgentResult(
+            output="",
+            trajectory=[],
+            errors=[f"{harness.INFRA_FAILURE_MARKER}: opening turn failed with HTTP 500"],
+        )
+    )
 
     assert _classify(path, "opentofu").outcome == "infra"
 

@@ -1211,10 +1211,12 @@ class _TransportError(RuntimeError):
         *,
         retryable: bool = False,
         failure_reason: str | None = None,
+        status_code: int | None = None,
     ) -> None:
         super().__init__(message)
         self.retryable = retryable
         self.failure_reason = failure_reason
+        self.status_code = status_code
 
 
 # Gateway statuses a proxy in front of the agent emits when the upstream is
@@ -1227,12 +1229,11 @@ class _TransportError(RuntimeError):
 # pure transport exhaustion both turn paths deliberately end in _infra_failure rather than
 # grading a partial record: see _DelegationTransportExhausted for why settling
 # the cards into a record that is about to be replaced wholesale is not a
-# A client error (non-429 4xx), a 500, or a body that is not JSON is an
+# rescue. A client error (non-429 4xx) or a body that is not JSON is an
 # answer about the request itself and repeating the request cannot change it:
-# a handler that raised will raise again, so the harness records non-retryable
-# opening-turn errors as errored results (not retried, not marked with
-# INFRA_FAILURE_MARKER); scoring.py classifies that record as infrastructure
-# when the opening turn has no trajectory and null tokens under #2430.
+# a handler that raised will raise again, so those remain graded agent errors.
+# On the opening turn, a non-retryable 5xx from the agent endpoint before any
+# agent ran or billed tokens is routed to _infra_failure under #2430.
 # When the server attaches X-Hermes-Failure-Reason on an opening request,
 # the turn executed; a rate-limit or billing reason is routed to infrastructure
 # on the opening turn, while any other failure reason (or any failure reason
@@ -1287,6 +1288,7 @@ def _post_turn(
             f"HTTP {exc.code} from agent endpoint: {_http_error_detail(exc)}",
             retryable=retryable,
             failure_reason=failure_reason,
+            status_code=exc.code,
         ) from exc
     except (OSError, http.client.HTTPException) as exc:
         # Timeouts, resets, and mid-read protocol failures: transport bugs.
@@ -1593,14 +1595,16 @@ class KubeAgentsHarness(AgentHarness):
                     return AgentResult.errored(
                         f"agent turn failed with {detail}: {exc}"
                     )
-                # A 500, a 4xx other than 429, or a body that is not JSON says a handler
-                # answered; the harness records non-retryable opening-turn errors as errored
-                # results without retrying or marking them, and scoring.py classifies that
-                # record as infrastructure when it has no trajectory and null tokens (#2430).
-                # Only a gateway status, an admission-control
-                # 429, or a dropped connection is worth a second attempt: see
-                # _RETRYABLE_STATUSES.
+                # A 500 on the opening turn before any agent ran or billed tokens is an
+                # infrastructure failure (#2430), routed to _infra_failure with the marker.
+                # Other non-retryable errors (e.g. 4xx client errors or non-JSON bodies)
+                # remain graded agent errors. Only a gateway status, an admission-control
+                # 429, or a dropped connection is worth a second attempt: see _RETRYABLE_STATUSES.
                 if not exc.retryable:
+                    if opening_turn and exc.status_code is not None and 500 <= exc.status_code < 600:
+                        return _infra_failure(
+                            f"the opening turn failed with HTTP {exc.status_code}: {exc}"
+                        )
                     return AgentResult.errored(str(exc))
                 transport_failures += 1
                 _log.warning(

@@ -462,9 +462,7 @@ what the renderer does with them.
   task results; an `infra` rep whose `reason` leads with
   `KUBE_AGENTS_DELEGATION_CEILING` is also excluded from the storm counts
   (`storm_reps`, `health.json`'s `infra_reps`) and reported under
-  `metrics.ceiling_reps` instead. Other `infra` repetitions (429 rate limits,
-  empty never-ran records under #1184, and opening-turn non-retryable 5xx errors
-  under #2430) are counted as storm repetitions. When `reps` is absent the task's single
+  `metrics.ceiling_reps` instead. When `reps` is absent the task's single
   `result` stands in for one rep.
 - `runs[].eval_verdict` — `GREEN` | `RED` | `null`: the Nightly report reads
   it; a night that is not a `SUCCESS` and carries `null` was ended before
@@ -547,20 +545,29 @@ what the renderer does with them.
   line and does not publish, so a stall is never republished under a fresh
   `generated_at`.
 - `--gitlab-pr-glob <gs glob>` (repeatable) — the GitLab lane's build-dir
-  glob (`.../pull-kube-agents-smoke-test-gitlab/*`), read as `--pr-glob` is
-  (the job's directory index above its own watermark, the glob without
-  one), every run tagged `tier: "gitlab"` and its unfinished builds tagged
-  the same on `pending_builds`. The presubmit's watermark ignores the
-  lane's ids and the lane's ignores the presubmit's, as the nightly's does.
-  An explicit `--index-prefix` is the presubmit's; the lane's index is
-  always derived from its own glob. The lane, like the nightly, must never
+  glob (`.../pull-kube-agents-smoke-test-gitlab/*`), read through the job's
+  directory index derived from it, above the lane's own watermark when a
+  lane run is on record and whole (under `--since-days`) when none is; the
+  glob itself is listed only when no index is derivable from it, or
+  `--index-prefix ""` disabled the index. Every run is tagged
+  `tier: "gitlab"` and its unfinished builds the same on `pending_builds`.
+  The presubmit's watermark ignores the lane's ids and the lane's ignores
+  the presubmit's, as the nightly's does. An explicit `--index-prefix` is
+  the presubmit's; the lane's index is always derived from its own glob.
+  The lane takes its index on the cold path too, unlike the presubmit,
+  because the archive-wide glob walks every pull request's directory on
+  every tick until the lane's first run is on record (minutes, and past
+  the listing timeout as the archive grows), while the index answers
+  "nothing yet" in one flat listing. The lane, like the nightly, must never
   stop the gate's dashboard publishing, so it follows the nightly's rule:
-  with no lane run on record any listing that fails is a `note: glob ...
-did not list` line and nothing from it (the job may not exist yet); with
-  one, a listing that matched no objects (the index purged or moved, the
-  job renamed, while a run from before sits on record) is a `note:
-directory index ... did not list` line, and any other failure is the
-  refusal line, as it is for the presubmit.
+  with no lane run on record any listing that fails is a
+  `note: directory index ... did not list` line (`note: glob ...` on the
+  glob fallback) and nothing from it (the job may not exist yet); with
+  one, a listing that matched no objects (the
+  index purged or moved, the job renamed, while a run from before sits on
+  record) is the same note, and any other failure is the refusal line, as
+  it is for the presubmit. A listing that hangs past `GSUTIL_TIMEOUT_S` is
+  the refusal line either way, as for the nightly.
 - `--nightly-prefix [<gs prefix>]` — the nightly periodic's Prow log
   prefix, `gs://<bucket>/logs/<job>/`. For a periodic that prefix **is**
   the directory index: one `<build_id>/` directory per build beside a

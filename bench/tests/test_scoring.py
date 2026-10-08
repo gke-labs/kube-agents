@@ -228,18 +228,6 @@ def never_ran(rec):
     rec["scores"]["VerificationCorrectness"] = 0.0
 
 
-def http_500_opening_turn(rec):
-    """The #2430 shape: HTTP 500 from agent endpoint at opening turn."""
-    rec["trajectory"] = []
-    rec["tokens"] = {"total": None, "prompt": None, "completion": None}
-    rec["status"] = "error"
-    error_msg = "Error: HTTP 500 from agent endpoint: Internal server error: 'HERMES_KANBAN_BOARD'"
-    rec["output"] = error_msg
-    rec["errors"] = [error_msg]
-    rec["scores"]["VerificationCorrectness"] = 0.0
-    rec["scores"]["OutcomeValidity"] = {"score": 0.0, "reason": "Server error"}
-
-
 def make_it_fail(rec):
     rec["scores"]["VerificationCorrectness"] = 0.5
 
@@ -857,147 +845,6 @@ def test_a_skeleton_record_still_blocks_at_rung_3(noop_spec, make_run):
     assert verdict.blocking is True
 
 
-def test_opening_turn_http_500_with_empty_trajectory_is_infra(noop_spec, make_run):
-    """The #2430 shape: opening turn gets HTTP 500 from agent endpoint.
-
-    The error string is recorded as output, trajectory is empty, and tokens are
-    null. It must be classified as infrastructure, not rung 3 NOT_A_REAL_RUN.
-    """
-    verdict = grade_case(noop_spec, [make_run(mutate=http_500_opening_turn)], admitted=True)
-    assert verdict.rung is Rung.INFRA
-    assert verdict.blocking is False
-    assert verdict.reps[0].outcome == "infra"
-    assert "HTTP 500" in verdict.reps[0].reason
-    assert "#2430" in verdict.reps[0].reason
-
-
-def test_opening_turn_http_500_beside_passing_reps_does_not_gate(tofu_spec, make_run):
-    """Repetition 2 lost to opening turn 500 while 1 and 3 passed.
-
-    The case must grade on the 2 passing repetitions rather than redding
-    at rung 3 NOT_A_REAL_RUN (#2430).
-    """
-    verdict = grade_case(
-        tofu_spec,
-        [make_run(), make_run(mutate=http_500_opening_turn), make_run()],
-        admitted=True,
-    )
-    assert verdict.rung is Rung.GREEN
-    assert verdict.blocking is False
-    assert verdict.passes == 2
-    assert len(verdict.scored_reps) == 2
-
-
-@pytest.mark.parametrize("status_code", [502, 503, 504])
-def test_opening_turn_http_5xx_variants_are_infra(noop_spec, make_run, status_code):
-    """Exercises _is_http_5xx pattern matching across 5xx status codes from agent endpoint.
-
-    In the live harness, retryable 502/503/504 errors follow the transport retry
-    loop into _infra_failure (classified by the marker branch) unless non-retryable;
-    this tests scorer-level regex classification for 5xx error formats.
-    """
-    def mutate(rec):
-        http_500_opening_turn(rec)
-        msg = f"HTTP {status_code} from agent endpoint: temporary failure"
-        rec["output"] = msg
-        rec["errors"] = [msg]
-
-    verdict = grade_case(noop_spec, [make_run(mutate=mutate)], admitted=True)
-    assert verdict.rung is Rung.INFRA
-    assert verdict.blocking is False
-    assert verdict.reps[0].outcome == "infra"
-
-
-def test_tripped_safeguard_outranks_opening_turn_http_5xx(noop_spec, make_run):
-    """Rung 1 outranks: a tripped safeguard on a 5xx record still blocks at Rung 1."""
-    verdict = grade_case(
-        noop_spec,
-        [make_run(mutate=lambda r: (http_500_opening_turn(r), trip_catastrophic(r)))],
-        admitted=True,
-    )
-    assert verdict.rung is Rung.FORBIDDEN_ACTION
-    assert verdict.blocking is True
-
-
-def test_executed_agent_turn_with_http_500_is_not_classified_as_infra(noop_spec, make_run):
-    """When an agent actually executed (has trajectory tool calls and billed tokens),
-    a 500 error remains a graded agent failure, not excused as infra."""
-    def failed_run(rec):
-        # Keeps kanban_green_1's non-empty trajectory and billed tokens
-        rec["output"] = "Error: HTTP 500 from agent endpoint"
-        rec["errors"] = ["Error: HTTP 500 from agent endpoint"]
-        rec["scores"]["VerificationCorrectness"] = 0.0
-
-    verdict = grade_case(noop_spec, [make_run(mutate=failed_run)], admitted=True)
-    assert verdict.rung is not Rung.INFRA
-    assert verdict.passes == 0
-
-
-def test_http_500_with_billed_tokens_and_empty_trajectory_is_not_infra(noop_spec, make_run):
-    """Disjunct near-miss 1: tokens billed with empty trajectory is an inconsistent
-    record and blocks at Rung 3, not excused as infra (#2430)."""
-    def mutate(rec):
-        http_500_opening_turn(rec)
-        rec["tokens"] = {"total": 500, "prompt": 400, "completion": 100}
-
-    verdict = grade_case(noop_spec, [make_run(mutate=mutate)], admitted=True)
-    assert verdict.rung is not Rung.INFRA
-    assert verdict.blocking is True
-    assert verdict.rung is Rung.NOT_A_REAL_RUN
-
-
-def test_http_500_with_trajectory_and_null_tokens_is_not_infra(noop_spec, make_run):
-    """Disjunct near-miss 2: non-empty trajectory with null tokens (inject-transport
-    shape) blocks at Rung 3, not excused as infra (#2430)."""
-    def mutate(rec):
-        http_500_opening_turn(rec)
-        rec["trajectory"] = [{"tool": "bash", "action": "echo hello"}]
-        rec["tokens"] = {"total": None, "prompt": None, "completion": None}
-
-    verdict = grade_case(noop_spec, [make_run(mutate=mutate)], admitted=True)
-    assert verdict.rung is not Rung.INFRA
-    assert verdict.blocking is True
-    assert verdict.rung is Rung.NOT_A_REAL_RUN
-
-
-def test_executed_turn_with_failure_reason_is_not_classified_as_infra(noop_spec, make_run):
-    """An executed agent turn that failed with X-Hermes-Failure-Reason has empty
-    trajectory and null tokens in the harness result, and blocks at Rung 3 rather
-    than being excused as infra."""
-    def mutate(rec):
-        rec["trajectory"] = []
-        rec["tokens"] = {"total": None, "prompt": None, "completion": None}
-        rec["status"] = "error"
-        msg = "agent turn failed with tool_error: HTTP 502 from agent endpoint: tool exploded"
-        rec["output"] = msg
-        rec["errors"] = [msg]
-        rec["scores"]["VerificationCorrectness"] = 0.0
-
-    verdict = grade_case(noop_spec, [make_run(mutate=mutate)], admitted=True)
-    assert verdict.rung is not Rung.INFRA
-    assert verdict.blocking is True
-    assert verdict.rung is Rung.NOT_A_REAL_RUN
-
-
-def test_successful_agent_turn_opening_with_http_5xx_text_is_not_infra(noop_spec, make_run):
-    """An agent answer in prose that happens to open with HTTP 5xx text on a
-    status='success' record without usage tokens blocks at Rung 3 and is not
-    excused as infra (#2430)."""
-    def mutate(rec):
-        rec["trajectory"] = []
-        rec["tokens"] = {"total": None, "prompt": None, "completion": None}
-        rec["status"] = "success"
-        msg = "HTTP 503 Service Unavailable is returned by the ingress when no pods match."
-        rec["output"] = msg
-        rec["errors"] = []
-        rec["scores"]["VerificationCorrectness"] = 1.0
-
-    verdict = grade_case(noop_spec, [make_run(mutate=mutate)], admitted=True)
-    assert verdict.rung is not Rung.INFRA
-    assert verdict.blocking is True
-    assert verdict.rung is Rung.NOT_A_REAL_RUN
-
-
 def test_a_provision_failure_is_infrastructure_not_a_scoring_crash(tofu_spec, make_run):
     """The autoops-warning-event-triage presubmit crash of 2026-09-01/02.
 
@@ -1134,8 +981,7 @@ def test_a_scoreless_record_whose_verification_ran_still_blocks(tofu_spec, make_
 
 
 def test_an_ordinary_error_is_still_graded(noop_spec, make_run):
-    """Only the marker (or opening-turn never-ran/5xx) excuses a run. An executed
-    turn with a 4xx, 500, or real answer is graded."""
+    """Only the marker excuses a run. A 4xx, a 500, or any real answer is graded."""
     def failed(rec):
         rec["errors"] = ["HTTP 500 from the agent endpoint"]
         rec["scores"]["VerificationCorrectness"] = 0.0

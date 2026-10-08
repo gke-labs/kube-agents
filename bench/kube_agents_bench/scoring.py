@@ -26,14 +26,12 @@ none of them is a flake: a tripped catastrophic safeguard (rung 1), a declared
 check that errored rather than ran (rung 2), and a record that is not evidence
 of a real agent run (rung 3). Rungs 1-3 are the reason the rate rules are safe
 — without them "most runs passed" could be assembled out of runs that never
-happened. Three shapes leave rung 3 as infrastructure rather than blocking: the
-zero-token never-ran record (empty trajectory, tokens.total exactly 0; #1184),
-the delegation ceiling marker (#1874), and the opening-turn non-retryable
-5xx with no trajectory and null tokens (#2430). All three are classified
-infrastructure and excluded from the rate rather than graded, so they can never
-be assembled into a pass either; rung 3 keeps blocking the inconsistent shapes.
-A separate carve-out (#2039) is the inject lane's: on that transport's record,
-a check that reads what the record cannot show is set aside as not applicable
+happened. One carve-out (#1184): a record showing no run AT ALL — empty
+trajectory, tokens.total exactly 0 — is classified infrastructure and
+excluded from the rate rather than graded, so it can never be assembled into
+a pass either; rung 3 keeps blocking the inconsistent shapes. A second
+carve-out (#2039) is the inject lane's: on that transport's record, a check
+that reads what the record cannot show is set aside as not applicable
 before the rungs -- failed or errored, it is neither a graded failure nor a
 rung-2 block there -- and the rungs grade what remains (see
 ``_inject_lane_view``). A check that reads the delegated workers is set
@@ -56,7 +54,6 @@ from __future__ import annotations
 
 import json
 import math
-import re
 from collections.abc import Sequence
 from dataclasses import dataclass, field, replace
 from enum import IntEnum
@@ -356,8 +353,6 @@ SUITE_OUTCOME_GREEN = "green"
 SUITE_OUTCOME_RED = "red"
 SUITE_OUTCOME_NOT_EVALUATED = "not_evaluated"
 
-_HTTP_5XX_PATTERN = re.compile(r"^(?:Error:\s*)?HTTP\s+5\d\d\b", re.IGNORECASE)
-
 
 class Rung(IntEnum):
     """The verdict ladder, evaluated in order, stopping at the first match.
@@ -551,18 +546,6 @@ def _as_float(value: Any) -> float | None:
 
 def _as_str(value: Any) -> str | None:
     return str(value) if value is not None else None
-
-
-def _is_http_5xx(text: str | None) -> bool:
-    """Return True if text consists of or opens with an HTTP 5xx error.
-
-    Matches e.g. "HTTP 500 from agent endpoint: ...", "Error: HTTP 500 ...",
-    etc. Exercises string matching for non-retryable opening-turn 5xx errors.
-    """
-    if not text:
-        return False
-    cleaned = text.strip().strip("'\"")
-    return bool(_HTTP_5XX_PATTERN.match(cleaned))
 
 
 @dataclass(frozen=True)
@@ -1203,9 +1186,7 @@ def classify_rep(
     # regression. Deliberately the CONJUNCTION, with 0 and null distinct:
     # tokens billed with no trajectory is an inconsistent record, and the
     # harness skeleton (empty trajectory, every token bucket null) never
-    # billed a model call it can prove -- both stay rung 3 blocks below,
-    # with the exception of an opening-turn HTTP 5xx (#2430) where the agent
-    # endpoint failed before any execution occurred.
+    # billed a model call it can prove -- both stay rung 3 blocks below.
     total_tokens = record.tokens.get("total")
     if (
         not record.trajectory
@@ -1218,30 +1199,6 @@ def classify_rep(
             "tokens.total is 0, so no model call was billed. There is no "
             "answer in it to grade, whatever produced it -- infrastructure, "
             "not the pull request (#1184)",
-        )
-
-    # An HTTP 5xx on the opening turn recorded as the entire output (#2430):
-    # the agent endpoint handler crashed or failed before an agent could execute
-    # (e.g. gateway env race or unhandled handler startup exception). The harness
-    # stored the error string as the answer with an empty trajectory and null
-    # billed tokens. The liveness signals read as inconsistent because the
-    # error string was stored as the answer, but no model call was ever billed
-    # and no trajectory recorded -- this is an infrastructure repetition by the
-    # gate's own definition (#1184), not an agent regression to block at rung 3.
-    output_text = (record.output or "").strip()
-    errors_text = " ".join(str(e) for e in errors) if errors else ""
-    if (
-        record.status != _STATUS_SUCCESS
-        and not record.trajectory
-        and total_tokens is None
-        and (_is_http_5xx(output_text) or (not output_text and _is_http_5xx(errors_text)))
-    ):
-        err_detail = output_text or errors_text
-        return rep(
-            "infra",
-            "the record holds an HTTP 5xx error as its entire output with no "
-            f"trajectory and no tokens billed ({err_detail}): the agent endpoint "
-            "failed before an agent ran -- infrastructure, not the pull request (#2430)",
         )
 
     # --- Rung 2. A declared check that did not produce a verdict.
