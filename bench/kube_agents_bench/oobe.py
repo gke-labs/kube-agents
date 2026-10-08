@@ -81,7 +81,8 @@ try:
     marks = {a: t for a, t in (recorded.get("marks") or {}).items() if isinstance(t, (int, float))}
 except (OSError, ValueError, AttributeError, TypeError):
     pass
-if out["applied_at"] and not out["error"]:
+# A store not yet created has no runs, as the stage and the runner read it.
+if out["applied_at"] and not out["error"] and os.path.exists(db):
     try:
         armed = datetime.fromisoformat(out["applied_at"]).timestamp()
         con = sqlite3.connect("file:" + db + "?mode=ro", uri=True, timeout=SQLITE_BUSY_TIMEOUT)

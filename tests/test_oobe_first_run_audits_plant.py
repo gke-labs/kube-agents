@@ -187,6 +187,16 @@ class PlantScriptsTest(unittest.TestCase):
         self.assertEqual(self._jobs().count("oobe"), 1)
         self.assertFalse(self._state()["job_added"])
 
+    def test_arm_refuses_a_paused_or_disabled_job_and_changes_nothing(self):
+        for job in ({**OOBE_JOB, "enabled": False}, {**OOBE_JOB, "state": "paused"}, {**OOBE_JOB, "paused_at": "x"}):
+            with self.subTest(job=job):
+                self.store.write_text(json.dumps([OTHER_JOB, job]))
+                done = self._arm()
+                self.assertNotEqual(done.returncode, 0)
+                self.assertIn("paused or disabled", done.stderr)
+                self.assertFalse((self.home / ".bench-oobe.json").exists())
+                self.assertFalse((self.home / ".bootstrap_scan_filed").exists())
+
     def test_arm_refuses_when_already_armed(self):
         (self.home / ".bench-oobe.json").write_text("{}")
         done = self._arm()

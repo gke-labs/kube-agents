@@ -38,6 +38,7 @@ RUNNER = REPO / "hack" / "ci-eval-pr.sh"
 STAGE = REPO / "agents" / "chat" / "scripts" / "oobe.py"
 AUDITS = ["fleet-wide-cost-analysis", "compliance-audit", "obtainability-audit", "stockout-prevention"]
 MINUTE = 60
+FINISH_AFTER_SECONDS = 3
 # The script's cutoff, read from source so the test follows it.
 STALE_SECONDS = eval(re.search(r"^STALE_SECONDS = (.+)$", SCRIPT.read_text(), re.M).group(1))
 
@@ -135,12 +136,13 @@ class PlatformRunsTest(unittest.TestCase):
         self._rows([("1", "compliance-audit", "running", ago(0))])
 
         def finish():
-            time.sleep(0.5)
+            # Well past the child's start-up, so its first read sees the run going.
+            time.sleep(FINISH_AFTER_SECONDS)
             with sqlite3.connect(self.db) as con:
                 con.execute("UPDATE executions SET status = 'completed'")
 
         threading.Thread(target=finish).start()
-        self.assertEqual(self._wait(bound=30), "ended after 1s")
+        self.assertRegex(self._wait(bound=30), r"^ended after \d+s$")
 
 
     # --- an oobe stage the eval stack left armed ----------------------------
@@ -163,9 +165,11 @@ class PlatformRunsTest(unittest.TestCase):
         self._stage({"fired": ["fleet-wide-cost-analysis"], "current": None}, armed=False)
         self.assertEqual(self._wait(), "still going after 0s, the run goes ahead: compliance-audit (oobe stage, next)")
 
-    def test_the_audit_awaiting_its_run_is_the_one_next(self):
+    def test_while_an_audit_awaits_its_run_the_one_after_it_is_next(self):
+        # The state the stage keeps from cost's mark to compliance's: cost is answered by its
+        # run and mark, compliance is held before it is marked.
         self._stage({"fired": ["fleet-wide-cost-analysis"], "current": {"job": "fleet-wide-cost-analysis", "marked_at": 1}}, armed=False)
-        self.assertEqual(self._wait(), "still going after 0s, the run goes ahead: fleet-wide-cost-analysis (oobe stage, next)")
+        self.assertEqual(self._wait(), "still going after 0s, the run goes ahead: compliance-audit (oobe stage, next)")
 
     def test_a_roster_whose_jobs_are_not_a_list_holds(self):
         self._stage({"fired": []}, armed=False)
@@ -198,9 +202,13 @@ class PlatformRunsTest(unittest.TestCase):
             "still going after 0s, the run goes ahead: obtainability-audit (armed oobe stage), stockout-prevention (armed oobe stage)",
         )
 
-    def test_the_audit_in_flight_holds_until_the_stage_moves_on(self):
+    def test_an_armed_stage_holds_every_audit_it_has_still_to_mark(self):
         self._stage({"fired": ["fleet-wide-cost-analysis"], "current": {"job": "fleet-wide-cost-analysis", "marked_at": 1}})
-        self.assertIn("fleet-wide-cost-analysis (armed oobe stage)", self._wait(audits=["fleet-wide-cost-analysis"]))
+        self.assertEqual(
+            self._wait(),
+            "still going after 0s, the run goes ahead: compliance-audit (armed oobe stage), "
+            "obtainability-audit (armed oobe stage), stockout-prevention (armed oobe stage)",
+        )
 
     def test_a_done_or_absent_stage_holds_nothing(self):
         self._stage({"done": True})

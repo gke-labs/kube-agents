@@ -634,7 +634,8 @@ class StageTest(unittest.TestCase):
         # trigger_job would set enabled back to true.
         self._roster([
             {"id": "compliance-audit", "enabled": False},
-            {"id": "obtainability-audit", "enabled": True, "state": "paused", "paused_at": "2026-10-06T00:00:00"},
+            {"id": "obtainability-audit", "enabled": True, "state": "paused"},
+            {"id": "stockout-prevention", "enabled": True, "paused_at": "2026-10-06T00:00:00"},
             {"id": "fleet-wide-cost-analysis", "enabled": True},
         ])
         self._file_scan()
@@ -645,7 +646,7 @@ class StageTest(unittest.TestCase):
         self.assertEqual(state[oobe.STATE_HELD], {
             "compliance-audit": "disabled",
             "obtainability-audit": "paused",
-            "stockout-prevention": oobe.HOLD_MISSING,
+            "stockout-prevention": "paused",
         })
         self.assertTrue(state[oobe.STATE_DONE])
 

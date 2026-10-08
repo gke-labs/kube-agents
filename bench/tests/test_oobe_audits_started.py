@@ -281,6 +281,14 @@ def test_an_unreadable_store_is_an_error(store: Store) -> None:
     assert str(store.db) in result.reason
 
 
+def test_no_store_yet_is_nothing_started(store: Store) -> None:
+    store.arm()
+    store.db.unlink(missing_ok=True)
+    result = _verify()
+    assert result.status == "fail"
+    assert "nothing started the first-run audits" in result.reason
+
+
 def test_a_pod_that_does_not_answer_is_an_error(store: Store, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(oobe, "agent_shell", lambda _script, _timeout: "")
     assert _verify().status == "error"

@@ -33,7 +33,7 @@ import subprocess
 import sys
 from datetime import datetime, timezone
 
-from cron.jobs import _jobs_lock, compute_next_run, load_jobs, save_jobs
+from cron.jobs import _jobs_lock, compute_next_run, is_job_runnable, load_jobs, save_jobs
 
 home, hermes, run = sys.argv[1:4]
 STATE = os.path.join(home, ".bench-oobe.json")
@@ -91,6 +91,11 @@ def shipped_job():
 
 if os.path.exists(STATE):
     sys.exit(f"{STATE} exists: the stage is already armed")
+# Before anything changes: a paused or disabled job never runs, and the case would read as an
+# image that ships none.
+paused = next((j for j in load_jobs() if j.get("id") == JOB_ID and not is_job_runnable(j)), None)
+if paused is not None:
+    sys.exit(f"the {JOB_ID} job is paused or disabled on this install; resume it or remove it before running this case")
 
 state = {
     "applied_at": datetime.now(timezone.utc).isoformat(),

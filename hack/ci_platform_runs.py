@@ -20,8 +20,9 @@ next one, and only once the chain has started (before that the stage waits on th
 onboarding scan, for as long as an hour and more): waiting out the scan or the whole
 chain would hold every audit case on those streams for most of an hour. While the oobe-first-run-audits stack has the stage armed (its
 state file is there: the chain overran or the teardown could not disarm), every
-audit the stage has still to run counts. An audit has had its turn once the stage
-has marked it and its run has ended, or it was held or given up on. The stage's
+audit the stage has still to mark counts. An audit has had its turn once the stage
+has marked it (its run, or the mark awaiting one, is counted above), or it was held
+or given up on; a mark never claimed is taken back and the audit counts again. The stage's
 audit list and order are read from the image's copy of oobe.py, not run.
 
 Prints one line: how long it waited and what was still going when it stopped.
@@ -125,8 +126,9 @@ def stage_pending():
         state = {}
     if state.get("done"):
         return set()
-    current = (state.get("current") or {}).get("job")
-    had_turn = (set(state.get("fired", [])) | set(state.get("held", {})) | set(state.get("gave_up", []))) - {current}
+    # The audit awaiting its run is in `fired` and answered by running() and due(); the one after
+    # it is the first not yet marked.
+    had_turn = set(state.get("fired", [])) | set(state.get("held", {})) | set(state.get("gave_up", []))
     remaining = [audit for audit in stage_audits() if audit not in had_turn]
     if os.path.exists(STACK_STATE):
         return {f"{audit} (armed oobe stage)" for audit in remaining if audit in audits}
