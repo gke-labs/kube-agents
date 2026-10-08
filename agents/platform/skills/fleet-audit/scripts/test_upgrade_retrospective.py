@@ -946,6 +946,39 @@ class LedgerAndGuardsTest(unittest.TestCase):
         self.assertEqual(recheck["cleared"], [])
         self.assertTrue(recheck["errors"])
 
+    def test_event_only_guard_is_not_recheckable(self):
+        reads = {**READS["seeded-a"], "events": READS["seeded-a"]["events"] + [event("FailedAttachVolume", "AttachVolume.Attach failed for volume pv-1", name="inference-server-778b78fdb8-zzzzz", namespace="seeded-capacity")]}
+        with mock.patch.dict(READS, {"seeded-a": reads}):
+            first, _ = self.collect()
+        gid = ur.guard_id(SEEDED, 19, INFERENCE)
+        guard = next(g for g in first["guards"] if g["id"] == gid)
+        self.assertEqual(guard["source"], ur.GUARD_SOURCE_EVENT)
+        # A guard a pod also showed is not event-only.
+        self.assertEqual(next(g for g in first["guards"] if g["id"] == ur.guard_id(SEEDED, 2, INFERENCE))["source"], ur.CATEGORY_PENDING)
+        # Unchanged, no events read: the event-only guard is neither cleared nor refreshed.
+        second, _ = self.collect(now=datetime(2026, 10, 15, 18, 0, tzinfo=timezone.utc))
+        [recheck] = [r for r in second["rechecks"] if r["cluster"] == SEEDED]
+        self.assertEqual((recheck["cleared"], recheck["not_recheckable"]), ([], [gid]))
+        self.assertIn(gid, {g["id"] for g in second["guards"]})
+        self.assertIn(f"- {SEEDED}: re-checked for {recheck['guards']} guard(s): 0 cleared; {ur.RECHECK_NOT_RECHECKABLE_TEXT.format(count=1)}", ur.render_report(second))
+        # The next full review of the cluster, with the event gone, clears it.
+        third, _ = self.collect(now=datetime(2026, 10, 16, 18, 0, tzinfo=timezone.utc), cluster=[SEEDED])
+        self.assertNotIn(gid, {g["id"] for g in third["guards"]})
+
+    def test_stale_guard_on_a_partially_read_cluster_says_so(self):
+        self.collect()
+        later = datetime(2026, 10, 15, 18, 0, tzinfo=timezone.utc)
+        second, _ = self.collect(FakeFleet(kubectl_fail=[("seeded-a", "pods")]), now=later, cluster=[SEEDED])
+        stale = [i for i in second["sections"]["warnings"] if i["kind"] == ur.INCIDENT_STALE_GUARD and i["cluster"] == SEEDED]
+        self.assertTrue(stale)
+        self.assertTrue(all(i["partial"] == ["pods"] for i in stale))
+        report = ur.render_report(second)
+        self.assertEqual(report.count(ur.STALE_PARTIAL_TEXT.format(failed="pods")), len(stale))
+        # gemma was neither reviewed nor re-checked under --cluster: its guards keep the other wording.
+        other = [i for i in second["sections"]["warnings"] if i["kind"] == ur.INCIDENT_STALE_GUARD and i["cluster"] == GEMMA]
+        self.assertEqual(report.count("cluster not reviewed this run"), len(other))
+        self.assertTrue(other)
+
     def test_store_defaults_live_under_the_store_home(self):
         result, _ = self.collect()
         self.assertEqual(Path(result["ledger_path"]), self.home / ur.LEDGER_FILENAME)

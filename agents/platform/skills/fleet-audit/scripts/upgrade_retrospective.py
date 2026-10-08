@@ -53,7 +53,11 @@ sandbox's data volume under /opt/data/upgrade-retrospective, readable by the
 agent's tools in any session and surviving restarts. An unchanged cluster
 that still holds a live guard is re-read cheaply every run -- only the reads
 its guards need -- so a guard clears when an operator's fix lands between
-upgrades, without waiting for the next one.
+upgrades, without waiting for the next one. The weekly run therefore
+re-reads every cluster that holds a guard, and with risk guards present
+that is most of the fleet; the SOP sizes the schedule for that. A failure
+guard whose only source was an event is not re-checkable (a re-check reads
+no events) and waits for the cluster's next full review.
 
 Every subprocess goes through `default_run`; tests inject a fake in its place.
 Nothing here writes to a cluster: `gcloud ... list`, `get-credentials` into a
@@ -293,7 +297,7 @@ SHAPE_CHECKS = (
     "emptyDir or local-SSD volumes whose name suggests state (4)",
     "GPU workloads pinning a CUDA version (18)",
     "fail-closed webhooks whose Service has no ready endpoint (7)",
-    "pre-cgroup-v2 runtime images on a cgroup v2 pool or a v1 pool GKE will migrate at 1.33 (14)",
+    "pre-cgroup-v2 runtime images on a cgroup v2 pool or a v1 pool GKE will migrate at 1.33 (14; pinned tags only, floating tags such as 8-jre are not matched)",
     "not checked statically: a multi-process container (15) is not visible from the spec",
 )
 # Guard kinds: a `failure` broke the last upgrade, a `risk` is a shape
@@ -303,6 +307,11 @@ GUARD_KIND_FAILURE, GUARD_KIND_RISK = "failure", "risk"
 # every one of them answered on the review that did not see it; a slow
 # `kubectl get pods` must not erase a cluster's memory.
 FAILURE_GUARD_READS = ("pods", "nodes", "events", "pdbs", "owners")
+# A failure guard whose only source was an event cannot be re-observed by a
+# re-check, which reads no events; it is kept until the next full review.
+GUARD_SOURCE_EVENT = CATEGORY_EVENT
+RECHECK_NOT_RECHECKABLE_TEXT = "{count} event-only guard(s) not re-checkable; cleared by the next review of the cluster"
+STALE_PARTIAL_TEXT = "cluster read partially this run ({failed}); the guard below could not be re-observed and was kept."
 SPEC_SHAPE_READS = ("pods", "owners", "workloads")
 SHAPE_READS_BY_ENTRY = {
     ENTRY_BUDGET: ("pdbs", "workloads"),
@@ -1469,7 +1478,13 @@ def guards_for(key: str, symptoms: list[dict], seen_at: str) -> list[dict]:
             if c["entry"] is None:
                 continue
             guard = _guard(key, GUARD_KIND_FAILURE, c["entry"], c["title"], symptom["object"], c["confidence"], c["evidence"], seen_at, FAILURE_GUARD_READS)
-            out.setdefault(guard["id"], guard)
+            guard["source"] = symptom["category"]
+            existing = out.get(guard["id"])
+            if existing is None:
+                out[guard["id"]] = guard
+            elif existing["source"] == GUARD_SOURCE_EVENT and symptom["category"] != GUARD_SOURCE_EVENT:
+                # A pod or node showed the same finding: the guard is not event-only.
+                existing["source"] = symptom["category"]
     return list(out.values())
 
 
@@ -1927,7 +1942,7 @@ def recheck_cluster(key: str, cluster: dict, cluster_guards: list[dict], *, run:
             needed |= set(RECHECK_FAILURE_READS)
             if guard.get("entry") == ENTRY_BUDGET:
                 needed |= set(RECHECK_BUDGET_READS)
-    result = {"cluster": key, "guards": len(cluster_guards), "cleared": [], "refreshed": [], "errors": []}
+    result = {"cluster": key, "guards": len(cluster_guards), "cleared": [], "refreshed": [], "not_recheckable": [], "errors": []}
     kubeconfig, error = fetch_credentials(cluster, run=run)
     if error:
         result["errors"].append(error)
@@ -1950,6 +1965,9 @@ def recheck_cluster(key: str, cluster: dict, cluster_guards: list[dict], *, run:
     fresh |= {g["id"] for g in risk_guards_for(key, collect_risks(cluster, reads)[0], "")}
     for guard in cluster_guards:
         kind = guard.get("kind", GUARD_KIND_FAILURE)
+        if kind == GUARD_KIND_FAILURE and guard.get("source") == GUARD_SOURCE_EVENT:
+            result["not_recheckable"].append(guard["id"])
+            continue
         reads_needed = set(guard.get("reads") or SPEC_SHAPE_READS) if kind == GUARD_KIND_RISK else set(RECHECK_FAILURE_READS) | (set(RECHECK_BUDGET_READS) if guard.get("entry") == ENTRY_BUDGET else set())
         present = guard["id"] in fresh or (kind == GUARD_KIND_FAILURE and guard.get("entry") == ENTRY_BUDGET and guard.get("object") in budgets_at_zero)
         if present:
@@ -1964,7 +1982,7 @@ def _safe_recheck(key: str, cluster: dict, cluster_guards: list[dict], *, run: R
         return recheck_cluster(key, cluster, cluster_guards, run=run)
     except Exception as exc:  # noqa: BLE001 -- the boundary is the point
         log(f"{key}: re-check failed: {exc!r}")
-        return {"cluster": key, "guards": len(cluster_guards), "cleared": [], "refreshed": [], "errors": [f"re-check failed: {exc!r}"[:ERROR_EXCERPT_CHARS]]}
+        return {"cluster": key, "guards": len(cluster_guards), "cleared": [], "refreshed": [], "not_recheckable": [], "errors": [f"re-check failed: {exc!r}"[:ERROR_EXCERPT_CHARS]]}
 
 
 def _safe_review(selection: Selection, ledger: dict, **kwargs) -> dict:
@@ -2159,11 +2177,13 @@ def triage(reviews: list[dict], unchanged: list[dict], failed_reads: list[str], 
             })
         for incident in sorted(incidents.values(), key=lambda i: i["object"]):
             (errors if incident["severity"] == SEVERITY_ERROR else warnings).append(incident)
+    partial_reads = {r["cluster"]: r["partial"] for r in reviews if r.get("partial") and not r["reviewed"]}
     for guard in guards:
         # A risk is never an incident, so only a failure guard that outlived
         # its last review is a Warning; stale risk guards stay in the file.
         if guard.get("last_seen") != seen_at and guard.get("kind", GUARD_KIND_FAILURE) == GUARD_KIND_FAILURE:
             warnings.append({
+                "partial": partial_reads.get(guard["cluster"]) or [],
                 "kind": INCIDENT_STALE_GUARD,
                 "severity": SEVERITY_WARNING,
                 "cluster": guard["cluster"],
@@ -2212,7 +2232,10 @@ def _incident_lines(incident: dict) -> list[str]:
     lines = [f"### {incident['entries']} — {_cell(incident['cluster'])} — `{_cell(incident['object'])}`" + (" (system)" if incident["system"] else ""), ""]
     if incident["kind"] == INCIDENT_STALE_GUARD:
         guard = incident["guards"][0]
-        lines.append(f"{PART_WHAT_HAPPENED} cluster not reviewed this run; the guard below is from an earlier run.")
+        if incident.get("partial"):
+            lines.append(f"{PART_WHAT_HAPPENED} {STALE_PARTIAL_TEXT.format(failed=', '.join(incident['partial']))}")
+        else:
+            lines.append(f"{PART_WHAT_HAPPENED} cluster not reviewed this run; the guard below is from an earlier run.")
         lines.append(f"{PART_WHAT_FAILED} entry {guard['entry']}. {guard['title']} ({guard['confidence']}) last seen {guard['last_seen']}: {_cell(guard['evidence'])}")
         lines.append(f"{PART_MITIGATE} the entry's row applies until the cluster is reviewed again.")
         lines.append(f"{PART_MITIGATION_SET_UP} guard `{_cell(guard['object'])}` entry {guard['entry']}, first seen {guard['first_seen']}, still live.")
@@ -2321,7 +2344,8 @@ def render_report(result: dict) -> str:
         lines += [INFO_RECHECKED, ""]
         for r in info["rechecked"]:
             errors = f"; reads that failed: {_cell('; '.join(r['errors']))}" if r["errors"] else ""
-            lines.append(f"- {_cell(r['cluster'])}: re-checked for {r['guards']} guard(s): {len(r['cleared'])} cleared{errors}")
+            not_recheckable = f"; {RECHECK_NOT_RECHECKABLE_TEXT.format(count=len(r['not_recheckable']))}" if r.get("not_recheckable") else ""
+            lines.append(f"- {_cell(r['cluster'])}: re-checked for {r['guards']} guard(s): {len(r['cleared'])} cleared{not_recheckable}{errors}")
         lines.append("")
     if info.get("removed"):
         lines += [INFO_REMOVED, ""]
