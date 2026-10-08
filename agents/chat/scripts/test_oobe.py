@@ -937,13 +937,14 @@ class StageTest(unittest.TestCase):
 
     # --- the stages ------------------------------------------------------------
 
-    def test_the_stages_run_scan_then_audits_then_delivery(self):
+    def test_the_stages_run_delivery_then_scan_then_audits(self):
+        # Delivery first, within seconds of the scheduler's snapshot of the job's destination.
         order = []
         self.scan.side_effect = lambda _d: order.append("scan")
         self.deliver.side_effect = lambda _d: order.append("deliver") or 0
         with mock.patch.object(oobe, "first_run_audits", lambda _d, _now: order.append("audits")):
             self._main()
-        self.assertEqual(order, ["scan", "audits", "deliver"])
+        self.assertEqual(order, ["deliver", "scan", "audits"])
 
     def test_the_exit_is_deliverys(self):
         # A report delivery cannot read fails the run, which the scheduler posts as an alert.

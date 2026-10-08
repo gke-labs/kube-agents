@@ -3,18 +3,19 @@
 
 The design is ``docs/designs/oobe.md``. Each tick runs three stages in order:
 
-1. The inventory scan, ``bootstrap_scan_gate.main``: file the sweep card, then the
+1. Delivery, ``bootstrap_delivery.main``: post the report to the chat the
+   ``bootstrap_onboarding`` plugin linked this job to, once a human has spoken. First,
+   because the scheduler snapshots this job's destination when the run starts.
+2. The inventory scan, ``bootstrap_scan_gate.main``: file the sweep card, then the
    hand-off's cluster and ranking cards.
-2. The first-run audits, below: once the scan has settled, the four fleet audits that
+3. The first-run audits, below: once the scan has settled, the four fleet audits that
    would otherwise wait for their schedules (the next 06:20 UTC, the next Monday for
    cost), one after another.
-3. Delivery, ``bootstrap_delivery.main``: post the report to the chat the
-   ``bootstrap_onboarding`` plugin linked this job to, once a human has spoken.
 
 Delivery's stdout is the report, and the scheduler posts whatever this job prints to
-that chat, and a non-zero exit as a failure. So the first two stages run with stdout
+that chat, and a non-zero exit as a failure. So the other two stages run with stdout
 sent to stderr, their subprocesses' included, and an exception in either is logged
-rather than raised: neither may post, or keep the report from going out.
+rather than raised: neither may post, or change delivery's exit.
 
 The first-run audits stage fires when the ranking card the hand-off recorded for the scan has
 finished, read through the hand-off's own reads (``bootstrap_handoff``). It
@@ -601,9 +602,14 @@ def main(data_dir: Path | None = None, now: float | None = None) -> int:
         bootstrap_delivery._retire_jobs()
         retire()
         return 0
+    # Delivery first: the scheduler snapshots this job's `deliver`/`origin` when the run starts, so
+    # the report must be claimed within seconds of that, as the old delivery job's was. Behind the
+    # scan and the audits stage (a trigger subprocess can take 30 s), a chat linked in between
+    # would be missed and the report posted to the old destination.
+    code = bootstrap_delivery.main(data_dir)
     _quiet_stage("scan", bootstrap_scan_gate.main, data_dir)
     _quiet_stage("first-run audits", first_run_audits, data_dir, now)
-    return bootstrap_delivery.main(data_dir)
+    return code
 
 
 if __name__ == "__main__":
