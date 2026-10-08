@@ -58,7 +58,9 @@ locals {
   # the reconcile's budget.
   gate_script = "bootstrap_scan_gate.py"
   gate_wait   = 450
-  scan_job    = "bootstrap-inventory-scan"
+  # The job whose scan stage files the sweep (agents/chat/scripts/oobe.py); the old
+  # bootstrap-inventory-scan entry ships disabled.
+  scan_job    = "oobe"
   # bootstrap_scan_gate.py's CLUSTER_IDEMPOTENCY_KEY_PREFIX.
   cluster_key_like = "bootstrap-inventory-cluster-%"
   # bootstrap_scan_gate.py's PRIORITIZE_IDEMPOTENCY_KEY: the ranking card the
@@ -295,10 +297,10 @@ resource "null_resource" "sweep" {
           echo "ERROR: ${local.home}/.user_aligned exists on ${var.host_cluster_name}: a person has connected, and the report a fresh sweep writes would be delivered to their chat. Run this case on an install nobody is chatting with." >&2
           exit 1 ;;
         completed)
-          echo "ERROR: onboarding already delivered on ${var.host_cluster_name} (${local.home}/.bootstrap_completed), and delivery removed the bootstrap-inventory-scan job with it. There is no gate left to re-arm." >&2
+          echo "ERROR: onboarding already delivered on ${var.host_cluster_name} (${local.home}/.bootstrap_completed), and the ${local.scan_job} job removes itself after delivery. There is no gate left to re-arm." >&2
           exit 1 ;;
         nojob)
-          echo "ERROR: the bootstrap-inventory-scan cron job is not in ${local.home}/cron/jobs.json on ${var.host_cluster_name}, so nothing will file a sweep." >&2
+          echo "ERROR: the ${local.scan_job} cron job is not in ${local.home}/cron/jobs.json on ${var.host_cluster_name}, so nothing will file a sweep." >&2
           exit 1 ;;
         paused)
           echo "ERROR: the ${local.scan_job} cron job is paused (\"enabled\": false in ${local.home}/cron/jobs.json) on ${var.host_cluster_name}, so nothing will file a sweep. The agent pod's next start re-enables it." >&2

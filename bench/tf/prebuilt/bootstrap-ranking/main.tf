@@ -114,9 +114,10 @@ locals {
   # none. A pod created in that time is not running yet and fails the exec
   # anyway, so kubectl's default of 60s only delays each failure by a minute.
   pod_wait = 5
-  # agents/chat/scripts/bootstrap_delivery.py: SCAN_JOB_ID and DELIVERY_JOB_ID.
+  # agents/chat/scripts/bootstrap_delivery.py: SCAN_JOB_ID, the disabled entry delivery removes
+  # with itself, and OOBE_JOB_ID, the job whose delivery stage posts the report.
   scan_job     = "bootstrap-inventory-scan"
-  delivery_job = "bootstrap-inventory-delivery"
+  delivery_job = "oobe"
   state_file   = "${local.home}/.bench-onboarding-jobs.json"
   # agents/chat/defaults/plugins/bootstrap_onboarding/plugin.py: GREETED_MARKER.
   greeted = "${local.home}/.bootstrap_greeted"

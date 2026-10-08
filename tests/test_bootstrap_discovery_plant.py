@@ -83,7 +83,7 @@ _INTERPOLATIONS = {
     "local.list_tries": "3",
     "local.list_wait": "5",
     "local.pod_wait": "5",
-    "local.scan_job": "bootstrap-inventory-scan",
+    "local.scan_job": "oobe",
     "local.prioritize_key": "bootstrap-inventory-prioritize",
     "local.handoff_wait": "1800",
     "local.settle_hold": "120",
@@ -594,10 +594,10 @@ class Step1StateQueryTest(unittest.TestCase):
         return completed.stdout.strip()
 
     def test_an_enabled_scan_job_reads_clear(self):
-        self.assertEqual(self._state([{"id": "other", "enabled": False}, {"id": "bootstrap-inventory-scan", "enabled": True}]), "clear")
+        self.assertEqual(self._state([{"id": "other", "enabled": False}, {"id": "oobe", "enabled": True}]), "clear")
 
     def test_a_paused_scan_job_reads_paused(self):
-        self.assertEqual(self._state([{"id": "bootstrap-inventory-scan", "enabled": False}]), "paused")
+        self.assertEqual(self._state([{"id": "oobe", "enabled": False}]), "paused")
 
     def test_a_missing_scan_job_reads_nojob(self):
         self.assertEqual(self._state([{"id": "other", "enabled": True}]), "nojob")
