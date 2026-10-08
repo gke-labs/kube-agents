@@ -1,0 +1,211 @@
+{
+ "apiVersion": "v1",
+ "items": [
+  {
+   "apiVersion": "apps/v1",
+   "kind": "ReplicaSet",
+   "metadata": {
+    "name": "inference-server-778b78fdb8",
+    "namespace": "seeded-capacity",
+    "ownerReferences": [
+     {
+      "kind": "Deployment",
+      "name": "inference-server"
+     }
+    ]
+   }
+  },
+  {
+   "apiVersion": "apps/v1",
+   "kind": "ReplicaSet",
+   "metadata": {
+    "name": "payments-api-79b77b8c67",
+    "namespace": "seeded-debug",
+    "ownerReferences": [
+     {
+      "kind": "Deployment",
+      "name": "payments-api"
+     }
+    ]
+   }
+  },
+  {
+   "apiVersion": "apps/v1",
+   "kind": "ReplicaSet",
+   "metadata": {
+    "name": "baseline-edge-worker-7875987d97",
+    "namespace": "seeded-defaults",
+    "ownerReferences": [
+     {
+      "kind": "Deployment",
+      "name": "baseline-edge-worker"
+     }
+    ]
+   }
+  },
+  {
+   "apiVersion": "apps/v1",
+   "kind": "ReplicaSet",
+   "metadata": {
+    "name": "notification-relay-7d6f9fd9f5",
+    "namespace": "seeded-intent",
+    "ownerReferences": [
+     {
+      "kind": "Deployment",
+      "name": "notification-relay"
+     }
+    ]
+   }
+  },
+  {
+   "apiVersion": "apps/v1",
+   "kind": "ReplicaSet",
+   "metadata": {
+    "name": "checkout-gateway-568bd768b4",
+    "namespace": "seeded-reliability",
+    "ownerReferences": [
+     {
+      "kind": "Deployment",
+      "name": "checkout-gateway"
+     }
+    ]
+   }
+  },
+  {
+   "apiVersion": "apps/v1",
+   "kind": "ReplicaSet",
+   "metadata": {
+    "name": "arch-pinned-worker-c5f7b64fb",
+    "namespace": "seeded-shapes",
+    "ownerReferences": [
+     {
+      "kind": "Deployment",
+      "name": "arch-pinned-worker"
+     }
+    ]
+   }
+  },
+  {
+   "apiVersion": "apps/v1",
+   "kind": "ReplicaSet",
+   "metadata": {
+    "name": "cache-on-emptydir-5dd89c85b5",
+    "namespace": "seeded-shapes",
+    "ownerReferences": [
+     {
+      "kind": "Deployment",
+      "name": "cache-on-emptydir"
+     }
+    ]
+   }
+  },
+  {
+   "apiVersion": "apps/v1",
+   "kind": "ReplicaSet",
+   "metadata": {
+    "name": "cgroup-blind-jvm-79dd4fb5c",
+    "namespace": "seeded-shapes",
+    "ownerReferences": [
+     {
+      "kind": "Deployment",
+      "name": "cgroup-blind-jvm"
+     }
+    ]
+   }
+  },
+  {
+   "apiVersion": "apps/v1",
+   "kind": "ReplicaSet",
+   "metadata": {
+    "name": "intree-pd-reader-5569d9d897",
+    "namespace": "seeded-shapes",
+    "ownerReferences": [
+     {
+      "kind": "Deployment",
+      "name": "intree-pd-reader"
+     }
+    ]
+   }
+  },
+  {
+   "apiVersion": "apps/v1",
+   "kind": "ReplicaSet",
+   "metadata": {
+    "name": "legacy-registry-pull-7979df9ddc",
+    "namespace": "seeded-shapes",
+    "ownerReferences": [
+     {
+      "kind": "Deployment",
+      "name": "legacy-registry-pull"
+     }
+    ]
+   }
+  },
+  {
+   "apiVersion": "apps/v1",
+   "kind": "ReplicaSet",
+   "metadata": {
+    "name": "multi-process-worker-56d6db4478",
+    "namespace": "seeded-shapes",
+    "ownerReferences": [
+     {
+      "kind": "Deployment",
+      "name": "multi-process-worker"
+     }
+    ]
+   }
+  },
+  {
+   "apiVersion": "apps/v1",
+   "kind": "ReplicaSet",
+   "metadata": {
+    "name": "inventory-api-5467d66b99",
+    "namespace": "seeded-stall",
+    "ownerReferences": [
+     {
+      "kind": "Deployment",
+      "name": "inventory-api"
+     }
+    ]
+   }
+  },
+  {
+   "apiVersion": "batch/v1",
+   "kind": "Job",
+   "metadata": {
+    "name": "legacy-endpoints-writer-29858020",
+    "namespace": "seeded-deprecation",
+    "ownerReferences": [
+     {
+      "kind": "CronJob",
+      "name": "legacy-endpoints-writer"
+     }
+    ]
+   }
+  },
+  {
+   "apiVersion": "batch/v1",
+   "kind": "Job",
+   "metadata": {
+    "name": "legacy-endpoints-writer-first-run",
+    "namespace": "seeded-deprecation",
+    "ownerReferences": []
+   }
+  },
+  {
+   "apiVersion": "batch/v1",
+   "kind": "Job",
+   "metadata": {
+    "name": "stale-kubectl-client-29858020",
+    "namespace": "seeded-shapes",
+    "ownerReferences": [
+     {
+      "kind": "CronJob",
+      "name": "stale-kubectl-client"
+     }
+    ]
+   }
+  }
+ ],
+ "kind": "List"
+}
