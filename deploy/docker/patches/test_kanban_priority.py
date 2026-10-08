@@ -518,6 +518,43 @@ class ReservedSlotTest(unittest.TestCase):
         self.assertEqual(spawned, ["kid1"])
         self.assertEqual(res.skipped_reserved, ["kid2"])
 
+    def test_two_waiters_one_of_each_class_release_both_slots_at_cap_2(self):
+        """verify_kanban_scheduling E5's shape: both waiters are discounted from
+        their class's share, so one child of each class runs."""
+        b = Board(self)
+        b.card("coord-u", U, status="running")
+        b.card("coord-b", status="running")
+        b.child_of("coord-u", "kid-u1", U)
+        b.child_of("coord-u", "kid-u2", U)
+        b.child_of("coord-b", "kid-b1")
+        b.child_of("coord-b", "kid-b2")
+        spawned, res = b.tick(cap=2)
+        self.assertEqual(sorted(spawned), ["kid-b1", "kid-u1"])
+        # kid-u2 is held for triage's slot; kid-b2 is never reached, the budget
+        # of two being spent once kid-b1 runs.
+        self.assertEqual(res.skipped_reserved, ["kid-u2"])
+
+    def test_two_user_waiters_at_cap_2_get_one_slot_by_design(self):
+        """The case the first E5 used, which the per-class floor changed: at cap
+        2 user cards may hold one slot, so only one user child runs even though
+        both waiting coordinators are discounted (budget is 2, not 0)."""
+        b = Board(self)
+        b.card("coord-1", U, status="running")
+        b.card("coord-2", U, status="running")
+        for n in range(3):
+            b.child_of("coord-1" if n < 2 else "coord-2", f"kid{n}", U)
+        spawned, res = b.tick(cap=2)
+        self.assertEqual(spawned, ["kid0"])
+        self.assertEqual(res.skipped_reserved, ["kid1", "kid2"])
+        # At cap 3 the user share is 2, and the discount gives both to children.
+        b2 = Board(self)
+        b2.card("coord-1", U, status="running")
+        b2.card("coord-2", U, status="running")
+        for n in range(3):
+            b2.child_of("coord-1" if n < 2 else "coord-2", f"kid{n}", U)
+        spawned, _ = b2.tick(cap=3)
+        self.assertEqual(spawned, ["kid0", "kid1"])
+
     def test_an_unassigned_background_row_is_reported_unassigned_not_reserved(self):
         b = Board(self)
         b.card("running", status="running")

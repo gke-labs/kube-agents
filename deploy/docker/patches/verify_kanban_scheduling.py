@@ -1186,28 +1186,32 @@ check(
 )
 
 # E5. Two waiters, cap 2: the whole board used to stop. Both are discounted, so
-# the two slots go to children rather than to the cards waiting for them. The
-# cards are user-class (section G): at priority 0 they would be background,
-# and background cards may hold only one of the two slots, which is G's
-# subject rather than this one's.
+# the two slots go to children rather than to the cards waiting for them.
+#
+# One waiter of each class (section G). At cap 2 each class is guaranteed
+# exactly one slot and may hold no more, so two user-class waiters with
+# user-class children could only ever get one child running, discount or not:
+# that is the per-class floor working, not the discount failing. One user
+# fan-out and one triage fan-out is the shape that can fill both slots, and
+# only if both waiters are discounted; without the discount nothing spawns.
 conn = waiting_board()
 first = new_card(conn, "Fan-out one", priority=KP.USER_PRIORITY)
-second = new_card(conn, "Fan-out two", priority=KP.USER_PRIORITY)
+second = new_card(conn, "Triage fan-out")
 K.recompute_ready(conn)
 K.claim_task(conn, first)
 K.claim_task(conn, second)
-helpers = [
-    fan_out(
-        conn, first if n < 3 else second, f"helper {n}",
-        priority=KP.USER_PRIORITY,
-    )
-    for n in range(5)
+user_helpers = [
+    fan_out(conn, first, f"helper {n}", priority=KP.USER_PRIORITY) for n in range(3)
 ]
+triage_helpers = [fan_out(conn, second, f"triage helper {n}") for n in range(2)]
+helpers = user_helpers + triage_helpers
 K.recompute_ready(conn)
 asked = spawns(conn, cap=2)
 check(
     "E5. two waiting coordinators release both slots",
-    len(asked) == 2 and set(asked) <= set(helpers),
+    len(asked) == 2
+    and len(set(asked) & set(user_helpers)) == 1
+    and len(set(asked) & set(triage_helpers)) == 1,
     f"spawned {asked}",
 )
 
