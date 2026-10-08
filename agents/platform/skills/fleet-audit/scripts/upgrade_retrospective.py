@@ -241,8 +241,9 @@ NOT_FULL_TEXT = "no --full: a scoped run"
 LISTING_FAILED_TEXT = "{cluster}: its project's listing failed ({error}); ledger entry and guards kept unchanged"
 # A crash record beside no ledger blocks every run until it is archived.
 CRASH_RECORD_GLOB = LEDGER_FILENAME + ".unreadable-*"
+GUARDS_RECORD_GLOB = GUARDS_FILENAME + ".unreadable-*"
 ARCHIVE_SUBDIR = "archive"
-CRASH_RECORD_TEXT = "{path} sits beside no ledger: a crash record, not a re-baseline. Restore it as the ledger or run --reset-ledger to archive it; until then nothing starts from empty. Nothing written."
+CRASH_RECORD_TEXT = "{path} sits beside no live state file: a crash record, not a re-baseline. Restore it as the ledger or run --reset-ledger to archive it; until then nothing starts from empty. Nothing written."
 RESET_LEDGER_TEXT = "archived {count} crash record(s) under {archive}; the next run starts fresh."
 RESET_LEDGER_NOTHING_TEXT = "no crash record to archive."
 # The full-run refresh of every fleet cluster's symptom set: pods for the
@@ -265,6 +266,9 @@ EVENT_REASONS = (REASON_FAILED_SCHEDULING, "FailedMount", "FailedAttachVolume", 
 EVENT_MESSAGE_MARKERS = ("failed calling webhook", "no matches for kind")
 # Event reasons a pod's own status already carries when the pod is listed.
 EVENT_REASONS_IMPLIED_BY_POD = (REASON_FAILED_SCHEDULING, "BackOff")
+# The node-problem-detector's kernel OOM event; charged to the OOMKilled pod
+# on that node when there is one.
+OOM_NODE_EVENT_REASON = "OOMKilling"
 NODE_BAD_CONDITIONS = (("Ready", "False"), ("Ready", "Unknown"), ("NetworkUnavailable", "True"))
 JOB_OWNER_KINDS = ("Job", "CronJob")
 # Entry 6's best-effort markers for a Job pod that calls a removed API.
@@ -467,6 +471,7 @@ OWNER_INTERMEDIATE_KINDS = ("ReplicaSet", "Job")
 OWNER_MAX_HOPS = 3
 # How a pod-backed symptom's evidence names the pods behind it.
 POD_EVIDENCE_FORMAT = "{count} of {total} pods: {evidence}; e.g. {example}"
+PRE_EXISTING_PODS_FORMAT = "; {count} pre-existing since {earliest} (e.g. {example})"
 # Image references without a host are Docker Hub's.
 DEFAULT_IMAGE_HOST = "docker.io"
 OOM_REASON = "OOMKilled"
@@ -1086,6 +1091,17 @@ def _api_marker_hits(pod: dict) -> list[str]:
     return [marker for marker in DEPRECATED_API_MARKERS if marker in text]
 
 
+def _api_marker_sources(pod: dict) -> dict[str, list[str]]:
+    """The same markers split by where they matched: the pod's or its
+    owners' names, or the spec (images, command, args, env values)."""
+    names = " ".join([pod["metadata"].get("name", "")] + [o.get("name", "") for o in pod["metadata"].get("ownerReferences") or []])
+    spec_text = " ".join(part for part in _pod_text(pod).split(" ") if part not in names.split(" "))
+    return {
+        "name": [m for m in DEPRECATED_API_MARKERS if m in names],
+        "spec": [m for m in DEPRECATED_API_MARKERS if m in spec_text],
+    }
+
+
 def _pod_text(pod: dict) -> str:
     """The text entry 6's best-effort markers are searched in: names, images,
     command, args and env values of every container."""
@@ -1175,6 +1191,7 @@ def _pod_detail(pod: dict) -> dict:
         "labels": meta.get("labels") or {},
         "node_selector": spec.get("nodeSelector") or {},
         "api_markers": _api_marker_hits(pod),
+        "api_marker_sources": _api_marker_sources(pod),
         "started": status.get("startTime") or meta.get("creationTimestamp"),
     }
 
@@ -1248,6 +1265,7 @@ def pod_symptoms(pods: list[dict], resolver: Resolver, window_start: datetime | 
             "pod_total": resolver.pod_total(obj),
             "example_pod": pod_name,
             "onset": fmt_ts(onset) if onset else None,
+            "pod_onsets": {pod_name: fmt_ts(onset) if onset else None},
             **_pod_detail(pod),
         }
         scheduled = _condition(pod, "PodScheduled")
@@ -1284,8 +1302,10 @@ def _merge_pod_row(rows: dict[tuple, dict], row: dict) -> None:
     existing["pods"].sort()
     existing["pod_count"] = len(existing["pods"])
     existing["example_pod"] = existing["pods"][0]
-    # The row's onset is the earliest of its pods'.
-    onsets = [o for o in (existing.get("onset"), row.get("onset")) if o]
+    # The row keeps every pod's onset; its own is the earliest, the grading
+    # in `mark_since` looks at each pod.
+    existing["pod_onsets"].update(row.get("pod_onsets") or {})
+    onsets = [o for o in existing["pod_onsets"].values() if o]
     existing["onset"] = min(onsets) if onsets else None
 
 
@@ -1507,11 +1527,16 @@ def _image_host_detail(symptom: dict) -> str:
 
 def _gate_open(symptom: dict, entry: int, ctx: Context) -> bool:
     """Whether an operation in the window reached the object: its pool for a
-    node-side mechanism, the control plane for 6 and 7. A pod without a node
-    (Pending) counts any upgraded pool."""
+    node-side mechanism, an UPGRADE_MASTER for 6 and 7. A Pending pod is
+    placed by its nodeSelector's pool label when it names one, else any
+    upgraded pool counts."""
     if entry in CONTROL_PLANE_ENTRIES:
-        return ctx.master_upgraded or bool(ctx.upgraded_pools)
+        return ctx.master_upgraded
     pool = symptom.get("pool") or ctx.node_pool.get(symptom.get("node") or "", "")
+    if not pool:
+        # A Pending pod names its pool through a nodeSelector on the pool
+        # label; only a pod with no pool preference counts any upgraded pool.
+        pool = (symptom.get("node_selector") or {}).get(NODEPOOL_LABEL, "")
     return pool in ctx.upgraded_pools if pool else bool(ctx.upgraded_pools)
 
 
@@ -1612,7 +1637,9 @@ def classify_symptom(symptom: dict, ctx: Context) -> list[dict]:
     if symptom["category"] == CATEGORY_NOT_READY and symptom.get("owner_kind") in JOB_OWNER_KINDS:
         hits = symptom.get("api_markers") or []
         if hits and any(c["reason"] == REASON_ERROR for c in containers):
-            add(ENTRY_REMOVED_API, MEDIUM, f"{symptom['owner_kind']} pod in Error; spec mentions {', '.join(hits)}", "best effort: a name, not an API call")
+            sources = symptom.get("api_marker_sources") or {}
+            where = " and ".join(place for place in ("name", "spec") if sources.get(place)) or "name"
+            add(ENTRY_REMOVED_API, MEDIUM, f"{symptom['owner_kind']} pod in Error; {where} mentions {', '.join(hits)}", "best effort: a name, not an API call")
 
     if not found:
         found.append(_classification(None, MEDIUM, f"{symptom.get('reason') or ''} {symptom.get('message') or ''}".strip()))
@@ -1634,6 +1661,26 @@ def mark_since(symptoms: list[dict], baseline: list[str] | None, first_operation
     previous = set(baseline or [])
     for symptom in symptoms:
         recorded = baseline is not None and symptom_key(symptom) in previous
+        pod_onsets = {pod: parse_ts(ts) for pod, ts in (symptom.get("pod_onsets") or {}).items()}
+        if pod_onsets and first_operation:
+            # Graded per pod: a row with any pod whose onset is inside the
+            # window is new (the displaced replicas), whatever the stored
+            # set says of the row; the older pods are noted as pre-existing.
+            new_pods = sorted(pod for pod, onset in pod_onsets.items() if onset and onset >= first_operation)
+            old_pods = sorted(pod for pod, onset in pod_onsets.items() if onset and onset < first_operation)
+            symptom["new_pods"], symptom["pre_existing_pods"] = new_pods, old_pods
+            if new_pods:
+                symptom["since"] = SINCE_FIRST_SEEN if baseline is None else SINCE_NEW
+                symptom["predates_upgrade"] = False
+            else:
+                symptom["since"] = SINCE_FIRST_SEEN if baseline is None else (SINCE_BEFORE if recorded else SINCE_NEW)
+                symptom["predates_upgrade"] = recorded or bool(old_pods)
+            if old_pods:
+                earliest = min(pod_onsets[pod] for pod in old_pods)
+                note = PRE_EXISTING_PODS_FORMAT.format(count=len(old_pods), earliest=fmt_ts(earliest), example=old_pods[0])
+                for c in symptom["classifications"]:
+                    c["evidence"] = (c["evidence"] + note)[:MESSAGE_EXCERPT_CHARS]
+            continue
         symptom["since"] = SINCE_FIRST_SEEN if baseline is None else (SINCE_BEFORE if recorded else SINCE_NEW)
         onset = parse_ts(symptom.get("onset"))
         before_operation = bool(first_operation and onset and onset < first_operation)
@@ -1663,7 +1710,12 @@ def collect_symptoms(cluster: dict, reads: dict[str, list], operations: list[dic
     pod_objects = {s["object"] for s in pods}
     # A FailedScheduling or BackOff event on a workload the pod list already
     # reports as Pending or crash-looping says the same thing twice.
-    events = [e for e in event_symptoms(reads.get("events") or [], window_start, resolver) if not (e["reason"] in EVENT_REASONS_IMPLIED_BY_POD and e["object"] in pod_objects)]
+    oom_nodes = {s.get("node") for s in pods if any(c["reason"] == OOM_REASON for c in s.get("containers") or [])}
+    events = [
+        e for e in event_symptoms(reads.get("events") or [], window_start, resolver)
+        if not (e["reason"] in EVENT_REASONS_IMPLIED_BY_POD and e["object"] in pod_objects)
+        and not (e["reason"] == OOM_NODE_EVENT_REASON and e["kind"] == "Node" and e["name"] in oom_nodes)
+    ]
     symptoms = pods + node_symptoms(nodes) + events + pdb_symptoms(reads.get("pdbs") or [], reads.get("pods") or [], nodes, upgraded)
     for symptom in symptoms:
         symptom["classifications"] = classify_symptom(symptom, ctx)
@@ -2745,10 +2797,13 @@ def collect(args: argparse.Namespace, *, run: RunFn | None = None, now: datetime
     since = parse_since(args.since, now)
     ledger_path = Path(args.ledger) if args.ledger else data_dir() / LEDGER_FILENAME
     guards_path = Path(args.guards) if args.guards else data_dir() / GUARDS_FILENAME
-    if not ledger_path.exists():
-        crash_records = sorted(ledger_path.parent.glob(CRASH_RECORD_GLOB))
-        if crash_records:
-            raise StateUnreadable(CRASH_RECORD_TEXT.format(path=crash_records[-1]))
+    for state_path, pattern in ((ledger_path, CRASH_RECORD_GLOB), (guards_path, GUARDS_RECORD_GLOB)):
+        if not state_path.exists():
+            crash_records = sorted(state_path.parent.glob(pattern))
+            if crash_records:
+                # A set-aside guards file blocks like a ledger's: restarting
+                # with no guards while the ledger says "unchanged" loses them.
+                raise StateUnreadable(CRASH_RECORD_TEXT.format(path=crash_records[-1]))
     ledger = load_json(ledger_path, empty_ledger(), version=LEDGER_VERSION, now=now, move_aside=not args.dry_run)
     guards = load_json(guards_path, empty_guards(), version=GUARDS_VERSION, now=now, move_aside=not args.dry_run)
     forced = {c.strip() for c in args.cluster or [] if c.strip()}
@@ -3006,7 +3061,7 @@ def lock_held_line(path: Path) -> str:
 def reset_ledger(store: Path, now: datetime) -> str:
     """Archive the crash records beside a missing ledger. The archive keeps
     them readable; only the operator's choice to run this clears the block."""
-    records = sorted(store.glob(CRASH_RECORD_GLOB)) + sorted(store.glob(GUARDS_FILENAME + ".unreadable-*"))
+    records = sorted(store.glob(CRASH_RECORD_GLOB)) + sorted(store.glob(GUARDS_RECORD_GLOB))
     if not records:
         return RESET_LEDGER_NOTHING_TEXT
     archive = store / ARCHIVE_SUBDIR / now.strftime(REPORT_TS_FORMAT)
