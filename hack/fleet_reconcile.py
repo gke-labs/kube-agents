@@ -1187,13 +1187,20 @@ def _run_workers(worker, count):
             for flag in done:
                 flag.wait(WORKER_JOIN_STEP_SECONDS)
     except boskos_pool.Terminated:
-        _begin_termination()
-        deadline = clock() + WORKER_DRAIN_SECONDS
-        for flag in started_flags:
-            flag.wait(max(0, deadline - clock()))
-        _children_signal(kill=True)
-        for flag in started_flags:
-            flag.wait(WORKER_JOIN_STEP_SECONDS)
+        boskos_pool._hold_signals(True)
+        try:
+            _begin_termination()
+            deadline = clock() + WORKER_DRAIN_SECONDS
+            for flag in started_flags:
+                flag.wait(max(0, deadline - clock()))
+            _children_signal(kill=True)
+            for flag in started_flags:
+                flag.wait(WORKER_JOIN_STEP_SECONDS)
+        finally:
+            try:
+                boskos_pool._hold_signals(False)
+            except boskos_pool.Terminated:
+                pass
         raise
     if failures:
         raise failures[0]
