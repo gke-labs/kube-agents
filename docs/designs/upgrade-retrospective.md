@@ -53,6 +53,18 @@ This feature is a scheduled review called the **upgrade retrospective**. It must
    is still present with nothing new. **Info** lists each cluster that was upgraded or found with
    nothing wrong, the clusters nothing happened to, and anything the review could not read.
 
+   A clean cluster is not an empty entry. For a reviewed cluster with no failure, part (C) is a
+   pre-flight for its next upgrade: the version its channel will move it to and when, and the known
+   failure shapes present on the cluster today although nothing has failed yet (a protection rule
+   with no allowance, a placement rule on a label the next version drops, an image from a retired
+   download site, a disk attached the old way, an agent tied to the machine's network or runtime,
+   data kept on the machine, a single copy behind a protection rule, a GPU program pinned to a
+   driver version, a gatekeeper with nobody behind it), each with its fix. Part (D) records the
+   baseline for the next review to compare against and marks each shape as a risk the readiness
+   check names before the next upgrade. The lines for unchanged clusters say when each was last
+   upgraded and what it will move to next; the lines for clusters the review could not read say
+   why. "None" appears only when the count is really zero.
+
 4. **Keep the report where the install keeps its records,** on the assistant's own storage, with
    the latest one always at the same path, and post one line per reviewed cluster in chat with the
    counts and the most important finding. A quiet weekend posts nothing.
@@ -185,8 +197,9 @@ cluster's symptoms are unclassified.
 (D) is what separates a retrospective from a post-mortem nobody reads. Two mechanisms, both
 automatic and both reversible:
 
-- **Guards.** `guards.json` beside the ledger holds one entry per classified failure: cluster,
-  entry, object (`namespace/kind/name`), evidence, first and last seen. The collector merges it on
+- **Guards.** `guards.json` beside the ledger holds one entry per classified failure and one per
+  risk shape found on a clean cluster, each marked `failure` or `risk`: cluster, entry, object
+  (`namespace/kind/name`), evidence, first and last seen. The collector merges it on
   every run (new, seen again, gone when the cluster is reviewed and the symptom is absent). The
   daily readiness watch, once it ships, reads the file and adds a line per live guard to its next
   report for that cluster, so the operator planning the next upgrade sees "the last upgrade held
@@ -251,10 +264,27 @@ What failed: Unhealthy probe events, 31 in the window, matching none of the twen
 
 ## Info
 
-- seeded-c: UPGRADE_MASTER 2026-10-06 03:27 (8m), UPGRADE_NODES default-pool 2026-10-07 03:26 (5m);
-  no failure found.
-- seeded-a: new (first seen), 1.35.8-gke.1380001; no failure found.
-- Unchanged: gemma-gpu (no operation since 2026-09-24).
+### seeded-c
+What happened: UPGRADE_MASTER 2026-10-06 03:27 (8m), UPGRADE_NODES default-pool 2026-10-07 03:26
+  (5m); no failure found.
+Next upgrade: at the channel default, 1.35.8-gke.1225000 (cluster is ahead; nothing pending);
+  window daily 03:00Z for 4h, next opens 2026-10-12 03:00Z; no exclusion.
+Risks present: none of the catalogue shapes checked (budgets, selectors, image hosts, in-tree
+  volumes, node agents, local state, GPU pins, webhooks).
+Baseline recorded: control plane and 1 pool at 1.35.8-gke.1380001, 14 pods, 2 budgets, 0 shapes;
+  no guard written.
+
+### seeded-a
+What happened: new (first seen), 1.35.8-gke.1380001.
+Next upgrade: at the channel default; window daily 03:00Z for 4h; no exclusion.
+Risks present:
+| object                                              | shape                                  | entry | confidence |
+| seeded-shapes/Deployment/legacy-registry-pull       | image host k8s.gcr.io                  | 20    | high       |
+| seeded-shapes/PersistentVolume/intree-pd            | gcePersistentDisk in-tree, CSI add-on off | 19 | high       |
+Baseline recorded: 3 pools, 41 pods, 4 budgets, 2 shapes; 2 risk guards written.
+
+- Unchanged: gemma-gpu, last upgraded 2026-09-24 (UPGRADE_NODES gpu-pool), next target
+  1.36.4-gke.1247000.
 - Reads that failed: none.
 ```
 
