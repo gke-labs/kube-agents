@@ -162,14 +162,12 @@ The two differ on steers: a session worker absorbs them at its next turn boundar
 while the standing front door queues them and answers each as a further turn after the
 current one, with a status notice per follow-up (the payload spec's steering rule).
 
-The status matcher's width bias inverts per executor, and the inversion is the
-contract, not a tuning detail. Beyond the exact phrase set there is a wide
-interrogative rule (status-shaped words in an interrogative frame), and it applies only
-where the executor refuses steers - the fixed-route front door - because there a stolen
-false positive costs nothing. Where the executor absorbs steers, a session worker, only
-the exact phrases match: a stolen steer there is a dropped correction, and a
-status-shaped steer is a question the worker can answer itself. Anything no interceptor
-claims during a `working` task is a steer, per the 8/24 decision above.
+The status matcher is the exact phrase set on every route (narrowed 10/8, G22). A wider
+interrogative rule applied while the fixed-route front door refused steers, where a
+stolen false positive cost nothing; the front door now queues steers and answers them,
+so a stolen one is a lost correction there too, and a status-shaped steer is a question
+the agent can answer itself. Anything no interceptor claims during a `working` task is
+a steer, per the 8/24 decision above.
 
 **Gateway-authored posts (amended 8/31).** Step 4's relay - events in, chat out - is
 not the whole output story: the gateway authors a small set of posts of its own. The
@@ -181,8 +179,8 @@ are deterministic templates over facts the
 gateway itself owns - its own publishes, its own registry, stream replay - which is
 what keeps them inside the no-model rule. They also say only what the gateway knows:
 the steer acknowledgement reports that the steer is on the stream, and what it says
-next is conditioned on the route the same way the width bias above is, because the
-gateway knows the route and the two executors do different things: on a
+next is conditioned on the route, because the gateway knows the route and the two
+executors do different things: on a
 session-routed conversation, that the worker picks it up at its next turn boundary
 if the task is still running; on a fixed-routed one, "got it, I'll take that next".
 The executor's notice on the stream corrects it when the follow-up was not taken

@@ -721,10 +721,9 @@ func TestNormalizePhrases(t *testing.T) {
 		"status update pls": false,
 		"do the thing":      false,
 	} {
-		// Narrow mode: these phrases exercise normalization through the
-		// exact set and classify the same way in both modes.
-		if got := isStatusQuery(phrase, false); got != want {
-			t.Errorf("isStatusQuery(%q, false) = %v, want %v", phrase, got, want)
+		// These phrases exercise normalization through the exact set.
+		if got := isStatusQuery(phrase); got != want {
+			t.Errorf("isStatusQuery(%q) = %v, want %v", phrase, got, want)
 		}
 	}
 	if !isStop("Stop!") || !isStop("cancel") || isStop("stop the deploy") {
@@ -1320,10 +1319,11 @@ func TestDelegateWithoutSpawnerRoutesDefault(t *testing.T) {
 	}
 }
 
-// TestDelegatedTaskStatusShapeSteers: the width bias inverts for executors
-// that absorb steers. During a delegated task a wide interrogative shape
-// must reach the worker as a steer - only the exact phrases stay status
-// affordances, or a correction is stolen and answered by replay.
+// TestDelegatedTaskStatusShapeSteers: the status matcher is the exact
+// phrase set everywhere. During a delegated task a status-shaped but
+// non-exact ask must reach the worker as a steer - only the exact phrases
+// stay status affordances, or a correction is stolen and answered by
+// replay.
 func TestDelegatedTaskStatusShapeSteers(t *testing.T) {
 	r, spawn := startRigWithSpawner(t)
 	conv := "discord:g1/thread-d3"

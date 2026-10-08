@@ -739,14 +739,6 @@ func (g *Gateway) routeTurn(ctx context.Context, msg InboundMessage, backend, pr
 	g.healActiveTask(ctx, rec)
 
 	active := rec.ActiveTask
-	// The status matcher's wide interrogative rule is only safe where a
-	// stolen steer costs nothing: a fixed-route executor (Hermes) refuses
-	// steers, a session worker absorbs them - so a session-addressed task
-	// gets the exact phrases only (see isStatusQuery). A detached task
-	// gets the exact phrases on either route: after a stop, the wide
-	// reading of "any update on the rollout" would steal a NEW task to
-	// replay a dead one, so the cost argument inverts there too.
-	wideStatus := !rec.AddressedToOwnSession() && !(active != nil && active.Detached)
 	// A slash command resolves before everything else (architecture 02,
 	// "Chat entrypoints"): it is not a status ask, not a stop, and never a
 	// steer. Text only - a programmatic cancel keeps its intent whatever
@@ -790,7 +782,7 @@ func (g *Gateway) routeTurn(ctx context.Context, msg InboundMessage, backend, pr
 		if !g.sessionCommand(ctx, rec, msg, backend, sessionRest, principal, authority) {
 			return
 		}
-	case msg.Intent == "" && active != nil && isStatusQuery(msg.Text, wideStatus):
+	case msg.Intent == "" && active != nil && isStatusQuery(msg.Text):
 		g.answerStatusByReplay(ctx, rec)
 	case stopping && msg.TaskID != "" && (active == nil || active.TaskID != msg.TaskID):
 		// A cancel that names a task the conversation no longer holds as

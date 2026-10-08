@@ -57,31 +57,13 @@ var statusQueries = map[string]bool{
 
 // isStatusQuery reports whether a mid-task message asks what the task is
 // doing rather than telling it something. Deterministic by design - the
-// gateway holds no model - so this is a phrase set plus a narrow
-// interrogative rule, not understanding. The interrogative rule is the wide
-// half and it misfires ("any update to the config should be reverted" is a
-// steer), so it only applies when wide is true. The caller sets wide by
-// executor: a fixed-route executor (Hermes) refuses steers, so a stolen
-// false positive costs nothing; a session worker absorbs steers, so a
-// stolen one is a dropped correction and only the exact phrases match -
-// a status-shaped steer there is a question the worker can answer itself.
-// wideMatchLenCap bounds the wide interrogative match: past this length a
-// message is a composed instruction, not a status poke, however it starts.
-const wideMatchLenCap = 48
-
-func isStatusQuery(text string, wide bool) bool {
-	n := normalize(text)
-	if statusQueries[n] {
-		return true
-	}
-	if !wide || len(n) > wideMatchLenCap {
-		return false
-	}
-	statusish := strings.Contains(n, "doing") || strings.Contains(n, "happening") ||
-		strings.Contains(n, "going on") || strings.Contains(n, "update")
-	interrogative := strings.HasPrefix(n, "what") || strings.HasPrefix(n, "how") ||
-		strings.HasPrefix(n, "any") || strings.HasPrefix(n, "is ") || strings.HasPrefix(n, "are ")
-	return statusish && interrogative
+// gateway holds no model - so this is a phrase set and nothing wider. A
+// wider interrogative rule existed while the fixed-route executor refused
+// steers, where a stolen steer cost nothing; since G22 every executor acts
+// on a steer, and a status-shaped steer is a question the agent can answer
+// itself.
+func isStatusQuery(text string) bool {
+	return statusQueries[normalize(text)]
 }
 
 // isDelegate reports whether the turn asks for a delegated session worker -

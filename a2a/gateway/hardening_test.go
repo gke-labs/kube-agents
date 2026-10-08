@@ -2,7 +2,7 @@ package gateway
 
 // The tests here pin the fixes from the upstream cut's adversarial pass:
 // the spawn-failure supervisor terminal, the route-conditioned steer
-// acknowledgement, the stop guards, the detached-task width bias, the
+// acknowledgement, the stop guards, the detached-task status matcher, the
 // pre-delete replay guard, the healed-terminal card, and the session pod's
 // seccomp profile.
 
@@ -167,11 +167,10 @@ func TestStopWithNothingToStopStartsNoTask(t *testing.T) {
 	}
 }
 
-// TestDetachedTaskNarrowsTheStatusMatcher: the wide interrogative rule is
-// justified where the alternative reading is a refused steer. After a stop
-// the alternative is a NEW task, so a status-shaped new ask must start one
-// rather than replaying the dead task — while the exact phrases still
-// answer status.
+// TestDetachedTaskNarrowsTheStatusMatcher: the status matcher is the exact
+// phrase set everywhere (G22), so after a stop a status-shaped but
+// non-exact ask is a NEW task, not a replay of the dead one — while the
+// exact phrases still answer status.
 func TestDetachedTaskNarrowsTheStatusMatcher(t *testing.T) {
 	r := startRig(t)
 	conv := "discord:g1/thread-detachwide"
@@ -184,7 +183,7 @@ func TestDetachedTaskNarrowsTheStatusMatcher(t *testing.T) {
 		rec, err := r.g.reg.Get(context.Background(), conv)
 		return err == nil && rec != nil && rec.ActiveTask != nil && rec.ActiveTask.Detached
 	})
-	// Wide-shaped but not an exact phrase: a new ask, not a status poke.
+	// Status-shaped but not an exact phrase: a new ask, not a status poke.
 	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group",
 		AuthorID: "1001", MessageID: "dw-3", Text: "any update on the rollout"}
 	waitFor(t, "new task started", func() bool {
@@ -192,6 +191,24 @@ func TestDetachedTaskNarrowsTheStatusMatcher(t *testing.T) {
 		return err == nil && rec != nil && len(rec.Tasks) == 2 &&
 			rec.ActiveTask != nil && rec.ActiveTask.Ask == "any update on the rollout"
 	})
+}
+
+// G22: on the fixed route an interrogative that is not an exact phrase is a
+// steer, published to the running task, not answered by replay.
+func TestFixedRouteWideAskIsASteer(t *testing.T) {
+	r := startRig(t)
+	conv := "discord:g1/thread-wide"
+	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: "w-1", Text: "check the fleet"}
+	origin := r.awaitTask(t, "platform")
+	_ = r.execFor(t, origin, "platform").PublishStatus(context.Background(), lib.StateWorking, false)
+	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: "w-2", Text: "what is the agent doing"}
+	waitFor(t, "steer on the in subject", func() bool { return len(inSubjectEnvelopes(t, r.url, "platform")) == 2 })
+	waitFor(t, "ack", postedContaining(r, ackSteerQueued))
+	for _, p := range r.adapter.postTexts() {
+		if strings.Contains(p, "🔎 task") {
+			t.Fatalf("answered by replay: %q", p)
+		}
+	}
 }
 
 // TestPreDeleteGuardKeepsPodWhenReplayFails: a replay failure means an

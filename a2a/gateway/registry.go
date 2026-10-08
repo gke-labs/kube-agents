@@ -494,9 +494,10 @@ func (rec *SessionRecord) TaskCanceled(taskID string) bool {
 // rather than a fixed executor — true on the standing session route AND
 // during a one-shot Delegate from a fixed-route conversation, which is why
 // it is not the SessionRouted field: the two executors differ on steers
-// (refused by the fixed executor, absorbed by a session worker), so the
-// status matcher's width bias and the steer acknowledgement condition on
-// where the task actually runs, not on the standing route.
+// (the fixed executor queues and answers them as further turns, a session
+// worker absorbs them at its next turn boundary), so the steer
+// acknowledgement conditions on where the task actually runs, not on the
+// standing route.
 func (rec *SessionRecord) AddressedToOwnSession() bool {
 	return rec.BusSession != "" && rec.Addressee == rec.BusSession
 }
