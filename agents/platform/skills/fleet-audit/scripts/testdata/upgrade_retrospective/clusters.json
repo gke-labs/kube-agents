@@ -1,0 +1,85 @@
+[
+ {
+  "autopilot": {},
+  "currentMasterVersion": "1.32.13-gke.2427000",
+  "currentNodeVersion": "1.31.14-gke.2704000 *",
+  "location": "us-central1-a",
+  "name": "gemma-gpu-upgraded",
+  "nodePools": [
+   {
+    "config": {
+     "effectiveCgroupMode": "EFFECTIVE_CGROUP_MODE_V2",
+     "imageType": "COS_CONTAINERD",
+     "machineType": "e2-small"
+    },
+    "initialNodeCount": 1,
+    "name": "default-pool",
+    "status": "RUNNING",
+    "version": "1.31.14-gke.2704000"
+   },
+   {
+    "config": {
+     "effectiveCgroupMode": "EFFECTIVE_CGROUP_MODE_V2",
+     "imageType": "COS_CONTAINERD",
+     "machineType": "g2-standard-4"
+    },
+    "initialNodeCount": 1,
+    "name": "gpu-pool",
+    "status": "RUNNING",
+    "version": "1.32.13-gke.2427000"
+   }
+  ],
+  "releaseChannel": {
+   "channel": "EXTENDED"
+  },
+  "status": "RUNNING",
+  "zone": "us-central1-a"
+ },
+ {
+  "autopilot": {},
+  "currentMasterVersion": "1.35.8-gke.1380001",
+  "currentNodeVersion": "1.35.8-gke.1380001",
+  "location": "us-central1-a",
+  "name": "seeded-a",
+  "nodePools": [
+   {
+    "config": {
+     "effectiveCgroupMode": "EFFECTIVE_CGROUP_MODE_V2",
+     "imageType": "COS_CONTAINERD",
+     "machineType": "e2-medium"
+    },
+    "initialNodeCount": 2,
+    "name": "default-pool",
+    "status": "RUNNING",
+    "version": "1.35.8-gke.1380001"
+   },
+   {
+    "config": {
+     "effectiveCgroupMode": "EFFECTIVE_CGROUP_MODE_V2",
+     "imageType": "COS_CONTAINERD",
+     "machineType": "e2-small"
+    },
+    "initialNodeCount": 1,
+    "name": "idle-batch-pool",
+    "status": "RUNNING",
+    "version": "1.35.8-gke.1380001"
+   },
+   {
+    "config": {
+     "effectiveCgroupMode": "EFFECTIVE_CGROUP_MODE_V2",
+     "imageType": "COS_CONTAINERD",
+     "machineType": "e2-small"
+    },
+    "initialNodeCount": 1,
+    "name": "pinned-inference-pool",
+    "status": "RUNNING",
+    "version": "1.35.8-gke.1380001"
+   }
+  ],
+  "releaseChannel": {
+   "channel": "REGULAR"
+  },
+  "status": "RUNNING",
+  "zone": "us-central1-a"
+ }
+]

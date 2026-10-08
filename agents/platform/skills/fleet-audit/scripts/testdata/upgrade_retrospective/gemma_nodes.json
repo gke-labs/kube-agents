@@ -1,0 +1,543 @@
+{
+ "apiVersion": "v1",
+ "items": [
+  {
+   "apiVersion": "v1",
+   "kind": "Node",
+   "metadata": {
+    "annotations": {
+     "container.googleapis.com/instance_id": "2820965730266702266",
+     "csi.volume.kubernetes.io/nodeid": "{\"pd.csi.storage.gke.io\":\"projects/haoxuw-gke-dev/zones/us-central1-a/instances/gke-gemma-gpu-upgraded-default-pool-49d92e50-zcx6\",\"podcertificate.gke.io\":\"gke-gemma-gpu-upgraded-default-pool-49d92e50-zcx6\"}",
+     "node.alpha.kubernetes.io/ttl": "0",
+     "node.gke.io/last-applied-node-labels": "cloud.google.com/gke-boot-disk=pd-balanced,cloud.google.com/gke-container-runtime=containerd,cloud.google.com/gke-cpu-scaling-level=2,cloud.google.com/gke-logging-variant=DEFAULT,cloud.google.com/gke-max-pods-per-node=110,cloud.google.com/gke-memory-gb-scaling-level=2,cloud.google.com/gke-netd-ready=true,cloud.google.com/gke-nodepool=default-pool,cloud.google.com/gke-os-distribution=cos,cloud.google.com/gke-provisioning=standard,cloud.google.com/gke-stack-type=IPV4,cloud.google.com/machine-family=e2,cloud.google.com/private-node=false,iam.gke.io/gke-metadata-server-enabled=true",
+     "node.gke.io/last-applied-node-taints": "",
+     "volumes.kubernetes.io/controller-managed-attach-detach": "true"
+    },
+    "creationTimestamp": "2026-09-24T17:39:24Z",
+    "labels": {
+     "beta.kubernetes.io/arch": "amd64",
+     "beta.kubernetes.io/instance-type": "e2-small",
+     "beta.kubernetes.io/os": "linux",
+     "cloud.google.com/gke-boot-disk": "pd-balanced",
+     "cloud.google.com/gke-container-runtime": "containerd",
+     "cloud.google.com/gke-cpu-scaling-level": "2",
+     "cloud.google.com/gke-logging-variant": "DEFAULT",
+     "cloud.google.com/gke-max-pods-per-node": "110",
+     "cloud.google.com/gke-memory-gb-scaling-level": "2",
+     "cloud.google.com/gke-netd-ready": "true",
+     "cloud.google.com/gke-nodepool": "default-pool",
+     "cloud.google.com/gke-os-distribution": "cos",
+     "cloud.google.com/gke-provisioning": "standard",
+     "cloud.google.com/gke-stack-type": "IPV4",
+     "cloud.google.com/machine-family": "e2",
+     "cloud.google.com/private-node": "false",
+     "failure-domain.beta.kubernetes.io/region": "us-central1",
+     "failure-domain.beta.kubernetes.io/zone": "us-central1-a",
+     "iam.gke.io/gke-metadata-server-enabled": "true",
+     "kubernetes.io/arch": "amd64",
+     "kubernetes.io/hostname": "gke-gemma-gpu-upgraded-default-pool-49d92e50-zcx6",
+     "kubernetes.io/os": "linux",
+     "node.kubernetes.io/instance-type": "e2-small",
+     "topology.gke.io/zone": "us-central1-a",
+     "topology.kubernetes.io/region": "us-central1",
+     "topology.kubernetes.io/zone": "us-central1-a"
+    },
+    "name": "gke-gemma-gpu-upgraded-default-pool-49d92e50-zcx6",
+    "resourceVersion": "1791480362115039017",
+    "uid": "8fc8f2cc-7fdc-4e24-b545-15049a66a476"
+   },
+   "spec": {
+    "podCIDR": "10.72.0.0/24",
+    "providerID": "gce://haoxuw-gke-dev/us-central1-a/gke-gemma-gpu-upgraded-default-pool-49d92e50-zcx6"
+   },
+   "status": {
+    "allocatable": {
+     "cpu": "940m",
+     "ephemeral-storage": "9226554939",
+     "hugepages-1Gi": "0",
+     "hugepages-2Mi": "0",
+     "memory": "1393776Ki",
+     "pods": "110"
+    },
+    "capacity": {
+     "cpu": "2",
+     "ephemeral-storage": "28652804Ki",
+     "hugepages-1Gi": "0",
+     "hugepages-2Mi": "0",
+     "memory": "2020464Ki",
+     "pods": "110"
+    },
+    "conditions": [
+     {
+      "lastHeartbeatTime": "2026-10-08T17:26:02Z",
+      "lastTransitionTime": "2026-09-24T17:36:30Z",
+      "message": "Swap is not active",
+      "reason": "SwapNotDetected",
+      "status": "False",
+      "type": "Swap"
+     },
+     {
+      "lastHeartbeatTime": "2026-10-08T17:26:02Z",
+      "lastTransitionTime": "2026-09-24T17:36:30Z",
+      "message": "UEFI CPER has no fatal error",
+      "reason": "CperHardwareHasNoFatalError",
+      "status": "False",
+      "type": "CperHardwareErrorFatal"
+     },
+     {
+      "lastHeartbeatTime": "2026-10-08T17:26:02Z",
+      "lastTransitionTime": "2026-09-24T17:36:30Z",
+      "message": "Default sysctls are in effect, no unexpected sysctl changes",
+      "reason": "SysctlNotChanged",
+      "status": "False",
+      "type": "SysctlChanged"
+     },
+     {
+      "lastHeartbeatTime": "2026-10-08T17:26:02Z",
+      "lastTransitionTime": "2026-09-24T17:36:30Z",
+      "message": "containerd is functioning properly",
+      "reason": "NoFrequentContainerdRestart",
+      "status": "False",
+      "type": "FrequentContainerdRestart"
+     },
+     {
+      "lastHeartbeatTime": "2026-10-08T17:26:02Z",
+      "lastTransitionTime": "2026-09-24T17:36:30Z",
+      "message": "kernel has no deadlock",
+      "reason": "KernelHasNoDeadlock",
+      "status": "False",
+      "type": "KernelDeadlock"
+     },
+     {
+      "lastHeartbeatTime": "2026-10-08T17:26:02Z",
+      "lastTransitionTime": "2026-09-24T17:36:30Z",
+      "message": "No deprecation risk: did not find any deprecated 'auths' field in containerd's config",
+      "reason": "DeprecatedAuthsFieldInContainerdConfigurationNotDetected",
+      "status": "False",
+      "type": "DeprecatedAuthsFieldInContainerdConfiguration"
+     },
+     {
+      "lastHeartbeatTime": "2026-10-08T17:26:02Z",
+      "lastTransitionTime": "2026-09-24T17:36:30Z",
+      "message": "node is functioning properly",
+      "reason": "NoFrequentUnregisterNetDevice",
+      "status": "False",
+      "type": "FrequentUnregisterNetDevice"
+     },
+     {
+      "lastHeartbeatTime": "2026-10-08T17:26:02Z",
+      "lastTransitionTime": "2026-09-24T17:36:30Z",
+      "message": "kubelet is functioning properly",
+      "reason": "NoFrequentKubeletRestart",
+      "status": "False",
+      "type": "FrequentKubeletRestart"
+     },
+     {
+      "lastHeartbeatTime": "2026-10-08T17:26:02Z",
+      "lastTransitionTime": "2026-09-24T17:36:30Z",
+      "message": "No deprecation risk: did not pull any schema v1 images",
+      "reason": "DeprecatedPullingSchemaV1ImageDetected",
+      "status": "False",
+      "type": "DeprecatedPullingSchemaV1Image"
+     },
+     {
+      "lastHeartbeatTime": "2026-10-08T17:26:02Z",
+      "lastTransitionTime": "2026-09-24T17:36:30Z",
+      "message": "docker is functioning properly",
+      "reason": "NoFrequentDockerRestart",
+      "status": "False",
+      "type": "FrequentDockerRestart"
+     },
+     {
+      "lastHeartbeatTime": "2026-10-08T17:26:02Z",
+      "lastTransitionTime": "2026-09-24T17:36:30Z",
+      "message": "No deprecation risk: did not find any deprecated 'mirrors' field in containerd's config",
+      "reason": "DeprecatedMirrorsFieldInContainerdConfigurationNotDetected",
+      "status": "False",
+      "type": "DeprecatedMirrorsFieldInContainerdConfiguration"
+     },
+     {
+      "lastHeartbeatTime": "2026-10-08T17:26:02Z",
+      "lastTransitionTime": "2026-09-24T17:36:30Z",
+      "message": "No deprecation risk: did not find any deprecated 'configs' field in containerd's config",
+      "reason": "DeprecatedConfigsFieldInContainerdConfigurationNotDetected",
+      "status": "False",
+      "type": "DeprecatedConfigsFieldInContainerdConfiguration"
+     },
+     {
+      "lastHeartbeatTime": "2026-10-08T17:26:02Z",
+      "lastTransitionTime": "2026-09-24T17:36:30Z",
+      "message": "No deprecation risk: did not find any deprecations other than 3 configs fields (auths/configs/mirrors), pulling schema v1 images and using v1alpha2 CRI.",
+      "reason": "DeprecatedOtherContainerdFeaturesNotDetected",
+      "status": "False",
+      "type": "DeprecatedOtherContainerdFeatures"
+     },
+     {
+      "lastHeartbeatTime": "2026-10-08T17:26:02Z",
+      "lastTransitionTime": "2026-09-24T17:36:30Z",
+      "message": "XFS has not shutdown",
+      "reason": "XfsHasNotShutDown",
+      "status": "False",
+      "type": "XfsShutdown"
+     },
+     {
+      "lastHeartbeatTime": "2026-10-08T17:26:02Z",
+      "lastTransitionTime": "2026-09-24T17:36:30Z",
+      "message": "No deprecation risk: did not use v1alpha2 CRI",
+      "reason": "DeprecatedUsingV1Alpha2CriNotDetected",
+      "status": "False",
+      "type": "DeprecatedUsingV1Alpha2Cri"
+     },
+     {
+      "lastHeartbeatTime": "2026-10-08T17:26:02Z",
+      "lastTransitionTime": "2026-09-24T17:36:30Z",
+      "message": "docker overlay2 is functioning properly",
+      "reason": "NoCorruptDockerOverlay2",
+      "status": "False",
+      "type": "CorruptDockerOverlay2"
+     },
+     {
+      "lastHeartbeatTime": "2026-09-24T17:39:25Z",
+      "lastTransitionTime": "2026-09-24T17:39:24Z",
+      "message": "NodeController create implicit route",
+      "reason": "RouteCreated",
+      "status": "False",
+      "type": "NetworkUnavailable"
+     },
+     {
+      "lastHeartbeatTime": "2026-10-08T17:22:26Z",
+      "lastTransitionTime": "2026-09-24T17:37:20Z",
+      "message": "kubelet has sufficient memory available",
+      "reason": "KubeletHasSufficientMemory",
+      "status": "False",
+      "type": "MemoryPressure"
+     },
+     {
+      "lastHeartbeatTime": "2026-10-08T17:22:26Z",
+      "lastTransitionTime": "2026-09-24T17:37:20Z",
+      "message": "kubelet has no disk pressure",
+      "reason": "KubeletHasNoDiskPressure",
+      "status": "False",
+      "type": "DiskPressure"
+     },
+     {
+      "lastHeartbeatTime": "2026-10-08T17:22:26Z",
+      "lastTransitionTime": "2026-09-24T17:37:20Z",
+      "message": "kubelet has sufficient PID available",
+      "reason": "KubeletHasSufficientPID",
+      "status": "False",
+      "type": "PIDPressure"
+     },
+     {
+      "lastHeartbeatTime": "2026-10-08T17:22:26Z",
+      "lastTransitionTime": "2026-09-24T17:39:34Z",
+      "message": "kubelet is posting ready status",
+      "reason": "KubeletReady",
+      "status": "True",
+      "type": "Ready"
+     }
+    ],
+    "nodeInfo": {
+     "architecture": "amd64",
+     "bootID": "918286c8-8a04-4c26-9a42-ff065df7ea7d",
+     "containerRuntimeVersion": "containerd://1.7.34",
+     "kernelVersion": "6.6.153+",
+     "kubeProxyVersion": "v1.31.14-gke.2704000",
+     "kubeletVersion": "v1.31.14-gke.2704000",
+     "machineID": "590a4fb90f48872e170c24741a643073",
+     "operatingSystem": "linux",
+     "osImage": "Container-Optimized OS from Google",
+     "systemUUID": "590a4fb9-0f48-872e-170c-24741a643073"
+    }
+   }
+  },
+  {
+   "apiVersion": "v1",
+   "kind": "Node",
+   "metadata": {
+    "annotations": {
+     "container.googleapis.com/instance_id": "6977149808160589888",
+     "csi.volume.kubernetes.io/nodeid": "{\"pd.csi.storage.gke.io\":\"projects/haoxuw-gke-dev/zones/us-central1-a/instances/gke-gemma-gpu-upgraded-gpu-pool-2de3842b-qqvn\",\"podcertificate.gke.io\":\"gke-gemma-gpu-upgraded-gpu-pool-2de3842b-qqvn\"}",
+     "node.alpha.kubernetes.io/ttl": "0",
+     "node.gke.io/last-applied-node-labels": "cloud.google.com/gke-accelerator=nvidia-l4,cloud.google.com/gke-boot-disk=pd-balanced,cloud.google.com/gke-container-runtime=containerd,cloud.google.com/gke-cpu-scaling-level=4,cloud.google.com/gke-gpu-driver-version=latest,cloud.google.com/gke-gpu=true,cloud.google.com/gke-logging-variant=DEFAULT,cloud.google.com/gke-max-pods-per-node=110,cloud.google.com/gke-memory-gb-scaling-level=16,cloud.google.com/gke-netd-ready=true,cloud.google.com/gke-nodepool=gpu-pool,cloud.google.com/gke-os-distribution=cos,cloud.google.com/gke-provisioning=standard,cloud.google.com/gke-stack-type=IPV4,cloud.google.com/machine-family=g2,cloud.google.com/private-node=false,iam.gke.io/gke-metadata-server-enabled=true,workload=gemma",
+     "node.gke.io/last-applied-node-taints": "nvidia.com/gpu=present:NoSchedule",
+     "volumes.kubernetes.io/controller-managed-attach-detach": "true"
+    },
+    "creationTimestamp": "2026-09-24T19:16:10Z",
+    "labels": {
+     "beta.kubernetes.io/arch": "amd64",
+     "beta.kubernetes.io/instance-type": "g2-standard-4",
+     "beta.kubernetes.io/os": "linux",
+     "cloud.google.com/gke-accelerator": "nvidia-l4",
+     "cloud.google.com/gke-boot-disk": "pd-balanced",
+     "cloud.google.com/gke-container-runtime": "containerd",
+     "cloud.google.com/gke-cpu-scaling-level": "4",
+     "cloud.google.com/gke-gpu": "true",
+     "cloud.google.com/gke-gpu-driver-version": "latest",
+     "cloud.google.com/gke-logging-variant": "DEFAULT",
+     "cloud.google.com/gke-max-pods-per-node": "110",
+     "cloud.google.com/gke-memory-gb-scaling-level": "16",
+     "cloud.google.com/gke-netd-ready": "true",
+     "cloud.google.com/gke-nodepool": "gpu-pool",
+     "cloud.google.com/gke-os-distribution": "cos",
+     "cloud.google.com/gke-provisioning": "standard",
+     "cloud.google.com/gke-stack-type": "IPV4",
+     "cloud.google.com/machine-family": "g2",
+     "cloud.google.com/private-node": "false",
+     "failure-domain.beta.kubernetes.io/region": "us-central1",
+     "failure-domain.beta.kubernetes.io/zone": "us-central1-a",
+     "iam.gke.io/gke-metadata-server-enabled": "true",
+     "kubernetes.io/arch": "amd64",
+     "kubernetes.io/hostname": "gke-gemma-gpu-upgraded-gpu-pool-2de3842b-qqvn",
+     "kubernetes.io/os": "linux",
+     "node.kubernetes.io/instance-type": "g2-standard-4",
+     "topology.gke.io/zone": "us-central1-a",
+     "topology.kubernetes.io/region": "us-central1",
+     "topology.kubernetes.io/zone": "us-central1-a",
+     "workload": "gemma"
+    },
+    "name": "gke-gemma-gpu-upgraded-gpu-pool-2de3842b-qqvn",
+    "resourceVersion": "1791480396483199022",
+    "uid": "6d4d4f00-67f0-4363-8207-a58dd0d4b8fa"
+   },
+   "spec": {
+    "podCIDR": "10.72.1.0/24",
+    "providerID": "gce://haoxuw-gke-dev/us-central1-a/gke-gemma-gpu-upgraded-gpu-pool-2de3842b-qqvn",
+    "taints": [
+     {
+      "effect": "NoSchedule",
+      "key": "nvidia.com/gpu",
+      "value": "present"
+     }
+    ]
+   },
+   "status": {
+    "allocatable": {
+     "cpu": "3920m",
+     "ephemeral-storage": "47060071478",
+     "hugepages-1Gi": "0",
+     "hugepages-2Mi": "0",
+     "memory": "13594680Ki",
+     "nvidia.com/gpu": "1",
+     "pods": "110"
+    },
+    "capacity": {
+     "cpu": "4",
+     "ephemeral-storage": "98831908Ki",
+     "hugepages-1Gi": "0",
+     "hugepages-2Mi": "0",
+     "memory": "16383032Ki",
+     "nvidia.com/gpu": "1",
+     "pods": "110"
+    },
+    "conditions": [
+     {
+      "lastHeartbeatTime": "2026-10-08T17:22:15Z",
+      "lastTransitionTime": "2026-09-24T19:16:11Z",
+      "message": "No deprecation risk: did not find any deprecated 'mirrors' field in containerd's config",
+      "reason": "DeprecatedMirrorsFieldInContainerdConfigurationNotDetected",
+      "status": "False",
+      "type": "DeprecatedMirrorsFieldInContainerdConfiguration"
+     },
+     {
+      "lastHeartbeatTime": "2026-10-08T17:22:15Z",
+      "lastTransitionTime": "2026-09-24T19:16:11Z",
+      "message": "Swap is not active",
+      "reason": "SwapNotDetected",
+      "status": "False",
+      "type": "Swap"
+     },
+     {
+      "lastHeartbeatTime": "2026-10-08T17:22:15Z",
+      "lastTransitionTime": "2026-09-24T19:16:11Z",
+      "message": "containerd is functioning properly",
+      "reason": "NoFrequentContainerdRestart",
+      "status": "False",
+      "type": "FrequentContainerdRestart"
+     },
+     {
+      "lastHeartbeatTime": "2026-10-08T17:22:15Z",
+      "lastTransitionTime": "2026-09-25T01:16:11Z",
+      "message": "{\"unmanaged\": {\"kernel.tainted\": \"4096\"}}",
+      "reason": "NodeSysctlChange",
+      "status": "True",
+      "type": "SysctlChanged"
+     },
+     {
+      "lastHeartbeatTime": "2026-10-08T17:22:15Z",
+      "lastTransitionTime": "2026-09-24T19:16:11Z",
+      "message": "kubelet is functioning properly",
+      "reason": "NoFrequentKubeletRestart",
+      "status": "False",
+      "type": "FrequentKubeletRestart"
+     },
+     {
+      "lastHeartbeatTime": "2026-10-08T17:22:15Z",
+      "lastTransitionTime": "2026-09-24T19:16:11Z",
+      "message": "No deprecation risk: did not pull any schema v1 images",
+      "reason": "DeprecatedPullingSchemaV1ImageDetected",
+      "status": "False",
+      "type": "DeprecatedPullingSchemaV1Image"
+     },
+     {
+      "lastHeartbeatTime": "2026-10-08T17:22:15Z",
+      "lastTransitionTime": "2026-09-24T19:16:11Z",
+      "message": "No deprecation risk: did not find any deprecated 'auths' field in containerd's config",
+      "reason": "DeprecatedAuthsFieldInContainerdConfigurationNotDetected",
+      "status": "False",
+      "type": "DeprecatedAuthsFieldInContainerdConfiguration"
+     },
+     {
+      "lastHeartbeatTime": "2026-10-08T17:22:15Z",
+      "lastTransitionTime": "2026-09-24T19:16:11Z",
+      "message": "No deprecation risk: did not find any deprecated 'configs' field in containerd's config",
+      "reason": "DeprecatedConfigsFieldInContainerdConfigurationNotDetected",
+      "status": "False",
+      "type": "DeprecatedConfigsFieldInContainerdConfiguration"
+     },
+     {
+      "lastHeartbeatTime": "2026-10-08T17:22:15Z",
+      "lastTransitionTime": "2026-09-24T19:16:11Z",
+      "message": "Root filesystem is not read only",
+      "reason": "ReadOnlyRootFileSystemNotDetected",
+      "status": "False",
+      "type": "ReadOnlyRootFileSystem"
+     },
+     {
+      "lastHeartbeatTime": "2026-10-08T17:22:15Z",
+      "lastTransitionTime": "2026-09-24T19:16:11Z",
+      "message": "XFS has not shutdown",
+      "reason": "XfsHasNotShutDown",
+      "status": "False",
+      "type": "XfsShutdown"
+     },
+     {
+      "lastHeartbeatTime": "2026-10-08T17:22:15Z",
+      "lastTransitionTime": "2026-09-24T19:16:11Z",
+      "message": "kernel has no deadlock",
+      "reason": "KernelHasNoDeadlock",
+      "status": "False",
+      "type": "KernelDeadlock"
+     },
+     {
+      "lastHeartbeatTime": "2026-10-08T17:22:15Z",
+      "lastTransitionTime": "2026-09-24T19:16:11Z",
+      "message": "UEFI CPER has no fatal error",
+      "reason": "CperHardwareHasNoFatalError",
+      "status": "False",
+      "type": "CperHardwareErrorFatal"
+     },
+     {
+      "lastHeartbeatTime": "2026-10-08T17:22:15Z",
+      "lastTransitionTime": "2026-09-24T19:16:11Z",
+      "message": "node is functioning properly",
+      "reason": "NoFrequentUnregisterNetDevice",
+      "status": "False",
+      "type": "FrequentUnregisterNetDevice"
+     },
+     {
+      "lastHeartbeatTime": "2026-10-08T17:22:15Z",
+      "lastTransitionTime": "2026-09-24T19:16:11Z",
+      "message": "docker is functioning properly",
+      "reason": "NoFrequentDockerRestart",
+      "status": "False",
+      "type": "FrequentDockerRestart"
+     },
+     {
+      "lastHeartbeatTime": "2026-10-08T17:22:15Z",
+      "lastTransitionTime": "2026-09-24T19:16:11Z",
+      "message": "No deprecation risk: did not use v1alpha2 CRI",
+      "reason": "DeprecatedUsingV1Alpha2CriNotDetected",
+      "status": "False",
+      "type": "DeprecatedUsingV1Alpha2Cri"
+     },
+     {
+      "lastHeartbeatTime": "2026-10-08T17:22:15Z",
+      "lastTransitionTime": "2026-09-24T19:16:11Z",
+      "message": "No deprecation risk: did not find any deprecations other than 3 configs fields (auths/configs/mirrors), pulling schema v1 images and using v1alpha2 CRI.",
+      "reason": "DeprecatedOtherContainerdFeaturesNotDetected",
+      "status": "False",
+      "type": "DeprecatedOtherContainerdFeatures"
+     },
+     {
+      "lastHeartbeatTime": "2026-10-08T17:22:15Z",
+      "lastTransitionTime": "2026-09-24T19:16:11Z",
+      "message": "docker overlay2 is functioning properly",
+      "reason": "NoCorruptDockerOverlay2",
+      "status": "False",
+      "type": "CorruptDockerOverlay2"
+     },
+     {
+      "lastHeartbeatTime": "2026-09-24T19:16:11Z",
+      "lastTransitionTime": "2026-09-24T19:16:11Z",
+      "message": "NodeController create implicit route",
+      "reason": "RouteCreated",
+      "status": "False",
+      "type": "NetworkUnavailable"
+     },
+     {
+      "lastHeartbeatTime": "2026-10-08T17:26:36Z",
+      "lastTransitionTime": "2026-09-24T19:16:08Z",
+      "message": "kubelet has sufficient memory available",
+      "reason": "KubeletHasSufficientMemory",
+      "status": "False",
+      "type": "MemoryPressure"
+     },
+     {
+      "lastHeartbeatTime": "2026-10-08T17:26:36Z",
+      "lastTransitionTime": "2026-09-24T19:16:08Z",
+      "message": "kubelet has no disk pressure",
+      "reason": "KubeletHasNoDiskPressure",
+      "status": "False",
+      "type": "DiskPressure"
+     },
+     {
+      "lastHeartbeatTime": "2026-10-08T17:26:36Z",
+      "lastTransitionTime": "2026-09-24T19:16:08Z",
+      "message": "kubelet has sufficient PID available",
+      "reason": "KubeletHasSufficientPID",
+      "status": "False",
+      "type": "PIDPressure"
+     },
+     {
+      "lastHeartbeatTime": "2026-10-08T17:26:36Z",
+      "lastTransitionTime": "2026-09-24T19:16:12Z",
+      "message": "kubelet is posting ready status",
+      "reason": "KubeletReady",
+      "status": "True",
+      "type": "Ready"
+     }
+    ],
+    "nodeInfo": {
+     "architecture": "amd64",
+     "bootID": "ae563764-358b-4c81-86af-30c34327ed8a",
+     "containerRuntimeVersion": "containerd://2.0.10",
+     "kernelVersion": "6.6.153+",
+     "kubeProxyVersion": "v1.32.13-gke.2427000",
+     "kubeletVersion": "v1.32.13-gke.2427000",
+     "machineID": "795d3adc4f08316c085501f5244d0119",
+     "operatingSystem": "linux",
+     "osImage": "Container-Optimized OS from Google",
+     "systemUUID": "795d3adc-4f08-316c-0855-01f5244d0119"
+    },
+    "runtimeHandlers": [
+     {
+      "features": {
+       "recursiveReadOnlyMounts": true,
+       "userNamespaces": true
+      },
+      "name": "runc"
+     },
+     {
+      "features": {
+       "recursiveReadOnlyMounts": true,
+       "userNamespaces": true
+      },
+      "name": ""
+     }
+    ]
+   }
+  }
+ ],
+ "kind": "List"
+}
