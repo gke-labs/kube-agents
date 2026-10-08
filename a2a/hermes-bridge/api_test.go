@@ -1219,3 +1219,94 @@ func TestNoticeState_FollowsTheWorkingPublish(t *testing.T) {
 	}
 	b.finalize(run, lib.StateCompleted, "", nil)
 }
+
+// holdingStub is an API server whose first request holds until release is
+// called or the request ends, so follow-ups arrive while the task runs;
+// every later request answers at once. in is closed once the first request
+// is in.
+func holdingStub(t *testing.T) (stub *apiStub, in <-chan struct{}, release func()) {
+	t.Helper()
+	inCh, rel := make(chan struct{}), make(chan struct{})
+	var inOnce, relOnce sync.Once
+	var first atomic.Bool
+	stub = newAPIStub(t, func(w http.ResponseWriter, r *http.Request, c apiCall) {
+		if first.CompareAndSwap(false, true) {
+			inOnce.Do(func() { close(inCh) })
+			select {
+			case <-rel:
+			case <-r.Context().Done():
+				return
+			}
+		}
+		writeCompletion(w, c.sessionID, "answer to "+c.prompt)
+	})
+	release = func() { relOnce.Do(func() { close(rel) }) }
+	t.Cleanup(release) // before the stub's Close, which waits for its handlers
+	return stub, inCh, release
+}
+
+// steerQueueCapacity bounds the follow-ups a task runs in total, not the
+// ones waiting at one moment: a thread that sends one follow-up per turn,
+// each taken off the queue as its turn starts, still stops at the cap, and
+// the next is refused queue-full.
+func TestAPI_FollowUpsStopAtTheTaskCap(t *testing.T) {
+	_, url := startServer(t)
+	const turns = steerQueueCapacity + 1
+	var started, released [turns + 1]chan struct{}
+	for i := range started {
+		started[i], released[i] = make(chan struct{}), make(chan struct{})
+	}
+	var n atomic.Int32
+	stub := newAPIStub(t, func(w http.ResponseWriter, r *http.Request, c apiCall) {
+		i := int(n.Add(1))
+		if i <= turns {
+			close(started[i])
+			select {
+			case <-released[i]:
+			case <-r.Context().Done():
+				return
+			}
+		}
+		writeCompletion(w, c.sessionID, fmt.Sprintf("answer %d", i))
+	})
+	var once sync.Once
+	t.Cleanup(func() {
+		once.Do(func() {
+			for i := 1; i <= turns; i++ {
+				select {
+				case <-released[i]:
+				default:
+					close(released[i])
+				}
+			}
+		})
+	})
+	startAPIBridge(t, url, stub, nil)
+	c := gatewayClient(t, url)
+	origin := submitIn(t, c, "task-api-cap", "ctx-cap", "q")
+	for turn := 1; turn <= turns; turn++ {
+		select {
+		case <-started[turn]:
+		case <-time.After(10 * time.Second):
+			t.Fatalf("turn %d never started", turn)
+		}
+		steer := sendSteer(t, c, origin, fmt.Sprintf("follow-up %d", turn))
+		waitFor(t, 10*time.Second, fmt.Sprintf("notice %d", turn), func() bool { return len(steerNotices(t, url, origin.TaskID)) == turn })
+		got := steerNotices(t, url, origin.TaskID)[turn-1]
+		want := lib.SteerNotice{Steer: lib.SteerQueued, EnvelopeID: steer.EnvelopeID}
+		if turn > steerQueueCapacity {
+			want = lib.SteerNotice{Steer: lib.SteerRefused, EnvelopeID: steer.EnvelopeID, Reason: lib.SteerReasonQueueFull}
+		}
+		if got.SteerNotice != want {
+			t.Fatalf("follow-up %d (none waiting, %d taken): notice %+v, want %+v", turn, turn-1, got.SteerNotice, want)
+		}
+		close(released[turn])
+	}
+	task := waitTerminal(t, c, origin.TaskID)
+	if task.State != lib.StateCompleted {
+		t.Fatalf("state %s reason %q", task.State, terminalReason(t, task))
+	}
+	if got := len(stub.seen()); got != turns {
+		t.Fatalf("%d turns ran, want the opening turn plus %d follow-ups", got, steerQueueCapacity)
+	}
+}

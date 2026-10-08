@@ -2,10 +2,10 @@
 // platform profile: it consumes a2a.tasks.{profile}.*.in, answers each task
 // as a turn on the pod's Hermes API server (one session per contextId) or,
 // on the cli executor, by one `hermes -p {profile} chat -Q --query=<prompt>` per
-// task, with a follow-up message that arrives mid-task queued and run as the
-// next turn in the same session (`--resume` on the cli executor), and
-// publishes the payload spec's lifecycle events with the answer as
-// the result artifact. It is
+// task, and publishes the payload spec's lifecycle events with the answer as
+// the result artifact. On the API executor a follow-up message that arrives
+// mid-task is queued and run as the next turn in the same session; the cli
+// executor cannot continue a session and refuses it no-resume. It is
 // scaffolding for the Hermes-first world - when the stage-3 dispatcher and
 // the W4 worker adapter land, the bridge retires. Design:
 // a2a/docs/hermes-bridge.md.
@@ -98,29 +98,15 @@ const (
 	// consumer runs one handler at a time, a cancel delivered behind the
 	// stalled one. The bound keeps that wait finite.
 	steerNoticeTimeout = 10 * time.Second
-	// sessionStoreTimeout bounds the session-store read that checks a
-	// session id before the first follow-up resumes it (verifySession). A
-	// read that outlives it vouches for nothing: the follow-ups are refused
-	// no-resume. sessionExportMaxBytes caps what that read may print, one
-	// turn's transcript; more is refused the same way, unread.
-	sessionStoreTimeout   = 15 * time.Second
-	sessionExportMaxBytes = 32 << 20
 
 	shutdownReason            = "reason: bridge-shutdown - the bridge was terminated while this task was in flight"
 	canceledBeforeStartReason = "reason: canceled-before-start"
 )
 
-// sessionStoreBudget is sessionStoreTimeout as a variable, so a test can
-// time the store read out without waiting the real bound.
-var sessionStoreBudget = sessionStoreTimeout
-
 // sessionIDLine is the last thing `hermes chat -Q` writes on stderr:
 // "session_id: <id>". The id finds the transcript under the profile's session
-// store, which is the evidence the status message cannot carry whole, and a
-// follow-up turn resumes it. The id's shape is checked, not just its
-// presence: it lands in a child's argv after --resume, and Hermes's own ids
-// (<timestamp>_<hex>) need nothing wider.
-var sessionIDLine = regexp.MustCompile(`^session_id:[ \t]*([A-Za-z0-9][A-Za-z0-9_.:-]{0,127})$`)
+// store, which is the evidence the status message cannot carry whole.
+var sessionIDLine = regexp.MustCompile(`(?m)^session_id:[ \t]*(\S+)`)
 
 // Config wires one bridge. Zero values get playground defaults in Run.
 type Config struct {
@@ -730,9 +716,11 @@ func (b *Bridge) lastEventIsFinal(ctx context.Context, taskID string) bool {
 
 // queueSteer answers a follow-up to a task this bridge holds. Queued, it
 // runs as a further turn in the task's Hermes session after the current
-// one; refused, the requester is told why. Either way one non-final notice
-// carrying the task's CURRENT state - a follow-up must not change folded
-// state by itself (assertion 12). The decision is made under mu; the notice
+// one; refused, the requester is told why. Only the API executor queues:
+// the cli executor cannot continue a session, so every follow-up to one of
+// its tasks is refused no-resume here, at once. Either way one non-final
+// notice carrying the task's CURRENT state - a follow-up must not change
+// folded state by itself (assertion 12). The decision is made under mu; the notice
 // goes out under noticeMu with mu released (publishSteerNotices), so it
 // still lands ahead of the final event finalize writes behind noticeMu. A
 // follow-up that reaches noticeMu after finalize gets no notice: the run is
@@ -757,6 +745,8 @@ func (b *Bridge) queueSteer(ctx context.Context, run *taskRun, steer *lib.Envelo
 	n := lib.SteerNotice{Steer: lib.SteerRefused, EnvelopeID: steer.EnvelopeID}
 	_, hasText := promptFromMessage(steer.Payload)
 	switch {
+	case b.cfg.Executor != ExecutorAPI:
+		n.Reason = lib.SteerReasonNoResume
 	case !hasText:
 		n.Reason = lib.SteerReasonNoText
 	case run.turnsClosed:
@@ -944,7 +934,8 @@ func steerNoticeText(n lib.SteerNotice) string {
 	case lib.SteerReasonCapability:
 		return prefix + "the task's capability check did not pass when its turn came (refused, or the verifier could not be reached), so it did not run."
 	case lib.SteerReasonNoResume:
-		return prefix + "the conversation could not be continued for it, so it did not run."
+		return prefix + "this agent's executor can't continue a session, so a follow-up cannot run while the task does; " +
+			"the task continues on its original message. Send it again after the answer."
 	}
 	return prefix + "it did not run."
 }
@@ -1239,11 +1230,16 @@ func (b *Bridge) runTask(ctx context.Context, run *taskRun) {
 		return
 	}
 
+	argv := promptArgv(b.cfg.Command, prompt)
+	cmd := exec.Command(argv[0], argv[1:]...)
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	var stdout strings.Builder
+	stderr := newTailBuffer(stderrTailBytes)
+	cmd.Stdout = &stdout
+	cmd.Stderr = stderr
 	// The activity door's side of this task: a signing key in the child's
-	// environment when the door is open, and the heartbeat either way. One
-	// for the task: every turn's child carries the same key.
+	// environment when the door is open, and the heartbeat either way.
 	act := newActivityState(b.activityLn != nil)
-	var env []string // nil: the child inherits, as with the door closed
 	if b.activityLn != nil {
 		scope, err := b.childManagedScope(taskID)
 		if err != nil {
@@ -1257,11 +1253,32 @@ func (b *Bridge) runTask(ctx context.Context, run *taskRun) {
 				b.cfg.Logger.Warn("child scope not removed", "task", run.origin.TaskID, "scope", scope, "err", err)
 			}
 		}()
-		env = append(os.Environ(), act.childEnv(b.ActivityURL(), scope)...)
+		cmd.Env = append(os.Environ(), act.childEnv(b.ActivityURL(), scope)...)
 	}
-	// One deadline for the task, every turn included: the profile's
-	// activeDeadlineSeconds is the task's, not a turn's.
-	deadlineAt := time.Now().Add(b.cfg.TaskDeadline)
+
+	run.mu.Lock()
+	if run.state != stateRunning {
+		// Shutdown or cancel finalized first.
+		run.mu.Unlock()
+		return
+	}
+	run.act.Store(act)
+	if err := cmd.Start(); err != nil {
+		// No child, so no publisher to join and nothing to drain.
+		run.act.Store(nil)
+		run.mu.Unlock()
+		b.finalize(run, lib.StateFailed, fmt.Sprintf("reason: spawn-failed - %v", err), nil)
+		return
+	}
+	run.proc = cmd
+	go b.runActivity(run)
+	// Cancel may have raced the spawn: its kill saw no process, so re-check
+	// under the same lock its kill path takes.
+	if run.canceled.Load() {
+		b.killGroup(run, cmd.Process.Pid)
+	}
+	run.mu.Unlock()
+
 	deadline := time.AfterFunc(b.cfg.TaskDeadline, func() {
 		run.deadlineHit.Store(true)
 		run.mu.Lock()
@@ -1270,206 +1287,44 @@ func (b *Bridge) runTask(ctx context.Context, run *taskRun) {
 		}
 		run.mu.Unlock()
 	})
-	defer deadline.Stop()
+	err := cmd.Wait()
+	deadline.Stop()
+	// The group is gone; stop any armed grace-period SIGKILLs before the
+	// pgid can be recycled onto an innocent process.
+	run.mu.Lock()
+	for _, t := range run.killTimers {
+		t.Stop()
+	}
+	run.killTimers = nil
+	run.mu.Unlock()
 
-	opening := prompt
-	argv := promptArgv(b.cfg.Command, prompt)
-	spawnedAt := time.Now() // no later than turn 1's spawn; its session begins after it
-	var steer *lib.Envelope // the follow-up this turn runs; nil on turn 1
-	var sessionID string    // the session the follow-ups resume, once the store vouched for it
-	for turn := 1; ; turn++ {
-		out, stderr, err, spawned := b.cliTurn(run, argv, env, act, steer, deadlineAt)
-		if !spawned {
-			return
-		}
-		if err != nil {
-			b.finalizeCLIError(run, err, out, stderr, turn)
-			return
-		}
-		// Resumable at all? Asked before a follow-up is looked at, so a
-		// refusal covers every queued one and this answer is the result.
-		// After the first follow-up the id is the verified one: a turn's
-		// stderr is shared with its tools, so a different id there is
-		// logged and not used.
-		stderrID := lastSessionID(stderr)
-		if sessionID != "" && stderrID != "" && stderrID != sessionID {
-			b.cfg.Logger.Warn("a follow-up turn's stderr names another session; resuming the verified one",
-				"task", taskID, "turn", turn, "session", sessionID, "stderr_session", stderrID)
-		}
-		if _, rerr := resumeArgv(b.cfg.Command, "x", "x"); (sessionID == "" && stderrID == "") || rerr != nil {
-			b.closeTurns(run, lib.SteerReasonNoResume)
-			b.finalize(run, lib.StateCompleted, "", &out)
-			return
-		}
-		next, prompt := b.runnableSteer(ctx, run)
-		if next == nil {
-			// A canceled task whose turn finished anyway won the race:
-			// completed wins, per the payload spec's cancel mapping.
-			b.finalize(run, lib.StateCompleted, "", &out)
-			return
-		}
-		if sessionID == "" {
-			if verr := b.verifySession(ctx, env, stderrID, opening, spawnedAt); verr != nil {
-				b.cfg.Logger.Warn("session id not verified against the session store; refusing the follow-ups no-resume",
-					"task", taskID, "session", stderrID, "err", verr)
-				b.closeTurns(run, lib.SteerReasonNoResume)
-				b.finalize(run, lib.StateCompleted, "", &out)
-				return
-			}
-			sessionID = stderrID
-		}
-		if !b.publishTurnAnswer(run, turn, out) {
-			return
-		}
-		steer = next
-		argv, _ = resumeArgv(b.cfg.Command, sessionID, prompt)
+	switch {
+	case err == nil:
+		// A canceled task that finished anyway won the race: completed wins,
+		// per the payload spec's cancel mapping.
+		out := stdout.String()
+		b.finalize(run, lib.StateCompleted, "", &out)
+	case run.deadlineHit.Load():
+		b.finalize(run, lib.StateFailed,
+			fmt.Sprintf("reason: deadline-exceeded - killed after %s", b.cfg.TaskDeadline), nil)
+	case run.canceled.Load():
+		b.finalize(run, lib.StateCanceled, "reason: canceled-by-request", nil)
+	case b.closing.Load():
+		// Killed by shutdownTasks; name the real cause, not the exit code.
+		b.finalize(run, lib.StateFailed, shutdownReason, nil)
+	default:
+		b.finalize(run, lib.StateFailed, failureReason(err, stdout.String(), stderr.String()), nil)
 	}
 }
 
-// storeArgv is the session-store read for sessionID: the configured command
-// up to its last "chat" token (the hermes binary and its -p profile), or up
-// to its trailing -q when it names no chat, then Hermes's jsonl export of
-// that one session to stdout. The read opens the store and selects; it
-// writes no session (Hermes v2026.9.14 hermes_cli/sessions_cmd.py:306-341,
-// hermes_state_portability.py:240-243).
-func storeArgv(command []string, sessionID string) ([]string, error) {
-	n := len(command)
-	prefix := -1
-	for i := n - 1; i > 0; i-- {
-		if command[i] == "chat" {
-			prefix = i
-			break
-		}
-	}
-	if prefix < 0 && n > 1 && command[n-1] == "-q" {
-		prefix = n - 1
-	}
-	if prefix < 1 {
-		return nil, fmt.Errorf("command %q names no chat subcommand to read the session store beside", command)
-	}
-	argv := append([]string(nil), command[:prefix]...)
-	return append(argv, "sessions", "export", "-", "--session-id", sessionID), nil
-}
-
-// verifySession checks a session id read off turn 1's stderr against the
-// profile's session store before a follow-up resumes it. stderr is shared
-// with the turn's tool subprocesses, and anything in the pod can write to
-// it, so the id's shape says nothing about whose it is: a line written after
-// the CLI's own can name another conversation's session. The store can say:
-// the session this task's opening turn made began after that turn was
-// spawned, and its first user message is the opening prompt as the argv
-// carried it. Either check failing, or the read failing or outliving
-// sessionStoreTimeout, is an error, and the caller refuses the follow-ups
-// no-resume as it does an id it could not parse.
-//
-// The read runs as the turns do: the same command's binary and profile, the
-// same environment, its own process group, killed with the group when ctx
-// or the timeout ends it.
-func (b *Bridge) verifySession(ctx context.Context, env []string, sessionID, opening string, spawnedAt time.Time) error {
-	argv, err := storeArgv(b.cfg.Command, sessionID)
-	if err != nil {
-		return err
-	}
-	ctx, cancel := context.WithTimeout(ctx, sessionStoreBudget)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	cmd.Cancel = func() error { return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL) }
-	cmd.WaitDelay = time.Second // a grandchild holding the pipes does not hold the read
-	out := &cappedBuffer{max: sessionExportMaxBytes}
-	errTail := newTailBuffer(stderrTailBytes)
-	cmd.Stdout, cmd.Stderr, cmd.Env = out, errTail, env
-	if err := cmd.Run(); err != nil {
-		if ctx.Err() != nil {
-			return fmt.Errorf("session store read ended (%v): %w", ctx.Err(), err)
-		}
-		return fmt.Errorf("session store read failed: %w; stderr tail: %s", err, errTail.String())
-	}
-	if out.over {
-		return fmt.Errorf("session store read printed more than %d bytes", sessionExportMaxBytes)
-	}
-	return checkSessionExport(out.buf, sessionID, argvText(opening), spawnedAt)
-}
-
-// sessionExport is the part of Hermes's jsonl session export the check
-// reads: the session row's id and started_at (epoch seconds, written with
-// time.time() when the row is created, hermes_state_common.py:344,
-// hermes_state_sessions.py:357) and its live messages in insertion order
-// (hermes_state_messages.py:774-777), each with its role and content.
-type sessionExport struct {
-	ID        string   `json:"id"`
-	StartedAt *float64 `json:"started_at"`
-	Messages  []struct {
-		Role    string          `json:"role"`
-		Content json.RawMessage `json:"content"`
-	} `json:"messages"`
-}
-
-// checkSessionExport is verifySession's judgement of one export: exactly one
-// JSON object, for sessionID, begun at or after spawnedAt, whose first user
-// message is opening.
-func checkSessionExport(raw []byte, sessionID, opening string, spawnedAt time.Time) error {
-	dec := json.NewDecoder(strings.NewReader(string(raw)))
-	var e sessionExport
-	if err := dec.Decode(&e); err != nil {
-		// The output is a conversation transcript, so only its size is logged.
-		return fmt.Errorf("session store printed no session export: %v (%d bytes of output)", err, len(raw))
-	}
-	if dec.More() {
-		return errors.New("session store printed more than one session")
-	}
-	if e.ID != sessionID {
-		return fmt.Errorf("session store exported %q for %q", e.ID, sessionID)
-	}
-	if e.StartedAt == nil {
-		return errors.New("session export carries no started_at")
-	}
-	if spawned := float64(spawnedAt.UnixNano()) / 1e9; *e.StartedAt < spawned {
-		return fmt.Errorf("session began at %.6f, before this task's opening turn was spawned at %.6f", *e.StartedAt, spawned)
-	}
-	for _, m := range e.Messages {
-		if m.Role != "user" {
-			continue
-		}
-		var text string
-		if json.Unmarshal(m.Content, &text) != nil {
-			return errors.New("session's first user message is not text")
-		}
-		if text != opening {
-			return errors.New("session's first user message is not this task's opening prompt")
-		}
-		return nil
-	}
-	return errors.New("session has no user message")
-}
-
-// cappedBuffer keeps what is written to it up to max bytes and notes, rather
-// than fails, anything past that, so a writer is never stopped mid-line by
-// an error it did not expect.
-type cappedBuffer struct {
-	buf  []byte
-	max  int
-	over bool
-}
-
-func (c *cappedBuffer) Write(p []byte) (int, error) {
-	n := len(p)
-	if room := c.max - len(c.buf); n > room {
-		c.over = true
-		p = p[:max(room, 0)]
-	}
-	c.buf = append(c.buf, p...)
-	return n, nil
-}
-
-// promptArgv is a turn's command: the configured command with the prompt as
-// its final argument. A command ending in Hermes's -q gets the prompt as one
-// "--query=<prompt>" token instead, so a prompt that starts with "-" stays
-// the query: after a bare -q, argparse reads a dash-led token with no space
-// in it ("--force") as an option and the child exits 2, and Hermes's own
-// pre-parse scans match whole tokens ("--help", "--tui", "-p"). Any other
-// command gets the prompt appended as it is. Either way the prompt is
-// argvText's, without NUL bytes.
+// promptArgv is the cli executor's command: the configured command with the
+// prompt as its final argument. A command ending in Hermes's -q gets the
+// prompt as one "--query=<prompt>" token instead, so a prompt that starts
+// with "-" stays the query: after a bare -q, argparse reads a dash-led token
+// with no space in it ("--force") as an option and the child exits 2, and
+// Hermes's own pre-parse scans match whole tokens ("--help", "--tui", "-p").
+// Any other command gets the prompt appended as it is. Either way the prompt
+// is argvText's, without NUL bytes.
 func promptArgv(command []string, prompt string) []string {
 	n := len(command)
 	if n == 0 || command[n-1] != "-q" {
@@ -1478,170 +1333,20 @@ func promptArgv(command []string, prompt string) []string {
 	return append(append([]string(nil), command[:n-1]...), "--query="+argvText(prompt))
 }
 
-// argvText is a turn's prompt as an argv string can carry it: without NUL
-// bytes, which exec refuses in any argument (EINVAL), so a message holding
-// one would fail its turn, and with it the task, as spawn-failed. Every
-// turn's prompt passes through here, the opening one and each follow-up's.
+// argvText is the prompt as an argv string can carry it: without NUL bytes,
+// which exec refuses in any argument (EINVAL), so a message holding one
+// would fail the task as spawn-failed.
 func argvText(prompt string) string {
 	return strings.ReplaceAll(prompt, "\x00", "")
-}
-
-// resumeArgv is a follow-up turn's command: the configured command with
-// "--resume <id>" in place of its trailing -q, then the prompt as
-// promptArgv writes it. A command that does not end in -q has no place for
-// the flag; the follow-ups are refused no-resume rather than guessed at.
-func resumeArgv(command []string, sessionID, prompt string) ([]string, error) {
-	n := len(command)
-	if n == 0 || command[n-1] != "-q" {
-		return nil, fmt.Errorf("command %q does not end in -q", command)
-	}
-	argv := append([]string(nil), command[:n-1]...)
-	return append(argv, "--resume", sessionID, "--query="+argvText(prompt)), nil
-}
-
-// lastSessionID is the id on a child's last non-blank stderr line, or "".
-// The CLI prints its own "session_id:" line last, after anything a tool's
-// nested run echoed. Only that line is read: stderr is shared with the
-// child's tool subprocesses, so an earlier match may be another session's
-// id, and a later line means the CLI's own was not last. A label with
-// nothing after it, or an id outside sessionIDLine's shape, is no id at all,
-// and a follow-up then has nothing to resume. A tool can write the last line
-// too, so an id read here is a candidate, not a fact: verifySession checks
-// it against the session store before a follow-up resumes it.
-func lastSessionID(stderr string) string {
-	lines := strings.Split(stderr, "\n")
-	for i := len(lines) - 1; i >= 0; i-- {
-		line := strings.TrimRight(lines[i], " \t\r")
-		if line == "" {
-			continue
-		}
-		if m := sessionIDLine.FindStringSubmatch(line); m != nil {
-			return m[1]
-		}
-		return ""
-	}
-	return ""
-}
-
-// cliTurn runs one hermes child for run and waits for it. steer is the
-// follow-up the turn runs, nil on turn 1; it leaves the queue as the child
-// starts. spawned is false when the task is final: it already was, or this
-// finalized it - the spawn failed, the turn found the task past deadlineAt,
-// or a follow-up's turn found it canceled or the bridge stopping (no child
-// starts once the deadline has fired, or it would outlive the kill). The
-// activity state is stored and its publisher started on turn 1 only; later
-// children reuse the same key in env.
-func (b *Bridge) cliTurn(run *taskRun, argv, env []string, act *activityState, steer *lib.Envelope, deadlineAt time.Time) (stdout, stderr string, err error, spawned bool) {
-	first := steer == nil
-	cmd := exec.Command(argv[0], argv[1:]...)
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	var out strings.Builder
-	errTail := newTailBuffer(stderrTailBytes)
-	cmd.Stdout, cmd.Stderr, cmd.Env = &out, errTail, env
-	if !time.Now().Before(deadlineAt) {
-		run.deadlineHit.Store(true) // due, its timer just has not run yet
-	}
-	run.mu.Lock()
-	if run.state != stateRunning {
-		// Shutdown or cancel finalized first.
-		run.mu.Unlock()
-		return "", "", nil, false
-	}
-	// The deadline on every turn, turn 1 included: its timer is armed before
-	// turn 1's spawn, and one that fired first found no child to kill. A
-	// cancel on turn 1 still spawns and kills below, as before.
-	if run.deadlineHit.Load() || (!first && (run.canceled.Load() || b.closing.Load())) {
-		// Checked under the lock the deadline timer and the cancel kill take,
-		// after each has stored its flag: one that lands after this check
-		// finds run.proc set and kills the child.
-		run.mu.Unlock()
-		b.finalizeCLIError(run, errTurnNotStarted, "", "", 0)
-		return "", "", nil, false
-	}
-	if !first && (len(run.steers) == 0 || run.steers[0] != steer) {
-		// A finalize has taken the queue (and refused it) and is on its
-		// way to the terminal. Unreachable while every finalizer sets a flag
-		// checked above; a child here would contradict its notice.
-		run.mu.Unlock()
-		b.cfg.Logger.Error("follow-up gone from the queue head before its turn; not spawning",
-			"task", run.origin.TaskID, "envelope", steer.EnvelopeID)
-		return "", "", nil, false
-	}
-	if first {
-		run.act.Store(act)
-	}
-	if serr := cmd.Start(); serr != nil {
-		// The follow-up stays at the head: the finalize below refuses it
-		// task-ended.
-		if first {
-			run.act.Store(nil) // no child, so no publisher to join
-		}
-		run.mu.Unlock()
-		b.finalize(run, lib.StateFailed, fmt.Sprintf("reason: spawn-failed - %v", serr), nil)
-		return "", "", nil, false
-	}
-	if !first {
-		takeSteerLocked(run, steer) // its turn has started: no notice owed now; at the head, checked above under this lock
-	}
-	run.proc = cmd
-	if first {
-		go b.runActivity(run)
-		// Cancel may have raced the spawn: its kill saw no process, so
-		// re-check under the same lock its kill path takes.
-		if run.canceled.Load() {
-			b.killGroup(run, cmd.Process.Pid)
-		}
-	}
-	run.mu.Unlock()
-	werr := cmd.Wait()
-	// The group is gone; stop any armed grace-period SIGKILLs before the
-	// pgid can be recycled onto an innocent process, and forget the child,
-	// so a deadline between turns signals nothing.
-	run.mu.Lock()
-	for _, t := range run.killTimers {
-		t.Stop()
-	}
-	run.killTimers = nil
-	run.proc = nil
-	run.mu.Unlock()
-	return out.String(), errTail.String(), werr, true
-}
-
-// errTurnNotStarted is what a turn that found the task stopped before its
-// spawn carries into finalizeCLIError: no child ran, so none was killed.
-var errTurnNotStarted = errors.New("the turn's child was not started")
-
-// finalizeCLIError names why a child's turn ended without an answer: the
-// deadline, a cancel, shutdown, else the child's non-zero exit and its
-// evidence. A follow-up turn (turn ≥ 2) the deadline or shutdown killed is
-// named, as a non-zero exit is.
-func (b *Bridge) finalizeCLIError(run *taskRun, err error, stdout, stderr string, turn int) {
-	switch {
-	case run.deadlineHit.Load() && errors.Is(err, errTurnNotStarted):
-		// Found before the spawn: between two turns, or before the first.
-		b.finalize(run, lib.StateFailed,
-			fmt.Sprintf("reason: deadline-exceeded - reached after %s before the next turn started; no child was running", b.cfg.TaskDeadline), nil)
-	case run.deadlineHit.Load():
-		b.finalize(run, lib.StateFailed,
-			fmt.Sprintf("reason: deadline-exceeded - killed after %s%s", b.cfg.TaskDeadline, turnNote(turn)), nil)
-	case run.canceled.Load():
-		b.finalize(run, lib.StateCanceled, "reason: canceled-by-request", nil)
-	case b.closing.Load():
-		// Killed by shutdownTasks; name the real cause, not the exit code.
-		b.finalize(run, lib.StateFailed, shutdownReason+turnNote(turn), nil)
-	default:
-		b.finalize(run, lib.StateFailed, failureReason(err, stdout, stderr, turn), nil)
-	}
 }
 
 // failureReason is the terminal message for a subprocess that exited
 // non-zero: the reason token, the exit error, the session id if hermes
 // printed one, and a bounded tail of each stream. Exit 75 (EX_TEMPFAIL) is
 // the rate-limit exit and gets its own token; everything else is
-// hermes-exited-nonzero. After turn 1 the reason names the turn that failed
-// (turnNote), straight after the session. Newlines are kept: the message is a text part, and
+// hermes-exited-nonzero. Newlines are kept: the message is a text part, and
 // the tails are read by a person.
-func failureReason(err error, stdout, stderr string, turn int) string {
+func failureReason(err error, stdout, stderr string) string {
 	token := "hermes-exited-nonzero"
 	var exit *exec.ExitError
 	if errors.As(err, &exit) && exit.ExitCode() == rateLimitedExitCode {
@@ -1649,10 +1354,12 @@ func failureReason(err error, stdout, stderr string, turn int) string {
 	}
 	var sb strings.Builder
 	fmt.Fprintf(&sb, "reason: %s - %v", token, err)
-	if id := lastSessionID(stderr); id != "" {
-		fmt.Fprintf(&sb, "; session: %s", id)
+	// The last match: the CLI prints its own line last, after anything a
+	// tool's nested run echoed; a label with nothing after it matches
+	// nothing, so no id is reported rather than the next line's first word.
+	if all := sessionIDLine.FindAllStringSubmatch(stderr, -1); len(all) > 0 {
+		fmt.Fprintf(&sb, "; session: %s", all[len(all)-1][1])
 	}
-	sb.WriteString(turnNote(turn))
 	fmt.Fprintf(&sb, "; stdout tail: %s; stderr tail: %s", tail(stdout, stdoutTailBytes), stderr)
 	return sb.String()
 }

@@ -174,10 +174,11 @@ func testCtx(t *testing.T) context.Context {
 	return ctx
 }
 
-// script writes an executable stub standing in for the hermes CLI. The
-// bridge appends the prompt as the final argument, so stubs see it in "$5"
-// under the default arg shape ["-p", profile, "chat", "-q", prompt] - tests
-// pass Command themselves, so stubs read "$1".
+// script writes an executable stub standing in for the hermes CLI. Under
+// the default command, which ends in -q, the bridge puts the prompt in place
+// of the -q as one "--query=<prompt>" token (promptArgv); tests pass a
+// Command that does not end in -q, so the prompt is appended as it is and
+// stubs read it in "$1".
 func script(t *testing.T, body string) []string {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "hermes-stub")
@@ -557,18 +558,6 @@ func sendSteer(t *testing.T, c *lib.Client, origin *lib.Envelope, text string) *
 	return steer
 }
 
-// blockingStub is a hermes stand-in whose first turn holds until release
-// exists, so follow-ups arrive while the task is running.
-func blockingStub(t *testing.T) (cmd []string, started, release string) {
-	t.Helper()
-	dir := t.TempDir()
-	started, release = filepath.Join(dir, "started"), filepath.Join(dir, "release")
-	return script(t, fmt.Sprintf(`touch %s
-while [ ! -f %s ]; do sleep 0.05; done
-echo first-answer
-echo "session_id: sess-1" >&2`, started, release)), started, release
-}
-
 func waitStarted(t *testing.T, path string) {
 	t.Helper()
 	waitFor(t, 10*time.Second, "subprocess start", func() bool { _, err := os.Stat(path); return err == nil })
@@ -587,11 +576,11 @@ func runOf(b *Bridge, taskID string) *taskRun {
 // terminal (assertion 10), in words that say the task ended.
 func TestSteer_QueuedThenRefusedAtCancel(t *testing.T) {
 	_, url := startServer(t)
-	cmd, started, _ := blockingStub(t)
-	startBridge(t, url, cmd)
+	stub, in, _ := holdingStub(t)
+	startAPIBridge(t, url, stub, nil)
 	c := gatewayClient(t, url)
 	origin := submit(t, c, "task-steer-q", "long question")
-	waitStarted(t, started)
+	<-in
 	s1 := sendSteer(t, c, origin, "also check the east region")
 	s2 := sendSteer(t, c, origin, "and the west")
 	waitFor(t, 10*time.Second, "two queued notices", func() bool { return len(steerNotices(t, url, origin.TaskID)) == 2 })
@@ -630,11 +619,11 @@ func TestSteer_QueuedThenRefusedAtCancel(t *testing.T) {
 
 func TestSteer_SeventeenthIsRefused(t *testing.T) {
 	_, url := startServer(t)
-	cmd, started, _ := blockingStub(t)
-	startBridge(t, url, cmd)
+	stub, in, _ := holdingStub(t)
+	startAPIBridge(t, url, stub, nil)
 	c := gatewayClient(t, url)
 	origin := submit(t, c, "task-steer-17", "long question")
-	waitStarted(t, started)
+	<-in
 	var last *lib.Envelope
 	for i := 0; i < steerQueueCapacity+1; i++ {
 		last = sendSteer(t, c, origin, fmt.Sprintf("follow-up %d", i+1))
@@ -658,12 +647,11 @@ func TestSteer_SeventeenthIsRefused(t *testing.T) {
 // follow-up with no text is refused no-text.
 func TestSteer_DuplicateAndSubmissionAreNotQueued(t *testing.T) {
 	_, url := startServer(t)
-	cmd, started, _ := blockingStub(t)
-	b, _ := startBridgeConfig(t, Config{NATSURL: url, Command: cmd, KillGrace: 500 * time.Millisecond,
-		Scope: capability.NamespaceScope("")}, nil)
+	stub, in, _ := holdingStub(t)
+	b := startAPIBridge(t, url, stub, nil)
 	c := gatewayClient(t, url)
 	origin := submit(t, c, "task-steer-dup", "long question")
-	waitStarted(t, started)
+	<-in
 	steer := sendSteer(t, c, origin, "once only")
 	waitFor(t, 10*time.Second, "queued", func() bool { return len(steerNotices(t, url, origin.TaskID)) == 1 })
 	b.deliver(testCtx(t), steer)  // the durable redelivering it
@@ -696,12 +684,11 @@ func TestSteer_DuplicateAndSubmissionAreNotQueued(t *testing.T) {
 // words do not promise a turn that will never run.
 func TestSteer_TurnsClosedRefusesTaskEnding(t *testing.T) {
 	_, url := startServer(t)
-	cmd, started, release := blockingStub(t)
-	b, _ := startBridgeConfig(t, Config{NATSURL: url, Command: cmd, KillGrace: 500 * time.Millisecond,
-		Scope: capability.NamespaceScope("")}, nil)
+	stub, in, release := holdingStub(t)
+	b := startAPIBridge(t, url, stub, nil)
 	c := gatewayClient(t, url)
 	origin := submit(t, c, "task-steer-ending", "long question")
-	waitStarted(t, started)
+	<-in
 	run := runOf(b, origin.TaskID)
 	run.mu.Lock()
 	run.turnsClosed = true
@@ -716,9 +703,7 @@ func TestSteer_TurnsClosedRefusesTaskEnding(t *testing.T) {
 	if strings.Contains(n.text, "queued") || !strings.Contains(n.text, "already chosen") {
 		t.Fatalf("task-ending text %q does not say the answer is already chosen", n.text)
 	}
-	if err := os.WriteFile(release, nil, 0o600); err != nil {
-		t.Fatal(err)
-	}
+	release()
 	task := waitTerminal(t, c, origin.TaskID)
 	if task.State != lib.StateCompleted || task.PostFinalDropped != 0 {
 		t.Fatalf("state %s, post-final %d", task.State, task.PostFinalDropped)
@@ -730,7 +715,7 @@ func TestSteer_TurnsClosedRefusesTaskEnding(t *testing.T) {
 
 // A stalled bus holds a follow-up's notice, never run.mu: the notice
 // publishes with mu released, so a handleCancel run beside the stalled
-// delivery still kills the subprocess at once, and no notice lands after the
+// delivery still ends the turn's request at once, and no notice lands after the
 // terminal once the bus is back (ruling: notices outside run.mu, bounded).
 // The test calls handleCancel itself. On the bridge's own consumer, which
 // runs one handler at a time, a cancel that arrives during the stall waits
@@ -741,12 +726,11 @@ func TestSteer_TurnsClosedRefusesTaskEnding(t *testing.T) {
 // queued one landed.
 func TestSteer_StalledNoticeDoesNotHoldRunLock(t *testing.T) {
 	s, url := startServer(t)
-	cmd, started, _ := blockingStub(t)
-	b, _ := startBridgeConfig(t, Config{NATSURL: url, Command: cmd, KillGrace: 500 * time.Millisecond,
-		Scope: capability.NamespaceScope("")}, nil)
+	stub, in, _ := holdingStub(t)
+	b := startAPIBridge(t, url, stub, nil)
 	c := gatewayClient(t, url)
 	origin := submit(t, c, "task-steer-stall", "long question")
-	waitStarted(t, started)
+	<-in
 	run := runOf(b, origin.TaskID)
 
 	steer, err := lib.NewFollowUpEnvelope(origin, gatewayParty,
@@ -827,26 +811,17 @@ func TestSteer_StalledNoticeDoesNotHoldRunLock(t *testing.T) {
 // and stay silent, never land a `working` after the canceled terminal
 // (assertion 10). The bus is down across the gap so finalize holds it open
 // on cue; the look-ahead seam holds the worker until finalize is in it.
+// Follow-ups queue on the API executor only, so that is where the gap is.
 func TestSteer_WorkerInFinalizeGapPublishesNoWorking(t *testing.T) {
-	for _, executor := range []string{ExecutorCLI, ExecutorAPI} {
-		t.Run(executor, func(t *testing.T) { testWorkerInFinalizeGap(t, executor) })
-	}
-}
-
-func testWorkerInFinalizeGap(t *testing.T, executor string) {
 	s, url := startServer(t)
 	marker := filepath.Join(t.TempDir(), "spawned")
-	cfg := Config{NATSURL: url, Command: script(t, fmt.Sprintf("touch %s\necho never", marker)),
+	stub := newAPIStub(t, func(w http.ResponseWriter, _ *http.Request, _ apiCall) {
+		_ = os.WriteFile(marker, nil, 0o600)
+		writeCompletion(w, "sess-gap", "never")
+	})
+	cfg := Config{NATSURL: url, Executor: ExecutorAPI, APIURL: stub.srv.URL + "/v1/chat/completions", APIKey: testAPIKey,
 		Concurrency: 1, TaskDeadline: 20 * time.Second, KillGrace: 500 * time.Millisecond,
 		Scope: capability.NamespaceScope("")}
-	var stub *apiStub
-	if executor == ExecutorAPI {
-		stub = newAPIStub(t, func(w http.ResponseWriter, _ *http.Request, _ apiCall) {
-			_ = os.WriteFile(marker, nil, 0o600)
-			writeCompletion(w, "sess-gap", "never")
-		})
-		cfg.Executor, cfg.APIURL, cfg.APIKey = ExecutorAPI, stub.srv.URL+"/v1/chat/completions", testAPIKey
-	}
 	entered, gate := make(chan struct{}), make(chan struct{})
 	var opened atomic.Bool
 	openGate := func() {
@@ -931,6 +906,56 @@ func testWorkerInFinalizeGap(t *testing.T, executor string) {
 	}
 	if _, err := os.Stat(marker); err == nil {
 		t.Fatal("the worker ran the canceled task")
+	}
+}
+
+// The cli executor cannot continue a session, so a follow-up to one of its
+// tasks is refused no-resume the moment it arrives, while the opening turn
+// still runs, in words that say why and what to do; nothing is queued, the
+// child runs once, and the task's one answer is the result, untouched.
+func TestCLI_FollowUpIsRefusedNoResumeAtOnce(t *testing.T) {
+	_, url := startServer(t)
+	dir := t.TempDir()
+	started, release, runs := filepath.Join(dir, "started"), filepath.Join(dir, "release"), filepath.Join(dir, "runs")
+	startBridge(t, url, script(t, fmt.Sprintf(`echo "$1" >> %s
+touch %s
+while [ ! -f %s ]; do sleep 0.05; done
+echo first-answer
+echo "session_id: sess-1" >&2`, runs, started, release)))
+	c := gatewayClient(t, url)
+	origin := submit(t, c, "task-cli-noresume", "long question")
+	waitStarted(t, started)
+	steer := sendSteer(t, c, origin, "and the west")
+	waitFor(t, 10*time.Second, "the refusal, during the turn", func() bool { return len(steerNotices(t, url, origin.TaskID)) == 1 })
+	n := steerNotices(t, url, origin.TaskID)[0]
+	if n.Steer != lib.SteerRefused || n.Reason != lib.SteerReasonNoResume || n.EnvelopeID != steer.EnvelopeID ||
+		n.state != lib.StateWorking || n.final {
+		t.Fatalf("notice = %+v, want refused no-resume on a non-final working status", n)
+	}
+	if !strings.Contains(n.text, "can't continue a session") || !strings.Contains(n.text, "after the answer") {
+		t.Fatalf("no-resume text %q does not say the executor can't continue a session", n.text)
+	}
+	if task := fold(t, c, origin.TaskID); task.State != lib.StateWorking {
+		t.Fatalf("folded state after the refusal = %s, want still working", task.State)
+	}
+	if err := os.WriteFile(release, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	task := waitTerminal(t, c, origin.TaskID)
+	if task.State != lib.StateCompleted || task.PostFinalDropped != 0 {
+		t.Fatalf("state %s, post-final %d", task.State, task.PostFinalDropped)
+	}
+	if got := artifactsNamed(t, url, origin.TaskID, lib.ArtifactResult); !slices.Equal(got, []string{"first-answer\n"}) {
+		t.Fatalf("result = %q, want the one answer", got)
+	}
+	if got := artifactsNamed(t, url, origin.TaskID, lib.ArtifactTurn); len(got) != 0 {
+		t.Fatalf("turn answers %q, want none", got)
+	}
+	if got := len(steerNotices(t, url, origin.TaskID)); got != 1 {
+		t.Fatalf("%d notices, want the one refusal", got)
+	}
+	if raw, err := os.ReadFile(runs); err != nil || string(raw) != "long question\n" {
+		t.Fatalf("child runs %q (%v), want the opening one only", raw, err)
 	}
 }
 
@@ -2164,7 +2189,7 @@ func TestFailureReason_SessionIDIsTheLastWholeLine(t *testing.T) {
 		{"nothing here\n", ""},
 	}
 	for _, c := range cases {
-		got := failureReason(err, "", c.stderr, 1)
+		got := failureReason(err, "", c.stderr)
 		if c.want == "" {
 			if strings.Contains(got, "session:") {
 				t.Errorf("stderr %q: reason reports a session id: %q", c.stderr, got)
@@ -2243,8 +2268,9 @@ func TestLifecycle_TerminalTaskTrafficIgnored(t *testing.T) {
 }
 
 // Assertion 12 for a QUEUED task: a follow-up arriving while the run waits
-// for a worker slot is queued on a submitted status, not working - a
-// follow-up must not change folded state by itself.
+// for a worker slot is answered on a submitted status, not working - a
+// follow-up must not change folded state by itself. On the cli executor the
+// answer is a no-resume refusal, given at once.
 func TestLifecycle_SteerToQueuedTaskAnswersSubmitted(t *testing.T) {
 	_, url := startServer(t)
 	marker := filepath.Join(t.TempDir(), "started")
@@ -2275,11 +2301,11 @@ echo done`, marker)), 1)
 		t.Fatal(err)
 	}
 
-	waitFor(t, 10*time.Second, "steer queued on queued task", func() bool {
+	waitFor(t, 10*time.Second, "steer answered on queued task", func() bool {
 		for _, n := range steerNotices(t, url, queued.TaskID) {
-			if n.Steer == lib.SteerQueued && n.EnvelopeID == steer.EnvelopeID {
-				if n.state != lib.StateSubmitted || n.final {
-					t.Fatalf("queued notice %+v, want a non-final submitted status for a queued task", n)
+			if n.EnvelopeID == steer.EnvelopeID {
+				if n.Steer != lib.SteerRefused || n.Reason != lib.SteerReasonNoResume || n.state != lib.StateSubmitted || n.final {
+					t.Fatalf("notice %+v, want refused no-resume on a non-final submitted status for a queued task", n)
 				}
 				return true
 			}
@@ -2290,16 +2316,13 @@ echo done`, marker)), 1)
 	if task.State != lib.StateSubmitted {
 		t.Fatalf("folded state after steer = %s, want still submitted", task.State)
 	}
-	// Both tasks still finish clean. The stub prints no session id, so the
-	// queued follow-up cannot run as a resumed turn: it is refused
-	// no-resume, ahead of the terminal.
+	// Both tasks still finish clean, and the refusal was the follow-up's
+	// one notice.
 	if got := waitTerminal(t, c, "task-queued"); got.State != lib.StateCompleted || got.PostFinalDropped != 0 {
 		t.Fatalf("queued task ended %s (post-final %d), want completed", got.State, got.PostFinalDropped)
 	}
-	ns := steerNotices(t, url, queued.TaskID)
-	if len(ns) != 2 || ns[1].Steer != lib.SteerRefused || ns[1].Reason != lib.SteerReasonNoResume ||
-		ns[1].seq > finalSeq(t, url, queued.TaskID) {
-		t.Fatalf("notices %+v, want queued then refused no-resume before the terminal", ns)
+	if ns := steerNotices(t, url, queued.TaskID); len(ns) != 1 {
+		t.Fatalf("notices %+v, want the one refusal", ns)
 	}
 }
 
@@ -2482,28 +2505,16 @@ func TestChunkString_NeverSplitsARune(t *testing.T) {
 	}
 }
 
-// ---- follow-up turns (cli executor) ------------------------------------------
+// ---- the cli executor's argv -------------------------------------------------
 
-func TestResumeArgv(t *testing.T) {
-	got, err := resumeArgv([]string{"hermes", "-p", "platform", "chat", "-Q", "-q"}, "sess-9", "and the west")
-	want := []string{"hermes", "-p", "platform", "chat", "-Q", "--resume", "sess-9", "--query=and the west"}
-	if err != nil || !slices.Equal(got, want) {
-		t.Fatalf("resumeArgv = %q, %v; want %q", got, err, want)
-	}
-	if _, err := resumeArgv([]string{"/stub"}, "sess-9", "x"); err == nil {
-		t.Fatal("a command not ending in -q must be refused: there is nowhere to put --resume")
-	}
-}
-
-// A prompt that is a dash-led token is one --query= token on every turn, so
-// no argv token equals it. That is the property the defect needed broken:
-// Hermes scans its whole argv for exact tokens before argparse runs
-// (hermes_cli/main.py at v2026.9.14: `"--tui" in argv` in _wants_tui_early,
-// which sends a headless run to the TUI's no-TTY bail-out, exit 0 with no
-// answer; `"-h" in argv or "--help" in argv` on the fast chat path), and
-// after a bare -q argparse reads such a token as an option ("expected one
-// argument", exit 2). A command not ending in -q gets the prompt appended
-// unchanged.
+// A prompt that is a dash-led token is one --query= token, so no argv token
+// equals it. That is the property the defect needed broken: Hermes scans its
+// whole argv for exact tokens before argparse runs (hermes_cli/main.py at
+// v2026.9.14: `"--tui" in argv` in _wants_tui_early, which sends a headless
+// run to the TUI's no-TTY bail-out, exit 0 with no answer; `"-h" in argv or
+// "--help" in argv` on the fast chat path), and after a bare -q argparse
+// reads such a token as an option ("expected one argument", exit 2). A
+// command not ending in -q gets the prompt appended unchanged.
 func TestPromptArgvKeepsADashLedPromptTheQuery(t *testing.T) {
 	cmd := []string{"hermes", "-p", "platform", "chat", "-Q", "-q"}
 	for _, prompt := range []string{"--tui", "--help", "-h", "-p", "--force"} {
@@ -2512,16 +2523,10 @@ func TestPromptArgvKeepsADashLedPromptTheQuery(t *testing.T) {
 		if !slices.Equal(got, want) {
 			t.Errorf("promptArgv(%q) = %q, want %q", prompt, got, want)
 		}
-		resumed, err := resumeArgv(cmd, "sess-9", prompt)
-		if want := []string{"hermes", "-p", "platform", "chat", "-Q", "--resume", "sess-9", "--query=" + prompt}; err != nil || !slices.Equal(resumed, want) {
-			t.Errorf("resumeArgv(%q) = %q, %v; want %q", prompt, resumed, err, want)
-		}
 		// The whole-token scans: the prompt must not be a token of its own.
 		// The configured command's own -p is the profile flag, not the prompt.
-		for _, argv := range [][]string{got, resumed} {
-			if slices.Contains(argv[len(cmd)-1:], prompt) {
-				t.Errorf("prompt %q is a bare argv token in %q: Hermes's pre-parse scans would match it", prompt, argv)
-			}
+		if slices.Contains(got[len(cmd)-1:], prompt) {
+			t.Errorf("prompt %q is a bare argv token in %q: Hermes's pre-parse scans would match it", prompt, got)
 		}
 	}
 	if got := promptArgv([]string{"/stub"}, "--force"); !slices.Equal(got, []string{"/stub", "--force"}) {
@@ -2532,61 +2537,15 @@ func TestPromptArgvKeepsADashLedPromptTheQuery(t *testing.T) {
 	}
 }
 
-// NUL bytes leave the prompt before it becomes an argument, on the opening
-// turn and every follow-up: exec refuses an argument that holds one.
+// NUL bytes leave the prompt before it becomes an argument: exec refuses an
+// argument that holds one.
 func TestArgvTextDropsNulBytes(t *testing.T) {
 	cmd := []string{"hermes", "chat", "-Q", "-q"}
 	if got := promptArgv(cmd, "a\x00b\x00"); got[len(got)-1] != "--query=ab" {
 		t.Errorf("promptArgv = %q, want the NUL bytes dropped", got)
 	}
-	if got, _ := resumeArgv(cmd, "sess-9", "\x00c"); got[len(got)-1] != "--query=c" {
-		t.Errorf("resumeArgv = %q, want the NUL bytes dropped", got)
-	}
 	if got := promptArgv([]string{"/stub"}, "d\x00"); got[len(got)-1] != "d" {
 		t.Errorf("promptArgv on a non -q command = %q, want the NUL byte dropped", got)
-	}
-}
-
-func TestLastSessionID(t *testing.T) {
-	if got := lastSessionID("noise\nsession_id: nested-1\nmore\nsession_id: sess-2\n"); got != "sess-2" {
-		t.Fatalf("got %q, want the last line's id", got)
-	}
-	if got := lastSessionID("session_id: 20260925_181506_ab12cd\n\n  \n"); got != "20260925_181506_ab12cd" {
-		t.Fatalf("trailing blank lines: got %q, want the id", got)
-	}
-	if got := lastSessionID("session_id:\n"); got != "" {
-		t.Fatalf("an empty label yields %q, want none", got)
-	}
-}
-
-// The id goes into a child's argv after --resume, so one that could read as
-// an option, or carries anything past the id's shape, is no id: the
-// follow-ups are refused no-resume rather than resuming it.
-func TestLastSessionIDRefusesADashLedOrMalformedID(t *testing.T) {
-	for _, stderr := range []string{
-		"session_id: --yolo\n",
-		"session_id: -sess-1\n",
-		"session_id: sess-1 --yolo\n",
-		"session_id: sess/../other\n",
-		"session_id: " + strings.Repeat("a", 129) + "\n",
-	} {
-		if got := lastSessionID(stderr); got != "" {
-			t.Errorf("stderr %q: got %q, want no id", stderr, got)
-		}
-	}
-}
-
-// Only the last non-blank line is read: an id followed by more output is
-// not taken. A tool's subprocess sharing the stream can still write the last
-// line itself, so this is not what keeps a follow-up out of another
-// conversation's session; the store check is (verifySession,
-// TestCLI_LateSessionIDFromAToolIsNotResumed).
-func TestLastSessionIDIsOnlyTheLastNonBlankLine(t *testing.T) {
-	if got := lastSessionID("session_id: sess-1\n[tool] still talking\n"); got != "" {
-		t.Fatalf("got %q, want none: the id line was not last", got)
-	}
-	if got := lastSessionID("session_id: sess-1\nsession_id: other-conv\n"); got != "other-conv" {
-		t.Fatalf("got %q, want the last line's id", got)
 	}
 }
 
@@ -2596,10 +2555,6 @@ func TestTurnNote(t *testing.T) {
 	}
 	if got := turnNote(3); got != "; turn: 3" {
 		t.Fatalf("turnNote(3) = %q", got)
-	}
-	reason := failureReason(errors.New("exit status 1"), "out", "session_id: s-1\n", 2)
-	if !strings.Contains(reason, "; session: s-1; turn: 2; stdout tail: ") {
-		t.Fatalf("reason %q, want the turn note between the session and the tails", reason)
 	}
 }
 
@@ -2638,570 +2593,8 @@ func artifactsNamed(t *testing.T, url, taskID, name string) []string {
 	return out
 }
 
-// resumeStub: turn 1 blocks until release, then every turn answers with its
-// own prompt (the --query= token's value) and the session id; ARGS records
-// each child's argv. resumeExit is the --resume branch's exit code. Its
-// store holds sess-1 as a "long question" task's opening turn leaves it.
-func resumeStub(t *testing.T, resumeExit int, printSession bool) (cmd []string, started, release, args string) {
-	t.Helper()
-	dir := t.TempDir()
-	started, release, args = filepath.Join(dir, "started"), filepath.Join(dir, "release"), filepath.Join(dir, "args")
-	sess := `echo "session_id: sess-1" >&2`
-	if !printSession {
-		sess = ":"
-	}
-	body := storeArm(t, filepath.Join(dir, "calls"), liveStore("long question")) + fmt.Sprintf(`echo "$*" >> %[3]s
-for last; do :; done
-last=${last#--query=}
-case "$*" in
-*--resume*) echo "answer to $last"; %[4]s; exit %[5]d ;;
-*) touch %[1]s; while [ ! -f %[2]s ]; do sleep 0.05; done; echo "answer to $last"; %[4]s ;;
-esac`, started, release, args, sess, resumeExit)
-	return append(script(t, body), "-q"), started, release, args
-}
-
-// storedSession is one session a stub's store holds, as Hermes's export
-// writes it: its id, its started_at (epoch seconds) and its messages.
-type storedSession struct {
-	prompt    string
-	startedAt time.Time
-}
-
-// storeArm is a stub's session store: the shell branch that answers the
-// bridge's read, `<prefix> sessions export - --session-id <id>`, with the
-// session's one JSON line (an id it does not hold gets Hermes's not-found
-// line), recording each read's argv in calls. It goes first in the stub, so
-// a store read never reaches the stub's turn branches or their argv record.
-func storeArm(t *testing.T, calls string, sessions map[string]storedSession) string {
-	t.Helper()
-	dir := t.TempDir()
-	var arms strings.Builder
-	for id, s := range sessions {
-		line, err := json.Marshal(map[string]any{
-			"id":         id,
-			"source":     "cli",
-			"started_at": float64(s.startedAt.UnixNano()) / 1e9,
-			"messages": []map[string]any{
-				{"id": 1, "session_id": id, "role": "user", "content": s.prompt, "timestamp": float64(s.startedAt.Unix())},
-				{"id": 2, "session_id": id, "role": "assistant", "content": "an answer", "timestamp": float64(s.startedAt.Unix())},
-			},
-		})
-		if err != nil {
-			t.Fatal(err)
-		}
-		path := filepath.Join(dir, id+".jsonl")
-		if err := os.WriteFile(path, append(line, '\n'), 0o600); err != nil {
-			t.Fatal(err)
-		}
-		fmt.Fprintf(&arms, "%s) cat %s ;;\n", id, path)
-	}
-	return fmt.Sprintf(`if [ "$1" = sessions ]; then
-echo "$*" >> %s
-for id; do :; done
-case "$id" in
-%s*) echo "Session '$id' not found." ;;
-esac
-exit 0
-fi
-`, calls, arms.String())
-}
-
-// liveStore is the store a stub's opening turn leaves behind: sess-1, begun
-// after the bridge spawned the turn, opened by prompt.
-func liveStore(prompt string) map[string]storedSession {
-	return map[string]storedSession{"sess-1": {prompt: prompt, startedAt: time.Now().Add(time.Hour)}}
-}
-
-func TestCLI_FollowUpsRunAsResumedTurnsInOrder(t *testing.T) {
-	_, url := startServer(t)
-	cmd, started, release, args := resumeStub(t, 0, true)
-	startBridge(t, url, cmd)
-	c := gatewayClient(t, url)
-	origin := submit(t, c, "task-cli-turns", "long question")
-	waitStarted(t, started)
-	sendSteer(t, c, origin, "also east")
-	sendSteer(t, c, origin, "and west")
-	waitFor(t, 10*time.Second, "two queued", func() bool { return len(steerNotices(t, url, origin.TaskID)) == 2 })
-	if err := os.WriteFile(release, nil, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	task := waitTerminal(t, c, origin.TaskID)
-	if task.State != lib.StateCompleted || task.PostFinalDropped != 0 {
-		t.Fatalf("state %s, post-final %d", task.State, task.PostFinalDropped)
-	}
-	if got := artifactsNamed(t, url, origin.TaskID, lib.ArtifactTurn); !slices.Equal(got, []string{"answer to long question\n", "answer to also east\n"}) {
-		t.Fatalf("turn answers = %q", got)
-	}
-	if got := artifactsNamed(t, url, origin.TaskID, lib.ArtifactResult); !slices.Equal(got, []string{"answer to and west\n"}) {
-		t.Fatalf("result = %q, want the last turn's answer only", got)
-	}
-	raw, _ := os.ReadFile(args)
-	want := "--query=long question\n--resume sess-1 --query=also east\n--resume sess-1 --query=and west\n"
-	if string(raw) != want {
-		t.Fatalf("argv per child:\n%s\nwant:\n%s", raw, want)
-	}
-	for _, n := range steerNotices(t, url, origin.TaskID) {
-		if n.Steer != lib.SteerQueued {
-			t.Fatalf("a follow-up that ran was also refused: %+v", n)
-		}
-	}
-}
-
-func TestCLI_ResumeFailureFailsTheTaskAfterTheFirstAnswer(t *testing.T) {
-	_, url := startServer(t)
-	cmd, started, release, _ := resumeStub(t, 1, true)
-	startBridge(t, url, cmd)
-	c := gatewayClient(t, url)
-	origin := submit(t, c, "task-cli-resume-fail", "long question")
-	waitStarted(t, started)
-	sendSteer(t, c, origin, "also east")
-	sendSteer(t, c, origin, "and west")
-	waitFor(t, 10*time.Second, "two queued", func() bool { return len(steerNotices(t, url, origin.TaskID)) == 2 })
-	_ = os.WriteFile(release, nil, 0o600)
-	task := waitTerminal(t, c, origin.TaskID)
-	reason := terminalReason(t, task)
-	if task.State != lib.StateFailed || !strings.Contains(reason, "reason: hermes-exited-nonzero") || !strings.Contains(reason, "; turn: 2") {
-		t.Fatalf("state %s reason %q", task.State, reason)
-	}
-	if got := artifactsNamed(t, url, origin.TaskID, lib.ArtifactTurn); len(got) != 1 {
-		t.Fatalf("turn 1's answer must have gone out before turn 2 ran: %q", got)
-	}
-	ns := steerNotices(t, url, origin.TaskID)
-	if last := ns[len(ns)-1]; last.Steer != lib.SteerRefused || last.Reason != lib.SteerReasonTaskEnded {
-		t.Fatalf("the unrun follow-up: %+v, want refused task-ended", last)
-	}
-	if len(ns) != 3 || ns[len(ns)-1].seq > finalSeq(t, url, origin.TaskID) {
-		t.Fatalf("notices %+v, want two queued and one refusal, all before the terminal", ns)
-	}
-}
-
-func TestCLI_NoSessionIDRefusesFollowUpsAndCompletes(t *testing.T) {
-	_, url := startServer(t)
-	cmd, started, release, args := resumeStub(t, 0, false)
-	startBridge(t, url, cmd)
-	c := gatewayClient(t, url)
-	origin := submit(t, c, "task-cli-nosess", "long question")
-	waitStarted(t, started)
-	sendSteer(t, c, origin, "also east")
-	waitFor(t, 10*time.Second, "queued", func() bool { return len(steerNotices(t, url, origin.TaskID)) == 1 })
-	_ = os.WriteFile(release, nil, 0o600)
-	task := waitTerminal(t, c, origin.TaskID)
-	if task.State != lib.StateCompleted {
-		t.Fatalf("state %s", task.State)
-	}
-	ns := steerNotices(t, url, origin.TaskID)
-	if len(ns) != 2 || ns[1].Steer != lib.SteerRefused || ns[1].Reason != lib.SteerReasonNoResume {
-		t.Fatalf("notices = %+v, want queued then refused no-resume", ns)
-	}
-	if raw, _ := os.ReadFile(args); strings.Count(string(raw), "\n") != 1 {
-		t.Fatalf("a follow-up ran with no session to resume: %s", raw)
-	}
-	if got := artifactsNamed(t, url, origin.TaskID, lib.ArtifactResult); !slices.Equal(got, []string{"answer to long question\n"}) {
-		t.Fatalf("result = %q, want turn 1's answer", got)
-	}
-}
-
-// A tool subprocess shares the CLI's stderr, so a line it writes after the
-// CLI's own (here a backgrounded write that lands once the CLI has exited)
-// can name another conversation's session. That id is checked against the
-// profile's session store before anything resumes it: other-conv began
-// before this turn and was opened by another prompt, so the follow-up is
-// refused no-resume and no child is pointed at it.
-func TestCLI_LateSessionIDFromAToolIsNotResumed(t *testing.T) {
-	_, url := startServer(t)
-	dir := t.TempDir()
-	started, release, args, calls := filepath.Join(dir, "started"), filepath.Join(dir, "release"),
-		filepath.Join(dir, "args"), filepath.Join(dir, "calls")
-	store := liveStore("long question")
-	store["other-conv"] = storedSession{prompt: "someone else's question", startedAt: time.Now().Add(-time.Hour)}
-	cmd := append(script(t, storeArm(t, calls, store)+fmt.Sprintf(`echo "$*" >> %[3]s
-case "$*" in
-*--resume*) echo "resumed"; echo "session_id: sess-1" >&2 ;;
-*) touch %[1]s; while [ ! -f %[2]s ]; do sleep 0.05; done; echo "answer"
-echo "session_id: sess-1" >&2
-(sleep 0.3; echo "session_id: other-conv" >&2) & ;;
-esac`, started, release, args)), "-q")
-	startBridge(t, url, cmd)
-	c := gatewayClient(t, url)
-	origin := submit(t, c, "task-cli-late-id", "long question")
-	waitStarted(t, started)
-	sendSteer(t, c, origin, "also east")
-	waitFor(t, 10*time.Second, "queued", func() bool { return len(steerNotices(t, url, origin.TaskID)) == 1 })
-	_ = os.WriteFile(release, nil, 0o600)
-	task := waitTerminal(t, c, origin.TaskID)
-	if task.State != lib.StateCompleted {
-		t.Fatalf("state %s reason %q", task.State, terminalReason(t, task))
-	}
-	raw, _ := os.ReadFile(args)
-	if strings.Contains(string(raw), "--resume") {
-		t.Fatalf("a follow-up resumed a session the store did not vouch for:\n%s", raw)
-	}
-	ns := steerNotices(t, url, origin.TaskID)
-	if len(ns) != 2 || ns[1].Steer != lib.SteerRefused || ns[1].Reason != lib.SteerReasonNoResume {
-		t.Fatalf("notices = %+v, want queued then refused no-resume", ns)
-	}
-	if got := artifactsNamed(t, url, origin.TaskID, lib.ArtifactResult); !slices.Equal(got, []string{"answer\n"}) {
-		t.Fatalf("result = %q, want turn 1's answer", got)
-	}
-}
-
-// The store vouches once, before the first follow-up, and that id is the
-// one every later follow-up resumes: turn 2's stderr naming another session
-// (a tool's line again) is logged and not used, and the store is not asked
-// again.
-func TestCLI_FollowUpsResumeTheVerifiedSessionOnly(t *testing.T) {
-	_, url := startServer(t)
-	dir := t.TempDir()
-	started, release, args, calls := filepath.Join(dir, "started"), filepath.Join(dir, "release"),
-		filepath.Join(dir, "args"), filepath.Join(dir, "calls")
-	store := liveStore("long question")
-	store["other-conv"] = storedSession{prompt: "long question", startedAt: time.Now().Add(time.Hour)}
-	cmd := append(script(t, storeArm(t, calls, store)+fmt.Sprintf(`echo "$*" >> %[3]s
-for last; do :; done
-last=${last#--query=}
-case "$*" in
-*"--query=also east"*) echo "answer to $last"; echo "session_id: other-conv" >&2 ;;
-*--resume*) echo "answer to $last" ;;
-*) touch %[1]s; while [ ! -f %[2]s ]; do sleep 0.05; done; echo "answer to $last"; echo "session_id: sess-1" >&2 ;;
-esac`, started, release, args)), "-q")
-	startBridge(t, url, cmd)
-	c := gatewayClient(t, url)
-	origin := submit(t, c, "task-cli-verified-only", "long question")
-	waitStarted(t, started)
-	sendSteer(t, c, origin, "also east")
-	sendSteer(t, c, origin, "and west")
-	sendSteer(t, c, origin, "and north")
-	waitFor(t, 10*time.Second, "three queued", func() bool { return len(steerNotices(t, url, origin.TaskID)) == 3 })
-	_ = os.WriteFile(release, nil, 0o600)
-	task := waitTerminal(t, c, origin.TaskID)
-	if task.State != lib.StateCompleted {
-		t.Fatalf("state %s reason %q", task.State, terminalReason(t, task))
-	}
-	raw, _ := os.ReadFile(args)
-	want := "--query=long question\n--resume sess-1 --query=also east\n--resume sess-1 --query=and west\n--resume sess-1 --query=and north\n"
-	if string(raw) != want {
-		t.Fatalf("argv per child:\n%s\nwant:\n%s", raw, want)
-	}
-	if got, _ := os.ReadFile(calls); string(got) != "sessions export - --session-id sess-1\n" {
-		t.Fatalf("store reads:\n%s\nwant the one read of sess-1, before the first follow-up", got)
-	}
-}
-
-// Whatever keeps the store from vouching for the id - it does not hold the
-// session, the session began before this task's opening turn, its first
-// message is another prompt, the read fails or outlives its budget - refuses
-// the follow-ups no-resume, as an id that cannot be parsed does, and the
-// opening turn's answer is the result.
-func TestCLI_UnverifiedSessionRefusesFollowUpsNoResume(t *testing.T) {
-	prev := sessionStoreBudget
-	sessionStoreBudget = 500 * time.Millisecond
-	t.Cleanup(func() { sessionStoreBudget = prev })
-	cases := []struct {
-		name  string
-		store string // the stub's store branch
-	}{
-		{"not-held", storeArm(t, filepath.Join(t.TempDir(), "calls"), nil)},
-		{"began-before", storeArm(t, filepath.Join(t.TempDir(), "calls"),
-			map[string]storedSession{"sess-1": {prompt: "long question", startedAt: time.Now().Add(-time.Hour)}})},
-		{"other-prompt", storeArm(t, filepath.Join(t.TempDir(), "calls"), liveStore("another question"))},
-		{"read-fails", "if [ \"$1\" = sessions ]; then echo 'Error: Could not open session database' >&2; exit 1; fi\n"},
-		{"read-times-out", "if [ \"$1\" = sessions ]; then exec sleep 30; fi\n"},
-		{"read-prints-junk", "if [ \"$1\" = sessions ]; then echo '{\"id\": \"sess-1\"'; exit 0; fi\n"},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			_, url := startServer(t)
-			dir := t.TempDir()
-			started, release, args := filepath.Join(dir, "started"), filepath.Join(dir, "release"), filepath.Join(dir, "args")
-			cmd := append(script(t, tc.store+fmt.Sprintf(`echo "$*" >> %[3]s
-case "$*" in
-*--resume*) echo "resumed" ;;
-*) touch %[1]s; while [ ! -f %[2]s ]; do sleep 0.05; done; echo "answer"; echo "session_id: sess-1" >&2 ;;
-esac`, started, release, args)), "-q")
-			startBridge(t, url, cmd)
-			c := gatewayClient(t, url)
-			origin := submit(t, c, "task-cli-unverified-"+tc.name, "long question")
-			waitStarted(t, started)
-			sendSteer(t, c, origin, "also east")
-			waitFor(t, 10*time.Second, "queued", func() bool { return len(steerNotices(t, url, origin.TaskID)) == 1 })
-			_ = os.WriteFile(release, nil, 0o600)
-			task := waitTerminal(t, c, origin.TaskID)
-			if task.State != lib.StateCompleted {
-				t.Fatalf("state %s reason %q", task.State, terminalReason(t, task))
-			}
-			if raw, _ := os.ReadFile(args); string(raw) != "--query=long question\n" {
-				t.Fatalf("argv per child:\n%s\nwant the opening turn only", raw)
-			}
-			ns := steerNotices(t, url, origin.TaskID)
-			if len(ns) != 2 || ns[1].Steer != lib.SteerRefused || ns[1].Reason != lib.SteerReasonNoResume {
-				t.Fatalf("notices = %+v, want queued then refused no-resume", ns)
-			}
-			if got := artifactsNamed(t, url, origin.TaskID, lib.ArtifactResult); !slices.Equal(got, []string{"answer\n"}) {
-				t.Fatalf("result = %q, want turn 1's answer", got)
-			}
-		})
-	}
-}
-
-func TestStoreArgv(t *testing.T) {
-	for _, tc := range []struct {
-		command []string
-		want    string
-	}{
-		{[]string{"hermes", "-p", "platform", "chat", "-Q", "-q"}, "hermes -p platform sessions export - --session-id s-1"},
-		{[]string{"hermes", "-p", "chat", "chat", "-Q", "-q"}, "hermes -p chat sessions export - --session-id s-1"},
-		{[]string{"/stub", "-q"}, "/stub sessions export - --session-id s-1"},
-	} {
-		got, err := storeArgv(tc.command, "s-1")
-		if err != nil || strings.Join(got, " ") != tc.want {
-			t.Errorf("storeArgv(%q) = %q, %v; want %q", tc.command, got, err, tc.want)
-		}
-	}
-	for _, command := range [][]string{nil, {"-q"}, {"chat"}, {"/stub", "run"}} {
-		if got, err := storeArgv(command, "s-1"); err == nil {
-			t.Errorf("storeArgv(%q) = %q, want an error", command, got)
-		}
-	}
-}
-
-func TestCheckSessionExport(t *testing.T) {
-	spawned := time.Unix(1_760_000_000, 500_000_000)
-	ok := `{"id": "s-1", "started_at": 1760000000.6, "messages": [{"role": "assistant", "content": "x"}, {"role": "user", "content": "the prompt"}, {"role": "user", "content": "later"}]}` + "\n"
-	if err := checkSessionExport([]byte(ok), "s-1", "the prompt", spawned); err != nil {
-		t.Fatalf("a matching export: %v", err)
-	}
-	for name, raw := range map[string]string{
-		"not found":     "Session 's-1' not found.\n",
-		"other id":      `{"id": "s-10", "started_at": 1760000000.6, "messages": [{"role": "user", "content": "the prompt"}]}`,
-		"no started_at": `{"id": "s-1", "messages": [{"role": "user", "content": "the prompt"}]}`,
-		"began before":  `{"id": "s-1", "started_at": 1760000000.4, "messages": [{"role": "user", "content": "the prompt"}]}`,
-		"other prompt":  `{"id": "s-1", "started_at": 1760000000.6, "messages": [{"role": "user", "content": "later"}, {"role": "user", "content": "the prompt"}]}`,
-		"not text":      `{"id": "s-1", "started_at": 1760000000.6, "messages": [{"role": "user", "content": [{"type": "text", "text": "the prompt"}]}]}`,
-		"no user":       `{"id": "s-1", "started_at": 1760000000.6, "messages": []}`,
-		"two sessions":  ok + ok,
-	} {
-		if err := checkSessionExport([]byte(raw), "s-1", "the prompt", spawned); err == nil {
-			t.Errorf("%s: verified", name)
-		}
-	}
-}
-
-func TestCLI_CancelDuringAFollowUpTurn(t *testing.T) {
-	_, url := startServer(t)
-	dir := t.TempDir()
-	turn1, turn2 := filepath.Join(dir, "turn1"), filepath.Join(dir, "turn2")
-	cmd := append(script(t, storeArm(t, filepath.Join(dir, "calls"), liveStore("q"))+fmt.Sprintf(`case "$*" in
-*--resume*) touch %s; sleep 30 ;;
-*) touch %s; echo first; echo "session_id: sess-1" >&2; sleep 1 ;;
-esac`, turn2, turn1)), "-q")
-	startBridge(t, url, cmd)
-	c := gatewayClient(t, url)
-	origin := submit(t, c, "task-cli-cancel2", "q")
-	waitStarted(t, turn1) // turn 1 is sleeping its 1s
-	sendSteer(t, c, origin, "second")
-	sendSteer(t, c, origin, "third")
-	waitFor(t, 10*time.Second, "turn 2 running", func() bool { _, err := os.Stat(turn2); return err == nil })
-	publishCancel(t, c, origin)
-	task := waitTerminal(t, c, origin.TaskID)
-	if task.State != lib.StateCanceled || terminalReason(t, task) != "reason: canceled-by-request" {
-		t.Fatalf("state %s reason %q", task.State, terminalReason(t, task))
-	}
-	ns := steerNotices(t, url, origin.TaskID)
-	if last := ns[len(ns)-1]; last.Reason != lib.SteerReasonTaskEnded {
-		t.Fatalf("the third follow-up: %+v, want refused task-ended", last)
-	}
-}
-
-// The task deadline firing while a follow-up's child runs kills that child
-// (the one timer spans every turn and finds run.proc set to turn 2's child),
-// names turn 2 in the terminal, and refuses the follow-up still queued.
-func TestCLI_DeadlineDuringAFollowUpTurn(t *testing.T) {
-	_, url := startServer(t)
-	dir := t.TempDir()
-	turn1, release, turn2, pidFile := filepath.Join(dir, "turn1"), filepath.Join(dir, "release"),
-		filepath.Join(dir, "turn2"), filepath.Join(dir, "pid2")
-	cmd := append(script(t, storeArm(t, filepath.Join(dir, "calls"), liveStore("q"))+fmt.Sprintf(`case "$*" in
-*--resume*) echo $$ > %[3]s; touch %[4]s; exec sleep 30 ;;
-*) touch %[1]s; while [ ! -f %[2]s ]; do sleep 0.05; done; echo first; echo "session_id: sess-1" >&2 ;;
-esac`, turn1, release, pidFile, turn2)), "-q")
-	startBridgeConfig(t, Config{NATSURL: url, Command: cmd, TaskDeadline: 4 * time.Second,
-		KillGrace: 300 * time.Millisecond, Scope: capability.NamespaceScope("")}, nil)
-	c := gatewayClient(t, url)
-	origin := submit(t, c, "task-cli-deadline2", "q")
-	waitStarted(t, turn1)
-	sendSteer(t, c, origin, "second")
-	third := sendSteer(t, c, origin, "third")
-	waitFor(t, 10*time.Second, "two queued", func() bool { return len(steerNotices(t, url, origin.TaskID)) == 2 })
-	if err := os.WriteFile(release, nil, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	waitFor(t, 10*time.Second, "turn 2 running", func() bool { _, err := os.Stat(turn2); return err == nil })
-	task := waitTerminal(t, c, origin.TaskID)
-	reason := terminalReason(t, task)
-	if task.State != lib.StateFailed || reason != "reason: deadline-exceeded - killed after 4s; turn: 2" {
-		t.Fatalf("state %s reason %q, want failed deadline-exceeded naming turn 2", task.State, reason)
-	}
-	raw, err := os.ReadFile(pidFile)
-	if err != nil {
-		t.Fatal(err)
-	}
-	pid, err := strconv.Atoi(strings.TrimSpace(string(raw)))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := syscall.Kill(pid, 0); !errors.Is(err, syscall.ESRCH) {
-		t.Fatalf("turn 2's child %d outlived the deadline: kill -0 = %v", pid, err)
-	}
-	if got := artifactsNamed(t, url, origin.TaskID, lib.ArtifactTurn); !slices.Equal(got, []string{"first\n"}) {
-		t.Fatalf("turn answers = %q, want turn 1's", got)
-	}
-	ns := steerNotices(t, url, origin.TaskID)
-	if len(ns) != 3 || ns[2].EnvelopeID != third.EnvelopeID || ns[2].Reason != lib.SteerReasonTaskEnded ||
-		ns[2].seq > finalSeq(t, url, origin.TaskID) {
-		t.Fatalf("notices %+v, want the third refused task-ended before the terminal", ns)
-	}
-}
-
-// A NUL byte cannot ride in an argv string (exec refuses it), so the prompt
-// text loses it before it becomes the --query= token: a follow-up carrying
-// one runs as its turn rather than failing the task as spawn-failed.
-func TestCLI_FollowUpWithANulByteRunsAsATurn(t *testing.T) {
-	_, url := startServer(t)
-	cmd, started, release, args := resumeStub(t, 0, true)
-	startBridge(t, url, cmd)
-	c := gatewayClient(t, url)
-	origin := submit(t, c, "task-cli-nul", "long question")
-	waitStarted(t, started)
-	sendSteer(t, c, origin, "also\x00 east")
-	waitFor(t, 10*time.Second, "queued", func() bool { return len(steerNotices(t, url, origin.TaskID)) == 1 })
-	_ = os.WriteFile(release, nil, 0o600)
-	task := waitTerminal(t, c, origin.TaskID)
-	if task.State != lib.StateCompleted {
-		t.Fatalf("state %s reason %q", task.State, terminalReason(t, task))
-	}
-	raw, _ := os.ReadFile(args)
-	if want := "--query=long question\n--resume sess-1 --query=also east\n"; string(raw) != want {
-		t.Fatalf("argv per child:\n%q\nwant:\n%q", raw, want)
-	}
-	if got := artifactsNamed(t, url, origin.TaskID, lib.ArtifactResult); !slices.Equal(got, []string{"answer to also east\n"}) {
-		t.Fatalf("result = %q", got)
-	}
-}
-
-// steerQueueCapacity bounds the follow-ups a task runs in total, not the
-// ones waiting at one moment: a thread that sends one follow-up per turn,
-// each taken off the queue as its turn starts, still stops at the cap, and
-// the next is refused queue-full.
-func TestCLI_FollowUpsStopAtTheTaskCap(t *testing.T) {
-	_, url := startServer(t)
-	dir := t.TempDir()
-	args := filepath.Join(dir, "args")
-	cmd := append(script(t, storeArm(t, filepath.Join(dir, "calls"), liveStore("q"))+fmt.Sprintf(`echo "$*" >> %[1]s
-n=$(wc -l < %[1]s | tr -d ' ')
-touch %[2]s/started-$n
-while [ ! -f %[2]s/release-$n ]; do sleep 0.02; done
-echo "answer $n"
-echo "session_id: sess-1" >&2`, args, dir)), "-q")
-	startBridge(t, url, cmd)
-	c := gatewayClient(t, url)
-	origin := submit(t, c, "task-cli-cap", "q")
-	for turn := 1; turn <= steerQueueCapacity+1; turn++ {
-		waitStarted(t, filepath.Join(dir, fmt.Sprintf("started-%d", turn)))
-		steer := sendSteer(t, c, origin, fmt.Sprintf("follow-up %d", turn))
-		waitFor(t, 10*time.Second, fmt.Sprintf("notice %d", turn), func() bool { return len(steerNotices(t, url, origin.TaskID)) == turn })
-		n := steerNotices(t, url, origin.TaskID)[turn-1]
-		want := lib.SteerNotice{Steer: lib.SteerQueued, EnvelopeID: steer.EnvelopeID}
-		if turn > steerQueueCapacity {
-			want = lib.SteerNotice{Steer: lib.SteerRefused, EnvelopeID: steer.EnvelopeID, Reason: lib.SteerReasonQueueFull}
-		}
-		if n.SteerNotice != want {
-			t.Fatalf("follow-up %d (none waiting, %d taken): notice %+v, want %+v", turn, turn-1, n.SteerNotice, want)
-		}
-		if err := os.WriteFile(filepath.Join(dir, fmt.Sprintf("release-%d", turn)), nil, 0o600); err != nil {
-			t.Fatal(err)
-		}
-	}
-	task := waitTerminal(t, c, origin.TaskID)
-	if task.State != lib.StateCompleted {
-		t.Fatalf("state %s reason %q", task.State, terminalReason(t, task))
-	}
-	raw, _ := os.ReadFile(args)
-	if got := strings.Count(string(raw), "\n"); got != steerQueueCapacity+1 {
-		t.Fatalf("%d turns ran, want the opening turn plus %d follow-ups", got, steerQueueCapacity)
-	}
-}
-
-// Once the worker has closed the queue (no follow-up to run), a follow-up is
-// refused task-ending, before the terminal.
-func TestCLI_FollowUpAfterTheQueueClosesIsRefused(t *testing.T) {
-	_, url := startServer(t)
-	cmd, started, release, args := resumeStub(t, 0, true)
-	b, _ := startBridgeConfig(t, Config{NATSURL: url, Command: cmd, KillGrace: 500 * time.Millisecond,
-		Scope: capability.NamespaceScope("")}, nil)
-	c := gatewayClient(t, url)
-	origin := submit(t, c, "task-cli-closed", "long question")
-	waitStarted(t, started)
-	run := runOf(b, origin.TaskID)
-	if s := b.nextSteer(run); s != nil { // the worker's decision, taken early
-		t.Fatalf("nextSteer = %v on an empty queue", s)
-	}
-	late := sendSteer(t, c, origin, "too late")
-	waitFor(t, 10*time.Second, "refusal", func() bool { return len(steerNotices(t, url, origin.TaskID)) == 1 })
-	if n := steerNotices(t, url, origin.TaskID)[0]; n.Reason != lib.SteerReasonTaskEnding || n.EnvelopeID != late.EnvelopeID {
-		t.Fatalf("notice = %+v, want refused task-ending", n)
-	}
-	_ = os.WriteFile(release, nil, 0o600)
-	task := waitTerminal(t, c, origin.TaskID)
-	if task.State != lib.StateCompleted || task.PostFinalDropped != 0 {
-		t.Fatalf("state %s post-final %d", task.State, task.PostFinalDropped)
-	}
-	if raw, _ := os.ReadFile(args); strings.Count(string(raw), "\n") != 1 {
-		t.Fatalf("the refused follow-up ran: %s", raw)
-	}
-}
-
-// A follow-up whose capability (the task's, carried on the steer) does not
-// pass is refused capability when its turn comes and skipped; the next one
-// runs.
-func TestCLI_FollowUpWithoutAuthorityIsRefusedAndSkipped(t *testing.T) {
-	_, url := startServer(t)
-	cmd, started, release, args := resumeStub(t, 0, true)
-	startBridge(t, url, cmd)
-	c := gatewayClient(t, url)
-	origin := submit(t, c, "task-cli-capability", "long question")
-	waitStarted(t, started)
-	bare, err := lib.NewFollowUpEnvelope(origin, gatewayParty,
-		messagePayload(t, origin.TaskID, origin.ContextID, "no authority"),
-		lib.WithTo(lib.Party{Session: "platform"}))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := c.Publish(testCtx(t), lib.TaskInSubject("platform", origin.TaskID), bare); err != nil {
-		t.Fatal(err)
-	}
-	waitFor(t, 10*time.Second, "bare queued", func() bool { return len(steerNotices(t, url, origin.TaskID)) == 1 })
-	sendSteer(t, c, origin, "and west")
-	waitFor(t, 10*time.Second, "two queued", func() bool { return len(steerNotices(t, url, origin.TaskID)) == 2 })
-	_ = os.WriteFile(release, nil, 0o600)
-	task := waitTerminal(t, c, origin.TaskID)
-	if task.State != lib.StateCompleted || task.PostFinalDropped != 0 {
-		t.Fatalf("state %s post-final %d", task.State, task.PostFinalDropped)
-	}
-	ns := steerNotices(t, url, origin.TaskID)
-	if len(ns) != 3 || ns[2].Reason != lib.SteerReasonCapability || ns[2].EnvelopeID != bare.EnvelopeID || ns[2].state != lib.StateWorking {
-		t.Fatalf("notices %+v, want the bare follow-up refused capability on a working status", ns)
-	}
-	raw, _ := os.ReadFile(args)
-	if want := "--query=long question\n--resume sess-1 --query=and west\n"; string(raw) != want {
-		t.Fatalf("argv per child:\n%s\nwant:\n%s", raw, want)
-	}
-	if got := artifactsNamed(t, url, origin.TaskID, lib.ArtifactResult); !slices.Equal(got, []string{"answer to and west\n"}) {
-		t.Fatalf("result = %q", got)
-	}
-}
-
 // idleRun is a running taskRun the bridge holds and no worker drives, with
-// one follow-up queued, for driving cliTurn by hand.
+// one follow-up queued, for driving a turn by hand.
 func idleRun(t *testing.T, b *Bridge, taskID string) (*taskRun, *lib.Envelope) {
 	t.Helper()
 	origin, err := lib.NewMessageEnvelope(gatewayParty, taskID, "ctx-"+taskID, "corr-"+taskID,
@@ -3223,138 +2616,4 @@ func idleRun(t *testing.T, b *Bridge, taskID string) (*taskRun, *lib.Envelope) {
 	b.tasks[taskID] = run
 	b.mu.Unlock()
 	return run, steer
-}
-
-// finalText is a terminal's state and first text part, for a failure message.
-func finalText(final *lib.StatusUpdate) string {
-	if final == nil {
-		return "<none>"
-	}
-	if final.Status.Message == nil || len(final.Status.Message.Parts) == 0 {
-		return string(final.Status.State)
-	}
-	return fmt.Sprintf("%s %q", final.Status.State, final.Status.Message.Parts[0].Text)
-}
-
-// notStartedDeadline is the terminal of a task whose deadline was found
-// before a turn's spawn, at the 20s TaskDeadline those tests run with.
-const notStartedDeadline = "reason: deadline-exceeded - reached after 20s before the next turn started; no child was running"
-
-// Ruling: a follow-up turn never spawns once the task is canceled, past its
-// deadline (fired or not yet fired), or finalized; the follow-up it would
-// have run is refused task-ended exactly once, before the terminal.
-func TestCLI_FollowUpTurnDoesNotSpawnAfterTheTaskStops(t *testing.T) {
-	_, url := startServer(t)
-	marker := filepath.Join(t.TempDir(), "spawned")
-	b, _ := startBridgeConfig(t, Config{NATSURL: url, Command: []string{"/bin/true", "-q"},
-		TaskDeadline: 20 * time.Second, KillGrace: 500 * time.Millisecond, Scope: capability.NamespaceScope("")}, nil)
-	argv := script(t, "touch "+marker)
-	future := time.Now().Add(time.Hour)
-	cases := []struct {
-		name       string
-		prepare    func(run *taskRun)
-		deadlineAt time.Time
-		state      lib.TaskState
-		reason     string
-	}{
-		{"canceled", func(run *taskRun) { run.canceled.Store(true) }, future, lib.StateCanceled, "reason: canceled-by-request"},
-		// No child was running, so none was killed: the reason says so.
-		{"deadline-fired", func(run *taskRun) { run.deadlineHit.Store(true) }, future, lib.StateFailed, notStartedDeadline},
-		{"deadline-passed", func(*taskRun) {}, time.Now().Add(-time.Second), lib.StateFailed, notStartedDeadline},
-		{"finalized", func(run *taskRun) { b.finalize(run, lib.StateFailed, shutdownReason, nil) }, future, lib.StateFailed, shutdownReason},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			taskID := "task-cli-nospawn-" + tc.name
-			run, steer := idleRun(t, b, taskID)
-			if got := b.nextSteer(run); got != steer { // the worker's pick, as runnableSteer makes it
-				t.Fatalf("nextSteer = %v, want the queued follow-up", got)
-			}
-			tc.prepare(run)
-			if _, _, _, spawned := b.cliTurn(run, argv, nil, nil, steer, tc.deadlineAt); spawned {
-				t.Fatal("a follow-up turn spawned after the task stopped")
-			}
-			if _, err := os.Stat(marker); err == nil {
-				t.Fatal("the follow-up's child ran")
-			}
-			var final *lib.StatusUpdate
-			for _, env := range replayEvents(t, url, taskID) {
-				if lib.IsFinalStatus(env) {
-					final = &lib.StatusUpdate{}
-					_ = json.Unmarshal(env.Payload, final)
-				}
-			}
-			if final == nil || final.Status.State != tc.state || final.Status.Message == nil ||
-				!strings.HasPrefix(final.Status.Message.Parts[0].Text, tc.reason) {
-				t.Fatalf("terminal %s, want %s %q", finalText(final), tc.state, tc.reason)
-			}
-			ns := steerNotices(t, url, taskID)
-			if len(ns) != 1 || ns[0].EnvelopeID != steer.EnvelopeID || ns[0].Reason != lib.SteerReasonTaskEnded ||
-				ns[0].seq > finalSeq(t, url, taskID) {
-				t.Fatalf("notices %+v, want the follow-up refused task-ended once, before the terminal", ns)
-			}
-		})
-	}
-	// Control: with nothing stopping it, the same call spawns and the
-	// follow-up leaves the queue as its turn starts.
-	run, steer := idleRun(t, b, "task-cli-nospawn-control")
-	if _, _, err, spawned := b.cliTurn(run, argv, nil, nil, steer, future); !spawned || err != nil {
-		t.Fatalf("control: spawned %v err %v", spawned, err)
-	}
-	if _, err := os.Stat(marker); err != nil {
-		t.Fatal("control: the child did not run")
-	}
-	run.mu.Lock()
-	left := len(run.steers)
-	run.mu.Unlock()
-	if left != 0 {
-		t.Fatalf("control: %d follow-ups still queued after the turn started", left)
-	}
-	b.finalize(run, lib.StateCompleted, "", nil)
-}
-
-// Ruling: the first turn checks the deadline before it spawns, as a
-// follow-up's does. Its timer is armed before turn 1's spawn, so one that
-// fires first finds no child to kill; a child spawned after it would run
-// with nothing left to stop it.
-func TestCLI_FirstTurnDoesNotSpawnPastTheDeadline(t *testing.T) {
-	_, url := startServer(t)
-	marker := filepath.Join(t.TempDir(), "spawned")
-	b, _ := startBridgeConfig(t, Config{NATSURL: url, Command: []string{"/bin/true", "-q"},
-		TaskDeadline: 20 * time.Second, KillGrace: 500 * time.Millisecond, Scope: capability.NamespaceScope("")}, nil)
-	argv := script(t, "touch "+marker)
-	future := time.Now().Add(time.Hour)
-	cases := []struct {
-		name       string
-		prepare    func(run *taskRun)
-		deadlineAt time.Time
-	}{
-		{"deadline-fired", func(run *taskRun) { run.deadlineHit.Store(true) }, future},
-		{"deadline-passed", func(*taskRun) {}, time.Now().Add(-time.Second)},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			taskID := "task-cli-first-nospawn-" + tc.name
-			run, _ := idleRun(t, b, taskID)
-			run.steers = nil // turn 1: nothing queued yet
-			tc.prepare(run)
-			if _, _, _, spawned := b.cliTurn(run, argv, nil, newActivityState(false), nil, tc.deadlineAt); spawned {
-				t.Fatal("the first turn spawned past the deadline")
-			}
-			if _, err := os.Stat(marker); err == nil {
-				t.Fatal("the first turn's child ran")
-			}
-			var final *lib.StatusUpdate
-			for _, env := range replayEvents(t, url, taskID) {
-				if lib.IsFinalStatus(env) {
-					final = &lib.StatusUpdate{}
-					_ = json.Unmarshal(env.Payload, final)
-				}
-			}
-			if final == nil || final.Status.State != lib.StateFailed || final.Status.Message == nil ||
-				final.Status.Message.Parts[0].Text != notStartedDeadline {
-				t.Fatalf("terminal %s, want failed %q", finalText(final), notStartedDeadline)
-			}
-		})
-	}
 }
