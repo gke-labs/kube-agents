@@ -77,11 +77,13 @@ The stage fires when the scan has settled. The hand-off records the ranking card
 sweep in `.bootstrap_handoff_filed`; when that card is `done`, `failed`, `cancelled` or `archived`
 (the statuses the hand-off itself counts as settled, less `blocked` and `triage`), the stage fires.
 When the record says no cluster was audited (`task_id=none`), the hand-off has written the report
-itself and the stage fires at once. Before the hand-off has recorded anything, every card under the
-ranking key (or the suffixed key of a re-run by hand) filed after the sweep card counts instead. A
-card a person may still unblock waits for the fallback below. The marker files are read with the
-hand-off's own parser and the card status from the board's SQLite file in the agent pod; neither
-costs a call into the sandbox.
+itself and the stage fires at once. Only the recorded card counts: a card under the ranking key that
+the hand-off did not file is one it archives as stale, so before the hand-off has recorded anything
+the stage waits for the fallback. A card a person may still unblock waits for the fallback too. The
+scan marker is read with the hand-off's own reader (`read_scan_marker`), which refuses a marker with
+no readable `task_id` as the hand-off does, and the sweep and its cluster cards with its own board
+read (`read_board`); a board that cannot be read, or that does not have the sweep, is waited on.
+Neither costs a call into the sandbox.
 
 Two things the trigger must not be:
 
@@ -93,7 +95,8 @@ Two things the trigger must not be:
 
 **Fallback.** If the scan has not settled by the hand-off's deadline for this sweep plus
 `RANKING_ALLOWANCE_SECONDS` (30 minutes), counted from `.bootstrap_scan_filed`, fire anyway: 90
-minutes for a sweep with no cluster cards, longer by five minutes a card. A stuck sweep, a blocked
+minutes for a sweep with no cluster cards, longer by five minutes a card the hand-off counts (an
+archived one is set aside, as `bootstrap_handoff.deadline` does). A stuck sweep, a blocked
 ranking card or one never filed must not hold the audits back forever, and a shorter wait would
 start them beside a large fleet's ranking card. A tick that cannot read the board waits for the
 next rather than taking the shortest fallback, and a board that never reads is ended by the
@@ -255,8 +258,9 @@ repetition waits for the previous one's four audits to finish). The stack
 (`bench/tf/prebuilt/oobe-first-run-audits`) first waits for the install's own first-run stage to
 finish, so it never cuts across a fresh install's real scan, then re-arms the stage: it files an
 archived stand-in sweep card and an archived ranking card after it, points `.bootstrap_scan_filed`
-at the sweep, clears `.oobe_audits_fired`, and puts back the `oobe` job when the image ships one;
-the teardown restores both markers and the job as it found them.
+at the sweep and the hand-off's `.bootstrap_handoff_filed` at the ranking card, clears
+`.oobe_audits_fired`, and puts back the `oobe` job when the image ships one; the teardown restores
+the markers and the job as it found them.
 The stack then waits, up to an hour, for the stage to finish its chain, so the verifier's two-minute window opens after the last audit has started. The verifier reads the Platform Agent's cron run records and
 passes when the stage's `.oobe_audits_fired` lists all four audits as marked due and each has a run claimed since the stage marked it that got going (running, completed, or ended after its start) (a skipped row is passed over), so a scheduled run that falls in the window does not count, and each started only after the one before it in the chain ended. That is stricter than the stage: a mark that lands on a scheduled run it did not see start, a race the runner's wait for running audits makes rare, reads as no run. Red: on
 an image without the job, no audit runs. Green: four, in three repetitions. The case's runs are

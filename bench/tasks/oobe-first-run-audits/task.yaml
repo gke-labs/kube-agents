@@ -14,7 +14,8 @@
 # bench/tf/prebuilt/oobe-first-run-audits waits for the install's own first-run
 # stage to finish, then files an archived stand-in sweep
 # card and an archived ranking card after it, points `.bootstrap_scan_filed` at
-# the sweep, removes `.oobe_audits_fired`, and puts back the `oobe` job if the
+# the sweep and `.bootstrap_handoff_filed` at the ranking card, removes
+# `.oobe_audits_fired`, and puts back the `oobe` job if the
 # deployed image ships one (an install that onboarded before the job existed never
 # got it), then waits up to an hour for the stage to finish its chain. The verifier
 # reads the stage's .oobe_audits_fired and the Platform Agent's cron/executions.db,
@@ -23,7 +24,8 @@
 # ended. On an image without the job nothing starts them, which is this case's red.
 #
 # Isolation class: writes to the install under test. It replaces
-# `.bootstrap_scan_filed` and `.oobe_audits_fired` for the run and restores both,
+# `.bootstrap_scan_filed`, `.bootstrap_handoff_filed` and `.oobe_audits_fired` for
+# the run and restores them,
 # files two archived cards, and adds and removes the `oobe` job. The four audits
 # it starts are real runs: each writes its ledger issue in the install's GitOps
 # repository and posts its summary wherever the install sends audit reports. The

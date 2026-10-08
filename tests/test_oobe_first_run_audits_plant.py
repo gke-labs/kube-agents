@@ -159,6 +159,9 @@ class PlantScriptsTest(unittest.TestCase):
         self.assertEqual([a[2] for a in archives], state["cards"])
         marker = (self.home / ".bootstrap_scan_filed").read_text()
         self.assertTrue(marker.startswith(f"task_id={state['cards'][0]}\nfiled_at="))
+        # The hand-off's record of the stand-in ranking card, which is all the stage reads it from.
+        handoff = (self.home / ".bootstrap_handoff_filed").read_text()
+        self.assertTrue(handoff.startswith(f"sweep={state['cards'][0]}\ntask_id={state['cards'][1]}\nfiled_at="))
         self.assertFalse((self.home / ".oobe_audits_fired").exists())
         self.assertEqual(state["scan_marker"], "task_id=t_real\nfiled_at=1\n")
         self.assertEqual(state["audits_marker"], '{"done": true}\n')
@@ -205,12 +208,14 @@ class PlantScriptsTest(unittest.TestCase):
 
     # --- disarm -----------------------------------------------------------------
 
-    def test_disarm_restores_both_markers_and_removes_the_job_it_added(self):
+    def test_disarm_restores_the_markers_and_removes_the_job_it_added(self):
         (self.home / ".bootstrap_scan_filed").write_text("task_id=t_real\nfiled_at=1\n")
+        (self.home / ".bootstrap_handoff_filed").write_text("sweep=t_real\ntask_id=t_rank\nfiled_at=2\n")
         self.assertEqual(self._arm().returncode, 0)
         done = self._run("disarm.py", str(self.home), str(self.hermes))
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertEqual((self.home / ".bootstrap_scan_filed").read_text(), "task_id=t_real\nfiled_at=1\n")
+        self.assertEqual((self.home / ".bootstrap_handoff_filed").read_text(), "sweep=t_real\ntask_id=t_rank\nfiled_at=2\n")
         self.assertFalse((self.home / ".oobe_audits_fired").exists())
         self.assertNotIn("oobe", self._jobs())
         self.assertFalse((self.home / ".bench-oobe.json").exists())
@@ -220,7 +225,18 @@ class PlantScriptsTest(unittest.TestCase):
         (self.home / ".oobe_audits_fired").write_text('{"done": true}\n')
         self.assertEqual(self._run("disarm.py", str(self.home), str(self.hermes)).returncode, 0)
         self.assertFalse((self.home / ".bootstrap_scan_filed").exists())
+        self.assertFalse((self.home / ".bootstrap_handoff_filed").exists())
         self.assertFalse((self.home / ".oobe_audits_fired").exists())
+
+    def test_disarm_of_an_arm_that_predates_the_hand_off_record_leaves_it(self):
+        # A state file written before arm.py recorded the hand-off marker: nothing to put back.
+        self.assertEqual(self._arm().returncode, 0)
+        state = self._state()
+        del state["handoff_marker"]
+        (self.home / ".bench-oobe.json").write_text(json.dumps(state))
+        (self.home / ".bootstrap_handoff_filed").write_text("sweep=t_real\ntask_id=t_rank\n")
+        self.assertEqual(self._run("disarm.py", str(self.home), str(self.hermes)).returncode, 0)
+        self.assertEqual((self.home / ".bootstrap_handoff_filed").read_text(), "sweep=t_real\ntask_id=t_rank\n")
 
     def test_disarm_keeps_a_job_it_did_not_add(self):
         self.store.write_text(json.dumps([OTHER_JOB, OOBE_JOB]))
