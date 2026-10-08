@@ -125,6 +125,8 @@ JSON_INDENT = 2
 # The refresh interval: a report per new version, then one a week while pending.
 REFRESH_DAYS_ENV = "UPGRADE_READINESS_REFRESH_DAYS"
 REFRESH_DAYS_DEFAULT = 7
+# A ceiling well inside what timedelta and a date header can carry; past it the default applies.
+REFRESH_DAYS_MAX = 365
 # Ten minutes of slack on the weekly comparison: the tick's own start second drifts
 # from one day to the next, and a strict week would land on day eight (as
 # feedback_prompt.py found).
@@ -270,7 +272,7 @@ def refresh_days() -> int:
         value = int(raw)
     except ValueError:
         return REFRESH_DAYS_DEFAULT
-    return value if value > 0 else REFRESH_DAYS_DEFAULT
+    return value if 0 < value <= REFRESH_DAYS_MAX else REFRESH_DAYS_DEFAULT
 
 
 def profile_home() -> Path:
@@ -457,6 +459,22 @@ def pending_targets(report: dict) -> dict[str, list[str]]:
     return {version: sorted(keys) for version, keys in pending.items()}
 
 
+def carry_forward_unlisted(pending: dict[str, list[str]], ledger: dict, read_errors: list) -> None:
+    """A project whose ``clusters list`` failed (an error with no location)
+    contributed no members, so its clusters would drop out of every version's
+    pending set and rejoin a week later under a version already recorded.
+    Keep them pending from the ledger instead; the readiness run then counts
+    them as not read, and a version with nothing graded is not recorded."""
+    unlisted = {error.get(MEMBER_ID_KEYS[0]) for error in read_errors if error.get(MEMBER_ID_KEYS[0]) and not error.get(MEMBER_ID_KEYS[1])}
+    if not unlisted:
+        return
+    for version, entry in ledger[TARGETS_KEY].items():
+        kept = [key for key in entry.get(PENDING_KEY) or [] if project_of(key) in unlisted]
+        if kept:
+            merged = sorted(set(pending.get(version, [])) | set(kept))
+            pending[version] = merged
+
+
 def empty_ledger() -> dict:
     return {LEDGER_SCHEMA_KEY: LEDGER_SCHEMA_VERSION, TARGETS_KEY: {}, LAST_TICK_KEY: None, ANNOUNCED_KEY: {}}
 
@@ -484,7 +502,9 @@ def load_ledger(path: Path) -> dict:
         if not shape_ok:
             raise RuntimeError(f"ledger at {path} has a malformed entry for {version}; refusing to overwrite it")
     block = data.get(ANNOUNCED_KEY)
-    if block is not None and not announced_shape_ok(block):
+    if block is None:
+        data[ANNOUNCED_KEY] = {}
+    elif not announced_shape_ok(block):
         raise RuntimeError(f"ledger at {path} has a malformed {ANNOUNCED_KEY} block; refusing to overwrite it")
     return data
 
@@ -692,6 +712,7 @@ def tick(dry_run: bool = False) -> list[str]:
     read_errors = versions[ENVELOPE_REPORT_KEY].get(ERRORS_KEY) or []
     complete = versions.get(ENVELOPE_EXIT_KEY) == EXIT_OK and not read_errors
     pending = pending_targets(versions[ENVELOPE_REPORT_KEY])
+    carry_forward_unlisted(pending, ledger, read_errors)
     if dry_run:
         due, _ = decide(ledger, pending, now, days, retire=False)
         lines = [DRY_RUN_WOULD_RETIRE.format(version=v) for v in sorted(ledger[TARGETS_KEY]) if v not in pending and complete]
