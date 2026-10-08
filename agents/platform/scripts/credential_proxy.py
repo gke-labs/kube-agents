@@ -181,6 +181,14 @@ OUTPUT_COPIES_PER_COMMAND = 6
 # sizing test holds the limit to the same floor
 # (credentialProxyMinimumAdmittedRequests in credential_proxy_manifests.go).
 BUDGET_MINIMUM_ADMITTED_REQUESTS = 2
+# child_memory_budget_floor_bytes at the 8 MiB output cap the operator sets
+# (CREDENTIAL_PROXY_MAX_OUTPUT_BYTES; the broker's own fallback is not the
+# deployed cap): 672 MiB. Declared as a literal so that the copies elsewhere can
+# be compared with it as text. test_credential_proxy.py holds it to the
+# function, and tests/test_credential_proxy_sizing_parity.py holds it equal to
+# the operator's credentialProxyMemoryFloorBytesAtDefaultCap and the chart's
+# kube-agents.credentialProxyMemoryFloorBytes.
+CHILD_MEMORY_BUDGET_FLOOR_BYTES_AT_DEFAULT_CAP = 704643072
 # Where the limit comes from, in order: the operator's Downward API variable,
 # then the cgroup v2 file for a broker whose Deployment predates the variable.
 # A value of `max` in the file means no limit, and no limit means no budget.
@@ -254,6 +262,13 @@ AGENT_API_DRAIN_TIMEOUT_SECONDS = 10
 # match and the length guard both live there, at the same 256 this module
 # enforced before; the alias keeps the name this module's own tests use.
 MAX_REPOSITORY_LENGTH = repo_ref.MAX_REPO_LENGTH
+
+# The one ref prefix a pinned base may carry, removed once to give the branch's
+# canonical name, and the prefixes that may not follow it or start the value:
+# `heads/x` and a repeated `refs/heads/` would each be read as another branch
+# by some door. The operator's CRD rule refuses the same values.
+PINNED_BASE_REF_PREFIX = "refs/heads/"
+PINNED_BASE_REFUSED_PREFIXES = ("refs/heads/", "heads/")
 
 # The read-only Cloud API relay, `GET /v1/gcp/<host>/<path>?<query>`. The route
 # prefix itself is API_RELAY_PREFIX, imported above from the client module so
@@ -3519,8 +3534,10 @@ def _detect_repo_default_branch(
     Reads refs/remotes/<remote>/HEAD directly without subprocess or network calls.
     On repositories with non-standard default trunks, this local detection acts as a
     cooperative guard against accidental pushes; authoritative protection against
-    deliberate workspace ref manipulation requires setting CREDENTIAL_PROXY_BASE_BRANCH
-    or GITOPS_BASE_BRANCH.
+    deliberate workspace ref manipulation comes from a configured base instead:
+    CREDENTIAL_PROXY_BASE_BRANCH or GITOPS_BASE_BRANCH, or a repository's pinned
+    base from --pinned-bases / CREDENTIAL_PROXY_PINNED_BASES, each of which is
+    protected on every push whatever the clone's refs say.
 
     `remote` comes from the agent's argv. Only a value that stays under
     `refs/remotes/` once joined is looked up. A URL in that slot never reached
@@ -3608,6 +3625,10 @@ def git_push_violation(argv: list[str], cwd: Path | str | None = None) -> str | 
         elif norm_override.startswith("heads/"):
             norm_override = norm_override[len("heads/"):]
         protected.add(norm_override)
+    # A pin is stored in its one canonical spelling (`parse_pinned_bases`), so
+    # it is protected under exactly the name proposals target.
+    pinned = getattr(CredentialProxyHandler, "pinned_bases", None) or {}
+    protected.update(configured.lower() for configured in pinned.values() if configured)
 
     has_tags = False
     positional: list[str] = []
@@ -3714,18 +3735,24 @@ def git_push_violation(argv: list[str], cwd: Path | str | None = None) -> str | 
                 "`git push` with bare 'HEAD' refspec is refused: specify an explicit "
                 "destination branch (e.g. 'HEAD:platform-agent/<name>')."
             )
-        norm_target = target.strip()
-        if norm_target.lower().startswith("refs/heads/"):
-            norm_target = norm_target[len("refs/heads/"):]
-        elif norm_target.lower().startswith("heads/"):
-            norm_target = norm_target[len("heads/"):]
+        # git matches a destination case-sensitively, so `Heads/x` is the
+        # branch `Heads/x` while `heads/x` may be `x`. The prefix is stripped
+        # in any case, as before, but the name as written is checked too, so a
+        # protected branch spelt with such a prefix is not read away to another.
+        written = target.strip()
+        candidates = [written]
+        if written.lower().startswith("refs/heads/"):
+            candidates.insert(0, written[len("refs/heads/"):])
+        elif written.lower().startswith("heads/"):
+            candidates.insert(0, written[len("heads/"):])
 
-        if norm_target.casefold() in protected or norm_target.casefold().startswith("run/"):
-            return (
-                f"`git push` to protected branch '{norm_target}' is refused: changes to "
-                "base or run branches must be proposed via pull request and merged through "
-                "the approved workflow."
-            )
+        for norm_target in candidates:
+            if norm_target.casefold() in protected or norm_target.casefold().startswith("run/"):
+                return (
+                    f"`git push` to protected branch '{norm_target}' is refused: changes to "
+                    "base or run branches must be proposed via pull request and merged through "
+                    "the approved workflow."
+                )
     return None
 
 
@@ -5268,7 +5295,7 @@ class CommandExecutor:
 
         Three things are enforced here rather than assumed:
 
-        * the subcommand is one of the twelve this product issues, checked
+        * the subcommand is one of `WORKSPACE_GIT_SUBCOMMANDS`, checked
           against the argv as parsed rather than as composed, so a later edit
           that threads a caller's string into one of these vectors is refused
           instead of run;
@@ -5319,8 +5346,8 @@ class CommandExecutor:
         """git the version-control broker issues, in its own scratch tree.
 
         A third door rather than a widening of the second. The broker needs
-        `bundle`, `init`, `remote` and `ls-remote`, which content-passing does
-        not, and putting them on one list would grant each path the other's
+        `bundle`, `init` and `remote`, which content-passing does not, and
+        putting them on one list would grant each path the other's
         subcommands for no reason beyond sharing a method.
 
         `config` is what the forge's credential asked for on this invocation --
@@ -6427,7 +6454,11 @@ class CommandExecutor:
         return value[: self.max_output_bytes], True
 
 
-def build_workspace_store(executor: CommandExecutor, base_branch: str = ""):
+def build_workspace_store(
+    executor: CommandExecutor,
+    base_branch: str = "",
+    pinned_bases: Mapping[tuple[str, str], str] | None = None,
+):
     """The content-passing store, or None when the feature is off.
 
     Returning None rather than an inert object is deliberate: the handler tests
@@ -6458,12 +6489,17 @@ def build_workspace_store(executor: CommandExecutor, base_branch: str = ""):
         # `require_managed_workspace` gives: a bare name does not resolve once
         # the install serves a second forge.
         credential_for=lambda repository: _workspace_credential(registry, repository),
+        pinned_bases=pinned_bases,
     )
     LOGGER.info("content workspace enabled root=%s", executor.content_workspace_root)
     return store
 
 
-def build_vcs_broker(executor: CommandExecutor, base_branch: str = ""):
+def build_vcs_broker(
+    executor: CommandExecutor,
+    base_branch: str = "",
+    pinned_bases: Mapping[tuple[str, str], str] | None = None,
+):
     """The version-control broker. Always built; there is no switch.
 
     Unlike the content workspace this has no off state. It is the forge-neutral
@@ -6490,6 +6526,7 @@ def build_vcs_broker(executor: CommandExecutor, base_branch: str = ""):
         http_timeout=executor.timeout_seconds,
         http_max_bytes=executor.max_output_bytes,
         request_deadline=executor.request_deadline,
+        pinned_bases=pinned_bases,
     )
     LOGGER.info(
         "version control enabled root=%s forges=%s",
@@ -7157,6 +7194,10 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
     # answers 503.
     api_relay: GoogleApiRelay | None = None
     base_branch: str = ""
+    # (forge host, path) -> the base every proposal onto that repository must
+    # target, from `parse_pinned_bases`. Each pinned branch is also protected
+    # from a direct push, as `base_branch` is; see `providers.pinned_base`.
+    pinned_bases: Mapping[tuple[str, str], str] = {}
     # None unless CREDENTIAL_PROXY_CONTENT_WORKSPACE is on. While it is None the
     # /v1/workspace/* routes answer 404 — the same answer an older broker gives,
     # which is what lets a migrating client detect support by asking rather than
@@ -8729,6 +8770,106 @@ def reachable_off_pod(args: argparse.Namespace) -> bool:
     return bool(envoy_address) and envoy_address not in {"127.0.0.1", "::1", "localhost"}
 
 
+def parse_pinned_bases(raw: str) -> dict[tuple[str, str], str]:
+    """(forge host, path) -> pinned base, from --pinned-bases.
+
+    The operator renders the value from every repository in the PlatformAgent's
+    `spec.integration.repositories` that sets `baseBranch`, as a JSON array of
+    `{"repository": "https://<host>/<path>", "branch": "<name>"}`. A pin that
+    does not parse would match nothing and turn that repository's base off
+    without a word, so anything short of a clean parse is refused at boot like
+    any other bad boot value: malformed JSON, an entry without a stated host,
+    a repository no forge this install serves reads as one, a branch git would
+    not take, or one repository pinned twice.
+
+    Each repository is read the way a request for it is read: by the forge
+    whose hosts include the stated host, through that forge's own `parse`. It
+    is kept under that forge's canonical host and the path `parse` answers,
+    which is the pair `providers.pinned_base` is asked about, so another
+    spelling of the host (`www.github.com`) is the same pin and a path of a
+    depth the forge never reads (`https://github.com/acme`) is refused rather
+    than kept to match nothing. So is a path the forge reads as another
+    repository when it is asked for it (`foo.git.git`, which reads back as
+    `foo`).
+
+    The branch is kept in its one canonical spelling: a single leading
+    `refs/heads/` is removed, and a value that starts with `heads/`, or with
+    `refs/heads/` followed by `refs/heads/` or `heads/`, is refused. Every door
+    compares against the stored name as it is, so a pin is protected under
+    exactly the name proposals are told to target.
+    """
+    text = (raw or "").strip()
+    if not text:
+        return {}
+
+    def refuse(detail: str) -> RuntimeError:
+        return RuntimeError(
+            f"invalid --pinned-bases / CREDENTIAL_PROXY_PINNED_BASES: {detail}; "
+            'expected a JSON array of {"repository": "https://<host>/<path>", '
+            '"branch": "<name>"}'
+        )
+
+    try:
+        entries = json.loads(text)
+    except ValueError as exc:
+        raise refuse("not JSON") from exc
+    if not isinstance(entries, list):
+        raise refuse("not an array")
+    forges = providers.Registry().forges
+    pins: dict[tuple[str, str], str] = {}
+    seen: set[tuple[str, str]] = set()
+    for entry in entries:
+        if not isinstance(entry, dict):
+            raise refuse(f"{entry!r} is not an object")
+        repository, branch = entry.get("repository"), entry.get("branch")
+        ref = repo_ref.try_parse(repository)
+        if ref is None or not ref.host_stated:
+            raise refuse(f"{repository!r} is not a repository URL with a host")
+        host = ref.host.casefold()
+        forge = next(
+            (f for f in forges if host in (h.casefold() for h in f.hosts)), None
+        )
+        if forge is None:
+            raise refuse(
+                f"{repository!r} is on {ref.host}, which is not a host of any "
+                "forge this install serves"
+            )
+        canonical_host = forge.hosts[0]
+        try:
+            path = forge.parse(repository.strip())
+            again = forge.parse(f"https://{canonical_host}/{path}")
+        except providers.WorkspaceError as exc:
+            raise refuse(str(exc)) from exc
+        if again != path:
+            raise refuse(
+                f"{repository!r} names {path}, which {forge.name} reads as "
+                f"{again} when it is asked for, so no request could match it"
+            )
+        if isinstance(branch, str):
+            branch = branch.strip()
+            rest = (
+                branch[len(PINNED_BASE_REF_PREFIX):]
+                if branch.startswith(PINNED_BASE_REF_PREFIX)
+                else branch
+            )
+            if rest.startswith(PINNED_BASE_REFUSED_PREFIXES):
+                raise refuse(
+                    f"the branch of {repository}, {branch!r}, does not name one "
+                    "branch: give the bare name, or refs/heads/ once before it"
+                )
+            branch = rest
+        try:
+            branch = providers.validate_branch(branch, f"the branch of {repository}")
+        except providers.WorkspaceError as exc:
+            raise refuse(str(exc)) from exc
+        key = (canonical_host.casefold(), path.casefold())
+        if key in seen:
+            raise refuse(f"{repository} is pinned more than once")
+        seen.add(key)
+        pins[(canonical_host, path)] = branch
+    return pins
+
+
 def resolve_role() -> str:
     """Which halves of this process to run.
 
@@ -8821,11 +8962,20 @@ def serve(args: argparse.Namespace) -> None:
         or os.getenv("CREDENTIAL_PROXY_BASE_BRANCH", "")
         or os.getenv("GITOPS_BASE_BRANCH", "")
     ).strip()
+    CredentialProxyHandler.pinned_bases = parse_pinned_bases(
+        getattr(args, "pinned_bases", "") or ""
+    )
+    for (host, path), branch in CredentialProxyHandler.pinned_bases.items():
+        LOGGER.info("pinned base repository=https://%s/%s branch=%s", host, path, branch)
     CredentialProxyHandler.workspaces = build_workspace_store(
-        executor, base_branch=CredentialProxyHandler.base_branch
+        executor,
+        base_branch=CredentialProxyHandler.base_branch,
+        pinned_bases=CredentialProxyHandler.pinned_bases,
     )
     CredentialProxyHandler.vcs = build_vcs_broker(
-        executor, base_branch=CredentialProxyHandler.base_branch
+        executor,
+        base_branch=CredentialProxyHandler.base_branch,
+        pinned_bases=CredentialProxyHandler.pinned_bases,
     )
     CredentialProxyHandler.max_request_bytes = args.max_request_bytes
     CredentialProxyHandler.enforce_read_only = read_only_enforced()
@@ -9033,6 +9183,16 @@ def parse_args() -> argparse.Namespace:
             "CREDENTIAL_PROXY_BASE_BRANCH", os.getenv("GITOPS_BASE_BRANCH", "")
         ),
         help="Protected GitOps base branch that agents may not push to directly",
+    )
+    parser.add_argument(
+        "--pinned-bases",
+        default=os.getenv("CREDENTIAL_PROXY_PINNED_BASES", ""),
+        help=(
+            'JSON array of {"repository": "https://<host>/<path>", "branch": '
+            '"<name>"}: every proposal onto that repository must target that '
+            "branch, and no agent may push to it directly; unset leaves every "
+            "repository's own default in charge"
+        ),
     )
     return parser.parse_args()
 

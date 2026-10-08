@@ -222,7 +222,7 @@ REPAIR_CLEANUP_POLICY = "docs/ci-pool-projects.md section 4, Cleanup policy"
 REPAIR_HOST_CLUSTER = "docs/ci-pool-projects.md section 2 by hand, against the project's existing full-install state so its api_server_key is kept (not scripts/provision_ci_pool_project.sh, which must not be re-run on a registered project: section 8)"
 REPAIR_HOST_CMEK = "gcloud container clusters update platform-agent-host --database-encryption-key=<the project's key>, as install.sh does for an existing cluster (docs/ci-pool-projects.md section 2)"
 REPAIR_STATE_BUCKET = "gcloud storage buckets create gs://{project_id}-tf-state --project={project_id} --location=us-central1 --uniform-bucket-level-access && gcloud storage buckets update gs://{project_id}-tf-state --versioning (docs/ci-pool-projects.md section 2; not scripts/provision_ci_pool_project.sh on a registered project: section 8)"
-REPAIR_FLEET_APPLY = "re-apply bench/tf/fleet against {project_id} (bench/tf/fleet/README.md, State and reconcile)"
+REPAIR_FLEET_APPLY = "apply bench/tf/fleet to {project_id} from a main checkout: before registration, python3 hack/fleet_reconcile.py --project {project_id} --no-lease (Boskos does not hold it yet); once registered, the daily reconcile at 08:30 UTC re-applies it, or the same command without --no-lease, leased (bench/tf/fleet/README.md, State and reconcile)"
 # An absent service account. The platform GSA is the full-install
 # composition's; the LiteLLM GSA has a hand repair in the runbook.
 REPAIR_PLATFORM_GSA = "docs/ci-pool-projects.md section 3: the full-install composition creates kubeagents-platform-gsa; re-create it against the project's existing full-install state (not scripts/provision_ci_pool_project.sh on a registered project: section 8)"
@@ -317,8 +317,8 @@ HOST_CLUSTER = "platform-agent-host"
 # seeded-d is deliberately absent. Pool projects applied before bench/tf/fleet
 # grew slot d do not have it, so listing it would make the hourly pool-state
 # scan report every one of them drifted and hold the presubmit gate DEGRADED
-# until the fleet is re-applied across the pool. The weekly reconcile
-# (hack/fleet_reconcile.py --all) creates it in each project it applies to,
+# until the fleet is re-applied across the pool. The reconcile
+# (hack/fleet_reconcile.py --all, on merge and daily) creates it in each project it applies to,
 # since a new cluster plans as a create; add it here once that has reached
 # every project.
 EXPECTED_CLUSTERS = {HOST_CLUSTER, "seeded-a", "seeded-b", "seeded-c"}
@@ -954,7 +954,7 @@ _FLEET_COULD_NOT_LOOK = re.compile(r"could not list clusters in", re.I)
 # reason and to the same effect, and so is one skipped because a temporary file
 # could not be created, or dropped because the file gcloud wrote could not be
 # rewritten to the reader's exec credential (a local fault, not a pool state).
-# Sources: the three per-cluster WARNING lines in hack/fleet-kubeconfigs.sh.
+# Sources: the three per-cluster WARNING lines and the per-role read failure in hack/fleet-kubeconfigs.sh.
 #
 # One of these, or _FLEET_COULD_NOT_LOOK, must be present before an unresolved
 # role may be excused: excusing on the *absence* of a "looked and found wrong"
@@ -964,7 +964,7 @@ _FLEET_COULD_NOT_LOOK = re.compile(r"could not list clusters in", re.I)
 # the script names a slot no labelled cluster resolved to, and that warning is
 # in the list above, where it fails the check whatever else went unreached.
 _FLEET_UNREACHABLE = re.compile(
-    r"no credentials for seeded cluster|could not create a temporary file|kubeconfig could not be rewritten to",
+    r"no credentials for seeded cluster|could not create a temporary file|kubeconfig could not be rewritten to|could not be read from",
     re.I,
 )
 

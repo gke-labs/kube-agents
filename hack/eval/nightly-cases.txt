@@ -130,10 +130,11 @@
 # (159) of sixty-seven (201), +3 more: the same shape on the card's last
 # attempt. chat-voice-failure-leads-with-fact (the last entry below) makes
 # it fifty-four (162) of sixty-eight (204), +3 more: the same shape on a
-# blocked card. Counted from the lists again (sixty here, fourteen in
-# the presubmit file, seventy-four cases and 222 units),
-# chat-fanout-fleet-restarts-rows makes it sixty-one (183) of seventy-five
-# (225), +3 more: one front-door turn and a four-card fan-out.
+# blocked card. Counted from the lists again (sixty-one here,
+# upgrades-zonal-control-plane-outage-warned among them, fourteen in the
+# presubmit file, seventy-five cases and 225 units),
+# chat-fanout-fleet-restarts-rows makes it sixty-two (186) of seventy-six
+# (228), +3 more: one front-door turn and a four-card fan-out.
 # Whether the worst night fits is a question about the whole matrix, and the
 # six measured nights (2026-09-16 to 09-21, oss-test-infra#2707's table)
 # answer it plainly: 1734-2693 serial minutes of work at a realised
@@ -199,6 +200,15 @@
 # runs measured about 960s), ~20 more serial minutes on the infra lock: the
 # eleven tofu cases come to ~453 serial minutes against the 480m deadline. The
 # case count is unchanged.
+#
+# 2026-10-05 adds upgrades-zonal-control-plane-outage-warned: one case,
+# three units at the 200s default (a read-only chat turn, measured 3-8
+# minutes a repetition on the dev install). Counted from the lists rather
+# than the paragraphs above (the chat-voice trio and the declared-intent
+# trio landed beside each other, each counted without the other, and two
+# chat cases registered since without a paragraph): this case, the last
+# entry below, makes it sixty-one cases (183 units) of a seventy-five-case,
+# 225-unit matrix.
 
 # ── The four full audits recast out of the presubmit on 2026-08-26 ──────────
 # Spec-ready, each domain covered in the presubmit by its probe:
@@ -674,6 +684,13 @@
 # (bench/kube_agents_bench/card_wake.py), so one front-door turn and no
 # worker: filing or unblocking a card fails the case's catastrophic fence.
 ./tasks/chat-voice-failure-leads-with-fact/task.yaml
+
+# The first of the upgrade-failure catalogue's scenario cases (entry 11, the
+# zonal control plane's API gap during its own upgrade). Read-only chat prompt
+# against the seeded clusters' own zonal shape; no planted fixture, nothing to
+# mutate. Nightly from its first merge; a presubmit seat is a later pull
+# request that cites its record.
+./tasks/upgrades-zonal-control-plane-outage-warned/task.yaml
 
 # A fleet question fanned out one card per cluster, each titled with the bare
 # cluster name the Slack plan row renders (agents/platform/SOUL.md, fan-out).

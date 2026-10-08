@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/gke-labs/kube-agents/a2a/lib"
 )
@@ -16,6 +17,26 @@ const discordChunk = 1900
 // progressCap bounds the progress text embedded in rolling lines and status
 // answers, so one artifact can't blow a chat edit past the backend cap.
 const progressCap = 300
+
+// The terminal log line carries the executor's reason token and never the
+// detail after it. Executors write the terminal message as
+// `reason: <token>[ - detail]` (docs/designs/eval-next-transport.md), and the
+// detail is free text from the executor or the bus: the bridge puts the tails
+// of the Hermes subprocess's stdout and stderr there, which can hold anything
+// the model or a tool printed. The token follows the eval harness's rule
+// (bench/kube_agents_bench/inject_transport.py, parse_reason): strip the
+// prefix, read the first word. It is stricter than the harness: nothing is
+// trimmed first, and any whitespace ends the word, not only a space, so a
+// newline can never ride into the token. A token longer than
+// reasonTokenCap, or with a byte outside [A-Za-z0-9._-], is logged as
+// reasonTokenMalformed, which no executor token can equal because its
+// parentheses are outside that set. No prefix logs an empty reason, the
+// harness's "no token".
+const (
+	reasonPrefix         = "reason: "
+	reasonTokenCap       = 64 // the longest executor token today is 34 bytes
+	reasonTokenMalformed = "(malformed)"
+)
 
 // KV access rides withRetry with these shapes: enough to ride out a
 // connection rebuild window without inventing a second resilience layer,
@@ -37,6 +58,23 @@ type relayState struct {
 	// drops the narration does not burn a backend edit per progress artifact
 	// re-rendering an unchanged line.
 	lastLine string
+	// notices wait for the task's terminal and post after its deliverable:
+	// a delegation refusal follows the turn's "delegated to platform".
+	notices []string
+	// lagSeen is when this gateway first saw the task final on the stream
+	// with its delegate request unrelayed, for a terminal the replay could
+	// not time (relayLagStart). Zero otherwise.
+	lagSeen time.Time
+	// sawDelegate is set once this gateway has run the task's delegate
+	// request (applyArtifact, or relayTerminal from the fold). A terminal
+	// with it unset reads the fold for a request this process never saw
+	// (relayTerminal).
+	sawDelegate bool
+	// local is set when this gateway started the task (startTaskWith), so
+	// every event of it reached this process's relay: an event acked and
+	// lost before its batch takes a crash, and a restart starts the task's
+	// relay state afresh without it.
+	local bool
 }
 
 // relayItem is one queued event with the subject it arrived on. The relay's
@@ -165,7 +203,7 @@ func (g *Gateway) applyEvent(ctx context.Context, rec *SessionRecord, item relay
 			g.log.Error("relay: malformed artifact-update", "taskId", env.TaskID, "err", err)
 			return
 		}
-		g.applyArtifact(rec, rs, env.TaskID, a, render)
+		g.applyArtifact(ctx, rec, rs, item.subject, env.TaskID, a, render)
 	}
 }
 
@@ -198,7 +236,7 @@ func (g *Gateway) applyStatus(ctx context.Context, rec *SessionRecord, rs *relay
 	}
 }
 
-func (g *Gateway) applyArtifact(rec *SessionRecord, rs *relayState, taskID string, a lib.ArtifactUpdate, render bool) {
+func (g *Gateway) applyArtifact(ctx context.Context, rec *SessionRecord, rs *relayState, subject, taskID string, a lib.ArtifactUpdate, render bool) {
 	switch a.Artifact.Name {
 	case lib.ArtifactProgress:
 		// The rolling progress line: one edited chat message as progress
@@ -215,10 +253,18 @@ func (g *Gateway) applyArtifact(rec *SessionRecord, rs *relayState, taskID strin
 		} else {
 			rs.result = append([]lib.Part(nil), a.Artifact.Parts...)
 		}
+	case lib.ArtifactDelegate:
+		// A request to the gateway, never rendered to chat.
+		rs.sawDelegate = true
+		g.handleDelegateRequest(ctx, rec, subject, taskID, a.Artifact.Parts)
 	case lib.ArtifactThinking, lib.ArtifactActivity:
 		// Debug/audit views only; never rendered to chat.
 	}
 }
+
+// completedNonTextResult stands in for a completed task's result that has no
+// text, in the room and in a wake.
+const completedNonTextResult = "(completed with a non-text result; see the stream)"
 
 // relayTerminal posts the deliverable (or the failure), releases the
 // session's serialization, and retires the task's index — the stream is
@@ -230,18 +276,55 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 	// replaying the stream to recover it would buy nothing. Checking here and
 	// not there is the difference between skipping the replay and paying for
 	// one whose result is then dropped.
-	if result == "" && s.Status.State == lib.StateCompleted && !isConsoleConversation(rec.Key) {
+	// A child's result feeds its wake as well as the room, so a child on a
+	// console conversation still has it replayed.
+	ref, _ := rec.TaskRefFor(taskID)
+	needResult := result == "" && s.Status.State == lib.StateCompleted &&
+		(!isConsoleConversation(rec.Key) || ref.Role == taskRoleChild)
+	// A session turn that ends completed may have asked to delegate in an
+	// event this process never ran: the artifact's delivery was acked and
+	// lost to a crash before its batch, and only the terminal was
+	// redelivered. Only a task this process did not start (local) can
+	// have lost an event that way. The record is the witness that a request was handled (a
+	// child linked, or a refusal marked, each written when it is made), so
+	// with neither on record and the request never seen here, the fold is
+	// read for it and the request runs first, every check applying, before
+	// the turn ends - otherwise the hand-off line would end the chain.
+	needDelegate := s.Status.State == lib.StateCompleted && !rs.local && !rs.sawDelegate && rec.mayHaveUnhandledDelegate(taskID)
+	evidence := delegateAbsent
+	if needResult || needDelegate {
 		// Render state is cache; if a restart lost it, the stream still has
 		// everything. Replay against the addressee the task's own subjects
 		// carried - after a Delegate re-home, rec.Addressee is not it.
-		if task, err := g.client.TasksGet(ctx, rec.AddresseeFor(taskID), taskID); err == nil {
-			if art := task.Artifact(lib.ArtifactResult); art != nil {
+		addressee := rec.AddresseeFor(taskID)
+		if task, err := g.replayForTerminal(ctx, addressee, taskID); err == nil {
+			if art := task.Artifact(lib.ArtifactResult); art != nil && needResult {
 				result = joinTextParts(art.Parts)
+			}
+			if task.Artifact(lib.ArtifactDelegate) != nil {
+				evidence = delegateSeen
+			}
+			if needDelegate {
+				g.runFoldedDelegate(ctx, rec, rs, taskID, addressee, task)
 			}
 		} else {
 			g.log.Error("relay: terminal replay fallback failed", "taskId", taskID, "err", err)
+			// The request this process never saw cannot be read: whether
+			// the turn asked to delegate is unknown, so its own result is
+			// not trusted as a deliverable (settleHandOff).
+			if needDelegate {
+				evidence = delegateUnknown
+			}
 		}
 	}
+	if rs.sawDelegate {
+		evidence = delegateSeen
+	}
+	// The hand-off line is never a deliverable: a session turn whose
+	// request minted no child ends failed toward the observers, with the
+	// reason on its entry (handOffEnd, read by observeDelivered and
+	// observeEnded below and by the read route).
+	g.settleHandOff(rec, taskID, evidence)
 
 	switch s.Status.State {
 	case lib.StateCompleted:
@@ -249,10 +332,10 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 		// posts below (DeliverableObserver). A non-text result hands over
 		// nothing: the notice that replaces it is not the deliverable.
 		if result != "" {
-			g.observeTaskDelivered(rec.Key, taskID, result)
+			g.observeDelivered(rec, taskID, result)
 		}
 		if result == "" {
-			result = "(completed with a non-text result; see the stream)"
+			result = completedNonTextResult
 		}
 		// The console renders answers straight off TASKS, so posting the
 		// deliverable here too would show it twice and put a burst of
@@ -295,6 +378,7 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 			g.post(rec.Key, "🚫 the executor rejected the task")
 		}
 	}
+	g.flushNotices(rec.Key, rs)
 
 	if active := rec.ActiveTask; active != nil && active.TaskID == taskID {
 		if active.StatusMsgID != "" {
@@ -304,7 +388,7 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 			if g.cfg.DisplayMode == displayModeDefault {
 				progress = ""
 			}
-			g.editLine(rec.Key, active.StatusMsgID, terminalLine(s.Status.State, progress))
+			g.editLine(rec.Key, active.StatusMsgID, withLineNote(terminalLine(s.Status.State, progress), active.LineNote))
 		}
 		rec.ActiveTask = nil
 		// An executor's end of a live task is activity. The idle TTL that
@@ -323,18 +407,29 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 			rec.LastActivity = now
 			rec.LastTaskActivity = now
 		}
+	} else if parent, ok := rec.TaskRefFor(taskID); ok && parent.StatusMsgID != "" {
+		// A session turn that delegated ends after its child took the
+		// active task - while the child runs, or after the child's own
+		// terminal and the wake it started, since nothing orders the two
+		// tasks' events. Its line closes as any turn's does, from the entry
+		// that kept it. Its answer ("delegated to platform") is task
+		// activity for the session-thread rule all the same; LastActivity
+		// stays the active task's business.
+		progress := rs.progress
+		if g.cfg.DisplayMode == displayModeDefault {
+			progress = ""
+		}
+		g.editLine(rec.Key, parent.StatusMsgID, terminalLine(s.Status.State, progress))
+		setParentLine(rec, taskID, "")
+		if source == TerminalFromExecutor {
+			rec.LastTaskActivity = time.Now().UTC()
+		}
 	}
 	// Retire the routing state. A post-final straggler then finds no route
 	// and is dropped rather than re-rendered (assertion 10 lives in the lib
 	// and the fold; the gateway's job is only to never replay the result at
 	// the room).
-	g.mu.Lock()
-	delete(g.relays, taskID)
-	delete(g.taskSessions, taskID)
-	g.mu.Unlock()
-	if err := g.reg.DropTask(ctx, taskID); err != nil {
-		g.log.Warn("relay: task index cleanup failed", "taskId", taskID, "err", err)
-	}
+	g.retireTaskRoute(ctx, taskID)
 	// Last, after the deliverable is posted and the rolling line edited, so
 	// an observer that treats this as "the task is over" has already been
 	// handed everything the conversation received for it. See TaskObserver.
@@ -358,7 +453,66 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 	if s.Status.Message != nil {
 		reason = joinTextParts(s.Status.Message.Parts)
 	}
-	g.observeTaskTerminal(rec.Key, taskID, s.Status.State, source, reason)
+	// Logged by the task's own id, against the addressee it was published
+	// to (ingress logged that one, not rec.Addressee): every task, a turn
+	// that delegated and a child included, though the observers below hear
+	// only of the chain's end.
+	g.logTaskTerminal(rec, rec.AddresseeFor(taskID), taskID, s.Status.State, source, reason)
+
+	// Under the chain's root, and only for the task whose end is the
+	// chain's (observedAs): a turn that delegated and a child end quietly,
+	// and the root's one terminal comes from the wake or, when none runs,
+	// from observeChildEnd below.
+	g.observeEnded(rec, taskID, s.Status.State, source, reason)
+
+	// A delegated child's end wakes the session that asked.
+	if ref, ok := rec.TaskRefFor(taskID); ok && ref.Role == taskRoleChild {
+		if woken, why := g.wakeSession(ctx, rec, ref, s.Status.State, result, reason); !woken {
+			g.observeChildEnd(rec, ref, s.Status.State, source, reason, why)
+		}
+	}
+}
+
+// replayForTerminal is relayTerminal's read of the task's stream.
+func (g *Gateway) replayForTerminal(ctx context.Context, addressee, taskID string) (*lib.Task, error) {
+	if g.terminalReplayHook != nil {
+		if err := g.terminalReplayHook(taskID); err != nil {
+			return nil, err
+		}
+	}
+	return g.client.TasksGet(ctx, addressee, taskID)
+}
+
+// reasonToken is the token of an executor's `reason: <token>[ - detail]`
+// terminal message, safe to log: bounded, one line, no detail. See
+// reasonPrefix for the rule and why the detail stays out.
+func reasonToken(reason string) string {
+	rest, ok := strings.CutPrefix(reason, reasonPrefix)
+	if !ok {
+		return ""
+	}
+	if end := strings.IndexFunc(rest, unicode.IsSpace); end >= 0 {
+		rest = rest[:end]
+	}
+	if rest == "" || len(rest) > reasonTokenCap {
+		return reasonTokenMalformed
+	}
+	for i := 0; i < len(rest); i++ {
+		if !isReasonTokenByte(rest[i]) {
+			return reasonTokenMalformed
+		}
+	}
+	return rest
+}
+
+func isReasonTokenByte(c byte) bool {
+	switch {
+	case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9':
+		return true
+	case c == '-', c == '_', c == '.':
+		return true
+	}
+	return false
 }
 
 // updateRollingLine edits the task's single status message in place. Under
@@ -374,7 +528,7 @@ func (g *Gateway) updateRollingLine(rec *SessionRecord, taskID string, rs *relay
 	if g.cfg.DisplayMode == displayModeDefault {
 		progress = ""
 	}
-	line := statusLine(rs.state, progress)
+	line := withLineNote(statusLine(rs.state, progress), active.LineNote)
 	if line == rs.lastLine {
 		return
 	}
@@ -394,6 +548,14 @@ func (g *Gateway) editLine(conversation, messageID, line string) bool {
 		return false
 	}
 	return true
+}
+
+// withLineNote suffixes a rolling line with the task's note, if it has one.
+func withLineNote(line, note string) string {
+	if note == "" {
+		return line
+	}
+	return line + " " + note
 }
 
 func statusLine(state lib.TaskState, progress string) string {
@@ -457,23 +619,46 @@ func (g *Gateway) post(conversation, text string) {
 // sessionForTask resolves a task to its conversation: the in-memory cache
 // first, the KV task index after a restart.
 func (g *Gateway) sessionForTask(ctx context.Context, taskID string) string {
+	key, err := g.lookupTaskSession(ctx, taskID)
+	if err != nil {
+		g.log.Error("task index lookup failed", "taskId", taskID, "err", err)
+		return ""
+	}
+	return key
+}
+
+// lookupTaskSession is sessionForTask with the KV error returned, for a
+// caller that must not read a failed lookup as "no route" (liveChild).
+func (g *Gateway) lookupTaskSession(ctx context.Context, taskID string) (string, error) {
 	g.mu.Lock()
 	key := g.taskSessions[taskID]
 	g.mu.Unlock()
 	if key != "" {
-		return key
+		return key, nil
 	}
 	key, err := g.reg.SessionForTask(ctx, taskID)
 	if err != nil {
-		g.log.Error("task index lookup failed", "taskId", taskID, "err", err)
-		return ""
+		return "", err
 	}
 	if key != "" {
 		g.mu.Lock()
 		g.taskSessions[taskID] = key
 		g.mu.Unlock()
 	}
-	return key
+	return key, nil
+}
+
+// retireTaskRoute drops a task's routing state, the render cache and the
+// in-memory and KV task index, once the task has ended for the gateway. A
+// straggler for it then finds no route and is dropped.
+func (g *Gateway) retireTaskRoute(ctx context.Context, taskID string) {
+	g.mu.Lock()
+	delete(g.relays, taskID)
+	delete(g.taskSessions, taskID)
+	g.mu.Unlock()
+	if err := g.reg.DropTask(ctx, taskID); err != nil {
+		g.log.Warn("relay: task index cleanup failed", "taskId", taskID, "err", err)
+	}
 }
 
 // withRetry runs f up to n times with a short linear-backoff pause.

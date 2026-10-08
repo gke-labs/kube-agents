@@ -87,6 +87,14 @@ rollout does replace the agent pods; what preservation guarantees is that the
 replacements keep the credential and the route, so the bridge reconnects instead of
 hanging at the dial. Found live during stage 1 bring-up (8/26).
 
+A deliberate flip back to `today` is the other half, and it does clean up: the A2A stack
+is torn down, with two objects kept so a later flip forward reuses them. The bus creds
+Secret `<agent>-a2a-nats-creds` stays, because re-enabling `next` must not re-roll the
+credentials. The JetStream PVC `data-<agent>-a2a-nats-0` stays, because flipping a mode
+is not license to destroy the file store. `hack/rollback-roundtrip.sh` checks both
+against a live install: it flips `next` to `today` and back, asserts the two keep their
+UIDs and the agent answers on each side, and the next lane runs it after its matrix.
+
 ## What the operator renders
 
 - `today`: exactly what it renders now. A normal install cannot tell this feature exists
@@ -175,13 +183,13 @@ between a person and that read is the gateway's ingress allowlist. That differs 
 record ([architecture 02](../architecture/02-agent-personas.md) §2.4,
 [03](../architecture/03-security-model.md) §4a, and "Sessions by default" in
 `spec-chatops-gateway.md`), where a session reaches cluster data only through a gateway-minted
-child task and the gateway checks the target agent's `AllowedUsers` against the requester first.
-Today the two gates admit the same people, because the ingress allowlist is the only human-to-agent
-check the gateway enforces. It is a demo aid with two retirement triggers, whichever lands first:
-declarative profiles carrying a session's identity and tools, and gateway-side `AllowedUsers`
-enforcement ([architecture 07](../architecture/07-implementation-roadmap.md)); once the gateway
-refuses a person for the platform agent, a session with this view would read its clusters anyway,
-so the flag goes before that enforcement ships.
+child task and the gateway checks the target agent's `AllowedUsers` against the requester first -
+built now: a delegation to `platform` is checked against its `AllowedUsers`, but the view bypasses
+that check entirely, so on an install whose CR narrows the platform agent's allowlist the two gates
+no longer admit the same people. The view retires on the default flip (#2371); until then, on an
+install whose operator has turned the flag on and whose CR narrows the platform agent's allowlist,
+a person the gateway refuses a delegation to `platform` can still read its clusters through a
+session's view.
 
 ## Per-feature overrides - sketched, not built
 

@@ -3,6 +3,7 @@ import os
 import shutil
 import subprocess
 import textwrap
+import time
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -14,11 +15,21 @@ CLUSTER = "cluster-a"
 LOCATION = "us-central1"
 EXPECTED_CONTEXT = f"gke_{PROJECT}_{LOCATION}_{CLUSTER}"
 
-# A fake `kubectl` covering only the three invocations the preflight makes. It
-# reads the context out of a kubeconfig the way the real one does, so a test
-# fixes the *file* and the script's own logic decides the verdict.
+# Well under the 15s cap the preflight puts on a kubectl call, and under the 20s
+# the hanging fake sleeps: a run this fast cannot have waited on either.
+PREFLIGHT_FAST_SECONDS = 10
+
+# Padding one byte longer than the reader's 1 MiB cap (KUBECONFIG_READ_MAX_BYTES),
+# so the file is over it however small the rest of the fixture gets.
+KUBECONFIG_OVER_CAP_BYTES = (1 << 20) + 1
+
+# A fake `kubectl` covering only the two invocations the preflight makes (check
+# 4's `config current-context`, check 5's `cluster-info`), plus the
+# `--kubeconfig=<file>` form check 3 used to run, kept so a test can make it
+# hang. It reads the context out of a kubeconfig the way the real one does, so
+# a test fixes the *file* and the script's own logic decides the verdict.
 #
-# Two knobs reproduce the failure modes that matter:
+# These knobs reproduce the failure modes that matter:
 #   FAKE_AMBIENT_CONTEXT   - what a plain `kubectl` resolves to when it ignores
 #                            KUBECONFIG, i.e. the credential-proxy sidecar's own
 #                            context leaking in. Unset means KUBECONFIG is honoured.
@@ -26,11 +37,28 @@ EXPECTED_CONTEXT = f"gke_{PROJECT}_{LOCATION}_{CLUSTER}"
 #   FAKE_CONFIG_FAILS      - make `config current-context` fail the way a
 #                            credential-proxy outage does: non-zero, error on
 #                            stderr, nothing on stdout.
+#   FAKE_KUBECONFIG_FLAG_HANGS - make `--kubeconfig=<file> config current-context`
+#                            hang past the preflight's 15s cap, the way a request
+#                            queued behind a saturated credential broker does.
+#                            Only that form, the one check 3 used to run: a real
+#                            broker queues check 4's call too (see the timeout
+#                            test below).
+#   FAKE_CONFIG_TIMES_OUT  - make `config current-context` exit 124, as the
+#                            preflight's `timeout` wrapper does when it fires.
+#   FAKE_KUBECTL_LOG       - append every argv the fake receives to this file.
+#
+# The context is read with PyYAML, as the credential-proxy shim reads it, so a
+# quoted or commented value means the same thing to the fake as to the real one.
 FAKE_KUBECTL = textwrap.dedent(
     """\
     #!/bin/bash
     set -u
-    from_file() { sed -n 's/^current-context:[[:space:]]*//p' "$1" | head -n1; }
+    from_file() {
+        python3 -c 'import sys, yaml
+    doc = yaml.safe_load(open(sys.argv[1], encoding="utf-8", errors="replace")) or {}
+    print(doc.get("current-context") or "")' "$1"
+    }
+    [ -n "${FAKE_KUBECTL_LOG:-}" ] && printf '%s\\n' "$*" >>"$FAKE_KUBECTL_LOG"
 
     KCFG=""
     ARGS=()
@@ -43,9 +71,13 @@ FAKE_KUBECTL = textwrap.dedent(
 
     case "${ARGS[*]}" in
         "config current-context")
+            [ -n "${FAKE_CONFIG_TIMES_OUT:-}" ] && exit 124
             if [ -n "${FAKE_CONFIG_FAILS:-}" ]; then
                 echo "credential proxy unavailable: [Errno 111] Connection refused" >&2
                 exit 1
+            fi
+            if [ -n "$KCFG" ] && [ -n "${FAKE_KUBECONFIG_FLAG_HANGS:-}" ]; then
+                exec sleep 20
             fi
             if [ -n "$KCFG" ]; then
                 from_file "$KCFG"
@@ -105,6 +137,9 @@ class ClusterPreflightTest(unittest.TestCase):
         if context:
             body += f"current-context: {context}\n"
         self.kubeconfig.write_text(body, encoding="utf-8")
+
+    def write_raw_kubeconfig(self, tail: str) -> None:
+        self.kubeconfig.write_text("apiVersion: v1\nkind: Config\n" + tail, encoding="utf-8")
 
     def run_preflight(self, **extra_env) -> dict:
         # KUBECONFIG is exported by default because that is the real dispatch
@@ -204,13 +239,197 @@ class ClusterPreflightTest(unittest.TestCase):
     def test_reports_a_proxy_outage_as_such_not_as_a_bad_pin(self):
         # A failing `kubectl config current-context` used to be swallowed, leaving
         # an empty context that read as "the pin selects no cluster" - and sent the
-        # agent to re-scaffold, which runs through the same broken proxy.
+        # agent to re-scaffold, which runs through the same broken proxy. Check 3
+        # no longer runs kubectl, so the outage surfaces at check 4, the first call
+        # through the proxy, and must not read as "talking to another cluster".
         result = self.run_preflight(FAKE_CONFIG_FAILS="1")
         self.assertEqual("failed", result["status"])
+        self.assertEqual("4", result["check"])
         self.assertIn("kubectl itself failed", result["reason"])
+        self.assertNotIn("another cluster", result["remediation"])
         self.assertIn("Connection refused", result["evidence"])
         self.assertNotIn("does not select a cluster", result["reason"])
         self.assertNotIn("Re-scaffold the profile to re-fetch", result["remediation"])
+
+    # ---- Check 3 reads the file, not kubectl ---------------------------------
+
+    # In the sandbox `kubectl` is the credential-proxy shim, so a kubectl call is a
+    # request queued at the broker. Check 3 reads the pinned file itself.
+
+    def test_check_3_passes_while_kubectl_on_the_pinned_file_hangs(self):
+        # The today-mode smoke failure at check 3: the shim's request for it
+        # queued past the 15s cap on a busy broker and a correct pin failed.
+        # Check 4 still asks the broker, and the next test covers it timing out.
+        start = time.monotonic()
+        result = self.run_preflight(FAKE_KUBECONFIG_FLAG_HANGS="1")
+        self.assertEqual("ok", result["status"], result)
+        self.assertLess(time.monotonic() - start, PREFLIGHT_FAST_SECONDS)
+
+    def test_a_busy_broker_fails_check_4_as_a_proxy_problem_not_a_bad_pin(self):
+        # With check 3 local, check 4 is the first call through the proxy, so a
+        # saturated broker now times out there. It must say so, not report that
+        # plain kubectl is talking to another cluster.
+        result = self.run_preflight(FAKE_CONFIG_TIMES_OUT="1")
+        self.assertEqual("4", result["check"])
+        self.assertIn("kubectl itself failed", result["reason"])
+        self.assertIn("timed out after 15s", result["evidence"])
+        self.assertIn("not saturated", result["remediation"])
+        self.assertNotIn("another cluster", result["remediation"])
+
+    def test_a_non_utf8_byte_reads_as_the_shim_reads_it(self):
+        # The shim decodes with replacement before parsing; a stray Latin-1 byte
+        # in a comment must not fail check 3 while every proxied kubectl works.
+        self.kubeconfig.write_bytes(
+            b"apiVersion: v1\ncurrent-context: "
+            + EXPECTED_CONTEXT.encode()
+            + b"\n# caf\xe9\n"
+        )
+        self.assertEqual("ok", self.run_preflight()["status"])
+
+    def test_check_3_runs_no_kubectl_against_the_pinned_file(self):
+        # A passing run makes exactly the kubectl calls checks 4 and 5 own, in
+        # order. The whole list is compared, not filtered for one spelling: a
+        # check 3 back on the broker as `env KUBECONFIG=... kubectl config
+        # current-context` (the form check 5 uses) logs the same argv as check
+        # 4's plain call, and only the extra entry gives it away.
+        log = Path(self._tmp.name) / "kubectl.log"
+        self.assertEqual("ok", self.run_preflight(FAKE_KUBECTL_LOG=str(log))["status"])
+        calls = log.read_text(encoding="utf-8").splitlines()
+        self.assertEqual(
+            ["config current-context", "cluster-info --request-timeout=8s"], calls
+        )
+
+    def test_reads_a_double_quoted_context(self):
+        self.write_raw_kubeconfig(f'current-context: "{EXPECTED_CONTEXT}"\n')
+        self.assertEqual("ok", self.run_preflight()["status"])
+
+    def test_reads_a_single_quoted_context(self):
+        self.write_raw_kubeconfig(f"current-context: '{EXPECTED_CONTEXT}'\n")
+        self.assertEqual("ok", self.run_preflight()["status"])
+
+    def test_reads_an_unquoted_context_with_a_comment_and_trailing_space(self):
+        self.write_raw_kubeconfig(f"current-context: {EXPECTED_CONTEXT}   # pinned\n")
+        self.assertEqual("ok", self.run_preflight()["status"])
+
+    def test_reads_a_json_kubeconfig(self):
+        # kubectl accepts JSON kubeconfigs, and JSON is YAML.
+        self.kubeconfig.write_text(
+            json.dumps({"apiVersion": "v1", "kind": "Config", "current-context": EXPECTED_CONTEXT}),
+            encoding="utf-8",
+        )
+        self.assertEqual("ok", self.run_preflight()["status"])
+
+    def test_ignores_a_current_context_nested_below_the_top_level(self):
+        # A line-oriented reader would take this one; kubectl would not.
+        self.write_raw_kubeconfig(
+            f"contexts:\n- name: x\n  context:\n    current-context: {EXPECTED_CONTEXT}\n"
+        )
+        result = self.run_preflight()
+        self.assertEqual("3", result["check"])
+        self.assertIn("does not select a cluster", result["reason"])
+
+    def test_a_quoted_context_for_another_cluster_still_fails(self):
+        self.write_raw_kubeconfig(
+            f'current-context: "gke_{PROJECT}_{LOCATION}_someone-elses-cluster"\n'
+        )
+        result = self.run_preflight()
+        self.assertEqual("3", result["check"])
+        self.assertIn("different cluster", result["reason"])
+        self.assertIn("someone-elses-cluster", result["evidence"])
+
+    def test_an_empty_quoted_context_selects_no_cluster(self):
+        self.write_raw_kubeconfig('current-context: ""\n')
+        result = self.run_preflight()
+        self.assertEqual("3", result["check"])
+        self.assertIn("does not select a cluster", result["reason"])
+
+    def test_a_null_context_selects_no_cluster(self):
+        self.write_raw_kubeconfig("current-context:\n")
+        result = self.run_preflight()
+        self.assertEqual("3", result["check"])
+        self.assertIn("does not select a cluster", result["reason"])
+
+    def test_an_unreadable_kubeconfig_reports_check_3(self):
+        if os.geteuid() == 0:
+            self.skipTest("root reads a mode-000 file")
+        self.kubeconfig.chmod(0)
+        self.addCleanup(self.kubeconfig.chmod, 0o600)
+        result = self.run_preflight()
+        self.assertEqual("3", result["check"])
+        self.assertIn("cannot read the pinned kubeconfig", result["reason"])
+        self.assertIn("Permission denied", result["evidence"])
+        self.assertNotIn("credential proxy", result["remediation"])
+
+    def test_a_kubeconfig_that_is_not_yaml_reports_check_3(self):
+        self.write_raw_kubeconfig("current-context: [unclosed\n")
+        result = self.run_preflight()
+        self.assertEqual("3", result["check"])
+        self.assertIn("not a valid kubeconfig", result["reason"])
+        self.assertIn("Re-scaffold", result["remediation"])
+
+    def test_a_scalar_pyyaml_cannot_construct_reports_check_3_as_invalid(self):
+        # PyYAML's safe constructors raise plain Python exceptions, not
+        # yaml.YAMLError, for a scalar they cannot build: an impossible date
+        # anywhere in the file (ValueError), or an explicit tag on a value that
+        # does not fit it (ValueError, KeyError, IndexError, AttributeError).
+        for tail in (
+            "x: 2001-13-45\n",
+            "x: !!int abc\n",
+            "x: !!bool abc\n",
+            'x: !!int ""\n',
+            "x: !!timestamp abc\n",
+        ):
+            with self.subTest(tail=tail):
+                self.write_raw_kubeconfig(f"current-context: {EXPECTED_CONTEXT}\n{tail}")
+                result = self.run_preflight()
+                self.assertEqual("3", result["check"])
+                self.assertIn("not a valid kubeconfig", result["reason"])
+                self.assertIn("not parseable as YAML", result["evidence"])
+
+    def test_a_kubeconfig_that_is_not_a_mapping_reports_check_3(self):
+        self.kubeconfig.write_text("- just\n- a list\n", encoding="utf-8")
+        result = self.run_preflight()
+        self.assertEqual("3", result["check"])
+        self.assertIn("not a valid kubeconfig", result["reason"])
+
+    def test_a_non_string_context_reports_check_3(self):
+        self.write_raw_kubeconfig("current-context: [a, b]\n")
+        result = self.run_preflight()
+        self.assertEqual("3", result["check"])
+        self.assertIn("not a valid kubeconfig", result["reason"])
+
+    def test_an_oversized_kubeconfig_reports_check_3(self):
+        self.write_raw_kubeconfig(
+            f"current-context: {EXPECTED_CONTEXT}\n# {'x' * KUBECONFIG_OVER_CAP_BYTES}\n"
+        )
+        result = self.run_preflight()
+        self.assertEqual("3", result["check"])
+        self.assertIn("larger than", result["evidence"])
+
+    def test_a_missing_pyyaml_reports_a_broken_image_not_a_bad_pin(self):
+        # `-S` drops site-packages, which is where PyYAML lives.
+        real = shutil.which("python3")
+        wrapper = self.bin / "python3"
+        wrapper.write_text(f'#!/bin/bash\nexec "{real}" -S "$@"\n', encoding="utf-8")
+        wrapper.chmod(0o755)
+        result = self.run_preflight()
+        self.assertEqual("3", result["check"])
+        self.assertIn("PyYAML is not available", result["reason"])
+        self.assertIn("broken image", result["remediation"])
+
+    def test_a_missing_python3_reports_a_broken_image_not_a_bad_pin(self):
+        wrapper = self.bin / "python3"
+        wrapper.write_text("#!/bin/bash\nexit 127\n", encoding="utf-8")
+        wrapper.chmod(0o755)
+        result = self.run_preflight()
+        self.assertEqual("3", result["check"])
+        self.assertIn("PyYAML is not available", result["reason"])
+
+    def test_a_vanished_kubeconfig_is_caught_by_check_2_before_check_3(self):
+        self.kubeconfig.unlink()
+        result = self.run_preflight()
+        self.assertEqual("2", result["check"])
+        self.assertIn("not pinned", result["reason"])
 
     # ---- The check number is reported ----------------------------------------
 

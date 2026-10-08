@@ -162,9 +162,9 @@ gate is a case that fails for the environment rather than the agent.
 A fourth GKE management fee plus an `e2-small` and an `e2-standard-2`, standing, per eval project. The fee is the
 larger of the two: [`bench/tf/fleet/README.md`](../../bench/tf/fleet/README.md) puts three of them
 at most of the fleet's monthly total, with the nodes and two orphan disks making up the rest. No
-regional control plane and no accelerators. The cost arrives with the weekly reconcile, which
-creates the cluster in each pool project it applies to once the periodic is past its first-week
-`--dry-run` ([`docs/ci-health.md`](../ci-health.md)), rather than with a separate rollout.
+regional control plane and no accelerators. The cost arrives with the reconcile's postsubmit
+on the merge, which creates the cluster in every pool project
+([`docs/ci-pool-projects.md`](../ci-pool-projects.md) §6.2), rather than with a separate rollout.
 
 "No change to the three existing clusters" holds for the Tier 2 work and not for all of Tier 1: two
 of those five fixtures need a condition closed on `seeded-a` before the planted one is

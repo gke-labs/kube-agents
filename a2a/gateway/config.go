@@ -4,6 +4,7 @@ import (
 	"crypto/hkdf"
 	"crypto/sha256"
 	"fmt"
+	"net"
 	"os"
 	"strconv"
 	"strings"
@@ -30,6 +31,10 @@ const attributionSaltLen = 32
 // comment carries the sizing rationale.
 const defaultMaxSessions = 10
 
+// defaultDelegationDepthMax is what DelegationDepthMax means when unset; the
+// field's comment carries the rationale.
+const defaultDelegationDepthMax = 3
+
 // defaultGchatTokenPath is where the operator projects the gateway's
 // relay-audience ServiceAccount token when the gchat backend is armed.
 const defaultGchatTokenPath = "/var/run/secrets/a2a-chat-relay/token"
@@ -53,6 +58,16 @@ const (
 // defaultA2ADoorPrincipalMapPath is the same for the A2A door's map: its own
 // file, keys prefixed a2a:, for the reason the inject door's is.
 const defaultA2ADoorPrincipalMapPath = "/etc/a2a/a2a-door-principal-map/principals"
+
+// metricsPortEnv names the metrics listener's port (see MetricsPath in
+// metrics.go). Unset or empty means no listener, the broker's rule for
+// CREDENTIAL_PROXY_METRICS_PORT; metricsPortMin and metricsPortMax are the
+// range a set value has to fall in.
+const (
+	metricsPortEnv = "A2A_METRICS_PORT"
+	metricsPortMin = 1
+	metricsPortMax = 65535
+)
 
 // The display-mode values, matching the GoogleChatSpec.Mode enum.
 const (
@@ -117,14 +132,24 @@ type Config struct {
 	// SlackAllowedUsers is the Slack backend's ingress allowlist, carried
 	// from spec.integration.slack.allowedUsers the way GchatAllowedUsers is
 	// from Chat's: the gate the legacy path enforces as SLACK_ALLOWED_USERS.
-	// Unlike gchat, Slack also has a mapping table (PrincipalMapPath), and a
-	// sender must pass both: listed (or allow-all) AND mapped. Member ids
-	// compare exactly.
+	// It is the only admission gate (beside the gateway's refusal of another
+	// workspace's member); Slack's mapping table (PrincipalMapPath) is an
+	// optional override that attributes a listed sender by an IdP identity.
+	// Member ids compare exactly.
 	SlackAllowedUsers []string
 	// SlackAllowAllUsers disables the Slack allowlist, stated explicitly -
-	// mirroring the legacy SLACK_ALLOW_ALL_USERS posture. The map still
-	// applies.
+	// mirroring the legacy SLACK_ALLOW_ALL_USERS posture. Another
+	// workspace's member is still refused.
 	SlackAllowAllUsers bool
+
+	// TargetAllowedUsers is the per-target, per-backend trusted-human
+	// allowlist a session's delegation is checked against: target ->
+	// backend -> ids in that backend's vocabulary. Only "platform" is
+	// populated from env today (EnvTargetAllowedUsersGchat/Slack); an absent
+	// pair means all authenticated users, and a present pair whose list is
+	// empty means nobody. The A2A door's backend ("a2a") is the exception:
+	// no pair for it means nobody (doorUnlisted). See allowlist.go.
+	TargetAllowedUsers map[string]map[string][]string
 
 	// InjectListen is the inject side door's HTTP listen address, and setting
 	// it arms the door. DEV AND EVAL ONLY. The door is not a backend in the
@@ -186,6 +211,14 @@ type Config struct {
 	// Empty makes the card advertise the address it was fetched from.
 	A2ADoorPublicURL string
 
+	// MetricsPort is the metrics-only listener's port (A2A_METRICS_PORT);
+	// zero means no listener. It binds every interface, because its caller
+	// is the managed-Prometheus collector on the pod network, and serves
+	// MetricsPath and nothing else. It may not be either door's port: a door
+	// that lost its port to this listener would fail to bind, and a door
+	// that won it would be what the collector's NetworkPolicy rule admits.
+	MetricsPort int
+
 	// DisplayMode is the existing Chat integration's default-vs-debug split
 	// (GoogleChatSpec.Mode), honoured by this relay rather than reinvented:
 	// under "default" the rolling line carries the state but never the
@@ -244,19 +277,25 @@ type Config struct {
 	// it turns long-running asks into failed tasks sooner.
 	TaskDeadline time.Duration
 
-	// AskTTL bounds the active task's `ask` copy in session-state
-	// (A2A_ASK_TTL). The copy's stated justification — the same text rides
-	// the W-bounded stream and the copy dies at the terminal event — holds
-	// only where a terminal event is guaranteed, and the spec names the
-	// case where it is not (a wedged adapter, until every pod carries its
-	// deadline; fixed-route executors have no janitor until stage 3). So
-	// the record gets an independent bound: the reap scan clears an ask
-	// older than this, leaving the task record itself intact. Unset means
-	// 24h — far above any legitimate task's runtime, well under the
-	// stream's 72h retention, so the KV copy always has the shorter
-	// horizon the content posture claims. Raising it toward the stream
-	// retention erodes exactly that claim; lowering it only trims how long
-	// a status card can echo the ask.
+	// AskTTL bounds the copies of a turn that session-state keeps past the
+	// bus (A2A_ASK_TTL): the active task's `ask` copy, and each task history
+	// entry's requester (backend and pseudonymized subject) and attribution,
+	// aged by the entry's StartedAt. The ask copy's stated justification —
+	// the same text rides the W-bounded stream and the copy dies at the
+	// terminal event — holds only where a terminal event is guaranteed, and
+	// the spec names the case where it is not (a wedged adapter, until every
+	// pod carries its deadline; fixed-route executors have no janitor until
+	// stage 3). So the record gets an independent bound: the reap scan
+	// clears an ask, and a history entry's requester and attribution, once
+	// they are this old (exactly this old included), leaving the task record
+	// and the history entry themselves intact. Unset means 24h — far above
+	// any legitimate task's runtime, well under the stream's 72h retention,
+	// so the KV copies always have the shorter horizon the content posture
+	// claims. Raising it toward the stream retention erodes exactly that
+	// claim; lowering it trims how long a status card can echo the ask, and
+	// how long after a turn a child task can still be minted on its behalf:
+	// past the TTL the entry has no requester to check, so a delegation from
+	// it is refused.
 	AskTTL time.Duration
 
 	// SessionTTL bounds the lifetime of idle session records in session-state
@@ -381,6 +420,18 @@ type Config struct {
 	// ignores its own cap and cannot ignore that one), which is also what
 	// bounds the count-then-create race between concurrent conversations.
 	MaxSessions int
+
+	// DelegationDepthMax bounds how deep a delegation chain may run
+	// (A2A_DELEGATION_DEPTH_MAX). A human turn is depth 0, a child its
+	// parent's depth plus one, and a turn already at the bound may not
+	// delegate again. One child at a time means the chain is a line, and
+	// this bounds its length: a harness that delegates in a loop stops at
+	// the bound instead of walking the session cap.
+	//
+	// Zero means 3. FromEnv refuses a value under 1 rather than clamping
+	// it: 0 would be "delegation off", which is a different switch
+	// (A2A_DELEGATE_TOOL on the worker side), not a typo to paper over.
+	DelegationDepthMax int
 }
 
 // Backend names the REAL chat backend this config arms: "gchat", "slack",
@@ -451,6 +502,19 @@ func FromEnv() (*Config, error) {
 		}
 	}
 	cfg.GchatAllowAllUsers = os.Getenv("A2A_GCHAT_ALLOW_ALL_USERS") == "true"
+	cfg.TargetAllowedUsers = map[string]map[string][]string{}
+	platformLists := map[string][]string{}
+	// Set is a list, even set empty: the operator renders the var empty for
+	// a CR list of blanks, which admits nobody. Unset is no list.
+	if raw, ok := os.LookupEnv(EnvTargetAllowedUsersGchat); ok {
+		platformLists[gchatBackend] = append([]string{}, splitList(raw)...)
+	}
+	if raw, ok := os.LookupEnv(EnvTargetAllowedUsersSlack); ok {
+		platformLists[slackBackend] = append([]string{}, splitList(raw)...)
+	}
+	if len(platformLists) > 0 {
+		cfg.TargetAllowedUsers[targetPlatform] = platformLists
+	}
 	for _, u := range strings.Split(os.Getenv("A2A_SLACK_ALLOWED_USERS"), ",") {
 		if u = strings.TrimSpace(u); u != "" {
 			cfg.SlackAllowedUsers = append(cfg.SlackAllowedUsers, u)
@@ -464,6 +528,11 @@ func FromEnv() (*Config, error) {
 	cfg.A2ADoorToken = strings.TrimSpace(os.Getenv("A2A_DOOR_TOKEN"))
 	cfg.A2ADoorPrincipalMapPath = envOr("A2A_DOOR_PRINCIPAL_MAP", defaultA2ADoorPrincipalMapPath)
 	cfg.A2ADoorPublicURL = strings.TrimSpace(os.Getenv("A2A_DOOR_PUBLIC_URL"))
+	metricsPort, err := metricsPortFromEnv(cfg)
+	if err != nil {
+		return nil, err
+	}
+	cfg.MetricsPort = metricsPort
 	cfg.DisplayMode = envOr("A2A_CHAT_DISPLAY_MODE", displayModeDebug)
 	if cfg.DisplayMode != displayModeDefault && cfg.DisplayMode != displayModeDebug {
 		return nil, fmt.Errorf("A2A_CHAT_DISPLAY_MODE %q: want %q or %q", cfg.DisplayMode, displayModeDefault, displayModeDebug)
@@ -562,6 +631,12 @@ func FromEnv() (*Config, error) {
 		return nil, fmt.Errorf("A2A_MAX_SESSIONS %q: need an integer >= 1", maxSessions)
 	}
 	cfg.MaxSessions = n
+	depthMax := envOr("A2A_DELEGATION_DEPTH_MAX", strconv.Itoa(defaultDelegationDepthMax))
+	dm, err := strconv.Atoi(depthMax)
+	if err != nil || dm < 1 {
+		return nil, fmt.Errorf("A2A_DELEGATION_DEPTH_MAX %q: need an integer >= 1", depthMax)
+	}
+	cfg.DelegationDepthMax = dm
 	ttl := envOr("A2A_IDLE_TTL", "30m")
 	d, err := time.ParseDuration(ttl)
 	if err != nil {
@@ -651,6 +726,44 @@ func FromEnv() (*Config, error) {
 		cfg.AttributionSalt = derived
 	}
 	return cfg, nil
+}
+
+// metricsPortFromEnv reads A2A_METRICS_PORT: zero when unset or empty, else
+// a port in range that neither door's listen address already names. A bad
+// value refuses the boot, like every other setting FromEnv reads; the
+// operator renders a valid one, so only a hand edit reaches these refusals.
+func metricsPortFromEnv(cfg *Config) (int, error) {
+	raw := strings.TrimSpace(os.Getenv(metricsPortEnv))
+	if raw == "" {
+		return 0, nil
+	}
+	port, err := strconv.Atoi(raw)
+	if err != nil || port < metricsPortMin || port > metricsPortMax {
+		return 0, fmt.Errorf("%s %q: need a port in %d-%d", metricsPortEnv, raw, metricsPortMin, metricsPortMax)
+	}
+	for _, door := range []struct{ name, listen string }{
+		{"the inject door", cfg.InjectListen},
+		{"the A2A door", cfg.A2ADoorListen},
+	} {
+		if door.listen == "" {
+			continue
+		}
+		// Compared as the number net.Listen will bind, not as the string:
+		// net.LookupPort is the parse net.Listen runs on the port, so a
+		// zero-padded, signed or named spelling of this port is caught here
+		// rather than as a door that loses the bind to this listener. An
+		// address or port it cannot read is skipped, because the door's own
+		// net.Listen refuses it the same way when it binds; that failure is
+		// the door's, and not a collision with this listener.
+		_, doorPortRaw, err := net.SplitHostPort(door.listen)
+		if err != nil {
+			continue
+		}
+		if doorPort, err := net.LookupPort("tcp", doorPortRaw); err == nil && doorPort == port {
+			return 0, fmt.Errorf("%s %d is the port %s listens on (%q); the metrics listener needs a port of its own", metricsPortEnv, port, door.name, door.listen)
+		}
+	}
+	return port, nil
 }
 
 // pyStrip trims what Python's str.strip() trims and nothing more. The Slack

@@ -3982,6 +3982,7 @@ class CommandExecutorTest(unittest.TestCase):
         mib = credential_proxy.MEBIBYTE
         floor = credential_proxy.child_memory_budget_floor_bytes(8 * mib)
         self.assertEqual(672 * mib, floor)
+        self.assertEqual(credential_proxy.CHILD_MEMORY_BUDGET_FLOOR_BYTES_AT_DEFAULT_CAP, floor)
         executor = self.executor(memory_limit_bytes=floor, max_output_bytes=8 * mib)
         self.assertEqual(2, executor.requests_the_budget_admits())
         self.assertIsNotNone(executor.children_budget_bytes)
@@ -7752,6 +7753,332 @@ class ServeArmsTheReadOnlyGateTest(unittest.TestCase):
             for s in bound:
                 s.server_close()
 
+    # `apps` is spelled with another of GitHub's hosts: kept under the
+    # canonical one, it is matched by every request for the repository.
+    PINS = json.dumps(
+        [
+            {"repository": "https://github.com/acme/infra", "branch": "refs/heads/gitops-base"},
+            {"repository": "https://www.github.com/acme/apps", "branch": "release"},
+        ]
+    )
+
+    def test_serve_wires_the_pinned_bases_into_every_door_with_env_cleared(self):
+        # The argparse default is where CREDENTIAL_PROXY_PINNED_BASES is read;
+        # `serve` takes the parsed value and nothing else.
+        with mock.patch.dict(
+            os.environ, {"CREDENTIAL_PROXY_PINNED_BASES": self.PINS}, clear=True
+        ), mock.patch.object(sys, "argv", ["credential_proxy.py"]):
+            parsed = credential_proxy.parse_args()
+        self.assertEqual(self.PINS, parsed.pinned_bases)
+
+        args = argparse.Namespace(
+            policy=str(self.policy_path),
+            host="127.0.0.1",
+            port=0,
+            unix_socket=str(Path(self.tmp.name) / "backend.sock"),
+            timeout_seconds=5,
+            max_request_bytes=1 << 20,
+            max_output_bytes=1 << 20,
+            state_dir=str(Path(self.tmp.name) / "state"),
+            role="full",
+            base_branch="",
+            pinned_bases=parsed.pinned_bases,
+        )
+        environment = {
+            "API_SERVER_EXTERNAL_KEY": "external",
+            "CREDENTIAL_PROXY_BOOTSTRAP_COMMAND": "",
+            "CREDENTIAL_PROXY_SCOPED_SA_POOL": "0",
+            "CREDENTIAL_PROXY_CONTENT_WORKSPACE": "1",
+        }
+        bound = []
+
+        class FakeThread:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def start(self):
+                pass
+
+        def stop(server):
+            bound.append(server)
+            raise self._Stop()
+
+        originals = (
+            CredentialProxyHandler.base_branch,
+            CredentialProxyHandler.pinned_bases,
+            CredentialProxyHandler.workspaces,
+            CredentialProxyHandler.vcs,
+        )
+        expected = {
+            ("github.com", "acme/infra"): "gitops-base",
+            ("github.com", "acme/apps"): "release",
+        }
+        try:
+            with mock.patch.dict(os.environ, environment, clear=True), \
+                    mock.patch.object(credential_proxy, "ThreadingTCPHTTPServer", mock.MagicMock()), \
+                    mock.patch.object(credential_proxy.threading, "Thread", FakeThread), \
+                    mock.patch.object(credential_proxy.ThreadingUnixHTTPServer, "serve_forever", stop):
+                with self.assertRaises(self._Stop):
+                    credential_proxy.serve(args)
+
+            self.assertEqual(expected, CredentialProxyHandler.pinned_bases)
+            assert CredentialProxyHandler.vcs is not None
+            self.assertEqual(expected, CredentialProxyHandler.vcs.pinned_bases)
+            for repository, base in (
+                ("acme/infra", "gitops-base"),
+                ("acme/apps", "release"),
+                ("https://www.github.com/acme/apps", "release"),
+                ("https://github.com/Acme/Apps.git", "release"),
+                ("acme/other", None),
+            ):
+                with self.subTest(repository=repository):
+                    self.assertEqual(
+                        base,
+                        CredentialProxyHandler.vcs.capabilities({"repository": repository})["baseBranch"],
+                    )
+            assert CredentialProxyHandler.workspaces is not None
+            self.assertEqual(expected, CredentialProxyHandler.workspaces.pinned_bases)
+
+            # Each pinned branch is protected from a direct push, with no
+            # `--base-branch` and the environment cleared.
+            with mock.patch.dict(os.environ, {}, clear=True):
+                for branch in ("gitops-base", "release"):
+                    with self.subTest(push=branch):
+                        violation = git_argument_violation(["git", "push", "origin", f"HEAD:{branch}"])
+                        self.assertIn(f"protected branch '{branch}' is refused", violation or "")
+                # Paired ordinary use: an ordinary branch still pushes.
+                self.assertIsNone(
+                    git_argument_violation(["git", "push", "origin", "HEAD:platform-agent/fix"])
+                )
+        finally:
+            (
+                CredentialProxyHandler.base_branch,
+                CredentialProxyHandler.pinned_bases,
+                CredentialProxyHandler.workspaces,
+                CredentialProxyHandler.vcs,
+            ) = originals
+            for server in bound:
+                server.server_close()
+
+    def test_the_base_repository_flag_is_gone(self):
+        with mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(
+            sys, "argv", ["credential_proxy.py", "--base-repository", "acme/infra"]
+        ), mock.patch("sys.stderr", io.StringIO()):
+            with self.assertRaises(SystemExit):
+                credential_proxy.parse_args()
+
+    def _serve_with_pinned_bases(self, pinned_bases):
+        args = argparse.Namespace(
+            policy=str(self.policy_path),
+            host="127.0.0.1",
+            port=0,
+            unix_socket=str(Path(self.tmp.name) / "backend.sock"),
+            timeout_seconds=5,
+            max_request_bytes=1 << 20,
+            max_output_bytes=1 << 20,
+            state_dir=str(Path(self.tmp.name) / "state"),
+            role="full",
+            base_branch="",
+            pinned_bases=pinned_bases,
+        )
+        environment = {
+            "API_SERVER_EXTERNAL_KEY": "external",
+            "CREDENTIAL_PROXY_BOOTSTRAP_COMMAND": "",
+            "CREDENTIAL_PROXY_SCOPED_SA_POOL": "0",
+        }
+        bound = []
+
+        class FakeThread:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def start(self):
+                pass
+
+        def stop(server):
+            bound.append(server)
+            raise self._Stop()
+
+        originals = (
+            CredentialProxyHandler.base_branch,
+            CredentialProxyHandler.pinned_bases,
+            CredentialProxyHandler.workspaces,
+            CredentialProxyHandler.vcs,
+        )
+        try:
+            with mock.patch.dict(os.environ, environment, clear=True), \
+                    mock.patch.object(credential_proxy, "ThreadingTCPHTTPServer", mock.MagicMock()), \
+                    mock.patch.object(credential_proxy.threading, "Thread", FakeThread), \
+                    mock.patch.object(credential_proxy.ThreadingUnixHTTPServer, "serve_forever", stop):
+                credential_proxy.serve(args)
+        finally:
+            (
+                CredentialProxyHandler.base_branch,
+                CredentialProxyHandler.pinned_bases,
+                CredentialProxyHandler.workspaces,
+                CredentialProxyHandler.vcs,
+            ) = originals
+            for server in bound:
+                server.server_close()
+
+    def test_serve_refuses_pinned_bases_that_do_not_parse(self):
+        # A pin that matches nothing would leave that repository's base off
+        # with nothing said, so the broker does not start on one.
+        infra = "https://github.com/acme/infra"
+        for value in (
+            "not json",
+            '{"repository": "https://github.com/acme/infra", "branch": "b"}',
+            '["https://github.com/acme/infra"]',
+            "[null]",
+            # A repository with no stated host would be matched on whichever
+            # forge a request resolved to.
+            json.dumps([{"repository": "acme/infra", "branch": "b"}]),
+            json.dumps([{"repository": "github.com/acme/infra", "branch": "b"}]),
+            json.dumps([{"repository": "https://github.com/-acme/infra", "branch": "b"}]),
+            json.dumps([{"repository": 7, "branch": "b"}]),
+            json.dumps([{"branch": "b"}]),
+            json.dumps([{"repository": infra}]),
+            json.dumps([{"repository": infra, "branch": ""}]),
+            json.dumps([{"repository": infra, "branch": "refs/heads/"}]),
+            json.dumps([{"repository": infra, "branch": "HEAD"}]),
+            json.dumps([{"repository": infra, "branch": "-x"}]),
+            json.dumps([{"repository": infra, "branch": "a..b"}]),
+            json.dumps([{"repository": infra, "branch": ["b"]}]),
+            # A branch some door would read as another branch: `heads/x` is
+            # read as `x` by a push, and a second `refs/heads/` as the first.
+            json.dumps([{"repository": infra, "branch": "heads/x"}]),
+            json.dumps([{"repository": infra, "branch": "refs/heads/heads/x"}]),
+            json.dumps([{"repository": infra, "branch": "refs/heads/refs/heads/HEAD"}]),
+            json.dumps([{"repository": infra, "branch": "refs/heads/refs/heads/x"}]),
+            # A path the forge never reads as a repository, which no request
+            # could match: one segment, three, and a name that reads back as
+            # another once asked for.
+            json.dumps([{"repository": "https://github.com/acme", "branch": "b"}]),
+            json.dumps([{"repository": "https://github.com/acme/infra/extra", "branch": "b"}]),
+            json.dumps([{"repository": "https://github.com/acme/infra.git.git", "branch": "b"}]),
+            # A host no forge this install serves.
+            json.dumps([{"repository": "https://gitlab.example/acme/infra", "branch": "b"}]),
+            json.dumps([{"repository": "https://gitlab.com/acme/infra", "branch": "b"}]),
+            # One repository pinned twice, however it is spelled.
+            json.dumps(
+                [
+                    {"repository": infra, "branch": "a"},
+                    {"repository": "https://GitHub.com/Acme/Infra.git", "branch": "b"},
+                ]
+            ),
+            json.dumps(
+                [
+                    {"repository": infra, "branch": "a"},
+                    {"repository": "https://www.github.com/acme/infra", "branch": "b"},
+                ]
+            ),
+        ):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(RuntimeError, "CREDENTIAL_PROXY_PINNED_BASES"):
+                    self._serve_with_pinned_bases(value)
+
+    def test_each_pin_is_kept_under_its_forge_s_reading(self):
+        # The canonical host and the path the forge reads, whichever of the
+        # forge's hosts and spellings the pin was written with, and the branch
+        # with one `refs/heads/` gone.
+        for repository in (
+            "https://github.com/acme/infra",
+            "https://www.github.com/acme/infra",
+            "https://WWW.GitHub.com/acme/infra.git",
+            "git@github.com:acme/infra.git",
+        ):
+            for branch in ("release/q3", "refs/heads/release/q3", " release/q3 "):
+                with self.subTest(repository=repository, branch=branch):
+                    self.assertEqual(
+                        {("github.com", "acme/infra"): "release/q3"},
+                        credential_proxy.parse_pinned_bases(
+                            json.dumps([{"repository": repository, "branch": branch}])
+                        ),
+                    )
+        for empty in ("", "  ", "[]"):
+            with self.subTest(empty=empty):
+                self.assertEqual({}, credential_proxy.parse_pinned_bases(empty))
+
+    def test_a_pin_on_another_spelling_of_the_host_matches_a_request(self):
+        pins = credential_proxy.parse_pinned_bases(
+            json.dumps([{"repository": "https://www.github.com/acme/infra", "branch": "release"}])
+        )
+        broker = vcs_broker.VcsBroker(
+            Path(self.tmp.name) / "vcs",
+            git_runner=lambda *a, **k: self.fail("git ran"),
+            pinned_bases=pins,
+        )
+        for repository in ("acme/infra", "https://github.com/acme/infra", "https://www.github.com/acme/infra"):
+            with self.subTest(repository=repository):
+                self.assertEqual(
+                    "release", broker.capabilities({"repository": repository})["baseBranch"]
+                )
+
+    def test_a_pinned_base_cannot_be_pushed_under_another_spelling(self):
+        with mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(
+            CredentialProxyHandler, "pinned_bases", {("github.com", "acme/infra"): "release"}
+        ):
+            for target in ("release", "refs/heads/release", "heads/release"):
+                with self.subTest(target=target):
+                    violation = git_argument_violation(["git", "push", "origin", f"HEAD:{target}"])
+                    self.assertIn("protected branch 'release' is refused", violation or "")
+            # Paired ordinary use: `refs/heads/heads/release` is another branch.
+            self.assertIsNone(
+                git_argument_violation(["git", "push", "origin", "HEAD:refs/heads/heads/release"])
+            )
+
+    def test_a_mixed_case_pin_cannot_be_pushed_in_its_own_case(self):
+        # git matches a push destination case-sensitively, so `Heads/x` is the
+        # branch `refs/heads/Heads/x`, not `x`. Boot admits both pins (the
+        # one-spelling rule's prefixes are lowercase), so the push check must
+        # not strip a prefix that git would not.
+        for pin, target in (
+            ("Heads/x", "Heads/x"),
+            ("Heads/x", "refs/heads/Heads/x"),
+            ("Refs/Heads/x", "Refs/Heads/x"),
+        ):
+            with self.subTest(pin=pin, target=target):
+                pins = credential_proxy.parse_pinned_bases(
+                    json.dumps([{"repository": "https://github.com/acme/infra", "branch": pin}])
+                )
+                self.assertEqual({("github.com", "acme/infra"): pin}, pins)
+                with mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(
+                    CredentialProxyHandler, "pinned_bases", pins
+                ):
+                    violation = git_argument_violation(["git", "push", "origin", f"HEAD:{target}"])
+                self.assertIn(f"protected branch '{pin}' is refused", violation or "")
+        # Paired ordinary use: under the pin `Heads/x`, `x` is another branch.
+        with mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(
+            CredentialProxyHandler, "pinned_bases", {("github.com", "acme/infra"): "Heads/x"}
+        ):
+            self.assertIsNone(git_argument_violation(["git", "push", "origin", "HEAD:x"]))
+
+    def test_a_pin_is_protected_under_the_name_it_is_stored_by(self):
+        # The stored pin is the branch proposals are told to target, so it is
+        # protected as it is, not read again as another branch. Boot refuses
+        # a `heads/` pin; one set here directly shows the push check does not
+        # re-read it as `x` and leave `refs/heads/heads/x`, the pinned branch,
+        # open.
+        with mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(
+            CredentialProxyHandler, "pinned_bases", {("github.com", "acme/infra"): "heads/x"}
+        ):
+            violation = git_argument_violation(["git", "push", "origin", "HEAD:refs/heads/heads/x"])
+        self.assertIn("protected branch 'heads/x' is refused", violation or "")
+
+    def test_serve_logs_each_pinned_base(self):
+        with self.assertLogs(credential_proxy.LOGGER, level="INFO") as logs, \
+                self.assertRaises(self._Stop):
+            self._serve_with_pinned_bases(self.PINS)
+        output = "\n".join(logs.output)
+        self.assertIn(
+            "INFO:credential-proxy:pinned base repository=https://github.com/acme/infra branch=gitops-base",
+            output,
+        )
+        self.assertIn(
+            "INFO:credential-proxy:pinned base repository=https://github.com/acme/apps branch=release",
+            output,
+        )
+
 
 class ReadOnlyOverTheSocketTest(unittest.TestCase):
     """A mutation must stop at the proxy socket, not merely at a decision function."""
@@ -8450,6 +8777,30 @@ class VcsRouteTest(unittest.TestCase):
             )
         self.assertEqual(HTTPStatus.FORBIDDEN, status)
         self.assertEqual("REPOSITORY_NOT_MANAGED", payload.get("code"))
+
+    def test_a_target_off_the_pinned_base_comes_back_as_its_own_refusal(self):
+        broker = self.broker(
+            pinned_bases={("github.com", "acme/infra"): "gitops-base"},
+            cli_runner=lambda *a, **k: self.fail("the forge was called"),
+            refresh=lambda provider, repository: self.fail("a credential was spent"),
+        )
+        with mock.patch.object(
+            credential_proxy, "managed_repositories",
+            return_value=frozenset({"github:github.com/acme/infra"}),
+        ):
+            status, payload = self._handler(
+                "/v1/vcs/proposal-create",
+                {
+                    "repository": "https://github.com/acme/infra",
+                    "source": "fix/a",
+                    "target": "main",
+                    "title": "t",
+                },
+                broker,
+            )
+        self.assertEqual(HTTPStatus.CONFLICT, status)
+        self.assertEqual("TARGET_NOT_BASE", payload.get("code"))
+        self.assertIn("gitops-base", payload.get("error", ""))
 
     def test_capabilities_is_the_one_verb_an_unmanaged_repository_can_be_asked(self):
         # It spends no credential, so it is the one verb the route lets

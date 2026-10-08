@@ -206,6 +206,13 @@ The tier and the scope are **deliberately not on the wire**. Putting them there 
 a consumer authorize on content it did not verify, in the shape that looks most like
 working code - and that is the one thing 09 forbids.
 
+`authority.via` (added 10/5) is attribution of a third kind: `{"taskId": "...", "session":
+"..."}`. On a task the gateway minted on a session's request, it names the session turn that
+asked and that turn's session. On the wake-up turn after it, `taskId` is the minted task whose
+end woke the session (not the turn that asked), and `session` is still the session that asked.
+Like `requester` and `audience` it is populated by the gateway only and advisory; absent on a
+task a human turn started.
+
 **The rule.** A consumer MAY treat `authority.grants` as decision-grade, subject to all
 four of:
 
@@ -395,17 +402,18 @@ calls and become properties of the stream:
 ### Reserved artifact names
 
 Added 8/24, ratified with the subagent framework. `artifact-update` payloads name their
-artifact, and four names are reserved so renderers and audit tooling can rely on them:
+artifact, and five names are reserved so renderers and audit tooling can rely on them:
 
-| Name       | Content                                                                                                                                                         |
-| ---------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `result`   | The deliverable, chunked per A2A chunking rules                                                                                                                 |
-| `thinking` | Reasoning deltas. Debug views only                                                                                                                              |
-| `activity` | Tool-call trace, one entry per invocation. Always in the audit replay                                                                                           |
-| `progress` | Agent-authored milestones, renderable to chat at zero model cost. Stage 1 derives these from model narration; the subagent framework spec records the deviation |
+| Name       | Content                                                                                                                                                                                                                                                |
+| ---------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `result`   | The deliverable, chunked per A2A chunking rules                                                                                                                                                                                                        |
+| `thinking` | Reasoning deltas. Debug views only                                                                                                                                                                                                                     |
+| `activity` | Tool-call trace, one entry per invocation. Always in the audit replay                                                                                                                                                                                  |
+| `progress` | Agent-authored milestones, renderable to chat at zero model cost. Stage 1 derives these from model narration; the subagent framework spec records the deviation                                                                                        |
+| `delegate` | The session's request to the gateway to mint a child task: one `data` part `{"addressee", "text"}` on the session's own task events. Consumed by the gateway's relay, never rendered to chat; reserved 10/5, used from the delegation primitive onward |
 
 Artifact names are data, so the set can grow without touching the envelope; only these
-four carry reserved semantics. An `activity` entry is one `data` part whose object carries
+five carry reserved semantics. An `activity` entry is one `data` part whose object carries
 `tool`, `input` when the call had one, and may carry `callId`, `status` (`completed`, `error`,
 `interrupted` for a call still open at the terminal, or `truncated` on the one entry an executor
 publishes in place of the calls missing from the trace: past its budget, failed to publish,

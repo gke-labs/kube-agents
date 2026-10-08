@@ -1339,7 +1339,7 @@ class PeriodicNote(unittest.TestCase):
     """The watched Prow periodics ride beside the state as notes, never as a
     state: a failed or overdue run is evidence and a `periodics` entry."""
 
-    WEEKLY = "ci-kube-agents-fleet-reconcile-all"
+    DAILY = "ci-kube-agents-fleet-reconcile-daily"
     SWEEP = "ci-kube-agents-pull-sweep"
 
     def judge(self, readings, prev=None, now=T0):
@@ -1347,24 +1347,24 @@ class PeriodicNote(unittest.TestCase):
 
     def test_a_failed_reconcile_is_a_note_with_its_projects_and_the_state_stays_green(self):
         artifact = {"dry_run": True, "outcomes": {"kube-agents-evals-3": {"outcome": "refused", "detail": "delete google_container_cluster.seeded_b"}}}
-        result = self.judge({self.WEEKLY: periodic_reading(self.WEEKLY, T0 - timedelta(hours=1), passed=False, artifact=artifact)})
+        result = self.judge({self.DAILY: periodic_reading(self.DAILY, T0 - timedelta(hours=1), passed=False, artifact=artifact)})
         self.assertEqual(result["state"], "GREEN", "a failed periodic is a note, not a state")
-        note = result["periodics"][self.WEEKLY]
+        note = result["periodics"][self.DAILY]
         self.assertEqual((note["verdict"], note["build"], note["since"], note["dry_run"]), ("FAILED", "100", health.iso(T0), True))
-        self.assertEqual(note["detail"], ["kube-agents-evals-3: refused (delete google_container_cluster.seeded_b)"])
-        self.assertEqual(result["periodics_read"], [self.WEEKLY])
-        self.assertTrue(any("seeded-fleet reconcile (weekly): build 100 failed" in line for line in result["evidence"]), result["evidence"])
+        self.assertEqual(note["detail"], ["kube-agents-evals-3: refused (delete google_container_cluster.seeded_b); next: a code change, or an entry in bench/tf/fleet/reconcile-allow.json"])
+        self.assertEqual(result["periodics_read"], [self.DAILY])
+        self.assertTrue(any("seeded-fleet reconcile (daily): build 100 failed" in line for line in result["evidence"]), result["evidence"])
         # The episode's start carries through the previous health.json.
-        again = self.judge({self.WEEKLY: periodic_reading(self.WEEKLY, T0 - timedelta(hours=1), passed=False, build="100")}, prev=result, now=T0 + timedelta(hours=1))
-        self.assertEqual(again["periodics"][self.WEEKLY]["since"], health.iso(T0))
+        again = self.judge({self.DAILY: periodic_reading(self.DAILY, T0 - timedelta(hours=1), passed=False, build="100")}, prev=result, now=T0 + timedelta(hours=1))
+        self.assertEqual(again["periodics"][self.DAILY]["since"], health.iso(T0))
 
     def test_a_clean_fresh_pool_writes_no_note_and_names_what_it_read(self):
-        result = self.judge({self.SWEEP: periodic_reading(self.SWEEP, T0 - timedelta(minutes=10)), self.WEEKLY: periodic_reading(self.WEEKLY, T0 - timedelta(days=2))})
+        result = self.judge({self.SWEEP: periodic_reading(self.SWEEP, T0 - timedelta(minutes=10)), self.DAILY: periodic_reading(self.DAILY, T0 - timedelta(hours=20))})
         self.assertEqual(result["periodics"], {})
-        self.assertEqual(result["periodics_read"], [self.WEEKLY, self.SWEEP])
+        self.assertEqual(result["periodics_read"], [self.DAILY, self.SWEEP])
         self.assertFalse(any("reconcile" in line or "sweep" in line for line in result["evidence"]))
         # What each read job's latest build did, for the recovery message.
-        self.assertEqual(sorted(result["periodics_runs"]), [self.WEEKLY, self.SWEEP])
+        self.assertEqual(sorted(result["periodics_runs"]), [self.DAILY, self.SWEEP])
         self.assertEqual(result["periodics_streaks"][self.SWEEP], {"build": "100", "projects": {}, "runs": 0})
 
         self.assertEqual(result["periodics_runs"][self.SWEEP]["passed"], True)
@@ -1400,31 +1400,31 @@ class PeriodicNote(unittest.TestCase):
         self.assertEqual((blind["periodics"], blind["periodics_read"]), ({}, []))
 
     def test_an_episodes_start_survives_a_blind_tick_and_ends_on_a_clean_reading(self):
-        failing = {self.WEEKLY: periodic_reading(self.WEEKLY, T0 - timedelta(hours=1), passed=False)}
+        failing = {self.DAILY: periodic_reading(self.DAILY, T0 - timedelta(hours=1), passed=False)}
         first = self.judge(failing)
-        self.assertEqual(first["periodics_since"], {self.WEEKLY: health.iso(T0)})
+        self.assertEqual(first["periodics_since"], {self.DAILY: health.iso(T0)})
         blind = self.judge(None, prev=first, now=T0 + timedelta(hours=1))
-        self.assertEqual((blind["periodics"], blind["periodics_since"]), ({}, {self.WEEKLY: health.iso(T0)}))
+        self.assertEqual((blind["periodics"], blind["periodics_since"]), ({}, {self.DAILY: health.iso(T0)}))
         again = self.judge(failing, prev=blind, now=T0 + timedelta(hours=2))
-        self.assertEqual(again["periodics"][self.WEEKLY]["since"], health.iso(T0), "the start is not the blind tick's end")
-        clean = self.judge({self.WEEKLY: periodic_reading(self.WEEKLY, T0 + timedelta(hours=2))}, prev=again, now=T0 + timedelta(hours=3))
+        self.assertEqual(again["periodics"][self.DAILY]["since"], health.iso(T0), "the start is not the blind tick's end")
+        clean = self.judge({self.DAILY: periodic_reading(self.DAILY, T0 + timedelta(hours=2))}, prev=again, now=T0 + timedelta(hours=3))
         self.assertEqual((clean["periodics"], clean["periodics_since"]), ({}, {}))
         # Blind to one job, not another: the unread job's start survives.
         partial = self.judge({self.SWEEP: periodic_reading(self.SWEEP, T0 + timedelta(hours=1))}, prev=first, now=T0 + timedelta(hours=1))
-        self.assertEqual(partial["periodics_since"], {self.WEEKLY: health.iso(T0)})
+        self.assertEqual(partial["periodics_since"], {self.DAILY: health.iso(T0)})
         self.assertEqual(partial["periodics_read"], [self.SWEEP])
         # A job no longer watched leaves the carry.
         retired = dict(first, periodics_since={**first["periodics_since"], "ci-kube-agents-retired": health.iso(T0)})
-        self.assertEqual(self.judge(None, prev=retired, now=T0 + timedelta(hours=1))["periodics_since"], {self.WEEKLY: health.iso(T0)})
+        self.assertEqual(self.judge(None, prev=retired, now=T0 + timedelta(hours=1))["periodics_since"], {self.DAILY: health.iso(T0)})
 
     def test_staleness_is_measured_on_the_wall_clock_not_the_data_horizon(self):
         # A stalled archive freezes data.json's generated_at with the jobs; the
         # dead-man's switch has to read the time it is.
-        reading = {self.WEEKLY: periodic_reading(self.WEEKLY, T0 - timedelta(days=9))}
+        reading = {self.DAILY: periodic_reading(self.DAILY, T0 - timedelta(days=9))}
         frozen = health.adjudicate(data(), T0 - timedelta(days=8), None, health.Roster.fixed(ADMITTED), periodics_readings=reading)
         self.assertEqual(frozen["periodics"], {}, "on the data's own horizon the run is a day old")
         live = health.adjudicate(data(), T0 - timedelta(days=8), None, health.Roster.fixed(ADMITTED), wall_clock=T0, periodics_readings=reading)
-        self.assertEqual(live["periodics"][self.WEEKLY]["verdict"], "STALE")
+        self.assertEqual(live["periodics"][self.DAILY]["verdict"], "STALE")
 
 
 class PoolNote(unittest.TestCase):
@@ -2379,7 +2379,7 @@ class FixtureDrift(unittest.TestCase):
         self.assertEqual(
             result["advice"],
             f"A red on a case that depends on {DRIFT_ROLE} from a run that leased {project(1)} is the fixture, not your change;"
-            " retest once the fleet owner has re-applied bench/tf/fleet there (README, State and reconcile).",
+            " retest after the daily reconcile has re-applied bench/tf/fleet there (08:30 UTC) and the scan that follows reads it healthy.",
         )
         self.assertEqual(result["failing_cases"], [])
 

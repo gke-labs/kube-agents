@@ -47,6 +47,18 @@ branch when it exists and refuses "nothing to commit" when the new tree
 matches it (#1755 item 2). Every other branch but the default goes too: a
 pool repository is a fixture nothing else keeps branches in, so a branch with
 no open pull request is a leftover whatever its name.
+
+`--forge gitlab` is the same pass over the pool's GitLab projects
+(kube-agents#2394): the closer is hack/ci_gitlab_forge.py, the credential the
+pool's one agent token read from Secret Manager, and the report
+pull-sweep-gitlab.json. That pass has a second job, the only rotation-related
+one anything automated does: it reads both tokens' expiry into the report
+(gitlab_tokens) and warns from 30 days out, naming the token, so the yearly
+human rotation is flagged while it can still be done with overlap
+(docs/ci-pool-projects.md 5.6). A token that is merely due does not fail the
+run -- a month of red sweeps would read as failed projects -- but one that is
+dead or could not be checked does. CI health's read of the report is
+kube-agents#2571.
 """
 
 import argparse
@@ -197,6 +209,19 @@ _terminate = boskos_pool.terminate
 # `    <project>) echo "<owner>/<repo>" ;;` inside gitops_repo_for_project().
 CI_DEPLOY_SCRIPT = pathlib.Path(__file__).resolve().parent / "ci-deploy.sh"
 MAPPING_FUNCTION = "gitops_repo_for_project"
+# The GitLab pass (--forge gitlab, kube-agents#2394): the same closes against
+# each project's GitLab project, with the pool's one token pair read from
+# Secret Manager in the project the runner identities live in -- nothing is
+# minted and nothing is rotated (hack/ci_gitlab_forge.py says why). Its report
+# is a file of its own so the GitHub pass's is never overwritten in a job that
+# runs both.
+FORGE_GITHUB = "github"
+FORGE_GITLAB = "gitlab"
+GITLAB_MAPPING_FUNCTION = "gitlab_project_for_project"
+GITLAB_SECRETS_PROJECT = "kube-agents-prow"
+GITLAB_AGENT_SECRET = "gitlab-agent-token"
+GITLAB_LEDGER_SECRET = "gitlab-ledger-token"
+GITLAB_REPORT_FILE = "pull-sweep-gitlab.json"
 MAPPING_LINE_RE = re.compile(r'^\s+([A-Za-z0-9-]+)\)\s+echo "([^"/]+/[^"]+)"\s+;;\s*$')
 
 
@@ -667,12 +692,13 @@ def sweep_repo(project, repo, app_id, dry_run=False, runner=subprocess.run, budg
     return closed
 
 
-def pool_repos(ci_deploy_script=CI_DEPLOY_SCRIPT):
-    """{project: owner/repo} from gitops_repo_for_project() in hack/ci-deploy.sh."""
+def pool_repos(ci_deploy_script=CI_DEPLOY_SCRIPT, function=MAPPING_FUNCTION):
+    """{project: owner/repo} from gitops_repo_for_project() in hack/ci-deploy.sh,
+    or from gitlab_project_for_project() when `function` names it."""
     mapping = {}
     inside = False
     for line in pathlib.Path(ci_deploy_script).read_text(encoding="utf-8").splitlines():
-        if line.startswith(MAPPING_FUNCTION + "()"):
+        if line.startswith(function + "()"):
             inside = True
             continue
         if inside and line.startswith("}"):
@@ -682,8 +708,110 @@ def pool_repos(ci_deploy_script=CI_DEPLOY_SCRIPT):
             if match:
                 mapping[match.group(1)] = match.group(2)
     if not mapping:
-        raise SweepError("no %s() mapping found in %s" % (MAPPING_FUNCTION, ci_deploy_script))
+        raise SweepError("no %s() mapping found in %s" % (function, ci_deploy_script))
     return mapping
+
+
+def gitlab_secret(name, runner=subprocess.run):
+    """One of the pool's GitLab tokens, read from Secret Manager through gcloud
+    (the periodic's image is the Cloud SDK and its identity holds the read).
+    Captured, never an argument: it is in no `ps` and no log."""
+    read = runner(
+        ["gcloud", "secrets", "versions", "access", "latest", "--secret=%s" % name, "--project=%s" % GITLAB_SECRETS_PROJECT],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=GCLOUD_TIMEOUT_SECONDS,
+    )
+    if read.returncode != 0:
+        raise SweepError(
+            "gcloud could not read %s/%s: %s (docs/ci-pool-projects.md 5.6: the sweeper holds secretAccessor there)"
+            % (GITLAB_SECRETS_PROJECT, name, read.stderr.decode()[:GCLOUD_ERROR_CHARS])
+        )
+    # One printable line or nothing: a value with a line break inside would
+    # be refused by http.client with the value in the error text, and that
+    # text ends up in the report, a Prow artifact. A value that is not even
+    # text is the same refusal, not a decode traceback.
+    try:
+        token = read.stdout.decode().strip()
+    except UnicodeDecodeError:
+        token = ""
+    if not token or any(ch.isspace() or not ch.isprintable() for ch in token):
+        raise SweepError("%s/%s is empty or is not one token on one line; store the bare token (docs/ci-pool-projects.md 5.6)" % (GITLAB_SECRETS_PROJECT, name))
+    return token
+
+
+def _token_fault(name, exc):
+    """One line naming the secret, for a token that answered badly."""
+    if isinstance(exc, urllib.error.HTTPError) and exc.code == 401:
+        return "the token in %s no longer authenticates (HTTP 401): it has expired or been revoked; create a new one (docs/ci-pool-projects.md 5.6)" % name
+    if isinstance(exc, urllib.error.HTTPError):
+        return "GitLab answered HTTP %d (%s) looking up the token in %s" % (exc.code, exc.reason, name)
+    return "the token in %s could not be checked: %s" % (name, exc)
+
+
+def gitlab_token_expiry(runner=subprocess.run, today=None, entries=None):
+    """What each of the pool's two tokens says about its own expiry; the agent
+    token's value is returned too, for the sweep. Entries land in `entries`
+    (the run's list, when the caller passes it) as each is computed, so a
+    report written after a fault still carries the ones that were read.
+
+    The lookup authenticates with the token it asks about, so a token that
+    has expired or been revoked answers 401 here: the case this pass exists
+    to name. The agent token's fault ends the run, since nothing can be swept
+    without it; the ledger token is read for its expiry only, so its fault is
+    recorded as a due entry and the walk goes on."""
+    import ci_gitlab_forge as gitlab
+
+    entries = entries if entries is not None else []
+    agent = gitlab_secret(GITLAB_AGENT_SECRET, runner)
+    for secret, needed in ((GITLAB_AGENT_SECRET, True), (GITLAB_LEDGER_SECRET, False)):
+        name = "%s/%s" % (GITLAB_SECRETS_PROJECT, secret)
+        try:
+            token = agent if needed else gitlab_secret(GITLAB_LEDGER_SECRET, runner)
+            entry = gitlab.token_expiry(token, today=today)
+        except gitlab.RateLimited as exc:
+            raise RateLimited("looking up the token in %s: %s" % (name, exc))
+        except (urllib.error.HTTPError, OSError, http.client.HTTPException, subprocess.SubprocessError, gitlab.ResetError, ValueError, SweepError) as exc:
+            if needed:
+                raise SweepError(_token_fault(name, exc))
+            entries.append({"name": secret, "secret": name, "scopes": [], "expires_at": None, "days_left": None, "active": False, "warn": True, "urgent": True, "error": _token_fault(name, exc)})
+            continue
+        entry["secret"] = name
+        entries.append(entry)
+    return agent, entries
+
+
+def sweep_gitlab_project(project, path, token, dry_run=False):
+    """Close the agent's leftovers in one project's GitLab project; returns the count."""
+    import ci_gitlab_forge as gitlab
+
+    record = gitlab.empty_record()
+    try:
+        gitlab.reset_merge_requests(path, project, "sweep", "sweep", token, dry_run, record)
+    except Terminated as exc:
+        # As the GitHub closer does: the report written on the way out counts
+        # what this project's sweep had closed before the signal.
+        exc.closed = len(record["closed"])
+        raise
+    except gitlab.RateLimited as exc:
+        # The GitHub pass's rule: a limit ends the run, and the projects
+        # Boskos still hands out are held and released untouched.
+        raise RateLimited(str(exc), closed=len(record["closed"]))
+    except gitlab.ResetError as exc:
+        # The module's refusals (a path outside the pool, a lookup without a
+        # default branch, a listing that is not a list) are this project's
+        # fault, reported like any other and the walk goes on.
+        raise SweepError("%s: %s" % (path, exc), closed=len(record["closed"]))
+    # A dry run counts what it would close, as the GitHub pass's does.
+    closed = record["open_before"] if dry_run else len(record["closed"])
+    faults = []
+    if record["unclosed"]:
+        faults.append("left %d merge request(s) open: %s" % (len(record["unclosed"]), ", ".join("!%s" % n for n in record["unclosed"])))
+    if record["undeleted"]:
+        faults.append("left %d branch(es): %s" % (len(record["undeleted"]), ", ".join(record["undeleted"])))
+    if faults:
+        raise SweepError("%s: %s" % (path, "; ".join(faults)), closed=closed)
+    return closed
 
 
 def boskos_reset_stranded(server):
@@ -691,7 +819,7 @@ def boskos_reset_stranded(server):
     return boskos_pool.reset_stranded(server, BOSKOS_SWEEP_STATE, BOSKOS_STRANDED_AFTER, "sweep")
 
 
-def sweep_pool(server, owner, app_id, mapping, dry_run=False, runner=subprocess.run, report=None):
+def sweep_pool(server, owner, app_id, mapping, dry_run=False, runner=subprocess.run, report=None, forge=FORGE_GITHUB, gitlab_token=None):
     """Sweep every project Boskos will hand out as free, once each.
 
     Returns (closed_by_project, failures_by_project, unmapped). A project is
@@ -726,7 +854,10 @@ def sweep_pool(server, owner, app_id, mapping, dry_run=False, runner=subprocess.
             return
         print("sweeping %s (%s)" % (name, repo))
         try:
-            closed[name] = sweep_repo(name, repo, app_id, dry_run=dry_run, runner=runner, budget=budget)
+            if forge == FORGE_GITLAB:
+                closed[name] = sweep_gitlab_project(name, repo, gitlab_token, dry_run=dry_run)
+            else:
+                closed[name] = sweep_repo(name, repo, app_id, dry_run=dry_run, runner=runner, budget=budget)
         except RateLimited as exc:
             print("  %s: %s" % (name, exc), file=sys.stderr)
             if exc.closed:
@@ -798,13 +929,20 @@ def main(argv=None):
     )
     parser.add_argument(
         "--report",
-        default=default_report_path(),
-        help="where to write the run's %s (default: $%s/%s when Prow sets it, else nowhere)" % (REPORT_FILE, ARTIFACTS_ENV, REPORT_FILE),
+        default=None,
+        help="where to write the run's report (default: $%s/%s, or $%s/%s under --forge gitlab, when Prow sets it, else nowhere)"
+        % (ARTIFACTS_ENV, REPORT_FILE, ARTIFACTS_ENV, GITLAB_REPORT_FILE),
+    )
+    parser.add_argument(
+        "--forge", choices=(FORGE_GITHUB, FORGE_GITLAB), default=FORGE_GITHUB,
+        help="github (default): the App-signed sweep of the GitHub repositories; gitlab: the pool's GitLab projects with the shared token, plus its expiry warning",
     )
     args = parser.parse_args(argv)
+    if args.report is None:
+        args.report = default_report_path(args.forge)
     signal.signal(signal.SIGTERM, _terminate)
     started = time.time()
-    run = {"closed": {}, "failures": {}, "unmapped": [], "skipped": [], "left": 0, "ended_early": None}
+    run = {"closed": {}, "failures": {}, "unmapped": [], "skipped": [], "left": 0, "ended_early": None, "gitlab_tokens": []}
     code = None
     error = None
     try:
@@ -812,6 +950,9 @@ def main(argv=None):
         return code
     except Terminated as exc:
         error = "terminated (%s); held projects were released unless named above" % exc
+        due = _due_lines(run)
+        if due:
+            error = "%s; %s" % (error, "; ".join(due))
         print("ERROR: %s" % error, file=sys.stderr)
         code = TERMINATED_EXIT_CODE
         return code
@@ -826,14 +967,29 @@ def main(argv=None):
 def _run(args, run):
     """The sweep itself; (exit code, error line or None)."""
     try:
-        mapping = pool_repos(args.ci_deploy_script)
+        gitlab = args.forge == FORGE_GITLAB
+        mapping = pool_repos(args.ci_deploy_script, GITLAB_MAPPING_FUNCTION if gitlab else MAPPING_FUNCTION)
+        gitlab_token = None
+        if gitlab:
+            # Read once for the run, and both tokens' expiry with it: the
+            # warning is this pass's second job, and it rides on every exit
+            # below (_with_expiry), so a run that is red for a project still
+            # names a token that is due.
+            gitlab_token, _ = gitlab_token_expiry(subprocess.run, entries=run["gitlab_tokens"])
+            for entry in run["gitlab_tokens"]:
+                line = _expiry_line(entry)
+                if line:
+                    print("WARNING: %s" % line, file=sys.stderr)
         if args.project:
             repo = args.repo or mapping.get(args.project)
             if not repo:
                 raise SweepError("%s maps to no GitOps repository" % args.project)
             # A hand run: paced, but every write is made; there is no next run.
             try:
-                run["closed"][args.project] = sweep_repo(args.project, repo, args.app_id, dry_run=args.dry_run, runner=subprocess.run)
+                if gitlab:
+                    run["closed"][args.project] = sweep_gitlab_project(args.project, repo, gitlab_token, dry_run=args.dry_run)
+                else:
+                    run["closed"][args.project] = sweep_repo(args.project, repo, args.app_id, dry_run=args.dry_run, runner=subprocess.run)
             except SweepError as exc:
                 # The project's own fault (a refused close, a mint the App
                 # cannot make); a mapping fault is raised before this branch
@@ -841,21 +997,25 @@ def _run(args, run):
                 if getattr(exc, "closed", 0):
                     run["closed"][args.project] = exc.closed
                 run["failures"][args.project] = str(exc)
-                print("ERROR: %s" % exc, file=sys.stderr)
-                return 1, str(exc)
+                return _with_expiry(run, str(exc))
             except RateLimited as exc:
                 if exc.closed:
                     run["closed"][args.project] = exc.closed
                 run["failures"][args.project] = str(exc)
                 run["ended_early"] = str(exc)
-                print("ERROR: %s" % exc, file=sys.stderr)
-                return 1, str(exc)
+                return _with_expiry(run, str(exc))
             except Terminated as exc:
                 if getattr(exc, "closed", 0):
                     run["closed"][args.project] = exc.closed
                 run["failures"][args.project] = "terminated mid-sweep (%s)" % exc
                 raise
-            return 0, None
+            except (urllib.error.HTTPError, OSError, http.client.HTTPException) as exc:
+                # A listing the forge refused or a connection that outlasted
+                # the retries: the project's failure, recorded as the pool
+                # walk records it, so the report's counts match the exit.
+                run["failures"][args.project] = boskos_pool.describe(exc)
+                return _with_expiry(run, "%s: %s" % (args.project, boskos_pool.describe(exc)))
+            return _expiry_verdict(run)
         _, failures, _ = sweep_pool(
             args.boskos_server,
             args.boskos_owner,
@@ -864,28 +1024,66 @@ def _run(args, run):
             dry_run=args.dry_run,
             runner=subprocess.run,
             report=run,
+            forge=args.forge,
+            gitlab_token=gitlab_token,
         )
         if failures:
-            error = "%d project(s) not fully swept: %s" % (len(failures), ", ".join(sorted(failures)))
-            print("ERROR: %s" % error, file=sys.stderr)
-            return 1, error
-        return 0, None
+            return _with_expiry(run, "%d project(s) not fully swept: %s" % (len(failures), ", ".join(sorted(failures))))
+        return _expiry_verdict(run)
+    except RateLimited as exc:
+        # The token lookup's own limit (the per-project ones are caught
+        # above): the run ends here as any other limit ends it.
+        run["ended_early"] = str(exc)
+        return _with_expiry(run, str(exc))
     except (SweepError, boskos_pool.BoskosError) as exc:
-        print("ERROR: %s" % exc, file=sys.stderr)
-        return 1, str(exc)
+        return _with_expiry(run, str(exc))
     except urllib.error.HTTPError as exc:
-        error = "HTTP %d (%s) from %s: %s" % (exc.code, exc.reason, exc.url, boskos_pool.error_body(exc))
-        print("ERROR: %s" % error, file=sys.stderr)
-        return 1, error
+        return _with_expiry(run, "HTTP %d (%s) from %s: %s" % (exc.code, exc.reason, exc.url, boskos_pool.error_body(exc)))
     except (OSError, http.client.HTTPException, subprocess.SubprocessError) as exc:
-        error = "could not reach a service (%s: %s)" % (type(exc).__name__, exc)
-        print("ERROR: %s" % error, file=sys.stderr)
-        return 1, error
+        return _with_expiry(run, "could not reach a service (%s: %s)" % (type(exc).__name__, exc))
 
 
-def default_report_path():
+def _expiry_line(entry):
+    import ci_gitlab_forge as gitlab
+
+    if entry.get("error"):
+        return entry["error"]
+    return gitlab.expiry_message(entry, entry.get("secret", ""))
+
+
+def _due_lines(run):
+    return [line for line in (_expiry_line(e) for e in run.get("gitlab_tokens") or []) if line]
+
+
+def _expiry_verdict(run):
+    """A clean sweep stays clean while a token is merely due: the report and
+    the WARNING line at the start of the run name it, and CI health carries
+    the report's entry, so a yearly step does not read as thirty days of
+    failed sweeps. A token that is dead or could not be checked still fails
+    the run: nothing can grade or sweep with it."""
+    faults = [_expiry_line(e) for e in run.get("gitlab_tokens") or [] if e.get("error") or not e.get("active", True)]
+    faults = [line for line in faults if line]
+    if not faults:
+        return 0, None
+    error = "; ".join(faults)
+    print("ERROR: %s" % error, file=sys.stderr)
+    return 1, error
+
+
+def _with_expiry(run, error):
+    """A failed run's error line, with a token that is due appended: a run that
+    is red for a project must not hide the rotation it is also announcing."""
+    due = _due_lines(run)
+    if due:
+        error = "%s; %s" % (error, "; ".join(due))
+    print("ERROR: %s" % error, file=sys.stderr)
+    return 1, error
+
+
+def default_report_path(forge=FORGE_GITHUB):
     artifacts = os.environ.get(ARTIFACTS_ENV)
-    return str(pathlib.Path(artifacts) / REPORT_FILE) if artifacts else None
+    name = GITLAB_REPORT_FILE if forge == FORGE_GITLAB else REPORT_FILE
+    return str(pathlib.Path(artifacts) / name) if artifacts else None
 
 
 def write_report(path, args, run, code, error, started):
@@ -898,6 +1096,7 @@ def write_report(path, args, run, code, error, started):
         outcomes.setdefault(project, {})["error"] = text
     document = {
         "schema_version": REPORT_SCHEMA_VERSION,
+        "forge": getattr(args, "forge", FORGE_GITHUB),
         "mode": MODE_PROJECT if args.project else MODE_POOL,
         "dry_run": bool(args.dry_run),
         "started_at": time.strftime(ISO_UTC_FORMAT, time.gmtime(started)),
@@ -913,6 +1112,7 @@ def write_report(path, args, run, code, error, started):
         "skipped": list(run.get("skipped") or []),
         "left_for_next_run": run.get("left", 0),
         "outcomes": outcomes,
+        "gitlab_tokens": list(run.get("gitlab_tokens") or []),
     }
     try:
         pathlib.Path(path).parent.mkdir(parents=True, exist_ok=True)

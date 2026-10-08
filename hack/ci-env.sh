@@ -167,7 +167,15 @@ collect_bench_results() {
 # cannot be reached costs the run its gateway log and nothing else. The
 # failure dumper below calls this rather than taking its own, shorter tail, so
 # the failure path never overwrites the every-run capture with less.
+# Once per process, like collect_agent_pod_diagnostics: ci-eval-pr.sh takes it
+# before the next lane's rollback round trip replaces the pod, and the EXIT
+# trap's call after that must not overwrite the eval's log with the new pod's.
+# Read with a default, so the function alone, without this assignment, still
+# runs under `set -u` (the test suites lift it that way).
+GATEWAY_LOG_COLLECTED=""
 collect_gateway_log() {
+  [ -z "${GATEWAY_LOG_COLLECTED:-}" ] || return 0
+  GATEWAY_LOG_COLLECTED=1
   local artifact_dir="${ARTIFACTS:-/tmp/artifacts}"
   local ns="${TARGET_NAMESPACE:-${NAMESPACE:-kubeagents-system}}"
   mkdir -p "${artifact_dir}" || true
@@ -276,10 +284,18 @@ _stop_agent_pod_watch() {
 # Runs once per process: the eval's trap takes it and the failure dumper's
 # second call returns at once, rather than repeating every read against a
 # cluster that may be what failed, inside the deadline's grace.
+#
+# `--keep-watch` snapshots and leaves the watch running, for a caller that
+# replaces pods after it (ci-eval-pr.sh's rollback round trip). That caller
+# then clears AGENT_DIAG_COLLECTED and sets AGENT_DIAG_PREFIX, so the trap's
+# call stops the watch, whose tails then cover the replacement too, and
+# writes a second snapshot under the prefix beside the first.
 AGENT_DIAG_COLLECTED=""
+AGENT_DIAG_PREFIX=""
 collect_agent_pod_diagnostics() {
   [ -z "${AGENT_DIAG_COLLECTED}" ] || return 0
   AGENT_DIAG_COLLECTED=1
+  local prefix="${AGENT_DIAG_PREFIX:-}"
   local artifact_dir="${ARTIFACTS:-/tmp/artifacts}"
   local ns="${TARGET_NAMESPACE:-${NAMESPACE:-kubeagents-system}}"
   local kctl=(kubectl --request-timeout="${AGENT_DIAG_REQUEST_TIMEOUT}")
@@ -287,17 +303,19 @@ collect_agent_pod_diagnostics() {
     kctl+=(--context "${AGENT_CLUSTER_CONTEXT}")
   fi
   mkdir -p "${artifact_dir}" || true
-  _stop_agent_pod_watch "${artifact_dir}"
+  if [ "${1:-}" != "--keep-watch" ]; then
+    _stop_agent_pod_watch "${artifact_dir}"
+  fi
 
   "${kctl[@]}" get pods -n "${ns}" -o jsonpath="${AGENT_DIAG_POD_STATUS_JSONPATH}" \
-    > "${artifact_dir}/agent-pod-status.txt" 2>&1 || true
+    > "${artifact_dir}/${prefix}agent-pod-status.txt" 2>&1 || true
   "${kctl[@]}" get events -n "${ns}" --sort-by=.lastTimestamp -o wide 2>&1 \
-    | tail -n "${AGENT_DIAG_EVENTS_TAIL_LINES}" > "${artifact_dir}/k8s-events.txt" || true
-  "${kctl[@]}" top pods -n "${ns}" --containers > "${artifact_dir}/agent-pod-top.txt" 2>&1 || true
+    | tail -n "${AGENT_DIAG_EVENTS_TAIL_LINES}" > "${artifact_dir}/${prefix}k8s-events.txt" || true
+  "${kctl[@]}" top pods -n "${ns}" --containers > "${artifact_dir}/${prefix}agent-pod-top.txt" 2>&1 || true
 
   "${kctl[@]}" logs "${AGENT_DIAG_DEPLOYMENT}" -c "${AGENT_DIAG_AGENT_CONTAINER}" -n "${ns}" \
     --previous --tail="${AGENT_DIAG_LOG_TAIL_LINES}" 2>&1 \
-    | tail -c "${AGENT_DIAG_LOG_MAX_BYTES}" > "${artifact_dir}/platform-agent-previous.log" || true
+    | tail -c "${AGENT_DIAG_LOG_MAX_BYTES}" > "${artifact_dir}/${prefix}platform-agent-previous.log" || true
 
   local containers=""
   if ! containers=$("${kctl[@]}" get "${AGENT_DIAG_DEPLOYMENT}" -n "${ns}" \
@@ -310,10 +328,10 @@ collect_agent_pod_diagnostics() {
     *" ${AGENT_DIAG_BRIDGE_CONTAINER} "*)
       "${kctl[@]}" logs "${AGENT_DIAG_DEPLOYMENT}" -c "${AGENT_DIAG_BRIDGE_CONTAINER}" -n "${ns}" \
         --tail="${AGENT_DIAG_LOG_TAIL_LINES}" 2>&1 \
-        | tail -c "${AGENT_DIAG_LOG_MAX_BYTES}" > "${artifact_dir}/hermes-bridge.log" || true
+        | tail -c "${AGENT_DIAG_LOG_MAX_BYTES}" > "${artifact_dir}/${prefix}hermes-bridge.log" || true
       "${kctl[@]}" logs "${AGENT_DIAG_DEPLOYMENT}" -c "${AGENT_DIAG_BRIDGE_CONTAINER}" -n "${ns}" \
         --previous --tail="${AGENT_DIAG_LOG_TAIL_LINES}" 2>&1 \
-        | tail -c "${AGENT_DIAG_LOG_MAX_BYTES}" > "${artifact_dir}/hermes-bridge-previous.log" || true
+        | tail -c "${AGENT_DIAG_LOG_MAX_BYTES}" > "${artifact_dir}/${prefix}hermes-bridge-previous.log" || true
       ;;
   esac
 }
@@ -340,8 +358,9 @@ dump_prow_artifacts_on_failure() {
     } > "${artifact_dir}/ci-failure-summary.txt" 2>&1 || true
 
     # 2. Current running & previous crashed pod logs (crucial for rollout deadline / CrashLoopBackOff failures).
-    #    The running pod's log is the every-run capture above, taken again here
-    #    so a caller without a green-path collector (ci-deploy.sh) still gets it.
+    #    The running pod's log is the every-run capture above, taken here for a
+    #    caller without a green-path collector (ci-deploy.sh); in a process that
+    #    already took it (ci-eval-pr.sh) the collector keeps that first capture.
     #    The previous agent container (platform-agent-previous.log), the
     #    bridge sidecar, pod restarts and events come from the every-run
     #    collector, called here for the same reason, with its bounds.

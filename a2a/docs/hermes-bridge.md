@@ -71,7 +71,9 @@ the flip removes the NATS Service and leaves the bridge dialling a host that no 
 resolves. Confirmed live 2026-09-05: the sidecar crash-loops, and because it shares the
 agent's pod the pod never reaches Ready - the whole agent is down, not merely carrying
 an A2A trace. Unset `spec.deployment.sidecars` _before_ flipping to `today`. In any
-flip runbook that step is a blocker, not tidiness.
+flip runbook that step is a blocker, not tidiness. `hack/rollback-roundtrip.sh` follows
+it: it unsets the whole list, not only the sidecars that look like bus clients, flips,
+and declares the saved list again once `next` is back.
 
 **The webhook does not screen sidecar env, on purpose.** The `SensitiveEnvVars`
 refusal applies to `spec.deployment.env` only; a sidecar's own `env` is unscreened (the
@@ -226,7 +228,10 @@ is not in the publish list, so the publish is refused, the submission is dropped
 Hermes is never spawned. The refusal does not read as one: a rejected JetStream publish is
 a reply that never arrives, so the bridge logs a timeout and the submitter waits on a task
 that got no terminal event and was never run. Leave the env unset, or widen the grant in
-the operator to match — the two have to move together.
+the operator to match — and add the new addressee to `a2aReservedAddressees()` in the same
+change, so the auth callout's `A2A_RESERVED_ADDRESSEES` refuses a narrowed pod named after it.
+The three have to move together: a grant widened without the reservation lets a session pod
+named after the second addressee read and publish its task subjects.
 
 The agent container is the other half of the same change and needs no edit: the operator
 stops rendering `NATS_USER`/`NATS_PASSWORD` there and mounts a projected token instead.

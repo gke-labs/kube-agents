@@ -51,6 +51,13 @@ func startA2ARig(t *testing.T) *a2aRig {
 // itself, or the door under the composite the shipped gateway builds.
 func startA2ARigWith(t *testing.T, stack func(*A2ADoor) Adapter) *a2aRig {
 	t.Helper()
+	return startA2ARigOpts(t, stack, nil, nil)
+}
+
+// startA2ARigOpts is startA2ARigWith with a session spawner (nil: none) and
+// a hook into the Config before New sees it.
+func startA2ARigOpts(t *testing.T, stack func(*A2ADoor) Adapter, spawn *fakeSpawner, tweak func(*Config)) *a2aRig {
+	t.Helper()
 	s := startServer(t)
 	url := s.ClientURL()
 	provision(t, url)
@@ -103,7 +110,14 @@ func startA2ARigWith(t *testing.T, stack func(*A2ADoor) Adapter) *a2aRig {
 		FirstEventGrace:         a2aTestGrace,
 		AttributionSalt:         salt,
 	}
-	g, err := New(Options{Client: client, Adapter: stack(door), Config: cfg})
+	if tweak != nil {
+		tweak(cfg)
+	}
+	opts := Options{Client: client, Adapter: stack(door), Config: cfg}
+	if spawn != nil {
+		opts.Spawner = spawn
+	}
+	g, err := New(opts)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}

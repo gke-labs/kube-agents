@@ -96,7 +96,11 @@ agent's own install rather than the seeded fleet (the `bootstrap_*` checks,
 `sandbox_tree_matches_image`) is not a fixture read, and a case carrying only those needs
 no `fixtures:`. `fixtures: []` is the declaration for a case that plants its own state — `gpu-stress-test-diagnosis` brings up
 its own Terraform stack and depends on no fixture — and an absent key on such a case is a
-finding, because a grep that returns one case for a role has to mean one case uses it.
+finding, because a grep that returns one case for a role has to mean one case uses it. A
+case that depends on a slot's shape rather than on a plant (every seeded cluster is zonal,
+say) names one role per slot it reads and grounds the objective that needs every slot with
+`report_contains`'s `fixture_roles`, saying in a comment that the roles stand for their
+slots; the grep then still finds it when a slot's cluster is replaced.
 
 `owner` is who answers for the case when it flakes: a GitHub login written without the at
 sign, or the literal `maintainers` for a case the repository's `OWNERS` approvers own. It is
@@ -178,10 +182,31 @@ fixture role, named by `fixture_role:` rather than by cluster.
 Nine read what the run produced, from this repository
 (`bench/kube_agents_bench/verifiers.py`, registered through the
 `devops_bench.verifiers` entry-point group in `bench/pyproject.toml`):
-`report_contains` (phrases in the agent's answer; its `forbidden_patterns` are
-regular expressions, for a banned word whose negated uses are legitimate and
-which no substring can express, and its `any_of_patterns` are regular-expression
-alternatives to `any_of_phrases`, for a phrase that must start at a word boundary), `tool_called` (calls in the
+`report_contains` (phrases in the agent's answer; its `forbidden_patterns` and
+`any_of_patterns` are regular expressions searched against a line-preserving text, with each
+line's decoration folded when the check sets `fold_decoration: true` (indentation, bullets,
+numbers, headings, quotes, links, a trailing stop or an affirming mark; a mark that hedges or
+negates the last word stays, so it reads as a wrong value), so a pattern anchored at both ends
+spells a declared line once and should keep `\n` out of its gaps (a literal space does not cross a
+line break; a phrase that may wrap says `\s+`), for what no substring can
+express: a banned word whose negated uses are legitimate, a phrase that must start at a word
+boundary (`any_of_patterns` are the regex alternatives to `any_of_phrases`, one pool: at least one
+of either must match), and a required claim whose subject and verb an adverb or a tense can
+separate; `{cluster:<slot>}` in either list stands for the
+cluster the runner recorded for that slot, bare or as the last `-` or `/`-joined component of a longer id (a
+kubeconfig context's `_` joins only under `fold_decoration: true`, which makes it a `-`; without the fold the
+underscore is deleted as emphasis and the id has no boundary before the name) and
+optionally followed by its recorded location, bounded on both sides by the expansion itself (so
+`unseeded-a` and `seeded-a-canary` are never slot a, whatever surrounds the placeholder), and
+`{cluster:any}` for every recorded slot, so a case names which cluster rather than what a cluster's
+name looks like; a placeholder naming a slot the runner recorded no cluster for returns
+`status: "error"`, like an unreached `fixture_roles` slot, and because an unreached slot is absent
+from `{cluster:any}` rather than forbidden, a case that forbids through it lists a `fixture_roles`
+entry for every slot it means; its `fixture_roles` names the seeded-fleet
+roles whose clusters the patterns require a line about, each resolved to its slot's own
+credential (`clusters/<slot>.kubeconfig`, written for every seeded cluster the runner reached,
+before any role on it is confirmed), and a slot the runner did not reach returns
+`status: "error"`, the cluster being absent from the project rather than missed by the agent), `tool_called` (calls in the
 trajectory), `ledger_issue_contains` (the GitHub ledger issue a fleet audit
 published), `pull_request_opened` (the remediation pull request the run opened,
 resolved through GitHub and required to be this run's rather than an earlier
@@ -368,9 +393,12 @@ The commented-out registration — a `# ./tasks/<id>/task.yaml` line — is reti
 the parking state for a case whose fixture or blocker was not ready, and it was
 indistinguishable from a case nobody had decided about. A `#` line in a roster file is a
 comment, and the validator rejects a case path inside one. The one case that does not go
-in a roster file is one whose fixture does not exist at all: it is a `FIXTURE_NOT_READY`
-entry in `scripts/validate_bench_cases.py`, with the issue that plants the fixture, and it
-moves to the nightly file in the pull request that lands the fixture.
+in a roster file is one whose fixture is not on the pool: it is a `FIXTURE_NOT_READY`
+entry in `scripts/validate_bench_cases.py`, with the issue that plants the fixture. The
+pull request that lands the fixture leaves it there, because merging puts nothing on a
+cluster; the reconcile's postsubmit does (`docs/ci-pool-projects.md` 6.2). A later pull
+request moves it to the nightly file, citing a reconcile report that visited every pool
+project and a scan that reads the role healthy on all of them.
 
 Who approves follows the split: an edit to the presubmit file or to
 `hack/eval/blocking-roster.txt` needs an `eval-crew` approver (`hack/OWNERS`); the nightly
