@@ -336,7 +336,7 @@ func buildA2ABridgeContainer(agent *agentv1alpha1.PlatformAgent, agentContainer 
 		}
 	}
 
-	return corev1.Container{
+	c := corev1.Container{
 		Name:            a2aBridgeContainerName,
 		Image:           a2aBridgeImage(agentContainer.Image),
 		ImagePullPolicy: agentContainer.ImagePullPolicy,
@@ -344,8 +344,13 @@ func buildA2ABridgeContainer(agent *agentv1alpha1.PlatformAgent, agentContainer 
 		EnvFrom:         agentContainer.EnvFrom,
 		VolumeMounts:    mounts,
 		SecurityContext: agentContainer.SecurityContext.DeepCopy(),
-		Resources:       a2aRenderedBridgeResources(agentContainer.Resources),
 	}
+	// Sized for the executor the bridge will actually run, read from the
+	// finished env the way the bridge binary and the activity hook read it
+	// (a2aBridgeRunsAPIExecutor), not from the operator setting alone: an
+	// AgentPlugin's env can blank API_SERVER_KEY, and the bridge then runs cli.
+	c.Resources = a2aRenderedBridgeResources(agentContainer.Resources, !a2aBridgeRunsAPIExecutor(c))
+	return c
 }
 
 // a2aRenderedBridgeDefaultResources sizes the rendered bridge for the api
@@ -374,7 +379,8 @@ func a2aRenderedBridgeDefaultResources() corev1.ResourceRequirements {
 // a2aRenderedBridgeResources is the rendered bridge's resources. The
 // operator's A2A_BRIDGE_RESOURCES wins when it reads as exactly one usable
 // ResourceRequirements (a2aBridgeResourcesRefusal); a value it can't use is
-// logged once and ignored. Otherwise it depends on the executor. Under api,
+// logged once and ignored. Otherwise it depends on the executor the bridge
+// will run (cli says so; the caller reads it from the container's env). Under api,
 // the default, the bridge gets a2aRenderedBridgeDefaultResources rather than a
 // copy of the agent container's, which doubled the agent pod's requests and
 // left next pods unschedulable on clusters sized for today (gke-labs#2748).
@@ -382,14 +388,14 @@ func a2aRenderedBridgeDefaultResources() corev1.ResourceRequirements {
 // hermes chat per task, which the api defaults can't hold, so an install that
 // pinned cli before A2A_BRIDGE_RESOURCES existed upgrades with its bridge
 // unchanged. That case is logged once, pointing at the override.
-func a2aRenderedBridgeResources(agentResources corev1.ResourceRequirements) corev1.ResourceRequirements {
+func a2aRenderedBridgeResources(agentResources corev1.ResourceRequirements, cli bool) corev1.ResourceRequirements {
 	fallback := a2aRenderedBridgeDefaultResources()
-	if a2aRenderedBridgeExecutor() == a2aBridgeExecutorCLI {
+	if cli {
 		fallback = *agentResources.DeepCopy()
 	}
 	raw := os.Getenv(a2aBridgeResourcesOperatorEnvVar)
 	if raw == "" {
-		if a2aRenderedBridgeExecutor() == a2aBridgeExecutorCLI {
+		if cli {
 			a2aCLIBridgeWithoutResourcesLogged.Do(func() {
 				logf.Log.WithName("platformagent-controller").Info(
 					"The rendered bridge runs the cli executor with no " + a2aBridgeResourcesOperatorEnvVar + ", so it copies the agent container's resources. Set " + a2aBridgeResourcesOperatorEnvVar + " to size it: about 430Mi of memory per BRIDGE_CONCURRENCY worker, plus headroom.")

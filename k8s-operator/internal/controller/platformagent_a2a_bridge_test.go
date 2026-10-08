@@ -526,3 +526,34 @@ func TestACLIBridgeWithoutAnOverrideKeepsTheAgentsResources(t *testing.T) {
 		t.Errorf("a cli bridge with a usable override has a memory limit of %s, want the override's 5Gi", q.String())
 	}
 }
+
+// The bridge runs cli when BRIDGE_EXECUTOR is unset and API_SERVER_KEY is
+// blank, which an AgentPlugin's env can arrange. Sizing reads the executor
+// from the container's env the way the binary and the activity hook do, so
+// that bridge keeps the agent's resources instead of the api defaults.
+func TestABridgeWhoseEnvSelectsCLIIsSizedForCLI(t *testing.T) {
+	pod := bridgeTestPod(provisionedAgent())
+	agentC := containersNamed(pod, "platform-agent")[0]
+	blanked := agentC.DeepCopy()
+	found := false
+	for i := range blanked.Env {
+		if blanked.Env[i].Name == a2aBridgeAPIServerKeyEnvVar {
+			blanked.Env[i] = corev1.EnvVar{Name: a2aBridgeAPIServerKeyEnvVar, Value: " "}
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("the agent container carries no %s; the probe is vacuous", a2aBridgeAPIServerKeyEnvVar)
+	}
+	b := buildA2ABridgeContainer(provisionedAgent(), *blanked)
+	if a2aBridgeRunsAPIExecutor(b) {
+		t.Fatal("precondition: a bridge with a blank API_SERVER_KEY should run cli")
+	}
+	if !reflect.DeepEqual(b.Resources, agentC.Resources) {
+		t.Errorf("a bridge whose env selects cli got %+v, want the agent container's %+v", b.Resources, agentC.Resources)
+	}
+	// The stock bridge, whose key is set, is api and gets the defaults.
+	if b := buildA2ABridgeContainer(provisionedAgent(), agentC); !reflect.DeepEqual(b.Resources, a2aRenderedBridgeDefaultResources()) {
+		t.Errorf("the stock bridge got %+v, want the api defaults", b.Resources)
+	}
+}
