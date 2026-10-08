@@ -46,10 +46,12 @@ Chat Agent's home, and a job on another profile would gate itself on a different
 | Delivery: post the report to the first chat                     | Report claimed                               | `.bootstrap_completed` (kept)                              | Step 2 (§5) |
 
 Stages this job takes over keep their `.bootstrap_*` markers, so an install upgraded mid-onboarding
-carries on from where it was. New stages use `.oobe_*`. The `bootstrap_onboarding` plugin keeps the
+carries on from where it was. One whose `oobe` an earlier image already removed carries on through
+the old jobs, which the sync leaves enabled while no `oobe` job exists. New stages use `.oobe_*`. The `bootstrap_onboarding` plugin keeps the
 first message: it greets, and links the delivery to that chat.
 
-Order within a tick: scan, then audits, then delivery. The audits wait for the scan rather than
+Order within a tick: delivery, then the scan, then the audits (§5 says why delivery is first). The
+audits wait for the scan rather than
 starting at boot for two reasons. The report is the operator's first result and should not compete
 for the model quota with four audits at once: on an API-key install, three workers running
 together have been enough to hit per-minute 429s. And the report should land before the audit
@@ -199,7 +201,10 @@ takes 9–15 minutes on its own, most of it inside the SOP
 
 ## 5. Folding in the bootstrap jobs
 
-The second step moves the scan and delivery into `oobe` as stages, behind the audits.
+The second step moves the scan and delivery into `oobe` as stages. Delivery runs first in each
+tick: the scheduler snapshots a job's `deliver`/`origin` when the run starts, so the report must be
+claimed within seconds of that, as the old delivery job's was. Behind the scan and the audits stage
+(whose trigger subprocess can take 30 s), a chat linked in between would be missed.
 
 - **Code.** `bootstrap_scan_gate.py` and `bootstrap_delivery.py` stay as modules `oobe.py` calls;
   their markers and claim logic do not change.
@@ -210,14 +215,21 @@ The second step moves the scan and delivery into `oobe` as stages, behind the au
 - **The chat link.** The plugin links `oobe` to the first chat instead of
   `bootstrap-inventory-delivery`. An install upgraded after its first message has the link on the
   old job only, and the plugin will not run again, so `cron_jobs_sync.py` copies `deliver` and
-  `origin` from the old delivery job to `oobe` when `oobe` is first added. Without that, the report
-  goes out with `deliver: local` and reaches nobody.
+  `origin` from the old delivery job to `oobe` on any boot where `oobe` has no `origin` of its own.
+  Without that, the report goes out with `deliver: local` and reaches nobody. The plugin binds
+  every delivery job present, the old one included, so a rollback to an image from before the fold
+  finds the link where that image looks for it.
+- **An install with no `oobe`.** An image from before the fold removed `oobe` as soon as its
+  audits stage was done, without waiting for a human, so an install can arrive mid-onboarding with
+  `oobe` gone. While no `oobe` job exists, the sync leaves the two old jobs enabled, and they
+  finish onboarding as they did.
 - **Scan output stays out of chat.** Once linked, anything `oobe` prints is posted to the operator,
   and a non-zero exit is posted as a failure. The scan stage writes to stderr only, including its
   subprocesses (fd 1 redirected for the stage), and an exception in it is caught so it neither
   posts nor blocks delivery.
-- **Removal.** Five minutes after `.bootstrap_completed`, `oobe` removes itself and the two disabled
-  entries, as `bootstrap_delivery._retire_jobs` does today.
+- **Removal.** Once its first-run audits stage is done and `.bootstrap_completed` is five minutes
+  old, `oobe` removes the two disabled entries (`bootstrap_delivery._retire_jobs`) and then itself.
+  On an install nobody speaks to, the report is never claimed and `oobe` stays, doing nothing.
 - **Finished installs.** Already in step 1: the entrypoint passes `oobe` in `--assume-retired`
   when `.bootstrap_completed` exists, beside the two bootstrap ids, so an install that onboarded
   before the job existed never gets it.

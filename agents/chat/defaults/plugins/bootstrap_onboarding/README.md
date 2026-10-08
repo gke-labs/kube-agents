@@ -13,7 +13,10 @@ A third constraint used to be the decisive one: only the `default` profile's cro
 (`agents/chat/scripts/oobe.py`, design `docs/designs/oobe.md` §5): each minute it runs delivery
 (`bootstrap_delivery.py`), then the scan (`bootstrap_scan_gate.py` and the hand-off), then the
 first-run audits. The `bootstrap-inventory-scan` and `bootstrap-inventory-delivery` entries ship
-`enabled: false` until every install has booted with that form. Below, "the scan job" means
+`enabled: false` until every install has booted with that form, except on an install with no `oobe`
+job (an earlier image removed it once its audits were done), where the sync leaves them enabled
+and they finish onboarding as before. The plugin binds every delivery job present, so the link is
+on whichever one delivers, and on the old one after a rollback. Below, "the scan job" means
 `oobe`'s scan stage and "the delivery job" its delivery stage; the scripts and markers are the
 same.
 
@@ -137,7 +140,7 @@ sequenceDiagram
     participant Deliver as oobe delivery stage (bootstrap_delivery.py)
     participant Disk as /opt/data Filesystem & jobs.json
 
-    Note over Scan,Deliver: Pod Boot -> both jobs start with deliver: local
+    Note over Scan,Deliver: Pod Boot -> oobe starts with deliver: local
     User->>Agent: Turn 1 ("Hello!")
     Agent->>Hook: pre_llm_call (is_first_turn=True)
     Hook->>Disk: update_job(delivery, deliver=origin, origin=chat_id)
