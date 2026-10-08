@@ -331,7 +331,15 @@ the agent image patches it
 (`deploy/docker/patches/apply_ssh_shared_master.py`): `cleanup()` keeps its
 sync-back and leaves the shared master alone, so an exiting process no longer
 cuts a sibling's command; `ControlPersist=300` reaps the master once nothing has
-used it for five minutes. The eviction path after an `EnvironmentConnectionError`
+used it for five minutes. The same patch puts `ServerAliveInterval 15` and
+`ServerAliveCountMax 3` on the client's command line, where no config file or
+Hermes default can shadow them: a master whose peer died without a FIN or RST
+(an evicted sandbox pod) used to be cleared by the next process exit and is now
+dropped after three missed replies, about 60 s, and the next command opens a
+fresh master. The pair also caps how long a multiplexed command rides out a
+silent sandbox, where the sandbox's `sshd` allows the client five minutes;
+`sandbox_exec.py` and `sandbox_mirror.py` made the same trade for their own
+connections. The eviction path after an `EnvironmentConnectionError`
 is left as it is: nothing reaches it with a registered ssh environment, because a
 connection failure during construction fires before registration and the sync,
 foreground and background-spawn paths catch their own errors. A prompt-time

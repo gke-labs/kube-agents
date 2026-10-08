@@ -13,10 +13,11 @@ from unittest import mock
 
 import verify_ssh_shared_master as verify
 from apply_ssh_shared_master import (
-    MARKER, RESULT_ANCHOR, RESULT_RELATIVE, SSH_CLEANUP_ANCHOR, SSH_INIT_ANCHOR, SSH_RELATIVE, apply,
+    MARKER, RESULT_ANCHOR, RESULT_RELATIVE, SSH_ARGV_ANCHOR, SSH_CLEANUP_ANCHOR, SSH_INIT_ANCHOR, SSH_RELATIVE,
+    apply,
 )
 
-# tools/environments/ssh.py at v2026.9.14: the two anchored regions, nothing else of the class.
+# tools/environments/ssh.py at v2026.9.14: the three anchored regions, nothing else of the class.
 SSH_STUB = (
     "import contextlib\n"
     "import hashlib\n"
@@ -25,6 +26,7 @@ SSH_STUB = (
     "from pathlib import Path\n"
     "\n"
     "logger = logging.getLogger(__name__)\n"
+    "_SSH_MULTIPLEX = True\n"
     "\n"
     "\n"
     "class SSHEnvironment:\n"
@@ -41,6 +43,26 @@ SSH_STUB = (
     "        plain = Path(self.control_socket)\n"
     '        siblings = sorted(plain.parent.glob(f"{plain.stem[:8]}*.sock")) if plain.parent.is_dir() else []\n'
     "        return [plain, *(s for s in siblings if s != plain)]\n"
+    "\n"
+    "    def _control_socket_for(self, send_env):\n"
+    "        return Path(self.control_socket)\n"
+    "\n"
+    "    def _target_flags(self, port_flag):\n"
+    "        flags = [port_flag, str(self.port)] if self.port != 22 else []\n"
+    '        return flags + (["-i", self.key_path] if self.key_path else [])\n'
+    "\n"
+    "    def _build_ssh_command(self, extra_args=None, send_env=()):\n"
+    "        send_env = tuple(sorted(send_env))\n"
+    '        cmd = ["ssh"]\n'
+    "        if _SSH_MULTIPLEX:\n"
+    '            cmd.extend(["-o", f"ControlPath={self._control_socket_for(send_env)}",\n'
+    '                        "-o", "ControlMaster=auto", "-o", "ControlPersist=300"])\n'
+    + SSH_ARGV_ANCHOR +
+    '        cmd.extend(arg for name in send_env for arg in ("-o", f"SendEnv={name}"))\n'
+    '        cmd.extend(self._target_flags("-p"))\n'
+    "        cmd.extend(extra_args or [])\n"
+    '        cmd.append(f"{self.user}@{self.host}")\n'
+    "        return cmd\n"
     "\n"
     + SSH_CLEANUP_ANCHOR
 )
@@ -96,6 +118,7 @@ class ApplierTest(unittest.TestCase):
         ssh = (root / SSH_RELATIVE).read_text()
         self.assertIn("self._shared_master = not probe_only", ssh)
         self.assertIn("def close_master(self):", ssh)
+        self.assertIn('cmd.extend(["-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=3"])', ssh)
         self.assertNotIn(SSH_CLEANUP_ANCHOR, ssh)
         self.assertIn('returncode == 255 and failure_hint is None and not (result or {}).get("cwd_observed")',
                       (root / RESULT_RELATIVE).read_text())
@@ -132,6 +155,15 @@ class VerifierTest(unittest.TestCase):
         self.assertIn("does not carry the patch marker", joined)
         self.assertIn("no close_master()", joined)
         self.assertIn("carries no hint", joined)
+
+    def test_an_argv_without_the_keep_alive_pair_fails(self):
+        root = stage()
+        apply(root)
+        path = root / SSH_RELATIVE
+        path.write_text(path.read_text().replace('"-o", "ServerAliveInterval=15", ', ""))
+        rc, failures = run_verifier(root)
+        self.assertEqual(rc, 1)
+        self.assertIn("carries no `-o ServerAliveInterval=15`", "\n".join(failures))
 
     def test_a_renamed_probe_only_parameter_fails_the_gate(self):
         # The applier's __init__ anchor is the _socket_id line, which an upstream rename of

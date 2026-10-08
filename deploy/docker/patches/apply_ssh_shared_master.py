@@ -13,12 +13,20 @@ environment is running when one of them fires dies as a mux client whose master 
 ``cleanup()`` half of this patch goes when a Hermes bump derives ``ControlPath`` per environment,
 and the hint stays useful either way.
 
-Three anchored edits in two files:
+Four anchored edits in two files:
 
 - ``ssh.py``: ``cleanup()`` keeps ``sync_back`` and no longer closes the master; the exit loop
   becomes ``close_master()``. ``ControlPersist=300`` reaps an idle master and the far side is a
   StatefulSet pod, so nothing is lost. A prompt-time probe's master is private (its own socket)
   and ``cleanup()`` still closes that one.
+- ``ssh.py``: ``_build_ssh_command()`` adds ``ServerAliveInterval=15`` and ``ServerAliveCountMax=3``.
+  The process exit used to be what cleared a master whose peer died without a FIN or RST (an
+  evicted sandbox pod); now three missed replies, about 60 s, drop it and the next command opens
+  a fresh master. On the command line because that outranks every config file, so neither a
+  Hermes bump nor a file under the runtime home can shadow it. Same pair as
+  ``agents/platform/scripts/sandbox_exec.py`` and ``deploy/shared/sandbox_mirror.py``; it also
+  caps how long a multiplexed command rides out a silent sandbox, where the sandbox's sshd allows
+  the client five minutes the other way.
 - ``terminal_tool_result.py``: a foreground ssh result with exit 255 and no cwd marker gets a ``hint``, the
   way exit 124 has one, unless upstream already attached a hint to the output (``Permission
   denied``). The wrapper prints the marker after the command and exits with its code, so a
@@ -53,6 +61,13 @@ SSH_INIT_ANCHOR = (
 )
 SSH_INIT_PATCHED = SSH_INIT_ANCHOR + (
     f"        self._shared_master = not probe_only  # {MARKER}\n"
+)
+
+SSH_ARGV_ANCHOR = (
+    '        cmd.extend(["-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new", "-o", "ConnectTimeout=10"])\n'
+)
+SSH_ARGV_PATCHED = SSH_ARGV_ANCHOR + (
+    f'        cmd.extend(["-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=3"])  # {MARKER}\n'
 )
 
 SSH_CLEANUP_ANCHOR = (
@@ -109,13 +124,14 @@ def apply(root: Path) -> None:
     ssh = patchlib.Patch(root, SSH_RELATIVE, prefix=PREFIX)
     ssh.refuse_if_patched(MARKER)
     ssh.substitute(SSH_INIT_ANCHOR, SSH_INIT_PATCHED, label="shared-master mark in __init__")
+    ssh.substitute(SSH_ARGV_ANCHOR, SSH_ARGV_PATCHED, label="keep-alive on the client argv")
     ssh.substitute(SSH_CLEANUP_ANCHOR, SSH_CLEANUP_PATCHED, label="cleanup() exit loop")
 
     result = patchlib.Patch(root, RESULT_RELATIVE, prefix=PREFIX)
     result.refuse_if_patched(MARKER)
     result.substitute(RESULT_ANCHOR, RESULT_PATCHED, label="failure hint assignment")
 
-    ssh.commit("cleanup() leaves the shared master to ControlPersist; close_master() closes it")
+    ssh.commit("cleanup() leaves the shared master to ControlPersist and the client keeps it alive; close_master() closes it")
     result.commit("an ssh exit 255 without the cwd marker carries a hint")
 
 

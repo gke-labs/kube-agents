@@ -4,7 +4,8 @@
 Run by ``deploy/docker/Dockerfile`` from ``/opt/hermes`` after ``apply_ssh_shared_master.py``.
 The applier proves its anchors matched once; this imports the patched modules and proves they
 behave: a shared environment's ``cleanup()`` runs no ``ssh -O exit`` and ``close_master()`` does,
-a probe's ``cleanup()`` still closes its private master, and the terminal result carries the hint
+a probe's ``cleanup()`` still closes its private master, the client argv carries the keep-alive
+pair and no ``-F`` (the command line is what outranks every config file), and the terminal result carries the hint
 only for an ssh exit 255 without the cwd marker. The two inserted statements are also checked with
 ``patchlib.unbound`` for ``probe_only``, ``env_type`` and ``result`` (``returncode`` and
 ``failure_hint`` are pinned by the anchor line itself): the ``__init__`` mark is never executed here
@@ -123,6 +124,14 @@ def check_ssh(ssh) -> None:
             env(shared=False).cleanup()
             if len(_exit_calls(run)) != 1:
                 fail("a probe's cleanup() no longer closes its private master")
+        e = env(shared=True)
+        e.key_path = ""
+        argv = list(e._build_ssh_command())
+        for opt in ("ServerAliveInterval=15", "ServerAliveCountMax=3"):
+            if argv.count(opt) != 1 or argv[argv.index(opt) - 1] != "-o":
+                fail(f"the client argv carries no `-o {opt}`")
+        if "-F" in argv:
+            fail("the client argv carries -F, which would drop the system ssh config")
 
 
 def check_result(result_mod) -> None:
