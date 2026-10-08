@@ -890,7 +890,12 @@ def test_opening_turn_http_500_beside_passing_reps_does_not_gate(tofu_spec, make
 
 @pytest.mark.parametrize("status_code", [502, 503, 504])
 def test_opening_turn_http_5xx_variants_are_infra(noop_spec, make_run, status_code):
-    """HTTP 5xx status codes from agent endpoint on opening turn without trajectory are infra."""
+    """Exercises _is_http_5xx pattern matching across 5xx status codes from agent endpoint.
+
+    In the live harness, retryable 502/503/504 errors follow the transport retry
+    loop into _infra_failure (classified by the marker branch) unless non-retryable;
+    this tests scorer-level regex classification for 5xx error formats.
+    """
     def mutate(rec):
         http_500_opening_turn(rec)
         msg = f"HTTP {status_code} from agent endpoint: temporary failure"
@@ -943,7 +948,7 @@ def test_http_500_with_billed_tokens_and_empty_trajectory_is_not_infra(noop_spec
 
 def test_http_500_with_trajectory_and_null_tokens_is_not_infra(noop_spec, make_run):
     """Disjunct near-miss 2: non-empty trajectory with null tokens (inject-transport
-    shape) is an executed turn and remains graded, not excused as infra (#2430)."""
+    shape) blocks at Rung 3, not excused as infra (#2430)."""
     def mutate(rec):
         http_500_opening_turn(rec)
         rec["trajectory"] = [{"tool": "bash", "action": "echo hello"}]
@@ -951,12 +956,14 @@ def test_http_500_with_trajectory_and_null_tokens_is_not_infra(noop_spec, make_r
 
     verdict = grade_case(noop_spec, [make_run(mutate=mutate)], admitted=True)
     assert verdict.rung is not Rung.INFRA
+    assert verdict.blocking is True
+    assert verdict.rung is Rung.NOT_A_REAL_RUN
 
 
 def test_executed_turn_with_failure_reason_is_not_classified_as_infra(noop_spec, make_run):
     """An executed agent turn that failed with X-Hermes-Failure-Reason has empty
-    trajectory and null tokens in the harness result, but is an agent error and
-    must not be excused as infra."""
+    trajectory and null tokens in the harness result, and blocks at Rung 3 rather
+    than being excused as infra."""
     def mutate(rec):
         rec["trajectory"] = []
         rec["tokens"] = {"total": None, "prompt": None, "completion": None}
@@ -968,7 +975,27 @@ def test_executed_turn_with_failure_reason_is_not_classified_as_infra(noop_spec,
 
     verdict = grade_case(noop_spec, [make_run(mutate=mutate)], admitted=True)
     assert verdict.rung is not Rung.INFRA
-    assert verdict.passes == 0
+    assert verdict.blocking is True
+    assert verdict.rung is Rung.NOT_A_REAL_RUN
+
+
+def test_successful_agent_turn_opening_with_http_5xx_text_is_not_infra(noop_spec, make_run):
+    """An agent answer in prose that happens to open with HTTP 5xx text on a
+    status='success' record without usage tokens blocks at Rung 3 and is not
+    excused as infra (#2430)."""
+    def mutate(rec):
+        rec["trajectory"] = []
+        rec["tokens"] = {"total": None, "prompt": None, "completion": None}
+        rec["status"] = "success"
+        msg = "HTTP 503 Service Unavailable is returned by the ingress when no pods match."
+        rec["output"] = msg
+        rec["errors"] = []
+        rec["scores"]["VerificationCorrectness"] = 1.0
+
+    verdict = grade_case(noop_spec, [make_run(mutate=mutate)], admitted=True)
+    assert verdict.rung is not Rung.INFRA
+    assert verdict.blocking is True
+    assert verdict.rung is Rung.NOT_A_REAL_RUN
 
 
 def test_a_provision_failure_is_infrastructure_not_a_scoring_crash(tofu_spec, make_run):

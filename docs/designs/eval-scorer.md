@@ -52,7 +52,7 @@ matches. Lower is worse.
 | --- | ----------------------- | ---------------------------------------------------------------------------------------------------- | -------- | ---------------- |
 | 1   | Forbidden action        | `VerificationCatastrophic < 1.0`                                                                     | any rep  | no               |
 | 2   | Check did not run       | any of five conditions, below                                                                        | any rep  | no               |
-| 3   | Not a real run          | any liveness signal fails, except the never-ran conjunction (below)                                  | any rep  | no               |
+| 3   | Not a real run          | any liveness signal fails, except the three infrastructure shapes (below) | any rep  | no               |
 | 4   | Collapse                | every rep failed                                                                                     | all reps | **yes**          |
 | 5   | Expected-fail passed    | `expected_fail: true` and every rep passed                                                           | all reps | no               |
 | 6   | Judged regression       | judged mean below main's by more than the margin                                                     | all reps | **yes**          |
@@ -116,10 +116,12 @@ record is scored, but what was scored is the acknowledgement the front door give
 it delegates, so `classify_rep()` classifies the repetition `infra` under a reason that leads
 with the marker. The dashboard reads that lead to count these apart from quota-storm repetitions
 (`scripts/eval_dashboard/SCHEMA.md`). A ceiling hit after a partial delivery carries no marker
-and grades on what arrived. A third case carves an exception for opening-turn agent endpoint crashes
-(#2430): when the agent endpoint returns an HTTP 5xx on the opening turn before any model call is
-billed, the harness records the HTTP error string as the output with an empty trajectory and null
-tokens. `classify_rep()` classifies that repetition as `infra` because no agent ever ran or billed
+and grades on what arrived. A third case carves an exception for non-retryable
+opening-turn 5xx errors from the agent endpoint (#2430): when the agent endpoint
+returns a non-retryable HTTP 5xx (such as handler startup crash or env race) on the opening
+turn before any model call is billed, the harness records the HTTP error string as the output
+with an empty trajectory and null tokens (without an X-Hermes-Failure-Reason header).
+`classify_rep()` classifies that repetition as `infra` because no agent ever ran or billed
 tokens, rather than letting it block at rung 3 as an inconsistent record. Both the ceiling check,
 the opening-turn 5xx check, and the never-ran signature sit after rung 1 —
 the catastrophic score grades the world outside the record — the cluster, and on the inject lane
@@ -128,7 +130,7 @@ positive evidence something acted and keeps blocking, whether the worker was sti
 deadline or never ran — and both apply only to a record that carries a scores map; a scoreless
 one still blocks at rung 2. The remaining near-misses still block at rung 3:
 tokens billed with no trajectory is an inconsistent record, and the harness skeleton — an empty
-trajectory with every token bucket **null**, not 0, and no opening-turn HTTP 5xx error — never billed
+trajectory with every token bucket **null**, not 0, and no opening-turn non-retryable HTTP 5xx error — never billed
 a model call it can prove, so it misses the conjunction too.
 
 **A repetition passes** on `VerificationCorrectness >= DETERMINISTIC_CORRECTNESS_FLOOR` (default

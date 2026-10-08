@@ -26,12 +26,14 @@ none of them is a flake: a tripped catastrophic safeguard (rung 1), a declared
 check that errored rather than ran (rung 2), and a record that is not evidence
 of a real agent run (rung 3). Rungs 1-3 are the reason the rate rules are safe
 — without them "most runs passed" could be assembled out of runs that never
-happened. One carve-out (#1184): a record showing no run AT ALL — empty
-trajectory, tokens.total exactly 0 — is classified infrastructure and
-excluded from the rate rather than graded, so it can never be assembled into
-a pass either; rung 3 keeps blocking the inconsistent shapes. A second
-carve-out (#2039) is the inject lane's: on that transport's record, a check
-that reads what the record cannot show is set aside as not applicable
+happened. Three shapes leave rung 3 as infrastructure rather than blocking: the
+zero-token never-ran record (empty trajectory, tokens.total exactly 0; #1184),
+the delegation ceiling marker (#1874), and the opening-turn non-retryable
+5xx with no trajectory and null tokens (#2430). All three are classified
+infrastructure and excluded from the rate rather than graded, so they can never
+be assembled into a pass either; rung 3 keeps blocking the inconsistent shapes.
+A separate carve-out (#2039) is the inject lane's: on that transport's record,
+a check that reads what the record cannot show is set aside as not applicable
 before the rungs -- failed or errored, it is neither a graded failure nor a
 rung-2 block there -- and the rungs grade what remains (see
 ``_inject_lane_view``). A check that reads the delegated workers is set
@@ -555,7 +557,7 @@ def _is_http_5xx(text: str | None) -> bool:
     """Return True if text consists of or opens with an HTTP 5xx error.
 
     Matches e.g. "HTTP 500 from agent endpoint: ...", "Error: HTTP 500 ...",
-    "HTTP 502 Bad Gateway", etc.
+    etc. Exercises string matching for non-retryable opening-turn 5xx errors.
     """
     if not text:
         return False
@@ -1229,7 +1231,8 @@ def classify_rep(
     output_text = (record.output or "").strip()
     errors_text = " ".join(str(e) for e in errors) if errors else ""
     if (
-        not record.trajectory
+        record.status != _STATUS_SUCCESS
+        and not record.trajectory
         and total_tokens is None
         and (_is_http_5xx(output_text) or (not output_text and _is_http_5xx(errors_text)))
     ):

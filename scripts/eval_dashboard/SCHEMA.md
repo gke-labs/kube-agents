@@ -462,7 +462,9 @@ what the renderer does with them.
   task results; an `infra` rep whose `reason` leads with
   `KUBE_AGENTS_DELEGATION_CEILING` is also excluded from the storm counts
   (`storm_reps`, `health.json`'s `infra_reps`) and reported under
-  `metrics.ceiling_reps` instead. When `reps` is absent the task's single
+  `metrics.ceiling_reps` instead. Other `infra` repetitions (429 rate limits,
+  empty never-ran records under #1184, and opening-turn non-retryable 5xx errors
+  under #2430) are counted as storm repetitions. When `reps` is absent the task's single
   `result` stands in for one rep.
 - `runs[].eval_verdict` — `GREEN` | `RED` | `null`: the Nightly report reads
   it; a night that is not a `SUCCESS` and carries `null` was ended before
