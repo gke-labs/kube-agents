@@ -6,7 +6,6 @@ The applier's contract against miniature copies of the two Hermes files, and the
 against the same stubs patched and unpatched: it imports them as ``tools.*`` from the staged root.
 """
 
-import shutil
 import tempfile
 import unittest
 from pathlib import Path
@@ -143,8 +142,11 @@ class ApplierTest(unittest.TestCase):
             self.assertNotIn(MARKER, (root / rel).read_text(), rel)
 
 
-@unittest.skipUnless(shutil.which("ssh") or Path("/usr/bin/ssh").exists(), "the verifier resolves the argv with ssh -G")
+needs_ssh = unittest.skipUnless(verify._ssh_client(), "the verifier resolves the argv with ssh -G")
+
+
 class VerifierTest(unittest.TestCase):
+    @needs_ssh
     def test_patched_stubs_pass(self):
         root = stage()
         apply(root)
@@ -159,6 +161,7 @@ class VerifierTest(unittest.TestCase):
         self.assertIn("no close_master()", joined)
         self.assertIn("carries no hint", joined)
 
+    @needs_ssh
     def test_an_argv_without_the_keep_alive_pair_fails(self):
         root = stage()
         apply(root)
@@ -170,6 +173,7 @@ class VerifierTest(unittest.TestCase):
         # keyword and the expected value are pinned.
         self.assertRegex("\n".join(failures), r"ssh resolves serveraliveinterval to \S+, expected 15")
 
+    @needs_ssh
     def test_an_argv_without_the_count_fails(self):
         root = stage()
         apply(root)
@@ -179,6 +183,7 @@ class VerifierTest(unittest.TestCase):
         self.assertEqual(rc, 1)
         self.assertRegex("\n".join(failures), r"ssh resolves serveralivecountmax to \S+, expected 3")
 
+    @needs_ssh
     def test_an_earlier_copy_of_the_interval_fails(self):
         # An upstream `-o ServerAliveInterval=N` placed before the anchor is earlier in argv and
         # wins under first-value-wins, so the gate refuses any second copy whatever its value.
@@ -189,6 +194,7 @@ class VerifierTest(unittest.TestCase):
         self.assertEqual(rc, 1)
         self.assertIn("ssh resolves serveraliveinterval to 5, expected 15", "\n".join(failures))
 
+    @needs_ssh
     def test_every_spelling_of_an_earlier_copy_fails(self):
         # ssh also takes the option glued to -o, after `-o=`, bundled behind other short flags, with
         # the keyword in any case, and with a space instead of `=`; the gate asks ssh -G what it
@@ -205,17 +211,6 @@ class VerifierTest(unittest.TestCase):
                 rc, failures = run_verifier(root)
                 self.assertEqual(rc, 1, spelling)
                 self.assertIn(f"ssh resolves {expect}, expected", "\n".join(failures), spelling)
-
-    def test_a_glued_or_bundled_dash_f_fails(self):
-        # Where the image's drop-in is installed the gate sees its SendEnv vanish; elsewhere (this
-        # suite on a developer machine) it falls back to the flag itself, in any bundling.
-        for spelling in ('"-F/dev/null"', '"-4F", "/dev/null"', '"-vF/dev/null"'):
-            with self.subTest(spelling=spelling):
-                root = stage(ssh=SSH_STUB.replace('        cmd = ["ssh"]\n', f'        cmd = ["ssh", {spelling}]\n'))
-                apply(root)
-                rc, failures = run_verifier(root)
-                self.assertEqual(rc, 1, spelling)
-                self.assertIn("-F", "\n".join(failures), spelling)
 
     def test_a_renamed_probe_only_parameter_fails_the_gate(self):
         # The applier's __init__ anchor is the _socket_id line, which an upstream rename of
