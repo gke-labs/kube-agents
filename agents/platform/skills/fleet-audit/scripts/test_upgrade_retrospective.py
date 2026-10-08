@@ -506,8 +506,70 @@ class ShapeTest(unittest.TestCase):
             ("seeded-shapes/DaemonSet/node-runtime-probe", 13),
             ("seeded-shapes/Deployment/arch-pinned-worker", 12),
             ("seeded-shapes/Deployment/cache-on-emptydir", 4),
+            ("seeded-shapes/Deployment/cgroup-blind-jvm", 14),
             ("seeded-shapes/Deployment/legacy-registry-pull", 20),
         ])
+
+    def test_entry_14_cgroup_blind_jvm_on_a_v2_pool(self):
+        shape = self.shape("seeded-shapes/Deployment/cgroup-blind-jvm", 14)
+        self.assertEqual(shape["confidence"], ur.MEDIUM)
+        self.assertEqual(shape["evidence"], "image docker.io/library/eclipse-temurin:8u302-b08-jre (JDK 8u302 < 8u372) on pool default-pool on cgroup v2")
+
+    def test_entry_14_runtime_table(self):
+        cases = {
+            "eclipse-temurin:8u302-b08-jre": "JDK 8u302 < 8u372",
+            "docker.io/library/eclipse-temurin:8u372-b07-jre": None,
+            "openjdk:11.0.15-jre": "JDK 11.0.15 < 11.0.16",
+            "openjdk:11.0.16-jdk": None,
+            "adoptopenjdk:8u292-b10-jre-hotspot": "JDK 8u292 < 8u372",
+            "eclipse-temurin:17-jre": None,
+            "eclipse-temurin:8-jre": None,
+            "openjdk:13.0.2": "JDK 13 predates cgroup v2 support",
+            "mcr.microsoft.com/dotnet/runtime:2.1": ".NET 2.1 < 3.1",
+            "mcr.microsoft.com/dotnet/aspnet:3.0-alpine": ".NET 3.0 < 3.1",
+            "mcr.microsoft.com/dotnet/runtime:3.1": None,
+            "mcr.microsoft.com/dotnet/sdk:8.0": None,
+            "busybox:1.36": None,
+            "registry.example.com:5000/eclipse-temurin:8u302": "JDK 8u302 < 8u372",
+        }
+        for image, expected in cases.items():
+            with self.subTest(image=image):
+                self.assertEqual(ur.cgroup_v1_runtime(image), expected)
+
+    def test_entry_14_needs_an_exposed_pool(self):
+        cluster = cluster_doc("seeded-a")
+        jvm = pod("jvm", images=["eclipse-temurin:8u302-jre"])
+        obj = ur._object_of("apps", "Pod", "jvm")
+        self.assertEqual(len(ur.runtime_shapes(obj, jvm["spec"], ["default-pool"], cluster)), 1)
+        for pool in cluster["nodePools"]:
+            pool["config"]["effectiveCgroupMode"] = ur.CGROUP_V1_MODE
+            pool["version"] = "1.31.14-gke.2704000"
+        [shape] = ur.runtime_shapes(obj, jvm["spec"], ["default-pool"], cluster)
+        self.assertIn("pool default-pool on cgroup v1 at 1.31.14-gke.2704000, migrated to v2 at 1.33", shape["evidence"])
+        for pool in cluster["nodePools"]:
+            pool["version"] = "1.34.12-gke.1011000"
+        self.assertEqual(ur.runtime_shapes(obj, jvm["spec"], ["default-pool"], cluster), [])
+        # No pod placed yet: every pool is a candidate.
+        cluster["nodePools"][1]["config"]["effectiveCgroupMode"] = ur.CGROUP_V2_MODE
+        [shape] = ur.runtime_shapes(obj, jvm["spec"], [], cluster)
+        self.assertIn("pool idle-batch-pool on cgroup v2", shape["evidence"])
+
+    def test_managed_agents_are_counted_not_reported(self):
+        def ds(namespace, name, host_network=True, socket=False):
+            volumes = [{"name": "sock", "hostPath": {"path": "/run/containerd/containerd.sock"}}] if socket else []
+            return {"kind": "DaemonSet", "metadata": {"name": name, "namespace": namespace}, "spec": {"template": {"metadata": {"labels": {}}, "spec": {"hostNetwork": host_network, "containers": [{"name": "c", "image": "busybox:1.36"}], "volumes": volumes}}}}
+        workloads = READS["seeded-a"]["workloads"] + [ds("kube-system", "anetd"), ds("kube-system", "efficiency-daemon", socket=True), ds("gke-gmp-system", "collector"), ds("config-management-system", "otel-agent"), ds("gke-managed-cim", "cim-agent", host_network=False, socket=True)]
+        reads = {**READS["seeded-a"], "workloads": workloads}
+        shapes, agents = ur.collect_risks(cluster_doc("seeded-a"), reads)
+        self.assertEqual(agents, 5)
+        self.assertEqual({s["object"] for s in shapes if s["entry"] in (13, 17)}, {"seeded-shapes/DaemonSet/cni-shaped-agent", "seeded-shapes/DaemonSet/node-runtime-probe"})
+        guards = ur.risk_guards_for(SEEDED, shapes, "2026-10-08T18:00:00Z")
+        self.assertFalse(any(g["namespace"] if "namespace" in g else g["object"].startswith(("kube-system/", "gke-", "config-management-")) for g in guards))
+        with tempfile.TemporaryDirectory() as home, mock.patch.dict(os.environ, {ur.HERMES_HOME_ENV: home}), mock.patch.dict(READS, {"seeded-a": reads}), redirect_stderr(io.StringIO()):
+            result = ur.collect(args(), run=FakeFleet(), now=NOW)
+        block = ur.render_report(result).split(f"### {SEEDED}")[1]
+        self.assertIn(ur.MANAGED_AGENTS_LINE.format(count=5), block)
+        self.assertNotIn("kube-system/DaemonSet/anetd", block)
 
     def test_entry_12_deprecated_label_selector(self):
         shape = self.shape("seeded-shapes/Deployment/arch-pinned-worker", 12)
@@ -581,7 +643,7 @@ class ShapeTest(unittest.TestCase):
 
     def test_risk_guards_carry_the_risk_kind(self):
         guards = ur.risk_guards_for(SEEDED, self.shapes, "2026-10-08T18:00:00Z")
-        self.assertEqual(len(guards), 9)
+        self.assertEqual(len(guards), 10)
         self.assertTrue(all(g["kind"] == ur.GUARD_KIND_RISK and g["id"].startswith(f"{SEEDED}#risk#") for g in guards))
         failure = ur.guards_for(SEEDED, symptoms_of("seeded-a"), "2026-10-08T18:00:00Z")
         self.assertTrue(all(g["kind"] == ur.GUARD_KIND_FAILURE for g in failure))
@@ -669,9 +731,9 @@ class LedgerAndGuardsTest(unittest.TestCase):
         self.assertTrue(seeded["mitigations"])
         self.assertTrue(all(m["entry"] in ur.MITIGATIONS for m in seeded["mitigations"]))
         self.assertEqual({g["entry"] for g in seeded["guards"] if g["kind"] == ur.GUARD_KIND_FAILURE}, {1, 2, 12, 14})
-        self.assertEqual({g["entry"] for g in seeded["guards"] if g["kind"] == ur.GUARD_KIND_RISK}, {1, 4, 12, 13, 17, 18, 19, 20})
+        self.assertEqual({g["entry"] for g in seeded["guards"] if g["kind"] == ur.GUARD_KIND_RISK}, {1, 4, 12, 13, 14, 17, 18, 19, 20})
         self.assertEqual(doc["guards"], result["guards"])
-        self.assertEqual(seeded["baseline"]["shapes"], 9)
+        self.assertEqual(seeded["baseline"]["shapes"], 10)
         self.assertEqual(seeded["next_upgrade"]["target"], "1.35.8-gke.1225000")
         sections = doc["sections"]
         self.assertEqual([(i["cluster"], i["object"], i["entries"]) for i in sections["errors"]], [(SEEDED, INFERENCE, "2, 12"), (SEEDED, "seeded-capacity/PodDisruptionBudget/inference-server", "1")])
@@ -814,7 +876,7 @@ class ReportTest(unittest.TestCase):
         seeded_block = info.split(f"### {SEEDED}")[1]
         self.assertIn(f"{ur.PART_NEXT_UPGRADE} channel REGULAR; target 1.35.8-gke.1225000; cluster at 1.35.8-gke.1380001, at or ahead of the target. Window: daily at 03:00 UTC for 4h; next opens 2026-10-09T03:00:00Z. Exclusions: none.", seeded_block)
         self.assertIn("| `seeded-shapes/Deployment/legacy-registry-pull` | 20. Images on a retired registry | high | image k8s.gcr.io/pause:3.9 |", seeded_block)
-        self.assertIn(f"{ur.PART_BASELINE} control plane 1.35.8-gke.1380001; pools default-pool 1.35.8-gke.1380001, idle-batch-pool 1.35.8-gke.1380001, pinned-inference-pool 1.35.8-gke.1380001; 23 pods, 1 budgets, 9 shapes. Guards written: 13.", seeded_block)
+        self.assertIn(f"{ur.PART_BASELINE} control plane 1.35.8-gke.1380001; pools default-pool 1.35.8-gke.1380001, idle-batch-pool 1.35.8-gke.1380001, pinned-inference-pool 1.35.8-gke.1380001; 23 pods, 1 budgets, 10 shapes. Guards written: 14.", seeded_block)
         gemma_block = info.split(f"### {GEMMA}")[1].split("### ")[0]
         self.assertIn("behind the target. Window: DAILY at", gemma_block)
         self.assertIn("Exclusions: hold-gpu-minor (NO_MINOR_UPGRADES) until 2026-10-21T00:00:00Z [active].", gemma_block)

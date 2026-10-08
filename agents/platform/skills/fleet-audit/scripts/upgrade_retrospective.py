@@ -40,8 +40,10 @@ channel's current default as the target, the maintenance window and when it
 next opens, exclusions with scope and end), the catalogue shapes present
 (static before-signals: a budget allowing no disruption, a selector on a
 deprecated node label, an image on a retired registry, an in-tree PD volume,
-a DaemonSet on hostNetwork or the containerd socket, state on a node-local
-volume, a CUDA pin on a GPU workload, a fail-closed webhook with no backend),
+a user DaemonSet on hostNetwork or the containerd socket, state on a
+node-local volume, a CUDA pin on a GPU workload, a fail-closed webhook with
+no backend, a pre-cgroup-v2 runtime image on an exposed pool; GKE's own
+agents are counted on one line),
 and the baseline recorded. Shapes are risks, never incidents; each writes a
 `risk` guard beside the symptoms' `failure` guards. The JSON carries the same
 grouping under `sections` beside the per-cluster `reviews`.
@@ -221,6 +223,26 @@ WEBHOOK_FAIL_CLOSED = "Fail"
 WEBHOOK_CONFIGURATION_KINDS = ("ValidatingWebhookConfiguration", "MutatingWebhookConfiguration")
 ENDPOINTSLICE_SERVICE_LABEL = "kubernetes.io/service-name"
 SINGLE_REPLICA = 1
+# Namespaces whose DaemonSets are GKE's own agents: they move with the node
+# image, so 13 and 17 there are counted on one line, not reported or guarded.
+# `is_system_namespace` covers kube-system, gmp-system and every `gke-*`
+# (gke-gmp-system, gke-managed-*); Config Sync's are the one more family.
+MANAGED_AGENT_NAMESPACE_PREFIXES = ("config-management-",)
+MANAGED_AGENT_ENTRIES = (13, 17)
+MANAGED_AGENTS_LINE = "{count} GKE-managed agents use host networking or the runtime socket; upgraded with the node image."
+# Entry 14: runtimes that read their memory limit from cgroup v1 paths, by
+# image repository and the first tag that reads cgroup v2, from the cgroup
+# v2 page: JDK 8u372 and 11.0.16; .NET 3.1 (so 2.x and 3.0 are affected).
+JAVA_IMAGE_REPOS = ("eclipse-temurin", "openjdk", "adoptopenjdk")
+JAVA_TAG_RE = re.compile(r"^(?:jdk-?|jre-?)?(\d+)(?:u(\d+)|\.(\d+)\.(\d+))")
+JDK8_CGROUP_V2_UPDATE = 372
+JDK11_CGROUP_V2_PATCH = (0, 16)
+JDK_FIRST_MAJOR_WITH_CGROUP_V2 = 15
+DOTNET_IMAGE_REPO_MARKERS = ("mcr.microsoft.com/dotnet/", "microsoft/dotnet")
+DOTNET_TAG_RE = re.compile(r"^(\d+)\.(\d+)")
+DOTNET_CGROUP_V2_VERSION = (3, 1)
+# The minor at which GKE migrates a cgroup v1 pool to v2.
+CGROUP_V2_MIGRATION_MINOR = 33
 # Kinds whose spec carries a pod template.
 TEMPLATE_KINDS = ("Deployment", "StatefulSet", "DaemonSet", "CronJob")
 # What the risks table says it looked for when it found nothing.
@@ -233,6 +255,8 @@ SHAPE_CHECKS = (
     "emptyDir or local-SSD volumes whose name suggests state (4)",
     "GPU workloads pinning a CUDA version (18)",
     "fail-closed webhooks whose Service has no ready endpoint (7)",
+    "pre-cgroup-v2 runtime images on a cgroup v2 pool or a v1 pool GKE will migrate at 1.33 (14)",
+    "not checked statically: a multi-process container (15) is not visible from the spec",
 )
 # Guard kinds: a `failure` broke the last upgrade, a `risk` is a shape
 # present before the next one.
@@ -1513,19 +1537,105 @@ def webhook_shapes(webhooks: list[dict], endpointslices: list[dict] | None) -> l
     return out
 
 
-def collect_shapes(cluster: dict, reads: dict[str, list]) -> list[dict]:
-    resolver = Resolver(reads.get("pods") or [], reads.get("owners") or [])
+def _image_repository_and_tag(image: str) -> tuple[str, str]:
+    """`docker.io/library/eclipse-temurin:8u302-b08-jre` -> (`eclipse-temurin`, `8u302-b08-jre`);
+    the repository is the last path component, the tag what follows the colon."""
+    name, _, digest_free = image.partition("@")
+    path, sep, tag = name.rpartition(":")
+    if not sep or "/" in tag:
+        path, tag = name, ""
+    return path.rsplit("/", 1)[-1], tag
+
+
+def cgroup_v1_runtime(image: str) -> str | None:
+    """Why `image` is a runtime that misreads a cgroup v2 limit, or None."""
+    repository, tag = _image_repository_and_tag(image)
+    if repository in JAVA_IMAGE_REPOS:
+        m = JAVA_TAG_RE.match(tag)
+        if not m:
+            return None
+        major, update, minor, patch = (int(x) if x is not None else None for x in m.groups())
+        if major == 8 and update is not None and update < JDK8_CGROUP_V2_UPDATE:
+            return f"JDK 8u{update} < 8u{JDK8_CGROUP_V2_UPDATE}"
+        if major == 11 and minor is not None and (minor, patch) < JDK11_CGROUP_V2_PATCH:
+            return f"JDK 11.{minor}.{patch} < 11.{JDK11_CGROUP_V2_PATCH[0]}.{JDK11_CGROUP_V2_PATCH[1]}"
+        if major < 8 or (8 < major < 11) or (11 < major < JDK_FIRST_MAJOR_WITH_CGROUP_V2):
+            return f"JDK {major} predates cgroup v2 support"
+        return None
+    if any(marker in image for marker in DOTNET_IMAGE_REPO_MARKERS):
+        m = DOTNET_TAG_RE.match(tag)
+        if m and (int(m.group(1)), int(m.group(2))) < DOTNET_CGROUP_V2_VERSION:
+            return f".NET {m.group(1)}.{m.group(2)} < {DOTNET_CGROUP_V2_VERSION[0]}.{DOTNET_CGROUP_V2_VERSION[1]}"
+    return None
+
+
+def _pool_exposure(pool: str, mode: str, version: str) -> str | None:
+    """How the pool exposes a cgroup v1 runtime: on v2 now, or v1 but below
+    the minor GKE migrates at."""
+    if mode == CGROUP_V2_MODE:
+        return f"pool {pool} on cgroup v2"
+    parsed = parse_version(version)
+    if mode == CGROUP_V1_MODE and parsed and parsed[1] < CGROUP_V2_MIGRATION_MINOR:
+        return f"pool {pool} on cgroup v1 at {version}, migrated to v2 at 1.{CGROUP_V2_MIGRATION_MINOR}"
+    return None
+
+
+def runtime_shapes(obj: dict, spec: dict, pools: list[str], cluster: dict) -> list[dict]:
+    """Entry 14 for a pod spec: a cgroup v1 runtime image on an exposed pool.
+    `pools` are the pools the owner's pods run on; empty means any pool."""
+    modes, versions = pool_cgroup_modes(cluster), versions_of(cluster)["node_pools"]
+    candidates = pools or sorted(modes)
+    exposures = [e for e in (_pool_exposure(p, modes.get(p, ""), versions.get(p, "")) for p in candidates) if e]
+    if not exposures:
+        return []
+    for container in _containers(spec):
+        reason = cgroup_v1_runtime(container.get("image") or "")
+        if reason:
+            return [_shape(obj, 14, MEDIUM, f"image {container.get('image')} ({reason}) on {'; '.join(exposures)}", "runtime image")]
+    return []
+
+
+def _is_managed_agent_namespace(namespace: str) -> bool:
+    return is_system_namespace(namespace) or namespace.startswith(MANAGED_AGENT_NAMESPACE_PREFIXES)
+
+
+def collect_risks(cluster: dict, reads: dict[str, list]) -> tuple[list[dict], int]:
+    """The shapes present, and how many GKE-managed agents carry 13/17
+    (counted, not reported: they move with the node image)."""
+    pods = reads.get("pods") or []
+    nodes = reads.get("nodes") or []
+    resolver = Resolver(pods, reads.get("owners") or [])
+    node_pool = {(n.get("metadata") or {}).get("name"): ((n.get("metadata") or {}).get("labels") or {}).get(NODEPOOL_LABEL, "") for n in nodes}
+    pools_of: dict[str, set[str]] = {}
+    for pod in pods:
+        meta = pod.get("metadata") or {}
+        kind, name = resolver.resolve(meta.get("namespace", ""), "Pod", meta.get("name", ""))
+        pool = node_pool.get((pod.get("spec") or {}).get("nodeName"), "")
+        if pool:
+            pools_of.setdefault(_object_ref(meta.get("namespace", ""), kind, name), set()).add(pool)
     workloads = reads.get("workloads") or []
     shapes: list[dict] = []
-    for obj, spec, _ in pod_specs_by_owner(workloads, reads.get("pods") or [], resolver).values():
+    for obj, spec, _ in pod_specs_by_owner(workloads, pods, resolver).values():
         shapes += shapes_in_spec(obj, spec)
+        shapes += runtime_shapes(obj, spec, sorted(pools_of.get(obj["object"], ())), cluster)
     shapes += budget_shapes(reads.get("pdbs") or [], workloads)
     shapes += storage_shapes(reads.get("storage") or [], cluster)
     shapes += webhook_shapes(reads.get("webhooks") or [], reads.get("endpointslices") if "endpointslices" in reads else None)
-    unique: dict[tuple, dict] = {}
+    managed_agents: set[str] = set()
+    kept = []
     for shape in shapes:
+        if shape["entry"] in MANAGED_AGENT_ENTRIES and _is_managed_agent_namespace(shape["namespace"]):
+            managed_agents.add(shape["object"])
+            continue
+        kept.append(shape)
+    unique: dict[tuple, dict] = {}
+    for shape in kept:
         unique.setdefault((shape["object"], shape["entry"]), shape)
-    return sorted(unique.values(), key=lambda s: (s["system"], s["namespace"], s["kind"], s["name"], s["entry"]))
+    return sorted(unique.values(), key=lambda s: (s["system"], s["namespace"], s["kind"], s["name"], s["entry"])), len(managed_agents)
+
+
+def collect_shapes(cluster: dict, reads: dict[str, list]) -> list[dict]:
+    return collect_risks(cluster, reads)[0]
 
 
 # --------------------------------------------------------------------------- #
@@ -1639,6 +1749,7 @@ def review_cluster(selection: Selection, ledger: dict, *, run: RunFn, seen_at: s
         "what_failed": [],
         "mitigations": [],
         "shapes": [],
+        "managed_agents": 0,
         "next_upgrade": next_upgrade(cluster, server_config, now or now_utc()),
         "baseline": None,
         "guards": [],
@@ -1661,8 +1772,9 @@ def review_cluster(selection: Selection, ledger: dict, *, run: RunFn, seen_at: s
     symptoms = collect_symptoms(cluster, reads, ops, window_start)
     review["what_failed"] = symptoms
     review["mitigations"] = [mitigation_lines(s, c) for s in symptoms for c in s["classifications"] if c["entry"] is not None]
-    shapes = collect_shapes(cluster, {k: v for k, v in reads.items() if not any(e.startswith(k + ":") for e in errors)})
+    shapes, managed_agents = collect_risks(cluster, {k: v for k, v in reads.items() if not any(e.startswith(k + ":") for e in errors)})
     review["shapes"] = shapes
+    review["managed_agents"] = managed_agents
     review["guards"] = guards_for(selection.key, symptoms, seen_at) + risk_guards_for(selection.key, shapes, seen_at)
     review["baseline"] = {
         "versions": versions_of(cluster),
@@ -1777,6 +1889,7 @@ def triage(reviews: list[dict], unchanged: list[dict], failed_reads: list[str], 
                 "incidents": len(incidents),
                 "next_upgrade": review["next_upgrade"],
                 "shapes": review["shapes"],
+                "managed_agents": review["managed_agents"],
                 "baseline": review["baseline"],
             })
         for incident in sorted(incidents.values(), key=lambda i: i["object"]):
@@ -1872,14 +1985,15 @@ def _next_upgrade_lines(nu: dict) -> list[str]:
     ]
 
 
-def _risks_lines(shapes: list[dict]) -> list[str]:
+def _risks_lines(shapes: list[dict], managed_agents: int) -> list[str]:
+    agents = [MANAGED_AGENTS_LINE.format(count=managed_agents)] if managed_agents else []
     if not shapes:
-        return [f"{PART_RISKS} {NO_SHAPE_TEXT}{'; '.join(SHAPE_CHECKS)}."]
+        return [f"{PART_RISKS} {NO_SHAPE_TEXT}{'; '.join(SHAPE_CHECKS)}."] + agents
     lines = [PART_RISKS, "", "| Object | Catalogue entry | Confidence | Evidence | Mitigate before |", "| --- | --- | --- | --- | --- |"]
     for shape in shapes:
         system = " (system)" if shape["system"] else ""
         lines.append(f"| `{shape['object']}`{system} | {shape['entry']}. {shape['title']} | {shape['confidence']} | {_cell(shape['evidence'])} | {_cell(MITIGATIONS[shape['entry']]['mitigate_before'])} |")
-    return lines
+    return lines + ([""] + agents if agents else [])
 
 
 def _baseline_lines(baseline: dict | None) -> list[str]:
@@ -1901,7 +2015,7 @@ def _cluster_block_lines(row: dict) -> list[str]:
     lines.append("")
     lines += _next_upgrade_lines(row["next_upgrade"])
     lines.append("")
-    lines += _risks_lines(row["shapes"])
+    lines += _risks_lines(row["shapes"], row.get("managed_agents") or 0)
     lines.append("")
     lines += _baseline_lines(row["baseline"])
     return lines + [""]
