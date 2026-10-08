@@ -183,7 +183,19 @@ class VerifierTest(unittest.TestCase):
         apply(root)
         rc, failures = run_verifier(root)
         self.assertEqual(rc, 1)
-        self.assertIn("carries ServerAliveInterval= 2 times (ServerAliveInterval=5, ServerAliveInterval=15)", "\n".join(failures))
+        self.assertIn("carries ServerAliveInterval 2 times (5, 15); the first copy wins", "\n".join(failures))
+
+    def test_every_spelling_of_an_earlier_copy_fails(self):
+        # ssh also takes the option glued to -o, with the keyword in any case, and with a space
+        # instead of `=`; the gate normalises before counting, so each spelling is a second copy.
+        for spelling in ('"-oServerAliveInterval=0"', '"-o", "serveraliveinterval=5"', '"-o", "ServerAliveInterval 5"',
+                         '"-oserveralivecountmax=9"'):
+            with self.subTest(spelling=spelling):
+                root = stage(ssh=SSH_STUB.replace('        cmd = ["ssh"]\n', f'        cmd = ["ssh", {spelling}]\n'))
+                apply(root)
+                rc, failures = run_verifier(root)
+                self.assertEqual(rc, 1, spelling)
+                self.assertIn("the first copy wins", "\n".join(failures), spelling)
 
     def test_a_glued_dash_f_fails(self):
         root = stage(ssh=SSH_STUB.replace('        cmd = ["ssh"]\n', '        cmd = ["ssh", "-F/dev/null"]\n'))
