@@ -1,0 +1,258 @@
+{
+ "apiVersion": "v1",
+ "items": [
+  {
+   "action": "Scheduling",
+   "apiVersion": "v1",
+   "eventTime": "2026-10-06T16:10:16.721119Z",
+   "firstTimestamp": null,
+   "involvedObject": {
+    "apiVersion": "v1",
+    "kind": "Pod",
+    "name": "kube-dns-797f658fb6-cjtqz",
+    "namespace": "kube-system",
+    "resourceVersion": "1790277370535247000",
+    "uid": "ce64c376-a272-4738-af93-208b046d4ca2"
+   },
+   "kind": "Event",
+   "lastTimestamp": null,
+   "message": "0/2 nodes are available: 1 Insufficient cpu, 1 node(s) had untolerated taint {nvidia.com/gpu: present}. preemption: 0/2 nodes are available: 1 Insufficient cpu, 1 Preemption is not helpful for scheduling.",
+   "metadata": {
+    "creationTimestamp": "2026-10-06T16:10:16Z",
+    "name": "kube-dns-797f658fb6-cjtqz.18dbfc9a5cbf9bd3",
+    "namespace": "kube-system",
+    "resourceVersion": "1791479410952639005",
+    "uid": "2258dc3b-b18d-4c9b-8b2e-1279885db24e"
+   },
+   "reason": "FailedScheduling",
+   "reportingComponent": "default-scheduler",
+   "reportingInstance": "default-scheduler-gke-007ea719d19b4b8388a8-7a04-4c92-vm",
+   "series": {
+    "count": 590,
+    "lastObservedTime": "2026-10-08T17:10:03.191233Z"
+   },
+   "source": {},
+   "type": "Warning"
+  },
+  {
+   "action": "Scheduling",
+   "apiVersion": "v1",
+   "eventTime": "2026-10-06T16:10:16.721787Z",
+   "firstTimestamp": null,
+   "involvedObject": {
+    "apiVersion": "v1",
+    "kind": "Pod",
+    "name": "kube-dns-797f658fb6-shxrb",
+    "namespace": "kube-system",
+    "resourceVersion": "1790277383348191002",
+    "uid": "20558b7e-e73b-4172-8823-5e8576a40061"
+   },
+   "kind": "Event",
+   "lastTimestamp": null,
+   "message": "0/2 nodes are available: 1 Insufficient cpu, 1 node(s) had untolerated taint {nvidia.com/gpu: present}. preemption: 0/2 nodes are available: 1 Insufficient cpu, 1 Preemption is not helpful for scheduling.",
+   "metadata": {
+    "creationTimestamp": "2026-10-06T16:10:16Z",
+    "name": "kube-dns-797f658fb6-shxrb.18dbfc9a5cc9b843",
+    "namespace": "kube-system",
+    "resourceVersion": "1791479410982943024",
+    "uid": "7501a9be-a2a8-406e-96be-35629aedbfc0"
+   },
+   "reason": "FailedScheduling",
+   "reportingComponent": "default-scheduler",
+   "reportingInstance": "default-scheduler-gke-007ea719d19b4b8388a8-7a04-4c92-vm",
+   "series": {
+    "count": 590,
+    "lastObservedTime": "2026-10-08T17:10:03.191449Z"
+   },
+   "source": {},
+   "type": "Warning"
+  },
+  {
+   "apiVersion": "v1",
+   "count": 1,
+   "eventTime": null,
+   "firstTimestamp": "2026-10-08T16:30:05Z",
+   "involvedObject": {
+    "apiVersion": "batch/v1",
+    "kind": "Job",
+    "name": "legacy-flowcontrol-tuner-29857950",
+    "namespace": "kubeagents-system",
+    "resourceVersion": "1791477005332127012",
+    "uid": "761c7081-a92b-46fe-8ed3-1c699d8d1e43"
+   },
+   "kind": "Event",
+   "lastTimestamp": "2026-10-08T16:30:05Z",
+   "message": "Job has reached the specified backoff limit",
+   "metadata": {
+    "creationTimestamp": "2026-10-08T16:30:05Z",
+    "name": "legacy-flowcontrol-tuner-29857950.18dc9ad841b3443a",
+    "namespace": "kubeagents-system",
+    "resourceVersion": "1791477005405279024",
+    "uid": "52c5a90b-a618-4cd6-85e3-44aea2b91367"
+   },
+   "reason": "BackoffLimitExceeded",
+   "reportingComponent": "job-controller",
+   "reportingInstance": "",
+   "source": {
+    "component": "job-controller"
+   },
+   "type": "Warning"
+  },
+  {
+   "apiVersion": "v1",
+   "count": 1,
+   "eventTime": null,
+   "firstTimestamp": "2026-10-08T16:40:05Z",
+   "involvedObject": {
+    "apiVersion": "batch/v1",
+    "kind": "Job",
+    "name": "legacy-flowcontrol-tuner-29857960",
+    "namespace": "kubeagents-system",
+    "resourceVersion": "1791477604563679021",
+    "uid": "7afc8790-b4ba-4ebc-9460-79fee9010b24"
+   },
+   "kind": "Event",
+   "lastTimestamp": "2026-10-08T16:40:05Z",
+   "message": "Job has reached the specified backoff limit",
+   "metadata": {
+    "creationTimestamp": "2026-10-08T16:40:05Z",
+    "name": "legacy-flowcontrol-tuner-29857960.18dc9b63ea29a53e",
+    "namespace": "kubeagents-system",
+    "resourceVersion": "1791477605234527019",
+    "uid": "869a114a-63bb-43e2-a970-6606e142c808"
+   },
+   "reason": "BackoffLimitExceeded",
+   "reportingComponent": "job-controller",
+   "reportingInstance": "",
+   "source": {
+    "component": "job-controller"
+   },
+   "type": "Warning"
+  },
+  {
+   "apiVersion": "v1",
+   "count": 1,
+   "eventTime": null,
+   "firstTimestamp": "2026-10-08T16:50:03Z",
+   "involvedObject": {
+    "apiVersion": "batch/v1",
+    "kind": "Job",
+    "name": "legacy-flowcontrol-tuner-29857970",
+    "namespace": "kubeagents-system",
+    "resourceVersion": "1791478203714815017",
+    "uid": "0cca4761-d7e8-417b-87a9-7ceae356b60b"
+   },
+   "kind": "Event",
+   "lastTimestamp": "2026-10-08T16:50:03Z",
+   "message": "Job has reached the specified backoff limit",
+   "metadata": {
+    "creationTimestamp": "2026-10-08T16:50:03Z",
+    "name": "legacy-flowcontrol-tuner-29857970.18dc9bef468a3862",
+    "namespace": "kubeagents-system",
+    "resourceVersion": "1791478203783871011",
+    "uid": "160f537e-6bca-46b1-b71f-4483ed946eca"
+   },
+   "reason": "BackoffLimitExceeded",
+   "reportingComponent": "job-controller",
+   "reportingInstance": "",
+   "source": {
+    "component": "job-controller"
+   },
+   "type": "Warning"
+  },
+  {
+   "apiVersion": "v1",
+   "count": 1,
+   "eventTime": null,
+   "firstTimestamp": "2026-10-08T17:00:04Z",
+   "involvedObject": {
+    "apiVersion": "batch/v1",
+    "kind": "Job",
+    "name": "legacy-flowcontrol-tuner-29857980",
+    "namespace": "kubeagents-system",
+    "resourceVersion": "1791478804113247005",
+    "uid": "fab61bc8-870e-40fa-a3c1-21c3406ee8bd"
+   },
+   "kind": "Event",
+   "lastTimestamp": "2026-10-08T17:00:04Z",
+   "message": "Job has reached the specified backoff limit",
+   "metadata": {
+    "creationTimestamp": "2026-10-08T17:00:04Z",
+    "name": "legacy-flowcontrol-tuner-29857980.18dc9c7b111e0ca0",
+    "namespace": "kubeagents-system",
+    "resourceVersion": "1791478804178335010",
+    "uid": "c13c227e-10c7-45f8-b452-0e4defa579d8"
+   },
+   "reason": "BackoffLimitExceeded",
+   "reportingComponent": "job-controller",
+   "reportingInstance": "",
+   "source": {
+    "component": "job-controller"
+   },
+   "type": "Warning"
+  },
+  {
+   "apiVersion": "v1",
+   "count": 1,
+   "eventTime": null,
+   "firstTimestamp": "2026-10-08T17:10:03Z",
+   "involvedObject": {
+    "apiVersion": "batch/v1",
+    "kind": "Job",
+    "name": "legacy-flowcontrol-tuner-29857990",
+    "namespace": "kubeagents-system",
+    "resourceVersion": "1791479403320047022",
+    "uid": "edabf518-edd3-40af-b51c-962bae2a6ffa"
+   },
+   "kind": "Event",
+   "lastTimestamp": "2026-10-08T17:10:03Z",
+   "message": "Job has reached the specified backoff limit",
+   "metadata": {
+    "creationTimestamp": "2026-10-08T17:10:03Z",
+    "name": "legacy-flowcontrol-tuner-29857990.18dc9d0694e3bc81",
+    "namespace": "kubeagents-system",
+    "resourceVersion": "1791479403397151024",
+    "uid": "318f2650-1488-461c-84ae-d1ea4bfaa6a0"
+   },
+   "reason": "BackoffLimitExceeded",
+   "reportingComponent": "job-controller",
+   "reportingInstance": "",
+   "source": {
+    "component": "job-controller"
+   },
+   "type": "Warning"
+  },
+  {
+   "apiVersion": "v1",
+   "count": 1,
+   "eventTime": null,
+   "firstTimestamp": "2026-10-08T17:20:04Z",
+   "involvedObject": {
+    "apiVersion": "batch/v1",
+    "kind": "Job",
+    "name": "legacy-flowcontrol-tuner-29858000",
+    "namespace": "kubeagents-system",
+    "resourceVersion": "1791480004270831008",
+    "uid": "8fcfea02-2225-4c26-a713-6d41831f8bb5"
+   },
+   "kind": "Event",
+   "lastTimestamp": "2026-10-08T17:20:04Z",
+   "message": "Job has reached the specified backoff limit",
+   "metadata": {
+    "creationTimestamp": "2026-10-08T17:20:04Z",
+    "name": "legacy-flowcontrol-tuner-29858000.18dc9d92810253f3",
+    "namespace": "kubeagents-system",
+    "resourceVersion": "1791480004357439003",
+    "uid": "d40b8a4a-bd6b-49ec-9e4c-f6e9eac21f28"
+   },
+   "reason": "BackoffLimitExceeded",
+   "reportingComponent": "job-controller",
+   "reportingInstance": "",
+   "source": {
+    "component": "job-controller"
+   },
+   "type": "Warning"
+  }
+ ],
+ "kind": "List"
+}

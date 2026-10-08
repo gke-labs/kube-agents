@@ -1,0 +1,43 @@
+{
+ "apiVersion": "v1",
+ "items": [
+  {
+   "apiVersion": "policy/v1",
+   "kind": "PodDisruptionBudget",
+   "metadata": {
+    "creationTimestamp": "2026-09-25T17:02:07Z",
+    "generation": 1,
+    "name": "inference-server",
+    "namespace": "seeded-capacity",
+    "resourceVersion": "1791436899027663007",
+    "uid": "6086df7a-b75e-4d1b-9b5b-5b2e934e7064"
+   },
+   "spec": {
+    "maxUnavailable": 1,
+    "selector": {
+     "matchLabels": {
+      "app": "inference-server"
+     }
+    }
+   },
+   "status": {
+    "conditions": [
+     {
+      "lastTransitionTime": "2026-09-25T17:02:48Z",
+      "message": "",
+      "observedGeneration": 1,
+      "reason": "InsufficientPods",
+      "status": "False",
+      "type": "DisruptionAllowed"
+     }
+    ],
+    "currentHealthy": 1,
+    "desiredHealthy": 3,
+    "disruptionsAllowed": 0,
+    "expectedPods": 4,
+    "observedGeneration": 1
+   }
+  }
+ ],
+ "kind": "List"
+}

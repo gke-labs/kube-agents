@@ -1,0 +1,44 @@
+{
+ "apiVersion": "v1",
+ "items": [
+  {
+   "apiVersion": "policy/v1",
+   "kind": "PodDisruptionBudget",
+   "metadata": {
+    "annotations": {},
+    "creationTimestamp": "2026-09-24T17:41:36Z",
+    "generation": 1,
+    "name": "gemma-server",
+    "namespace": "kubeagents-system",
+    "resourceVersion": "1790278132210639017",
+    "uid": "ca1ff910-33ac-45f5-b25e-699961fc8cf6"
+   },
+   "spec": {
+    "maxUnavailable": 0,
+    "selector": {
+     "matchLabels": {
+      "app": "gemma-server"
+     }
+    }
+   },
+   "status": {
+    "conditions": [
+     {
+      "lastTransitionTime": "2026-09-24T17:41:36Z",
+      "message": "",
+      "observedGeneration": 1,
+      "reason": "InsufficientPods",
+      "status": "False",
+      "type": "DisruptionAllowed"
+     }
+    ],
+    "currentHealthy": 1,
+    "desiredHealthy": 1,
+    "disruptionsAllowed": 0,
+    "expectedPods": 1,
+    "observedGeneration": 1
+   }
+  }
+ ],
+ "kind": "List"
+}
