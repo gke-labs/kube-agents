@@ -22,21 +22,31 @@ This feature is a scheduled review called the **upgrade retrospective**. It must
    review of every cluster it finds, and then every weekend. Nobody has to ask.
 2. **Look only at what changed.** A cluster is reviewed when it is new to the assistant or when it
    was upgraded since the last review. A cluster nothing happened to gets one line saying so.
-3. **Write a report, the `upgrade-retro-report`,** with four parts for each reviewed cluster:
-   - **(A) What happened.** Which upgrades ran, on which part of the cluster, from which version to
-     which, when they started and finished, how long they took, and whether Google reported them as
-     finished or failed.
-   - **(B) What failed.** Which pieces of the application were down, stuck or restarting after the
-     upgrade, and which of the twenty known upgrade failures each one matches, with the evidence.
-   - **(C) How to see it coming and how to fix it next time.** For each failure found: the sign
-     that was visible before the upgrade, whether anything the assistant already runs reads that
-     sign, and the fix, both the one to make before the next upgrade and the one that repairs the
-     cluster now. Written about this cluster's own objects, not in general terms.
+3. **Write a report, the `upgrade-retro-report`,** in three sections, **Errors**, **Warnings**
+   and **Info**, any of which may be empty. An entry under Errors or Warnings is one incident:
+   one application object on one cluster, with four parts:
+   - **(A) What happened.** Which upgrades ran on that cluster, on which part of it, from which
+     version to which, when they started and finished, how long they took, and whether Google
+     reported them as finished or failed.
+   - **(B) What failed.** How the object was down, stuck or restarting after the upgrade, which of
+     the twenty known upgrade failures it matches, how sure the match is, and the evidence.
+   - **(C) How to see it coming and how to fix it next time.** The sign that was visible before the
+     upgrade, whether anything the assistant already runs reads that sign, and the fix, both the
+     one to make before the next upgrade and the one that repairs the cluster now. Written about
+     this object, not in general terms.
    - **(D) The fix, set up.** Two things happen without being asked. The daily readiness check
      learns about the failure, so the next pre-upgrade report says "the last upgrade broke this,
      and it is still here" while it is. And where the install has a GitHub repository, one tracked
      issue per reviewed cluster carries the checklist of fixes and is updated by the next review
      rather than duplicated.
+
+   An incident is an **Error** when the match is sure and the object is one of the user's, or when
+   Google reported the upgrade itself as failed, or a computer stayed broken after its rebuild. It
+   is a **Warning** when the match is tentative, when the object belongs to the cluster's own
+   plumbing, when the symptom matches none of the twenty, or when a failure from an earlier review
+   is still present with nothing new. **Info** lists each cluster that was upgraded or found with
+   nothing wrong, the clusters nothing happened to, and anything the review could not read.
+
 4. **Keep the report where the install keeps its records,** on the assistant's own storage, with
    the latest one always at the same path, and post one line per reviewed cluster in chat with the
    counts and the most important finding. A quiet weekend posts nothing.
@@ -138,8 +148,8 @@ signatures:
 | a budget with no allowance left on a drained node; a node operation past an hour per node | 1     |
 | `no matches for kind`; a Job or CronJob pod in `Error` whose spec names a removed API     | 6     |
 
-A symptom that matches nothing is reported as unclassified rather than dropped: the report is a
-record of the upgrade, not only of the catalogue's part of it. The entries not in the table (3, 4,
+A symptom that matches nothing is reported as a Warning, unclassified, rather than dropped: the
+report is a record of the upgrade, not only of the catalogue's part of it. The entries not in the table (3, 4,
 5, 8, 9, 10, 11, 13, 16) have no symptom a single read identifies with confidence; they are the
 ones the readiness checks have to catch before the upgrade, and the report says so under (C) when a
 cluster's symptoms are unclassified.
@@ -182,36 +192,44 @@ to a cluster's maintenance policy.
 ```
 # Upgrade retrospective 2026-10-11
 
-## haoxuw-gke-dev/us-central1-a/seeded-b
+## Errors
 
-### What happened
-| when (UTC)       | operation      | target        | from                | to                  | took   | status |
-| 2026-10-07 18:27 | UPGRADE_MASTER | control plane | 1.34.11-gke.1209000 | 1.34.12-gke.1011000 | 6m54s  | DONE   |
-| 2026-10-07 18:34 | UPGRADE_NODES  | default-pool  | 1.34.11-gke.1209000 | 1.34.12-gke.1011000 | 3m43s  | DONE   |
-
-### What failed
-| object                                        | symptom                               | entry | confidence |
-| seeded-upgrade/pinned-batch-runner (pod)      | drain held: PDB disruptionsAllowed 0  | 1     | high       |
-
-### Detect and mitigate next time
-- Entry 1, a PodDisruptionBudget forbids the eviction. Seen before the upgrade as
-  `seeded-upgrade/pinned-batch-runner` with `maxUnavailable: 0` on one replica; read today by the
-  daily obtainability audit (`blocking-pdb`) and the readiness report. Before the next upgrade: allow
+### Entry 1 on seeded-b: seeded-upgrade/PodDisruptionBudget/pinned-batch-runner
+What happened: UPGRADE_MASTER control plane 1.34.11-gke.1209000 -> 1.34.12-gke.1011000,
+  2026-10-07 18:27 to 18:34 (6m54s), DONE; UPGRADE_NODES default-pool, 18:34 to 18:38 (3m43s), DONE.
+What failed: drain held, disruptionsAllowed 0 on one replica, catalogue entry 1 (a
+  PodDisruptionBudget forbids the eviction), high; evidence: maxUnavailable 0, 1 of 1 pods on the
+  drained pool.
+Detect and mitigate next time: visible before the upgrade as the budget itself; read today by the
+  daily obtainability audit (blocking-pdb) and the readiness report. Before the next upgrade: allow
   one disruption or add a replica. Now: the pod is back; nothing to repair.
+Mitigation set up: guard seeded-b / entry 1 / seeded-upgrade/PodDisruptionBudget/pinned-batch-runner
+  (first seen 2026-10-11), reported by the readiness watch until the budget has room; ledger issue
+  <url> where a repository is linked.
 
-### Mitigation set up
-- guard: seeded-b / entry 1 / seeded-upgrade/PodDisruptionBudget/pinned-batch-runner (first seen
-  2026-10-11); the readiness watch reports it until the budget has room.
-- ledger issue: <url> (where a repository is linked)
+## Warnings
 
-## Unchanged clusters
-- haoxuw-gke-dev/us-central1-a/seeded-c: 1.35.8-gke.1380001, no operation since 2026-10-04
+### Entry 6 on gemma-gpu-upgraded: kubeagents-system/CronJob/legacy-flowcontrol-tuner
+What happened: no upgrade operation in the window; control plane 1.32.13, default-pool 1.31.14.
+What failed: 6 of 6 Job pods in Error, catalogue entry 6 (a served API version is removed),
+  medium; evidence: the spec names flowcontrol, a name rather than an observed API call.
+Detect and mitigate next time: ...
+Mitigation set up: guard ...
 
-## Reads that failed
-- none
+### Unclassified on platform-agent-host: kubeagents-system/Deployment/platform-agent-gateway
+What failed: Unhealthy probe events, 31 in the window, matching none of the twenty.
+
+## Info
+
+- seeded-c: UPGRADE_MASTER 2026-10-06 03:27 (8m), UPGRADE_NODES default-pool 2026-10-07 03:26 (5m);
+  no failure found.
+- seeded-a: new (first seen), 1.35.8-gke.1380001; no failure found.
+- Unchanged: gemma-gpu (no operation since 2026-09-24).
+- Reads that failed: none.
 ```
 
-The example's facts are from the test fleet; a real run's tables come from the collector's JSON.
+The example's facts are from the test fleet; a real run's content comes from the collector's JSON,
+which keeps the per-cluster data and the same three-way grouping.
 
 ## 5. Work breakdown
 
@@ -242,7 +260,8 @@ The example's facts are from the test fleet; a real run's tables come from the c
 
 - **Unit.** Each classifier signature against one captured fixture; selection (new, upgraded by
   version, upgraded by operation, unchanged, forced); the ledger and guards round trips; an
-  unreachable cluster recorded without failing the run; the report rendering.
+  unreachable cluster recorded without failing the run; the report rendering, including an empty
+  section and the severity of each fixture incident.
 - **Eval.** One case per entry the first report classifies on the test fleet, graded on declared
   lines (`<cluster>/<object>: entry <n>`), red on `main` where the report does not exist, green
   three times on the branch; registered in the nightly roster. The out-of-the-box path (collector
