@@ -153,6 +153,23 @@ class ConfigurationFileTest(_ConfigCase):
                     registry_module.load_forge_entries()
 
 
+class OperatorRenderedConfigurationTest(_ConfigCase):
+    def test_the_shape_the_operator_renders_builds_both_forges(self):
+        """The document k8s-operator's BrokerForges renders for a GitHub forge
+        beside a GitLab one. Read from the golden file `vcs_forges_test.go`
+        compares the operator's render to byte for byte, so a change to either
+        side's field names or shape fails one of the two tests."""
+        golden = (
+            Path(__file__).resolve().parents[3]
+            / "k8s-operator/internal/controller/testdata/vcs-forges.golden.json"
+        )
+        self.configure(golden.read_text())
+        registry = providers.Registry()
+        self.assertEqual(["github", "gitlab"], [forge.name for forge in registry.forges])
+        forge, repo = registry.resolve("https://gitlab.com/platform/tools")
+        self.assertEqual(("gitlab", "platform/tools"), (forge.name, repo))
+
+
 class UnclaimedProviderTest(_ConfigCase):
     def test_a_provider_no_forge_class_serves_stops_the_build(self):
         # Review finding: a misspelt provider, or one this image predates,

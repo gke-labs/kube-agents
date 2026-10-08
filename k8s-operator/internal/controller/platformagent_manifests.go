@@ -3664,6 +3664,9 @@ func buildCredentialProxyPolicyConfigMap(agent *agentv1alpha1.PlatformAgent) *co
 	if pool := scopedSAPoolJSON(agent); pool != "" {
 		data[scopedSAPoolKey] = pool
 	}
+	if forges := vcsForgesJSON(agent); forges != "" {
+		data[vcsForgesKey] = forges
+	}
 	return &corev1.ConfigMap{
 		TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "ConfigMap"},
 		ObjectMeta: metav1.ObjectMeta{
@@ -3711,8 +3714,8 @@ func eventWatcherEnabled(agent *agentv1alpha1.PlatformAgent) bool {
 // and not only a non-empty check. The detector refuses an all-digits --project
 // outright (looksLikeProjectNumber in cmd/drift-detector/main.go), because the
 // join matches it against each audit record's project_id, which is always the ID;
-// start-services.sh always passes --in-cluster and --profiles-dir, so the join is
-// always on and that refusal is always reachable. Nothing else reading the triple
+// start-services.sh always passes --in-cluster, which is what keys that refusal,
+// so it is always reachable. Nothing else reading the triple
 // minds a number -- the gcloud bootstrap in buildCredentialProxyEnv takes one, and
 // so do GKE_PROJECT_ID and KUBE_CONTEXT_NAME -- so an install can carry a numeric
 // projectId, be healthy in every other respect, and get the restart loop the
@@ -4123,6 +4126,10 @@ func buildCredentialProxyEnv(agent *agentv1alpha1.PlatformAgent) []corev1.EnvVar
 	} else {
 		envVars = append(envVars, corev1.EnvVar{Name: "CREDENTIAL_PROXY_SCOPED_SA_POOL", Value: "0"})
 	}
+	// Declared here, in the managed set, so mergeCredentialProxyEnv reserves
+	// the name: a CR env entry must not point the broker at a configuration
+	// the operator did not render.
+	envVars = append(envVars, buildVCSForgesEnv(agent)...)
 	// What the broker's own Pod changes about its configuration. The agent-API
 	// front door is gone — it stayed in the agent Pod, so none of its three
 	// variables are set here — Envoy listens on the Pod IP rather than loopback,
@@ -4344,6 +4351,13 @@ func mergeCredentialProxyEnv(managed, custom []corev1.EnvVar) []corev1.EnvVar {
 		// one, or, naming the same subscription, refuse the broker's start.
 		legacyGoogleChatSubscriptionEnvVar,
 		"CREDENTIAL_PROXY_BOOTSTRAP_COMMAND",
+		// The forge configuration is reserved whether or not the operator
+		// renders one. It names which forges the broker builds and where
+		// their tokens are, so a CR that could set it could hand the broker a
+		// forge no declaration admitted -- or, on a GitHub-only install where
+		// the operator sets nothing, point it at a file that is not there and
+		// keep it from starting.
+		vcsForgesEnv,
 		// The listen address is reserved for the placements as well as for the
 		// authentication: it is appended after this merge in every container
 		// the sidecar split into, and an operator who set it to 127.0.0.1

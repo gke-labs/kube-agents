@@ -195,6 +195,10 @@ type Gateway struct {
 	// case preserved: Slack member ids compare exactly).
 	slackAllowed  map[string]bool
 	slackAllowAll bool
+	// a2aGoogleAllowed gates the A2A door's Google-verified callers
+	// (Config.A2ADoorAllowedUsers, lowercased at build). Empty admits
+	// nobody; there is no allow-all.
+	a2aGoogleAllowed map[string]bool
 	// droppedNotices records which unverifiable senders have been told so —
 	// the drop is visible once per sender, not once per message. Per
 	// sender, NOT per conversation: a channel mention mints a fresh
@@ -324,7 +328,7 @@ func New(o Options) (*Gateway, error) {
 		// whose lines forgot the a2a: prefix or point outside eval: has
 		// entries and admits nobody.
 		if a2aAudience.Len() == 0 {
-			log.Warn("the A2A door's principal map carries no a2a: entry mapped to an eval: identity; every message through it will be dropped at verification",
+			log.Warn("the A2A door's principal map carries no a2a: entry mapped to an eval: identity; every static-token message through it will be dropped at verification (Google-verified callers are gated by the allowlist instead)",
 				"path", o.Config.A2ADoorPrincipalMapPath, "entries", a2aPM.Len())
 		}
 	}
@@ -333,6 +337,10 @@ func New(o Options) (*Gateway, error) {
 		if u = strings.TrimSpace(u); u != "" {
 			gchatAllowed[strings.ToLower(u)] = true
 		}
+	}
+	a2aGoogleAllowed := googleAllowlist(o.Config.A2ADoorAllowedUsers)
+	if o.Config.A2ADoorGoogleClientID != "" && len(a2aGoogleAllowed) == 0 {
+		log.Warn("the A2A door's Google sign-in is armed but A2A_DOOR_ALLOWED_USERS is empty; the door refuses every Google-verified caller")
 	}
 	if backend == gchatBackend && len(gchatAllowed) == 0 && !o.Config.GchatAllowAllUsers {
 		log.Warn("gchat allowlist is empty and allow-all is off; every inbound message will be dropped at verification")
@@ -404,6 +412,7 @@ func New(o Options) (*Gateway, error) {
 		targetAllowed:    targetAllowed,
 		slackAllowed:     slackAllowed,
 		slackAllowAll:    o.Config.SlackAllowAllUsers,
+		a2aGoogleAllowed: a2aGoogleAllowed,
 		droppedNotices:   map[string]bool{},
 		relayDurable:     o.RelayDurable,
 	}
@@ -590,7 +599,7 @@ func (g *Gateway) handleInbound(msg InboundMessage) {
 	//
 	// A chat turn's caller is a person, for whom a late answer beats none:
 	// the lock first, then a whole turn, as before the door existed.
-	if backend == injectBackend || backend == a2aBackend {
+	if backend == injectBackend || backend == a2aBackend || backend == a2aGoogleBackend {
 		ctx, cancel := context.WithTimeout(g.runCtx, g.turnBudget)
 		defer cancel()
 		g.runTurn(ctx, msg, backend, principal)
@@ -2428,7 +2437,11 @@ func (g *Gateway) verifiedByOf(backend, principal string) string {
 // be read under the same map the requester's principal was read under, and
 // one backend's map is never a fallback for another's.
 func (g *Gateway) rosterResolver(backend string) func(string) string {
-	if backend == consoleBackend {
+	// The console's grant and the Google class's verified email are the
+	// mechanism. The Google class must not fall through to principalMapFor,
+	// whose default is the chat map, or a door caller's id would resolve as
+	// a chat identity.
+	if backend == consoleBackend || backend == a2aGoogleBackend {
 		return func(id string) string { return g.resolvePrincipal(backend, id) }
 	}
 	if backend == slackBackend {
