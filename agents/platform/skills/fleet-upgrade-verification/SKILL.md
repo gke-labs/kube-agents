@@ -146,7 +146,10 @@ the same target as the member's version row, and a `readiness` object per member
 (`members[].readiness`, with a top-level `readiness` block holding the instant evaluated and a
 count per verdict). Without the flag nothing changes. The rules below each name the governance
 SOP check they derive from, except the webhook rule, which has no SOP check yet; the maintenance
-rule departs from its SOP where the two differ, and says so:
+rule departs from its SOP where the two differ, and says so. Run it once, from this profile, for
+every cluster the question covers; a readiness question fanned out to the Cluster Agents loses the
+maintenance read and the grading below, and a hand survey in their place reports every fail-closed
+webhook without a visible backend, GKE's own URL-backed ones included, as a blocker.
 
 - **Drain-blocking PDBs** (`obtainability_audit_sop.md` §3.4). For each member the script runs
   `gcloud container clusters get-credentials` into a kubeconfig of its own under
@@ -301,6 +304,9 @@ its scope and end time and that it holds back automatic upgrades only, the webho
 `configuration/webhook` with its configuration kind, why its backend is unreachable and what it
 matches, the pool with its skew. A webhook the cell lists as matching none of the upgrade's path
 is an outage to report, not a blocker, with what it does match named so the operator can judge it.
+When the user asks for a verdict per object — does this budget, exclusion or webhook block the
+upgrade — take it from the table: an entry under `blocking` (or a blocking exclusion or pool) is
+yes, a webhook under `outage` is no, with the outage named; do not re-grade by hand.
 Say what the operator has to change before the upgrade can proceed; do not change it, and do not
 propose deleting an exclusion. When the question is a target version's readiness, paste each
 repository's deprecation section too, with its source line, and state the floor and target the
