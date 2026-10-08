@@ -376,7 +376,8 @@ echo "==> Provisioning the environment at the candidate commit via canonical ins
 # merges: that installer takes PLATFORM_AGENT_MODE from the environment this
 # script leaves it exported in under `next`, or from the install.env the
 # deploy workflow's lease check renders for a long-lived environment, so the
-# two patch lines are then the only thing to delete. The wait stays either way.
+# platform_agent_mode_patch_next call below is then the one line to delete
+# (with this paragraph's patch sentences). The wait stays either way.
 #
 # install.sh has already pointed kubectl at the cluster and checked the
 # context; the context is still named on each call, so nothing here can reach
