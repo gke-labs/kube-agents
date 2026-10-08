@@ -54,8 +54,9 @@ permissions:
 
 jobs:
   # Resolves one commit for both environments. Bound to autopush for
-  # vars.REGISTRY_PREFIX: both deploy the same images from GHCR, and binding
-  # autopush-next here would create that environment before it is provisioned.
+  # vars.REGISTRY_PREFIX, which autopush-next's has to match: the images are
+  # checked once, here. Binding autopush-next instead would create that
+  # environment before it is provisioned.
   resolve-candidate:
     if: |
       github.repository == 'gke-labs/kube-agents' &&
