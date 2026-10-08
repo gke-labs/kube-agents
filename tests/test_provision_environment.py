@@ -1116,6 +1116,42 @@ class PlatformAgentModeTest(unittest.TestCase):
         self.assertIn("::error title=mode next: BusProvisioned not True::", proc.stdout)
         self.assertFalse(any("rollout status" in c for c in calls), calls)
 
+    def test_a_dropped_gateway_read_is_retried(self):
+        proc, calls = self._run({"PLATFORM_AGENT_MODE": "next"}, gateway_read_failures=2)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        normalised = self._normalise(calls)
+        self.assertEqual(normalised.count(self._expected_gate()[-2]), 3)
+        self.assertEqual(normalised[-1], self._expected_gate()[-1])
+
+    def test_a_gateway_read_that_never_succeeds_fails_the_step_with_the_state(self):
+        proc, calls = self._run(
+            {"PLATFORM_AGENT_MODE": "next", "PLATFORM_AGENT_MODE_GATE_TIMEOUT_SECONDS": "0"},
+            gateway_read_failures=1000,
+        )
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("::error title=mode next: A2AGateway unreadable::", proc.stdout)
+        self.assertTrue(any("-l app.kubernetes.io/part-of=a2a-next" in c for c in calls), calls)
+        self.assertFalse(any("a2a-gateway" in c and "rollout status" in c for c in calls), calls)
+
+    def test_next_is_refused_on_a_long_lived_environment_before_the_teardown(self):
+        for spelling in ("true", "1", "yes"):
+            with self.subTest(spelling=spelling):
+                proc, calls = self._run(
+                    {"PLATFORM_AGENT_MODE": "next", "LONG_LIVED_ENVIRONMENT": spelling,
+                     "GOOGLE_CHAT_ALLOW_ALL_USERS": "true"}
+                )
+                self.assertEqual(proc.returncode, 1)
+                self.assertEqual(calls, [], "nothing may run, the teardown least of all")
+                self.assertIn("::error title=spec.mode next is for the ephemeral environments::", proc.stdout)
+
+    def test_today_on_a_long_lived_environment_is_untouched(self):
+        proc, calls = self._run(
+            {"PLATFORM_AGENT_MODE": "today", "LONG_LIVED_ENVIRONMENT": "true",
+             "GOOGLE_CHAT_ALLOW_ALL_USERS": "true"}
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(len(calls), 2, calls)
+
     def test_a_failed_rollout_fails_the_step(self):
         proc, _ = self._run({"PLATFORM_AGENT_MODE": "next"}, rollout_exit=1)
         self.assertNotEqual(proc.returncode, 0)

@@ -181,6 +181,12 @@ fi
 # uninstall.sh and install.sh inherit, which platform_agent_mode_resolve
 # clears of the variable. `next` is applied after the install, at the bottom.
 platform_agent_mode_resolve || exit 1
+# And `next` only on the ephemeral environments; the helper says why.
+# LONG_LIVED_ENVIRONMENT is the workflow's flag for autopush and staging,
+# read with the same truthiness as the allowlist guard above.
+if provision_is_truthy "${LONG_LIVED_ENVIRONMENT:-}"; then
+  platform_agent_mode_refuse_long_lived true "${GKE_CLUSTER_NAME:-}" || exit 1
+fi
 
 TEARDOWN_LOG="$(mktemp)"
 

@@ -124,16 +124,30 @@ jobs:
 
       # Also before the checkout, and for the same reason. A `workflow_call`
       # input is a free string, so this is where a caller's typo stops; the
-      # dispatch form offers the two values only. Skipped for `today`.
+      # dispatch form offers the two values only. Skipped for `today` and for
+      # an empty input, which the scripts also read as today.
+      #
+      # `next` is refused on autopush and staging. On a long-lived cluster the
+      # patched spec.mode outlives the run: the chart renders none and the
+      # installer does not read the key, so no upgrade, reconcile or drift
+      # report sees it, and Google Chat stays on the A2A gateway until a
+      # `today` rebuild. provision_environment.sh refuses it as well.
       - name: Check the PlatformAgent mode
-        if: inputs.mode != 'today'
+        if: inputs.mode != 'today' && inputs.mode != ''
         env:
           MODE: ${{ inputs.mode }}
+          TARGET: ${{ inputs.github_environment }}
         run: |
           if [ "${MODE}" != "next" ]; then
             echo "::error title=Not a PlatformAgent mode::mode is '${MODE}'. The PlatformAgent's spec.mode takes today or next; pass one of those, or leave the input unset for today."
             exit 1
           fi
+          case "${TARGET}" in
+            autopush | staging)
+              echo "::error title=spec.mode next is for the ephemeral environments::Refusing mode next on '${TARGET}', a long-lived environment: nothing that later moves it knows about the patched mode, so it would stay next, with Google Chat on the A2A gateway, until a today rebuild. Use rc or nightly for next."
+              exit 1
+              ;;
+          esac
           echo "==> Installing with spec.mode: ${MODE}."
 
       - name: Checkout repository
@@ -167,7 +181,7 @@ jobs:
       # the teardown, rather than discovered from the tests. Skipped for
       # `today`, which every candidate installs.
       - name: Confirm the candidate can install the mode
-        if: inputs.mode != 'today'
+        if: inputs.mode != 'today' && inputs.mode != ''
         env:
           MODE: ${{ inputs.mode }}
         run: |

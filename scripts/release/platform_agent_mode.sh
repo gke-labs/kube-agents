@@ -3,12 +3,16 @@
 # scripts carry for it, the patch that applies `next` after an install, and the
 # gate that waits for what `next` renders.
 #
-# PLATFORM_AGENT_MODE is the install.env key the installer's --mode flag
-# records, so the release path spells it the same way. Unset or `today` is the
-# default and changes nothing: platform_agent_mode_resolve unsets the variable,
-# so a release script and everything it runs see exactly the environment they
-# saw before the mode existed, and render_install_env.sh writes no key for it,
-# which the installer reads as `today` too. Only `next` adds anything.
+# PLATFORM_AGENT_MODE is the install.env key the install's planned --mode
+# flag (#2524) will read and record, so the release path spells it the same
+# way. Unset or `today` is the default and changes nothing:
+# platform_agent_mode_resolve unsets the variable, so a release script and
+# everything it runs see exactly the environment they saw before the mode
+# existed, and render_install_env.sh writes no key for it (an absent spec.mode
+# is `today` to the CRD). Only `next` adds anything.
+#
+# `next` is for the ephemeral rc and nightly clusters only.
+# platform_agent_mode_refuse_long_lived says why.
 #
 # Sourced, not executed: this file defines constants and functions and runs
 # nothing.
@@ -81,6 +85,22 @@ platform_agent_mode_resolve() {
       return 1
       ;;
   esac
+}
+
+# Refuses `next` on a long-lived environment (autopush, staging). The patch
+# outlives the run there: the chart renders no spec.mode and the installer
+# does not read the key, so no later upgrade or reconcile puts it back, drift
+# detection plans nothing for it, and Google Chat stays moved off the legacy
+# consumer onto the A2A gateway until somebody rebuilds the environment on
+# `today`. rc and nightly are destroyed and rebuilt every run, so the mode
+# goes with them. Call after platform_agent_mode_resolve.
+platform_agent_mode_refuse_long_lived() {
+  local long_lived="${1:-}" environment="${2:-this environment}"
+  [ "${RELEASE_PLATFORM_AGENT_MODE}" = "${PLATFORM_AGENT_MODE_NEXT}" ] || return 0
+  [ -n "${long_lived}" ] || return 0
+  echo "::error title=spec.mode next is for the ephemeral environments::Refusing spec.mode ${PLATFORM_AGENT_MODE_NEXT} on '${environment}', a long-lived environment. Nothing that later moves it (an upgrade, a reconcile, drift detection) knows about the patched mode, so it would stay next, with Google Chat moved to the A2A gateway, until a ${PLATFORM_AGENT_MODE_TODAY} rebuild. Use the ephemeral rc or nightly environment for next."
+  echo "==> spec.mode ${PLATFORM_AGENT_MODE_NEXT} refused on long-lived '${environment}'." >&2
+  return 1
 }
 
 # What a failed gate leaves in the log: the CR's status and the A2A objects.
@@ -214,9 +234,20 @@ platform_agent_mode_wait_next() {
     platform_agent_mode_gate_rollout "${namespace}" "${context}" "${workload}" "${deadline}" || return 1
   done
 
+  # Empty is an answer here (the condition is absent while the gateway is
+  # rendered), so a dropped read is told from it by the exit status and
+  # retried inside the budget like every other read in the gate.
   local gateway_reason=""
-  gateway_reason="$("${kc[@]}" get platformagent "${PLATFORM_AGENT_MODE_CR_NAME}" -n "${namespace}" \
-    -o jsonpath="{.status.conditions[?(@.type==\"${PLATFORM_AGENT_MODE_GATEWAY_CONDITION}\")].reason}")"
+  until gateway_reason="$("${kc[@]}" get platformagent "${PLATFORM_AGENT_MODE_CR_NAME}" -n "${namespace}" \
+    -o jsonpath="{.status.conditions[?(@.type==\"${PLATFORM_AGENT_MODE_GATEWAY_CONDITION}\")].reason}" 2>/dev/null)"; do
+    gateway_reason=""
+    if [ "${SECONDS}" -ge "${deadline}" ]; then
+      echo "::error title=mode next: ${PLATFORM_AGENT_MODE_GATEWAY_CONDITION} unreadable::PlatformAgent/${PLATFORM_AGENT_MODE_CR_NAME}'s ${PLATFORM_AGENT_MODE_GATEWAY_CONDITION} condition could not be read within the gate's ${PLATFORM_AGENT_MODE_GATE_TIMEOUT_SECONDS}s, so whether to wait for the A2A gateway is unknown."
+      platform_agent_mode_dump_state "${namespace}" "${context}"
+      return 1
+    fi
+    sleep "${PLATFORM_AGENT_MODE_POLL_SECONDS}"
+  done
   if [ "${gateway_reason}" = "${PLATFORM_AGENT_MODE_GATEWAY_DARK_REASON}" ]; then
     echo "${PLATFORM_AGENT_MODE_A2A_GATEWAY} is withheld (${PLATFORM_AGENT_MODE_GATEWAY_CONDITION}=False ${PLATFORM_AGENT_MODE_GATEWAY_DARK_REASON}): this install configures no chat backend, so there is no A2A gateway to wait for."
   else

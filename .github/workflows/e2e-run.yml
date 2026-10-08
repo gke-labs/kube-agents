@@ -122,7 +122,7 @@ jobs:
       # platform_agent_mode.sh ignores PLATFORM_AGENT_MODE, so `next` would
       # run the suites without its gate. Skipped for `today`.
       - name: Confirm the candidate can gate the mode
-        if: inputs.mode != 'today'
+        if: inputs.mode != 'today' && inputs.mode != ''
         env:
           MODE: ${{ inputs.mode }}
         run: |
