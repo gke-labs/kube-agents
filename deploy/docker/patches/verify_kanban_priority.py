@@ -174,7 +174,7 @@ for row in conn.execute("SELECT priority FROM tasks WHERE id = ?", (spoof,)):
     spoof_priority = int(row[0] or 0)
 check(
     "a triage worker naming another board still files background",
-    spoof_priority is None or spoof_priority < KP.USER_PRIORITY,
+    spoof_priority is not None and spoof_priority < KP.USER_PRIORITY,
     f"priority={spoof_priority}",
 )
 check(

@@ -187,6 +187,9 @@ def stamp_priority(
         return max(base, USER_PRIORITY)
     except Exception as exc:  # noqa: BLE001 — never fail kanban_create
         logger.warning("kanban priority: stamping fell back to %r: %r", base, exc)
+        # A worker's card is never promoted on a failed read.
+        if worker_task_id:
+            return min(base, USER_PRIORITY - 1)
         return base
 
 

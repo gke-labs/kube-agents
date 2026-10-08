@@ -171,6 +171,19 @@ class UntrustedSessionTest(unittest.TestCase):
             kp.USER_PRIORITY - 1,
         )
 
+    def test_a_worker_whose_parent_read_fails_is_not_promoted(self):
+        class Unreadable:
+            session_id = "20261008_101500_ab12cd34"
+
+            @property
+            def priority(self):
+                raise RuntimeError("row gone")
+
+        self.assertEqual(
+            kp.stamp_priority(500, Unreadable(), worker_task_id="t_w", origin_session=""),
+            kp.USER_PRIORITY - 1,
+        )
+
     def test_a_user_turn_naming_a_triage_session_is_not_demoted_by_it_either(self):
         out, created = HandlerHarness(self).create(
             {"title": "Question", "session_id": EVENT_SESSION}, origin="",
