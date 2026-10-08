@@ -16,9 +16,10 @@
 
 Usage: python3 - <home> < own_stage.py
 
-A fresh install has the `oobe` job and no finished `.oobe_audits_fired` until its own scan
-settles. Arming over that would point the job at the stand-in cards, start the audits beside
-the real scan, and use up the install's own first run. Prints `pending` or `clear`.
+A fresh install has the `oobe` job and no finished `.oobe_audits_fired` until its scan settles
+and its own chain has started the last audit. Arming over that would point the job at the
+stand-in cards, start the audits beside the real scan or chain, and use up the install's own
+first run. Prints `pending` or `clear`.
 """
 
 import json

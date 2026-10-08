@@ -113,6 +113,15 @@ def runnable(job):
     return job.get("enabled", True) and job.get("state") != PAUSED_STATE and not job.get("paused_at")
 
 
+def unrunnable_audits():
+    """The stage's audits that are missing from the Platform roster, disabled or paused."""
+    try:
+        jobs = {job.get("id"): job for job in jobs_in(ROSTER)}
+    except FileNotFoundError:
+        return set()
+    return {audit for audit in stage_audits() if audit not in jobs or not runnable(jobs[audit])}
+
+
 def stage_pending():
     """The audits asked about that a pending `oobe` stage holds, each with why."""
     try:
@@ -130,12 +139,19 @@ def stage_pending():
     # The audit awaiting its run counts as well as the next: the stage records a mark before the
     # store has it, and a mark the store dropped is made again at the start limit.
     current = (state.get("current") or {}).get("job")
-    had_turn = set(state.get("fired", [])) | set(state.get("held", {})) | set(state.get("gave_up", []))
-    remaining = [audit for audit in stage_audits() if audit not in had_turn]
+    fired, gave_up = set(state.get("fired", [])), set(state.get("gave_up", []))
+    # A mark taken back (never claimed, or a trigger that failed) stays in `marks`, and the stage
+    # adopts its run if one turns up: it counts, and the audit after it is the next.
+    taken_back = set(state.get("marks") or {}) - fired - gave_up
+    had_turn = fired | set(state.get("held", {})) | gave_up | taken_back
+    # The stage holds an audit the Platform roster cannot run and marks the one after it, by the
+    # same three markers as its audit_holds.
+    skipped = unrunnable_audits()
+    remaining = [audit for audit in stage_audits() if audit not in had_turn and audit not in skipped]
     if os.path.exists(STACK_STATE):
-        held = set(remaining) | {current}
+        held = set(remaining) | {current} | taken_back
     elif state:
-        held = set(remaining[:1]) | {current}
+        held = set(remaining[:1]) | {current} | taken_back
     else:
         return set()
     return {f"{audit} (oobe stage)" for audit in held if audit in audits}

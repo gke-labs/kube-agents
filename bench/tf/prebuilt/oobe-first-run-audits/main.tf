@@ -24,8 +24,8 @@
 # An image without the job gets nothing put back, so nothing starts the audits.
 #
 # Before it arms, the apply waits for the install's own first-run stage to finish
-# (a fresh install has the job pending until its own scan settles), failing after
-# `own_wait`. An earlier run's arm left behind is disarmed first. After the arm it
+# (a fresh install has the job pending until its scan settles and its own chain has
+# started the last audit), failing after `own_wait`. An earlier run's arm left behind is disarmed first. After the arm it
 # waits, up to `chain_wait`, for the stage to finish: it marks the audits one after
 # another, which outlasts the verifier's two-minute window. On an image without the
 # job there is nothing to wait for.
@@ -59,9 +59,10 @@ locals {
   arm_b64    = base64encode(file("${path.module}/arm.py"))
   disarm_b64 = base64encode(file("${path.module}/disarm.py"))
   own_b64    = base64encode(file("${path.module}/own_stage.py"))
-  # One infra-lock deadline (hack/ci-eval-pr.sh): a fresh install's own scan usually settles
-  # inside it, and holding the lock longer stalls every other stack-bearing case.
-  own_wait = 1800
+  # A fresh CI install's scan settles about 17 minutes after boot, then its chain runs three
+  # audits and claims the fourth (one to 45 minutes each). Held under the infra lock, which
+  # gives each stack-bearing case 30 minutes per contender, so a longer wait starves them.
+  own_wait = 3600
   # arm.py prints this when the image ships no oobe job.
   no_job = "ships no oobe job"
   # The chain runs the four audits one after another (1-15 minutes each), and the stage is
@@ -146,7 +147,7 @@ resource "null_resource" "oobe" {
       elapsed=0
       until own="$(printf '%s' '${local.own_b64}' | base64 -d | agent_py "${local.home}")" && [ "$own" = clear ]; do
         if [ "$elapsed" -ge ${local.own_wait} ]; then
-          echo "ERROR: the install's own first-run stage on ${var.host_cluster_name} is still $${own:-unreadable} after $${elapsed}s: its onboarding scan has not settled, and this case would cut across it." >&2
+          echo "ERROR: the install's own first-run stage on ${var.host_cluster_name} is still $${own:-unreadable} after $${elapsed}s: its onboarding scan or its own first-run chain has not finished, and this case would cut across it." >&2
           exit 1
         fi
         sleep ${local.poll}

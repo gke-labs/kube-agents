@@ -193,6 +193,28 @@ class PlatformRunsTest(unittest.TestCase):
             "still going after 0s, the run goes ahead: compliance-audit (oobe stage), fleet-wide-cost-analysis (oobe stage)",
         )
 
+    def test_a_mark_taken_back_counts_and_the_audit_after_it_is_next(self):
+        # Never claimed in time (or a trigger that failed after the store took it): the stage
+        # adopts its run if one turns up, then marks compliance.
+        self._stage({"fired": [], "marks": {"fleet-wide-cost-analysis": 1}, "current": None}, armed=False)
+        self.assertEqual(
+            self._wait(),
+            "still going after 0s, the run goes ahead: compliance-audit (oobe stage), fleet-wide-cost-analysis (oobe stage)",
+        )
+
+    def test_an_audit_the_platform_roster_cannot_run_is_passed_over(self):
+        # The stage holds a disabled audit and marks the one after it, so that one is next.
+        self._stage({"fired": ["fleet-wide-cost-analysis"], "current": None}, armed=False)
+        self._roster(
+            [
+                {"id": "fleet-wide-cost-analysis", "enabled": True},
+                {"id": "compliance-audit", "enabled": False},
+                {"id": "obtainability-audit", "enabled": True},
+                {"id": "stockout-prevention", "enabled": True},
+            ]
+        )
+        self.assertEqual(self._wait(), "still going after 0s, the run goes ahead: obtainability-audit (oobe stage)")
+
     def test_a_roster_whose_jobs_are_not_a_list_holds(self):
         self._stage({"fired": []}, armed=False)
         (self.home / "cron" / "jobs.json").write_text(json.dumps({"jobs": {"oobe": {}}}))
