@@ -365,10 +365,10 @@ Tool calls from either can land in the wrong task's trace. And when Hermes compr
 session it continues it under a new session id, which the hook reports and the trace's key does
 not match, so the trace stops for that conversation while the answers keep arriving.
 
-**`cli`: a subprocess per task.** `hermes -p <BRIDGE_PROFILE> chat -Q --query=<prompt>`, a fresh
-session for every task, with no memory of the thread's earlier tasks. Within one task,
-follow-up turns resume the task's session (`--resume`). The rest of this page
-describes it where the two differ.
+**`cli`: a subprocess per turn.** `hermes -p <BRIDGE_PROFILE> chat -Q --query=<prompt>`, a fresh
+session for every task, with no memory of the thread's earlier tasks. Within one task, each
+follow-up turn is another subprocess that resumes the task's session (`--resume`). The rest of
+this page describes it where the two differ.
 
 ## Lifecycle, steering, cancel
 
@@ -406,9 +406,10 @@ terminal event is acked with a warning and nothing else.
 **Steering:** a follow-up message to a running task is queued, not refused. The bridge answers
 each one with a non-final status carrying the task's current state (`submitted` while queued or
 waiting for the session, `working` after) and a `steerNotice` data part: `queued`, or `refused`
-with `queue-full` (16 already waiting), `task-ending` (the answer was already chosen), `no-text`,
-`capability` (the task's capability, carried on the follow-up, was refused when checked on the worker
-before its turn),
+with `queue-full` (a task takes at most 16 follow-ups, counted per task: those already run count,
+not only those waiting), `task-ending` (the answer was already chosen), `no-text`, `capability`
+(the task's capability, carried on the follow-up, did not pass when checked on the worker before
+its turn: refused, or the verifier could not be reached; the one token covers both),
 `no-resume` (cli: stderr's last non-blank line is not `session_id:` and an id of up to 128
 letters, digits, `_`, `.`, `:` and `-` that starts with a letter or digit, or the command does not
 end in `-q`), or
@@ -419,12 +420,14 @@ posts another turn with the same session headers, under the same session slot, a
 never replays the opening answer; `cli` runs
 `hermes -p <profile> chat -Q --resume <session_id> --query=<text>`. Every turn passes its text as one
 `--query=` token, the opening turn too, so a message that starts with `-` stays the query rather
-than reading as an option. Each earlier turn's answer is
+than reading as an option, and with any NUL byte dropped, since no argument can carry one. Each earlier turn's answer is
 published as a `turn` artifact as soon as the next turn is about to run; the last turn's answer
 is the `result`, then the one terminal. A failed follow-up turn names itself in the terminal
 (`; turn: N` after the session, on either executor). A follow-up does not change task state
 (payload spec assertion 12). A bridge that crashes with follow-ups queued loses them; the
-gateway's relay reports them as not run at the terminal, unless the gateway restarted too.
+gateway's relay reports them as not run at the terminal, unless the gateway restarted too. The
+count is best-effort: a follow-up whose turn had started when the bridge crashed counts as run,
+though its answer never arrives.
 Mid-turn steering through the runs API is gke-labs#2628.
 
 **Upgrade order for steering.** The gateway and the bridge do not roll together. The gateway's
@@ -440,15 +443,19 @@ rollback, move the sidecar tag back first, then the operator. The two skews look
 - **New gateway, old bridge.** Noisy, but nothing is lost. The room gets "✏️ got it, I'll take
   that next", which is wrong, then the old bridge's "ℹ️ steering received but not absorbed …",
   and the task's one answer. The gateway posts its "a follow-up arrived as the task finished"
-  line only after it has heard a steer notice from that addressee, and an old bridge sends none,
-  so that false line does not appear.
+  line only after it has heard a steer notice from that addressee since it started, and an old
+  bridge sends none. That memory outlives the bridge, though: until the gateway restarts, a
+  gateway that heard notices from that addressee before the rollback can still post one false
+  "follow-up arrived as the task finished" line at the end of a task that had a follow-up.
 
 **Cancel:** SIGTERM to the subprocess's process group, SIGKILL after a grace period,
 then terminal `canceled` (`reason: canceled-by-request`). A task racing to completion may
 land `completed` first - both orders are legal and the terminal event wins. A per-task
 deadline (default 7200s, matching the profile's `activeDeadlineSeconds`), which covers every
-turn of the task, takes the same kill path and lands `failed`; no
-follow-up turn starts once it has passed.
+turn of the task, takes the same kill path and lands `failed` (`reason: deadline-exceeded - killed
+after …`, with `; turn: N` for a follow-up turn); no follow-up turn starts once it has passed, and
+a deadline found before a turn starts, with no child to kill, reads `reached after … before the
+next turn started` instead.
 
 A cancel for a task still queued finalizes it `canceled` with `reason: canceled-before-start`
 and nothing is spawned, and the worker looks for one itself before it spawns. The durable

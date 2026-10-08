@@ -184,7 +184,8 @@ executors do different things: on a
 session-routed conversation, that the worker picks it up at its next turn boundary
 if the task is still running; on a fixed-routed one, "got it, I'll take that next".
 The executor's notice on the stream corrects it when the follow-up was not taken
-(queue full, the task already ending), and at the task's terminal the gateway says so
+(the task's follow-up limit reached, which the platform executor counts per task, or the
+task already ending), and at the task's terminal the gateway says so
 for a follow-up the executor never answered or never ran, and in one line for those it
 refused because it could not continue the session. The never-answered line posts only
 once the gateway has heard a steer notice from that addressee since it started: an
