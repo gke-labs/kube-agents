@@ -31,12 +31,17 @@ What
    ``priority``. A dispatcher worker's child inherits its parent's priority, so
    a user card's fan-out stays user-class and a triage card's stays
    background. The class is read only from trusted context (the turn's own
-   session as the runtime bound it, or the worker's own card), never from the
-   ``session_id`` a model may pass to the tool, and a worker whose own card
-   cannot be read files background. On the ``kanban_create`` path the
-   classification fails toward the user: a background producer with a prefix
-   this list does not know about is treated as a user, which costs triage
-   speed and never a user's slot. Cards that never pass through
+   session as the runtime bound it, or the priority stamped on the worker's
+   own card), never from a ``session_id``: not the one a model may pass to
+   the tool, and not the one stored on the worker's card, which upstream
+   copies from that same argument. A worker whose own card cannot be read
+   files background. On the ``kanban_create`` path the classification fails
+   toward the user by design: a background producer with a prefix this list
+   does not know about is stamped user-class. That card then counts against
+   the user class and can take a user's slot, and a person's card filed after
+   it sorts behind it at equal priority, so the cost is a user slot, not only
+   triage speed. A new background producer adds its prefix here.
+   Cards that never pass through
    ``kanban_create`` are not stamped and keep upstream's priority 0, which is
    background: ``hermes kanban create`` without ``--priority 100``, the
    dashboard, and the children auto-decompose inserts for a ``triage: true``
@@ -144,12 +149,16 @@ def stamp_priority(
     tests pass it.
 
     The class comes only from trusted context: the creating turn's own session
-    as the runtime bound it, and for a dispatcher worker its own card. The
-    ``session_id`` argument a model may pass to ``kanban_create`` is ignored
-    here, because a triage worker could otherwise name a user-looking session
-    and take the user slot. The card is background when any trusted source
-    says so: the origin session or the parent's session has a background
-    prefix, or the parent itself is below :data:`USER_PRIORITY`. A dispatcher
+    as the runtime bound it, and for a dispatcher worker the priority stamped
+    on its own card. The ``session_id`` argument a model may pass to
+    ``kanban_create`` is ignored here, because a triage worker could otherwise
+    name a user-looking session and take the user slot. So is the parent's
+    stored ``session_id``: upstream writes ``args["session_id"]`` there, so a
+    person's card filed with a triage-looking argument would otherwise fan out
+    background children. The parent's priority is the trusted record of its
+    class, written by this function from the parent's own origin (or by an
+    operator on the dashboard). The card is background when the origin session
+    has a background prefix or the parent is below :data:`USER_PRIORITY`. A dispatcher
     worker whose own card cannot be read (it named another ``board``, or the
     card is gone) fails closed to background: a worker never files a user card
     on the strength of a card it cannot show.
@@ -176,8 +185,6 @@ def stamp_priority(
             background = True
         if parent is not None:
             parent_priority = getattr(parent, "priority", None)
-            if is_background_session(getattr(parent, "session_id", None)):
-                background = True
             if parent_priority is not None:
                 base = max(base, int(parent_priority))
                 if not is_user_priority(parent_priority):
@@ -200,9 +207,10 @@ def stamp_priority(
 #: Event kind written for a user card left waiting for a worker slot.
 QUEUED_KIND = "queued"
 
-#: The line the user sees in the card's thread, and that ``kanban_create``
-#: hands the model. Worded by bnaylor: no counts in the user-facing
-#: line; the counts go to the gateway log's saturation warning.
+#: The line the user sees in the card's thread, carried on the dispatcher's
+#: ``queued`` event. ``kanban_create`` returns counts only, no text for the
+#: model to relay. Worded by bnaylor: no counts in the user-facing line; the
+#: counts go to the gateway log's saturation warning.
 QUEUED_TEXT = "Queued: the system is busy. Your request will start when a worker frees up."
 QUEUED_MARKER = "⏳"
 
@@ -212,6 +220,10 @@ CARDS_SHOWN = 5
 #: How often the saturation warning may repeat, matching upstream's stuck
 #: warning, which it replaces for this case.
 WARN_INTERVAL_SECONDS = 300
+
+#: The units the saturation warning prints a running card's age in.
+SECONDS_PER_MINUTE = 60
+SECONDS_PER_HOUR = 3600
 
 
 def _kb():
@@ -608,7 +620,17 @@ def queue_fields(
     conn, task_id: str, board: Optional[str] = None,
     cap_reader: Optional[Callable[[], Optional[int]]] = None,
 ) -> dict:
-    """``{"queued": True, "queue": {...}}`` when the new card will wait.
+    """``{"queued": True, "queue": {...}}`` when the new card's class has no
+    free slot now.
+
+    The test is the slot count alone: the cap less every running card, and,
+    at a cap of 2 or more, the card's class share (:func:`class_cap`) less the
+    cards of its class already running. Ready rows ahead of the card are not
+    counted, because the dispatcher may hold them for the other class's slot or
+    skip them for reasons of their own (no assignee, the per-profile cap), and
+    a row it will not spawn is no wait. So ``queued`` never reports a wait that
+    will not happen; a card filed behind other spawnable rows can still wait a
+    tick unflagged, and the dispatcher's ``queued`` event covers that.
 
     Machine-readable only. The thread hears about the wait once, from the
     dispatcher's ``queued`` event, so this carries no text for the model to
@@ -638,14 +660,9 @@ def queue_fields(
             background = count_running_background_host(conn, board)
             held_by_class = background if not user else max(0, running - background)
             free = min(free, cap - held_by_class)
-        ahead = 0
-        for other in _ready_rows(conn):
-            if _cell(other, "id", 0) == task_id:
-                break
-            ahead += 1
-        if ahead < free:
+        if free > 0:
             return {}
-        return {"queued": True, "queue": {"running": running, "limit": limit, "ahead": ahead}}
+        return {"queued": True, "queue": {"running": running, "limit": limit}}
     except Exception as exc:  # noqa: BLE001 — never fail kanban_create
         logger.debug("kanban priority: queue snapshot failed: %r", exc)
         return {}
@@ -716,19 +733,27 @@ def _age(started_at: object, now: float) -> str:
         seconds = max(0, int(now) - int(started_at))
     except (TypeError, ValueError):
         return "?"
-    if seconds >= 3600:
-        return f"{seconds // 3600}h"
-    if seconds >= 60:
-        return f"{seconds // 60}m"
+    if seconds >= SECONDS_PER_HOUR:
+        return f"{seconds // SECONDS_PER_HOUR}h"
+    if seconds >= SECONDS_PER_MINUTE:
+        return f"{seconds // SECONDS_PER_MINUTE}m"
     return f"{seconds}s"
 
 
 def _origin(card: dict) -> str:
+    """A running card's label: ``user``, or the background producer's prefix.
+
+    The priority decides the class. The stored session only names which
+    background producer filed a background card, because a user card can carry
+    whatever session a model passed to ``kanban_create``.
+    """
+    if is_user_priority(card.get("priority")):
+        return "user"
     session = card.get("session_id")
     for prefix in BACKGROUND_SESSION_PREFIXES:
         if isinstance(session, str) and session.startswith(prefix):
             return prefix
-    return "user" if is_user_priority(card.get("priority")) else "background"
+    return "background"
 
 
 def saturation_message(sat: dict, now: Optional[float] = None) -> str:

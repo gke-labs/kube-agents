@@ -90,9 +90,15 @@ class StampTest(unittest.TestCase):
         parent = SimpleNamespace(priority=0, session_id=GATEWAY_SESSION)
         self.assertEqual(stamp(0, parent), 0)
 
-    def test_an_operator_promoted_triage_parents_child_is_still_clamped(self):
+    def test_a_parents_stored_session_does_not_set_its_childs_class(self):
+        """The parent's priority is the trusted record of its class, written by
+        stamp_priority from the creating turn's own session. Its stored
+        ``session_id`` is not: upstream stores ``args["session_id"]`` there when
+        the model passes one. So a parent at or above the floor fans out user
+        cards whatever session it carries, an operator's dashboard promotion
+        included."""
         parent = SimpleNamespace(priority=150, session_id=EVENT_SESSION)
-        self.assertEqual(stamp(0, parent), kp.USER_PRIORITY - 1)
+        self.assertEqual(stamp(0, parent), 150)
 
     def test_a_parent_without_a_priority_is_ignored(self):
         self.assertEqual(stamp(0, SimpleNamespace()), kp.USER_PRIORITY)
@@ -189,6 +195,20 @@ class UntrustedSessionTest(unittest.TestCase):
             {"title": "Question", "session_id": EVENT_SESSION}, origin="",
         )
         self.assertEqual(created["priority"], kp.USER_PRIORITY)
+
+    def test_a_user_card_naming_a_triage_session_fans_out_user_cards(self):
+        """Upstream stores the argument on the row, so the worker's own card
+        later carries the triage-looking session. Its children classify from
+        the card's stamped priority, not from that stored value."""
+        _out, card = HandlerHarness(self).create(
+            {"title": "Question", "session_id": EVENT_SESSION}, origin="",
+        )
+        self.assertEqual(card["session_id"], EVENT_SESSION, "upstream still stores what it was given")
+        parent = SimpleNamespace(priority=card["priority"], session_id=card["session_id"])
+        _out, child = HandlerHarness(self).create(
+            {"title": "Check the logs"}, origin="", self_task=parent,
+        )
+        self.assertEqual(child["priority"], kp.USER_PRIORITY)
 
 
 class SessionPrefixPinTest(unittest.TestCase):
@@ -596,6 +616,25 @@ class ReservedSlotTest(unittest.TestCase):
         spawned, _ = b2.tick(cap=3)
         self.assertEqual(spawned, ["kid0", "kid1"])
 
+    def test_a_waiting_user_coordinator_is_not_discounted_from_the_background_share(self):
+        """Only background waiters come off the background count. A user
+        coordinator waiting on its child must leave triage's running card
+        counted, or the next background card takes the user's slot."""
+        b = Board(self)
+        b.card("coord-u", U, status="running")
+        b.child_of("coord-u", "kid-u", U)
+        b.conn.execute("UPDATE tasks SET status = 'todo' WHERE id = 'kid-u'")
+        b.card("bg-run", status="running")
+        b.card("bg2")
+        from kanban_scheduling import count_waiting_on_children
+
+        self.assertEqual(count_waiting_on_children(b.conn), 1)
+        self.assertEqual(count_waiting_on_children(b.conn, below_priority=U), 0)
+        self.assertEqual(kp.count_running_background(b.conn), 1)
+        spawned, res = b.tick(cap=2)
+        self.assertEqual(spawned, [])
+        self.assertEqual(res.skipped_reserved, ["bg2"])
+
     def test_an_unassigned_background_row_is_reported_unassigned_not_reserved(self):
         b = Board(self)
         b.card("running", status="running")
@@ -748,13 +787,23 @@ class SaturationAndQueuedTest(unittest.TestCase):
 
 
 class QueueFieldsTest(unittest.TestCase):
+    def setUp(self):
+        # queue_fields answers nothing in a dispatcher worker, so a runner that
+        # inherits a worker's HERMES_KANBAN_TASK would empty every answer here.
+        patcher = mock.patch.dict("os.environ")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        import os
+
+        os.environ.pop("HERMES_KANBAN_TASK", None)
+
     def test_a_user_card_into_a_full_cap_is_queued(self):
         b = Board(self)
         b.card("bg-run", status="running")
         b.card("u-run", U, status="running")
         b.card("new", U)
         out = kp.queue_fields(b.conn, "new", cap_reader=lambda: 2)
-        self.assertEqual(out, {"queued": True, "queue": {"running": 2, "limit": 2, "ahead": 0}})
+        self.assertEqual(out, {"queued": True, "queue": {"running": 2, "limit": 2}})
 
     def test_a_user_card_with_the_reserved_slot_free_is_not_queued(self):
         b = Board(self)
@@ -768,13 +817,34 @@ class QueueFieldsTest(unittest.TestCase):
         b.card("new")
         self.assertTrue(kp.queue_fields(b.conn, "new", cap_reader=lambda: 2).get("queued"))
 
-    def test_cards_ahead_of_it_count(self):
+    def test_a_background_card_behind_held_user_rows_is_not_queued(self):
+        """The user class is at its floor (5 of 6) and three more user cards are
+        ready: the dispatcher holds all three, so the background card filed
+        behind them starts on the next tick and must not be told it waits."""
         b = Board(self)
-        b.card("u-run", U, status="running")
-        b.card("ahead", U)
+        for n in range(5):
+            b.card(f"u-run{n}", U, status="running")
+        for n in range(3):
+            b.card(f"u-held{n}", U)
+        b.card("new")
+        self.assertEqual(kp.queue_fields(b.conn, "new", cap_reader=lambda: 6), {})
+        spawned, res = b.tick(cap=6)
+        self.assertEqual(spawned, ["new"])
+        self.assertEqual(res.skipped_reserved, ["u-held0", "u-held1", "u-held2"])
+
+    def test_a_user_card_behind_rows_the_dispatcher_skips_is_not_queued(self):
+        """Unassigned rows ahead of it never take a slot, so they are no wait:
+        one user slot is free and the new card takes it on the next tick."""
+        b = Board(self)
+        for n in range(4):
+            b.card(f"u-run{n}", U, status="running")
+        for n in range(3):
+            b.card(f"orphan{n}", U, assignee=None)
         b.card("new", U)
-        self.assertTrue(kp.queue_fields(b.conn, "new", cap_reader=lambda: 2).get("queued"))
-        self.assertEqual(kp.queue_fields(b.conn, "new", cap_reader=lambda: 4), {})
+        self.assertEqual(kp.queue_fields(b.conn, "new", cap_reader=lambda: 6), {})
+        spawned, res = b.tick(cap=6)
+        self.assertEqual(spawned, ["new"])
+        self.assertEqual(res.skipped_unassigned, ["orphan0", "orphan1", "orphan2"])
 
     def test_a_user_card_beyond_the_user_share_is_queued(self):
         b = Board(self)
@@ -1005,6 +1075,11 @@ class WarningTest(unittest.TestCase):
 
     def test_a_user_card_is_labelled_user(self):
         sat = dict(SAT, cards=[{"id": "t_1", "assignee": "a", "priority": U, "session_id": "2026_x", "started_at": 990}])
+        self.assertIn("t_1 @a 10s [user]", kp.saturation_message(sat, now=1000))
+
+    def test_a_user_card_carrying_a_triage_session_is_labelled_user(self):
+        """The stored session can be what the model passed; the priority is the class."""
+        sat = dict(SAT, cards=[{"id": "t_1", "assignee": "a", "priority": U, "session_id": "k8s-evt-1", "started_at": 990}])
         self.assertIn("t_1 @a 10s [user]", kp.saturation_message(sat, now=1000))
 
     def test_saturation_waits_for_the_window_then_rate_limits(self):
