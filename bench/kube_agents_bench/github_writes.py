@@ -59,6 +59,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import sys
 import urllib.parse
 from collections.abc import Callable
@@ -102,6 +103,7 @@ __all__ = [
     "forge_name",
     "is_gitlab_token_bot",
     "main",
+    "named_in",
     "parse_github_time",
     "proposal_numbers_named",
     "token_env_vars",
@@ -109,7 +111,7 @@ __all__ = [
 ]
 
 #: Where the run learns the case's GitOps repository, ``owner/name``.
-#: ``hack/ci-eval-pr.sh`` exports it on the inject lane from the same
+#: ``hack/ci-eval-pr.sh`` exports it on both lanes from the same
 #: project-to-repository mapping the deploy and the ledger reset read
 #: (``gitops_repo_for_project`` in ``hack/ci-deploy.sh``); a dev install sets
 #: it by hand to the repository its ``EVAL_GITOPS_REPO`` named.
@@ -173,6 +175,19 @@ DEFAULT_CALL_TIMEOUT_SECONDS = 30.0
 #: The length of a bare-year ``--since`` (``2026``), which ``fromisoformat``
 #: refuses and which would otherwise read as seconds since 1970.
 YEAR_DIGITS = 4
+
+#: Where a branch name is found in a text: not after a character that would
+#: make it the tail of a longer name (a ``/`` may precede it, as in
+#: ``refs/heads/<branch>`` or a ``/tree/<branch>`` URL), and not before one
+#: that would continue it (a ``.`` only when a name character follows, so a
+#: sentence may end on it). ``platform-agent/fix`` is not found inside
+#: ``platform-agent/fix-oom``.
+BRANCH_NAME_BEFORE = r"(?<![A-Za-z0-9._-])"
+BRANCH_NAME_AFTER = r"(?![A-Za-z0-9_/-]|\.[A-Za-z0-9_/-])"
+#: A branch whose name holds none of these is a bare word (``fix``,
+#: ``main``) that a reply's prose carries by accident, so it is attributed
+#: by its pull request's URL alone, never by its name.
+BRANCH_NAME_SEPARATORS = ("/", "-", "_")
 
 Transport = Callable[[str, str, float], tuple[int, Any]]
 
@@ -644,6 +659,30 @@ def proposal_numbers_named(
     of the other forge, names nothing here."""
     return {n for path, n in proposal_refs(text, forge, environ) if path.lower() == repo.lower()}
 
+def named_in(
+    write: GitHubWrite,
+    text: str,
+    repo: str,
+    forge: str,
+    environ: dict[str, str] | None = None,
+) -> bool:
+    """Whether ``text`` -- what one repetition said and sent -- ties
+    ``write`` to that repetition: the pull request's web URL in full, or the
+    branch it was written on, as a whole name with a separator in it.
+
+    What charges a write to the repetition that made it rather than to every
+    repetition whose window it falls in (#2611): the agent links the pull
+    request it opened in its own reply, and its own push or
+    ``submit-suggestion`` call carries the branch.
+    """
+    if write.number is not None and write.number in proposal_numbers_named(text, repo, forge, environ):
+        return True
+    branch = write.branch
+    if not branch or not any(sep in branch for sep in BRANCH_NAME_SEPARATORS):
+        return False
+    return re.search(BRANCH_NAME_BEFORE + re.escape(branch) + BRANCH_NAME_AFTER, text) is not None
+
+
 def parse_github_time(value: Any) -> datetime | None:
     """A GitHub API timestamp (``2026-09-25T17:32:18Z``) as an aware datetime, or None."""
     if not isinstance(value, str) or not value.strip():
@@ -830,7 +869,7 @@ def _parse_since(text: str) -> datetime:
 def main(argv: list[str] | None = None) -> int:
     """List what a run wrote to the repository since an instant.
 
-    ``hack/ci-eval-pr.sh`` runs this after the fan-out on the inject lane so
+    ``hack/ci-eval-pr.sh`` runs this after the fan-out on both lanes so
     the job's log names every pull request and branch the run left behind.
     It closes nothing: the in-job reset (``hack/ci_reset_agent_pulls.py``)
     closes before each unit that may write, and the next lease's reset or the
