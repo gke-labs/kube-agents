@@ -8,8 +8,9 @@ three things have to agree for the scrape to work: the port the operator
 declares on the container, the number in the PodMonitoring, and the labels the
 operator puts on the pod. The chart cannot read the operator, so the structural
 tests hold the template to the operator's golden manifest instead. No golden
-renders mode next, so the A2A gateway's row is held to the operator's source:
-the port constant and the pod name it builds the app label from. Whether they render at all follows the cluster by
+renders mode next, so the A2A gateway's row is held to the rendered A2A
+ingress fixture (k8s-operator/internal/controller/testdata/a2a-gateway-ingress.yaml).
+Whether they render at all follows the cluster by
 default: helm template has no cluster, so the render tests hand it the
 PodMonitoring API with --api-versions where they mean a cluster that serves it.
 The render tests need a helm binary, which the agent-startup job lacks.
@@ -34,15 +35,8 @@ _GOLDEN = (
     _REPO_ROOT / "k8s-operator" / "internal" / "testing" / "testdata" / "platform" / "expected" / "platformagent.yaml"
 )
 _KIND_UP = _REPO_ROOT / "hack" / "kind-up.sh"
-_A2A_MANIFESTS = _REPO_ROOT / "k8s-operator" / "internal" / "controller" / "platformagent_a2a_manifests.go"
-# The operator's declarations the A2A gateway's row is read from. Each must
-# match exactly once, or the read raises: a renamed constant fails here rather
-# than leaving the row checking nothing.
-_A2A_PORT_RE = re.compile(r"^\s*a2aGatewayMetricsPort\s+int32\s*=\s*(\d+)\s*$", re.MULTILINE)
-_A2A_PORT_NAME_RE = re.compile(r'^\s*a2aGatewayMetricsPortName\s*=\s*"([^"]+)"\s*$', re.MULTILINE)
-_A2A_NAME_RE = re.compile(
-    r'^func a2aGatewayName\(agent \*agentv1alpha1\.PlatformAgent\) string \{ return agent\.Name \+ "([^"]+)" \}$',
-    re.MULTILINE,
+_A2A_FIXTURE = (
+    _REPO_ROOT / "k8s-operator" / "internal" / "controller" / "testdata" / "a2a-gateway-ingress.yaml"
 )
 _REQUIRED = [
     "--set", "platformAgent.harness.clusterName=ci-cluster",
@@ -60,8 +54,8 @@ _GATE = '{{- if and .Values.platformAgent.enabled (include "kube-agents.platform
 # One row per scraped pod: the PodMonitoring name suffix, the Deployment and
 # container the golden declares the port on, the port's name there, and the
 # keys of the pod labels the selector has to carry. The values come from the
-# golden, so a label the operator moves fails this test until the template
-# follows.
+# golden or fixture, so a label the operator moves fails this test until the
+# template follows.
 _SCRAPES = (
     {
         "suffix": "-gateway-monitoring",
@@ -77,38 +71,29 @@ _SCRAPES = (
         "port_name": "cred-metrics",
         "selector_keys": ("app", "kubeagents.x-k8s.io/component"),
     },
-    # Read from the operator's source rather than the golden (see the module
-    # docstring): "operator_source" marks the row.
+    # Read from the rendered A2A ingress fixture rather than the golden (see
+    # the module docstring).
     {
         "suffix": "-a2a-gateway-monitoring",
-        "operator_source": True,
+        "fixture": _A2A_FIXTURE,
+        "agent_name": "test-agent",
+        "deployment": "test-agent-a2a-gateway",
+        "container": "gateway",
         "port_name": "a2a-metrics",
+        "selector_keys": ("app",),
     },
 )
 
 
-def _only_match(pattern, text, what):
-    """The one capture of pattern in text, raising unless there is exactly one."""
-    found = pattern.findall(text)
-    if len(found) != 1:
-        raise AssertionError(f"expected one {what} in {_A2A_MANIFESTS}, found {found}")
-    return found[0]
-
-
 def _scrape_port(scrape):
-    """The port a row's PodMonitoring has to scrape, from the golden or the operator source."""
-    if not scrape.get("operator_source"):
-        return _golden_port(scrape["deployment"], scrape["container"], scrape["port_name"])
-    source = _A2A_MANIFESTS.read_text()
-    name = _only_match(_A2A_PORT_NAME_RE, source, "a2aGatewayMetricsPortName")
-    if name != scrape["port_name"]:
-        raise AssertionError(f"the operator names the A2A gateway's metrics port {name!r}, the row {scrape['port_name']!r}")
-    return int(_only_match(_A2A_PORT_RE, source, "a2aGatewayMetricsPort"))
+    """The port a row's PodMonitoring has to scrape, from the golden or the A2A fixture."""
+    fixture = scrape.get("fixture", _GOLDEN)
+    return _manifest_port(fixture, scrape["deployment"], scrape["container"], scrape["port_name"])
 
 
-def _golden_port(deployment, container, port_name):
-    """The named containerPort the operator declares, read from the golden render."""
-    for document in yaml.safe_load_all(_GOLDEN.read_text()):
+def _manifest_port(fixture, deployment, container, port_name):
+    """The named containerPort the operator declares, read from the golden or fixture render."""
+    for document in yaml.safe_load_all(fixture.read_text()):
         if not isinstance(document, dict) or document.get("kind") != "Deployment":
             continue
         if document["metadata"]["name"] != deployment:
@@ -120,25 +105,24 @@ def _golden_port(deployment, container, port_name):
             for port in candidate.get("ports", []):
                 if port["name"] == port_name:
                     return port["containerPort"]
-    raise AssertionError(f"no {port_name} port on {deployment}/{container} in {_GOLDEN}")
+    raise AssertionError(f"no {port_name} port on {deployment}/{container} in {fixture}")
 
 
-def _golden_pod_labels(deployment):
-    """The pod-template labels the operator puts on the named Deployment, from the golden."""
-    for document in yaml.safe_load_all(_GOLDEN.read_text()):
+def _manifest_pod_labels(fixture, deployment):
+    """The pod-template labels the operator puts on the named Deployment, from the golden or fixture."""
+    for document in yaml.safe_load_all(fixture.read_text()):
         if isinstance(document, dict) and document.get("kind") == "Deployment" and document["metadata"]["name"] == deployment:
             return document["spec"]["template"]["metadata"]["labels"]
-    raise AssertionError(f"no Deployment {deployment} in {_GOLDEN}")
+    raise AssertionError(f"no Deployment {deployment} in {fixture}")
 
 
 def _selector(scrape, name):
-    """The selector the PodMonitoring has to carry for agent `name`: the golden's
-    values for the keys the row names, with the golden's agent name replaced; for
-    the operator-source row, the app label the operator builds from the CR name."""
-    if scrape.get("operator_source"):
-        return {"app": name + _only_match(_A2A_NAME_RE, _A2A_MANIFESTS.read_text(), "a2aGatewayName")}
-    labels = _golden_pod_labels(scrape["deployment"])
-    return {key: labels[key].replace(_GOLDEN_AGENT, name) for key in scrape["selector_keys"]}
+    """The selector the PodMonitoring has to carry for agent `name`: the manifest's
+    values for the keys the row names, with the manifest's agent name replaced."""
+    fixture = scrape.get("fixture", _GOLDEN)
+    agent_name = scrape.get("agent_name", _GOLDEN_AGENT)
+    labels = _manifest_pod_labels(fixture, scrape["deployment"])
+    return {key: labels[key].replace(agent_name, name) for key in scrape["selector_keys"]}
 
 
 class MonitoringShapeTest(unittest.TestCase):

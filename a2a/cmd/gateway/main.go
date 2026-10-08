@@ -218,7 +218,7 @@ func realMain(ctx context.Context, log *slog.Logger) error {
 		"defaultAddressee", cfg.DefaultAddressee,
 		"spawnSessions", cfg.SpawnSessions,
 		"idleTTL", cfg.IdleTTL.String())
-	return serve(ctx, cfg, metrics, log, gw.Run)
+	return serve(ctx, cfg, gw.Metrics(), log, gw.Run)
 }
 
 // serve is realMain's last step: the metrics listener beside the gateway,

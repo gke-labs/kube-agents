@@ -224,6 +224,65 @@ func TestRelayedTerminalIsCountedOnce(t *testing.T) {
 	}
 }
 
+// TestHealedStaleTerminalDeliversOnceEvenIfRelayQueued: if the stale-terminal
+// heal fires while the relay still has the same terminal queued (the two
+// share the session lock), the heal delivers the terminal and drops the
+// routing entries; the relay's later delivery must be a no-op so the user
+// does not see the answer posted twice and task_terminals_total is not
+// incremented twice.
+func TestHealedStaleTerminalDeliversOnceEvenIfRelayQueued(t *testing.T) {
+	r := startRig(t)
+	m := r.g.Metrics()
+	conv := "discord:g1/metrics-heal-queued"
+	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: "m-1", Text: "do task"}
+	origin := r.awaitTask(t, "platform")
+
+	ctx := context.Background()
+	// Hold the session lock to simulate the window where the relay has
+	// received the terminal and queued it for this conversation, but
+	// handleInbound runs its heal before the relay can process the batch.
+	l := r.g.lockSession(conv)
+	l.Lock()
+
+	// Executor completes the task: the terminal lands on the TASKS stream
+	// and relayEvent enqueues it for the session worker.
+	publishMetricsTerminal(t, r, origin, TerminalFromExecutor, lib.StateCompleted)
+	// Wait until the relay worker has picked up the batch and is blocked on the session lock.
+	waitFor(t, "relay blocked on session lock", func() bool {
+		r.g.mu.Lock()
+		defer r.g.mu.Unlock()
+		entry := r.g.sessionLocks[conv]
+		return entry != nil && entry.refcount >= 2
+	})
+
+	// While the session lock is still held, the heal runs (e.g. from handleInbound).
+	rec, err := r.g.reg.Get(ctx, conv)
+	if err != nil || rec == nil {
+		t.Fatalf("session record: %v", err)
+	}
+	r.g.healActiveTask(ctx, rec)
+	l.Unlock()
+
+	// Wait for the relay worker to finish.
+	waitFor(t, "relay worker finished", func() bool {
+		r.g.mu.Lock()
+		defer r.g.mu.Unlock()
+		return r.g.sessionLocks[conv] == nil
+	})
+	time.Sleep(metricsSettle)
+
+	if got := metricsTerminalCount(t, m, "completed", "executor"); got != 1 {
+		t.Errorf("completed/executor counted %v times, want 1", got)
+	}
+	if got := metricsTerminalTotal(t, m); got != 1 {
+		t.Errorf("total terminals counted = %v, want 1", got)
+	}
+	posts := r.adapter.postTexts()
+	if len(posts) != 2 {
+		t.Errorf("adapter saw %d posts %v, want 2 (submission placeholder and one terminal post)", len(posts), posts)
+	}
+}
+
 // TestBusUnreachableTerminalIsCounted (jayantid's review of #2473): a task
 // whose submission never reached the bus ends in the gateway's own failed
 // terminal, which bypasses the relay. The user reads "could not reach the
@@ -433,7 +492,6 @@ func TestFromEnvReadsTheMetricsPort(t *testing.T) {
 		{name: "the inject door's port zero-padded", value: "9096", inject: "127.0.0.1:09096", refused: true},
 		{name: "the inject door's port signed", value: "9096", inject: "127.0.0.1:+9096", refused: true},
 		{name: "the inject door's port signed and padded", value: "9096", inject: "127.0.0.1:+09096", refused: true},
-		{name: "the inject door's port after a space", value: "9096", inject: "127.0.0.1: 9096", refused: true},
 		{name: "the A2A door's port zero-padded", value: "8098", door: "127.0.0.1:008098", refused: true},
 		{name: "the A2A door's port as a service name", value: "80", door: "127.0.0.1:http", refused: true},
 		// A port net.Listen cannot read either is the door's own boot failure

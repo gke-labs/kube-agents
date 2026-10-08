@@ -181,6 +181,9 @@ func (g *Gateway) relayBatch(sessionKey string, batch []relayItem) {
 // rolling-line edit; posts always happen.
 func (g *Gateway) applyEvent(ctx context.Context, rec *SessionRecord, item relayItem, render bool) {
 	env := item.env
+	if g.sessionForTask(ctx, env.TaskID) != rec.Key {
+		return
+	}
 	g.mu.Lock()
 	rs, ok := g.relays[env.TaskID]
 	if !ok {
