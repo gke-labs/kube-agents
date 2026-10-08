@@ -434,6 +434,11 @@ PART_NEXT_UPGRADE = "**Next upgrade.**"
 PART_RISKS = "**Risks present.**"
 PART_BASELINE = "**Baseline recorded.**"
 NO_SHAPE_TEXT = "no catalogue shape found; checked: "
+# What an incident says when it has no catalogue entry to cite. `_none_` is
+# reserved for an empty Errors or Warnings section.
+UNCLASSIFIED_MITIGATION_TEXT = "no catalogue entry matched this symptom; it is reported for a reader to classify, and the entries' rows above do not apply."
+UNCLASSIFIED_GUARD_TEXT = "no guard: an unclassified symptom writes none until it has an entry."
+OPERATION_GUARD_TEXT = "no guard: an operation carries none; its cluster's risks are in the Info block."
 INFO_UNCHANGED = "Unchanged clusters:"
 INFO_FAILED_READS = "Reads that failed:"
 NONE_LINE = "_none_"
@@ -1836,7 +1841,7 @@ def _incident_lines(incident: dict) -> list[str]:
         op = incident["operation"]
         lines.append(f"{PART_WHAT_FAILED} {op['type']} on {op['target']} ended {op['status']}: {op['error'] or 'no error text'}")
         lines.append(f"{PART_MITIGATE} GKE's error text names the cause; the catalogue's entry 2 (capacity) and 5 (window) are the usual ones for an operation that did not complete.")
-        lines.append(f"{PART_MITIGATION_SET_UP} {NONE_LINE} (an operation carries no guard).")
+        lines.append(f"{PART_MITIGATION_SET_UP} {OPERATION_GUARD_TEXT}")
         return lines + [""]
     lines += [PART_WHAT_FAILED, "", "| Symptom | Catalogue entry | Confidence | Evidence |", "| --- | --- | --- | --- |"]
     for symptom in incident["symptoms"]:
@@ -1847,12 +1852,12 @@ def _incident_lines(incident: dict) -> list[str]:
             lines.append(f"| {symptom['reason']} | {entry} | {c['confidence']} | {_cell(c['evidence'])} |")
     lines += ["", PART_MITIGATE]
     if not incident["mitigations"]:
-        lines.append(NONE_LINE)
+        lines.append(UNCLASSIFIED_MITIGATION_TEXT)
     for m in incident["mitigations"]:
         lines.append(f"- **{m['entry']}. {m['title']}** — {m['before_signal']} Read today: {m['read_today']}. Mitigate before: {m['mitigate_before']} Mitigate after: {m['mitigate_after']}")
     lines += ["", PART_MITIGATION_SET_UP]
     if not incident["guards"]:
-        lines.append(NONE_LINE)
+        lines.append(UNCLASSIFIED_GUARD_TEXT)
     for g in incident["guards"]:
         lines.append(f"- guard `{g['id']}` {g['kind']} entry {g['entry']} ({g['confidence']}), first seen {g['first_seen']}")
     return lines + [""]
