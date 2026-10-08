@@ -40,8 +40,8 @@ Generated from [`agents/chat/defaults/cron/jobs.json`](https://github.com/gke-la
 | -- | ------- | -------- | ------- | :-----: | ---- |
 | `profile-cron-tick` | Planning Agent | `* * * * *` | — | yes | `profile_cron_tick.py` |
 | `cluster-agent-reconcile` | Planning Agent | `11 * * * *` | Hourly at :11 | yes | `cluster_agent_reconcile.py` |
-| `bootstrap-inventory-scan` | Planning Agent | `* * * * *` | — | yes | `bootstrap_scan_gate.py` |
-| `bootstrap-inventory-delivery` | Planning Agent | `* * * * *` | — | yes | `bootstrap_delivery.py` |
+| `bootstrap-inventory-scan` | Planning Agent | `* * * * *` | — | no | `bootstrap_scan_gate.py` |
+| `bootstrap-inventory-delivery` | Planning Agent | `* * * * *` | — | no | `bootstrap_delivery.py` |
 | `oobe` | Planning Agent | `* * * * *` | — | yes | `oobe.py` |
 | `compliance-audit` | Platform Agent | `20 6 * * *` | Daily 06:20 | yes | Run the daily fleet security and RBAC posture audit. Read the SOP at 'governance/compliance_audit_sop.md' i... |
 | `obtainability-audit` | Platform Agent | `50 6 * * *` | Daily 06:50 | yes | Run the daily workload reliability audit. Read the SOP at 'governance/obtainability_audit_sop.md' in your p... |

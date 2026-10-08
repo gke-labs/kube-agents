@@ -8,8 +8,8 @@ inventory scan finishes, so an operator sees cost, security, reliability and cap
 within about two hours of install. Later it takes over the two bootstrap jobs, so first-run work
 lives in one place.
 
-> **Status:** §4, the first-run audits, is implemented, with the entrypoint's `--assume-retired` entry
-> from §5. The rest of §5, folding in the bootstrap jobs, is not. §8 is the build order.
+> **Status:** §4, the first-run audits, and §5, the fold of the bootstrap jobs, are implemented. §8 is
+> the build order; dropping the disabled ids is what remains of it.
 
 ## 1. Why
 
@@ -257,7 +257,10 @@ times. It rides with the audits stage, whose eval case covers both.
 1. **First-run audits stage**, with `oobe` running beside the two bootstrap jobs, and the
    entrypoint entry that keeps it off finished installs. This covers the
    part of [#1866](https://github.com/gke-labs/kube-agents/issues/1866) that removes the wait; §7 lists what it leaves.
-2. **The fold** (§5), in a later change.
+2. **The fold** (§5): the scan and delivery run as `oobe` stages, delivery first in each tick
+   (the scheduler snapshots the destination when a run starts, so delivery must claim the report
+   within seconds of that), and the old entries ship disabled. The bench stacks for the
+   onboarding cases drive `oobe`.
 3. **Later:** drop the disabled ids; the report line for a skipped audit; T+0 delivery to the home
    channel.
 
