@@ -664,6 +664,11 @@ and only its `mark` is validated. When the newest task ends with no mark on its 
 
 ### Card work after the task ends
 
+**A stopgap.** This retires when delegated work runs as bus tasks (cards as child tasks
+through the delegation primitive and the profile dispatcher), at which point card updates
+ride the carriers above. The plan is on #2149
+([the 10/8 comment](https://github.com/gke-labs/kube-agents/issues/2149#issuecomment-6065582878)).
+
 Under `next` the Planning Agent often answers "on it", hands the work to kanban cards, and
 its task ends. The cards keep going outside any A2A task, so none of the carriers above
 reach them. Their updates reach the conversation on the chat.notify route instead,
