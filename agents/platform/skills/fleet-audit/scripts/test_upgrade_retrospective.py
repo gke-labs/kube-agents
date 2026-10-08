@@ -351,7 +351,7 @@ class ClassifierFixtureTest(unittest.TestCase):
         self.assertEqual(row["reason"], "Error")
         self.assertEqual(row["owner_kind"], "CronJob")
         self.assertEqual(entries(row), {(6, ur.MEDIUM)})
-        self.assertEqual(row["classifications"][0]["evidence"], "2 of 2 pods: CronJob pod in Error; spec mentions flowcontrol; e.g. legacy-flowcontrol-tuner-29857980-9r4jr")
+        self.assertEqual(row["classifications"][0]["evidence"], "2 of 2 pods: CronJob pod in Error; name mentions flowcontrol; e.g. legacy-flowcontrol-tuner-29857980-9r4jr")
 
     def test_unclassified_symptom_is_still_reported(self):
         rows = by_object(self.seeded, "seeded-stall/Deployment/inventory-api", "not-ready")
@@ -360,9 +360,10 @@ class ClassifierFixtureTest(unittest.TestCase):
         self.assertEqual(rows[0]["classifications"][0]["title"], ur.UNCLASSIFIED)
 
     def test_healthy_pods_are_not_symptoms(self):
-        names = {s["name"] for s in self.seeded}
-        self.assertNotIn("cgroup-blind-jvm-79dd4fb5c-dxxjg", names)
-        self.assertNotIn("legacy-registry-pull-7979df9ddc-flfzz", names)
+        pods = {p for s in self.seeded for p in s.get("pods") or []}
+        self.assertNotIn("cgroup-blind-jvm-79dd4fb5c-dxxjg", pods)
+        self.assertNotIn("legacy-registry-pull-7979df9ddc-flfzz", pods)
+        self.assertIn("inference-server-778b78fdb8-cp2pf", pods)
 
     def test_user_namespaces_come_before_system(self):
         flags = [s["system"] for s in self.gemma]
@@ -414,6 +415,13 @@ class ClassifierSignatureTest(unittest.TestCase):
         # The kubelet's generic mount-timeout sentence names ConfigMaps too.
         [row] = self.classify(events=[event("FailedMount", "Unable to attach or mount volumes: unmounted volumes=[config], unattached volumes=[config kube-api-access-x]: timed out waiting for the condition")])
         self.assertEqual(entries(row), {(None, ur.MEDIUM)})
+
+    def test_kernel_oomkilling_event_is_charged_to_the_pod_on_that_node(self):
+        seeded = symptoms_of("seeded-a")
+        self.assertEqual([s for s in seeded if s["reason"] == ur.OOM_NODE_EVENT_REASON], [])
+        without_payments = {**READS["seeded-a"], "pods": [p for p in READS["seeded-a"]["pods"] if "payments-api" not in p["metadata"]["name"]]}
+        rows = [s for s in symptoms_of("seeded-a", reads=without_payments) if s["reason"] == ur.OOM_NODE_EVENT_REASON]
+        self.assertEqual([r["object"] for r in rows], ["Node/gke-seeded-a-default-pool-62ac8ee0-d595"])
 
     def test_pod_events_implied_by_the_pod_row_are_collapsed(self):
         seeded = symptoms_of("seeded-a")
@@ -489,6 +497,20 @@ class ClassifierSignatureTest(unittest.TestCase):
         [row] = self.classify(pods=[pod("big", scheduled_message="0/4 nodes are available: 4 Insufficient memory.")])
         self.assertEqual(entries(row), {(2, ur.HIGH)})
 
+    def test_pending_pod_pinned_to_an_untouched_pool_is_medium(self):
+        # Friday's rollout touched gpu-pool only; a pod pinned to default-pool that cannot schedule is not its doing.
+        gpu_pool_only = copy.deepcopy([o for o in ops_for("seeded-a") if "pinned-inference-pool" in o["targetLink"]])
+        pinned = pod("web", scheduled_message="0/4 nodes are available: 4 Insufficient cpu.", node_selector={"cloud.google.com/gke-nodepool": "default-pool"})
+        [row] = self.classify(pods=[pinned], ops=gpu_pool_only)
+        self.assertEqual(entries(row), {(2, ur.MEDIUM)})
+        self.assertIn(ur.GATE_CLOSED_TEXT, row["classifications"][0]["detail"])
+        pinned["spec"]["nodeSelector"] = {"cloud.google.com/gke-nodepool": "pinned-inference-pool"}
+        [row] = self.classify(pods=[pinned], ops=gpu_pool_only)
+        self.assertEqual(entries(row), {(2, ur.HIGH)})
+        free = pod("web", scheduled_message="0/4 nodes are available: 4 Insufficient cpu.")
+        [row] = self.classify(pods=[free], ops=gpu_pool_only)
+        self.assertEqual(entries(row), {(2, ur.HIGH)})
+
     def test_entry_6_no_matches_for_kind(self):
         [row] = self.classify(events=[event("FailedCreate", 'error: unable to recognize "manifest.yaml": no matches for kind "FlowSchema" in version "flowcontrol.apiserver.k8s.io/v1beta3"', kind="CronJob")])
         self.assertEqual(entries(row), {(6, ur.HIGH)})
@@ -503,6 +525,7 @@ class ClassifierSignatureTest(unittest.TestCase):
         [row] = self.classify(pods=[secret_pod])
         self.assertEqual(entries(row), {(6, ur.MEDIUM)})
         self.assertEqual(row["api_markers"], ["flowcontrol", "v1beta"])
+        self.assertIn("name and spec mentions flowcontrol, v1beta", row["classifications"][0]["evidence"])
         self.assertNotIn("hunter2", json.dumps(row))
         self.assertNotIn("spec_text", row)
 
@@ -598,6 +621,12 @@ class ClassifierSignatureTest(unittest.TestCase):
         [row] = self.classify(events=[event("FailedCreate", 'failed calling webhook "gate.example.io"', kind="ReplicaSet")], ops=[])
         self.assertEqual(entries(row), {(7, ur.MEDIUM)})
         self.assertIn(ur.GATE_CLOSED_TEXT, row["classifications"][0]["detail"])
+        # A pool-only window does not open the control-plane gate.
+        pools_only = [o for o in ops_for("seeded-a") if o["operationType"] == "UPGRADE_NODES"]
+        [row] = self.classify(events=[event("FailedCreate", 'failed calling webhook "gate.example.io"', kind="ReplicaSet")], ops=pools_only)
+        self.assertEqual(entries(row), {(7, ur.MEDIUM)})
+        [row] = self.classify(events=[event("FailedCreate", 'error: unable to recognize: no matches for kind "FlowSchema"', kind="CronJob")], ops=pools_only)
+        self.assertEqual(entries(row), {(6, ur.MEDIUM)})
 
     def test_symptom_onset_is_read_from_the_object(self):
         pending = pod("waiting", scheduled_message="0/4 nodes are available: 4 Insufficient cpu.")
@@ -809,7 +838,11 @@ class ShapeTest(unittest.TestCase):
         config["webhooks"][0]["namespaceSelector"] = {"matchExpressions": [{"key": "kubernetes.io/metadata.name", "operator": "NotIn", "values": ["kube-system"]}]}
         [shape] = ur.webhook_shapes([config], READS["seeded-a"]["endpointslices"])
         self.assertEqual(shape["confidence"], ur.MEDIUM)
-        # The captured gmp-operator webhook is fail-closed with a ready endpoint: no shape.
+        # A fail-closed hook reaching pods whose Service has a ready endpoint (gmp-operator's): no shape.
+        backed = copy.deepcopy(config)
+        backed["webhooks"][0]["clientConfig"]["service"] = {"namespace": "gmp-system", "name": "gmp-operator"}
+        self.assertEqual(ur.webhook_shapes([backed], READS["seeded-a"]["endpointslices"]), [])
+        # The captured gmp-operator hooks reach monitoring resources, not pods: screened out by their rules.
         self.assertEqual(ur.webhook_shapes(READS["seeded-a"]["webhooks"], READS["seeded-a"]["endpointslices"]), [])
         # Without the endpoint read the check cannot run.
         self.assertEqual(ur.webhook_shapes([config], None), [])
@@ -947,10 +980,11 @@ class LedgerAndGuardsTest(unittest.TestCase):
         self.assertEqual(seeded["baseline"]["shapes"], 9)
         self.assertEqual(seeded["next_upgrade"]["target"], "1.35.8-gke.1225000")
         sections = doc["sections"]
-        self.assertEqual([(i["cluster"], i["object"], i["entries"]) for i in sections["errors"]], [(SEEDED, "seeded-capacity/PodDisruptionBudget/inference-server", "1")])
-        self.assertEqual([i["object"] for i in sections["warnings"]], [KUBE_DNS, TUNER, "Node/gke-seeded-a-default-pool-62ac8ee0-d595", INFERENCE, PAYMENTS, "seeded-stall/Deployment/inventory-api"])
-        self.assertTrue(next(i for i in sections["warnings"] if i["object"] == INFERENCE)["predates_upgrade"])
-        self.assertEqual([(c["cluster"], c["incidents"]) for c in sections["info"]["clean"]], [(GEMMA, 2), (SEEDED, 5)])
+        self.assertEqual([(i["cluster"], i["object"], i["entries"]) for i in sections["errors"]], [(SEEDED, INFERENCE, "2, 12"), (SEEDED, "seeded-capacity/PodDisruptionBudget/inference-server", "1")])
+        self.assertEqual([i["object"] for i in sections["warnings"]], [KUBE_DNS, TUNER, PAYMENTS, "seeded-stall/Deployment/inventory-api"])
+        inference_row = next(s for r in doc["reviews"] for s in r["what_failed"] if s["object"] == INFERENCE)
+        self.assertEqual((inference_row["new_pods"], inference_row["pre_existing_pods"]), (["inference-server-778b78fdb8-ld26r", "inference-server-778b78fdb8-zxlkz"], ["inference-server-778b78fdb8-cp2pf"]))
+        self.assertEqual([(c["cluster"], c["incidents"]) for c in sections["info"]["clean"]], [(GEMMA, 2), (SEEDED, 4)])
         self.assertEqual((sections["info"]["unchanged"], sections["info"]["failed_reads"]), ([], []))
 
     def test_guards_file_merges_new_seen_again_and_gone(self):
@@ -1046,9 +1080,13 @@ class LedgerAndGuardsTest(unittest.TestCase):
             with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
                 self.assertEqual(ur.main(["--full", "--project", PROJECT, "--no-report"]), ur.EXIT_USAGE)
                 self.assertEqual(ur.main(["--reset-ledger"]), 0)
-                # The broken guards file is met next: set aside, refused once, then a fresh start.
+                # The broken guards file is met next: set aside, and its record blocks like the ledger's.
                 self.assertEqual(ur.main(["--full", "--project", PROJECT, "--no-report"]), ur.EXIT_USAGE)
-                self.assertTrue(list(self.home.glob(ur.GUARDS_FILENAME + ".unreadable-*")))
+                self.assertTrue(list(self.home.glob(ur.GUARDS_RECORD_GLOB)))
+                with redirect_stderr(io.StringIO()) as err2:
+                    self.assertEqual(ur.main(["--full", "--project", PROJECT, "--no-report"]), ur.EXIT_USAGE)
+                self.assertIn("guards.json.unreadable-", err2.getvalue())
+                self.assertEqual(ur.main(["--reset-ledger"]), 0)
                 rc = ur.main(["--full", "--project", PROJECT, "--no-report"])
         self.assertEqual(rc, 0)
         self.assertEqual(ur.load_json(self.home / ur.LEDGER_FILENAME, {})["version"], ur.LEDGER_VERSION)
@@ -1276,7 +1314,7 @@ class LedgerAndGuardsTest(unittest.TestCase):
         first, _ = self.collect()
         seeded = next(r for r in first["reviews"] if r["cluster"] == SEEDED)
         self.assertEqual({s["since"] for s in seeded["what_failed"]}, {ur.SINCE_FIRST_SEEN})
-        self.assertIn("Symptom baseline recorded: 5 symptom(s), 5 first seen.", ur.render_report(first))
+        self.assertIn("Symptom baseline recorded: 4 symptom(s), 4 first seen.", ur.render_report(first))
         ledger = ur.load_json(self.home / ur.LEDGER_FILENAME, {})
         self.assertIn(f"{INFERENCE}|pending|Unschedulable", ledger["clusters"][SEEDED]["symptoms"])
         self.assertFalse(any("Insufficient" in k for k in ledger["clusters"][SEEDED]["symptoms"]))
@@ -1328,7 +1366,7 @@ class LedgerAndGuardsTest(unittest.TestCase):
         self.assertEqual(result["guards"], [])
         ledger = ur.load_json(self.home / ur.LEDGER_FILENAME, {})
         self.assertEqual((ledger["clusters"], ledger[ur.LEDGER_PROJECTS_KEY]), ({}, []))
-        self.assertIn(f"### {SEEDED} — 5 incident(s) above; {ur.OUTSIDE_FLEET_TEXT}", ur.render_report(result))
+        self.assertIn(f"### {SEEDED} — 4 incident(s) above; {ur.OUTSIDE_FLEET_TEXT}", ur.render_report(result))
         self.assertTrue(Path(result["report_path"]).name.endswith("-scoped.md"))
         self.assertFalse((self.home / ur.REPORTS_SUBDIR / ur.LATEST_REPORT_LINK).exists())
         # After a full run of one project, a scoped --cluster run on a cluster of another project records nothing for it.
@@ -1397,7 +1435,7 @@ class LedgerAndGuardsTest(unittest.TestCase):
             # The ledger is gone and a crash record sits beside its place: every run refuses.
             with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()) as err:
                 self.assertEqual(ur.main(["--full", "--project", PROJECT, "--no-report"]), ur.EXIT_USAGE)
-            self.assertIn("sits beside no ledger", err.getvalue())
+            self.assertIn("sits beside no live state file", err.getvalue())
             self.assertFalse((self.home / ur.LEDGER_FILENAME).exists())
             with redirect_stdout(io.StringIO()) as out:
                 self.assertEqual(ur.main(["--reset-ledger"]), 0)
@@ -1517,6 +1555,28 @@ class LedgerAndGuardsTest(unittest.TestCase):
         self.assertIn(f"- {other}: its project's listing failed (clusters list rc=1: PERMISSION_DENIED); ledger entry and guards kept unchanged", report.split(ur.INFO_FAILED_READS)[1])
         self.assertEqual(os.readlink(self.home / ur.REPORTS_SUBDIR / ur.LATEST_REPORT_LINK), "20261015T180000Z.md")
 
+    def test_newly_displaced_replicas_make_an_already_recorded_row_new(self):
+        first, _ = self.collect()
+        # Next week the cluster upgrades again; one more replica is displaced inside that window.
+        bumped = cluster_doc("seeded-a")
+        bumped["currentMasterVersion"] = "1.36.4-gke.1247000"
+        pods = copy.deepcopy(READS["seeded-a"]["pods"])
+        fresh = copy.deepcopy(next(p for p in pods if p["metadata"]["name"] == "inference-server-778b78fdb8-cp2pf"))
+        fresh["metadata"]["name"] = "inference-server-778b78fdb8-newpd"
+        for cond in fresh["status"]["conditions"]:
+            if cond["type"] == "PodScheduled":
+                cond["lastTransitionTime"] = "2026-10-15T09:30:00Z"
+        master = copy.deepcopy(next(o for o in OPERATIONS if o["operationType"] == "UPGRADE_NODES" and "/clusters/seeded-a/nodePools/pinned-inference-pool" in o["targetLink"]))
+        master.update(name="operation-second-drain", startTime="2026-10-15T09:00:00Z", endTime="2026-10-15T09:20:00Z")
+        with mock.patch.dict(READS, {"seeded-a": {**READS["seeded-a"], "pods": pods + [fresh]}}):
+            second, _ = self.collect(FakeFleet(clusters=[bumped, cluster_doc("gemma-gpu-upgraded")], operations=OPERATIONS + [master]), now=datetime(2026, 10, 15, 18, 0, tzinfo=timezone.utc))
+        row = next(s for r in second["reviews"] for s in r["what_failed"] if s["object"] == INFERENCE)
+        self.assertEqual(row["new_pods"], ["inference-server-778b78fdb8-newpd"])
+        self.assertEqual(len(row["pre_existing_pods"]), 3)
+        self.assertEqual((row["since"], row["predates_upgrade"]), (ur.SINCE_NEW, False))
+        self.assertIn(INFERENCE, [i["object"] for i in second["sections"]["errors"]])
+        self.assertIn("; 3 pre-existing since 2026-09-25T17:02:48Z (e.g. inference-server-778b78fdb8-cp2pf)", row["classifications"][0]["evidence"])
+
     def test_crash_loop_since_before_the_window_predates_the_upgrade(self):
         looping = pod("legacy-worker", statuses=[{"name": "c0", "state": {"waiting": {"reason": "CrashLoopBackOff"}}, "lastState": {"terminated": {"reason": "Error", "exitCode": 1, "finishedAt": "2026-10-08T17:55:00Z"}}}])
         looping["status"]["startTime"] = "2026-09-01T00:00:00Z"
@@ -1626,17 +1686,20 @@ class ReportTest(unittest.TestCase):
         errors, rest = report.split(ur.SECTION_ERRORS)[1].split(ur.SECTION_WARNINGS)
         warnings, info = rest.split(ur.SECTION_INFO)
         # Errors: entry numbers first, then cluster, then object; the four parts inline.
-        # inference-server has been Pending since before the 10-06 master upgrade: by onset it predates it.
+        # Two of inference-server's three Pending pods were displaced inside the pinned-inference-pool
+        # drain; the third has waited since 09-25 and is noted as pre-existing. The row is new: an Error.
         self.assertEqual([line for line in errors.splitlines() if line.startswith("### ")], [
+            f"### 2, 12 — {SEEDED} — `{INFERENCE}`",
             f"### 1 — {SEEDED} — `seeded-capacity/PodDisruptionBudget/inference-server`",
         ])
-        inference = warnings.split("### 2, 12")[1].split("### ")[0]
-        self.assertIn(ur.PREDATES_UPGRADE_TEXT, inference)
+        inference = errors.split("### 2, 12")[1].split("### 1 —")[0]
+        self.assertNotIn(ur.PREDATES_UPGRADE_TEXT, inference)
+        self.assertIn("; 1 pre-existing since 2026-09-25T17:02:48Z (e.g. inference-server-778b78fdb8-cp2pf)", inference)
         for part in (ur.PART_WHAT_HAPPENED, ur.PART_WHAT_FAILED, ur.PART_MITIGATE, ur.PART_MITIGATION_SET_UP):
             self.assertIn(part, inference)
         self.assertIn("| UPGRADE_NODES | pinned-inference-pool | 2026-10-08T04:20:35Z | 2026-10-08T05:24:10Z | 63 min | DONE |  |", inference)
         self.assertIn("| control plane | - | 1.35.8-gke.1380001 |", inference)
-        self.assertIn("| Unschedulable | first seen | 2. No spare capacity for the displaced pods | high | 3 of 4 pods: Insufficient cpu; e.g. inference-server-778b78fdb8-cp2pf |", inference)
+        self.assertIn("| Unschedulable | first seen | 2. No spare capacity for the displaced pods | high | 3 of 4 pods: Insufficient cpu; e.g. inference-server-778b78fdb8-cp2pf; 1 pre-existing since 2026-09-25T17:02:48Z (e.g. inference-server-778b78fdb8-cp2pf) |", inference)
         self.assertIn("| Unschedulable | first seen | 12. A node label is removed (selector seeded-role=pinned-inference) | medium |", inference)
         self.assertIn(f"- **12. A node label is removed** — For {INFERENCE} (selector seeded-role=pinned-inference):", inference)
         self.assertIn(f"- guard `{ur.guard_id(SEEDED, 2, INFERENCE)}` failure entry 2 (high), first seen 2026-10-08T18:00:00Z", inference)
@@ -1646,22 +1709,20 @@ class ReportTest(unittest.TestCase):
         self.assertEqual(headings, [
             f"### 2 — {GEMMA} — `{KUBE_DNS}` (system)",
             f"### 6 — {GEMMA} — `{TUNER}`",
-            f"### unclassified — {SEEDED} — `Node/gke-seeded-a-default-pool-62ac8ee0-d595` (system)",
-            f"### 2, 12 — {SEEDED} — `{INFERENCE}`",
             f"### 14 — {SEEDED} — `{PAYMENTS}`",
             f"### unclassified — {SEEDED} — `seeded-stall/Deployment/inventory-api`",
         ])
         self.assertIn(f"{ur.PART_WHAT_HAPPENED} new (first seen); channel EXTENDED; cluster status RUNNING.", warnings)
         self.assertIn(ur.NO_OPERATION_LINE, warnings.split("### 2")[1].split("### 6")[0])
-        self.assertIn("| Error | first seen | 6. A served API version is removed (best effort: a name, not an API call) | medium | 2 of 2 pods:", warnings)
+        self.assertIn("| Error | first seen | 6. A served API version is removed (best effort: a name, not an API call) | medium | 2 of 2 pods: CronJob pod in Error; name mentions flowcontrol", warnings)
         self.assertIn(f"- guard `{ur.guard_id(SEEDED, 14, PAYMENTS)}` failure entry 14 (medium), first seen 2026-10-08T18:00:00Z", warnings)
         # Info: one block per reviewed cluster, with the next upgrade, the risks and the baseline.
-        self.assertIn(f"### {SEEDED} — 5 incident(s) above", info)
+        self.assertIn(f"### {SEEDED} — 4 incident(s) above", info)
         self.assertIn(f"### {GEMMA} — 2 incident(s) above", info)
         seeded_block = info.split(f"### {SEEDED}")[1]
         self.assertIn(f"{ur.PART_NEXT_UPGRADE} channel REGULAR; target 1.35.8-gke.1225000; cluster at 1.35.8-gke.1380001, at or ahead of the target. Window: daily at 03:00 UTC for 4h; next opens 2026-10-09T03:00:00Z. Exclusions: none.", seeded_block)
         self.assertIn("| `seeded-shapes/Deployment/legacy-registry-pull` | 20. Images on a retired registry | high | image k8s.gcr.io/pause:3.9 |", seeded_block)
-        self.assertIn(f"{ur.PART_BASELINE} control plane 1.35.8-gke.1380001; pools default-pool 1.35.8-gke.1380001, idle-batch-pool 1.35.8-gke.1380001, pinned-inference-pool 1.35.8-gke.1380001; 23 pods, 1 budgets, 9 shapes. Symptom baseline recorded: 5 symptom(s), 5 first seen. first run: graded by onset only, no previous symptom set. Guards written: 13.", seeded_block)
+        self.assertIn(f"{ur.PART_BASELINE} control plane 1.35.8-gke.1380001; pools default-pool 1.35.8-gke.1380001, idle-batch-pool 1.35.8-gke.1380001, pinned-inference-pool 1.35.8-gke.1380001; 23 pods, 1 budgets, 9 shapes. Symptom baseline recorded: 4 symptom(s), 4 first seen. first run: graded by onset only, no previous symptom set. Guards written: 13.", seeded_block)
         gemma_block = info.split(f"### {GEMMA}")[1].split("### ")[0]
         self.assertIn("behind the target. Window: DAILY at", gemma_block)
         self.assertIn("Exclusions: hold-gpu-minor (NO_MINOR_UPGRADES) until 2026-10-21T00:00:00Z [active].", gemma_block)
