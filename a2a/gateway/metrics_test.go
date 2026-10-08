@@ -347,6 +347,7 @@ func TestHealedStaleTerminalWithoutArtifactSkipsNonTextNoticeIfRelayQueued(t *te
 // straggler so the session is not woken a second time.
 func TestHealedStaleChildTerminalDropsQueuedRelayStraggler(t *testing.T) {
 	r, spawn := startRigWithSpawner(t)
+	m := r.g.Metrics()
 	ctx := context.Background()
 	conv := "discord:g1/t-child-heal-queued"
 	_, _, child := delegated(t, r, spawn, conv, "")
@@ -380,6 +381,28 @@ func TestHealedStaleChildTerminalDropsQueuedRelayStraggler(t *testing.T) {
 	// Exactly 2 spawn calls: initial turn + one wake from the heal; no duplicate wake.
 	if len(spawn.calls()) != 2 {
 		t.Fatalf("spawn calls = %d, want 2 (duplicate wake was not dropped)", len(spawn.calls()))
+	}
+
+	// With the applyEvent guard, the post-retirement child terminal straggler is dropped:
+	// 1. Result text is not posted to the room (the heal posted the status card; the wake carries the result).
+	for _, text := range r.adapter.postTexts() {
+		if strings.Contains(text, "fleet is green") {
+			t.Errorf("adapter unexpectedly posted child result text %q", text)
+		}
+	}
+
+	// 2. observeChildEnd does not mark ChainEnd as failed (the child session was woken by the heal).
+	latestRec, err := r.g.reg.Get(ctx, conv)
+	if err != nil || latestRec == nil {
+		t.Fatalf("reg.Get: %v", err)
+	}
+	if ref, ok := latestRec.TaskRefFor(child.TaskID); !ok || ref.ChainEnd != nil {
+		t.Errorf("expected ChainEnd == nil for child, got ok=%v, ref=%+v", ok, ref)
+	}
+
+	// 3. Spurious failed/executor terminal is not counted under the chain's root.
+	if failedExec := metricsTerminalCount(t, m, "failed", "executor"); failedExec != 0 {
+		t.Errorf("metricsTerminalCount(failed, executor) = %v, want 0", failedExec)
 	}
 }
 

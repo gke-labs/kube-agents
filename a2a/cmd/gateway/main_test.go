@@ -41,7 +41,11 @@ const unreachableNATSURL = "nats://127.0.0.1:1"
 // the "no chat backend" refusal or add a token refusal before the dial. One
 // place, so the next knob cannot reopen this per test.
 func TestMain(m *testing.M) {
-	for _, k := range []string{"A2A_DOOR_LISTEN", "A2A_DOOR_TOKEN", "A2A_DOOR_PRINCIPAL_MAP", "A2A_DOOR_PUBLIC_URL", "A2A_INJECT_LISTEN", "A2A_INJECT_TOKEN", "A2A_INJECT_PRINCIPAL_MAP"} {
+	for _, k := range []string{
+		"A2A_DOOR_LISTEN", "A2A_DOOR_TOKEN", "A2A_DOOR_PRINCIPAL_MAP", "A2A_DOOR_PUBLIC_URL",
+		"A2A_INJECT_LISTEN", "A2A_INJECT_TOKEN", "A2A_INJECT_PRINCIPAL_MAP",
+		"A2A_SPAWN_SESSIONS", "A2A_SESSION_SERVICE_ACCOUNT", "A2A_DEFAULT_ADDRESSEE",
+	} {
 		os.Unsetenv(k)
 	}
 	os.Exit(m.Run())
@@ -534,6 +538,9 @@ func TestRealMainWiresMetrics(t *testing.T) {
 	t.Setenv("DISCORD_TOKEN", "")
 	t.Setenv("SLACK_BOT_TOKEN", "")
 	t.Setenv("SLACK_APP_TOKEN", "")
+	t.Setenv("A2A_SPAWN_SESSIONS", "")
+	t.Setenv("A2A_SESSION_SERVICE_ACCOUNT", "")
+	t.Setenv("A2A_DEFAULT_ADDRESSEE", "")
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -550,6 +557,11 @@ func TestRealMainWiresMetrics(t *testing.T) {
 	found := false
 	metricPrefix := "kubeagents_a2a_gateway_gchat_pulls_total{outcome=\"empty\"} "
 	for time.Now().Before(deadline) {
+		select {
+		case err := <-errCh:
+			t.Fatalf("realMain exited early while polling /metrics: %v", err)
+		default:
+		}
 		resp, err := client.Get(metricsURL)
 		if err == nil {
 			body, _ := io.ReadAll(resp.Body)
@@ -560,7 +572,11 @@ func TestRealMainWiresMetrics(t *testing.T) {
 				break
 			}
 		}
-		time.Sleep(25 * time.Millisecond)
+		select {
+		case err := <-errCh:
+			t.Fatalf("realMain exited early while polling /metrics: %v", err)
+		case <-time.After(25 * time.Millisecond):
+		}
 	}
 
 	cancel()
