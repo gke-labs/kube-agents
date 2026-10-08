@@ -14,11 +14,11 @@ source "$(cd "$(dirname "${BASH_SOURCE[0]}")/../scripts/installer" && pwd)/gke_d
 # TODO(boskos): Once oss-test-infra#2655 merges and deploys Boskos project leasing,
 # consider failing closed if JOB_NAME is set and PROJECT_ID is unset.
 export PROJECT_ID="${PROJECT_ID:-kube-agents-evals}"
-# TEST PIN (draft PR, never merge): this build runs on kube-agents-evals-2,
+# TEST PIN (draft PR, never merge): this build runs on kube-agents-evals,
 # held out of Boskos in state `rebuilding` for its post-repair check. The
 # wrapper's own lease keeps both heartbeats and is released untouched.
 export BOSKOS_RESOURCE_NAME="${BOSKOS_RESOURCE_NAME:-${PROJECT_ID}}"
-export PROJECT_ID="kube-agents-evals-2"
+export PROJECT_ID="kube-agents-evals"
 export GCP_PROJECT_ID="${PROJECT_ID}"
 export REGION="${REGION:-us-central1}"
 
