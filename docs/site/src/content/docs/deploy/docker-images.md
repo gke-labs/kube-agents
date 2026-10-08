@@ -22,10 +22,11 @@ the same registry and tag, so an install at a release pulls them at that release
 install pulls them from the mirror. A `PlatformAgent`'s own `spec.deployment.image` does not move
 them;
 `A2A_GATEWAY_IMAGE`, `A2A_WORKER_IMAGE`, `A2A_CALLOUT_IMAGE`, `A2A_VERIFIER_IMAGE` and
-`A2A_CONSOLE_IMAGE` on the operator override one at a time. The bridge is
-built from the `platform-agent` image of the same commit and is declared on the `PlatformAgent`
-as a sidecar rather than rendered by the operator, so it has no operator override: the sidecar's
-image is whatever the resource names. NATS and nats-box are ordinary third-party pins, in the
+`A2A_CONSOLE_IMAGE` on the operator override one at a time. The Hermes bridge sidecar the
+operator renders into the agent pod under `next` is built from the `platform-agent` image of the
+same commit, so the operator takes its registry and tag from the agent image instead, and
+`A2A_BRIDGE_IMAGE` on the operator overrides it. A `PlatformAgent` that declares its own
+`hermes-bridge` sidecar keeps it, and that sidecar's image is whatever the resource names. NATS and nats-box are ordinary third-party pins, in the
 table as `nats` and `nats-box`, so `make mirror-images` copies them; the chart does not set their
 env vars, so a mirrored `next` install still points `A2A_NATS_IMAGE` and `A2A_PROVISION_IMAGE` at
 the copies by hand.
@@ -63,7 +64,7 @@ Tagged with the release version; `:latest` on every push to `main`.
 | `a2a-authcallout` | `ghcr.io/gke-labs/kube-agents/a2a-authcallout` | release tag | `A2A_CALLOUT_IMAGE` | The auth callout Deployment the operator renders under spec.mode: next, and nothing on a default install. |
 | `a2a-console` | `ghcr.io/gke-labs/kube-agents/a2a-console` | release tag | `A2A_CONSOLE_IMAGE` | The console server Deployment the operator renders under spec.mode: next, and nothing on a default install. |
 | `a2a-verifier` | `ghcr.io/gke-labs/kube-agents/a2a-verifier` | release tag | `A2A_VERIFIER_IMAGE` | The capability verifier Deployment the operator renders under spec.mode: next, and nothing on a default install. It resolves the same way the gateway, the worker and the callout do. |
-| `hermes-bridge` | `ghcr.io/gke-labs/kube-agents/hermes-bridge` | release tag | — | The hermes-bridge sidecar a spec.mode: next install declares on spec.deployment.sidecars beside the agent container. The operator renders no bridge of its own, so there is no operator override; the sidecar's image is the CR's. |
+| `hermes-bridge` | `ghcr.io/gke-labs/kube-agents/hermes-bridge` | release tag | `A2A_BRIDGE_IMAGE` | The hermes-bridge sidecar the operator renders beside the agent container under spec.mode: next, and nothing on a default install. The operator derives it from the agent image (registry and tag) unless the override is set; a CR that declares its own hermes-bridge sidecar on spec.deployment.sidecars keeps it, and that sidecar's image is the CR's. |
 
 ### Pulled by an install, built elsewhere
 

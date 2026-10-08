@@ -21,6 +21,7 @@ import (
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/utils/ptr"
 	k8syaml "sigs.k8s.io/yaml"
 
@@ -28,8 +29,8 @@ import (
 )
 
 // The pod-wide activity hook and its signing key render together, and only
-// on a next install that declares a bridge sidecar whose door the hook can
-// reach: a today install, a next install with no bridge to post to, or a
+// on a next install whose bridge (declared, or rendered when none is) has a
+// door the hook can reach: a today install, a next install with no bridge to post to, or a
 // bridge on the cli executor or with its door off or elsewhere, renders
 // exactly what it did before.
 func TestActivityHookRendersOnlyWithABridgeOnNext(t *testing.T) {
@@ -57,6 +58,9 @@ func TestActivityHookRendersOnlyWithABridgeOnNext(t *testing.T) {
 		want     bool
 	}{
 		{"today with a bridge", nil, bridge, false},
+		// No declared bridge and no bus yet: the rendered bridge is not
+		// in the pod, so there is no door to post to.
+		// TestARenderedBridgeGetsTheHookOnceInThePod covers the rest.
 		{"next without sidecars", ptr.To("next"), nil, false},
 		{"next with another sidecar", ptr.To("next"), other, false},
 		{"next with a bridge", ptr.To("next"), bridge, true},
@@ -145,4 +149,28 @@ func TestCredsKeysIncludeTheActivityKey(t *testing.T) {
 		}
 	}
 	t.Fatalf("a2aCredsKeys = %v, missing bridge-activity-key", a2aCredsKeys)
+}
+
+// The rendered bridge pinned to cli by the operator setting has no door for the
+// hook to post to, so no hook renders.
+func TestARenderedCliBridgeGetsNoHook(t *testing.T) {
+	t.Setenv(a2aBridgeExecutorOperatorEnvVar, "cli")
+	agent := &agentv1alpha1.PlatformAgent{Spec: agentv1alpha1.PlatformAgentSpec{Mode: ptr.To("next")}}
+	setBusProvisionedCondition(agent, true, "provision-job", metav1.Now())
+	if a2aActivityHookWanted(agent) {
+		t.Error("a rendered bridge pinned to cli wanted the activity hook")
+	}
+}
+
+// The rendered bridge, on the shipped api executor, gets the hook once it is
+// in the pod (bus provisioned), and not before.
+func TestARenderedBridgeGetsTheHookOnceInThePod(t *testing.T) {
+	agent := &agentv1alpha1.PlatformAgent{Spec: agentv1alpha1.PlatformAgentSpec{Mode: ptr.To("next")}}
+	if a2aActivityHookWanted(agent) {
+		t.Error("the hook rendered before the bridge was in the pod")
+	}
+	setBusProvisionedCondition(agent, true, "provision-job", metav1.Now())
+	if !a2aActivityHookWanted(agent) {
+		t.Error("the rendered api bridge is in the pod and the hook did not render")
+	}
 }

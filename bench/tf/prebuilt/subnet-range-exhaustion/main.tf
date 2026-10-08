@@ -37,7 +37,8 @@ locals {
   # into this stack's own names rather than used as one.
   name = "${var.subnet_name_prefix}-${substr(md5(var.cluster_name), 0, 8)}"
   # Networks and subnets take no labels, so a sweep for a killed run's
-  # leftovers has this fixed description to match on, as well as the name.
+  # leftovers has this fixed description to match on (swept by
+  # hack/ci_sweep_compute_plants.py), as well as the name.
   plant_description = "kube-agents-bench plant (networking-audit-subnet-range-exhaustion); safe to delete when no eval run holds the infra lock"
 }
 

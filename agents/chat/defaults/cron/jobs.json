@@ -59,6 +59,21 @@
       "risk": "low",
       "enabled": true,
       "deliver": "local"
+    },
+    {
+      "id": "oobe",
+      "name": "First-Boot Out-of-Box Experience",
+      "schedule": {
+        "kind": "cron",
+        "expr": "* * * * *",
+        "display": "* * * * *"
+      },
+      "prompt": "",
+      "no_agent": true,
+      "script": "oobe.py",
+      "risk": "low",
+      "enabled": true,
+      "deliver": "local"
     }
   ]
 }

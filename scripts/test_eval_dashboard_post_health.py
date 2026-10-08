@@ -1835,6 +1835,90 @@ class WatchedPeriodics(RunHarness):
 
     DAILY = "ci-kube-agents-fleet-reconcile-daily"
 
+    def test_a_due_gitlab_token_is_said_once_as_its_own_note_and_cleared_by_name(self):
+        sweep = "ci-kube-agents-pull-sweep"
+        line = "gitlab token kube-agents-prow/gitlab-ledger-token: expires 2026-11-01, in 25 day(s); rotate it (docs/ci-pool-projects.md 5.6)"
+        words = post_health.periodics
+        doc = health("GREEN")
+        doc["periodics"] = {sweep: dict(periodic_note(job=sweep, label="GitOps pull sweep", verdict="TOKEN", stale_after_h=1, detail=[line], summary="the run passed; 1 token(s) to rotate"), absence=words.TOKEN_ABSENCE, effect=words.TOKEN_EFFECT, runbook=words.TOKEN_RUNBOOK)}
+        doc["periodics_read"] = [sweep]
+        doc["periodics_runs"] = {sweep: {"build": "100", "finished_at": "2026-09-14T13:40:00+00:00", "passed": True, "summary": "closed 0 pull request(s) across 3 project(s)"}}
+        self.tick(doc, T14)
+        self.assertEqual(len(self.opener.texts), 1)
+        text = self.opener.texts[0]
+        self.assertTrue(text.startswith("🟡 *Eval GitOps repos: a GitLab token of the eval pool is due for rotation, or dead.*\n`ci-kube-agents-pull-sweep` runs every ten minutes and"), text)
+        self.assertIn("Its 9:40 AM ET run (build 100) passed, and its GitLab report names:\n- " + line, text)
+        self.assertIn("Effect: rotated with overlap nothing stops;", text)
+        self.assertIn("Runbook: " + words.TOKEN_RUNBOOK, text)
+        self.assertEqual(self.recorded()["periodics_told"], {f"{sweep}#token": "TOKEN"})
+        self.assertEqual(self.recorded()["state"], "GREEN")
+        self.tick(doc, T14 + timedelta(minutes=15))
+        self.assertEqual(len(self.opener.texts), 1, "said once per episode")
+        self.assertIn("🟡 Eval GitOps repos: a GitLab token of the eval pool is due for rotation, or dead (build 100 passed", "\n".join(post_health.periodic_digest_lines(doc, T14)))
+        # A passed build whose GitLab report was not read (absent, unreadable, a
+        # failed cat) says nothing about the token: no clear, the episode holds.
+        unread = health("GREEN")
+        unread["periodics"], unread["periodics_read"] = {}, [sweep]
+        unread["periodics_runs"] = {sweep: {"build": "103", "finished_at": "2026-09-14T15:40:00+00:00", "passed": True, "summary": "closed 0 pull request(s) across 3 project(s)", "tokens_current": None}}
+        self.tick(unread, T14 + timedelta(hours=2))
+        self.assertEqual(len(self.opener.texts), 1, "an unread report is not a rotation")
+        self.assertEqual(self.recorded()["periodics_told"], {f"{sweep}#token": "TOKEN"})
+        # Rotated: a passed build whose report was read and names no token, and the clear says so rather than "pull requests are being cleaned up again".
+        clean = health("GREEN")
+        clean["periodics"], clean["periodics_read"] = {}, [sweep]
+        clean["periodics_runs"] = {sweep: {"build": "104", "finished_at": "2026-09-14T16:40:00+00:00", "passed": True, "summary": "closed 0 pull request(s) across 3 project(s)", "tokens_current": True}}
+        self.tick(clean, T14 + timedelta(hours=3))
+        self.assertEqual(self.opener.texts[-1], "✅ *Eval GitOps repos: the eval pool's GitLab tokens are current again.* `ci-kube-agents-pull-sweep`'s 12:40 PM ET run (build 104) names no token to rotate.")
+        self.assertEqual(self.recorded()["periodics_told"], {})
+
+    def test_the_token_episode_and_the_sweeps_own_are_tracked_apart(self):
+        """Inside a rotation window the sweep can go red and green; the token
+        is said once for the window, and the sweep's own failure and recovery
+        are said once each, whichever came first."""
+        sweep = "ci-kube-agents-pull-sweep"
+        line = "gitlab token kube-agents-prow/gitlab-ledger-token: expires 2026-11-01, in 25 day(s); rotate it (docs/ci-pool-projects.md 5.6)"
+        words = post_health.periodics
+        def token_doc(build, finished):
+            doc = health("GREEN")
+            doc["periodics"] = {sweep: dict(periodic_note(job=sweep, label="GitOps pull sweep", verdict="TOKEN", build=build, finished=finished, stale_after_h=1, detail=[line], summary="the run passed; 1 token(s) to rotate"), absence=words.TOKEN_ABSENCE, effect=words.TOKEN_EFFECT, runbook=words.TOKEN_RUNBOOK)}
+            doc["periodics_read"] = [sweep]
+            doc["periodics_runs"] = {sweep: {"build": build, "finished_at": finished, "passed": True, "summary": "closed 0 pull request(s) across 3 project(s)", "tokens_current": False}}
+            return doc
+        def failed_doc(build, finished):
+            doc = health("GREEN")
+            doc["periodics"] = {sweep: periodic_note(job=sweep, label="GitOps pull sweep", build=build, finished=finished, stale_after_h=1, summary="failed in 1 of 3 project(s)", detail=["kube-agents-evals-2: HTTP 403 Forbidden", line])}
+            doc["periodics_read"] = [sweep]
+            doc["periodics_runs"] = {sweep: {"build": build, "finished_at": finished, "passed": False, "summary": "failed in 1 of 3 project(s)", "tokens_current": False}}
+            return doc
+        # TOKEN first, then the sweep fails, then passes with the token still due.
+        self.tick(token_doc("100", "2026-09-14T13:40:00+00:00"), T14)
+        self.assertEqual(len(self.opener.texts), 1)
+        self.tick(failed_doc("101", "2026-09-14T14:40:00+00:00"), T14 + timedelta(hours=1))
+        self.assertEqual(len(self.opener.texts), 2)
+        self.assertTrue(self.opener.texts[-1].startswith("🟠 *Eval GitOps repos: leftover pull requests from eval runs are not being cleaned up.*"), self.opener.texts[-1])
+        self.assertEqual(self.recorded()["periodics_told"], {sweep: "FAILED", f"{sweep}#token": "TOKEN"})
+        self.tick(token_doc("102", "2026-09-14T15:40:00+00:00"), T14 + timedelta(hours=2))
+        self.assertEqual(len(self.opener.texts), 3)
+        self.assertIn("✅ *Eval GitOps repos: leftover pull requests from eval runs are being cleaned up again.*", self.opener.texts[-1])
+        self.assertNotIn("🟡", self.opener.texts[-1], "the same due token is not a new episode")
+        self.assertEqual(self.recorded()["periodics_told"], {f"{sweep}#token": "TOKEN"})
+        # Rotated: the token clears by name, and nothing else is said.
+        clean = health("GREEN")
+        clean["periodics"], clean["periodics_read"] = {}, [sweep]
+        clean["periodics_runs"] = {sweep: {"build": "103", "finished_at": "2026-09-14T16:40:00+00:00", "passed": True, "summary": "closed 0 pull request(s) across 3 project(s)", "tokens_current": True}}
+        self.tick(clean, T14 + timedelta(hours=3))
+        self.assertEqual(len(self.opener.texts), 4)
+        self.assertIn("the eval pool's GitLab tokens are current again", self.opener.texts[-1])
+        self.assertEqual(self.recorded()["periodics_told"], {})
+        # FAILED first: the first passed build naming a due token clears the sweep's episode and opens the token's, in one tick.
+        self.tick(failed_doc("110", "2026-09-14T17:40:00+00:00"), T14 + timedelta(hours=4))
+        self.assertEqual(self.recorded()["periodics_told"], {sweep: "FAILED"})
+        self.tick(token_doc("111", "2026-09-14T18:40:00+00:00"), T14 + timedelta(hours=5))
+        said = "\n".join(self.opener.texts[5:])
+        self.assertIn("leftover pull requests from eval runs are being cleaned up again", said)
+        self.assertIn("🟡 *Eval GitOps repos: a GitLab token of the eval pool is due for rotation, or dead.*", said)
+        self.assertEqual(self.recorded()["periodics_told"], {f"{sweep}#token": "TOKEN"})
+
     def test_a_failed_reconcile_is_said_once_per_build_and_cleared_once(self):
         failed = health("GREEN")
         failed["periodics"] = {self.DAILY: periodic_note(detail=["kube-agents-evals-3: refused (delete google_container_cluster.seeded_b)"])}
