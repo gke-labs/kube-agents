@@ -29,7 +29,7 @@ SANDBOX_IMAGE_ARGS := $(foreach v,$(SANDBOX_IMAGE_VARS),$(if $($(v)),--build-arg
 KUBE_AGENTS_VERSION ?= dev
 VERSION_ARG := --build-arg KUBE_AGENTS_VERSION=$(KUBE_AGENTS_VERSION)
 
-.PHONY: default help docker-build docker-build-agents docker-build-credential-proxy docker-build-sandbox docker-smoke-sandbox dev-rebuild-agent mirror-images images-check prettier-check prettier-write shellcheck lint-python test-python test-python-deps test-bench test-bench-deps bench-case-check e2e-tests test-e2e-deps validate prompt-check docs-generate docs-check docs-check-generated docs-check-links docs-check-terminology docs-check-audience docs-check-context-budget chart-sync chart-check iac-parity-check tfvar-check terraform-test tf-apply tf-destroy fleet-audit-view coverage coverage-check test-integration conformance
+.PHONY: default help docker-build docker-build-agents docker-build-credential-proxy docker-build-sandbox docker-smoke-sandbox dev-rebuild-agent mirror-images images-check prettier-check prettier-write shellcheck lint-python test-python test-python-deps test-bench test-bench-deps bench-case-check e2e-tests test-e2e-deps validate prompt-check skills-sync skills-continue skills-import skills-refresh skills-generate skills-check skills-status skills-verify-upstream docs-generate docs-check docs-check-generated docs-check-links docs-check-terminology docs-check-audience docs-check-context-budget chart-sync chart-check iac-parity-check tfvar-check terraform-test tf-apply tf-destroy fleet-audit-view coverage coverage-check test-integration conformance
 
 # The agent images this repository builds -- one per `--target` stage in
 # deploy/docker/Dockerfile, which is not the same thing as one per directory
@@ -654,6 +654,35 @@ test-integration: ## Run just the integration seam tests; CI reaches them throug
 # job in validate.yml, alongside the other repository-structure invariants.
 prompt-check: ## Verify the agent's instructions cite skills and files that exist.
 	@python3 scripts/check_prompt_assets.py
+
+# Mirrored gke-* skills: an exact copy of google/skills at a pinned commit, this repository's
+# changes as patch files, and the generated skill the image ships
+# (docs/designs/upstream-skill-overlays.md). Each target wraps scripts/skill_overlay.py.
+SKILL_OVERLAY := python3 scripts/skill_overlay.py
+
+skills-sync: ## Sync one mirrored skill to google/skills (SKILL=name [REF=commit]); adopts a skill not yet mirrored.
+	@$(SKILL_OVERLAY) sync $(SKILL) $(if $(REF),--ref $(REF))
+
+skills-continue: ## Resume a skill sync that stopped on a conflict (SKILL=name).
+	@$(SKILL_OVERLAY) continue $(SKILL)
+
+skills-import: ## Start mirroring a skill this repository already ships (SKILL=name REF=commit); the shipped skill is unchanged.
+	@$(SKILL_OVERLAY) import $(SKILL) --ref $(REF)
+
+skills-refresh: ## Record edits to a mirrored skill as a patch (SKILL=name [MSG="..."] [PATCH=nnnn to fold]).
+	@$(SKILL_OVERLAY) refresh $(SKILL) $(if $(PATCH),--patch $(PATCH)) $(if $(MSG),--message "$(MSG)")
+
+skills-generate: ## Rebuild a mirrored skill from its upstream copy and overlay (SKILL=name).
+	@$(SKILL_OVERLAY) generate $(SKILL)
+
+skills-check: ## Verify every mirrored skill equals its upstream copy plus overlay, offline.
+	@$(SKILL_OVERLAY) check
+
+skills-status: ## List mirrored skills google/skills has moved past, and upstream skills not mirrored.
+	@$(SKILL_OVERLAY) status
+
+skills-verify-upstream: ## Compare each upstream copy with google/skills at its locked commit ([BASE=ref] skips when no copy or lock changed).
+	@$(SKILL_OVERLAY) verify-upstream $(if $(BASE),--changed-since $(BASE))
 
 # Documentation that mirrors a machine-readable source is generated rather than
 # hand-kept: the cron jobs, the skill catalogue and the image inventory as

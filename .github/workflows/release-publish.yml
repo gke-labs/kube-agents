@@ -11,12 +11,12 @@ name: Release & Publish (GA)
 # on a commit that is not the candidate's stamped child — from being a red run
 # nobody reads.
 #
-# `scripts/release/README.md`, "The weekly GA release", is canonical for the cron
+# `scripts/release/README.md`, "The daily GA release", is canonical for the cron
 # value and the reasoning behind it — do not restate either here.
 
 on:
   # No `schedule:` on this workflow: scheduled execution is owned by
-  # release-scheduler.yml via the decoupled trigger pattern, so a weekly tick
+  # release-scheduler.yml via the decoupled trigger pattern, so a daily tick
   # with nothing to publish produces no pipeline run at all. Explicit overrides
   # and manual dispatches remain supported here via workflow_dispatch.
   #checkov:skip=CKV_GHA_7:GA release publish workflow requires explicit version override, target commit, emergency bypass and schedule-gate parameters

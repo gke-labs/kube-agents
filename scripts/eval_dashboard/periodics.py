@@ -250,23 +250,6 @@ WATCHED = (
         SWEEP_RUN_ALERT_AFTER,
         extra_artifacts=(GITLAB_SWEEP_ARTIFACT,),
     ),
-    # The hourly and the weekly stay watched until the oss-test-infra change
-    # retires them for the daily and the postsubmit below; a follow-up removes
-    # these two entries then, so the watch never goes dark between the merges.
-    # No stale window: their last build stays in the bucket after Prow drops
-    # them, and a merely old one must not read as "stopped running".
-    Periodic(
-        "ci-kube-agents-fleet-reconcile", "seeded-fleet reconcile (hourly, retiring)", None, RECONCILE_ARTIFACT,
-        "Eval seeded fleet", "planted defects are not being re-applied", "planted defects are being re-applied again",
-        "runs hourly and re-applies the seeded-fleet stack in the pool projects the scan reports drifted", RECONCILE_EFFECT,
-        f"{RUNBOOK_ROOT}docs/ci-pool-projects.md#62-the-scheduled-reconcile",
-    ),
-    Periodic(
-        "ci-kube-agents-fleet-reconcile-all", "seeded-fleet reconcile (weekly, retiring)", None, RECONCILE_ARTIFACT,
-        "Eval seeded fleet", "planted defects are not being re-applied", "planted defects are being re-applied again",
-        "runs weekly and re-applies the seeded-fleet stack in every free pool project", RECONCILE_EFFECT,
-        f"{RUNBOOK_ROOT}docs/ci-pool-projects.md#62-the-scheduled-reconcile",
-    ),
     Periodic(
         RECONCILE_DAILY_JOB, "seeded-fleet reconcile (daily)", timedelta(hours=36), RECONCILE_ARTIFACT,
         "Eval seeded fleet", "planted defects are not being re-applied", "planted defects are being re-applied again",
@@ -276,13 +259,13 @@ WATCHED = (
     Periodic(
         RECONCILE_POSTSUBMIT_JOB, "seeded-fleet reconcile (on merge)", None, RECONCILE_ARTIFACT,
         "Eval seeded fleet", "planted defects are not being re-applied", "planted defects are being re-applied again",
-        "runs on every merge to main that changes bench/tf/fleet and applies it to every pool project", RECONCILE_EFFECT,
+        "runs on every merge to main that changes the stack under bench/tf/fleet and applies it to every pool project", RECONCILE_EFFECT,
         f"{RUNBOOK_ROOT}docs/ci-pool-projects.md#62-the-scheduled-reconcile",
     ),
 )
 WATCHED_BY_JOB = {p.job: p for p in WATCHED}
 # The reconcile jobs, for the digest's run line; the words name the trigger.
-RECONCILE_RUN_WORDS = {"ci-kube-agents-fleet-reconcile": "hourly run", "ci-kube-agents-fleet-reconcile-all": "weekly run", RECONCILE_DAILY_JOB: "daily run", RECONCILE_POSTSUBMIT_JOB: "on-merge run"}
+RECONCILE_RUN_WORDS = {RECONCILE_DAILY_JOB: "daily run", RECONCILE_POSTSUBMIT_JOB: "on-merge run"}
 
 
 def history_url(job: str) -> str:
@@ -943,7 +926,7 @@ def _supersession(job: str, readings: dict[str, dict]) -> str | None:
 
 
 def _fleet_tree(artifact) -> str | None:
-    """The bench/tf/fleet tree a run applied, from its report; None when it carries none."""
+    """The fleet tree a run applied (the report's `fleet_tree`, a hash of the stack's inputs); None when it carries none."""
     tree = artifact.get(REPORT_KEY_FLEET_TREE) if isinstance(artifact, dict) else None
     return tree if isinstance(tree, str) and tree else None
 

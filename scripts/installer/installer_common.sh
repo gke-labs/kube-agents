@@ -569,6 +569,10 @@ load_install_env() {
   # inherited SCOPED_SA_POOL_ENABLED=true would arm the pool for one run, on
   # accounts the next run from a clean shell deletes again.
   unset SCOPED_SA_POOL_ENABLED SCOPED_SA_POOL_MAX_ACCOUNTS
+  # The GitOps forge keys too: an inherited GITOPS_FORGE=gitlab would render a
+  # GitLab forge, and drop the GitHub alias and minter, for one run of an
+  # install the file records as GitHub. --gitops-forge is the per-run way in.
+  unset GITOPS_FORGE GITOPS_HOST GITLAB_TOKEN_SECRET
   [ -n "$file" ] && [ -f "$file" ] || return 1
   # Checked before sourcing: a stray quote would otherwise abort the caller
   # through its ERR trap with a bash parse error naming no file.
@@ -855,6 +859,8 @@ github_account_type() {
 check_github_org_is_organization() {
   local org="${1:-}"
   [ -z "$org" ] && return 0
+  # A GitLab install has no token minter, so no GitHub account to check.
+  [ "${GITOPS_FORGE:-${DEFAULT_GITOPS_FORGE:-github}}" = "gitlab" ] && return 0
 
   if is_truthy "${SKIP_GITHUB_ORG_CHECK:-false}"; then
     print_warning "SKIP_GITHUB_ORG_CHECK=true is set; not verifying that '${org}' is an organization."
@@ -2955,7 +2961,11 @@ write_tfvars_from_state() {
   # import mutating anything before the confirmation (or on a dry run).
   # With no key and no PEM, defer the minter loudly rather than wedge.
   local enable_github_minter="false"
-  if [ -n "${GITOPS_ORG:-}" ] && [ -n "${GITOPS_REPO:-}" ] && [ -n "${GITHUB_APP_ID:-}" ]; then
+  # A GitLab install has no GitHub App: the GitOps repository is on GitLab and
+  # the composition refuses the minter beside it.
+  if [ "${GITOPS_FORGE:-${DEFAULT_GITOPS_FORGE:-github}}" = "gitlab" ]; then
+    :
+  elif [ -n "${GITOPS_ORG:-}" ] && [ -n "${GITOPS_REPO:-}" ] && [ -n "${GITHUB_APP_ID:-}" ]; then
     local minter_key_version=""
     minter_key_version="$(kms_key_enabled_version "${KMS_KEY:-$DEFAULT_KMS_KEY}" \
       "${KMS_KEYRING:-$DEFAULT_KMS_KEYRING}" "$(derive_kms_location "${REGION}")" "${PROJECT_ID}")"
@@ -3226,7 +3236,14 @@ write_tfvars_from_state() {
     echo "slack_home_channel      = $(hcl_str "${SLACK_HOME_CHANNEL:-}")"
     echo "slack_home_channel_name = $(hcl_str "${SLACK_HOME_CHANNEL_NAME:-}")"
     echo ""
-    if [ -n "${GITOPS_ORG:-}" ] && [ -n "${GITOPS_REPO:-}" ]; then
+    # Written only for a GitLab install, so a GitHub one renders the exact
+    # lines it always has. GITOPS_REPO is the project's full path there.
+    if [ "${GITOPS_FORGE:-${DEFAULT_GITOPS_FORGE:-github}}" = "gitlab" ]; then
+      echo "gitops_forge              = \"gitlab\""
+      echo "gitops_host               = $(hcl_str "${GITOPS_HOST:-}")"
+      echo "gitlab_repo               = $(hcl_str "${GITOPS_REPO:-}")"
+      echo "gitlab_token_secret_name  = $(hcl_str "${GITLAB_TOKEN_SECRET:-${DEFAULT_GITLAB_TOKEN_SECRET:-gitlab-forge-token}}")"
+    elif [ -n "${GITOPS_ORG:-}" ] && [ -n "${GITOPS_REPO:-}" ]; then
       echo "github_repo = $(hcl_str "${GITOPS_ORG}/${GITOPS_REPO}")"
     fi
     echo "enable_github_minter = ${enable_github_minter}"
