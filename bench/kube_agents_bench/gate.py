@@ -355,10 +355,12 @@ def _cmd_case(args: argparse.Namespace) -> int:
         None if d == MISSING else d for d in (args.result or [])
     ]
 
-    # The version key comes off the first repetition that produced a readable
-    # record. All repetitions of one case run on the same software, so any of
-    # them answers; taking the first readable one tolerates a lead-off infra
-    # failure without losing the key.
+    # The version key comes off the first repetition whose record has one.
+    # All repetitions of one case run on the same software, so any of them
+    # answers; taking the first that has a key tolerates a lead-off infra
+    # failure without losing it. A launcher's not-run record
+    # (record_unit_not_run in hack/ci-eval-pr.sh) is readable but has no
+    # manifest, so it has no key and is passed over like a missing one.
     key: VersionKey | None = None
     admission_reason = "no readable record, so no version key"
     try:
@@ -377,7 +379,8 @@ def _cmd_case(args: argparse.Namespace) -> int:
             judge_model=args.judge_model or os.environ.get("JUDGE_MODEL"),
             versions=versions,
         )
-        break
+        if key is not None:
+            break
 
     store, fatal, degraded = _load_store(_store_location(args), only={spec.case_id})
     if fatal or store is None:

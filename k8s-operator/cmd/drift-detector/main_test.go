@@ -18,6 +18,7 @@ import (
 	"context"
 	"errors"
 	"flag"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -349,19 +350,8 @@ func TestRealMainRejectsBadConfiguration(t *testing.T) {
 			// unreachable -- which is also what a healthy single-cluster
 			// detector reports for the rest of the project, so nothing at
 			// runtime tells the two apart.
-			name:    "project given as a number with the join enabled",
+			name:    "project given as a number with a direct cluster",
 			argv:    []string{"--project", "123456789012", "--in-cluster", "--cluster-name", "prod-a", "--cluster-location", "us-central1"},
-			wantErr: "is a project number",
-		},
-		{
-			// The same refusal reached through the other credential source. The
-			// profile path compares --project twice -- against each record's
-			// project_id, and against each discovered profile's own project to
-			// decide what to register -- so a number here discards the whole
-			// fleet at discovery and then matches nothing either, which reads as
-			// an empty fleet rather than as a bad flag.
-			name:    "project given as a number with only the profile fan-in",
-			argv:    []string{"--project", "123456789012", "--profiles-dir", "/opt/data/profiles"},
 			wantErr: "is a project number",
 		},
 	}
@@ -376,6 +366,58 @@ func TestRealMainRejectsBadConfiguration(t *testing.T) {
 				t.Errorf("realMain(%v) error = %q, want it to contain %q", tc.argv, err, tc.wantErr)
 			}
 		})
+	}
+}
+
+// The refusal above is keyed on the direct credentials, not on the join being
+// on: the profile fan-in reads --project for nothing but the subscription, since
+// each profile carries its own project and a record is matched on the full
+// triple, so a number there is a working configuration and refusing it would
+// reject a local run on the fan-in alone. The table cannot hold that case,
+// because its loop wants an error; TestRealMainTakesAProjectNumberOnTheFanInAlone
+// drives realMain past the check instead.
+func TestRefuseProjectNumber(t *testing.T) {
+	cases := []struct {
+		name       string
+		project    string
+		directJoin bool
+		wantErr    bool
+	}{
+		{"number with a direct cluster", "123456789012", true, true},
+		{"number on the profile fan-in alone", "123456789012", false, false},
+		{"id with a direct cluster", "example-project", true, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := refuseProjectNumber(tc.project, tc.directJoin)
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("refuseProjectNumber(%q, %v) = %v, want error: %v", tc.project, tc.directJoin, err, tc.wantErr)
+			}
+			if err != nil && !strings.Contains(err.Error(), "is a project number") {
+				t.Errorf("error = %q, want it to name the project number", err)
+			}
+		})
+	}
+}
+
+// The wiring, not the helper: realMain has to key the refusal on the direct
+// credentials, and restoring the old key -- the join being on at all -- passes
+// TestRefuseProjectNumber untouched. A missing --profiles-dir is the stop that
+// makes this deterministic: discovery is fatal on it, and it comes after the
+// refusal and before the Pub/Sub client, so the run ends on the directory
+// rather than on credentials this test does not have.
+func TestRealMainTakesAProjectNumberOnTheFanInAlone(t *testing.T) {
+	missing := filepath.Join(t.TempDir(), "profiles")
+	argv := []string{"--project", "123456789012", "--profiles-dir", missing}
+	err := realMain(argv)
+	if err == nil {
+		t.Fatalf("realMain(%v) succeeded, want it to stop on the missing profiles directory", argv)
+	}
+	if strings.Contains(err.Error(), "is a project number") {
+		t.Fatalf("realMain(%v) refused the project number with no direct credentials: %v", argv, err)
+	}
+	if !strings.Contains(err.Error(), "does not exist yet") {
+		t.Errorf("realMain(%v) error = %q, want the missing-directory stop, which proves the run got past the project check", argv, err)
 	}
 }
 
