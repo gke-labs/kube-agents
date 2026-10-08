@@ -3966,23 +3966,30 @@ class FleetResourceTypesAreCoveredByReconcilerRolesTest(unittest.TestCase):
     """Every resource type the fleet stack declares maps to roles the reconciler holds."""
 
     _FLEET = checker._ROOT / "bench" / "tf" / "fleet"
+    # The scan reads *.tf files and their resource and data blocks. Anything
+    # else tofu might load is refused rather than enumerated: a file that is
+    # not *.tf and not one of the directory's known inert files, and a
+    # top-level block kind that is neither read nor known to load no provider.
+    _INERT_FILES = {"README.md", ".terraform.lock.hcl", "fixtures.json", "reconcile-allow.json"}
+    _READ_BLOCKS = {"resource", "data"}
+    _INERT_BLOCKS = {"terraform", "provider", "variable", "output", "locals"}
+
+    def _blocks(self):
+        blocks = []
+        for path in sorted(self._FLEET.glob("*.tf")):
+            blocks.extend(_hcl_top_level_blocks(path.read_text()))
+        return blocks
 
     def _types(self):
-        # Comments stripped and spacing free, as tofu reads it; resource and
-        # data blocks both, since a data source is a read the plan makes.
-        types = set()
-        for path in sorted(self._FLEET.glob("*.tf")):
-            types.update(t for _, t in re.findall(r'^\s*(resource|data)\s+"([a-z0-9_]+)"', _without_hcl_comments(path.read_text()), re.MULTILINE))
+        types = {label for kind, label in self._blocks() if kind in self._READ_BLOCKS and label}
         self.assertGreater(len(types), 10)
         return types
 
     def test_the_scan_sees_everything_tofu_would_load(self):
-        # The scan reads *.tf in this one directory; a *.tf.json file or a
-        # module block would carry types it never sees, so neither may appear
-        # without extending it.
-        self.assertEqual(sorted(p.name for p in self._FLEET.glob("*.tf.json")), [])
-        modules = [p.name for p in self._FLEET.glob("*.tf") if re.search(r'^\s*module\s+"', _without_hcl_comments(p.read_text()), re.MULTILINE)]
-        self.assertEqual(modules, [])
+        strangers = sorted(p.name for p in self._FLEET.iterdir() if p.is_file() and not p.name.endswith(".tf") and p.name not in self._INERT_FILES)
+        self.assertEqual(strangers, [], "a file the scan does not read (tofu also loads *.tofu, *.tf.json, *.tofu.json): extend the scan or name it inert here")
+        kinds = sorted({kind for kind, _ in self._blocks()} - self._READ_BLOCKS - self._INERT_BLOCKS)
+        self.assertEqual(kinds, [], "a top-level block kind the scan does not read (module, ephemeral, action, ...): extend the scan")
 
     def test_every_type_in_the_stack_is_mapped_and_its_roles_are_held(self):
         unmapped, unheld = [], []
@@ -5000,8 +5007,10 @@ class TokenMinterKmsHalfTest(unittest.TestCase):
 
 def _without_hcl_comments(text):
     """HCL's three comment forms stripped: `#`, `//` and `/* */`, outside
-    string literals (a `principalSet://...` member is not a comment). A role
-    commented out in any of them is a role removed."""
+    string literals (a `principalSet://...` member is not a comment) and
+    outside heredocs, whose bodies are literal. A role commented out in any
+    of them is a role removed."""
+
     out, i, n, in_string = [], 0, len(text), False
     while i < n:
         c = text[i]
@@ -5017,6 +5026,14 @@ def _without_hcl_comments(text):
             in_string = True
             out.append(c)
             i += 1
+        elif text.startswith("<<", i) and (heredoc := re.match(r"<<-?([A-Za-z_]\w*)\r?\n", text[i:])):
+            # A heredoc body is literal text: no comment and no string in it,
+            # and its own `/*`, `#` or `"` must not open one. Copied verbatim
+            # through the line that holds the marker alone.
+            end = re.compile(r"^[ \t]*" + re.escape(heredoc.group(1)) + r"[ \t]*$", re.MULTILINE).search(text, i + heredoc.end())
+            stop = n if end is None else end.end()
+            out.append(text[i:stop])
+            i = stop
         elif text.startswith("/*", i):
             end = text.find("*/", i + 2)
             i = n if end < 0 else end + 2
@@ -5027,6 +5044,37 @@ def _without_hcl_comments(text):
             out.append(c)
             i += 1
     return "".join(out)
+
+
+def _hcl_top_level_blocks(text):
+    """(kind, first label or None) for every top-level block, read through
+    comments, strings and heredocs with a brace depth count, so a nested
+    block, a `${...}` in a string or a brace in a heredoc is not a block."""
+    text = _without_hcl_comments(text)
+    blocks, depth, i, n = [], 0, 0, len(text)
+    while i < n:
+        c = text[i]
+        if c == '"':
+            i += 1
+            while i < n and text[i] != '"':
+                i += 2 if text[i] == "\\" else 1
+            i += 1
+            continue
+        if text.startswith("<<", i) and (heredoc := re.match(r"<<-?([A-Za-z_]\w*)\r?\n", text[i:])):
+            end = re.compile(r"^[ \t]*" + re.escape(heredoc.group(1)) + r"[ \t]*$", re.MULTILINE).search(text, i + heredoc.end())
+            i = n if end is None else end.end()
+            continue
+        if c == "{":
+            if depth == 0:
+                header = text[text.rfind("\n", 0, i) + 1 : i]
+                m = re.match(r'\s*([a-z_]+)(?:\s+"([^"]*)")?', header)
+                if m:
+                    blocks.append((m.group(1), m.group(2)))
+            depth += 1
+        elif c == "}":
+            depth -= 1
+        i += 1
+    return blocks
 
 
 class PoolStateReaderMatchesTerraformTest(unittest.TestCase):
@@ -5054,6 +5102,19 @@ class PoolStateReaderMatchesTerraformTest(unittest.TestCase):
         stripped = _without_hcl_comments(text)
         self.assertEqual(re.findall(r'"([^"]+)"', stripped), ["a", "f", "principalSet://iam.googleapis.com/locations/global/workforcePools/p/*", "with # hash"])
         self.assertEqual(re.search(r"x\s*=\s*\[(.*?)\]", stripped, re.S).group(1).count('"'), 8, "the bracket in the comment did not end the list")
+
+    def test_the_comment_strip_leaves_a_heredoc_alone(self):
+        # A heredoc body is literal: its `/*`, `#` and odd `"` open nothing,
+        # and the text after it is still read.
+        text = 'script = <<-EOT\n  rm -rf /tmp/* # not a comment\n  echo "odd\nEOT\nafter = "kept" # gone\n'
+        stripped = _without_hcl_comments(text)
+        self.assertIn('rm -rf /tmp/* # not a comment', stripped)
+        self.assertIn('after = "kept"', stripped)
+        self.assertNotIn("# gone", stripped)
+
+    def test_top_level_blocks_are_read_through_nesting_strings_and_heredocs(self):
+        text = 'resource "google_compute_instance" "a" {\n  boot_disk {\n    x = "${var.y}"\n  }\n  script = <<-EOT\n    if [ {a} ]; then /* x */ fi\n  EOT\n}\n  data   "google_client_config" "d" {}\n/* resource "google_pubsub_topic" "parked" {} */\nlocals {\n  m = { k = "v" }\n}\n'
+        self.assertEqual(_hcl_top_level_blocks(text), [("resource", "google_compute_instance"), ("data", "google_client_config"), ("locals", None)])
 
 
 if __name__ == "__main__":
