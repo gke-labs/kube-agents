@@ -1244,9 +1244,12 @@ through a send-only stand-in adapter that exists only inside the notifier
 (`deploy/docker/patches/kanban_chat_notify.py`); nothing else in the Hermes gateway treats
 the platform as connected. Only the subscription's thread is forwarded, so the home-space
 rule applies: a thread of another space is refused, and a subscription with no thread is not
-delivered. While the route is unavailable (the gateway restarting) the notifier holds
-deliveries rather than spending a subscription's failure budget, and events older than six
-hours are advanced past without posting.
+delivered. A route probe (an empty notify, which an armed gateway refuses at once) tells the
+notifier when the route is unavailable (the gateway restarting), and it holds deliveries
+unclaimed then; only a send that meets the outage before the next probe spends one unit of
+the subscription's failure budget. Once, when routed delivery first goes live on an install,
+events that are already more than six hours old are advanced past without posting: they are
+the backlog nothing could deliver before.
 
 A notify is not a task. It mints no capability, starts no executor, opens no session and
 carries no `authority` block; the requester rules above do not apply, because nobody

@@ -27,9 +27,12 @@ platform, and only inside the notifier:
    adapter answers for a subscription that names a thread. The stand-in posts
    with ``a2a notify``, which asks the gateway to post into that thread over its
    chat.notify route.
-3. :func:`fresh_events` drops events older than :data:`STALE_EVENT_SECONDS`
-   from a claim, so the first rollout does not replay the backlog every
-   skipped subscription accumulated; the cursor still advances past them.
+3. :func:`fresh_events` drops, from a claim, events that were already older
+   than :data:`STALE_EVENT_SECONDS` when routed delivery first went live, so
+   the first rollout does not replay the backlog every skipped subscription
+   accumulated; the cursor still advances past them. The moment is kept under
+   ``$HERMES_HOME`` (the agent's volume), so this is a one-time skip: an
+   outage after the rollout delays events, and drops none.
 
 Only the subscription's thread is forwarded, and the gateway posts only into
 threads of the home channel, so a thread of another space is refused (and the
@@ -43,11 +46,12 @@ bus unreachable: ``a2a notify`` exit 4), :func:`resolve` answers no adapter,
 which is upstream's disconnected-adapter path: skipped without a claim and
 without spending the failure budget. It learns this from a probe (an empty
 notify, which an armed gateway refuses at once) that the collector's pre-claim
-authorization runs on its worker thread, at most every
-:data:`ROUTE_PROBE_TTL_SECONDS`, and from any send that meets exit 4, which
-holds the route down for :data:`ROUTE_DOWN_BACKOFF_SECONDS`. Only a send that
-races the very start of an outage can still spend one unit. Without this a
-gateway roll would unsubscribe every card with a pending event.
+authorization runs on its worker thread, and from any send that meets exit
+4. An up answer is trusted for :data:`ROUTE_PROBE_TTL_SECONDS`; a down one
+holds the route down for :data:`ROUTE_DOWN_BACKOFF_SECONDS` and is probed
+again after it. So a send that meets an outage inside that window spends one
+unit, and marks the route down for the rest. Without this a gateway roll
+would unsubscribe every card with a pending event.
 
 The stand-in is never registered in ``runner.adapters``, so nothing else in the
 gateway believes the platform is connected, and it is not offered under
@@ -98,18 +102,29 @@ SEND_TIMEOUT_SECONDS = NOTIFY_WAIT_SECONDS + NOTIFY_CONNECT_SECONDS + NOTIFY_MAR
 # (Recreate) is tens of seconds; this keeps the notifier from spending a
 # subscription's failure budget on it.
 ROUTE_DOWN_BACKOFF_SECONDS = 60
-# Events older than this are advanced past without posting: on the first
-# rollout they are the backlog of a subscription nobody could deliver, and a
-# completion from days ago posted now is noise, a stale failure wake worse.
+# Events already older than this when routed delivery first went live are
+# advanced past without posting: they are the backlog of a subscription nobody
+# could deliver, and a completion from days ago posted now is noise, a stale
+# failure wake worse.
 STALE_EVENT_SECONDS = 6 * 3600
-# How long a route probe's answer is trusted, and how long one may take. The
-# probe is an empty notify: an armed gateway refuses it at once ("text is
-# empty"), and no responders (exit 4) means the route is not there.
-ROUTE_PROBE_TTL_SECONDS = 10
+# Where the moment routed delivery first went live is kept: a file under
+# $HERMES_HOME, which is on the agent's volume, so a pod restart does not move
+# it and the stale skip happens once per install.
+HERMES_HOME_ENV = "HERMES_HOME"
+ROUTED_SINCE_FILE = "kanban_chat_notify.routed_since"
+# How long an up answer from the route probe is trusted, and how long a probe
+# may take. The probe is an empty notify: an armed gateway refuses it at once
+# ("text is empty"), and no responders (exit 4) means the route is not there.
+# The collector authorizes every routed subscription on every tick, work or
+# not, so this bounds the probes an idle install makes.
+ROUTE_PROBE_TTL_SECONDS = 300
 ROUTE_PROBE_TIMEOUT_SECONDS = 5
 # The attribute the stand-in is cached under on the runner, which outlives the
 # per-tick collector and the per-delivery notification.
 RUNNER_ATTR = "_kage_chat_notify_adapter"
+
+# routed_since's answer, read or written once per process.
+_routed_since: Optional[float] = None
 
 
 def _on_event_loop() -> bool:
@@ -154,15 +169,50 @@ def resolve(runner: Any, platform: Any, adapter: Any, sub: Optional[dict] = None
     return stand_in
 
 
+def routed_since(now: float) -> float:
+    """When routed delivery first went live on this install: read, or recorded as ``now``.
+
+    Kept under $HERMES_HOME so it survives a restart. When it cannot be kept,
+    this process's first call stands in, and the log says a restart moves it.
+    """
+    global _routed_since
+    if _routed_since is not None:
+        return _routed_since
+    home = os.environ.get(HERMES_HOME_ENV, "").strip()
+    path = os.path.join(home, ROUTED_SINCE_FILE) if home else ""
+    value = None
+    if path:
+        try:
+            with open(path, encoding="utf-8") as handle:
+                value = float(handle.read().strip())
+        except FileNotFoundError:
+            pass
+        except (OSError, ValueError) as exc:
+            logger.warning("kanban notifier: %s unreadable (%s); recording now", path, exc)
+    if value is None:
+        value = now
+        try:
+            if not path:
+                raise OSError(f"{HERMES_HOME_ENV} is not set")
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write(f"{value}\n")
+        except OSError as exc:
+            logger.warning("kanban notifier: cannot record when routed delivery went live (%s); "
+                           "a restart will skip stale events again", exc)
+    _routed_since = value
+    return value
+
+
 def fresh_events(claim: Optional[dict], now: Optional[float] = None) -> Optional[dict]:
-    """``claim`` with events older than STALE_EVENT_SECONDS removed, for the routed platform only."""
+    """``claim`` minus events already STALE_EVENT_SECONDS old when routing went live, for the routed platform only."""
     if not claim or not routes((claim.get("sub") or {}).get("platform")):
         return claim
-    cutoff = (time.time() if now is None else now) - STALE_EVENT_SECONDS
+    cutoff = routed_since(time.time() if now is None else now) - STALE_EVENT_SECONDS
     events = claim.get("events") or []
     kept = [ev for ev in events if (getattr(ev, "created_at", 0) or 0) >= cutoff]
     if len(kept) != len(events):
-        logger.info("kanban notifier: skipping %d event(s) older than %ds for %s on %s (cursor still advances)",
+        logger.info("kanban notifier: skipping %d event(s) from before routed delivery went live, "
+                    "older than %ds then, for %s on %s (cursor still advances)",
                     len(events) - len(kept), STALE_EVENT_SECONDS,
                     claim["sub"].get("task_id"), claim["sub"].get("platform"))
         claim = dict(claim, events=kept)
@@ -187,12 +237,13 @@ class ChatNotifyAdapter(BasePlatformAdapter):
     def route_up(self) -> bool:
         """Whether a delivery should be attempted now.
 
-        False while a send's exit 4 holds the route down. Otherwise the answer
-        of a probe, refreshed at most every ROUTE_PROBE_TTL_SECONDS and only
-        off the event loop: the collector authorizes each subscription on a
-        worker thread before it claims, so a route that is down is skipped
-        there, unclaimed and uncounted, and the first send never meets it.
-        Delivery runs on the loop and reads the last answer.
+        False while a down answer (a probe's, or a send's exit 4) holds the
+        route down. Otherwise the answer of a probe, run only off the event
+        loop: the collector authorizes each subscription on a worker thread
+        before it claims, so a route seen down there is skipped, unclaimed and
+        uncounted. An up answer is trusted for ROUTE_PROBE_TTL_SECONDS; a down
+        one is probed again once its backoff ends. Delivery runs on the loop
+        and reads the last answer.
         """
         if self.route_down():
             return False
@@ -201,8 +252,14 @@ class ChatNotifyAdapter(BasePlatformAdapter):
             self._probed_at = now
             self._route_ok = self._probe()
             if not self._route_ok:
-                self._route_down_until = now + ROUTE_DOWN_BACKOFF_SECONDS
+                self.mark_route_down()
         return self._route_ok
+
+    def mark_route_down(self) -> None:
+        """Hold deliveries for the backoff, then probe again rather than trust an old up answer."""
+        self._route_down_until = time.monotonic() + ROUTE_DOWN_BACKOFF_SECONDS
+        self._route_ok = False
+        self._probed_at = float("-inf")
 
     def _probe(self) -> bool:
         try:
@@ -266,7 +323,7 @@ class ChatNotifyAdapter(BasePlatformAdapter):
             logger.warning("chat.notify: no answer in time for %s; treating as sent", chat_id)
             return SendResult(success=True)
         if proc.returncode == NOTIFY_ROUTE_UNAVAILABLE:
-            self._route_down_until = time.monotonic() + ROUTE_DOWN_BACKOFF_SECONDS
+            self.mark_route_down()
             logger.warning("chat.notify: route unavailable; holding deliveries for %ds", ROUTE_DOWN_BACKOFF_SECONDS)
         if proc.returncode != 0:
             return SendResult(success=False, error=(err.decode(errors="replace").strip() or f"exit {proc.returncode}"))

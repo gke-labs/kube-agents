@@ -76,6 +76,13 @@ class _Runner:
 
 
 class ResolveTest(unittest.TestCase):
+    def setUp(self):
+        # Pin the route probe up, so no test here runs whatever `a2a` is on the
+        # developer's PATH. The probe's own tests stop this and patch the child.
+        self.probe = mock.patch.object(kanban_chat_notify.ChatNotifyAdapter, "_probe", return_value=True)
+        self.probe.start()
+        self.addCleanup(mock.patch.stopall)
+
     def test_a_live_adapter_always_wins(self):
         live = object()
         with mock.patch.dict(os.environ, ROUTED):
@@ -117,9 +124,12 @@ class ResolveTest(unittest.TestCase):
             self.assertIs(kanban_chat_notify.resolve(runner, Platform.GOOGLE_CHAT, None), stand_in)
 
     def test_the_probe_decides_whether_a_routed_subscription_is_offered(self):
+        self.probe.stop()
         runner = _Runner()
+        refused = subprocess.CompletedProcess([], 1, b"", b"")
         with mock.patch.dict(os.environ, ROUTED):
-            stand_in = kanban_chat_notify.resolve(runner, Platform.GOOGLE_CHAT, None)  # first probe: default up
+            with mock.patch.object(kanban_chat_notify.subprocess, "run", return_value=refused):
+                stand_in = kanban_chat_notify.resolve(runner, Platform.GOOGLE_CHAT, None)  # an armed gateway's refusal: up
             for returncode, offered in ((kanban_chat_notify.NOTIFY_ROUTE_UNAVAILABLE, False), (1, True)):
                 stand_in._route_down_until = 0.0
                 stand_in._probed_at = float("-inf")
@@ -130,6 +140,7 @@ class ResolveTest(unittest.TestCase):
                 self.assertEqual(run.call_args.args[0][-2:], ["--", ""])
 
     def test_the_probe_is_cached_and_never_runs_on_the_event_loop(self):
+        self.probe.stop()
         runner = _Runner()
         with mock.patch.dict(os.environ, ROUTED), \
                 mock.patch.object(kanban_chat_notify.subprocess, "run",
@@ -144,6 +155,32 @@ class ResolveTest(unittest.TestCase):
 
             self.assertIs(asyncio.run(on_loop()), stand_in)
             self.assertEqual(run.call_count, 1, "delivery on the event loop must use the cached answer")
+
+    def test_an_up_answer_is_trusted_for_the_ttl_and_a_down_one_is_reprobed_after_its_backoff(self):
+        self.probe.stop()
+        runner = _Runner()
+        clock = [1000.0]
+        up = subprocess.CompletedProcess([], 1, b"", b"")
+        down = subprocess.CompletedProcess([], kanban_chat_notify.NOTIFY_ROUTE_UNAVAILABLE, b"", b"")
+        with mock.patch.dict(os.environ, ROUTED), \
+                mock.patch.object(kanban_chat_notify.time, "monotonic", lambda: clock[0]), \
+                mock.patch.object(kanban_chat_notify.subprocess, "run", return_value=up) as run:
+            stand_in = kanban_chat_notify.resolve(runner, Platform.GOOGLE_CHAT, None)
+            clock[0] += kanban_chat_notify.ROUTE_PROBE_TTL_SECONDS - 1
+            kanban_chat_notify.resolve(runner, Platform.GOOGLE_CHAT, None)
+            self.assertEqual(run.call_count, 1, "an up answer is trusted for the TTL")
+            # A send meets an outage: the route is held down, then probed again
+            # at once rather than trusting the old up answer for the rest of the TTL.
+            stand_in.mark_route_down()
+            self.assertIsNone(kanban_chat_notify.resolve(runner, Platform.GOOGLE_CHAT, None))
+            clock[0] += kanban_chat_notify.ROUTE_DOWN_BACKOFF_SECONDS + 1
+            run.return_value = down
+            self.assertIsNone(kanban_chat_notify.resolve(runner, Platform.GOOGLE_CHAT, None))
+            self.assertEqual(run.call_count, 2, "the backoff's end is probed")
+            clock[0] += kanban_chat_notify.ROUTE_DOWN_BACKOFF_SECONDS + 1
+            run.return_value = up
+            self.assertIs(kanban_chat_notify.resolve(runner, Platform.GOOGLE_CHAT, None), stand_in)
+            self.assertEqual(run.call_count, 3)
 
     def test_active_platforms(self):
         with mock.patch.dict(os.environ, ROUTED):
@@ -245,6 +282,35 @@ class _Event:
 
 
 class FreshEventsTest(unittest.TestCase):
+    def setUp(self):
+        home = tempfile.TemporaryDirectory()
+        self.addCleanup(home.cleanup)
+        self.home = home.name
+        patcher = mock.patch.dict(os.environ, {kanban_chat_notify.HERMES_HOME_ENV: self.home})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        kanban_chat_notify._routed_since = None
+        self.addCleanup(setattr, kanban_chat_notify, "_routed_since", None)
+
+    def test_the_skip_is_once_per_install_not_a_standing_deadline(self):
+        live = 1_000_000.0
+        claim = {"sub": {"platform": "google_chat", "task_id": "t"}, "cursor": 9}
+        backlog = _Event(1, int(live - kanban_chat_notify.STALE_EVENT_SECONDS - 1))
+        with mock.patch.dict(os.environ, ROUTED):
+            self.assertEqual(kanban_chat_notify.fresh_events(dict(claim, events=[backlog]), now=live)["events"], [])
+            # A day later, after an outage: an event raised after routing went
+            # live is delivered however old it is now.
+            later = live + 24 * 3600
+            held = _Event(2, int(live + 60))
+            kept = kanban_chat_notify.fresh_events(dict(claim, events=[held]), now=later)
+            self.assertEqual([ev.id for ev in kept["events"]], [2])
+            # And a restart reads the recorded moment rather than starting over.
+            kanban_chat_notify._routed_since = None
+            kept = kanban_chat_notify.fresh_events(dict(claim, events=[held]), now=later)
+            self.assertEqual([ev.id for ev in kept["events"]], [2])
+        recorded = Path(self.home, kanban_chat_notify.ROUTED_SINCE_FILE).read_text().strip()
+        self.assertEqual(float(recorded), live)
+
     def test_stale_events_are_dropped_for_the_routed_platform_only(self):
         now = 1_000_000.0
         old, new = _Event(1, int(now - kanban_chat_notify.STALE_EVENT_SECONDS - 1)), _Event(2, int(now - 60))

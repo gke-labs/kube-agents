@@ -3,16 +3,25 @@
 
 Run from ``/opt/hermes`` by ``deploy/docker/Dockerfile`` after
 ``apply_kanban_chat_notify.py``. It imports the real patched notifier and
-exercises the two seams the patch adds, so a base-image bump that changes what
-``_Collector`` or ``_adapter_for_subscription`` look like fails the build here
-rather than on a live install:
+exercises what the patch adds, so a base-image bump that changes what
+``_Collector``, ``_adapter_for_subscription`` or the wake path look like fails
+the build here rather than on a live install. A fake ``a2a`` on PATH stands in
+for the CLI from the first routed resolve on.
 
-1. With ``A2A_NOTIFY_PLATFORM`` set and no Google Chat adapter connected, a
-   collector counts ``google_chat`` as served, and ``_adapter_for_subscription``
-   returns the stand-in; with it unset, neither happens.
-2. The stand-in's ``send`` runs ``a2a notify`` with the thread and a ``--``
-   before the text, and reports the answer as a successful ``SendResult``; a
-   non-zero exit is a failed send, and exit 3 (outcome unknown) is not.
+1. Resolution: with ``A2A_NOTIFY_PLATFORM`` set and no Google Chat adapter
+   connected, a collector counts ``google_chat`` as served and
+   ``_adapter_for_subscription`` returns the stand-in, reused across
+   deliveries and never registered in ``runner.adapters``; with it unset,
+   neither happens. A threadless subscription and ``multiplex_profiles`` get
+   none, and the collector's claim is wrapped by the stale filter.
+2. Send: ``a2a notify`` with the thread and a ``--`` before the text; exit 0
+   is sent, exit 1 failed, exit 3 (outcome unknown) not a failure, and exit 4
+   a failure that holds the route down.
+3. The route probe: an empty notify; exit 4 reads as down before any send,
+   an armed gateway's refusal as up.
+4. Attachments are not posted.
+5. A failure wake is admitted, reaches the runner's handler, and the turn's
+   reply goes out through ``a2a notify``.
 """
 
 from __future__ import annotations
@@ -87,6 +96,20 @@ def main() -> None:
     check(notifier._adapter_for_subscription(runner, GCHAT, sub, None) is None,
           "unrouted: no adapter for google_chat")
 
+    # From here on the CLI is a fake on PATH: the first routed resolve probes
+    # the route, and an armed gateway's refusal of the empty probe (exit 1)
+    # reads as up. HERMES_HOME holds the stale filter's rollout record.
+    tmp_dir = tempfile.TemporaryDirectory()
+    tmp = tmp_dir.name
+    fake = Path(tmp) / "a2a"
+    fake.write_text(FAKE_A2A)
+    fake.chmod(fake.stat().st_mode | stat.S_IEXEC)
+    log = Path(tmp) / "argv"
+    os.environ["PATH"] = f"{tmp}:{os.environ['PATH']}"
+    os.environ["A2A_ARGV_LOG"] = str(log)
+    os.environ["A2A_EXIT"] = "1"
+    os.environ["HERMES_HOME"] = tmp
+
     os.environ[NOTIFY_PLATFORM_ENV] = "google_chat"
     collector = notifier._Collector(runner, kb=None, notifier_profile=None, gc_due=False, gc_retention_days=30)
     check("google_chat" in collector.active_platforms, "routed: google_chat is served")
@@ -108,14 +131,7 @@ def main() -> None:
     check(notifier._Collector._claim_for_sub.__name__ == "_kage_claim_for_sub",
           "the collector's claim is wrapped to drop stale events")
 
-    with tempfile.TemporaryDirectory() as tmp:
-        fake = Path(tmp) / "a2a"
-        fake.write_text(FAKE_A2A)
-        fake.chmod(fake.stat().st_mode | stat.S_IEXEC)
-        log = Path(tmp) / "argv"
-        os.environ["PATH"] = f"{tmp}:{os.environ['PATH']}"
-        os.environ["A2A_ARGV_LOG"] = str(log)
-
+    with tmp_dir:
         os.environ["A2A_EXIT"] = "0"
         result = asyncio.run(adapter.send("spaces/H", "- done", metadata={"thread_id": "spaces/H/threads/T"}))
         argv = log.read_text().splitlines()
