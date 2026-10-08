@@ -22,7 +22,8 @@ import (
 	lib "github.com/gke-labs/kube-agents/a2a/lib"
 )
 
-// The API executor: a task is one turn in the conversation's Hermes session.
+// The API executor: a task is a turn in the conversation's Hermes session,
+// and one more turn in it for each follow-up the task queues.
 //
 // Instead of a cold `hermes chat -Q` per task, the bridge POSTs the task's
 // text to the Hermes API server in the same pod, which runs it under the
@@ -290,7 +291,7 @@ func (b *Bridge) runTaskAPI(ctx context.Context, run *taskRun) {
 	// reads a wait as a run.
 	release := b.turns.acquire(taskCtx, sessionID)
 	if release == nil {
-		b.finalizeAPIError(run, taskCtx, errWaitingForTurn)
+		b.finalizeAPIError(run, taskCtx, errWaitingForTurn, 1)
 		return
 	}
 	defer release() // every turn of the task runs under this one slot
@@ -389,7 +390,7 @@ func (b *Bridge) apiTurn(run *taskRun, taskCtx context.Context, sessionID, promp
 			// they end cancelReq, after each has stored its flag: one that
 			// lands after this check ends the request below.
 			run.mu.Unlock()
-			b.finalizeAPIError(run, taskCtx, errTurnNotSent)
+			b.finalizeAPIError(run, taskCtx, errTurnNotSent, turn)
 			return "", false
 		}
 		if !takeSteerLocked(run, steer) {
@@ -406,7 +407,7 @@ func (b *Bridge) apiTurn(run *taskRun, taskCtx context.Context, sessionID, promp
 
 	resp, err := b.sendAPI(taskCtx, req, body)
 	if err != nil {
-		b.finalizeAPIError(run, taskCtx, err)
+		b.finalizeAPIError(run, taskCtx, err, turn)
 		return "", false
 	}
 	defer resp.Body.Close()
@@ -415,7 +416,7 @@ func (b *Bridge) apiTurn(run *taskRun, taskCtx context.Context, sessionID, promp
 	// still end the request.
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, apiResponseCap+1))
 	if err != nil && taskCtx.Err() != nil {
-		b.finalizeAPIError(run, taskCtx, err)
+		b.finalizeAPIError(run, taskCtx, err, turn)
 		return "", false
 	}
 	if err != nil {
@@ -502,8 +503,11 @@ func (b *Bridge) sendAPI(ctx context.Context, req *http.Request, body []byte) (*
 
 // finalizeAPIError ends a task whose request (or wait for its session's
 // turn) ended without a response, naming the cause: the cancel, the
-// shutdown and the deadline each end reqCtx, so they are read first.
-func (b *Bridge) finalizeAPIError(run *taskRun, reqCtx context.Context, err error) {
+// shutdown and the deadline each end reqCtx, so they are read first. A
+// follow-up turn (turn ≥ 2) that started and ended here is named, as
+// apiTurn's in-band failures name it; one that found the task stopped
+// before it started (errTurnNotSent) is not, since it never ran.
+func (b *Bridge) finalizeAPIError(run *taskRun, reqCtx context.Context, err error, turn int) {
 	switch {
 	case run.canceled.Load() && errors.Is(err, errWaitingForTurn):
 		// Nothing was sent: the task was still waiting for its turn, the
@@ -512,7 +516,7 @@ func (b *Bridge) finalizeAPIError(run *taskRun, reqCtx context.Context, err erro
 	case run.canceled.Load():
 		b.finalize(run, lib.StateCanceled, "reason: canceled-by-request", nil)
 	case b.closing.Load():
-		b.finalize(run, lib.StateFailed, shutdownReason, nil)
+		b.finalize(run, lib.StateFailed, shutdownReason+turnNote(turn), nil)
 	case errors.Is(err, errTurnNotSent):
 		// Only the deadline is left: it passed between two turns, after
 		// the last answer went out as a turn artifact.
@@ -524,12 +528,12 @@ func (b *Bridge) finalizeAPIError(run *taskRun, reqCtx context.Context, err erro
 	case reqCtx.Err() == context.DeadlineExceeded && errors.Is(err, errNeverConnected):
 		// Infrastructure, as the refused connection past the retry window
 		// is: the deadline ended a wait for a server that never listened.
-		b.finalize(run, lib.StateFailed, fmt.Sprintf("reason: hermes-api-unreachable - task deadline %s ended before the server accepted a connection; no request was sent: %v", b.cfg.TaskDeadline, err), nil)
+		b.finalize(run, lib.StateFailed, fmt.Sprintf("reason: hermes-api-unreachable - task deadline %s ended before the server accepted a connection; no request was sent: %v%s", b.cfg.TaskDeadline, err, turnNote(turn)), nil)
 	case reqCtx.Err() == context.DeadlineExceeded:
 		b.finalize(run, lib.StateFailed,
-			fmt.Sprintf("reason: deadline-exceeded - request ended after %s", b.cfg.TaskDeadline), nil)
+			fmt.Sprintf("reason: deadline-exceeded - request ended after %s%s", b.cfg.TaskDeadline, turnNote(turn)), nil)
 	default:
-		b.finalize(run, lib.StateFailed, fmt.Sprintf("reason: hermes-api-unreachable - %v", err), nil)
+		b.finalize(run, lib.StateFailed, fmt.Sprintf("reason: hermes-api-unreachable - %v%s", err, turnNote(turn)), nil)
 	}
 }
 

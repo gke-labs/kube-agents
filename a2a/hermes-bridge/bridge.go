@@ -42,9 +42,12 @@ const (
 	// taskQueueCapacity bounds the accepted-but-not-started queue; hitting
 	// it on a playground bridge is a fault, not load.
 	taskQueueCapacity = 1024
-	// steerQueueCapacity bounds the follow-ups one task holds while its
-	// current turn runs, as the worker adapter bounds its steers (16). The
-	// next one is refused queue-full with a notice, never dropped silently.
+	// steerQueueCapacity bounds the follow-ups one task queues in total,
+	// those whose turn has started or that left the queue refused included,
+	// not just those waiting: a task runs at most this many follow-ups, so
+	// at most this many turns past the opening one. The number is the
+	// worker adapter's steer bound (16). The next one is refused queue-full
+	// with a notice, never dropped silently.
 	steerQueueCapacity = 16
 	// stderrTailBytes and stdoutTailBytes are how much of each stream a
 	// failed task's status message carries. stdout matters on failure too:
@@ -286,17 +289,21 @@ type taskRun struct {
 	cancelReq context.CancelFunc
 
 	// steers are the follow-ups waiting for the current turn to end, oldest
-	// first, at most steerQueueCapacity. seenSteers is every follow-up
-	// envelope this run has answered, so a redelivery is answered once.
+	// first. steersQueued counts every follow-up this run has queued, the
+	// ones since taken off steers included, and is what steerQueueCapacity
+	// bounds: the task's total, not what waits at one moment. seenSteers is
+	// every follow-up envelope this run has answered, so a redelivery is
+	// answered once.
 	// turnsClosed is set when the worker has chosen the current answer as
 	// the deliverable (nothing queued to run) or finalize began: a
 	// follow-up after the first is refused task-ending, never queued behind
 	// a terminal. One after finalize began waits on noticeMu, finds the run
 	// done and is dropped with a warning; the gateway's relay reports it as
 	// missed. All three under mu.
-	steers      []*lib.Envelope
-	seenSteers  map[string]bool
-	turnsClosed bool
+	steers       []*lib.Envelope
+	steersQueued int
+	seenSteers   map[string]bool
+	turnsClosed  bool
 	// workingSent is set once the working status is on the stream
 	// (publishWorking), under mu: a notice reads it for the task's current
 	// state, so none can say submitted after working.
@@ -743,10 +750,11 @@ func (b *Bridge) queueSteer(ctx context.Context, run *taskRun, steer *lib.Envelo
 		n.Reason = lib.SteerReasonNoText
 	case run.turnsClosed:
 		n.Reason = lib.SteerReasonTaskEnding
-	case len(run.steers) >= steerQueueCapacity:
+	case run.steersQueued >= steerQueueCapacity:
 		n.Reason = lib.SteerReasonQueueFull
 	default:
 		run.steers = append(run.steers, steer)
+		run.steersQueued++
 		n = lib.SteerNotice{Steer: lib.SteerQueued, EnvelopeID: steer.EnvelopeID}
 	}
 	run.mu.Unlock()
@@ -914,7 +922,7 @@ func steerNoticeText(n lib.SteerNotice) string {
 	prefix := "follow-up not taken (" + n.Reason + "): "
 	switch n.Reason {
 	case lib.SteerReasonQueueFull:
-		return prefix + fmt.Sprintf("%d follow-ups are already waiting on this task; it continues without this one. "+
+		return prefix + fmt.Sprintf("this task has already taken its %d follow-ups (run or waiting); it continues without this one. "+
 			"Send it again after the answer.", steerQueueCapacity)
 	case lib.SteerReasonNoText:
 		return prefix + "the message has no text to ask; the task continues without it."
@@ -923,7 +931,7 @@ func steerNoticeText(n lib.SteerNotice) string {
 	case lib.SteerReasonTaskEnded:
 		return prefix + "the task ended before this follow-up's turn, so it never ran. Send it again as a new message."
 	case lib.SteerReasonCapability:
-		return prefix + "the task's capability no longer passed when its turn came, so it did not run."
+		return prefix + "the task's capability check did not pass when its turn came (refused, or the verifier could not be reached), so it did not run."
 	case lib.SteerReasonNoResume:
 		return prefix + "the conversation could not be continued for it, so it did not run."
 	}
@@ -1293,13 +1301,22 @@ func (b *Bridge) runTask(ctx context.Context, run *taskRun) {
 // the query: after a bare -q, argparse reads a dash-led token with no space
 // in it ("--force") as an option and the child exits 2, and Hermes's own
 // pre-parse scans match whole tokens ("--help", "--tui", "-p"). Any other
-// command gets the prompt appended as it is.
+// command gets the prompt appended as it is. Either way the prompt is
+// argvText's, without NUL bytes.
 func promptArgv(command []string, prompt string) []string {
 	n := len(command)
 	if n == 0 || command[n-1] != "-q" {
-		return append(append([]string(nil), command...), prompt)
+		return append(append([]string(nil), command...), argvText(prompt))
 	}
-	return append(append([]string(nil), command[:n-1]...), "--query="+prompt)
+	return append(append([]string(nil), command[:n-1]...), "--query="+argvText(prompt))
+}
+
+// argvText is a turn's prompt as an argv string can carry it: without NUL
+// bytes, which exec refuses in any argument (EINVAL), so a message holding
+// one would fail its turn, and with it the task, as spawn-failed. Every
+// turn's prompt passes through here, the opening one and each follow-up's.
+func argvText(prompt string) string {
+	return strings.ReplaceAll(prompt, "\x00", "")
 }
 
 // resumeArgv is a follow-up turn's command: the configured command with
@@ -1312,7 +1329,7 @@ func resumeArgv(command []string, sessionID, prompt string) ([]string, error) {
 		return nil, fmt.Errorf("command %q does not end in -q", command)
 	}
 	argv := append([]string(nil), command[:n-1]...)
-	return append(argv, "--resume", sessionID, "--query="+prompt), nil
+	return append(argv, "--resume", sessionID, "--query="+argvText(prompt)), nil
 }
 
 // lastSessionID is the id on a child's last non-blank stderr line, or "".
@@ -1369,7 +1386,7 @@ func (b *Bridge) cliTurn(run *taskRun, argv, env []string, act *activityState, s
 		// after each has stored its flag: one that lands after this check
 		// finds run.proc set and kills the child.
 		run.mu.Unlock()
-		b.finalizeCLIError(run, nil, "", "", 0)
+		b.finalizeCLIError(run, errTurnNotStarted, "", "", 0)
 		return "", "", nil, false
 	}
 	if !first && (len(run.steers) == 0 || run.steers[0] != steer) {
@@ -1421,19 +1438,28 @@ func (b *Bridge) cliTurn(run *taskRun, argv, env []string, act *activityState, s
 	return out.String(), errTail.String(), werr, true
 }
 
+// errTurnNotStarted is what a turn that found the task stopped before its
+// spawn carries into finalizeCLIError: no child ran, so none was killed.
+var errTurnNotStarted = errors.New("the turn's child was not started")
+
 // finalizeCLIError names why a child's turn ended without an answer: the
 // deadline, a cancel, shutdown, else the child's non-zero exit and its
-// evidence.
+// evidence. A follow-up turn (turn ≥ 2) the deadline or shutdown killed is
+// named, as a non-zero exit is.
 func (b *Bridge) finalizeCLIError(run *taskRun, err error, stdout, stderr string, turn int) {
 	switch {
+	case run.deadlineHit.Load() && errors.Is(err, errTurnNotStarted):
+		// Found before the spawn: between two turns, or before the first.
+		b.finalize(run, lib.StateFailed,
+			fmt.Sprintf("reason: deadline-exceeded - reached after %s before the next turn started; no child was running", b.cfg.TaskDeadline), nil)
 	case run.deadlineHit.Load():
 		b.finalize(run, lib.StateFailed,
-			fmt.Sprintf("reason: deadline-exceeded - killed after %s", b.cfg.TaskDeadline), nil)
+			fmt.Sprintf("reason: deadline-exceeded - killed after %s%s", b.cfg.TaskDeadline, turnNote(turn)), nil)
 	case run.canceled.Load():
 		b.finalize(run, lib.StateCanceled, "reason: canceled-by-request", nil)
 	case b.closing.Load():
 		// Killed by shutdownTasks; name the real cause, not the exit code.
-		b.finalize(run, lib.StateFailed, shutdownReason, nil)
+		b.finalize(run, lib.StateFailed, shutdownReason+turnNote(turn), nil)
 	default:
 		b.finalize(run, lib.StateFailed, failureReason(err, stdout, stderr, turn), nil)
 	}

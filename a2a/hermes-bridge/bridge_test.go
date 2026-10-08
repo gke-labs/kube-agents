@@ -2495,20 +2495,33 @@ func TestResumeArgv(t *testing.T) {
 	}
 }
 
-// A prompt that starts with "-" is one --query= token on every turn: after a
-// bare -q, Hermes's argparse (hermes_cli/_parser.py, chat's -q/--query)
-// reads "--force" as an option and exits 2, failing the turn. A command not
-// ending in -q gets the prompt appended unchanged.
+// A prompt that is a dash-led token is one --query= token on every turn, so
+// no argv token equals it. That is the property the defect needed broken:
+// Hermes scans its whole argv for exact tokens before argparse runs
+// (hermes_cli/main.py at v2026.9.14: `"--tui" in argv` in _wants_tui_early,
+// which sends a headless run to the TUI's no-TTY bail-out, exit 0 with no
+// answer; `"-h" in argv or "--help" in argv` on the fast chat path), and
+// after a bare -q argparse reads such a token as an option ("expected one
+// argument", exit 2). A command not ending in -q gets the prompt appended
+// unchanged.
 func TestPromptArgvKeepsADashLedPromptTheQuery(t *testing.T) {
 	cmd := []string{"hermes", "-p", "platform", "chat", "-Q", "-q"}
-	for _, prompt := range []string{"--force", "-p evil", "--help", "plain words"} {
+	for _, prompt := range []string{"--tui", "--help", "-h", "-p", "--force"} {
 		want := []string{"hermes", "-p", "platform", "chat", "-Q", "--query=" + prompt}
-		if got := promptArgv(cmd, prompt); !slices.Equal(got, want) {
+		got := promptArgv(cmd, prompt)
+		if !slices.Equal(got, want) {
 			t.Errorf("promptArgv(%q) = %q, want %q", prompt, got, want)
 		}
-		got, err := resumeArgv(cmd, "sess-9", prompt)
-		if want := []string{"hermes", "-p", "platform", "chat", "-Q", "--resume", "sess-9", "--query=" + prompt}; err != nil || !slices.Equal(got, want) {
-			t.Errorf("resumeArgv(%q) = %q, %v; want %q", prompt, got, err, want)
+		resumed, err := resumeArgv(cmd, "sess-9", prompt)
+		if want := []string{"hermes", "-p", "platform", "chat", "-Q", "--resume", "sess-9", "--query=" + prompt}; err != nil || !slices.Equal(resumed, want) {
+			t.Errorf("resumeArgv(%q) = %q, %v; want %q", prompt, resumed, err, want)
+		}
+		// The whole-token scans: the prompt must not be a token of its own.
+		// The configured command's own -p is the profile flag, not the prompt.
+		for _, argv := range [][]string{got, resumed} {
+			if slices.Contains(argv[len(cmd)-1:], prompt) {
+				t.Errorf("prompt %q is a bare argv token in %q: Hermes's pre-parse scans would match it", prompt, argv)
+			}
 		}
 	}
 	if got := promptArgv([]string{"/stub"}, "--force"); !slices.Equal(got, []string{"/stub", "--force"}) {
@@ -2516,6 +2529,21 @@ func TestPromptArgvKeepsADashLedPromptTheQuery(t *testing.T) {
 	}
 	if got := promptArgv(cmd, "x"); &got[0] == &cmd[0] || cmd[len(cmd)-1] != "-q" {
 		t.Error("promptArgv aliased or changed the configured command")
+	}
+}
+
+// NUL bytes leave the prompt before it becomes an argument, on the opening
+// turn and every follow-up: exec refuses an argument that holds one.
+func TestArgvTextDropsNulBytes(t *testing.T) {
+	cmd := []string{"hermes", "chat", "-Q", "-q"}
+	if got := promptArgv(cmd, "a\x00b\x00"); got[len(got)-1] != "--query=ab" {
+		t.Errorf("promptArgv = %q, want the NUL bytes dropped", got)
+	}
+	if got, _ := resumeArgv(cmd, "sess-9", "\x00c"); got[len(got)-1] != "--query=c" {
+		t.Errorf("resumeArgv = %q, want the NUL bytes dropped", got)
+	}
+	if got := promptArgv([]string{"/stub"}, "d\x00"); got[len(got)-1] != "d" {
+		t.Errorf("promptArgv on a non -q command = %q, want the NUL byte dropped", got)
 	}
 }
 
@@ -2744,6 +2772,125 @@ esac`, turn2, turn1)), "-q")
 	}
 }
 
+// The task deadline firing while a follow-up's child runs kills that child
+// (the one timer spans every turn and finds run.proc set to turn 2's child),
+// names turn 2 in the terminal, and refuses the follow-up still queued.
+func TestCLI_DeadlineDuringAFollowUpTurn(t *testing.T) {
+	_, url := startServer(t)
+	dir := t.TempDir()
+	turn1, release, turn2, pidFile := filepath.Join(dir, "turn1"), filepath.Join(dir, "release"),
+		filepath.Join(dir, "turn2"), filepath.Join(dir, "pid2")
+	cmd := append(script(t, fmt.Sprintf(`case "$*" in
+*--resume*) echo $$ > %[3]s; touch %[4]s; exec sleep 30 ;;
+*) touch %[1]s; while [ ! -f %[2]s ]; do sleep 0.05; done; echo first; echo "session_id: sess-1" >&2 ;;
+esac`, turn1, release, pidFile, turn2)), "-q")
+	startBridgeConfig(t, Config{NATSURL: url, Command: cmd, TaskDeadline: 4 * time.Second,
+		KillGrace: 300 * time.Millisecond, Scope: capability.NamespaceScope("")}, nil)
+	c := gatewayClient(t, url)
+	origin := submit(t, c, "task-cli-deadline2", "q")
+	waitStarted(t, turn1)
+	sendSteer(t, c, origin, "second")
+	third := sendSteer(t, c, origin, "third")
+	waitFor(t, 10*time.Second, "two queued", func() bool { return len(steerNotices(t, url, origin.TaskID)) == 2 })
+	if err := os.WriteFile(release, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 10*time.Second, "turn 2 running", func() bool { _, err := os.Stat(turn2); return err == nil })
+	task := waitTerminal(t, c, origin.TaskID)
+	reason := terminalReason(t, task)
+	if task.State != lib.StateFailed || reason != "reason: deadline-exceeded - killed after 4s; turn: 2" {
+		t.Fatalf("state %s reason %q, want failed deadline-exceeded naming turn 2", task.State, reason)
+	}
+	raw, err := os.ReadFile(pidFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(raw)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := syscall.Kill(pid, 0); !errors.Is(err, syscall.ESRCH) {
+		t.Fatalf("turn 2's child %d outlived the deadline: kill -0 = %v", pid, err)
+	}
+	if got := artifactsNamed(t, url, origin.TaskID, lib.ArtifactTurn); !slices.Equal(got, []string{"first\n"}) {
+		t.Fatalf("turn answers = %q, want turn 1's", got)
+	}
+	ns := steerNotices(t, url, origin.TaskID)
+	if len(ns) != 3 || ns[2].EnvelopeID != third.EnvelopeID || ns[2].Reason != lib.SteerReasonTaskEnded ||
+		ns[2].seq > finalSeq(t, url, origin.TaskID) {
+		t.Fatalf("notices %+v, want the third refused task-ended before the terminal", ns)
+	}
+}
+
+// A NUL byte cannot ride in an argv string (exec refuses it), so the prompt
+// text loses it before it becomes the --query= token: a follow-up carrying
+// one runs as its turn rather than failing the task as spawn-failed.
+func TestCLI_FollowUpWithANulByteRunsAsATurn(t *testing.T) {
+	_, url := startServer(t)
+	cmd, started, release, args := resumeStub(t, 0, true)
+	startBridge(t, url, cmd)
+	c := gatewayClient(t, url)
+	origin := submit(t, c, "task-cli-nul", "long question")
+	waitStarted(t, started)
+	sendSteer(t, c, origin, "also\x00 east")
+	waitFor(t, 10*time.Second, "queued", func() bool { return len(steerNotices(t, url, origin.TaskID)) == 1 })
+	_ = os.WriteFile(release, nil, 0o600)
+	task := waitTerminal(t, c, origin.TaskID)
+	if task.State != lib.StateCompleted {
+		t.Fatalf("state %s reason %q", task.State, terminalReason(t, task))
+	}
+	raw, _ := os.ReadFile(args)
+	if want := "--query=long question\n--resume sess-1 --query=also east\n"; string(raw) != want {
+		t.Fatalf("argv per child:\n%q\nwant:\n%q", raw, want)
+	}
+	if got := artifactsNamed(t, url, origin.TaskID, lib.ArtifactResult); !slices.Equal(got, []string{"answer to also east\n"}) {
+		t.Fatalf("result = %q", got)
+	}
+}
+
+// steerQueueCapacity bounds the follow-ups a task runs in total, not the
+// ones waiting at one moment: a thread that sends one follow-up per turn,
+// each taken off the queue as its turn starts, still stops at the cap, and
+// the next is refused queue-full.
+func TestCLI_FollowUpsStopAtTheTaskCap(t *testing.T) {
+	_, url := startServer(t)
+	dir := t.TempDir()
+	args := filepath.Join(dir, "args")
+	cmd := append(script(t, fmt.Sprintf(`echo "$*" >> %[1]s
+n=$(wc -l < %[1]s | tr -d ' ')
+touch %[2]s/started-$n
+while [ ! -f %[2]s/release-$n ]; do sleep 0.02; done
+echo "answer $n"
+echo "session_id: sess-1" >&2`, args, dir)), "-q")
+	startBridge(t, url, cmd)
+	c := gatewayClient(t, url)
+	origin := submit(t, c, "task-cli-cap", "q")
+	for turn := 1; turn <= steerQueueCapacity+1; turn++ {
+		waitStarted(t, filepath.Join(dir, fmt.Sprintf("started-%d", turn)))
+		steer := sendSteer(t, c, origin, fmt.Sprintf("follow-up %d", turn))
+		waitFor(t, 10*time.Second, fmt.Sprintf("notice %d", turn), func() bool { return len(steerNotices(t, url, origin.TaskID)) == turn })
+		n := steerNotices(t, url, origin.TaskID)[turn-1]
+		want := lib.SteerNotice{Steer: lib.SteerQueued, EnvelopeID: steer.EnvelopeID}
+		if turn > steerQueueCapacity {
+			want = lib.SteerNotice{Steer: lib.SteerRefused, EnvelopeID: steer.EnvelopeID, Reason: lib.SteerReasonQueueFull}
+		}
+		if n.SteerNotice != want {
+			t.Fatalf("follow-up %d (none waiting, %d taken): notice %+v, want %+v", turn, turn-1, n.SteerNotice, want)
+		}
+		if err := os.WriteFile(filepath.Join(dir, fmt.Sprintf("release-%d", turn)), nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	task := waitTerminal(t, c, origin.TaskID)
+	if task.State != lib.StateCompleted {
+		t.Fatalf("state %s reason %q", task.State, terminalReason(t, task))
+	}
+	raw, _ := os.ReadFile(args)
+	if got := strings.Count(string(raw), "\n"); got != steerQueueCapacity+1 {
+		t.Fatalf("%d turns ran, want the opening turn plus %d follow-ups", got, steerQueueCapacity)
+	}
+}
+
 // Once the worker has closed the queue (no follow-up to run), a follow-up is
 // refused task-ending, before the terminal.
 func TestCLI_FollowUpAfterTheQueueClosesIsRefused(t *testing.T) {
@@ -2838,6 +2985,21 @@ func idleRun(t *testing.T, b *Bridge, taskID string) (*taskRun, *lib.Envelope) {
 	return run, steer
 }
 
+// finalText is a terminal's state and first text part, for a failure message.
+func finalText(final *lib.StatusUpdate) string {
+	if final == nil {
+		return "<none>"
+	}
+	if final.Status.Message == nil || len(final.Status.Message.Parts) == 0 {
+		return string(final.Status.State)
+	}
+	return fmt.Sprintf("%s %q", final.Status.State, final.Status.Message.Parts[0].Text)
+}
+
+// notStartedDeadline is the terminal of a task whose deadline was found
+// before a turn's spawn, at the 20s TaskDeadline those tests run with.
+const notStartedDeadline = "reason: deadline-exceeded - reached after 20s before the next turn started; no child was running"
+
 // Ruling: a follow-up turn never spawns once the task is canceled, past its
 // deadline (fired or not yet fired), or finalized; the follow-up it would
 // have run is refused task-ended exactly once, before the terminal.
@@ -2856,8 +3018,9 @@ func TestCLI_FollowUpTurnDoesNotSpawnAfterTheTaskStops(t *testing.T) {
 		reason     string
 	}{
 		{"canceled", func(run *taskRun) { run.canceled.Store(true) }, future, lib.StateCanceled, "reason: canceled-by-request"},
-		{"deadline-fired", func(run *taskRun) { run.deadlineHit.Store(true) }, future, lib.StateFailed, "reason: deadline-exceeded"},
-		{"deadline-passed", func(*taskRun) {}, time.Now().Add(-time.Second), lib.StateFailed, "reason: deadline-exceeded"},
+		// No child was running, so none was killed: the reason says so.
+		{"deadline-fired", func(run *taskRun) { run.deadlineHit.Store(true) }, future, lib.StateFailed, notStartedDeadline},
+		{"deadline-passed", func(*taskRun) {}, time.Now().Add(-time.Second), lib.StateFailed, notStartedDeadline},
 		{"finalized", func(run *taskRun) { b.finalize(run, lib.StateFailed, shutdownReason, nil) }, future, lib.StateFailed, shutdownReason},
 	}
 	for _, tc := range cases {
@@ -2883,7 +3046,7 @@ func TestCLI_FollowUpTurnDoesNotSpawnAfterTheTaskStops(t *testing.T) {
 			}
 			if final == nil || final.Status.State != tc.state || final.Status.Message == nil ||
 				!strings.HasPrefix(final.Status.Message.Parts[0].Text, tc.reason) {
-				t.Fatalf("terminal %+v, want %s %q", final, tc.state, tc.reason)
+				t.Fatalf("terminal %s, want %s %q", finalText(final), tc.state, tc.reason)
 			}
 			ns := steerNotices(t, url, taskID)
 			if len(ns) != 1 || ns[0].EnvelopeID != steer.EnvelopeID || ns[0].Reason != lib.SteerReasonTaskEnded ||
@@ -2949,8 +3112,8 @@ func TestCLI_FirstTurnDoesNotSpawnPastTheDeadline(t *testing.T) {
 				}
 			}
 			if final == nil || final.Status.State != lib.StateFailed || final.Status.Message == nil ||
-				!strings.HasPrefix(final.Status.Message.Parts[0].Text, "reason: deadline-exceeded") {
-				t.Fatalf("terminal %+v, want failed deadline-exceeded", final)
+				final.Status.Message.Parts[0].Text != notStartedDeadline {
+				t.Fatalf("terminal %s, want failed %q", finalText(final), notStartedDeadline)
 			}
 		})
 	}

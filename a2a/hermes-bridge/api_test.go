@@ -1045,6 +1045,50 @@ func TestAPI_CancelDuringAFollowUpTurn(t *testing.T) {
 	}
 }
 
+// The task deadline landing while a follow-up's request is in flight ends
+// that request, and the terminal names the turn it ended (finalizeAPIError's
+// deadline arm), as the in-band failure arms do.
+func TestAPI_DeadlineDuringAFollowUpTurn(t *testing.T) {
+	_, url := startServer(t)
+	release, gone := make(chan struct{}), make(chan struct{})
+	var n atomic.Int32
+	stub := newAPIStub(t, func(w http.ResponseWriter, r *http.Request, c apiCall) {
+		if n.Add(1) == 1 {
+			<-release
+			writeCompletion(w, c.sessionID, "first")
+			return
+		}
+		<-r.Context().Done() // turn 2 runs until the bridge ends the request
+		close(gone)
+	})
+	startAPIBridge(t, url, stub, func(cfg *Config) { cfg.TaskDeadline = 4 * time.Second })
+	c := gatewayClient(t, url)
+	origin := submitIn(t, c, "task-api-deadline2", "ctx-deadline2", "q")
+	waitFor(t, 10*time.Second, "turn 1 in flight", func() bool { return len(stub.seen()) == 1 })
+	sendSteer(t, c, origin, "second")
+	third := sendSteer(t, c, origin, "third")
+	waitFor(t, 10*time.Second, "two queued", func() bool { return len(steerNotices(t, url, origin.TaskID)) == 2 })
+	close(release)
+	task := waitTerminal(t, c, origin.TaskID)
+	if reason := terminalReason(t, task); task.State != lib.StateFailed ||
+		reason != "reason: deadline-exceeded - request ended after 4s; turn: 2" {
+		t.Fatalf("state %s reason %q, want failed deadline-exceeded naming turn 2", task.State, reason)
+	}
+	select {
+	case <-gone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("turn 2's request outlived the deadline")
+	}
+	if got := len(stub.seen()); got != 2 {
+		t.Fatalf("%d requests, want turn 1 and turn 2", got)
+	}
+	ns := steerNotices(t, url, origin.TaskID)
+	if len(ns) != 3 || ns[2].EnvelopeID != third.EnvelopeID || ns[2].Reason != lib.SteerReasonTaskEnded ||
+		ns[2].seq > finalSeq(t, url, origin.TaskID) {
+		t.Fatalf("notices %+v, want the third refused task-ended before the terminal", ns)
+	}
+}
+
 // Once the worker has chosen the current answer as the deliverable, a
 // follow-up is refused task-ending, not queued behind the terminal.
 func TestAPI_FollowUpAfterTheQueueClosesIsRefused(t *testing.T) {
