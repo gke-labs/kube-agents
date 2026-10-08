@@ -166,27 +166,38 @@ class NewVersion(Base):
 
     def test_a_version_none_of_whose_clusters_were_graded_is_written_but_not_recorded(self) -> None:
         readiness = envelope(
-            [member("a", "lagging", readiness="unknown")],
+            [],
             errors=[{"project": "p1", "location": "us-central1-a", "cluster": "a", "message": "get-credentials failed: 403"}],
         )
         sandbox = FakeSandbox(envelope([member("a", "lagging")]), readiness)
         code, out = self.run_tick(sandbox)
         self.assertEqual(code, 0)
-        self.assertIn(f"new target version {TARGET}, 1 cluster(s) pending (a): none graded (readiness reads failed)", out)
+        self.assertIn(f"new target version {TARGET}, 1 cluster(s) pending (a): none graded (the readiness run returned none of them)", out)
         self.assertIn("retrying tomorrow", out)
         self.assertNotIn("0 blocked", out)
         self.assertIsNone(self.ledger()["targets"][TARGET]["last_report_at"])
         text = (self.home / "reports" / TARGET / "latest.md").read_text()
-        self.assertIn("1 not graded (p1/us-central1-a/a; their reads failed)", text)
+        self.assertIn("1 not read (p1/us-central1-a/a; the run returned nothing for them)", text)
         self.assertIn("Reads that failed during this run", text)
         self.assertIn("- p1/us-central1-a/a: get-credentials failed: 403", text)
 
+    def test_an_unknown_verdict_is_graded_and_recorded_not_retried(self) -> None:
+        readiness = envelope([member("a", "lagging", readiness="unknown")])
+        sandbox = FakeSandbox(envelope([member("a", "lagging")]), readiness)
+        code, out = self.run_tick(sandbox)
+        self.assertEqual(code, 0)
+        self.assertIn("0 blocked, 0 ready, 1 unknown;", out)
+        self.assertNotIn("retrying tomorrow", out)
+        self.assertEqual(self.ledger()["targets"][TARGET]["last_report_at"], NOW.isoformat())
+        text = (self.home / "reports" / TARGET / "latest.md").read_text()
+        self.assertIn("1 unknown (p1/us-central1-a/a; the table says what it could not decide)", text)
+
     def test_a_partly_graded_version_counts_the_ungraded_clusters_in_the_line(self) -> None:
-        readiness = envelope([member("a", "lagging", readiness="ready"), member("b", "lagging", readiness="unknown")])
+        readiness = envelope([member("a", "lagging", readiness="ready")])
         sandbox = FakeSandbox(envelope([member("a", "lagging"), member("b", "lagging")]), readiness)
         code, out = self.run_tick(sandbox)
         self.assertEqual(code, 0)
-        self.assertIn("0 blocked, 1 ready, 1 not graded;", out)
+        self.assertIn("0 blocked, 1 ready, 1 not read;", out)
         self.assertEqual(self.ledger()["targets"][TARGET]["last_report_at"], NOW.isoformat())
 
     def test_readiness_runs_once_per_project_and_a_failed_project_leaves_only_its_clusters_ungraded(self) -> None:
@@ -348,13 +359,15 @@ class Failures(Base):
         self.assertEqual((self.home / watch.LEDGER_FILE_NAME).read_text(), '{"something": "else"}')
 
     def test_a_malformed_entry_in_the_ledger_is_refused_not_overwritten(self) -> None:
-        self.home.mkdir(parents=True)
-        (self.home / watch.LEDGER_FILE_NAME).write_text(json.dumps({"targets": {TARGET: "x"}}))
-        sandbox = FakeSandbox(envelope([member("a", "lagging")]))
-        code, out = self.run_tick(sandbox)
-        self.assertEqual(code, 0)
-        self.assertIn(f"has a malformed entry for {TARGET}; refusing to overwrite it", out)
-        self.assertEqual(sandbox.calls, [])
+        for bad in ("x", {"pending": ["p1/l/a"], "last_report_at": 5}, {"pending": ["p1/l/a"], "last_report_at": ["2026-10-01"]}, {"pending": "p1/l/a"}):
+            with self.subTest(entry=bad):
+                self.home.mkdir(parents=True, exist_ok=True)
+                (self.home / watch.LEDGER_FILE_NAME).write_text(json.dumps({"targets": {TARGET: bad}}))
+                sandbox = FakeSandbox(envelope([member("a", "lagging")]))
+                code, out = self.run_tick(sandbox)
+                self.assertEqual(code, 0)
+                self.assertIn(f"has a malformed entry for {TARGET}; refusing to overwrite it", out)
+                self.assertEqual(sandbox.calls, [])
 
     def test_no_resolvable_project_fails_closed(self) -> None:
         def unset(argv, *, timeout, check, stdin=None):
