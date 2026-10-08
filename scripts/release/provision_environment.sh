@@ -380,8 +380,8 @@ echo "==> Provisioning the environment at the candidate commit via canonical ins
 # mode, so the switch is the same merge patch the next-mode dev clusters were
 # installed with. The install's --mode flag (#2524) replaces the patch once it
 # merges: that installer takes PLATFORM_AGENT_MODE from the environment this
-# script leaves it exported in under `next`, or from the install.env the
-# deploy workflow's lease check renders for a long-lived environment, so the
+# script leaves it exported in under `next` (only rc and nightly get here
+# with it; the long-lived environments are refused above), so the
 # platform_agent_mode_patch_next call below is then the one line to delete
 # (with this paragraph's patch sentences). The wait stays either way.
 #

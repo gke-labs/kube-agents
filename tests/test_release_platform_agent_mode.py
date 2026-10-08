@@ -246,57 +246,96 @@ class WorkflowsCarryTheModeTest(unittest.TestCase):
 
     def test_the_scripts_get_the_input_under_the_installers_name(self):
         deploy = _workflow("deploy-environment.yml")
-        for step in ("Provision Environment in GCP", "Refuse while somebody is live-testing"):
-            with self.subTest(step=step):
-                env = _step(deploy, "deploy-environment", step)["env"]
-                self.assertEqual(env["PLATFORM_AGENT_MODE"], "${{ inputs.mode }}")
+        env = _step(deploy, "deploy-environment", "Provision Environment in GCP")["env"]
+        self.assertEqual(env["PLATFORM_AGENT_MODE"], "${{ inputs.mode }}")
         e2e = _workflow("e2e-run.yml")
         env = _step(e2e, "run-e2e", "Connect to GKE & Wait for Pod Readiness")["env"]
         self.assertEqual(env["PLATFORM_AGENT_MODE"], "${{ inputs.mode }}")
 
-    def test_every_step_the_mode_adds_is_skipped_for_today_and_for_empty(self):
-        """'' is today to the scripts, so the workflows read it the same way."""
-        cases = (
-            ("deploy-environment.yml", "deploy-environment",
-             ("Check the PlatformAgent mode", "Confirm the candidate can install the mode")),
-            ("e2e-run.yml", "run-e2e", ("Confirm the candidate can gate the mode",)),
-        )
-        for workflow, job, steps in cases:
-            doc = _workflow(workflow)
-            for name in steps:
-                with self.subTest(workflow=workflow, step=name):
-                    self.assertEqual(
-                        _step(doc, job, name)["if"],
-                        "inputs.mode != 'today' && inputs.mode != ''",
-                    )
+    def test_the_lease_check_renders_no_mode(self):
+        """It runs only on autopush and staging, where next is refused, so a mode there is dead."""
+        env = _step(_workflow("deploy-environment.yml"), "deploy-environment",
+                    "Refuse while somebody is live-testing")["env"]
+        self.assertNotIn("PLATFORM_AGENT_MODE", env)
 
-    def _run_mode_check(self, mode, target):
-        step = _step(_workflow("deploy-environment.yml"), "deploy-environment", "Check the PlatformAgent mode")
-        self.assertEqual(step["env"]["TARGET"], "${{ inputs.github_environment }}")
-        return subprocess.run(
-            ["bash", "-e", "-c", step["run"]], capture_output=True, text=True,
-            env={"PATH": "/usr/bin:/bin", "MODE": mode, "TARGET": target},
+    _CHECKS = (
+        ("deploy-environment.yml", "deploy-environment"),
+        ("e2e-run.yml", "run-e2e"),
+    )
+
+    def test_the_mode_check_always_runs(self):
+        """GitHub expressions compare strings case-insensitively, so no `if:` may
+        decide whether the value is checked: `TODAY` would skip it and reach the
+        candidate's exact-match check only after checkout, auth and setup."""
+        for workflow, job in self._CHECKS:
+            with self.subTest(workflow=workflow):
+                step = _step(_workflow(workflow), job, "Check the PlatformAgent mode")
+                self.assertNotIn("if", step)
+                self.assertEqual(step["id"], "mode")
+
+    def test_the_steps_only_next_needs_are_gated_on_the_checked_value(self):
+        cases = (
+            ("deploy-environment.yml", "deploy-environment", "Confirm the candidate can install the mode"),
+            ("e2e-run.yml", "run-e2e", "Confirm the candidate can gate the mode"),
         )
+        for workflow, job, name in cases:
+            with self.subTest(workflow=workflow):
+                self.assertEqual(_step(_workflow(workflow), job, name)["if"],
+                                 "steps.mode.outputs.next == 'true'")
+
+    def _run_mode_check(self, mode, target="rc", workflow="deploy-environment.yml", job="deploy-environment"):
+        step = _step(_workflow(workflow), job, "Check the PlatformAgent mode")
+        self.assertEqual(step["env"]["MODE"], "${{ inputs.mode }}")
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        output = pathlib.Path(tmp.name) / "github_output"
+        output.write_text("")
+        proc = subprocess.run(
+            ["bash", "-e", "-c", step["run"]], capture_output=True, text=True,
+            env={"PATH": "/usr/bin:/bin", "MODE": mode, "TARGET": target, "GITHUB_OUTPUT": str(output)},
+        )
+        return proc, output.read_text()
+
+    def test_today_and_empty_pass_the_check_as_today(self):
+        for workflow, job in self._CHECKS:
+            for value in ("", "today"):
+                with self.subTest(workflow=workflow, value=value):
+                    proc, output = self._run_mode_check(value, workflow=workflow, job=job)
+                    self.assertEqual(proc.returncode, 0, proc.stdout)
+                    self.assertEqual(output, "next=false\n")
+
+    def test_a_value_that_is_not_exactly_a_mode_stops_at_the_first_step(self):
+        for workflow, job in self._CHECKS:
+            for value in ("TODAY", "Today", "Next", "NEXT", "nxt", "today "):
+                with self.subTest(workflow=workflow, value=value):
+                    proc, output = self._run_mode_check(value, workflow=workflow, job=job)
+                    self.assertEqual(proc.returncode, 1)
+                    self.assertIn("::error title=Not a PlatformAgent mode::", proc.stdout)
+                    self.assertEqual(output, "")
 
     def test_the_mode_check_refuses_next_on_the_long_lived_environments(self):
-        for target in ("autopush", "staging"):
+        """The sibling guards match these names case-insensitively, so this does too."""
+        step = _step(_workflow("deploy-environment.yml"), "deploy-environment", "Check the PlatformAgent mode")
+        self.assertEqual(step["env"]["TARGET"], "${{ inputs.github_environment }}")
+        for target in ("autopush", "staging", "Staging", "AUTOPUSH"):
             with self.subTest(target=target):
-                proc = self._run_mode_check("next", target)
+                proc, output = self._run_mode_check("next", target)
                 self.assertEqual(proc.returncode, 1)
                 self.assertIn("::error title=spec.mode next is for the ephemeral environments::", proc.stdout)
+                self.assertEqual(output, "")
 
     def test_the_mode_check_accepts_next_on_the_ephemeral_environments(self):
         for target in ("rc", "nightly"):
             with self.subTest(target=target):
-                proc = self._run_mode_check("next", target)
+                proc, output = self._run_mode_check("next", target)
                 self.assertEqual(proc.returncode, 0, proc.stdout)
+                self.assertEqual(output, "next=true\n")
+        proc, output = self._run_mode_check("next", workflow="e2e-run.yml", job="run-e2e")
+        self.assertEqual((proc.returncode, output), (0, "next=true\n"), proc.stdout)
 
-    def test_the_mode_check_refuses_a_value_that_is_not_a_mode(self):
-        for value in ("Next", "nxt", "TODAY"):
-            with self.subTest(value=value):
-                proc = self._run_mode_check(value, "rc")
-                self.assertEqual(proc.returncode, 1)
-                self.assertIn("::error title=Not a PlatformAgent mode::", proc.stdout)
+    def test_the_e2e_mode_check_runs_before_the_checkout(self):
+        steps = [s.get("name") for s in _workflow("e2e-run.yml")["jobs"]["run-e2e"]["steps"]]
+        self.assertLess(steps.index("Check the PlatformAgent mode"), steps.index("Checkout Repository"))
 
     def test_the_mode_value_is_checked_before_the_checkout(self):
         steps = [s.get("name") for s in _workflow("deploy-environment.yml")["jobs"]["deploy-environment"]["steps"]]

@@ -84,6 +84,25 @@ jobs:
     env:
       CLOUDSDK_PYTHON: "/usr/bin/python3"
     steps:
+      # First, and unconditional: a GitHub expression compares strings
+      # case-insensitively, so an `if:` on the input would let `TODAY` through
+      # to the candidate's exact-match check after the setup below. Exactly '',
+      # `today` and `next` pass; '' is today, as it is to the scripts. The
+      # steps only `next` needs read this step's `next` output.
+      - name: Check the PlatformAgent mode
+        id: mode
+        env:
+          MODE: ${{ inputs.mode }}
+        run: |
+          case "${MODE}" in
+            "" | today) echo "next=false" >> "${GITHUB_OUTPUT}" ;;
+            next) echo "next=true" >> "${GITHUB_OUTPUT}" ;;
+            *)
+              echo "::error title=Not a PlatformAgent mode::mode is '${MODE}'. The PlatformAgent's spec.mode takes exactly today or next, lowercase; pass one of those, or leave the input unset for today."
+              exit 1
+              ;;
+          esac
+
       - name: Checkout Repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -120,9 +139,10 @@ jobs:
 
       # The readiness script is the candidate's, and one older than
       # platform_agent_mode.sh ignores PLATFORM_AGENT_MODE, so `next` would
-      # run the suites without its gate. Skipped for `today`.
+      # run the suites without its gate. Skipped unless the mode check passed
+      # `next`.
       - name: Confirm the candidate can gate the mode
-        if: inputs.mode != 'today' && inputs.mode != ''
+        if: steps.mode.outputs.next == 'true'
         env:
           MODE: ${{ inputs.mode }}
         run: |

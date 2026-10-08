@@ -124,30 +124,45 @@ jobs:
 
       # Also before the checkout, and for the same reason. A `workflow_call`
       # input is a free string, so this is where a caller's typo stops; the
-      # dispatch form offers the two values only. Skipped for `today` and for
-      # an empty input, which the scripts also read as today.
+      # dispatch form offers the two values only.
       #
-      # `next` is refused on autopush and staging. On a long-lived cluster the
-      # patched spec.mode outlives the run: the chart renders none and the
-      # installer does not read the key, so no upgrade, reconcile or drift
-      # report sees it, and Google Chat stays on the A2A gateway until a
-      # `today` rebuild. provision_environment.sh refuses it as well.
+      # Unconditional, and matched in shell. A GitHub expression compares
+      # strings case-insensitively, so an `if:` on the input would skip this
+      # for `TODAY` and let it reach the candidate's exact-match check only
+      # after the checkout, auth and setup. Exactly '', `today` and `next`
+      # pass; '' is today, as it is to the scripts. The steps only `next`
+      # needs read this step's `next` output rather than the input.
+      #
+      # `next` is refused on autopush and staging, matched case-insensitively
+      # like the two guards above. On a long-lived cluster the patched
+      # spec.mode outlives the run: the chart renders none and the installer
+      # does not read the key, so no upgrade, reconcile or drift report sees
+      # it, and Google Chat stays on the A2A gateway until a `today` rebuild.
+      # provision_environment.sh refuses it as well.
       - name: Check the PlatformAgent mode
-        if: inputs.mode != 'today' && inputs.mode != ''
+        id: mode
         env:
           MODE: ${{ inputs.mode }}
           TARGET: ${{ inputs.github_environment }}
         run: |
-          if [ "${MODE}" != "next" ]; then
-            echo "::error title=Not a PlatformAgent mode::mode is '${MODE}'. The PlatformAgent's spec.mode takes today or next; pass one of those, or leave the input unset for today."
-            exit 1
-          fi
-          case "${TARGET}" in
+          case "${MODE}" in
+            "" | today)
+              echo "next=false" >> "${GITHUB_OUTPUT}"
+              exit 0
+              ;;
+            next) ;;
+            *)
+              echo "::error title=Not a PlatformAgent mode::mode is '${MODE}'. The PlatformAgent's spec.mode takes exactly today or next, lowercase; pass one of those, or leave the input unset for today."
+              exit 1
+              ;;
+          esac
+          case "$(printf '%s' "${TARGET}" | tr '[:upper:]' '[:lower:]')" in
             autopush | staging)
               echo "::error title=spec.mode next is for the ephemeral environments::Refusing mode next on '${TARGET}', a long-lived environment: nothing that later moves it knows about the patched mode, so it would stay next, with Google Chat on the A2A gateway, until a today rebuild. Use rc or nightly for next."
               exit 1
               ;;
           esac
+          echo "next=true" >> "${GITHUB_OUTPUT}"
           echo "==> Installing with spec.mode: ${MODE}."
 
       - name: Checkout repository
@@ -178,10 +193,10 @@ jobs:
       # The scripts below are the candidate's, and a candidate older than
       # platform_agent_mode.sh ignores PLATFORM_AGENT_MODE: it would install
       # `today` and the run would report `next` validated. Refused here, before
-      # the teardown, rather than discovered from the tests. Skipped for
-      # `today`, which every candidate installs.
+      # the teardown, rather than discovered from the tests. Skipped unless
+      # the mode check passed `next`; every candidate installs today.
       - name: Confirm the candidate can install the mode
-        if: inputs.mode != 'today' && inputs.mode != ''
+        if: steps.mode.outputs.next == 'true'
         env:
           MODE: ${{ inputs.mode }}
         run: |
@@ -248,9 +263,11 @@ jobs:
           GCP_REGION: ${{ vars.GCP_REGION }}
           GKE_CLUSTER_NAME: ${{ vars.GKE_CLUSTER_NAME }}
           NAMESPACE: ${{ vars.NAMESPACE }}
-          # So the install.env rendered here records a `next` the provision
-          # step below is asked for; `today` renders no key.
-          PLATFORM_AGENT_MODE: ${{ inputs.mode }}
+          # No PLATFORM_AGENT_MODE here. This step runs only on autopush and
+          # staging, where the mode check refuses `next`, so the only values
+          # that could reach it render no key anyway. The reconcile path
+          # (reconcile-environment.yml) is the one that carries the key into a
+          # long-lived environment's install.env, from vars.PLATFORM_AGENT_MODE.
         run: |
           set -euo pipefail
           # The workspace here is the CANDIDATE's tree (see the checkout step
