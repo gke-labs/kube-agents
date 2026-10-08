@@ -202,7 +202,13 @@ chat line says "none graded" and the version is tried again tomorrow), and the
 weekly comparison carries ten minutes of slack so the tick's own drift cannot
 push a refresh to day eight. A partial table or an ungraded version is
 announced once, not daily: the ledger keeps what was announced and the next
-line is the recovery. The three
+line is the recovery. A version none of whose clusters can be read is retried
+three days running and then recorded, so an unreachable cluster costs its
+project one readiness sweep a week rather than one a day; a `blocked` verdict
+the script grades from cluster metadata stands even when the kubectl read
+failed. A hand run in the container finds the ticker's ledger under the
+platform profile, as `feedback-prompt` does, rather than starting a second one
+at the gateway's home. The three
 environment knobs (`UPGRADE_READINESS_REFRESH_DAYS`, `_PROJECTS`,
 `_WATCH_HOME`) are for a run started by hand in the pod; the operator's
 `spec.deployment.env` allowlist does not carry them.

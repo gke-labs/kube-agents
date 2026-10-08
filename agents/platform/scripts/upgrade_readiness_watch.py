@@ -19,9 +19,13 @@ but only on a tick whose version table read every project: a partial table
 retires nothing, so a failed listing cannot erase a version and have it come
 back as new. A report whose readiness reads graded none of a version's
 pending clusters is written but not recorded, and the version is tried again
-the next day; a cluster the script graded ``unknown`` counts as graded, since
-that is a verdict with its reason in the table, and only a cluster the run
-returned nothing for is "not read". A tick with nothing due prints nothing.
+the next day, up to ``UNGRADED_ATTEMPTS_BEFORE_WEEKLY`` days in a row, after
+which it is recorded as reported so an unreachable cluster costs its project
+one sweep a week rather than one a day; a cluster the script graded
+``unknown`` counts as graded, since that is a verdict with its reason in the
+table; "not read" is a cluster whose kubectl read failed (the script lists it
+under ``errors`` and grades it ``unknown``) or that the run returned nothing
+for, and a ``blocked`` verdict stands whatever the kubectl read did. A tick with nothing due prints nothing.
 
 Which clusters. The projects come from this pod, not from the sandbox:
 ``UPGRADE_READINESS_PROJECTS`` when set, otherwise the management project
@@ -100,6 +104,10 @@ import sandbox_exec  # noqa: E402
 # Where the job keeps its ledger and reports, under the agent home.
 HOME_ENV = "HERMES_HOME"
 DEFAULT_HOME = "/opt/data"
+# Under the ticker HERMES_HOME is the platform profile home; in a shell in the
+# container it is the gateway's home, and the profile is a directory under it
+# (feedback_prompt.py resolves the same two cases).
+PROFILE_HOME = Path("profiles") / "platform"
 WATCH_HOME_ENV = "UPGRADE_READINESS_WATCH_HOME"
 WATCH_DIR_NAME = "upgrade-readiness"
 LEDGER_FILE_NAME = "ledger.json"
@@ -189,6 +197,8 @@ LAST_TICK_KEY = "last_tick"
 ANNOUNCED_KEY = "announced"
 ANNOUNCED_PARTIAL_KEY = "partial"
 ANNOUNCED_UNGRADED_KEY = "ungraded"
+DETAIL_KEY = "detail"
+ATTEMPTS_KEY = "attempts"
 REASON_NEW = "new target version"
 REASON_REFRESH = "scheduled refresh"
 
@@ -212,7 +222,9 @@ UNGRADED_LINE = (
 )
 UNKNOWN_COUNT = ", {count} unknown"
 UNREAD_COUNT = ", {count} not read"
-READS_FAILED_DETAIL = "the readiness run returned none of them"
+READS_FAILED_DETAIL = "their kubectl read failed or the run returned nothing for them"
+UNGRADED_ATTEMPTS_BEFORE_WEEKLY = 3
+UNGRADED_PARKED_DETAIL = "{detail}; not graded on {attempts} consecutive days, next attempt at the weekly refresh"
 PROJECT_RUN_FAILED_DETAIL = "readiness run for {project} failed: {error}"
 TIMED_OUT_DETAIL = "the sandbox run timed out after {seconds}s"
 DRY_RUN_WOULD_REPORT = "dry run: would report {version} ({reason}) for {names}"
@@ -255,11 +267,20 @@ def refresh_days() -> int:
     return value if value > 0 else REFRESH_DAYS_DEFAULT
 
 
+def profile_home() -> Path:
+    """The platform profile's home: HERMES_HOME itself under the ticker, or the
+    profile directory beneath it from a shell in the container, so a hand run
+    and the scheduled tick share one ledger."""
+    home = Path(os.environ.get(HOME_ENV, DEFAULT_HOME))
+    beneath = home / PROFILE_HOME
+    return beneath if beneath.is_dir() else home
+
+
 def watch_home() -> Path:
     override = os.environ.get(WATCH_HOME_ENV, "").strip()
     if override:
         return Path(override)
-    return Path(os.environ.get(HOME_ENV, DEFAULT_HOME)) / WATCH_DIR_NAME
+    return profile_home() / WATCH_DIR_NAME
 
 
 # --- which projects ----------------------------------------------------------
@@ -456,7 +477,27 @@ def load_ledger(path: Path) -> dict:
         )
         if not shape_ok:
             raise RuntimeError(f"ledger at {path} has a malformed entry for {version}; refusing to overwrite it")
+    block = data.get(ANNOUNCED_KEY)
+    if block is not None and not announced_shape_ok(block):
+        raise RuntimeError(f"ledger at {path} has a malformed {ANNOUNCED_KEY} block; refusing to overwrite it")
     return data
+
+
+def announced_shape_ok(block: object) -> bool:
+    if not isinstance(block, dict):
+        return False
+    partial = block.get(ANNOUNCED_PARTIAL_KEY)
+    if partial is not None and not isinstance(partial, str):
+        return False
+    ungraded = block.get(ANNOUNCED_UNGRADED_KEY)
+    if ungraded is None:
+        return True
+    if not isinstance(ungraded, dict):
+        return False
+    return all(
+        isinstance(entry, dict) and isinstance(entry.get(DETAIL_KEY), str) and isinstance(entry.get(ATTEMPTS_KEY), int)
+        for entry in ungraded.values()
+    )
 
 
 def save_ledger(path: Path, ledger: dict) -> None:
@@ -503,15 +544,20 @@ def readiness_verdicts(report: dict, clusters: list[str]) -> tuple[list[str], li
     member key. ``unknown`` is a verdict the script gave (an exclusion or a pool
     it could not decide) and counts as graded; ``unread`` is a cluster the run
     returned no member for, or one whose kubectl read the report lists under
-    ``errors`` (the script still appends such a member, graded unknown)."""
+    ``errors`` and that the script graded ``unknown`` for want of that read. A
+    ``blocked`` verdict stands whatever the kubectl read did: the script grades
+    a covering exclusion or blocking skew from cluster metadata and says a
+    definite blocker beats an unknown."""
     wanted = set(clusters)
     failed_reads = {member_key(error) for error in report.get(ERRORS_KEY) or [] if error.get(MEMBER_ID_KEYS[-1])}
     buckets: dict[str, list[str]] = {READINESS_BLOCKED: [], READINESS_READY: [], READINESS_UNKNOWN: []}
     for member in report.get(MEMBERS_KEY) or []:
         key = member_key(member)
-        if key not in wanted or key in failed_reads:
+        if key not in wanted:
             continue
         status = (member.get(READINESS_KEY) or {}).get(STATUS_KEY)
+        if key in failed_reads and status != READINESS_BLOCKED:
+            continue
         if status in buckets:
             buckets[status].append(key)
     seen = {k for keys in buckets.values() for k in keys}
@@ -569,7 +615,7 @@ def render_markdown(version: str, reason: str, clusters: list[str], envelope: di
         + (f" ({', '.join(blocked)})" if blocked else "")
         + f", {len(ready)} ready"
         + (f", {len(unknown)} unknown ({', '.join(unknown)}; the table says what it could not decide)" if unknown else "")
-        + (f" and {len(unread)} not read ({', '.join(unread)}; the run returned nothing for them)" if unread else "")
+        + (f" and {len(unread)} not read ({', '.join(unread)}; their kubectl read failed or the run returned nothing for them)" if unread else "")
         + ". "
         f"The next scheduled refresh is after {(now + timedelta(days=days)).strftime(DATE_FORMAT)} "
         "while any cluster is still pending; ask the Platform Agent for the report at any time to refresh it sooner.",
@@ -655,14 +701,22 @@ def tick(dry_run: bool = False) -> list[str]:
                 failed_projects = sorted({project_of(k) for k in clusters} & set(failures))
                 detail = "; ".join(PROJECT_RUN_FAILED_DETAIL.format(project=p, error=failures[p]) for p in failed_projects) or READS_FAILED_DETAIL
                 ungraded_announced = announced(ledger).setdefault(ANNOUNCED_UNGRADED_KEY, {})
-                if ungraded_announced.get(version) != detail:
+                previous = ungraded_announced.get(version) or {}
+                attempts = (previous.get(ATTEMPTS_KEY) or 0) + 1
+                parked = attempts >= UNGRADED_ATTEMPTS_BEFORE_WEEKLY
+                shown = UNGRADED_PARKED_DETAIL.format(detail=detail, attempts=attempts) if parked else detail
+                if previous.get(DETAIL_KEY) != detail or parked:
                     lines.append(
                         UNGRADED_LINE.format(
                             prefix=LINE_PREFIX, reason=reason, version=version, pending=len(clusters),
-                            names=cluster_names(clusters), detail=detail, path=path,
+                            names=cluster_names(clusters), detail=shown, path=path,
                         )
                     )
-                ungraded_announced[version] = detail
+                if parked:
+                    ledger[TARGETS_KEY][version][LAST_REPORT_KEY] = iso(now)
+                    ungraded_announced.pop(version, None)
+                else:
+                    ungraded_announced[version] = {DETAIL_KEY: detail, ATTEMPTS_KEY: attempts}
                 continue
             announced(ledger).get(ANNOUNCED_UNGRADED_KEY, {}).pop(version, None)
             ledger[TARGETS_KEY][version][LAST_REPORT_KEY] = iso(now)
