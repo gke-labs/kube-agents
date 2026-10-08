@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Walk the pool's free projects through Boskos, holding each for one visit.
 
-Shared by the periodics that touch every pool project from outside any run:
-the pull-request sweep (ci_sweep_agent_pulls.py) and the fleet reconcile
-(fleet_reconcile.py). Each acquires a project out of `free` into its own hold
+Shared by the out-of-band jobs and periodics that touch every pool project
+from outside any run: the pull-request sweep (ci_sweep_agent_pulls.py),
+the compute plants sweep (ci_sweep_compute_plants.py), and the fleet reconcile
+(fleet_reconcile.py). Each acquires a project out of `free` into a hold
 state, visits it, and releases it back, so a project a run holds is never
 touched and a run arriving mid-visit waits at its own acquire. No listing
 endpoint is needed and no run's state is read.

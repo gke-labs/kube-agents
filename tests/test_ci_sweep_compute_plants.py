@@ -641,7 +641,7 @@ class SweepProjectTest(unittest.TestCase):
         self.assertEqual(res["networks"], ["bench-vpc-old"])
 
         delete_cmds = [cmd for cmd in commands_run if "delete" in cmd]
-        deleted_names = [cmd[4] for cmd in delete_cmds]
+        deleted_names = [cmd[cmd.index("delete") + 1] for cmd in delete_cmds]
         self.assertIn("bench-addr-west", deleted_names)
         self.assertNotIn("bench-addr-east", deleted_names)
 
@@ -1094,6 +1094,9 @@ class MainCliTest(unittest.TestCase):
         patch_reset = mock.patch.object(sweep, "boskos_reset_stranded")
         patch_reset.start()
         self.addCleanup(patch_reset.stop)
+        patch_pool = mock.patch.object(sweep, "pool_projects", return_value={"proj-1"})
+        patch_pool.start()
+        self.addCleanup(patch_pool.stop)
 
     def tearDown(self):
         for sig, handler in self._orig_signals.items():
@@ -1217,6 +1220,29 @@ class MainCliTest(unittest.TestCase):
             code = sweep.main(["--project", "proj-1", "--dry-run", "--max-age-hours", "2.5"])
             self.assertEqual(code, 0)
             mock_sp.assert_called_once_with("proj-1", max_age_hours=2.5, dry_run=True)
+
+    def test_project_mode_unmapped_project_refuses_without_acquire_or_sweep(self):
+        with tempfile.NamedTemporaryFile("w", delete=False) as tf:
+            report_path = tf.name
+
+        try:
+            with (
+                mock.patch.object(sweep, "pool_projects", return_value={"proj-1"}),
+                mock.patch.object(sweep.boskos_pool, "acquire") as mock_acquire,
+                mock.patch.object(sweep, "sweep_project") as mock_sp,
+            ):
+                code = sweep.main(["--project", "p-outside", "--report", report_path])
+                self.assertEqual(code, 1)
+                mock_acquire.assert_not_called()
+                mock_sp.assert_not_called()
+                data = json.loads(pathlib.Path(report_path).read_text(encoding="utf-8"))
+                self.assertEqual(data["exit"], "failed")
+                self.assertEqual(
+                    data["failures"]["p-outside"],
+                    f"project p-outside is not mapped in {sweep.CI_DEPLOY_SCRIPT}",
+                )
+        finally:
+            pathlib.Path(report_path).unlink(missing_ok=True)
 
     def test_project_mode_not_free_in_boskos_refuses(self):
         with tempfile.NamedTemporaryFile("w", delete=False) as tf:

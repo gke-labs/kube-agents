@@ -78,6 +78,7 @@ Terminated = boskos_pool.Terminated
 CI_DEPLOY_SCRIPT = pathlib.Path(__file__).resolve().parent / "ci-deploy.sh"
 MAPPING_FUNCTION = "gitops_repo_for_project"
 MAPPING_LINE_RE = re.compile(r'^\s+([A-Za-z0-9-]+)\)\s+echo "([^"/]+/[^"]+)"\s+;;\s*$')
+PROJECT_ID_PATTERN = re.compile(r"^[a-z][a-z0-9-]{4,28}[a-z0-9]$")
 
 
 class SweepError(Exception):
@@ -509,9 +510,6 @@ def parse_max_age_hours(val: str) -> float:
     return v
 
 
-PROJECT_ID_PATTERN = re.compile(r"^[a-z][a-z0-9-]{4,28}[a-z0-9]$")
-
-
 def parse_project_name(val: str) -> str:
     """Parse and validate --project: legal GCP project ID (6-30 chars, no commas)."""
     cleaned = (val or "").strip()
@@ -569,60 +567,66 @@ def main(argv=None) -> int:
     error = None
 
     try:
+        projects = pool_projects(args.ci_deploy_script)
         if args.project is not None:
-            boskos_reset_stranded(args.boskos_server)
-
-            visited_project = None
-
-            def visit(p: str):
-                nonlocal visited_project
-                visited_project = p
-                print(f"sweeping {p}")
-                try:
-                    res = sweep_project(p, max_age_hours=args.max_age_hours, dry_run=args.dry_run)
-                    run["deleted"][p] = _counts(res, allow_empty=True)
-                except Terminated as exc:
-                    run["ended_early"] = str(exc)
-                    c = _counts(getattr(exc, "deleted", None))
-                    if c:
-                        run["deleted"][p] = c
-                    run["failures"][p] = str(exc)
-                    raise
-                except Exception as exc:
-                    print(f"  {p}: {boskos_pool.describe(exc)}", file=sys.stderr)
-                    c = _counts(getattr(exc, "deleted", None))
-                    if c:
-                        run["deleted"][p] = c
-                    run["failures"][p] = boskos_pool.describe(exc)
-
-            outcome = boskos_pool.acquire_and_hold(
-                args.boskos_server,
-                args.boskos_owner,
-                BOSKOS_SWEEP_STATE,
-                lambda: boskos_pool.acquire(
-                    args.boskos_server, args.boskos_owner, BOSKOS_SWEEP_STATE, name=args.project
-                ),
-                visit,
-                run["failures"],
-                heartbeat=True,
-            )
-
-            target_project = visited_project or args.project
-            if outcome is boskos_pool.NOT_ACQUIRED:
+            if args.project not in projects:
                 code = 1
-                error = f"project {args.project} is not free in Boskos (leased, busy, or not registered there)"
+                error = f"project {args.project} is not mapped in {args.ci_deploy_script}"
                 run["failures"][args.project] = error
                 print(f"ERROR: {error}", file=sys.stderr)
-            elif target_project in run["failures"]:
-                code = 1
-                error = run["failures"][target_project]
-                print(f"ERROR: {error}", file=sys.stderr)
-            elif run["failures"]:
-                code = 1
-                error = next(iter(run["failures"].values()))
-                print(f"ERROR: {error}", file=sys.stderr)
+            else:
+                boskos_reset_stranded(args.boskos_server)
+
+                visited_project = None
+
+                def visit(p: str):
+                    nonlocal visited_project
+                    visited_project = p
+                    print(f"sweeping {p}")
+                    try:
+                        res = sweep_project(p, max_age_hours=args.max_age_hours, dry_run=args.dry_run)
+                        run["deleted"][p] = _counts(res, allow_empty=True)
+                    except Terminated as exc:
+                        run["ended_early"] = str(exc)
+                        c = _counts(getattr(exc, "deleted", None))
+                        if c:
+                            run["deleted"][p] = c
+                        run["failures"][p] = str(exc)
+                        raise
+                    except Exception as exc:
+                        print(f"  {p}: {boskos_pool.describe(exc)}", file=sys.stderr)
+                        c = _counts(getattr(exc, "deleted", None))
+                        if c:
+                            run["deleted"][p] = c
+                        run["failures"][p] = boskos_pool.describe(exc)
+
+                outcome = boskos_pool.acquire_and_hold(
+                    args.boskos_server,
+                    args.boskos_owner,
+                    BOSKOS_SWEEP_STATE,
+                    lambda: boskos_pool.acquire(
+                        args.boskos_server, args.boskos_owner, BOSKOS_SWEEP_STATE, name=args.project
+                    ),
+                    visit,
+                    run["failures"],
+                    heartbeat=True,
+                )
+
+                target_project = visited_project or args.project
+                if outcome is boskos_pool.NOT_ACQUIRED:
+                    code = 1
+                    error = f"project {args.project} is not free in Boskos (leased, busy, or not registered there)"
+                    run["failures"][args.project] = error
+                    print(f"ERROR: {error}", file=sys.stderr)
+                elif target_project in run["failures"]:
+                    code = 1
+                    error = run["failures"][target_project]
+                    print(f"ERROR: {error}", file=sys.stderr)
+                elif run["failures"]:
+                    code = 1
+                    error = next(iter(run["failures"].values()))
+                    print(f"ERROR: {error}", file=sys.stderr)
         else:
-            projects = pool_projects(args.ci_deploy_script)
             deleted, failures, unmapped = sweep_pool(
                 args.boskos_server,
                 args.boskos_owner,
