@@ -1959,8 +1959,11 @@ class WorkersTest(unittest.TestCase):
             if argv[1] == "apply":
                 started.wait(timeout=15)
                 # The fake stands in for a tofu that exits on the interrupt.
-                while not reconcile.terminating():
+                deadline = time.monotonic() + 15
+                while not reconcile.terminating() and time.monotonic() < deadline:
                     time.sleep(0.02)
+                if not reconcile.terminating():
+                    return subprocess.CompletedProcess(argv, 0, "", "")
                 return subprocess.CompletedProcess(argv, 130, "", "interrupted")
             if argv[1] == "plan":
                 return subprocess.CompletedProcess(argv, reconcile.PLAN_HAS_CHANGES, "", "")
@@ -2008,8 +2011,11 @@ class WorkersTest(unittest.TestCase):
         def tofu(argv, **_):
             if argv[1] == "apply":
                 started.wait(timeout=15)
-                while not reconcile.terminating():
+                deadline = time.monotonic() + 15
+                while not reconcile.terminating() and time.monotonic() < deadline:
                     time.sleep(0.02)
+                if not reconcile.terminating():
+                    return subprocess.CompletedProcess(argv, 0, "", "")
                 time.sleep(0.2)
                 return subprocess.CompletedProcess(argv, 130, "", "interrupted")
             if argv[1] == "plan":
@@ -2062,8 +2068,11 @@ class WorkersTest(unittest.TestCase):
         def tofu(argv, **_):
             nonlocal second_fired
             if argv[1] == "apply":
-                while not reconcile.terminating():
+                deadline = time.monotonic() + 15
+                while not reconcile.terminating() and time.monotonic() < deadline:
                     time.sleep(0.02)
+                if not reconcile.terminating():
+                    return subprocess.CompletedProcess(argv, 0, "", "")
                 if not second_fired:
                     second_fired = True
                     os.kill(os.getpid(), signal.SIGINT)
@@ -2094,6 +2103,41 @@ class WorkersTest(unittest.TestCase):
             self.assertTrue(len(boskos.released) > 0, "at least one worker ran and released its hold")
             self.assertTrue(second_fired, "second signal was fired during drain")
             self.assertTrue(mock_children_signal.called, "_children_signal ran to completion despite second termination")
+
+    def test_a_termination_before_workers_start_drains_without_waiting_on_unstarted_flags(self):
+        # A termination observed before any worker thread is started (e.g. inside
+        # _hold_signals(True) before the swap) leaves started_flags empty.
+        # The drain must wait only on started workers and return promptly rather than
+        # blocking for WORKER_DRAIN_SECONDS (150s) on unstarted flags in done.
+        orig_hold = boskos_pool._hold_signals
+        calls = []
+
+        def hold_and_raise(block):
+            calls.append(block)
+            if block and len(calls) == 1:
+                raise boskos_pool.Terminated("signal 2")
+            return orig_hold(block)
+
+        boskos = _Boskos(free=[P7, P8])
+        previous = signal.signal(signal.SIGINT, boskos_pool.terminate)
+        outcomes = {}
+        started_time = time.monotonic()
+        with mock.patch.object(reconcile, "_children_signal", wraps=reconcile._children_signal) as mock_children_signal:
+            try:
+                with mock.patch.object(boskos_pool, "_hold_signals", hold_and_raise), mock.patch.object(
+                    boskos_pool.urllib.request, "urlopen", boskos
+                ), mock.patch("sys.stdout", io.StringIO()):
+                    with self.assertRaises(boskos_pool.Terminated):
+                        reconcile.reconcile_pool(BOSKOS, OWNER, runner=lambda argv, **_: None, known=KNOWN, run=reconcile.Run(workers=2), outcomes=outcomes)
+            finally:
+                signal.signal(signal.SIGINT, previous)
+                reconcile._TERMINATING.clear()
+                boskos_pool._DEFERRED.clear()
+                boskos_pool._HOLD_DEPTH = 0
+            elapsed = time.monotonic() - started_time
+            self.assertLess(elapsed, 5, "the drain returned immediately without waiting for WORKER_DRAIN_SECONDS on unstarted flags")
+            self.assertTrue(mock_children_signal.called, "_children_signal was called")
+            self.assertEqual(boskos.acquired, [], "no worker acquired a lease")
 
     def test_no_tofu_is_started_once_a_termination_has_landed(self):
         # The forward reaches the children alive at that instant; a worker
