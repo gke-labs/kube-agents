@@ -137,8 +137,10 @@ GUARDS_FILENAME = "guards.json"
 REPORTS_SUBDIR = "reports"
 # One run at a time per store: an exclusive, non-blocking lock on this file.
 LOCK_FILENAME = ".lock"
+REPORT_IS_LINK_TEXT = "--report must not be named {name}: that is the link a full run points at the newest report"
 LOCK_HELD_TEXT = "another retrospective run holds {path} since {since}; nothing written"
 STATE_UNREADABLE_DRY_RUN_TEXT = "{path} {why}; a dry run moves nothing and stops here. Nothing written."
+STATE_NOT_MOVED_TEXT = "{path} {why} and could not be moved aside ({error}); it is unchanged in place. Fix or move it by hand, then rerun. Nothing written."
 STATE_UNREADABLE_TEXT = "{path} {why}; moved to {aside}. A set-aside ledger is a crash record, not a re-baseline: restore it or remove it on purpose, then rerun. Nothing written."
 EXIT_USAGE = 2
 # Reports are named by the run's finish time in UTC; a scoped run (one that
@@ -340,6 +342,11 @@ WEBHOOK_FAIL_CLOSED = "Fail"
 # namespaceSelector is the catalogue's full shape, below it a lesser one.
 WEBHOOK_DEFAULT_TIMEOUT_S = 10
 WEBHOOK_LONG_TIMEOUT_S = 10
+# A webhook stops a drain only if its rules reach pod creation: core group,
+# `pods` (or a wildcard), operation CREATE (or a wildcard); no rules match nothing.
+WEBHOOK_POD_GROUPS = ("", "*")
+WEBHOOK_POD_RESOURCES = ("pods", "*", "*/*", "pods/*")
+WEBHOOK_POD_OPERATIONS = ("CREATE", "*")
 WEBHOOK_CONFIGURATION_KINDS = ("ValidatingWebhookConfiguration", "MutatingWebhookConfiguration")
 ENDPOINTSLICE_SERVICE_LABEL = "kubernetes.io/service-name"
 SINGLE_REPLICA = 1
@@ -863,8 +870,10 @@ def _set_aside(path: Path, why: str, now: datetime, move: bool = True) -> None:
     if not move:
         raise StateUnreadable(STATE_UNREADABLE_DRY_RUN_TEXT.format(path=path, why=why))
     aside = path.with_name(path.name + UNREADABLE_SUFFIX.format(ts=now.strftime("%Y%m%dT%H%M%SZ")))
-    with contextlib.suppress(OSError):
+    try:
         os.replace(path, aside)
+    except OSError as exc:
+        raise StateUnreadable(STATE_NOT_MOVED_TEXT.format(path=path, why=why, error=exc)) from exc
     raise StateUnreadable(STATE_UNREADABLE_TEXT.format(path=path, why=why, aside=aside))
 
 
@@ -875,7 +884,7 @@ def load_json(path: Path, default: dict, *, version: int | None = None, now: dat
             loaded = json.load(handle)
     except FileNotFoundError:
         return default
-    except (OSError, json.JSONDecodeError) as exc:
+    except (OSError, ValueError) as exc:  # ValueError covers JSONDecodeError and a non-UTF-8 byte
         _set_aside(path, f"is unreadable ({exc})", now, move_aside)
     if not isinstance(loaded, dict):
         _set_aside(path, "is not a JSON object", now, move_aside)
@@ -1159,7 +1168,7 @@ def _pod_detail(pod: dict) -> dict:
         "labels": meta.get("labels") or {},
         "node_selector": spec.get("nodeSelector") or {},
         "api_markers": _api_marker_hits(pod),
-        "since": status.get("startTime") or meta.get("creationTimestamp"),
+        "started": status.get("startTime") or meta.get("creationTimestamp"),
     }
 
 
@@ -1569,17 +1578,22 @@ def classify_symptom(symptom: dict, ctx: Context) -> list[dict]:
     if symptom["category"] == CATEGORY_NODE:
         pool = symptom.get("pool") or ""
         touched = ctx.upgraded_pools.get(pool)
-        add(ENTRY_NODE_AGENT, HIGH if touched else MEDIUM, f"node {symptom['name']} {symptom['reason']}" + (f" after UPGRADE_NODES on {pool} at {touched['start']}" if touched else ""), f"pool {pool}")
+        transition = f" since {symptom['onset']}" if symptom.get("onset") else ""
+        add(ENTRY_NODE_AGENT, HIGH if touched else MEDIUM, f"node {symptom['name']} {symptom['reason']}{transition}" + (f" after UPGRADE_NODES on {pool} at {touched['start']}" if touched else ""), f"pool {pool}")
 
     # Entry 1: a budget allowing no disruption on an upgraded pool, or an
     # upgrade that ran longer than the hour-per-node a drain is held.
-    if symptom["category"] == CATEGORY_PDB:
-        for pool in symptom.get("upgraded_pools") or []:
-            info = ctx.upgraded_pools[pool]
-            held = info["longest_s"] > info["nodes"] * DRAIN_HOLD_PER_NODE.total_seconds() and info["nodes"] > 0
-            # The budget allowed nothing on a pool that was drained: the
-            # mechanism itself; whether the drain visibly stalled is detail.
-            add(ENTRY_BUDGET, HIGH, f"disruptionsAllowed=0 with pods on {pool}; UPGRADE_NODES {info['operation']} took {info['longest_s'] // 60} min over {info['nodes']} node(s)", f"budget {symptom['name']}" + ("; drain held past an hour per node" if held else ""))
+    if symptom["category"] == CATEGORY_PDB and symptom.get("upgraded_pools"):
+        # Every touched pool counts: the budget allowed nothing on a pool that
+        # was drained, the mechanism itself; the pool whose drain visibly
+        # stalled, if any, is named as detail.
+        touched = {pool: ctx.upgraded_pools[pool] for pool in symptom["upgraded_pools"]}
+        held_pools = [pool for pool, info in touched.items() if info["nodes"] > 0 and info["longest_s"] > info["nodes"] * DRAIN_HOLD_PER_NODE.total_seconds()]
+        named = held_pools[0] if held_pools else next(iter(touched))
+        info, held = touched[named], bool(held_pools)
+        if True:
+            pool = named
+            add(ENTRY_BUDGET, HIGH, f"disruptionsAllowed=0 with pods on {', '.join(touched)}; UPGRADE_NODES {info['operation']} on {pool} took {info['longest_s'] // 60} min over {info['nodes']} node(s)", f"budget {symptom['name']}" + (f"; drain held past an hour per node on {', '.join(held_pools)}" if held else ""))
 
     # Entry 6: a Job pod in Error whose spec names a removed API, best effort.
     if symptom["category"] == CATEGORY_NOT_READY and symptom.get("owner_kind") in JOB_OWNER_KINDS:
@@ -1917,6 +1931,16 @@ def _ready_services(endpointslices: list[dict]) -> set[tuple[str, str]]:
     return ready
 
 
+def _rules_reach_pod_creation(hook: dict) -> bool:
+    for rule in hook.get("rules") or []:
+        groups = rule.get("apiGroups") or []
+        resources = rule.get("resources") or []
+        operations = rule.get("operations") or []
+        if any(g in WEBHOOK_POD_GROUPS for g in groups) and any(r in WEBHOOK_POD_RESOURCES for r in resources) and any(o in WEBHOOK_POD_OPERATIONS for o in operations):
+            return True
+    return False
+
+
 def webhook_shapes(webhooks: list[dict], endpointslices: list[dict] | None) -> list[dict]:
     """Entry 7: a fail-closed webhook whose Service has no ready endpoint.
     Without the endpoint read the check cannot run and reports nothing."""
@@ -1931,7 +1955,7 @@ def webhook_shapes(webhooks: list[dict], endpointslices: list[dict] | None) -> l
         obj = _object_of("", config["kind"], meta.get("name", ""))
         for hook in config.get("webhooks") or []:
             service = ((hook.get("clientConfig") or {}).get("service")) or {}
-            if hook.get("failurePolicy") != WEBHOOK_FAIL_CLOSED or not service.get("name"):
+            if hook.get("failurePolicy") != WEBHOOK_FAIL_CLOSED or not service.get("name") or not _rules_reach_pod_creation(hook):
                 continue
             if (service.get("namespace", ""), service["name"]) not in ready:
                 # The catalogue's full shape also has a long timeout and no
@@ -2574,7 +2598,7 @@ def _cluster_block_lines(row: dict) -> list[str]:
         lines += [PARTIAL_READ_TEXT.format(failed=", ".join(row["partial"])), ""]
     lines += _next_upgrade_lines(row["next_upgrade"])
     lines.append("")
-    lines += _risks_lines(row["shapes"], row.get("managed_agents") or 0, (row.get("baseline") or {}).get("shape_reads_failed") or [])
+    lines += _risks_lines(row["shapes"], row.get("managed_agents") or 0, list(row.get("partial") or []) + list((row.get("baseline") or {}).get("shape_reads_failed") or []))
     lines.append("")
     lines += _baseline_lines(row["baseline"])
     return lines + [""]
@@ -2863,6 +2887,8 @@ def collect(args: argparse.Namespace, *, run: RunFn | None = None, now: datetime
     finish = (now if clock_fixed else now_utc()).strftime(REPORT_TS_FORMAT)
     suffix = SCOPED_SUFFIX if scoped else ""
     reports_dir = data_dir() / REPORTS_SUBDIR
+    if args.report and Path(args.report).name == LATEST_REPORT_LINK:
+        raise argparse.ArgumentTypeError(REPORT_IS_LINK_TEXT.format(name=LATEST_REPORT_LINK))
     if not getattr(args, "no_report", False):
         report_path = Path(args.report) if args.report else reports_dir / REPORT_FILENAME.format(ts=finish, scoped=suffix)
         write_report(report_path, result["report"], link=not scoped)
