@@ -189,6 +189,11 @@ KEY_DOES = "does"
 KEY_EFFECT = "effect"
 KEY_RUNBOOK = "runbook"
 KEY_SUMMARY = "summary"
+# periodics_runs only, for a job with extra reports: True when the GitLab
+# report was read and names no token to rotate, False when it names one, None
+# when it was not read (absent, unreadable, or a failed read). What clears a
+# TOKEN note: a passed build alone says nothing about the credential.
+KEY_TOKENS_CURRENT = "tokens_current"
 # The reconcile's summary counts (hack/fleet_reconcile.py write_report).
 RECONCILE_KEY_SUMMARY = "summary"
 # The reconcile's report (hack/fleet_reconcile.py write_report).
@@ -688,10 +693,19 @@ def run_summary(periodic: Periodic, artifact: dict | None, passed: bool, extras:
     return f"the run failed after {', '.join(parts)}" if parts else "the run failed before reaching a project"
 
 
+def tokens_current(extras: dict | None) -> bool | None:
+    """Whether the GitLab report was read and names no token to rotate; None
+    when it was not read (absent, not a JSON object, or a read that failed)."""
+    report = extras.get(GITLAB_SWEEP_ARTIFACT) if isinstance(extras, dict) else None
+    if not isinstance(report, dict) or report.get(REPORT_KEY_ERROR) == REPORT_UNREADABLE:
+        return None
+    return not gitlab_token_lines(extras)
+
+
 def runs(readings: dict[str, dict], watched=WATCHED) -> dict[str, dict]:
     """What each read job's latest finished build did, for the recovery message
     and the digest's run line: `{job: {build, finished_at, passed, summary,
-    dry_run}}`."""
+    dry_run}}`, plus `tokens_current` for a job with extra reports."""
     out = {}
     for periodic in watched:
         reading = readings.get(periodic.job)
@@ -705,6 +719,8 @@ def runs(readings: dict[str, dict], watched=WATCHED) -> dict[str, dict]:
             KEY_SUMMARY: run_summary(periodic, artifact, bool(reading.get(KEY_PASSED)), reading.get(KEY_EXTRA_ARTIFACTS)),
             KEY_DRY_RUN: bool(artifact.get(KEY_DRY_RUN)) if artifact else None,
         }
+        if periodic.extra_artifacts:
+            out[periodic.job][KEY_TOKENS_CURRENT] = tokens_current(reading.get(KEY_EXTRA_ARTIFACTS))
     return out
 
 
@@ -987,6 +1003,8 @@ def evidence(note: dict) -> str:
             return f"{note[KEY_LABEL]}: build {note[KEY_BUILD]} finished at a time its finished.json does not give, so {window}"
         return f"{note[KEY_LABEL]}: no finished run since {note[KEY_FINISHED_AT]} ({note[KEY_JOB]} has finished nothing in {note[KEY_STALE_AFTER_H]}h)"
     detail = f": {'; '.join(note[KEY_DETAIL])}" if note.get(KEY_DETAIL) else ""
+    if note[KEY_VERDICT] == VERDICT_TOKEN:
+        return f"{note[KEY_LABEL]}: build {note[KEY_BUILD]} passed at {note[KEY_FINISHED_AT]}{detail}"
     return f"{note[KEY_LABEL]}: build {note[KEY_BUILD]} failed at {note[KEY_FINISHED_AT]}{detail}"
 
 

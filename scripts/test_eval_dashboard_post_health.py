@@ -1855,10 +1855,18 @@ class WatchedPeriodics(RunHarness):
         self.tick(doc, T14 + timedelta(minutes=15))
         self.assertEqual(len(self.opener.texts), 1, "said once per episode")
         self.assertIn("🟡 Eval GitOps repos: a GitLab token of the eval pool is due for rotation, or dead (build 100 passed", "\n".join(post_health.periodic_digest_lines(doc, T14)))
-        # Rotated: the next passed build names no token, and the clear says so rather than "pull requests are being cleaned up again".
+        # A passed build whose GitLab report was not read (absent, unreadable, a
+        # failed cat) says nothing about the token: no clear, the episode holds.
+        unread = health("GREEN")
+        unread["periodics"], unread["periodics_read"] = {}, [sweep]
+        unread["periodics_runs"] = {sweep: {"build": "103", "finished_at": "2026-09-14T15:40:00+00:00", "passed": True, "summary": "closed 0 pull request(s) across 3 project(s)", "tokens_current": None}}
+        self.tick(unread, T14 + timedelta(hours=2))
+        self.assertEqual(len(self.opener.texts), 1, "an unread report is not a rotation")
+        self.assertEqual(self.recorded()["periodics_told"], {sweep: "TOKEN"})
+        # Rotated: a passed build whose report was read and names no token, and the clear says so rather than "pull requests are being cleaned up again".
         clean = health("GREEN")
         clean["periodics"], clean["periodics_read"] = {}, [sweep]
-        clean["periodics_runs"] = {sweep: {"build": "104", "finished_at": "2026-09-14T16:40:00+00:00", "passed": True, "summary": "closed 0 pull request(s) across 3 project(s)"}}
+        clean["periodics_runs"] = {sweep: {"build": "104", "finished_at": "2026-09-14T16:40:00+00:00", "passed": True, "summary": "closed 0 pull request(s) across 3 project(s)", "tokens_current": True}}
         self.tick(clean, T14 + timedelta(hours=3))
         self.assertEqual(self.opener.texts[-1], "✅ *Eval GitOps repos: the eval pool's GitLab tokens are current again.* `ci-kube-agents-pull-sweep`'s 12:40 PM ET run (build 104) names no token to rotate.")
         self.assertEqual(self.recorded()["periodics_told"], {})

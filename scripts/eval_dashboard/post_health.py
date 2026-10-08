@@ -1001,8 +1001,14 @@ def periodic_clears(health: dict, prev: dict | None) -> list[str]:
     def recovered(job):
         # Its own passed build, or the tick's decision that a later pass of
         # the job that supersedes it reached its projects. A silence (a
-        # later failed daily) is not a recovery and clears nothing.
-        return bool((runs.get(job) or {}).get("passed")) or bool((superseded.get(job) or {}).get(periodics.SUPERSEDED_KEY_RECOVERY))
+        # later failed daily) is not a recovery and clears nothing. A TOKEN
+        # note is about the credential, so only a passed build whose GitLab
+        # report was read and names no token clears it: a build whose report
+        # was not read says nothing about the token.
+        run = runs.get(job) or {}
+        if told.get(job) == periodics.VERDICT_TOKEN:
+            return bool(run.get("passed")) and run.get(periodics.KEY_TOKENS_CURRENT) is True
+        return bool(run.get("passed")) or bool((superseded.get(job) or {}).get(periodics.SUPERSEDED_KEY_RECOVERY))
 
     return sorted(job for job in told if job in read and job not in current and recovered(job))
 

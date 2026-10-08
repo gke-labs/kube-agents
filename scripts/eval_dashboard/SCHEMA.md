@@ -1074,7 +1074,7 @@ while its GitLab sweep report names a token that is due, dead or unreadable
 "the run passed; N token(s) to rotate", and its `absence`, `effect` and
 `runbook` are the credential's words rather than the sweep's): `{job, label, verdict, since, build,
 finished_at, result, stale_after_h, dry_run, detail[], summary, history_url,
-place, absence, does, effect, runbook}`. `detail` (on `FAILED` only)
+place, absence, does, effect, runbook}`. `detail` (on `FAILED`, and the token lines on `TOKEN`)
 is the report's lines, the projects capped at five (then `and N more`) and the
 run's lines after the cap: for the reconcile the
 projects it refused, failed or was interrupted in, each with its one next
@@ -1085,7 +1085,7 @@ run's own `error` line; for the sweep the projects whose sweep failed with GitHu
 the writes left for the next run under its budget, then the projects held and
 released unswept after the run stopped, then why the run ended early or its
 `error` line; either says when the report was not a JSON object.
-`summary` (on `FAILED` only) is one clause on what the run did ("failed in 11
+`summary` (on `FAILED`, and "the run passed; N token(s) to rotate" on `TOKEN`) is one clause on what the run did ("failed in 11
 of 11 project(s)", "3 applied, 9 unchanged"); `since` is carried from the
 previous `health.json`;
 `place`, `absence`, `does`, `effect` and `runbook` are the words and
@@ -1129,13 +1129,17 @@ projects.
 `periodics` notes every watched job whose latest build failed or is stale,
 less those superseded. `periodics_runs` is, per read
 job, `{build, finished_at, passed, summary, dry_run}` of its latest finished build, what
-the recovery message and the digest's reconcile run line say. `periodics_streaks` is, per watched job, `{build,
+the recovery message and the digest's reconcile run line say, plus
+`tokens_current` for the sweep: true when its GitLab report was read and
+names no token to rotate, false when it names one, null when the report was
+not read. `periodics_streaks` is, per watched job, `{build,
 projects{project: n}, runs}`: the last build counted, each project's
 consecutive failed checks (dropped at zero; every count cleared by a clean
 build) and the run's; a failed build is a note only once the run's count
 reaches the job's threshold (two consecutive checks for the sweep, the first
 failure for the reconciles), and the poster treats a told job as recovered only
-on a build that passed (`periodics_runs`), not on a sub-threshold failure. `periodics_since` is each open note's start, kept
+on a build that passed (`periodics_runs`), not on a sub-threshold failure, and
+a told `TOKEN` note only on a passed build whose `tokens_current` is true. `periodics_since` is each open note's start, kept
 for a job across the ticks with no reading for it (which write no note for it)
 and dropped once a tick with a reading for it writes no note
 (`scripts/eval_dashboard/periodics.py` owns the notes).

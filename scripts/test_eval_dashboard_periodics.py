@@ -328,11 +328,20 @@ class AssessTest(unittest.TestCase):
         self.assertEqual(note["detail"], ["gitlab token kube-agents-prow/gitlab-ledger-token: expires 2026-11-01, in 25 day(s); rotate it (docs/ci-pool-projects.md 5.6)"])
         self.assertEqual((note["absence"], note["effect"], note["runbook"]), (periodics.TOKEN_ABSENCE, periodics.TOKEN_EFFECT, periodics.TOKEN_RUNBOOK))
         self.assertEqual(note["place"], SWEEP.place)
+        self.assertIn("build 100 passed at", periodics.evidence(note), "a TOKEN note is a build that passed")
+        # runs() says whether the report was read and names no token: False here,
+        # True once rotated, None when the report was absent or unreadable.
+        self.assertIs(periodics.runs({SWEEP.job: reading})[SWEEP.job]["tokens_current"], False)
+        unread = dict(reading); unread.pop("extra_artifacts")
+        self.assertIsNone(periodics.runs({SWEEP.job: unread})[SWEEP.job]["tokens_current"])
+        broken = dict(reading, extra_artifacts={periodics.GITLAB_SWEEP_ARTIFACT: {"error": periodics.REPORT_UNREADABLE}})
+        self.assertIsNone(periodics.runs({SWEEP.job: broken})[SWEEP.job]["tokens_current"])
         # A dead token is the same note; no token due is no note; a failed build is FAILED, not TOKEN.
         gitlab["gitlab_tokens"][1] = dict(due, active=False, error="the token in kube-agents-prow/gitlab-ledger-token no longer authenticates (HTTP 401)")
         self.assertIn("no longer authenticates", periodics.assess({SWEEP.job: reading}, NOW, {})[SWEEP.job]["detail"][0])
         gitlab["gitlab_tokens"][1] = dict(due, days_left=300, warn=False)
         self.assertEqual(periodics.assess({SWEEP.job: reading}, NOW, {}), {})
+        self.assertIs(periodics.runs({SWEEP.job: reading})[SWEEP.job]["tokens_current"], True)
         gitlab["gitlab_tokens"][1] = due
         reading["passed"] = False
         streaks = {SWEEP.job: {"build": "100", "projects": {}, "runs": periodics.SWEEP_RUN_ALERT_AFTER}}
@@ -729,7 +738,7 @@ class WorkflowWiring(unittest.TestCase):
         self.assertTrue(note["runbook"].endswith("#55-the-repository-reset-and-the-sweep-behind-it"))
         passed = {"job": SWEEP.job, "build": "100", "finished_at": NOW.isoformat(timespec="seconds"), "passed": True, "result": "SUCCESS", "artifact": {"projects": 12, "closed": 241, "failed": 0, "left_for_next_run": 0, "outcomes": {}}}
         runs = periodics.runs({SWEEP.job: passed})
-        self.assertEqual(runs[SWEEP.job], {"build": "100", "finished_at": NOW.isoformat(timespec="seconds"), "passed": True, "summary": "closed 241 pull request(s) across 12 project(s)", "dry_run": False})
+        self.assertEqual(runs[SWEEP.job], {"build": "100", "finished_at": NOW.isoformat(timespec="seconds"), "passed": True, "summary": "closed 241 pull request(s) across 12 project(s)", "dry_run": False, "tokens_current": None})
 
     def test_every_watched_job_has_its_words_and_a_runbook_section_that_exists(self):
         headings = (pathlib.Path(__file__).resolve().parents[1] / "docs" / "ci-pool-projects.md").read_text().splitlines()
