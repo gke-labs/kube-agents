@@ -1050,6 +1050,14 @@ def render_periodic(health: dict, prev: dict | None) -> str:
                 middle = f"Build {note['build']} finished, but its finished.json gives no time for it, so {window}. Someone check the job."
             blocks.append("\n".join([f"⚪ *{words['place']}: {_stale_headline(words, note)}.*", f"{does} {middle}", effect, footer]))
             continue
+        if note.get("verdict") == periodics.VERDICT_TOKEN:
+            # The run passed; the credential it reports on is the news.
+            lines = [f"🟡 *{words['place']}: {words['absence']}.*", f"{does} Its {when} run (build {note['build']}) passed, and its GitLab report names:"]
+            lines.extend(f"- {line}" for line in note.get("detail") or [])
+            lines.append(f"Effect: {words['effect']} {periodics.SCOPE_LINE}" if words.get("effect") else periodics.SCOPE_LINE)
+            lines.append(footer)
+            blocks.append("\n".join(lines))
+            continue
         dry = " (a dry run: nothing was applied)" if note.get("dry_run") else ""
         how = f": {note['summary']}" if note.get("summary") else ""
         lines = [f"🟠 *{words['place']}: {words['absence']}.*", f"{does} Its {when} run (build {note['build']}){dry} failed{how}."]
@@ -1081,6 +1089,10 @@ def render_periodic_clear(health: dict, prev: dict | None) -> str:
             lines.append(f"✅ *{words['place']}: {words['presence']}.* `{job}`'s build {run.get('build')} failure is cleared by `{other}`'s {when} run (build {theirs.get('build')}){did}.")
             continue
         when = clock(parse_iso(run.get("finished_at"))) if run.get("finished_at") else None
+        if (((prev or {}).get("periodics_told") or {}).get(job)) == periodics.VERDICT_TOKEN:
+            # What was told was the credential, so what clears is the credential.
+            lines.append(f"✅ *{words['place']}: {periodics.TOKEN_PRESENCE}.* `{job}`'s {when} run (build {run.get('build')}) names no token to rotate.")
+            continue
         did = run.get("summary")
         # A passed build has a finish time (none is STALE and noted), so
         # `when` is there. The job by name: the reconciles share a place and
@@ -1145,6 +1157,8 @@ def periodic_digest_lines(health: dict, now: datetime | None = None) -> list[str
         if note.get("verdict") == periodics.VERDICT_STALE:
             last = f"last finished run {dated_clock(parse_iso(note.get('finished_at')), now)}" if note.get("finished_at") else f"build {note['build']} finished at a time its finished.json does not give"
             lines.append(f"⚪ {words['place']}: {_stale_headline(words, note)}; {last}.")
+        elif note.get("verdict") == periodics.VERDICT_TOKEN:
+            lines.append(f"🟡 {words['place']}: {words['absence']} (build {note['build']} passed {dated_clock(parse_iso(note.get('finished_at')), now)}; {'; '.join(note.get('detail') or [])}); {note['history_url']}")
         else:
             lines.append(f"🟠 {words['place']}: {words['absence']} (build {note['build']} failed {dated_clock(parse_iso(note.get('finished_at')), now)}); {note['history_url']}")
     return lines

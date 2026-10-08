@@ -208,7 +208,7 @@ BUDGET="${EVAL_DASHBOARD_TIMEOUT:-900}"
 TIMEOUT_CMD=(timeout "${BUDGET}")
 command -v timeout >/dev/null 2>&1 || TIMEOUT_CMD=()
 
-# Single quotes on purpose: $1..${11} are the child bash's own positionals, so
+# Single quotes on purpose: $1..${12} are the child bash's own positionals, so
 # no value ever meets an outer expansion. --merge-with always points at the
 # prior path; when the download above left nothing there, collect.py treats
 # it as a first run and bounds the sweep itself. The nightly prefixes and the
@@ -221,9 +221,9 @@ ${TIMEOUT_CMD[@]+"${TIMEOUT_CMD[@]}"} bash -c '
     src_args=(--from-dir "$6")
   else
     src_args=(--pr-glob "$4")
-    [ -n "${11}" ] && src_args+=(--gitlab-pr-glob "${11}")
     [ -n "$8" ] && src_args+=(--nightly-prefix "$8")
     [ -n "${11}" ] && src_args+=(--nightly-writers-prefix "${11}")
+    [ -n "${12}" ] && src_args+=(--gitlab-pr-glob "${12}")
   fi
   # The RC source. ${10} is the offline one and wins outright; the bucket glob
   # in $9 is only armed on the bucket path, so EVAL_DASHBOARD_FROM_DIR stays

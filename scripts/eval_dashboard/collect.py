@@ -1590,7 +1590,7 @@ def runs_from_index(
     per-build reads as the glob path. A failed listing is a warning and an
     empty result -- the refresh workflow greps for that warning and refuses
     to publish, so a stall never republishes old runs as fresh -- unless
-    `unlisted_is_note` and the listing is the kind _unlisted_note allows.
+    `unlisted_is_note` and the listing is the kind _unlisted_is_note allows.
     """
     prefix = index_prefix.rstrip("/") + "/"
     listing, stderr = _gsutil_call(["ls", prefix], gsutil)
@@ -1637,7 +1637,7 @@ def runs_from_gcs(
     ~1700 builds, so this is the cold-sweep path; an incremental scan goes
     through runs_from_index. A glob that does not list is the `warning:
     gsutil ls ... failed` line the refresh workflow refuses on, unless
-    `unlisted_is_note` and the listing is the kind _unlisted_note allows.
+    `unlisted_is_note` and the listing is the kind _unlisted_is_note allows.
     """
     runs = []
     for glob in pr_globs:

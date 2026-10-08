@@ -314,6 +314,30 @@ class AssessTest(unittest.TestCase):
         note = periodics.assess({SWEEP.job: reading}, NOW, {}, streaks=streaks)[SWEEP.job]
         self.assertIn("gitlab: and 2 more", note["detail"])
 
+    def test_a_passed_sweep_whose_gitlab_report_names_a_due_token_is_a_token_note(self):
+        """The sweep stays green on a due token (a month of red would read as
+        failed projects), so the note is where the token is said; a failed
+        build keeps its FAILED note, whose detail carries the same line."""
+        github = {"dry_run": False, "exit": "ok", "projects": 3, "failed": 0, "closed": 0, "outcomes": {}}
+        due = {"name": "kube-agents-evals-ledger", "secret": "kube-agents-prow/gitlab-ledger-token", "expires_at": "2026-11-01", "days_left": 25, "active": True, "warn": True, "urgent": False}
+        gitlab = {"forge": "gitlab", "exit": "ok", "projects": 3, "failed": 0, "closed": 1, "outcomes": {}, "gitlab_tokens": [dict(due, name="kube-agents-evals-agent", secret="kube-agents-prow/gitlab-agent-token", days_left=300, warn=False), due]}
+        reading = self.reading(SWEEP, NOW - timedelta(minutes=5), passed=True, artifact=github)
+        reading["extra_artifacts"] = {periodics.GITLAB_SWEEP_ARTIFACT: gitlab}
+        note = periodics.assess({SWEEP.job: reading}, NOW, {})[SWEEP.job]
+        self.assertEqual((note["verdict"], note["result"], note["summary"]), ("TOKEN", "SUCCESS", "the run passed; 1 token(s) to rotate"))
+        self.assertEqual(note["detail"], ["gitlab token kube-agents-prow/gitlab-ledger-token: expires 2026-11-01, in 25 day(s); rotate it (docs/ci-pool-projects.md 5.6)"])
+        self.assertEqual((note["absence"], note["effect"], note["runbook"]), (periodics.TOKEN_ABSENCE, periodics.TOKEN_EFFECT, periodics.TOKEN_RUNBOOK))
+        self.assertEqual(note["place"], SWEEP.place)
+        # A dead token is the same note; no token due is no note; a failed build is FAILED, not TOKEN.
+        gitlab["gitlab_tokens"][1] = dict(due, active=False, error="the token in kube-agents-prow/gitlab-ledger-token no longer authenticates (HTTP 401)")
+        self.assertIn("no longer authenticates", periodics.assess({SWEEP.job: reading}, NOW, {})[SWEEP.job]["detail"][0])
+        gitlab["gitlab_tokens"][1] = dict(due, days_left=300, warn=False)
+        self.assertEqual(periodics.assess({SWEEP.job: reading}, NOW, {}), {})
+        gitlab["gitlab_tokens"][1] = due
+        reading["passed"] = False
+        streaks = {SWEEP.job: {"build": "100", "projects": {}, "runs": periodics.SWEEP_RUN_ALERT_AFTER}}
+        self.assertEqual(periodics.assess({SWEEP.job: reading}, NOW, {}, streaks=streaks)[SWEEP.job]["verdict"], "FAILED")
+
     def test_a_job_past_its_stale_window_is_stale_whatever_its_last_verdict(self):
         readings = {DAILY.job: self.reading(DAILY, NOW - timedelta(hours=37)), POST.job: self.reading(POST, NOW - timedelta(days=30))}
         notes = periodics.assess(readings, NOW, {})
