@@ -1412,7 +1412,8 @@ func checkSessionExport(raw []byte, sessionID, opening string, spawnedAt time.Ti
 	dec := json.NewDecoder(strings.NewReader(string(raw)))
 	var e sessionExport
 	if err := dec.Decode(&e); err != nil {
-		return fmt.Errorf("session store printed no session export: %v; output: %s", err, tail(string(raw), stderrTailBytes))
+		// The output is a conversation transcript, so only its size is logged.
+		return fmt.Errorf("session store printed no session export: %v (%d bytes of output)", err, len(raw))
 	}
 	if dec.More() {
 		return errors.New("session store printed more than one session")
