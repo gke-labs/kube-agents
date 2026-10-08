@@ -2077,7 +2077,6 @@ class WorkersTest(unittest.TestCase):
             ), mock.patch("sys.stdout", io.StringIO()):
                 with self.assertRaises(boskos_pool.Terminated):
                     reconcile.reconcile_pool(BOSKOS, OWNER, runner=tofu, known=KNOWN, run=reconcile.Run(workers=2), outcomes=outcomes)
-            handler_after = signal.getsignal(signal.SIGINT)
         finally:
             boskos_pool._DEFERRED.clear()
             boskos_pool._HOLD_DEPTH = 0
@@ -2085,7 +2084,62 @@ class WorkersTest(unittest.TestCase):
             reconcile._TERMINATING.clear()
         self.assertEqual(sorted(boskos.released), [P7, P8], "both holds were released before the termination propagated")
         self.assertEqual({p: o for p, (o, _) in outcomes.items()}, {P7: reconcile.OUTCOME_INTERRUPTED, P8: reconcile.OUTCOME_INTERRUPTED})
-        self.assertIs(handler_after, boskos_pool.terminate, "the handler is back once the start's hold is given up")
+
+    def test_a_second_termination_during_the_drain_after_one_in_the_worker_start_is_held(self):
+        # A termination the handler raises leaves later ones held, so the
+        # drain cannot be interrupted; one the start's unblock raises must
+        # get the same drain. The first signal lands inside the last worker's
+        # start, the second from a worker once the first has been forwarded,
+        # while the main thread is waiting on the holds.
+        started = threading.Barrier(3)
+        last_worker = "fleet-reconcile-1"
+        second_sent = threading.Event()
+
+        def tofu(argv, **_):
+            if argv[1] == "apply":
+                started.wait(timeout=5)
+                for _ in range(100):
+                    if reconcile.terminating():
+                        if not second_sent.is_set():
+                            second_sent.set()
+                            os.kill(os.getpid(), signal.SIGINT)
+                        time.sleep(0.2)
+                        return subprocess.CompletedProcess(argv, 130, "", "interrupted")
+                    time.sleep(0.02)
+                return subprocess.CompletedProcess(argv, 0, "", "")
+            if argv[1] == "plan":
+                return subprocess.CompletedProcess(argv, reconcile.PLAN_HAS_CHANGES, "", "")
+            if argv[1] == "show":
+                return subprocess.CompletedProcess(argv, 0, UPDATE_ONLY, "")
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+        real_start = threading.Thread.start
+
+        def start(thread):
+            real_start(thread)
+            if thread.name == last_worker:
+                started.wait(timeout=5)
+                os.kill(os.getpid(), signal.SIGINT)
+
+        boskos = _Boskos(free=[P7, P8])
+        previous = signal.signal(signal.SIGINT, boskos_pool.terminate)
+        outcomes = {}
+        try:
+            with mock.patch.object(threading.Thread, "start", start), mock.patch.object(
+                boskos_pool.urllib.request, "urlopen", boskos
+            ), mock.patch("sys.stdout", io.StringIO()):
+                with self.assertRaises(boskos_pool.Terminated):
+                    reconcile.reconcile_pool(BOSKOS, OWNER, runner=tofu, known=KNOWN, run=reconcile.Run(workers=2), outcomes=outcomes)
+            held = list(boskos_pool._DEFERRED)
+        finally:
+            boskos_pool._DEFERRED.clear()
+            boskos_pool._HOLD_DEPTH = 0
+            signal.signal(signal.SIGINT, previous)
+            reconcile._TERMINATING.clear()
+        self.assertTrue(second_sent.is_set(), "the second signal was sent")
+        self.assertEqual(sorted(boskos.released), [P7, P8], "both holds were released before the termination propagated")
+        self.assertEqual({p: o for p, (o, _) in outcomes.items()}, {P7: reconcile.OUTCOME_INTERRUPTED, P8: reconcile.OUTCOME_INTERRUPTED})
+        self.assertEqual(held, [signal.SIGINT], "the second termination was held across the drain")
 
     def test_no_tofu_is_started_once_a_termination_has_landed(self):
         # The forward reaches the children alive at that instant; a worker

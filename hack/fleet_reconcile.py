@@ -1191,6 +1191,12 @@ def _run_workers(worker, count):
             for flag in done:
                 flag.wait(WORKER_JOIN_STEP_SECONDS)
     except boskos_pool.Terminated:
+        # The drain runs with later terminations held, whichever way the
+        # first arrived: the handler defers them itself before it raises,
+        # but the unblock above restores the handlers before raising the
+        # one it held, and a second signal landing in the drain would
+        # otherwise raise out of it with the holds still to release.
+        boskos_pool._defer_terminations()
         _begin_termination()
         deadline = clock() + WORKER_DRAIN_SECONDS
         for flag in done:
