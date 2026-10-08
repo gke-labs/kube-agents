@@ -715,6 +715,19 @@ class StageTest(unittest.TestCase):
         self._main(now=FILED_AT + oobe.NEW_INSTALL_SECONDS)
         self.assertEqual(oobe.read_state(self.d)[oobe.STATE_REASON], oobe.SKIP_UNSETTLED)
 
+    def test_a_ranking_card_unfinished_after_a_day_is_unsettled_not_old(self):
+        # Past the fallback, but the recorded card is still blocked, or none was recorded: the scan
+        # did not finish, whatever the fallback says.
+        for ranking, cards in (("t_rank", [_ranking("blocked")]), (None, [])):
+            with self.subTest(ranking=ranking):
+                (self.d / oobe.AUDITS_MARKER).unlink(missing_ok=True)
+                (self.d / oobe.bootstrap_handoff.HANDOFF_MARKER).unlink(missing_ok=True)
+                self.board.unlink(missing_ok=True)
+                self._file_scan(ranking=ranking)
+                _board(self.board, cards)
+                self._main(now=FILED_AT + oobe.NEW_INSTALL_SECONDS)
+                self.assertEqual(oobe.read_state(self.d)[oobe.STATE_REASON], oobe.SKIP_UNSETTLED)
+
     def test_a_chain_already_under_way_is_not_cut_off_by_age(self):
         self._file_scan()
         _board(self.board, [_ranking("done")])

@@ -213,7 +213,19 @@ def ranking_finished(board: Path, task_id: str) -> bool | None:
     return row is not None and row[0] in FINISHED_STATUSES
 
 
-def scan_settled(data_dir: Path, now: float, quiet: bool = False) -> bool:
+def scan_finished(data_dir: Path) -> bool:
+    """Whether the scan really finished: the hand-off recorded no cluster audited, or its recorded
+    ranking card has finished. Not the fallback, which by a day has always passed."""
+    filed = scan_filed(data_dir)
+    if filed is None:
+        return False
+    ranking = handoff_ranking(data_dir, filed[0])
+    if ranking == bootstrap_handoff.NO_RANKING:
+        return True
+    return ranking is not None and bool(ranking_finished(board_path(data_dir), ranking))
+
+
+def scan_settled(data_dir: Path, now: float) -> bool:
     """Whether the onboarding scan has settled, read from the hand-off's own record and board read.
 
     The ranking card is the one the hand-off recorded for this sweep, and nothing else: a card
@@ -244,8 +256,6 @@ def scan_settled(data_dir: Path, now: float, quiet: bool = False) -> bool:
         return False
     wait = bootstrap_handoff.deadline(state) + RANKING_ALLOWANCE_SECONDS
     if now - filed_at >= wait:
-        if quiet:
-            return True
         _log(
             f"the scan has not settled {wait // bootstrap_handoff.SECONDS_PER_MINUTE} minutes after its sweep "
             "was filed; starting the audits anyway"
@@ -502,7 +512,7 @@ def main(data_dir: Path | None = None, now: float | None = None) -> int:
             skip(data_dir, SKIP_NO_SWEEP, now)
             return 0
         if filed is not None and now - filed[1] >= NEW_INSTALL_SECONDS:
-            skip(data_dir, SKIP_NOT_NEW if scan_settled(data_dir, now, quiet=True) else SKIP_UNSETTLED, now)
+            skip(data_dir, SKIP_NOT_NEW if scan_finished(data_dir) else SKIP_UNSETTLED, now)
             return 0
         if not scan_settled(data_dir, now):
             return 0

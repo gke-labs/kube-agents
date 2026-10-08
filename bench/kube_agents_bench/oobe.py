@@ -18,9 +18,10 @@
 scan settles, by marking each due on that profile's roster. A started audit leaves a
 row in the profile's ``cron/executions.db``. The case's stack
 (``bench/tf/prebuilt/oobe-first-run-audits``) records when it armed the stage in its
-state file, and the stage records when it marked each audit; this passes when every audit
-has a run of its own claimed at or after its mark that got going: running, completed, or
-ended after it started.
+state file, and the stage records when it marked each audit; this passes when every audit it
+marked has a run of its own claimed at or after its mark that got going (running, completed, or
+ended after it started), and every other audit is one it adopted (a run completed since the
+sweep).
 
 Its own module rather than a section of ``verifiers.py``, registered through the same
 ``devops_bench.verifiers`` entry-point group.
