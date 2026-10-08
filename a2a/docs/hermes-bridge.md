@@ -228,7 +228,10 @@ is not in the publish list, so the publish is refused, the submission is dropped
 Hermes is never spawned. The refusal does not read as one: a rejected JetStream publish is
 a reply that never arrives, so the bridge logs a timeout and the submitter waits on a task
 that got no terminal event and was never run. Leave the env unset, or widen the grant in
-the operator to match — the two have to move together.
+the operator to match — and add the new addressee to `a2aReservedAddressees()` in the same
+change, so the auth callout's `A2A_RESERVED_ADDRESSEES` refuses a narrowed pod named after it.
+The three have to move together: a grant widened without the reservation lets a session pod
+named after the second addressee read and publish its task subjects.
 
 The agent container is the other half of the same change and needs no edit: the operator
 stops rendering `NATS_USER`/`NATS_PASSWORD` there and mounts a projected token instead.

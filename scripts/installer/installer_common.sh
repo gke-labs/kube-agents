@@ -592,7 +592,9 @@ load_install_env() {
 # The Day-2 control panel is the only caller, and it is the one place that may
 # write here: "Save & Apply Configuration Changes" is an explicit instruction
 # to record a change, not the installer quietly overwriting an input. install.sh
-# itself only ever creates the file when there is none.
+# itself creates the file when there is none, and otherwise only appends a chat
+# key the file does not assign (record_flags_into_install_env); it never
+# rewrites a line.
 #
 # No `export` keyword in the output: install.env is a dotenv, loaded with
 # `set -a`. The value is still %q-quoted, so spaces and quotes survive.
