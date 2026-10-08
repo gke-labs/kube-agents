@@ -44,13 +44,15 @@ STALE_SECONDS = eval(re.search(r"^STALE_SECONDS = (.+)$", SCRIPT.read_text(), re
 
 
 # The runner's own readonly lines the function reads, lifted so a rename there fails here; each
-# test sets the wait and poll itself so it runs in seconds.
+# test then overrides the wait and poll so it runs in seconds.
 RUNNER_CONSTANTS = (
     "EVAL_SANDBOX_EXEC_TIMEOUT",
     "EVAL_SANDBOX_EXEC_ROUND_TRIP_SECONDS",
     "EVAL_GATEWAY_CONTAINER",
     "EVAL_GATEWAY_PYTHON",
     "EVAL_GATEWAY_HOME",
+    "EVAL_PLATFORM_RUN_WAIT_SECONDS",
+    "EVAL_PLATFORM_RUN_POLL_SECONDS",
 )
 
 
