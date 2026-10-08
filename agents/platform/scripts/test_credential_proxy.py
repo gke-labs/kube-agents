@@ -3982,6 +3982,7 @@ class CommandExecutorTest(unittest.TestCase):
         mib = credential_proxy.MEBIBYTE
         floor = credential_proxy.child_memory_budget_floor_bytes(8 * mib)
         self.assertEqual(672 * mib, floor)
+        self.assertEqual(credential_proxy.CHILD_MEMORY_BUDGET_FLOOR_BYTES_AT_DEFAULT_CAP, floor)
         executor = self.executor(memory_limit_bytes=floor, max_output_bytes=8 * mib)
         self.assertEqual(2, executor.requests_the_budget_admits())
         self.assertIsNotNone(executor.children_budget_bytes)

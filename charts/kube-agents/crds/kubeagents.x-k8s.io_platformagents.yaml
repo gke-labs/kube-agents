@@ -1077,6 +1077,103 @@ spec:
                       items:
                         type: string
                       type: array
+                    credentialProxy:
+                      description: |-
+                        CredentialProxy configures the credential-proxy container, the broker that
+                        runs every credentialed command on the agent's behalf in a pod of its own.
+                      properties:
+                        resources:
+                          description: |-
+                            Resources overrides the credential-proxy container's requests and limits.
+                            Each key set here replaces the operator's default for that key and the
+                            rest keep their defaults, unlike spec.deployment.resources, which replaces
+                            the agent container's block wholesale: a CR that sets only limits.memory
+                            keeps the default 500m CPU request, 1 CPU limit and 2Gi ephemeral-storage
+                            limit. The broker sizes how many commands it admits at once from the
+                            memory limit, so raising the limit is the one knob for an install whose
+                            fleet outgrows the default; the ephemeral-storage limit bounds the content
+                            workspace the broker clones into; the proxy's state and /tmp emptyDirs
+                            (sizeLimits 5Gi and 2Gi) follow it when it is raised above their
+                            defaults, so the kubelet does not evict the pod at the smaller figure.
+                            Only cpu, memory and ephemeral-storage
+                            are accepted, the quantities the container declares. The operator
+                            refuses a memory limit below what admits two commands at once, a request
+                            above its limit, a negative quantity and a zero limit; `claims` is refused, because the proxy
+                            pod declares no resourceClaims. A refused override, including an edit of
+                            one that was valid, renders the proxy Deployment at the operator's
+                            defaults, not at the last accepted override, until it is corrected,
+                            which on the proxy's Recreate Deployment restarts the proxy once; the
+                            operator reports Degraded with reason InvalidCredentialProxyResources
+                            when no higher-ranked Degraded cause is present, the agent staying
+                            Ready, whether or not the validating webhook is enabled. Where the
+                            webhook is on, it refuses the edit at apply and the running proxy is
+                            untouched. The webhook warns when memory per
+                            CPU on the requests pair leaves the band GKE Autopilot admits unchanged,
+                            because Autopilot then raises the smaller request into the band; it
+                            applies the band to requests only. It also warns for each of cpu and
+                            memory set under limits without the same key under requests, unless the
+                            limit equals the request it would be replaced by: Autopilot
+                            without bursting sets the limits equal to the requests, so there the
+                            proxy runs at the request and the limit has no effect. With bursting the
+                            declared limits stand.
+                          properties:
+                            claims:
+                              description: |-
+                                Claims lists the names of resources, defined in spec.resourceClaims,
+                                that are used by this container.
+
+                                This field depends on the
+                                DynamicResourceAllocation feature gate.
+
+                                This field is immutable. It can only be set for containers.
+                              items:
+                                description: ResourceClaim references one entry in PodSpec.ResourceClaims.
+                                properties:
+                                  name:
+                                    description: |-
+                                      Name must match the name of one entry in pod.spec.resourceClaims of
+                                      the Pod where this field is used. It makes that resource available
+                                      inside a container.
+                                    type: string
+                                  request:
+                                    description: |-
+                                      Request is the name chosen for a request in the referenced claim.
+                                      If empty, everything from the claim is made available, otherwise
+                                      only the result of this request.
+                                    type: string
+                                required:
+                                  - name
+                                type: object
+                              type: array
+                              x-kubernetes-list-map-keys:
+                                - name
+                              x-kubernetes-list-type: map
+                            limits:
+                              additionalProperties:
+                                anyOf:
+                                  - type: integer
+                                  - type: string
+                                pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                                x-kubernetes-int-or-string: true
+                              description: |-
+                                Limits describes the maximum amount of compute resources allowed.
+                                More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
+                              type: object
+                            requests:
+                              additionalProperties:
+                                anyOf:
+                                  - type: integer
+                                  - type: string
+                                pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                                x-kubernetes-int-or-string: true
+                              description: |-
+                                Requests describes the minimum amount of compute resources required.
+                                If Requests is omitted for a container, it defaults to Limits if that is explicitly specified,
+                                otherwise to an implementation-defined value. Requests cannot exceed Limits.
+                                More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
+                              type: object
+                          type: object
+                      type: object
                     defaultStorageClassName:
                       description:
                         DefaultStorageClassName specifies the default storage

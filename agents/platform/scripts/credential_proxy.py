@@ -181,6 +181,14 @@ OUTPUT_COPIES_PER_COMMAND = 6
 # sizing test holds the limit to the same floor
 # (credentialProxyMinimumAdmittedRequests in credential_proxy_manifests.go).
 BUDGET_MINIMUM_ADMITTED_REQUESTS = 2
+# child_memory_budget_floor_bytes at the 8 MiB output cap the operator sets
+# (CREDENTIAL_PROXY_MAX_OUTPUT_BYTES; the broker's own fallback is not the
+# deployed cap): 672 MiB. Declared as a literal so that the copies elsewhere can
+# be compared with it as text. test_credential_proxy.py holds it to the
+# function, and tests/test_credential_proxy_sizing_parity.py holds it equal to
+# the operator's credentialProxyMemoryFloorBytesAtDefaultCap and the chart's
+# kube-agents.credentialProxyMemoryFloorBytes.
+CHILD_MEMORY_BUDGET_FLOOR_BYTES_AT_DEFAULT_CAP = 704643072
 # Where the limit comes from, in order: the operator's Downward API variable,
 # then the cgroup v2 file for a broker whose Deployment predates the variable.
 # A value of `max` in the file means no limit, and no limit means no budget.

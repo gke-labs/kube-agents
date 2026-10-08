@@ -628,6 +628,15 @@
               "items": {
                 "type": "object"
               }
+            },
+            "credentialProxy": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "resources": {
+                  "type": "object"
+                }
+              }
             }
           }
         },

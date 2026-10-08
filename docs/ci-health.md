@@ -183,7 +183,7 @@ A case failing on exactly one pull request while passing elsewhere is that pull
 request's problem and moves no state; the message lists it as "PR-caused".
 
 Only presubmit runs reach these rules and the digest's numbers. `data.json`
-also carries the nightly periodic's runs (`runs[].tier`, see
+also carries the nightly periodics' runs (`runs[].tier`, see
 `scripts/eval_dashboard/SCHEMA.md`); a nightly has no pull request to count
 towards a distinct-PR floor, and a nightly collapsing is a case's record on
 `main`, not a gate incident.
@@ -377,7 +377,8 @@ latest builds` step reads each job's `latest-build.txt` from
 identities cannot write the Prow archive),
 walks back to a build with a `finished.json` (the newest is often still
 running), keeps the job's report when the build wrote one (the reconcile's
-`fleet-reconcile.json`, the sweep's `pull-sweep.json`), and hands the readings
+`fleet-reconcile.json`, the sweep's `pull-sweep.json`; the sweep's GitLab pass
+writes `pull-sweep-gitlab.json`, which is not read), and hands the readings
 to `health.py --periodics-dir`.
 
 Like the pool note it rides beside the state and never becomes one. A job whose

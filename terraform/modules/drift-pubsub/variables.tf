@@ -54,6 +54,45 @@ variable "sink_name" {
   default     = "platform-agent-drift-audit-sink"
 }
 
+variable "sink_drain_duration" {
+  description = "How long a destroy waits, after deleting the sink, before removing the topic and the sink's publish grant. Cloud Logging stops exporting some minutes after the sink is gone, and an export that lands in that gap mails every project owner a sink configuration error; the wait is a timer because Logging offers nothing to wait on. The 120s default is a chosen margin, not a measured convergence time: Google documents no bound, so lengthening it buys margin and shortening it trades destroy time for the chance of that email. Paid once per destroy and never on apply. A change to this takes effect only once an apply has recorded it: time_sleep reads destroy_duration from state when it is destroyed, because a provider's delete is handed prior state and no configuration, so raising it and going straight to a destroy waits the old value. Apply first, then destroy."
+  type        = string
+  default     = "120s"
+
+  # Narrower than a Go duration on purpose: time_sleep takes a number followed
+  # by exactly one of ms, s, m or h, and refuses both the multi-unit form
+  # ("2m30s") and the sub-millisecond units Go accepts. Matching the provider
+  # here fails the variable with a usable message rather than failing inside
+  # the provider after the plan.
+  #
+  # An empty string is refused with the rest. Unlike the override below it has
+  # no sensible reading -- there is no "no duration" -- so the message says how
+  # to get the default back rather than the condition admitting it.
+  validation {
+    condition     = can(regex("^[0-9]+(\\.[0-9]+)?(ms|s|m|h)$", var.sink_drain_duration))
+    error_message = "sink_drain_duration must be a number followed by one of ms, s, m or h, e.g. 120s or 2m. time_sleep does not accept the multi-unit form (2m30s). An empty value is not the default: a blank TF_VAR_ line exports \"\" and overrides the default, so remove the line rather than blanking it."
+  }
+}
+
+variable "sink_writer_identity_override" {
+  description = "The principal to grant roles/pubsub.publisher on the topic, overriding the service-<project-number>@gcp-sa-logging.iam.gserviceaccount.com the module derives. Include the \"serviceAccount:\" prefix. The module derives the identity rather than reading it off the sink so the grant can precede the sink, and a sink carrying some other writer identity would otherwise fail the sink's postcondition on every subsequent plan with no way out short of editing the module. Set this to whatever Logging reports for the sink and both the grant and the postcondition follow it. Leave null unless an apply has told you to set it."
+  type        = string
+  default     = null
+
+  # "" is admitted alongside null because it is how an operator turns the
+  # override off. The composition reaches this through a TF_VAR_ line in
+  # install.env, and blanking that line rather than deleting it exports ""
+  # through `set -a` -- which overrides the default, as lifecycle.sh says of
+  # the same pattern on drift_pubsub_subscription. Refusing it would answer
+  # someone switching the override off by telling them to add a prefix to it.
+  # expected_sink_writer_identity coalesces "" to the derived identity, which
+  # is what they meant.
+  validation {
+    condition     = var.sink_writer_identity_override == null || var.sink_writer_identity_override == "" || can(regex("^serviceAccount:.+@.+$", var.sink_writer_identity_override))
+    error_message = "sink_writer_identity_override must carry the \"serviceAccount:\" prefix, as writer_identity does. Leave it unset, or empty, to use the identity the module derives."
+  }
+}
+
 variable "ack_deadline_seconds" {
   description = "How long the detector has to ack a message before Pub/Sub redelivers it. The ack follows the managedFields join, and synchronous pull does not extend the deadline underneath a running handler, so this has to cover a whole batch's live-object lookups. The detector caps a batch's join with its own --batch-join-budget flag, defaulting to 30s, half this default; the two are not wired together — the detector reads this value at startup and warns when its budget takes more than half of it, but it does not adopt it — so lowering this below 60 means passing a smaller --batch-join-budget to the detector to match."
   type        = number

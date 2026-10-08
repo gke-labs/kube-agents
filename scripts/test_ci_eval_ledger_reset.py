@@ -374,11 +374,13 @@ class ResetStepTest(unittest.TestCase):
                 lifted_line(r"^LEDGER_MINT_RETRYABLE=\d+$"),
                 lifted_line(r"^LEDGER_RESET_MINT_ATTEMPTS=\d+$"),
                 lifted_line(r"^LEDGER_RESET_MINT_RETRY_DELAY=\d+$"),
+                'EVAL_FORGE="github"',  # the GitHub path, whatever the shell exports
                 f'EVAL_LEDGER_APP_ID=4739812; EVAL_LEDGER_APP_KEY_FILE="{key_file}"',
                 f'EVAL_LEDGER_REPO="{repo}"; PROJECT_ID="{PROJECT}"; BUILD_ID=2102186223282950144',
                 f'SCRIPT_DIR="{self.dir}"',
                 mint,
                 lifted("ledger_reset_token"),
+                lifted("forge_write_token"),
                 lifted("reset_audit_ledgers"),
                 "reset_audit_ledgers " + args,
                 'echo "RC=$?"',

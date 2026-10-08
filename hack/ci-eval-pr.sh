@@ -340,6 +340,40 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 profile_begin "bootstrap: source ci-env.sh"
 source "${SCRIPT_DIR}/ci-env.sh"
 
+# EVAL_FORGE=gitlab (#2394): the deploy (hack/ci-deploy.sh) registers the
+# pool project's GitLab project, and the resets and grading here follow it --
+# the ledger and pull-request resets close GitLab issues and merge requests
+# through hack/ci_gitlab_forge.py, and the ledger token is exported under
+# BENCH_FORGE and BENCH_GITLAB_*, the names the bench's forge-graded checks
+# and the inject lane's github_writes safeguard read, with the GitHub token
+# unset so nothing can read the GitHub twin repository by mistake. One token
+# pair serves the pool, in Secret Manager where the runner identities live;
+# nothing is minted per unit and nothing rotates here
+# (docs/ci-pool-projects.md 5.6). The names are pinned equal to
+# hack/ci-deploy.sh's by scripts/test_ci_gitlab_forge.py.
+EVAL_FORGE="${EVAL_FORGE:-github}"
+case "${EVAL_FORGE}" in
+  github) ;;
+  gitlab)
+    # The deploy builds the GitLab forge from the mapping alone and ignores
+    # EVAL_GITOPS_REPO, so a developer's override would steer the resets and
+    # the lane at a repository the agent was not told to write to.
+    if [ -n "${EVAL_GITOPS_REPO:-}" ]; then
+      echo "ERROR: EVAL_FORGE=gitlab does not take EVAL_GITOPS_REPO (the deploy ignores it); unset it, the GitLab project follows the leased PROJECT_ID." >&2
+      exit 1
+    fi
+    ;;
+  *) echo "ERROR: EVAL_FORGE='${EVAL_FORGE}' is not a forge this eval knows; use github (default) or gitlab." >&2; exit 1 ;;
+esac
+GITLAB_SECRETS_PROJECT="kube-agents-prow"
+GITLAB_AGENT_SM_SECRET="gitlab-agent-token"
+GITLAB_LEDGER_SM_SECRET="gitlab-ledger-token"
+GITLAB_BOT_LOGIN="kube-agents-eval-bot"
+GITLAB_FORGE_HOST="gitlab.com"
+# What the two reset helpers are told; empty under github.
+EVAL_FORGE_HELPER_ARGS=()
+[ "${EVAL_FORGE}" = "gitlab" ] && EVAL_FORGE_HELPER_ARGS=(--forge gitlab)
+
 # ─── Eval dashboard publish hook (dashboard PR 4/4) ─────────────────────────
 # Re-renders and republishes the eval dashboard at the very end of every
 # MAIN-BRANCH run, red or green, from the EXIT trap below. FAIL-SAFE BY
@@ -859,7 +893,9 @@ _ledger_token_mint() {
 # its own scope. Never falls back to the mounted PAT -- that would let a smoke
 # test pass while proving nothing about the credential it exercises.
 mint_ledger_token() { # <label>
-  if [ -z "${EVAL_LEDGER_APP_KEY_FILE:-}" ]; then
+  # Under gitlab the grading token is the pool's, read once at preflight by
+  # read_gitlab_tokens; it lasts a year, so there is nothing to mint per unit.
+  if [ "${EVAL_FORGE:-github}" = "gitlab" ] || [ -z "${EVAL_LEDGER_APP_KEY_FILE:-}" ]; then
     return 0
   fi
   # The token never reaches argv, where ps would show it: python writes it to
@@ -894,7 +930,55 @@ mint_ledger_token() { # <label>
 # Once here as well as once per unit: a key that cannot mint at all is a
 # run-wide fault, and it costs seconds to find out now instead of at the end of
 # the fan-out, where it would surface as every repetition grading MISSING.
-if [ -z "${EVAL_LEDGER_APP_KEY_FILE:-}" ]; then
+# The GitLab pair, read once from Secret Manager over a pipe into the
+# shell's own variables: the agent token for the two resets (the bot owns
+# the issues and merge requests they close), the ledger token for grading,
+# exported under the names the bench's GitLab checks read.
+# Neither touches argv or a file. A read that fails stops the run here, as a
+# mint that fails does: grading without the token would prove nothing.
+EVAL_GITLAB_AGENT_TOKEN=""
+read_gitlab_tokens() {
+  local agent ledger
+  agent="$(gcloud secrets versions access latest --secret="${GITLAB_AGENT_SM_SECRET}" --project="${GITLAB_SECRETS_PROJECT}" | tr -d '\r\n')" || agent=""
+  ledger="$(gcloud secrets versions access latest --secret="${GITLAB_LEDGER_SM_SECRET}" --project="${GITLAB_SECRETS_PROJECT}" | tr -d '\r\n')" || ledger=""
+  local missing=()
+  [ -n "${agent}" ] || missing+=("${GITLAB_SECRETS_PROJECT}/${GITLAB_AGENT_SM_SECRET}")
+  [ -n "${ledger}" ] || missing+=("${GITLAB_SECRETS_PROJECT}/${GITLAB_LEDGER_SM_SECRET}")
+  if [ "${#missing[@]}" -gt 0 ]; then
+    echo "ERROR: preflight: could not read ${missing[*]} as this runner (docs/ci-pool-projects.md 5.6: the pair and the runner's secretAccessor grant are hand steps)." >&2
+    echo "       Grading a GitLab ledger needs the ledger token and the resets need the agent token; not running without them." >&2
+    return 1
+  fi
+  # A pair that reads but no longer authenticates (expired, revoked, replaced)
+  # would spend the whole lease to meet a 401 in the resets and the bench;
+  # prove both now, as the GitHub preflight proves the mint. The token goes
+  # to the probe in its environment, never on argv.
+  local which secret login
+  for which in agent ledger; do
+    [ "${which}" = "agent" ] && secret="${GITLAB_AGENT_SM_SECRET}" || secret="${GITLAB_LEDGER_SM_SECRET}"
+    if ! login="$(GITLAB_PROBE_TOKEN="${!which}" python3 "${SCRIPT_DIR}/ci_gitlab_forge.py" whoami --host "${GITLAB_FORGE_HOST}")"; then
+      echo "ERROR: preflight: the ${which} token in ${GITLAB_SECRETS_PROJECT}/${secret} does not authenticate at ${GITLAB_FORGE_HOST} (docs/ci-pool-projects.md 5.6: create a new one and store it); not running with it." >&2
+      return 1
+    fi
+    echo "Preflight: the ${which} token in ${GITLAB_SECRETS_PROJECT}/${secret} authenticates as ${login}"
+    if [ "${which}" = "agent" ] && [ "${login}" != "${GITLAB_BOT_LOGIN}" ]; then
+      echo "WARNING: preflight: the agent token belongs to ${login}, not ${GITLAB_BOT_LOGIN}; the bench grades the agent's ledgers and merge requests by the latter (GITLAB_BOT_LOGIN)." >&2
+    fi
+  done
+  EVAL_GITLAB_AGENT_TOKEN="${agent}"
+  # The job mounts BENCH_GITHUB_TOKEN for the GitHub path; unset under
+  # gitlab so no check can fall back to the GitHub twin repository.
+  unset BENCH_GITHUB_TOKEN GITHUB_TOKEN
+  export BENCH_FORGE="gitlab"
+  export BENCH_GITLAB_TOKEN="${ledger}"
+  export BENCH_GITLAB_HOST="${GITLAB_FORGE_HOST}"
+  export BENCH_GITLAB_AGENT_LOGIN="${GITLAB_BOT_LOGIN}"
+  echo "Ledger token: the pool's GitLab ledger token from ${GITLAB_SECRETS_PROJECT}/${GITLAB_LEDGER_SM_SECRET} (BENCH_FORGE=gitlab, agent login ${GITLAB_BOT_LOGIN}); the agent token from ${GITLAB_SECRETS_PROJECT}/${GITLAB_AGENT_SM_SECRET} drives the resets"
+}
+
+if [ "${EVAL_FORGE}" = "gitlab" ]; then
+  read_gitlab_tokens || exit 1
+elif [ -z "${EVAL_LEDGER_APP_KEY_FILE:-}" ]; then
   echo "Ledger token: using the mounted BENCH_GITHUB_TOKEN -- EVAL_LEDGER_APP_KEY_FILE is unset"
 else
   mint_ledger_token "preflight" || exit 1
@@ -928,6 +1012,9 @@ fi
 # The reset token stays out of BENCH_GITHUB_TOKEN, and the grading mint asks
 # for its reads explicitly (LEDGER_GRADING_MINT_BODY), so the grant the reset
 # needs does not widen the token grading holds.
+# Under EVAL_FORGE=gitlab the same two calls close GitLab issues with the
+# pool's agent token (--forge gitlab, hack/ci_gitlab_forge.py); the rest of
+# this comment is the GitHub path.
 # A reset that cannot run (no App key, an unmapped project, a mint the
 # installation refuses because App EVAL_LEDGER_APP_ID's installation no longer
 # holds issues: write -- granted 2026-09-22, docs/ci-pool-projects.md 5.4)
@@ -943,6 +1030,28 @@ eval_gitops_repo() { # <project-id>
   [ -n "${body}" ] || return 1
   eval "${body}"
   gitops_repo_for_project "$1"
+}
+
+eval_gitlab_project() { # <project-id>
+  # The GitLab table beside it, lifted the same way; under EVAL_FORGE=gitlab
+  # this is the repository the resets and the inject lane name.
+  local body
+  body="$(sed -n '/^gitlab_project_for_project() {$/,/^}$/p' "${SCRIPT_DIR}/ci-deploy.sh")"
+  [ -n "${body}" ] || return 1
+  eval "${body}"
+  gitlab_project_for_project "$1"
+}
+
+# The token a reset writes with: under gitlab the pool's agent token, read at
+# preflight; under github one minted narrowed to the repository (and to the
+# permissions named, issues: write when none are).
+forge_write_token() { # <owner/repo> [permissions JSON]
+  if [ "${EVAL_FORGE:-github}" = "gitlab" ]; then
+    [ -n "${EVAL_GITLAB_AGENT_TOKEN:-}" ] || return 1
+    printf '%s\n' "${EVAL_GITLAB_AGENT_TOKEN}"
+    return 0
+  fi
+  ledger_reset_token "$@"
 }
 
 # Emits the token on stdout, nothing else; diagnostics on stderr. Narrowed
@@ -1027,19 +1136,23 @@ reset_audit_ledgers() { # <label> [audit-id]
   local label="$1" audit_id="${2:-}" scope token out rc=0
   scope="every audit stream"
   [ -n "${audit_id}" ] && scope="the ${audit_id} stream"
-  if [ -z "${EVAL_LEDGER_APP_KEY_FILE:-}" ]; then
+  if [ "${EVAL_FORGE:-github}" != "gitlab" ] && [ -z "${EVAL_LEDGER_APP_KEY_FILE:-}" ]; then
     echo "Ledger reset (${label}): skipped, EVAL_LEDGER_APP_KEY_FILE is unset and the mounted PAT is a read credential; ${scope} keeps whatever ledger is open"
     return 0
   fi
   if [ -z "${EVAL_LEDGER_REPO:-}" ]; then
-    echo "Ledger reset (${label}): skipped, PROJECT_ID=${PROJECT_ID:-unset} maps to no GitOps repository (gitops_repo_for_project in hack/ci-deploy.sh); ${scope} keeps whatever ledger is open"
+    echo "Ledger reset (${label}): skipped, PROJECT_ID=${PROJECT_ID:-unset} maps to no GitOps repository (gitops_repo_for_project / gitlab_project_for_project in hack/ci-deploy.sh); ${scope} keeps whatever ledger is open"
     return 0
   fi
-  if ! token="$(ledger_reset_token "${EVAL_LEDGER_REPO}")"; then
-    echo "WARNING: Ledger reset (${label}): App ${EVAL_LEDGER_APP_ID} could not mint issues: write narrowed to ${EVAL_LEDGER_REPO}; ${scope} keeps whatever ledger is open. A 422 above means the installation no longer holds issues: write, which it was granted on 2026-09-22 (docs/ci-pool-projects.md 5.4)." >&2
+  if ! token="$(forge_write_token "${EVAL_LEDGER_REPO}")"; then
+    if [ "${EVAL_FORGE:-github}" = "gitlab" ]; then
+      echo "WARNING: Ledger reset (${label}): the pool's GitLab agent token is not in hand (read_gitlab_tokens at preflight); ${scope} keeps whatever ledger is open." >&2
+    else
+      echo "WARNING: Ledger reset (${label}): App ${EVAL_LEDGER_APP_ID} could not mint issues: write narrowed to ${EVAL_LEDGER_REPO}; ${scope} keeps whatever ledger is open. A 422 above means the installation no longer holds issues: write, which it was granted on 2026-09-22 (docs/ci-pool-projects.md 5.4)." >&2
+    fi
     return 0
   fi
-  local args=(--repo "${EVAL_LEDGER_REPO}" --project "${PROJECT_ID}" --build "${BUILD_ID:-local}")
+  local args=(--repo "${EVAL_LEDGER_REPO}" --project "${PROJECT_ID}" --build "${BUILD_ID:-local}" ${EVAL_FORGE_HELPER_ARGS[@]+"${EVAL_FORGE_HELPER_ARGS[@]}"})
   [ -n "${audit_id}" ] && args+=(--audit "${audit_id}")
   # The token rides in the environment of this one process, never on argv.
   out="$(LEDGER_RESET_TOKEN="${token}" python3 "${SCRIPT_DIR}/ci_reset_audit_ledgers.py" "${args[@]}" 2>&1)" || rc=$?
@@ -1065,16 +1178,20 @@ reset_audit_ledgers() { # <label> [audit-id]
 # (AGENT_PULLS_RESET_PERMISSIONS); the same guards as the ledger reset's.
 reset_agent_pulls() { # <label>  -> 0 when the repository is clean, 1 when a unit must not run on it
   local label="$1" token out rc=0 slug record
-  if [ -z "${EVAL_LEDGER_APP_KEY_FILE:-}" ]; then
+  if [ "${EVAL_FORGE:-github}" != "gitlab" ] && [ -z "${EVAL_LEDGER_APP_KEY_FILE:-}" ]; then
     echo "Agent pulls reset (${label}): skipped, EVAL_LEDGER_APP_KEY_FILE is unset and the mounted PAT is a read credential; the repository keeps whatever the agent left"
     return 0
   fi
   if [ -z "${EVAL_LEDGER_REPO:-}" ]; then
-    echo "Agent pulls reset (${label}): skipped, PROJECT_ID=${PROJECT_ID:-unset} maps to no GitOps repository (gitops_repo_for_project in hack/ci-deploy.sh)"
+    echo "Agent pulls reset (${label}): skipped, PROJECT_ID=${PROJECT_ID:-unset} maps to no GitOps repository (gitops_repo_for_project / gitlab_project_for_project in hack/ci-deploy.sh)"
     return 0
   fi
-  if ! token="$(ledger_reset_token "${EVAL_LEDGER_REPO}" "${AGENT_PULLS_RESET_PERMISSIONS}")"; then
-    echo "WARNING: Agent pulls reset (${label}): App ${EVAL_LEDGER_APP_ID} could not mint pull_requests: write, contents: write and issues: write narrowed to ${EVAL_LEDGER_REPO}; a unit that requests a pull request does not run on a repository this could not clean. A 422 above means the installation does not hold those permissions (docs/ci-pool-projects.md 5.3)." >&2
+  if ! token="$(forge_write_token "${EVAL_LEDGER_REPO}" "${AGENT_PULLS_RESET_PERMISSIONS}")"; then
+    if [ "${EVAL_FORGE:-github}" = "gitlab" ]; then
+      echo "WARNING: Agent pulls reset (${label}): the pool's GitLab agent token is not in hand (read_gitlab_tokens at preflight); a unit that requests a merge request does not run on a project this could not clean." >&2
+    else
+      echo "WARNING: Agent pulls reset (${label}): App ${EVAL_LEDGER_APP_ID} could not mint pull_requests: write, contents: write and issues: write narrowed to ${EVAL_LEDGER_REPO}; a unit that requests a pull request does not run on a repository this could not clean. A 422 above means the installation does not hold those permissions (docs/ci-pool-projects.md 5.3)." >&2
+    fi
     return 1
   fi
   # One record per call beside the artifacts, named for the call, so a run
@@ -1084,7 +1201,7 @@ reset_agent_pulls() { # <label>  -> 0 when the repository is clean, 1 when a uni
   # The token rides in the environment of this one process, never on argv.
   out="$(AGENT_PULLS_RESET_TOKEN="${token}" python3 "${SCRIPT_DIR}/ci_reset_agent_pulls.py" \
     --repo "${EVAL_LEDGER_REPO}" --project "${PROJECT_ID}" --build "${BUILD_ID:-local}" \
-    --scope "${label}" --record "${record}" 2>&1)" || rc=$?
+    --scope "${label}" --record "${record}" ${EVAL_FORGE_HELPER_ARGS[@]+"${EVAL_FORGE_HELPER_ARGS[@]}"} 2>&1)" || rc=$?
   [ -n "${out}" ] && printf '%s\n' "${out}" | sed "s/^/Agent pulls reset (${label}): /"
   if [ "${rc}" -ne 0 ]; then
     echo "WARNING: Agent pulls reset (${label}): the helper exited ${rc}; the repository is not clean (${record}), and a unit that requests a pull request does not run on it." >&2
@@ -1258,7 +1375,11 @@ wait_platform_runs() { # <label> <space-separated audit ids>
   return 0
 }
 
-EVAL_LEDGER_REPO="$(eval_gitops_repo "${PROJECT_ID:-}" 2>/dev/null)" || EVAL_LEDGER_REPO=""
+if [ "${EVAL_FORGE}" = "gitlab" ]; then
+  EVAL_LEDGER_REPO="$(eval_gitlab_project "${PROJECT_ID:-}" 2>/dev/null)" || EVAL_LEDGER_REPO=""
+else
+  EVAL_LEDGER_REPO="$(eval_gitops_repo "${PROJECT_ID:-}" 2>/dev/null)" || EVAL_LEDGER_REPO=""
+fi
 reset_audit_ledgers "lease"
 reset_agent_pulls "lease" || echo "WARNING: Agent pulls reset (lease): the repository is not clean; every unit of a case that requests a pull request runs its own reset first and is marked MISSING when that fails too." >&2
 
@@ -1724,7 +1845,7 @@ if [ "${AGENT_TRANSPORT:-}" = "${EVAL_INJECT_TRANSPORT}" ]; then
     INJECT_LANE_REPO="${EVAL_GITOPS_REPO}"
   fi
   if [ -z "${INJECT_LANE_REPO}" ]; then
-    echo "ERROR: AGENT_TRANSPORT=${AGENT_TRANSPORT} but no GitOps repository is known for PROJECT_ID=${PROJECT_ID:-unset} (gitops_repo_for_project in hack/ci-deploy.sh, or EVAL_GITOPS_REPO on a local run); the lane's GitHub-write safeguard (${EVAL_INJECT_LANE_SAFEGUARDS_FILE}) cannot name the repository it reads, so the lane does not start." >&2
+    echo "ERROR: AGENT_TRANSPORT=${AGENT_TRANSPORT} but no GitOps repository is known for PROJECT_ID=${PROJECT_ID:-unset} (gitops_repo_for_project or gitlab_project_for_project in hack/ci-deploy.sh, by EVAL_FORGE; EVAL_GITOPS_REPO on a local GitHub run); the lane's write safeguard (${EVAL_INJECT_LANE_SAFEGUARDS_FILE}) cannot name the repository it reads, so the lane does not start." >&2
     exit 1
   fi
   export BENCH_GITOPS_REPO="${INJECT_LANE_REPO}"
@@ -3025,11 +3146,12 @@ profile_begin "record + final gate"
 # against a window it had just moved.
 #
 # EVAL_MODE_NEXT=1 is the fourth, for the same reason as the third. The next
-# lane's periodic on main (ci-kube-agents-eval-next) is also a periodic with
-# no PULL_NUMBER, and the key has no mode field either, so its samples would
-# be today's the moment they landed. The deploy admits the flag on that job
-# by name (EVAL_MODE_NEXT_JOB_NAMES in hack/ci-deploy.sh); this is what keeps
-# the admission from moving the window. Whatever the job's identity may hold
+# lane's periodic and nightly on main (ci-kube-agents-eval-next,
+# ci-kube-agents-eval-nightly-next-claude) are also periodics with no
+# PULL_NUMBER, and the key has no mode field either, so their samples would
+# be today's the moment they landed. The deploy admits the flag on those
+# jobs by name (EVAL_MODE_NEXT_JOB_NAMES in hack/ci-deploy.sh); this is what
+# keeps the admission from moving the window. Whatever the job's identity may hold
 # on the store is a grant in oss-test-infra this script cannot see, not a
 # property of it. A next record of its own is the mode field on the key;
 # until it exists a flagged run reads the store, when one is armed, and

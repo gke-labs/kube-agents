@@ -35,6 +35,7 @@ func setBaseEnv(t *testing.T) {
 	t.Setenv("A2A_FIRST_EVENT_GRACE", "")
 	t.Setenv("A2A_OWNER_DEPLOYMENT", "")
 	t.Setenv("A2A_MAX_SESSIONS", "")
+	t.Setenv("A2A_DELEGATION_DEPTH_MAX", "")
 	t.Setenv("A2A_IDLE_TTL", "")
 	t.Setenv("A2A_GCHAT_RELAY_URL", "")
 	t.Setenv("A2A_GCHAT_TOKEN_PATH", "")
@@ -948,5 +949,37 @@ func TestAMalformedPodNamespaceIsAGatewayBootFailure(t *testing.T) {
 					tc.namespace, tc.scope, err, tc.wantErr)
 			}
 		})
+	}
+}
+
+// TestDelegationDepthMaxFromEnv: unset means 3; a value below 1 or a
+// non-integer refuses the boot, the way A2A_MAX_SESSIONS does, rather than
+// quietly clamping a typo into a different bound.
+func TestDelegationDepthMaxFromEnv(t *testing.T) {
+	setBaseEnv(t)
+	cfg, err := FromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.DelegationDepthMax != 3 {
+		t.Fatalf("default DelegationDepthMax = %d, want 3", cfg.DelegationDepthMax)
+	}
+
+	t.Setenv("A2A_DELEGATION_DEPTH_MAX", "5")
+	cfg, err = FromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.DelegationDepthMax != 5 {
+		t.Fatalf("DelegationDepthMax = %d, want 5", cfg.DelegationDepthMax)
+	}
+
+	for _, bad := range []string{"0", "-1", "junk"} {
+		t.Setenv("A2A_DELEGATION_DEPTH_MAX", bad)
+		if _, err := FromEnv(); err == nil {
+			t.Fatalf("A2A_DELEGATION_DEPTH_MAX=%q accepted", bad)
+		} else if !strings.Contains(err.Error(), "A2A_DELEGATION_DEPTH_MAX") {
+			t.Fatalf("A2A_DELEGATION_DEPTH_MAX=%q: error %q does not name the variable", bad, err)
+		}
 	}
 }

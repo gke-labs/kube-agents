@@ -44,6 +44,7 @@ nothing, which is how this is checked from a laptop with a personal token.
 from __future__ import annotations
 
 import argparse
+import http.client
 import json
 import os
 import sys
@@ -78,6 +79,11 @@ CLOSE_REASON = "not_planned"
 # blaming the run for a close it did not make. scripts/test_ci_eval_ledger_reset.py
 # pins the two literals equal.
 RESET_MARKER = "<!-- kube-agents-eval-ledger-reset -->"
+# The two forges this closes ledgers on. GitLab's rules and calls live in
+# hack/ci_gitlab_forge.py, which reads the ledger constants above from here.
+FORGE_GITHUB = "github"
+FORGE_GITLAB = "gitlab"
+FORGE_HOSTS = {FORGE_GITHUB: "api.github.com", FORGE_GITLAB: "gitlab.com"}
 
 
 class ResetError(Exception):
@@ -242,25 +248,51 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--build", required=True, help="the eval build id, named in the closing comment")
     parser.add_argument("--audit", default=None, help="close this stream's ledger only (the audit id, as in audit:<id>)")
     parser.add_argument("--dry-run", action="store_true", help="list what would close; write nothing")
+    parser.add_argument(
+        "--forge", choices=(FORGE_GITHUB, FORGE_GITLAB), default=FORGE_GITHUB,
+        help="github: --repo is owner/name on github.com; gitlab: --repo is the project path under the pool's group (hack/ci_gitlab_forge.py)",
+    )
     args = parser.parse_args(argv)
     token = os.environ.get(TOKEN_ENV, "")
     if not token:
         print(f"ERROR: {TOKEN_ENV} is not set; nothing to authenticate with", file=sys.stderr)
         return 2
+    forge = "GitLab" if args.forge == FORGE_GITLAB else "GitHub"
+    host = FORGE_HOSTS[args.forge]
+    # Run as a script this module is __main__, and the GitLab module's import
+    # of it by name loads a second copy with a ResetError of its own; the
+    # refusals caught below are both classes, so a guard's refusal is an
+    # ERROR line and exit 2 on either forge rather than a traceback.
+    refusals: tuple = (ResetError,)
+    limited: tuple = ()
     try:
-        unclosed = reset(args.repo, args.project, args.build, token, args.audit, args.dry_run)
-    except ResetError as exc:
+        if args.forge == FORGE_GITLAB:
+            # Imported here: the GitLab module imports this one for the shared
+            # ledger rules, so a top-level import would be circular.
+            import ci_gitlab_forge as gitlab
+
+            refusals = (ResetError, gitlab.ResetError)
+            limited = (gitlab.RateLimited,)
+            unclosed = gitlab.reset_ledgers(args.repo, args.project, args.build, token, args.audit, args.dry_run)
+        else:
+            unclosed = reset(args.repo, args.project, args.build, token, args.audit, args.dry_run)
+    except refusals as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2
+    except limited as exc:
+        # The GitHub path's limit surfaces as an HTTPError below; GitLab's as
+        # this, reported the same way.
+        print(f"ERROR: {exc}; the ledgers left open are graded as every run before the reset did", file=sys.stderr)
+        return 1
     except urllib.error.HTTPError as exc:
         print(
-            f"ERROR: GitHub answered HTTP {exc.code} ({exc.reason}) listing {args.repo}'s issues; "
+            f"ERROR: {forge} answered HTTP {exc.code} ({exc.reason}) listing {args.repo}'s issues; "
             "a 403 or 404 here is the token's reach, not an empty repository",
             file=sys.stderr,
         )
         return 1
-    except OSError as exc:
-        print(f"ERROR: could not reach api.github.com ({type(exc).__name__}: {exc})", file=sys.stderr)
+    except (OSError, http.client.HTTPException) as exc:
+        print(f"ERROR: could not reach {host} ({type(exc).__name__}: {exc})", file=sys.stderr)
         return 1
     return 1 if unclosed else 0
 

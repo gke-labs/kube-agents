@@ -155,6 +155,12 @@ KNOWN_UNREGISTERED = {
     # nightly is a tier decision nobody has made; this entry is the record
     # that the omission is known rather than accidental.
     "cluster-provision-kanban": "cluster-scoped provisioning task, tier decision pending",
+    # Has its fixture (its own stack) and its eval record (#2468: red on main,
+    # three greens on the fix), and belongs in the nightly; held out only
+    # because the nightly's infra-lock chain has no room for another stack
+    # case. The entry goes when #2467 makes room, #2552 sweeps what a killed
+    # run leaves behind, and the case joins hack/eval/nightly-cases.txt.
+    "networking-audit-subnet-range-exhaustion": "#2467: stack case held out of the nightly for its infra-lock budget",
 }
 
 # Cases whose fixture does not exist at all, waiting on the issue that plants
@@ -213,6 +219,11 @@ FIXTURE_NOT_READY = {
         "#2228: needs checkout-gateway declared under clusters/seeded-a/ in "
         "each pool project's *-infra repository, so 3.3's fix is a manifest "
         "rather than manual"
+    ),
+    "obtainability-untargeted-compute-class-manifest": (
+        "#2540: needs a ComputeClass cluster without default ComputeClass and with "
+        "an untargeted workload (untargeted-worker) in each pool project, so 3.24's "
+        "finding on the planted workload is verifiable"
     ),
     "cluster-agent-stalled-controller-diagnosis": (
         "#1873: needs the stalled-controller role applied to every pool "

@@ -7560,3 +7560,67 @@ func TestTheSessionFenceIsTheLastFenceTheTeardownDeletes(t *testing.T) {
 			"fence is left behind forever on an install refused on its first reconcile", got, want)
 	}
 }
+
+// TestGatewayRendersThePlatformAllowlists: the CR's Chat and Slack allowlists
+// reach the gateway as two env vars, comma-joined, Chat lowercased; an absent
+// or empty list renders no var at all (absent means all authenticated users).
+func TestGatewayRendersThePlatformAllowlists(t *testing.T) {
+	envOf := func(agent *agentv1alpha1.PlatformAgent) map[string]string {
+		out := map[string]string{}
+		for _, e := range buildA2AGatewayDeployment(agent).Spec.Template.Spec.Containers[0].Env {
+			out[e.Name] = e.Value
+		}
+		return out
+	}
+	agent := a2aTestAgent()
+	if _, ok := envOf(agent)[a2aTargetAllowedUsersGchatEnvVar]; ok {
+		t.Fatal("gchat allowlist rendered with no integration block")
+	}
+	agent.Spec.Integration = &agentv1alpha1.PlatformAgentIntegrationSpec{
+		GoogleChat: &agentv1alpha1.GoogleChatSpec{AllowedUsers: []string{"Alice@Example.com", " bob@example.com "}},
+		Slack:      &agentv1alpha1.SlackSpec{AllowedUsers: []string{"U0ABC", "U0DEF"}},
+	}
+	env := envOf(agent)
+	if got := env[a2aTargetAllowedUsersGchatEnvVar]; got != "alice@example.com,bob@example.com" {
+		t.Fatalf("gchat = %q", got)
+	}
+	if got := env[a2aTargetAllowedUsersSlackEnvVar]; got != "U0ABC,U0DEF" {
+		t.Fatalf("slack = %q", got)
+	}
+	// Absent, and the allow-all spelling [""] the legacy consumer reads as
+	// such, render nothing: all authenticated users.
+	agent.Spec.Integration.GoogleChat.AllowedUsers = nil
+	agent.Spec.Integration.Slack.AllowedUsers = []string{""}
+	env = envOf(agent)
+	for _, name := range []string{a2aTargetAllowedUsersGchatEnvVar, a2aTargetAllowedUsersSlackEnvVar} {
+		if _, ok := env[name]; ok {
+			t.Fatalf("%s rendered for an allow-all list", name)
+		}
+	}
+}
+
+// TestGatewayRendersABlankPlatformAllowlistAsNobody: a CR list that is present
+// but blank after trimming, and not the allow-all spelling, renders the var
+// empty. The gateway reads set-but-empty as a list with no members, so the
+// list admits nobody (#2207's rule for the Chat ingress list) rather than
+// quietly widening to everyone.
+func TestGatewayRendersABlankPlatformAllowlistAsNobody(t *testing.T) {
+	agent := a2aTestAgent()
+	agent.Spec.Integration = &agentv1alpha1.PlatformAgentIntegrationSpec{
+		GoogleChat: &agentv1alpha1.GoogleChatSpec{AllowedUsers: []string{"  "}},
+		Slack:      &agentv1alpha1.SlackSpec{AllowedUsers: []string{"", " "}},
+	}
+	env := map[string]corev1.EnvVar{}
+	for _, e := range buildA2AGatewayDeployment(agent).Spec.Template.Spec.Containers[0].Env {
+		env[e.Name] = e
+	}
+	for _, name := range []string{a2aTargetAllowedUsersGchatEnvVar, a2aTargetAllowedUsersSlackEnvVar} {
+		e, ok := env[name]
+		if !ok {
+			t.Fatalf("%s not rendered for a blank list; the gateway would read no list as everyone", name)
+		}
+		if e.Value != "" || e.ValueFrom != nil {
+			t.Fatalf("%s = %+v, want rendered empty", name, e)
+		}
+	}
+}

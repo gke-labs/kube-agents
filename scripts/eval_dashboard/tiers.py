@@ -3,8 +3,10 @@
 
 The collector records two kinds of run under one schema (SCHEMA.md,
 ``runs[].tier``): the presubmit gate's, one per pull-request build of
-``pull-kube-agents-smoke-test``, and the nightly periodic's, one per build of
-``ci-kube-agents-eval-nightly`` against ``main`` with no pull request. Every
+``pull-kube-agents-smoke-test``, and the nightly periodics', one per build of
+``ci-kube-agents-eval-nightly`` (and of ``ci-kube-agents-eval-nightly-writers``
+when a night is split across two jobs, ``nightly.py``) against ``main`` with
+no pull request. Every
 gate verdict -- the health adjudicator's rules, the "is this red mine?"
 classification, the Brief's runs list -- is a statement about the presubmit,
 so each of those consumers filters through ``presubmit_runs`` before it
