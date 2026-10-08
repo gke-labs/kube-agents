@@ -76,6 +76,7 @@ IN_FLIGHT_STATUSES = (CLAIMED_STATUS, "running")
 # its reason. A mark skipped because the audit was already running is answered by that run; a skip
 # for any other reason (a shutdown, a lost claim) ran nothing and is read as no claim at all.
 SKIPPED_STATUS = "skipped"
+COMPLETED_STATUS = "completed"
 SKIP_REASON_COLUMN = "skip_reason"
 SKIP_ALREADY_RUNNING = "already_running_elsewhere"
 PLATFORM_PROFILE = "platform"
@@ -106,9 +107,11 @@ MAX_TRIGGER_ATTEMPTS = 5
 # A marked audit is claimed on the next profile-cron-tick, a minute or two later; past this
 # with no run, the mark is counted as a failed attempt and made again.
 START_LIMIT_SECONDS = 10 * 60
-# Several times the longest audit run (9-15 minutes, #985). A run still going past it, or a
-# row a gateway restart left at running, does not hold the chain any longer.
-RUN_LIMIT_SECONDS = 60 * 60
+# A run still going past this, or a row a gateway restart left at running (Hermes retires those as
+# `unknown` on its next start), does not hold the chain any longer. Single audit runs on the CI
+# install have reached 2739 s, so an hour leaves too little room before the chain starts the next
+# audit beside a slow one.
+RUN_LIMIT_SECONDS = 2 * 60 * 60
 
 STATE_DONE = "done"
 STATE_FIRED = "fired"
@@ -123,8 +126,13 @@ CURRENT_MARKED_AT = "marked_at"
 STATE_SKIPPED = "skipped"
 STATE_REASON = "reason"
 STATE_AT = "at"
-SKIP_NO_REPOSITORY = "no GitOps repository is configured"
-SKIP_NOT_NEW = "the onboarding sweep was filed before this job existed"
+# What the audits publish to is the GitHub entries of managed_repos (gitops_workspace); a repository
+# on another forge is not one they can use.
+SKIP_NO_REPOSITORY = "no GitHub repository in managed_repos for the audits to publish to"
+# Past NEW_INSTALL_SECONDS the stage cannot tell an install that onboarded before this job existed
+# from a new one whose start checks failed all day, so the reason says only what it knows.
+SKIP_NOT_NEW = "the onboarding sweep was filed more than a day before the stage could start"
+SKIP_UNSETTLED = "the onboarding scan had not settled a day after its sweep was filed"
 HOLD_MISSING = "not on the Platform Agent's roster"
 HOLD_DISABLED = "disabled"
 HOLD_PAUSED = "paused"
@@ -199,7 +207,7 @@ def ranking_finished(board: Path, task_id: str) -> bool | None:
     return row is not None and row[0] in FINISHED_STATUSES
 
 
-def scan_settled(data_dir: Path, now: float) -> bool:
+def scan_settled(data_dir: Path, now: float, quiet: bool = False) -> bool:
     """Whether the onboarding scan has settled, read from the hand-off's own record and board read.
 
     The ranking card is the one the hand-off recorded for this sweep, and nothing else: a card
@@ -229,6 +237,8 @@ def scan_settled(data_dir: Path, now: float) -> bool:
             return True
     wait = bootstrap_handoff.deadline(state) + RANKING_ALLOWANCE_SECONDS
     if now - filed_at >= wait:
+        if quiet:
+            return True
         _log(
             f"the scan has not settled {wait // bootstrap_handoff.SECONDS_PER_MINUTE} minutes after its sweep "
             "was filed; starting the audits anyway"
@@ -291,10 +301,12 @@ def audit_holds(data_dir: Path) -> dict[str, str] | None:
         job = by_id.get(job_id)
         if job is None:
             holds[job_id] = HOLD_MISSING
+        elif job.get("state") == PAUSED_STATE or job.get("paused_at"):
+            # Before `enabled`: Hermes' pause_job sets enabled false too, so a paused job reads as
+            # disabled unless its pause markers are checked first.
+            holds[job_id] = HOLD_PAUSED
         elif not job.get("enabled", True):
             holds[job_id] = HOLD_DISABLED
-        elif job.get("state") == PAUSED_STATE or job.get("paused_at"):
-            holds[job_id] = HOLD_PAUSED
     return holds
 
 
@@ -357,10 +369,17 @@ def audits_in_flight(runs: list[tuple[str, str, float]], now: float) -> set[str]
     return {job for job, status, claimed in runs if status in IN_FLIGHT_STATUSES and now - claimed < RUN_LIMIT_SECONDS}
 
 
-def advance_chain(data_dir: Path, state: dict, now: float) -> dict:
+def completed_since(runs: list[tuple[str, str, float]], job_id: str, since: float) -> bool:
+    """Whether ``job_id`` has a completed run claimed at or after ``since``."""
+    return any(job == job_id and status == COMPLETED_STATUS and claimed >= since for job, status, claimed in runs)
+
+
+def advance_chain(data_dir: Path, state: dict, now: float, since: float | None = None) -> dict:
     """Move the chain one step: wait on the audit in flight, or mark the next one due.
 
-    The returned state is also written to the marker, and says whether the stage is done.
+    ``since`` is when the onboarding sweep was filed: an audit with a run completed after it, a
+    scheduled one say, is one this install has already had, and is not run again. The returned
+    state is also written to the marker, and says whether the stage is done.
     """
     fired = list(state.get(STATE_FIRED, []))
     attempts = dict(state.get(STATE_ATTEMPTS, {}))
@@ -422,6 +441,10 @@ def advance_chain(data_dir: Path, state: dict, now: float) -> dict:
             # was this audit's, and marking it again would start a second.
             fired.append(job_id)
             continue
+        if since is not None and completed_since(runs, job_id, since):
+            _log(f"not marking {job_id}: it has completed a run since the onboarding sweep was filed")
+            fired.append(job_id)
+            continue
         if job_id in holds:
             _log(f"not starting {job_id}: {holds[job_id]}")
             held[job_id] = holds[job_id]
@@ -448,6 +471,11 @@ def advance_chain(data_dir: Path, state: dict, now: float) -> dict:
     return save(done=True)
 
 
+def skip(data_dir: Path, reason: str, now: float) -> None:
+    _log(f"not starting the first-run audits: {reason}")
+    write_state(data_dir, {STATE_DONE: True, STATE_SKIPPED: True, STATE_REASON: reason, STATE_AT: now})
+
+
 def main(data_dir: Path | None = None, now: float | None = None) -> int:
     data_dir = data_dir or _data_dir()
     now = time.time() if now is None else now
@@ -455,12 +483,11 @@ def main(data_dir: Path | None = None, now: float | None = None) -> int:
     if state.get(STATE_DONE):
         retire()
         return 0
+    filed = scan_filed(data_dir)
     if not state:
         # Not started yet: the checks that decide whether, and when, the chain starts.
-        filed = scan_filed(data_dir)
         if filed is not None and now - filed[1] >= NEW_INSTALL_SECONDS:
-            _log(f"not starting the first-run audits: {SKIP_NOT_NEW}")
-            write_state(data_dir, {STATE_DONE: True, STATE_SKIPPED: True, STATE_REASON: SKIP_NOT_NEW, STATE_AT: now})
+            skip(data_dir, SKIP_NOT_NEW if scan_settled(data_dir, now, quiet=True) else SKIP_UNSETTLED, now)
             return 0
         if not scan_settled(data_dir, now):
             return 0
@@ -470,10 +497,9 @@ def main(data_dir: Path | None = None, now: float | None = None) -> int:
             _log(f"cannot read the managed repositories: {e}")
             return 0
         if not repositories:
-            _log(f"not starting the first-run audits: {SKIP_NO_REPOSITORY}")
-            write_state(data_dir, {STATE_DONE: True, STATE_SKIPPED: True, STATE_REASON: SKIP_NO_REPOSITORY, STATE_AT: now})
+            skip(data_dir, SKIP_NO_REPOSITORY, now)
             return 0
-    advance_chain(data_dir, state, now)
+    advance_chain(data_dir, state, now, since=filed[1] if filed is not None else None)
     return 0
 
 

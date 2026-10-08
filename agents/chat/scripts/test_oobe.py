@@ -470,6 +470,32 @@ class StageTest(unittest.TestCase):
         self._main(now=NOW_SETTLED + MINUTE)
         self.assertEqual(self._started_ids(), FIRST)
 
+    def test_a_scheduled_run_completed_since_the_sweep_is_not_run_again(self):
+        # The 06:20 compliance run went while the scan was still settling: when the chain reaches
+        # compliance it passes over it and marks the audit after.
+        self._ledger("compliance-audit", "completed", FILED_AT + MINUTE)
+        self._file_scan()
+        _board(self.board, [_ranking("done")])
+        now = self._drive()
+        self.assertNotIn("compliance-audit", self._started_ids())
+        self.assertEqual(self._started_ids(), [a for a in oobe.FIRST_RUN_AUDITS if a != "compliance-audit"])
+        self.assertIn("compliance-audit", oobe.read_state(self.d)[oobe.STATE_FIRED])
+
+    def test_a_run_from_before_the_sweep_is_not_adopted(self):
+        # Yesterday's scheduled run is not this install's first run.
+        self._ledger("compliance-audit", "completed", FILED_AT - 2 * MINUTE)
+        self._file_scan()
+        _board(self.board, [_ranking("done")])
+        self._drive()
+        self.assertEqual(self._started_ids(), list(oobe.FIRST_RUN_AUDITS))
+
+    def test_a_failed_run_since_the_sweep_is_run_again(self):
+        self._ledger("compliance-audit", "failed", FILED_AT + MINUTE)
+        self._file_scan()
+        _board(self.board, [_ranking("done")])
+        self._drive()
+        self.assertIn("compliance-audit", self._started_ids())
+
     def test_the_next_mark_waits_for_a_scheduled_run(self):
         self._file_scan()
         _board(self.board, [_ranking("done")])
@@ -659,6 +685,14 @@ class StageTest(unittest.TestCase):
         self.assertTrue(state[oobe.STATE_DONE])
         self.assertEqual(state[oobe.STATE_REASON], oobe.SKIP_NOT_NEW)
 
+    def test_a_scan_still_unsettled_after_a_day_says_so(self):
+        # A board that never reads, or a sweep it does not have, is ended by the age rule with
+        # that reason, not with "filed before this job existed".
+        self._file_scan()
+        self.board.write_text("not a database")
+        self._main(now=FILED_AT + oobe.NEW_INSTALL_SECONDS)
+        self.assertEqual(oobe.read_state(self.d)[oobe.STATE_REASON], oobe.SKIP_UNSETTLED)
+
     def test_a_chain_already_under_way_is_not_cut_off_by_age(self):
         self._file_scan()
         _board(self.board, [_ranking("done")])
@@ -671,7 +705,8 @@ class StageTest(unittest.TestCase):
         # trigger_job would set enabled back to true.
         self._roster([
             {"id": "compliance-audit", "enabled": False},
-            {"id": "obtainability-audit", "enabled": True, "state": "paused"},
+            # pause_job's own shape: enabled false beside the pause markers, so not "disabled".
+            {"id": "obtainability-audit", "enabled": False, "state": "paused", "paused_at": "2026-10-06T00:00:00"},
             {"id": "stockout-prevention", "enabled": True, "paused_at": "2026-10-06T00:00:00"},
             {"id": "fleet-wide-cost-analysis", "enabled": True},
         ])

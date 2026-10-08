@@ -134,8 +134,8 @@ before the first mark and between marks; a mark that finds its audit already run
 run as its own, and one the store skipped for any other reason counts as not claimed.
 A mark the scheduler has not claimed after `START_LIMIT_SECONDS` (10 minutes) is made again, as a
 failed attempt, unless the scheduler claims it late first, in which case that run is the audit's.
-A run still going after `RUN_LIMIT_SECONDS` (an hour), or a row a gateway restart left at running,
-stops holding the chain. The stage is done once the last audit's run has started.
+A run still going after `RUN_LIMIT_SECONDS` (two hours; single audit runs on CI have reached
+46 minutes), or a row a gateway restart left at running, stops holding the chain. The stage is done once the last audit's run has started.
 
 For each audit in turn, `oobe.py` calls Hermes' `cron.jobs.trigger_job(<id>)` in a subprocess of the
 gateway's own interpreter with `HERMES_HOME=<agent home>/profiles/platform`, which is where

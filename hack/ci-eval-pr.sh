@@ -139,12 +139,12 @@ readonly EVAL_INFLIGHT_POLL_STEP_SECONDS=5
 # container, the interpreter it runs the read with and the home holding the
 # Platform Agent's cron store, how long a unit waits for a run the install started on
 # one of its streams, and how often it looks. A unit may owe two runs: the one
-# before the audit a pending stage marks next, then that audit's own. Each is
-# counted for at most an hour (the stage's RUN_LIMIT_SECONDS and the read's
-# stale cutoff), and single runs here have reached 2739 s (the delegation
-# ceilings below), so the bound is two of those hours. It is reached only
-# while runs are really going; a stage oobe-first-run-audits left armed can
-# owe more, and the bound caps that too.
+# before the audit a pending stage marks next, then that audit's own. Single
+# runs here have reached 2739 s (the delegation ceilings below), so the bound
+# is two hours. Each run is counted for up to the stage's RUN_LIMIT_SECONDS
+# (the read's stale cutoff matches it), so two slow runs, or a stage
+# oobe-first-run-audits left armed, can owe more; the bound caps that. It is
+# reached only while runs are really going.
 readonly EVAL_GATEWAY_CONTAINER="platform-agent"
 readonly EVAL_GATEWAY_PYTHON="/opt/hermes/.venv/bin/python3"
 readonly EVAL_GATEWAY_HOME="/opt/data"
