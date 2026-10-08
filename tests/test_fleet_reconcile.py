@@ -542,7 +542,7 @@ class MainTest(unittest.TestCase):
 
     def test_a_run_terminated_mid_walk_has_named_every_project_it_reached(self):
         # The per-project line is printed as each finishes, and the summary
-        # is printed on the way out, so a weekly killed at its deadline still
+        # is printed on the way out, so a run killed at its deadline still
         # says what it applied and refused.
         calls = []
 
@@ -1493,6 +1493,43 @@ class FleetTreeTest(unittest.TestCase):
         # and the hash encodes them back, so such a name is an input, not a crash.
         listing = _fleet_listing(**FLEET_INPUTS, **{"caf\udce9.tf": "cccc"}, **FLEET_DOCS)
         self.assertNotEqual(self._tree(listing), TREE_A)
+
+    def test_a_non_utf8_input_name_hashes_through_real_git(self):
+        # The index can hold a name the filesystem cannot; `ls-tree -z` prints
+        # its raw bytes and git_output decodes them with surrogateescape. Real
+        # git, so the decode half is what this pins, not the mock's string.
+        with tempfile.TemporaryDirectory() as tmp:
+            env = dict(os.environ, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@t", GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@t")
+
+            def git(*args, data=None):
+                return subprocess.run([b"git", b"-C", os.fsencode(tmp), *args], check=True, capture_output=True, input=data, env=env).stdout.decode().strip()
+
+            def commit_index():
+                git(b"update-ref", b"HEAD", git(b"commit-tree", git(b"write-tree").encode(), b"-m", b"x").encode())
+
+            git(b"init", b"-q")
+            blob = git(b"hash-object", b"-w", b"--stdin", data=b"# tf\n").encode()
+            for name in (b"bench/tf/fleet/main.tf", b"bench/tf/fleet/caf\xe9.tf", b"bench/tf/fleet/README.md"):
+                git(b"update-index", b"--add", b"--cacheinfo", b"100644," + blob + b"," + name)
+            commit_index()
+            with mock.patch.object(reconcile, "REPO_ROOT", pathlib.Path(tmp)):
+                with_name = reconcile.fleet_tree("HEAD")
+            git(b"update-index", b"--force-remove", b"bench/tf/fleet/caf\xe9.tf")
+            commit_index()
+            with mock.patch.object(reconcile, "REPO_ROOT", pathlib.Path(tmp)):
+                without_name = reconcile.fleet_tree("HEAD")
+        self.assertEqual(len(with_name), 64)
+        self.assertNotEqual(with_name, without_name, "the non-UTF-8 .tf counted as an input")
+
+    def test_every_tracked_file_in_the_fleet_directory_is_an_input_or_a_known_bystander(self):
+        # A new file kind tofu would read (a tfvars file, a templatefile
+        # source) belongs in the inputs and in the postsubmit's trigger: a
+        # stranger here is a decision to make, so its arrival is red.
+        bystanders = {"README.md", "fixtures.json"}
+        tracked = subprocess.run(["git", "-C", str(reconcile.REPO_ROOT), "ls-files", "--", reconcile.FLEET_SUBDIR], check=True, capture_output=True, text=True).stdout.split()
+        self.assertGreater(len(tracked), 5)
+        strangers = [path for path in tracked if not reconcile.is_fleet_input(path) and path.rsplit("/", 1)[-1] not in bystanders]
+        self.assertEqual(strangers, [], "add it to FLEET_INPUT_SUFFIXES/NAMES and the postsubmit's run_if_changed, or to the bystanders here")
 
     def test_the_inputs_are_the_stack_its_lock_and_the_allowlist(self):
         self.assertTrue(all(reconcile.is_fleet_input("bench/tf/fleet/" + n) for n in ("main.tf", "defects-b.tf", ".terraform.lock.hcl", "reconcile-allow.json")))

@@ -3937,7 +3937,7 @@ class FleetReconcilerRolesMatchGrantersTest(unittest.TestCase):
     """FLEET_RECONCILER_ROLES and its member must equal the provisioning loop and the runbook's repair block.
 
     Same silent drift as the runners': a role dropped from the script leaves a
-    project the verifier passes and the weekly reconcile fails in.
+    project the verifier passes and the daily reconcile fails in.
     """
 
     _VAR = "FLEET_RECONCILER_SA"
