@@ -1461,6 +1461,21 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/apply_state_db_sync
 # itself was installed by its own stage.
 # See the module docstring in deploy/docker/patches/kanban_children_settled.py.
 #
+# kanban_priority (gke-labs/kube-agents#2678): user cards ahead of background
+# triage. The dispatcher half (one slot held for user cards, the saturation
+# record, the `queued` events) is in the kanban-scheduling stage above, which
+# also installs hermes_cli/kanban_priority.py. This applier wires the rest:
+# kanban_create stamps a user card at priority >= 100 and clamps a background
+# one (k8s-evt-/cron- sessions) below it, and says when the new card is queued;
+# the dispatcher watcher logs "kanban dispatcher saturated: ..." instead of
+# "stuck" when every slot is busy; the notifier claims `queued` (TERMINAL_KINDS,
+# never _WAKE_KINDS) and delivers it as the first line of the card's rolling
+# progress message. Runs after wake_nudge, whose two dispatcher anchors bracket
+# the stuck counter this edits, and after the four kanban_tools.py appliers
+# above, whose lines it does not share. The _WAKE_KINDS grep repeats the one in
+# the kanban-progress stage: a queued notice must never cost an LLM turn.
+# See the module docstring in deploy/docker/patches/kanban_priority.py.
+#
 # credential-redaction: a kanban worker that pasted a GCP access token into a
 # curl left it in plaintext on the PVC (#603). Upstream already redacts
 # agent.log and the terminal-output spill; the two sinks it did not cover are
@@ -1505,6 +1520,8 @@ COPY deploy/docker/patches/kanban_wake_nudge.py \
      deploy/docker/patches/kanban_children_settled.py \
      deploy/docker/patches/apply_kanban_children_settled.py \
      deploy/docker/patches/verify_kanban_children_settled.py \
+     deploy/docker/patches/apply_kanban_priority.py \
+     deploy/docker/patches/verify_kanban_priority.py \
      deploy/docker/patches/kanban_result_required.py \
      deploy/docker/patches/credential_redaction.py \
      deploy/docker/patches/apply_credential_redaction.py \
@@ -1557,6 +1574,15 @@ RUN install -m 0644 /tmp/latency-patches/kanban_wake_nudge.py /opt/hermes/hermes
     grep -qF '_kanban_record_worker_child(conn, new_tid)' /opt/hermes/tools/kanban_tools.py && \
     grep -qF 'tid, _kanban_children_connect, result' /opt/hermes/tools/kanban_tools.py && \
     grep -q "from tools.kanban_children_settled import" /opt/hermes/tools/kanban_tools.py && \
+    /opt/hermes/.venv/bin/python3 /tmp/latency-patches/apply_kanban_priority.py /opt/hermes && \
+    grep -qF 'priority=_kanban_stamp_priority(_opt_int(args.get("priority"), 0), session_id, self_task),' /opt/hermes/tools/kanban_tools.py && \
+    grep -qF '**_kanban_queue_fields(conn, new_tid, args.get("board")),' /opt/hermes/tools/kanban_tools.py && \
+    test "$(grep -c 'from hermes_cli.kanban_priority import' /opt/hermes/tools/kanban_tools.py)" = "1" && \
+    test "$(grep -c '_kanban_saturation_tick(' /opt/hermes/gateway/kanban_watchers.py)" = "1" && \
+    grep -q 'kanban dispatcher stuck: ready queue non-empty' /opt/hermes/gateway/kanban_watchers.py && \
+    grep -qF '+ ("heartbeat",) + ("queued",)' /opt/hermes/gateway/kanban_watchers_notifier.py && \
+    grep -qF '_EVENT_FORMATTERS["queued"] = _kanban_format_queued' /opt/hermes/gateway/kanban_watchers_notifier.py && \
+    grep -q '^_WAKE_KINDS = ("completed", "gave_up", "crashed", "timed_out", "blocked", "review_requested", "changes_requested", "block_loop_detected")' /opt/hermes/gateway/kanban_watchers_notifier.py && \
     install -m 0644 /tmp/latency-patches/credential_redaction.py /opt/hermes/agent/credential_redaction.py && \
     /opt/hermes/.venv/bin/python3 /tmp/latency-patches/apply_credential_redaction.py /opt/hermes && \
     test "$(grep -c '_kube_agents_register_patterns()' /opt/hermes/agent/redact.py)" = "1" && \
@@ -1576,6 +1602,7 @@ RUN install -m 0644 /tmp/latency-patches/kanban_wake_nudge.py /opt/hermes/hermes
     /opt/hermes/.venv/bin/python3 /tmp/latency-patches/verify_kanban_notify_delivery.py && \
     /opt/hermes/.venv/bin/python3 /tmp/latency-patches/verify_kanban_event_routing.py && \
     /opt/hermes/.venv/bin/python3 /tmp/latency-patches/verify_kanban_children_settled.py && \
+    /opt/hermes/.venv/bin/python3 /tmp/latency-patches/verify_kanban_priority.py && \
     /opt/hermes/.venv/bin/python3 /tmp/latency-patches/verify_credential_redaction.py && \
     /opt/hermes/.venv/bin/python3 /tmp/latency-patches/verify_skill_manage_image_owned.py && \
     rm -rf /tmp/latency-patches

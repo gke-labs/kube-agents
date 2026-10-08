@@ -135,7 +135,20 @@ def progress_note(payload: object, limit: int = DEFAULT_NOTE_LIMIT) -> str:
 #: upstream's ``_EVENT_FORMATTERS["status"]`` renders it. Listing it here means
 #: such a move folds into the card's trail as ``→ <status>`` rather than
 #: posting upstream's ``🔄`` line as a message of its own.
-ROLLING_KINDS = ("heartbeat", "status")
+#:
+#: ``queued`` is the dispatcher's notice that a user card is waiting for a
+#: worker slot (``hermes_cli/kanban_priority.py``, #2678). It rolls so the
+#: card's first progress note joins the queued line instead of posting under
+#: it, and so a card queued twice reads as one message.
+ROLLING_KINDS = ("heartbeat", "status", "queued")
+
+#: The rolling kinds whose trail entry is the ``note`` on the event payload.
+NOTE_KINDS = ("heartbeat", "queued")
+
+#: A queued line that opens a card's rolling message is posted bare, without
+#: the card's header, because it is worded for the user as a whole sentence
+#: (bnaylor, #2678). The header joins once the worker's first note arrives.
+QUEUED_KIND = "queued"
 
 #: With ``KAGE_SLACK_UX`` on, the blocked kind that may post a question, and
 #: the terminal kind whose report may announce a PR (see ``slack_ux_moments``).
@@ -260,7 +273,7 @@ def rolling_line(kind: str, payload: object) -> str:
     being non-empty — an event that rolls must not fall through and settle the
     message just because its payload was thin.
     """
-    if kind == "heartbeat":
+    if kind in NOTE_KINDS:
         return progress_note(payload)
     if kind == "status":
         status = payload.get("status") if isinstance(payload, dict) else None
@@ -780,6 +793,8 @@ async def deliver(
 
     payload = getattr(ev, "payload", None)
     line = rolling_line(kind, payload) or message
+    if kind == QUEUED_KIND and not entry:
+        header = ""
     moments = _slack_moments(quiet)
     await _settle_question(moments, adapter, sub, kind, event_id)
     result = await _roll(
