@@ -141,6 +141,31 @@ platform_agent_mode_gate_rollout() {
   fi
 }
 
+# Waits, until the deadline, for one CR condition to read True. Polled off
+# the status rather than left to `kubectl wait --for=condition`, which skips a
+# condition whose observedGeneration trails the CR's generation: the operator
+# writes BusProvisioned once, when the provisioning Job first completes, and
+# deliberately never rewrites it, so on any CR edited since (the mode patch
+# included, once the bus is up) that wait times out on a condition that is True.
+platform_agent_mode_wait_condition() {
+  local namespace="$1" context="$2" condition="$3" deadline="$4"
+  local -a kc=(kubectl)
+  [ -z "${context}" ] || kc+=(--context "${context}")
+  local status=""
+  echo "Waiting for ${condition}=True..."
+  while :; do
+    status="$("${kc[@]}" get platformagent "${PLATFORM_AGENT_MODE_CR_NAME}" -n "${namespace}" \
+      -o jsonpath="{.status.conditions[?(@.type==\"${condition}\")].status}" 2>/dev/null)" || status=""
+    [ "${status}" != "True" ] || return 0
+    if [ "${SECONDS}" -ge "${deadline}" ]; then
+      echo "::error title=mode next: ${condition} not True::PlatformAgent/${PLATFORM_AGENT_MODE_CR_NAME} did not report ${condition}=True within the gate's ${PLATFORM_AGENT_MODE_GATE_TIMEOUT_SECONDS}s (last read: ${status:-absent})."
+      platform_agent_mode_dump_state "${namespace}" "${context}"
+      return 1
+    fi
+    sleep "${PLATFORM_AGENT_MODE_POLL_SECONDS}"
+  done
+}
+
 # Waits for the operator to report what `next` renders as ready, in the
 # order the operator brings it up, inside one budget.
 #
@@ -180,13 +205,7 @@ platform_agent_mode_wait_next() {
 
   local condition
   for condition in "${PLATFORM_AGENT_MODE_BUS_PROVISIONED}" "${PLATFORM_AGENT_MODE_BUS_CREDENTIALS}"; do
-    echo "Waiting for ${condition}=True..."
-    if ! "${kc[@]}" wait --for="condition=${condition}=True" "platformagent/${PLATFORM_AGENT_MODE_CR_NAME}" \
-      -n "${namespace}" --timeout="$(platform_agent_mode_remaining "${deadline}")s"; then
-      echo "::error title=mode next: ${condition} not True::PlatformAgent/${PLATFORM_AGENT_MODE_CR_NAME} did not report ${condition}=True within the gate's ${PLATFORM_AGENT_MODE_GATE_TIMEOUT_SECONDS}s."
-      platform_agent_mode_dump_state "${namespace}" "${context}"
-      return 1
-    fi
+    platform_agent_mode_wait_condition "${namespace}" "${context}" "${condition}" "${deadline}" || return 1
   done
 
   local workload

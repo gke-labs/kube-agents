@@ -578,12 +578,13 @@ MOCK_GATEWAY_DARK_REASON = "NoChatBackend"
 
 
 def write_mode_kubectl_stub(bin_dir, calls_log, ready_reads=(MOCK_CR_READY_AT_GENERATION_2,),
-                            gateway_reason="", containers="", rollout_exit=0):
+                            gateway_reason="", containers="", rollout_exit=0, condition_status="True"):
     """A `kubectl` on PATH that records every call and answers the mode gate's reads.
 
     `ready_reads` is what successive reads of the CR's generation and Ready
     condition return, the last one repeating; `gateway_reason` is the
-    A2AGateway condition's reason; `containers` the pod template's container
+    A2AGateway condition's reason; `condition_status` what a read of any other
+    condition's status returns; `containers` the pod template's container
     names. Every other call succeeds silently, `rollout status` with
     `rollout_exit`. Each call is one line of `calls_log`, prefixed `kubectl `.
     """
@@ -606,6 +607,7 @@ case "$*" in
     sed -n "$((n + 1))p" "{reads}" | tr -d '\\n'
     exit 0 ;;
   *A2AGateway*) printf '%s' "{gateway_reason}"; exit 0 ;;
+  *"status.conditions"*) printf '%s' "{condition_status}"; exit 0 ;;
   *"containers[*].name"*) printf '%s' "{containers}"; exit 0 ;;
   *"rollout status"*) exit {rollout_exit} ;;
 esac

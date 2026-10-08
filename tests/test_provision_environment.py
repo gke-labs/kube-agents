@@ -971,8 +971,8 @@ class PlatformAgentModeTest(unittest.TestCase):
     _NEXT_GATE = [
         "kubectl --context {ctx} patch platformagent platform-agent -n {ns} --type merge -p {{\"spec\":{{\"mode\":\"next\"}}}}",
         "kubectl --context {ctx} get platformagent platform-agent -n {ns} -o jsonpath=READ",
-        "kubectl --context {ctx} wait --for=condition=BusProvisioned=True platformagent/platform-agent -n {ns} --timeout=GATE",
-        "kubectl --context {ctx} wait --for=condition=BusCredentialsReady=True platformagent/platform-agent -n {ns} --timeout=GATE",
+        "kubectl --context {ctx} get platformagent platform-agent -n {ns} -o jsonpath=BusProvisioned",
+        "kubectl --context {ctx} get platformagent platform-agent -n {ns} -o jsonpath=BusCredentialsReady",
         "kubectl --context {ctx} rollout status statefulset/platform-agent-a2a-nats -n {ns} --timeout=GATE",
         "kubectl --context {ctx} rollout status deployment/platform-agent-a2a-callout -n {ns} --timeout=GATE",
         "kubectl --context {ctx} rollout status deployment/platform-agent-a2a-verifier -n {ns} --timeout=GATE",
@@ -1031,7 +1031,10 @@ class PlatformAgentModeTest(unittest.TestCase):
         out = []
         for line in lines:
             if "-o jsonpath=" in line:
-                tag = "GATEWAY" if "A2AGateway" in line else "READ"
+                tag = next(
+                    (c for c in ("A2AGateway", "BusProvisioned", "BusCredentialsReady") if c in line),
+                    "READ",
+                ).replace("A2AGateway", "GATEWAY")
                 line = line.split("-o jsonpath=", 1)[0] + "-o jsonpath=" + tag
             if line.startswith("kubectl "):
                 match = re.search(r"--timeout=(\d+)s$", line)
@@ -1102,6 +1105,15 @@ class PlatformAgentModeTest(unittest.TestCase):
         )
         self.assertNotEqual(proc.returncode, 0)
         self.assertIn("::error title=mode next: PlatformAgent not Ready::", proc.stdout)
+        self.assertFalse(any("rollout status" in c for c in calls), calls)
+
+    def test_a_bus_condition_that_never_reads_true_fails_the_step(self):
+        proc, calls = self._run(
+            {"PLATFORM_AGENT_MODE": "next", "PLATFORM_AGENT_MODE_GATE_TIMEOUT_SECONDS": "0"},
+            condition_status="False",
+        )
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("::error title=mode next: BusProvisioned not True::", proc.stdout)
         self.assertFalse(any("rollout status" in c for c in calls), calls)
 
     def test_a_failed_rollout_fails_the_step(self):

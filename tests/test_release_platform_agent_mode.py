@@ -48,8 +48,8 @@ _GATE_BUDGET_SECONDS = 1800
 # gateway's. The jsonpath reads are abbreviated (see _normalise).
 _NEXT_GATE = [
     f"kubectl get platformagent platform-agent -n {_NAMESPACE} -o jsonpath=READ",
-    f"kubectl wait --for=condition=BusProvisioned=True platformagent/platform-agent -n {_NAMESPACE} --timeout=GATE",
-    f"kubectl wait --for=condition=BusCredentialsReady=True platformagent/platform-agent -n {_NAMESPACE} --timeout=GATE",
+    f"kubectl get platformagent platform-agent -n {_NAMESPACE} -o jsonpath=BusProvisioned",
+    f"kubectl get platformagent platform-agent -n {_NAMESPACE} -o jsonpath=BusCredentialsReady",
     f"kubectl rollout status statefulset/platform-agent-a2a-nats -n {_NAMESPACE} --timeout=GATE",
     f"kubectl rollout status deployment/platform-agent-a2a-callout -n {_NAMESPACE} --timeout=GATE",
     f"kubectl rollout status deployment/platform-agent-a2a-verifier -n {_NAMESPACE} --timeout=GATE",
@@ -64,7 +64,10 @@ def _normalise(lines):
     out = []
     for line in lines:
         if "-o jsonpath=" in line:
-            tag = "GATEWAY" if "A2AGateway" in line else "READ"
+            tag = next(
+                (c for c in ("A2AGateway", "BusProvisioned", "BusCredentialsReady") if c in line),
+                "READ",
+            ).replace("A2AGateway", "GATEWAY")
             line = line.split("-o jsonpath=", 1)[0] + "-o jsonpath=" + tag
         match = re.search(r"--timeout=(\d+)s$", line)
         if match:
