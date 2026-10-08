@@ -3461,7 +3461,7 @@ def test_a_question_wake_archives_its_card_when_the_wake_turn_errors(
     result = KubeAgentsHarness().run(_REPLAY_PROMPT)
 
     assert result.has_errors()
-    assert len(stub_agent.requests) == 1
+    assert len(stub_agent.requests) == 2
     assert _archived(scripts)
     assert [s["name"] for s in result.trajectory][-1] == card_wake.SETTLED_ENTRY
     assert "question_wake" in result.metadata and "failure_wake" not in result.metadata
@@ -3503,6 +3503,41 @@ def test_a_card_wake_answer_turn_500_is_an_agent_error_not_infra(
     assert "HTTP 500" in result.errors[0]
     assert len(stub_agent.requests) == 2
     assert result.output == _FINAL_TEXT
+    assert _archived(scripts)
+
+
+def test_a_card_wake_turn_502_with_rate_limit_is_infra(
+    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer
+) -> None:
+    """A 502 with rate_limit on the wake turn is classified as infrastructure."""
+    scripts: list[str] = []
+    monkeypatch.setattr(harness, "_agent_shell", _replay_shell(scripts))
+    stub_agent.fail_on = frozenset({1})
+    stub_agent.fail_on_status = 502
+    stub_agent.fail_headers = {"X-Hermes-Failure-Reason": "rate_limit"}
+
+    result = KubeAgentsHarness().run(_REPLAY_PROMPT)
+
+    assert result.has_errors()
+    assert result.errors[0].startswith(harness.INFRA_FAILURE_MARKER)
+    assert "rate_limit" in result.errors[0]
+    assert len(stub_agent.requests) == 1
+    assert _archived(scripts)
+
+
+def test_a_card_wake_turn_transient_500_clears_on_retry(
+    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer
+) -> None:
+    """A transient 500 on the wake turn clears on bounded retry without losing the run (#2430)."""
+    scripts: list[str] = []
+    monkeypatch.setattr(harness, "_agent_shell", _replay_shell(scripts))
+    stub_agent.fail_on = frozenset({1})
+    stub_agent.fail_on_status = 500
+
+    result = KubeAgentsHarness().run(_REPLAY_PROMPT)
+
+    assert not result.has_errors()
+    assert len(stub_agent.requests) == 3
     assert _archived(scripts)
 
 

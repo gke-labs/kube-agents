@@ -1734,7 +1734,7 @@ class KubeAgentsHarness(AgentHarness):
         pinned = _PINNED_RUN_ID.set(_run_id())
         answer_turn = None
         try:
-            wake_turn = self._execute(planted.wake, workspace_path, opening_turn=False)
+            wake_turn = self._execute(planted.wake, workspace_path, opening_turn=True)
             if not card_wake.no_reply(wake_turn) and not failure and replay.fresh:
                 answer_turn = self._execute_fresh_answer(replay, planted, wake_turn, workspace_path)
             elif not card_wake.no_reply(wake_turn) and not failure:
