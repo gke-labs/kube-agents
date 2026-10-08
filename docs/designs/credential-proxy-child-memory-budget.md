@@ -176,7 +176,7 @@ test models, counted for the slots in use now rather than for the cap, so a brok
 requests in flight is not charged for eight. A request is admitted when a slot is free and the
 sum of live reservations plus its own fits `children_budget` with its slot counted.
 
-(Since gke-labs/kube-agents#2678 the default limit is 2Gi: 1728 MiB after the reserves admits nine,
+(The default limit is now 2Gi, raised when the kanban slot default rose to six: 1728 MiB after the reserves admits nine,
 and the slot cap of eight binds. The figures below are the 1Gi limit this design was written
 against.)
 

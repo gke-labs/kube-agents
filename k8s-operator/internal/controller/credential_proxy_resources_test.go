@@ -200,7 +200,7 @@ func TestCredentialProxyBudgetArithmeticAtTheDefaults(t *testing.T) {
 		t.Errorf("the default limit admits %d requests, want 9", got)
 	}
 	// The kanban default runs six workers, each of which may hold a brokered
-	// command; the default limit has to admit at least that many (#2678).
+	// command; the default limit has to admit at least that many.
 	if got := credentialProxyAdmittedRequests(defaultLimit.Value(), credentialProxyOutputCapBytes); got < defaultKanbanMaxInProgress {
 		t.Errorf("the default limit admits %d requests, fewer than the %d kanban workers the default cap runs", got, defaultKanbanMaxInProgress)
 	}

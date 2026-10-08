@@ -260,9 +260,10 @@ CLUSTER_LIST_TIMEOUT_SECONDS = 120
 #: sized to the four requests the proxy admitted at its old 1Gi default
 #: (docs/designs/credential-proxy-child-memory-budget.md §2.2), past which a
 #: listing queues at the proxy and one still waiting at its 60 s admission
-#: bound is refused busy and reads unlisted. The 2Gi default now admits eight
-#: (#2678); four wide leaves the rest for kanban workers' own commands, as in
-#: cluster_agent_reconcile.py.
+#: bound is refused busy and reads unlisted. At the 2Gi default the proxy's
+#: slot cap of eight binds, and it is shared: while this pool lists, kanban
+#: workers' commands have four slots, and none if cluster_agent_reconcile.py's
+#: four-wide pool is listing at the same time.
 LIST_WORKERS = 4
 #: 12 s per listing at four wide: the per-listing share the 150 s budget gave
 #: at eight. The listing runs inside TICK_BUDGET_SECONDS, so it leaves the

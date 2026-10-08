@@ -212,14 +212,16 @@ kanban:
   # over this key at startup — so keep this value in step with
   # defaultKanbanMaxInProgress in platformagent_manifests.go.
   #
-  # One of these slots is held for user cards: background work (event triage,
-  # cron report relays) may hold every slot but one, so at 6 triage gets five
-  # and a chat question always has one (deploy/docker/patches/kanban_priority.py).
-  # Six workers at 400-512 MiB each over the gateway's 1.8 GiB idle floor fit
-  # its 8Gi limit, and the credential proxy's default 2Gi admits 9 brokered
-  # commands at once (8 with its slot cap), so each worker can have one in
-  # flight. Model rate limits are per install and unmeasured: if worker logs
-  # show 429s, lower this.
+  # One slot is guaranteed to each class of card: background work (event
+  # triage, cron report relays) may hold every slot but one, and so may user
+  # cards, so a chat question always has a slot and so do alerts; the four
+  # between go to whoever is first (deploy/docker/patches/kanban_priority.py).
+  # A worker measured about 430 MiB, so six are about 2.6 GiB over the
+  # gateway's 1.8 GiB idle set, under its 8Gi limit; coordinators waiting on
+  # their own children stay resident on top. The credential proxy's default
+  # 2Gi admits 9 brokered commands (8 with its slot cap), shared with the
+  # stall watch's and reconcile's four-wide listings. Model rate limits are
+  # per install and unmeasured: if worker logs show 429s, lower this.
   max_in_progress: 6
 
 # Denylist applied last for every platform key — the authoritative guarantee that

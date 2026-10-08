@@ -532,7 +532,7 @@ means zero rather than unset.
 container, the broker that runs every credentialed command in a pod of its own.
 It is forwarded to the CR's `spec.deployment.credentialProxy.resources` when any
 key is set, and the operator merges it over its defaults per key, so
-`limits: {memory: 2Gi}` raises the memory limit and keeps the rest. The
+`limits: {memory: 3Gi}` raises the memory limit and keeps the rest. The
 [`spec.deployment` section of the CRD reference](https://gke-labs.github.io/kube-agents/operator/platformagent-crd/#specdeployment)
 is canonical for the defaults, what the operator refuses and how it reports it,
 and the Autopilot warnings;

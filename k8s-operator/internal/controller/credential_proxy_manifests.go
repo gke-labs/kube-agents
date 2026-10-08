@@ -106,7 +106,7 @@ const (
 	// held to eight by the slot cap (credentialProxyMaxConcurrentCommands),
 	// which is the upper bound. 2Gi rather than the earlier 1Gi (four at once)
 	// because the default kanban cap is six workers, and each can have a
-	// brokered command in flight (gke-labs/kube-agents#2678). The sizing test in
+	// brokered command in flight. The sizing test in
 	// platformagent_manifests_test.go and ValidateCredentialProxyResources
 	// hold the limit to at least two. An install raises the limit through
 	// spec.deployment.credentialProxy.resources (resolveCredentialProxyResources

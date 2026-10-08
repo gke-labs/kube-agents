@@ -4,12 +4,12 @@ The image ships ``kanban.max_in_progress: 6`` (``agents/chat/config.yaml``), and
 operator renders a different cap only when the PlatformAgent CR carries
 ``spec.harness.tuning.maxInProgress``. The eval fans its units out at
 ``EVAL_TASK_PARALLELISM`` -- 4 on a pull request, 8 on the nightly -- and nearly every
-unit's opening turn delegates one platform card. Before the image default rose to six,
-most lanes queued behind two slots: a queued card waits out the cards ahead of it and then runs its own 10-45
-minutes, past the delegation ceiling with no worker at fault, while the dispatcher
+unit's opening turn delegates one platform card. The override dates from an image
+default of two, where most lanes queued: a queued card waits out the cards ahead of it and
+then runs its own 10-45 minutes, past the delegation ceiling with no worker at fault, while the dispatcher
 logs the same "0 workers spawned" warning a wedged worker produces (#1879, #1880,
 and the residual after their fixes). ``hack/ci-deploy.sh`` therefore sets the cap on
-the eval install and nowhere else.
+the eval install and nowhere else, deliberately below the production default of six.
 
 The value rides three hops: the ``--set`` in ``ci-deploy.sh`` (``--set`` rather than
 ``--set-string``, because the chart schema types the key as an integer and a string
@@ -19,8 +19,9 @@ fails validation at ``helm upgrade``), the chart template that renders
 own ``TestMaxInProgressReachesTheDefaultOverlay`` covers. One test per hop this
 repository can see from Python, plus the two bounds: a cap below the pull
 request's lane count recreates the queue the flag exists to remove, and a cap
-above the worker count the gateway's memory limit was sized for trades that
-queue for a worker the OOM killer takes, which strands its card the same way.
+above the eval's ceiling runs more workers than the eval install's working set
+has been measured at, risking a worker the OOM killer takes, which strands its
+card the same way.
 """
 
 import pathlib
@@ -38,14 +39,15 @@ _CAP_FLAG = '--set "platformAgent.harness.tuning.maxInProgress=${EVAL_KANBAN_MAX
 _CAP_AS_STRING = '--set-string "platformAgent.harness.tuning.maxInProgress'
 _CAP_CONSTANT_RE = re.compile(r'^readonly EVAL_KANBAN_MAX_IN_PROGRESS="(\d+)"$', re.MULTILINE)
 # The presubmit's lane count is the script's own default. The ceiling is the
-# worker count the gateway container's memory limit was sized for
-# (resolveResources in k8s-operator/internal/controller/manifest_helpers.go:
-# 8Gi for five concurrent workers over a 1.8GiB idle set); raising the cap
-# past it belongs in the same change as raising that limit for the eval
-# install, once the working set at five has been measured (#2032). The nightly
-# runs eight lanes (oss-test-infra#2707) and queues three deep until then.
+# eval's own, deliberately below the production default of six: the gateway's
+# 8Gi limit (resolveResources in
+# k8s-operator/internal/controller/manifest_helpers.go) has room for six at the
+# ~430 MiB a worker measured live, but the eval's working set above five has
+# not been measured (#2032), and raising the cap belongs with that measurement.
+# The nightly runs eight lanes (oss-test-infra#2707) and queues three deep until
+# then.
 _PRESUBMIT_LANES_RE = re.compile(r'^EVAL_TASK_PARALLELISM="\$\{EVAL_TASK_PARALLELISM:-(\d+)\}"$', re.MULTILINE)
-_WORKERS_THE_MEMORY_LIMIT_FITS = 5
+_EVAL_WORKERS_MEASURED = 5
 
 
 def _cap() -> int:
@@ -85,11 +87,11 @@ class CiDeployKanbanCapTest(unittest.TestCase):
         )
         self.assertLessEqual(
             cap,
-            _WORKERS_THE_MEMORY_LIMIT_FITS,
-            f"EVAL_KANBAN_MAX_IN_PROGRESS={cap} is above the {_WORKERS_THE_MEMORY_LIMIT_FITS} "
-            "workers the gateway's memory limit was sized for: raise that limit for "
-            "the eval install in the same change, or a worker the OOM killer takes "
-            "strands its card exactly like the queue the cap removes.",
+            _EVAL_WORKERS_MEASURED,
+            f"EVAL_KANBAN_MAX_IN_PROGRESS={cap} is above the {_EVAL_WORKERS_MEASURED} "
+            "workers the eval install's working set has been measured at: measure it "
+            "(and raise its memory limit if needed) in the same change, or a worker the "
+            "OOM killer takes strands its card exactly like the queue the cap removes.",
         )
 
 

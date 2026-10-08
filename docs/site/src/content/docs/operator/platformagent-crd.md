@@ -358,18 +358,22 @@ delays a delegated task, too high loses it silently. Raise it once you know your
 and your model quota — that quota is the other shared resource, and for most deployments it binds
 before memory does.
 
-One slot is held for user cards. A card is classed when it is filed: one filed from an event-triage
-or cron-relay session is background, and every other card (chat, the inject and A2A doors, a card
-filed by hand) is a user card. At a cap of 2 or more, background cards may hold every slot but one,
-so a question asked in chat starts at once even while triage is running. At the default of 6 that is
-five slots for triage and one for users. The price is that a burst of alerts drains more slowly
-than it would with every slot open to it. At a cap of 1 nothing is held: a user card still goes
-ahead of waiting triage, but it waits for the running card to finish. User cards can take every
-slot, and when they do, the next one waits and its thread says so:
-`⏳ Queued: the system is busy. Your request will start when a worker frees up.` The dispatcher
-needs a card's priority to tell the classes apart, so a card filed with `hermes kanban create`
-outside a chat turn is background unless it is given `--priority 100` or more. The dashboard can
-change a card's priority by hand.
+One slot is guaranteed to each class of card. A card is classed when an agent files it with
+`kanban_create`: one filed from an event-triage or cron-relay session is background, and one filed
+in a chat turn or through the inject and A2A doors is a user card. A card filed by hand, with
+`hermes kanban create` or from the dashboard, never passes through that step and is background
+unless it is given priority 100 or more (`--priority 100`); the dashboard can change a card's
+priority afterwards.
+
+At a cap of 2 or more, background cards may hold every slot but one, so a question asked in chat
+starts at once even while triage is running, and user cards may hold every slot but one, so a
+door's fan-out cannot silence alerts. The slots between go to whoever is first, and user cards
+sort first. At the default of 6 that is one slot for each class and four shared. The price is that
+a burst of alerts drains more slowly than it would with every slot open to it, and a burst of user
+work likewise. At a cap of 2 each class gets exactly one. At a cap of 1 nothing is held: a user
+card still goes ahead of waiting triage, but it waits for the running card to finish. A user card
+that waits, because every slot is busy or the only free one is triage's, gets one line in its
+thread: `⏳ Queued: the system is busy. Your request will start when a worker frees up.`
 
 A full board is logged as what it is. When every slot is busy for six ticks in a row the gateway
 logs, at most every five minutes:
@@ -378,22 +382,30 @@ logs, at most every five minutes:
 kanban dispatcher saturated: 6/6 worker slots busy (5 background, 1 user: t_ab12 @cluster-prod 14m [k8s-evt-], …); 1 user card(s) and 2 background card(s) waiting
 ```
 
-with `; N background card(s) held back because one slot is reserved for user cards` added when the
-reserved slot is what held them. When the only free slot is the one held for users, the line
-starts `kanban dispatcher holding background cards:` instead. That line is load, not a fault. The older
+with `; N background card(s) held back because one slot is reserved for user cards` or
+`; N user card(s) held back because one slot is reserved for background triage` added when a held
+slot is what stopped them. When the only free slot is the one held for the other class, the line
+starts `kanban dispatcher holding background cards:` or `kanban dispatcher holding user cards:`
+instead. That line is load, not a fault. The older
 `kanban dispatcher stuck: … Check profile health` warning now means what it says: slots were free
 and still nothing started.
 
 The arithmetic behind `6`:
 
-- **Gateway memory.** Six workers at roughly 400-512 MiB each over the gateway's 1.8 GiB idle set
-  comes to about 4.2-4.8 GiB, under the container's 8Gi limit.
+- **Gateway memory.** One worker measured about 430 MiB on a live install: `hermes chat` 207 MiB,
+  two Node MCP proxies about 100 MiB each, a supervisor and an ssh. Six of them are about 2.6 GiB
+  over the gateway's 1.8 GiB idle set, about 4.4 GiB under the container's 8Gi limit. A coordinator
+  waiting on its own children gives its slot back but stays resident, so the process count can sit
+  above six; the 8Gi limit leaves room for about fourteen workers at that size.
 - **Credential proxy.** Every worker's `kubectl` and `gcloud` runs through the proxy, which admits a
   request only when its children fit the proxy's memory limit: 176 MiB per request after 320 MiB of
   fixed reserves. At its default 2Gi limit that is 9 at once
   (`credentialProxyAdmittedRequests` in
-  `k8s-operator/internal/controller/credential_proxy_manifests.go`), held to 8 by its slot cap, so
-  each of the six workers can have a command in flight. At the old 1Gi it was 4.
+  `k8s-operator/internal/controller/credential_proxy_manifests.go`), held to 8 by its slot cap. At
+  the old 1Gi it was 4. The 8 slots are shared: the stall watch and the cluster-agent reconcile
+  each list four projects at a time through them. With neither listing, all 8 are free for the six
+  workers; while one lists, 4 are; while both list at once, none, and a worker command waits up to
+  60 s for a slot and is then refused busy.
 - **Model quota.** Per-install model rate limits are not measured. A small quota may see 429s at 6;
   if worker logs show them, lower `maxInProgress`.
 
@@ -550,7 +562,7 @@ Abstracts the pod/deployment configuration. The controller synthesises a `Deploy
 - `availability.runtimeClassName` — pod runtime class (e.g. `gvisor`) for the agent Pod. Nested under `availability` alongside `replicas`, `nodeSelector`, `tolerations` and `affinity`. When set, the managed config also carries `database.journal_mode: delete`, and the entrypoint converts Hermes' existing databases out of WAL once at start-up — `state.db`, `kanban.db` and the cron, project, evidence, response, memory and Discord stores Hermes opens through the same journal-mode helper: a sandboxed runtime serves the data volume over a gofer mount that accepts SQLite's WAL mode and then corrupts it ([#610](https://github.com/gke-labs/kube-agents/issues/610)). The Session KV store (`session_kv.db` on the `system-metadata` volume) sets WAL itself and is not covered by either. Clearing the field drops the pin, and the databases return to WAL on their next open.
 - `env` — additional container environment variables.
 - `resources` — requests and limits for the agent container, replacing the operator's defaults as a block.
-- `credentialProxy.resources` — requests and limits for the credential-proxy container, the broker that runs every credentialed command in a pod of its own. Merged over the operator's defaults per key, unlike `resources`: a CR that sets only `limits.memory` keeps the default 500m CPU request, 1 CPU limit and 2Gi ephemeral-storage limit, which bounds the content workspace. The proxy's state and `/tmp` emptyDirs (size limits 5Gi and 2Gi) follow that limit when it is raised above their defaults, so the kubelet does not evict the pod at the smaller figure. The broker sizes how many commands it admits at once from the memory limit, so that is the key to raise when the proxy is OOM-killed under a large fleet. Only `cpu`, `memory` and `ephemeral-storage` are accepted, the quantities the container declares. The operator refuses a memory limit below 672Mi (two commands at once), a request above its limit, a negative quantity, a zero limit and `claims`, which the proxy pod has no use for. A refused override, including an edit of one that was valid, renders the proxy Deployment at the operator's defaults rather than at the last accepted override until it is corrected, which restarts the proxy once (its Deployment is `Recreate`), and the agent stays Ready whether or not the webhook is on. The `Degraded` condition carries one reason, and reports `InvalidCredentialProxyResources` when no higher-ranked `Degraded` cause is present. Where the [validating webhook](/kube-agents/operator/#admission-webhooks) is enabled, admission refuses the same override at apply and the running proxy is untouched. Admission also warns when memory per CPU on the requests pair leaves the 1 to 6.5 GiB per vCPU band GKE Autopilot admits unchanged, because Autopilot then raises the smaller request and the chart's quota preflight is short by the difference; Autopilot applies the band to requests only. It warns too for each of `cpu` and `memory` set under `limits` without the same key under `requests`, unless the limit equals the request it would be replaced by: Autopilot without bursting sets the limits equal to the requests, so a CR that sets only `limits.memory: 2Gi` runs at the 512Mi request there. Set the request to the same value, or enable bursting, under which the declared limits stand.
+- `credentialProxy.resources` — requests and limits for the credential-proxy container, the broker that runs every credentialed command in a pod of its own. Merged over the operator's defaults per key, unlike `resources`: a CR that sets only `limits.memory` keeps the default 500m CPU request, 1 CPU limit and 2Gi ephemeral-storage limit, which bounds the content workspace. The proxy's state and `/tmp` emptyDirs (size limits 5Gi and 2Gi) follow that limit when it is raised above their defaults, so the kubelet does not evict the pod at the smaller figure. The broker sizes how many commands it admits at once from the memory limit, so that is the key to raise when the proxy is OOM-killed under a large fleet. Only `cpu`, `memory` and `ephemeral-storage` are accepted, the quantities the container declares. The operator refuses a memory limit below 672Mi (two commands at once), a request above its limit, a negative quantity, a zero limit and `claims`, which the proxy pod has no use for. A refused override, including an edit of one that was valid, renders the proxy Deployment at the operator's defaults rather than at the last accepted override until it is corrected, which restarts the proxy once (its Deployment is `Recreate`), and the agent stays Ready whether or not the webhook is on. The `Degraded` condition carries one reason, and reports `InvalidCredentialProxyResources` when no higher-ranked `Degraded` cause is present. Where the [validating webhook](/kube-agents/operator/#admission-webhooks) is enabled, admission refuses the same override at apply and the running proxy is untouched. Admission also warns when memory per CPU on the requests pair leaves the 1 to 6.5 GiB per vCPU band GKE Autopilot admits unchanged, because Autopilot then raises the smaller request and the chart's quota preflight is short by the difference; Autopilot applies the band to requests only. It warns too for each of `cpu` and `memory` set under `limits` without the same key under `requests`, unless the limit equals the request it would be replaced by: Autopilot without bursting sets the limits equal to the requests, so a CR that sets only `limits.memory: 3Gi` runs at the 512Mi request there. Set the request to the same value, or enable bursting, under which the declared limits stand.
 - `initContainers` / `sidecars` — standard init and sidecar containers. A `volumeMounts` entry naming a reserved volume is refused at admission, the same as `extraVolumeMounts`. That is the route that needs no user-authored volume at all, and so the one the name reservation exists for; see [Reconcile behavior](#reconcile-behavior). Under the unsupported `spec.mode: next` dev toggle the render also writes two environment variables onto every `sidecars` entry — `POD_NAMESPACE` (downward API) and `A2A_CAPABILITY_REQUIRED` — with different precedence: the operator's `A2A_CAPABILITY_REQUIRED` wins, so a value set for that name in the CR is discarded on every reconcile, while `POD_NAMESPACE` is supplied only as a default and a CR value for it survives. Both are inputs to the A2A capability check the sidecar executor performs, not container configuration; nothing else in the container is rewritten.
 - `extraVolumes` — custom volumes for the main container. Both halves of the reservation apply: a reserved name, and a source that would carry the A2A bus credential, are each refused at admission; see [Reconcile behavior](#reconcile-behavior).
 - `extraVolumeMounts` — custom mounts for the main container. A mount has no source, so only the name half applies: an entry naming a reserved volume is refused at admission.
