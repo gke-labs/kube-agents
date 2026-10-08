@@ -172,12 +172,12 @@ class NewVersion(Base):
         sandbox = FakeSandbox(envelope([member("a", "lagging")]), readiness)
         code, out = self.run_tick(sandbox)
         self.assertEqual(code, 0)
-        self.assertIn(f"new target version {TARGET}, 1 cluster(s) pending (a): none graded (the readiness run returned none of them)", out)
+        self.assertIn(f"new target version {TARGET}, 1 cluster(s) pending (a): none graded (their kubectl read failed or the run returned nothing for them)", out)
         self.assertIn("retrying tomorrow", out)
         self.assertNotIn("0 blocked", out)
         self.assertIsNone(self.ledger()["targets"][TARGET]["last_report_at"])
         text = (self.home / "reports" / TARGET / "latest.md").read_text()
-        self.assertIn("1 not read (p1/us-central1-a/a; the run returned nothing for them)", text)
+        self.assertIn("1 not read (p1/us-central1-a/a; their kubectl read failed or the run returned nothing for them)", text)
         self.assertIn("Reads that failed during this run", text)
         self.assertIn("- p1/us-central1-a/a: get-credentials failed: 403", text)
 
@@ -304,6 +304,54 @@ class Retired(Base):
         self.assertEqual(out2, "")
         code, out3 = self.run_tick(FakeSandbox(envelope([member("a", "lagging")]), envelope([member("a", "lagging", readiness="ready")])))
         self.assertIn("1 ready;", out3)
+
+
+    def test_a_blocked_verdict_stands_when_the_kubectl_read_failed(self) -> None:
+        readiness = envelope(
+            [member("a", "lagging", readiness="blocked")],
+            errors=[{"project": "p1", "location": "us-central1-a", "cluster": "a", "message": "kubectl get timed out"}],
+        )
+        sandbox = FakeSandbox(envelope([member("a", "lagging")]), readiness)
+        code, out = self.run_tick(sandbox)
+        self.assertEqual(code, 0)
+        self.assertIn("1 blocked (a), 0 ready;", out)
+        self.assertEqual(self.ledger()["targets"][TARGET]["last_report_at"], NOW.isoformat())
+
+    def test_an_unreadable_cluster_is_retried_three_days_then_parked_until_the_weekly_refresh(self) -> None:
+        readiness = envelope([member("a", "lagging", readiness="unknown")], errors=[{"project": "p1", "location": "us-central1-a", "cluster": "a", "message": "403"}])
+        outs = []
+        for _ in range(4):
+            code, out = self.run_tick(FakeSandbox(envelope([member("a", "lagging")]), readiness))
+            outs.append(out)
+        self.assertIn("none graded", outs[0])
+        self.assertEqual(outs[1], "")
+        self.assertIn("not graded on 3 consecutive days, next attempt at the weekly refresh", outs[2])
+        self.assertEqual(self.ledger()["targets"][TARGET]["last_report_at"], NOW.isoformat())
+        self.assertEqual(outs[3], "")
+
+    def test_a_malformed_announced_block_is_refused(self) -> None:
+        for block in (None, [], {"partial": 5}, {"ungraded": "x"}, {"ungraded": {TARGET: "old-string-shape"}}):
+            with self.subTest(block=block):
+                self.home.mkdir(parents=True, exist_ok=True)
+                (self.home / watch.LEDGER_FILE_NAME).write_text(json.dumps({"targets": {}, "announced": block}))
+                sandbox = FakeSandbox(envelope([member("a", "lagging")]))
+                code, out = self.run_tick(sandbox)
+                self.assertEqual(code, 0)
+                if block is None:
+                    self.assertNotIn("malformed", out)
+                else:
+                    self.assertIn("has a malformed announced block; refusing to overwrite it", out)
+                    self.assertEqual(sandbox.calls, [])
+
+
+class ProfileHome(unittest.TestCase):
+    def test_a_hand_run_from_the_gateway_home_finds_the_profile_s_ledger(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            (Path(root) / "profiles" / "platform").mkdir(parents=True)
+            with mock.patch.dict(os.environ, {watch.HOME_ENV: root, watch.WATCH_HOME_ENV: ""}):
+                self.assertEqual(watch.watch_home(), Path(root) / "profiles" / "platform" / watch.WATCH_DIR_NAME)
+            with mock.patch.dict(os.environ, {watch.HOME_ENV: str(Path(root) / "profiles" / "platform"), watch.WATCH_HOME_ENV: ""}):
+                self.assertEqual(watch.watch_home(), Path(root) / "profiles" / "platform" / watch.WATCH_DIR_NAME)
 
 
 class DryRun(Base):
