@@ -779,6 +779,12 @@ class WarningTest(unittest.TestCase):
                 "; 1 background card(s) held back because one slot is reserved for user cards"
             )
         )
+        # A free slot held for users is not called saturation (live run, ka-today-1).
+        self.assertTrue(
+            kp.saturation_message(sat, now=1000).startswith(
+                "kanban dispatcher holding background cards: 1/2 worker slots busy"
+            )
+        )
 
     def test_a_user_card_is_labelled_user(self):
         sat = dict(SAT, cards=[{"id": "t_1", "assignee": "a", "priority": U, "session_id": "2026_x", "started_at": 990}])

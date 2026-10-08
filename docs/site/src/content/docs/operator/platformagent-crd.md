@@ -379,7 +379,8 @@ kanban dispatcher saturated: 6/6 worker slots busy (5 background, 1 user: t_ab12
 ```
 
 with `; N background card(s) held back because one slot is reserved for user cards` added when the
-reserved slot is what held them. That line is load, not a fault. The older
+reserved slot is what held them. When the only free slot is the one held for users, the line
+starts `kanban dispatcher holding background cards:` instead. That line is load, not a fault. The older
 `kanban dispatcher stuck: … Check profile health` warning now means what it says: slots were free
 and still nothing started.
 

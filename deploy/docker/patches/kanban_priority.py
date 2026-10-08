@@ -658,8 +658,12 @@ def saturation_message(sat: dict, now: Optional[float] = None) -> str:
         f"{_age(card.get('started_at'), now)} [{_origin(card)}]"
         for card in sat.get("cards", ())
     )
+    # A free slot held back for user cards is not saturation; say which it is.
+    running, limit = sat.get("running"), sat.get("limit")
+    full = isinstance(running, int) and isinstance(limit, int) and running >= limit
+    state = "saturated" if full else "holding background cards"
     text = (
-        f"kanban dispatcher saturated: {sat.get('running')}/{sat.get('limit')} "
+        f"kanban dispatcher {state}: {running}/{limit} "
         f"worker slots busy ({sat.get('background_running', 0)} background, "
         f"{sat.get('user_running', 0)} user: {cards or 'none listed'}); "
         f"{sat.get('user_waiting', 0)} user card(s) and "
