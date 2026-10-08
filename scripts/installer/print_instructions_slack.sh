@@ -49,7 +49,7 @@ if is_truthy "${SLACK_ENABLED:-$DEFAULT_SLACK_ENABLED}"; then
   if [ -z "${SLACK_HOME_CHANNEL:-}" ]; then
     echo -e "[ ] 5. No home channel was configured at install. If step 2 was the install's first chat message, it set one there."
     echo -e "       Otherwise scheduled audits have nowhere to post on Slack. Set or move it from the channel you want: ${C_WHITE}/hermes sethome${C_RESET}"
-    echo -e "       Or set ${C_WHITE}SLACK_HOME_CHANNEL${C_RESET} by re-running this step."
+    echo -e "       Setting ${C_WHITE}SLACK_HOME_CHANNEL${C_RESET} by re-running this step applies only while no chat message has set one; after that, use ${C_WHITE}/hermes sethome${C_RESET}."
     echo -e ""
   fi
 fi

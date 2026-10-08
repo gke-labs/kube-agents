@@ -27,9 +27,13 @@ import plugin  # noqa: E402
 EVAL_STACK_DIR = "bench/tf/prebuilt/first-install-hello/"
 
 
+# Hermes' Platform also has non-durable members, so a turn past a regressed
+# allowlist resolves instead of raising.
 class _Platform(enum.Enum):
     GOOGLE_CHAT = "google_chat"
     SLACK = "slack"
+    CLI = "cli"
+    API_SERVER = "api_server"
 
 
 def _fake_session_env(**values):
@@ -292,6 +296,19 @@ class PreLlmCallTest(unittest.TestCase):
         self._call(platform="test-local-surface-01")
         persist.assert_not_called()
         save_env_value.assert_not_called()
+
+    def test_failed_bind_sets_no_home_channel(self):
+        persist, save_env_value = self._arm_home_channel()
+        self.update_job.side_effect = RuntimeError("cron store unavailable")
+        self.assertIsNone(self._call())
+        persist.assert_not_called()
+        save_env_value.assert_not_called()
+
+    def test_later_session_sets_no_home_channel(self):
+        persist, _ = self._arm_home_channel()
+        self._call()
+        self._call(session_id="20260720_130000_efgh5678")
+        persist.assert_called_once()
 
     def test_home_channel_has_every_field_load_gateway_config_reads(self):
         # HomeChannel.from_dict indexes platform and chat_id; a block missing
