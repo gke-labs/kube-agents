@@ -358,6 +358,83 @@ func TestDispatcherKeepsDedupOnPolicyFilter(t *testing.T) {
 	}
 }
 
+func TestDispatcherKeepsDedupClosedOnWorkloadFoldedDuplicate(t *testing.T) {
+	injectCount := 0
+	createCount := 0
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/sessions":
+			createCount++
+			w.WriteHeader(http.StatusCreated)
+			_ = json.NewEncoder(w).Encode(createSessionResponse{
+				AppName:   "platform",
+				UserID:    "default",
+				SessionID: "session-1",
+			})
+		default:
+			injectCount++
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"status":"filtered","duplicate_of":"42"}`))
+		}
+	}))
+	defer server.Close()
+
+	inj, err := newInjector(injectorConfig{
+		daemonURL:   server.URL,
+		bearerToken: "mock-token",
+		httpClient:  server.Client(),
+	})
+	if err != nil {
+		t.Fatalf("failed to build injector: %v", err)
+	}
+	dedup, err := newDedupCache(24*time.Hour, "")
+	if err != nil {
+		t.Fatalf("failed to build cache: %v", err)
+	}
+	disp := &dispatcher{
+		filter:      newFilter(newFilterConfig(nil, nil, nil, filterThresholds{})),
+		dedup:       dedup,
+		pullClasses: newPullClassMemo(0, 0),
+		injector:    inj,
+		metrics:     newMetrics(),
+		mode:        "per-incident",
+	}
+
+	ev := TriageEvent{
+		Key:       EventKey{UID: "pod-folded-1", Reason: "BackOff"},
+		Type:      "Warning",
+		Cluster:   "test-cluster",
+		Namespace: "prod",
+		Name:      "api-7d9f8b6c4-bbbbb",
+		Message:   "Back-off restarting failed container",
+		Count:     5,
+		FirstSeen: time.Now(),
+		LastSeen:  time.Now(),
+	}
+
+	disp.Dispatch(context.Background(), ev)
+	if injectCount != 1 {
+		t.Fatalf("got %d inject calls on first sighting; want 1", injectCount)
+	}
+	if dedup.Len() != 1 {
+		t.Fatalf("got %d dedup entries after folded response; want 1", dedup.Len())
+	}
+
+	// Repeat Warning sightings for the same pod UID must stay locally
+	// deduplicated instead of reopening and deleting the entry.
+	for i := 1; i <= 3; i++ {
+		ev.LastSeen = ev.LastSeen.Add(time.Duration(i) * time.Minute)
+		disp.Dispatch(context.Background(), ev)
+	}
+	if injectCount != 1 {
+		t.Errorf("got %d inject calls across 4 Warning sightings; want 1", injectCount)
+	}
+	if createCount != 1 {
+		t.Errorf("got %d create-session calls across 4 Warning sightings; want 1", createCount)
+	}
+}
+
 // TestDispatcherReopensPolicyFilteredKeyForWarning is the limit on the test
 // above. Keeping the dedup entry is right for the event that was graded, and
 // the entry is not keyed on that event: canonicalizeReason folds kubelet's

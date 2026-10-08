@@ -85,6 +85,14 @@ spec:
     driftDetector:
       {{- . | nindent 6 }}
     {{- end }}
+    {{- $triage := .Values.platformAgent.harness.incidentTriage | default dict }}
+    {{- /* Omitted unless set, for the reason driftDetector above is. */}}
+    {{- with include "kube-agents.compactFields" (dict
+          "openPullRequest" $triage.openPullRequest
+          "workloadDedupSeconds" $triage.workloadDedupSeconds) }}
+    incidentTriage:
+      {{- . | nindent 6 }}
+    {{- end }}
     {{- $tuning := deepCopy (.Values.platformAgent.harness.tuning | default dict) }}
     {{- if and .Values.plugins (and .Values.plugins.stockoutInvestigator .Values.plugins.stockoutInvestigator.enabled) }}
     {{- $defaultStockoutTuning := dict "maxInProgress" 3 "platform" (dict "apiMaxRetries" 8 "maxTurns" 200) "cluster" (dict "apiMaxRetries" 8 "maxTurns" 150) }}

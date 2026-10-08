@@ -634,6 +634,17 @@ func (d *dispatcher) Dispatch(ctx context.Context, ev TriageEvent) {
 		d.metrics.injectErrors.WithLabelValues(ev.Cluster, ev.Project, ev.Location, ev.Key.Reason, "inject").Inc()
 		return
 	}
+	if status == injectStatusFolded {
+		// 2xx, folded into an earlier admitted incident on the same
+		// workload. Keep the dedup entry closed (PolicyFiltered=false)
+		// so repeat kubelet sightings for this pod UID are suppressed
+		// locally for the watcher window instead of triggering
+		// ReopenIfPolicyFiltered on the next Warning sighting.
+		d.metrics.eventsPolicyFiltered.WithLabelValues(ev.Cluster, ev.Project, ev.Location, ev.Key.Reason, ev.Namespace).Inc()
+		log.Printf("workload-folded %s pod=%s/%s (sid=%s) — daemon folded into active workload incident",
+			ev.Key.Reason, ev.Namespace, ev.Name, sid)
+		return
+	}
 	if status == injectStatusFiltered {
 		// 2xx, and nobody was told — but by policy rather than by
 		// exhaustion, so the dedup entry stays. The daemon graded the

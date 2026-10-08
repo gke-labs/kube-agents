@@ -110,11 +110,12 @@ type injectMessageRequest struct {
 	Message string `json:"message"`
 }
 
-// injectResponse is the daemon's reply to an accepted inject. Only the status
-// is read; the daemon sends more on the suppressed path and may send more
-// later.
+// injectResponse is the daemon's reply to an accepted inject. Status and
+// DuplicateOf distinguish delivered, Info-filtered, workload-folded, and
+// quota-suppressed responses.
 type injectResponse struct {
-	Status string `json:"status"`
+	Status      string `json:"status"`
+	DuplicateOf string `json:"duplicate_of"`
 }
 
 // injectStatusSuppressed is the daemon's word for "accepted, and then dropped
@@ -154,6 +155,15 @@ const injectStatusSuppressed = "suppressed"
 // the other by a container image pull, so they version independently on every
 // install and a pod is not all-old or all-new.
 const injectStatusFiltered = "filtered"
+
+// injectStatusFolded is returned by Inject when the daemon answered
+// status="filtered" with a non-empty duplicate_of — meaning a Warning event was
+// folded into an earlier admitted incident on the same workload inside
+// workloadDedupSeconds. Unlike an Info-graded event (injectStatusFiltered), a
+// folded event is already Warning-level; keeping its dedup entry closed
+// (PolicyFiltered=false) suppresses repeat kubelet sightings for this pod UID
+// instead of reopening and deleting the entry on the next sighting.
+const injectStatusFolded = "folded"
 
 // injectFeaturesHeader lists the response behaviours this watcher understands,
 // so the daemon can answer an older one the way that older one expects.
@@ -216,5 +226,8 @@ func (i *injector) Inject(ctx context.Context, sessionID string, payload InjectP
 	}
 	var parsed injectResponse
 	_ = json.Unmarshal(respBody, &parsed)
+	if parsed.Status == injectStatusFiltered && parsed.DuplicateOf != "" {
+		return injectStatusFolded, nil
+	}
 	return parsed.Status, nil
 }
