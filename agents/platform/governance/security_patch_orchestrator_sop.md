@@ -2,9 +2,9 @@
 
 **Cron id:** `security-patch-orchestrator` — `20 7 * * 1` (Mondays, 07:20 UTC).
 
-**Purpose:** Report whether every GKE cluster in the fleet runs a version GKE still offers at its location, and whether it is configured to _stay_ current on its own — and, for a cluster that is behind, whether the upgrade it needs would complete. This audit is **read-only and reports readiness**. It never upgrades anything: upgrading is a human decision, and the audit's job is to make that decision cheap, evidence-backed, and repeatable week over week.
+**Purpose:** Report whether every GKE cluster in the fleet runs a version GKE still offers at its location, and whether it is configured to _stay_ current on its own — and, for a cluster that is behind, how the upgrade it needs would go. This audit is **read-only and reports readiness**. It never upgrades anything: upgrading is a human decision, and the audit's job is to make that decision cheap, evidence-backed, and repeatable week over week.
 
-**Data sources:** `gcloud container ...`, read-only `kubectl`, the `gke` MCP server, and the `platform_control` MCP tools (`list_cc_pods`, `get_cc_pod_diagnostics`, `list_cc_healthchecks`, `get_cc_operator_status`, `audit_log_searcher`). **Nothing else.** No BigQuery, no Prometheus, no Container Analysis or Artifact Registry vulnerability scanning, no Security Command Center, no external blueprint or CVE feed, and no delegation to Cluster Agents via kanban. **You have no vulnerability feed, so you never enumerate CVEs** — every finding here is version currency, upgrade-policy hygiene, or — for 3.11 alone — whether an upgrade would complete, and must be worded that way.
+**Data sources:** `gcloud container ...`, read-only `kubectl`, the `gke` MCP server, and the `platform_control` MCP tools (`list_cc_pods`, `get_cc_pod_diagnostics`, `list_cc_healthchecks`, `get_cc_operator_status`, `audit_log_searcher`). **Nothing else.** No BigQuery, no Prometheus, no Container Analysis or Artifact Registry vulnerability scanning, no Security Command Center, no external blueprint or CVE feed, and no delegation to Cluster Agents via kanban. **You have no vulnerability feed, so you never enumerate CVEs** — every finding here is version currency, upgrade-policy hygiene, or — for 3.11 alone — how an upgrade would go, and must be worded that way.
 
 ---
 
@@ -224,12 +224,14 @@ This stream's targets are GKE control-plane and node-pool metadata, with one in-
 - **Remediation:** `kind: gcloud` — `gcloud container clusters update <cluster> --location=<loc> --project=<p> --notification-config=pubsub=ENABLED,pubsub-topic=projects/<p>/topics/<topic>`; verify the flag's filter syntax with `--help` before recording it.
 - **When the excerpt names a topic the fleet already publishes to, that is the topic — do not conclude there is none.** The collector appends `; other clusters in this fleet publish upgrade notifications to <path>` to every `no-notifications` excerpt when every enrolled cluster publishes to the same topic, because a cluster with Pub/Sub disabled has no topic of its own to tell you. Use that path verbatim in the remediation. A cluster flagged for its filter already publishes to its own topic, gets no such suffix, and keeps that topic: its fix is the filter. A cluster with no declared topic is still a `gcloud` finding, not a `manual` one: the topic's absence from GCP is a reason to order the work, not to decline it.
 
-#### 3.11 The upgrade cannot complete (`upgrade-blocked`)
+#### 3.11 The upgrade would be held or refused (`upgrade-blocked`)
 
-The other ten checks say whether a cluster is **due** an upgrade. This one says whether the upgrade
-would **finish**, which is the difference between a report an operator reads and one an operator
-can act on. A cluster three minors behind with a healthy drain path is a scheduling decision; the
-same cluster with a drain that cannot complete is an outage waiting for whoever starts the upgrade.
+The other ten checks say whether a cluster is **due** an upgrade. This one says how the upgrade
+would **go**, which is the difference between a report an operator reads and one an operator can
+act on. A cluster three minors behind with a healthy drain path is a scheduling decision. The same
+cluster with a budget that refuses eviction is a workload GKE forces off its node an hour into the
+drain, and the same cluster with a pool past the skew ceiling is an upgrade GKE refuses to start;
+each is waiting for whoever schedules it.
 
 - **Command:** the collector runs it; do not re-implement the detection, and do not run it by hand
   on a cluster the collector collected. For every cluster with a 3.1 or 3.2 candidate, the
@@ -242,7 +244,7 @@ same cluster with a drain that cannot complete is an outage waiting for whoever 
 - **Do NOT flag:** a block that rests only on `readiness.maintenance.blocking_exclusions`. The
   skill grades a `NO_MINOR_UPGRADES` exclusion as blocking; 3.8 here deliberately does not, because
   an exclusion holds back GKE's automatic upgrade and does not stop a manual one — that exclusion is
-  3.8's subject, and it is not a drain that cannot finish. The collector records the check as run
+  3.8's subject, and it is neither a held drain nor a refused move. The collector records the check as run
   there and emits no candidate.
 - **Not applicable**, in two cases and no other. A cluster 3.1 judged and found current, with no
   3.2 candidate either, has no upgrade whose completion could be blocked; a `RECONCILING` one,
@@ -266,30 +268,44 @@ same cluster with a drain that cannot complete is an outage waiting for whoever 
   clean pass; `finish` refuses the slug in `checks_run` or `checks_not_applicable` there. Do not
   run the reporter yourself to fill it: the cross-check rejects a `checks_run` the manifest does
   not back.
-- **Severity:** **critical**. The only check here whose subject is an upgrade that fails rather
-  than one that is late.
+- **Severity:** **critical**. The only check here whose subject is how an upgrade would go rather
+  than whether one is late: a budget's hold ends in a forced eviction of the workload it protects,
+  and a skew ceiling stops the upgrade outright.
 - **Object and evidence:** `object` is `Cluster/<cluster>`, like every finding in this audit (§2:
   `namespace` is `""`), so the finding keeps one identity week over week. The candidate's
   `excerpt` carries every blocking budget in name order, each with its field, the workloads it
   covers and `disruptionsAllowed`, taken from the `members[].readiness.pdbs.blocking[]` entries;
   paste it as it is.
-- **Impact:** the candidate's, whose tail names the mechanism for its cause. For a budget:
-  "`<cluster>` is `<n>` minor(s) behind and its upgrade would not complete: PodDisruptionBudget
-  `<namespace>/<budget>` (`maxUnavailable: 0`, disruptionsAllowed 0) refuses eviction of
-  `<workload>`, so the node drain an upgrade performs stalls on it." For skew: "... would not
-  complete: node pool(s) `<pool>` would exceed the version-skew ceiling against the target control
-  plane, so GKE will not move the control plane until the pool moves."
-- **Remediation:** `kind: manual`. The fix belongs to whoever owns the blocking object, and it is
-  the object that changes, not the cluster. For a budget, name it and what would have to change
-  about it; never propose deleting a PodDisruptionBudget, which trades a stalled upgrade for an
-  unprotected workload. For skew, name the pool and the version it has to reach before the control
-  plane can move.
+- **Impact:** the candidate's, whose tail names the mechanism for its cause, and the two causes
+  make different claims. A budget delays the upgrade and costs the workload its pod; it does not
+  stop the upgrade: a surge upgrade respects the budget for up to an hour per node and then
+  evicts anyway. For a budget: "`<cluster>` is `<n>` minor(s) behind and its upgrade would be
+  held, not stopped: PodDisruptionBudget `<namespace>/<budget>` (`maxUnavailable: 0`,
+  disruptionsAllowed 0) refuses eviction of `<workload>`, so GKE holds each node's drain for up to
+  an hour and then evicts `<workload>` anyway." A skew ceiling does stop it. For skew: "`<cluster>`
+  is `<n>` minor(s) behind and its upgrade would not complete: node pool(s) `<pool>` would exceed
+  the version-skew ceiling against the target control plane, so GKE will not move the control
+  plane until the pool moves." Never write "would not complete" or "stalls" on the budget arm: an
+  operator reads it as a drain that waits for them, and the forced eviction is what they need to
+  know about.
+- **Remediation:** `kind: manual`, and for a budget the fix is not filed here a second time. The
+  obtainability audit owns PodDisruptionBudgets: its 3.4 `blocking-pdb` reports the same budget
+  daily in its own ledger as `critical`, with the `maxUnavailable: 1` manifest that `/remediate`
+  there turns into a pull request when the workload runs two or more replicas, and as `manual`
+  when it runs one. Point this finding at that one: name the budget and say that the fix is the
+  obtainability ledger's `blocking-pdb` finding for it, so an operator who reaches for `/remediate`
+  here is sent to the finding that carries the manifest rather than refused with no pointer. Never
+  propose deleting a PodDisruptionBudget, which trades a held drain for an unprotected workload.
+  For skew, name the pool and the version it has to reach before the control plane can move; no
+  other ledger carries that.
 
 **Why this is a join and not a new detector.** Drain safety is the obtainability audit's subject,
 and its 3.4 already finds these budgets daily. What no run produced before is the pairing: that
 audit reports a reliability risk with no notion of an upgrade, and checks 3.1 to 3.3 here report a
 version lag with no notion of whether it can be closed. Neither alone tells an operator that the
-upgrade they are about to schedule will stall. Read the grade, join it to the lag, and say so.
+upgrade they are about to schedule will be held to a forced eviction, or refused. Read the grade,
+join it to the lag, and say so; the budget's fix stays with the obtainability finding, so one
+budget carries one remediation across the two ledgers.
 
 **Deliberately not checked.** State these in the ledger only if asked; never fabricate coverage. CVE enumeration and image vulnerability scanning are **dropped** — they need Container Analysis, Artifact Registry scanning, or an external feed, all forbidden. Calendar end-of-life ("this minor goes EOL in 45 days") is **dropped** — GKE exposes no EOL date in the API and a support-window calendar would be an external input; 3.1(a)'s "offered by no route at this location" is the closest tool-derivable proxy and is what the audit actually reports. In-cluster component versions and workload image tags are out of scope. This audit covers GKE control planes and node pools, plus one in-cluster object: the PodDisruptionBudget set that 3.11 takes from the readiness grade.
 
