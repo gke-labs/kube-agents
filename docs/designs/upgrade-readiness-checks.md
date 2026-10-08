@@ -273,9 +273,11 @@ Rollout tracking against one target version already runs (see Scope). The additi
   `CrashLoopBackOff` or `ImagePullBackOff`, webhook latency, pods stuck pending, deprecation
   warnings that were not there before. Without the diff, "the upgrade worked" means "nothing
   obvious caught fire".
-  The [upgrade retrospective](upgrade-retrospective.md) is that diff on a schedule: a review of
-  every new or upgraded cluster at the end of each weekend, with the failures it finds classified against
-  the catalogue and fed back to the readiness report as guards.
+  The [upgrade retrospective](upgrade-retrospective.md) does the pod and node part of that diff on
+  a schedule (new `CrashLoopBackOff`, `ImagePullBackOff` and Pending pods; not webhook latency or
+  deprecation warnings): a review of every new or upgraded cluster at the end of each weekend, with
+  the failures it finds classified against the catalogue and fed back to the readiness report as
+  guards.
 
 ## How it is delivered
 
