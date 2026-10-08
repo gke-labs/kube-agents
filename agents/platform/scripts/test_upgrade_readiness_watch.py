@@ -374,9 +374,33 @@ class Retired(Base):
                 self.assertEqual(code, 0)
                 if block is None:
                     self.assertNotIn("malformed", out)
+                    self.assertNotIn("the tick failed", out)
+                    self.assertEqual(sandbox.kinds(), ["versions", "readiness"])
+                    self.assertIsInstance(self.ledger()["announced"], dict)
                 else:
                     self.assertIn("has a malformed announced block; refusing to overwrite it", out)
                     self.assertEqual(sandbox.calls, [])
+
+
+    def test_an_oversized_refresh_interval_falls_back_to_the_default(self) -> None:
+        self.seed(TARGET, NOW - timedelta(days=3))
+        with mock.patch.dict(os.environ, {watch.REFRESH_DAYS_ENV: "99999999999"}):
+            sandbox = FakeSandbox(envelope([member("a", "lagging")]))
+            code, out = self.run_tick(sandbox)
+        self.assertEqual(code, 0)
+        self.assertEqual(out, "")
+        self.assertEqual(self.ledger()["last_tick"], NOW.isoformat())
+
+    def test_a_failed_project_listing_keeps_its_clusters_pending_as_not_read(self) -> None:
+        self.seed(TARGET, NOW - timedelta(days=8), ["p1/us-central1-a/a", "p2/us-central1-a/b"])
+        partial = envelope([member("a", "lagging")], errors=[{"project": "p2", "message": "clusters list failed"}], exit_code=1)
+        readiness = envelope([member("a", "lagging", readiness="ready")])
+        with mock.patch.dict(os.environ, {watch.PROJECTS_ENV: "p1,p2"}):
+            sandbox = FakeSandbox(partial, readiness)
+            code, out = self.run_tick(sandbox)
+        self.assertEqual(code, 0)
+        self.assertIn("2 cluster(s) pending (a, b): 0 blocked, 1 ready, 1 not read;", out)
+        self.assertEqual(self.ledger()["targets"][TARGET]["pending"], ["p1/us-central1-a/a", "p2/us-central1-a/b"])
 
 
 class ProfileHome(unittest.TestCase):
