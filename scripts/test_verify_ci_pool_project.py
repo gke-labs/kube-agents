@@ -3997,19 +3997,21 @@ class FleetResourceTypesAreCoveredByReconcilerRolesTest(unittest.TestCase):
         """(kind, label tokens) for every top-level block in the stack."""
         headers = []
         for path in sorted(self._FLEET.glob("*.tf")):
-            tokens, depth = _hcl_tokens(path.read_text()), 0
+            tokens, depth, start = _hcl_tokens(path.read_text()), 0, 0
             for index, token in enumerate(tokens):
                 if token[0] == _HCL_OPEN:
                     if depth == 0:
-                        # Back to the keyword that opened this block.
-                        words = index
-                        while words > 0 and tokens[words - 1][0] != _HCL_WORD:
-                            words -= 1
-                        if words > 0:
-                            headers.append((tokens[words - 1][1], tokens[words:index]))
+                        # The header is every token since the previous
+                        # top-level block closed: the keyword, then the labels,
+                        # whatever they are (a naked label is a label, not a kind).
+                        head = tokens[start:index]
+                        self.assertTrue(head and head[0][0] == _HCL_WORD, f"{path.name}: a top-level block with no keyword before its brace: {head!r}")
+                        headers.append((head[0][1], head[1:]))
                     depth += 1
                 elif token[0] == _HCL_CLOSE:
                     depth -= 1
+                    if depth == 0:
+                        start = index + 1
             self.assertEqual(depth, 0, f"{path.name}: unbalanced braces after tokenizing; the scan cannot trust this file")
         return headers
 
