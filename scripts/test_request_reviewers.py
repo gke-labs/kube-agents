@@ -40,14 +40,15 @@ import request_reviewers as rr
 # input, so a test fixture that reorders them tests nothing.
 CONFIG = {
     "reviewers": {
-        "defaults": ["repository-owners"],
+        "defaults": ["repository-owners", "repository-reviewers"],
         "groups": {
-            "repository-owners": ["bradhoekstra", "jayantid", "toshiowang", "dshnayder", "bnaylor"],
+            "repository-owners": ["bradhoekstra", "jayantid", "toshiowang", "dshnayder", "bnaylor", "haoxuw"],
+            "repository-reviewers": ["lapis2002", "stalhaali", "Fuxiao-Gao"],
             "eval-crew": ["jayantid", "lapis2002"],
         },
     },
     "files": {
-        "**": ["repository-owners"],
+        "**": ["repository-owners", "repository-reviewers"],
         "hack/eval/presubmit-cases.txt": ["eval-crew"],
         "hack/eval/blocking-roster.txt": ["eval-crew"],
     },
@@ -62,7 +63,12 @@ CONFIG = {
 }
 
 OWNERS = CONFIG["reviewers"]["groups"]["repository-owners"]
+REVIEWERS = CONFIG["reviewers"]["groups"]["repository-reviewers"]
 EVAL_CREW = CONFIG["reviewers"]["groups"]["eval-crew"]
+# What an ordinary change draws from: the approvers and the non-approver
+# reviewers, in config order, before the author is removed and the pool is
+# narrowed for an author whose own approval does not cover the change.
+POOL = OWNERS + REVIEWERS
 REPO_ROOT = _HERE.parent
 LIVE_CONFIG = REPO_ROOT / rr.DEFAULT_CONFIG_PATH
 
@@ -72,13 +78,13 @@ LIVE_CONFIG = REPO_ROOT / rr.DEFAULT_CONFIG_PATH
 # `jayantid` is inside it, so an `APPROVED` review from him reads as an
 # approval, and `NON_APPROVER` is outside it, so the same review from him
 # does not.
-APPROVERS = {"bradhoekstra", "jayantid", "toshiowang", "dshnayder", "bnaylor"}
+APPROVERS = {"bradhoekstra", "jayantid", "toshiowang", "dshnayder", "bnaylor", "haoxuw"}
 NON_APPROVER = "outside-contributor"
 
 # The root OWNERS, OWNERS_ALIASES and hack/OWNERS as they stand, for the walk
 # tests that need a tree they can also mutate.
 OWNERS_TREE = {
-    "OWNERS": "approvers:\n- AntonTyb\n- bradhoekstra\n- jayantid\n",
+    "OWNERS": "approvers:\n- AntonTyb\n- bradhoekstra\n- jayantid\nreviewers:\n- bradhoekstra\n- lapis2002\n- stalhaali\n",
     "OWNERS_ALIASES": "aliases:\n  eval-crew:\n    - jayantid\n    - lapis2002\n",
     "hack/OWNERS": (
         "filters:\n"
@@ -90,6 +96,7 @@ OWNERS_TREE = {
     ),
 }
 ROOT_APPROVERS = {"antontyb", "bradhoekstra", "jayantid"}
+ROOT_REVIEWERS = {"bradhoekstra", "lapis2002", "stalhaali"}
 
 
 def write_tree(root, files):
@@ -307,7 +314,7 @@ class SelectionTest(unittest.TestCase):
 
     def test_ordinary_change_falls_to_the_catch_all_group(self):
         matched = rr.reviewers_by_changed_files(CONFIG, ["README.md"], "author")
-        self.assertEqual(matched, OWNERS)
+        self.assertEqual(matched, POOL)
 
     def test_a_literal_dot_entry_still_matches(self):
         # The live config names no dotfile path today, but the port has to
@@ -320,7 +327,7 @@ class SelectionTest(unittest.TestCase):
         # `**` cannot reach `.github/workflows/validate.yml`, so nothing matches
         # and the defaults carry it.
         self.assertEqual(rr.reviewers_by_changed_files(CONFIG, [".github/workflows/validate.yml"], "author"), [])
-        self.assertEqual(self.select([".github/workflows/validate.yml"])[0] in OWNERS, True)
+        self.assertEqual(self.select([".github/workflows/validate.yml"])[0] in POOL, True)
 
     def test_a_presubmit_roster_change_goes_to_eval_crew(self):
         # Only eval-crew can /approve hack/eval/presubmit-cases.txt and
@@ -338,7 +345,7 @@ class SelectionTest(unittest.TestCase):
         # route to the default reviewers like any other change.
         for path in ("hack/eval/nightly-cases.txt", "bench/tasks/new-case/task.yaml", "hack/ci-eval-pr.sh", "hack/ci-deploy.sh"):
             with self.subTest(path=path):
-                self.assertEqual(rr.reviewers_by_changed_files(CONFIG, [path], "author"), OWNERS)
+                self.assertEqual(rr.reviewers_by_changed_files(CONFIG, [path], "author"), POOL)
 
     def test_a_mixed_change_still_goes_to_eval_crew(self):
         # Last match wins, and eval-crew is listed last: the reviewer who can
@@ -366,17 +373,17 @@ class SelectionTest(unittest.TestCase):
         self.assertEqual(rr.reviewers_by_changed_files(config, ["hack/eval/presubmit-cases.txt"], "jayantid"), [])
         picked = rr.select_reviewers(config, ["hack/eval/presubmit-cases.txt"], "jayantid", rng=random.Random(0))
         self.assertEqual(len(picked), 1)
-        self.assertIn(picked[0], [name for name in OWNERS if name != "jayantid"])
+        self.assertIn(picked[0], [name for name in POOL if name != "jayantid"])
 
     def test_the_author_is_never_requested(self):
         matched = rr.reviewers_by_changed_files(CONFIG, ["README.md"], "bradhoekstra")
         self.assertNotIn("bradhoekstra", matched)
-        self.assertEqual(matched, [name for name in OWNERS if name != "bradhoekstra"])
+        self.assertEqual(matched, [name for name in POOL if name != "bradhoekstra"])
 
     def test_number_of_reviewers_caps_the_request(self):
         picked = self.select(["README.md"])
         self.assertEqual(len(picked), 1)
-        self.assertIn(picked[0], OWNERS)
+        self.assertIn(picked[0], POOL)
 
     def test_sampling_is_reproducible_for_a_given_seed(self):
         first = rr.select_reviewers(CONFIG, ["README.md"], "author", rng=random.Random(7))
@@ -386,9 +393,45 @@ class SelectionTest(unittest.TestCase):
     def test_fewer_candidates_than_requested_is_not_an_error(self):
         # One more than the group holds, so the request stays short of the
         # candidates however many names the group grows to.
-        config = dict(CONFIG, options=dict(CONFIG["options"], number_of_reviewers=len(OWNERS) + 1))
+        config = dict(CONFIG, options=dict(CONFIG["options"], number_of_reviewers=len(POOL) + 1))
         picked = rr.select_reviewers(config, ["README.md"], "author", rng=random.Random(0))
-        self.assertCountEqual(picked, OWNERS)
+        self.assertCountEqual(picked, POOL)
+
+    def test_a_restriction_narrows_the_pool_to_the_logins_given(self):
+        # The pool for a pull request whose author cannot self-approve: the
+        # non-approver reviewers would leave it with lgtm and nobody asked for
+        # the /approve, so only the OWNERS approvers for the change are drawn.
+        config = dict(CONFIG, options=dict(CONFIG["options"], number_of_reviewers=None))
+        approvers = {name.lower() for name in OWNERS}
+        picked = rr.select_reviewers(config, ["README.md"], "author", rng=random.Random(0), restrict_to=approvers)
+        self.assertEqual(picked, OWNERS)
+        for seed in range(20):
+            picked = rr.select_reviewers(CONFIG, ["README.md"], "author", rng=random.Random(seed), restrict_to=approvers)
+            self.assertIn(picked[0], OWNERS, seed)
+
+    def test_no_restriction_draws_from_the_whole_pool(self):
+        # An approver's own pull request is self-approved and needs lgtm
+        # alone, which any name in the pool can give: equal weight, no
+        # preference either way.
+        picked = {rr.select_reviewers(CONFIG, ["README.md"], "bradhoekstra", rng=random.Random(seed))[0] for seed in range(60)}
+        self.assertEqual(picked, set(POOL) - {"bradhoekstra"})
+
+    def test_a_restriction_matches_logins_case_insensitively(self):
+        # OWNERS logins come out of the walk lower-cased; the config spells
+        # them as GitHub shows them.
+        config = dict(CONFIG, options=dict(CONFIG["options"], number_of_reviewers=None))
+        picked = rr.select_reviewers(config, ["README.md"], "author", rng=random.Random(0), restrict_to={"fuxiao-gao"})
+        self.assertEqual(picked, ["Fuxiao-Gao"])
+
+    def test_a_restriction_that_empties_the_pool_falls_back_to_the_whole_of_it(self):
+        # Nobody in the matched pool can /approve: a config shape, not a
+        # pull-request one. Asking someone who can lgtm beats asking nobody,
+        # and the run log says the pool was not narrowed.
+        config = dict(CONFIG, options=dict(CONFIG["options"], number_of_reviewers=None))
+        with contextlib.redirect_stderr(io.StringIO()) as stderr:
+            picked = rr.select_reviewers(config, ["README.md"], "author", rng=random.Random(0), restrict_to={"nobody"})
+        self.assertEqual(picked, POOL)
+        self.assertIn("none of them", stderr.getvalue())
 
     def test_teams_are_split_from_users(self):
         users, teams = rr.split_teams(["bradhoekstra", "team:sre"])
@@ -428,6 +471,41 @@ class OwnersTest(unittest.TestCase):
         for path in ("hack/eval/nightly-cases.txt", "hack/ci-eval-pr.sh"):
             with self.subTest(path=path):
                 self.assertEqual(self.approvers(path), ROOT_APPROVERS)
+
+    def test_the_reviewer_walk_reads_the_other_list(self):
+        self.assertEqual(rr.applicable_reviewers(["README.md"], self.root.name), ROOT_REVIEWERS)
+
+    def test_the_reviewer_walk_falls_through_no_parent_owners_that_names_no_reviewers(self):
+        # Prow stops a walk at no_parent_owners only once *that* walk has
+        # collected something, and hack/OWNERS names no reviewers, so a
+        # roster-only change takes its lgtm from the root reviewers as well.
+        for path in ("hack/eval/presubmit-cases.txt", "hack/eval/blocking-roster.txt"):
+            with self.subTest(path=path):
+                self.assertEqual(rr.applicable_reviewers([path], self.root.name), ROOT_REVIEWERS)
+
+    def test_a_filter_with_reviewers_of_its_own_stops_the_reviewer_walk(self):
+        write_tree(
+            self.root.name,
+            {"hack/OWNERS": OWNERS_TREE["hack/OWNERS"].replace("    - eval-crew\n", "    - eval-crew\n    reviewers:\n    - roster-reader\n")},
+        )
+        self.assertEqual(rr.applicable_reviewers(["hack/eval/presubmit-cases.txt"], self.root.name), {"roster-reader"})
+        self.assertEqual(rr.applicable_reviewers(["hack/ci-eval-pr.sh"], self.root.name), ROOT_REVIEWERS)
+
+    def test_an_author_self_approves_only_when_every_file_is_theirs(self):
+        # Prow's `approved` is per file: a root approver's own pull request
+        # is approved on open (#1075), but not the roster half of a mixed one,
+        # since only eval-crew approves that (hack/OWNERS, no_parent_owners).
+        def approves(author, *changed):
+            return rr.author_approves(list(changed), author, self.root.name)
+
+        self.assertTrue(approves("bradhoekstra", "README.md", "k8s-operator/go.mod"))
+        self.assertTrue(approves("BradHoekstra", "README.md"))
+        self.assertFalse(approves("bradhoekstra", "README.md", "hack/eval/presubmit-cases.txt"))
+        self.assertTrue(approves("jayantid", "README.md", "hack/eval/presubmit-cases.txt"))
+        self.assertFalse(approves("lapis2002", "README.md", "hack/eval/presubmit-cases.txt"))
+        self.assertTrue(approves("lapis2002", "hack/eval/presubmit-cases.txt"))
+        self.assertFalse(approves("stalhaali", "README.md"))
+        self.assertFalse(approves("bradhoekstra"))
 
     def test_a_mixed_change_is_the_union(self):
         self.assertEqual(
@@ -469,10 +547,11 @@ class OwnersTest(unittest.TestCase):
             self.assertEqual(rr.applicable_approvers(["README.md"], empty), set())
 
     def test_the_live_tree_agrees_with_the_bots_config(self):
-        # The same property docs/pull-request-workflow.md states of the config:
-        # everyone the bot can assign is an approver for what it assigns them.
-        # If this fails, one of OWNERS, OWNERS_ALIASES, hack/OWNERS or the
-        # config moved and the other did not.
+        # The properties docs/pull-request-workflow.md states of the config:
+        # repository-owners and eval-crew are approvers for what the config
+        # assigns them, and repository-reviewers may lgtm and not approve. If
+        # this fails, one of OWNERS, OWNERS_ALIASES, hack/OWNERS or the config
+        # moved and the other did not.
         root_approvers = rr.applicable_approvers(["README.md"], REPO_ROOT)
         self.assertTrue(set(OWNERS) <= root_approvers, root_approvers)
         self.assertEqual(rr.applicable_approvers(["hack/eval/presubmit-cases.txt"], REPO_ROOT), set(EVAL_CREW))
@@ -487,6 +566,13 @@ class OwnersTest(unittest.TestCase):
         root_reviewers = {login.lower() for login in rr._read_yaml(REPO_ROOT / rr.OWNERS_FILENAME).get("reviewers") or []}
         self.assertTrue({login.lower() for login in root_approvers} <= root_reviewers, root_approvers - root_reviewers)
         self.assertTrue({login.lower() for login in EVAL_CREW} <= root_reviewers, set(EVAL_CREW) - root_reviewers)
+        # repository-reviewers are asked for lgtm alone, which Prow takes from
+        # them only while OWNERS lists them under `reviewers`; and none of them
+        # is a root approver, or they belong in repository-owners, where the
+        # narrowed pool for a non-approver's pull request can reach them.
+        reviewers = {login.lower() for login in REVIEWERS}
+        self.assertTrue(reviewers <= root_reviewers, reviewers - root_reviewers)
+        self.assertFalse(reviewers & {login.lower() for login in root_approvers}, reviewers & root_approvers)
         hack_owners = rr._read_yaml(REPO_ROOT / "hack" / rr.OWNERS_FILENAME)
         self.assertNotIn("reviewers", hack_owners)
         for pattern, rules in (hack_owners.get("filters") or {}).items():
@@ -649,8 +735,8 @@ class MainTest(unittest.TestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
 
-    def run_main(self, pull, reviews, *extra):
-        self.api = FakeAPI(pulls=[pull], reviews={1: reviews}, files={1: ["README.md"]})
+    def run_main(self, pull, reviews, *extra, files=("README.md",)):
+        self.api = FakeAPI(pulls=[pull], reviews={1: reviews}, files={1: list(files)})
         argv = ["--pr", "1", "--config", str(LIVE_CONFIG), "--owners-root", self.root.name, "--seed", "0", *extra]
         self.stdout, self.stderr = io.StringIO(), io.StringIO()
         with mock.patch.object(rr, "GitHubAPI", return_value=self.api):
@@ -681,6 +767,92 @@ class MainTest(unittest.TestCase):
         posts = self.run_main(pull_request(requested_reviewers=[{"login": "kyber775"}]), [])
         self.assertEqual(posts, [self.REQUESTED])
         self.assertEqual(self.code, 0)
+
+    def requested(self):
+        return [login for path, payload in self.api.posts if path == self.REQUESTED for login in payload["reviewers"]]
+
+    def test_a_non_approver_author_is_sent_an_approver(self):
+        # The live roster now lists non-approvers in the catch-all pool, and
+        # "author" approves nothing in the fixture tree: whoever is asked has
+        # to be able to clear `approved`, or the pull request takes an lgtm it
+        # cannot use and sits with nobody asked for the rest.
+        # Against the fixture tree's approvers, not the config group's names:
+        # the group holds three logins the tree does not make approvers, and
+        # an implementation that narrowed by group name would hand them out.
+        for seed in range(20):
+            self.run_main(pull_request(), [], "--seed", str(seed))
+            self.assertEqual(self.code, 0)
+            self.assertIn(self.requested()[0].lower(), ROOT_APPROVERS, seed)
+        self.assertIn("author's own approval does not cover", self.stderr.getvalue())
+
+    def test_the_override_narrows_the_pool_too(self):
+        # `/request-review` skips the verdict check, not the narrowing: the
+        # person asking wants a reviewer now, and a non-approver's pull request
+        # still needs an approver's. The two live in different blocks of
+        # `main`, so this pins that moving the narrowing into the verdict block
+        # cannot ship green.
+        for seed in range(20):
+            self.run_main(pull_request(), [], "--react-to", str(self.COMMENT_ID), "--seed", str(seed))
+            self.assertEqual(self.code, 0)
+            self.assertIn(self.requested()[0].lower(), ROOT_APPROVERS, seed)
+            self.assertEqual(self.reaction(), [rr.REACTION_ACKNOWLEDGED])
+
+    def test_an_approver_author_draws_from_the_whole_pool(self):
+        # bradhoekstra approves README.md in the fixture tree, so the pull
+        # request opens approved and needs lgtm alone: the non-approver
+        # reviewers are in the draw, at the same weight as everyone else.
+        picked = set()
+        for seed in range(60):
+            self.run_main(pull_request(user={"login": "bradhoekstra", "type": "User"}), [], "--seed", str(seed))
+            picked.update(self.requested())
+        self.assertEqual(picked, set(POOL) - {"bradhoekstra"})
+
+    def test_a_mixed_change_by_an_approver_is_not_self_approved(self):
+        # The roster half needs eval-crew, so the pool is narrowed to the
+        # OWNERS approvers for the change -- root and eval-crew -- after the
+        # files map has already cut it to eval-crew. Either member clears the
+        # roster half; the README half is the author's own.
+        self.run_main(
+            pull_request(user={"login": "bradhoekstra", "type": "User"}), [], files=("README.md", "hack/eval/presubmit-cases.txt")
+        )
+        self.assertEqual(len(self.requested()), 1)
+        self.assertIn(self.requested()[0], EVAL_CREW)
+        self.assertIn("own approval does not cover", self.stderr.getvalue())
+
+    def test_a_reviewers_approval_covers_an_approvers_pull_request(self):
+        # stalhaali is under `reviewers` in the fixture OWNERS: on a
+        # self-approved pull request that approval sets lgtm, the last label
+        # it needed, so a later check run asks nobody else.
+        posts = self.run_main(pull_request(user={"login": "bradhoekstra", "type": "User"}), [review("stalhaali", "APPROVED")])
+        self.assertEqual(posts, [])
+        self.assertIn("stalhaali already reviewed it", self.stderr.getvalue())
+
+    def test_a_reviewers_approval_does_not_cover_anyone_elses(self):
+        # The same approval on a non-approver's pull request leaves `approved`
+        # outstanding, so an approver is still asked, and only an approver.
+        posts = self.run_main(pull_request(), [review("stalhaali", "APPROVED")])
+        self.assertEqual(posts, [self.REQUESTED])
+        self.assertIn(self.requested()[0].lower(), ROOT_APPROVERS)
+
+    def test_a_change_no_approver_covers_gets_nobody(self):
+        # No changed files -- an empty commit, or a branch reset to its base
+        # while the pull request stays open: the approver walk returns nothing
+        # and the author self-approves nothing, so narrowing to an empty set
+        # would fall back to the whole pool and could hand a non-approver an
+        # `approved` nobody can give. Both paths decline and say why.
+        posts = self.run_main(pull_request(), [], files=())
+        self.assertEqual(posts, [])
+        self.assertIn("no OWNERS approver covers the change", self.stderr.getvalue())
+        self.assertEqual(self.code, 0)
+        posts = self.run_main(pull_request(), [], "--react-to", str(self.COMMENT_ID), files=())
+        self.assertEqual(posts, [self.REACTIONS])
+        self.assertEqual(self.reaction(), [rr.REACTION_DECLINED])
+        self.assertIn("no OWNERS approver covers the change", self.stdout.getvalue())
+
+    def test_an_outsiders_approval_covers_nothing_even_for_an_approver(self):
+        # Not under `reviewers` either: Prow sets no lgtm for it.
+        posts = self.run_main(pull_request(user={"login": "bradhoekstra", "type": "User"}), [review(NON_APPROVER, "APPROVED")])
+        self.assertEqual(posts, [self.REQUESTED])
 
     def test_an_approvers_approval_still_blocks_the_check_run_path(self):
         posts = self.run_main(pull_request(), [review("jayantid", "APPROVED")])

@@ -61,7 +61,7 @@ kube-agents/
 │   ├── designs/                                   per-feature design documents
 │   ├── ci-pool-projects.md, environment-reconcile.md,
 │   │   security-requirements.md, credential-isolation-design.md,
-│   │   eval-gate-roster.md, ci-health.md, testing-map.md,
+│   │   eval-gate-roster.md, ci-health.md, testing-map.md, ownership.md,
 │   │   pull-request-workflow.md                   standalone docs
 │   ├── chatops/, samples/                         the Teams integration and its
 │   │                                              sample manifests
@@ -209,6 +209,7 @@ identifier appears, add its source here.
 | Bundled Hermes platform plugins the image installs (no patch) | the plugin's own `adapter.py` docstring under `deploy/docker/plugins/`, plus the `COPY`/`RUN` list in `deploy/docker/Dockerfile` |
 | Slack bot token scopes an install must grant | upstream `_build_full_manifest` in `hermes_cli/slack_cli.py` as patched by `deploy/docker/patches/apply_slack_reactions_scope.py`; the one prose copy, in `INSTALL.md`, must match it (`scripts/installer/print_instructions_slack.sh` defers to `hermes slack manifest` and carries no copy) |
 | What pod start-up force-syncs from the image vs. preserves on the PV | `deploy/shared/docker-entrypoint.sh` |
+| GitHub logins named as area or service owners | `OWNERS` (approvers and reviewers); `scripts/test_ownership.py` pins `docs/ownership.md` to it |
 | Shared agent defaults (`approvals.*`, `security.*`) | `deploy/shared/defaults/config.yaml` and `renderConfigYAML()` in `k8s-operator/internal/controller/platformagent_manifests.go` |
 | Image defaults and override env vars (`PLATFORM_AGENT_IMAGE` et al.) | `k8s-operator/internal/controller/manifest_helpers.go` |
 | The `status.usage.activeInterfaces` vocabulary (`dashboard`, `googlechat`, `slack`, `teams`) and how each is resolved from the spec | `resolveActiveInterfaces` and the `interface*` constants in `k8s-operator/internal/controller/manifest_helpers.go` |
@@ -254,7 +255,7 @@ identifier appears, add its source here.
 | Unresolved-thread hold: the label, the pool condition, the sweep interval, the ownership rule | `scripts/hold_unresolved_threads.py` and `.github/workflows/hold-unresolved-threads.yml` |
 | Issue triage queue: the `needs-triage` label, the `priority:` label prefix it mirrors, and when each event adds or removes it | `.github/workflows/needs-triage.yml` |
 | Flaky-check tracking: the `ci:flaky` label, the watched checks and the exclusions, the one-issue-per-container key, the never-close rule | `scripts/notify_flaky_check.py` and `.github/workflows/flaky-check-notify.yml`; the exclusion list the contract test enforces is `FLAKY_CHECK_EXCLUDED_WORKFLOWS` in `scripts/test_integration_contracts.py` |
-| Reviewer auto-assign: the skip reasons, the `OWNERS`-approver verdict rule, the robot-account exclusion, the `/request-review` reactions | `scripts/request_reviewers.py`, `.github/workflows/auto_request_review.yml` and `options.robot_accounts` in `.github/auto_request_review.yml` |
+| Reviewer auto-assign: the skip reasons, the self-approval test that widens the verdict rule and narrows the draw, the robot-account exclusion, the `/request-review` reactions | `scripts/request_reviewers.py`, `.github/workflows/auto_request_review.yml` and `reviewers.groups` and `options.robot_accounts` in `.github/auto_request_review.yml` |
 | Broken-main tracking: the `ci:main-broken` label, the watched workflows, the one-issue-per-episode marker, the sweep interval, the dismissal, older-episode-only and whole-read rules | `scripts/notify_broken_main.py` and `.github/workflows/main-broken-notify.yml`; the required-check roster the contract test enforces is `BROKEN_MAIN_WATCHED_WORKFLOWS` in `scripts/test_integration_contracts.py` |
 | Context budget for the always-loaded agent instruction files (`AGENTS.md`, `CLAUDE.md`) | `BUDGET` in `scripts/check_context_budget.py` |
 | Who may set the `approved` and `lgtm` labels on a change | `OWNERS` (`approvers`; `reviewers` for `lgtm` only), `hack/OWNERS`, and `OWNERS_ALIASES`; the `skip_collaborators` switch that makes `lgtm` OWNERS-gated is `prow/oss/plugins.yaml` in `GoogleCloudPlatform/oss-test-infra` |
