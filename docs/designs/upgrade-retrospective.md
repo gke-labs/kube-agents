@@ -153,9 +153,12 @@ The ledger holds, per cluster, the control-plane version, every node pool's vers
 of the last run. A cluster is _new_ when absent, _upgraded_ when a version differs or when
 `gcloud container operations list` shows an `UPGRADE_MASTER` or `UPGRADE_NODES` operation targeting
 it that started after the last run. The first run has no ledger and reviews the last fourteen days
-of operations. Projects resolve on the agent pod: an explicit list, otherwise the management project
-and every project a Cluster Agent profile's identity names, the roster the cluster reconciler keeps;
-the same rule the readiness watch design uses, so the two agree on what "the fleet" is.
+of operations. The collector runs where the fleet-audit collectors run, in the agent's terminal, and
+resolves projects the way they do: `--project` when given, else `MONITORED_PROJECT_IDS`, else every
+project `gcloud projects list` returns. The SOP passes `--project` for the management project and
+every project a Cluster Agent profile names, so a scheduled run reads the reconciler's roster and
+agrees with the readiness watch design on what "the fleet" is; a run by hand without the flag reads
+what the credential can list.
 
 ### 3.3 A collector for the facts, an SOP for the judgement
 
@@ -217,7 +220,7 @@ and the change that "apply" would make.
 ### 3.6 Where the report lives
 
 Under the Platform Agent profile's data directory, `upgrade-retrospective/reports/<date>.md`, with
-`upgrade-retro-report.md` beside it pointing at the latest, the same report as `.json`, the ledger
+`upgrade-retro-report.md` beside `reports/` pointing at the latest, the same report as `.json`, the ledger
 and `guards.json`. The directory is on the data volume, survives a pod restart, and needs no
 repository. The agent's own tools run in the sandbox and cannot open that path, so the chat line
 carries the counts and the top finding rather than only the path, and the SOP reads the collector's
