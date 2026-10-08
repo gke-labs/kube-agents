@@ -125,6 +125,12 @@ class ScanMarkerTest(unittest.TestCase):
                 self.assertEqual(h.read_scan_marker(self.marker, now=2000), ("t_s", mtime))
 
 
+    def test_a_marker_gone_before_its_age_is_read_is_none(self):
+        self.marker.write_text("task_id=t_s\nfiled_at=garbage\n")
+        with mock.patch.object(Path, "stat", side_effect=FileNotFoundError(self.marker)):
+            self.assertIsNone(h.read_scan_marker(self.marker, now=2000))
+
+
 class FindingLinesTest(unittest.TestCase):
     def test_every_reported_finding_becomes_a_line_the_ranking_parser_accepts(self):
         for meta in _metadata().values():

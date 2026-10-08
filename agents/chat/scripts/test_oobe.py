@@ -251,6 +251,13 @@ class StageTest(unittest.TestCase):
         self._main()
         self.assertEqual(self._started_ids(), FIRST)
 
+    def test_a_board_that_cannot_be_opened_waits(self):
+        # The recorded ranking card cannot be read: not finished, and not past the fallback either.
+        self._file_scan()
+        self.board = self.d / "no-such-dir" / "kanban.db"
+        self._main(now=NOW_PAST_FALLBACK)
+        self.assertEqual(self.started, [])
+
     def test_a_sweep_not_on_the_board_waits_past_the_fallback(self):
         # The re-arm runbook's `task_id=pending` placeholder: the hand-off waits for it, and so does the stage.
         (self.d / oobe.SCAN_FILED_MARKER).write_text(f"task_id=pending\nfiled_at={FILED_AT}\n")
@@ -714,6 +721,13 @@ class StageTest(unittest.TestCase):
         self.board.write_text("not a database")
         self._main(now=FILED_AT + oobe.NEW_INSTALL_SECONDS)
         self.assertEqual(oobe.read_state(self.d)[oobe.STATE_REASON], oobe.SKIP_UNSETTLED)
+
+    def test_no_cluster_audited_a_day_ago_is_old_not_unsettled(self):
+        # The hand-off finished the scan itself (`task_id=none`): it settled.
+        self._file_scan(ranking=oobe.bootstrap_handoff.NO_RANKING)
+        _board(self.board, [])
+        self._main(now=FILED_AT + oobe.NEW_INSTALL_SECONDS)
+        self.assertEqual(oobe.read_state(self.d)[oobe.STATE_REASON], oobe.SKIP_NOT_NEW)
 
     def test_a_ranking_card_unfinished_after_a_day_is_unsettled_not_old(self):
         # Past the fallback, but the recorded card is still blocked, or none was recorded: the scan

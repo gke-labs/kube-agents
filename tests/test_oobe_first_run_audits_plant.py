@@ -46,6 +46,52 @@ def render(script: str) -> str:
     """A provisioner's bash as Terraform hands it over, every interpolation a placeholder."""
     return re.sub(r"(?<!\$)\$\{[^}]*\}", "X", script).replace("$${", "${")
 
+
+def run_script_in_process(path: pathlib.Path, args: list[str], env: dict, extra_path: str | None = None) -> subprocess.CompletedProcess:
+    """Run a script the way `python3 - <args> < script` does, in this process so coverage sees it.
+
+    Its argv, environment and stdout/stderr are its own for the call, and a ``cron`` stub on
+    ``extra_path`` is imported fresh. SystemExit becomes the return code, as the CLI's would be.
+    """
+    import contextlib
+    import io
+    import runpy
+
+    saved_argv, saved_env, saved_path = sys.argv, dict(os.environ), list(sys.path)
+    saved_mods = {name: mod for name, mod in sys.modules.items() if name == "cron" or name.startswith("cron.")}
+    for name in saved_mods:
+        del sys.modules[name]
+    out, err, code = io.StringIO(), io.StringIO(), 0
+    try:
+        sys.argv = ["-", *args]
+        os.environ.clear()
+        os.environ.update(env)
+        if extra_path:
+            sys.path.insert(0, extra_path)
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            try:
+                runpy.run_path(str(path), run_name="__main__")
+            except SystemExit as exc:
+                if isinstance(exc.code, str):
+                    err.write(exc.code + "\n")
+                    code = 1
+                else:
+                    code = exc.code or 0
+            except Exception:  # noqa: BLE001 - the interpreter would print it and exit 1
+                import traceback
+
+                traceback.print_exc(file=err)
+                code = 1
+    finally:
+        sys.argv = saved_argv
+        os.environ.clear()
+        os.environ.update(saved_env)
+        sys.path[:] = saved_path
+        for name in [n for n in sys.modules if n == "cron" or n.startswith("cron.")]:
+            del sys.modules[name]
+        sys.modules.update(saved_mods)
+    return subprocess.CompletedProcess(["-", *args], code, out.getvalue(), err.getvalue())
+
 CRON_JOBS_STUB = textwrap.dedent(
     """
     import contextlib, json, os
@@ -119,11 +165,7 @@ class PlantScriptsTest(unittest.TestCase):
         self._tmp.cleanup()
 
     def _run(self, script: str, *args: str) -> subprocess.CompletedProcess:
-        return subprocess.run(
-            [sys.executable, "-", *args],
-            input=(STACK / script).read_text(),
-            capture_output=True, text=True, env=self.env, check=False,
-        )
+        return run_script_in_process(STACK / script, list(args), self.env, str(self.stubs))
 
     def _arm(self, shipped: pathlib.Path | None = None) -> subprocess.CompletedProcess:
         return self._run("arm.py", str(self.home), str(self.hermes), "20261006200000", str(shipped or self.shipped))

@@ -213,13 +213,10 @@ def ranking_finished(board: Path, task_id: str) -> bool | None:
     return row is not None and row[0] in FINISHED_STATUSES
 
 
-def scan_finished(data_dir: Path) -> bool:
+def scan_finished(data_dir: Path, sweep_id: str) -> bool:
     """Whether the scan really finished: the hand-off recorded no cluster audited, or its recorded
     ranking card has finished. Not the fallback, which by a day has always passed."""
-    filed = scan_filed(data_dir)
-    if filed is None:
-        return False
-    ranking = handoff_ranking(data_dir, filed[0])
+    ranking = handoff_ranking(data_dir, sweep_id)
     if ranking == bootstrap_handoff.NO_RANKING:
         return True
     return ranking is not None and bool(ranking_finished(board_path(data_dir), ranking))
@@ -512,7 +509,7 @@ def main(data_dir: Path | None = None, now: float | None = None) -> int:
             skip(data_dir, SKIP_NO_SWEEP, now)
             return 0
         if filed is not None and now - filed[1] >= NEW_INSTALL_SECONDS:
-            skip(data_dir, SKIP_NOT_NEW if scan_finished(data_dir) else SKIP_UNSETTLED, now)
+            skip(data_dir, SKIP_NOT_NEW if scan_finished(data_dir, filed[0]) else SKIP_UNSETTLED, now)
             return 0
         if not scan_settled(data_dir, now):
             return 0
