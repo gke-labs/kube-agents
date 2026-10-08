@@ -319,7 +319,10 @@ matches, the pool with its skew. A webhook the cell lists as matching none of th
 is an outage to report, not a blocker, with what it does match named so the operator can judge it.
 When the user asks for a verdict per object — does this budget, exclusion or webhook block the
 upgrade — take it from the table: an entry under `blocking` (or a blocking exclusion or pool) is
-yes, a webhook under `outage` is no, with the outage named; do not re-grade by hand.
+yes, a webhook under `outage` is no, with the outage named; do not re-grade by hand. An exclusion
+in effect whose scope covers the target is `yes` whatever the aside says about automatic versus
+manual upgrades: the table graded the member `blocked` on it, and that is the verdict; the
+automatic-only qualification belongs in the prose beside the line, never in the yes/no.
 Say what the operator has to change before the upgrade can proceed; do not change it, and do not
 propose deleting an exclusion. When the question is a target version's readiness, paste each
 repository's deprecation section too, with its source line, and state the floor and target the
