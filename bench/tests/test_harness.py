@@ -1284,12 +1284,13 @@ def test_an_exhausted_retry_is_infrastructure_and_not_an_answer(
 
 
 def test_an_agent_side_error_is_still_graded(stub_agent: _StubAgentServer) -> None:
-    """A 500 is the endpoint answering, so it keeps the old behaviour.
+    """A 500 is the endpoint answering, so it keeps the old behaviour in the harness.
 
     The INFRA class is for turns where transport died or provider capacity
     blocked the opening turn. Widening it to every failed request would take
     real agent faults off the gate: they are not retried, they are not marked,
-    and their text still reaches the judge.
+    and their text still reaches the judge (where opening-turn 5xx with no
+    trajectory or billed tokens is classified as infra by scoring.py under #2430).
     """
     stub_agent.fail_with = 500
 

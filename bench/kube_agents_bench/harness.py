@@ -1227,9 +1227,11 @@ class _TransportError(RuntimeError):
 # pure transport exhaustion both turn paths deliberately end in _infra_failure rather than
 # grading a partial record: see _DelegationTransportExhausted for why settling
 # the cards into a record that is about to be replaced wholesale is not a
-# rescue. A client error (non-429 4xx), a 500, or a body that is not JSON is an
+# A client error (non-429 4xx), a 500, or a body that is not JSON is an
 # answer about the request itself and repeating the request cannot change it:
-# a handler that raised will raise again, so those remain graded agent errors.
+# a handler that raised will raise again, so those remain graded agent errors
+# (though scoring.py classifies an opening-turn 5xx with no trajectory and no
+# billed tokens as infrastructure under #2430).
 # When the server attaches X-Hermes-Failure-Reason on an opening request,
 # the turn executed; a rate-limit or billing reason is routed to infrastructure
 # on the opening turn, while any other failure reason (or any failure reason
@@ -1592,7 +1594,9 @@ class KubeAgentsHarness(AgentHarness):
                     )
                 # A 500, a 4xx other than 429, or a body that is not JSON says a handler
                 # answered; that is the agent's own failure and still belongs in
-                # front of the judge. Only a gateway status, an admission-control
+                # front of the judge (though scoring.py classifies an opening-turn 5xx
+                # with no trajectory and no billed tokens as infrastructure under #2430).
+                # Only a gateway status, an admission-control
                 # 429, or a dropped connection is worth a second attempt: see
                 # _RETRYABLE_STATUSES.
                 if not exc.retryable:

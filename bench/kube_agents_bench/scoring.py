@@ -354,6 +354,8 @@ SUITE_OUTCOME_GREEN = "green"
 SUITE_OUTCOME_RED = "red"
 SUITE_OUTCOME_NOT_EVALUATED = "not_evaluated"
 
+_HTTP_5XX_PATTERN = re.compile(r"^(?:Error:\s*)?HTTP\s+5\d\d\b", re.IGNORECASE)
+
 
 class Rung(IntEnum):
     """The verdict ladder, evaluated in order, stopping at the first match.
@@ -547,9 +549,6 @@ def _as_float(value: Any) -> float | None:
 
 def _as_str(value: Any) -> str | None:
     return str(value) if value is not None else None
-
-
-_HTTP_5XX_PATTERN = re.compile(r"^(?:Error:\s*)?HTTP\s+5\d\d\b", re.IGNORECASE)
 
 
 def _is_http_5xx(text: str | None) -> bool:
@@ -1202,7 +1201,9 @@ def classify_rep(
     # regression. Deliberately the CONJUNCTION, with 0 and null distinct:
     # tokens billed with no trajectory is an inconsistent record, and the
     # harness skeleton (empty trajectory, every token bucket null) never
-    # billed a model call it can prove -- both stay rung 3 blocks below.
+    # billed a model call it can prove -- both stay rung 3 blocks below,
+    # with the exception of an opening-turn HTTP 5xx (#2430) where the agent
+    # endpoint failed before any execution occurred.
     total_tokens = record.tokens.get("total")
     if (
         not record.trajectory
@@ -1218,20 +1219,18 @@ def classify_rep(
         )
 
     # An HTTP 5xx on the opening turn recorded as the entire output (#2430):
-    # the gateway or proxy crashed before an agent could execute. The harness
-    # stored the error string as the answer with an empty trajectory and no
+    # the agent endpoint handler crashed or failed before an agent could execute
+    # (e.g. gateway env race or unhandled handler startup exception). The harness
+    # stored the error string as the answer with an empty trajectory and null
     # billed tokens. The liveness signals read as inconsistent because the
     # error string was stored as the answer, but no model call was ever billed
-    # -- this is an infrastructure repetition by the gate's own definition (#1184),
-    # not an agent regression to block at rung 3.
+    # and no trajectory recorded -- this is an infrastructure repetition by the
+    # gate's own definition (#1184), not an agent regression to block at rung 3.
     output_text = (record.output or "").strip()
     errors_text = " ".join(str(e) for e in errors) if errors else ""
     if (
         not record.trajectory
-        and (
-            total_tokens is None
-            or (not isinstance(total_tokens, bool) and _as_float(total_tokens) == 0)
-        )
+        and total_tokens is None
         and (_is_http_5xx(output_text) or (not output_text and _is_http_5xx(errors_text)))
     ):
         err_detail = output_text or errors_text

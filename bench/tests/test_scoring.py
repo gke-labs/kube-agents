@@ -890,10 +890,10 @@ def test_opening_turn_http_500_beside_passing_reps_does_not_gate(tofu_spec, make
 
 @pytest.mark.parametrize("status_code", [502, 503, 504])
 def test_opening_turn_http_5xx_variants_are_infra(noop_spec, make_run, status_code):
-    """Gateway statuses (502, 503, 504) on opening turn without trajectory are infra."""
+    """HTTP 5xx status codes from agent endpoint on opening turn without trajectory are infra."""
     def mutate(rec):
         http_500_opening_turn(rec)
-        msg = f"HTTP {status_code} Bad Gateway"
+        msg = f"HTTP {status_code} from agent endpoint: temporary failure"
         rec["output"] = msg
         rec["errors"] = [msg]
 
@@ -915,7 +915,7 @@ def test_tripped_safeguard_outranks_opening_turn_http_5xx(noop_spec, make_run):
 
 
 def test_executed_agent_turn_with_http_500_is_not_classified_as_infra(noop_spec, make_run):
-    """When an agent actually executed (has trajectory tool calls or billed tokens),
+    """When an agent actually executed (has trajectory tool calls and billed tokens),
     a 500 error remains a graded agent failure, not excused as infra."""
     def failed_run(rec):
         # Keeps kanban_green_1's non-empty trajectory and billed tokens
@@ -924,6 +924,49 @@ def test_executed_agent_turn_with_http_500_is_not_classified_as_infra(noop_spec,
         rec["scores"]["VerificationCorrectness"] = 0.0
 
     verdict = grade_case(noop_spec, [make_run(mutate=failed_run)], admitted=True)
+    assert verdict.rung is not Rung.INFRA
+    assert verdict.passes == 0
+
+
+def test_http_500_with_billed_tokens_and_empty_trajectory_is_not_infra(noop_spec, make_run):
+    """Disjunct near-miss 1: tokens billed with empty trajectory is an inconsistent
+    record and blocks at Rung 3, not excused as infra (#2430)."""
+    def mutate(rec):
+        http_500_opening_turn(rec)
+        rec["tokens"] = {"total": 500, "prompt": 400, "completion": 100}
+
+    verdict = grade_case(noop_spec, [make_run(mutate=mutate)], admitted=True)
+    assert verdict.rung is not Rung.INFRA
+    assert verdict.blocking is True
+    assert verdict.rung is Rung.NOT_A_REAL_RUN
+
+
+def test_http_500_with_trajectory_and_null_tokens_is_not_infra(noop_spec, make_run):
+    """Disjunct near-miss 2: non-empty trajectory with null tokens (inject-transport
+    shape) is an executed turn and remains graded, not excused as infra (#2430)."""
+    def mutate(rec):
+        http_500_opening_turn(rec)
+        rec["trajectory"] = [{"tool": "bash", "action": "echo hello"}]
+        rec["tokens"] = {"total": None, "prompt": None, "completion": None}
+
+    verdict = grade_case(noop_spec, [make_run(mutate=mutate)], admitted=True)
+    assert verdict.rung is not Rung.INFRA
+
+
+def test_executed_turn_with_failure_reason_is_not_classified_as_infra(noop_spec, make_run):
+    """An executed agent turn that failed with X-Hermes-Failure-Reason has empty
+    trajectory and null tokens in the harness result, but is an agent error and
+    must not be excused as infra."""
+    def mutate(rec):
+        rec["trajectory"] = []
+        rec["tokens"] = {"total": None, "prompt": None, "completion": None}
+        rec["status"] = "error"
+        msg = "agent turn failed with tool_error: HTTP 502 from agent endpoint: tool exploded"
+        rec["output"] = msg
+        rec["errors"] = [msg]
+        rec["scores"]["VerificationCorrectness"] = 0.0
+
+    verdict = grade_case(noop_spec, [make_run(mutate=mutate)], admitted=True)
     assert verdict.rung is not Rung.INFRA
     assert verdict.passes == 0
 
@@ -1064,7 +1107,8 @@ def test_a_scoreless_record_whose_verification_ran_still_blocks(tofu_spec, make_
 
 
 def test_an_ordinary_error_is_still_graded(noop_spec, make_run):
-    """Only the marker excuses a run. A 4xx, a 500, or any real answer is graded."""
+    """Only the marker (or opening-turn never-ran/5xx) excuses a run. An executed
+    turn with a 4xx, 500, or real answer is graded."""
     def failed(rec):
         rec["errors"] = ["HTTP 500 from the agent endpoint"]
         rec["scores"]["VerificationCorrectness"] = 0.0
