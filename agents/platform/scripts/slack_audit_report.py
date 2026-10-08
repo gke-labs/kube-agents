@@ -46,9 +46,9 @@ seeded-c, so this run didn't check it." when every reason says it was
 unreachable, "Didn't check seeded-c this run." otherwise), counted past three
 names, or the line's own words for what it could not scan when the body has
 no such table. Then a "Look at the first one" button and the ledger link. The
-relayed line itself is not on the card, so it goes in the headline's thread
-(:func:`needs_fold`), where its resolved count and remediation pull requests
-stay readable. Finding titles are model-written and editable
+relayed line itself is not on the card, and nothing posts it under the card
+either: the card links the ledger issue, which holds the rest. Finding titles
+are model-written and editable
 on the forge, as is the issue title, and the relayed line is model-written
 too, so a row, the audit name and the relayed line keep a link's text and drop
 its target, and a ``<!channel>``-style token loses its brackets.
@@ -287,30 +287,6 @@ def ledger_ref(report: str) -> LedgerRef | None:
     if any(segment in DOT_SEGMENTS for segment in repo.split("/")):
         return None
     return LedgerRef(f"https://github.com/{repo}/issues/{number}", repo, int(number))
-
-
-def has_more(report: str) -> bool:
-    """Whether the report says more than its one line, so it is worth posting in the thread."""
-    return len([line for line in report.splitlines() if line.strip()]) > 1
-
-
-def needs_fold(report: str, headline: str) -> bool:
-    """Whether the full report goes into the headline's thread: it says more than
-    one line, or the headline lost part of its line (a link target, a clipped
-    tail, or all of it, as :func:`headline_from_issue` does).
-
-    The headline shows the line as plain text, so the line is compared plain:
-    emphasis or a code span the headline dropped is not a loss.
-    """
-    if has_more(report):
-        return True
-    line = report.strip()
-    found = _trailing_ledger(line)
-    if found:
-        line = line[: found[0]]
-    if MD_LINK.search(line) or SLACK_LINK.search(line):
-        return True
-    return _plain(line).rstrip(LEDGER_SEPARATORS).strip() not in headline
 
 
 def _new_count(line: str) -> int:

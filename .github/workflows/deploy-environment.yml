@@ -31,6 +31,14 @@ on:
         required: false
         default: ""
         type: string
+      mode:
+        description: "The PlatformAgent's spec.mode to install: today, or next (the unsupported A2A stack)"
+        required: false
+        default: "today"
+        type: choice
+        options:
+          - "today"
+          - "next"
   workflow_call:
     inputs:
       # The GitHub Actions environment, and nothing else: it renders straight
@@ -51,6 +59,16 @@ on:
         description: "Release Candidate Tag or Commit SHA"
         required: true
         type: string
+      # The PlatformAgent's spec.mode, `today` or `next`. Defaulted, unlike the
+      # two above, because `today` is what every caller installed before the
+      # input existed and the default changes nothing: the provisioning script
+      # sees no PLATFORM_AGENT_MODE at all. `next` switches the CR after the
+      # install and waits for the stack it renders (platform_agent_mode.sh).
+      mode:
+        description: "The PlatformAgent's spec.mode to install: today or next"
+        required: false
+        default: "today"
+        type: string
     secrets:
       GEMINI_API_KEY:
         description: "Gemini API Key"
@@ -67,7 +85,10 @@ jobs:
     concurrency:
       group: ${{ inputs.github_environment }}-environment
       cancel-in-progress: false
-    timeout-minutes: 60
+    # `next` adds the mode switch's wait to the install's: the agent rolls
+    # again, and Ready waits on the bus, the callout and the provisioning Job.
+    # `today` keeps the 60 it always had.
+    timeout-minutes: ${{ inputs.mode == 'next' && 90 || 60 }}
     permissions:
       contents: read
       id-token: write
@@ -101,6 +122,49 @@ jobs:
           fi
           echo "==> Teardown of '${TARGET}' confirmed."
 
+      # Also before the checkout, and for the same reason. A `workflow_call`
+      # input is a free string, so this is where a caller's typo stops; the
+      # dispatch form offers the two values only.
+      #
+      # Unconditional, and matched in shell. A GitHub expression compares
+      # strings case-insensitively, so an `if:` on the input would skip this
+      # for `TODAY` and let it reach the candidate's exact-match check only
+      # after the checkout, auth and setup. Exactly '', `today` and `next`
+      # pass; '' is today, as it is to the scripts. The steps only `next`
+      # needs read this step's `next` output rather than the input.
+      #
+      # `next` is refused on autopush and staging, matched case-insensitively
+      # like the two guards above. On a long-lived cluster the patched
+      # spec.mode outlives the run: the chart renders none and the installer
+      # does not read the key, so no upgrade, reconcile or drift report sees
+      # it, and Google Chat stays on the A2A gateway until a `today` rebuild.
+      # provision_environment.sh refuses it as well.
+      - name: Check the PlatformAgent mode
+        id: mode
+        env:
+          MODE: ${{ inputs.mode }}
+          TARGET: ${{ inputs.github_environment }}
+        run: |
+          case "${MODE}" in
+            "" | today)
+              echo "next=false" >> "${GITHUB_OUTPUT}"
+              exit 0
+              ;;
+            next) ;;
+            *)
+              echo "::error title=Not a PlatformAgent mode::mode is '${MODE}'. The PlatformAgent's spec.mode takes exactly today or next, lowercase; pass one of those, or leave the input unset for today."
+              exit 1
+              ;;
+          esac
+          case "$(printf '%s' "${TARGET}" | tr '[:upper:]' '[:lower:]')" in
+            autopush | staging)
+              echo "::error title=spec.mode next is for the ephemeral environments::Refusing mode next on '${TARGET}', a long-lived environment: nothing that later moves it knows about the patched mode, so it would stay next, with Google Chat on the A2A gateway, until a today rebuild. Use rc or nightly for next."
+              exit 1
+              ;;
+          esac
+          echo "next=true" >> "${GITHUB_OUTPUT}"
+          echo "==> Installing with spec.mode: ${MODE}."
+
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -125,6 +189,21 @@ jobs:
         with:
           ref: ${{ steps.resolve_target.outputs.commit_sha }}
           persist-credentials: false
+
+      # The scripts below are the candidate's, and a candidate older than
+      # platform_agent_mode.sh ignores PLATFORM_AGENT_MODE: it would install
+      # `today` and the run would report `next` validated. Refused here, before
+      # the teardown, rather than discovered from the tests. Skipped unless
+      # the mode check passed `next`; every candidate installs today.
+      - name: Confirm the candidate can install the mode
+        if: steps.mode.outputs.next == 'true'
+        env:
+          MODE: ${{ inputs.mode }}
+        run: |
+          if [ ! -f scripts/release/platform_agent_mode.sh ]; then
+            echo "::error title=This candidate predates the mode input::The commit being deployed has no scripts/release/platform_agent_mode.sh, so its provisioning script would ignore mode '${MODE}' and install today. Re-run with rc_tag set to a commit at or after the one that added it, or with mode today."
+            exit 1
+          fi
 
       - name: Validate & Log Deployment Configuration Summary
         env:
@@ -184,6 +263,11 @@ jobs:
           GCP_REGION: ${{ vars.GCP_REGION }}
           GKE_CLUSTER_NAME: ${{ vars.GKE_CLUSTER_NAME }}
           NAMESPACE: ${{ vars.NAMESPACE }}
+          # No PLATFORM_AGENT_MODE here. This step runs only on autopush and
+          # staging, where the mode check refuses `next`, so the only values
+          # that could reach it render no key anyway. The reconcile path
+          # (reconcile-environment.yml) is the one that carries the key into a
+          # long-lived environment's install.env, from vars.PLATFORM_AGENT_MODE.
         run: |
           set -euo pipefail
           # The workspace here is the CANDIDATE's tree (see the checkout step
@@ -244,6 +328,9 @@ jobs:
         env:
           CLOUDSDK_CORE_DISABLE_PROMPTS: "1"
           IMAGE_TAG: ${{ steps.resolve_target.outputs.commit_sha }}
+          # The input, under the installer's name for it. The script clears it
+          # for `today`, so uninstall.sh and install.sh inherit nothing new.
+          PLATFORM_AGENT_MODE: ${{ inputs.mode }}
           REGISTRY_PREFIX: ${{ vars.REGISTRY_PREFIX }}
           GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
           GCP_REGION: ${{ vars.GCP_REGION }}
@@ -327,10 +414,12 @@ jobs:
           # mechanism the GITOPS_* pair above already relies on. The exceptions
           # are the ones provision_environment.sh turns into flags before it
           # calls the installer: ALLOWED_USERS, NAMESPACE, CLUSTER_MODE and the
-          # SLACK_* set. A flag beats whatever the rendered install.env says,
-          # which is why that script passes them that way -- so for those, this
-          # block is the source and the flag is the route, not an alternative
-          # to it.
+          # SLACK_* set. A flag beats whatever the rendered install.env says
+          # (the chat flags excepted: install.sh refuses one that disagrees with
+          # the rendered file, and the render this job makes carries no chat
+          # key), which is why that script passes them that way -- so for
+          # those, this block is the source and the flag is the route, not an
+          # alternative to it.
           ALLOWED_USERS: ${{ vars.ALLOWED_USERS }}
           # Not install settings — the empty allowlist is already what produces
           # allow-all. Their only job is to let an operator SAY that the open

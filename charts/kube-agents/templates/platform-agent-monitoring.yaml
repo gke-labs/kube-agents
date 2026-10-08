@@ -57,4 +57,28 @@ spec:
     - port: 8766
       path: /metrics
       interval: 30s
+---
+{{- /*
+The A2A gateway's metrics-only listener (a2aGatewayMetricsPort in the
+operator): task terminals by state and source, and Google Chat pulls by
+outcome. The pod exists only on an install the operator runs under spec.mode
+next, which the chart does not set; elsewhere this selects no pod and scrapes
+nothing. The selector is the operator's app label for that pod and the port
+is the metrics-only one; the doors' ports admit no collector.
+*/}}
+apiVersion: monitoring.googleapis.com/v1
+kind: PodMonitoring
+metadata:
+  name: {{ .Values.platformAgent.name }}-a2a-gateway-monitoring
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "kube-agents.labels" . | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      app: {{ .Values.platformAgent.name }}-a2a-gateway
+  endpoints:
+    - port: 9096
+      path: /metrics
+      interval: 30s
 {{- end }}

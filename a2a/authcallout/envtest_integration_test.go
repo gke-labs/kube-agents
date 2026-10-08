@@ -220,6 +220,10 @@ func startLiveHarness(t *testing.T) *liveHarness {
 		// was started from, so the callout refuses exactly the static
 		// users this server authenticates by password.
 		ReservedPrincipals: renderedAuthUsers(t, string(rendered)),
+
+		// The reserved addressees the operator renders, from the fixture it
+		// keeps equal to its render.
+		ReservedAddressees: renderedFixtureAddressees(t),
 	}, log)
 	if err != nil {
 		t.Fatalf("NewService: %v", err)

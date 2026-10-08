@@ -8,43 +8,44 @@ it submitted before the flag existed, the Helm install gets no extra value, and
 step 6b makes no kubectl call at all. The positive half is pinned by the same
 lifting technique tests/test_ci_deploy_rc_images.py uses: section 4 run with
 the flag set names the six next-stack images and fills the operator.extraEnv
-values the release expands (the five image overrides and the inject door's
-flag), the Cloud Build's `a2a` and `a2a-bridge` steps run with `docker` stubbed
-build and push those six in order with the bridge FROM this build's platform
-image, the three guards (release-candidate path, Prow run with no pull request
-that is not a next-lane job, the concurrency's grammar) run against the values
-they refuse and admit, the
-sidecar patch rendered from a fixture Deployment carries what the bridge doc
-lists and what the agent container had, and the release-candidate refusal sits
-at the top of the branch the script says it guards.
+values the release expands (the five image overrides, the inject door's flag,
+and the three settings of the bridge the operator renders: its image, its
+concurrency and its executor pin), the Cloud Build's `a2a` and `a2a-bridge`
+steps run with `docker` stubbed build and push those six in order with the
+bridge FROM this build's platform image, the three guards (release-candidate
+path, Prow run with no pull request that is not a next-lane job, the
+concurrency's grammar) run against the values they refuse and admit, and the
+release-candidate refusal sits at the top of the branch the script says it
+guards.
 
 The names the flag path hands the operator, or reads back from what it
 renders, are copied from the operator's Go source, the bridge's, and the eval
 script, and pinned against them here: a rename there would otherwise make the
 override a silent no-op and the run fail 600 s later on an ImagePullBackOff, a
-sidecar that cannot authenticate, or a token read from a Secret that no longer
-exists, attributed to the wrong thing.
+bridge at the wrong concurrency or executor, or a token read from a Secret that
+no longer exists, attributed to the wrong thing.
 
 The gate order in step 6b is pinned as text. The order is the dependency
 order the block's comment states (NATS, callout, provisioning Job, agent, the
-inject door, the sidecar's roll, the bridge's log line), and two workloads are
-deliberately absent from it: the A2A gateway, reported and not gated, and the
-shell StatefulSet, which does not change under next.
+inject door, the bridge's log line), and two workloads are deliberately absent
+from it: the A2A gateway, reported and not gated, and the shell StatefulSet,
+which does not change under next.
 
-The two provision runs (gke-labs/kube-agents#2077). The operator sizes the
+The TASKS budget (gke-labs/kube-agents#2077, #2592). The operator sizes the
 TASKS stream's consumer budget from the CR's maxSessions and from the bridge
-workers its sidecars declare, creates the stream at the larger of that budget
-and a floor of 64, never edits a stream that exists, and refuses a later
-render whose budget the live stream cannot hold. Step 6b declares the sidecar
-only after the bus is up, so the first provision creates TASKS for a CR with
-no sidecar and the sidecar patch re-renders the Job against it. The tests here
-pin the two halves of the tech lead's decision: (b) the first patch carries a
-maxSessions sized so the second budget fits the floor, computed from four
-constants copied from the operator's and pinned against them (the Go side's
+workers the pod runs, creates the stream at the larger of that budget and a
+floor of 64, never edits a stream that exists, and refuses a later render
+whose budget the live stream cannot hold. The operator budgets the bridge from
+the first next render, with the concurrency step 5 sets on it, and adds it to
+the agent pod once the bus is provisioned, so the mode patch is the only patch
+and the one provision Job already counts the bridge's workers. The first patch still carries a maxSessions sized so that
+budget fits the floor, computed from four constants copied from the
+operator's and pinned against them (the Go side's
 TestCiDeploySizesMaxSessionsToTheTasksFloor pins the same four against the
-functions that derive them), and (c) the step waits for the re-run Job and
-reads the CR's phase after it, so a refusal reds the lane instead of parking
-the CR Degraded over a working bus while the step proceeds.
+functions that derive them). The provision wait's re-render form and the
+Degraded gate that read the CR after the old sidecar patch's re-run are no
+longer called by step 6b; their function-level tests stay, against the code
+that ships.
 """
 
 import json
@@ -68,7 +69,7 @@ _A2A_MANIFESTS = _CONTROLLER / "platformagent_a2a_manifests.go"
 _A2A_CALLOUT = _CONTROLLER / "platformagent_a2a_callout.go"
 _A2A_VERIFIER = _CONTROLLER / "platformagent_a2a_verifier.go"
 _A2A_CONSOLE = _CONTROLLER / "platformagent_a2a_console.go"
-_A2A_IDENTITIES = _CONTROLLER / "platformagent_a2a_identities.go"
+_A2A_BRIDGE = _CONTROLLER / "platformagent_a2a_bridge.go"
 _AGENT_MANIFESTS = _CONTROLLER / "platformagent_manifests.go"
 _API_TYPES = _REPO_ROOT / "k8s-operator" / "api" / "v1alpha1" / "common_types.go"
 _BRIDGE_MAIN = _REPO_ROOT / "a2a" / "cmd" / "hermes-bridge" / "main.go"
@@ -103,66 +104,6 @@ _OTHER_JOB_NAME = "ci-x"
 
 _BUILD_SECTION = (r"^# ─── 4\. Build Container Images.*?", r"^# ─── 5\. Chart Deployment")
 _MODE_SECTION = (r"^# ─── 6b\. EVAL_MODE_NEXT.*?", r"^# ─── 7\. Agent API Connectivity")
-_SIDECAR_FUNCTION = "render_mode_next_sidecar_patch"
-# The function embeds a python program whose dict literal closes with a `}` in
-# column 0, which _lift_shell's closing-brace rule would take for the end of
-# the function; its real end is the line that hands the program its arguments.
-_SIDECAR_FUNCTION_RE = rf"^{_SIDECAR_FUNCTION}\(\) \{{\n.*?^' \"\$@\"\n\}}\n"
-
-# The fixture the sidecar renderer is fed: the shape of the agent Deployment
-# the operator renders under next, reduced to what the renderer reads and what
-# it must not copy.
-_AGENT_ENV = [
-    {"name": "PLATFORM_AGENT_HOME", "value": "/opt/data"},
-    {"name": "HOME", "value": "/opt/data/home"},
-    {"name": "API_SERVER_KEY", "valueFrom": {"secretKeyRef": {"name": "platform-agent-secrets", "key": "API_SERVER_KEY"}}},
-    {"name": "NATS_URL", "value": "nats://from-the-agent:4222"},
-    {"name": "A2A_BUS_USER", "value": "agent"},
-    {"name": "AGENT_SHARED_STATE_SETUP", "value": "owner"},
-    {"name": "PATH", "value": "/opt/hermes/.venv/bin:/usr/bin"},
-]
-_AGENT_MOUNTS = [
-    {"name": "platform-agent-data-vol", "mountPath": "/opt/data"},
-    {"name": "platform-agent-managed-vol", "mountPath": "/etc/hermes"},
-    {"name": "a2a-bus-token", "mountPath": "/var/run/secrets/a2a-bus", "readOnly": True},
-    {"name": "tmp-scratch", "mountPath": "/tmp"},
-]
-_AGENT_SECURITY_CONTEXT = {
-    "allowPrivilegeEscalation": False,
-    "readOnlyRootFilesystem": True,
-    "capabilities": {"drop": ["ALL"]},
-}
-_AGENT_RESOURCES = {"requests": {"cpu": "1", "memory": "2Gi"}, "limits": {"cpu": "3", "memory": "8Gi"}}
-_AGENT_DEPLOYMENT = {
-    "spec": {
-        "template": {
-            "spec": {
-                "containers": [
-                    {
-                        "name": "platform-agent",
-                        "image": _PLATFORM_URI,
-                        "imagePullPolicy": "Always",
-                        "env": _AGENT_ENV,
-                        "envFrom": [{"secretRef": {"name": "extra"}}],
-                        "ports": [{"name": "api", "containerPort": 8642}],
-                        "readinessProbe": {"httpGet": {"path": "/health", "port": 8642}},
-                        "volumeMounts": _AGENT_MOUNTS,
-                        "securityContext": _AGENT_SECURITY_CONTEXT,
-                        "resources": _AGENT_RESOURCES,
-                    },
-                    {
-                        "name": "platform-agent-dashboard",
-                        "image": _PLATFORM_URI,
-                        "env": [{"name": "AGENT_SHARED_STATE_SETUP", "value": "skip"}],
-                        "volumeMounts": [{"name": "platform-agent-data-vol", "mountPath": "/opt/data"}],
-                    },
-                ]
-            }
-        }
-    }
-}
-
-
 def text(path: pathlib.Path) -> str:
     return path.read_text(encoding="utf-8")
 
@@ -273,13 +214,19 @@ def flag_line(mode_next: str | None) -> str:
     return "" if mode_next is None else f'export EVAL_MODE_NEXT="{mode_next}"'
 
 
+# The concurrency section 2b admitted, which section 4 hands the operator.
+_BRIDGE_CONCURRENCY = "6"
+
+
 def run_build_section(mode_next: str | None) -> subprocess.CompletedProcess:
     """Run section 4 with `gcloud` stubbed to print its argv, then print the
-    operator.extraEnv values it left for the release."""
+    operator.extraEnv values it left for the release. MODE_NEXT_BRIDGE_CONCURRENCY
+    is set as section 2b leaves it under the flag."""
     return run_bash(
         "\n".join(
             [
                 f'export AR_REPO="{_AR_REPO}"',
+                f'MODE_NEXT_BRIDGE_CONCURRENCY="{_BRIDGE_CONCURRENCY}"',
                 f'export TAG="{_TAG}"',
                 'export PROJECT_ID="kube-agents-evals"',
                 'export HERMES_AGENT_TAG="v0"',
@@ -304,50 +251,6 @@ def substitutions(result: subprocess.CompletedProcess) -> str:
 
 def helm_args(result: subprocess.CompletedProcess) -> list[str]:
     return [line.partition("=")[2] for line in result.stdout.splitlines() if line.startswith("HELM=")]
-
-
-def sidecar_function() -> str:
-    match = re.search(_SIDECAR_FUNCTION_RE, text(_CI_DEPLOY), re.DOTALL | re.MULTILINE)
-    if match is None:
-        raise AssertionError(f"{_CI_DEPLOY} no longer defines {_SIDECAR_FUNCTION}() in the shape this test lifts")
-    return match.group(0)
-
-
-def render_sidecar(deployment: dict, concurrency: str = "4") -> dict:
-    """Run the renderer the way step 6b calls it, on a fixture Deployment."""
-    consts = constants()
-    args = [
-        consts["AGENT_CONTAINER_NAME"],
-        consts["BRIDGE_SIDECAR_NAME"],
-        f"{_AR_REPO}/hermes-bridge:{_TAG}",
-        consts["BRIDGE_NATS_URL_ENV_VAR"],
-        "nats://platform-agent-a2a-nats.kubeagents-system.svc:4222",
-        consts["BRIDGE_NATS_USER_ENV_VAR"],
-        consts["A2A_BRIDGE_USER"],
-        consts["BRIDGE_NATS_PASSWORD_ENV_VAR"],
-        "platform-agent-a2a-nats-creds",
-        consts["A2A_BRIDGE_PASSWORD_KEY"],
-        consts["BRIDGE_CONCURRENCY_ENV_VAR"],
-        concurrency,
-        consts["A2A_BUS_TOKEN_VOLUME"],
-        consts["AGENT_SHARED_STATE_SETUP_ENV_VAR"],
-        consts["AGENT_SHARED_STATE_SETUP_SKIP"],
-        consts["BRIDGE_ACTIVITY_SECRET_ENV_VAR"],
-        consts["A2A_BRIDGE_ACTIVITY_KEY"],
-        consts["BRIDGE_EXECUTOR_ENV_VAR"],
-        consts["BRIDGE_EXECUTOR_PINNED"],
-    ]
-    quoted = " ".join(f"'{a}'" for a in args)
-    result = subprocess.run(
-        ["bash", "-c", f"set -euo pipefail\n{sidecar_function()}\n{_SIDECAR_FUNCTION} {quoted}"],
-        input=json.dumps(deployment),
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if result.returncode != 0:
-        raise AssertionError(result.stderr)
-    return json.loads(result.stdout)
 
 
 def build_step(step_id: str) -> dict:
@@ -436,7 +339,7 @@ class FlagSetIsNextTest(unittest.TestCase):
         for name, image in zip(_A2A_SUBSTITUTIONS, _A2A_IMAGES, strict=True):
             self.assertIn(f"{name}={_AR_REPO}/{image}:{_TAG}", subs)
 
-    def test_the_release_gets_the_five_overrides_and_the_inject_flag_as_operator_extra_env(self) -> None:
+    def test_the_release_gets_the_overrides_the_inject_flag_and_the_bridge_settings_as_operator_extra_env(self) -> None:
         result = run_build_section("1")
         self.assertEqual(result.returncode, 0, result.stderr)
         args = helm_args(result)
@@ -467,9 +370,25 @@ class FlagSetIsNextTest(unittest.TestCase):
             "--set-string",
             "operator.extraEnv[5].value=true",
         ]
+        # The bridge the operator renders under next (#2592): its image (this
+        # build's), the concurrency section 2b admitted, and the executor pin,
+        # each under the name the operator reads it by.
+        consts = constants()
+        expected += [
+            "--set-string",
+            f"operator.extraEnv[6].name={go_constant(_A2A_BRIDGE, 'a2aBridgeImageEnvVar')}",
+            "--set-string",
+            f"operator.extraEnv[6].value={_AR_REPO}/hermes-bridge:{_TAG}",
+            "--set-string",
+            f"operator.extraEnv[7].name={go_constant(_A2A_BRIDGE, 'a2aBridgeConcurrencyOperatorEnvVar')}",
+            "--set-string",
+            f"operator.extraEnv[7].value={_BRIDGE_CONCURRENCY}",
+            "--set-string",
+            f"operator.extraEnv[8].name={go_constant(_A2A_BRIDGE, 'a2aBridgeExecutorOperatorEnvVar')}",
+            "--set-string",
+            f"operator.extraEnv[8].value={consts['BRIDGE_EXECUTOR_PINNED']}",
+        ]
         self.assertEqual(args, expected)
-        # The bridge image goes to the CR, not to the operator.
-        self.assertNotIn("hermes-bridge", " ".join(args))
         # The chart renders the value the array names, last in the container's env.
         self.assertIn(".Values.operator.extraEnv", text(_OPERATOR_TEMPLATE))
         # And the release expands the array.
@@ -487,34 +406,28 @@ class FlagSetIsNextTest(unittest.TestCase):
             f"app.kubernetes.io/part-of={go_constant(_A2A_MANIFESTS, 'a2aPartOf')}",
         )
         nats_suffix = go_constant(_API_TYPES, "a2aNATSNameSuffix")
-        creds_suffix = go_constant(_API_TYPES, "a2aCredsSecretSuffix")
         callout_suffix = go_constant(_API_TYPES, "a2aCalloutNameSuffix")
-        self.assertEqual(consts["A2A_NATS_SERVICE_NAME"], "${PLATFORM_AGENT_CR_NAME}" + nats_suffix)
-        self.assertEqual(consts["A2A_CREDS_SECRET_NAME"], "${A2A_NATS_SERVICE_NAME}" + creds_suffix)
         self.assertEqual(consts["A2A_NATS_POD_SELECTOR"], "app=${PLATFORM_AGENT_CR_NAME}" + nats_suffix)
-        self.assertEqual(int(consts["A2A_NATS_CLIENT_PORT"]), go_int_constant(_A2A_MANIFESTS, "a2aNATSClientPort"))
-        # The URL format is the one the operator renders into the agent container
-        # (printf and Python's % agree on %s and %d), filled by the step's printf.
-        self.assertIn('Value: fmt.Sprintf("nats://%s.%s.svc:4222", a2aNATSName(agent), agent.Namespace)', text(_AGENT_MANIFESTS))
-        self.assertEqual(
-            consts["A2A_NATS_URL_FORMAT"] % ("platform-agent-a2a-nats", "kubeagents-system", int(consts["A2A_NATS_CLIENT_PORT"])),
-            "nats://platform-agent-a2a-nats.kubeagents-system.svc:4222",
-        )
-        self.assertIn('printf -v A2A_NATS_URL "${A2A_NATS_URL_FORMAT}" "${A2A_NATS_SERVICE_NAME}" "${NAMESPACE}" "${A2A_NATS_CLIENT_PORT}"', lifted(*_MODE_SECTION))
         manifests = text(_A2A_MANIFESTS)
         self.assertRegex(manifests, r'func a2aGatewayName\(.*\) string\s*{\s*return agent\.Name \+ "-a2a-gateway"')
         self.assertRegex(manifests, r'func a2aInjectName\(.*\) string\s*{\s*return agent\.Name \+ "-a2a-inject"')
         self.assertEqual(consts["A2A_INJECT_NAME"], "${PLATFORM_AGENT_CR_NAME}-a2a-inject")
         self.assertEqual(consts["A2A_INJECT_TOKEN_KEY"], go_constant(_A2A_MANIFESTS, "a2aInjectTokenKey"))
-        self.assertEqual(consts["A2A_BRIDGE_USER"], go_constant(_A2A_IDENTITIES, "a2aBridgeUser"))
-        self.assertEqual(consts["A2A_BRIDGE_PASSWORD_KEY"], go_constant(_A2A_MANIFESTS, "a2aBridgePasswordKey"))
-        self.assertEqual(consts["A2A_BRIDGE_ACTIVITY_KEY"], go_constant(_A2A_MANIFESTS, "a2aBridgeActivityKey"))
-        self.assertEqual(consts["BRIDGE_ACTIVITY_SECRET_ENV_VAR"], go_constant(_A2A_MANIFESTS, "a2aActivitySecretEnvVar"))
-        self.assertEqual(consts["A2A_BUS_TOKEN_VOLUME"], go_constant(_A2A_CALLOUT, "a2aBusTokenVolume"))
-        self.assertIn(f'"{consts["A2A_BUS_TOKEN_VOLUME"]}": {{}}', text(_API_TYPES))
-        self.assertEqual(consts["AGENT_SHARED_STATE_SETUP_ENV_VAR"], go_constant(_AGENT_MANIFESTS, "sharedStateSetupEnvVar"))
-        self.assertEqual(consts["AGENT_SHARED_STATE_SETUP_SKIP"], go_constant(_AGENT_MANIFESTS, "sharedStateSetupSkip"))
-        self.assertIn(f'Name:            "{consts["AGENT_CONTAINER_NAME"]}",', text(_AGENT_MANIFESTS))
+        # The rendered bridge: the container the log gate reads, the image name
+        # step 4 pushes under, and the three operator settings step 5 sets, each
+        # the operator's own spelling and each read from the operator's own
+        # environment rather than the CR's.
+        self.assertEqual(consts["BRIDGE_SIDECAR_NAME"], go_constant(_A2A_BRIDGE, "a2aBridgeContainerName"))
+        self.assertEqual(consts["A2A_BRIDGE_IMAGE_NAME"], go_constant(_A2A_BRIDGE, "a2aBridgeImageName"))
+        bridge_go = text(_A2A_BRIDGE)
+        for const, go_name in (
+            ("A2A_BRIDGE_IMAGE_ENV_VAR", "a2aBridgeImageEnvVar"),
+            ("A2A_BRIDGE_CONCURRENCY_ENV_VAR", "a2aBridgeConcurrencyOperatorEnvVar"),
+            ("A2A_BRIDGE_EXECUTOR_ENV_VAR", "a2aBridgeExecutorOperatorEnvVar"),
+        ):
+            with self.subTest(const=const):
+                self.assertEqual(consts[const], go_constant(_A2A_BRIDGE, go_name))
+                self.assertIn(f"os.Getenv({go_name})", bridge_go)
         block = lifted(*_MODE_SECTION)
         self.assertIn('-a2a-callout"', block)
         self.assertEqual(callout_suffix, "-a2a-callout")
@@ -530,10 +443,6 @@ class FlagSetIsNextTest(unittest.TestCase):
     def test_the_bridge_env_and_log_line_match_the_bridge_source(self) -> None:
         consts = constants()
         main_go = text(_BRIDGE_MAIN)
-        for const in ("BRIDGE_NATS_URL_ENV_VAR", "BRIDGE_NATS_USER_ENV_VAR", "BRIDGE_NATS_PASSWORD_ENV_VAR"):
-            with self.subTest(const=const):
-                self.assertIn(f'os.Getenv("{consts[const]}")', main_go)
-        self.assertIn(f'"{consts["BRIDGE_CONCURRENCY_ENV_VAR"]}"', main_go)
         self.assertEqual(int(consts["BRIDGE_QUEUE_CAPACITY"]), go_int_constant(_BRIDGE_GO, "taskQueueCapacity"))
         self.assertIn('Info("hermes bridge consuming", "profile", b.cfg.Profile, ', text(_BRIDGE_GO))
         # The shape the deploy greps is the JSON handler's: `"msg":"..."` and
@@ -543,10 +452,29 @@ class FlagSetIsNextTest(unittest.TestCase):
         self.assertEqual(consts["BRIDGE_CONSUMING_LOG_MSG"], '"msg":"hermes bridge consuming"')
         self.assertEqual(consts["BRIDGE_CONSUMING_LOG_PROFILE"], f'"profile":"{go_constant(_BRIDGE_MAIN, "defaultProfile")}"')
         # The lane pins the subprocess executor, and the start line is where the
-        # deploy proves the pin took: the variable the bridge reads, the value it
-        # accepts, and the field it logs the choice under.
-        self.assertEqual(consts["BRIDGE_EXECUTOR_ENV_VAR"], go_constant(_BRIDGE_MAIN, "executorEnv"))
+        # deploy proves the pin took: the variable the operator renders the pin
+        # into is the one the bridge reads, the value is one it accepts, and the
+        # field it logs the choice under is the one the wait greps.
+        self.assertEqual(go_constant(_A2A_MANIFESTS, "a2aBridgeExecutorEnvVar"), go_constant(_BRIDGE_MAIN, "executorEnv"))
+        # The operator spells the rest of the bridge's env itself too, since it
+        # cannot import the bridge's module, so each is pinned to the name the
+        # bridge actually reads.
+        bridge_go = _A2A_BRIDGE
+        for op_const, bridge_name in (
+            ("a2aBridgeNATSURLEnvVar", "NATS_URL"),
+            ("a2aBridgeNATSUserEnvVar", "NATS_USER"),
+            ("a2aBridgeNATSPasswordEnvVar", "NATS_PASSWORD"),
+        ):
+            with self.subTest(env=bridge_name):
+                self.assertEqual(go_constant(bridge_go, op_const), bridge_name)
+                self.assertIn(f'"{bridge_name}"', main_go, f"the bridge no longer reads {bridge_name}")
+        self.assertEqual(go_constant(_A2A_MANIFESTS, "a2aBridgeConcurrencyEnvVar"), "BRIDGE_CONCURRENCY")
+        self.assertIn('"BRIDGE_CONCURRENCY"', main_go, "the bridge no longer reads BRIDGE_CONCURRENCY")
         self.assertEqual(consts["BRIDGE_EXECUTOR_PINNED"], go_constant(_BRIDGE_API_GO, "ExecutorCLI"))
+        # The operator admits only these two spellings into BRIDGE_EXECUTOR and
+        # drops anything else as unset, so each must be the bridge's own.
+        self.assertEqual(go_constant(_A2A_BRIDGE, "a2aBridgeExecutorCLI"), go_constant(_BRIDGE_API_GO, "ExecutorCLI"))
+        self.assertEqual(go_constant(_A2A_MANIFESTS, "a2aBridgeExecutorAPI"), go_constant(_BRIDGE_API_GO, "ExecutorAPI"))
         self.assertIn('"executor", b.cfg.Executor)', text(_BRIDGE_GO))
         self.assertEqual(consts["BRIDGE_CONSUMING_LOG_EXECUTOR"], f'"executor":"{consts["BRIDGE_EXECUTOR_PINNED"]}"')
         self.assertIn(
@@ -563,8 +491,11 @@ class FlagSetIsNextTest(unittest.TestCase):
         self.assertLessEqual(int(consts["EVAL_TASK_PARALLELISM_DEFAULT"]), int(consts["BRIDGE_QUEUE_CAPACITY"]))
         script = text(_CI_DEPLOY)
         self.assertIn('MODE_NEXT_BRIDGE_CONCURRENCY="${EVAL_TASK_PARALLELISM:-${EVAL_TASK_PARALLELISM_DEFAULT}}"', script)
-        # And the value the guard admitted is what the sidecar gets.
-        self.assertIn('"${BRIDGE_CONCURRENCY_ENV_VAR}" "${MODE_NEXT_BRIDGE_CONCURRENCY}"', lifted(*_MODE_SECTION))
+        # And the value the guard admitted is what the operator renders into
+        # the bridge (and budgets TASKS by).
+        self.assertIn('--set-string "operator.extraEnv[7].value=${MODE_NEXT_BRIDGE_CONCURRENCY}"', lifted(*_BUILD_SECTION))
+        self.assertEqual(go_constant(_A2A_MANIFESTS, "a2aBridgeConcurrencyEnvVar"), "BRIDGE_CONCURRENCY")
+        self.assertIn("{Name: a2aBridgeConcurrencyEnvVar, Value: a2aRenderedBridgeConcurrency()}", text(_A2A_BRIDGE))
 
     def test_the_release_candidate_path_refuses_the_flag(self) -> None:
         script = text(_CI_DEPLOY)
@@ -669,6 +600,9 @@ class FlagSetIsNextTest(unittest.TestCase):
                 "statefulset/${PLATFORM_AGENT_CR_NAME}-a2a-nats",
                 "deployment/${PLATFORM_AGENT_CR_NAME}-a2a-callout",
                 "deployment/${AGENT_DEPLOYMENT_NAME}",
+                # Twice: the operator adds the bridge to the agent pod only
+                # once the bus is provisioned, so the agent rolls a second
+                # time after the Job, and that roll is gated like the first.
                 "deployment/${AGENT_DEPLOYMENT_NAME}",
                 # Last, not after the Job its bucket comes from: see the
                 # step header. A verifier still in its crash-loop backoff
@@ -681,16 +615,10 @@ class FlagSetIsNextTest(unittest.TestCase):
         markers = [
             'gate_mode_next_rollout "deployment/${PLATFORM_AGENT_CR_NAME}-a2a-callout"',
             'wait_provision_job "the mode patch"',
-            'FIRST_PROVISION_JOB="${PROVISION_JOB_NAME}"',
+            'gate_mode_next_rollout "deployment/${AGENT_DEPLOYMENT_NAME}"',
+            '*" ${BRIDGE_SIDECAR_NAME} "*) break ;;',
             'gate_mode_next_rollout "deployment/${AGENT_DEPLOYMENT_NAME}"',
             'kubectl get "service/${A2A_INJECT_NAME}" "secret/${A2A_INJECT_NAME}"',
-            "render_mode_next_sidecar_patch \\",
-            'kubectl patch platformagent "${PLATFORM_AGENT_CR_NAME}" -n "${NAMESPACE}" --type merge -p "${SIDECAR_PATCH}"',
-            'SIDECAR_CR_GENERATION="$(kubectl get platformagent',
-            'wait_agent_generation_past "${SIDECAR_GEN_BEFORE}"',
-            'wait_provision_job "the sidecar patch" "${FIRST_PROVISION_JOB}" "${SIDECAR_CR_GENERATION}"',
-            'gate_cr_not_degraded "the sidecar patch"',
-            'gate_mode_next_rollout "deployment/${AGENT_DEPLOYMENT_NAME}"',
             'grep -F "${BRIDGE_CONSUMING_LOG_MSG}" | grep -F "${BRIDGE_CONSUMING_LOG_PROFILE}"',
             'gate_mode_next_rollout "deployment/${PLATFORM_AGENT_CR_NAME}-a2a-verifier"',
         ]
@@ -700,6 +628,14 @@ class FlagSetIsNextTest(unittest.TestCase):
                 found = block.find(marker, position)
                 self.assertGreater(found, -1, f"{marker!r} is missing after offset {position}")
                 position = found + len(marker)
+        # One patch, one provision run: the bridge is the operator's from the
+        # first render (#2592), so nothing declares it and nothing waits for a
+        # re-run, so there is no refusal for the Degraded gate to read.
+        self.assertEqual(block.count("kubectl patch platformagent"), 1)
+        self.assertEqual(block.count("wait_provision_job \""), 1)
+        self.assertNotIn('gate_cr_not_degraded "', block)
+        self.assertNotIn("render_mode_next_sidecar_patch", text(_CI_DEPLOY))
+        self.assertNotIn("SIDECAR_PATCH", text(_CI_DEPLOY))
         for never_gated in ("a2a-gateway", "platform-agent-shell"):
             with self.subTest(never_gated=never_gated):
                 for line in block.splitlines():
@@ -744,19 +680,16 @@ class FlagSetIsNextTest(unittest.TestCase):
                 else:
                     self.assertLess(elapsed, bound, "a Failed Job is reported within one poll")
 
-    def test_the_generation_is_read_before_each_patch(self) -> None:
+    def test_the_generation_is_read_before_the_patch(self) -> None:
         block = lifted(*_MODE_SECTION)
         self.assertLess(block.index("GEN_BEFORE="), block.index("kubectl patch platformagent"))
-        sidecar_patch = block.index('--type merge -p "${SIDECAR_PATCH}"')
-        self.assertLess(block.index("SIDECAR_GEN_BEFORE="), sidecar_patch)
-        # And the render reads the Deployment after the mode roll, so the
-        # environment it copies is the next-mode one.
-        self.assertLess(block.index('gate_mode_next_rollout "deployment/${AGENT_DEPLOYMENT_NAME}"'), block.index("SIDECAR_PATCH="))
+        self.assertLess(block.index("kubectl patch platformagent"), block.index('wait_agent_generation_past "${GEN_BEFORE}" "the mode patch"'))
 
 
 class TasksBudgetSizingTest(unittest.TestCase):
-    """(b): the first patch carries a maxSessions sized so the sidecar patch's
-    budget fits the TASKS the first provision creates at the floor."""
+    """(b): the first patch carries a maxSessions sized so the one
+    provision's budget, which counts the rendered bridge's workers, fits the
+    floor."""
 
     def test_the_budget_terms_are_the_operators(self) -> None:
         """The four numbers are copied from the operator, which keeps them as
@@ -794,8 +727,9 @@ class TasksBudgetSizingTest(unittest.TestCase):
     def test_max_sessions_is_the_largest_that_fits_the_floor_and_at_least_one(self) -> None:
         """Section 2b's arithmetic, run for the lane's worker counts. The
         tech lead's numbers: 6 at the presubmit's 4 workers, 2 at 6; at 8 the
-        floor cannot hold the reserve and the clamp gives 1, which (c) then
-        turns into a red lane rather than a parked CR."""
+        floor cannot hold the reserve and the clamp gives 1, and the one
+        provision creates TASKS at the budget instead (#2592: no later render
+        re-measures it)."""
         consts = constants()
         floor, per_session = int(consts["A2A_TASKS_FLOOR"]), int(consts["A2A_SESSION_CONSUMERS"])
         fixed, per_worker = int(consts["A2A_RESERVE_FIXED"]), int(consts["A2A_RESERVE_PER_WORKER"])
@@ -986,11 +920,13 @@ def run_provision_wait(
 
 
 class ProvisionRerunGateTest(unittest.TestCase):
-    """(c): after the sidecar patch the step waits for the provision Job's
-    re-run, counting only a Job that is not the first run's, and reds on a
-    refusal instead of proceeding over it."""
+    """(c), as a function: the provision wait's re-render form counts only a
+    Job that is not the superseded run's, and reds on a refusal instead of
+    proceeding over it. Step 6b called it after the sidecar patch until the
+    operator rendered the bridge (#2592) and calls neither it nor the
+    Degraded gate now; the tests hold the functions that still ship."""
 
-    _RERUN = 'wait_provision_job "the sidecar patch" j1 3'
+    _RERUN = 'wait_provision_job "a re-render" j1 3'
 
     def test_the_rerun_wait_counts_only_the_new_job(self) -> None:
         # The first run, j1, stays listed until the operator's pass sweeps it,
@@ -1057,7 +993,7 @@ class ProvisionRerunGateTest(unittest.TestCase):
         self.assertNotIn("PASSED", result.stdout)
 
     def test_the_degraded_gate_reds_on_a_refusal_the_job_did_not_show(self) -> None:
-        gate = 'gate_cr_not_degraded "the sidecar patch"'
+        gate = 'gate_cr_not_degraded "a re-render"'
         cases = {
             # (phase, Ready condition) -> exit status
             ("Ready", "Ready: all workloads ready"): 0,
@@ -1071,9 +1007,9 @@ class ProvisionRerunGateTest(unittest.TestCase):
                 self.assertEqual(result.returncode, status, result.stdout + result.stderr)
                 if status == 0:
                     self.assertIn("PASSED", result.stdout)
-                    self.assertIn(f"✓ platform-agent is {phase} after the sidecar patch", result.stdout)
+                    self.assertIn(f"✓ platform-agent is {phase} after a re-render", result.stdout)
                 else:
-                    self.assertIn(f"ERROR: platform-agent is {phase} after the sidecar patch; Ready condition: {ready}", result.stdout)
+                    self.assertIn(f"ERROR: platform-agent is {phase} after a re-render; Ready condition: {ready}", result.stdout)
                     self.assertIn("DUMPED", result.stdout)
                     self.assertNotIn("PASSED", result.stdout)
         # A status read back empty is no answer: the CR carries a status once
@@ -1081,7 +1017,7 @@ class ProvisionRerunGateTest(unittest.TestCase):
         # then red as unread, never a pass as an unphased CR.
         result = run_provision_wait(jobs="", call=gate, phase="", ready="")
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
-        self.assertIn("ERROR: could not read platform-agent after the sidecar patch: all 3 reads in ", result.stdout)
+        self.assertIn("ERROR: could not read platform-agent after a re-render: all 3 reads in ", result.stdout)
         self.assertNotIn("unphased", result.stdout)
         self.assertNotIn("PASSED", result.stdout)
 
@@ -1099,7 +1035,7 @@ class ProvisionRerunGateTest(unittest.TestCase):
         self.assertNotIn("Owns(&batchv1.Job{})", controller)
 
 
-# The Ready conditions the gate after the sidecar patch reads, in the shape the
+# The Ready conditions gate_cr_not_degraded reads, in the shape the
 # operator writes them ("<reason>: <message>", the message wrapping the
 # scheduler's in getDeploymentStatusDetails). The first is #2414's, the
 # scheduler's elided middle filled in with its usual wording.
@@ -1122,14 +1058,15 @@ _ALL_READY = "Ready: all workloads ready"
 
 
 class TransientUnschedulableGateTest(unittest.TestCase):
-    """gate_cr_not_degraded after the sidecar patch (#2414). The patch rolls
-    the agent pod, and on Autopilot that pod can be Unschedulable for want of
+    """gate_cr_not_degraded after a re-render (#2414; step 6b called it
+    after the sidecar patch until #2592). The re-render rolls the agent pod,
+    and on Autopilot that pod can be Unschedulable for want of
     CPU or memory while a node is added; the operator calls that Degraded.
     The gate re-reads that one Degraded for a bounded window and nothing
     else: a refused provision and every other Degraded fail on the first
     read that answers, as they did before."""
 
-    _GATE = 'gate_cr_not_degraded_fast "the sidecar patch"'
+    _GATE = 'gate_cr_not_degraded_fast "a re-render"'
 
     def _reads(self, result: subprocess.CompletedProcess) -> int:
         return int(re.search(r"READS=(\d+)", result.stdout).group(1))
@@ -1153,14 +1090,14 @@ class TransientUnschedulableGateTest(unittest.TestCase):
                 # is taken; the poll interval is the stub's zero.
                 self.assertRegex(
                     result.stdout,
-                    re.escape("platform-agent is Degraded after the sidecar patch on a pod waiting for CPU or memory, ")
+                    re.escape("platform-agent is Degraded after a re-render on a pod waiting for CPU or memory, ")
                     + r"\d+s"
                     + re.escape(f" in; re-read 1/5 in 0s (Ready condition: {ready})"),
                 )
                 self.assertIn("re-read 2/5", result.stdout)
                 self.assertNotIn("re-read 3/5", result.stdout)
                 self.assertRegex(result.stdout, re.escape("✓ the wait for capacity cleared after 2 re-reads, ") + r"\d+s\n")
-                self.assertIn(f"✓ platform-agent is Ready after the sidecar patch (Ready condition: {_ALL_READY})", result.stdout)
+                self.assertIn(f"✓ platform-agent is Ready after a re-render (Ready condition: {_ALL_READY})", result.stdout)
                 self.assertNotIn("ERROR", result.stdout)
 
     def test_the_phase_and_condition_come_from_one_read(self) -> None:
@@ -1182,7 +1119,7 @@ class TransientUnschedulableGateTest(unittest.TestCase):
         self.assertEqual(self._reads(result), 2)
         self.assertIn(f"re-read 1/5 in 0s (Ready condition: {_WAITING_FOR_CAPACITY})", result.stdout)
         self.assertNotIn("re-read 2/5", result.stdout)
-        self.assertIn(f"✓ platform-agent is Ready after the sidecar patch (Ready condition: {_ALL_READY})", result.stdout)
+        self.assertIn(f"✓ platform-agent is Ready after a re-render (Ready condition: {_ALL_READY})", result.stdout)
         self.assertNotIn("ERROR", result.stdout)
 
     def test_a_wait_for_capacity_that_outlasts_the_window_fails_as_before(self) -> None:
@@ -1194,7 +1131,7 @@ class TransientUnschedulableGateTest(unittest.TestCase):
         self.assertIn("re-read 3/3", result.stdout)
         self.assertNotIn("re-read 4/3", result.stdout)
         self.assertIn("the wait for capacity ended after 3 re-reads", result.stdout)
-        self.assertIn(f"ERROR: platform-agent is Degraded after the sidecar patch; Ready condition: {_WAITING_FOR_CAPACITY}", result.stdout)
+        self.assertIn(f"ERROR: platform-agent is Degraded after a re-render; Ready condition: {_WAITING_FOR_CAPACITY}", result.stdout)
         self.assertIn("--- provisioning Job pod logs ---", result.stdout)
         self.assertIn("kubectl logs -n kubeagents-system -l kubeagents.x-k8s.io/a2a-component=provision", result.stdout)
         self.assertIn("DUMPED", result.stdout)
@@ -1220,7 +1157,7 @@ class TransientUnschedulableGateTest(unittest.TestCase):
                 self.assertIn(f"re-read 1/5 in 0s (Ready condition: {_WAITING_FOR_CAPACITY})", result.stdout)
                 self.assertNotIn("re-read 2/5", result.stdout)
                 self.assertRegex(result.stdout, re.escape("the wait for capacity ended after 1 re-reads, ") + r"\d+s\n")
-                self.assertIn(f"ERROR: platform-agent is {phase} after the sidecar patch; Ready condition: {ready}", result.stdout)
+                self.assertIn(f"ERROR: platform-agent is {phase} after a re-render; Ready condition: {ready}", result.stdout)
                 self.assertIn("DUMPED", result.stdout)
                 self.assertNotIn("PASSED", result.stdout)
 
@@ -1256,7 +1193,7 @@ class TransientUnschedulableGateTest(unittest.TestCase):
                 self.assertIn(f"re-read 1/5 in 0s (Ready condition: {_WAITING_FOR_CAPACITY})", result.stdout)
                 self.assertRegex(
                     result.stdout,
-                    re.escape("the read of platform-agent after the sidecar patch returned nothing, ")
+                    re.escape("the read of platform-agent after a re-render returned nothing, ")
                     + r"\d+s"
                     + re.escape(f" in; re-read 2/5 in 0s (last Ready condition: {_WAITING_FOR_CAPACITY})"),
                 )
@@ -1264,11 +1201,11 @@ class TransientUnschedulableGateTest(unittest.TestCase):
                 self.assertNotIn("is unphased", result.stdout)
                 if status == 0:
                     self.assertRegex(result.stdout, re.escape("✓ the wait for capacity cleared after 2 re-reads, ") + r"\d+s\n")
-                    self.assertIn(f"✓ platform-agent is Ready after the sidecar patch (Ready condition: {_ALL_READY})", result.stdout)
+                    self.assertIn(f"✓ platform-agent is Ready after a re-render (Ready condition: {_ALL_READY})", result.stdout)
                     self.assertNotIn("ERROR", result.stdout)
                 else:
                     self.assertRegex(result.stdout, re.escape("the wait for capacity ended after 2 re-reads, ") + r"\d+s\n")
-                    self.assertIn(f"ERROR: platform-agent is {phases[2]} after the sidecar patch; Ready condition: {readies[2]}", result.stdout)
+                    self.assertIn(f"ERROR: platform-agent is {phases[2]} after a re-render; Ready condition: {readies[2]}", result.stdout)
                     self.assertIn("DUMPED", result.stdout)
                     self.assertNotIn("PASSED", result.stdout)
 
@@ -1286,7 +1223,7 @@ class TransientUnschedulableGateTest(unittest.TestCase):
             + r"\d+s"
             + re.escape("; the last read returned nothing, so this is the last one that answered\n"),
         )
-        self.assertIn(f"ERROR: platform-agent is Degraded after the sidecar patch; Ready condition: {_WAITING_FOR_CAPACITY}", result.stdout)
+        self.assertIn(f"ERROR: platform-agent is Degraded after a re-render; Ready condition: {_WAITING_FOR_CAPACITY}", result.stdout)
         self.assertIn("DUMPED", result.stdout)
         self.assertNotIn("PASSED", result.stdout)
 
@@ -1311,7 +1248,7 @@ class TransientUnschedulableGateTest(unittest.TestCase):
                 self.assertEqual(result.returncode, status, result.stdout + result.stderr)
                 self.assertEqual(self._reads(result), 2)
                 self.assertIn(
-                    "the first read of platform-agent after the sidecar patch returned nothing; re-read 1/5 in 0s (no read has answered yet)\n",
+                    "the first read of platform-agent after a re-render returned nothing; re-read 1/5 in 0s (no read has answered yet)\n",
                     result.stdout,
                 )
                 self.assertNotIn("re-read 2/5", result.stdout)
@@ -1321,10 +1258,10 @@ class TransientUnschedulableGateTest(unittest.TestCase):
                     result.stdout, re.escape(f"{'✓ ' if status == 0 else ''}platform-agent answered after 1 reads that returned nothing, ") + r"\d+s\n"
                 )
                 if status == 0:
-                    self.assertIn(f"✓ platform-agent is Ready after the sidecar patch (Ready condition: {_ALL_READY})", result.stdout)
+                    self.assertIn(f"✓ platform-agent is Ready after a re-render (Ready condition: {_ALL_READY})", result.stdout)
                     self.assertNotIn("ERROR", result.stdout)
                 else:
-                    self.assertIn(f"ERROR: platform-agent is {phase} after the sidecar patch; Ready condition: {ready}", result.stdout)
+                    self.assertIn(f"ERROR: platform-agent is {phase} after a re-render; Ready condition: {ready}", result.stdout)
                     self.assertIn("DUMPED", result.stdout)
                     self.assertNotIn("PASSED", result.stdout)
 
@@ -1335,17 +1272,17 @@ class TransientUnschedulableGateTest(unittest.TestCase):
         result = run_provision_wait(jobs="", call=self._GATE, phase=DROPPED_READ, unschedulable_attempts=3)
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         self.assertEqual(self._reads(result), 4)
-        self.assertIn("the first read of platform-agent after the sidecar patch returned nothing; re-read 1/3 in 0s (no read has answered yet)", result.stdout)
+        self.assertIn("the first read of platform-agent after a re-render returned nothing; re-read 1/3 in 0s (no read has answered yet)", result.stdout)
         self.assertRegex(
             result.stdout,
-            re.escape("the read of platform-agent after the sidecar patch returned nothing again, ")
+            re.escape("the read of platform-agent after a re-render returned nothing again, ")
             + r"\d+s"
             + re.escape(" in; re-read 3/3 in 0s (no read has answered yet)"),
         )
         self.assertNotIn("re-read 4/3", result.stdout)
         self.assertRegex(
             result.stdout,
-            re.escape("ERROR: could not read platform-agent after the sidecar patch: all 4 reads in ")
+            re.escape("ERROR: could not read platform-agent after a re-render: all 4 reads in ")
             + r"\d+s"
             + re.escape(" returned nothing, so there is no phase or Ready condition to judge\n"),
         )
@@ -1371,7 +1308,7 @@ class TransientUnschedulableGateTest(unittest.TestCase):
                 self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
                 self.assertEqual(self._reads(result), 1)
                 self.assertNotIn("re-read", result.stdout)
-                self.assertIn(f"ERROR: platform-agent is {phase} after the sidecar patch; Ready condition: {ready}", result.stdout)
+                self.assertIn(f"ERROR: platform-agent is {phase} after a re-render; Ready condition: {ready}", result.stdout)
                 self.assertIn("--- provisioning Job pod logs ---", result.stdout)
                 self.assertIn("DUMPED", result.stdout)
 
@@ -1393,7 +1330,7 @@ class TransientUnschedulableGateTest(unittest.TestCase):
                 self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
                 self.assertEqual(self._reads(result), 1)
                 self.assertNotIn("re-read", result.stdout)
-                self.assertIn(f"ERROR: platform-agent is Degraded after the sidecar patch; Ready condition: {ready}", result.stdout)
+                self.assertIn(f"ERROR: platform-agent is Degraded after a re-render; Ready condition: {ready}", result.stdout)
                 self.assertIn("DUMPED", result.stdout)
 
     def test_the_window_is_bounded_and_inside_the_next_gates_rollout_budget(self) -> None:
@@ -1440,7 +1377,7 @@ class CapacityWaitReadsThePodTest(unittest.TestCase):
     pulls and the agent's start on a fresh node all ran inside the window on
     that stale text."""
 
-    _GATE = 'gate_cr_not_degraded_fast "the sidecar patch"'
+    _GATE = 'gate_cr_not_degraded_fast "a re-render"'
 
     def _count(self, name: str, result: subprocess.CompletedProcess) -> int:
         return int(re.search(rf"(?:^| ){name}=(\d+)", result.stdout, re.MULTILINE).group(1))
@@ -1501,7 +1438,7 @@ class CapacityWaitReadsThePodTest(unittest.TestCase):
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         self.assertEqual(self._count("POD_READS", result), 4)
         self.assertIn("the wait for capacity ended after 3 re-reads", result.stdout)
-        self.assertIn(f"ERROR: platform-agent is Degraded after the sidecar patch; Ready condition: {_WAITING_FOR_CAPACITY}", result.stdout)
+        self.assertIn(f"ERROR: platform-agent is Degraded after a re-render; Ready condition: {_WAITING_FOR_CAPACITY}", result.stdout)
         self.assertNotIn("handed off", result.stdout)
         self.assertNotIn("PASSED", result.stdout)
 
@@ -1573,7 +1510,7 @@ class CapacityWaitReadsThePodTest(unittest.TestCase):
                 self.assertEqual(self._count("POD_READS", result), 4)
                 self.assertIn("re-read 3/3", result.stdout)
                 self.assertIn("the wait for capacity ended after 3 re-reads", result.stdout)
-                self.assertIn(f"ERROR: platform-agent is Degraded after the sidecar patch; Ready condition: {_WAITING_FOR_CAPACITY}", result.stdout)
+                self.assertIn(f"ERROR: platform-agent is Degraded after a re-render; Ready condition: {_WAITING_FOR_CAPACITY}", result.stdout)
                 self.assertIn("DUMPED", result.stdout)
                 self.assertNotIn("handed off", result.stdout)
                 self.assertNotIn("PASSED", result.stdout)
@@ -1597,7 +1534,7 @@ class CapacityWaitReadsThePodTest(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         self.assertEqual(self._count("POD_READS", result), 4)
-        self.assertIn(f"ERROR: platform-agent is Degraded after the sidecar patch; Ready condition: {_WAITING_FOR_CAPACITY}", result.stdout)
+        self.assertIn(f"ERROR: platform-agent is Degraded after a re-render; Ready condition: {_WAITING_FOR_CAPACITY}", result.stdout)
         self.assertNotIn("handed off", result.stdout)
 
     def test_a_condition_about_another_workloads_pod_is_not_handed_off_by_the_agents(self) -> None:
@@ -1609,7 +1546,7 @@ class CapacityWaitReadsThePodTest(unittest.TestCase):
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         self.assertEqual(self._count("READS", result), 4)
         self.assertEqual(self._count("POD_READS", result), 0)
-        self.assertIn(f"ERROR: platform-agent is Degraded after the sidecar patch; Ready condition: {other}", result.stdout)
+        self.assertIn(f"ERROR: platform-agent is Degraded after a re-render; Ready condition: {other}", result.stdout)
         self.assertNotIn("handed off", result.stdout)
 
     def test_the_pod_read_is_the_operators_selector_for_the_agent_pod(self) -> None:
@@ -1624,102 +1561,32 @@ class CapacityWaitReadsThePodTest(unittest.TestCase):
         self.assertIn('-l "app=${AGENT_DEPLOYMENT_NAME}"', shell_function("gate_cr_not_degraded"))
 
 
-class SidecarPatchTest(unittest.TestCase):
-    """render_mode_next_sidecar_patch, run on the fixture Deployment."""
+class RenderedBridgeTest(unittest.TestCase):
+    """The bridge is the operator's (#2592): the deploy declares no sidecar
+    and hands the operator the three settings instead. What the rendered
+    container carries -- the agent's env, mounts, securityContext and
+    resources, minus the bus token and the agent's bus identity, plus the
+    bridge's own env -- is the operator's to pin, and
+    k8s-operator/internal/controller/platformagent_a2a_bridge_test.go does
+    (TestANextInstallWithNoDeclaredBridgeGetsOne, and the env copy entry by
+    entry in TestTheRenderedBridgeCarriesTheAgentsEnvExceptTheDroppedNames).
+    What is pinned here is the
+    hand-off: nothing in the deploy writes spec.deployment.sidecars, and the
+    operator renders a container under the name the log gate reads."""
 
-    def setUp(self) -> None:
-        self.consts = constants()
-        self.patch = render_sidecar(_AGENT_DEPLOYMENT)
-        sidecars = self.patch["spec"]["deployment"]["sidecars"]
-        self.assertEqual(len(sidecars), 1)
-        self.sidecar = sidecars[0]
-        self.assertEqual(set(self.patch), {"spec"})
-        self.assertEqual(set(self.patch["spec"]), {"deployment"})
-        self.assertEqual(set(self.patch["spec"]["deployment"]), {"sidecars"})
+    def test_the_deploy_declares_no_sidecar(self) -> None:
+        code = [line for line in text(_CI_DEPLOY).splitlines() if not line.lstrip().startswith("#")]
+        for line in code:
+            with self.subTest(line=line):
+                self.assertNotIn("sidecars", line)
 
-    def test_it_is_the_bridge_image_named_as_the_script_names_it(self) -> None:
-        self.assertEqual(self.sidecar["name"], self.consts["BRIDGE_SIDECAR_NAME"])
-        self.assertEqual(self.sidecar["image"], f"{_AR_REPO}/hermes-bridge:{_TAG}")
-        self.assertEqual(self.sidecar["imagePullPolicy"], "Always")
-
-    def test_it_carries_the_agents_environment_plus_the_bridges_own(self) -> None:
-        env = self.sidecar["env"]
-        names = [e["name"] for e in env]
-        # The agent's own entries, in their order, minus what the bridge sets itself.
-        self.assertEqual(names[:5], ["PLATFORM_AGENT_HOME", "HOME", "API_SERVER_KEY", "A2A_BUS_USER", "PATH"])
-        self.assertEqual(env[2], _AGENT_ENV[2], "a valueFrom entry is copied whole")
-        # Then the bridge's, as the bridge doc lists them, and the entrypoint switch.
-        self.assertEqual(
-            env[5:],
-            [
-                {"name": "AGENT_SHARED_STATE_SETUP", "value": "skip"},
-                {"name": "NATS_URL", "value": "nats://platform-agent-a2a-nats.kubeagents-system.svc:4222"},
-                {"name": "NATS_USER", "value": "bridge"},
-                {"name": "NATS_PASSWORD", "valueFrom": {"secretKeyRef": {"name": "platform-agent-a2a-nats-creds", "key": "bridge-password"}}},
-                {"name": "BRIDGE_EXECUTOR", "value": "cli"},
-                {"name": "BRIDGE_CONCURRENCY", "value": "4"},
-                {
-                    "name": "A2A_ACTIVITY_SECRET",
-                    "valueFrom": {"secretKeyRef": {"name": "platform-agent-a2a-nats-creds", "key": "bridge-activity-key", "optional": True}},
-                },
-            ],
-        )
-        self.assertEqual(names.count("NATS_URL"), 1, "the agent's NATS_URL is replaced, not shadowed")
-        self.assertEqual(names.count("AGENT_SHARED_STATE_SETUP"), 1)
-        self.assertEqual(names.count("BRIDGE_EXECUTOR"), 1)
-        self.assertEqual(self.sidecar["envFrom"], [{"secretRef": {"name": "extra"}}])
-
-    def test_it_mounts_what_the_agent_mounts_except_the_reserved_bus_token(self) -> None:
-        mounts = self.sidecar["volumeMounts"]
-        self.assertEqual([m["name"] for m in mounts], ["platform-agent-data-vol", "platform-agent-managed-vol", "tmp-scratch"])
-        self.assertNotIn(self.consts["A2A_BUS_TOKEN_VOLUME"], [m["name"] for m in mounts])
-
-    def test_it_copies_security_context_and_resources_and_nothing_that_would_collide(self) -> None:
-        self.assertEqual(self.sidecar["securityContext"], _AGENT_SECURITY_CONTEXT)
-        self.assertEqual(self.sidecar["resources"], _AGENT_RESOURCES)
-        for key in ("ports", "readinessProbe", "livenessProbe", "startupProbe", "command", "args", "lifecycle"):
-            self.assertNotIn(key, self.sidecar)
-        self.assertEqual(
-            set(self.sidecar),
-            {"name", "image", "imagePullPolicy", "env", "envFrom", "volumeMounts", "securityContext", "resources"},
-        )
-
-    def test_it_reads_the_agent_container_and_not_the_dashboard(self) -> None:
-        self.assertNotIn({"name": "AGENT_SHARED_STATE_SETUP", "value": "owner"}, self.sidecar["env"])
-        reordered = json.loads(json.dumps(_AGENT_DEPLOYMENT))
-        reordered["spec"]["template"]["spec"]["containers"].reverse()
-        self.assertEqual(render_sidecar(reordered), self.patch)
-
-    def test_optional_fields_absent_on_the_agent_stay_absent(self) -> None:
-        bare = json.loads(json.dumps(_AGENT_DEPLOYMENT))
-        agent = bare["spec"]["template"]["spec"]["containers"][0]
-        for key in ("imagePullPolicy", "envFrom", "securityContext", "resources", "env", "volumeMounts"):
-            agent.pop(key)
-        sidecar = render_sidecar(bare, concurrency="6")["spec"]["deployment"]["sidecars"][0]
-        self.assertEqual(set(sidecar), {"name", "image", "env", "volumeMounts"})
-        self.assertEqual(sidecar["volumeMounts"], [])
-        self.assertEqual([e["name"] for e in sidecar["env"]], ["AGENT_SHARED_STATE_SETUP", "NATS_URL", "NATS_USER", "NATS_PASSWORD", "BRIDGE_EXECUTOR", "BRIDGE_CONCURRENCY", "A2A_ACTIVITY_SECRET"])
-        self.assertEqual(sidecar["env"][-2]["value"], "6")
-
-    def test_the_context_the_operator_renders_is_one_the_webhook_admits(self) -> None:
-        """The renderer copies the agent container's securityContext verbatim,
-        so what the webhook sees is what the operator rendered: pinned here
-        against hardenedSecurityContext() in the operator source (the fixture
-        above mirrors it), against the four sidecar rules in
-        platformagent_webhook.go: no privileged, no privilege escalation, no
-        root, no added capabilities."""
-        manifests = text(_AGENT_MANIFESTS)
-        body = re.search(r"func hardenedSecurityContext\(\) \*corev1\.SecurityContext \{\n(.*?)\n\}", manifests, re.DOTALL)
-        self.assertIsNotNone(body, "hardenedSecurityContext() not found in the operator source")
-        self.assertIn("AllowPrivilegeEscalation: ptr.To(false)", body.group(1))
-        self.assertIn('Drop: []corev1.Capability{"ALL"}', body.group(1))
-        self.assertNotIn("Privileged", body.group(1))
-        self.assertNotIn("RunAsUser", body.group(1))
-        self.assertNotIn("Add:", body.group(1))
-        webhook = text(_CONTROLLER.parent / "webhook" / "platformagent_webhook.go")
-        for rule in ("sc.Privileged", "sc.AllowPrivilegeEscalation", "*sc.RunAsUser == 0", "sc.Capabilities.Add"):
-            self.assertIn(rule, webhook)
-        self.assertEqual(self.sidecar["securityContext"], _AGENT_SECURITY_CONTEXT)
+    def test_the_operator_renders_the_container_the_log_gate_reads(self) -> None:
+        consts = constants()
+        bridge_go = text(_A2A_BRIDGE)
+        self.assertEqual(consts["BRIDGE_SIDECAR_NAME"], go_constant(_A2A_BRIDGE, "a2aBridgeContainerName"))
+        self.assertIn("Name:            a2aBridgeContainerName,", bridge_go)
+        self.assertIn("Image:           a2aBridgeImage(agentContainer.Image),", bridge_go)
+        self.assertIn('-c "${BRIDGE_SIDECAR_NAME}"', lifted(*_MODE_SECTION))
 
 
 class BridgeImageBuildTest(unittest.TestCase):
@@ -1741,21 +1608,27 @@ class BridgeImageBuildTest(unittest.TestCase):
         # The go-directive call site is pinned by test_check_image_inventory_go_directive.
         self.assertIn("check_base_image golang a2a/Dockerfile.hermes-bridge GOLANG_IMAGE GOLANG_VERSION", script)
         # The bridge is release surface: a first-party entry the release
-        # workflow publishes, with no operator override since the operator
-        # renders no bridge and the sidecar's image is the CR's.
+        # workflow publishes, whose override is the one the operator reads
+        # when it renders the bridge (#2592), and whose compiled name the
+        # inventory check holds.
+        self.assertIn(
+            "check_compiled_image_name hermes-bridge k8s-operator/internal/controller/platformagent_a2a_bridge.go a2aBridgeImageName",
+            script,
+        )
         inventory = json.loads(text(_REPO_ROOT / "images.json"))
         by_name = {image["name"]: image for image in inventory["images"]}
         self.assertIn("hermes-bridge", by_name)
         bridge = by_name["hermes-bridge"]
         self.assertEqual(bridge["origin"], "first-party")
         self.assertEqual(bridge["tagPolicy"], "release")
-        self.assertNotIn("override", bridge)
+        self.assertEqual(bridge["override"], go_constant(_A2A_BRIDGE, "a2aBridgeImageEnvVar"))
         for name, override in (
             ("a2a-gateway", "A2A_GATEWAY_IMAGE"),
             ("a2a-worker", "A2A_WORKER_IMAGE"),
             ("a2a-authcallout", "A2A_CALLOUT_IMAGE"),
             ("a2a-verifier", "A2A_VERIFIER_IMAGE"),
             ("a2a-console", "A2A_CONSOLE_IMAGE"),
+            ("hermes-bridge", "A2A_BRIDGE_IMAGE"),
         ):
             self.assertEqual(by_name[name]["override"], override)
             self.assertEqual(by_name[name]["tagPolicy"], "release")

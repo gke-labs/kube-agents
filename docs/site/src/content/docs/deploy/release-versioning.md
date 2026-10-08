@@ -56,7 +56,7 @@ with manual dispatches available for overrides and off-schedule releases.
 | :-------------------------- | :----------------------------------------------------------------------------------------------------------------------------------- |
 | RC selection and validation | Every three hours, at 17 minutes past. Dispatches nothing when the newest candidate on `main` has already been tried.                |
 | Staging promotion           | Daily at 02:17 UTC, against the newest validated candidate on `main`. One already nominated or promoted is re-tested, not re-tagged. |
-| GA release                  | Weekly on Fridays at 05:17 UTC, or when a maintainer dispatches it.                                                                  |
+| GA release                  | Weekly on Fridays at 06:17 UTC, or when a maintainer dispatches it.                                                                  |
 
 A staging promotion is not finished when its matrix goes green. The eval runs between the
 nomination and the tag and takes hours, so the `staging_*` tag can appear most of a working day

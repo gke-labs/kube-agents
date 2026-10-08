@@ -443,11 +443,13 @@ Layout:
   in flight at once and one tail each; the callers that replay in a loop with nothing
   between calls are named there as what the term does not size for. Amended 9/28: the
   replay term scales with the bridge's worker count, which the render reads as
-  `BRIDGE_CONCURRENCY` off `spec.deployment.sidecars` - the sum over every sidecar that
+  `BRIDGE_CONCURRENCY` off `spec.deployment.sidecars` and, when the operator renders the
+  bridge itself, off the operator's `A2A_BRIDGE_CONCURRENCY` setting, read by the same rule
+  (10, the rendered bridge's default, when unset) - the sum over every sidecar that
   sets it, each read as the bridge runs it: the literal, with a `$(NAME)` reference to an
   earlier literal in the same sidecar expanded as the kubelet expands it, or the bridge's
   default of 2 for a `valueFrom` or a reference to one, an unparsable value or one below
-  one, and 2 when no sidecar sets it, and at
+  one, and 2 when nothing sets it, and at
   most 1024, the bridge's queue capacity, since the CRD bounds `maxSessions` at 10000 against
   the same wrap and a sidecar's env is bounded nowhere else - so the reserve moves with the
   bridge's worker count, and each surface says what it read. The provision script's refusal
@@ -458,7 +460,8 @@ Layout:
   not, when an entry took the default or a sidecar carries `envFrom` with no entry in `env`
   (a `BRIDGE_CONCURRENCY` delivered through `envFrom` is not read), since the budget may then
   be short for the real count with no refusal to say so. Where the count is above the
-  default, both refusal surfaces offer fewer workers as the third way out beside a lower
+  default, both refusal surfaces offer fewer workers (on a rendered bridge, a lower
+  `A2A_BRIDGE_CONCURRENCY`) as the third way out beside a lower
   `maxSessions` and a deleted stream; the message attributes the need to the count wherever
   it moved the reserve, one worker included.
   The trade is stated where it is made: an install that raises `maxSessions` raises
@@ -664,9 +667,24 @@ their user JWT expires, at most the callout's grant lifetime (one hour by defaul
 operator does not set `A2A_GRANT_TTL_SECONDS`), and a narrowed pod named after it can be
 minted the same inbox inside that window. Only an operator re-render removes a map user,
 and the window is accepted. The refusal reason says which kind of name the pod copies.
-The pod name is also the session's task addressee, consumer stem and capability caller,
-so the same collision exists in the addressee namespace: a narrowed pod named `platform`,
-the bridge's addressee, is not refused by this check.
+
+The pod name is also the session's task addressee. The callout keys the events a narrowed
+pod may publish, the consumers it may create over `.in`, and its capability verify and
+reply subjects on that name, so a pod named after another addressee would be handed that
+addressee's task subjects. The gateway never mints such a name, but anyone who can create a
+pod under a narrowed ServiceAccount can, so the same check refuses a narrowed pod whose name
+is a fixed-name addressee. Today that is `platform`: the gateway's default addressee, which
+the operator leaves unset so the gateway keeps its own default, and the only addressee the
+bridge's grants name. The operator renders the list into the callout's
+`A2A_RESERVED_ADDRESSEES` environment variable, from the constant the bridge's grants are
+built from, and an operator test holds it to both defaults in the a2a module. The callout
+refuses to start if the variable is missing, empty, or holds anything but dot-free DNS-1123
+labels. Session addressees need no entry, since each is the name of the pod that is that
+addressee. Two kinds are not on the list. One is the name a `BRIDGE_PROFILE` override
+sets, which leaves the bridge unable to publish its own events because its grants still
+name `platform`. The other is `AgentProfile` addressees, which come and go with their CRs:
+a narrowed pod named after a profile would be handed that profile's task subjects, so
+profiles need the same refusal, from a set that follows them, when the CRD lands.
 
 A reaped session's credential stops working because the pod object is gone, not because
 the token expired: measured on envtest 1.36, a zero-grace pod delete invalidated the token
@@ -836,8 +854,9 @@ on that function). On the mounts it goes further than admission does: besides th
 reserved names it drops any mount naming a volume it has just dropped by source, because
 a volume dropped while a mount still names it is a Deployment the API server refuses. Neither
 layer touches `sidecars[].env` or `.envFrom`, which reach the same Secrets with no volume
-at all; that is deliberate, because it is the supported route for the Hermes bridge
-sidecar, which is meant to hold `bridge-password`.
+at all; that is deliberate, because it is the supported route for a CR-declared Hermes
+bridge sidecar, which is meant to hold `bridge-password`. The bridge the operator renders
+under `next` gets the same key as a `secretKeyRef` the operator writes itself.
 
 Read on the right terms, which are narrower than the mechanism suggests: KSA tokens are
 pod-scoped and the callout cannot see which container presented one, so this is a guard

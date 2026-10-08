@@ -77,9 +77,10 @@ readonly AGENT_DIAG_LOG_TAIL_LINES=20000
 readonly AGENT_DIAG_LOG_MAX_BYTES=$((8 * 1024 * 1024))
 # Events are one line each; the namespace's whole retained window fits.
 readonly AGENT_DIAG_EVENTS_TAIL_LINES=5000
-# The agent's own container, and the bridge sidecar hack/ci-deploy.sh declares
-# under EVAL_MODE_NEXT=1 (its BRIDGE_SIDECAR_NAME). Named apart from that
-# constant because ci-deploy.sh sources this file and both are readonly.
+# The agent's own container, and the bridge sidecar the operator renders
+# beside it under EVAL_MODE_NEXT=1 (hack/ci-deploy.sh's BRIDGE_SIDECAR_NAME).
+# Named apart from that constant because ci-deploy.sh sources this file and
+# both are readonly.
 readonly AGENT_DIAG_AGENT_CONTAINER="platform-agent"
 readonly AGENT_DIAG_BRIDGE_CONTAINER="hermes-bridge"
 readonly AGENT_DIAG_DEPLOYMENT="deployment/platform-agent-gateway"

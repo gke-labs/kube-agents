@@ -15,6 +15,7 @@ import copy
 import fnmatch
 import importlib.util
 import io
+import argparse
 import json
 import fcntl
 import os
@@ -202,6 +203,7 @@ NUMBER_WORDS = {
             "twenty-one",
             "twenty-two",
             "twenty-three",
+            "twenty-four",
         )
     )
 }
@@ -11042,7 +11044,7 @@ class TestRemediationBaseBranch(HarnessTestCase):
         self.patch_attr("content_mode", lambda: True)
         self.patch_attr(
             "_land_group_via_broker",
-            lambda *args: landed.append(args) or audit_report._GroupPush("main", False),
+            lambda *args, **kwargs: landed.append(args) or audit_report._GroupPush("main", False),
         )
         with contextlib.redirect_stderr(io.StringIO()) as err:
             audit_report.open_remediation_pr(
@@ -11764,6 +11766,20 @@ class TestRemediateSubcommand(HarnessTestCase):
         # Resolving the ledger number is a gh call, which a dry run may not
         # make — so it says why the link is missing instead of just omitting it.
         self.assertIn("the 'Part of #N' link is omitted", self.err)
+
+    def test_dry_run_resolves_the_repository_and_noun_once_for_all_groups(self):
+        # Review (#2549): each group re-read the repository and the noun.
+        calls = []
+        real = audit_report._proposal_noun
+        self.patch_attr("_proposal_noun", lambda repo: calls.append(repo) or real(repo))
+        doc = make_doc(findings=[
+            make_finding(fid="a", remediation={"kind": "manifest", "path": "a.yaml", "note": "x"}),
+            make_finding(fid="b", remediation={"kind": "manifest", "path": "b.yaml", "note": "y"}),
+        ])
+        rc = self.run_remediate(doc, [derived_id(fid="a"), derived_id(fid="b")], ["--dry-run"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(2, self.err.count("WOULD OPEN:"), self.err)
+        self.assertEqual(1, len(calls), calls)
 
     def test_dry_run_links_the_ledger_when_it_is_named(self):
         self.run_remediate(make_doc(), [derived_id()], ["--dry-run", "--issue", "42"])
@@ -14141,6 +14157,465 @@ class TestRemediationOutcomes(unittest.TestCase):
         self.assertIn("no pull request was opened", out["a"])
 
 
+class TestTheForgesNoun(unittest.TestCase):
+    """A GitLab repository's ledger speaks of merge requests, GitHub's of pull requests."""
+
+    def test_the_outcomes_and_the_acknowledgement_use_the_forges_noun(self):
+        plan = audit_report.PromotionPlan([], [], [])
+        requests = audit_report.RemediateRequests(["a", "b"], [], {})
+        out = audit_report._remediation_outcomes(
+            requests, plan, {"a": {"url": "https://gitlab.com/acme/infra/-/merge_requests/4"}}, [], "merge request"
+        )
+        self.assertEqual("merge request refreshed — https://gitlab.com/acme/infra/-/merge_requests/4", out["a"])
+        self.assertIn("no merge request was opened", out["b"])
+        self.assertNotIn("pull request", " ".join(out.values()))
+        ack = audit_report.render_ack_comment(
+            "IC_1", ["a", "c"], out, audit_report.datetime(2026, 10, 6, tzinfo=audit_report.timezone.utc), "merge request"
+        )
+        self.assertIn("`c` — no merge request was opened", ack)
+
+    def test_the_ledger_header_uses_it_and_github_is_unchanged(self):
+        self.assertEqual(audit_report._render_header("compliance-audit"), audit_report._render_header("compliance-audit", "pull request"))
+        header = "\n".join(audit_report._render_header("compliance-audit", "merge request"))
+        self.assertIn("separate remediation merge requests", header)
+        self.assertIn("can become a merge request.", header)
+        # The whole header, not the part before `/remediate`: the agent-facing
+        # paragraph after it said "pull requests" on GitLab (live, ka-gitlab-g4).
+        self.assertNotIn("pull request", header)
+
+    def test_the_noun_is_read_from_the_registered_entry(self):
+        entries = [{"type": "gitlab", "url": "https://gitlab.example.com/acme/platform/infra"}]
+        with patch("gitops_workspace.get_managed_repo_entries", return_value=entries):
+            self.assertEqual("merge request", audit_report._proposal_noun("gitlab.example.com/acme/platform/infra"))
+            self.assertEqual("pull request", audit_report._proposal_noun("acme/fleet"))
+        self.assertEqual("pull request", audit_report._proposal_noun(None))
+
+
+class TestNoPullRequestOnGitLab(unittest.TestCase):
+    """Everything the audit writes on a GitLab repository says "merge request".
+
+    Live on a GitLab install the ledger said "pull request" in a paragraph the
+    per-section tests did not reach. So this renders a full ledger, with every
+    section a real run can write, and every comment and reply the audit posts,
+    and reads all of it for the GitHub word. Then the same renders, for GitHub,
+    against `testdata/github_texts.golden.json`: what the code before the noun
+    was threaded through wrote, with the noun left out and with it named.
+    """
+
+    WORD = re.compile(r"pull[ -]request", re.IGNORECASE)
+
+    def held_entry(self, index):
+        return {
+            "id": derived_id(fid=f"held-{index}"),
+            "title": f"Held finding {index}",
+            "check": "netpol-missing",
+            "cluster": "prod-us-east",
+            "namespace": "payments",
+            "object": f"Namespace/held-{index}",
+            "commands": ["kubectl get networkpolicy -A -o json"],
+        }
+
+    def texts(self, noun=None):
+        # `noun` only when named, so the same renders run on code that predates
+        # the parameter: that is how the GitHub golden below was made.
+        kw = {} if noun is None else {"noun": noun}
+        findings = [
+            manifest_finding("crit-open", "a.yaml"),
+            manifest_finding("crit-pr", "b.yaml"),
+            manifest_finding("crit-persists", "c.yaml"),
+            manifest_finding("crit-withdrawn", "d.yaml"),
+            manifest_finding("crit-refused", "e.yaml"),
+            manifest_finding("crit-withheld", "f.yaml"),
+            make_finding(fid="major-g", severity="major", remediation={"kind": "gcloud", "note": "g"}),
+            make_finding(fid="minor-m", severity="minor"),
+        ]
+        url = "https://forge.example/acme/infra/-/merge_requests/"
+        states = {
+            "crit-open": audit_report.STATE_OPEN,
+            "crit-pr": audit_report.STATE_PR_OPEN,
+            "crit-persists": audit_report.STATE_PR_MERGED_PERSISTS,
+            "crit-withdrawn": audit_report.STATE_WITHDRAWN,
+            "crit-refused": audit_report.STATE_REFUSED,
+        }
+        pr_urls = {fid: f"{url}{i}" for i, fid in enumerate(states, 1)}
+        gaps = ["prod-us-east: netpol-missing did not run"]
+        doc = make_doc(findings=findings)
+        body = audit_report.render_issue_body(
+            doc,
+            generated_at=NOW,
+            audit_id=AUDIT,
+            states=states,
+            pr_urls=pr_urls,
+            withheld=["crit-withheld"],
+            gaps=gaps,
+            uncorroborated=["crit-open"],
+            needs_triage=["major-g"],
+            held=[self.held_entry(i) for i in range(3)],
+            held_overflow=2,
+            held_carried=True,
+            new_ids={"crit-open"},
+            **kw,
+        ).body
+        out = [body]
+        out.append(
+            audit_report.render_delta_comment(
+                AUDIT, ["crit-open"], ["gone-1"], findings, {"gone-1": "Gone"}, NOW, gaps=gaps, **kw
+            )
+        )
+        empty = make_doc(findings=[])
+        for clean_gaps in ([], gaps, [audit_report.LOST_MEMORY_GAP]):
+            out.append(audit_report.render_clean_comment(AUDIT, empty, NOW, gaps=clean_gaps, **kw))
+        out.append(
+            audit_report.render_held_comment(
+                AUDIT, empty, [self.held_entry(9)], NOW, collector=[], carried=[], **kw
+            )
+        )
+        out.append(
+            audit_report.render_remediation_pr_body(
+                AUDIT, findings[:2], issue_number=7, generated_at=NOW, **kw
+            )
+        )
+        out.append(audit_report.render_stale_close_comment(AUDIT, findings[:1], NOW, pr_number=3, **kw))
+        out.append(
+            audit_report.render_stale_close_comment(
+                AUDIT,
+                findings[:1],
+                NOW,
+                pr_number=3,
+                reason=audit_report.SHARED_ACCOUNT_STALE_REASON.format(noun=noun or "pull request"),
+                **kw,
+            )
+        )
+        out.append(audit_report.render_persists_comment(AUDIT, findings[2], NOW, **kw))
+        request = {"author": "operator", "targets": ["crit-open"], "comment_id": "IC_9"}
+        for mode in ({}, {"held": True}, {"lost_memory": True, "partial": True}):
+            out.append(
+                audit_report.render_clean_remediate_answer(
+                    AUDIT, request, NOW, closing=False, **kw, **mode
+                )
+            )
+        comments = [
+            {"id": "IC_1", "body": "/remediate crit-open", "authorAssociation": "NONE", "author": {"login": "stranger"}},
+            {"id": "IC_2", "body": "/remediate major-g", "authorAssociation": "MEMBER", "author": {"login": "operator"}},
+        ]
+        requests = audit_report.parse_remediate_commands(comments, findings, **kw)
+        out += [audit_report.render_refusal_comment(r, NOW) for r in requests.refusals]
+        out += [
+            audit_report.collector_hold_reason("x", **kw),
+            audit_report.collector_candidate_reason("x", **kw),
+            audit_report.declared_reason("x", {"path": "intent.yaml"}, **kw),
+        ]
+        plan = audit_report.PromotionPlan([], [], [])
+        outcomes = audit_report._remediation_outcomes(
+            audit_report.RemediateRequests(["crit-open"], [], {}), plan, {}, [], **kw
+        )
+        out.append(audit_report.render_ack_comment("IC_2", ["crit-open"], outcomes, NOW, **kw))
+        with tempfile.TemporaryDirectory() as root:
+            out.append(str(audit_report.remediation_file_problem(findings[0], Path(root), **kw)))
+        return [text for text in out if text]
+
+    def test_github_writes_exactly_what_it_wrote_before_the_noun(self):
+        # Review: the docstring claimed this and no method checked it. The
+        # golden was rendered by this class's `texts()` on the code before the
+        # noun parameter existed, so it is the GitHub text as shipped.
+        golden = json.loads((Path(__file__).parent / "testdata" / "github_texts.golden.json").read_text())
+        self.assertEqual(golden, self.texts())
+        self.assertEqual(golden, self.texts("pull request"))
+
+    def test_nothing_the_audit_writes_on_gitlab_says_pull_request(self):
+        texts = self.texts("merge request")
+        self.assertGreater(len(texts), 15)
+        for text in texts:
+            found = self.WORD.search(text)
+            self.assertIsNone(found, f"...{text[max(found.start() - 120, 0):found.end() + 40]}..." if found else "")
+        self.assertIn("merge request", "\n".join(texts))
+
+
+class TestRefreshOnAnotherForge(unittest.TestCase):
+    """Only GitHub's per-repository credential is refreshed; the refresh takes a bare slug."""
+
+    def refreshed(self, repo):
+        calls = []
+        module = type(sys)("github_token_refresh")
+        module.refresh_git_credentials = lambda r=None: calls.append(r)
+        with patch.dict(sys.modules, {"github_token_refresh": module}), \
+                patch.object(audit_report, "proxy_endpoint", lambda: ""):
+            audit_report.refresh_credentials(repo)
+        return calls
+
+    def test_the_labels_the_audit_ensures_on_gitlab_say_merge_request(self):
+        # Review round 3: `ensure_labels` posts its descriptions on every run and
+        # `audit:remediation` still said "Pull request"; `texts()` never saw it.
+        entries = [{"type": "gitlab", "url": "https://gitlab.com/acme/infra"}]
+        posted = []
+        with patch("gitops_workspace.get_managed_repo_entries", return_value=entries), \
+                patch.object(audit_report, "try_forge", side_effect=lambda verb, repo, payload: posted.append(payload)):
+            audit_report.ensure_labels("gitlab.com/acme/infra", "compliance-audit")
+        text = "\n".join(p["description"] for p in posted)
+        self.assertNotIn("pull request", text.lower())
+        self.assertIn("Merge request proposing a fix", text)
+        posted.clear()
+        with patch.object(audit_report, "try_forge", side_effect=lambda verb, repo, payload: posted.append(payload)):
+            audit_report.ensure_labels("acme/fleet", "compliance-audit")
+        self.assertIn("Pull request proposing a fix for one group of audit findings", [p["description"] for p in posted])
+
+    def test_a_gitlab_repository_is_not_sent_to_the_github_refresh(self):
+        self.assertEqual([], self.refreshed("gitlab.com/acme/platform/infra"))
+
+    def test_github_with_its_host_is_refreshed_as_the_slug(self):
+        self.assertEqual(["acme/fleet"], self.refreshed("github.com/acme/fleet"))
+        self.assertEqual(["acme/fleet"], self.refreshed("acme/fleet"))
+
+
+class TestRunRecordAcrossSpellings(BaseTestCase):
+    """Review: `start` records the lifted `github.com/owner/name` on an install
+    with a second forge, and a dry run's bare `--repo owner/name` read no record."""
+
+    def test_the_bare_and_the_host_qualified_github_name_read_one_record(self):
+        self.record_run(repo="github.com/acme/fleet")
+        self.assertIsNotNone(audit_report.read_run_record(DECLARING_AUDIT, "acme/fleet"))
+        self.assertIsNotNone(audit_report.read_run_record(DECLARING_AUDIT, "GitHub.com/Acme/Fleet"))
+        # Still one repository's record, not anyone's.
+        self.assertIsNone(audit_report.read_run_record(DECLARING_AUDIT, "acme/other"))
+        self.assertIsNone(audit_report.read_run_record(DECLARING_AUDIT, "gitlab.com/acme/fleet"))
+
+    def test_has_run_record_reads_the_two_github_spellings_as_one(self):
+        # #2300's `has_run_record` compared the raw strings, so a dry run's
+        # bare `--repo` read no record after `start` recorded the lifted name.
+        self.record_run(repo="github.com/acme/fleet")
+        self.assertTrue(audit_report.has_run_record(DECLARING_AUDIT, "acme/fleet"))
+        self.assertTrue(audit_report.has_run_record(DECLARING_AUDIT, "GitHub.com/Acme/Fleet"))
+        self.assertFalse(audit_report.has_run_record(DECLARING_AUDIT, "gitlab.com/acme/fleet"))
+
+
+class TestTheNounIsResolvedOncePerFinish(HarnessTestCase):
+    """Review round 3: `_finish` bound the noun and then looked it up again at
+    every posting site -- each a managed-list read on GitLab that falls back to
+    "pull request" on failure, so one transient read could split the wording."""
+
+    def test_finish_resolves_the_noun_once(self):
+        calls = []
+        real = audit_report._proposal_noun
+
+        def counting(repo):
+            calls.append(repo)
+            return real(repo)
+
+        self.patch_attr("_proposal_noun", counting)
+        self.run_finish(make_doc(findings=[manifest_finding("crit-open", "a.yaml")]))
+        self.assertEqual(1, len(calls), calls)
+
+
+class TestDryRunNounWithoutRepo(unittest.TestCase):
+    """Review round 3: a dry run with no `--repo` previewed GitHub's noun for a
+    GitLab repository it resolved anyway."""
+
+    def test_the_dry_run_takes_the_noun_from_the_repository_it_resolves(self):
+        entries = [{"type": "gitlab", "url": "https://gitlab.com/acme/infra"}]
+        with patch.object(audit_report, "resolve_repo", return_value="gitlab.com/acme/infra"), \
+                patch("gitops_workspace.get_managed_repo_entries", return_value=entries):
+            self.assertEqual("gitlab.com/acme/infra", audit_report._dry_run_repo("compliance-audit", None))
+            self.assertEqual("merge request", audit_report._proposal_noun(audit_report._dry_run_repo("compliance-audit", None)))
+        with patch.object(audit_report, "resolve_repo", side_effect=ValueError("no repo")):
+            self.assertIsNone(audit_report._dry_run_repo("compliance-audit", None))
+        self.assertEqual("acme/fleet", audit_report._dry_run_repo("compliance-audit", "acme/fleet"))
+
+
+class TestDeclarationsAcrossSpellings(BaseTestCase):
+    """Review round 3: `read_declarations` made the raw comparison `read_run_record`
+    no longer makes, so a bare dry run applied none of the declarations."""
+
+    def test_the_bare_and_the_host_qualified_github_name_read_one_file(self):
+        Path(audit_report.declarations_path_for(DECLARING_AUDIT)).parent.mkdir(parents=True, exist_ok=True)
+        audit_report.write_declarations(DECLARING_AUDIT, "github.com/acme/fleet", [{"id": "d1"}])
+        self.assertEqual([{"id": "d1"}], audit_report.read_declarations(DECLARING_AUDIT, "acme/fleet"))
+        self.assertEqual([], audit_report.read_declarations(DECLARING_AUDIT, "acme/other"))
+        self.assertEqual([], audit_report.read_declarations(DECLARING_AUDIT, "gitlab.com/acme/fleet"))
+
+
+class TestContentWorkspaceReachesEveryForge(unittest.TestCase):
+    """Content mode's file workspace clones a repository from its own forge."""
+
+    def setUp(self):
+        audit_report.set_content_mode(True)
+        self.addCleanup(audit_report.set_content_mode, False)
+
+    def test_the_declared_intent_search_clones_a_repository_on_another_forge(self):
+        with tempfile.TemporaryDirectory() as tmp, \
+                patch.object(audit_report, "SCRATCH_DIR", Path(tmp)), \
+                patch.object(audit_report, "_clone_for_search", return_value=None) as clone, \
+                contextlib.redirect_stderr(io.StringIO()):
+            audit_report.discover_declarations(DECLARING_AUDIT, "gitlab.com/acme/infra", Path(tmp), [])
+        clone.assert_called_once()
+        self.assertEqual("gitlab.com/acme/infra", clone.call_args.args[0])
+
+    def test_the_withheld_postures_gap_names_the_repositories_plainly(self):
+        gap = audit_report._declared_intent_gap({
+            audit_report.POSTURES_WITHHELD_KEY: {
+                "findings": [], "run_record": True,
+                "unsearched": ["gitlab.com/acme/infra", "acme/fleet"],
+            }
+        })
+        self.assertIn("repositories not searched: gitlab.com/acme/infra, acme/fleet", gap)
+
+    def test_a_remediation_opens_the_workspace_with_the_name_its_forge_resolves(self):
+        opened = []
+        client = type(sys)("credential_proxy_client")
+
+        class Workspace:
+            @staticmethod
+            def open(endpoint, repo, branch=None):
+                opened.append(repo)
+                raise RuntimeError("stop after the open")
+
+        client.Workspace = Workspace
+        for repo, expected in (("gitlab.com/acme/infra", "gitlab.com/acme/infra"), ("github.com/acme/fleet", "acme/fleet")):
+            with self.subTest(repo=repo), patch.dict(sys.modules, {"credential_proxy_client": client}), \
+                    patch.object(audit_report, "proxy_endpoint", return_value="http://broker"), \
+                    patch.object(audit_report, "_proposal_noun", lambda repo: "merge request"):
+                with self.assertRaises(RuntimeError):
+                    audit_report._land_group_via_broker(
+                        repo, "compliance-audit", [], "audit/x", ["a.yaml"], {"a.yaml": b""}
+                    )
+        self.assertEqual(["gitlab.com/acme/infra", "acme/fleet"], opened)
+
+    def test_content_mode_refuses_only_a_host_no_managed_entry_names(self):
+        managed = ["github.com/acme/fleet", "gitlab.com/acme/infra"]
+        with patch("gitops_workspace.get_managed_repos", return_value=managed):
+            self.assertEqual("", audit_report.remediation_refusal("gitlab.com/acme/infra"))
+            self.assertEqual("", audit_report.remediation_refusal("acme/fleet"))
+            refusal = audit_report.remediation_refusal("gitlab.example.com/acme/infra")
+        self.assertIn("not a forge this install serves", refusal)
+        self.assertIn("a retry will not change this", refusal)
+
+
+class TestWorkspaceGetsGitHubsBareSlug(unittest.TestCase):
+    """Review: an install with a second forge spells GitHub's repositories
+    `github.com/owner/name`, and the workspace refused that spelling."""
+
+    def test_the_door_puts_github_back_to_the_slug(self):
+        self.assertEqual("acme/fleet", audit_report.content_workspace_repo("github.com/acme/fleet"))
+        self.assertEqual("acme/fleet", audit_report.content_workspace_repo("acme/fleet"))
+        self.assertEqual("gitlab.com/a/b", audit_report.content_workspace_repo("gitlab.com/a/b"))
+
+    def test_a_remediation_opens_the_workspace_with_the_slug(self):
+        client = type(sys)("credential_proxy_client")
+        opened = []
+
+        class Workspace:
+            @staticmethod
+            def open(endpoint, repo, **kwargs):
+                opened.append(repo)
+                raise RuntimeError("stop here")
+
+        client.Workspace = Workspace
+        with patch.dict(sys.modules, {"credential_proxy_client": client}), \
+                patch.object(audit_report, "proxy_endpoint", lambda: "http://proxy"):
+            with self.assertRaises(RuntimeError):
+                audit_report._land_group_via_broker(
+                    "github.com/acme/fleet", "compliance-audit", [], "audit/x", ["a.yaml"], {"a.yaml": b""}
+                )
+        self.assertEqual(["acme/fleet"], opened)
+
+
+class TestRemediateReplyNamesTheRefusal(unittest.TestCase):
+    """Review: the reply promised a retry that could not succeed."""
+
+    def test_a_repository_no_proposal_can_reach_says_why(self):
+        requests = type("R", (), {"targets": ["f1"]})()
+        plan = type("P", (), {"already_open": set(), "superseded": set()})()
+        refusal = audit_report.remediation_refusal("gitlab.com/acme/infra")
+        self.assertIn("directory mode", refusal)
+        outcomes = audit_report._remediation_outcomes(requests, plan, {}, [], "merge request", refusal)
+        self.assertIn("a retry will not change this", outcomes["f1"])
+        self.assertNotIn("will retry", outcomes["f1"])
+        self.assertEqual("", audit_report.remediation_refusal("github.com/acme/fleet"))
+        self.assertEqual("", audit_report.remediation_refusal("acme/fleet"))
+
+
+class TestRemediateRefusesWhereNoProposalCanLand(unittest.TestCase):
+    """Review round 4: `remediate --finding` on a repository on another forge
+    printed `status: REMEDIATED` with nothing opened and no reason."""
+
+    def test_the_command_refuses_with_the_reason_before_it_plans(self):
+        for dry_run in (False, True):
+            with self.subTest(dry_run=dry_run):
+                args = argparse.Namespace(
+                    audit="compliance-audit", findings_file="f.json", repo="gitlab.com/acme/infra",
+                    finding=["f1"], dry_run=dry_run, manifest_file=None, issue=None,
+                )
+                with patch.object(audit_report, "load_findings", return_value={"findings": []}), \
+                        patch.object(audit_report, "resolve_repo", return_value="gitlab.com/acme/infra"), \
+                        patch.object(audit_report, "read_run_record",
+                                     side_effect=AssertionError("planned past the refusal")):
+                    with self.assertRaises(audit_report.ValidationError) as caught:
+                        audit_report.handle_remediate(args)
+                self.assertIn("directory mode", str(caught.exception))
+
+    def test_in_content_mode_a_gitlab_repository_goes_on_to_plan(self):
+        # The content workspace clones from the repository's own forge, so the
+        # refusal is directory mode's alone: here `remediate` reaches planning.
+        audit_report.set_content_mode(True)
+        self.addCleanup(audit_report.set_content_mode, False)
+        args = argparse.Namespace(
+            audit="compliance-audit", findings_file="f.json", repo="gitlab.com/acme/infra",
+            finding=["f1"], dry_run=False, manifest_file=None, issue=None,
+        )
+        reached = RuntimeError("reached planning")
+        with patch.object(audit_report, "load_findings", return_value={"findings": []}), \
+                patch.object(audit_report, "resolve_repo", return_value="gitlab.com/acme/infra"), \
+                patch.object(audit_report, "read_run_record", side_effect=reached):
+            with self.assertRaises(RuntimeError) as caught:
+                audit_report.handle_remediate(args)
+        self.assertIs(reached, caught.exception)
+
+    def test_a_dry_run_without_repo_refuses_what_it_resolves(self):
+        # Review round 5: with no `--repo` the dry run resolved the repository
+        # for its body but not for the refusal, and previewed a merge request.
+        args = argparse.Namespace(
+            audit="compliance-audit", findings_file="f.json", repo=None,
+            finding=["f1"], dry_run=True, manifest_file=None, issue=None,
+        )
+        with patch.object(audit_report, "load_findings", return_value={"findings": []}), \
+                patch.object(audit_report, "resolve_repo", return_value="gitlab.com/acme/infra"), \
+                patch.object(audit_report, "read_run_record",
+                             side_effect=AssertionError("planned past the refusal")):
+            with self.assertRaises(audit_report.ValidationError) as caught:
+                audit_report.handle_remediate(args)
+        self.assertIn("directory mode", str(caught.exception))
+
+
+class TestLedgerStoreForNestedPaths(unittest.TestCase):
+    def setUp(self):
+        # Only the path is computed; nothing is created under it.
+        self.root = "/reports"
+        patcher = patch.dict(os.environ, {"FLEET_AUDIT_REPORTS_DIR": self.root})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_a_nested_gitlab_path_is_that_many_directories_down(self):
+        self.assertEqual(
+            Path(self.root, "compliance-audit", "gitlab.com", "acme%2Fplatform%2Finfra"),
+            audit_report.reports_dir_for("compliance-audit", "gitlab.com/Acme/platform/infra"),
+        )
+
+    def test_github_named_with_its_host_keeps_the_bare_slugs_ledger(self):
+        self.assertEqual(
+            audit_report.reports_dir_for("compliance-audit", "acme/fleet"),
+            audit_report.reports_dir_for("compliance-audit", "github.com/Acme/fleet"),
+        )
+
+    def test_a_deep_path_without_a_host_or_with_a_climb_is_refused(self):
+        for repo in ("acme/platform/infra", "gitlab.com/acme/../infra", "gitlab.com/acme"):
+            with self.subTest(repo=repo):
+                if repo == "gitlab.com/acme":
+                    # Two segments read as owner/name, as before.
+                    audit_report.reports_dir_for("compliance-audit", repo)
+                    continue
+                with self.assertRaises(ValueError):
+                    audit_report.reports_dir_for("compliance-audit", repo)
+
+
 # --------------------------------------------------------------------------- #
 # Body budget bookkeeping
 # --------------------------------------------------------------------------- #
@@ -14276,31 +14751,31 @@ class TestRepoResolution(BaseTestCase):
     def test_it_falls_back_to_the_git_remote(self):
         module = type(sys)("github_token_refresh")
         module.get_current_git_repo = lambda: "acme/from-remote"
-        with patch("gitops_workspace.get_managed_github_repos", return_value=[]), patch.dict(sys.modules, {"github_token_refresh": module}):
+        with patch("gitops_workspace.get_managed_repos", return_value=[]), patch.dict(sys.modules, {"github_token_refresh": module}):
             self.assertEqual(audit_report.resolve_repo(), "acme/from-remote")
 
     def test_all_sources_failing_names_sources(self):
         module = type(sys)("github_token_refresh")
         module.get_current_git_repo = lambda: None
-        with patch("gitops_workspace.get_managed_github_repos", return_value=[]), patch.dict(sys.modules, {"github_token_refresh": module}):
+        with patch("gitops_workspace.get_managed_repos", return_value=[]), patch.dict(sys.modules, {"github_token_refresh": module}):
             with self.assertRaises(RuntimeError) as caught:
                 audit_report.resolve_repo()
         self.assertIn("ConfigMap", str(caught.exception))
         self.assertIn("origin remote", str(caught.exception))
 
     def test_explicit_repo_in_managed_repos_succeeds(self):
-        with patch("gitops_workspace.get_managed_github_repos", return_value=["acme/first", "acme/second"]):
+        with patch("gitops_workspace.get_managed_repos", return_value=["acme/first", "acme/second"]):
             self.assertEqual(audit_report.resolve_repo(repo="acme/first"), "acme/first")
 
     def test_explicit_repo_not_in_managed_repos_raises(self):
-        with patch("gitops_workspace.get_managed_github_repos", return_value=["acme/first", "acme/second"]):
+        with patch("gitops_workspace.get_managed_repos", return_value=["acme/first", "acme/second"]):
             with self.assertRaises(ValueError) as caught:
                 audit_report.resolve_repo(repo="acme/unregistered")
             self.assertIn("not in the managed repositories list", str(caught.exception))
 
-    def test_explicit_repo_raises_when_get_managed_github_repos_fails(self):
+    def test_explicit_repo_raises_when_get_managed_repos_fails(self):
         with patch(
-            "gitops_workspace.get_managed_github_repos",
+            "gitops_workspace.get_managed_repos",
             side_effect=RuntimeError("kubectl failed: Forbidden"),
         ):
             with self.assertRaises(RuntimeError) as caught:
@@ -14793,7 +15268,7 @@ class ContentModeTestCase(BaseTestCase):
         )
         managed = patch.object(
             gitops_workspace,
-            "get_managed_github_repos",
+            "get_managed_repos",
             return_value=["acme/fleet"],
         )
         managed.start()
@@ -17239,6 +17714,17 @@ class TestUnwrittenSweepFixes(HarnessTestCase):
         # Only the URL: the SKILL and SOP say so, and a bare `#41` could as well
         # be an issue.
         self.assertFalse(audit_report.decline_names_a_pull_request("#41 already adds this budget"))
+        # GitLab's proposal URL counts the same way.
+        self.assertTrue(audit_report.decline_names_a_pull_request(
+            "carried by https://gitlab.com/acme/platform/fleet/-/merge_requests/12"
+        ))
+        self.assertFalse(audit_report.decline_names_a_pull_request(
+            "see https://gitlab.com/acme/fleet/-/work_items/12"
+        ))
+        # Review (#2549): GitLab still answers the legacy form without `/-/`.
+        self.assertTrue(audit_report.decline_names_a_pull_request(
+            "carried by https://gitlab.com/acme/platform/fleet/merge_requests/12"
+        ))
 
     def test_the_name_search_reads_past_a_demoted_fixs_own_file(self):
         """The worker's budget is still in the declaration's file; it names
@@ -22543,6 +23029,17 @@ class TestReportStore(HarnessTestCase):
         self.assertEqual(memory["id_scheme"], audit_report.ID_SCHEME)
         runs = list((self.store_dir() / "runs").glob("*.json"))
         self.assertEqual([p.name for p in runs], ["20260801T093000.000000Z.json"])
+
+    def test_the_memory_carries_over_when_a_second_forge_puts_githubs_host_on_the_name(self):
+        # Review: the stored `acme/fleet` was compared to `github.com/acme/fleet`
+        # as a string, so the first run after a second forge lost its delta.
+        audit_report.write_report(AUDIT, self.envelope(), NOW)
+        memory = audit_report.read_report_memory(AUDIT, 42, "github.com/Acme/fleet")
+        self.assertIsNotNone(memory)
+        self.assertEqual(memory["ledger_body"], "body")
+        # And the other way: a memory written under the host-qualified name.
+        audit_report.write_report(AUDIT, self.envelope(repo="github.com/acme/fleet"), NOW.replace(minute=31))
+        self.assertEqual(audit_report.read_report_memory(AUDIT, 42, "acme/fleet")["ledger_body"], "body")
 
     def test_a_report_for_another_ledger_is_not_trusted(self):
         audit_report.write_report(AUDIT, self.envelope(), NOW)

@@ -498,10 +498,12 @@ class ResetStepTest(unittest.TestCase):
                 lifted_line(r"^LEDGER_RESET_MINT_RETRY_DELAY=\d+$"),
                 lifted_line(r"^AGENT_PULLS_RESET_PERMISSIONS=.*$"),
                 f'EVAL_LEDGER_APP_ID=4739812; EVAL_LEDGER_APP_KEY_FILE="{key_file}"',
+                'EVAL_FORGE="github"',  # the GitHub path, whatever the shell exports
                 f'EVAL_LEDGER_REPO="{repo}"; PROJECT_ID="{PROJECT}"; BUILD_ID={BUILD}',
                 f'SCRIPT_DIR="{self.dir}"; ARTIFACT_DIR="{self.dir}/artifacts"',
                 mint,
                 lifted("ledger_reset_token"),
+                lifted("forge_write_token"),
                 lifted("reset_agent_pulls"),
                 f'reset_agent_pulls "{label}"',
                 'echo "RC=$?"',
@@ -571,8 +573,9 @@ class CallSiteTest(unittest.TestCase):
         )
         self.assertIsNotNone(gate, "the gated call in run_one_unit")
         body = gate.group(1)
-        for lock in ("lock-stream-${audit_id}", "lock-infra", "lock-task-${name}"):
+        for lock in ("lock-infra", "lock-task-${name}"):
             self.assertIn(f'lock_release "${{STATE_DIR}}/{lock}"', body)
+        self.assertIn('release_streams "${streams}"', body)
         self.assertLess(unit.index('reset_audit_ledgers "${name} rep ${rep}"'), unit.index("reset_agent_pulls"), "after the ledger reset")
         self.assertLess(unit.index("reset_agent_pulls"), unit.index("uv run devops-bench"), "before devops-bench")
 

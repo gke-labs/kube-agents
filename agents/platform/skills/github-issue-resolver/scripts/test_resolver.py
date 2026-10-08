@@ -197,7 +197,7 @@ class ResolverTest(unittest.TestCase):
             stack.enter_context(mock.patch.object(vcs_client, "call", self.forge))
             if managed is None:
                 managed = mock.patch.object(
-                    resolver, "get_managed_github_repos", return_value=list(repos)
+                    resolver, "get_managed_repos", return_value=list(repos)
                 )
             stack.enter_context(managed)
             try:
@@ -217,30 +217,30 @@ class GetManagedReposTest(unittest.TestCase):
     def test_extracts_managed_repos_list(self):
         cm_json = json.dumps({"data": {"managed_repos": '[{"type": "github", "url": "https://github.com/gke-labs/kube-agents"}, {"type": "github", "url": "https://github.com/acme/toolkit"}]'}})
         with mock.patch("subprocess.run", return_value=subprocess.CompletedProcess([], 0, cm_json, "")):
-            self.assertEqual(resolver.get_managed_github_repos(), ["gke-labs/kube-agents", "acme/toolkit"])
+            self.assertEqual(resolver.get_managed_repos(), ["gke-labs/kube-agents", "acme/toolkit"])
 
     def test_empty_when_no_managed_repos(self):
         cm_json = json.dumps({"data": {"managed_repos": ""}})
         with mock.patch("subprocess.run", return_value=subprocess.CompletedProcess([], 0, cm_json, "")):
-            self.assertEqual(resolver.get_managed_github_repos(), [])
+            self.assertEqual(resolver.get_managed_repos(), [])
 
     def test_raises_when_kubectl_fails(self):
         with mock.patch("subprocess.run", side_effect=subprocess.CalledProcessError(1, ["kubectl"], stderr="Forbidden")):
             with self.assertRaises(RuntimeError) as ctx:
-                resolver.get_managed_github_repos()
+                resolver.get_managed_repos()
             self.assertIn("Failed to read ConfigMap", str(ctx.exception))
             self.assertIn("Forbidden", str(ctx.exception))
 
     def test_raises_when_kubectl_not_found(self):
         with mock.patch("subprocess.run", side_effect=FileNotFoundError("kubectl")):
             with self.assertRaises(RuntimeError) as ctx:
-                resolver.get_managed_github_repos()
+                resolver.get_managed_repos()
             self.assertIn("kubectl binary not found", str(ctx.exception))
 
     def test_raises_when_json_invalid(self):
         with mock.patch("subprocess.run", return_value=subprocess.CompletedProcess([], 0, "not-json", "")):
             with self.assertRaises(RuntimeError) as ctx:
-                resolver.get_managed_github_repos()
+                resolver.get_managed_repos()
             self.assertIn("Failed to parse ConfigMap", str(ctx.exception))
 
 
@@ -283,7 +283,7 @@ class SandboxForwardingTest(unittest.TestCase):
             # whatever the host happens to have mounted.
             stack.enter_context(
                 mock.patch.object(
-                    resolver, "get_managed_github_repos", return_value=["acme/toolkit"]
+                    resolver, "get_managed_repos", return_value=["acme/toolkit"]
                 )
             )
             try:
@@ -432,7 +432,7 @@ class SandboxForwardingTest(unittest.TestCase):
         """`> 0` is not the property the margin is for.
 
         The gate starts its clock at `subprocess.run`; this process then pays
-        its own `get_managed_github_repos()` before `sandbox_exec.run` is
+        its own `get_managed_repos()` before `sandbox_exec.run` is
         entered, and that read is bounded by `GITOPS_STATE_READ_TIMEOUT_SECONDS`
         rather than by anything here. A margin under that number inverts the
         order the margin exists to fix on exactly the tick it matters -- a slow
@@ -464,7 +464,7 @@ class SandboxForwardingTest(unittest.TestCase):
         self.assertEqual(ran.call_args.kwargs["timeout"], one)
         # Three repositories behind one hop is three repositories' worth of work.
         with mock.patch.object(
-            resolver, "get_managed_github_repos", return_value=["a/b", "c/d", "e/f"]
+            resolver, "get_managed_repos", return_value=["a/b", "c/d", "e/f"]
         ):
             self.assertEqual(
                 resolver._forward_timeout(["poll"]),
@@ -473,7 +473,7 @@ class SandboxForwardingTest(unittest.TestCase):
         # `claim` names one issue, so it gets the one-repository ceiling and
         # does not pay a ConfigMap read on the model's path to find that out.
         with mock.patch.object(
-            resolver, "get_managed_github_repos", side_effect=AssertionError("read anyway")
+            resolver, "get_managed_repos", side_effect=AssertionError("read anyway")
         ) as unread:
             self.assertEqual(resolver._forward_timeout(["claim", "--issue", "1"]), one)
         unread.assert_not_called()
@@ -486,7 +486,7 @@ class SandboxForwardingTest(unittest.TestCase):
         would put a ConfigMap read in front of every card the agent works.
         """
         with mock.patch.object(
-            resolver, "get_managed_github_repos", return_value=["a/b", "c/d", "e/f"]
+            resolver, "get_managed_repos", return_value=["a/b", "c/d", "e/f"]
         ) as looked_up:
             self.assertEqual(
                 resolver._forward_timeout(["claim", "--issue", "42"]),
@@ -503,7 +503,7 @@ class SandboxForwardingTest(unittest.TestCase):
 
     def test_an_unreadable_repository_list_does_not_stop_the_forward(self):
         with mock.patch.object(
-            resolver, "get_managed_github_repos", side_effect=RuntimeError("no kubectl")
+            resolver, "get_managed_repos", side_effect=RuntimeError("no kubectl")
         ):
             self.assertEqual(
                 resolver._forward_timeout(["poll"]),
@@ -588,7 +588,7 @@ class HandlePollTest(ResolverTest):
         payload, code = self.poll(
             managed=mock.patch.object(
                 resolver,
-                "get_managed_github_repos",
+                "get_managed_repos",
                 side_effect=RuntimeError("kubectl failed: Forbidden"),
             )
         )
@@ -621,6 +621,8 @@ class HandlePollTest(ResolverTest):
         # decides: lowest-numbered wins, regardless of listing order.
         self.assertEqual(payload["issue_number"], 7)
         self.assertEqual(payload["repository"], "acme/toolkit")
+        # The forge's own link, for the escalation message to use verbatim.
+        self.assertEqual(payload["issue_url"], "https://forge.invalid/issues/7")
         # The neutral comment shape carries `author` as a login, already
         # normalised by the provider -- not GitHub's `{"login": ...}` node.
         self.assertEqual(payload["comments"][0]["author"], "alice")
@@ -965,11 +967,30 @@ class ValidateRepoOrExitTest(ResolverTest):
         text = out.getvalue()
         return (json.loads(text) if text.strip() else None), code
 
+    def test_a_managed_nested_gitlab_project_passes(self):
+        payload, code = self._validate(
+            "gitlab.com/acme/platform/infra",
+            mock.patch.object(
+                resolver, "get_managed_repos", return_value=["gitlab.com/acme/platform/infra"]
+            ),
+        )
+        self.assertIsNone(code)
+        self.assertIsNone(payload)
+
+    def test_a_bare_name_is_lifted_on_an_install_with_a_second_forge(self):
+        # Review: a cron's `--repo acme/toolkit` was refused once the list
+        # spelt GitHub with its host, and the broker would have refused it too.
+        with mock.patch.object(
+            resolver, "get_managed_repos",
+            return_value=["github.com/acme/toolkit", "gitlab.com/acme/infra"],
+        ):
+            self.assertEqual("github.com/acme/toolkit", resolver._validate_repo_or_exit("acme/toolkit"))
+
     def test_valid_repo_in_managed_passes(self):
         payload, code = self._validate(
             "acme/toolkit",
             mock.patch.object(
-                resolver, "get_managed_github_repos", return_value=["acme/toolkit"]
+                resolver, "get_managed_repos", return_value=["acme/toolkit"]
             ),
         )
         self.assertIsNone(code)
@@ -985,7 +1006,7 @@ class ValidateRepoOrExitTest(ResolverTest):
             "acme/toolkit",
             mock.patch.object(
                 resolver,
-                "get_managed_github_repos",
+                "get_managed_repos",
                 side_effect=RuntimeError("kubectl failed: Forbidden"),
             ),
         )
@@ -997,7 +1018,7 @@ class ValidateRepoOrExitTest(ResolverTest):
         payload, code = self._validate(
             "other-org/other-repo",
             mock.patch.object(
-                resolver, "get_managed_github_repos", return_value=["acme/toolkit"]
+                resolver, "get_managed_repos", return_value=["acme/toolkit"]
             ),
         )
         self.assertEqual(code, 1)
@@ -1049,7 +1070,7 @@ class HandleClaimTest(ResolverTest):
         payload, code = self.claim(
             managed=mock.patch.object(
                 resolver,
-                "get_managed_github_repos",
+                "get_managed_repos",
                 side_effect=RuntimeError("kubectl failed: Forbidden"),
             )
         )
@@ -1190,7 +1211,7 @@ class HandleTransitionTest(ResolverTest):
             forge=forge,
             managed=mock.patch.object(
                 resolver,
-                "get_managed_github_repos",
+                "get_managed_repos",
                 side_effect=RuntimeError("kubectl failed: Forbidden"),
             ),
         )
@@ -1361,7 +1382,7 @@ class TestResolverSecurityAndPrioritization(unittest.TestCase):
         with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(io.StringIO()):
             with mock.patch.object(vcs_client, "call", forge):
                 with mock.patch.object(
-                    resolver, "get_managed_github_repos", return_value=["acme/toolkit"]
+                    resolver, "get_managed_repos", return_value=["acme/toolkit"]
                 ):
                     resolver.handle_poll(argparse.Namespace())
         payload = json.loads(buf.getvalue())
