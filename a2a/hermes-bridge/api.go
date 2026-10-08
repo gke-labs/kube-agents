@@ -515,6 +515,10 @@ func (b *Bridge) finalizeAPIError(run *taskRun, reqCtx context.Context, err erro
 		b.finalize(run, lib.StateCanceled, canceledBeforeStartReason, nil)
 	case run.canceled.Load():
 		b.finalize(run, lib.StateCanceled, "reason: canceled-by-request", nil)
+	case b.closing.Load() && errors.Is(err, errTurnNotSent):
+		// Found before the send, as cliTurn's pre-spawn gate finds it: the
+		// turn never left the bridge, so it is not named.
+		b.finalize(run, lib.StateFailed, shutdownReason, nil)
 	case b.closing.Load():
 		b.finalize(run, lib.StateFailed, shutdownReason+turnNote(turn), nil)
 	case errors.Is(err, errTurnNotSent):

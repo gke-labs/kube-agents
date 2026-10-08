@@ -1129,11 +1129,16 @@ func TestAPI_FollowUpTurnDoesNotSendAfterTheTaskStops(t *testing.T) {
 		ctx     context.Context
 		state   lib.TaskState
 		reason  string
+		exact   bool // the whole reason, not a prefix: no turn is named
 	}{
-		{"canceled", func(run *taskRun) { run.canceled.Store(true) }, context.Background(), lib.StateCanceled, "reason: canceled-by-request"},
-		{"deadline-fired", func(run *taskRun) { run.deadlineHit.Store(true) }, context.Background(), lib.StateFailed, "reason: deadline-exceeded"},
-		{"deadline-passed", func(*taskRun) {}, expired, lib.StateFailed, "reason: deadline-exceeded"},
-		{"finalized", func(run *taskRun) { b.finalize(run, lib.StateFailed, shutdownReason, nil) }, context.Background(), lib.StateFailed, shutdownReason},
+		{"canceled", func(run *taskRun) { run.canceled.Store(true) }, context.Background(), lib.StateCanceled, "reason: canceled-by-request", false},
+		{"deadline-fired", func(run *taskRun) { run.deadlineHit.Store(true) }, context.Background(), lib.StateFailed, "reason: deadline-exceeded", false},
+		{"deadline-passed", func(*taskRun) {}, expired, lib.StateFailed, "reason: deadline-exceeded", false},
+		{"finalized", func(run *taskRun) { b.finalize(run, lib.StateFailed, shutdownReason, nil) }, context.Background(), lib.StateFailed, shutdownReason, false},
+		// The bridge stopping before the send: the turn never left the
+		// bridge, so the terminal does not name it, as the CLI's pre-spawn
+		// gate does not.
+		{"closing", func(*taskRun) { b.closing.Store(true) }, context.Background(), lib.StateFailed, shutdownReason, true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1143,6 +1148,7 @@ func TestAPI_FollowUpTurnDoesNotSendAfterTheTaskStops(t *testing.T) {
 				t.Fatalf("nextSteer = %v, want the queued follow-up", got)
 			}
 			tc.prepare(run)
+			defer b.closing.Store(false)
 			if _, ok := b.apiTurn(run, tc.ctx, "a2a-ctx-"+taskID, "next", steer, 2); ok {
 				t.Fatal("a follow-up turn answered after the task stopped")
 			}
@@ -1157,7 +1163,8 @@ func TestAPI_FollowUpTurnDoesNotSendAfterTheTaskStops(t *testing.T) {
 				}
 			}
 			if final == nil || final.Status.State != tc.state || final.Status.Message == nil ||
-				!strings.HasPrefix(final.Status.Message.Parts[0].Text, tc.reason) {
+				!strings.HasPrefix(final.Status.Message.Parts[0].Text, tc.reason) ||
+				(tc.exact && final.Status.Message.Parts[0].Text != tc.reason) {
 				t.Fatalf("terminal %+v, want %s %q", final, tc.state, tc.reason)
 			}
 			ns := steerNotices(t, url, taskID)
