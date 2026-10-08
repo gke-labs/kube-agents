@@ -20,6 +20,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -95,8 +96,8 @@ const (
 
 	// a2aBridgeResourcesOperatorEnvVar overrides the rendered bridge's
 	// resources: a corev1.ResourceRequirements in JSON, used whole. Unset, or
-	// not one the operator can read, the bridge gets a2aRenderedBridgeResources'
-	// defaults.
+	// not one the operator can read, the bridge gets
+	// a2aRenderedBridgeDefaultResources.
 	a2aBridgeResourcesOperatorEnvVar = "A2A_BRIDGE_RESOURCES"
 
 	// a2aBridgeConcurrencyOperatorEnvVar sets the rendered bridge's
@@ -348,15 +349,18 @@ func buildA2ABridgeContainer(agent *agentv1alpha1.PlatformAgent, agentContainer 
 // a2aRenderedBridgeDefaultResources sizes the rendered bridge for the api
 // executor, the default: a Go relay to the agent container's API server, where
 // the turn itself runs. Measured idle at 1m CPU and 4-5Mi on three next
-// installs (gke-labs#2748); the request leaves headroom for concurrent relays,
-// and the limit is generous so a burst doesn't OOM it. The cli executor runs
+// installs (gke-labs#2748). The request is sized to be livable as a ceiling,
+// because GKE Autopilot without Pod bursting sets each limit to its request:
+// one answer at the bridge's 8 MiB response cap takes about 80MiB to read,
+// decode and publish, and three at once about 113MiB. The limit gives ten at
+// once room where bursting is on. The cli executor runs
 // a one-shot hermes chat per task (about 430Mi each, up to BRIDGE_CONCURRENCY
 // of them) and needs A2A_BRIDGE_RESOURCES set; it doesn't fit these.
 func a2aRenderedBridgeDefaultResources() corev1.ResourceRequirements {
 	return corev1.ResourceRequirements{
 		Requests: corev1.ResourceList{
-			corev1.ResourceCPU:    resource.MustParse("50m"),
-			corev1.ResourceMemory: resource.MustParse("64Mi"),
+			corev1.ResourceCPU:    resource.MustParse("100m"),
+			corev1.ResourceMemory: resource.MustParse("256Mi"),
 		},
 		Limits: corev1.ResourceList{
 			corev1.ResourceCPU:    resource.MustParse("1"),
@@ -366,8 +370,9 @@ func a2aRenderedBridgeDefaultResources() corev1.ResourceRequirements {
 }
 
 // a2aRenderedBridgeResources is the rendered bridge's resources: the
-// operator's A2A_BRIDGE_RESOURCES when it reads as a ResourceRequirements with
-// no request above its limit, else the defaults. A value it can't use is
+// operator's A2A_BRIDGE_RESOURCES when it reads as a ResourceRequirements (no
+// unknown fields, not empty) with no request above its limit, else the
+// defaults. A value it can't use is
 // logged once and ignored, like a refused A2A_BRIDGE_EXECUTOR. Unlike before
 // gke-labs#2748, the agent container's resources are not copied: that doubled
 // the agent pod's requests and left next pods unschedulable on clusters sized
@@ -377,15 +382,14 @@ func a2aRenderedBridgeResources() corev1.ResourceRequirements {
 	if raw == "" {
 		return a2aRenderedBridgeDefaultResources()
 	}
+	// Strict: a misspelled key that decoded to nothing would otherwise
+	// render the bridge with no resources at all, not the defaults.
 	var r corev1.ResourceRequirements
-	err := json.Unmarshal([]byte(raw), &r)
+	dec := json.NewDecoder(strings.NewReader(raw))
+	dec.DisallowUnknownFields()
+	err := dec.Decode(&r)
 	if err == nil {
-		for name, req := range r.Requests {
-			if lim, ok := r.Limits[name]; ok && req.Cmp(lim) > 0 {
-				err = fmt.Errorf("the %s request %s is above its limit %s", name, req.String(), lim.String())
-				break
-			}
-		}
+		err = a2aBridgeResourcesRefusal(r)
 	}
 	if err != nil {
 		if _, seen := a2aRefusedBridgeResources.LoadOrStore(raw, true); !seen {
@@ -396,6 +400,41 @@ func a2aRenderedBridgeResources() corev1.ResourceRequirements {
 		return a2aRenderedBridgeDefaultResources()
 	}
 	return r
+}
+
+// a2aBridgeResourcesRefusal says why the API server would refuse r on the
+// bridge container, or why it would leave the bridge unsized, or nil. The
+// rules are the credential proxy override's (ValidateCredentialProxyResources):
+// cpu, memory and ephemeral-storage only, no negative quantity, no zero limit,
+// no claims, and no request above its limit. A value the server refuses would
+// fail every agent Deployment update, so it is caught here and the defaults
+// stand instead.
+func a2aBridgeResourcesRefusal(r corev1.ResourceRequirements) error {
+	if len(r.Requests) == 0 && len(r.Limits) == 0 {
+		return fmt.Errorf("it sets neither requests nor limits")
+	}
+	if len(r.Claims) > 0 {
+		return fmt.Errorf("claims are not supported on the bridge")
+	}
+	for side, list := range map[string]corev1.ResourceList{"request": r.Requests, "limit": r.Limits} {
+		for name, q := range list {
+			if !slices.Contains(credentialProxyResourceNames, name) {
+				return fmt.Errorf("%s is not cpu, memory or ephemeral-storage", name)
+			}
+			if q.Sign() < 0 {
+				return fmt.Errorf("the %s %s %s is negative", name, side, q.String())
+			}
+			if side == "limit" && q.IsZero() {
+				return fmt.Errorf("the %s limit is zero", name)
+			}
+		}
+	}
+	for name, req := range r.Requests {
+		if lim, ok := r.Limits[name]; ok && req.Cmp(lim) > 0 {
+			return fmt.Errorf("the %s request %s is above its limit %s", name, req.String(), lim.String())
+		}
+	}
+	return nil
 }
 
 // a2aRefusedBridgeResources holds each refused A2A_BRIDGE_RESOURCES value

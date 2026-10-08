@@ -426,8 +426,8 @@ func TestARefusedExecutorSettingIsLoggedOnce(t *testing.T) {
 
 // The rendered bridge no longer copies the agent container's resources: that
 // doubled a next pod's requests and left it unschedulable on a cluster sized
-// for today (gke-labs#2748). With the defaults its requests are a small
-// fraction of the agent container's.
+// for today (gke-labs#2748). With the defaults its requests are an eighth of
+// the agent container's or less.
 func TestTheRenderedBridgeDoesNotDoubleThePodsRequests(t *testing.T) {
 	pod := bridgeTestPod(provisionedAgent())
 	b := containersNamed(pod, a2aBridgeContainerName)[0]
@@ -437,15 +437,12 @@ func TestTheRenderedBridgeDoesNotDoubleThePodsRequests(t *testing.T) {
 		if agent.IsZero() {
 			t.Fatalf("the agent container requests no %s; the comparison is vacuous", name)
 		}
-		if bridge.MilliValue()*10 > agent.MilliValue() {
-			t.Errorf("the bridge requests %s %s, more than a tenth of the agent container's %s", bridge.String(), name, agent.String())
+		if bridge.MilliValue()*8 > agent.MilliValue() {
+			t.Errorf("the bridge requests %s %s, more than an eighth of the agent container's %s", bridge.String(), name, agent.String())
 		}
 	}
-	for _, name := range []corev1.ResourceName{corev1.ResourceCPU, corev1.ResourceMemory} {
-		req, lim := b.Resources.Requests[name], b.Resources.Limits[name]
-		if lim.IsZero() || req.Cmp(lim) > 0 {
-			t.Errorf("the bridge's %s request %s and limit %s: want a limit at or above the request", name, req.String(), lim.String())
-		}
+	if err := a2aBridgeResourcesRefusal(a2aRenderedBridgeDefaultResources()); err != nil {
+		t.Errorf("the defaults fail the override's own check: %v", err)
 	}
 }
 
@@ -465,7 +462,9 @@ func TestTheBridgeResourcesSettingOverridesTheDefaults(t *testing.T) {
 		t.Error("the setting is used whole, but a default CPU limit was merged into it")
 	}
 
-	for _, bad := range []string{"lots", `{"requests":{"memory":"1Gi"},"limits":{"memory":"512Mi"}}`} {
+	for _, bad := range []string{"lots", `{"requests":{"memory":"1Gi"},"limits":{"memory":"512Mi"}}`, `{"cpu":"1"}`, `{"request":{"memory":"1Gi"}}`, `{}`,
+		`{"requests":{"cpu":"-1"}}`, `{"limits":{"foo":"1"}}`, `{"requests":{"example.com/gpu":"1"}}`,
+		`{"limits":{"memory":"0"}}`, `{"limits":{"memory":"1Gi"},"claims":[{"name":"x"}]}`} {
 		t.Run(bad, func(t *testing.T) {
 			t.Setenv(a2aBridgeResourcesOperatorEnvVar, bad)
 			got := containersNamed(bridgeTestPod(provisionedAgent()), a2aBridgeContainerName)[0].Resources

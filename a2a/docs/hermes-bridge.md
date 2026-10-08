@@ -55,16 +55,16 @@ of the same commit, so the two containers are one build. Otherwise - an agent im
 custom repository name, which has no bridge published beside it, or one pinned by digest
 alone, which the swap cannot carry over - it is the image the other release A2A images
 resolve to, derived from the operator image the way `A2A_GATEWAY_IMAGE` and the rest are
-when unset. An install that runs a custom agent image sets `A2A_BRIDGE_IMAGE`. Three
+when unset. An install that runs a custom agent image sets `A2A_BRIDGE_IMAGE`. Four
 operator settings shape the rendered bridge. The operator reads them from its own
 environment, as it reads `A2A_INJECT_BACKEND`; no CR field carries them.
 
-| Operator env             | What it sets                                                         | Unset                                                                                                                                                                     |
-| ------------------------ | -------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `A2A_BRIDGE_IMAGE`       | the bridge's image                                                   | derived as above                                                                                                                                                          |
-| `A2A_BRIDGE_CONCURRENCY` | the bridge's `BRIDGE_CONCURRENCY`                                    | 10, Hermes's own gateway pool (not the bridge's default of 2)                                                                                                             |
-| `A2A_BRIDGE_EXECUTOR`    | the bridge's `BRIDGE_EXECUTOR`                                       | not rendered, so the bridge's shipped default decides: `api`, given the key. A value other than exactly `api` or `cli` is treated as unset, and the operator logs it once |
-| `A2A_BRIDGE_RESOURCES`   | the bridge's resources, a `ResourceRequirements` in JSON, used whole | the `api`-sized defaults below. A value that isn't JSON, or has a request above its limit, is ignored and logged once                                                     |
+| Operator env             | What it sets                                                         | Unset                                                                                                                                                                                                                                                                                                                                       |
+| ------------------------ | -------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `A2A_BRIDGE_IMAGE`       | the bridge's image                                                   | derived as above                                                                                                                                                                                                                                                                                                                            |
+| `A2A_BRIDGE_CONCURRENCY` | the bridge's `BRIDGE_CONCURRENCY`                                    | 10, Hermes's own gateway pool (not the bridge's default of 2)                                                                                                                                                                                                                                                                               |
+| `A2A_BRIDGE_EXECUTOR`    | the bridge's `BRIDGE_EXECUTOR`                                       | not rendered, so the bridge's shipped default decides: `api`, given the key. A value other than exactly `api` or `cli` is treated as unset, and the operator logs it once                                                                                                                                                                   |
+| `A2A_BRIDGE_RESOURCES`   | the bridge's resources, a `ResourceRequirements` in JSON, used whole | the `api`-sized defaults below. A value that isn't a `ResourceRequirements` (not JSON, an unknown field, or neither requests nor limits), or that the API server would refuse (a resource other than cpu, memory or ephemeral-storage, a negative quantity, a zero limit, claims, or a request above its limit), is ignored and logged once |
 
 The TASKS consumer reserve reads the same `A2A_BRIDGE_CONCURRENCY` the bridge is given
 ([sizing](#sizing-against-the-eval-harness)), and the `api` executor's pod-wide hook is
@@ -97,8 +97,9 @@ mode and again when the bridge arrives after the Job. The agent Deployment's str
 agent outage: the old pod stops before the new one starts. Once `BusProvisioned` has been
 `True` the bridge stays in the pod on later renders.
 
-**It has its own resources, sized for the `api` executor.** The rendered bridge requests 50m
-CPU and 64Mi, with limits of 1 CPU and 512Mi. On `api`, the default, it's a Go relay that
+**It has its own resources, sized for the `api` executor.** The rendered bridge requests 100m
+CPU and 256Mi, with limits of 1 CPU and 512Mi. The request is sized to live under on its
+own, since GKE Autopilot without Pod bursting sets every limit to its request. On `api`, the default, it's a Go relay that
 holds one HTTP request per task to the agent container's API server, and the turn itself
 runs in the agent container. Measured idle it uses about 1m CPU and 5Mi
 ([#2748](https://github.com/gke-labs/kube-agents/issues/2748)). It used to copy the agent
@@ -179,7 +180,7 @@ it renders the bridge. `deploy/docker/cloudbuild-ci.yaml` builds the presubmit's
 `a2a-bridge` step when `hack/ci-deploy.sh` runs under `EVAL_MODE_NEXT=1`, `FROM` the
 platform-agent image that same build produced, by the tag it just pushed and never from a
 registry default; the deploy then hands it to the operator as `A2A_BRIDGE_IMAGE`, with
-`A2A_BRIDGE_CONCURRENCY` and `A2A_BRIDGE_EXECUTOR=cli`, for the eval install
+`A2A_BRIDGE_CONCURRENCY`, `A2A_BRIDGE_EXECUTOR=cli` and agent-sized `A2A_BRIDGE_RESOURCES`, for the eval install
 (`docs/designs/eval-next-transport.md`, "The CI flag"). Either way the sidecar and the agent
 container it shares a pod with are one build. The static `bridge` bus user the next section
 describes is the released mechanism, not scaffolding graduation removes: the password arrives

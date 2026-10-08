@@ -403,7 +403,7 @@ The bridge was CI-only until the executor question was settled; the release work
 publishes it as `hermes-bridge`, on the same `FROM`-the-same-commit rule, and `images.json`
 carries it (the bridge doc's provenance paragraph says the same). `hack/ci-deploy.sh` under the flag
 hands that image to the operator as `A2A_BRIDGE_IMAGE`, with `A2A_BRIDGE_CONCURRENCY` set to
-`EVAL_TASK_PARALLELISM`, through the chart's `operator.extraEnv`; the operator renders the bridge
+`EVAL_TASK_PARALLELISM` and agent-sized `A2A_BRIDGE_RESOURCES` for the `cli` pin, through the chart's `operator.extraEnv`; the operator renders the bridge
 with the bus URL and the `bridge` user's password from its creds Secret as the bridge doc lists
 its env, and withholds it from the agent pod until the bus is provisioned (a bridge that starts
 before the bus exists crash-loops the agent's pod). The worker count is sized against the
@@ -418,8 +418,8 @@ run creates (6 at 4 workers, 2 at 6; at 8 or more the floor cannot hold the rese
 value clamps to 1), computed from four constants the script copies from the operator and
 pins against it. The mode patch is the only patch, so no later render re-measures the budget
 against the stream the Job created. The rendered bridge carries the agent container's own
-environment, mounts, security context and resources, copied by the operator from the agent
-container it renders: the bridge's `cli` subprocess stands in for the `hermes chat -q` a kanban worker spawns
+environment, mounts and security context, copied by the operator from the agent
+container it renders (its resources are its own: `api`-sized defaults, which the deploy replaces with agent-sized `A2A_BRIDGE_RESOURCES` while it pins `cli`, gke-labs/kube-agents#2748): the bridge's `cli` subprocess stands in for the `hermes chat -q` a kanban worker spawns
 inside the agent container, and that is the environment such a worker inherits; under the
 default `api` executor the same copy is what carries `API_SERVER_KEY` into the bridge, which is
 why the deploy pins `A2A_BRIDGE_EXECUTOR=cli` rather than leaving the choice to the key. The
@@ -593,7 +593,7 @@ the door and the executor. The deploy arms the gateway's inject door on the oper
 same flag (`A2A_INJECT_BACKEND=true` through the chart's `operator.extraEnv`, beside the A2A
 image overrides) and waits for the door's Service and token Secret. The bridge is the
 operator's: it renders it with the image, `BRIDGE_CONCURRENCY` and executor pin the deploy sets
-on it the same way (`A2A_BRIDGE_IMAGE`, `A2A_BRIDGE_CONCURRENCY`, `A2A_BRIDGE_EXECUTOR=cli`), and
+on it the same way (`A2A_BRIDGE_IMAGE`, `A2A_BRIDGE_CONCURRENCY`, `A2A_BRIDGE_EXECUTOR=cli`, `A2A_BRIDGE_RESOURCES`), and
 the TASKS budget counts its workers from the first `next` render, so the mode patch is the only
 patch and the one provisioning Job is already sized for the bridge. The bridge enters the agent
 pod only once the bus is provisioned (the CR's `BusProvisioned` condition), so the agent
