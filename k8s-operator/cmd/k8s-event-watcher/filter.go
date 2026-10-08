@@ -16,6 +16,7 @@ package main
 
 import (
 	"log"
+	"sort"
 	"strings"
 	"time"
 )
@@ -203,8 +204,8 @@ func newFilterConfig(reasons []string, allowNamespaces, excludeNamespaces []stri
 	// defaultReasons, which applies when --reason is unset, carries neither.
 	autopilotScaleToZeroHold := !th.disableAutopilotScaleToZeroHold
 	if autopilotScaleToZeroHold && !allowsScaleUpMarks(allowedReasons) {
-		log.Printf("k8s-event-watcher: the Autopilot scale-to-zero hold is OFF because --reason carries neither %s nor %s, so no cluster-autoscaler verdict can be recorded and the hold could not tell an abandoned system pod from a declined one; add both reasons to enable it",
-			reasonTriggeredScaleUp, reasonNotTriggerScaleUp)
+		log.Printf("k8s-event-watcher: the Autopilot scale-to-zero hold is OFF because --reason does not carry both %s and %s, so the watcher cannot hear every cluster-autoscaler verdict and the hold could not tell an abandoned system pod from a declined one; add both reasons to enable it (--reason is currently %s)",
+			reasonTriggeredScaleUp, reasonNotTriggerScaleUp, sortedReasons(allowedReasons))
 		autopilotScaleToZeroHold = false
 	}
 	return filterConfig{
@@ -227,6 +228,23 @@ func newFilterConfig(reasons []string, allowNamespaces, excludeNamespaces []stri
 // "match every reason" case, which no caller produces — newFilterConfig
 // substitutes defaultReasons for an empty list before building the set — but
 // which answers true rather than panicking if one ever does.
+// sortedReasons renders an allow-list for a log line, in a stable order so two
+// runs of the same configuration read alike. Only the disable notice above
+// uses it: knowing the hold is off because a reason is missing does not say
+// which one, and an operator comparing the message against their own --reason
+// should not have to guess at the half that is absent.
+func sortedReasons(allowedReasons map[string]struct{}) string {
+	if len(allowedReasons) == 0 {
+		return "empty"
+	}
+	reasons := make([]string, 0, len(allowedReasons))
+	for reason := range allowedReasons {
+		reasons = append(reasons, reason)
+	}
+	sort.Strings(reasons)
+	return strings.Join(reasons, ",")
+}
+
 func allowsScaleUpMarks(allowedReasons map[string]struct{}) bool {
 	if allowedReasons == nil {
 		return true

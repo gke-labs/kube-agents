@@ -190,10 +190,19 @@ clamp_at_least() {
 # on, with only a line on stderr. Rejecting a spelling is safe; silently
 # inverting one is not, so this list must stay at least as wide as
 # ParseBool's.
+# Surrounding whitespace is stripped before the match for the same reason the
+# table is wide. A `case` pattern matches the whole word, so `false ` -- a
+# quoted YAML scalar, a wrapper's printf, a copy-paste -- misses every arm and
+# lands on the fallback, which inverts it. The intent of `false ` is not in
+# doubt, and a value whose intent *is* in doubt still reaches the fallback.
 normalize_boolean() {
   local name="$1"
   local fallback="$2"
   local value="${!name}"
+  # Leading, then trailing. Both expansions are literal-quoted so the inner
+  # pattern is not re-globbed, and both are no-ops on an already-clean value.
+  value="${value#"${value%%[![:space:]]*}"}"
+  value="${value%"${value##*[![:space:]]}"}"
 
   case "${value}" in
     [Tt] | [Tt][Rr][Uu][Ee] | 1 | [Yy][Ee][Ss] | [Oo][Nn]) printf -v "${name}" '%s' true ;;

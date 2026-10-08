@@ -879,7 +879,7 @@ class NormalizeBooleanResolvesWhatTheWatcherIsHandedAsAFlag(_ScriptCase):
 
     def test_an_unrecognised_value_lands_on_the_callers_default_and_says_so(self) -> None:
         """Loudly, because the alternative is a flag error on every start."""
-        for value in ("bogus", "", " true"):
+        for value in ("bogus", "", "   ", "truthy", "0.0"):
             with self.subTest(value=value):
                 result = self._resolve(value, default="true")
                 self.assertIn("resolved=true", result.stdout)
@@ -889,6 +889,35 @@ class NormalizeBooleanResolvesWhatTheWatcherIsHandedAsAFlag(_ScriptCase):
         # The fallback is the caller's, not a constant inside the helper.
         result = self._resolve("bogus", default="false")
         self.assertIn("resolved=false", result.stdout)
+
+    def test_surrounding_whitespace_does_not_invert_the_answer(self) -> None:
+        """A `case` pattern matches the whole word, so ` false` misses every arm.
+
+        Landing on the fallback is the wrong answer for a value whose intent is
+        not in doubt: `false ` from a quoted YAML scalar or a wrapper's printf
+        would reach the watcher as `--autopilot-scale-to-zero-hold=true`, the
+        opposite of what was set. The default is pinned opposite to the
+        expectation in each case, so a value that falls through reads as the
+        inversion rather than coincidentally matching -- which is what an
+        earlier version of this test did, asserting `" true"` against a `true`
+        default and passing while the bug was live.
+        """
+        for value, want in (
+            (" false", "false"),
+            ("false ", "false"),
+            ("  false  ", "false"),
+            ("\tfalse\n", "false"),
+            (" true", "true"),
+            ("true ", "true"),
+            ("  F  ", "false"),
+            (" off", "false"),
+            (" on ", "true"),
+        ):
+            with self.subTest(value=repr(value)):
+                opposite = "false" if want == "true" else "true"
+                result = self._resolve(value, default=opposite)
+                self.assertIn(f"resolved={want}", result.stdout)
+                self.assertNotIn("is not a recognised boolean", result.stderr)
 
     def test_the_watcher_hold_is_normalised_and_defaulted_from_one_name(self) -> None:
         """Both the unset path and the unrecognised path answer `true`.
