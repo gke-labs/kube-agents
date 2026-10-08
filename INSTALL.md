@@ -1004,9 +1004,9 @@ kubectl exec deploy/platform-agent-gateway -n kubeagents-system -c platform-agen
 Each audit's report is a ledger issue in the GitOps repository, so the audits need the GitHub
 integration: with no GitOps repository configured, every run fails before it audits anything. A
 run that changed something since the last one also posts a one-line summary linking the issue to
-the home channel of each enabled chat platform (wherever `/sethome` last ran; otherwise
-`SLACK_HOME_CHANNEL` or `GOOGLE_CHAT_HOME_CHANNEL` from the install; otherwise the chat the
-install's first chat message came from), and an audit can open remediation pull requests in the
+the home channel of each enabled chat platform (wherever `/sethome` last ran; otherwise the chat
+the install's first chat message came from; otherwise `SLACK_HOME_CHANNEL` or
+`GOOGLE_CHAT_HOME_CHANNEL` from the install), and an audit can open remediation pull requests in the
 repository.
 [Autonomous watchdogs](docs/site/src/content/docs/concepts/autonomous-watchdogs.md) covers the
 schedule and delivery, and
