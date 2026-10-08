@@ -90,9 +90,10 @@ const (
 	lookAheadTimeout = 10 * time.Second
 	// steerNoticeTimeout bounds the steer notices of one call (a follow-up's
 	// one notice, or the refusals of a closing queue). They publish outside
-	// run.mu, so a stalled bus delays only the notices and whatever orders
-	// itself behind them (noticeMu), never a cancel's kill; the bound keeps
-	// that delay finite.
+	// run.mu, so a stalled bus holds no lock a kill needs; what waits is
+	// whatever orders itself behind them (noticeMu) and, because the
+	// consumer runs one handler at a time, a cancel delivered behind the
+	// stalled one. The bound keeps that wait finite.
 	steerNoticeTimeout = 10 * time.Second
 
 	shutdownReason            = "reason: bridge-shutdown - the bridge was terminated while this task was in flight"
