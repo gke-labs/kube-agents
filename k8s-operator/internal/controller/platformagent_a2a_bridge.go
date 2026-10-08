@@ -110,8 +110,8 @@ const (
 
 	// a2aBridgeExecutorOperatorEnvVar pins the rendered bridge's
 	// BRIDGE_EXECUTOR. Unset, the bridge's shipped default decides (api,
-	// since the agent's API_SERVER_KEY is copied); CI pins `cli` here until
-	// the api executor is graded.
+	// since the agent's API_SERVER_KEY is copied), and the next eval lane
+	// leaves it unset so it measures that default.
 	a2aBridgeExecutorOperatorEnvVar = "A2A_BRIDGE_EXECUTOR"
 
 	// The bridge's own environment contract (a2a/cmd/hermes-bridge/main.go),

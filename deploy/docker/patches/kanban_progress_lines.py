@@ -59,7 +59,8 @@ fallback, an opened pull request and a ``needs_input`` question post as
 messages of their own (``gateway/slack_ux_moments.py``), and any later event
 takes the buttons off the card's open question; :func:`silent_event` carries
 ``archived`` and ``unblocked``, which upstream never posts, to the plan and
-the question. See :func:`deliver`.
+the question, and opens a card's row when its first noteless heartbeat says
+it started. See :func:`deliver`.
 
 Three properties of the surrounding code make this nearly free:
 
@@ -260,6 +261,14 @@ MARKER_MAX = 2
 #: them before any send. With ``KAGE_SLACK_UX`` on they still move a Slack
 #: card's row in the thread's plan; see :func:`silent_event`.
 SILENT_PLAN_KINDS = ("archived", "unblocked")
+
+#: The kind whose noteless events ``_fmt_heartbeat`` renders as ``None``, so
+#: ``_send_pings`` skips them too. With ``KAGE_SLACK_UX`` on, one opens a Slack
+#: card's row in the thread's plan, running, when the card has none yet: the
+#: worker's first automatic heartbeat, written on its first activity, is the
+#: earliest event of a run the notifier claims, since ``claimed`` and
+#: ``spawned`` are not among its kinds. See :func:`silent_event`.
+STARTED_KIND = "heartbeat"
 
 #: Kinds that settle a plan row past an earlier ``unblocked`` in the same
 #: batch: every kind ``slack_status.TASK_STATUS_BY_KIND`` maps to a status
@@ -674,6 +683,41 @@ def _overtaken(notification: Any, ev: Any) -> bool:
     )
 
 
+def _noted_later(notification: Any, ev: Any) -> bool:
+    """Whether a heartbeat carrying a note follows this event in its batch."""
+    event_id = int(getattr(ev, "id", 0) or 0)
+    batch = getattr(notification, "d", None)
+    events = batch.get("events") if isinstance(batch, dict) else None
+    return any(
+        int(getattr(later, "id", 0) or 0) > event_id
+        and str(getattr(later, "kind", "") or "") == STARTED_KIND
+        and progress_note(getattr(later, "payload", None))
+        for later in events or ()
+    )
+
+
+async def _started(notification: Any, ev: Any) -> None:
+    """Open a Slack card's plan row, running, on a noteless heartbeat: see :data:`STARTED_KIND`.
+
+    Not for one replayed or overtaken in its batch (:func:`_overtaken`): the
+    later event opens the row settled. Nor for one a note follows in its
+    batch, which opens the row itself, in one post rather than a post and an
+    edit. Only with ``KAGE_SLACK_UX`` on for a Slack card, and never raises: it
+    runs inside the send loop.
+    """
+    try:
+        if _overtaken(notification, ev) or _noted_later(notification, ev):
+            return
+        sub = notification.sub
+        adapter = getattr(notification, "adapter", None)
+        plan = _slack_plan(_slack_quiet(sub))
+        if adapter is None or plan is None:
+            return
+        await plan.start_row(adapter, sub, str(getattr(notification, "title", "") or ""))
+    except Exception as exc:  # noqa: BLE001 — never fail a delivery on the plan
+        logger.debug("kanban progress: opening the plan row on a start failed: %s", exc)
+
+
 async def silent_event(notification: Any, ev: Any) -> None:
     """Move a Slack card's plan row on a kind upstream keeps silent.
 
@@ -688,10 +732,15 @@ async def silent_event(notification: Any, ev: Any) -> None:
     and never raises: it runs inside the send loop. An ``unblocked`` overtaken
     in its batch, not replayed, still settles the question it answered, which
     the later event would settle as unanswered; one posted for that later
-    event is newer than the unblock and left alone.
+    event is newer than the unblock and left alone. A noteless heartbeat
+    goes to :func:`_started` instead, and touches neither the question nor
+    the ask's reaction.
     """
     try:
         kind = str(getattr(ev, "kind", "") or "")
+        if kind == STARTED_KIND:
+            await _started(notification, ev)
+            return
         if kind not in SILENT_PLAN_KINDS:
             return
         overtaken = _overtaken(notification, ev)

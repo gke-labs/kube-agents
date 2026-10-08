@@ -14,8 +14,7 @@
 > repositories this install does not manage and does it with a shallow clone —
 > neither of which the verbs offer, the second on purpose
 > ([The seam](#3-the-seam)). The CRD declares forges and repositories in `spec.integration.forges`
-> and `spec.integration.repositories` with only `github` registered, so a GitLab
-> forge is not yet declared through the CR.
+> and `spec.integration.repositories`; each provider states its own hosts, grammar and credential.
 > This is the design for driving any forge, and the order the rest has to
 > happen in.
 
@@ -146,8 +145,9 @@ The coupling runs through five layers, each with a different owner and a differe
    network policy that decides where the pod may reach at all.
 4. **The declarative surface.** The CRD declares forges and repositories in
    `spec.integration.forges` and `spec.integration.repositories` and labels each state-ConfigMap
-   entry with its forge's provider, but the chart, installer and Terraform
-   composition all carry GitHub App inputs, and GitHub is the only provider registered.
+   entry with its forge's provider. Each surface that writes a declaration — the CRD, the chart,
+   the installer and the Terraform composition — has to take a forge's provider, host and
+   credential from the administrator rather than assume the GitHub App.
 5. **The prompts.** Four `SKILL.md` files instructed the model in `gh` spellings; seven governance
    SOPs name `gh` to forbid it and call the artefact a pull request throughout. Three of the four
    are on the verbs; `fleet-audit/SKILL.md` and the seven SOPs are `audit_report.py`'s prose and
@@ -420,10 +420,11 @@ in Go alike, at the points where GitHub is the provider. The difference is that 
 refusal is a provider's, and states a reason, instead of being an invariant of the whole stack
 expressed in four dialects.
 
-A GitLab remote in any spelling is refused at admission, by the GitHub provider's host check,
-because GitHub is the only provider registered. That inverts the obvious reading: admitting a
-GitLab forge in `spec.integration.forges` is **relaxing an existing host check under provider dispatch**,
-not adding a host check where a host-blind shape check stood.
+A GitLab remote in any spelling is refused at admission on a GitHub forge, by the GitHub
+provider's host check. That inverts the obvious reading: admitting a GitLab forge in
+`spec.integration.forges` **relaxed an existing host check under provider dispatch** — the GitLab
+provider admits what GitHub's refuses, on its own forges only — rather than adding a host check
+where a host-blind shape check stood.
 
 **What remains.** The Python side has one parser and one set of rules, and the host survives the
 parse instead of being discarded before the slashes are counted. What it does not yet have is
@@ -587,7 +588,8 @@ A `gitops` or `managed` repository entry names it in `baseBranch`
 the base of every accepted repository that sets one into the broker container's
 environment as one variable, `CREDENTIAL_PROXY_PINNED_BASES`: a JSON array of
 `{"repository": "https://<host>/<path>", "branch": "<base>"}`, the host being
-the forge's canonical one. `spec.deployment.env` can never set it, and the
+the forge's canonical one and the path as that forge reads it, nested groups
+included on GitLab. `spec.deployment.env` can never set it, and the
 broker refuses to start on a value it cannot read. Nothing reaches the agent
 container or the sandbox, and the sandbox's environment is never consulted: the
 skills ask the broker for the base, so a branch name an agent exports changes
@@ -595,8 +597,8 @@ nothing. A `CREDENTIAL_PROXY_BASE_BRANCH` in `spec.deployment.env`, or failing
 that a `GITOPS_BASE_BRANCH`, still reaches the broker and joins the protected
 branches above, but pins no target, because nothing names its repository. A
 repository is its host and path, compared without regard to case; a request
-that names no host is on its forge's canonical host, so the same `owner/name`
-on another host is another repository and is not pinned. For a pinned
+that names no host is on its forge's canonical host, so the same path on
+another host, or on another forge, is another repository and is not pinned. For a pinned
 repository every door that chooses a target holds it to the base and compares
 branch names exactly: the base is accepted as `<base>` or `refs/heads/<base>`,
 and `heads/<base>` is another branch.
@@ -2026,14 +2028,57 @@ spelling's `namespace` is a plain string and the grammar lives with the provider
 `credentialsRef` names a Secret in the agent's namespace for a provider whose credential is a
 token an administrator holds. GitHub's is not: its tokens are minted per call from the GitHub
 App, so on a `github` forge the field is ignored, and admission says so with a warning rather
-than an error, so a values file can carry it ahead of the provider that reads it.
+than an error, so a values file can carry it ahead of the provider that reads it. GitLab's is,
+so on a `gitlab` forge the field is required: without it the broker has no token to call the
+forge with, and the forge and every repository on it are refused rather than seeded into a list
+the broker would then refuse on every call.
+
+The operator hands a credentialed forge to the broker and to nothing else. The Secret's `token`
+key is projected into the broker's pod alone — never the agent's, never the sandbox's — as
+`/var/run/kube-agents/forge-credentials/<forge>/token`, optional so a Secret created after the
+CR does not keep the broker, and with it GitHub and chat, from starting. Beside it the operator
+renders the forge configuration the broker builds its forges from (`VCS_FORGES_CONFIG`) into
+the broker's policy ConfigMap, whose hash already rolls the broker when it changes. GitHub is
+always its first entry, because a configuration is the broker's whole answer and an install that
+declares a GitLab forge still has its GitHub App; and a GitHub-only declaration renders no
+configuration at all, so its broker is unchanged. Each GitLab entry's `allowedPaths` is the
+forge's `namespace` together with the group of every repository accepted on it — the narrowing
+a GitLab token gets nowhere else — and a forge with neither is left out, since an entry with no
+`allowedPaths` is one the broker refuses to build. The broker holds one credential per host, so a second
+credentialed forge at a host already declared is refused at its `host`, naming the first. A
+forge claims its host only when it is valid and serves something, and the same rule decides
+which forges the broker is given, so a forge the status refuses is never one whose token is
+mounted.
+
+**A mixed install still takes a registered bare GitHub name.** When a forge beside GitHub is
+declared, the broker serves more than one forge. The broker then refuses a bare `owner/name`,
+because the name does not tell which forge it is on ([Forge neutrality](#forge-neutrality)). This
+refusal is intentional: a guess can send the name of a GitLab group to GitHub. The sandbox client
+prevents the refusal for a GitHub repository that the install registered by URL: it sends the
+bare name as the URL of the registration. Thus a cron, a skill invocation or a `--repo` that names
+such a repository does not change when an administrator adds GitLab. Use `https://<host>/<path>`
+or `<host>/<path>` for a repository on another forge. Also use it for a GitHub repository in
+these cases:
+
+- The install did not register the repository.
+- An administrator registered the repository without a URL.
+- A repository on another forge has the same path.
+
+A missing Secret, or one without a `token` key, does not stop the broker: the projection is
+optional, so GitHub and chat keep working, and each call to that forge answers
+`FORGE_CREDENTIAL_UNAVAILABLE` naming the host until the Secret exists. The operator does not
+read the Secret to report it in the status, so that answer is where an administrator sees it.
 
 Validation dispatches on each repository's forge. Its provider parses the repository with its
 host kept, refuses a host that is neither the forge's declared one nor one of its own, and asserts
 its own namespace grammar and path depth; the admission webhook, the reconciler's status and the
 operator's warning all ask the same question through one call, and every refusal names the list
-entry at fault. GitHub is the only provider registered, so a GitLab URL is refused at admission —
-by GitHub's host check, which accepting GitLab relaxes under dispatch rather than removes.
+entry at fault. A GitLab URL on a `github` forge is refused by GitHub's host check, and a GitHub
+URL on a `gitlab` forge by GitLab's. GitLab is also self-managed: its forge may declare a host
+of its operator's choosing, never one another provider serves, and a repository on that forge
+must name that host or none. The declared host never replaces one the repository names, so
+`https://gitlab.com/g/p` on a forge at `gitlab.example.com` is refused rather than moved onto
+the other server.
 
 The operator writes each repository into the state ConfigMap as a `ManagedRepoEntry` whose `type`
 is its forge's provider, which is how the discriminator reaches the agent: written down by the
@@ -2053,6 +2098,10 @@ GitHub App inputs as `github_app_id`, `enable_github_minter` and `github_minter_
 chart spells the same settings `githubMinter.appId`, `githubMinter.enabled` and
 `githubMinter.kms.*`. All of them are provider-conditional: an install that declares no GitHub
 forge provisions no KMS key and no minter.
+A provider whose credential is a token an administrator holds takes it as
+a Secret in the agent's namespace: the installer reads the token from a no-echo prompt or a file
+and pipes it into that Secret, and the Terraform composition, the chart values and the CR carry
+only the Secret's name, so the token is never in Terraform state, a values file or `install.env`.
 
 **What the surface does not carry is a switch for the abstraction itself.** An
 install declares _which_ forge it uses, never _whether_ the abstraction is in
@@ -2272,6 +2321,12 @@ starts with its own host, and the spelling is what someone writes who means the
 whole host, which is `[]`. Whitespace anywhere is refused rather than stripped. A GitHub entry refuses `allowedPaths` outright: the App
 installation's repository selection is what scopes that token, and the same key
 accepted there and ignored would read as narrowing it.
+The operator derives the list rather than asking for it: the forge's declared
+`namespace` and the group of every repository accepted on the forge ([The
+declarative surface](#6-the-declarative-surface)). A forge with neither has
+nothing to serve, and the operator hands the broker no entry for it rather than
+`[]` — so the whole host is only ever a choice made in a hand-written
+configuration, never something a CR implies.
 
 Prefix matching is on **path segments, not string prefix**. `acme/infra-secret`
 starts with the string `acme/infra` and is a different project.

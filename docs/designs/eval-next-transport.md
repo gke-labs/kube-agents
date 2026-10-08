@@ -168,8 +168,9 @@ from inside the pod's network namespace, so they are not what keeps the door shu
 bearer token the operator renders into a Secret beside the adapter's env, under the eval flag
 only, which the harness reads the way the presubmit reads `API_SERVER_KEY` today. The door it
 replaces admits key holders, and this one admits the same population rather than everyone
-holding `pods/portforward` in the namespace; that matters because the task it starts runs on the
-platform persona with the install's cluster and GitHub credentials, under an `authority` block
+holding `pods/portforward` in the namespace; that matters because the task it starts reaches the
+platform persona with the install's cluster and GitHub credentials (directly under the bridge's
+`cli` executor, through a card the default profile files under `api`), under an `authority` block
 the gateway mints for a synthetic principal, past the allowed-users gate.
 
 **The adapter cannot assert a real principal (decided 2026-09-17).** The gateway spec's test-backend
@@ -354,14 +355,20 @@ the worker checks
 ([`eval-scorer.md`](eval-scorer.md), "The inject lane sets aside what its transport
 cannot show"). A case whose premise
 needs the front door — `agent-kanban-smoke`, which grades
-the chat profile's `kanban_create` — is a different matter: the door addresses `platform`,
-and the bridge's `cli` executor answers it with the platform profile, so
-`hack/eval/inject-lane-exclusions.txt` keeps it off this lane's matrix with the reason, and the
-api lane's roster is untouched. The lane pins that executor: `hack/ci-deploy.sh` sets the
-operator's `A2A_BRIDGE_EXECUTOR=cli`, which the rendered bridge takes as `BRIDGE_EXECUTOR`, and its start-line wait requires `"executor":"cli"`. The
-bridge's default `api` executor runs the turn under the pod's API server, whose profile is the
-chat path's own (`default` on a stock install), so it changes which agent answers every case on
-the lane; the pin, and the exclusion, stay until cases have been graded on that executor.
+the chat profile's `kanban_create` — is a different matter:
+`hack/eval/inject-lane-exclusions.txt` keeps it off this lane's matrix with the reason below, and the
+api lane's roster is untouched. The lane runs the bridge's shipped default executor, `api`, the
+one a customer install runs: `hack/ci-deploy.sh` leaves the operator's `A2A_BRIDGE_EXECUTOR`
+unset, so the rendered bridge carries no `BRIDGE_EXECUTOR` and picks `api` from the
+`API_SERVER_KEY` it copies from the agent container, and the deploy's start-line wait requires
+`"executor":"api"`, which a bridge that fell back to `cli` for want of the key fails. Under `api`
+the turn runs under the pod's API server, whose profile is the chat path's own (`default` on a
+stock install), so the agent that answers a case on this lane is the one the chat path reaches
+("What the lane grades" below). That does not return the exclusion's premise: the default
+profile may file the card, but the card's completion never reaches the A2A thread
+([`a2a/docs/hermes-bridge.md`](../../a2a/docs/hermes-bridge.md), "Executors"), and the graded
+answer gets the card's result only once the rebuilt wait lands (Completion signals), so the
+exclusion stays.
 `ledger_issue_contains` finds the ledger by scanning the final message for a GitHub issue URL, so
 it works on any transport that maps a result into the final message, which both new transports
 do, and its grade depends on that mapping: the fleet-audit cases get the URL from the delegated
@@ -384,9 +391,9 @@ with nobody consuming `platform` tasks, and every case on the
 inject transport ends as infrastructure. That is the correct reading of that install, and it is
 why a task nobody took is infrastructure rather than a failed case. The bridge accepts a task by
 publishing `submitted` and queues it behind `BRIDGE_CONCURRENCY` workers, default 2, and
-publishes `working` only when a worker spawns the subprocess; the presubmit fans units out at
+publishes `working` only when a worker starts the task's turn; the presubmit fans units out at
 `EVAL_TASK_PARALLELISM`, default 4, the nightly at 8. At those defaults two of every four
-concurrent units wait in the bridge's queue carrying an executor event and no subprocess, for as
+concurrent units wait in the bridge's queue carrying an executor event and no turn, for as
 long as the two ahead of them run. The eval install's bridge therefore runs
 `BRIDGE_CONCURRENCY` of at least `EVAL_TASK_PARALLELISM`, set through the operator's
 `A2A_BRIDGE_CONCURRENCY`, and the `submitted`-only classification above is the backstop rather than the fix: a queued
@@ -422,7 +429,7 @@ environment, mounts and security context, copied by the operator from the agent
 container it renders (its resources are its own: `api`-sized defaults, which the deploy replaces with agent-sized `A2A_BRIDGE_RESOURCES` while it pins `cli`, gke-labs/kube-agents#2748): the bridge's `cli` subprocess stands in for the `hermes chat -q` a kanban worker spawns
 inside the agent container, and that is the environment such a worker inherits; under the
 default `api` executor the same copy is what carries `API_SERVER_KEY` into the bridge, which is
-why the deploy pins `A2A_BRIDGE_EXECUTOR=cli` rather than leaving the choice to the key. The
+how the lane gets `api` without setting `A2A_BRIDGE_EXECUTOR`. The
 operator adds `A2A_ACTIVITY_SECRET` from the creds Secret's `bridge-activity-key` itself. The one
 mount not carried is the projected bus token, the agent principal's credential. The
 third piece was decided the same day and is built: a look-ahead in the bridge's worker that
@@ -433,28 +440,42 @@ cancel"; its "Sizing against the eval harness" is the canonical statement of
 `BRIDGE_CONCURRENCY` against the fan-out and the bridge's queue capacity, which this paragraph
 summarises).
 
-**What the lane grades (decided 2026-09-28 on gke-labs/kube-agents#2037).** Through the inject
-door the eval addresses the platform persona directly, with the `platform_toolsets.cli` bundle:
-`terminal`, `read_file`, `patch`, `process_manage`, `execute_code`, `delegate_task` and every
-MCP tool the install carries. That is a different agent from the one today's evals reach. The api transport posts to
-the API server, which runs the default profile, the Planning Agent: its model-facing tools are the
-kanban set, it delegates fleet work to the platform persona over a card, and it relays the
-worker's report. Same prompt, two agents reading it: `obtainability-remediation-proposal` is 12
-of 12 on the first, where the Planning Agent inlines a manifest, and was 0 of 3 on the second,
-where the persona followed its own rule and opened a pull request (the rule has since been
-scoped, in `agents/platform/SOUL.md` §3: a request to investigate or report is answered in the
-reply, and a pull request is opened only when the request asks for one or for a change to be
-submitted or fixed; the unattended case is `fleet-audit`'s own path). The lane's record is therefore
-the platform persona's, and parity in [#2007](https://github.com/gke-labs/kube-agents/issues/2007)
-(phase 2) is that persona's record being acceptable per case and stable across the on-demand
-runs, not the api lane's numbers; the first run's 94.4% against 77.8% is withdrawn as a
-like-for-like comparison. Two things follow for the lane. A case that grades the delegation
+**What the lane grades (decided 2026-09-28 on gke-labs/kube-agents#2037, for the `cli` executor
+the lane then ran).** Under `cli` the inject door's task reaches the platform persona directly,
+with the `platform_toolsets.cli` bundle: `terminal`, `read_file`, `patch`, `process_manage`,
+`execute_code`, `delegate_task` and every MCP tool the install carries. That is a different agent
+from the one today's evals reach. The api transport posts to the API server, which runs the
+default profile, the Planning Agent: its model-facing tools are the kanban set, it delegates fleet
+work to the platform persona over a card, and it relays the worker's report. Same prompt, two
+agents reading it: `obtainability-remediation-proposal` is 12 of 12 on the first, where the
+Planning Agent inlines a manifest, and was 0 of 3 on the second, where the persona followed its own
+rule and opened a pull request (the rule has since been scoped, in `agents/platform/SOUL.md` §3: a
+request to investigate or report is answered in the reply, and a pull request is opened only when
+the request asks for one or for a change to be submitted or fixed; the unattended case is
+`fleet-audit`'s own path); the first run's 94.4% against 77.8% is withdrawn as a like-for-like
+comparison. The lane now runs the bridge's `api` executor, the default a customer install runs,
+so the turn is the API server's and the agent that answers is the Planning Agent, the one the api
+transport reaches. Three differences from the api lane remain, and all three are the transport's
+rather than the agent's. The delegation wait finds no card ids on this path (Completion signals), so a
+case whose answer is a delegated worker's report is graded on the Planning Agent's own reply,
+which may be the card receipt. And a router-scope `tool_called` reads the Planning Agent's calls
+through the door's trace, which carries no worker's calls. And the GitHub-write safeguard dates a
+write rather than signing it, and keeps by-design writes apart by running requesting cases one at a
+time; a worker that opens its pull request after the task's terminal can land that write in the
+next unit's window, which charges the next unit for it
+([#2619](https://github.com/gke-labs/kube-agents/issues/2619),
+[#2611](https://github.com/gke-labs/kube-agents/issues/2611)). Read a block on a requesting
+case's later repetitions as transport until those are fixed. Parity in
+[#2007](https://github.com/gke-labs/kube-agents/issues/2007) (phase 2) is this lane's record on
+`api` being acceptable per case and stable across the on-demand runs, not the api lane's numbers.
+Two things follow for the lane. A case that grades the delegation
 composition rather than the executor's answer gets a persona-aware check or leaves the lane
 through the exclusion list with its reason. And the lane carries a safeguard of its own, applied
 by the CI flag's script to every case it runs (`hack/eval/inject-lane-safeguards.yaml`, a
 none-wrapped `github_writes` at catastrophic severity over the leased project's GitOps
-repository), because the persona can open a pull request where the cluster safeguards see
-nothing, and the first run left several on the pool repository that no case had asked for. The
+repository), because the platform persona can open a pull request where the cluster safeguards
+see nothing (in the turn under `cli`, from a card the Planning Agent files under `api`), and the
+first run left several on the pool repository that no case had asked for. The
 lane moves to the session agent's front door when the delegation primitive lands, and the
 classification says which cases regain their delegation checks then.
 
@@ -592,8 +613,8 @@ conditions, so its bound is generous), and the agent Deployment. Then
 the door and the executor. The deploy arms the gateway's inject door on the operator under the
 same flag (`A2A_INJECT_BACKEND=true` through the chart's `operator.extraEnv`, beside the A2A
 image overrides) and waits for the door's Service and token Secret. The bridge is the
-operator's: it renders it with the image, `BRIDGE_CONCURRENCY` and executor pin the deploy sets
-on it the same way (`A2A_BRIDGE_IMAGE`, `A2A_BRIDGE_CONCURRENCY`, `A2A_BRIDGE_EXECUTOR=cli`, `A2A_BRIDGE_RESOURCES`), and
+operator's: it renders it with the image and `BRIDGE_CONCURRENCY` the deploy sets on it the same
+way (`A2A_BRIDGE_IMAGE`, `A2A_BRIDGE_CONCURRENCY`) and the bridge's default `api` executor, and
 the TASKS budget counts its workers from the first `next` render, so the mode patch is the only
 patch and the one provisioning Job is already sized for the bridge. The bridge enters the agent
 pod only once the bus is provisioned (the CR's `BusProvisioned` condition), so the agent

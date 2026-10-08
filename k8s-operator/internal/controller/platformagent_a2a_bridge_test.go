@@ -136,6 +136,28 @@ func TestANextInstallWithNoDeclaredBridgeGetsOne(t *testing.T) {
 	}
 }
 
+// With no operator setting the rendered bridge runs the api executor, the
+// shipped default and what the next eval lane measures (hack/ci-deploy.sh sets
+// no A2A_BRIDGE_EXECUTOR): it carries no BRIDGE_EXECUTOR, and it keeps the
+// agent container's non-blank API_SERVER_KEY, which is what the bridge's
+// bridgeExecutor reads to pick api over its keyless cli fallback. The pod's
+// actual container is checked, not a2aRenderedBridgeSettings, so a copy that
+// dropped the key would show here even if the settings still listed it.
+func TestARenderedBridgeWithNoExecutorSettingRunsTheAPIExecutor(t *testing.T) {
+	t.Setenv(a2aBridgeExecutorOperatorEnvVar, "")
+	b := containersNamed(bridgeTestPod(provisionedAgent()), a2aBridgeContainerName)[0]
+	env := envIndex(b)
+	if e, ok := env[a2aBridgeExecutorEnvVar]; ok {
+		t.Errorf("the rendered bridge sets %s=%q with no operator setting", a2aBridgeExecutorEnvVar, e.Value)
+	}
+	if key := env[a2aBridgeAPIServerKeyEnvVar]; strings.TrimSpace(key.Value) == "" && key.ValueFrom == nil {
+		t.Errorf("the rendered bridge has no %s, so the bridge would fall back to the cli executor", a2aBridgeAPIServerKeyEnvVar)
+	}
+	if !a2aBridgeRunsAPIExecutor(b) {
+		t.Error("the operator reads the rendered bridge as a cli bridge, so it would render no activity hook for it")
+	}
+}
+
 // Under today nothing is rendered, which is also what ends the rollback
 // crash-loop: there is no bridge left behind to dial a torn-down bus.
 func TestATodayInstallGetsNoBridge(t *testing.T) {

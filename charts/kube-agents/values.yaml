@@ -1029,11 +1029,17 @@ platformAgent:
     #
     # forges:
     #   - name: github            # what repositories[].forge refers to
-    #     provider: github        # the only registered provider; default github
+    #     provider: github        # github or gitlab; default github
     #     host: ""                # empty is the provider's default (github.com)
     #     namespace: my-org       # default owner for this forge's repositories
     #     credentialsRef:         # Secret for providers that need one; ignored
     #       name: ""              # for github, which uses the GitHub App
+    #   - name: gitlab
+    #     provider: gitlab
+    #     host: ""                # gitlab.com, or a self-managed instance's hostname
+    #     namespace: my-group     # group path; bounds which projects the agent may reach
+    #     credentialsRef:         # required for gitlab: a Secret holding an access
+    #       name: gitlab-token    # token under the key `token`, created out of band
     forges: []
     # repositories:
     #   - forge: github
