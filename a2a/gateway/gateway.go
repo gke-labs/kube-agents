@@ -2187,12 +2187,14 @@ const (
 
 // steerRefusalWhy words an executor's refusal reason token for the room.
 // task-ended and no-resume are absent on purpose: those are counted into
-// noticeSteersUnrun and noticeSteersNoResume at the terminal.
+// noticeSteersUnrun and noticeSteersNoResume at the terminal. capability is
+// worded for both of its causes, because the bridge sends the one token for
+// a refusal and for a verifier it could not reach.
 var steerRefusalWhy = map[string]string{
-	lib.SteerReasonQueueFull:  "too many follow-ups are already waiting",
+	lib.SteerReasonQueueFull:  "the task has already taken as many follow-ups as it runs",
 	lib.SteerReasonTaskEnding: "the task was already finishing",
 	lib.SteerReasonNoText:     "it had no text",
-	lib.SteerReasonCapability: "it was not authorized",
+	lib.SteerReasonCapability: "the task's capability check did not pass (refused, or the verifier could not be reached)",
 }
 
 // steerTask forwards a message that arrived while the task runs as a

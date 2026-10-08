@@ -86,11 +86,13 @@ type relayState struct {
 	// executor publishes one just before the next queued follow-up's turn
 	// starts, so it counts that turn as started even if a cancel, deadline
 	// or shutdown stops it in between. Such a follow-up is then refused
-	// task-ended, so it moves from queued to ended and is still counted. At
-	// the terminal (postSteerShortfall), steersSent - answered never reached
-	// a live run, and ended plus queued - turnsStarted never ran. Cache like
-	// the rest: a gateway restart forgets them, and the terminal then says
-	// nothing.
+	// task-ended, so it moves from queued to ended and is still counted. A
+	// bridge that crashes refuses nothing, so a follow-up whose turn had
+	// started when it died counts as run, though its answer never came; the
+	// ones still waiting behind it count as not run. At the terminal
+	// (postSteerShortfall), steersSent - answered never reached a live run,
+	// and ended plus queued - turnsStarted never ran. Cache like the rest: a
+	// gateway restart forgets them, and the terminal then says nothing.
 	answered     map[string]bool
 	queued       map[string]bool
 	ended        map[string]bool
