@@ -10,6 +10,7 @@ reading this machine's /etc/gitops.
 import contextlib
 import io
 import json
+import os
 import sqlite3
 import subprocess
 import sys
@@ -69,10 +70,15 @@ class StageTest(unittest.TestCase):
         self.failing: set[str] = set()
         self.repos: list[str] | Exception = list(REPOS)
         self._roster([{"id": job_id, "enabled": True, "state": "scheduled"} for job_id in oobe.FIRST_RUN_AUDITS])
+        # The scan and delivery stages are their own modules, tested beside them; here they are stubs.
+        self.scan = mock.Mock(return_value=0)
+        self.deliver = mock.Mock(return_value=0)
         patches = [
             mock.patch.object(oobe, "board_path", lambda _d: self.board),
             mock.patch.object(oobe.subprocess, "run", self._run),
             mock.patch.object(oobe, "managed_repositories", self._repos),
+            mock.patch.object(oobe.bootstrap_scan_gate, "main", self.scan),
+            mock.patch.object(oobe.bootstrap_delivery, "main", self.deliver),
         ]
         for p in patches:
             p.start()
@@ -878,18 +884,103 @@ class StageTest(unittest.TestCase):
 
     # --- once only ------------------------------------------------------------
 
-    def test_once_done_it_removes_itself_and_starts_nothing(self):
+    def _claim(self, at: float) -> None:
+        completed = self.d / ".bootstrap_completed"
+        completed.touch()
+        os.utime(completed, (at, at))
+
+    def _main_removing(self, now: float) -> list[str]:
+        removed: list[str] = []
+        jobs = types.ModuleType("cron.jobs")
+        jobs.remove_job = removed.append
+        with mock.patch.dict(sys.modules, {"cron": types.ModuleType("cron"), "cron.jobs": jobs}):
+            self._main(now=now)
+        return removed
+
+    def test_once_every_stage_is_done_it_removes_itself_and_the_old_jobs(self):
         self._file_scan()
         _board(self.board, [_ranking("done")])
         now = self._drive()
         self.started.clear()
-        removed = []
-        jobs = types.ModuleType("cron.jobs")
-        jobs.remove_job = removed.append
-        with mock.patch.dict(sys.modules, {"cron": types.ModuleType("cron"), "cron.jobs": jobs}):
-            self._main(now=now + MINUTE)
+        self.deliver.reset_mock()
+        self._claim(now - oobe.bootstrap_delivery.RETIRE_AFTER_SECONDS)
+        removed = self._main_removing(now)
         self.assertEqual(self.started, [])
-        self.assertEqual(removed, [oobe.OOBE_JOB_ID])
+        # The old entries first; removing oobe ends the run.
+        self.assertEqual(
+            removed, [oobe.bootstrap_delivery.SCAN_JOB_ID, oobe.bootstrap_delivery.DELIVERY_JOB_ID, oobe.OOBE_JOB_ID]
+        )
+        self.deliver.assert_not_called()
+
+    def test_it_stays_until_the_report_is_claimed(self):
+        self._file_scan()
+        _board(self.board, [_ranking("done")])
+        now = self._drive()
+        self.assertEqual(self._main_removing(now + MINUTE), [])
+        self.deliver.assert_called_with(self.d)
+
+    def test_a_young_claim_keeps_it(self):
+        # The run that claimed the report may still be posting it.
+        self._file_scan()
+        _board(self.board, [_ranking("done")])
+        now = self._drive()
+        self._claim(now - oobe.bootstrap_delivery.RETIRE_AFTER_SECONDS + MINUTE)
+        self.assertEqual(self._main_removing(now), [])
+
+    def test_a_claimed_report_does_not_end_the_audits(self):
+        # Delivery can land before the chain ends; the job stays for the rest of it.
+        self._file_scan()
+        _board(self.board, [_ranking("done")])
+        self._claim(NOW_SETTLED - oobe.bootstrap_delivery.RETIRE_AFTER_SECONDS)
+        self.assertEqual(self._main_removing(NOW_SETTLED), [])
+        self.assertEqual(self._started_ids(), FIRST)
+
+    # --- the stages ------------------------------------------------------------
+
+    def test_the_stages_run_scan_then_audits_then_delivery(self):
+        order = []
+        self.scan.side_effect = lambda _d: order.append("scan")
+        self.deliver.side_effect = lambda _d: order.append("deliver") or 0
+        with mock.patch.object(oobe, "first_run_audits", lambda _d, _now: order.append("audits")):
+            self._main()
+        self.assertEqual(order, ["scan", "audits", "deliver"])
+
+    def test_the_exit_is_deliverys(self):
+        # A report delivery cannot read fails the run, which the scheduler posts as an alert.
+        self.deliver.return_value = 1
+        self.assertEqual(oobe.main(self.d, now=NOW_SETTLED), 1)
+
+    def test_a_failing_stage_still_delivers(self):
+        self.scan.side_effect = RuntimeError("board locked")
+        with mock.patch.object(oobe, "first_run_audits", mock.Mock(side_effect=RuntimeError("roster gone"))):
+            self.assertEqual(oobe.main(self.d, now=NOW_SETTLED), 0)
+        self.deliver.assert_called_once_with(self.d)
+
+    def test_only_delivery_reaches_stdout(self):
+        # Once oobe is linked to the chat, whatever it prints is posted there.
+        def speaks(_d, *_rest):
+            print("scan chatter")
+            os.write(oobe.STDOUT_FD, b"subprocess chatter\n")
+
+        def delivers(_d):
+            sys.stdout.write("REPORT")
+            return 0
+
+        self.scan.side_effect = speaks
+        self.deliver.side_effect = delivers
+        with tempfile.TemporaryFile() as captured, mock.patch.object(oobe, "first_run_audits", speaks):
+            saved = os.dup(oobe.STDOUT_FD)
+            out = io.StringIO()
+            try:
+                os.dup2(captured.fileno(), oobe.STDOUT_FD)
+                with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+                    oobe.main(self.d, now=NOW_SETTLED)
+            finally:
+                os.dup2(saved, oobe.STDOUT_FD)
+                os.close(saved)
+            captured.seek(0)
+            self.assertEqual(captured.read(), b"")
+        self.assertEqual(out.getvalue(), "REPORT")
 
     def test_a_corrupt_marker_is_read_as_not_started(self):
         (self.d / oobe.AUDITS_MARKER).write_text("{not json", encoding="utf-8")

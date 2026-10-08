@@ -130,6 +130,14 @@ from pathlib import Path
 # point of the rule. See `merge_job`.
 RUNTIME_WINS = ("deliver",)
 
+# oobe took over the delivery job's chat link (docs/designs/oobe.md section 5). The plugin
+# links once, on the first human turn, so an install that spoke before oobe ran has the link
+# on the old job only; without carrying it, the report would go out with `deliver: local`.
+LINK_FROM_JOB = "bootstrap-inventory-delivery"
+LINK_TO_JOB = "oobe"
+LINK_KEYS = ("deliver", "origin")
+ORIGIN_KEY = "origin"
+
 DEFAULT_LEDGER_NAME = ".cron_jobs_installed"
 DEFAULT_LEGACY_CRON_RISK = "low"
 
@@ -250,7 +258,24 @@ def reconcile(
             else:
                 result.append(job)
 
+    summary["linked"] = carry_chat_link(result)
     return result, ledger | {j.get("id") for j in image_jobs if j.get("id")}, summary
+
+
+def carry_chat_link(jobs: list[dict]) -> list[str]:
+    """Copy the old delivery job's chat link onto ``oobe`` when only the old job has one.
+
+    Returns the ids linked, for the summary. A link already on ``oobe`` stands: the plugin
+    wrote it to the chat the operator spoke in under this image.
+    """
+    by_id = {j.get("id"): j for j in jobs if isinstance(j, dict)}
+    source, target = by_id.get(LINK_FROM_JOB), by_id.get(LINK_TO_JOB)
+    if source is None or target is None or not source.get(ORIGIN_KEY) or target.get(ORIGIN_KEY):
+        return []
+    for key in LINK_KEYS:
+        if key in source:
+            target[key] = source[key]
+    return [LINK_TO_JOB]
 
 
 def writer_tag() -> str:

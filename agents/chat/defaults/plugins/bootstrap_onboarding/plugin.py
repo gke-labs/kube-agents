@@ -28,7 +28,8 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
-DELIVERY_JOB_ID = "bootstrap-inventory-delivery"
+# The job whose delivery stage posts the report (agents/chat/scripts/oobe.py).
+DELIVERY_JOB_ID = "oobe"
 # Only adapters with a durable destination may own the one-time report. Use a
 # positive allowlist so new local or request/response surfaces fail closed until
 # they explicitly implement durable delivery.
