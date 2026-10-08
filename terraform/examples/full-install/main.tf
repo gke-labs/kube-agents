@@ -509,6 +509,12 @@ module "drift_pubsub" {
   sink_writer_identity_override = var.drift_pubsub_sink_writer_identity_override
   sink_drain_duration           = var.drift_pubsub_sink_drain_duration
 
+  # The module's two timers are both chosen margins against something GCP
+  # documents no bound for, so both are exposed: an operator whose apply still
+  # fails on an unbindable Logging agent, or whose teardown still mails, has
+  # only this composition to lengthen them in.
+  logging_identity_propagation_duration = var.drift_pubsub_logging_identity_propagation_duration
+
   # Defers data.google_project.this inside the module to apply time whenever
   # any member of required_apis has a planned change, which makes the sink's
   # publish grant "(known after apply)" and -- member being ForceNew -- plans

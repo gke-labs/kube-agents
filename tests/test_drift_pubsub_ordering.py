@@ -7,19 +7,40 @@ where the topic exists and the sink's publish grant is in place mails an
 holding roles/owner on the project -- `topic_permission_denied` on apply,
 `topic_not_found` on destroy.
 
-Three `depends_on` edges in the module are what prevent that, and together they
-are the whole of the fix:
+One chain of four links carries all of the module's ordering, and is the whole
+of the fix:
 
     google_project_service_identity.logging
-      -> google_pubsub_topic_iam_member.sink_writer   (grant before sink)
-        -> time_sleep.sink_drain                      (the destroy-side wait)
-          -> google_logging_project_sink.drift_audit  (sink created last)
+      -> time_sleep.logging_identity                    (the apply-side wait)
+        -> google_pubsub_topic_iam_member.sink_writer   (grant before sink)
+          -> time_sleep.sink_drain                      (the destroy-side wait)
+            -> google_logging_project_sink.drift_audit  (sink created last)
 
-Each arrow is one `depends_on`, and those three are what REQUIRED_EDGES pins.
+The last three arrows are `depends_on`, and those three are what REQUIRED_EDGES
+pins. The first is not: `time_sleep.logging_identity` reaches the identity
+through its own `triggers`, and a reference orders as well as a `depends_on`
+would, so an edge declared beside it would be redundant -- and a test asserting
+that redundant edge would report an ordering failure for removing a line that
+costs no ordering. That link is pinned instead by the `triggers` assertion in
+`terraform/modules/drift-pubsub/tests/sink_writer_grant.tftest.hcl`, which is
+where its real cost shows: lose the reference and the wait stops being re-paid
+when the identity is re-minted or the duration is raised.
+
 The chain roots at the service identity rather than at the topic because the
 grant has nothing to bind until Service Usage has minted the Logging agent;
-the topic is upstream of the grant too, but by reference rather than by
-`depends_on`, so it needs no pinning and is not one of the three.
+the topic is upstream of the grant too, by reference, so it needs no pinning
+either.
+
+Only the last two of the three pinned edges prevent the email. The first
+answers a different failure: `time_sleep.logging_identity` sits between the
+Service Usage call and the grant because minting the agent and being able to
+bind it are different moments. On a project that did not already have one, the
+grant run straight after that call fails with "Service account ... does not
+exist" about one time in five, which stops the apply with the topic created and
+neither grant nor sink (#2693). No sink means no export and no email -- a
+louder failure, and still an install someone has to run again by hand.
+REQUIRED_EDGES carries that split: each edge is paired with what removing it
+costs, and no edge is listed whose removal costs nothing.
 
 Terraform destroys in reverse dependency order, so the same chain deletes the
 sink first, waits, and only then removes the grant and the topic. Keeping the
@@ -30,9 +51,11 @@ publish while the Log Router is still exporting trades `topic_not_found` for
 None of this is observable from `terraform test`. A mocked plan cannot show
 which resource was created first and has no notion of a destroy-time wait at
 all, so `terraform/modules/drift-pubsub/tests/sink_writer_grant.tftest.hcl`
-pins the values and this file pins the edges between them. Delete any one of
-the three and that suite still passes green -- which is the regression this
-file exists to catch.
+pins the values and this file pins the `depends_on` edges between them. Delete
+any one of the three and that suite still passes green -- which is the
+regression this file exists to catch. The fourth link is the exception that
+proves the split: being a reference rather than an edge, it shows up in the
+plan as a value, so the tftest can and does pin it.
 
 That division is why there are only two tests here. The drain's shape and the
 sink's postcondition are values, and the tftest suite reaches both; asserting
@@ -90,16 +113,35 @@ _RESOURCE_LABELS = 2
 GRANT = ("google_pubsub_topic_iam_member", "sink_writer")
 DRAIN = ("time_sleep", "sink_drain")
 SINK = ("google_logging_project_sink", "drift_audit")
+IDENTITY_WAIT = ("time_sleep", "logging_identity")
 SERVICE_IDENTITY = ("google_project_service_identity", "logging")
 
-# Each resource and the address it must declare a depends_on edge to, in the
-# order the chain runs. The reason each edge exists is in the module comment
-# beside it; the module README's "Why the sink is created last and destroyed
-# first" is the prose version.
+# The chain's first link, which is a reference rather than a depends_on and so
+# cannot be read out of REQUIRED_EDGES below: the wait keys its own triggers on
+# the identity's id, and that reference is what orders the wait after the mint.
+# Pinned here as well as in the tftest because the two catch different
+# rewrites. The tftest asserts the trigger's value, which a hand-built string
+# of the right shape satisfies; this asserts that the attribute is read at all.
+IDENTITY_REFERENCE = f"{SERVICE_IDENTITY[0]}.{SERVICE_IDENTITY[1]}.id"
+
+# Each resource, the address it must declare a depends_on edge to, and what
+# removing that edge costs, in the order the chain runs. The reason each edge
+# exists is in the module comment beside it; the module README's "Why the sink
+# is created last and destroyed first" is the prose version.
+_MAIL = (
+    "Cloud Logging will export to a topic that does not exist or that it cannot "
+    "publish to, and mail every project owner about it"
+)
+_UNBOUND_AGENT = (
+    "the publish grant will run before GCP can bind the Logging service agent it "
+    "names, and the apply fails with \"Service account ... does not exist\" on any "
+    "project whose agent did not already exist (#2693)"
+)
+
 REQUIRED_EDGES = (
-    (GRANT, SERVICE_IDENTITY),
-    (DRAIN, GRANT),
-    (SINK, DRAIN),
+    (GRANT, IDENTITY_WAIT, _UNBOUND_AGENT),
+    (DRAIN, GRANT, _MAIL),
+    (SINK, DRAIN, _MAIL),
 )
 
 # The sink's own attribute the grant must not read: doing so is what orders the
@@ -159,24 +201,36 @@ class DriftPubsubOrdering(unittest.TestCase):
         cls.tokens = _tokens(MODULE_MAIN.read_text(encoding="utf-8"))
 
     def test_the_sink_is_the_last_link_in_the_ordering_chain(self) -> None:
-        for (dependent_type, dependent_name), (target_type, target_name) in REQUIRED_EDGES:
+        for edge in REQUIRED_EDGES:
+            (dependent_type, dependent_name), (target_type, target_name), consequence = edge
             with self.subTest(dependent=dependent_name, target=target_name):
                 body = _resource_body(self.tokens, dependent_type, dependent_name)
                 references = _depends_on_references(body)
                 self.assertIsNotNone(
                     references,
                     f"{dependent_type}.{dependent_name} declares no depends_on, so nothing "
-                    f"orders it after {target_type}.{target_name}; Cloud Logging will export "
-                    f"to a topic that does not exist or that it cannot publish to, and mail "
-                    f"every project owner about it",
+                    f"orders it after {target_type}.{target_name}; {consequence}",
                 )
                 self.assertIn(
                     f"{target_type}.{target_name}",
                     references,
                     f"{dependent_type}.{dependent_name} must depend on "
-                    f"{target_type}.{target_name}; see the comment above it in main.tf. "
-                    f"A commented-out edge does not count -- this reads tokens, not text",
+                    f"{target_type}.{target_name}; {consequence}. See the comment above it "
+                    f"in main.tf. A commented-out edge does not count -- this reads tokens, "
+                    f"not text",
                 )
+
+    def test_the_wait_reaches_the_service_identity_by_reference(self) -> None:
+        body = _resource_body(self.tokens, *IDENTITY_WAIT)
+        self.assertIn(
+            IDENTITY_REFERENCE,
+            _code_text(body),
+            f"{IDENTITY_WAIT[0]}.{IDENTITY_WAIT[1]} must read {IDENTITY_REFERENCE} -- it is "
+            f"the chain's first link and the wait declares no depends_on, so a trigger "
+            f"keyed on anything else (a hand-built \"projects/<project>/services/...\" "
+            f"string included) leaves nothing ordering the wait after the mint and nothing "
+            f"re-paying it when the identity is re-minted",
+        )
 
     def test_the_grant_does_not_read_the_identity_off_the_sink(self) -> None:
         body = _resource_body(self.tokens, *GRANT)
