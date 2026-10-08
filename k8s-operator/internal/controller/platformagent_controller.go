@@ -538,6 +538,7 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 				"updates to this PlatformAgent will be rejected by the admission webhook until corrected",
 				"name", instance.Name, "namespace", instance.Namespace, "fields", gitProblemFields(&instance.Spec.Integration.IntegrationSpec))
 		}
+		r.recordIntegrationWarnings(instance)
 	}
 
 	// 1. Intercept Deletion
@@ -667,6 +668,12 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	if err != nil {
 		return ctrl.Result{}, err
 	}
+	// The gateway's annotation leaves out what only the broker reads, so a
+	// forge configuration change rolls the broker and not the gateway.
+	gatewayPolicyHash, err := getConfigMapHash(gatewayPolicyView(buildCredentialProxyPolicyConfigMap(instance)))
+	if err != nil {
+		return ctrl.Result{}, err
+	}
 
 	// 9b. Refuse a CR that mounts the broker's own volumes into the agent container.
 	//
@@ -790,7 +797,7 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	otlpEndpoint, otlpSource := r.resolveOTLPEndpoint(ctx, instance)
 	otlpDisabled := otlpSource == otlpSourceNone
 	netpolProf := r.resolveNetpolProfile(ctx, instance)
-	if err := r.reconcileWorkload(ctx, instance, configMapHash, fluentBitHash, settingsHash, proxyPolicyHash, agentPlugins, otlpEndpoint, otlpDisabled); err != nil {
+	if err := r.reconcileWorkload(ctx, instance, configMapHash, fluentBitHash, settingsHash, gatewayPolicyHash, agentPlugins, otlpEndpoint, otlpDisabled); err != nil {
 		return ctrl.Result{}, err
 	}
 
@@ -4497,6 +4504,31 @@ func (r *PlatformAgentReconciler) updateStatusDegraded(ctx context.Context, agen
 		setHostPathDroppedCondition(agent, hostPathDroppedMsg, now)
 	}
 	return r.Status().Update(ctx, agent)
+}
+
+// conditionReasonIntegrationWarning is the Event reason for a declaration that
+// is valid but does nothing.
+const conditionReasonIntegrationWarning = "IntegrationWarning"
+
+// recordIntegrationWarnings writes each of the integration's Warnings() as a
+// Warning Event on the PlatformAgent. Admission returns the same warnings, but
+// the chart ships the webhook off, and on such an install a credentialed forge
+// the broker is not given would otherwise leave no trace: the status is Ready,
+// because nothing is invalid. Each warning names a field path and a provider,
+// never a repository value, so nothing a clone URL carries reaches an Event.
+// The API server aggregates a repeated Event, so writing it on every
+// reconcile raises its count rather than adding one per pass.
+func (r *PlatformAgentReconciler) recordIntegrationWarnings(agent *agentv1alpha1.PlatformAgent) {
+	if agent.Spec.Integration == nil {
+		return
+	}
+	resolved, err := agent.Spec.Integration.ResolveGit()
+	if err != nil {
+		return
+	}
+	for _, warning := range resolved.Warnings() {
+		r.recordEvent(agent, corev1.EventTypeWarning, conditionReasonIntegrationWarning, warning)
+	}
 }
 
 // recordEvent writes an Event on obj through the manager's recorder, and
