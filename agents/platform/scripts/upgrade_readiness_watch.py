@@ -12,17 +12,26 @@ roster and asks the cheap half of the question first: which version is each
 cluster's release channel offering now, and which clusters are below it. A
 target version a cluster is below is *pending*. A pending version the ledger
 has never seen is *new*, and a new version earns a readiness report at once.
-After that the report is refreshed every ``REFRESH_DAYS_DEFAULT`` days while a
-cluster is still pending it, and a version no cluster is pending any more is
-retired from the ledger. A tick with nothing due prints nothing.
+After that the report is refreshed every ``REFRESH_DAYS_DEFAULT`` days (with
+ten minutes of slack for the tick's own drift) while a cluster is still pending
+it, and a version no cluster is pending any more is retired from the ledger,
+but only on a tick whose version table read every project: a partial table
+retires nothing, so a failed listing cannot erase a version and have it come
+back as new. A report whose readiness reads graded none of a version's
+pending clusters is written but not recorded, and the version is tried again
+the next day. A tick with nothing due prints nothing.
 
 Which clusters. The projects come from this pod, not from the sandbox:
 ``UPGRADE_READINESS_PROJECTS`` when set, otherwise the management project
 (``GCP_PROJECT_ID``) together with every project a Cluster Agent profile's
 ``cluster_identity`` names, the roster the cluster reconciler keeps; with
-neither, the sandbox's ``gcloud config get-value project``. Every cluster in
-those projects is read, including ones ``spec.scope.exclude.clusters`` keeps a
-Cluster Agent from, because the report script enumerates by project.
+neither, the sandbox's ``gcloud config get-value project``; and with nothing
+at all the tick fails closed rather than let the report script enumerate every
+project the credential can list. Every cluster in those projects is read,
+including ones ``spec.scope.exclude.clusters`` keeps a Cluster Agent from,
+because the report script enumerates by project. The readiness read runs once
+per project that holds a pending cluster, each run with its own timeout, so a
+project the sandbox cannot finish leaves only its own clusters ungraded.
 
 Where it runs, and how. The agent container carries no ``gcloud`` or
 ``kubectl``; both live in the shell sandbox behind the credential proxy, and
@@ -55,9 +64,10 @@ baseline, not a comparison with last week.
 
 Stdout is the chat message (``deliver: "chat"``): one line per report
 produced, naming the target version, the clusters pending it, how many the
-report graded blocked and ready and which are blocked, where the report is on
-the gateway pod, and when the next refresh is due; one line per version
-retired; and one line when a tick fails. A quiet tick prints nothing, and
+report graded blocked, ready and not graded and which are blocked, where the
+report is on the gateway pod, and when the next refresh is due; one line per
+version retired; one line when the version table was partial; and one line
+when a tick fails. A quiet tick prints nothing, and
 nothing reaches chat. Exit code is 0 on every path except a ledger or report
 that cannot be written, because a tick whose ledger did not save would report
 the same version as new again tomorrow.
@@ -104,6 +114,10 @@ JSON_INDENT = 2
 # The refresh interval: a report per new version, then one a week while pending.
 REFRESH_DAYS_ENV = "UPGRADE_READINESS_REFRESH_DAYS"
 REFRESH_DAYS_DEFAULT = 7
+# Ten minutes of slack on the weekly comparison: the tick's own start second drifts
+# from one day to the next, and a strict week would land on day eight (as
+# feedback_prompt.py found).
+REFRESH_SLACK_SECONDS = 10 * 60
 
 # Which projects the report enumerates, resolved on this side.
 PROJECTS_ENV = "UPGRADE_READINESS_PROJECTS"
@@ -114,6 +128,10 @@ IDENTITY_PROJECT_KEY = "project"
 CONFIG_PROJECT_ARGV = ("gcloud", "config", "get-value", "project")
 PROJECT_LOOKUP_TIMEOUT_SECONDS = 30
 PROJECT_FLAG = "--project"
+NO_PROJECT_DETAIL = (
+    f"no GCP project: set {PROJECTS_ENV} or {MANAGEMENT_PROJECT_ENV}, onboard a cluster, or configure gcloud in the sandbox; "
+    "refusing to let the report enumerate every project the credential can list"
+)
 
 # The skill's scripts: the agent image's copy first, the checkout's beside this
 # file for a run from the repository.
@@ -147,6 +165,7 @@ STDERR_EXCERPT_CHARS = 300
 
 # The report's vocabulary this job reads (fleet_upgrade_report.py, upgrade_readiness.py).
 MEMBERS_KEY = "members"
+EXIT_OK = 0
 STATUS_KEY = "status"
 TARGET_KEY = "target_version"
 READINESS_KEY = "readiness"
@@ -172,12 +191,20 @@ LINE_PREFIX = "upgrade readiness"
 RETIRED_LINE = "{prefix}: {version} is no longer pending on any cluster; retired from the watch"
 REPORT_LINE = (
     "{prefix}: {reason} {version}, {pending} cluster(s) pending ({names}): {blocked} blocked{blocked_names}, "
-    "{ready} ready; report on the gateway pod at {path}; next refresh after {next_date}"
+    "{ready} ready{ungraded}; report on the gateway pod at {path}; next refresh after {next_date}"
 )
 BLOCKED_NAMES = " ({names})"
 FAILED_LINE = "{prefix} watch: {what} failed: {detail}"
 FAILED_WHAT_TICK = "the tick"
 FAILED_WHAT_WRITE = "writing the ledger or the report"
+PARTIAL_LINE = "{prefix} watch: the version table was partial ({errors} read error(s), exit {code}); nothing retired this tick"
+UNGRADED_LINE = (
+    "{prefix}: {reason} {version}, {pending} cluster(s) pending ({names}): none graded ({detail}); "
+    "report on the gateway pod at {path}; retrying tomorrow"
+)
+UNGRADED_COUNT = ", {count} not graded"
+READS_FAILED_DETAIL = "readiness reads failed"
+PROJECT_RUN_FAILED_DETAIL = "readiness run for {project} failed: {error}"
 TIMED_OUT_DETAIL = "the sandbox run timed out after {seconds}s"
 DRY_RUN_WOULD_REPORT = "dry run: would report {version} ({reason}) for {names}"
 DRY_RUN_NOTHING_DUE = "dry run: nothing due; pending versions: {versions}"
@@ -262,7 +289,9 @@ def projects() -> list[str]:
         return sorted(found)
     completed = sandbox_exec.run(list(CONFIG_PROJECT_ARGV), timeout=PROJECT_LOOKUP_TIMEOUT_SECONDS, check=False)
     configured = (completed.stdout or "").strip()
-    return [configured] if configured else []
+    if not configured:
+        raise RuntimeError(NO_PROJECT_DETAIL)
+    return [configured]
 
 
 def project_flags(names: list[str]) -> list[str]:
@@ -388,6 +417,15 @@ def load_ledger(path: Path) -> dict:
         return empty_ledger()
     if not isinstance(data, dict) or not isinstance(data.get(TARGETS_KEY), dict):
         raise RuntimeError(f"ledger at {path} is not this job's ledger; refusing to overwrite it")
+    for version, entry in data[TARGETS_KEY].items():
+        shape_ok = (
+            isinstance(entry, dict)
+            and isinstance(entry.get(PENDING_KEY), list)
+            and all(isinstance(c, str) for c in entry[PENDING_KEY])
+            and (entry.get(LAST_REPORT_KEY) is None or parse_iso(entry.get(LAST_REPORT_KEY)) is not None)
+        )
+        if not shape_ok:
+            raise RuntimeError(f"ledger at {path} has a malformed entry for {version}; refusing to overwrite it")
     return data
 
 
@@ -398,12 +436,17 @@ def save_ledger(path: Path, ledger: dict) -> None:
     tmp.replace(path)
 
 
-def decide(ledger: dict, pending: dict[str, list[str]], now: datetime, days: int) -> tuple[dict[str, str], list[str]]:
+def decide(
+    ledger: dict, pending: dict[str, list[str]], now: datetime, days: int, retire: bool = True
+) -> tuple[dict[str, str], list[str]]:
     """Apply the gate. Returns (due: version -> reason, retired versions) and
     updates the ledger's targets in place: new versions get ``first_seen``,
-    every pending version its current cluster list, retired versions go."""
+    every pending version its current cluster list, and, when ``retire`` is
+    set (a complete version table), versions no cluster is pending go. A
+    ``last_report_at`` in the future counts as never reported."""
     targets = ledger[TARGETS_KEY]
     due: dict[str, str] = {}
+    interval = timedelta(days=days) - timedelta(seconds=REFRESH_SLACK_SECONDS)
     for version, clusters in sorted(pending.items()):
         entry = targets.get(version)
         if entry is None:
@@ -412,11 +455,11 @@ def decide(ledger: dict, pending: dict[str, list[str]], now: datetime, days: int
             continue
         entry[PENDING_KEY] = clusters
         last = parse_iso(entry.get(LAST_REPORT_KEY))
-        if last is None:
+        if last is None or last > now:
             due[version] = REASON_NEW
-        elif now - last >= timedelta(days=days):
+        elif now - last >= interval:
             due[version] = REASON_REFRESH
-    retired = sorted(version for version in targets if version not in pending)
+    retired = sorted(version for version in targets if version not in pending) if retire else []
     for version in retired:
         del targets[version]
     return due, retired
@@ -425,8 +468,9 @@ def decide(ledger: dict, pending: dict[str, list[str]], now: datetime, days: int
 # --- the report files ------------------------------------------------------
 
 
-def readiness_verdicts(report: dict, clusters: list[str]) -> tuple[list[str], list[str]]:
-    """The blocked and the ready clusters among ``clusters``, by member key."""
+def readiness_verdicts(report: dict, clusters: list[str]) -> tuple[list[str], list[str], list[str]]:
+    """The blocked, the ready and the ungraded clusters among ``clusters``, by
+    member key; a cluster the run did not reach or graded ``unknown`` is ungraded."""
     wanted = set(clusters)
     blocked: list[str] = []
     ready: list[str] = []
@@ -439,7 +483,32 @@ def readiness_verdicts(report: dict, clusters: list[str]) -> tuple[list[str], li
             blocked.append(key)
         elif status == READINESS_READY:
             ready.append(key)
-    return sorted(blocked), sorted(ready)
+    ungraded = sorted(wanted - set(blocked) - set(ready))
+    return sorted(blocked), sorted(ready), ungraded
+
+
+def project_of(member_key_text: str) -> str:
+    return member_key_text.split(MEMBER_KEY_SEPARATOR, 1)[0]
+
+
+def readiness_by_project(pending: dict[str, list[str]], due: dict[str, str]) -> tuple[dict, dict[str, str]]:
+    """One readiness run per project that holds a due version's pending
+    clusters, each with its own timeout, merged into one envelope; a project
+    whose run failed leaves its clusters ungraded and is named in the second
+    value, so the other projects' versions still get their report."""
+    needed = sorted({project_of(key) for version in due for key in pending[version]})
+    merged = {ENVELOPE_EXIT_KEY: EXIT_OK, ENVELOPE_TABLES_KEY: "", ENVELOPE_REPORT_KEY: {MEMBERS_KEY: [], ERRORS_KEY: []}}
+    failures: dict[str, str] = {}
+    for project in needed:
+        try:
+            envelope = run_report([project], readiness=True)
+        except RuntimeError as exc:
+            failures[project] = str(exc)
+            continue
+        merged[ENVELOPE_TABLES_KEY] += envelope.get(ENVELOPE_TABLES_KEY, "")
+        merged[ENVELOPE_REPORT_KEY][MEMBERS_KEY] += envelope[ENVELOPE_REPORT_KEY].get(MEMBERS_KEY) or []
+        merged[ENVELOPE_REPORT_KEY][ERRORS_KEY] += envelope[ENVELOPE_REPORT_KEY].get(ERRORS_KEY) or []
+    return merged, failures
 
 
 def cluster_names(clusters: list[str]) -> str:
@@ -458,7 +527,7 @@ def tables_without_the_output_line(tables: str) -> str:
 
 def render_markdown(version: str, reason: str, clusters: list[str], envelope: dict, now: datetime, days: int) -> str:
     report = envelope[ENVELOPE_REPORT_KEY]
-    blocked, ready = readiness_verdicts(report, clusters)
+    blocked, ready, ungraded = readiness_verdicts(report, clusters)
     lines = [
         f"# Upgrade readiness for {version}",
         "",
@@ -466,7 +535,9 @@ def render_markdown(version: str, reason: str, clusters: list[str], envelope: di
         f"{len(clusters)} cluster(s) are below this version: {', '.join(clusters)}. "
         f"Of those the readiness check graded {len(blocked)} blocked"
         + (f" ({', '.join(blocked)})" if blocked else "")
-        + f" and {len(ready)} ready. "
+        + f", {len(ready)} ready"
+        + (f" and {len(ungraded)} not graded ({', '.join(ungraded)}; their reads failed)" if ungraded else "")
+        + ". "
         f"The next scheduled refresh is after {(now + timedelta(days=days)).strftime(DATE_FORMAT)} "
         "while any cluster is still pending; ask the Platform Agent for the report at any time to refresh it sooner.",
         "",
@@ -518,9 +589,13 @@ def tick(dry_run: bool = False) -> list[str]:
     ledger = load_ledger(ledger_path)
     names = projects()
     versions = run_report(names, readiness=False)
+    read_errors = versions[ENVELOPE_REPORT_KEY].get(ERRORS_KEY) or []
+    complete = versions.get(ENVELOPE_EXIT_KEY) == EXIT_OK and not read_errors
     pending = pending_targets(versions[ENVELOPE_REPORT_KEY])
-    due, retired = decide(ledger, pending, now, days)
+    due, retired = decide(ledger, pending, now, days, retire=complete)
     lines = [RETIRED_LINE.format(prefix=LINE_PREFIX, version=v) for v in retired]
+    if not complete:
+        lines.append(PARTIAL_LINE.format(prefix=LINE_PREFIX, errors=len(read_errors), code=versions.get(ENVELOPE_EXIT_KEY)))
     if dry_run:
         for version, reason in due.items():
             lines.append(DRY_RUN_WOULD_REPORT.format(version=version, reason=reason, names=cluster_names(pending[version])))
@@ -528,14 +603,24 @@ def tick(dry_run: bool = False) -> list[str]:
             lines.append(DRY_RUN_NOTHING_DUE.format(versions=", ".join(sorted(pending)) or NONE_WORD))
         return lines
     if due:
-        readiness = run_report(names, readiness=True)
+        readiness, failures = readiness_by_project(pending, due)
         for version, reason in due.items():
             clusters = pending[version]
             try:
                 path = write_report(home, version, reason, clusters, readiness, now, days)
             except OSError as exc:
                 raise WriteFailed(str(exc)) from exc
-            blocked, ready = readiness_verdicts(readiness[ENVELOPE_REPORT_KEY], clusters)
+            blocked, ready, ungraded = readiness_verdicts(readiness[ENVELOPE_REPORT_KEY], clusters)
+            if not blocked and not ready:
+                failed_projects = sorted({project_of(k) for k in clusters} & set(failures))
+                detail = "; ".join(PROJECT_RUN_FAILED_DETAIL.format(project=p, error=failures[p]) for p in failed_projects) or READS_FAILED_DETAIL
+                lines.append(
+                    UNGRADED_LINE.format(
+                        prefix=LINE_PREFIX, reason=reason, version=version, pending=len(clusters),
+                        names=cluster_names(clusters), detail=detail, path=path,
+                    )
+                )
+                continue
             ledger[TARGETS_KEY][version][LAST_REPORT_KEY] = iso(now)
             lines.append(
                 REPORT_LINE.format(
@@ -547,6 +632,7 @@ def tick(dry_run: bool = False) -> list[str]:
                     blocked=len(blocked),
                     blocked_names=BLOCKED_NAMES.format(names=cluster_names(blocked)) if blocked else "",
                     ready=len(ready),
+                    ungraded=UNGRADED_COUNT.format(count=len(ungraded)) if ungraded else "",
                     path=path,
                     next_date=(now + timedelta(days=days)).strftime(DATE_FORMAT),
                 )

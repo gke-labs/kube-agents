@@ -162,7 +162,9 @@ so a quiet day costs no message.
 Which clusters it reads is decided on the agent pod: `UPGRADE_READINESS_PROJECTS`
 when set, otherwise the management project and every project a Cluster Agent
 profile's identity names, the roster `stall-watch` follows; with neither, the
-sandbox's configured project. Within those projects the report script
+sandbox's configured project; and with nothing at all the tick fails closed,
+because the report script's own fallback is every project the credential can
+list. Within those projects the report script
 enumerates every cluster, so a cluster `spec.scope.exclude.clusters` keeps a
 Cluster Agent from is still read here. That read is `gcloud` cluster metadata
 for the version table and, on a report day, one `get-credentials` and one
@@ -190,7 +192,15 @@ sandbox and cannot open that path, which is why the line carries the verdicts.
 
 Daily at 10:10 UTC, after the morning audits and before the US day; the
 version table is a handful of `gcloud` list calls and the readiness report
-runs only on the day a version appears or its week comes round. The three
+runs only on the day a version appears or its week comes round, once per
+project that holds a pending cluster with its own timeout, so one project the
+sandbox cannot finish leaves only its own clusters ungraded and the others'
+versions still reported. Three guards keep the ledger honest: a version is
+retired only on a tick whose version table read every project, a report that
+graded none of a version's pending clusters is written but not recorded (the
+chat line says "none graded" and the version is tried again tomorrow), and the
+weekly comparison carries ten minutes of slack so the tick's own drift cannot
+push a refresh to day eight. The three
 environment knobs (`UPGRADE_READINESS_REFRESH_DAYS`, `_PROJECTS`,
 `_WATCH_HOME`) are for a run started by hand in the pod; the operator's
 `spec.deployment.env` allowlist does not carry them.

@@ -24,15 +24,15 @@ OLDER_TARGET = "1.34.9-gke.1000000"
 ARGV_LINE_PREFIX = "ARGV = "
 
 
-def member(cluster: str, status: str, target: str = TARGET, readiness: str | None = None) -> dict:
-    entry = {"project": "p1", "location": "us-central1-a", "cluster": cluster, "status": status, "target_version": target}
+def member(cluster: str, status: str, target: str = TARGET, readiness: str | None = None, project: str = "p1") -> dict:
+    entry = {"project": project, "location": "us-central1-a", "cluster": cluster, "status": status, "target_version": target}
     if readiness is not None:
         entry["readiness"] = {"status": readiness}
     return entry
 
 
-def envelope(members: list[dict], tables: str = "| table |", errors: list | None = None) -> dict:
-    return {"exit": 0, "tables": tables, "report": {"members": members, "errors": errors or []}}
+def envelope(members: list[dict], tables: str = "| table |", errors: list | None = None, exit_code: int = 0) -> dict:
+    return {"exit": exit_code, "tables": tables, "report": {"members": members, "errors": errors or []}}
 
 
 def loader_argv(stdin: str) -> list[str]:
@@ -44,10 +44,11 @@ class FakeSandbox:
     """Stands in for sandbox_exec.run: answers the version table and the
     readiness run from canned envelopes and records what was asked."""
 
-    def __init__(self, versions: dict, readiness: dict | None = None, readiness_error: Exception | None = None):
+    def __init__(self, versions: dict, readiness: dict | None = None, readiness_error: Exception | None = None, failing_projects: set | None = None):
         self.versions = versions
         self.readiness = readiness or versions
         self.readiness_error = readiness_error
+        self.failing_projects = failing_projects or set()
         self.calls: list[tuple[str, list[str], float]] = []
 
     def run(self, argv, *, timeout, check, stdin=None):
@@ -59,7 +60,12 @@ class FakeSandbox:
         self.calls.append(("readiness" if wanted else "versions", report_argv, timeout))
         if wanted and self.readiness_error is not None:
             raise self.readiness_error
+        if wanted and any(p in self.failing_projects for p in report_argv[1::2]):
+            return subprocess.CompletedProcess(argv, 255, stdout="", stderr="ssh: lost connection")
         body = self.readiness if wanted else self.versions
+        if wanted:
+            projects = set(report_argv[1::2])
+            body = dict(body, report=dict(body["report"], members=[m for m in body["report"]["members"] if m["project"] in projects]))
         return subprocess.CompletedProcess(argv, 0, stdout=f"noise\n{watch.ENVELOPE_SENTINEL}\n{json.dumps(body)}\n", stderr="")
 
     def kinds(self) -> list[str]:
@@ -126,7 +132,7 @@ class NewVersion(Base):
         text = (self.home / "reports" / TARGET / "20261008T071000Z.md").read_text()
         self.assertIn("| readiness table |", text)
         self.assertIn("new target version", text)
-        self.assertIn("graded 1 blocked (p1/us-central1-a/a) and 1 ready", text)
+        self.assertIn("graded 1 blocked (p1/us-central1-a/a), 1 ready.", text)
         self.assertIn("first-run baseline", text)
 
     def test_the_report_script_s_output_path_line_is_not_saved(self) -> None:
@@ -158,7 +164,7 @@ class NewVersion(Base):
         self.assertTrue((self.home / "reports" / TARGET / "latest.md").exists())
         self.assertTrue((self.home / "reports" / OLDER_TARGET / "latest.md").exists())
 
-    def test_failed_reads_are_listed_in_the_report(self) -> None:
+    def test_a_version_none_of_whose_clusters_were_graded_is_written_but_not_recorded(self) -> None:
         readiness = envelope(
             [member("a", "lagging", readiness="unknown")],
             errors=[{"project": "p1", "location": "us-central1-a", "cluster": "a", "message": "get-credentials failed: 403"}],
@@ -166,10 +172,35 @@ class NewVersion(Base):
         sandbox = FakeSandbox(envelope([member("a", "lagging")]), readiness)
         code, out = self.run_tick(sandbox)
         self.assertEqual(code, 0)
-        self.assertIn("0 blocked, 0 ready", out)
+        self.assertIn(f"new target version {TARGET}, 1 cluster(s) pending (a): none graded (readiness reads failed)", out)
+        self.assertIn("retrying tomorrow", out)
+        self.assertNotIn("0 blocked", out)
+        self.assertIsNone(self.ledger()["targets"][TARGET]["last_report_at"])
         text = (self.home / "reports" / TARGET / "latest.md").read_text()
+        self.assertIn("1 not graded (p1/us-central1-a/a; their reads failed)", text)
         self.assertIn("Reads that failed during this run", text)
         self.assertIn("- p1/us-central1-a/a: get-credentials failed: 403", text)
+
+    def test_a_partly_graded_version_counts_the_ungraded_clusters_in_the_line(self) -> None:
+        readiness = envelope([member("a", "lagging", readiness="ready"), member("b", "lagging", readiness="unknown")])
+        sandbox = FakeSandbox(envelope([member("a", "lagging"), member("b", "lagging")]), readiness)
+        code, out = self.run_tick(sandbox)
+        self.assertEqual(code, 0)
+        self.assertIn("0 blocked, 1 ready, 1 not graded;", out)
+        self.assertEqual(self.ledger()["targets"][TARGET]["last_report_at"], NOW.isoformat())
+
+    def test_readiness_runs_once_per_project_and_a_failed_project_leaves_only_its_clusters_ungraded(self) -> None:
+        versions = envelope([member("a", "lagging"), member("b", "lagging", project="p2", target=OLDER_TARGET)])
+        readiness = envelope([member("a", "lagging", readiness="ready"), member("b", "lagging", project="p2", target=OLDER_TARGET, readiness="ready")])
+        with mock.patch.dict(os.environ, {watch.PROJECTS_ENV: "p1,p2"}):
+            sandbox = FakeSandbox(versions, readiness, failing_projects={"p2"})
+            code, out = self.run_tick(sandbox)
+        self.assertEqual(code, 0)
+        self.assertEqual([c[1] for c in sandbox.calls if c[0] == "readiness"], [["--project", "p1", "--readiness", "--kubeconfig-dir", watch.SANDBOX_KUBECONFIG_DIR], ["--project", "p2", "--readiness", "--kubeconfig-dir", watch.SANDBOX_KUBECONFIG_DIR]])
+        self.assertIn(f"{TARGET}, 1 cluster(s) pending (a): 0 blocked, 1 ready;", out)
+        self.assertIn(f"{OLDER_TARGET}, 1 cluster(s) pending (b): none graded (readiness run for p2 failed: sandbox exited 255 without a report: ssh: lost connection)", out)
+        self.assertEqual(self.ledger()["targets"][TARGET]["last_report_at"], NOW.isoformat())
+        self.assertIsNone(self.ledger()["targets"][OLDER_TARGET]["last_report_at"])
 
 
 class Refresh(Base):
@@ -189,6 +220,21 @@ class Refresh(Base):
         code, out = self.run_tick(sandbox)
         self.assertEqual(code, 0)
         self.assertIn(f"scheduled refresh {TARGET}, 1 cluster(s) pending (a): 1 blocked (a), 0 ready", out)
+        self.assertEqual(self.ledger()["targets"][TARGET]["last_report_at"], NOW.isoformat())
+
+    def test_a_tick_a_few_seconds_short_of_a_week_still_refreshes(self) -> None:
+        self.seed(TARGET, NOW - timedelta(days=7) + timedelta(seconds=45))
+        sandbox = FakeSandbox(envelope([member("a", "lagging")]), envelope([member("a", "lagging", readiness="ready")]))
+        code, out = self.run_tick(sandbox)
+        self.assertEqual(code, 0)
+        self.assertIn("scheduled refresh", out)
+
+    def test_a_last_report_in_the_future_counts_as_never_reported(self) -> None:
+        self.seed(TARGET, NOW + timedelta(days=3))
+        sandbox = FakeSandbox(envelope([member("a", "lagging")]), envelope([member("a", "lagging", readiness="ready")]))
+        code, out = self.run_tick(sandbox)
+        self.assertEqual(code, 0)
+        self.assertIn("new target version", out)
         self.assertEqual(self.ledger()["targets"][TARGET]["last_report_at"], NOW.isoformat())
 
     def test_the_refresh_interval_comes_from_the_environment(self) -> None:
@@ -216,6 +262,16 @@ class Retired(Base):
         self.assertEqual(code, 0)
         self.assertEqual(out.strip(), f"upgrade readiness: {OLDER_TARGET} is no longer pending on any cluster; retired from the watch")
         self.assertEqual(self.ledger()["targets"], {})
+
+
+    def test_a_partial_version_table_retires_nothing_and_says_so(self) -> None:
+        self.seed(OLDER_TARGET, NOW, ["p1/us-central1-a/b"])
+        partial = envelope([member("a", "current")], errors=[{"project": "p1", "message": "clusters list failed"}], exit_code=1)
+        sandbox = FakeSandbox(partial)
+        code, out = self.run_tick(sandbox)
+        self.assertEqual(code, 0)
+        self.assertEqual(out.strip(), "upgrade readiness watch: the version table was partial (1 read error(s), exit 1); nothing retired this tick")
+        self.assertIn(OLDER_TARGET, self.ledger()["targets"])
 
 
 class DryRun(Base):
@@ -268,17 +324,18 @@ class Failures(Base):
         self.assertEqual(out.getvalue().strip(), f"upgrade readiness watch: the tick failed: RuntimeError: the sandbox run timed out after {watch.VERSION_TABLE_TIMEOUT_SECONDS}s")
         self.assertNotIn("ssh", out.getvalue())
 
-    def test_a_failed_readiness_run_leaves_the_ledger_unsaved_so_the_version_is_retried(self) -> None:
+    def test_a_failed_readiness_run_records_no_report_so_the_version_is_retried(self) -> None:
         sandbox = FakeSandbox(envelope([member("a", "lagging")]), readiness_error=RuntimeError("sandbox exited 255 without a report: lost connection"))
         code, out = self.run_tick(sandbox)
         self.assertEqual(code, 0)
-        self.assertIn("the tick failed: RuntimeError: sandbox exited 255", out)
-        self.assertFalse((self.home / watch.LEDGER_FILE_NAME).exists())
-        self.assertFalse((self.home / "reports").exists())
+        self.assertIn("none graded (readiness run for p1 failed: sandbox exited 255 without a report: lost connection)", out)
+        self.assertIn("retrying tomorrow", out)
+        self.assertIsNone(self.ledger()["targets"][TARGET]["last_report_at"])
         sandbox = FakeSandbox(envelope([member("a", "lagging")]), envelope([member("a", "lagging", readiness="ready")]))
         code, out = self.run_tick(sandbox)
         self.assertEqual(code, 0)
         self.assertIn("new target version", out)
+        self.assertEqual(self.ledger()["targets"][TARGET]["last_report_at"], NOW.isoformat())
 
     def test_a_foreign_file_at_the_ledger_path_is_refused_not_overwritten(self) -> None:
         self.home.mkdir(parents=True)
@@ -289,6 +346,28 @@ class Failures(Base):
         self.assertIn("is not this job's ledger; refusing to overwrite it", out)
         self.assertEqual(sandbox.calls, [])
         self.assertEqual((self.home / watch.LEDGER_FILE_NAME).read_text(), '{"something": "else"}')
+
+    def test_a_malformed_entry_in_the_ledger_is_refused_not_overwritten(self) -> None:
+        self.home.mkdir(parents=True)
+        (self.home / watch.LEDGER_FILE_NAME).write_text(json.dumps({"targets": {TARGET: "x"}}))
+        sandbox = FakeSandbox(envelope([member("a", "lagging")]))
+        code, out = self.run_tick(sandbox)
+        self.assertEqual(code, 0)
+        self.assertIn(f"has a malformed entry for {TARGET}; refusing to overwrite it", out)
+        self.assertEqual(sandbox.calls, [])
+
+    def test_no_resolvable_project_fails_closed(self) -> None:
+        def unset(argv, *, timeout, check, stdin=None):
+            return subprocess.CompletedProcess(argv, 0, stdout="", stderr="(unset)\n")
+
+        out = io.StringIO()
+        with mock.patch.dict(os.environ, {watch.PROJECTS_ENV: "", watch.MANAGEMENT_PROJECT_ENV: ""}), mock.patch.object(
+            watch, "roster_projects", return_value=set()
+        ), mock.patch.object(watch.sandbox_exec, "run", side_effect=unset), redirect_stdout(out):
+            code = watch.main([])
+        self.assertEqual(code, 0)
+        self.assertIn("the tick failed: RuntimeError: no GCP project: set UPGRADE_READINESS_PROJECTS or GCP_PROJECT_ID", out.getvalue())
+        self.assertFalse((self.home / watch.LEDGER_FILE_NAME).exists())
 
     def test_an_unsaveable_ledger_exits_non_zero(self) -> None:
         sandbox = FakeSandbox(envelope([member("a", "lagging")]), envelope([member("a", "lagging", readiness="ready")]))
@@ -316,6 +395,16 @@ class Projects(unittest.TestCase):
             watch, "roster_projects", return_value={"tenant-a", "mgmt"}
         ):
             self.assertEqual(watch.projects(), ["mgmt", "tenant-a"])
+
+    def test_nothing_resolvable_raises_rather_than_widening_the_scope(self) -> None:
+        def unset(argv, *, timeout, check, stdin=None):
+            return subprocess.CompletedProcess(argv, 0, stdout="", stderr="(unset)\n")
+
+        with mock.patch.dict(os.environ, {watch.PROJECTS_ENV: "", watch.MANAGEMENT_PROJECT_ENV: ""}), mock.patch.object(
+            watch, "roster_projects", return_value=set()
+        ), mock.patch.object(watch.sandbox_exec, "run", side_effect=unset):
+            with self.assertRaises(RuntimeError):
+                watch.projects()
 
     def test_the_sandbox_s_configured_project_as_the_last_resort(self) -> None:
         sandbox = FakeSandbox(envelope([]))
