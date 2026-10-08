@@ -185,7 +185,11 @@ session-routed conversation, that the worker picks it up at its next turn bounda
 if the task is still running; on a fixed-routed one, "got it, I'll take that next".
 The executor's notice on the stream corrects it when the follow-up was not taken
 (queue full, the task already ending), and at the task's terminal the gateway says so
-for a follow-up the executor never answered or never ran. Those counts are the relay's
+for a follow-up the executor never answered or never ran, and in one line for those it
+refused because it could not continue the session. The never-answered line posts only
+once the gateway has heard a steer notice from that addressee since it started: an
+executor that predates the notices answers none, and every follow-up would read as
+missed. Those counts are the relay's
 cache, so a gateway restart in between loses them and that terminal says nothing about
 the follow-ups. Each earlier turn's answer posts as it completes; the result is the
 last turn's answer and the only deliverable a program behind a door receives. A steer into a delegated

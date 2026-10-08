@@ -60,13 +60,20 @@ type relayState struct {
 	steersSent int
 	// The executor's word on those follow-ups (G22): answered, the envelope
 	// ids it sent a steer notice for; queued, those it queued and has not
-	// refused since, except task-ended; turnsStarted, the turn answers
-	// posted, each the start of one queued follow-up's turn. At the
-	// terminal, steersSent - answered never reached a live run and queued -
-	// turnsStarted never ran (postSteerShortfall). Cache like the rest: a
-	// gateway restart forgets them, and the terminal then says nothing.
+	// refused since; ended, those it refused task-ended; noResume, how many
+	// it refused no-resume. turnsStarted counts the turn answers posted. The
+	// executor publishes one just before the next queued follow-up's turn
+	// starts, so it counts that turn as started even if a cancel, deadline
+	// or shutdown stops it in between. Such a follow-up is then refused
+	// task-ended, so it moves from queued to ended and is still counted. At
+	// the terminal (postSteerShortfall), steersSent - answered never reached
+	// a live run, and ended plus queued - turnsStarted never ran. Cache like
+	// the rest: a gateway restart forgets them, and the terminal then says
+	// nothing.
 	answered     map[string]bool
 	queued       map[string]bool
+	ended        map[string]bool
+	noResume     int
 	turnsStarted int
 	// turn is the turn answer being assembled; turnPending, that it has
 	// parts not yet posted.
@@ -231,7 +238,7 @@ func (g *Gateway) applyStatus(ctx context.Context, rec *SessionRecord, rs *relay
 		// Any other non-final status message is worth the room seeing.
 		if s.Status.Message != nil {
 			if n, ok := lib.SteerNoticeOf(s.Status.Message.Parts); ok {
-				g.applySteerNotice(rec, rs, n)
+				g.applySteerNotice(rec, rs, taskID, n)
 			} else if note := joinTextParts(s.Status.Message.Parts); note != "" {
 				g.post(rec.Key, "ℹ️ "+note)
 			}
@@ -399,7 +406,7 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 			g.post(rec.Key, "🚫 the executor rejected the task")
 		}
 	}
-	g.postSteerShortfall(rec, rs)
+	g.postSteerShortfall(rec, rs, taskID)
 	g.flushNotices(rec.Key, rs)
 
 	if active := rec.ActiveTask; active != nil && active.TaskID == taskID {
@@ -492,17 +499,28 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 
 // applySteerNotice reads the executor's word on one follow-up. Queued posts
 // nothing: steerTask already acknowledged it. Refused posts why, except
-// task-ended, which the terminal reports in one line with any lost ones.
-func (g *Gateway) applySteerNotice(rec *SessionRecord, rs *relayState, n lib.SteerNotice) {
+// task-ended and no-resume. The terminal reports task-ended in one line with
+// any lost ones, and no-resume in one line however many there were: the
+// executor refuses every queued follow-up at once for it. It also records
+// that the task's addressee speaks steer notices (postSteerShortfall says
+// why).
+func (g *Gateway) applySteerNotice(rec *SessionRecord, rs *relayState, taskID string, n lib.SteerNotice) {
 	if rs.answered == nil {
-		rs.answered, rs.queued = make(map[string]bool), make(map[string]bool)
+		rs.answered, rs.queued, rs.ended = make(map[string]bool), make(map[string]bool), make(map[string]bool)
 	}
+	g.mu.Lock()
+	g.steerNoticesFrom[rec.AddresseeFor(taskID)] = true
+	g.mu.Unlock()
 	rs.answered[n.EnvelopeID] = true
 	switch {
 	case n.Steer == lib.SteerQueued:
 		rs.queued[n.EnvelopeID] = true
 	case n.Reason == lib.SteerReasonTaskEnded:
-		// Stays in queued (it was): counted at the terminal.
+		delete(rs.queued, n.EnvelopeID)
+		rs.ended[n.EnvelopeID] = true
+	case n.Reason == lib.SteerReasonNoResume:
+		delete(rs.queued, n.EnvelopeID)
+		rs.noResume++
 	default:
 		delete(rs.queued, n.EnvelopeID)
 		g.post(rec.Key, steerNotTakenNotice(n.Reason))
@@ -535,17 +553,28 @@ func (g *Gateway) flushTurn(rec *SessionRecord, rs *relayState) {
 
 // postSteerShortfall tells the room, after the deliverable, about follow-ups
 // it was told would be taken and were not: ones the executor never answered
-// (they reached the stream after its terminal), and queued ones whose turn
-// never started (refused task-ended, or lost with the executor).
-func (g *Gateway) postSteerShortfall(rec *SessionRecord, rs *relayState) {
+// (they reached the stream after its terminal), queued ones whose turn never
+// started (refused task-ended, or lost with the executor), and ones refused
+// because the session could not be resumed.
+//
+// The never-answered line needs an executor that answers at all. A bridge
+// that predates steer notices (a sidecar image older than the gateway, which
+// the CR pins separately) answers none, and every follow-up would read as
+// missed. So the line posts only once this gateway has heard a steer notice
+// from the task's addressee, on this task or another since it started.
+func (g *Gateway) postSteerShortfall(rec *SessionRecord, rs *relayState, taskID string) {
 	g.mu.Lock()
 	sent := rs.steersSent
+	speaks := g.steerNoticesFrom[rec.AddresseeFor(taskID)]
 	g.mu.Unlock()
-	if sent-len(rs.answered) > 0 {
+	if sent-len(rs.answered) > 0 && speaks {
 		g.post(rec.Key, noticeSteerMissed)
 	}
-	if unrun := len(rs.queued) - rs.turnsStarted; unrun > 0 {
+	if unrun := len(rs.ended) + max(0, len(rs.queued)-rs.turnsStarted); unrun > 0 {
 		g.post(rec.Key, fmt.Sprintf(noticeSteersUnrun, unrun))
+	}
+	if rs.noResume > 0 {
+		g.post(rec.Key, fmt.Sprintf(noticeSteersNoResume, rs.noResume))
 	}
 }
 

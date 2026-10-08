@@ -150,6 +150,10 @@ type Gateway struct {
 	taskSessions map[string]string
 	// relays holds per-task render state for the rolling progress line.
 	relays map[string]*relayState
+	// steerNoticesFrom is each addressee this gateway has heard a steer
+	// notice from since it started, under mu: the relay's evidence that the
+	// executor answers follow-ups at all (postSteerShortfall).
+	steerNoticesFrom map[string]bool
 
 	// backend names the gateway's configured chat backend, which is what a
 	// message that names none is attributed to. Since the mux and the side
@@ -368,30 +372,31 @@ func New(o Options) (*Gateway, error) {
 		return nil, err
 	}
 	g := &Gateway{
-		turnBudget:     turnTimeout,
-		cfg:            o.Config,
-		client:         o.Client,
-		reg:            NewRegistry(o.Client),
-		adapter:        o.Adapter,
-		pm:             pm,
-		ps:             ps,
-		log:            log,
-		runCtx:         context.Background(),
-		sessionLocks:   map[string]*sessionLockEntry{},
-		taskSessions:   map[string]string{},
-		relays:         map[string]*relayState{},
-		backend:        backend,
-		injectPM:       injectPM,
-		injectAudience: injectAudience,
-		a2aPM:          a2aPM,
-		a2aAudience:    a2aAudience,
-		gchatAllowed:   gchatAllowed,
-		gchatAllowAll:  o.Config.GchatAllowAllUsers,
-		targetAllowed:  targetAllowed,
-		slackAllowed:   slackAllowed,
-		slackAllowAll:  o.Config.SlackAllowAllUsers,
-		droppedNotices: map[string]bool{},
-		relayDurable:   o.RelayDurable,
+		turnBudget:       turnTimeout,
+		cfg:              o.Config,
+		client:           o.Client,
+		reg:              NewRegistry(o.Client),
+		adapter:          o.Adapter,
+		pm:               pm,
+		ps:               ps,
+		log:              log,
+		runCtx:           context.Background(),
+		sessionLocks:     map[string]*sessionLockEntry{},
+		taskSessions:     map[string]string{},
+		relays:           map[string]*relayState{},
+		steerNoticesFrom: map[string]bool{},
+		backend:          backend,
+		injectPM:         injectPM,
+		injectAudience:   injectAudience,
+		a2aPM:            a2aPM,
+		a2aAudience:      a2aAudience,
+		gchatAllowed:     gchatAllowed,
+		gchatAllowAll:    o.Config.GchatAllowAllUsers,
+		targetAllowed:    targetAllowed,
+		slackAllowed:     slackAllowed,
+		slackAllowAll:    o.Config.SlackAllowAllUsers,
+		droppedNotices:   map[string]bool{},
+		relayDurable:     o.RelayDurable,
 	}
 	g.inbox = newKeyedQueue(func(_ string, batch []InboundMessage) {
 		for _, msg := range batch {
@@ -2084,19 +2089,20 @@ const (
 // The relay's posts about follow-ups on the fixed route, from the
 // executor's steer notices and from what the relay counted at the terminal.
 const (
-	noticeSteerNotTaken = "⚠️ not taken: %s. Send it again after the answer."
-	noticeSteersUnrun   = "⚠️ %d queued follow-up(s) did not run before the task ended; send them again if they still matter"
-	noticeSteerMissed   = "⚠️ a follow-up arrived as the task finished and was not taken; send it again"
+	noticeSteerNotTaken  = "⚠️ not taken: %s. Send it again after the answer."
+	noticeSteersUnrun    = "⚠️ %d queued follow-up(s) did not run before the task ended; send them again if they still matter"
+	noticeSteerMissed    = "⚠️ a follow-up arrived as the task finished and was not taken; send it again"
+	noticeSteersNoResume = "⚠️ %d follow-up(s) not taken: the executor could not continue this conversation's session; send them again if they still matter"
 )
 
 // steerRefusalWhy words an executor's refusal reason token for the room.
-// task-ended is absent on purpose: those are counted into noticeSteersUnrun.
+// task-ended and no-resume are absent on purpose: those are counted into
+// noticeSteersUnrun and noticeSteersNoResume at the terminal.
 var steerRefusalWhy = map[string]string{
 	lib.SteerReasonQueueFull:  "too many follow-ups are already waiting",
 	lib.SteerReasonTaskEnding: "the task was already finishing",
 	lib.SteerReasonNoText:     "it had no text",
 	lib.SteerReasonCapability: "it was not authorized",
-	lib.SteerReasonNoResume:   "the executor could not continue this conversation's session",
 }
 
 // steerTask forwards a message that arrived while the task runs as a

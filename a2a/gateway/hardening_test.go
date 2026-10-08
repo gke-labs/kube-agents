@@ -167,11 +167,11 @@ func TestStopWithNothingToStopStartsNoTask(t *testing.T) {
 	}
 }
 
-// TestDetachedTaskNarrowsTheStatusMatcher: the status matcher is the exact
+// TestAfterAStopANonExactStatusAskIsANewTask: the status matcher is the exact
 // phrase set everywhere (G22), so after a stop a status-shaped but
 // non-exact ask is a NEW task, not a replay of the dead one — while the
 // exact phrases still answer status.
-func TestDetachedTaskNarrowsTheStatusMatcher(t *testing.T) {
+func TestAfterAStopANonExactStatusAskIsANewTask(t *testing.T) {
 	r := startRig(t)
 	conv := "discord:g1/thread-detachwide"
 	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group",
