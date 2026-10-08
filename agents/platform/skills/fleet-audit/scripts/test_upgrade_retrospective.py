@@ -45,10 +45,13 @@ def items(name):
 
 CLUSTERS = load("clusters.json")
 OPERATIONS = load("operations.json")
+READ_FILES = {"pods": "pods", "nodes": "nodes", "events": "events", "pdbs": "pdbs", "owners": "owners", "workloads": "workloads", "storage": "storage", "webhooks": "webhooks", "endpointslices": "endpointslices"}
 READS = {
-    "seeded-a": {"pods": items("seeded_a_pods.json"), "nodes": items("seeded_a_nodes.json"), "events": items("seeded_a_events.json"), "pdbs": items("seeded_a_pdbs.json"), "owners": items("seeded_a_owners.json")},
-    "gemma-gpu-upgraded": {"pods": items("gemma_pods.json"), "nodes": items("gemma_nodes.json"), "events": items("gemma_events.json"), "pdbs": items("gemma_pdbs.json"), "owners": items("gemma_owners.json")},
+    "seeded-a": {key: items(f"seeded_a_{name}.json") for key, name in READ_FILES.items()},
+    "gemma-gpu-upgraded": {key: items(f"gemma_{name}.json") for key, name in READ_FILES.items()},
 }
+SERVER_CONFIG = load("serverconfig_us-central1-a.json")
+KUBECTL_KINDS = {"pdb": "pdbs", "replicasets,jobs": "owners", "deploy,ds,sts,cronjobs": "workloads", "pv,storageclasses": "storage", "validatingwebhookconfigurations,mutatingwebhookconfigurations": "webhooks"}
 INFERENCE = "seeded-capacity/Deployment/inference-server"
 PAYMENTS = "seeded-debug/Deployment/payments-api"
 TUNER = "kubeagents-system/CronJob/legacy-flowcontrol-tuner"
@@ -89,13 +92,15 @@ class FakeFleet:
             return run_of(0, json.dumps([{k: v for k, v in c.items() if k != "project"} for c in self.clusters]))
         if "operations list" in joined:
             return run_of(0, json.dumps(self.operations))
+        if "get-server-config" in joined:
+            return run_of(0, json.dumps(SERVER_CONFIG))
         if "get-credentials" in joined:
             name = argv[4]
             return run_of(1, "", f"ERROR: cluster {name} not found") if name in self.broken else run_of(0)
         if argv[0] == "kubectl":
             kind, kubeconfig = argv[2], (env or {}).get("KUBECONFIG", "")
             cluster = next((c for c in READS if f"_{c}_" in kubeconfig), None)
-            key = {"pdb": "pdbs", "replicasets,jobs": "owners"}.get(kind, kind)
+            key = KUBECTL_KINDS.get(kind, kind)
             if cluster is None or (cluster, key) in self.kubectl_fail:
                 return run_of(1, "", "Unable to connect to the server")
             return run_of(0, json.dumps({"items": READS[cluster][key]}))
@@ -479,6 +484,144 @@ class OwnerResolutionTest(unittest.TestCase):
         self.assertEqual(entries(rows[0]), {(1, ur.MEDIUM)})
 
 
+class ShapeTest(unittest.TestCase):
+    """Each detector on a captured object from seeded-a's planted shapes,
+    plus the cases the captures do not carry."""
+
+    def setUp(self):
+        self.shapes = ur.collect_shapes(cluster_doc("seeded-a"), READS["seeded-a"])
+        self.by_object = {(s["object"], s["entry"]): s for s in self.shapes}
+
+    def shape(self, obj, entry):
+        self.assertIn((obj, entry), self.by_object, sorted(self.by_object))
+        return self.by_object[(obj, entry)]
+
+    def test_seeded_a_planted_shapes(self):
+        self.assertEqual(sorted(self.by_object), [
+            ("PersistentVolume/intree-pd", 19),
+            ("StorageClass/standard", 19),
+            ("seeded-capacity/PodDisruptionBudget/inference-server", 1),
+            ("seeded-shapes/CronJob/cuda-pinned-trainer", 18),
+            ("seeded-shapes/DaemonSet/cni-shaped-agent", 17),
+            ("seeded-shapes/DaemonSet/node-runtime-probe", 13),
+            ("seeded-shapes/Deployment/arch-pinned-worker", 12),
+            ("seeded-shapes/Deployment/cache-on-emptydir", 4),
+            ("seeded-shapes/Deployment/legacy-registry-pull", 20),
+        ])
+
+    def test_entry_12_deprecated_label_selector(self):
+        shape = self.shape("seeded-shapes/Deployment/arch-pinned-worker", 12)
+        self.assertEqual((shape["confidence"], shape["evidence"]), (ur.HIGH, "selector beta.kubernetes.io/arch=amd64"))
+
+    def test_entry_20_retired_registry(self):
+        shape = self.shape("seeded-shapes/Deployment/legacy-registry-pull", 20)
+        self.assertEqual((shape["confidence"], shape["evidence"], shape["detail"]), (ur.HIGH, "image k8s.gcr.io/pause:3.9", "image host k8s.gcr.io"))
+
+    def test_entry_4_stateful_emptydir(self):
+        shape = self.shape("seeded-shapes/Deployment/cache-on-emptydir", 4)
+        self.assertEqual((shape["confidence"], shape["evidence"]), (ur.MEDIUM, "emptyDir volume `queue`"))
+
+    def test_entry_18_cuda_pin_on_suspended_cronjob(self):
+        shape = self.shape("seeded-shapes/CronJob/cuda-pinned-trainer", 18)
+        self.assertEqual(shape["confidence"], ur.MEDIUM)
+        self.assertEqual(shape["evidence"], "nvidia.com/gpu requested with image docker.io/nvidia/cuda:12.2.0-base-ubuntu22.04")
+
+    def test_entries_17_and_13_daemonsets(self):
+        self.assertEqual(self.shape("seeded-shapes/DaemonSet/cni-shaped-agent", 17)["evidence"], "DaemonSet on hostNetwork")
+        self.assertEqual(self.shape("seeded-shapes/DaemonSet/node-runtime-probe", 13)["evidence"], "DaemonSet mounts /run/containerd/containerd.sock (volume `sock`)")
+        self.assertNotIn(("seeded-shapes/DaemonSet/cni-shaped-agent", 13), self.by_object)
+
+    def test_entry_1_budget(self):
+        shape = self.shape("seeded-capacity/PodDisruptionBudget/inference-server", 1)
+        self.assertEqual(shape["confidence"], ur.HIGH)
+        self.assertTrue(shape["evidence"].startswith("disruptionsAllowed=0"))
+
+    def test_entry_1_single_replica_behind_a_budget(self):
+        pdb = {"kind": "PodDisruptionBudget", "metadata": {"name": "payments", "namespace": "seeded-debug"}, "spec": {"minAvailable": 1, "selector": {"matchLabels": {"app": "payments-api"}}}, "status": {"disruptionsAllowed": 1}}
+        shapes = ur.budget_shapes([pdb], READS["seeded-a"]["workloads"])
+        self.assertEqual([(s["object"], s["entry"], s["confidence"]) for s in shapes], [("seeded-debug/Deployment/payments-api", 1, ur.HIGH)])
+        self.assertIn("one replica behind budget payments", shapes[0]["evidence"])
+
+    def test_entry_19_in_tree_volume_and_class(self):
+        pv = self.shape("PersistentVolume/intree-pd", 19)
+        self.assertEqual(pv["confidence"], ur.MEDIUM)
+        self.assertIn("PD CSI driver add-on enabled", pv["evidence"])
+        sc = self.shape("StorageClass/standard", 19)
+        self.assertIn("provisioner kubernetes.io/gce-pd", sc["evidence"])
+        cluster = cluster_doc("seeded-a")
+        cluster["addonsConfig"]["gcePersistentDiskCsiDriverConfig"] = {"enabled": False}
+        high = ur.storage_shapes(READS["seeded-a"]["storage"], cluster)
+        self.assertEqual({s["confidence"] for s in high}, {ur.HIGH})
+
+    def test_entry_7_fail_closed_webhook_without_endpoints(self):
+        config = {"kind": "ValidatingWebhookConfiguration", "metadata": {"name": "gate"}, "webhooks": [{"name": "gate.example.io", "failurePolicy": "Fail", "clientConfig": {"service": {"namespace": "apps", "name": "gate"}}}]}
+        [shape] = ur.webhook_shapes([config], READS["seeded-a"]["endpointslices"])
+        self.assertEqual((shape["object"], shape["entry"], shape["confidence"]), ("ValidatingWebhookConfiguration/gate", 7, ur.HIGH))
+        self.assertIn("Service apps/gate has no ready endpoint", shape["evidence"])
+        # The captured gmp-operator webhook is fail-closed with a ready endpoint: no shape.
+        self.assertEqual(ur.webhook_shapes(READS["seeded-a"]["webhooks"], READS["seeded-a"]["endpointslices"]), [])
+        # Without the endpoint read the check cannot run.
+        self.assertEqual(ur.webhook_shapes([config], None), [])
+
+    def test_shapes_from_a_bare_pod_and_affinity_and_local_ssd(self):
+        bare = pod("edge", images=["gcr.io/google-containers/pause:3.2"])
+        bare["spec"]["affinity"] = {"nodeAffinity": {"requiredDuringSchedulingIgnoredDuringExecution": {"nodeSelectorTerms": [{"matchExpressions": [{"key": "failure-domain.beta.kubernetes.io/zone", "operator": "In", "values": ["us-central1-a"]}]}]}}}
+        bare["spec"]["volumes"] = [{"name": "scratch", "hostPath": {"path": "/mnt/disks/ssd0"}}]
+        shapes = ur.collect_shapes(cluster_doc("seeded-a"), {"pods": [bare], "owners": [], "workloads": [], "pdbs": [], "storage": [], "webhooks": [], "endpointslices": []})
+        self.assertEqual([(s["object"], s["entry"]) for s in shapes], [("apps/Pod/edge", 4), ("apps/Pod/edge", 12), ("apps/Pod/edge", 20)])
+        self.assertEqual(next(s for s in shapes if s["entry"] == 12)["evidence"], "selector affinity on failure-domain.beta.kubernetes.io/zone")
+
+    def test_gpu_without_a_cuda_pin_is_not_a_shape(self):
+        plain = pod("gpu-job")
+        plain["spec"]["containers"][0]["resources"] = {"limits": {"nvidia.com/gpu": "1"}}
+        self.assertEqual(ur.shapes_in_spec(ur._object_of("apps", "Pod", "gpu-job"), plain["spec"]), [])
+        plain["spec"]["containers"][0]["env"] = [{"name": "CUDA_VERSION", "value": "12.2"}]
+        [shape] = ur.shapes_in_spec(ur._object_of("apps", "Pod", "gpu-job"), plain["spec"])
+        self.assertEqual(shape["evidence"], "nvidia.com/gpu requested with env CUDA_VERSION=12.2")
+
+    def test_risk_guards_carry_the_risk_kind(self):
+        guards = ur.risk_guards_for(SEEDED, self.shapes, "2026-10-08T18:00:00Z")
+        self.assertEqual(len(guards), 9)
+        self.assertTrue(all(g["kind"] == ur.GUARD_KIND_RISK and g["id"].startswith(f"{SEEDED}#risk#") for g in guards))
+        failure = ur.guards_for(SEEDED, symptoms_of("seeded-a"), "2026-10-08T18:00:00Z")
+        self.assertTrue(all(g["kind"] == ur.GUARD_KIND_FAILURE for g in failure))
+        # The same object and entry can be both: the budget broke the last upgrade and is still there.
+        ids = {g["id"] for g in guards} | {g["id"] for g in failure}
+        self.assertIn(ur.guard_id(SEEDED, 1, "seeded-capacity/PodDisruptionBudget/inference-server", ur.GUARD_KIND_RISK), ids)
+        self.assertIn(ur.guard_id(SEEDED, 1, "seeded-capacity/PodDisruptionBudget/inference-server", ur.GUARD_KIND_FAILURE), ids)
+
+
+class NextUpgradeTest(unittest.TestCase):
+    def test_daily_window_and_channel_target(self):
+        nu = ur.next_upgrade(cluster_doc("seeded-a"), SERVER_CONFIG, NOW)
+        self.assertEqual((nu["channel"], nu["target"], nu["current"], nu["below_target"]), ("REGULAR", "1.35.8-gke.1225000", "1.35.8-gke.1380001", False))
+        self.assertEqual((nu["window"], nu["next_opens"], nu["exclusions"]), ("daily at 03:00 UTC for 4h", "2026-10-09T03:00:00Z", []))
+
+    def test_recurring_window_and_active_exclusion(self):
+        nu = ur.next_upgrade(cluster_doc("gemma-gpu-upgraded"), SERVER_CONFIG, NOW)
+        self.assertEqual((nu["channel"], nu["target"], nu["below_target"]), ("EXTENDED", "1.36.4-gke.1247000", True))
+        self.assertTrue(nu["window"].startswith("DAILY at"))
+        self.assertGreater(nu["next_opens"], "2026-10-08T18:00:00Z")
+        self.assertEqual(nu["exclusions"], [{"name": "hold-gpu-minor", "scope": "NO_MINOR_UPGRADES", "start": "2026-09-24T17:41:17Z", "end": "2026-10-21T00:00:00Z", "active": True}])
+
+    def test_weekly_rule_no_channel_and_no_window(self):
+        cluster = cluster_doc("seeded-a")
+        cluster["releaseChannel"] = {}
+        cluster["maintenancePolicy"] = {"window": {"recurringWindow": {"recurrence": "FREQ=WEEKLY;BYDAY=SA,SU", "window": {"startTime": "2024-01-06T09:00:00Z", "endTime": "2024-01-06T17:00:00Z"}}}}
+        nu = ur.next_upgrade(cluster, SERVER_CONFIG, NOW)  # NOW is a Thursday
+        self.assertEqual(nu["target"], SERVER_CONFIG["defaultClusterVersion"])
+        self.assertEqual((nu["window"], nu["next_opens"]), ("WEEKLY on SA,SU at 09:00 UTC for 8h", "2026-10-10T09:00:00Z"))
+        cluster["maintenancePolicy"] = {}
+        nu = ur.next_upgrade(cluster, None, NOW)
+        self.assertEqual((nu["target"], nu["below_target"], nu["window"], nu["next_opens"]), (None, None, ur.NO_WINDOW_TEXT, None))
+
+    def test_server_config_is_fetched_once_per_location(self):
+        fleet = FakeFleet()
+        with tempfile.TemporaryDirectory() as home, mock.patch.dict(os.environ, {ur.HERMES_HOME_ENV: home}), redirect_stderr(io.StringIO()):
+            ur.collect(args(), run=fleet, now=NOW)
+        self.assertEqual(sum(1 for c in fleet.calls if "get-server-config" in c), 1)
+
+
 class LedgerAndGuardsTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -525,12 +668,16 @@ class LedgerAndGuardsTest(unittest.TestCase):
         self.assertTrue(seeded["what_failed"])
         self.assertTrue(seeded["mitigations"])
         self.assertTrue(all(m["entry"] in ur.MITIGATIONS for m in seeded["mitigations"]))
-        self.assertEqual({g["entry"] for g in seeded["guards"]}, {1, 2, 12, 14})
+        self.assertEqual({g["entry"] for g in seeded["guards"] if g["kind"] == ur.GUARD_KIND_FAILURE}, {1, 2, 12, 14})
+        self.assertEqual({g["entry"] for g in seeded["guards"] if g["kind"] == ur.GUARD_KIND_RISK}, {1, 4, 12, 13, 17, 18, 19, 20})
         self.assertEqual(doc["guards"], result["guards"])
+        self.assertEqual(seeded["baseline"]["shapes"], 9)
+        self.assertEqual(seeded["next_upgrade"]["target"], "1.35.8-gke.1225000")
         sections = doc["sections"]
         self.assertEqual([(i["cluster"], i["object"], i["entries"]) for i in sections["errors"]], [(SEEDED, INFERENCE, "2, 12"), (SEEDED, "seeded-capacity/PodDisruptionBudget/inference-server", "1")])
         self.assertEqual([i["object"] for i in sections["warnings"]], [KUBE_DNS, TUNER, "Node/gke-seeded-a-default-pool-62ac8ee0-d595", PAYMENTS, "seeded-stall/Deployment/inventory-api"])
-        self.assertEqual(sections["info"], {"clean": [], "unchanged": [], "failed_reads": []})
+        self.assertEqual([(c["cluster"], c["incidents"]) for c in sections["info"]["clean"]], [(GEMMA, 2), (SEEDED, 5)])
+        self.assertEqual((sections["info"]["unchanged"], sections["info"]["failed_reads"]), ([], []))
 
     def test_guards_file_merges_new_seen_again_and_gone(self):
         seen = "2026-10-08T18:00:00Z"
@@ -646,7 +793,7 @@ class ReportTest(unittest.TestCase):
         self.assertIn("| Unschedulable | 2. No spare capacity for the displaced pods | high | 3 of 4 pods: Insufficient cpu; e.g. inference-server-778b78fdb8-cp2pf |", inference)
         self.assertIn("| Unschedulable | 12. A node label is removed (selector seeded-role=pinned-inference) | medium |", inference)
         self.assertIn(f"- **12. A node label is removed** — For {INFERENCE} (selector seeded-role=pinned-inference):", inference)
-        self.assertIn(f"- guard `{ur.guard_id(SEEDED, 2, INFERENCE)}` entry 2 (high), first seen 2026-10-08T18:00:00Z", inference)
+        self.assertIn(f"- guard `{ur.guard_id(SEEDED, 2, INFERENCE)}` failure entry 2 (high), first seen 2026-10-08T18:00:00Z", inference)
         self.assertIn("Read today: the obtainability audit (`blocking-pdb`) and the readiness report.", errors)
         # Warnings: medium, system, unclassified.
         headings = [line for line in warnings.splitlines() if line.startswith("### ")]
@@ -660,9 +807,18 @@ class ReportTest(unittest.TestCase):
         self.assertIn(f"{ur.PART_WHAT_HAPPENED} new (first seen); channel EXTENDED; cluster status RUNNING.", warnings)
         self.assertIn(ur.NO_OPERATION_LINE, warnings.split("### 2")[1].split("### 6")[0])
         self.assertIn("| Error | 6. A served API version is removed (best effort: a name, not an API call) | medium | 2 of 2 pods:", warnings)
-        self.assertIn(f"- guard `{ur.guard_id(SEEDED, 14, PAYMENTS)}` entry 14 (medium), first seen 2026-10-08T18:00:00Z", warnings)
-        # Info: nothing clean, unchanged or failed on a first run over two reviewed clusters.
-        self.assertEqual(info.strip(), ur.NONE_LINE)
+        self.assertIn(f"- guard `{ur.guard_id(SEEDED, 14, PAYMENTS)}` failure entry 14 (medium), first seen 2026-10-08T18:00:00Z", warnings)
+        # Info: one block per reviewed cluster, with the next upgrade, the risks and the baseline.
+        self.assertIn(f"### {SEEDED} — 5 incident(s) above", info)
+        self.assertIn(f"### {GEMMA} — 2 incident(s) above", info)
+        seeded_block = info.split(f"### {SEEDED}")[1]
+        self.assertIn(f"{ur.PART_NEXT_UPGRADE} channel REGULAR; target 1.35.8-gke.1225000; cluster at 1.35.8-gke.1380001, at or ahead of the target. Window: daily at 03:00 UTC for 4h; next opens 2026-10-09T03:00:00Z. Exclusions: none.", seeded_block)
+        self.assertIn("| `seeded-shapes/Deployment/legacy-registry-pull` | 20. Images on a retired registry | high | image k8s.gcr.io/pause:3.9 |", seeded_block)
+        self.assertIn(f"{ur.PART_BASELINE} control plane 1.35.8-gke.1380001; pools default-pool 1.35.8-gke.1380001, idle-batch-pool 1.35.8-gke.1380001, pinned-inference-pool 1.35.8-gke.1380001; 23 pods, 1 budgets, 9 shapes. Guards written: 13.", seeded_block)
+        gemma_block = info.split(f"### {GEMMA}")[1].split("### ")[0]
+        self.assertIn("behind the target. Window: DAILY at", gemma_block)
+        self.assertIn("Exclusions: hold-gpu-minor (NO_MINOR_UPGRADES) until 2026-10-21T00:00:00Z [active].", gemma_block)
+        self.assertNotIn(ur.NONE_LINE, info)
 
     def test_info_lists_clean_unchanged_and_failed(self):
         reads_clean = {**READS["seeded-a"], "pods": [p for p in READS["seeded-a"]["pods"] if p["status"]["phase"] == "Running" and "payments" not in p["metadata"]["name"]], "events": [], "pdbs": []}
@@ -671,13 +827,19 @@ class ReportTest(unittest.TestCase):
                 first = ur.collect(args(), run=FakeFleet(broken=["gemma-gpu-upgraded"]), now=NOW)
         report = ur.render_report(first)
         info = report.split(ur.SECTION_INFO)[1]
-        self.assertIn(f"{ur.INFO_CLEAN}\n\n- {SEEDED}: new (first seen); control plane 1.35.8-gke.1380001; UPGRADE_MASTER control plane 8 min DONE; UPGRADE_NODES default-pool 9 min DONE;", info)
+        self.assertIn(f"### {SEEDED} — clean", info)
+        self.assertNotIn(f"### {GEMMA}", info)
+        clean_block = info.split(f"### {SEEDED} — clean")[1]
+        for part in (ur.PART_WHAT_HAPPENED, ur.PART_NEXT_UPGRADE, ur.PART_RISKS, ur.PART_BASELINE):
+            self.assertIn(part, clean_block)
+        self.assertNotIn(ur.PART_MITIGATE, clean_block)
+        self.assertNotIn(ur.NONE_LINE, clean_block.split(ur.INFO_FAILED_READS)[0])
         self.assertIn(f"{ur.INFO_FAILED_READS}\n\n- {GEMMA}: get-credentials rc=1", info)
         self.assertEqual(first["sections"]["errors"], [])
         with redirect_stderr(io.StringIO()):
             second = ur.collect(args(), run=FakeFleet(broken=["gemma-gpu-upgraded"]), now=NOW)
         info = ur.render_report(second).split(ur.SECTION_INFO)[1]
-        self.assertIn(f"{ur.INFO_UNCHANGED}\n\n- {SEEDED} at 1.35.8-gke.1380001, last reviewed 2026-10-08T18:00:00Z", info)
+        self.assertIn(f"{ur.INFO_UNCHANGED}\n\n- {SEEDED} at 1.35.8-gke.1380001; last upgrade operation 2026-10-08T04:20:35Z; next target 1.35.8-gke.1225000; last reviewed 2026-10-08T18:00:00Z", info)
 
     def test_failed_operation_is_an_error_incident(self):
         ops = copy.deepcopy(OPERATIONS)

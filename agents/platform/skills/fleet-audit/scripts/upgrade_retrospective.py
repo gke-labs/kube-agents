@@ -35,8 +35,16 @@ from an earlier run on a cluster this run did not review; Info is each clean
 review's (A) summary, the unchanged clusters, and the reads that failed. A
 read that fails is listed rather than failing the run: a cluster this run
 could not reach is a gap the report names, not a reason to drop the rest.
-The JSON carries the same grouping under `sections` beside the per-cluster
-`reviews`.
+Each reviewed cluster also gets an Info block: the next upgrade (the
+channel's current default as the target, the maintenance window and when it
+next opens, exclusions with scope and end), the catalogue shapes present
+(static before-signals: a budget allowing no disruption, a selector on a
+deprecated node label, an image on a retired registry, an in-tree PD volume,
+a DaemonSet on hostNetwork or the containerd socket, state on a node-local
+volume, a CUDA pin on a GPU workload, a fail-closed webhook with no backend),
+and the baseline recorded. Shapes are risks, never incidents; each writes a
+`risk` guard beside the symptoms' `failure` guards. The JSON carries the same
+grouping under `sections` beside the per-cluster `reviews`.
 
 Every subprocess goes through `default_run`; tests inject a fake in its place.
 Nothing here writes to a cluster: `gcloud ... list`, `get-credentials` into a
@@ -179,7 +187,71 @@ KUBECTL_READS = (
     ("events", ["kubectl", "get", "events", "-A", "--field-selector", "type=Warning", "-o", "json"]),
     ("pdbs", ["kubectl", "get", "pdb", "-A", "-o", "json"]),
     ("owners", ["kubectl", "get", "replicasets,jobs", "-A", "-o", "json"]),
+    # The four below feed the shape detectors only; a failure there loses
+    # the risks table, not the review.
+    ("workloads", ["kubectl", "get", "deploy,ds,sts,cronjobs", "-A", "-o", "json"]),
+    ("storage", ["kubectl", "get", "pv,storageclasses", "-o", "json"]),
+    ("webhooks", ["kubectl", "get", "validatingwebhookconfigurations,mutatingwebhookconfigurations", "-o", "json"]),
+    ("endpointslices", ["kubectl", "get", "endpointslices", "-A", "-o", "json"]),
 )
+SHAPE_READS = ("workloads", "storage", "webhooks", "endpointslices")
+# A review needs these to have answered; the shape reads are optional.
+CORE_READS = ("pods", "nodes", "events", "pdbs", "owners")
+
+# Shapes: the catalogue's before-signals, read statically. Each is a risk,
+# never an incident. The labels a kubelet stopped setting (entry 12), the
+# registries that stopped publishing (20), the in-tree PD provisioner (19),
+# the containerd socket a node agent couples itself to (13), and the names
+# that say a node-local volume holds state (4).
+DEPRECATED_NODE_LABEL_PREFIXES = ("beta.kubernetes.io/", "failure-domain.beta.kubernetes.io/")
+RETIRED_IMAGE_HOSTS = ("k8s.gcr.io/", "gcr.io/google-containers/", "gcr.io/google_containers/", "gcr.io/kubernetes-helm/")
+IN_TREE_PD_PROVISIONER = "kubernetes.io/gce-pd"
+IN_TREE_PD_VOLUME_KEY = "gcePersistentDisk"
+PD_CSI_ADDON_KEY = "gcePersistentDiskCsiDriverConfig"
+CSI_PD_PROVISIONER = "pd.csi.storage.gke.io"
+CONTAINERD_SOCKET_PATH_PREFIXES = ("/run/containerd", "/var/run/containerd")
+STATEFUL_VOLUME_NAME_RE = re.compile(r"data|state|cache|db|queue|store|journal|wal|persist", re.I)
+LOCAL_SSD_HOSTPATH_PREFIXES = ("/mnt/disks", "/mnt/stateful_partition")
+GPU_RESOURCE = "nvidia.com/gpu"
+# A CUDA pin in an image tag (`nvidia/cuda:12.2.0-base`) or an env value.
+CUDA_IMAGE_PIN_RE = re.compile(r"cuda[:/_-]?(\d+\.\d+)", re.I)
+CUDA_ENV_NAME_MARKER = "CUDA"
+VERSION_IN_TEXT_RE = re.compile(r"\d+\.\d+")
+WEBHOOK_FAIL_CLOSED = "Fail"
+WEBHOOK_CONFIGURATION_KINDS = ("ValidatingWebhookConfiguration", "MutatingWebhookConfiguration")
+ENDPOINTSLICE_SERVICE_LABEL = "kubernetes.io/service-name"
+SINGLE_REPLICA = 1
+# Kinds whose spec carries a pod template.
+TEMPLATE_KINDS = ("Deployment", "StatefulSet", "DaemonSet", "CronJob")
+# What the risks table says it looked for when it found nothing.
+SHAPE_CHECKS = (
+    "budgets allowing no disruption and single-replica workloads behind a budget (1)",
+    "selectors on beta.kubernetes.io / failure-domain.beta.kubernetes.io labels (12)",
+    "images on a retired registry host (20)",
+    "in-tree gcePersistentDisk volumes and kubernetes.io/gce-pd StorageClasses (19)",
+    "DaemonSets on hostNetwork (17) or mounting the containerd socket (13)",
+    "emptyDir or local-SSD volumes whose name suggests state (4)",
+    "GPU workloads pinning a CUDA version (18)",
+    "fail-closed webhooks whose Service has no ready endpoint (7)",
+)
+# Guard kinds: a `failure` broke the last upgrade, a `risk` is a shape
+# present before the next one.
+GUARD_KIND_FAILURE, GUARD_KIND_RISK = "failure", "risk"
+
+# The next upgrade, from the cluster record and `get-server-config`.
+NO_WINDOW_TEXT = "no maintenance window: an upgrade may start at any hour"
+DEFAULT_EXCLUSION_SCOPE = "NO_UPGRADES"
+RRULE_FREQ_DAILY, RRULE_FREQ_WEEKLY = "DAILY", "WEEKLY"
+RRULE_WEEKDAYS = {"MO": 0, "TU": 1, "WE": 2, "TH": 3, "FR": 4, "SA": 5, "SU": 6}
+# How far ahead the next window opening is searched: a weekly rule repeats
+# inside this many days.
+NEXT_WINDOW_SEARCH_DAYS = 8
+DAILY_WINDOW_TIME_FORMAT = "%H:%M"
+# GKE's default daily window length when the record carries none.
+DEFAULT_DAILY_WINDOW = timedelta(hours=4)
+SECONDS_PER_HOUR = 3600
+ISO_DURATION_RE = re.compile(r"^PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?$")
+VERSION_RE = re.compile(r"^(\d+)\.(\d+)\.(\d+)(?:-gke\.(\d+))?$")
 # Symptoms, (C) rows and guards are keyed by a pod's top owner so a finding
 # survives the pods being replaced: Pod -> ReplicaSet -> Deployment, Pod ->
 # Job -> CronJob, Pod -> StatefulSet/DaemonSet; a bare pod stays a Pod. The
@@ -358,7 +430,10 @@ PART_WHAT_HAPPENED = "**What happened.**"
 PART_WHAT_FAILED = "**What failed.**"
 PART_MITIGATE = "**Detect and mitigate next time.**"
 PART_MITIGATION_SET_UP = "**Mitigation set up.**"
-INFO_CLEAN = "Reviewed, no incident:"
+PART_NEXT_UPGRADE = "**Next upgrade.**"
+PART_RISKS = "**Risks present.**"
+PART_BASELINE = "**Baseline recorded.**"
+NO_SHAPE_TEXT = "no catalogue shape found; checked: "
 INFO_UNCHANGED = "Unchanged clusters:"
 INFO_FAILED_READS = "Reads that failed:"
 NONE_LINE = "_none_"
@@ -1181,8 +1256,23 @@ def mitigation_lines(symptom: dict, classification: dict) -> dict:
     }
 
 
-def guard_id(cluster: str, entry: int, obj: str) -> str:
-    return f"{cluster}#{entry}#{obj}"
+def guard_id(cluster: str, entry: int, obj: str, kind: str = GUARD_KIND_FAILURE) -> str:
+    return f"{cluster}#{kind}#{entry}#{obj}"
+
+
+def _guard(key: str, kind: str, entry: int, title: str, obj: str, confidence: str, evidence: str, seen_at: str) -> dict:
+    return {
+        "id": guard_id(key, entry, obj, kind),
+        "kind": kind,
+        "cluster": key,
+        "entry": entry,
+        "title": title,
+        "object": obj,
+        "confidence": confidence,
+        "evidence": evidence,
+        "first_seen": seen_at,
+        "last_seen": seen_at,
+    }
 
 
 def guards_for(key: str, symptoms: list[dict], seen_at: str) -> list[dict]:
@@ -1191,27 +1281,23 @@ def guards_for(key: str, symptoms: list[dict], seen_at: str) -> list[dict]:
         for c in symptom["classifications"]:
             if c["entry"] is None:
                 continue
-            gid = guard_id(key, c["entry"], symptom["object"])
-            if gid in out:
-                continue
-            out[gid] = {
-                "id": gid,
-                "cluster": key,
-                "entry": c["entry"],
-                "title": c["title"],
-                "object": symptom["object"],
-                "confidence": c["confidence"],
-                "evidence": c["evidence"],
-                "first_seen": seen_at,
-                "last_seen": seen_at,
-            }
+            guard = _guard(key, GUARD_KIND_FAILURE, c["entry"], c["title"], symptom["object"], c["confidence"], c["evidence"], seen_at)
+            out.setdefault(guard["id"], guard)
+    return list(out.values())
+
+
+def risk_guards_for(key: str, shapes: list[dict], seen_at: str) -> list[dict]:
+    out: dict[str, dict] = {}
+    for shape in shapes:
+        guard = _guard(key, GUARD_KIND_RISK, shape["entry"], shape["title"], shape["object"], shape["confidence"], shape["evidence"], seen_at)
+        out.setdefault(guard["id"], guard)
     return list(out.values())
 
 
 def merge_guards(existing: dict, fresh: list[dict], reviewed: set[str], seen_at: str) -> dict:
     """Keep what was there, refresh what is seen again, drop what a reviewed
     cluster no longer shows. A cluster this run did not review keeps its guards."""
-    by_id = {g["id"]: g for g in existing.get("guards") or [] if isinstance(g, dict) and g.get("id")}
+    by_id = {g["id"]: {"kind": GUARD_KIND_FAILURE, **g} for g in existing.get("guards") or [] if isinstance(g, dict) and g.get("id")}
     fresh_ids = {g["id"] for g in fresh}
     merged = []
     for gid, guard in by_id.items():
@@ -1229,11 +1315,315 @@ def merge_guards(existing: dict, fresh: list[dict], reviewed: set[str], seen_at:
 
 
 # --------------------------------------------------------------------------- #
+# Shapes: the catalogue's before-signals read statically. Risks, not
+# incidents; each is keyed by owner like a symptom and writes a `risk` guard.
+# --------------------------------------------------------------------------- #
+
+
+def _shape(obj: dict, entry: int, confidence: str, evidence: str, detail: str = "") -> dict:
+    return {
+        "kind": obj["kind"],
+        "namespace": obj["namespace"],
+        "name": obj["name"],
+        "object": obj["object"],
+        "system": obj["system"],
+        "entry": entry,
+        "title": MITIGATIONS[entry]["title"],
+        "confidence": confidence,
+        "evidence": evidence[:MESSAGE_EXCERPT_CHARS],
+        "detail": detail,
+    }
+
+
+def _object_of(namespace: str, kind: str, name: str) -> dict:
+    return {"kind": kind, "namespace": namespace, "name": name, "object": _object_ref(namespace, kind, name), "system": is_system_namespace(namespace) if namespace else True}
+
+
+def _pod_template_spec(workload: dict) -> dict | None:
+    spec = workload.get("spec") or {}
+    if workload.get("kind") == "CronJob":
+        return (((spec.get("jobTemplate") or {}).get("spec") or {}).get("template") or {}).get("spec")
+    return (spec.get("template") or {}).get("spec")
+
+
+def _template_labels(workload: dict) -> dict:
+    spec = workload.get("spec") or {}
+    return ((spec.get("template") or {}).get("metadata") or {}).get("labels") or {}
+
+
+def pod_specs_by_owner(workloads: list[dict], pods: list[dict], resolver: Resolver) -> dict[str, tuple[dict, dict, dict]]:
+    """Every workload's pod template, plus the spec of any pod whose owner
+    the workload list does not cover (bare pods, Jobs), keyed by owner."""
+    out: dict[str, tuple[dict, dict, dict]] = {}
+    for workload in workloads:
+        if workload.get("kind") not in TEMPLATE_KINDS:
+            continue
+        meta = workload.get("metadata") or {}
+        obj = _object_of(meta.get("namespace", ""), workload["kind"], meta.get("name", ""))
+        spec = _pod_template_spec(workload)
+        if spec is not None:
+            out[obj["object"]] = (obj, spec, workload)
+    for pod in pods:
+        meta = pod.get("metadata") or {}
+        kind, name = resolver.resolve(meta.get("namespace", ""), "Pod", meta.get("name", ""))
+        obj = _object_of(meta.get("namespace", ""), kind, name)
+        if obj["object"] not in out:
+            out[obj["object"]] = (obj, pod.get("spec") or {}, pod)
+    return out
+
+
+def _selector_label_keys(spec: dict) -> list[str]:
+    keys = list((spec.get("nodeSelector") or {}).keys())
+    node_affinity = (spec.get("affinity") or {}).get("nodeAffinity") or {}
+    terms = list((node_affinity.get("requiredDuringSchedulingIgnoredDuringExecution") or {}).get("nodeSelectorTerms") or [])
+    terms += [p.get("preference") or {} for p in node_affinity.get("preferredDuringSchedulingIgnoredDuringExecution") or []]
+    for term in terms:
+        for expr in (term.get("matchExpressions") or []) + (term.get("matchFields") or []):
+            if expr.get("key"):
+                keys.append(expr["key"])
+    return keys
+
+
+def _containers(spec: dict) -> list[dict]:
+    return (spec.get("containers") or []) + (spec.get("initContainers") or [])
+
+
+def shapes_in_spec(obj: dict, spec: dict) -> list[dict]:
+    """Entries 12, 20, 4, 18 from one pod spec, and 13/17 for a DaemonSet."""
+    out = []
+    deprecated = [k for k in _selector_label_keys(spec) if k.startswith(DEPRECATED_NODE_LABEL_PREFIXES)]
+    if deprecated:
+        selector = spec.get("nodeSelector") or {}
+        evidence = ", ".join(f"{k}={selector[k]}" if k in selector else f"affinity on {k}" for k in sorted(set(deprecated)))
+        out.append(_shape(obj, 12, HIGH, f"selector {evidence}", f"selector {sorted(set(deprecated))[0]}"))
+    for container in _containers(spec):
+        image = container.get("image") or ""
+        if image.startswith(RETIRED_IMAGE_HOSTS):
+            out.append(_shape(obj, 20, HIGH, f"image {image}", f"image host {_image_host(image)}"))
+            break
+    for volume in spec.get("volumes") or []:
+        name = volume.get("name") or ""
+        host_path = (volume.get("hostPath") or {}).get("path") or ""
+        if "emptyDir" in volume and STATEFUL_VOLUME_NAME_RE.search(name):
+            out.append(_shape(obj, 4, MEDIUM, f"emptyDir volume `{name}`", f"volume {name}"))
+        elif host_path.startswith(LOCAL_SSD_HOSTPATH_PREFIXES):
+            out.append(_shape(obj, 4, MEDIUM, f"hostPath volume `{name}` at {host_path}", f"volume {name}"))
+    gpu = any(GPU_RESOURCE in ((c.get("resources") or {}).get("limits") or {}) or GPU_RESOURCE in ((c.get("resources") or {}).get("requests") or {}) for c in _containers(spec))
+    if gpu:
+        pins = []
+        for container in _containers(spec):
+            m = CUDA_IMAGE_PIN_RE.search(container.get("image") or "")
+            if m:
+                pins.append(f"image {container.get('image')}")
+            for env in container.get("env") or []:
+                if CUDA_ENV_NAME_MARKER in (env.get("name") or "").upper() and VERSION_IN_TEXT_RE.search(str(env.get("value") or "")):
+                    pins.append(f"env {env.get('name')}={env.get('value')}")
+        if pins:
+            out.append(_shape(obj, 18, MEDIUM, f"{GPU_RESOURCE} requested with {'; '.join(pins)}", "CUDA pin"))
+    if obj["kind"] == "DaemonSet":
+        if spec.get("hostNetwork"):
+            out.append(_shape(obj, 17, MEDIUM, "DaemonSet on hostNetwork", "hostNetwork"))
+        for volume in spec.get("volumes") or []:
+            host_path = (volume.get("hostPath") or {}).get("path") or ""
+            if host_path.startswith(CONTAINERD_SOCKET_PATH_PREFIXES):
+                out.append(_shape(obj, 13, MEDIUM, f"DaemonSet mounts {host_path} (volume `{volume.get('name')}`)", f"hostPath {host_path}"))
+                break
+    return out
+
+
+def budget_shapes(pdbs: list[dict], workloads: list[dict]) -> list[dict]:
+    """Entry 1: a budget allowing no disruption, and a one-replica
+    Deployment or StatefulSet a budget selects."""
+    out = []
+    for pdb in pdbs:
+        meta, status = pdb.get("metadata") or {}, pdb.get("status") or {}
+        namespace, name = meta.get("namespace", ""), meta.get("name", "")
+        obj = _object_of(namespace, "PodDisruptionBudget", name)
+        spec = {k: v for k, v in (pdb.get("spec") or {}).items() if k != "selector"}
+        if status.get("disruptionsAllowed") == 0:
+            out.append(_shape(obj, 1, HIGH, f"disruptionsAllowed=0, spec {json.dumps(spec, sort_keys=True)}", f"budget {name}"))
+        selector = (pdb.get("spec") or {}).get("selector") or {}
+        for workload in workloads:
+            wmeta = workload.get("metadata") or {}
+            if workload.get("kind") not in ("Deployment", "StatefulSet") or wmeta.get("namespace") != namespace:
+                continue
+            if (workload.get("spec") or {}).get("replicas") == SINGLE_REPLICA and _selector_matches(selector, _template_labels(workload)):
+                wobj = _object_of(namespace, workload["kind"], wmeta.get("name", ""))
+                out.append(_shape(wobj, 1, HIGH, f"one replica behind budget {name} ({json.dumps(spec, sort_keys=True)})", f"budget {name}"))
+    return out
+
+
+def storage_shapes(storage: list[dict], cluster: dict) -> list[dict]:
+    """Entry 19: in-tree PD volumes and StorageClasses; high when the PD CSI
+    add-on is off, medium when migration carries them and the class should
+    still move."""
+    addon = ((cluster.get("addonsConfig") or {}).get(PD_CSI_ADDON_KEY) or {}).get("enabled")
+    confidence = MEDIUM if addon else HIGH
+    addon_text = "PD CSI driver add-on enabled" if addon else "PD CSI driver add-on disabled"
+    out = []
+    for item in storage:
+        meta = item.get("metadata") or {}
+        obj = _object_of("", item.get("kind") or "", meta.get("name", ""))
+        if item.get("kind") == "PersistentVolume" and IN_TREE_PD_VOLUME_KEY in (item.get("spec") or {}):
+            disk = ((item.get("spec") or {}).get(IN_TREE_PD_VOLUME_KEY) or {}).get("pdName", "")
+            out.append(_shape(obj, 19, confidence, f"in-tree {IN_TREE_PD_VOLUME_KEY} {disk}; {addon_text}", f"volume {meta.get('name', '')}"))
+        elif item.get("kind") == "StorageClass" and item.get("provisioner") == IN_TREE_PD_PROVISIONER:
+            out.append(_shape(obj, 19, confidence, f"provisioner {IN_TREE_PD_PROVISIONER}; {addon_text}; move to {CSI_PD_PROVISIONER}", f"class {meta.get('name', '')}"))
+    return out
+
+
+def _ready_services(endpointslices: list[dict]) -> set[tuple[str, str]]:
+    ready = set()
+    for es in endpointslices:
+        meta = es.get("metadata") or {}
+        service = (meta.get("labels") or {}).get(ENDPOINTSLICE_SERVICE_LABEL)
+        if not service:
+            continue
+        for endpoint in es.get("endpoints") or []:
+            if (endpoint.get("conditions") or {}).get("ready") is not False:
+                ready.add((meta.get("namespace", ""), service))
+                break
+    return ready
+
+
+def webhook_shapes(webhooks: list[dict], endpointslices: list[dict] | None) -> list[dict]:
+    """Entry 7: a fail-closed webhook whose Service has no ready endpoint.
+    Without the endpoint read the check cannot run and reports nothing."""
+    if endpointslices is None:
+        return []
+    ready = _ready_services(endpointslices)
+    out = []
+    for config in webhooks:
+        if config.get("kind") not in WEBHOOK_CONFIGURATION_KINDS:
+            continue
+        meta = config.get("metadata") or {}
+        obj = _object_of("", config["kind"], meta.get("name", ""))
+        for hook in config.get("webhooks") or []:
+            service = ((hook.get("clientConfig") or {}).get("service")) or {}
+            if hook.get("failurePolicy") != WEBHOOK_FAIL_CLOSED or not service.get("name"):
+                continue
+            if (service.get("namespace", ""), service["name"]) not in ready:
+                out.append(_shape(obj, 7, HIGH, f"webhook {hook.get('name')} failurePolicy {WEBHOOK_FAIL_CLOSED}; Service {service.get('namespace', '')}/{service['name']} has no ready endpoint", f"webhook {hook.get('name')}"))
+                break
+    return out
+
+
+def collect_shapes(cluster: dict, reads: dict[str, list]) -> list[dict]:
+    resolver = Resolver(reads.get("pods") or [], reads.get("owners") or [])
+    workloads = reads.get("workloads") or []
+    shapes: list[dict] = []
+    for obj, spec, _ in pod_specs_by_owner(workloads, reads.get("pods") or [], resolver).values():
+        shapes += shapes_in_spec(obj, spec)
+    shapes += budget_shapes(reads.get("pdbs") or [], workloads)
+    shapes += storage_shapes(reads.get("storage") or [], cluster)
+    shapes += webhook_shapes(reads.get("webhooks") or [], reads.get("endpointslices") if "endpointslices" in reads else None)
+    unique: dict[tuple, dict] = {}
+    for shape in shapes:
+        unique.setdefault((shape["object"], shape["entry"]), shape)
+    return sorted(unique.values(), key=lambda s: (s["system"], s["namespace"], s["kind"], s["name"], s["entry"]))
+
+
+# --------------------------------------------------------------------------- #
+# The next upgrade: target, window, exclusions.
+# --------------------------------------------------------------------------- #
+
+
+def fetch_server_config(project: str, location: str, *, run: RunFn) -> tuple[dict | None, str | None]:
+    parsed, error = run_json(["gcloud", "container", "get-server-config", "--location", location, "--project", project, "--format", "json"], run=run)
+    if error:
+        return None, error
+    return (parsed if isinstance(parsed, dict) else None), (None if isinstance(parsed, dict) else "get-server-config returned JSON that is not an object")
+
+
+def _parse_iso_duration(text: str) -> timedelta | None:
+    m = ISO_DURATION_RE.match(text or "")
+    if not m:
+        return None
+    hours, minutes, seconds = (int(x or 0) for x in m.groups())
+    return timedelta(hours=hours, minutes=minutes, seconds=seconds)
+
+
+def _next_opening(window: dict, now: datetime) -> tuple[str, datetime | None]:
+    """A one-line description of the maintenance window and when it next
+    opens; `None` when the rule is one this does not parse."""
+    daily = window.get("dailyMaintenanceWindow")
+    if daily:
+        start = datetime.strptime(daily.get("startTime") or "00:00", DAILY_WINDOW_TIME_FORMAT).time()
+        length = _parse_iso_duration(daily.get("duration") or "") or DEFAULT_DAILY_WINDOW
+        candidate = datetime.combine(now.date(), start, tzinfo=timezone.utc)
+        if candidate <= now:
+            candidate += timedelta(days=1)
+        return f"daily at {daily.get('startTime')} UTC for {int(length.total_seconds() // SECONDS_PER_HOUR)}h", candidate
+    recurring = window.get("recurringWindow")
+    if recurring:
+        rule = {k: v for k, v in (part.split("=", 1) for part in (recurring.get("recurrence") or "").split(";") if "=" in part)}
+        start = parse_ts((recurring.get("window") or {}).get("startTime"))
+        end = parse_ts((recurring.get("window") or {}).get("endTime"))
+        if start is None:
+            return f"recurring {recurring.get('recurrence')}", None
+        length = (end - start) if end else timedelta(0)
+        days = [RRULE_WEEKDAYS[d] for d in (rule.get("BYDAY") or "").split(",") if d in RRULE_WEEKDAYS]
+        freq = rule.get("FREQ")
+        text = f"{freq or 'recurring'}{' on ' + rule['BYDAY'] if rule.get('BYDAY') else ''} at {start.strftime(DAILY_WINDOW_TIME_FORMAT)} UTC for {int(length.total_seconds() // SECONDS_PER_HOUR)}h"
+        if freq not in (RRULE_FREQ_DAILY, RRULE_FREQ_WEEKLY):
+            return text, None
+        for offset in range(NEXT_WINDOW_SEARCH_DAYS):
+            candidate = datetime.combine((now + timedelta(days=offset)).date(), start.timetz())
+            if candidate >= now and (freq == RRULE_FREQ_DAILY or not days or candidate.weekday() in days):
+                return text, candidate
+        return text, None
+    return NO_WINDOW_TEXT, None
+
+
+def next_upgrade(cluster: dict, server_config: dict | None, now: datetime) -> dict:
+    current = cluster.get("currentMasterVersion") or ""
+    channel = (cluster.get("releaseChannel") or {}).get("channel") or ""
+    target = None
+    if server_config:
+        if channel:
+            info = next((c for c in server_config.get("channels") or [] if c.get("channel") == channel), None)
+            target = (info or {}).get("defaultVersion")
+        else:
+            target = server_config.get("defaultClusterVersion")
+    cur_t, tgt_t = parse_version(current), parse_version(target or "")
+    below = (cur_t < tgt_t) if cur_t and tgt_t else None
+    policy = ((cluster.get("maintenancePolicy") or {}).get("window") or {})
+    window_text, opens = _next_opening(policy, now)
+    exclusions = []
+    for name, exclusion in sorted((policy.get("maintenanceExclusions") or {}).items()):
+        start, end = parse_ts(exclusion.get("startTime")), parse_ts(exclusion.get("endTime"))
+        exclusions.append({
+            "name": name,
+            "scope": ((exclusion.get("maintenanceExclusionOptions") or {}).get("scope")) or DEFAULT_EXCLUSION_SCOPE,
+            "start": fmt_ts(start) if start else None,
+            "end": fmt_ts(end) if end else None,
+            "active": bool(start and end and start <= now <= end),
+        })
+    return {
+        "channel": channel,
+        "current": current,
+        "target": target,
+        "below_target": below,
+        "window": window_text,
+        "next_opens": fmt_ts(opens) if opens else None,
+        "exclusions": exclusions,
+    }
+
+
+def parse_version(v: str) -> tuple[int, int, int, int] | None:
+    m = VERSION_RE.match(v or "")
+    if not m:
+        return None
+    major, minor, patch, build = m.groups()
+    return (int(major), int(minor), int(patch), int(build or 0))
+
+
+# --------------------------------------------------------------------------- #
 # The review of one cluster.
 # --------------------------------------------------------------------------- #
 
 
-def review_cluster(selection: Selection, ledger: dict, *, run: RunFn, seen_at: str) -> dict:
+def review_cluster(selection: Selection, ledger: dict, *, run: RunFn, seen_at: str, server_config: dict | None = None, now: datetime | None = None) -> dict:
     cluster = selection.cluster
     review = {
         "cluster": selection.key,
@@ -1243,6 +1633,9 @@ def review_cluster(selection: Selection, ledger: dict, *, run: RunFn, seen_at: s
         "what_happened": what_happened(selection, ledger),
         "what_failed": [],
         "mitigations": [],
+        "shapes": [],
+        "next_upgrade": next_upgrade(cluster, server_config, now or now_utc()),
+        "baseline": None,
         "guards": [],
         "read_errors": [],
         "reviewed": False,
@@ -1257,13 +1650,23 @@ def review_cluster(selection: Selection, ledger: dict, *, run: RunFn, seen_at: s
         return review
     reads, errors = read_cluster(kubeconfig, run=run)
     review["read_errors"].extend(errors)
-    if len(errors) == len(KUBECTL_READS):
+    if all(any(e.startswith(name + ":") for e in errors) for name in CORE_READS):
         return review
     review["reviewed"] = True
     symptoms = collect_symptoms(cluster, reads, ops, window_start)
     review["what_failed"] = symptoms
     review["mitigations"] = [mitigation_lines(s, c) for s in symptoms for c in s["classifications"] if c["entry"] is not None]
-    review["guards"] = guards_for(selection.key, symptoms, seen_at)
+    shapes = collect_shapes(cluster, {k: v for k, v in reads.items() if not any(e.startswith(k + ":") for e in errors)})
+    review["shapes"] = shapes
+    review["guards"] = guards_for(selection.key, symptoms, seen_at) + risk_guards_for(selection.key, shapes, seen_at)
+    review["baseline"] = {
+        "versions": versions_of(cluster),
+        "pods": len(reads.get("pods") or []),
+        "budgets": len(reads.get("pdbs") or []),
+        "shapes": len(shapes),
+        "guards": [g["id"] for g in review["guards"]],
+        "shape_reads_failed": [e for e in errors if e.split(":")[0] in SHAPE_READS],
+    }
     return review
 
 
@@ -1359,14 +1762,24 @@ def triage(reviews: list[dict], unchanged: list[dict], failed_reads: list[str], 
                     "mitigations": [],
                     "guards": [],
                 }
-        if not incidents and review["reviewed"]:
-            # A cluster whose reads failed is not clean; Info names it under
-            # the failed reads instead.
-            clean.append({"cluster": review["cluster"], "what_happened": review["what_happened"]})
+        if review["reviewed"]:
+            # Every reviewed cluster gets an Info block: its next upgrade,
+            # the risks present and the baseline recorded. A cluster whose
+            # reads failed is not clean; Info names it under the failed reads.
+            clean.append({
+                "cluster": review["cluster"],
+                "what_happened": review["what_happened"],
+                "incidents": len(incidents),
+                "next_upgrade": review["next_upgrade"],
+                "shapes": review["shapes"],
+                "baseline": review["baseline"],
+            })
         for incident in sorted(incidents.values(), key=lambda i: i["object"]):
             (errors if incident["severity"] == SEVERITY_ERROR else warnings).append(incident)
     for guard in guards:
-        if guard.get("last_seen") != seen_at:
+        # A risk is never an incident, so only a failure guard that outlived
+        # its last review is a Warning; stale risk guards stay in the file.
+        if guard.get("last_seen") != seen_at and guard.get("kind", GUARD_KIND_FAILURE) == GUARD_KIND_FAILURE:
             warnings.append({
                 "kind": INCIDENT_STALE_GUARD,
                 "severity": SEVERITY_WARNING,
@@ -1441,7 +1854,51 @@ def _incident_lines(incident: dict) -> list[str]:
     if not incident["guards"]:
         lines.append(NONE_LINE)
     for g in incident["guards"]:
-        lines.append(f"- guard `{g['id']}` entry {g['entry']} ({g['confidence']}), first seen {g['first_seen']}")
+        lines.append(f"- guard `{g['id']}` {g['kind']} entry {g['entry']} ({g['confidence']}), first seen {g['first_seen']}")
+    return lines + [""]
+
+
+def _next_upgrade_lines(nu: dict) -> list[str]:
+    standing = "unknown" if nu["below_target"] is None else ("behind the target" if nu["below_target"] else "at or ahead of the target")
+    exclusions = "; ".join(f"{e['name']} ({e['scope']}) until {e['end'] or '?'}{' [active]' if e['active'] else ''}" for e in nu["exclusions"]) or "none"
+    return [
+        f"{PART_NEXT_UPGRADE} channel {nu['channel'] or 'none'}; target {nu['target'] or 'unknown'}; cluster at {nu['current']}, {standing}. "
+        f"Window: {nu['window']}; next opens {nu['next_opens'] or 'unknown'}. Exclusions: {exclusions}."
+    ]
+
+
+def _risks_lines(shapes: list[dict]) -> list[str]:
+    if not shapes:
+        return [f"{PART_RISKS} {NO_SHAPE_TEXT}{'; '.join(SHAPE_CHECKS)}."]
+    lines = [PART_RISKS, "", "| Object | Catalogue entry | Confidence | Evidence | Mitigate before |", "| --- | --- | --- | --- | --- |"]
+    for shape in shapes:
+        system = " (system)" if shape["system"] else ""
+        lines.append(f"| `{shape['object']}`{system} | {shape['entry']}. {shape['title']} | {shape['confidence']} | {_cell(shape['evidence'])} | {_cell(MITIGATIONS[shape['entry']]['mitigate_before'])} |")
+    return lines
+
+
+def _baseline_lines(baseline: dict | None) -> list[str]:
+    if not baseline:
+        return [f"{PART_BASELINE} {NONE_LINE}"]
+    versions = baseline["versions"]
+    pools = ", ".join(f"{p} {v}" for p, v in sorted(versions["node_pools"].items()))
+    failed = f" Shape reads that failed: {'; '.join(baseline['shape_reads_failed'])}." if baseline["shape_reads_failed"] else ""
+    lines = [f"{PART_BASELINE} control plane {versions['control_plane']}; pools {pools or 'none'}; {baseline['pods']} pods, {baseline['budgets']} budgets, {baseline['shapes']} shapes.{failed} Guards written: {len(baseline['guards'])}."]
+    for gid in baseline["guards"]:
+        lines.append(f"- `{gid}`")
+    return lines
+
+
+def _cluster_block_lines(row: dict) -> list[str]:
+    standing = "clean" if not row["incidents"] else f"{row['incidents']} incident(s) above"
+    lines = [f"### {row['cluster']} — {standing}", ""]
+    lines += _what_happened_lines(row["what_happened"])
+    lines.append("")
+    lines += _next_upgrade_lines(row["next_upgrade"])
+    lines.append("")
+    lines += _risks_lines(row["shapes"])
+    lines.append("")
+    lines += _baseline_lines(row["baseline"])
     return lines + [""]
 
 
@@ -1461,17 +1918,14 @@ def render_report(result: dict) -> str:
     lines += [SECTION_INFO, ""]
     if not (info["clean"] or info["unchanged"] or info["failed_reads"]):
         lines += [NONE_LINE, ""]
-    if info["clean"]:
-        lines += [INFO_CLEAN, ""]
-        for row in info["clean"]:
-            wh = row["what_happened"]
-            ops = "; ".join(f"{op['type']} {op['target']} {_duration(op['duration_s'])} {op['status']}" for op in wh["operations"]) or NO_OPERATION_LINE
-            lines.append(f"- {row['cluster']}: {wh['status']} ({'; '.join(wh['reasons'])}); control plane {wh['versions_after']['control_plane']}; {ops}")
-        lines.append("")
+    # Severity sections keep `_none_`; Info is never empty after a review.
+    for row in info["clean"]:
+        lines += _cluster_block_lines(row)
     if info["unchanged"]:
         lines += [INFO_UNCHANGED, ""]
         for row in info["unchanged"]:
-            lines.append(f"- {row['cluster']} at {row['control_plane']}, last reviewed {row['last_run'] or 'never'}")
+            nu = row.get("next_upgrade") or {}
+            lines.append(f"- {row['cluster']} at {row['control_plane']}; last upgrade operation {row.get('last_operation') or 'none recorded'}; next target {nu.get('target') or 'unknown'}{' (behind)' if nu.get('below_target') else ''}; last reviewed {row['last_run'] or 'never'}")
         lines.append("")
     if info["failed_reads"]:
         lines += [INFO_FAILED_READS, ""]
@@ -1498,9 +1952,10 @@ def parse_since(text: str | None, now: datetime) -> datetime:
     return parsed
 
 
-def ledger_after(ledger: dict, reviews: list[dict], clusters: list[dict], seen_at: str) -> dict:
+def ledger_after(ledger: dict, reviews: list[dict], clusters: list[dict], seen_at: str, operations: dict[str, list[dict]] | None = None) -> dict:
     """Every enumerated cluster's current versions; `last_run` moves only for
-    a cluster this run reviewed, so a failed read is retried next time."""
+    a cluster this run reviewed, so a failed read is retried next time.
+    `last_operation` is the latest upgrade operation the review saw."""
     entries = dict((ledger.get("clusters") or {}))
     reviewed = {r["cluster"] for r in reviews if r["reviewed"]}
     for cluster in clusters:
@@ -1508,12 +1963,15 @@ def ledger_after(ledger: dict, reviews: list[dict], clusters: list[dict], seen_a
         current = versions_of(cluster)
         old = entries.get(key) or {}
         if key in reviewed or not old:
+            starts = [op.get("startTime") for op in (operations or {}).get(key) or [] if op.get("startTime")]
+            latest = parse_ts(max(starts)) if starts else None
             entries[key] = {
                 "control_plane": current["control_plane"],
                 "node_pools": current["node_pools"],
                 "channel": current["channel"],
                 "first_seen": old.get("first_seen") or seen_at,
                 "last_run": seen_at if key in reviewed else old.get("last_run"),
+                "last_operation": fmt_ts(latest) if latest else old.get("last_operation"),
             }
     return {"version": LEDGER_VERSION, "updated_at": seen_at, "clusters": entries}
 
@@ -1559,14 +2017,29 @@ def collect(args: argparse.Namespace, *, run: RunFn | None = None, now: datetime
 
     selected, unchanged = select_clusters(clusters, ledger, operations, since=since, forced=forced)
     log(f"{len(clusters)} cluster(s) in {len(projects)} project(s); reviewing {len(selected)}, {len(unchanged)} unchanged")
+    # One get-server-config per (project, location), for every cluster:
+    # the next target is printed for unchanged clusters too.
+    server_configs: dict[tuple[str, str], dict | None] = {}
+    for cluster in clusters:
+        key = (cluster["project"], cluster["location"])
+        if key in server_configs:
+            continue
+        config, error = fetch_server_config(cluster["project"], cluster["location"], run=run)
+        server_configs[key] = config
+        if error:
+            failed_reads.append(f"{cluster['project']}/{cluster['location']}: {error}")
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
-        reviews = list(pool.map(lambda s: review_cluster(s, ledger, run=run, seen_at=seen_at), selected))
+        reviews = list(pool.map(lambda s: review_cluster(s, ledger, run=run, seen_at=seen_at, server_config=server_configs.get((s.cluster["project"], s.cluster["location"])), now=now), selected))
     reviews.sort(key=lambda r: r["cluster"])
+    for row in unchanged:
+        cluster = next(c for c in clusters if cluster_key(c["project"], c["location"], c["name"]) == row["cluster"])
+        row["next_upgrade"] = next_upgrade(cluster, server_configs.get((cluster["project"], cluster["location"])), now)
+        row["last_operation"] = ((ledger.get("clusters") or {}).get(row["cluster"]) or {}).get("last_operation")
 
     reviewed = {r["cluster"] for r in reviews if r["reviewed"]}
     fresh_guards = [g for r in reviews for g in r["guards"]]
     new_guards = merge_guards(guards, fresh_guards, reviewed, seen_at)
-    new_ledger = ledger_after(ledger, reviews, clusters, seen_at)
+    new_ledger = ledger_after(ledger, reviews, clusters, seen_at, {s.key: s.operations for s in selected})
 
     # Read failures from inside a review join the top-level list so Info
     # names every one in one place.

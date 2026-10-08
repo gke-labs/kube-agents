@@ -1,0 +1,290 @@
+{
+ "apiVersion": "v1",
+ "items": [
+  {
+   "apiVersion": "admissionregistration.k8s.io/v1",
+   "kind": "ValidatingWebhookConfiguration",
+   "metadata": {
+    "annotations": {
+     "components.gke.io/component-name": "managed-prometheus",
+     "components.gke.io/component-version": "0.15.3-gke.11",
+     "components.gke.io/layer": "addon"
+    },
+    "creationTimestamp": "2026-09-24T17:38:10Z",
+    "generation": 1,
+    "labels": {
+     "addonmanager.kubernetes.io/mode": "Reconcile"
+    },
+    "name": "gmp-operator.gmp-system.monitoring.googleapis.com",
+    "resourceVersion": "1790273065266255020",
+    "uid": "7d4ada2b-7a75-44b5-bf98-0a8d36c8db0d"
+   },
+   "webhooks": [
+    {
+     "admissionReviewVersions": [
+      "v1"
+     ],
+     "clientConfig": {
+      "service": {
+       "name": "gmp-operator",
+       "namespace": "gmp-system",
+       "path": "/validate/monitoring.googleapis.com/v1/podmonitorings",
+       "port": 443
+      }
+     },
+     "failurePolicy": "Fail",
+     "matchPolicy": "Equivalent",
+     "name": "validate.podmonitorings.gmp-operator.gmp-system.monitoring.googleapis.com",
+     "sideEffects": "None",
+     "timeoutSeconds": 10
+    },
+    {
+     "admissionReviewVersions": [
+      "v1"
+     ],
+     "clientConfig": {
+      "service": {
+       "name": "gmp-operator",
+       "namespace": "gmp-system",
+       "path": "/validate/monitoring.googleapis.com/v1/clusterpodmonitorings",
+       "port": 443
+      }
+     },
+     "failurePolicy": "Fail",
+     "matchPolicy": "Equivalent",
+     "name": "validate.clusterpodmonitorings.gmp-operator.gmp-system.monitoring.googleapis.com",
+     "sideEffects": "None",
+     "timeoutSeconds": 10
+    },
+    {
+     "admissionReviewVersions": [
+      "v1"
+     ],
+     "clientConfig": {
+      "service": {
+       "name": "gmp-operator",
+       "namespace": "gmp-system",
+       "path": "/validate/monitoring.googleapis.com/v1/clusternodemonitorings",
+       "port": 443
+      }
+     },
+     "failurePolicy": "Fail",
+     "matchPolicy": "Equivalent",
+     "name": "validate.clusternodemonitorings.gmp-operator.gmp-system.monitoring.googleapis.com",
+     "sideEffects": "None",
+     "timeoutSeconds": 10
+    },
+    {
+     "admissionReviewVersions": [
+      "v1"
+     ],
+     "clientConfig": {
+      "service": {
+       "name": "gmp-operator",
+       "namespace": "gmp-system",
+       "path": "/validate/monitoring.googleapis.com/v1/rules",
+       "port": 443
+      }
+     },
+     "failurePolicy": "Fail",
+     "matchPolicy": "Equivalent",
+     "name": "validate.rules.gmp-operator.gmp-system.monitoring.googleapis.com",
+     "sideEffects": "None",
+     "timeoutSeconds": 10
+    },
+    {
+     "admissionReviewVersions": [
+      "v1"
+     ],
+     "clientConfig": {
+      "service": {
+       "name": "gmp-operator",
+       "namespace": "gmp-system",
+       "path": "/validate/monitoring.googleapis.com/v1/clusterrules",
+       "port": 443
+      }
+     },
+     "failurePolicy": "Fail",
+     "matchPolicy": "Equivalent",
+     "name": "validate.clusterrules.gmp-operator.gmp-system.monitoring.googleapis.com",
+     "sideEffects": "None",
+     "timeoutSeconds": 10
+    },
+    {
+     "admissionReviewVersions": [
+      "v1"
+     ],
+     "clientConfig": {
+      "service": {
+       "name": "gmp-operator",
+       "namespace": "gmp-system",
+       "path": "/validate/monitoring.googleapis.com/v1/globalrules",
+       "port": 443
+      }
+     },
+     "failurePolicy": "Fail",
+     "matchPolicy": "Equivalent",
+     "name": "validate.globalrules.gmp-operator.gmp-system.monitoring.googleapis.com",
+     "sideEffects": "None",
+     "timeoutSeconds": 10
+    },
+    {
+     "admissionReviewVersions": [
+      "v1"
+     ],
+     "clientConfig": {
+      "service": {
+       "name": "gmp-operator",
+       "namespace": "gmp-system",
+       "path": "/validate/monitoring.googleapis.com/v1/operatorconfigs",
+       "port": 443
+      }
+     },
+     "failurePolicy": "Fail",
+     "matchPolicy": "Equivalent",
+     "name": "validate.operatorconfigs.gmp-operator.gmp-system.monitoring.googleapis.com",
+     "sideEffects": "None",
+     "timeoutSeconds": 10
+    }
+   ]
+  },
+  {
+   "apiVersion": "admissionregistration.k8s.io/v1",
+   "kind": "ValidatingWebhookConfiguration",
+   "metadata": {
+    "creationTimestamp": "2026-09-24T17:37:37Z",
+    "generation": 2,
+    "labels": {
+     "networking.gke.io/common-webhooks": "true"
+    },
+    "name": "warden-validating.config.common-webhooks.networking.gke.io",
+    "resourceVersion": "1790273034236415006",
+    "uid": "8533e239-7515-473f-81f7-24e6190dc899"
+   },
+   "webhooks": [
+    {
+     "admissionReviewVersions": [
+      "v1beta1"
+     ],
+     "clientConfig": {
+      "url": "https://localhost:5443/webhook/warden-validating"
+     },
+     "failurePolicy": "Fail",
+     "matchPolicy": "Equivalent",
+     "name": "warden-validating.common-webhooks.networking.gke.io",
+     "sideEffects": "None",
+     "timeoutSeconds": 10
+    }
+   ]
+  },
+  {
+   "apiVersion": "admissionregistration.k8s.io/v1",
+   "kind": "MutatingWebhookConfiguration",
+   "metadata": {
+    "annotations": {
+     "components.gke.io/component-name": "managed-prometheus",
+     "components.gke.io/component-version": "0.15.3-gke.11",
+     "components.gke.io/layer": "addon"
+    },
+    "creationTimestamp": "2026-09-24T17:38:09Z",
+    "generation": 1,
+    "labels": {
+     "addonmanager.kubernetes.io/mode": "Reconcile"
+    },
+    "name": "gmp-operator.gmp-system.monitoring.googleapis.com",
+    "resourceVersion": "1790273064966943007",
+    "uid": "8ebe1fe5-6ba0-404e-a793-efc5b64690e2"
+   },
+   "webhooks": [
+    {
+     "admissionReviewVersions": [
+      "v1"
+     ],
+     "clientConfig": {
+      "service": {
+       "name": "gmp-operator",
+       "namespace": "gmp-system",
+       "path": "/default/monitoring.googleapis.com/v1/podmonitorings",
+       "port": 443
+      }
+     },
+     "failurePolicy": "Fail",
+     "matchPolicy": "Equivalent",
+     "name": "default.podmonitorings.gmp-operator.gmp-system.monitoring.googleapis.com",
+     "reinvocationPolicy": "Never",
+     "sideEffects": "None",
+     "timeoutSeconds": 10
+    },
+    {
+     "admissionReviewVersions": [
+      "v1"
+     ],
+     "clientConfig": {
+      "service": {
+       "name": "gmp-operator",
+       "namespace": "gmp-system",
+       "path": "/default/monitoring.googleapis.com/v1/clusterpodmonitorings",
+       "port": 443
+      }
+     },
+     "failurePolicy": "Fail",
+     "matchPolicy": "Equivalent",
+     "name": "default.clusterpodmonitorings.gmp-operator.gmp-system.monitoring.googleapis.com",
+     "reinvocationPolicy": "Never",
+     "sideEffects": "None",
+     "timeoutSeconds": 10
+    },
+    {
+     "admissionReviewVersions": [
+      "v1"
+     ],
+     "clientConfig": {
+      "service": {
+       "name": "gmp-operator",
+       "namespace": "gmp-system",
+       "path": "/default/monitoring.googleapis.com/v1/operatorconfigs",
+       "port": 443
+      }
+     },
+     "failurePolicy": "Ignore",
+     "matchPolicy": "Equivalent",
+     "name": "default.operatorconfigs.gmp-operator.gmp-system.monitoring.googleapis.com",
+     "reinvocationPolicy": "Never",
+     "sideEffects": "None",
+     "timeoutSeconds": 10
+    }
+   ]
+  },
+  {
+   "apiVersion": "admissionregistration.k8s.io/v1",
+   "kind": "MutatingWebhookConfiguration",
+   "metadata": {
+    "creationTimestamp": "2026-09-24T17:37:38Z",
+    "generation": 1,
+    "labels": {
+     "networking.gke.io/common-webhooks": "true"
+    },
+    "name": "warden-mutating.config.common-webhooks.networking.gke.io",
+    "resourceVersion": "1790271459004783006",
+    "uid": "33b72966-e4e4-4a8b-b9cc-046ab33db6fc"
+   },
+   "webhooks": [
+    {
+     "admissionReviewVersions": [
+      "v1beta1"
+     ],
+     "clientConfig": {
+      "url": "https://localhost:5443/webhook/warden-mutating"
+     },
+     "failurePolicy": "Fail",
+     "matchPolicy": "Equivalent",
+     "name": "warden-mutating.common-webhooks.networking.gke.io",
+     "reinvocationPolicy": "Never",
+     "sideEffects": "None",
+     "timeoutSeconds": 10
+    }
+   ]
+  }
+ ],
+ "kind": "List"
+}

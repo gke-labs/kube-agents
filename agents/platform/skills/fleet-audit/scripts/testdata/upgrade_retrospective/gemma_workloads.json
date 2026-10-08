@@ -1,0 +1,711 @@
+{
+ "apiVersion": "v1",
+ "items": [
+  {
+   "apiVersion": "apps/v1",
+   "kind": "Deployment",
+   "metadata": {
+    "annotations": {
+     "deployment.kubernetes.io/revision": "2"
+    },
+    "creationTimestamp": "2026-09-24T17:37:17Z",
+    "generation": 5,
+    "labels": {
+     "addonmanager.kubernetes.io/mode": "Reconcile",
+     "k8s-app": "kube-dns",
+     "kubernetes.io/cluster-service": "true"
+    },
+    "name": "kube-dns",
+    "namespace": "kube-system",
+    "resourceVersion": "1790277974031279022",
+    "uid": "d3912d65-a4bd-4ea0-acb7-73cf52e80b6d"
+   },
+   "spec": {
+    "progressDeadlineSeconds": 600,
+    "replicas": 2,
+    "revisionHistoryLimit": 10,
+    "selector": {
+     "matchLabels": {
+      "k8s-app": "kube-dns"
+     }
+    },
+    "strategy": {
+     "rollingUpdate": {
+      "maxSurge": "10%",
+      "maxUnavailable": 0
+     },
+     "type": "RollingUpdate"
+    },
+    "template": {
+     "metadata": {
+      "labels": {
+       "k8s-app": "kube-dns"
+      }
+     },
+     "spec": {
+      "affinity": {
+       "podAntiAffinity": {
+        "preferredDuringSchedulingIgnoredDuringExecution": [
+         {
+          "podAffinityTerm": {
+           "labelSelector": {
+            "matchExpressions": [
+             {
+              "key": "k8s-app",
+              "operator": "In",
+              "values": [
+               "kube-dns"
+              ]
+             }
+            ]
+           },
+           "topologyKey": "kubernetes.io/hostname"
+          },
+          "weight": 100
+         }
+        ]
+       }
+      },
+      "containers": [
+       {
+        "args": [
+         "--domain=cluster.local.",
+         "--dns-port=10053",
+         "--config-dir=/kube-dns-config",
+         "--v=2"
+        ],
+        "env": [
+         {
+          "name": "PROMETHEUS_PORT",
+          "value": "10055"
+         }
+        ],
+        "image": "us-central1-artifactregistry.gcr.io/gke-release/gke-release/k8s-dns-kube-dns:1.25.0-gke.23@sha256:17bf1c20b0f344d3afbf09acd5a88bedc496069ac4e95ceaa96fa1f871f09bdc",
+        "imagePullPolicy": "IfNotPresent",
+        "name": "kubedns",
+        "ports": [
+         {
+          "containerPort": 10053,
+          "name": "dns-local",
+          "protocol": "UDP"
+         },
+         {
+          "containerPort": 10053,
+          "name": "dns-tcp-local",
+          "protocol": "TCP"
+         }
+        ],
+        "resources": {
+         "limits": {
+          "memory": "210Mi"
+         },
+         "requests": {
+          "cpu": "100m",
+          "memory": "70Mi"
+         }
+        },
+        "terminationMessagePath": "/dev/termination-log",
+        "terminationMessagePolicy": "File",
+        "volumeMounts": [
+         {
+          "mountPath": "/kube-dns-config",
+          "name": "kube-dns-config"
+         }
+        ]
+       },
+       {
+        "args": [
+         "-v=2",
+         "-logtostderr",
+         "-configDir=/etc/k8s/dns/dnsmasq-nanny",
+         "-restartDnsmasq=true",
+         "--",
+         "-k",
+         "--cache-size=1000",
+         "--no-negcache",
+         "--dns-forward-max=1500",
+         "--log-facility=-",
+         "--server=/cluster.local/127.0.0.1#10053",
+         "--server=/in-addr.arpa/127.0.0.1#10053",
+         "--server=/ip6.arpa/127.0.0.1#10053",
+         "--max-ttl=30",
+         "--max-cache-ttl=30",
+         "--max-tcp-connections=200"
+        ],
+        "image": "us-central1-artifactregistry.gcr.io/gke-release/gke-release/k8s-dns-dnsmasq-nanny:1.25.0-gke.23@sha256:5d3bb7ddc1a00430cb109475b6415e085aaa411cd998ac77d80c96e84e212de2",
+        "imagePullPolicy": "IfNotPresent",
+        "name": "dnsmasq",
+        "ports": [
+         {
+          "containerPort": 53,
+          "name": "dns",
+          "protocol": "UDP"
+         },
+         {
+          "containerPort": 53,
+          "name": "dns-tcp",
+          "protocol": "TCP"
+         }
+        ],
+        "resources": {
+         "requests": {
+          "cpu": "150m",
+          "memory": "20Mi"
+         }
+        },
+        "terminationMessagePath": "/dev/termination-log",
+        "terminationMessagePolicy": "File",
+        "volumeMounts": [
+         {
+          "mountPath": "/etc/k8s/dns/dnsmasq-nanny",
+          "name": "kube-dns-config"
+         }
+        ]
+       },
+       {
+        "args": [
+         "--v=2",
+         "--probe=kubedns,127.0.0.1:10053,kubernetes.default.svc.cluster.local,5,SRV",
+         "--probe=dnsmasq,127.0.0.1:53,kubernetes.default.svc.cluster.local,5,SRV"
+        ],
+        "image": "us-central1-artifactregistry.gcr.io/gke-release/gke-release/k8s-dns-sidecar:1.25.0-gke.23@sha256:83c6ea849bf3421edf63ed4f3400b7f6270d38e57b7e22e685c1ebc8b765517b",
+        "imagePullPolicy": "IfNotPresent",
+        "name": "sidecar",
+        "ports": [
+         {
+          "containerPort": 10054,
+          "name": "metrics",
+          "protocol": "TCP"
+         }
+        ],
+        "resources": {
+         "requests": {
+          "cpu": "10m",
+          "memory": "20Mi"
+         }
+        },
+        "terminationMessagePath": "/dev/termination-log",
+        "terminationMessagePolicy": "File"
+       },
+       {
+        "env": [
+         {
+          "name": "GOMAXPROCS",
+          "value": "2"
+         },
+         {
+          "name": "COLLECTOR_CONFIG_PATH",
+          "value": "/conf/kubedns-metrics-collector-config-data.textproto,/conf/sidecar-metrics-collector-config-data.textproto"
+         },
+         {
+          "name": "SPLIT_GAUGE_BUFFER",
+          "value": "true"
+         },
+         {
+          "name": "PROJECT_NUMBER",
+          "value": "196584622296"
+         },
+         {
+          "name": "LOCATION",
+          "value": "us-central1-a"
+         },
+         {
+          "name": "CLUSTER_NAME",
+          "value": "gemma-gpu-upgraded"
+         },
+         {
+          "name": "POD_NAMESPACE"
+         },
+         {
+          "name": "NODE_NAME"
+         },
+         {
+          "name": "POD_NAME"
+         },
+         {
+          "name": "CONTAINER_NAME",
+          "value": "kubedns-metrics-collector"
+         },
+         {
+          "name": "COMPONENT_VERSION"
+         },
+         {
+          "name": "COMPONENT_NAME"
+         }
+        ],
+        "image": "us-central1-artifactregistry.gcr.io/gke-release/gke-release/gke-metrics-collector:20260401_2300_RC0@sha256:258912d769fd027c80bd086f5a4a6389520b698f9c851bfb4737b2ba97b19b23",
+        "imagePullPolicy": "IfNotPresent",
+        "name": "kubedns-metrics-collector",
+        "resources": {
+         "limits": {
+          "cpu": "1",
+          "memory": "45Mi"
+         },
+         "requests": {
+          "cpu": "10m",
+          "memory": "45Mi"
+         }
+        },
+        "terminationMessagePath": "/dev/termination-log",
+        "terminationMessagePolicy": "File",
+        "volumeMounts": [
+         {
+          "mountPath": "/conf",
+          "name": "kubedns-metrics-collector-config-map-vol"
+         }
+        ]
+       }
+      ],
+      "dnsPolicy": "Default",
+      "nodeSelector": {
+       "kubernetes.io/os": "linux"
+      },
+      "priorityClassName": "system-cluster-critical",
+      "restartPolicy": "Always",
+      "schedulerName": "default-scheduler",
+      "securityContext": {
+       "fsGroup": 65534,
+       "seccompProfile": {
+        "type": "RuntimeDefault"
+       },
+       "supplementalGroups": [
+        65534
+       ]
+      },
+      "serviceAccount": "kube-dns",
+      "serviceAccountName": "kube-dns",
+      "terminationGracePeriodSeconds": 30,
+      "tolerations": [
+       {
+        "key": "CriticalAddonsOnly",
+        "operator": "Exists"
+       },
+       {
+        "key": "components.gke.io/gke-managed-components",
+        "operator": "Exists"
+       },
+       {
+        "effect": "NoSchedule",
+        "key": "kubernetes.io/arch",
+        "operator": "Equal",
+        "value": "arm64"
+       }
+      ],
+      "volumes": [
+       {
+        "configMap": {
+         "defaultMode": 420,
+         "name": "kube-dns",
+         "optional": true
+        },
+        "name": "kube-dns-config"
+       },
+       {
+        "configMap": {
+         "defaultMode": 420,
+         "items": [
+          {
+           "key": "kubedns-metrics-collector-config-data",
+           "path": "kubedns-metrics-collector-config-data.textproto"
+          },
+          {
+           "key": "sidecar-metrics-collector-config-data",
+           "path": "sidecar-metrics-collector-config-data.textproto"
+          }
+         ],
+         "name": "kubedns-metrics-collector-config-map"
+        },
+        "name": "kubedns-metrics-collector-config-map-vol"
+       }
+      ]
+     }
+    }
+   }
+  },
+  {
+   "apiVersion": "apps/v1",
+   "kind": "Deployment",
+   "metadata": {
+    "annotations": {
+     "deployment.kubernetes.io/revision": "2"
+    },
+    "creationTimestamp": "2026-09-24T17:37:57Z",
+    "generation": 2,
+    "labels": {
+     "addonmanager.kubernetes.io/mode": "Reconcile",
+     "k8s-app": "kube-dns-autoscaler",
+     "kubernetes.io/cluster-service": "true"
+    },
+    "name": "kube-dns-autoscaler",
+    "namespace": "kube-system",
+    "resourceVersion": "1790273063467823023",
+    "uid": "b9d75af7-eb35-458f-822d-668b0a2574fb"
+   },
+   "spec": {
+    "progressDeadlineSeconds": 600,
+    "replicas": 1,
+    "revisionHistoryLimit": 10,
+    "selector": {
+     "matchLabels": {
+      "k8s-app": "kube-dns-autoscaler"
+     }
+    },
+    "strategy": {
+     "rollingUpdate": {
+      "maxSurge": "25%",
+      "maxUnavailable": "25%"
+     },
+     "type": "RollingUpdate"
+    },
+    "template": {
+     "metadata": {
+      "labels": {
+       "k8s-app": "kube-dns-autoscaler"
+      }
+     },
+     "spec": {
+      "containers": [
+       {
+        "command": [
+         "/cluster-proportional-autoscaler",
+         "--namespace=kube-system",
+         "--configmap=kube-dns-autoscaler",
+         "--target=Deployment/kube-dns",
+         "--default-params={\"linear\":{\"coresPerReplica\":256,\"nodesPerReplica\":16,\"preventSinglePointFailure\":true,\"includeUnschedulableNodes\":true}}",
+         "--logtostderr=true",
+         "--v=2"
+        ],
+        "image": "us-central1-artifactregistry.gcr.io/gke-release/gke-release/cluster-proportional-autoscaler:v1.10.2-gke.37@sha256:c27a7214ada7532f1879bbe3e0a8035a704b5a953946c1698c9598a0ba965f9f",
+        "imagePullPolicy": "IfNotPresent",
+        "name": "autoscaler",
+        "resources": {
+         "requests": {
+          "cpu": "20m",
+          "memory": "10Mi"
+         }
+        },
+        "terminationMessagePath": "/dev/termination-log",
+        "terminationMessagePolicy": "File"
+       }
+      ],
+      "dnsPolicy": "ClusterFirst",
+      "nodeSelector": {
+       "kubernetes.io/os": "linux"
+      },
+      "priorityClassName": "system-cluster-critical",
+      "restartPolicy": "Always",
+      "schedulerName": "default-scheduler",
+      "securityContext": {
+       "fsGroup": 65534,
+       "runAsGroup": 1000,
+       "runAsUser": 1000,
+       "seccompProfile": {
+        "type": "RuntimeDefault"
+       },
+       "supplementalGroups": [
+        65534
+       ]
+      },
+      "serviceAccount": "kube-dns-autoscaler",
+      "serviceAccountName": "kube-dns-autoscaler",
+      "terminationGracePeriodSeconds": 30,
+      "tolerations": [
+       {
+        "key": "CriticalAddonsOnly",
+        "operator": "Exists"
+       },
+       {
+        "key": "components.gke.io/gke-managed-components",
+        "operator": "Exists"
+       },
+       {
+        "effect": "NoSchedule",
+        "key": "kubernetes.io/arch",
+        "operator": "Equal",
+        "value": "arm64"
+       }
+      ],
+      "volumes": []
+     }
+    }
+   }
+  },
+  {
+   "apiVersion": "apps/v1",
+   "kind": "Deployment",
+   "metadata": {
+    "annotations": {
+     "deployment.kubernetes.io/revision": "1"
+    },
+    "creationTimestamp": "2026-09-24T17:41:29Z",
+    "generation": 1,
+    "name": "vllm-gemma-deployment",
+    "namespace": "kubeagents-system",
+    "resourceVersion": "1790278132255311022",
+    "uid": "50e25e8f-58d5-4423-aaf7-456401b9b332"
+   },
+   "spec": {
+    "progressDeadlineSeconds": 1500,
+    "replicas": 1,
+    "revisionHistoryLimit": 10,
+    "selector": {
+     "matchLabels": {
+      "app": "gemma-server"
+     }
+    },
+    "strategy": {
+     "type": "Recreate"
+    },
+    "template": {
+     "metadata": {
+      "labels": {
+       "ai.gke.io/inference-server": "vllm",
+       "ai.gke.io/model": "gemma-4-e2b-it",
+       "app": "gemma-server",
+       "examples.ai.gke.io/source": "user-guide"
+      }
+     },
+     "spec": {
+      "containers": [
+       {
+        "args": [
+         "--model=$(MODEL_ID)",
+         "--host=0.0.0.0",
+         "--port=8000",
+         "--tensor-parallel-size=1",
+         "--enable-log-requests",
+         "--enable-chunked-prefill",
+         "--enable-prefix-caching",
+         "--enable-auto-tool-choice",
+         "--generation-config=auto",
+         "--tool-call-parser=gemma4",
+         "--dtype=bfloat16",
+         "--max-num-seqs=16",
+         "--max-model-len=131072",
+         "--gpu-memory-utilization=0.95",
+         "--reasoning-parser=gemma4",
+         "--trust-remote-code"
+        ],
+        "command": [
+         "python3",
+         "-m",
+         "vllm.entrypoints.api_server"
+        ],
+        "env": [
+         {
+          "name": "LD_LIBRARY_PATH",
+          "value": "${LD_LIBRARY_PATH}:/usr/local/nvidia/lib64"
+         },
+         {
+          "name": "MODEL_ID",
+          "value": "google/gemma-4-E2B-it"
+         },
+         {
+          "name": "OTEL_SERVICE_NAME",
+          "value": "vllm-gemma"
+         }
+        ],
+        "image": "us-docker.pkg.dev/vertex-ai/vertex-vision-model-garden-dockers/pytorch-vllm-serve:gemma4",
+        "imagePullPolicy": "IfNotPresent",
+        "name": "inference-server",
+        "resources": {
+         "limits": {
+          "cpu": "2",
+          "ephemeral-storage": "10Gi",
+          "memory": "10Gi",
+          "nvidia.com/gpu": "1"
+         },
+         "requests": {
+          "cpu": "2",
+          "ephemeral-storage": "10Gi",
+          "memory": "10Gi",
+          "nvidia.com/gpu": "1"
+         }
+        },
+        "terminationMessagePath": "/dev/termination-log",
+        "terminationMessagePolicy": "File",
+        "volumeMounts": [
+         {
+          "mountPath": "/dev/shm",
+          "name": "dshm"
+         },
+         {
+          "mountPath": "/root/.cache",
+          "name": "model-cache"
+         }
+        ]
+       },
+       {
+        "command": [
+         "python3",
+         "/proxy/traffic_log_proxy.py"
+        ],
+        "env": [
+         {
+          "name": "UPSTREAM_HOST",
+          "value": "127.0.0.1"
+         },
+         {
+          "name": "UPSTREAM_PORT",
+          "value": "8000"
+         },
+         {
+          "name": "LISTEN_PORT",
+          "value": "8080"
+         }
+        ],
+        "image": "python:3.12-slim",
+        "imagePullPolicy": "IfNotPresent",
+        "name": "traffic-log",
+        "ports": [
+         {
+          "containerPort": 8080,
+          "name": "logged",
+          "protocol": "TCP"
+         }
+        ],
+        "resources": {
+         "limits": {
+          "memory": "256Mi"
+         },
+         "requests": {
+          "cpu": "100m",
+          "memory": "128Mi"
+         }
+        },
+        "terminationMessagePath": "/dev/termination-log",
+        "terminationMessagePolicy": "File",
+        "volumeMounts": [
+         {
+          "mountPath": "/proxy",
+          "name": "proxy",
+          "readOnly": true
+         }
+        ]
+       }
+      ],
+      "dnsPolicy": "ClusterFirst",
+      "nodeSelector": {
+       "cloud.google.com/gke-accelerator": "nvidia-l4",
+       "cloud.google.com/gke-gpu-driver-version": "latest"
+      },
+      "restartPolicy": "Always",
+      "schedulerName": "default-scheduler",
+      "securityContext": {},
+      "terminationGracePeriodSeconds": 30,
+      "volumes": [
+       {
+        "emptyDir": {
+         "medium": "Memory"
+        },
+        "name": "dshm"
+       },
+       {
+        "configMap": {
+         "defaultMode": 420,
+         "name": "traffic-log-proxy"
+        },
+        "name": "proxy"
+       },
+       {
+        "emptyDir": {
+         "sizeLimit": "40Gi"
+        },
+        "name": "model-cache"
+       }
+      ]
+     }
+    }
+   }
+  },
+  {
+   "apiVersion": "batch/v1",
+   "kind": "CronJob",
+   "metadata": {
+    "annotations": {},
+    "creationTimestamp": "2026-09-24T17:41:32Z",
+    "generation": 1,
+    "name": "legacy-flowcontrol-tuner",
+    "namespace": "kubeagents-system",
+    "resourceVersion": "1791482404501391017",
+    "uid": "854688b1-6e13-4374-a136-ae81780987ca"
+   },
+   "spec": {
+    "concurrencyPolicy": "Forbid",
+    "failedJobsHistoryLimit": 6,
+    "jobTemplate": {
+     "metadata": {
+      "creationTimestamp": null
+     },
+     "spec": {
+      "backoffLimit": 0,
+      "template": {
+       "metadata": {
+        "labels": {
+         "app": "legacy-flowcontrol-tuner"
+        }
+       },
+       "spec": {
+        "containers": [
+         {
+          "command": [
+           "python3",
+           "/app/tuner.py"
+          ],
+          "image": "python:3.12-slim",
+          "imagePullPolicy": "IfNotPresent",
+          "name": "tuner",
+          "resources": {
+           "limits": {
+            "memory": "64Mi"
+           },
+           "requests": {
+            "cpu": "20m",
+            "memory": "32Mi"
+           }
+          },
+          "terminationMessagePath": "/dev/termination-log",
+          "terminationMessagePolicy": "File",
+          "volumeMounts": [
+           {
+            "mountPath": "/app",
+            "name": "app",
+            "readOnly": true
+           }
+          ]
+         }
+        ],
+        "dnsPolicy": "ClusterFirst",
+        "restartPolicy": "Never",
+        "schedulerName": "default-scheduler",
+        "securityContext": {
+         "runAsNonRoot": true,
+         "runAsUser": 65534,
+         "seccompProfile": {
+          "type": "RuntimeDefault"
+         }
+        },
+        "serviceAccount": "legacy-flowcontrol-tuner",
+        "serviceAccountName": "legacy-flowcontrol-tuner",
+        "terminationGracePeriodSeconds": 30,
+        "volumes": [
+         {
+          "configMap": {
+           "defaultMode": 420,
+           "name": "legacy-flowcontrol-tuner"
+          },
+          "name": "app"
+         }
+        ]
+       }
+      }
+     }
+    },
+    "schedule": "*/10 * * * *",
+    "successfulJobsHistoryLimit": 3,
+    "suspend": false
+   }
+  }
+ ],
+ "kind": "List"
+}
