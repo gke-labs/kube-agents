@@ -189,10 +189,16 @@ Optional, and copied through when set: `CLUSTER_MODE`, `MODEL_DEFAULT_NAME`,
 `SLACK_APP_TOKEN`.
 
 `PLATFORM_AGENT_MODE` is the `PlatformAgent`'s `spec.mode`, `today` or `next`; the
-renderer refuses anything else and writes `today` as no key, which is how the installer
-reads an absent one. The installer does not read the key yet, so on this path it changes
-nothing on the cluster. A rebuild through `deploy-environment.yml` takes the mode as its
-`mode` input instead and applies `next` to the `PlatformAgent` itself after the install.
+renderer refuses anything else and writes `today` as no key, because an absent
+`spec.mode` is `today` to the CRD. The installer does not read the key, so on this
+path it changes nothing on the cluster, and `install.env.example` has no entry for it:
+it is a release-path key until the installer reads it. A rebuild through
+`deploy-environment.yml` takes the mode as its `mode` input instead and applies `next`
+to the `PlatformAgent` itself after the install, on `rc` and `nightly` only. Both that
+workflow and `provision_environment.sh` refuse `next` on `autopush` and `staging`:
+there the patched mode would outlive the run, since the chart renders no `spec.mode`
+and nothing this page describes (reconcile, upgrade, drift report) reads it back, and
+Google Chat would stay on the A2A gateway until a `today` rebuild.
 
 Two naming details that are easy to trip over:
 

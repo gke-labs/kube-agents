@@ -243,7 +243,7 @@ identifier appears, add its source here.
 | Memory bank name, scope-tag spelling, and provider name | `agents/chat/plugins/memory/kube_agents_memory/config_schema.py` |
 | Per-profile Hindsight recall settings the agent uses | `agents/chat/defaults/hindsight/config.json`, `agents/platform/hindsight/config.json` |
 | Hindsight endpoint (`HINDSIGHT_API_URL`, derived from the namespace) | `k8s-operator/internal/controller/platformagent_manifests.go` |
-| Gateway rollout budgets: `StartupProbe` (`agentAPIProbe`), `gatewayProgressDeadlineSeconds`, and the rollout gates in `upgrade.sh` and `scripts/release/wait_for_gke_readiness.sh` (`GATEWAY_READINESS_TIMEOUT`) | `k8s-operator/internal/controller/platformagent_manifests.go`, `upgrade.sh`, and `scripts/release/wait_for_gke_readiness.sh`, held in order by `tests/test_gateway_rollout_budgets.py` |
+| Gateway rollout budgets: `StartupProbe` (`agentAPIProbe`), `gatewayProgressDeadlineSeconds`, and the rollout gates in `upgrade.sh` and `scripts/release/wait_for_gke_readiness.sh` (`GATEWAY_READINESS_TIMEOUT`) | `k8s-operator/internal/controller/platformagent_manifests.go`, `upgrade.sh`, `scripts/release/wait_for_gke_readiness.sh`, and `scripts/release/platform_agent_mode.sh` (`PLATFORM_AGENT_MODE_GATE_TIMEOUT_SECONDS`), held in order by `tests/test_gateway_rollout_budgets.py` |
 | Admission webhook server port (`--webhook-port` default) | `DefaultPort` in `k8s-operator/internal/webhook/platformagent_webhook.go` |
 | Live-test lease: ConfigMap name, TTL, install-configuration keys read, which commands count as mutations | `scripts/live_test_lease.py` |
 | PR evidence screenshots: publish branch, file-name provenance, caption format | `scripts/pr_evidence_screenshot.sh` |
