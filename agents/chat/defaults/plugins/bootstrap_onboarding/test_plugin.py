@@ -236,6 +236,7 @@ class PreLlmCallTest(unittest.TestCase):
         """
         gateway_config = mock.MagicMock()
         gateway_config.get_home_channel.return_value = configured
+        self.gateway_config = gateway_config
         persist = mock.MagicMock(side_effect=persist_error)
         save_env_value = mock.MagicMock()
         for name, value in (
@@ -262,9 +263,23 @@ class PreLlmCallTest(unittest.TestCase):
         save_env_value.assert_any_call("GOOGLE_CHAT_HOME_CHANNEL", "spaces/AAA")
         save_env_value.assert_any_call("GOOGLE_CHAT_HOME_CHANNEL_THREAD_ID", "")
 
+    def test_slack_turn_sets_the_slack_home_channel(self):
+        persist, save_env_value = self._arm_home_channel()
+        with mock.patch.object(
+            plugin,
+            "get_session_env",
+            _fake_session_env(HERMES_SESSION_PLATFORM="slack", HERMES_SESSION_CHAT_ID="C123"),
+        ):
+            self._call(platform="slack")
+        self.gateway_config.get_home_channel.assert_called_once_with(_Platform.SLACK)
+        (home,), _ = persist.call_args
+        self.assertEqual((home["platform"], home["chat_id"]), (_Platform.SLACK, "C123"))
+        save_env_value.assert_any_call("SLACK_HOME_CHANNEL", "C123")
+
     def test_configured_home_channel_is_left_alone(self):
         persist, save_env_value = self._arm_home_channel(configured=mock.sentinel.home)
         self.assertIsNotNone(self._call())
+        self.gateway_config.get_home_channel.assert_called_once_with(_Platform.GOOGLE_CHAT)
         persist.assert_not_called()
         save_env_value.assert_not_called()
 

@@ -37,6 +37,11 @@ DURABLE_CHAT_PLATFORMS = {"google_chat", "slack"}
 # platforms' by this pattern; the thread id's is the same name plus a suffix.
 HOME_CHANNEL_ENV_FORMAT = "{}_HOME_CHANNEL"
 HOME_THREAD_ENV_SUFFIX = "_THREAD_ID"
+SESSION_PLATFORM_ENV = "HERMES_SESSION_PLATFORM"
+SESSION_CHAT_ID_ENV = "HERMES_SESSION_CHAT_ID"
+SESSION_CHAT_NAME_ENV = "HERMES_SESSION_CHAT_NAME"
+SESSION_USER_ID_ENV = "HERMES_SESSION_USER_ID"
+SESSION_SCOPE_ID_ENV = "HERMES_SESSION_SCOPE_ID"
 
 # Written once the opening turn has been primed. Onboarding is a ONE-TIME
 # event, but ``.bootstrap_completed`` only appears at the very end of the
@@ -153,8 +158,8 @@ def _set_home_channel_if_unset(**kwargs: Any) -> None:
 
     ``deliver: chat`` jobs and the chat relay post to the home channel, and a
     fresh install has none until someone runs ``/sethome``, so every scheduled
-    report is dropped until then. A configured channel is left alone, whichever
-    layer set it: ``/sethome``, the operator's overlay or a home-channel env var.
+    report is dropped until then. A configured channel is left alone, whether
+    ``/sethome`` or the CR's ``homeChannel`` (a home-channel env var) set it.
     The write goes through ``persist_home_channel``, as ``/sethome``'s does: a
     ``home_channel`` block without ``platform`` or ``chat_id`` raises out of
     ``load_gateway_config`` and stops cron delivery for every platform.
@@ -162,8 +167,8 @@ def _set_home_channel_if_unset(**kwargs: Any) -> None:
     if None in (get_session_env, HomeChannel, Platform, load_gateway_config, persist_home_channel):
         return
     try:
-        platform = Platform(get_session_env("HERMES_SESSION_PLATFORM") or str(kwargs.get("platform") or ""))
-        chat_id = str(get_session_env("HERMES_SESSION_CHAT_ID") or "")
+        platform = Platform(get_session_env(SESSION_PLATFORM_ENV) or str(kwargs.get("platform") or ""))
+        chat_id = str(get_session_env(SESSION_CHAT_ID_ENV) or "")
         if not chat_id or load_gateway_config().get_home_channel(platform) is not None:
             return
         # No thread_id: a home channel pinned to the opening message's thread would
@@ -172,9 +177,9 @@ def _set_home_channel_if_unset(**kwargs: Any) -> None:
             HomeChannel(
                 platform=platform,
                 chat_id=chat_id,
-                name=get_session_env("HERMES_SESSION_CHAT_NAME") or chat_id,
-                user_id=get_session_env("HERMES_SESSION_USER_ID") or None,
-                scope_id=get_session_env("HERMES_SESSION_SCOPE_ID") or None,
+                name=get_session_env(SESSION_CHAT_NAME_ENV) or chat_id,
+                user_id=get_session_env(SESSION_USER_ID_ENV) or None,
+                scope_id=get_session_env(SESSION_SCOPE_ID_ENV) or None,
             )
         )
         logger.info("Set the %s home channel to %s.", platform.value, chat_id)

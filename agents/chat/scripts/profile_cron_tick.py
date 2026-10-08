@@ -318,8 +318,10 @@ def home_target_env(root_home: Path) -> dict[str, str]:
       an affected install, so nothing lands and the lookup below finds nothing.
 
     Only the operator rendering a ``home_channel`` beside the ``enabled`` and
-    ``typing_status_text`` it already writes covers both, and covers the install
-    where nobody has typed ``/sethome`` at all. That is still missing.
+    ``typing_status_text`` it already writes covers both. On a writable file the
+    ``bootstrap_onboarding`` plugin sets one on a fresh install's first chat
+    message; an install onboarded before that, or whose first turn was not on
+    chat, still has none.
 
     Two things to get right if you write that, both worse than the bug this
     function fixes. **The shape:** only ``chat_id`` is read here, but the whole
