@@ -1,9 +1,3 @@
-# FIXTURE NOT READY — a FIXTURE_NOT_READY entry in scripts/validate_bench_cases.py
-# until the eval install has an audit ingress: a drift-audit topic, a
-# subscription, and a detector enabled to pull from it. That is the whole of
-# what parks the case, and the alert ceiling has to move in the same change.
-# Both are spelled out below.
-#
 # Domain: incident triage. Journey: a burst of changes lands across two
 # namespaces, almost all of it controller churn, and the drift pipeline files a
 # triage for the one a person made and for nothing else.
@@ -514,7 +508,32 @@
 id: gitops-drift-noise-filtered-triage
 name: A burst of controller churn around one human change is triaged as the human change alone
 infrastructure:
-  deployer: noop
+  deployer: "tofu"
+  provider: "gcp"
+  stack: "prebuilt/gitops-drift-noise"
+  teardown: true
+  # host_cluster_name and host_cluster_location are deliberately absent: they
+  # arrive from the environment (TF_VAR_host_cluster_name /
+  # TF_VAR_host_cluster_location, exported by hack/ci-eval-pr.sh) because they
+  # name the install the runner deployed and no task may choose a different
+  # one. The stack's variables.tf says why getting them wrong is silent.
+  #
+  # Everything below is also named in the prompt, in the checks at the bottom
+  # of this file, and in bench/tf/prebuilt/gitops-drift-noise/variables.tf.
+  # Change one and change all three: a rename reaching two of them reds the
+  # case as a report that omitted a workload nobody planted.
+  variables:
+    human_namespace: "eval-drift-payments"
+    churn_namespace: "eval-drift-platform"
+    human_workload: "eval-drift-payments-api"
+    human_container: "api"
+    churn_workloads: ["eval-drift-ledger-worker", "eval-drift-checkout-web"]
+    gitops_field_manager: "argocd-controller"
+    drift_field_manager: "kubectl-edit"
+    declared_memory: "256Mi"
+    drifted_memory: "512Mi"
+    human_principal: "ada@example.com"
+    churn_record_count: 11
 validated: false
 
 # Slug per docs/designs/domains.yaml.

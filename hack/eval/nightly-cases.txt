@@ -737,3 +737,15 @@
 # the rows through the Session KV server's findings routes and resolves them on
 # destroy. No fixture; the host install only.
 ./tasks/findings-decision-covers-item/task.yaml
+
+# gitops-drift-noise-filtered-triage (#2424, #911). gitops-drift-out-of-band-
+# triage grades the drift pipeline's delivery with one record and no noise;
+# this one grades the discrimination, which is CUJ 3 of
+# docs/designs/drift-detection.md and the part nothing exercised before. Its fixture publishes twelve synthetic
+# audit records to the drift-audit topic -- one human write and eleven by
+# controllers -- so Classify itself is under test rather than bypassed, which
+# is what separates it from the sibling's direct inject. Unparked once #2425
+# gave the eval installs the ingress it needs. Nightly from its first merge;
+# a presubmit seat is a later pull request that cites its record, and cannot
+# be taken while any pool project lacks the ingress (#2616).
+./tasks/gitops-drift-noise-filtered-triage/task.yaml

@@ -243,19 +243,6 @@ FIXTURE_NOT_READY = {
         "project; fixture defined in #1893, waiting on fleet re-apply and pool "
         "verification sweep"
     ),
-    "gitops-drift-noise-filtered-triage": (
-        "#911: needs an audit ingress on the eval install -- a drift-audit "
-        "topic, a subscription and a detector enabled to pull from it, none of "
-        "which hack/ci-deploy.sh builds, so no record of any tier reaches the "
-        "classifier and the case files no card at all, which is broken rather "
-        "than red. The umbrella owns it because the gap is the eval install "
-        "not asking for what the composition already builds behind "
-        "enable_drift_pubsub, not a defect anyone has filed separately. The "
-        "case's own header carries the rest: why the sink is the one part of "
-        "the trio it can do without, why #2137 is not a second blocker, and "
-        "the ALERT_DAILY_LIMIT_DRIFT raise the unparking pull request owes "
-        "alongside the ingress"
-    ),
 }
 
 # Cases that claim no domain because no row in domains.yaml describes them.
