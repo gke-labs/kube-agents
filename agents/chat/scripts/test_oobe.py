@@ -30,16 +30,26 @@ SWEEP_ID = "t_sweep"
 FILED_AT = 1_000_000
 SWEEP_CREATED_AT = FILED_AT
 NOW_SETTLED = FILED_AT + 600
-NOW_PAST_FALLBACK = FILED_AT + oobe.fallback_seconds(0)
+# The hand-off's deadline for a sweep with no cluster cards, plus the ranking allowance.
+FALLBACK_SECONDS = oobe.bootstrap_handoff.DEADLINE_SECONDS + oobe.RANKING_ALLOWANCE_SECONDS
+NOW_PAST_FALLBACK = FILED_AT + FALLBACK_SECONDS
+RANKING_ID = "t_rank"
 REPOS = ["acme/gitops"]
 FIRST = [oobe.FIRST_RUN_AUDITS[0]]
 MINUTE = 60
 
 
 def _board(path: Path, cards: list[tuple[str, str, str, int]]) -> None:
-    """A board with the sweep card plus `cards` as (id, status, idempotency_key, created_at)."""
+    """A board with the sweep card plus `cards` as (id, status, idempotency_key, created_at).
+
+    The tables the hand-off's board read takes, in the board's own names (test_bootstrap_handoff._board).
+    """
     conn = sqlite3.connect(path)
-    conn.execute("CREATE TABLE tasks (id TEXT, status TEXT, idempotency_key TEXT, title TEXT, created_at INTEGER, body TEXT)")
+    conn.executescript(
+        "CREATE TABLE tasks (id TEXT, status TEXT, idempotency_key TEXT, title TEXT, created_at INTEGER, body TEXT);"
+        "CREATE TABLE task_runs (id INTEGER PRIMARY KEY, task_id TEXT, outcome TEXT, metadata TEXT);"
+        "CREATE TABLE task_events (id INTEGER PRIMARY KEY, task_id TEXT, kind TEXT, payload TEXT);"
+    )
     rows = [(SWEEP_ID, "done", "bootstrap-inventory-scan", SWEEP_CREATED_AT)] + cards
     conn.executemany("INSERT INTO tasks (id, status, idempotency_key, created_at) VALUES (?, ?, ?, ?)", rows)
     conn.commit()
@@ -86,8 +96,13 @@ class StageTest(unittest.TestCase):
         cron.mkdir(parents=True, exist_ok=True)
         (cron / "jobs.json").write_text(json.dumps({"jobs": jobs, "updated_at": "x"}), encoding="utf-8")
 
-    def _file_scan(self, filed_at: int = FILED_AT) -> None:
+    def _file_scan(self, filed_at: int = FILED_AT, ranking: str | None = RANKING_ID) -> None:
+        """The gate's sweep marker, and the hand-off's record of its ranking card unless ``ranking`` is None."""
         (self.d / oobe.SCAN_FILED_MARKER).write_text(f"task_id={SWEEP_ID}\nfiled_at={filed_at}\n", encoding="utf-8")
+        if ranking is not None:
+            (self.d / oobe.bootstrap_handoff.HANDOFF_MARKER).write_text(
+                f"sweep={SWEEP_ID}\ntask_id={ranking}\nfiled_at={filed_at}\n", encoding="utf-8"
+            )
 
     def _main(self, now: float = NOW_SETTLED) -> str:
         out = io.StringIO()
@@ -182,8 +197,7 @@ class StageTest(unittest.TestCase):
 
     def test_the_hand_offs_recorded_card_decides(self):
         # Only the card the hand-off filed counts, whatever else sits under the key.
-        (self.d / ".bootstrap_handoff_filed").write_text(f"sweep={SWEEP_ID}\ntask_id=t_real\nfiled_at={FILED_AT}\n")
-        self._file_scan()
+        self._file_scan(ranking="t_real")
         _board(self.board, [_ranking("done", tid="t_stray"), _ranking("running", tid="t_real")])
         self._main()
         self.assertEqual(self.started, [])
@@ -193,18 +207,36 @@ class StageTest(unittest.TestCase):
         self.assertEqual(self._started_ids(), FIRST)
 
     def test_a_record_for_another_sweep_is_ignored(self):
-        self._file_scan()
-        _board(self.board, [_ranking("running")])
+        self._file_scan(ranking=None)
+        _board(self.board, [_ranking("done")])
         (self.d / ".bootstrap_handoff_filed").write_text("sweep=t_older\ntask_id=none\nfiled_at=1\n")
         self._main()
         self.assertEqual(self.started, [])
 
     def test_a_scan_marker_typed_by_hand_is_read(self):
         # The re-arm runbook has an operator write this file; the hand-off accepts `key = value`.
+        self._file_scan()
         (self.d / oobe.SCAN_FILED_MARKER).write_text(f"task_id = {SWEEP_ID}\nfiled_at = {FILED_AT}\n")
         _board(self.board, [_ranking("done")])
         self._main()
         self.assertEqual(self._started_ids(), FIRST)
+
+    def test_a_scan_marker_the_hand_off_refuses_starts_nothing(self):
+        # No readable task_id: the hand-off hands nothing off, so the stage must not fire either,
+        # not even at the fallback.
+        _board(self.board, [_ranking("done")])
+        for text in ("task_id=\n", f"task_id = {SWEEP_ID} # re-armed\n", f"task={SWEEP_ID}\n"):
+            with self.subTest(marker=text):
+                (self.d / oobe.SCAN_FILED_MARKER).write_text(text + f"filed_at={FILED_AT}\n")
+                self._main(now=NOW_PAST_FALLBACK)
+                self.assertEqual(self.started, [])
+
+    def test_a_sweep_not_on_the_board_waits_past_the_fallback(self):
+        # The re-arm runbook's `task_id=pending` placeholder: the hand-off waits for it, and so does the stage.
+        (self.d / oobe.SCAN_FILED_MARKER).write_text(f"task_id=pending\nfiled_at={FILED_AT}\n")
+        _board(self.board, [])
+        self._main(now=NOW_PAST_FALLBACK)
+        self.assertEqual(self.started, [])
 
     def test_a_blocked_ranking_card_waits_for_the_fallback(self):
         # A card a person may still unblock.
@@ -215,35 +247,27 @@ class StageTest(unittest.TestCase):
         self._main(now=NOW_PAST_FALLBACK)
         self.assertEqual(self._started_ids(), FIRST)
 
-    def test_waits_while_a_retry_still_runs(self):
-        self._file_scan()
-        _board(self.board, [_ranking("done"), _ranking("running", key=oobe.bootstrap_handoff.PRIORITIZE_KEY + "-retry-1", tid="t_retry")])
-        self._main()
-        self.assertEqual(self.started, [])
-
-    def test_a_finished_retry_counts(self):
-        self._file_scan()
-        _board(self.board, [_ranking("done", key=oobe.bootstrap_handoff.PRIORITIZE_KEY + "-retry-1")])
-        self._main()
-        self.assertEqual(self._started_ids(), FIRST)
-
-    def test_an_archived_ranking_card_counts(self):
+    def test_an_archived_recorded_card_counts(self):
         # How the eval stack presents a settled scan (bench/tf/prebuilt/oobe-first-run-audits).
         self._file_scan()
-        _board(self.board, [_ranking("archived", key=oobe.bootstrap_handoff.PRIORITIZE_KEY + "-oobe-eval-20261006")])
+        _board(self.board, [_ranking("archived")])
         self._main()
         self.assertEqual(self._started_ids(), FIRST)
 
-    def test_an_earlier_runs_ranking_card_does_not_count(self):
-        # Left on the board by a run before onboarding was re-armed.
-        self._file_scan()
-        _board(self.board, [_ranking("done", created_at=SWEEP_CREATED_AT - 3600)])
-        self._main()
-        self.assertEqual(self.started, [])
+    def test_without_the_hand_offs_record_a_finished_card_under_the_key_does_not_fire(self):
+        # A ranking card the hand-off did not file, such as one a sweep worker filed against a raw
+        # file that did not exist yet: the hand-off archives it as stale, and the stage waits.
+        self._file_scan(ranking=None)
+        for status in ("done", "failed"):
+            with self.subTest(status=status):
+                self.board.unlink(missing_ok=True)
+                _board(self.board, [_ranking(status, tid="t_worker")])
+                self._main()
+                self.assertEqual(self.started, [])
 
     def test_no_ranking_card_fires_at_the_fallback(self):
-        # A sweep that audited no cluster files no ranking card.
-        self._file_scan()
+        # The hand-off never recorded a card: the stage stops waiting at the hand-off's deadline.
+        self._file_scan(ranking=None)
         _board(self.board, [])
         self._main()
         self.assertEqual(self.started, [])
@@ -253,24 +277,29 @@ class StageTest(unittest.TestCase):
     def test_a_large_fleet_waits_out_the_hand_offs_deadline(self):
         # The hand-off files the ranking card only after its per-cluster deadline.
         clusters = [(f"t_c{i}", "running", f"bootstrap-inventory-cluster-c{i}", SWEEP_CREATED_AT + 1) for i in range(10)]
-        self._file_scan()
+        self._file_scan(ranking=None)
         _board(self.board, clusters)
         self._main(now=NOW_PAST_FALLBACK)
         self.assertEqual(self.started, [])
-        self._main(now=FILED_AT + oobe.fallback_seconds(10))
+        self._main(now=NOW_PAST_FALLBACK + 10 * oobe.bootstrap_handoff.DEADLINE_PER_CARD_SECONDS)
         self.assertEqual(self._started_ids(), FIRST)
 
-    def test_the_fallback_follows_the_hand_offs_deadline(self):
-        handoff = oobe.bootstrap_handoff
-        self.assertEqual(
-            oobe.fallback_seconds(4),
-            handoff.DEADLINE_SECONDS + 4 * handoff.DEADLINE_PER_CARD_SECONDS + oobe.RANKING_ALLOWANCE_SECONDS,
-        )
+    def test_the_fallback_is_the_hand_offs_deadline_for_the_cards_it_counts(self):
+        # An archived cluster card is not one the hand-off waits for, so the stage does not either.
+        per_card = oobe.bootstrap_handoff.DEADLINE_PER_CARD_SECONDS
+        clusters = [(f"t_c{i}", "running", f"bootstrap-inventory-cluster-c{i}", SWEEP_CREATED_AT + 1) for i in range(3)]
+        clusters.append(("t_c3", "archived", "bootstrap-inventory-cluster-c3", SWEEP_CREATED_AT + 1))
+        self._file_scan(ranking=None)
+        _board(self.board, clusters)
+        self._main(now=NOW_PAST_FALLBACK + 3 * per_card - 1)
+        self.assertEqual(self.started, [])
+        self._main(now=NOW_PAST_FALLBACK + 3 * per_card)
+        self.assertEqual(self._started_ids(), FIRST)
 
     def test_an_unreadable_board_waits_past_the_fallback(self):
         # Not the shortest fallback, which on a large fleet starts the audits beside the scan; it
         # fires once the board reads, and a board that never does is ended by the not-new rule.
-        self._file_scan()
+        self._file_scan(ranking=None)
         self.board.write_text("not a database")
         self._main()
         self.assertEqual(self.started, [])
@@ -287,7 +316,7 @@ class StageTest(unittest.TestCase):
         mtime = (self.d / oobe.SCAN_FILED_MARKER).stat().st_mtime
         self._main(now=mtime + 60)
         self.assertEqual(self.started, [])
-        self._main(now=mtime + oobe.fallback_seconds(0))
+        self._main(now=mtime + FALLBACK_SECONDS)
         self.assertEqual(self._started_ids(), FIRST)
 
     def test_a_filed_at_that_is_not_epoch_seconds_falls_back_to_its_age(self):
@@ -301,7 +330,7 @@ class StageTest(unittest.TestCase):
                 mtime = (self.d / oobe.SCAN_FILED_MARKER).stat().st_mtime
                 self._main(now=mtime + 60)
                 self.assertEqual(self.started, [])
-                self._main(now=mtime + oobe.fallback_seconds(0))
+                self._main(now=mtime + FALLBACK_SECONDS)
                 self.assertEqual(self._started_ids(), FIRST)
 
     # --- how it starts them ---------------------------------------------------
@@ -504,7 +533,7 @@ class StageTest(unittest.TestCase):
         _board(self.board, [_ranking("done")])
         now = NOW_SETTLED
         last = oobe.FIRST_RUN_AUDITS[-1]
-        while True:
+        for _ in range(40):
             self._main(now=now)
             current = oobe.read_state(self.d).get(oobe.STATE_CURRENT)
             if current and current[oobe.CURRENT_JOB] == last:
@@ -512,6 +541,8 @@ class StageTest(unittest.TestCase):
             if current and current[oobe.CURRENT_MARKED_AT] == now:
                 self._ledger(current[oobe.CURRENT_JOB], "completed", now + MINUTE)
             now += 2 * MINUTE
+        else:
+            self.fail("the chain did not reach the last audit")
         self._ledger(last, "claimed", now + MINUTE)
         self._main(now=now + 2 * MINUTE)
         self.assertFalse(oobe.read_state(self.d)[oobe.STATE_DONE])

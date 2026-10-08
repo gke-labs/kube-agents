@@ -96,6 +96,35 @@ class MarkerTest(unittest.TestCase):
             self.assertEqual(h._read_marker(path), {"task_id": "t_abc", "filed_at": "123"})
 
 
+class ScanMarkerTest(unittest.TestCase):
+    """read_scan_marker, the one reader of the gate's marker for the hand-off and the oobe stage."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.marker = Path(self._tmp.name) / ".bootstrap_scan_filed"
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_an_id_and_an_epoch_stamp_are_read(self):
+        self.marker.write_text("task_id=t_s\nfiled_at=1000\n")
+        self.assertEqual(h.read_scan_marker(self.marker, now=2000), ("t_s", 1000.0))
+
+    def test_no_readable_id_is_none(self):
+        for text in ("filed_at=1000\n", "task_id=\nfiled_at=1000\n", "task_id = t_s # note\n"):
+            with self.subTest(text=text):
+                self.marker.write_text(text)
+                self.assertIsNone(h.read_scan_marker(self.marker, now=2000))
+
+    def test_a_stamp_that_is_not_epoch_seconds_falls_back_to_the_files_age(self):
+        mtime = 1500.0
+        for stamp in ("", "garbage", "nan", "inf", "-5", "1000000000000"):
+            with self.subTest(stamp=stamp):
+                self.marker.write_text(f"task_id=t_s\nfiled_at={stamp}\n")
+                os.utime(self.marker, (mtime, mtime))
+                self.assertEqual(h.read_scan_marker(self.marker, now=2000), ("t_s", mtime))
+
+
 class FindingLinesTest(unittest.TestCase):
     def test_every_reported_finding_becomes_a_line_the_ranking_parser_accepts(self):
         for meta in _metadata().values():

@@ -42,7 +42,6 @@ delivers locally and never speaks to the user.
 """
 
 import json
-import math
 import os
 import sqlite3
 import subprocess
@@ -58,7 +57,6 @@ AUDITS_MARKER = ".oobe_audits_fired"
 # Written by bootstrap_scan_gate.py when it files the sweep: `task_id=` and `filed_at=` lines.
 SCAN_FILED_MARKER = ".bootstrap_scan_filed"
 MARKER_TASK_ID = "task_id"
-MARKER_FILED_AT = "filed_at"
 # The hand-off's marker (bootstrap_handoff._record): `sweep=`, and `task_id=` its ranking card.
 HANDOFF_SWEEP = "sweep"
 
@@ -87,18 +85,9 @@ ROSTER_FILE = "jobs.json"
 # Hermes' pause marker on a job record (cron.jobs: is_job_runnable).
 PAUSED_STATE = "paused"
 
-# Without the hand-off's own record of its ranking card (an install the hand-off has not reached,
-# or the eval stack's stand-in), the card is found by key. Hermes retries it in place; a re-run by
-# hand adds a suffix (bootstrap_onboarding/README.md), so the prefix counts too.
-PRIORITIZE_RETRY_PATTERN = bootstrap_handoff.PRIORITIZE_KEY + "-%"
 # The statuses the hand-off itself counts as settled, less blocked and triage: a person may still
 # unblock a card, and the fallback covers one nobody does.
-FINISHED_STATUSES = (
-    bootstrap_handoff.DONE,
-    bootstrap_handoff.FAILED,
-    bootstrap_handoff.CANCELLED,
-    bootstrap_handoff.ARCHIVED,
-)
+FINISHED_STATUSES = bootstrap_handoff.SWEEP_FINISHED + (bootstrap_handoff.ARCHIVED,)
 
 # The fallback waits out the hand-off's own deadline for this sweep's cluster cards
 # (bootstrap_handoff.deadline), after which it files the ranking card, plus this long for the
@@ -107,7 +96,6 @@ FINISHED_STATUSES = (
 RANKING_ALLOWANCE_SECONDS = 30 * 60
 # Far past any fallback: a sweep this old was filed before the job existed.
 NEW_INSTALL_SECONDS = 24 * 60 * 60
-SECONDS_PER_MINUTE = 60
 TRIGGER_TIMEOUT_SECONDS = 30
 # Marks one job due and exits non-zero when the store does not have it. Run with
 # HERMES_HOME set to the Platform Agent's home, which is where cron.jobs finds its store.
@@ -141,7 +129,7 @@ HOLD_MISSING = "not on the Platform Agent's roster"
 HOLD_DISABLED = "disabled"
 HOLD_PAUSED = "paused"
 DEFAULT_HOME = "/opt/data"
-TMP_SUFFIX = ".tmp"
+TMP_SUFFIX = bootstrap_handoff.TMP_SUFFIX
 
 
 def _log(message: str) -> None:
@@ -171,21 +159,13 @@ def write_state(data_dir: Path, state: dict) -> None:
 def scan_filed(data_dir: Path) -> tuple[str, float] | None:
     """The sweep card's id and when it was filed, or None before the scan has started.
 
-    Read with the hand-off's own parser, which takes a marker typed by hand as `key = value`.
+    Read with the hand-off's own reader, so the two agree on a marker typed by hand, one with no
+    id (refused by both), and a ``filed_at`` that is not epoch seconds.
     """
     marker = data_dir / SCAN_FILED_MARKER
     if not marker.is_file():
         return None
-    fields = bootstrap_handoff._read_marker(marker)
-    try:
-        filed_at = float(fields.get(MARKER_FILED_AT, ""))
-    except ValueError:
-        filed_at = math.nan
-    if not 0 < filed_at <= time.time():
-        # Hand-written, truncated, or not epoch seconds (milliseconds, nan, inf), any of which
-        # would stop both clocks: the marker's own age is the next best one.
-        filed_at = marker.stat().st_mtime
-    return fields.get(MARKER_TASK_ID, ""), filed_at
+    return bootstrap_handoff.read_scan_marker(marker)
 
 
 def board_path(data_dir: Path) -> Path:
@@ -200,61 +180,35 @@ def handoff_ranking(data_dir: Path, sweep_id: str) -> str | None:
     return fields.get(MARKER_TASK_ID) or None
 
 
-# read_scan's answer when the board cannot be read, as distinct from a board without the sweep.
-BOARD_UNREADABLE = "unreadable"
-
-
-def read_scan(board: Path, sweep_id: str, ranking: str | None = None) -> tuple[bool, int] | str | None:
-    """Whether this sweep's ranking cards have all finished, and how many cluster cards it has.
-
-    ``ranking`` is the card the hand-off recorded for this sweep. Without it, every card under the
-    ranking key created after the sweep card counts, so an earlier run's cards, left on the board
-    after onboarding was re-armed, cannot fire this one. None when the sweep is not on the board,
-    ``BOARD_UNREADABLE`` when the board cannot be read.
-    """
-    if not sweep_id:
-        return None
+def ranking_finished(board: Path, task_id: str) -> bool | None:
+    """Whether the hand-off's ranking card has finished; None when the board cannot say."""
     try:
         conn = sqlite3.connect(
             f"file:{board}?mode=ro", uri=True, timeout=bootstrap_handoff.SQLITE_BUSY_TIMEOUT_SECONDS
         )
     except sqlite3.Error as e:
         _log(f"cannot open the board: {e}")
-        return BOARD_UNREADABLE
+        return None
     try:
-        row = conn.execute("SELECT created_at FROM tasks WHERE id = ?", (sweep_id,)).fetchone()
-        if row is None:
-            return None
-        if ranking is not None:
-            statuses = [status for (status,) in conn.execute("SELECT status FROM tasks WHERE id = ?", (ranking,))]
-        else:
-            statuses = [
-                status
-                for (status,) in conn.execute(
-                    "SELECT status FROM tasks WHERE (idempotency_key = ? OR idempotency_key LIKE ?) "
-                    "AND created_at >= ?",
-                    (bootstrap_handoff.PRIORITIZE_KEY, PRIORITIZE_RETRY_PATTERN, row[0]),
-                ).fetchall()
-            ]
-        (clusters,) = conn.execute(
-            "SELECT count(*) FROM tasks WHERE idempotency_key LIKE ? AND created_at >= ?",
-            (bootstrap_handoff.CLUSTER_KEY_PREFIX + "%", row[0]),
-        ).fetchone()
+        row = conn.execute("SELECT status FROM tasks WHERE id = ?", (task_id,)).fetchone()
     except sqlite3.Error as e:
         _log(f"cannot read the board: {e}")
-        return BOARD_UNREADABLE
+        return None
     finally:
         conn.close()
-    return bool(statuses) and all(status in FINISHED_STATUSES for status in statuses), clusters
-
-
-def fallback_seconds(clusters: int) -> int:
-    """How long after the sweep was filed the stage stops waiting for the ranking card."""
-    hand_off = bootstrap_handoff.DEADLINE_SECONDS + bootstrap_handoff.DEADLINE_PER_CARD_SECONDS * clusters
-    return hand_off + RANKING_ALLOWANCE_SECONDS
+    return row is not None and row[0] in FINISHED_STATUSES
 
 
 def scan_settled(data_dir: Path, now: float) -> bool:
+    """Whether the onboarding scan has settled, read from the hand-off's own record and board read.
+
+    The ranking card is the one the hand-off recorded for this sweep, and nothing else: a card
+    under the ranking key that the hand-off did not file is one it archives as stale. The fallback
+    is the hand-off's own deadline for this sweep (``bootstrap_handoff.deadline``, archived cluster
+    cards set aside) plus ``RANKING_ALLOWANCE_SECONDS``. A board that cannot be read, or that does
+    not have the sweep, is waited on, as the hand-off waits; the not-new rule ends one that never
+    reads.
+    """
     filed = scan_filed(data_dir)
     if filed is None:
         return False
@@ -263,16 +217,22 @@ def scan_settled(data_dir: Path, now: float) -> bool:
     if ranking == bootstrap_handoff.NO_RANKING:
         # No cluster was audited: the hand-off wrote the report itself and filed no ranking card.
         return True
-    scan = read_scan(board_path(data_dir), sweep_id, ranking)
-    if scan == BOARD_UNREADABLE:
-        # Not the shortest fallback: on a large fleet that would start the audits beside the scan.
-        # A board that never reads is ended by the not-new rule.
+    board = board_path(data_dir)
+    state = bootstrap_handoff.read_board(board, sweep_id)
+    if state is None:
         return False
-    if scan is not None and scan[0]:
-        return True
-    wait = fallback_seconds(scan[1] if scan is not None else 0)
+    if ranking is not None:
+        finished = ranking_finished(board, ranking)
+        if finished is None:
+            return False
+        if finished:
+            return True
+    wait = bootstrap_handoff.deadline(state) + RANKING_ALLOWANCE_SECONDS
     if now - filed_at >= wait:
-        _log(f"the scan has not settled {wait // SECONDS_PER_MINUTE} minutes after its sweep was filed; starting the audits anyway")
+        _log(
+            f"the scan has not settled {wait // bootstrap_handoff.SECONDS_PER_MINUTE} minutes after its sweep "
+            "was filed; starting the audits anyway"
+        )
         return True
     return False
 
