@@ -120,17 +120,20 @@ updates:
         patterns:
           - "*"
 
-  # These two directories hold the only literal FROM pins in the tree, and
-  # images.json covers neither. The gke-app-onboarding one is `node:18-slim`,
-  # past end of life, and deploy/docker/Dockerfile copies
-  # agents/platform/skills/ wholesale into the published platform image, so it
-  # ships. The other is `alpine:3.19` in an e2e fixture.
+  # These two directories hold the literal FROM pins that images.json does not
+  # cover. The gke-app-onboarding one is a `node` tag, and
+  # deploy/docker/Dockerfile copies agents/platform/skills/ wholesale into the
+  # published platform image, so it ships. The other is an `alpine` tag in an
+  # e2e fixture.
   #
-  # Every other Dockerfile is out of reach rather than excluded: the images
-  # this repository builds interpolate two ARGs each
+  # Every other Dockerfile is either out of reach or excluded on purpose. The
+  # images this repository builds interpolate two ARGs each
   # (`FROM ${GOLANG_IMAGE}:${GOLANG_VERSION}`), which the Docker updater cannot
-  # resolve, and the agentplugins ones are `FROM scratch`. images.json and
-  # `make mirror-images` own the ARG-interpolated pins. Naming the two
+  # resolve; images.json and `make mirror-images` own those pins. The
+  # agentplugins Dockerfiles are `FROM busybox:musl@sha256:…`, a literal digest
+  # the updater could move, and are left out because images.json owns that pin
+  # (its `busybox` entry) and `make images-check` holds the three copies in
+  # step; a bump lands in all of them at once, by hand. Naming the two
   # directories, rather than globbing, is what keeps this from recreating #763.
   - package-ecosystem: "docker"
     directories:

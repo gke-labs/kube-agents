@@ -94,7 +94,7 @@ whose own rule is that the project is registered last.
 
 ## The roles
 
-Twenty fixtures: nineteen across the four cluster slots and one project-scoped. Most in-cluster
+Twenty-one fixtures: nineteen across the four cluster slots and two project-scoped. Most in-cluster
 fixtures are on slot `a`, across the nine seeded namespaces `seeded-debug`,
 `seeded-reliability`, `seeded-security`, `seeded-capacity`, `seeded-deprecation`, `seeded-intent`, `seeded-token`, `seeded-headroom` and `seeded-stall`, plus both
 defect node pools. Slot `c` carries a GKE-level defect only and no workloads at all: it is the
@@ -122,6 +122,7 @@ its roles are never published.
 | `deprecated-api-caller`         | a       | 0   | `cronjob/legacy-endpoints-writer` in `seeded-deprecation`, patching Endpoints v1 every ten minutes; each write audit-stamped `k8s.io/deprecated=true`, no removal, no insight                                                     |
 | `idle-nodepool`                 | a       | 7   | `idle-batch-pool`, zero non-system pods, held by a NoSchedule taint                                                                                                                                                               |
 | `orphan-disks`                  | project | 30  | `orphan-pd-1` and `orphan-pd-2`, unattached, 10GB, in `var.zone`                                                                                                                                                                  |
+| `startup-fail-vm`               | project | 0   | `startup-fail-<prefix>`, a standalone e2-micro in `var.zone` whose startup script exits 1 on every boot                                                                                                                           |
 | `version-laggard`               | b       | 0   | Control plane one minor behind the REGULAR channel default                                                                                                                                                                        |
 | `drift-outlier`                 | c       | 1   | Master authorized networks absent, where a, b and d carry an open block                                                                                                                                                           |
 | `readiness-surge-blocked`       | b       | 0   | `no-surge-pool`, `maxSurge 0` / `maxUnavailable 1`, tainted `seeded-role=no-surge`                                                                                                                                                |

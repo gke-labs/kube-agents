@@ -3739,8 +3739,8 @@ func eventWatcherEnabled(agent *agentv1alpha1.PlatformAgent) bool {
 // and not only a non-empty check. The detector refuses an all-digits --project
 // outright (looksLikeProjectNumber in cmd/drift-detector/main.go), because the
 // join matches it against each audit record's project_id, which is always the ID;
-// start-services.sh always passes --in-cluster and --profiles-dir, so the join is
-// always on and that refusal is always reachable. Nothing else reading the triple
+// start-services.sh always passes --in-cluster, which is what keys that refusal,
+// so it is always reachable. Nothing else reading the triple
 // minds a number -- the gcloud bootstrap in buildCredentialProxyEnv takes one, and
 // so do GKE_PROJECT_ID and KUBE_CONTEXT_NAME -- so an install can carry a numeric
 // projectId, be healthy in every other respect, and get the restart loop the

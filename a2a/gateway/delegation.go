@@ -328,8 +328,14 @@ func (g *Gateway) sessionTurn(ref TaskRef) bool {
 // or eval install, its principal map already names who may use it, and the
 // live runs and evals exercise delegation through it. Its absent list stays
 // everyone its map admits, as a chat backend's does.
+//
+// The door's Google sign-in class (a2aGoogleBackend, a2adoor_google.go) is
+// held to the same rule: its callers are verified people, but they reach the
+// door through a program, and bnaylor decided (2026-10-07) that a door
+// caller delegates only under a list of its own, whichever class verified
+// them.
 func (g *Gateway) doorUnlisted(target, backend string) bool {
-	return backend == a2aBackend && g.targetAllowed[target][backend] == nil
+	return (backend == a2aBackend || backend == a2aGoogleBackend) && g.targetAllowed[target][backend] == nil
 }
 
 // authorRefusal is the rule a steer author or incarnation-set member refuses

@@ -7235,6 +7235,27 @@ class SlackRelayTest(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     relay.api_call("T123", method, {})
 
+    def test_removing_the_bots_own_reaction_is_the_one_remove_that_passes(self):
+        """`reactions.remove` takes off only the token's own reaction.
+
+        The exemption is the exact method name. Every other `*.remove` and
+        `*.delete` is still refused, and so is a case variant of the exempt
+        name: the verb rule case-folds, the exemption does not.
+        """
+        relay = self.relay()
+        self.assertTrue(relay.api_call("T123", "reactions.remove", {})["ok"])
+        for method in (
+            "chat.delete",
+            "bookmarks.remove",
+            "pins.remove",
+            "Reactions.Remove",
+            "reactions.REMOVE",
+            " reactions.remove",
+        ):
+            with self.subTest(method=method):
+                with self.assertRaises(ValueError):
+                    relay.api_call("T123", method, {})
+
     def test_a_non_destructive_web_api_method_still_passes(self):
         relay = self.relay()
         for method in ("chat.postMessage", "conversations.list", "users.info"):
