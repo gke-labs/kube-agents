@@ -762,8 +762,6 @@ class WorkflowWiring(unittest.TestCase):
     def test_the_watched_jobs_are_the_periodics_and_the_postsubmit(self):
         # The names are the Prow job names in oss-test-infra, which nothing here
         # can check; a rename there is a rename here.
-        # The hourly and the weekly stay watched until the oss-test-infra
-        # change retires them: the watch must not go dark between the merges.
         self.assertEqual(
             [p.job for p in periodics.WATCHED],
             ["ci-kube-agents-pull-sweep", "ci-kube-agents-fleet-reconcile-daily", "post-kube-agents-fleet-reconcile"],

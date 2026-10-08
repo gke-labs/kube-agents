@@ -47,8 +47,8 @@ the deletes and replaces `reconcile-allow.json` beside this file declares (one e
 address, or per resource to cover every instance of a `count` or `for_each` one, with its
 reason, reviewed in the pull request that needs it and removed by its follow-up; the no-surge
 pool's replace on a minor roll is the standing one). Its two Prow
-entries in `oss-test-infra` run `main` only: a postsubmit on every merge that changes the stack's files here
-(`docs/ci-pool-projects.md` 6.2 says which), and a daily pass at 08:30 UTC (`docs/ci-pool-projects.md` §6.2, which also states
+entries in `oss-test-infra` run `main` only: a postsubmit on every merge that changes the stack's files
+here, and a daily pass at 08:30 UTC (`docs/ci-pool-projects.md` §6.2, which says which files, and states
 the rule for a fixture pull request and for proving a branch on one leased project). A hand
 run goes through the script too (`--project <id>`), never `tofu apply` from a branch, and
 never from a laptop while a run holds the project. The two recovery replaces below (`seeded_b`'s

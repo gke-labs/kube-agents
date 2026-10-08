@@ -475,7 +475,7 @@ class LeaseTest(unittest.TestCase):
         self.assertIn("release failed", outcomes[P8][1])
 
     def test_a_named_projects_release_failure_before_a_termination_is_on_the_record(self):
-        # The hourly's path (reconcile_named): a release refused, then a
+        # The --project and --drifted path (reconcile_named): a release refused, then a
         # termination raised by the unblock, must still record the failure.
         class _Boskos_signalling_release(_Boskos):
             def __call__(self, request, timeout=None):
@@ -1486,6 +1486,12 @@ class FleetTreeTest(unittest.TestCase):
     def test_a_non_ascii_input_name_is_still_an_input(self):
         # `ls-tree -z` prints the path unquoted, so the suffix test sees it.
         listing = _fleet_listing(**FLEET_INPUTS, **{"caf\u00e9.tf": "cccc"}, **FLEET_DOCS)
+        self.assertNotEqual(self._tree(listing), TREE_A)
+
+    def test_a_path_that_is_not_utf8_still_hashes(self):
+        # ls-tree -z prints raw bytes; git_output decodes with surrogateescape,
+        # and the hash encodes them back, so such a name is an input, not a crash.
+        listing = _fleet_listing(**FLEET_INPUTS, **{"caf\udce9.tf": "cccc"}, **FLEET_DOCS)
         self.assertNotEqual(self._tree(listing), TREE_A)
 
     def test_the_inputs_are_the_stack_its_lock_and_the_allowlist(self):

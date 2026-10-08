@@ -152,8 +152,8 @@ FLEET_SUBDIR = "bench/tf/fleet"
 # the allowlist the inspection reads. README.md and fixtures.json live beside
 # them and tofu never reads them, so they do not move the fleet tree: a
 # docs-only merge neither stops a running reconcile nor needs one. A new input
-# kind (a tfvars file, a templatefile source) goes here and into the
-# postsubmit's run_if_changed in oss-test-infra together.
+# kind (a tfvars file, a templatefile source) goes here, into the postsubmit's
+# run_if_changed in oss-test-infra, and into docs/ci-pool-projects.md 6.2.
 FLEET_INPUT_SUFFIXES = (".tf", ".hcl")
 FLEET_INPUT_NAMES = ("reconcile-allow.json",)
 GIT_TIMEOUT_SECONDS = 120
@@ -722,7 +722,9 @@ def pool_size(ci_deploy_script=fixture_state.CI_DEPLOY_SCRIPT):
 def git_output(args):
     """stdout of `git <args>` in the repository, stripped; ReconcileError on a failure."""
     try:
-        result = subprocess.run(["git", "-C", str(REPO_ROOT)] + list(args), capture_output=True, text=True, timeout=GIT_TIMEOUT_SECONDS)
+        # surrogateescape: a path git prints that is not UTF-8 (ls-tree -z
+        # emits raw bytes) is carried through, not a decode error.
+        result = subprocess.run(["git", "-C", str(REPO_ROOT)] + list(args), capture_output=True, text=True, errors="surrogateescape", timeout=GIT_TIMEOUT_SECONDS)
     except (OSError, subprocess.SubprocessError) as exc:
         raise ReconcileError("git %s: %s" % (" ".join(args), exc))
     if result.returncode != 0:
@@ -752,7 +754,7 @@ def fleet_tree(rev):
     lines = sorted(entry for entry in listing.split("\0") if "\t" in entry and is_fleet_input(entry.split("\t", 1)[1]))
     if not lines:
         raise ReconcileError("no stack inputs (%s, %s) under %s at %s; not a kube-agents checkout, or the wrong ref" % ("/".join(FLEET_INPUT_SUFFIXES), "/".join(FLEET_INPUT_NAMES), FLEET_SUBDIR, rev))
-    return hashlib.sha256("\n".join(lines).encode()).hexdigest()
+    return hashlib.sha256("\n".join(lines).encode("utf-8", "surrogateescape")).hexdigest()
 
 
 class Run:
@@ -833,7 +835,8 @@ class Run:
 
     def require_main_readable(self):
         """The first read of `main_ref`, before anything is leased: a ref git
-        cannot fetch is a configuration error, not "main has not moved"; a
+        cannot fetch, or one with no stack under it, is a configuration error,
+        not "main has not moved"; a
         failure later in the run is a warning the report carries."""
         if not self.main_ref:
             return
@@ -1246,7 +1249,7 @@ def main(argv=None):
     parser.add_argument("--budget-seconds", type=int, help="how long the whole run may take; no project starts with less than the ceiling left (default: unbounded)")
     parser.add_argument("--project-ceiling-seconds", type=int, default=PROJECT_TIMEOUT_SECONDS, help="the most one project may take, init through apply (default: %(default)s)")
     parser.add_argument("--workers", type=int, default=DEFAULT_WORKERS, help="projects reconciled at once, each under its own lease (default: %(default)s)")
-    parser.add_argument("--stop-when-moved", metavar="REMOTE/BRANCH", help="stop, with the rest not reached, once this ref's fleet tree (a hash of the stack's files under bench/tf/fleet: *.tf, *.hcl, reconcile-allow.json) differs from the checkout's (the jobs pass origin/main)")
+    parser.add_argument("--stop-when-moved", metavar="REMOTE/BRANCH", help="stop, with the rest not reached, once this ref's fleet tree (a hash of the stack's files under %s: %s, %s) differs from the checkout's (the jobs pass origin/main)" % (FLEET_SUBDIR, ", ".join("*" + s for s in FLEET_INPUT_SUFFIXES), ", ".join(FLEET_INPUT_NAMES)))
     parser.add_argument("--no-publish", action="store_true", help="do not write applied.json to the project's state bucket")
     parser.add_argument(
         "--report",

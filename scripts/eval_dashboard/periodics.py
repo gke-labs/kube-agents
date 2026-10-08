@@ -259,7 +259,7 @@ WATCHED = (
     Periodic(
         RECONCILE_POSTSUBMIT_JOB, "seeded-fleet reconcile (on merge)", None, RECONCILE_ARTIFACT,
         "Eval seeded fleet", "planted defects are not being re-applied", "planted defects are being re-applied again",
-        "runs on every merge to main that changes bench/tf/fleet and applies it to every pool project", RECONCILE_EFFECT,
+        "runs on every merge to main that changes the stack under bench/tf/fleet and applies it to every pool project", RECONCILE_EFFECT,
         f"{RUNBOOK_ROOT}docs/ci-pool-projects.md#62-the-scheduled-reconcile",
     ),
 )
