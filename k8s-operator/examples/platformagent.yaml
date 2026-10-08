@@ -49,13 +49,14 @@ spec:
     #   enabled: false # RED BUTTON: no cluster event reaches the agent at all
     # Tuning bounds what the harness may consume. Left unset on purpose: the per-run
     # fields under it are a deployment trade, not a default the operator can pick for
-    # you. `maxInProgress` is the exception — unset renders the operator's cap of 2,
-    # because uncapped dispatch loses cards silently rather than merely running them
-    # unbounded. See the field docs on TuningSpec in
+    # you. `maxInProgress` is the exception — unset renders the operator's cap of 4,
+    # one slot of it held for user cards, because uncapped dispatch loses cards
+    # silently rather than merely running them unbounded. Above 4, raise the
+    # credential proxy's memory with it: its default 1Gi admits 4 commands at once. See the field docs on TuningSpec in
     # api/v1alpha1/common_types.go (`kubectl explain platformagent.spec.harness.tuning`).
     # +optional
     # tuning:
-    #   maxInProgress: 4 # raises the operator's default of 2
+    #   maxInProgress: 6 # raises the operator's default of 4
   # Deployment abstracts the Kubernetes Pod/Deployment configuration,
   # decoupling the compute payload from the agent's application logic.
   # +optional

@@ -211,7 +211,13 @@ kanban:
   # operator writes into profile-default.overlay.yaml and the entrypoint merges
   # over this key at startup — so keep this value in step with
   # defaultKanbanMaxInProgress in platformagent_manifests.go.
-  max_in_progress: 2
+  #
+  # One of these slots is held for user cards: background work (event triage,
+  # cron report relays) may hold every slot but one, so at 4 triage gets three
+  # and a chat question always has one (deploy/docker/patches/kanban_priority.py).
+  # Going higher, the credential proxy binds first: at its default 1Gi limit it
+  # admits 4 brokered commands at once, so raise its memory with this.
+  max_in_progress: 4
 
 # Denylist applied last for every platform key — the authoritative guarantee that
 # the front door cannot touch the system. Everything except the delegation

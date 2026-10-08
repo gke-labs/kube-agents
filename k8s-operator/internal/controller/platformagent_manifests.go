@@ -1028,7 +1028,11 @@ const clusterProfileClassKey = "profileclass-cluster" + profileOverlaySuffix
 // can be compared against it, and so the two files can be kept in step. The one place it
 // IS rendered is frontDoorKanban, where there is no image copy to defer to: the platform
 // profile's config declares no `kanban` key at all.
-const defaultKanbanMaxInProgress = 2
+//
+// One slot of the cap is held for user cards (deploy/docker/patches/kanban_priority.py),
+// so at 4 background triage gets three. Above 4 the credential proxy binds first: its
+// default 1Gi limit admits 4 brokered commands at once (credentialProxyAdmittedRequests).
+const defaultKanbanMaxInProgress = 4
 
 // defaultProfileLimits, platformProfileLimits and clusterProfileLimits read
 // spec.harness.tuning, tolerating every level being nil.
