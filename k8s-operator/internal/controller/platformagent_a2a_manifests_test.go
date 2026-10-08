@@ -3275,6 +3275,14 @@ func TestPluginCannotOverrideBusEnv(t *testing.T) {
 		if !found {
 			t.Error("today dropped a plugin's NATS_URL; the reservation must be gated on the A2A surface")
 		}
+		// The one exception: A2A_NOTIFY_PLATFORM is dropped on today as well,
+		// because there it would reroute every Google Chat post from hermes
+		// send to a chat.notify route the install does not have.
+		for _, e := range c.Env {
+			if e.Name == a2aNotifyPlatformEnvVar {
+				t.Errorf("a plugin's %s survived on a today install: %q", a2aNotifyPlatformEnvVar, e.Value)
+			}
+		}
 	}
 }
 

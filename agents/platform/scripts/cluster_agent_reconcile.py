@@ -67,6 +67,10 @@ from pathlib import Path
 import sandbox_exec
 import chat_notify
 from chat_platforms import enabled_chat_platforms
+
+# The reconcile notice's kill timeout for `hermes send`; a routed send gets
+# at least `a2a notify`'s own bound (chat_notify.subprocess_timeout).
+NOTIFY_SEND_TIMEOUT_SECONDS = 30
 from cluster_agent_profile import (
     HERMES_BIN,
     RESERVED_PROFILES,  # noqa: F401 - re-exported for callers/tests; used indirectly via list_profiles
@@ -2051,9 +2055,15 @@ def _notify(message: str) -> None:
         try:
             subprocess.run(
                 chat_notify.command(platform, message, json_output=False, hermes_bin=HERMES_BIN),
-                capture_output=True, text=True, check=True, timeout=30, env=_run_env(),
+                capture_output=True, text=True, check=True, env=_run_env(),
+                timeout=chat_notify.subprocess_timeout(platform, NOTIFY_SEND_TIMEOUT_SECONDS),
                 stdin=subprocess.DEVNULL,
             )
+        except subprocess.CalledProcessError as e:
+            if chat_notify.outcome_unknown(e.returncode):
+                log(f"Reconcile notification to {platform} got no answer in time; it may have posted")
+                continue
+            log(f"Failed to post reconcile notification to {platform}: {e}")
         except Exception as e:  # noqa: BLE001 - notification is best-effort; never fail the run
             log(f"Failed to post reconcile notification to {platform}: {e}")
 

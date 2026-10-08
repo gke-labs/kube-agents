@@ -353,37 +353,104 @@ func TestStopAnswersEveryAcceptedRequest(t *testing.T) {
 
 	stopped := make(chan struct{})
 	go func() { sub.Stop(); close(stopped) }()
-	time.Sleep(100 * time.Millisecond)
+
+	// The two queued requests are refused while the post in flight is still
+	// blocked: their answer does not wait on it.
+	for i := 0; i < 2; i++ {
+		msg, err := in.NextMsg(2 * time.Second)
+		if err != nil {
+			t.Fatalf("queued request %d not answered while the in-flight post was blocked: %v", i+1, err)
+		}
+		var got lib.NotifyReply
+		_ = json.Unmarshal(msg.Data, &got)
+		if got.Error != notifyStoppingRefusal {
+			t.Errorf("queued answer %d = %+v, want the stopping refusal", i+1, got)
+		}
+	}
 	close(poster.release)
+	msg, err := in.NextMsg(2 * time.Second)
+	if err != nil {
+		t.Fatalf("the in-flight post was not answered: %v", err)
+	}
+	var got lib.NotifyReply
+	_ = json.Unmarshal(msg.Data, &got)
+	if got.MessageID == "" {
+		t.Errorf("in-flight answer = %+v, want the post", got)
+	}
 	select {
 	case <-stopped:
 	case <-time.After(notifyStopGrace):
 		t.Fatal("Stop did not return")
 	}
 
-	var posted, refused int
-	for i := 0; i < 3; i++ {
-		msg, err := in.NextMsg(2 * time.Second)
-		if err != nil {
-			t.Fatalf("answer %d missing: %v", i+1, err)
-		}
-		var got lib.NotifyReply
-		_ = json.Unmarshal(msg.Data, &got)
-		switch {
-		case got.MessageID != "":
-			posted++
-		case got.Error == notifyStoppingRefusal:
-			refused++
-		}
-	}
-	if posted != 1 || refused != 2 {
-		t.Errorf("posted %d, refused %d; want the in-flight post and two stopping refusals", posted, refused)
-	}
-
 	// After Stop: refused under the lock, no panic on the closed queue.
-	_, refusal := n.validate(body)
-	if refusal != nil {
-		t.Fatal(refusal.Error)
-	}
 	n.handle(&nats.Msg{Subject: lib.NotifySubjectGchat, Reply: lib.NotifyReplyPrefix + "late", Data: body})
+}
+
+// Run binds and serves, and returns when its context ends.
+func TestRunServesUntilItsContextEnds(t *testing.T) {
+	s := startServer(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	client, err := lib.Connect(ctx, s.ClientURL(), lib.WithName("notify-gateway"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	n, err := NewGchatNotifier(&fakeNotifyPoster{landsIn: testHome + "/threads/T1"}, testHome, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runCtx, stopRun := context.WithCancel(ctx)
+	done := make(chan struct{})
+	go func() { n.Run(runCtx, client); close(done) }()
+
+	agent, err := nats.Connect(s.ClientURL())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer agent.Close()
+	body, _ := json.Marshal(lib.NotifyRequest{Text: "x"})
+	var answered bool
+	for i := 0; i < 20 && !answered; i++ {
+		in, _ := agent.SubscribeSync(lib.NotifyReplyPrefix + "run")
+		_ = agent.PublishRequest(lib.NotifySubjectGchat, lib.NotifyReplyPrefix+"run", body)
+		if _, err := in.NextMsg(250 * time.Millisecond); err == nil {
+			answered = true
+		}
+		_ = in.Unsubscribe()
+	}
+	if !answered {
+		t.Fatal("Run never armed the route")
+	}
+	stopRun()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run did not return after its context ended")
+	}
+}
+
+// A bind that cannot succeed (the client is closed) is retried, not given
+// up on, until the context ends.
+func TestRunRetriesAFailedBind(t *testing.T) {
+	s := startServer(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	client, err := lib.Connect(ctx, s.ClientURL(), lib.WithName("notify-gateway"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.Close()
+	n, err := NewGchatNotifier(&fakeNotifyPoster{}, testHome, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runCtx, stopRun := context.WithTimeout(ctx, 2500*time.Millisecond)
+	defer stopRun()
+	started := time.Now()
+	n.Run(runCtx, client)
+	if elapsed := time.Since(started); elapsed < 2*time.Second {
+		t.Errorf("Run returned after %s; a failed bind must be retried until the context ends", elapsed)
+	}
 }
