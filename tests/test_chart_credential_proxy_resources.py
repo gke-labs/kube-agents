@@ -305,10 +305,10 @@ class CredentialProxyResourcesRefusedAtRenderTest(unittest.TestCase):
 
     def test_more_than_fifteen_significant_digits_fail_naming_the_key(self):
         # float64 holds 15 significant digits exactly; with a 16th, each of these reads
-        # as its bound (1Gi, the floor, 2^53) and would render while the operator,
+        # as its bound (the 2Gi default limit, the floor, 2^53) and would render while the operator,
         # comparing exactly, refuses it.
         cases = (
-            ([f"{_VALUE_PATH}.requests.memory=1073741824.00000001"], "requests.memory", "1073741824.00000001"),
+            ([f"{_VALUE_PATH}.requests.memory=2147483648.00000001"], "requests.memory", "2147483648.00000001"),
             ([f"{_VALUE_PATH}.limits.memory=704643071.99999999"], "limits.memory", "704643071.99999999"),
             ([f"{_VALUE_PATH}.requests.memory=9007199254740993", f"{_VALUE_PATH}.limits.memory=9007199254740992"],
              "limits.memory", "9007199254740992"),

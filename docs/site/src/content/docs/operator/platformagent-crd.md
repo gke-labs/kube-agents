@@ -375,9 +375,11 @@ door's fan-out cannot silence alerts. The slots between go to whoever is first, 
 sort first. At the default of 6 that is one slot for each class and four shared. The price is that
 a burst of alerts drains more slowly than it would with every slot open to it, and a burst of user
 work likewise. At a cap of 2 each class gets exactly one. At a cap of 1 nothing is held: a user
-card still goes ahead of waiting triage, but it waits for the running card to finish. A user card
-that waits, because every slot is busy or the only free one is triage's, gets one line in its
-thread: `⏳ Queued: the system is busy. Your request will start when a worker frees up.`
+card still goes ahead of waiting triage, but it waits for the running card to finish. A top-level
+user card that waits, because every slot is busy or the only free one is triage's, gets one line in
+its thread: `⏳ Queued: the system is busy. Your request will start when a worker frees up.` A card
+filed as part of a request already running (a worker's child, or a card with a parent link) waits
+without one.
 
 A full board is logged as what it is. When every slot is busy for six ticks in a row the gateway
 logs, at most every five minutes:
@@ -386,8 +388,10 @@ logs, at most every five minutes:
 kanban dispatcher saturated: 6/6 worker slots busy (5 background, 1 user: t_ab12 @cluster-prod 14m [k8s-evt-], t_cd34 @cluster-prod 9m [k8s-evt-]); 1 user card(s) and 2 background card(s) waiting
 ```
 
-The card list is shortened here; the real line names up to five running cards, oldest first. The
-line gets `; N background card(s) held back because one slot is reserved for user cards` or
+The card list is shortened here. The real line names up to five cards that hold slots, oldest first
+within each board, boards in turn; a coordinator only waiting on its own children is left out,
+because it is not counted as running.
+The line gets `; N background card(s) held back because one slot is reserved for user cards` or
 `; N user card(s) held back because one slot is reserved for background triage` added when a held
 slot is what stopped them. When the only free slot is the one held for the other class, the line
 starts `kanban dispatcher holding background cards:` or `kanban dispatcher holding user cards:`
