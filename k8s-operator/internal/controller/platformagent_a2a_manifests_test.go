@@ -5854,9 +5854,9 @@ func TestSubjectPatternsOverlap(t *testing.T) {
 }
 
 // The console chat door, in the one spelling every check here shares. Two
-// exact subjects, not a namespace: these are the only chat.* grants the
-// render produces, so admitting the "chat" namespace wholesale in rule 2
-// would be wider than the thing being held.
+// exact subjects, not a namespace: the render's other chat.* grants are the
+// notify route's, held by their own check below, so admitting the "chat"
+// namespace wholesale in rule 2 would be wider than the thing being held.
 const (
 	consoleInbound  = "chat.console.*.in"
 	consoleOutbound = "chat.console.*.out"

@@ -58,6 +58,9 @@ const (
 	// route exists.
 	notifyStartRetryMin = time.Second
 	notifyStartRetryMax = 30 * time.Second
+	// notifyLostLineMax bounds how much of a lost request's text the error
+	// log carries: enough to find the post it was, not the whole report.
+	notifyLostLineMax = 120
 )
 
 // notifyMentionTokens and notifyMentionElements are what blocksMention
@@ -154,6 +157,30 @@ func (n *Notifier) Start(client *lib.Client) (lib.Subscription, error) {
 type notifyJob struct {
 	req    lib.NotifyRequest
 	answer func(lib.NotifyReply)
+	// deadline is when the requester stops waiting for the answer; zero
+	// when the request did not say.
+	deadline time.Time
+}
+
+// reply answers the job. When the answer says nothing was posted and the
+// requester has already stopped waiting, nobody hears it and the requester
+// has recorded the text as possibly posted ("outcome unknown"), so the loss
+// is logged as an error naming the text, the one place it shows.
+func (n *Notifier) reply(job notifyJob, r lib.NotifyReply) {
+	if r.MessageID == "" && r.Error != "" && !job.deadline.IsZero() && time.Now().After(job.deadline) {
+		n.log.Error("notify lost: not posted after its requester stopped waiting, which records it as possibly posted",
+			"reason", r.Error, "thread", job.req.Thread, "text", firstLine(job.req.Text, notifyLostLineMax))
+	}
+	job.answer(r)
+}
+
+// firstLine is text's first line, cut to max runes.
+func firstLine(text string, max int) string {
+	line, _, _ := strings.Cut(strings.TrimSpace(text), "\n")
+	if r := []rune(line); len(r) > max {
+		return string(r[:max]) + "…"
+	}
+	return line
 }
 
 // notifierSub stops the subscription, closes the queue under the notifier's
@@ -218,8 +245,12 @@ func (n *Notifier) handle(m *nats.Msg) {
 		answer(n.refuse(notifyStoppingRefusal))
 		return
 	}
+	job := notifyJob{req: req, answer: answer}
+	if req.WaitMillis > 0 {
+		job.deadline = time.Now().Add(time.Duration(req.WaitMillis) * time.Millisecond)
+	}
 	select {
-	case n.jobs <- notifyJob{req: req, answer: answer}:
+	case n.jobs <- job:
 	default:
 		answer(n.refuse(fmt.Sprintf("%d notifies are already waiting to post", notifyQueueDepth)))
 	}
@@ -229,10 +260,10 @@ func (n *Notifier) work() {
 	defer close(n.done)
 	for job := range n.jobs {
 		if n.isStopping() {
-			job.answer(n.refuse(notifyStoppingRefusal))
+			n.reply(job, n.refuse(notifyStoppingRefusal))
 			continue
 		}
-		n.post(job.req, job.answer)
+		n.post(job)
 	}
 }
 
@@ -242,7 +273,7 @@ func (n *Notifier) drainRefusing() {
 	for {
 		select {
 		case job := <-n.jobs:
-			job.answer(n.refuse(notifyStoppingRefusal))
+			n.reply(job, n.refuse(notifyStoppingRefusal))
 		default:
 			return
 		}
@@ -316,33 +347,35 @@ func (n *Notifier) validate(data []byte) (lib.NotifyRequest, *lib.NotifyReply) {
 	return req, nil
 }
 
-// post writes one accepted request, chunked, and calls answer exactly once:
+// post writes one accepted request, chunked, and answers it exactly once:
 // after the first chunk lands, with where it landed, or with the reason it did
 // not. The remaining chunks follow into the same thread; a failure among them
 // is logged, since the caller already holds its answer and the start of the
 // text is in the channel.
-func (n *Notifier) post(req lib.NotifyRequest, answer func(lib.NotifyReply)) {
-	if len(req.Blocks) > 0 {
-		n.postBlocks(req, answer)
+func (n *Notifier) post(job notifyJob) {
+	if len(job.req.Blocks) > 0 {
+		n.postBlocks(job)
 		return
 	}
-	thread := req.Thread
+	thread := job.req.Thread
 	var first string
-	for i, chunk := range chatChunks(req.Text, discordChunk) {
+	answered := false
+	for i, chunk := range chatChunks(job.req.Text, discordChunk) {
 		message, landed, err := n.poster.PostNotify(n.home, thread, chunk)
 		if err != nil {
 			n.log.Error("notify post failed", "home", n.home, "thread", thread, "chunk", i+1, "err", err)
-			if first == "" {
-				answer(lib.NotifyReply{Error: "post failed: " + err.Error()})
+			if !answered {
+				n.reply(job, lib.NotifyReply{Error: "post failed: " + err.Error()})
 			}
 			return
 		}
 		if landed != "" {
 			thread = landed
 		}
-		if first == "" {
+		if !answered {
+			answered = true
 			first = message
-			answer(lib.NotifyReply{MessageID: first, ThreadID: thread})
+			n.reply(job, lib.NotifyReply{MessageID: first, ThreadID: thread})
 		}
 	}
 	n.log.Info("notify posted", "home", n.home, "thread", thread, "message", first)
@@ -385,15 +418,15 @@ func blocksMention(v any) string {
 // postBlocks writes a Block Kit request as one message: blocks are not
 // chunked, so the text is only the notification and fallback, cut to one
 // chunk. validate has already refused blocks to a backend without them.
-func (n *Notifier) postBlocks(req lib.NotifyRequest, answer func(lib.NotifyReply)) {
+func (n *Notifier) postBlocks(job notifyJob) {
 	poster := n.poster.(notifyBlocksPoster)
-	message, landed, err := poster.PostNotifyBlocks(n.home, req.Thread, truncateRunes(req.Text, discordChunk), req.Blocks)
+	message, landed, err := poster.PostNotifyBlocks(n.home, job.req.Thread, truncateRunes(job.req.Text, discordChunk), job.req.Blocks)
 	if err != nil {
-		n.log.Error("notify blocks post failed", "home", n.home, "thread", req.Thread, "err", err)
-		answer(lib.NotifyReply{Error: "post failed: " + err.Error()})
+		n.log.Error("notify blocks post failed", "home", n.home, "thread", job.req.Thread, "err", err)
+		n.reply(job, lib.NotifyReply{Error: "post failed: " + err.Error()})
 		return
 	}
-	answer(lib.NotifyReply{MessageID: message, ThreadID: landed})
+	n.reply(job, lib.NotifyReply{MessageID: message, ThreadID: landed})
 	n.log.Info("notify posted", "home", n.home, "thread", landed, "message", message, "blocks", true)
 }
 

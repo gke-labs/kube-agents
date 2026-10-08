@@ -1194,6 +1194,32 @@ def get_active_platform(platforms: Optional[list[str]] = None) -> str:
 ALERT_SENT_WITHOUT_THREAD = "\x00alert-sent-without-thread"
 
 
+def _run_alert_send(active_platform: str, alert_msg: str) -> subprocess.CompletedProcess:
+    """Run the alert's send, waiting out a gateway route that is briefly not there.
+
+    The alert has one shot, so `a2a notify`'s "route unavailable" (a gateway
+    roll, or its bind retry) is retried on chat_notify's schedule rather than
+    dropping the alert; every other outcome is the caller's to read.
+    """
+    delays = chat_notify.NOTIFY_ROUTE_RETRY_DELAYS_SECONDS if chat_notify.routes(active_platform) else ()
+    for delay in (*delays, None):
+        try:
+            return subprocess.run(
+                chat_notify.command(active_platform, alert_msg),
+                check=True,
+                capture_output=True,
+                text=True,
+                stdin=subprocess.DEVNULL,
+                env=_run_env()
+            )
+        except subprocess.CalledProcessError as exc:
+            if delay is None or not chat_notify.route_unavailable(exc.returncode):
+                raise
+            logger.warning(f"Alert to '{active_platform}': the gateway's route is not there; retrying in {delay}s")
+            time.sleep(delay)
+    raise AssertionError("unreachable: the last attempt returns or raises")
+
+
 def _post_initial_alert(active_platform: str, alert_msg: str) -> str | None:
     """Send the initial warning alert and return the thread/message ID.
 
@@ -1204,14 +1230,7 @@ def _post_initial_alert(active_platform: str, alert_msg: str) -> str | None:
     happened here, and it is the one where a retry does damage rather than good.
     """
     try:
-        res = subprocess.run(
-            chat_notify.command(active_platform, alert_msg),
-            check=True,
-            capture_output=True,
-            text=True,
-            stdin=subprocess.DEVNULL,
-            env=_run_env()
-        )
+        res = _run_alert_send(active_platform, alert_msg)
         resp = json.loads(res.stdout)
         msg_id = resp.get("message_id", "")
         if msg_id:
@@ -2644,8 +2663,9 @@ def _send_to_chat(
 ) -> str | None:
     """Post `message`, into an existing thread when one is known, within `timeout` seconds if given.
 
-    Returns the thread id to route replies to, or None if the send failed.
-    Generalises _post_initial_alert's target handling: `hermes send --to` takes
+    Returns the thread id to route replies to, None if the send failed, or
+    :data:`ALERT_SENT_WITHOUT_THREAD` when a fresh post succeeded (or, exit 3,
+    may have) with no thread to read. Generalises _post_initial_alert's target handling: `hermes send --to` takes
     `<platform>:<chat>:<thread>` for a threaded reply, which is the same target
     shape send_notification builds in platform_mcp_server.py.
     """
@@ -2670,9 +2690,10 @@ def _send_to_chat(
         )
     except subprocess.CalledProcessError as exc:
         if chat_notify.outcome_unknown(exc.returncode):
-            # May have posted: say so, and do not register a thread for it.
+            # May have posted. A reply into a known thread keeps that thread,
+            # as a success does; a fresh post has no thread to register.
             logger.warning(f"Relayed report to {target} got no answer in time; treating it as sent")
-            return ALERT_SENT_WITHOUT_THREAD
+            return thread_id if threaded else ALERT_SENT_WITHOUT_THREAD
         logger.error(f"Failed to post relayed report to {target}. Stderr: {exc.stderr}")
         return None
     except Exception as exc:
@@ -3326,6 +3347,11 @@ def relay_cron_report(
                 f"so nothing follows them in a thread and replies are not routed"
             )
             unthreaded.append(platform)
+        elif platform in unthreaded:
+            logger.warning(
+                f"Relay for {profile}/{job_id}: report to {platform} got no answer in time; "
+                f"treated as delivered, with no thread to register"
+            )
         else:
             logger.error(
                 f"Relay for {profile}/{job_id}: report composed but not delivered to {platform}"

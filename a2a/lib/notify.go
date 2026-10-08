@@ -39,6 +39,11 @@ type NotifyRequest struct {
 	// which names no channel, so the gateway posts it into the home
 	// channel and nowhere else.
 	Thread string `json:"thread,omitempty"`
+	// WaitMillis is how long the requester waits for the answer. A request
+	// the gateway fails or refuses after that has nobody to tell, and the
+	// requester has recorded it as possibly posted, so the gateway logs the
+	// loss as an error rather than as an ordinary refusal. Zero is unknown.
+	WaitMillis int64 `json:"wait_ms,omitempty"`
 	// Blocks, when set, is a Slack Block Kit array posted as one message
 	// with Text as its notification and fallback text (the fleet audit's
 	// report card). Only a backend that renders blocks takes it; any other

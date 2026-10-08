@@ -1221,7 +1221,7 @@ as the primitive, unused, like the other backends.
 (an alert, a cron finding, an audit report) has no conversation to answer, and under `next`
 the Hermes platform that used to post it is off. So the agent asks the gateway, which holds
 the Chat credential, to post it. The agent container runs `a2a notify`, which publishes a
-core NATS request on `chat.notify.gchat` carrying `{"text", "thread"?}` with its reply subject
+core NATS request on `chat.notify.gchat` carrying `{"text", "thread"?, "wait_ms"?}` with its reply subject
 under `chat.notify.reply.agent.`; the gateway posts the text into the home space
 (`googleChat.homeChannel`, carried as `A2A_GCHAT_HOME_CHANNEL`), as a new thread or as a reply
 on a thread of that space, and answers with `message_id` (the field `hermes send --json`
@@ -1229,7 +1229,12 @@ prints) and `thread_id`, the thread it landed in, or an `error` naming why nothi
 posted. The answer goes out once the first part has landed; a long text is chunked, and
 the rest follows into the same thread. A request the gateway took and did not answer in
 time may still post, so `a2a notify` exits with its own status then, and the alert path
-treats that as sent rather than sending again. The agent-side callers
+treats that as sent rather than sending again. `wait_ms` is how long the requester waits:
+a request that fails or is refused after it has nobody to tell and is already recorded as
+possibly posted, so the gateway logs it as lost, at error, with its first line. When the
+route is not there (no gateway subscribed, or the bus unreachable) `a2a notify` exits with
+a third status, nothing posted; the alert path, which has one shot, waits through about
+half a minute of those before giving up. The agent-side callers
 (`agents/platform/scripts/chat_notify.py`) switch on `A2A_NOTIFY_PLATFORM`, which the operator
 renders exactly when `a2aChatArmed` holds and `homeChannel` is a space name (the condition
 the gateway arms the route on), and send to every other platform through `hermes send` as

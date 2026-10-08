@@ -154,6 +154,61 @@ class SessionKVCallersTest(unittest.TestCase):
                 mock.patch.object(self.skv.subprocess, "run", side_effect=err):
             self.assertEqual(self.skv._send_to_chat("google_chat", "report"), self.skv.ALERT_SENT_WITHOUT_THREAD)
 
+    def test_the_relay_keeps_a_known_thread_on_exit_3(self):
+        # A reply into a thread the report already has keeps that thread when
+        # the outcome is unknown, as it does on success, so the leg is still
+        # registered and its incident row updated.
+        err = subprocess.CalledProcessError(chat_notify.NOTIFY_OUTCOME_UNKNOWN, ["a2a"], stderr="no answer")
+        with mock.patch.dict(os.environ, ROUTED), \
+                mock.patch.object(self.skv.subprocess, "run", side_effect=err):
+            self.assertEqual(self.skv._send_to_chat("google_chat", "report", "spaces/H", "spaces/H/threads/T"),
+                             "spaces/H/threads/T")
+
+    def test_the_relay_files_an_exit_3_leg_as_delivered_and_does_not_log_it_undelivered(self):
+        skv = self.skv
+        with mock.patch.object(skv, "enabled_chat_platforms", return_value=["google_chat"]), \
+                mock.patch.object(skv, "_gateway_api_token", return_value=""), \
+                mock.patch.object(skv, "_ensure_session_row"), \
+                mock.patch.object(skv, "_create_gateway_session", return_value=True), \
+                mock.patch.object(skv, "_run_relay_turn", return_value="composed report"), \
+                mock.patch.object(skv, "_lookup_session_routing", return_value=("", "", "")), \
+                mock.patch.object(skv, "_lookup_platform_threads", return_value={}), \
+                mock.patch.object(skv, "_slack_audit_headline", return_value=None), \
+                mock.patch.object(skv, "_send_to_chat", return_value=skv.ALERT_SENT_WITHOUT_THREAD), \
+                self.assertLogs(skv.logger, level="WARNING") as logs:
+            result = skv.relay_cron_report("sess", "audit", "job", "Audit", "report")
+        self.assertEqual(result, (None, "", []))
+        self.assertFalse([line for line in logs.output if "not delivered" in line], logs.output)
+        self.assertTrue([line for line in logs.output if "treated as delivered" in line], logs.output)
+
+    def test_the_alert_waits_out_a_route_that_is_briefly_not_there(self):
+        unavailable = subprocess.CalledProcessError(chat_notify.NOTIFY_ROUTE_UNAVAILABLE, ["a2a"], stderr="no responders")
+        answer = _completed(json.dumps({"message_id": "spaces/H/messages/X", "thread_id": "spaces/H/threads/T"}))
+        with mock.patch.dict(os.environ, ROUTED), \
+                mock.patch.object(self.skv.time, "sleep") as sleep, \
+                mock.patch.object(self.skv.subprocess, "run", side_effect=[unavailable, unavailable, answer]) as run:
+            thread = self.skv._post_initial_alert("google_chat", "Warning")
+        self.assertEqual(thread, "spaces/H/threads/T")
+        self.assertEqual(run.call_count, 3)
+        self.assertEqual([c.args[0] for c in sleep.call_args_list], list(chat_notify.NOTIFY_ROUTE_RETRY_DELAYS_SECONDS[:2]))
+
+    def test_the_alert_gives_up_once_the_route_stays_away(self):
+        unavailable = subprocess.CalledProcessError(chat_notify.NOTIFY_ROUTE_UNAVAILABLE, ["a2a"], stderr="no responders")
+        with mock.patch.dict(os.environ, ROUTED), \
+                mock.patch.object(self.skv.time, "sleep"), \
+                mock.patch.object(self.skv.subprocess, "run", side_effect=unavailable) as run:
+            self.assertIsNone(self.skv._post_initial_alert("google_chat", "Warning"))
+        self.assertEqual(run.call_count, len(chat_notify.NOTIFY_ROUTE_RETRY_DELAYS_SECONDS) + 1)
+
+    def test_a_refusal_is_not_retried(self):
+        err = subprocess.CalledProcessError(1, ["a2a"], stderr="refused")
+        with mock.patch.dict(os.environ, ROUTED), \
+                mock.patch.object(self.skv.time, "sleep") as sleep, \
+                mock.patch.object(self.skv.subprocess, "run", side_effect=err) as run:
+            self.assertIsNone(self.skv._post_initial_alert("google_chat", "Warning"))
+        self.assertEqual(run.call_count, 1)
+        sleep.assert_not_called()
+
     def test_a_refusal_is_a_failure(self):
         err = subprocess.CalledProcessError(1, ["a2a"], stderr="route not armed")
         with mock.patch.dict(os.environ, ROUTED), \
