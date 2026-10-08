@@ -5,14 +5,6 @@
    "apiVersion": "v1",
    "kind": "Node",
    "metadata": {
-    "annotations": {
-     "container.googleapis.com/instance_id": "2820965730266702266",
-     "csi.volume.kubernetes.io/nodeid": "{\"pd.csi.storage.gke.io\":\"projects/haoxuw-gke-dev/zones/us-central1-a/instances/gke-gemma-gpu-upgraded-default-pool-49d92e50-zcx6\",\"podcertificate.gke.io\":\"gke-gemma-gpu-upgraded-default-pool-49d92e50-zcx6\"}",
-     "node.alpha.kubernetes.io/ttl": "0",
-     "node.gke.io/last-applied-node-labels": "cloud.google.com/gke-boot-disk=pd-balanced,cloud.google.com/gke-container-runtime=containerd,cloud.google.com/gke-cpu-scaling-level=2,cloud.google.com/gke-logging-variant=DEFAULT,cloud.google.com/gke-max-pods-per-node=110,cloud.google.com/gke-memory-gb-scaling-level=2,cloud.google.com/gke-netd-ready=true,cloud.google.com/gke-nodepool=default-pool,cloud.google.com/gke-os-distribution=cos,cloud.google.com/gke-provisioning=standard,cloud.google.com/gke-stack-type=IPV4,cloud.google.com/machine-family=e2,cloud.google.com/private-node=false,iam.gke.io/gke-metadata-server-enabled=true",
-     "node.gke.io/last-applied-node-taints": "",
-     "volumes.kubernetes.io/controller-managed-attach-detach": "true"
-    },
     "creationTimestamp": "2026-09-24T17:39:24Z",
     "labels": {
      "beta.kubernetes.io/arch": "amd64",
@@ -42,31 +34,9 @@
      "topology.kubernetes.io/region": "us-central1",
      "topology.kubernetes.io/zone": "us-central1-a"
     },
-    "name": "gke-gemma-gpu-upgraded-default-pool-49d92e50-zcx6",
-    "resourceVersion": "1791480362115039017",
-    "uid": "8fc8f2cc-7fdc-4e24-b545-15049a66a476"
-   },
-   "spec": {
-    "podCIDR": "10.72.0.0/24",
-    "providerID": "gce://haoxuw-gke-dev/us-central1-a/gke-gemma-gpu-upgraded-default-pool-49d92e50-zcx6"
+    "name": "gke-gemma-gpu-upgraded-default-pool-49d92e50-zcx6"
    },
    "status": {
-    "allocatable": {
-     "cpu": "940m",
-     "ephemeral-storage": "9226554939",
-     "hugepages-1Gi": "0",
-     "hugepages-2Mi": "0",
-     "memory": "1393776Ki",
-     "pods": "110"
-    },
-    "capacity": {
-     "cpu": "2",
-     "ephemeral-storage": "28652804Ki",
-     "hugepages-1Gi": "0",
-     "hugepages-2Mi": "0",
-     "memory": "2020464Ki",
-     "pods": "110"
-    },
     "conditions": [
      {
       "lastHeartbeatTime": "2026-10-08T17:26:02Z",
@@ -238,16 +208,7 @@
      }
     ],
     "nodeInfo": {
-     "architecture": "amd64",
-     "bootID": "918286c8-8a04-4c26-9a42-ff065df7ea7d",
-     "containerRuntimeVersion": "containerd://1.7.34",
-     "kernelVersion": "6.6.153+",
-     "kubeProxyVersion": "v1.31.14-gke.2704000",
-     "kubeletVersion": "v1.31.14-gke.2704000",
-     "machineID": "590a4fb90f48872e170c24741a643073",
-     "operatingSystem": "linux",
-     "osImage": "Container-Optimized OS from Google",
-     "systemUUID": "590a4fb9-0f48-872e-170c-24741a643073"
+     "kubeletVersion": "v1.31.14-gke.2704000"
     }
    }
   },
@@ -255,14 +216,6 @@
    "apiVersion": "v1",
    "kind": "Node",
    "metadata": {
-    "annotations": {
-     "container.googleapis.com/instance_id": "6977149808160589888",
-     "csi.volume.kubernetes.io/nodeid": "{\"pd.csi.storage.gke.io\":\"projects/haoxuw-gke-dev/zones/us-central1-a/instances/gke-gemma-gpu-upgraded-gpu-pool-2de3842b-qqvn\",\"podcertificate.gke.io\":\"gke-gemma-gpu-upgraded-gpu-pool-2de3842b-qqvn\"}",
-     "node.alpha.kubernetes.io/ttl": "0",
-     "node.gke.io/last-applied-node-labels": "cloud.google.com/gke-accelerator=nvidia-l4,cloud.google.com/gke-boot-disk=pd-balanced,cloud.google.com/gke-container-runtime=containerd,cloud.google.com/gke-cpu-scaling-level=4,cloud.google.com/gke-gpu-driver-version=latest,cloud.google.com/gke-gpu=true,cloud.google.com/gke-logging-variant=DEFAULT,cloud.google.com/gke-max-pods-per-node=110,cloud.google.com/gke-memory-gb-scaling-level=16,cloud.google.com/gke-netd-ready=true,cloud.google.com/gke-nodepool=gpu-pool,cloud.google.com/gke-os-distribution=cos,cloud.google.com/gke-provisioning=standard,cloud.google.com/gke-stack-type=IPV4,cloud.google.com/machine-family=g2,cloud.google.com/private-node=false,iam.gke.io/gke-metadata-server-enabled=true,workload=gemma",
-     "node.gke.io/last-applied-node-taints": "nvidia.com/gpu=present:NoSchedule",
-     "volumes.kubernetes.io/controller-managed-attach-detach": "true"
-    },
     "creationTimestamp": "2026-09-24T19:16:10Z",
     "labels": {
      "beta.kubernetes.io/arch": "amd64",
@@ -296,40 +249,9 @@
      "topology.kubernetes.io/zone": "us-central1-a",
      "workload": "gemma"
     },
-    "name": "gke-gemma-gpu-upgraded-gpu-pool-2de3842b-qqvn",
-    "resourceVersion": "1791480396483199022",
-    "uid": "6d4d4f00-67f0-4363-8207-a58dd0d4b8fa"
-   },
-   "spec": {
-    "podCIDR": "10.72.1.0/24",
-    "providerID": "gce://haoxuw-gke-dev/us-central1-a/gke-gemma-gpu-upgraded-gpu-pool-2de3842b-qqvn",
-    "taints": [
-     {
-      "effect": "NoSchedule",
-      "key": "nvidia.com/gpu",
-      "value": "present"
-     }
-    ]
+    "name": "gke-gemma-gpu-upgraded-gpu-pool-2de3842b-qqvn"
    },
    "status": {
-    "allocatable": {
-     "cpu": "3920m",
-     "ephemeral-storage": "47060071478",
-     "hugepages-1Gi": "0",
-     "hugepages-2Mi": "0",
-     "memory": "13594680Ki",
-     "nvidia.com/gpu": "1",
-     "pods": "110"
-    },
-    "capacity": {
-     "cpu": "4",
-     "ephemeral-storage": "98831908Ki",
-     "hugepages-1Gi": "0",
-     "hugepages-2Mi": "0",
-     "memory": "16383032Ki",
-     "nvidia.com/gpu": "1",
-     "pods": "110"
-    },
     "conditions": [
      {
       "lastHeartbeatTime": "2026-10-08T17:22:15Z",
@@ -509,33 +431,8 @@
      }
     ],
     "nodeInfo": {
-     "architecture": "amd64",
-     "bootID": "ae563764-358b-4c81-86af-30c34327ed8a",
-     "containerRuntimeVersion": "containerd://2.0.10",
-     "kernelVersion": "6.6.153+",
-     "kubeProxyVersion": "v1.32.13-gke.2427000",
-     "kubeletVersion": "v1.32.13-gke.2427000",
-     "machineID": "795d3adc4f08316c085501f5244d0119",
-     "operatingSystem": "linux",
-     "osImage": "Container-Optimized OS from Google",
-     "systemUUID": "795d3adc-4f08-316c-0855-01f5244d0119"
-    },
-    "runtimeHandlers": [
-     {
-      "features": {
-       "recursiveReadOnlyMounts": true,
-       "userNamespaces": true
-      },
-      "name": "runc"
-     },
-     {
-      "features": {
-       "recursiveReadOnlyMounts": true,
-       "userNamespaces": true
-      },
-      "name": ""
-     }
-    ]
+     "kubeletVersion": "v1.32.13-gke.2427000"
+    }
    }
   }
  ],
