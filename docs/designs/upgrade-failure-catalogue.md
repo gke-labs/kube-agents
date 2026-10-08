@@ -764,4 +764,5 @@ placement (3) is already read. The node-image entries (12 to 20) follow, which n
 version to be known before they mean anything. Post-upgrade detection is one mechanism for every
 entry: watch the operation, then compare Pending and crash-looping pod counts and a live service
 probe against the same measurements taken before the upgrade started, as the readiness requirements'
-[rollout section](upgrade-readiness-checks.md#rollout-and-verification) specifies.
+[rollout section](upgrade-readiness-checks.md#rollout-and-verification) specifies. The [upgrade retrospective](upgrade-retrospective.md) is that mechanism as a scheduled
+review, with each failure it finds classified against this list.
