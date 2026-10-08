@@ -311,6 +311,32 @@ func TestABridgeDeclaredUnderAnotherNameStillWins(t *testing.T) {
 	}
 }
 
+// The bridge binary doesn't need BRIDGE_CONCURRENCY set, so a sidecar running
+// the hermes-bridge image under another name, with the key unset or arriving
+// through envFrom, is a declared bridge too. Rendering a second one beside it
+// would put two listeners on the activity door's port.
+func TestABridgeImageUnderAnotherNameWithNoConcurrencyStillWins(t *testing.T) {
+	for name, sidecar := range map[string]corev1.Container{
+		"key unset": {Name: "my-bridge", Image: "registry.example/hermes-bridge:1"},
+		"envFrom": {Name: "my-bridge", Image: "registry.example/kube-agents/hermes-bridge@sha256:" + strings.Repeat("a", 64),
+			EnvFrom: []corev1.EnvFromSource{{ConfigMapRef: &corev1.ConfigMapEnvSource{LocalObjectReference: corev1.LocalObjectReference{Name: "bridge-env"}}}}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			agent := provisionedAgent()
+			agent.Spec.Deployment = &agentv1alpha1.DeploymentSpec{Sidecars: []corev1.Container{sidecar}}
+			if got := containersNamed(bridgeTestPod(agent), a2aBridgeContainerName); len(got) != 0 {
+				t.Errorf("the operator rendered a bridge beside a hermes-bridge image declared as %s (%d containers)", sidecar.Name, len(got))
+			}
+		})
+	}
+	// A sidecar on some other image, setting nothing, is not a bridge.
+	agent := provisionedAgent()
+	agent.Spec.Deployment = &agentv1alpha1.DeploymentSpec{Sidecars: []corev1.Container{{Name: "sidecar", Image: "registry.example/log-shipper:1"}}}
+	if got := containersNamed(bridgeTestPod(agent), a2aBridgeContainerName); len(got) != 1 {
+		t.Errorf("an unrelated sidecar suppressed the rendered bridge (%d containers)", len(got))
+	}
+}
+
 // An executor value the bridge refuses would crash-loop the whole agent pod, so
 // the operator passes through only api or cli; anything else leaves the
 // shipped default to decide.
@@ -337,5 +363,25 @@ func TestTheProvisionNoteForAnUnreadableSettingNamesIt(t *testing.T) {
 	script := a2aProvisionScript(a2aTestAgent())
 	if !strings.Contains(script, "NOTE: the operator's "+a2aBridgeConcurrencyOperatorEnvVar) || strings.Contains(script, "NOTE: a spec.deployment.sidecars entry sets") {
 		t.Error("the provision script's read note does not name the operator setting for a rendered bridge")
+	}
+}
+
+// A refused executor value is recorded as logged, once per value, so the
+// typo shows up in the operator log instead of only as the bridge's start line.
+// Unset and the two accepted values are not refusals.
+func TestARefusedExecutorSettingIsLoggedOnce(t *testing.T) {
+	for _, v := range []string{"", a2aBridgeExecutorAPI, a2aBridgeExecutorCLI} {
+		t.Setenv(a2aBridgeExecutorOperatorEnvVar, v)
+		a2aRenderedBridgeExecutor()
+		if _, logged := a2aRefusedBridgeExecutors.Load(v); logged {
+			t.Errorf("%q was logged as refused", v)
+		}
+	}
+	t.Setenv(a2aBridgeExecutorOperatorEnvVar, "Cli-refused-once")
+	if got := a2aRenderedBridgeExecutor(); got != "" {
+		t.Fatalf("a refused value rendered %q", got)
+	}
+	if _, logged := a2aRefusedBridgeExecutors.Load("Cli-refused-once"); !logged {
+		t.Error("the refused value was not logged")
 	}
 }

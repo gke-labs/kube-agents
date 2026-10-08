@@ -59,11 +59,11 @@ when unset. An install that runs a custom agent image sets `A2A_BRIDGE_IMAGE`. T
 operator settings shape the rendered bridge. The operator reads them from its own
 environment, as it reads `A2A_INJECT_BACKEND`; no CR field carries them.
 
-| Operator env             | What it sets                      | Unset                                                                       |
-| ------------------------ | --------------------------------- | --------------------------------------------------------------------------- |
-| `A2A_BRIDGE_IMAGE`       | the bridge's image                | derived as above                                                            |
-| `A2A_BRIDGE_CONCURRENCY` | the bridge's `BRIDGE_CONCURRENCY` | 10, Hermes's own gateway pool (not the bridge's default of 2)               |
-| `A2A_BRIDGE_EXECUTOR`    | the bridge's `BRIDGE_EXECUTOR`    | not rendered, so the bridge's shipped default decides: `api`, given the key |
+| Operator env             | What it sets                      | Unset                                                                                                                                                                     |
+| ------------------------ | --------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `A2A_BRIDGE_IMAGE`       | the bridge's image                | derived as above                                                                                                                                                          |
+| `A2A_BRIDGE_CONCURRENCY` | the bridge's `BRIDGE_CONCURRENCY` | 10, Hermes's own gateway pool (not the bridge's default of 2)                                                                                                             |
+| `A2A_BRIDGE_EXECUTOR`    | the bridge's `BRIDGE_EXECUTOR`    | not rendered, so the bridge's shipped default decides: `api`, given the key. A value other than exactly `api` or `cli` is treated as unset, and the operator logs it once |
 
 The TASKS consumer reserve reads the same `A2A_BRIDGE_CONCURRENCY` the bridge is given
 ([sizing](#sizing-against-the-eval-harness)), and the `api` executor's pod-wide hook is
@@ -78,8 +78,11 @@ the `cli` executor starts every task as a fresh one-shot session with no history
 of 10 the TASKS budget for 10 workers is 110, above the 64-consumer floor. A `next` install
 whose TASKS stream was created at the floor, before the rendered default was 10, is refused by
 its provision Job with the ways out named: delete TASKS and let provisioning recreate it, lower
-`maxSessions`, or set `A2A_BRIDGE_CONCURRENCY` lower. A fresh install creates TASKS at 110 from
-the first render.
+`maxSessions`, or set `A2A_BRIDGE_CONCURRENCY` lower. While that `A2AProvisionFailed`
+stands, the bridge is already in the agent pod at the new concurrency (the workload renders before
+the refusal parks the CR), running over the undersized stream, so consumer creates can be refused
+under load. That's the shape [#2043](https://github.com/gke-labs/kube-agents/issues/2043) describes. A fresh install creates TASKS at 110 from the first
+render.
 
 **It enters the pod once the bus is provisioned.** The rendered bridge is withheld from the
 agent pod until the CR's `BusProvisioned` condition is `True`: before that it has no bus to
@@ -100,19 +103,10 @@ CPU/8Gi of limits, roughly doubling the agent pod's requests, and a node or name
 sized for the `today` pod may not schedule the `next` one. `spec.deployment.resources` sizes
 both containers together; no setting sizes the bridge alone.
 
-**"Declared bridge" means two things.** The render's opt-out keys on the container name: a
-sidecar named `hermes-bridge` on `spec.deployment.sidecars` is the declared bridge, and the
-operator then renders none. The TASKS reserve and the activity hook key on the env instead:
-they count every sidecar whose `env` sets `BRIDGE_CONCURRENCY`, under any name, plus the
-rendered bridge when there is one. So a bus-client sidecar under another name that sets
-`BRIDGE_CONCURRENCY` does not suppress the rendered bridge: the pod runs both, the reserve is
-sized for the sum of their workers, and if that sidecar consumes `platform` tasks the two
-compete for them. To replace the rendered
-bridge with a sidecar of its own, a CR names that sidecar `hermes-bridge`.
-
-**A CR-declared bridge wins.** A CR that declares a sidecar named `hermes-bridge` on
-`spec.deployment.sidecars` keeps it, and the operator then renders none, so an install that
-already carries one does not get two containers of one name. The `sidecars` field takes
+**A CR-declared bridge wins.** A sidecar on `spec.deployment.sidecars` is a declared bridge
+if it is named `hermes-bridge`, if its `env` sets `BRIDGE_CONCURRENCY`, or if it runs the
+`hermes-bridge` image. The CR keeps it and the operator renders none, so an install that
+already carries one does not get two bridges. The `sidecars` field takes
 ordinary `corev1.Container` entries, so a declared bridge's shape is CR-authored and
 reconcile leaves it alone: it has to carry its own `NATS_URL` and creds, and, for the `api`
 executor, `API_SERVER_KEY` and `A2A_ACTIVITY_SECRET`. The operator reads `BRIDGE_CONCURRENCY`

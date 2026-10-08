@@ -455,7 +455,7 @@ class FlagSetIsNextTest(unittest.TestCase):
         # The operator spells the rest of the bridge's env itself too, since it
         # cannot import the bridge's module, so each is pinned to the name the
         # bridge actually reads.
-        bridge_go = pathlib.Path("k8s-operator/internal/controller/platformagent_a2a_bridge.go")
+        bridge_go = _A2A_BRIDGE
         for op_const, bridge_name in (
             ("a2aBridgeNATSURLEnvVar", "NATS_URL"),
             ("a2aBridgeNATSUserEnvVar", "NATS_USER"),
@@ -467,6 +467,10 @@ class FlagSetIsNextTest(unittest.TestCase):
         self.assertEqual(go_constant(_A2A_MANIFESTS, "a2aBridgeConcurrencyEnvVar"), "BRIDGE_CONCURRENCY")
         self.assertIn('"BRIDGE_CONCURRENCY"', main_go, "the bridge no longer reads BRIDGE_CONCURRENCY")
         self.assertEqual(consts["BRIDGE_EXECUTOR_PINNED"], go_constant(_BRIDGE_API_GO, "ExecutorCLI"))
+        # The operator admits only these two spellings into BRIDGE_EXECUTOR and
+        # drops anything else as unset, so each must be the bridge's own.
+        self.assertEqual(go_constant(_A2A_BRIDGE, "a2aBridgeExecutorCLI"), go_constant(_BRIDGE_API_GO, "ExecutorCLI"))
+        self.assertEqual(go_constant(_A2A_MANIFESTS, "a2aBridgeExecutorAPI"), go_constant(_BRIDGE_API_GO, "ExecutorAPI"))
         self.assertIn('"executor", b.cfg.Executor)', text(_BRIDGE_GO))
         self.assertEqual(consts["BRIDGE_CONSUMING_LOG_EXECUTOR"], f'"executor":"{consts["BRIDGE_EXECUTOR_PINNED"]}"')
         self.assertIn(

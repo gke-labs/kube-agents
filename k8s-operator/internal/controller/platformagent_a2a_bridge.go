@@ -20,8 +20,10 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 
 	corev1 "k8s.io/api/core/v1"
+	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
 )
@@ -38,9 +40,9 @@ import (
 // skew, where a frozen bus that is still running keeps its executor). Under
 // `today` nothing is rendered.
 //
-// A CR that declares its own `hermes-bridge` sidecar keeps it: the declared one
-// wins and the operator renders none, so an install that already carries one
-// does not get two containers of one name. Such a declared sidecar is still
+// A CR that declares its own bridge sidecar keeps it: the declared one wins and
+// the operator renders none (a2aBridgeDeclared says what counts as declared), so
+// an install that already carries one does not get two bridges. Such a declared sidecar is still
 // copied into the pod without regard to the mode, so it still crash-loops on a
 // flip to `today` (a2a/docs/hermes-bridge.md); the rendered one does not.
 //
@@ -109,10 +111,12 @@ const (
 )
 
 // a2aBridgeDeclared reports whether the CR declares its own bridge sidecar:
-// one named hermes-bridge, or any sidecar whose env sets BRIDGE_CONCURRENCY,
-// which is how every other reader of a declared bridge identifies one (the
-// TASKS budget, the activity hook, a2aExecutorSidecarEnv). Keying on the name
-// alone would render a second bridge beside one declared under another name,
+// one named hermes-bridge, any sidecar whose env sets BRIDGE_CONCURRENCY (which
+// is how every other reader of a declared bridge identifies one: the TASKS
+// budget, the activity hook, a2aExecutorSidecarEnv), or any sidecar running the
+// hermes-bridge image. The bridge binary doesn't need BRIDGE_CONCURRENCY set,
+// so the image catches one that leaves it unset or takes it through envFrom.
+// Missing any of these would render a second bridge beside the declared one,
 // and the two would fight over the activity door's port.
 func a2aBridgeDeclared(agent *agentv1alpha1.PlatformAgent) bool {
 	if agent == nil || agent.Spec.Deployment == nil {
@@ -123,6 +127,9 @@ func a2aBridgeDeclared(agent *agentv1alpha1.PlatformAgent) bool {
 			return true
 		}
 		if _, set := a2aBridgeConcurrencyValue(c); set {
+			return true
+		}
+		if imageRepositoryName(c.Image) == a2aBridgeImageName {
 			return true
 		}
 	}
@@ -172,15 +179,26 @@ func a2aRenderedBridgeSettings() []corev1.EnvVar {
 // one the bridge accepts (api or cli), else "". The bridge refuses any other
 // value at startup, before it dials the bus, and the container would
 // crash-loop the whole agent pod; an unknown value is therefore treated as
-// unset, so the shipped default decides.
+// unset, so the shipped default decides. The refused value is logged once, with
+// the two the bridge accepts, since the shipped default picks a different
+// executor (and so a different persona) than the one the setting asked for.
 func a2aRenderedBridgeExecutor() string {
 	switch v := os.Getenv(a2aBridgeExecutorOperatorEnvVar); v {
-	case a2aBridgeExecutorAPI, a2aBridgeExecutorCLI:
+	case "", a2aBridgeExecutorAPI, a2aBridgeExecutorCLI:
 		return v
 	default:
+		if _, seen := a2aRefusedBridgeExecutors.LoadOrStore(v, true); !seen {
+			logf.Log.WithName("platformagent-controller").Info(
+				"Ignoring "+a2aBridgeExecutorOperatorEnvVar+": the bridge accepts only "+a2aBridgeExecutorAPI+" or "+a2aBridgeExecutorCLI+", so the rendered bridge runs its shipped default",
+				"value", v)
+		}
 		return ""
 	}
 }
+
+// a2aRefusedBridgeExecutors holds each refused A2A_BRIDGE_EXECUTOR value
+// already logged, so a reconcile loop logs a typo once rather than per pass.
+var a2aRefusedBridgeExecutors sync.Map
 
 // a2aRenderedBridgeConcurrency is the rendered bridge's BRIDGE_CONCURRENCY:
 // the operator setting when it is set, else a2aRenderedBridgeDefaultConcurrency.
