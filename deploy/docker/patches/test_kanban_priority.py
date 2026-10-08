@@ -43,61 +43,120 @@ QUEUED_LINE = "⏳ Queued: the system is busy. Your request will start when a wo
 # ---------------------------------------------------------------------------
 
 
+GATEWAY_SESSION = "20261008_101500_ab12cd34"
+EVENT_SESSION = "k8s-evt-0a1b2c3d"
+
+
+def stamp(requested, parent=None, origin=""):
+    return kp.stamp_priority(requested, parent, origin_session=origin)
+
+
 class StampTest(unittest.TestCase):
     def test_a_chat_users_card_is_raised_to_the_user_floor(self):
-        self.assertEqual(kp.stamp_priority(0, "20261008_101500_ab12cd34"), kp.USER_PRIORITY)
+        # A Slack/Chat turn has no api_server origin session.
+        self.assertEqual(stamp(0), kp.USER_PRIORITY)
 
-    def test_a_card_with_no_session_is_a_user_card(self):
-        self.assertEqual(kp.stamp_priority(0, None), kp.USER_PRIORITY)
-        self.assertEqual(kp.stamp_priority(0, ""), kp.USER_PRIORITY)
+    def test_an_api_door_card_is_a_user_card(self):
+        self.assertEqual(stamp(0, origin=GATEWAY_SESSION), kp.USER_PRIORITY)
 
     def test_a_user_asking_for_more_keeps_it(self):
-        self.assertEqual(kp.stamp_priority(250, "20261008_101500_ab12cd34"), 250)
+        self.assertEqual(stamp(250), 250)
 
     def test_event_triage_and_cron_relays_are_background(self):
-        self.assertEqual(kp.stamp_priority(0, "k8s-evt-0a1b2c3d"), 0)
-        self.assertEqual(kp.stamp_priority(0, "cron-platform-stall-watch-20261008"), 0)
+        self.assertEqual(stamp(0, origin=EVENT_SESSION), 0)
+        self.assertEqual(stamp(0, origin="cron-platform-stall-watch-20261008"), 0)
 
     def test_a_model_cannot_promote_triage(self):
-        self.assertEqual(kp.stamp_priority(500, "k8s-evt-0a1b2c3d"), kp.USER_PRIORITY - 1)
-        self.assertEqual(kp.stamp_priority(kp.USER_PRIORITY, "cron-x-20261008"), kp.USER_PRIORITY - 1)
+        self.assertEqual(stamp(500, origin=EVENT_SESSION), kp.USER_PRIORITY - 1)
+        self.assertEqual(stamp(kp.USER_PRIORITY, origin="cron-x-20261008"), kp.USER_PRIORITY - 1)
 
     def test_a_low_background_request_is_kept(self):
-        self.assertEqual(kp.stamp_priority(5, "k8s-evt-0a1b2c3d"), 5)
+        self.assertEqual(stamp(5, origin=EVENT_SESSION), 5)
 
     def test_a_user_cards_child_inherits_the_user_class(self):
-        parent = SimpleNamespace(priority=kp.USER_PRIORITY)
-        self.assertEqual(kp.stamp_priority(0, "20261008_101500_ab12cd34", parent), kp.USER_PRIORITY)
-        bumped = SimpleNamespace(priority=180)
-        self.assertEqual(kp.stamp_priority(0, None, bumped), 180)
+        parent = SimpleNamespace(priority=kp.USER_PRIORITY, session_id=GATEWAY_SESSION)
+        self.assertEqual(stamp(0, parent), kp.USER_PRIORITY)
+        bumped = SimpleNamespace(priority=180, session_id=None)
+        self.assertEqual(stamp(0, bumped), 180)
 
     def test_a_triage_cards_child_stays_background(self):
-        parent = SimpleNamespace(priority=0)
-        self.assertEqual(kp.stamp_priority(300, "k8s-evt-0a1b2c3d", parent), kp.USER_PRIORITY - 1)
-        self.assertEqual(kp.stamp_priority(0, "k8s-evt-0a1b2c3d", parent), 0)
+        parent = SimpleNamespace(priority=0, session_id=EVENT_SESSION)
+        self.assertEqual(stamp(300, parent), kp.USER_PRIORITY - 1)
+        self.assertEqual(stamp(0, parent), 0)
 
-    def test_an_operator_promoted_triage_parent_passes_its_priority_on(self):
-        """The dashboard can bump a triage card; its fan-out may follow it, no higher."""
-        parent = SimpleNamespace(priority=150)
-        self.assertEqual(kp.stamp_priority(0, "k8s-evt-0a1b2c3d", parent), 150)
-        self.assertEqual(kp.stamp_priority(900, "k8s-evt-0a1b2c3d", parent), 150)
+    def test_a_child_of_any_background_priority_parent_stays_background(self):
+        """The parent's own priority is trusted context too: a card below the
+        floor is background whatever session it carries."""
+        parent = SimpleNamespace(priority=0, session_id=GATEWAY_SESSION)
+        self.assertEqual(stamp(0, parent), 0)
+
+    def test_an_operator_promoted_triage_parents_child_is_still_clamped(self):
+        parent = SimpleNamespace(priority=150, session_id=EVENT_SESSION)
+        self.assertEqual(stamp(0, parent), kp.USER_PRIORITY - 1)
 
     def test_a_parent_without_a_priority_is_ignored(self):
-        self.assertEqual(kp.stamp_priority(0, None, SimpleNamespace()), kp.USER_PRIORITY)
+        self.assertEqual(stamp(0, SimpleNamespace()), kp.USER_PRIORITY)
 
     def test_an_unreadable_parent_falls_back_to_the_request(self):
         class Bad:
+            session_id = None
+
             @property
             def priority(self):
                 raise RuntimeError("boom")
 
-        self.assertEqual(kp.stamp_priority(3, None, Bad()), 3)
+        self.assertEqual(stamp(3, Bad()), 3)
+
+    def test_the_origin_is_read_from_the_runtime_when_not_given(self):
+        with mock.patch.object(kp, "trusted_origin_session", return_value=EVENT_SESSION):
+            self.assertEqual(kp.stamp_priority(500), kp.USER_PRIORITY - 1)
+        with mock.patch.object(kp, "trusted_origin_session", return_value=""):
+            self.assertEqual(kp.stamp_priority(0), kp.USER_PRIORITY)
+
+    def test_the_runtime_origin_fails_toward_no_session(self):
+        # No tools.async_delegation on the host: the read must not raise.
+        self.assertEqual(kp.trusted_origin_session(), "")
 
     def test_the_class_boundary_is_the_floor(self):
         self.assertTrue(kp.is_user_priority(kp.USER_PRIORITY))
         self.assertFalse(kp.is_user_priority(kp.USER_PRIORITY - 1))
         self.assertFalse(kp.is_user_priority(None))
         self.assertFalse(kp.is_user_priority("garbage"))
+
+
+class UntrustedSessionTest(unittest.TestCase):
+    """The ``session_id`` a model passes to kanban_create never sets the class.
+
+    An automated security review found the first version classified by the
+    handler's ``session_id`` local, which prefers ``args["session_id"]``: a
+    triage worker could name a user-looking session and take the user slot.
+    """
+
+    def test_the_stamp_takes_no_session_argument_from_the_handler(self):
+        self.assertNotIn("session_id", applier.PRIORITY_PATCHED)
+        self.assertIn("self_task", applier.PRIORITY_PATCHED)
+
+    def test_background_origin_with_a_user_looking_args_session_stays_background(self):
+        out, created = HandlerHarness(self).create(
+            {"title": "Triage x", "priority": 500, "session_id": GATEWAY_SESSION},
+            origin=EVENT_SESSION,
+        )
+        self.assertEqual(created["session_id"], GATEWAY_SESSION, "upstream still stores what it was given")
+        self.assertEqual(created["priority"], kp.USER_PRIORITY - 1)
+
+    def test_a_background_cards_child_with_a_user_looking_session_stays_background(self):
+        parent = SimpleNamespace(priority=0, session_id=EVENT_SESSION)
+        out, created = HandlerHarness(self).create(
+            {"title": "Triage sub-step", "priority": 300, "session_id": GATEWAY_SESSION},
+            origin="", self_task=parent,
+        )
+        self.assertEqual(created["priority"], kp.USER_PRIORITY - 1)
+
+    def test_a_user_turn_naming_a_triage_session_is_not_demoted_by_it_either(self):
+        out, created = HandlerHarness(self).create(
+            {"title": "Question", "session_id": EVENT_SESSION}, origin="",
+        )
+        self.assertEqual(created["priority"], kp.USER_PRIORITY)
 
 
 class SessionPrefixPinTest(unittest.TestCase):
@@ -878,6 +937,65 @@ PRISTINE = {
 }
 
 
+class HandlerHarness:
+    """Run the patched ``_handle_create`` fixture with stub collaborators.
+
+    ``origin`` is what the runtime reports as the turn's own session (upstream
+    reads it twice: once for the card's ``session_id``, and through
+    ``kanban_priority.trusted_origin_session`` for the class).
+    """
+
+    def __init__(self, testcase):
+        self.testcase = testcase
+        root = Path(tempfile.mkdtemp())
+        for relative, make in PRISTINE.items():
+            target = root / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(make())
+        applier.apply(root)
+        self.source = (root / applier.TOOLS_RELATIVE).read_text().replace(
+            "from hermes_cli.kanban_priority import", "from kanban_priority import"
+        )
+
+    def create(self, args, origin="", self_task=None):
+        created = {}
+
+        class Kb:
+            def get_task(self, conn, tid):
+                return self_task if tid == "t_parent" else None
+
+            def create_task(self, conn, **kw):
+                created.update(kw)
+                return "t_new"
+
+        @contextlib.contextmanager
+        def _board(board=None):
+            yield Kb(), "conn"
+
+        ns = {
+            "_kanban_handler": lambda name: (lambda fn: fn),
+            "_board": _board,
+            "_current_origin_session_id": lambda: origin,
+            "_with_report_format": lambda body: body,
+            "_fields": lambda task, names: {"status": "ready"},
+            "_CREATED_FIELDS": ("status",),
+            "_kanban_record_worker_child": lambda conn, tid: None,
+            "_kanban_inherit_worker_subs": lambda conn, tid: None,
+            "_maybe_auto_subscribe": lambda conn, tid: True,
+        }
+        exec(compile(self.source, "<tools>", "exec"), ns)
+        ns["_kanban_queue_fields"] = kp.queue_fields
+        env = {"HERMES_KANBAN_TASK": "t_parent"} if self_task is not None else {}
+        with mock.patch.dict("os.environ", env, clear=False), \
+                mock.patch.object(kp, "trusted_origin_session", return_value=origin):
+            if self_task is None:
+                import os
+
+                os.environ.pop("HERMES_KANBAN_TASK", None)
+            out = json.loads(ns["_handle_create"](args))
+        return out, created
+
+
 class ApplierTest(unittest.TestCase):
     def _tree(self, bodies=None):
         root = Path(tempfile.mkdtemp())
@@ -936,40 +1054,12 @@ class ApplierTest(unittest.TestCase):
         self.assertEqual(msg, QUEUED_LINE)
 
     def test_the_patched_handler_stamps_and_reports_the_queue(self):
-        tools = self._applied()[applier.TOOLS_RELATIVE].replace(
-            "from hermes_cli.kanban_priority import", "from kanban_priority import"
-        )
-        created = {}
-
-        class Kb:
-            def get_task(self, conn, tid):
-                return SimpleNamespace(session_id=None, priority=0) if tid else None
-
-            def create_task(self, conn, **kw):
-                created.update(kw)
-                return "t_new"
-
-        @contextlib.contextmanager
-        def _board(board=None):
-            yield Kb(), "conn"
-
-        ns = {
-            "_kanban_handler": lambda name: (lambda fn: fn),
-            "_board": _board,
-            "_current_origin_session_id": lambda: "k8s-evt-0a1b2c3d",
-            "_with_report_format": lambda body: body,
-            "_fields": lambda task, names: {"status": "ready"},
-            "_CREATED_FIELDS": ("status",),
-            "_kanban_record_worker_child": lambda conn, tid: None,
-            "_kanban_inherit_worker_subs": lambda conn, tid: None,
-            "_maybe_auto_subscribe": lambda conn, tid: True,
-        }
-        exec(compile(tools, "<tools>", "exec"), ns)
         with mock.patch.object(kp, "queue_fields", return_value={"queued": True, "queue_note": "n"}) as qf:
-            ns["_kanban_queue_fields"] = kp.queue_fields
-            out = json.loads(ns["_handle_create"]({"title": "Triage x", "priority": 500, "board": "b"}))
+            out, created = HandlerHarness(self).create(
+                {"title": "Triage x", "priority": 500, "board": "b"}, origin=EVENT_SESSION,
+            )
         self.assertEqual(created["priority"], kp.USER_PRIORITY - 1, "triage is clamped")
-        self.assertEqual(created["session_id"], "k8s-evt-0a1b2c3d")
+        self.assertEqual(created["session_id"], EVENT_SESSION)
         self.assertEqual(out["task_id"], "t_new")
         self.assertTrue(out["subscribed"])
         self.assertTrue(out["queued"])

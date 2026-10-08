@@ -14,8 +14,10 @@ before any is written:
 
     1. The ``priority=`` keyword of the ``kb.create_task(...)`` call in
        ``_handle_create``: the requested priority is passed through
-       ``stamp_priority`` with the card's ``session_id`` and the creating
-       worker's ``self_task``, both locals the handler computed two lines up.
+       ``stamp_priority`` with the creating worker's ``self_task``, a local the
+       handler computed a few lines up. Not the handler's ``session_id`` local:
+       that one prefers ``args["session_id"]``, which the model controls, so
+       ``stamp_priority`` reads the turn's session from the runtime itself.
        Located inside ``_handle_create`` and refused anywhere else, the way
        ``apply_kanban_report_format.py`` pins its ``body=`` keyword to the same
        call. It shares no text with that edit.
@@ -77,8 +79,7 @@ NOTIFIER_RELATIVE = "gateway/kanban_watchers_notifier.py"
 HANDLER = "_handle_create"
 PRIORITY_ANCHOR = 'priority=_opt_int(args.get("priority"), 0),'
 PRIORITY_PATCHED = (
-    'priority=_kanban_stamp_priority(_opt_int(args.get("priority"), 0), '
-    "session_id, self_task),"
+    'priority=_kanban_stamp_priority(_opt_int(args.get("priority"), 0), self_task),'
 )
 
 # --- 2. say when the new card is queued --------------------------------------

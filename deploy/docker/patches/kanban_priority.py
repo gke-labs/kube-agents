@@ -29,9 +29,13 @@ What
    no session at all. User cards get at least :data:`USER_PRIORITY`; background
    cards are clamped below it, so a model cannot promote triage by passing
    ``priority``. A dispatcher worker's child inherits its parent's priority, so
-   a user card's fan-out stays user-class. The classification fails toward the
-   user: a background producer with a prefix this list does not know about is
-   treated as a user, which costs triage speed and never a user's slot.
+   a user card's fan-out stays user-class and a triage card's stays
+   background. The class is read only from trusted context (the turn's own
+   session as the runtime bound it, or the worker's own card), never from the
+   ``session_id`` a model may pass to the tool. The classification fails
+   toward the user: a background producer with a prefix this list does not
+   know about is treated as a user, which costs triage speed and never a
+   user's slot.
 2. **One slot reserved for user cards** (:class:`ReservedSlot`). At a cap of 2
    or more, background cards may hold at most ``max_in_progress - 1`` slots
    host-wide; the ready loop skips the rest into
@@ -95,19 +99,47 @@ def is_user_priority(priority: object) -> bool:
         return False
 
 
-def stamp_priority(requested: object, session_id: object, parent: Any = None) -> int:
+_UNREAD = object()
+
+
+def trusted_origin_session() -> str:
+    """The creating turn's own session as the runtime bound it, or ``""``.
+
+    Upstream's ``tools.async_delegation._current_origin_session_id``: the
+    request-scoped ``HERMES_SESSION_CHAT_ID`` of an ``api_server`` turn, which
+    is where event triage (``k8s-evt-...``) and cron relays (``cron-...``) run.
+    It reads the gateway's ContextVars, not anything the model passed.
+    """
+    try:
+        from tools.async_delegation import _current_origin_session_id
+
+        return _current_origin_session_id() or ""
+    except Exception:  # noqa: BLE001 — no session context is not an error
+        return ""
+
+
+def stamp_priority(requested: object, parent: Any = None, origin_session: object = _UNREAD) -> int:
     """The priority ``kanban_create`` writes for a new card.
 
     ``requested`` is what the caller asked for (upstream's
-    ``_opt_int(args.get("priority"), 0)``), ``session_id`` the session the card
-    will carry, and ``parent`` the dispatcher-owned card creating it, if any.
+    ``_opt_int(args.get("priority"), 0)``) and ``parent`` the dispatcher-owned
+    card creating it, if any (the handler's ``self_task``). ``origin_session``
+    defaults to :func:`trusted_origin_session`; tests pass it.
 
-    * A child takes ``max(requested, parent.priority)``. Upstream does not
+    The class comes only from trusted context: the creating turn's own session
+    as the runtime bound it, and for a dispatcher worker its own card. The
+    ``session_id`` argument a model may pass to ``kanban_create`` is ignored
+    here, because a triage worker could otherwise name a user-looking session
+    and take the user slot. The card is background when any trusted source
+    says so: the origin session or the parent's session has a background
+    prefix, or the parent itself is below :data:`USER_PRIORITY`.
+
+    * A child starts from ``max(requested, parent.priority)``. Upstream does not
       inherit priority at all, so without this a user card's fan-out would
       drop back to background.
-    * A background card is clamped below :data:`USER_PRIORITY`, or below its
-      parent's priority if an operator promoted the parent past that from the
-      dashboard, so a model passing ``priority`` cannot promote triage.
+    * A background card is clamped below :data:`USER_PRIORITY`, so a model
+      passing ``priority`` cannot promote triage. An operator can still promote
+      a card from the dashboard, which edits the row directly.
     * Every other card is raised to at least :data:`USER_PRIORITY`.
 
     Never raises: a value it cannot read keeps upstream's.
@@ -117,12 +149,19 @@ def stamp_priority(requested: object, session_id: object, parent: Any = None) ->
     except (TypeError, ValueError):
         return requested if isinstance(requested, int) else 0
     try:
-        parent_priority = getattr(parent, "priority", None) if parent is not None else None
-        if parent_priority is not None:
-            base = max(base, int(parent_priority))
-        if is_background_session(session_id):
-            ceiling = max(USER_PRIORITY - 1, int(parent_priority or 0))
-            return min(base, ceiling)
+        if origin_session is _UNREAD:
+            origin_session = trusted_origin_session()
+        background = is_background_session(origin_session)
+        if parent is not None:
+            parent_priority = getattr(parent, "priority", None)
+            if is_background_session(getattr(parent, "session_id", None)):
+                background = True
+            if parent_priority is not None:
+                base = max(base, int(parent_priority))
+                if not is_user_priority(parent_priority):
+                    background = True
+        if background:
+            return min(base, USER_PRIORITY - 1)
         return max(base, USER_PRIORITY)
     except Exception as exc:  # noqa: BLE001 — never fail kanban_create
         logger.warning("kanban priority: stamping fell back to %r: %r", base, exc)

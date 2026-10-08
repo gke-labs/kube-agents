@@ -9,8 +9,8 @@ drives the real patched code:
      reaches, under the session contexts real turns carry: a chat user's card
      is stamped user-class, an event-triage card (``api_server``,
      ``k8s-evt-...``) and a cron relay card stay background, a model-supplied
-     priority cannot promote triage, and a dispatcher worker's child inherits
-     its parent's class.
+     priority or ``session_id`` cannot promote triage, and a dispatcher
+     worker's child inherits its parent's class.
   B. ``kanban_create``'s return says when the new card is queued, and says
      nothing when a slot is free.
   C. The notifier claims ``queued`` without waking anyone, formats it as the
@@ -128,6 +128,18 @@ check(
     f"priority={priority(promoted)}",
 )
 
+# The session_id a model passes is not trusted context: a triage turn naming a
+# user-looking session still files a background card.
+spoofed = tool_create(
+    title="Triage claiming a chat session", priority=500,
+    session_id="20261008_101500_ab12cd34",
+)["task_id"]
+check(
+    "a triage turn cannot pass itself off as a user with args.session_id",
+    priority(spoofed) == KP.USER_PRIORITY - 1,
+    f"priority={priority(spoofed)}",
+)
+
 session("api_server", "cron-platform-stall-watch-20261008")
 relay = tool_create(title="Report relay")["task_id"]
 check("a cron relay card is background", priority(relay) == 0, f"priority={priority(relay)}")
@@ -153,9 +165,11 @@ check(
 os.environ.pop("HERMES_KANBAN_TASK", None)
 K.claim_task(conn, triage)
 os.environ["HERMES_KANBAN_TASK"] = triage
-tchild = tool_create(title="Triage sub-step", priority=300)["task_id"]
+tchild = tool_create(
+    title="Triage sub-step", priority=300, session_id="20261008_101500_ab12cd34",
+)["task_id"]
 check(
-    "a triage card's fan-out stays background whatever it asks for",
+    "a triage card's fan-out stays background whatever priority or session it names",
     priority(tchild) < KP.USER_PRIORITY,
     f"priority={priority(tchild)}",
 )
