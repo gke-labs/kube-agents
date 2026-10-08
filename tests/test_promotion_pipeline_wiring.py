@@ -679,9 +679,40 @@ class AutopushDeployWiringTest(unittest.TestCase):
         self.assertEqual(on["workflow_run"].get("branches"), ["main"])
 
     def test_concurrency_group_locks_autopush_deploy_without_cancelling(self):
-        concurrency = self.doc.get("concurrency", {})
+        concurrency = self.jobs["deploy"].get("concurrency", {})
         self.assertEqual(concurrency.get("group"), "autopush-deploy")
         self.assertFalse(concurrency.get("cancel-in-progress"), "running deploys must not be cancelled mid-flight")
+
+    def test_each_environment_deploys_under_its_own_lock(self):
+        """A workflow-level group would hold autopush behind a slow autopush-next."""
+        self.assertNotIn("concurrency", self.doc)
+        concurrency = self.jobs["deploy-next"].get("concurrency", {})
+        self.assertEqual(concurrency.get("group"), "autopush-next-deploy")
+        self.assertFalse(concurrency.get("cancel-in-progress"))
+
+    def test_deploy_next_reconciles_autopush_next_at_the_same_candidate(self):
+        deploy = self.jobs["deploy-next"]
+        self.assertEqual(deploy["needs"], "resolve-candidate")
+        self.assertEqual(deploy["uses"].split()[0], self.jobs["deploy"]["uses"].split()[0])
+        self.assertEqual(deploy["with"]["github_environment"], "autopush-next")
+        self.assertEqual(deploy["with"]["mode"], "apply")
+        self.assertEqual(deploy["with"]["image_tag"], self.jobs["deploy"]["with"]["image_tag"])
+        self.assertEqual(deploy["with"]["lease_policy"], self.jobs["deploy"]["with"]["lease_policy"])
+        self.assertEqual(deploy["if"], "github.repository == 'gke-labs/kube-agents'")
+
+    def test_only_autopush_next_may_skip_while_unprovisioned(self):
+        self.assertIs(self.jobs["deploy-next"]["with"]["skip_unconfigured"], True)
+        self.assertNotIn("skip_unconfigured", self.jobs["deploy"]["with"])
+
+    def test_autopush_next_has_its_own_verify_job(self):
+        verify = self.jobs["verify-deploy-next"]
+        self.assertEqual(set(verify["needs"]), {"resolve-candidate", "deploy-next"})
+        step = next(s for s in verify["steps"] if "verify_deploy_result.sh" in s.get("run", ""))
+        self.assertEqual(step["env"]["TARGET_ENVIRONMENT"], "autopush-next")
+        self.assertEqual(step["env"]["DEPLOY_RESULT"], "${{ needs.deploy-next.outputs.result }}")
+        self.assertEqual(step["env"]["ALLOW_SKIPPED"], "true")
+        autopush = next(s for s in self.jobs["verify-deploy"]["steps"] if "verify_deploy_result.sh" in s.get("run", ""))
+        self.assertNotIn("ALLOW_SKIPPED", autopush["env"])
 
     def test_upstream_repository_guard_present(self):
         resolve = self.jobs["resolve-candidate"]

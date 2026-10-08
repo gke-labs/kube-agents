@@ -1,16 +1,16 @@
 # Reconciling the long-lived environments
 
 A maintainer runbook for the environments **kube-agents itself** runs its CI
-against — `autopush`, `staging`, `rc` and `nightly`. Nothing here is something a
-user configures on their own install. It covers how `autopush` and `staging` are
-kept in step with `terraform/examples/full-install`, what each one has to be
+against — `autopush`, `autopush-next`, `staging`, `rc` and `nightly`. Nothing
+here is something a user configures on their own install. It covers how the
+long-lived ones are kept in step with `terraform/examples/full-install`, what each one has to be
 configured with, and what to do when a drift report opens.
 [`scripts/release/README.md`](../scripts/release/README.md) documents the
 scripts these workflows run; [`ci-pool-projects.md`](ci-pool-projects.md) is the
 runbook for the presubmit's project pool.
 
-`autopush` and `staging` are long-lived: they are installed once and then kept
-running, and people live-test pull requests against them. `rc` and `nightly` are
+`autopush`, `autopush-next` and `staging` are long-lived: they are installed
+once and then kept running, and people live-test pull requests against them. `rc` and `nightly` are
 the opposite — every pipeline run destroys them and builds them again from
 `terraform/examples/full-install`, so they always run today's composition.
 
@@ -34,7 +34,9 @@ no lease.
 One issue per environment, edited in place while the drift lasts and closed
 automatically by the first clean plan. A plan that fails to run leaves whatever
 is open exactly as it is — a failure is not evidence either way, and the red job
-is the signal.
+is the signal. `autopush-next` is the exception while it is being provisioned:
+until its GitHub environment exists with a `GCP_PROJECT_ID`, its plan posts a
+notice and is skipped rather than failing.
 
 The plan pins no image tag. It holds the tag at whatever the last apply
 recorded, read out of Terraform state (`image_tag: ""`), so the daily report
@@ -55,6 +57,7 @@ Long-lived environments are reconciled and deployed atomically using `./upgrade.
 
 - **staging** is deployed by `Staging: Deploy` (`staging-deploy.yml`), which triggers when the staging promotion pipeline pushes a `staging_*` tag. It pushes that tag only after two gates: its full E2E test matrix passes on a fresh nightly cluster, and the release-candidate eval returns GREEN on the `evalcand_*` tag it pushes first. The workflow reconciles the Terraform composition, Helm release, and container images together atomically from that validated candidate commit.
 - **autopush** is deployed by `Autopush: Deploy` (`autopush-deploy.yml`), which triggers whenever candidate container images are successfully published to GHCR from `main`.
+- **autopush-next** is deployed by the same workflow, at the same commit, from its own GitHub environment and GCP project, which set `PLATFORM_AGENT_MODE=next`. It has its own deploy job and concurrency group, and its own cluster and so its own lease, so a failure or a held lease on one does not hold up the other. Until its GitHub environment exists with a `GCP_PROJECT_ID`, its deploy posts a notice and reports `skipped`. It runs `next` only once the chart and installer render `spec.mode`; until then it installs `today`, like `autopush`.
 
 A deploy takes the live-test lease before it applies anything (see
 [`designs/live-test-lease.md`](designs/live-test-lease.md)).
@@ -70,7 +73,7 @@ documents it.
 ## The rebuild button
 
 When an in-place apply cannot converge, `Shared: Deploy Environment` takes
-`autopush` and `staging` as well as `rc` and `nightly`. It **destroys the
+the long-lived environments as well as `rc` and `nightly`. It **destroys the
 cluster** and builds it again, so it asks you to type the environment's name
 into `confirm_destroy`, and it refuses unless the live-test lease reads back
 as free.
@@ -195,7 +198,7 @@ path it changes nothing on the cluster, and `install.env.example` has no entry f
 it is a release-path key until the installer reads it. A rebuild through
 `deploy-environment.yml` takes the mode as its `mode` input instead and applies `next`
 to the `PlatformAgent` itself after the install, on `rc` and `nightly` only. Both that
-workflow and `provision_environment.sh` refuse `next` on `autopush` and `staging`:
+workflow and `provision_environment.sh` refuse `next` on `autopush`, `autopush-next` and `staging`:
 there the patched mode would outlive the run, since the chart renders no `spec.mode`
 and nothing this page describes (reconcile, upgrade, drift report) reads it back, and
 Google Chat would stay on the A2A gateway until a `today` rebuild.

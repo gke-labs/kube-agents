@@ -6,8 +6,8 @@ name: "Shared: Reconcile Environment"
 # This is the in-place half of #1117. deploy-environment.yml is the other half:
 # it destroys the environment and builds it again, which is right for `rc` and
 # `nightly` — they exist to prove an install works from nothing — and wrong for
-# `autopush` and `staging`, which people live-test against and which hold state
-# nobody wants rebuilt nightly.
+# `autopush`, `autopush-next` and `staging`, which people live-test against and
+# which hold state nobody wants rebuilt nightly.
 #
 # In-place is also the only path that exercises what a real user upgrading an
 # existing install goes through. Nothing else in CI covers it.
@@ -36,10 +36,21 @@ on:
         required: false
         default: "defer"
         type: string
+      # For an environment that may not be provisioned yet: when the GitHub
+      # environment does not exist, or exists without GCP_PROJECT_ID, the run
+      # posts a notice and reports `skipped` instead of failing on the strict
+      # render. Off by default, because on an environment that should exist a
+      # missing one is the failure. A caller drops it once the environment is
+      # provisioned, so that clearing its variables reds the run again.
+      skip_unconfigured:
+        description: "Skip, rather than fail, when the GitHub environment or its GCP_PROJECT_ID is missing"
+        required: false
+        default: false
+        type: boolean
     outputs:
       result:
-        description: "planned, applied, deferred or failed"
-        value: ${{ jobs.reconcile.outputs.result }}
+        description: "planned, applied, deferred, failed, or skipped (skip_unconfigured only)"
+        value: ${{ jobs.reconcile.outputs.result || jobs.preflight.outputs.result }}
       drift:
         description: "true, false or unknown — only meaningful for mode: plan"
         value: ${{ jobs.reconcile.outputs.drift }}
@@ -52,6 +63,7 @@ on:
         type: choice
         options:
           - "autopush"
+          - "autopush-next"
           - "staging"
           - "rc"
           - "nightly"
@@ -79,11 +91,63 @@ on:
           - "ignore"
 
 jobs:
+  # Asks whether the GitHub environment exists before any job binds it, because
+  # binding a missing environment creates it, empty and unprotected. Only under
+  # skip_unconfigured; otherwise it answers yes without asking, and the bound
+  # job below fails as it always did.
+  preflight:
+    name: find ${{ inputs.github_environment }}
+    if: github.repository == 'gke-labs/kube-agents'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      # GET /repos/{repo}/environments/{name}.
+      actions: read
+    outputs:
+      exists: ${{ steps.exists.outputs.exists }}
+      result: ${{ steps.exists.outputs.result }}
+    steps:
+      - name: Check the GitHub environment exists
+        id: exists
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          TARGET: ${{ inputs.github_environment }}
+          SKIP_UNCONFIGURED: ${{ inputs.skip_unconfigured }}
+        run: |
+          set -euo pipefail
+          if [ "${SKIP_UNCONFIGURED}" != "true" ]; then
+            echo "exists=true" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+          # 404 is the one answer that means "not provisioned yet". Anything
+          # else that is not 200 is an API failure, and skipping on it would
+          # report an unreachable environment as an absent one.
+          code="$(curl -sS -o /dev/null -w '%{http_code}' \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            "${GITHUB_API_URL}/repos/${REPOSITORY}/environments/${TARGET}")"
+          case "${code}" in
+            200)
+              echo "exists=true" >> "${GITHUB_OUTPUT}"
+              ;;
+            404)
+              echo "::notice title=${TARGET} is not provisioned::The GitHub environment '${TARGET}' does not exist yet, so there is nothing to reconcile. Skipped; a repository admin creates it."
+              echo "exists=false" >> "${GITHUB_OUTPUT}"
+              echo "result=skipped" >> "${GITHUB_OUTPUT}"
+              ;;
+            *)
+              echo "::error title=Could not look up ${TARGET}::GET environments/${TARGET} returned HTTP ${code}, so whether the environment exists is unknown."
+              exit 1
+              ;;
+          esac
+
   reconcile:
     name: ${{ inputs.mode }} ${{ inputs.github_environment }}
+    needs: preflight
     # A fork inherits workflow_dispatch but none of the credentials, and this
     # one authenticates to GCP. Repeated on the job rather than left to cascade.
-    if: github.repository == 'gke-labs/kube-agents'
+    if: github.repository == 'gke-labs/kube-agents' && needs.preflight.outputs.exists == 'true'
     runs-on: ubuntu-latest
     environment: ${{ inputs.github_environment }}
     # Shared with deploy-environment.yml's group for the same environment, so a
@@ -102,14 +166,32 @@ jobs:
       # `gh run list`, for the in-flight redeploy check.
       actions: read
     outputs:
-      result: ${{ steps.reconcile.outputs.result }}
+      result: ${{ steps.configured.outputs.skip == 'true' && 'skipped' || steps.reconcile.outputs.result }}
       drift: ${{ steps.reconcile.outputs.drift }}
       plan_log: ${{ steps.reconcile.outputs.plan_log }}
     env:
       CLOUDSDK_PYTHON: "/usr/bin/python3"
 
     steps:
+      # The other half of skip_unconfigured: an environment that exists but
+      # has no GCP_PROJECT_ID has not been pointed at a project yet. Every
+      # step after this one is gated on it.
+      - name: Check the environment is configured
+        id: configured
+        env:
+          TARGET: ${{ inputs.github_environment }}
+          GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+          SKIP_UNCONFIGURED: ${{ inputs.skip_unconfigured }}
+        run: |
+          if [ "${SKIP_UNCONFIGURED}" = "true" ] && [ -z "${GCP_PROJECT_ID}" ]; then
+            echo "::notice title=${TARGET} is not configured::The GitHub environment '${TARGET}' has no GCP_PROJECT_ID variable, so it is not pointed at a project yet. Skipped."
+            echo "skip=true" >> "${GITHUB_OUTPUT}"
+          else
+            echo "skip=false" >> "${GITHUB_OUTPUT}"
+          fi
+
       - name: Checkout repository
+        if: steps.configured.outputs.skip != 'true'
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # The revision being reconciled TO, not the one the caller happens to
@@ -134,12 +216,14 @@ jobs:
           persist-credentials: false
 
       - name: Authenticate to GCP via Workload Identity Federation (WIF)
+        if: steps.configured.outputs.skip != 'true'
         uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
         with:
           workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
           service_account: ${{ vars.GCP_SERVICE_ACCOUNT }}
 
       - name: Set up Google Cloud SDK
+        if: steps.configured.outputs.skip != 'true'
         uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3.0.1
         with:
           version: "579.0.0"
@@ -150,6 +234,7 @@ jobs:
       # it. Here it matters twice over: `plan -detailed-exitcode` reports drift
       # through its exit code, and the wrapper does not preserve one.
       - name: Set up Terraform
+        if: steps.configured.outputs.skip != 'true'
         uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
         with:
           terraform_version: "1.15.8"
@@ -157,6 +242,7 @@ jobs:
 
       - name: Reconcile
         id: reconcile
+        if: steps.configured.outputs.skip != 'true'
         env:
           CLOUDSDK_CORE_DISABLE_PROMPTS: "1"
           # Configured in GitHub Environment Variables (vars.KUBE_AGENTS_KUBECTL_TIMEOUT).

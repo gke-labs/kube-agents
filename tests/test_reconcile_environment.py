@@ -32,7 +32,7 @@ _TF_VARIABLES = _REPO_ROOT / "terraform" / "examples" / "full-install" / "variab
 _RECONCILE_SH = _REPO_ROOT / "scripts" / "release" / "reconcile_environment.sh"
 _UPGRADE_SH = _REPO_ROOT / "upgrade.sh"
 
-_LONG_LIVED = ("autopush", "staging")
+_LONG_LIVED = ("autopush", "autopush-next", "staging")
 
 
 def _executable_lines(chunk):
@@ -362,6 +362,40 @@ class ReconcileWorkflowTest(unittest.TestCase):
         """The in-flight redeploy check is a `gh run list`."""
         self.assertEqual(self.job["permissions"].get("actions"), "read")
 
+    def test_skip_unconfigured_is_off_unless_asked_for(self):
+        """On an environment that should exist, a missing one is the failure."""
+        call = self.doc[True]["workflow_call"]["inputs"]["skip_unconfigured"]
+        self.assertIs(call["default"], False)
+        self.assertEqual(call["type"], "boolean")
+
+    def test_a_missing_environment_is_never_bound(self):
+        """Binding a GitHub environment that does not exist creates it.
+
+        So the existence check runs in a job with no `environment:`, and the
+        bound job only runs once it has answered yes.
+        """
+        preflight = self.doc["jobs"]["preflight"]
+        self.assertNotIn("environment", preflight)
+        self.assertIn("github.repository == 'gke-labs/kube-agents'", preflight["if"])
+        self.assertEqual(self.job["needs"], "preflight")
+        self.assertIn("needs.preflight.outputs.exists == 'true'", self.job["if"])
+
+    def test_every_step_after_the_configuration_check_is_gated_on_it(self):
+        steps = self.job["steps"]
+        self.assertEqual(steps[0]["id"], "configured")
+        self.assertEqual(steps[0]["env"]["GCP_PROJECT_ID"], "${{ vars.GCP_PROJECT_ID }}")
+        for step in steps[1:]:
+            with self.subTest(step=step.get("name")):
+                self.assertIn("steps.", step.get("if", ""))
+                if "steps.reconcile.outputs.plan_log" not in step["if"]:
+                    self.assertEqual(step["if"], "steps.configured.outputs.skip != 'true'")
+
+    def test_a_skip_is_reported_as_skipped(self):
+        outputs = self.doc[True]["workflow_call"]["outputs"]
+        self.assertEqual(outputs["result"]["value"],
+                         "${{ jobs.reconcile.outputs.result || jobs.preflight.outputs.result }}")
+        self.assertIn("'skipped'", self.job["outputs"]["result"])
+
     def test_every_variable_the_renderer_reads_is_passed_through(self):
         """The renderer reaches for the environment, never for `vars.` itself.
 
@@ -395,13 +429,23 @@ class DriftWorkflowTest(unittest.TestCase):
         """Read-only is what lets it run on a schedule against a shared install."""
         self.assertEqual(self.doc["jobs"]["plan"]["with"]["mode"], "plan")
 
-    def test_it_covers_both_long_lived_environments(self):
+    def test_it_covers_every_long_lived_environment(self):
         """Reporting on autopush alone leaves staging exactly as stale."""
         matrix = self.doc["jobs"]["plan"]["strategy"]["matrix"]["environment"]
         self.assertEqual(sorted(matrix), sorted(_LONG_LIVED))
 
     def test_a_failing_environment_does_not_cancel_the_other(self):
         self.assertIs(self.doc["jobs"]["plan"]["strategy"]["fail-fast"], False)
+
+    def test_the_report_covers_what_the_plan_covers(self):
+        plan = self.doc["jobs"]["plan"]["strategy"]["matrix"]["environment"]
+        report = self.doc["jobs"]["report"]["strategy"]["matrix"]["environment"]
+        self.assertEqual(sorted(report), sorted(plan))
+
+    def test_only_autopush_next_may_skip_while_unprovisioned(self):
+        """A missing autopush or staging is a failure, not something to skip."""
+        self.assertEqual(self.doc["jobs"]["plan"]["with"]["skip_unconfigured"],
+                         "${{ matrix.environment == 'autopush-next' }}")
 
     def test_it_pins_no_image_tag(self):
         """Otherwise the report conflates image lag with infrastructure drift."""

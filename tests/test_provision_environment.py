@@ -1258,7 +1258,7 @@ class DeployEnvironmentCarriesTheInstallSettingsTest(unittest.TestCase):
         workflow = yaml.safe_load(self._WORKFLOW.read_text())
         dispatch = workflow[True]["workflow_dispatch"]
         options = dispatch["inputs"]["github_environment"]["options"]
-        self.assertEqual(sorted(options), ["autopush", "nightly", "rc", "staging"])
+        self.assertEqual(sorted(options), ["autopush", "autopush-next", "nightly", "rc", "staging"])
 
         expression = None
         for job in workflow["jobs"].values():
@@ -1266,7 +1266,7 @@ class DeployEnvironmentCarriesTheInstallSettingsTest(unittest.TestCase):
                 if step.get("name") == self._STEP:
                     expression = step["env"]["LONG_LIVED_ENVIRONMENT"]
         self.assertIsNotNone(expression)
-        for env_name in ("autopush", "staging"):
+        for env_name in ("autopush", "autopush-next", "staging"):
             self.assertIn(
                 f"'{env_name}'",
                 expression,
