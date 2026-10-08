@@ -5,8 +5,9 @@ Run by ``deploy/docker/Dockerfile`` from ``/opt/hermes`` after ``apply_ssh_share
 The applier proves its anchors matched once; this imports the patched modules and proves they
 behave: a shared environment's ``cleanup()`` runs no ``ssh -O exit`` and ``close_master()`` does,
 a probe's ``cleanup()`` still closes its private master, the client argv carries the keep-alive
-pair and no ``-F`` (the command line is what outranks every config file), and the terminal result carries the hint
-only for an ssh exit 255 without the cwd marker. The two inserted statements are also checked with
+pair exactly once (the command line is what outranks every config file, and a second copy placed
+earlier would win) and no ``-F`` (which would drop the system config and the SendEnv drop-in with
+it), and the terminal result carries the hint only for an ssh exit 255 without the cwd marker. The two inserted statements are also checked with
 ``patchlib.unbound`` for ``probe_only``, ``env_type`` and ``result`` (``returncode`` and
 ``failure_hint`` are pinned by the anchor line itself): the ``__init__`` mark is never executed here
 (the instances are built with ``__new__``), so an upstream rename of ``probe_only`` would otherwise
@@ -128,9 +129,12 @@ def check_ssh(ssh) -> None:
         e.key_path = ""
         argv = list(e._build_ssh_command())
         for opt in ("ServerAliveInterval=15", "ServerAliveCountMax=3"):
-            if argv.count(opt) != 1 or argv[argv.index(opt) - 1] != "-o":
-                fail(f"the client argv carries no `-o {opt}`")
-        if "-F" in argv:
+            name = opt.split("=")[0] + "="
+            copies = [a for a in argv if a.startswith(name)]
+            if copies != [opt] or argv[argv.index(opt) - 1] != "-o":
+                fail(f"the client argv carries no `-o {opt}`" if opt not in copies
+                     else f"the client argv carries {name} {len(copies)} times ({', '.join(copies)}); an earlier copy wins")
+        if any(a == "-F" or a.startswith("-F") for a in argv):
             fail("the client argv carries -F, which would drop the system ssh config")
 
 
@@ -178,7 +182,7 @@ def main() -> int:
         for msg in FAILURES:
             print(f"verify_ssh_shared_master: {msg}", file=sys.stderr)
         return 1
-    print("verify_ssh_shared_master: ok (cleanup leaves the shared master; close_master and the 255 hint behave)")
+    print("verify_ssh_shared_master: ok (cleanup leaves the shared master; close_master, the keep-alive argv and the 255 hint behave)")
     return 0
 
 

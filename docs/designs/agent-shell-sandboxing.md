@@ -332,8 +332,8 @@ the agent image patches it
 sync-back and leaves the shared master alone, so an exiting process no longer
 cuts a sibling's command; `ControlPersist=300` reaps the master once nothing has
 used it for five minutes. The same patch puts `ServerAliveInterval 15` and
-`ServerAliveCountMax 3` on the client's command line, where no config file or
-Hermes default can shadow them: a master whose peer died without a FIN or RST
+`ServerAliveCountMax 3` on the client's command line, where no config file, and
+no upstream option placed after them, can shadow them: a master whose peer died without a FIN or RST
 (an evicted sandbox pod) used to be cleared by the next process exit and is now
 dropped after three missed replies, about 60 s, and the next command opens a
 fresh master. The pair also caps how long a multiplexed command rides out a

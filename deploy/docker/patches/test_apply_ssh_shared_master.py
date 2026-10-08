@@ -17,7 +17,8 @@ from apply_ssh_shared_master import (
     apply,
 )
 
-# tools/environments/ssh.py at v2026.9.14: the three anchored regions, nothing else of the class.
+# tools/environments/ssh.py at v2026.9.14: the three anchored regions, plus the two helpers
+# _build_ssh_command needs so the verifier can call it; nothing else of the class.
 SSH_STUB = (
     "import contextlib\n"
     "import hashlib\n"
@@ -164,6 +165,32 @@ class VerifierTest(unittest.TestCase):
         rc, failures = run_verifier(root)
         self.assertEqual(rc, 1)
         self.assertIn("carries no `-o ServerAliveInterval=15`", "\n".join(failures))
+
+    def test_an_argv_without_the_count_fails(self):
+        root = stage()
+        apply(root)
+        path = root / SSH_RELATIVE
+        path.write_text(path.read_text().replace(', "-o", "ServerAliveCountMax=3"', ""))
+        rc, failures = run_verifier(root)
+        self.assertEqual(rc, 1)
+        self.assertIn("carries no `-o ServerAliveCountMax=3`", "\n".join(failures))
+
+    def test_an_earlier_copy_of_the_interval_fails(self):
+        # An upstream `-o ServerAliveInterval=N` placed before the anchor is earlier in argv and
+        # wins under first-value-wins, so the gate refuses any second copy whatever its value.
+        root = stage(ssh=SSH_STUB.replace(
+            '        cmd = ["ssh"]\n', '        cmd = ["ssh", "-o", "ServerAliveInterval=5"]\n'))
+        apply(root)
+        rc, failures = run_verifier(root)
+        self.assertEqual(rc, 1)
+        self.assertIn("carries ServerAliveInterval= 2 times (ServerAliveInterval=5, ServerAliveInterval=15)", "\n".join(failures))
+
+    def test_a_glued_dash_f_fails(self):
+        root = stage(ssh=SSH_STUB.replace('        cmd = ["ssh"]\n', '        cmd = ["ssh", "-F/dev/null"]\n'))
+        apply(root)
+        rc, failures = run_verifier(root)
+        self.assertEqual(rc, 1)
+        self.assertIn("carries -F", "\n".join(failures))
 
     def test_a_renamed_probe_only_parameter_fails_the_gate(self):
         # The applier's __init__ anchor is the _socket_id line, which an upstream rename of

@@ -22,8 +22,9 @@ Four anchored edits in two files:
 - ``ssh.py``: ``_build_ssh_command()`` adds ``ServerAliveInterval=15`` and ``ServerAliveCountMax=3``.
   The process exit used to be what cleared a master whose peer died without a FIN or RST (an
   evicted sandbox pod); now three missed replies, about 60 s, drop it and the next command opens
-  a fresh master. On the command line because that outranks every config file, so neither a
-  Hermes bump nor a file under the runtime home can shadow it. Same pair as
+  a fresh master. On the command line because that outranks every config file, so no file under
+  the runtime home, and no upstream option placed after it, can shadow it; the verifier fails on a
+  second copy of either option, whatever its value. Same pair as
   ``agents/platform/scripts/sandbox_exec.py`` and ``deploy/shared/sandbox_mirror.py``; it also
   caps how long a multiplexed command rides out a silent sandbox, where the sandbox's sshd allows
   the client five minutes the other way.
