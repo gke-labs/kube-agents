@@ -92,7 +92,8 @@ type relayState struct {
 	// ones still waiting behind it count as not run. At the terminal
 	// (postSteerShortfall), steersSent - answered never reached a live run,
 	// and ended plus queued - turnsStarted never ran. Cache like the rest: a
-	// gateway restart forgets them, and the terminal then says nothing.
+	// gateway restart forgets them and the follow-ups sent, so that terminal
+	// posts no never-answered line and counts only the notices after it.
 	answered     map[string]bool
 	queued       map[string]bool
 	ended        map[string]bool

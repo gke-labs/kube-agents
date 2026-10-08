@@ -185,14 +185,16 @@ session-routed conversation, that the worker picks it up at its next turn bounda
 if the task is still running; on a fixed-routed one, "got it, I'll take that next".
 The executor's notice on the stream corrects it when the follow-up was not taken
 (the task's follow-up limit reached, which the platform executor counts per task, or the
-task already ending), and at the task's terminal the gateway says so
-for a follow-up the executor never answered or never ran, and in one line for those it
-refused because it could not continue the session. The never-answered line posts only
-once the gateway has heard a steer notice from that addressee since it started: an
-executor that predates the notices answers none, and every follow-up would read as
-missed. Those counts are the relay's
-cache, so a gateway restart in between loses them and that terminal says nothing about
-the follow-ups. Each earlier turn's answer posts as it completes; the result is the
+task already ending), and at the task's terminal the gateway says so, with a count,
+for the follow-ups the executor never answered or never ran, and in one line for those it
+refused because it cannot continue a session (the platform executor runs follow-ups on its
+`api` executor only; its `cli` executor refuses each one `no-resume`). The never-answered
+line posts only once the gateway has heard a steer notice from that addressee since it
+started: an executor that predates the notices answers none, and every follow-up would read
+as missed. Those counts are the relay's cache. A gateway restart in between forgets the
+follow-ups it sent and the notices before it, so that terminal never posts the
+never-answered line, and its not-run and no-resume lines count only the notices that arrived
+after the restart. Each earlier turn's answer posts as it completes; the result is the
 last turn's answer and the only deliverable a program behind a door receives. A steer into a delegated
 child is checked against the target's list first (rule `delegation.child-steer`);
 refused, it is not published, its author is not recorded, and the room is told the
@@ -337,7 +339,7 @@ so the room reads "delegated to platform" first and the refusal after it; the au
 the rule, the backend, and the hashed subject that failed it. A steer into the running child is
 checked the same way before it is recorded or published (`delegation.child-steer`, or
 `delegation.door-unlisted` for a door the target does not list): the child runs on `platform`'s
-executor, which acts on a steer as a further turn, so an author the target's list refuses is
+executor, which acts on a steer as a further turn (on its `api` executor), so an author the target's list refuses is
 refused here, with the same target-only notice and an audit line, and nothing reaches the child.
 
 **The child** carries the platform agent's own `in` subject, the parent's `correlationId`, and the
@@ -368,7 +370,8 @@ two do not nest. When the session delegates, its turn completes with a reply tha
 thread as it does for any task, and the child's terminal wakes the session for one more turn
 with the child's result as its input, so the session can synthesize or follow up. A follow-up
 the human sends while the child runs steers the child, through the gateway, as follow-ups do
-today: the platform executor queues each one and answers it after the current turn, and
+today: the platform executor queues each one and answers it after the current turn (on its
+`api` executor; the `cli` executor refuses it `no-resume`), and
 the gateway checks the steer's author against the target's list first, as it checked the
 delegation's. A session pod
 is therefore busy for seconds per turn, not for the life of the work it delegated, which is also

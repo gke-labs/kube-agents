@@ -365,10 +365,13 @@ Tool calls from either can land in the wrong task's trace. And when Hermes compr
 session it continues it under a new session id, which the hook reports and the trace's key does
 not match, so the trace stops for that conversation while the answers keep arriving.
 
-**`cli`: a subprocess per turn.** `hermes -p <BRIDGE_PROFILE> chat -Q --query=<prompt>`, a fresh
-session for every task, with no memory of the thread's earlier tasks. Within one task, each
-follow-up turn is another subprocess that resumes the task's session (`--resume`). The rest of
-this page describes it where the two differ.
+**`cli`: a subprocess per task.** `hermes -p <BRIDGE_PROFILE> chat -Q --query=<prompt>`, a fresh
+session for every task, with no memory of the thread's earlier tasks. The prompt is one
+`--query=` token, so a message that starts with `-` stays the query rather than reading as an
+option, with any NUL byte dropped, since no argument can carry one. It cannot continue a
+session, so a follow-up to one of its tasks is refused `no-resume` when it arrives: follow-ups run
+on the `api` executor only ("Steering" below). The rest of this page describes it where the two
+differ.
 
 ## Lifecycle, steering, cancel
 
@@ -376,13 +379,12 @@ Per task: `submitted` on accept (before the consumer ack, so a bridge death befo
 ack just redelivers), `working` when the subprocess spawns, the persona's tool calls as
 an `activity` artifact and a heartbeat as a `progress` artifact while it runs ("Activity"
 below), the stdout as a `result` artifact (chunked if large), one terminal
-`status-update` with `final: true`. When follow-ups ran as further turns ("Steering" below), each
-earlier turn's stdout is a `turn` artifact of its own (`artifact-<taskId>-turn-<N>`), published
-just before the next turn starts, and the `result` is the last turn's stdout. A nonzero
-exit is terminal `failed` with the evidence in the status message: `reason: hermes-exited-nonzero -
-exit status N; session: <id>; stdout tail: …; stderr tail: …`, with `; turn: N` after the
-session when a follow-up turn (N ≥ 2) is the one that failed; the earlier turns' answers have
-already gone out as `turn` artifacts. Both tails are bounded (2 KiB each),
+`status-update` with `final: true`. On the `api` executor, when follow-ups ran as further turns
+("Steering" below), each earlier turn's answer is a `turn` artifact of its own
+(`artifact-<taskId>-turn-<N>`), published just before the next turn starts, and the `result` is
+the last turn's answer. A nonzero exit is terminal `failed` with the evidence in the status
+message: `reason: hermes-exited-nonzero - exit status N; session: <id>; stdout tail: …; stderr
+tail: …`. Both tails are bounded (2 KiB each),
 and `session:` carries the id when `hermes chat -Q` printed its `session_id:` line on stderr (it
 is the last thing the CLI writes before exiting), so the transcript under the profile's session
 store can be found from the terminal alone. Exit 75 is Hermes's `EX_TEMPFAIL` for a turn that
@@ -403,40 +405,34 @@ constructible. The component that does NOT get this for free is the worker adapt
 terminal its own predecessor's supervisor declared. Anything on `…in` for a task with a
 terminal event is acked with a warning and nothing else.
 
-**Steering:** a follow-up message to a running task is queued, not refused. The bridge answers
-each one with a non-final status carrying the task's current state (`submitted` while queued or
-waiting for the session, `working` after) and a `steerNotice` data part: `queued`, or `refused`
-with `queue-full` (a task takes at most 16 follow-ups, counted per task: those already run count,
-not only those waiting), `task-ending` (the answer was already chosen), `no-text`, `capability`
-(the task's capability, carried on the follow-up, did not pass when checked on the worker before
-its turn: refused, or the verifier could not be reached; the one token covers both),
-`no-resume` (cli: the opening turn's stderr does not end in `session_id:` and an id of up to 128
-letters, digits, `_`, `.`, `:` and `-` that starts with a letter or digit, the profile's session
-store does not vouch for that id, or the command does not end in `-q`), or
-`task-ended` (the task ended first: cancel, failure, deadline, shutdown). When the current turn
-ends, queued follow-ups run in arrival order as further turns in the same Hermes session: `api`
-posts another turn with the same session headers, under the same session slot, and the
-`Idempotency-Key` `<taskId>/<envelopeId>` (the opening turn's is `<taskId>`), so a follow-up
-never replays the opening answer; `cli` runs
-`hermes -p <profile> chat -Q --resume <session_id> --query=<text>`. The id is read off the opening
-turn's stderr, which the turn's tool subprocesses share, so a line one of them writes after the
-CLI's own could name another conversation's session. Before the first follow-up runs, the bridge
-checks the id against the profile's session store with
-`hermes -p <profile> sessions export - --session-id <id>`, bounded at 15s under the task: the
-session must have begun at or after the opening turn was spawned (`started_at`), and its first user
-message must be the opening prompt as the argv carried it. A session that fails either check, or a
-read that fails or times out, refuses the follow-ups `no-resume`, logged with why. The id the store
-vouched for is the one every later follow-up resumes; a different id on a later turn's stderr is
-logged and not used. Every turn passes its text as one
-`--query=` token, the opening turn too, so a message that starts with `-` stays the query rather
-than reading as an option, and with any NUL byte dropped, since no argument can carry one. Each earlier turn's answer is
-published as a `turn` artifact as soon as the next turn is about to run; the last turn's answer
-is the `result`, then the one terminal. A failed follow-up turn names itself in the terminal
-(`; turn: N` after the session, on either executor). A follow-up does not change task state
-(payload spec assertion 12). A bridge that crashes with follow-ups queued loses them; the
-gateway's relay reports them as not run at the terminal, unless the gateway restarted too. The
-count is best-effort: a follow-up whose turn had started when the bridge crashed counts as run,
-though its answer never arrives.
+**Steering:** on the `api` executor a follow-up message to a running task is queued, not
+refused. Follow-ups run on the `api` executor only: the `cli` executor cannot continue a session.
+The bridge answers each follow-up with a non-final status carrying the task's current state
+(`submitted` while queued or waiting for the session, `working` after) and a `steerNotice` data
+part: `queued`, or `refused` with `no-resume` (the task runs on the `cli` executor, which can't
+continue a session; every follow-up to it is refused so when it arrives, and the notice's text says
+to send it again after the answer), `queue-full` (a task takes at most 16 follow-ups, counted per
+task: those already run count, not only those waiting), `task-ending` (the answer was already
+chosen), `no-text` (no text part holds anything but white space, U+001C-U+001F or NUL: Hermes's API
+server refuses a turn that Python's `str.strip()` empties, which strips U+001C-U+001F too, and a
+NUL alone asks nothing), `capability` (the task's capability, carried on the follow-up, did not pass
+when checked on the worker before its turn: refused, or the verifier could not be reached; the one
+token covers both), or `task-ended` (the task ended first: cancel, failure, deadline, shutdown).
+When the current turn ends, queued follow-ups run in arrival order as further turns in the same
+Hermes session: the bridge posts another turn with the same session headers, under the same session
+slot, and the `Idempotency-Key` `<taskId>/<envelopeId>` (the opening turn's is `<taskId>`), so a
+follow-up never replays the opening answer. A follow-up's text needs no length check of its own: the
+gateway's doors cap a text at 65,536 runes, the server's own cap on a message
+(`MAX_NORMALIZED_TEXT_LENGTH`, 65,536 characters), and the bus's 1 MiB message limit keeps the
+request far under the server's 10 MB body limit. Each earlier turn's answer is published as a
+`turn` artifact as soon as the next turn is about to run; the last turn's answer is the `result`,
+then the one terminal. A turn's answer the bridge holds between turns, while the next follow-up's
+capability is checked, is not lost to a shutdown: the worker ends the task with it as the `result`,
+and the queue is refused `task-ended`. A failed follow-up turn names itself in the terminal
+(`; turn: N` after the session). A follow-up does not change task state (payload spec assertion
+12). A bridge that crashes with follow-ups queued loses them; the gateway's relay reports them as
+not run at the terminal, unless the gateway restarted too. The count is best-effort: a follow-up
+whose turn had started when the bridge crashed counts as run, though its answer never arrives.
 Mid-turn steering through the runs API is gke-labs#2628.
 
 **Upgrade order for steering.** The gateway and the bridge do not roll together. The gateway's
@@ -451,20 +447,19 @@ rollback, move the sidecar tag back first, then the operator. The two skews look
   follow-up's answer. The answer to the original question never posts.
 - **New gateway, old bridge.** Noisy, but nothing is lost. The room gets "✏️ got it, I'll take
   that next", which is wrong, then the old bridge's "ℹ️ steering received but not absorbed …",
-  and the task's one answer. The gateway posts its "a follow-up arrived as the task finished"
+  and the task's one answer. The gateway posts its "N follow-up(s) arrived as the task finished"
   line only after it has heard a steer notice from that addressee since it started, and an old
   bridge sends none. That memory outlives the bridge, though: until the gateway restarts, a
   gateway that heard notices from that addressee before the rollback can still post one false
-  "follow-up arrived as the task finished" line at the end of a task that had a follow-up.
+  "follow-up(s) arrived as the task finished" line at the end of a task that had a follow-up.
 
 **Cancel:** SIGTERM to the subprocess's process group, SIGKILL after a grace period,
 then terminal `canceled` (`reason: canceled-by-request`). A task racing to completion may
 land `completed` first - both orders are legal and the terminal event wins. A per-task
 deadline (default 7200s, matching the profile's `activeDeadlineSeconds`), which covers every
 turn of the task, takes the same kill path and lands `failed` (`reason: deadline-exceeded - killed
-after …`, with `; turn: N` for a follow-up turn); no follow-up turn starts once it has passed, and
-a deadline found before a turn starts, with no child to kill, reads `reached after … before the
-next turn started` instead.
+after …`; on `api`, `request ended after …`, with `; turn: N` for a follow-up turn); no follow-up
+turn starts once it has passed.
 
 A cancel for a task still queued finalizes it `canceled` with `reason: canceled-before-start`
 and nothing is spawned, and the worker looks for one itself before it spawns. The durable
