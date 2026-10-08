@@ -1565,7 +1565,11 @@ class FleetTreeTest(unittest.TestCase):
         bystanders = {"README.md", "fixtures.json"}
         # -z, as the script's ls-tree: an unquoted name per entry, so a
         # non-ASCII or space-bearing input is read as the input it is.
-        tracked = subprocess.run(["git", "-C", str(reconcile.REPO_ROOT), "ls-files", "-z", "--", reconcile.FLEET_SUBDIR], check=True, capture_output=True, env=_scrubbed_git_env()).stdout.decode("utf-8", "surrogateescape").split("\0")
+        # The scrub nulls the config scopes git reads safe.directory from, and
+        # this is a read of the real checkout: assert its trust on the command
+        # line, which git honours as protected config (a checkout owned by
+        # another uid, a container or shared workspace, would otherwise refuse).
+        tracked = subprocess.run(["git", "-C", str(reconcile.REPO_ROOT), "-c", "safe.directory=%s" % reconcile.REPO_ROOT, "ls-files", "-z", "--", reconcile.FLEET_SUBDIR], check=True, capture_output=True, env=_scrubbed_git_env()).stdout.decode("utf-8", "surrogateescape").split("\0")
         tracked = [path for path in tracked if path]
         self.assertGreater(len(tracked), 5)
         strangers = [path for path in tracked if not reconcile.is_fleet_input(path) and path.rsplit("/", 1)[-1] not in bystanders]
