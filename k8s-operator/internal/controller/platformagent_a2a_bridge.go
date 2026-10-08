@@ -19,6 +19,7 @@ package controller
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"slices"
 	"strconv"
@@ -343,7 +344,7 @@ func buildA2ABridgeContainer(agent *agentv1alpha1.PlatformAgent, agentContainer 
 		EnvFrom:         agentContainer.EnvFrom,
 		VolumeMounts:    mounts,
 		SecurityContext: agentContainer.SecurityContext.DeepCopy(),
-		Resources:       a2aRenderedBridgeResources(),
+		Resources:       a2aRenderedBridgeResources(agentContainer.Resources),
 	}
 }
 
@@ -356,7 +357,7 @@ func buildA2ABridgeContainer(agent *agentv1alpha1.PlatformAgent, agentContainer 
 // decode and publish, and three at once about 113MiB. The limit gives ten at
 // once room where bursting is on. The cli executor runs
 // a one-shot hermes chat per task (about 430Mi each, up to BRIDGE_CONCURRENCY
-// of them) and needs A2A_BRIDGE_RESOURCES set; it doesn't fit these.
+// of them) and doesn't fit these (a2aRenderedBridgeResources).
 func a2aRenderedBridgeDefaultResources() corev1.ResourceRequirements {
 	return corev1.ResourceRequirements{
 		Requests: corev1.ResourceList{
@@ -370,29 +371,44 @@ func a2aRenderedBridgeDefaultResources() corev1.ResourceRequirements {
 	}
 }
 
-// a2aRenderedBridgeResources is the rendered bridge's resources: the
-// operator's A2A_BRIDGE_RESOURCES when it reads as a ResourceRequirements (no
-// unknown fields, not empty) with no request above its limit, else the
-// defaults. A value it can't use is
-// logged once and ignored, like a refused A2A_BRIDGE_EXECUTOR. Unlike before
-// gke-labs#2748, the agent container's resources are not copied: that doubled
-// the agent pod's requests and left next pods unschedulable on clusters sized
-// for today.
-func a2aRenderedBridgeResources() corev1.ResourceRequirements {
+// a2aRenderedBridgeResources is the rendered bridge's resources. The
+// operator's A2A_BRIDGE_RESOURCES wins when it reads as exactly one usable
+// ResourceRequirements (a2aBridgeResourcesRefusal); a value it can't use is
+// logged once and ignored. Otherwise it depends on the executor. Under api,
+// the default, the bridge gets a2aRenderedBridgeDefaultResources rather than a
+// copy of the agent container's, which doubled the agent pod's requests and
+// left next pods unschedulable on clusters sized for today (gke-labs#2748).
+// Under cli it keeps the copy it had before #2748: a cli bridge runs a
+// hermes chat per task, which the api defaults can't hold, so an install that
+// pinned cli before A2A_BRIDGE_RESOURCES existed upgrades with its bridge
+// unchanged. That case is logged once, pointing at the override.
+func a2aRenderedBridgeResources(agentResources corev1.ResourceRequirements) corev1.ResourceRequirements {
+	fallback := a2aRenderedBridgeDefaultResources()
+	if a2aRenderedBridgeExecutor() == a2aBridgeExecutorCLI {
+		fallback = *agentResources.DeepCopy()
+	}
 	raw := os.Getenv(a2aBridgeResourcesOperatorEnvVar)
 	if raw == "" {
-		return a2aRenderedBridgeDefaultResources()
+		if a2aRenderedBridgeExecutor() == a2aBridgeExecutorCLI {
+			a2aCLIBridgeWithoutResourcesLogged.Do(func() {
+				logf.Log.WithName("platformagent-controller").Info(
+					"The rendered bridge runs the cli executor with no " + a2aBridgeResourcesOperatorEnvVar + ", so it copies the agent container's resources. Set " + a2aBridgeResourcesOperatorEnvVar + " to size it: about 430Mi of memory per BRIDGE_CONCURRENCY worker, plus headroom.")
+			})
+		}
+		return fallback
 	}
-	// Strict: a misspelled key that decoded to nothing would otherwise
-	// render the bridge with no resources at all, not the defaults.
+	// Strict, and exactly one value: a misspelled key that decoded to nothing
+	// would render the bridge with no resources at all, and anything after
+	// the first value (a second object, a stray closer, text) would be
+	// dropped unread.
 	var r corev1.ResourceRequirements
 	dec := json.NewDecoder(strings.NewReader(raw))
 	dec.DisallowUnknownFields()
 	err := dec.Decode(&r)
-	if err == nil && dec.More() {
-		// One value only: Decode stops after the first, and a second object
-		// or stray text after it would otherwise be dropped unread.
-		err = fmt.Errorf("it has content after the first JSON value")
+	if err == nil {
+		if extra := dec.Decode(new(json.RawMessage)); extra != io.EOF {
+			err = fmt.Errorf("it has content after the first JSON value")
+		}
 	}
 	if err == nil {
 		err = a2aBridgeResourcesRefusal(r)
@@ -400,22 +416,26 @@ func a2aRenderedBridgeResources() corev1.ResourceRequirements {
 	if err != nil {
 		if _, seen := a2aRefusedBridgeResources.LoadOrStore(raw, true); !seen {
 			logf.Log.WithName("platformagent-controller").Info(
-				"Ignoring "+a2aBridgeResourcesOperatorEnvVar+": it is not a usable ResourceRequirements in JSON, so the rendered bridge gets the default resources",
+				"Ignoring "+a2aBridgeResourcesOperatorEnvVar+": it is not a usable ResourceRequirements in JSON, so the rendered bridge gets the resources it would get without it",
 				"value", raw, "error", err.Error())
 		}
-		return a2aRenderedBridgeDefaultResources()
+		return fallback
 	}
 	return r
 }
+
+// a2aCLIBridgeWithoutResourcesLogged logs the cli-without-override case once
+// per operator process.
+var a2aCLIBridgeWithoutResourcesLogged sync.Once
 
 // a2aBridgeResourcesRefusal says why the API server would refuse r on the
 // bridge container, or why it would leave the bridge unsized, or nil. The
 // rules are the credential proxy override's (ValidateCredentialProxyResources):
 // cpu, memory and ephemeral-storage only, no negative quantity, no zero limit,
 // no quantity past what an int64 carries, no claims, and no request above its
-// limit. The proxy's Autopilot warnings and floor are its own and not carried. A value the server refuses would
-// fail every agent Deployment update, so it is caught here and the defaults
-// stand instead.
+// limit. The proxy's Autopilot warnings and floor are its own and not
+// carried. A value the server refuses would fail every agent Deployment
+// update, so it is caught here and refused instead.
 func a2aBridgeResourcesRefusal(r corev1.ResourceRequirements) error {
 	if len(r.Requests) == 0 && len(r.Limits) == 0 {
 		return fmt.Errorf("it sets neither requests nor limits")

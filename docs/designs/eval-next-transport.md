@@ -410,7 +410,7 @@ The bridge was CI-only until the executor question was settled; the release work
 publishes it as `hermes-bridge`, on the same `FROM`-the-same-commit rule, and `images.json`
 carries it (the bridge doc's provenance paragraph says the same). `hack/ci-deploy.sh` under the flag
 hands that image to the operator as `A2A_BRIDGE_IMAGE`, with `A2A_BRIDGE_CONCURRENCY` set to
-`EVAL_TASK_PARALLELISM` and agent-sized `A2A_BRIDGE_RESOURCES` for the `cli` pin, through the chart's `operator.extraEnv`; the operator renders the bridge
+`EVAL_TASK_PARALLELISM`, through the chart's `operator.extraEnv`; the operator renders the bridge
 with the bus URL and the `bridge` user's password from its creds Secret as the bridge doc lists
 its env, and withholds it from the agent pod until the bus is provisioned (a bridge that starts
 before the bus exists crash-loops the agent's pod). The worker count is sized against the
@@ -426,7 +426,7 @@ value clamps to 1), computed from four constants the script copies from the oper
 pins against it. The mode patch is the only patch, so no later render re-measures the budget
 against the stream the Job created. The rendered bridge carries the agent container's own
 environment, mounts and security context, copied by the operator from the agent
-container it renders (its resources are its own: `api`-sized defaults, which the deploy replaces with agent-sized `A2A_BRIDGE_RESOURCES` while it pins `cli`, gke-labs/kube-agents#2748): the bridge's `cli` subprocess stands in for the `hermes chat -q` a kanban worker spawns
+container it renders (its resources are its own, sized for the `api` executor the lane runs, gke-labs/kube-agents#2748): the bridge's `cli` subprocess stands in for the `hermes chat -q` a kanban worker spawns
 inside the agent container, and that is the environment such a worker inherits; under the
 default `api` executor the same copy is what carries `API_SERVER_KEY` into the bridge, which is
 how the lane gets `api` without setting `A2A_BRIDGE_EXECUTOR`. The

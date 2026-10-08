@@ -488,7 +488,8 @@ func TestTheBridgeResourcesSettingOverridesTheDefaults(t *testing.T) {
 		`{"requests":{"cpu":"-1"}}`, `{"limits":{"foo":"1"}}`, `{"requests":{"example.com/gpu":"1"}}`,
 		`{"limits":{"memory":"0"}}`, `{"limits":{"memory":"1Gi"},"claims":[{"name":"x"}]}`,
 		`{"requests":{"cpu":"10E"}}`,
-		`{"requests":{"cpu":"500m"}}{"limits":{"memory":"5Gi"}}`, `{"requests":{"cpu":"500m"}} trailing`} {
+		`{"requests":{"cpu":"500m"}}{"limits":{"memory":"5Gi"}}`, `{"requests":{"cpu":"500m"}} trailing`,
+		`{"requests":{"cpu":"500m"}}}`, `{"requests":{"cpu":"500m"}}]`} {
 		t.Run(bad, func(t *testing.T) {
 			t.Setenv(a2aBridgeResourcesOperatorEnvVar, bad)
 			got := containersNamed(bridgeTestPod(provisionedAgent()), a2aBridgeContainerName)[0].Resources
@@ -499,5 +500,29 @@ func TestTheBridgeResourcesSettingOverridesTheDefaults(t *testing.T) {
 				t.Error("the unusable setting was not logged")
 			}
 		})
+	}
+}
+
+// A cli bridge runs a hermes chat per task, which the api defaults can't hold.
+// An install that pinned cli before A2A_BRIDGE_RESOURCES existed keeps the copy
+// of the agent container's resources it had, so the upgrade changes nothing;
+// so does one whose override can't be used. A usable override still wins.
+func TestACLIBridgeWithoutAnOverrideKeepsTheAgentsResources(t *testing.T) {
+	t.Setenv(a2aBridgeExecutorOperatorEnvVar, a2aBridgeExecutorCLI)
+	for name, value := range map[string]string{"unset": "", "unusable": `{"limits":{"foo":"1"}}`} {
+		t.Run(name, func(t *testing.T) {
+			t.Setenv(a2aBridgeResourcesOperatorEnvVar, value)
+			pod := bridgeTestPod(provisionedAgent())
+			b := containersNamed(pod, a2aBridgeContainerName)[0]
+			agentC := containersNamed(pod, "platform-agent")[0]
+			if !reflect.DeepEqual(b.Resources, agentC.Resources) {
+				t.Errorf("a cli bridge with the override %s got %+v, want the agent container's %+v", name, b.Resources, agentC.Resources)
+			}
+		})
+	}
+	t.Setenv(a2aBridgeResourcesOperatorEnvVar, `{"requests":{"memory":"2Gi"},"limits":{"memory":"5Gi"}}`)
+	b := containersNamed(bridgeTestPod(provisionedAgent()), a2aBridgeContainerName)[0]
+	if q := b.Resources.Limits[corev1.ResourceMemory]; q.String() != "5Gi" {
+		t.Errorf("a cli bridge with a usable override has a memory limit of %s, want the override's 5Gi", q.String())
 	}
 }
