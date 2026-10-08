@@ -135,6 +135,73 @@ class ResolveChatRouteTest(unittest.TestCase):
         self.assertEqual(self.resolve("api_server", ""), ("api_server", "", None))
 
 
+STATE_SCHEMA = """
+CREATE TABLE sessions (id TEXT PRIMARY KEY, parent_session_id TEXT, end_reason TEXT);
+"""
+
+
+def state_db(path, rows):
+    with sqlite3.connect(path) as conn:
+        conn.executescript(STATE_SCHEMA)
+        conn.executemany("INSERT INTO sessions (id, parent_session_id, end_reason) VALUES (?, ?, ?)", rows)
+    return str(path)
+
+
+class CompressedSessionTest(unittest.TestCase):
+    """A conversation's session renamed by compression still finds its route."""
+
+    ROUTE = {"conversation_route": {"platform": "slack", "conversation": "slack:dm/D1", "context_id": "ctx-1"}}
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.db = routing_db(self.tmp / "session_kv.db", {"a2a-ctx-1": self.ROUTE})
+        state_db(self.tmp / "state.db", [
+            ("a2a-ctx-1", None, "compression"),
+            ("20261008_1510_aa", "a2a-ctx-1", "compression"),
+            ("20261008_1530_bb", "20261008_1510_aa", None),
+            ("a2a-ctx-2", None, "branched"),
+            ("20261008_1600_cc", "a2a-ctx-2", None),
+        ])
+        env = mock.patch.dict("os.environ", {"HERMES_HOME": str(self.tmp)})
+        env.start()
+        self.addCleanup(env.stop)
+
+    def test_a_card_filed_after_two_compressions_reports_to_the_conversation(self):
+        self.assertEqual(
+            resolve_chat_route("api_server", "20261008_1530_bb", None, db_path=self.db),
+            ("slack", "a2a-ctx-1", "slack:dm/D1"),
+        )
+
+    def test_a_card_filed_in_the_conversation_session_itself(self):
+        # chat_id is the session holding the route: the stand-in reads the
+        # context id back from it, and a wake self-posts into it.
+        self.assertEqual(
+            resolve_chat_route("api_server", "a2a-ctx-1", None, db_path=self.db),
+            ("slack", "a2a-ctx-1", "slack:dm/D1"),
+        )
+
+    def test_a_route_without_its_context_is_not_used(self):
+        routing_db(self.tmp / "partial.db", {"a2a-ctx-9": {"conversation_route": {"platform": "slack", "conversation": "slack:dm/D9"}}})
+        self.assertEqual(
+            resolve_chat_route("api_server", "a2a-ctx-9", None, db_path=str(self.tmp / "partial.db")),
+            ("api_server", "a2a-ctx-9", None),
+        )
+
+    def test_a_parent_that_is_not_a_compression_is_not_followed(self):
+        routing_db(self.tmp / "other.db", {"a2a-ctx-2": self.ROUTE})
+        self.assertEqual(
+            resolve_chat_route("api_server", "20261008_1600_cc", None, db_path=str(self.tmp / "other.db")),
+            ("api_server", "20261008_1600_cc", None),
+        )
+
+    def test_no_store_means_no_walk(self):
+        with mock.patch.dict("os.environ", {"HERMES_HOME": str(self.tmp / "absent")}):
+            self.assertEqual(
+                resolve_chat_route("api_server", "20261008_1530_bb", None, db_path=self.db),
+                ("api_server", "20261008_1530_bb", None),
+            )
+
+
 class FailOpenTest(unittest.TestCase):
     """`kanban_tools` runs where none of this exists. It must not notice."""
 

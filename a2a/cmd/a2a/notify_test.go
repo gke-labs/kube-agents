@@ -302,3 +302,29 @@ func TestNotifyARefusedSubscribeSendsNothing(t *testing.T) {
 		t.Fatalf("the gateway received %q; a refused subscribe must not publish", msg.Data)
 	}
 }
+
+// --conversation and --context aim the request at a conversation: both go
+// out on the wire, and each without the other, or beside --thread, is refused
+// before anything is sent.
+func TestNotifyAimsAtAConversation(t *testing.T) {
+	s := startNotifyServer(t)
+	notifyEnv(t, s.ClientURL())
+	got, _ := answerNotify(t, s.ClientURL(), lib.NotifyReply{MessageID: "m", ThreadID: "gchat:spaces/A/threads/B"})
+	if err := run([]string{"notify", "--platform", "google_chat", "--conversation", "gchat:spaces/A/threads/B",
+		"--context", "ctx-1", "--", "3 nodes"}); err != nil {
+		t.Fatalf("notify: %v", err)
+	}
+	if req := <-got; req.Conversation != "gchat:spaces/A/threads/B" || req.ContextID != "ctx-1" || req.Thread != "" {
+		t.Fatalf("request = %+v", req)
+	}
+	for _, args := range [][]string{
+		{"--conversation", "gchat:spaces/A/threads/B"},
+		{"--context", "ctx-1"},
+		{"--conversation", "gchat:spaces/A/threads/B", "--context", "ctx-1", "--thread", "spaces/A/threads/B"},
+	} {
+		argv := append([]string{"notify", "--platform", "google_chat"}, append(args, "x")...)
+		if err := run(argv); err == nil || errors.Is(err, errNotifyRouteUnavailable) {
+			t.Errorf("%v: err = %v, want a usage refusal", args, err)
+		}
+	}
+}

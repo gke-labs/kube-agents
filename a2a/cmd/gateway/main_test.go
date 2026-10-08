@@ -438,3 +438,53 @@ func TestServeKeepsTheGatewayWhenTheMetricsListenerCannotStart(t *testing.T) {
 		})
 	}
 }
+
+type stubConversations struct{}
+
+func (stubConversations) ConversationContext(context.Context, string) (string, error) { return "", nil }
+func (stubConversations) Post(string, string) (string, error)                         { return "", nil }
+
+// The chat.notify route arms for a Google Chat or Slack backend with or without a home
+// channel, always with the gateway's conversations behind it (a kanban
+// card's report back to its conversation needs them, and with no home channel
+// they are all the route serves); a malformed home channel or another backend
+// arms nothing.
+func TestTheChatNotifyRouteArmsWithConversations(t *testing.T) {
+	gchat, err := gateway.NewGoogleChatAdapter("http://relay.invalid", "/nonexistent/token", slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	slackBackend, err := gateway.NewSlackAdapter("xoxb-stub", "xapp-stub", slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	conversations := func(gateway.Adapter) gateway.NotifyConversations { return stubConversations{} }
+	for _, tc := range []struct {
+		name    string
+		backend gateway.Adapter
+		home    string
+		armed   bool
+	}{
+		{"chat with a home channel", gchat, "spaces/AAAA", true},
+		{"chat with no home channel", gchat, "", true},
+		{"chat with a malformed home channel", gchat, "spaces/A/threads/B", false},
+		{"another backend", nil, "spaces/AAAA", false},
+		{"slack with a home channel", slackBackend, "C0HOME", true},
+		{"slack with no home channel", slackBackend, "", true},
+		{"slack with a malformed home channel", slackBackend, "#ops", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := &gateway.Config{GchatHomeChannel: tc.home}
+			if tc.backend == slackBackend {
+				cfg = &gateway.Config{SlackHomeChannel: tc.home}
+			}
+			n := chatNotifier(cfg, tc.backend, conversations, slog.Default())
+			if (n != nil) != tc.armed {
+				t.Fatalf("armed = %v, want %v", n != nil, tc.armed)
+			}
+			if n != nil && !n.ServesConversations() {
+				t.Fatal("the route armed without the gateway's conversations: every card report would be refused")
+			}
+		})
+	}
+}

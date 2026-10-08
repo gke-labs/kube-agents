@@ -37,10 +37,11 @@ import (
 //
 // The subprocess executor stays as a fallback (Config.Executor); what this
 // one does not do, by design of the stopgap it is: steer a running turn (the
-// fixed route keeps refusing steers), or bring a kanban card's completion
-// back to the thread (the API server has no push channel, so it never
-// reaches the A2A task; the subprocess loses it the same way). Both are
-// named in a2a/docs/hermes-bridge.md.
+// fixed route keeps refusing steers). A kanban card's completion never
+// reaches the A2A task (the API server has no push channel); it goes back to
+// the conversation through the gateway's chat.notify route instead, on the
+// route this executor records before each turn (route.go). Both are named in
+// a2a/docs/hermes-bridge.md.
 const (
 	// ExecutorAPI runs a task as a turn in the conversation's Hermes session
 	// through the pod's API server. The daemon's default.
@@ -298,6 +299,16 @@ func (b *Bridge) runTaskAPI(ctx context.Context, run *taskRun) {
 		return
 	}
 
+	// Recorded before the turn, so a card the turn files finds it. Best
+	// effort: the turn runs either way, and a failure is said in the answer.
+	routeLost := false
+	if err := b.recordRoute(reqCtx, sessionID, run.origin); err != nil &&
+		!errors.Is(err, errNoChatConversation) && !errors.Is(err, errRouteDisabled) {
+		b.cfg.Logger.Warn("conversation route not recorded; a card this turn files cannot report back",
+			"task", taskID, "session", sessionID, "err", err)
+		routeLost = true
+	}
+
 	// The door's side of this task: attributed by the session id the hook
 	// payload carries, signed with the pod's shared secret, and only while
 	// this task holds the session's turn.
@@ -376,6 +387,9 @@ func (b *Bridge) runTaskAPI(ctx context.Context, run *taskRun) {
 	// A canceled task that finished anyway won the race: completed wins,
 	// per the payload spec's cancel mapping, as on the subprocess path.
 	text := out.Choices[0].Message.Content
+	if routeLost {
+		text += routeLostNote
+	}
 	b.finalize(run, lib.StateCompleted, "", &text)
 }
 

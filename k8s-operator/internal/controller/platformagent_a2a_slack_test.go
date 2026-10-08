@@ -700,35 +700,43 @@ func TestTheSlackHomeChannelReachesTheArmedGateway(t *testing.T) {
 
 // TestTheAgentRoutesSlackProactivePostsExactlyWhenArmed: the agent is told
 // to route Slack's proactive posts through chat.notify exactly when the
-// gateway holds Slack AND the home channel is a channel id, which is when
-// the gateway arms the route. Otherwise every post would go to a subject
-// nobody answers. Chat holding the gateway routes Chat, never both.
+// gateway holds Slack AND the home channel is a channel id, and the kanban
+// notifier to send a card's report back to its conversation whenever the
+// gateway arms Slack's route (home channel unset or a channel id). Otherwise
+// posts would go to a subject nobody answers. Chat holding the gateway routes
+// Chat, never both.
 func TestTheAgentRoutesSlackProactivePostsExactlyWhenArmed(t *testing.T) {
 	withSlackHome := func(agent *agentv1alpha1.PlatformAgent, home string) *agentv1alpha1.PlatformAgent {
 		agent.Spec.Integration.Slack.HomeChannel = home
 		return agent
 	}
 	for _, tc := range []struct {
-		name  string
-		agent *agentv1alpha1.PlatformAgent
-		want  string
+		name               string
+		agent              *agentv1alpha1.PlatformAgent
+		home, conversation bool
 	}{
-		{"today with slack and home", withSlackHome(slackTestAgent("", true), "C0HOME"), ""},
-		{"skew with slack and home", withSlackHome(slackTestAgent("later", true), "C0HOME"), ""},
-		{"next with slack, public channel", withSlackHome(slackTestAgent("next", true), "C0HOME"), a2aNotifyPlatformSlack},
-		{"next with slack, private channel", withSlackHome(slackTestAgent("next", true), "G0PRIV"), a2aNotifyPlatformSlack},
-		{"next with slack, no home channel", slackTestAgent("next", true), ""},
-		{"next with slack, a DM", withSlackHome(slackTestAgent("next", true), "D0DM"), ""},
-		{"next with slack, a name", withSlackHome(slackTestAgent("next", true), "#ops"), ""},
-		{"next without slack", withSlackHome(slackTestAgent("next", false), "C0HOME"), ""},
+		{"today with slack and home", withSlackHome(slackTestAgent("", true), "C0HOME"), false, false},
+		{"skew with slack and home", withSlackHome(slackTestAgent("later", true), "C0HOME"), false, false},
+		{"next with slack, public channel", withSlackHome(slackTestAgent("next", true), "C0HOME"), true, true},
+		{"next with slack, private channel", withSlackHome(slackTestAgent("next", true), "G0PRIV"), true, true},
+		{"next with slack, no home channel", slackTestAgent("next", true), false, true},
+		{"next with slack, a DM", withSlackHome(slackTestAgent("next", true), "D0DM"), false, false},
+		{"next with slack, a name", withSlackHome(slackTestAgent("next", true), "#ops"), false, false},
+		{"next without slack", withSlackHome(slackTestAgent("next", false), "C0HOME"), false, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			pod := buildPodTemplateSpec(tc.agent, "h", "h", "h", "h", nil, renderOptions{})
-			got := envMapOf(brokerContainerNamed(pod.Spec.Containers, "platform-agent").Env)[a2aNotifyPlatformEnvVar].Value
-			if got != tc.want {
-				t.Errorf("%s = %q, want %q", a2aNotifyPlatformEnvVar, got, tc.want)
+			env := envMapOf(brokerContainerNamed(pod.Spec.Containers, "platform-agent").Env)
+			for name, want := range map[string]bool{a2aNotifyPlatformEnvVar: tc.home, a2aNotifyConversationsEnvVar: tc.conversation} {
+				got, ok := env[name]
+				if ok != want {
+					t.Fatalf("%s present = %v, want %v", name, ok, want)
+				}
+				if ok && got.Value != a2aNotifyPlatformSlack {
+					t.Errorf("%s = %q, want %q", name, got.Value, a2aNotifyPlatformSlack)
+				}
 			}
-			if tc.want != "" && legacySlackConsumer(tc.agent) {
+			if (tc.home || tc.conversation) && legacySlackConsumer(tc.agent) {
 				t.Error("the notify route and the legacy Hermes slack platform both render")
 			}
 		})

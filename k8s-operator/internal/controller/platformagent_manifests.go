@@ -2903,14 +2903,14 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 			}
 			extEnvs = kept
 		}
-		// A2A_NOTIFY_PLATFORM is dropped on every install, not only while the
-		// A2A surface is up: on a today install a plugin's value would reroute
-		// every Google Chat post from hermes send to a chat.notify route that
-		// does not exist there. The operator renders it only under next, after
-		// this merge.
+		// A2A_NOTIFY_PLATFORM and A2A_NOTIFY_CONVERSATIONS are dropped on
+		// every install, not only while the A2A surface is up: on a today
+		// install a plugin's value would reroute Google Chat posts from
+		// hermes send to a chat.notify route that does not exist there. The
+		// operator renders them only under next, after this merge.
 		kept := extEnvs[:0]
 		for _, e := range extEnvs {
-			if e.Name != a2aNotifyPlatformEnvVar {
+			if e.Name != a2aNotifyPlatformEnvVar && e.Name != a2aNotifyConversationsEnvVar {
 				kept = append(kept, e)
 			}
 		}
@@ -3083,10 +3083,11 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 	}
 	// The Hermes Google Chat platform is off under next (legacyChatConsumer),
 	// so the agent-side callers that used to `hermes send` a proactive post
-	// route it to the gateway's chat.notify instead. This names the platform
-	// they reroute; the bus identity above is what sends it. Only when the
-	// home channel is one the gateway will arm the route for: otherwise every
-	// post would go to a subject nobody answers.
+	// route it to the gateway's chat.notify home channel instead. This names
+	// the platform they reroute; the bus identity above is what sends it.
+	// Only with a home channel the route posts to: otherwise every proactive
+	// post would be refused, and on a Chat-and-Slack install the agent would
+	// count Chat as a platform to post to ahead of Slack.
 	if a2aAgentSurface(agent) && a2aChatArmed(agent) && a2aGchatHomeSpace(agent) != "" {
 		envVars = append(envVars, corev1.EnvVar{Name: a2aNotifyPlatformEnvVar, Value: a2aNotifyPlatformGchat})
 	} else if a2aAgentSurface(agent) && a2aSlackArmed(agent) && a2aSlackHomeChannel(agent) != "" {
@@ -3094,6 +3095,14 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 		// when the gateway holds Slack (legacySlackConsumer), and Chat wins
 		// the single-backend gateway, so at most one platform is routed.
 		envVars = append(envVars, corev1.EnvVar{Name: a2aNotifyPlatformEnvVar, Value: a2aNotifyPlatformSlack})
+	}
+	// A kanban card's report back to the gateway conversation it was filed
+	// in rides the same route whenever the gateway arms it, home channel or
+	// not; only the kanban notifier reads this.
+	if a2aAgentSurface(agent) && a2aGchatNotifyArmed(agent) {
+		envVars = append(envVars, corev1.EnvVar{Name: a2aNotifyConversationsEnvVar, Value: a2aNotifyPlatformGchat})
+	} else if a2aAgentSurface(agent) && a2aSlackNotifyArmed(agent) {
+		envVars = append(envVars, corev1.EnvVar{Name: a2aNotifyConversationsEnvVar, Value: a2aNotifyPlatformSlack})
 	}
 	if a2aActivityHookWanted(agent) {
 		envVars = append(envVars, a2aActivitySecretEnv(agent))

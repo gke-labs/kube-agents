@@ -22,6 +22,9 @@ import (
 // like Discord's — "a DM, or a thread in a group space" (gateway design).
 const slackDMPrefix = "slack:dm/"
 
+// slackKeyPrefix begins every Slack conversation key.
+const slackKeyPrefix = "slack:"
+
 // slackSeenCap bounds the at-least-once dedupe ring: Socket Mode redelivers
 // unacked envelopes, so delivered (channel, ts) pairs are remembered and
 // re-deliveries dropped. Sized to roughly a busy hour of messages.

@@ -31,12 +31,12 @@ func newTestSlackNotifier(t *testing.T, p notifyPoster) *Notifier {
 }
 
 func TestSlackNotifyRefusesAHomeThatIsNotAChannel(t *testing.T) {
-	for _, home := range []string{"", "D0DM", "general", "#ops", "c0lower", "C", "spaces/AAA", "C0HOME/1.2"} {
+	for _, home := range []string{"D0DM", "general", "#ops", "c0lower", "C", "spaces/AAA", "C0HOME/1.2"} {
 		if _, err := NewSlackNotifier(&fakeNotifyPoster{}, home, nil); err == nil {
 			t.Errorf("home %q was accepted", home)
 		}
 	}
-	for _, home := range []string{"C0HOME", "G0PRIVATE"} {
+	for _, home := range []string{"C0HOME", "G0PRIVATE", ""} {
 		if _, err := NewSlackNotifier(&fakeNotifyPoster{}, home, nil); err != nil {
 			t.Errorf("home %q was refused: %v", home, err)
 		}
@@ -225,6 +225,49 @@ func TestSlackNotifyRefusesMentionsInBlocks(t *testing.T) {
 	link := `[{"type":"section","text":{"type":"mrkdwn","text":"<https://github.com/o/r/issues/1|ledger #1>"}}]`
 	if got := serveJSON(t, n, lib.NotifyRequest{Text: "x", Blocks: json.RawMessage(link)}); got.Error != "" {
 		t.Errorf("a link was refused as a mention: %+v", got)
+	}
+}
+
+const testSlackConversation = "slack:C0OTHER/1700000000.000300"
+
+// TestSlackNotifyWithNoHomeServesConversationsOnly: with no home channel the
+// Slack route refuses a home post but posts a card's report into a live
+// conversation, Slack's own, through the gateway's adapter.
+func TestSlackNotifyWithNoHomeServesConversationsOnly(t *testing.T) {
+	home := &fakeNotifyPoster{}
+	n, err := NewSlackNotifier(home, "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	conv := &fakeConversations{contexts: map[string]string{testSlackConversation: testContext}}
+	n.SetConversations(conv)
+	if got := serveJSON(t, n, lib.NotifyRequest{Text: "drift"}); got.Error != notifyNoHome {
+		t.Errorf("home post with no home = %+v, want %q", got, notifyNoHome)
+	}
+	got := serveJSON(t, n, lib.NotifyRequest{Text: "3 nodes", Conversation: testSlackConversation, ContextID: testContext})
+	if got.Error != "" || got.ThreadID != testSlackConversation {
+		t.Fatalf("conversation post = %+v", got)
+	}
+	if len(conv.posts) != 1 || len(home.all()) != 0 {
+		t.Fatalf("conversation posts %v, home posts %v", conv.posts, home.all())
+	}
+	// Chat's conversation is not Slack's to post into.
+	conv.contexts[testConversation] = testContext
+	if got := serveJSON(t, n, lib.NotifyRequest{Text: "x", Conversation: testConversation, ContextID: testContext}); !strings.Contains(got.Error, "not on this route's backend") {
+		t.Errorf("a Chat conversation on Slack's route = %+v", got)
+	}
+}
+
+// TestNotifyRefusesBlocksOnAConversation: raw Block Kit is for home posts; a
+// conversation post carries its layout as chat, so blocks there are refused
+// rather than dropped.
+func TestNotifyRefusesBlocksOnAConversation(t *testing.T) {
+	n := newTestSlackNotifier(t, newTestSlackAdapter(&fakeSlackAPI{}))
+	conv := &fakeConversations{contexts: map[string]string{testSlackConversation: testContext}}
+	n.SetConversations(conv)
+	got := serveJSON(t, n, lib.NotifyRequest{Text: "x", Conversation: testSlackConversation, ContextID: testContext, Blocks: json.RawMessage(testBlocks)})
+	if !strings.Contains(got.Error, "carries no blocks") || len(conv.posts) != 0 {
+		t.Fatalf("reply = %+v, posts = %v", got, conv.posts)
 	}
 }
 

@@ -57,10 +57,13 @@ const notifyExitRouteUnavailable = 4
 // notifyExitRouteUnavailable.
 var errNotifyRouteUnavailable = errors.New("route unavailable")
 
-const notifyUsage = `usage: a2a notify --platform <platform> [--thread <thread>] [--timeout <d>] [--] [text]
+const notifyUsage = `usage: a2a notify --platform <platform> [--thread <thread> | --conversation <key> --context <id>] [--timeout <d>] [--] [text]
 
 Post text to the install's chat home channel through the A2A gateway: a new
 thread, or a reply on --thread, which must be a thread of the home channel.
+With --conversation and --context, post into that conversation instead (the
+gateway's conversation key, and the context id its tasks carry): the gateway
+posts only into a live conversation whose session record has that context.
 Reads the text from stdin when it is omitted, or "-" with no "--" before it.
 Prints the gateway's answer as JSON (message_id, the field hermes send --json
 prints, and thread_id). Exits 1 when nothing was posted, 3 when the gateway
@@ -73,6 +76,8 @@ func runNotify(args []string) error {
 	fs.Usage = func() { fmt.Fprint(os.Stderr, notifyUsage) }
 	platform := fs.String("platform", "", "chat platform: "+strings.Join(notifyPlatforms(), ", "))
 	thread := fs.String("thread", "", "thread to reply on (default: a new thread in the home channel)")
+	conversation := fs.String("conversation", "", "the gateway conversation to post into, instead of the home channel")
+	contextID := fs.String("context", "", "the conversation's context id (with --conversation)")
 	timeout := fs.Duration("timeout", notifyDefaultTimeout, "how long to wait for the gateway's answer")
 	blocksFile := fs.String("blocks-file", "", "a JSON array of Slack Block Kit blocks to post as one message, with the text as its fallback (Slack only)")
 	if err := fs.Parse(args); err != nil {
@@ -82,13 +87,20 @@ func runNotify(args []string) error {
 	if !ok {
 		return fmt.Errorf("notify: --platform must be one of %s", strings.Join(notifyPlatforms(), ", "))
 	}
+	if (*conversation == "") != (*contextID == "") {
+		return errors.New("notify: --conversation and --context go together")
+	}
+	if *conversation != "" && *thread != "" {
+		return errors.New("notify: --thread or --conversation, not both")
+	}
 	// flag drops the "--" it stops at, so whether one was given is read from
 	// the raw arguments: after it, a lone "-" is text, not "read stdin".
 	text, err := notifyText(fs.Args(), slices.Contains(args, "--"), os.Stdin)
 	if err != nil {
 		return err
 	}
-	req := lib.NotifyRequest{Text: text, Thread: *thread, WaitMillis: timeout.Milliseconds()}
+	req := lib.NotifyRequest{Text: text, Thread: *thread, WaitMillis: timeout.Milliseconds(),
+		Conversation: *conversation, ContextID: *contextID}
 	if *blocksFile != "" {
 		raw, err := os.ReadFile(*blocksFile)
 		if err != nil {

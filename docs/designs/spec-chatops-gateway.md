@@ -1223,7 +1223,7 @@ as the primitive, unused, like the other backends.
 (an alert, a cron finding, an audit report) has no conversation to answer, and under `next`
 the Hermes platform that used to post it is off. So the agent asks the gateway, which holds
 the Chat credential, to post it. The agent container runs `a2a notify`, which publishes a
-core NATS request on `chat.notify.gchat` carrying `{"text", "thread"?, "wait_ms"?}` with its reply subject
+core NATS request on `chat.notify.gchat` carrying `{"text", "thread"?, "wait_ms"?, "conversation"?, "context_id"?}` with its reply subject
 under `chat.notify.reply.agent.`; the gateway posts the text into the home space
 (`googleChat.homeChannel`, carried as `A2A_GCHAT_HOME_CHANNEL`), as a new thread or as a reply
 on a thread of that space, and answers with `message_id` (the field `hermes send --json`
@@ -1238,9 +1238,47 @@ route is not there (no gateway subscribed, or the bus unreachable) `a2a notify` 
 a third status, nothing posted; the alert path, which has one shot, waits through about
 half a minute of those before giving up. The agent-side callers
 (`agents/platform/scripts/chat_notify.py`) switch on `A2A_NOTIFY_PLATFORM`, which the operator
-renders exactly when `a2aChatArmed` holds and `homeChannel` is a space name (the condition
-the gateway arms the route on), and send to every other platform through `hermes send` as
-before.
+renders exactly when `a2aChatArmed` holds and `homeChannel` is a space name, and send to every
+other platform through `hermes send` as before. The kanban notifier's report back to a gateway
+conversation (below) is armed by its own variable, `A2A_NOTIFY_CONVERSATIONS`, which the
+operator renders whenever the gateway arms the route: `homeChannel` unset (the route then
+serves conversation requests only) or a space name. The Hermes kanban notifier, which posts a card's events into the thread the card
+subscribes to and wakes its creator when a card blocks or fails, reaches the same route
+through a send-only stand-in adapter that exists only inside the notifier
+(`deploy/docker/patches/kanban_chat_notify.py`); nothing else in the Hermes gateway treats
+the platform as connected. Only the subscription's thread is forwarded: a thread of the home
+space goes as `--thread`, under the home-space rule (a thread of another space is refused), and a
+gateway conversation key (below) goes as `--conversation` with `--context`. A subscription with
+no thread is not delivered. A route probe (an empty notify, which an armed gateway refuses at once) tells the
+notifier when the route is unavailable (the gateway restarting), and it holds deliveries
+unclaimed then; only a send that meets the outage before the next probe spends one unit of
+the subscription's failure budget. Once, when routed delivery first goes live on an install,
+events that are already more than six hours old are advanced past without posting: they are
+the backlog nothing could deliver before.
+
+A request may name a conversation instead of the home channel: `conversation` (the gateway's
+session-record key, such as `gchat:spaces/A/threads/B`) and `context_id`. The route is armed for
+Google Chat; a Slack conversation's route is recorded the same way, and is delivered once the
+gateway arms the route for Slack. This
+is how a kanban card filed in a gateway conversation reports back to it. The hermes-bridge's
+`api` executor records, before each turn, the conversation its Hermes session answers: the
+platform, the conversation key from the task's `authority.audience.conversation`, and the
+task's `contextId`, stored in the pod's session-kv (`PUT /v1/sessions/{id}/route`, loopback
+only, accepted for `a2a-*` sessions alone). `kanban_event_routing` swaps that route in for the
+`api_server` origin when the turn files a card, following Hermes's compression lineage
+(`parent_session_id`, parent ended `compression`) when the session has since been renamed. The
+kanban notifier then sends the card's report with `--conversation` and `--context`. The gateway
+posts it, through its own adapter and into the conversation's thread, only when it holds a
+session record for that key carrying that context id: a conversation the agent is working in.
+The bound is the set of live records rather than a secret: the agent principal, the one sender,
+can read every live conversation's context id (its Hermes sessions are named for them), so the
+check refuses a conversation with no record, a made-up key and a stale route, not a post into
+another conversation the agent holds a session for. No record, another
+context, or a record that cannot be read gets one refusal whatever the reason; a malformed request (a key on another backend, a thread and a conversation
+together, a conversation with no context id) is refused by name. Nothing is posted in either
+case. The subjects and grants are the same as for a home post; a route the
+bridge cannot record is said at the end of the turn's answer, since the card's report will not
+arrive.
 
 Slack has the same route on its own subject, `chat.notify.slack`, armed when the gateway holds
 Slack (`a2aSlackArmed`) and `slack.homeChannel`, carried as `A2A_SLACK_HOME_CHANNEL`, is a
@@ -1265,16 +1303,17 @@ home channel that is not a channel id leaves the route unarmed; the gateway logs
 
 A notify is not a task. It mints no capability, starts no executor, opens no session and
 carries no `authority` block; the requester rules above do not apply, because nobody
-requested it. What bounds it is where it may land and who may send it. Where: the home space
-only, and a thread of another space, or anything that is not a thread of the home space, is
-refused before any post (on Slack, the home channel only, which the gateway sets on every
+requested it. What bounds it is where it may land and who may send it. Where: the home space,
+or a conversation the gateway holds a session record for carrying the request's context id; a
+thread of another space, or a conversation without that record and context, is refused before
+any post (on Slack, a home post lands in the home channel only, which the gateway sets on every
 post). Who: the agent principal alone publishes `chat.notify.gchat` and `chat.notify.slack`
 and reads `chat.notify.reply.agent.>`; the gateway alone reads the first two and publishes the
 third. The answer does not go to the agent's `_INBOX` for the reason the verifier's does not:
 the agent reads its JetStream replies there, and a gateway able to publish into it could
 forge them; a request whose reply subject is outside the namespace is dropped unanswered.
-The agent could already post the same text to the same channel through `hermes send` under
-`today`, so the route moves the post to the process holding the credential rather than adding
+The agent could already post the same text to the same channel or conversation through
+`hermes send` under `today`, so the route moves the post to the process holding the credential rather than adding
 a reach. A reply a human types in a notify's thread arrives at the gateway as an ordinary
 message from that human, through the usual ingress checks, and starts a conversation of its
 own: nothing binds it to the investigation that raised the alert.
