@@ -131,7 +131,7 @@ class PreLlmCallTest(unittest.TestCase):
         # Presence marker set, delivery bound to origin and triggered.
         self.assertTrue((self.data_dir / ".user_aligned").exists())
         self.update_job.assert_called_once_with(
-            "bootstrap-inventory-delivery",
+            "oobe",
             {
                 "deliver": "origin",
                 "origin": {
@@ -141,7 +141,7 @@ class PreLlmCallTest(unittest.TestCase):
                 },
             },
         )
-        self.trigger_job.assert_called_once_with("bootstrap-inventory-delivery")
+        self.trigger_job.assert_called_once_with("oobe")
 
     # --- Case B: user connects after scan finished (INVENTORY.md present) -
 
@@ -153,7 +153,7 @@ class PreLlmCallTest(unittest.TestCase):
         # The plugin must NOT inject the inventory itself (delivery is verbatim).
         self.assertNotIn("SECRET-FLEET-DATA", result["context"])
         self.assertTrue((self.data_dir / ".user_aligned").exists())
-        self.trigger_job.assert_called_once_with("bootstrap-inventory-delivery")
+        self.trigger_job.assert_called_once_with("oobe")
 
     def test_origin_binding_happens_before_user_aligned(self):
         # update_job (origin binding) must precede touching .user_aligned so the

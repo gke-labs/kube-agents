@@ -1,13 +1,23 @@
 #!/usr/bin/env python3
 """Dispatcher for the ``oobe`` cron job: the work an install does once, on first boot.
 
-The design is ``docs/designs/oobe.md``. Today the job has one stage, the first-run
-audits: once the onboarding inventory scan has settled, run the four fleet audits
-that would otherwise wait for their schedules (the next 06:20 UTC, the next Monday
-for cost), one after another. The bootstrap scan and delivery jobs still run beside it.
+The design is ``docs/designs/oobe.md``. Each tick runs three stages in order:
 
-The stage fires when the ranking card the hand-off recorded for the scan has finished, read
-through the hand-off's own reads (``bootstrap_handoff``). It
+1. The inventory scan, ``bootstrap_scan_gate.main``: file the sweep card, then the
+   hand-off's cluster and ranking cards.
+2. The first-run audits, below: once the scan has settled, the four fleet audits that
+   would otherwise wait for their schedules (the next 06:20 UTC, the next Monday for
+   cost), one after another.
+3. Delivery, ``bootstrap_delivery.main``: post the report to the chat the
+   ``bootstrap_onboarding`` plugin linked this job to, once a human has spoken.
+
+Delivery's stdout is the report, and the scheduler posts whatever this job prints to
+that chat, and a non-zero exit as a failure. So the first two stages run with stdout
+sent to stderr, their subprocesses' included, and an exception in either is logged
+rather than raised: neither may post, or keep the report from going out.
+
+The first-run audits stage fires when the ranking card the hand-off recorded for the scan has
+finished, read through the hand-off's own reads (``bootstrap_handoff``). It
 does not wait for delivery, which needs a human message, and it does not look for
 the report file, which is on the sandbox's volume when the sandbox is on. A scan
 that has not settled by the hand-off's own deadline plus ``RANKING_ALLOWANCE_SECONDS``
@@ -40,10 +50,12 @@ entrypoint could not tell, or a start check failed all day; the stage cannot tel
 so the reason it records says only which: the scan had not settled, or it had. A scan marker the
 hand-off refuses is given up on a day after it was written. Its audits run on their schedules.
 
-Once the stage is done, the next run removes the job. Stdout stays empty: the job
-delivers locally and never speaks to the user.
+Once the audits stage is done and the report was claimed ``RETIRE_AFTER_SECONDS``
+ago, a run removes this job; delivery's own run removes the two bootstrap entries,
+disabled since this job took them over.
 """
 
+import contextlib
 import json
 import os
 import sqlite3
@@ -53,7 +65,9 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-import bootstrap_handoff  # beside this script in the pod
+import bootstrap_delivery  # beside this script in the pod
+import bootstrap_handoff
+import bootstrap_scan_gate
 
 OOBE_JOB_ID = "oobe"
 AUDITS_MARKER = ".oobe_audits_fired"
@@ -145,6 +159,8 @@ HOLD_DISABLED = "disabled"
 HOLD_PAUSED = "paused"
 DEFAULT_HOME = "/opt/data"
 TMP_SUFFIX = bootstrap_handoff.TMP_SUFFIX
+STDOUT_FD = 1
+STDERR_FD = 2
 
 
 def _log(message: str) -> None:
@@ -326,7 +342,11 @@ def audit_holds(data_dir: Path) -> dict[str, str] | None:
 
 
 def retire() -> None:
-    """Remove this job in-process. Its runs print nothing, so no output is lost with it."""
+    """Remove this job in-process.
+
+    Only from a run with nothing to post: removing a job while it runs drops the run's fire
+    claim, and the scheduler then discards its output (``bootstrap_delivery._retire_jobs``).
+    """
     try:
         from cron.jobs import remove_job  # type: ignore import-not-found
     except Exception:  # noqa: BLE001 - outside the gateway
@@ -513,13 +533,34 @@ def skip(data_dir: Path, reason: str, now: float) -> None:
     write_state(data_dir, {STATE_DONE: True, STATE_SKIPPED: True, STATE_REASON: reason, STATE_AT: now})
 
 
-def main(data_dir: Path | None = None, now: float | None = None) -> int:
-    data_dir = data_dir or _data_dir()
-    now = time.time() if now is None else now
+@contextlib.contextmanager
+def _quiet():
+    """Send stdout, the file descriptor as well as ``sys.stdout``, to stderr for the block."""
+    sys.stdout.flush()
+    saved = os.dup(STDOUT_FD)
+    try:
+        os.dup2(STDERR_FD, STDOUT_FD)
+        with contextlib.redirect_stdout(sys.stderr):
+            yield
+    finally:
+        sys.stdout.flush()
+        os.dup2(saved, STDOUT_FD)
+        os.close(saved)
+
+
+def _quiet_stage(name: str, stage, *args) -> None:
+    """Run a stage that must not speak to the operator: nothing on stdout, no exception out."""
+    with _quiet():
+        try:
+            stage(*args)
+        except Exception as e:  # noqa: BLE001 - the next tick retries; delivery must still run
+            _log(f"the {name} stage failed: {e!r}")
+
+
+def first_run_audits(data_dir: Path, now: float) -> None:
     state = read_state(data_dir)
     if state.get(STATE_DONE):
-        retire()
-        return 0
+        return
     filed = scan_filed(data_dir)
     if not state:
         # Not started yet: the checks that decide whether, and when, the chain starts.
@@ -528,22 +569,41 @@ def main(data_dir: Path | None = None, now: float | None = None) -> int:
             # A marker the hand-off refuses (no readable task_id) starts nothing; a day on, the
             # stage stops waiting for it rather than ticking for good.
             skip(data_dir, SKIP_NO_SWEEP, now)
-            return 0
+            return
         if filed is not None and now - filed[1] >= NEW_INSTALL_SECONDS:
             skip(data_dir, SKIP_NOT_NEW if scan_finished(data_dir, filed[0]) else SKIP_UNSETTLED, now)
-            return 0
+            return
         if not scan_settled(data_dir, now):
-            return 0
+            return
         try:
             repositories = managed_repositories()
         except Exception as e:  # noqa: BLE001 - an unreadable list is retried, not taken as empty
             _log(f"cannot read the managed repositories: {e}")
-            return 0
+            return
         if not repositories:
             skip(data_dir, SKIP_NO_REPOSITORY, now)
-            return 0
+            return
     advance_chain(data_dir, state, now, since=filed[1] if filed is not None else None)
-    return 0
+
+
+def finished(data_dir: Path, now: float) -> bool:
+    """Every stage is done, and the report was claimed long enough ago that no run still posts it."""
+    if not read_state(data_dir).get(STATE_DONE):
+        return False
+    claimed = bootstrap_delivery._completed_at(data_dir)
+    return claimed is not None and now - claimed >= bootstrap_delivery.RETIRE_AFTER_SECONDS
+
+
+def main(data_dir: Path | None = None, now: float | None = None) -> int:
+    data_dir = data_dir or _data_dir()
+    now = time.time() if now is None else now
+    if finished(data_dir, now):
+        bootstrap_delivery._retire_jobs()
+        retire()
+        return 0
+    _quiet_stage("scan", bootstrap_scan_gate.main, data_dir)
+    _quiet_stage("first-run audits", first_run_audits, data_dir, now)
+    return bootstrap_delivery.main(data_dir)
 
 
 if __name__ == "__main__":
