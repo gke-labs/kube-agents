@@ -105,8 +105,10 @@ permission/config change, anything only a maintainer can resolve - do **not**
 silently stall:
 
 1. Apply the `needs-human` label.
-2. Comment, `@mention`ing the relevant maintainer: read `OWNERS` for the
-   approver, and expand a group alias (e.g. `eval-crew`) through
+2. Comment, `@mention`ing the relevant maintainer: the primary for the
+   area in `docs/ownership.md`, or any approver from `OWNERS` when the row
+   names no login, and an approver as well when the decision is one only
+   an approver can make; expand a group alias (e.g. `eval-crew`) through
    `OWNERS_ALIASES` to the accounts a mention actually reaches. State what
    blocks you, what would unblock you, and who can unblock it.
 

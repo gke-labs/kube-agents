@@ -309,6 +309,25 @@ SOURCES: dict[str, Source] = {
         "a2a/gateway/gchat.go",
         ("func (g *Gateway) resolveA2APrincipal", "a2aPrincipalPrefix + authorID"),
     ),
+    # The A2A door's developer class: the verifier, the gateway's resolver
+    # for what it verified, the eval-caller grammar the class's prefix is
+    # disjoint from, and the roster arm that keeps it off the chat map.
+    "a2a_door_google": Source(
+        "a2a/gateway/a2adoor_google.go",
+        ("func (v *googleTokenVerifier) check", "a2aGoogleCallerPrefix =", ") identify("),
+    ),
+    "a2a_door_google_identity": Source(
+        "a2a/gateway/gchat.go",
+        ("func (g *Gateway) resolveA2AGooglePrincipal", "a2aGoogleCallerPrefix"),
+    ),
+    "a2a_door_callers": Source(
+        "a2a/gateway/a2adoor.go",
+        ("func callerOf(",),
+    ),
+    "a2a_door_roster": Source(
+        "a2a/gateway/gateway.go",
+        ("func (g *Gateway) rosterResolver", "a2aGoogleBackend"),
+    ),
     # The gateway's Slack identity rule: the allowlist gates, the map
     # overrides, and the member id is the principal otherwise.
     "a2a_slack_ingress": Source(

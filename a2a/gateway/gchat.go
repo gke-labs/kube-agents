@@ -163,6 +163,10 @@ func verifiedByFor(backend string) string {
 		// distinguishable downstream even though both resolve through a
 		// door-scoped map into the eval namespace.
 		return a2aVerifiedBy
+	case a2aGoogleBackend:
+		// What checked the caller is Google, through the door's tokeninfo
+		// call: neither the door's static token nor a map.
+		return a2aGoogleVerifiedBy
 	}
 	return "principal-map"
 }
@@ -188,6 +192,8 @@ func unverifiedRemedyFor(backend string) string {
 		return "the inject door's principal map"
 	case a2aBackend:
 		return "the A2A door's principal map"
+	case a2aGoogleBackend:
+		return "the A2A door's allowed users list"
 	}
 	return "the principal map"
 }
@@ -991,14 +997,18 @@ func (a *GoogleChatAdapter) classify(ev *gchatEvent) (InboundMessage, string) {
 // subject, so the author is the console principal - but only on a console
 // conversation, so the string "console" arriving on any other backend is
 // just an unmapped id. The inject door has a map, but its own and prefixed
-// (resolveInjectPrincipal), never this one. Everything else goes through the
-// principal map. Empty means drop.
+// (resolveInjectPrincipal), never this one; the A2A door has its own too
+// (resolveA2APrincipal), and its Google-verified callers resolve as Chat's do,
+// the email gated by the door's own allowlist (resolveA2AGooglePrincipal).
+// Everything else goes through the principal map. Empty means drop.
 func (g *Gateway) resolvePrincipal(backend, authorID string) string {
 	switch backend {
 	case injectBackend:
 		return g.resolveInjectPrincipal(authorID)
 	case a2aBackend:
 		return g.resolveA2APrincipal(authorID)
+	case a2aGoogleBackend:
+		return g.resolveA2AGooglePrincipal(authorID)
 	case consoleBackend:
 		if authorID == consoleAuthor {
 			return consolePrincipal
@@ -1132,6 +1142,25 @@ func (g *Gateway) resolveA2APrincipal(authorID string) string {
 		return ""
 	}
 	return principal
+}
+
+// resolveA2AGooglePrincipal resolves a caller the A2A door verified with
+// Google. The door has already checked the token; what is left is the
+// gateway's own gate, the same one Chat applies to a Google-asserted email:
+// the email is the principal, admitted only if it is on the door's
+// allowlist. The author must carry the class's prefix, so an id that did
+// not come through the door's Google check resolves to nothing even on this
+// arm. The email is returned as Google sent it, case-preserved, for the
+// reason the gchat arm keeps the case: the audit join hashes that string.
+func (g *Gateway) resolveA2AGooglePrincipal(authorID string) string {
+	email, ok := strings.CutPrefix(authorID, a2aGoogleCallerPrefix)
+	if !ok || email == "" {
+		return ""
+	}
+	if !g.a2aGoogleAllowed[strings.ToLower(email)] {
+		return ""
+	}
+	return email
 }
 
 // gchatConversationID mints the session key for one inbound message. space is

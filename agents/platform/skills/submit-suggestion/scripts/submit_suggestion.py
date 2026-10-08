@@ -154,10 +154,11 @@ def check_branch(branch_name: str, base_branch: str | None = None) -> str:
 
 
 def validate_repo(repo: str) -> str:
-    """Ensure repo is formatted as owner/name and is in the managed repos allowlist if configured."""
+    """Ensure repo is a repository name and is in the managed repos allowlist if configured."""
     if not repo or not gitops_workspace.is_valid_repo_slug(repo):
-        raise ValueError(f"Invalid repository format: {repo!r}. Expected 'owner/name'.")
-    managed = gitops_workspace.get_managed_github_repos()
+        raise ValueError(f"Invalid repository format: {repo!r}. Expected 'owner/name', or '<host>/<path>' for a repository on another forge.")
+    managed = gitops_workspace.get_managed_repos()
+    repo = gitops_workspace.qualify(repo, managed)
     if managed and repo not in managed:
         raise ValueError(
             f"Repository {repo!r} is not in the managed repositories list: {managed}"
@@ -509,7 +510,7 @@ def handle_prepare(args) -> int:
     # fleet whose cards target several GitOps repositories writes every
     # suggestion to whichever one `resolve_repo` happens to answer with.
     repo = args.repo or gitops_workspace.resolve_repo()
-    validate_repo(repo)
+    repo = validate_repo(repo)
 
     proposal = open_proposal(repo, branch)
     if proposal:
@@ -624,7 +625,7 @@ def handle_submit(args) -> int:
     # got past the check below and then died on "no local copy".
     copy_key = vcs_client.key_of(session)
     repo = args.repo or session["spec"]
-    validate_repo(repo)
+    repo = validate_repo(repo)
 
     current = vcs_client.current_branch(session)
     if current != branch:

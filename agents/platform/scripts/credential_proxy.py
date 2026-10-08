@@ -1121,13 +1121,19 @@ def _provider_forge(provider: str) -> providers.Forge:
 
 
 def read_credential_for(registry: providers.Registry, repository: str) -> providers.Credential:
-    """The credential the broker's own clone of ``repository`` presents.
+    """The credential the broker's clone, fetch or push of ``repository`` presents.
 
-    A context repository gets the forge's read-only credential; anything else
-    gets none, and that "none" is not the same thing for the two remaining
-    roles. A managed repository rides the ambient write credential the CLI
-    installed, as it always has, so the broker adds nothing. An unregistered
-    one is a public upstream read with no credential at all, as it always was.
+    Asked at `open`, and again before every fetch and push of a handle whose
+    credential is a stored token, so a repository unregistered meanwhile stops
+    getting it. By role:
+
+    - managed: on a forge whose credential is a token an administrator stored
+      (GitLab), that token, through the forge's helper; on GitHub, nothing --
+      the clone and push ride the ambient write credential the CLI installed,
+      as they always have;
+    - context: the forge's read-only credential, and never the write token; a
+      forge that offers none clones with no credential;
+    - unregistered: no credential at all, a public upstream read.
 
     An unreadable list is logged and answered with no credential rather than
     raised: this is not an authorization check -- `open` has none by design --
@@ -1157,13 +1163,45 @@ def read_credential_for(registry: providers.Registry, repository: str) -> provid
             type(exc).__name__,
         )
         return providers.NoCredential()
-    LOGGER.info("content workspace open repo=%s role=%s", repository, role)
+    LOGGER.info("content workspace credential repo=%s role=%s", repository, role)
+    if role == ROLE_MANAGED and _holds_stored_token(forge):
+        # A forge whose credential is a token an administrator stored has no
+        # ambient helper behind it, so a managed repository's clone, fetch and
+        # push present the token themselves, through the forge's helper.
+        return forge.credential
     if role != ROLE_CONTEXT:
         return providers.NoCredential()
-    return forge.read_credential(repo)
+    # A context repository gets the forge's read-only credential, and never
+    # the write token: a forge that offers none -- GitLab's stored token has
+    # no read-only variant here -- clones it with no credential, which reads a
+    # public repository and refuses a private one at the clone.
+    credential = forge.read_credential(repo)
+    if isinstance(credential, providers.NoCredential) and _holds_stored_token(forge):
+        LOGGER.warning(
+            "content workspace open repo=%s role=context: the %s forge offers no "
+            "read-only credential and its stored token can write, so the clone "
+            "presents none; a private repository will refuse it",
+            repository, forge.name,
+        )
+    return credential
 
 
-#: The one forge the content workspace clones from.
+def _holds_stored_token(forge: providers.Forge) -> bool:
+    """Whether ``forge`` presents a stored token rather than a minted one.
+
+    GitHub's is brokered: minted per repository, and installed for git by the
+    CLI, so the broker's own clones of a managed repository ride it ambiently.
+    A forge whose credential is neither brokered nor absent has nothing ambient
+    behind it, and its clones carry the credential themselves.
+    """
+    credential = getattr(forge, "credential", None)
+    return credential is not None and not isinstance(
+        credential, (providers.BrokeredCredential, providers.NoCredential)
+    )
+
+
+#: The forge a bare `owner/name` means to the content workspace. A
+#: host-qualified name is cloned from the forge that serves its host.
 CONTENT_WORKSPACE_PROVIDER = "github"
 
 
@@ -1180,24 +1218,33 @@ def _hosted(repository: object, provider: str) -> object:
     """
     if not provider or not isinstance(repository, str):
         return repository
-    if "://" in repository or repository.count("/") != 1:
+    # Hostless as the parser reads it, not by counting slashes: `owner/name.git`
+    # and `owner/name/` are bare names, `gitlab.com/group` is not.
+    ref = repo_ref.try_parse(repository)
+    if ref is None or ref.host or len(ref.segments) != 2:
         return repository
-    try:
-        host = _provider_forge(provider).hosts[0]
-    except (PermissionError, IndexError):
+    # Only when exactly one built forge carries the provider: with two (say
+    # gitlab.com and a self-managed instance) a bare name means neither, and
+    # picking the first would place it on a host the caller never named.
+    forges = [forge for forge in forge_registry().forges if forge.name == provider]
+    if len(forges) != 1 or not forges[0].hosts:
         return repository
-    return f"https://{host}/{repository}"
+    return f"https://{forges[0].hosts[0]}/{'/'.join(ref.segments)}"
 
 
 def _workspace_credential(registry: providers.Registry, repository: str) -> providers.Credential:
-    """The content workspace's clone credential: `read_credential_for` on GitHub.
+    """The content workspace's clone credential: `read_credential_for` on its forge.
 
-    On an install that built no GitHub forge there is none to read with, and
-    the bare name would otherwise resolve to whatever single forge the install
-    does serve -- a credential for another host, on a github.com clone. The
+    ``repository`` is the store's canonical name: a bare `owner/name` is
+    GitHub's, and anything else names its host and resolves to the forge that
+    serves it. A bare name on an install that built no GitHub forge has none to
+    read with, and would otherwise resolve to whatever single forge the install
+    does serve -- a credential for another host, on a github.com clone. That
     clone proceeds without one, as an unregistered repository's does, and the
     log says why.
     """
+    if not _is_bare_name(repository):
+        return read_credential_for(registry, repository)
     try:
         _provider_forge(CONTENT_WORKSPACE_PROVIDER)
     except PermissionError:
@@ -1208,6 +1255,37 @@ def _workspace_credential(registry: providers.Registry, repository: str) -> prov
         )
         return providers.NoCredential()
     return read_credential_for(registry, _hosted(repository, CONTENT_WORKSPACE_PROVIDER))
+
+
+def _is_bare_name(repository: object) -> bool:
+    """Whether ``repository`` is a bare `owner/name`: GitHub's, to the workspace."""
+    import content_workspace
+
+    return isinstance(repository, str) and content_workspace.is_bare_github_name(repository)
+
+
+def _workspace_locate(repository: str) -> tuple[str, str]:
+    """A host-qualified repository's canonical name and clone URL, for the store.
+
+    Resolved through the forges this install serves, so the forge parses the
+    name -- nesting, allowed paths -- and composes the URL; the caller names a
+    repository and never a host or a URL. GitHub's comes back as the bare
+    `owner/name` the store has always keyed it by, so `github.com/owner/name`
+    and `owner/name` are one repository there.
+    """
+    import content_workspace
+
+    try:
+        forge, path = forge_registry().resolve(repository)
+        if forge.name == CONTENT_WORKSPACE_PROVIDER:
+            return path, f"https://github.com/{path}.git"
+        # Inside the same refusal: the placeholder for a forge this install
+        # names but has no credential for parses the name and refuses here.
+        return f"{forge.hosts[0]}/{path}", forge.clone_url(path)
+    except providers.WorkspaceError as exc:
+        raise content_workspace.ContentWorkspaceError(
+            f"{repository} is not a repository on a forge this install serves: {exc}"
+        ) from exc
 
 
 def require_managed_workspace(store, handle: object) -> None:
@@ -1232,12 +1310,22 @@ def require_managed_workspace(store, handle: object) -> None:
     import content_workspace
 
     repository = store.get(handle).repo
-    # The content workspace clones `https://github.com/<owner>/<name>` and
-    # nothing else, so its repository is GitHub's whatever else the install
-    # serves. Asked of the GitHub forge by name: with a second forge there is
-    # no install-wide default to fall back on. An install that built no GitHub
-    # forge has nothing the workspace can write through, which is a refusal of
-    # this repository -- the list itself is readable, so not "unavailable".
+    # A bare `owner/name` is GitHub's whatever else the install serves: the
+    # store cloned it from github.com. Asked of the GitHub forge by name, since
+    # with a second forge there is no install-wide default to fall back on. An
+    # install that built no GitHub forge has nothing to write it through, which
+    # is a refusal of this repository -- the list itself is readable, so not
+    # "unavailable". A host-qualified name was cloned from its own forge, and
+    # is asked of that forge.
+    if not _is_bare_name(repository):
+        try:
+            forge, path = forge_registry().resolve(repository)
+        except providers.WorkspaceError as exc:
+            raise content_workspace.RepositoryNotManaged(
+                f"{repository} is not on a forge this install serves"
+            ) from exc
+        _require_managed(content_workspace, path, forge, repository)
+        return
     try:
         forge = _provider_forge(CONTENT_WORKSPACE_PROVIDER)
     except PermissionError as exc:
@@ -1246,8 +1334,13 @@ def require_managed_workspace(store, handle: object) -> None:
             f"{CONTENT_WORKSPACE_PROVIDER} repositories only, and this install serves "
             f"no {CONTENT_WORKSPACE_PROVIDER} forge"
         ) from exc
+    _require_managed(content_workspace, repository, forge, repository)
+
+
+def _require_managed(content_workspace, path: str, forge: providers.Forge, shown: str) -> None:
+    """Refuse unless ``path`` on ``forge`` is managed; an unreadable list refuses too."""
     try:
-        permitted = repository_is_managed(repository, forge)
+        permitted = repository_is_managed(path, forge)
     except Exception as exc:
         LOGGER.warning(
             "refusing a workspace write: the managed-repository list could not "
@@ -1259,7 +1352,7 @@ def require_managed_workspace(store, handle: object) -> None:
         ) from exc
     if not permitted:
         raise content_workspace.RepositoryNotManaged(
-            f"{repository} is not one of the repositories this agent manages; "
+            f"{shown} is not one of the repositories this agent manages; "
             "register it in the gitops-state ConfigMap first"
         )
 
@@ -6489,6 +6582,9 @@ def build_workspace_store(
         # `require_managed_workspace` gives: a bare name does not resolve once
         # the install serves a second forge.
         credential_for=lambda repository: _workspace_credential(registry, repository),
+        # A repository named with its host is cloned from the forge that serves
+        # it, which composes the URL; a bare `owner/name` stays GitHub's.
+        locate=_workspace_locate,
         pinned_bases=pinned_bases,
     )
     LOGGER.info("content workspace enabled root=%s", executor.content_workspace_root)
@@ -8131,7 +8227,14 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
         store = self.workspaces
         if route == "open":
             requested = payload.get("repo")
-            if not is_valid_repository(requested):
+            # A bare `owner/name` is held to the GitHub slug rule it always was;
+            # a host-qualified name goes on to the store, which asks the forge
+            # that serves it and refuses anything no served forge owns.
+            # Two segments and no host is a GitHub slug; anything that names a
+            # host, or nests deeper, is for the forges this install serves.
+            ref = repo_ref.try_parse(requested) if isinstance(requested, str) else None
+            slug = ref is not None and not ref.host and len(ref.segments) == 2
+            if ref is None or (slug and not is_valid_repository(requested)):
                 # A ContentWorkspaceError rather than a ValueError, though both
                 # answer 400. `credential_proxy_client.workspaces_available`
                 # probes this route with an empty repo to find out whether the
@@ -8141,7 +8244,7 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                 # keeps the refusal on the same exception family as the write
                 # gate below, so a caller catching one catches both.
                 raise content_workspace.ContentWorkspaceError(
-                    "repo must be owner/name"
+                    "repo must be owner/name, or a repository on a forge this install serves"
                 )
             # No managed-repository gate here. `inspect-repository` exists to
             # read code this install does not manage -- a dependency, an

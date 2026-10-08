@@ -749,6 +749,7 @@ func toTriageEvent(ev *corev1.Event, cluster targetCluster) TriageEvent {
 		Cluster:       cluster.Name,
 		Project:       cluster.ProjectID,
 		Location:      cluster.Location,
+		Autopilot:     cluster.Autopilot,
 		Namespace:     ev.InvolvedObject.Namespace,
 		KindOfObject:  ev.InvolvedObject.Kind,
 		Name:          ev.InvolvedObject.Name,

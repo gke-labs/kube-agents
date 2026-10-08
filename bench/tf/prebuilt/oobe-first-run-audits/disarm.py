@@ -16,7 +16,7 @@
 
 Usage: python3 - <home> <hermes> < disarm.py
 
-Puts both markers back as they were. Removes the `oobe` job when arm.py put it there
+Puts the markers back as they were. Removes the `oobe` job when arm.py put it there
 and it has not already removed itself, and puts back the job arm.py found in the store
 when the stage has since removed it, and archives the stand-in cards again in case an arm
 stopped between filing one and archiving it. The stand-in cards were archived when
@@ -35,6 +35,7 @@ home, HERMES = sys.argv[1:3]
 STATE = os.path.join(home, ".bench-oobe.json")
 SCAN_MARKER = os.path.join(home, ".bootstrap_scan_filed")
 AUDITS_MARKER = os.path.join(home, ".oobe_audits_fired")
+HANDOFF_MARKER = os.path.join(home, ".bootstrap_handoff_filed")
 JOB_ID = "oobe"
 TMP_SUFFIX = ".tmp"
 # Scheduler bookkeeping a put-back record must not carry over.
@@ -78,5 +79,8 @@ for card in state.get("cards", []):
         print(f"could not archive {card}: {exc}", file=sys.stderr)
 restore(SCAN_MARKER, state.get("scan_marker"))
 restore(AUDITS_MARKER, state.get("audits_marker"))
+# An arm from before it recorded this marker wrote none, so there is nothing to put back.
+if "handoff_marker" in state:
+    restore(HANDOFF_MARKER, state.get("handoff_marker"))
 os.remove(STATE)
 print("disarmed: markers restored" + (f", {JOB_ID} removed" if state.get("job_added") else "") + (f", {JOB_ID} put back" if saved else ""))
