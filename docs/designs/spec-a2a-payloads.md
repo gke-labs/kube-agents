@@ -11,6 +11,8 @@
   to subject-derived identity (the Verified identity section), and - once the capability
   envelope armed later the same day - the authority half flips too, so `authority.grants`
   becomes decision-grade by resolution (the Authority section).
+  Amended 10/8, again without a version bump: the chat message schema (the Chat messages
+  section), a DataPart layout for chat renderers that adds no kind and no envelope field.
 
 ## Purpose
 
@@ -515,6 +517,120 @@ an older `ts`), not built. And identity ends at a bridge: the bridge is the publ
 and a chat user's identity is the gateway's `authority` block, which is the capability
 envelope's to make decision-grade.
 
+## Chat messages (added 10/8)
+
+A task's answer is not always prose. A report has a headline and rows, a question has
+choices, and a running task has a plan. Under `today` the Slack presenter lays these out
+from the agent's text at post time. Under `next` the chat gateway posts what comes off the
+bus, and it holds no model and does not parse prose (#2149). So the executor states the
+structure, and every adapter renders it: Block Kit, a card, an embed, or plain text.
+
+The mechanism is the one topics already use. A **chat message** is one DataPart whose
+`data` object carries `"schema": "kube-agents.chat/v1"`, with a TextPart beside it in the
+same part list. No new kind, envelope field or artifact name.
+
+### Where one may appear
+
+| Carrier                                                | What it renders as                           | Meaningful fields                     |
+| ------------------------------------------------------ | -------------------------------------------- | ------------------------------------- |
+| `result` artifact, on the chunk with `lastChunk: true` | the answer                                   | all but `plan`                        |
+| `progress` artifact                                    | the task's one live message, edited in place | `plan`, `headline`, `mark`            |
+| the message of an `input-required` `status-update`     | the question                                 | `headline`, `note`, `rows`, `choices` |
+
+At most one chat message per part list. In `progress` it is the whole current state, not a
+delta, so a consumer that missed an event renders the next one correctly. A `result` keeps
+its TextPart chunks as they are; the chat message rides the last chunk only.
+
+### The object
+
+```json
+{
+  "schema": "kube-agents.chat/v1",
+  "headline": "3 of 12 clusters are behind the GKE stable channel",
+  "note": "checked 12 of 12",
+  "tone": "warning",
+  "rows": [
+    {
+      "text": "`prod-eu` is on 1.30, stable is 1.31",
+      "severity": "major",
+      "detail": "auto-upgrade is off"
+    }
+  ],
+  "after": ["2 more are in the ledger issue."],
+  "fold": {
+    "title": "why",
+    "text": "Each cluster's channel and version, as `gcloud` reported them.",
+    "table": {
+      "columns": ["cluster", "channel", "version"],
+      "rows": [["prod-eu", "none", "1.30.4"]]
+    }
+  },
+  "links": [
+    {
+      "text": "Ledger issue #231",
+      "url": "https://github.com/o/r/issues/231",
+      "primary": true
+    }
+  ],
+  "choices": [{ "text": "Look at the first one" }],
+  "plan": {
+    "title": "Upgrade readiness",
+    "items": [
+      {
+        "id": "t-1",
+        "title": "Read cluster versions",
+        "status": "complete",
+        "steps": ["listed 12 clusters"],
+        "note": "",
+        "result": "12 read"
+      }
+    ]
+  },
+  "mark": { "ask": "question", "settle": "done" }
+}
+```
+
+Every field but `schema` is optional, and a renderer omits whatever is absent or empty.
+
+| Field      | Rules                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
+| ---------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `schema`   | Required, exactly `kube-agents.chat/v1`. A renderer that does not know the value posts the TextPart.                                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| `headline` | Plain text, one line, at most 150 characters. Rendered bold.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| `note`     | Plain text, one line, at most 300 characters. Rendered after the headline, not bold.                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| `tone`     | `info`, `success`, `warning` or `critical`. The message's colour where a backend has one (Slack's side bar: `success` green, `warning` yellow). Never the only place a fact is stated.                                                                                                                                                                                                                                                                                                                                                              |
+| `rows`     | At most 10. Each has `text` (markdown, at most 300 characters), optional `severity` (a token of 1-16 characters `[a-z0-9-]`, rendered as inline code ahead of the text, eg `critical`) and optional `detail` (markdown, at most 300, a second line).                                                                                                                                                                                                                                                                                                |
+| `after`    | At most 5 plain lines, at most 300 characters each, rendered after the rows.                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| `fold`     | One collapsed section. `title` plain, at most 40 characters (default `why`); `text` markdown, at most 12,000 characters; optional `table` with 1-6 `columns` (plain, at most 40 each) and at most 20 `rows`, each exactly as wide as `columns`, cells plain, at most 200.                                                                                                                                                                                                                                                                           |
+| `links`    | At most 5. `text` plain, at most 75; `url` `https` or `http` with a host, no userinfo, no whitespace, at most 3,000; `primary` true on at most one.                                                                                                                                                                                                                                                                                                                                                                                                 |
+| `choices`  | At most 5. `text` plain, at most 75. A click arrives as a message from the clicker whose text is exactly `text` (#2149: clicks are text, through the principal map, no new intent).                                                                                                                                                                                                                                                                                                                                                                 |
+| `plan`     | `title` plain, at most 256. `items`: at most 20, each with `id` (opaque, unique in the plan), `title` (plain, at most 256), `status` (`pending`, `in_progress`, `complete` or `error`), `steps` (at most 6 plain lines, at most 300 each), `note` and `result` (plain, at most 300).                                                                                                                                                                                                                                                                |
+| `mark`     | Reaction state for the ask that started the task: `ask` is `question`, `change`, `board` or `incident`, and `settle` is `done`, `blocked` or `failed`. It is state, not operations. A chat message that carries `mark` carries the whole current mark (one without it changes nothing), and the adapter adds a reaction for a value that appears and removes the one for a value that is gone or changed (a `blocked` that lifts, the `ask` once the answer posts), best-effort both ways (#2149, amended 10/8). Which emoji is the adapter's rule. |
+
+The caps are the `today` presenter's (`slack_presenter.py`, `slack_status.py`), so a port
+renders the same thing on both paths, and every one fits Slack's own limits.
+
+### Rules
+
+- **The TextPart is the answer.** It stands alone: everything a reader needs is in it,
+  because a consumer that is not a chat renderer (another agent, the eval, an older
+  gateway) reads only it. The chat message is a layout of the same content and adds no
+  fact the text lacks. A chat message with no TextPart beside it is invalid.
+- **The renderer validates, then renders or falls back.** A chat message that breaks any
+  rule above (an unknown `schema`, a cap exceeded, a `tone` outside the enum, an unsafe
+  url) is dropped whole and the TextPart posted, with the reason logged and counted. A
+  renderer does not clip, repair or partly render one: clipping would hide an emitter
+  bug that the fallback makes visible. Unknown fields are ignored, so `v1` can grow.
+- **Text never mentions.** Every plain and markdown field is escaped by the renderer, so
+  no field can mention a user, a group or a channel, and markdown links render only
+  for the url rule above. The same rule holds for the TextPart on the way out
+  (the gateway's existing escaping).
+- **The gateway renders, it doesn't compose.** It neither invents fields nor reads the
+  TextPart to fill one. Who emits the chat message is the executor's business. Under
+  `next` the Hermes bridge does, as a port of the `today` presenter's rules, with the same
+  fixtures (#2149).
+- **Size.** The part counts against the envelope's max message size like any other. A
+  `result` too large with it is published without it: the text is the deliverable.
+
 ## Topics
 
 Tasks are conversations. Topics are the blackboard: durable, named subjects where agents
@@ -717,6 +833,15 @@ Verified identity (added 9/9):
     carve-out, held by the `provision` principal the rendered Job authenticates as and by the
     static `seed` identity beside it; neither verb returns an entry). Per `AGENTS.md` those
     belong in `tests/conformance/`.
+
+Chat messages (added 10/8):
+
+27. A chat message is never emitted without a TextPart in the same part list, and a
+    `result` that carries one carries it on its last chunk only.
+28. A renderer given a chat message that breaks any rule in the Chat messages section
+    (an unknown `schema`, a cap exceeded, an enum value outside its set, an unsafe url)
+    posts the TextPart and nothing from the chat message, and logs the reason. No field,
+    escaped or not, renders as a mention.
 
 ## Open Questions
 
