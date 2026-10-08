@@ -48,9 +48,23 @@ and the baseline recorded. Shapes are risks, never incidents; each writes a
 `risk` guard beside the symptoms' `failure` guards. The JSON carries the same
 grouping under `sections` beside the per-cluster `reviews`.
 
+Projects come from `--project`, else `MONITORED_PROJECT_IDS`, else the
+active gcloud project plus `gcloud projects list`.
+
 The store (`ledger.json`, `guards.json`, `reports/`) lives on the shell
 sandbox's data volume under /opt/data/upgrade-retrospective, readable by the
-agent's tools in any session and surviving restarts. An unchanged cluster
+agent's tools in any session and surviving restarts. One run at a time: an
+exclusive lock on `.lock` there is held for the whole run, and a second run
+exits 0 saying so with nothing written (`--dry-run` takes no lock). A run
+writes its report, then the JSON, then the guards, then the ledger last, each
+atomically, so a crash leaves at most a report with no ledger advance. A
+ledger or guards file that exists but cannot be read, or carries another
+version, is moved aside as `<name>.unreadable-<ts>` and the run stops: that
+file is a crash record, not a re-baseline, and a run proceeds as a first run
+only when no ledger file existed at all. A cluster with an upgrade operation
+still in flight is not reviewed; Info lists it as upgrading now, nothing is
+read from it and no guard is written, and only operations that ended inside
+the window count. An unchanged cluster
 that still holds a live guard is re-read cheaply every run -- only the reads
 its guards need -- so a guard clears when an operator's fix lands between
 upgrades, without waiting for the next one. The weekly run therefore
@@ -68,6 +82,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import fcntl
 import json
 import os
 import re
@@ -95,6 +110,11 @@ DATA_SUBDIR = "upgrade-retrospective"
 LEDGER_FILENAME = "ledger.json"
 GUARDS_FILENAME = "guards.json"
 REPORTS_SUBDIR = "reports"
+# One run at a time per store: an exclusive, non-blocking lock on this file.
+LOCK_FILENAME = ".lock"
+LOCK_HELD_TEXT = "another retrospective run holds {path} since {since}; nothing written"
+STATE_UNREADABLE_TEXT = "{path} {why}; moved to {aside}. A set-aside ledger is a crash record, not a re-baseline: restore it or remove it on purpose, then rerun. Nothing written."
+EXIT_USAGE = 2
 REPORT_FILENAME = "upgrade-retro-report-{date}.md"
 LATEST_REPORT_LINK = "upgrade-retro-report.md"
 # The report file and its link are swapped in through these.
@@ -127,9 +147,8 @@ MESSAGE_EXCERPT_CHARS = 400
 FILE_MODE = 0o666
 TEMP_SUFFIX = ".tmp"
 
-# Project discovery, mirroring `fleet_upgrade_report.py`: an explicit list in
-# the environment wins, otherwise the configured project plus every project
-# the credential can list.
+# Project discovery: `--project`, else `MONITORED_PROJECT_IDS`, else the
+# active gcloud project plus `gcloud projects list`.
 MONITORED_PROJECTS_ENV = "MONITORED_PROJECT_IDS"
 PROJECT_ENV_VARS = ("GCP_PROJECT_ID", "GKE_PROJECT_ID", "PROJECT_ID")
 # gcloud's words for a project whose Kubernetes Engine API is off: it cannot
@@ -558,8 +577,12 @@ SEVERITY_ERROR, SEVERITY_WARNING = "error", "warning"
 # Incident kinds: a symptom on an object, an operation GKE reported failed,
 # a guard from an earlier run on a cluster this run did not review.
 INCIDENT_SYMPTOM, INCIDENT_OPERATION, INCIDENT_STALE_GUARD = "symptom", "operation", "stale-guard"
-# GKE operation statuses that are not a failure on their own.
-OPERATION_OK_STATUSES = ("DONE", "RUNNING", "PENDING")
+# GKE operation statuses: only a DONE operation with an end time counts for
+# a review; one still PENDING, RUNNING or ABORTING holds its cluster back.
+OPERATION_TERMINAL_STATUS = "DONE"
+OPERATION_IN_FLIGHT_STATUSES = ("PENDING", "RUNNING", "ABORTING")
+INFO_UPGRADING = "Upgrading now:"
+UPGRADING_LINE = "{cluster}: upgrading now ({operation} {target} since {start}); reviewed on the next run"
 OPERATION_OBJECT_PREFIX = "operation/"
 NO_OPERATION_LINE = "no upgrade operation in the window"
 NODE_AFTER_POOL_UPGRADE_ENTRY = ENTRY_NODE_AGENT
@@ -663,8 +686,9 @@ def run_json(argv: list[str], *, run: RunFn, timeout: int = GCLOUD_TIMEOUT_S, en
 
 def discover_projects(*, run: RunFn) -> tuple[list[str], list[str]]:
     """The projects to enumerate when `--project` is absent, and the reads
-    that failed on the way. An explicit `MONITORED_PROJECT_IDS` wins; otherwise
-    the configured project plus every project the credential can list."""
+    that failed on the way: `MONITORED_PROJECT_IDS` (with any `GCP_PROJECT_ID`,
+    `GKE_PROJECT_ID`, `PROJECT_ID`) when set; otherwise the active gcloud
+    project plus every project `gcloud projects list` returns."""
     errors: list[str] = []
     monitored = set(os.environ.get(MONITORED_PROJECTS_ENV, "").replace(",", " ").split())
     projects = set(monitored)
@@ -768,13 +792,19 @@ def pool_cgroup_modes(cluster: dict) -> dict[str, str]:
 # --------------------------------------------------------------------------- #
 
 
+class StateUnreadable(Exception):
+    """A ledger or guards file exists but cannot be used. The run stops: a
+    set-aside ledger is a crash record, not a re-baseline, and a run proceeds
+    as a first run only when no ledger file existed at all."""
+
+
 def _set_aside(path: Path, why: str, now: datetime) -> None:
-    """Move a state file this run will not use out of the way, so a rewrite
-    cannot destroy it and the operator can read what was there."""
+    """Move a state file this run cannot use out of the way, so nothing
+    overwrites it, and stop."""
     aside = path.with_name(path.name + UNREADABLE_SUFFIX.format(ts=now.strftime("%Y%m%dT%H%M%SZ")))
     with contextlib.suppress(OSError):
         os.replace(path, aside)
-    log(f"WARNING: {path} {why}; moved to {aside} and starting from empty")
+    raise StateUnreadable(STATE_UNREADABLE_TEXT.format(path=path, why=why, aside=aside))
 
 
 def load_json(path: Path, default: dict, *, version: int | None = None, now: datetime | None = None) -> dict:
@@ -785,14 +815,11 @@ def load_json(path: Path, default: dict, *, version: int | None = None, now: dat
     except FileNotFoundError:
         return default
     except (OSError, json.JSONDecodeError) as exc:
-        _set_aside(path, f"unreadable ({exc})", now)
-        return default
+        _set_aside(path, f"is unreadable ({exc})", now)
     if not isinstance(loaded, dict):
         _set_aside(path, "is not a JSON object", now)
-        return default
     if version is not None and loaded.get("version") != version:
         _set_aside(path, f"has version {loaded.get('version')!r}, this collector writes {version}", now)
-        return default
     return loaded
 
 
@@ -825,6 +852,14 @@ def write_json_atomically(path: Path, doc: object) -> None:
         raise
 
 
+def _op_end(op: dict) -> datetime | None:
+    return parse_ts(op.get("endTime"))
+
+
+def _op_in_flight(op: dict) -> bool:
+    return (op.get("status") or "") in OPERATION_IN_FLIGHT_STATUSES or ((op.get("status") or "") != OPERATION_TERMINAL_STATUS and _op_end(op) is None)
+
+
 class Selection(NamedTuple):
     cluster: dict
     key: str
@@ -834,16 +869,24 @@ class Selection(NamedTuple):
     operations: list[dict]
 
 
-def select_clusters(clusters: list[dict], ledger: dict, operations: list[dict], *, since: datetime, forced: set[str]) -> tuple[list[Selection], list[dict]]:
-    """Which clusters this run reviews, and why; the rest as unchanged rows."""
+def select_clusters(clusters: list[dict], ledger: dict, operations: list[dict], *, since: datetime, forced: set[str]) -> tuple[list[Selection], list[dict], list[dict]]:
+    """Which clusters this run reviews, and why; the rest as unchanged rows;
+    and the clusters an operation still in flight holds back until the next
+    run. Only an operation that ended, inside the window, counts."""
     by_target: dict[tuple[str, str, str], list[dict]] = {}
     for op in operations:
         target = parse_target_link(op.get("targetLink", ""))
         if target and op.get("operationType") in UPGRADE_OPERATION_TYPES:
             by_target.setdefault((op.get("project") or "", target[0], target[1]), []).append(op)
-    selected, unchanged = [], []
+    selected, unchanged, upgrading = [], [], []
     for cluster in clusters:
         key = cluster_key(cluster["project"], cluster["location"], cluster["name"])
+        cluster_ops = by_target.get((cluster["project"], cluster["location"], cluster["name"]), [])
+        in_flight = [op for op in cluster_ops if _op_in_flight(op)]
+        if in_flight:
+            op = operation_summary(sorted(in_flight, key=lambda o: o.get("startTime") or "")[0])
+            upgrading.append({"cluster": key, "operation": op})
+            continue
         entry = (ledger.get("clusters") or {}).get(key)
         if entry is not None and not entry.get("last_run"):
             # Enumerated once but never reviewed (its reads failed): still new.
@@ -869,14 +912,14 @@ def select_clusters(clusters: list[dict], ledger: dict, operations: list[dict], 
             if partial and partial >= last_run:
                 reasons.append(f"previous review at {entry['partial_read']} read the cluster partially")
         ops = sorted(
-            (op for op in by_target.get((cluster["project"], cluster["location"], cluster["name"]), []) if (parse_ts(op.get("startTime")) or since) >= window_start),
+            (op for op in cluster_ops if (op.get("status") or "") == OPERATION_TERMINAL_STATUS and _op_end(op) and _op_end(op) >= window_start),
             key=lambda op: op.get("startTime") or "",
         )
         if entry is not None:
-            # Only an operation since the last run makes a known cluster
-            # "upgraded"; a forced review widens the window without that.
+            # Only an operation that ended since the last run makes a known
+            # cluster "upgraded"; a forced review widens the window without that.
             last_run = parse_ts(entry.get("last_run")) or since
-            recent = [op for op in ops if (parse_ts(op.get("startTime")) or since) >= last_run]
+            recent = [op for op in ops if _op_end(op) >= last_run]
             if recent:
                 reasons.append(f"{len(recent)} upgrade operation(s) since {fmt_ts(last_run)}")
         if key in forced:
@@ -887,7 +930,8 @@ def select_clusters(clusters: list[dict], ledger: dict, operations: list[dict], 
             continue
         selected.append(Selection(cluster, key, status, reasons, window_start, ops))
     unchanged.sort(key=lambda row: row["cluster"])
-    return selected, unchanged
+    upgrading.sort(key=lambda row: row["cluster"])
+    return selected, unchanged, upgrading
 
 
 def what_happened(selection: Selection, ledger: dict) -> dict:
@@ -2090,7 +2134,7 @@ def _versions_table(before: dict | None, after: dict) -> list[str]:
 
 
 def _operation_failed(op: dict) -> bool:
-    return bool(op.get("error")) or (op.get("status") or "") not in OPERATION_OK_STATUSES
+    return bool(op.get("error")) or (op.get("status") or "") != OPERATION_TERMINAL_STATUS
 
 
 def _symptom_severity(symptom: dict) -> str:
@@ -2117,7 +2161,7 @@ def _incident_key(incident: dict) -> tuple[str, str]:
     return incident["cluster"], incident["object"]
 
 
-def triage(reviews: list[dict], unchanged: list[dict], failed_reads: list[str], guards: list[dict], seen_at: str, removed: list[str] | None = None, rechecks: list[dict] | None = None) -> dict:
+def triage(reviews: list[dict], unchanged: list[dict], failed_reads: list[str], guards: list[dict], seen_at: str, removed: list[str] | None = None, rechecks: list[dict] | None = None, upgrading: list[dict] | None = None) -> dict:
     """Group the reviews into the report's three sections. An incident is one
     object on one cluster: its symptoms, their (C) rows and the guards it
     produced, plus the cluster's (A) summary."""
@@ -2200,7 +2244,7 @@ def triage(reviews: list[dict], unchanged: list[dict], failed_reads: list[str], 
     return {
         "errors": errors,
         "warnings": warnings,
-        "info": {"clean": clean, "unchanged": unchanged, "failed_reads": failed_reads, "removed": list(removed or []), "rechecked": list(rechecks or [])},
+        "info": {"clean": clean, "unchanged": unchanged, "failed_reads": failed_reads, "removed": list(removed or []), "rechecked": list(rechecks or []), "upgrading": list(upgrading or [])},
     }
 
 
@@ -2329,7 +2373,7 @@ def render_report(result: dict) -> str:
             lines += _incident_lines(incident)
     info = sections["info"]
     lines += [SECTION_INFO, ""]
-    if not (info["clean"] or info["unchanged"] or info["failed_reads"] or info.get("removed") or info.get("rechecked")):
+    if not (info["clean"] or info["unchanged"] or info["failed_reads"] or info.get("removed") or info.get("rechecked") or info.get("upgrading")):
         lines += [NONE_LINE, ""]
     # Severity sections keep `_none_`; Info is never empty after a review.
     for row in info["clean"]:
@@ -2339,6 +2383,12 @@ def render_report(result: dict) -> str:
         for row in info["unchanged"]:
             nu = row.get("next_upgrade") or {}
             lines.append(f"- {_cell(row['cluster'])} at {_cell(row['control_plane'])}; last upgrade operation {row.get('last_operation') or 'none recorded'}; next target {_cell(nu.get('target') or 'unknown')}{' (behind)' if nu.get('below_target') else ''}; last reviewed {row['last_run'] or 'never'}")
+        lines.append("")
+    if info.get("upgrading"):
+        lines += [INFO_UPGRADING, ""]
+        for row in info["upgrading"]:
+            op = row["operation"]
+            lines.append("- " + UPGRADING_LINE.format(cluster=_cell(row["cluster"]), operation=_cell(op["type"]), target=_cell(op["target"]), start=op["start"] or "?"))
         lines.append("")
     if info.get("rechecked"):
         lines += [INFO_RECHECKED, ""]
@@ -2377,7 +2427,7 @@ def parse_since(text: str | None, now: datetime) -> datetime:
     return parsed
 
 
-def ledger_after(ledger: dict, reviews: list[dict], clusters: list[dict], seen_at: str, operations: dict[str, list[dict]] | None = None, removed: set[str] | None = None) -> dict:
+def ledger_after(ledger: dict, reviews: list[dict], clusters: list[dict], seen_at: str, operations: dict[str, list[dict]] | None = None, removed: set[str] | None = None, skip: set[str] | None = None) -> dict:
     """Every enumerated cluster's current versions; `last_run` moves only for
     a cluster this run reviewed in full, so a failed or partial read is
     retried next time (`partial_read` records the attempt and re-selects
@@ -2388,6 +2438,9 @@ def ledger_after(ledger: dict, reviews: list[dict], clusters: list[dict], seen_a
     partial = {r["cluster"] for r in reviews if r["partial"] and not r["reviewed"]}
     for cluster in clusters:
         key = cluster_key(cluster["project"], cluster["location"], cluster["name"])
+        if key in (skip or set()):
+            # Upgrading now: nothing recorded until it is reviewed.
+            continue
         current = versions_of(cluster)
         old = entries.get(key) or {}
         if key in reviewed or not old:
@@ -2455,8 +2508,8 @@ def collect(args: argparse.Namespace, *, run: RunFn | None = None, now: datetime
         for key in sorted(missing):
             failed_reads.append(f"{key}: named by --cluster but not listed in its project")
 
-    selected, unchanged = select_clusters(clusters, ledger, operations, since=since, forced=forced)
-    log(f"{len(clusters)} cluster(s) in {len(projects)} project(s); reviewing {len(selected)}, {len(unchanged)} unchanged")
+    selected, unchanged, upgrading = select_clusters(clusters, ledger, operations, since=since, forced=forced)
+    log(f"{len(clusters)} cluster(s) in {len(projects)} project(s); reviewing {len(selected)}, {len(unchanged)} unchanged, {len(upgrading)} upgrading now")
     # One get-server-config per (project, location), in parallel, for every
     # cluster: the next target is printed for unchanged clusters too.
     locations = sorted({(c["project"], c["location"]) for c in clusters})
@@ -2498,7 +2551,7 @@ def collect(args: argparse.Namespace, *, run: RunFn | None = None, now: datetime
             guard["last_seen"] = seen_at
     for r in rechecks:
         failed_reads.extend(f"{r['cluster']}: re-check: {e}" for e in r["errors"])
-    new_ledger = ledger_after(ledger, reviews, clusters, seen_at, {s.key: s.operations for s in selected}, removed)
+    new_ledger = ledger_after(ledger, reviews, clusters, seen_at, {s.key: s.operations for s in selected}, removed, {row["cluster"] for row in upgrading})
 
     # Read failures from inside a review join the top-level list so Info
     # names every one in one place.
@@ -2512,17 +2565,26 @@ def collect(args: argparse.Namespace, *, run: RunFn | None = None, now: datetime
         "failed_reads": failed_reads,
         "removed_clusters": sorted(removed),
         "rechecks": rechecks,
-        "sections": triage(reviews, unchanged, failed_reads, new_guards["guards"], seen_at, sorted(removed), rechecks),
+        "upgrading": upgrading,
+        "sections": triage(reviews, unchanged, failed_reads, new_guards["guards"], seen_at, sorted(removed), rechecks, upgrading),
         "ledger_path": str(ledger_path),
         "guards_path": str(guards_path),
         "guards": new_guards["guards"],
         "dry_run": bool(args.dry_run),
     }
-    if not args.dry_run:
-        write_json_atomically(ledger_path, new_ledger)
-        write_json_atomically(guards_path, new_guards)
-        if args.output:
-            write_json_atomically(Path(args.output), result)
+    result["report"] = render_report(result)
+    if args.dry_run:
+        return result
+    # Write order: report, JSON, guards, ledger last -- each atomic -- so a
+    # crash leaves at most a report with no ledger advance.
+    if not getattr(args, "no_report", False):
+        report_path = Path(args.report) if args.report else data_dir() / REPORTS_SUBDIR / REPORT_FILENAME.format(date=now.strftime(REPORT_DATE_FORMAT))
+        write_report(report_path, result["report"])
+        result["report_path"] = str(report_path)
+    if args.output:
+        write_json_atomically(Path(args.output), {k: v for k, v in result.items() if k != "report"})
+    write_json_atomically(guards_path, new_guards)
+    write_json_atomically(ledger_path, new_ledger)
     return result
 
 
@@ -2543,7 +2605,7 @@ def write_report(path: Path, text: str) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Collect what each new or upgraded cluster's last upgrade did, and classify what failed against the upgrade failure catalogue.")
-    parser.add_argument("--project", action="append", help=f"GCP project to enumerate (repeatable; default: ${MONITORED_PROJECTS_ENV}, else the configured project plus every project `gcloud projects list` returns)")
+    parser.add_argument("--project", action="append", help=f"GCP project to enumerate (repeatable); without it ${MONITORED_PROJECTS_ENV}, else the active gcloud project plus every project `gcloud projects list` returns")
     parser.add_argument("--cluster", action="append", help="<project>/<location>/<name>: restrict to this cluster and review it even if unchanged (repeatable)")
     parser.add_argument("--since", help=f"window for a cluster not yet in the ledger: <days>, <days>d or an RFC 3339 timestamp (default {DEFAULT_SINCE_DAYS} days)")
     parser.add_argument("--ledger", help=f"ledger path (default ${STORE_HOME_ENV}/{LEDGER_FILENAME}, {DEFAULT_STORE_DIR}/{LEDGER_FILENAME})")
@@ -2555,19 +2617,49 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def acquire_lock(path: Path):
+    """An exclusive, non-blocking lock on `path` for the whole run; None
+    when another run holds it. The handle keeps the lock until it is closed."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle = open(path, "a+", encoding="utf-8")  # noqa: SIM115 -- held for the run
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        handle.close()
+        return None
+    os.utime(path, None)
+    return handle
+
+
+def lock_held_line(path: Path) -> str:
+    try:
+        since = fmt_ts(datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc))
+    except OSError:
+        since = "unknown"
+    return LOCK_HELD_TEXT.format(path=path, since=since)
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    lock = None
+    if not args.dry_run:
+        lock_path = data_dir() / LOCK_FILENAME
+        lock = acquire_lock(lock_path)
+        if lock is None:
+            print(lock_held_line(lock_path))
+            return 0
     try:
         result = collect(args)
     except argparse.ArgumentTypeError as exc:
         print(str(exc), file=sys.stderr)
-        return 2
-    report = render_report(result)
-    sys.stdout.write(report)
-    if not args.dry_run and not args.no_report:
-        generated = parse_ts(result["generated_at"]) or now_utc()
-        path = Path(args.report) if args.report else data_dir() / REPORTS_SUBDIR / REPORT_FILENAME.format(date=generated.strftime(REPORT_DATE_FORMAT))
-        write_report(path, report)
+        return EXIT_USAGE
+    except StateUnreadable as exc:
+        print(str(exc), file=sys.stderr)
+        return EXIT_USAGE
+    finally:
+        if lock is not None:
+            lock.close()
+    sys.stdout.write(result["report"])
     return 0
 
 
