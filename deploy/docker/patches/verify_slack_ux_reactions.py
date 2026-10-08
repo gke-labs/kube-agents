@@ -342,7 +342,12 @@ def _load_runtime(root: Path):
 async def _drive(module) -> None:
     success = SimpleNamespace(value="success")
     failure = SimpleNamespace(value="failure")
-    failed = [(CHANNEL, ASK_TS, "x", TEAM, False)]
+
+    def react(emoji: str, remove: bool = False) -> tuple:
+        return (CHANNEL, ASK_TS, emoji, TEAM, remove)
+
+    change, question = react("hammer_and_wrench"), react("eyes")
+    failed = react("x")
 
     os.environ.pop(FLAG_ENV, None)
     if module.enabled():
@@ -360,8 +365,11 @@ async def _drive(module) -> None:
     module.open_cards = open_cards
     module.thread_lineage = thread_lineage
 
-    # A direct answer: nothing on arrival or success; ❌ at once on failure.
-    for outcome, expected in ((success, []), (failure, failed)):
+    # A direct answer: its kind on arrival, off when it answers, with ❌ on failure.
+    for outcome, expected in (
+        (success, [change, react("hammer_and_wrench", True)]),
+        (failure, [change, failed, react("hammer_and_wrench", True)]),
+    ):
         adapter = _StubAdapter()
         boards[:] = [{}, {}]
         await module.on_processing_start(adapter, _event("fix it"))
@@ -369,20 +377,26 @@ async def _drive(module) -> None:
         if adapter.calls != expected:
             raise _fail(f"a direct {outcome.value} reacted {adapter.calls!r}, expected {expected!r}")
 
-    # A delegated answer: nothing at completion; the notifier's terminal event
-    # settles it, and only a give-up shows. The third read is the settle's look
-    # for follow-up cards: none.
+    # A delegated answer keeps its kind past the acknowledgement; the notifier's
+    # terminal event settles it, ⏸️ standing between a block and its unblock.
+    # The third read is the settle's look for follow-up cards: none.
     sub = {"platform": "slack", "chat_id": CHANNEL, "thread_id": THREAD, "task_id": CARD}
-    for kind, expected in (("completed", []), ("gave_up", failed)):
+    paused, resumed = react("double_vertical_bar"), react("double_vertical_bar", True)
+    for kinds, expected in (
+        (("completed",), [react("eyes", True)]),
+        (("gave_up",), [failed, react("eyes", True)]),
+        (("blocked", "unblocked", "completed"), [paused, resumed, react("eyes", True)]),
+    ):
         adapter = _StubAdapter()
         boards[:] = [{}, {(module.DEFAULT_BOARD, CARD): module._Card("running")}, {}]
         await module.on_processing_start(adapter, _event("is seeded-a healthy?"))
         await module.on_processing_complete(adapter, _event("is seeded-a healthy?"), success)
-        if adapter.calls:
-            raise _fail(f"delegated answer reacted before the notifier: {adapter.calls!r}")
-        await module.settle_delegated(adapter, sub, kind)
-        if adapter.calls != expected:
-            raise _fail(f"a delegated answer whose card {kind} reacted {adapter.calls!r}, expected {expected!r}")
+        if adapter.calls != [question]:
+            raise _fail(f"delegated answer settled before the notifier: {adapter.calls!r}")
+        for kind in kinds:
+            await module.settle_delegated(adapter, sub, kind)
+        if adapter.calls[1:] != expected:
+            raise _fail(f"a delegated answer whose card went {kinds} reacted {adapter.calls!r}, expected {expected!r}")
     os.environ.pop(FLAG_ENV, None)
 
 
@@ -395,7 +409,8 @@ def main(root: Path = Path("/opt/hermes"), *, board_read: bool = True) -> None:
     print(
         "slack_ux_reactions verify: both hooks guarded ahead of upstream's body; "
         "adapter members in the shape the runtime calls; board read finds open cards on every board; "
-        "runtime shows only a failure, at once for a direct answer and at the notifier for a delegated one, never removes"
+        "runtime reacts with the ask's kind until it is answered, at once for a direct answer and at the "
+        "notifier for a delegated one, with ⏸️ while it waits on the user and ❌ left only on failure"
     )
 
 
