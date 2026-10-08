@@ -132,6 +132,23 @@ def test_a_lead_on_its_own_line_needs_no_full_stop():
     assert _run("**No node is under memory pressure**\n\nAll three report False.").success
 
 
+def test_a_one_word_or_heading_span_on_its_own_line_is_a_label():
+    for result in (
+        "**Memory**\n\nNo node is under pressure. All pods outside kube-system are Running.",
+        "**Summary**\n\nNo node is under memory pressure.",
+        "**## No node is under memory pressure**\n\nAll three report False.",
+    ):
+        assert "not a whole sentence" in _run(result, lead_terms=["memory"]).reason, result
+
+
+def test_report_contains_fold_keeps_its_own_link_rule():
+    # answer_first's link pattern is named apart, so it does not rebind the fold's.
+    from kube_agents_bench.verifiers import _fold_line_decoration
+
+    line = "[seeded-a](https://console.example us-central1): control plane is zonal"
+    assert _fold_line_decoration(line) == "seeded-a: control plane is zonal"
+
+
 def test_abbreviations_end_no_sentence():
     outcome = _run("**Every node reports pressure False, e.g. node-a.** Checked at 10 a.m. vs. yesterday.")
     assert outcome.success, outcome.reason

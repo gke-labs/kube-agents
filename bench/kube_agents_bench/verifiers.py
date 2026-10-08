@@ -711,11 +711,13 @@ _TERMINAL = ".!?"
 # "**No**: ...", "**Yes** \u2014 ...". A longer span before a colon is a label ("**Memory check**:").
 _LEAD_CLAUSE = (":", "\u2014", "\u2013")
 _WHITESPACE = re.compile(r"\s")
+_HEADING_MARK = "#"
 # A later bold span closed without a stop and followed by a colon, a dash or the line's end:
 # a section label. After an unpunctuated lead, it makes the lead one label of several.
 _BOLD_SECTION = re.compile(r"\*\*[^*\n]+?(?<![.!?])\*\*[ \t]*(?:[:\u2014\u2013]|$)", re.MULTILINE)
-# A markdown link; chat shows its text, not its target.
-_MARKDOWN_LINK = re.compile(r"\[([^\]]*)\]\([^)\s]*\)")
+# A markdown link; chat shows its text, not its target. Named apart from report_contains'
+# _MARKDOWN_LINK above, whose fold keeps its own rule (non-empty text, one line).
+_ANSWER_LINK = re.compile(r"\[([^\]]*)\]\([^)\s]*\)")
 # Bold and code markers, which chat renders rather than shows.
 _UNSHOWN_MARKUP = re.compile(r"\*\*|`")
 
@@ -801,18 +803,21 @@ class AnswerFirstVerifier(BaseVerifier):
             if _INNER_SENTENCE_BREAK.search(_unabbreviate(inner)):
                 defects.append(f"the bold lead is more than one sentence: {inner!r}")
             elif not (inner.endswith(tuple(_TERMINAL)) or after[:1] in tuple(_TERMINAL)):
+                # A span alone on its line is a sentence missing its stop only when it reads as
+                # one: a single word ("**Memory**") or a heading mark is a label.
+                own_line = not after.split("\n", 1)[0].strip()
                 if not (
                     (after.lstrip(" ").startswith(_LEAD_CLAUSE) and not _WHITESPACE.search(inner))
-                    or not after.split("\n", 1)[0].strip()
+                    or (own_line and _WHITESPACE.search(inner) and not inner.startswith(_HEADING_MARK))
                 ):
                     defects.append(f"the bold span is not a whole sentence: {inner!r}")
                 elif _BOLD_SECTION.search(after):
                     defects.append(f"the bold lead is one of several bold labels: {inner!r}")
-            lead_text = _normalize(_MARKDOWN_LINK.sub(r"\1", inner))
+            lead_text = _normalize(_ANSWER_LINK.sub(r"\1", inner))
             rest = after.lstrip(_LEAD_TRAIL)
         if _ATX_HEADING.search(_FENCE.sub("", result)):
             defects.append("carries a section heading")
-        shown = len(_UNSHOWN_MARKUP.sub("", _MARKDOWN_LINK.sub(r"\1", result)))
+        shown = len(_UNSHOWN_MARKUP.sub("", _ANSWER_LINK.sub(r"\1", result)))
         if shown > self.max_chars:
             defects.append(f"{shown} characters, over {self.max_chars}")
         later = _sentences(rest)
