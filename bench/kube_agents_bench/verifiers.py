@@ -754,7 +754,7 @@ class ToolCalledVerifier(BaseVerifier):
 
     ``arguments``: optional map of argument name to Python regular expression.
     When set, a call counts only if each named argument is present and its
-    value, as a string, ``re.fullmatch``\ es its pattern: the shape of what was
+    value, as a string, matches its pattern under ``re.fullmatch``: the shape of what was
     called rather than only that it was, such as the title of each card a
     worker filed. Read from the entry's own ``args``, so a call made through
     the ``tool_call`` wrapper, whose arguments sit one level down, never
