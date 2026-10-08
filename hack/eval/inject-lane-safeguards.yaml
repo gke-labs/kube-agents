@@ -8,8 +8,10 @@
 # the cases that request a pull request in the second phase below (#2260),
 # and appends nothing.
 #
-# Why a lane-level list. Through the inject door the eval addresses the
-# platform persona directly, which opens its pull requests through
+# Why a lane-level list. Through the inject door the eval reaches the
+# platform persona (directly under the bridge's cli executor, which that first
+# run used; through a card the Planning Agent files under its default api
+# executor), which opens its pull requests through
 # submit-suggestion, and the first matrix run through it left pull requests on
 # the pool project's GitOps repository that no case had asked for (#2037; the
 # persona's rule since then puts a diagnosis's fix in the reply, SOUL.md §3

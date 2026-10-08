@@ -1439,6 +1439,10 @@ var writeRoles = []string{RepositoryRoleGitOps, RepositoryRoleManaged}
 // repository on another host is refused rather than rewritten into a
 // same-named repository on this one. See
 // docs/designs/version-control-support.md §6.
+//
+// A gitlab forge's credentialsRef is required by the API server too, so it
+// holds with the webhook off -- the chart ships it off.
+// +kubebuilder:validation:XValidation:rule="!has(self.provider) || self.provider != 'gitlab' || has(self.credentialsRef)",message="a gitlab forge needs credentialsRef.name: the Secret holding its access token under the key token"
 type ForgeSpec struct {
 	// Name identifies the forge within this PlatformAgent. Repositories refer
 	// to it by this name. The deprecated GitHub alias is the forge "github".
@@ -1452,23 +1456,26 @@ type ForgeSpec struct {
 	// the agent reads which forge was declared rather than guessing from the
 	// URL's text.
 	//
-	// Only "github" is registered today; the enum grows with each agent-side
-	// provider. Defaults to "github".
-	// +kubebuilder:validation:Enum=github
+	// "github" and "gitlab" are registered; the enum grows with each
+	// agent-side provider. Defaults to "github".
+	// +kubebuilder:validation:Enum=github;gitlab
 	// +kubebuilder:default=github
 	// +optional
 	Provider string `json:"provider,omitempty"`
 
 	// Host is the forge hostname. Omit it for the provider's default
-	// ("github.com" for GitHub). A host the declared provider does not serve is
-	// rejected, and an alternative spelling of one it does serve resolves to the
-	// provider's canonical host.
+	// ("github.com" for GitHub, "gitlab.com" for GitLab). A host the declared
+	// provider does not serve is rejected, and an alternative spelling of one
+	// it does serve resolves to the provider's canonical host. For GitLab it may
+	// also be a self-managed instance's hostname, which every repository on the
+	// forge must then name or leave implied; a host another provider serves is
+	// rejected.
 	//
 	// The pattern is a DNS name, which every forge's host is; it is here rather
 	// than only in the webhook so the API server still refuses whitespace and
 	// control characters when the operator runs with ENABLE_WEBHOOKS=false.
 	// +kubebuilder:validation:MaxLength=253
-	// +kubebuilder:validation:Pattern=`^$|^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$`
+	// +kubebuilder:validation:Pattern=`^$|^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)*$`
 	// +optional
 	Host string `json:"host,omitempty"`
 
@@ -1482,7 +1489,9 @@ type ForgeSpec struct {
 	//
 	// On GitHub it is also the organisation the token minter scopes the
 	// agent's credentials to; a repository in another organisation is not
-	// given a token.
+	// given a token. On GitLab it, with the group of every repository declared
+	// on the forge, is the set of groups the credential broker serves, so a
+	// token that reaches further is still refused there.
 	//
 	// The schema pattern is every forge's grammar at once, not GitHub's: the
 	// tight rule depends on Provider and a CRD pattern cannot dispatch on a
@@ -1497,11 +1506,31 @@ type ForgeSpec struct {
 
 	// CredentialsRef names a Secret in the PlatformAgent's namespace holding
 	// the credentials for this forge. It is for providers whose credentials an
-	// administrator supplies. GitHub's come from the install's GitHub App
-	// through the token minter, so it is ignored for provider "github", and
-	// admission warns when it is set there.
+	// administrator supplies, and it is required for them. GitHub's come from
+	// the install's GitHub App through the token minter, so it is ignored for
+	// provider "github", and admission warns when it is set there.
+	//
+	// For GitLab the Secret holds an access token under the key `token`: a
+	// group or project access token, or a dedicated account's personal access
+	// token where the tier offers neither. It is mounted into the credential
+	// broker's pod only, never the agent's or the sandbox's, and read on every
+	// call, so rotating the token is updating the Secret.
 	// +optional
-	CredentialsRef *corev1.LocalObjectReference `json:"credentialsRef,omitempty"`
+	CredentialsRef *ForgeCredentialsRef `json:"credentialsRef,omitempty"`
+}
+
+// ForgeCredentialsRef names the Secret holding a forge's credential. The JSON
+// shape is corev1.LocalObjectReference's, so existing resources apply
+// unchanged; it is a type of its own so the name can carry the Secret-name
+// rule in the schema. The operator mounts the Secret into the broker's pod,
+// and a name the API server refuses there would otherwise pass admission and
+// then fail the broker Deployment's apply on every reconcile.
+type ForgeCredentialsRef struct {
+	// Name is the Secret's name: a lowercase DNS subdomain.
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=253
+	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$`
+	Name string `json:"name"`
 }
 
 // RepositorySpec declares one repository on a declared forge, and what the

@@ -2,11 +2,11 @@
 
 Following the decoupled trigger pattern established by rc-scheduler.yml and
 staging-promotion-scheduler.yml, release-scheduler.yml holds the cron trigger
-("17 6 * * 5") so that quiet ticks with nothing to release produce no
+("17 6 * * *") so that quiet ticks with nothing to release produce no
 pipeline run at all.
 
 These tests pin the structural invariants:
-- The scheduler holds the cron ("17 6 * * 5"), and release-publish.yml does not.
+- The scheduler holds the cron ("17 6 * * *"), and release-publish.yml does not.
 - The scheduler evaluates candidates via resolve_scheduled_release.sh.
 - Dispatch is strictly gated on steps.resolve.outputs.should_release == 'true'.
 - Skips are recorded via record_release_scheduler_skip.sh on should_release != 'true'.
@@ -22,7 +22,11 @@ _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 _WORKFLOWS = _REPO_ROOT / ".github" / "workflows"
 _SCHEDULER = "release-scheduler.yml"
 _PIPELINE = "release-publish.yml"
-_RELEASE_CRON = "17 6 * * 5"
+# Daily, at 06:17 UTC: after the nightly staging promotion (02:17 UTC) has had
+# time to push its staging_* tag, and off the top of the hour, where GitHub's
+# scheduler queues. test_release_publish_workflow.py asserts the daily shape
+# only; the exact value lives here.
+_RELEASE_CRON = "17 6 * * *"
 
 _DISPATCH_SCRIPT_NAME = "dispatch_release_pipeline.sh"
 _DISPATCH_SCRIPT = (
@@ -53,6 +57,51 @@ def _steps(doc: dict) -> list[dict]:
     return steps
 
 
+_DISPATCH_MARKERS = ("gh workflow run", "/dispatches", "createWorkflowDispatch")
+
+
+def _step_text(step: dict) -> str:
+    """A step's `run` script with `#`-led lines dropped, plus its `with` values.
+
+    `with` is where a dispatch action (`workflow:` input) or `actions/github-script`
+    (`script:` input) carries the pipeline's name, and a `#` line in a `run:` block
+    is a comment, not a dispatch.
+    """
+    run = step.get("run") or ""
+    lines = [line for line in run.splitlines() if not line.lstrip().startswith("#")]
+    with_values = [str(value) for value in (step.get("with") or {}).values()]
+    return "\n".join(lines + with_values)
+
+
+def _starts_the_pipeline(step: dict, pipeline_display_name: str) -> bool:
+    """Whether this step starts the release pipeline, as far as text can tell.
+
+    True for the sanctioned route (the dispatch script) and for any step that
+    both names the pipeline (by file or by display name) and carries a dispatch
+    form: `gh workflow run`, a `/dispatches` API call, `createWorkflowDispatch`,
+    or a `workflow:` input. Not covered, because no static match can see it: a
+    dispatch by the workflow's numeric ID.
+    """
+    text = _step_text(step)
+    if _DISPATCH_SCRIPT_NAME in text:
+        return True
+    names_it = _PIPELINE in text or pipeline_display_name in text
+    dispatches = any(marker in text for marker in _DISPATCH_MARKERS) or "workflow" in (step.get("with") or {})
+    return names_it and dispatches
+
+
+def _workflows_that_start_the_pipeline(scheduled_only: bool) -> list[str]:
+    display_name = _workflow(_PIPELINE)["name"]
+    holders = []
+    for path in sorted(_WORKFLOWS.glob("*.yml")):
+        doc = _workflow(path.name)
+        if scheduled_only and not (doc.get("on") or {}).get("schedule"):
+            continue
+        if any(_starts_the_pipeline(step, display_name) for step in _steps(doc)):
+            holders.append(path.name)
+    return holders
+
+
 class SchedulerOwnsTheCron(unittest.TestCase):
     def test_the_scheduler_carries_the_release_cron(self) -> None:
         schedule = _workflow(_SCHEDULER)["on"]["schedule"]
@@ -67,15 +116,62 @@ class SchedulerOwnsTheCron(unittest.TestCase):
             "the cron so that a tick with nothing to publish produces no run at all",
         )
 
-    def test_exactly_one_workflow_holds_the_release_cron(self) -> None:
-        """Two schedules would double-dispatch, and the second would be invisible."""
-        holders = []
-        for path in sorted(_WORKFLOWS.glob("*.yml")):
-            doc = _workflow(path.name)
-            for entry in (doc.get("on") or {}).get("schedule") or []:
-                if entry.get("cron") == _RELEASE_CRON:
-                    holders.append(path.name)
-        self.assertEqual(holders, [_SCHEDULER])
+    def test_exactly_one_scheduled_workflow_dispatches_the_pipeline(self) -> None:
+        """Two schedules would double-dispatch, and the second would be invisible.
+
+        Matched on what a workflow does rather than on the cron string: a daily
+        cron is a value other sweeps share, so sharing it proves nothing, while
+        a second scheduled workflow with a step that starts the pipeline is the
+        double dispatch this guards against. `_starts_the_pipeline` says what
+        counts as starting it, and what it cannot see.
+        """
+        self.assertEqual(_workflows_that_start_the_pipeline(scheduled_only=True), [_SCHEDULER])
+
+    def test_the_dispatch_script_is_the_only_route_in_any_workflow(self) -> None:
+        """One sanctioned route: the scheduler's step that runs the dispatch script.
+
+        Scheduled or not, no other workflow starts the pipeline, and the scheduler
+        does so only through `dispatch_release_pipeline.sh`, so a second route
+        anywhere in the tree fails here before it can be scheduled.
+        """
+        self.assertEqual(_workflows_that_start_the_pipeline(scheduled_only=False), [_SCHEDULER])
+        display_name = _workflow(_PIPELINE)["name"]
+        starting_steps = [
+            step for step in _steps(_workflow(_SCHEDULER)) if _starts_the_pipeline(step, display_name)
+        ]
+        self.assertEqual(starting_steps, [_dispatch_step(_workflow(_SCHEDULER))])
+
+    def test_what_the_dispatch_match_covers(self) -> None:
+        """Comments in YAML or in a `run:` block do not count; `run:` and `with:` dispatches do."""
+        display_name = "Release & Publish (GA)"
+
+        def step(yaml_text: str) -> dict:
+            return yaml.safe_load(yaml_text)
+
+        self.assertFalse(
+            _starts_the_pipeline(step("run: |\n  # the gate lives in release-publish.yml\n  ./scripts/sweep.sh\n"), display_name)
+        )
+        self.assertFalse(_starts_the_pipeline(step("run: echo release-publish.yml is dispatch-only\n"), display_name))
+        self.assertTrue(
+            _starts_the_pipeline(step("run: gh workflow run 'Release & Publish (GA)' -f schedule_gate=evaluate\n"), display_name)
+        )
+        self.assertTrue(_starts_the_pipeline(step("run: gh workflow run release-publish.yml\n"), display_name))
+        self.assertTrue(
+            _starts_the_pipeline(
+                step("uses: some-org/workflow-dispatch@0123456789abcdef0123456789abcdef01234567\nwith:\n  workflow: release-publish.yml\n"),
+                display_name,
+            )
+        )
+        self.assertTrue(
+            _starts_the_pipeline(
+                step(
+                    "uses: actions/github-script@0123456789abcdef0123456789abcdef01234567\nwith:\n"
+                    "  script: |\n    await github.rest.actions.createWorkflowDispatch({workflow_id: 'release-publish.yml'})\n"
+                ),
+                display_name,
+            )
+        )
+        self.assertTrue(_starts_the_pipeline(step("run: ./scripts/release/dispatch_release_pipeline.sh\n"), display_name))
 
 
 class SchedulerDispatchWiring(unittest.TestCase):
