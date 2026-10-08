@@ -2505,6 +2505,7 @@ func a2aProvisionScript(agent *agentv1alpha1.PlatformAgent) string {
 		bridgeWorkersNoun = "worker"
 	}
 	bridgeDefault := strconv.Itoa(a2aBridgeDefaultConcurrency)
+	renderedDefault := strconv.Itoa(a2aRenderedBridgeDefaultConcurrency)
 	bridgeMax := strconv.Itoa(a2aBridgeConcurrencyMax)
 	// The reserve without its per-worker term and the term itself, so the
 	// script can compute the worker count that fits beside this CR's
@@ -2525,7 +2526,7 @@ func a2aProvisionScript(agent *agentv1alpha1.PlatformAgent) string {
 `
 	if a2aBridgeRendered(agent) {
 		bridgeNote = `  echo "  (the replay share of that reserve is sized for ` + bridgeWorkers + ` bridge ` + bridgeWorkersNoun + `: the operator renders the bridge, at the" >&2
-  echo "  ` + a2aBridgeConcurrencyOperatorEnvVar + ` in its own environment, or ` + bridgeDefault + ` when that is unset or not a count)." >&2
+  echo "  ` + a2aBridgeConcurrencyOperatorEnvVar + ` in its own environment, or ` + renderedDefault + ` when that is unset, ` + bridgeDefault + ` when it is not a count)." >&2
 `
 	}
 	if bridgeWorkersCapped {
@@ -2606,7 +2607,7 @@ echo "  read it, set it in env as a literal, which the kubelet lets override env
     echo "  workers - ` + a2aBridgeConcurrencyEnvVar + ` on its spec.deployment.sidecars entry; unset, the bridge runs ` + bridgeDefault + ` - which is" >&2`
 		if a2aBridgeRendered(agent) {
 			workerLever = `set the operator's ` + a2aBridgeConcurrencyOperatorEnvVar + ` to at most ${workers_fit}" >&2
-    echo "  - the operator renders the bridge; unset, it runs ` + bridgeDefault + ` - which is" >&2`
+    echo "  - the operator renders the bridge; unset, it runs ` + renderedDefault + ` - which is" >&2`
 		}
 		thirdLever = `  if [ "${workers_fit}" -ge 1 ]; then
     echo "Or keep spec.harness.tuning.maxSessions at ` + maxSessions + ` and ` + workerLever + `
@@ -3714,6 +3715,9 @@ func a2aProvisionRefusalStatus(agent *agentv1alpha1.PlatformAgent) string {
 		countIs := "The CR declares"
 		if a2aBridgeRendered(agent) {
 			source = fmt.Sprintf("the operator's rendered bridge runs (%s in the operator's environment)", a2aBridgeConcurrencyOperatorEnvVar)
+			if os.Getenv(a2aBridgeConcurrencyOperatorEnvVar) == "" {
+				source = fmt.Sprintf("the operator's rendered bridge runs (its default of %d, with no %s in the operator's environment)", a2aRenderedBridgeDefaultConcurrency, a2aBridgeConcurrencyOperatorEnvVar)
+			}
 			countIs = "The operator setting asks for"
 		}
 		if defaulted {
@@ -3731,6 +3735,9 @@ func a2aProvisionRefusalStatus(agent *agentv1alpha1.PlatformAgent) string {
 		if workers == a2aBridgeDefaultConcurrency {
 			reserve = fmt.Sprintf("the reserve is %d at %d %s, the bridge's default", a2aTasksReserve(agent), workers, noun)
 		}
+		if a2aBridgeRendered(agent) && !defaulted {
+			reserve = fmt.Sprintf("the reserve is %d at %d %s and %d at %d", a2aTasksReserve(agent), workers, noun, a2aTasksReservedConsumers, a2aBridgeDefaultConcurrency)
+		}
 		need = fmt.Sprintf("spec.harness.tuning.maxSessions=%d and the %d bridge %s %s need together (%d; %s)",
 			maxSessions, workers, noun, source, a2aTasksConsumerBudget(agent), reserve)
 		if capped {
@@ -3742,7 +3749,7 @@ func a2aProvisionRefusalStatus(agent *agentv1alpha1.PlatformAgent) string {
 		fits = "the maxSessions, or the worker count, that fits"
 		finish = "The three do not finish the same way. Lowering maxSessions or the bridge's worker count finishes by itself: either CR edit re-renders this Job, so a new one appears and runs, and nothing has to be deleted."
 		if a2aBridgeRendered(agent) {
-			ways = fmt.Sprintf("the ways out are to lower maxSessions until the budget fits the stream, to lower the operator's %s (unset for the bridge's default of %d) until it does, or to delete the TASKS stream", a2aBridgeConcurrencyOperatorEnvVar, a2aBridgeDefaultConcurrency)
+			ways = fmt.Sprintf("the ways out are to lower maxSessions until the budget fits the stream, to set the operator's %s to fewer workers (unset, the rendered bridge runs %d) until it does, or to delete the TASKS stream", a2aBridgeConcurrencyOperatorEnvVar, a2aRenderedBridgeDefaultConcurrency)
 			finish = "The three do not finish the same way. Lowering maxSessions, or the operator's bridge setting, finishes by itself: either re-renders this Job, so a new one appears and runs, and nothing has to be deleted."
 		}
 	}

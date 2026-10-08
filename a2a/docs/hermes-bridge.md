@@ -62,13 +62,24 @@ environment, as it reads `A2A_INJECT_BACKEND`; no CR field carries them.
 | Operator env             | What it sets                      | Unset                                                                       |
 | ------------------------ | --------------------------------- | --------------------------------------------------------------------------- |
 | `A2A_BRIDGE_IMAGE`       | the bridge's image                | derived as above                                                            |
-| `A2A_BRIDGE_CONCURRENCY` | the bridge's `BRIDGE_CONCURRENCY` | the bridge's default, 2                                                     |
+| `A2A_BRIDGE_CONCURRENCY` | the bridge's `BRIDGE_CONCURRENCY` | 10, Hermes's own gateway pool (not the bridge's default of 2)               |
 | `A2A_BRIDGE_EXECUTOR`    | the bridge's `BRIDGE_EXECUTOR`    | not rendered, so the bridge's shipped default decides: `api`, given the key |
 
 The TASKS consumer reserve reads the same `A2A_BRIDGE_CONCURRENCY` the bridge is given
 ([sizing](#sizing-against-the-eval-harness)), and the `api` executor's pod-wide hook is
 rendered by the same rule as for a declared bridge ([Executors](#executors)): the operator
 counts a rendered bridge exactly like a declared one.
+
+The rendered default is 10, not the bridge's own 2, because 10 is what the Hermes gateway
+runs agent turns on (its `ThreadPoolExecutor(max_workers=10)`), and the rendered bridge is that
+gateway's replacement on `next`. More workers don't let two turns race on one conversation's
+history. The `api` executor runs turns in one Hermes session one at a time (`sessionTurns`), and
+the `cli` executor starts every task as a fresh one-shot session with no history to share. At the default `maxSessions`
+of 10 the TASKS budget for 10 workers is 110, above the 64-consumer floor. A `next` install
+whose TASKS stream was created at the floor, before the rendered default was 10, is refused by
+its provision Job with the ways out named: delete TASKS and let provisioning recreate it, lower
+`maxSessions`, or set `A2A_BRIDGE_CONCURRENCY` lower. A fresh install creates TASKS at 110 from
+the first render.
 
 **It enters the pod once the bus is provisioned.** The rendered bridge is withheld from the
 agent pod until the CR's `BusProvisioned` condition is `True`: before that it has no bus to

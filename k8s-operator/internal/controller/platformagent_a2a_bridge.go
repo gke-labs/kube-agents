@@ -76,6 +76,18 @@ const (
 	// value it accepts beside a2aBridgeExecutorAPI.
 	a2aBridgeExecutorCLI = "cli"
 
+	// a2aRenderedBridgeDefaultConcurrency is the rendered bridge's worker
+	// count when the operator sets none: the size of the pool Hermes's own
+	// gateway runs model turns on today (gateway/run.py, ThreadPoolExecutor
+	// max_workers=10, at the pinned hermes-agent tag), so moving chat onto the
+	// bridge does not narrow it. The bridge binary's own default (2,
+	// a2aBridgeDefaultConcurrency) still applies to a sidecar the CR declares
+	// without setting it. At the default maxSessions the TASKS budget for 10
+	// workers is above the 64-consumer floor, so an install whose TASKS stream
+	// was created before this at the floor is refused by the provision Job
+	// with the remedy named (recreate TASKS or lower maxSessions).
+	a2aRenderedBridgeDefaultConcurrency = 10
+
 	// a2aBridgeConcurrencyOperatorEnvVar sets the rendered bridge's
 	// BRIDGE_CONCURRENCY: an operator setting, like the other next-only
 	// knobs, since no CR field carries it. Unset, the bridge's own default.
@@ -171,14 +183,14 @@ func a2aRenderedBridgeExecutor() string {
 }
 
 // a2aRenderedBridgeConcurrency is the rendered bridge's BRIDGE_CONCURRENCY:
-// the operator setting when it is set, else the bridge's default. An invalid
-// operator value is passed through as written, so the budget and the bridge
-// fall back the same way they do for a declared sidecar's.
+// the operator setting when it is set, else a2aRenderedBridgeDefaultConcurrency.
+// An invalid operator value is passed through as written, so the budget and
+// the bridge fall back the same way they do for a declared sidecar's.
 func a2aRenderedBridgeConcurrency() string {
 	if v := os.Getenv(a2aBridgeConcurrencyOperatorEnvVar); v != "" {
 		return v
 	}
-	return strconv.Itoa(a2aBridgeDefaultConcurrency)
+	return strconv.Itoa(a2aRenderedBridgeDefaultConcurrency)
 }
 
 // a2aBridgeSidecars is every sidecar the bridge readers consider: the CR's

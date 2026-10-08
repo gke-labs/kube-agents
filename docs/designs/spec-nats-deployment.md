@@ -445,7 +445,7 @@ Layout:
   replay term scales with the bridge's worker count, which the render reads as
   `BRIDGE_CONCURRENCY` off `spec.deployment.sidecars` and, when the operator renders the
   bridge itself, off the operator's `A2A_BRIDGE_CONCURRENCY` setting, read by the same rule
-  (2 when unset) - the sum over every sidecar that
+  (10, the rendered bridge's default, when unset) - the sum over every sidecar that
   sets it, each read as the bridge runs it: the literal, with a `$(NAME)` reference to an
   earlier literal in the same sidecar expanded as the kubelet expands it, or the bridge's
   default of 2 for a `valueFrom` or a reference to one, an unparsable value or one below

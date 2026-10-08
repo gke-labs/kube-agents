@@ -18,6 +18,7 @@ package controller
 
 import (
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -78,7 +79,7 @@ func TestANextInstallWithNoDeclaredBridgeGetsOne(t *testing.T) {
 	want := map[string]string{
 		a2aBridgeNATSURLEnvVar:     a2aNATSClientURL(agent),
 		a2aBridgeNATSUserEnvVar:    a2aBridgeUser,
-		a2aBridgeConcurrencyEnvVar: "2",
+		a2aBridgeConcurrencyEnvVar: strconv.Itoa(a2aRenderedBridgeDefaultConcurrency),
 		sharedStateSetupEnvVar:     sharedStateSetupSkip,
 	}
 	for name, value := range want {
@@ -195,12 +196,14 @@ func TestTheOperatorSettingsReachTheRenderedBridge(t *testing.T) {
 	}
 }
 
-// The budget's default and the rendered bridge's default are one number, so a
-// stock install's TASKS sizing is unchanged by the render.
-func TestARenderedBridgeAtItsDefaultLeavesTheBudgetAlone(t *testing.T) {
+// With no operator setting the rendered bridge runs
+// a2aRenderedBridgeDefaultConcurrency workers, Hermes's own gateway pool, and
+// the TASKS budget reads the same number rather than the module default a CR
+// with no bridge at all would get.
+func TestARenderedBridgeAtItsDefaultIsBudgetedAtTheRenderedDefault(t *testing.T) {
 	agent := a2aTestAgent()
-	if n, capped, defaulted := a2aBridgeWorkers(agent); n != a2aBridgeDefaultConcurrency || capped || defaulted {
-		t.Errorf("a2aBridgeWorkers = %d,%v,%v; want the default %d with no flags", n, capped, defaulted, a2aBridgeDefaultConcurrency)
+	if n, capped, defaulted := a2aBridgeWorkers(agent); n != a2aRenderedBridgeDefaultConcurrency || capped || defaulted {
+		t.Errorf("a2aBridgeWorkers = %d,%v,%v; want the rendered default %d with no flags", n, capped, defaulted, a2aRenderedBridgeDefaultConcurrency)
 	}
 }
 
@@ -255,6 +258,29 @@ func TestARefusalForARenderedBridgeNamesTheOperatorSetting(t *testing.T) {
 	}
 	if !strings.Contains(a2aProvisionScript(agent), a2aBridgeConcurrencyOperatorEnvVar) {
 		t.Error("the provision script's notes do not name the operator setting for a rendered bridge")
+	}
+}
+
+// The refusal an install created before the rendered default meets: no
+// operator setting, ten workers, a TASKS stream made at the floor. Its remedy
+// must not say that unsetting the setting gets the bridge's own default of 2;
+// unset is what it already is, and it runs the rendered default.
+func TestARefusalAtTheRenderedDefaultDoesNotOfferUnsetAsALowerCount(t *testing.T) {
+	t.Setenv(a2aBridgeConcurrencyOperatorEnvVar, "")
+	agent := a2aTestAgent()
+	status := a2aProvisionRefusalStatus(agent)
+	ten := strconv.Itoa(a2aRenderedBridgeDefaultConcurrency)
+	for _, want := range []string{"its default of " + ten, "unset, the rendered bridge runs " + ten} {
+		if !strings.Contains(status, want) {
+			t.Errorf("refusal status lacks %q:\n%s", want, status)
+		}
+	}
+	if strings.Contains(status, "bridge's default of 2") {
+		t.Errorf("refusal status offers the bridge's own default of 2 to a rendered bridge:\n%s", status)
+	}
+	script := a2aProvisionScript(agent)
+	if !strings.Contains(script, "unset, it runs "+ten) || !strings.Contains(script, "or "+ten+" when that is unset") {
+		t.Error("the provision script's refusal does not name the rendered default for an unset operator setting")
 	}
 }
 
