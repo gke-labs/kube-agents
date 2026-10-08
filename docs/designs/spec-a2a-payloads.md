@@ -533,13 +533,14 @@ artifact names).
 
 ### Where one may appear
 
-| Carrier                                                | Renders as                                   | Its text fallback                                    |
-| ------------------------------------------------------ | -------------------------------------------- | ---------------------------------------------------- |
-| `result` artifact, on the chunk with `lastChunk: true` | the answer                                   | the artifact's text as folded per A2A chunking rules |
-| `progress` artifact                                    | the task's one live message, edited in place | the TextPart in the same part list                   |
-| `notice` artifact                                      | one message of its own, posted once          | the TextPart in the same part list                   |
-| the message of an `input-required` `status-update`     | the question                                 | the TextPart in the same message                     |
-| the message of a terminal `status-update`              | nothing; only its `mark` is read             | none (the one carrier without a fallback)            |
+| Carrier                                                | Renders as                                       | Its text fallback                                    |
+| ------------------------------------------------------ | ------------------------------------------------ | ---------------------------------------------------- |
+| `result` artifact, on the chunk with `lastChunk: true` | the answer                                       | the artifact's text as folded per A2A chunking rules |
+| `progress` artifact                                    | the task's one live message, edited in place     | the TextPart in the same part list                   |
+| `notice` artifact                                      | one message of its own, posted once              | the TextPart in the same part list                   |
+| the message of an `input-required` `status-update`     | the question                                     | the TextPart in the same message                     |
+| the message of a terminal `status-update`              | nothing; only its `mark` is read                 | none (the one carrier without a fallback)            |
+| a conversation chat.notify request (Card work, below)  | a card's post, or an edit of one by `update` key | the request's `text`                                 |
 
 At most one chat message per artifact chunk or status message. `plan` is read only in
 `progress`. In `progress` the chat message is the whole current state, not a delta, so a
@@ -661,6 +662,38 @@ and only its `mark` is validated. When the newest task ends with no mark on its 
 `canceled` completing a stop the requester sent), the `ask` comes off, a `blocked` settle lifts, and `failed` sets
 `settle: failed`. Any other message without `mark` changes nothing.
 
+### Card work after the task ends
+
+Under `next` the Planning Agent often answers "on it", hands the work to kanban cards, and
+its task ends. The cards keep going outside any A2A task, so none of the carriers above
+reach them. Their updates reach the conversation on the chat.notify route instead,
+addressed to the asking conversation and checked against the gateway's session record
+(spec-chatops-gateway, the conversation-addressed notify of #2679). A notify request may
+carry the same chat message:
+
+- **`chat`** is a `kube-agents.chat/v1` object beside the request's `text`, which is its
+  fallback. Every rule in this section applies to it, as on the bus. (On Slack it takes
+  the place of the request's raw `blocks` for a conversation post, and `blocks` stays for
+  home-channel posts.)
+- **`update`** is a key the sender picks (eg `plan`, or a card's question). The first
+  request with a key posts a message. A later request with the same key edits that
+  message in place instead of posting a new one, which is how a plan stays one message
+  per thread and an answered question settles where it was asked. An `update` key edits
+  only a message the gateway itself posted for that same conversation and key. A key it
+  has no message for (another conversation's, one evicted, or one lost to a restart)
+  posts a new message and edits nothing. A conversation holds at most 16 live keys, and
+  the oldest is evicted first, so a chatty card can't grow gateway state without bound.
+- **`mark`** on a conversation notify marks the conversation's latest chain message, and
+  counts as that chain's newest writer once every task in it has ended. While a newer
+  chain is running in the conversation, a notify's `mark` is dropped. (A card that
+  settles after a later question has finished marks the later message. That is a known
+  limit of addressing by conversation rather than by task.)
+
+So the Planning Agent's terminal carries a mark-only chat message with `ask` still set, and the terminal no-mark default doesn't fire at the ack. Its cards' notifies
+then carry the plan (`update: "plan"`), ⏸️ (`settle: blocked`), the one answer per fan-out
+and the folded answer, and the final settle. The task is not held open for its cards:
+that would turn every follow-up into a steer queued behind hours of idle.
+
 ### Rules
 
 - **The text fallback is the answer.** It stands alone, because a consumer that is not a
@@ -682,6 +715,12 @@ and only its `mark` is validated. When the newest task ends with no mark on its 
   `today` presenter's rules with the same fixtures (#2149).
 - **Size.** The part counts against the envelope's max message size like any other. A
   carrier too large with it is published without it: the text is the deliverable.
+- **A backend that can't hold it.** The caps fit Slack. A valid chat message may still be
+  more than another backend takes (a Google Chat card message is capped at 32,000 bytes,
+  a Discord embed at 6,000 characters). A renderer whose backend can't hold a valid chat
+  message posts the fallback, logged and counted, as for an invalid one, and never clips
+  it or sends a card the API will refuse. The same goes for a post the backend's API
+  refuses: the renderer retries it once as the fallback.
 
 ## Topics
 
