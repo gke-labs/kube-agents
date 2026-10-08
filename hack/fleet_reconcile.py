@@ -1174,9 +1174,19 @@ def _run_workers(worker, count):
             flag.set()
 
     threads = [threading.Thread(target=guarded, args=(flag,), name="fleet-reconcile-%d" % i, daemon=True) for i, flag in enumerate(done)]
-    for thread in threads:
-        thread.start()
+    # Signals reach the main thread alone, so a termination landing while the
+    # workers are being started would escape the `except` below: no flag, no
+    # drain, the applies left running. The starts run inside the `try` with
+    # terminations deferred, and the unblock raises one that landed only once
+    # every worker is running, where the drain handles it. A termination
+    # raised out of the hold itself propagates with nothing started.
+    boskos_pool._hold_signals(True)
     try:
+        try:
+            for thread in threads:
+                thread.start()
+        finally:
+            boskos_pool._hold_signals(False)
         while not all(flag.is_set() for flag in done):
             for flag in done:
                 flag.wait(WORKER_JOIN_STEP_SECONDS)

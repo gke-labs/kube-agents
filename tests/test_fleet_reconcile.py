@@ -2035,6 +2035,58 @@ class WorkersTest(unittest.TestCase):
             reconcile._TERMINATING.clear()
         self.assertEqual(sorted(boskos.released), [P7, P8], "both holds were released before the termination propagated")
 
+    def test_a_termination_during_the_worker_start_still_drains(self):
+        # Signals reach the main thread alone, and the workers are started
+        # before it arms the drain: a termination landing while the last
+        # start() returns, with both applies already running, must still
+        # raise the flag, interrupt the applies and wait for the holds. The
+        # patched start holds the main thread inside the last worker's start
+        # until both fake applies run, then sends the signal from there, so
+        # the handler runs in that gap with no timing involved.
+        started = threading.Barrier(3)
+        last_worker = "fleet-reconcile-1"
+
+        def tofu(argv, **_):
+            if argv[1] == "apply":
+                started.wait(timeout=5)
+                for _ in range(100):
+                    if reconcile.terminating():
+                        return subprocess.CompletedProcess(argv, 130, "", "interrupted")
+                    time.sleep(0.02)
+                return subprocess.CompletedProcess(argv, 0, "", "")
+            if argv[1] == "plan":
+                return subprocess.CompletedProcess(argv, reconcile.PLAN_HAS_CHANGES, "", "")
+            if argv[1] == "show":
+                return subprocess.CompletedProcess(argv, 0, UPDATE_ONLY, "")
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+        real_start = threading.Thread.start
+
+        def start(thread):
+            real_start(thread)
+            if thread.name == last_worker:
+                started.wait(timeout=5)
+                os.kill(os.getpid(), signal.SIGINT)
+
+        boskos = _Boskos(free=[P7, P8])
+        previous = signal.signal(signal.SIGINT, boskos_pool.terminate)
+        outcomes = {}
+        try:
+            with mock.patch.object(threading.Thread, "start", start), mock.patch.object(
+                boskos_pool.urllib.request, "urlopen", boskos
+            ), mock.patch("sys.stdout", io.StringIO()):
+                with self.assertRaises(boskos_pool.Terminated):
+                    reconcile.reconcile_pool(BOSKOS, OWNER, runner=tofu, known=KNOWN, run=reconcile.Run(workers=2), outcomes=outcomes)
+            handler_after = signal.getsignal(signal.SIGINT)
+        finally:
+            boskos_pool._DEFERRED.clear()
+            boskos_pool._HOLD_DEPTH = 0
+            signal.signal(signal.SIGINT, previous)
+            reconcile._TERMINATING.clear()
+        self.assertEqual(sorted(boskos.released), [P7, P8], "both holds were released before the termination propagated")
+        self.assertEqual({p: o for p, (o, _) in outcomes.items()}, {P7: reconcile.OUTCOME_INTERRUPTED, P8: reconcile.OUTCOME_INTERRUPTED})
+        self.assertIs(handler_after, boskos_pool.terminate, "the handler is back once the start's hold is given up")
+
     def test_no_tofu_is_started_once_a_termination_has_landed(self):
         # The forward reaches the children alive at that instant; a worker
         # between two steps, or just out of its acquire, must not start the
