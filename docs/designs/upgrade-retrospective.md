@@ -18,8 +18,14 @@ _did_ break, so the same surprise waits for the next cluster.
 
 This feature is a scheduled review called the **upgrade retrospective**. It must:
 
-1. **Run on its own.** Once when the assistant is first installed, so a new install starts with a
-   review of every cluster it finds, and then every weekend. Nobody has to ask.
+1. **Run on its own, and answer when asked.** Once when the assistant is first installed, so a new
+   install starts with a review of every cluster it finds, and then at the end of every weekend;
+   nobody has to ask. And anyone who does ask, in their own words, gets the same report: "how did
+   the last upgrades go", "did anything break when the clusters were upgraded", "any upgrade
+   problems I should know about", "is there anything to fix before the next one". The question does
+   not have to name the feature, a cluster or a version. The assistant answers from the latest
+   saved report when nothing has been upgraded since, and runs the review first when something
+   has.
 2. **Look only at what changed.** A cluster is reviewed when it is new to the assistant or when it
    was upgraded since the last review. A cluster nothing happened to gets one line saying so.
 3. **Write a report, the `upgrade-retro-report`,** in three sections, **Errors**, **Warnings**
@@ -94,8 +100,11 @@ upgrade-retrospective (Platform Agent roster: Sunday 18:00 UTC; and once, from t
        ├─ reads the collector's output, tailors (C) to the cluster's objects
        ├─ (D) one ledger issue per reviewed cluster where a repository is linked
        └─ posts one line per cluster to chat; names the file on the gateway pod
-  └─ upgrade-readiness-watch (daily)
+  └─ upgrade-readiness-watch (daily, once it ships)
        └─ reads guards.json and prints each live guard in its next report
+  └─ on demand: a question about what an upgrade did, or whether upgrades have problems,
+       routed by the chat roster and the platform persona to this report; the SOP answers from
+       the saved report when it is newer than the last upgrade operation, else runs the collector
 ```
 
 ## 3. Decisions
@@ -115,6 +124,16 @@ it manages rather than a blank. That stage today skips every audit when no GitOp
 configured and runs nothing for an install that onboarded before a job existed; the collector needs
 no repository, so the stage change in the second work item lets this one job run without one, and
 an install that predates the job gets its baseline from the first Sunday tick.
+
+### 3.1a On demand: the same report, from a generic question
+
+The routing that sends "is the fleet ready to upgrade" to the readiness report sends "how did the
+upgrade go", "did anything break", "any upgrade concerns" here: one line in the chat roster
+(`CAPABILITIES.md`) and one in the platform persona's delegation list name what an upgrade _did_
+as this report and what it _would do_ as the readiness report. The SOP decides freshness: when the
+latest saved report is newer than the last upgrade operation on the clusters the question covers,
+answer from it and say when it was produced; otherwise run the collector for those clusters first.
+A question that names a cluster the last run did not review forces that cluster (`--cluster`).
 
 ### 3.2 Scope: new or upgraded since the last run
 
@@ -248,7 +267,9 @@ which keeps the per-cluster data and the same three-way grouping.
    ledger, selection, (A), (B), the signature table, the catalogue table for (C), the guards merge,
    JSON and Markdown output, `--dry-run`, `--since`, `--cluster`; unit tests on fixtures captured
    from the test fleet.
-2. **The job.** `agents/platform/governance/upgrade_retrospective_sop.md`; the roster entry
+2. **The job and the on-demand route.** `agents/platform/governance/upgrade_retrospective_sop.md`
+   (including the freshness rule for a question); the routing lines in `CAPABILITIES.md` and the
+   platform `AGENTS.md`; the roster entry
    (`0 18 * * 0`, `skills: ["fleet-audit"]`, the `AUDITS` allowlist so findings file); the first-run
    hook in the Chat Agent's first-run stage, changed so this job runs without a repository; the
    readiness watch reading `guards.json` once it ships; the cron
@@ -260,7 +281,8 @@ which keeps the per-cluster data and the same three-way grouping.
 ## 6. Files touched
 
 - `agents/platform/skills/fleet-audit/scripts/upgrade_retrospective.py`, its test and `testdata/`.
-- `agents/platform/governance/upgrade_retrospective_sop.md`.
+- `agents/platform/governance/upgrade_retrospective_sop.md`, `agents/platform/CAPABILITIES.md`,
+  `agents/platform/AGENTS.md` (the on-demand route).
 - `agents/platform/cron/jobs.json`, `agents/platform/cron/README.md`,
   `agents/platform/skills/fleet-audit/scripts/audit_report.py` (`AUDITS`).
 - The Chat Agent's first-run stage (`agents/chat/scripts/oobe.py`: the list of audits it starts
@@ -277,7 +299,9 @@ which keeps the per-cluster data and the same three-way grouping.
   section and the severity of each fixture incident.
 - **Eval.** One case per entry the first report classifies on the test fleet, graded on declared
   lines (`<cluster>/<object>: entry <n>`), red on `main` where the report does not exist, green
-  three times on the branch; registered in the nightly roster. The out-of-the-box path (collector
+  three times on the branch; one case for the on-demand route, a generic question ("did anything
+  break in the last upgrades") that must be answered from the report; registered in the nightly
+  roster. The out-of-the-box path (collector
   alone, no model) is a test, not an eval.
 - **Live.** The first run on a dev install: the first-run stage producing the baseline report; a
   weekend tick after an upgrade producing an incident with all four parts; a guard appearing in the
