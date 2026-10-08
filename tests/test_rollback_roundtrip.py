@@ -86,7 +86,8 @@ _FAST_ENV = {
 }
 
 # Every assertion a passing run prints, in order, for a CR that declares the
-# bridge sidecar.
+# bridge sidecar by hand (the case the unset and restore exist for; the
+# operator's rendered bridge needs neither, test_no_sidecars_... below).
 _PASSING_ORDER = [
     "pre.mode-next",
     "pre.ready",
@@ -695,10 +696,16 @@ class KeptRoundTripTest(RoundTripTest):
         self.assertIn("SKIP leg2.bridge-consuming:", result.stdout)
 
     def test_no_sidecars_patches_nothing_but_the_mode(self) -> None:
+        # The lane's own install since the operator renders the bridge
+        # (#2592): nothing on spec.deployment.sidecars, so nothing to unset
+        # before the flip. The simulator answers the bus task whatever runs,
+        # so this pins the script's path for the lane's install shape, not
+        # that an executor came back; the live round trip is what shows that.
         result, state, _ = self.run_sim(healthy_next_state(sidecars=[]))
         self.assertEqual(result.returncode, 0, result.stdout)
-        self.assertIn("SKIP leg1.sidecars-unset:", result.stdout)
+        self.assertIn("SKIP leg1.sidecars-unset: the CR declares no sidecars (a bridge the operator renders leaves with the mode and needs no unset)", result.stdout)
         self.assertIn("SKIP leg2.sidecars-restored:", result.stdout)
+        self.assertIn("PASS leg2.bus-task", result.stdout)
         self.assertEqual(state["patches"], [{"spec": {"mode": "today"}}, {"spec": {"mode": "next"}}])
 
     def test_every_kubectl_call_is_pinned_to_the_context(self) -> None:

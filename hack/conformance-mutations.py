@@ -1577,6 +1577,24 @@ Mutation(
         "user; the static credential it names is the half the bridge inherited",
     ),
     Mutation(
+        "C1-rendered-bridge-keeps-the-bus-token",
+        "k8s-operator/internal/controller/platformagent_a2a_bridge.go",
+        ("\t\tif !a2aIsBusTokenMount(m) {\n\t\t\tmounts = append(mounts, m)\n\t\t}",
+         "\t\tmounts = append(mounts, m)"),
+        "test_C1_the_rendered_bridge_is_not_the_agent_principal",
+        "copy every agent mount into the rendered bridge, bus token included: "
+        "the bridge then authenticates as the agent principal and the A5 split "
+        "is undone by a volumeMount",
+    ),
+    Mutation(
+        "C1-rendered-bridge-inherits-the-agent-bus-user",
+        "k8s-operator/internal/controller/platformagent_a2a_bridge.go",
+        ("\ta2aBusUserEnv:               true,\n", ""),
+        "test_C1_the_rendered_bridge_is_not_the_agent_principal",
+        "let the rendered bridge inherit A2A_BUS_USER=agent, the agent "
+        "principal's name and inbox prefix",
+    ),
+    Mutation(
         "A3-session-writes-its-own-supervisor-subject",
         "a2a/authcallout/session.go",
         ('\t\tPublish: []string{\n\t\t\tlib.TaskEventsSubject(pod, "*"),\n\t\t},',

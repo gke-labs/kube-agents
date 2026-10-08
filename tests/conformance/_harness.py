@@ -273,6 +273,13 @@ SOURCES: dict[str, Source] = {
         "a2a/gateway/gchat.go",
         ("func (g *Gateway) resolveInjectPrincipal", "injectEvalPrincipalPrefix"),
     ),
+    # The operator-rendered Hermes bridge: built from the agent container, so
+    # what it drops from that copy is the whole of what keeps it a separate
+    # principal from the agent beside it.
+    "a2a_bridge_render": Source(
+        "k8s-operator/internal/controller/platformagent_a2a_bridge.go",
+        ("func buildA2ABridgeContainer(", "func a2aBridgeOwnEnv(", "var a2aBridgeDroppedAgentEnv"),
+    ),
     # The A2A door is the inject door's sibling for an agent caller, gated and
     # resolved the same way; A3 reads the same two seams for it.
     "a2a_door_render": Source(
