@@ -12,6 +12,7 @@
 import {
   ARTIFACT_PROGRESS,
   ARTIFACT_RESULT,
+  ARTIFACT_TURN,
   TERMINAL_STATES,
   authorityOf,
   partsText,
@@ -654,7 +655,7 @@ function reduceArtifactUpdate(
     executor: prev?.executor ?? env.from.session,
   });
 
-  if (name === ARTIFACT_RESULT) {
+  if (name === ARTIFACT_RESULT || name === ARTIFACT_TURN) {
     next.chat = appendChunk(
       state,
       env,
