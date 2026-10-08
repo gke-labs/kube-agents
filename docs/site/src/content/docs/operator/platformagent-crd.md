@@ -352,18 +352,22 @@ only trace is `pid not alive` in the kanban ledger. The dispatcher's retry budge
 is stranded rather than re-dispatched, and the work it stood for is never done — a triage report
 that simply never arrives, with nothing anywhere reporting a failure.
 
-`6` is a floor for a deployment that has not measured itself, not a recommendation. It is chosen to
-hold on the smallest pod anyone runs, and because the cost of being wrong is asymmetric: too low
-delays a delegated task, too high loses it silently. Raise it once you know your worker footprint
-and your model quota — that quota is the other shared resource, and for most deployments it binds
-before memory does.
+`6` is a floor for a deployment that has not measured itself, not a recommendation. It assumes the
+operator's default 8Gi memory limit on the agent container, and the cost of being wrong is
+asymmetric: too low delays a delegated task, too high loses it silently. An install that lowered the
+agent's memory limit through `spec.deployment.resources` (which replaces the defaults as a block)
+should set `maxInProgress` to fit: about 430 MiB per worker over the 1.8 GiB the pod holds idle, so
+a 4Gi limit fits about five. Raise it once you know your worker footprint and your model quota —
+that quota is the other shared resource, and for most deployments it binds before memory does.
 
 One slot is guaranteed to each class of card. A card is classed when an agent files it with
 `kanban_create`: one filed from an event-triage or cron-relay session is background, and one filed
 in a chat turn or through the inject and A2A doors is a user card. A card filed by hand, with
 `hermes kanban create` or from the dashboard, never passes through that step and is background
 unless it is given priority 100 or more (`--priority 100`); the dashboard can change a card's
-priority afterwards.
+priority afterwards. So are the children Hermes' auto-decompose files for a card created with
+`triage: true`: they are written at priority 0, so a user card filed that way runs its decomposed
+work as background.
 
 At a cap of 2 or more, background cards may hold every slot but one, so a question asked in chat
 starts at once even while triage is running, and user cards may hold every slot but one, so a
@@ -379,8 +383,10 @@ A full board is logged as what it is. When every slot is busy for six ticks in a
 logs, at most every five minutes:
 
 ```text
-kanban dispatcher saturated: 6/6 worker slots busy (5 background, 1 user: t_ab12 @cluster-prod 14m [k8s-evt-], …); 1 user card(s) and 2 background card(s) waiting
+kanban dispatcher saturated: 6/6 worker slots busy (5 background, 1 user: t_ab12 @cluster-prod 14m [k8s-evt-], t_cd34 @cluster-prod 9m [k8s-evt-]); 1 user card(s) and 2 background card(s) waiting
 ```
+
+The card list is shortened here; the real line names up to five running cards, oldest first.
 
 with `; N background card(s) held back because one slot is reserved for user cards` or
 `; N user card(s) held back because one slot is reserved for background triage` added when a held

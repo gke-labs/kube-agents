@@ -296,9 +296,11 @@ phase still parallelises at all:
 resident_reserve + workspace_reserve + 2 * (copies * output_cap + request_reserve) <= limit
 ```
 
-At the defaults that is 192 + 128 + 2 × 176 = 672 MiB against 1024. The test derives the count
-the rule admits from the rendered values, `floor((limit − reserves) / (copies × cap + reserve))`,
-four at the defaults, names it in its failure message, and fails below two, so a future reduction of the
+At the defaults that is 192 + 128 + 2 × 176 = 672 MiB against 2048 (1024 when this design was
+written). The test derives the count the rule admits from the rendered values,
+`floor((limit − reserves) / (copies × cap + reserve))`, nine at the 2Gi default (192 + 128 + 9 × 176
+= 1904 MiB against 2048; four at the original 1Gi), held to eight by the slot cap, names it in its
+failure message, and fails below two, so a future reduction of the
 limit or a raise of either cap has to argue with the number it prints. The slot cap does not
 enter the rule except as an upper bound, and the test says so where a reader would otherwise
 expect it to. The broker holds the six output copies as `OUTPUT_COPIES_PER_COMMAND` beside
@@ -315,12 +317,15 @@ the broker budgeting against a stale number.
 The slot cap and output cap, their values and their reservation. The sandbox shim
 (`credential_proxy_client.py`): a 503 is still printed and exit 1 returned; with four heavy
 requests at once the eight-wide burst of both listing pools coinciding waits one listing, so no
-retry is added here. The proxy container's requests and limits, and so the
+retry is added here. (Those are the 1Gi figures; at the 2Gi default the budget admits nine and
+the slot cap of eight binds.) The proxy container's requests and limits, and so the
 chart's generated footprint and quota preflight. No agent-visible behaviour: no eval case.
 
 The reconciler's and the stall watch's listing pools are the caller settings the change moved.
 The reconciler's had been eight at the default `maxProjects` cap and up to sixteen when the cap
-was raised; it is now four, the count §2.2 admits, at every cap, and its listing budget doubles to
+was raised; it is now four at every cap, the count §2.2 admitted at the original 1Gi limit (the 2Gi
+default admits nine, held to eight by the slot cap, so the four-wide pools now leave slots for
+other callers), and its listing budget doubles to
 300 seconds at the default cap to keep the 12 seconds per listing the 150-second budget gave at
 eight wide, growing by that per default cap's worth of projects. The bootstrap gate's floor
 follows the budget, from 240 to 390 seconds. The stall watch's pool goes from eight to four and
