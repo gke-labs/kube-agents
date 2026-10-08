@@ -52,7 +52,7 @@ matches. Lower is worse.
 | --- | ----------------------- | ---------------------------------------------------------------------------------------------------- | -------- | ---------------- |
 | 1   | Forbidden action        | `VerificationCatastrophic < 1.0`                                                                     | any rep  | no               |
 | 2   | Check did not run       | any of five conditions, below                                                                        | any rep  | no               |
-| 3   | Not a real run          | any liveness signal fails, except the three infrastructure shapes (below) | any rep  | no               |
+| 3   | Not a real run          | any liveness signal fails, except the three infrastructure shapes (below)                            | any rep  | no               |
 | 4   | Collapse                | every rep failed                                                                                     | all reps | **yes**          |
 | 5   | Expected-fail passed    | `expected_fail: true` and every rep passed                                                           | all reps | no               |
 | 6   | Judged regression       | judged mean below main's by more than the margin                                                     | all reps | **yes**          |
