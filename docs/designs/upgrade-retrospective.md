@@ -27,7 +27,10 @@ This feature is a scheduled review called the **upgrade retrospective**. It must
    saved report when nothing has been upgraded since, and runs the review first when something
    has.
 2. **Look only at what changed.** A cluster is reviewed when it is new to the assistant or when it
-   was upgraded since the last review. A cluster nothing happened to gets one line saying so.
+   was upgraded since the last review. A cluster nothing happened to gets one line saying so, with
+   one exception: a cluster that still carries a finding from an earlier review is re-checked for
+   that finding every time, so a fix made between upgrades clears it without waiting for the next
+   upgrade.
 3. **Write a report, the `upgrade-retro-report`,** in three sections, **Errors**, **Warnings**
    and **Info**, any of which may be empty. An entry under Errors or Warnings is one incident:
    one application object on one cluster, with four parts:
@@ -42,9 +45,9 @@ This feature is a scheduled review called the **upgrade retrospective**. It must
      this object, not in general terms.
    - **(D) The fix, set up.** Two things happen without being asked. The daily readiness check
      learns about the failure, so the next pre-upgrade report says "the last upgrade broke this,
-     and it is still here" while it is. And where the install has a GitHub repository, one tracked
-     issue per reviewed cluster carries the checklist of fixes and is updated by the next review
-     rather than duplicated.
+     and it is still here" while it is. And where the install has a GitHub repository, the
+     review's one tracked issue carries the checklist of fixes, one entry per cluster and object,
+     rewritten by the next review rather than duplicated and closed when a review finds nothing.
 
    An incident is an **Error** when the match is sure and the object is one of the user's, or when
    Google reported the upgrade itself as failed, or a computer stayed broken after its rebuild. It
@@ -65,9 +68,10 @@ This feature is a scheduled review called the **upgrade retrospective**. It must
    upgraded and what it will move to next; the lines for clusters the review could not read say
    why. "None" appears only when the count is really zero.
 
-4. **Keep the report where the install keeps its records,** on the assistant's own storage, with
-   the latest one always at the same path, and post one line per reviewed cluster in chat with the
-   counts and the most important finding. A quiet weekend posts nothing.
+4. **Keep the report where the assistant can read it back,** on the storage its own tools use,
+   with the latest one always at the same path, and post one line per reviewed cluster in chat
+   with the counts and the most important finding. A quiet weekend posts nothing. A GitHub
+   repository is not required for any of this; it only adds the tracked issue.
 5. **Be testable on the failures we already know how to produce.** The test fleet carries planted
    examples of the catalogue's failures; the first report over that fleet has to classify those
    correctly, and every one of them becomes a nightly test.
@@ -110,10 +114,10 @@ upgrade-retrospective (Platform Agent roster: Sunday 18:00 UTC; and once, from t
        └─ report.json + the Markdown report (A, B, C, D per cluster)
   └─ Platform Agent, following governance/upgrade_retrospective_sop.md
        ├─ reads the collector's output, tailors (C) to the cluster's objects
-       ├─ (D) one ledger issue per reviewed cluster where a repository is linked
-       └─ posts one line per cluster to chat; names the file on the gateway pod
+       ├─ (D) the stream's one ledger issue, an entry per cluster and object, where a repository is linked
+       └─ posts one line per cluster to chat; names the report's path
   └─ upgrade-readiness-watch (daily, once it ships)
-       └─ reads guards.json and prints each live guard in its next report
+       └─ its sandbox hop reads guards.json and prints each live guard in its next report
   └─ on demand: a question about what an upgrade did, or whether upgrades have problems,
        routed by the chat roster and the platform persona to this report; the SOP answers from
        the saved report when it is newer than the last upgrade operation, else runs the collector
@@ -132,10 +136,15 @@ are a weak witness at that distance: the API server keeps them for one hour by d
 so (B) leans on pod and node state and uses events as corroboration, not as the only source. The
 first run comes from the Chat Agent's first-run stage, the same place the four fleet audits start
 once the onboarding scan settles, so a fresh install's first report is a baseline of every cluster
-it manages rather than a blank. That stage today skips every audit when no GitOps repository is
-configured and runs nothing for an install that onboarded before a job existed; the collector needs
-no repository, so the stage change in the second work item lets this one job run without one, and
-an install that predates the job gets its baseline from the first Sunday tick.
+it manages rather than a blank. Two things stand in the way today and the second work item
+removes both. The first-run stage skips every audit when no GitOps repository is configured, and
+the fleet-audit skill's `start` fails outright without one (`INSTALL.md` says so), because the
+streams it serves exist to file a ledger. This stream does not: the collector needs no repository
+and the report on the volume is the record, so the SOP runs the collector first and calls `start`
+and `finish` only when a repository is configured, and the first-run stage marks this job due
+without a repository. That is the "chat-only mode" the first-run design lists as an open question,
+scoped to this one stream. An install that onboarded before the job existed gets its baseline from
+the first Sunday tick.
 
 ### 3.1a On demand: the same report, from a generic question
 
@@ -152,8 +161,10 @@ A question that names a cluster the last run did not review forces that cluster 
 The ledger holds, per cluster, the control-plane version, every node pool's version, and the time
 of the last run. A cluster is _new_ when absent, _upgraded_ when a version differs or when
 `gcloud container operations list` shows an `UPGRADE_MASTER` or `UPGRADE_NODES` operation targeting
-it that started after the last run. The first run has no ledger and reviews the last fourteen days
-of operations. The collector runs where the fleet-audit collectors run, in the agent's terminal, and
+it that started after the last run, and _re-checked_ when it is unchanged but holds a live guard:
+only the reads that guard needs run, and a guard whose symptom or shape is gone is cleared. A
+cluster a successful listing no longer names leaves the ledger and loses its guards, and the report
+says so. The first run has no ledger and reviews the last fourteen days of operations. The collector runs where the fleet-audit collectors run, in the agent's terminal, and
 resolves projects the way they do: `--project` when given, else `MONITORED_PROJECT_IDS`, else every
 project `gcloud projects list` returns. The SOP passes `--project` for the management project and
 every project a Cluster Agent profile names, so a scheduled run reads the reconciler's roster and
@@ -203,28 +214,38 @@ automatic and both reversible:
 - **Guards.** `guards.json` beside the ledger holds one entry per classified failure and one per
   risk shape found on a clean cluster, each marked `failure` or `risk`: cluster, entry, object
   (`namespace/kind/name`), evidence, first and last seen. The collector merges it on
-  every run (new, seen again, gone when the cluster is reviewed and the symptom is absent). The
-  daily readiness watch, once it ships, reads the file and adds a line per live guard to its next
+  every run (new, seen again, gone when the cluster is reviewed or re-checked and the symptom or
+  shape is absent, and dropped with a cluster that left the fleet). The daily readiness watch, once
+  it ships, reads the file through its own sandbox hop and adds a line per live guard to its next
   report for that cluster, so the operator planning the next upgrade sees "the last upgrade held
   the drain on `seeded-upgrade/pinned-batch-runner`'s budget; it still allows no disruption".
-- **A ledger issue.** Where the install has a repository, the SOP files one issue per reviewed
-  cluster with the (C) checklist, labelled for the stream, rewritten in place on the next review
-  and closed when every guard is gone, the way the fleet audits keep one ledger issue per stream.
+- **The stream's ledger issue.** Where the install has a repository, the retrospective is a
+  fleet-audit stream and keeps what every stream keeps: exactly one open issue, rewritten in full
+  on every run, with each finding identified by cluster and object and closed by a run that finds
+  nothing. That one issue is the (C) checklist for the whole fleet; a per-cluster issue would need a
+  ledger mode the skill does not have and the skill forbids opening issues any other way.
 
 Opening a pull request for a manifest change is not (D). The retrospective is a fleet-audit stream,
-and that skill, not `submit-suggestion`, owns pull requests for audit findings: its `finish` step
-opens a remediation pull request on its own only for a `critical` finding, and this stream files
-nothing above `major`, so no pull request opens without a user's "apply"; the report names the file
-and the change that "apply" would make.
+and that skill, not `submit-suggestion`, owns pull requests for audit findings. Its `finish` step
+opens a remediation pull request on its own for a `critical` finding and for a `major` one whose
+check id is on its `MAJOR_SWEEP_CHECKS` allowlist; this stream's check ids stay off that allowlist,
+which is the guard (a reused `no-pdb` slug would put the budget finding on it), so no pull request
+opens without a user's "apply"; the report names the file and the change that "apply" would make.
 
 ### 3.6 Where the report lives
 
-Under the Platform Agent profile's data directory, `upgrade-retrospective/reports/<date>.md`, with
-`upgrade-retro-report.md` beside `reports/` pointing at the latest, the same report as `.json`, the ledger
-and `guards.json`. The directory is on the data volume, survives a pod restart, and needs no
-repository. The agent's own tools run in the sandbox and cannot open that path, so the chat line
-carries the counts and the top finding rather than only the path, and the SOP reads the collector's
-output from the sandbox-side copy the run produces.
+The collector runs in the agent's shell, so its store is on whichever pod that shell runs in: with
+the shell sandbox on, the sandbox pod's own data volume, which is not the gateway's profile volume
+(the [fleet-audit report store](fleet-audit-report-store.md) worked this out for the audit
+streams). The root is fixed at `/opt/data/upgrade-retrospective/`, overridable by an environment
+variable, rather than under `$HERMES_HOME`, because a cron worker and a chat session resolve that
+variable to different directories and a store rooted there is written at one path and read from
+another. Under the root: `reports/<date>.md`, `upgrade-retro-report.md` beside `reports/` pointing
+at the latest, the same report as `.json`, `ledger.json` and `guards.json`. The volume survives a
+pod restart, every session's tools can read it, and the on-demand route finds the Sunday report
+there. The readiness watch runs on the gateway pod and reaches the file the same way it reaches
+`gcloud`, through its sandbox hop. The chat line still carries the counts and the top finding, so
+a reader who never opens the file gets the verdict.
 
 ### 3.7 What the run may not do
 
@@ -250,8 +271,8 @@ Detect and mitigate next time: visible before the upgrade as the budget itself; 
   Before the next upgrade: allow
   one disruption or add a replica. Now: the pod is back; nothing to repair.
 Mitigation set up: guard seeded-b / entry 1 / seeded-upgrade/PodDisruptionBudget/pinned-batch-runner
-  (first seen 2026-10-11), reported by the readiness watch until the budget has room; ledger issue
-  <url> where a repository is linked.
+  (first seen 2026-10-11), reported by the readiness watch until the budget has room; entry in the
+  stream's ledger issue <url> where a repository is linked.
 
 ## Warnings
 
@@ -303,10 +324,11 @@ which keeps the per-cluster data and the same three-way grouping.
 2. **The job and the on-demand route.** `agents/platform/governance/upgrade_retrospective_sop.md`
    (including the freshness rule for a question); the routing lines in `CAPABILITIES.md` and the
    platform `AGENTS.md`; the roster entry
-   (`0 18 * * 0`, `skills: ["fleet-audit"]`, the `AUDITS` allowlist so findings file); the first-run
-   hook in the Chat Agent's first-run stage, changed so this job runs without a repository; the
-   readiness watch reading `guards.json` once it ships; the cron
-   README section and the generated cron reference.
+   (`0 18 * * 0`, `skills: ["fleet-audit"]`, the `AUDITS` allowlist so findings file, with check
+   ids off `MAJOR_SWEEP_CHECKS`); the SOP's no-repository path (collector first, `start`/`finish`
+   only with a repository) and the first-run stage marking this job due without one; the readiness
+   watch reading `guards.json` through its sandbox hop once it ships; the cron README section and
+   the generated cron reference.
 3. **The proof.** The first report over the test fleet; one nightly case per catalogue entry the
    report must classify, starting with the entries that have no passing record yet; the catalogue's
    status table gains the retrospective as the after-the-fact reader.
@@ -320,7 +342,7 @@ which keeps the per-cluster data and the same three-way grouping.
   `agents/platform/skills/fleet-audit/scripts/audit_report.py` (`AUDITS`).
 - The Chat Agent's first-run stage (`agents/chat/scripts/oobe.py`: the list of audits it starts
   after the inventory scan, and its repository skip).
-- The readiness watch's script, once it is on `main` (reads `guards.json`).
+- The readiness watch's script, once it is on `main` (reads `guards.json` through its sandbox hop).
 - `docs/site/src/content/docs/reference/cron-jobs.md` (generated), the autonomous-watchdogs and
   security reference pages where they enumerate the roster.
 
@@ -348,7 +370,7 @@ which keeps the per-cluster data and the same three-way grouping.
   an event.
 - Classification is by signature and can be wrong; every finding carries its evidence and a
   confidence, and the SOP may downgrade one. A wrong guard costs one extra line in a readiness
-  report until the next retrospective drops it.
+  report until the next run re-checks the cluster and drops it.
 - Fourteen days for the first run, and a fixed Sunday evening rather than a slot after each
   install's maintenance window, are starting values.
 - Audit-log reads (eviction 429s, admission rejections) would sharpen (B); `gcloud logging read` is
