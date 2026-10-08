@@ -95,7 +95,9 @@ Two things the trigger must not be:
 `RANKING_ALLOWANCE_SECONDS` (30 minutes), counted from `.bootstrap_scan_filed`, fire anyway: 90
 minutes for a sweep with no cluster cards, longer by five minutes a card. A stuck sweep, a blocked
 ranking card or one never filed must not hold the audits back forever, and a shorter wait would
-start them beside a large fleet's ranking card.
+start them beside a large fleet's ranking card. A tick that cannot read the board waits for the
+next rather than taking the shortest fallback, and a board that never reads is ended by the
+not-new rule below.
 
 **Not a new install.** If, before the stage has started anything, it finds a sweep filed more than
 `NEW_INSTALL_SECONDS` (24 hours) earlier, the install onboarded before this job existed but never
@@ -256,7 +258,7 @@ archived stand-in sweep card and an archived ranking card after it, points `.boo
 at the sweep, clears `.oobe_audits_fired`, and puts back the `oobe` job when the image ships one;
 the teardown restores both markers and the job as it found them.
 The stack then waits, up to an hour, for the stage to finish its chain, so the verifier's two-minute window opens after the last audit has started. The verifier reads the Platform Agent's cron run records and
-passes when the stage's `.oobe_audits_fired` lists all four audits as marked due and each has a run claimed since the stage marked it that is running or completed (a skipped row is passed over), so a scheduled run that falls in the window does not count, and each started only after the one before it in the chain ended. That is stricter than the stage: a mark that lands on a scheduled run it did not see start, a race the runner's wait for running audits makes rare, reads as no run. Red: on
+passes when the stage's `.oobe_audits_fired` lists all four audits as marked due and each has a run claimed since the stage marked it that got going (running, completed, or ended after its start) (a skipped row is passed over), so a scheduled run that falls in the window does not count, and each started only after the one before it in the chain ended. That is stricter than the stage: a mark that lands on a scheduled run it did not see start, a race the runner's wait for running audits makes rare, reads as no run. Red: on
 an image without the job, no audit runs. Green: four, in three repetitions. The case's runs are
 real audit runs on four streams, so it declares them (`audit_streams`) and the runner holds their
 locks for the unit. Every unit on an audit stream first waits, up to 40 minutes, while the install

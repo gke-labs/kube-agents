@@ -48,7 +48,7 @@ def test_one_line_per_task_in_order_and_none_for_an_undeclared_case(tmp_path, ca
     assert capsys.readouterr().out.splitlines() == ["oobe compliance-audit stockout-prevention", "plain"]
 
 
-@pytest.mark.parametrize("value", ["compliance-audit", "[1]", "['a b']", "['../x']", "{a: b}"])
+@pytest.mark.parametrize("value", ["compliance-audit", "[1]", "['a b']", "['../x']", "{a: b}", '["compliance-audit\\n", x]'])
 def test_a_value_the_runner_cannot_lock_on_fails_the_read(tmp_path, capsys, value):
     task = _task(tmp_path, "bad", f"audit_streams: {value}\n")
     assert audit_streams.main([str(task)]) == 1

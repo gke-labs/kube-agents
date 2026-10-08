@@ -43,6 +43,23 @@ FINISH_AFTER_SECONDS = 3
 STALE_SECONDS = eval(re.search(r"^STALE_SECONDS = (.+)$", SCRIPT.read_text(), re.M).group(1))
 
 
+# The runner's own readonly lines the function reads, lifted so a rename there fails here; each
+# test sets the wait and poll itself so it runs in seconds.
+RUNNER_CONSTANTS = (
+    "EVAL_SANDBOX_EXEC_TIMEOUT",
+    "EVAL_SANDBOX_EXEC_ROUND_TRIP_SECONDS",
+    "EVAL_GATEWAY_CONTAINER",
+    "EVAL_GATEWAY_PYTHON",
+    "EVAL_GATEWAY_HOME",
+)
+
+
+def runner_constants() -> list[str]:
+    text = RUNNER.read_text()
+    lines = [re.search(rf"^readonly {name}=.*$", text, re.M).group(0).replace("readonly ", "", 1) for name in RUNNER_CONSTANTS]
+    return lines
+
+
 def ago(seconds: int) -> str:
     return (datetime.now(timezone.utc) - timedelta(seconds=seconds)).isoformat()
 
@@ -161,15 +178,18 @@ class PlatformRunsTest(unittest.TestCase):
         self._stage(armed=False)
         self.assertEqual(self._wait(), "none going")
         self._stage({"fired": [], "current": None, "at": 1}, armed=False)
-        self.assertEqual(self._wait(), "still going after 0s, the run goes ahead: fleet-wide-cost-analysis (oobe stage, next)")
+        self.assertEqual(self._wait(), "still going after 0s, the run goes ahead: fleet-wide-cost-analysis (oobe stage)")
         self._stage({"fired": ["fleet-wide-cost-analysis"], "current": None}, armed=False)
-        self.assertEqual(self._wait(), "still going after 0s, the run goes ahead: compliance-audit (oobe stage, next)")
+        self.assertEqual(self._wait(), "still going after 0s, the run goes ahead: compliance-audit (oobe stage)")
 
     def test_while_an_audit_awaits_its_run_the_one_after_it_is_next(self):
-        # The state the stage keeps from cost's mark to compliance's: cost is answered by its
-        # run and mark, compliance is held before it is marked.
+        # The state the stage keeps from cost's mark to compliance's, with no mark in the store
+        # yet: cost is held (recorded before the store has it) and so is compliance.
         self._stage({"fired": ["fleet-wide-cost-analysis"], "current": {"job": "fleet-wide-cost-analysis", "marked_at": 1}}, armed=False)
-        self.assertEqual(self._wait(), "still going after 0s, the run goes ahead: compliance-audit (oobe stage, next)")
+        self.assertEqual(
+            self._wait(),
+            "still going after 0s, the run goes ahead: compliance-audit (oobe stage), fleet-wide-cost-analysis (oobe stage)",
+        )
 
     def test_a_roster_whose_jobs_are_not_a_list_holds(self):
         self._stage({"fired": []}, armed=False)
@@ -190,7 +210,7 @@ class PlatformRunsTest(unittest.TestCase):
         self._stage()
         self.assertEqual(
             self._wait(audits=["compliance-audit", "gce-compute-fleet-audit"]),
-            "still going after 0s, the run goes ahead: compliance-audit (armed oobe stage)",
+            "still going after 0s, the run goes ahead: compliance-audit (oobe stage)",
         )
 
     def test_an_audit_the_stage_has_marked_and_left_no_longer_holds(self):
@@ -199,15 +219,15 @@ class PlatformRunsTest(unittest.TestCase):
         self._stage({"fired": ["fleet-wide-cost-analysis"], "held": {"compliance-audit": "disabled"}, "current": None})
         self.assertEqual(
             self._wait(),
-            "still going after 0s, the run goes ahead: obtainability-audit (armed oobe stage), stockout-prevention (armed oobe stage)",
+            "still going after 0s, the run goes ahead: obtainability-audit (oobe stage), stockout-prevention (oobe stage)",
         )
 
     def test_an_armed_stage_holds_every_audit_it_has_still_to_mark(self):
         self._stage({"fired": ["fleet-wide-cost-analysis"], "current": {"job": "fleet-wide-cost-analysis", "marked_at": 1}})
         self.assertEqual(
             self._wait(),
-            "still going after 0s, the run goes ahead: compliance-audit (armed oobe stage), "
-            "obtainability-audit (armed oobe stage), stockout-prevention (armed oobe stage)",
+            "still going after 0s, the run goes ahead: compliance-audit (oobe stage), fleet-wide-cost-analysis (oobe stage), "
+            "obtainability-audit (oobe stage), stockout-prevention (oobe stage)",
         )
 
     def test_a_done_or_absent_stage_holds_nothing(self):
@@ -240,8 +260,8 @@ class PlatformRunsTest(unittest.TestCase):
             [
                 "set -euo pipefail",
                 f'SCRIPT_DIR="{REPO / "hack"}"',
-                "EVAL_PLATFORM_RUN_WAIT_SECONDS=60 EVAL_PLATFORM_RUN_POLL_SECONDS=0 EVAL_SANDBOX_EXEC_ROUND_TRIP_SECONDS=5",
-                'EVAL_SANDBOX_EXEC_TIMEOUT=30s EVAL_GATEWAY_CONTAINER=c EVAL_GATEWAY_PYTHON=p EVAL_GATEWAY_HOME=/h',
+                *runner_constants(),
+                "EVAL_PLATFORM_RUN_WAIT_SECONDS=60 EVAL_PLATFORM_RUN_POLL_SECONDS=0",
                 "PROJECT_ID=proj AGENT_CLUSTER_CONTEXT=gke_proj_us_c TARGET_NAMESPACE=ns AGENT_SERVICE_NAME=platform-agent",
                 fn,
                 'wait_platform_runs "case rep 1" "compliance-audit"',
@@ -267,8 +287,8 @@ class PlatformRunsTest(unittest.TestCase):
             [
                 "set -euo pipefail",
                 f'SCRIPT_DIR="{REPO / "hack"}"',
-                "EVAL_PLATFORM_RUN_WAIT_SECONDS=2 EVAL_PLATFORM_RUN_POLL_SECONDS=1 EVAL_SANDBOX_EXEC_ROUND_TRIP_SECONDS=5",
-                'EVAL_SANDBOX_EXEC_TIMEOUT=30s EVAL_GATEWAY_CONTAINER=c EVAL_GATEWAY_PYTHON=p EVAL_GATEWAY_HOME=/h',
+                *runner_constants(),
+                "EVAL_PLATFORM_RUN_WAIT_SECONDS=2 EVAL_PLATFORM_RUN_POLL_SECONDS=1",
                 "PROJECT_ID=proj AGENT_CLUSTER_CONTEXT=gke_proj_us_c TARGET_NAMESPACE=ns AGENT_SERVICE_NAME=platform-agent",
                 fn,
                 'wait_platform_runs "case rep 1" "compliance-audit"',

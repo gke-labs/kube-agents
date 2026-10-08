@@ -200,12 +200,17 @@ def handoff_ranking(data_dir: Path, sweep_id: str) -> str | None:
     return fields.get(MARKER_TASK_ID) or None
 
 
-def read_scan(board: Path, sweep_id: str, ranking: str | None = None) -> tuple[bool, int] | None:
+# read_scan's answer when the board cannot be read, as distinct from a board without the sweep.
+BOARD_UNREADABLE = "unreadable"
+
+
+def read_scan(board: Path, sweep_id: str, ranking: str | None = None) -> tuple[bool, int] | str | None:
     """Whether this sweep's ranking cards have all finished, and how many cluster cards it has.
 
     ``ranking`` is the card the hand-off recorded for this sweep. Without it, every card under the
     ranking key created after the sweep card counts, so an earlier run's cards, left on the board
-    after onboarding was re-armed, cannot fire this one. None when the board cannot say.
+    after onboarding was re-armed, cannot fire this one. None when the sweep is not on the board,
+    ``BOARD_UNREADABLE`` when the board cannot be read.
     """
     if not sweep_id:
         return None
@@ -215,7 +220,7 @@ def read_scan(board: Path, sweep_id: str, ranking: str | None = None) -> tuple[b
         )
     except sqlite3.Error as e:
         _log(f"cannot open the board: {e}")
-        return None
+        return BOARD_UNREADABLE
     try:
         row = conn.execute("SELECT created_at FROM tasks WHERE id = ?", (sweep_id,)).fetchone()
         if row is None:
@@ -237,7 +242,7 @@ def read_scan(board: Path, sweep_id: str, ranking: str | None = None) -> tuple[b
         ).fetchone()
     except sqlite3.Error as e:
         _log(f"cannot read the board: {e}")
-        return None
+        return BOARD_UNREADABLE
     finally:
         conn.close()
     return bool(statuses) and all(status in FINISHED_STATUSES for status in statuses), clusters
@@ -259,6 +264,10 @@ def scan_settled(data_dir: Path, now: float) -> bool:
         # No cluster was audited: the hand-off wrote the report itself and filed no ranking card.
         return True
     scan = read_scan(board_path(data_dir), sweep_id, ranking)
+    if scan == BOARD_UNREADABLE:
+        # Not the shortest fallback: on a large fleet that would start the audits beside the scan.
+        # A board that never reads is ended by the not-new rule.
+        return False
     if scan is not None and scan[0]:
         return True
     wait = fallback_seconds(scan[1] if scan is not None else 0)

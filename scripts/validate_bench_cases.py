@@ -441,8 +441,13 @@ def _load_yaml(path: pathlib.Path) -> Any:
 
 def platform_job_ids() -> set[str]:
     """The Platform Agent's cron job ids, the audit streams among them."""
-    data = json.loads(PLATFORM_JOBS_FILE.read_text(encoding="utf-8"))
-    jobs = data.get("jobs", []) if isinstance(data, dict) else data
+    try:
+        data = json.loads(PLATFORM_JOBS_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise CaseError(f"{PLATFORM_JOBS_FILE}: could not be read as JSON: {exc}") from exc
+    jobs = data.get("jobs") if isinstance(data, dict) else data
+    if not isinstance(jobs, list):
+        raise CaseError(f"{PLATFORM_JOBS_FILE}: expected a list of jobs")
     return {job["id"] for job in jobs if isinstance(job, dict) and job.get("id")}
 
 

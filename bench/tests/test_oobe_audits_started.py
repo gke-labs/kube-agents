@@ -86,14 +86,18 @@ class Store:
         recorded.setdefault("marks", {})[audit] = at.timestamp()
         self.marker.write_text(json.dumps(recorded))
 
-    def run(self, job: str, claimed: datetime, status: str = "running", finished: datetime | None = None) -> None:
+    def run(
+        self, job: str, claimed: datetime, status: str = "running", finished: datetime | None = None, started: bool | None = None
+    ) -> None:
+        """A run row; ``started_at`` is set as the ledger sets it, for a run that got going, unless told."""
         self.rows += 1
+        began = status in oobe.STARTED_STATUSES if started is None else started
         with sqlite3.connect(self.db) as con:
             con.execute(
-                "INSERT INTO executions (id, job_id, source, process_id, pid, status, claimed_at, finished_at)"
-                " VALUES (?,?,?,?,?,?,?,?)",
+                "INSERT INTO executions (id, job_id, source, process_id, pid, status, claimed_at, finished_at, started_at)"
+                " VALUES (?,?,?,?,?,?,?,?,?)",
                 (f"{self.rows:032x}", job, "builtin", "p", 1, status, claimed.isoformat(),
-                 finished.isoformat() if finished else None),
+                 finished.isoformat() if finished else None, claimed.isoformat() if began else None),
             )
 
     def chain(self, start: datetime, last_status: str = "running") -> None:
@@ -234,6 +238,27 @@ def test_a_run_that_did_not_get_going_does_not_count(store: Store, status: str) 
     result = _verify()
     assert result.status == "fail"
     assert f"({status})" in result.reason
+
+
+@pytest.mark.parametrize("status", ["failed", "unknown"])
+def test_a_run_that_got_going_and_then_ended_badly_still_started(store: Store, status: str) -> None:
+    # How the run ended is the audit cases' to grade; a GitHub 500 in `finish` is not "did not start".
+    store.arm()
+    store.chain(ARMED + timedelta(minutes=1))
+    store.run(oobe.FIRST_RUN_AUDITS[0], ARMED + timedelta(seconds=30), status, ARMED + timedelta(seconds=50), started=True)
+    assert _verify().status == "pass"
+
+
+def test_a_red_names_what_the_stage_held_skipped_or_gave_up(store: Store) -> None:
+    store.arm(marked=oobe.FIRST_RUN_AUDITS[1:])
+    recorded = json.loads(store.marker.read_text())
+    recorded.update({"held": {oobe.FIRST_RUN_AUDITS[0]: "disabled"}, "gave_up": [oobe.FIRST_RUN_AUDITS[1]]})
+    store.marker.write_text(json.dumps(recorded))
+    reason = _verify().reason
+    assert f"the stage held {oobe.FIRST_RUN_AUDITS[0]} (disabled)" in reason
+    assert f"the stage gave up on {oobe.FIRST_RUN_AUDITS[1]}" in reason
+    store.marker.write_text(json.dumps({"done": True, "skipped": True, "reason": "no GitOps repository is configured"}))
+    assert "the stage skipped the first-run audits: no GitOps repository is configured" in _verify().reason
 
 
 def test_a_run_the_stage_did_not_mark_does_not_count(store: Store) -> None:

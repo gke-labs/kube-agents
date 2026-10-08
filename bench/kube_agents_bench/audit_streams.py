@@ -35,7 +35,7 @@ import yaml
 
 KEY = "audit_streams"
 # A Platform Agent job id: what the runner splices into a lock directory's name.
-BARE_ID = re.compile(r"^[A-Za-z0-9_.-]+$")
+BARE_ID = re.compile(r"\A[A-Za-z0-9_.-]+\Z")
 
 
 class AuditStreamsError(Exception):

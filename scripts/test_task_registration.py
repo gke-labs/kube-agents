@@ -652,6 +652,16 @@ class TestTheRulesReject(unittest.TestCase):
             with self.subTest(value=value):
                 self._only("non-empty list", audit_streams=value)
 
+    def test_an_unreadable_platform_roster_is_a_case_error_naming_it(self):
+        # A CaseError, which the lint's per-case loop reports, not a traceback that hides every case.
+        for text in ("{trailing,}", "null", '{"jobs": {"compliance-audit": {}}}'):
+            with self.subTest(text=text), tempfile.TemporaryDirectory() as tmp:
+                roster = pathlib.Path(tmp) / "jobs.json"
+                roster.write_text(text)
+                with unittest.mock.patch.object(validator, "PLATFORM_JOBS_FILE", roster):
+                    with self.assertRaisesRegex(validator.CaseError, re.escape(str(roster))):
+                        validator.platform_job_ids()
+
     def test_a_quoted_expected_fail_is_rejected(self):
         # yaml.safe_dump quotes a string that would otherwise read as a bool,
         # which is exactly the file a contributor produces by typing quotes.

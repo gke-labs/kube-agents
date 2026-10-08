@@ -67,7 +67,7 @@ from datetime import datetime
 state, marker, db, sentinel, audits = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5:]
 SQLITE_BUSY_TIMEOUT = 10
 SKIPPED = "skipped"
-out = {"applied_at": None, "marked": [], "runs": {}, "error": None}
+out = {"applied_at": None, "marked": [], "runs": {}, "error": None, "held": {}, "gave_up": [], "skipped": None}
 marks = {}
 try:
     out["applied_at"] = json.load(open(state))["applied_at"]
@@ -78,6 +78,9 @@ except (OSError, ValueError, KeyError, TypeError) as exc:
 try:
     recorded = json.load(open(marker))
     out["marked"] = [a for a in recorded.get("fired", []) if isinstance(a, str)]
+    out["held"] = recorded.get("held") or {}
+    out["gave_up"] = recorded.get("gave_up") or []
+    out["skipped"] = recorded.get("reason") if recorded.get("skipped") else None
     marks = {a: t for a, t in (recorded.get("marks") or {}).items() if isinstance(t, (int, float))}
 except (OSError, ValueError, AttributeError, TypeError):
     pass
@@ -88,11 +91,11 @@ if out["applied_at"] and not out["error"] and os.path.exists(db):
         con = sqlite3.connect("file:" + db + "?mode=ro", uri=True, timeout=SQLITE_BUSY_TIMEOUT)
         for audit in audits:
             since = max(armed, marks.get(audit, armed))
-            for status, claimed, finished in con.execute(
-                "SELECT status, claimed_at, finished_at FROM executions WHERE job_id = ? AND claimed_at IS NOT NULL"
+            for status, claimed, finished, began in con.execute(
+                "SELECT status, claimed_at, finished_at, started_at FROM executions WHERE job_id = ? AND claimed_at IS NOT NULL"
                 " ORDER BY claimed_at", (audit,)):
                 if status != SKIPPED and datetime.fromisoformat(claimed).timestamp() >= since:
-                    out["runs"][audit] = {"status": status, "claimed_at": claimed, "finished_at": finished}
+                    out["runs"][audit] = {"status": status, "claimed_at": claimed, "finished_at": finished, "started_at": began}
                     break
     except (sqlite3.Error, ValueError, TypeError) as exc:
         out["error"] = "%s: %s" % (db, exc)
@@ -147,10 +150,10 @@ def _overlaps(runs: dict[str, dict[str, Any]]) -> list[str]:
 @VERIFIERS.register("oobe_audits_started")
 class OobeAuditsStartedVerifier(_OnboardingPollVerifier):
     """Passes once the stage marked every first-run audit due, each has a run since its mark that
-    is running or completed, and each started only after the one before it in the chain ended.
+    got going (running, completed, or ended after its start), and each started only after the one
+    before it in the chain ended.
 
-    A row only claimed or failed does not count: a run cut off at its start leaves exactly
-    that. Nor does a run the stage did not mark: a scheduled run that falls in the window is
+    A row with no start time does not count: a run cut off at its start leaves exactly that. Nor does a run the stage did not mark: a scheduled run that falls in the window is
     not the stage's. Past running, the outcome is the audit's own, graded by the audit
     cases.
     The agent pod unreadable, or a state file or cron store the read cannot use, is
@@ -169,7 +172,12 @@ class OobeAuditsStartedVerifier(_OnboardingPollVerifier):
             return "error", f"there is no {STATE_FILE}: the stack did not arm the stage", read
         armed = datetime.fromisoformat(read["applied_at"]).isoformat()
         runs, marked = read["runs"], set(read.get("marked") or [])
-        running = [a for a in FIRST_RUN_AUDITS if runs.get(a, {}).get("status") in STARTED_STATUSES]
+        # A run that got going and then failed, or was cut off by a restart, still started: how it
+        # ended is the audit cases' to grade. A row with no start time ran nothing.
+        running = [
+            a for a in FIRST_RUN_AUDITS
+            if runs.get(a, {}).get("status") in STARTED_STATUSES or runs.get(a, {}).get("started_at")
+        ]
         started = [a for a in running if a in marked]
         if len(started) == len(FIRST_RUN_AUDITS):
             overlaps = _overlaps(runs)
@@ -188,4 +196,12 @@ class OobeAuditsStartedVerifier(_OnboardingPollVerifier):
             parts.append(f"a run the stage did not mark due (a scheduled one) for {', '.join(unmarked)}")
         if not started and not stalled and not unmarked:
             parts.append("nothing started the first-run audits")
+        # The stage's own account of an audit it did not mark, so a red names the install's state.
+        if read.get("skipped"):
+            parts.append(f"the stage skipped the first-run audits: {read['skipped']}")
+        held = read.get("held") or {}
+        if held:
+            parts.append(f"the stage held {', '.join(f'{a} ({why})' for a, why in sorted(held.items()))}")
+        if read.get("gave_up"):
+            parts.append(f"the stage gave up on {', '.join(read['gave_up'])} after its marks were never claimed")
         return "fail", "; ".join(parts), read

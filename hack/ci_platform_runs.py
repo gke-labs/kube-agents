@@ -20,9 +20,10 @@ next one, and only once the chain has started (before that the stage waits on th
 onboarding scan, for as long as an hour and more): waiting out the scan or the whole
 chain would hold every audit case on those streams for most of an hour. While the oobe-first-run-audits stack has the stage armed (its
 state file is there: the chain overran or the teardown could not disarm), every
-audit the stage has still to mark counts. An audit has had its turn once the stage
-has marked it (its run, or the mark awaiting one, is counted above), or it was held
-or given up on; a mark never claimed is taken back and the audit counts again. The stage's
+audit the stage has still to mark counts. The audit awaiting its run counts in both
+cases, since the stage records a mark before the store has it. An audit has had its
+turn once its run has ended, or it was held or given up on; a mark never claimed is
+taken back and the audit counts again. The stage's
 audit list and order are read from the image's copy of oobe.py, not run.
 
 Prints one line: how long it waited and what was still going when it stopped.
@@ -126,15 +127,18 @@ def stage_pending():
         state = {}
     if state.get("done"):
         return set()
-    # The audit awaiting its run is in `fired` and answered by running() and due(); the one after
-    # it is the first not yet marked.
+    # The audit awaiting its run counts as well as the next: the stage records a mark before the
+    # store has it, and a mark the store dropped is made again at the start limit.
+    current = (state.get("current") or {}).get("job")
     had_turn = set(state.get("fired", [])) | set(state.get("held", {})) | set(state.get("gave_up", []))
     remaining = [audit for audit in stage_audits() if audit not in had_turn]
     if os.path.exists(STACK_STATE):
-        return {f"{audit} (armed oobe stage)" for audit in remaining if audit in audits}
-    if not state:
+        held = set(remaining) | {current}
+    elif state:
+        held = set(remaining[:1]) | {current}
+    else:
         return set()
-    return {f"{audit} (oobe stage, next)" for audit in remaining[:1] if audit in audits}
+    return {f"{audit} (oobe stage)" for audit in held if audit in audits}
 
 
 def running(now):

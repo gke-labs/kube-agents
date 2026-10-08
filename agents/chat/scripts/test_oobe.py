@@ -267,11 +267,17 @@ class StageTest(unittest.TestCase):
             handoff.DEADLINE_SECONDS + 4 * handoff.DEADLINE_PER_CARD_SECONDS + oobe.RANKING_ALLOWANCE_SECONDS,
         )
 
-    def test_an_unreadable_board_waits_for_the_fallback(self):
+    def test_an_unreadable_board_waits_past_the_fallback(self):
+        # Not the shortest fallback, which on a large fleet starts the audits beside the scan; it
+        # fires once the board reads, and a board that never does is ended by the not-new rule.
         self._file_scan()
         self.board.write_text("not a database")
         self._main()
         self.assertEqual(self.started, [])
+        self._main(now=NOW_PAST_FALLBACK)
+        self.assertEqual(self.started, [])
+        self.board.unlink()
+        _board(self.board, [])
         self._main(now=NOW_PAST_FALLBACK)
         self.assertEqual(self._started_ids(), FIRST)
 
