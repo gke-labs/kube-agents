@@ -24,8 +24,8 @@
 # An image without the job gets nothing put back, so nothing starts the audits.
 #
 # Before it arms, the apply waits for the install's own first-run stage to finish
-# (a fresh install has the job pending until its scan settles and its own chain has
-# started the last audit), failing after `own_wait`. An earlier run's arm left behind is disarmed first. After the arm it
+# (a fresh install has the job until its scan settles, its own chain has started
+# the last audit and the next tick has removed it), failing after `own_wait`. An earlier run's arm left behind is disarmed first. After the arm it
 # waits, up to `chain_wait`, for the stage to finish: it marks the audits one after
 # another, which outlasts the verifier's two-minute window. On an image without the
 # job there is nothing to wait for.

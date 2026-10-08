@@ -51,6 +51,10 @@ import eval_rosters  # noqa: E402
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 PLATFORM_JOBS_FILE = REPO_ROOT / "agents" / "platform" / "cron" / "jobs.json"
+# The runner's reader of `audit_streams:` (hack/ci-eval-pr.sh), loaded by path so the lint applies
+# its rule rather than a second one.
+AUDIT_STREAMS_FILE = REPO_ROOT / "bench" / "kube_agents_bench" / "audit_streams.py"
+AUDIT_STREAMS_MODULE_NAME = "bench_audit_streams"
 TASKS_DIR = REPO_ROOT / "bench" / "tasks"
 # The rosters hack/ci-eval-pr.sh reads at startup (#1546): what the presubmit
 # runs, what the nightly adds. A case is registered by being in one of them.
@@ -448,6 +452,15 @@ def _load_yaml(path: pathlib.Path) -> Any:
         return yaml.safe_load(path.read_text(encoding="utf-8"))
     except (OSError, yaml.YAMLError) as exc:
         raise CaseError(f"{path}: could not be parsed as YAML: {exc}") from exc
+
+
+def audit_streams_reader() -> Any:
+    spec = importlib.util.spec_from_file_location(AUDIT_STREAMS_MODULE_NAME, AUDIT_STREAMS_FILE)
+    if spec is None or spec.loader is None:
+        raise CaseError(f"{AUDIT_STREAMS_FILE}: could not be loaded")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def platform_job_ids() -> set[str]:
@@ -863,10 +876,15 @@ def validate_case(name: str, path: pathlib.Path, *, registered: set[str] | None)
     # holds each one's lock for the unit (hack/ci-eval-pr.sh, task_streams); an
     # id no Platform Agent job has would lock nothing real.
     if "audit_streams" in spec:
-        streams = spec["audit_streams"]
-        if not isinstance(streams, list) or not streams or not all(isinstance(s, str) for s in streams):
+        reader = audit_streams_reader()
+        try:
+            streams = reader.declared_streams(path)
+        except reader.AuditStreamsError as exc:
+            streams = None
+            problems.append(f"'audit_streams:' must be a non-empty list of audit job ids: {exc}")
+        if streams == []:
             problems.append("'audit_streams:' must be a non-empty list of audit job ids")
-        else:
+        elif streams:
             unknown = sorted(set(streams) - platform_job_ids())
             if unknown:
                 problems.append(

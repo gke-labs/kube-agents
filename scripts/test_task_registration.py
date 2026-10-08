@@ -648,7 +648,8 @@ class TestTheRulesReject(unittest.TestCase):
         self._only("does not define", audit_streams=["compliance-audit", "no-such-audit"])
 
     def test_audit_streams_that_are_not_a_list_are_rejected(self):
-        for value in ([], "compliance-audit", [1]):
+        # Blank, padded or newline-bearing ids are refused by the runner's own reader too.
+        for value in ([], "compliance-audit", [1], [""], ["  "], ["compliance-audit\n"]):
             with self.subTest(value=value):
                 self._only("non-empty list", audit_streams=value)
 

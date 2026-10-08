@@ -211,7 +211,7 @@ class DelegationCeilingTest(unittest.TestCase):
         # the deadline, and so is the wait for a run the install started on
         # the unit's streams (wait_platform_runs).
         unit = lifted("run_one_unit")
-        deadline = 'lock_deadline="$(stream_lock_deadline "${name}" "${audit_id}")"'
+        deadline = 'lock_deadline="$(stream_lock_deadline "${name}" "${audit_id}" "${streams}")"'
         ledgerless_stack = (
             'if [ -z "${audit_id}" ] && [ -n "${has_stack}" ]; then\n'
             "    lock_deadline=$(( lock_deadline + INFRA_LOCK_DEADLINE ))\n"
@@ -238,14 +238,14 @@ class DelegationCeilingTest(unittest.TestCase):
                 "INFRA_LOCK_DEADLINE=900",
                 'stream_case_count() { echo "${CASES_ON_STREAM}"; }',
                 'stream_stack_wait() { echo "${STACK_WAIT:-0}"; }',
-                "CASES_ON_STREAM=1 STACK_WAIT=0 name=compliance-rbac-overgrant audit_id=compliance-audit has_stack=\n" + computed,
-                "CASES_ON_STREAM=1 STACK_WAIT=0 name=capacity-pinned-pool-probe audit_id= has_stack=\n" + computed,
-                "CASES_ON_STREAM=2 STACK_WAIT=0 name=consistency-drift-outlier audit_id=fleet-consistency-drift has_stack=\n" + computed,
-                "CASES_ON_STREAM=1 STACK_WAIT=900 name=compliance-rbac-overgrant audit_id=compliance-audit has_stack=1\n" + computed,
-                "CASES_ON_STREAM=1 STACK_WAIT=0 name=capacity-pinned-pool-probe audit_id= has_stack=1\n" + computed,
+                "CASES_ON_STREAM=1 STACK_WAIT=0 name=compliance-rbac-overgrant audit_id=compliance-audit streams=compliance-audit has_stack=\n" + computed,
+                "CASES_ON_STREAM=1 STACK_WAIT=0 name=capacity-pinned-pool-probe audit_id= streams= has_stack=\n" + computed,
+                "CASES_ON_STREAM=2 STACK_WAIT=0 name=consistency-drift-outlier audit_id=fleet-consistency-drift streams=fleet-consistency-drift has_stack=\n" + computed,
+                "CASES_ON_STREAM=1 STACK_WAIT=900 name=compliance-rbac-overgrant audit_id=compliance-audit streams=compliance-audit has_stack=1\n" + computed,
+                "CASES_ON_STREAM=1 STACK_WAIT=0 name=capacity-pinned-pool-probe audit_id= streams= has_stack=1\n" + computed,
             ]
         )
-        self.assertEqual(run_bash(body).stdout.split(), ["11100", "10800", "22200", "12000", "11700"])
+        self.assertEqual(run_bash(body).stdout.split(), ["11100", "3600", "22200", "12000", "4500"])
 
 
 class PerCaseGradingTest(unittest.TestCase):

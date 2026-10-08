@@ -215,6 +215,16 @@ class PlatformRunsTest(unittest.TestCase):
         )
         self.assertEqual(self._wait(), "still going after 0s, the run goes ahead: obtainability-audit (oobe stage)")
 
+    def test_a_stage_not_started_does_not_read_the_stages_source(self):
+        # An `oobe` job left on the roster of an image that ships no oobe.py holds nothing.
+        self._stage(armed=False)
+        done = subprocess.run(
+            [sys.executable, "-", str(self.home), "0", "1", *AUDITS],
+            input=SCRIPT.read_text(), capture_output=True, text=True, check=False,
+            env={**os.environ, "OOBE_STAGE_SOURCE": str(self.home / "no-such-oobe.py")},
+        )
+        self.assertEqual(done.stdout.strip(), "none going", done.stderr)
+
     def test_a_roster_whose_jobs_are_not_a_list_holds(self):
         self._stage({"fired": []}, armed=False)
         (self.home / "cron" / "jobs.json").write_text(json.dumps({"jobs": {"oobe": {}}}))

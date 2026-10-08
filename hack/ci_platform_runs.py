@@ -134,7 +134,10 @@ def stage_pending():
             state = json.load(fh)
     except FileNotFoundError:
         state = {}
-    if state.get("done"):
+    armed = os.path.exists(STACK_STATE)
+    # Decided before the stage's source is read: a stage that has not started, or is done, holds
+    # nothing, and an image without oobe.py must not turn that into an unreadable store.
+    if state.get("done") or not (state or armed):
         return set()
     # The audit awaiting its run counts as well as the next: the stage records a mark before the
     # store has it, and a mark the store dropped is made again at the start limit.
@@ -148,12 +151,7 @@ def stage_pending():
     # same three markers as its audit_holds.
     skipped = unrunnable_audits()
     remaining = [audit for audit in stage_audits() if audit not in had_turn and audit not in skipped]
-    if os.path.exists(STACK_STATE):
-        held = set(remaining) | {current} | taken_back
-    elif state:
-        held = set(remaining[:1]) | {current} | taken_back
-    else:
-        return set()
+    held = (set(remaining) if armed else set(remaining[:1])) | {current} | taken_back
     return {f"{audit} (oobe stage)" for audit in held if audit in audits}
 
 

@@ -16,28 +16,21 @@
 
 Usage: python3 - <home> < own_stage.py
 
-A fresh install has the `oobe` job and no finished `.oobe_audits_fired` until its scan settles
-and its own chain has started the last audit. Arming over that would point the job at the
-stand-in cards, start the audits beside the real scan or chain, and use up the install's own
-first run. Prints `pending` or `clear`.
+A fresh install has the `oobe` job until its scan has settled, its own chain has started the
+last audit, and the tick after that has removed the job. Arming over that would point the job at
+the stand-in cards, start the audits beside the real scan or chain, and use up the install's own
+first run; arming in the minute between `done` and the removal would record the job as present
+while its own tick takes it away, leaving nothing to run the stand-in chain. So this waits for
+the job itself to be gone. Prints `pending` or `clear`.
 """
 
-import json
-import os
 import sys
 
 from cron.jobs import is_job_runnable, load_jobs
 
 home = sys.argv[1]
-AUDITS_MARKER = os.path.join(home, ".oobe_audits_fired")
 JOB_ID = "oobe"
-DONE_KEY = "done"
 
 # A disabled or paused job never runs, so it never finishes: nothing to wait for.
 present = any(job.get("id") == JOB_ID and is_job_runnable(job) for job in load_jobs())
-try:
-    with open(AUDITS_MARKER, encoding="utf-8") as fh:
-        done = bool(json.load(fh).get(DONE_KEY))
-except (OSError, ValueError, AttributeError):
-    done = False
-print("pending" if present and not done else "clear")
+print("pending" if present else "clear")

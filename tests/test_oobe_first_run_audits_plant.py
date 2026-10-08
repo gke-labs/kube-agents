@@ -271,12 +271,13 @@ class PlantScriptsTest(unittest.TestCase):
         (self.home / ".oobe_audits_fired").write_text('{"fired": ["compliance-audit"]}')
         self.assertEqual(self._run("own_stage.py", str(self.home)).stdout.strip(), "pending")
 
-    def test_own_stage_is_clear_once_done_or_gone(self):
+    def test_own_stage_waits_for_a_done_job_to_retire(self):
+        # Between `done` and the next tick's removal, arming would record the job as present
+        # while that tick takes it away.
         self.store.write_text(json.dumps([OTHER_JOB, OOBE_JOB]))
         (self.home / ".oobe_audits_fired").write_text('{"done": true}')
-        self.assertEqual(self._run("own_stage.py", str(self.home)).stdout.strip(), "clear")
+        self.assertEqual(self._run("own_stage.py", str(self.home)).stdout.strip(), "pending")
         self.store.write_text(json.dumps([OTHER_JOB]))
-        (self.home / ".oobe_audits_fired").unlink()
         self.assertEqual(self._run("own_stage.py", str(self.home)).stdout.strip(), "clear")
 
     def test_own_stage_is_clear_for_a_job_that_cannot_run(self):

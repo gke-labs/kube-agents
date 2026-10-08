@@ -2654,11 +2654,15 @@ stream_stack_wait() { # <audit-id>
 
 # How long a unit waits for one stream's lock: the single-unit figure times the
 # cases holding the stream, plus the infra queue its stack-bearing ones may hold
-# it through. The single-unit figure counts the holder's wait for the
-# install's own runs (wait_platform_runs) as well as its in-flight grace. For
-# the stream a case grades, or none, it is the task lock's too.
-stream_lock_deadline() { # <task-name> <audit-id>
-  echo $(( $(stream_case_count "$2") * ($(unit_delegation_timeout "$1") + UNIT_LOCK_ALLOWANCE_SECONDS + EVAL_INFLIGHT_GRACE_SECONDS + EVAL_PLATFORM_RUN_WAIT_SECONDS) + $(stream_stack_wait "$2") ))
+# it through. The single-unit figure counts the holder's in-flight grace, and
+# for a unit that holds streams its wait for the install's own runs
+# (wait_platform_runs); a unit with none never waits, so a dead holder's
+# successor gives up as soon as it did before. For the stream a case grades,
+# or none, it is the task lock's too.
+stream_lock_deadline() { # <task-name> <audit-id> <the unit's streams>
+  local run_wait=0
+  if [ -n "${3:-}" ]; then run_wait="${EVAL_PLATFORM_RUN_WAIT_SECONDS}"; fi
+  echo $(( $(stream_case_count "$2") * ($(unit_delegation_timeout "$1") + UNIT_LOCK_ALLOWANCE_SECONDS + EVAL_INFLIGHT_GRACE_SECONDS + run_wait) + $(stream_stack_wait "$2") ))
 }
 
 release_streams() { # <space-separated audit ids>
@@ -2807,7 +2811,7 @@ run_one_unit() { # <task-path> <task-name> <rep> <reuse:true|empty> <has-stack:t
   # held only while this unit's own stack is in use.
   local audit_id lock_deadline held="" s
   audit_id="$(ledger_audit_id_for_task "${task}")"
-  lock_deadline="$(stream_lock_deadline "${name}" "${audit_id}")"
+  lock_deadline="$(stream_lock_deadline "${name}" "${audit_id}" "${streams}")"
   if [ -z "${audit_id}" ] && [ -n "${has_stack}" ]; then
     lock_deadline=$(( lock_deadline + INFRA_LOCK_DEADLINE ))
   fi
@@ -2828,7 +2832,7 @@ run_one_unit() { # <task-path> <task-name> <rep> <reuse:true|empty> <has-stack:t
   # out its INFRA_LOCK_DEADLINE waiting on a lane nothing is using.
   # shellcheck disable=SC2086 # audit ids carry no spaces or glob characters
   for s in ${streams}; do
-    if ! lock_acquire "${STATE_DIR}/lock-stream-${s}" "$(stream_lock_deadline "${name}" "${s}")"; then
+    if ! lock_acquire "${STATE_DIR}/lock-stream-${s}" "$(stream_lock_deadline "${name}" "${s}" "${streams}")"; then
       release_streams "${held}"
       lock_release "${STATE_DIR}/lock-task-${name}"
       echo "<<< [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] ${name} rep ${rep} gave up on the ${s} stream lock" >&2
