@@ -6,6 +6,7 @@ Run: python3 -m unittest discover -s deploy/docker/patches -p 'test_*.py' -t dep
 import ast
 import os
 import shutil
+import sqlite3
 import sys
 import tempfile
 import unittest
@@ -1066,6 +1067,7 @@ class SlackPlanHookTest(unittest.IsolatedAsyncioTestCase):
         self.moves = []
         self.settled = []
         self.results = []
+        self.titles = []
         self.flag = True
         self.plan = True
         self.takes = True
@@ -1078,9 +1080,10 @@ class SlackPlanHookTest(unittest.IsolatedAsyncioTestCase):
                 raise test.takes
             return test.takes
 
-        async def settle_row(adapter, sub, kind, result=""):
+        async def settle_row(adapter, sub, kind, result="", title=""):
             test.settled.append((sub["task_id"], kind))
             test.results.append(result)
+            test.titles.append(title)
 
         async def settle_delegated(adapter, sub, kind, board=None):
             return None
@@ -1126,6 +1129,14 @@ class SlackPlanHookTest(unittest.IsolatedAsyncioTestCase):
         completed = SimpleNamespace(id=3, kind="completed", payload={"summary": "seeded-a · 1.33.4 = default"})
         await deliver(SimpleNamespace(), _Adapter(), SLACK_SUB, "completed", completed, "Done.", None, HEADER)
         self.assertEqual(self.results, ["seeded-a · 1.33.4 = default"])
+
+    async def test_a_terminal_event_names_the_card_for_a_row_it_opens(self):
+        # A card that sent no note gets its row from the settle, led by its title.
+        completed = SimpleNamespace(id=3, kind="completed", payload={"summary": "1.33.4 = default"})
+        await deliver(
+            SimpleNamespace(), _Adapter(), SLACK_SUB, "completed", completed, "Done.", None, HEADER, title="seeded-a",
+        )
+        self.assertEqual(self.titles, ["seeded-a"])
 
     async def test_a_plan_that_refuses_falls_back_to_the_rolling_line(self):
         # The fallback is the flag-on rolling line: the trail settles to its last line.
@@ -1253,6 +1264,117 @@ class SlackPlanHookTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((self.rows, self.settled), ([], []))
 
 
+class FanOutOpenTest(unittest.IsolatedAsyncioTestCase):
+    """The read that decides whether a card beneath a fan-out folds its report, against a sqlite board."""
+
+    def setUp(self):
+        self.path = Path(tempfile.mkdtemp()) / "kanban.db"
+        self.addCleanup(shutil.rmtree, self.path.parent)
+        conn = sqlite3.connect(self.path)
+        conn.executescript(
+            "CREATE TABLE tasks (id TEXT, status TEXT);"
+            "CREATE TABLE task_events (id INTEGER PRIMARY KEY, task_id TEXT, kind TEXT, payload TEXT);"
+            "CREATE TABLE kanban_notify_subs (task_id TEXT, platform TEXT, chat_id TEXT, thread_id TEXT);"
+            "INSERT INTO tasks VALUES ('t_parent', 'running'), ('t_e0c1', 'done'), ('t_e0c2', 'running');"
+            "INSERT INTO task_events (task_id, kind, payload) VALUES ('t_e0c1', 'created', '{\"creator_task_id\": \"t_parent\"}');"
+            "INSERT INTO task_events (task_id, kind, payload) VALUES ('t_e0c2', 'created', '{\"creator_task_id\": \"t_parent\"}');"
+        )
+        conn.execute(
+            "INSERT INTO kanban_notify_subs VALUES ('t_parent', 'Slack', ?, ?)",
+            (SLACK_SUB["chat_id"], SLACK_SUB["thread_id"]),
+        )
+        conn.commit()
+        conn.close()
+        connect = SimpleNamespace(connect=lambda board=None: sqlite3.connect(self.path))
+        patcher = mock.patch.dict(
+            sys.modules,
+            {"hermes_cli": SimpleNamespace(kanban_db_connect=connect), "hermes_cli.kanban_db_connect": connect},
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _set(self, sql, *params):
+        conn = sqlite3.connect(self.path)
+        conn.execute(sql, params)
+        conn.commit()
+        conn.close()
+
+    async def test_an_open_fan_out_on_the_same_thread_folds(self):
+        self.assertTrue(await kanban_progress_lines._folds(SLACK_SUB, None))
+
+    async def test_a_creator_that_is_done_or_archived_does_not(self):
+        # A worker that answered and then filed a follow-up: the follow-up is the answer.
+        for status in ("done", "archived"):
+            with self.subTest(status=status):
+                self._set("UPDATE tasks SET status = ? WHERE id = 't_parent'", status)
+                self.assertFalse(await kanban_progress_lines._folds(SLACK_SUB, None))
+
+    async def test_a_creator_parked_by_a_give_up_does_not_and_one_asking_a_question_does(self):
+        # A give-up's worker never runs again to carry the children's reports up, so they post;
+        # a question resumes on the answer, so its children still fold.
+        stop = "INSERT INTO task_events (task_id, kind, payload) VALUES ('t_parent', ?, '{}')"
+        self._set("UPDATE tasks SET status = 'blocked' WHERE id = 't_parent'")
+        self._set(stop, "blocked")
+        self.assertTrue(await kanban_progress_lines._folds(SLACK_SUB, None))
+        self._set(stop, "gave_up")
+        self.assertFalse(await kanban_progress_lines._folds(SLACK_SUB, None))
+        # Revived by an unblock, then blocked on a question again.
+        self._set(stop, "unblocked")
+        self._set(stop, "blocked")
+        self.assertTrue(await kanban_progress_lines._folds(SLACK_SUB, None))
+
+    async def test_a_creators_only_child_does_not(self):
+        # A single-cluster delegation: the Cluster Agent's whole report is the answer's evidence.
+        self._set("DELETE FROM task_events WHERE task_id = 't_e0c2'")
+        self.assertFalse(await kanban_progress_lines._folds(SLACK_SUB, None))
+
+    def _grandchild(self, creator="t_e0c1"):
+        self._set(
+            "INSERT INTO task_events (task_id, kind, payload) VALUES ('t_g1', 'created', ?)", f'{{"creator_task_id": "{creator}"}}',
+        )
+        return {**SLACK_SUB, "task_id": "t_g1"}
+
+    async def test_a_card_a_fanned_out_card_filed_folds(self):
+        # A Platform Agent card per cluster handing its cluster to the Cluster Agent:
+        # the per-cluster card's row and the fan-out's answer carry the report.
+        self.assertTrue(await kanban_progress_lines._folds(self._grandchild(), None))
+
+    async def test_a_chain_with_no_fan_out_above_it_does_not(self):
+        # Planning Agent, Platform Agent, Cluster Agent, one card each: a single-cluster delegation.
+        self._set("DELETE FROM task_events WHERE task_id = 't_e0c2'")
+        self.assertFalse(await kanban_progress_lines._folds(self._grandchild(), None))
+
+    async def test_a_card_whose_middle_card_gave_up_posts(self):
+        # The per-cluster card gave up before its Cluster Agent card finished: nothing will
+        # carry the Cluster Agent's report up, so it posts. A question still folds.
+        sub = self._grandchild()
+        stop = "INSERT INTO task_events (task_id, kind, payload) VALUES ('t_e0c1', ?, '{}')"
+        self._set("UPDATE tasks SET status = 'blocked' WHERE id = 't_e0c1'")
+        self._set(stop, "blocked")
+        self.assertTrue(await kanban_progress_lines._folds(sub, None))
+        self._set(stop, "gave_up")
+        self.assertFalse(await kanban_progress_lines._folds(sub, None))
+        self.assertTrue(await kanban_progress_lines._folds({**SLACK_SUB, "task_id": "t_e0c2"}, None))
+
+    async def test_the_nearest_fan_out_decides(self):
+        # t_e0c1 fanned out in turn and has finished: its own answer stands, whatever its creator is doing.
+        sub = self._grandchild()
+        self._set("INSERT INTO task_events (task_id, kind, payload) VALUES ('t_g2', 'created', '{\"creator_task_id\": \"t_e0c1\"}')")
+        self.assertFalse(await kanban_progress_lines._folds(sub, None))
+        self._set("INSERT INTO kanban_notify_subs VALUES ('t_e0c1', 'slack', ?, ?)", SLACK_SUB["chat_id"], SLACK_SUB["thread_id"])
+        self._set("UPDATE tasks SET status = 'running' WHERE id = 't_e0c1'")
+        self.assertTrue(await kanban_progress_lines._folds(sub, None))
+
+    async def test_a_creator_on_another_thread_or_none_does_not(self):
+        self.assertFalse(await kanban_progress_lines._folds({**SLACK_SUB, "thread_id": "1790717879.000001"}, None))
+        self._set("DELETE FROM task_events")
+        self.assertFalse(await kanban_progress_lines._folds(SLACK_SUB, None))
+
+    async def test_a_read_that_fails_posts_the_report(self):
+        sys.modules["hermes_cli.kanban_db_connect"].connect = mock.Mock(side_effect=RuntimeError("locked"))
+        self.assertFalse(await kanban_progress_lines._folds(SLACK_SUB, None))
+
+
 class SlackMomentsHookTest(unittest.IsolatedAsyncioTestCase):
     """KAGE_SLACK_UX on a Slack card: a question and an opened PR get messages of their own.
 
@@ -1323,6 +1445,63 @@ class SlackMomentsHookTest(unittest.IsolatedAsyncioTestCase):
         for event_id, note in ((1, "Checking seeded-a."), (2, self.PR_NOTE)):
             await deliver(watcher, adapter, sub, "heartbeat", _beat(event_id, note), "", None, HEADER)
         return await deliver(watcher, adapter, sub, "completed", _terminal(3), report, None, HEADER)
+
+    def _plan(self, shows, folds):
+        # The thread's plan, and whether the card's creator is still open on it.
+        test = self
+        test.plan_settled = []
+
+        async def settle_row(adapter, sub, kind, result="", title=""):
+            test.plan_settled.append(kind)
+            return shows
+
+        status = SimpleNamespace(enabled=lambda: True, settle_row=settle_row)
+        sys.modules["gateway.slack_ux_status"] = status
+        sys.modules["gateway"].slack_ux_status = status
+        reader = mock.AsyncMock(return_value=folds)
+        patcher = mock.patch.object(kanban_progress_lines, "_folds", reader)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return reader
+
+    async def _child(self, adapter, kind="completed", payload=None, message="seeded-a: 1.33.4 = default."):
+        ev = SimpleNamespace(id=3, kind=kind, payload=payload or {})
+        return await deliver(SimpleNamespace(), adapter, SLACK_SUB, kind, ev, message, None, HEADER, title="seeded-a")
+
+    async def test_a_fanned_out_cards_completion_folds_into_its_row(self):
+        self._plan(shows=True, folds=True)
+        adapter = _Adapter()
+        self.assertIsNone(await self._child(adapter, message=f"seeded-a: {self.PR_NOTE}"))
+        self.assertEqual(adapter.sent, [])
+        self.assertEqual(self.settled, [("t_e0c1", "completed")], "the arrival reaction was left on")
+        self.assertEqual(self.announced, [("t_e0c1", f"seeded-a: {self.PR_NOTE}", 0)], "a PR it opened lost its message")
+
+    async def test_a_completion_the_plan_does_not_show_or_with_no_open_fan_out_posts(self):
+        for shows, folds in ((False, True), (True, False)):
+            with self.subTest(shows=shows, folds=folds):
+                reader = self._plan(shows=shows, folds=folds)
+                adapter = _Adapter()
+                await self._child(adapter)
+                self.assertEqual([content for _chat, content, _id in adapter.sent], ["seeded-a: 1.33.4 = default."])
+                self.assertEqual(reader.await_count, int(shows), "the creator was read for a row not shown")
+
+    async def test_a_fanned_out_cards_question_still_posts(self):
+        reader = self._plan(shows=True, folds=True)
+        payload = {"kind": "needs_input", "reason": "seeded-c is unreachable. Skip it?"}
+        self.assertIsNone(await self._child(_Adapter(), "blocked", payload, "⏸ t_e0c1 blocked: skip it?"))
+        self.assertEqual(self.asked, [("t_e0c1", payload, 3)])
+        self.assertEqual(self.plan_settled, ["blocked"])
+        reader.assert_not_awaited()
+
+    async def test_a_fanned_out_card_that_fails_still_posts(self):
+        for kind in ("gave_up", "crashed", "timed_out"):
+            with self.subTest(kind=kind):
+                reader = self._plan(shows=True, folds=True)
+                adapter = _Adapter()
+                await self._child(adapter, kind, message=f"✖ t_e0c1 {kind}")
+                self.assertEqual(self.plan_settled, [kind])
+                self.assertEqual([content for _chat, content, _id in adapter.sent], [f"✖ t_e0c1 {kind}"])
+                reader.assert_not_awaited()
 
     async def test_a_needs_input_block_posts_the_question_instead_of_the_line(self):
         adapter = _Adapter()

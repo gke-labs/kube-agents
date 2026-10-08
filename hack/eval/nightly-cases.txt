@@ -130,12 +130,15 @@
 # (159) of sixty-seven (201), +3 more: the same shape on the card's last
 # attempt. chat-voice-failure-leads-with-fact (after it) makes
 # it fifty-four (162) of sixty-eight (204), +3 more: the same shape on a
-# blocked card. oobe-first-run-audits (the last entry below) makes it
+# blocked card. oobe-first-run-audits (the second-last entry below) makes it
 # sixty-two (186) of seventy-six (228), counted from the lists with
 # upgrades-zonal-control-plane-outage-warned (2026-10-05, below), +3 more at its 2400s hint: a unit
 # that waits out the previous repetition's audits (the runner's wait_platform_runs), a stack that
 # waits out the stage's chain, then a turn with no tools,
 # holding the four audit streams' locks throughout, so their audit cases queue behind it.
+# chat-fanout-fleet-restarts-rows (the last entry below) makes it sixty-three
+# (189) of seventy-seven (231), +3 more: one front-door turn and a four-card
+# fan-out.
 # Whether the worst night fits is a question about the whole matrix, and the
 # six measured nights (2026-09-16 to 09-21, oss-test-infra#2707's table)
 # answer it plainly: 1734-2693 serial minutes of work at a realised
@@ -696,7 +699,13 @@
 # The oobe job's first-run audits stage (docs/designs/oobe.md): once the
 # onboarding scan settles, four fleet audits start instead of waiting for their
 # schedules, one after another. The stack arms the stage with two archived
-# stand-in cards and the scan marker, and puts back the oobe job the image ships;
+# stand-in cards, the scan marker and the hand-off's record, and puts back the
+# oobe job the image ships;
 # the verifier reads the Platform Agent's cron runs. Nightly rather than presubmit
 # because each repetition runs four real audits back to back.
 ./tasks/oobe-first-run-audits/task.yaml
+
+# A fleet question fanned out one card per cluster, each titled with the bare
+# cluster name the Slack plan row renders (agents/platform/SOUL.md, fan-out).
+# deployer: noop; reads the seeded fleet's crashloop-workload role.
+./tasks/chat-fanout-fleet-restarts-rows/task.yaml

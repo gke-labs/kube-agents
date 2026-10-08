@@ -410,9 +410,9 @@ def repository_path(repo: str) -> str:
 
     The forge names the repository a proposal came from by its path on that
     forge (`acme/toolkit`, `group/sub/project`), never with a host, while the
-    managed list spells a repository on an install with a second forge as
-    `host/path`. Comparing the two as written would make every proposal "not
-    ours" the moment a second forge is registered. The rule is
+    managed list spells a repository on another forge, and now and then a
+    GitHub one, as `host/path`. Comparing the two as written would make every
+    such repository's proposals "not ours". The rule is
     `gitops_workspace.split_host`'s, restated because this module imports none
     of that one: a hostname followed by at least two more segments.
     """

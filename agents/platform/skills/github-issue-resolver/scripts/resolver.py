@@ -781,9 +781,9 @@ def handle_poll(args):
 def _validate_repo_or_exit(repo: str) -> str:
     """`repo` as the managed list spells it, or a refusal and exit.
 
-    Returned rather than only checked: a bare `owner/name` is lifted to
-    `github.com/owner/name` once the list names a second forge, and that is
-    the spelling the broker then has to be sent.
+    Returned rather than only checked: the list may spell a GitHub repository
+    `github.com/owner/name` (`gitops_workspace.get_managed_repos` says when),
+    and that is the spelling the broker then has to be sent.
     """
     if not repo or not is_valid_repo_slug(repo):
         refuse("INVALID_REPOSITORY", f"Invalid repository format: {repo!r}")
