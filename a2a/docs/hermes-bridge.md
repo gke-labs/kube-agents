@@ -410,9 +410,10 @@ refused. Follow-ups run on the `api` executor only: the `cli` executor cannot co
 The bridge answers each follow-up with a non-final status carrying the task's current state
 (`submitted` while queued or waiting for the session, `working` after) and a `steerNotice` data
 part: `queued`, or `refused` with `no-resume` (the task runs on the `cli` executor, which can't
-continue a session; every follow-up to it is refused so when it arrives, and the notice's text says
-to send it again after the answer), `queue-full` (a task takes at most 16 follow-ups, counted per
-task: those already run count, not only those waiting), `task-ending` (the answer was already
+continue a session; every follow-up to it is refused so when it arrives, the notice's text says
+to send it again after the answer, and the gateway posts that to the room at once),
+`queue-full` (a task takes at most 16 follow-ups, counted per task: those already run count, not
+only those waiting), `task-ending` (the answer was already
 chosen), `no-text` (no text part holds anything but white space, U+001C-U+001F or NUL: Hermes's API
 server refuses a turn that Python's `str.strip()` empties, which strips U+001C-U+001F too, and a
 NUL alone asks nothing), `capability` (the task's capability, carried on the follow-up, did not pass

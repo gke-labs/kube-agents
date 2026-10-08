@@ -2179,17 +2179,16 @@ const (
 // The relay's posts about follow-ups on the fixed route, from the
 // executor's steer notices and from what the relay counted at the terminal.
 const (
-	noticeSteerNotTaken  = "⚠️ not taken: %s. Send it again after the answer."
-	noticeSteersUnrun    = "⚠️ %d queued follow-up(s) did not run before the task ended; send them again if they still matter"
-	noticeSteerMissed    = "⚠️ %d follow-up(s) arrived as the task finished and were not taken; send them again"
-	noticeSteersNoResume = "⚠️ %d follow-up(s) not taken: this agent's executor can't continue a session, and follow-ups run on the api executor only; send them again after the answer if they still matter"
+	noticeSteerNotTaken = "⚠️ not taken: %s. Send it again after the answer."
+	noticeSteersUnrun   = "⚠️ %d queued follow-up(s) did not run before the task ended; send them again if they still matter"
+	noticeSteerMissed   = "⚠️ %d follow-up(s) arrived as the task finished and were not taken; send them again"
 )
 
 // steerRefusalWhy words an executor's refusal reason token for the room.
-// task-ended and no-resume are absent on purpose: those are counted into
-// noticeSteersUnrun and noticeSteersNoResume at the terminal (no-resume is
-// the bridge's cli executor refusing every follow-up, since follow-ups run
-// on the api executor only). capability is
+// task-ended is absent on purpose: it is counted into noticeSteersUnrun at
+// the terminal. no-resume is the bridge's cli executor refusing a follow-up
+// as it arrives, since follow-ups run on the api executor only; it posts at
+// once, like the others. capability is
 // worded for both of its causes, because the bridge sends the one token for
 // a refusal and for a verifier it could not reach.
 var steerRefusalWhy = map[string]string{
@@ -2197,6 +2196,7 @@ var steerRefusalWhy = map[string]string{
 	lib.SteerReasonTaskEnding: "the task was already finishing",
 	lib.SteerReasonNoText:     "it had no text",
 	lib.SteerReasonCapability: "the task's capability check did not pass (refused, or the verifier could not be reached)",
+	lib.SteerReasonNoResume:   "this agent's executor can't continue a session, so follow-ups run on the api executor only",
 }
 
 // steerTask forwards a message that arrived while the task runs as a

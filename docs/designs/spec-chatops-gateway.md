@@ -184,16 +184,16 @@ executors do different things: on a
 session-routed conversation, that the worker picks it up at its next turn boundary
 if the task is still running; on a fixed-routed one, "got it, I'll take that next".
 The executor's notice on the stream corrects it when the follow-up was not taken
-(the task's follow-up limit reached, which the platform executor counts per task, or the
-task already ending), and at the task's terminal the gateway says so, with a count,
-for the follow-ups the executor never answered or never ran, and in one line for those it
-refused because it cannot continue a session (the platform executor runs follow-ups on its
-`api` executor only; its `cli` executor refuses each one `no-resume`). The never-answered
-line posts only once the gateway has heard a steer notice from that addressee since it
-started: an executor that predates the notices answers none, and every follow-up would read
-as missed. Those counts are the relay's cache. A gateway restart in between forgets the
-follow-ups it sent and the notices before it, so that terminal never posts the
-never-answered line, and its not-run and no-resume lines count only the notices that arrived
+(the task's follow-up limit reached, which the platform executor counts per task, the
+task already ending, or an executor that cannot continue a session: the platform executor
+runs follow-ups on its `api` executor only, and its `cli` executor refuses each one
+`no-resume` as it arrives), and the gateway posts that refusal at once. At the task's
+terminal the gateway says, with a count, which follow-ups the executor never answered or never
+ran. The never-answered line posts only once the gateway has heard a steer notice from that
+addressee since it started: an executor that predates the notices answers none, and every
+follow-up would read as missed. Those counts are the relay's cache. A gateway restart in
+between forgets the follow-ups it sent and the notices before it, so that terminal never
+posts the never-answered line, and its not-run line counts only the notices that arrived
 after the restart. Each earlier turn's answer posts as it completes; the result is the
 last turn's answer and the only deliverable a program behind a door receives. A steer into a delegated
 child is checked against the target's list first (rule `delegation.child-steer`);

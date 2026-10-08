@@ -3082,36 +3082,41 @@ func TestRelayFlushesAChunkedTurnAtTheNextNonAppendChunk(t *testing.T) {
 }
 
 // An executor that cannot continue a session (the bridge's cli executor)
-// refuses each follow-up no-resume as it arrives; the room gets one line at
-// the terminal with the count, not one per follow-up, saying follow-ups run
-// on the api executor only.
-func TestRelayFoldsNoResumeRefusalsIntoOneLine(t *testing.T) {
+// refuses each follow-up no-resume as it arrives, and the room is told at
+// once, one line per follow-up, while the task still runs: not the ack and
+// then silence until the terminal. Nothing more is said at the terminal.
+func TestRelayPostsANoResumeRefusalAtOnce(t *testing.T) {
 	r := startRig(t)
 	conv := "discord:g1/thread-noresume"
 	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: "nr-1", Text: "check the fleet"}
 	origin := r.awaitTask(t, "platform")
 	exec := r.execFor(t, origin, "platform")
 	_ = exec.PublishStatus(context.Background(), lib.StateWorking, false)
-	var ids []string
+	want := steerNotTakenNotice(lib.SteerReasonNoResume)
+	if !strings.Contains(want, "can't continue a session") || !strings.Contains(want, "after the answer") {
+		t.Fatalf("no-resume wording %q does not say the executor can't continue a session", want)
+	}
 	for i, text := range []string{"one", "two", "three"} {
 		r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: fmt.Sprintf("nr-s%d", i), Text: text}
 		waitFor(t, "steer published", func() bool { return len(inSubjectEnvelopes(t, r.url, "platform")) == i+2 })
-		ids = append(ids, lastInSubject(t, r, origin).EnvelopeID)
-		publishSteerNotice(t, r, origin, "platform", lib.SteerNotice{Steer: lib.SteerRefused, EnvelopeID: ids[i], Reason: lib.SteerReasonNoResume})
+		publishSteerNotice(t, r, origin, "platform", lib.SteerNotice{Steer: lib.SteerRefused,
+			EnvelopeID: lastInSubject(t, r, origin).EnvelopeID, Reason: lib.SteerReasonNoResume})
+		waitFor(t, fmt.Sprintf("refusal %d posted while the task runs", i+1), func() bool {
+			return strings.Count(strings.Join(r.adapter.postTexts(), "\n"), want) == i+1
+		})
 	}
 	completeTask(t, exec, "fleet: green")
-	want := fmt.Sprintf(noticeSteersNoResume, 3)
-	waitFor(t, "no-resume line", postedContaining(r, want))
+	waitFor(t, "deliverable", postedContaining(r, "fleet: green"))
 	waitFor(t, "terminal line", terminalEdited(r, lib.StateCompleted))
 	all := strings.Join(r.adapter.postTexts(), "\n")
-	if n := strings.Count(all, "api executor only"); n != 1 {
-		t.Fatalf("%d no-resume lines, want 1:\n%s", n, all)
+	if n := strings.Count(all, "can't continue a session"); n != 3 {
+		t.Fatalf("%d no-resume lines, want one per follow-up and none at the terminal:\n%s", n, all)
 	}
 	if strings.Contains(all, "did not run") || strings.Contains(all, "as the task finished") {
 		t.Fatalf("a refused follow-up was also counted as unrun or missed:\n%s", all)
 	}
-	if a, b := postIndex(r, "fleet: green"), postIndex(r, want); a < 0 || a > b {
-		t.Fatalf("deliverable at %d, no-resume line at %d", a, b)
+	if a, b := postIndex(r, want), postIndex(r, "fleet: green"); a < 0 || a > b {
+		t.Fatalf("first refusal at %d, deliverable at %d: the refusal must post before the terminal", a, b)
 	}
 }
 
