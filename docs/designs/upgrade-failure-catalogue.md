@@ -878,4 +878,7 @@ version to be known before they mean anything. After an upgrade, two reads divid
 [rollout section](upgrade-readiness-checks.md#rollout-and-verification) specifies the generic one,
 watch the operation and compare Pending and crash-looping pod counts and a live service probe
 against the same measurements taken before the upgrade started, which says that something broke;
-the retrospective's per-entry signatures (the gap table's "After" column) say which entry it was. The [upgrade retrospective](upgrade-retrospective.md) is that mechanism as a scheduled review, with each failure it finds classified against this list.
+the retrospective's per-entry signatures (the gap table's "After" column) say which entry it was. The [upgrade retrospective](upgrade-retrospective.md) is the scheduled form of the
+pod-count half of that mechanism: it compares pod and node state and events after an operation
+against what was there before it, runs no service probe, and classifies each failure it finds
+against this list.

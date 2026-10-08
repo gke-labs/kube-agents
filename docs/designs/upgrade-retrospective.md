@@ -95,8 +95,9 @@ One thing on the roster and one design shape this one. The fleet audits pair a d
 collector (`collect.py`, `patch_readiness.py`) with a governance SOP the Platform Agent follows,
 which is the split used here. The daily readiness watch, `upgrade-readiness-watch`, is specified
 beside the [readiness checks](upgrade-readiness-checks.md) and is in review rather than on `main`:
-it produces the before-the-upgrade report and keeps its state on the profile volume, which is where
-this design's (D) lands its guards once it ships.
+it produces the before-the-upgrade report and keeps its own state on the gateway's profile volume;
+this design's (D) lands its guards on the shell's volume (§3.6), which the watch reads through its
+sandbox hop once it ships.
 
 ## 2. Target model
 
@@ -163,8 +164,10 @@ the last run, and the symptom set seen at the last full run (owner, category, re
 tenant text). The before side of the catalogue's diff is established two ways, and the stronger one
 decides. Every full run reads pods and nodes on every fleet cluster, upgraded or not (one list call
 each), so the stored set is at most a week old rather than as old as the previous upgrade. And each
-symptom carries its own onset, read from the object: a Pending pod's start, a container's last
-termination, a `Ready=False` transition, an event's first observation. A symptom whose onset is
+symptom carries its own onset, read from the object as the earliest evidence it holds: a Pending
+pod's start, a crash-looping or not-ready pod's `Ready=False` transition time (falling back to the
+pod's start; a container's last termination is the latest crash, not the first, and is never the
+onset), a node condition's transition, an event's first observation. A symptom whose onset is
 earlier than the first operation of the cluster's upgrade window, or that the previous full run
 already recorded, is graded a Warning with the reason "predates the upgrade", never an Error; a
 symptom with no readable onset falls back to the stored set alone. The first run has no stored set
@@ -175,11 +178,18 @@ run, and _re-checked_ when it is unchanged but holds a live guard:
 only the reads that guard needs run, and a guard whose symptom or shape is gone is cleared. A
 cluster a successful listing no longer names leaves the ledger and loses its guards, and the report
 says so, but only on a _full_ run. The ledger records the fleet's project set, written by the last
-full run; a full run is one with no `--cluster` whose `--project` set is the SOP's roster (the
-management project and every project a Cluster Agent profile names) and whose every listing
-succeeded, and it may change the fleet set: a project that left the roster is pruned with its
-clusters, a project that joined is added. A run narrowed by `--cluster`, by the question that
-invoked it, or by a hand run without `--project` is _scoped_: it reviews only its targets, never
+full run. The collector cannot tell the roster from a hand-picked project list, so the SOP says
+which it is: a full run is one invoked with `--full`, which the SOP passes with the roster's
+`--project` set (the management project and every project a Cluster Agent profile names) on the
+scheduled route and on the fleet-wide on-demand route, and which refuses `--cluster`. A full run may
+change the fleet set: a project that left the roster is pruned with its clusters, a project that
+joined is added. A project the roster still names whose listing failed (a deleted project, a
+removed binding, the Container API disabled) does not demote the run: its ledger entries and guards
+are held unchanged, its clusters are listed under "Reads that failed", and the run stays full and
+moves the latest link, the way `fleet_drift.py` and `patch_readiness.py` keep a failed project as
+that project's gap rather than the sweep's. Every run without `--full` is _scoped_, whatever its
+`--project` set: a run narrowed by `--cluster`, by the question that invoked it, or any hand run,
+with or without `--project`. A scoped run reviews only its targets, never
 prunes a ledger entry or a guard outside them, never adds a project to the fleet set (a cluster it
 reviews outside the fleet is reported and marked "outside the fleet; not recorded"), writes its
 report under a `-scoped` name, does not move the latest link, and never calls the fleet-audit
@@ -195,7 +205,8 @@ Projects are `--project` when given, else the active `gcloud` project plus every
 share, so this collector reads the same fleet as the three beside it. The SOP passes `--project` for
 the management project and every project a Cluster Agent profile names, so a scheduled run reads the
 reconciler's roster and agrees with the readiness watch design on what "the fleet" is; a run by hand
-without the flag reads what the credential can list, and is a scoped run.
+without the flag reads what the credential can list, and with or without it is a scoped run unless
+it passes `--full`.
 
 ### 3.3 A collector for the facts, an SOP for the judgement
 
@@ -371,7 +382,7 @@ comes from the collector's JSON, which keeps the per-cluster data and the same t
 
 1. **The collector.** `agents/platform/skills/fleet-audit/scripts/upgrade_retrospective.py`: the
    ledger, selection, (A), (B), the signature table, the catalogue table for (C), the guards merge,
-   JSON and Markdown output, `--dry-run`, `--cluster`, `--since` and `--reset-ledger` as §3.2 and
+   JSON and Markdown output, `--dry-run`, `--full`, `--cluster`, `--since` and `--reset-ledger` as §3.2 and
    §3.6 define them; unit tests on fixtures captured
    from the test fleet.
 2. **The job and the on-demand route.** `agents/platform/governance/upgrade_retrospective_sop.md`
