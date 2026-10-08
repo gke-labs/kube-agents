@@ -634,3 +634,21 @@ func recordedAttr(h *recordingHandler, key, value string) bool {
 	}
 	return false
 }
+
+// TestA2AGoogleCallersDelegateOnlyUnderAListOfTheirOwn: the door's rule for
+// delegation covers the Google class too. With no list for a2a-google, a
+// Google-verified caller may not delegate; a list of its own is what would
+// let one.
+func TestA2AGoogleCallersDelegateOnlyUnderAListOfTheirOwn(t *testing.T) {
+	g := &Gateway{targetAllowed: targetAllowed{}}
+	if !g.doorUnlisted("platform", a2aGoogleBackend) {
+		t.Error("a Google-verified door caller with no list may delegate; the door's rule says nobody")
+	}
+	g.targetAllowed = targetAllowed{"platform": {a2aGoogleBackend: {"x": true}}}
+	if g.doorUnlisted("platform", a2aGoogleBackend) {
+		t.Error("a list for the class did not lift the door's rule")
+	}
+	if (&Gateway{targetAllowed: targetAllowed{}}).doorUnlisted("platform", slackBackend) {
+		t.Error("a chat backend fell under the door's rule")
+	}
+}
