@@ -6,6 +6,7 @@ from __future__ import annotations
 import hmac
 import json
 import os
+import hashlib
 import re
 import sqlite3
 import subprocess
@@ -94,6 +95,15 @@ GATEWAY_AUTH_ENV = "API_SERVER_KEY"
 # session (PUT /v1/sessions/{id}/route): only the bridge's session ids, which
 # all start with this, so the route cannot re-address an alert or cron session.
 CONVERSATION_SESSION_PREFIX = "a2a-"
+# How the hermes-bridge names a conversation's session from its context id
+# (a2a/hermes-bridge/api.go, apiSessionID): the context id verbatim when it is
+# path-safe and short enough, else a truncated SHA-256 under "h-". A route is
+# recorded only for the session its own context id names, so one session's
+# cards cannot be re-addressed to another conversation's context.
+CONVERSATION_SAFE_CONTEXT_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+CONVERSATION_CONTEXT_MAX_CHARS = 128
+CONVERSATION_HASHED_PREFIX = "h-"
+CONVERSATION_HASHED_HEX_CHARS = 32
 # The conversation key's prefix for each platform the A2A gateway can hold, as
 # the gateway spells its session-record keys (gchatConversationID,
 # slackConversationID); a key for another backend is refused.
@@ -3735,6 +3745,14 @@ def inject_message(
     return {"status": "injected"}
 
 
+def _conversation_session_id(context_id: str) -> str:
+    """The hermes-bridge's session id for a context id (apiSessionID in a2a/hermes-bridge/api.go)."""
+    if len(context_id) <= CONVERSATION_CONTEXT_MAX_CHARS and CONVERSATION_SAFE_CONTEXT_RE.match(context_id):
+        return CONVERSATION_SESSION_PREFIX + context_id
+    digest = hashlib.sha256(context_id.encode()).hexdigest()[:CONVERSATION_HASHED_HEX_CHARS]
+    return CONVERSATION_SESSION_PREFIX + CONVERSATION_HASHED_PREFIX + digest
+
+
 @app.put("/v1/sessions/{session_id}/route", dependencies=[Depends(verify_api_key)])
 def put_conversation_route(session_id: str, request_data: Dict[str, Any]) -> Dict[str, str]:
     """Record the gateway conversation a bridge session answers, so its cards report back there.
@@ -3766,6 +3784,8 @@ def put_conversation_route(session_id: str, request_data: Dict[str, Any]) -> Dic
         raise HTTPException(status_code=400, detail="context_id is required")
     if max(len(conversation), len(context_id)) > CONVERSATION_FIELD_MAX_CHARS:
         raise HTTPException(status_code=400, detail="conversation or context_id is too long")
+    if session_id != _conversation_session_id(context_id):
+        raise HTTPException(status_code=400, detail="context_id is not this session's")
     with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=5.0, isolation_level=None)) as conn:
         conn.execute("BEGIN IMMEDIATE")
         try:

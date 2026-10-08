@@ -228,9 +228,21 @@ class TestSessionKvServerApi(unittest.TestCase):
         self.assertEqual(meta["conversation_route"]["conversation"], "slack:C1/1712.0001")
         self.assertTrue(meta["kept"])
 
+    def test_a_hashed_session_takes_its_own_context(self):
+        # The bridge hashes a context id that is not path-safe
+        # (a2a/hermes-bridge/api.go, apiSessionID); the route is accepted for
+        # that session and no other.
+        import hashlib
+        ctx = "ctx/odd id"
+        sid = "a2a-h-" + hashlib.sha256(ctx.encode()).hexdigest()[:32]
+        body = {"platform": "google_chat", "conversation": "gchat:spaces/A/threads/B", "context_id": ctx}
+        self.assertEqual(self.client.put(f"/v1/sessions/{sid}/route", json=body).status_code, 200)
+        self.assertEqual(self.client.put("/v1/sessions/a2a-h-0000/route", json=body).status_code, 400)
+
     def test_a_conversation_route_is_refused_outside_its_shape(self):
         good = {"platform": "google_chat", "conversation": "gchat:spaces/A/threads/B", "context_id": "ctx-1"}
         for sid, body, why in (
+            ("a2a-ctx-other", good, "another session's cards re-addressed to this context"),
             ("k8s-evt-12345678", good, "an alert session cannot be re-addressed"),
             ("a2a-ctx-1", dict(good, platform="discord"), "a backend the gateway cannot hold for notify"),
             ("a2a-ctx-1", dict(good, conversation="slack:C1/1.2"), "a key for the other backend"),

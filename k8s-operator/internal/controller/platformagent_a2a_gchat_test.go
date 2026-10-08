@@ -451,10 +451,10 @@ func TestTheAllowAllDecisionMatchesTheLegacyConsumer(t *testing.T) {
 	}
 }
 
-// TestTheHomeChannelReachesTheArmedGateway: the chat.notify route posts to
-// googleChat.homeChannel, so the armed gateway carries it, trimmed, and an
-// install with no home channel leaves the route unarmed rather than handing
-// the gateway an empty value it would have to refuse.
+// TestTheHomeChannelReachesTheArmedGateway: the chat.notify route posts
+// proactive messages to googleChat.homeChannel, so the armed gateway carries
+// it, trimmed, and an install with no home channel renders none, which leaves
+// the route serving conversation requests only.
 func TestTheHomeChannelReachesTheArmedGateway(t *testing.T) {
 	t.Setenv(a2aInjectBackendEnvVar, "")
 	for _, tc := range []struct {

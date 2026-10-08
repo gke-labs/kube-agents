@@ -101,6 +101,12 @@ COMPRESSION_WALK_MAX = 32
 #: route, the conversation key); the kanban stand-in reads the context id back
 #: from here, and a wake self-posts into that session.
 CONVERSATION_ROUTE_KEY = "conversation_route"
+#: The platform whose gateway conversations the kanban notifier serves
+#: (kanban_chat_notify.NOTIFY_CONVERSATIONS_ENV, rendered by the operator). A
+#: route for any other platform is not substituted: the card keeps its
+#: api_server address, whose wake still reaches the bridge's session, rather
+#: than a chat address nothing collects.
+NOTIFY_CONVERSATIONS_ENV = "A2A_NOTIFY_CONVERSATIONS"
 
 
 def session_kv_db_path() -> str:
@@ -215,8 +221,11 @@ def resolve_chat_route(
     """Swap a non-chat session origin for the chat route that produced it.
 
     Returns the arguments unchanged unless ``platform`` is a non-chat origin
-    *and* ``chat_id`` keys a stored route naming a real chat platform and a
-    channel. Callers can treat the result as a drop-in for what they passed in.
+    *and* ``chat_id`` keys a stored route: a chat thread (the alert path's
+    platform, channel and thread), or a gateway conversation's route
+    (``conversation_route``: the platform, the session holding the route and
+    the conversation key, for the platform A2A_NOTIFY_CONVERSATIONS names).
+    Callers can treat the result as a drop-in for what they passed in.
 
     When it does substitute, all three values come from the stored route,
     including ``thread_id``. The incoming thread belongs to the origin being
@@ -246,7 +255,15 @@ def resolve_chat_route(
                 break
     conversation = _conversation_route(holder, metadata)
     if conversation:
-        return conversation
+        served = os.environ.get(NOTIFY_CONVERSATIONS_ENV, "").strip()
+        if conversation[0] == served:
+            return conversation
+        _log_undeliverable(
+            chat_id,
+            f"its conversation route is on {conversation[0]}, which no notifier serves here "
+            f"({NOTIFY_CONVERSATIONS_ENV}={served or '<unset>'})",
+        )
+        return platform, chat_id, thread_id
     if not metadata:
         _log_undeliverable(chat_id, "no chat route was recorded for it")
         return platform, chat_id, thread_id

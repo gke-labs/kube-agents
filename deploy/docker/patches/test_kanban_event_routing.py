@@ -162,7 +162,7 @@ class CompressedSessionTest(unittest.TestCase):
             ("a2a-ctx-2", None, "branched"),
             ("20261008_1600_cc", "a2a-ctx-2", None),
         ])
-        env = mock.patch.dict("os.environ", {"HERMES_HOME": str(self.tmp)})
+        env = mock.patch.dict("os.environ", {"HERMES_HOME": str(self.tmp), "A2A_NOTIFY_CONVERSATIONS": "slack"})
         env.start()
         self.addCleanup(env.stop)
 
@@ -179,6 +179,15 @@ class CompressedSessionTest(unittest.TestCase):
             resolve_chat_route("api_server", "a2a-ctx-1", None, db_path=self.db),
             ("slack", "a2a-ctx-1", "slack:dm/D1"),
         )
+
+    def test_a_route_for_a_platform_no_notifier_serves_keeps_the_api_server_address(self):
+        # Substituting it would leave a chat address nothing collects, and the
+        # card would lose the wake the api_server address still delivers.
+        with mock.patch.dict("os.environ", {"A2A_NOTIFY_CONVERSATIONS": "google_chat"}), \
+                self.assertLogs(ker.log, level="WARNING") as logs:
+            got = resolve_chat_route("api_server", "a2a-ctx-1", None, db_path=self.db)
+        self.assertEqual(got, ("api_server", "a2a-ctx-1", None))
+        self.assertTrue(any("no notifier serves" in line for line in logs.output), logs.output)
 
     def test_a_route_without_its_context_is_not_used(self):
         routing_db(self.tmp / "partial.db", {"a2a-ctx-9": {"conversation_route": {"platform": "slack", "conversation": "slack:dm/D9"}}})
