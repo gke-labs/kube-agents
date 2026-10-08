@@ -1283,22 +1283,44 @@ def test_an_exhausted_retry_is_infrastructure_and_not_an_answer(
     assert len(recorded_pf_resets) == harness._MAX_TRANSPORT_FAILURES - 1
 
 
-def test_an_opening_turn_500_is_classified_as_infra(stub_agent: _StubAgentServer) -> None:
-    """An opening turn 500 without failure reason is routed to _infra_failure (#2430)."""
+def test_an_agent_side_error_is_still_graded(stub_agent: _StubAgentServer) -> None:
+    """A persistent 500 is the endpoint answering, so it remains a graded agent error.
+
+    The INFRA class is for turns where transport died or provider capacity
+    blocked the opening turn. Widening it to every failed request would take
+    real agent faults off the gate: a non-retryable 5xx is retried once on the
+    opening turn to clear transient races (#2430), but a recurring 500 is not
+    marked infra, is not retried beyond the limit, and still reaches the judge.
+    """
     stub_agent.fail_with = 500
 
     result = KubeAgentsHarness().run("Provision operator agent in cluster mercury-09.")
 
     assert result.has_errors()
-    assert harness.INFRA_FAILURE_MARKER in result.errors[0]
+    assert harness.INFRA_FAILURE_MARKER not in result.errors[0]
     assert "HTTP 500" in result.errors[0]
-    assert result.output == ""
-    assert result.trajectory == []
-    assert len(stub_agent.requests) == 1
+    assert result.errors[0] in result.output
+    assert len(stub_agent.requests) == 2
+
+
+def test_an_opening_turn_transient_500_clears_on_retry(
+    stub_agent: _StubAgentServer, recorded_pf_resets: list[int]
+) -> None:
+    """A transient 500 on the opening turn clears on bounded retry without tunnel respawn (#2430)."""
+    stub_agent.fail_on = frozenset({1})
+    stub_agent.fail_on_status = 500
+
+    result = KubeAgentsHarness().run("Provision operator agent in cluster mercury-09.")
+
+    assert not result.has_errors()
+    assert result.output == _FINAL_TEXT
+    assert len(stub_agent.requests) == 2
+    # An endpoint response is not a transport drop: no tunnel reset.
+    assert recorded_pf_resets == []
 
 
 def test_an_opening_turn_client_error_is_still_graded(stub_agent: _StubAgentServer) -> None:
-    """A client error (non-429 4xx) on the opening turn is an answered turn, not infra."""
+    """A client error (non-429 4xx) on the opening turn is not retried and reaches the judge."""
     stub_agent.fail_with = 400
 
     result = KubeAgentsHarness().run("Provision operator agent in cluster mercury-09.")
@@ -1626,21 +1648,6 @@ def test_an_agent_error_without_the_marker_is_still_graded(results_json: Any) ->
     path = results_json(AgentResult.errored("HTTP 500 from agent endpoint: agent exploded"))
 
     assert _classify(path, "opentofu").outcome != "infra"
-
-
-def test_an_opening_turn_500_harness_result_is_classified_as_infra(
-    results_json: Any,
-) -> None:
-    """An opening turn 500 routed through _infra_failure is classified as infra (#2430)."""
-    path = results_json(
-        AgentResult(
-            output="",
-            trajectory=[],
-            errors=[f"{harness.INFRA_FAILURE_MARKER}: opening turn failed with HTTP 500"],
-        )
-    )
-
-    assert _classify(path, "opentofu").outcome == "infra"
 
 
 def test_a_scoreless_record_still_blocks(results_json: Any) -> None:

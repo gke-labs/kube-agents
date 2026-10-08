@@ -1232,8 +1232,9 @@ class _TransportError(RuntimeError):
 # rescue. A client error (non-429 4xx) or a body that is not JSON is an
 # answer about the request itself and repeating the request cannot change it:
 # a handler that raised will raise again, so those remain graded agent errors.
-# On the opening turn, a non-retryable 5xx from the agent endpoint before any
-# agent ran or billed tokens is routed to _infra_failure under #2430.
+# On the opening turn, a non-retryable 5xx is given one bounded retry to clear
+# transient endpoint races (such as the .env reload race, #2430); if it recurs,
+# it remains a graded agent error.
 # When the server attaches X-Hermes-Failure-Reason on an opening request,
 # the turn executed; a rate-limit or billing reason is routed to infrastructure
 # on the opening turn, while any other failure reason (or any failure reason
@@ -1572,6 +1573,7 @@ class KubeAgentsHarness(AgentHarness):
         # upstream, so the tunnel is torn down and respawned, never merely
         # probed.
         transport_failures = 0
+        opening_5xx_retries = 0
         while True:
             try:
                 result, session_id = _post_turn(url, body, headers, timeout)
@@ -1595,16 +1597,26 @@ class KubeAgentsHarness(AgentHarness):
                     return AgentResult.errored(
                         f"agent turn failed with {detail}: {exc}"
                     )
-                # A 500 on the opening turn before any agent ran or billed tokens is an
-                # infrastructure failure (#2430), routed to _infra_failure with the marker.
-                # Other non-retryable errors (e.g. 4xx client errors or non-JSON bodies)
-                # remain graded agent errors. Only a gateway status, an admission-control
-                # 429, or a dropped connection is worth a second attempt: see _RETRYABLE_STATUSES.
+                # A 500, a 4xx other than 429, or a body that is not JSON says a handler
+                # answered. A handler that raised will raise again, so those remain graded
+                # agent errors. However, a non-retryable 5xx on the opening turn may be a
+                # transient race (such as the .env reload race, #2430) before any agent
+                # execution: give it one bounded retry without tunnel respawn. If it clears,
+                # execution continues normally. If it recurs, it remains a graded agent error.
                 if not exc.retryable:
-                    if opening_turn and exc.status_code is not None and 500 <= exc.status_code < 600:
-                        return _infra_failure(
-                            f"the opening turn failed with HTTP {exc.status_code}: {exc}"
+                    if (
+                        opening_turn
+                        and exc.status_code is not None
+                        and 500 <= exc.status_code < 600
+                        and opening_5xx_retries < 1
+                    ):
+                        opening_5xx_retries += 1
+                        _log.warning(
+                            "opening turn failed with HTTP %d: %s; retrying once (#2430)",
+                            exc.status_code,
+                            exc,
                         )
+                        continue
                     return AgentResult.errored(str(exc))
                 transport_failures += 1
                 _log.warning(
@@ -1722,7 +1734,7 @@ class KubeAgentsHarness(AgentHarness):
         pinned = _PINNED_RUN_ID.set(_run_id())
         answer_turn = None
         try:
-            wake_turn = self._execute(planted.wake, workspace_path, opening_turn=True)
+            wake_turn = self._execute(planted.wake, workspace_path, opening_turn=False)
             if not card_wake.no_reply(wake_turn) and not failure and replay.fresh:
                 answer_turn = self._execute_fresh_answer(replay, planted, wake_turn, workspace_path)
             elif not card_wake.no_reply(wake_turn) and not failure:
