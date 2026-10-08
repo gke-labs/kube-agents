@@ -216,11 +216,18 @@ LiteLLM gateway by default (`litellm.enabled=true`), mirroring
 `k8s-operator/config/integrations/litellm/base`. `litellm.modelProvider`
 (gemini/anthropic/openai/vertex_ai) picks which provider `model-default` routes to
 — the matching API key must be in the credentials Secret, except `vertex_ai`, which
-uses Workload Identity (below); `litellm.modelDefaultName`
+uses Workload Identity by default (or a service-account key Secret when
+`litellm.vertex.credentialsSecretRef` is set; see below); `litellm.modelDefaultName`
 overrides the per-provider default model; `litellm.maxTokens` (default `0`,
 meaning none) puts a `max_tokens` under every alias for a request that names
 none, which a self-hosted backend with one combined prompt-plus-output budget
-needs — a request's own `max_tokens` still wins. Set `litellm.enabled=false`
+needs — a request's own `max_tokens` still wins. `litellm.reasoningEffort`,
+`litellm.fallback` and `litellm.dropParams` (all off by default) set a
+reasoning effort on every alias, add a fallback alias at another effort with
+`router_settings.fallbacks` to it, and drop parameters the provider refuses;
+`litellm.vertex.credentialsSecretRef` and `projectSecretRef` read a Vertex
+service-account key and project from a Secret. The site's inference-gateway
+page has the rendered shapes. Set `litellm.enabled=false`
 only if you operate your own gateway at that address. LLM-call telemetry is
 opt-in (`litellm.otel=true`) — enable it only on clusters that run a reachable
 collector, since without one the otel callback aborts every LLM request on DNS
@@ -894,7 +901,6 @@ helm uninstall kube-agents -n kubeagents-system
   `terraform/examples/full-install` does both in one apply.
 
   Two behaviours worth knowing before you enable them:
-
   - **`failurePolicy` defaults to `Ignore`, where the kustomize path uses
     `Fail`.** Helm applies the webhook configurations before both the
     `Certificate` and the `PlatformAgent` CR, so under `Fail` the API server

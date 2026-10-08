@@ -253,11 +253,45 @@ litellm:
   # the key out, so the rendered config and its rollout checksum are what they
   # were. Set it for a backend with one combined prompt-plus-output budget
   # (vLLM, SGLang, TGI, llama.cpp), which refuses a request whose max_tokens
-  # alone fills the served window. A request that carries its own max_tokens
-  # keeps it: what that means for the agent's own traffic is on the site's
+  # alone fills the served window. On non-adaptive Anthropic Claude models
+  # (claude-sonnet-4-5, claude-3-7-sonnet), if maxTokens is explicitly set
+  # alongside reasoningEffort: high (budget_tokens: 4096), maxTokens must be
+  # set > 4096 (e.g. 8192). A request that carries its own max_tokens keeps it:
+  # what that means for the agent's own traffic is on the site's
   # inference-gateway page, "Setting the output-token budget". Chart-only;
   # the kustomize dev base carries no such key.
   maxTokens: 0
+  # Reasoning effort the gateway asks for on every primary alias
+  # (model-default, hermes-agent, <model>), rendered as reasoning_effort in
+  # each alias's litellm_params. Setting it also adds a <model>-<effort>
+  # alias and enables litellm_settings.drop_params: true automatically (since
+  # Anthropic Claude rejects temperature != 1.0 when thinking is enabled unless
+  # drop_params is active, and preview Vertex model names also require it). On
+  # non-adaptive Anthropic Claude models (claude-sonnet-4-5, claude-3-7-sonnet),
+  # if maxTokens is set alongside reasoningEffort: high (budget_tokens: 4096),
+  # maxTokens must be > 4096 (e.g. 8192). Empty leaves the key out, so the
+  # rendered config and its rollout checksum are what they were. One of
+  # minimal, low, medium, high.
+  reasoningEffort: ""
+  # Renders litellm_settings.drop_params: true (also enabled automatically when
+  # reasoningEffort or fallback.reasoningEffort is set), so a parameter the
+  # provider does not accept (such as temperature != 1.0 with Claude thinking
+  # or reasoning_effort on a model LiteLLM's cost map does not list as a
+  # reasoning model) is dropped instead of failing the request.
+  # It is dropped silently: check the model is in the map before relying on
+  # reasoningEffort with this on.
+  dropParams: false
+  # A second alias the router retries on when a primary alias fails, at a
+  # different reasoning effort. Setting fallback.reasoningEffort renders the
+  # alias (named modelName, default <model>-<reasoningEffort>) and a
+  # router_settings.fallbacks entry for every primary alias. A fallback is
+  # visible in the x-litellm-attempted-fallbacks response header.
+  fallback:
+    modelName: ""
+    reasoningEffort: ""
+    # router_settings.timeout and num_retries; 0 leaves each key out.
+    timeoutSeconds: 0
+    numRetries: 0
   # modelProvider: vertex_ai only. The gateway calls
   # projects/<projectId>/locations/<location> as a GSA reached through Workload
   # Identity, so the chart always creates this KSA — no operator reconciles it.
@@ -274,6 +308,19 @@ litellm:
     # region here for either reason.
     projectId: ""
     location: ""
+    # A service-account key read from a Secret, for an install that cannot
+    # use Workload Identity. The key is mounted read-only at
+    # /var/run/secrets/vertex/sa.json and named by
+    # GOOGLE_APPLICATION_CREDENTIALS, which wins over the KSA's Workload
+    # Identity binding. Empty name leaves the pod spec as it was.
+    credentialsSecretRef:
+      name: ""
+      key: ""
+    # VERTEXAI_PROJECT read from a Secret instead of projectId, so the
+    # project id does not appear in the pod spec. Empty name uses projectId.
+    projectSecretRef:
+      name: ""
+      key: ""
   # Keep in step with the kustomize base
   # (k8s-operator/config/integrations/litellm/base/deployment.yaml), which is
   # the dev copy of this gateway.
@@ -283,7 +330,7 @@ litellm:
     # copies: a chart pinned to a version the mirror was never populated with
     # is an ImagePullBackOff. This pin sat a release behind the kustomize base
     # for exactly that reason.
-    tag: v1.100.1
+    tag: v1.104.0
     pullPolicy: IfNotPresent
   replicaCount: 2
   # Rollout strategy — the canonical home for this argument. The chart template

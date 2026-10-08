@@ -21,9 +21,29 @@
   scripts/installer/installer_common.sh.
 */}}
 {{- $vertexLocation := $vertex.location | default "global" }}
+{{- /*
+  A service-account key and the project id, each read from a Secret, for an
+  install that cannot use Workload Identity or must not show the project in
+  the pod spec. Both off unless named. The key is mounted read-only and named
+  by GOOGLE_APPLICATION_CREDENTIALS, which google.auth.default prefers over
+  the metadata server, so it wins over the KSA's Workload Identity binding.
+*/}}
+{{- $vertexCredentials := $vertex.credentialsSecretRef | default dict }}
+{{- $vertexProjectRef := $vertex.projectSecretRef | default dict }}
+{{- $vertexCredentialsDir := "/var/run/secrets/vertex" }}
+{{- $vertexCredentialsFile := "sa.json" }}
+{{- $vertexCredentialsMode := 288 }}{{- /* 0440 */}}
+{{- range $field, $ref := dict "credentialsSecretRef" $vertexCredentials "projectSecretRef" $vertexProjectRef }}
+{{- if and $ref.name (ne $provider "vertex_ai") }}
+{{- fail (printf "litellm.vertex.%s is set but litellm.modelProvider is %q; it is read only for vertex_ai" $field $provider) }}
+{{- end }}
+{{- if and $ref.name (empty $ref.key) }}
+{{- fail (printf "litellm.vertex.%s.name is set without a key" $field) }}
+{{- end }}
+{{- end }}
 {{- if eq $provider "vertex_ai" }}
-{{- if empty $vertexProject }}
-{{- fail "litellm.modelProvider 'vertex_ai' needs litellm.vertex.projectId (or platformAgent.harness.projectId): Vertex AI is addressed as projects/<project>/locations/<location> and the project has no usable default." }}
+{{- if and (empty $vertexProject) (empty $vertexProjectRef.name) }}
+{{- fail "litellm.modelProvider 'vertex_ai' needs litellm.vertex.projectId, litellm.vertex.projectSecretRef, or platformAgent.harness.projectId: Vertex AI is addressed as projects/<project>/locations/<location> and the project has no usable default." }}
 {{- end }}
 {{- end }}
 {{- $redaction := .Values.litellm.redaction | default dict }}
@@ -106,7 +126,8 @@
   "model-default", but a caller that names the harness ("hermes-agent") or the
   concrete model gets routed rather than a 404 from the gateway.
 */}}
-{{- $config := include "kube-agents.litellmConfig" (dict "provider" $provider "model" $model "callbacks" $callbacks "maxTokens" .Values.litellm.maxTokens) }}
+{{- $fallback := .Values.litellm.fallback | default dict }}
+{{- $config := include "kube-agents.litellmConfig" (dict "provider" $provider "model" $model "callbacks" $callbacks "maxTokens" .Values.litellm.maxTokens "reasoningEffort" .Values.litellm.reasoningEffort "dropParams" .Values.litellm.dropParams "fallback" $fallback "timeoutSeconds" $fallback.timeoutSeconds "numRetries" $fallback.numRetries) }}
 {{- /*
   Every key the ConfigMap carries feeds the checksum: the rule file and the
   two modules are subPath mounts too, so an edit to any of them has to roll
@@ -233,9 +254,20 @@ spec:
               value: /tmp
             {{- if eq $provider "vertex_ai" }}
             - name: VERTEXAI_PROJECT
+              {{- if $vertexProjectRef.name }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $vertexProjectRef.name | quote }}
+                  key: {{ $vertexProjectRef.key | quote }}
+              {{- else }}
               value: {{ $vertexProject | quote }}
+              {{- end }}
             - name: VERTEXAI_LOCATION
               value: {{ $vertexLocation | quote }}
+            {{- if $vertexCredentials.name }}
+            - name: GOOGLE_APPLICATION_CREDENTIALS
+              value: {{ printf "%s/%s" $vertexCredentialsDir $vertexCredentialsFile | quote }}
+            {{- end }}
             {{- end }}
             - name: GEMINI_API_KEY
               valueFrom:
@@ -334,12 +366,26 @@ spec:
             {{- end }}
             - name: tmp
               mountPath: /tmp
+            {{- if $vertexCredentials.name }}
+            - name: vertex-sa-vol
+              mountPath: {{ $vertexCredentialsDir }}
+              readOnly: true
+            {{- end }}
       volumes:
         - name: config-volume
           configMap:
             name: litellm-config
         - name: tmp
           emptyDir: {}
+        {{- if $vertexCredentials.name }}
+        - name: vertex-sa-vol
+          secret:
+            secretName: {{ $vertexCredentials.name | quote }}
+            defaultMode: {{ $vertexCredentialsMode }}
+            items:
+              - key: {{ $vertexCredentials.key | quote }}
+                path: {{ $vertexCredentialsFile }}
+        {{- end }}
 ---
 apiVersion: v1
 kind: Service
