@@ -732,6 +732,7 @@ class MainTest(unittest.TestCase):
         self.assertEqual(rc, reconcile.EXIT_FAILED)
         self.assertEqual(boskos.acquired, [])
         self.assertIn("could not resolve host", stderr.getvalue())
+        self.assertNotIn("wrong ref", stderr.getvalue(), "a failed fetch says nothing about the checkout or the ref")
 
     def test_a_termination_during_the_main_fetch_exits_as_terminated(self):
         # Prow aborts a superseded postsubmit; the signal can land in the

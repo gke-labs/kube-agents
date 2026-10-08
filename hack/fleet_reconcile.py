@@ -224,6 +224,9 @@ REASON_NOT_REACHED_BUDGET = "not started: %ds left in the run's budget, under th
 REASON_NOT_REACHED_BUDGET_MARK = "left in the run's budget"
 REASON_NOT_REACHED_MOVED = "not started: the fleet stack under bench/tf/fleet on %s is now %s and this run applies %s; the next run takes it"
 REASON_NOT_REACHED_MOVED_AWAY = "not started: bench/tf/fleet on %s no longer holds the stack this run applies (%s); the next run takes it"
+# Appended to a definite no-stack reading at the first check, and only there: a
+# fetch that failed says nothing about the checkout or the ref.
+HINT_NO_STACK = "not a kube-agents checkout, or the wrong ref"
 # How git's bytes are decoded and the hash input re-encoded: the same encoding
 # and error handler on both sides, whatever the process locale, so a path git
 # prints that is not UTF-8 survives the round trip and two processes hash one
@@ -857,7 +860,7 @@ class Run:
             return
         moved = self._main_moved(first=True)
         if self.main_check_error:
-            raise ReconcileError("--stop-when-moved %s: %s (not a kube-agents checkout, or the wrong ref)" % (self.main_ref, self.main_check_error))
+            raise ReconcileError("--stop-when-moved %s: %s" % (self.main_ref, self.main_check_error))
         if moved:
             self._stop = moved
 
@@ -876,7 +879,7 @@ class Run:
                 except NoStackError as exc:
                     # The checkout's own tree, not main's: a definite reading,
                     # fatal at the first check.
-                    self.main_check_error = "this checkout: %s" % exc
+                    self.main_check_error = "this checkout: %s (%s)" % (exc, HINT_NO_STACK)
                     return None
             # No --depth: a depth-limited fetch marks a full clone shallow,
             # and a hand run with this flag uses the operator's own checkout.
@@ -887,7 +890,7 @@ class Run:
                 if first:
                     # A definite reading, not a failed one: no warning here;
                     # require_main_readable makes it the fatal configuration error.
-                    self.main_check_error = str(exc)
+                    self.main_check_error = "%s (%s)" % (exc, HINT_NO_STACK)
                     return None
                 # The fetch answered and the tree holds no stack: main has
                 # moved to a state this run must not apply over, a stop.
