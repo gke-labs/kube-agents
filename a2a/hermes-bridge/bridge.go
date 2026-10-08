@@ -146,7 +146,8 @@ type Config struct {
 	// requests (default 2, the platform profile's concurrency in the
 	// profiles spec).
 	Concurrency int
-	// TaskDeadline is the per-invocation wall-clock ceiling (default 7200s,
+	// TaskDeadline is the task's wall-clock ceiling, counted from its first
+	// turn and spanning every follow-up turn after it (default 7200s,
 	// matching the platform profile's activeDeadlineSeconds).
 	TaskDeadline time.Duration
 	// KillGrace is SIGTERM-to-SIGKILL grace on cancel/deadline (default 10s).

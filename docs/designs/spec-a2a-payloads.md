@@ -357,8 +357,9 @@ calls and become properties of the stream:
   `{"steerNotice": {"steer": "queued"|"refused", "envelopeId", "reason"}}`, runs queued
   follow-ups as further turns after the current one, publishes each earlier turn's
   answer as a `turn` artifact and the last as the `result`. A refusal (`queue-full`,
-  `task-ending`, `task-ended`, `no-text`, `capability`, `no-resume`) is the refusal shape
-  below: never a silent drop, never a state change caused by the follow-up alone.
+  `task-ending`, `task-ended`, `no-text`, `capability`, `no-resume`) is that non-final
+  `status-update` with `"steer": "refused"`: never a silent drop, never a state change
+  caused by the follow-up alone.
   Assertion 21's stdin delivery applies to absorbing executors; a refusal satisfies its
   never-silently-dropped half.
 - Turn accounting is the steering contract (amended 8/31, from the worker adapter). A

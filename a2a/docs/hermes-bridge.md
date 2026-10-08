@@ -249,7 +249,8 @@ Hermes API server in the same pod (`BRIDGE_API_URL`, default
 `http://127.0.0.1:8642/v1/chat/completions`, model `BRIDGE_API_MODEL`, default
 `model-default`) with `Authorization: Bearer $API_SERVER_KEY` and three headers:
 `X-Hermes-Session-Key` and `X-Hermes-Session-Id`, both set to the session id below, and
-`Idempotency-Key`, set to the task id so a redelivered task does not run its turn twice. The
+`Idempotency-Key`, set to the task id so a redelivered task does not run its turn twice (a
+follow-up turn's key adds its envelope id; see **Steering** below). The
 server loads the session's history from its own store before the turn and appends to it after,
 so the second task in a thread sees the first. The session id is `a2a-` plus the task's
 `contextId`, which the gateway mints once per backend conversation. A `contextId` that is not
@@ -327,8 +328,9 @@ waiting for the session, `working` after) and a `steerNotice` data part: `queued
 with `queue-full` (16 already waiting), `task-ending` (the answer was already chosen), `no-text`,
 `capability` (the task's capability, carried on the follow-up, was refused when checked on the worker
 before its turn),
-`no-resume` (cli: stderr's last line is not a well-formed `session_id:` line, or the command does
-not end in `-q`), or
+`no-resume` (cli: stderr's last non-blank line is not `session_id:` and an id of up to 128
+letters, digits, `_`, `.`, `:` and `-` that starts with a letter or digit, or the command does not
+end in `-q`), or
 `task-ended` (the task ended first: cancel, failure, deadline, shutdown). When the current turn
 ends, queued follow-ups run in arrival order as further turns in the same Hermes session: `api`
 posts another turn with the same session headers, under the same session slot, and the

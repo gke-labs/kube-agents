@@ -729,10 +729,14 @@ func TestSteer_TurnsClosedRefusesTaskEnding(t *testing.T) {
 }
 
 // A stalled bus holds a follow-up's notice, never run.mu: the notice
-// publishes with mu released, so a cancel arriving mid-stall still kills the
-// subprocess at once, and no notice lands after the terminal once the bus is
-// back (ruling: notices outside run.mu, bounded). The stall is bounded by
-// steerNoticeTimeout, not unbounded: a notice whose publish outlives it is
+// publishes with mu released, so a handleCancel run beside the stalled
+// delivery still kills the subprocess at once, and no notice lands after the
+// terminal once the bus is back (ruling: notices outside run.mu, bounded).
+// The test calls handleCancel itself. On the bridge's own consumer, which
+// runs one handler at a time, a cancel that arrives during the stall waits
+// behind the stalled delivery until steerNoticeTimeout ends it; what this
+// pins is that the run's lock adds no wait of its own. The stall is bounded
+// by steerNoticeTimeout, not unbounded: a notice whose publish outlives it is
 // dropped, so the test asserts no notice follows the terminal, not that the
 // queued one landed.
 func TestSteer_StalledNoticeDoesNotHoldRunLock(t *testing.T) {
