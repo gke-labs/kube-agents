@@ -155,7 +155,9 @@ finishing again (the gateway log in a run's artifacts says whether the
 dispatcher stalled); for fixture drift, once the daily reconcile has re-applied
 the stack — a red on a case that depends on the drifted fixture, from a run
 that leased one of those projects, is the fixture's, not the change's; for pool
-drift, once the pool owner has run the repair the issue carries.
+drift, once the pool owner has run the repair the issue carries. Who the
+fleet owner, the pool owner and the person who owns the gate are is recorded
+in [`docs/ownership.md`](ownership.md).
 
 A pull request that will not merge into `main` dies in the same seconds with
 no tasks and is not a setup death either (`merge_conflict` in SCHEMA.md,
