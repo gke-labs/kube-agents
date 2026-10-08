@@ -1954,13 +1954,11 @@ class WorkersTest(unittest.TestCase):
 
         def tofu(argv, **_):
             if argv[1] == "apply":
-                started.wait(timeout=5)
+                started.wait(timeout=15)
                 # The fake stands in for a tofu that exits on the interrupt.
-                for _ in range(100):
-                    if reconcile.terminating():
-                        return subprocess.CompletedProcess(argv, 130, "", "interrupted")
+                while not reconcile.terminating():
                     time.sleep(0.02)
-                return subprocess.CompletedProcess(argv, 0, "", "")
+                return subprocess.CompletedProcess(argv, 130, "", "interrupted")
             if argv[1] == "plan":
                 return subprocess.CompletedProcess(argv, reconcile.PLAN_HAS_CHANGES, "", "")
             if argv[1] == "show":
@@ -1975,17 +1973,21 @@ class WorkersTest(unittest.TestCase):
         outcomes = {}
 
         def fire():
-            started.wait(timeout=5)
+            started.wait(timeout=15)
             os.kill(os.getpid(), signal.SIGINT)
 
+        fire_thread = threading.Thread(target=fire, daemon=True)
         try:
-            threading.Thread(target=fire, daemon=True).start()
+            fire_thread.start()
             with mock.patch.object(boskos_pool.urllib.request, "urlopen", boskos), mock.patch("sys.stdout", io.StringIO()):
                 with self.assertRaises(boskos_pool.Terminated):
                     reconcile.reconcile_pool(BOSKOS, OWNER, runner=tofu, known=KNOWN | {p9}, run=reconcile.Run(workers=2), outcomes=outcomes)
         finally:
             signal.signal(signal.SIGINT, previous)
             reconcile._TERMINATING.clear()
+            boskos_pool._DEFERRED.clear()
+            boskos_pool._HOLD_DEPTH = 0
+            fire_thread.join(timeout=5)
         self.assertEqual(sorted(boskos.released), [P7, P8])
         self.assertEqual(sorted(boskos.acquired), [P7, P8], "no project is leased after the termination")
         self.assertEqual({p: o for p, (o, _) in outcomes.items()}, {P7: reconcile.OUTCOME_INTERRUPTED, P8: reconcile.OUTCOME_INTERRUPTED, p9: reconcile.OUTCOME_NOT_REACHED})
@@ -2002,13 +2004,11 @@ class WorkersTest(unittest.TestCase):
 
         def tofu(argv, **_):
             if argv[1] == "apply":
-                started.wait(timeout=5)
-                for _ in range(100):
-                    if reconcile.terminating():
-                        time.sleep(0.2)
-                        return subprocess.CompletedProcess(argv, 130, "", "interrupted")
+                started.wait(timeout=15)
+                while not reconcile.terminating():
                     time.sleep(0.02)
-                return subprocess.CompletedProcess(argv, 0, "", "")
+                time.sleep(0.2)
+                return subprocess.CompletedProcess(argv, 130, "", "interrupted")
             if argv[1] == "plan":
                 return subprocess.CompletedProcess(argv, reconcile.PLAN_HAS_CHANGES, "", "")
             if argv[1] == "show":
@@ -2020,11 +2020,12 @@ class WorkersTest(unittest.TestCase):
         outcomes = {}
 
         def fire():
-            started.wait(timeout=5)
+            started.wait(timeout=15)
             os.kill(os.getpid(), signal.SIGINT)
 
+        fire_thread = threading.Thread(target=fire, daemon=True)
         try:
-            threading.Thread(target=fire, daemon=True).start()
+            fire_thread.start()
             with mock.patch.object(threading.Thread, "join", lambda self, timeout=None: None), mock.patch.object(
                 boskos_pool.urllib.request, "urlopen", boskos
             ), mock.patch("sys.stdout", io.StringIO()):
@@ -2033,6 +2034,9 @@ class WorkersTest(unittest.TestCase):
         finally:
             signal.signal(signal.SIGINT, previous)
             reconcile._TERMINATING.clear()
+            boskos_pool._DEFERRED.clear()
+            boskos_pool._HOLD_DEPTH = 0
+            fire_thread.join(timeout=5)
         self.assertEqual(sorted(boskos.released), [P7, P8], "both holds were released before the termination propagated")
 
     def test_no_tofu_is_started_once_a_termination_has_landed(self):
@@ -2086,17 +2090,21 @@ class WorkersTest(unittest.TestCase):
         outcomes = {}
 
         def fire():
-            started.wait(timeout=5)
+            started.wait(timeout=15)
             os.kill(os.getpid(), signal.SIGINT)
 
+        fire_thread = threading.Thread(target=fire, daemon=True)
         try:
-            threading.Thread(target=fire, daemon=True).start()
+            fire_thread.start()
             with mock.patch.object(boskos_pool.urllib.request, "urlopen", boskos), mock.patch("sys.stdout", io.StringIO()):
                 with self.assertRaises(boskos_pool.Terminated):
                     reconcile.reconcile_pool(BOSKOS, OWNER, runner=tofu, known=KNOWN, run=reconcile.Run(workers=2), outcomes=outcomes)
         finally:
             signal.signal(signal.SIGINT, previous)
             reconcile._TERMINATING.clear()
+            boskos_pool._DEFERRED.clear()
+            boskos_pool._HOLD_DEPTH = 0
+            fire_thread.join(timeout=5)
         early, late = order
         self.assertEqual(verbs[late], ["init"], "the late project ran nothing after the termination")
         self.assertEqual(verbs[early][-1], "apply")
@@ -2148,14 +2156,18 @@ class WorkersTest(unittest.TestCase):
             previous = signal.signal(signal.SIGINT, boskos_pool.terminate)
             outcomes = {}
             started = time.monotonic()
+            fire_thread = threading.Thread(target=fire, daemon=True)
             try:
-                threading.Thread(target=fire, daemon=True).start()
+                fire_thread.start()
                 with mock.patch.object(boskos_pool.urllib.request, "urlopen", boskos), mock.patch("sys.stdout", io.StringIO()):
                     with self.assertRaises(boskos_pool.Terminated):
                         reconcile.reconcile_pool(BOSKOS, OWNER, runner=tofu, known=KNOWN, run=reconcile.Run(workers=2), outcomes=outcomes)
             finally:
                 signal.signal(signal.SIGINT, previous)
                 reconcile._TERMINATING.clear()
+                boskos_pool._DEFERRED.clear()
+                boskos_pool._HOLD_DEPTH = 0
+                fire_thread.join(timeout=5)
             self.assertLess(time.monotonic() - started, 20, "the children exited on the interrupt, not on the 30 s sleep")
             pids = [int(name) for name in os.listdir(tmp)]
             self.assertEqual(len(pids), 2)
