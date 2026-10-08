@@ -714,7 +714,7 @@ RUN cp /tmp/channel-directory/channel_directory_threads.py /opt/hermes/gateway/c
 # See the module docstring in
 # deploy/docker/patches/apply_google_chat_attachment_notice.py.
 #
-# Slack agent view, behind KAGE_SLACK_UX (off by default; off leaves both files
+# Slack agent view, behind KAGE_SLACK_UX (on unless set off; off leaves both files
 # behaving as upstream). With it on, --agent-view describes the app by its
 # --name, and the adapter answers a new thread or DM open with three suggested
 # prompts when platforms.slack.extra.suggested_prompts is unset. The default

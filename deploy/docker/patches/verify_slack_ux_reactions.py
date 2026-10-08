@@ -48,6 +48,8 @@ from types import SimpleNamespace
 ADAPTER = "plugins/platforms/slack/adapter.py"
 RUNTIME = "gateway/slack_ux_reactions.py"
 FLAG_ENV = "KAGE_SLACK_UX"
+#: Unset is on, so the flag-off path needs a value.
+FLAG_OFF = "false"
 
 #: The adapter hooks the patch guards; each guard calls the runtime's function
 #: of the same name.
@@ -344,9 +346,12 @@ async def _drive(module) -> None:
     failure = SimpleNamespace(value="failure")
     failed = [(CHANNEL, ASK_TS, "x", TEAM, False)]
 
-    os.environ.pop(FLAG_ENV, None)
+    os.environ[FLAG_ENV] = FLAG_OFF
     if module.enabled():
-        raise _fail(f"enabled() is true with {FLAG_ENV} unset")
+        raise _fail(f"enabled() is true with {FLAG_ENV}={FLAG_OFF}")
+    os.environ.pop(FLAG_ENV, None)
+    if not module.enabled():
+        raise _fail(f"enabled() is false with {FLAG_ENV} unset, which is on")
 
     os.environ[FLAG_ENV] = "1"
     boards: list[dict] = []

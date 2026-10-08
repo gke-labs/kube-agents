@@ -42,6 +42,8 @@ ADAPTER = "plugins/platforms/slack/adapter.py"
 ADAPTER_CLASS = "SlackAdapter"
 RUNTIME = "gateway/slack_ux_status.py"
 FLAG_ENV = "KAGE_SLACK_UX"
+#: Unset is on, so the flag-off path needs a value.
+FLAG_OFF = "false"
 
 SETTER = "_set_thread_status"
 #: ``_set_thread_status``'s positional parameters, in the order this module's
@@ -239,9 +241,12 @@ def _load_runtime(root: Path):
 
 
 async def _drive(module) -> None:
-    os.environ.pop(FLAG_ENV, None)
+    os.environ[FLAG_ENV] = FLAG_OFF
     if module.enabled():
-        raise _fail(f"enabled() is true with {FLAG_ENV} unset")
+        raise _fail(f"enabled() is true with {FLAG_ENV}={FLAG_OFF}")
+    os.environ.pop(FLAG_ENV, None)
+    if not module.enabled():
+        raise _fail(f"enabled() is false with {FLAG_ENV} unset, which is on")
     os.environ[FLAG_ENV] = "1"
 
     # The session: the phrase becomes processing, sent once; the ask titles it; the clear closes it.

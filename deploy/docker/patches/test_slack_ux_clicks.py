@@ -331,7 +331,7 @@ class FlagOffIdentityTest(unittest.TestCase):
         upstream = root.load("upstream_fixture")
         applier.apply(root.dir)
         patched = root.load("patched_fixture")
-        for value in (None, "", "0", "false"):
+        for value in ("", "0", "false"):
             with self.subTest(flag=value), mock.patch.dict(os.environ, {}, clear=False):
                 os.environ.pop("KAGE_SLACK_UX", None)
                 if value is not None:

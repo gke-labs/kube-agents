@@ -4492,7 +4492,8 @@ func safeSandboxEnvOverrides(custom []corev1.EnvVar) []corev1.EnvVar {
 	//
 	// KAGE_SLACK_UX switches between code paths already in the image, all of
 	// them about Slack. It is compared against `FLAG_ON_VALUES` in
-	// `slack_presenter.py`; any other value is off, the image default. It names
+	// `slack_presenter.py`; unset is on, the image default, and any other value
+	// is off, so passing it through is how an install opts out. It names
 	// no path, URL, credential or image, and no value of it adds a destination
 	// or a credential. Its writes go only to Slack, in the channels and threads
 	// the gateway already serves, among them a reaction on an ask, a click's

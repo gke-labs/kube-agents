@@ -98,7 +98,7 @@ THREAD = "111.000"
 TEAM = "T1"
 PLAN_TS = "222.000"
 PHRASE = "is thinking..."
-FLAG_OFF_VALUES = (None, "", "0", "false")
+FLAG_OFF_VALUES = ("", "0", "false")
 
 
 def _run(coro):
@@ -1747,6 +1747,10 @@ class EnabledTest(unittest.TestCase):
         for value, expected in (("1", True), ("true", True), ("", False), ("0", False)):
             with self.subTest(value=value), mock.patch.dict(os.environ, {"KAGE_SLACK_UX": value}):
                 self.assertEqual(runtime.enabled(), expected)
+
+    def test_unset_is_on(self):
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertTrue(runtime.enabled())
 
 
 class SettlingKindsTest(unittest.TestCase):
