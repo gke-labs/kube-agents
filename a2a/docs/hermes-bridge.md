@@ -172,8 +172,9 @@ it renders the bridge. `deploy/docker/cloudbuild-ci.yaml` builds the presubmit's
 `a2a-bridge` step when `hack/ci-deploy.sh` runs under `EVAL_MODE_NEXT=1`, `FROM` the
 platform-agent image that same build produced, by the tag it just pushed and never from a
 registry default; the deploy then hands it to the operator as `A2A_BRIDGE_IMAGE`, with
-`A2A_BRIDGE_CONCURRENCY` and `A2A_BRIDGE_EXECUTOR=cli`, for the eval install
-(`docs/designs/eval-next-transport.md`, "The CI flag"). Either way the sidecar and the agent
+`A2A_BRIDGE_CONCURRENCY`, for the eval install, and leaves `A2A_BRIDGE_EXECUTOR` unset, so the
+eval runs the `api` executor a customer install runs (`docs/designs/eval-next-transport.md`,
+"The CI flag"). Either way the sidecar and the agent
 container it shares a pod with are one build. The static `bridge` bus user the next section
 describes is the released mechanism, not scaffolding graduation removes: the password arrives
 as sidecar env from the operator's creds Secret, and it stays a password principal for the

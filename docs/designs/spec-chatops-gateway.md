@@ -1048,9 +1048,17 @@ namespace, no door armed and neither `spec.integration.googleChat` nor `spec.int
 enabled - gets no gateway Deployment at all, its `Ready` counts the rest
 of the stack (NATS, the auth callout, the provisioning Job's first completion, the sandbox, the
 broker, today's gateway), and an `A2AGateway` condition (`status: False`, `Reason: NoChatBackend`) names what
-would render it. The rule is creation-only, like the callout ordering gate: a gateway that
-exists keeps reconciling whatever happened to its backend, because deleting it would take
-every session pod that hangs off its UID. An eval install with this door armed has an ingress
+would render it. A gateway that already exists when its last backend goes is not deleted,
+because deleting it would take every session pod that hangs off its UID, and it is not left at
+one replica either, because that replica exits on `no chat backend` and crash-loops. The
+operator applies it at zero replicas, keeping the object and its UID, and its own NetworkPolicy
+(see "Metrics" below), and writes the same `A2AGateway` condition; `Ready` does not wait on it. So the backend question is asked on every
+pass: the door flags, Chat and Slack answer it without a read, and an install whose only backend is a
+Secret pays one uncached read per pass. When a backend comes back, the next pass applies one
+replica on the same Deployment, and the condition stays, as `WaitingForReplica`, until that
+replica is ready. The dark state shares the reconcile's 30 s requeue, so a Secret, which is
+not watched, is seen within one requeue; a door flag comes back with the operator restart that
+changing it causes, and Chat or Slack with the CR edit. An eval install with this door armed has an ingress
 the guard accepts, by the decision recorded above, and the render counts the door as a backend
 for the same reason. An install that enables Google Chat or Slack under `next` has a backend
 by that fact alone: the render asks the CR before it reads any Secret, and, because the gateway
@@ -1060,12 +1068,13 @@ or Slack gateway starting. With both integrations enabled, Chat holds the gatewa
 stays on the legacy consumer rather than reaching nobody. The Slack refs are rendered on the
 gateway as required references, whatever the CR's own copy says, because the gateway refuses
 half a pair at boot: a missing Secret or key holds the pod at container creation, named in its
-events, instead of starting a pod that exits. The
-rule is creation-only in this direction too: disabling Google Chat on an install whose gateway
-has no other backend re-renders the existing gateway without one, and it exits on
-`no chat backend` until the admin flips the CR to `today` (which tears the stack down), enables
-Slack, creates a `discord-bot` Secret, or deletes the gateway Deployment and its session pods with it - the
-same shape as removing the Secret from under a Discord gateway, reached through the CR.
+events, instead of starting a pod that exits. Disabling Google Chat or Slack on an install whose
+gateway has no other backend takes the same path as removing the Secret from under a Discord
+gateway, or turning off the door an eval gateway started on: the existing gateway goes to zero
+replicas with the condition, its session pods stay, and enabling Chat or Slack again, creating a
+`discord-bot` Secret or arming a door brings it back on the same object. The gateway's
+secret-env digest is stamped only on a pass that renders it with a backend, never on the zero
+apply, so a dark gateway whose Secret is gone costs no read of it.
 
 ## The Google Chat adapter (added 9/5)
 
@@ -1675,7 +1684,8 @@ renders `A2A_METRICS_PORT=9096` and declares container port `a2a-metrics` on 909
 constant (`a2aGatewayMetricsPort`), and the chart's `<name>-a2a-gateway-monitoring`
 `PodMonitoring` scrapes 9096 every 30 seconds behind the `platformAgent.podMonitoring` switch. The
 gateway's own NetworkPolicy, `<name>-a2a-gateway-netpol`, renders wherever the gateway Deployment
-does, door or no door, and admits one peer: the `gke-gmp-system` namespace, to 9096 alone, the
+does, door or no door, including a gateway scaled to zero replicas for want of a backend (only the
+stack's teardown removes it), and admits one peer: the `gke-gmp-system` namespace, to 9096 alone, the
 broker's second rule with the gateway's port in it. Each armed door renders a copy under its own
 name, and the doors' ports admit no pod. The gateway's fence used to render only with a door, which
 left the metrics port, bound on every interface, reachable from the whole pod network on an install

@@ -485,8 +485,15 @@ Use `telemetry.otlpEndpoint` instead when you do have a collector to point at.
   `platformAgent.integration.repositories` the repositories on them (`forge`,
   `repository`, optional `namespace`, and `role`: `gitops` for the one the
   agent publishes to, `managed` for others it may change, `context` for
-  read-only reference). `provider` defaults to `github`, the only one
-  registered today, and `credentialsRef` is ignored for it. A GitHub forge's
+  read-only reference). `provider` is `github` (the default) or `gitlab`. `credentialsRef` is
+  ignored for `github` and required for `gitlab`: a Secret holding the access
+  token under the key `token`, mounted into the credential broker only. A
+  `gitlab` forge's `host` is gitlab.com by default or a self-managed instance,
+  never a GitHub name, and one `gitlab` forge per host. With a `gitlab` forge
+  declared beside GitHub, a bare `owner/name` still works for a GitHub
+  repository that the install registered by URL. Name a GitLab repository, or
+  a GitHub repository that the install did not register, by its URL. Apply `crds/` before upgrading
+  to a release that adds a provider, since `helm upgrade` does not update CRDs. A GitHub forge's
   `host` must be a GitHub spelling (`github.com`, `www.github.com`,
   `ssh.github.com`), and a repository must name a declared forge.
   `platformAgent.integration.github.org` / `.gitRepo` remain as a deprecated

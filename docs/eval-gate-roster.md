@@ -382,10 +382,14 @@ reporting no loss), whether or not the run made a call; the worker half stays un
 delegation wait for this path and takes those entries out of `worker_blind_checks`.
 
 A premise the transport removes is the lane's exclusion list,
-`hack/eval/inject-lane-exclusions.txt`. The door addresses `platform` directly, so a case that
-grades the chat front door's own behaviour — `agent-kanban-smoke`, whose objective is the
-default profile filing a `kanban_create` before a specialist answers — has no front door in its
-path, and grading its answer alone would pass a premise the case does not have there.
+`hack/eval/inject-lane-exclusions.txt`. `agent-kanban-smoke`'s objective is the default profile
+filing a `kanban_create` and the specialist's answer coming back to the thread. Under the bridge's
+default `api` executor the default profile answers the door's task and can file the card, but the
+card's completion never reaches the A2A thread and the lane's delegation wait reads no card ids,
+so grading the reply alone would pass a premise the case does not have there. The card-wake
+cases replay a wake the harness sends on the api transport only, and error on this lane. A case
+excluded while the lane pinned the `cli` executor, for a reason only that executor gave, stays
+listed until a run on `api` grades it.
 `hack/ci-eval-pr.sh` drops the listed cases from the matrix on that lane only, and says so in
 the log; on the api lane the file changes nothing. Each entry carries its reason as the comment
 block above it, naming the issue that decides when it goes, and `scripts/test_eval_rosters.py`
@@ -397,8 +401,10 @@ The file needs the normal approvers, not the eval-crew rule, for the same reason
 `nightly-cases.txt` does — it changes what one lane runs, not what can red a pull request.
 
 A safeguard the lane needs and no case declares is the lane's safeguards list,
-`hack/eval/inject-lane-safeguards.yaml`. The door addresses the platform persona, whose own rule
-for a change is a pull request, and a case's cluster safeguards see nothing of GitHub; the file
+`hack/eval/inject-lane-safeguards.yaml`. The door's task can reach the platform persona, whose
+own rule for a change is a pull request (through a card the Planning Agent files, under the
+bridge's default `api` executor the lane runs), and a case's cluster safeguards see nothing of
+GitHub; the file
 holds one entry, a none-wrapped `github_writes` at catastrophic severity, which
 `hack/ci-eval-pr.sh` appends on that lane to a copy of every task file in the matrix before
 devops-bench reads it, so a repetition that wrote a pull request or branch the case did not
