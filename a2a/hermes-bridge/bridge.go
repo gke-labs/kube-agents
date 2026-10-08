@@ -98,10 +98,21 @@ const (
 	// consumer runs one handler at a time, a cancel delivered behind the
 	// stalled one. The bound keeps that wait finite.
 	steerNoticeTimeout = 10 * time.Second
+	// sessionStoreTimeout bounds the session-store read that checks a
+	// session id before the first follow-up resumes it (verifySession). A
+	// read that outlives it vouches for nothing: the follow-ups are refused
+	// no-resume. sessionExportMaxBytes caps what that read may print, one
+	// turn's transcript; more is refused the same way, unread.
+	sessionStoreTimeout   = 15 * time.Second
+	sessionExportMaxBytes = 32 << 20
 
 	shutdownReason            = "reason: bridge-shutdown - the bridge was terminated while this task was in flight"
 	canceledBeforeStartReason = "reason: canceled-before-start"
 )
+
+// sessionStoreBudget is sessionStoreTimeout as a variable, so a test can
+// time the store read out without waiting the real bound.
+var sessionStoreBudget = sessionStoreTimeout
 
 // sessionIDLine is the last thing `hermes chat -Q` writes on stderr:
 // "session_id: <id>". The id finds the transcript under the profile's session
@@ -1261,8 +1272,11 @@ func (b *Bridge) runTask(ctx context.Context, run *taskRun) {
 	})
 	defer deadline.Stop()
 
+	opening := prompt
 	argv := promptArgv(b.cfg.Command, prompt)
+	spawnedAt := time.Now() // no later than turn 1's spawn; its session begins after it
 	var steer *lib.Envelope // the follow-up this turn runs; nil on turn 1
+	var sessionID string    // the session the follow-ups resume, once the store vouched for it
 	for turn := 1; ; turn++ {
 		out, stderr, err, spawned := b.cliTurn(run, argv, env, act, steer, deadlineAt)
 		if !spawned {
@@ -1274,8 +1288,15 @@ func (b *Bridge) runTask(ctx context.Context, run *taskRun) {
 		}
 		// Resumable at all? Asked before a follow-up is looked at, so a
 		// refusal covers every queued one and this answer is the result.
-		sessionID := lastSessionID(stderr)
-		if _, rerr := resumeArgv(b.cfg.Command, "x", "x"); sessionID == "" || rerr != nil {
+		// After the first follow-up the id is the verified one: a turn's
+		// stderr is shared with its tools, so a different id there is
+		// logged and not used.
+		stderrID := lastSessionID(stderr)
+		if sessionID != "" && stderrID != "" && stderrID != sessionID {
+			b.cfg.Logger.Warn("a follow-up turn's stderr names another session; resuming the verified one",
+				"task", taskID, "turn", turn, "session", sessionID, "stderr_session", stderrID)
+		}
+		if _, rerr := resumeArgv(b.cfg.Command, "x", "x"); (sessionID == "" && stderrID == "") || rerr != nil {
 			b.closeTurns(run, lib.SteerReasonNoResume)
 			b.finalize(run, lib.StateCompleted, "", &out)
 			return
@@ -1287,12 +1308,157 @@ func (b *Bridge) runTask(ctx context.Context, run *taskRun) {
 			b.finalize(run, lib.StateCompleted, "", &out)
 			return
 		}
+		if sessionID == "" {
+			if verr := b.verifySession(ctx, env, stderrID, opening, spawnedAt); verr != nil {
+				b.cfg.Logger.Warn("session id not verified against the session store; refusing the follow-ups no-resume",
+					"task", taskID, "session", stderrID, "err", verr)
+				b.closeTurns(run, lib.SteerReasonNoResume)
+				b.finalize(run, lib.StateCompleted, "", &out)
+				return
+			}
+			sessionID = stderrID
+		}
 		if !b.publishTurnAnswer(run, turn, out) {
 			return
 		}
 		steer = next
 		argv, _ = resumeArgv(b.cfg.Command, sessionID, prompt)
 	}
+}
+
+// storeArgv is the session-store read for sessionID: the configured command
+// up to its last "chat" token (the hermes binary and its -p profile), or up
+// to its trailing -q when it names no chat, then Hermes's jsonl export of
+// that one session to stdout. The read opens the store and selects; it
+// writes no session (Hermes v2026.9.14 hermes_cli/sessions_cmd.py:306-341,
+// hermes_state_portability.py:240-243).
+func storeArgv(command []string, sessionID string) ([]string, error) {
+	n := len(command)
+	prefix := -1
+	for i := n - 1; i > 0; i-- {
+		if command[i] == "chat" {
+			prefix = i
+			break
+		}
+	}
+	if prefix < 0 && n > 1 && command[n-1] == "-q" {
+		prefix = n - 1
+	}
+	if prefix < 1 {
+		return nil, fmt.Errorf("command %q names no chat subcommand to read the session store beside", command)
+	}
+	argv := append([]string(nil), command[:prefix]...)
+	return append(argv, "sessions", "export", "-", "--session-id", sessionID), nil
+}
+
+// verifySession checks a session id read off turn 1's stderr against the
+// profile's session store before a follow-up resumes it. stderr is shared
+// with the turn's tool subprocesses, and anything in the pod can write to
+// it, so the id's shape says nothing about whose it is: a line written after
+// the CLI's own can name another conversation's session. The store can say:
+// the session this task's opening turn made began after that turn was
+// spawned, and its first user message is the opening prompt as the argv
+// carried it. Either check failing, or the read failing or outliving
+// sessionStoreTimeout, is an error, and the caller refuses the follow-ups
+// no-resume as it does an id it could not parse.
+//
+// The read runs as the turns do: the same command's binary and profile, the
+// same environment, its own process group, killed with the group when ctx
+// or the timeout ends it.
+func (b *Bridge) verifySession(ctx context.Context, env []string, sessionID, opening string, spawnedAt time.Time) error {
+	argv, err := storeArgv(b.cfg.Command, sessionID)
+	if err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(ctx, sessionStoreBudget)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error { return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL) }
+	cmd.WaitDelay = time.Second // a grandchild holding the pipes does not hold the read
+	out := &cappedBuffer{max: sessionExportMaxBytes}
+	errTail := newTailBuffer(stderrTailBytes)
+	cmd.Stdout, cmd.Stderr, cmd.Env = out, errTail, env
+	if err := cmd.Run(); err != nil {
+		if ctx.Err() != nil {
+			return fmt.Errorf("session store read ended (%v): %w", ctx.Err(), err)
+		}
+		return fmt.Errorf("session store read failed: %w; stderr tail: %s", err, errTail.String())
+	}
+	if out.over {
+		return fmt.Errorf("session store read printed more than %d bytes", sessionExportMaxBytes)
+	}
+	return checkSessionExport(out.buf, sessionID, argvText(opening), spawnedAt)
+}
+
+// sessionExport is the part of Hermes's jsonl session export the check
+// reads: the session row's id and started_at (epoch seconds, written with
+// time.time() when the row is created, hermes_state_common.py:344,
+// hermes_state_sessions.py:357) and its live messages in insertion order
+// (hermes_state_messages.py:774-777), each with its role and content.
+type sessionExport struct {
+	ID        string   `json:"id"`
+	StartedAt *float64 `json:"started_at"`
+	Messages  []struct {
+		Role    string          `json:"role"`
+		Content json.RawMessage `json:"content"`
+	} `json:"messages"`
+}
+
+// checkSessionExport is verifySession's judgement of one export: exactly one
+// JSON object, for sessionID, begun at or after spawnedAt, whose first user
+// message is opening.
+func checkSessionExport(raw []byte, sessionID, opening string, spawnedAt time.Time) error {
+	dec := json.NewDecoder(strings.NewReader(string(raw)))
+	var e sessionExport
+	if err := dec.Decode(&e); err != nil {
+		return fmt.Errorf("session store printed no session export: %v; output: %s", err, tail(string(raw), stderrTailBytes))
+	}
+	if dec.More() {
+		return errors.New("session store printed more than one session")
+	}
+	if e.ID != sessionID {
+		return fmt.Errorf("session store exported %q for %q", e.ID, sessionID)
+	}
+	if e.StartedAt == nil {
+		return errors.New("session export carries no started_at")
+	}
+	if spawned := float64(spawnedAt.UnixNano()) / 1e9; *e.StartedAt < spawned {
+		return fmt.Errorf("session began at %.6f, before this task's opening turn was spawned at %.6f", *e.StartedAt, spawned)
+	}
+	for _, m := range e.Messages {
+		if m.Role != "user" {
+			continue
+		}
+		var text string
+		if json.Unmarshal(m.Content, &text) != nil {
+			return errors.New("session's first user message is not text")
+		}
+		if text != opening {
+			return errors.New("session's first user message is not this task's opening prompt")
+		}
+		return nil
+	}
+	return errors.New("session has no user message")
+}
+
+// cappedBuffer keeps what is written to it up to max bytes and notes, rather
+// than fails, anything past that, so a writer is never stopped mid-line by
+// an error it did not expect.
+type cappedBuffer struct {
+	buf  []byte
+	max  int
+	over bool
+}
+
+func (c *cappedBuffer) Write(p []byte) (int, error) {
+	n := len(p)
+	if room := c.max - len(c.buf); n > room {
+		c.over = true
+		p = p[:max(room, 0)]
+	}
+	c.buf = append(c.buf, p...)
+	return n, nil
 }
 
 // promptArgv is a turn's command: the configured command with the prompt as
@@ -1338,7 +1504,9 @@ func resumeArgv(command []string, sessionID, prompt string) ([]string, error) {
 // child's tool subprocesses, so an earlier match may be another session's
 // id, and a later line means the CLI's own was not last. A label with
 // nothing after it, or an id outside sessionIDLine's shape, is no id at all,
-// and a follow-up then has nothing to resume.
+// and a follow-up then has nothing to resume. A tool can write the last line
+// too, so an id read here is a candidate, not a fact: verifySession checks
+// it against the session store before a follow-up resumes it.
 func lastSessionID(stderr string) string {
 	lines := strings.Split(stderr, "\n")
 	for i := len(lines) - 1; i >= 0; i-- {

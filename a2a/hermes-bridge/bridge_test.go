@@ -2576,9 +2576,11 @@ func TestLastSessionIDRefusesADashLedOrMalformedID(t *testing.T) {
 	}
 }
 
-// Only the last non-blank line is the CLI's own: an id followed by more
-// output (a tool's subprocess writing after it, sharing the stream) is not
-// taken, so a turn cannot be pointed at another conversation's session.
+// Only the last non-blank line is read: an id followed by more output is
+// not taken. A tool's subprocess sharing the stream can still write the last
+// line itself, so this is not what keeps a follow-up out of another
+// conversation's session; the store check is (verifySession,
+// TestCLI_LateSessionIDFromAToolIsNotResumed).
 func TestLastSessionIDIsOnlyTheLastNonBlankLine(t *testing.T) {
 	if got := lastSessionID("session_id: sess-1\n[tool] still talking\n"); got != "" {
 		t.Fatalf("got %q, want none: the id line was not last", got)
@@ -2638,7 +2640,8 @@ func artifactsNamed(t *testing.T, url, taskID, name string) []string {
 
 // resumeStub: turn 1 blocks until release, then every turn answers with its
 // own prompt (the --query= token's value) and the session id; ARGS records
-// each child's argv. resumeExit is the --resume branch's exit code.
+// each child's argv. resumeExit is the --resume branch's exit code. Its
+// store holds sess-1 as a "long question" task's opening turn leaves it.
 func resumeStub(t *testing.T, resumeExit int, printSession bool) (cmd []string, started, release, args string) {
 	t.Helper()
 	dir := t.TempDir()
@@ -2647,7 +2650,7 @@ func resumeStub(t *testing.T, resumeExit int, printSession bool) (cmd []string, 
 	if !printSession {
 		sess = ":"
 	}
-	body := fmt.Sprintf(`echo "$*" >> %[3]s
+	body := storeArm(t, filepath.Join(dir, "calls"), liveStore("long question")) + fmt.Sprintf(`echo "$*" >> %[3]s
 for last; do :; done
 last=${last#--query=}
 case "$*" in
@@ -2655,6 +2658,58 @@ case "$*" in
 *) touch %[1]s; while [ ! -f %[2]s ]; do sleep 0.05; done; echo "answer to $last"; %[4]s ;;
 esac`, started, release, args, sess, resumeExit)
 	return append(script(t, body), "-q"), started, release, args
+}
+
+// storedSession is one session a stub's store holds, as Hermes's export
+// writes it: its id, its started_at (epoch seconds) and its messages.
+type storedSession struct {
+	prompt    string
+	startedAt time.Time
+}
+
+// storeArm is a stub's session store: the shell branch that answers the
+// bridge's read, `<prefix> sessions export - --session-id <id>`, with the
+// session's one JSON line (an id it does not hold gets Hermes's not-found
+// line), recording each read's argv in calls. It goes first in the stub, so
+// a store read never reaches the stub's turn branches or their argv record.
+func storeArm(t *testing.T, calls string, sessions map[string]storedSession) string {
+	t.Helper()
+	dir := t.TempDir()
+	var arms strings.Builder
+	for id, s := range sessions {
+		line, err := json.Marshal(map[string]any{
+			"id":         id,
+			"source":     "cli",
+			"started_at": float64(s.startedAt.UnixNano()) / 1e9,
+			"messages": []map[string]any{
+				{"id": 1, "session_id": id, "role": "user", "content": s.prompt, "timestamp": float64(s.startedAt.Unix())},
+				{"id": 2, "session_id": id, "role": "assistant", "content": "an answer", "timestamp": float64(s.startedAt.Unix())},
+			},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		path := filepath.Join(dir, id+".jsonl")
+		if err := os.WriteFile(path, append(line, '\n'), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		fmt.Fprintf(&arms, "%s) cat %s ;;\n", id, path)
+	}
+	return fmt.Sprintf(`if [ "$1" = sessions ]; then
+echo "$*" >> %s
+for id; do :; done
+case "$id" in
+%s*) echo "Session '$id' not found." ;;
+esac
+exit 0
+fi
+`, calls, arms.String())
+}
+
+// liveStore is the store a stub's opening turn leaves behind: sess-1, begun
+// after the bridge spawned the turn, opened by prompt.
+func liveStore(prompt string) map[string]storedSession {
+	return map[string]storedSession{"sess-1": {prompt: prompt, startedAt: time.Now().Add(time.Hour)}}
 }
 
 func TestCLI_FollowUpsRunAsResumedTurnsInOrder(t *testing.T) {
@@ -2746,11 +2801,196 @@ func TestCLI_NoSessionIDRefusesFollowUpsAndCompletes(t *testing.T) {
 	}
 }
 
+// A tool subprocess shares the CLI's stderr, so a line it writes after the
+// CLI's own (here a backgrounded write that lands once the CLI has exited)
+// can name another conversation's session. That id is checked against the
+// profile's session store before anything resumes it: other-conv began
+// before this turn and was opened by another prompt, so the follow-up is
+// refused no-resume and no child is pointed at it.
+func TestCLI_LateSessionIDFromAToolIsNotResumed(t *testing.T) {
+	_, url := startServer(t)
+	dir := t.TempDir()
+	started, release, args, calls := filepath.Join(dir, "started"), filepath.Join(dir, "release"),
+		filepath.Join(dir, "args"), filepath.Join(dir, "calls")
+	store := liveStore("long question")
+	store["other-conv"] = storedSession{prompt: "someone else's question", startedAt: time.Now().Add(-time.Hour)}
+	cmd := append(script(t, storeArm(t, calls, store)+fmt.Sprintf(`echo "$*" >> %[3]s
+case "$*" in
+*--resume*) echo "resumed"; echo "session_id: sess-1" >&2 ;;
+*) touch %[1]s; while [ ! -f %[2]s ]; do sleep 0.05; done; echo "answer"
+echo "session_id: sess-1" >&2
+(sleep 0.3; echo "session_id: other-conv" >&2) & ;;
+esac`, started, release, args)), "-q")
+	startBridge(t, url, cmd)
+	c := gatewayClient(t, url)
+	origin := submit(t, c, "task-cli-late-id", "long question")
+	waitStarted(t, started)
+	sendSteer(t, c, origin, "also east")
+	waitFor(t, 10*time.Second, "queued", func() bool { return len(steerNotices(t, url, origin.TaskID)) == 1 })
+	_ = os.WriteFile(release, nil, 0o600)
+	task := waitTerminal(t, c, origin.TaskID)
+	if task.State != lib.StateCompleted {
+		t.Fatalf("state %s reason %q", task.State, terminalReason(t, task))
+	}
+	raw, _ := os.ReadFile(args)
+	if strings.Contains(string(raw), "--resume") {
+		t.Fatalf("a follow-up resumed a session the store did not vouch for:\n%s", raw)
+	}
+	ns := steerNotices(t, url, origin.TaskID)
+	if len(ns) != 2 || ns[1].Steer != lib.SteerRefused || ns[1].Reason != lib.SteerReasonNoResume {
+		t.Fatalf("notices = %+v, want queued then refused no-resume", ns)
+	}
+	if got := artifactsNamed(t, url, origin.TaskID, lib.ArtifactResult); !slices.Equal(got, []string{"answer\n"}) {
+		t.Fatalf("result = %q, want turn 1's answer", got)
+	}
+}
+
+// The store vouches once, before the first follow-up, and that id is the
+// one every later follow-up resumes: turn 2's stderr naming another session
+// (a tool's line again) is logged and not used, and the store is not asked
+// again.
+func TestCLI_FollowUpsResumeTheVerifiedSessionOnly(t *testing.T) {
+	_, url := startServer(t)
+	dir := t.TempDir()
+	started, release, args, calls := filepath.Join(dir, "started"), filepath.Join(dir, "release"),
+		filepath.Join(dir, "args"), filepath.Join(dir, "calls")
+	store := liveStore("long question")
+	store["other-conv"] = storedSession{prompt: "long question", startedAt: time.Now().Add(time.Hour)}
+	cmd := append(script(t, storeArm(t, calls, store)+fmt.Sprintf(`echo "$*" >> %[3]s
+for last; do :; done
+last=${last#--query=}
+case "$*" in
+*"--query=also east"*) echo "answer to $last"; echo "session_id: other-conv" >&2 ;;
+*--resume*) echo "answer to $last" ;;
+*) touch %[1]s; while [ ! -f %[2]s ]; do sleep 0.05; done; echo "answer to $last"; echo "session_id: sess-1" >&2 ;;
+esac`, started, release, args)), "-q")
+	startBridge(t, url, cmd)
+	c := gatewayClient(t, url)
+	origin := submit(t, c, "task-cli-verified-only", "long question")
+	waitStarted(t, started)
+	sendSteer(t, c, origin, "also east")
+	sendSteer(t, c, origin, "and west")
+	sendSteer(t, c, origin, "and north")
+	waitFor(t, 10*time.Second, "three queued", func() bool { return len(steerNotices(t, url, origin.TaskID)) == 3 })
+	_ = os.WriteFile(release, nil, 0o600)
+	task := waitTerminal(t, c, origin.TaskID)
+	if task.State != lib.StateCompleted {
+		t.Fatalf("state %s reason %q", task.State, terminalReason(t, task))
+	}
+	raw, _ := os.ReadFile(args)
+	want := "--query=long question\n--resume sess-1 --query=also east\n--resume sess-1 --query=and west\n--resume sess-1 --query=and north\n"
+	if string(raw) != want {
+		t.Fatalf("argv per child:\n%s\nwant:\n%s", raw, want)
+	}
+	if got, _ := os.ReadFile(calls); string(got) != "sessions export - --session-id sess-1\n" {
+		t.Fatalf("store reads:\n%s\nwant the one read of sess-1, before the first follow-up", got)
+	}
+}
+
+// Whatever keeps the store from vouching for the id - it does not hold the
+// session, the session began before this task's opening turn, its first
+// message is another prompt, the read fails or outlives its budget - refuses
+// the follow-ups no-resume, as an id that cannot be parsed does, and the
+// opening turn's answer is the result.
+func TestCLI_UnverifiedSessionRefusesFollowUpsNoResume(t *testing.T) {
+	prev := sessionStoreBudget
+	sessionStoreBudget = 500 * time.Millisecond
+	t.Cleanup(func() { sessionStoreBudget = prev })
+	cases := []struct {
+		name  string
+		store string // the stub's store branch
+	}{
+		{"not-held", storeArm(t, filepath.Join(t.TempDir(), "calls"), nil)},
+		{"began-before", storeArm(t, filepath.Join(t.TempDir(), "calls"),
+			map[string]storedSession{"sess-1": {prompt: "long question", startedAt: time.Now().Add(-time.Hour)}})},
+		{"other-prompt", storeArm(t, filepath.Join(t.TempDir(), "calls"), liveStore("another question"))},
+		{"read-fails", "if [ \"$1\" = sessions ]; then echo 'Error: Could not open session database' >&2; exit 1; fi\n"},
+		{"read-times-out", "if [ \"$1\" = sessions ]; then exec sleep 30; fi\n"},
+		{"read-prints-junk", "if [ \"$1\" = sessions ]; then echo '{\"id\": \"sess-1\"'; exit 0; fi\n"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, url := startServer(t)
+			dir := t.TempDir()
+			started, release, args := filepath.Join(dir, "started"), filepath.Join(dir, "release"), filepath.Join(dir, "args")
+			cmd := append(script(t, tc.store+fmt.Sprintf(`echo "$*" >> %[3]s
+case "$*" in
+*--resume*) echo "resumed" ;;
+*) touch %[1]s; while [ ! -f %[2]s ]; do sleep 0.05; done; echo "answer"; echo "session_id: sess-1" >&2 ;;
+esac`, started, release, args)), "-q")
+			startBridge(t, url, cmd)
+			c := gatewayClient(t, url)
+			origin := submit(t, c, "task-cli-unverified-"+tc.name, "long question")
+			waitStarted(t, started)
+			sendSteer(t, c, origin, "also east")
+			waitFor(t, 10*time.Second, "queued", func() bool { return len(steerNotices(t, url, origin.TaskID)) == 1 })
+			_ = os.WriteFile(release, nil, 0o600)
+			task := waitTerminal(t, c, origin.TaskID)
+			if task.State != lib.StateCompleted {
+				t.Fatalf("state %s reason %q", task.State, terminalReason(t, task))
+			}
+			if raw, _ := os.ReadFile(args); string(raw) != "--query=long question\n" {
+				t.Fatalf("argv per child:\n%s\nwant the opening turn only", raw)
+			}
+			ns := steerNotices(t, url, origin.TaskID)
+			if len(ns) != 2 || ns[1].Steer != lib.SteerRefused || ns[1].Reason != lib.SteerReasonNoResume {
+				t.Fatalf("notices = %+v, want queued then refused no-resume", ns)
+			}
+			if got := artifactsNamed(t, url, origin.TaskID, lib.ArtifactResult); !slices.Equal(got, []string{"answer\n"}) {
+				t.Fatalf("result = %q, want turn 1's answer", got)
+			}
+		})
+	}
+}
+
+func TestStoreArgv(t *testing.T) {
+	for _, tc := range []struct {
+		command []string
+		want    string
+	}{
+		{[]string{"hermes", "-p", "platform", "chat", "-Q", "-q"}, "hermes -p platform sessions export - --session-id s-1"},
+		{[]string{"hermes", "-p", "chat", "chat", "-Q", "-q"}, "hermes -p chat sessions export - --session-id s-1"},
+		{[]string{"/stub", "-q"}, "/stub sessions export - --session-id s-1"},
+	} {
+		got, err := storeArgv(tc.command, "s-1")
+		if err != nil || strings.Join(got, " ") != tc.want {
+			t.Errorf("storeArgv(%q) = %q, %v; want %q", tc.command, got, err, tc.want)
+		}
+	}
+	for _, command := range [][]string{nil, {"-q"}, {"chat"}, {"/stub", "run"}} {
+		if got, err := storeArgv(command, "s-1"); err == nil {
+			t.Errorf("storeArgv(%q) = %q, want an error", command, got)
+		}
+	}
+}
+
+func TestCheckSessionExport(t *testing.T) {
+	spawned := time.Unix(1_760_000_000, 500_000_000)
+	ok := `{"id": "s-1", "started_at": 1760000000.6, "messages": [{"role": "assistant", "content": "x"}, {"role": "user", "content": "the prompt"}, {"role": "user", "content": "later"}]}` + "\n"
+	if err := checkSessionExport([]byte(ok), "s-1", "the prompt", spawned); err != nil {
+		t.Fatalf("a matching export: %v", err)
+	}
+	for name, raw := range map[string]string{
+		"not found":     "Session 's-1' not found.\n",
+		"other id":      `{"id": "s-10", "started_at": 1760000000.6, "messages": [{"role": "user", "content": "the prompt"}]}`,
+		"no started_at": `{"id": "s-1", "messages": [{"role": "user", "content": "the prompt"}]}`,
+		"began before":  `{"id": "s-1", "started_at": 1760000000.4, "messages": [{"role": "user", "content": "the prompt"}]}`,
+		"other prompt":  `{"id": "s-1", "started_at": 1760000000.6, "messages": [{"role": "user", "content": "later"}, {"role": "user", "content": "the prompt"}]}`,
+		"not text":      `{"id": "s-1", "started_at": 1760000000.6, "messages": [{"role": "user", "content": [{"type": "text", "text": "the prompt"}]}]}`,
+		"no user":       `{"id": "s-1", "started_at": 1760000000.6, "messages": []}`,
+		"two sessions":  ok + ok,
+	} {
+		if err := checkSessionExport([]byte(raw), "s-1", "the prompt", spawned); err == nil {
+			t.Errorf("%s: verified", name)
+		}
+	}
+}
+
 func TestCLI_CancelDuringAFollowUpTurn(t *testing.T) {
 	_, url := startServer(t)
 	dir := t.TempDir()
 	turn1, turn2 := filepath.Join(dir, "turn1"), filepath.Join(dir, "turn2")
-	cmd := append(script(t, fmt.Sprintf(`case "$*" in
+	cmd := append(script(t, storeArm(t, filepath.Join(dir, "calls"), liveStore("q"))+fmt.Sprintf(`case "$*" in
 *--resume*) touch %s; sleep 30 ;;
 *) touch %s; echo first; echo "session_id: sess-1" >&2; sleep 1 ;;
 esac`, turn2, turn1)), "-q")
@@ -2780,7 +3020,7 @@ func TestCLI_DeadlineDuringAFollowUpTurn(t *testing.T) {
 	dir := t.TempDir()
 	turn1, release, turn2, pidFile := filepath.Join(dir, "turn1"), filepath.Join(dir, "release"),
 		filepath.Join(dir, "turn2"), filepath.Join(dir, "pid2")
-	cmd := append(script(t, fmt.Sprintf(`case "$*" in
+	cmd := append(script(t, storeArm(t, filepath.Join(dir, "calls"), liveStore("q"))+fmt.Sprintf(`case "$*" in
 *--resume*) echo $$ > %[3]s; touch %[4]s; exec sleep 30 ;;
 *) touch %[1]s; while [ ! -f %[2]s ]; do sleep 0.05; done; echo first; echo "session_id: sess-1" >&2 ;;
 esac`, turn1, release, pidFile, turn2)), "-q")
@@ -2856,7 +3096,7 @@ func TestCLI_FollowUpsStopAtTheTaskCap(t *testing.T) {
 	_, url := startServer(t)
 	dir := t.TempDir()
 	args := filepath.Join(dir, "args")
-	cmd := append(script(t, fmt.Sprintf(`echo "$*" >> %[1]s
+	cmd := append(script(t, storeArm(t, filepath.Join(dir, "calls"), liveStore("q"))+fmt.Sprintf(`echo "$*" >> %[1]s
 n=$(wc -l < %[1]s | tr -d ' ')
 touch %[2]s/started-$n
 while [ ! -f %[2]s/release-$n ]; do sleep 0.02; done

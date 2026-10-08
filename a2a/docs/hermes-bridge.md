@@ -410,15 +410,24 @@ with `queue-full` (a task takes at most 16 follow-ups, counted per task: those a
 not only those waiting), `task-ending` (the answer was already chosen), `no-text`, `capability`
 (the task's capability, carried on the follow-up, did not pass when checked on the worker before
 its turn: refused, or the verifier could not be reached; the one token covers both),
-`no-resume` (cli: stderr's last non-blank line is not `session_id:` and an id of up to 128
-letters, digits, `_`, `.`, `:` and `-` that starts with a letter or digit, or the command does not
-end in `-q`), or
+`no-resume` (cli: the opening turn's stderr does not end in `session_id:` and an id of up to 128
+letters, digits, `_`, `.`, `:` and `-` that starts with a letter or digit, the profile's session
+store does not vouch for that id, or the command does not end in `-q`), or
 `task-ended` (the task ended first: cancel, failure, deadline, shutdown). When the current turn
 ends, queued follow-ups run in arrival order as further turns in the same Hermes session: `api`
 posts another turn with the same session headers, under the same session slot, and the
 `Idempotency-Key` `<taskId>/<envelopeId>` (the opening turn's is `<taskId>`), so a follow-up
 never replays the opening answer; `cli` runs
-`hermes -p <profile> chat -Q --resume <session_id> --query=<text>`. Every turn passes its text as one
+`hermes -p <profile> chat -Q --resume <session_id> --query=<text>`. The id is read off the opening
+turn's stderr, which the turn's tool subprocesses share, so a line one of them writes after the
+CLI's own could name another conversation's session. Before the first follow-up runs, the bridge
+checks the id against the profile's session store with
+`hermes -p <profile> sessions export - --session-id <id>`, bounded at 15s under the task: the
+session must have begun at or after the opening turn was spawned (`started_at`), and its first user
+message must be the opening prompt as the argv carried it. A session that fails either check, or a
+read that fails or times out, refuses the follow-ups `no-resume`, logged with why. The id the store
+vouched for is the one every later follow-up resumes; a different id on a later turn's stderr is
+logged and not used. Every turn passes its text as one
 `--query=` token, the opening turn too, so a message that starts with `-` stays the query rather
 than reading as an option, and with any NUL byte dropped, since no argument can carry one. Each earlier turn's answer is
 published as a `turn` artifact as soon as the next turn is about to run; the last turn's answer
