@@ -8,6 +8,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=scripts/release/common.sh
 source "${SCRIPT_DIR}/common.sh"
+# shellcheck source=scripts/release/platform_agent_mode.sh
+source "${SCRIPT_DIR}/platform_agent_mode.sh"
 
 # Per-Deployment, because the two have different ceilings and one number cannot
 # respect both. The rule test_gateway_rollout_budgets.py enforces is
@@ -31,6 +33,10 @@ source "${SCRIPT_DIR}/common.sh"
 # those were warm).
 readonly LITELLM_READINESS_TIMEOUT="420s"
 readonly GATEWAY_READINESS_TIMEOUT="1500s"
+
+# PLATFORM_AGENT_MODE, refused before anything connects when it is not a mode.
+# Unset and `today` add nothing below; `next` adds the gate at the end.
+platform_agent_mode_resolve
 
 release_resolve_target
 
@@ -70,3 +76,11 @@ kubectl wait --for=condition=Available deployment/litellm -n "${AGENT_NAMESPACE}
 echo "Waiting for platform-agent-gateway deployment readiness..."
 kubectl rollout status deployment/platform-agent-gateway -n "${AGENT_NAMESPACE}" --timeout="${GATEWAY_READINESS_TIMEOUT}"
 kubectl wait --for=condition=Available deployment/platform-agent-gateway -n "${AGENT_NAMESPACE}" --timeout="${GATEWAY_READINESS_TIMEOUT}"
+
+# Under spec.mode: next, what the mode renders as well, so the suites do not
+# start on a bus still coming up or mid-way through a roll. The deploy job ran
+# the same gate after it switched the mode; this one holds the line for
+# anything the operator rolls after that job ended.
+if [ "${RELEASE_PLATFORM_AGENT_MODE}" = "${PLATFORM_AGENT_MODE_NEXT}" ]; then
+  platform_agent_mode_wait_next "${AGENT_NAMESPACE}"
+fi

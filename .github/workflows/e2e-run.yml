@@ -49,6 +49,16 @@ on:
         required: false
         default: 95
         type: number
+      # The PlatformAgent's spec.mode the environment was deployed with, the
+      # same input deploy-environment.yml takes. `next` adds a readiness gate
+      # for what that mode renders (platform_agent_mode.sh), whose worst case
+      # a caller passing it adds to timeout_minutes;
+      # SiblingGatewayRolloutGatesTest models it. `today` adds nothing.
+      mode:
+        description: "The PlatformAgent's spec.mode the environment runs: today or next"
+        required: false
+        default: "today"
+        type: string
 
 jobs:
   run-e2e:
@@ -108,10 +118,25 @@ jobs:
           location: ${{ vars.GCP_REGION }}
           project_id: ${{ vars.GCP_PROJECT_ID }}
 
+      # The readiness script is the candidate's, and one older than
+      # platform_agent_mode.sh ignores PLATFORM_AGENT_MODE, so `next` would
+      # run the suites without its gate. Skipped for `today`.
+      - name: Confirm the candidate can gate the mode
+        if: inputs.mode != 'today'
+        env:
+          MODE: ${{ inputs.mode }}
+        run: |
+          if [ ! -f scripts/release/platform_agent_mode.sh ]; then
+            echo "::error title=This candidate predates the mode input::The commit under test has no scripts/release/platform_agent_mode.sh, so its readiness script would ignore mode '${MODE}'. Run it at or after the commit that added that file, or with mode today."
+            exit 1
+          fi
+
       - name: Connect to GKE & Wait for Pod Readiness
         env:
           AGENT_NAMESPACE: ${{ vars.AGENT_NAMESPACE }}
           COMMIT_SHA: ${{ inputs.commit_sha }}
+          # Refused by the script unless today or next; cleared for today.
+          PLATFORM_AGENT_MODE: ${{ inputs.mode }}
           GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
           GCP_REGION: ${{ vars.GCP_REGION }}
           GKE_CLUSTER_NAME: ${{ vars.GKE_CLUSTER_NAME }}
