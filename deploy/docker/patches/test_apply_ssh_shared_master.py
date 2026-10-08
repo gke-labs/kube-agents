@@ -6,6 +6,7 @@ The applier's contract against miniature copies of the two Hermes files, and the
 against the same stubs patched and unpatched: it imports them as ``tools.*`` from the staged root.
 """
 
+import shutil
 import tempfile
 import unittest
 from pathlib import Path
@@ -142,6 +143,7 @@ class ApplierTest(unittest.TestCase):
             self.assertNotIn(MARKER, (root / rel).read_text(), rel)
 
 
+@unittest.skipUnless(shutil.which("ssh") or Path("/usr/bin/ssh").exists(), "the verifier resolves the argv with ssh -G")
 class VerifierTest(unittest.TestCase):
     def test_patched_stubs_pass(self):
         root = stage()
@@ -164,7 +166,9 @@ class VerifierTest(unittest.TestCase):
         path.write_text(path.read_text().replace('"-o", "ServerAliveInterval=15", ', ""))
         rc, failures = run_verifier(root)
         self.assertEqual(rc, 1)
-        self.assertIn("carries no `-o ServerAliveInterval=15`", "\n".join(failures))
+        # What ssh falls back to is the machine's (a ~/.ssh/config may set its own), so only the
+        # keyword and the expected value are pinned.
+        self.assertRegex("\n".join(failures), r"ssh resolves serveraliveinterval to \S+, expected 15")
 
     def test_an_argv_without_the_count_fails(self):
         root = stage()
@@ -173,7 +177,7 @@ class VerifierTest(unittest.TestCase):
         path.write_text(path.read_text().replace(', "-o", "ServerAliveCountMax=3"', ""))
         rc, failures = run_verifier(root)
         self.assertEqual(rc, 1)
-        self.assertIn("carries no `-o ServerAliveCountMax=3`", "\n".join(failures))
+        self.assertRegex("\n".join(failures), r"ssh resolves serveralivecountmax to \S+, expected 3")
 
     def test_an_earlier_copy_of_the_interval_fails(self):
         # An upstream `-o ServerAliveInterval=N` placed before the anchor is earlier in argv and
@@ -183,26 +187,35 @@ class VerifierTest(unittest.TestCase):
         apply(root)
         rc, failures = run_verifier(root)
         self.assertEqual(rc, 1)
-        self.assertIn("carries ServerAliveInterval 2 times (5, 15); the first copy wins", "\n".join(failures))
+        self.assertIn("ssh resolves serveraliveinterval to 5, expected 15", "\n".join(failures))
 
     def test_every_spelling_of_an_earlier_copy_fails(self):
-        # ssh also takes the option glued to -o, with the keyword in any case, and with a space
-        # instead of `=`; the gate normalises before counting, so each spelling is a second copy.
-        for spelling in ('"-oServerAliveInterval=0"', '"-o", "serveraliveinterval=5"', '"-o", "ServerAliveInterval 5"',
-                         '"-oserveralivecountmax=9"'):
+        # ssh also takes the option glued to -o, after `-o=`, bundled behind other short flags, with
+        # the keyword in any case, and with a space instead of `=`; the gate asks ssh -G what it
+        # resolved, so each spelling lands as the earlier, winning value.
+        for spelling, expect in (('"-oServerAliveInterval=0"', "serveraliveinterval to 0"),
+                                 ('"-o=ServerAliveInterval=5"', "serveraliveinterval to 5"),
+                                 ('"-To", "ServerAliveInterval=5"', "serveraliveinterval to 5"),
+                                 ('"-o", "serveraliveinterval=5"', "serveraliveinterval to 5"),
+                                 ('"-o", "ServerAliveInterval 5"', "serveraliveinterval to 5"),
+                                 ('"-4oserveralivecountmax=9"', "serveralivecountmax to 9")):
             with self.subTest(spelling=spelling):
                 root = stage(ssh=SSH_STUB.replace('        cmd = ["ssh"]\n', f'        cmd = ["ssh", {spelling}]\n'))
                 apply(root)
                 rc, failures = run_verifier(root)
                 self.assertEqual(rc, 1, spelling)
-                self.assertIn("the first copy wins", "\n".join(failures), spelling)
+                self.assertIn(f"ssh resolves {expect}, expected", "\n".join(failures), spelling)
 
-    def test_a_glued_dash_f_fails(self):
-        root = stage(ssh=SSH_STUB.replace('        cmd = ["ssh"]\n', '        cmd = ["ssh", "-F/dev/null"]\n'))
-        apply(root)
-        rc, failures = run_verifier(root)
-        self.assertEqual(rc, 1)
-        self.assertIn("carries -F", "\n".join(failures))
+    def test_a_glued_or_bundled_dash_f_fails(self):
+        # Where the image's drop-in is installed the gate sees its SendEnv vanish; elsewhere (this
+        # suite on a developer machine) it falls back to the flag itself, in any bundling.
+        for spelling in ('"-F/dev/null"', '"-4F", "/dev/null"', '"-vF/dev/null"'):
+            with self.subTest(spelling=spelling):
+                root = stage(ssh=SSH_STUB.replace('        cmd = ["ssh"]\n', f'        cmd = ["ssh", {spelling}]\n'))
+                apply(root)
+                rc, failures = run_verifier(root)
+                self.assertEqual(rc, 1, spelling)
+                self.assertIn("-F", "\n".join(failures), spelling)
 
     def test_a_renamed_probe_only_parameter_fails_the_gate(self):
         # The applier's __init__ anchor is the _socket_id line, which an upstream rename of

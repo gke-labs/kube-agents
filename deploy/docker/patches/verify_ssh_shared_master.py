@@ -5,8 +5,10 @@ Run by ``deploy/docker/Dockerfile`` from ``/opt/hermes`` after ``apply_ssh_share
 The applier proves its anchors matched once; this imports the patched modules and proves they
 behave: a shared environment's ``cleanup()`` runs no ``ssh -O exit`` and ``close_master()`` does,
 a probe's ``cleanup()`` still closes its private master, the client argv carries the keep-alive
-pair exactly once in any spelling ssh accepts (the command line is what outranks every config
-file, and a copy placed earlier would win) and no ``-F`` (which would drop the system config and the SendEnv drop-in with
+pair as ssh itself resolves it (``ssh -G`` over the argv: the command line outranks every config
+file and the first value on it wins, so this is judged by ssh's own parser, not a copy of its
+grammar) and still reads the system config (the drop-in's ``SendEnv`` resolves; an ``-F`` in any
+spelling would drop it) (which would drop the system config and the SendEnv drop-in with
 it), and the terminal result carries the hint only for an ssh exit 255 without the cwd marker. The two inserted statements are also checked with
 ``patchlib.unbound`` for ``probe_only``, ``env_type`` and ``result`` (``returncode`` and
 ``failure_hint`` are pinned by the anchor line itself): the ``__init__`` mark is never executed here
@@ -24,6 +26,8 @@ import ast
 import json
 import os
 import re
+import shutil
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -57,24 +61,35 @@ def _import(name: str):
         return None
 
 
-def _ssh_options(argv: list[str]) -> list[tuple[str, str]]:
-    """Every ``-o`` option in *argv* as ``(keyword lower-cased, value)``, in order, in the spellings
-    ssh accepts: ``-o Key=value``, ``-oKey=value`` and ``-o "Key value"``."""
-    options: list[tuple[str, str]] = []
-    i = 0
-    while i < len(argv):
-        arg = argv[i]
-        if arg == "-o" and i + 1 < len(argv):
-            spec, i = argv[i + 1], i + 2
-        elif arg.startswith("-o") and len(arg) > 2:
-            spec, i = arg[2:], i + 1
-        else:
-            i += 1
-            continue
-        match = re.match(r"\s*([A-Za-z]+)\s*(?:=|\s)\s*(.*?)\s*$", spec)
-        if match:
-            options.append((match.group(1).lower(), match.group(2)))
-    return options
+# The host the Dockerfile's own `ssh -G` checks use: the operator's sandbox naming, so the
+# image's ssh_config.d drop-in matches it and its SendEnv shows in the resolved config.
+SANDBOX_PROBE_HOST = "probe-shell-0.probe-shell.probe.svc.cluster.local"
+
+
+def _ssh_client() -> str | None:
+    return "/usr/bin/ssh" if os.path.exists("/usr/bin/ssh") else shutil.which("ssh")
+
+
+# Apple's ssh resolves the host even under -G and gives up after a DNS timeout; pinning Hostname
+# skips that. `Match host` then sees 127.0.0.1, so the drop-in's SendEnv check below runs without
+# the pin, and only where a bare connection shows the drop-in is installed (the image).
+_HOSTNAME_PIN = ["-o", "Hostname=127.0.0.1"]
+_dropin_cache: dict[str, dict[str, list[str]] | None] = {}
+
+
+def _resolved(ssh_bin: str, args: list[str], *, quiet: bool = False) -> dict[str, list[str]] | None:
+    """What ssh resolves for *args* (``ssh -G``, no connection), keyword lower-cased -> values in
+    print order; repeated keywords such as ``sendenv`` keep every line."""
+    proc = subprocess.run([ssh_bin, "-G", *args], capture_output=True, text=True, timeout=30)
+    if proc.returncode != 0:
+        if not quiet:
+            fail(f"`ssh -G` refused the argv: {proc.stderr.strip()[:200]}")
+        return None
+    resolved: dict[str, list[str]] = {}
+    for line in proc.stdout.splitlines():
+        key, _, value = line.partition(" ")
+        resolved.setdefault(key.lower(), []).append(value)
+    return resolved
 
 
 def _exit_calls(run_mock) -> list[list[str]]:
@@ -127,7 +142,7 @@ def check_ssh(ssh) -> None:
     with tempfile.TemporaryDirectory() as tmp:
         def env(shared: bool):
             e = cls.__new__(cls)
-            e.user, e.host, e.port = "agent", "sandbox", 2222
+            e.user, e.host, e.port = "agent", SANDBOX_PROBE_HOST, 2222
             e._sync_manager = None
             e._shared_master = shared
             e.control_socket = Path(tmp) / "0123456789abcdef.sock"
@@ -149,15 +164,28 @@ def check_ssh(ssh) -> None:
         e = env(shared=True)
         e.key_path = ""
         argv = list(e._build_ssh_command())
-        options = _ssh_options(argv)
-        for keyword, value in (("ServerAliveInterval", "15"), ("ServerAliveCountMax", "3")):
-            copies = [v for k, v in options if k == keyword.lower()]
-            if copies == [value]:
-                continue
-            fail(f"the client argv carries no `-o {keyword}={value}`" if not copies
-                 else f"the client argv carries {keyword} {len(copies)} times ({', '.join(copies)}); the first copy wins")
-        if any(a == "-F" or a.startswith("-F") for a in argv):
-            fail("the client argv carries -F, which would drop the system ssh config")
+        ssh_bin = _ssh_client()
+        if ssh_bin is None:
+            fail("no ssh client to resolve the argv with `ssh -G`")
+            return
+        resolved = _resolved(ssh_bin, [*_HOSTNAME_PIN, *argv[1:]])
+        if resolved is None:
+            return
+        for keyword, want in (("serveraliveinterval", "15"), ("serveralivecountmax", "3")):
+            got = resolved.get(keyword, [])
+            if got != [want]:
+                fail(f"ssh resolves {keyword} to {' '.join(got) or 'nothing'}, expected {want} "
+                     "(the first value on the command line wins)")
+        if ssh_bin not in _dropin_cache:
+            _dropin_cache[ssh_bin] = _resolved(ssh_bin, [f"agent@{SANDBOX_PROBE_HOST}"], quiet=True)
+        bare = _dropin_cache[ssh_bin]
+        if bare is not None and "HERMES_PROFILE_HOME" in bare.get("sendenv", []):
+            with_argv = _resolved(ssh_bin, argv[1:], quiet=True)
+            if with_argv is None or "HERMES_PROFILE_HOME" not in with_argv.get("sendenv", []):
+                fail("the client argv drops the system ssh config: sendenv HERMES_PROFILE_HOME resolves "
+                     "for a bare connection and not with Hermes's argv (an -F?)")
+        elif any(re.fullmatch(r"-[^-]*F.*", a) for a in argv):
+            fail("the client argv carries an -F, which would drop the system ssh config")
 
 
 def check_result(result_mod) -> None:
