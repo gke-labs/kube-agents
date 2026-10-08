@@ -54,6 +54,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 from collections.abc import Sequence
 from dataclasses import dataclass, field, replace
 from enum import IntEnum
@@ -546,6 +547,21 @@ def _as_float(value: Any) -> float | None:
 
 def _as_str(value: Any) -> str | None:
     return str(value) if value is not None else None
+
+
+_HTTP_5XX_PATTERN = re.compile(r"^(?:Error:\s*)?HTTP\s+5\d\d\b", re.IGNORECASE)
+
+
+def _is_http_5xx(text: str | None) -> bool:
+    """Return True if text consists of or opens with an HTTP 5xx error.
+
+    Matches e.g. "HTTP 500 from agent endpoint: ...", "Error: HTTP 500 ...",
+    "HTTP 502 Bad Gateway", etc.
+    """
+    if not text:
+        return False
+    cleaned = text.strip().strip("'\"")
+    return bool(_HTTP_5XX_PATTERN.match(cleaned))
 
 
 @dataclass(frozen=True)
@@ -1199,6 +1215,31 @@ def classify_rep(
             "tokens.total is 0, so no model call was billed. There is no "
             "answer in it to grade, whatever produced it -- infrastructure, "
             "not the pull request (#1184)",
+        )
+
+    # An HTTP 5xx on the opening turn recorded as the entire output (#2430):
+    # the gateway or proxy crashed before an agent could execute. The harness
+    # stored the error string as the answer with an empty trajectory and no
+    # billed tokens. The liveness signals read as inconsistent because the
+    # error string was stored as the answer, but no model call was ever billed
+    # -- this is an infrastructure repetition by the gate's own definition (#1184),
+    # not an agent regression to block at rung 3.
+    output_text = (record.output or "").strip()
+    errors_text = " ".join(str(e) for e in errors) if errors else ""
+    if (
+        not record.trajectory
+        and (
+            total_tokens is None
+            or (not isinstance(total_tokens, bool) and _as_float(total_tokens) == 0)
+        )
+        and (_is_http_5xx(output_text) or (not output_text and _is_http_5xx(errors_text)))
+    ):
+        err_detail = output_text or errors_text
+        return rep(
+            "infra",
+            "the record holds an HTTP 5xx error as its entire output with no "
+            f"trajectory and no tokens billed ({err_detail}): the agent endpoint "
+            "failed before an agent ran -- infrastructure, not the pull request (#2430)",
         )
 
     # --- Rung 2. A declared check that did not produce a verdict.

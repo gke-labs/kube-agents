@@ -1615,10 +1615,19 @@ def test_an_ordinary_scored_record_is_still_graded(results_json: Any) -> None:
 
 
 def test_an_agent_error_without_the_marker_is_still_graded(results_json: Any) -> None:
-    """A 500 reaches the judge exactly as it did before this change."""
-    path = results_json(AgentResult.errored("HTTP 500 from agent endpoint: agent exploded"))
+    """A non-5xx agent error reaches the judge without being excused as infra."""
+    path = results_json(AgentResult.errored("agent exploded: internal tool failure"))
 
     assert _classify(path, "opentofu").outcome != "infra"
+
+
+def test_an_opening_turn_500_without_trajectory_is_classified_as_infra(
+    results_json: Any,
+) -> None:
+    """An HTTP 500 on the opening turn with empty trajectory and no tokens is infra (#2430)."""
+    path = results_json(AgentResult.errored("HTTP 500 from agent endpoint: agent exploded"))
+
+    assert _classify(path, "opentofu").outcome == "infra"
 
 
 def test_a_scoreless_record_still_blocks(results_json: Any) -> None:
