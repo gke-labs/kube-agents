@@ -1,11 +1,13 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"slices"
 	"sort"
@@ -93,8 +95,13 @@ func runNotify(args []string) error {
 	ctx, cancel := cliContext()
 	defer cancel()
 	client, err := connect(ctx, "notify")
-	if err != nil {
+	if err != nil && busUnreachable(err) {
 		return fmt.Errorf("notify: cannot reach the bus: %v: %w", err, errNotifyRouteUnavailable)
+	}
+	if err != nil {
+		// A refused login or a missing setting will not fix itself by
+		// waiting: a refusal, not "the route is not there right now".
+		return fmt.Errorf("notify: %w", err)
 	}
 	defer client.Close()
 	nc := client.Conn()
@@ -170,6 +177,19 @@ func awaitAnswer(nc *nats.Conn, in *nats.Subscription, timeout time.Duration) (*
 		}
 		return msg, err
 	}
+}
+
+// busUnreachable reports whether a connect failure is the bus not being
+// reachable (no server answering, a refused or timed-out dial) as opposed to
+// the bus refusing this client or the client being misconfigured.
+func busUnreachable(err error) bool {
+	if errors.Is(err, nats.ErrAuthorization) || errors.Is(err, nats.ErrAuthExpired) ||
+		errors.Is(err, nats.ErrAuthRevoked) || errors.Is(err, nats.ErrPermissionViolation) {
+		return false
+	}
+	var opErr *net.OpError
+	return errors.Is(err, nats.ErrNoServers) || errors.Is(err, nats.ErrTimeout) ||
+		errors.Is(err, context.DeadlineExceeded) || errors.As(err, &opErr)
 }
 
 // notifyText is the positional text, or stdin when it is absent, or "-" with

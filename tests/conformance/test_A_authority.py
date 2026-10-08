@@ -861,9 +861,12 @@ class A3TheTaskPlaneSubjectSaysWhoWroteIt(unittest.TestCase):
                 builder for builder, allow in grants.items() if any(self._subject_matches(g, probe) for g in allow)
             )
             self.assertEqual(want, writers, f"principals whose publish grants reach {probe}")
-        self.assertNotIn(
-            "chat.notify",
+        # Matched on the subject and on the Go names a grant would be spelled
+        # with (lib.NotifySubjectGchat, lib.NotifyReplyPrefix): sessionGrants
+        # builds its list from lib constants, never from subject literals.
+        self.assertNotRegex(
             self._session_publish_derivation(),
+            r"chat\.notify|Notify(Subject|Reply)",
             "the callout derives a session a publish grant on the notify route",
         )
 
