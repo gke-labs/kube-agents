@@ -341,6 +341,22 @@ is the `result`, then the one terminal. A failed follow-up turn names itself in 
 gateway's relay reports them as not run at the terminal, unless the gateway restarted too.
 Mid-turn steering through the runs API is gke-labs#2628.
 
+**Upgrade order for steering.** The gateway and the bridge do not roll together. The gateway's
+image follows the operator, but the sidecar's image is whatever the CR names, so until someone
+edits the CR the two can be a release apart, and a rollback produces the reverse skew. Upgrade the
+operator (and with it the gateway) first, then bump the CR's `hermes-bridge` sidecar tag. On a
+rollback, move the sidecar tag back first, then the operator. The two skews look like this:
+
+- **Old gateway, new bridge (the order to avoid).** The old relay has no case for `turn`
+  artifacts, so every earlier turn's answer is dropped. The room gets the old "does not take
+  mid-task input" ack, the notice's text part as "ℹ️ follow-up queued …", and then only the last
+  follow-up's answer. The answer to the original question never posts.
+- **New gateway, old bridge.** Noisy, but nothing is lost. The room gets "✏️ got it, I'll take
+  that next", which is wrong, then the old bridge's "ℹ️ steering received but not absorbed …",
+  and the task's one answer. The gateway posts its "a follow-up arrived as the task finished"
+  line only after it has heard a steer notice from that addressee, and an old bridge sends none,
+  so that false line does not appear.
+
 **Cancel:** SIGTERM to the subprocess's process group, SIGKILL after a grace period,
 then terminal `canceled` (`reason: canceled-by-request`). A task racing to completion may
 land `completed` first - both orders are legal and the terminal event wins. A per-task

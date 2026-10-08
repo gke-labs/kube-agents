@@ -4,8 +4,8 @@
  * here reads the clock or the network — timestamps always arrive on the event
  * so replay and live traffic reduce identically. Lifted from the demo UI and
  * reworked for a2a-jetstream/0.4: kinds changed (`task` → `message`,
- * `message-chunk` is gone), the transcript is driven by the four reserved
- * artifact names, and there are no heartbeats — the `web` user's read surface
+ * `message-chunk` is gone), the transcript is driven by the reserved artifact
+ * names in protocol.ts (`turn` among them), and there are no heartbeats — the `web` user's read surface
  * is `a2a.>` only, and nothing on the install publishes heartbeats yet, so
  * liveness is derived from stream traffic.
  */
