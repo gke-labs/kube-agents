@@ -730,8 +730,11 @@ func TestSteer_TurnsClosedRefusesTaskEnding(t *testing.T) {
 
 // A stalled bus holds a follow-up's notice, never run.mu: the notice
 // publishes with mu released, so a cancel arriving mid-stall still kills the
-// subprocess at once, and the terminal it leads to still lands after the
-// notice once the bus is back (ruling: notices outside run.mu, bounded).
+// subprocess at once, and no notice lands after the terminal once the bus is
+// back (ruling: notices outside run.mu, bounded). The stall is bounded by
+// steerNoticeTimeout, not unbounded: a notice whose publish outlives it is
+// dropped, so the test asserts no notice follows the terminal, not that the
+// queued one landed.
 func TestSteer_StalledNoticeDoesNotHoldRunLock(t *testing.T) {
 	s, url := startServer(t)
 	cmd, started, _ := blockingStub(t)
@@ -2479,7 +2482,7 @@ func TestChunkString_NeverSplitsARune(t *testing.T) {
 
 func TestResumeArgv(t *testing.T) {
 	got, err := resumeArgv([]string{"hermes", "-p", "platform", "chat", "-Q", "-q"}, "sess-9", "and the west")
-	want := []string{"hermes", "-p", "platform", "chat", "-Q", "--resume", "sess-9", "-q", "and the west"}
+	want := []string{"hermes", "-p", "platform", "chat", "-Q", "--resume", "sess-9", "--query=and the west"}
 	if err != nil || !slices.Equal(got, want) {
 		t.Fatalf("resumeArgv = %q, %v; want %q", got, err, want)
 	}
@@ -2488,12 +2491,68 @@ func TestResumeArgv(t *testing.T) {
 	}
 }
 
+// A prompt that starts with "-" is one --query= token on every turn: after a
+// bare -q, Hermes's argparse (hermes_cli/_parser.py, chat's -q/--query)
+// reads "--force" as an option and exits 2, failing the turn. A command not
+// ending in -q gets the prompt appended unchanged.
+func TestPromptArgvKeepsADashLedPromptTheQuery(t *testing.T) {
+	cmd := []string{"hermes", "-p", "platform", "chat", "-Q", "-q"}
+	for _, prompt := range []string{"--force", "-p evil", "--help", "plain words"} {
+		want := []string{"hermes", "-p", "platform", "chat", "-Q", "--query=" + prompt}
+		if got := promptArgv(cmd, prompt); !slices.Equal(got, want) {
+			t.Errorf("promptArgv(%q) = %q, want %q", prompt, got, want)
+		}
+		got, err := resumeArgv(cmd, "sess-9", prompt)
+		if want := []string{"hermes", "-p", "platform", "chat", "-Q", "--resume", "sess-9", "--query=" + prompt}; err != nil || !slices.Equal(got, want) {
+			t.Errorf("resumeArgv(%q) = %q, %v; want %q", prompt, got, err, want)
+		}
+	}
+	if got := promptArgv([]string{"/stub"}, "--force"); !slices.Equal(got, []string{"/stub", "--force"}) {
+		t.Errorf("promptArgv on a non -q command = %q, want the prompt appended", got)
+	}
+	if got := promptArgv(cmd, "x"); &got[0] == &cmd[0] || cmd[len(cmd)-1] != "-q" {
+		t.Error("promptArgv aliased or changed the configured command")
+	}
+}
+
 func TestLastSessionID(t *testing.T) {
 	if got := lastSessionID("noise\nsession_id: nested-1\nmore\nsession_id: sess-2\n"); got != "sess-2" {
 		t.Fatalf("got %q, want the last line's id", got)
 	}
+	if got := lastSessionID("session_id: 20260925_181506_ab12cd\n\n  \n"); got != "20260925_181506_ab12cd" {
+		t.Fatalf("trailing blank lines: got %q, want the id", got)
+	}
 	if got := lastSessionID("session_id:\n"); got != "" {
 		t.Fatalf("an empty label yields %q, want none", got)
+	}
+}
+
+// The id goes into a child's argv after --resume, so one that could read as
+// an option, or carries anything past the id's shape, is no id: the
+// follow-ups are refused no-resume rather than resuming it.
+func TestLastSessionIDRefusesADashLedOrMalformedID(t *testing.T) {
+	for _, stderr := range []string{
+		"session_id: --yolo\n",
+		"session_id: -sess-1\n",
+		"session_id: sess-1 --yolo\n",
+		"session_id: sess/../other\n",
+		"session_id: " + strings.Repeat("a", 129) + "\n",
+	} {
+		if got := lastSessionID(stderr); got != "" {
+			t.Errorf("stderr %q: got %q, want no id", stderr, got)
+		}
+	}
+}
+
+// Only the last non-blank line is the CLI's own: an id followed by more
+// output (a tool's subprocess writing after it, sharing the stream) is not
+// taken, so a turn cannot be pointed at another conversation's session.
+func TestLastSessionIDIsOnlyTheLastNonBlankLine(t *testing.T) {
+	if got := lastSessionID("session_id: sess-1\n[tool] still talking\n"); got != "" {
+		t.Fatalf("got %q, want none: the id line was not last", got)
+	}
+	if got := lastSessionID("session_id: sess-1\nsession_id: other-conv\n"); got != "other-conv" {
+		t.Fatalf("got %q, want the last line's id", got)
 	}
 }
 
@@ -2546,8 +2605,8 @@ func artifactsNamed(t *testing.T, url, taskID, name string) []string {
 }
 
 // resumeStub: turn 1 blocks until release, then every turn answers with its
-// own prompt and the session id; ARGS records each child's argv. resumeExit
-// is the --resume branch's exit code.
+// own prompt (the --query= token's value) and the session id; ARGS records
+// each child's argv. resumeExit is the --resume branch's exit code.
 func resumeStub(t *testing.T, resumeExit int, printSession bool) (cmd []string, started, release, args string) {
 	t.Helper()
 	dir := t.TempDir()
@@ -2558,6 +2617,7 @@ func resumeStub(t *testing.T, resumeExit int, printSession bool) (cmd []string, 
 	}
 	body := fmt.Sprintf(`echo "$*" >> %[3]s
 for last; do :; done
+last=${last#--query=}
 case "$*" in
 *--resume*) echo "answer to $last"; %[4]s; exit %[5]d ;;
 *) touch %[1]s; while [ ! -f %[2]s ]; do sleep 0.05; done; echo "answer to $last"; %[4]s ;;
@@ -2589,7 +2649,7 @@ func TestCLI_FollowUpsRunAsResumedTurnsInOrder(t *testing.T) {
 		t.Fatalf("result = %q, want the last turn's answer only", got)
 	}
 	raw, _ := os.ReadFile(args)
-	want := "-q long question\n--resume sess-1 -q also east\n--resume sess-1 -q and west\n"
+	want := "--query=long question\n--resume sess-1 --query=also east\n--resume sess-1 --query=and west\n"
 	if string(raw) != want {
 		t.Fatalf("argv per child:\n%s\nwant:\n%s", raw, want)
 	}
@@ -2657,15 +2717,15 @@ func TestCLI_NoSessionIDRefusesFollowUpsAndCompletes(t *testing.T) {
 func TestCLI_CancelDuringAFollowUpTurn(t *testing.T) {
 	_, url := startServer(t)
 	dir := t.TempDir()
-	turn2 := filepath.Join(dir, "turn2")
+	turn1, turn2 := filepath.Join(dir, "turn1"), filepath.Join(dir, "turn2")
 	cmd := append(script(t, fmt.Sprintf(`case "$*" in
 *--resume*) touch %s; sleep 30 ;;
-*) echo first; echo "session_id: sess-1" >&2; sleep 1 ;;
-esac`, turn2)), "-q")
+*) touch %s; echo first; echo "session_id: sess-1" >&2; sleep 1 ;;
+esac`, turn2, turn1)), "-q")
 	startBridge(t, url, cmd)
 	c := gatewayClient(t, url)
 	origin := submit(t, c, "task-cli-cancel2", "q")
-	time.Sleep(200 * time.Millisecond) // turn 1 is sleeping its 1s
+	waitStarted(t, turn1) // turn 1 is sleeping its 1s
 	sendSteer(t, c, origin, "second")
 	sendSteer(t, c, origin, "third")
 	waitFor(t, 10*time.Second, "turn 2 running", func() bool { _, err := os.Stat(turn2); return err == nil })
@@ -2709,8 +2769,9 @@ func TestCLI_FollowUpAfterTheQueueClosesIsRefused(t *testing.T) {
 	}
 }
 
-// A follow-up whose own authority does not pass is refused capability when
-// its turn comes and skipped; the next one runs.
+// A follow-up whose capability (the task's, carried on the steer) does not
+// pass is refused capability when its turn comes and skipped; the next one
+// runs.
 func TestCLI_FollowUpWithoutAuthorityIsRefusedAndSkipped(t *testing.T) {
 	_, url := startServer(t)
 	cmd, started, release, args := resumeStub(t, 0, true)
@@ -2740,7 +2801,7 @@ func TestCLI_FollowUpWithoutAuthorityIsRefusedAndSkipped(t *testing.T) {
 		t.Fatalf("notices %+v, want the bare follow-up refused capability on a working status", ns)
 	}
 	raw, _ := os.ReadFile(args)
-	if want := "-q long question\n--resume sess-1 -q and west\n"; string(raw) != want {
+	if want := "--query=long question\n--resume sess-1 --query=and west\n"; string(raw) != want {
 		t.Fatalf("argv per child:\n%s\nwant:\n%s", raw, want)
 	}
 	if got := artifactsNamed(t, url, origin.TaskID, lib.ArtifactResult); !slices.Equal(got, []string{"answer to and west\n"}) {

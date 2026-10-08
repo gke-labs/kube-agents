@@ -845,8 +845,11 @@ func TestAPI_AServerThatStartsLateStillAnswers(t *testing.T) {
 	}
 }
 
-// keyedStub answers like a Hermes server with an idempotency cache: a repeated
-// key replays its first answer. The first request blocks until release closes.
+// keyedStub stands in for a Hermes server's idempotency cache, keyed on the
+// Idempotency-Key alone: a repeated key replays its first answer. The real
+// cache also matches the request body's fingerprint, so this replays more
+// readily than Hermes, which is the strict side for a test that a follow-up
+// never reuses turn 1's key. The first request blocks until release closes.
 func keyedStub(t *testing.T, release <-chan struct{}) *apiStub {
 	var mu sync.Mutex
 	cache := map[string]string{}

@@ -394,8 +394,11 @@ func (b *Bridge) apiTurn(run *taskRun, taskCtx context.Context, sessionID, promp
 		}
 		if !takeSteerLocked(run, steer) {
 			// A finalize has taken the queue (and refused it) and is on its
-			// way to the terminal.
+			// way to the terminal. Unreachable while every finalizer sets a
+			// flag checked above; a request here would contradict its notice.
 			run.mu.Unlock()
+			b.cfg.Logger.Error("follow-up gone from the queue head before its turn; not sending",
+				"task", run.origin.TaskID, "envelope", steer.EnvelopeID)
 			return "", false
 		}
 		run.mu.Unlock()

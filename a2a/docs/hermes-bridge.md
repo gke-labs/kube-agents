@@ -13,7 +13,7 @@ nothing answers on that subject yet - the worker adapter (W4) fast-follows, and 
 dispatcher is stage 3. The bridge is the stand-in executor: a small Go daemon on
 `a2a/lib` that consumes tasks addressed to `platform`, runs each as a turn in its
 conversation's Hermes session through the pod's API server (or, as the fallback, as a
-`hermes -p platform chat -Q -q <prompt>` subprocess; [executors](#executors)), and publishes
+`hermes -p platform chat -Q --query=<prompt>` subprocess; [executors](#executors)), and publishes
 the lifecycle events with the answer as the `result` artifact and the persona's tool calls as
 `activity`. It is scaffolding with a planned demolition date:
 when the dispatcher and worker adapter land, the bridge retires. Nothing here is
@@ -280,7 +280,7 @@ Tool calls from either can land in the wrong task's trace. And when Hermes compr
 session it continues it under a new session id, which the hook reports and the trace's key does
 not match, so the trace stops for that conversation while the answers keep arriving.
 
-**`cli`: a subprocess per task.** `hermes -p <BRIDGE_PROFILE> chat -Q -q <prompt>`, a fresh
+**`cli`: a subprocess per task.** `hermes -p <BRIDGE_PROFILE> chat -Q --query=<prompt>`, a fresh
 session for every task, with no memory of the thread's earlier tasks. Within one task,
 follow-up turns resume the task's session (`--resume`). The rest of this page
 describes it where the two differ.
@@ -322,14 +322,18 @@ terminal event is acked with a warning and nothing else.
 each one with a non-final status carrying the task's current state (`submitted` while queued or
 waiting for the session, `working` after) and a `steerNotice` data part: `queued`, or `refused`
 with `queue-full` (16 already waiting), `task-ending` (the answer was already chosen), `no-text`,
-`capability` (the follow-up's own authority was refused, checked on the worker before its turn),
-`no-resume` (cli: no `session_id:` line to resume, or a command that does not end in `-q`), or
+`capability` (the task's capability, carried on the follow-up, was refused when checked on the worker
+before its turn),
+`no-resume` (cli: stderr's last line is not a well-formed `session_id:` line, or the command does
+not end in `-q`), or
 `task-ended` (the task ended first: cancel, failure, deadline, shutdown). When the current turn
 ends, queued follow-ups run in arrival order as further turns in the same Hermes session: `api`
 posts another turn with the same session headers, under the same session slot, and the
 `Idempotency-Key` `<taskId>/<envelopeId>` (the opening turn's is `<taskId>`), so a follow-up
 never replays the opening answer; `cli` runs
-`hermes -p <profile> chat -Q --resume <session_id> -q <text>`. Each earlier turn's answer is
+`hermes -p <profile> chat -Q --resume <session_id> --query=<text>`. Every turn passes its text as one
+`--query=` token, the opening turn too, so a message that starts with `-` stays the query rather
+than reading as an option. Each earlier turn's answer is
 published as a `turn` artifact as soon as the next turn is about to run; the last turn's answer
 is the `result`, then the one terminal. A failed follow-up turn names itself in the terminal
 (`; turn: N` after the session, on either executor). A follow-up does not change task state

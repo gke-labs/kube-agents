@@ -1,7 +1,7 @@
 // Package hermesbridge is the stand-in executor for tasks addressed to the
 // platform profile: it consumes a2a.tasks.{profile}.*.in, answers each task
 // as a turn on the pod's Hermes API server (one session per contextId) or,
-// on the cli executor, by one `hermes -p {profile} chat -Q -q <prompt>` per
+// on the cli executor, by one `hermes -p {profile} chat -Q --query=<prompt>` per
 // task, with a follow-up message that arrives mid-task queued and run as the
 // next turn in the same session (`--resume` on the cli executor), and
 // publishes the payload spec's lifecycle events with the answer as
@@ -101,8 +101,11 @@ const (
 
 // sessionIDLine is the last thing `hermes chat -Q` writes on stderr:
 // "session_id: <id>". The id finds the transcript under the profile's session
-// store, which is the evidence the status message cannot carry whole.
-var sessionIDLine = regexp.MustCompile(`(?m)^session_id:[ \t]*(\S+)`)
+// store, which is the evidence the status message cannot carry whole, and a
+// follow-up turn resumes it. The id's shape is checked, not just its
+// presence: it lands in a child's argv after --resume, and Hermes's own ids
+// (<timestamp>_<hex>) need nothing wider.
+var sessionIDLine = regexp.MustCompile(`^session_id:[ \t]*([A-Za-z0-9][A-Za-z0-9_.:-]{0,127})$`)
 
 // Config wires one bridge. Zero values get playground defaults in Run.
 type Config struct {
@@ -135,8 +138,9 @@ type Config struct {
 	// carry their own per-task key either way).
 	ActivitySecret string
 	// Command is the CLI executor's invocation prefix; the task prompt is
-	// appended as the final argument. Default: ["hermes", "-p", <profile>,
-	// "chat", "-Q", "-q"].
+	// appended as the final argument, or replaces a trailing -q as one
+	// "--query=<prompt>" token (promptArgv). Default: ["hermes", "-p",
+	// <profile>, "chat", "-Q", "-q"].
 	Command []string
 	// Concurrency caps simultaneous tasks, hermes subprocesses or API
 	// requests (default 2, the platform profile's concurrency in the
@@ -284,8 +288,10 @@ type taskRun struct {
 	// envelope this run has answered, so a redelivery is answered once.
 	// turnsClosed is set when the worker has chosen the current answer as
 	// the deliverable (nothing queued to run) or finalize began: a
-	// follow-up after that is refused task-ending, never queued behind a
-	// terminal. All three under mu.
+	// follow-up after the first is refused task-ending, never queued behind
+	// a terminal. One after finalize began waits on noticeMu, finds the run
+	// done and is dropped with a warning; the gateway's relay reports it as
+	// missed. All three under mu.
 	steers      []*lib.Envelope
 	seenSteers  map[string]bool
 	turnsClosed bool
@@ -708,7 +714,9 @@ func (b *Bridge) lastEventIsFinal(ctx context.Context, taskID string) bool {
 // carrying the task's CURRENT state - a follow-up must not change folded
 // state by itself (assertion 12). The decision is made under mu; the notice
 // goes out under noticeMu with mu released (publishSteerNotices), so it
-// still lands ahead of the final event finalize writes behind noticeMu.
+// still lands ahead of the final event finalize writes behind noticeMu. A
+// follow-up that reaches noticeMu after finalize gets no notice: the run is
+// done, and the gateway's relay counts it as missed.
 func (b *Bridge) queueSteer(ctx context.Context, run *taskRun, steer *lib.Envelope) {
 	run.noticeMu.Lock()
 	defer run.noticeMu.Unlock()
@@ -747,7 +755,8 @@ func (b *Bridge) queueSteer(ctx context.Context, run *taskRun, steer *lib.Envelo
 // queued, for reason, oldest first. The caller holds run.noticeMu and NOT
 // run.mu: the queue is taken under mu and the refusals publish without it.
 // After it returns nothing more can be queued on the run (turnsClosed); a
-// later follow-up is refused task-ending by queueSteer.
+// later follow-up is refused task-ending by queueSteer, unless the run is
+// done by the time it gets noticeMu, when it is dropped.
 func (b *Bridge) refuseQueued(ctx context.Context, run *taskRun, reason string) {
 	run.mu.Lock()
 	run.turnsClosed = true
@@ -794,8 +803,9 @@ func takeSteerLocked(run *taskRun, steer *lib.Envelope) bool {
 	return true
 }
 
-// runnableSteer finds the follow-up to run next: its own authority must pass
-// the capability check, because it is a turn now, not a note. A refused one
+// runnableSteer finds the follow-up to run next: the capability it carries
+// (the task's, minted at submission) must still pass the check, because it
+// is a turn now, not a note: a revoked or expired capability stops it. A refused one
 // is told so, taken off the queue and skipped. Runs on the worker, never on
 // the durable's callback, for capabilityPermits's reason. nil means there is
 // none to run and the caller's answer is the deliverable; anything still
@@ -911,7 +921,7 @@ func steerNoticeText(n lib.SteerNotice) string {
 	case lib.SteerReasonTaskEnded:
 		return prefix + "the task ended before this follow-up's turn, so it never ran. Send it again as a new message."
 	case lib.SteerReasonCapability:
-		return prefix + "its authority was refused (capability), so it did not run."
+		return prefix + "the task's capability no longer passed when its turn came, so it did not run."
 	case lib.SteerReasonNoResume:
 		return prefix + "the conversation could not be continued for it, so it did not run."
 	}
@@ -1241,7 +1251,7 @@ func (b *Bridge) runTask(ctx context.Context, run *taskRun) {
 	})
 	defer deadline.Stop()
 
-	argv := append(append([]string(nil), b.cfg.Command...), prompt)
+	argv := promptArgv(b.cfg.Command, prompt)
 	var steer *lib.Envelope // the follow-up this turn runs; nil on turn 1
 	for turn := 1; ; turn++ {
 		out, stderr, err, spawned := b.cliTurn(run, argv, env, act, steer, deadlineAt)
@@ -1275,29 +1285,54 @@ func (b *Bridge) runTask(ctx context.Context, run *taskRun) {
 	}
 }
 
+// promptArgv is a turn's command: the configured command with the prompt as
+// its final argument. A command ending in Hermes's -q gets the prompt as one
+// "--query=<prompt>" token instead, so a prompt that starts with "-" stays
+// the query: after a bare -q, argparse reads a dash-led token with no space
+// in it ("--force") as an option and the child exits 2, and Hermes's own
+// pre-parse scans match whole tokens ("--help", "--tui", "-p"). Any other
+// command gets the prompt appended as it is.
+func promptArgv(command []string, prompt string) []string {
+	n := len(command)
+	if n == 0 || command[n-1] != "-q" {
+		return append(append([]string(nil), command...), prompt)
+	}
+	return append(append([]string(nil), command[:n-1]...), "--query="+prompt)
+}
+
 // resumeArgv is a follow-up turn's command: the configured command with
-// "--resume <id>" before its trailing -q, then the prompt. A command that
-// does not end in -q has no place for the flag; the follow-ups are refused
-// no-resume rather than guessed at.
+// "--resume <id>" in place of its trailing -q, then the prompt as
+// promptArgv writes it. A command that does not end in -q has no place for
+// the flag; the follow-ups are refused no-resume rather than guessed at.
 func resumeArgv(command []string, sessionID, prompt string) ([]string, error) {
 	n := len(command)
 	if n == 0 || command[n-1] != "-q" {
 		return nil, fmt.Errorf("command %q does not end in -q", command)
 	}
 	argv := append([]string(nil), command[:n-1]...)
-	return append(argv, "--resume", sessionID, "-q", prompt), nil
+	return append(argv, "--resume", sessionID, "--query="+prompt), nil
 }
 
-// lastSessionID is the id on the last "session_id:" line of a child's
-// stderr, or "": the CLI prints its own line last, after anything a tool's
-// nested run echoed, and a label with nothing after it matches nothing, so
-// no id is reported rather than the next line's first word.
+// lastSessionID is the id on a child's last non-blank stderr line, or "".
+// The CLI prints its own "session_id:" line last, after anything a tool's
+// nested run echoed. Only that line is read: stderr is shared with the
+// child's tool subprocesses, so an earlier match may be another session's
+// id, and a later line means the CLI's own was not last. A label with
+// nothing after it, or an id outside sessionIDLine's shape, is no id at all,
+// and a follow-up then has nothing to resume.
 func lastSessionID(stderr string) string {
-	all := sessionIDLine.FindAllStringSubmatch(stderr, -1)
-	if len(all) == 0 {
+	lines := strings.Split(stderr, "\n")
+	for i := len(lines) - 1; i >= 0; i-- {
+		line := strings.TrimRight(lines[i], " \t\r")
+		if line == "" {
+			continue
+		}
+		if m := sessionIDLine.FindStringSubmatch(line); m != nil {
+			return m[1]
+		}
 		return ""
 	}
-	return all[len(all)-1][1]
+	return ""
 }
 
 // cliTurn runs one hermes child for run and waits for it. steer is the
@@ -1332,10 +1367,21 @@ func (b *Bridge) cliTurn(run *taskRun, argv, env []string, act *activityState, s
 		b.finalizeCLIError(run, nil, "", "", 0)
 		return "", "", nil, false
 	}
+	if !first && (len(run.steers) == 0 || run.steers[0] != steer) {
+		// A finalize has taken the queue (and refused it) and is on its
+		// way to the terminal. Unreachable while every finalizer sets a flag
+		// checked above; a child here would contradict its notice.
+		run.mu.Unlock()
+		b.cfg.Logger.Error("follow-up gone from the queue head before its turn; not spawning",
+			"task", run.origin.TaskID, "envelope", steer.EnvelopeID)
+		return "", "", nil, false
+	}
 	if first {
 		run.act.Store(act)
 	}
 	if serr := cmd.Start(); serr != nil {
+		// The follow-up stays at the head: the finalize below refuses it
+		// task-ended.
 		if first {
 			run.act.Store(nil) // no child, so no publisher to join
 		}
@@ -1344,7 +1390,7 @@ func (b *Bridge) cliTurn(run *taskRun, argv, env []string, act *activityState, s
 		return "", "", nil, false
 	}
 	if !first {
-		takeSteerLocked(run, steer) // its turn has started: no notice owed now
+		takeSteerLocked(run, steer) // its turn has started: no notice owed now; at the head, checked above under this lock
 	}
 	run.proc = cmd
 	if first {

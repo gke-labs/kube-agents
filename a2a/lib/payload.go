@@ -100,7 +100,7 @@ const (
 	SteerReasonTaskEnding = "task-ending" // the deliverable was already chosen
 	SteerReasonTaskEnded  = "task-ended"  // the task ended before the follow-up's turn
 	SteerReasonNoText     = "no-text"     // nothing textual to ask
-	SteerReasonCapability = "capability"  // the follow-up's authority was refused
+	SteerReasonCapability = "capability"  // the task's capability, carried on the follow-up, was refused
 	SteerReasonNoResume   = "no-resume"   // the executor could not continue the session
 )
 
