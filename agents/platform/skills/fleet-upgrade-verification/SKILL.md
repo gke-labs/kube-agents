@@ -32,6 +32,9 @@ Neither reads versions against a target.
   --output /opt/data/scratch/fleet_versions.json
 ```
 
+The path is relative to the profile home, `/opt/data/profiles/platform`; from any other working
+directory use the absolute path, `/opt/data/profiles/platform/skills/fleet-upgrade-verification/scripts/fleet_upgrade_report.py`.
+
 - `--project` is repeatable and, when given, is the whole scope. Without it the script takes the
   union of `GCP_PROJECT_ID`, `GKE_PROJECT_ID` and `PROJECT_ID` with `MONITORED_PROJECT_IDS`
   (comma- or whitespace-separated) when set, or with every project visible to
