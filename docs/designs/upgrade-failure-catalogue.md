@@ -104,8 +104,9 @@ after. Dev Progress names the file on `main` that reads the signal, the register
 it, and the pull request that carries it when it is in review; the
 [Scope table](upgrade-readiness-checks.md#scope) in the readiness requirements is the canonical
 record of what is built, and this column adds the case and the in-review item. Every entry has one
-nightly evaluation case planned beyond what is registered, and the tables under "How each failure
-is tested" say row by row whether its fixture exists, so the column does not repeat either. The
+nightly evaluation case, registered where the column names one and planned otherwise, and the
+tables under "How each failure is tested" say row by row whether its fixture exists, so the column
+repeats neither. The
 in-review items are the one part of this section that changes as work merges; the column was last
 reconciled on 2026-10-08.
 
