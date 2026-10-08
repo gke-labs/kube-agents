@@ -66,6 +66,9 @@ TEAM = "T0KAGE"
 CARD = "t_verify"
 QUIET_CARD = "t_verify_quiet"
 QUIET_TITLE = "seeded-a"
+STARTED_CARD = "t_verify_started"
+STARTED_TITLE = "check checkout-gateway"
+STARTED_THREAD = "1700000000.000300"
 RESULT = "1.33.4 = default"
 PLAN_TS = "1700000000.000200"
 PHRASE = "is thinking..."
@@ -284,6 +287,21 @@ async def _drive(module) -> None:
     task = adapter.calls[0][1][0]["tasks"][0]
     if (task["status"], task["title"]) != ("complete", RESULT):
         raise _fail(f"a card with no note settled as {task!r}")
+
+    # A card the turn handed work to holds processing across the turn's clear,
+    # and posts its row, running and titled, when it starts.
+    adapter = _StubAdapter(module)
+    thread = STARTED_THREAD
+    sub = {"platform": "slack", "chat_id": CHANNEL, "thread_id": thread, "task_id": STARTED_CARD}
+    await module.expect_cards(adapter, CHANNEL, TEAM, thread, {STARTED_CARD})
+    await adapter._set_thread_status(CHANNEL, TEAM, thread, "", "clear failed")
+    if not await module.start_row(adapter, sub, STARTED_TITLE):
+        raise _fail(f"a card that started opened no row: {adapter.calls!r}")
+    if [call[0] for call in adapter.calls] != ["setStatus", "post"] or adapter.calls[0] != ("setStatus", "processing"):
+        raise _fail(f"an expected card that started made calls {adapter.calls!r}")
+    task = adapter.calls[1][1][0]["tasks"][0]
+    if (task["status"], task["title"]) != ("in_progress", STARTED_TITLE):
+        raise _fail(f"a card that started showed {task!r}")
     os.environ.pop(FLAG_ENV, None)
 
 
@@ -293,7 +311,8 @@ def main(root: Path = Path("/opt/hermes")) -> None:
     print(
         "slack_ux_status verify: status setter guarded ahead of upstream's body; adapter members in the "
         "shape the runtime calls; "
-        "runtime sends enum statuses on change, titles the session, posts, edits and settles one plan"
+        "runtime sends enum statuses on change, titles the session, posts, edits and settles one plan, "
+        "and holds processing for a card from its turn's end to its row"
     )
 
 

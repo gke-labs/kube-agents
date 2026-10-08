@@ -1088,8 +1088,16 @@ class SlackPlanHookTest(unittest.IsolatedAsyncioTestCase):
         async def settle_delegated(adapter, sub, kind, board=None):
             return None
 
+        self.started = []
+
+        async def start_row(adapter, sub, title=""):
+            test.started.append((sub["task_id"], title))
+            return True
+
         reactions = SimpleNamespace(enabled=lambda: test.flag, settle_delegated=settle_delegated)
-        status = SimpleNamespace(enabled=lambda: test.flag and test.plan, deliver_row=deliver_row, settle_row=settle_row)
+        status = SimpleNamespace(
+            enabled=lambda: test.flag and test.plan, deliver_row=deliver_row, settle_row=settle_row, start_row=start_row,
+        )
         patcher = mock.patch.dict(
             sys.modules,
             {
@@ -1242,6 +1250,32 @@ class SlackPlanHookTest(unittest.IsolatedAsyncioTestCase):
         self.flag = False
         await silent_event(SimpleNamespace(sub=SLACK_SUB, adapter=_Adapter()), SimpleNamespace(kind="archived"))
         self.assertEqual(self.settled, [])
+
+    async def test_a_noteless_heartbeat_opens_the_cards_row(self):
+        # _fmt_heartbeat renders a noteless heartbeat as None, so only silent_event sees it.
+        notification = SimpleNamespace(sub=SLACK_SUB, adapter=_Adapter(), title="check seeded-a")
+        await silent_event(notification, SimpleNamespace(id=4, kind="heartbeat"))
+        self.assertEqual(self.started, [("t_e0c1", "check seeded-a")])
+        self.assertEqual((self.settled, self.rows), ([], []))
+
+    async def test_a_start_a_later_event_settles_in_its_batch_opens_nothing(self):
+        events = [SimpleNamespace(id=4, kind="heartbeat"), SimpleNamespace(id=5, kind="completed")]
+        notification = SimpleNamespace(sub=SLACK_SUB, adapter=_Adapter(), title="t", d={"events": events})
+        await silent_event(notification, events[0])
+        self.assertEqual(self.started, [])
+
+    async def test_a_start_reaches_no_plan_off_slack_or_with_the_flag_off(self):
+        await silent_event(SimpleNamespace(sub=SUB, adapter=_Adapter(), title="t"), SimpleNamespace(id=4, kind="heartbeat"))
+        self.flag = False
+        await silent_event(SimpleNamespace(sub=SLACK_SUB, adapter=_Adapter(), title="t"), SimpleNamespace(id=4, kind="heartbeat"))
+        self.assertEqual(self.started, [])
+
+    async def test_a_failed_start_never_raises(self):
+        async def boom(adapter, sub, title=""):
+            raise RuntimeError("slack down")
+
+        sys.modules["gateway.slack_ux_status"].start_row = boom
+        await silent_event(SimpleNamespace(sub=SLACK_SUB, adapter=_Adapter()), SimpleNamespace(id=4, kind="heartbeat"))
 
     async def test_a_silent_event_never_raises(self):
         async def boom(adapter, sub, kind, result=""):

@@ -3,8 +3,10 @@
 Installed into the image at ``/opt/hermes/gateway/slack_ux_status.py``.
 ``apply_slack_ux_status.py`` makes the Slack adapter's thread-status setter
 and its message-event builder hand over to this module when ``KAGE_SLACK_UX``
-is on, and ``gateway/kanban_progress_lines.py`` calls :func:`deliver_row` and
-:func:`settle_row` for a Slack card. With the flag off none of those callers
+is on, ``gateway/kanban_progress_lines.py`` calls :func:`start_row`,
+:func:`deliver_row` and :func:`settle_row` for a Slack card, and
+``gateway/slack_ux_reactions.py`` calls :func:`expect_cards` for the cards a
+turn opened. With the flag off none of those callers
 reaches anything here. What the blocks look like is
 ``agents/platform/scripts/slack_status.py``; this module decides when to post
 them.
@@ -37,10 +39,14 @@ keeps it. An event alert's thread takes the title the event watcher recorded for
 **One plan per thread.** ``kanban_progress_lines`` rolls each card's progress
 notes into one message per card. With the flag on, a Slack thread instead gets
 one message holding a plan with a row per card, edited in place with
-``chat.update`` as notes arrive. A progress note creates a card's row; a terminal
+``chat.update`` as notes arrive. A card's row opens when the card starts: its
+worker's first automatic heartbeat, which carries no note, reaches
+:func:`start_row` through ``kanban_progress_lines.silent_event``, and the row
+shows the card's title, running, until a note arrives. A progress note opens
+the row of a card that has none yet and adds to it after; a terminal
 event settles it (``complete`` with the card's one-line result, ``error``, or
 ``pending`` for a card waiting on the user). A card that reaches one of those
-without a note gets its row then, already settled, so every card in the thread
+without a row gets its row then, already settled, so every card in the thread
 shows in the plan; a card this process already put on a plan opens no second
 row, so a replayed event or one arriving after its plan was dropped adds
 nothing far down the thread. :func:`settle_row` says whether the plan now
@@ -57,7 +63,11 @@ leave the row running, since the dispatcher retries the card, and
 ``block_loop_detected`` sets it waiting, as ``slack_presenter`` reads them.
 The plan holds the thread's session status: ``processing`` while a row runs,
 ``suspended`` while rows wait on the user and none runs, and a Planning Agent
-turn ending in the thread does not close it under either. Once no row is
+turn ending in the thread does not close it under either. It also holds
+``processing`` for each card a turn in the thread just handed work to until
+that card starts, rolls a note or settles (:func:`expect_cards`, which
+``slack_ux_reactions`` calls as the turn ends, after its acknowledgement has
+posted), so Working… stays on from the acknowledgement to the card's row. Once no row is
 running or waiting, the session is closed and the plan is forgotten here, and
 the thread's next card starts a new plan. A plan with a card that gave up,
 which the breaker parks until it is unblocked, is set aside instead, as a
@@ -92,13 +102,14 @@ session when its cards settle, even if its initial post was refused by Slack.
 A settle still edits a posted plan, best effort, so an edit refused once,
 for a rate limit say, does not leave its rows showing as running. Everything
 here is in process, like the progress-line map: a gateway restart forgets
-the plan, and the next note starts a new one. A
+the plan, and a card still running starts a new one at its next automatic
+heartbeat or note. A
 card that settles after a restart opens its row on a new plan, as a card with
 no note does, and one whose row this process dropped settles with no plan;
 either closes the thread's session, or suspends
 it while the card waits on the user, so the Working… the old process set
 does not stick; it can also clear Working… for another card from before the
-restart that is still running, until that card's next note.
+restart that is still running, until that card's next heartbeat or note.
 """
 
 from __future__ import annotations
@@ -136,8 +147,9 @@ SESSION_REFRESH_SECONDS = 60.0
 #: aside, closing the session unless a card waits on the user. A card whose
 #: terminal event never reaches the thread (a dropped subscription, a lost
 #: event) leaves its row running for good; this stops that row holding Working…
-#: forever, while covering a card's silent stretches, since noteless heartbeats
-#: reach no one.
+#: forever, while covering a card's silent stretches, since a card's noteless
+#: heartbeats after the first move nothing. A card a turn handed work to that
+#: never starts stops holding Working… here too.
 PLAN_HOLD_SECONDS = 1800.0
 
 #: How long a set-aside plan is kept after it was set aside, or after a card
@@ -217,13 +229,20 @@ class _Row:
 
 
 class _Plan:
-    __slots__ = ("expiry", "fallback", "lapse", "rolling", "rows", "team_id", "touched", "ts", "waiting")
+    __slots__ = (
+        "expiry", "fallback", "lapse", "pending", "rolling", "rows", "team_id", "touched", "ts", "waiting",
+    )
 
     def __init__(self, team_id: str) -> None:
         self.ts = ""
         self.team_id = team_id
         self.rows: OrderedDict[str, _Row] = OrderedDict()
         self.fallback = False
+        #: Cards a turn in the thread just handed work to that have not reached
+        #: the plan yet (:func:`expect_cards`). Each holds ``processing`` until
+        #: it starts, rolls a note or settles, so Working… stays on from the
+        #: acknowledgement to the card's row.
+        self.pending: set[str] = set()
         #: Cards whose notes went to a rolling line after the plan fell back.
         #: The plan is kept until each has settled, so none of them opens a
         #: second plan beside its rolling message.
@@ -419,7 +438,7 @@ def _plan_session(chat_id: str, thread_ts: str) -> str:
 
 
 def _running(plan: _Plan) -> bool:
-    return bool(plan.rolling - plan.waiting) or _status.running(plan.rows.values())
+    return bool(plan.pending) or bool(plan.rolling - plan.waiting) or _status.running(plan.rows.values())
 
 
 def _waiting(plan: _Plan) -> bool:
@@ -611,6 +630,7 @@ async def _lapse(adapter: Any, key: tuple, plan: _Plan) -> None:
         key[0], key[1], int(PLAN_HOLD_SECONDS),
     )
     _plans.pop(key, None)
+    plan.pending.clear()  # expected cards that never started hold no longer
     if (plan.ts or plan.rolling) and _held(plan):
         await _set_aside(adapter, key, plan)
     await _session(adapter, key, plan)
@@ -676,7 +696,19 @@ def _roll(adapter: Any, key: tuple, plan: _Plan, card: str) -> None:
 
 
 def _settled(plan: _Plan) -> bool:
-    return not plan.rolling and not any(_live(row) for row in plan.rows.values())
+    return not plan.pending and not plan.rolling and not any(_live(row) for row in plan.rows.values())
+
+
+async def _retire(adapter: Any, key: tuple, plan: _Plan) -> None:
+    """Forget a plan whose cards have all settled, setting it aside if one can still move; else re-arm it."""
+    if _settled(plan):
+        _disarm(plan)
+        if _plans.get(key) is plan:
+            _plans.pop(key, None)
+            if plan.ts and _held(plan):
+                await _set_aside(adapter, key, plan)  # a card that gave up waits there for its unblock
+    else:
+        _arm(adapter, key, plan)
 
 
 def _move(row: _Row, kind: str, result: str = "") -> bool:
@@ -784,14 +816,7 @@ async def _settle_current(
         await _render(adapter, key, plan)
     # A plan that fell back is still forgotten once its cards settle, so the
     # thread's next card tries a plan again.
-    if _settled(plan):
-        _disarm(plan)
-        if _plans.get(key) is plan:
-            _plans.pop(key, None)
-            if plan.ts and _held(plan):
-                await _set_aside(adapter, key, plan)  # a card that gave up waits there for its unblock
-    else:
-        _arm(adapter, key, plan)
+    await _retire(adapter, key, plan)
     return True
 
 
@@ -850,6 +875,7 @@ async def deliver_row(
         await _keep(adapter, key, plan)
     else:
         _plans.move_to_end(key)  # eviction at PLANS_MAX takes the least active thread
+    plan.pending.discard(card)  # on its row now, or rolling
     if plan.fallback:
         _roll(adapter, key, plan, card)
         await _session(adapter, key, plan)
@@ -883,6 +909,81 @@ async def deliver_row(
     return True
 
 
+def _shown(key: tuple, card: str) -> bool:
+    """Whether the card reached one of the thread's plans in this process, or has a row on one."""
+    plans = [*_lapsed.get(key, ()), *([_plans[key]] if key in _plans else [])]
+    return (*key, card) in _seen or any(card in plan.rows for plan in plans)
+
+
+async def start_row(adapter: Any, sub: dict, title: str = "") -> bool:
+    """Put a running row, led by the card's ``title``, on the thread's plan for a card that started.
+
+    ``kanban_progress_lines.silent_event`` calls this for a noteless
+    heartbeat: the first one a worker writes, on its first activity, is the
+    earliest event of a run the notifier delivers. A card already shown in
+    this process, by a row, a note or a settle, moves nothing, so the
+    heartbeats after the first cost a lookup each; so does one on a plan
+    that fell back, which holds ``processing`` for the card while it is
+    pending and rolls its first note. True when the row was posted. A refused
+    post drops the row and leaves the card rolling on the fallen-back plan,
+    as a refused note does.
+    """
+    key = _thread(sub)
+    card = str(sub.get("task_id") or "")
+    if not (key[0] and key[1] and card and hasattr(adapter, "_get_client")) or _shown(key, card):
+        return False
+    plan = _plans.get(key)
+    if plan is not None and plan.fallback:
+        return False
+    _remember(_seen, (*key, card), True, SEEN_MAX)
+    if plan is None:
+        plan = _Plan(str(sub.get("team_id") or ""))
+        await _keep(adapter, key, plan)
+    else:
+        _plans.move_to_end(key)
+    plan.pending.discard(card)
+    row = plan.rows[card] = _Row(card, title)
+    row.status = _status.TASK_RUNNING
+    plan.touched = time.monotonic()
+    if not await _render(adapter, key, plan):
+        del plan.rows[card]  # never shown
+        _roll(adapter, key, plan, card)
+        await _session(adapter, key, plan)
+        return False
+    _arm(adapter, key, plan)
+    await _session(adapter, key, plan)
+    return True
+
+
+async def expect_cards(adapter: Any, chat_id: str, team_id: Any, thread_ts: str, cards: Any) -> None:
+    """Hold ``processing`` on the thread for ``cards``, which a turn there just handed work to.
+
+    ``slack_ux_reactions`` calls this once a turn that opened cards has
+    ended, and for the follow-ups a completed card leaves, so Working… stays
+    on from the acknowledgement until each card's row opens, and from then
+    until the cards settle. A card already shown in this process is left to
+    its row. Each expected card holds until it starts, rolls a note or
+    settles; the plan's :data:`PLAN_HOLD_SECONDS` bounds a card that never
+    does.
+    """
+    if not (chat_id and thread_ts and enabled()):
+        return
+    key = (str(chat_id), str(thread_ts))
+    if not any(card and not _shown(key, str(card)) for card in cards):
+        return
+    plan = _plans.get(key)
+    if plan is None:
+        plan = _Plan(str(team_id or ""))
+        await _keep(adapter, key, plan)
+    else:
+        _plans.move_to_end(key)
+    # After the awaits above, so a card that started during them is not held again.
+    plan.pending |= {str(card) for card in cards if card and not _shown(key, str(card))}
+    plan.touched = time.monotonic()
+    _arm(adapter, key, plan)
+    await _session(adapter, key, plan)
+
+
 async def settle_row(adapter: Any, sub: dict, kind: str, result: str = "", title: str = "") -> bool:
     """Settle the card's row after a terminal event, on the thread's plan and on any set aside.
 
@@ -905,6 +1006,13 @@ async def _settle(adapter: Any, sub: dict, kind: str, result: str, title: str, o
         _remember(_seen, (*key, card), True, SEEN_MAX)
     # Read before the settle, which may forget or set aside the plan it settles.
     plans = [*_lapsed.get(key, ())]
+    current = _plans.get(key)
+    # An expected card that settled, waits or runs again stops holding the
+    # session: its row, if it opens one below, holds it instead. A retried
+    # failure leaves it expected, since the dispatcher runs the card again.
+    expected = current is not None and card in current.pending and (done or status is not None)
+    if expected:
+        current.pending.discard(card)
     sender = await _settle_lapsed(adapter, key, card, kind, status, done, result)
     plan = _plans.get(key)
     plans.append(plan)
@@ -916,6 +1024,14 @@ async def _settle(adapter: Any, sub: dict, kind: str, result: str, title: str, o
     elif opens:
         opened = await _open_settled(adapter, sub, key, card, status, title, result)
         plans.append(opened)
+    if expected and sender is None:
+        # The processing Slack shows is this card's hold, not a Planning Agent
+        # turn's, so it is sent even where _open_settled leaves it. A card that
+        # ended without reaching the plan, or beside a fallen-back one, has its
+        # plan retired here.
+        if opened is None:
+            await _retire(adapter, key, current)
+        await _session(adapter, key, opened or current)
     if sender is None and opened is None and plan is None and not _lapsed.get(key):
         # An archive with no row in this process is cleanup of a card that
         # finished long ago, not a settle: the thread may hold another card.
@@ -969,14 +1085,7 @@ async def _open_settled(
             # Rolling, as a refused note leaves it, so the plan keeps its wait.
             plan.rolling.add(card)
             plan.waiting.add(card)
-    if _settled(plan):
-        _disarm(plan)
-        if _plans.get(key) is plan:
-            _plans.pop(key, None)
-            if plan.ts and _held(plan):
-                await _set_aside(adapter, key, plan)  # a card that gave up waits there for its unblock
-    else:
-        _arm(adapter, key, plan)
+    await _retire(adapter, key, plan)
     sent = _sessions.get(key)
     if _plan_session(*key) or not (sent and sent[0] == _status.SESSION_PROCESSING):
         # With nothing left to hold, a Planning Agent turn working in the
