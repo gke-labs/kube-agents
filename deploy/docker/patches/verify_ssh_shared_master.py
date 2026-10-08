@@ -40,6 +40,14 @@ SSH_RELATIVE = "tools/environments/ssh.py"
 RESULT_RELATIVE = "tools/terminal_tool_result.py"
 SHARED_MASTER_ATTR = "_shared_master"
 HINT_EXIT_CODE = 255
+# What the patched argv must resolve to, as `ssh -G` prints it.
+KEEPALIVE = (("serveraliveinterval", "15"), ("serveralivecountmax", "3"))
+# A bare instance to build the argv from; nothing the gate reads depends on these values.
+PROBE_USER, PROBE_HOST, PROBE_PORT = "agent", "sandbox.example.invalid", 2222
+PROBE_SOCKET = "0123456789abcdef.sock"
+# Apple's ssh resolves the host even under -G and gives up after a DNS timeout; pinning Hostname
+# skips that and changes nothing the gate reads. Tests extend this to pin the config fallback.
+_HOSTNAME_PIN = ["-o", "Hostname=127.0.0.1"]
 
 
 def fail(msg: str) -> None:
@@ -59,19 +67,8 @@ def _import(name: str):
         return None
 
 
-# The host the Dockerfile's own `ssh -G` checks use: the operator's sandbox naming.
-SANDBOX_PROBE_HOST = "probe-shell-0.probe-shell.probe.svc.cluster.local"
-# What the patched argv must resolve to, as `ssh -G` prints it.
-KEEPALIVE = (("serveraliveinterval", "15"), ("serveralivecountmax", "3"))
-
-
 def _ssh_client() -> str | None:
     return "/usr/bin/ssh" if os.path.exists("/usr/bin/ssh") else shutil.which("ssh")
-
-
-# Apple's ssh resolves the host even under -G and gives up after a DNS timeout; pinning Hostname
-# skips that and changes nothing the gate reads.
-_HOSTNAME_PIN = ["-o", "Hostname=127.0.0.1"]
 
 
 def _resolved(ssh_bin: str, args: list[str]) -> dict[str, list[str]] | None:
@@ -138,10 +135,10 @@ def check_ssh(ssh) -> None:
     with tempfile.TemporaryDirectory() as tmp:
         def env(shared: bool):
             e = cls.__new__(cls)
-            e.user, e.host, e.port = "agent", SANDBOX_PROBE_HOST, 2222
+            e.user, e.host, e.port = PROBE_USER, PROBE_HOST, PROBE_PORT
             e._sync_manager = None
             e._shared_master = shared
-            e.control_socket = Path(tmp) / "0123456789abcdef.sock"
+            e.control_socket = Path(tmp) / PROBE_SOCKET
             e.control_socket.touch()
             return e
 

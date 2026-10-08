@@ -104,10 +104,21 @@ def stage(ssh=SSH_STUB, result=RESULT_STUB):
     return root
 
 
+# The gate judges the argv by what `ssh -G` resolves, and a stripped option falls back to the
+# machine's config (OpenSSH's own default for the count is the wanted 3). The tests pin that
+# fallback with a config of their own, which `-F` also uses to shut out the developer's
+# ~/.ssh/config: an intact argv still resolves 15/3 because the command line wins, a stripped
+# one resolves 7 and reds the gate on every machine.
+FALLBACK_CONFIG = "ServerAliveInterval 7\nServerAliveCountMax 7\n"
+
+
 def run_verifier(root):
     import sys
+    cfg = root / "fallback_ssh_config"
+    cfg.write_text(FALLBACK_CONFIG)
     with mock.patch.object(verify, "HERMES", root), mock.patch.object(verify, "FAILURES", []), \
-            mock.patch.object(sys, "path", list(sys.path)):
+            mock.patch.object(sys, "path", list(sys.path)), \
+            mock.patch.object(verify, "_HOSTNAME_PIN", [*verify._HOSTNAME_PIN, "-F", str(cfg)]):
         rc = verify.main()
         return rc, list(verify.FAILURES)
 
@@ -162,31 +173,30 @@ class VerifierTest(unittest.TestCase):
         self.assertIn("carries no hint", joined)
 
     @needs_ssh
-    def test_an_argv_without_the_keep_alive_pair_fails(self):
+    def test_a_stripped_interval_falls_back_and_fails(self):
         root = stage()
         apply(root)
         path = root / SSH_RELATIVE
         path.write_text(path.read_text().replace('"-o", "ServerAliveInterval=15", ', ""))
         rc, failures = run_verifier(root)
         self.assertEqual(rc, 1)
-        # What ssh falls back to is the machine's (a ~/.ssh/config may set its own), so only the
-        # keyword and the expected value are pinned.
-        self.assertRegex("\n".join(failures), r"ssh resolves serveraliveinterval to \S+, expected 15")
+        self.assertIn("ssh resolves serveraliveinterval to 7, expected 15", "\n".join(failures))
 
     @needs_ssh
-    def test_an_argv_without_the_count_fails(self):
+    def test_a_stripped_count_falls_back_and_fails(self):
         root = stage()
         apply(root)
         path = root / SSH_RELATIVE
         path.write_text(path.read_text().replace(', "-o", "ServerAliveCountMax=3"', ""))
         rc, failures = run_verifier(root)
         self.assertEqual(rc, 1)
-        self.assertRegex("\n".join(failures), r"ssh resolves serveralivecountmax to \S+, expected 3")
+        self.assertIn("ssh resolves serveralivecountmax to 7, expected 3", "\n".join(failures))
 
     @needs_ssh
     def test_an_earlier_copy_of_the_interval_fails(self):
         # An upstream `-o ServerAliveInterval=N` placed before the anchor is earlier in argv and
-        # wins under first-value-wins, so the gate refuses any second copy whatever its value.
+        # wins under first-value-wins, so the gate reds on an earlier copy with another value (a
+        # same-valued one changes nothing ssh does and passes).
         root = stage(ssh=SSH_STUB.replace(
             '        cmd = ["ssh"]\n', '        cmd = ["ssh", "-o", "ServerAliveInterval=5"]\n'))
         apply(root)
