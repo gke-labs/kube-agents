@@ -154,28 +154,46 @@ half first: it runs the skill's version table, with no readiness read, and
 collects the target version each cluster's release channel offers and which
 clusters sit below it. A version a cluster is below is pending; a pending
 version the job's ledger has never seen earns the full readiness report at
-once, and a version already reported is refreshed every seven days
-(`UPGRADE_READINESS_REFRESH_DAYS`) while any cluster is still pending it. A
-version no cluster is pending any more is retired from the ledger with one
-line. A tick with nothing due prints nothing, so a quiet day costs no message.
+once, and a version already reported is refreshed every seven days while any
+cluster is still pending it. A version no cluster is pending any more is
+retired from the ledger with one line. A tick with nothing due prints nothing,
+so a quiet day costs no message.
+
+Which clusters it reads is decided on the agent pod: `UPGRADE_READINESS_PROJECTS`
+when set, otherwise the management project and every project a Cluster Agent
+profile's identity names, the roster `stall-watch` follows; with neither, the
+sandbox's configured project. Within those projects the report script
+enumerates every cluster, so a cluster `spec.scope.exclude.clusters` keeps a
+Cluster Agent from is still read here. That read is `gcloud` cluster metadata
+for the version table and, on a report day, one `get-credentials` and one
+`kubectl get pdb,deploy,statefulset -A` per cluster for the readiness grade;
+the budget names those objects in the saved report, which is tenant-written
+text, so the entry declares `risk: high` as `stall-watch` does.
 
 It runs the skill the way `stall-watch` runs `stall_report.py`: the two scripts
 are read from the agent image's `/opt/platform-template/skills/` copy and
 handed to `python3 -I -` in the sandbox on stdin, behind a loader that
 registers `upgrade_readiness` before running `fleet_upgrade_report.main`. The
-sandbox's `/opt/data` is not this pod's, so the loader prints the report back
-as JSON and the job writes the files on this side, under
-`<agent home>/upgrade-readiness/`: `ledger.json`, and one dated `.md` and
-`.json` per report under `reports/<version>/`, with `latest.md` pointing at the
-newest. The report script's rollout record and kubeconfigs go to directories of
-the job's own in the sandbox, so a scheduled run never rewrites what a user's
-own run compares against. Its stdout, one line per report with the counts and
-the file's path, is what `deliver: "chat"` posts; `--dry-run` prints what a
-tick would do and changes nothing.
+loader gives the report a private `tempfile.mkdtemp` directory for its JSON
+output and rollout record, so nothing the model can write to is on the path
+the result crosses, and removes it afterwards; the sandbox's `/opt/data` is
+not this pod's, so the loader prints the report back as JSON and the job
+writes the files on this side, under `<agent home>/upgrade-readiness/`:
+`ledger.json`, and one dated `.md` and `.json` per report under
+`reports/<version>/`, with `latest.md` pointing at the newest. Each run starts
+from an empty rollout record, so a saved report's progress table is a
+first-run baseline, not a week-over-week comparison. Its stdout, one line per
+report with the pending clusters, the blocked ones, and the file's path on the
+gateway pod, is what `deliver: "chat"` posts; the agent's own tools run in the
+sandbox and cannot open that path, which is why the line carries the verdicts.
+`--dry-run` prints what a tick would do and changes nothing.
 
 Daily at 10:10 UTC, after the morning audits and before the US day; the
 version table is a handful of `gcloud` list calls and the readiness report
-runs only on the day a version appears or its week comes round.
+runs only on the day a version appears or its week comes round. The three
+environment knobs (`UPGRADE_READINESS_REFRESH_DAYS`, `_PROJECTS`,
+`_WATCH_HOME`) are for a run started by hand in the pod; the operator's
+`spec.deployment.env` allowlist does not carry them.
 
 ## `kanban-workspace-gc` is neither a watchdog nor a poller
 

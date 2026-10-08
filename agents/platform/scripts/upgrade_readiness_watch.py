@@ -16,6 +16,14 @@ After that the report is refreshed every ``REFRESH_DAYS_DEFAULT`` days while a
 cluster is still pending it, and a version no cluster is pending any more is
 retired from the ledger. A tick with nothing due prints nothing.
 
+Which clusters. The projects come from this pod, not from the sandbox:
+``UPGRADE_READINESS_PROJECTS`` when set, otherwise the management project
+(``GCP_PROJECT_ID``) together with every project a Cluster Agent profile's
+``cluster_identity`` names, the roster the cluster reconciler keeps; with
+neither, the sandbox's ``gcloud config get-value project``. Every cluster in
+those projects is read, including ones ``spec.scope.exclude.clusters`` keeps a
+Cluster Agent from, because the report script enumerates by project.
+
 Where it runs, and how. The agent container carries no ``gcloud`` or
 ``kubectl``; both live in the shell sandbox behind the credential proxy, and
 the sandbox login never executes a file under the agent-owned ``/opt/data``
@@ -25,9 +33,13 @@ the agent image's copy under ``/opt/platform-template``, and handed to
 registers ``upgrade_readiness`` as a module before running
 ``fleet_upgrade_report.main``: the same route ``stall_watch.py`` takes with
 ``stall_report.py``. ``-I`` keeps the sandbox's working directory off the
-module path. The sandbox's ``/opt/data`` is a different directory from this
-pod's, so the loader prints the report back as JSON on stdout and this job
-writes the files on its own side.
+module path. The loader gives the report script a private temporary directory
+of its own (``tempfile.mkdtemp``, owned by the sandbox login and readable by
+nobody else) for its JSON output and its rollout record, reads the output
+back, removes the directory, and prints the report as one JSON envelope after
+a sentinel line; nothing the model can write to is on that path. The sandbox's
+``/opt/data`` is a different directory from this pod's, so the files below
+are written on this side.
 
 What it writes. Under ``<agent home>/upgrade-readiness/``: ``ledger.json``,
 one entry per target version with when it was first seen, when it was last
@@ -35,28 +47,28 @@ reported and which clusters are pending it; and ``reports/<version>/
 <timestamp>.md`` with the tables the skill prints and a header saying why the
 report was produced, beside the same report as ``.json``. ``<agent home>`` is
 ``HERMES_HOME``, the Platform Agent profile when the roster runs this job,
-which is on the data volume and survives a pod restart. The report script's
-own rollout record (``--state-dir``) and kubeconfigs (``--kubeconfig-dir``) go
-to directories of this job's own in the sandbox, so a scheduled run never
-rewrites the record a user's own ``fleet_upgrade_report.py`` run compares
-against, and the kubeconfigs stay where the model cannot read them.
+which is on the data volume and survives a pod restart. The kubeconfigs the
+readiness read needs go to a directory of this job's own under the sandbox
+login's home, where the model cannot read them. Each run starts from an empty
+rollout record, so the progress section of a saved report is a first-run
+baseline, not a comparison with last week.
 
 Stdout is the chat message (``deliver: "chat"``): one line per report
-produced, naming the target version, how many clusters are pending it, how
-many the report graded blocked and ready, where the report is, and when the
-next refresh is due; one line per version retired; and one line when a tick
-fails. A quiet tick prints nothing, and nothing reaches chat. Exit code is 0
-on every path except a ledger that cannot be saved, because a tick whose
-ledger did not save would report the same version as new again tomorrow.
+produced, naming the target version, the clusters pending it, how many the
+report graded blocked and ready and which are blocked, where the report is on
+the gateway pod, and when the next refresh is due; one line per version
+retired; and one line when a tick fails. A quiet tick prints nothing, and
+nothing reaches chat. Exit code is 0 on every path except a ledger or report
+that cannot be written, because a tick whose ledger did not save would report
+the same version as new again tomorrow.
 
 ``UPGRADE_READINESS_REFRESH_DAYS`` overrides the refresh interval,
 ``UPGRADE_READINESS_WATCH_HOME`` the directory the ledger and reports live in,
-and ``UPGRADE_READINESS_PROJECTS`` (comma-separated) the projects the report
-enumerates; without it the report script's own project discovery applies,
-``MONITORED_PROJECT_IDS`` first, then every project ``gcloud projects list``
-returns. ``--dry-run`` runs the version table and the gate and prints what a
-real tick would do without running the readiness report or touching the
-ledger.
+and ``UPGRADE_READINESS_PROJECTS`` (comma-separated) the projects. These are
+for a run started by hand in the pod; the operator's ``spec.deployment.env``
+allowlist does not carry them. ``--dry-run`` runs the version table and the
+gate and prints what a real tick would do without running the readiness report
+or touching the ledger.
 """
 
 from __future__ import annotations
@@ -64,11 +76,13 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import subprocess
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import gitops_workspace  # noqa: E402
 import sandbox_exec  # noqa: E402
 
 # Where the job keeps its ledger and reports, under the agent home.
@@ -78,6 +92,7 @@ WATCH_HOME_ENV = "UPGRADE_READINESS_WATCH_HOME"
 WATCH_DIR_NAME = "upgrade-readiness"
 LEDGER_FILE_NAME = "ledger.json"
 LEDGER_TMP_SUFFIX = ".tmp"
+LEDGER_SCHEMA_KEY = "schema_version"
 LEDGER_SCHEMA_VERSION = 1
 REPORTS_DIR_NAME = "reports"
 REPORT_MARKDOWN_SUFFIX = ".md"
@@ -89,8 +104,16 @@ JSON_INDENT = 2
 # The refresh interval: a report per new version, then one a week while pending.
 REFRESH_DAYS_ENV = "UPGRADE_READINESS_REFRESH_DAYS"
 REFRESH_DAYS_DEFAULT = 7
+
+# Which projects the report enumerates, resolved on this side.
 PROJECTS_ENV = "UPGRADE_READINESS_PROJECTS"
 PROJECTS_SEPARATOR = ","
+MANAGEMENT_PROJECT_ENV = "GCP_PROJECT_ID"
+PROFILES_DIR = "profiles"
+IDENTITY_PROJECT_KEY = "project"
+CONFIG_PROJECT_ARGV = ("gcloud", "config", "get-value", "project")
+PROJECT_LOOKUP_TIMEOUT_SECONDS = 30
+PROJECT_FLAG = "--project"
 
 # The skill's scripts: the agent image's copy first, the checkout's beside this
 # file for a run from the repository.
@@ -105,10 +128,18 @@ PYTHON_SOURCE_SUFFIX = ".py"
 PYTHON_EXECUTABLE = "python3"
 PYTHON_ISOLATED_FLAG = "-I"
 STDIN_SCRIPT_ARG = "-"
-SANDBOX_OUTPUT_PATH = "/tmp/upgrade-readiness-watch/report.json"
-SANDBOX_STATE_DIR = "/tmp/upgrade-readiness-watch/state"
+SANDBOX_TMP_PREFIX = "upgrade-readiness-watch-"
+SANDBOX_OUTPUT_NAME = "report.json"
+SANDBOX_STATE_DIR_NAME = "state"
 SANDBOX_KUBECONFIG_DIR = "/home/hermes/.kubeconfigs/upgrade-readiness-watch"
+OUTPUT_FLAG = "--output"
+STATE_DIR_FLAG = "--state-dir"
+READINESS_FLAG = "--readiness"
+KUBECONFIG_DIR_FLAG = "--kubeconfig-dir"
 ENVELOPE_SENTINEL = "__UPGRADE_READINESS_WATCH_ENVELOPE__"
+ENVELOPE_EXIT_KEY = "exit"
+ENVELOPE_TABLES_KEY = "tables"
+ENVELOPE_REPORT_KEY = "report"
 VERSION_TABLE_TIMEOUT_SECONDS = 600
 READINESS_TIMEOUT_SECONDS = 1500
 STDERR_EXCERPT_CHARS = 300
@@ -119,6 +150,8 @@ STATUS_KEY = "status"
 TARGET_KEY = "target_version"
 READINESS_KEY = "readiness"
 ERRORS_KEY = "errors"
+MESSAGE_KEY = "message"
+MEMBER_ID_KEYS = ("project", "location", "cluster")
 BEHIND_STATUSES = frozenset({"lagging", "patch-behind"})
 READINESS_BLOCKED = "blocked"
 READINESS_READY = "ready"
@@ -131,21 +164,31 @@ LAST_REPORT_KEY = "last_report_at"
 PENDING_KEY = "pending"
 LAST_TICK_KEY = "last_tick"
 REASON_NEW = "new target version"
-REASON_REFRESH = "weekly refresh"
+REASON_REFRESH = "scheduled refresh"
 
 # Output.
 LINE_PREFIX = "upgrade readiness"
 RETIRED_LINE = "{prefix}: {version} is no longer pending on any cluster; retired from the watch"
 REPORT_LINE = (
-    "{prefix}: {reason} {version}, {pending} cluster(s) pending ({names}): {blocked} blocked, {ready} ready; "
-    "report at {path}; next refresh after {next_date}"
+    "{prefix}: {reason} {version}, {pending} cluster(s) pending ({names}): {blocked} blocked{blocked_names}, "
+    "{ready} ready; report on the gateway pod at {path}; next refresh after {next_date}"
 )
+BLOCKED_NAMES = " ({names})"
 FAILED_LINE = "{prefix} watch: {what} failed: {detail}"
-DRY_RUN_PREFIX = "dry run:"
+FAILED_WHAT_TICK = "the tick"
+FAILED_WHAT_WRITE = "writing the ledger or the report"
+TIMED_OUT_DETAIL = "the sandbox run timed out after {seconds}s"
+DRY_RUN_WOULD_REPORT = "dry run: would report {version} ({reason}) for {names}"
+DRY_RUN_NOTHING_DUE = "dry run: nothing due; pending versions: {versions}"
+NONE_WORD = "none"
 MAX_NAMES_IN_LINE = 6
 NAMES_OVERFLOW = ", +{more} more"
-LEDGER_UNSAVED_EXIT = 2
+WRITE_FAILED_EXIT = 2
 DATE_FORMAT = "%Y-%m-%d"
+
+
+class WriteFailed(Exception):
+    """The ledger or a report file could not be written; the tick's result must not be claimed."""
 
 
 def now_utc() -> datetime:
@@ -182,13 +225,50 @@ def watch_home() -> Path:
     return Path(os.environ.get(HOME_ENV, DEFAULT_HOME)) / WATCH_DIR_NAME
 
 
-def projects_argument() -> list[str]:
-    raw = os.environ.get(PROJECTS_ENV, "")
-    projects = [p.strip() for p in raw.split(PROJECTS_SEPARATOR) if p.strip()]
-    argv: list[str] = []
-    for project in projects:
-        argv += ["--project", project]
-    return argv
+# --- which projects ----------------------------------------------------------
+
+
+def roster_projects() -> set[str]:
+    """The projects the Cluster Agent profiles' identities name, as
+    stall_watch.py reads them; a profile whose identity cannot be read names none."""
+    from cluster_agent_profile import RESERVED_PROFILES, read_cluster_identity  # lazy, as in stall_watch
+
+    base = Path(gitops_workspace.agent_home()) / PROFILES_DIR
+    if not base.is_dir():
+        return set()
+    projects: set[str] = set()
+    for home in base.iterdir():
+        if home.name in RESERVED_PROFILES or not home.is_dir():
+            continue
+        try:
+            identity = read_cluster_identity(home)
+        except Exception:  # noqa: BLE001 - any unreadable file is an absent identity
+            identity = None
+        if identity and identity.get(IDENTITY_PROJECT_KEY):
+            projects.add(identity[IDENTITY_PROJECT_KEY])
+    return projects
+
+
+def projects() -> list[str]:
+    explicit = [p.strip() for p in os.environ.get(PROJECTS_ENV, "").split(PROJECTS_SEPARATOR) if p.strip()]
+    if explicit:
+        return sorted(set(explicit))
+    found = roster_projects()
+    management = os.environ.get(MANAGEMENT_PROJECT_ENV, "").strip()
+    if management:
+        found.add(management)
+    if found:
+        return sorted(found)
+    completed = sandbox_exec.run(list(CONFIG_PROJECT_ARGV), timeout=PROJECT_LOOKUP_TIMEOUT_SECONDS, check=False)
+    configured = (completed.stdout or "").strip()
+    return [configured] if configured else []
+
+
+def project_flags(names: list[str]) -> list[str]:
+    flags: list[str] = []
+    for name in names:
+        flags += [PROJECT_FLAG, name]
+    return flags
 
 
 # --- the sandbox hop -------------------------------------------------------
@@ -206,67 +286,75 @@ def skill_scripts_dir() -> Path:
 def loader_source(argv: list[str]) -> str:
     """The program ``python3 -I -`` runs in the sandbox: both skill scripts as
     string literals, the readiness module registered first so the report's
-    ``import upgrade_readiness`` resolves, then ``main`` with ``argv``, its
-    tables captured, and one JSON envelope printed after a sentinel line."""
+    ``import upgrade_readiness`` resolves, then ``main`` with ``argv`` plus an
+    output path and a rollout record inside a private temporary directory, its
+    tables captured, the directory removed, and one JSON envelope printed after
+    a sentinel line."""
     scripts = skill_scripts_dir()
-    readiness_src = (scripts / (READINESS_MODULE + PYTHON_SOURCE_SUFFIX)).read_text(encoding="utf-8")
-    report_src = (scripts / (REPORT_MODULE + PYTHON_SOURCE_SUFFIX)).read_text(encoding="utf-8")
+    readiness_path = scripts / (READINESS_MODULE + PYTHON_SOURCE_SUFFIX)
+    report_path = scripts / (REPORT_MODULE + PYTHON_SOURCE_SUFFIX)
     return "\n".join(
         [
-            "import contextlib, io, json, os, sys, types",
-            f"READINESS_SRC = {json.dumps(readiness_src)}",
-            f"REPORT_SRC = {json.dumps(report_src)}",
+            "import contextlib, io, json, os, shutil, sys, tempfile, types",
+            f"READINESS_SRC = {json.dumps(readiness_path.read_text(encoding='utf-8'))}",
+            f"REPORT_SRC = {json.dumps(report_path.read_text(encoding='utf-8'))}",
             f"ARGV = {json.dumps(argv)}",
-            f"OUTPUT = {json.dumps(SANDBOX_OUTPUT_PATH)}",
             f"SENTINEL = {json.dumps(ENVELOPE_SENTINEL)}",
             f"readiness = types.ModuleType({json.dumps(READINESS_MODULE)})",
-            f"readiness.__file__ = {json.dumps(str(scripts / (READINESS_MODULE + PYTHON_SOURCE_SUFFIX)))}",
-            f"exec(compile(READINESS_SRC, readiness.__file__, 'exec'), readiness.__dict__)",
+            f"readiness.__file__ = {json.dumps(str(readiness_path))}",
+            "exec(compile(READINESS_SRC, readiness.__file__, 'exec'), readiness.__dict__)",
             f"sys.modules[{json.dumps(READINESS_MODULE)}] = readiness",
             f"report = types.ModuleType({json.dumps(REPORT_MODULE)})",
-            f"report.__file__ = {json.dumps(str(scripts / (REPORT_MODULE + PYTHON_SOURCE_SUFFIX)))}",
+            f"report.__file__ = {json.dumps(str(report_path))}",
             "exec(compile(REPORT_SRC, report.__file__, 'exec'), report.__dict__)",
-            "os.makedirs(os.path.dirname(OUTPUT), exist_ok=True)",
+            f"private = tempfile.mkdtemp(prefix={json.dumps(SANDBOX_TMP_PREFIX)})",
+            f"output = os.path.join(private, {json.dumps(SANDBOX_OUTPUT_NAME)})",
+            f"state = os.path.join(private, {json.dumps(SANDBOX_STATE_DIR_NAME)})",
             "tables = io.StringIO()",
-            "with contextlib.redirect_stdout(tables):",
-            "    code = report.main(ARGV)",
             "data = None",
-            "if os.path.exists(OUTPUT):",
-            "    with open(OUTPUT, encoding='utf-8') as handle:",
-            "        data = json.load(handle)",
-            "    os.remove(OUTPUT)",
+            "try:",
+            "    with contextlib.redirect_stdout(tables):",
+            f"        code = report.main(ARGV + [{json.dumps(OUTPUT_FLAG)}, output, {json.dumps(STATE_DIR_FLAG)}, state])",
+            "    if os.path.exists(output):",
+            "        with open(output, encoding='utf-8') as handle:",
+            "            data = json.load(handle)",
+            "finally:",
+            "    shutil.rmtree(private, ignore_errors=True)",
             "print(SENTINEL)",
-            "print(json.dumps({'exit': code, 'tables': tables.getvalue(), 'report': data}))",
+            f"print(json.dumps({{{json.dumps(ENVELOPE_EXIT_KEY)}: code, {json.dumps(ENVELOPE_TABLES_KEY)}: tables.getvalue(), {json.dumps(ENVELOPE_REPORT_KEY)}: data}}))",
             "",
         ]
     )
 
 
-def report_argv(readiness: bool) -> list[str]:
-    argv = ["--output", SANDBOX_OUTPUT_PATH, "--state-dir", SANDBOX_STATE_DIR] + projects_argument()
+def report_argv(names: list[str], readiness: bool) -> list[str]:
+    argv = project_flags(names)
     if readiness:
-        argv += ["--readiness", "--kubeconfig-dir", SANDBOX_KUBECONFIG_DIR]
+        argv += [READINESS_FLAG, KUBECONFIG_DIR_FLAG, SANDBOX_KUBECONFIG_DIR]
     return argv
 
 
-def run_report(readiness: bool) -> dict:
+def run_report(names: list[str], readiness: bool) -> dict:
     """Run the skill's report in the sandbox and return the envelope:
     ``{"exit": int, "tables": str, "report": dict | None}``."""
-    argv = report_argv(readiness)
     timeout = READINESS_TIMEOUT_SECONDS if readiness else VERSION_TABLE_TIMEOUT_SECONDS
-    completed = sandbox_exec.run(
-        [PYTHON_EXECUTABLE, PYTHON_ISOLATED_FLAG, STDIN_SCRIPT_ARG],
-        timeout=timeout,
-        check=False,
-        stdin=loader_source(argv),
-    )
+    try:
+        completed = sandbox_exec.run(
+            [PYTHON_EXECUTABLE, PYTHON_ISOLATED_FLAG, STDIN_SCRIPT_ARG],
+            timeout=timeout,
+            check=False,
+            stdin=loader_source(report_argv(names, readiness)),
+        )
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(TIMED_OUT_DETAIL.format(seconds=timeout)) from None
     stdout = completed.stdout or ""
+    excerpt = " ".join((completed.stderr or "").split())[:STDERR_EXCERPT_CHARS]
     if ENVELOPE_SENTINEL not in stdout:
-        detail = " ".join((completed.stderr or stdout).split())[:STDERR_EXCERPT_CHARS]
+        detail = excerpt or " ".join(stdout.split())[:STDERR_EXCERPT_CHARS]
         raise RuntimeError(f"sandbox exited {completed.returncode} without a report: {detail}")
     envelope = json.loads(stdout.rsplit(ENVELOPE_SENTINEL, 1)[1].strip())
-    if not isinstance(envelope.get("report"), dict):
-        raise RuntimeError(f"report script exited {envelope.get('exit')} and wrote no report")
+    if not isinstance(envelope.get(ENVELOPE_REPORT_KEY), dict):
+        raise RuntimeError(f"report script exited {envelope.get(ENVELOPE_EXIT_KEY)} and wrote no report: {excerpt}")
     return envelope
 
 
@@ -274,7 +362,7 @@ def run_report(readiness: bool) -> dict:
 
 
 def member_key(member: dict) -> str:
-    return MEMBER_KEY_SEPARATOR.join(str(member.get(k, "")) for k in ("project", "location", "cluster"))
+    return MEMBER_KEY_SEPARATOR.join(str(member.get(k, "")) for k in MEMBER_ID_KEYS)
 
 
 def pending_targets(report: dict) -> dict[str, list[str]]:
@@ -289,7 +377,7 @@ def pending_targets(report: dict) -> dict[str, list[str]]:
 
 
 def empty_ledger() -> dict:
-    return {"schema_version": LEDGER_SCHEMA_VERSION, TARGETS_KEY: {}, LAST_TICK_KEY: None}
+    return {LEDGER_SCHEMA_KEY: LEDGER_SCHEMA_VERSION, TARGETS_KEY: {}, LAST_TICK_KEY: None}
 
 
 def load_ledger(path: Path) -> dict:
@@ -336,18 +424,21 @@ def decide(ledger: dict, pending: dict[str, list[str]], now: datetime, days: int
 # --- the report files ------------------------------------------------------
 
 
-def readiness_counts(report: dict, clusters: list[str]) -> tuple[int, int]:
-    blocked = ready = 0
+def readiness_verdicts(report: dict, clusters: list[str]) -> tuple[list[str], list[str]]:
+    """The blocked and the ready clusters among ``clusters``, by member key."""
     wanted = set(clusters)
+    blocked: list[str] = []
+    ready: list[str] = []
     for member in report.get(MEMBERS_KEY) or []:
-        if member_key(member) not in wanted:
+        key = member_key(member)
+        if key not in wanted:
             continue
         status = (member.get(READINESS_KEY) or {}).get(STATUS_KEY)
         if status == READINESS_BLOCKED:
-            blocked += 1
+            blocked.append(key)
         elif status == READINESS_READY:
-            ready += 1
-    return blocked, ready
+            ready.append(key)
+    return sorted(blocked), sorted(ready)
 
 
 def cluster_names(clusters: list[str]) -> str:
@@ -359,23 +450,26 @@ def cluster_names(clusters: list[str]) -> str:
 
 
 def render_markdown(version: str, reason: str, clusters: list[str], envelope: dict, now: datetime, days: int) -> str:
-    report = envelope["report"]
-    blocked, ready = readiness_counts(report, clusters)
+    report = envelope[ENVELOPE_REPORT_KEY]
+    blocked, ready = readiness_verdicts(report, clusters)
     lines = [
         f"# Upgrade readiness for {version}",
         "",
         f"Produced {iso(now)} by the `upgrade-readiness-watch` job: {reason}. "
         f"{len(clusters)} cluster(s) are below this version: {', '.join(clusters)}. "
-        f"Of those the readiness check graded {blocked} blocked and {ready} ready. "
+        f"Of those the readiness check graded {len(blocked)} blocked"
+        + (f" ({', '.join(blocked)})" if blocked else "")
+        + f" and {len(ready)} ready. "
         f"The next scheduled refresh is after {(now + timedelta(days=days)).strftime(DATE_FORMAT)} "
         "while any cluster is still pending; ask the Platform Agent for the report at any time to refresh it sooner.",
         "",
         "The tables below are what `fleet_upgrade_report.py --readiness` printed. A `blocked` member names what "
         "blocks it; fix that before scheduling the upgrade. A member graded on this version's channel default "
-        "shows `channel default` in its target column.",
+        "shows `channel default` in its target column. The progress table is a first-run baseline: each "
+        "scheduled run starts from an empty rollout record, so it does not compare with the previous report.",
         "",
         "```",
-        envelope.get("tables", "").rstrip(),
+        envelope.get(ENVELOPE_TABLES_KEY, "").rstrip(),
         "```",
         "",
     ]
@@ -384,8 +478,8 @@ def render_markdown(version: str, reason: str, clusters: list[str], envelope: di
         lines.append("Reads that failed during this run, and so are not graded:")
         lines.append("")
         for error in errors:
-            where = MEMBER_KEY_SEPARATOR.join(str(error.get(k)) for k in ("project", "location", "cluster") if error.get(k))
-            lines.append(f"- {where}: {error.get('message', '')}")
+            where = MEMBER_KEY_SEPARATOR.join(str(error.get(k)) for k in MEMBER_ID_KEYS if error.get(k))
+            lines.append(f"- {where}: {error.get(MESSAGE_KEY, '')}")
         lines.append("")
     return "\n".join(lines)
 
@@ -397,7 +491,7 @@ def write_report(home: Path, version: str, reason: str, clusters: list[str], env
     markdown = directory / (stamp + REPORT_MARKDOWN_SUFFIX)
     markdown.write_text(render_markdown(version, reason, clusters, envelope, now, days), encoding="utf-8")
     (directory / (stamp + REPORT_JSON_SUFFIX)).write_text(
-        json.dumps(envelope["report"], indent=JSON_INDENT) + "\n", encoding="utf-8"
+        json.dumps(envelope[ENVELOPE_REPORT_KEY], indent=JSON_INDENT) + "\n", encoding="utf-8"
     )
     latest = directory / LATEST_LINK_NAME
     if latest.is_symlink() or latest.exists():
@@ -415,22 +509,26 @@ def tick(dry_run: bool = False) -> list[str]:
     home = watch_home()
     ledger_path = home / LEDGER_FILE_NAME
     ledger = load_ledger(ledger_path)
-    versions = run_report(readiness=False)
-    pending = pending_targets(versions["report"])
+    names = projects()
+    versions = run_report(names, readiness=False)
+    pending = pending_targets(versions[ENVELOPE_REPORT_KEY])
     due, retired = decide(ledger, pending, now, days)
     lines = [RETIRED_LINE.format(prefix=LINE_PREFIX, version=v) for v in retired]
     if dry_run:
         for version, reason in due.items():
-            lines.append(f"{DRY_RUN_PREFIX} would report {version} ({reason}) for {cluster_names(pending[version])}")
+            lines.append(DRY_RUN_WOULD_REPORT.format(version=version, reason=reason, names=cluster_names(pending[version])))
         if not due:
-            lines.append(f"{DRY_RUN_PREFIX} nothing due; pending versions: {', '.join(sorted(pending)) or 'none'}")
+            lines.append(DRY_RUN_NOTHING_DUE.format(versions=", ".join(sorted(pending)) or NONE_WORD))
         return lines
     if due:
-        readiness = run_report(readiness=True)
+        readiness = run_report(names, readiness=True)
         for version, reason in due.items():
             clusters = pending[version]
-            path = write_report(home, version, reason, clusters, readiness, now, days)
-            blocked, ready = readiness_counts(readiness["report"], clusters)
+            try:
+                path = write_report(home, version, reason, clusters, readiness, now, days)
+            except OSError as exc:
+                raise WriteFailed(str(exc)) from exc
+            blocked, ready = readiness_verdicts(readiness[ENVELOPE_REPORT_KEY], clusters)
             ledger[TARGETS_KEY][version][LAST_REPORT_KEY] = iso(now)
             lines.append(
                 REPORT_LINE.format(
@@ -439,14 +537,18 @@ def tick(dry_run: bool = False) -> list[str]:
                     version=version,
                     pending=len(clusters),
                     names=cluster_names(clusters),
-                    blocked=blocked,
-                    ready=ready,
+                    blocked=len(blocked),
+                    blocked_names=BLOCKED_NAMES.format(names=cluster_names(blocked)) if blocked else "",
+                    ready=len(ready),
                     path=path,
                     next_date=(now + timedelta(days=days)).strftime(DATE_FORMAT),
                 )
             )
     ledger[LAST_TICK_KEY] = iso(now)
-    save_ledger(ledger_path, ledger)
+    try:
+        save_ledger(ledger_path, ledger)
+    except OSError as exc:
+        raise WriteFailed(str(exc)) from exc
     return lines
 
 
@@ -456,11 +558,11 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         lines = tick(dry_run=args.dry_run)
-    except OSError as exc:
-        print(FAILED_LINE.format(prefix=LINE_PREFIX, what="saving the ledger or the report", detail=exc))
-        return LEDGER_UNSAVED_EXIT
+    except WriteFailed as exc:
+        print(FAILED_LINE.format(prefix=LINE_PREFIX, what=FAILED_WHAT_WRITE, detail=exc))
+        return WRITE_FAILED_EXIT
     except Exception as exc:  # noqa: BLE001 - one line to chat, never a traceback
-        print(FAILED_LINE.format(prefix=LINE_PREFIX, what="the tick", detail=f"{type(exc).__name__}: {exc}"))
+        print(FAILED_LINE.format(prefix=LINE_PREFIX, what=FAILED_WHAT_TICK, detail=f"{type(exc).__name__}: {exc}"))
         return 0
     for line in lines:
         print(line)

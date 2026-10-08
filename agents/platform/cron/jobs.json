@@ -250,7 +250,7 @@
       "skills": [],
       "no_agent": true,
       "script": "upgrade_readiness_watch.py",
-      "risk": "low",
+      "risk": "high",
       "enabled": true,
       "deliver": "chat"
     },
