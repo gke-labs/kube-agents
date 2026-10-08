@@ -387,8 +387,19 @@ class FlagSetIsNextTest(unittest.TestCase):
             f"operator.extraEnv[8].name={go_constant(_A2A_BRIDGE, 'a2aBridgeExecutorOperatorEnvVar')}",
             "--set-string",
             f"operator.extraEnv[8].value={consts['BRIDGE_EXECUTOR_PINNED']}",
+            # The cli pin's resources (#2748), a JSON value, so the entry goes
+            # in whole through --set-json.
+            "--set-json",
+            "operator.extraEnv[9]="
+            + json.dumps(
+                {"name": go_constant(_A2A_BRIDGE, "a2aBridgeResourcesOperatorEnvVar"), "value": consts["MODE_NEXT_BRIDGE_RESOURCES"]},
+                separators=(",", ":"),
+            ),
         ]
         self.assertEqual(args, expected)
+        # The value is a ResourceRequirements the operator can read.
+        resources = json.loads(consts["MODE_NEXT_BRIDGE_RESOURCES"])
+        self.assertEqual(set(resources), {"requests", "limits"})
         # The chart renders the value the array names, last in the container's env.
         self.assertIn(".Values.operator.extraEnv", text(_OPERATOR_TEMPLATE))
         # And the release expands the array.
@@ -424,6 +435,7 @@ class FlagSetIsNextTest(unittest.TestCase):
             ("A2A_BRIDGE_IMAGE_ENV_VAR", "a2aBridgeImageEnvVar"),
             ("A2A_BRIDGE_CONCURRENCY_ENV_VAR", "a2aBridgeConcurrencyOperatorEnvVar"),
             ("A2A_BRIDGE_EXECUTOR_ENV_VAR", "a2aBridgeExecutorOperatorEnvVar"),
+            ("A2A_BRIDGE_RESOURCES_ENV_VAR", "a2aBridgeResourcesOperatorEnvVar"),
         ):
             with self.subTest(const=const):
                 self.assertEqual(consts[const], go_constant(_A2A_BRIDGE, go_name))

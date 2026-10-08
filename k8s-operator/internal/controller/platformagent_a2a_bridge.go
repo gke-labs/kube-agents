@@ -17,12 +17,15 @@ limitations under the License.
 package controller
 
 import (
+	"encoding/json"
+	"fmt"
 	"os"
 	"strconv"
 	"strings"
 	"sync"
 
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
@@ -89,6 +92,12 @@ const (
 	// was created before this at the floor is refused by the provision Job
 	// with the remedy named (recreate TASKS or lower maxSessions).
 	a2aRenderedBridgeDefaultConcurrency = 10
+
+	// a2aBridgeResourcesOperatorEnvVar overrides the rendered bridge's
+	// resources: a corev1.ResourceRequirements in JSON, used whole. Unset, or
+	// not one the operator can read, the bridge gets a2aRenderedBridgeResources'
+	// defaults.
+	a2aBridgeResourcesOperatorEnvVar = "A2A_BRIDGE_RESOURCES"
 
 	// a2aBridgeConcurrencyOperatorEnvVar sets the rendered bridge's
 	// BRIDGE_CONCURRENCY: an operator setting, like the other next-only
@@ -332,6 +341,63 @@ func buildA2ABridgeContainer(agent *agentv1alpha1.PlatformAgent, agentContainer 
 		EnvFrom:         agentContainer.EnvFrom,
 		VolumeMounts:    mounts,
 		SecurityContext: agentContainer.SecurityContext.DeepCopy(),
-		Resources:       *agentContainer.Resources.DeepCopy(),
+		Resources:       a2aRenderedBridgeResources(),
 	}
 }
+
+// a2aRenderedBridgeDefaultResources sizes the rendered bridge for the api
+// executor, the default: a Go relay to the agent container's API server, where
+// the turn itself runs. Measured idle at 1m CPU and 4-5Mi on three next
+// installs (gke-labs#2748); the request leaves headroom for concurrent relays,
+// and the limit is generous so a burst doesn't OOM it. The cli executor runs
+// a one-shot hermes chat per task (about 430Mi each, up to BRIDGE_CONCURRENCY
+// of them) and needs A2A_BRIDGE_RESOURCES set; it doesn't fit these.
+func a2aRenderedBridgeDefaultResources() corev1.ResourceRequirements {
+	return corev1.ResourceRequirements{
+		Requests: corev1.ResourceList{
+			corev1.ResourceCPU:    resource.MustParse("50m"),
+			corev1.ResourceMemory: resource.MustParse("64Mi"),
+		},
+		Limits: corev1.ResourceList{
+			corev1.ResourceCPU:    resource.MustParse("1"),
+			corev1.ResourceMemory: resource.MustParse("512Mi"),
+		},
+	}
+}
+
+// a2aRenderedBridgeResources is the rendered bridge's resources: the
+// operator's A2A_BRIDGE_RESOURCES when it reads as a ResourceRequirements with
+// no request above its limit, else the defaults. A value it can't use is
+// logged once and ignored, like a refused A2A_BRIDGE_EXECUTOR. Unlike before
+// gke-labs#2748, the agent container's resources are not copied: that doubled
+// the agent pod's requests and left next pods unschedulable on clusters sized
+// for today.
+func a2aRenderedBridgeResources() corev1.ResourceRequirements {
+	raw := os.Getenv(a2aBridgeResourcesOperatorEnvVar)
+	if raw == "" {
+		return a2aRenderedBridgeDefaultResources()
+	}
+	var r corev1.ResourceRequirements
+	err := json.Unmarshal([]byte(raw), &r)
+	if err == nil {
+		for name, req := range r.Requests {
+			if lim, ok := r.Limits[name]; ok && req.Cmp(lim) > 0 {
+				err = fmt.Errorf("the %s request %s is above its limit %s", name, req.String(), lim.String())
+				break
+			}
+		}
+	}
+	if err != nil {
+		if _, seen := a2aRefusedBridgeResources.LoadOrStore(raw, true); !seen {
+			logf.Log.WithName("platformagent-controller").Info(
+				"Ignoring "+a2aBridgeResourcesOperatorEnvVar+": it is not a usable ResourceRequirements in JSON, so the rendered bridge gets the default resources",
+				"value", raw, "error", err.Error())
+		}
+		return a2aRenderedBridgeDefaultResources()
+	}
+	return r
+}
+
+// a2aRefusedBridgeResources holds each refused A2A_BRIDGE_RESOURCES value
+// already logged.
+var a2aRefusedBridgeResources sync.Map

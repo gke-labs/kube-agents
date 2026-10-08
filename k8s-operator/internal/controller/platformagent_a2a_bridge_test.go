@@ -124,8 +124,12 @@ func TestANextInstallWithNoDeclaredBridgeGetsOne(t *testing.T) {
 			t.Errorf("the rendered bridge lacks the agent's mount %s", m.Name)
 		}
 	}
-	if !reflect.DeepEqual(b.SecurityContext, agentC.SecurityContext) || !reflect.DeepEqual(b.Resources, agentC.Resources) {
-		t.Error("the rendered bridge's securityContext or resources differ from the agent container's")
+	if !reflect.DeepEqual(b.SecurityContext, agentC.SecurityContext) {
+		t.Error("the rendered bridge's securityContext differs from the agent container's")
+	}
+	// Its own resources, not the agent's (gke-labs#2748).
+	if !reflect.DeepEqual(b.Resources, a2aRenderedBridgeDefaultResources()) {
+		t.Errorf("the rendered bridge's resources = %+v, want the defaults", b.Resources)
 	}
 	if b.Image != deriveImageFromOperator(agentC.Image, a2aBridgeImageName) {
 		t.Errorf("image = %q, want the agent image's registry and tag under %s", b.Image, a2aBridgeImageName)
@@ -417,5 +421,60 @@ func TestARefusedExecutorSettingIsLoggedOnce(t *testing.T) {
 	}
 	if _, logged := a2aRefusedBridgeExecutors.Load("Cli-refused-once"); !logged {
 		t.Error("the refused value was not logged")
+	}
+}
+
+// The rendered bridge no longer copies the agent container's resources: that
+// doubled a next pod's requests and left it unschedulable on a cluster sized
+// for today (gke-labs#2748). With the defaults its requests are a small
+// fraction of the agent container's.
+func TestTheRenderedBridgeDoesNotDoubleThePodsRequests(t *testing.T) {
+	pod := bridgeTestPod(provisionedAgent())
+	b := containersNamed(pod, a2aBridgeContainerName)[0]
+	agentC := containersNamed(pod, "platform-agent")[0]
+	for _, name := range []corev1.ResourceName{corev1.ResourceCPU, corev1.ResourceMemory} {
+		bridge, agent := b.Resources.Requests[name], agentC.Resources.Requests[name]
+		if agent.IsZero() {
+			t.Fatalf("the agent container requests no %s; the comparison is vacuous", name)
+		}
+		if bridge.MilliValue()*10 > agent.MilliValue() {
+			t.Errorf("the bridge requests %s %s, more than a tenth of the agent container's %s", bridge.String(), name, agent.String())
+		}
+	}
+	for _, name := range []corev1.ResourceName{corev1.ResourceCPU, corev1.ResourceMemory} {
+		req, lim := b.Resources.Requests[name], b.Resources.Limits[name]
+		if lim.IsZero() || req.Cmp(lim) > 0 {
+			t.Errorf("the bridge's %s request %s and limit %s: want a limit at or above the request", name, req.String(), lim.String())
+		}
+	}
+}
+
+// A2A_BRIDGE_RESOURCES replaces the defaults whole, for a cli install or one
+// that needs more. A value the operator can't use (not JSON, or a request
+// above its limit) is ignored and logged once, and the defaults stand.
+func TestTheBridgeResourcesSettingOverridesTheDefaults(t *testing.T) {
+	t.Setenv(a2aBridgeResourcesOperatorEnvVar, `{"requests":{"cpu":"500m","memory":"2Gi"},"limits":{"memory":"5Gi"}}`)
+	got := containersNamed(bridgeTestPod(provisionedAgent()), a2aBridgeContainerName)[0].Resources
+	if q := got.Requests[corev1.ResourceMemory]; q.String() != "2Gi" {
+		t.Errorf("memory request = %s, want the setting's 2Gi", q.String())
+	}
+	if q := got.Limits[corev1.ResourceMemory]; q.String() != "5Gi" {
+		t.Errorf("memory limit = %s, want the setting's 5Gi", q.String())
+	}
+	if _, ok := got.Limits[corev1.ResourceCPU]; ok {
+		t.Error("the setting is used whole, but a default CPU limit was merged into it")
+	}
+
+	for _, bad := range []string{"lots", `{"requests":{"memory":"1Gi"},"limits":{"memory":"512Mi"}}`} {
+		t.Run(bad, func(t *testing.T) {
+			t.Setenv(a2aBridgeResourcesOperatorEnvVar, bad)
+			got := containersNamed(bridgeTestPod(provisionedAgent()), a2aBridgeContainerName)[0].Resources
+			if !reflect.DeepEqual(got, a2aRenderedBridgeDefaultResources()) {
+				t.Errorf("an unusable setting rendered %+v, want the defaults", got)
+			}
+			if _, logged := a2aRefusedBridgeResources.Load(bad); !logged {
+				t.Error("the unusable setting was not logged")
+			}
+		})
 	}
 }

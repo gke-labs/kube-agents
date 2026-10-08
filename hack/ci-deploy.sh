@@ -280,6 +280,12 @@ readonly BRIDGE_SIDECAR_NAME="hermes-bridge"
 # against. The pin holds until cases have been graded on api
 # (docs/designs/eval-next-transport.md).
 readonly BRIDGE_EXECUTOR_PINNED="cli"
+# The cli executor runs a one-shot `hermes chat` per task, about 430Mi each
+# (round_3 g24 measurement in gke-labs#2748), and the operator's default bridge
+# resources are sized for api. So while the lane pins cli it hands the bridge
+# the agent container's resources, what the bridge copied before #2748. Drop
+# this with the cli pin.
+readonly MODE_NEXT_BRIDGE_RESOURCES='{"requests":{"cpu":"1","memory":"2Gi"},"limits":{"cpu":"3","memory":"8Gi"}}'
 # BRIDGE_CONCURRENCY is sized against the matrix's fan-out: hack/ci-eval-pr.sh
 # runs EVAL_TASK_PARALLELISM units at once from the same job environment,
 # defaulting to 4 (the nightly sets 8), and every unit past the bridge's
@@ -413,6 +419,7 @@ readonly A2A_CONSOLE_IMAGE_ENV_VAR="A2A_CONSOLE_IMAGE"
 readonly A2A_BRIDGE_IMAGE_ENV_VAR="A2A_BRIDGE_IMAGE"
 readonly A2A_BRIDGE_CONCURRENCY_ENV_VAR="A2A_BRIDGE_CONCURRENCY"
 readonly A2A_BRIDGE_EXECUTOR_ENV_VAR="A2A_BRIDGE_EXECUTOR"
+readonly A2A_BRIDGE_RESOURCES_ENV_VAR="A2A_BRIDGE_RESOURCES"
 readonly A2A_GATEWAY_IMAGE_NAME="a2a-gateway"
 readonly A2A_CALLOUT_IMAGE_NAME="a2a-authcallout"
 readonly A2A_WORKER_IMAGE_NAME="a2a-worker"
@@ -1214,6 +1221,9 @@ else
       --set-string "operator.extraEnv[7].value=${MODE_NEXT_BRIDGE_CONCURRENCY}"
       --set-string "operator.extraEnv[8].name=${A2A_BRIDGE_EXECUTOR_ENV_VAR}"
       --set-string "operator.extraEnv[8].value=${BRIDGE_EXECUTOR_PINNED}"
+      # A JSON value: --set-string splits on its commas, so the entry goes in
+      # whole as JSON.
+      --set-json "operator.extraEnv[9]={\"name\":\"${A2A_BRIDGE_RESOURCES_ENV_VAR}\",\"value\":\"${MODE_NEXT_BRIDGE_RESOURCES//\"/\\\"}\"}"
     )
     echo "EVAL_MODE_NEXT=1: also building the A2A gateway, auth callout, worker, verifier and console images and the Hermes bridge sidecar"
   fi

@@ -33,7 +33,7 @@ cross-pod, which RWO only allows with same-node scheduling games. Not worth it f
 component we intend to delete.
 
 The rendered container is the agent container, copied: its env, `envFrom`, mounts,
-`securityContext`, resources and pull policy, so it runs Hermes against the agent's profile
+`securityContext` and pull policy (but not its resources, below), so it runs Hermes against the agent's profile
 state on the agent's PVC, as the pod's KSA (model auth via Workload Identity for free). Two
 things are taken out. The agent's own values for the names the bridge sets for itself, and
 the agent's bus identity: `AGENT_SHARED_STATE_SETUP`, `NATS_URL`, `NATS_USER`,
@@ -59,11 +59,12 @@ when unset. An install that runs a custom agent image sets `A2A_BRIDGE_IMAGE`. T
 operator settings shape the rendered bridge. The operator reads them from its own
 environment, as it reads `A2A_INJECT_BACKEND`; no CR field carries them.
 
-| Operator env             | What it sets                      | Unset                                                                                                                                                                     |
-| ------------------------ | --------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `A2A_BRIDGE_IMAGE`       | the bridge's image                | derived as above                                                                                                                                                          |
-| `A2A_BRIDGE_CONCURRENCY` | the bridge's `BRIDGE_CONCURRENCY` | 10, Hermes's own gateway pool (not the bridge's default of 2)                                                                                                             |
-| `A2A_BRIDGE_EXECUTOR`    | the bridge's `BRIDGE_EXECUTOR`    | not rendered, so the bridge's shipped default decides: `api`, given the key. A value other than exactly `api` or `cli` is treated as unset, and the operator logs it once |
+| Operator env             | What it sets                                                         | Unset                                                                                                                                                                     |
+| ------------------------ | -------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `A2A_BRIDGE_IMAGE`       | the bridge's image                                                   | derived as above                                                                                                                                                          |
+| `A2A_BRIDGE_CONCURRENCY` | the bridge's `BRIDGE_CONCURRENCY`                                    | 10, Hermes's own gateway pool (not the bridge's default of 2)                                                                                                             |
+| `A2A_BRIDGE_EXECUTOR`    | the bridge's `BRIDGE_EXECUTOR`                                       | not rendered, so the bridge's shipped default decides: `api`, given the key. A value other than exactly `api` or `cli` is treated as unset, and the operator logs it once |
+| `A2A_BRIDGE_RESOURCES`   | the bridge's resources, a `ResourceRequirements` in JSON, used whole | the `api`-sized defaults below. A value that isn't JSON, or has a request above its limit, is ignored and logged once                                                     |
 
 The TASKS consumer reserve reads the same `A2A_BRIDGE_CONCURRENCY` the bridge is given
 ([sizing](#sizing-against-the-eval-harness)), and the `api` executor's pod-wide hook is
@@ -96,12 +97,18 @@ mode and again when the bridge arrives after the Job. The agent Deployment's str
 agent outage: the old pod stops before the new one starts. Once `BusProvisioned` has been
 `True` the bridge stays in the pod on later renders.
 
-**It doubles the agent container's share of the pod.** The rendered container copies the
-agent container's resources, so the pod carries two of them. With the defaults (requests 1
-CPU and 2Gi, limits 3 CPU and 8Gi) the bridge adds another 1 CPU/2Gi of requests and 3
-CPU/8Gi of limits, roughly doubling the agent pod's requests, and a node or namespace quota
-sized for the `today` pod may not schedule the `next` one. `spec.deployment.resources` sizes
-both containers together; no setting sizes the bridge alone.
+**It has its own resources, sized for the `api` executor.** The rendered bridge requests 50m
+CPU and 64Mi, with limits of 1 CPU and 512Mi. On `api`, the default, it's a Go relay that
+holds one HTTP request per task to the agent container's API server, and the turn itself
+runs in the agent container. Measured idle it uses about 1m CPU and 5Mi
+([#2748](https://github.com/gke-labs/kube-agents/issues/2748)). It used to copy the agent
+container's resources, which doubled the agent pod's requests and could leave a `next` pod
+unschedulable on a cluster sized for `today`.
+
+The `cli` executor doesn't fit these. It runs a one-shot `hermes chat` per task, about
+430Mi each, up to `BRIDGE_CONCURRENCY` of them, so an install that pins `cli` sets
+`A2A_BRIDGE_RESOURCES` too. Size the memory limit at about 430Mi times the concurrency,
+plus headroom. CI does this while it pins `cli`.
 
 **A CR-declared bridge wins.** A sidecar on `spec.deployment.sidecars` is a declared bridge
 if it is named `hermes-bridge`, if its `env` sets `BRIDGE_CONCURRENCY`, or if it runs the
