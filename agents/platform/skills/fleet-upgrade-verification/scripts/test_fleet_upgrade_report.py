@@ -982,10 +982,12 @@ class ReadinessTest(unittest.TestCase):
                 k8s_pdb("readiness-1411", "orphan", {"maxUnavailable": 0, "selector": {"matchLabels": {"app": "gone"}}}, 0),
             ],
         }
-        # seeded-b: the seeded fleet's fixture shape, a gate on ConfigMaps only, whose Service does not exist.
-        self.objects["seeded-b"] = self.objects.get("seeded-b", []) + [
-            k8s_webhook("ValidatingWebhookConfiguration", "seeded-fail-closed-gate", "gate.seeded.invalid", "Fail", ("seeded-upgrade", "nonexistent-admission-gate"), ["configmaps"]),
-        ]
+        # seeded-b: the seeded fleet's fixture shape, a gate on ConfigMaps only, whose Service does
+        # not exist, scoped to its own namespace as bench/tf/fleet/defects-b.tf scopes it (so it
+        # does not reach kube-system and stays an outage).
+        seeded_gate = k8s_webhook("ValidatingWebhookConfiguration", "seeded-fail-closed-gate", "gate.seeded.invalid", "Fail", ("seeded-upgrade", "nonexistent-admission-gate"), ["configmaps"])
+        seeded_gate["webhooks"][0]["namespaceSelector"] = {"matchLabels": {"kubernetes.io/metadata.name": "seeded-upgrade"}}
+        self.objects["seeded-b"] = self.objects.get("seeded-b", []) + [seeded_gate]
         # robot-host: a gate on pod creation whose Service exists but has no endpoints; the drain's replacements need it.
         self.objects["robot-host"] = self.objects.get("robot-host", []) + [
             k8s_webhook("ValidatingWebhookConfiguration", "pod-gate", "pods.example.com", "Fail", ("gate", "pod-hook"), ["pods"]),

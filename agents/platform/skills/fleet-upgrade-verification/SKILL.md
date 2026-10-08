@@ -199,8 +199,13 @@ validatingwebhookconfigurations,mutatingwebhookconfigurations,services,endpoints
   cell says the server sends it no request at a served version rather than that its requests fail
   now, and one that pairs such a rule with a rule the server does serve off the path is an outage
   whose cell names the live rules as failing their requests now and the pinned rule alone as sent
-  nothing; `namespaceSelector`, `objectSelector` and `matchConditions` are not
-  evaluated, so a webhook they narrow is reported as able to match. The cell names the
+  nothing; `objectSelector` and `matchConditions` are not evaluated, and `namespaceSelector`
+  is read only for the `kube-system` reach, so a webhook they narrow is otherwise reported as
+  able to match. A dead webhook off the node path is graded `blocked` all the same when its
+  `namespaceSelector` admits `kube-system` and its rules match a write the control plane makes
+  there on a master's start (`CONTROL_PLANE_KUBE_SYSTEM_WRITES` in the script: the ConfigMap
+  kube-apiserver publishes, created or updated), because the new master's first write is
+  refused and the control-plane upgrade cannot complete; its cell names that write. The cell names the
   configuration, the webhook, the reason and what it matches (an outage cell lists the webhook's
   own rules, with their `apiVersions` when a rule pins any); each JSON finding carries
   `reason`, `upgrade_path` and `rules`, split into `blocking` and `outage`. A fail-closed webhook with a URL backend is counted in the

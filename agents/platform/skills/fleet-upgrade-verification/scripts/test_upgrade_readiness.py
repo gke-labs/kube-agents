@@ -435,6 +435,14 @@ def endpoint_slice(namespace, svc, ready_flags, port_name="https"):
 
 
 POD_GATE = [rule(["pods"])]
+# A namespace selector that keeps a gate off kube-system, for the outage-wording tests: since
+# the kube-system reach is graded, a bare ConfigMap gate is a blocker, not an outage.
+OFF_KUBE_SYSTEM = {"matchLabels": {"kubernetes.io/metadata.name": "scen"}}
+
+
+def scoped(record, namespace_selector):
+    record["namespaceSelector"] = namespace_selector
+    return record
 LIVE = [service("scen", "gate-svc")], [endpoint_slice("scen", "gate-svc", [True])]
 
 
@@ -493,13 +501,83 @@ class WebhookBackendTest(unittest.TestCase):
         self.assertEqual((graded["fail_open"], graded["url_backends"], graded["evaluated"]), (1, 1, 0))
 
 
+class KubeSystemReachTest(unittest.TestCase):
+    """A dead gate off the node path that can refuse the control plane's own writes in
+    kube-system blocks the control-plane upgrade (the Jetstack 2019 shape)."""
+
+    CONFIGMAP_GATE = [rule(["configmaps"])]
+
+    def _one(self, hooks):
+        graded = grade(hooks)
+        return graded["blocking"], graded["outage"]
+
+    def test_a_cluster_wide_dead_configmap_gate_blocks_and_names_the_write(self):
+        blocking, outage = self._one([hook("opa.example.com", self.CONFIGMAP_GATE, policy="Fail")])
+        self.assertEqual(outage, [])
+        self.assertEqual(blocking[0]["upgrade_path"], ["CREATE configmaps in kube-system"])
+        self.assertIn("matches CREATE configmaps in kube-system", r.describe_webhook_finding(blocking[0]))
+
+    def test_an_empty_selector_admits_every_namespace(self):
+        blocking, _ = self._one([scoped(hook("opa.example.com", self.CONFIGMAP_GATE, policy="Fail"), {})])
+        self.assertEqual(len(blocking), 1)
+
+    def test_a_selector_naming_another_namespace_keeps_the_gate_an_outage(self):
+        gate = scoped(hook("gate.seeded.invalid", self.CONFIGMAP_GATE, policy="Fail"), {"matchLabels": {"kubernetes.io/metadata.name": "seeded-upgrade"}})
+        blocking, outage = self._one([gate])
+        self.assertEqual((blocking, len(outage)), ([], 1))
+
+    def test_a_selector_excluding_kube_system_keeps_the_gate_an_outage(self):
+        gate = scoped(hook("opa.example.com", self.CONFIGMAP_GATE, policy="Fail"), {"matchExpressions": [{"key": "kubernetes.io/metadata.name", "operator": "NotIn", "values": ["kube-system"]}]})
+        blocking, outage = self._one([gate])
+        self.assertEqual((blocking, len(outage)), ([], 1))
+
+    def test_a_selector_this_reader_cannot_evaluate_errs_toward_blocking(self):
+        gate = scoped(hook("opa.example.com", self.CONFIGMAP_GATE, policy="Fail"), {"matchExpressions": [{"key": "tier", "operator": "Gt", "values": ["1"]}]})
+        blocking, _ = self._one([gate])
+        self.assertEqual(len(blocking), 1)
+
+    def test_a_dead_lease_gate_already_blocks_on_the_node_path(self):
+        # Leader-election Leases live in kube-system, but the kubelet's Lease rows already put
+        # any Lease gate on the node path, so the kube-system list does not repeat them.
+        gate = hook("leases.example.com", [rule(["leases"], operations=("UPDATE",), groups=("coordination.k8s.io",))], policy="Fail")
+        blocking, _ = self._one([gate])
+        self.assertEqual(blocking[0]["upgrade_path"], ["UPDATE leases"])
+
+    def test_a_dead_gate_on_another_resource_stays_an_outage_whatever_its_selector(self):
+        # cert-manager's shape: fail-closed on its own kinds, no namespace selector.
+        gate = hook("webhook.cert-manager.io", [rule(["certificates", "certificaterequests"], operations=("CREATE", "UPDATE"), groups=("cert-manager.io",))], policy="Fail")
+        blocking, outage = self._one([gate])
+        self.assertEqual((blocking, len(outage)), ([], 1))
+
+    def test_a_configmap_gate_pinned_to_an_unserved_version_is_not_reached(self):
+        gate = hook("opa.example.com", [rule(["configmaps"], versions=("v2",))], policy="Fail")
+        blocking, outage = self._one([gate])
+        self.assertEqual((blocking, len(outage)), ([], 1))
+
+    def test_the_node_path_match_is_named_ahead_of_the_kube_system_reach(self):
+        gate = hook("opa.example.com", [rule(["pods", "configmaps"])], policy="Fail")
+        blocking, _ = self._one([gate])
+        self.assertEqual(blocking[0]["upgrade_path"], ["CREATE pods"])
+
+    def test_the_control_plane_write_list_is_pinned(self):
+        self.assertEqual(
+            r.CONTROL_PLANE_KUBE_SYSTEM_WRITES,
+            (
+                ("", "v1", "configmaps", "CREATE", "Namespaced"),
+                ("", "v1", "configmaps", "UPDATE", "Namespaced"),
+            ),
+        )
+
+
 class WebhookScopeTest(unittest.TestCase):
     def _path(self, rules):
         return r.upgrade_path_matches({"rules": rules})
 
     def test_a_gate_outside_the_upgrade_path_is_an_outage_not_a_blocker(self):
-        # The seeded fleet's fixture: a gate on ConfigMaps with no Service.
-        graded = grade([hook("gate.seeded.invalid", [rule(["configmaps"])], policy="Fail", service=("seeded-upgrade", "nonexistent-admission-gate"))])
+        # The seeded fleet's fixture: a gate on ConfigMaps with no Service, scoped to its own
+        # namespace (bench/tf/fleet/defects-b.tf), so it does not reach kube-system either.
+        gate = scoped(hook("gate.seeded.invalid", [rule(["configmaps"])], policy="Fail", service=("seeded-upgrade", "nonexistent-admission-gate")), {"matchLabels": {"kubernetes.io/metadata.name": "seeded-upgrade"}})
+        graded = grade([gate])
         self.assertEqual(graded["blocking"], [])
         self.assertEqual(len(graded["outage"]), 1)
         self.assertIn("matches none of the operations this rule reads as the upgrade's path (its rules: CREATE configmaps)", r.describe_webhook_finding(graded["outage"][0]))
@@ -508,14 +586,14 @@ class WebhookScopeTest(unittest.TestCase):
     def test_an_outage_cell_names_every_rule_with_its_group(self):
         # GKE's managed Prometheus operator gate, outside the path: the cell says what it does match.
         hook_rules = [rule(["rules", "clusterrules"], groups=("monitoring.googleapis.com",), operations=("CREATE", "UPDATE")), rule(["configmaps"])]
-        graded = grade([hook("mon.example.com", hook_rules, policy="Fail")])
+        graded = grade([scoped(hook("mon.example.com", hook_rules, policy="Fail"), OFF_KUBE_SYSTEM)])
         self.assertEqual(graded["outage"][0]["rules"], ["CREATE/UPDATE rules,clusterrules in monitoring.googleapis.com", "CREATE configmaps"])
         self.assertIn("(its rules: CREATE/UPDATE rules,clusterrules in monitoring.googleapis.com, CREATE configmaps)", r.describe_webhook_finding(graded["outage"][0]))
 
     def test_an_outage_cell_names_the_core_group_beside_another(self):
         # A rule on `["", "apps"]` gates core resources too: the cell says `core,apps`, not `apps`.
         hook_rules = [rule(["configmaps", "deployments"], groups=("", "apps")), rule(["configmaps"], groups=("",)), rule(["rules"], groups=("monitoring.googleapis.com", ""))]
-        graded = grade([hook("policy.example.com", hook_rules, policy="Fail")])
+        graded = grade([scoped(hook("policy.example.com", hook_rules, policy="Fail"), OFF_KUBE_SYSTEM)])
         self.assertEqual(graded["outage"][0]["rules"], ["CREATE configmaps,deployments in core,apps", "CREATE configmaps", "CREATE rules in monitoring.googleapis.com,core"])
 
     def test_each_upgrade_path_target(self):
@@ -704,7 +782,7 @@ class WebhookScopeTest(unittest.TestCase):
         self.assertIn("matches no request the server sends at a served version (its rules: CREATE certificatesigningrequests in certificates.k8s.io at v1beta1; the server serves CREATE certificatesigningrequests at v1 alone, so it sends this webhook none of them); it is reported, not graded", cell)
         self.assertNotIn("fails its own requests now", cell)
         # A dead gate on a resource off the list does fail the requests it matches now.
-        graded = grade([hook("cm.example.com", [rule(["configmaps"])], policy="Fail")])
+        graded = grade([scoped(hook("cm.example.com", [rule(["configmaps"])], policy="Fail"), OFF_KUBE_SYSTEM)])
         self.assertEqual([f["version_pinned"] for f in graded["outage"]], [[]])
         self.assertIn("it fails its own requests now", r.describe_webhook_finding(graded["outage"][0]))
         # A pinned rule beside a served one is a blocker, with nothing pinned.
@@ -724,7 +802,7 @@ class WebhookScopeTest(unittest.TestCase):
         # and the pinned rule alone as sent nothing, rather than saying the server sends the
         # webhook none of its requests.
         pinned = rule(["certificatesigningrequests"], groups=("certificates.k8s.io",), versions=("v1beta1",))
-        graded = grade([hook("mixed.example.com", [pinned, rule(["configmaps"], versions=("v1",))], policy="Fail")])
+        graded = grade([scoped(hook("mixed.example.com", [pinned, rule(["configmaps"], versions=("v1",))], policy="Fail"), OFF_KUBE_SYSTEM)])
         self.assertEqual(graded["blocking"], [])
         finding = graded["outage"][0]
         self.assertEqual(finding["version_pinned"], ["CREATE certificatesigningrequests"])
@@ -735,7 +813,7 @@ class WebhookScopeTest(unittest.TestCase):
         self.assertNotIn("sends this webhook none of them", cell)
         self.assertNotIn("fails its own requests now", cell)
         # The order of the rules does not change which is named as failing.
-        graded = grade([hook("mixed.example.com", [rule(["configmaps"]), pinned], policy="Fail")])
+        graded = grade([scoped(hook("mixed.example.com", [rule(["configmaps"]), pinned], policy="Fail"), OFF_KUBE_SYSTEM)])
         self.assertEqual((graded["outage"][0]["live_rules"], graded["outage"][0]["pinned_rules"]), (["CREATE configmaps"], ["CREATE certificatesigningrequests in certificates.k8s.io at v1beta1"]))
         # Only a rule the list can vouch for is pinned: a wildcard at v1beta1 and a path
         # resource named beside one off the list at v1beta1 may still be served, so both keep

@@ -231,10 +231,11 @@ Four ways a workload breaks on a new version:
   no liveness probe is what turns a slow webhook into a stuck one. `--readiness` already grades the
   case where the backend is unreachable now, on the webhook's rules (the writes a node drain and a
   node join make, listed with their sources as `UPGRADE_PATH_TARGETS` in
-  `agents/platform/skills/fleet-upgrade-verification/scripts/upgrade_readiness.py`); the selectors,
-  `kube-system` reach and the
-  would-fail-once-drained backend are still
-  unread.
+  `agents/platform/skills/fleet-upgrade-verification/scripts/upgrade_readiness.py`) and on its
+  `kube-system` reach (a dead webhook whose namespace selector admits `kube-system` and whose
+  rules match the ConfigMap kube-apiserver publishes on start, `CONTROL_PLANE_KUBE_SYSTEM_WRITES`
+  in the same file; the leader-election Leases are already on the node path's list); the object selector, match conditions,
+  cluster-scoped reach and the would-fail-once-drained backend are still unread.
 - **Manifests in Git, and release state, not just live clusters.** Stored Helm release manifests
   carry removed kinds even when nothing in the cluster runs them, and the next `helm upgrade` of that
   release fails on reading its own stored state. Nothing breaks until someone deploys, which is why
