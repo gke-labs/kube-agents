@@ -51,9 +51,10 @@ spec:
     # fields under it are a deployment trade, not a default the operator can pick for
     # you. `maxInProgress` is the exception — unset renders the operator's cap of 6,
     # one slot of it held for each class of card, because uncapped dispatch loses cards
-    # silently rather than merely running them unbounded. Above 6, raise the
-    # credential proxy's memory with it: its default 2Gi admits 9 commands at
-    # once. See the field docs on TuningSpec in
+    # silently rather than merely running them unbounded. The credential
+    # proxy's slot cap of 8 commands is the ceiling past about eight workers;
+    # no CR field moves it, so more proxy memory does not help there. See the
+    # field docs on TuningSpec in
     # api/v1alpha1/common_types.go (`kubectl explain platformagent.spec.harness.tuning`).
     # +optional
     # tuning:

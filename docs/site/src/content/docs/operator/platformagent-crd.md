@@ -63,7 +63,7 @@ the agent a usable kubectl context) when it has the complete triple; with one mi
 | `driftDetector.gitopsManagers`                 | string | Comma-separated `managedFields` field managers belonging to your GitOps controller, matched exactly — `argocd-controller`, `flux`. Unset means no card is ever annotated as possibly already reconciled.                          |
 | `tuning.<persona>.apiMaxRetries`               | int    | Model-call retries before a run gives up. Unset = Hermes default `3`.                                                                                                                                                             |
 | `tuning.<persona>.maxTurns`                    | int    | Iterations allowed in a single turn. Unset = Hermes default `90`, except `platform` (see below).                                                                                                                                  |
-| `tuning.maxInProgress`                         | int    | Board-wide cap on concurrent kanban workers. Unset = operator default `2`.                                                                                                                                                        |
+| `tuning.maxInProgress`                         | int    | Board-wide cap on concurrent kanban workers. Unset = operator default `6`.                                                                                                                                                        |
 | `tuning.maxSessions`                           | int    | Install-wide cap on concurrent A2A session pods (1–10000). Unset = operator default `10`. Inert under `mode: today`; a separate lane from `maxInProgress`. A stream too small for it makes the provision Job refuse.              |
 | `experimental.platformFrontDoor`               | bool   | **Unsupported.** Run the gateway as the Platform Agent, so chat reaches it directly. Default `false`. See below.                                                                                                                  |
 
@@ -386,9 +386,8 @@ logs, at most every five minutes:
 kanban dispatcher saturated: 6/6 worker slots busy (5 background, 1 user: t_ab12 @cluster-prod 14m [k8s-evt-], t_cd34 @cluster-prod 9m [k8s-evt-]); 1 user card(s) and 2 background card(s) waiting
 ```
 
-The card list is shortened here; the real line names up to five running cards, oldest first.
-
-with `; N background card(s) held back because one slot is reserved for user cards` or
+The card list is shortened here; the real line names up to five running cards, oldest first. The
+line gets `; N background card(s) held back because one slot is reserved for user cards` or
 `; N user card(s) held back because one slot is reserved for background triage` added when a held
 slot is what stopped them. When the only free slot is the one held for the other class, the line
 starts `kanban dispatcher holding background cards:` or `kanban dispatcher holding user cards:`
@@ -415,8 +414,13 @@ The arithmetic behind `6`:
 - **Model quota.** Per-install model rate limits are not measured. A small quota may see 429s at 6;
   if worker logs show them, lower `maxInProgress`.
 
-If you raise `maxInProgress`, raise the proxy's memory limit in
-`spec.deployment.credentialProxy.resources` with it, and check your model quota.
+If you raise `maxInProgress`, check your model quota, and know where the credential proxy stops it.
+The proxy's default 2Gi already admits more than its slot cap of 8, so up to about eight workers'
+worth of commands fit, fewer while a listing runs. Past that the slot cap binds, and the operator
+owns it: no CR field moves it, so raising the proxy's memory in
+`spec.deployment.credentialProxy.resources` does not help, and a command beyond eight waits up to
+60 s for a slot and is then refused busy. Keep that limit at 2Gi or more, because below it the
+memory budget binds first.
 
 The cap counts running cards, not resident processes, and one case makes those differ: a coordinator
 waiting on work it fanned out is discounted, or it would hold the slot its own children need

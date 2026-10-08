@@ -642,9 +642,14 @@ type TuningSpec struct {
 	// worker logs show them.
 	//
 	// Set it higher once a deployment has measured its own worker footprint and model
-	// quota, and raise the memory limit in spec.deployment.credentialProxy.resources with
-	// it: each request the proxy admits costs 176 MiB of that limit after 320 MiB of fixed
-	// reserves. Set it to 1 to serialise all delegated work. When quota rather than
+	// quota. The credential proxy sets the ceiling on brokered commands: its default 2Gi
+	// already admits more than its slot cap of 8, so up to about eight workers' worth of
+	// commands fit at the defaults, fewer while the listings above run. Past that the
+	// slot cap binds, and no CR field moves it, so raising the memory limit in
+	// spec.deployment.credentialProxy.resources does not help: a command beyond eight
+	// waits up to 60 s for a slot and is then refused busy. Keep that limit at 2Gi or
+	// more, since below it the memory budget (176 MiB per command after 320 MiB of fixed
+	// reserves) binds first. Set it to 1 to serialise all delegated work. When quota rather than
 	// memory binds, note the related failure mode: workers that exhaust their retry
 	// budget exit without calling a terminal kanban tool, and the dispatcher reports that
 	// as a "protocol violation" rather than as the quota exhaustion it actually is.
