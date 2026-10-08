@@ -1295,6 +1295,19 @@ func TestToTriageEvent_Reporter(t *testing.T) {
 	}
 }
 
+// TestToTriageEvent_Autopilot pins that the cluster's Autopilot bit rides on
+// the event. One filter serves every cluster's dispatcher, so the gate that
+// reads it cannot ask which cluster it is looking at; if the copy here is
+// dropped, every cluster reads as Standard and the hold silently never fires.
+func TestToTriageEvent_Autopilot(t *testing.T) {
+	for _, autopilot := range []bool{true, false} {
+		got := toTriageEvent(&corev1.Event{}, targetCluster{Name: "c", Autopilot: autopilot}).Autopilot
+		if got != autopilot {
+			t.Errorf("targetCluster{Autopilot: %t} reached the event as %t", autopilot, got)
+		}
+	}
+}
+
 // streamedFakeWatch returns a fake watch already carrying the events of a
 // watch-list stream's initial state, ending with the bookmark that closes it,
 // in the order given. Buffered for the whole batch so the reactor can return

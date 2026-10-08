@@ -283,8 +283,10 @@ class MarkTest(FlagOn):
         blocks = self.draw(_turn())
         self.assertTrue(blocks[0]["text"]["text"].startswith("**I couldn't find seeded-z.**"))
         (button,) = _buttons(blocks)
-        self.assertEqual(button["text"]["text"], "check it there")
-        self.assertEqual(button["value"], "check it there")
+        # A fixed label, whatever the question; the reply above keeps the question.
+        self.assertEqual(button["text"]["text"], "Try again")
+        self.assertEqual(button["value"], "Try again")
+        self.assertIn("Check it there?", blocks[0]["text"]["text"])
         self.assertRegex(button["action_id"], slack_presenter.CHOICE_ACTION_ID_PATTERN)
 
     def test_a_reply_needs_its_turn_to_have_claimed_the_mark(self):

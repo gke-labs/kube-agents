@@ -54,6 +54,37 @@ class ForgeCallTest(unittest.TestCase):
         self.assertEqual(answer, {"ok": True})
         self.assertEqual(seen, [("issue-update", {"number": 7, "labelsAdd": ["a"], "repository": "acme/infra"})])
 
+    def test_a_name_registered_as_github_travels_with_its_host(self):
+        # Review round 4: the broker refuses a bare name whenever it is
+        # configured with two forges, which the managed list cannot see (a
+        # GitLab forge declared before any GitLab repository is registered).
+        # A name registered as GitHub is GitHub's whatever the broker serves,
+        # so it goes on the wire as the URL it was registered by; one another
+        # forge's entry shares, or nothing registers, is sent as written.
+        sent = []
+        entries = [
+            {"type": "github", "url": "https://github.com/acme/fleet"},
+            {"type": "gitlab", "url": "https://gitlab.com/acme/both"},
+            {"type": "github", "url": "https://github.com/acme/both"},
+            # Review (#2549): an scp remote on another forge collides too.
+            {"type": "gitlab", "url": "git@gitlab.com:acme/scp.git"},
+            {"type": "github", "url": "https://github.com/acme/scp"},
+        ]
+        with mock.patch.dict(os.environ, {"CREDENTIAL_PROXY_URL": "http://127.0.0.1:1"}), \
+                mock.patch.object(vcs_client.credential_proxy_client, "vcs_call",
+                                  lambda endpoint, verb, payload: sent.append(payload["repository"]) or {}), \
+                mock.patch("gitops_workspace.mounted_repo_entries",
+                           side_effect=lambda key: entries if key == "managed_repos" else []):
+            vcs_client._registered_urls.cache_clear()
+            for name in ("acme/fleet", "Acme/Fleet", "acme/both", "acme/unregistered",
+                         "gitlab.com/acme/both", "https://github.com/acme/fleet", "acme/scp"):
+                vcs_client.call("issue-list", {"repository": name})
+        self.assertEqual(
+            ["https://github.com/acme/fleet", "https://github.com/acme/fleet", "acme/both",
+             "acme/unregistered", "gitlab.com/acme/both", "https://github.com/acme/fleet", "acme/scp"],
+            sent,
+        )
+
     def test_capabilities_takes_a_repository_without_a_working_copy(self):
         with mock.patch.object(vcs_client, "call", lambda verb, payload: {"verb": verb, **payload}):
             self.assertEqual(

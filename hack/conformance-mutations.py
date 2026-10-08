@@ -475,6 +475,42 @@ Mutation(
         "allows every verb beneath it, `delete` included",
     ),
     Mutation(
+        "B1-slack-remove-allowlist-widened",
+        "agents/platform/scripts/credential_proxy.py",
+        ('SLACK_REMOVE_ALLOWLIST = frozenset({"reactions.remove"})\n',
+         'SLACK_REMOVE_ALLOWLIST = frozenset({"reactions.remove", "pins.remove"})\n'),
+        "test_B1_the_slack_relay_removes_nothing_but_its_own_reaction",
+        "exempt a second remove the same way the first was, one name added to "
+        "a set that reads as already settled",
+    ),
+    Mutation(
+        "B1-slack-remove-exemption-case-folded",
+        "agents/platform/scripts/credential_proxy.py",
+        ("            method not in SLACK_REMOVE_ALLOWLIST\n",
+         "            method.lower() not in SLACK_REMOVE_ALLOWLIST\n"),
+        "test_B1_the_slack_relay_removes_nothing_but_its_own_reaction",
+        "case-fold the exemption to match the verb rule beside it, which "
+        "forwards `Reactions.Remove` past the gate",
+    ),
+    Mutation(
+        "B1-slack-verb-rule-dropped",
+        "agents/platform/scripts/credential_proxy.py",
+        ('DESTRUCTIVE_SLACK_VERBS = frozenset({"delete", "remove", "kick", "archive"})\n',
+         'DESTRUCTIVE_SLACK_VERBS = frozenset({"kick", "archive"})\n'),
+        "test_B1_the_slack_relay_removes_nothing_but_its_own_reaction",
+        "replace the remove refusal with the allowlist rather than adding the "
+        "allowlist beside it",
+    ),
+    Mutation(
+        "B1-slack-method-shape-dropped",
+        "agents/platform/scripts/credential_proxy.py",
+        ("        if not SLACK_METHOD_SHAPE.fullmatch(method):\n",
+         "        if not method:\n"),
+        "test_B1_the_slack_relay_removes_nothing_but_its_own_reaction",
+        "drop the shape check as redundant beside the verb rule, which reads "
+        "only the text after the last dot and so forwards `chat.delete#x`",
+    ),
+    Mutation(
         "B2-second-pull-requests-write",
         ".github/workflows/conformance.yml",
         ("permissions:\n  contents: read\n\njobs:\n  conformance:\n",
@@ -1244,6 +1280,91 @@ Mutation(
         "keep the A2A door's refusal condition and log line but repair the "
         "value into the eval namespace instead of dropping it, so a map entry "
         "naming a cloud identity is still honoured",
+    ),
+    Mutation(
+        "A3-a2a-google-token-any-client",
+        "a2a/gateway/a2adoor_google.go",
+        ("\tif string(info.Aud) != v.clientID && string(info.Azp) != v.clientID {",
+         "\tif false {"),
+        "test_A3_a_google_token_is_bound_to_the_install_client_and_a_verified_email",
+        "accept a Google access token issued for any OAuth client, so a token "
+        "a developer granted some other app signs them in here",
+    ),
+    Mutation(
+        "A3-a2a-google-email-unverified",
+        "a2a/gateway/a2adoor_google.go",
+        ('\tif string(info.EmailVerified) != "true" {', "\tif false {"),
+        "test_A3_a_google_token_is_bound_to_the_install_client_and_a_verified_email",
+        "accept a token whose email Google has not verified, so the principal "
+        "is an address its holder never proved they own",
+    ),
+    Mutation(
+        "A3-a2a-google-prefix-unchecked",
+        "a2a/gateway/gchat.go",
+        ('\tif !ok || email == "" {', '\tif email == "" {'),
+        "test_A3_the_google_class_admits_only_a_prefixed_allowlisted_email",
+        "resolve an id that did not come through the door's Google check, so "
+        "any author stamped with the class's backend is admitted on the "
+        "allowlist alone",
+    ),
+    Mutation(
+        "A3-a2a-google-allowlist-bypassed",
+        "a2a/gateway/gchat.go",
+        ("\tif !g.a2aGoogleAllowed[strings.ToLower(email)] {", "\tif false {"),
+        "test_A3_the_google_class_admits_only_a_prefixed_allowlisted_email",
+        "admit every Google-verified email, so anyone with a Google account "
+        "and the install's public client id signs in",
+    ),
+    Mutation(
+        "A3-a2a-google-door-allowlist-skipped",
+        "a2a/gateway/a2adoor_google.go",
+        ("\tif err == nil && !d.googleAllowed[strings.ToLower(email)] {", "\tif false {"),
+        "test_A3_the_door_refuses_an_account_off_the_allowlist_before_holding_state",
+        "leave the allowlist to the gateway alone, so any Google account that "
+        "can mint a token for the install's client creates door conversations "
+        "and submissions that evict an allowed developer's",
+    ),
+    Mutation(
+        "A3-a2a-google-any-bearer-to-google",
+        "a2a/gateway/a2adoor_google.go",
+        ("\tif !strings.HasPrefix(token, a2aGoogleAccessTokenPrefix) {", "\tif false {"),
+        "test_A3_a_bearer_that_is_not_a_google_token_never_leaves_the_cluster",
+        "send every non-static bearer to Google's tokeninfo again, so a mistyped "
+        "door token or another secret pasted into Authorization leaves the cluster",
+    ),
+    Mutation(
+        "A3-a2a-google-prefix-spellable",
+        "a2a/gateway/a2adoor_google.go",
+        ('\ta2aGoogleCallerPrefix = ":google:"', '\ta2aGoogleCallerPrefix = "google:"'),
+        "test_A3_no_eval_caller_can_spell_a_google_caller",
+        "drop the leading colon, so an eval caller \"google\" naming the context "
+        "\"<email>:<ctx>\" spells a developer's conversation key with the "
+        "static token",
+    ),
+    Mutation(
+        "A3-a2a-eval-caller-colon-allowed",
+        "a2a/gateway/a2adoor.go",
+        ('\tif strings.Contains(caller, ":") {', "\tif false {"),
+        "test_A3_no_eval_caller_can_spell_a_google_caller",
+        "let an eval caller contain a colon, so the static token's holder can "
+        "name themselves \":google:<email>\" and read that developer's tasks",
+    ),
+    Mutation(
+        "A3-a2a-eval-caller-empty-allowed",
+        "a2a/gateway/a2adoor.go",
+        ('\tif caller == "" {', "\tif false {"),
+        "test_A3_no_eval_caller_can_spell_a_google_caller",
+        "let an eval caller be empty, so its conversation key starts a2a:: "
+        "like a Google caller's and the two namespaces meet",
+    ),
+    Mutation(
+        "A3-a2a-google-roster-chat-map",
+        "a2a/gateway/gateway.go",
+        ("\tif backend == consoleBackend || backend == a2aGoogleBackend {",
+         "\tif backend == consoleBackend {"),
+        "test_A3_the_google_class_roster_does_not_resolve_through_the_chat_map",
+        "send the Google class's roster through principalMapFor, whose default "
+        "is the chat map, so a door caller's id resolves as a chat identity",
     ),
     Mutation(
         "A3-slack-allowlist-skipped",

@@ -67,6 +67,19 @@ readonly EVAL_GITHUB_WRITE_SETTLE_SECONDS=120
 readonly EVAL_SUITE_NOT_EVALUATED_STATUS=2
 readonly EVAL_VERDICT_OUTCOME_NOT_EVALUATED="not_evaluated"
 
+# A repetition the launcher could not start because GitHub's token endpoint
+# failed transiently (record_unit_not_run, beside run_one_unit). The unit
+# writes a record in place of the run that carries the harness's own
+# infrastructure marker -- bench/kube_agents_bench/harness.py's and
+# scoring.py's INFRA_FAILURE_MARKER, which tests/test_ci_eval_ledger_mint.py
+# holds this copy to -- so the gate excludes the repetition as infrastructure
+# instead of grading a missing record at rung 2. The directory, under
+# STATE_DIR, holds one such record per skipped repetition.
+readonly EVAL_INFRA_FAILURE_MARKER="KUBE_AGENTS_INFRA_FAILURE"
+readonly EVAL_NOT_RUN_DIR="not-run"
+# The record's status: what the harness writes for a run that did not succeed.
+readonly EVAL_NOT_RUN_STATUS="failed"
+
 # EVAL_MODE_NEXT=1 is the flag hack/ci-deploy.sh flipped the install to
 # `spec.mode: next` under, in the same job environment. Under it the matrix
 # runs through the gateway's inject door (docs/designs/eval-next-transport.md,
@@ -892,6 +905,12 @@ _ledger_token_mint() {
 # the time it mints, and exiting there would strand them. Each caller unwinds
 # its own scope. Never falls back to the mounted PAT -- that would let a smoke
 # test pass while proving nothing about the credential it exercises.
+#
+# Which non-zero says why: LEDGER_MINT_RETRYABLE when the last attempt was a
+# transient failure (a 5xx, a 429, a 403 GitHub marks as its rate limit, an
+# unreachable api.github.com) and the ladder ran out, 1 for anything else.
+# LEDGER_MINT_LAST_FAILURE is left holding the mint's last diagnostic line
+# either way, for the caller's record.
 mint_ledger_token() { # <label>
   # Under gitlab the grading token is the pool's, read once at preflight by
   # read_gitlab_tokens; it lasts a year, so there is nothing to mint per unit.
@@ -901,21 +920,39 @@ mint_ledger_token() { # <label>
   # The token never reaches argv, where ps would show it: python writes it to
   # stdout and command substitution keeps it in this shell.
   #
-  # Retried because the alternative is worse than the wait. A unit that cannot
-  # mint releases its locks and returns, its repetition has no run directory,
-  # and the gate grades that MISSING -- rung CHECK_DID_NOT_RUN, which is
-  # blocking and whose reason line blames a harness or agent crash. So a single
-  # unreachable api.github.com reds the suite and points the reader at the
-  # agent. Retrying only what could survive one keeps a real credential fault
+  # Retried because a short outage should not cost the repetition at all. A
+  # unit that cannot mint releases its locks and returns without a run, and
+  # its repetition goes to the gate as a record of that (record_unit_not_run)
+  # when the ladder ran out on a transient failure, which the gate excludes as
+  # infrastructure, or as MISSING otherwise -- rung CHECK_DID_NOT_RUN, which
+  # blocks. Retrying only what could survive one keeps a real credential fault
   # arriving on the first attempt.
-  local minted rc attempt=1 delay=2
+  #
+  # The ladder stays at LEDGER_MINT_ATTEMPTS whatever GitHub is doing: an
+  # incident lasts longer than any wait a unit holding its locks can afford,
+  # and the not-run record is what keeps that from reading as a red.
+  local minted rc attempt=1 delay=2 diagnostics
+  LEDGER_MINT_LAST_FAILURE=""
+  # The mint's stderr goes through a file so its last line can name the
+  # failure in the record; it is echoed to this shell's stderr as before.
+  diagnostics="$(mktemp)"
   while :; do
-    minted="$(LEDGER_MINT_BODY="${LEDGER_GRADING_MINT_BODY}" _ledger_token_mint)" && break
-    rc=$?
+    rc=0
+    minted="$(LEDGER_MINT_BODY="${LEDGER_GRADING_MINT_BODY}" _ledger_token_mint 2>"${diagnostics}")" || rc=$?
+    cat "${diagnostics}" >&2
+    if [ "${rc}" -eq 0 ]; then
+      LEDGER_MINT_LAST_FAILURE=""
+      break
+    fi
+    LEDGER_MINT_LAST_FAILURE="$(tail -n 1 "${diagnostics}")"
     if [ "${rc}" -ne "${LEDGER_MINT_RETRYABLE}" ] || [ "${attempt}" -ge "${LEDGER_MINT_ATTEMPTS}" ]; then
+      rm -f "${diagnostics}"
       echo "ERROR: ${1}: could not mint a ledger read token from App ${EVAL_LEDGER_APP_ID}," \
            "installation ${EVAL_LEDGER_INSTALLATION_ID}, key ${EVAL_LEDGER_APP_KEY_FILE}." >&2
       echo "       Grading a ledger issue needs it; not falling back to the mounted PAT." >&2
+      if [ "${rc}" -eq "${LEDGER_MINT_RETRYABLE}" ]; then
+        return "${LEDGER_MINT_RETRYABLE}"
+      fi
       return 1
     fi
     echo "Ledger token (${1}): attempt ${attempt} of ${LEDGER_MINT_ATTEMPTS} hit a transient failure, retrying in ${delay}s" >&2
@@ -923,6 +960,7 @@ mint_ledger_token() { # <label>
     attempt=$((attempt + 1))
     delay=$((delay * 4))
   done
+  rm -f "${diagnostics}"
   export BENCH_GITHUB_TOKEN="${minted%% *}"
   echo "Ledger token (${1}): minted from App ${EVAL_LEDGER_APP_ID}, installation ${EVAL_LEDGER_INSTALLATION_ID}, expires ${minted##* }"
 }
@@ -1058,7 +1096,8 @@ forge_write_token() { # <owner/repo> [permissions JSON]
 # twice at mint, to the one repository and to the permissions asked for
 # (issues: write when none are named). One retry on a
 # transient failure, as mint_ledger_token does; a 422 comes back on the
-# first attempt and means the grant is missing.
+# first attempt and means the grant is missing. Returns as mint_ledger_token
+# does: LEDGER_MINT_RETRYABLE when the last attempt was transient, 1 otherwise.
 ledger_reset_token() { # <owner/repo> [permissions JSON; issues: write when omitted]
   local body minted rc attempt=1 permissions='{"issues":"write"}'
   [ -n "${2:-}" ] && permissions="$2"
@@ -1069,6 +1108,9 @@ ledger_reset_token() { # <owner/repo> [permissions JSON; issues: write when omit
     minted="$(LEDGER_MINT_BODY="${body}" _ledger_token_mint)" && { printf '%s\n' "${minted%% *}"; return 0; }
     rc=$?
     if [ "${rc}" -ne "${LEDGER_MINT_RETRYABLE}" ] || [ "${attempt}" -ge "${LEDGER_RESET_MINT_ATTEMPTS}" ]; then
+      if [ "${rc}" -eq "${LEDGER_MINT_RETRYABLE}" ]; then
+        return "${LEDGER_MINT_RETRYABLE}"
+      fi
       return 1
     fi
     sleep "${LEDGER_RESET_MINT_RETRY_DELAY}"
@@ -1176,8 +1218,16 @@ reset_audit_ledgers() { # <label> [audit-id]
 # when the repository is not clean, and a unit does not run on it. The mint is
 # the ledger App's, narrowed to the one repository and the three writes
 # (AGENT_PULLS_RESET_PERMISSIONS); the same guards as the ledger reset's.
-reset_agent_pulls() { # <label>  -> 0 when the repository is clean, 1 when a unit must not run on it
-  local label="$1" token out rc=0 slug record
+#
+# On the GitHub forge, a mint that ran out on a transient failure returns
+# LEDGER_MINT_RETRYABLE instead of 1, with the mint's last diagnostic line in
+# AGENT_PULLS_RESET_LAST_FAILURE, so the unit can record its repetition as
+# infrastructure rather than as a missing run (record_unit_not_run). A mint
+# GitHub refused outright (a 422 for a missing grant) and a repository that
+# would not come clean both stay 1, as does a GitLab agent token that is not
+# in hand.
+reset_agent_pulls() { # <label>  -> 0 when the repository is clean, non-zero when a unit must not run on it
+  local label="$1" token out rc=0 slug record diagnostics mint_rc=0
   if [ "${EVAL_FORGE:-github}" != "gitlab" ] && [ -z "${EVAL_LEDGER_APP_KEY_FILE:-}" ]; then
     echo "Agent pulls reset (${label}): skipped, EVAL_LEDGER_APP_KEY_FILE is unset and the mounted PAT is a read credential; the repository keeps whatever the agent left"
     return 0
@@ -1186,14 +1236,25 @@ reset_agent_pulls() { # <label>  -> 0 when the repository is clean, 1 when a uni
     echo "Agent pulls reset (${label}): skipped, PROJECT_ID=${PROJECT_ID:-unset} maps to no GitOps repository (gitops_repo_for_project / gitlab_project_for_project in hack/ci-deploy.sh)"
     return 0
   fi
-  if ! token="$(forge_write_token "${EVAL_LEDGER_REPO}" "${AGENT_PULLS_RESET_PERMISSIONS}")"; then
+  AGENT_PULLS_RESET_LAST_FAILURE=""
+  diagnostics="$(mktemp)"
+  token="$(forge_write_token "${EVAL_LEDGER_REPO}" "${AGENT_PULLS_RESET_PERMISSIONS}" 2>"${diagnostics}")" || mint_rc=$?
+  cat "${diagnostics}" >&2
+  if [ "${mint_rc}" -ne 0 ]; then
     if [ "${EVAL_FORGE:-github}" = "gitlab" ]; then
+      rm -f "${diagnostics}"
       echo "WARNING: Agent pulls reset (${label}): the pool's GitLab agent token is not in hand (read_gitlab_tokens at preflight); a unit that requests a merge request does not run on a project this could not clean." >&2
-    else
-      echo "WARNING: Agent pulls reset (${label}): App ${EVAL_LEDGER_APP_ID} could not mint pull_requests: write, contents: write and issues: write narrowed to ${EVAL_LEDGER_REPO}; a unit that requests a pull request does not run on a repository this could not clean. A 422 above means the installation does not hold those permissions (docs/ci-pool-projects.md 5.3)." >&2
+      return 1
+    fi
+    AGENT_PULLS_RESET_LAST_FAILURE="$(tail -n 1 "${diagnostics}")"
+    rm -f "${diagnostics}"
+    echo "WARNING: Agent pulls reset (${label}): App ${EVAL_LEDGER_APP_ID} could not mint pull_requests: write, contents: write and issues: write narrowed to ${EVAL_LEDGER_REPO}; a unit that requests a pull request does not run on a repository this could not clean. A 422 above means the installation does not hold those permissions (docs/ci-pool-projects.md 5.3)." >&2
+    if [ "${mint_rc}" -eq "${LEDGER_MINT_RETRYABLE}" ]; then
+      return "${LEDGER_MINT_RETRYABLE}"
     fi
     return 1
   fi
+  rm -f "${diagnostics}"
   # One record per call beside the artifacts, named for the call, so a run
   # carries its own proof of what each unit started on.
   slug="$(printf '%s' "${label}" | tr -c 'A-Za-z0-9._-' '_')"
@@ -1381,7 +1442,7 @@ else
   EVAL_LEDGER_REPO="$(eval_gitops_repo "${PROJECT_ID:-}" 2>/dev/null)" || EVAL_LEDGER_REPO=""
 fi
 reset_audit_ledgers "lease"
-reset_agent_pulls "lease" || echo "WARNING: Agent pulls reset (lease): the repository is not clean; every unit of a case that requests a pull request runs its own reset first and is marked MISSING when that fails too." >&2
+reset_agent_pulls "lease" || echo "WARNING: Agent pulls reset (lease): the repository is not clean; every unit of a case that requests a pull request runs its own reset first and does not run when that fails too." >&2
 
 # For opentofu provider
 export CLOUD_PROVIDER="gcp"
@@ -2773,6 +2834,84 @@ finish_case() { # <task-path> <task-name>
   lock_release "${STATE_DIR}/lock-grade"
 }
 
+# A repetition the launcher could not start because GitHub's token endpoint
+# failed transiently, written as a record in place of the run so the gate can
+# tell it from a crash. Without it the repetition had no run directory and the
+# gate graded MISSING, which on a noop-deployer case is rung CHECK_DID_NOT_RUN
+# ("a harness or agent crash, not infrastructure") and reds the run whatever
+# the case's other repetitions did -- the reds of 2026-10-07, when two GitHub
+# incidents made every mint attempt answer HTTP 500 for minutes at a time.
+#
+# The record carries EVAL_INFRA_FAILURE_MARKER at the head of `errors`, the
+# harness's own statement that infrastructure failed (harness.py
+# _infra_failure), which the gate reads as infrastructure whatever the task's
+# deployer and before it asks for scores (classify_rep in
+# bench/kube_agents_bench/scoring.py). The empty trajectory and zero
+# tokens.total say the same to any other reader of the record; the marker is
+# what the gate classifies on, since a record with no scores map never
+# reaches the never-ran signature check. So the
+# repetition leaves the rate, its case is graded on the rest, a case that
+# loses all of them is excluded, and a suite that loses an admitted case or
+# every case reports not evaluated -- the treatment a repetition lost to the
+# agent endpoint already gets.
+#
+# Only for a transient failure, never a refused one: a mint GitHub turns away
+# (the wrong key, a missing grant, a malformed body) is a fault someone has to
+# fix, and one a change to the mint could cause, so it stays MISSING and
+# blocks. Written under the caller's task lock, as a run's state files are, so
+# the count after it is serial. Never fails the unit, which still holds its
+# locks here: every write is guarded, and a record that could not be written
+# leaves the run directory empty, which is the MISSING of before.
+record_unit_not_run() { # <task-name> <rep> <reason>
+  local name="$1" rep="$2" reason="$3" dir now
+  dir="${STATE_DIR}/${EVAL_NOT_RUN_DIR}/${name}.rep${rep}"
+  mkdir -p "${dir}" 2>/dev/null || true
+  EVAL_NOT_RUN_RECORD_STATUS="${EVAL_NOT_RUN_STATUS}" EVAL_NOT_RUN_ERROR="${EVAL_INFRA_FAILURE_MARKER}: ${reason}" python3 -c '
+import json, os, sys
+record = dict(status=os.environ["EVAL_NOT_RUN_RECORD_STATUS"], errors=[os.environ["EVAL_NOT_RUN_ERROR"]], trajectory=[], tokens=dict(total=0), output="")
+with open(sys.argv[1], "w", encoding="utf-8") as fh:
+    json.dump([record], fh)
+' "${dir}/results.json" 2>/dev/null || true
+  [ -s "${dir}/results.json" ] || dir=""
+  now="$(_now_ms)" || now=0
+  printf '%s\n' "${now}" > "${STATE_DIR}/${name}.rep${rep}.start" || true
+  printf '%s\n' "${now}" > "${STATE_DIR}/${name}.rep${rep}.end" || true
+  printf '%s\n' "${dir}" > "${STATE_DIR}/${name}.rep${rep}.dir" || true
+  echo "Repetition not run (${name} rep ${rep}): recorded as infrastructure -- ${reason}" >&2
+}
+
+# How many of a case's repetitions have written their state files. Read under
+# the task lock: the one repetition that sees it reach EVAL_REPETITIONS grades
+# the case.
+finished_rep_count() { # <task-name>
+  local n=0 state
+  for state in "${STATE_DIR}/${1}".rep*.end; do
+    [ -e "${state}" ] && n=$((n + 1))
+  done
+  echo "${n}"
+}
+
+# A unit that did not run, unwound: the locks back, the `<<<` line, and the
+# case graded here when this repetition's not-run record (infra_reason
+# non-empty) was the last of its repetitions to land. Without a reason nothing
+# is written, the repetition grades MISSING, and its case waits for the pass
+# after the fan-out, as before.
+skip_unit() { # <task-path> <task-name> <rep> <streams> <has-stack> <why, for the log line> [infra-reason]
+  local task="$1" name="$2" rep="$3" streams="$4" has_stack="$5" why="$6" infra_reason="${7:-}"
+  local finished_reps=0
+  if [ -n "${infra_reason}" ]; then
+    record_unit_not_run "${name}" "${rep}" "${infra_reason}"
+    finished_reps="$(finished_rep_count "${name}")"
+  fi
+  release_streams "${streams}"
+  [ -n "${has_stack}" ] && lock_release "${STATE_DIR}/lock-infra"
+  lock_release "${STATE_DIR}/lock-task-${name}"
+  echo "<<< [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] ${name} rep ${rep} ${why}" >&2
+  if [ "${finished_reps}" -ge "${EVAL_REPETITIONS}" ]; then
+    finish_case "${task}" "${name}"
+  fi
+}
+
 run_one_unit() { # <task-path> <task-name> <rep> <reuse:true|empty> <has-stack:true|empty> <seq> <streams>
   local task="$1" name="$2" rep="$3" reuse="$4" has_stack="$5" seq="$6" streams="${7:-}"
   local log="/tmp/eval_${name}_rep${rep}.log"
@@ -2851,11 +2990,16 @@ run_one_unit() { # <task-path> <task-name> <rep> <reuse:true|empty> <has-stack:t
   # waiting rather than before it: reps of one task serialize on the task lock,
   # so at the default EVAL_REPETITIONS=3 a unit can sleep past the hour a token
   # lasts and reach devops-bench holding a dead one.
-  if ! mint_ledger_token "${name} rep ${rep}"; then
-    release_streams "${streams}"
-    [ -n "${has_stack}" ] && lock_release "${STATE_DIR}/lock-infra"
-    lock_release "${STATE_DIR}/lock-task-${name}"
-    echo "<<< [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] ${name} rep ${rep} could not mint a ledger token" >&2
+  # A mint that ran out on a transient failure is recorded as infrastructure
+  # (record_unit_not_run); any other failure is left MISSING.
+  local mint_rc=0
+  mint_ledger_token "${name} rep ${rep}" || mint_rc=$?
+  if [ "${mint_rc}" -ne 0 ]; then
+    local mint_infra=""
+    if [ "${mint_rc}" -eq "${LEDGER_MINT_RETRYABLE}" ]; then
+      mint_infra="the ledger read token could not be minted before launch: ${LEDGER_MINT_LAST_FAILURE:-the mint printed no diagnostic}"
+    fi
+    skip_unit "${task}" "${name}" "${rep}" "${streams}" "${has_stack}" "could not mint a ledger token" "${mint_infra}"
     return 0
   fi
   # This stream's in-flight note on the sandbox pod first, left by a
@@ -2879,14 +3023,20 @@ run_one_unit() { # <task-path> <task-name> <rep> <reuse:true|empty> <has-stack:t
   # the agent builds on (#2260). Only for a case that requests a pull request:
   # those run one at a time after every other unit (unit_phase), so nothing a
   # sibling is working on is open here. Not clean: the unit does not run, the
-  # locks go back, and the repetition grades MISSING, as a unit that could not
-  # mint does.
-  if [ "$(unit_phase "${name}")" = "1" ] && ! reset_agent_pulls "${name} rep ${rep}"; then
-    release_streams "${streams}"
-    [ -n "${has_stack}" ] && lock_release "${STATE_DIR}/lock-infra"
-    lock_release "${STATE_DIR}/lock-task-${name}"
-    echo "<<< [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] ${name} rep ${rep} did not run: the leased repository could not be reset" >&2
-    return 0
+  # locks go back, and the repetition grades MISSING -- unless what stopped it
+  # was the reset's own mint running out on a transient failure, which is
+  # recorded as infrastructure, as the grading mint's is above.
+  if [ "$(unit_phase "${name}")" = "1" ]; then
+    local reset_rc=0
+    reset_agent_pulls "${name} rep ${rep}" || reset_rc=$?
+    if [ "${reset_rc}" -ne 0 ]; then
+      local reset_infra=""
+      if [ "${reset_rc}" -eq "${LEDGER_MINT_RETRYABLE}" ]; then
+        reset_infra="the repository reset's token could not be minted before launch: ${AGENT_PULLS_RESET_LAST_FAILURE:-the mint printed no diagnostic}"
+      fi
+      skip_unit "${task}" "${name}" "${rep}" "${streams}" "${has_stack}" "did not run: the leased repository could not be reset" "${reset_infra}"
+      return 0
+    fi
   fi
   if [ -n "${reuse}" ]; then
     export GKE_CLUSTER_NAME="${SEEDED_TASK_CLUSTER}" CLUSTER_NAME="${SEEDED_TASK_CLUSTER}"
@@ -2947,10 +3097,8 @@ run_one_unit() { # <task-path> <task-name> <rep> <reuse:true|empty> <has-stack:t
   printf '%s\n' "${start}" > "${STATE_DIR}/${name}.rep${rep}.start"
   printf '%s\n' "${end}" > "${STATE_DIR}/${name}.rep${rep}.end"
   printf '%s\n' "${dir}" > "${STATE_DIR}/${name}.rep${rep}.dir"
-  local finished_reps=0 state
-  for state in "${STATE_DIR}/${name}".rep*.end; do
-    [ -e "${state}" ] && finished_reps=$((finished_reps + 1))
-  done
+  local finished_reps
+  finished_reps="$(finished_rep_count "${name}")"
   release_streams "${streams}"
   [ -n "${has_stack}" ] && lock_release "${STATE_DIR}/lock-infra"
   lock_release "${STATE_DIR}/lock-task-${name}"

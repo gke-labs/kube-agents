@@ -2137,11 +2137,11 @@ def collect(
                 unfinished=unfinished,
             )
         )
-    # The GitLab lane: pull-request builds of its own job, read as the
-    # presubmit's are (index above the watermark, glob without one) but
-    # above its own watermark, tagged tier gitlab; its unfinished builds are
-    # tagged the same on pending_builds, so the right source retries them
-    # and they never raise the presubmit's watermark.
+    # The GitLab lane: pull-request builds of its own job, read through the
+    # job's directory index above the lane's own watermark, tagged tier
+    # gitlab; its unfinished builds are tagged the same on pending_builds,
+    # so the right source retries them and they never raise the presubmit's
+    # watermark.
     gitlab_fresh: list[dict] = []
     if gitlab_globs:
         listed_before = set(unfinished)
@@ -2150,9 +2150,17 @@ def collect(
         gitlab_glob_only: list[str] = []
         # An explicit --index-prefix is the presubmit's index; the lane's is
         # derived from its own glob (an empty string still disables both).
+        # Unlike the presubmit, the lane takes its index on the cold path
+        # too: the archive-wide glob walks every pull request's directory
+        # (minutes, growing with the archive, past the listing timeout near
+        # 1,700) on every tick until the lane's first run is on record,
+        # which for an on-demand lane is indefinitely, and a timeout is the
+        # refusal line. The index answers "nothing yet" in one flat listing,
+        # and that is a note. The glob is listed only when no index is
+        # derivable from it.
         lane_index = index_prefix if index_prefix == "" else None
         for glob in gitlab_globs:
-            prefix = discovery_index(glob, lane_index) if gitlab_after is not None else None
+            prefix = discovery_index(glob, lane_index)
             if prefix is None:
                 gitlab_glob_only.append(glob)
             elif prefix not in gitlab_indexes:
@@ -2322,9 +2330,10 @@ def main(argv: list[str] | None = None) -> int:
         metavar="GS_GLOB",
         help="gsutil glob of the GitLab lane's Prow build dirs, e.g."
         " gs://kube-agents-prow/pr-logs/pull/gke-labs_kube-agents/*/"
-        "pull-kube-agents-smoke-test-gitlab/* (repeatable). Read like"
-        " --pr-glob, above its own watermark; its runs carry tier=gitlab and"
-        " count in no gate verdict",
+        "pull-kube-agents-smoke-test-gitlab/* (repeatable). Read through"
+        " the job's own directory index, whole on a cold sweep and above its"
+        " own watermark after; its runs carry tier=gitlab and count in no"
+        " gate verdict",
     )
     parser.add_argument(
         "--index-prefix",

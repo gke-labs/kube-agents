@@ -96,8 +96,16 @@ def scratch_root() -> Path:
 
 
 def default_into(repo: str) -> Path:
-    owner, _, name = repo.partition("/")
-    return scratch_root() / f"{owner}__{name}"
+    """Where a clone of `repo` lands when the caller names no directory.
+
+    GitHub's `owner/name` keeps the `owner__name` it always had. A name on
+    another forge carries its host and nests deeper, so every `/` is spelled
+    `%2F`: one directory, and no two names land in the same one.
+    """
+    if repo.count("/") == 1:
+        owner, _, name = repo.partition("/")
+        return scratch_root() / f"{owner}__{name}"
+    return scratch_root() / repo.replace("/", "%2F")
 
 
 def prepare_destination(into: Path, force: bool) -> Path:
@@ -367,7 +375,10 @@ def build_parser() -> argparse.ArgumentParser:
     commands = parser.add_subparsers(dest="command", required=True)
 
     def add_repo(sub):
-        sub.add_argument("--repo", required=True, help="owner/name")
+        sub.add_argument(
+            "--repo", required=True,
+            help="owner/name on GitHub, or <host>/<path> on another forge this install serves",
+        )
         sub.add_argument("--ref", help="branch to read; defaults to the base the broker pins the repository to, else the remote's HEAD")
         sub.add_argument(
             "--depth",

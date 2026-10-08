@@ -1,65 +1,66 @@
-"""Mark a Slack ask ❌ when the work it started fails, and nothing otherwise.
+"""React to a Slack ask by its kind until it is answered, then leave ❌ only if it failed.
 
 Installed into the image at ``/opt/hermes/gateway/slack_ux_reactions.py``.
 ``apply_slack_ux_reactions.py`` makes the Slack adapter's two reaction hooks
 (``on_processing_start``, ``on_processing_complete``) hand over to this module
 when ``KAGE_SLACK_UX`` is on, and ``kanban_progress_lines.py`` (installed by
 ``apply_kanban_progress_lines.py``) calls :func:`settle_delegated` after the
-kanban notifier delivers a terminal event.
+kanban notifier delivers a terminal event or an ``unblocked`` one.
 With the flag off neither caller reaches anything here, and the adapter keeps
 upstream's 👀 then ✅/❌.
 
 Upstream, and why it changes
 ----------------------------
 Upstream adds 👀 when a turn starts, then removes it and adds ✅ or ❌ when the
-turn ends. Two things go wrong in a kube-agents install:
+turn ends. The turn that delegates ends in seconds, with an acknowledgement;
+the work runs on the kanban board for minutes after, so upstream's ✅ says
+"done" at the moment the work starts.
 
-* The credential proxy refuses every Slack method ending in ``remove``, so the
-  👀 never goes and the ✅ lands beside it anyway.
-* The turn that delegates ends in seconds, with an acknowledgement; the work
-  runs on the kanban board for minutes after. Upstream's ✅ says "done" at the
-  moment the work starts.
+With the flag on:
 
-With the flag on, only a failure shows: ``SHOW_ARRIVAL`` and
-``SHOWN_SETTLES`` hold the routine reactions (the arrival reaction, ✅ and ⏸️)
-back, a display choice made for now. Everything below still decides each ask's
-settle, so a delegated ask's ❌ still waits on the cards it opened.
+* The arrival reaction says what kind of ask this is, chosen from its words
+  before any model call (``slack_presenter.arrival_reaction``): 🔍 something
+  to investigate, 🌐 the whole fleet, ⬆️ an upgrade or version, 💰 cost, 🛡️
+  security, 🛠️ a change, 📋 the board, 🚨 an incident, and 👀 otherwise.
+* It comes off when the answer posts. For a turn that answered directly that
+  is the turn's end; for a delegated ask it is the final answer, not the
+  acknowledgement. Work that succeeded is left with no reaction, and work that
+  failed with ❌. A cancelled turn has its arrival reaction taken off and
+  nothing added. There is no ✅.
+* ⏸️ stands while one of the ask's cards waits on the user, and comes off when
+  the card is unblocked or finishes.
+* Slack's ``reactions.remove`` removes only the caller's own reaction, so a
+  reaction someone else put on the ask is never touched. A removal that fails
+  or is refused leaves the reaction on and is logged; the answer still posts.
 
-* The arrival reaction would say what kind of ask this is, chosen from its
-  words before any model call (``slack_presenter.arrival_reaction``): 👀 a
-  question or check, 🛠️ a change, 📋 the board, 🚨 an incident.
-* Nothing is ever removed.
-* A turn that answered directly settles at once: ✅, or ❌ on failure. A
-  cancelled turn adds nothing.
-* A turn that put new cards on the board, subscribed to this thread, defers
-  its settle to those cards, and only those: a card already open when the ask
-  arrived is not its to wait on, even one unblocked while the turn ran.
-  Hermes records no actor on an unblock, so it may be the CLI's or another
-  turn's; that card's own ask carries its outcome. Nor is a card created
-  under one it did not open, a worker's follow-up or one filed beneath that,
-  even through a follow-up that completed while the turn ran: Hermes copies
-  the creator's subscriptions onto it, so it is in the thread without being
-  the turn's. A turn that failed after opening them still
-  settles ❌ when they finish, whatever they did. The kanban notifier calls
-  :func:`settle_delegated` on each terminal event: ⏸️ as soon as one of the
-  ask's cards blocks on the user, and once every one of them has finished, ✅,
-  or ❌ if any gave up. A completion extends its ask to the open cards created
-  under it, directly or through follow-ups already completed (see
-  :func:`settle_delegated`). A fan-out settles once, when all of it has. Only a
-  finish reported while the turn runs, or after it, counts for its ask. Cards
-  are read from every live board, as the notifier reads them, and known by
-  board and id.
+A turn that put new cards on the board, subscribed to this thread, defers its
+settle to those cards, and only those: a card already open when the ask
+arrived is not its to wait on, even one unblocked while the turn ran. Hermes
+records no actor on an unblock, so it may be the CLI's or another turn's; that
+card's own ask carries its outcome. Nor is a card created under one it did not
+open, a worker's follow-up or one filed beneath that, even through a follow-up
+that completed while the turn ran: Hermes copies the creator's subscriptions
+onto it, so it is in the thread without being the turn's. A turn that failed
+after opening them still settles ❌ when they finish, whatever they did. The
+kanban notifier calls :func:`settle_delegated` on each terminal event: ⏸️ as
+soon as one of the ask's cards blocks on the user, and once every one of them
+has finished, the arrival reaction off, with ❌ if any gave up. A completion
+extends its ask to the open cards created under it, directly or through
+follow-ups already completed (see :func:`settle_delegated`). A fan-out settles
+once, when all of it has. Only a finish reported while the turn runs, or after
+it, counts for its ask. Cards are read from every live board, as the notifier
+reads them, and known by board and id.
 
 The deferred asks live in this process only (the notifier runs in the gateway
 process too). A gateway restart between the turn and the settle loses the
-settle, and the ask shows nothing; nothing is ever put on a message this
-process did not see arrive.
+settle, and the ask keeps its arrival reaction; nothing is ever put on a
+message this process did not see arrive.
 
 Fail-soft throughout: an open-card read that fails, on any board, settles the
 ask at once as a direct answer; a lineage read that fails leaves the turn to the
 open-card reads, so a card under a creator that closed within the turn counts as
-the turn's; and a reaction that fails is logged at debug and the turn carries
-on, as upstream's ``_react`` already does.
+the turn's; and a reaction that fails is logged and the turn carries on, as
+upstream's ``_react`` already does.
 """
 
 from __future__ import annotations
@@ -126,7 +127,8 @@ THREAD_LINEAGE_SQL = (
 LINEAGE_DEPTH = 8
 
 #: ``ProcessingOutcome`` values, compared by value so this module needs no
-#: gateway import. ``cancelled`` is absent: an interrupted turn settles nothing.
+#: gateway import. ``cancelled`` is absent: an interrupted turn settles nothing
+#: beyond taking its arrival reaction off.
 OUTCOME_SETTLES = {"success": "done", "failure": "failed"}
 
 #: Bounds on the in-process maps, oldest evicted first. A turn in flight is
@@ -141,11 +143,15 @@ DEFERRED_PER_THREAD = 32
 #: The notifier's dedup key for a board whose database path does not resolve.
 UNRESOLVED_PREFIX = "slug:"
 
-#: Whether an ask gets its arrival reaction, and which settles show as a
-#: reaction on it (``slack_presenter.SETTLE_*`` values, copied as the flag
-#: values are). Only a failure is marked for now: no routine 👀, ✅ or ⏸️.
-SHOW_ARRIVAL = False
-SHOWN_SETTLES = frozenset({"failed"})
+#: The notifier event kind that resumes a card blocked on the user. It
+#: settles nothing (``slack_presenter.settle_for_kanban_kind``); it takes ⏸️ off.
+RESUME_KIND = "unblocked"
+
+#: The notifier event kind for a card archived by hand. It settles nothing in
+#: ``slack_presenter``, but no later event names the card, so it takes the
+#: card off each ask waiting on it as a final event does: no failure, and no
+#: read for follow-ups.
+ARCHIVED_KIND = "archived"
 
 #: Statuses a card runs from, or waits to be picked up in. A card that paused
 #: during a turn but sits in one of these at its end was resumed within it.
@@ -166,33 +172,43 @@ class _Card(NamedTuple):
 
 class _Turn:
     """A turn in flight: its thread, the thread's open cards when it started,
-    the cards that finished while it ran, each with whether it failed, and the
-    cards that paused while it ran.
+    the cards that finished while it ran, each with whether it failed, the
+    cards that paused while it ran, and the arrival reaction it put on the ask.
 
     Only events seen during the turn count, so nothing a card did before this
     turn, or after an earlier one, decides this ask. A pause is kept because
     its ask is not deferred yet, so nothing else would put ⏸️ on it.
     """
 
-    __slots__ = ("before", "finished", "key", "paused")
+    __slots__ = ("arrival", "before", "finished", "key", "paused")
 
-    def __init__(self, key: tuple, before: dict | None) -> None:
+    def __init__(self, key: tuple, before: dict | None, arrival: str | None = None) -> None:
         self.key = key
         self.before = before
+        self.arrival = arrival
         self.finished: dict[tuple[str, str], bool] = {}
         self.paused: set[tuple[str, str]] = set()
 
 
 class _Ask:
-    """A Slack ask whose settle waits on the cards its turn opened, as ``(board, id)``."""
+    """A Slack ask whose settle waits on the cards its turn opened, as ``(board, id)``.
 
-    __slots__ = ("cards", "failed", "team_id", "ts")
+    ``blocked`` holds those of its cards waiting on the user, and ``paused``
+    whether ⏸️ is on the ask for them.
+    """
 
-    def __init__(self, ts: str, team_id: Any, cards: set, failed: bool = False) -> None:
+    __slots__ = ("arrival", "blocked", "cards", "failed", "paused", "team_id", "ts")
+
+    def __init__(
+        self, ts: str, team_id: Any, cards: set, failed: bool = False, arrival: str | None = None,
+    ) -> None:
         self.ts = ts
         self.team_id = team_id
         self.cards = cards
         self.failed = failed
+        self.arrival = arrival
+        self.blocked: set = set()
+        self.paused = False
 
 
 _started: OrderedDict[Any, _Turn] = OrderedDict()
@@ -214,10 +230,40 @@ def enabled() -> bool:
     return False
 
 
-async def _show(adapter: Any, chat_id: str, ts: str, settle: str, team_id: Any) -> None:
-    """Put ``settle``'s reaction on the ask, if it is one that shows."""
-    if settle in SHOWN_SETTLES:
-        await adapter._react(chat_id, ts, _presenter.settle_reaction(settle), team_id, remove=False)
+async def _unreact(adapter: Any, chat_id: str, ts: str, emoji: str, team_id: Any) -> None:
+    """Take this process's ``emoji`` off the ask; one that will not come off stays on."""
+    if not await adapter._react(chat_id, ts, emoji, team_id, remove=True):
+        logger.info("slack_ux_reactions: could not remove :%s: from %s/%s; leaving it on", emoji, chat_id, ts)
+
+
+async def _answered(
+    adapter: Any, chat_id: str, ts: str, team_id: Any, arrival: str | None, failed: bool, paused: bool = False,
+) -> None:
+    """The ask is answered: ❌ on if it failed, then ⏸️ and the arrival reaction off."""
+    if failed:
+        await adapter._react(chat_id, ts, _presenter.settle_reaction(_presenter.SETTLE_FAILED), team_id, remove=False)
+    if paused:
+        await _unreact(adapter, chat_id, ts, _presenter.settle_reaction(_presenter.SETTLE_BLOCKED), team_id)
+    if arrival:
+        await _unreact(adapter, chat_id, ts, arrival, team_id)
+
+
+async def _pause(adapter: Any, chat_id: str, ask: _Ask, cards: set) -> None:
+    """``cards`` of this ask wait on the user: ⏸️ on, once."""
+    ask.blocked |= cards
+    if ask.blocked and not ask.paused:
+        ask.paused = True
+        await adapter._react(
+            chat_id, ask.ts, _presenter.settle_reaction(_presenter.SETTLE_BLOCKED), ask.team_id, remove=False,
+        )
+
+
+async def _resume(adapter: Any, chat_id: str, ask: _Ask, card: tuple | None = None) -> None:
+    """``card`` no longer waits on the user: ⏸️ off once none of the ask's cards does."""
+    ask.blocked.discard(card)
+    if ask.paused and not ask.blocked:
+        ask.paused = False
+        await _unreact(adapter, chat_id, ask.ts, _presenter.settle_reaction(_presenter.SETTLE_BLOCKED), ask.team_id)
 
 
 def _remember(store: OrderedDict, key: Any, value: Any, cap: int) -> None:
@@ -366,7 +412,7 @@ def _creator_unseen(before: dict, after: dict, finished: dict) -> bool:
 
 
 async def on_processing_start(adapter: Any, event: Any) -> None:
-    """Note the thread's open cards, after the arrival reaction for this ask's kind if that shows."""
+    """Put the arrival reaction for this ask's kind on it, then note the thread's open cards."""
     target = adapter._reacting_target(event)
     if target is None:
         return
@@ -374,18 +420,18 @@ async def on_processing_start(adapter: Any, event: Any) -> None:
     chat_id, thread_id = _where(event)
     if not chat_id:
         return
-    if SHOW_ARRIVAL:
-        emoji = _presenter.arrival_reaction(getattr(event, "text", ""))
-        await adapter._react(chat_id, ts, emoji, team_id, remove=False)
+    emoji = _presenter.arrival_reaction(getattr(event, "text", ""))
+    arrival = emoji if await adapter._react(chat_id, ts, emoji, team_id, remove=False) else None
     # After the reaction, so the read never delays it; the model has not
     # created a card yet, since the turn has not reached its first tool call.
     # Events are recorded from here on. One can lag the change it reports, so
     # _own_cards decides from the board what the turn did, not from arrival.
-    _remember(_started, marker, _Turn((chat_id, thread_id), await open_cards(chat_id, thread_id)), STARTED_MAX)
+    turn = _Turn((chat_id, thread_id), await open_cards(chat_id, thread_id), arrival)
+    _remember(_started, marker, turn, STARTED_MAX)
 
 
 async def on_processing_complete(adapter: Any, event: Any, outcome: Any) -> None:
-    """Settle the ask now, or defer to the cards this turn put on the board. Never removes."""
+    """Settle the ask now, or defer to the cards this turn put on the board."""
     target = adapter._reacting_target(event)
     if target is None:
         return
@@ -394,7 +440,9 @@ async def on_processing_complete(adapter: Any, event: Any, outcome: Any) -> None
     chat_id, thread_id = _where(event)
     settle = OUTCOME_SETTLES.get(str(getattr(outcome, "value", outcome)))
     if not chat_id or settle is None:
-        _started.pop(marker, None)
+        cancelled = _started.pop(marker, None)
+        if chat_id and cancelled is not None and cancelled.arrival:
+            await _unreact(adapter, chat_id, ts, cancelled.arrival, team_id)
         return
     after = await open_cards(chat_id, thread_id)
     # A closed creator is in neither read; the lineage read links it to its
@@ -410,6 +458,7 @@ async def on_processing_complete(adapter: Any, event: Any, outcome: Any) -> None
     # nothing below awaits before the ask is deferred.
     turn = _started.pop(marker, None)
     before = turn.before if turn is not None else None
+    arrival = turn.arrival if turn is not None else None
     new = _own_cards(before, after, turn.finished, lineage) if before is not None and after is not None else set()
     if new:
         waiting = new - set(turn.finished)
@@ -417,7 +466,8 @@ async def on_processing_complete(adapter: Any, event: Any, outcome: Any) -> None
         # later complete do not undo an ask whose turn raised.
         failed = settle == _presenter.SETTLE_FAILED or any(turn.finished.get(card, False) for card in new)
         if waiting:
-            asks = [*_deferred.get((chat_id, thread_id), []), _Ask(ts, team_id, waiting, failed)]
+            ask = _Ask(ts, team_id, waiting, failed, arrival)
+            asks = [*_deferred.get((chat_id, thread_id), []), ask]
             if len(asks) > DEFERRED_PER_THREAD:
                 logger.debug(
                     "slack_ux_reactions: %s/%s has %d asks waiting; dropping the oldest, which will not settle",
@@ -425,22 +475,27 @@ async def on_processing_complete(adapter: Any, event: Any, outcome: Any) -> None
                 )
             _remember(_deferred, (chat_id, thread_id), asks[-DEFERRED_PER_THREAD:], DEFERRED_MAX)
             # A pause the turn also saw resumed would put ⏸️ on nothing that waits.
-            paused = {card for card in waiting & turn.paused if card in after}
-            if any(after[card].status not in RESUMED_STATUSES for card in paused):
-                await _show(adapter, chat_id, ts, _presenter.SETTLE_BLOCKED, team_id)
+            paused = {
+                card for card in waiting & turn.paused
+                if card in after and after[card].status not in RESUMED_STATUSES
+            }
+            if paused:
+                await _pause(adapter, chat_id, ask, paused)
             return
         if failed:
             settle = _presenter.SETTLE_FAILED
-    await _show(adapter, chat_id, ts, settle, team_id)
+    await _answered(adapter, chat_id, ts, team_id, arrival, settle == _presenter.SETTLE_FAILED)
 
 
 async def settle_delegated(adapter: Any, sub: dict, kind: str, board: str | None = None) -> None:
-    """Settle the asks waiting on this card, after a notifier terminal event.
+    """Settle the asks waiting on this card, after a notifier terminal or ``unblocked`` event.
 
-    ⏸️ goes on each ask waiting on the card as soon as it blocks. A final event
-    takes the card off each ask's set; an ask whose set empties gets ✅, or ❌
-    if any of its cards gave up, and is forgotten. A card no ask is waiting on
-    is left alone. ``board`` is the notifier's slug for the card's board, which
+    ⏸️ goes on each ask waiting on the card as soon as it blocks, and comes off
+    once the card is unblocked or finishes and no other card of the ask waits
+    on the user. A final event takes the card off each ask's set; an ask whose
+    set empties has its arrival reaction taken off, gets ❌ if any of its cards
+    gave up, and is forgotten. ``archived`` counts as final, and not as a failure.
+    A card no ask is waiting on is left alone. ``board`` is the notifier's slug for the card's board, which
     with the card's id is how an ask knows it.
 
     Before a completion takes a card off, the thread is read once for open
@@ -453,21 +508,29 @@ async def settle_delegated(adapter: Any, sub: dict, kind: str, board: str | None
     follow-up still open waits for that follow-up's completion, as it would
     have had the follow-up been on the board at the turn's end. One
     blocked on the user is kept and puts ⏸️ on the ask. One parked by a give-up
-    is not, nor is anything created under it, and it leaves the ask ✅ for the
-    work it did: being subscribed to this thread, the follow-up has posted its
+    is not, nor is anything created under it, and it leaves the ask settled
+    without ❌ for the work it did: being subscribed to this thread, the follow-up has posted its
     own "gave up" line in it, which is the failure. A
     give-up holds on nothing more: the card is parked, so a follow-up it gates
     cannot start, and the ask is ❌ whatever the rest do. A failed read settles
     as though there were none. A card filed under this one after its
     completion is delivered is not seen: the ask has settled by then.
     """
-    if not enabled() or (sub.get("platform") or "").lower() != PLATFORM:
-        return
-    settle = _presenter.settle_for_kanban_kind(kind)
-    if settle is None or not sub.get("task_id"):
+    if not enabled() or (sub.get("platform") or "").lower() != PLATFORM or not sub.get("task_id"):
         return
     card = (board or DEFAULT_BOARD, sub["task_id"])
     key = (sub.get("chat_id"), str(sub.get("thread_id") or ""))
+    if kind == RESUME_KIND:
+        for turn in _started.values():
+            if turn.key == key:
+                turn.paused.discard(card)
+        if hasattr(adapter, "_react"):
+            for ask in [ask for ask in _deferred.get(key, []) if card in ask.blocked]:
+                await _resume(adapter, key[0], ask, card)
+        return
+    settle = _presenter.settle_for_kanban_kind(kind)
+    if settle is None and kind != ARCHIVED_KIND:
+        return
     provisional = settle in _presenter.PROVISIONAL_SETTLES
     for turn in _started.values():
         if turn.key != key:
@@ -481,7 +544,7 @@ async def settle_delegated(adapter: Any, sub: dict, kind: str, board: str | None
         return
     if provisional:
         for ask in asks:
-            await _show(adapter, key[0], ask.ts, settle, ask.team_id)
+            await _pause(adapter, key[0], ask, {card})
         return
     follow_ups = {}
     if settle == _presenter.SETTLE_DONE:
@@ -490,13 +553,14 @@ async def settle_delegated(adapter: Any, sub: dict, kind: str, board: str | None
             creators = {**await thread_lineage(*key), **{c: seen.creator for c, seen in still_open.items()}}
             under = _descendants(card, creators, frozenset(still_open) - {card})
             follow_ups = {c: seen for c, seen in still_open.items() if c in under and not seen.gave_up}
-    waits_on_user = any(seen.status not in RESUMED_STATUSES for seen in follow_ups.values())
+    waits_on_user = {c for c, seen in follow_ups.items() if seen.status not in RESUMED_STATUSES}
     # The read awaited, so another event may have settled an ask meanwhile.
     asks = [ask for ask in _deferred.get(key, []) if card in ask.cards]
     settled = []
     for ask in asks:
         ask.cards |= follow_ups.keys()
         ask.cards.discard(card)
+        ask.blocked.discard(card)
         ask.failed = ask.failed or settle == _presenter.SETTLE_FAILED
         if not ask.cards:
             settled.append(ask)
@@ -506,9 +570,10 @@ async def settle_delegated(adapter: Any, sub: dict, kind: str, board: str | None
             _deferred[key] = remaining
         else:
             _deferred.pop(key, None)
-    if waits_on_user:
-        for ask in asks:
-            await _show(adapter, key[0], ask.ts, _presenter.SETTLE_BLOCKED, ask.team_id)
-    for ask in settled:
-        outcome = _presenter.SETTLE_FAILED if ask.failed else _presenter.SETTLE_DONE
-        await _show(adapter, key[0], ask.ts, outcome, ask.team_id)
+    for ask in asks:
+        if ask in settled:
+            await _answered(adapter, key[0], ask.ts, ask.team_id, ask.arrival, ask.failed, ask.paused)
+        elif waits_on_user:
+            await _pause(adapter, key[0], ask, waits_on_user)
+        else:
+            await _resume(adapter, key[0], ask)
