@@ -1635,7 +1635,7 @@ func childSteers(t *testing.T, r *rig, child *lib.Envelope) int {
 }
 
 // TestAnOffListSteerIntoTheChildIsRefusedAndNotSent: gke-labs#2531 item 5.
-// The platform executor now acts on a steer (G22), so a steer into a
+// The platform executor now acts on a steer, so a steer into a
 // delegated child is checked against the target's list as the delegation
 // was. Refused: the target-only notice, nothing published, no author
 // recorded. Allowed: published on the child's in subject and acknowledged.

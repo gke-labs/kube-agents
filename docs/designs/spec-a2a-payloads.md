@@ -416,7 +416,7 @@ artifact, and six names are reserved so renderers and audit tooling can rely on 
 | `activity` | Tool-call trace, one entry per invocation. Always in the audit replay                                                                                                                                                                                  |
 | `progress` | Agent-authored milestones, renderable to chat at zero model cost. Stage 1 derives these from model narration; the subagent framework spec records the deviation                                                                                        |
 | `delegate` | The session's request to the gateway to mint a child task: one `data` part `{"addressee", "text"}` on the session's own task events. Consumed by the gateway's relay, never rendered to chat; reserved 10/5, used from the delegation primitive onward |
-| `turn`     | One finished turn's answer on a task with more turns queued (an executor that queues follow-ups). Chunked like `result`, posted by renderers as it completes, never the deliverable; the last turn's answer is the `result`. Reserved 10/8 (G22)       |
+| `turn`     | One finished turn's answer on a task with more turns queued (an executor that queues follow-ups). Chunked like `result`, posted by renderers as it completes, never the deliverable; the last turn's answer is the `result`.                           |
 
 Artifact names are data, so the set can grow without touching the envelope; only these
 six carry reserved semantics. An `activity` entry is one `data` part whose object carries

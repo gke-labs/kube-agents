@@ -403,7 +403,7 @@ func capAsk(text string) string {
 // relay has already posted the whole result to the conversation.
 //
 // turns are the answers of the child's earlier turns, in order, when it ran
-// follow-ups (G22): the first answers the delegated request, and the result
+// follow-ups: the first answers the delegated request, and the result
 // answers the last follow-up. A completed wake's body is then every answer in
 // order, each follow-up's under wakeFollowUpMarker, so the session reads the
 // answer to what it asked and not only the last. A child that answered turns

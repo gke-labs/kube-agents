@@ -70,7 +70,7 @@ func TestSpawnFailureClosesTheTaskAsItsSupervisor(t *testing.T) {
 
 // TestSteerAckIsRouteConditioned: the spec's gateway-authored-posts rule —
 // the acknowledgement depends on what the executor will do with the steer:
-// the fixed route's executor queues it and answers it next (G22), a session
+// the fixed route's executor queues it and answers it next, a session
 // worker absorbs it at its next turn boundary if the task is still running.
 func TestSteerAckIsRouteConditioned(t *testing.T) {
 	t.Run("fixed route says it takes it next", func(t *testing.T) {
@@ -168,7 +168,7 @@ func TestStopWithNothingToStopStartsNoTask(t *testing.T) {
 }
 
 // TestAfterAStopANonExactStatusAskIsANewTask: the status matcher is the exact
-// phrase set everywhere (G22), so after a stop a status-shaped but
+// phrase set everywhere, so after a stop a status-shaped but
 // non-exact ask is a NEW task, not a replay of the dead one — while the
 // exact phrases still answer status.
 func TestAfterAStopANonExactStatusAskIsANewTask(t *testing.T) {
@@ -193,7 +193,7 @@ func TestAfterAStopANonExactStatusAskIsANewTask(t *testing.T) {
 	})
 }
 
-// G22: on the fixed route an interrogative that is not an exact phrase is a
+// On the fixed route an interrogative that is not an exact phrase is a
 // steer, published to the running task, not answered by replay.
 func TestFixedRouteWideAskIsASteer(t *testing.T) {
 	r := startRig(t)

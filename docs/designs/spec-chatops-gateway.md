@@ -162,7 +162,7 @@ The two differ on steers: a session worker absorbs them at its next turn boundar
 while the standing front door queues them and answers each as a further turn after the
 current one, with a status notice per follow-up (the payload spec's steering rule).
 
-The status matcher is the exact phrase set on every route (narrowed 10/8, G22). A wider
+The status matcher is the exact phrase set on every route. A wider
 interrogative rule applied while the fixed-route front door refused steers, where a
 stolen false positive cost nothing; the front door now queues steers and answers them,
 so a stolen one is a lost correction there too, and a status-shaped steer is a question

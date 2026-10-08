@@ -59,7 +59,7 @@ var statusQueries = map[string]bool{
 // doing rather than telling it something. Deterministic by design - the
 // gateway holds no model - so this is a phrase set and nothing wider. A
 // wider interrogative rule existed while the fixed-route executor refused
-// steers, where a stolen steer cost nothing; since G22 every executor acts
+// steers, where a stolen steer cost nothing; now every executor acts
 // on a steer, and a status-shaped steer is a question the agent can answer
 // itself.
 func isStatusQuery(text string) bool {

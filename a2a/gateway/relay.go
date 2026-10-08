@@ -58,7 +58,7 @@ type relayState struct {
 	// task, under g.mu, for the relay to weigh against the executor's steer
 	// notices at the terminal.
 	steersSent int
-	// The executor's word on those follow-ups (G22): answered, the envelope
+	// The executor's word on those follow-ups: answered, the envelope
 	// ids it sent a steer notice for; queued, those it queued and has not
 	// refused since; ended, those it refused task-ended; noResume, how many
 	// it refused no-resume. turnsStarted counts the turn answers posted. The

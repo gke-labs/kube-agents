@@ -8,7 +8,7 @@ import (
 
 func TestIsStatusQuery(t *testing.T) {
 	// Exact phrases are the only status affordance: every executor now acts
-	// on a steer (G22), so a status-shaped steer stolen by a wide rule is a
+	// on a steer, so a status-shaped steer stolen by a wide rule is a
 	// lost correction everywhere.
 	exact := []string{
 		"what is it doing", "What's it doing?", "status", "Status?",

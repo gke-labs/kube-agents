@@ -2110,8 +2110,8 @@ func (g *Gateway) startTaskWith(ctx context.Context, rec *SessionRecord, ts task
 const noticeSteerNotSent = "⚠️ could not send that to the running task; it is still working on the original instruction"
 
 // The steer acknowledgements, one per route (spec-chatops-gateway.md,
-// "Gateway-authored posts"). The fixed-route wording is a product decision
-// (G22): the platform agent queues a follow-up and answers it next, and a
+// "Gateway-authored posts"). The fixed-route wording is a product decision:
+// the platform agent queues a follow-up and answers it next, and a
 // refusal follows as its own notice on the stream, so this is the one place
 // it is spelled.
 const (
@@ -2153,8 +2153,8 @@ func (g *Gateway) steerTask(ctx context.Context, rec *SessionRecord, msg Inbound
 	// the steer never arrived, and an author recorded for nothing costs at
 	// most a refused delegation.
 	author := TaskRequester{Backend: backend, Subject: requesterSubject(g.ps, backend, msg.AuthorID)}
-	// A delegated child runs on the target's executor, which acts on a steer
-	// (G22), so its author is checked against the target's list as a
+	// A delegated child runs on the target's executor, which acts on a steer,
+	// so its author is checked against the target's list as a
 	// delegation's are (gke-labs#2531 item 5). Before the author is recorded
 	// and before anything is published: a refused steer leaves no trace but
 	// the audit line and the target-only notice.
