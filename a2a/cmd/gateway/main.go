@@ -198,10 +198,18 @@ func realMain(ctx context.Context, log *slog.Logger) error {
 		notifier, err := gateway.NewSlackNotifier(slackAdapter, cfg.SlackHomeChannel, log)
 		if err != nil {
 			log.Error("chat.notify route not armed", "err", err)
-		} else if sub, err := notifier.Start(client); err != nil {
-			log.Error("chat.notify route not armed", "err", err)
 		} else {
-			defer sub.Stop()
+			// Run retries a failed bind, as Chat's arm above does.
+			notifyCtx, cancelNotify := context.WithCancel(ctx)
+			notifierDone := make(chan struct{})
+			go func() {
+				defer close(notifierDone)
+				notifier.Run(notifyCtx, client)
+			}()
+			defer func() {
+				cancelNotify()
+				<-notifierDone
+			}()
 		}
 	}
 	// The door is a side door, not a backend: it can be armed beside either
