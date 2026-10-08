@@ -141,7 +141,7 @@ removes both. The first-run stage skips every audit when no GitOps repository is
 the fleet-audit skill's `start` fails outright without one (`INSTALL.md` says so), because the
 streams it serves exist to file a ledger. This stream does not: the collector needs no repository
 and the report on the volume is the record, so the SOP runs the collector first and calls `start`
-and `finish` only when a repository is configured, and the first-run stage marks this job due
+and `finish` only when a repository is configured and the run is full, and the first-run stage marks this job due
 without a repository. That is the "chat-only mode" the first-run design lists as an open question,
 scoped to this one stream. An install that onboarded before the job existed gets its baseline from
 the first Sunday tick.
@@ -159,22 +159,33 @@ A question that names a cluster the last run did not review forces that cluster 
 ### 3.2 Scope: new or upgraded since the last run
 
 The ledger holds, per cluster, the control-plane version, every node pool's version, the time of
-the last run, and the symptom set seen at the last review (owner, category and reason, no tenant
-text), which is the before side of the catalogue's diff: on review each symptom is marked new since
-the last review or present before, and a symptom that was already present before an upgraded
-cluster's operations started is graded a Warning with the reason "predates the upgrade", never an
-Error. The first run has no baseline, marks every symptom first seen and says a baseline was
-recorded. A cluster is _new_ when absent, _upgraded_ when a version differs or when
+the last run, and the symptom set seen at the last full run (owner, category, reason and onset, no
+tenant text). The before side of the catalogue's diff is established two ways, and the stronger one
+decides. Every full run reads pods and nodes on every fleet cluster, upgraded or not (one list call
+each), so the stored set is at most a week old rather than as old as the previous upgrade. And each
+symptom carries its own onset, read from the object: a Pending pod's start, a container's last
+termination, a `Ready=False` transition, an event's first observation. A symptom whose onset is
+earlier than the first operation of the cluster's upgrade window, or that the previous full run
+already recorded, is graded a Warning with the reason "predates the upgrade", never an Error; a
+symptom with no readable onset falls back to the stored set alone. The first run has no stored set
+and grades by onset only, which it says. A cluster is _new_ when absent, _upgraded_ when a version differs or when
 `gcloud container operations list` shows an `UPGRADE_MASTER` or `UPGRADE_NODES` operation targeting
 it that reached a terminal status (`DONE`, `ABORTING`, an error) with an end time after the last
 run, and _re-checked_ when it is unchanged but holds a live guard:
 only the reads that guard needs run, and a guard whose symptom or shape is gone is cleared. A
 cluster a successful listing no longer names leaves the ledger and loses its guards, and the report
-says so, but only on a _full_ run: one with no `--cluster`, whose project set covers every project
-the ledger holds and whose every listing succeeded. A run narrowed by `--cluster`, by the question
-that invoked it, or by a hand run without `--project` is _scoped_: it reviews only its targets, never
-prunes a ledger entry or a guard outside them, writes its report under a `-scoped` name and does not
-move the latest link. A cluster with an operation still `RUNNING` is not reviewed: a drain in progress shows a
+says so, but only on a _full_ run. The ledger records the fleet's project set, written by the last
+full run; a full run is one with no `--cluster` whose `--project` set is the SOP's roster (the
+management project and every project a Cluster Agent profile names) and whose every listing
+succeeded, and it may change the fleet set: a project that left the roster is pruned with its
+clusters, a project that joined is added. A run narrowed by `--cluster`, by the question that
+invoked it, or by a hand run without `--project` is _scoped_: it reviews only its targets, never
+prunes a ledger entry or a guard outside them, never adds a project to the fleet set (a cluster it
+reviews outside the fleet is reported and marked "outside the fleet; not recorded"), writes its
+report under a `-scoped` name, does not move the latest link, and never calls the fleet-audit
+`start` or `finish`, so a question about one clean cluster cannot close the fleet's ledger issue.
+`--since` is a hand-run flag that widens the window a scoped run reviews; it never replaces the
+ledger's last-run time. A cluster with an operation still `RUNNING` is not reviewed: a drain in progress shows a
 budget with no allowance, a Pending replacement and a `NotReady` node, which are the signatures of
 entries 1, 2 and 17 on a cluster that is simply not finished; it is listed under Info as upgrading
 now and reviewed on the next run, and the on-demand route says the same when asked mid-upgrade. The
@@ -205,9 +216,9 @@ signatures:
 | ----------------------------------------------------------------------------------------- | ----- |
 | `failed calling webhook` in a `FailedCreate` event or a pod's message                     | 7     |
 | `didn't match … node selector` / node affinity on a pod                                   | 12    |
-| `OOMKilled` on a cgroup v2 pool, single-container pod                                     | 14    |
+| `OOMKilled` on a cgroup v2 pool with a runtime image older than the catalogue's floor     | 14    |
 | `OOMKilled` where the container runs several processes                                    | 15    |
-| `ImagePullBackOff` / `ErrImagePull`, on rebuilt nodes only                                | 20    |
+| `ImagePullBackOff` / `ErrImagePull` on rebuilt nodes while the same image runs elsewhere  | 20    |
 | `PersistentVolume's node affinity`, `FailedAttachVolume`, `FailedMount`                   | 19    |
 | `nvidia.com/gpu` in a scheduling message; `nvidia`, `CUDA`, `Error 803` in a container    | 18    |
 | nodes `NotReady` / `NetworkUnavailable` after a node-pool operation                       | 17    |
@@ -215,8 +226,15 @@ signatures:
 | a budget with no allowance left on a drained node; a node operation past an hour per node | 1     |
 | `no matches for kind`; a Job or CronJob pod in `Error` whose spec names a removed API     | 6     |
 
-A symptom that matches nothing is reported as a Warning, unclassified, rather than dropped: the
-report is a record of the upgrade, not only of the catalogue's part of it. The entries not in the table (3, 4,
+A match is _sure_ (`high`) when the signature names the entry's own mechanism and the pool the
+object sits on had an operation in the window: a webhook named in the rejection, a selector that
+names a dropped label, a runtime image below the catalogue's floor on a pool migrated to cgroup v2,
+an image that pulls on untouched nodes and fails on rebuilt ones, a volume attach error naming a
+PersistentVolume, a driver error text, a budget with no allowance on a drained node. Anything less,
+a generic `OOMKilled`, an image pull failure with no untouched node to compare, a Pending pod with
+no pool operation, is _tentative_ (`medium`). A symptom that matches nothing is reported as a
+Warning, unclassified, rather than dropped: the report is a record of the upgrade, not only of the
+catalogue's part of it. The entries not in the table (3, 4,
 5, 8, 9, 10, 11, 13, 16) have no symptom a single read identifies with confidence; they are the
 ones the readiness checks have to catch before the upgrade, and the report says so under (C) when a
 cluster's symptoms are unclassified.
@@ -270,8 +288,10 @@ fleet-audit report store uses, and only a full run moves the latest link. Each f
 temporary name and renamed,
 in the order report, guards, ledger, so a run that dies leaves at most a report with no ledger
 advance; a ledger that cannot be parsed is set aside under a dated name and the run stops with that
-as its line, which is a crash record to read, not a re-baseline, and a run starts from an empty
-ledger only when no ledger file exists at all. The readiness watch runs on the gateway pod and reaches the file the same way it reaches
+as its line. While a dated crash record sits beside no ledger, every run refuses to start from empty
+and repeats that line, so the record is read rather than overwritten; `--reset-ledger`, run by an
+operator on purpose, archives the record and lets the next run start as a first run. A run starts
+from an empty ledger on its own only when neither a ledger nor a crash record exists. The readiness watch runs on the gateway pod and reaches the file the same way it reaches
 `gcloud`, through its sandbox hop. The chat line still carries the counts and the top finding, so
 a reader who never opens the file gets the verdict.
 
@@ -290,10 +310,10 @@ to a cluster's maintenance policy.
 
 ### Entry 1 on seeded-b: seeded-upgrade/PodDisruptionBudget/pinned-batch-runner
 What happened: UPGRADE_MASTER control plane 1.34.11-gke.1209000 -> 1.34.12-gke.1011000,
-  2026-10-07 18:27 to 18:34 (6m54s), DONE; UPGRADE_NODES default-pool, 18:34 to 18:38 (3m43s), DONE.
+  2026-10-07 18:27 to 18:34 (6m54s), DONE; UPGRADE_NODES no-surge-pool, 18:34 to 19:37 (62m), DONE.
 What failed: drain held, disruptionsAllowed 0 on one replica, catalogue entry 1 (a
   PodDisruptionBudget forbids the eviction), high; evidence: maxUnavailable 0, 1 of 1 pods on the
-  drained pool.
+  drained no-surge-pool, operation past an hour on one node.
 Detect and mitigate next time: visible before the upgrade as the budget itself; read today by the
   daily obtainability audit (blocking-pdb) and by fleet-upgrade-verification --readiness when asked.
   Before the next upgrade: allow
@@ -351,7 +371,8 @@ comes from the collector's JSON, which keeps the per-cluster data and the same t
 
 1. **The collector.** `agents/platform/skills/fleet-audit/scripts/upgrade_retrospective.py`: the
    ledger, selection, (A), (B), the signature table, the catalogue table for (C), the guards merge,
-   JSON and Markdown output, `--dry-run`, `--since`, `--cluster`; unit tests on fixtures captured
+   JSON and Markdown output, `--dry-run`, `--cluster`, `--since` and `--reset-ledger` as §3.2 and
+   §3.6 define them; unit tests on fixtures captured
    from the test fleet.
 2. **The job and the on-demand route.** `agents/platform/governance/upgrade_retrospective_sop.md`
    (including the freshness rule for a question); the routing lines in `CAPABILITIES.md` and the
