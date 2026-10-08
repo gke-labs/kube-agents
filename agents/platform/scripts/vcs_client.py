@@ -25,6 +25,8 @@ printed one.
 from __future__ import annotations
 
 import base64
+import repo_ref
+import functools
 import json
 import os
 import shutil
@@ -129,7 +131,60 @@ BROKER_ROUTE_UNSUPPORTED = "BROKER_ROUTE_UNSUPPORTED"
 BROKER_ENDPOINT_VAR = "CREDENTIAL_PROXY_URL"
 
 
+@functools.lru_cache(maxsize=1)
+def _registered_urls() -> dict[str, str]:
+    """Bare `owner/name` -> the URL it was registered under, for GitHub entries.
+
+    The managed and context lists, from the mounted state file, read once per
+    process. Only a GitHub entry registered by URL counts, and only a name no
+    other forge's entry also spells: which forge an ambiguous name means is
+    not this client's to decide. No file, or an unreadable one, answers
+    empty, so every name is sent as written -- the broker's own refusal is
+    then the answer. The URL is the registration's own text: this client
+    composes no forge URL, which is the broker's allowlist to decide.
+    """
+    import gitops_workspace
+
+    # The mounted file only: this runs on every verb, and the kubectl fallback
+    # the full readers have would put a subprocess on each one.
+    entries = gitops_workspace.mounted_repo_entries(
+        gitops_workspace.MANAGED_REPOS_KEY
+    ) + gitops_workspace.mounted_repo_entries(gitops_workspace.CONTEXT_REPOS_KEY)
+    github: dict[str, str] = {}
+    other: set[str] = set()
+    for entry in entries:
+        url = str(entry.get("url") or "").strip()
+        if str(entry.get("type") or "") == gitops_workspace.GITHUB_REPO_TYPE:
+            slug = gitops_workspace.extract_github_slug(url)
+            if slug and "://" in url:
+                github.setdefault(slug.lower(), url)
+        else:
+            # The one repository parser, not a split by hand: an scp remote
+            # (`git@host:group/name.git`) has no `/` after the host, and a
+            # hand split read it as `name` and missed the collision.
+            ref = repo_ref.try_parse(url)
+            if ref is not None:
+                other.add("/".join(ref.segments).lower())
+    return {slug: url for slug, url in github.items() if slug not in other}
+
+
+def _on_the_wire(repository: object) -> object:
+    """A bare name registered as GitHub, sent as the URL it was registered by.
+
+    The broker refuses a hostless name whenever it is configured with more
+    than one forge, and the sandbox cannot see that configuration: a second
+    forge can be declared before any repository on it is registered. A name
+    the install registered as GitHub is GitHub's either way, so it travels as
+    its registration spells it; with one forge the broker resolves both alike.
+    """
+    if not isinstance(repository, str) or "://" in repository or repository.count("/") != 1:
+        return repository
+    return _registered_urls().get(repository.lower(), repository)
+
+
 def call(verb: str, payload: dict) -> dict:
+    if "repository" in payload:
+        payload = {**payload, "repository": _on_the_wire(payload["repository"])}
     endpoint = os.environ.get(BROKER_ENDPOINT_VAR, "").strip()
     if not endpoint:
         raise VcsError(

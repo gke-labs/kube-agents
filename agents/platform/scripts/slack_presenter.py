@@ -48,8 +48,8 @@ can draw, so the dividers stand in for a border. :func:`names_gap` and
 
 Reactions (:func:`arrival_reaction`, :func:`settle_reaction`): the first
 reaction says what kind of ask arrived, chosen by keyword before any model
-call; a second joins it when the work settles. The first is never removed; the
-credential proxy refuses every Slack method ending in ``remove``.
+call, and comes off when the answer posts. ⏸️ stands while the work waits on
+the user, and ❌ marks work that failed; work that succeeded is left with none.
 """
 
 from __future__ import annotations
@@ -70,19 +70,23 @@ FLAG_ON_VALUES = frozenset({"1", "true", "yes", "on"})
 
 #: Slack emoji names (``reactions.add`` takes the name, not the glyph).
 REACTION_QUESTION = "eyes"  # 👀
+REACTION_INVESTIGATE = "mag"  # 🔍
+REACTION_FLEET = "globe_with_meridians"  # 🌐
+REACTION_UPGRADE = "arrow_up"  # ⬆️
+REACTION_COST = "moneybag"  # 💰
+REACTION_SECURITY = "shield"  # 🛡️
 REACTION_CHANGE = "hammer_and_wrench"  # 🛠️
 REACTION_BOARD = "clipboard"  # 📋
 REACTION_INCIDENT = "rotating_light"  # 🚨
-REACTION_DONE = "white_check_mark"  # ✅
 REACTION_BLOCKED = "double_vertical_bar"  # ⏸️
 REACTION_FAILED = "x"  # ❌
 
-#: How work can settle, as the callers name it.
+#: How work can settle, as the callers name it, and the reaction each leaves.
+#: Done leaves none: the answer in the thread says it.
 SETTLE_DONE = "done"
 SETTLE_BLOCKED = "blocked"
 SETTLE_FAILED = "failed"
 SETTLE_REACTIONS = {
-    SETTLE_DONE: REACTION_DONE,
     SETTLE_BLOCKED: REACTION_BLOCKED,
     SETTLE_FAILED: REACTION_FAILED,
 }
@@ -105,17 +109,38 @@ SETTLE_BY_KANBAN_KIND = {
 #: a blocked card is answered and runs on to done.
 PROVISIONAL_SETTLES = frozenset({SETTLE_BLOCKED})
 
-#: Keyword classes, tried in this order; the first match wins. A change request
-#: outranks everything because it is the ask with consequences. A question
-#: outranks the incident words, so "is checkout crashlooping?" is 👀 (a check),
-#: while "checkout is down" is 🚨.
+#: Keyword classes, tried in this order; the first match wins (see
+#: :func:`arrival_reaction`). A change request outranks everything because it
+#: is the ask with consequences. A question outranks the incident words, so
+#: "is checkout crashlooping?" is 🔍 (a check), while "checkout is down" is 🚨.
 CHANGE_WORDS = re.compile(
     r"\bfix(es|ing)?\b"
     r"|\bbump\b"
     r"|\broll(ing)?[\s-]*back\b|\brollback\b"
     r"|\bopen\s+(a\s+|the\s+|an\s+)?(pr|pull\s+request)\b"
-    r"|\bscale\b"
-    r"|\bupgrade\b",
+    r"|\bscale\b",
+    re.IGNORECASE,
+)
+UPGRADE_WORDS = re.compile(
+    r"\bupgrad(e|es|ed|ing)\b|\bversions?\b|\brelease\s+channels?\b|\boutdated\b|\bout\s+of\s+date\b",
+    re.IGNORECASE,
+)
+COST_WORDS = re.compile(
+    r"\bcosts?\b|\bcosting\b|\bspend(s|ing)?\b|\bbill(s|ing)?\b|\bbudgets?\b|\bpric(e|es|ing)\b",
+    re.IGNORECASE,
+)
+SECURITY_WORDS = re.compile(
+    r"\bsecurity\b|\baudit(s|ing)?\b|\bcves?\b|\bvulnerab|\brbac\b|\biam\b|\bpermissions?\b|\bexposed\b",
+    re.IGNORECASE,
+)
+FLEET_WORDS = re.compile(
+    r"\b(all|every|which|each)\s+(of\s+(the|my|our)\s+)?(my\s+|our\s+|the\s+)?clusters?\b"
+    r"|\bacross\s+(the\s+|my\s+|our\s+)?(fleet|clusters)\b|\bfleet[\s-]*wide\b",
+    re.IGNORECASE,
+)
+INVESTIGATE_WORDS = re.compile(
+    r"\bwhy\b|\brestart|\berrors?\b|\bfail|\bcrash|\boom(killed|kill|ed)?\b|\bpending\b|\bslow\b"
+    r"|\bdebug|\bdiagnos|\binvestigat|\bbroken\b",
     re.IGNORECASE,
 )
 BOARD_WORDS = re.compile(
@@ -371,21 +396,32 @@ def _is_question(text: str) -> bool:
 
 
 def arrival_reaction(text: str | None) -> str:
-    """The emoji name for an ask, from its words alone (no model call)."""
+    """The emoji name for an ask, from its words alone (no model call).
+
+    🛠️ a change, ⬆️ an upgrade or version, 📋 the board, 💰 cost, 🛡️ security,
+    🌐 the whole fleet, 🚨 an incident told rather than asked about, 🔍
+    something to investigate, and 👀 for anything else.
+    """
     clean = MENTION.sub(" ", text or "").strip()
-    if CHANGE_WORDS.search(clean):
-        return REACTION_CHANGE
-    if BOARD_WORDS.search(clean):
-        return REACTION_BOARD
-    if _is_question(clean):
-        return REACTION_QUESTION
-    if INCIDENT_WORDS.search(clean):
+    for words, emoji in (
+        (CHANGE_WORDS, REACTION_CHANGE),
+        (UPGRADE_WORDS, REACTION_UPGRADE),
+        (BOARD_WORDS, REACTION_BOARD),
+        (COST_WORDS, REACTION_COST),
+        (SECURITY_WORDS, REACTION_SECURITY),
+        (FLEET_WORDS, REACTION_FLEET),
+    ):
+        if words.search(clean):
+            return emoji
+    if not _is_question(clean) and INCIDENT_WORDS.search(clean):
         return REACTION_INCIDENT
+    if INVESTIGATE_WORDS.search(clean) or INCIDENT_WORDS.search(clean):
+        return REACTION_INVESTIGATE
     return REACTION_QUESTION
 
 
 def settle_reaction(outcome: str) -> str | None:
-    """The emoji name for ``done``/``blocked``/``failed``; None for anything else."""
+    """The emoji name for ``blocked``/``failed``; None for ``done`` or anything else."""
     return SETTLE_REACTIONS.get(outcome)
 
 

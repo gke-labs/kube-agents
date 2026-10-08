@@ -98,3 +98,9 @@ first-install-hello-done
 # filed and no result is delivered, and the check fails every repetition.
 # Returns to the lane when the door routes through the chat profile.
 chat-voice-answer-first
+# #2039: grades the chat front door's ack for a fleet question and the
+# platform worker's fan-out beneath the one card it files. The inject door
+# addresses `platform` directly, so no front door acks and no card for
+# platform is filed. Returns to the lane when the door routes through the
+# chat profile.
+chat-fanout-fleet-restarts-rows

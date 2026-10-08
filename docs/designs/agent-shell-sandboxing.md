@@ -2696,7 +2696,8 @@ through `execute_workspace_git`, which shares `_execute` with the agent-facing p
 inherits the same hardened environment — but is not reachable from `/v1/exec` and takes no
 agent-supplied argv: the subcommands are literals in `content_workspace.py`, and the only
 caller-supplied strings in them are a validated branch name and validated repository-relative
-paths. That separation is what lets the agent-facing git surface go to zero once the skills
+paths. The clone URL is never one of them: the broker composes it from a validated `owner/name`
+for GitHub, or the forge that owns a host-qualified name composes it. That separation is what lets the agent-facing git surface go to zero once the skills
 migrate, rather than going to zero by accident.
 
 **What runs which way.** Both mechanisms are live at once, because a fleet does not upgrade

@@ -121,7 +121,11 @@ class GitLabForge(Forge):
         self, host: str, token_path: str, allowed_paths: Iterable[str] = ()
     ) -> None:
         super().__init__()
-        self.hosts = (host,)
+        # gitlab.com answers on `www.` too, and the operator folds that
+        # spelling onto gitlab.com, so a URL written with it resolves here.
+        # The canonical host stays first: clone URLs and managed-list keys
+        # are built from it.
+        self.hosts = (host, "www.gitlab.com") if host == "gitlab.com" else (host,)
         self.api_url = f"https://{host}/api/v4"
         self.credential = StaticFileCredential(
             token_path, host, header="PRIVATE-TOKEN", username=GIT_USERNAME

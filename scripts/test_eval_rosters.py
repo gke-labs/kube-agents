@@ -164,6 +164,7 @@ ADDED_AFTER_THE_MOVE = [
     "upgrades-zonal-control-plane-outage-warned",  # upgrade-failure catalogue entry 11, the first scenario case
     "oobe-first-run-audits",  # the oobe job's first-run audits stage
     "chat-voice-answer-first",  # a delegated answer opens on its verdict
+    "chat-fanout-fleet-restarts-rows",  # a fleet question fanned out one titled card per cluster
 ]
 
 # Admitted after the split, each by a pull request that cited the record
@@ -361,6 +362,7 @@ INJECT_LANE_EXCLUDED = [
     "first-install-hello-running",  # #2039: grades the chat profile's onboarding greeting, which platform does not give
     "first-install-hello-done",  # the same once the first-look scan has finished
     "chat-voice-answer-first",  # #2039: grades the card result the front door delivers; the inject door files no card
+    "chat-fanout-fleet-restarts-rows",  # #2039: grades the front door's ack and the fan-out under its one card; same door
 ]
 # The directives a case's prompt opens with to replay a wake into the chat
 # front door (bench/kube_agents_bench/card_wake.py); the harness errors such
@@ -387,6 +389,7 @@ INJECT_LANE_EXCLUDED_TIER = {
     "first-install-hello-running": "nightly",
     "first-install-hello-done": "nightly",
     "chat-voice-answer-first": "nightly",
+    "chat-fanout-fleet-restarts-rows": "nightly",
 }
 
 

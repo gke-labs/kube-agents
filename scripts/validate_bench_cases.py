@@ -219,6 +219,10 @@ FIXTURE_NOT_READY = {
         "not, so the case fails with the branch absent, which is broken rather "
         "than red"
     ),
+    "gce-startup-script-failure": (
+        "#2483: needs bench/tf/fleet's startup_fail VM applied to every pool project "
+        "(fleet re-apply); no pool project runs a VM whose startup script fails"
+    ),
     "obtainability-major-pdb-auto-pr": (
         "#2228: needs checkout-gateway declared under clusters/seeded-a/ in "
         "each pool project's *-infra repository, so 3.3's fix is a manifest "
