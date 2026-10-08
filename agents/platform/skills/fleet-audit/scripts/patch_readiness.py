@@ -71,6 +71,10 @@ GLOBAL_LOCATION = "global"
 # GKE supports node pools at most this many minors behind the control plane;
 # at it the next control-plane upgrade is blocked, past it the pool is unsupported.
 SKEW_CEILING_MINORS = 2
+# §3.2's critical rung as shipped: the first gap past the ceiling. The audit's
+# criteria can raise it (`--pool-skew-critical-minors`), never lower it: below
+# this the critical rung would overlap the fixed two-minor one.
+POOL_SKEW_CRITICAL_MINORS = SKEW_CEILING_MINORS + 1
 # §3.3: a fleet flags once its control planes span this many minors.
 FLEET_SPREAD_MIN_MINORS = 2
 
@@ -136,7 +140,10 @@ BLOCKING_EXCLUSION_SCOPES = {"NO_UPGRADES", "NO_MINOR_OR_NODE_UPGRADES"}
 # value, and GKE's JSON omits a field at its zero value.
 DEFAULT_EXCLUSION_SCOPE = "NO_UPGRADES"
 # §3.8's "ends more than 30 days from now": time left, not the freeze's length.
-LONG_FREEZE = timedelta(days=30)
+LONG_FREEZE_DAYS = 30
+LONG_FREEZE = timedelta(days=LONG_FREEZE_DAYS)
+# How `--deprecated-image-types` separates its entries.
+IMAGE_TYPE_LIST_SEPARATOR = ","
 # §3.8's escalation: a freeze beside a critical or major version finding.
 # The severities the SOP grades in, as `finish` spells them.
 CRITICAL, MAJOR, MINOR = "critical", "major", "minor"
@@ -157,6 +164,43 @@ FILTER_EXCLUDES_PREFIX = "pubsub filter excludes"
 QUALIFIED_TARGET_SEPARATOR = "/"
 
 VERSION_RE = re.compile(r"^(\d+)\.(\d+)\.(\d+)(?:-gke\.(\d+))?$")
+
+
+class Criteria(NamedTuple):
+    """The thresholds the audit's criteria store can tune.
+
+    One field per key of
+    agents/platform/capabilities/security-patch-orchestrator/criteria.schema.json,
+    named the same, and one `main` flag each. The SOP passes the values
+    `capability_criteria` returned at the start of the run; a field left at its
+    default is the shipped number the SOP prints beside the check, so a run
+    whose tool call failed collects on those rather than on nothing. This
+    script runs in the shell sandbox, which never sees the criteria tree, so
+    the flags are the only way a tuned value reaches a candidate's severity.
+    The store enforces the schema's bounds; `criteria_from_args` refuses only
+    a value this file's own arithmetic cannot take.
+    """
+
+    pool_skew_critical_minors: int = POOL_SKEW_CRITICAL_MINORS
+    fleet_spread_min_minors: int = FLEET_SPREAD_MIN_MINORS
+    blocking_exclusion_min_days: int = LONG_FREEZE_DAYS
+    deprecated_image_types: frozenset[str] = frozenset(DEPRECATED_IMAGE_TYPES)
+
+    @property
+    def long_freeze(self) -> timedelta:
+        return timedelta(days=self.blocking_exclusion_min_days)
+
+    def record(self) -> dict:
+        """The manifest's `criteria` block: what this collection was judged against."""
+        return {
+            "pool_skew_critical_minors": self.pool_skew_critical_minors,
+            "fleet_spread_min_minors": self.fleet_spread_min_minors,
+            "blocking_exclusion_min_days": self.blocking_exclusion_min_days,
+            "deprecated_image_types": sorted(self.deprecated_image_types),
+        }
+
+
+DEFAULT_CRITERIA = Criteria()
 
 # §1.5's skip list, verbatim. A cluster in one of these states is not a
 # cluster this audit has an opinion about: mid-flight or broken means its
@@ -540,7 +584,7 @@ def _pool_status_excludes(pool: dict, cluster: dict) -> bool:
     return (pool.get("status") or "") in (STATUS_RECONCILING, STATUS_PROVISIONING) or _upgrade_in_progress(cluster)
 
 
-def check_pool_skew(cluster: dict) -> list[dict]:
+def check_pool_skew(cluster: dict, *, critical_minors: int = POOL_SKEW_CRITICAL_MINORS) -> list[dict]:
     # Autopilot is not excluded. Its node pools carry a real `version` and can
     # genuinely trail the control plane, and the one Autopilot-specific way
     # that happens innocently -- Google upgrading the control plane first and
@@ -566,8 +610,14 @@ def check_pool_skew(cluster: dict) -> list[dict]:
             hits.append({"object": f"NodePool/{name}", "excerpt": f"pool on a different major version ({pool.get('version')} vs {cluster.get('currentMasterVersion')})", "severity": CRITICAL})
             continue
         minor_gap = master_t[1] - pool_t[1]
-        if minor_gap > SKEW_CEILING_MINORS:
+        if minor_gap >= critical_minors:
             hits.append({"object": f"NodePool/{name}", "excerpt": f"pool {minor_gap} minors behind control plane", "severity": CRITICAL})
+        elif minor_gap > SKEW_CEILING_MINORS:
+            # Only reachable once the criteria raised the critical rung: past
+            # GKE's ceiling, which the excerpt still says, but under the
+            # operator's rung for critical, which it names so the ledger
+            # shows why this week's pool-skew finding is a major one.
+            hits.append({"object": f"NodePool/{name}", "excerpt": f"pool {minor_gap} minors behind control plane, past GKE's skew ceiling; critical from {critical_minors} under this run's criteria", "severity": MAJOR})
         elif minor_gap == SKEW_CEILING_MINORS:
             hits.append({"object": f"NodePool/{name}", "excerpt": f"pool {minor_gap} minors behind control plane, at GKE's skew ceiling", "severity": MAJOR})
         elif minor_gap == 1:
@@ -585,7 +635,7 @@ def check_pool_skew(cluster: dict) -> list[dict]:
     return hits
 
 
-def check_fleet_spread(clusters: list[dict]) -> list[dict]:
+def check_fleet_spread(clusters: list[dict], *, min_minors: int = FLEET_SPREAD_MIN_MINORS) -> list[dict]:
     """§3.3, over the whole fleet. `clusters` is every cluster the run audited,
     not one project's — the spread is a property of the fleet, and computing it
     per project both misses a fleet whose two minors live in two projects and
@@ -611,7 +661,7 @@ def check_fleet_spread(clusters: list[dict]) -> list[dict]:
     # boundary would be meaningless.
     if newest[0] != oldest[0]:
         width = "across major versions"
-    elif newest[1] - oldest[1] >= FLEET_SPREAD_MIN_MINORS:
+    elif newest[1] - oldest[1] >= min_minors:
         width = f"{newest[1] - oldest[1]} minors wide"
     else:
         return []
@@ -711,7 +761,7 @@ def blocking_exclusions_readable(cluster: dict) -> bool:
     return True
 
 
-def check_blocking_exclusion(cluster: dict, *, now: datetime, has_version_finding: bool) -> dict | None:
+def check_blocking_exclusion(cluster: dict, *, now: datetime, has_version_finding: bool, long_freeze: timedelta = LONG_FREEZE) -> dict | None:
     # `maintenanceExclusions` is a map keyed by exclusion name
     # (`{name: {startTime, endTime, maintenanceExclusionOptions}}`), not a
     # list -- iterating it as a list would walk the names, not the windows.
@@ -733,8 +783,8 @@ def check_blocking_exclusion(cluster: dict, *, now: datetime, has_version_findin
         # through: the SOP's threshold is "longer than 30 days", and comparing
         # the timedelta itself is the only reading of that which does not lose
         # the last day. The SOP measures the time left, from now to the end.
-        long_freeze = (end - now) > LONG_FREEZE
-        if not (long_freeze or has_version_finding):
+        is_long_freeze = (end - now) > long_freeze
+        if not (is_long_freeze or has_version_finding):
             continue
         # Several can qualify at once. The one that ends last is the freeze
         # actually holding the cluster, and choosing it keeps the excerpt
@@ -747,7 +797,7 @@ def check_blocking_exclusion(cluster: dict, *, now: datetime, has_version_findin
     return best
 
 
-def check_stale_image_type(cluster: dict, baseline: dict | None) -> list[dict]:
+def check_stale_image_type(cluster: dict, baseline: dict | None, *, deprecated: frozenset[str] = DEFAULT_CRITERIA.deprecated_image_types) -> list[dict]:
     # Autopilot included: its pools carry `config.imageType` like any other
     # (`COS_CONTAINERD` on the fleet measured 2026-09-05), so the check reads a
     # real value rather than declining on the belief that there is none.
@@ -764,7 +814,7 @@ def check_stale_image_type(cluster: dict, baseline: dict | None) -> list[dict]:
         image_type = ((pool.get("config") or {}).get("imageType") or "").upper()
         if not image_type:
             continue
-        if image_type not in valid or image_type in DEPRECATED_IMAGE_TYPES:
+        if image_type not in valid or image_type in deprecated:
             hits.append({"object": f"NodePool/{pool.get('name', '')}", "excerpt": f"config.imageType={image_type}"})
     return hits
 
@@ -847,7 +897,7 @@ def _emit(slug: str, hit: dict) -> dict:
 # the second one Google owns.
 
 
-def collect_one_cluster(cluster: dict, baseline: dict | None, *, now: datetime) -> tuple[list[str], list[dict]]:
+def collect_one_cluster(cluster: dict, baseline: dict | None, *, now: datetime, criteria: Criteria = DEFAULT_CRITERIA) -> tuple[list[str], list[dict]]:
     """The check slugs this cluster has data for, and its candidates. A slug
     missing from the first is a check that judged nothing here -- `master-behind`
     and `stale-image-type` without the baseline they read, `pool-skew` or
@@ -874,7 +924,7 @@ def collect_one_cluster(cluster: dict, baseline: dict | None, *, now: datetime) 
         slugs.insert(0, "pool-skew")
 
     master_behind_hit = check_master_behind(cluster, baseline)
-    pool_skew_hits = check_pool_skew(cluster) if pool_skew_judged else []
+    pool_skew_hits = check_pool_skew(cluster, critical_minors=criteria.pool_skew_critical_minors) if pool_skew_judged else []
     # §3.8's escalation is specifically "a critical/major version finding" --
     # a minor one (3.1c's same-minor patch lag, 3.2's patch-only drift)
     # does not, on its own, justify calling out a long freeze as major.
@@ -889,14 +939,14 @@ def collect_one_cluster(cluster: dict, baseline: dict | None, *, now: datetime) 
     escalation_judged = has_version_finding or (pool_skew_judged and master_behind_judged(cluster, baseline))
     # A blocking exclusion whose window does not parse is skipped by the
     # check, so it keeps the slug out for the same reason.
-    frozen = check_blocking_exclusion(cluster, now=now, has_version_finding=True) is not None
+    frozen = check_blocking_exclusion(cluster, now=now, has_version_finding=True, long_freeze=criteria.long_freeze) is not None
     if not blocking_exclusions_readable(cluster) or (not escalation_judged and frozen):
         slugs.remove("blocking-exclusion")
 
     single_hits = (
         ("no-channel", check_no_channel(cluster)),
         ("no-maintenance-window", check_no_maintenance_window(cluster)),
-        ("blocking-exclusion", check_blocking_exclusion(cluster, now=now, has_version_finding=has_version_finding)),
+        ("blocking-exclusion", check_blocking_exclusion(cluster, now=now, has_version_finding=has_version_finding, long_freeze=criteria.long_freeze)),
         ("no-notifications", check_no_notifications(cluster)),
     )
     candidates += [_emit(slug, hit) for slug, hit in single_hits if hit and slug in slugs]
@@ -915,7 +965,7 @@ def collect_one_cluster(cluster: dict, baseline: dict | None, *, now: datetime) 
     )
     if baseline is not None and baseline["validImageTypes"] and image_types_readable:
         slugs.append("stale-image-type")
-        candidates += [_emit("stale-image-type", hit) for hit in check_stale_image_type(cluster, baseline)]
+        candidates += [_emit("stale-image-type", hit) for hit in check_stale_image_type(cluster, baseline, deprecated=criteria.deprecated_image_types)]
 
     return slugs, candidates
 
@@ -969,7 +1019,7 @@ def target_name(project: str, location: str, name: str) -> str:
     return QUALIFIED_TARGET_SEPARATOR.join([p for p in (project, location) if p] + [name])
 
 
-def attach_fleet_spread(entries: list[dict]) -> None:
+def attach_fleet_spread(entries: list[dict], criteria: Criteria = DEFAULT_CRITERIA) -> None:
     """Run §3.3 once over the whole fleet and attach its finding, in place.
 
     Not inside `collect_project`, which sees one project: §3.3 is "across all
@@ -986,7 +1036,8 @@ def attach_fleet_spread(entries: list[dict]) -> None:
         [
             {"name": e["name"], "currentMasterVersion": e.get("_master_version") or "", "status": e.get("_status") or ""}
             for e in readable
-        ]
+        ],
+        min_minors=criteria.fleet_spread_min_minors,
     )
     by_name = {entry["name"]: entry for entry in readable}
     for hit in hits:
@@ -1052,7 +1103,7 @@ def attach_incumbent_topic(entries: list[dict]) -> None:
             )
 
 
-def collect_project(project: str, *, run: RunFn, now: datetime) -> list[dict]:
+def collect_project(project: str, *, run: RunFn, now: datetime, criteria: Criteria = DEFAULT_CRITERIA) -> list[dict]:
     argv = ["gcloud", "container", "clusters", "list", "--project", project, "--format", "json"]
     parsed, result = run_and_gate(argv, run=run)
     if parsed is None:
@@ -1116,7 +1167,7 @@ def collect_project(project: str, *, run: RunFn, now: datetime) -> list[dict]:
             continue
         baseline_pair = baselines.get(location)
         baseline = baseline_pair[0] if baseline_pair else None
-        slugs, candidates = collect_one_cluster(c, baseline, now=now)
+        slugs, candidates = collect_one_cluster(c, baseline, now=now, criteria=criteria)
         commands = {slug: clusters_record for slug in slugs}
         if baseline_pair is not None:
             # Both baseline checks read `get-server-config`, so that call is
@@ -1165,7 +1216,7 @@ def collect_project(project: str, *, run: RunFn, now: datetime) -> list[dict]:
     return entries + shortfall
 
 
-def collect_fleet(project: str | None = None, *, run: RunFn = default_run, max_workers: int = MAX_WORKERS, now: datetime | None = None) -> dict:
+def collect_fleet(project: str | None = None, *, run: RunFn = default_run, max_workers: int = MAX_WORKERS, now: datetime | None = None, criteria: Criteria = DEFAULT_CRITERIA) -> dict:
     now = now or datetime.now(timezone.utc)
     started_at = time.strftime(TIMESTAMP_FORMAT, time.gmtime())
     discovery = discover_fleet(project, run=run)
@@ -1173,7 +1224,7 @@ def collect_fleet(project: str | None = None, *, run: RunFn = default_run, max_w
 
     results: list[list[dict]] = [[] for _ in projects]
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
-        futures = {pool.submit(collect_project, p, run=run, now=now): i for i, p in enumerate(projects)}
+        futures = {pool.submit(collect_project, p, run=run, now=now, criteria=criteria): i for i, p in enumerate(projects)}
         for future in as_completed(futures):
             index = futures[future]
             try:
@@ -1182,7 +1233,7 @@ def collect_fleet(project: str | None = None, *, run: RunFn = default_run, max_w
                 results[index] = crashed_entries(projects[index], exc)
 
     entries = [entry for group in results for entry in group]
-    attach_fleet_spread(entries)
+    attach_fleet_spread(entries, criteria)
     attach_incumbent_topic(entries)
 
     # A `projects list` that failed took the project names with it, so this
@@ -1203,6 +1254,10 @@ def collect_fleet(project: str | None = None, *, run: RunFn = default_run, max_w
     manifest = {
         "version": MANIFEST_VERSION,
         "checks_revision": CHECKS_REVISION,
+        # Carried, like `checks_revision`: what the candidates' severities were
+        # judged against, so the SOP can hold the manifest to the values the
+        # criteria tool returned and a reader of the file can see them.
+        "criteria": criteria.record(),
         "audit": AUDIT_ID,
         "started_at": started_at,
         "finished_at": time.strftime(TIMESTAMP_FORMAT, time.gmtime()),
@@ -1271,11 +1326,52 @@ def candidate_summary(manifest: dict) -> list[str]:
     ]
 
 
+def criteria_from_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> Criteria:
+    """The run's `Criteria` from the parsed flags, or `parser.error` on a value
+    the checks cannot take.
+
+    Only the floors are checked here. The ceilings are the criteria schema's
+    and the store refuses a write past them; a flag is read as what the tool
+    returned, and this script is not the place for a second copy of that
+    policy. The floors are different: a critical rung at or below GKE's
+    ceiling makes two of §3.2's rungs claim the same pool, and a spread width
+    or horizon under one has no reading at all.
+    """
+    if args.pool_skew_critical_minors < POOL_SKEW_CRITICAL_MINORS:
+        parser.error(
+            f"--pool-skew-critical-minors must be at least {POOL_SKEW_CRITICAL_MINORS}: GKE's skew ceiling is "
+            f"{SKEW_CEILING_MINORS} minors, and a critical rung at or below it would overlap §3.2's fixed major rung"
+        )
+    if args.fleet_spread_min_minors < 1:
+        parser.error("--fleet-spread-min-minors must be at least 1")
+    if args.blocking_exclusion_min_days < 1:
+        parser.error("--blocking-exclusion-min-days must be at least 1")
+    # Compared case-insensitively, as §3.9 reads image types; an empty flag is
+    # an operator who emptied the list, not the default.
+    deprecated = frozenset(
+        item.strip().upper()
+        for item in args.deprecated_image_types.split(IMAGE_TYPE_LIST_SEPARATOR)
+        if item.strip()
+    )
+    return Criteria(
+        pool_skew_critical_minors=args.pool_skew_critical_minors,
+        fleet_spread_min_minors=args.fleet_spread_min_minors,
+        blocking_exclusion_min_days=args.blocking_exclusion_min_days,
+        deprecated_image_types=deprecated,
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--project", help="single project to audit; omit to run §1's project discovery")
+    # One flag per criteria key, defaulting to the shipped value; the SOP's §3
+    # command passes what `capability_criteria` returned.
+    parser.add_argument("--pool-skew-critical-minors", type=int, default=POOL_SKEW_CRITICAL_MINORS, help="§3.2: a pool this many minors or more behind its control plane is critical (criteria.pool_skew_critical_minors)")
+    parser.add_argument("--fleet-spread-min-minors", type=int, default=FLEET_SPREAD_MIN_MINORS, help="§3.3: flag the fleet once its control-plane minors span this many (criteria.fleet_spread_min_minors)")
+    parser.add_argument("--blocking-exclusion-min-days", type=int, default=LONG_FREEZE_DAYS, help="§3.8: an upgrade-blocking exclusion ending further out than this many days is flagged on its own (criteria.blocking_exclusion_min_days)")
+    parser.add_argument("--deprecated-image-types", default=IMAGE_TYPE_LIST_SEPARATOR.join(sorted(DEPRECATED_IMAGE_TYPES)), help="§3.9: comma-separated node image types flagged whether or not the location still offers them (criteria.deprecated_image_types)")
     args = parser.parse_args(argv)
-    manifest = collect_fleet(args.project)
+    manifest = collect_fleet(args.project, criteria=criteria_from_args(parser, args))
     print(json.dumps(manifest, indent=2))
     if manifest.get("error"):
         log(f"WARNING: {manifest['error']}")

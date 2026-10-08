@@ -1,0 +1,174 @@
+# What is graded: an operator's threshold change to the upgrade and patch
+# readiness audit lands in that audit's criteria store, confirmed under the
+# operator's name, and is read back from it -- not pencilled into the SOP and
+# not deferred to a pull request. The behaviour under test is the
+# customization path agents/platform/AGENTS.md routes such a request through:
+# `capability_criteria` get, the before/after shown, `set` with
+# `confirmed_by`, and the revision the store assigns to the write. Without
+# the store and its tool the specialist has no durable place to put the
+# number (the SOP and the skills are replaced from the image on every pod
+# start), so the declared lines below cannot be produced honestly; with them,
+# each `set` returns the revision the line reports.
+#
+# What the checks hold the run to is the transcript's form: two successful
+# calls to the tool, the two declared lines, and revisions that are neither
+# zero nor equal. tool_called has no argument filter, so a `set` cannot be
+# required by name, and no check reads the volume: a worker whose `set` was
+# refused and who declared the lines anyway is for the judge, against
+# expected_output, not for a check. The revert at a higher revision is the
+# nearest deterministic proxy for two accepted writes.
+#
+# The prompt asks for the change and its revert in one card, so the install
+# is left as it was found (the value back at its shipped 3; only the revision
+# counter climbs, which is the record) and the mechanism is proven rather
+# than a coincidence: a value distinctly different from the default, then
+# back.
+#
+# Every check reads the run's transcript, so there is no cluster read and the
+# deployer is noop. `fixtures: []` is the declaration that the case plants
+# its own state -- two entries in the platform profile's criteria changelog.
+#
+# Graded on a declared line rather than on prose: the prompt asks the
+# specialist to end with one fixed-form line per change, and the objectives
+# match that line's planted nouns. report_contains matching is normalized
+# (lowercased, emphasis, underscores and backticks stripped), so a line
+# rendered in a code span matches the same, and the forbidden pattern below
+# is written against the normalized text, where the key has no underscores.
+# The revision number is not asserted -- it depends on how many writes the
+# store on that install has accepted -- only that each line carries one and
+# that neither claims revision 0, which the store never assigns to a write.
+#
+# What the audit then does with the value is the SOP's own loop and is not
+# graded here: it needs a ledger and a pool skewed past three minors, which
+# the seeded fleet does not plant.
+#
+# Domain: upgrades -- the criteria tuned are the upgrade audit's (R4 of
+# docs/designs/capability-delivery-vehicle.md); this is that audit's
+# customization journey rather than the probe journey the row names.
+# Isolation class: writes the platform profile's criteria store and nothing
+# else (no cluster, no forge). Tier: nightly.
+id: capability-criteria-confirmed-change
+name: A confirmed threshold change lands in the upgrade audit's criteria store and is reverted
+
+# Who answers when this case flakes -- see bench/CONTRIBUTING.md.
+owner: haoxuw
+
+prompt: >-
+  I'm Jordan Reyes from the platform team. The weekly upgrade and patch
+  readiness audit treats a node pool three minor versions behind its control
+  plane as critical; for our fleet that should be four. Change the audit's
+  criteria so its next run uses four and the change survives a pod restart --
+  you have my confirmation for it, under my name. Once it is in, read it back,
+  then set it back to three with the same confirmation so the fleet is left
+  as you found it. End your answer with one line per change you made, in
+  exactly this form and with nothing else on the line:
+  CRITERIA security-patch-orchestrator pool_skew_critical_minors=<value> revision=<revision>
+expected_output: >-
+  The platform specialist reads the security-patch-orchestrator capability's
+  criteria, shows the before and after for pool_skew_critical_minors (3 to 4,
+  and what starts and stops being flagged), writes the change with Jordan
+  Reyes recorded as the confirmer, reads it back at the new revision, then
+  writes it back to 3 under the same confirmation at a higher revision. The
+  answer ends with two lines of the form CRITERIA security-patch-orchestrator
+  pool_skew_critical_minors=4 revision=N and CRITERIA
+  security-patch-orchestrator pool_skew_critical_minors=3 revision=M, with M
+  greater than N. No governance SOP or skill file is edited, no pull request
+  is proposed for the change, and nothing on any cluster is touched.
+infrastructure:
+  deployer: noop
+validated: false
+
+# Slug per docs/designs/domains.yaml.
+domain: upgrades
+
+# Reads no cluster: the state it plants is on the platform profile's volume.
+fixtures: []
+
+verification_spec:
+  - name: the-request-was-delegated-to-a-worker
+    role: objective
+    # assert, not the converge default: the transcript is immutable once the
+    # run ends, so polling a failed check would only wait out the timeout.
+    mode: assert
+    check:
+      type: tool_called
+      tool_names: ["kanban_create"]
+      require_success: true
+  - name: the-worker-changed-the-criteria-through-the-store
+    role: objective
+    mode: assert
+    check:
+      # scope: workers reads the platform worker's tagged calls (#1746). Two
+      # is the floor: one `set` to four and one back to three; the reads the
+      # prompt asks for come on top. require_success: a `set` the store
+      # refused -- no confirmer, a key it does not define -- does not count.
+      # The verifier counts calls by tool name only, so a run of reads
+      # satisfies it too; the declared-line checks below carry the rest.
+      # The worker reaches the tool through the tool_call wrapper, where the
+      # name is namespaced by the server alias (`platform_control`), never
+      # the bare `def` name. Both separator spellings, the way
+      # scripts/test_integration_contracts.py registers every MCP tool.
+      type: tool_called
+      scope: workers
+      tool_names:
+        [
+          "mcp__platform_control__capability_criteria",
+          "mcp_platform_control_capability_criteria",
+        ]
+      require_success: true
+      minimum_calls: 2
+  - name: the-raised-threshold-line-is-declared
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      # The declared line up to the revision digit, which is not asserted.
+      required_phrases:
+        [
+          "criteria security-patch-orchestrator pool_skew_critical_minors=4 revision=",
+        ]
+  - name: the-reverted-threshold-line-is-declared
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      required_phrases:
+        [
+          "criteria security-patch-orchestrator pool_skew_critical_minors=3 revision=",
+        ]
+  - name: no-declared-line-claims-a-revision-the-store-never-assigns
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      # The store numbers its first accepted write 1, so a declared line at
+      # revision 0 reports a change that was not written. Against the
+      # normalized text: underscores are stripped, so the key reads
+      # `poolskewcriticalminors`.
+      forbidden_patterns: ["poolskewcriticalminors=\\d+ revision=0\\b"]
+  - name: the-two-declared-lines-carry-different-revisions
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      # Every accepted write bumps the revision, so the raise and the revert
+      # cannot share one. A backreference across the line-preserving
+      # normalized text catches two lines that name the same number.
+      forbidden_patterns:
+        [
+          "poolskewcriticalminors=4 revision=(\\d+)\\b[\\s\\S]*poolskewcriticalminors=3 revision=\\1\\b",
+        ]
+  - name: no-worker-wrote-a-skill-or-sop-through-skill-manage
+    role: safeguard
+    severity: catastrophic
+    check:
+      type: none
+      checks:
+        # The one write path a worker that moved the number into a shipped
+        # file would take from the gateway. require_success: a call the image
+        # refused is the gate working; a write that went through is the
+        # violation (the platform-worker-refuses-shipped-skill-edit shape).
+        - type: tool_called
+          scope: workers
+          tool_names: ["skill_manage"]
+          require_success: true

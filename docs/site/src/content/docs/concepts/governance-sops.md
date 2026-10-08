@@ -31,6 +31,8 @@ Upgrade & patch readiness, weekly. Control-plane and node-pool versions compared
 
 The SOP forbids the words "vulnerable", "unpatched", and "CVE" in its findings: there is no vulnerability feed in this environment, so every finding is version currency or upgrade-policy hygiene. Invoked by the `security-patch-orchestrator` watchdog.
 
+Its thresholds — the node-skew band that counts as critical, the fleet-spread width, the maintenance-exclusion horizon, and the deprecated image types — are read at run time from the capability criteria store rather than fixed in the SOP. Ask the agent in chat to change one; it shows the before/after and what will start and stop being flagged, and once you agree the next run uses the new value, across restarts and upgrades. The mechanism is in [`agents/platform/capabilities/README.md`](https://github.com/gke-labs/kube-agents/blob/main/agents/platform/capabilities/README.md).
+
 ### `fleet_wide_cost_analysis_sop.md`
 
 Fleet waste, weekly. Fourteen checks, run by a collector script the agent starts: over-requested, under-requested, unsized and idle workloads, judged against a week of Cloud Monitoring usage; orphaned PersistentVolumes, unconsumed PVCs, unattached Compute Engine disks, idle reserved IPs, orphaned load-balancer resources, under-allocated node pools, the scale-down blockers pinning them, terminal-pod accumulation, idle namespaces still holding billable objects, and Artifact Registry repositories with no cleanup policy.

@@ -8,7 +8,7 @@ import sys
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from unittest import mock
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 sys.path.insert(0, os.path.dirname(__file__))
 import audit_report  # noqa: E402
@@ -1381,7 +1381,7 @@ class CollectFleetTest(unittest.TestCase):
         run = self.discovering(base="", listing=(1, ""))
         real = pr.collect_fleet
         out = io.StringIO()
-        with mock.patch.object(pr, "collect_fleet", lambda project=None: real(project, run=run, now=NOW)):
+        with mock.patch.object(pr, "collect_fleet", lambda project=None, **kwargs: real(project, run=run, now=NOW, **kwargs)):
             with redirect_stdout(out), redirect_stderr(io.StringIO()):
                 rc = pr.main([])
         self.assertEqual(rc, 1)
@@ -1575,6 +1575,160 @@ class ManifestComposesWithAuditReportTest(unittest.TestCase):
         with self.assertRaises(audit_report.ValidationError):
             audit_report.cross_check_manifest(data, manifest)
 
+
+
+class CriteriaTest(unittest.TestCase):
+    """The four thresholds the audit's criteria store tunes reach the checks
+    through `Criteria`, and the manifest says which values a run used."""
+
+    def test_the_defaults_are_the_shipped_numbers(self):
+        c = pr.DEFAULT_CRITERIA
+        self.assertEqual(c.pool_skew_critical_minors, pr.SKEW_CEILING_MINORS + 1)
+        self.assertEqual(c.fleet_spread_min_minors, pr.FLEET_SPREAD_MIN_MINORS)
+        self.assertEqual(c.long_freeze, pr.LONG_FREEZE)
+        self.assertEqual(c.deprecated_image_types, frozenset(pr.DEPRECATED_IMAGE_TYPES))
+
+    def test_the_fields_are_the_schema_keys(self):
+        """One flag per key of the shipped criteria schema, under the same
+        name: a key the schema adds without a flag here is a value the operator
+        can set that never reaches a candidate."""
+        schema_path = os.path.join(
+            os.path.dirname(__file__), "..", "..", "..", "capabilities", "security-patch-orchestrator", "criteria.schema.json"
+        )
+        with open(schema_path, encoding="utf-8") as fh:
+            schema = json.load(fh)
+        self.assertEqual(set(schema["properties"]), set(pr.Criteria._fields))
+        self.assertEqual(set(pr.DEFAULT_CRITERIA.record()), set(pr.Criteria._fields))
+        for key, spec in schema["properties"].items():
+            shipped = pr.DEFAULT_CRITERIA.record()[key]
+            self.assertEqual(sorted(spec["default"]) if isinstance(shipped, list) else spec["default"], shipped, key)
+
+    def test_the_critical_rung_moves_with_the_criteria(self):
+        c = cluster(master="1.33.0-gke.1", node_pools=[pool(version="1.30.0-gke.1")])
+        self.assertEqual(pr.check_pool_skew(c)[0]["severity"], "critical")
+        raised = pr.check_pool_skew(c, critical_minors=4)[0]
+        self.assertEqual(raised["severity"], "major")
+        self.assertIn("past GKE's skew ceiling", raised["excerpt"])
+        self.assertIn("critical from 4", raised["excerpt"])
+        four_behind = cluster(master="1.34.0-gke.1", node_pools=[pool(version="1.30.0-gke.1")])
+        self.assertEqual(pr.check_pool_skew(four_behind, critical_minors=4)[0]["severity"], "critical")
+
+    def test_a_raised_critical_rung_leaves_the_fixed_rungs_alone(self):
+        two = cluster(master="1.32.0-gke.1", node_pools=[pool(version="1.30.0-gke.1")])
+        self.assertEqual(pr.check_pool_skew(two, critical_minors=5)[0]["severity"], "major")
+        self.assertIn("at GKE's skew ceiling", pr.check_pool_skew(two, critical_minors=5)[0]["excerpt"])
+        other_major = cluster(master="2.0.0-gke.1", node_pools=[pool(version="1.30.0-gke.1")])
+        self.assertEqual(pr.check_pool_skew(other_major, critical_minors=5)[0]["severity"], "critical")
+
+    def test_the_spread_width_moves_with_the_criteria(self):
+        clusters = [cluster(name="old", master="1.28.0-gke.1"), cluster(name="new", master="1.30.0-gke.1")]
+        self.assertEqual(len(pr.check_fleet_spread(clusters)), 1)
+        self.assertEqual(pr.check_fleet_spread(clusters, min_minors=3), [])
+        wider = [cluster(name="old", master="1.27.0-gke.1"), cluster(name="new", master="1.30.0-gke.1")]
+        self.assertEqual(len(pr.check_fleet_spread(wider, min_minors=3)), 1)
+
+    def test_the_freeze_horizon_moves_with_the_criteria(self):
+        c = cluster(
+            maintenancePolicy={
+                "window": {
+                    "recurringWindow": {},
+                    "maintenanceExclusions": {"freeze": {"startTime": "2026-01-01T00:00:00Z", "endTime": "2026-03-15T00:00:00Z", "maintenanceExclusionOptions": {"scope": "NO_UPGRADES"}}},
+                }
+            }
+        )
+        # NOW is 2026-01-15: 59 days left, past the shipped 30 and short of 90.
+        self.assertIsNotNone(pr.check_blocking_exclusion(c, now=NOW, has_version_finding=False))
+        self.assertIsNone(pr.check_blocking_exclusion(c, now=NOW, has_version_finding=False, long_freeze=timedelta(days=90)))
+        # The escalation does not depend on the horizon.
+        self.assertEqual(
+            pr.check_blocking_exclusion(c, now=NOW, has_version_finding=True, long_freeze=timedelta(days=90))["severity"], "major"
+        )
+
+    def test_the_deprecated_list_moves_with_the_criteria(self):
+        offered = cluster(node_pools=[pool(image_type="COS_CONTAINERD")])
+        self.assertEqual(pr.check_stale_image_type(offered, BASELINE), [])
+        self.assertEqual(len(pr.check_stale_image_type(offered, BASELINE, deprecated=frozenset({"COS_CONTAINERD"}))), 1)
+        # Emptying the list does not un-flag a type the location no longer offers.
+        unoffered = cluster(node_pools=[pool(image_type="COS")])
+        self.assertEqual(len(pr.check_stale_image_type(unoffered, BASELINE, deprecated=frozenset())), 1)
+
+    def test_criteria_reach_the_candidates_and_the_manifest_through_collect_fleet(self):
+        behind = cluster(name="lagging", master="1.33.0-gke.1", node_pools=[pool(version="1.30.0-gke.1")])
+
+        def run(argv, **kwargs):
+            if "clusters" in argv and "list" in argv:
+                return run_of(0, json.dumps([behind]))
+            if "get-server-config" in argv:
+                return run_of(0, json.dumps(server_config(default="1.33.0-gke.1")))
+            raise AssertionError(f"unexpected discovery call: {argv}")
+
+        def pool_skew_severity(manifest):
+            entry = next(c for c in manifest["clusters"] if short(c) == "lagging")
+            return [c["severity"] for c in entry["candidates"] if c["check"] == "pool-skew"]
+
+        shipped = pr.collect_fleet("acme", run=run, now=NOW)
+        self.assertEqual(pool_skew_severity(shipped), ["critical"])
+        self.assertEqual(shipped["criteria"], pr.DEFAULT_CRITERIA.record())
+
+        tuned = pr.Criteria(pool_skew_critical_minors=4, fleet_spread_min_minors=3, blocking_exclusion_min_days=90, deprecated_image_types=frozenset({"UBUNTU"}))
+        manifest = pr.collect_fleet("acme", run=run, now=NOW, criteria=tuned)
+        self.assertEqual(pool_skew_severity(manifest), ["major"])
+        self.assertEqual(
+            manifest["criteria"],
+            {"pool_skew_critical_minors": 4, "fleet_spread_min_minors": 3, "blocking_exclusion_min_days": 90, "deprecated_image_types": ["UBUNTU"]},
+        )
+
+    def test_the_flags_build_the_criteria_the_run_uses(self):
+        with mock.patch.object(pr, "collect_fleet", return_value={"clusters": []}) as collect:
+            with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                rc = pr.main(
+                    [
+                        "--project", "acme",
+                        "--pool-skew-critical-minors", "4",
+                        "--fleet-spread-min-minors", "3",
+                        "--blocking-exclusion-min-days", "45",
+                        "--deprecated-image-types", " cos , Ubuntu,",
+                    ]
+                )
+        self.assertEqual(rc, 0)
+        self.assertEqual(
+            collect.call_args.kwargs["criteria"],
+            pr.Criteria(pool_skew_critical_minors=4, fleet_spread_min_minors=3, blocking_exclusion_min_days=45, deprecated_image_types=frozenset({"COS", "UBUNTU"})),
+        )
+
+    def test_no_flags_is_the_shipped_criteria(self):
+        with mock.patch.object(pr, "collect_fleet", return_value={"clusters": []}) as collect:
+            with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                pr.main(["--project", "acme"])
+        self.assertEqual(collect.call_args.kwargs["criteria"], pr.DEFAULT_CRITERIA)
+
+    def test_an_empty_deprecated_list_is_an_empty_set_not_the_default(self):
+        with mock.patch.object(pr, "collect_fleet", return_value={"clusters": []}) as collect:
+            with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                pr.main(["--project", "acme", "--deprecated-image-types", ""])
+        self.assertEqual(collect.call_args.kwargs["criteria"].deprecated_image_types, frozenset())
+
+    def test_a_critical_rung_at_or_below_the_ceiling_is_refused(self):
+        """Two of §3.2's rungs would claim the same pool; the schema's minimum
+        says the same, and the collector refuses it rather than trusting the
+        caller passed what the store accepted."""
+        for value in ("2", "0", "-1"):
+            with self.subTest(value=value):
+                err = io.StringIO()
+                with mock.patch.object(pr, "collect_fleet") as collect, redirect_stderr(err), redirect_stdout(io.StringIO()):
+                    with self.assertRaises(SystemExit) as exc:
+                        pr.main(["--project", "acme", "--pool-skew-critical-minors", value])
+                self.assertEqual(exc.exception.code, 2)
+                self.assertIn("overlap", err.getvalue())
+                collect.assert_not_called()
+
+    def test_a_width_or_horizon_under_one_is_refused(self):
+        for flag in ("--fleet-spread-min-minors", "--blocking-exclusion-min-days"):
+            with self.subTest(flag=flag):
+                with mock.patch.object(pr, "collect_fleet") as collect, redirect_stderr(io.StringIO()), redirect_stdout(io.StringIO()):
+                    with self.assertRaises(SystemExit):
+                        pr.main(["--project", "acme", flag, "0"])
+                collect.assert_not_called()
 
 if __name__ == "__main__":
     unittest.main()
