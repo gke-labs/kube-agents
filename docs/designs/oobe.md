@@ -103,9 +103,13 @@ next rather than taking the shortest fallback, and a board that never reads is e
 not-new rule below.
 
 **Not a new install.** If, before the stage has started anything, it finds a sweep filed more than
-`NEW_INSTALL_SECONDS` (24 hours) earlier, the install onboarded before this job existed but never
-reached delivery, so the entrypoint's `--assume-retired` entry (§5) could not tell it apart from a
-new one. The stage records the skip and starts nothing; the audits run on their schedules.
+`NEW_INSTALL_SECONDS` (24 hours) earlier, it records a skip and starts nothing; the audits run on
+their schedules. Usually the install onboarded before this job existed but never reached delivery,
+so the entrypoint's `--assume-retired` entry (§5) could not tell it apart from a new one; it may
+also be a new install whose start checks failed all day, which the stage cannot tell apart. The
+reason it records says what it knows: the scan had settled (`SKIP_NOT_NEW`) or had not
+(`SKIP_UNSETTLED`). A scan marker the hand-off refuses is given up on a day after it was written
+(`SKIP_NO_SWEEP`).
 
 ### 4.2 Which audits
 
@@ -137,7 +141,11 @@ failed attempt, unless the scheduler claims it late first, in which case that ru
 A run still going after `RUN_LIMIT_SECONDS` (two hours; single audit runs on CI have reached
 46 minutes), or a row a gateway restart left at running, stops holding the chain. The stage is done once the last audit's run has started.
 
-For each audit in turn, `oobe.py` calls Hermes' `cron.jobs.trigger_job(<id>)` in a subprocess of the
+An audit with a run completed since the sweep was filed, a scheduled one that went while the scan
+settled, is recorded in `fired` and `adopted` and not marked: the install already has that run, and
+marking it would start a second.
+
+For each other audit in turn, `oobe.py` calls Hermes' `cron.jobs.trigger_job(<id>)` in a subprocess of the
 gateway's own interpreter with `HERMES_HOME=<agent home>/profiles/platform`, which is where
 `cron.jobs` finds the Platform Agent's store. That sets the job's `next_run_at` to now; the next
 `profile-cron-tick` runs it within a minute through the schedule's own path, with its prompt,
@@ -262,7 +270,7 @@ at the sweep and the hand-off's `.bootstrap_handoff_filed` at the ranking card, 
 `.oobe_audits_fired`, and puts back the `oobe` job when the image ships one; the teardown restores
 the markers and the job as it found them.
 The stack then waits, up to an hour, for the stage to finish its chain, so the verifier's two-minute window opens after the last audit has started. The verifier reads the Platform Agent's cron run records and
-passes when the stage's `.oobe_audits_fired` lists all four audits as marked due and each has a run claimed since the stage marked it that got going (running, completed, or ended after its start) (a skipped row is passed over), so a scheduled run that falls in the window does not count, and each started only after the one before it in the chain ended. That is stricter than the stage: a mark that lands on a scheduled run it did not see start, a race the runner's wait for running audits makes rare, reads as no run. Red: on
+passes when the stage's `.oobe_audits_fired` lists all four audits as marked due and each has a run claimed since the stage marked it that got going (running, completed, or ended after its start) (a skipped row is passed over), so a scheduled run that falls in the window does not count, and each started only after the one before it in the chain ended. An audit the stage recorded as adopted (a run completed since the sweep) counts as had, and stays out of that order; at least one audit must be the stage's own. That is stricter than the stage: a mark that lands on a scheduled run it did not see start, a race the runner's wait for running audits makes rare, reads as no run. Red: on
 an image without the job, no audit runs. Green: four, in three repetitions. The case's runs are
 real audit runs on four streams, so it declares them (`audit_streams`) and the runner holds their
 locks for the unit. Every unit on an audit stream first waits, up to two hours, while the install

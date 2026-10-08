@@ -484,6 +484,14 @@ class HandOffTest(unittest.TestCase):
         os.utime(self.scan_marker, (old, old))
         self.assertEqual(self._run(), "t_rank1")
 
+    def test_a_filed_at_in_milliseconds_times_out_from_its_own_timestamp(self):
+        # Read as seconds it would lie in the far future, and the deadline would never arrive.
+        _board(self.board, clusters=_all_done() + [("t_stuck", "ready", None, "")])
+        self.scan_marker.write_text(f"task_id={SWEEP}\nfiled_at={int(NOW * 1000)}\n")
+        old = NOW - 10 * h.DEADLINE_SECONDS
+        os.utime(self.scan_marker, (old, old))
+        self.assertEqual(self._run(), "t_rank1")
+
     def test_metadata_of_the_wrong_type_does_not_raise(self):
         meta = {"project": "p", "cluster": "c", "workloads": 12, "findings": "none", "gaps": 3,
                 "topology": {"node_pools": "default"}}

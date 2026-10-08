@@ -6,7 +6,8 @@ audits: once the onboarding inventory scan has settled, run the four fleet audit
 that would otherwise wait for their schedules (the next 06:20 UTC, the next Monday
 for cost), one after another. The bootstrap scan and delivery jobs still run beside it.
 
-The stage fires when the scan's ranking card has finished, read from the board. It
+The stage fires when the ranking card the hand-off recorded for the scan has finished, read
+through the hand-off's own reads (``bootstrap_handoff``). It
 does not wait for delivery, which needs a human message, and it does not look for
 the report file, which is on the sandbox's volume when the sandbox is on. A scan
 that has not settled by the hand-off's own deadline plus ``RANKING_ALLOWANCE_SECONDS``
@@ -21,8 +22,10 @@ Platform Agent's roster with Hermes' ``cron.jobs.trigger_job``, so the next
 run``: that CLI runs the whole job synchronously in the calling process.
 ``.oobe_audits_fired`` records each one before it is marked, and the mark awaiting
 its run, so a run killed partway marks nothing twice: marking an audit due again after it has run
-starts a second full run. With no GitOps repository configured every audit fails
-before it reads anything, so the stage records the skip and marks none.
+starts a second full run. An audit that has completed a run since the sweep was filed (a
+scheduled one) is recorded as adopted and not marked: the install already has that run. With no
+GitHub repository for the audits to publish to every audit fails before it reads anything, so the
+stage records the skip and marks none.
 
 ``trigger_job`` also sets a job's ``enabled`` back to true, so an audit an operator
 has disabled or paused is left alone rather than started.
@@ -31,11 +34,11 @@ A read that fails is never taken as an answer: a tick that cannot read the Platf
 Agent's run ledger or roster marks nothing and spends no attempt, and the next tick
 reads again.
 
-An install whose sweep was filed more than ``NEW_INSTALL_SECONDS`` ago while the
-stage has started nothing is not new: it onboarded before this job existed but
-never reached delivery, so the entrypoint could not tell. Its audits run on their
-schedules. A scan still unsettled after a day (a fleet of hundreds of clusters)
-is caught by the same rule.
+A sweep filed more than ``NEW_INSTALL_SECONDS`` ago while the stage has started nothing is
+skipped: either the install onboarded before this job existed but never reached delivery, so the
+entrypoint could not tell, or a start check failed all day; the stage cannot tell the two apart,
+so the reason it records says only which: the scan had not settled, or it had. A scan marker the
+hand-off refuses is given up on a day after it was written. Its audits run on their schedules.
 
 Once the stage is done, the next run removes the job. Stdout stays empty: the job
 delivers locally and never speaks to the user.
@@ -121,6 +124,8 @@ STATE_HELD = "held"
 STATE_CURRENT = "current"
 # When each audit was marked due, so the run that answers a mark can be told from a scheduled one.
 STATE_MARKS = "marks"
+# Audits passed over because they completed a run since the sweep was filed: in `fired`, never marked.
+STATE_ADOPTED = "adopted"
 CURRENT_JOB = "job"
 CURRENT_MARKED_AT = "marked_at"
 STATE_SKIPPED = "skipped"
@@ -133,6 +138,7 @@ SKIP_NO_REPOSITORY = "no GitHub repository in managed_repos for the audits to pu
 # from a new one whose start checks failed all day, so the reason says only what it knows.
 SKIP_NOT_NEW = "the onboarding sweep was filed more than a day before the stage could start"
 SKIP_UNSETTLED = "the onboarding scan had not settled a day after its sweep was filed"
+SKIP_NO_SWEEP = "the onboarding scan marker has named no sweep card for a day"
 HOLD_MISSING = "not on the Platform Agent's roster"
 HOLD_DISABLED = "disabled"
 HOLD_PAUSED = "paused"
@@ -226,15 +232,16 @@ def scan_settled(data_dir: Path, now: float, quiet: bool = False) -> bool:
         # No cluster was audited: the hand-off wrote the report itself and filed no ranking card.
         return True
     board = board_path(data_dir)
-    state = bootstrap_handoff.read_board(board, sweep_id)
-    if state is None:
-        return False
     if ranking is not None:
+        # The recorded card answers on its own; the sweep's row is needed only for the fallback.
         finished = ranking_finished(board, ranking)
         if finished is None:
             return False
         if finished:
             return True
+    state = bootstrap_handoff.read_board(board, sweep_id)
+    if state is None:
+        return False
     wait = bootstrap_handoff.deadline(state) + RANKING_ALLOWANCE_SECONDS
     if now - filed_at >= wait:
         if quiet:
@@ -387,11 +394,12 @@ def advance_chain(data_dir: Path, state: dict, now: float, since: float | None =
     held = dict(state.get(STATE_HELD, {}))
     current = state.get(STATE_CURRENT)
     marks = dict(state.get(STATE_MARKS, {}))
+    adopted = list(state.get(STATE_ADOPTED, []))
 
     def save(done: bool = False) -> dict:
         new_state = {
             STATE_FIRED: fired, STATE_ATTEMPTS: attempts, STATE_GAVE_UP: gave_up, STATE_HELD: held,
-            STATE_CURRENT: current, STATE_MARKS: marks, STATE_AT: now, STATE_DONE: done,
+            STATE_CURRENT: current, STATE_MARKS: marks, STATE_ADOPTED: adopted, STATE_AT: now, STATE_DONE: done,
         }
         write_state(data_dir, new_state)
         return new_state
@@ -444,6 +452,7 @@ def advance_chain(data_dir: Path, state: dict, now: float, since: float | None =
         if since is not None and completed_since(runs, job_id, since):
             _log(f"not marking {job_id}: it has completed a run since the onboarding sweep was filed")
             fired.append(job_id)
+            adopted.append(job_id)
             continue
         if job_id in holds:
             _log(f"not starting {job_id}: {holds[job_id]}")
@@ -486,6 +495,12 @@ def main(data_dir: Path | None = None, now: float | None = None) -> int:
     filed = scan_filed(data_dir)
     if not state:
         # Not started yet: the checks that decide whether, and when, the chain starts.
+        marker = data_dir / SCAN_FILED_MARKER
+        if filed is None and marker.is_file() and now - marker.stat().st_mtime >= NEW_INSTALL_SECONDS:
+            # A marker the hand-off refuses (no readable task_id) starts nothing; a day on, the
+            # stage stops waiting for it rather than ticking for good.
+            skip(data_dir, SKIP_NO_SWEEP, now)
+            return 0
         if filed is not None and now - filed[1] >= NEW_INSTALL_SECONDS:
             skip(data_dir, SKIP_NOT_NEW if scan_settled(data_dir, now, quiet=True) else SKIP_UNSETTLED, now)
             return 0

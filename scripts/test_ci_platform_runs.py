@@ -141,6 +141,12 @@ class PlatformRunsTest(unittest.TestCase):
         self._rows([("1", "compliance-audit", "running", ago(0))])
         self.assertEqual(self._wait(audits=["stockout-prevention"]), "none going")
 
+    def test_the_stale_cutoff_is_the_stages_run_limit(self):
+        # A run the chain still waits on is one a unit waits on too.
+        stage = REPO / "agents" / "chat" / "scripts" / "oobe.py"
+        limit = eval(re.search(r"^RUN_LIMIT_SECONDS = (.+)$", stage.read_text(), re.M).group(1))
+        self.assertEqual(STALE_SECONDS, limit)
+
     def test_no_store_is_nothing_going(self):
         self.assertEqual(self._wait(), "none going")
 

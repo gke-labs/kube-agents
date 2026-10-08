@@ -696,7 +696,8 @@
 # The oobe job's first-run audits stage (docs/designs/oobe.md): once the
 # onboarding scan settles, four fleet audits start instead of waiting for their
 # schedules, one after another. The stack arms the stage with two archived
-# stand-in cards and the scan marker, and puts back the oobe job the image ships;
+# stand-in cards, the scan marker and the hand-off's record, and puts back the
+# oobe job the image ships;
 # the verifier reads the Platform Agent's cron runs. Nightly rather than presubmit
 # because each repetition runs four real audits back to back.
 ./tasks/oobe-first-run-audits/task.yaml

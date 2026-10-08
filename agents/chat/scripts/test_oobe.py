@@ -231,6 +231,26 @@ class StageTest(unittest.TestCase):
                 self._main(now=NOW_PAST_FALLBACK)
                 self.assertEqual(self.started, [])
 
+    def test_a_refused_marker_is_given_up_on_after_a_day(self):
+        _board(self.board, [])
+        marker = self.d / oobe.SCAN_FILED_MARKER
+        marker.write_text("task_id=\n")
+        self._main(now=marker.stat().st_mtime + oobe.NEW_INSTALL_SECONDS - MINUTE)
+        self.assertEqual(oobe.read_state(self.d), {})
+        self._main(now=marker.stat().st_mtime + oobe.NEW_INSTALL_SECONDS)
+        self.assertEqual(oobe.read_state(self.d)[oobe.STATE_REASON], oobe.SKIP_NO_SWEEP)
+
+    def test_a_finished_recorded_card_needs_no_sweep_row(self):
+        # Archived cards purged from the board: the recorded ranking card still answers.
+        self._file_scan()
+        conn = sqlite3.connect(self.board)
+        conn.executescript("CREATE TABLE tasks (id TEXT, status TEXT, idempotency_key TEXT, title TEXT, created_at INTEGER, body TEXT);")
+        conn.execute("INSERT INTO tasks (id, status) VALUES (?, 'done')", (RANKING_ID,))
+        conn.commit()
+        conn.close()
+        self._main()
+        self.assertEqual(self._started_ids(), FIRST)
+
     def test_a_sweep_not_on_the_board_waits_past_the_fallback(self):
         # The re-arm runbook's `task_id=pending` placeholder: the hand-off waits for it, and so does the stage.
         (self.d / oobe.SCAN_FILED_MARKER).write_text(f"task_id=pending\nfiled_at={FILED_AT}\n")
@@ -479,7 +499,9 @@ class StageTest(unittest.TestCase):
         now = self._drive()
         self.assertNotIn("compliance-audit", self._started_ids())
         self.assertEqual(self._started_ids(), [a for a in oobe.FIRST_RUN_AUDITS if a != "compliance-audit"])
-        self.assertIn("compliance-audit", oobe.read_state(self.d)[oobe.STATE_FIRED])
+        state = oobe.read_state(self.d)
+        self.assertIn("compliance-audit", state[oobe.STATE_FIRED])
+        self.assertEqual(state[oobe.STATE_ADOPTED], ["compliance-audit"])
 
     def test_a_run_from_before_the_sweep_is_not_adopted(self):
         # Yesterday's scheduled run is not this install's first run.
