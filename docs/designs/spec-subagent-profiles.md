@@ -315,7 +315,7 @@ debug mode adds `activity` and `thinking` - the same split the Google Chat `mode
 draws today (`platformagent_manifests.go:1348-1371`).
 
 Artifact names are data, so the set can grow without touching the envelope or the payload
-spec. These five are reserved so that renderers and the audit tooling can rely on them.
+spec. These six are reserved so that renderers and the audit tooling can rely on them.
 
 Deviation, recorded 8/31: the worker adapter as first built (ahead of its stage 3
 slot, for the gateway's session workers) produces `progress` from the model's own
