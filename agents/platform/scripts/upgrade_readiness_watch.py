@@ -140,6 +140,7 @@ ENVELOPE_SENTINEL = "__UPGRADE_READINESS_WATCH_ENVELOPE__"
 ENVELOPE_EXIT_KEY = "exit"
 ENVELOPE_TABLES_KEY = "tables"
 ENVELOPE_REPORT_KEY = "report"
+WROTE_LINE_PREFIX = "Wrote "
 VERSION_TABLE_TIMEOUT_SECONDS = 600
 READINESS_TIMEOUT_SECONDS = 1500
 STDERR_EXCERPT_CHARS = 300
@@ -449,6 +450,12 @@ def cluster_names(clusters: list[str]) -> str:
     return shown
 
 
+def tables_without_the_output_line(tables: str) -> str:
+    """The skill's tables as printed, minus the line naming the loader's
+    temporary output path, which is gone by the time anyone reads this."""
+    return "\n".join(line for line in tables.rstrip().splitlines() if not line.startswith(WROTE_LINE_PREFIX))
+
+
 def render_markdown(version: str, reason: str, clusters: list[str], envelope: dict, now: datetime, days: int) -> str:
     report = envelope[ENVELOPE_REPORT_KEY]
     blocked, ready = readiness_verdicts(report, clusters)
@@ -469,7 +476,7 @@ def render_markdown(version: str, reason: str, clusters: list[str], envelope: di
         "scheduled run starts from an empty rollout record, so it does not compare with the previous report.",
         "",
         "```",
-        envelope.get(ENVELOPE_TABLES_KEY, "").rstrip(),
+        tables_without_the_output_line(envelope.get(ENVELOPE_TABLES_KEY, "")),
         "```",
         "",
     ]

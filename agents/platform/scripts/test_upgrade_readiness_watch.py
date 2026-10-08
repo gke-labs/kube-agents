@@ -129,6 +129,14 @@ class NewVersion(Base):
         self.assertIn("graded 1 blocked (p1/us-central1-a/a) and 1 ready", text)
         self.assertIn("first-run baseline", text)
 
+    def test_the_report_script_s_output_path_line_is_not_saved(self) -> None:
+        readiness = envelope([member("a", "lagging", readiness="ready")], tables="| t |\nWrote 1 member(s) to /tmp/upgrade-readiness-watch-x/report.json\n")
+        sandbox = FakeSandbox(envelope([member("a", "lagging")]), readiness)
+        self.run_tick(sandbox)
+        text = (self.home / "reports" / TARGET / "latest.md").read_text()
+        self.assertIn("| t |", text)
+        self.assertNotIn("Wrote 1 member(s)", text)
+
     def test_a_cluster_at_or_above_its_target_is_not_pending(self) -> None:
         sandbox = FakeSandbox(envelope([member("a", "current"), member("b", "ahead"), member("c", "unknown"), member("d", "lagging", target=None)]))
         code, out = self.run_tick(sandbox)
