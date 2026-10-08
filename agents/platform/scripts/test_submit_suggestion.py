@@ -22,6 +22,7 @@ from __future__ import annotations
 import base64
 import importlib.util
 import io
+import argparse
 import json
 import os
 import shutil
@@ -331,7 +332,7 @@ class SubmitSuggestionTestCase(unittest.TestCase):
 
         for name, value in (
             ("resolve_repo", lambda workspace=None: "acme/infra"),
-            ("get_managed_github_repos", lambda: []),
+            ("get_managed_repos", lambda: []),
         ):
             patch = mock.patch.object(gitops_workspace, name, value)
             patch.start()
@@ -961,7 +962,7 @@ class SubmitSuggestionTestCase(unittest.TestCase):
 
     def test_prepare_refuses_a_repository_outside_the_managed_list(self):
         with mock.patch.object(
-            gitops_workspace, "get_managed_github_repos", lambda: ["acme/infra"]
+            gitops_workspace, "get_managed_repos", lambda: ["acme/infra"]
         ):
             with self.assertRaises(ValueError) as caught:
                 self.run_subject("prepare", "--branch", "b", "--repo", "other/elsewhere")
@@ -974,7 +975,7 @@ class SubmitSuggestionTestCase(unittest.TestCase):
         # empty allowlist -- after which every `--repo` the model names is
         # accepted whenever that read hiccups, and the suite stays green.
         with mock.patch.object(
-            gitops_workspace, "get_managed_github_repos",
+            gitops_workspace, "get_managed_repos",
             mock.Mock(side_effect=RuntimeError("ConfigMap missing")),
         ):
             with self.assertRaises(RuntimeError):
@@ -1066,7 +1067,7 @@ class SubmitSuggestionTestCase(unittest.TestCase):
         prepared = self.prepare()
         self.edit(prepared)
         with mock.patch.object(
-            gitops_workspace, "get_managed_github_repos",
+            gitops_workspace, "get_managed_repos",
             mock.Mock(side_effect=RuntimeError("ConfigMap missing")),
         ):
             with self.assertRaises(RuntimeError):
@@ -1831,7 +1832,7 @@ class TestValidateRepo(unittest.TestCase):
 
     def test_an_unreadable_managed_list_is_refused_rather_than_read_as_empty(self):
         with mock.patch.object(
-            gitops_workspace, "get_managed_github_repos",
+            gitops_workspace, "get_managed_repos",
             mock.Mock(side_effect=RuntimeError("kubectl failed: Forbidden")),
         ):
             with self.assertRaises(RuntimeError) as caught:
@@ -1841,17 +1842,76 @@ class TestValidateRepo(unittest.TestCase):
     def test_an_empty_managed_list_means_no_allowlist_is_configured(self):
         # The other reading of an empty list, and the reason the one above
         # matters: "" and "the read failed" must not arrive at the same place.
-        with mock.patch.object(gitops_workspace, "get_managed_github_repos", lambda: []):
+        with mock.patch.object(gitops_workspace, "get_managed_repos", lambda: []):
             with mock.patch.object(gitops_workspace, "validate_repo_org", lambda repo: repo):
                 self.assertEqual(submit_suggestion.validate_repo("acme/any"), "acme/any")
 
     def test_a_repository_outside_a_populated_managed_list_is_refused(self):
         with mock.patch.object(
-            gitops_workspace, "get_managed_github_repos", lambda: ["acme/managed"]
+            gitops_workspace, "get_managed_repos", lambda: ["acme/managed"]
         ):
             with self.assertRaises(ValueError) as caught:
                 submit_suggestion.validate_repo("acme/unmanaged")
         self.assertIn("not in the managed repositories list", str(caught.exception))
+
+    def test_a_bare_name_is_lifted_on_an_install_with_a_second_forge(self):
+        mixed = ["github.com/acme/fleet", "gitlab.com/acme/infra"]
+        with mock.patch.object(gitops_workspace, "get_managed_repos", lambda: mixed):
+            with mock.patch.dict(os.environ, {"GITOPS_ORG": "acme"}):
+                self.assertEqual("github.com/acme/fleet", submit_suggestion.validate_repo("acme/fleet"))
+
+    def test_a_managed_repository_on_another_forge_is_accepted_at_any_depth(self):
+        name = "gitlab.com/acme/platform/infra"
+        with mock.patch.object(gitops_workspace, "get_managed_repos", lambda: [name]):
+            with mock.patch.dict(os.environ, {"GITOPS_ORG": "acme"}):
+                self.assertEqual(submit_suggestion.validate_repo(name), name)
+
+
+
+class LiftedNameReachesTheBrokerTest(unittest.TestCase):
+    """Review: `prepare` validated the lifted name and sent the bare one."""
+
+    def test_prepare_asks_the_broker_with_the_lifted_name(self):
+        mixed = ["github.com/acme/fleet", "gitlab.com/acme/infra"]
+        seen = []
+
+        def stop(repo, branch):
+            seen.append(repo)
+            raise RuntimeError("stop here")
+
+        args = argparse.Namespace(repo="acme/fleet", branch="platform-agent/x")
+        with mock.patch.object(gitops_workspace, "get_managed_repos", lambda: mixed), \
+                mock.patch.dict(os.environ, {"GITOPS_ORG": "acme"}), \
+                mock.patch.object(submit_suggestion, "open_proposal", stop):
+            with self.assertRaises(RuntimeError):
+                submit_suggestion.handle_prepare(args)
+        self.assertEqual(["github.com/acme/fleet"], seen)
+
+    def test_submit_asks_the_broker_with_the_lifted_name(self):
+        # Review: only `prepare` was pinned; reverting `submit`'s
+        # `repo = validate_repo(repo)` left the suite green, and the broker
+        # refuses the bare name once it serves a second forge.
+        mixed = ["github.com/acme/fleet", "gitlab.com/acme/infra"]
+        seen = []
+
+        def stop(repo, branch):
+            seen.append(repo)
+            raise RuntimeError("stop here")
+
+        session = {"spec": "acme/fleet", "path": "/scratch/acme__fleet", "key": "platform-agent/x"}
+        args = argparse.Namespace(
+            repo="acme/fleet", branch="platform-agent/x", title="t", body="b",
+            body_file=None, keep_description=False,
+        )
+        with mock.patch.object(gitops_workspace, "get_managed_repos", lambda: mixed), \
+                mock.patch.dict(os.environ, {"GITOPS_ORG": "acme"}), \
+                mock.patch.object(submit_suggestion.vcs_client, "resolve_session", return_value=session), \
+                mock.patch.object(submit_suggestion.vcs_client, "key_of", return_value="platform-agent/x"), \
+                mock.patch.object(submit_suggestion.vcs_client, "current_branch", return_value="platform-agent/x"), \
+                mock.patch.object(submit_suggestion, "open_proposal", stop):
+            with self.assertRaises(RuntimeError):
+                submit_suggestion.handle_submit(args)
+        self.assertEqual(["github.com/acme/fleet"], seen)
 
 
 if __name__ == "__main__":

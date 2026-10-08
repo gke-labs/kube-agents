@@ -219,7 +219,7 @@ class _Harness(unittest.TestCase):
             else mock.Mock(return_value=provider)
         )
         buf = StringIO()
-        with mock.patch("gitops_workspace.get_managed_github_repos", managed_mock), \
+        with mock.patch("gitops_workspace.get_managed_repos", managed_mock), \
              mock.patch.object(forge, "provider_for", selector), \
              redirect_stdout(buf):
             rc = helper.main(argv)
@@ -422,7 +422,7 @@ class PollTest(_Harness):
 
         provider = MultiRepoFakeProvider()
         managed_mock = mock.Mock(return_value=["acme/repo1", "acme/repo2"])
-        with mock.patch("gitops_workspace.get_managed_github_repos", managed_mock), \
+        with mock.patch("gitops_workspace.get_managed_repos", managed_mock), \
              mock.patch.object(forge, "provider_for", return_value=provider), \
              redirect_stdout(StringIO()) as buf:
             helper.main(["poll"])
@@ -1531,6 +1531,20 @@ class RepoValidationTest(_Harness):
         self.assertEqual(payload["status"], "ERROR")
         self.assertEqual(payload["reason"], "INVALID_REPOSITORY")
         self.assertIn("not in the managed repositories list", payload["value"])
+
+
+
+class ForgeNeutralRepositoryTest(unittest.TestCase):
+    def test_a_managed_nested_gitlab_project_is_a_valid_repository(self):
+        import gitops_workspace
+
+        name = "gitlab.com/acme/platform/infra"
+        with mock.patch.object(gitops_workspace, "get_managed_repos", lambda: [name]):
+            with mock.patch.dict(os.environ, {"GITOPS_ORG": ""}):
+                self.assertEqual(name, helper.validate_repo(name))
+        with self.assertRaises(ValueError) as caught:
+            helper.validate_repo("https://gitlab.com/acme/infra")
+        self.assertIn("<host>/<path>", str(caught.exception))
 
 
 if __name__ == "__main__":

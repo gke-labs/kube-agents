@@ -170,6 +170,50 @@ clamp_at_least() {
   echo "start-services: ${name}=${value} is not usable (minimum ${floor_name}=${floor}); using ${floor}" >&2
 }
 
+# Rewrite the *named* variable, in place, to the literal `true` or `false` that
+# Go's flag package parses. Correct rather than reject, for the reason given
+# above: these values reach the watcher as `--flag=${value}`, and an unparseable
+# one is a flag error, which is an immediate non-zero exit on every start — the
+# supervisor's backoff loop and three ALERT lines, for a typo. An unrecognised
+# value lands on the caller's default and says so.
+#
+# The list is a superset of the one event_watcher_disabled carries below, and
+# the two are not folded together because they fail in different directions:
+# that one has a fixed answer for an unrecognised value (keep watching) and a
+# message naming what would otherwise go silent, while this one returns
+# whatever its caller nominates.
+#
+# `t`/`T`/`f`/`F` are here because strconv.ParseBool, which is what the flag
+# package calls, accepts them. Without those arms a value the binary would have
+# read as false falls to the fallback and is rewritten to the *opposite* of
+# what was asked for -- an operator who sets `F` to switch a hold off gets it
+# on, with only a line on stderr. Rejecting a spelling is safe; silently
+# inverting one is not, so this list must stay at least as wide as
+# ParseBool's.
+# Surrounding whitespace is stripped before the match for the same reason the
+# table is wide. A `case` pattern matches the whole word, so `false ` -- a
+# quoted YAML scalar, a wrapper's printf, a copy-paste -- misses every arm and
+# lands on the fallback, which inverts it. The intent of `false ` is not in
+# doubt, and a value whose intent *is* in doubt still reaches the fallback.
+normalize_boolean() {
+  local name="$1"
+  local fallback="$2"
+  local value="${!name}"
+  # Leading, then trailing. Both expansions are literal-quoted so the inner
+  # pattern is not re-globbed, and both are no-ops on an already-clean value.
+  value="${value#"${value%%[![:space:]]*}"}"
+  value="${value%"${value##*[![:space:]]}"}"
+
+  case "${value}" in
+    [Tt] | [Tt][Rr][Uu][Ee] | 1 | [Yy][Ee][Ss] | [Oo][Nn]) printf -v "${name}" '%s' true ;;
+    [Ff] | [Ff][Aa][Ll][Ss][Ee] | 0 | [Nn][Oo] | [Oo][Ff][Ff]) printf -v "${name}" '%s' false ;;
+    *)
+      printf -v "${name}" '%s' "${fallback}"
+      echo "start-services: ${name}=${value} is not a recognised boolean; using ${fallback}" >&2
+      ;;
+  esac
+}
+
 clamp_at_least WATCHER_RETRY_MIN_SECONDS
 clamp_at_least DRIFT_RETRY_MIN_SECONDS
 # The ceilings are floored at their own minimum, not at MIN_SETTING_VALUE: a
@@ -279,6 +323,21 @@ WATCHER_FAILEDSCHEDULING_MIN_COUNT="${WATCHER_FAILEDSCHEDULING_MIN_COUNT:-5}"
 # a pod still pending past it is reported on the count whatever the autoscaler
 # last said. Raise it on a cluster whose node pools take longer to provision.
 WATCHER_SCALEUP_HOLD="${WATCHER_SCALEUP_HOLD:-15m}"
+
+# Whether to hold the FailedScheduling an Autopilot cluster emits for GKE's own
+# system pods once it has scaled itself to zero nodes — kube-dns, metrics-server,
+# rule-evaluator and the rest, left Pending by design on a cluster with no user
+# workloads. NAP rules on none of them, so without the hold they cross
+# WATCHER_FAILEDSCHEDULING_MIN_COUNT every time and open a Critical card each
+# master upgrade, which renames their pods. Reaches Autopilot clusters only --
+# zero nodes on a Standard cluster is a fault and still fires. Set to false on a
+# fleet where a scaled-to-zero Autopilot cluster is itself the thing you want
+# reported.
+# Named once: an unset value and an unrecognised one have to resolve the same
+# way, and stating `true` on both lines below lets them drift into disagreeing.
+readonly WATCHER_AUTOPILOT_SCALE_TO_ZERO_HOLD_DEFAULT=true
+WATCHER_AUTOPILOT_SCALE_TO_ZERO_HOLD="${WATCHER_AUTOPILOT_SCALE_TO_ZERO_HOLD:-${WATCHER_AUTOPILOT_SCALE_TO_ZERO_HOLD_DEFAULT}}"
+normalize_boolean WATCHER_AUTOPILOT_SCALE_TO_ZERO_HOLD "${WATCHER_AUTOPILOT_SCALE_TO_ZERO_HOLD_DEFAULT}"
 
 # The agent image's interpreter. The credential-proxy image is built on
 # agent-base by way of proxy-tools, so this is the same venv the agent runs
@@ -553,7 +612,8 @@ start_event_watcher() {
         --backoff-min-count="${WATCHER_BACKOFF_MIN_COUNT}" \
         --imagepull-transient-min-count="${WATCHER_IMAGEPULL_TRANSIENT_MIN_COUNT}" \
         --failedscheduling-min-count="${WATCHER_FAILEDSCHEDULING_MIN_COUNT}" \
-        --scaleup-hold="${WATCHER_SCALEUP_HOLD}" || true
+        --scaleup-hold="${WATCHER_SCALEUP_HOLD}" \
+        --autopilot-scale-to-zero-hold="${WATCHER_AUTOPILOT_SCALE_TO_ZERO_HOLD}" || true
       ran=$(( SECONDS - started ))
 
       # A run long enough to have synced and served is treated as a fresh
