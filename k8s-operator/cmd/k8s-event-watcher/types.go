@@ -55,8 +55,10 @@ type TriageEvent struct {
 	// gate alone: an Autopilot cluster with no user workloads scales itself
 	// to zero nodes by design, where a Standard cluster at zero nodes is a
 	// fault, and the two are indistinguishable from the event otherwise.
-	// False for the direct --in-cluster cluster; see targetCluster.Autopilot
-	// for why that costs nothing.
+	// Carried from the describe call cluster discovery already makes. A
+	// direct --in-cluster entry that no profile covers has no describe behind
+	// it and reads false; see targetCluster.Autopilot for why that costs
+	// nothing, and for the covered case, which does carry the bit.
 	Autopilot     bool
 	Namespace     string
 	KindOfObject  string

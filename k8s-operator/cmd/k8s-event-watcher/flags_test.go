@@ -122,7 +122,11 @@ func TestParseFlags_AutopilotScaleToZeroHold(t *testing.T) {
 		t.Error("--autopilot-scale-to-zero-hold default = false; want true")
 	}
 
-	if cfg := newFilterConfig(nil, nil, nil, filterThresholds{}); !cfg.autopilotScaleToZeroHold {
+	// scaleUpReasons, because the hold also requires both autoscaler reasons
+	// on the allow-list; nil would fall back to defaultReasons and switch it
+	// off for that reason instead, which is TestAutopilotHoldNeedsTheAutoscalerReasons'
+	// subject rather than this one's.
+	if cfg := newFilterConfig(scaleUpReasons, nil, nil, filterThresholds{}); !cfg.autopilotScaleToZeroHold {
 		t.Error("an unfilled threshold group disabled the autopilot hold; want it on")
 	}
 }
@@ -146,7 +150,7 @@ func TestFlagsFilterThresholds(t *testing.T) {
 		if err != nil {
 			t.Fatalf("parseFlags(%v): %v", tc.args, err)
 		}
-		cfg := newFilterConfig(nil, nil, nil, f.filterThresholds())
+		cfg := newFilterConfig(scaleUpReasons, nil, nil, f.filterThresholds())
 		if cfg.autopilotScaleToZeroHold != tc.want {
 			t.Errorf("parseFlags(%v) reached the filter as autopilotScaleToZeroHold=%t; want %t", tc.args, cfg.autopilotScaleToZeroHold, tc.want)
 		}

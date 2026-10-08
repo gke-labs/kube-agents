@@ -177,19 +177,27 @@ clamp_at_least() {
 # supervisor's backoff loop and three ALERT lines, for a typo. An unrecognised
 # value lands on the caller's default and says so.
 #
-# The spelling list matches event_watcher_disabled's below, and the two are not
-# folded together because they fail in different directions: that one has a
-# fixed answer for an unrecognised value (keep watching) and a message naming
-# what would otherwise go silent, while this one returns whatever its caller
-# nominates. Adding a spelling is worth doing in both.
+# The list is a superset of the one event_watcher_disabled carries below, and
+# the two are not folded together because they fail in different directions:
+# that one has a fixed answer for an unrecognised value (keep watching) and a
+# message naming what would otherwise go silent, while this one returns
+# whatever its caller nominates.
+#
+# `t`/`T`/`f`/`F` are here because strconv.ParseBool, which is what the flag
+# package calls, accepts them. Without those arms a value the binary would have
+# read as false falls to the fallback and is rewritten to the *opposite* of
+# what was asked for -- an operator who sets `F` to switch a hold off gets it
+# on, with only a line on stderr. Rejecting a spelling is safe; silently
+# inverting one is not, so this list must stay at least as wide as
+# ParseBool's.
 normalize_boolean() {
   local name="$1"
   local fallback="$2"
   local value="${!name}"
 
   case "${value}" in
-    [Tt][Rr][Uu][Ee] | 1 | [Yy][Ee][Ss] | [Oo][Nn]) printf -v "${name}" '%s' true ;;
-    [Ff][Aa][Ll][Ss][Ee] | 0 | [Nn][Oo] | [Oo][Ff][Ff]) printf -v "${name}" '%s' false ;;
+    [Tt] | [Tt][Rr][Uu][Ee] | 1 | [Yy][Ee][Ss] | [Oo][Nn]) printf -v "${name}" '%s' true ;;
+    [Ff] | [Ff][Aa][Ll][Ss][Ee] | 0 | [Nn][Oo] | [Oo][Ff][Ff]) printf -v "${name}" '%s' false ;;
     *)
       printf -v "${name}" '%s' "${fallback}"
       echo "start-services: ${name}=${value} is not a recognised boolean; using ${fallback}" >&2

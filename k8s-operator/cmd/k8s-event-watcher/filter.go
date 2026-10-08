@@ -188,8 +188,27 @@ func newFilterConfig(reasons []string, allowNamespaces, excludeNamespaces []stri
 	if scaleUpHold <= 0 {
 		scaleUpHold = defaultScaleUpHold
 	}
+	allowedReasons := stringSet(reasons)
+	// The Autopilot hold reads "cluster-autoscaler has said nothing about this
+	// pod" off the absence of a mark, and a mark is only ever recorded for an
+	// event whose reason is allowed: RecordScaleUpMark admits an event only
+	// when Decide returns gateScaleUpMark, and Decide stops a reason off the
+	// list at gateReason first. With either autoscaler reason missing the
+	// watcher cannot hear a verdict at all, so "no verdict" stops meaning what
+	// the hold reads it as, and the hold would sit on a pod the autoscaler had
+	// actually declined — forever, since it has no count or deadline to fall
+	// through to. Every other branch degrades the safe way when a mark is
+	// missing, to the count backstop, which fires; this one does not, so it
+	// switches itself off instead. The shipped entrypoint passes both reasons;
+	// defaultReasons, which applies when --reason is unset, carries neither.
+	autopilotScaleToZeroHold := !th.disableAutopilotScaleToZeroHold
+	if autopilotScaleToZeroHold && !allowsScaleUpMarks(allowedReasons) {
+		log.Printf("k8s-event-watcher: the Autopilot scale-to-zero hold is OFF because --reason carries neither %s nor %s, so no cluster-autoscaler verdict can be recorded and the hold could not tell an abandoned system pod from a declined one; add both reasons to enable it",
+			reasonTriggeredScaleUp, reasonNotTriggerScaleUp)
+		autopilotScaleToZeroHold = false
+	}
 	return filterConfig{
-		allowedReasons:             stringSet(reasons),
+		allowedReasons:             allowedReasons,
 		allowedNamespaces:          stringSet(allowNamespaces),
 		excludedNamespaces:         stringSet(excludeNamespaces),
 		unhealthyMinCount:          orDefault(th.unhealthyMinCount),
@@ -197,8 +216,27 @@ func newFilterConfig(reasons []string, allowNamespaces, excludeNamespaces []stri
 		imagePullTransientMinCount: orDefault(th.imagePullTransientMinCount),
 		failedSchedulingMinCount:   failedSchedulingMinCount,
 		scaleUpHold:                scaleUpHold,
-		autopilotScaleToZeroHold:   !th.disableAutopilotScaleToZeroHold,
+		autopilotScaleToZeroHold:   autopilotScaleToZeroHold,
 	}
+}
+
+// allowsScaleUpMarks reports whether both cluster-autoscaler reasons are on the
+// allow-list, so a verdict can reach the memo. Both, not either: a watcher that
+// hears only TriggeredScaleUp never learns of a decline, and one that hears
+// only NotTriggerScaleUp reads a pod mid-scale-up as unruled. A nil set is the
+// "match every reason" case, which no caller produces — newFilterConfig
+// substitutes defaultReasons for an empty list before building the set — but
+// which answers true rather than panicking if one ever does.
+func allowsScaleUpMarks(allowedReasons map[string]struct{}) bool {
+	if allowedReasons == nil {
+		return true
+	}
+	for _, reason := range []string{reasonTriggeredScaleUp, reasonNotTriggerScaleUp} {
+		if _, ok := allowedReasons[reason]; !ok {
+			return false
+		}
+	}
+	return true
 }
 
 // stringSet converts a slice of strings to a lookup map for fast O(1) checks.
@@ -272,10 +310,12 @@ const (
 	// re-emitting long enough ago that the pod is no longer pending; see
 	// failedSchedulingStaleAfter.
 	gateFailedSchedulingStale filterGate = "failedscheduling_stale"
-	// gateAutopilotScaleToZero is a FailedScheduling from the Autopilot
-	// scheduler on a cluster that has no nodes and no pod NAP has ruled on:
-	// the product scaled the cluster to zero and left its own system pods
-	// Pending, which is not an incident. See autopilotScaleToZero.
+	// gateAutopilotScaleToZero is a FailedScheduling on an Autopilot cluster
+	// that has no nodes, for a pod NAP has not ruled on: the product scaled
+	// the cluster to zero and left its own system pods Pending, which is not
+	// an incident. Not keyed on which scheduler reported it — Autopilot runs
+	// two and the kube-system addons use the ordinary one. See
+	// autopilotScaleToZero.
 	gateAutopilotScaleToZero filterGate = "autopilot_scale_to_zero"
 )
 

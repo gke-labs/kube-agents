@@ -430,7 +430,13 @@ func TestFilterDecideFailedScheduling(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			f := newFilter(newFilterConfig(nil, nil, nil, filterThresholds{
+			// scaleUpReasons, not nil: the Autopilot hold switches itself off
+			// unless both autoscaler reasons are on the allow-list, because
+			// only then can "no verdict on record" mean the autoscaler was
+			// silent rather than unheard. nil here falls back to
+			// defaultReasons, which carries neither, and every autopilot case
+			// below would be exercising the disabled path by accident.
+			f := newFilter(newFilterConfig(scaleUpReasons, nil, nil, filterThresholds{
 				failedSchedulingMinCount:        tc.minCount,
 				scaleUpHold:                     tc.hold,
 				disableAutopilotScaleToZeroHold: tc.disableHold,
@@ -438,6 +444,64 @@ func TestFilterDecideFailedScheduling(t *testing.T) {
 			f.now = func() time.Time { return now }
 			if gate := f.Decide(tc.event); gate != tc.wantGate {
 				t.Errorf("Decide(count=%d, mark=%+v, lastSeen=%v) = %q; want %q", tc.event.Count, tc.event.ScaleUp, tc.event.LastSeen, gate, tc.wantGate)
+			}
+		})
+	}
+}
+
+// TestAutopilotHoldNeedsTheAutoscalerReasons pins that the hold switches itself
+// off unless the watcher can actually hear a cluster-autoscaler verdict.
+//
+// The hold reads "no verdict on record" as "the autoscaler is ignoring this
+// pod", and a verdict only reaches the memo through an event whose reason is
+// allowed — RecordScaleUpMark admits one only when Decide returns
+// gateScaleUpMark, and Decide stops a disallowed reason at gateReason first.
+// With the marks off the list every Autopilot no-nodes event looks unruled,
+// including a pod the autoscaler declined, and the hold has no count or
+// deadline to release it. defaultReasons carries neither mark, so the binary's
+// own default --reason is one of the configurations this covers.
+func TestAutopilotHoldNeedsTheAutoscalerReasons(t *testing.T) {
+	// A pod NAP has actually declined, on an Autopilot cluster with no nodes:
+	// the case that must still open a card however the reasons are configured.
+	declined := TriageEvent{
+		Key:       EventKey{UID: "pod-1", Reason: reasonFailedScheduling},
+		Namespace: "team-a",
+		Name:      "api",
+		Message:   noNodesAvailableMessage,
+		Autopilot: true,
+		Count:     50,
+		LastSeen:  time.Unix(1_700_000_000, 0),
+	}
+
+	for _, tc := range []struct {
+		name     string
+		reasons  []string
+		wantHold bool
+	}{
+		{name: "both marks allowed", reasons: scaleUpReasons, wantHold: true},
+		{name: "no marks allowed", reasons: []string{reasonFailedScheduling}, wantHold: false},
+		{name: "only the trigger allowed", reasons: []string{reasonFailedScheduling, reasonTriggeredScaleUp}, wantHold: false},
+		{name: "only the decline allowed", reasons: []string{reasonFailedScheduling, reasonNotTriggerScaleUp}, wantHold: false},
+		{name: "the shipped defaults carry neither", reasons: nil, wantHold: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := newFilterConfig(tc.reasons, nil, nil, filterThresholds{})
+			if cfg.autopilotScaleToZeroHold != tc.wantHold {
+				t.Fatalf("autopilotScaleToZeroHold = %t; want %t", cfg.autopilotScaleToZeroHold, tc.wantHold)
+			}
+
+			// The consequence, not just the flag: with the hold off, the
+			// declined pod reaches the count backstop and fires, which is
+			// what it did before this gate existed.
+			f := newFilter(cfg)
+			f.now = func() time.Time { return declined.LastSeen }
+			gate := f.Decide(declined)
+			want := gateAutopilotScaleToZero
+			if !tc.wantHold {
+				want = gateAccepted
+			}
+			if gate != want {
+				t.Errorf("Decide(declined-looking pod) = %q; want %q", gate, want)
 			}
 		})
 	}

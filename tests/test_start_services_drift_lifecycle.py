@@ -846,6 +846,37 @@ class NormalizeBooleanResolvesWhatTheWatcherIsHandedAsAFlag(_ScriptCase):
                 self.assertIn(f"resolved={want}", result.stdout)
                 self.assertNotIn("is not a recognised boolean", result.stderr)
 
+    def test_it_never_inverts_a_spelling_go_itself_would_have_parsed(self) -> None:
+        """`strconv.ParseBool`'s vocabulary, which the flag package uses.
+
+        A spelling missing from the table does not fail closed -- it falls to
+        the caller's fallback, so `F` with a `true` default reaches the watcher
+        as `--autopilot-scale-to-zero-hold=true`. The operator asked for the
+        hold off and got it on. Rejecting a spelling is survivable; rewriting
+        one to its opposite is not.
+        """
+        for value, want in (
+            ("t", "true"),
+            ("T", "true"),
+            ("TRUE", "true"),
+            ("True", "true"),
+            ("true", "true"),
+            ("1", "true"),
+            ("f", "false"),
+            ("F", "false"),
+            ("FALSE", "false"),
+            ("False", "false"),
+            ("false", "false"),
+            ("0", "false"),
+        ):
+            with self.subTest(value=value):
+                # Default deliberately opposite to `want`, so a value that
+                # falls through to the fallback reads as the inversion.
+                opposite = "false" if want == "true" else "true"
+                result = self._resolve(value, default=opposite)
+                self.assertIn(f"resolved={want}", result.stdout)
+                self.assertNotIn("is not a recognised boolean", result.stderr)
+
     def test_an_unrecognised_value_lands_on_the_callers_default_and_says_so(self) -> None:
         """Loudly, because the alternative is a flag error on every start."""
         for value in ("bogus", "", " true"):
