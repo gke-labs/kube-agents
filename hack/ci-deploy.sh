@@ -142,16 +142,22 @@ readonly EVAL_DRIFT_READY_INTERVAL_SECONDS=5
 # worker the cgroup OOM killer takes strands its card with no restart and no
 # event: the same shape as the queue this removes, indistinguishable from it
 # in the run record. The gateway's 8Gi limit (resolveResources in
-# k8s-operator/internal/controller/manifest_helpers.go) has room for six at
-# the ~430 MiB a worker measured live, but the eval's working set at more than
-# five has not been measured (#2032), so the eval holds at five: that covers
-# the pull request's four lanes with one slot for a fan-out child, and the
-# nightly's eight lanes still queue three deep. Raising it belongs with that
-# measurement. Running below the production default also means the eval
-# exercises a 4/1 class split rather than production's 5/1. Set on this
-# install only. tests/test_ci_deploy_kanban_cap.py pins the flag, the floor
-# under the pull request's lanes, the eval's ceiling, and the chart rendering
-# the value onto the CR.
+# k8s-operator/internal/controller/manifest_helpers.go) holds about fourteen
+# workers at the ~430 MiB one measured live over the 1.8 GiB idle set, so six
+# active plus their waiting coordinators fit on paper, but the eval's working
+# set at more than five has not been measured (#2032), so the eval holds at
+# five. The lanes' cards arrive through the inject and A2A doors and are user
+# cards, and at a cap of 2 or more each class may hold every slot but the one
+# guaranteed to the other (deploy/docker/patches/kanban_priority.py). At five
+# that leaves four for user cards: exactly the pull request's four lanes
+# (EVAL_TASK_PARALLELISM_DEFAULT below), with the fifth held for event triage.
+# A lane's fan-out child runs in the slot its waiting coordinator gives back.
+# The nightly's eight lanes still queue four deep. Raising the cap belongs with
+# that measurement. Each class may hold four of the five slots here, against
+# five of six in production. Set on this install only.
+# tests/test_ci_deploy_kanban_cap.py pins the flag, the floor (the lanes plus
+# triage's slot), the eval's ceiling, and the chart rendering the value onto
+# the CR.
 readonly EVAL_KANBAN_MAX_IN_PROGRESS="5"
 
 # The release step 5 installs, and — for the poisoned-record guard (#1172) —
