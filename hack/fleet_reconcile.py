@@ -868,7 +868,13 @@ class Run:
         remote, _, branch = self.main_ref.partition("/")
         try:
             if self.fleet_tree is None:
-                self.fleet_tree = fleet_tree("HEAD")
+                try:
+                    self.fleet_tree = fleet_tree("HEAD")
+                except NoStackError as exc:
+                    # The checkout's own tree, not main's: a definite reading,
+                    # fatal at the first check.
+                    self.main_check_error = "this checkout: %s" % exc
+                    return None
             # No --depth: a depth-limited fetch marks a full clone shallow,
             # and a hand run with this flag uses the operator's own checkout.
             git_output(["fetch", "--quiet", remote, branch])

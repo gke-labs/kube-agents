@@ -74,6 +74,16 @@ FLEET_INPUTS = {"main.tf": "aaa1", "versions.tf": "aaa2", ".terraform.lock.hcl":
 FLEET_DOCS = {"README.md": "doc1", "fixtures.json": "fix1"}
 
 
+def _scrubbed_git_env():
+    """An environment the developer's git cannot reach: every inherited GIT_*
+    variable dropped (config injected by a parent `git -c`, an exported
+    GIT_DIR, GIT_OBJECT_DIRECTORY, ...), no global or system config, a fixed
+    identity. Every test that shells out to git passes it as env=."""
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_") or k == "GIT_EXEC_PATH"}
+    env.update(GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1", GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@t", GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@t")
+    return env
+
+
 def _fleet_lines(**blobs):
     return sorted("100644 blob %s\tbench/tf/fleet/%s" % (sha, name) for name, sha in blobs.items())
 
@@ -1511,17 +1521,21 @@ class FleetTreeTest(unittest.TestCase):
         self.assertEqual(calls[0].get("encoding"), "utf-8")
         self.assertEqual(calls[0].get("errors"), "surrogateescape")
 
+    def test_the_scrubbed_git_environment_drops_every_inherited_git_variable(self):
+        with mock.patch.dict(os.environ, {"GIT_DIR": "/elsewhere/.git", "GIT_CONFIG_PARAMETERS": "'commit.gpgsign=true'", "GIT_OBJECT_DIRECTORY": "/elsewhere/objects", "GIT_EXEC_PATH": "/usr/lib/git-core", "HOME": os.environ.get("HOME", "/tmp")}):
+            env = _scrubbed_git_env()
+        self.assertEqual([k for k in env if k.startswith("GIT_") and k not in ("GIT_EXEC_PATH", "GIT_CONFIG_GLOBAL", "GIT_CONFIG_NOSYSTEM", "GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL")], [])
+        self.assertEqual((env["GIT_EXEC_PATH"], env["GIT_CONFIG_GLOBAL"], env["GIT_CONFIG_NOSYSTEM"]), ("/usr/lib/git-core", os.devnull, "1"))
+
     def test_a_non_utf8_input_name_hashes_through_real_git(self):
         # The index can hold a name the filesystem cannot; `ls-tree -z` prints
         # its raw bytes and git_output decodes them with surrogateescape. Real
         # git, so the decode half is what this pins, not the mock's string.
         with tempfile.TemporaryDirectory() as tmp:
-            # The developer's git must not reach the scratch repository: no
-            # global or system config (a commit.gpgsign would prompt or fail),
-            # and no exported GIT_DIR/GIT_WORK_TREE/GIT_INDEX_FILE, which would
-            # make every command below write into the developer's repository.
-            env = {k: v for k, v in os.environ.items() if k not in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE")}
-            env.update(GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1", GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@t", GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@t")
+            # The developer's git must not reach the scratch repository: an
+            # exported GIT_DIR would make every command below write into the
+            # developer's repository, a commit.gpgsign would prompt or fail.
+            env = _scrubbed_git_env()
 
             def git(*args, data=None):
                 return subprocess.run([b"git", b"-C", os.fsencode(tmp), *args], check=True, capture_output=True, input=data, env=env).stdout.decode().strip()
@@ -1551,7 +1565,7 @@ class FleetTreeTest(unittest.TestCase):
         bystanders = {"README.md", "fixtures.json"}
         # -z, as the script's ls-tree: an unquoted name per entry, so a
         # non-ASCII or space-bearing input is read as the input it is.
-        tracked = subprocess.run(["git", "-C", str(reconcile.REPO_ROOT), "ls-files", "-z", "--", reconcile.FLEET_SUBDIR], check=True, capture_output=True).stdout.decode("utf-8", "surrogateescape").split("\0")
+        tracked = subprocess.run(["git", "-C", str(reconcile.REPO_ROOT), "ls-files", "-z", "--", reconcile.FLEET_SUBDIR], check=True, capture_output=True, env=_scrubbed_git_env()).stdout.decode("utf-8", "surrogateescape").split("\0")
         tracked = [path for path in tracked if path]
         self.assertGreater(len(tracked), 5)
         strangers = [path for path in tracked if not reconcile.is_fleet_input(path) and path.rsplit("/", 1)[-1] not in bystanders]
