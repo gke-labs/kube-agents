@@ -2905,3 +2905,49 @@ func TestCLI_FollowUpTurnDoesNotSpawnAfterTheTaskStops(t *testing.T) {
 	}
 	b.finalize(run, lib.StateCompleted, "", nil)
 }
+
+// Ruling: the first turn checks the deadline before it spawns, as a
+// follow-up's does. Its timer is armed before turn 1's spawn, so one that
+// fires first finds no child to kill; a child spawned after it would run
+// with nothing left to stop it.
+func TestCLI_FirstTurnDoesNotSpawnPastTheDeadline(t *testing.T) {
+	_, url := startServer(t)
+	marker := filepath.Join(t.TempDir(), "spawned")
+	b, _ := startBridgeConfig(t, Config{NATSURL: url, Command: []string{"/bin/true", "-q"},
+		TaskDeadline: 20 * time.Second, KillGrace: 500 * time.Millisecond, Scope: capability.NamespaceScope("")}, nil)
+	argv := script(t, "touch "+marker)
+	future := time.Now().Add(time.Hour)
+	cases := []struct {
+		name       string
+		prepare    func(run *taskRun)
+		deadlineAt time.Time
+	}{
+		{"deadline-fired", func(run *taskRun) { run.deadlineHit.Store(true) }, future},
+		{"deadline-passed", func(*taskRun) {}, time.Now().Add(-time.Second)},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			taskID := "task-cli-first-nospawn-" + tc.name
+			run, _ := idleRun(t, b, taskID)
+			run.steers = nil // turn 1: nothing queued yet
+			tc.prepare(run)
+			if _, _, _, spawned := b.cliTurn(run, argv, nil, newActivityState(false), nil, tc.deadlineAt); spawned {
+				t.Fatal("the first turn spawned past the deadline")
+			}
+			if _, err := os.Stat(marker); err == nil {
+				t.Fatal("the first turn's child ran")
+			}
+			var final *lib.StatusUpdate
+			for _, env := range replayEvents(t, url, taskID) {
+				if lib.IsFinalStatus(env) {
+					final = &lib.StatusUpdate{}
+					_ = json.Unmarshal(env.Payload, final)
+				}
+			}
+			if final == nil || final.Status.State != lib.StateFailed || final.Status.Message == nil ||
+				!strings.HasPrefix(final.Status.Message.Parts[0].Text, "reason: deadline-exceeded") {
+				t.Fatalf("terminal %+v, want failed deadline-exceeded", final)
+			}
+		})
+	}
+}

@@ -1338,8 +1338,8 @@ func lastSessionID(stderr string) string {
 // cliTurn runs one hermes child for run and waits for it. steer is the
 // follow-up the turn runs, nil on turn 1; it leaves the queue as the child
 // starts. spawned is false when the task is final: it already was, or this
-// finalized it - the spawn failed, or a follow-up's turn found the task
-// canceled, past deadlineAt or the bridge stopping (no follow-up child
+// finalized it - the spawn failed, the turn found the task past deadlineAt,
+// or a follow-up's turn found it canceled or the bridge stopping (no child
 // starts once the deadline has fired, or it would outlive the kill). The
 // activity state is stored and its publisher started on turn 1 only; later
 // children reuse the same key in env.
@@ -1350,7 +1350,7 @@ func (b *Bridge) cliTurn(run *taskRun, argv, env []string, act *activityState, s
 	var out strings.Builder
 	errTail := newTailBuffer(stderrTailBytes)
 	cmd.Stdout, cmd.Stderr, cmd.Env = &out, errTail, env
-	if !first && !time.Now().Before(deadlineAt) {
+	if !time.Now().Before(deadlineAt) {
 		run.deadlineHit.Store(true) // due, its timer just has not run yet
 	}
 	run.mu.Lock()
@@ -1359,7 +1359,10 @@ func (b *Bridge) cliTurn(run *taskRun, argv, env []string, act *activityState, s
 		run.mu.Unlock()
 		return "", "", nil, false
 	}
-	if !first && (run.canceled.Load() || run.deadlineHit.Load() || b.closing.Load()) {
+	// The deadline on every turn, turn 1 included: its timer is armed before
+	// turn 1's spawn, and one that fired first found no child to kill. A
+	// cancel on turn 1 still spawns and kills below, as before.
+	if run.deadlineHit.Load() || (!first && (run.canceled.Load() || b.closing.Load())) {
 		// Checked under the lock the deadline timer and the cancel kill take,
 		// after each has stored its flag: one that lands after this check
 		// finds run.proc set and kills the child.
