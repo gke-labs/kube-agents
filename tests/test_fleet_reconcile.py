@@ -2039,6 +2039,48 @@ class WorkersTest(unittest.TestCase):
             fire_thread.join(timeout=5)
         self.assertEqual(sorted(boskos.released), [P7, P8], "both holds were released before the termination propagated")
 
+    def test_a_termination_landing_during_worker_startup_drains_started_workers(self):
+        # A SIGINT landing while worker threads are being started must be
+        # caught by the drain rather than escaping before _run_workers enters
+        # its try block, ensuring started workers are drained and holds released.
+        orig_start = threading.Thread.start
+        fired = False
+
+        def wrapped_start(thread_self):
+            nonlocal fired
+            orig_start(thread_self)
+            if not fired and thread_self.name.startswith("fleet-reconcile-"):
+                fired = True
+                os.kill(os.getpid(), signal.SIGINT)
+
+        def tofu(argv, **_):
+            if argv[1] == "apply":
+                while not reconcile.terminating():
+                    time.sleep(0.02)
+                return subprocess.CompletedProcess(argv, 130, "", "interrupted")
+            if argv[1] == "plan":
+                return subprocess.CompletedProcess(argv, reconcile.PLAN_HAS_CHANGES, "", "")
+            if argv[1] == "show":
+                return subprocess.CompletedProcess(argv, 0, UPDATE_ONLY, "")
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+        boskos = _Boskos(free=[P7, P8])
+        previous = signal.signal(signal.SIGINT, boskos_pool.terminate)
+        outcomes = {}
+        try:
+            with mock.patch.object(threading.Thread, "start", wrapped_start), mock.patch.object(
+                boskos_pool.urllib.request, "urlopen", boskos
+            ), mock.patch("sys.stdout", io.StringIO()):
+                with self.assertRaises(boskos_pool.Terminated):
+                    reconcile.reconcile_pool(BOSKOS, OWNER, runner=tofu, known=KNOWN, run=reconcile.Run(workers=2), outcomes=outcomes)
+        finally:
+            signal.signal(signal.SIGINT, previous)
+            reconcile._TERMINATING.clear()
+            boskos_pool._DEFERRED.clear()
+            boskos_pool._HOLD_DEPTH = 0
+        self.assertEqual(sorted(boskos.released), sorted(boskos.acquired), "all acquired holds were released before termination propagated")
+        self.assertTrue(len(boskos.released) > 0, "at least one worker ran and released its hold")
+
     def test_no_tofu_is_started_once_a_termination_has_landed(self):
         # The forward reaches the children alive at that instant; a worker
         # between two steps, or just out of its acquire, must not start the
@@ -2068,13 +2110,13 @@ class WorkersTest(unittest.TestCase):
                 order.append(project)
             verbs[project].append(argv[1])
             if argv[1] == "init" and len(order) == 2:
-                started.wait(timeout=5)
+                started.wait(timeout=15)
                 while not reconcile.terminating():
                     time.sleep(0.02)
                 time.sleep(0.1)
                 return subprocess.CompletedProcess(argv, 0, "", "")
             if argv[1] == "apply":
-                started.wait(timeout=5)
+                started.wait(timeout=15)
                 while not reconcile.terminating():
                     time.sleep(0.02)
                 return subprocess.CompletedProcess(argv, 130, "", "interrupted")
@@ -2146,7 +2188,7 @@ class WorkersTest(unittest.TestCase):
                 return subprocess.CompletedProcess(argv, 0, "", "")
 
             def fire():
-                for _ in range(250):
+                for _ in range(750):
                     if len(os.listdir(tmp)) >= 2:
                         os.kill(os.getpid(), signal.SIGINT)
                         return

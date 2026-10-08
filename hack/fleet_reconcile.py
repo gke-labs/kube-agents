@@ -1174,19 +1174,25 @@ def _run_workers(worker, count):
             flag.set()
 
     threads = [threading.Thread(target=guarded, args=(flag,), name="fleet-reconcile-%d" % i, daemon=True) for i, flag in enumerate(done)]
-    for thread in threads:
-        thread.start()
+    started_flags = []
     try:
+        boskos_pool._hold_signals(True)
+        try:
+            for thread, flag in zip(threads, done):
+                thread.start()
+                started_flags.append(flag)
+        finally:
+            boskos_pool._hold_signals(False)
         while not all(flag.is_set() for flag in done):
             for flag in done:
                 flag.wait(WORKER_JOIN_STEP_SECONDS)
     except boskos_pool.Terminated:
         _begin_termination()
         deadline = clock() + WORKER_DRAIN_SECONDS
-        for flag in done:
+        for flag in started_flags:
             flag.wait(max(0, deadline - clock()))
         _children_signal(kill=True)
-        for flag in done:
+        for flag in started_flags:
             flag.wait(WORKER_JOIN_STEP_SECONDS)
         raise
     if failures:
