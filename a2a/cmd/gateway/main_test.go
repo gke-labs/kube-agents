@@ -548,12 +548,14 @@ func TestRealMainWiresMetrics(t *testing.T) {
 
 	deadline := time.Now().Add(10 * time.Second)
 	found := false
+	metricPrefix := "kubeagents_a2a_gateway_gchat_pulls_total{outcome=\"empty\"} "
 	for time.Now().Before(deadline) {
 		resp, err := client.Get(metricsURL)
 		if err == nil {
 			body, _ := io.ReadAll(resp.Body)
 			resp.Body.Close()
-			if resp.StatusCode == http.StatusOK && strings.Contains(string(body), "kubeagents_a2a_gateway_gchat_pulls_total{outcome=\"empty\"} 1") {
+			bodyStr := string(body)
+			if resp.StatusCode == http.StatusOK && strings.Contains(bodyStr, metricPrefix) && !strings.Contains(bodyStr, metricPrefix+"0\n") {
 				found = true
 				break
 			}

@@ -295,6 +295,94 @@ func TestHealedStaleTerminalDeliversOnceEvenIfRelayQueued(t *testing.T) {
 	}
 }
 
+// TestHealedStaleTerminalWithoutArtifactSkipsNonTextNoticeIfRelayQueued: when
+// a task finishes without an ArtifactResult, the heal posts the status card;
+// the relay's subsequent delivery must skip the redundant completedNonTextResult
+// notice on chat conversations.
+func TestHealedStaleTerminalWithoutArtifactSkipsNonTextNoticeIfRelayQueued(t *testing.T) {
+	r := startRig(t)
+	conv := "discord:g1/metrics-heal-no-artifact"
+	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: "m-1", Text: "do task"}
+	origin := r.awaitTask(t, "platform")
+
+	ctx := context.Background()
+	l := r.g.lockSession(conv)
+	l.Lock()
+
+	// Complete without publishing ArtifactResult.
+	publishMetricsTerminal(t, r, origin, TerminalFromExecutor, lib.StateCompleted)
+	waitFor(t, "relay blocked on session lock", func() bool {
+		r.g.mu.Lock()
+		defer r.g.mu.Unlock()
+		entry := r.g.sessionLocks[conv]
+		return entry != nil && entry.refcount >= 2
+	})
+
+	rec, err := r.g.reg.Get(ctx, conv)
+	if err != nil || rec == nil {
+		t.Fatalf("session record: %v", err)
+	}
+	r.g.healActiveTask(ctx, rec)
+	l.Unlock()
+
+	waitFor(t, "relay worker finished", func() bool {
+		r.g.mu.Lock()
+		defer r.g.mu.Unlock()
+		return r.g.sessionLocks[conv] == nil
+	})
+	time.Sleep(metricsSettle)
+
+	posts := r.adapter.postTexts()
+	if len(posts) != 2 {
+		t.Errorf("adapter saw %d posts %v, want 2 (submission placeholder and status card)", len(posts), posts)
+	}
+	if slices.Contains(posts, completedNonTextResult) {
+		t.Errorf("adapter unexpectedly posted completedNonTextResult: %v", posts)
+	}
+}
+
+// TestHealedStaleChildTerminalDropsQueuedRelayStraggler: when a delegated child's
+// terminal is queued behind the session lock while the heal runs, the heal wakes
+// the session and retires the route. applyEvent must drop the post-retirement
+// straggler so the session is not woken a second time.
+func TestHealedStaleChildTerminalDropsQueuedRelayStraggler(t *testing.T) {
+	r, spawn := startRigWithSpawner(t)
+	ctx := context.Background()
+	conv := "discord:g1/t-child-heal-queued"
+	_, _, child := delegated(t, r, spawn, conv, "")
+
+	l := r.g.lockSession(conv)
+	l.Lock()
+
+	completeTask(t, r.execFor(t, child, targetPlatform), "fleet is green")
+
+	waitFor(t, "relay blocked on session lock", func() bool {
+		r.g.mu.Lock()
+		defer r.g.mu.Unlock()
+		entry := r.g.sessionLocks[conv]
+		return entry != nil && entry.refcount >= 2
+	})
+
+	rec, err := r.g.reg.Get(ctx, conv)
+	if err != nil || rec == nil {
+		t.Fatalf("session record: %v", err)
+	}
+	r.g.healActiveTask(ctx, rec)
+	l.Unlock()
+
+	waitFor(t, "relay worker finished", func() bool {
+		r.g.mu.Lock()
+		defer r.g.mu.Unlock()
+		return r.g.sessionLocks[conv] == nil
+	})
+	time.Sleep(metricsSettle)
+
+	// Exactly 2 spawn calls: initial turn + one wake from the heal; no duplicate wake.
+	if len(spawn.calls()) != 2 {
+		t.Fatalf("spawn calls = %d, want 2 (duplicate wake was not dropped)", len(spawn.calls()))
+	}
+}
+
 // TestBusUnreachableTerminalIsCounted (jayantid's review of #2473): a task
 // whose submission never reached the bus ends in the gateway's own failed
 // terminal, which bypasses the relay. The user reads "could not reach the

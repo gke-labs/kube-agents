@@ -1062,7 +1062,6 @@ func (g *Gateway) healActiveTask(ctx context.Context, rec *SessionRecord) {
 		// says, age is not evidence.
 		g.logTaskTerminal(rec, addressee, active.TaskID, lib.StateFailed, TerminalNeverStarted, "")
 		g.observeEnded(rec, active.TaskID, lib.StateFailed, TerminalNeverStarted, "")
-		rec.MarkTerminalObserved(active.TaskID)
 		healed, healedSource = true, TerminalNeverStarted
 	}
 	if healed {
