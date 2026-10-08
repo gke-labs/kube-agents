@@ -87,7 +87,7 @@ func runNotify(args []string) error {
 	if err != nil {
 		return err
 	}
-	body, err := json.Marshal(lib.NotifyRequest{Text: text, Thread: *thread})
+	body, err := json.Marshal(lib.NotifyRequest{Text: text, Thread: *thread, WaitMillis: timeout.Milliseconds()})
 	if err != nil {
 		return err
 	}
@@ -116,6 +116,16 @@ func runNotify(args []string) error {
 		return fmt.Errorf("notify: subscribe %s: %w", reply, err)
 	}
 	defer func() { _ = in.Unsubscribe() }()
+	// A refused subscribe is reported only asynchronously, and the publish
+	// after it would still reach the gateway, which would post into a reply
+	// namespace this client cannot hear. Flush first, so a refusal here is
+	// known before anything is sent and "nothing was posted" stays true.
+	if err := nc.Flush(); err != nil {
+		return fmt.Errorf("notify: flush: %w", err)
+	}
+	if busRefused(nc) {
+		return fmt.Errorf("notify: the bus refused the reply subscription, so nothing was sent: %v", nc.LastError())
+	}
 	if err := nc.PublishRequest(subject, reply, body); err != nil {
 		return fmt.Errorf("notify: publish: %w", err)
 	}
@@ -163,8 +173,7 @@ func runNotify(args []string) error {
 func awaitAnswer(nc *nats.Conn, in *nats.Subscription, timeout time.Duration) (*nats.Msg, error) {
 	deadline := time.Now().Add(timeout)
 	for {
-		if last := nc.LastError(); errors.Is(last, nats.ErrPermissionViolation) ||
-			(last != nil && strings.Contains(strings.ToLower(last.Error()), notifyPermissionsViolation)) {
+		if busRefused(nc) {
 			return nil, errNotifyRefusedByBus
 		}
 		wait := time.Until(deadline)
@@ -177,6 +186,14 @@ func awaitAnswer(nc *nats.Conn, in *nats.Subscription, timeout time.Duration) (*
 		}
 		return msg, err
 	}
+}
+
+// busRefused reports whether the server has refused something this connection
+// sent: a permissions violation, which reaches only the async error.
+func busRefused(nc *nats.Conn) bool {
+	last := nc.LastError()
+	return errors.Is(last, nats.ErrPermissionViolation) ||
+		(last != nil && strings.Contains(strings.ToLower(last.Error()), notifyPermissionsViolation))
 }
 
 // busUnreachable reports whether a connect failure is the bus not being

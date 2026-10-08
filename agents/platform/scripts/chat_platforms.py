@@ -72,8 +72,9 @@ CONFIG_PATH = os.environ.get("PLATFORM_AGENT_CONFIG_PATH", "/opt/data/config.yam
 # consumer, so it answers the question being asked rather than approximating it
 # (platformagent_manifests.go, the `integration.GoogleChat` / `integration.Slack` blocks
 # in buildPodTemplateSpec). Under `mode: next` Google Chat moves to the A2A gateway and
-# the variable is not set here, which this list correctly reads as Chat not being this
-# pod's to post to.
+# the variable is not set here, so this list does not count it; the operator sets
+# `A2A_NOTIFY_PLATFORM` instead, and the platform it names is counted through the
+# gateway's notify route (chat_notify.py).
 #
 # In a deployed pod the relay URL is not merely first, it is the only one of these
 # that arrives. A bot token is a credential, so it lives in the credential-proxy

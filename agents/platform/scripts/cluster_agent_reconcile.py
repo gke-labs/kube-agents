@@ -67,10 +67,6 @@ from pathlib import Path
 import sandbox_exec
 import chat_notify
 from chat_platforms import enabled_chat_platforms
-
-# The reconcile notice's kill timeout for `hermes send`; a routed send gets
-# at least `a2a notify`'s own bound (chat_notify.subprocess_timeout).
-NOTIFY_SEND_TIMEOUT_SECONDS = 30
 from cluster_agent_profile import (
     HERMES_BIN,
     RESERVED_PROFILES,  # noqa: F401 - re-exported for callers/tests; used indirectly via list_profiles
@@ -84,6 +80,9 @@ from cluster_agent_profile import (
 )
 
 DESCRIBE_TIMEOUT_SECONDS = 30
+# The reconcile notice's kill timeout for `hermes send`; a routed send gets
+# at least `a2a notify`'s own bound (chat_notify.subprocess_timeout).
+NOTIFY_SEND_TIMEOUT_SECONDS = 30
 _MD_BASE = "http://metadata.google.internal/computeMetadata/v1/"
 EXTRA_EXCLUDE = {c for c in os.environ.get("RECONCILE_EXCLUDE", "").split(",") if c}
 

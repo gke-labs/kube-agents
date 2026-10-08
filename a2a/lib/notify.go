@@ -29,6 +29,11 @@ type NotifyRequest struct {
 	// Thread, when set, is the thread to reply on. It must be a thread of
 	// the home channel; empty starts a new thread there.
 	Thread string `json:"thread,omitempty"`
+	// WaitMillis is how long the requester waits for the answer. A request
+	// the gateway fails or refuses after that has nobody to tell, and the
+	// requester has recorded it as possibly posted, so the gateway logs the
+	// loss as an error rather than as an ordinary refusal. Zero is unknown.
+	WaitMillis int64 `json:"wait_ms,omitempty"`
 }
 
 // NotifyReply is the answer: the first message posted and the thread it
