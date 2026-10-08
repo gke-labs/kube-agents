@@ -406,18 +406,19 @@ func capAsk(text string) string {
 // follow-ups (G22): the first answers the delegated request, and the result
 // answers the last follow-up. A completed wake's body is then every answer in
 // order, each follow-up's under wakeFollowUpMarker, so the session reads the
-// answer to what it asked and not only the last. With none the body is the
-// result alone, as before.
+// answer to what it asked and not only the last. A child that answered turns
+// and then ended otherwise wakes with those answers, then its reason under
+// wakeEndMarker. With none the body is the result or the reason alone, as
+// before.
 func wakeText(state lib.TaskState, childID, ask string, turns []string, result, reason string) string {
-	outcome, earlier, body := "completed", "", result
+	outcome, completed, body := "completed", true, result
 	switch state {
 	case lib.StateFailed, lib.StateCanceled: // a canceled the gateway did not publish
-		outcome, body = "failed", reason
+		outcome, completed, body = "failed", false, reason
 	case lib.StateRejected:
-		outcome, body = "was rejected", reason
-	default:
-		earlier, body = wakeAnswers(turns, result)
+		outcome, completed, body = "was rejected", false, reason
 	}
+	earlier, body := wakeAnswers(turns, outcome, completed, body)
 	var text string
 	if ask = strings.TrimSpace(ask); ask != "" {
 		// Runs broken first, then the cap: each break adds a zero-width
@@ -446,13 +447,18 @@ const wakeFollowUpMarker = "(follow-up %d answer)"
 // the answers after it keep their numbers.
 const nonTextTurnAnswer = "(a non-text answer; see the stream)"
 
-// wakeAnswers splits a completed child's answers for fenceWakeBody: earlier,
-// every turn answer but the result's, each follow-up's under its marker, and
-// last, the result under the last follow-up's marker. With no turns earlier
-// is empty and last is the result untouched.
-func wakeAnswers(turns []string, result string) (earlier, last string) {
+// wakeEndMarker opens a child's reason after its turn answers in a wake
+// whose child did not complete, with the header's outcome.
+const wakeEndMarker = "(then it %s)"
+
+// wakeAnswers splits a child's answers for fenceWakeBody: earlier, every
+// turn answer, each follow-up's under its marker, and last, body (the result
+// or the reason) under the last follow-up's marker when completed, else under
+// wakeEndMarker, and empty for an empty reason. With no turns earlier is
+// empty and last is body untouched.
+func wakeAnswers(turns []string, outcome string, completed bool, body string) (earlier, last string) {
 	if len(turns) == 0 {
-		return "", result
+		return "", body
 	}
 	var b strings.Builder
 	for i, t := range turns {
@@ -464,7 +470,13 @@ func wakeAnswers(turns []string, result string) (earlier, last string) {
 		}
 		b.WriteString(t)
 	}
-	return b.String(), "\n\n" + fmt.Sprintf(wakeFollowUpMarker, len(turns)) + "\n" + strings.TrimSpace(result)
+	if completed {
+		return b.String(), "\n\n" + fmt.Sprintf(wakeFollowUpMarker, len(turns)) + "\n" + strings.TrimSpace(body)
+	}
+	if body = strings.TrimSpace(body); body == "" {
+		return b.String(), ""
+	}
+	return b.String(), "\n\n" + fmt.Sprintf(wakeEndMarker, outcome) + "\n" + body
 }
 
 // fenceWakeBody is the label, the fence, the capped body and the fence. The

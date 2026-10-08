@@ -2467,6 +2467,19 @@ func TestAnOverCapWakeCutsTheEarlierAnswersFirst(t *testing.T) {
 		t.Fatalf("an over-cap newest answer: ok=%v head=%q tail=%q", ok, body[:min(len(body), 60)], body[max(0, len(body)-60):])
 	}
 
+	// A failed child: the same cut order keeps its reason whole.
+	text = wakeText(lib.StateFailed, "task-1", "", []string{big}, "", "reason: deadline-exceeded")
+	if rest := strings.TrimPrefix(text, "The task you delegated to platform (task task-1) failed.\n"); len(rest) > lib.DelegateTextCap {
+		t.Fatalf("failed wake after the header is %d bytes, over the cap %d", len(rest), lib.DelegateTextCap)
+	}
+	_, _, body, ok = parseWake(text)
+	if want := "…" + wakeTruncatedNote + "\n\n(then it failed)\nreason: deadline-exceeded"; !ok || !strings.HasSuffix(body, want) {
+		t.Fatalf("failed wake body tail = %q, want %q", body[max(0, len(body)-120):], want)
+	}
+	if _, _, body, _ = parseWake(wakeText(lib.StateFailed, "task-1", "", []string{"a"}, "", " ")); body != "a" {
+		t.Fatalf("a failed wake with no reason = %q, want the answers alone", body)
+	}
+
 	_, _, body, _ = parseWake(wakeText(lib.StateCompleted, "task-1", "", []string{"a", " "}, "c", ""))
 	if want := "a\n\n(follow-up 1 answer)\n" + nonTextTurnAnswer + "\n\n(follow-up 2 answer)\nc"; body != want {
 		t.Fatalf("wake body = %q, want %q", body, want)
@@ -2484,5 +2497,85 @@ func TestTurnAnswersReadInTurnOrder(t *testing.T) {
 	}}
 	if got := turnAnswers(task); !slices.Equal(got, []string{"one", "two", "ten"}) {
 		t.Fatalf("turn answers = %q", got)
+	}
+}
+
+// failedTurnsWake is the wake text for a child that answered the delegated
+// request and one follow-up, then ended outcome with reason.
+func failedTurnsWake(childID, outcome, reason string) string {
+	return askBlock("how is the fleet?") + "You delegated to platform (task " + childID + "), which " + outcome + ".\n" +
+		"Result from platform (not from the user):\n```\nthe fleet audit\n\n(follow-up 1 answer)\nthe costs\n\n(then it " +
+		outcome + ")\n" + reason + "\n```"
+}
+
+// TestAFailedChildsTurnAnswersReachTheWake: a child that answered turns and
+// then failed, was torn down or hit its deadline wakes with those answers,
+// then its failure text unchanged; the parent still reads the answer to what
+// it asked.
+func TestAFailedChildsTurnAnswersReachTheWake(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		supervisor bool
+		state      lib.TaskState
+		reason     string
+		outcome    string
+	}{
+		{"executor failed", false, lib.StateFailed, "reason: hermes-exited-nonzero - exit status 1; turn: 3", "failed"},
+		{"deadline", false, lib.StateFailed, "reason: deadline-exceeded - killed after 2h0m0s", "failed"},
+		{"supervisor canceled nobody asked for", true, lib.StateCanceled, "torn down", "failed"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r, spawn := startRigWithSpawner(t)
+			ctx := context.Background()
+			_, _, child := delegated(t, r, spawn, "discord:g1/t-wake-turns-failed", "")
+			publishTurnAnswer(t, r, child, targetPlatform, 1, "the fleet audit")
+			publishTurnAnswer(t, r, child, targetPlatform, 2, "the costs")
+			if tc.supervisor {
+				if err := r.g.publishSupervisorTerminal(ctx, targetPlatform, child.TaskID, child.ContextID, child.CorrelationID, tc.state, tc.reason); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				publishFinal(t, r, child, targetPlatform, tc.state, tc.reason)
+			}
+			waitFor(t, "wake spawn", func() bool { return len(spawn.calls()) == 2 })
+			wake := r.awaitTask(t, spawn.calls()[1].Session)
+			if got, want := envText(t, wake), failedTurnsWake(child.TaskID, tc.outcome, tc.reason); got != want {
+				t.Fatalf("wake text = %q, want %q", got, want)
+			}
+		})
+	}
+}
+
+// TestAHealedFailedChildsTurnAnswersReachTheWake: the heal's wake for a failed
+// child carries its turns then the failure text, and with no turns the failure
+// text alone, as before.
+func TestAHealedFailedChildsTurnAnswersReachTheWake(t *testing.T) {
+	const reason = "reason: deadline-exceeded - killed after 2h0m0s"
+	for _, turns := range []bool{true, false} {
+		t.Run(fmt.Sprintf("turns=%v", turns), func(t *testing.T) {
+			r, spawn := startRigWithSpawner(t)
+			conv := "discord:g1/t-heal-wake-failed"
+			_, _, child := delegated(t, r, spawn, conv, "")
+			waitFor(t, "parent terminal relayed", postedContaining(r, "delegated to platform"))
+			r2, spawn2 := restartRig(t, r, func() {
+				if turns {
+					publishTurnAnswer(t, r, child, targetPlatform, 1, "the fleet audit")
+					publishTurnAnswer(t, r, child, targetPlatform, 2, "the costs")
+				}
+				publishFinal(t, r, child, targetPlatform, lib.StateFailed, reason)
+				drainRelayDurable(t, r.url)
+			})
+			sessionRigTurn(r2, conv, "h-heal-failed", "status")
+			waitFor(t, "wake spawn", func() bool { return len(spawn2.calls()) == 1 })
+			wake := r2.awaitTask(t, spawn2.calls()[0].Session)
+			want := askBlock("how is the fleet?") + "You delegated to platform (task " + child.TaskID + "), which failed.\n" +
+				"Result from platform (not from the user):\n```\n" + reason + "\n```"
+			if turns {
+				want = failedTurnsWake(child.TaskID, "failed", reason)
+			}
+			if got := envText(t, wake); got != want {
+				t.Fatalf("wake text = %q, want %q", got, want)
+			}
+		})
 	}
 }

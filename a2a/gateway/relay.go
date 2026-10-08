@@ -312,11 +312,12 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 	ref, _ := rec.TaskRefFor(taskID)
 	needResult := result == "" && s.Status.State == lib.StateCompleted &&
 		(!isConsoleConversation(rec.Key) || ref.Role == taskRoleChild)
-	// A child's turn answers feed its wake too. The render state holds them
-	// when this process relayed every event (local); otherwise a restart may
-	// have lost some, and the stream has them all.
+	// A child's turn answers feed its wake too, however it ended. The render
+	// state holds them when this process relayed every event (local);
+	// otherwise a restart may have lost some, and the stream has them all. A
+	// child its requester stopped wakes nothing, so it needs none.
 	turns := rs.turnAnswers
-	needTurns := ref.Role == taskRoleChild && s.Status.State == lib.StateCompleted && !rs.local
+	needTurns := ref.Role == taskRoleChild && !ref.Canceled && !rs.local
 	// A session turn that ends completed may have asked to delegate in an
 	// event this process never ran: the artifact's delivery was acked and
 	// lost to a crash before its batch, and only the terminal was
