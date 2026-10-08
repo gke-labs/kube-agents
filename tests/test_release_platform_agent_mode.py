@@ -192,6 +192,18 @@ class ReadinessScriptModeTest(unittest.TestCase):
             [f"kubectl rollout status deployment/platform-agent-gateway -n {_NAMESPACE} --timeout=GATE"],
         )
 
+    def test_a_spent_budget_still_waits_rather_than_passing_unchecked(self):
+        """kubectl reads --timeout=0s as "do not wait", so the floor is one second."""
+        helper = _REPO_ROOT / "scripts" / "release" / "platform_agent_mode.sh"
+        out = subprocess.run(
+            ["bash", "-c", f'set -euo pipefail; . "{helper}"; '
+             'platform_agent_mode_remaining "$((SECONDS - 5))"; '
+             'platform_agent_mode_remaining "$((SECONDS + 90))"'],
+            capture_output=True, text=True, check=True,
+        ).stdout.split()
+        self.assertEqual(out[0], "1")
+        self.assertIn(int(out[1]), (89, 90))
+
     def test_a_mode_that_is_not_a_mode_stops_before_any_connection(self):
         for value in ("Next", "nxt", "today ", "TODAY"):
             with self.subTest(value=value):
