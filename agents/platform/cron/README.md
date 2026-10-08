@@ -200,7 +200,9 @@ retired only on a tick whose version table read every project, a report that
 graded none of a version's pending clusters is written but not recorded (the
 chat line says "none graded" and the version is tried again tomorrow), and the
 weekly comparison carries ten minutes of slack so the tick's own drift cannot
-push a refresh to day eight. The three
+push a refresh to day eight. A partial table or an ungraded version is
+announced once, not daily: the ledger keeps what was announced and the next
+line is the recovery. The three
 environment knobs (`UPGRADE_READINESS_REFRESH_DAYS`, `_PROJECTS`,
 `_WATCH_HOME`) are for a run started by hand in the pod; the operator's
 `spec.deployment.env` allowlist does not carry them.

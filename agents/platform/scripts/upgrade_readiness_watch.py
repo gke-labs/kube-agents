@@ -186,6 +186,9 @@ FIRST_SEEN_KEY = "first_seen"
 LAST_REPORT_KEY = "last_report_at"
 PENDING_KEY = "pending"
 LAST_TICK_KEY = "last_tick"
+ANNOUNCED_KEY = "announced"
+ANNOUNCED_PARTIAL_KEY = "partial"
+ANNOUNCED_UNGRADED_KEY = "ungraded"
 REASON_NEW = "new target version"
 REASON_REFRESH = "scheduled refresh"
 
@@ -200,7 +203,9 @@ BLOCKED_NAMES = " ({names})"
 FAILED_LINE = "{prefix} watch: {what} failed: {detail}"
 FAILED_WHAT_TICK = "the tick"
 FAILED_WHAT_WRITE = "writing the ledger or the report"
-PARTIAL_LINE = "{prefix} watch: the version table was partial ({errors} read error(s), exit {code}); nothing retired this tick"
+PARTIAL_LINE = "{prefix} watch: the version table was partial ({errors} read error(s), exit {code}); nothing retired while it stays so"
+PARTIAL_CLEARED_LINE = "{prefix} watch: the version table reads every project again"
+DRY_RUN_WOULD_RETIRE = "dry run: would retire {version} (no cluster is pending it)"
 UNGRADED_LINE = (
     "{prefix}: {reason} {version}, {pending} cluster(s) pending ({names}): none graded ({detail}); "
     "report on the gateway pod at {path}; retrying tomorrow"
@@ -291,7 +296,10 @@ def projects() -> list[str]:
         found.add(management)
     if found:
         return sorted(found)
-    completed = sandbox_exec.run(list(CONFIG_PROJECT_ARGV), timeout=PROJECT_LOOKUP_TIMEOUT_SECONDS, check=False)
+    try:
+        completed = sandbox_exec.run(list(CONFIG_PROJECT_ARGV), timeout=PROJECT_LOOKUP_TIMEOUT_SECONDS, check=False)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(TIMED_OUT_DETAIL.format(seconds=PROJECT_LOOKUP_TIMEOUT_SECONDS)) from None
     configured = (completed.stdout or "").strip()
     if not configured:
         raise RuntimeError(NO_PROJECT_DETAIL)
@@ -361,6 +369,17 @@ def loader_source(argv: list[str]) -> str:
     )
 
 
+def envelope_line(stdout: str) -> str | None:
+    """The JSON line after the last line that is exactly the sentinel. The
+    sentinel inside a tenant-written string sits on the JSON line itself, never
+    alone on a line, so it cannot shift the split."""
+    lines = stdout.splitlines()
+    for index in range(len(lines) - 1, -1, -1):
+        if lines[index].strip() == ENVELOPE_SENTINEL:
+            return lines[index + 1].strip() if index + 1 < len(lines) else None
+    return None
+
+
 def report_argv(names: list[str], readiness: bool) -> list[str]:
     argv = project_flags(names)
     if readiness:
@@ -383,10 +402,11 @@ def run_report(names: list[str], readiness: bool) -> dict:
         raise RuntimeError(TIMED_OUT_DETAIL.format(seconds=timeout)) from None
     stdout = completed.stdout or ""
     excerpt = " ".join((completed.stderr or "").split())[:STDERR_EXCERPT_CHARS]
-    if ENVELOPE_SENTINEL not in stdout:
+    envelope_text = envelope_line(stdout)
+    if envelope_text is None:
         detail = excerpt or " ".join(stdout.split())[:STDERR_EXCERPT_CHARS]
         raise RuntimeError(f"sandbox exited {completed.returncode} without a report: {detail}")
-    envelope = json.loads(stdout.rsplit(ENVELOPE_SENTINEL, 1)[1].strip())
+    envelope = json.loads(envelope_text)
     if not isinstance(envelope.get(ENVELOPE_REPORT_KEY), dict):
         raise RuntimeError(f"report script exited {envelope.get(ENVELOPE_EXIT_KEY)} and wrote no report: {excerpt}")
     return envelope
@@ -411,7 +431,11 @@ def pending_targets(report: dict) -> dict[str, list[str]]:
 
 
 def empty_ledger() -> dict:
-    return {LEDGER_SCHEMA_KEY: LEDGER_SCHEMA_VERSION, TARGETS_KEY: {}, LAST_TICK_KEY: None}
+    return {LEDGER_SCHEMA_KEY: LEDGER_SCHEMA_VERSION, TARGETS_KEY: {}, LAST_TICK_KEY: None, ANNOUNCED_KEY: {}}
+
+
+def announced(ledger: dict) -> dict:
+    return ledger.setdefault(ANNOUNCED_KEY, {})
 
 
 def load_ledger(path: Path) -> dict:
@@ -419,6 +443,8 @@ def load_ledger(path: Path) -> dict:
         data = json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError:
         return empty_ledger()
+    except ValueError as exc:
+        raise RuntimeError(f"ledger at {path} is not valid JSON ({exc}); refusing to overwrite it") from None
     if not isinstance(data, dict) or not isinstance(data.get(TARGETS_KEY), dict):
         raise RuntimeError(f"ledger at {path} is not this job's ledger; refusing to overwrite it")
     for version, entry in data[TARGETS_KEY].items():
@@ -476,12 +502,14 @@ def readiness_verdicts(report: dict, clusters: list[str]) -> tuple[list[str], li
     """The blocked, ready, unknown and unread clusters among ``clusters``, by
     member key. ``unknown`` is a verdict the script gave (an exclusion or a pool
     it could not decide) and counts as graded; ``unread`` is a cluster the run
-    returned no member for, which is a failed or missing read."""
+    returned no member for, or one whose kubectl read the report lists under
+    ``errors`` (the script still appends such a member, graded unknown)."""
     wanted = set(clusters)
+    failed_reads = {member_key(error) for error in report.get(ERRORS_KEY) or [] if error.get(MEMBER_ID_KEYS[-1])}
     buckets: dict[str, list[str]] = {READINESS_BLOCKED: [], READINESS_READY: [], READINESS_UNKNOWN: []}
     for member in report.get(MEMBERS_KEY) or []:
         key = member_key(member)
-        if key not in wanted:
+        if key not in wanted or key in failed_reads:
             continue
         status = (member.get(READINESS_KEY) or {}).get(STATUS_KEY)
         if status in buckets:
@@ -597,16 +625,23 @@ def tick(dry_run: bool = False) -> list[str]:
     read_errors = versions[ENVELOPE_REPORT_KEY].get(ERRORS_KEY) or []
     complete = versions.get(ENVELOPE_EXIT_KEY) == EXIT_OK and not read_errors
     pending = pending_targets(versions[ENVELOPE_REPORT_KEY])
-    due, retired = decide(ledger, pending, now, days, retire=complete)
-    lines = [RETIRED_LINE.format(prefix=LINE_PREFIX, version=v) for v in retired]
-    if not complete:
-        lines.append(PARTIAL_LINE.format(prefix=LINE_PREFIX, errors=len(read_errors), code=versions.get(ENVELOPE_EXIT_KEY)))
     if dry_run:
+        due, _ = decide(ledger, pending, now, days, retire=False)
+        lines = [DRY_RUN_WOULD_RETIRE.format(version=v) for v in sorted(ledger[TARGETS_KEY]) if v not in pending and complete]
         for version, reason in due.items():
             lines.append(DRY_RUN_WOULD_REPORT.format(version=version, reason=reason, names=cluster_names(pending[version])))
         if not due:
             lines.append(DRY_RUN_NOTHING_DUE.format(versions=", ".join(sorted(pending)) or NONE_WORD))
         return lines
+    due, retired = decide(ledger, pending, now, days, retire=complete)
+    lines = [RETIRED_LINE.format(prefix=LINE_PREFIX, version=v) for v in retired]
+    partial_signature = json.dumps(sorted(json.dumps(e, sort_keys=True) for e in read_errors)) if not complete else None
+    already = announced(ledger).get(ANNOUNCED_PARTIAL_KEY)
+    if partial_signature and partial_signature != already:
+        lines.append(PARTIAL_LINE.format(prefix=LINE_PREFIX, errors=len(read_errors), code=versions.get(ENVELOPE_EXIT_KEY)))
+    elif complete and already:
+        lines.append(PARTIAL_CLEARED_LINE.format(prefix=LINE_PREFIX))
+    announced(ledger)[ANNOUNCED_PARTIAL_KEY] = partial_signature
     if due:
         readiness, failures = readiness_by_project(pending, due)
         for version, reason in due.items():
@@ -619,13 +654,17 @@ def tick(dry_run: bool = False) -> list[str]:
             if not blocked and not ready and not unknown:
                 failed_projects = sorted({project_of(k) for k in clusters} & set(failures))
                 detail = "; ".join(PROJECT_RUN_FAILED_DETAIL.format(project=p, error=failures[p]) for p in failed_projects) or READS_FAILED_DETAIL
-                lines.append(
-                    UNGRADED_LINE.format(
-                        prefix=LINE_PREFIX, reason=reason, version=version, pending=len(clusters),
-                        names=cluster_names(clusters), detail=detail, path=path,
+                ungraded_announced = announced(ledger).setdefault(ANNOUNCED_UNGRADED_KEY, {})
+                if ungraded_announced.get(version) != detail:
+                    lines.append(
+                        UNGRADED_LINE.format(
+                            prefix=LINE_PREFIX, reason=reason, version=version, pending=len(clusters),
+                            names=cluster_names(clusters), detail=detail, path=path,
+                        )
                     )
-                )
+                ungraded_announced[version] = detail
                 continue
+            announced(ledger).get(ANNOUNCED_UNGRADED_KEY, {}).pop(version, None)
             ledger[TARGETS_KEY][version][LAST_REPORT_KEY] = iso(now)
             lines.append(
                 REPORT_LINE.format(

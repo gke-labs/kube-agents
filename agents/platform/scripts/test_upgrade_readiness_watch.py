@@ -166,7 +166,7 @@ class NewVersion(Base):
 
     def test_a_version_none_of_whose_clusters_were_graded_is_written_but_not_recorded(self) -> None:
         readiness = envelope(
-            [],
+            [member("a", "lagging", readiness="unknown")],
             errors=[{"project": "p1", "location": "us-central1-a", "cluster": "a", "message": "get-credentials failed: 403"}],
         )
         sandbox = FakeSandbox(envelope([member("a", "lagging")]), readiness)
@@ -281,8 +281,29 @@ class Retired(Base):
         sandbox = FakeSandbox(partial)
         code, out = self.run_tick(sandbox)
         self.assertEqual(code, 0)
-        self.assertEqual(out.strip(), "upgrade readiness watch: the version table was partial (1 read error(s), exit 1); nothing retired this tick")
+        self.assertEqual(out.strip(), "upgrade readiness watch: the version table was partial (1 read error(s), exit 1); nothing retired while it stays so")
         self.assertIn(OLDER_TARGET, self.ledger()["targets"])
+
+
+    def test_a_persisting_partial_table_is_announced_once_and_its_recovery_once(self) -> None:
+        self.seed(OLDER_TARGET, NOW, ["p1/us-central1-a/b"])
+        partial = envelope([member("a", "current")], errors=[{"project": "p1", "message": "clusters list failed"}], exit_code=1)
+        code, out1 = self.run_tick(FakeSandbox(partial))
+        code, out2 = self.run_tick(FakeSandbox(partial))
+        self.assertIn("the version table was partial", out1)
+        self.assertEqual(out2, "")
+        code, out3 = self.run_tick(FakeSandbox(envelope([member("b", "current", target=OLDER_TARGET)])))
+        self.assertIn("the version table reads every project again", out3)
+        self.assertIn(f"{OLDER_TARGET} is no longer pending", out3)
+
+    def test_a_persisting_ungraded_version_is_announced_once(self) -> None:
+        readiness = envelope([], errors=[{"project": "p1", "location": "us-central1-a", "cluster": "a", "message": "403"}])
+        code, out1 = self.run_tick(FakeSandbox(envelope([member("a", "lagging")]), readiness))
+        code, out2 = self.run_tick(FakeSandbox(envelope([member("a", "lagging")]), readiness))
+        self.assertIn("none graded", out1)
+        self.assertEqual(out2, "")
+        code, out3 = self.run_tick(FakeSandbox(envelope([member("a", "lagging")]), envelope([member("a", "lagging", readiness="ready")])))
+        self.assertIn("1 ready;", out3)
 
 
 class DryRun(Base):
@@ -293,6 +314,15 @@ class DryRun(Base):
         self.assertIn(f"dry run: would report {TARGET} (new target version) for a", out)
         self.assertEqual(sandbox.kinds(), ["versions"])
         self.assertFalse((self.home / watch.LEDGER_FILE_NAME).exists())
+
+    def test_dry_run_says_would_retire_rather_than_retired(self) -> None:
+        self.seed(OLDER_TARGET, NOW, ["p1/us-central1-a/b"])
+        sandbox = FakeSandbox(envelope([member("b", "current", target=OLDER_TARGET)]))
+        code, out = self.run_tick(sandbox, ["--dry-run"])
+        self.assertEqual(code, 0)
+        self.assertIn(f"dry run: would retire {OLDER_TARGET}", out)
+        self.assertNotIn("retired from the watch", out)
+        self.assertIn(OLDER_TARGET, self.ledger()["targets"])
 
     def test_dry_run_says_when_nothing_is_due(self) -> None:
         sandbox = FakeSandbox(envelope([member("a", "current")]))
@@ -368,6 +398,41 @@ class Failures(Base):
                 self.assertEqual(code, 0)
                 self.assertIn(f"has a malformed entry for {TARGET}; refusing to overwrite it", out)
                 self.assertEqual(sandbox.calls, [])
+
+    def test_a_sentinel_inside_tenant_text_does_not_shift_the_envelope(self) -> None:
+        body = envelope([member("a", "lagging")], tables=f"| exclusion {watch.ENVELOPE_SENTINEL} (NO_UPGRADES) |")
+
+        def run(argv, *, timeout, check, stdin=None):
+            return subprocess.CompletedProcess(argv, 0, stdout=f"{watch.ENVELOPE_SENTINEL}\n{json.dumps(body)}\n", stderr="")
+
+        out = io.StringIO()
+        with mock.patch.object(watch.sandbox_exec, "run", side_effect=run), redirect_stdout(out):
+            code = watch.main(["--dry-run"])
+        self.assertEqual(code, 0)
+        self.assertIn("dry run: would report", out.getvalue())
+
+    def test_an_unparsable_ledger_is_refused_not_overwritten(self) -> None:
+        self.home.mkdir(parents=True)
+        (self.home / watch.LEDGER_FILE_NAME).write_text('{"targets": {')
+        sandbox = FakeSandbox(envelope([member("a", "lagging")]))
+        code, out = self.run_tick(sandbox)
+        self.assertEqual(code, 0)
+        self.assertIn("is not valid JSON", out)
+        self.assertEqual(sandbox.calls, [])
+        self.assertEqual((self.home / watch.LEDGER_FILE_NAME).read_text(), '{"targets": {')
+
+    def test_a_project_lookup_timeout_is_one_short_line(self) -> None:
+        def slow(argv, *, timeout, check, stdin=None):
+            raise subprocess.TimeoutExpired(["ssh", "-F", "/dev/null"], timeout)
+
+        out = io.StringIO()
+        with mock.patch.dict(os.environ, {watch.PROJECTS_ENV: "", watch.MANAGEMENT_PROJECT_ENV: ""}), mock.patch.object(
+            watch, "roster_projects", return_value=set()
+        ), mock.patch.object(watch.sandbox_exec, "run", side_effect=slow), redirect_stdout(out):
+            code = watch.main([])
+        self.assertEqual(code, 0)
+        self.assertIn(f"timed out after {watch.PROJECT_LOOKUP_TIMEOUT_SECONDS}s", out.getvalue())
+        self.assertNotIn("ssh", out.getvalue())
 
     def test_no_resolvable_project_fails_closed(self) -> None:
         def unset(argv, *, timeout, check, stdin=None):
