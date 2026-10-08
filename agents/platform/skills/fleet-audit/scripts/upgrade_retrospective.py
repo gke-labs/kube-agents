@@ -51,21 +51,25 @@ grouping under `sections` beside the per-cluster `reviews`.
 Projects come from `--project`, else the active gcloud project plus
 `gcloud projects list`, exactly as `collect.py` discovers the fleet.
 
-A *full* run names `--project` explicitly, no `--cluster`, no `--since`, and
-every listing succeeds; it records the fleet's project set in the ledger and
-may change it (projects that left are pruned with their clusters, projects
-that joined are added), prunes departed clusters, refreshes every fleet
-cluster's stored symptom set (pods, nodes and owners, one list each), writes
-`reports/<finish-UTC>.md` and moves `upgrade-retro-report.md` to it. Any
-other run is *scoped*: it reviews its targets, never adds a project to the
-fleet (a cluster outside it is reported "outside the fleet; not recorded"
-and gets no ledger entry or guard), prunes nothing, reports no stale guard
-outside its scope, writes `reports/<finish-UTC>-scoped.md` and leaves the
-link alone; `--since` is a hand run that widens the window and advances no
-last-run time. The newest fourteen reports of each kind are kept. Each
+Only a run invoked with `--full` is *full* (`--full` with `--cluster` is a
+usage error): it records the fleet's project set in the ledger and may
+change it (a project absent from its `--project` set is pruned with its
+clusters and guards, a joined project is added), prunes departed clusters,
+refreshes every fleet cluster's stored symptom set (pods, nodes and owners,
+one list each), writes `reports/<finish-UTC>.md` and moves
+`upgrade-retro-report.md` to it. A roster project whose listing failed is
+that project's gap, not the run's: its entries and guards stay unchanged,
+its known clusters are listed under "Reads that failed", and the run stays
+full. Every other run is *scoped*, whatever its `--project` set: it reviews
+its targets, never adds a project to the fleet (a cluster outside it is
+reported "outside the fleet; not recorded" and gets no ledger entry or
+guard), prunes nothing, reports no stale guard outside its scope, writes
+`reports/<finish-UTC>-scoped.md` and leaves the link alone; `--since` is a
+hand run that widens the window and advances no last-run time. The newest fourteen reports of each kind are kept. Each
 symptom carries an onset read from the object (a Pending pod's scheduling
-transition, the last termination, the readiness loss, an event's first
-observation); one whose onset predates the window's first operation, or
+transition or start; for a pod that is not Ready the `Ready` condition's
+transition to False, else its start, never its latest crash; an event's
+first observation; a node condition's transition); one whose onset predates the window's first operation, or
 that the previous full run recorded, is a Warning that says so, never an
 Error; with no readable onset the stored set decides, and a first run grades
 by onset alone and says so. Confidence is high only when the signature names
@@ -232,6 +236,9 @@ FIRST_RUN_GRADING_TEXT = "first run: graded by onset only, no previous symptom s
 # reviews a cluster outside it but records nothing for it.
 LEDGER_PROJECTS_KEY = "projects"
 OUTSIDE_FLEET_TEXT = "outside the fleet; not recorded"
+FULL_WITH_CLUSTER_TEXT = "--full names a fleet-wide run and cannot be combined with --cluster"
+NOT_FULL_TEXT = "no --full: a scoped run"
+LISTING_FAILED_TEXT = "{cluster}: its project's listing failed ({error}); ledger entry and guards kept unchanged"
 # A crash record beside no ledger blocks every run until it is archived.
 CRASH_RECORD_GLOB = LEDGER_FILENAME + ".unreadable-*"
 ARCHIVE_SUBDIR = "archive"
@@ -1194,13 +1201,19 @@ def _pod_last_activity(pod: dict) -> datetime | None:
 
 def _pod_onset(pod: dict, activity: datetime | None) -> datetime | None:
     """When the symptom began, read from the object: a Pending pod's
-    scheduling transition or start, otherwise its last termination or
-    readiness loss (`activity`)."""
+    scheduling transition or start; for a pod that is not Ready, the Ready
+    condition's transition to False, else the pod's start. The last
+    termination is the latest crash, never the onset (`activity` dates the
+    window bound, not the symptom)."""
     status = pod.get("status") or {}
+    meta = pod.get("metadata") or {}
     if status.get("phase") == PHASE_PENDING:
         scheduled = _condition(pod, "PodScheduled")
-        return parse_ts(scheduled.get("lastTransitionTime")) or parse_ts(status.get("startTime")) or parse_ts((pod.get("metadata") or {}).get("creationTimestamp"))
-    return activity
+        return parse_ts(scheduled.get("lastTransitionTime")) or parse_ts(status.get("startTime")) or parse_ts(meta.get("creationTimestamp"))
+    ready = _condition(pod, "Ready")
+    if ready.get("status") == "False" and parse_ts(ready.get("lastTransitionTime")):
+        return parse_ts(ready["lastTransitionTime"])
+    return parse_ts(status.get("startTime")) or parse_ts(meta.get("creationTimestamp"))
 
 
 def pod_symptoms(pods: list[dict], resolver: Resolver, window_start: datetime | None = None) -> list[dict]:
@@ -2373,7 +2386,7 @@ def _incident_key(incident: dict) -> tuple[str, str]:
     return incident["cluster"], incident["object"]
 
 
-def triage(reviews: list[dict], unchanged: list[dict], failed_reads: list[str], guards: list[dict], seen_at: str, removed: list[str] | None = None, rechecks: list[dict] | None = None, upgrading: list[dict] | None = None, in_scope: set[str] | None = None, scope_reason: str = "") -> dict:
+def triage(reviews: list[dict], unchanged: list[dict], failed_reads: list[str], guards: list[dict], seen_at: str, removed: list[str] | None = None, rechecks: list[dict] | None = None, upgrading: list[dict] | None = None, in_scope: set[str] | None = None, scope_reason: str = "", unlisted: set[str] | None = None) -> dict:
     """Group the reviews into the report's three sections. An incident is one
     object on one cluster: its symptoms, their (C) rows and the guards it
     produced, plus the cluster's (A) summary."""
@@ -2450,6 +2463,10 @@ def triage(reviews: list[dict], unchanged: list[dict], failed_reads: list[str], 
         # its last review is a Warning; stale risk guards stay in the file,
         # and a scoped run says nothing about clusters outside its scope.
         if in_scope is not None and guard.get("cluster") not in in_scope:
+            continue
+        if guard.get("cluster") in (unlisted or set()):
+            # Its project's listing failed this run: the gap is under "Reads
+            # that failed", not a stale Warning per guard.
             continue
         if guard.get("last_seen") != seen_at and guard.get("kind", GUARD_KIND_FAILURE) == GUARD_KIND_FAILURE:
             warnings.append({
@@ -2735,6 +2752,8 @@ def collect(args: argparse.Namespace, *, run: RunFn | None = None, now: datetime
     ledger = load_json(ledger_path, empty_ledger(), version=LEDGER_VERSION, now=now, move_aside=not args.dry_run)
     guards = load_json(guards_path, empty_guards(), version=GUARDS_VERSION, now=now, move_aside=not args.dry_run)
     forced = {c.strip() for c in args.cluster or [] if c.strip()}
+    if getattr(args, "full", False) and forced:
+        raise argparse.ArgumentTypeError(FULL_WITH_CLUSTER_TEXT)
 
     failed_reads: list[str] = []
     if args.project:
@@ -2785,21 +2804,23 @@ def collect(args: argparse.Namespace, *, run: RunFn | None = None, now: datetime
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
         reviews = list(pool.map(lambda s: _safe_review(s, ledger, run=run, seen_at=seen_at, server_config=server_configs.get((s.cluster["project"], s.cluster["location"])), now=now), selected))
     reviews.sort(key=lambda r: r["cluster"])
-    # A run is full when it can stand for the fleet: no --cluster, an explicit
-    # --project set, no --since, every listing successful. A full run records
-    # the fleet's project set and may change it; a scoped run never adds to it.
+    # Only a run invoked with --full is full: it records the fleet's project
+    # set and may change it, prunes, writes the dated report and moves the
+    # link. Every other run is scoped, whatever its --project set. A roster
+    # project whose listing failed is that project's gap, not the run's: its
+    # entries and guards stay, its known clusters go under "Reads that failed".
     fleet = set(ledger.get(LEDGER_PROJECTS_KEY) or [])
     scope_reasons = []
+    if not getattr(args, "full", False):
+        scope_reasons.append(NOT_FULL_TEXT)
     if forced:
         scope_reasons.append("--cluster named " + ", ".join(sorted(forced)))
-    if not args.project:
-        scope_reasons.append("no --project: the fleet's project set is not stated")
     if args.since:
         scope_reasons.append("--since widens the window by hand")
-    if len(listed_projects) < len(projects):
-        scope_reasons.append("a project listing failed")
     scoped = bool(scope_reasons)
     hand_run = bool(args.since)
+    unlisted = {project for project in projects if project not in listed_projects}
+    unlisted_clusters = {key for key in (ledger.get("clusters") or {}) if key.split(CLUSTER_KEY_SEPARATOR)[0] in unlisted}
     if scoped:
         new_fleet = fleet
         removed = set()
@@ -2808,6 +2829,9 @@ def collect(args: argparse.Namespace, *, run: RunFn | None = None, now: datetime
         left = fleet - new_fleet
         removed = {key for key in (ledger.get("clusters") or {}) if key.split(CLUSTER_KEY_SEPARATOR)[0] in left}
         removed |= {key for project, listed in listed_projects.items() for key in (ledger.get("clusters") or {}) if key.startswith(project + CLUSTER_KEY_SEPARATOR) and key not in listed}
+        for key in sorted(unlisted_clusters):
+            error = next((e for e in failed_reads if e.startswith(key.split(CLUSTER_KEY_SEPARATOR)[0] + ": clusters list")), "clusters list failed")
+            failed_reads.append(LISTING_FAILED_TEXT.format(cluster=key, error=error.split(": ", 1)[-1]))
     outside = set()
     for review in reviews:
         if review["project"] not in new_fleet:
@@ -2872,7 +2896,7 @@ def collect(args: argparse.Namespace, *, run: RunFn | None = None, now: datetime
         "scope_reason": "; ".join(scope_reasons),
         "fleet": sorted(new_fleet),
         "outside_fleet": sorted(outside),
-        "sections": triage(reviews, unchanged, failed_reads, new_guards["guards"], seen_at, sorted(removed), rechecks, upgrading, in_scope={cluster_key(c["project"], c["location"], c["name"]) for c in clusters} if scoped else None, scope_reason="; ".join(scope_reasons)),
+        "sections": triage(reviews, unchanged, failed_reads, new_guards["guards"], seen_at, sorted(removed), rechecks, upgrading, in_scope={cluster_key(c["project"], c["location"], c["name"]) for c in clusters} if scoped else None, scope_reason="; ".join(scope_reasons), unlisted=unlisted_clusters),
         "ledger_path": str(ledger_path),
         "guards_path": str(guards_path),
         "guards": new_guards["guards"],
@@ -2952,6 +2976,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--report", help=f"write the Markdown report here instead of ${STORE_HOME_ENV}/{REPORTS_SUBDIR}/<finish-UTC>[{SCOPED_SUFFIX}].md (a full run also points {LATEST_REPORT_LINK} beside it at it)")
     parser.add_argument("--no-report", action="store_true", help="print the report without writing it to the store")
     parser.add_argument("--reset-ledger", action="store_true", help=f"archive the crash records ({CRASH_RECORD_GLOB}) under {ARCHIVE_SUBDIR}/ so the next run may start fresh; does nothing else")
+    parser.add_argument("--full", action="store_true", help=f"the fleet-wide run: records and may change the ledger's fleet set, prunes departed projects and clusters, writes {REPORTS_SUBDIR}/<finish-UTC>.md and moves {LATEST_REPORT_LINK}; without it a run is scoped whatever its --project set")
     parser.add_argument("--dry-run", action="store_true", help="read everything, print the report, write nothing")
     return parser
 

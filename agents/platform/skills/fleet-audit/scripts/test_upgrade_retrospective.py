@@ -10,6 +10,7 @@ failure, a volume attach, a NotReady node, a GPU shortage) are built inline
 from the same shapes.
 """
 
+import argparse
 import copy
 import io
 import json
@@ -83,19 +84,19 @@ class FakeFleet:
     `broken` names clusters whose get-credentials fails; `kubectl_fail`
     names (cluster, kind) reads that fail."""
 
-    def __init__(self, clusters=None, operations=None, broken=(), kubectl_fail=(), list_rc=0):
+    def __init__(self, clusters=None, operations=None, broken=(), kubectl_fail=(), list_rc=0, list_fail=()):
         self.clusters = clusters if clusters is not None else [cluster_doc("seeded-a"), cluster_doc("gemma-gpu-upgraded")]
         self.operations = operations if operations is not None else OPERATIONS
-        self.broken, self.kubectl_fail, self.list_rc = set(broken), set(kubectl_fail), list_rc
+        self.broken, self.kubectl_fail, self.list_rc, self.list_fail = set(broken), set(kubectl_fail), list_rc, set(list_fail)
         self.calls = []
 
     def __call__(self, argv, *, timeout=None, env=None):
         self.calls.append(argv)
         joined = " ".join(argv)
         if "clusters list" in joined:
-            if self.list_rc:
-                return run_of(self.list_rc, "", "PERMISSION_DENIED")
             project = argv[argv.index("--project") + 1]
+            if self.list_rc or project in self.list_fail:
+                return run_of(self.list_rc or 1, "", "PERMISSION_DENIED")
             return run_of(0, json.dumps([{k: v for k, v in c.items() if k != "project"} for c in self.clusters if c.get("project", PROJECT) == project]))
         if "operations list" in joined:
             return run_of(0, json.dumps(self.operations))
@@ -119,8 +120,13 @@ class FakeFleet:
 
 
 def args(**overrides):
+    """The scheduled run's arguments: `--full` unless the test narrows the run
+    with --cluster or --since, or says otherwise."""
     base = {"project": [PROJECT], "cluster": None, "since": None, "ledger": None, "guards": None, "output": None, "report": None, "no_report": False, "dry_run": False, "reset_ledger": False}
     base.update(overrides)
+    base.setdefault("full", base["cluster"] is None and base["since"] is None)
+    if "full" in overrides:
+        base["full"] = overrides["full"]
     return mock.Mock(**base)
 
 
@@ -597,9 +603,15 @@ class ClassifierSignatureTest(unittest.TestCase):
         pending = pod("waiting", scheduled_message="0/4 nodes are available: 4 Insufficient cpu.")
         pending["status"]["conditions"][0]["lastTransitionTime"] = "2026-10-01T00:00:00Z"
         crashed = pod("crash", statuses=[{"name": "c0", "state": {"waiting": {"reason": "CrashLoopBackOff"}}, "lastState": {"terminated": {"reason": "Error", "exitCode": 1, "finishedAt": "2026-10-08T06:00:00Z"}}}])
+        crashed["status"]["conditions"] = [{"type": "Ready", "status": "False", "lastTransitionTime": "2026-10-05T00:00:00Z"}]
+        crashed["status"]["startTime"] = "2026-10-04T00:00:00Z"
         rows = {s["name"]: s for s in self.classify(pods=[pending, crashed], events=[event("Unhealthy", "probe failed", name="other", last="2026-10-08T12:00:00Z")])}
         self.assertEqual(rows["waiting"]["onset"], "2026-10-01T00:00:00Z")
-        self.assertEqual(rows["crash"]["onset"], "2026-10-08T06:00:00Z")
+        # The Ready transition, never the latest crash.
+        self.assertEqual(rows["crash"]["onset"], "2026-10-05T00:00:00Z")
+        crashed["status"]["conditions"] = []
+        no_condition = {s["name"]: s for s in self.classify(pods=[crashed])}
+        self.assertEqual(no_condition["crash"]["onset"], "2026-10-04T00:00:00Z")
         self.assertEqual(rows["other"]["onset"], "2026-10-08T12:00:00Z")
 
 
@@ -1025,19 +1037,19 @@ class LedgerAndGuardsTest(unittest.TestCase):
         (self.home / ur.GUARDS_FILENAME).write_text("{not json")
         with mock.patch.object(ur, "default_run", FakeFleet()), mock.patch.object(ur, "now_utc", lambda: NOW):
             with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()) as err:
-                rc = ur.main(["--project", PROJECT, "--no-report"])
+                rc = ur.main(["--full", "--project", PROJECT, "--no-report"])
         self.assertEqual(rc, ur.EXIT_USAGE)
         self.assertIn("crash record, not a re-baseline", err.getvalue())
         self.assertFalse((self.home / ur.LEDGER_FILENAME).exists())
         # The crash record blocks a fresh start until it is archived.
         with mock.patch.object(ur, "default_run", FakeFleet()), mock.patch.object(ur, "now_utc", lambda: NOW):
             with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
-                self.assertEqual(ur.main(["--project", PROJECT, "--no-report"]), ur.EXIT_USAGE)
+                self.assertEqual(ur.main(["--full", "--project", PROJECT, "--no-report"]), ur.EXIT_USAGE)
                 self.assertEqual(ur.main(["--reset-ledger"]), 0)
                 # The broken guards file is met next: set aside, refused once, then a fresh start.
-                self.assertEqual(ur.main(["--project", PROJECT, "--no-report"]), ur.EXIT_USAGE)
+                self.assertEqual(ur.main(["--full", "--project", PROJECT, "--no-report"]), ur.EXIT_USAGE)
                 self.assertTrue(list(self.home.glob(ur.GUARDS_FILENAME + ".unreadable-*")))
-                rc = ur.main(["--project", PROJECT, "--no-report"])
+                rc = ur.main(["--full", "--project", PROJECT, "--no-report"])
         self.assertEqual(rc, 0)
         self.assertEqual(ur.load_json(self.home / ur.LEDGER_FILENAME, {})["version"], ur.LEDGER_VERSION)
 
@@ -1048,7 +1060,7 @@ class LedgerAndGuardsTest(unittest.TestCase):
         try:
             with mock.patch.object(ur, "default_run", FakeFleet()), mock.patch.object(ur, "now_utc", lambda: NOW):
                 with redirect_stdout(io.StringIO()) as out, redirect_stderr(io.StringIO()):
-                    rc = ur.main(["--project", PROJECT])
+                    rc = ur.main(["--full", "--project", PROJECT])
             self.assertEqual(rc, 0)
             self.assertEqual(out.getvalue().strip(), ur.lock_held_line(lock_path))
             self.assertIn("another retrospective run holds", out.getvalue())
@@ -1064,7 +1076,7 @@ class LedgerAndGuardsTest(unittest.TestCase):
             held.close()
         with mock.patch.object(ur, "default_run", FakeFleet()), mock.patch.object(ur, "now_utc", lambda: NOW):
             with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
-                self.assertEqual(ur.main(["--project", PROJECT, "--no-report"]), 0)
+                self.assertEqual(ur.main(["--full", "--project", PROJECT, "--no-report"]), 0)
         self.assertTrue((self.home / ur.LEDGER_FILENAME).exists())
 
     def test_in_flight_operation_holds_the_cluster_back(self):
@@ -1101,12 +1113,13 @@ class LedgerAndGuardsTest(unittest.TestCase):
         self.assertNotIn(GEMMA, ur.load_json(self.home / ur.LEDGER_FILENAME, {})["clusters"])
         self.assertIn(f"{ur.INFO_REMOVED}\n\n- {GEMMA}: no longer listed", ur.render_report(result))
         self.assertEqual([i for i in result["sections"]["warnings"] if i["kind"] == ur.INCIDENT_STALE_GUARD], [])
-        # A listing that failed is a scoped run and drops nothing.
+        # A listing that failed is the project's gap: the run stays full and drops nothing.
         self.collect()
         kept, _ = self.collect(FakeFleet(list_rc=1), now=datetime(2026, 10, 16, 18, 0, tzinfo=timezone.utc))
         self.assertEqual(kept["removed_clusters"], [])
-        self.assertTrue(kept["scoped"])
+        self.assertFalse(kept["scoped"])
         self.assertIn(GEMMA, {g["cluster"] for g in kept["guards"]})
+        self.assertIn(f"{GEMMA}: its project's listing failed (clusters list rc=1: PERMISSION_DENIED); ledger entry and guards kept unchanged", kept["failed_reads"])
 
     def test_malformed_pod_is_a_failed_read_not_a_crash(self):
         reads = {**READS["seeded-a"], "pods": READS["seeded-a"]["pods"] + ["garbage", {"metadata": None, "spec": 3}]}
@@ -1307,10 +1320,10 @@ class LedgerAndGuardsTest(unittest.TestCase):
         self.assertNotIn("other-project/us-central1-a/elsewhere", ur.load_json(self.home / ur.LEDGER_FILENAME, {})["clusters"])
 
     def test_scoped_run_never_adds_to_the_fleet(self):
-        # No --project: scoped, nothing recorded, every cluster outside the (empty) fleet.
-        result, _ = self.collect(project=None)
+        # No --full (discovery, no --project): scoped, nothing recorded, every cluster outside the (empty) fleet.
+        result, _ = self.collect(project=None, full=False)
         self.assertTrue(result["scoped"])
-        self.assertIn("no --project", result["scope_reason"])
+        self.assertIn(ur.NOT_FULL_TEXT, result["scope_reason"])
         self.assertEqual(result["outside_fleet"], [GEMMA, SEEDED])
         self.assertEqual(result["guards"], [])
         ledger = ur.load_json(self.home / ur.LEDGER_FILENAME, {})
@@ -1380,10 +1393,10 @@ class LedgerAndGuardsTest(unittest.TestCase):
         (self.home / ur.LEDGER_FILENAME).write_text("{broken")
         with mock.patch.object(ur, "default_run", FakeFleet()), mock.patch.object(ur, "now_utc", lambda: NOW):
             with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
-                self.assertEqual(ur.main(["--project", PROJECT, "--no-report"]), ur.EXIT_USAGE)
+                self.assertEqual(ur.main(["--full", "--project", PROJECT, "--no-report"]), ur.EXIT_USAGE)
             # The ledger is gone and a crash record sits beside its place: every run refuses.
             with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()) as err:
-                self.assertEqual(ur.main(["--project", PROJECT, "--no-report"]), ur.EXIT_USAGE)
+                self.assertEqual(ur.main(["--full", "--project", PROJECT, "--no-report"]), ur.EXIT_USAGE)
             self.assertIn("sits beside no ledger", err.getvalue())
             self.assertFalse((self.home / ur.LEDGER_FILENAME).exists())
             with redirect_stdout(io.StringIO()) as out:
@@ -1392,7 +1405,7 @@ class LedgerAndGuardsTest(unittest.TestCase):
             self.assertEqual(list(self.home.glob(ur.CRASH_RECORD_GLOB)), [])
             self.assertTrue(list((self.home / ur.ARCHIVE_SUBDIR).rglob("ledger.json.unreadable-*")))
             with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
-                self.assertEqual(ur.main(["--project", PROJECT, "--no-report"]), 0)
+                self.assertEqual(ur.main(["--full", "--project", PROJECT, "--no-report"]), 0)
             self.assertTrue((self.home / ur.LEDGER_FILENAME).exists())
             with redirect_stdout(io.StringIO()) as out:
                 self.assertEqual(ur.main(["--reset-ledger"]), 0)
@@ -1454,6 +1467,75 @@ class LedgerAndGuardsTest(unittest.TestCase):
             self.assertIn(entry, skipped)
         self.assertIn("(19)", checked)
 
+    def test_only_full_is_full_and_full_rejects_cluster(self):
+        with self.assertRaises(argparse.ArgumentTypeError):
+            self.collect(full=True, cluster=[SEEDED])
+        with mock.patch.object(ur, "default_run", FakeFleet()), mock.patch.object(ur, "now_utc", lambda: NOW):
+            with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()) as err:
+                self.assertEqual(ur.main(["--full", "--project", PROJECT, "--cluster", SEEDED]), ur.EXIT_USAGE)
+        self.assertIn(ur.FULL_WITH_CLUSTER_TEXT, err.getvalue())
+        # A full run records the fleet; the same --project set without --full is scoped and changes nothing.
+        self.collect()
+        ledger = ur.load_json(self.home / ur.LEDGER_FILENAME, {})
+        ledger["clusters"]["other-project/us-central1-a/elsewhere"] = {"control_plane": "1.0.0", "node_pools": {}, "channel": "", "first_seen": "2026-10-01T00:00:00Z", "last_run": "2026-10-01T00:00:00Z"}
+        ledger[ur.LEDGER_PROJECTS_KEY] = [PROJECT, "other-project"]
+        ur.write_json_atomically(self.home / ur.LEDGER_FILENAME, ledger)
+        scoped, _ = self.collect(full=False, now=datetime(2026, 10, 15, 18, 0, tzinfo=timezone.utc))
+        self.assertTrue(scoped["scoped"])
+        self.assertEqual(scoped["scope_reason"], ur.NOT_FULL_TEXT)
+        self.assertEqual(scoped["removed_clusters"], [])
+        after = ur.load_json(self.home / ur.LEDGER_FILENAME, {})
+        self.assertEqual(after[ur.LEDGER_PROJECTS_KEY], [PROJECT, "other-project"])
+        self.assertIn("other-project/us-central1-a/elsewhere", after["clusters"])
+        self.assertTrue(Path(scoped["report_path"]).name.endswith("-scoped.md"))
+        self.assertEqual(os.readlink(self.home / ur.REPORTS_SUBDIR / ur.LATEST_REPORT_LINK), "20261008T180000Z.md")
+        # With --full the absent project is pruned and the link moves.
+        full, _ = self.collect(now=datetime(2026, 10, 16, 18, 0, tzinfo=timezone.utc))
+        self.assertFalse(full["scoped"])
+        self.assertEqual(full["removed_clusters"], ["other-project/us-central1-a/elsewhere"])
+        self.assertEqual(full["fleet"], [PROJECT])
+        self.assertEqual(os.readlink(self.home / ur.REPORTS_SUBDIR / ur.LATEST_REPORT_LINK), "20261016T180000Z.md")
+
+    def test_failed_listing_is_the_projects_gap_not_the_runs(self):
+        self.collect(project=[PROJECT, "other-project"])
+        ledger = ur.load_json(self.home / ur.LEDGER_FILENAME, {})
+        other = "other-project/us-central1-a/elsewhere"
+        ledger["clusters"][other] = {"control_plane": "1.0.0", "node_pools": {}, "channel": "", "first_seen": "2026-10-01T00:00:00Z", "last_run": "2026-10-01T00:00:00Z"}
+        ur.write_json_atomically(self.home / ur.LEDGER_FILENAME, ledger)
+        guards = ur.load_json(self.home / ur.GUARDS_FILENAME, {})
+        guards["guards"].append({**guards["guards"][0], "id": ur.guard_id(other, 7, "apps/Deployment/x"), "cluster": other, "entry": 7, "object": "apps/Deployment/x"})
+        ur.write_json_atomically(self.home / ur.GUARDS_FILENAME, guards)
+        later = datetime(2026, 10, 15, 18, 0, tzinfo=timezone.utc)
+        result, _ = self.collect(FakeFleet(list_fail=["other-project"]), now=later, project=[PROJECT, "other-project"])
+        self.assertFalse(result["scoped"])
+        self.assertEqual(result["fleet"], [PROJECT, "other-project"])
+        self.assertEqual(result["removed_clusters"], [])
+        self.assertIn(other, ur.load_json(self.home / ur.LEDGER_FILENAME, {})["clusters"])
+        self.assertIn(other, {g["cluster"] for g in result["guards"]})
+        self.assertEqual([i for i in result["sections"]["warnings"] if i["kind"] == ur.INCIDENT_STALE_GUARD and i["cluster"] == other], [])
+        report = ur.render_report(result)
+        self.assertIn(f"- {other}: its project's listing failed (clusters list rc=1: PERMISSION_DENIED); ledger entry and guards kept unchanged", report.split(ur.INFO_FAILED_READS)[1])
+        self.assertEqual(os.readlink(self.home / ur.REPORTS_SUBDIR / ur.LATEST_REPORT_LINK), "20261015T180000Z.md")
+
+    def test_crash_loop_since_before_the_window_predates_the_upgrade(self):
+        looping = pod("legacy-worker", statuses=[{"name": "c0", "state": {"waiting": {"reason": "CrashLoopBackOff"}}, "lastState": {"terminated": {"reason": "Error", "exitCode": 1, "finishedAt": "2026-10-08T17:55:00Z"}}}])
+        looping["status"]["startTime"] = "2026-09-01T00:00:00Z"
+        looping["status"]["conditions"] = [{"type": "Ready", "status": "False", "lastTransitionTime": "2026-09-08T00:00:00Z"}]
+        looping["spec"]["containers"][0]["image"] = "eclipse-temurin:8u302-jre"
+        looping["status"]["containerStatuses"][0]["lastState"]["terminated"]["reason"] = "OOMKilled"
+        looping["status"]["containerStatuses"][0]["lastState"]["terminated"]["exitCode"] = 137
+        reads = {**READS["seeded-a"], "pods": READS["seeded-a"]["pods"] + [looping]}
+        with mock.patch.dict(READS, {"seeded-a": reads}):
+            result, _ = self.collect()
+        review = next(r for r in result["reviews"] if r["cluster"] == SEEDED)
+        row = next(s for s in review["what_failed"] if s["name"] == "legacy-worker")
+        self.assertEqual((row["onset"], row["since"]), ("2026-09-08T00:00:00Z", ur.SINCE_FIRST_SEEN))
+        self.assertTrue(row["predates_upgrade"])
+        self.assertEqual(row["classifications"][0]["confidence"], ur.HIGH)  # the signature is the mechanism; the grade is a Warning all the same
+        incident = next(i for i in result["sections"]["warnings"] if i["object"] == "apps/Pod/legacy-worker")
+        self.assertTrue(incident["predates_upgrade"])
+        self.assertNotIn("apps/Pod/legacy-worker", [i["object"] for i in result["sections"]["errors"]])
+
     def test_store_defaults_live_under_the_store_home(self):
         result, _ = self.collect()
         self.assertEqual(Path(result["ledger_path"]), self.home / ur.LEDGER_FILENAME)
@@ -1506,7 +1588,8 @@ class LedgerAndGuardsTest(unittest.TestCase):
         # A --cluster run is scoped: seeded-a's live guards are outside it and not reported as stale.
         self.assertTrue(result["scoped"])
         self.assertEqual([i for i in result["sections"]["warnings"] if i["kind"] == ur.INCIDENT_STALE_GUARD], [])
-        self.assertIn(ur.INFO_SCOPED.format(reason=f"--cluster named {GEMMA}"), ur.render_report(result))
+        self.assertEqual(result["scope_reason"], f"{ur.NOT_FULL_TEXT}; --cluster named {GEMMA}")
+        self.assertIn(ur.INFO_SCOPED.format(reason=result["scope_reason"]), ur.render_report(result))
         self.assertTrue(Path(result["report_path"]).name.endswith("-scoped.md"))
         self.assertEqual(os.readlink(self.home / ur.REPORTS_SUBDIR / ur.LATEST_REPORT_LINK), "20261008T180000Z.md")
         missing, _ = self.collect(cluster=[f"{PROJECT}/{LOCATION}/nope"])
@@ -1629,7 +1712,7 @@ class ReportTest(unittest.TestCase):
         with mock.patch.object(ur, "default_run", FakeFleet()), mock.patch.object(ur, "now_utc", lambda: NOW):
             out, err = io.StringIO(), io.StringIO()
             with redirect_stdout(out), redirect_stderr(err):
-                rc = ur.main(["--project", PROJECT, "--output", str(home / "out.json"), "--report", str(report_path)])
+                rc = ur.main(["--full", "--project", PROJECT, "--output", str(home / "out.json"), "--report", str(report_path)])
         self.assertEqual(rc, 0)
         self.assertTrue(out.getvalue().startswith("# Upgrade retrospective 2026-10-08"))
         self.assertEqual(report_path.read_text(), out.getvalue())
@@ -1656,7 +1739,7 @@ class ReportTest(unittest.TestCase):
         with mock.patch.object(ur, "default_run", FakeFleet()), mock.patch.object(ur, "now_utc", lambda: NOW), mock.patch.object(ur, "write_json_atomically", spy):
             with redirect_stderr(io.StringIO()), redirect_stdout(io.StringIO()):
                 with self.assertRaises(OSError):
-                    ur.main(["--project", PROJECT, "--output", str(home / "out.json")])
+                    ur.main(["--full", "--project", PROJECT, "--output", str(home / "out.json")])
         self.assertEqual(order, ["out.json", ur.GUARDS_FILENAME, ur.LEDGER_FILENAME])
         self.assertTrue((home / ur.REPORTS_SUBDIR / ur.LATEST_REPORT_LINK).exists())
         self.assertEqual([p.name for p in (home / ur.REPORTS_SUBDIR).glob("*Z.md")], ["20261008T180000Z.md"])
