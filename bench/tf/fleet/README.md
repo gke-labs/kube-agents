@@ -46,7 +46,9 @@ writer: from `main`, under a Boskos lease per project, creates and in-place upda
 the deletes and replaces `reconcile-allow.json` beside this file declares (one entry per
 address, or per resource to cover every instance of a `count` or `for_each` one, with its
 reason, reviewed in the pull request that needs it and removed by its follow-up; the no-surge
-pool's replace on a minor roll is the standing one). Its two Prow
+pool's replace on a minor roll is the standing one). A resource type that needs a project role the
+reconciler does not hold brings the role in the same pull request and the grant before the merge
+(`docs/ci-pool-projects.md` §3). Its two Prow
 entries in `oss-test-infra` run `main` only: a postsubmit on every merge touching this
 directory, and a daily pass at 08:30 UTC (`docs/ci-pool-projects.md` §6.2, which also states
 the rule for a fixture pull request and for proving a branch on one leased project). A hand

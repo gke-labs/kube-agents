@@ -3933,6 +3933,54 @@ class ProwRunnerRolesMatchGrantersTest(unittest.TestCase):
         self.assertEqual(self._loop_members(page, "docs/ci-pool-projects.md"), set(self._MEMBER_VARS))
 
 
+# What each resource type under bench/tf/fleet needs from the reconciler's
+# project roles. A fixture pull request that adds a type this table does not
+# know is red until the author maps it, adds any new role to
+# FLEET_RECONCILER_ROLES, the provisioning loop and the runbook, and the pool
+# owner grants it on every registered project before the merge: the postsubmit
+# applies the stack as the reconciler and cannot grant the reconciler its own
+# roles (#2545 shipped a VM without compute.instanceAdmin.v1 and every pool
+# project's first on-merge apply failed on it).
+FLEET_RESOURCE_ROLES = {
+    "google_container_cluster": {"roles/container.admin"},
+    "google_container_node_pool": {"roles/container.admin"},
+    "google_compute_disk": {"roles/compute.storageAdmin"},
+    "google_compute_instance": {"roles/compute.instanceAdmin.v1"},
+    "google_service_account": {"roles/iam.serviceAccountAdmin"},
+    "google_service_account_iam_member": {"roles/iam.serviceAccountAdmin"},
+    "google_project_iam_member": {"roles/resourcemanager.projectIamAdmin"},
+    "terraform_data": set(),
+}
+# Every kubernetes_* resource is an in-cluster write, which container.admin
+# grants through the GKE IAM webhook.
+FLEET_KUBERNETES_ROLES = {"roles/container.admin"}
+
+
+class FleetResourceTypesAreCoveredByReconcilerRolesTest(unittest.TestCase):
+    """Every resource type the fleet stack declares maps to roles the reconciler holds."""
+
+    def _types(self):
+        types = set()
+        for path in sorted((checker._ROOT / "bench" / "tf" / "fleet").glob("*.tf")):
+            types.update(re.findall(r'^resource "([a-z0-9_]+)"', path.read_text(), re.MULTILINE))
+        self.assertGreater(len(types), 10)
+        return types
+
+    def test_every_type_in_the_stack_is_mapped_and_its_roles_are_held(self):
+        unmapped, unheld = [], []
+        for rtype in sorted(self._types()):
+            needed = FLEET_KUBERNETES_ROLES if rtype.startswith("kubernetes_") else FLEET_RESOURCE_ROLES.get(rtype)
+            if needed is None:
+                unmapped.append(rtype)
+            elif not needed <= checker.FLEET_RECONCILER_ROLES:
+                unheld.append((rtype, sorted(needed - checker.FLEET_RECONCILER_ROLES)))
+        self.assertEqual(unmapped, [], "a new resource type: map it in FLEET_RESOURCE_ROLES, and if it needs a role the reconciler lacks, add the role to FLEET_RECONCILER_ROLES, the provisioning loop and the runbook, and have it granted on every pool project before the merge")
+        self.assertEqual(unheld, [], "the reconciler lacks a role a mapped type needs")
+
+    def test_the_table_carries_no_type_the_stack_no_longer_uses(self):
+        self.assertEqual(sorted(set(FLEET_RESOURCE_ROLES) - self._types()), [])
+
+
 class FleetReconcilerRolesMatchGrantersTest(unittest.TestCase):
     """FLEET_RECONCILER_ROLES and its member must equal the provisioning loop and the runbook's repair block.
 
