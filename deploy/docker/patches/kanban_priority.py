@@ -252,6 +252,14 @@ def _count_waiting(conn, below_priority: int) -> int:
     return count_waiting_on_children(conn, below_priority=below_priority)
 
 
+def _waiting_ids(conn) -> set:
+    try:
+        from hermes_cli.kanban_scheduling import waiting_on_children_ids
+    except ImportError:  # unit tests import the patch modules flat
+        from kanban_scheduling import waiting_on_children_ids
+    return waiting_on_children_ids(conn)
+
+
 def count_running_background(conn) -> int:
     """Running background cards on one board, less those only waiting on children."""
     raw = int(
@@ -444,6 +452,11 @@ def record_saturation(
     a ready loop that left cards waiting. Never raises.
     """
     try:
+        # The cards that hold slots: a coordinator only waiting on its own
+        # children is discounted from ``running`` (kanban_scheduling part 4),
+        # so it is left out here too, or the list would not add up to the
+        # counts beside it.
+        waiting = _waiting_ids(conn)
         cards = [
             {
                 "id": _cell(row, "id", 0),
@@ -454,10 +467,10 @@ def record_saturation(
             }
             for row in conn.execute(
                 "SELECT id, assignee, priority, session_id, started_at FROM tasks "
-                "WHERE status = 'running' ORDER BY started_at ASC, id ASC LIMIT ?",
-                (CARDS_SHOWN,),
+                "WHERE status = 'running' ORDER BY started_at ASC, id ASC"
             ).fetchall()
-        ]
+            if _cell(row, "id", 0) not in waiting
+        ][:CARDS_SHOWN]
         background = count_running_background_host(conn, board)
         user_waiting = background_waiting = 0
         for row in _ready_rows(conn):

@@ -672,6 +672,25 @@ class SaturationAndQueuedTest(unittest.TestCase):
         self.assertEqual([c["id"] for c in sat["cards"]], ["bg-run", "u-run"])
         self.assertEqual((sat["user_waiting"], sat["background_waiting"]), (1, 1))
 
+    def test_a_coordinator_waiting_on_its_children_is_not_listed_as_a_holder(self):
+        """It is discounted from ``running``, so naming it would list three
+        cards for two slots. It is the oldest running row, so it would also
+        push a real holder past the list's limit."""
+        b = Board(self)
+        b.card("coord", U, status="running")
+        b.child_of("coord", "kid", U)
+        b.conn.execute(
+            "UPDATE tasks SET status = 'running', claim_lock = 'me', started_at = ? WHERE id = 'kid'",
+            (b.clock,),
+        )
+        b.card("bg-run", status="running", session_id="k8s-evt-0a1b2c3d")
+        b.card("waiting", U)
+        spawned, res = b.tick(cap=2)
+        self.assertEqual(spawned, [])
+        sat = res.saturation
+        self.assertEqual((sat["running"], sat["limit"]), (2, 2))
+        self.assertEqual([c["id"] for c in sat["cards"]], ["kid", "bg-run"])
+
     def test_a_waiting_user_card_is_queued_once_per_wait(self):
         b = self._full()
         _, res = b.tick(cap=2)
@@ -804,6 +823,28 @@ class QueueFieldsTest(unittest.TestCase):
         b.card("new", U)
         out = kp.queue_fields(b.conn, "new", cap_reader=lambda: 2)
         self.assertEqual(out, {"queued": True, "queue": {"running": 2, "limit": 2}})
+
+    def test_a_full_cap_queues_a_card_whose_class_share_has_room(self):
+        """Only the full-cap term decides these: the new card's class still has
+        room, but every slot is busy."""
+        b = Board(self)
+        for n in range(5):
+            b.card(f"u-run{n}", U, status="running")
+        b.card("bg-run", status="running")
+        b.card("new")
+        self.assertEqual(
+            kp.queue_fields(b.conn, "new", cap_reader=lambda: 6),
+            {"queued": True, "queue": {"running": 6, "limit": 6}},
+        )
+        b2 = Board(self)
+        b2.card("u-run", U, status="running")
+        b2.card("bg-run1", status="running")
+        b2.card("bg-run2", status="running")
+        b2.card("new", U)
+        self.assertEqual(
+            kp.queue_fields(b2.conn, "new", cap_reader=lambda: 3),
+            {"queued": True, "queue": {"running": 3, "limit": 3}},
+        )
 
     def test_a_user_card_with_the_reserved_slot_free_is_not_queued(self):
         b = Board(self)

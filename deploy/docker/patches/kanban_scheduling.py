@@ -910,8 +910,8 @@ CHILDREN_TABLE = "kanban_worker_children"
 CHILD_SETTLED_STATUSES = ("done", "archived")
 CHILD_COLUMNS = ("child_id", "creator_id")
 
-_WAITING_ON_CHILDREN_SQL = (
-    "SELECT COUNT(*) FROM tasks t"
+_WAITING_ON_CHILDREN_FROM = (
+    " FROM tasks t"
     " WHERE t.status = 'running'"
     "   AND EXISTS ("
     f"        SELECT 1 FROM {CHILDREN_TABLE} c"
@@ -925,6 +925,10 @@ _WAITING_ON_CHILDREN_SQL = (
     "           )"
     "   )"
 )
+_WAITING_ON_CHILDREN_SQL = "SELECT COUNT(*)" + _WAITING_ON_CHILDREN_FROM
+# The same predicate, naming the cards: kanban_priority's saturation warning
+# lists the cards that hold slots, so it leaves these out.
+_WAITING_ON_CHILDREN_IDS_SQL = "SELECT t.id" + _WAITING_ON_CHILDREN_FROM
 
 
 def count_waiting_on_children(conn, below_priority: Optional[int] = None) -> int:
@@ -974,3 +978,20 @@ def count_waiting_on_children(conn, below_priority: Optional[int] = None) -> int
                 exc,
             )
         return 0
+
+
+def waiting_on_children_ids(conn) -> set:
+    """The ids :func:`count_waiting_on_children` counts, on one board.
+
+    Fails open to an empty set, quietly: the one caller only labels a log line,
+    and :func:`count_waiting_on_children` already reports the same failure.
+    """
+    try:
+        return {
+            row[0]
+            for row in conn.execute(
+                _WAITING_ON_CHILDREN_IDS_SQL, CHILD_SETTLED_STATUSES
+            ).fetchall()
+        }
+    except Exception:  # noqa: BLE001 — never break the dispatch tick
+        return set()

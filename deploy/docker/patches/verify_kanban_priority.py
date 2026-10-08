@@ -194,24 +194,27 @@ os.environ.pop("HERMES_KANBAN_TASK", None)
 
 # --- B. kanban_create says when the card waits ---------------------------------
 print("queue note:")
-# Two cards are running (chat and triage, claimed above). Every child they
-# filed is settled first (chat's child; triage's tchild and spoof): a
+# chat (user) and triage (background) are running, claimed above. Every child
+# they filed is settled first (chat's child; triage's tchild and spoof): a
 # coordinator with an unsettled child is discounted from the running count
 # (kanban_scheduling part 4), and this section is about a full cap, not about
-# that discount. A cap of 2 is then full, and the check pins running == 2 so
-# the class-share branch cannot pass in its place.
+# that discount. The relay card (background) is claimed too, and the cap is 3:
+# every slot is busy, while the user class share (3 - 1 = 2) still has a slot
+# free with only chat running. So only the full-cap term (limit - running) can
+# report this card queued, and a regression in it fails here.
 conn.execute(
     "UPDATE tasks SET status = 'done' WHERE id IN (?, ?, ?)", (child, tchild, spoof)
 )
 conn.commit()
-KP._configured_cap = lambda: 2
+K.claim_task(conn, relay)
+KP._configured_cap = lambda: 3
 session("slack", "C0EXAMPLE", "1700000000.000200")
 queued = tool_create(title="One more question")
 check(
     "a user card filed into a full cap is reported queued, machine-readably",
     queued.get("queued") is True
-    and queued.get("queue", {}).get("limit") == 2
-    and queued.get("queue", {}).get("running") == 2,
+    and queued.get("queue", {}).get("limit") == 3
+    and queued.get("queue", {}).get("running") == 3,
     f"{queued}",
 )
 check(
