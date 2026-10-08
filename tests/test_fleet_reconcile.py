@@ -1499,7 +1499,12 @@ class FleetTreeTest(unittest.TestCase):
         # its raw bytes and git_output decodes them with surrogateescape. Real
         # git, so the decode half is what this pins, not the mock's string.
         with tempfile.TemporaryDirectory() as tmp:
-            env = dict(os.environ, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@t", GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@t")
+            # The developer's git must not reach the scratch repository: no
+            # global or system config (a commit.gpgsign would prompt or fail),
+            # and no exported GIT_DIR/GIT_WORK_TREE/GIT_INDEX_FILE, which would
+            # make every command below write into the developer's repository.
+            env = {k: v for k, v in os.environ.items() if k not in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE")}
+            env.update(GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1", GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@t", GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@t")
 
             def git(*args, data=None):
                 return subprocess.run([b"git", b"-C", os.fsencode(tmp), *args], check=True, capture_output=True, input=data, env=env).stdout.decode().strip()
@@ -1512,11 +1517,12 @@ class FleetTreeTest(unittest.TestCase):
             for name in (b"bench/tf/fleet/main.tf", b"bench/tf/fleet/caf\xe9.tf", b"bench/tf/fleet/README.md"):
                 git(b"update-index", b"--add", b"--cacheinfo", b"100644," + blob + b"," + name)
             commit_index()
-            with mock.patch.object(reconcile, "REPO_ROOT", pathlib.Path(tmp)):
+            # The script's own git inherits os.environ: the same scrub applies.
+            with mock.patch.object(reconcile, "REPO_ROOT", pathlib.Path(tmp)), mock.patch.dict(os.environ, env, clear=True):
                 with_name = reconcile.fleet_tree("HEAD")
             git(b"update-index", b"--force-remove", b"bench/tf/fleet/caf\xe9.tf")
             commit_index()
-            with mock.patch.object(reconcile, "REPO_ROOT", pathlib.Path(tmp)):
+            with mock.patch.object(reconcile, "REPO_ROOT", pathlib.Path(tmp)), mock.patch.dict(os.environ, env, clear=True):
                 without_name = reconcile.fleet_tree("HEAD")
         self.assertEqual(len(with_name), 64)
         self.assertNotEqual(with_name, without_name, "the non-UTF-8 .tf counted as an input")
@@ -1590,6 +1596,22 @@ class MainMovedTest(unittest.TestCase):
             reconcile.write_report(str(report), argparse.Namespace(project=None, drifted=False, dry_run=False), {}, 0, None, 0, run)
             doc = json.loads(report.read_text())
         self.assertEqual((doc["main_ref"], "could not resolve host" in doc["main_check_error"]), ("origin/main", True))
+
+    def test_a_main_that_lost_its_stack_mid_run_stops_the_run(self):
+        # The fetch answered and the tree holds no stack: main moved to a
+        # state this run must not apply over. A stop, as the old tree compare
+        # gave, not a "could not read main" the walk goes on under.
+        git = self._git([FLEET_A, _fleet_listing(**FLEET_DOCS)])
+        boskos = _Boskos(free=[P7, P8])
+        tofu = _Tofu({P7: UPDATE_ONLY, P8: UPDATE_ONLY})
+        with mock.patch.object(reconcile, "git_output", git), mock.patch.object(boskos_pool.urllib.request, "urlopen", boskos), mock.patch.object(reconcile, "MAIN_CHECK_INTERVAL_SECONDS", 0):
+            run = reconcile.Run(main_ref="origin/main")
+            outcomes = reconcile.reconcile_pool(BOSKOS, OWNER, runner=tofu, known=KNOWN, run=run)
+        self.assertEqual(outcomes[P7][0], reconcile.OUTCOME_APPLIED)
+        self.assertEqual(outcomes[P8][0], reconcile.OUTCOME_NOT_REACHED)
+        self.assertIn("no longer holds the stack", outcomes[P8][1])
+        self.assertTrue(run.main_moved)
+        self.assertIsNone(run.main_check_error, "a definite reading, not a failed one")
 
     def test_a_docs_only_change_on_main_does_not_stop_the_run(self):
         # README.md and fixtures.json sit beside the stack and tofu never reads

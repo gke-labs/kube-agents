@@ -223,6 +223,10 @@ REASON_RUNNER = "could not run tofu (%s: %s)"
 REASON_NOT_REACHED_BUDGET = "not started: %ds left in the run's budget, under the %ds per-project ceiling; the next run takes it"
 REASON_NOT_REACHED_BUDGET_MARK = "left in the run's budget"
 REASON_NOT_REACHED_MOVED = "not started: the fleet stack under bench/tf/fleet on %s is now %s and this run applies %s; the next run takes it"
+REASON_NOT_REACHED_MOVED_AWAY = "not started: bench/tf/fleet on %s no longer holds the stack this run applies (%s); the next run takes it"
+# How git's bytes are decoded and the hash input re-encoded: the two must agree
+# so a path git prints that is not UTF-8 survives the round trip.
+GIT_TEXT_ERRORS = "surrogateescape"
 REASON_NOT_REACHED_BUSY = "not free in Boskos before the run's budget ran out; the next run takes it"
 REASON_NOT_REACHED_TERMINATED = "not started: the run was terminated; the next run takes it"
 REASON_NOT_REACHED_RUN_ERROR = "not started: the run stopped on an error (%s); the next run takes it"
@@ -724,7 +728,7 @@ def git_output(args):
     try:
         # surrogateescape: a path git prints that is not UTF-8 (ls-tree -z
         # emits raw bytes) is carried through, not a decode error.
-        result = subprocess.run(["git", "-C", str(REPO_ROOT)] + list(args), capture_output=True, text=True, errors="surrogateescape", timeout=GIT_TIMEOUT_SECONDS)
+        result = subprocess.run(["git", "-C", str(REPO_ROOT)] + list(args), capture_output=True, text=True, errors=GIT_TEXT_ERRORS, timeout=GIT_TIMEOUT_SECONDS)
     except (OSError, subprocess.SubprocessError) as exc:
         raise ReconcileError("git %s: %s" % (" ".join(args), exc))
     if result.returncode != 0:
@@ -742,6 +746,10 @@ def is_fleet_input(path):
     return name.endswith(FLEET_INPUT_SUFFIXES) or name in FLEET_INPUT_NAMES
 
 
+class NoStackError(ReconcileError):
+    """A rev git answered for whose bench/tf/fleet holds no stack input."""
+
+
 def fleet_tree(rev):
     """A hash over the stack's inputs under FLEET_SUBDIR at `rev`: each input's
     mode, blob and path from `git ls-tree`, so a change to any of them moves it
@@ -753,8 +761,8 @@ def fleet_tree(rev):
     listing = git_output(["ls-tree", "-r", "-z", "--full-tree", rev, "--", FLEET_SUBDIR])
     lines = sorted(entry for entry in listing.split("\0") if "\t" in entry and is_fleet_input(entry.split("\t", 1)[1]))
     if not lines:
-        raise ReconcileError("no stack inputs (%s, %s) under %s at %s; not a kube-agents checkout, or the wrong ref" % ("/".join(FLEET_INPUT_SUFFIXES), "/".join(FLEET_INPUT_NAMES), FLEET_SUBDIR, rev))
-    return hashlib.sha256("\n".join(lines).encode("utf-8", "surrogateescape")).hexdigest()
+        raise NoStackError("no stack inputs (%s, %s) under %s at %s; not a kube-agents checkout, or the wrong ref" % ("/".join(FLEET_INPUT_SUFFIXES), "/".join(FLEET_INPUT_NAMES), FLEET_SUBDIR, rev))
+    return hashlib.sha256("\n".join(lines).encode("utf-8", GIT_TEXT_ERRORS)).hexdigest()
 
 
 class Run:
@@ -840,17 +848,17 @@ class Run:
         failure later in the run is a warning the report carries."""
         if not self.main_ref:
             return
-        moved = self._main_moved(force=True)
+        moved = self._main_moved(first=True)
         if self.main_check_error:
             raise ReconcileError("--stop-when-moved %s: %s" % (self.main_ref, self.main_check_error))
         if moved:
             self._stop = moved
 
-    def _main_moved(self, force=False):
+    def _main_moved(self, first=False):
         if not self.main_ref:
             return None
         now = clock()
-        if not force and self._last_main_check is not None and now - self._last_main_check < MAIN_CHECK_INTERVAL_SECONDS:
+        if not first and self._last_main_check is not None and now - self._last_main_check < MAIN_CHECK_INTERVAL_SECONDS:
             return None
         self._last_main_check = now
         remote, _, branch = self.main_ref.partition("/")
@@ -860,7 +868,17 @@ class Run:
             # No --depth: a depth-limited fetch marks a full clone shallow,
             # and a hand run with this flag uses the operator's own checkout.
             git_output(["fetch", "--quiet", remote, branch])
-            current = fleet_tree("FETCH_HEAD")
+            try:
+                current = fleet_tree("FETCH_HEAD")
+            except NoStackError as exc:
+                if first:
+                    raise
+                # The fetch answered and the tree holds no stack: main has
+                # moved to a state this run must not apply over, which is a
+                # stop, not a failed read. At the first check it is the
+                # configuration error require_main_readable makes fatal.
+                self.main_moved = True
+                return REASON_NOT_REACHED_MOVED_AWAY % (self.main_ref, exc)
         except ReconcileError as exc:
             # Not knowing is not the same as having moved: the run goes on
             # and tries again at the next check, and the report says so.
