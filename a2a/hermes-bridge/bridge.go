@@ -28,6 +28,7 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
+	"unicode"
 	"unicode/utf8"
 
 	"github.com/nats-io/nats.go"
@@ -1629,8 +1630,9 @@ func chunkString(s string, size int) []string {
 	return append(out, s)
 }
 
-// promptFromMessage joins the submission message's text parts. ok is false
-// when there is nothing textual to ask.
+// promptFromMessage joins the message's text parts, a submission's or a
+// follow-up's. ok is false when there is nothing textual to ask: no text
+// part holds anything but blankRune's runes.
 func promptFromMessage(payload json.RawMessage) (string, bool) {
 	var m lib.Message
 	if err := json.Unmarshal(payload, &m); err != nil {
@@ -1638,7 +1640,7 @@ func promptFromMessage(payload json.RawMessage) (string, bool) {
 	}
 	var texts []string
 	for _, p := range m.Parts {
-		if p.Kind == "text" && strings.TrimSpace(p.Text) != "" {
+		if p.Kind == "text" && strings.TrimFunc(p.Text, blankRune) != "" {
 			texts = append(texts, p.Text)
 		}
 	}
@@ -1646,6 +1648,16 @@ func promptFromMessage(payload json.RawMessage) (string, bool) {
 		return "", false
 	}
 	return strings.Join(texts, "\n\n"), true
+}
+
+// blankRune reports a rune that asks nothing: Unicode white space, as Go's
+// TrimSpace reads it; U+001C-U+001F, which Python's str.strip() also strips,
+// so Hermes's API server refuses a turn of them alone ("No user message
+// found", a 400 that would fail the task); and NUL, which the cli executor
+// drops from its argv (argvText) and which leaves nothing to ask on either
+// executor.
+func blankRune(r rune) bool {
+	return unicode.IsSpace(r) || r == 0 || (r >= 0x1c && r <= 0x1f)
 }
 
 func isTaskNotFound(err error) bool {

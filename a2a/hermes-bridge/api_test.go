@@ -1245,6 +1245,40 @@ func holdingStub(t *testing.T) (stub *apiStub, in <-chan struct{}, release func(
 	return stub, inCh, release
 }
 
+// A follow-up whose text is blank to Hermes is refused no-text when it
+// arrives, never acked and then sent. Hermes refuses a turn whose text
+// Python's str.strip() empties (400, "No user message found"), and that
+// strips U+001C-U+001F, which Go's TrimSpace keeps; a text of NUL bytes
+// alone survives both, and asks nothing. Queued, either would fail or waste
+// the turn after turn 1's answer.
+func TestAPI_BlankFollowUpIsRefusedNoText(t *testing.T) {
+	_, url := startServer(t)
+	stub, in, release := holdingStub(t)
+	startAPIBridge(t, url, stub, nil)
+	c := gatewayClient(t, url)
+	origin := submitIn(t, c, "task-api-blank", "ctx-blank", "long question")
+	<-in
+	blanks := []string{"\x00", "\x1f\x1c", " \x00\n\x1e\t", "　\x1d"}
+	var ids []string
+	for _, text := range blanks {
+		ids = append(ids, sendSteer(t, c, origin, text).EnvelopeID)
+	}
+	waitFor(t, 10*time.Second, "four notices", func() bool { return len(steerNotices(t, url, origin.TaskID)) == len(blanks) })
+	for i, n := range steerNotices(t, url, origin.TaskID) {
+		if n.Steer != lib.SteerRefused || n.Reason != lib.SteerReasonNoText || n.EnvelopeID != ids[i] {
+			t.Fatalf("notice for %q = %+v, want refused no-text", blanks[i], n)
+		}
+	}
+	release()
+	task := waitTerminal(t, c, origin.TaskID)
+	if task.State != lib.StateCompleted || len(stub.seen()) != 1 {
+		t.Fatalf("state %s, %d requests; want completed on the opening request alone", task.State, len(stub.seen()))
+	}
+	if got := artifactsNamed(t, url, origin.TaskID, lib.ArtifactResult); !slices.Equal(got, []string{"answer to long question"}) {
+		t.Fatalf("result %q", got)
+	}
+}
+
 // steerQueueCapacity bounds the follow-ups a task runs in total, not the
 // ones waiting at one moment: a thread that sends one follow-up per turn,
 // each taken off the queue as its turn starts, still stops at the cap, and
@@ -1308,5 +1342,29 @@ func TestAPI_FollowUpsStopAtTheTaskCap(t *testing.T) {
 	}
 	if got := len(stub.seen()); got != turns {
 		t.Fatalf("%d turns ran, want the opening turn plus %d follow-ups", got, steerQueueCapacity)
+	}
+}
+
+// A message whose text parts hold only blank runes asks nothing, whichever
+// executor would carry it; one with any other rune is asked as it is.
+func TestPromptFromMessage_BlankRunes(t *testing.T) {
+	msg := func(texts ...string) json.RawMessage {
+		parts := make([]lib.Part, 0, len(texts))
+		for _, s := range texts {
+			parts = append(parts, lib.Part{Kind: "text", Text: s})
+		}
+		raw, err := json.Marshal(lib.Message{Role: "user", MessageID: "m", Parts: parts})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return raw
+	}
+	for _, blank := range []string{"", " \t\n", "\x00", "\x1c\x1d\x1e\x1f", " 　\x00"} {
+		if got, ok := promptFromMessage(msg(blank, blank)); ok {
+			t.Errorf("parts %q: prompt %q, want nothing to ask", blank, got)
+		}
+	}
+	if got, ok := promptFromMessage(msg("\x00", " a\x00 ")); !ok || got != " a\x00 " {
+		t.Errorf("prompt %q, %v; want the one askable part as it is", got, ok)
 	}
 }
