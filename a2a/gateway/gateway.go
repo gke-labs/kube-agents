@@ -719,13 +719,10 @@ func (g *Gateway) routeTurn(ctx context.Context, msg InboundMessage, backend, pr
 	// terminal on the stream (the relay's ack raced a transient failure, or
 	// the gateway was down when the terminal fired and the redelivery
 	// hasn't landed), release the serialization instead of steering the
-	// user into a finished task. Only the serialization: the task index
-	// stays until the relay retires it, so a queued terminal event still
-	// posts its result. Healing at all means the render was probably lost
-	// (an acked event is never redelivered), so post the replayed status
-	// card rather than clearing silently — the same deterministic template
-	// the status ask uses. In the relay-lag case this duplicates the
-	// rolling-line edit that follows; redundant beats swallowed.
+	// user into a finished task. The heal posts the replayed status card
+	// and delivers the terminal outcome (answer text or terminal notice),
+	// then retires the task route so a queued or redelivered terminal
+	// is dropped rather than posting twice or double-counting in metrics.
 	//
 	// The other stale shape has no terminal to find: a task with NO events
 	// at all (TasksGet answers TaskNotFound) because its executor never
@@ -739,11 +736,11 @@ func (g *Gateway) routeTurn(ctx context.Context, msg InboundMessage, backend, pr
 	// age alone is not evidence, a first event that is merely late could
 	// still arrive, and no supervisor path ever sees a task with no pod —
 	// so a task released here ages out with the stream's retention, the
-	// residue Session lifecycle names. The task index stays, as in the
-	// terminal case, so a late start still renders; its key is retired
-	// only if the task ever terminates. A delegated child is the exception
-	// in both shapes: its index is the one-live-child rule's liveness, so
-	// the heal retires it (healActiveTask says why).
+	// residue Session lifecycle names. For a never-started task, the task
+	// index stays so a late start can still post; its key is retired only if
+	// the task ever terminates. A delegated child is the exception in both
+	// shapes: its index is the one-live-child rule's liveness, so the heal
+	// retires it (healActiveTask says why).
 	//
 	// This is the heal's only caller. The inject door's read route
 	// (probeConversation) reports the same facts and heals nothing: the
@@ -1026,14 +1023,45 @@ func (g *Gateway) healActiveTask(ctx context.Context, rec *SessionRecord) {
 		if terminalSubject == lib.TaskSupervisorSubject(addressee, active.TaskID) {
 			source = TerminalFromSupervisor
 		}
+		ref, known := rec.TaskRefFor(active.TaskID)
+		child := known && ref.Role == taskRoleChild
+		result := ""
+		if art := task.Artifact(lib.ArtifactResult); art != nil {
+			result = joinTextParts(art.Parts)
+		}
 		// The deliverable too, from the stream, for the same program: the
 		// status card posted above never carries the result's text, and
 		// a door that inferred its artifact from the last post would hand
 		// the card over as the answer.
-		if task.State == lib.StateCompleted {
-			if art := task.Artifact(lib.ArtifactResult); art != nil {
-				if result := joinTextParts(art.Parts); result != "" {
-					g.observeDelivered(rec, active.TaskID, result)
+		if task.State == lib.StateCompleted && result != "" {
+			g.observeDelivered(rec, active.TaskID, result)
+		}
+		// Post the deliverable or terminal notice for a human turn (a child
+		// hands its result to wakeSession instead), matching what relayTerminal
+		// delivers so retiring the route below does not drop the answer.
+		if !child {
+			switch task.State {
+			case lib.StateCompleted:
+				postResult := result
+				if postResult == "" {
+					postResult = completedNonTextResult
+				}
+				if !isConsoleConversation(rec.Key) {
+					g.post(rec.Key, postResult)
+				}
+			case lib.StateFailed:
+				if reason := finalMessageText(task); reason != "" {
+					g.post(rec.Key, "❌ failed: "+reason)
+				} else {
+					g.post(rec.Key, "❌ the task failed")
+				}
+			case lib.StateCanceled:
+				g.post(rec.Key, "🛑 canceled")
+			case lib.StateRejected:
+				if reason := finalMessageText(task); reason != "" {
+					g.post(rec.Key, "🚫 the executor rejected the task: "+reason)
+				} else {
+					g.post(rec.Key, "🚫 the executor rejected the task")
 				}
 			}
 		}

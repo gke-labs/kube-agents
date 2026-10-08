@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -244,8 +245,16 @@ func TestHealedStaleTerminalDeliversOnceEvenIfRelayQueued(t *testing.T) {
 	l := r.g.lockSession(conv)
 	l.Lock()
 
-	// Executor completes the task: the terminal lands on the TASKS stream
-	// and relayEvent enqueues it for the session worker.
+	// Executor publishes a result artifact and completes the task: the
+	// terminal lands on the TASKS stream and relayEvent enqueues it for the
+	// session worker.
+	exec := r.execFor(t, origin, "platform")
+	if err := exec.PublishArtifact(ctx, lib.Artifact{
+		Name:  lib.ArtifactResult,
+		Parts: []lib.Part{{Kind: "text", Text: "answer text from executor"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
 	publishMetricsTerminal(t, r, origin, TerminalFromExecutor, lib.StateCompleted)
 	// Wait until the relay worker has picked up the batch and is blocked on the session lock.
 	waitFor(t, "relay blocked on session lock", func() bool {
@@ -278,8 +287,11 @@ func TestHealedStaleTerminalDeliversOnceEvenIfRelayQueued(t *testing.T) {
 		t.Errorf("total terminals counted = %v, want 1", got)
 	}
 	posts := r.adapter.postTexts()
-	if len(posts) != 2 {
-		t.Errorf("adapter saw %d posts %v, want 2 (submission placeholder and one terminal post)", len(posts), posts)
+	if len(posts) != 3 {
+		t.Errorf("adapter saw %d posts %v, want 3 (submission placeholder, status card, and result text)", len(posts), posts)
+	}
+	if !slices.Contains(posts, "answer text from executor") {
+		t.Errorf("adapter posts %v did not contain result text %q", posts, "answer text from executor")
 	}
 }
 
