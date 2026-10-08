@@ -1264,6 +1264,15 @@ class SlackPlanHookTest(unittest.IsolatedAsyncioTestCase):
         await silent_event(notification, events[0])
         self.assertEqual(self.started, [])
 
+    async def test_a_start_a_note_follows_in_its_batch_leaves_the_row_to_the_note(self):
+        events = [SimpleNamespace(id=4, kind="heartbeat", payload=None), _beat(5, "Checking seeded-a.")]
+        notification = SimpleNamespace(sub=SLACK_SUB, adapter=_Adapter(), title="t", d={"events": events})
+        await silent_event(notification, events[0])
+        self.assertEqual(self.started, [])
+        later = [SimpleNamespace(id=4, kind="heartbeat", payload=None), SimpleNamespace(id=5, kind="heartbeat", payload=None)]
+        await silent_event(SimpleNamespace(sub=SLACK_SUB, adapter=_Adapter(), title="t", d={"events": later}), later[0])
+        self.assertEqual(self.started, [("t_e0c1", "t")], "a noteless heartbeat after it does not count")
+
     async def test_a_start_reaches_no_plan_off_slack_or_with_the_flag_off(self):
         await silent_event(SimpleNamespace(sub=SUB, adapter=_Adapter(), title="t"), SimpleNamespace(id=4, kind="heartbeat"))
         self.flag = False

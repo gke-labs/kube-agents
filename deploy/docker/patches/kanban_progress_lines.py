@@ -683,15 +683,30 @@ def _overtaken(notification: Any, ev: Any) -> bool:
     )
 
 
+def _noted_later(notification: Any, ev: Any) -> bool:
+    """Whether a heartbeat carrying a note follows this event in its batch."""
+    event_id = int(getattr(ev, "id", 0) or 0)
+    batch = getattr(notification, "d", None)
+    events = batch.get("events") if isinstance(batch, dict) else None
+    return any(
+        int(getattr(later, "id", 0) or 0) > event_id
+        and str(getattr(later, "kind", "") or "") == STARTED_KIND
+        and progress_note(getattr(later, "payload", None))
+        for later in events or ()
+    )
+
+
 async def _started(notification: Any, ev: Any) -> None:
     """Open a Slack card's plan row, running, on a noteless heartbeat: see :data:`STARTED_KIND`.
 
     Not for one replayed or overtaken in its batch (:func:`_overtaken`): the
-    later event opens the row settled. Only with ``KAGE_SLACK_UX`` on for a
-    Slack card, and never raises: it runs inside the send loop.
+    later event opens the row settled. Nor for one a note follows in its
+    batch, which opens the row itself, in one post rather than a post and an
+    edit. Only with ``KAGE_SLACK_UX`` on for a Slack card, and never raises: it
+    runs inside the send loop.
     """
     try:
-        if _overtaken(notification, ev):
+        if _overtaken(notification, ev) or _noted_later(notification, ev):
             return
         sub = notification.sub
         adapter = getattr(notification, "adapter", None)

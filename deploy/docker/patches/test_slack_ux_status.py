@@ -1856,8 +1856,10 @@ class StartTest(_RuntimeCase):
     def _start(self, adapter, task="t_a", title="check checkout-gateway"):
         return _run(runtime.start_row(adapter, _sub(task), title))
 
-    def _expect(self, adapter, *cards):
-        _run(runtime.expect_cards(adapter, CHANNEL, TEAM, THREAD, cards))
+    def _expect(self, adapter, *cards, waiting=()):
+        # waiting: cards held at todo until their parents are done.
+        own = {card: True for card in cards}
+        _run(runtime.expect_cards(adapter, CHANNEL, TEAM, THREAD, {**own, **{card: False for card in waiting}}))
 
     def _status(self, adapter, status):
         _run(adapter._set_thread_status(CHANNEL, TEAM, THREAD, status, "failed"))
@@ -1946,7 +1948,7 @@ class StartTest(_RuntimeCase):
 
     def test_a_card_waiting_on_its_parents_holds_until_it_starts(self):
         adapter = _Adapter()
-        self._expect(adapter, "t_a", "t_sum")
+        self._expect(adapter, "t_a", waiting=("t_sum",))
         self._start(adapter)
         _run(runtime.settle_row(adapter, _sub(), "completed", "seeded-a fine"))
         self.assertEqual(self._sent(adapter), ["processing"], "t_sum has not started")
@@ -1954,6 +1956,32 @@ class StartTest(_RuntimeCase):
         self.assertEqual(self._kinds(adapter).count("post"), 1, "it joins the same plan")
         _run(runtime.settle_row(adapter, _sub("t_sum"), "completed", "all fine"))
         self.assertEqual(self._sent(adapter), ["processing", "closed"])
+
+    def test_a_card_waiting_on_a_parent_that_waits_on_you_suspends(self):
+        adapter = _Adapter()
+        self._expect(adapter, "t_a", waiting=("t_sum",))
+        self._start(adapter)
+        _run(runtime.settle_row(adapter, _sub(), "blocked"))
+        self.assertEqual(self._sent(adapter), ["processing", "suspended"])
+        _run(runtime.settle_row(adapter, _sub(), "unblocked"))
+        _run(runtime.settle_row(adapter, _sub(), "completed", "fine"))
+        self.assertEqual(self._sent(adapter), ["processing", "suspended", "processing"], "t_sum still to start")
+
+    def test_a_card_waiting_on_a_parent_that_gave_up_holds_nothing(self):
+        adapter = _Adapter()
+        self._expect(adapter, "t_a", waiting=("t_sum",))
+        self._start(adapter)
+        _run(runtime.settle_row(adapter, _sub(), "gave_up"))
+        self.assertEqual(self._sent(adapter), ["processing", "closed"])
+        self._status(adapter, "")
+        self.assertEqual(self._sent(adapter), ["processing", "closed"])
+
+    def test_a_card_starting_on_its_own_holds_beside_a_card_that_waits_on_you(self):
+        adapter = _Adapter()
+        self._expect(adapter, "t_a", "t_b")
+        self._start(adapter)
+        _run(runtime.settle_row(adapter, _sub(), "blocked"))
+        self.assertEqual(self._sent(adapter), ["processing"], "t_b is about to start")
 
     def test_an_expected_card_already_shown_is_not_held(self):
         adapter = _Adapter()

@@ -67,7 +67,9 @@ turn ending in the thread does not close it under either. It also holds
 ``processing`` for each card a turn in the thread just handed work to until
 that card starts, rolls a note or settles (:func:`expect_cards`, which
 ``slack_ux_reactions`` calls as the turn ends, after its acknowledgement has
-posted), so Working… stays on from the acknowledgement to the card's row. Once no row is
+posted), so Working… stays on from the acknowledgement to the card's row. A
+card waiting on its parents holds only while nothing on the plan waits on the
+user or gave up, since behind either it may never start. Once no row is
 running or waiting, the session is closed and the plan is forgotten here, and
 the thread's next card starts a new plan. A plan with a card that gave up,
 which the breaker parks until it is unblocked, is set aside instead, as a
@@ -239,10 +241,12 @@ class _Plan:
         self.rows: OrderedDict[str, _Row] = OrderedDict()
         self.fallback = False
         #: Cards a turn in the thread just handed work to that have not reached
-        #: the plan yet (:func:`expect_cards`). Each holds ``processing`` until
-        #: it starts, rolls a note or settles, so Working… stays on from the
-        #: acknowledgement to the card's row.
-        self.pending: set[str] = set()
+        #: the plan yet (:func:`expect_cards`), each with whether it starts on
+        #: its own rather than waiting on its parents. Each holds ``processing``
+        #: until it starts, rolls a note or settles, so Working… stays on from
+        #: the acknowledgement to the card's row; one waiting on its parents
+        #: only while nothing on the plan waits on a person (:func:`_expecting`).
+        self.pending: dict[str, bool] = {}
         #: Cards whose notes went to a rolling line after the plan fell back.
         #: The plan is kept until each has settled, so none of them opens a
         #: second plan beside its rolling message.
@@ -438,7 +442,18 @@ def _plan_session(chat_id: str, thread_ts: str) -> str:
 
 
 def _running(plan: _Plan) -> bool:
-    return bool(plan.pending) or bool(plan.rolling - plan.waiting) or _status.running(plan.rows.values())
+    return _expecting(plan) or bool(plan.rolling - plan.waiting) or _status.running(plan.rows.values())
+
+
+def _expecting(plan: _Plan) -> bool:
+    """Whether an expected card holds ``processing``: one about to start, or one waiting on its parents.
+
+    A card waiting on its parents holds only while nothing on the plan waits on
+    a person (:func:`_kept`): behind a card blocked on the user, or one that gave
+    up, it may never start, and the session suspends or closes as it would
+    without it.
+    """
+    return any(plan.pending.values()) or (bool(plan.pending) and not _kept(plan))
 
 
 def _waiting(plan: _Plan) -> bool:
@@ -875,7 +890,7 @@ async def deliver_row(
         await _keep(adapter, key, plan)
     else:
         _plans.move_to_end(key)  # eviction at PLANS_MAX takes the least active thread
-    plan.pending.discard(card)  # on its row now, or rolling
+    plan.pending.pop(card, None)  # on its row now, or rolling
     if plan.fallback:
         _roll(adapter, key, plan, card)
         await _session(adapter, key, plan)
@@ -941,7 +956,7 @@ async def start_row(adapter: Any, sub: dict, title: str = "") -> bool:
         await _keep(adapter, key, plan)
     else:
         _plans.move_to_end(key)
-    plan.pending.discard(card)
+    plan.pending.pop(card, None)
     row = plan.rows[card] = _Row(card, title)
     row.status = _status.TASK_RUNNING
     plan.touched = time.monotonic()
@@ -955,16 +970,17 @@ async def start_row(adapter: Any, sub: dict, title: str = "") -> bool:
     return True
 
 
-async def expect_cards(adapter: Any, chat_id: str, team_id: Any, thread_ts: str, cards: Any) -> None:
+async def expect_cards(adapter: Any, chat_id: str, team_id: Any, thread_ts: str, cards: dict) -> None:
     """Hold ``processing`` on the thread for ``cards``, which a turn there just handed work to.
 
-    ``slack_ux_reactions`` calls this once a turn that opened cards has
-    ended, and for the follow-ups a completed card leaves, so Working… stays
-    on from the acknowledgement until each card's row opens, and from then
-    until the cards settle. A card already shown in this process is left to
-    its row. Each expected card holds until it starts, rolls a note or
-    settles; the plan's :data:`PLAN_HOLD_SECONDS` bounds a card that never
-    does.
+    ``cards`` maps each card's id to whether it starts on its own, False for
+    one waiting on its parents (:func:`_expecting`). ``slack_ux_reactions``
+    calls this once a turn that opened cards has ended, and for the
+    follow-ups a completed card leaves, so Working… stays on from the
+    acknowledgement until each card's row opens, and from then until the
+    cards settle. A card already shown in this process is left to its row.
+    Each expected card holds until it starts, rolls a note or settles; the
+    plan's :data:`PLAN_HOLD_SECONDS` bounds a card that never does.
     """
     if not (chat_id and thread_ts and enabled()):
         return
@@ -978,7 +994,7 @@ async def expect_cards(adapter: Any, chat_id: str, team_id: Any, thread_ts: str,
     else:
         _plans.move_to_end(key)
     # After the awaits above, so a card that started during them is not held again.
-    plan.pending |= {str(card) for card in cards if card and not _shown(key, str(card))}
+    plan.pending.update({str(card): bool(own) for card, own in cards.items() if card and not _shown(key, str(card))})
     plan.touched = time.monotonic()
     _arm(adapter, key, plan)
     await _session(adapter, key, plan)
@@ -1012,7 +1028,7 @@ async def _settle(adapter: Any, sub: dict, kind: str, result: str, title: str, o
     # failure leaves it expected, since the dispatcher runs the card again.
     expected = current is not None and card in current.pending and (done or status is not None)
     if expected:
-        current.pending.discard(card)
+        current.pending.pop(card, None)
     sender = await _settle_lapsed(adapter, key, card, kind, status, done, result)
     plan = _plans.get(key)
     plans.append(plan)

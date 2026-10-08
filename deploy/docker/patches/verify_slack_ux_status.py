@@ -293,7 +293,7 @@ async def _drive(module) -> None:
     adapter = _StubAdapter(module)
     thread = STARTED_THREAD
     sub = {"platform": "slack", "chat_id": CHANNEL, "thread_id": thread, "task_id": STARTED_CARD}
-    await module.expect_cards(adapter, CHANNEL, TEAM, thread, {STARTED_CARD})
+    await module.expect_cards(adapter, CHANNEL, TEAM, thread, {STARTED_CARD: True})
     await adapter._set_thread_status(CHANNEL, TEAM, thread, "", "clear failed")
     if not await module.start_row(adapter, sub, STARTED_TITLE):
         raise _fail(f"a card that started opened no row: {adapter.calls!r}")

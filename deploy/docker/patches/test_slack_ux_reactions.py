@@ -502,7 +502,7 @@ class RuntimeTest(unittest.TestCase):
         self.expected = []
 
         async def expect_cards(adapter, chat_id, team_id, thread_ts, cards):
-            self.expected.append((chat_id, team_id, thread_ts, sorted(cards)))
+            self.expected.append((chat_id, team_id, thread_ts, dict(sorted(cards.items()))))
 
         status = SimpleNamespace(expect_cards=expect_cards)
         modules = mock.patch.dict(sys.modules, {"gateway": SimpleNamespace(slack_ux_status=status), "gateway.slack_ux_status": status})
@@ -633,7 +633,7 @@ class RuntimeTest(unittest.TestCase):
     def test_a_turn_that_opened_cards_holds_working_for_those_about_to_start(self):
         board = {**_cards("t_a"), **_cards("t_b", status="todo"), **_cards("t_later", status="scheduled")}
         self._turn("fix it", _cards("t_old"), {**_cards("t_old"), **board})
-        self.assertEqual(self.expected, [(CHANNEL, TEAM, THREAD, ["t_a", "t_b"])])
+        self.assertEqual(self.expected, [(CHANNEL, TEAM, THREAD, {"t_a": True, "t_b": False})], "t_b waits on its parents")
 
     def test_a_direct_answer_holds_nothing(self):
         self._turn("what now?", _cards("t_old"), _cards("t_old"))
@@ -643,7 +643,7 @@ class RuntimeTest(unittest.TestCase):
         adapter = self._turn("fix it", {}, _cards("t_a"))
         self.boards[:] = [_cards("t_b", status="todo", creator="t_a")]
         _run(runtime.settle_delegated(adapter, self._sub("t_a"), "completed"))
-        self.assertEqual(self.expected, [(CHANNEL, TEAM, THREAD, ["t_a"]), (CHANNEL, TEAM, THREAD, ["t_b"])])
+        self.assertEqual(self.expected, [(CHANNEL, TEAM, THREAD, {"t_a": True}), (CHANNEL, TEAM, THREAD, {"t_b": False})])
 
     def test_a_failed_hold_never_fails_the_turn(self):
         async def boom(*args):

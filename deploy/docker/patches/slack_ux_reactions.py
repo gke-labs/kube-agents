@@ -164,6 +164,10 @@ RESUMED_STATUSES = frozenset({"todo", "ready", "scheduled", "running"})
 #: the thread's Working… until it starts (``slack_ux_status.expect_cards``).
 #: ``scheduled`` is not one, since the card may not run for hours.
 STARTING_STATUSES = frozenset({"todo", "ready", "running"})
+#: The one of those that waits on the card's parents: Hermes holds a card at
+#: ``todo`` until they are done, so it holds Working… only while nothing on
+#: the thread's plan waits on a person.
+PARENTS_STATUS = "todo"
 
 
 class _Card(NamedTuple):
@@ -375,11 +379,15 @@ async def _hold_session(adapter: Any, chat_id: str, team_id: Any, thread_id: str
     """Keep the thread's Working… on until ``cards`` start: see ``slack_ux_status.expect_cards``.
 
     ``cards`` maps ``(board, id)`` to the card as a read saw it; only those in
-    :data:`STARTING_STATUSES` are held. Imported when called, as
+    :data:`STARTING_STATUSES` are held, each marked with whether it starts on
+    its own (:data:`PARENTS_STATUS`). Imported when called, as
     ``kanban_progress_lines`` imports it; an image without it holds nothing,
     and a failure is logged, never raised.
     """
-    ids = {task for (_board, task), seen in cards.items() if seen.status in STARTING_STATUSES}
+    ids = {
+        task: seen.status != PARENTS_STATUS
+        for (_board, task), seen in cards.items() if seen.status in STARTING_STATUSES
+    }
     if not ids:
         return
     try:
