@@ -184,9 +184,15 @@ Optional, and copied through when set: `CLUSTER_MODE`, `MODEL_DEFAULT_NAME`,
 `CHAT_TOPIC_NAME`, `CHAT_SUB_NAME`, `SLACK_ENABLED`, `SLACK_HOME_CHANNEL`,
 `SLACK_HOME_CHANNEL_NAME`, `PLATFORM_AGENT_CUSTOM_ROLES`,
 `REGISTRY_PREFIX`, `THIRD_PARTY_REGISTRY_PREFIX`,
-`KMS_KEYRING`, `KMS_KEY`, `GITOPS_ORG`, `GITOPS_REPO`. Secrets: `GH_APP_ID`,
+`KMS_KEYRING`, `KMS_KEY`, `GITOPS_ORG`, `GITOPS_REPO`, `PLATFORM_AGENT_MODE`. Secrets: `GH_APP_ID`,
 `GEMINI_API_KEY`, `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `SLACK_BOT_TOKEN`,
 `SLACK_APP_TOKEN`.
+
+`PLATFORM_AGENT_MODE` is the `PlatformAgent`'s `spec.mode`, `today` or `next`; the
+renderer refuses anything else and writes `today` as no key, which is how the installer
+reads an absent one. The installer does not read the key yet, so on this path it changes
+nothing on the cluster. A rebuild through `deploy-environment.yml` takes the mode as its
+`mode` input instead and applies `next` to the `PlatformAgent` itself after the install.
 
 Two naming details that are easy to trip over:
 
