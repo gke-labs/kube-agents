@@ -159,6 +159,9 @@ async def _drive(module, db_path: str, expected_fold: list[dict]) -> None:
     try:
         if module.adapter_for(adapter, "slack", event, task, sub) is not adapter:
             raise _fail(f"adapter_for() wrapped the adapter with {FLAG_ENV}={FLAG_OFF}")
+        os.environ.pop(FLAG_ENV, None)
+        if not module.enabled():
+            raise _fail(f"enabled() is false with {FLAG_ENV} unset, which is on")
         os.environ[FLAG_ENV] = "1"
         wrapped = module.adapter_for(adapter, "slack", event, task, sub)
         if wrapped is adapter:

@@ -272,10 +272,7 @@ class FlagOffIdentityTest(unittest.TestCase):
         applier.apply(root.dir)
         patched = root.load("patched_fixture")
         for value in ("", "0", "false"):
-            env = {} if value is None else {"KAGE_SLACK_UX": value}
-            with mock.patch.dict(os.environ, env, clear=False):
-                if value is None:
-                    os.environ.pop("KAGE_SLACK_UX", None)
+            with mock.patch.dict(os.environ, {"KAGE_SLACK_UX": value}):
                 for text, outcome in self.SCENARIOS:
                     with self.subTest(flag=value, text=text, outcome=outcome):
                         self.assertEqual(
@@ -1037,11 +1034,14 @@ class MissingPresenterTest(unittest.TestCase):
             self.assertFalse(runtime.enabled())
 
     def test_warns_only_when_the_flag_is_on(self):
-        for value, warns in (("0", False), ("false", False), ("on", True)):
+        for value, warns in ((None, True), ("0", False), ("false", False), ("on", True)):
             importlib.reload(runtime)
+            env = {} if value is None else {"KAGE_SLACK_UX": value}
             with self.subTest(flag=value), mock.patch.object(runtime, "_presenter", None), mock.patch.dict(
-                os.environ, {"KAGE_SLACK_UX": value}
+                os.environ, env
             ), mock.patch.object(runtime.logger, "warning") as warning:
+                if value is None:
+                    os.environ.pop("KAGE_SLACK_UX", None)
                 runtime.enabled()
                 self.assertEqual(warning.called, warns)
 

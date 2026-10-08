@@ -230,6 +230,9 @@ def drive(module) -> None:
     module.note_wake(SUB, {"gave_up"}, "wake")
     if module._marks:
         raise _fail(f"a failure wake marked its thread with {FLAG_ENV}={FLAG_OFF}")
+    os.environ.pop(FLAG_ENV, None)
+    if not module.enabled():
+        raise _fail(f"enabled() is false with {FLAG_ENV} unset, which is on")
     os.environ[FLAG_ENV] = "1"
     try:
         module.note_wake(SUB, {"gave_up"}, "wake")
