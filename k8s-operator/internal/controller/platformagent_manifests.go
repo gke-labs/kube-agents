@@ -3180,7 +3180,7 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 	// sidecar gets, like a declared bridge does. See platformagent_a2a_bridge.go.
 	if a2aBridgeInPod(agent) {
 		for _, c := range containers {
-			if c.Name == "platform-agent" {
+			if c.Name == a2aAgentContainerName {
 				sidecars = append(sidecars, a2aExecutorSidecarEnv([]corev1.Container{buildA2ABridgeContainer(agent, c)})...)
 				break
 			}

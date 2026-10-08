@@ -267,3 +267,49 @@ func TestAnUnreadableOperatorSettingIsReportedAgainstItself(t *testing.T) {
 		t.Errorf("refusal status = %q; want the operator setting named, not a CR sidecar", status)
 	}
 }
+
+// A bridge declared under another name is still a declared bridge, by the
+// same rule every other reader uses (it sets BRIDGE_CONCURRENCY), so the
+// operator renders no second one beside it.
+func TestABridgeDeclaredUnderAnotherNameStillWins(t *testing.T) {
+	agent := provisionedAgent()
+	agent.Spec.Deployment = &agentv1alpha1.DeploymentSpec{Sidecars: []corev1.Container{{
+		Name: "my-bridge", Image: "registry.example/bridge:1",
+		Env: []corev1.EnvVar{{Name: a2aBridgeConcurrencyEnvVar, Value: "3"}},
+	}}}
+	if got := containersNamed(bridgeTestPod(agent), a2aBridgeContainerName); len(got) != 0 {
+		t.Errorf("the operator rendered a bridge beside one declared as my-bridge (%d containers)", len(got))
+	}
+	if n := a2aBridgeConcurrency(agent); n != 3 {
+		t.Errorf("the budget reads %d workers, want the declared 3 alone", n)
+	}
+}
+
+// An executor value the bridge refuses would crash-loop the whole agent pod, so
+// the operator passes through only api or cli; anything else leaves the
+// shipped default to decide.
+func TestAnUnknownExecutorSettingIsNotRendered(t *testing.T) {
+	for value, want := range map[string]string{"api": "api", "cli": "cli", "CLI": "", "subprocess": "", " cli": ""} {
+		t.Run(value, func(t *testing.T) {
+			t.Setenv(a2aBridgeExecutorOperatorEnvVar, value)
+			b := containersNamed(bridgeTestPod(provisionedAgent()), a2aBridgeContainerName)[0]
+			got, ok := envIndex(b)[a2aBridgeExecutorEnvVar]
+			if want == "" && ok {
+				t.Errorf("%s=%q rendered %s=%q; the bridge refuses it", a2aBridgeExecutorOperatorEnvVar, value, a2aBridgeExecutorEnvVar, got.Value)
+			}
+			if want != "" && got.Value != want {
+				t.Errorf("%s = %q, want %q", a2aBridgeExecutorEnvVar, got.Value, want)
+			}
+		})
+	}
+}
+
+// An unreadable operator concurrency is reported in the provision script's
+// note against the operator setting, not against a CR sidecar.
+func TestTheProvisionNoteForAnUnreadableSettingNamesIt(t *testing.T) {
+	t.Setenv(a2aBridgeConcurrencyOperatorEnvVar, "lots")
+	script := a2aProvisionScript(a2aTestAgent())
+	if !strings.Contains(script, "NOTE: the operator's "+a2aBridgeConcurrencyOperatorEnvVar) || strings.Contains(script, "NOTE: a spec.deployment.sidecars entry sets") {
+		t.Error("the provision script's read note does not name the operator setting for a rendered bridge")
+	}
+}

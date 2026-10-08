@@ -936,8 +936,9 @@ const (
 	// maxSessions edit does. A literal above a2aBridgeConcurrencyMax (below)
 	// counts as the cap, and both surfaces say so. A bridge the operator
 	// renders (platformagent_a2a_bridge.go) is counted from the first render,
-	// so it never takes this path; a sidecar declared after the bus is up
-	// still does.
+	// so its arrival does not take this path; raising the operator's
+	// A2A_BRIDGE_CONCURRENCY on a live install still can, as can a sidecar
+	// declared after the bus is up.
 	a2aTasksStandingDurables     = 2
 	a2aTasksAuditDurableHeadroom = 1
 	a2aTasksIncarnationOverlap   = a2aSessionConsumersPerSession
@@ -2532,6 +2533,12 @@ func a2aProvisionScript(agent *agentv1alpha1.PlatformAgent) string {
   echo "  declares more than that across the spec.deployment.sidecars entries that set ` + a2aBridgeConcurrencyEnvVar + `, and ` + bridgeMax + ` is" >&2
   echo "  the queue behind the bridge's workers, so a count past it is a typo, not a sizing - correct the literal)." >&2
 `
+		if a2aBridgeRendered(agent) {
+			bridgeNote = `  echo "  (the replay share of that reserve is sized for ` + bridgeWorkers + ` bridge workers, the most this render sizes for: the" >&2
+  echo "  operator's ` + a2aBridgeConcurrencyOperatorEnvVar + ` asks for more, and ` + bridgeMax + ` is the queue behind the bridge's workers," >&2
+  echo "  so a count past it is a typo, not a sizing - correct the setting)." >&2
+`
+		}
 	}
 	// What the budget could not read, said on every run and not only in the
 	// refusal. An entry that took the default in place of a count the render
@@ -2545,7 +2552,13 @@ func a2aProvisionScript(agent *agentv1alpha1.PlatformAgent) string {
 	// per-entry rule on refusal (a2aProvisionRefusalStatus); this is the
 	// surface a successful run has.
 	readNote := ""
-	if bridgeWorkersDefaulted {
+	if bridgeWorkersDefaulted && a2aBridgeRendered(agent) {
+		readNote += `# The operator's ` + a2aBridgeConcurrencyOperatorEnvVar + ` is not a count this render could read.
+echo "NOTE: the operator's ` + a2aBridgeConcurrencyOperatorEnvVar + ` is not a count this render could read, so the rendered bridge" >&2
+echo "  counted as the bridge's default of ` + bridgeDefault + `. The bridge falls back the same way, so the budget and the bridge" >&2
+echo "  agree; set the operator's ` + a2aBridgeConcurrencyOperatorEnvVar + ` to a count to size both." >&2
+`
+	} else if bridgeWorkersDefaulted {
 		readNote += `# An entry set ` + a2aBridgeConcurrencyEnvVar + ` to something this render could not read as a count.
 echo "NOTE: a spec.deployment.sidecars entry sets ` + a2aBridgeConcurrencyEnvVar + ` to a value this render could not read as a count -" >&2
 echo "  a valueFrom, a \$(NAME) reference to one or to a name no earlier literal in the same entry set, or a value" >&2

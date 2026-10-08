@@ -698,8 +698,9 @@ class KeptRoundTripTest(RoundTripTest):
     def test_no_sidecars_patches_nothing_but_the_mode(self) -> None:
         # The lane's own install since the operator renders the bridge
         # (#2592): nothing on spec.deployment.sidecars, so nothing to unset
-        # before the flip, and the bus task after the flip forward is what
-        # shows an executor consuming again.
+        # before the flip. The simulator answers the bus task whatever runs,
+        # so this pins the script's path for the lane's install shape, not
+        # that an executor came back; the live round trip is what shows that.
         result, state, _ = self.run_sim(healthy_next_state(sidecars=[]))
         self.assertEqual(result.returncode, 0, result.stdout)
         self.assertIn("SKIP leg1.sidecars-unset: the CR declares no sidecars (a bridge the operator renders leaves with the mode and needs no unset)", result.stdout)

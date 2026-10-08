@@ -35,10 +35,10 @@ The TASKS budget (gke-labs/kube-agents#2077, #2592). The operator sizes the
 TASKS stream's consumer budget from the CR's maxSessions and from the bridge
 workers the pod runs, creates the stream at the larger of that budget and a
 floor of 64, never edits a stream that exists, and refuses a later render
-whose budget the live stream cannot hold. Since #2592 the operator renders the
-bridge from the first next render, with the concurrency step 5 sets on it, so
-the mode patch is the only patch and the one provision Job already counts the
-bridge's workers. The first patch still carries a maxSessions sized so that
+whose budget the live stream cannot hold. The operator budgets the bridge from
+the first next render, with the concurrency step 5 sets on it, and adds it to
+the agent pod once the bus is provisioned, so the mode patch is the only patch
+and the one provision Job already counts the bridge's workers. The first patch still carries a maxSessions sized so that
 budget fits the floor, computed from four constants copied from the
 operator's and pinned against them (the Go side's
 TestCiDeploySizesMaxSessionsToTheTasksFloor pins the same four against the
@@ -452,6 +452,20 @@ class FlagSetIsNextTest(unittest.TestCase):
         # into is the one the bridge reads, the value is one it accepts, and the
         # field it logs the choice under is the one the wait greps.
         self.assertEqual(go_constant(_A2A_MANIFESTS, "a2aBridgeExecutorEnvVar"), go_constant(_BRIDGE_MAIN, "executorEnv"))
+        # The operator spells the rest of the bridge's env itself too, since it
+        # cannot import the bridge's module, so each is pinned to the name the
+        # bridge actually reads.
+        bridge_go = pathlib.Path("k8s-operator/internal/controller/platformagent_a2a_bridge.go")
+        for op_const, bridge_name in (
+            ("a2aBridgeNATSURLEnvVar", "NATS_URL"),
+            ("a2aBridgeNATSUserEnvVar", "NATS_USER"),
+            ("a2aBridgeNATSPasswordEnvVar", "NATS_PASSWORD"),
+        ):
+            with self.subTest(env=bridge_name):
+                self.assertEqual(go_constant(bridge_go, op_const), bridge_name)
+                self.assertIn(f'"{bridge_name}"', main_go, f"the bridge no longer reads {bridge_name}")
+        self.assertEqual(go_constant(_A2A_MANIFESTS, "a2aBridgeConcurrencyEnvVar"), "BRIDGE_CONCURRENCY")
+        self.assertIn('"BRIDGE_CONCURRENCY"', main_go, "the bridge no longer reads BRIDGE_CONCURRENCY")
         self.assertEqual(consts["BRIDGE_EXECUTOR_PINNED"], go_constant(_BRIDGE_API_GO, "ExecutorCLI"))
         self.assertIn('"executor", b.cfg.Executor)', text(_BRIDGE_GO))
         self.assertEqual(consts["BRIDGE_CONSUMING_LOG_EXECUTOR"], f'"executor":"{consts["BRIDGE_EXECUTOR_PINNED"]}"')

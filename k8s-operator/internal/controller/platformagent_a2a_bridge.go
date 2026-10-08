@@ -69,6 +69,13 @@ const (
 	// the one the bridge image is published beside.
 	platformAgentImageName = "platform-agent"
 
+	// a2aAgentContainerName is the agent container the bridge is built from.
+	a2aAgentContainerName = "platform-agent"
+
+	// a2aBridgeExecutorCLI is the bridge's subprocess executor, the other
+	// value it accepts beside a2aBridgeExecutorAPI.
+	a2aBridgeExecutorCLI = "cli"
+
 	// a2aBridgeConcurrencyOperatorEnvVar sets the rendered bridge's
 	// BRIDGE_CONCURRENCY: an operator setting, like the other next-only
 	// knobs, since no CR field carries it. Unset, the bridge's own default.
@@ -89,13 +96,21 @@ const (
 	a2aBridgeNATSPasswordEnvVar = "NATS_PASSWORD"
 )
 
-// a2aBridgeDeclared reports whether the CR declares its own bridge sidecar.
+// a2aBridgeDeclared reports whether the CR declares its own bridge sidecar:
+// one named hermes-bridge, or any sidecar whose env sets BRIDGE_CONCURRENCY,
+// which is how every other reader of a declared bridge identifies one (the
+// TASKS budget, the activity hook, a2aExecutorSidecarEnv). Keying on the name
+// alone would render a second bridge beside one declared under another name,
+// and the two would fight over the activity door's port.
 func a2aBridgeDeclared(agent *agentv1alpha1.PlatformAgent) bool {
 	if agent == nil || agent.Spec.Deployment == nil {
 		return false
 	}
 	for _, c := range agent.Spec.Deployment.Sidecars {
 		if c.Name == a2aBridgeContainerName {
+			return true
+		}
+		if _, set := a2aBridgeConcurrencyValue(c); set {
 			return true
 		}
 	}
@@ -135,10 +150,24 @@ func a2aRenderedBridgeSettings() []corev1.EnvVar {
 		// when BRIDGE_EXECUTOR is unset.
 		{Name: a2aBridgeAPIServerKeyEnvVar, Value: loopbackAgentAPIKey},
 	}
-	if executor := os.Getenv(a2aBridgeExecutorOperatorEnvVar); executor != "" {
+	if executor := a2aRenderedBridgeExecutor(); executor != "" {
 		env = append(env, corev1.EnvVar{Name: a2aBridgeExecutorEnvVar, Value: executor})
 	}
 	return env
+}
+
+// a2aRenderedBridgeExecutor is the operator's A2A_BRIDGE_EXECUTOR when it is
+// one the bridge accepts (api or cli), else "". The bridge refuses any other
+// value at startup, before it dials the bus, and the container would
+// crash-loop the whole agent pod; an unknown value is therefore treated as
+// unset, so the shipped default decides.
+func a2aRenderedBridgeExecutor() string {
+	switch v := os.Getenv(a2aBridgeExecutorOperatorEnvVar); v {
+	case a2aBridgeExecutorAPI, a2aBridgeExecutorCLI:
+		return v
+	default:
+		return ""
+	}
 }
 
 // a2aRenderedBridgeConcurrency is the rendered bridge's BRIDGE_CONCURRENCY:
@@ -225,7 +254,7 @@ func a2aBridgeOwnEnv(agent *agentv1alpha1.PlatformAgent) []corev1.EnvVar {
 		{Name: a2aBridgeConcurrencyEnvVar, Value: a2aRenderedBridgeConcurrency()},
 		a2aActivitySecretEnv(agent),
 	}
-	if executor := os.Getenv(a2aBridgeExecutorOperatorEnvVar); executor != "" {
+	if executor := a2aRenderedBridgeExecutor(); executor != "" {
 		env = append(env, corev1.EnvVar{Name: a2aBridgeExecutorEnvVar, Value: executor})
 	}
 	return env
