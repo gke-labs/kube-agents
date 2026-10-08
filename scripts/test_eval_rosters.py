@@ -396,6 +396,45 @@ INJECT_LANE_EXCLUDED_TIER = {
 }
 
 
+class GitLabLaneTest(unittest.TestCase):
+    """hack/eval/gitlab-presubmit-cases.txt: what the GitLab lane's presubmit
+    runs (kube-agents#2394). A subset of the presubmit, every entry a case
+    that grades the forge."""
+
+    FORGE_CHECKS = {"pull_request_opened", "pull_request_diff_contains", "ledger_issue_contains"}
+    PINNED = ["pdb-remediation-pr", "compliance-rbac-overgrant"]
+
+    def test_the_file_is_the_pinned_set(self):
+        self.assertEqual(eval_rosters.gitlab_presubmit_cases(), self.PINNED)
+
+    def test_the_lane_is_a_subset_of_the_presubmit(self):
+        presubmit = eval_rosters.presubmit_cases()
+        for case in eval_rosters.gitlab_presubmit_cases():
+            with self.subTest(case=case):
+                self.assertIn(case, presubmit, "a GitLab seat comes after a presubmit seat")
+
+    def test_every_lane_case_grades_the_forge(self):
+        import yaml
+
+        def check_types(node):
+            if isinstance(node, dict):
+                found = {node["type"]} if isinstance(node.get("type"), str) else set()
+                for value in node.values():
+                    found |= check_types(value)
+                return found
+            if isinstance(node, list):
+                return set().union(*(check_types(item) for item in node)) if node else set()
+            return set()
+
+        for case in eval_rosters.gitlab_presubmit_cases():
+            with self.subTest(case=case):
+                doc = yaml.safe_load((REPO_ROOT / "bench" / "tasks" / case / "task.yaml").read_text(encoding="utf-8"))
+                self.assertTrue(check_types(doc) & self.FORGE_CHECKS, f"{case} grades nothing on the forge; a chat probe proves nothing about GitLab")
+
+    def test_no_commented_out_case_path(self):
+        self.assertEqual(eval_rosters.commented_out_cases(eval_rosters.GITLAB_PRESUBMIT_CASES_FILE.read_text(encoding="utf-8")), [])
+
+
 class InjectLaneExclusionsTest(unittest.TestCase):
     """hack/eval/inject-lane-exclusions.txt: the lane-level list, checked here.
 

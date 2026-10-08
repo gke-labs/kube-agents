@@ -2,7 +2,8 @@
 """The ``gitlab`` block of brief.json: the GitLab lane's last runs.
 
 The lane (``pull-kube-agents-smoke-test-gitlab``, kube-agents#2394) is the
-presubmit's matrix driven against a pool project's GitLab repository. Its
+forge-grading subset of the presubmit's matrix driven against a pool
+project's GitLab repository. Its
 runs carry ``tier: gitlab`` (tiers.py) and so reach no gate verdict, no case
 history and no digest number; this block is where they are seen at all: the
 newest ``RUNS_LISTED`` runs with Prow's result, the eval's own verdict, how
@@ -21,8 +22,8 @@ except ImportError:  # run as a script
 
 RUNS_LISTED = 20
 # A lane build on the collector's pending_builds is in flight only while its
-# first sighting is this recent: the lane runs the presubmit's matrix under
-# the presubmit's 360-minute ceiling, plus the time Prow takes to write
+# first sighting is this recent: the lane runs under the presubmit's
+# 360-minute ceiling, plus the time Prow takes to write
 # finished.json. Past that it is a pod that died without uploading, which
 # the collector keeps on pending_builds for two days (render.py's Grid
 # columns and nightly.py's running nights draw the same line).

@@ -7,7 +7,8 @@
 # startup into its TASKS array and refuses to start on a line that names no
 # case directory; scripts/validate_bench_cases.py reads it too, so a case
 # under bench/tasks/ that is in neither this file nor nightly-cases.txt
-# fails the registration lint. Cases are NOT discovered; this list is the
+# fails the registration lint. (gitlab-presubmit-cases.txt, the GitLab
+# lane's subset of this file, is not a registration.) Cases are NOT discovered; this list is the
 # registration.
 #
 # WHO APPROVES. Adding or removing a line here changes what every pull

@@ -1,0 +1,48 @@
+# The GitLab lane's presubmit matrix: what pull-kube-agents-smoke-test-gitlab
+# runs (kube-agents#2394). hack/ci-eval-pr.sh reads this file instead of
+# presubmit-cases.txt when EVAL_FORGE=gitlab and EVAL_TIER is presubmit; the
+# nightly under EVAL_FORGE=gitlab runs the whole catalogue, as the GitHub
+# nightly does, so this file is the only place the two lanes differ.
+#
+# One `./tasks/<id>/task.yaml` path per line, relative to bench/. `#` starts
+# a comment, blank lines are skipped. Every entry must also be a line in
+# presubmit-cases.txt: the lane is a subset of the presubmit, so a case earns
+# its presubmit seat first and its GitLab seat second. The script refuses to
+# start on an entry outside the presubmit, on a path with no case behind it,
+# and on a file that names nothing.
+#
+# WHAT BELONGS HERE. Cases that grade the forge: a `pull_request_opened` or
+# `pull_request_diff_contains` check (a merge request on GitLab) or a
+# `ledger_issue_contains` check (a ledger issue). A chat probe passes the
+# same on either forge and proves nothing about GitLab; the GitHub run
+# already grades it on every pull request. scripts/test_eval_rosters.py pins
+# that rule.
+#
+# WHAT CAN RED THE LANE. The blocking roster still applies, intersected with
+# this list: a roster case here arms rung 4 on the lane; a held-out case here
+# runs and reports without arming it, as it does on the GitHub presubmit.
+# Rungs 1-3 red the lane like every case. Both seats below are held out, so
+# the lane cannot red a pull request on a graded failure today, and the job
+# stays optional in Prow until it has a green history (oss-test-infra#2724).
+#
+# WHO APPROVES. The normal approvers (root OWNERS), as for nightly-cases.txt
+# and the inject-lane files: this file changes what one optional lane runs,
+# not what can red a pull request. It moves under the eval-crew rule in
+# hack/OWNERS the day the lane gates.
+#
+# BUDGET. Two cases, six units at EVAL_REPETITIONS of 3, each case's three
+# serialized on its task lock, and the two cases back to back, not side by
+# side: pdb-remediation-pr requests a pull request, so its units run in the
+# fan-out's second phase after every other unit (unit_phase in the script).
+# compliance-rbac-overgrant (hinted 1000s) then pdb-remediation-pr (hinted
+# 1250s) is ~115 minutes of units at the hints and up to ~200 at their p90,
+# plus ~16 minutes of lease, build and deploy: inside the job's 360-minute
+# deadline, and beside the GitHub presubmit's ~136-minute median rather
+# than under it. One case here would be the lighter lane.
+
+# The merge-request path: the remediation lands as a merge request on the
+# project's GitLab repository, never on the cluster (pull_request_opened).
+./tasks/pdb-remediation-pr/task.yaml
+# The ledger path: the audit's findings land in a ledger issue on the
+# GitLab project and the lease-time reset retires it (ledger_issue_contains).
+./tasks/compliance-rbac-overgrant/task.yaml
