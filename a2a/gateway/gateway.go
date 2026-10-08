@@ -2079,6 +2079,16 @@ func (g *Gateway) startTaskWith(ctx context.Context, rec *SessionRecord, ts task
 // noticeSteerNotSent tells the room a steer did not reach the running task.
 const noticeSteerNotSent = "⚠️ could not send that to the running task; it is still working on the original instruction"
 
+// The steer acknowledgements, one per route (spec-chatops-gateway.md,
+// "Gateway-authored posts"). The fixed-route wording is a product decision
+// (G22): the platform agent queues a follow-up and answers it next, and a
+// refusal follows as its own notice on the stream, so this is the one place
+// it is spelled.
+const (
+	ackSteerQueued  = "✏️ got it, I'll take that next"
+	ackSteerSession = "✏️ steering sent — the worker picks it up at its next turn boundary if the task is still running"
+)
+
 // steerTask forwards a message that arrived while the task runs as a
 // follow-up on the same taskId — injected, absorbed at the executor's next
 // turn boundary (decided 8/24). It reuses the task's correlationId; the
@@ -2094,6 +2104,19 @@ func (g *Gateway) steerTask(ctx context.Context, rec *SessionRecord, msg Inbound
 	// the steer never arrived, and an author recorded for nothing costs at
 	// most a refused delegation.
 	author := TaskRequester{Backend: backend, Subject: requesterSubject(g.ps, backend, msg.AuthorID)}
+	// A delegated child runs on the target's executor, which acts on a steer
+	// (G22), so its author is checked against the target's list as a
+	// delegation's are (gke-labs#2531 item 5). Before the author is recorded
+	// and before anything is published: a refused steer leaves no trace but
+	// the audit line and the target-only notice.
+	if ref, ok := rec.TaskRefFor(active.TaskID); ok && ref.Role == taskRoleChild {
+		if rule := g.authorRefusal(rec.Addressee, author, ruleDelegationChildSteer); rule != "" {
+			g.log.Warn("steer refused", "rule", rule, "taskId", active.TaskID, "conversation", rec.Key,
+				"addressee", rec.Addressee, "steerBackend", author.Backend, "steerAuthor", author.Subject)
+			g.post(rec.Key, noticeDelegationNotAllowed)
+			return
+		}
+	}
 	rec.recordSteerAuthor(active.TaskID, author)
 	if rec.AddressedToOwnSession() {
 		rec.addSessionAuthor(author)
@@ -2123,17 +2146,24 @@ func (g *Gateway) steerTask(ctx context.Context, rec *SessionRecord, msg Inbound
 		g.post(rec.Key, noticeSteerNotSent)
 		return
 	}
-	// Say what we know and no more: the steer is on the stream, and what
-	// happens next is the route's contract (spec: gateway-authored posts,
-	// amended 8/31) - a session worker absorbs at its next turn boundary if
-	// the task is still running; the fixed-route executor refuses mid-task
-	// input and publishes its refusal itself. Neither line claims the steer
-	// was absorbed, which the gateway cannot know.
+	// The steer is on the stream, and what happens next is the route's
+	// contract (spec: gateway-authored posts): a session worker absorbs it at
+	// its next turn boundary if the task is still running; the fixed-route
+	// executor queues it and answers it as a further turn after the current
+	// one, and a follow-up it does not take (queue full, the task already
+	// ending) is corrected by its own notice on the stream.
 	if rec.AddressedToOwnSession() {
-		g.post(rec.Key, "✏️ steering sent — the worker picks it up at its next turn boundary if the task is still running")
-	} else {
-		g.post(rec.Key, "✏️ steering sent — the standing executor does not take mid-task input; its reply will say so")
+		g.post(rec.Key, ackSteerSession)
+		return
 	}
+	// The executor answers each follow-up with a steer notice; the relay
+	// counts what it was sent against what it heard, to tell the room about
+	// one it never answered.
+	rs := g.relayFor(active.TaskID)
+	g.mu.Lock()
+	rs.steersSent++
+	g.mu.Unlock()
+	g.post(rec.Key, ackSteerQueued)
 }
 
 // cancelTask publishes kind:cancel — the hard interrupt — and detaches the

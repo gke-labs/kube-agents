@@ -22,6 +22,9 @@ const (
 	ruleDelegationStale         = "delegation.stale"
 	ruleDelegationMalformed     = "delegation.malformed"
 	ruleDelegationDoorUnlisted  = "delegation.door-unlisted"
+	// ruleDelegationChildSteer refuses a steer into a delegated child from
+	// an author the target's list refuses (gke-labs#2531 item 5).
+	ruleDelegationChildSteer = "delegation.child-steer"
 )
 
 // reasonWakeNotStarted is the reason token on a delegation chain's root

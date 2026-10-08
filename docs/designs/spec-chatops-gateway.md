@@ -159,8 +159,8 @@ Two routes exist, and the terms recur below: a conversation is **fixed-routed** 
 its tasks address the standing executor configured at deploy time (the platform front
 door), and **session-routed** when they address the conversation's own spawned worker.
 The two differ on steers: a session worker absorbs them at its next turn boundary,
-while the standing front door refuses them with an honest status reply - the refusal
-posture the payload spec's steering rule records.
+while the standing front door queues them and answers each as a further turn after the
+current one, with a status notice per follow-up (the payload spec's steering rule).
 
 The status matcher's width bias inverts per executor, and the inversion is the
 contract, not a tuning detail. Beyond the exact phrase set there is a wide
@@ -184,11 +184,13 @@ the steer acknowledgement reports that the steer is on the stream, and what it s
 next is conditioned on the route the same way the width bias above is, because the
 gateway knows the route and the two executors do different things: on a
 session-routed conversation, that the worker picks it up at its next turn boundary
-if the task is still running; on a fixed-routed one, that the standing executor does
-not take mid-task input and the reply will say so. Neither claims the steer was
-absorbed, which the gateway cannot know. The payload spec's refusal posture - both
-the fixed-route refusal and the race-window one - is what closes the loop on the
-stream.
+if the task is still running; on a fixed-routed one, "got it, I'll take that next".
+The executor's notice on the stream corrects it when the follow-up was not taken
+(queue full, the task already ending), and at the task's terminal the gateway says so
+for a follow-up the executor never answered or never ran. A steer into a delegated
+child is checked against the target's list first (rule `delegation.child-steer`);
+refused, it is not published, its author is not recorded, and the room is told the
+target is not reachable from here.
 
 ## The Delegate flow (added 8/31)
 
@@ -359,7 +361,9 @@ two do not nest. When the session delegates, its turn completes with a reply tha
 thread as it does for any task, and the child's terminal wakes the session for one more turn
 with the child's result as its input, so the session can synthesize or follow up. A follow-up
 the human sends while the child runs steers the child, through the gateway, as follow-ups do
-today (the platform executor refuses steers on the fixed route today, and says so). A session pod
+today: the platform executor queues each one and answers it after the current turn, and
+the gateway checks the steer's author against the target's list first, as it checked the
+delegation's. A session pod
 is therefore busy for seconds per turn, not for the life of the work it delegated, which is also
 what keeps the per-conversation pod cost small. The delegating turn's answer is decided at the
 call, so an eviction that lands before its harness has exited (a fast child's wake retires the

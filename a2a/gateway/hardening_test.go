@@ -68,11 +68,12 @@ func TestSpawnFailureClosesTheTaskAsItsSupervisor(t *testing.T) {
 	})
 }
 
-// TestSteerAckIsRouteConditioned: the spec's gateway-authored-posts rule
-// (amended 8/31) — the acknowledgement reports the steer is on the stream,
-// and what it says next depends on what the executor will do with it.
+// TestSteerAckIsRouteConditioned: the spec's gateway-authored-posts rule —
+// the acknowledgement depends on what the executor will do with the steer:
+// the fixed route's executor queues it and answers it next (G22), a session
+// worker absorbs it at its next turn boundary if the task is still running.
 func TestSteerAckIsRouteConditioned(t *testing.T) {
-	t.Run("fixed route says the executor refuses", func(t *testing.T) {
+	t.Run("fixed route says it takes it next", func(t *testing.T) {
 		r := startRig(t)
 		conv := "discord:g1/thread-ackfixed"
 		r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group",
@@ -82,7 +83,7 @@ func TestSteerAckIsRouteConditioned(t *testing.T) {
 			AuthorID: "1001", MessageID: "af-2", Text: "actually only prod"}
 		waitFor(t, "fixed-route steer ack", func() bool {
 			for _, p := range r.adapter.postTexts() {
-				if strings.Contains(p, "does not take mid-task input") {
+				if strings.Contains(p, ackSteerQueued) {
 					return true
 				}
 			}
@@ -102,7 +103,7 @@ func TestSteerAckIsRouteConditioned(t *testing.T) {
 			AuthorID: "1001", MessageID: "as-2", Text: "actually only prod"}
 		waitFor(t, "session-route steer ack", func() bool {
 			for _, p := range r.adapter.postTexts() {
-				if strings.Contains(p, "if the task is still running") {
+				if strings.Contains(p, ackSteerSession) {
 					return true
 				}
 			}

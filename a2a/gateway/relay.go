@@ -54,6 +54,22 @@ type relayState struct {
 	// lost before its batch takes a crash, and a restart starts the task's
 	// relay state afresh without it.
 	local bool
+	// steersSent counts the follow-ups steerTask published to a fixed-route
+	// task, under g.mu, for the relay to weigh against the executor's steer
+	// notices at the terminal.
+	steersSent int
+}
+
+// relayFor is the task's render state, created on first use.
+func (g *Gateway) relayFor(taskID string) *relayState {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	rs, ok := g.relays[taskID]
+	if !ok {
+		rs = &relayState{}
+		g.relays[taskID] = rs
+	}
+	return rs
 }
 
 // relayItem is one queued event with the subject it arrived on. The relay's
@@ -160,13 +176,7 @@ func (g *Gateway) relayBatch(sessionKey string, batch []relayItem) {
 // rolling-line edit; posts always happen.
 func (g *Gateway) applyEvent(ctx context.Context, rec *SessionRecord, item relayItem, render bool) {
 	env := item.env
-	g.mu.Lock()
-	rs, ok := g.relays[env.TaskID]
-	if !ok {
-		rs = &relayState{}
-		g.relays[env.TaskID] = rs
-	}
-	g.mu.Unlock()
+	rs := g.relayFor(env.TaskID)
 
 	switch env.Kind {
 	case lib.KindStatusUpdate:

@@ -576,7 +576,7 @@ func TestMessageDuringWorkingIsSteeringOnSameTask(t *testing.T) {
 	// a dropped message live.
 	waitFor(t, "steer acknowledgement", func() bool {
 		for _, p := range r.adapter.postTexts() {
-			if strings.Contains(p, "steering sent") {
+			if strings.Contains(p, ackSteerQueued) {
 				return true
 			}
 		}

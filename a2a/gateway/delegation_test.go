@@ -1621,12 +1621,73 @@ func TestDelegateChecksEverySteerAuthor(t *testing.T) {
 	}
 }
 
-// TestASteerIntoTheChildIsCheckedAtTheWakesDelegation: 1002 steers the
-// child on platform; the child's result is what the wake reads, so a
-// delegation from the wake is checked against 1002 too.
-func TestASteerIntoTheChildIsCheckedAtTheWakesDelegation(t *testing.T) {
+// childSteers counts the follow-ups on platform's in subject for child.
+func childSteers(t *testing.T, r *rig, child *lib.Envelope) int {
+	t.Helper()
+	n := 0
+	for _, e := range inSubjectEnvelopes(t, r.url, targetPlatform) {
+		if e.TaskID == child.TaskID && e.Kind == lib.KindMessage && e.EnvelopeID != child.EnvelopeID {
+			n++
+		}
+	}
+	return n
+}
+
+// TestAnOffListSteerIntoTheChildIsRefusedAndNotSent: gke-labs#2531 item 5.
+// The platform executor now acts on a steer (G22), so a steer into a
+// delegated child is checked against the target's list as the delegation
+// was. Refused: the target-only notice, nothing published, no author
+// recorded. Allowed: published on the child's in subject and acknowledged.
+func TestAnOffListSteerIntoTheChildIsRefusedAndNotSent(t *testing.T) {
+	for _, tc := range []struct {
+		name, author string
+		sent         bool
+	}{
+		{"an off-list author is refused", "1002", false},
+		{"an on-list author is steered", "1001", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r, spawn := startRigWithSpawnerCap(t, "platform", 0, func(c *Config) {
+				c.TargetAllowedUsers = map[string]map[string][]string{targetPlatform: {"discord": {"1001"}}}
+			})
+			ctx := context.Background()
+			conv := "discord:g1/t-child-steer-" + tc.author
+			_, _, child := delegated(t, r, spawn, conv, "")
+			waitFor(t, "parent terminal relayed", postedContaining(r, "delegated to platform"))
+			_ = r.execFor(t, child, targetPlatform).PublishStatus(ctx, lib.StateWorking, false)
+			steerAs(r, conv, "cs-1", tc.author, "include costs")
+			if tc.sent {
+				waitFor(t, "steer on the child's in subject", func() bool { return childSteers(t, r, child) == 1 })
+				waitFor(t, "the ack", postedContaining(r, ackSteerQueued))
+				return
+			}
+			waitFor(t, "the notice", postedContaining(r, noticeDelegationNotAllowed))
+			waitFor(t, "the audit line", loggedContaining(r, "steer refused", "rule="+ruleDelegationChildSteer, child.TaskID))
+			if n := childSteers(t, r, child); n != 0 {
+				t.Fatalf("a refused steer reached the child: %d", n)
+			}
+			rec, _ := r.g.reg.Get(ctx, conv)
+			if cref, _ := rec.TaskRefFor(child.TaskID); len(cref.SteerAuthors) != 0 {
+				t.Fatalf("a refused steer recorded its author: %+v", cref.SteerAuthors)
+			}
+			for _, p := range r.adapter.postTexts() {
+				if strings.Contains(p, "1002") || strings.Contains(p, ackSteerQueued) {
+					t.Fatalf("post %q names the requester or acks a refused steer", p)
+				}
+			}
+		})
+	}
+}
+
+// TestASteerIntoTheChildTravelsToTheWake: 1002 steers the child on
+// platform; the child's result is what the wake reads, so the wake's steer
+// authors carry 1002 and a delegation from the wake is checked against them.
+// Both authors are on the list here, so the wake's delegation mints. An
+// off-list author never gets this far: the steer itself is refused
+// (TestAnOffListSteerIntoTheChildIsRefusedAndNotSent).
+func TestASteerIntoTheChildTravelsToTheWake(t *testing.T) {
 	r, spawn := startRigWithSpawnerCap(t, "platform", 0, func(c *Config) {
-		c.TargetAllowedUsers = map[string]map[string][]string{targetPlatform: {"discord": {"1001"}}}
+		c.TargetAllowedUsers = map[string]map[string][]string{targetPlatform: {"discord": {"1001", "1002"}}}
 	})
 	ctx := context.Background()
 	conv := "discord:g1/t-steer-child"
@@ -1647,7 +1708,7 @@ func TestASteerIntoTheChildIsCheckedAtTheWakesDelegation(t *testing.T) {
 	wexec := r.execFor(t, wake, wakeSession)
 	_ = wexec.PublishStatus(ctx, lib.StateWorking, false)
 	_ = wexec.PublishArtifact(ctx, delegateArtifact(t, "platform", "again"))
-	waitFor(t, "refusal line", loggedContaining(r, "delegation refused", "rule="+ruleDelegationSteerAuthor, wake.TaskID))
+	waitFor(t, "mint line", loggedContaining(r, "delegation minted", "parent="+wake.TaskID))
 	// Tasks, not messages: the steer into the child is a message too.
 	tasks := map[string]bool{}
 	for _, e := range inSubjectEnvelopes(t, r.url, targetPlatform) {
@@ -1655,8 +1716,8 @@ func TestASteerIntoTheChildIsCheckedAtTheWakesDelegation(t *testing.T) {
 			tasks[e.TaskID] = true
 		}
 	}
-	if len(tasks) != 1 {
-		t.Fatalf("platform received %d tasks, want 1", len(tasks))
+	if len(tasks) != 2 {
+		t.Fatalf("platform received %d tasks, want 2", len(tasks))
 	}
 }
 

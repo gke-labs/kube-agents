@@ -1215,8 +1215,8 @@ func TestA2AFollowUpOnARunningTaskReturnsTheGatewaysReply(t *testing.T) {
 	if err := json.Unmarshal(raw, &reply); err != nil || reply.Kind != a2aKindMessage || reply.Role != a2aRoleAgent {
 		t.Fatalf("result = %s, want an agent Message", raw)
 	}
-	if text := joinTextParts(reply.Parts); !strings.Contains(text, "steer") {
-		t.Errorf("reply text = %q, want the gateway's steering notice", text)
+	if text := joinTextParts(reply.Parts); !strings.Contains(text, ackSteerQueued) {
+		t.Errorf("reply text = %q, want the gateway's steer acknowledgement %q", text, ackSteerQueued)
 	}
 	// The steer reached the bus as a second message on the task.
 	waitFor(t, "the steer on the in subject", func() bool {
@@ -1231,7 +1231,7 @@ func TestA2AFollowUpOnARunningTaskReturnsTheGatewaysReply(t *testing.T) {
 	// And the task's history carries the notice too.
 	got := r.getUntil(t, a2aTestCaller, task.ID, "the notice in the task history", func(task a2aTaskObject) bool {
 		for _, m := range task.History {
-			if strings.Contains(joinTextParts(m.Parts), "steer") {
+			if strings.Contains(joinTextParts(m.Parts), ackSteerQueued) {
 				return true
 			}
 		}
