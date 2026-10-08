@@ -102,11 +102,19 @@ class ConfigurationTest(unittest.TestCase):
             {"provider": "gitlab", "host": "gitlab.example.com", "token_path": "/t/b", "allowed_paths": ()},
             {"provider": "github", "host": "github.com"},
         ]})
-        self.assertEqual([("gitlab.com",), ("gitlab.example.com",)], [f.hosts for f in built])
+        self.assertEqual([("gitlab.com", "www.gitlab.com"), ("gitlab.example.com",)], [f.hosts for f in built])
 
     def test_an_entry_without_a_token_path_stops_the_build(self):
         with self.assertRaises(ValueError):
             GitLabForge.for_config({"forges": [{"provider": "gitlab", "host": "gitlab.com"}]})
+
+    def test_www_gitlab_com_is_gitlab_com(self):
+        # Review (#2439): the operator folds `www.gitlab.com` onto gitlab.com;
+        # the broker refused a URL written that way.
+        built = forge()
+        self.assertEqual("gitlab.com", built.hosts[0])
+        self.assertEqual("acme/infra", built.parse("https://www.gitlab.com/acme/infra"))
+        self.assertEqual(("gitlab.example.com",), GitLabForge("gitlab.example.com", "/t").hosts)
 
     def test_the_whole_host_is_allowed_only_when_asked_for(self):
         # Review: omitting allowedPaths silently granted the whole host.

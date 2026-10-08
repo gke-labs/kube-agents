@@ -355,9 +355,10 @@ class NamesTest(unittest.TestCase):
         # A same-task waiter's deadline is the holder's ceiling plus grading
         # and teardown; a holder that spends the grace before its run must
         # not push the waiter past it, so the grace is in the deadline.
+        self.assertIn('lock_deadline="$(stream_lock_deadline "${name}" "${audit_id}" "${streams}")"', lifted("run_one_unit"))
         self.assertIn(
-            'lock_deadline="$(( $(stream_case_count "${audit_id}") * ($(unit_delegation_timeout "${name}") + 600 + EVAL_INFLIGHT_GRACE_SECONDS) + $(stream_stack_wait "${audit_id}") ))"',
-            lifted("run_one_unit"),
+            "($(unit_delegation_timeout \"$1\") + UNIT_LOCK_ALLOWANCE_SECONDS + EVAL_INFLIGHT_GRACE_SECONDS + run_wait)",
+            lifted("stream_lock_deadline"),
         )
         self.assertEqual(grace_seconds(), 300)
 
@@ -372,11 +373,11 @@ class CallSiteTest(unittest.TestCase):
         # one carrying the worker's findings, and this unit's `start` would
         # carry them into the repetition.
         unit = lifted("run_one_unit")
-        stream_lock = unit.index('lock_acquire "${STATE_DIR}/lock-stream-${audit_id}"')
+        stream_lock = unit.index('lock_acquire "${STATE_DIR}/lock-stream-${s}"')
         reset = unit.index('reset_audit_ledgers "${name} rep ${rep}" "${audit_id}"')
         release = unit.index('release_inflight_note "${name} rep ${rep}" "${audit_id}"')
         launch = unit.index("uv run devops-bench")
-        stream_release = unit.index('lock_release "${STATE_DIR}/lock-stream-${audit_id}"', launch)
+        stream_release = unit.index('release_streams "${streams}"', launch)
         self.assertLess(stream_lock, release)
         self.assertLess(release, reset)
         self.assertLess(reset, launch)

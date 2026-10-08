@@ -443,11 +443,13 @@ Layout:
   in flight at once and one tail each; the callers that replay in a loop with nothing
   between calls are named there as what the term does not size for. Amended 9/28: the
   replay term scales with the bridge's worker count, which the render reads as
-  `BRIDGE_CONCURRENCY` off `spec.deployment.sidecars` - the sum over every sidecar that
+  `BRIDGE_CONCURRENCY` off `spec.deployment.sidecars` and, when the operator renders the
+  bridge itself, off the operator's `A2A_BRIDGE_CONCURRENCY` setting, read by the same rule
+  (10, the rendered bridge's default, when unset) - the sum over every sidecar that
   sets it, each read as the bridge runs it: the literal, with a `$(NAME)` reference to an
   earlier literal in the same sidecar expanded as the kubelet expands it, or the bridge's
   default of 2 for a `valueFrom` or a reference to one, an unparsable value or one below
-  one, and 2 when no sidecar sets it, and at
+  one, and 2 when nothing sets it, and at
   most 1024, the bridge's queue capacity, since the CRD bounds `maxSessions` at 10000 against
   the same wrap and a sidecar's env is bounded nowhere else - so the reserve moves with the
   bridge's worker count, and each surface says what it read. The provision script's refusal
@@ -458,7 +460,8 @@ Layout:
   not, when an entry took the default or a sidecar carries `envFrom` with no entry in `env`
   (a `BRIDGE_CONCURRENCY` delivered through `envFrom` is not read), since the budget may then
   be short for the real count with no refusal to say so. Where the count is above the
-  default, both refusal surfaces offer fewer workers as the third way out beside a lower
+  default, both refusal surfaces offer fewer workers (on a rendered bridge, a lower
+  `A2A_BRIDGE_CONCURRENCY`) as the third way out beside a lower
   `maxSessions` and a deleted stream; the message attributes the need to the count wherever
   it moved the reserve, one worker included.
   The trade is stated where it is made: an install that raises `maxSessions` raises
@@ -853,8 +856,9 @@ on that function). On the mounts it goes further than admission does: besides th
 reserved names it drops any mount naming a volume it has just dropped by source, because
 a volume dropped while a mount still names it is a Deployment the API server refuses. Neither
 layer touches `sidecars[].env` or `.envFrom`, which reach the same Secrets with no volume
-at all; that is deliberate, because it is the supported route for the Hermes bridge
-sidecar, which is meant to hold `bridge-password`.
+at all; that is deliberate, because it is the supported route for a CR-declared Hermes
+bridge sidecar, which is meant to hold `bridge-password`. The bridge the operator renders
+under `next` gets the same key as a `secretKeyRef` the operator writes itself.
 
 Read on the right terms, which are narrower than the mechanism suggests: KSA tokens are
 pod-scoped and the callout cannot see which container presented one, so this is a guard

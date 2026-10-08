@@ -466,7 +466,7 @@ func Run(ctx context.Context, cfg Config) (Result, error) {
 	prompt := promptFromOrigin(origin)
 	if prompt == "" {
 		state := lib.StateRejected
-		err := a.finalize(state, "reason: no text parts in submission - nothing to execute", "")
+		err := a.finalize(state, "reason: no-text-parts - the submission message carries nothing to execute", "")
 		return Result{State: state}, err
 	}
 

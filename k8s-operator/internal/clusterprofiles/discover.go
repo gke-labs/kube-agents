@@ -90,6 +90,15 @@ type Cluster struct {
 	// per-cluster filename, where the bare cluster name would collide.
 	Profile string
 	Config  *rest.Config
+	// Autopilot is the describe call's Autopilot.Enabled, carried out of
+	// Discover because the GKE API was already asked. It separates the two
+	// clusters that look identical from inside — both report zero nodes and
+	// leave GKE's own system pods Pending — but mean opposite things: on
+	// Autopilot that is the product scaling an unused cluster to nothing, and
+	// on Standard it is a fault. A caller with no describe behind it (the
+	// direct --in-cluster cluster) never builds one of these and reads false,
+	// which is the fail-open side of that question.
+	Autopilot bool
 }
 
 // Discoverer scans a profiles directory. The zero value reaches the real GKE
@@ -367,7 +376,12 @@ func (d Discoverer) Discover(ctx context.Context, dir string) ([]Cluster, error)
 		UseGoogleTokenSource(cfg, tokenSource)
 
 		seen[identity.String()] = e.Name()
-		clusters = append(clusters, Cluster{Identity: *identity, Profile: e.Name(), Config: cfg})
+		clusters = append(clusters, Cluster{
+			Identity:  *identity,
+			Profile:   e.Name(),
+			Config:    cfg,
+			Autopilot: described.Autopilot != nil && described.Autopilot.Enabled,
+		})
 	}
 	return clusters, nil
 }

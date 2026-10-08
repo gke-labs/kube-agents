@@ -389,7 +389,15 @@ The GKE-events path is live end to end:
   forwards: a `FailedScheduling` is held while a scale-up for its pod is in progress, passed at any
   count once the autoscaler has declined to help, and otherwise held until its fifth repeat, so a
   pod waiting for a node the cluster is already adding opens no card and a pod nothing will place
-  opens one. The eleven-entry `defaultReasons` in the watcher's `filter.go` — which does include
+  opens one. On an Autopilot cluster the event is also held, at any count, when the message is
+  `no nodes available to schedule pods` and the autoscaler has recorded no verdict on the pod — an
+  Autopilot cluster with no user workloads scales to zero nodes and leaves GKE's own system pods
+  `Pending` by design, which is not an incident. Whether the cluster is Autopilot comes from the
+  describe call cluster discovery already makes, so it costs no extra API call; zero nodes on a
+  Standard cluster is a fault and still opens a card, and a real workload draws a node-auto-provisioning
+  verdict within seconds, which takes it out of the hold.
+  `WATCHER_AUTOPILOT_SCALE_TO_ZERO_HOLD=false` reports them.
+  The eleven-entry `defaultReasons` in the watcher's `filter.go` — which does include
   `Evicted` — applies only when `--reason` is left unset, so it does not describe an install.
   `Decide` matches the wire reason exactly and before canonicalization, so a reason absent from
   that list produces nothing at all: no session, no card, no report.

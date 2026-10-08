@@ -33,11 +33,16 @@
 # it), because a task over the bus is submitted through it, as the lane's
 # matrix submits its cases; and python3, which runs that submission through
 # the lane's own client (bench/kube_agents_bench/inject_transport.py, stdlib
-# only, so no virtualenv). The CR's spec.deployment.sidecars, whatever they
-# are, is unset before the flip to today, as a2a/docs/hermes-bridge.md
+# only, so no virtualenv). The bridge the operator renders under next (the
+# lane's install declares none, hack/ci-deploy.sh) leaves the pod with the
+# mode and comes back with it, so it needs nothing here; the bus task after
+# the flip forward is what shows it consuming again. A CR that declares
+# sidecars of its own on spec.deployment.sidecars is the case left: the
+# operator copies those into the pod whatever the mode, so the list, whatever
+# it holds, is unset before the flip to today, as a2a/docs/hermes-bridge.md
 # requires, and declared again, byte for byte, once the bus is back; a run
 # that fails or is stopped with the list unset and the CR at next declares it
-# again on its way out.
+# again on its way out. An empty list is skipped.
 #
 # Every assertion prints one PASS or FAIL line with its name. The first FAIL
 # stops the run, which exits non-zero after a line naming it. Every wait has a
@@ -688,7 +693,11 @@ assert_nats_on_claim() {
 }
 
 # ─── Sidecars ────────────────────────────────────────────────────────────────
-# The whole of spec.deployment.sidecars is unset before the flip to today and
+# Only CR-declared sidecars: the operator's rendered bridge is not on
+# spec.deployment.sidecars, is removed with the mode, and needs no unset. A
+# hand-declared one is still copied into the pod under today and crash-loops
+# there (a2a/docs/hermes-bridge.md, "What a declared sidecar costs"), so the
+# whole of spec.deployment.sidecars is unset before the flip to today and
 # declared again after the flip forward, not only the sidecars that look like
 # they talk to the bus: a sidecar is an ordinary corev1.Container
 # (a2a/docs/hermes-bridge.md), and one the flip breaks can say so in more ways
@@ -968,7 +977,7 @@ if [ -n "${UNSET_SIDECARS}" ]; then
   note "unsetting spec.deployment.sidecars (${UNSET_SIDECARS}) before the flip (a2a/docs/hermes-bridge.md)"
   patch_and_settle "leg1" "sidecars-unset" '{"spec":{"deployment":{"sidecars":null}}}'
 else
-  skip "leg1.sidecars-unset" "the CR declares no sidecars"
+  skip "leg1.sidecars-unset" "the CR declares no sidecars (a bridge the operator renders leaves with the mode and needs no unset)"
 fi
 patch_and_settle "leg1" "mode-today" "{\"spec\":{\"mode\":\"${MODE_TODAY}\"}}"
 # The teardown ran to its end: the StatefulSet is the last thing cleanupA2A

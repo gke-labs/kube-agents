@@ -162,8 +162,8 @@ check_base_image distroless-static a2a/Dockerfile.console DISTROLESS_IMAGE DISTR
 # builder base to compare: its runtime base is the platform-agent image of the
 # same build, passed as a build arg with no default, so there is no runtime
 # pin in the Dockerfile. The image itself is a first-party inventory entry
-# (hermes-bridge), published by the release workflow beside the four A2A
-# images.
+# (hermes-bridge), published by the release workflow beside the A2A images,
+# and the operator renders it under next (check 2 holds its compiled name).
 check_base_image golang a2a/Dockerfile.hermes-bridge GOLANG_IMAGE GOLANG_VERSION
 
 # The Go builder and k8s-operator/go.mod's `go` directive must name the same
@@ -250,7 +250,7 @@ jq -r '.images[] | select(.tagFrom) | "\(.name)\t\(.tagFrom.file)\t\(.tagFrom.ke
 #    is the string the operator renders into the pod template; the comparison
 #    is on the normalised form, the same way check 1 reads a Dockerfile ARG.
 #    The first-party next defaults (gateway, worker, callout, capability
-#    verifier, console) are release images with no fixed tag in the inventory,
+#    verifier, console, and the Hermes bridge sidecar) are release images with no fixed tag in the inventory,
 #    so the operator compiles in the bare image name and takes registry and tag
 #    from its own or the agent image; the second check below holds each name to
 #    the inventory's entry, and that entry's repository to the name under the
@@ -306,6 +306,7 @@ check_compiled_image_name a2a-worker k8s-operator/internal/controller/platformag
 check_compiled_image_name a2a-authcallout k8s-operator/internal/controller/platformagent_a2a_callout.go a2aCalloutImageName
 check_compiled_image_name a2a-verifier k8s-operator/internal/controller/platformagent_a2a_verifier.go a2aVerifierImageName
 check_compiled_image_name a2a-console k8s-operator/internal/controller/platformagent_a2a_console.go a2aConsoleImageName
+check_compiled_image_name hermes-bridge k8s-operator/internal/controller/platformagent_a2a_bridge.go a2aBridgeImageName
 check_compiled_repository a2a-worker a2a/gateway/config.go defaultWorkerRepository
 
 # ---------------------------------------------------------------------------
