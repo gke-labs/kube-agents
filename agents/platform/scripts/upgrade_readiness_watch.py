@@ -20,8 +20,9 @@ retires nothing, so a failed listing cannot erase a version and have it come
 back as new. A report whose readiness reads graded none of a version's
 pending clusters is written but not recorded, and the version is tried again
 the next day, up to ``UNGRADED_ATTEMPTS_BEFORE_WEEKLY`` days in a row, after
-which it is recorded as reported so an unreachable cluster costs its project
-one sweep a week rather than one a day; a cluster the script graded
+which it is recorded as reported and stays on the weekly cadence until a
+cluster is graded, so an unreachable cluster costs its project one sweep a
+week rather than one a day and the daily ladder runs once, not every week; a cluster the script graded
 ``unknown`` counts as graded, since that is a verdict with its reason in the
 table; "not read" is a cluster whose kubectl read failed (the script lists it
 under ``errors`` and grades it ``unknown``) or that the run returned nothing
@@ -224,7 +225,12 @@ UNKNOWN_COUNT = ", {count} unknown"
 UNREAD_COUNT = ", {count} not read"
 READS_FAILED_DETAIL = "their kubectl read failed or the run returned nothing for them"
 UNGRADED_ATTEMPTS_BEFORE_WEEKLY = 3
-UNGRADED_PARKED_DETAIL = "{detail}; not graded on {attempts} consecutive days, next attempt at the weekly refresh"
+UNGRADED_PARKED_LINE = (
+    "{prefix}: {reason} {version}, {pending} cluster(s) pending ({names}): none graded ({detail}); "
+    "not graded on {attempts} consecutive attempt(s); report on the gateway pod at {path}; next attempt at the weekly refresh"
+)
+PARKED_KEY = "parked"
+PROJECT_FAILURES_SUFFIX = "; {failures}"
 PROJECT_RUN_FAILED_DETAIL = "readiness run for {project} failed: {error}"
 TIMED_OUT_DETAIL = "the sandbox run timed out after {seconds}s"
 DRY_RUN_WOULD_REPORT = "dry run: would report {version} ({reason}) for {names}"
@@ -495,7 +501,10 @@ def announced_shape_ok(block: object) -> bool:
     if not isinstance(ungraded, dict):
         return False
     return all(
-        isinstance(entry, dict) and isinstance(entry.get(DETAIL_KEY), str) and isinstance(entry.get(ATTEMPTS_KEY), int)
+        isinstance(entry, dict)
+        and isinstance(entry.get(DETAIL_KEY), str)
+        and isinstance(entry.get(ATTEMPTS_KEY), int)
+        and isinstance(entry.get(PARKED_KEY, False), bool)
         for entry in ungraded.values()
     )
 
@@ -543,20 +552,30 @@ def readiness_verdicts(report: dict, clusters: list[str]) -> tuple[list[str], li
     """The blocked, ready, unknown and unread clusters among ``clusters``, by
     member key. ``unknown`` is a verdict the script gave (an exclusion or a pool
     it could not decide) and counts as graded; ``unread`` is a cluster the run
-    returned no member for, or one whose kubectl read the report lists under
-    ``errors`` and that the script graded ``unknown`` for want of that read. A
+    returned no member for, one whose kubectl read the report lists under
+    ``errors`` and that the script graded ``unknown`` for want of that read, or
+    one graded ``unknown`` in a location whose ``get-server-config`` failed (an
+    ``errors`` entry with a location and no cluster), which left it no target. A
     ``blocked`` verdict stands whatever the kubectl read did: the script grades
     a covering exclusion or blocking skew from cluster metadata and says a
     definite blocker beats an unknown."""
     wanted = set(clusters)
-    failed_reads = {member_key(error) for error in report.get(ERRORS_KEY) or [] if error.get(MEMBER_ID_KEYS[-1])}
+    errors = report.get(ERRORS_KEY) or []
+    failed_reads = {member_key(error) for error in errors if error.get(MEMBER_ID_KEYS[-1])}
+    failed_locations = {
+        (error.get(MEMBER_ID_KEYS[0]), error.get(MEMBER_ID_KEYS[1]))
+        for error in errors
+        if error.get(MEMBER_ID_KEYS[1]) and not error.get(MEMBER_ID_KEYS[-1])
+    }
     buckets: dict[str, list[str]] = {READINESS_BLOCKED: [], READINESS_READY: [], READINESS_UNKNOWN: []}
     for member in report.get(MEMBERS_KEY) or []:
         key = member_key(member)
         if key not in wanted:
             continue
         status = (member.get(READINESS_KEY) or {}).get(STATUS_KEY)
-        if key in failed_reads and status != READINESS_BLOCKED:
+        location = (member.get(MEMBER_ID_KEYS[0]), member.get(MEMBER_ID_KEYS[1]))
+        read_failed = key in failed_reads or (location in failed_locations and status == READINESS_UNKNOWN)
+        if read_failed and status != READINESS_BLOCKED:
             continue
         if status in buckets:
             buckets[status].append(key)
@@ -586,6 +605,8 @@ def readiness_by_project(pending: dict[str, list[str]], due: dict[str, str]) -> 
         merged[ENVELOPE_TABLES_KEY] += envelope.get(ENVELOPE_TABLES_KEY, "")
         merged[ENVELOPE_REPORT_KEY][MEMBERS_KEY] += envelope[ENVELOPE_REPORT_KEY].get(MEMBERS_KEY) or []
         merged[ENVELOPE_REPORT_KEY][ERRORS_KEY] += envelope[ENVELOPE_REPORT_KEY].get(ERRORS_KEY) or []
+    for project, error in failures.items():
+        merged[ENVELOPE_REPORT_KEY][ERRORS_KEY].append({MEMBER_ID_KEYS[0]: project, MESSAGE_KEY: PROJECT_RUN_FAILED_DETAIL.format(project=project, error=error)})
     return merged, failures
 
 
@@ -697,26 +718,32 @@ def tick(dry_run: bool = False) -> list[str]:
             except OSError as exc:
                 raise WriteFailed(str(exc)) from exc
             blocked, ready, unknown, unread = readiness_verdicts(readiness[ENVELOPE_REPORT_KEY], clusters)
+            failed_projects = sorted({project_of(k) for k in clusters} & set(failures))
+            failure_text = "; ".join(PROJECT_RUN_FAILED_DETAIL.format(project=p, error=failures[p]) for p in failed_projects)
             if not blocked and not ready and not unknown:
-                failed_projects = sorted({project_of(k) for k in clusters} & set(failures))
-                detail = "; ".join(PROJECT_RUN_FAILED_DETAIL.format(project=p, error=failures[p]) for p in failed_projects) or READS_FAILED_DETAIL
+                detail = failure_text or READS_FAILED_DETAIL
                 ungraded_announced = announced(ledger).setdefault(ANNOUNCED_UNGRADED_KEY, {})
                 previous = ungraded_announced.get(version) or {}
                 attempts = (previous.get(ATTEMPTS_KEY) or 0) + 1
-                parked = attempts >= UNGRADED_ATTEMPTS_BEFORE_WEEKLY
-                shown = UNGRADED_PARKED_DETAIL.format(detail=detail, attempts=attempts) if parked else detail
-                if previous.get(DETAIL_KEY) != detail or parked:
+                # Once parked, a version stays on the weekly cadence until graded:
+                # the ladder of daily retries runs once, not once a week.
+                parked = previous.get(PARKED_KEY, False) or attempts >= UNGRADED_ATTEMPTS_BEFORE_WEEKLY
+                if parked:
+                    lines.append(
+                        UNGRADED_PARKED_LINE.format(
+                            prefix=LINE_PREFIX, reason=reason, version=version, pending=len(clusters),
+                            names=cluster_names(clusters), detail=detail, attempts=attempts, path=path,
+                        )
+                    )
+                    ledger[TARGETS_KEY][version][LAST_REPORT_KEY] = iso(now)
+                elif previous.get(DETAIL_KEY) != detail:
                     lines.append(
                         UNGRADED_LINE.format(
                             prefix=LINE_PREFIX, reason=reason, version=version, pending=len(clusters),
-                            names=cluster_names(clusters), detail=shown, path=path,
+                            names=cluster_names(clusters), detail=detail, path=path,
                         )
                     )
-                if parked:
-                    ledger[TARGETS_KEY][version][LAST_REPORT_KEY] = iso(now)
-                    ungraded_announced.pop(version, None)
-                else:
-                    ungraded_announced[version] = {DETAIL_KEY: detail, ATTEMPTS_KEY: attempts}
+                ungraded_announced[version] = {DETAIL_KEY: detail, ATTEMPTS_KEY: attempts, PARKED_KEY: parked}
                 continue
             announced(ledger).get(ANNOUNCED_UNGRADED_KEY, {}).pop(version, None)
             ledger[TARGETS_KEY][version][LAST_REPORT_KEY] = iso(now)
@@ -735,7 +762,10 @@ def tick(dry_run: bool = False) -> list[str]:
                     path=path,
                     next_date=(now + timedelta(days=days)).strftime(DATE_FORMAT),
                 )
+                + (PROJECT_FAILURES_SUFFIX.format(failures=failure_text) if failure_text else "")
             )
+    for version in retired:
+        announced(ledger).get(ANNOUNCED_UNGRADED_KEY, {}).pop(version, None)
     ledger[LAST_TICK_KEY] = iso(now)
     try:
         save_ledger(ledger_path, ledger)
