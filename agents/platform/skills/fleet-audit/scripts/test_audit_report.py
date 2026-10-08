@@ -8845,15 +8845,12 @@ class TestAiSecurityAuditStream(BaseTestCase):
         # into `checks_not_applicable` would not even reach this line.
         self.assertIn("is now clean", self.out)
 
-    def test_the_whole_roster_excused_as_not_applicable_publishes_nothing(self):
-        """The shape the SOP used to prescribe, and the validator refuses.
-
-        `checks_not_applicable` does not satisfy the empty-`checks_run` rule —
-        only a `limitations` note does, and a `limitations` note would pin the
-        daily stream at `partial: true` forever. So there is no way to write
-        this document that both validates and closes the ledger, which is why
-        the SOP has to send model-free clusters down the `checks_run` path.
-        """
+    def test_the_whole_roster_excused_without_a_collector_publishes_nothing(self):
+        """With no collector to corroborate them (this class runs with
+        `COLLECTOR_AUDITS` empty), declarations of inapplicability do not
+        satisfy the empty-`checks_run` rule: that would be a command-free
+        all-clear. The SOP sends model-free clusters down the `checks_run`
+        path, because there the checks did run."""
         excused = {
             "name": "prod-us-east",
             "location": "us-east1",
@@ -13069,6 +13066,61 @@ class TestChecksRun(unittest.TestCase):
         self.assertEqual(audit_report.validate_findings(doc, AUDIT), doc)
         self.assertTrue(audit_report.coverage_gaps(doc))
 
+    NA_REASON = "nothing of the kind this check reads exists on this target, so there is nothing for it to evaluate"
+
+    def test_a_target_with_every_check_inapplicable_is_accounted_for(self):
+        """Every check named with its reason is not a silent zero: accepted with
+        no limitations note, and no coverage gap holds the run partial."""
+        roster = audit_report.audit_target_checks(AUDIT, "prod-us-east")
+        doc = make_doc(
+            findings=[],
+            clusters=[
+                self._cluster(
+                    checks_run=[],
+                    checks_not_applicable=[{"check": c, "reason": self.NA_REASON} for c in roster],
+                )
+            ],
+        )
+        self.assertEqual(audit_report.validate_findings(doc, AUDIT), doc)
+        self.assertEqual(audit_report.coverage_gaps(doc), [])
+
+    def test_every_check_inapplicable_needs_a_collector_stream(self):
+        stream = "gcp-networking-fabric-audit"
+        self.assertNotIn(stream, audit_report.COLLECTOR_AUDITS)
+        roster = audit_report.audit_target_checks(stream, "project/acme-prod")
+        doc = make_doc(
+            audit=stream,
+            findings=[],
+            clusters=[
+                {
+                    "name": "project/acme-prod",
+                    "location": "global",
+                    "project": "acme-prod",
+                    "checks_run": [],
+                    "checks_not_applicable": [{"check": c, "reason": self.NA_REASON} for c in roster],
+                }
+            ],
+        )
+        with self.assertRaises(audit_report.ValidationError) as exc:
+            audit_report.validate_findings(doc, stream)
+        self.assertIn("checks_run: empty", str(exc.exception))
+        self.assertIn("runs no collector", str(exc.exception))
+        self.assertNotIn("needs nothing more", str(exc.exception))
+
+    def test_a_target_with_some_checks_inapplicable_and_none_run_is_rejected(self):
+        roster = audit_report.audit_target_checks(AUDIT, "prod-us-east")
+        doc = make_doc(
+            clusters=[
+                self._cluster(
+                    checks_run=[],
+                    checks_not_applicable=[{"check": c, "reason": self.NA_REASON} for c in roster[1:]],
+                )
+            ],
+        )
+        with self.assertRaises(audit_report.ValidationError) as exc:
+            audit_report.validate_findings(doc, AUDIT)
+        self.assertIn("scope.clusters[0].checks_run", str(exc.exception))
+
     def test_checks_run_of_the_wrong_type_is_rejected(self):
         doc = make_doc(clusters=[self._cluster(checks_run="privileged-container")])
         with self.assertRaises(audit_report.ValidationError) as exc:
@@ -16586,6 +16638,62 @@ class TestCrossCheckManifest(unittest.TestCase):
                 ]
                 audit_report.cross_check_manifest(doc, self.unreadable(outcome))
 
+    def test_an_unreadable_target_cannot_be_declared_all_inapplicable(self):
+        """Without this, a gate-failed target listed with every check in
+        `checks_not_applicable` publishes as fully covered over a read that
+        never happened."""
+        roster = audit_report.audit_target_checks(AUDIT, "prod-eu-west")
+        for outcome in ("unreachable", "gate-failed"):
+            with self.subTest(outcome=outcome):
+                doc = self.doc(["no-requests"])
+                doc["scope"]["clusters"].append(
+                    {
+                        "name": "prod-eu-west",
+                        "checks_run": [],
+                        "checks_not_applicable": [
+                            {"check": c, "reason": "nothing of this kind exists on this target"} for c in roster
+                        ],
+                    }
+                )
+                with self.assertRaises(audit_report.ValidationError) as ctx:
+                    audit_report.cross_check_manifest(doc, self.unreadable(outcome))
+                self.assertIn("declares", str(ctx.exception))
+                self.assertIn(outcome, str(ctx.exception))
+
+    def test_a_target_the_manifest_never_names_cannot_be_declared_all_inapplicable(self):
+        doc = self.doc(["no-requests"])
+        roster = audit_report.audit_target_checks(doc["audit"], "some-other-cluster")
+        doc["scope"]["clusters"].append(
+            {
+                "name": "some-other-cluster",
+                "checks_run": [],
+                "checks_not_applicable": [
+                    {"check": c, "reason": "nothing of this kind exists on this target"} for c in roster
+                ],
+            }
+        )
+        with self.assertRaises(audit_report.ValidationError) as ctx:
+            audit_report.cross_check_manifest(doc, self.manifest())
+        self.assertIn("does not name it", str(ctx.exception))
+
+    def test_an_out_of_scope_target_is_refused_as_out_of_scope(self):
+        doc = self.doc(["no-requests"])
+        roster = audit_report.audit_target_checks(doc["audit"], "prod-eu-west")
+        doc["scope"]["clusters"].append(
+            {
+                "name": "prod-eu-west",
+                "checks_run": [],
+                "checks_not_applicable": [
+                    {"check": c, "reason": "nothing of this kind exists on this target"} for c in roster
+                ],
+            }
+        )
+        manifest = self.unreadable("out-of-scope", error="not this audit's cluster")
+        with self.assertRaises(audit_report.ValidationError) as ctx:
+            audit_report.cross_check_manifest(doc, manifest)
+        self.assertIn("out of scope", str(ctx.exception))
+        self.assertNotIn("does not name it", str(ctx.exception))
+
     def test_scope_clusters_with_limitations_also_accounts_for_it(self):
         doc = self.doc(["no-requests"])
         doc["scope"]["clusters"].append(
@@ -18709,6 +18817,35 @@ class TestScopedCoverage(unittest.TestCase):
     def test_an_empty_scope_does_not_trigger_a_gap_per_kind(self):
         self.assertEqual(audit_report._unenumerated_kind_gaps(self.NETWORKING, []), [])
 
+    def test_a_gce_run_that_enumerated_no_project_reports_all_four_stranded(self):
+        """Every gce check is project-scoped, so a run with no project entry ran none.
+
+        The collector names `project/<id>` and nothing else, so a document
+        holding some other kind of target got there by the model rewriting the
+        scope rather than copying it, and no project was audited at all.
+        """
+        gaps = audit_report._unenumerated_kind_gaps(
+            "gce-compute-fleet-audit", [{"name": "prod-us-east"}]
+        )
+        self.assertEqual(len(gaps), 1, gaps)
+        self.assertIn("no project targets were audited", gaps[0])
+        for slug in audit_report.AUDITS["gce-compute-fleet-audit"].checks:
+            self.assertIn(slug, gaps[0])
+
+    def test_a_gce_project_entry_is_rated_against_the_whole_roster(self):
+        """The partition must not narrow what a `project/<id>` entry owes."""
+        spec = audit_report.AUDITS["gce-compute-fleet-audit"]
+        self.assertEqual(
+            audit_report.audit_target_checks("gce-compute-fleet-audit", "project/acme-prod"),
+            spec.checks,
+        )
+        self.assertEqual(
+            audit_report._unenumerated_kind_gaps(
+                "gce-compute-fleet-audit", [{"name": "project/acme-prod"}]
+            ),
+            [],
+        )
+
     def test_the_scope_table_rates_a_project_row_against_its_own_checks(self):
         """The rendered `Checks` column had the same scope-blind denominator."""
         out = "\n".join(
@@ -18746,14 +18883,23 @@ class TestCollectorStreamsRequireAManifest(HarnessTestCase):
         import fleet_waste
         import patch_readiness
 
+        # The GCE stream's collector ships in its own skill, beside its SOP.
+        spec = importlib.util.spec_from_file_location(
+            "compute_fleet_audit",
+            Path(__file__).resolve().parents[2] / "gce-compute-fleet-audit" / "scripts" / "compute_fleet_audit.py",
+        )
+        compute_fleet_audit = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(compute_fleet_audit)
+
         expected = set(collect.CHECK_TABLES) | {
             fleet_drift.AUDIT_ID, patch_readiness.AUDIT_ID, fleet_waste.AUDIT_NAME, fleet_stockout.AUDIT_ID,
+            compute_fleet_audit.AUDIT_ID,
         }
         self.assertEqual(set(REAL_COLLECTOR_AUDITS), expected)
         self.assertLessEqual(set(REAL_COLLECTOR_AUDITS), set(audit_report.AUDITS))
 
     def test_streams_with_no_collector_are_not_held_to_it(self):
-        for audit in ("gce-compute-fleet-audit", "gcp-networking-fabric-audit"):
+        for audit in ("gcp-networking-fabric-audit",):
             with self.subTest(audit=audit):
                 self.assertIn(audit, audit_report.AUDITS)
                 self.assertNotIn(audit, REAL_COLLECTOR_AUDITS)

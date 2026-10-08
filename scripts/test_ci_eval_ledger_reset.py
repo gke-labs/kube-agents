@@ -627,9 +627,12 @@ class CallSiteTest(unittest.TestCase):
         self.assertLess(wait, unit.index('lock_acquire "${STATE_DIR}/lock-infra"'))
         # A failed acquisition gives back the streams already held.
         self.assertIn('release_streams "${held}"', unit)
-        # Released on the infra-lock, mint-failure and repository-reset paths
-        # as well as after the run.
-        self.assertEqual(unit.count('release_streams "${streams}"'), 4)
+        # Released on the infra-lock path and after the run here, and on the
+        # mint-failure and repository-reset paths through skip_unit, which
+        # both hand it the streams.
+        self.assertEqual(unit.count('release_streams "${streams}"'), 2)
+        self.assertEqual(unit.count('skip_unit "${task}" "${name}" "${rep}" "${streams}" "${has_stack}"'), 2)
+        self.assertIn('release_streams "${streams}"', lifted("skip_unit"))
         # Before the infra lock: a stack-bearing unit waiting on its stream
         # must not hold the one tofu lane while it waits.
         infra_lock = unit.index('lock_acquire "${STATE_DIR}/lock-infra"')

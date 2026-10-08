@@ -66,6 +66,9 @@ CHANNEL = "C0KAGE"
 THREAD = "1700000000.000100"
 TEAM = "T0KAGE"
 CARD = "t_verify"
+QUIET_CARD = "t_verify_quiet"
+QUIET_TITLE = "seeded-a"
+RESULT = "1.33.4 = default"
 PLAN_TS = "1700000000.000200"
 PHRASE = "is thinking..."
 ASK = "why is <#C1|payments> slow: check /metrics"
@@ -276,6 +279,16 @@ async def _drive(module) -> None:
         raise _fail(f"the settled plan was {settled!r}")
     if adapter.calls[1] != ("setStatus", "processing") or adapter.calls[4] != ("setStatus", "closed"):
         raise _fail(f"the plan's session went {adapter.calls[1]!r} then {adapter.calls[4]!r}")
+
+    # A card that completes without a note still gets its row, showing its result.
+    adapter = _StubAdapter(module)
+    sub = {**sub, "task_id": QUIET_CARD}
+    await module.settle_row(adapter, sub, "completed", RESULT, QUIET_TITLE)
+    if [call[0] for call in adapter.calls][:1] != ["post"]:
+        raise _fail(f"a card with no note opened no row: {adapter.calls!r}")
+    task = adapter.calls[0][1][0]["tasks"][0]
+    if (task["status"], task["title"]) != ("complete", RESULT):
+        raise _fail(f"a card with no note settled as {task!r}")
     os.environ.pop(FLAG_ENV, None)
 
 

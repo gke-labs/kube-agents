@@ -1,0 +1,71 @@
+# NIGHTLY-TIER once its fixture is applied: a full audit, the same cost band
+# as the other fleet-audit cases. Until then a FIXTURE_NOT_READY entry in
+# scripts/validate_bench_cases.py, because the VM below exists in no pool
+# project yet.
+#
+# The check this case grades is `gce-startup-script-status`, GCE compute SOP
+# §2.1: a RUNNING instance whose startup script failed. The collector
+# (skills/gce-compute-fleet-audit/scripts/compute_fleet_audit.py) reads the
+# serial console of every instance that runs a startup script and flags the
+# failure line.
+#
+# Planted state: bench/tf/fleet/main.tf `google_compute_instance.startup_fail`,
+# `startup-fail-<cluster_prefix>` in the fleet's zone, whose script exits 1 on
+# every boot. It is a project-level object, not a cluster's, so there is no
+# fixtures.json role: that catalogue's probes are Kubernetes objects.
+#
+# Eval-driven development (.agents/rules/eval_driven_development.md): red on
+# main, whose markers (`startup-script exit status 1`, `Finished running
+# startup scripts with error`) are the older guest agent's; the current agent
+# prints `Script "startup-script" failed with error: exit status 1` and a plain
+# `Finished running startup scripts`, so no finding can be filed. Green once
+# the collector recognises the current line.
+#
+# Isolation class: read-only on the project; writes the ledger issue to the
+# eval GitOps repo, as every fleet-audit stream does.
+id: gce-startup-script-failure
+name: GCE compute audit files the VM whose startup script failed
+prompt: >-
+  Run the GCE compute fleet audit, following the gce-compute-fleet-audit SOP.
+expected_output: >-
+  The ledger issue carries a gce-startup-script-status finding against the
+  standalone VM whose startup script exits 1. The closing response is the
+  SOP's one line, carrying the ledger URL in full.
+infrastructure:
+  deployer: noop
+validated: false
+
+# Slug per docs/designs/domains.yaml.
+domain: fleet-audits
+
+# Who answers when this case flakes -- see bench/CONTRIBUTING.md.
+owner: maintainers
+
+verification_spec:
+  # The slug against the LEDGER's finding ids (scope: finding_ids), as
+  # consistency-no-environment-label explains: an id carries the check slug,
+  # and the rendered body's evidence table restates every roster slug on every
+  # run, so only a filed finding satisfies it. The VM's name cannot be graded
+  # there: `_shorten_id` clips an id to MAX_FINDING_ID, and the zone in
+  # `ComputeInstance/<zone>/<name>` pushes the clip into the name on every pool
+  # project. It is graded against the body instead, as `/startup-fail-`: the
+  # body also names the VM in the evidence appendix's serial-read commands
+  # and in a limitations sentence, but always after a space, while only a
+  # finding's object path (`ComputeInstance/<zone>/startup-fail-...`, in its
+  # heading and its Where: line) puts it after a slash.
+  - name: a-startup-script-finding-was-filed
+    role: objective
+    # assert, not converge: the ledger is written once, at `finish`.
+    mode: assert
+    check:
+      type: ledger_issue_contains
+      audit: gce-compute-fleet-audit
+      scope: finding_ids
+      required_phrases: ["gce-startup-script-status"]
+  - name: the-ledger-names-the-planted-vm
+    role: objective
+    mode: assert
+    check:
+      type: ledger_issue_contains
+      audit: gce-compute-fleet-audit
+      required_phrases: ["/startup-fail-"]

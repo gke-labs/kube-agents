@@ -320,6 +320,60 @@ class B1NoAgentCredentialCausesAProductionChange(unittest.TestCase):
                 )
 
 
+    def test_B1_the_slack_relay_removes_nothing_but_its_own_reaction(self) -> None:
+        """The workspace's bot token deletes and removes nothing, bar one method.
+
+        Every Slack `*.delete` and `*.remove` is refused at the relay, because
+        the token behind it is the workspace's and a deleted message or a
+        removed pin cannot be put back by sending another. `reactions.remove`
+        is the one exemption: Slack lets it take off only the calling token's
+        own reaction, which adding it again restores. The exemption is the
+        exact name, so a case variant of it is refused like the rest. The
+        verb is read after the last dot, so a name that is not dotted words
+        (`chat.delete#x`, whose fragment the URL drops) is refused before it.
+        """
+        relay = h.credential_proxy.SlackRelay.__new__(h.credential_proxy.SlackRelay)
+        forwarded: list[str] = []
+
+        class Response:
+            data = {"ok": True}
+            headers: dict[str, str] = {}
+
+        class Client:
+            def api_call(self, method, **_arguments):
+                forwarded.append(method)
+                return Response()
+
+        relay.primary_client = Client()
+        relay.clients = {}
+        for method in (
+            "reactions.remove",
+            "Reactions.Remove",
+            "reactions.REMOVE",
+            "chat.delete",
+            "files.remove",
+            "pins.remove",
+            "bookmarks.remove",
+            "stars.remove",
+            "reminders.delete",
+            "usergroups.users.remove",
+            "admin.conversations.delete",
+            "chat.delete#x",
+            "chat.delete?x",
+            "chat.delete.",
+        ):
+            try:
+                relay.api_call("T123", method, {})
+            except ValueError:
+                pass
+        self.assertEqual(["reactions.remove"], forwarded)
+        self.assertEqual(
+            frozenset({"reactions.remove"}),
+            h.credential_proxy.SLACK_REMOVE_ALLOWLIST,
+            "a second Slack remove or delete method reaches the bot token",
+        )
+
+
 class B2AssentIsHumanOrPolicy(unittest.TestCase):
     """B2: gatekeepers may block and may never approve."""
 
