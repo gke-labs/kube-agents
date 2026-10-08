@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -48,6 +49,15 @@ const (
 	// post because it is stopping. A refusal (exit 1 at the CLI), never
 	// silence: silence reads as "may have posted" and is not retried.
 	notifyStoppingRefusal = "the gateway is stopping; not posted"
+	// notifyEmptyText answers an empty request: nothing to post.
+	notifyEmptyText = "text is empty"
+	// The backoff between attempts to bind the route when the first fails
+	// (a flush that timed out on a connection that had just dialled). Run
+	// keeps trying for the life of the process: a route left unbound would
+	// answer every notify with no responders while the agent is told the
+	// route exists.
+	notifyStartRetryMin = time.Second
+	notifyStartRetryMax = 30 * time.Second
 )
 
 // notifyMentionTokens and notifyMentionElements are what blocksMention
@@ -162,6 +172,12 @@ func (s *notifierSub) Stop() {
 		s.sub.Stop()
 		s.n.mu.Lock()
 		s.n.stopping = true
+		s.n.mu.Unlock()
+		// Refuse what is queued now, not after the post in flight returns:
+		// that post can outlast the grace (one relay call per chunk), and a
+		// request still queued when the process exits gets no answer at all.
+		s.n.drainRefusing()
+		s.n.mu.Lock()
 		close(s.n.jobs)
 		s.n.mu.Unlock()
 		select {
@@ -220,6 +236,41 @@ func (n *Notifier) work() {
 	}
 }
 
+// drainRefusing answers every request still in the queue with the stopping
+// refusal. The worker may take one concurrently; it refuses it too.
+func (n *Notifier) drainRefusing() {
+	for {
+		select {
+		case job := <-n.jobs:
+			job.answer(n.refuse(notifyStoppingRefusal))
+		default:
+			return
+		}
+	}
+}
+
+// Run binds the route, retrying a failed bind with a capped backoff until it
+// succeeds or ctx ends, then holds it until ctx ends and stops it. A bind
+// that fails once is not a route that stays down for the life of the pod.
+func (n *Notifier) Run(ctx context.Context, client *lib.Client) {
+	wait := notifyStartRetryMin
+	for {
+		sub, err := n.Start(client)
+		if err == nil {
+			<-ctx.Done()
+			sub.Stop()
+			return
+		}
+		n.log.Error("chat.notify route not armed; retrying", "err", err, "in", wait)
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(wait):
+		}
+		wait = min(wait*2, notifyStartRetryMax)
+	}
+}
+
 func (n *Notifier) isStopping() bool {
 	n.mu.Lock()
 	defer n.mu.Unlock()
@@ -240,7 +291,12 @@ func (n *Notifier) validate(data []byte) (lib.NotifyRequest, *lib.NotifyReply) {
 		return refuse("request is not JSON: " + err.Error())
 	}
 	if strings.TrimSpace(req.Text) == "" {
-		return refuse("text is empty")
+		// An empty request is how the kanban notifier's stand-in probes
+		// whether the route is armed (any answer means it is), every few
+		// seconds while it has work: refused, but not worth a warning.
+		n.log.Debug("notify: empty request (route probe) answered")
+		r := lib.NotifyReply{Error: notifyEmptyText}
+		return req, &r
 	}
 	if req.Thread != "" && !n.threadOK(req.Thread) {
 		return refuse(fmt.Sprintf("thread %q is not a thread of the home channel", req.Thread))

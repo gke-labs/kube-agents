@@ -55,6 +55,19 @@ class CommandTest(unittest.TestCase):
             for text in ("- pod crashlooping", "--- Daily report", "-1 nodes down", "--thread=spaces/X/threads/Y", "-"):
                 self.assertEqual(chat_notify.command("google_chat", text)[-2:], ["--", text])
 
+    def test_a_caller_deadline_becomes_the_cli_wait(self):
+        with mock.patch.dict(os.environ, ROUTED):
+            argv = chat_notify.command("google_chat", "x", wait_seconds=12.7)
+        self.assertEqual(argv[4:6], ["--timeout", "12s"])
+
+    def test_the_kill_timeout_covers_the_cli_for_a_routed_platform_only(self):
+        with mock.patch.dict(os.environ, ROUTED):
+            self.assertEqual(chat_notify.subprocess_timeout("google_chat", 30), chat_notify.NOTIFY_SUBPROCESS_TIMEOUT_SECONDS)
+            self.assertEqual(chat_notify.subprocess_timeout("google_chat:spaces/H:spaces/H/threads/T", None),
+                             chat_notify.NOTIFY_SUBPROCESS_TIMEOUT_SECONDS)
+            self.assertEqual(chat_notify.subprocess_timeout("slack", 30), 30)
+            self.assertIsNone(chat_notify.subprocess_timeout("slack", None))
+
     def test_only_the_routed_platform_is_rerouted(self):
         with mock.patch.dict(os.environ, ROUTED):
             self.assertEqual(chat_notify.command("slack", "x")[:2], ["hermes", "send"])
@@ -135,6 +148,12 @@ class SessionKVCallersTest(unittest.TestCase):
                 mock.patch.object(self.skv.subprocess, "run", side_effect=err):
             self.assertEqual(self.skv._post_initial_alert("google_chat", "Warning"), self.skv.ALERT_SENT_WITHOUT_THREAD)
 
+    def test_the_relay_treats_exit_3_as_sent_without_a_thread(self):
+        err = subprocess.CalledProcessError(chat_notify.NOTIFY_OUTCOME_UNKNOWN, ["a2a"], stderr="no answer")
+        with mock.patch.dict(os.environ, ROUTED), \
+                mock.patch.object(self.skv.subprocess, "run", side_effect=err):
+            self.assertEqual(self.skv._send_to_chat("google_chat", "report"), self.skv.ALERT_SENT_WITHOUT_THREAD)
+
     def test_a_refusal_is_a_failure(self):
         err = subprocess.CalledProcessError(1, ["a2a"], stderr="route not armed")
         with mock.patch.dict(os.environ, ROUTED), \
@@ -183,6 +202,26 @@ class OtherCallersTest(unittest.TestCase):
         self.assertEqual(argv[:4], ["a2a", "notify", "--platform", "google_chat"])
         self.assertEqual(argv[-2:], ["--", "- the node pool is out of capacity"])
         self.assertIs(run.call_args.kwargs.get("stdin"), subprocess.DEVNULL)
+
+    def test_send_notification_reports_exit_3_as_may_have_posted(self):
+        import platform_mcp_server as mcp_server
+
+        err = subprocess.CalledProcessError(chat_notify.NOTIFY_OUTCOME_UNKNOWN, ["a2a"], stderr="no answer")
+        with mock.patch.dict(os.environ, ROUTED), \
+                mock.patch.object(mcp_server, "_run_env", return_value={}), \
+                mock.patch.object(mcp_server.subprocess, "run", side_effect=err):
+            result = mcp_server.send_notification("x", session_id="")
+        self.assertIn("may have posted", result)
+        self.assertNotIn("ERROR", result)
+
+    def test_the_reconcile_notice_waits_for_the_cli(self):
+        import cluster_agent_reconcile as rec
+
+        with mock.patch.dict(os.environ, ROUTED), \
+                mock.patch.object(rec, "enabled_chat_platforms", return_value=["google_chat"]), \
+                mock.patch.object(rec.subprocess, "run") as run:
+            rec._notify("created 1 profile(s): demo")
+        self.assertGreaterEqual(run.call_args.kwargs["timeout"], chat_notify.NOTIFY_SUBPROCESS_TIMEOUT_SECONDS)
 
     def test_the_reconcile_notice_posts_through_the_gateway(self):
         import cluster_agent_reconcile as rec

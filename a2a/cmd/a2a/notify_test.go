@@ -154,6 +154,28 @@ func TestNotifyWithNoBusIsRouteUnavailable(t *testing.T) {
 	}
 }
 
+// A refused login is a refusal, not route-unavailable: waiting will not fix it.
+func TestNotifyARefusedLoginIsNotRouteUnavailable(t *testing.T) {
+	s, err := server.NewServer(&server.Options{
+		Host: "127.0.0.1", Port: -1, NoLog: true, NoSigs: true,
+		Users: []*server.User{{Username: "agent", Password: "right"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	go s.Start()
+	if !s.ReadyForConnections(10 * time.Second) {
+		t.Fatal("nats-server not ready")
+	}
+	t.Cleanup(s.Shutdown)
+	notifyEnv(t, s.ClientURL())
+	t.Setenv("NATS_PASSWORD", "wrong")
+	err = run([]string{"notify", "--platform", "google_chat", "x"})
+	if err == nil || errors.Is(err, errNotifyRouteUnavailable) {
+		t.Errorf("err = %v, want a refusal that is not route-unavailable", err)
+	}
+}
+
 func TestNotifyRefusesAnUnknownPlatform(t *testing.T) {
 	err := run([]string{"notify", "--platform", "telegram", "x"})
 	if err == nil || !strings.Contains(err.Error(), "--platform must be one of") {

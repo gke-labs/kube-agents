@@ -47,6 +47,14 @@ type AuthorityAudience struct {
 	RosterComplete bool     `json:"rosterComplete"`
 }
 
+// AuthorityVia names the task and session on whose request the gateway
+// minted this task. Attribution, like Requester and Audience: advisory,
+// populated by the gateway only, absent on a task a human turn started.
+type AuthorityVia struct {
+	TaskID  string `json:"taskId"`
+	Session string `json:"session"`
+}
+
 // AuthorityGrants is what `grants` carries: a reference and nothing else.
 //
 // Deliberately not the tier and the scope. Putting them on the wire would let a
@@ -63,6 +71,7 @@ type AuthorityGrants struct {
 type Authority struct {
 	Requester AuthorityRequester `json:"requester"`
 	Audience  AuthorityAudience  `json:"audience"`
+	Via       *AuthorityVia      `json:"via,omitempty"`
 	Grants    json.RawMessage    `json:"grants"`
 }
 
@@ -84,6 +93,31 @@ func (a Authority) Render(ref *capability.Ref) json.RawMessage {
 		return nil
 	}
 	return data
+}
+
+// Attribution is the block without grants: what a later task minted on
+// this turn's behalf inherits. Grants are per task and minted fresh.
+func (a Authority) Attribution() json.RawMessage {
+	type attribution struct {
+		Requester AuthorityRequester `json:"requester"`
+		Audience  AuthorityAudience  `json:"audience"`
+		Via       *AuthorityVia      `json:"via,omitempty"`
+	}
+	raw, err := json.Marshal(attribution{a.Requester, a.Audience, a.Via})
+	if err != nil {
+		return nil
+	}
+	return raw
+}
+
+// AuthorityFromAttribution rebuilds a block from Attribution's output.
+func AuthorityFromAttribution(raw json.RawMessage) (Authority, error) {
+	var a Authority
+	if err := json.Unmarshal(raw, &a); err != nil {
+		return Authority{}, err
+	}
+	a.Grants = nil
+	return a, nil
 }
 
 // BuildAuthority assembles the block for one turn. principal and subject are

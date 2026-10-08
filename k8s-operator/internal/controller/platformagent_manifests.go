@@ -2889,7 +2889,7 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 			kept := extEnvs[:0]
 			for _, e := range extEnvs {
 				if e.Name == "NATS_URL" || e.Name == a2aBusUserEnv ||
-					e.Name == a2aBusTokenFileEnv || e.Name == a2aNotifyPlatformEnvVar ||
+					e.Name == a2aBusTokenFileEnv ||
 					e.Name == "NATS_USER" || e.Name == "NATS_PASSWORD" {
 					continue
 				}
@@ -2897,6 +2897,18 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 			}
 			extEnvs = kept
 		}
+		// A2A_NOTIFY_PLATFORM is dropped on every install, not only while the
+		// A2A surface is up: on a today install a plugin's value would reroute
+		// every Google Chat post from hermes send to a chat.notify route that
+		// does not exist there. The operator renders it only under next, after
+		// this merge.
+		kept := extEnvs[:0]
+		for _, e := range extEnvs {
+			if e.Name != a2aNotifyPlatformEnvVar {
+				kept = append(kept, e)
+			}
+		}
+		extEnvs = kept
 		if len(extEnvs) > 0 {
 			envVars = mergeEnvVars(envVars, extEnvs)
 		}

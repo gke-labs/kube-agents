@@ -2654,8 +2654,13 @@ def _send_to_chat(
     if threaded:
         target = f"{active_platform}:{chat_id}:{thread_id}"
     try:
+        # A deadline shorter than the CLI's own wait is passed down to it, so it
+        # answers (exit 3) before this kills it.
+        wait = None
+        if timeout is not None and chat_notify.routes(active_platform):
+            wait = max(1, timeout - chat_notify.NOTIFY_CONNECT_SECONDS)
         res = subprocess.run(
-            chat_notify.command(target, message),
+            chat_notify.command(target, message, wait_seconds=wait),
             check=True,
             capture_output=True,
             text=True,
@@ -2664,6 +2669,10 @@ def _send_to_chat(
             timeout=timeout,
         )
     except subprocess.CalledProcessError as exc:
+        if chat_notify.outcome_unknown(exc.returncode):
+            # May have posted: say so, and do not register a thread for it.
+            logger.warning(f"Relayed report to {target} got no answer in time; treating it as sent")
+            return ALERT_SENT_WITHOUT_THREAD
         logger.error(f"Failed to post relayed report to {target}. Stderr: {exc.stderr}")
         return None
     except Exception as exc:
@@ -3294,6 +3303,10 @@ def relay_cron_report(
         else:
             leg_message = truncation_notice + headline.text if headline else message
             new_thread_id = _send_to_chat(platform, leg_message, leg_chat_id, leg_thread_id)
+            if new_thread_id == ALERT_SENT_WITHOUT_THREAD:
+                # Posted (or may have): delivered, with no thread to register.
+                unthreaded.append(platform)
+                new_thread_id = None
         # The blocks leave out the report's line as the text headline does, so they lose what it loses.
         if headline and slack_audit_report.needs_fold(composed, headline.text):
             if new_thread_id:

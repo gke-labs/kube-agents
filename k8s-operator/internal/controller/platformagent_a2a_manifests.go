@@ -259,6 +259,12 @@ const (
 	// reason a2aInjectBackendEnvVar is: the pod executes model output, and
 	// what widens its fence is a property of who deployed the operator.
 	a2aSessionClusterViewEnvVar = "A2A_SESSION_CLUSTER_VIEW"
+	// The platform agent's trusted-human allowlists, handed to the gateway
+	// so a session's request to delegate to the platform agent is checked
+	// against the same lists the agent's own adapters enforce. Spelled the
+	// same in a2a/gateway/allowlist.go; the conformance suite pins it.
+	a2aTargetAllowedUsersGchatEnvVar = "A2A_TARGET_ALLOWED_USERS_GCHAT"
+	a2aTargetAllowedUsersSlackEnvVar = "A2A_TARGET_ALLOWED_USERS_SLACK"
 
 	// a2aInjectListenEnvVar is what the operator renders onto the gateway to
 	// select the backend; a2aInjectListenHost and a2aInjectPort are the
@@ -516,8 +522,8 @@ const (
 	// Secret of spec-chatops-gateway.md, "The Slack adapter", when Slack is
 	// armed, and otherwise the hand-made principal-map ConfigMap that is
 	// Discord's test table. Optional either way, which is the gateway's own
-	// rule for a missing map: it runs, and every sender drops at
-	// verification.
+	// rule for a missing map: it runs, Discord senders drop at verification,
+	// and listed Slack senders are attributed by member id.
 	a2aPrincipalMapEnvVar          = "A2A_PRINCIPAL_MAP"
 	a2aPrincipalMapDir             = "/etc/a2a/principal-map"
 	a2aPrincipalMapVolume          = "principal-map"
@@ -1118,6 +1124,41 @@ func a2aStrictEventsWriter() string {
 // here "relaxed" is the shut door.
 func a2aInjectBackendEnabled() bool {
 	return os.Getenv(a2aInjectBackendEnvVar) == "true"
+}
+
+// a2aTargetAllowlistEnv renders the CR's Chat and Slack allowlists for the
+// gateway. An absent list, or the allow-all spelling allowAllUsers accepts,
+// renders nothing: the gateway reads no var as "all authenticated users",
+// which is what the CR field promises. Any other list renders, even one that
+// is blank after trimming: the gateway reads a set-but-empty var as a list
+// with no members, so a list of blanks admits nobody, the rule #2207 set for
+// the Chat ingress list, rather than widening to everyone.
+func a2aTargetAllowlistEnv(agent *agentv1alpha1.PlatformAgent) []corev1.EnvVar {
+	integ := agent.Spec.Integration
+	if integ == nil {
+		return nil
+	}
+	join := func(ids []string, lower bool) string {
+		var out []string
+		for _, id := range ids {
+			if id = strings.TrimSpace(id); id == "" {
+				continue
+			}
+			if lower {
+				id = strings.ToLower(id)
+			}
+			out = append(out, id)
+		}
+		return strings.Join(out, ",")
+	}
+	var env []corev1.EnvVar
+	if integ.GoogleChat != nil && !allowAllUsers(integ.GoogleChat.AllowedUsers) {
+		env = append(env, corev1.EnvVar{Name: a2aTargetAllowedUsersGchatEnvVar, Value: join(integ.GoogleChat.AllowedUsers, true)})
+	}
+	if integ.Slack != nil && !allowAllUsers(integ.Slack.AllowedUsers) {
+		env = append(env, corev1.EnvVar{Name: a2aTargetAllowedUsersSlackEnvVar, Value: join(integ.Slack.AllowedUsers, false)})
+	}
+	return env
 }
 
 // a2aAgentDoorEnabled reports whether the operator was deployed with the A2A
@@ -4177,8 +4218,9 @@ func buildA2AGatewayNetworkPolicy(agent *agentv1alpha1.PlatformAgent) *networkin
 // principal-map ConfigMap, Discord's test table, which never maps a real
 // principal. The eval door's map is its own ConfigMap at its own path and is
 // not this volume. Optional either way, for the gateway's own reason: an
-// install without its table runs and drops every sender at verification,
-// visibly.
+// install without its table runs. Without Discord's table every Discord
+// sender drops at verification, visibly; without Slack's, every listed Slack
+// sender is attributed by member id, because the table is an override.
 func a2aPrincipalMapVolumeSource(agent *agentv1alpha1.PlatformAgent) corev1.Volume {
 	if a2aSlackArmed(agent) {
 		return corev1.Volume{
@@ -4328,10 +4370,11 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 			{Name: a2aSlackAppTokenEnvVar, ValueFrom: &corev1.EnvVarSource{SecretKeyRef: a2aRequiredSecretRef(slack.AppTokenSecretRef, a2aSlackAppTokenEnvVar)}},
 			// The allowed-users gate, carried on Chat's terms (see the Chat
 			// pair below): normalized the way the gateway reads it, the
-			// allow-all flag the legacy rule on the RAW list. The gateway
-			// admits a Slack sender only if this gate AND the principal map
-			// both pass, so a mapped member the CR does not allow is
-			// refused under next as under today.
+			// allow-all flag the legacy rule on the RAW list. This is the
+			// gateway's only Slack admission gate (beside refusing another
+			// workspace's member): the principal map overrides attribution,
+			// so a mapped member the CR does not allow is refused under next
+			// as under today.
 			{Name: a2aSlackAllowedUsersEnvVar, Value: strings.Join(a2aAllowlist(slack.AllowedUsers), ",")},
 			{Name: a2aSlackAllowAllUsersEnvVar, Value: strconv.FormatBool(allowAllUsers(slack.AllowedUsers))},
 		}
@@ -4480,6 +4523,7 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 	env = append(env, chatEnv...)
 	env = append(env, injectEnv...)
 	env = append(env, clusterViewEnv...)
+	env = append(env, a2aTargetAllowlistEnv(agent)...)
 
 	return &appsv1.Deployment{
 		TypeMeta:   metav1.TypeMeta{APIVersion: "apps/v1", Kind: "Deployment"},

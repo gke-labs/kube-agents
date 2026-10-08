@@ -168,31 +168,107 @@ func (g *Gateway) reapSession(ctx context.Context, rec *SessionRecord) {
 // older than AskTTL is cleared here, in the same scan that reaps — content
 // only: the task record itself, its serialization, and its detach state are
 // untouched, because this bound is about the copy's horizon, not the
-// task's lifecycle.
+// task's lifecycle. The same pass bounds the history entries' requester and
+// attribution copies by their StartedAt. A copy exactly AskTTL old is past
+// it, on both sides.
 func (g *Gateway) boundAskCopy(ctx context.Context, rec *SessionRecord) {
+	g.boundAskCopyAt(ctx, rec, time.Now())
+}
+
+// boundAskCopyAt is boundAskCopy at a given instant, so the TTL boundary is
+// testable without a sleep.
+func (g *Gateway) boundAskCopyAt(ctx context.Context, rec *SessionRecord, now time.Time) {
 	active := rec.ActiveTask
-	if active == nil || active.Ask == "" || active.SubmittedAt.IsZero() ||
-		time.Since(active.SubmittedAt) < g.cfg.AskTTL {
+	askExpired := active != nil && active.Ask != "" && !active.SubmittedAt.IsZero() &&
+		now.Sub(active.SubmittedAt) >= g.cfg.AskTTL
+	if !askExpired && !g.requesterExpired(rec, now) && !g.sessionAuthorsExpired(rec, now) {
 		return
 	}
 	l := g.lockSession(rec.Key)
 	l.Lock()
 	defer l.Unlock()
 	// Same discipline as the reap: re-check on the fresh record under the
-	// lock, and clear only the copy the scan saw expire.
+	// lock, and clear only the copies the scan saw expire.
 	fresh, err := g.reg.Get(ctx, rec.Key)
-	if err != nil || fresh == nil || fresh.ActiveTask == nil ||
-		fresh.ActiveTask.TaskID != active.TaskID || fresh.ActiveTask.Ask == "" ||
-		fresh.ActiveTask.SubmittedAt.IsZero() ||
-		time.Since(fresh.ActiveTask.SubmittedAt) < g.cfg.AskTTL {
+	if err != nil || fresh == nil {
 		return
 	}
-	fresh.ActiveTask.Ask = ""
+	changed := false
+	var askTaskID string      // the active task whose ask was cleared, if any
+	var requesterIDs []string // history entries whose requester copy was cleared
+	if askExpired && fresh.ActiveTask != nil && fresh.ActiveTask.TaskID == active.TaskID &&
+		fresh.ActiveTask.Ask != "" && !fresh.ActiveTask.SubmittedAt.IsZero() &&
+		now.Sub(fresh.ActiveTask.SubmittedAt) >= g.cfg.AskTTL {
+		fresh.ActiveTask.Ask = ""
+		askTaskID = fresh.ActiveTask.TaskID
+		changed = true
+	}
+	// The requester copy on the task history is bounded the same way: the
+	// pseudonymized requester a later child task would be checked against,
+	// the attribution it would inherit, and the request text a wake would
+	// open with, outlive nothing past the TTL. The entry
+	// itself stays; a delegation from it is refused rather than guessed.
+	for i := range fresh.Tasks {
+		ref := &fresh.Tasks[i]
+		if !ref.holdsRequesterCopy() {
+			continue
+		}
+		if ref.StartedAt.IsZero() || now.Sub(ref.StartedAt) < g.cfg.AskTTL {
+			continue
+		}
+		ref.Requester, ref.Attribution = nil, nil
+		ref.SteerAuthors, ref.SteerAuthorsOverflow = nil, false
+		ref.Request = "" // user content, the ActiveTask.Ask posture
+		requesterIDs = append(requesterIDs, ref.ID)
+		changed = true
+	}
+	// The incarnation's author set is the same kind of copy (hashed ids a
+	// delegation is checked against) and is bounded the same way, from its
+	// oldest entry. Cleared, it no longer lists everyone, so it is marked
+	// and the incarnation's delegations fail closed, as a cleared
+	// requester's do.
+	sessionAuthorsCleared := false
+	if g.sessionAuthorsExpired(fresh, now) {
+		fresh.SessionAuthors, fresh.SessionAuthorsSince = nil, time.Time{}
+		fresh.SessionAuthorsUnknown = true
+		sessionAuthorsCleared, changed = true, true
+	}
+	if !changed {
+		return
+	}
 	if err := g.reg.Put(ctx, fresh); err != nil {
 		g.log.Error("ask bound: record write failed", "session", fresh.Key, "err", err)
 		return
 	}
-	g.log.Info("ask bound: cleared an ask copy past its TTL", "session", fresh.Key, "taskId", fresh.ActiveTask.TaskID)
+	g.log.Info("ask bound: cleared copies past their TTL", "session", fresh.Key,
+		"taskId", askTaskID, "requesterTaskIds", requesterIDs, "sessionAuthors", sessionAuthorsCleared)
+}
+
+// sessionAuthorsExpired reports whether the incarnation's author set is past
+// AskTTL, counted from its oldest entry.
+func (g *Gateway) sessionAuthorsExpired(rec *SessionRecord, now time.Time) bool {
+	return len(rec.SessionAuthors) > 0 && !rec.SessionAuthorsSince.IsZero() &&
+		now.Sub(rec.SessionAuthorsSince) >= g.cfg.AskTTL
+}
+
+// holdsRequesterCopy reports whether the entry holds any of the copies the
+// ask bound ages out: the requester, its attribution, the steer authors,
+// and the request text.
+func (ref TaskRef) holdsRequesterCopy() bool {
+	return ref.Requester != nil || ref.Attribution != nil || len(ref.SteerAuthors) > 0 || ref.SteerAuthorsOverflow ||
+		ref.Request != ""
+}
+
+// requesterExpired reports whether any history entry's requester copy is
+// past AskTTL, from the scan's own view of the record.
+func (g *Gateway) requesterExpired(rec *SessionRecord, now time.Time) bool {
+	for _, ref := range rec.Tasks {
+		if ref.holdsRequesterCopy() && !ref.StartedAt.IsZero() &&
+			now.Sub(ref.StartedAt) >= g.cfg.AskTTL {
+			return true
+		}
+	}
+	return false
 }
 
 // buildRehydrationPrimer folds the context's tasks from JetStream into a

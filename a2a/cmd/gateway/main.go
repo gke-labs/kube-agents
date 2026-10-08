@@ -160,10 +160,21 @@ func realMain(ctx context.Context, log *slog.Logger) error {
 		notifier, err := gateway.NewGchatNotifier(gchat, cfg.GchatHomeChannel, log)
 		if err != nil {
 			log.Error("chat.notify route not armed", "err", err)
-		} else if sub, err := notifier.Start(client); err != nil {
-			log.Error("chat.notify route not armed", "err", err)
 		} else {
-			defer sub.Stop()
+			// Run retries a failed bind and stops the route when its
+			// context ends. This defer runs before client.Close (defers
+			// are LIFO), so every request the route accepted is answered
+			// on an open connection.
+			notifyCtx, cancelNotify := context.WithCancel(ctx)
+			notifierDone := make(chan struct{})
+			go func() {
+				defer close(notifierDone)
+				notifier.Run(notifyCtx, client)
+			}()
+			defer func() {
+				cancelNotify()
+				<-notifierDone
+			}()
 		}
 	}
 	// Slack's arm, the same way: its adapter, its home channel.

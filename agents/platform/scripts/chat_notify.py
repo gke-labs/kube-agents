@@ -37,6 +37,13 @@ HERMES_CLI = "hermes"
 # The exit status `a2a notify` uses when the gateway did not answer in time: the
 # post may or may not have landed, so a caller must not post it again.
 NOTIFY_OUTCOME_UNKNOWN = 3
+# How long `a2a notify` waits for the gateway by default (a2a/cmd/a2a/notify.go),
+# its own bound on connecting, and a margin: a caller that kills the child
+# sooner than their sum turns a post that may have landed into a failure.
+NOTIFY_WAIT_SECONDS = 60
+NOTIFY_CONNECT_SECONDS = 30
+NOTIFY_MARGIN_SECONDS = 15
+NOTIFY_SUBPROCESS_TIMEOUT_SECONDS = NOTIFY_WAIT_SECONDS + NOTIFY_CONNECT_SECONDS + NOTIFY_MARGIN_SECONDS
 # A Google Chat message name and the thread it starts: spaces/S/messages/M.M is
 # in thread spaces/S/threads/M when Hermes posted it.
 GCHAT_PLATFORM = "google_chat"
@@ -55,11 +62,27 @@ def routes(platform: str) -> bool:
     return bool(routed) and platform == routed
 
 
-def command(target: str, message: str, json_output: bool = True, hermes_bin: str = HERMES_CLI) -> list[str]:
+def subprocess_timeout(target: str, default: float | None) -> float | None:
+    """The kill timeout a caller should give the send for ``target``.
+
+    For a routed platform it is at least what `a2a notify` itself may take, so
+    the CLI answers (exit 3 on no answer) before the caller kills it. For any
+    other platform it is the caller's ``default``, None included.
+    """
+    platform = target.partition(":")[0]
+    if not routes(platform):
+        return default
+    return max(default or 0, NOTIFY_SUBPROCESS_TIMEOUT_SECONDS)
+
+
+def command(target: str, message: str, json_output: bool = True, hermes_bin: str = HERMES_CLI,
+            wait_seconds: float | None = None) -> list[str]:
     """The argv that posts ``message`` to ``target``.
 
     ``target`` is a ``hermes send --to`` target. ``json_output`` asks the
     Hermes path for ``--json``; the gateway path always answers in JSON.
+    ``wait_seconds`` bounds how long `a2a notify` waits for the gateway, for a
+    caller with a deadline shorter than the CLI's default.
     """
     platform, _, rest = target.partition(":")
     if not routes(platform):
@@ -69,6 +92,8 @@ def command(target: str, message: str, json_output: bool = True, hermes_bin: str
         return argv + ["--to", target, message]
     _chat, _, thread = rest.partition(":")
     argv = [A2A_CLI, "notify", "--platform", platform]
+    if wait_seconds is not None:
+        argv += ["--timeout", f"{max(1, int(wait_seconds))}s"]
     if thread:
         argv += ["--thread", thread]
     # "--" ends the flags: a report that opens with a bullet, a rule or a
