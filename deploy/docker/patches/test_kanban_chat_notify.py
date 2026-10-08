@@ -7,6 +7,7 @@ file runs on every pull request, where Hermes is not installed.
 import asyncio
 import enum
 import os
+import subprocess
 import sys
 import tempfile
 import types
@@ -114,6 +115,35 @@ class ResolveTest(unittest.TestCase):
             self.assertIsNone(kanban_chat_notify.resolve(runner, Platform.GOOGLE_CHAT, None))
             stand_in._route_down_until = 0.0
             self.assertIs(kanban_chat_notify.resolve(runner, Platform.GOOGLE_CHAT, None), stand_in)
+
+    def test_the_probe_decides_whether_a_routed_subscription_is_offered(self):
+        runner = _Runner()
+        with mock.patch.dict(os.environ, ROUTED):
+            stand_in = kanban_chat_notify.resolve(runner, Platform.GOOGLE_CHAT, None)  # first probe: default up
+            for returncode, offered in ((kanban_chat_notify.NOTIFY_ROUTE_UNAVAILABLE, False), (1, True)):
+                stand_in._route_down_until = 0.0
+                stand_in._probed_at = float("-inf")
+                done = subprocess.CompletedProcess([], returncode, b"", b"")
+                with mock.patch.object(kanban_chat_notify.subprocess, "run", return_value=done) as run:
+                    got = kanban_chat_notify.resolve(runner, Platform.GOOGLE_CHAT, None)
+                self.assertEqual(got is stand_in, offered, returncode)
+                self.assertEqual(run.call_args.args[0][-2:], ["--", ""])
+
+    def test_the_probe_is_cached_and_never_runs_on_the_event_loop(self):
+        runner = _Runner()
+        with mock.patch.dict(os.environ, ROUTED), \
+                mock.patch.object(kanban_chat_notify.subprocess, "run",
+                                  return_value=subprocess.CompletedProcess([], 1, b"", b"")) as run:
+            stand_in = kanban_chat_notify.resolve(runner, Platform.GOOGLE_CHAT, None)
+            kanban_chat_notify.resolve(runner, Platform.GOOGLE_CHAT, None)
+            self.assertEqual(run.call_count, 1, "a second resolve inside the TTL must not probe again")
+            stand_in._probed_at = float("-inf")
+
+            async def on_loop():
+                return kanban_chat_notify.resolve(runner, Platform.GOOGLE_CHAT, None)
+
+            self.assertIs(asyncio.run(on_loop()), stand_in)
+            self.assertEqual(run.call_count, 1, "delivery on the event loop must use the cached answer")
 
     def test_active_platforms(self):
         with mock.patch.dict(os.environ, ROUTED):

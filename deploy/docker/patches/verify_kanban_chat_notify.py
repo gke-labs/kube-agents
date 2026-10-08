@@ -132,9 +132,23 @@ def main() -> None:
         check(not asyncio.run(adapter.send("spaces/H", "x")).success, "send: exit 4 (route unavailable) is a failed send")
         check(notifier._adapter_for_subscription(runner, GCHAT, sub, None) is None,
               "route down: no adapter, so the notifier skips without spending the failure budget")
+        # The probe: an empty notify, run from the collector's thread (not the
+        # event loop). An armed gateway refuses it ("text is empty", exit 1),
+        # which reads as up; no responders (exit 4) reads as down.
         adapter._route_down_until = 0.0
+        adapter._probed_at = float("-inf")
+        log.unlink(missing_ok=True)
+        os.environ["A2A_EXIT"] = "4"
+        check(notifier._adapter_for_subscription(runner, GCHAT, sub, None) is None,
+              "probe: a route answering no responders is down before any send, so nothing is claimed or counted")
+        probe = log.read_text().splitlines() if log.exists() else []
+        check(probe == ["notify", "--platform", "google_chat", "--timeout", "5s", "--", ""],
+              f"probe: it is an empty notify ({probe})")
+        adapter._route_down_until = 0.0
+        adapter._probed_at = float("-inf")
+        os.environ["A2A_EXIT"] = "1"
         check(notifier._adapter_for_subscription(runner, GCHAT, sub, None) is adapter,
-              "route back: the stand-in answers again after the backoff")
+              "route back: a probe the gateway answers (a refusal) reads as up, and the stand-in answers again")
         log.unlink(missing_ok=True)
         os.environ["A2A_EXIT"] = "0"
         media = asyncio.run(adapter.send_document("spaces/H", "/opt/data/report.pdf", metadata={"thread_id": "spaces/H/threads/T"}))
