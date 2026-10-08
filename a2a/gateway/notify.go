@@ -211,7 +211,8 @@ type notifyJob struct {
 func (n *Notifier) reply(job notifyJob, r lib.NotifyReply) {
 	if r.MessageID == "" && r.Error != "" && !job.deadline.IsZero() && time.Now().After(job.deadline) {
 		n.log.Error("notify lost: not posted after its requester stopped waiting, which records it as possibly posted",
-			"reason", r.Error, "thread", job.req.Thread, "text", firstLine(job.req.Text, notifyLostLineMax))
+			"reason", r.Error, "thread", job.req.Thread, "conversation", job.req.Conversation,
+			"text", firstLine(job.req.Text, notifyLostLineMax))
 	}
 	job.answer(r)
 }

@@ -418,8 +418,8 @@ func gatewayIdentity(agent *agentv1alpha1.PlatformAgent, ns string) a2aIdentity 
 			"agents.hb.>",
 			"$KV.session-state.>",
 			"chat.console.*.in",
-			// Proactive posts from the agent to the home channel, one
-			// subject per backend.
+			// Proactive posts from the agent to the home channel, and a
+			// card's report back to its conversation, one subject per backend.
 			a2aNotifySubjectGchat,
 			a2aNotifySubjectSlack,
 			"_INBOX.gateway.>",
@@ -663,9 +663,11 @@ func agentIdentity(agent *agentv1alpha1.PlatformAgent, ns string) a2aIdentity {
 	}
 	publish = append(publish, a2aAgentJetStreamGrants()...)
 	// Proactive posts (alerts, cron findings, audit reports) to the chat home
-	// channel, through the gateway that holds the chat credential. Not the
+	// channel, and a kanban card's report back to the conversation it was
+	// filed in, through the gateway that holds the chat credential. Not the
 	// task plane: a notify mints no capability and starts no executor, and
-	// the gateway posts it to the home channel and nowhere else.
+	// the gateway posts it to the home channel or to a conversation it holds a
+	// live session record for, and nowhere else.
 	publish = append(publish, a2aNotifySubjectGchat, a2aNotifySubjectSlack)
 	publish = append(publish, "_INBOX."+a2aAgentBusUser+".>")
 

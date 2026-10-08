@@ -110,6 +110,8 @@ with sqlite3.connect(KV) as kv:
 HOME = TMP / "hermes-home"
 HOME.mkdir()
 os.environ["HERMES_HOME"] = str(HOME)
+# The platform the kanban notifier serves conversations on, as the operator renders it.
+os.environ["A2A_NOTIFY_CONVERSATIONS"] = "google_chat"
 from hermes_state import SessionDB  # noqa: E402
 
 _sessions = SessionDB(HOME / "state.db")

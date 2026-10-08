@@ -367,7 +367,7 @@ func New(ctx context.Context, cfg Config) (*Bridge, error) {
 		queue:       make(chan *taskRun, taskQueueCapacity),
 		replaySlots: make(chan struct{}, cfg.Concurrency),
 		apiClient:   newAPIClient(),
-		routeClient: &http.Client{},
+		routeClient: newAPIClient(),
 	}
 	b.lookAhead = b.cancelInStream
 	b.holdReplaySlot = func(release func()) { time.AfterFunc(lib.EphemeralConsumerInactiveThreshold, release) }

@@ -166,8 +166,8 @@ func runNotify(args []string) error {
 	}
 	if errors.Is(err, nats.ErrNoResponders) {
 		// Nothing subscribes on the subject, so the gateway's route is not
-		// armed (no home channel, another backend, or the gateway down).
-		// Nothing was posted.
+		// armed (another backend, a malformed home channel, or the gateway
+		// down). Nothing was posted.
 		return fmt.Errorf("notify: nothing is answering on %s; the gateway's notify route is not armed: %w",
 			subject, errNotifyRouteUnavailable)
 	}
