@@ -4,7 +4,8 @@
 The pull sweep and the seeded-fleet reconciles run on the build cluster and
 report nowhere but TestGrid. This module reads each one's latest finished build
 from the bucket they log to, gs://kube-agents-periodic-logs (`latest-build.txt`,
-then `finished.json`, then the report the job wrote, on every finished build) and turns a failed or overdue run into
+then `finished.json`, then the report the job wrote and any extra report the
+entry names, on every finished build) and turns a failed or overdue run into
 a note health.py carries and post_health.py posts once, with the job's history
 link and the report's detail: for the reconcile the projects it refused or
 could not finish, for the sweep the projects whose sweep failed and what the run
@@ -53,6 +54,9 @@ FALLBACK_BUILDS = 3
 RESULT_ABORTED = "ABORTED"
 VERDICT_FAILED = "FAILED"
 VERDICT_STALE = "STALE"
+# A passed sweep build whose GitLab report names a token that is due, dead or
+# unreadable (kube-agents#2394): the run is fine, the credential is the news.
+VERDICT_TOKEN = "TOKEN"
 # How many refused or failed projects a message names before "and N more".
 DETAIL_LIMIT = 5
 # The reconcile's artifact (hack/fleet_reconcile.py --report) and the outcomes
@@ -60,6 +64,11 @@ DETAIL_LIMIT = 5
 RECONCILE_ARTIFACT = "fleet-reconcile.json"
 # The sweep's report (hack/ci_sweep_agent_pulls.py write_report).
 SWEEP_ARTIFACT = "pull-sweep.json"
+# The sweep's GitLab pass (kube-agents#2394) writes its own report beside the
+# GitHub one; read as an extra, so the GitHub report stays what the streaks
+# and the summary are built on, and the GitLab lines ride in the detail.
+GITLAB_SWEEP_ARTIFACT = "pull-sweep-gitlab.json"
+GITLAB_KEY_TOKENS = "gitlab_tokens"
 SWEEP_KEY_CLOSED = "closed"
 SWEEP_KEY_PROJECTS = "projects"
 SWEEP_KEY_FAILED = "failed"
@@ -165,6 +174,7 @@ KEY_FINISHED_AT = "finished_at"
 KEY_PASSED = "passed"
 KEY_RESULT = "result"
 KEY_ARTIFACT = "artifact"
+KEY_EXTRA_ARTIFACTS = "extra_artifacts"
 KEY_SINCE = "since"
 KEY_VERDICT = "verdict"
 KEY_TIMESTAMP = "timestamp"
@@ -179,6 +189,11 @@ KEY_DOES = "does"
 KEY_EFFECT = "effect"
 KEY_RUNBOOK = "runbook"
 KEY_SUMMARY = "summary"
+# periodics_runs only, for a job with extra reports: True when the GitLab
+# report was read and names no token to rotate, False when it names one, None
+# when it was not read (absent, unreadable, or a failed read). What clears a
+# TOKEN note: a passed build alone says nothing about the credential.
+KEY_TOKENS_CURRENT = "tokens_current"
 # The reconcile's summary counts (hack/fleet_reconcile.py write_report).
 RECONCILE_KEY_SUMMARY = "summary"
 # The reconcile's report (hack/fleet_reconcile.py write_report).
@@ -212,9 +227,17 @@ class Periodic:
     # A failed build is a note once the job has failed this many consecutive
     # checks; FIRST_FAILURE for a job whose every run is news.
     run_alert_after: int = FIRST_FAILURE
+    # Reports the job writes beside `artifact`, read into the reading when
+    # present and absent otherwise; their lines ride in the note's detail.
+    extra_artifacts: tuple = ()
 
 
 SWEEP_DOES = "closes the pull requests the agent opened during eval runs in the pool projects' `kube-agents-evals[-<n>]-infra` repos"
+# The words a TOKEN note is built from, in place of the sweep's own.
+TOKEN_ABSENCE = "a GitLab token of the eval pool is due for rotation, or dead"
+TOKEN_PRESENCE = "the eval pool's GitLab tokens are current again"
+TOKEN_EFFECT = "rotated with overlap nothing stops; on the day it expires every GitLab eval and the sweep's GitLab pass stop until a human creates a new pair."
+TOKEN_RUNBOOK = f"{RUNBOOK_ROOT}docs/ci-pool-projects.md#56-the-gitlab-forge-evalforgegitlab"
 SWEEP_EFFECT = "pull requests a run left behind stay open until the project's next lease, whose reset closes them."
 RECONCILE_EFFECT = "drifted fixtures stay drifted, and the eval cases that assert on them fail."
 WATCHED = (
@@ -225,6 +248,7 @@ WATCHED = (
         f"runs every ten minutes and {SWEEP_DOES}", SWEEP_EFFECT,
         f"{RUNBOOK_ROOT}docs/ci-pool-projects.md#55-the-repository-reset-and-the-sweep-behind-it",
         SWEEP_RUN_ALERT_AFTER,
+        extra_artifacts=(GITLAB_SWEEP_ARTIFACT,),
     ),
     # The hourly and the weekly stay watched until the oss-test-infra change
     # retires them for the daily and the postsubmit below; a follow-up removes
@@ -396,6 +420,25 @@ def read_job(periodic: Periodic, runner=subprocess.run, log=print) -> dict | Non
                 log(f"{WARNING_PREFIX}could not read {periodic.job}'s {build}/{periodic.artifact}: {err.strip()}", file=sys.stderr)
                 if not reading[KEY_PASSED]:
                     return None
+        extras = {}
+        for name in periodic.extra_artifacts:
+            # Absent is a pass that did not run (not every build writes it);
+            # not an object is said in its own lines; a read that fails for
+            # another reason follows the main report's rule above: a failed
+            # build's note is posted once, so it goes out whole or not yet.
+            out, err = collect._gsutil_call(["-q", "cat", f"{LOGS_ROOT}/{periodic.job}/{build}/{ARTIFACTS_DIR}/{name}"], runner=runner)
+            if out is not None:
+                try:
+                    loaded = json.loads(out)
+                except ValueError:
+                    loaded = None
+                extras[name] = loaded if isinstance(loaded, dict) else {REPORT_KEY_ERROR: REPORT_UNREADABLE}
+            elif not _not_found(err):
+                log(f"{WARNING_PREFIX}could not read {periodic.job}'s {build}/{name}: {err.strip()}", file=sys.stderr)
+                if not reading[KEY_PASSED]:
+                    return None
+        if extras:
+            reading[KEY_EXTRA_ARTIFACTS] = extras
         return reading
     return None
 
@@ -526,19 +569,87 @@ def sweep_detail(artifact: dict | None) -> list[str]:
     return lines
 
 
-def detail_lines(periodic: Periodic, artifact: dict | None) -> list[str]:
+def gitlab_sweep_detail(artifact: dict | None) -> list[str]:
+    """What the sweep's GitLab report says: failed projects, every token that
+    is due, dead or unreadable, then the run's own error, each line marked as
+    the GitLab pass's."""
+    if not isinstance(artifact, dict):
+        return []
+    if artifact.get(REPORT_KEY_ERROR) == REPORT_UNREADABLE:
+        return [f"gitlab pass: {REPORT_UNREADABLE}"]
+    lines = []
+    outcomes = artifact.get(REPORT_KEY_OUTCOMES)
+    if isinstance(outcomes, dict):
+        for project in sorted(outcomes):
+            entry = outcomes[project]
+            if isinstance(entry, dict) and entry.get(REPORT_KEY_ERROR):
+                lines.append(f"gitlab {project}: {entry[REPORT_KEY_ERROR]}")
+    if len(lines) > DETAIL_LIMIT:
+        # Marked as the pass's: the thresholded detail drops a bare `and N more`.
+        lines = lines[:DETAIL_LIMIT] + [f"gitlab: and {len(lines) - DETAIL_LIMIT} more"]
+    for token in artifact.get(GITLAB_KEY_TOKENS) or []:
+        if not isinstance(token, dict):
+            continue
+        name = token.get("secret") or token.get("name") or "a GitLab token"
+        if token.get(REPORT_KEY_ERROR):
+            lines.append(f"gitlab token {name}: {token[REPORT_KEY_ERROR]}")
+        elif token.get("warn"):
+            days = token.get("days_left")
+            lines.append(f"gitlab token {name}: expires {token.get('expires_at')}" + (f", in {days} day(s)" if isinstance(days, int) else "") + "; rotate it (docs/ci-pool-projects.md 5.6)")
+    if artifact.get(SWEEP_KEY_ENDED_EARLY):
+        lines.append(f"gitlab run ended early: {artifact[SWEEP_KEY_ENDED_EARLY]}")
+    elif artifact.get(REPORT_KEY_ERROR):
+        lines.append(f"gitlab run: {artifact[REPORT_KEY_ERROR]}")
+    return lines
+
+
+def gitlab_token_lines(extras: dict | None) -> list[str]:
+    """The GitLab report's token lines alone: every token that is due, dead or
+    unreadable, as gitlab_sweep_detail words them."""
+    report = extras.get(GITLAB_SWEEP_ARTIFACT) if isinstance(extras, dict) else None
+    return [line for line in gitlab_sweep_detail(report) if line.startswith("gitlab token ")]
+
+
+def extra_lines(periodic: Periodic, extras: dict | None) -> list[str]:
+    """The extra reports' lines, in the order the periodic names them."""
+    if not isinstance(extras, dict):
+        return []
+    lines = []
+    for name in periodic.extra_artifacts:
+        if name == GITLAB_SWEEP_ARTIFACT and name in extras:
+            lines.extend(gitlab_sweep_detail(extras[name]))
+    return lines
+
+
+def detail_lines(periodic: Periodic, artifact: dict | None, extras: dict | None = None) -> list[str]:
     if periodic.artifact == SWEEP_ARTIFACT:
-        return sweep_detail(artifact)
-    return reconcile_detail(artifact)
+        return sweep_detail(artifact) + extra_lines(periodic, extras)
+    return reconcile_detail(artifact) + extra_lines(periodic, extras)
 
 
-def run_summary(periodic: Periodic, artifact: dict | None, passed: bool) -> str | None:
+def gitlab_summary(extras: dict | None) -> str | None:
+    """The GitLab pass's clause for the summary, None without its report."""
+    artifact = extras.get(GITLAB_SWEEP_ARTIFACT) if isinstance(extras, dict) else None
+    if not isinstance(artifact, dict) or not isinstance(artifact.get(SWEEP_KEY_PROJECTS), int):
+        return None
+    text = f"GitLab: closed {artifact.get(SWEEP_KEY_CLOSED) or 0} merge request(s) across {artifact[SWEEP_KEY_PROJECTS]} project(s)"
+    failed = artifact.get(SWEEP_KEY_FAILED)
+    if failed:
+        text += f", {failed} failed"
+    due = [t for t in artifact.get(GITLAB_KEY_TOKENS) or [] if isinstance(t, dict) and (t.get("warn") or t.get(REPORT_KEY_ERROR))]
+    if due:
+        text += f", {len(due)} token(s) to rotate"
+    return text
+
+
+def run_summary(periodic: Periodic, artifact: dict | None, passed: bool, extras: dict | None = None) -> str | None:
     """One clause on what the run did, from its report; None without one."""
     if not isinstance(artifact, dict):
         return None
     if artifact.get(REPORT_KEY_ERROR) == REPORT_UNREADABLE:
         return REPORT_UNREADABLE
     if periodic.artifact == SWEEP_ARTIFACT:
+        gitlab = gitlab_summary(extras)
         projects = artifact.get(SWEEP_KEY_PROJECTS)
         failed = artifact.get(SWEEP_KEY_FAILED)
         closed = artifact.get(SWEEP_KEY_CLOSED)
@@ -564,7 +675,7 @@ def run_summary(periodic: Periodic, artifact: dict | None, passed: bool) -> str 
         left = artifact.get(SWEEP_KEY_LEFT)
         if isinstance(left, int) and left > 0:
             text += f", {left} write(s) left for the next run"
-        return text
+        return f"{text}; {gitlab}" if gitlab else text
     summary = artifact.get(RECONCILE_KEY_SUMMARY)
     if not isinstance(summary, dict):
         return None
@@ -582,10 +693,19 @@ def run_summary(periodic: Periodic, artifact: dict | None, passed: bool) -> str 
     return f"the run failed after {', '.join(parts)}" if parts else "the run failed before reaching a project"
 
 
+def tokens_current(extras: dict | None) -> bool | None:
+    """Whether the GitLab report was read and names no token to rotate; None
+    when it was not read (absent, not a JSON object, or a read that failed)."""
+    report = extras.get(GITLAB_SWEEP_ARTIFACT) if isinstance(extras, dict) else None
+    if not isinstance(report, dict) or report.get(REPORT_KEY_ERROR) == REPORT_UNREADABLE:
+        return None
+    return not gitlab_token_lines(extras)
+
+
 def runs(readings: dict[str, dict], watched=WATCHED) -> dict[str, dict]:
     """What each read job's latest finished build did, for the recovery message
     and the digest's run line: `{job: {build, finished_at, passed, summary,
-    dry_run}}`."""
+    dry_run}}`, plus `tokens_current` for a job with extra reports."""
     out = {}
     for periodic in watched:
         reading = readings.get(periodic.job)
@@ -596,9 +716,11 @@ def runs(readings: dict[str, dict], watched=WATCHED) -> dict[str, dict]:
             KEY_BUILD: reading.get(KEY_BUILD),
             KEY_FINISHED_AT: reading.get(KEY_FINISHED_AT),
             KEY_PASSED: bool(reading.get(KEY_PASSED)),
-            KEY_SUMMARY: run_summary(periodic, artifact, bool(reading.get(KEY_PASSED))),
+            KEY_SUMMARY: run_summary(periodic, artifact, bool(reading.get(KEY_PASSED)), reading.get(KEY_EXTRA_ARTIFACTS)),
             KEY_DRY_RUN: bool(artifact.get(KEY_DRY_RUN)) if artifact else None,
         }
+        if periodic.extra_artifacts:
+            out[periodic.job][KEY_TOKENS_CURRENT] = tokens_current(reading.get(KEY_EXTRA_ARTIFACTS))
     return out
 
 
@@ -660,7 +782,7 @@ def _failure_text(periodic: Periodic, entry: dict) -> str:
     return f"{entry.get(REPORT_KEY_OUTCOME)} ({entry.get(REPORT_KEY_DETAIL) or 'no detail'})"
 
 
-def _thresholded_detail(periodic: Periodic, persistent: dict, artifact: dict | None) -> list[str]:
+def _thresholded_detail(periodic: Periodic, persistent: dict, artifact: dict | None, extras: dict | None = None) -> list[str]:
     """The persisting projects first with their count, then this build's other
     failed projects, capped together; then the run's own lines."""
     outcomes = (artifact or {}).get(REPORT_KEY_OUTCOMES)
@@ -674,32 +796,40 @@ def _thresholded_detail(periodic: Periodic, persistent: dict, artifact: dict | N
     if len(lines) > DETAIL_LIMIT:
         lines = lines[:DETAIL_LIMIT] + [f"and {len(lines) - DETAIL_LIMIT} more"]
     project_prefixes = tuple(f"{p}:" for p in outcomes)
-    lines.extend(line for line in detail_lines(periodic, artifact) if not line.startswith(project_prefixes) and not line.startswith("and "))
+    lines.extend(line for line in detail_lines(periodic, artifact, extras) if not line.startswith(project_prefixes) and not line.startswith("and "))
     return lines
 
 
 def assess(readings: dict[str, dict], now: datetime, prev_notes: dict | None, watched=WATCHED, streaks: dict | None = None, superseded: dict | None = None) -> dict[str, dict]:
     """The notes this tick: one per watched job whose latest finished build
-    failed, or is older than the job's stale window. `prev_notes` carries each
-    open note's `since`. With `streaks` (from streaks()), a failed build is a
-    note only once the job's consecutive failed checks reach its threshold. A
-    job with no reading writes no note and ends none."""
+    failed, or is older than the job's stale window, or passed while its
+    GitLab report names a token that is due, dead or unreadable (TOKEN: the
+    sweep stays green on a due token, so the note is the only place it is
+    said). `prev_notes` carries each open note's `since`. With `streaks`
+    (from streaks()), a failed build is a note only once the job's
+    consecutive failed checks reach its threshold. A job with no reading
+    writes no note and ends none."""
     notes = {}
     for periodic in watched:
         reading = readings.get(periodic.job)
         if not isinstance(reading, dict):
             continue
         finished_at = parse_iso(reading.get(KEY_FINISHED_AT))
+        token_lines: list[str] = []
         if finished_at is None or (periodic.stale_after is not None and now - finished_at > periodic.stale_after):
             verdict = VERDICT_STALE
         elif not reading.get(KEY_PASSED):
             verdict = VERDICT_FAILED
         else:
-            continue
+            token_lines = gitlab_token_lines(reading.get(KEY_EXTRA_ARTIFACTS)) if periodic.extra_artifacts else []
+            if not token_lines:
+                continue
+            verdict = VERDICT_TOKEN
         if verdict == VERDICT_FAILED and periodic.job in (superseded if superseded is not None else superseded_jobs(readings)):
             continue
         before = (prev_notes or {}).get(periodic.job) or {}
         artifact = reading.get(KEY_ARTIFACT) if isinstance(reading.get(KEY_ARTIFACT), dict) else None
+        extras = reading.get(KEY_EXTRA_ARTIFACTS) if isinstance(reading.get(KEY_EXTRA_ARTIFACTS), dict) else None
         persistent = {}
         if verdict == VERDICT_FAILED and streaks is not None:
             streak = streaks.get(periodic.job) or {}
@@ -718,14 +848,15 @@ def assess(readings: dict[str, dict], now: datetime, prev_notes: dict | None, wa
             KEY_DRY_RUN: bool(artifact.get(KEY_DRY_RUN)) if artifact else None,
             # A job whose first failure is news keeps the report's own lines; a
             # thresholded job leads with the projects that keep failing.
-            KEY_DETAIL: (_thresholded_detail(periodic, persistent, artifact) if periodic.run_alert_after > FIRST_FAILURE else detail_lines(periodic, artifact)) if verdict == VERDICT_FAILED else [],
-            KEY_SUMMARY: run_summary(periodic, artifact, bool(reading.get(KEY_PASSED))) if verdict == VERDICT_FAILED else None,
+            KEY_DETAIL: token_lines if verdict == VERDICT_TOKEN else ((_thresholded_detail(periodic, persistent, artifact, extras) if periodic.run_alert_after > FIRST_FAILURE else detail_lines(periodic, artifact, extras)) if verdict == VERDICT_FAILED else []),
+            KEY_SUMMARY: f"the run passed; {len(token_lines)} token(s) to rotate" if verdict == VERDICT_TOKEN else (run_summary(periodic, artifact, bool(reading.get(KEY_PASSED)), extras) if verdict == VERDICT_FAILED else None),
             KEY_HISTORY_URL: history_url(periodic.job),
             KEY_PLACE: periodic.place,
-            KEY_ABSENCE: periodic.absence,
+            # A TOKEN note is about the credential, not the sweep: its words say so.
+            KEY_ABSENCE: TOKEN_ABSENCE if verdict == VERDICT_TOKEN else periodic.absence,
             KEY_DOES: periodic.does,
-            KEY_EFFECT: periodic.effect,
-            KEY_RUNBOOK: periodic.runbook,
+            KEY_EFFECT: TOKEN_EFFECT if verdict == VERDICT_TOKEN else periodic.effect,
+            KEY_RUNBOOK: TOKEN_RUNBOOK if verdict == VERDICT_TOKEN else periodic.runbook,
         }
     return notes
 
@@ -872,6 +1003,8 @@ def evidence(note: dict) -> str:
             return f"{note[KEY_LABEL]}: build {note[KEY_BUILD]} finished at a time its finished.json does not give, so {window}"
         return f"{note[KEY_LABEL]}: no finished run since {note[KEY_FINISHED_AT]} ({note[KEY_JOB]} has finished nothing in {note[KEY_STALE_AFTER_H]}h)"
     detail = f": {'; '.join(note[KEY_DETAIL])}" if note.get(KEY_DETAIL) else ""
+    if note[KEY_VERDICT] == VERDICT_TOKEN:
+        return f"{note[KEY_LABEL]}: build {note[KEY_BUILD]} passed at {note[KEY_FINISHED_AT]}{detail}"
     return f"{note[KEY_LABEL]}: build {note[KEY_BUILD]} failed at {note[KEY_FINISHED_AT]}{detail}"
 
 

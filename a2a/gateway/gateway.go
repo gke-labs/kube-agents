@@ -1037,6 +1037,7 @@ func (g *Gateway) healActiveTask(ctx context.Context, rec *SessionRecord) {
 				}
 			}
 		}
+		g.logTaskTerminal(rec, addressee, active.TaskID, task.State, source, finalMessageText(task))
 		// Under the chain's root, and not at all for a child: its result
 		// is the wake's to digest, not the root's deliverable, and the
 		// root's end comes from the wake below or, with no wake, from
@@ -1056,6 +1057,7 @@ func (g *Gateway) healActiveTask(ctx context.Context, rec *SessionRecord) {
 		// failed answer decides whether a run is the agent's fault or
 		// the install's. Nothing is published: as handleInbound's comment
 		// says, age is not evidence.
+		g.logTaskTerminal(rec, addressee, active.TaskID, lib.StateFailed, TerminalNeverStarted, "")
 		g.observeEnded(rec, active.TaskID, lib.StateFailed, TerminalNeverStarted, "")
 		healed, healedSource = true, TerminalNeverStarted
 	}
@@ -1682,6 +1684,39 @@ func (g *Gateway) observeTaskTerminal(conversation, taskID string, state lib.Tas
 	}
 }
 
+// logTaskTerminal logs a task's terminal, at each place one is handled: the
+// relay's, the heal's (a final the relay missed, a task no executor took)
+// and the gateway's own for a submission that never reached the bus. The
+// line is the outcome side of "ingress": the same keys, so one task's two
+// ends join on taskId. It is logged by the task's own id, for every task
+// that wrote an ingress line - a delegated child and a wake included - and
+// not from observeTaskTerminal, which names a chain by its root and is
+// called only for the task whose end is the chain's (observedAs). The
+// addressee is the one the task was published to, which is what ingress
+// logged; after a Delegate re-home rec.Addressee is not it, so each caller
+// passes the one it holds. Chat already showed the user the reason; the log
+// keeps only its token (reasonToken), so a failing install's log says how
+// each task ended without copying executor output into it.
+//
+// The state and reason are the ones the adapter and the read route report:
+// a session turn whose delegate request minted no child ends failed with
+// the delegation reason, not on its hand-off line's `completed`
+// (SessionRecord.handOffEnd, the same guard observeEnded applies). The
+// rewrite is here rather than at each caller so no path can log the raw
+// end; it reads the record, so a caller logs after settleHandOff.
+func (g *Gateway) logTaskTerminal(rec *SessionRecord, addressee, taskID string, state lib.TaskState, source TerminalSource, reason string) {
+	if replaced, why, handOff := rec.handOffEnd(taskID, state); handOff {
+		state, reason = replaced, why
+	}
+	g.log.Info("task terminal",
+		"taskId", taskID,
+		"conversation", rec.Key,
+		"addressee", addressee,
+		"state", state,
+		"source", source,
+		"reason", reasonToken(reason))
+}
+
 // observeDelivered, observeEnded and observeCancel are the three above as a
 // task of the record is announced: under its chain's root, and only for the
 // task whose end is the chain's (SessionRecord.observedAs). A program behind
@@ -2063,7 +2098,9 @@ func (g *Gateway) startTaskWith(ctx context.Context, rec *SessionRecord, ts task
 		// stream, which would be a claim about a task the stream has never
 		// heard of. A child or a wake was never announced; its caller says
 		// what the chain's root is owed (handleDelegateRequest leaves the
-		// parent to end as itself, wakeSession ends the root).
+		// parent to end as itself, wakeSession ends the root). Every task
+		// is logged, though: each wrote its ingress line above.
+		g.logTaskTerminal(rec, rec.Addressee, taskID, lib.StateFailed, TerminalFromGateway, "")
 		if ts.Role == "" {
 			g.observeTaskTerminal(rec.Key, taskID, lib.StateFailed, TerminalFromGateway, "")
 		}

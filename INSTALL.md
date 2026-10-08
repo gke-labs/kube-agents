@@ -990,7 +990,9 @@ section describes each stage.
 ### Each morning: the scheduled audits
 
 The Platform Agent runs its fleet audits on a cron schedule in UTC, some daily and some on
-Mondays only. To list every job with its next and last run:
+Mondays only. On a new install with a GitOps repository, four of them (security, reliability, cost
+and capacity) also run once as soon as the first inventory scan finishes, or at a fallback of 90 minutes or more
+after it started if it has not, so their first results do not wait for the schedule. To list every job with its next and last run:
 
 ```bash
 kubectl exec deploy/platform-agent-gateway -n kubeagents-system -c platform-agent -- \

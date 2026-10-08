@@ -5750,7 +5750,7 @@ main() {
       if [ -n "$github_org" ] || [ -n "$github_app_id" ]; then
         print_info "GitOps interview skipped; keeping the GitOps configuration this install already records."
       else
-        print_info "GitOps repository connection skipped."
+        print_info "GitOps repository connection skipped. Scheduled fleet audits need one and fail without it."
       fi
     fi
   else

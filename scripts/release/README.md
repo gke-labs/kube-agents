@@ -88,7 +88,7 @@ The end-to-end pipeline (`.github/workflows/rc-release-pipeline.yml`) is dispatc
   - Automatically resolves the latest validated candidate (`rc_*_validated`) on `main` using `resolve_promotion_candidate.sh`.
   - **Redundant Run Skipping**: If no eligible validated candidate exists, the scheduler dispatches nothing and records the reason in its job summary via `record_promotion_scheduler_skip.sh`.
   - Dispatches `staging-promotion-pipeline.yml` using `dispatch_promotion_pipeline.sh` with the default `GITHUB_TOKEN` and `actions: write`.
-- **Weekly GA Scheduled Cadence (`release-scheduler.yml`, weekly on Fridays at `17 5 * * 5`, best-effort)**:
+- **Weekly GA Scheduled Cadence (`release-scheduler.yml`, weekly on Fridays at `17 6 * * 5`, best-effort)**:
   - Automatically resolves whether an eligible candidate exists using `resolve_scheduled_release.sh` (requiring a valid `staging_<ts>_<sha>` tag and unreleased commits since the GA release the candidate descends from, while halting on major breaking changes on stable `>= 1.0.0` releases).
   - **Redundant Run Skipping**: If no eligible candidate exists or no new commits have merged, the scheduler dispatches nothing and records why in its job summary via `record_release_scheduler_skip.sh`.
   - Dispatches `release-publish.yml` using `dispatch_release_pipeline.sh` (`-f schedule_gate=evaluate`) with the default `GITHUB_TOKEN` and `actions: write`.
@@ -518,7 +518,7 @@ line somewhere else, put it back first.
 ### Scheduled execution & testing the gate
 
 **Scheduled execution is owned by `.github/workflows/release-scheduler.yml` via the decoupled
-trigger pattern (`cron: "17 5 * * 5"`), while `release-publish.yml` remains dispatch-only.** The gate
+trigger pattern (`cron: "17 6 * * 5"`), while `release-publish.yml` remains dispatch-only.** The gate
 reads the staging tag produced by `staging-promotion-pipeline.yml` (dispatched by `staging-promotion-scheduler.yml`).
 The activation ladder progresses in order:
 
@@ -543,14 +543,15 @@ The activation ladder progresses in order:
    bump minor under SemVer 2.0 Clause 4 (`0.4.0 -> 0.5.0`) and release unattended.
 
 4. **Automate on weekly schedule via dedicated scheduler.** Automated execution is owned by
-   `.github/workflows/release-scheduler.yml` via the decoupled trigger pattern (`cron: "17 5 * * 5"`).
-   The schedule runs overnight from Thursday into Friday at 05:17 UTC. It was picked to sit after
-   the staging promotion pipeline has finished and no longer does: the pipeline starts at 02:17 and
-   now waits on the release-candidate eval between its matrix and its staging tag, a step allowed
-   345 minutes on its own, so a run that goes the distance pushes `staging_*` after 10:00 UTC. That
-   costs latency and never correctness, because the gate is a poll — a candidate promoted after
-   this tick is picked up the following week rather than missed. Moving the slot later shortens
-   that wait, and nothing breaks while it stays where it is.
+   `.github/workflows/release-scheduler.yml` via the decoupled trigger pattern (`cron: "17 6 * * 5"`).
+   The schedule runs overnight from Thursday into Friday at 06:17 UTC so typical nightly staging
+   promotion runs (`02:17 UTC` scheduled, `02:40–03:10 UTC` actual start, `05:28–05:59 UTC`
+   completion) finish pushing `staging_*` before the Friday release evaluation runs. Because the
+   pipeline waits on the release-candidate eval between its matrix and its staging tag (a step
+   allowed up to 345 minutes on its own), an unusually slow run that goes the full timeout distance
+   can still push `staging_*` after 06:17 UTC; that costs latency and never correctness, because the
+   gate is a poll — a candidate promoted after this tick is picked up the following week rather than
+   missed.
 
 Two things to know about a weekly cadence, neither of them a reason to change it. A Friday that
 produces nothing costs a full week, because there is no rate limiter inside the resolver to buy the

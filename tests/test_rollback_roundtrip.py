@@ -1364,7 +1364,14 @@ class CiEvalWiringTest(unittest.TestCase):
                 result, _ = self.run_wiring(mode_next="1", script_status=status)
                 out = result.stdout
                 self.assertIn("COLLECT_DIAG --keep-watch prefix=\n", out)
-                self.assertLess(out.index("stub ran"), out.index("COLLECT_DIAG  prefix=rollback-"))
+                # The child's line is checked for presence only: it reaches
+                # stdout through an un-waited `tee` process substitution, so it
+                # can land after the collect call (the same race as #2626).
+                self.assertIn("stub ran", out)
+                # The snapshot comes after the round trip: the function's own
+                # closing line, printed after its wait, precedes it. Both are
+                # the parent's, so this order is fixed.
+                self.assertLess(out.index("report-only, so the eval verdict"), out.index("COLLECT_DIAG  prefix=rollback-"))
 
     def test_a_run_too_late_for_its_bound_is_skipped(self) -> None:
         result, artifacts = self.run_wiring(mode_next="1", elapsed=16000)
@@ -1436,8 +1443,13 @@ class CiEvalWiringTest(unittest.TestCase):
             root = pathlib.Path(tmp)
             (root / "artifacts").mkdir()
             started = root / "started"
+            # The stub's trap marks its own finish in a file, not only on the
+            # pipe: its echo goes through the un-waited `tee`, so only the
+            # marker says when it ran. The sleep makes it finish well after a
+            # parent that did not wait for it would already have exited.
+            done = root / "child-done"
             (root / "rollback-roundtrip.sh").write_text(
-                f"trap 'echo stub interrupted; exit 1' TERM\ntouch {started}\nwhile :; do sleep 1 & wait $!; done\n"
+                f"trap 'sleep 1; touch {done}; echo stub interrupted; exit 1' TERM\ntouch {started}\nwhile :; do sleep 1 & wait $!; done\n"
             )
             script = textwrap.dedent(
                 f"""\
@@ -1459,7 +1471,7 @@ class CiEvalWiringTest(unittest.TestCase):
                   echo "DIAG $* prefix=${{AGENT_DIAG_PREFIX:-}}"
                 }}
                 timeout() {{ shift 2; exec "$@"; }}
-                trap 'echo EXIT TRAP RAN; collect_agent_pod_diagnostics' EXIT
+                trap 'echo EXIT TRAP RAN; if [ -e {done} ]; then echo CHILD DONE BEFORE EXIT=yes; else echo CHILD DONE BEFORE EXIT=no; fi; collect_agent_pod_diagnostics' EXIT
                 trap 'exit 143' TERM INT
                 {ci_eval_function("job_started_epoch")}
                 {ci_eval_function("run_rollback_roundtrip")}
@@ -1480,8 +1492,16 @@ class CiEvalWiringTest(unittest.TestCase):
         self.assertIn("stub interrupted", out)
         self.assertIn("EXIT TRAP RAN", out)
         self.assertNotIn("NOT REACHED", out)
-        # The deadline's exit still takes the round trip's own snapshot.
-        self.assertLess(out.index("stub interrupted"), out.index("DIAG  prefix=rollback-"))
+        # The TERM trap waits for the round trip before exiting, so the EXIT
+        # trap runs after the child's own trap has finished. Both this line and
+        # the snapshot below are the parent's, so their order is fixed; the
+        # child's `stub interrupted` reaches the pipe through the `tee` process
+        # substitution, which nothing waits for, so it is checked for presence
+        # only (#2626).
+        self.assertIn("CHILD DONE BEFORE EXIT=yes", out)
+        # The deadline's exit still takes the round trip's own snapshot, and
+        # takes it in the EXIT trap, after the child is done.
+        self.assertLess(out.index("CHILD DONE BEFORE EXIT=yes"), out.index("DIAG  prefix=rollback-"))
 
     def test_the_function_never_assigns_the_suite_status(self) -> None:
         self.assertNotIn("SUITE_STATUS", ci_eval_function("run_rollback_roundtrip"))

@@ -140,7 +140,6 @@ class LedgerRefTest(unittest.TestCase):
             with self.subTest(text=text[:16]):
                 start = time.monotonic()
                 self.assertIsNone(sar.ledger_ref(text))
-                sar.needs_fold(text, "")
                 self.assertLess(time.monotonic() - start, FAST_SECONDS)
         start = time.monotonic()
         self.assertIsNone(sar.ledger_ref("[" * LONG_INPUT))
@@ -236,7 +235,7 @@ class HeadlineFromIssueTest(unittest.TestCase):
         self.assertTrue(row.endswith(sar.NEW_TAG), row[-20:])
 
     def test_the_relayed_line_is_not_on_the_card(self):
-        # It goes in the thread instead (needs_fold), so "1 resolved" is not said twice here.
+        # Nor is it posted under the card: the ledger issue holds the rest.
         self.assertNotIn("resolved", sar.headline_from_issue(ISSUE, REF, REPORT))
 
     def test_no_critical_findings_lead_with_the_most_severe_present(self):
@@ -603,7 +602,6 @@ class HeadlineFromIssueTest(unittest.TestCase):
                 ]
                 for text in texts:
                     self.assertNotIn("evil.example", text)
-                self.assertTrue(sar.needs_fold(report, texts[0]))
 
     def test_a_nested_link_in_a_title_leaves_no_link_behind(self):
         for title in ("[[y](@U2)](!channel)", "[[[z](#C1)](@U2)](!here)", "<!channel|[y](@U2)>"):
@@ -857,40 +855,30 @@ class BalancedClipTest(unittest.TestCase):
         self.assertEqual(sar._balanced_clip(title, sar.FINDING_ROW_MAX), title)
 
 
-class NeedsFoldTest(unittest.TestCase):
-    def test_a_line_shown_whole_is_not_folded(self):
+class LedgerLinkTest(unittest.TestCase):
+    """Nothing posts the report under its headline, so every headline must link the ledger itself."""
+
+    def test_every_headline_links_the_ledger(self):
         report = f"{LINE} — {LEDGER}"
-        self.assertFalse(sar.needs_fold(report, sar.headline_fallback(report, REF)))
+        link = sar.LEDGER_LINK.format(number=REF.number, url=REF.url)
+        closed = dict(ISSUE, state="closed")
+        for name, text in (
+            ("card", sar.headline_from_issue(ISSUE, REF, report)),
+            ("clean", sar.headline_from_issue(closed, REF, f"Ledger: {LEDGER}")),
+            ("fallback", sar.headline_fallback(report, REF)),
+        ):
+            with self.subTest(name=name):
+                self.assertIn(link, text)
 
-    def test_the_card_leaves_the_line_for_the_thread(self):
-        report = f"{LINE} — {LEDGER}"
-        self.assertTrue(sar.needs_fold(report, sar.headline_from_issue(ISSUE, REF, report)))
-
-    def test_a_line_whose_pr_links_were_flattened_is_folded(self):
-        report = f"{LINE}, remediation PRs opened: [#12](https://github.com/acme/fleet-config/pull/12) — {LEDGER}"
-        self.assertTrue(sar.needs_fold(report, sar.headline_from_issue(ISSUE, REF, report)))
-
-    def test_a_clipped_line_is_folded(self):
-        prs = ", ".join(f"https://github.com/acme/fleet-config/pull/{n}" for n in range(1230, 1236))
-        report = f"{LINE}, remediation PRs opened: {prs} — {LEDGER}"
-        self.assertTrue(sar.needs_fold(report, sar.headline_from_issue(ISSUE, REF, report)))
-        self.assertTrue(sar.needs_fold(report, sar.headline_fallback(report, REF)))
-
-    def test_emphasis_in_a_line_shown_whole_is_not_folded(self):
-        report = f"Cost audit: **2 new**, 1 resolved across `3` clusters — {LEDGER}"
-        self.assertFalse(sar.needs_fold(report, sar.headline_fallback(report, REF)))
-
-    def test_several_lines_are_folded(self):
-        report = f"Audit\n\n- a finding\n{LEDGER}"
-        self.assertTrue(sar.needs_fold(report, sar.headline_fallback(report, REF) or ""))
-
-
-class HasMoreTest(unittest.TestCase):
-    def test_one_line_has_nothing_more(self):
-        self.assertFalse(sar.has_more(REPORT + "\n"))
-
-    def test_several_lines_do(self):
-        self.assertTrue(sar.has_more(f"Audit\n\n- a finding\n{LEDGER}"))
+    def test_every_block_card_has_the_ledger_button(self):
+        closed = dict(ISSUE, state="closed")
+        for name, built in (
+            ("card", sar.blocks_from_issue(ISSUE, REF, REPORT)),
+            ("clean", sar.blocks_from_issue(closed, REF, f"Ledger: {LEDGER}")),
+        ):
+            with self.subTest(name=name):
+                blocks, _ = built
+                self.assertEqual(blocks[-1]["elements"][-1]["url"], REF.url)
 
 
 class BlocksFromIssueTest(unittest.TestCase):
