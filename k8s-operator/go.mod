@@ -3,7 +3,7 @@ module github.com/gke-labs/kube-agents/k8s-operator
 go 1.27.0
 
 require (
-	cloud.google.com/go/compute/metadata v0.9.1
+	cloud.google.com/go/compute/metadata v0.10.0
 	github.com/go-logr/logr v1.4.4
 	github.com/google/go-cmp v0.7.0
 	github.com/nats-io/nats-server/v2 v2.15.0
@@ -11,18 +11,18 @@ require (
 	github.com/nats-io/nkeys v0.4.16
 	github.com/prometheus/client_golang v1.24.1
 	github.com/prometheus/client_model v0.6.3
-	github.com/prometheus/common v0.70.1
+	github.com/prometheus/common v0.72.0
 	github.com/securego/gosec/v2 v2.29.0
 	golang.org/x/oauth2 v0.37.0
 	google.golang.org/api v0.299.0
 	gopkg.in/yaml.v3 v3.0.1
 	k8s.io/api v0.37.1
-	k8s.io/apiextensions-apiserver v0.37.0
+	k8s.io/apiextensions-apiserver v0.37.1
 	k8s.io/apimachinery v0.37.1
-	k8s.io/apiserver v0.37.0
+	k8s.io/apiserver v0.37.1
 	k8s.io/client-go v0.37.1
 	k8s.io/utils v0.0.0-20260626114624-be93311217bd
-	sigs.k8s.io/controller-runtime v0.25.1
+	sigs.k8s.io/controller-runtime v0.25.2
 	sigs.k8s.io/yaml v1.6.0
 )
 
@@ -129,7 +129,7 @@ require (
 	google.golang.org/protobuf v1.36.12 // indirect
 	gopkg.in/evanphx/json-patch.v4 v4.13.0 // indirect
 	gopkg.in/inf.v0 v0.9.1 // indirect
-	k8s.io/component-base v0.37.0 // indirect
+	k8s.io/component-base v0.37.1 // indirect
 	k8s.io/klog/v2 v2.140.0 // indirect
 	k8s.io/kube-openapi v0.0.0-20260721132016-d427ff9ee9ad // indirect
 	k8s.io/streaming v0.37.1 // indirect
