@@ -19,6 +19,7 @@ tests do not reach: acquiring one project by name.
 
 import argparse
 import importlib.util
+import hashlib
 import io
 import json
 import pathlib
@@ -63,6 +64,33 @@ REPLACE_NO_SURGE = _plan((["delete", "create"], "google_container_node_pool.no_s
 DELETE = _plan((["delete"], "google_compute_disk.orphan"))
 FORGET = _plan((["forget"], "google_compute_disk.orphan"), (["update"], "google_container_cluster.seeded_b"))
 KNOWN = {P7, P8}
+
+# The fleet tree is a hash over the stack's inputs under bench/tf/fleet as
+# `git ls-tree` lists them; the recipe is pinned here, independent of the code:
+# sha256 over the sorted input lines, docs left out.
+LS_TREE_HEAD = ["ls-tree", "-r", "--full-tree", "HEAD", "--", "bench/tf/fleet"]
+LS_TREE_FETCHED = ["ls-tree", "-r", "--full-tree", "FETCH_HEAD", "--", "bench/tf/fleet"]
+FLEET_INPUTS = {"main.tf": "aaa1", "versions.tf": "aaa2", ".terraform.lock.hcl": "aaa3", "reconcile-allow.json": "aaa4"}
+FLEET_DOCS = {"README.md": "doc1", "fixtures.json": "fix1"}
+
+
+def _fleet_lines(**blobs):
+    return sorted("100644 blob %s\tbench/tf/fleet/%s" % (sha, name) for name, sha in blobs.items())
+
+
+def _fleet_listing(**blobs):
+    return "\n".join(_fleet_lines(**blobs))
+
+
+def _fleet_hash(**inputs):
+    return hashlib.sha256("\n".join(_fleet_lines(**inputs)).encode()).hexdigest()
+
+
+FLEET_A = _fleet_listing(**FLEET_INPUTS, **FLEET_DOCS)
+FLEET_A_DOCS_MOVED = _fleet_listing(**FLEET_INPUTS, **{"README.md": "doc2", "fixtures.json": "fix2"})
+FLEET_B = _fleet_listing(**{**FLEET_INPUTS, "main.tf": "bbb1"}, **FLEET_DOCS)
+TREE_A = _fleet_hash(**FLEET_INPUTS)
+TREE_B = _fleet_hash(**{**FLEET_INPUTS, "main.tf": "bbb1"})
 
 
 class _Tofu:
@@ -701,7 +729,7 @@ class MainTest(unittest.TestCase):
         def git(args):
             if args[:1] == ["fetch"]:
                 raise boskos_pool.Terminated("signal 15")
-            return "tree-aaa" if args[1].startswith("HEAD:") else "commit-111"
+            return FLEET_A if args[:1] == ["ls-tree"] else "commit-111"
 
         boskos = _Boskos(free=[P7])
         stderr = io.StringIO()
@@ -721,9 +749,9 @@ class MainTest(unittest.TestCase):
         def git(args):
             if args[:1] == ["fetch"]:
                 return ""
-            if args[1].startswith("FETCH_HEAD:"):
-                return "tree-bbb"
-            return "tree-aaa" if args[1].startswith("HEAD:") else "commit-111"
+            if args == LS_TREE_FETCHED:
+                return FLEET_B
+            return FLEET_A if args[:1] == ["ls-tree"] else "commit-111"
 
         boskos = _Boskos(free=[P7, P8])
         stderr = io.StringIO()
@@ -737,7 +765,7 @@ class MainTest(unittest.TestCase):
         self.assertEqual(rc, reconcile.EXIT_OK, "main moved under the run; the next run takes it, nothing is wrong")
         self.assertEqual(boskos.acquired, [])
         self.assertEqual({p: v["outcome"] for p, v in doc["outcomes"].items()}, {P7: reconcile.OUTCOME_NOT_REACHED, P8: reconcile.OUTCOME_NOT_REACHED})
-        self.assertIn("tree-bbb", doc["outcomes"][P7]["detail"])
+        self.assertIn(TREE_B, doc["outcomes"][P7]["detail"])
         self.assertNotIn("visited no project", stderr.getvalue())
 
     def test_a_main_ref_without_a_remote_is_refused_by_the_parser(self):
@@ -1392,7 +1420,40 @@ class PassTest(unittest.TestCase):
 def _git_whose_fetch_fails(args):
     if args[:1] == ["fetch"]:
         raise reconcile.ReconcileError("fetch: could not resolve host")
-    return "tree-aaa" if args[1].startswith("HEAD:") else "commit-111"
+    return FLEET_A if args[:1] == ["ls-tree"] else "commit-111"
+
+
+class FleetTreeTest(unittest.TestCase):
+    """The fleet tree hashes the stack's inputs and nothing else beside them."""
+
+    def _tree(self, listing):
+        calls = []
+
+        def git(args):
+            calls.append(list(args))
+            return listing
+
+        with mock.patch.object(reconcile, "git_output", git):
+            tree = reconcile.fleet_tree("HEAD")
+        self.assertEqual(calls, [LS_TREE_HEAD])
+        return tree
+
+    def test_the_tree_is_the_pinned_hash_of_the_inputs(self):
+        self.assertEqual(self._tree(FLEET_A), TREE_A)
+        self.assertEqual(len(TREE_A), 64)
+
+    def test_docs_and_strangers_do_not_move_it_and_each_input_does(self):
+        self.assertEqual(self._tree(FLEET_A_DOCS_MOVED), TREE_A, "README.md and fixtures.json are not inputs")
+        self.assertEqual(self._tree(_fleet_listing(**FLEET_INPUTS, **FLEET_DOCS, **{"notes.txt": "n1"})), TREE_A, "an unknown file beside the stack is not an input")
+        self.assertEqual(self._tree(FLEET_B), TREE_B)
+        self.assertNotEqual(TREE_A, TREE_B)
+        for name in FLEET_INPUTS:
+            moved = _fleet_listing(**{**FLEET_INPUTS, name: "zzz"}, **FLEET_DOCS)
+            self.assertNotEqual(self._tree(moved), TREE_A, name)
+
+    def test_the_inputs_are_the_stack_its_lock_and_the_allowlist(self):
+        self.assertTrue(all(reconcile.is_fleet_input("bench/tf/fleet/" + n) for n in ("main.tf", "defects-b.tf", ".terraform.lock.hcl", "reconcile-allow.json")))
+        self.assertFalse(any(reconcile.is_fleet_input("bench/tf/fleet/" + n) for n in ("README.md", "fixtures.json", "notes.txt", "reconcile-allow.json.bak")))
 
 
 class MainMovedTest(unittest.TestCase):
@@ -1405,10 +1466,10 @@ class MainMovedTest(unittest.TestCase):
             calls.append(list(args))
             if args[:1] == ["fetch"]:
                 return ""
-            if args[:1] == ["rev-parse"] and args[1].startswith("FETCH_HEAD:"):
+            if args == LS_TREE_FETCHED:
                 return trees.pop(0) if len(trees) > 1 else trees[0]
-            if args[:1] == ["rev-parse"] and args[1] == "HEAD:bench/tf/fleet":
-                return "tree-aaa"
+            if args == LS_TREE_HEAD:
+                return FLEET_A
             if args[:1] == ["rev-parse"] and args[1] == "HEAD":
                 return "commit-111"
             raise AssertionError(args)
@@ -1417,7 +1478,7 @@ class MainMovedTest(unittest.TestCase):
         return git
 
     def test_the_run_stops_when_the_fleet_tree_on_main_moves(self):
-        git = self._git(["tree-aaa", "tree-bbb"])
+        git = self._git([FLEET_A, FLEET_B])
         boskos = _Boskos(free=[P7, P8])
         tofu = _Tofu({P7: UPDATE_ONLY, P8: UPDATE_ONLY})
         with mock.patch.object(reconcile, "git_output", git), mock.patch.object(boskos_pool.urllib.request, "urlopen", boskos), mock.patch.object(reconcile, "MAIN_CHECK_INTERVAL_SECONDS", 0):
@@ -1425,7 +1486,7 @@ class MainMovedTest(unittest.TestCase):
             outcomes = reconcile.reconcile_pool(BOSKOS, OWNER, runner=tofu, known=KNOWN, run=run)
         self.assertEqual(outcomes[P7][0], reconcile.OUTCOME_APPLIED)
         self.assertEqual(outcomes[P8][0], reconcile.OUTCOME_NOT_REACHED)
-        self.assertIn("tree-bbb", outcomes[P8][1])
+        self.assertIn(TREE_B, outcomes[P8][1])
         self.assertIn(["fetch", "--quiet", "origin", "main"], git.calls)
         self.assertFalse(any("--depth" in arg for call in git.calls for arg in call), "a depth-limited fetch would mark a full clone shallow")
         self.assertEqual(boskos.acquired, [P7])
@@ -1447,8 +1508,21 @@ class MainMovedTest(unittest.TestCase):
             doc = json.loads(report.read_text())
         self.assertEqual((doc["main_ref"], "could not resolve host" in doc["main_check_error"]), ("origin/main", True))
 
+    def test_a_docs_only_change_on_main_does_not_stop_the_run(self):
+        # README.md and fixtures.json sit beside the stack and tofu never reads
+        # them: a merge touching only them changes nothing a run applies, so it
+        # is not "main moved" and the pass goes on.
+        git = self._git([FLEET_A, FLEET_A_DOCS_MOVED])
+        boskos = _Boskos(free=[P7, P8])
+        tofu = _Tofu({P7: UPDATE_ONLY, P8: UPDATE_ONLY})
+        with mock.patch.object(reconcile, "git_output", git), mock.patch.object(boskos_pool.urllib.request, "urlopen", boskos), mock.patch.object(reconcile, "MAIN_CHECK_INTERVAL_SECONDS", 0):
+            run = reconcile.Run(main_ref="origin/main")
+            outcomes = reconcile.reconcile_pool(BOSKOS, OWNER, runner=tofu, known=KNOWN, run=run)
+        self.assertEqual({p: o for p, (o, _) in outcomes.items()}, {P7: reconcile.OUTCOME_APPLIED, P8: reconcile.OUTCOME_APPLIED})
+        self.assertFalse(run.main_moved)
+
     def test_without_a_main_ref_git_is_never_fetched(self):
-        git = self._git(["tree-aaa"])
+        git = self._git([FLEET_A])
         boskos = _Boskos(free=[P7])
         with mock.patch.object(reconcile, "git_output", git), mock.patch.object(boskos_pool.urllib.request, "urlopen", boskos):
             reconcile.reconcile_pool(BOSKOS, OWNER, runner=_Tofu({P7: UPDATE_ONLY}), known={P7}, run=reconcile.Run())
@@ -1651,8 +1725,8 @@ class ReportFieldsTest(unittest.TestCase):
     def _git(self, args):
         if args == ["rev-parse", "HEAD"]:
             return "commit-111"
-        if args == ["rev-parse", "HEAD:bench/tf/fleet"]:
-            return "tree-aaa"
+        if args == LS_TREE_HEAD:
+            return FLEET_A
         raise AssertionError(args)
 
     def test_the_report_carries_the_commit_the_tree_the_times_and_the_visited_count(self):
@@ -1670,7 +1744,7 @@ class ReportFieldsTest(unittest.TestCase):
                 rc = reconcile.main(["--all", "--workers", "1", "--report", str(report), "--boskos-server", BOSKOS, "--boskos-owner", OWNER])
             doc = json.loads(report.read_text())
         self.assertEqual(rc, reconcile.EXIT_OK)
-        self.assertEqual((doc["commit"], doc["fleet_tree"], doc["workers"], doc["build"], doc["job"]), ("commit-111", "tree-aaa", 1, "123", "post-x"))
+        self.assertEqual((doc["commit"], doc["fleet_tree"], doc["workers"], doc["build"], doc["job"]), ("commit-111", TREE_A, 1, "123", "post-x"))
         self.assertEqual((doc["visited"], doc["mapped"]), (1, 2))
         # No budget was given, so the busy project is busy, as a hand run reports it.
         self.assertEqual(doc["outcomes"][P8]["outcome"], reconcile.OUTCOME_BUSY)

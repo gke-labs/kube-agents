@@ -37,6 +37,7 @@ summary), under $ARTIFACTS when Prow sets it, for the CI health bot
 import argparse
 import atexit
 import collections
+import hashlib
 import json
 import os
 import pathlib
@@ -147,6 +148,12 @@ DEFAULT_WORKERS = 1
 WORKER_DRAIN_SECONDS = INTERRUPT_GRACE_SECONDS + 30
 WORKER_JOIN_STEP_SECONDS = 0.2
 FLEET_SUBDIR = "bench/tf/fleet"
+# The files that change what a run applies: the stack and its lock file, and
+# the allowlist the inspection reads. README.md and fixtures.json live beside
+# them and tofu never reads them, so they do not move the fleet tree: a
+# docs-only merge neither stops a running reconcile nor needs one.
+FLEET_INPUT_SUFFIXES = (".tf", ".hcl")
+FLEET_INPUT_NAMES = ("reconcile-allow.json",)
 GIT_TIMEOUT_SECONDS = 120
 # Prow's identifiers for the build, kept in the report and the markers.
 BUILD_ID_ENV = "BUILD_ID"
@@ -725,6 +732,21 @@ def _iso(epoch):
     return time.strftime(ISO_UTC_FORMAT, time.gmtime(epoch))
 
 
+def is_fleet_input(path):
+    """Whether a path under the fleet directory is one of the stack's inputs."""
+    name = path.rsplit("/", 1)[-1]
+    return name.endswith(FLEET_INPUT_SUFFIXES) or name in FLEET_INPUT_NAMES
+
+
+def fleet_tree(rev):
+    """A hash over the stack's inputs under FLEET_SUBDIR at `rev`: each input's
+    mode, blob and path from `git ls-tree`, so a change to any of them moves it
+    and a change to anything else there does not."""
+    listing = git_output(["ls-tree", "-r", "--full-tree", rev, "--", FLEET_SUBDIR])
+    lines = sorted(line for line in listing.splitlines() if "\t" in line and is_fleet_input(line.split("\t", 1)[1]))
+    return hashlib.sha256("\n".join(lines).encode()).hexdigest()
+
+
 class Run:
     """One run's budget and provenance, shared by every project it visits.
 
@@ -823,11 +845,11 @@ class Run:
         remote, _, branch = self.main_ref.partition("/")
         try:
             if self.fleet_tree is None:
-                self.fleet_tree = git_output(["rev-parse", "HEAD:%s" % FLEET_SUBDIR])
+                self.fleet_tree = fleet_tree("HEAD")
             # No --depth: a depth-limited fetch marks a full clone shallow,
             # and a hand run with this flag uses the operator's own checkout.
             git_output(["fetch", "--quiet", remote, branch])
-            current = git_output(["rev-parse", "FETCH_HEAD:%s" % FLEET_SUBDIR])
+            current = fleet_tree("FETCH_HEAD")
         except ReconcileError as exc:
             # Not knowing is not the same as having moved: the run goes on
             # and tries again at the next check, and the report says so.
@@ -1286,11 +1308,11 @@ def main(argv=None):
 def _provenance():
     """(commit, fleet tree) of the checkout; None for either git cannot answer, with a warning."""
     values = []
-    for spec in ("HEAD", "HEAD:%s" % FLEET_SUBDIR):
+    for name, read in (("commit", lambda: git_output(["rev-parse", "HEAD"])), ("fleet tree", lambda: fleet_tree("HEAD"))):
         try:
-            values.append(git_output(["rev-parse", spec]))
+            values.append(read())
         except ReconcileError as exc:
-            print("WARNING: %s; the report and the markers carry no %s" % (exc, "commit" if spec == "HEAD" else "fleet tree"), file=sys.stderr)
+            print("WARNING: %s; the report and the markers carry no %s" % (exc, name), file=sys.stderr)
             values.append(None)
     return tuple(values)
 
