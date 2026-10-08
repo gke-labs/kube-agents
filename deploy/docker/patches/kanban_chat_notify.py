@@ -39,11 +39,15 @@ or a space as a whole) is not delivered at all: posting it as a new thread in
 the home channel would move text meant for one space into another.
 
 When the route is not there (the gateway restarting, its route unarmed, the
-bus unreachable: ``a2a notify`` exit 4) the stand-in marks it down for
-:data:`ROUTE_DOWN_BACKOFF_SECONDS` and :func:`resolve` answers no adapter
-meanwhile, which is upstream's disconnected-adapter path: skipped without a
-claim and without spending the failure budget. Without the backoff a gateway
-roll would unsubscribe every card with a pending event.
+bus unreachable: ``a2a notify`` exit 4), :func:`resolve` answers no adapter,
+which is upstream's disconnected-adapter path: skipped without a claim and
+without spending the failure budget. It learns this from a probe (an empty
+notify, which an armed gateway refuses at once) that the collector's pre-claim
+authorization runs on its worker thread, at most every
+:data:`ROUTE_PROBE_TTL_SECONDS`, and from any send that meets exit 4, which
+holds the route down for :data:`ROUTE_DOWN_BACKOFF_SECONDS`. Only a send that
+races the very start of an outage can still spend one unit. Without this a
+gateway roll would unsubscribe every card with a pending event.
 
 The stand-in is never registered in ``runner.adapters``, so nothing else in the
 gateway believes the platform is connected, and it is not offered under
@@ -63,6 +67,7 @@ import asyncio
 import json
 import logging
 import os
+import subprocess
 import time
 from typing import Any, Dict, Optional
 
@@ -97,9 +102,22 @@ ROUTE_DOWN_BACKOFF_SECONDS = 60
 # rollout they are the backlog of a subscription nobody could deliver, and a
 # completion from days ago posted now is noise, a stale failure wake worse.
 STALE_EVENT_SECONDS = 6 * 3600
+# How long a route probe's answer is trusted, and how long one may take. The
+# probe is an empty notify: an armed gateway refuses it at once ("text is
+# empty"), and no responders (exit 4) means the route is not there.
+ROUTE_PROBE_TTL_SECONDS = 10
+ROUTE_PROBE_TIMEOUT_SECONDS = 5
 # The attribute the stand-in is cached under on the runner, which outlives the
 # per-tick collector and the per-delivery notification.
 RUNNER_ATTR = "_kage_chat_notify_adapter"
+
+
+def _on_event_loop() -> bool:
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return False
+    return True
 
 
 def routed_platform() -> str:
@@ -131,7 +149,7 @@ def resolve(runner: Any, platform: Any, adapter: Any, sub: Optional[dict] = None
     if stand_in is None or stand_in.platform != platform:
         stand_in = ChatNotifyAdapter(platform, runner)
         setattr(runner, RUNNER_ATTR, stand_in)
-    if stand_in.route_down():
+    if not stand_in.route_up():
         return None
     return stand_in
 
@@ -157,12 +175,50 @@ class ChatNotifyAdapter(BasePlatformAdapter):
     def __init__(self, platform: Platform, runner: Any) -> None:
         super().__init__(PlatformConfig(enabled=True), platform)
         self._route_down_until = 0.0
+        self._probed_at = float("-inf")
+        self._route_ok = True
         handler_factory = getattr(runner, "_primary_message_handler", None)
         if callable(handler_factory):
             self.set_message_handler(handler_factory())
 
     def route_down(self) -> bool:
         return time.monotonic() < self._route_down_until
+
+    def route_up(self) -> bool:
+        """Whether a delivery should be attempted now.
+
+        False while a send's exit 4 holds the route down. Otherwise the answer
+        of a probe, refreshed at most every ROUTE_PROBE_TTL_SECONDS and only
+        off the event loop: the collector authorizes each subscription on a
+        worker thread before it claims, so a route that is down is skipped
+        there, unclaimed and uncounted, and the first send never meets it.
+        Delivery runs on the loop and reads the last answer.
+        """
+        if self.route_down():
+            return False
+        now = time.monotonic()
+        if now - self._probed_at >= ROUTE_PROBE_TTL_SECONDS and not _on_event_loop():
+            self._probed_at = now
+            self._route_ok = self._probe()
+            if not self._route_ok:
+                self._route_down_until = now + ROUTE_DOWN_BACKOFF_SECONDS
+        return self._route_ok
+
+    def _probe(self) -> bool:
+        try:
+            done = subprocess.run(
+                [A2A_CLI, "notify", "--platform", self.platform.value,
+                 "--timeout", f"{ROUTE_PROBE_TIMEOUT_SECONDS}s", "--", ""],
+                stdin=subprocess.DEVNULL, capture_output=True,
+                timeout=ROUTE_PROBE_TIMEOUT_SECONDS + NOTIFY_CONNECT_SECONDS,
+            )
+        except Exception as exc:  # noqa: BLE001 - a probe that cannot run says nothing about the route
+            logger.warning("chat.notify: route probe could not run: %s", exc)
+            return True
+        if done.returncode == NOTIFY_ROUTE_UNAVAILABLE:
+            logger.warning("chat.notify: route unavailable; holding deliveries for %ds", ROUTE_DOWN_BACKOFF_SECONDS)
+            return False
+        return True
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         return True
