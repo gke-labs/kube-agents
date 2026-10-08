@@ -93,8 +93,8 @@ func TestNotifyFailsWhenTheGatewayPostedNothing(t *testing.T) {
 func TestNotifyTimesOutWithNoGateway(t *testing.T) {
 	s := startNotifyServer(t)
 	notifyEnv(t, s.ClientURL())
-	// No gateway at all is "no responders": refused, exit 1. Only a request
-	// that someone received and did not answer is outcome-unknown.
+	// No gateway at all is "no responders": route unavailable, exit 4. Only
+	// a request that someone received and did not answer is outcome-unknown.
 	err := run([]string{"notify", "--platform", "google_chat", "--timeout", "200ms", "x"})
 	if !errors.Is(err, errNotifyRouteUnavailable) || errors.Is(err, errNotifyOutcomeUnknown) {
 		t.Errorf("err = %v, want route-unavailable (nothing posted), not outcome-unknown", err)
@@ -232,5 +232,55 @@ func TestNotifyARefusedPublishIsARefusalNotAnUnknown(t *testing.T) {
 	}
 	if elapsed := time.Since(started); elapsed > 5*time.Second {
 		t.Errorf("took %s; a refusal should not wait out the timeout", elapsed)
+	}
+}
+
+// A refused reply subscription is caught before the request is published: the
+// gateway would otherwise post a text whose answer this client cannot hear,
+// and the caller, told "nothing was posted", would send it again.
+func TestNotifyARefusedSubscribeSendsNothing(t *testing.T) {
+	s, err := server.NewServer(&server.Options{
+		Host: "127.0.0.1", Port: -1, NoLog: true, NoSigs: true,
+		Users: []*server.User{
+			{
+				Username: "agent", Password: "pw",
+				Permissions: &server.Permissions{
+					Publish:   &server.SubjectPermission{Allow: []string{">"}},
+					Subscribe: &server.SubjectPermission{Allow: []string{">"}, Deny: []string{lib.NotifyReplyPrefix + ">"}},
+				},
+			},
+			{Username: "gateway", Password: "pw"},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	go s.Start()
+	if !s.ReadyForConnections(10 * time.Second) {
+		t.Fatal("nats-server not ready")
+	}
+	t.Cleanup(s.Shutdown)
+	gw, err := nats.Connect(s.ClientURL(), nats.UserInfo("gateway", "pw"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(gw.Close)
+	requests, err := gw.SubscribeSync(lib.NotifySubjectGchat)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := gw.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	notifyEnv(t, s.ClientURL())
+	t.Setenv("NATS_PASSWORD", "pw")
+
+	err = run([]string{"notify", "--platform", "google_chat", "--timeout", "10s", "x"})
+	if err == nil || errors.Is(err, errNotifyOutcomeUnknown) || errors.Is(err, errNotifyRouteUnavailable) ||
+		!strings.Contains(err.Error(), "nothing was sent") {
+		t.Fatalf("err = %v, want a refusal before the publish", err)
+	}
+	if msg, err := requests.NextMsg(500 * time.Millisecond); err == nil {
+		t.Fatalf("the gateway received %q; a refused subscribe must not publish", msg.Data)
 	}
 }

@@ -1,6 +1,8 @@
 // Command a2a is the topics client: read the current answer on a provisioned
 // topic, or write one. It is the reader beat 3 needs before any session pod
 // exists, and the thing the platform agent's a2a-topics skill shells out to.
+// Its `notify` command asks the A2A gateway to post a proactive message to the
+// chat backend it holds (notify.go).
 //
 // Credentials: in the platform-agent container, which is where this binary
 // mostly runs, it authenticates through the auth callout as `agent` -- the

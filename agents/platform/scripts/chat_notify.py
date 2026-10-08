@@ -37,6 +37,15 @@ HERMES_CLI = "hermes"
 # The exit status `a2a notify` uses when the gateway did not answer in time: the
 # post may or may not have landed, so a caller must not post it again.
 NOTIFY_OUTCOME_UNKNOWN = 3
+# The exit status `a2a notify` uses when the route is not there right now: no
+# gateway subscribed (a roll, or its bind retry) or the bus unreachable. Nothing
+# was posted, and waiting may help where retrying a refusal would not.
+NOTIFY_ROUTE_UNAVAILABLE = 4
+# The waits before each retry of a send that found the route unavailable, for
+# a caller with one shot at the post. They sum past the gateway's longest wait
+# between attempts to bind the route (a2a/gateway/notify.go,
+# notifyStartRetryMax, 30s), so a gateway that is up again is heard from.
+NOTIFY_ROUTE_RETRY_DELAYS_SECONDS = (5, 10, 20)
 # How long `a2a notify` waits for the gateway by default (a2a/cmd/a2a/notify.go),
 # its own bound on connecting, and a margin: a caller that kills the child
 # sooner than their sum turns a post that may have landed into a failure.
@@ -105,6 +114,11 @@ def command(target: str, message: str, json_output: bool = True, hermes_bin: str
 def outcome_unknown(returncode: int) -> bool:
     """Whether a failed send may still have posted (the gateway did not answer in time)."""
     return returncode == NOTIFY_OUTCOME_UNKNOWN
+
+
+def route_unavailable(returncode: int) -> bool:
+    """Whether a failed send found no route (nothing posted; waiting may help)."""
+    return returncode == NOTIFY_ROUTE_UNAVAILABLE
 
 
 def thread_from_response(platform: str, response: dict) -> str:

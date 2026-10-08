@@ -312,7 +312,9 @@ func (c *Client) rebuild() {
 		cores := append([]*coreSub(nil), c.cores...)
 		c.mu.Unlock()
 
-		if c.resubscribe(subs, js, nc) && c.resubscribeCore(cores, nc) {
+		// Core subscriptions first: they need no JetStream, so they are not
+		// held behind a durable whose stream is still recovering.
+		if c.resubscribeCore(cores, nc) && c.resubscribe(subs, js, nc) {
 			c.rebuilds.Add(1)
 			c.log.Info("nats rebuild complete")
 			return

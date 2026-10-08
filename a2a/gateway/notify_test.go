@@ -1,9 +1,11 @@
 package gateway
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"strings"
 	"sync"
 	"testing"
@@ -21,6 +23,7 @@ type fakeNotifyPoster struct {
 	posts   []notifyPost
 	failAt  int // 1-based post index to fail; 0 never
 	landsIn string
+	noName  bool // answer with an empty message name
 }
 
 func (f *fakeNotifyPoster) PostNotify(space, thread, text string) (string, string, error) {
@@ -34,6 +37,9 @@ func (f *fakeNotifyPoster) PostNotify(space, thread, text string) (string, strin
 	landed := thread
 	if landed == "" {
 		landed = f.landsIn
+	}
+	if f.noName {
+		return "", landed, nil
 	}
 	return space + "/messages/m" + string(rune('0'+n)), landed, nil
 }
@@ -73,7 +79,7 @@ func serveBytes(t *testing.T, n *Notifier, body []byte) lib.NotifyReply {
 		return *refusal
 	}
 	var answers []lib.NotifyReply
-	n.post(req, func(r lib.NotifyReply) { answers = append(answers, r) })
+	n.post(notifyJob{req: req, answer: func(r lib.NotifyReply) { answers = append(answers, r) }})
 	if len(answers) != 1 {
 		t.Fatalf("post answered %d times, want exactly once: %+v", len(answers), answers)
 	}
@@ -452,5 +458,67 @@ func TestRunRetriesAFailedBind(t *testing.T) {
 	n.Run(runCtx, client)
 	if elapsed := time.Since(started); elapsed < 2*time.Second {
 		t.Errorf("Run returned after %s; a failed bind must be retried until the context ends", elapsed)
+	}
+}
+
+// A poster that returns no message name still gets exactly one answer for a
+// text that takes several chunks: the guard is whether it answered, not the
+// name it got back.
+func TestNotifyAnswersOnceWhenThePostHasNoName(t *testing.T) {
+	p := &fakeNotifyPoster{noName: true, landsIn: testHome + "/threads/T1"}
+	serveJSON(t, newTestNotifier(t, p), lib.NotifyRequest{Text: strings.Repeat("word ", discordChunk)})
+	if got := len(p.all()); got < 2 {
+		t.Fatalf("posted %d chunks; the test needs a text that takes several", got)
+	}
+}
+
+// A request that fails after its requester stopped waiting is logged as lost:
+// the requester exited "outcome unknown" and recorded it as possibly posted,
+// so the refusal it never hears is the one record of the loss. Before the
+// deadline the same failure is an ordinary refusal the requester hears.
+func TestNotifyLogsARequestThatFailsAfterItsRequesterGaveUp(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		deadline time.Time
+		wantLost bool
+	}{
+		{"past its deadline", time.Now().Add(-time.Second), true},
+		{"inside its deadline", time.Now().Add(time.Minute), false},
+		{"no deadline given", time.Time{}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var logs bytes.Buffer
+			n, err := NewGchatNotifier(&fakeNotifyPoster{failAt: 1}, testHome, slog.New(slog.NewTextHandler(&logs, nil)))
+			if err != nil {
+				t.Fatal(err)
+			}
+			var got lib.NotifyReply
+			n.post(notifyJob{req: lib.NotifyRequest{Text: "nightly audit: 3 findings\nmore"},
+				answer: func(r lib.NotifyReply) { got = r }, deadline: tc.deadline})
+			if got.Error == "" {
+				t.Fatalf("reply = %+v, want the post failure", got)
+			}
+			lost := strings.Contains(logs.String(), "notify lost")
+			if lost != tc.wantLost {
+				t.Fatalf("logged lost = %v, want %v; logs:\n%s", lost, tc.wantLost, logs.String())
+			}
+			if lost && !strings.Contains(logs.String(), "nightly audit: 3 findings") {
+				t.Errorf("the lost line does not name the text's first line:\n%s", logs.String())
+			}
+		})
+	}
+}
+
+// The CLI tells the gateway how long it waits, so the gateway can tell a
+// refusal the requester hears from one it does not.
+func TestNotifyRequestCarriesTheWait(t *testing.T) {
+	n := newTestNotifier(t, &fakeNotifyPoster{})
+	n.jobs = make(chan notifyJob, 1)
+	body, _ := json.Marshal(lib.NotifyRequest{Text: "x", WaitMillis: 60000})
+	before := time.Now()
+	n.handle(&nats.Msg{Subject: lib.NotifySubjectGchat, Reply: lib.NotifyReplyPrefix + "r", Data: body})
+	job := <-n.jobs
+	if d := job.deadline.Sub(before); d < 59*time.Second || d > 61*time.Second {
+		t.Fatalf("deadline is %s after receipt, want the request's 60s", d)
 	}
 }

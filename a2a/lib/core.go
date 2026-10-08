@@ -88,6 +88,9 @@ func (c *Client) resubscribeCore(cores []*coreSub, nc *nats.Conn) bool {
 		}
 		var failed []*coreSub
 		for _, s := range pending {
+			if s.stopped.Load() {
+				continue
+			}
 			if err := s.start(nc); err != nil {
 				c.log.Error("nats rebuild core re-subscribe failed; will retry", "subject", s.subject, "err", err)
 				failed = append(failed, s)
