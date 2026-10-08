@@ -167,8 +167,9 @@ Every check below carries a tier, and the tiers are what produce the verdict:
 The findings are the evidence behind the verdict; the verdict is the deliverable.
 
 Closest thing on `main`: `fleet-upgrade-verification --readiness` already emits
-`blocked`/`unknown`/`ready` per cluster from drain-blocking PDBs, fail-closed webhooks in the
-upgrade's path with an unreachable backend, maintenance exclusions and skew.
+`blocked`/`unknown`/`ready` per cluster from drain-blocking PDBs, fail-closed webhooks with an
+unreachable backend in the upgrade's path or able to refuse the control plane's bootstrap Role and
+RoleBinding writes, maintenance exclusions and skew.
 Three things are missing — the verdict is per cluster, not per family; it reads four inputs rather
 than every check here; and it runs only when asked, not on the schedule.
 
@@ -232,9 +233,9 @@ Four ways a workload breaks on a new version:
   case where the backend is unreachable now, on the webhook's rules (the writes a node drain and a
   node join make, listed with their sources as `UPGRADE_PATH_TARGETS` in
   `agents/platform/skills/fleet-upgrade-verification/scripts/upgrade_readiness.py`) and on its
-  `kube-system` reach (a dead webhook whose namespace selector admits `kube-system` and whose
-  rules match the bootstrap Roles and RoleBindings a new master's `rbac/bootstrap-roles` hook
-  reconciles there, `CONTROL_PLANE_KUBE_SYSTEM_WRITES` in the same file; the ConfigMap write the
+  `kube-system` reach (a dead webhook whose namespace selector admits `kube-system` or `kube-public`
+  and whose rules match the bootstrap Roles and RoleBindings a new master's `rbac/bootstrap-roles`
+  hook reconciles in those two namespaces, `CONTROL_PLANE_KUBE_SYSTEM_WRITES` in the same file; the ConfigMap write the
   Jetstack outage deadlocked on left the start-up path in Kubernetes 1.17, and the leader-election
   Leases are already on the node path's list); the object selector, match conditions,
   cluster-scoped reach and the would-fail-once-drained backend are still unread.

@@ -983,8 +983,8 @@ class ReadinessTest(unittest.TestCase):
             ],
         }
         # seeded-b: the seeded fleet's fixture shape, a gate on ConfigMaps only, whose Service does
-        # not exist, scoped to its own namespace as bench/tf/fleet/defects-b.tf scopes it (so it
-        # does not reach kube-system and stays an outage).
+        # not exist, scoped to its own namespace as bench/tf/fleet/defects-b.tf scopes it. It is an
+        # outage because ConfigMaps are on neither graded list; the scope confines the gate.
         seeded_gate = k8s_webhook("ValidatingWebhookConfiguration", "seeded-fail-closed-gate", "gate.seeded.invalid", "Fail", ("seeded-upgrade", "nonexistent-admission-gate"), ["configmaps"])
         seeded_gate["webhooks"][0]["namespaceSelector"] = {"matchLabels": {"kubernetes.io/metadata.name": "seeded-upgrade"}}
         self.objects["seeded-b"] = self.objects.get("seeded-b", []) + [seeded_gate]

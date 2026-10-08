@@ -21,8 +21,8 @@ check yet and is stated here:
   no Service port for the webhook's port, or no ready endpoint behind that port), graded
   on its rules: one that can match a write a node drain or a node join makes
   (`UPGRADE_PATH_TARGETS` below is the list, with the package behind each write) breaks
-  the upgrade; so does one whose `namespaceSelector` admits `kube-system` and whose rules
-  match a Role or RoleBinding write the API server's own start-up reconciles there
+  the upgrade; so does one whose `namespaceSelector` admits `kube-system` or `kube-public`
+  and whose rules match a Role or RoleBinding write the API server's own start-up reconciles there
   (`CONTROL_PLANE_KUBE_SYSTEM_WRITES` below); one that matches none of those is a current
   outage for what it does match and is reported, not graded. The lists are the rule's
   reading of the path, not a proof of the upgrade's safety.
@@ -264,33 +264,38 @@ UPGRADE_PATH_STORAGE = (
 )
 UPGRADE_PATH_TARGETS = UPGRADE_PATH_DRAIN + UPGRADE_PATH_REPLACEMENT_PODS + UPGRADE_PATH_NODES + UPGRADE_PATH_KUBELET_IDENTITY + UPGRADE_PATH_STORAGE
 UPGRADE_PATH_LABEL = "{operation} {resource}"
-# The control plane's own writes into `kube-system` that a new master cannot start without,
-# which a control-plane upgrade makes on each new master: kube-apiserver's
-# `rbac/bootstrap-roles` post-start hook reconciles the bootstrap Roles and RoleBindings in
-# `kube-system` (`pkg/registry/rbac/rest/storage_rbac.go`, `EnsureRBACPolicy`: a 30-second
+# The control plane's own writes that a new master cannot start without, which a
+# control-plane upgrade makes on each new master: kube-apiserver's `rbac/bootstrap-roles`
+# post-start hook reconciles the bootstrap Roles and RoleBindings in `kube-system` and
+# `kube-public` (`pkg/registry/rbac/rest/storage_rbac.go`, `EnsureRBACPolicy`: a 30-second
 # poll, then `unable to initialize roles`, which `runPostStartHook` turns into a fatal; the
 # objects are `bootstrappolicy.NamespaceRoles()` and `NamespaceRoleBindings()` in
-# `plugin/pkg/auth/authorizer/rbac/bootstrappolicy/namespace_policy.go`). A fail-closed webhook
-# with a dead backend whose rules match one of these writes and whose `namespaceSelector`
-# admits `kube-system` refuses that reconcile, so the master crash-loops the way Jetstack's
-# 2019 GKE outage did (`docs/designs/upgrade-readiness-checks.md`), and it is graded `blocked`
-# like a webhook on the node path, with the cell naming the write. ConfigMaps are not on the
-# list: the `ca-registration` hook that outage deadlocked on was removed in Kubernetes 1.17,
-# and its successor (`pkg/controlplane/controller/clusterauthenticationtrust`) writes from a
-# retrying background queue, so a refused ConfigMap write is an outage, not a stuck master.
-# The leader-election Leases the controller manager and scheduler take in `kube-system` are
-# already on UPGRADE_PATH_NODES (the Lease rows), so a Lease gate blocks on that list. Rows as
-# in UPGRADE_PATH_TARGETS; every one is Namespaced and served at v1.
+# `plugin/pkg/auth/authorizer/rbac/bootstrappolicy/namespace_policy.go`, six and six in
+# `kube-system` and the `bootstrap-signer` pair in `kube-public`). A fail-closed webhook with
+# a dead backend whose rules match one of these writes and whose `namespaceSelector` admits
+# either namespace refuses that reconcile, so the master crash-loops the way Jetstack's 2019
+# GKE outage did (`docs/designs/upgrade-readiness-checks.md`), and it is graded `blocked` like
+# a webhook on the node path, with the cell naming the write and the namespaces admitted.
+# ConfigMaps are not on the list: the `ca-registration` hook that outage deadlocked on left the
+# start-up path in Kubernetes 1.17, and its successor
+# (`pkg/controlplane/controller/clusterauthenticationtrust`) writes from a retrying background
+# queue, so a refused ConfigMap write is an outage, not a stuck master. The leader-election
+# Leases the controller manager and scheduler take in `kube-system` are already on
+# UPGRADE_PATH_NODES (the Lease rows), so a Lease gate blocks on that list. Rows as in
+# UPGRADE_PATH_TARGETS; every one is Namespaced and served at v1. The namespaces are judged on
+# their default `kubernetes.io/metadata.name` label alone (`namespace_selector_reaches`).
 NAMESPACE_NAME_LABEL = "kubernetes.io/metadata.name"
 KUBE_SYSTEM_NAMESPACE = "kube-system"
-KUBE_SYSTEM_NAMESPACE_LABELS = {NAMESPACE_NAME_LABEL: KUBE_SYSTEM_NAMESPACE}
+KUBE_PUBLIC_NAMESPACE = "kube-public"
+BOOTSTRAP_POLICY_NAMESPACES = (KUBE_SYSTEM_NAMESPACE, KUBE_PUBLIC_NAMESPACE)
 CONTROL_PLANE_KUBE_SYSTEM_WRITES = (
     (GROUP_RBAC, VERSION_V1, "roles", OP_CREATE, SCOPE_NAMESPACED),
     (GROUP_RBAC, VERSION_V1, "roles", OP_UPDATE, SCOPE_NAMESPACED),
     (GROUP_RBAC, VERSION_V1, "rolebindings", OP_CREATE, SCOPE_NAMESPACED),
     (GROUP_RBAC, VERSION_V1, "rolebindings", OP_UPDATE, SCOPE_NAMESPACED),
 )
-KUBE_SYSTEM_WRITE_LABEL = "{operation} {resource} in " + KUBE_SYSTEM_NAMESPACE
+KUBE_SYSTEM_WRITE_LABEL = "{operation} {resource} in {namespaces}"
+NAMESPACE_JOIN = ","
 WEBHOOK_NAME_FORMAT = "{config}/{webhook}"
 WEBHOOK_SERVICE_FORMAT = "{namespace}/{name}"
 WEBHOOK_FINDING_FORMAT = "{webhook} ({config_kind}): failurePolicy Fail and {reason}; matches {matches}"
@@ -885,36 +890,43 @@ def namespace_selector_reaches(hook: dict, labels: dict) -> bool:
     """Whether the webhook's `namespaceSelector` admits a namespace carrying `labels`, as
     admission reads it: absent or empty admits every namespace, and a requirement this reader
     cannot evaluate counts as admitting, which errs toward naming the webhook. The caller
-    passes the namespace's labels; `kube-system` is judged on its default label alone
-    (`KUBE_SYSTEM_NAMESPACE_LABELS`), so a selector keyed on a label an operator added to it
-    reads as not admitting, the one direction this reader errs away from naming."""
+    passes the namespace's labels; `kube-system` and `kube-public` are judged on their default
+    `kubernetes.io/metadata.name` label alone, so a selector keyed on a label an operator added
+    to them reads as not admitting, the one direction this reader errs away from naming."""
     selector = hook.get("namespaceSelector")
     if not isinstance(selector, dict) or not selector:
         return True
     return _requirements_hold(selector, labels, unevaluable=True)
 
 
-def _kube_system_labels(rules: list[dict], *, read_version: bool) -> list[str]:
+def bootstrap_namespaces_admitted(hook: dict) -> list[str]:
+    """The bootstrap-policy namespaces this webhook's `namespaceSelector` admits, in
+    `BOOTSTRAP_POLICY_NAMESPACES` order; empty when it admits neither."""
+    return [name for name in BOOTSTRAP_POLICY_NAMESPACES if namespace_selector_reaches(hook, {NAMESPACE_NAME_LABEL: name})]
+
+
+def _kube_system_labels(rules: list[dict], namespaces: list[str], *, read_version: bool) -> list[str]:
     matched = []
     for group, version, resource, operation, scope in CONTROL_PLANE_KUBE_SYSTEM_WRITES:
         if any(_rule_reaches(rule, group, version if read_version else None, resource, operation, scope) for rule in rules):
-            matched.append(KUBE_SYSTEM_WRITE_LABEL.format(operation=operation, resource=resource))
+            matched.append(KUBE_SYSTEM_WRITE_LABEL.format(operation=operation, resource=resource, namespaces=NAMESPACE_JOIN.join(namespaces)))
     return matched
 
 
 def kube_system_write_matches(hook: dict) -> list[str]:
-    """The control plane's own `kube-system` writes this webhook can match, as labels: empty
-    unless its `namespaceSelector` admits `kube-system` and a rule matches a row of
-    `CONTROL_PLANE_KUBE_SYSTEM_WRITES` at the served version."""
-    if not namespace_selector_reaches(hook, KUBE_SYSTEM_NAMESPACE_LABELS):
+    """The control plane's own bootstrap-policy writes this webhook can match, as labels: empty
+    unless its `namespaceSelector` admits `kube-system` or `kube-public` and a rule matches a
+    row of `CONTROL_PLANE_KUBE_SYSTEM_WRITES` at the served version."""
+    admitted = bootstrap_namespaces_admitted(hook)
+    if not admitted:
         return []
-    return _kube_system_labels(_rules(hook), read_version=True)
+    return _kube_system_labels(_rules(hook), admitted, read_version=True)
 
 
 def _graded_targets(hook: dict) -> tuple:
-    """The rows this webhook is graded on: the node path always, the `kube-system` writes
-    when its `namespaceSelector` admits that namespace."""
-    if namespace_selector_reaches(hook, KUBE_SYSTEM_NAMESPACE_LABELS):
+    """The rows this webhook is graded on: the node path always, the bootstrap-policy writes
+    when its `namespaceSelector` admits `kube-system` or `kube-public`."""
+    if bootstrap_namespaces_admitted(hook):
         return UPGRADE_PATH_TARGETS + CONTROL_PLANE_KUBE_SYSTEM_WRITES
     return UPGRADE_PATH_TARGETS
 
@@ -922,8 +934,9 @@ def _graded_targets(hook: dict) -> tuple:
 def _pinned_labels(rules: list[dict], hook: dict) -> list[str]:
     """The graded writes `rules` name only at a version the server does not serve, labelled."""
     labels = _upgrade_path_labels(rules, read_version=False)
-    if CONTROL_PLANE_KUBE_SYSTEM_WRITES[0] in _graded_targets(hook):
-        labels += _kube_system_labels(rules, read_version=False)
+    admitted = bootstrap_namespaces_admitted(hook)
+    if admitted:
+        labels += _kube_system_labels(rules, admitted, read_version=False)
     return labels
 
 
@@ -958,8 +971,8 @@ def grade_webhooks(configs: list[dict], services: list[dict], slices: list[dict]
 
     `blocking`: the webhook's rules can match a write in `UPGRADE_PATH_TARGETS`, one the
     drain or the node join makes and does not proceed without, so the upgrade cannot
-    complete while its backend is down; or its `namespaceSelector` admits `kube-system` and
-    its rules match a Role or RoleBinding write a new master's start-up reconciles there
+    complete while its backend is down; or its `namespaceSelector` admits `kube-system` or
+    `kube-public` and its rules match a Role or RoleBinding write a new master's start-up reconciles there
     (`CONTROL_PLANE_KUBE_SYSTEM_WRITES`), so the control-plane upgrade cannot complete either.
     `outage`: the backend is unreachable but the rules match none of those; its requests fail now and the member is not graded on it, with
     what it does match named so the operator can judge it, because the list is what this

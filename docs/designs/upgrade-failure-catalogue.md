@@ -436,8 +436,8 @@ case `kube-system`.
 - Mitigate after: set `failurePolicy: Ignore` or remove the webhook configuration to unwedge the cluster, then restore it once the backend is up.
 - Read today: the readiness mode of `fleet-upgrade-verification` grades a fail-closed webhook
   whose backend the API server cannot reach now, `blocked` when its rules reach the upgrade's
-  path or, with a namespace selector admitting `kube-system`, the Role writes a new master
-  reconciles there, and an outage otherwise; the backend that would fail once drained, and the
+  path or, with a namespace selector admitting `kube-system` or `kube-public`, the Role and
+  RoleBinding writes a new master reconciles there, and an outage otherwise; the backend that would fail once drained, and the
   object selector, are unread ([the readiness checks](upgrade-readiness-checks.md)). After the fact, the upgrade
   skill's stuck-upgrade steps check whether webhooks are rejecting pod creation on new nodes.
 - GKE recommender: `K8S_ADMISSION_WEBHOOK_UNAVAILABLE` flags a webhook whose Service has no endpoints and `K8S_ADMISSION_WEBHOOK_UNSAFE` one that intercepts `kube-system` or cluster-scoped system resources ([webhook insights](https://docs.cloud.google.com/kubernetes-engine/docs/how-to/optimize-webhooks)); the certificate subtypes (`DEPRECATION_K8S_1_23_CERTIFICATE`, `DEPRECATION_K8S_SHA_1_CERTIFICATE`) covered backend certificates the 1.23 and 1.29 removals rejected; `K8S_CRD_WITH_INVALID_CA_BUNDLE` flags CRDs with an invalid CA bundle.

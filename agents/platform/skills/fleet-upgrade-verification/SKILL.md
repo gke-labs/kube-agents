@@ -1,6 +1,6 @@
 ---
 name: fleet-upgrade-verification
-description: Reports every GKE cluster's control-plane and node-pool versions against a target version or each cluster's release-channel default, naming the members that lag and by how many minors; run again during a rollout, it shows which members started, completed or stalled since the previous run; with --readiness, it also grades each member on what would stop the upgrade, naming drain-blocking PodDisruptionBudgets, fail-closed admission webhooks in the upgrade's path with an unreachable backend, maintenance exclusions and windows, and node-pool version skew. Scans the linked GitOps repositories' manifests for apiVersions the target removes, with each hit's replacement. Read-only against GCP, the clusters and Git, from gcloud container, kubectl get and repository reads, keeping only its own record of each run and per-member kubeconfig files; the executed counterpart to gke-upgrades' advice.
+description: Reports every GKE cluster's control-plane and node-pool versions against a target version or each cluster's release-channel default, naming the members that lag and by how many minors; run again during a rollout, it shows which members started, completed or stalled since the previous run; with --readiness, it also grades each member on what would stop the upgrade, naming drain-blocking PodDisruptionBudgets, fail-closed admission webhooks in the upgrade's path or able to refuse the control plane's bootstrap Role and RoleBinding writes with an unreachable backend, maintenance exclusions and windows, and node-pool version skew. Scans the linked GitOps repositories' manifests for apiVersions the target removes, with each hit's replacement. Read-only against GCP, the clusters and Git, from gcloud container, kubectl get and repository reads, keeping only its own record of each run and per-member kubeconfig files; the executed counterpart to gke-upgrades' advice.
 ---
 
 # Fleet upgrade verification
@@ -13,8 +13,8 @@ fleet is from a release-channel default, or whether the repositories are ready f
 version. Run the version report again during a rollout and it also says, per member, what changed
 since the previous run and which members have stopped moving (see "Track a rollout across runs").
 With `--readiness` it also says, per member, what would stop the upgrade: a PodDisruptionBudget
-that blocks every node drain, a fail-closed admission webhook in the upgrade's path whose
-backend is unreachable, a maintenance exclusion or window, or node pools too far below the target
+that blocks every node drain, a fail-closed admission webhook with an unreachable backend in the upgrade's path or able to
+refuse the control plane's bootstrap Role and RoleBinding writes, a maintenance exclusion or window, or node pools too far below the target
 (see "Check upgrade readiness"). For upgrade plans, runbooks and checklists, use the
 `gke-upgrades` skill; it links back here when the question is one these two scripts answer.
 
@@ -202,13 +202,15 @@ validatingwebhookconfigurations,mutatingwebhookconfigurations,services,endpoints
   nothing; `objectSelector` and `matchConditions` are not evaluated, and `namespaceSelector`
   is read only for the `kube-system` reach, so a webhook they narrow is otherwise reported as
   able to match. A dead webhook off the node path is graded `blocked` all the same when its
-  `namespaceSelector` admits `kube-system` (absent or empty admits every namespace; `kube-system`
-  is judged on its default `kubernetes.io/metadata.name` label alone) and its rules match a
+  `namespaceSelector` admits `kube-system` or `kube-public` (absent or empty admits every
+  namespace; a requirement the reader cannot evaluate counts as admitting; the two namespaces
+  are judged on their default `kubernetes.io/metadata.name` label alone) and its rules match a
   Role or RoleBinding write in `rbac.authorization.k8s.io` (`CONTROL_PLANE_KUBE_SYSTEM_WRITES`
   in the script), because a new master's start-up reconciles the bootstrap Roles and
-  RoleBindings there and fatals when it cannot, so the control-plane upgrade cannot complete;
-  its cell names that write. A ConfigMap gate is not on that list: the start-up ConfigMap write
-  the Jetstack outage deadlocked on left Kubernetes in 1.17, and its successor retries. The cell names the
+  RoleBindings in both namespaces and fatals when it cannot, so the control-plane upgrade
+  cannot complete; its cell names that write and the namespaces admitted. A ConfigMap gate is
+  not on that list: the start-up ConfigMap write the Jetstack outage deadlocked on left the
+  start-up path in Kubernetes 1.17, and its successor retries. The cell names the
   configuration, the webhook, the reason and what it matches (an outage cell lists the webhook's
   own rules, with their `apiVersions` when a rule pins any); each JSON finding carries
   `reason`, `upgrade_path` and `rules`, split into `blocking` and `outage`. A fail-closed webhook with a URL backend is counted in the

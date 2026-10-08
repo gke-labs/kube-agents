@@ -3,8 +3,8 @@
 # request its rules match. The table grades the member blocked when those rules reach
 # a write a node drain or a node join makes (`UPGRADE_PATH_TARGETS` in the skill's
 # `scripts/upgrade_readiness.py` is the list, with the package behind each write), or when
-# its namespace selector admits kube-system and the rules reach the bootstrap Role and
-# RoleBinding writes a new master reconciles there (`CONTROL_PLANE_KUBE_SYSTEM_WRITES`);
+# its namespace selector admits kube-system or kube-public and the rules reach the bootstrap
+# Role and RoleBinding writes a new master reconciles there (`CONTROL_PLANE_KUBE_SYSTEM_WRITES`);
 # otherwise it names the webhook as a current outage without grading on it. The upgrade-scenario
 # campaign reproduced the pod-gating form end to end on GKE (the drain's replacement pods
 # refused until the webhook was deleted).
@@ -54,9 +54,10 @@
 #
 # Planted defect required: on slot b, the ValidatingWebhookConfiguration
 # seeded-fail-closed-gate, webhook gate.seeded.invalid, failurePolicy Fail, 30 s timeout,
-# rules on ConfigMaps only, namespaceSelector naming the seeded-upgrade namespace (so the gate
-# does not reach kube-system and the script keeps it an outage) and objectSelector limited to
-# the fleet's own objects, client_config pointing at Service
+# rules on ConfigMaps only (which neither graded list carries, so the script keeps it an
+# outage), namespaceSelector naming the seeded-upgrade namespace and objectSelector limited to
+# the fleet's own objects (both confine the fail-closed gate to the fleet's own namespace on a
+# shared cluster), client_config pointing at Service
 # seeded-upgrade/nonexistent-admission-gate, which does not exist (role
 # readiness-failclosed-webhook).
 #

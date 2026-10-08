@@ -498,8 +498,8 @@ class WebhookBackendTest(unittest.TestCase):
 
 class KubeSystemReachTest(unittest.TestCase):
     """A dead gate off the node path that can refuse the bootstrap Role and RoleBinding
-    writes a new master's start-up reconciles in kube-system blocks the control-plane
-    upgrade (the Jetstack 2019 shape, on the write that still gates a master)."""
+    writes a new master's start-up reconciles in kube-system and kube-public blocks the
+    control-plane upgrade (the Jetstack 2019 shape, on the write that still gates a master)."""
 
     ROLE_GATE = [rule(["roles"], groups=("rbac.authorization.k8s.io",))]
     SEEDED_SCOPE = {"matchLabels": {"kubernetes.io/metadata.name": "seeded-upgrade"}}
@@ -511,13 +511,13 @@ class KubeSystemReachTest(unittest.TestCase):
     def test_a_cluster_wide_dead_role_gate_blocks_and_names_the_write(self):
         blocking, outage = self._one([hook("opa.example.com", self.ROLE_GATE, policy="Fail")])
         self.assertEqual(outage, [])
-        self.assertEqual(blocking[0]["upgrade_path"], ["CREATE roles in kube-system"])
-        self.assertIn("matches CREATE roles in kube-system", r.describe_webhook_finding(blocking[0]))
+        self.assertEqual(blocking[0]["upgrade_path"], ["CREATE roles in kube-system,kube-public"])
+        self.assertIn("matches CREATE roles in kube-system,kube-public", r.describe_webhook_finding(blocking[0]))
 
     def test_a_rolebinding_update_gate_blocks_too(self):
         gate = hook("opa.example.com", [rule(["rolebindings"], operations=("UPDATE",), groups=("rbac.authorization.k8s.io",))], policy="Fail")
         blocking, _ = self._one([gate])
-        self.assertEqual(blocking[0]["upgrade_path"], ["UPDATE rolebindings in kube-system"])
+        self.assertEqual(blocking[0]["upgrade_path"], ["UPDATE rolebindings in kube-system,kube-public"])
 
     def test_an_empty_selector_admits_every_namespace(self):
         blocking, _ = self._one([scoped(hook("opa.example.com", self.ROLE_GATE, policy="Fail"), {})])
@@ -533,8 +533,14 @@ class KubeSystemReachTest(unittest.TestCase):
         blocking, outage = self._one([scoped(hook("gate.seeded.invalid", self.ROLE_GATE, policy="Fail"), self.SEEDED_SCOPE)])
         self.assertEqual((blocking, len(outage)), ([], 1))
 
-    def test_a_selector_excluding_kube_system_keeps_the_gate_an_outage(self):
+    def test_a_selector_excluding_kube_system_alone_still_reaches_kube_public(self):
+        # The bootstrap-signer Role and RoleBinding are reconciled in kube-public too.
         gate = scoped(hook("opa.example.com", self.ROLE_GATE, policy="Fail"), {"matchExpressions": [{"key": "kubernetes.io/metadata.name", "operator": "NotIn", "values": ["kube-system"]}]})
+        blocking, _ = self._one([gate])
+        self.assertEqual(blocking[0]["upgrade_path"], ["CREATE roles in kube-public"])
+
+    def test_a_selector_excluding_both_bootstrap_namespaces_keeps_the_gate_an_outage(self):
+        gate = scoped(hook("opa.example.com", self.ROLE_GATE, policy="Fail"), {"matchExpressions": [{"key": "kubernetes.io/metadata.name", "operator": "NotIn", "values": ["kube-system", "kube-public"]}]})
         blocking, outage = self._one([gate])
         self.assertEqual((blocking, len(outage)), ([], 1))
 
@@ -566,8 +572,8 @@ class KubeSystemReachTest(unittest.TestCase):
         gate = hook("opa.example.com", [rule(["roles"], groups=("rbac.authorization.k8s.io",), versions=("v1beta1",))], policy="Fail")
         blocking, outage = self._one([gate])
         self.assertEqual(blocking, [])
-        self.assertEqual(outage[0]["version_pinned"], ["CREATE roles in kube-system"])
-        self.assertIn("the server serves CREATE roles in kube-system at v1 alone, so it sends this webhook none of them", r.describe_webhook_finding(outage[0]))
+        self.assertEqual(outage[0]["version_pinned"], ["CREATE roles in kube-system,kube-public"])
+        self.assertIn("the server serves CREATE roles in kube-system,kube-public at v1 alone, so it sends this webhook none of them", r.describe_webhook_finding(outage[0]))
 
     def test_a_pinned_role_gate_scoped_off_kube_system_is_a_plain_outage(self):
         gate = scoped(hook("opa.example.com", [rule(["roles"], groups=("rbac.authorization.k8s.io",), versions=("v1beta1",))], policy="Fail"), self.SEEDED_SCOPE)
@@ -598,7 +604,8 @@ class WebhookScopeTest(unittest.TestCase):
 
     def test_a_gate_outside_the_upgrade_path_is_an_outage_not_a_blocker(self):
         # The seeded fleet's fixture: a gate on ConfigMaps with no Service, scoped to its own
-        # namespace (bench/tf/fleet/defects-b.tf), so it does not reach kube-system either.
+        # namespace (bench/tf/fleet/defects-b.tf). It is an outage because its rules match
+        # ConfigMaps only, which neither graded list carries; the scope confines the gate.
         gate = scoped(hook("gate.seeded.invalid", [rule(["configmaps"])], policy="Fail", service=("seeded-upgrade", "nonexistent-admission-gate")), {"matchLabels": {"kubernetes.io/metadata.name": "seeded-upgrade"}})
         graded = grade([gate])
         self.assertEqual(graded["blocking"], [])

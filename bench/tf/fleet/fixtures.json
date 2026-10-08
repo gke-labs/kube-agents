@@ -329,15 +329,6 @@
           "op": "any_eq",
           "value": "nonexistent-admission-gate",
           "why": "the property that makes this dangerous rather than ordinary. failurePolicy Fail is set by cert-manager, managed-prometheus and this repository's own operator webhook; Fail onto a backend that cannot answer is what deadlocks a drain. Point the clientConfig at a Service that resolves and the fixture is healed while the policy and the timeout still read as planted"
-        },
-        {
-          "subject": "validatingwebhookconfiguration/seeded-fail-closed-gate",
-          "path": "webhooks[*].namespaceSelector.matchLabels",
-          "op": "any_eq",
-          "value": {
-            "kubernetes.io/metadata.name": "seeded-upgrade"
-          },
-          "why": "the scope the readiness grade reads: a dead gate whose namespace selector admits kube-system is graded blocked on the Role writes a new master reconciles there, so the case's 'no' for this gate holds only while the selector keeps it to its own namespace; drop or widen the selector and a correct agent fails the gate-line objectives"
         }
       ]
     },

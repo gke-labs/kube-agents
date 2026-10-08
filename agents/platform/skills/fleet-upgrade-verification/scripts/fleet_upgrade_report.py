@@ -16,7 +16,8 @@ active (another member moved, or `--rollout-in-progress` was passed).
 
 With `--readiness`, each member is also graded on whether it can take the upgrade to its
 target: drain-blocking PodDisruptionBudgets and fail-closed admission webhooks with an
-unreachable backend in the upgrade's path (read with two `kubectl get` per member after
+unreachable backend in the upgrade's path or able to refuse the control plane's bootstrap Role
+and RoleBinding writes (read with two `kubectl get` per member after
 `gcloud container clusters get-credentials` into a per-target kubeconfig), a maintenance
 exclusion in effect whose scope covers the upgrade, the maintenance window's state at
 `--at`, and node-pool version skew against the target control plane. The rules live in
@@ -796,7 +797,7 @@ def _pdb_cell(r: dict) -> str:
 
 
 def _webhook_cell(r: dict) -> str:
-    """Upgrade-path findings first; unreachable-backend webhooks outside the path after them,
+    """Blocking findings first (the upgrade's path, or the bootstrap-policy writes a dead webhook reaching `kube-system` or `kube-public` would refuse); unreachable-backend webhooks outside both after them,
     since they are an outage now even though they do not grade the member."""
     webhooks = r["webhooks"]
     if webhooks is None:
@@ -859,7 +860,7 @@ def render_readiness(report: dict) -> str:
     lines.append(
         f"Readiness at {report['readiness']['evaluated_at']}: "
         + ", ".join(f"{summary[s]} {s}" for s in readiness.READINESS_ORDER)
-        + "; a maintenance exclusion holds back GKE's automatic upgrades only, a drain-blocking PDB, a fail-closed webhook in the upgrade's path (or reaching the control plane's kube-system Role writes) with an unreachable backend, or skew any upgrade."
+        + "; a maintenance exclusion holds back GKE's automatic upgrades only, a drain-blocking PDB, a fail-closed webhook with an unreachable backend in the upgrade's path or able to refuse the control plane's bootstrap Role and RoleBinding writes, or skew any upgrade."
     )
     return "\n".join(lines)
 
@@ -1105,7 +1106,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--output", help="Path to write the report as JSON.")
     parser.add_argument("--state-dir", default=DEFAULT_STATE_DIR, help=f"Directory holding one record per target from the previous run (default: {DEFAULT_STATE_DIR}).")
     parser.add_argument("--rollout-in-progress", action="store_true", help="Assert a rollout is under way, so an unchanged, behind member is flagged stalled even when no other member moved.")
-    parser.add_argument("--readiness", action="store_true", help="Also grade each member's readiness for the upgrade: drain-blocking PDBs and fail-closed webhooks in the upgrade's path, or reaching the control plane's kube-system Role writes, with an unreachable backend (two kubectl reads per member), maintenance exclusions and window, node-pool skew.")
+    parser.add_argument("--readiness", action="store_true", help="Also grade each member's readiness for the upgrade: drain-blocking PDBs and fail-closed webhooks with an unreachable backend in the upgrade's path or able to refuse the control plane's bootstrap Role and RoleBinding writes (two kubectl reads per member), maintenance exclusions and window, node-pool skew.")
     parser.add_argument("--at", help="RFC 3339 instant to evaluate maintenance exclusions and the window at (default: now). Only with --readiness.")
     parser.add_argument("--kubeconfig-dir", help="Directory for the per-member kubeconfig files --readiness writes (default: $HERMES_HOME/.kubeconfigs).")
     args = parser.parse_args(argv)

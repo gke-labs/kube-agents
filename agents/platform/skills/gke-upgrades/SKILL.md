@@ -241,7 +241,7 @@ the checklist rather than asking the operator to check those three by hand. It a
 fourth thing the checklist's admission-webhook item points at: a fail-closed webhook whose
 backend is unreachable and whose rules reach the upgrade's path (the writes a node drain and a node
 join make, as `UPGRADE_PATH_TARGETS` in `./skills/fleet-upgrade-verification/scripts/upgrade_readiness.py` lists them), which is a cause of
-a drain that will not finish, or whose namespace selector admits `kube-system` and whose rules reach the
+a drain that will not finish, or whose namespace selector admits `kube-system` or `kube-public` and whose rules reach the
 Role and RoleBinding writes a new master reconciles there, which is a cause of a master that will not start. The PDB read costs one
 `get-credentials` and one `kubectl get` per member and leaves a per-member kubeconfig under
 `${HERMES_HOME:-/opt/data}/.kubeconfigs/`; an exclusion is reported as holding back automatic
