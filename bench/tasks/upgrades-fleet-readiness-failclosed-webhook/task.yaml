@@ -150,8 +150,10 @@ verification_spec:
         - '(?m)^{cluster:b}/(?:[a-z0-9.-]+/)?hold-the-minor-lag(?:\s*\([^)\n]*\))?:[^\n]*; blocks the upgrade: (?!yes$)'
 
   # The objective this case exists for. The discovery proof and the grade in one line:
-  # neither the configuration's name nor the webhook's is in the prompt, so a line for
-  # seeded-fail-closed-gate at all is the agent having read the admission configurations;
+  # neither the configuration's name nor the webhook's is in the prompt, so a line for the
+  # gate under either name (the configuration seeded-fail-closed-gate, with or without the
+  # webhook after a slash, or the webhook gate.seeded.invalid alone, which one run wrote
+  # against the prompt's instruction) is the agent having read the admission configurations;
   # `backend: missing` is the agent having resolved its Service and found none; and
   # `blocks the upgrade: no` is the agent having read what the gate matches (ConfigMaps
   # only) and kept it out of the upgrade's path. The forbids: the same anchor with any kind
@@ -166,11 +168,11 @@ verification_spec:
       fixture_roles:
         - readiness-failclosed-webhook
       any_of_patterns:
-        - '(?m)^{cluster:b}/(?:[a-z0-9.-]+/)?seeded-fail-closed-gate(?:/[a-z0-9.-]+)?(?:\s*\([^)\n]*\))?: kind:? webhook; backend: missing; blocks the upgrade: no$'
+        - '(?m)^{cluster:b}/(?:[a-z0-9.-]+/)?(?:seeded-fail-closed-gate(?:/[a-z0-9.-]+)?|gate\.seeded\.invalid)(?:\s*\([^)\n]*\))?: kind:? webhook; backend: missing; blocks the upgrade: no$'
       forbidden_patterns:
-        - '(?m)^{cluster:b}/(?:[a-z0-9.-]+/)?seeded-fail-closed-gate(?:/[a-z0-9.-]+)?(?:\s*\([^)\n]*\))?:[^\n]*(?<![a-z0-9-])kind:? (?!webhook;)'
-        - '(?m)^{cluster:b}/(?:[a-z0-9.-]+/)?seeded-fail-closed-gate(?:/[a-z0-9.-]+)?(?:\s*\([^)\n]*\))?:[^\n]*; backend: (?!missing;)'
-        - '(?m)^{cluster:b}/(?:[a-z0-9.-]+/)?seeded-fail-closed-gate(?:/[a-z0-9.-]+)?(?:\s*\([^)\n]*\))?:[^\n]*; blocks the upgrade: (?!no$)'
+        - '(?m)^{cluster:b}/(?:[a-z0-9.-]+/)?(?:seeded-fail-closed-gate(?:/[a-z0-9.-]+)?|gate\.seeded\.invalid)(?:\s*\([^)\n]*\))?:[^\n]*(?<![a-z0-9-])kind:? (?!webhook;)'
+        - '(?m)^{cluster:b}/(?:[a-z0-9.-]+/)?(?:seeded-fail-closed-gate(?:/[a-z0-9.-]+)?|gate\.seeded\.invalid)(?:\s*\([^)\n]*\))?:[^\n]*; backend: (?!missing;)'
+        - '(?m)^{cluster:b}/(?:[a-z0-9.-]+/)?(?:seeded-fail-closed-gate(?:/[a-z0-9.-]+)?|gate\.seeded\.invalid)(?:\s*\([^)\n]*\))?:[^\n]*; blocks the upgrade: (?!no$)'
 
   # No line on any cluster blames the gate, under any of its names (the configuration
   # seeded-fail-closed-gate, the webhook gate.seeded.invalid, the Service
