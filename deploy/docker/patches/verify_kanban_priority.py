@@ -168,6 +168,15 @@ os.environ["HERMES_KANBAN_TASK"] = triage
 tchild = tool_create(
     title="Triage sub-step", priority=300, session_id="20261008_101500_ab12cd34",
 )["task_id"]
+spoof = tool_create(title="Triage on another board", priority=300, board="x")["task_id"]
+spoof_priority = None
+for row in conn.execute("SELECT priority FROM tasks WHERE id = ?", (spoof,)):
+    spoof_priority = int(row[0] or 0)
+check(
+    "a triage worker naming another board still files background",
+    spoof_priority is None or spoof_priority < KP.USER_PRIORITY,
+    f"priority={spoof_priority}",
+)
 check(
     "a triage card's fan-out stays background whatever priority or session it names",
     priority(tchild) < KP.USER_PRIORITY,

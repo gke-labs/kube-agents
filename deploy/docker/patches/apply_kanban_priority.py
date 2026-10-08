@@ -14,15 +14,18 @@ before any is written:
 
     1. The ``priority=`` keyword of the ``kb.create_task(...)`` call in
        ``_handle_create``: the requested priority is passed through
-       ``stamp_priority`` with the creating worker's ``self_task``, a local the
-       handler computed a few lines up. Not the handler's ``session_id`` local:
-       that one prefers ``args["session_id"]``, which the model controls, so
+       ``stamp_priority`` with the creating worker's ``self_task`` and
+       ``self_tid``, locals the handler computed a few lines up (a worker
+       whose card is not found, say on another ``board=``, files background).
+       Not the handler's ``session_id`` local: that one prefers ``args["session_id"]``, which the model controls, so
        ``stamp_priority`` reads the turn's session from the runtime itself.
        Located inside ``_handle_create`` and refused anywhere else, the way
        ``apply_kanban_report_format.py`` pins its ``body=`` keyword to the same
        call. It shares no text with that edit.
-    2. The handler's success return: ``queue_fields`` adds ``queued`` and
-       ``queue_note`` when the new card will wait for a slot. Precedent:
+    2. The handler's success return: ``queue_fields`` adds ``queued`` and a
+       ``queue`` dict of counts when the new card will wait for a slot. It is
+       machine-readable only; the thread hears about the wait once, from the
+       dispatcher's ``queued`` event. Precedent:
        ``apply_kanban_comment_status.py`` grows ``kanban_comment``'s return
        the same way. ``apply_kanban_auto_subscribe.py`` and
        ``apply_kanban_children_settled.py`` anchor on the ``landed = ...`` line
@@ -79,7 +82,7 @@ NOTIFIER_RELATIVE = "gateway/kanban_watchers_notifier.py"
 HANDLER = "_handle_create"
 PRIORITY_ANCHOR = 'priority=_opt_int(args.get("priority"), 0),'
 PRIORITY_PATCHED = (
-    'priority=_kanban_stamp_priority(_opt_int(args.get("priority"), 0), self_task),'
+    'priority=_kanban_stamp_priority(_opt_int(args.get("priority"), 0), self_task, self_tid),'
 )
 
 # --- 2. say when the new card is queued --------------------------------------
@@ -88,8 +91,9 @@ RETURN_ANCHOR = (
     "subscribed=_maybe_auto_subscribe(conn, new_tid))\n"
 )
 RETURN_PATCHED = (
-    "        # kube-agents patch: say when the new card waits for a worker slot,\n"
-    "        # so the creating turn can tell the user it is queued.\n"
+    "        # kube-agents patch: flag, machine-readably, a new card that waits\n"
+    "        # for a worker slot. The thread hears about the wait from the\n"
+    "        # dispatcher's queued event, not from this return.\n"
     "        # See hermes_cli/kanban_priority.py.\n"
     "        return _ok(\n"
     "            task_id=new_tid, **landed,\n"

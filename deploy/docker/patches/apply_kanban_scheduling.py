@@ -199,7 +199,7 @@ COMPATIBILITY WITH ``apply_kanban_wake_nudge``
 That patch edits ``kanban_db.py`` too, at ``create_task``, ``complete_task`` and
 ``unblock_task``, and runs after this one. The one anchor here in that file is
 in ``block_task``, its replacement text contains none of the three wake anchors,
-and the other ten edits are in a file that patch does not touch, so this
+and the other nine edits are in a file that patch does not touch, so this
 applier neither consumes nor invalidates them. ``test_kanban_scheduling.py``
 asserts that rather than leaving it to inspection, because the coupling is
 invisible from either file alone.

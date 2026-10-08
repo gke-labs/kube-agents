@@ -32,10 +32,17 @@ What
    a user card's fan-out stays user-class and a triage card's stays
    background. The class is read only from trusted context (the turn's own
    session as the runtime bound it, or the worker's own card), never from the
-   ``session_id`` a model may pass to the tool. The classification fails
-   toward the user: a background producer with a prefix this list does not
-   know about is treated as a user, which costs triage speed and never a
-   user's slot.
+   ``session_id`` a model may pass to the tool, and a worker whose own card
+   cannot be read files background. On the ``kanban_create`` path the
+   classification fails toward the user: a background producer with a prefix
+   this list does not know about is treated as a user, which costs triage
+   speed and never a user's slot. Cards that never pass through
+   ``kanban_create`` are not stamped and keep upstream's priority 0, which is
+   background: ``hermes kanban create`` without ``--priority 100``, the
+   dashboard, and the children auto-decompose inserts for a ``triage: true``
+   card (upstream's ``_insert_decomposed_child`` writes no priority, so a
+   user card filed with ``triage: true`` runs its decomposed graph as
+   background).
 2. **One slot guaranteed to each class** (:class:`ReservedSlot`). At a cap of
    2 or more, each class may hold at most ``max_in_progress - 1`` slots
    host-wide: background cannot take the user's last slot, and user cards
@@ -63,6 +70,7 @@ point fails open to upstream's behaviour and logs why.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import time
@@ -122,13 +130,18 @@ def trusted_origin_session() -> str:
         return ""
 
 
-def stamp_priority(requested: object, parent: Any = None, origin_session: object = _UNREAD) -> int:
+def stamp_priority(
+    requested: object, parent: Any = None, worker_task_id: object = None,
+    origin_session: object = _UNREAD,
+) -> int:
     """The priority ``kanban_create`` writes for a new card.
 
     ``requested`` is what the caller asked for (upstream's
     ``_opt_int(args.get("priority"), 0)``) and ``parent`` the dispatcher-owned
-    card creating it, if any (the handler's ``self_task``). ``origin_session``
-    defaults to :func:`trusted_origin_session`; tests pass it.
+    card creating it, if any (the handler's ``self_task``), and
+    ``worker_task_id`` the card id a dispatcher worker runs (the handler's
+    ``self_tid``). ``origin_session`` defaults to :func:`trusted_origin_session`;
+    tests pass it.
 
     The class comes only from trusted context: the creating turn's own session
     as the runtime bound it, and for a dispatcher worker its own card. The
@@ -136,7 +149,10 @@ def stamp_priority(requested: object, parent: Any = None, origin_session: object
     here, because a triage worker could otherwise name a user-looking session
     and take the user slot. The card is background when any trusted source
     says so: the origin session or the parent's session has a background
-    prefix, or the parent itself is below :data:`USER_PRIORITY`.
+    prefix, or the parent itself is below :data:`USER_PRIORITY`. A dispatcher
+    worker whose own card cannot be read (it named another ``board``, or the
+    card is gone) fails closed to background: a worker never files a user card
+    on the strength of a card it cannot show.
 
     * A child starts from ``max(requested, parent.priority)``. Upstream does not
       inherit priority at all, so without this a user card's fan-out would
@@ -156,6 +172,8 @@ def stamp_priority(requested: object, parent: Any = None, origin_session: object
         if origin_session is _UNREAD:
             origin_session = trusted_origin_session()
         background = is_background_session(origin_session)
+        if worker_task_id and parent is None:
+            background = True
         if parent is not None:
             parent_priority = getattr(parent, "priority", None)
             if is_background_session(getattr(parent, "session_id", None)):
@@ -472,6 +490,34 @@ def _queued_owed(conn, task_id: str) -> bool:
     return claimed is not None and claimed > queued
 
 
+def _filed_by_a_person(conn, task_id: str) -> bool:
+    """Whether a card is a top-level card a person's turn filed, not a child.
+
+    A child is a card with a dependency parent (``task_links``) or a creator
+    card (the ``creator_task_id`` upstream records on the ``created`` event
+    when a dispatcher worker files it). A child of a user card waits as part
+    of a request that is already running, so its wait is not news for the
+    person's thread. Fails toward silence.
+    """
+    try:
+        if conn.execute(
+            "SELECT 1 FROM task_links WHERE child_id = ? LIMIT 1", (task_id,)
+        ).fetchone():
+            return False
+        row = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'created' "
+            "ORDER BY id LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        if row and row[0]:
+            payload = json.loads(row[0])
+            if isinstance(payload, dict) and payload.get("creator_task_id"):
+                return False
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def note_waiting(
     conn,
     result: Any,
@@ -524,7 +570,10 @@ def note_waiting(
             return
         full = int(result.saturation["running"]) >= int(max_in_progress)
         candidates = user_waiting if full else held_user
-        owed = [tid for tid in candidates if _queued_owed(conn, tid)]
+        owed = [
+            tid for tid in candidates
+            if _filed_by_a_person(conn, tid) and _queued_owed(conn, tid)
+        ]
         if not owed:
             return
         payload_base = {

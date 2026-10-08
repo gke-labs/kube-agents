@@ -152,6 +152,25 @@ class UntrustedSessionTest(unittest.TestCase):
         )
         self.assertEqual(created["priority"], kp.USER_PRIORITY - 1)
 
+    def test_a_worker_naming_another_board_cannot_file_a_user_card(self):
+        """A triage worker passes board="x", so its own card is not found there.
+        A worker with no readable card of its own fails closed to background."""
+        parent = SimpleNamespace(priority=0, session_id=EVENT_SESSION)
+        out, created = HandlerHarness(self).create(
+            {"title": "Spoofed", "priority": 300, "board": "x"},
+            origin="", self_task=parent, worker=True,
+        )
+        self.assertEqual(created["priority"], kp.USER_PRIORITY - 1)
+
+    def test_a_worker_whose_card_is_missing_files_background(self):
+        self.assertEqual(
+            kp.stamp_priority(0, None, worker_task_id="t_gone", origin_session=""), 0
+        )
+        self.assertEqual(
+            kp.stamp_priority(500, None, worker_task_id="t_gone", origin_session=""),
+            kp.USER_PRIORITY - 1,
+        )
+
     def test_a_user_turn_naming_a_triage_session_is_not_demoted_by_it_either(self):
         out, created = HandlerHarness(self).create(
             {"title": "Question", "session_id": EVENT_SESSION}, origin="",
@@ -389,6 +408,15 @@ class Board:
             f"INSERT INTO {kanban_children_settled.CHILDREN_TABLE} (child_id, creator_id, created_at) VALUES (?, ?, ?)",
             (tid, creator, self.clock),
         )
+        # What upstream create_task writes for a worker's child.
+        self.append_event(self.conn, tid, "created", {"creator_task_id": creator, "parents": []})
+        return tid
+
+    def linked_child_of(self, parent, tid, priority=0):
+        """A card created with ``parents=[parent]`` (a dependency, no creator)."""
+        self.card(tid, priority)
+        self.conn.execute("INSERT INTO task_links (parent_id, child_id) VALUES (?, ?)", (parent, tid))
+        self.append_event(self.conn, tid, "created", {"creator_task_id": None, "parents": [parent]})
         return tid
 
     def requeue(self, tid):
@@ -616,6 +644,34 @@ class SaturationAndQueuedTest(unittest.TestCase):
         self.assertEqual(res.queued_noticed, ["waiting"])
         self.assertEqual(len(b.queued("waiting")), 2)
 
+    def test_a_user_cards_children_are_never_told_they_are_queued(self):
+        """The person's request is already running; its fan-out waiting for a
+        slot is not news for their thread."""
+        b = self._full()
+        # Their creator has finished, so it is not a waiting coordinator and the
+        # board stays full; the children carry its creator_task_id all the same.
+        b.card("u-done", U, status="done")
+        b.child_of("u-done", "kid1", U)
+        b.child_of("u-done", "kid2", U)
+        _, res = b.tick(cap=2)
+        self.assertEqual(res.queued_noticed, ["waiting"])
+        self.assertEqual(b.queued("kid1"), [])
+        self.assertEqual(b.queued("kid2"), [])
+
+    def test_a_card_with_a_parent_link_is_not_told_either(self):
+        b = self._full()
+        b.linked_child_of("u-run", "follow-up", U)
+        _, res = b.tick(cap=2)
+        self.assertNotIn("follow-up", res.queued_noticed)
+
+    def test_a_user_child_held_for_triages_slot_is_not_told(self):
+        b = Board(self)
+        b.card("coord", U, status="running")
+        for n in range(6):
+            b.child_of("coord", f"kid{n}", U)
+        _, res = b.tick(cap=6)
+        self.assertEqual(res.queued_noticed, [])
+
     def test_a_background_card_left_waiting_is_never_queued(self):
         b = self._full()
         b.tick(cap=2)
@@ -809,6 +865,50 @@ class NoticeTest(unittest.TestCase):
             adapter.edits,
             [f"⏳ @cluster-dev\n• {kp.QUEUED_TEXT}\n• Reading events"],
         )
+
+    def test_a_queued_card_that_settles_without_a_note_drops_the_queued_text(self):
+        """The reviewer's simulation: queued, then completed with no heartbeat
+        between. The rolling message must not settle as "✓ @… Queued: …"."""
+        for kind in ("completed", "crashed"):
+            with self.subTest(kind=kind):
+                adapter, watcher = Adapter(), SimpleNamespace()
+                done = SimpleNamespace(id=10, kind=kind, payload={"summary": "All good"})
+
+                async def run():
+                    await kanban_progress_lines.deliver(
+                        watcher, adapter, self.SUB, "queued", self.EV, QUEUED_LINE, {},
+                        header="@platform ",
+                    )
+                    await kanban_progress_lines.deliver(
+                        watcher, adapter, self.SUB, kind, done, "✔ @platform done: All good", {},
+                        header="@platform ",
+                    )
+
+                asyncio.run(run())
+                self.assertEqual(adapter.sent, [QUEUED_LINE, "✔ @platform done: All good"])
+                self.assertEqual(len(adapter.edits), 1)
+                self.assertNotIn("Queued", adapter.edits[0])
+                marker = "✓" if kind == "completed" else "⏹"
+                self.assertEqual(adapter.edits[0], f"{marker} @platform")
+
+    def test_a_queued_card_with_notes_settles_on_its_notes(self):
+        adapter, watcher = Adapter(), SimpleNamespace()
+        note = SimpleNamespace(id=9, kind="heartbeat", payload={"note": "Reading events"})
+        done = SimpleNamespace(id=10, kind="completed", payload={"summary": "ok"})
+
+        async def run():
+            await kanban_progress_lines.deliver(
+                watcher, adapter, self.SUB, "queued", self.EV, QUEUED_LINE, {}, header="@platform ",
+            )
+            await kanban_progress_lines.deliver(
+                watcher, adapter, self.SUB, "heartbeat", note, "", {}, header="@platform ",
+            )
+            await kanban_progress_lines.deliver(
+                watcher, adapter, self.SUB, "completed", done, "✔ done", {}, header="@platform ",
+            )
+
+        asyncio.run(run())
+        self.assertEqual(adapter.edits[-1], "✓ @platform Reading events")
 
     def test_a_card_already_rolling_keeps_its_header(self):
         adapter, watcher = Adapter(), SimpleNamespace()
@@ -1067,11 +1167,20 @@ class HandlerHarness:
             "from hermes_cli.kanban_priority import", "from kanban_priority import"
         )
 
-    def create(self, args, origin="", self_task=None):
+    def create(self, args, origin="", self_task=None, worker=None):
+        """``worker`` defaults to "a dispatcher worker exactly when self_task is
+        given". A worker's own card lives on the default board; asking another
+        board (``board="x"``) finds no card, as upstream's get_task would."""
         created = {}
+        worker = self_task is not None if worker is None else worker
 
         class Kb:
+            def __init__(self, board):
+                self.board = board
+
             def get_task(self, conn, tid):
+                if self.board not in (None, "default"):
+                    return None
                 return self_task if tid == "t_parent" else None
 
             def create_task(self, conn, **kw):
@@ -1080,7 +1189,7 @@ class HandlerHarness:
 
         @contextlib.contextmanager
         def _board(board=None):
-            yield Kb(), "conn"
+            yield Kb(board), "conn"
 
         ns = {
             "_kanban_handler": lambda name: (lambda fn: fn),
@@ -1095,10 +1204,10 @@ class HandlerHarness:
         }
         exec(compile(self.source, "<tools>", "exec"), ns)
         ns["_kanban_queue_fields"] = kp.queue_fields
-        env = {"HERMES_KANBAN_TASK": "t_parent"} if self_task is not None else {}
+        env = {"HERMES_KANBAN_TASK": "t_parent"} if worker else {}
         with mock.patch.dict("os.environ", env, clear=False), \
                 mock.patch.object(kp, "trusted_origin_session", return_value=origin):
-            if self_task is None:
+            if not worker:
                 import os
 
                 os.environ.pop("HERMES_KANBAN_TASK", None)

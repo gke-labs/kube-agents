@@ -151,6 +151,10 @@ NOTE_KINDS = ("heartbeat", "queued")
 #: (bnaylor). The header joins once the worker's first note arrives.
 QUEUED_KIND = "queued"
 
+#: Where a card's map entry remembers which of its trail lines were queued
+#: notices, so the terminal settle can drop them.
+QUEUED_LINES_KEY = "queued_lines"
+
 #: With ``KAGE_SLACK_UX`` on, the blocked kind that may post a question, and
 #: the terminal kind whose report may announce a PR (see ``slack_ux_moments``).
 NEEDS_YOU_KIND = "blocked"
@@ -850,7 +854,10 @@ async def deliver(
             result = result_line(kind, getattr(ev, "payload", None))
             shown = await _settle_plan_row(plan, adapter, sub, kind, result, title)
         if entry and entry["message_id"] and entry["lines"]:
-            settled = entry["lines"][-1:] if quiet else entry["lines"]
+            # A queued line says the card is waiting; once it settles that is
+            # stale, so the settled message keeps only the card's own notes.
+            notes = [line for line in entry["lines"] if line not in entry.get(QUEUED_LINES_KEY, ())]
+            settled = notes[-1:] if quiet else notes
             try:
                 await adapter.edit_message(
                     chat_id,
@@ -903,6 +910,8 @@ async def deliver(
         adapter, sub, metadata, header, title, line, _moved_to(kind, payload),
         _slack_plan(quiet), event_id, tracked,
     )
+    if kind == QUEUED_KIND and tracked.get(key):
+        tracked[key].setdefault(QUEUED_LINES_KEY, []).append(line)
     # The whole note, not the clipped line: a url past the clip is cut whole.
     note = progress_note(payload, limit=0) if kind == "heartbeat" else ""
     await _pr_opened(moments, adapter, sub, note or line, result)
