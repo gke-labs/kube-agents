@@ -14,6 +14,14 @@ import sys
 import tempfile
 import time
 import unittest
+
+_REPO_ROOT_FOR_IMPORTS = pathlib.Path(__file__).resolve().parent.parent
+if str(_REPO_ROOT_FOR_IMPORTS) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT_FOR_IMPORTS))
+try:
+    from tests.test_terraform_module_tests import _CLOSE as _HCL_CLOSE, _OPEN as _HCL_OPEN, _STR as _HCL_STR, _WORD as _HCL_WORD, _tokens as _hcl_tokens
+except ImportError:  # run from inside tests/
+    from test_terraform_module_tests import _CLOSE as _HCL_CLOSE, _OPEN as _HCL_OPEN, _STR as _HCL_STR, _WORD as _HCL_WORD, _tokens as _hcl_tokens
 import urllib.error
 from datetime import datetime, timezone
 from pathlib import Path
@@ -3944,11 +3952,17 @@ class ProwRunnerRolesMatchGrantersTest(unittest.TestCase):
 # so the role has to be on the project before the first apply that needs it:
 # the stack's startup-fail VM shipped without compute.instanceAdmin.v1 and the
 # first on-merge apply failed on each project it reached.
+# compute.viewer: the GKE provider lists each node pool's instance group
+# managers on refresh (the provisioning script's comment, seen live 2026-09-28),
+# and the compute provider reads the VM's zone and image. iam.serviceAccountUser:
+# every node pool runs as the stack's own node service account, which is an
+# act-as. serviceusage.serviceUsageConsumer is held for the provider itself,
+# whose calls name the project as their quota project (FLEET_PROVIDER_ROLES).
 FLEET_RESOURCE_ROLES = {
-    "google_container_cluster": {"roles/container.admin"},
-    "google_container_node_pool": {"roles/container.admin"},
+    "google_container_cluster": {"roles/container.admin", "roles/compute.viewer", "roles/iam.serviceAccountUser"},
+    "google_container_node_pool": {"roles/container.admin", "roles/compute.viewer", "roles/iam.serviceAccountUser"},
     "google_compute_disk": {"roles/compute.storageAdmin"},
-    "google_compute_instance": {"roles/compute.instanceAdmin.v1"},
+    "google_compute_instance": {"roles/compute.instanceAdmin.v1", "roles/compute.viewer"},
     "google_service_account": {"roles/iam.serviceAccountAdmin"},
     "google_service_account_iam_member": {"roles/iam.serviceAccountAdmin"},
     "google_project_iam_member": {"roles/resourcemanager.projectIamAdmin"},
@@ -3960,41 +3974,66 @@ FLEET_RESOURCE_ROLES = {
 # Every kubernetes_* resource is an in-cluster write, which container.admin
 # grants through the GKE IAM webhook.
 FLEET_KUBERNETES_ROLES = {"roles/container.admin"}
+# Needed by every google_* call regardless of type.
+FLEET_PROVIDER_ROLES = {"roles/serviceusage.serviceUsageConsumer"}
 
 
 class FleetResourceTypesAreCoveredByReconcilerRolesTest(unittest.TestCase):
     """Every resource type the fleet stack declares maps to roles the reconciler holds."""
 
     _FLEET = checker._ROOT / "bench" / "tf" / "fleet"
-    # The scan reads *.tf files and their resource and data blocks. Anything
-    # else tofu might load is refused rather than enumerated: a file that is
-    # not *.tf and not one of the directory's known inert files, and a
-    # top-level block kind that is neither read nor known to load no provider.
+    # The scan reads *.tf files through the repository's HCL tokenizer
+    # (tests/test_terraform_module_tests.py: comments dropped, strings and
+    # heredocs one token each, templates followed) and takes the resource and
+    # data blocks at depth 0. Anything else tofu might load is refused rather
+    # than enumerated: a file that is not *.tf and not one of the directory's
+    # known inert files, a top-level block kind that is neither read nor known
+    # to load no provider, and a read block whose header the scan cannot read.
     _INERT_FILES = {"README.md", ".terraform.lock.hcl", "fixtures.json", "reconcile-allow.json"}
     _READ_BLOCKS = {"resource", "data"}
     _INERT_BLOCKS = {"terraform", "provider", "variable", "output", "locals"}
 
-    def _blocks(self):
-        blocks = []
+    def _headers(self):
+        """(kind, label tokens) for every top-level block in the stack."""
+        headers = []
         for path in sorted(self._FLEET.glob("*.tf")):
-            blocks.extend(_hcl_top_level_blocks(path.read_text()))
-        return blocks
+            tokens, depth = _hcl_tokens(path.read_text()), 0
+            for index, token in enumerate(tokens):
+                if token[0] == _HCL_OPEN:
+                    if depth == 0:
+                        # Back to the keyword that opened this block.
+                        words = index
+                        while words > 0 and tokens[words - 1][0] != _HCL_WORD:
+                            words -= 1
+                        if words > 0:
+                            headers.append((tokens[words - 1][1], tokens[words:index]))
+                    depth += 1
+                elif token[0] == _HCL_CLOSE:
+                    depth -= 1
+            self.assertEqual(depth, 0, f"{path.name}: unbalanced braces after tokenizing; the scan cannot trust this file")
+        return headers
 
     def _types(self):
-        types = {label for kind, label in self._blocks() if kind in self._READ_BLOCKS and label}
+        types = set()
+        for kind, labels in self._headers():
+            if kind in self._READ_BLOCKS:
+                self.assertTrue(len(labels) == 2 and all(l[0] == _HCL_STR for l in labels), f"a {kind} block whose header the scan cannot read: {labels!r}; write it as tofu fmt does")
+                types.add(labels[0][1])
         self.assertGreater(len(types), 10)
         return types
 
     def test_the_scan_sees_everything_tofu_would_load(self):
         strangers = sorted(p.name for p in self._FLEET.iterdir() if p.is_file() and not p.name.endswith(".tf") and p.name not in self._INERT_FILES)
         self.assertEqual(strangers, [], "a file the scan does not read (tofu also loads *.tofu, *.tf.json, *.tofu.json): extend the scan or name it inert here")
-        kinds = sorted({kind for kind, _ in self._blocks()} - self._READ_BLOCKS - self._INERT_BLOCKS)
+        kinds = sorted({kind for kind, _ in self._headers()} - self._READ_BLOCKS - self._INERT_BLOCKS)
         self.assertEqual(kinds, [], "a top-level block kind the scan does not read (module, ephemeral, action, ...): extend the scan")
 
     def test_every_type_in_the_stack_is_mapped_and_its_roles_are_held(self):
         unmapped, unheld = [], []
         for rtype in sorted(self._types()):
             needed = FLEET_KUBERNETES_ROLES if rtype.startswith("kubernetes_") else FLEET_RESOURCE_ROLES.get(rtype)
+            if needed is not None and rtype.startswith("google_"):
+                needed = needed | FLEET_PROVIDER_ROLES
             if needed is None:
                 unmapped.append(rtype)
             elif not needed <= checker.FLEET_RECONCILER_ROLES:
@@ -4004,6 +4043,14 @@ class FleetResourceTypesAreCoveredByReconcilerRolesTest(unittest.TestCase):
 
     def test_the_table_carries_no_type_the_stack_no_longer_uses(self):
         self.assertEqual(sorted(set(FLEET_RESOURCE_ROLES) - self._types()), [])
+
+    def test_every_granted_role_is_accounted_for_by_a_type_or_the_provider(self):
+        # The reverse direction: a role in the reconciler's set that no type
+        # and not the provider needs is either a stale grant or a type the
+        # table maps too thinly (the leg that would miss compute.viewer gone).
+        accounted = set().union(FLEET_PROVIDER_ROLES, FLEET_KUBERNETES_ROLES, *FLEET_RESOURCE_ROLES.values())
+        self.assertEqual(sorted(checker.FLEET_RECONCILER_ROLES - accounted), [], "a reconciler role no mapped type needs: map the type that needs it, or drop the grant")
+        self.assertLessEqual(FLEET_PROVIDER_ROLES, checker.FLEET_RECONCILER_ROLES)
 
 
 class FleetReconcilerRolesMatchGrantersTest(unittest.TestCase):
@@ -5007,9 +5054,8 @@ class TokenMinterKmsHalfTest(unittest.TestCase):
 
 def _without_hcl_comments(text):
     """HCL's three comment forms stripped: `#`, `//` and `/* */`, outside
-    string literals (a `principalSet://...` member is not a comment) and
-    outside heredocs, whose bodies are literal. A role commented out in any
-    of them is a role removed."""
+    string literals (a `principalSet://...` member is not a comment). A role
+    commented out in any of them is a role removed."""
 
     out, i, n, in_string = [], 0, len(text), False
     while i < n:
@@ -5026,14 +5072,6 @@ def _without_hcl_comments(text):
             in_string = True
             out.append(c)
             i += 1
-        elif text.startswith("<<", i) and (heredoc := re.match(r"<<-?([A-Za-z_]\w*)\r?\n", text[i:])):
-            # A heredoc body is literal text: no comment and no string in it,
-            # and its own `/*`, `#` or `"` must not open one. Copied verbatim
-            # through the line that holds the marker alone.
-            end = re.compile(r"^[ \t]*" + re.escape(heredoc.group(1)) + r"[ \t]*$", re.MULTILINE).search(text, i + heredoc.end())
-            stop = n if end is None else end.end()
-            out.append(text[i:stop])
-            i = stop
         elif text.startswith("/*", i):
             end = text.find("*/", i + 2)
             i = n if end < 0 else end + 2
@@ -5045,36 +5083,6 @@ def _without_hcl_comments(text):
             i += 1
     return "".join(out)
 
-
-def _hcl_top_level_blocks(text):
-    """(kind, first label or None) for every top-level block, read through
-    comments, strings and heredocs with a brace depth count, so a nested
-    block, a `${...}` in a string or a brace in a heredoc is not a block."""
-    text = _without_hcl_comments(text)
-    blocks, depth, i, n = [], 0, 0, len(text)
-    while i < n:
-        c = text[i]
-        if c == '"':
-            i += 1
-            while i < n and text[i] != '"':
-                i += 2 if text[i] == "\\" else 1
-            i += 1
-            continue
-        if text.startswith("<<", i) and (heredoc := re.match(r"<<-?([A-Za-z_]\w*)\r?\n", text[i:])):
-            end = re.compile(r"^[ \t]*" + re.escape(heredoc.group(1)) + r"[ \t]*$", re.MULTILINE).search(text, i + heredoc.end())
-            i = n if end is None else end.end()
-            continue
-        if c == "{":
-            if depth == 0:
-                header = text[text.rfind("\n", 0, i) + 1 : i]
-                m = re.match(r'\s*([a-z_]+)(?:\s+"([^"]*)")?', header)
-                if m:
-                    blocks.append((m.group(1), m.group(2)))
-            depth += 1
-        elif c == "}":
-            depth -= 1
-        i += 1
-    return blocks
 
 
 class PoolStateReaderMatchesTerraformTest(unittest.TestCase):
@@ -5102,19 +5110,6 @@ class PoolStateReaderMatchesTerraformTest(unittest.TestCase):
         stripped = _without_hcl_comments(text)
         self.assertEqual(re.findall(r'"([^"]+)"', stripped), ["a", "f", "principalSet://iam.googleapis.com/locations/global/workforcePools/p/*", "with # hash"])
         self.assertEqual(re.search(r"x\s*=\s*\[(.*?)\]", stripped, re.S).group(1).count('"'), 8, "the bracket in the comment did not end the list")
-
-    def test_the_comment_strip_leaves_a_heredoc_alone(self):
-        # A heredoc body is literal: its `/*`, `#` and odd `"` open nothing,
-        # and the text after it is still read.
-        text = 'script = <<-EOT\n  rm -rf /tmp/* # not a comment\n  echo "odd\nEOT\nafter = "kept" # gone\n'
-        stripped = _without_hcl_comments(text)
-        self.assertIn('rm -rf /tmp/* # not a comment', stripped)
-        self.assertIn('after = "kept"', stripped)
-        self.assertNotIn("# gone", stripped)
-
-    def test_top_level_blocks_are_read_through_nesting_strings_and_heredocs(self):
-        text = 'resource "google_compute_instance" "a" {\n  boot_disk {\n    x = "${var.y}"\n  }\n  script = <<-EOT\n    if [ {a} ]; then /* x */ fi\n  EOT\n}\n  data   "google_client_config" "d" {}\n/* resource "google_pubsub_topic" "parked" {} */\nlocals {\n  m = { k = "v" }\n}\n'
-        self.assertEqual(_hcl_top_level_blocks(text), [("resource", "google_compute_instance"), ("data", "google_client_config"), ("locals", None)])
 
 
 if __name__ == "__main__":
