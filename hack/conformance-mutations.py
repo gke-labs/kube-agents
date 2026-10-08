@@ -1254,6 +1254,32 @@ Mutation(
         "naming a cloud identity is still honoured",
     ),
     Mutation(
+        "A3-slack-allowlist-skipped",
+        "a2a/gateway/gchat.go",
+        ('\tif authorID == "" || (!g.slackAllowAll && !g.slackAllowed[authorID]) {',
+         '\tif authorID == "" {'),
+        "test_A3_an_unlisted_slack_sender_resolves_to_nothing",
+        "drop the Slack allowlist now that the map is no longer a gate, so any "
+        "member of the workspace is admitted as slack:<member id>",
+    ),
+    Mutation(
+        "A3-slack-foreign-workspace-admitted",
+        "a2a/gateway/slack.go",
+        ("\tif s.foreignSender(m) {\n\t\treturn InboundMessage{}, false\n\t}\n", ""),
+        "test_A3_another_workspaces_member_is_not_a_turn",
+        "drop the workspace check, so under allow-all a Slack Connect guest from "
+        "another organisation is admitted as slack:<member id> with the install's "
+        "capability",
+    ),
+    Mutation(
+        "A3-slack-map-asserts-member-prefix",
+        "a2a/gateway/gchat.go",
+        ("\t\tif strings.HasPrefix(mapped, slackMemberPrincipalPrefix) {", "\t\tif false {"),
+        "test_A3_the_slack_map_cannot_assert_a_member_id_principal",
+        "honour a map value that carries the reserved slack: prefix, so a map "
+        "entry can name a principal that claims to be some other member's id",
+    ),
+    Mutation(
         "C1-session-fence-selector-drift",
         "a2a/gateway/spawn.go",
         ('\tsessionRole = "a2a-session"', '\tsessionRole = "a2a-worker"'),

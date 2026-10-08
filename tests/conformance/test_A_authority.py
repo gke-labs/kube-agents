@@ -427,6 +427,51 @@ class A3TheA2ADoorIsDarkUnlessTheOperatorOpensIt(unittest.TestCase):
         )
 
 
+class A3TheGatewaysSlackPrincipalComesFromSlackOrTheMap(unittest.TestCase):
+    """A3 on the gateway's Slack backend under `next`: the allowlist is the
+    admission gate, and the principal is either the IdP identity the admin's
+    map joins to the member id, or the member id Slack asserted, qualified
+    `slack:`.  The map is an override and not a gate, so three things carry
+    the invariant: a member of another workspace (a Slack Connect guest) is
+    not a turn at all, so admission never reaches past the install's own
+    workspace; an unlisted sender resolves to nothing whatever the map says;
+    and the map cannot assert the reserved prefix, so a principal that claims
+    to be a bare member id always is one.
+    """
+
+    def test_A3_an_unlisted_slack_sender_resolves_to_nothing(self) -> None:
+        body = h.go_function_body(h.text("a2a_slack_identity"), "slackPrincipal")
+        self.assertRegex(
+            body,
+            r'if authorID == "" \|\| \(!g\.slackAllowAll && !g\.slackAllowed\[authorID\]\) \{\s*return "", false',
+            "a Slack sender off the allowlist (or with no member id) is no longer refused",
+        )
+
+    def test_A3_another_workspaces_member_is_not_a_turn(self) -> None:
+        source = h.text("a2a_slack_ingress")
+        inbound = h.go_function_body(source, "inbound")
+        self.assertRegex(
+            inbound,
+            r"if s\.foreignSender\(m\) \{\s*return InboundMessage\{\}, false",
+            "the Slack ingress no longer refuses a member of another workspace before admission",
+        )
+        foreign = h.go_function_body(source, "foreignSender")
+        self.assertIn(
+            "if !s.otherWorkspace(m.UserTeam) && (m.Message == nil || !s.otherWorkspace(m.Message.Team)) {",
+            foreign,
+        )
+        other = h.go_function_body(source, "otherWorkspace")
+        self.assertIn('return team != "" && (s.teamID == "" || team != s.teamID)', other)
+
+    def test_A3_the_slack_map_cannot_assert_a_member_id_principal(self) -> None:
+        body = h.go_function_body(h.text("a2a_slack_identity"), "slackPrincipal")
+        self.assertRegex(
+            body,
+            r"if strings\.HasPrefix\(mapped, slackMemberPrincipalPrefix\) \{\s*return \"\", true",
+            "a map value carrying the reserved slack: prefix is no longer refused",
+        )
+
+
 RBAC_GROUP = "rbac.authorization.k8s.io"
 
 # The ClusterRoles the operator is allowed to hold `bind` over, and why each is

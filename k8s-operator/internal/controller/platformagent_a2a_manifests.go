@@ -516,8 +516,8 @@ const (
 	// Secret of spec-chatops-gateway.md, "The Slack adapter", when Slack is
 	// armed, and otherwise the hand-made principal-map ConfigMap that is
 	// Discord's test table. Optional either way, which is the gateway's own
-	// rule for a missing map: it runs, and every sender drops at
-	// verification.
+	// rule for a missing map: it runs, Discord senders drop at verification,
+	// and listed Slack senders are attributed by member id.
 	a2aPrincipalMapEnvVar          = "A2A_PRINCIPAL_MAP"
 	a2aPrincipalMapDir             = "/etc/a2a/principal-map"
 	a2aPrincipalMapVolume          = "principal-map"
@@ -4144,8 +4144,9 @@ func buildA2AGatewayNetworkPolicy(agent *agentv1alpha1.PlatformAgent) *networkin
 // principal-map ConfigMap, Discord's test table, which never maps a real
 // principal. The eval door's map is its own ConfigMap at its own path and is
 // not this volume. Optional either way, for the gateway's own reason: an
-// install without its table runs and drops every sender at verification,
-// visibly.
+// install without its table runs. Without Discord's table every Discord
+// sender drops at verification, visibly; without Slack's, every listed Slack
+// sender is attributed by member id, because the table is an override.
 func a2aPrincipalMapVolumeSource(agent *agentv1alpha1.PlatformAgent) corev1.Volume {
 	if a2aSlackArmed(agent) {
 		return corev1.Volume{
@@ -4295,10 +4296,11 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 			{Name: a2aSlackAppTokenEnvVar, ValueFrom: &corev1.EnvVarSource{SecretKeyRef: a2aRequiredSecretRef(slack.AppTokenSecretRef, a2aSlackAppTokenEnvVar)}},
 			// The allowed-users gate, carried on Chat's terms (see the Chat
 			// pair below): normalized the way the gateway reads it, the
-			// allow-all flag the legacy rule on the RAW list. The gateway
-			// admits a Slack sender only if this gate AND the principal map
-			// both pass, so a mapped member the CR does not allow is
-			// refused under next as under today.
+			// allow-all flag the legacy rule on the RAW list. This is the
+			// gateway's only Slack admission gate (beside refusing another
+			// workspace's member): the principal map overrides attribution,
+			// so a mapped member the CR does not allow is refused under next
+			// as under today.
 			{Name: a2aSlackAllowedUsersEnvVar, Value: strings.Join(a2aAllowlist(slack.AllowedUsers), ",")},
 			{Name: a2aSlackAllowAllUsersEnvVar, Value: strconv.FormatBool(allowAllUsers(slack.AllowedUsers))},
 		}

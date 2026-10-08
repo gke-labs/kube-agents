@@ -558,9 +558,11 @@ How `principal` gets established depends on the backend, and the three are not e
   shape the mechanism is topic IAM, and the impersonation surface is exactly the set of
   identities holding `pubsub.publisher` on the topic. The Google Chat adapter section
   below names it precisely.)
-- **Slack:** join on the immutable `user_id` against a mapping table we maintain from our
-  own IdP. Never `profile.email` - whether that field is IdP-asserted or user-editable
-  depends on workspace config we don't control.
+- **Slack:** the immutable `user_id`, admitted by the allowed-users list. A mapping table
+  we maintain from our own IdP joins it to an IdP identity when it names the member;
+  otherwise the principal is the member id itself, `slack:<user_id>`, as Chat's is the
+  email Google asserts. Never `profile.email` - whether that field is IdP-asserted or
+  user-editable depends on workspace config we don't control.
 - **Discord:** a checked-in test mapping table from Discord user id to a test principal.
   Test-only, by construction: a Discord identity never maps to a real cloud principal,
   full stop.
@@ -1088,9 +1090,11 @@ slack platform and its relay env are off (`legacySlackConsumer`); under `today`,
 over the way Chat's does (2026-10-06): the operator renders it as `A2A_SLACK_ALLOWED_USERS`,
 normalized the way the gateway reads it, with `A2A_SLACK_ALLOW_ALL_USERS` from the legacy
 consumer's rule on the raw list (absent, or a single empty string, is everyone), so one CR
-means one thing in both modes. The gateway then admits a Slack sender only if the list
-admits them (exact `user_id` match, no case fold) AND the principal map below resolves
-them; allow-all lifts the list, never the map. Two things do not carry over on the flip:
+means one thing in both modes. The gateway then admits a Slack sender only if they belong
+to the bot's own workspace (a Slack Connect guest from another organisation is not a turn;
+see the mapping-table paragraph below) and the list admits them (exact `user_id` match, no
+case fold). The principal map below is an optional override for attribution, not a second
+gate. Two things do not carry over on the flip:
 the broker reads `SLACK_BOT_TOKEN` as a comma-separated list, one token per workspace,
 where the gateway's adapter takes one token, so a multi-workspace install stays on
 `today`; and `homeChannel` goes with the Hermes slack platform, so proactive alerts have no
@@ -1115,9 +1119,10 @@ again: the broker's Socket Mode relay and the Hermes slack platform. The reconci
 the A2A objects on skew rather than touching them, and a Slack gateway holds the token pair
 in its own pod env, so the frozen gateway keeps its own Socket Mode connection beside the
 legacy one, until the operator recognises the mode again. Slack delivers each event to one
-of the two connections, and the two consumers do not admit the same senders: both gate on
-`allowedUsers`, but the gateway also requires the principal map. A sender admitted by one gate
-and not the other is answered or dropped depending on which consumer receives the event. Chat's
+of the two connections. Both admit by `allowedUsers`, but only the gateway refuses another
+workspace's member, so a Slack Connect guest is answered or dropped depending on which
+consumer receives the event (as is a sender whose map entry carries the reserved `slack:`
+prefix, which only the gateway refuses). Chat's
 frozen gateway goes quiet instead, because it reaches Chat only through the broker's A2A
 relay, which the re-rendered broker drops. The Chat-identical rule was kept and the
 behaviour documented (2026-10-06).
@@ -1140,7 +1145,8 @@ registry, which it asks whether a task has started in that thread (a record alon
 not enough, since one is minted for any verified turn, a "stop" with nothing running
 included). Nothing is derived from the root message. A mention on its own starts
 nothing and makes nothing a session thread, whoever typed it, so a channel mention from
-a sender the gateway refuses (the allowlist, then the principal map) roots nothing. A session thread stays one while a
+a sender the gateway refuses (another workspace's member, or one the allowlist does not
+admit) roots nothing. A session thread stays one while a
 task runs there or the session has had activity within the idle TTL; past that, the
 thread needs a fresh mention. The activity that counts is the last task's own: its start,
 and an executor's terminal for it, so the window opens at the answer, not at the ask that
@@ -1160,14 +1166,35 @@ applies; Discord's group DMs read as DMs, and the asymmetry is deliberate. The b
 only sees channels it has been invited to, so the invitation is the trust boundary for
 group ingress.
 
-**The mapping table - where it lives and who writes it.** The join is Slack's immutable
-`user_id` against a table sourced from our own IdP; never `profile.email` (the identity
-section above says why). The table is a Kubernetes Secret, mounted read-only at the
-gateway's principal-map path, same file format the Discord ConfigMap uses.
+**The mapping table - where it lives and who writes it.** The table is an optional
+override, not an admission gate: the allowed-users list admits, and the table joins an
+admitted sender's immutable `user_id` to an identity sourced from our own IdP; never
+`profile.email` (the identity section above says why). A sender the table does not name
+is attributed by member id, `slack:<user_id>`, with `verifiedBy`
+`slack-socket-mode`. The `slack:` prefix is reserved: a table value that carries it is
+refused (the sender drops, with an error in the gateway's log), so a principal that
+claims to be a bare member id always is one. The Slack principal decides attribution
+only: capability is minted from the install's tier for every sender, and sessions have no
+owner.
+
+Because an unmapped sender's member id is enough to be admitted, admission must not reach
+past the install's own workspace. Slack names the sender's workspace as `user_team` on a
+message in a channel shared between workspaces, and a message's own `team` field names the
+workspace it was posted from. The gateway refuses a message that names a workspace other
+than the bot's own (from `auth.test`) in either: it is not a turn, silent to the sender,
+and logged when it addressed the bot. Without a team id from `auth.test` it refuses any
+message that names a workspace, and warns once at start. A message that names no workspace
+in either field is taken as our own member's, which rests on Slack setting them on a
+shared channel's messages; no captured Slack Connect payload has confirmed it yet. Under allow-all this is the only boundary on
+who may reach the bot, and it is stricter than the legacy consumer, which has no such
+check. Under Enterprise Grid a member of a sister workspace in a shared channel is refused
+too, since the event does not carry the sender's enterprise.
+
+The table is a Kubernetes Secret, mounted read-only at the gateway's principal-map path, same file format the Discord ConfigMap uses.
 `a2a-slack-principal-map` is the name the operator mounts under `next`: alone at the
 gateway's one principal-map path, optional, so an install without its table is the
-gateway's own case (it runs, and every Slack sender drops at verification, with the
-warning the gateway logs when the map is empty). Alone because the gateway reads that
+gateway's own case (it runs, and every listed sender is attributed by member id, which
+the gateway notes in its log at start). Alone because the gateway reads that
 directory as one flat map and resolves a Slack sender against every key in it: the
 hand-made `principal-map` ConfigMap, Discord's table, mounted there too would let a
 ConfigMap write add a Slack `user_id`, so a Slack-armed gateway does not mount it. Every
@@ -1186,25 +1213,27 @@ the API server audit log. Generating
 the Secret's content from the IdP is a job we do not build yet; until it exists the
 table is maintained by hand, which is honest at the current install count.
 
-**Unmapped senders.** Dropped at ingress, as everywhere - but visibly now: the gateway
+**Unverified senders.** Dropped at ingress, as everywhere (on Slack that is an unlisted
+sender; an unmapped one is attributed by member id, below) - but visibly now: the gateway
 posts a one-line notice to the conversation, once per sender, and keeps the structured
 log line. A silent drop of a real user is a support burden. Per sender, not per
 conversation - a channel mention mints a fresh conversation every time, so a
 conversation-scoped dedupe would be no bound at all. The memory is capped and evicted
 wholesale at the cap, so the worst an unverified sender can do is make one notice
 repeat. This is gateway behavior, not Slack behavior, so Discord and Google Chat get
-it too - the notice names the remedy for whichever backend it fires on (here both the
-allowed-users list and the principal map, the allowed-users list on gchat). On Slack the
-notice is the same whichever of the two refused, so it does not tell a sender which table
-they are missing from.
+it too - the notice names the remedy for whichever backend it fires on (the allowed-users
+list on Slack and gchat; on Slack it also names the principal map, for the one refusal the
+map still makes, a listed member whose entry carries the reserved `slack:` prefix). A listed
+sender the table does not name is attributed by member id, not dropped.
 
 **Roster.** Channel membership via the members API, one page; past a page the roster
 reports incomplete rather than paging (the roster cap truncates far below it anyway).
 Slack has no per-thread membership, and anyone in the channel can read the thread, so
 channel membership is the honest answer to "who could have read this." Members are
-resolved through the same gate as the requester, the allowed-users list and then the map,
-so a mapped member the list refuses is recorded by their backend id, as an unmapped one
-is, never under the principal the gateway declined to grant them.
+resolved through the same rule as the requester, the allowed-users list and then the map,
+so a mapped member the list refuses is recorded by their raw backend id, never under the
+principal the gateway declined to grant them, and a listed member the map does not name
+as `slack:<user_id>`, the principal they get as a requester.
 
 **One backend per gateway process.** The relay binds one durable, and two gateways on
 one durable split event deliveries - so config counts the armed backends and refuses
@@ -1214,8 +1243,9 @@ second Deployment with its own durable, when we want one. The inject side door i
 in that count - it may sit beside any one of the three, for the reason the inject
 section gives - and neither is the console adapter, which has no durable to split.
 
-`verifiedBy` is `slack-socket-mode+principal-map`: Slack authenticated the sender over
-the socket and asserted the `user_id`, our table joined it to a principal. Rendering
+`verifiedBy` is `slack-socket-mode+principal-map` when our table joined the sender to a
+principal, and `slack-socket-mode` when it did not: either way Slack authenticated the
+sender over the socket and asserted the `user_id`. Rendering
 into mrkdwn is a narrow deterministic translation of the two forms the relay emits
 (bold, links); the legacy Hermes converter stays where it is. The translation leaves
 code spans as written, converts bold only on a closed `**` pair, never alters a

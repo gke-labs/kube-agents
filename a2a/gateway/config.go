@@ -117,13 +117,14 @@ type Config struct {
 	// SlackAllowedUsers is the Slack backend's ingress allowlist, carried
 	// from spec.integration.slack.allowedUsers the way GchatAllowedUsers is
 	// from Chat's: the gate the legacy path enforces as SLACK_ALLOWED_USERS.
-	// Unlike gchat, Slack also has a mapping table (PrincipalMapPath), and a
-	// sender must pass both: listed (or allow-all) AND mapped. Member ids
-	// compare exactly.
+	// It is the only admission gate (beside the gateway's refusal of another
+	// workspace's member); Slack's mapping table (PrincipalMapPath) is an
+	// optional override that attributes a listed sender by an IdP identity.
+	// Member ids compare exactly.
 	SlackAllowedUsers []string
 	// SlackAllowAllUsers disables the Slack allowlist, stated explicitly -
-	// mirroring the legacy SLACK_ALLOW_ALL_USERS posture. The map still
-	// applies.
+	// mirroring the legacy SLACK_ALLOW_ALL_USERS posture. Another
+	// workspace's member is still refused.
 	SlackAllowAllUsers bool
 
 	// InjectListen is the inject side door's HTTP listen address, and setting

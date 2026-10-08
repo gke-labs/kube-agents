@@ -259,19 +259,23 @@ func New(o Options) (*Gateway, error) {
 			"so nothing but the A2A door and the console can reach this install")
 	}
 	// gchat resolves identity from the Google-asserted email, not from the
-	// map — an empty map is only a lockout on the backends that use one
-	// (Discord's test table and Slack's user_id join alike). The console
-	// does not use one either: its grant is the mechanism, since only the
-	// console credential may publish on the console subject. And a gateway
-	// whose only ingress is the side door uses the door's map below instead
-	// of this one. Slack is the case that matters operationally: the
-	// operator projects its map Secret as optional, so a Slack gateway on
-	// an install that never created it would otherwise pass boot silently
-	// and drop every sender.
+	// map — an empty map is a lockout only on Discord, whose test table is
+	// its whole identity join. On Slack the map is an optional override (the
+	// allowlist admits, and an unmapped sender is attributed by member id),
+	// so an empty one is noted, not warned. The console does not use one
+	// either: its grant is the mechanism, since only the console credential
+	// may publish on the console subject. And a gateway whose only ingress
+	// is the side door uses the door's map below instead of this one.
 	// Naming the backend matters, because the other ingresses beside it
 	// keep working.
-	if (backend == discordBackend || backend == slackBackend) && pm.Len() == 0 {
-		log.Warn(fmt.Sprintf("principal map is empty; every %s message will be dropped at verification", backend),
+	switch {
+	case backend == discordBackend && pm.Len() == 0:
+		log.Warn("principal map is empty; every discord message will be dropped at verification",
+			"path", o.Config.PrincipalMapPath)
+	case backend == slackBackend && pm.Len() == 0:
+		// Not a warning since the map became an override: every listed
+		// sender is admitted and attributed by member id.
+		log.Info("the Slack principal map is empty; listed senders are attributed by their Slack member id",
 			"path", o.Config.PrincipalMapPath)
 	}
 	// The side door's map, which is a different file and not a section of
@@ -677,7 +681,7 @@ func (g *Gateway) routeTurn(ctx context.Context, msg InboundMessage, backend, pr
 	}
 	resolveRoster := g.rosterResolver(backend)
 	authority := BuildAuthority(g.ps, resolveRoster, principal, backend, msg.AuthorID,
-		verifiedByFor(backend), msg.Conversation, rec.Kind, rosterIDs, rosterComplete)
+		g.verifiedByOf(backend, principal), msg.Conversation, rec.Kind, rosterIDs, rosterComplete)
 	rec.Roster = hashRoster(g.ps, resolveRoster, rosterIDs)
 
 	// Heal a stale ActiveTask before routing: if the task is already
@@ -1795,6 +1799,16 @@ func messagePayload(text, taskID, contextID string) ([]byte, error) {
 	})
 }
 
+// verifiedByOf is the mechanism the authority block records for one
+// requester. Per backend everywhere but Slack, whose principal came either
+// from the map's join or from the member id alone (slackVerifiedByFor).
+func (g *Gateway) verifiedByOf(backend, principal string) string {
+	if backend == slackBackend {
+		return slackVerifiedByFor(principal)
+	}
+	return verifiedByFor(backend)
+}
+
 // rosterResolver picks the principal resolution to apply to one backend's
 // roster ids, and two things decide it.
 //
@@ -1805,19 +1819,23 @@ func messagePayload(text, taskID, contextID string) ([]byte, error) {
 // H("nats:console") - the requester missing from its own audience.
 //
 // Slack goes the same way for a different reason: its requester passes the
-// allowlist before the map (resolvePrincipal), and a roster read under the
-// map alone would name a mapped member the allowlist refuses by the
+// allowlist before the map (resolveSlackPrincipal), and a roster read under
+// the map alone would name a mapped member the allowlist refuses by the
 // principal the gateway just declined to grant them. Through
-// resolvePrincipal that member is recorded by backend id instead, like any
-// unmapped one.
+// resolvePrincipal that member is recorded by raw backend id instead, and a
+// listed member the map does not name by slack:<member id>, which is the
+// principal they get as a requester.
 //
 // Every other backend resolves in its OWN map rather than in whichever one
 // the gateway happens to hold, which is principalMapFor: the roster has to
 // be read under the same map the requester's principal was read under, and
 // one backend's map is never a fallback for another's.
 func (g *Gateway) rosterResolver(backend string) func(string) string {
-	if backend == consoleBackend || backend == slackBackend {
+	if backend == consoleBackend {
 		return func(id string) string { return g.resolvePrincipal(backend, id) }
+	}
+	if backend == slackBackend {
+		return g.slackRosterPrincipal
 	}
 	return g.principalMapFor(backend).Resolve
 }

@@ -289,6 +289,16 @@ SOURCES: dict[str, Source] = {
         "a2a/gateway/gchat.go",
         ("func (g *Gateway) resolveA2APrincipal", "a2aPrincipalPrefix + authorID"),
     ),
+    # The gateway's Slack identity rule: the allowlist gates, the map
+    # overrides, and the member id is the principal otherwise.
+    "a2a_slack_ingress": Source(
+        "a2a/gateway/slack.go",
+        ("func (s *SlackAdapter) inbound(", "func (s *SlackAdapter) foreignSender(", "func (s *SlackAdapter) otherWorkspace("),
+    ),
+    "a2a_slack_identity": Source(
+        "a2a/gateway/gchat.go",
+        ("func (g *Gateway) slackPrincipal(", "slackMemberPrincipalPrefix"),
+    ),
     # labelPartOf lives here rather than beside the fence, so resolving the
     # operator's side of the pair needs both files.
     "operator_labels": Source(
