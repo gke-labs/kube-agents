@@ -320,7 +320,7 @@ class PlantScriptsTest(unittest.TestCase):
             stub.chmod(stub.stat().st_mode | stat.S_IXUSR)
         done = subprocess.run(
             ["bash", "-c", render(teardown)],
-            capture_output=True, text=True, check=False,
+            capture_output=True, text=True, check=False, stdin=subprocess.DEVNULL,
             env={**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}"},
         )
         self.assertEqual(calls.read_text().split(), ["gcloud", "kubectl"], done.stderr)

@@ -245,7 +245,7 @@ class DelegationCeilingTest(unittest.TestCase):
                 "CASES_ON_STREAM=1 STACK_WAIT=0 name=capacity-pinned-pool-probe audit_id= has_stack=1\n" + computed,
             ]
         )
-        self.assertEqual(run_bash(body).stdout.split(), ["6300", "6000", "12600", "7200", "6900"])
+        self.assertEqual(run_bash(body).stdout.split(), ["11100", "10800", "22200", "12000", "11700"])
 
 
 class PerCaseGradingTest(unittest.TestCase):

@@ -19,7 +19,8 @@ scan settles, by marking each due on that profile's roster. A started audit leav
 row in the profile's ``cron/executions.db``. The case's stack
 (``bench/tf/prebuilt/oobe-first-run-audits``) records when it armed the stage in its
 state file, and the stage records when it marked each audit; this passes when every audit
-has a run of its own claimed at or after its mark that is running or has completed.
+has a run of its own claimed at or after its mark that got going: running, completed, or
+ended after it started.
 
 Its own module rather than a section of ``verifiers.py``, registered through the same
 ``devops_bench.verifiers`` entry-point group.
@@ -46,8 +47,8 @@ STATE_FILE = f"{DATA_ROOT}/.bench-oobe.json"
 AUDITS_MARKER = f"{DATA_ROOT}/.oobe_audits_fired"
 PLATFORM_EXECUTIONS_DB = f"{DATA_ROOT}/profiles/platform/cron/executions.db"
 STARTS_READ = "__OOBE_STARTS_READ__"
-# A run that got going: the scheduler has it, or it ended without being lost.
-# A claimed row the run never left and a failed one say the audit did not run.
+# A run that got going by its status; a run that ended otherwise counts too when it has a
+# started_at (it began, then failed or was cut off). A row with no start time ran nothing.
 STARTED_STATUSES = ("running", "completed")
 # The gateway Deployment, as the stack names it (variables.tf: agent_deployment). Exec goes
 # there rather than through AGENT_SERVICE_NAME, which can name a tunnel in front of the

@@ -138,15 +138,17 @@ readonly EVAL_INFLIGHT_POLL_STEP_SECONDS=5
 # wait_platform_runs (beside release_inflight_note): the gateway's agent
 # container, the interpreter it runs the read with and the home holding the
 # Platform Agent's cron store, how long a unit waits for a run the install started on
-# one of its streams, and how often it looks. The wait outlasts one audit run
-# (9-15 minutes, #985) started just before the unit, with room for the
-# scheduler to claim a mark first; a pending stage's next audit adds at most
-# one run before it. A stage oobe-first-run-audits left armed can have more of
-# its chain to run than that; the bound caps the wait either way.
+# one of its streams, and how often it looks. A unit may owe two runs: the one
+# before the audit a pending stage marks next, then that audit's own. Each is
+# counted for at most an hour (the stage's RUN_LIMIT_SECONDS and the read's
+# stale cutoff), and single runs here have reached 2739 s (the delegation
+# ceilings below), so the bound is two of those hours. It is reached only
+# while runs are really going; a stage oobe-first-run-audits left armed can
+# owe more, and the bound caps that too.
 readonly EVAL_GATEWAY_CONTAINER="platform-agent"
 readonly EVAL_GATEWAY_PYTHON="/opt/hermes/.venv/bin/python3"
 readonly EVAL_GATEWAY_HOME="/opt/data"
-readonly EVAL_PLATFORM_RUN_WAIT_SECONDS=2400
+readonly EVAL_PLATFORM_RUN_WAIT_SECONDS=7200
 readonly EVAL_PLATFORM_RUN_POLL_SECONDS=30
 # What a unit's lock deadline allows past its delegation timeout, for the
 # stack, the verifier and the state writes around the run.

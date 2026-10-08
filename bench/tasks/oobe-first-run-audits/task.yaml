@@ -28,7 +28,7 @@
 # it starts are real runs: each writes its ledger issue in the install's GitOps
 # repository and posts its summary wherever the install sends audit reports. The
 # runner holds their four streams' locks for the unit (`audit_streams` below), and
-# every unit on one of those streams first waits up to 40 minutes for a run the
+# every unit on one of those streams first waits up to two hours for a run the
 # install started there, so no audit case runs beside them and the next repetition
 # arms only once they have ended. Other stack-bearing cases are kept apart by the
 # infra lock.
