@@ -16,11 +16,27 @@ produces the deterministic half of the retrospective:
   (D) the guards     — one entry per classified failure in `guards.json`,
       which the daily readiness watch reads before the next upgrade.
 
+Symptoms, (C) rows and guards are keyed by a pod's top owner (Deployment,
+CronJob, StatefulSet, DaemonSet; a bare pod stays a Pod), so one finding
+covers every replica and a guard goes away when the owner's replacement pods
+are healthy. A budget stays keyed as a budget.
+
 A cluster is reviewed when it is *new* (absent from the ledger) or *upgraded*
 (a version differs from the ledger, or an upgrade operation started since the
-last run). Every other cluster is listed as unchanged. Reads that fail are
-recorded under "Reads that failed" instead of failing the run: a cluster this
-run could not reach is a gap the report names, not a reason to drop the rest.
+last run). Every other cluster is listed as unchanged.
+
+The Markdown report has three sections, Errors, Warnings and Info. An entry
+under the first two is one incident: one owner object (or budget) on one
+cluster, carrying the four parts above inline. Error is a high-confidence
+classified symptom on a user workload, an operation GKE reported failed, or a
+node NotReady after its pool was upgraded; Warning is a medium-confidence or
+unclassified symptom, anything in a system namespace, and a guard still live
+from an earlier run on a cluster this run did not review; Info is each clean
+review's (A) summary, the unchanged clusters, and the reads that failed. A
+read that fails is listed rather than failing the run: a cluster this run
+could not reach is a gap the report names, not a reason to drop the rest.
+The JSON carries the same grouping under `sections` beside the per-cluster
+`reviews`.
 
 Every subprocess goes through `default_run`; tests inject a fake in its place.
 Nothing here writes to a cluster: `gcloud ... list`, `get-credentials` into a
@@ -154,13 +170,24 @@ SIGNATURES = (
     (20, HIGH, SCOPE_REASON, re.compile(r"^(?:ImagePullBackOff|ErrImagePull)$")),
     (18, HIGH, SCOPE_CONTAINER, re.compile(r"nvidia|CUDA|Error 803")),
 )
-# The four reads per cluster, in the order the report's symptoms need them.
+# The reads per cluster. `owners` is the intermediates a pod's
+# ownerReferences stop at: a ReplicaSet names its Deployment and a Job its
+# CronJob only in their own metadata.
 KUBECTL_READS = (
     ("pods", ["kubectl", "get", "pods", "-A", "-o", "json"]),
     ("nodes", ["kubectl", "get", "nodes", "-o", "json"]),
     ("events", ["kubectl", "get", "events", "-A", "--field-selector", "type=Warning", "-o", "json"]),
     ("pdbs", ["kubectl", "get", "pdb", "-A", "-o", "json"]),
+    ("owners", ["kubectl", "get", "replicasets,jobs", "-A", "-o", "json"]),
 )
+# Symptoms, (C) rows and guards are keyed by a pod's top owner so a finding
+# survives the pods being replaced: Pod -> ReplicaSet -> Deployment, Pod ->
+# Job -> CronJob, Pod -> StatefulSet/DaemonSet; a bare pod stays a Pod. The
+# kinds here are the ones with an owner of their own worth one more hop.
+OWNER_INTERMEDIATE_KINDS = ("ReplicaSet", "Job")
+OWNER_MAX_HOPS = 3
+# How a pod-backed symptom's evidence names the pods behind it.
+POD_EVIDENCE_FORMAT = "{count} of {total} pods: {evidence}; e.g. {example}"
 # Image references without a host are Docker Hub's.
 DEFAULT_IMAGE_HOST = "docker.io"
 OOM_REASON = "OOMKilled"
@@ -322,13 +349,28 @@ MITIGATIONS = {
 OOM_UNDECIDED_ENTRIES = (14, 15)
 
 REPORT_TITLE = "# Upgrade retrospective {date}"
-SECTION_WHAT_HAPPENED = "### What happened"
-SECTION_WHAT_FAILED = "### What failed"
-SECTION_MITIGATE = "### Detect and mitigate next time"
-SECTION_MITIGATION_SET_UP = "### Mitigation set up"
-SECTION_UNCHANGED = "## Unchanged clusters"
-SECTION_FAILED_READS = "## Reads that failed"
+# The report's three sections. An incident under Errors or Warnings is one
+# owner object (or budget) on one cluster, with the four parts inline.
+SECTION_ERRORS = "## Errors"
+SECTION_WARNINGS = "## Warnings"
+SECTION_INFO = "## Info"
+PART_WHAT_HAPPENED = "**What happened.**"
+PART_WHAT_FAILED = "**What failed.**"
+PART_MITIGATE = "**Detect and mitigate next time.**"
+PART_MITIGATION_SET_UP = "**Mitigation set up.**"
+INFO_CLEAN = "Reviewed, no incident:"
+INFO_UNCHANGED = "Unchanged clusters:"
+INFO_FAILED_READS = "Reads that failed:"
 NONE_LINE = "_none_"
+SEVERITY_ERROR, SEVERITY_WARNING = "error", "warning"
+# Incident kinds: a symptom on an object, an operation GKE reported failed,
+# a guard from an earlier run on a cluster this run did not review.
+INCIDENT_SYMPTOM, INCIDENT_OPERATION, INCIDENT_STALE_GUARD = "symptom", "operation", "stale-guard"
+# GKE operation statuses that are not a failure on their own.
+OPERATION_OK_STATUSES = ("DONE", "RUNNING", "PENDING")
+OPERATION_OBJECT_PREFIX = "operation/"
+NO_OPERATION_LINE = "no upgrade operation in the window"
+NODE_AFTER_POOL_UPGRADE_ENTRY = 17
 
 
 def log(msg: str) -> None:
@@ -711,41 +753,93 @@ def _pod_text(pod: dict) -> str:
     return " ".join(parts)
 
 
-def _owner_kind(pod: dict) -> str:
-    owners = pod["metadata"].get("ownerReferences") or []
-    return owners[0].get("kind", "") if owners else ""
+def _controller_of(obj: dict) -> tuple[str, str] | None:
+    for owner in (obj.get("metadata") or {}).get("ownerReferences") or []:
+        if owner.get("kind") and owner.get("name"):
+            return owner["kind"], owner["name"]
+    return None
 
 
-def pod_symptoms(pods: list[dict]) -> list[dict]:
-    out = []
+class Resolver:
+    """Maps any pod, ReplicaSet or Job to its top owner, from the pod list
+    and the `owners` read. An intermediate the read did not return is itself
+    the top: the hop is unknown rather than absent."""
+
+    def __init__(self, pods: list[dict], owners: list[dict]):
+        self.parent: dict[tuple[str, str, str], tuple[str, str]] = {}
+        for pod in pods:
+            controller = _controller_of(pod)
+            meta = pod.get("metadata") or {}
+            if controller:
+                self.parent[(meta.get("namespace", ""), "Pod", meta.get("name", ""))] = controller
+        for obj in owners:
+            controller = _controller_of(obj)
+            meta = obj.get("metadata") or {}
+            if controller and obj.get("kind") in OWNER_INTERMEDIATE_KINDS:
+                self.parent[(meta.get("namespace", ""), obj["kind"], meta.get("name", ""))] = controller
+        # Which pods each top owner has, for "n of m pods".
+        self.pods_of: dict[str, list[str]] = {}
+        for pod in pods:
+            meta = pod.get("metadata") or {}
+            kind, name = self.resolve(meta.get("namespace", ""), "Pod", meta.get("name", ""))
+            self.pods_of.setdefault(_object_ref(meta.get("namespace", ""), kind, name), []).append(meta.get("name", ""))
+
+    def resolve(self, namespace: str, kind: str, name: str) -> tuple[str, str]:
+        for _ in range(OWNER_MAX_HOPS):
+            parent = self.parent.get((namespace, kind, name))
+            if parent is None:
+                break
+            kind, name = parent
+        return kind, name
+
+    def pod_total(self, owner_object: str) -> int:
+        return len(self.pods_of.get(owner_object) or [])
+
+
+def _pod_detail(pod: dict) -> dict:
+    meta, spec, status = pod.get("metadata") or {}, pod.get("spec") or {}, pod.get("status") or {}
+    containers = spec.get("containers") or []
+    return {
+        "node": spec.get("nodeName"),
+        "phase": status.get("phase"),
+        "container_count": len(containers),
+        "images": [c.get("image", "") for c in containers],
+        "labels": meta.get("labels") or {},
+        "node_selector": spec.get("nodeSelector") or {},
+        "spec_text": _pod_text(pod),
+        "since": status.get("startTime") or meta.get("creationTimestamp"),
+    }
+
+
+def pod_symptoms(pods: list[dict], resolver: Resolver) -> list[dict]:
+    """One row per (top owner, category, reason), carrying the pods behind
+    it; the row's detail (node, containers, images) is the example pod's."""
+    rows: dict[tuple, dict] = {}
     for pod in pods:
-        meta, spec, status = pod.get("metadata") or {}, pod.get("spec") or {}, pod.get("status") or {}
+        meta, status = pod.get("metadata") or {}, pod.get("status") or {}
         phase = status.get("phase")
         ready = _condition(pod, "Ready").get("status") == "True"
         if phase == PHASE_SUCCEEDED or (phase == PHASE_RUNNING and ready):
             continue
-        namespace, name = meta.get("namespace", ""), meta.get("name", "")
-        containers = spec.get("containers") or []
-        images = [c.get("image", "") for c in containers]
+        namespace, pod_name = meta.get("namespace", ""), meta.get("name", "")
+        kind, name = resolver.resolve(namespace, "Pod", pod_name)
+        obj = _object_ref(namespace, kind, name)
         base = {
-            "kind": "Pod",
+            "kind": kind,
             "namespace": namespace,
             "name": name,
-            "object": _object_ref(namespace, "Pod", name),
+            "object": obj,
             "system": is_system_namespace(namespace),
-            "node": spec.get("nodeName"),
-            "phase": phase,
-            "owner_kind": _owner_kind(pod),
-            "container_count": len(containers),
-            "images": images,
-            "labels": meta.get("labels") or {},
-            "node_selector": spec.get("nodeSelector") or {},
-            "spec_text": _pod_text(pod),
-            "since": status.get("startTime") or meta.get("creationTimestamp"),
+            "owner_kind": kind,
+            "pods": [pod_name],
+            "pod_count": 1,
+            "pod_total": resolver.pod_total(obj),
+            "example_pod": pod_name,
+            **_pod_detail(pod),
         }
         scheduled = _condition(pod, "PodScheduled")
         if phase == PHASE_PENDING and scheduled.get("status") == "False":
-            out.append({**base, "category": "pending", "reason": scheduled.get("reason") or "Unschedulable", "message": (scheduled.get("message") or "")[:MESSAGE_EXCERPT_CHARS]})
+            _merge_pod_row(rows, {**base, "category": "pending", "reason": scheduled.get("reason") or "Unschedulable", "message": (scheduled.get("message") or "")[:MESSAGE_EXCERPT_CHARS]})
             continue
         container_reasons = []
         for cs in (status.get("containerStatuses") or []) + (status.get("initContainerStatuses") or []):
@@ -761,8 +855,20 @@ def pod_symptoms(pods: list[dict]) -> list[dict]:
         container_reasons.sort(key=lambda c: c["reason"] not in CONTAINER_FAILURE_REASONS)
         reason = container_reasons[0]["reason"] if container_reasons else (status.get("reason") or ("NotReady" if phase == PHASE_RUNNING else phase or "NotReady"))
         message = container_reasons[0]["message"] if container_reasons else (status.get("message") or "")[:MESSAGE_EXCERPT_CHARS]
-        out.append({**base, "category": "not-ready", "reason": reason, "message": message, "containers": container_reasons})
-    return out
+        _merge_pod_row(rows, {**base, "category": "not-ready", "reason": reason, "message": message, "containers": container_reasons})
+    return list(rows.values())
+
+
+def _merge_pod_row(rows: dict[tuple, dict], row: dict) -> None:
+    key = (row["object"], row["category"], row["reason"])
+    existing = rows.get(key)
+    if existing is None:
+        rows[key] = row
+        return
+    existing["pods"].append(row["example_pod"])
+    existing["pods"].sort()
+    existing["pod_count"] = len(existing["pods"])
+    existing["example_pod"] = existing["pods"][0]
 
 
 def node_symptoms(nodes: list[dict]) -> list[dict]:
@@ -798,8 +904,9 @@ def _event_time(event: dict) -> datetime | None:
     return parse_ts(series.get("lastObservedTime")) or parse_ts((event.get("metadata") or {}).get("creationTimestamp"))
 
 
-def event_symptoms(events: list[dict], window_start: datetime) -> list[dict]:
-    """Warning events since `window_start`, one row per (object, reason)."""
+def event_symptoms(events: list[dict], window_start: datetime, resolver: Resolver) -> list[dict]:
+    """Warning events since `window_start`, one row per (top owner, reason);
+    a pod's or ReplicaSet's event is charged to the owner that outlives it."""
     rows: dict[tuple, dict] = {}
     for event in events:
         if event.get("type") and event.get("type") != "Warning":
@@ -812,7 +919,8 @@ def event_symptoms(events: list[dict], window_start: datetime) -> list[dict]:
         if last is None or last < window_start:
             continue
         obj = event.get("involvedObject") or {}
-        namespace, kind, name = obj.get("namespace") or "", obj.get("kind") or "", obj.get("name") or ""
+        namespace, involved_kind, involved_name = obj.get("namespace") or "", obj.get("kind") or "", obj.get("name") or ""
+        kind, name = resolver.resolve(namespace, involved_kind, involved_name)
         key = (namespace, kind, name, reason)
         row = rows.get(key)
         if row is None:
@@ -829,6 +937,12 @@ def event_symptoms(events: list[dict], window_start: datetime) -> list[dict]:
                 "first_seen": fmt_ts(parse_ts(event.get("firstTimestamp")) or last),
                 "last_seen": fmt_ts(last),
             }
+            if involved_kind == "Pod" and (kind, name) != (involved_kind, involved_name):
+                row.update(pods=[], pod_count=0, pod_total=resolver.pod_total(row["object"]), example_pod=involved_name)
+        if "pods" in row and involved_name not in row["pods"]:
+            row["pods"].append(involved_name)
+            row["pods"].sort()
+            row["pod_count"], row["example_pod"] = len(row["pods"]), row["pods"][0]
         row["count"] += int(event.get("count") or 1)
         if fmt_ts(last) > row["last_seen"]:
             row["last_seen"], row["message"] = fmt_ts(last), message[:MESSAGE_EXCERPT_CHARS]
@@ -1031,14 +1145,18 @@ def collect_symptoms(cluster: dict, reads: dict[str, list], operations: list[dic
         node_pool={(n.get("metadata") or {}).get("name"): ((n.get("metadata") or {}).get("labels") or {}).get(NODEPOOL_LABEL, "") for n in nodes},
         upgraded_pools=upgraded,
     )
-    pods = pod_symptoms(reads.get("pods") or [])
+    resolver = Resolver(reads.get("pods") or [], reads.get("owners") or [])
+    pods = pod_symptoms(reads.get("pods") or [], resolver)
     pod_objects = {s["object"] for s in pods}
-    # A FailedScheduling or BackOff event on a pod the pod list already
+    # A FailedScheduling or BackOff event on a workload the pod list already
     # reports as Pending or crash-looping says the same thing twice.
-    events = [e for e in event_symptoms(reads.get("events") or [], window_start) if not (e["reason"] in EVENT_REASONS_IMPLIED_BY_POD and e["object"] in pod_objects)]
+    events = [e for e in event_symptoms(reads.get("events") or [], window_start, resolver) if not (e["reason"] in EVENT_REASONS_IMPLIED_BY_POD and e["object"] in pod_objects)]
     symptoms = pods + node_symptoms(nodes) + events + pdb_symptoms(reads.get("pdbs") or [], reads.get("pods") or [], nodes, upgraded)
     for symptom in symptoms:
         symptom["classifications"] = classify_symptom(symptom, ctx)
+        if symptom.get("pod_count"):
+            for c in symptom["classifications"]:
+                c["evidence"] = POD_EVIDENCE_FORMAT.format(count=symptom["pod_count"], total=max(symptom["pod_total"], symptom["pod_count"]), evidence=c["evidence"], example=symptom["example_pod"])[:MESSAGE_EXCERPT_CHARS]
     symptoms.sort(key=lambda s: (s["system"], s["namespace"], s["kind"], s["name"], s.get("reason") or ""))
     return symptoms
 
@@ -1169,63 +1287,197 @@ def _versions_table(before: dict | None, after: dict) -> list[str]:
     return lines
 
 
+def _operation_failed(op: dict) -> bool:
+    return bool(op.get("error")) or (op.get("status") or "") not in OPERATION_OK_STATUSES
+
+
+def _symptom_severity(symptom: dict) -> str:
+    """Error for a high-confidence entry on a user workload, or a node that
+    went NotReady after its pool was upgraded; Warning for everything else
+    (medium, system namespace, unclassified)."""
+    for c in symptom["classifications"]:
+        if c["entry"] == NODE_AFTER_POOL_UPGRADE_ENTRY and c["confidence"] == HIGH and symptom["category"] == "node":
+            return SEVERITY_ERROR
+        if c["entry"] is not None and c["confidence"] == HIGH and not symptom["system"]:
+            return SEVERITY_ERROR
+    return SEVERITY_WARNING
+
+
+def _entries_label(classifications: list[dict]) -> str:
+    numbers = sorted({c["entry"] for c in classifications if c["entry"] is not None})
+    label = ", ".join(str(n) for n in numbers)
+    if any(c["entry"] is None for c in classifications):
+        label = f"{label}, {UNCLASSIFIED}" if label else UNCLASSIFIED
+    return label
+
+
+def _incident_key(incident: dict) -> tuple[str, str]:
+    return incident["cluster"], incident["object"]
+
+
+def triage(reviews: list[dict], unchanged: list[dict], failed_reads: list[str], guards: list[dict], seen_at: str) -> dict:
+    """Group the reviews into the report's three sections. An incident is one
+    object on one cluster: its symptoms, their (C) rows and the guards it
+    produced, plus the cluster's (A) summary."""
+    errors: list[dict] = []
+    warnings: list[dict] = []
+    clean: list[dict] = []
+    for review in reviews:
+        incidents: dict[str, dict] = {}
+        for symptom in review["what_failed"]:
+            incident = incidents.get(symptom["object"])
+            if incident is None:
+                incidents[symptom["object"]] = incident = {
+                    "kind": INCIDENT_SYMPTOM,
+                    "severity": SEVERITY_WARNING,
+                    "cluster": review["cluster"],
+                    "object": symptom["object"],
+                    "system": symptom["system"],
+                    "entries": "",
+                    "what_happened": review["what_happened"],
+                    "symptoms": [],
+                    "mitigations": [m for m in review["mitigations"] if m["object"] == symptom["object"]],
+                    "guards": [g for g in review["guards"] if g["object"] == symptom["object"]],
+                }
+            incident["symptoms"].append(symptom)
+            if _symptom_severity(symptom) == SEVERITY_ERROR:
+                incident["severity"] = SEVERITY_ERROR
+        for incident in incidents.values():
+            incident["entries"] = _entries_label([c for s in incident["symptoms"] for c in s["classifications"]])
+        for op in review["what_happened"]["operations"]:
+            if _operation_failed(op):
+                incidents[OPERATION_OBJECT_PREFIX + (op["name"] or "")] = {
+                    "kind": INCIDENT_OPERATION,
+                    "severity": SEVERITY_ERROR,
+                    "cluster": review["cluster"],
+                    "object": f"{OPERATION_OBJECT_PREFIX}{op['type']} {op['target']}",
+                    "system": False,
+                    "entries": "operation " + (op["status"] or "?"),
+                    "what_happened": review["what_happened"],
+                    "operation": op,
+                    "symptoms": [],
+                    "mitigations": [],
+                    "guards": [],
+                }
+        if not incidents and review["reviewed"]:
+            # A cluster whose reads failed is not clean; Info names it under
+            # the failed reads instead.
+            clean.append({"cluster": review["cluster"], "what_happened": review["what_happened"]})
+        for incident in sorted(incidents.values(), key=lambda i: i["object"]):
+            (errors if incident["severity"] == SEVERITY_ERROR else warnings).append(incident)
+    for guard in guards:
+        if guard.get("last_seen") != seen_at:
+            warnings.append({
+                "kind": INCIDENT_STALE_GUARD,
+                "severity": SEVERITY_WARNING,
+                "cluster": guard["cluster"],
+                "object": guard["object"],
+                "system": False,
+                "entries": str(guard["entry"]),
+                "what_happened": None,
+                "symptoms": [],
+                "mitigations": [],
+                "guards": [guard],
+            })
+    errors.sort(key=_incident_key)
+    warnings.sort(key=_incident_key)
+    return {
+        "errors": errors,
+        "warnings": warnings,
+        "info": {"clean": clean, "unchanged": unchanged, "failed_reads": failed_reads},
+    }
+
+
+def _operations_lines(wh: dict) -> list[str]:
+    if not wh["operations"]:
+        return [NO_OPERATION_LINE + "."]
+    lines = ["", "| Operation | Target | Start | End | Duration | Status | Error |", "| --- | --- | --- | --- | --- | --- | --- |"]
+    for op in wh["operations"]:
+        lines.append(f"| {op['type']} | {op['target']} | {op['start'] or '-'} | {op['end'] or '-'} | {_duration(op['duration_s'])} | {op['status']} | {op['error'] or ''} |")
+    return lines
+
+
+def _what_happened_lines(wh: dict) -> list[str]:
+    lines = [f"{PART_WHAT_HAPPENED} {wh['status']} ({'; '.join(wh['reasons'])}); channel {wh['channel'] or 'none'}; cluster status {wh['cluster_status']}.", ""]
+    lines += _versions_table(wh["versions_before"], wh["versions_after"])
+    lines += _operations_lines(wh)
+    return lines
+
+
+def _cell(text: str) -> str:
+    return text.replace("|", "/").replace("\n", " ")
+
+
+def _incident_lines(incident: dict) -> list[str]:
+    lines = [f"### {incident['entries']} — {incident['cluster']} — `{incident['object']}`" + (" (system)" if incident["system"] else ""), ""]
+    if incident["kind"] == INCIDENT_STALE_GUARD:
+        guard = incident["guards"][0]
+        lines.append(f"{PART_WHAT_HAPPENED} cluster not reviewed this run; the guard below is from an earlier run.")
+        lines.append(f"{PART_WHAT_FAILED} entry {guard['entry']}. {guard['title']} ({guard['confidence']}) last seen {guard['last_seen']}: {guard['evidence']}")
+        lines.append(f"{PART_MITIGATE} the entry's row applies until the cluster is reviewed again.")
+        lines.append(f"{PART_MITIGATION_SET_UP} guard `{guard['object']}` entry {guard['entry']}, first seen {guard['first_seen']}, still live.")
+        return lines + [""]
+    lines += _what_happened_lines(incident["what_happened"])
+    lines.append("")
+    if incident["kind"] == INCIDENT_OPERATION:
+        op = incident["operation"]
+        lines.append(f"{PART_WHAT_FAILED} {op['type']} on {op['target']} ended {op['status']}: {op['error'] or 'no error text'}")
+        lines.append(f"{PART_MITIGATE} GKE's error text names the cause; the catalogue's entry 2 (capacity) and 5 (window) are the usual ones for an operation that did not complete.")
+        lines.append(f"{PART_MITIGATION_SET_UP} {NONE_LINE} (an operation carries no guard).")
+        return lines + [""]
+    lines += [PART_WHAT_FAILED, "", "| Symptom | Catalogue entry | Confidence | Evidence |", "| --- | --- | --- | --- |"]
+    for symptom in incident["symptoms"]:
+        for c in symptom["classifications"]:
+            entry = f"{c['entry']}. {c['title']}" if c["entry"] else UNCLASSIFIED
+            if c.get("detail"):
+                entry += f" ({c['detail']})"
+            lines.append(f"| {symptom['reason']} | {entry} | {c['confidence']} | {_cell(c['evidence'])} |")
+    lines += ["", PART_MITIGATE]
+    if not incident["mitigations"]:
+        lines.append(NONE_LINE)
+    for m in incident["mitigations"]:
+        lines.append(f"- **{m['entry']}. {m['title']}** — {m['before_signal']} Read today: {m['read_today']}. Mitigate before: {m['mitigate_before']} Mitigate after: {m['mitigate_after']}")
+    lines += ["", PART_MITIGATION_SET_UP]
+    if not incident["guards"]:
+        lines.append(NONE_LINE)
+    for g in incident["guards"]:
+        lines.append(f"- guard `{g['id']}` entry {g['entry']} ({g['confidence']}), first seen {g['first_seen']}")
+    return lines + [""]
+
+
 def render_report(result: dict) -> str:
     generated = parse_ts(result["generated_at"]) or now_utc()
+    sections = result["sections"]
     lines = [REPORT_TITLE.format(date=generated.strftime(REPORT_DATE_FORMAT)), ""]
     lines.append(f"Window since {result['since']}; projects: {', '.join(result['projects']) or 'none'}; generated {result['generated_at']}.")
     lines.append("")
-    for review in result["reviews"]:
-        wh = review["what_happened"]
-        lines += [f"## {review['cluster']}", "", SECTION_WHAT_HAPPENED, ""]
-        lines.append(f"{wh['status']} ({'; '.join(wh['reasons'])}); channel {wh['channel'] or 'none'}; cluster status {wh['cluster_status']}.")
+    for heading, incidents in ((SECTION_ERRORS, sections["errors"]), (SECTION_WARNINGS, sections["warnings"])):
+        lines += [heading, ""]
+        if not incidents:
+            lines += [NONE_LINE, ""]
+        for incident in incidents:
+            lines += _incident_lines(incident)
+    info = sections["info"]
+    lines += [SECTION_INFO, ""]
+    if not (info["clean"] or info["unchanged"] or info["failed_reads"]):
+        lines += [NONE_LINE, ""]
+    if info["clean"]:
+        lines += [INFO_CLEAN, ""]
+        for row in info["clean"]:
+            wh = row["what_happened"]
+            ops = "; ".join(f"{op['type']} {op['target']} {_duration(op['duration_s'])} {op['status']}" for op in wh["operations"]) or NO_OPERATION_LINE
+            lines.append(f"- {row['cluster']}: {wh['status']} ({'; '.join(wh['reasons'])}); control plane {wh['versions_after']['control_plane']}; {ops}")
         lines.append("")
-        lines += _versions_table(wh["versions_before"], wh["versions_after"])
+    if info["unchanged"]:
+        lines += [INFO_UNCHANGED, ""]
+        for row in info["unchanged"]:
+            lines.append(f"- {row['cluster']} at {row['control_plane']}, last reviewed {row['last_run'] or 'never'}")
         lines.append("")
-        if wh["operations"]:
-            lines += ["| Operation | Target | Start | End | Duration | Status | Error |", "| --- | --- | --- | --- | --- | --- | --- |"]
-            for op in wh["operations"]:
-                lines.append(f"| {op['type']} | {op['target']} | {op['start'] or '-'} | {op['end'] or '-'} | {_duration(op['duration_s'])} | {op['status']} | {op['error'] or ''} |")
-        else:
-            lines.append("No upgrade operation in the window.")
-        lines += ["", SECTION_WHAT_FAILED, ""]
-        if review["read_errors"] and not review["reviewed"]:
-            lines.append(f"Not read: {'; '.join(review['read_errors'])}")
-        elif not review["what_failed"]:
-            lines.append(NONE_LINE)
-        else:
-            lines += ["| Object | Symptom | Catalogue entry | Confidence | Evidence |", "| --- | --- | --- | --- | --- |"]
-            for symptom in review["what_failed"]:
-                for c in symptom["classifications"]:
-                    entry = f"{c['entry']}. {c['title']}" if c["entry"] else UNCLASSIFIED
-                    if c.get("detail"):
-                        entry += f" ({c['detail']})"
-                    system = " (system)" if symptom["system"] else ""
-                    lines.append(f"| `{symptom['object']}`{system} | {symptom['reason']} | {entry} | {c['confidence']} | {c['evidence'].replace('|', '/').replace(chr(10), ' ')} |")
-            if review["read_errors"]:
-                lines += ["", f"Partial read: {'; '.join(review['read_errors'])}"]
-        lines += ["", SECTION_MITIGATE, ""]
-        if not review["mitigations"]:
-            lines.append(NONE_LINE)
-        for m in review["mitigations"]:
-            lines.append(f"- **{m['entry']}. {m['title']}** — {m['before_signal']} Read today: {m['read_today']}. Mitigate before: {m['mitigate_before']} Mitigate after: {m['mitigate_after']}")
-        lines += ["", SECTION_MITIGATION_SET_UP, ""]
-        if not review["guards"]:
-            lines.append(NONE_LINE)
-        for g in review["guards"]:
-            lines.append(f"- guard `{g['object']}` entry {g['entry']} ({g['confidence']}), first seen {g['first_seen']}")
+    if info["failed_reads"]:
+        lines += [INFO_FAILED_READS, ""]
+        for line in info["failed_reads"]:
+            lines.append(f"- {line}")
         lines.append("")
-    lines += [SECTION_UNCHANGED, ""]
-    if not result["unchanged"]:
-        lines.append(NONE_LINE)
-    for row in result["unchanged"]:
-        lines.append(f"- {row['cluster']} at {row['control_plane']}, last reviewed {row['last_run'] or 'never'}")
-    lines += ["", SECTION_FAILED_READS, ""]
-    failed = list(result["failed_reads"]) + [f"{r['cluster']}: {e}" for r in result["reviews"] for e in r["read_errors"]]
-    if not failed:
-        lines.append(NONE_LINE)
-    for line in failed:
-        lines.append(f"- {line}")
-    lines.append("")
     return "\n".join(lines)
 
 
@@ -1316,6 +1568,9 @@ def collect(args: argparse.Namespace, *, run: RunFn | None = None, now: datetime
     new_guards = merge_guards(guards, fresh_guards, reviewed, seen_at)
     new_ledger = ledger_after(ledger, reviews, clusters, seen_at)
 
+    # Read failures from inside a review join the top-level list so Info
+    # names every one in one place.
+    failed_reads = failed_reads + [f"{r['cluster']}: {e}" for r in reviews for e in r["read_errors"]]
     result = {
         "generated_at": seen_at,
         "since": fmt_ts(since),
@@ -1323,6 +1578,7 @@ def collect(args: argparse.Namespace, *, run: RunFn | None = None, now: datetime
         "reviews": reviews,
         "unchanged": unchanged,
         "failed_reads": failed_reads,
+        "sections": triage(reviews, unchanged, failed_reads, new_guards["guards"], seen_at),
         "ledger_path": str(ledger_path),
         "guards_path": str(guards_path),
         "guards": new_guards["guards"],
