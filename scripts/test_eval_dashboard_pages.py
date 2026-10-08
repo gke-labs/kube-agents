@@ -881,6 +881,26 @@ class BrowserTest(unittest.TestCase):
         out = render_to(pathlib.Path(self.tmp.name) / sub, self.data, health=health)
         return dom_text(out / "index.html")
 
+    def test_the_gitlab_lane_has_its_own_section_outside_the_gates_numbers(self):
+        """A tier-gitlab run is listed under "GitLab lane" with its own
+        Spyglass link and never among the gate's runs; without one the
+        section says how the lane is run."""
+        app = dom_text(self.index)
+        self.assertIn("GitLab lane", app)
+        self.assertIn("No GitLab run on record", app)
+        data = copy.deepcopy(self.data)
+        base = next(r for r in data["runs"] if r["build_id"] == "2097282860221206528")
+        lane_run = dict(base, build_id="2097282860221206600", tier="gitlab", job="pull-kube-agents-smoke-test-gitlab", pr=2475, result="FAILURE", eval_verdict="RED")
+        data["runs"].append(lane_run)
+        out = render_to(pathlib.Path(self.tmp.name) / "gitlab", data, health=health_doc())
+        page = dom_text(out / "index.html")
+        self.assertIn("GitLab lane", page)
+        self.assertIn("1 run on record: 0 green, 1 not", page)
+        self.assertIn('href="https://oss.gprow.dev/view/gs/kube-agents-prow/pr-logs/pull/gke-labs_kube-agents/2475/pull-kube-agents-smoke-test-gitlab/2097282860221206600"', page)
+        self.assertIn("<th>Prow</th><th>Eval verdict</th>", page, "the result pill sits under Prow, not Job")
+        # The gate's own list does not carry it.
+        self.assertNotIn('href="run.html#build=2097282860221206600"', page)
+
     def test_a_case_lost_to_the_delegation_ceiling_says_so_on_the_run_page(self):
         """Ceiling reps sit under their own key in `reps` (#1874). The card's
         totals must include them, or a three-rep case reads "all 0 reps lost

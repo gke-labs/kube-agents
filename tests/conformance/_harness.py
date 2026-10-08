@@ -281,6 +281,13 @@ SOURCES: dict[str, Source] = {
         "k8s-operator/internal/controller/platformagent_a2a_manifests.go",
         ("func buildA2AGatewayRole(", '[]string{"deployments"},', "a2aSlackPrincipalMapSecretName ="),
     ),
+    # The operator-rendered Hermes bridge: built from the agent container, so
+    # what it drops from that copy is the whole of what keeps it a separate
+    # principal from the agent beside it.
+    "a2a_bridge_render": Source(
+        "k8s-operator/internal/controller/platformagent_a2a_bridge.go",
+        ("func buildA2ABridgeContainer(", "func a2aBridgeOwnEnv(", "var a2aBridgeDroppedAgentEnv"),
+    ),
     "a2a_callout_role": Source(
         "k8s-operator/internal/controller/platformagent_a2a_callout.go",
         ("func buildA2ACalloutRole(", '[]string{"configmaps"},'),

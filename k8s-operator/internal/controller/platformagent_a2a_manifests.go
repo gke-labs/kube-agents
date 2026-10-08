@@ -940,10 +940,11 @@ const (
 	// the refusal and the status message offer only then: declare the
 	// sidecar with fewer workers, which re-renders the Job the way a
 	// maxSessions edit does. A literal above a2aBridgeConcurrencyMax (below)
-	// counts as the cap, and both surfaces say so. The mode-next step of
-	// hack/ci-deploy.sh is such an install: it declares the sidecar after
-	// the bus is up, so its second provision Job refuses against the first
-	// one's stream.
+	// counts as the cap, and both surfaces say so. A bridge the operator
+	// renders (platformagent_a2a_bridge.go) is counted from the first render,
+	// so its arrival does not take this path; raising the operator's
+	// A2A_BRIDGE_CONCURRENCY on a live install still can, as can a sidecar
+	// declared after the bus is up.
 	a2aTasksStandingDurables     = 2
 	a2aTasksAuditDurableHeadroom = 1
 	a2aTasksIncarnationOverlap   = a2aSessionConsumersPerSession
@@ -2566,6 +2567,7 @@ func a2aProvisionScript(agent *agentv1alpha1.PlatformAgent) string {
 		bridgeWorkersNoun = "worker"
 	}
 	bridgeDefault := strconv.Itoa(a2aBridgeDefaultConcurrency)
+	renderedDefault := strconv.Itoa(a2aRenderedBridgeDefaultConcurrency)
 	bridgeMax := strconv.Itoa(a2aBridgeConcurrencyMax)
 	// The reserve without its per-worker term and the term itself, so the
 	// script can compute the worker count that fits beside this CR's
@@ -2584,11 +2586,22 @@ func a2aProvisionScript(agent *agentv1alpha1.PlatformAgent) string {
   echo "  that sets ` + a2aBridgeConcurrencyEnvVar + ` counts its literal - a \$(NAME) reference to an earlier literal in the same entry is expanded" >&2
   echo "  as the kubelet expands it - or ` + bridgeDefault + ` for a value this render cannot read, a valueFrom or a reference to one; ` + bridgeDefault + ` when none sets it)." >&2
 `
+	if a2aBridgeRendered(agent) {
+		bridgeNote = `  echo "  (the replay share of that reserve is sized for ` + bridgeWorkers + ` bridge ` + bridgeWorkersNoun + `: the operator renders the bridge, at the" >&2
+  echo "  ` + a2aBridgeConcurrencyOperatorEnvVar + ` in its own environment, or ` + renderedDefault + ` when that is unset, ` + bridgeDefault + ` when it is not a count)." >&2
+`
+	}
 	if bridgeWorkersCapped {
 		bridgeNote = `  echo "  (the replay share of that reserve is sized for ` + bridgeWorkers + ` bridge workers, the most this render sizes for: this CR" >&2
   echo "  declares more than that across the spec.deployment.sidecars entries that set ` + a2aBridgeConcurrencyEnvVar + `, and ` + bridgeMax + ` is" >&2
   echo "  the queue behind the bridge's workers, so a count past it is a typo, not a sizing - correct the literal)." >&2
 `
+		if a2aBridgeRendered(agent) {
+			bridgeNote = `  echo "  (the replay share of that reserve is sized for ` + bridgeWorkers + ` bridge workers, the most this render sizes for: the" >&2
+  echo "  operator's ` + a2aBridgeConcurrencyOperatorEnvVar + ` asks for more, and ` + bridgeMax + ` is the queue behind the bridge's workers," >&2
+  echo "  so a count past it is a typo, not a sizing - correct the setting)." >&2
+`
+		}
 	}
 	// What the budget could not read, said on every run and not only in the
 	// refusal. An entry that took the default in place of a count the render
@@ -2602,7 +2615,13 @@ func a2aProvisionScript(agent *agentv1alpha1.PlatformAgent) string {
 	// per-entry rule on refusal (a2aProvisionRefusalStatus); this is the
 	// surface a successful run has.
 	readNote := ""
-	if bridgeWorkersDefaulted {
+	if bridgeWorkersDefaulted && a2aBridgeRendered(agent) {
+		readNote += `# The operator's ` + a2aBridgeConcurrencyOperatorEnvVar + ` is not a count this render could read.
+echo "NOTE: the operator's ` + a2aBridgeConcurrencyOperatorEnvVar + ` is not a count this render could read, so the rendered bridge" >&2
+echo "  counted as the bridge's default of ` + bridgeDefault + `. The bridge falls back the same way, so the budget and the bridge" >&2
+echo "  agree; set the operator's ` + a2aBridgeConcurrencyOperatorEnvVar + ` to a count to size both." >&2
+`
+	} else if bridgeWorkersDefaulted {
 		readNote += `# An entry set ` + a2aBridgeConcurrencyEnvVar + ` to something this render could not read as a count.
 echo "NOTE: a spec.deployment.sidecars entry sets ` + a2aBridgeConcurrencyEnvVar + ` to a value this render could not read as a count -" >&2
 echo "  a valueFrom, a \$(NAME) reference to one or to a name no earlier literal in the same entry set, or a value" >&2
@@ -2646,9 +2665,14 @@ echo "  read it, set it in env as a literal, which the kubelet lets override env
 `
 		oneSessionAt = ` at ` + bridgeWorkers + ` bridge workers`
 		thatLeaves = ""
+		workerLever := `declare the bridge sidecar with at most ${workers_fit}" >&2
+    echo "  workers - ` + a2aBridgeConcurrencyEnvVar + ` on its spec.deployment.sidecars entry; unset, the bridge runs ` + bridgeDefault + ` - which is" >&2`
+		if a2aBridgeRendered(agent) {
+			workerLever = `set the operator's ` + a2aBridgeConcurrencyOperatorEnvVar + ` to at most ${workers_fit}" >&2
+    echo "  - the operator renders the bridge; unset, it runs ` + renderedDefault + ` - which is" >&2`
+		}
 		thirdLever = `  if [ "${workers_fit}" -ge 1 ]; then
-    echo "Or keep spec.harness.tuning.maxSessions at ` + maxSessions + ` and declare the bridge sidecar with at most ${workers_fit}" >&2
-    echo "  workers - ` + a2aBridgeConcurrencyEnvVar + ` on its spec.deployment.sidecars entry; unset, the bridge runs ` + bridgeDefault + ` - which is" >&2
+    echo "Or keep spec.harness.tuning.maxSessions at ` + maxSessions + ` and ` + workerLever + `
     echo "  the most this stream has room for beside those sessions: the reserve is ` + fixedReserve + ` plus ` + perWorker + ` a worker." >&2
   else
     echo "Fewer bridge workers alone will not fit it beside spec.harness.tuning.maxSessions=` + maxSessions + `: one worker" >&2
@@ -3391,10 +3415,7 @@ func a2aBridgeConcurrency(agent *agentv1alpha1.PlatformAgent) int {
 // unset with API_SERVER_KEY taken through envFrom, gets no hook, and its
 // API tasks report that they carry no trace.
 func a2aBridgeDoorDeclared(agent *agentv1alpha1.PlatformAgent) bool {
-	if agent == nil || agent.Spec.Deployment == nil {
-		return false
-	}
-	for _, c := range agent.Spec.Deployment.Sidecars {
+	for _, c := range a2aBridgeSidecarsInPod(agent) {
 		if _, set := a2aBridgeConcurrencyValue(c); !set {
 			continue
 		}
@@ -3507,11 +3528,8 @@ func a2aActivitySecretEnv(agent *agentv1alpha1.PlatformAgent) corev1.EnvVar {
 // set when no sidecar sets the key: the default is then the count, not a
 // stand-in for one.
 func a2aBridgeWorkers(agent *agentv1alpha1.PlatformAgent) (count int, capped, defaulted bool) {
-	if agent == nil || agent.Spec.Deployment == nil {
-		return a2aBridgeDefaultConcurrency, false, false
-	}
 	total, declared := 0, false
-	for _, c := range agent.Spec.Deployment.Sidecars {
+	for _, c := range a2aBridgeSidecars(agent) {
 		value, set := a2aBridgeConcurrencyValue(c)
 		if !set {
 			continue
@@ -3757,8 +3775,18 @@ func a2aProvisionRefusalStatus(agent *agentv1alpha1.PlatformAgent) string {
 	if workers != a2aBridgeDefaultConcurrency || defaulted {
 		source := fmt.Sprintf("the CR declares (%s on spec.deployment.sidecars)", a2aBridgeConcurrencyEnvVar)
 		countIs := "The CR declares"
+		if a2aBridgeRendered(agent) {
+			source = fmt.Sprintf("the operator's rendered bridge runs (%s in the operator's environment)", a2aBridgeConcurrencyOperatorEnvVar)
+			if os.Getenv(a2aBridgeConcurrencyOperatorEnvVar) == "" {
+				source = fmt.Sprintf("the operator's rendered bridge runs (its default of %d, with no %s in the operator's environment)", a2aRenderedBridgeDefaultConcurrency, a2aBridgeConcurrencyOperatorEnvVar)
+			}
+			countIs = "The operator setting asks for"
+		}
 		if defaulted {
 			source = fmt.Sprintf("the render reads from spec.deployment.sidecars (%s; an entry it cannot read as a count, a valueFrom or a reference to one among them, counts as the bridge's default of %d)", a2aBridgeConcurrencyEnvVar, a2aBridgeDefaultConcurrency)
+			if a2aBridgeRendered(agent) {
+				source = fmt.Sprintf("the operator's rendered bridge runs (%s in the operator's environment, which this render could not read as a count, so the bridge's default of %d)", a2aBridgeConcurrencyOperatorEnvVar, a2aBridgeDefaultConcurrency)
+			}
 			countIs = "That count is"
 		}
 		noun, noLower := "workers", ""
@@ -3768,6 +3796,9 @@ func a2aProvisionRefusalStatus(agent *agentv1alpha1.PlatformAgent) string {
 		reserve := fmt.Sprintf("the reserve is %d at %d %s and %d at the bridge's default of %d%s", a2aTasksReserve(agent), workers, noun, a2aTasksReservedConsumers, a2aBridgeDefaultConcurrency, noLower)
 		if workers == a2aBridgeDefaultConcurrency {
 			reserve = fmt.Sprintf("the reserve is %d at %d %s, the bridge's default", a2aTasksReserve(agent), workers, noun)
+		}
+		if a2aBridgeRendered(agent) && !defaulted {
+			reserve = fmt.Sprintf("the reserve is %d at %d %s and %d at %d", a2aTasksReserve(agent), workers, noun, a2aTasksReservedConsumers, a2aBridgeDefaultConcurrency)
 		}
 		need = fmt.Sprintf("spec.harness.tuning.maxSessions=%d and the %d bridge %s %s need together (%d; %s)",
 			maxSessions, workers, noun, source, a2aTasksConsumerBudget(agent), reserve)
@@ -3779,6 +3810,10 @@ func a2aProvisionRefusalStatus(agent *agentv1alpha1.PlatformAgent) string {
 		ways = fmt.Sprintf("the ways out are to lower maxSessions until the budget fits the stream, to declare the bridge sidecar with fewer workers (a lower %s, or none for the bridge's default of %d) until it does, or to delete the TASKS stream", a2aBridgeConcurrencyEnvVar, a2aBridgeDefaultConcurrency)
 		fits = "the maxSessions, or the worker count, that fits"
 		finish = "The three do not finish the same way. Lowering maxSessions or the bridge's worker count finishes by itself: either CR edit re-renders this Job, so a new one appears and runs, and nothing has to be deleted."
+		if a2aBridgeRendered(agent) {
+			ways = fmt.Sprintf("the ways out are to lower maxSessions until the budget fits the stream, to set the operator's %s to fewer workers (unset, the rendered bridge runs %d) until it does, or to delete the TASKS stream", a2aBridgeConcurrencyOperatorEnvVar, a2aRenderedBridgeDefaultConcurrency)
+			finish = "The three do not finish the same way. Lowering maxSessions, or the operator's bridge setting, finishes by itself: either re-renders this Job, so a new one appears and runs, and nothing has to be deleted."
+		}
 	}
 	return fmt.Sprintf(
 		" That reason means the script exited 2, the refusal a re-run reaches again: a TASKS stream holding fewer consumers than %s. max_consumers cannot be widened in place — nats-server refuses that edit on a stream that exists — so %s and let provisioning recreate it at %d, which discards the task history it is holding. The pod log has what the stream actually holds, and therefore %s. %s Deleting the stream does not — nothing re-reads the bus until the Job runs again. Delete the Job to re-run it now, or leave it and the 24h TTL will; then, once TASKS is back, restart the clients that held a durable consumer on it: kubectl rollout restart deployment/%s -n %s, and the agent workload %s-gateway with it where a Hermes bridge sidecar runs. Deleting a stream deletes its consumers and neither client re-creates one, so skipping that leaves a gateway accepting delegations and spawning session pods while relaying no events, and a CR reading Ready over it. Restarting before the stream is back only fails the subscribe, so the order holds.",

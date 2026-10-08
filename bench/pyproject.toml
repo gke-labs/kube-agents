@@ -61,6 +61,7 @@ bootstrap_report_read = "kube_agents_bench.verifiers:BootstrapReportReadVerifier
 fleet_resource_property = "kube_agents_bench.verifiers:FleetResourcePropertyVerifier"
 github_writes = "kube_agents_bench.verifiers:GitHubWritesVerifier"
 ledger_issue_contains = "kube_agents_bench.verifiers:LedgerIssueContainsVerifier"
+oobe_audits_started = "kube_agents_bench.oobe:OobeAuditsStartedVerifier"
 pull_request_opened = "kube_agents_bench.verifiers:PullRequestOpenedVerifier"
 replay_card = "kube_agents_bench.verifiers:ReplayCardVerifier"
 reply_is_silent = "kube_agents_bench.verifiers:ReplyIsSilentVerifier"

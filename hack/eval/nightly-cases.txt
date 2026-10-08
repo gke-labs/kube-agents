@@ -128,9 +128,14 @@
 # sixty-six (198), +3 more: one front-door turn on a planted card, no worker.
 # chat-voice-final-attempt-is-not-retried (after it) makes it fifty-three
 # (159) of sixty-seven (201), +3 more: the same shape on the card's last
-# attempt. chat-voice-failure-leads-with-fact (after that) makes
+# attempt. chat-voice-failure-leads-with-fact (after it) makes
 # it fifty-four (162) of sixty-eight (204), +3 more: the same shape on a
-# blocked card.
+# blocked card. oobe-first-run-audits (below) makes it
+# sixty-two (186) of seventy-six (228), counted from the lists with
+# upgrades-zonal-control-plane-outage-warned (2026-10-05, below), +3 more at its 2400s hint: a unit
+# that waits out the previous repetition's audits (the runner's wait_platform_runs), a stack that
+# waits out the stage's chain, then a turn with no tools,
+# holding the four audit streams' locks throughout, so their audit cases queue behind it.
 # Whether the worst night fits is a question about the whole matrix, and the
 # six measured nights (2026-09-16 to 09-21, oss-test-infra#2707's table)
 # answer it plainly: 1734-2693 serial minutes of work at a realised
@@ -202,13 +207,15 @@
 # minutes a repetition on the dev install). Counted from the lists rather
 # than the paragraphs above (the chat-voice trio and the declared-intent
 # trio landed beside each other, each counted without the other, and two
-# chat cases registered since without a paragraph): this case makes it
-# sixty-one cases (183 units) of a seventy-five-case, 225-unit matrix.
+# chat cases registered since without a paragraph): this case, the entry
+# before oobe-first-run-audits below, makes it sixty-one cases (183 units) of a
+# seventy-five-case, 225-unit matrix.
 #
 # 2026-10-05 adds chat-voice-answer-first: one case, three units, deployer:
 # noop at the 200s default, about 10 serial minutes. Counted from the lists
-# with it, the last entry below: sixty-two cases (186 units) here, of a
-# seventy-six-case, 228-unit matrix with the presubmit file's fourteen.
+# with it, the last entry below, and oobe-first-run-audits before it:
+# sixty-three cases (189 units) here, of a seventy-seven-case, 231-unit
+# matrix with the presubmit file's fourteen.
 
 # ── The four full audits recast out of the presubmit on 2026-08-26 ──────────
 # Spec-ready, each domain covered in the presubmit by its probe:
@@ -691,6 +698,14 @@
 # mutate. Nightly from its first merge; a presubmit seat is a later pull
 # request that cites its record.
 ./tasks/upgrades-zonal-control-plane-outage-warned/task.yaml
+
+# The oobe job's first-run audits stage (docs/designs/oobe.md): once the
+# onboarding scan settles, four fleet audits start instead of waiting for their
+# schedules, one after another. The stack arms the stage with two archived
+# stand-in cards and the scan marker, and puts back the oobe job the image ships;
+# the verifier reads the Platform Agent's cron runs. Nightly rather than presubmit
+# because each repetition runs four real audits back to back.
+./tasks/oobe-first-run-audits/task.yaml
 
 # A delegated answer opens on one bold sentence and does not restate it
 # (the report stanza in deploy/docker/patches/kanban_report_format.py).

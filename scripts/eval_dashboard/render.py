@@ -105,11 +105,12 @@ import urllib.parse
 import yaml
 
 try:
-    from . import classify, nightly, post_health, tiers, trend
+    from . import classify, forge_lane, nightly, post_health, tiers, trend
     from .health import POOL_BREACH, POOL_STALE, POOL_UNMEASURED
 except ImportError:  # run as a script: python3 scripts/eval_dashboard/render.py
     sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
     import classify
+    import forge_lane
     import nightly
     import post_health
     import tiers
@@ -951,7 +952,7 @@ def case_documents(data: dict, notes: dict, admitted: frozenset | None, demoted:
     nightly_rows = appearances_by_case(nightly_runs(data))
     rates = {
         (tier, days): tier_pass_rates(data, tier, days)
-        for tier in tiers.TIERS
+        for tier in tiers.CASE_TIERS
         for days in TIER_RATE_WINDOWS_DAYS
     }
     cases = {}
@@ -972,7 +973,7 @@ def case_documents(data: dict, notes: dict, admitted: frozenset | None, demoted:
             "issues": list(note.get("issues") or []),
             "rates": {
                 tier: [rate_pair(rates[(tier, days)].get(name)) for days in TIER_RATE_WINDOWS_DAYS]
-                for tier in tiers.TIERS
+                for tier in tiers.CASE_TIERS
             },
             "strip": case_strip(gate.get(name, [])),
             "last_failure": last_failure(name, gate.get(name, []), nightly_rows.get(name, []), classified, nights),
@@ -1117,6 +1118,7 @@ def brief_document(data: dict, health: dict | None, history: list[dict] | None, 
         "pending": pending_builds(data),
         "releases": [compact_release(r) for r in sorted_releases(data)],
         "nightly": nightly.nightly_document(data),
+        "gitlab": forge_lane.gitlab_document(data, now),
         "trend": trend.trend_document(store, data),
     }
 
