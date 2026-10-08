@@ -2906,8 +2906,9 @@ func TestRelayReportsAFollowUpNoExecutorAnswered(t *testing.T) {
 		waitFor(t, "second steer published", func() bool { return len(inSubjectEnvelopes(t, r.url, "platform")) == 3 })
 		waitFor(t, "second ack", func() bool { return strings.Count(strings.Join(r.adapter.postTexts(), "\n"), ackSteerQueued) == 2 })
 		completeTask(t, exec, "prod: green")
-		waitFor(t, "missed line", postedContaining(r, noticeSteerMissed))
-		if a, b := postIndex(r, "prod: green"), postIndex(r, noticeSteerMissed); a < 0 || a > b {
+		missed := fmt.Sprintf(noticeSteerMissed, 1)
+		waitFor(t, "missed line", postedContaining(r, missed))
+		if a, b := postIndex(r, "prod: green"), postIndex(r, missed); a < 0 || a > b {
 			t.Fatalf("deliverable at %d, missed line at %d: the missed line must follow the deliverable", a, b)
 		}
 		if strings.Contains(strings.Join(r.adapter.postTexts(), "\n"), "did not run") {
@@ -2937,7 +2938,34 @@ func TestRelayReportsAFollowUpNoExecutorAnswered(t *testing.T) {
 		r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: "ms-2", Text: "only prod"}
 		waitFor(t, "second ack", func() bool { return strings.Count(strings.Join(r.adapter.postTexts(), "\n"), ackSteerQueued) == 2 })
 		completeTask(t, exec2, "nodes: green")
-		waitFor(t, "missed line", postedContaining(r, noticeSteerMissed))
+		waitFor(t, "missed line", postedContaining(r, fmt.Sprintf(noticeSteerMissed, 1)))
+	})
+	// Three follow-ups nothing answered are one line that counts them, so
+	// the room is not told to resend "it" when there were three.
+	t.Run("three unanswered, one counted line", func(t *testing.T) {
+		r := startRig(t)
+		conv := "discord:g1/thread-missed-3"
+		r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: "m3-1", Text: "check the fleet"}
+		origin := r.awaitTask(t, "platform")
+		exec := r.execFor(t, origin, "platform")
+		_ = exec.PublishStatus(context.Background(), lib.StateWorking, false)
+		r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: "m3-2", Text: "only prod"}
+		waitFor(t, "steer published", func() bool { return len(inSubjectEnvelopes(t, r.url, "platform")) == 2 })
+		publishSteerNotice(t, r, origin, "platform", lib.SteerNotice{Steer: lib.SteerQueued, EnvelopeID: lastInSubject(t, r, origin).EnvelopeID})
+		publishTurnAnswer(t, r, origin, "platform", 1, "fleet: 3 clusters")
+		waitFor(t, "turn 1 posted", postedContaining(r, "fleet: 3 clusters"))
+		for i, text := range []string{"and staging", "and dev", "and qa"} {
+			r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: fmt.Sprintf("m3-s%d", i), Text: text}
+			waitFor(t, "steer published", func() bool { return len(inSubjectEnvelopes(t, r.url, "platform")) == i+3 })
+		}
+		waitFor(t, "four acks", func() bool { return strings.Count(strings.Join(r.adapter.postTexts(), "\n"), ackSteerQueued) == 4 })
+		completeTask(t, exec, "prod: green")
+		want := fmt.Sprintf(noticeSteerMissed, 3)
+		waitFor(t, "missed line", postedContaining(r, want))
+		waitFor(t, "terminal line", terminalEdited(r, lib.StateCompleted))
+		if n := strings.Count(strings.Join(r.adapter.postTexts(), "\n"), "as the task finished"); n != 1 {
+			t.Fatalf("%d missed lines, want the one counted line", n)
+		}
 	})
 }
 
@@ -3053,9 +3081,10 @@ func TestRelayFlushesAChunkedTurnAtTheNextNonAppendChunk(t *testing.T) {
 	waitFor(t, "deliverable", postedContaining(r, "done"))
 }
 
-// The executor refuses every queued follow-up no-resume at once when the
-// session cannot be continued; the room gets one line with the count, not
-// one per follow-up.
+// An executor that cannot continue a session (the bridge's cli executor)
+// refuses each follow-up no-resume as it arrives; the room gets one line at
+// the terminal with the count, not one per follow-up, saying follow-ups run
+// on the api executor only.
 func TestRelayFoldsNoResumeRefusalsIntoOneLine(t *testing.T) {
 	r := startRig(t)
 	conv := "discord:g1/thread-noresume"
@@ -3068,20 +3097,17 @@ func TestRelayFoldsNoResumeRefusalsIntoOneLine(t *testing.T) {
 		r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: fmt.Sprintf("nr-s%d", i), Text: text}
 		waitFor(t, "steer published", func() bool { return len(inSubjectEnvelopes(t, r.url, "platform")) == i+2 })
 		ids = append(ids, lastInSubject(t, r, origin).EnvelopeID)
-		publishSteerNotice(t, r, origin, "platform", lib.SteerNotice{Steer: lib.SteerQueued, EnvelopeID: ids[i]})
-	}
-	for _, id := range ids {
-		publishSteerNotice(t, r, origin, "platform", lib.SteerNotice{Steer: lib.SteerRefused, EnvelopeID: id, Reason: lib.SteerReasonNoResume})
+		publishSteerNotice(t, r, origin, "platform", lib.SteerNotice{Steer: lib.SteerRefused, EnvelopeID: ids[i], Reason: lib.SteerReasonNoResume})
 	}
 	completeTask(t, exec, "fleet: green")
 	want := fmt.Sprintf(noticeSteersNoResume, 3)
 	waitFor(t, "no-resume line", postedContaining(r, want))
 	waitFor(t, "terminal line", terminalEdited(r, lib.StateCompleted))
 	all := strings.Join(r.adapter.postTexts(), "\n")
-	if n := strings.Count(all, "could not continue"); n != 1 {
+	if n := strings.Count(all, "api executor only"); n != 1 {
 		t.Fatalf("%d no-resume lines, want 1:\n%s", n, all)
 	}
-	if strings.Contains(all, "did not run") || strings.Contains(all, noticeSteerMissed) {
+	if strings.Contains(all, "did not run") || strings.Contains(all, "as the task finished") {
 		t.Fatalf("a refused follow-up was also counted as unrun or missed:\n%s", all)
 	}
 	if a, b := postIndex(r, "fleet: green"), postIndex(r, want); a < 0 || a > b {

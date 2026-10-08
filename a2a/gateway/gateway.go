@@ -2181,13 +2181,15 @@ const (
 const (
 	noticeSteerNotTaken  = "⚠️ not taken: %s. Send it again after the answer."
 	noticeSteersUnrun    = "⚠️ %d queued follow-up(s) did not run before the task ended; send them again if they still matter"
-	noticeSteerMissed    = "⚠️ a follow-up arrived as the task finished and was not taken; send it again"
-	noticeSteersNoResume = "⚠️ %d follow-up(s) not taken: the executor could not continue this conversation's session; send them again if they still matter"
+	noticeSteerMissed    = "⚠️ %d follow-up(s) arrived as the task finished and were not taken; send them again"
+	noticeSteersNoResume = "⚠️ %d follow-up(s) not taken: this agent's executor can't continue a session, and follow-ups run on the api executor only; send them again after the answer if they still matter"
 )
 
 // steerRefusalWhy words an executor's refusal reason token for the room.
 // task-ended and no-resume are absent on purpose: those are counted into
-// noticeSteersUnrun and noticeSteersNoResume at the terminal. capability is
+// noticeSteersUnrun and noticeSteersNoResume at the terminal (no-resume is
+// the bridge's cli executor refusing every follow-up, since follow-ups run
+// on the api executor only). capability is
 // worded for both of its causes, because the bridge sends the one token for
 // a refusal and for a verifier it could not reach.
 var steerRefusalWhy = map[string]string{

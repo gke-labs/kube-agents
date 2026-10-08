@@ -554,8 +554,9 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 // applySteerNotice reads the executor's word on one follow-up. Queued posts
 // nothing: steerTask already acknowledged it. Refused posts why, except
 // task-ended and no-resume. The terminal reports task-ended in one line with
-// any lost ones, and no-resume in one line however many there were: the
-// executor refuses every queued follow-up at once for it. It also records
+// any lost ones, and no-resume in one line however many there were: an
+// executor that cannot continue a session (the bridge's cli executor;
+// follow-ups run on the api executor only) refuses every follow-up for it. It also records
 // that the task's addressee speaks steer notices (postSteerShortfall says
 // why).
 func (g *Gateway) applySteerNotice(rec *SessionRecord, rs *relayState, taskID string, n lib.SteerNotice) {
@@ -620,7 +621,8 @@ func (g *Gateway) flushTurn(rec *SessionRecord, rs *relayState) {
 // it was told would be taken and were not: ones the executor never answered
 // (they reached the stream after its terminal), queued ones whose turn never
 // started (refused task-ended, or lost with the executor), and ones refused
-// because the session could not be resumed.
+// no-resume because the executor cannot continue a session. Each line
+// carries its count.
 //
 // The never-answered line needs an executor that answers at all. A bridge
 // that predates steer notices (a sidecar image older than the gateway, which
@@ -632,8 +634,8 @@ func (g *Gateway) postSteerShortfall(rec *SessionRecord, rs *relayState, taskID 
 	sent := rs.steersSent
 	speaks := g.steerNoticesFrom[rec.AddresseeFor(taskID)]
 	g.mu.Unlock()
-	if sent-len(rs.answered) > 0 && speaks {
-		g.post(rec.Key, noticeSteerMissed)
+	if missed := sent - len(rs.answered); missed > 0 && speaks {
+		g.post(rec.Key, fmt.Sprintf(noticeSteerMissed, missed))
 	}
 	if unrun := len(rs.ended) + max(0, len(rs.queued)-rs.turnsStarted); unrun > 0 {
 		g.post(rec.Key, fmt.Sprintf(noticeSteersUnrun, unrun))
