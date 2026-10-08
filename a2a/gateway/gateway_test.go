@@ -2848,6 +2848,36 @@ func TestRelayRendersARefusedFollowUp(t *testing.T) {
 	waitFor(t, "refusal", postedContaining(r, fmt.Sprintf(noticeSteerNotTaken, steerRefusalWhy[lib.SteerReasonQueueFull])))
 }
 
+// TestRelayWordsARefusalWithNoReason: a refused notice with no reason token
+// says none was given; quoting the empty token would post "the executor said
+// ." to the room.
+func TestRelayWordsARefusalWithNoReason(t *testing.T) {
+	r := startRig(t)
+	conv := "discord:g1/thread-refused-bare"
+	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: "rb-1", Text: "check the fleet"}
+	origin := r.awaitTask(t, "platform")
+	_ = r.execFor(t, origin, "platform").PublishStatus(context.Background(), lib.StateWorking, false)
+	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: "rb-2", Text: "only prod"}
+	waitFor(t, "ack", postedContaining(r, ackSteerQueued))
+	steer := lastInSubject(t, r, origin)
+	publishSteerNotice(t, r, origin, "platform", lib.SteerNotice{Steer: lib.SteerRefused, EnvelopeID: steer.EnvelopeID})
+	waitFor(t, "refusal", postedContaining(r, fmt.Sprintf(noticeSteerNotTaken, "the executor gave no reason")))
+	for _, p := range r.adapter.postTexts() {
+		if strings.Contains(p, "the executor said") {
+			t.Fatalf("an empty reason was quoted: %q", p)
+		}
+	}
+
+	// An unknown token is quoted, bounded.
+	long := strings.Repeat("x", 2*steerReasonQuoteMax)
+	if got, want := steerNotTakenNotice(long), fmt.Sprintf(noticeSteerNotTaken, "the executor said "+truncateRunes(long, steerReasonQuoteMax)); got != want {
+		t.Fatalf("unknown token = %q, want %q", got, want)
+	}
+	if got := steerNotTakenNotice(" "); got != fmt.Sprintf(noticeSteerNotTaken, "the executor gave no reason") {
+		t.Fatalf("blank token = %q", got)
+	}
+}
+
 // The follow-up reached the stream after the executor's terminal, so
 // nothing answered it; the room is told at the terminal. The executor has
 // shown it answers follow-ups: on an earlier follow-up of the same task, or

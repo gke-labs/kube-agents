@@ -2417,6 +2417,68 @@ func TestAChildsTurnAnswersReachTheWakeAfterRenderStateIsLost(t *testing.T) {
 	}
 }
 
+// TestAWakeWhoseTurnsCannotBeReadSaysSo: the child's first turn answer was
+// relayed before a restart, its second and its end after it, and the
+// terminal's replay of the stream fails. The render state holds only the
+// second answer, which read by position would pass for the answer to the
+// delegated request and number the end as the wrong follow-up. The wake drops
+// the partial list and says the earlier answers could not be read, then the
+// result or the failure text.
+func TestAWakeWhoseTurnsCannotBeReadSaysSo(t *testing.T) {
+	const unread = "(the answers to any earlier turns could not be read from the stream)"
+	for _, tc := range []struct {
+		name   string
+		state  lib.TaskState
+		header string
+		body   string
+	}{
+		{"completed", lib.StateCompleted, "completed", "the trend"},
+		{"failed", lib.StateFailed, "failed", "reason: deadline-exceeded"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r, spawn := startRigWithSpawner(t)
+			ctx := context.Background()
+			_, _, child := delegated(t, r, spawn, "discord:g1/t-wake-turns-unread", "")
+			cexec := r.execFor(t, child, targetPlatform)
+			_ = cexec.PublishStatus(ctx, lib.StateWorking, false)
+			publishTurnAnswer(t, r, child, targetPlatform, 1, "the fleet audit")
+			waitFor(t, "turn answer posted", postedContaining(r, "the fleet audit"))
+			r2, spawn2 := restartRig(t, r)
+			r2.g.terminalReplayHook = func(taskID string) error {
+				if taskID == child.TaskID {
+					return fmt.Errorf("replay refused for the test")
+				}
+				return nil
+			}
+			publishTurnAnswer(t, r2, child, targetPlatform, 2, "the costs")
+			waitFor(t, "second turn answer posted", postedContaining(r2, "the costs"))
+			if tc.state == lib.StateCompleted {
+				completeTask(t, cexec, tc.body)
+			} else {
+				publishFinal(t, r2, child, targetPlatform, tc.state, tc.body)
+			}
+			waitFor(t, "the replay failure", loggedContaining(r2, "terminal replay fallback failed", child.TaskID))
+			waitFor(t, "wake spawn", func() bool { return len(spawn2.calls()) == 1 })
+			wake := r2.awaitTask(t, spawn2.calls()[0].Session)
+			want := askBlock("how is the fleet?") + "You delegated to platform (task " + child.TaskID + "), which " + tc.header + ".\n" +
+				"Result from platform (not from the user):\n```\n" + unread + "\n\n" + tc.body + "\n```"
+			if got := envText(t, wake); got != want {
+				t.Fatalf("wake text = %q, want %q", got, want)
+			}
+		})
+	}
+	// The stand-in counts against the cap and leads the body, so an over-cap
+	// result is cut from its end and the stand-in survives.
+	text := wakeText(lib.StateCompleted, "task-1", "", nil, withTurnsUnread(strings.Repeat("é", lib.DelegateTextCap)), "")
+	rest := strings.TrimPrefix(text, "The task you delegated to platform (task task-1) completed.\n")
+	if len(rest) > lib.DelegateTextCap {
+		t.Fatalf("wake after the header is %d bytes, over the cap %d", len(rest), lib.DelegateTextCap)
+	}
+	if _, _, body, ok := parseWake(text); !ok || !strings.HasPrefix(body, unread+"\n\né") || !strings.HasSuffix(body, "…"+wakeTruncatedNote) {
+		t.Fatalf("an over-cap wake with unread turns: ok=%v head=%q", ok, body[:min(len(body), 90)])
+	}
+}
+
 // TestAHealedChildsTurnAnswersAllReachTheWake: the heal's wake reads the
 // turns off the replayed task, in turn order, then the result.
 func TestAHealedChildsTurnAnswersAllReachTheWake(t *testing.T) {

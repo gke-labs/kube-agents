@@ -318,6 +318,7 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 	// child its requester stopped wakes nothing, so it needs none.
 	turns := rs.turnAnswers
 	needTurns := ref.Role == taskRoleChild && !ref.Canceled && !rs.local
+	turnsUnread := false
 	// A session turn that ends completed may have asked to delegate in an
 	// event this process never ran: the artifact's delivery was acked and
 	// lost to a crash before its batch, and only the terminal was
@@ -354,6 +355,13 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 			// not trusted as a deliverable (settleHandOff).
 			if needDelegate {
 				evidence = delegateUnknown
+			}
+			// The render state holds only the turns relayed since the
+			// restart, and the wake reads them by position: the first would
+			// pass for the answer to the delegated request. A wake that says
+			// the answers are missing beats one that misattributes them.
+			if needTurns {
+				turns, turnsUnread = nil, true
 			}
 		}
 	}
@@ -503,7 +511,13 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 
 	// A delegated child's end wakes the session that asked.
 	if ref, ok := rec.TaskRefFor(taskID); ok && ref.Role == taskRoleChild {
-		if woken, why := g.wakeSession(ctx, rec, ref, s.Status.State, turns, result, reason); !woken {
+		// Only the wake's copy carries the stand-in: the room and the
+		// observers have the result and the reason as they are.
+		wakeResult, wakeReason := result, reason
+		if turnsUnread {
+			wakeResult, wakeReason = withTurnsUnread(result), withTurnsUnread(reason)
+		}
+		if woken, why := g.wakeSession(ctx, rec, ref, s.Status.State, turns, wakeResult, wakeReason); !woken {
 			g.observeChildEnd(rec, ref, s.Status.State, source, reason, why)
 		}
 	}
@@ -539,12 +553,21 @@ func (g *Gateway) applySteerNotice(rec *SessionRecord, rs *relayState, taskID st
 	}
 }
 
+// steerReasonQuoteMax bounds, in runes, a refusal token this gateway does
+// not know when the room is shown it.
+const steerReasonQuoteMax = 64
+
 // steerNotTakenNotice words a refusal for the room. A token this gateway
-// does not know is quoted, bounded, rather than dropped.
+// does not know is quoted, bounded, rather than dropped; an empty one says
+// no reason was given rather than quoting nothing.
 func steerNotTakenNotice(reason string) string {
 	why, ok := steerRefusalWhy[reason]
-	if !ok {
-		why = "the executor said " + truncateRunes(reason, 64)
+	switch {
+	case ok:
+	case strings.TrimSpace(reason) == "":
+		why = "the executor gave no reason"
+	default:
+		why = "the executor said " + truncateRunes(reason, steerReasonQuoteMax)
 	}
 	return fmt.Sprintf(noticeSteerNotTaken, why)
 }

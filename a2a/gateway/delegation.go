@@ -451,6 +451,22 @@ const nonTextTurnAnswer = "(a non-text answer; see the stream)"
 // whose child did not complete, with the header's outcome.
 const wakeEndMarker = "(then it %s)"
 
+// wakeTurnsUnread opens a wake body whose child's earlier turn answers could
+// not be read: the render state lost some to a restart and the stream's
+// replay failed. The answers that survived would be read by position, so the
+// first would pass for the answer to the delegated request; none are sent.
+const wakeTurnsUnread = "(the answers to any earlier turns could not be read from the stream)"
+
+// withTurnsUnread is body, the result or the reason, after wakeTurnsUnread;
+// the stand-in alone for an empty body. The cap applies to the whole, as to
+// any wake body (fenceWakeBody).
+func withTurnsUnread(body string) string {
+	if body = strings.TrimSpace(body); body == "" {
+		return wakeTurnsUnread
+	}
+	return wakeTurnsUnread + "\n\n" + body
+}
+
 // wakeAnswers splits a child's answers for fenceWakeBody: earlier, every
 // turn answer, each follow-up's under its marker, and last, body (the result
 // or the reason) under the last follow-up's marker when completed, else under
