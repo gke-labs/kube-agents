@@ -68,7 +68,7 @@ from kube_agents_bench.scoring import (
     score_value,
 )
 
-from conftest import GREEN_RUNS, INJECT_RUN, RED_RUNS, FIXTURE_RUNS
+from conftest import GREEN_RUNS, INJECT_RUN, RED_RUNS, FIXTURE_RUNS, TASKS
 
 
 # --------------------------------------------------------------------------
@@ -529,6 +529,80 @@ def test_rung_3_ignores_an_empty_output(noop_spec, make_run):
         admitted=True,
     )
     assert verdict.rung is Rung.GREEN
+
+
+@pytest.fixture
+def no_tool_spec() -> CaseSpec:
+    """The real `first-install-hello-running`: a greeting a correct agent
+    gives without a tool call, so the task declares `tool_calls_optional`."""
+    return load_case(TASKS / "first-install-hello-running" / "task.yaml")
+
+
+def test_the_no_tool_cases_declare_it():
+    """The three cases the Claude nightly red on rung 3 on 2026-10-08
+    (#2691) answer without a tool call; each must carry the key."""
+    for case in (
+        "first-install-hello-running",
+        "first-install-hello-done",
+        "chat-reset-history-names-the-command",
+    ):
+        assert load_case(TASKS / case / "task.yaml").tool_calls_optional is True, case
+
+
+def test_rung_3_accepts_a_reply_with_no_tool_calls_when_the_case_declares_it(
+    no_tool_spec, make_run
+):
+    """The 2026-10-08 Claude nightly record: status success, tokens billed,
+    latency recorded, the greeting as the reply, and an empty trajectory
+    because a greeting needs no tool. That is a run (#2691)."""
+
+    def greet_without_a_tool(rec):
+        rec["trajectory"] = []
+        rec["output"] = "Hi there, I'm kube-agents. I'm taking a first look at your GKE fleet."
+
+    verdict = grade_case(no_tool_spec, [make_run(mutate=greet_without_a_tool)], admitted=False)
+    assert verdict.rung is not Rung.NOT_A_REAL_RUN, verdict.reason
+
+
+def test_rung_3_still_blocks_a_declared_case_with_no_reply(no_tool_spec, make_run):
+    """The reply is what stands in for the trajectory, so with neither the
+    record shows nothing an agent produced."""
+
+    def nothing_at_all(rec):
+        rec["trajectory"] = []
+        rec["output"] = "  \n"
+
+    verdict = grade_case(no_tool_spec, [make_run(mutate=nothing_at_all)], admitted=False)
+    assert verdict.rung is Rung.NOT_A_REAL_RUN
+    assert "trajectory and the reply are both empty" in verdict.reason
+
+
+@pytest.mark.parametrize(
+    "mutation, needle",
+    [
+        (null_the_tokens, "tokens.total is null"),
+        (zero_the_latency, "no wall-clock time elapsed"),
+        (fail_the_status, "not 'success'"),
+    ],
+    ids=["null-tokens", "latency", "status"],
+)
+def test_the_declaration_waives_only_the_trajectory(no_tool_spec, make_run, mutation, needle):
+    """A skeleton with a reply in it is still a skeleton: the key replaces
+    one signal, and the token, latency and status signals keep blocking."""
+    verdict = grade_case(
+        no_tool_spec,
+        [make_run(mutate=lambda r: (empty_the_trajectory(r), mutation(r)))],
+        admitted=False,
+    )
+    assert verdict.rung is Rung.NOT_A_REAL_RUN
+    assert needle in verdict.reason
+
+
+def test_an_undeclared_case_still_blocks_a_reply_with_no_tool_calls(noop_spec, make_run):
+    """Every other case keeps the trajectory signal, reply or not."""
+    verdict = grade_case(noop_spec, [make_run(mutate=empty_the_trajectory)], admitted=False)
+    assert verdict.rung is Rung.NOT_A_REAL_RUN
+    assert "trajectory is empty" in verdict.reason
 
 
 def test_a_failed_status_names_the_error(noop_spec, make_run):

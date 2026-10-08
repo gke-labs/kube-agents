@@ -28,6 +28,10 @@ domain: chat-and-routing
 
 owner: jayantid
 
+# A greeting needs no tool call, so rung 3 takes the reply, not the
+# trajectory, as the evidence the agent ran (docs/designs/bench-case-format.md).
+tool_calls_optional: true
+
 prompt: "hi! priya here, just installed you"
 
 expected_output: |

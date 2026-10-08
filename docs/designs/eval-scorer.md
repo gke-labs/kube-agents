@@ -99,7 +99,10 @@ stands in for a null total and nothing else; a null total with no such entry, or
 block on a devops-bench record, so the originally planned `metadata.session_id` does not exist; that mistake
 is why the fixtures are captured rather than hand-written. `output` is deliberately **not** a
 signal: a legitimately failing agent can return an empty report, and rung 3 must not double as a
-quality check. The token and latency floors are `> 0` rather than something realistic because five
+quality check. The exception is a case that declares `tool_calls_optional: true`, one a correct
+agent can answer without a tool call (a first-turn greeting, a reply that names a command). Its
+non-empty `output` stands in for the trajectory; the token, latency and status signals still apply,
+and an empty trajectory with an empty reply still fails the rung. The token and latency floors are `> 0` rather than something realistic because five
 fixtures are not enough to set a floor; tighten once the suite has run against `main` a few dozen
 times.
 

@@ -24,7 +24,7 @@ in silence — no error, no warning. The fields it reads are `id`, `name`, `prom
 means no coercion: `critical: yes` is a string, not a boolean, and fails validation.
 
 **This repository's lints** read the same file for fields devops-bench discards: `domain`,
-`fixtures`, `owner`, `expected_fail` and `audit_streams`. Those are ours. A typo in any of them cannot fail a run, which is
+`fixtures`, `owner`, `expected_fail`, `tool_calls_optional` and `audit_streams`. Those are ours. A typo in any of them cannot fail a run, which is
 exactly why `scripts/validate_bench_cases.py` exists.
 
 ## The id key
@@ -114,6 +114,13 @@ declared outcome, and passing every repetition reds the job until the marker is 
 defaults to `false`, a case for your own change never carries it, and it must be a bare YAML
 boolean: `"false"` is a string, and truthy, and the validator rejects it.
 `.agents/rules/eval_driven_development.md` has the rule; devops-bench ignores the key.
+
+`tool_calls_optional` is for a case a correct agent can answer without calling a tool: a
+first-turn greeting, a reply that names a command. `bench-gate`'s rung 3 otherwise reads an empty
+trajectory as no agent having run; with the key set, a non-empty reply stands in for the
+trajectory, and the token, latency and status signals still apply
+([`eval-scorer.md`](eval-scorer.md)). It does not forbid tool calls. It defaults to `false`, must be
+a bare YAML boolean, and devops-bench ignores it.
 
 `audit_streams` is for a case whose stack starts real audit runs without grading their
 ledger: a list of the Platform Agent job ids it starts
@@ -428,8 +435,8 @@ id that disagrees with its directory, a `domain:` that is missing or not in
 `domains.yaml`, a `fixtures:` role the fleet catalog does not define (outside a `FIXTURE_NOT_READY` case, which names the role its issue plants), a cluster-reading
 case that declares no `fixtures:` at all, a missing, empty or inline `verification_spec`,
 a check that carries no assertion and so can only pass, a missing `owner:` or one written
-as a mention or as something other than a login, an `expected_fail:` that is not a bare YAML
-boolean, an `audit_streams:` that is not a non-empty list or names a job the Platform Agent
+as a mention or as something other than a login, an `expected_fail:` or `tool_calls_optional:`
+that is not a bare YAML boolean, an `audit_streams:` that is not a non-empty list or names a job the Platform Agent
 does not have, and a case that is registered nowhere. It
 also applies the entry vocabulary above — role, the severity pairing, the rejected `hold`
 mode, a positive weight — which devops-bench enforces too, at spec-load time, after the

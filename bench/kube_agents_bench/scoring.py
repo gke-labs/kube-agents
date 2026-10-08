@@ -611,7 +611,7 @@ def _a2a_run_evidence(trajectory: list[Any]) -> bool:
     return False
 
 
-def _liveness_failures(record: RunRecord) -> list[str]:
+def _liveness_failures(record: RunRecord, *, tool_calls_optional: bool = False) -> list[str]:
     """Rung 3's signals. Every one must hold for the record to be a real run.
 
     These are the fields the fixtures showed are actually populated -- there
@@ -622,6 +622,9 @@ def _liveness_failures(record: RunRecord) -> list[str]:
 
     ``output`` is deliberately NOT among them. A legitimately failing agent
     can return an empty report, and rung 3 must not double as a quality check.
+    The one exception is a case that declares ``tool_calls_optional``: a
+    correct answer there can leave the trajectory empty, so the reply takes
+    the trajectory's place as the evidence that an agent produced something.
     """
     failures: list[str] = []
 
@@ -630,10 +633,16 @@ def _liveness_failures(record: RunRecord) -> list[str]:
         failures.append(f"record status is {record.status!r}, not 'success'{detail}")
 
     if not record.trajectory:
-        failures.append(
-            "the trajectory is empty: the agent made no tool calls, which for "
-            "these tasks means no agent ran"
-        )
+        if not tool_calls_optional:
+            failures.append(
+                "the trajectory is empty: the agent made no tool calls, which for "
+                "these tasks means no agent ran"
+            )
+        elif not record.output.strip():
+            failures.append(
+                "the trajectory and the reply are both empty: the case needs no "
+                "tool call, but nothing shows an agent answered it"
+            )
 
     # empty_tokens() fills every bucket with None, so a skeleton record reads
     # None here rather than 0. Both are liveness failures; the wording differs
@@ -1184,7 +1193,8 @@ def classify_rep(
     # because the check and liveness signals on a never-ran record are
     # artifacts of the outage, and grading them reports it as an agent
     # regression. Deliberately the CONJUNCTION, with 0 and null distinct:
-    # tokens billed with no trajectory is an inconsistent record, and the
+    # tokens billed with no trajectory is an inconsistent record (unless the
+    # case declares tool_calls_optional and carries a reply), and the
     # harness skeleton (empty trajectory, every token bucket null) never
     # billed a model call it can prove -- both stay rung 3 blocks below.
     total_tokens = record.tokens.get("total")
@@ -1239,7 +1249,7 @@ def classify_rep(
         return rep("blocked", "; ".join(problems), Rung.CHECK_DID_NOT_RUN)
 
     # --- Rung 3. Evidence that an agent actually ran.
-    liveness = _liveness_failures(record)
+    liveness = _liveness_failures(record, tool_calls_optional=spec.tool_calls_optional)
     if liveness:
         return rep(
             "blocked",
