@@ -59,6 +59,8 @@ the agent a usable kubectl context) when it has the complete triple; with one mi
 | `driftDetector.enabled`                        | bool   | Start the `drift-detector`. Default `false`, because it needs a Pub/Sub subscription a hand-written CR or a Helm-only install does not create; `install.sh` creates one and sets this to `true` unless told otherwise. See below. |
 | `driftDetector.subscription`                   | string | Pub/Sub subscription the detector pulls audit records from. Unset takes the detector's own default, which is the name the Terraform module creates.                                                                               |
 | `driftDetector.gitopsManagers`                 | string | Comma-separated `managedFields` field managers belonging to your GitOps controller, matched exactly — `argocd-controller`, `flux`. Unset means no card is ever annotated as possibly already reconciled.                          |
+| `incidentTriage.openPullRequest`               | bool   | Open the triage report's recommended fix as a pull request without waiting for a human `apply` reply. Default `false`. See below.                                                                                                 |
+| `incidentTriage.workloadDedupSeconds`          | int    | Fold a further Warning event for a workload with a live incident into that incident for this many seconds. Default `0` (one incident per object UID). See below.                                                                  |
 | `tuning.<persona>.apiMaxRetries`               | int    | Model-call retries before a run gives up. Unset = Hermes default `3`.                                                                                                                                                             |
 | `tuning.<persona>.maxTurns`                    | int    | Iterations allowed in a single turn. Unset = Hermes default `90`, except `platform` (see below).                                                                                                                                  |
 | `tuning.maxInProgress`                         | int    | Board-wide cap on concurrent kanban workers. Unset = operator default `2`.                                                                                                                                                        |
@@ -262,6 +264,54 @@ ownership is still read and reported, and you get the same cards without the ann
 Nothing else about the detector is exposed here. Which principals count as human, and which calls
 are dropped as failed or non-declarative, are compiled into the binary; what reaches it at all is
 set by the Terraform module's log sink, not by the CR.
+
+### `spec.harness.incidentTriage`
+
+By default, a triage report from the `k8s-event-watcher` proposes GitOps fixes and stops. A human
+replies `apply` (or `apply Option B`), and the Platform Agent opens that fix as a pull request.
+`openPullRequest: true` removes the wait for the reply. The Planning Agent files a second card
+beside the triage card. That card is assigned to the Platform Agent and parented on the triage card,
+so it starts only after the report is complete. It opens the option the report marked Recommended,
+or the single proposed fix, through `submit-suggestion`.
+
+```yaml
+spec:
+  harness:
+    incidentTriage:
+      openPullRequest: true
+```
+
+A human still reviews and merges the pull request, and nothing is written to the live cluster. The
+branch is `platform-agent/incident-<cluster>-<namespace>-<workload>-<digest>`, keyed to the workload, so a
+second incident on a workload revises its open pull request rather than opening another. The event
+watcher's own window lapses on a fault nobody has fixed yet (FailedScheduling repeats on a five-minute
+back-off), and each lapse would be a new incident. So before it starts a session, Session KV asks the
+forge whether the workload's branch has a pull request that is open, or merged or closed in the last
+ten minutes, the time a merged fix takes to sync and roll out. If one does, the event is written to the
+ledger as a duplicate of the workload's last admitted event, answered to the watcher as filtered, and
+starts no session. The lookup is bounded at five seconds; a slow or failed forge admits the event as
+before. After that grace period, the next incident opens a new pull request. The second card's result,
+the pull request URL, is posted to the same chat thread as the report.
+
+The setting has limits. Drift reports from `drift-detector` are not covered; they still wait for a
+reply. A human `apply` reply on a report whose pull request is already open does not know the
+incident branch, so it can open a second pull request. Changing the field rolls the gateway pod,
+because it reaches the agent as the `INCIDENT_TRIAGE_OPEN_PULL_REQUEST` environment variable. The
+operator sets that variable only when the field is `true`, so an install that never sets it keeps
+the pod it had. The Helm value is `platformAgent.harness.incidentTriage.openPullRequest`.
+
+`workloadDedupSeconds` bounds how many incidents one failing workload opens. The `k8s-event-watcher`
+deduplicates on the involved object's UID, so a Deployment whose two replicas fail the same way, or
+whose rollout replaces one failing pod with another, offers one event per pod. Each becomes a triage
+session, and with `openPullRequest` a pull request for the same fix. With the window set, a further
+Warning event for the same cluster, namespace and workload within that many seconds of the
+workload's last admitted event is written to the event ledger as a duplicate of that row
+(`duplicate_of`), answered to the watcher as filtered, and starts no session. Only an admitted event
+anchors the window: an event the daily ceiling refused does not silence the next. Pick a window
+longer than the gap between sibling pods' first events (seconds) and shorter than the time a second,
+unrelated incident on the same workload could follow a fix. Default `0` keeps one incident per
+object UID. It reaches the agent as `INCIDENT_WORKLOAD_DEDUP_SECONDS`, set only when the field is
+above zero. The Helm value is `platformAgent.harness.incidentTriage.workloadDedupSeconds`.
 
 ### `spec.harness.tuning`
 

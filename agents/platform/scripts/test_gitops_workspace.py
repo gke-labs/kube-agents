@@ -1629,6 +1629,32 @@ class TestContextRepos(WorkspaceTestCase):
         with patch("gitops_workspace.get_managed_github_repos", return_value=["acme/single"]):
             self.assertEqual(gitops_workspace.resolve_repo(), "acme/single")
 
+    def test_get_managed_forge_repos_returns_host_qualified_entries_across_forges(self):
+        entries = [
+            {"type": "github", "url": "https://github.com/acme/fleet.git"},
+            {"type": "github", "url": "https://github.com/ACME/fleet"},
+            {"type": "gitea", "url": "http://gitea.local:3000/ops/manifests.git"},
+            {"type": "gitlab", "url": "https://gitlab.example.com/platform/gitops/cluster-cfg"},
+            {"type": "gitea", "url": "http://gitea.local:3000/only-a-group"},
+            {"type": "gitlab", "url": "relative/no-host"},
+            {"type": "github", "url": "https://gitlab.example.com/wrong/type"},
+            {"type": "bitbucket", "url": "https://bitbucket.org/acme/ignored"},
+        ]
+        with patch("gitops_workspace.get_managed_repo_entries", return_value=entries):
+            got = gitops_workspace.get_managed_forge_repos()
+        self.assertEqual(
+            got,
+            [
+                {"type": "github", "repo": "github.com/acme/fleet", "path": "acme/fleet"},
+                {"type": "gitea", "repo": "gitea.local/ops/manifests", "path": "ops/manifests"},
+                {
+                    "type": "gitlab",
+                    "repo": "gitlab.example.com/platform/gitops/cluster-cfg",
+                    "path": "platform/gitops/cluster-cfg",
+                },
+            ],
+        )
+
     def test_multiple_repos_in_configmap_raises_error(self):
         with patch("gitops_workspace.get_managed_github_repos", return_value=["acme/first", "acme/second"]):
             with self.assertRaises(RuntimeError) as caught:

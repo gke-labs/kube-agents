@@ -365,6 +365,21 @@ class TestEODWatcherRecap(unittest.TestCase):
         self.assertEqual(summary["cap_dropped"], 30)
         self.assertEqual(summary["cap_dropped_alerts"], 3)
 
+    def test_workload_window_folded_duplicates_are_not_counted_as_ceiling_drops(self):
+        """A duplicate folded into a live incident was not withheld by the daily ceiling."""
+        anchor = event(workload="payment-api", object_uid="pod-0", notified=True)
+        duplicates = [
+            {**event(workload="payment-api", object_uid=f"pod-{i}", notified=False), "duplicate_of": 42}
+            for i in range(1, 4)
+        ]
+        summary = filter_and_aggregate_events([anchor] + duplicates)
+        report = generate_markdown_report(summary, cluster_name="test-cluster")
+
+        self.assertEqual(summary["alerts_posted"], 1)
+        self.assertEqual(summary["cap_dropped"], 0)
+        self.assertEqual(summary["cap_dropped_alerts"], 0)
+        self.assertNotIn("withheld by the daily ceiling", report)
+
     def test_a_clean_day_is_not_told_about_alerts_it_did_not_lose(self):
         """The control. Without it the assertion above passes on a fixed string."""
         summary = filter_and_aggregate_events([event(), listed()])
