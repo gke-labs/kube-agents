@@ -819,6 +819,11 @@ class ReportTest(unittest.TestCase):
         self.assertIn("behind the target. Window: DAILY at", gemma_block)
         self.assertIn("Exclusions: hold-gpu-minor (NO_MINOR_UPGRADES) until 2026-10-21T00:00:00Z [active].", gemma_block)
         self.assertNotIn(ur.NONE_LINE, info)
+        # `_none_` is reserved for an empty severity section: an unclassified
+        # incident says what it lacks instead.
+        self.assertNotIn(ur.NONE_LINE, report)
+        self.assertIn(ur.UNCLASSIFIED_MITIGATION_TEXT, warnings)
+        self.assertIn(ur.UNCLASSIFIED_GUARD_TEXT, warnings)
 
     def test_info_lists_clean_unchanged_and_failed(self):
         reads_clean = {**READS["seeded-a"], "pods": [p for p in READS["seeded-a"]["pods"] if p["status"]["phase"] == "Running" and "payments" not in p["metadata"]["name"]], "events": [], "pdbs": []}
