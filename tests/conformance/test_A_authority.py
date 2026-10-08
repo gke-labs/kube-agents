@@ -962,15 +962,35 @@ class A3TheTaskPlaneSubjectSaysWhoWroteIt(unittest.TestCase):
         read filter, built the same way as the publish grants around it),
         must name `pod`, the session's own attested name, and nothing else.
         """
-        body = h.go_function_body(h.text("a2a_session_grants"), "sessionGrants")
-        calls = re.findall(r"TaskInSubject\(\s*([^,]+),", body)
-        self.assertTrue(calls, "sessionGrants calls TaskInSubject nowhere; the probe below is vacuous")
-        for arg in calls:
+        src = h.text("a2a_session_grants")
+        body = h.go_function_body(src, "sessionGrants")
+        for arg in re.findall(r"TaskInSubject\(\s*([^,]+),", body):
             self.assertEqual(
                 "pod",
                 arg.strip(),
                 f"sessionGrants calls TaskInSubject({arg.strip()}, ...): a literal "
                 f"addressee here grants the session a publish on another "
+                f"addressee's in subject",
+            )
+        # The task-plane half, the per-session consumer's read filter among
+        # it, is built by executorGrants, which AgentProfile pods share
+        # (gke-labs#2469). The session reaches it only as
+        # executorGrants(pod, pod), and inside it every TaskInSubject names
+        # the addressee argument, so the session's calls still name pod.
+        self.assertEqual(
+            ["pod, pod"],
+            [a.strip() for a in re.findall(r"executorGrants\(([^)]*)\)", body)],
+            "sessionGrants no longer derives its task-plane grants as executorGrants(pod, pod)",
+        )
+        executor = h.go_function_body(src, "executorGrants")
+        calls = re.findall(r"TaskInSubject\(\s*([^,]+),", executor)
+        self.assertTrue(calls, "executorGrants calls TaskInSubject nowhere; the probe above is vacuous")
+        for arg in calls:
+            self.assertEqual(
+                "addressee",
+                arg.strip(),
+                f"executorGrants calls TaskInSubject({arg.strip()}, ...): every "
+                f"executor, sessions included, would hold a grant on that "
                 f"addressee's in subject",
             )
 
