@@ -219,6 +219,11 @@ FIXTURE_NOT_READY = {
         "each pool project's *-infra repository, so 3.3's fix is a manifest "
         "rather than manual"
     ),
+    "obtainability-untargeted-compute-class-manifest": (
+        "#2540: needs a ComputeClass cluster without default ComputeClass and with "
+        "an untargeted workload (untargeted-worker) in each pool project, so 3.24's "
+        "finding on the planted workload is verifiable"
+    ),
     "cluster-agent-stalled-controller-diagnosis": (
         "#1873: needs the stalled-controller role applied to every pool "
         "project; fixture defined in #1893, waiting on fleet re-apply and pool "

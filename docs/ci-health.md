@@ -377,7 +377,8 @@ latest builds` step reads each job's `latest-build.txt` from
 identities cannot write the Prow archive),
 walks back to a build with a `finished.json` (the newest is often still
 running), keeps the job's report when the build wrote one (the reconcile's
-`fleet-reconcile.json`, the sweep's `pull-sweep.json`), and hands the readings
+`fleet-reconcile.json`, the sweep's `pull-sweep.json`; the sweep's GitLab pass
+writes `pull-sweep-gitlab.json`, which is not read), and hands the readings
 to `health.py --periodics-dir`.
 
 Like the pool note it rides beside the state and never becomes one. A job whose

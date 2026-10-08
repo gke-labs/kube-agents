@@ -1681,6 +1681,19 @@ Mutation(
         "required and never go Ready",
     ),
     Mutation(
+        "C1-reserved-addressees-env-renamed-on-the-callout-side",
+        "a2a/cmd/authcallout/main.go",
+        ('envReservedAddressees = "A2A_RESERVED_ADDRESSEES"',
+         'envReservedAddressees = "A2A_FIXED_ADDRESSEES"'),
+        "test_C1_the_callouts_reserved_addressees_env_is_spelled_the_same_in_both_modules",
+        "rename the callout's reserved-addressees variable to say what the "
+        "names are, in the module that reads it. a2a builds and its tests set "
+        "the env by the same constant, so they stay green; the operator is not "
+        "rebuilt by this edit and goes on rendering A2A_RESERVED_ADDRESSEES. "
+        "The next callout rollout's pods exit with A2A_FIXED_ADDRESSEES is "
+        "required and never go Ready",
+    ),
+    Mutation(
         "C1-agent-principal-gets-a-static-password",
         "k8s-operator/internal/controller/platformagent_a2a_identities.go",
         ('\t\tuser:           a2aAgentBusUser,',
