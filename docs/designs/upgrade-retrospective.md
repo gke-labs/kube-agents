@@ -104,7 +104,7 @@ this design's (D) lands its guards once it ships.
 upgrade-retrospective (Platform Agent roster: Sunday 18:00 UTC; and once, from the
                        Chat Agent's first-run stage after the inventory scan settles)
   └─ collector  upgrade_retrospective.py                          deterministic, no model
-       ├─ ledger: versions per cluster, last run                   <agent home>/upgrade-retrospective/ledger.json
+       ├─ ledger: versions per cluster, last run                   /opt/data/upgrade-retrospective/ledger.json (the shell's volume)
        ├─ select: new (not in ledger) or upgraded (version differs, or an
        │          UPGRADE_MASTER / UPGRADE_NODES operation since the last run)
        ├─ (A) operations in the window, versions before and after
@@ -161,15 +161,22 @@ A question that names a cluster the last run did not review forces that cluster 
 The ledger holds, per cluster, the control-plane version, every node pool's version, and the time
 of the last run. A cluster is _new_ when absent, _upgraded_ when a version differs or when
 `gcloud container operations list` shows an `UPGRADE_MASTER` or `UPGRADE_NODES` operation targeting
-it that started after the last run, and _re-checked_ when it is unchanged but holds a live guard:
+it that reached a terminal status (`DONE`, `ABORTING`, an error) with an end time after the last
+run, and _re-checked_ when it is unchanged but holds a live guard:
 only the reads that guard needs run, and a guard whose symptom or shape is gone is cleared. A
 cluster a successful listing no longer names leaves the ledger and loses its guards, and the report
-says so. The first run has no ledger and reviews the last fourteen days of operations. The collector runs where the fleet-audit collectors run, in the agent's terminal, and
-resolves projects the way they do: `--project` when given, else `MONITORED_PROJECT_IDS`, else every
-project `gcloud projects list` returns. The SOP passes `--project` for the management project and
-every project a Cluster Agent profile names, so a scheduled run reads the reconciler's roster and
-agrees with the readiness watch design on what "the fleet" is; a run by hand without the flag reads
-what the credential can list.
+says so. A cluster with an operation still `RUNNING` is not reviewed: a drain in progress shows a
+budget with no allowance, a Pending replacement and a `NotReady` node, which are the signatures of
+entries 1, 2 and 17 on a cluster that is simply not finished; it is listed under Info as upgrading
+now and reviewed on the next run, and the on-demand route says the same when asked mid-upgrade. The
+first run has no ledger and reviews the last fourteen days of operations. The collector runs where the fleet-audit collectors run, in the agent's terminal.
+Projects are `--project` when given, else `MONITORED_PROJECT_IDS`, else the active `gcloud` project
+plus every project `gcloud projects list` returns (the order `fleet_upgrade_report.py` uses; the
+fleet-audit collectors read no environment variable and go straight from `--project` to the active
+project and the listing). The SOP passes `--project` for the management project and every project a
+Cluster Agent profile names, so a scheduled run reads the reconciler's roster and agrees with the
+readiness watch design on what "the fleet" is; a run by hand without the flag reads what the
+credential can list.
 
 ### 3.3 A collector for the facts, an SOP for the judgement
 
@@ -243,7 +250,13 @@ variable to different directories and a store rooted there is written at one pat
 another. Under the root: `reports/<date>.md`, `upgrade-retro-report.md` beside `reports/` pointing
 at the latest, the same report as `.json`, `ledger.json` and `guards.json`. The volume survives a
 pod restart, every session's tools can read it, and the on-demand route finds the Sunday report
-there. The readiness watch runs on the gateway pod and reaches the file the same way it reaches
+there. Two triggers write the same files, so one run holds an exclusive lock on `.lock` under the
+root for its duration and a second run, scheduled or on demand, prints one line and exits without
+writing (a dry run reads without the lock). Each file is written to a temporary name and renamed,
+in the order report, guards, ledger, so a run that dies leaves at most a report with no ledger
+advance; a ledger that cannot be parsed is set aside under a dated name and the run stops with that
+as its line, which is a crash record to read, not a re-baseline, and a run starts from an empty
+ledger only when no ledger file exists at all. The readiness watch runs on the gateway pod and reaches the file the same way it reaches
 `gcloud`, through its sandbox hop. The chat line still carries the counts and the top finding, so
 a reader who never opens the file gets the verdict.
 
@@ -276,14 +289,15 @@ Mitigation set up: guard seeded-b / entry 1 / seeded-upgrade/PodDisruptionBudget
 
 ## Warnings
 
-### Entry 6 on gemma-gpu-upgraded: kubeagents-system/CronJob/legacy-flowcontrol-tuner
-What happened: no upgrade operation in the window; control plane 1.32.13, default-pool 1.31.14.
-What failed: 6 of 6 Job pods in Error, catalogue entry 6 (a served API version is removed),
-  medium; evidence: the spec names flowcontrol, a name rather than an observed API call.
+### Entry 14 on seeded-a: seeded-shapes/Deployment/cgroup-blind-jvm
+What happened: UPGRADE_NODES default-pool 1.35.7 -> 1.35.8, <date> (9m), DONE.
+What failed: 1 of 1 pods CrashLoopBackOff, container OOMKilled on a cgroup v2 pool, catalogue
+  entry 14 (cgroup v2 under a runtime that cannot read it), medium; evidence: image
+  eclipse-temurin:8u302-b08-jre, one container.
 Detect and mitigate next time: ...
 Mitigation set up: guard ...
 
-### Unclassified on platform-agent-host: kubeagents-system/Deployment/platform-agent-gateway
+### Unclassified on <cluster>: <namespace>/Deployment/<name>
 What failed: Unhealthy probe events, 31 in the window, matching none of the twenty.
 
 ## Info
@@ -307,13 +321,16 @@ Risks present:
 | seeded-shapes/PersistentVolume/intree-pd            | gcePersistentDisk in-tree, CSI add-on off | 19 | high       |
 Baseline recorded: 3 pools, 41 pods, 4 budgets, 2 shapes; 2 risk guards written.
 
-- Unchanged: gemma-gpu, last upgraded 2026-09-24 (UPGRADE_NODES gpu-pool), next target
-  1.36.4-gke.1247000.
+- Unchanged: seeded-d, last upgraded <date> (UPGRADE_NODES second-zone-pool), next target
+  1.35.8-gke.1225000.
+- Upgrading now: <cluster> (UPGRADE_NODES <pool> since <time>); reviewed on the next run.
 - Reads that failed: none.
 ```
 
-The example's facts are from the test fleet; a real run's content comes from the collector's JSON,
-which keeps the per-cluster data and the same three-way grouping.
+The example is illustrative: cluster and object names are the seeded fleet's where it has one
+(`seeded-upgrade/pinned-batch-runner` on seeded-b, `seeded-shapes/Deployment/cgroup-blind-jvm` on
+seeded-a), placeholders otherwise, and the dates and verdicts are invented. A real run's content
+comes from the collector's JSON, which keeps the per-cluster data and the same three-way grouping.
 
 ## 5. Work breakdown
 
