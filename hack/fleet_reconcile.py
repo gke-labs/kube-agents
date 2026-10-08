@@ -224,8 +224,11 @@ REASON_NOT_REACHED_BUDGET = "not started: %ds left in the run's budget, under th
 REASON_NOT_REACHED_BUDGET_MARK = "left in the run's budget"
 REASON_NOT_REACHED_MOVED = "not started: the fleet stack under bench/tf/fleet on %s is now %s and this run applies %s; the next run takes it"
 REASON_NOT_REACHED_MOVED_AWAY = "not started: bench/tf/fleet on %s no longer holds the stack this run applies (%s); the next run takes it"
-# How git's bytes are decoded and the hash input re-encoded: the two must agree
-# so a path git prints that is not UTF-8 survives the round trip.
+# How git's bytes are decoded and the hash input re-encoded: the same encoding
+# and error handler on both sides, whatever the process locale, so a path git
+# prints that is not UTF-8 survives the round trip and two processes hash one
+# tree alike.
+GIT_TEXT_ENCODING = "utf-8"
 GIT_TEXT_ERRORS = "surrogateescape"
 REASON_NOT_REACHED_BUSY = "not free in Boskos before the run's budget ran out; the next run takes it"
 REASON_NOT_REACHED_TERMINATED = "not started: the run was terminated; the next run takes it"
@@ -728,7 +731,7 @@ def git_output(args):
     try:
         # surrogateescape: a path git prints that is not UTF-8 (ls-tree -z
         # emits raw bytes) is carried through, not a decode error.
-        result = subprocess.run(["git", "-C", str(REPO_ROOT)] + list(args), capture_output=True, text=True, errors=GIT_TEXT_ERRORS, timeout=GIT_TIMEOUT_SECONDS)
+        result = subprocess.run(["git", "-C", str(REPO_ROOT)] + list(args), capture_output=True, text=True, encoding=GIT_TEXT_ENCODING, errors=GIT_TEXT_ERRORS, timeout=GIT_TIMEOUT_SECONDS)
     except (OSError, subprocess.SubprocessError) as exc:
         raise ReconcileError("git %s: %s" % (" ".join(args), exc))
     if result.returncode != 0:
@@ -754,15 +757,16 @@ def fleet_tree(rev):
     """A hash over the stack's inputs under FLEET_SUBDIR at `rev`: each input's
     mode, blob and path from `git ls-tree`, so a change to any of them moves it
     and a change to anything else there does not. A rev with no inputs there
-    is an error, not a tree: a ref that resolves but lacks the stack must fail
-    the run, not read as "main moved" and drain it green."""
+    raises NoStackError, never a hash: at the run's first check that is a
+    configuration error that fails the run; later in the run it means main
+    has moved away from the stack and the run stops."""
     # -z: NUL-separated entries with the path unquoted, so a non-ASCII name is
     # still matched by its suffix.
     listing = git_output(["ls-tree", "-r", "-z", "--full-tree", rev, "--", FLEET_SUBDIR])
     lines = sorted(entry for entry in listing.split("\0") if "\t" in entry and is_fleet_input(entry.split("\t", 1)[1]))
     if not lines:
-        raise NoStackError("no stack inputs (%s, %s) under %s at %s; not a kube-agents checkout, or the wrong ref" % ("/".join(FLEET_INPUT_SUFFIXES), "/".join(FLEET_INPUT_NAMES), FLEET_SUBDIR, rev))
-    return hashlib.sha256("\n".join(lines).encode("utf-8", GIT_TEXT_ERRORS)).hexdigest()
+        raise NoStackError("no stack inputs (%s, %s) under %s at %s" % ("/".join(FLEET_INPUT_SUFFIXES), "/".join(FLEET_INPUT_NAMES), FLEET_SUBDIR, rev))
+    return hashlib.sha256("\n".join(lines).encode(GIT_TEXT_ENCODING, GIT_TEXT_ERRORS)).hexdigest()
 
 
 class Run:
@@ -850,7 +854,7 @@ class Run:
             return
         moved = self._main_moved(first=True)
         if self.main_check_error:
-            raise ReconcileError("--stop-when-moved %s: %s" % (self.main_ref, self.main_check_error))
+            raise ReconcileError("--stop-when-moved %s: %s (not a kube-agents checkout, or the wrong ref)" % (self.main_ref, self.main_check_error))
         if moved:
             self._stop = moved
 
@@ -872,13 +876,14 @@ class Run:
                 current = fleet_tree("FETCH_HEAD")
             except NoStackError as exc:
                 if first:
-                    raise
+                    # A definite reading, not a failed one: no warning here;
+                    # require_main_readable makes it the fatal configuration error.
+                    self.main_check_error = str(exc)
+                    return None
                 # The fetch answered and the tree holds no stack: main has
-                # moved to a state this run must not apply over, which is a
-                # stop, not a failed read. At the first check it is the
-                # configuration error require_main_readable makes fatal.
+                # moved to a state this run must not apply over, a stop.
                 self.main_moved = True
-                return REASON_NOT_REACHED_MOVED_AWAY % (self.main_ref, exc)
+                return REASON_NOT_REACHED_MOVED_AWAY % (self.main_ref, self.fleet_tree)
         except ReconcileError as exc:
             # Not knowing is not the same as having moved: the run goes on
             # and tries again at the next check, and the report says so.

@@ -765,6 +765,8 @@ class MainTest(unittest.TestCase):
         self.assertEqual(rc, reconcile.EXIT_FAILED)
         self.assertEqual(boskos.acquired, [])
         self.assertIn("no stack inputs", stderr.getvalue())
+        self.assertIn("wrong ref", stderr.getvalue(), "the configuration hint belongs to the first check")
+        self.assertNotIn("could not read", stderr.getvalue(), "a definite reading is not logged as a failed one")
 
     def test_a_main_that_moved_before_the_first_project_is_not_reached_and_not_blamed_on_boskos(self):
         def git(args):
@@ -1494,6 +1496,21 @@ class FleetTreeTest(unittest.TestCase):
         listing = _fleet_listing(**FLEET_INPUTS, **{"caf\udce9.tf": "cccc"}, **FLEET_DOCS)
         self.assertNotEqual(self._tree(listing), TREE_A)
 
+    def test_the_hash_does_not_depend_on_the_process_locale(self):
+        # The decode names utf-8 outright: a valid UTF-8 name hashes the same
+        # whatever locale the interpreter runs under, so the daily, the
+        # postsubmit and a hand run write one value for one tree.
+        calls = []
+
+        def run(argv, **kw):
+            calls.append(kw)
+            return subprocess.CompletedProcess(argv, 0, _fleet_listing(**FLEET_INPUTS, **{"caf\u00e9.tf": "cccc"}), "")
+
+        with mock.patch.object(reconcile.subprocess, "run", run):
+            reconcile.fleet_tree("HEAD")
+        self.assertEqual(calls[0].get("encoding"), "utf-8")
+        self.assertEqual(calls[0].get("errors"), "surrogateescape")
+
     def test_a_non_utf8_input_name_hashes_through_real_git(self):
         # The index can hold a name the filesystem cannot; `ls-tree -z` prints
         # its raw bytes and git_output decodes them with surrogateescape. Real
@@ -1610,6 +1627,8 @@ class MainMovedTest(unittest.TestCase):
         self.assertEqual(outcomes[P7][0], reconcile.OUTCOME_APPLIED)
         self.assertEqual(outcomes[P8][0], reconcile.OUTCOME_NOT_REACHED)
         self.assertIn("no longer holds the stack", outcomes[P8][1])
+        self.assertIn(TREE_A, outcomes[P8][1], "names the tree this run applies")
+        self.assertNotIn("wrong ref", outcomes[P8][1], "the first check's hint does not belong on a legitimate move")
         self.assertTrue(run.main_moved)
         self.assertIsNone(run.main_check_error, "a definite reading, not a failed one")
 
