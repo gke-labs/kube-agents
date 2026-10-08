@@ -28,9 +28,8 @@
 #
 # It refuses an install where a person has connected (`.user_aligned`) or
 # onboarding already delivered (`.bootstrap_completed`): a fresh sweep there
-# ends in a report sent to a real chat. It also refuses one whose
-# `bootstrap-inventory-scan` job is missing or paused, where nothing would
-# file the sweep.
+# ends in a report sent to a real chat. It also refuses one whose `oobe` job,
+# which runs the scan, is missing or paused, where nothing would file the sweep.
 
 terraform {
   required_version = ">= 1.5.0"
@@ -51,12 +50,14 @@ locals {
   run_wait  = 900
   poll      = 15
   inventory = "${local.home}/INVENTORY.raw.md ${local.home}/INVENTORY.md"
-  # The gate as the cron job launches it, and the longest one run of it can
+  # The longest one run of the gate can
   # take at the default scope cap, which is what this stack installs:
   # bootstrap_scan_gate.py's RECONCILE_TIMEOUT_SECONDS (390) plus one cron
   # tick. A declared spec.scope.maxProjects raises the gate's ceiling with
   # the reconcile's budget.
-  gate_script = "bootstrap_scan_gate.py"
+  # The processes the gate runs in: oobe.py, whose scan stage calls it in-process, and the
+  # gate script itself, which the old scan job still runs on an install with no oobe job.
+  gate_script = "oobe.py bootstrap_scan_gate.py"
   gate_wait   = 450
   # The job whose scan stage files the sweep (agents/chat/scripts/oobe.py); the old
   # bootstrap-inventory-scan entry ships disabled.
@@ -225,7 +226,7 @@ resource "null_resource" "sweep" {
         fi
         for pod in $pods; do
           state="$(kubectl exec -i -n "${var.agent_namespace}" "$pod" -c "${var.agent_container}" -- \
-            ${local.python} - "${local.gate_script}" <<'PY' || true
+            ${local.python} - ${local.gate_script} <<'PY' || true
       import os, sys
       me = os.getpid()
       for pid in filter(str.isdigit, os.listdir("/proc")):
@@ -234,7 +235,7 @@ resource "null_resource" "sweep" {
                   argv = fh.read().decode(errors="replace").split("\0")
           except OSError:
               continue
-          if int(pid) != me and any(os.path.basename(a) == sys.argv[1] for a in argv[1:]):
+          if int(pid) != me and any(os.path.basename(a) in sys.argv[1:] for a in argv[1:]):
               print("running")
               break
       else:

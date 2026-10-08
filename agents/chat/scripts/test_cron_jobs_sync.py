@@ -206,6 +206,58 @@ class ReconcileTests(unittest.TestCase):
                 self.assertEqual(state & set(entry), set())
 
 
+class FoldTests(unittest.TestCase):
+    """The fold of the onboarding jobs into oobe (docs/designs/oobe.md section 5)."""
+
+    SCAN = {"id": "bootstrap-inventory-scan", "schedule": "* * * * *", "enabled": False}
+    DELIVERY = {"id": "bootstrap-inventory-delivery", "schedule": "* * * * *", "enabled": False, "deliver": "local"}
+    OOBE = {"id": "oobe", "schedule": "* * * * *", "deliver": "local"}
+    ORIGIN = {"platform": "google_chat", "chat_id": "spaces/AAA"}
+
+    def _jobs(self, merged):
+        return {j["id"]: j for j in merged}
+
+    def test_the_link_on_the_old_delivery_job_is_carried_to_oobe(self):
+        runtime = [
+            {**self.SCAN, "enabled": True},
+            {**self.DELIVERY, "enabled": True, "deliver": "origin", "origin": self.ORIGIN},
+            dict(self.OOBE),
+        ]
+        merged, _, summary = cron_jobs_sync.reconcile([self.SCAN, self.DELIVERY, self.OOBE], runtime, set())
+        oobe = self._jobs(merged)["oobe"]
+        self.assertEqual((oobe["deliver"], oobe["origin"]), ("origin", self.ORIGIN))
+        self.assertEqual(summary["linked"], ["oobe"])
+
+    def test_a_link_already_on_oobe_stands(self):
+        mine = {"platform": "slack", "chat_id": "C1"}
+        runtime = [
+            {**self.DELIVERY, "deliver": "origin", "origin": self.ORIGIN},
+            {**self.OOBE, "deliver": "origin", "origin": mine},
+        ]
+        merged, _, summary = cron_jobs_sync.reconcile([self.DELIVERY, self.OOBE], runtime, set())
+        self.assertEqual(self._jobs(merged)["oobe"]["origin"], mine)
+        self.assertEqual(summary["linked"], [])
+
+    def test_the_old_jobs_ship_disabled_beside_oobe(self):
+        runtime = [{**self.SCAN, "enabled": True}, {**self.DELIVERY, "enabled": True}, dict(self.OOBE)]
+        merged, _, summary = cron_jobs_sync.reconcile([self.SCAN, self.DELIVERY, self.OOBE], runtime, set())
+        jobs = self._jobs(merged)
+        self.assertEqual((jobs["bootstrap-inventory-scan"]["enabled"], jobs["bootstrap-inventory-delivery"]["enabled"]), (False, False))
+        self.assertEqual(summary["kept_onboarding"], [])
+
+    def test_without_oobe_the_old_jobs_stay_enabled(self):
+        # An earlier image removed oobe once its audits were done, mid-onboarding: the old jobs
+        # are all that can still deliver the report.
+        runtime = [{**self.SCAN, "enabled": True}, {**self.DELIVERY, "enabled": True}]
+        merged, _, summary = cron_jobs_sync.reconcile(
+            [self.SCAN, self.DELIVERY, self.OOBE], runtime, {"bootstrap-inventory-scan", "bootstrap-inventory-delivery", "oobe"}
+        )
+        jobs = self._jobs(merged)
+        self.assertNotIn("oobe", jobs)
+        self.assertEqual((jobs["bootstrap-inventory-scan"]["enabled"], jobs["bootstrap-inventory-delivery"]["enabled"]), (True, True))
+        self.assertEqual(summary["kept_onboarding"], ["bootstrap-inventory-scan", "bootstrap-inventory-delivery"])
+
+
 class SyncFileTests(unittest.TestCase):
     def setUp(self):
         self._tmp = TemporaryDirectory()

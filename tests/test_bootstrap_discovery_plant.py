@@ -78,7 +78,7 @@ _INTERPOLATIONS = {
     "local.run_wait": "900",
     "local.poll": "15",
     "local.inventory": "/opt/data/INVENTORY.raw.md /opt/data/INVENTORY.md",
-    "local.gate_script": "bootstrap_scan_gate.py",
+    "local.gate_script": "oobe.py bootstrap_scan_gate.py",
     "local.gate_wait": "300",
     "local.list_tries": "3",
     "local.list_wait": "5",

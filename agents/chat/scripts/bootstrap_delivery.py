@@ -489,8 +489,12 @@ def _origin() -> dict:
     try:
         from cron.jobs import get_job  # type: ignore import-not-found
 
-        job = get_job(OOBE_JOB_ID) or {}
-        return job.get(ORIGIN_KEY) or {}
+        # oobe's when it runs this stage; the old job's on an install still delivering through it.
+        for job_id in (OOBE_JOB_ID, DELIVERY_JOB_ID):
+            origin = (get_job(job_id) or {}).get(ORIGIN_KEY)
+            if origin:
+                return origin
+        return {}
     except Exception as e:
         sys.stderr.write(f"bootstrap_delivery: could not read the delivery origin: {e}\n")
         return {}
