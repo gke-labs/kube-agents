@@ -1073,7 +1073,9 @@ func (b *Bridge) runTask(ctx context.Context, run *taskRun) {
 			"reason: no-text-parts - the submission message carries nothing the hermes CLI can be asked", nil)
 		return
 	}
-	if err := b.publishWorking(ctx, run); err != nil {
+	if err := b.publishWorking(ctx, run); errors.Is(err, errRunEnded) {
+		return // canceled or shut down first; its finalize wrote the terminal
+	} else if err != nil {
 		b.cfg.Logger.Error("working publish failed", "task", taskID, "err", err)
 		b.finalize(run, lib.StateFailed, "reason: bus-publish-failed at working", nil)
 		return
@@ -1316,12 +1318,28 @@ func (b *Bridge) publishTerminal(ctx context.Context, run *taskRun, state lib.Ta
 	return b.publishStatusMessage(ctx, run, state, true, msg)
 }
 
+// errRunEnded is publishWorking finding the run already finalized: there is
+// nothing to report and nothing to finalize, the caller just returns.
+var errRunEnded = errors.New("run finalized before its working status")
+
 // publishWorking publishes the run's working status under noticeMu, so a
 // steer notice that read the run as still submitted lands before it, never
-// after: a late "submitted" would fold the task backwards.
+// after: a late "submitted" would fold the task backwards. It publishes only
+// if the run is still running when noticeMu is held, and answers errRunEnded
+// otherwise. finalize drops mu while it refuses the queue, so a worker can
+// take a pending run in that gap and get here; finalize sets stateDone only
+// under noticeMu, so the check under it is final both ways - a finalize that
+// began first has written its terminal, and one that begins later waits for
+// this working.
 func (b *Bridge) publishWorking(ctx context.Context, run *taskRun) error {
 	run.noticeMu.Lock()
 	defer run.noticeMu.Unlock()
+	run.mu.Lock()
+	running := run.state == stateRunning
+	run.mu.Unlock()
+	if !running {
+		return errRunEnded
+	}
 	return run.exec.PublishStatus(ctx, lib.StateWorking, false)
 }
 

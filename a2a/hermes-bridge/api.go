@@ -292,7 +292,9 @@ func (b *Bridge) runTaskAPI(ctx context.Context, run *taskRun) {
 		return
 	}
 	defer release()
-	if err := b.publishWorking(ctx, run); err != nil {
+	if err := b.publishWorking(ctx, run); errors.Is(err, errRunEnded) {
+		return // canceled or shut down first; its finalize wrote the terminal
+	} else if err != nil {
 		b.cfg.Logger.Error("working publish failed", "task", taskID, "err", err)
 		b.finalize(run, lib.StateFailed, "reason: bus-publish-failed at working", nil)
 		return

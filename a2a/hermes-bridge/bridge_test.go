@@ -8,6 +8,7 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -809,6 +810,119 @@ func TestSteer_StalledNoticeDoesNotHoldRunLock(t *testing.T) {
 		if n.seq > final {
 			t.Fatalf("notice %+v after the terminal at %d", n, final)
 		}
+	}
+}
+
+// finalize releases run.mu while it refuses a pending task's queued
+// follow-ups. A worker freed in that gap still sees the run pending, takes
+// it, and reaches its working publish; that publish must see the run ended
+// and stay silent, never land a `working` after the canceled terminal
+// (assertion 10). The bus is down across the gap so finalize holds it open
+// on cue; the look-ahead seam holds the worker until finalize is in it.
+func TestSteer_WorkerInFinalizeGapPublishesNoWorking(t *testing.T) {
+	for _, executor := range []string{ExecutorCLI, ExecutorAPI} {
+		t.Run(executor, func(t *testing.T) { testWorkerInFinalizeGap(t, executor) })
+	}
+}
+
+func testWorkerInFinalizeGap(t *testing.T, executor string) {
+	s, url := startServer(t)
+	marker := filepath.Join(t.TempDir(), "spawned")
+	cfg := Config{NATSURL: url, Command: script(t, fmt.Sprintf("touch %s\necho never", marker)),
+		Concurrency: 1, TaskDeadline: 20 * time.Second, KillGrace: 500 * time.Millisecond,
+		Scope: capability.NamespaceScope("")}
+	var stub *apiStub
+	if executor == ExecutorAPI {
+		stub = newAPIStub(t, func(w http.ResponseWriter, _ *http.Request, _ apiCall) {
+			_ = os.WriteFile(marker, nil, 0o600)
+			writeCompletion(w, "sess-gap", "never")
+		})
+		cfg.Executor, cfg.APIURL, cfg.APIKey = ExecutorAPI, stub.srv.URL+"/v1/chat/completions", testAPIKey
+	}
+	entered, gate := make(chan struct{}), make(chan struct{})
+	var opened atomic.Bool
+	openGate := func() {
+		if opened.CompareAndSwap(false, true) {
+			close(gate)
+		}
+	}
+	t.Cleanup(openGate)
+	b, _ := startBridgeConfig(t, cfg, func(b *Bridge) {
+		b.lookAhead = func(ctx context.Context, run *taskRun) (bool, error) {
+			close(entered)
+			<-gate
+			return false, nil
+		}
+	})
+	c := gatewayClient(t, url)
+	origin := submit(t, c, "task-steer-gap", "never runs")
+	<-entered // the worker holds the run, still pending
+	sendSteer(t, c, origin, "first follow-up")
+	sendSteer(t, c, origin, "second follow-up")
+	waitFor(t, 10*time.Second, "two queued notices", func() bool { return len(steerNotices(t, url, origin.TaskID)) == 2 })
+	run := runOf(b, origin.TaskID)
+	cancelEnv, err := lib.NewCancelEnvelope(gatewayParty, origin.TaskID, origin.ContextID, origin.CorrelationID,
+		lib.WithTo(lib.Party{Session: "platform"}))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	storeDir, port := s.JetStreamConfig().StoreDir, s.Addr().(*net.TCPAddr).Port
+	s.Shutdown()
+	s.WaitForShutdown()
+	go b.handleCancel(context.Background(), cancelEnv) // pending: finalize, stalled in its refusals
+	waitFor(t, 5*time.Second, "finalize in its refusals", func() bool {
+		if !run.mu.TryLock() {
+			return false
+		}
+		defer run.mu.Unlock()
+		return run.turnsClosed && run.state == statePending
+	})
+	openGate()
+	waitFor(t, 5*time.Second, "worker took the run in the gap", func() bool {
+		if !run.mu.TryLock() {
+			return false
+		}
+		defer run.mu.Unlock()
+		return run.state == stateRunning
+	})
+	time.Sleep(200 * time.Millisecond) // the worker reaches its working publish, behind noticeMu
+
+	s2, err := natsserver.NewServer(&natsserver.Options{Host: "127.0.0.1", Port: port, JetStream: true,
+		StoreDir: storeDir, NoLog: true, NoSigs: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	go s2.Start()
+	if !s2.ReadyForConnections(10 * time.Second) {
+		t.Fatal("server not back")
+	}
+	t.Cleanup(s2.Shutdown)
+	task := waitTerminal(t, c, origin.TaskID)
+	waitFor(t, 15*time.Second, "run released", func() bool { return runOf(b, origin.TaskID) == nil })
+	time.Sleep(500 * time.Millisecond) // room for a late working publish to land
+	task = waitTerminal(t, c, origin.TaskID)
+	if task.State != lib.StateCanceled || task.PostFinalDropped != 0 {
+		t.Fatalf("state %s, post-final %d: the worker published after the terminal", task.State, task.PostFinalDropped)
+	}
+	final := finalSeq(t, url, origin.TaskID)
+	for i, env := range replayEvents(t, url, origin.TaskID) {
+		var su lib.StatusUpdate
+		if env.Kind == lib.KindStatusUpdate && json.Unmarshal(env.Payload, &su) == nil &&
+			su.Status.State == lib.StateWorking && su.Status.Message == nil {
+			t.Fatalf("working status at %d (final at %d): a canceled-before-start task never works", i, final)
+		}
+	}
+	// The refusals were published into the outage: one whose ack the
+	// restart swallowed times out and is logged, so their count is not this
+	// test's to assert, only that none follows the terminal.
+	for _, n := range steerNotices(t, url, origin.TaskID) {
+		if n.seq > final {
+			t.Fatalf("notice %+v after the terminal at %d", n, final)
+		}
+	}
+	if _, err := os.Stat(marker); err == nil {
+		t.Fatal("the worker ran the canceled task")
 	}
 }
 
