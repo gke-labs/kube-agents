@@ -99,6 +99,17 @@ Sources:
               failure IS the refusal line: a stall, not an absent job.
   --nightly-job  the job name recorded on nightly runs (`runs[].job`);
               defaults to the prefix's last path segment.
+  --nightly-writers-prefix  the same, for the nightly's writers periodic
+              (a night split across two jobs; nightly.py joins the two
+              builds into one night). Given without a value it is
+              DEFAULT_NIGHTLY_WRITERS_PREFIX; omitted, no writers scan. It
+              is read the three ways above against a watermark of its own,
+              so until a writers build is on record a listing failure other
+              than a hang is a note, and its job is always the prefix's
+              last segment. nightly.py files a run as the writers part only
+              under DEFAULT_NIGHTLY_WRITERS_JOB, so a prefix ending in any
+              other job is collected but reported as the main part, and is
+              warned about.
   --index-prefix  Prow's per-job directory index, gs://<bucket>/pr-logs/
               directory/<job>/: one small `<build_id>.txt` object per build
               holding the gs:// path of that build's directory (plus a
@@ -202,6 +213,15 @@ SCHEMA_VERSION = 1
 DEFAULT_NIGHTLY_JOB = "ci-kube-agents-eval-nightly"
 NIGHTLY_LOGS_ROOT = "gs://kube-agents-evals-nightly-logs/logs"
 DEFAULT_NIGHTLY_PREFIX = f"{NIGHTLY_LOGS_ROOT}/{DEFAULT_NIGHTLY_JOB}/"
+# The nightly's second periodic when a night is split across two pool
+# projects (#2467): the cases that request a pull request, on a project of
+# their own, logging to the same bucket. Its runs are tier `nightly` too,
+# told apart by their job (nightly.py, NIGHTLY_WRITERS_JOB), and it keeps a
+# watermark of its own: both jobs start at 00:00 UTC, and the shorter
+# writers build, recorded first, must not lift the main job's watermark
+# over a main build the listing has not named yet.
+DEFAULT_NIGHTLY_WRITERS_JOB = "ci-kube-agents-eval-nightly-writers"
+DEFAULT_NIGHTLY_WRITERS_PREFIX = f"{NIGHTLY_LOGS_ROOT}/{DEFAULT_NIGHTLY_WRITERS_JOB}/"
 # Where Prow's Spyglass shows a build directory: the gs:// path after the
 # scheme, so a link follows the bucket the build was read from.
 SPYGLASS_VIEW = "https://oss.gprow.dev/view/gs/"
@@ -1613,6 +1633,11 @@ def _build_dirs_in_listing(
     ]
 
 
+def _periodic_job(prefix: str) -> str:
+    """A periodic's job name: its log prefix's last segment."""
+    return prefix.rstrip("/").rsplit("/", 1)[-1]
+
+
 def runs_from_periodic(
     prefix: str,
     gsutil: str = "gsutil",
@@ -1644,7 +1669,7 @@ def runs_from_periodic(
     the warning line either way.
     """
     prefix = prefix.rstrip("/") + "/"
-    job = job or prefix.rstrip("/").rsplit("/", 1)[-1]
+    job = job or _periodic_job(prefix)
     listing, stderr = _gsutil_call(["ls", prefix], gsutil)
     if listing is None:
         if after_build is not None and not _NO_OBJECTS.search(stderr or ""):
@@ -1946,6 +1971,7 @@ def collect(
     index_prefix: str | None = None,
     nightly_prefix: str | None = None,
     nightly_job: str | None = None,
+    nightly_writers_prefix: str | None = None,
     rc_globs: list[str] | None = None,
     rc_from_dir: pathlib.Path | None = None,
     rc_limit: int = RC_RELEASES_MAX,
@@ -1959,7 +1985,8 @@ def collect(
     # the index off, anything else is listed as given. nightly_prefix is
     # what asks for the nightly periodic to be scanned at all (None: it is
     # not), the way --pr-glob asks for the presubmit; nightly_job labels
-    # the runs it yields.
+    # the runs it yields. nightly_writers_prefix asks the same for the
+    # writers periodic, whose job is its prefix's last segment.
     now_dt = now or datetime.now(timezone.utc)
     prior: list[dict] = []
     retry: dict[str, str] = {}  # build_id -> first_seen, still worth re-reading
@@ -1973,15 +2000,30 @@ def collect(
     # One watermark per source. Prow's build ids are one global sequence
     # ordered by start, so the newest presubmit id (dozens of builds a day)
     # is normally above every nightly id (one a day); the newest id on
-    # record says what one source has seen, not the other.
+    # record says what one source has seen, not the other. The nightly's
+    # two periodics are two sources (DEFAULT_NIGHTLY_WRITERS_JOB): a
+    # nightly run of the writers job counts towards its watermark, every
+    # other nightly run towards the main one's, as all of them did before
+    # the split.
+    writers_job = _periodic_job(nightly_writers_prefix) if nightly_writers_prefix else DEFAULT_NIGHTLY_WRITERS_JOB
+    if writers_job != DEFAULT_NIGHTLY_WRITERS_JOB:
+        # nightly.py tells the writers part by this job name alone.
+        print(
+            f"warning: --nightly-writers-prefix {nightly_writers_prefix} names"
+            f" job {writers_job}, not {DEFAULT_NIGHTLY_WRITERS_JOB}; the report"
+            " files its runs as the main part",
+            file=sys.stderr,
+        )
     after_build = None
     nightly_after = None
+    writers_after = None
     if merge_with is not None:
         prior_data = load_prior(merge_with, gsutil)
         if prior_data is not None:
             prior = prior_data["runs"]
             after_build = newest_build_id(tiers.presubmit_runs(prior))
-            nightly_after = newest_build_id(tiers.nightly_runs(prior))
+            nightly_after = newest_build_id([r for r in tiers.nightly_runs(prior) if r.get("job") != writers_job])
+            writers_after = newest_build_id([r for r in tiers.nightly_runs(prior) if r.get("job") == writers_job])
             for build_id, first_seen in pending_from_prior(prior_data).items():
                 if _pending_expired(first_seen, now_dt):
                     print(
@@ -2055,25 +2097,33 @@ def collect(
                 unfinished=unfinished,
             )
         )
-    # The nightly periodic, above its own watermark. The shared retry list
-    # is safe to hand over whole: a pending id is only re-read where its
-    # source's listing names it, and no id is in both listings.
+    # The nightly periodics, each above its own watermark. The shared retry
+    # list is safe to hand over whole: a pending id is only re-read where
+    # its source's listing names it, and no id is in two listings.
     nightly_fresh: list[dict] = []
-    if nightly_prefix:
+    writers_fresh: list[dict] = []
+    for prefix, job, after, out in (
+        (nightly_prefix, nightly_job, nightly_after, nightly_fresh),
+        (nightly_writers_prefix, None, writers_after, writers_fresh),
+    ):
+        if not prefix:
+            continue
         listed_before = set(unfinished)
-        nightly_fresh = runs_from_periodic(
-            nightly_prefix,
-            gsutil,
-            after_build=nightly_after,
-            since_cutoff=since_cutoff,
-            retry_builds=frozenset(retry),
-            unfinished=unfinished,
-            job=nightly_job,
+        out.extend(
+            runs_from_periodic(
+                prefix,
+                gsutil,
+                after_build=after,
+                since_cutoff=since_cutoff,
+                retry_builds=frozenset(retry),
+                unfinished=unfinished,
+                job=job,
+            )
         )
         nightly_pending |= unfinished - listed_before
         for build_id in unfinished - listed_before:
-            nightly_pending_urls.setdefault(build_id, spyglass_url(nightly_prefix.rstrip("/") + f"/{build_id}/"))
-        fresh.extend(nightly_fresh)
+            nightly_pending_urls.setdefault(build_id, spyglass_url(prefix.rstrip("/") + f"/{build_id}/"))
+        fresh.extend(out)
     if merge_with is not None:
         print(
             f"note: merged {len(prior)} prior runs with {len(fresh)} newly"
@@ -2084,6 +2134,12 @@ def collect(
                 f"; nightly scan resumed above build {nightly_after},"
                 f" {len(nightly_fresh)} new"
                 if nightly_prefix
+                else ""
+            )
+            + (
+                f"; writers scan resumed above build {writers_after},"
+                f" {len(writers_fresh)} new"
+                if nightly_writers_prefix
                 else ""
             )
             + ")",
@@ -2203,6 +2259,18 @@ def main(argv: list[str] | None = None) -> int:
         " for the default prefix)",
     )
     parser.add_argument(
+        "--nightly-writers-prefix",
+        nargs="?",
+        const=DEFAULT_NIGHTLY_WRITERS_PREFIX,
+        default=None,
+        metavar="GS_PREFIX",
+        help="also collect the nightly's writers periodic (the second job of a"
+        " night split across two) from this Prow log prefix. Given without a"
+        f" value: {DEFAULT_NIGHTLY_WRITERS_PREFIX}. Omitted: no writers scan."
+        " Its runs are tier=nightly with the prefix's last segment as job, on"
+        " a watermark of their own",
+    )
+    parser.add_argument(
         "--from-dir",
         type=pathlib.Path,
         help="local directory of <build_id>/ subdirs with build-log.txt,"
@@ -2281,12 +2349,14 @@ def main(argv: list[str] | None = None) -> int:
         and args.from_dir is None
         and args.merge_with is None
         and args.nightly_prefix is None
+        and args.nightly_writers_prefix is None
         and not args.rc_glob
         and args.rc_from_dir is None
     ):
         parser.error(
-            "nothing to collect: pass --pr-glob, --nightly-prefix, --from-dir,"
-            " --rc-glob, --rc-from-dir and/or --merge-with"
+            "nothing to collect: pass --pr-glob, --nightly-prefix,"
+            " --nightly-writers-prefix, --from-dir, --rc-glob, --rc-from-dir"
+            " and/or --merge-with"
         )
     if args.rc_limit < 1:
         parser.error("--rc-limit must be at least 1")
@@ -2303,6 +2373,7 @@ def main(argv: list[str] | None = None) -> int:
         index_prefix=args.index_prefix,
         nightly_prefix=args.nightly_prefix,
         nightly_job=args.nightly_job,
+        nightly_writers_prefix=args.nightly_writers_prefix,
         rc_globs=args.rc_glob,
         rc_from_dir=args.rc_from_dir,
         rc_limit=args.rc_limit,

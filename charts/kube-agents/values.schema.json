@@ -628,6 +628,15 @@
               "items": {
                 "type": "object"
               }
+            },
+            "credentialProxy": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "resources": {
+                  "type": "object"
+                }
+              }
             }
           }
         },
@@ -855,6 +864,14 @@
                   "role": {
                     "type": "string",
                     "enum": ["gitops", "managed", "context"]
+                  },
+                  "baseBranch": {
+                    "type": "string",
+                    "maxLength": 200,
+                    "pattern": "^$|^[A-Za-z0-9][A-Za-z0-9._/-]*$",
+                    "not": {
+                      "pattern": "^heads/|^refs/heads/(refs/heads/|heads/)"
+                    }
                   }
                 }
               }

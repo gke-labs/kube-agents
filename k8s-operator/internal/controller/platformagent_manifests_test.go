@@ -1623,8 +1623,9 @@ func TestCredentialProxyOutputCapClearsTheLargestFleetDump(t *testing.T) {
 
 	// The broker budgets against the limit it actually has, read once at start
 	// through the Downward API rather than copied from the Resources block, so
-	// a limit moved by whatever recreates the pod (no CR field sets it today)
-	// is the one it budgets against. A literal here would be the drift the
+	// a limit moved by whatever recreates the pod
+	// (spec.deployment.credentialProxy.resources, a VPA eviction) is the one
+	// it budgets against. A literal here would be the drift the
 	// design forbids.
 	var limitEnv *corev1.EnvVar
 	for i := range proxy.Env {

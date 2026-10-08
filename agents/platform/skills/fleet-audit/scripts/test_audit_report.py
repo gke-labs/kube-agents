@@ -202,6 +202,7 @@ NUMBER_WORDS = {
             "twenty-one",
             "twenty-two",
             "twenty-three",
+            "twenty-four",
         )
     )
 }
@@ -497,7 +498,6 @@ class Recorder:
         self.cwds: list[str | None] = []
         # The payload each forge call carried, None for a command.
         self.payloads: list[dict | None] = []
-        self.envs: list[dict | None] = []
         self.replies = replies or {}
         self.failures = failures or {}
         # What `identity` answers for each comment author, filled from the
@@ -517,11 +517,9 @@ class Recorder:
         # names none should carry. None leaves listings exactly as replied.
         self.listed_body = None
 
-    def __call__(self, cmd, *, check=True, capture=True, cwd=None, env=None):
+    def __call__(self, cmd, *, check=True, capture=True, cwd=None):
         self.calls.append(list(cmd))
         self.cwds.append(None if cwd is None else str(cwd))
-        # The environment the call named, None when it inherited the process's.
-        self.envs.append(env)
         self.payloads.append(None)
         joined = " ".join(cmd)
         for key, code in self.failures.items():
@@ -548,7 +546,6 @@ class Recorder:
             payload["repository"] = repository
         self.calls.append(["forge", verb])
         self.cwds.append(None)
-        self.envs.append(None)
         self.payloads.append(payload)
         for key, code in self.failures.items():
             if forge_key_matches(key, verb, payload):
@@ -813,10 +810,9 @@ class BaseTestCase(unittest.TestCase):
         self.err = ""
         # Both of these outlive a single test. `_WORKSPACE` is a module global
         # that `ensure_workspace` sets and nothing clears, and the base-branch
-        # answer is memoised per workspace inside `gitops_workspace`; a
-        # developer with GITOPS_BASE_BRANCH exported would move it again.
-        # Leaving any of the three alone makes a test's result depend on which
-        # tests ran before it.
+        # answer is memoised per workspace inside `gitops_workspace`.
+        # Leaving either alone makes a test's result depend on which tests ran
+        # before it.
         audit_report.set_workspace(None)
         self.addCleanup(audit_report.set_workspace, None)
         # Same reason, one global further: the mode a run resolved outlives the
@@ -838,7 +834,6 @@ class BaseTestCase(unittest.TestCase):
         env = patch.dict(
             os.environ,
             {
-                "GITOPS_BASE_BRANCH": "",
                 "CREDENTIAL_PROXY_URL": "",
                 "FLEET_AUDIT_REPORTS_DIR": str(self.reports_dir),
             },
@@ -3149,13 +3144,18 @@ class TestProtectedBranches(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "CRITICAL SECURITY REFUSAL"):
                     audit_report.assert_pushable(branch)
 
-        with patch.dict(os.environ, {"GITOPS_BASE_BRANCH": "custom-gitops-base"}):
-            with self.assertRaisesRegex(ValueError, "CRITICAL SECURITY REFUSAL"):
-                audit_report.assert_pushable("custom-gitops-base")
-
-        with patch.dict(os.environ, {"CREDENTIAL_PROXY_BASE_BRANCH": "custom-broker-base"}):
-            with self.assertRaisesRegex(ValueError, "CRITICAL SECURITY REFUSAL"):
-                audit_report.assert_pushable("custom-broker-base")
+    def test_the_sandbox_environment_does_not_widen_the_protected_set(self):
+        # The agent owns this environment, so a variable in it is not the
+        # operator's configuration. The broker protects the configured base
+        # on its own side, from configuration the agent cannot reach.
+        env = {
+            "GITOPS_BASE_BRANCH": "custom-gitops-base",
+            "CREDENTIAL_PROXY_BASE_BRANCH": "custom-gitops-base",
+        }
+        with patch.dict(os.environ, env):
+            self.assertEqual(
+                audit_report.assert_pushable("custom-gitops-base"), "custom-gitops-base"
+            )
 
     def test_remediation_branch_is_pushable(self):
         # The audit report branch is gone; the only branch the harness ever
@@ -8143,32 +8143,6 @@ class TestDeclaredIntentDiscovery(DiscoveryTestCase):
         self.assertTrue(leased.is_dir())
         self.assertEqual(self.temp_dirs(), [])
 
-    def test_the_copies_run_without_the_gitops_base_branch_override(self):
-        # `resolve_base_branch` consults the override before the remote's
-        # HEAD, and a directory-mode clone with no `--ref` asks it which
-        # branch to check out, so a context repository copied with the
-        # variable in the environment was read at the GitOps repository's
-        # branch, not its own default. Every copy the search makes runs
-        # without the two variables and with the rest of the environment.
-        self.harness.replies["rev-parse HEAD"] = SEARCH_SHA + "\n"
-        self.context("acme/terraform-live")
-        leased = self.tmp_path / "leased" / "acme__terraform-live"
-        self.write(leased, "intent.md", note([declaration()]))
-        self.harness.replies["--repo acme/terraform-live"] = self.copy_reply(
-            leased, mode="directory", depthIgnored=True
-        )
-        override = {"GITOPS_BASE_BRANCH": "release", "CREDENTIAL_PROXY_BASE_BRANCH": "release"}
-        with patch.dict(os.environ, {**override, "LIVE_1576_MARKER": "kept"}):
-            payload = self.start()
-        self.assertIn(f"acme/terraform-live@{SEARCH_SHA}", payload["declared_intent_searched"])
-        clones = [i for i, c in enumerate(self.harness.calls) if str(audit_report.CLONE_SCRIPT) in c]
-        self.assertTrue(clones)
-        for index in clones:
-            env = self.harness.envs[index]
-            self.assertIsNotNone(env, "the copy inherited the process environment")
-            self.assertEqual(sorted(set(env) & set(override)), [])
-            self.assertEqual(env.get("LIVE_1576_MARKER"), "kept")
-
     def test_a_copy_the_harness_cannot_call_searched_is_left_out_with_a_warning(self):
         self.harness.replies["rev-parse HEAD"] = SEARCH_SHA + "\n"
         self.context("acme/terraform-live")
@@ -10949,7 +10923,7 @@ class TestRemediationBaseBranch(HarnessTestCase):
         }
         self.harness.replies = {"proposal-create": created("proposal", "https://github.com/acme/fleet/pull/8")}
 
-    def open_it(self):
+    def open_it(self, existing=None):
         with contextlib.redirect_stderr(io.StringIO()):
             return audit_report.open_remediation_pr(
                 "acme/fleet",
@@ -10958,7 +10932,7 @@ class TestRemediationBaseBranch(HarnessTestCase):
                 snapshot=self.snapshot,
                 root=self.workspace,
                 issue_number=42,
-                existing=None,
+                existing=existing,
                 generated_at=NOW,
             )
 
@@ -10974,15 +10948,133 @@ class TestRemediationBaseBranch(HarnessTestCase):
         )
         self.assertEqual(self.base_used(), "master")
 
-    def test_the_env_override_wins_over_origin_head(self):
+    def pin(self, base, repository="acme/fleet"):
+        """Stand in for a broker that pins `repository`'s proposals to `base`."""
+        asked = []
+
+        def capabilities(verb, payload):
+            self.assertEqual(verb, "capabilities")
+            asked.append(payload["repository"])
+            pinned = base if payload["repository"] == repository else None
+            return {"forge": "github", "repo": payload["repository"], "baseBranch": pinned}
+
+        for patcher in (
+            patch.dict(os.environ, {"CREDENTIAL_PROXY_URL": "http://127.0.0.1:8765"}),
+            patch.object(vcs_client, "call", capabilities),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        return asked
+
+    def test_the_base_the_broker_pins_wins_over_origin_head(self):
         # An operator whose GitOps flow merges into a long-running release
-        # trunk sets GITOPS_BASE_BRANCH; origin/HEAD still says main, and the
-        # override is the whole point.
+        # trunk configures it on the PlatformAgent; origin/HEAD still says
+        # main, and the broker refuses a proposal onto main.
         self.harness.origin_head = "origin/main"
-        with patch.dict(os.environ, {"GITOPS_BASE_BRANCH": "release-1.29"}):
-            self.open_it()
+        asked = self.pin("release-1.29")
+        self.open_it()
+        self.assertEqual(asked, ["acme/fleet"])
         self.assertIn(["git", "fetch", "origin", "release-1.29"], self.harness.calls)
         self.assertEqual(self.base_used(), "release-1.29")
+
+    def existing_pr(self, state, base):
+        # Through `pr_record`, as `list_remediation_prs` hands it over, so the
+        # proposal's `target` is what reaches the recut.
+        return audit_report.pr_record(
+            {
+                "number": 9,
+                "source": audit_report.group_branch_for(AUDIT, self.group),
+                "target": base,
+                "state": state,
+                "url": "https://github.com/acme/fleet/pull/9",
+            }
+        )
+
+    def test_an_open_pull_request_is_recut_from_the_base_it_targets(self):
+        # The pull request was opened onto main before the operator pinned
+        # release. Recut from release, its diff would carry every commit
+        # release has that main lacks, while it still targets main.
+        self.harness.origin_head = "origin/master"
+        self.pin("release")
+        self.open_it(existing=self.existing_pr("OPEN", "main"))
+        self.assertIn(["git", "fetch", "origin", "main"], self.harness.calls)
+        self.assertTrue(
+            any(c[:2] == ["git", "checkout"] and "origin/main" in c for c in self.harness.calls)
+        )
+        self.assertNotIn(["git", "fetch", "origin", "release"], self.harness.calls)
+        self.assertEqual(self.harness.forge_calls("proposal-create"), [])
+        self.assertEqual(len(self.harness.forge_calls("proposal-update", number=9, title=...)), 1)
+
+    def test_a_closed_pull_request_does_not_choose_the_base(self):
+        # A closed pull request is not refreshed, so the new one goes onto the
+        # pinned base like any other.
+        self.harness.origin_head = "origin/master"
+        self.pin("release")
+        self.open_it(existing=self.existing_pr("CLOSED", "main"))
+        self.assertIn(["git", "fetch", "origin", "release"], self.harness.calls)
+        self.assertEqual(self.base_used(), "release")
+
+    def test_an_open_target_that_is_not_a_branch_name_never_reaches_git(self):
+        # The open pull request's target is the forge's answer, and anyone who
+        # can retarget the pull request writes it. `--depth=1` would reach
+        # `git fetch` as an option; it is dropped for the resolved base.
+        self.harness.origin_head = "origin/master"
+        self.pin("release")
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            audit_report.open_remediation_pr(
+                "acme/fleet",
+                AUDIT,
+                self.group,
+                snapshot=self.snapshot,
+                root=self.workspace,
+                issue_number=42,
+                existing=self.existing_pr("OPEN", "--depth=1"),
+                generated_at=NOW,
+            )
+        self.assertFalse(any("--depth=1" in " ".join(c) for c in self.harness.calls))
+        self.assertIn(["git", "fetch", "origin", "release"], self.harness.calls)
+        self.assertIn("'--depth=1'", err.getvalue())
+        self.assertIn("using the resolved base instead", err.getvalue())
+
+    def test_content_mode_neither_checks_nor_warns_about_the_open_target(self):
+        # The broker's workspace continues the branch and takes no base, so an
+        # open target it never uses is not reported as replaced by one.
+        landed = []
+        self.patch_attr("content_mode", lambda: True)
+        self.patch_attr(
+            "_land_group_via_broker",
+            lambda *args: landed.append(args) or audit_report._GroupPush("main", False),
+        )
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            audit_report.open_remediation_pr(
+                "acme/fleet",
+                AUDIT,
+                self.group,
+                snapshot=self.snapshot,
+                root=self.workspace,
+                issue_number=42,
+                existing=self.existing_pr("OPEN", "--depth=1"),
+                generated_at=NOW,
+            )
+        self.assertEqual(len(landed), 1)
+        self.assertNotIn("--depth=1", err.getvalue())
+        self.assertNotIn("WARNING", err.getvalue())
+
+    def test_a_pin_on_another_repository_leaves_this_one_on_its_default(self):
+        self.harness.origin_head = "origin/master"
+        self.pin("release-1.29", repository="acme/other")
+        self.open_it()
+        self.assertEqual(self.base_used(), "master")
+
+    def test_the_sandbox_environment_does_not_choose_the_base(self):
+        # The variable a sandbox session once exported to steer this. It is
+        # the agent's to set, so it is not read; origin/HEAD answers.
+        self.harness.origin_head = "origin/master"
+        env = {"GITOPS_BASE_BRANCH": "main", "CREDENTIAL_PROXY_BASE_BRANCH": "main"}
+        with patch.dict(os.environ, env):
+            self.open_it()
+        self.assertIn(["git", "fetch", "origin", "master"], self.harness.calls)
+        self.assertEqual(self.base_used(), "master")
 
     def test_a_clone_with_no_origin_head_repairs_it_then_falls_back(self):
         # `git symbolic-ref` exits 1 on a clone that never recorded origin/HEAD
@@ -11374,6 +11466,56 @@ class TestAutoPromotionInFinish(HarnessTestCase):
         self.assertEqual(self.run_finish(make_doc()), 0)
         self.assertEqual(self.stdout_json()["prs_opened"], [])
         self.assertIn("could not publish the fix", self.err)
+
+    def test_a_refused_base_lookup_skips_the_group_not_the_run(self):
+        # In directory mode the base is asked of the broker when a group is
+        # cut, after the ledger is written. A refusal there is a publish
+        # failure like any other: the group is skipped with the same warning,
+        # and the next group still opens.
+        findings = []
+        for i in range(2):
+            path = f"clusters/prod-us-east/f{i}.yaml"
+            findings.append(
+                make_finding(
+                    fid=f"crit-{i}",
+                    title=f"Crit {i}",
+                    remediation={"kind": "manifest", "path": path, "note": "n"},
+                )
+            )
+            self.touch(path)
+        refusals = [vcs_client.VcsError("the broker answered 503", code="FORGE_CALL_FAILED")]
+
+        def base_branch(repository):
+            if refusals:
+                raise refusals.pop()
+            return None
+
+        patcher = patch.object(vcs_client, "base_branch", base_branch)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+        self.assertEqual(self.run_finish(make_doc(findings=findings)), 0)
+        self.assertEqual(len(self.harness.forge_calls("proposal-create")), 1)
+        self.assertEqual(self.stdout_json()["prs_opened"], ["https://github.com/acme/fleet/pull/8"])
+        self.assertIn("could not publish the fix", self.err)
+        self.assertIn("base branch of acme/fleet failed [FORGE_CALL_FAILED]", self.err)
+
+    def test_a_broker_lost_during_the_base_lookup_is_not_a_skipped_group(self):
+        # A lookup the broker never answered is not a refusal: the run stops
+        # with the broker named and stays open, rather than skipping the group
+        # and exiting 0 having opened nothing.
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+
+        def base_branch(repository):
+            raise ContentModeTestCase.lost_broker_error()
+
+        patcher = patch.object(vcs_client, "base_branch", base_branch)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+        self.assertEqual(self.run_finish(make_doc()), 2)
+        self.assertIn("BROKER UNAVAILABLE:", self.err)
+        self.assertNotIn("could not publish the fix", self.err)
 
     def test_a_failed_label_after_create_does_not_fail_the_run(self):
         # The pull request exists but carries no label to be found by, so it
@@ -15128,11 +15270,17 @@ class ContentModeTestCase(BaseTestCase):
         def unavailable(endpoint, verb, payload):
             raise credential_proxy_client.WorkspaceUnavailable("not enabled")
 
-        patcher = patch.object(
-            credential_proxy_client, "_workspace_call", unavailable
-        )
-        patcher.start()
-        self.addCleanup(patcher.stop)
+        # The broker is up and pins nothing: the directory-mode reset asks it
+        # for this repository's base before falling back to origin/HEAD.
+        def capabilities(endpoint, verb, payload):
+            return {"forge": "github", "repo": payload["repository"], "baseBranch": None}
+
+        for patcher in (
+            patch.object(credential_proxy_client, "_workspace_call", unavailable),
+            patch.object(credential_proxy_client, "vcs_call", capabilities),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
 
         self.harness.replies = {"issue-list": {"issues": []}}
         self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 2)

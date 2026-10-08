@@ -73,7 +73,11 @@ const (
 	// The paragraph above their use ties the two to the proxy container's
 	// memory limit, and the cap test asserts the three from the rendered env.
 	// Both are set there and so reserved in mergeCredentialProxyEnv: a CR can
-	// move neither, because the limit they are sized against is not a CR field.
+	// move neither. The limit they are sized against is a CR field
+	// (spec.deployment.credentialProxy.resources), and the broker derives what
+	// it admits from that limit, so the limit is the CR's knob and the admitted
+	// count follows it; the two caps stay the operator's constants, and a CR
+	// override of either would detach them from the limit again.
 	credentialProxyMaxOutputBytes        = "8388608"
 	credentialProxyMaxConcurrentCommands = "8"
 	// hermesHomeMode is what HERMES_HOME_MODE carries into every container that runs
@@ -132,6 +136,11 @@ const (
 	// refusal of a metrics port equal to it compares against the number the
 	// operator renders rather than the runtime's own default.
 	credentialProxyPortEnv = "CREDENTIAL_PROXY_PORT" // #nosec G101 -- Environment variable name, not hardcoded credentials
+	// credentialProxyPinnedBasesEnv carries every repositories[].baseBranch to
+	// the broker: a JSON array of {"repository": URL, "branch": base}. The
+	// broker refuses a pull request onto a listed repository targeting any
+	// other branch.
+	credentialProxyPinnedBasesEnv = "CREDENTIAL_PROXY_PINNED_BASES" // #nosec G101 -- Environment variable name, not hardcoded credentials
 	// dashboardPort is the port `hermes dashboard` listens on. It is loopback-only
 	// (see the readiness probe in buildBaseContainers), so the container port, the
 	// Service port, and the NetworkPolicy rule below all describe a listener that
@@ -4038,7 +4047,10 @@ func buildCredentialProxyEnv(agent *agentv1alpha1.PlatformAgent) []corev1.EnvVar
 		// its child process (credential_proxy_manifests.go has the terms).
 		// Raising this cap lowers how many requests the same limit admits,
 		// which is why it is set here and so reserved rather than left to
-		// spec.deployment.env. The cap test asserts the arithmetic from the
+		// spec.deployment.env. The limit itself is a CR field,
+		// spec.deployment.credentialProxy.resources, and the admitted count
+		// follows it; a CR that could also raise a cap would detach the cap
+		// from what holds it. The cap test asserts the arithmetic from the
 		// rendered env, so believe it over this paragraph if they ever
 		// disagree.
 		{Name: "CREDENTIAL_PROXY_MAX_OUTPUT_BYTES", Value: credentialProxyMaxOutputBytes},
@@ -4219,10 +4231,56 @@ kubectl config set-context "$KUBE_CONTEXT_NAME" --namespace="$KUBE_DEFAULT_NAMES
 			}
 		}
 	}
+	// Rendered here, in the broker's managed env and nowhere else: the broker
+	// is what enforces the base, and the agent and the shell sandbox get no
+	// copy they could be mistaken for the authority over.
+	envVars = append(envVars, credentialProxyBaseEnv(agent)...)
 	if agent.Spec.Deployment != nil {
 		envVars = mergeCredentialProxyEnv(envVars, agent.Spec.Deployment.Env)
 	}
 	return envVars
+}
+
+// pinnedBase is one entry of CREDENTIAL_PROXY_PINNED_BASES.
+type pinnedBase struct {
+	Repository string `json:"repository"`
+	Branch     string `json:"branch"`
+}
+
+// credentialProxyBaseEnv is CREDENTIAL_PROXY_PINNED_BASES, naming each gitops
+// or managed repository that sets baseBranch by its URL, host included, sorted
+// by it so the pod template only changes when a base does. It is nothing when
+// no repository sets a base. Only an accepted repository counts, as for the
+// gitops-state seed: with the webhook off, a refused one would otherwise name
+// a repository the agent was never given.
+func credentialProxyBaseEnv(agent *agentv1alpha1.PlatformAgent) []corev1.EnvVar {
+	if agent.Spec.Integration == nil {
+		return nil
+	}
+	resolved, err := agent.Spec.Integration.ResolveGit()
+	if err != nil || resolved == nil {
+		return nil
+	}
+	var pins []pinnedBase
+	for _, role := range []string{agentv1alpha1.RepositoryRoleGitOps, agentv1alpha1.RepositoryRoleManaged} {
+		for _, repo := range resolved.Accepted(role) {
+			if repo.BaseBranch == "" {
+				continue
+			}
+			ref, err := repo.Resolve()
+			if err != nil {
+				continue
+			}
+			pins = append(pins, pinnedBase{Repository: ref.URL(), Branch: repo.BaseBranch})
+		}
+	}
+	if len(pins) == 0 {
+		return nil
+	}
+	sort.Slice(pins, func(i, j int) bool { return pins[i].Repository < pins[j].Repository })
+	// A slice of string pairs, which json.Marshal cannot fail on.
+	document, _ := json.Marshal(pins)
+	return []corev1.EnvVar{{Name: credentialProxyPinnedBasesEnv, Value: string(document)}}
 }
 
 func mergeCredentialProxyEnv(managed, custom []corev1.EnvVar) []corev1.EnvVar {
@@ -4312,6 +4370,12 @@ func mergeCredentialProxyEnv(managed, custom []corev1.EnvVar) []corev1.EnvVar {
 		// pool this line is the only thing reserving it.
 		"CREDENTIAL_PROXY_SCOPED_SA_POOL",
 		"CREDENTIAL_PROXY_SCOPED_SA_POOL_FILE",
+		// The repositories the pull-request bases pin. A plugin that could set
+		// it would pin a repository to a branch of its own choosing, or, by
+		// replacing the operator's value, lift a pin. It is only in `managed`
+		// when a repository sets baseBranch, so on an install without one this
+		// line is the only thing reserving it.
+		credentialProxyPinnedBasesEnv,
 		"CREDENTIAL_PROXY_STATE_DIR",
 		"CREDENTIAL_PROXY_TIMEOUT_SECONDS",
 		"CREDENTIAL_PROXY_UNIX_SOCKET",
@@ -4547,8 +4611,8 @@ func buildEventWatcherTokenVolume() corev1.Volume {
 func buildCredentialProxyVolumes(agent *agentv1alpha1.PlatformAgent) []corev1.Volume {
 	return []corev1.Volume{
 		{Name: "credential-proxy-policy", VolumeSource: corev1.VolumeSource{ConfigMap: &corev1.ConfigMapVolumeSource{LocalObjectReference: corev1.LocalObjectReference{Name: agent.Name + "-credential-proxy-policy"}}}},
-		{Name: "credential-proxy-tmp", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{SizeLimit: ptr.To(resource.MustParse("2Gi"))}}},
-		{Name: "credential-proxy-state", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{SizeLimit: ptr.To(resource.MustParse("5Gi"))}}},
+		{Name: credentialProxyTmpVolumeName, VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{SizeLimit: ptr.To(resource.MustParse(credentialProxyTmpSizeLimit))}}},
+		{Name: credentialProxyStateVolumeName, VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{SizeLimit: ptr.To(resource.MustParse(credentialProxyStateSizeLimit))}}},
 		{Name: "credential-proxy-runtime", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{Medium: corev1.StorageMediumMemory, SizeLimit: ptr.To(resource.MustParse("16Mi"))}}},
 		buildEventWatcherKubeconfigVolume(),
 		{Name: "credential-proxy-ksa-token", VolumeSource: corev1.VolumeSource{Projected: &corev1.ProjectedVolumeSource{

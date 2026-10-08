@@ -57,6 +57,20 @@ class C1IsolationIsStructural(unittest.TestCase):
         {"envoy-credential-proxy", "agent-api-proxy", "credential-broker"}
     )
 
+    def _one_match(self, pattern: str, text: str, what: str) -> str:
+        """The one match of pattern in text, failing unless there is exactly one.
+
+        Zero matches means the anchor moved and the comparison it feeds would
+        compare nothing; two means the test cannot tell which one is meant.
+        """
+        found = re.findall(pattern, text)
+        self.assertEqual(
+            len(found),
+            1,
+            "%s is not a single match (%d); this test compared nothing" % (what, len(found)),
+        )
+        return found[0]
+
     def test_C1_the_sandbox_identity_carries_no_cloud_annotation(self) -> None:
         """The sharpest assertion in this set after #913, and the one F10 owns.
 
@@ -462,6 +476,74 @@ class C1IsolationIsStructural(unittest.TestCase):
             "the session fence selects labels the spawner does not stamp, so it "
             "fences no pod: fence requires %r, spawner stamps %r" % (required, stamped),
         )
+
+    def test_C1_the_a2a_gateway_admits_the_collector_to_the_metrics_port_and_nobody_else(self) -> None:
+        """The gateway's fences admit one peer, to one port: the collector, to metrics.
+
+        The A2A gateway's doors listen on loopback, and its fences deny every
+        pod on their ports; a door reached from the pod network is a task
+        submission endpoint guarded by a bearer token alone. The metrics
+        listener is the one port on that pod the pod network is meant to
+        reach, and only from the managed-Prometheus collector's namespace --
+        the credential broker's second rule, copied. A rule that admits any
+        other peer, or admits the collector to any other port, widens the
+        gateway past what the metrics listener needed.
+
+        Read from the operator's real render (the fixture its Go test keeps
+        equal to the builder), with both doors armed so all three fences
+        exist: each door's, and the gateway's own, which renders on every next
+        gateway door or no door because the metrics listener binds every
+        interface (#2473).
+        """
+        documents = h.yaml_documents("a2a_gateway_ingress_fixture")
+        policies = h.objects_of_kind(documents, "NetworkPolicy")
+        deployments = h.objects_of_kind(documents, "Deployment")
+        self.assertEqual(len(policies), 3, "the fixture no longer renders the three gateway fences")
+        self.assertTrue(
+            any(p["metadata"]["name"].endswith("-a2a-gateway-netpol") for p in policies),
+            "the fixture no longer renders the gateway's own fence, the one no door flag decides",
+        )
+        self.assertEqual(len(deployments), 1, "the fixture no longer carries the gateway's ports")
+
+        gateway = deployments[0]
+        ports = [p for c in h.containers_of(gateway) for p in c.get("ports") or []]
+        metrics = [p["containerPort"] for p in ports if p.get("name") == "a2a-metrics"]
+        doors = {p["containerPort"] for p in ports if p.get("name") != "a2a-metrics"}
+        self.assertEqual(len(metrics), 1, "the gateway declares no single a2a-metrics port")
+        self.assertTrue(doors, "the fixture renders no door port, so nothing here is fenced")
+        self.assertNotIn(metrics[0], doors, "the metrics port is also a door's port")
+        collector = {"matchLabels": {"kubernetes.io/metadata.name": "gke-gmp-system"}}
+        # The labels the gateway pod carries, not the Deployment's name: a
+        # fence requiring a label the pod lacks selects nothing, and the API
+        # server reports that as success.
+        pod_labels = ((gateway["spec"].get("template") or {}).get("metadata") or {}).get("labels") or {}
+        self.assertTrue(pod_labels, "the fixture carries no gateway pod labels, so no selector can be checked")
+
+        for policy in policies:
+            name = policy["metadata"]["name"]
+            spec = policy["spec"]
+            with self.subTest(policy=name):
+                selector = spec.get("podSelector") or {}
+                required = selector.get("matchLabels") or {}
+                self.assertEqual(set(selector), {"matchLabels"}, "the fence's podSelector is not plain matchLabels")
+                self.assertTrue(required, "the fence's podSelector is empty, so it selects every pod")
+                self.assertEqual(
+                    required, {key: pod_labels.get(key) for key in required},
+                    "the fence selects labels the gateway pod does not carry, so it fences no pod: "
+                    "fence requires %r, pod carries %r" % (required, pod_labels),
+                )
+                self.assertIn("Ingress", spec.get("policyTypes") or [], "the fence governs no ingress")
+                rules = spec.get("ingress") or []
+                self.assertEqual(len(rules), 1, "the fence admits more than the collector's rule")
+                rule = rules[0]
+                self.assertEqual(
+                    rule.get("from"), [{"namespaceSelector": collector}],
+                    "the fence admits a peer other than the collector's namespace, alone",
+                )
+                self.assertEqual(
+                    rule.get("ports"), [{"port": metrics[0], "protocol": "TCP"}],
+                    "the collector is admitted to a port other than the metrics listener's",
+                )
 
     def test_C1_a_session_pod_carries_no_kubernetes_identity(self) -> None:
         """The premise the fence's rule set rests on.
@@ -926,19 +1008,9 @@ class C1IsolationIsStructural(unittest.TestCase):
         api = h.text("operator_bus_api")
         library = h.text("a2a_bus_credentials")
 
-        def one(pattern: str, text: str, what: str) -> str:
-            found = re.findall(pattern, text)
-            self.assertEqual(
-                len(found),
-                1,
-                "%s is not a single string constant (%d matches); this test "
-                "compared nothing" % (what, len(found)),
-            )
-            return found[0]
-
-        mount = one(r'a2aBusTokenPath\s*=\s*"([^"]+)"', operator, "a2aBusTokenPath")
-        filename = one(r'a2aBusTokenFile\s*=\s*"([^"]+)"', operator, "a2aBusTokenFile")
-        reader = one(r'BusTokenPath\s*=\s*"([^"]+)"', library, "lib.BusTokenPath")
+        mount = self._one_match(r'a2aBusTokenPath\s*=\s*"([^"]+)"', operator, "a2aBusTokenPath")
+        filename = self._one_match(r'a2aBusTokenFile\s*=\s*"([^"]+)"', operator, "a2aBusTokenFile")
+        reader = self._one_match(r'BusTokenPath\s*=\s*"([^"]+)"', library, "lib.BusTokenPath")
 
         self.assertEqual(
             mount.rstrip("/") + "/" + filename,
@@ -956,10 +1028,10 @@ class C1IsolationIsStructural(unittest.TestCase):
         # spelling, which is what keeps the literal read here the one the
         # kubelet actually mints under. Comparing the controller constant to
         # the API constant instead would be the same value twice.
-        rendered_audience = one(
+        rendered_audience = self._one_match(
             r'A2ABusTokenAudience\s*=\s*"([^"]+)"', api, "A2ABusTokenAudience"
         )
-        controller_audience = one(
+        controller_audience = self._one_match(
             r"a2aBusTokenAudience\s*=\s*(\S+)", operator, "the controller's audience"
         )
         self.assertEqual(
@@ -970,7 +1042,7 @@ class C1IsolationIsStructural(unittest.TestCase):
             "compared is not the one the projection mints under"
             % controller_audience,
         )
-        demanded_audience = one(
+        demanded_audience = self._one_match(
             r'BusTokenAudience\s*=\s*"([^"]+)"', library, "lib.BusTokenAudience"
         )
         self.assertEqual(
@@ -1033,19 +1105,10 @@ class C1IsolationIsStructural(unittest.TestCase):
         a2a_manifests = h.text("a2a_session_fence")
         spawner = h.text("a2a_spawner")
         config = h.text("a2a_gateway_config")
-        def one(pattern: str, text: str, what: str) -> str:
-            found = re.findall(pattern, text)
-            self.assertEqual(
-                len(found),
-                1,
-                "%s is not a single match (%d); this test compared nothing" % (what, len(found)),
-            )
-            return found[0]
-
-        rendered = one(
+        rendered = self._one_match(
             r'credentialProxySessionAudience\s*=\s*"([^"]+)"', operator, "the operator's session audience"
         )
-        projected = one(
+        projected = self._one_match(
             r'credentialProxySessionAudience\s*=\s*"([^"]+)"', spawner, "the spawner's session audience"
         )
         self.assertEqual(
@@ -1057,12 +1120,12 @@ class C1IsolationIsStructural(unittest.TestCase):
         )
         # Both halves use their constant where it matters, so the equality
         # above is about the strings that actually flow.
-        one(
+        self._one_match(
             r'Name:\s*"CREDENTIAL_PROXY_SESSION_AUDIENCE",\s*Value:\s*credentialProxySessionAudience',
             manifests,
             "the broker env render of the session audience",
         )
-        one(
+        self._one_match(
             r"Audience:\s+credentialProxySessionAudience,",
             spawner,
             "the spawner's projection of the session audience",
@@ -1070,8 +1133,8 @@ class C1IsolationIsStructural(unittest.TestCase):
 
         for name in ("A2A_SESSION_CLUSTER_VIEW", "A2A_CREDENTIAL_PROXY_URL"):
             with self.subTest(env=name):
-                one(r'Name:\s*"%s"' % name, a2a_manifests, "the operator's render of %s" % name)
-                one(r'os\.Getenv\("%s"\)' % name, config, "the gateway's read of %s" % name)
+                self._one_match(r'Name:\s*"%s"' % name, a2a_manifests, "the operator's render of %s" % name)
+                self._one_match(r'os\.Getenv\("%s"\)' % name, config, "the gateway's read of %s" % name)
 
         # The shim's half: the spawner sets three names and the client reads
         # three names, in a Go module and a Python script that share nothing.
@@ -1081,11 +1144,172 @@ class C1IsolationIsStructural(unittest.TestCase):
         shim = h.text("credential_proxy_client")
         for name in ("CREDENTIAL_PROXY_URL", "CREDENTIAL_PROXY_TOKEN_FILE", "HERMES_HOME"):
             with self.subTest(env=name):
-                one(r'Name:\s*"%s"' % name, spawner, "the spawner's render of %s" % name)
+                self._one_match(r'Name:\s*"%s"' % name, spawner, "the spawner's render of %s" % name)
                 self.assertTrue(
                     re.search(r'environ(?:\.get)?\(\s*"%s"' % name, shim) or re.search(r'getenv\(\s*"%s"' % name, shim),
                     "the shim no longer reads %s by that name" % name,
                 )
+
+    def test_C1_the_target_allowlist_env_names_agree_across_the_module_boundary(self) -> None:
+        """The platform agent's allowlists cross the same boundary, fail-open.
+
+        The operator renders the CR's integration.{googleChat,slack}.allowedUsers
+        onto the gateway as A2A_TARGET_ALLOWED_USERS_{GCHAT,SLACK}; the gateway
+        reads the same two names and checks a session's request to delegate to
+        the platform agent against them. The gateway reads an absent variable
+        as "all authenticated users", by design (an absent CR list means the
+        same), so a rename on either side is not a refusal anyone sees: every
+        requester is allowed and both Go suites are green. The two spellings
+        are pinned equal here, and the absent-list branch is pinned as allow so
+        a future "fix" that flips it to deny is a visible change.
+        """
+        a2a_manifests = h.text("a2a_session_fence")
+        allowlist = h.text("a2a_gateway_allowlist")
+
+        for const, env in (
+            ("a2aTargetAllowedUsersGchatEnvVar", "EnvTargetAllowedUsersGchat"),
+            ("a2aTargetAllowedUsersSlackEnvVar", "EnvTargetAllowedUsersSlack"),
+        ):
+            with self.subTest(pair=const):
+                rendered = self._one_match(r'%s\s*=\s*"([^"]+)"' % const, a2a_manifests, "the operator's %s" % const)
+                read = self._one_match(r'%s\s*=\s*"([^"]+)"' % env, allowlist, "the gateway's %s" % env)
+                self.assertEqual(
+                    rendered,
+                    read,
+                    "the operator renders %r and the gateway reads %r: every delegation "
+                    "is allowed on an install whose Go suites are green" % (rendered, read),
+                )
+                self._one_match(r"Name:\s*%s," % const, a2a_manifests, "the operator's render of %s" % const)
+                self._one_match(r"os\.(?:Getenv|LookupEnv)\(%s\)" % env, allowlist + h.text("a2a_gateway_config"), "the gateway's read of %s" % env)
+
+        # The absent-list branch is allow, stated in the function that answers.
+        body = _go_code(allowlist, "targetAllows")
+        self.assertIn("if set == nil {", body, "targetAllows lost its absent-list branch")
+        self.assertIn("return true", body.split("if set == nil {")[1].split("}")[0],
+                      "targetAllows answers an absent list with something other than allow")
+
+        # And the membership check under a list is pinned too: a loosened
+        # join (`||` for `&&`, say) or a dropped blank-subject guard would
+        # admit a subject that is not in the compiled set, or the blank
+        # pseudonym TestABlankListIsNobody relies on reading as "nobody" --
+        # neither of which a rename-only reading of this function would
+        # catch, since both sides still agree on the env names.
+        self.assertIn(
+            'return subject != "" && set[subject]',
+            body,
+            "targetAllows's membership check changed; a looser join or a "
+            "dropped blank-subject guard could admit a requester the "
+            "compiled list does not name",
+        )
+
+    def test_C1_the_delegate_artifact_is_spelled_once(self) -> None:
+        """The reserved artifact name crosses a module boundary in two places.
+
+        `lib.ArtifactDelegate` is defined once in `a2a/lib/payload.go`
+        (spec-a2a-payloads.md, "Reserved artifact names"); the worker-adapter
+        publishes it and the gateway relay switches on it to route a
+        session's delegate ask off the ordinary chat-rendering path. Both
+        are meant to reference the constant rather than the literal
+        `"delegate"`: a hand-spelled literal on either side compiles and
+        passes every Go suite today, because a string literal that happens
+        to equal a constant's value is indistinguishable from the constant at
+        every call site -- and stops agreeing with it silently the day
+        lib.ArtifactDelegate's value changes. `"delegated"` text sits beside
+        both consumers (a chat-facing note on each one) and is excluded
+        rather than mistaken for a reserved-name literal.
+        """
+        payload = h.text("a2a_payload")
+        self.assertIn(
+            'ArtifactDelegate = "delegate"',
+            payload,
+            "lib.ArtifactDelegate's definition moved or changed value; this test compared nothing",
+        )
+        for key, what in (
+            ("a2a_worker_adapter", "the worker-adapter's publish site"),
+            ("a2a_gateway_relay", "the gateway relay's switch"),
+        ):
+            src = h.text(key)
+            self.assertIn("lib.ArtifactDelegate", src, f"{what} no longer references the shared constant")
+            hand_spelled = re.sub(r'"delegated[^"]*"', "", src)
+            self.assertNotIn(
+                '"delegate"', hand_spelled,
+                f"{what} spells the reserved artifact name by hand instead of through lib.ArtifactDelegate",
+            )
+
+    def test_C1_the_delegate_text_cap_is_spelled_once(self) -> None:
+        """Both halves of the length check reference the one constant.
+
+        The worker-adapter refuses an over-length delegate request before it
+        reaches the bus (`validateDelegate`); the gateway ignores one that
+        arrives anyway (`handleDelegateRequest`'s own comment: "the adapter
+        holds the same cap", because the adapter's check is bypassable by
+        anything that can reach the bus directly, so this is a second,
+        independent line of defence rather than a redundant one). Both call
+        `lib.DelegateTextCap`; a hand-typed `16 * 1024` or `16384` on either
+        side compiles, passes every Go suite today, and silently stops
+        agreeing with lib.DelegateTextCap's definition the day someone edits
+        only that constant.
+        """
+        payload = h.text("a2a_payload")
+        self.assertIn(
+            "DelegateTextCap = ",
+            payload,
+            "lib.DelegateTextCap's definition moved; this test compared nothing",
+        )
+        magic_number = re.compile(r"\b16\s*\*\s*1024\b|\b16384\b")
+        # Scoped to the function that makes the check, and to its code
+        # without comments (_go_code): elsewhere in delegation.go the wake's
+        # budget and two comments name the constant too, and a comment inside
+        # the function could name it beside a hand-spelled check.
+        for key, function, what in (
+            ("a2a_worker_adapter_delegate", "validateDelegate", "the worker-adapter's validateDelegate"),
+            ("a2a_gateway_delegation", "handleDelegateRequest", "the gateway's handleDelegateRequest"),
+        ):
+            body = _go_code(h.text(key), function)
+            self.assertIn("lib.DelegateTextCap", body, f"{what} no longer references the shared cap")
+            self.assertNotRegex(body, magic_number, f"{what} hand-spells the delegate text cap")
+
+    def test_C1_the_delegate_tool_schema_names_agree_with_the_wire_shape(self) -> None:
+        """The MCP tool schema and `lib.DelegateRequest` spell the same two fields.
+
+        The session's harness speaks MCP to the worker-adapter's own server,
+        which answers `tools/list` with `delegateToolSchema` -- a
+        `map[string]any` literal, because that is what an MCP tool definition
+        is on the wire, so it cannot reference `lib.DelegateRequest`'s json
+        tags the way Go code can. The two are independent spellings of one
+        shape: the model calls the tool using the schema's field names, the
+        adapter decodes the call straight into `lib.DelegateRequest`
+        (`callDelegate`'s `Arguments lib.DelegateRequest`), and a rename on
+        either side with nothing on the other is a tool the model calls
+        correctly by its own schema while the adapter quietly reads a field
+        that was never sent -- an empty addressee or an empty text, refused
+        downstream for a reason that looks like a model mistake.
+        """
+        payload = h.text("a2a_payload")
+        struct = payload.split("type DelegateRequest struct {")[1].split("\n}")[0]
+        tags = sorted(re.findall(r'`json:"(\w+)"`', struct))
+        self.assertEqual(
+            ["addressee", "text"],
+            tags,
+            "lib.DelegateRequest's wire shape changed; this test compared nothing",
+        )
+
+        mcp = h.text("a2a_worker_adapter_mcp")
+        schema = mcp.split("var delegateToolSchema")[1].split("\n}\n")[0]
+        properties = sorted(re.findall(r'"(\w+)":\s*map\[string\]any\{"type": "string"', schema))
+        self.assertEqual(
+            tags,
+            properties,
+            "the tool schema's declared properties no longer match lib.DelegateRequest's json tags",
+        )
+        required_block = re.search(r'"required":\s*\[\]string\{([^}]*)\}', schema)
+        self.assertIsNotNone(required_block, "delegateToolSchema's required list moved or changed shape")
+        required = sorted(re.findall(r'"(\w+)"', required_block.group(1)))
+        self.assertEqual(
+            tags,
+            required,
+            "the tool schema's required list no longer matches lib.DelegateRequest's json tags",
+        )
 
     def test_C1_the_reserved_bus_token_file_env_is_spelled_the_same_in_both_modules(
         self,
@@ -1182,6 +1406,145 @@ class C1IsolationIsStructural(unittest.TestCase):
             "buildPodTemplateSpec no longer drops a plugin-supplied "
             "a2aBusTokenFileEnv by that constant; the name this test compared "
             "across the module boundary is not the name the operator refuses",
+        )
+
+    # The fourth cross-module literal: the operator renders the static
+    # principal names into the callout under this name, and the callout reads
+    # it back to refuse narrowed pods named after them.
+    RESERVED_PRINCIPALS_ENV = "A2A_RESERVED_PRINCIPALS"
+
+    def test_C1_the_callouts_reserved_principals_env_is_spelled_the_same_in_both_modules(
+        self,
+    ) -> None:
+        """The operator writes the static principal list; the callout reads it.
+
+        The callout refuses a narrowed pod named after a static nats.conf user,
+        and it learns those names only from this variable: they are in no
+        identity map, and the callout does not read nats.conf. Two Go modules,
+        no shared package, so each holds its own literal.
+
+        A drift is loud rather than silent, because the callout refuses to
+        start without the variable. But both Go suites stay green through a
+        rename on one side, and the failure lands at the next operator
+        upgrade: the new callout pods exit, never go Ready, and the rollout
+        stalls on every `spec.mode: next` install.
+        """
+        operator = h.text("operator_a2a_callout")
+        callout = h.text("a2a_callout_main")
+
+        operator_env = re.findall(r'a2aCalloutReservedPrincipalsEnvVar\s*=\s*"([^"]+)"', operator)
+        callout_env = re.findall(r'envReservedPrincipals\s*=\s*"([^"]+)"', callout)
+
+        # Anti-vacuity, both halves.
+        self.assertEqual(
+            len(operator_env),
+            1,
+            "a2aCalloutReservedPrincipalsEnvVar is not a single string constant "
+            "in platformagent_a2a_callout.go; this test compared nothing",
+        )
+        self.assertEqual(
+            len(callout_env),
+            1,
+            "envReservedPrincipals is not a single string constant in "
+            "a2a/cmd/authcallout/main.go; this test compared nothing",
+        )
+
+        self.assertEqual(
+            operator_env[0],
+            callout_env[0],
+            "the operator renders %r and the callout reads %r: the callout "
+            "refuses to start, and the next operator upgrade stalls the callout "
+            "rollout on every spec.mode: next install" % (operator_env[0], callout_env[0]),
+        )
+        self.assertEqual(
+            operator_env[0],
+            self.RESERVED_PRINCIPALS_ENV,
+            "the reserved principals env var was renamed; a callout image and "
+            "an operator from either side of the rename cannot run together",
+        )
+
+        # Both halves use the constant this test compared.
+        self.assertIn(
+            "os.LookupEnv(envReservedPrincipals)",
+            _go_code(callout, "run"),
+            "the callout's run() no longer reads envReservedPrincipals, so the "
+            "name compared here is not the name the callout resolves",
+        )
+        self.assertIn(
+            "Name: a2aCalloutReservedPrincipalsEnvVar",
+            _go_code(operator, "buildA2ACalloutDeployment"),
+            "buildA2ACalloutDeployment no longer renders "
+            "a2aCalloutReservedPrincipalsEnvVar by that constant, so the name "
+            "compared here is not the name the operator writes",
+        )
+
+    # The fifth: the fixed-name addressees, rendered by the operator from the
+    # constant the bridge's grants name and read back by the callout to refuse
+    # a narrowed pod named after one.
+    RESERVED_ADDRESSEES_ENV = "A2A_RESERVED_ADDRESSEES"
+
+    def test_C1_the_callouts_reserved_addressees_env_is_spelled_the_same_in_both_modules(
+        self,
+    ) -> None:
+        """The operator writes the fixed-name addressee list; the callout reads it.
+
+        The callout refuses a narrowed pod named after an addressee whose task
+        subjects a static grant already names (the bridge's `platform`), and
+        it learns those names only from this variable. Two Go modules, no
+        shared package, so each holds its own literal.
+
+        The same failure shape as the reserved principals above: the callout
+        refuses to start without the variable, both Go suites stay green
+        through a rename on one side, and the next operator upgrade stalls the
+        callout rollout on every `spec.mode: next` install.
+        """
+        operator = h.text("operator_a2a_callout")
+        callout = h.text("a2a_callout_main")
+
+        operator_env = re.findall(r'a2aCalloutReservedAddresseesEnvVar\s*=\s*"([^"]+)"', operator)
+        callout_env = re.findall(r'envReservedAddressees\s*=\s*"([^"]+)"', callout)
+
+        # Anti-vacuity, both halves.
+        self.assertEqual(
+            len(operator_env),
+            1,
+            "a2aCalloutReservedAddresseesEnvVar is not a single string constant "
+            "in platformagent_a2a_callout.go; this test compared nothing",
+        )
+        self.assertEqual(
+            len(callout_env),
+            1,
+            "envReservedAddressees is not a single string constant in "
+            "a2a/cmd/authcallout/main.go; this test compared nothing",
+        )
+
+        self.assertEqual(
+            operator_env[0],
+            callout_env[0],
+            "the operator renders %r and the callout reads %r: the callout "
+            "refuses to start, and the next operator upgrade stalls the callout "
+            "rollout on every spec.mode: next install" % (operator_env[0], callout_env[0]),
+        )
+        self.assertEqual(
+            operator_env[0],
+            self.RESERVED_ADDRESSEES_ENV,
+            "the reserved addressees env var was renamed; a callout image and "
+            "an operator from either side of the rename cannot run together",
+        )
+
+        # Both halves use the constant this test compared.
+        self.assertIn(
+            "os.LookupEnv(envReservedAddressees)",
+            _go_code(callout, "run"),
+            "the callout's run() no longer reads envReservedAddressees, so the "
+            "name compared here is not the name the callout resolves",
+        )
+        self.assertIn(
+            "Name: a2aCalloutReservedAddresseesEnvVar",
+            _go_code(operator, "buildA2ACalloutDeployment"),
+            "buildA2ACalloutDeployment no longer renders "
+            "a2aCalloutReservedAddresseesEnvVar by that constant, so the name "
+            "compared here is not the name the operator writes",
         )
 
     def test_C1_the_agent_principal_carries_no_static_bus_password(self) -> None:

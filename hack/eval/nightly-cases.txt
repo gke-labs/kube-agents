@@ -197,10 +197,18 @@
 # eleven tofu cases come to ~453 serial minutes against the 480m deadline. The
 # case count is unchanged.
 #
+# 2026-10-05 adds upgrades-zonal-control-plane-outage-warned: one case,
+# three units at the 200s default (a read-only chat turn, measured 3-8
+# minutes a repetition on the dev install). Counted from the lists rather
+# than the paragraphs above (the chat-voice trio and the declared-intent
+# trio landed beside each other, each counted without the other, and two
+# chat cases registered since without a paragraph): this case makes it
+# sixty-one cases (183 units) of a seventy-five-case, 225-unit matrix.
+#
 # 2026-10-05 adds chat-voice-answer-first: one case, three units, deployer:
 # noop at the 200s default, about 10 serial minutes. Counted from the lists
-# with it, the last entry below: sixty cases (180 units) here, of a
-# seventy-four-case, 222-unit matrix with the presubmit file's fourteen.
+# with it, the last entry below: sixty-two cases (186 units) here, of a
+# seventy-six-case, 228-unit matrix with the presubmit file's fourteen.
 
 # ── The four full audits recast out of the presubmit on 2026-08-26 ──────────
 # Spec-ready, each domain covered in the presubmit by its probe:
@@ -676,6 +684,13 @@
 # (bench/kube_agents_bench/card_wake.py), so one front-door turn and no
 # worker: filing or unblocking a card fails the case's catastrophic fence.
 ./tasks/chat-voice-failure-leads-with-fact/task.yaml
+
+# The first of the upgrade-failure catalogue's scenario cases (entry 11, the
+# zonal control plane's API gap during its own upgrade). Read-only chat prompt
+# against the seeded clusters' own zonal shape; no planted fixture, nothing to
+# mutate. Nightly from its first merge; a presubmit seat is a later pull
+# request that cites its record.
+./tasks/upgrades-zonal-control-plane-outage-warned/task.yaml
 
 # A delegated answer opens on one bold sentence and does not restate it
 # (the report stanza in deploy/docker/patches/kanban_report_format.py).

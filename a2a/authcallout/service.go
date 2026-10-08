@@ -88,6 +88,19 @@ type Config struct {
 	// expires means a map change never reaches anything already connected.
 	GrantTTL time.Duration
 
+	// ReservedPrincipals are the static nats.conf users a narrowed pod may
+	// not be named after (see reserved.go). Required: NewService refuses an
+	// empty list rather than serving a callout that reserves nothing. The
+	// identity map's own users are reserved too, but come from the map being
+	// served rather than from here.
+	ReservedPrincipals []string
+
+	// ReservedAddressees are the fixed-name addressees a narrowed pod may
+	// not be named after (see addressees.go). Required: NewService refuses
+	// an empty list rather than serving a callout that reserves none. They
+	// join ReservedPrincipals in the one set reservedAs checks.
+	ReservedAddressees []string
+
 	// Now is injectable for tests.
 	Now func() time.Time
 }
@@ -99,6 +112,7 @@ type Service struct {
 	issuer    nkeys.KeyPair
 	xkey      nkeys.KeyPair
 	grantTTL  time.Duration
+	reserved  map[string]reservedKind
 	now       func() time.Time
 	log       *slog.Logger
 }
@@ -134,11 +148,17 @@ func NewService(store *Store, validator *TokenValidator, cfg Config, log *slog.L
 		return nil, fmt.Errorf("issuer seed: %w", err)
 	}
 
+	reserved, err := reservedSet(cfg.ReservedPrincipals, cfg.ReservedAddressees)
+	if err != nil {
+		return nil, err
+	}
+
 	svc := &Service{
 		store:     store,
 		validator: validator,
 		issuer:    issuer,
 		grantTTL:  cfg.GrantTTL,
+		reserved:  reserved,
 		now:       cfg.Now,
 		log:       log,
 	}
@@ -332,6 +352,20 @@ func (s *Service) authorize(ctx context.Context, req *jwt.AuthorizationRequestCl
 			grants, user = g, att.PodName
 		default:
 			return "", nil, "", fmt.Errorf("%s names narrowing %q, which this callout does not implement", att.ServiceAccount, id.Narrowing)
+		}
+		// A narrowed user is named for its pod, and that name is both its
+		// inbox prefix and the addressee its task subjects are keyed on. A
+		// pod named after a static principal (the gateway, the bridge, web,
+		// console, seed) or after a user this map mints (the verifier, the
+		// agent, the provisioner) would be granted that principal's inbox,
+		// and could read or forge the JetStream replies delivered there. A
+		// pod named after a fixed-name addressee (the bridge's `platform`)
+		// would be handed that addressee's task events, its `.in` consumers
+		// and its verify subject. Checked after the switch so every narrowing
+		// is covered by one check, whatever derived the user, and against m,
+		// the snapshot the identity was resolved from.
+		if kind, ok := s.reservedAs(m, user); ok {
+			return "", nil, "", fmt.Errorf("%s narrows on pod %q, which is the name of %s; %s", att.ServiceAccount, user, kind, kind.copied())
 		}
 	}
 

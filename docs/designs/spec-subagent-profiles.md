@@ -295,14 +295,15 @@ notes. Prefixes are not a protocol. Instead:
 `input-required`, and one terminal event with `final: true`. Not progress, not tool
 chatter.
 
-**`artifact-update` carries the streams, as named artifacts.** Four reserved names:
+**`artifact-update` carries the streams, as named artifacts.** Five reserved names:
 
-| Artifact name | Content                                                    | Producer                                       | Default consumer                                                                 |
-| ------------- | ---------------------------------------------------------- | ---------------------------------------------- | -------------------------------------------------------------------------------- |
-| `result`      | The deliverable, chunked per A2A chunking rules            | harness output                                 | posted to the requester verbatim, as `kanban_complete`'s `result` field is today |
-| `thinking`    | Thinking/reasoning deltas                                  | adapter, from the harness stream               | debug views only                                                                 |
-| `activity`    | Tool-call trace: one entry per tool invocation             | adapter                                        | debug views; always in the audit replay                                          |
-| `progress`    | Agent-authored milestones - the heartbeat-note replacement | an explicit progress tool exposed to the agent | rendered to chat at zero model cost                                              |
+| Artifact name | Content                                                                      | Producer                                       | Default consumer                                                                 |
+| ------------- | ---------------------------------------------------------------------------- | ---------------------------------------------- | -------------------------------------------------------------------------------- |
+| `result`      | The deliverable, chunked per A2A chunking rules                              | harness output                                 | posted to the requester verbatim, as `kanban_complete`'s `result` field is today |
+| `thinking`    | Thinking/reasoning deltas                                                    | adapter, from the harness stream               | debug views only                                                                 |
+| `activity`    | Tool-call trace: one entry per tool invocation                               | adapter                                        | debug views; always in the audit replay                                          |
+| `progress`    | Agent-authored milestones - the heartbeat-note replacement                   | an explicit progress tool exposed to the agent | rendered to chat at zero model cost                                              |
+| `delegate`    | A session's request to hand a task on: one data part (`lib.DelegateRequest`) | adapter, from the harness's delegate tool      | the gateway, which mints the child or refuses; never rendered to chat            |
 
 This maps one-to-one onto what exists. Kanban heartbeat notes become `progress` updates:
 the gateway's notifier can render them into a rolling chat line without waking any model,
@@ -313,7 +314,7 @@ debug mode adds `activity` and `thinking` - the same split the Google Chat `mode
 draws today (`platformagent_manifests.go:1348-1371`).
 
 Artifact names are data, so the set can grow without touching the envelope or the payload
-spec. These four are reserved so that renderers and the audit tooling can rely on them.
+spec. These five are reserved so that renderers and the audit tooling can rely on them.
 
 Deviation, recorded 8/31: the worker adapter as first built (ahead of its stage 3
 slot, for the gateway's session workers) produces `progress` from the model's own
@@ -360,7 +361,10 @@ grace period, and the adapter MUST trap it: flush the pending output buffer, pub
 terminal `failed` with `reason: worker-evicted`, exit 143. That keeps an infrastructure
 eviction distinguishable from an agent crash in the audit trail and in the breaker's
 failure classes - the same infra-vs-agent distinction the kanban board's forgiveness
-classes draw today.
+classes draw today. The one exception is a turn that has already delegated: its
+deliverable is decided (the one-line "delegated to" result), and the gateway retiring its
+pod for the wake is expected, so the adapter publishes `completed` with that result
+and exits 0 instead.
 
 **Orphaned.** A worker can die without a terminal event - OOM, node loss, image bug.
 The dispatcher doubles as the janitor: it watches the Jobs it created, and when a Job

@@ -42,6 +42,16 @@ const (
 	envGrantTTL     = "A2A_GRANT_TTL_SECONDS"
 	envStatusAddr   = "A2A_STATUS_ADDR"
 
+	// envReservedPrincipals carries the static nats.conf user names, comma
+	// separated, which the operator renders from the list it renders
+	// auth_users from. Required: see authcallout.ParseReservedPrincipals.
+	envReservedPrincipals = "A2A_RESERVED_PRINCIPALS"
+
+	// envReservedAddressees carries the fixed-name addressees, comma
+	// separated, which the operator renders from the constant the bridge's
+	// grants name. Required: see authcallout.ParseReservedAddressees.
+	envReservedAddressees = "A2A_RESERVED_ADDRESSEES"
+
 	defaultAuthMapKey  = "identities.json"
 	defaultStatusAddr  = ":8080"
 	defaultMapWait     = 60 * time.Second
@@ -103,6 +113,31 @@ func run(log *slog.Logger) error {
 		return fmt.Errorf("%s is required", envIssuerSeed)
 	}
 
+	// Refused rather than defaulted, and before anything else starts. A
+	// callout with no reserved names would admit a narrowed pod named
+	// `gateway` and hand it the gateway's inbox. An image newer than the
+	// operator rendering it lands here, which is the safe direction: the
+	// rollout stalls on the new pods and the old ones keep serving.
+	rawReserved, ok := os.LookupEnv(envReservedPrincipals)
+	if !ok {
+		return fmt.Errorf("%s is required; the operator renders it from nats.conf's static users", envReservedPrincipals)
+	}
+	reserved, err := authcallout.ParseReservedPrincipals(rawReserved)
+	if err != nil {
+		return fmt.Errorf("%s: %w", envReservedPrincipals, err)
+	}
+
+	// The same, for the fixed-name addressees: with none reserved, a narrowed
+	// pod named `platform` would be handed the bridge's task subjects.
+	rawAddressees, ok := os.LookupEnv(envReservedAddressees)
+	if !ok {
+		return fmt.Errorf("%s is required; the operator renders it from the bridge's addressee", envReservedAddressees)
+	}
+	reservedAddressees, err := authcallout.ParseReservedAddressees(rawAddressees)
+	if err != nil {
+		return fmt.Errorf("%s: %w", envReservedAddressees, err)
+	}
+
 	restCfg, err := rest.InClusterConfig()
 	if err != nil {
 		return fmt.Errorf("in-cluster config: %w", err)
@@ -128,9 +163,11 @@ func run(log *slog.Logger) error {
 	}
 
 	svc, err := authcallout.NewService(store, validator, authcallout.Config{
-		IssuerSeed: issuerSeed,
-		XKeySeed:   os.Getenv(envXKeySeed),
-		GrantTTL:   grantTTL,
+		IssuerSeed:         issuerSeed,
+		XKeySeed:           os.Getenv(envXKeySeed),
+		GrantTTL:           grantTTL,
+		ReservedPrincipals: reserved,
+		ReservedAddressees: reservedAddressees,
 	}, log)
 	if err != nil {
 		return err

@@ -276,9 +276,8 @@ to it.
 half of that step, already done by the time `start` prints. On a stream with a declared-intent step,
 `start` reads every repository in `declared_intent_repos` it can — each `context_repos` entry
 through `inspect_repository.py clone` at the entry's `ref` when it has one and at its own default
-branch otherwise (the copy runs without `GITOPS_BASE_BRANCH` and `CREDENTIAL_PROXY_BASE_BRANCH`,
-which name the GitOps repository's branch and which a directory-mode clone with no `--ref` would
-otherwise check out), the GitOps repository
+branch otherwise (a base branch the operator configures applies only to a gitops or managed
+repository, so a context repository is never read at it), the GitOps repository
 from the clone it just reset or through the same script in content mode — for `declares:`
 frontmatter in OKF notes, within the paths each repository's `.kube-agents/intent.yaml` names
 (`declared_intent_sources` lists each as `{repo, ref, paths}`, `paths` empty when the whole tree
@@ -397,8 +396,8 @@ streams `collect.py` covers: compliance (`governance/compliance_audit_sop.md` §
 (`governance/obtainability_audit_sop.md` §2) and AI security (`governance/ai_security_audit_sop.md`
 §3), the cost stream (`fleet_waste.py`, `governance/fleet_wide_cost_analysis_sop.md` §2) and the
 stockout stream (`fleet_stockout.py`, `governance/stockout_prevention_sop.md` §3).
-The compliance, stockout and cost collectors may also give a target `checks_unevaluated`,
-`{check, reason}` for a check whose own read failed: it did not run and is not inapplicable, so it
+The compliance, obtainability, stockout and cost collectors may also give a target `checks_unevaluated`,
+`{check, reason}` for a check whose own read failed or whose inputs could not decide it: it did not run and is not inapplicable, so it
 goes in neither `checks_run` nor `checks_not_applicable` but in that target's `limitations`, which
 keeps the run partial and leaves open every finding that check filed there. `finish` rejects the
 slug anywhere else.

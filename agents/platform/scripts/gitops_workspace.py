@@ -183,18 +183,25 @@ Runner = Callable[..., object]
 # here is a shim that POSTs to the sidecar, so every repeat is an HTTP round
 # trip and a line of log noise. Tests that switch repositories clear it.
 _BASE_BRANCH_CACHE: dict[str, str] = {}
+# The broker's pinned base, once per repository per process, None included: it
+# is one `capabilities` round trip, and the answer is the operator's
+# configuration, which does not change under a running process.
+_PINNED_BASE_CACHE: dict[str, str | None] = {}
 
 
 def forget_base_branch(workspace: str | Path | None = None) -> None:
-    """Drop the cached default branch for `workspace`, or for every workspace."""
+    """Drop the cached default branch for `workspace`, or every cached answer."""
     if workspace is None:
         _BASE_BRANCH_CACHE.clear()
+        _PINNED_BASE_CACHE.clear()
     else:
         _BASE_BRANCH_CACHE.pop(str(Path(workspace)), None)
 
 
 def resolve_base_branch(
-    workspace: str | Path | None = None, runner: Runner | None = None
+    workspace: str | Path | None = None,
+    runner: Runner | None = None,
+    repository: str | None = None,
 ) -> str:
     """The branch a pull request should target, for *this* repository.
 
@@ -206,21 +213,26 @@ def resolve_base_branch(
 
     Resolution order:
 
-    1. `CREDENTIAL_PROXY_BASE_BRANCH` or `GITOPS_BASE_BRANCH`. For a repository
-       whose default branch is not the branch the fleet deploys from — a `release`
-       line, say. Nothing this function can observe would tell it that, so an operator
-       has to.
+    1. The base the credential broker pins `repository` to. For a GitOps or
+       managed repository whose default branch is not the branch the fleet
+       deploys from — a `release` line, say. Nothing this function can observe
+       would tell it that, so the operator configures it on the repository's
+       PlatformAgent entry, and the broker refuses a pull request onto any
+       other branch. Asked only when the caller names the repository, and
+       answered per repository, so one repository is never put on another's
+       branch.
     2. `origin/HEAD` in the clone. `git clone` sets it from the default the
        remote advertises, which is the right answer for every ordinary
        repository, and it costs one `symbolic-ref`.
     3. `main`, when there is no clone to ask yet.
+
+    The environment is not consulted. It belongs to the agent, which can set
+    any variable in it, so a base read from there is the agent's choice rather
+    than the operator's.
     """
-    override = (
-        os.environ.get("CREDENTIAL_PROXY_BASE_BRANCH", "").strip()
-        or os.environ.get("GITOPS_BASE_BRANCH", "").strip()
-    )
-    if override:
-        return override
+    pinned = _pinned_base(repository) if repository else None
+    if pinned:
+        return pinned
     if workspace is None:
         return DEFAULT_BASE_BRANCH
     key = str(Path(workspace))
@@ -230,6 +242,16 @@ def resolve_base_branch(
     resolved = _detect_base_branch(workspace, runner) or DEFAULT_BASE_BRANCH
     _BASE_BRANCH_CACHE[key] = resolved
     return resolved
+
+
+def _pinned_base(repository: str) -> str | None:
+    if repository not in _PINNED_BASE_CACHE:
+        # Here rather than at the top: the broker process imports this module
+        # too, and has no business importing the sandbox's broker client.
+        import vcs_client
+
+        _PINNED_BASE_CACHE[repository] = vcs_client.base_branch(repository)
+    return _PINNED_BASE_CACHE[repository]
 
 
 def _detect_base_branch(workspace: str | Path, runner: Runner | None) -> str | None:
@@ -541,9 +563,10 @@ def ensure_workspace(
     `base_branch` at the remote's tip, which is what an audit wants before it
     starts: a leftover branch or a dirty tree from a run that crashed is not
     authored by a human and there is nothing in it to preserve. `base_branch`
-    defaults to whatever the remote says its default branch is, resolved after
-    the clone by `resolve_base_branch` — a repository whose trunk is `master`
-    used to fail here on a `origin/main` that does not exist.
+    defaults to the base the broker pins `repo` to, else whatever the remote
+    says its default branch is, resolved after the clone by
+    `resolve_base_branch` — a repository whose trunk is `master` used to fail
+    here on a `origin/main` that does not exist.
 
     With `reset=False` the tree is left exactly as the caller found it and only
     `origin` is fetched. This is not a nicety — it is the difference between a
@@ -586,7 +609,7 @@ def ensure_workspace(
 
     # Resolved here rather than defaulted in the signature: it takes a `git` in
     # the clone, and the clone is what the lines above just established.
-    base_branch = base_branch or resolve_base_branch(target, runner)
+    base_branch = base_branch or resolve_base_branch(target, runner, repo)
 
     # An empty repository has no commits on any branch, so origin/<base_branch>
     # cannot exist. Probe before checkout rather than dying on raw git fatal output.

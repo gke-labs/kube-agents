@@ -83,9 +83,9 @@ def lifted(restart_seconds: str | None = None, healthy_seconds: str | None = Non
         constants = [re.sub(r"(WATCH_RESTART_SECONDS=).*", rf"\g<1>{restart_seconds}", c) for c in constants]
     if healthy_seconds is not None:
         constants = [re.sub(r"(WATCH_HEALTHY_SECONDS=).*", rf"\g<1>{healthy_seconds}", c) for c in constants]
-    state = re.findall(r'^AGENT_DIAG_(?:WATCH_[A-Z]+|COLLECTED)=""$', src, re.MULTILINE)
-    if len(state) != 3:  # pragma: no cover
-        raise AssertionError(f"expected the three state variables in {ENV_SCRIPT}, found {state}")
+    state = re.findall(r'^AGENT_DIAG_(?:WATCH_[A-Z]+|COLLECTED|PREFIX)=""$', src, re.MULTILINE)
+    if len(state) != 4:  # pragma: no cover
+        raise AssertionError(f"expected the four state variables in {ENV_SCRIPT}, found {state}")
     bodies = []
     for name in FUNCTIONS:
         match = re.search(rf"^{name}\(\) \{{\n.*?^\}}$", src, re.DOTALL | re.MULTILINE)
@@ -315,6 +315,50 @@ class AgentPodDiagnosticsTest(unittest.TestCase):
         proc, _, twice = run_collect(collect_times=2, STUB_CONTAINERS="platform-agent hermes-bridge")
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(len(twice), len(once), twice)
+
+    def test_a_kept_watch_runs_on_and_the_rearmed_call_stops_it_under_a_prefix(self):
+        """ci-eval-pr.sh's rollback round trip: the eval's snapshot first, with
+        the watch left running through the flip, then the trap's call stops it
+        and writes the round trip's own snapshot beside the eval's."""
+        tmp = pathlib.Path(tempfile.mkdtemp(prefix="poddiag-keep-"))
+        artifacts = tmp / "artifacts"
+        script = "\n".join(
+            [
+                "set -euo pipefail",
+                lifted(),
+                "start_agent_pod_watch",
+                "sleep 1",
+                f"{FUNCTION} --keep-watch",
+                'for pid in ${AGENT_DIAG_WATCH_PIDS}; do kill -0 "${pid}" && echo "LOOP ALIVE"; done',
+                f'ls {artifacts} | sed "s/^/AFTER KEEP: /"',
+                'AGENT_DIAG_COLLECTED=""',
+                'AGENT_DIAG_PREFIX="rollback-"',
+                f"{FUNCTION}",
+                'echo "STATUS AFTER: $?"',
+            ]
+        )
+        env = {k: v for k, v in os.environ.items() if k != "AGENT_CLUSTER_CONTEXT"}
+        env.update(
+            PATH=f"{stub_bin(tmp)}:{os.environ['PATH']}",
+            ARTIFACTS=str(artifacts),
+            TARGET_NAMESPACE="test-ns",
+            STUB_CALLS=str(tmp / "calls"),
+            STUB_WATCH_PIDS=str(tmp / "watch-pids"),
+            STUB_CONTAINERS="platform-agent hermes-bridge",
+        )
+        proc = subprocess.run(["bash", "-c", script], capture_output=True, text=True, check=False, env=env)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("STATUS AFTER: 0", proc.stdout)
+        self.assertEqual(proc.stdout.count("LOOP ALIVE"), 2, "the kept snapshot must leave both watches running")
+        for name in WATCH_FILES:
+            self.assertNotIn(f"AFTER KEEP: {name}", proc.stdout, "the kept snapshot must not write the tails yet")
+            self.assertTrue((artifacts / name).is_file(), name)
+        snapshot = ("agent-pod-status.txt", "k8s-events.txt", "agent-pod-top.txt", "platform-agent-previous.log", "hermes-bridge.log", "hermes-bridge-previous.log")
+        for name in snapshot:
+            self.assertIn(f"AFTER KEEP: {name}", proc.stdout)
+            self.assertTrue((artifacts / f"rollback-{name}").is_file(), name)
+        kubectls = [int(p) for p in (tmp / "watch-pids").read_text(encoding="utf-8").split()]
+        self.assertTrue(all_exit(kubectls), "the re-armed call must stop the watch")
 
     def test_a_watch_that_failed_to_open_is_retried_with_its_list(self):
         """Until an open has held, nothing has recorded the list, so a retry

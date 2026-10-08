@@ -22,6 +22,11 @@
 
 set -euo pipefail
 
+# Wall clock at this script's entry, before the lease heartbeat, the cluster
+# auth and section 1: the fallback job start for the rollback round trip's
+# start-by bound when BUILD_ID does not give one (job_started_epoch).
+EVAL_SCRIPT_STARTED_EPOCH="$(date +%s)"
+
 # The eval rosters, three files beside this script under hack/eval/ (#1546):
 # what every pull request runs, what can red one on a graded failure, and
 # what the nightly adds. Section 6 reads the first and third into TASKS and
@@ -69,10 +74,12 @@ readonly EVAL_VERDICT_OUTCOME_NOT_EVALUATED="not_evaluated"
 # from the Secret the operator renders beside the door -- <agent>-a2a-inject,
 # key `token` (a2aInjectName and a2aInjectTokenKey in the operator; the deploy
 # already waited for it). Unset, the matrix runs over the agent API exactly
-# as before. Three places read the flag: section 4 below; the baseline
+# as before. Four places read the flag: section 4 below; the baseline
 # recorder (its decision, EVAL_IS_MAIN_RUN, and the log line at the record
-# step after the fan-out); and the dashboard publisher's gate, which mirrors
-# the recorder's. A flagged run passes neither: the next lane's periodic on
+# step after the fan-out); the dashboard publisher's gate, which mirrors
+# the recorder's; and the rollback round trip after the suite verdict
+# (run_rollback_roundtrip, below). A flagged run passes neither the recorder
+# nor the publisher: the next lane's periodic on
 # main runs under it with no PULL_NUMBER, the shape both otherwise write
 # from, and a next-mode sample in today's window would be indistinguishable
 # once written (VersionKey in bench/kube_agents_bench/baselines.py carries
@@ -86,6 +93,28 @@ readonly EVAL_INJECT_TOKEN_SECRET_KEY="token"
 # fan-out on one listener that the first unit to finish tears down. The base
 # sits clear of the API range (28642 + seq) for any matrix this job runs.
 readonly EVAL_INJECT_LOCAL_PORT_BASE=29099
+
+# The rollback round trip under EVAL_MODE_NEXT=1 (run_rollback_roundtrip, after
+# the suite verdict is computed): hack/rollback-roundtrip.sh flips the install
+# next -> today -> next and checks the JetStream PVC and the bus creds Secret
+# come through it (cutover condition 6, #2461). Reported beside the verdict,
+# never in it: its own log section and artifacts, no case, no effect on the
+# exit status. It starts only while the JOB is young enough that its own
+# bound still ends inside the presubmit's 360m deadline, measured from the
+# job's start (job_started_epoch), not from the eval's, so a slow deploy in
+# front counts against it too. The arithmetic: start by 15600s (260m), plus
+# the 3600s bound, plus the 60s kill grace, ends by 19260s; the 360m deadline
+# is 21600s, which leaves 2340s (39m) for the verdict line, the EXIT trap's
+# artifact collection and the teardown's 10m uninstall bound
+# (hack/ci-teardown.sh, RELEASE_UNINSTALL_TIMEOUT). The bound kills a run that
+# outlives it, after a grace for its port-forwards to close.
+readonly EVAL_ROLLBACK_SCRIPT="rollback-roundtrip.sh"
+readonly EVAL_ROLLBACK_JOB_DEADLINE_SECONDS=21600
+readonly EVAL_ROLLBACK_START_BY_SECONDS=15600
+readonly EVAL_ROLLBACK_TIMEOUT_SECONDS=3600
+readonly EVAL_ROLLBACK_KILL_AFTER_SECONDS=60
+readonly EVAL_ROLLBACK_LOG="rollback-roundtrip.log"
+readonly EVAL_ROLLBACK_RESULTS="rollback-roundtrip.txt"
 
 # release_inflight_note (beside the ledger reset, section 5): the sandbox
 # pod's shell container, the scratch directory audit_report.py writes its
@@ -292,6 +321,40 @@ PY
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 profile_begin "bootstrap: source ci-env.sh"
 source "${SCRIPT_DIR}/ci-env.sh"
+
+# EVAL_FORGE=gitlab (#2394): the deploy (hack/ci-deploy.sh) registers the
+# pool project's GitLab project, and the resets and grading here follow it --
+# the ledger and pull-request resets close GitLab issues and merge requests
+# through hack/ci_gitlab_forge.py, and the ledger token is exported under
+# BENCH_FORGE and BENCH_GITLAB_*, the names the bench's forge-graded checks
+# and the inject lane's github_writes safeguard read, with the GitHub token
+# unset so nothing can read the GitHub twin repository by mistake. One token
+# pair serves the pool, in Secret Manager where the runner identities live;
+# nothing is minted per unit and nothing rotates here
+# (docs/ci-pool-projects.md 5.6). The names are pinned equal to
+# hack/ci-deploy.sh's by scripts/test_ci_gitlab_forge.py.
+EVAL_FORGE="${EVAL_FORGE:-github}"
+case "${EVAL_FORGE}" in
+  github) ;;
+  gitlab)
+    # The deploy builds the GitLab forge from the mapping alone and ignores
+    # EVAL_GITOPS_REPO, so a developer's override would steer the resets and
+    # the lane at a repository the agent was not told to write to.
+    if [ -n "${EVAL_GITOPS_REPO:-}" ]; then
+      echo "ERROR: EVAL_FORGE=gitlab does not take EVAL_GITOPS_REPO (the deploy ignores it); unset it, the GitLab project follows the leased PROJECT_ID." >&2
+      exit 1
+    fi
+    ;;
+  *) echo "ERROR: EVAL_FORGE='${EVAL_FORGE}' is not a forge this eval knows; use github (default) or gitlab." >&2; exit 1 ;;
+esac
+GITLAB_SECRETS_PROJECT="kube-agents-prow"
+GITLAB_AGENT_SM_SECRET="gitlab-agent-token"
+GITLAB_LEDGER_SM_SECRET="gitlab-ledger-token"
+GITLAB_BOT_LOGIN="kube-agents-eval-bot"
+GITLAB_FORGE_HOST="gitlab.com"
+# What the two reset helpers are told; empty under github.
+EVAL_FORGE_HELPER_ARGS=()
+[ "${EVAL_FORGE}" = "gitlab" ] && EVAL_FORGE_HELPER_ARGS=(--forge gitlab)
 
 # ─── Eval dashboard publish hook (dashboard PR 4/4) ─────────────────────────
 # Re-renders and republishes the eval dashboard at the very end of every
@@ -812,7 +875,9 @@ _ledger_token_mint() {
 # its own scope. Never falls back to the mounted PAT -- that would let a smoke
 # test pass while proving nothing about the credential it exercises.
 mint_ledger_token() { # <label>
-  if [ -z "${EVAL_LEDGER_APP_KEY_FILE:-}" ]; then
+  # Under gitlab the grading token is the pool's, read once at preflight by
+  # read_gitlab_tokens; it lasts a year, so there is nothing to mint per unit.
+  if [ "${EVAL_FORGE:-github}" = "gitlab" ] || [ -z "${EVAL_LEDGER_APP_KEY_FILE:-}" ]; then
     return 0
   fi
   # The token never reaches argv, where ps would show it: python writes it to
@@ -847,7 +912,55 @@ mint_ledger_token() { # <label>
 # Once here as well as once per unit: a key that cannot mint at all is a
 # run-wide fault, and it costs seconds to find out now instead of at the end of
 # the fan-out, where it would surface as every repetition grading MISSING.
-if [ -z "${EVAL_LEDGER_APP_KEY_FILE:-}" ]; then
+# The GitLab pair, read once from Secret Manager over a pipe into the
+# shell's own variables: the agent token for the two resets (the bot owns
+# the issues and merge requests they close), the ledger token for grading,
+# exported under the names the bench's GitLab checks read.
+# Neither touches argv or a file. A read that fails stops the run here, as a
+# mint that fails does: grading without the token would prove nothing.
+EVAL_GITLAB_AGENT_TOKEN=""
+read_gitlab_tokens() {
+  local agent ledger
+  agent="$(gcloud secrets versions access latest --secret="${GITLAB_AGENT_SM_SECRET}" --project="${GITLAB_SECRETS_PROJECT}" | tr -d '\r\n')" || agent=""
+  ledger="$(gcloud secrets versions access latest --secret="${GITLAB_LEDGER_SM_SECRET}" --project="${GITLAB_SECRETS_PROJECT}" | tr -d '\r\n')" || ledger=""
+  local missing=()
+  [ -n "${agent}" ] || missing+=("${GITLAB_SECRETS_PROJECT}/${GITLAB_AGENT_SM_SECRET}")
+  [ -n "${ledger}" ] || missing+=("${GITLAB_SECRETS_PROJECT}/${GITLAB_LEDGER_SM_SECRET}")
+  if [ "${#missing[@]}" -gt 0 ]; then
+    echo "ERROR: preflight: could not read ${missing[*]} as this runner (docs/ci-pool-projects.md 5.6: the pair and the runner's secretAccessor grant are hand steps)." >&2
+    echo "       Grading a GitLab ledger needs the ledger token and the resets need the agent token; not running without them." >&2
+    return 1
+  fi
+  # A pair that reads but no longer authenticates (expired, revoked, replaced)
+  # would spend the whole lease to meet a 401 in the resets and the bench;
+  # prove both now, as the GitHub preflight proves the mint. The token goes
+  # to the probe in its environment, never on argv.
+  local which secret login
+  for which in agent ledger; do
+    [ "${which}" = "agent" ] && secret="${GITLAB_AGENT_SM_SECRET}" || secret="${GITLAB_LEDGER_SM_SECRET}"
+    if ! login="$(GITLAB_PROBE_TOKEN="${!which}" python3 "${SCRIPT_DIR}/ci_gitlab_forge.py" whoami --host "${GITLAB_FORGE_HOST}")"; then
+      echo "ERROR: preflight: the ${which} token in ${GITLAB_SECRETS_PROJECT}/${secret} does not authenticate at ${GITLAB_FORGE_HOST} (docs/ci-pool-projects.md 5.6: create a new one and store it); not running with it." >&2
+      return 1
+    fi
+    echo "Preflight: the ${which} token in ${GITLAB_SECRETS_PROJECT}/${secret} authenticates as ${login}"
+    if [ "${which}" = "agent" ] && [ "${login}" != "${GITLAB_BOT_LOGIN}" ]; then
+      echo "WARNING: preflight: the agent token belongs to ${login}, not ${GITLAB_BOT_LOGIN}; the bench grades the agent's ledgers and merge requests by the latter (GITLAB_BOT_LOGIN)." >&2
+    fi
+  done
+  EVAL_GITLAB_AGENT_TOKEN="${agent}"
+  # The job mounts BENCH_GITHUB_TOKEN for the GitHub path; unset under
+  # gitlab so no check can fall back to the GitHub twin repository.
+  unset BENCH_GITHUB_TOKEN GITHUB_TOKEN
+  export BENCH_FORGE="gitlab"
+  export BENCH_GITLAB_TOKEN="${ledger}"
+  export BENCH_GITLAB_HOST="${GITLAB_FORGE_HOST}"
+  export BENCH_GITLAB_AGENT_LOGIN="${GITLAB_BOT_LOGIN}"
+  echo "Ledger token: the pool's GitLab ledger token from ${GITLAB_SECRETS_PROJECT}/${GITLAB_LEDGER_SM_SECRET} (BENCH_FORGE=gitlab, agent login ${GITLAB_BOT_LOGIN}); the agent token from ${GITLAB_SECRETS_PROJECT}/${GITLAB_AGENT_SM_SECRET} drives the resets"
+}
+
+if [ "${EVAL_FORGE}" = "gitlab" ]; then
+  read_gitlab_tokens || exit 1
+elif [ -z "${EVAL_LEDGER_APP_KEY_FILE:-}" ]; then
   echo "Ledger token: using the mounted BENCH_GITHUB_TOKEN -- EVAL_LEDGER_APP_KEY_FILE is unset"
 else
   mint_ledger_token "preflight" || exit 1
@@ -881,6 +994,9 @@ fi
 # The reset token stays out of BENCH_GITHUB_TOKEN, and the grading mint asks
 # for its reads explicitly (LEDGER_GRADING_MINT_BODY), so the grant the reset
 # needs does not widen the token grading holds.
+# Under EVAL_FORGE=gitlab the same two calls close GitLab issues with the
+# pool's agent token (--forge gitlab, hack/ci_gitlab_forge.py); the rest of
+# this comment is the GitHub path.
 # A reset that cannot run (no App key, an unmapped project, a mint the
 # installation refuses because App EVAL_LEDGER_APP_ID's installation no longer
 # holds issues: write -- granted 2026-09-22, docs/ci-pool-projects.md 5.4)
@@ -896,6 +1012,28 @@ eval_gitops_repo() { # <project-id>
   [ -n "${body}" ] || return 1
   eval "${body}"
   gitops_repo_for_project "$1"
+}
+
+eval_gitlab_project() { # <project-id>
+  # The GitLab table beside it, lifted the same way; under EVAL_FORGE=gitlab
+  # this is the repository the resets and the inject lane name.
+  local body
+  body="$(sed -n '/^gitlab_project_for_project() {$/,/^}$/p' "${SCRIPT_DIR}/ci-deploy.sh")"
+  [ -n "${body}" ] || return 1
+  eval "${body}"
+  gitlab_project_for_project "$1"
+}
+
+# The token a reset writes with: under gitlab the pool's agent token, read at
+# preflight; under github one minted narrowed to the repository (and to the
+# permissions named, issues: write when none are).
+forge_write_token() { # <owner/repo> [permissions JSON]
+  if [ "${EVAL_FORGE:-github}" = "gitlab" ]; then
+    [ -n "${EVAL_GITLAB_AGENT_TOKEN:-}" ] || return 1
+    printf '%s\n' "${EVAL_GITLAB_AGENT_TOKEN}"
+    return 0
+  fi
+  ledger_reset_token "$@"
 }
 
 # Emits the token on stdout, nothing else; diagnostics on stderr. Narrowed
@@ -969,19 +1107,23 @@ reset_audit_ledgers() { # <label> [audit-id]
   local label="$1" audit_id="${2:-}" scope token out rc=0
   scope="every audit stream"
   [ -n "${audit_id}" ] && scope="the ${audit_id} stream"
-  if [ -z "${EVAL_LEDGER_APP_KEY_FILE:-}" ]; then
+  if [ "${EVAL_FORGE:-github}" != "gitlab" ] && [ -z "${EVAL_LEDGER_APP_KEY_FILE:-}" ]; then
     echo "Ledger reset (${label}): skipped, EVAL_LEDGER_APP_KEY_FILE is unset and the mounted PAT is a read credential; ${scope} keeps whatever ledger is open"
     return 0
   fi
   if [ -z "${EVAL_LEDGER_REPO:-}" ]; then
-    echo "Ledger reset (${label}): skipped, PROJECT_ID=${PROJECT_ID:-unset} maps to no GitOps repository (gitops_repo_for_project in hack/ci-deploy.sh); ${scope} keeps whatever ledger is open"
+    echo "Ledger reset (${label}): skipped, PROJECT_ID=${PROJECT_ID:-unset} maps to no GitOps repository (gitops_repo_for_project / gitlab_project_for_project in hack/ci-deploy.sh); ${scope} keeps whatever ledger is open"
     return 0
   fi
-  if ! token="$(ledger_reset_token "${EVAL_LEDGER_REPO}")"; then
-    echo "WARNING: Ledger reset (${label}): App ${EVAL_LEDGER_APP_ID} could not mint issues: write narrowed to ${EVAL_LEDGER_REPO}; ${scope} keeps whatever ledger is open. A 422 above means the installation no longer holds issues: write, which it was granted on 2026-09-22 (docs/ci-pool-projects.md 5.4)." >&2
+  if ! token="$(forge_write_token "${EVAL_LEDGER_REPO}")"; then
+    if [ "${EVAL_FORGE:-github}" = "gitlab" ]; then
+      echo "WARNING: Ledger reset (${label}): the pool's GitLab agent token is not in hand (read_gitlab_tokens at preflight); ${scope} keeps whatever ledger is open." >&2
+    else
+      echo "WARNING: Ledger reset (${label}): App ${EVAL_LEDGER_APP_ID} could not mint issues: write narrowed to ${EVAL_LEDGER_REPO}; ${scope} keeps whatever ledger is open. A 422 above means the installation no longer holds issues: write, which it was granted on 2026-09-22 (docs/ci-pool-projects.md 5.4)." >&2
+    fi
     return 0
   fi
-  local args=(--repo "${EVAL_LEDGER_REPO}" --project "${PROJECT_ID}" --build "${BUILD_ID:-local}")
+  local args=(--repo "${EVAL_LEDGER_REPO}" --project "${PROJECT_ID}" --build "${BUILD_ID:-local}" ${EVAL_FORGE_HELPER_ARGS[@]+"${EVAL_FORGE_HELPER_ARGS[@]}"})
   [ -n "${audit_id}" ] && args+=(--audit "${audit_id}")
   # The token rides in the environment of this one process, never on argv.
   out="$(LEDGER_RESET_TOKEN="${token}" python3 "${SCRIPT_DIR}/ci_reset_audit_ledgers.py" "${args[@]}" 2>&1)" || rc=$?
@@ -1007,16 +1149,20 @@ reset_audit_ledgers() { # <label> [audit-id]
 # (AGENT_PULLS_RESET_PERMISSIONS); the same guards as the ledger reset's.
 reset_agent_pulls() { # <label>  -> 0 when the repository is clean, 1 when a unit must not run on it
   local label="$1" token out rc=0 slug record
-  if [ -z "${EVAL_LEDGER_APP_KEY_FILE:-}" ]; then
+  if [ "${EVAL_FORGE:-github}" != "gitlab" ] && [ -z "${EVAL_LEDGER_APP_KEY_FILE:-}" ]; then
     echo "Agent pulls reset (${label}): skipped, EVAL_LEDGER_APP_KEY_FILE is unset and the mounted PAT is a read credential; the repository keeps whatever the agent left"
     return 0
   fi
   if [ -z "${EVAL_LEDGER_REPO:-}" ]; then
-    echo "Agent pulls reset (${label}): skipped, PROJECT_ID=${PROJECT_ID:-unset} maps to no GitOps repository (gitops_repo_for_project in hack/ci-deploy.sh)"
+    echo "Agent pulls reset (${label}): skipped, PROJECT_ID=${PROJECT_ID:-unset} maps to no GitOps repository (gitops_repo_for_project / gitlab_project_for_project in hack/ci-deploy.sh)"
     return 0
   fi
-  if ! token="$(ledger_reset_token "${EVAL_LEDGER_REPO}" "${AGENT_PULLS_RESET_PERMISSIONS}")"; then
-    echo "WARNING: Agent pulls reset (${label}): App ${EVAL_LEDGER_APP_ID} could not mint pull_requests: write, contents: write and issues: write narrowed to ${EVAL_LEDGER_REPO}; a unit that requests a pull request does not run on a repository this could not clean. A 422 above means the installation does not hold those permissions (docs/ci-pool-projects.md 5.3)." >&2
+  if ! token="$(forge_write_token "${EVAL_LEDGER_REPO}" "${AGENT_PULLS_RESET_PERMISSIONS}")"; then
+    if [ "${EVAL_FORGE:-github}" = "gitlab" ]; then
+      echo "WARNING: Agent pulls reset (${label}): the pool's GitLab agent token is not in hand (read_gitlab_tokens at preflight); a unit that requests a merge request does not run on a project this could not clean." >&2
+    else
+      echo "WARNING: Agent pulls reset (${label}): App ${EVAL_LEDGER_APP_ID} could not mint pull_requests: write, contents: write and issues: write narrowed to ${EVAL_LEDGER_REPO}; a unit that requests a pull request does not run on a repository this could not clean. A 422 above means the installation does not hold those permissions (docs/ci-pool-projects.md 5.3)." >&2
+    fi
     return 1
   fi
   # One record per call beside the artifacts, named for the call, so a run
@@ -1026,7 +1172,7 @@ reset_agent_pulls() { # <label>  -> 0 when the repository is clean, 1 when a uni
   # The token rides in the environment of this one process, never on argv.
   out="$(AGENT_PULLS_RESET_TOKEN="${token}" python3 "${SCRIPT_DIR}/ci_reset_agent_pulls.py" \
     --repo "${EVAL_LEDGER_REPO}" --project "${PROJECT_ID}" --build "${BUILD_ID:-local}" \
-    --scope "${label}" --record "${record}" 2>&1)" || rc=$?
+    --scope "${label}" --record "${record}" ${EVAL_FORGE_HELPER_ARGS[@]+"${EVAL_FORGE_HELPER_ARGS[@]}"} 2>&1)" || rc=$?
   [ -n "${out}" ] && printf '%s\n' "${out}" | sed "s/^/Agent pulls reset (${label}): /"
   if [ "${rc}" -ne 0 ]; then
     echo "WARNING: Agent pulls reset (${label}): the helper exited ${rc}; the repository is not clean (${record}), and a unit that requests a pull request does not run on it." >&2
@@ -1141,7 +1287,11 @@ release_inflight_note() { # <label> <audit-id>
   return 0
 }
 
-EVAL_LEDGER_REPO="$(eval_gitops_repo "${PROJECT_ID:-}" 2>/dev/null)" || EVAL_LEDGER_REPO=""
+if [ "${EVAL_FORGE}" = "gitlab" ]; then
+  EVAL_LEDGER_REPO="$(eval_gitlab_project "${PROJECT_ID:-}" 2>/dev/null)" || EVAL_LEDGER_REPO=""
+else
+  EVAL_LEDGER_REPO="$(eval_gitops_repo "${PROJECT_ID:-}" 2>/dev/null)" || EVAL_LEDGER_REPO=""
+fi
 reset_audit_ledgers "lease"
 reset_agent_pulls "lease" || echo "WARNING: Agent pulls reset (lease): the repository is not clean; every unit of a case that requests a pull request runs its own reset first and is marked MISSING when that fails too." >&2
 
@@ -1607,7 +1757,7 @@ if [ "${AGENT_TRANSPORT:-}" = "${EVAL_INJECT_TRANSPORT}" ]; then
     INJECT_LANE_REPO="${EVAL_GITOPS_REPO}"
   fi
   if [ -z "${INJECT_LANE_REPO}" ]; then
-    echo "ERROR: AGENT_TRANSPORT=${AGENT_TRANSPORT} but no GitOps repository is known for PROJECT_ID=${PROJECT_ID:-unset} (gitops_repo_for_project in hack/ci-deploy.sh, or EVAL_GITOPS_REPO on a local run); the lane's GitHub-write safeguard (${EVAL_INJECT_LANE_SAFEGUARDS_FILE}) cannot name the repository it reads, so the lane does not start." >&2
+    echo "ERROR: AGENT_TRANSPORT=${AGENT_TRANSPORT} but no GitOps repository is known for PROJECT_ID=${PROJECT_ID:-unset} (gitops_repo_for_project or gitlab_project_for_project in hack/ci-deploy.sh, by EVAL_FORGE; EVAL_GITOPS_REPO on a local GitHub run); the lane's write safeguard (${EVAL_INJECT_LANE_SAFEGUARDS_FILE}) cannot name the repository it reads, so the lane does not start." >&2
     exit 1
   fi
   export BENCH_GITOPS_REPO="${INJECT_LANE_REPO}"
@@ -2865,11 +3015,12 @@ profile_begin "record + final gate"
 # against a window it had just moved.
 #
 # EVAL_MODE_NEXT=1 is the fourth, for the same reason as the third. The next
-# lane's periodic on main (ci-kube-agents-eval-next) is also a periodic with
-# no PULL_NUMBER, and the key has no mode field either, so its samples would
-# be today's the moment they landed. The deploy admits the flag on that job
-# by name (EVAL_MODE_NEXT_JOB_NAMES in hack/ci-deploy.sh); this is what keeps
-# the admission from moving the window. Whatever the job's identity may hold
+# lane's periodic and nightly on main (ci-kube-agents-eval-next,
+# ci-kube-agents-eval-nightly-next-claude) are also periodics with no
+# PULL_NUMBER, and the key has no mode field either, so their samples would
+# be today's the moment they landed. The deploy admits the flag on those
+# jobs by name (EVAL_MODE_NEXT_JOB_NAMES in hack/ci-deploy.sh); this is what
+# keeps the admission from moving the window. Whatever the job's identity may hold
 # on the store is a grant in oss-test-infra this script cannot see, not a
 # property of it. A next record of its own is the mode field on the key;
 # until it exists a flagged run reads the store, when one is armed, and
@@ -2966,6 +3117,107 @@ announce_suite_verdict() {
   return 1
 }
 
+# When the job started, for the rollback round trip's start-by bound: sets
+# EVAL_JOB_STARTED_EPOCH and EVAL_JOB_STARTED_FROM (what it was read from).
+# Prow's BUILD_ID is a Twitter snowflake whose top bits are milliseconds since
+# a fixed epoch, and it decodes to the pod's pendingTime within seconds
+# (scripts/pool_pressure.py, SNOWFLAKE_*, which scripts/test_pool_pressure.py
+# holds to recorded prowjobs): before the clone, the build and the deploy, so
+# an age read from it is never short. Without one that decodes to a time in
+# the last day, the fallback is this script's own entry less an allowance for
+# the deploy that ran before it as a separate script (about 45m on the next
+# lane), so the start-by arithmetic holds on that path too.
+readonly EVAL_SNOWFLAKE_EPOCH_MS=1288834974657
+readonly EVAL_SNOWFLAKE_TIMESTAMP_SHIFT=22
+readonly EVAL_JOB_START_MAX_AGE_SECONDS=86400
+readonly EVAL_JOB_START_DEPLOY_ALLOWANCE_SECONDS=2700
+job_started_epoch() {
+  local now decoded
+  now="$(date +%s)"
+  EVAL_JOB_STARTED_EPOCH=$((EVAL_SCRIPT_STARTED_EPOCH - EVAL_JOB_START_DEPLOY_ALLOWANCE_SECONDS))
+  EVAL_JOB_STARTED_FROM="this script's start less ${EVAL_JOB_START_DEPLOY_ALLOWANCE_SECONDS}s for the deploy; BUILD_ID gave none"
+  if [[ "${BUILD_ID:-}" =~ ^[0-9]{15,19}$ ]]; then
+    decoded=$((((10#${BUILD_ID} >> EVAL_SNOWFLAKE_TIMESTAMP_SHIFT) + EVAL_SNOWFLAKE_EPOCH_MS) / 1000))
+    if [ "${decoded}" -le "${now}" ] && [ $((now - decoded)) -le "${EVAL_JOB_START_MAX_AGE_SECONDS}" ]; then
+      EVAL_JOB_STARTED_EPOCH="${decoded}"
+      EVAL_JOB_STARTED_FROM="BUILD_ID ${BUILD_ID}"
+    fi
+  fi
+}
+
+# The rollback round trip, under EVAL_MODE_NEXT=1 only (the constants at the
+# top say why it runs and how long it may). Called after the suite step has
+# written eval-verdict.json and eval-verdict.md and captured SUITE_STATUS,
+# and before the final line announces them, so it can change neither: it
+# runs in a child process whose status it reports and then drops, and it
+# always returns 0. Its own section of this log, its own artifacts
+# (EVAL_ROLLBACK_LOG, the transcript; EVAL_ROLLBACK_RESULTS, the PASS/FAIL
+# lines and an outcome), and no case in the matrix.
+#
+# The flip replaces the agent pod, whose log and diagnostics the EXIT trap
+# collects, so the eval's are taken first; the gateway log collector keeps
+# the first capture of a process, so the trap does not overwrite it with the
+# replacement pod's. The pod and event watches keep running through the
+# round trip, and the diagnostics collector is re-armed under a prefix
+# before it starts: whatever ends the run after that (a pass, a failure, the
+# deadline's TERM), the EXIT trap stops the watch, whose tails then cover
+# the flip, and writes a rollback-* snapshot beside the eval's.
+#
+# The round trip runs in the background and is waited on, so a SIGTERM (the
+# job's deadline) reaches this script's trap during the wait rather than
+# after an hour: the handler here passes it on to the round trip, which
+# reports itself interrupted, and then exits 143 as the global trap does, so
+# the EXIT trap's collection still runs inside the grace period. The start-by
+# bound is on the job's age, so that handler is for a deadline that moved,
+# not for a slow deploy.
+run_rollback_roundtrip() {
+  if [ "${EVAL_MODE_NEXT:-}" != "1" ]; then
+    return 0
+  fi
+  local log="${ARTIFACT_DIR}/${EVAL_ROLLBACK_LOG}" results="${ARTIFACT_DIR}/${EVAL_ROLLBACK_RESULTS}"
+  local now job_age status=0 outcome
+  local -a bound=()
+  profile_begin "rollback round trip (report-only)"
+  echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Rollback round trip (next -> today -> next), reported beside the eval verdict and not part of it ==="
+  : >"${results}" || true
+  job_started_epoch
+  now="$(date +%s)"
+  job_age=$((now - EVAL_JOB_STARTED_EPOCH))
+  if [ "${job_age}" -gt "${EVAL_ROLLBACK_START_BY_SECONDS}" ]; then
+    echo "SKIPPED: not enough time left in the job: it started ${job_age}s ago (${EVAL_JOB_STARTED_FROM}), past the ${EVAL_ROLLBACK_START_BY_SECONDS}s start-by bound, so the round trip's ${EVAL_ROLLBACK_TIMEOUT_SECONDS}s bound would not end inside the job's ${EVAL_ROLLBACK_JOB_DEADLINE_SECONDS}s deadline with room for the verdict and the teardown" | tee -a "${results}"
+    echo "OUTCOME: skipped" >>"${results}" || true
+    return 0
+  fi
+  echo "the job started ${job_age}s ago (${EVAL_JOB_STARTED_FROM}); inside the ${EVAL_ROLLBACK_START_BY_SECONDS}s start-by bound" | tee -a "${results}"
+  collect_gateway_log
+  collect_agent_pod_diagnostics --keep-watch
+  # Both read by collect_agent_pod_diagnostics (hack/ci-env.sh).
+  # shellcheck disable=SC2034
+  AGENT_DIAG_COLLECTED=""
+  # shellcheck disable=SC2034
+  AGENT_DIAG_PREFIX="rollback-"
+  if command -v timeout >/dev/null 2>&1; then
+    bound=(timeout --kill-after="${EVAL_ROLLBACK_KILL_AFTER_SECONDS}" "${EVAL_ROLLBACK_TIMEOUT_SECONDS}")
+  fi
+  # Streamed as it runs, and kept whole in its own file. timeout passes a
+  # TERM it receives on to the script.
+  ROLLBACK_KUBE_CONTEXT="${AGENT_CLUSTER_CONTEXT:-}" ROLLBACK_RESULTS_FILE="${results}" \
+    ${bound[@]+"${bound[@]}"} bash "${SCRIPT_DIR}/${EVAL_ROLLBACK_SCRIPT}" "${TARGET_NAMESPACE}" "${AGENT_SERVICE_NAME}" \
+    > >(tee "${log}") 2>&1 &
+  EVAL_ROLLBACK_PID=$!
+  trap 'kill -TERM "${EVAL_ROLLBACK_PID}" 2>/dev/null || true; wait "${EVAL_ROLLBACK_PID}" 2>/dev/null || true; exit 143' TERM INT
+  wait "${EVAL_ROLLBACK_PID}" || status=$?
+  trap 'exit 143' TERM INT
+  if [ "${status}" -eq 0 ]; then
+    outcome="passed"
+  else
+    outcome="failed (exit ${status})"
+  fi
+  echo "OUTCOME: ${outcome}" >>"${results}" || true
+  echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Rollback round trip ${outcome}; report-only, so the eval verdict below is unchanged by it (transcript: ${log}) ==="
+  return 0
+}
+
 TOTAL_DURATION=$((SECONDS - START_TIME))
 SUITE_STATUS=0
 # From here the run writes its own verdict; the EXIT trap's cut-off report
@@ -2975,5 +3227,6 @@ EVAL_SUITE_REACHED=1
   "${CASE_RESULTS[@]}" \
   --markdown-out "${ARTIFACT_DIR}/eval-verdict.md" \
   --json-out "${ARTIFACT_DIR}/eval-verdict.json") || SUITE_STATUS=$?
+run_rollback_roundtrip || true
 announce_suite_verdict "${SUITE_STATUS}" "${ARTIFACT_DIR}/eval-verdict.json" \
   "${ARTIFACT_DIR}/eval-verdict.md" "${TOTAL_DURATION}" || exit $?

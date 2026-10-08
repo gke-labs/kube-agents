@@ -51,6 +51,9 @@ type ActiveTask struct {
 	// retarget). A detached task no longer serializes the session; its events,
 	// if they ever arrive, still relay.
 	Detached bool `json:"detached,omitempty"`
+	// LineNote suffixes every render of the rolling line (taskStart.LineNote);
+	// on the record so a gateway restart keeps rendering it.
+	LineNote string `json:"lineNote,omitempty"`
 }
 
 // SessionRecord is one conversation's durable state in the session-state KV
@@ -85,6 +88,119 @@ type SessionRecord struct {
 	// session-routed addressees rotate per incarnation. Bounded; the
 	// stream's retention is the real horizon.
 	Tasks []TaskRef `json:"tasks,omitempty"`
+	// SessionAuthors is everyone whose text was published to the
+	// incarnation SessionAuthorsFor names: each turn's requester and each
+	// steer author, stored as TaskRequester (hashed, never the id),
+	// deduplicated, at most sessionAuthorCap. An incarnation's pod keeps what
+	// it was told, so a delegation from it is checked against all of them,
+	// not only the delegating turn's people. The set belongs to one
+	// BusSession: once BusSession moves on (any rotation or retirement), it
+	// is stale and the next add starts the new incarnation's (addSessionAuthor),
+	// which is the one place the reset happens. SessionAuthorsUnknown marks
+	// a set that no longer lists everyone (past the cap, or cleared by the
+	// ask bound); the incarnation's delegations are refused until a fresh
+	// one. SessionAuthorsSince is when the set's oldest entry was added,
+	// what the ask bound ages it by.
+	SessionAuthors        []TaskRequester `json:"sessionAuthors,omitempty"`
+	SessionAuthorsFor     string          `json:"sessionAuthorsFor,omitempty"`
+	SessionAuthorsUnknown bool            `json:"sessionAuthorsUnknown,omitempty"`
+	SessionAuthorsSince   time.Time       `json:"sessionAuthorsSince,omitzero"`
+}
+
+// sessionAuthorCap bounds SessionRecord.SessionAuthors. It holds a turn's
+// requester and a full steer list (1 + steerAuthorCap) with room for what a
+// wake carries over; past it the set is marked and the incarnation refuses
+// to delegate rather than drop an author.
+const sessionAuthorCap = 2 * steerAuthorCap
+
+// currentSessionAuthors makes the set the current incarnation's: a set
+// recorded for an earlier BusSession is dropped. This is the reset, and the
+// only one; every rotation or retirement moves BusSession, so none needs its
+// own.
+func (rec *SessionRecord) currentSessionAuthors() {
+	if rec.SessionAuthorsFor == rec.BusSession {
+		return
+	}
+	rec.SessionAuthors, rec.SessionAuthorsUnknown, rec.SessionAuthorsSince = nil, false, time.Time{}
+	rec.SessionAuthorsFor = rec.BusSession
+}
+
+// addSessionAuthor adds an author to the current incarnation's set: not
+// twice, and past the cap only as the mark.
+func (rec *SessionRecord) addSessionAuthor(a TaskRequester) {
+	if rec.BusSession == "" {
+		return
+	}
+	rec.currentSessionAuthors()
+	for _, have := range rec.SessionAuthors {
+		if have == a {
+			return
+		}
+	}
+	if len(rec.SessionAuthors) >= sessionAuthorCap {
+		rec.SessionAuthorsUnknown = true
+		return
+	}
+	if rec.SessionAuthorsSince.IsZero() {
+		rec.SessionAuthorsSince = time.Now().UTC()
+	}
+	rec.SessionAuthors = append(rec.SessionAuthors, a)
+}
+
+// addTurnToSession adds the people behind text published to the current
+// incarnation: the turn's requester and the steer authors its entry carries
+// (TaskRef.SteerAuthors), the mark if those overflowed.
+func (rec *SessionRecord) addTurnToSession(requester TaskRequester, steer []TaskRequester, steerOverflow bool) {
+	if rec.BusSession == "" {
+		return
+	}
+	rec.addSessionAuthor(requester)
+	for _, a := range steer {
+		rec.addSessionAuthor(a)
+	}
+	if steerOverflow {
+		rec.SessionAuthorsUnknown = true
+	}
+}
+
+// sessionAuthorsOf returns the current incarnation's set, with its mark and
+// age, for a caller about to rotate the incarnation (the wake).
+func (rec *SessionRecord) sessionAuthorsOf() (authors []TaskRequester, unknown bool, since time.Time) {
+	if rec.BusSession == "" || rec.SessionAuthorsFor != rec.BusSession {
+		return nil, false, time.Time{}
+	}
+	return append([]TaskRequester(nil), rec.SessionAuthors...), rec.SessionAuthorsUnknown, rec.SessionAuthorsSince
+}
+
+// seedSessionAuthors starts the current incarnation's set from another's.
+// The age carried is the older of the two, so nothing outlives the bound.
+func (rec *SessionRecord) seedSessionAuthors(authors []TaskRequester, unknown bool, since time.Time) {
+	if rec.BusSession == "" {
+		return
+	}
+	rec.currentSessionAuthors()
+	for _, a := range authors {
+		rec.addSessionAuthor(a)
+	}
+	rec.SessionAuthorsUnknown = rec.SessionAuthorsUnknown || unknown
+	if !since.IsZero() && (rec.SessionAuthorsSince.IsZero() || since.Before(rec.SessionAuthorsSince)) {
+		rec.SessionAuthorsSince = since
+	}
+}
+
+// TaskRequester is the turn's requester as the target's allowlist is checked
+// against it when this turn asks the gateway to mint a child task: the
+// backend it came in on and its Subject, the author id normalized for that
+// backend and HMAC'd under the install salt (requesterSubject). No plaintext
+// id is stored; the allowlist entries are hashed the same way, so the check
+// compares pseudonyms. On Google Chat it is the lowercased email's hash, so it
+// can differ from Attribution's requester.subject (the raw id's hash, which
+// the cross-surface audit join keys on); the two are not meant to join.
+// It lives in the session-state KV and never reaches the
+// bus; the bus carries Attribution. Cleared by the ask bound past AskTTL.
+type TaskRequester struct {
+	Backend string `json:"backend"`
+	Subject string `json:"subject"`
 }
 
 // TaskRef names one historical task and the authority it ran under: the
@@ -110,6 +226,169 @@ type TaskRef struct {
 	// the requester asked for" (terminal `canceled`) from "the executor
 	// died mid-work" (terminal `failed`) — assertion 13's distinction.
 	Canceled bool `json:"canceled,omitempty"`
+	// Requester, Attribution and StartedAt are what a child task minted on
+	// this turn's behalf, or the wake-up turn after it, inherits: the
+	// allowlist is checked against Requester, the child's authority block is
+	// Attribution with fresh grants, and StartedAt is what the AskTTL pass
+	// ages them by. Nil/zero on entries written before the fields existed.
+	Requester   *TaskRequester  `json:"requester,omitempty"`
+	Attribution json.RawMessage `json:"attribution,omitempty"`
+	StartedAt   time.Time       `json:"startedAt,omitzero"`
+	// SteerAuthors are the humans who steered this turn other than its
+	// requester, stored as Requester is (backend and requesterSubject: hashed,
+	// never the id), deduplicated, at most steerAuthorCap. Anyone in the room
+	// can steer a running turn, so a delegation from it is checked against
+	// each of them as well as the requester. A child carries its parent's, a
+	// wake its parent's and its child's, so a later delegation in the chain
+	// is checked against everyone who shaped it. SteerAuthorsOverflow marks a
+	// turn steered by more people than the cap holds; its delegation is
+	// refused rather than checked against a list that dropped someone.
+	// Cleared with Requester by the ask bound.
+	SteerAuthors         []TaskRequester `json:"steerAuthors,omitempty"`
+	SteerAuthorsOverflow bool            `json:"steerAuthorsOverflow,omitempty"`
+	// Role, ParentTaskID, Children and Depth are the delegation chain. A
+	// child is minted on a session turn's request and names it as parent; a
+	// wake turn is started on the child's terminal and names the child. Depth
+	// counts delegations: a child's is its parent's plus one, a wake inherits
+	// its child's, and a turn at the bound may not delegate again. Children
+	// is a slice although one child runs at a time, so fan-out is one
+	// condition later rather than a record migration. Role, ParentTaskID and
+	// Depth are empty on a human turn, and Children is empty on one that did
+	// not delegate; all four are empty on entries written before they
+	// existed.
+	// StatusMsgID is the rolling-line message of a turn that delegated:
+	// the child takes ActiveTask, and with it the only other copy, so the
+	// parent's line is kept here to close on the parent's terminal.
+	StatusMsgID  string   `json:"statusMsgId,omitempty"`
+	Role         string   `json:"role,omitempty"`
+	ParentTaskID string   `json:"parentTaskId,omitempty"`
+	Children     []string `json:"children,omitempty"`
+	Depth        int      `json:"depth,omitempty"`
+	// RootTaskID is the human (or door) turn a delegation chain started
+	// from: a human turn's own id, copied to its child and the wake after
+	// it, and down a longer chain unchanged. The adapter's observers know
+	// the whole chain by it (observedAs). Empty on entries written before
+	// it existed, which read as their own root.
+	RootTaskID string `json:"rootTaskId,omitempty"`
+	// Request is the human's text that started the chain, capped at
+	// wakeAskCap: a human turn's own message, and a wake's copy of its
+	// delegating turn's, so a wake of a wake still reads the human's
+	// question rather than the gateway-authored text of the wake before
+	// it. The wake opens with it (wakeText), because its pod starts with
+	// no memory. This is user CONTENT at rest on the bus, deliberately,
+	// under the same posture as ActiveTask.Ask: the same text already rides
+	// the TASKS stream in the submission envelope for the whole retention
+	// window, the gateway is the only user granted $KV.session-state.>, and
+	// the bucket keeps one revision. It outlives the terminal event (the
+	// wake needs it after the turn ends), so the independent age bound is
+	// the whole bound: AskTTL clears it with the requester copy
+	// (boundAskCopyAt). Empty on entries written before it existed, on a
+	// child, and once cleared.
+	Request string `json:"request,omitempty"`
+	// ChainEnd is set on a child whose end started no wake: the root
+	// terminal observeChildEnd announced, kept so the read route reports
+	// the same end for a settled chain (probeConversation). Nil otherwise.
+	ChainEnd *ChainEnd `json:"chainEnd,omitempty"`
+	// DelegationEnd is the reason a session turn that asked to delegate
+	// minted no child: `reason: delegation-refused - <the room's notice>`
+	// for a refusal, `reason: delegation-not-started - <why>` otherwise
+	// (the child could not reach the bus, the turn was stopped, the request
+	// was malformed, lost or unreadable). Written when the outcome is known
+	// (handleDelegateRequest, settleHandOff). The turn's own `completed` is
+	// then only the hand-off line, which is never a deliverable: toward an
+	// observer the turn ends failed with this reason and delivers nothing
+	// (handOffEnd), and the read route reports the same. Empty otherwise.
+	DelegationEnd string `json:"delegationEnd,omitempty"`
+}
+
+// handOffEnd is the one rule for a session turn's own end when it asked to
+// delegate: the hand-off line ("delegated to <addressee>") is never a
+// deliverable. For a turn with a DelegationEnd and no child, a `completed`
+// is replaced by failed with that reason, and nothing is delivered (the
+// caller skips the deliverable when ok). Any other state stands, and a turn
+// that minted a child ends quietly as the chain's parent (observedAs).
+// relayTerminal, the heal and the read route all decide through it, after
+// settleHandOff has written what the stream shows.
+func (rec *SessionRecord) handOffEnd(taskID string, state lib.TaskState) (lib.TaskState, string, bool) {
+	ref, ok := rec.TaskRefFor(taskID)
+	if !ok || ref.DelegationEnd == "" || len(ref.Children) > 0 || state != lib.StateCompleted {
+		return state, "", false
+	}
+	return lib.StateFailed, ref.DelegationEnd, true
+}
+
+// markDelegationEnd records why the task's delegate request minted no child,
+// keeping the first reason recorded.
+func (rec *SessionRecord) markDelegationEnd(taskID, reason string) {
+	for i := range rec.Tasks {
+		if rec.Tasks[i].ID == taskID && rec.Tasks[i].DelegationEnd == "" {
+			rec.Tasks[i].DelegationEnd = reason
+		}
+	}
+}
+
+// ChainEnd is a delegation chain's root terminal as the gateway announced it
+// when no wake followed the child.
+type ChainEnd struct {
+	State  lib.TaskState  `json:"state"`
+	Source TerminalSource `json:"source"`
+	Reason string         `json:"reason,omitempty"`
+}
+
+// rootID is the id the entry's chain is known by outside the gateway.
+func (ref TaskRef) rootID() string {
+	if ref.RootTaskID != "" {
+		return ref.RootTaskID
+	}
+	return ref.ID
+}
+
+// Task roles on TaskRef.Role; the empty role is a human turn.
+const (
+	taskRoleChild = "child"
+	taskRoleWake  = "wake"
+)
+
+// steerAuthorCap bounds TaskRef.SteerAuthors. Past it the entry is marked
+// (SteerAuthorsOverflow) and its delegation refused: dropping an author
+// silently would let the one it dropped through the check.
+const steerAuthorCap = 8
+
+// addSteerAuthor records a steer author on the entry: not the requester, not
+// twice, and past the cap only as the overflow mark.
+func (ref *TaskRef) addSteerAuthor(a TaskRequester) {
+	if ref.Requester != nil && *ref.Requester == a {
+		return
+	}
+	for _, have := range ref.SteerAuthors {
+		if have == a {
+			return
+		}
+	}
+	if len(ref.SteerAuthors) >= steerAuthorCap {
+		ref.SteerAuthorsOverflow = true
+		return
+	}
+	ref.SteerAuthors = append(ref.SteerAuthors, a)
+}
+
+// carrySteerAuthors adds every steer author of from (and its overflow mark)
+// to ref: how a child takes its parent's and a wake its parent's and child's.
+func (ref *TaskRef) carrySteerAuthors(from TaskRef) {
+	for _, a := range from.SteerAuthors {
+		ref.addSteerAuthor(a)
+	}
+	ref.SteerAuthorsOverflow = ref.SteerAuthorsOverflow || from.SteerAuthorsOverflow
+}
+
+// recordSteerAuthor adds a steer author to the history entry of taskID.
+func (rec *SessionRecord) recordSteerAuthor(taskID string, a TaskRequester) {
+	for i := range rec.Tasks {
+		if rec.Tasks[i].ID == taskID {
+			rec.Tasks[i].addSteerAuthor(a)
+			return
+		}
+	}
 }
 
 // MarkCanceled records a published cancel against the task's history entry.
@@ -127,6 +406,72 @@ func (rec *SessionRecord) MarkCanceled(taskID string) {
 func (rec *SessionRecord) TaskRefFor(taskID string) (TaskRef, bool) {
 	for _, ref := range rec.Tasks {
 		if ref.ID == taskID {
+			return ref, true
+		}
+	}
+	return TaskRef{}, false
+}
+
+// observedAs is the task id the adapter's observers know taskID by, and
+// whether taskID's own end is the end they are told. A delegation chain is
+// one task to them, its root (TaskRef.RootTaskID): a child is never named,
+// and neither is a turn that delegated, whose end is not the chain's. Every
+// other turn's end is its root's - a human turn is its own root, and a
+// wake that did not delegate ends the chain it continues. An id the record
+// does not hold is passed through as it is.
+func (rec *SessionRecord) observedAs(taskID string) (id string, ends bool) {
+	ref, ok := rec.TaskRefFor(taskID)
+	if !ok {
+		return taskID, true
+	}
+	return ref.rootID(), ref.Role != taskRoleChild && len(ref.Children) == 0
+}
+
+// delegationHandled reports whether the task's history entry shows a
+// delegate request of its was handled: a child linked, or a reason it
+// minted none (DelegationEnd). Both are written to the record when they are
+// made (startTaskWith's write for a mint, handleDelegateRequest's for the
+// rest), so the record holds either from the moment the request is decided.
+func (rec *SessionRecord) delegationHandled(taskID string) bool {
+	ref, ok := rec.TaskRefFor(taskID)
+	return ok && (len(ref.Children) > 0 || ref.DelegationEnd != "")
+}
+
+// mayHaveUnhandledDelegate reports whether the task is a session turn - not
+// a child, addressed to the record's own bus session - whose entry shows no
+// delegate request handled: the only kind of task whose fold can carry a
+// delegate request still to run.
+func (rec *SessionRecord) mayHaveUnhandledDelegate(taskID string) bool {
+	ref, ok := rec.TaskRefFor(taskID)
+	return ok && ref.Role != taskRoleChild && rec.BusSession != "" && ref.Addressee == rec.BusSession &&
+		len(ref.Children) == 0 && ref.DelegationEnd == ""
+}
+
+// chainLast follows a delegation chain from the turn that started it to its
+// last task: down each turn's last child to the wake that child started, until
+// a turn that did not delegate (the wake that ends the chain) or a child no
+// wake followed. false when root did not delegate, or a link has fallen off
+// the history cap.
+func (rec *SessionRecord) chainLast(root TaskRef) (TaskRef, bool) {
+	cur := root
+	for steps := 0; len(cur.Children) > 0 && steps <= taskHistoryCap; steps++ {
+		child, ok := rec.TaskRefFor(cur.Children[len(cur.Children)-1])
+		if !ok {
+			return TaskRef{}, false
+		}
+		wake, ok := rec.wakeOf(child.ID)
+		if !ok {
+			return child, true
+		}
+		cur = wake
+	}
+	return cur, cur.ID != root.ID
+}
+
+// wakeOf is the wake a child's end started, if any.
+func (rec *SessionRecord) wakeOf(childID string) (TaskRef, bool) {
+	for _, ref := range rec.Tasks {
+		if ref.Role == taskRoleWake && ref.ParentTaskID == childID {
 			return ref, true
 		}
 	}

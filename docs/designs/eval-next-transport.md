@@ -633,6 +633,19 @@ fan-out the script lists in the job log what the run left on that repository, cl
 With the flag unset both scripts are byte for byte what
 they were, and the presubmit's own tests hold that.
 
+Under the flag the run also checks the rollback path once the suite verdict is computed and
+before the final line announces it: `hack/rollback-roundtrip.sh` flips the install to `today`
+and back to `next`, with `spec.deployment.sidecars` unset before the first flip and declared
+again after the second, and asserts that the JetStream PVC and the bus creds Secret keep their
+UIDs, that the agent answers a turn under `today`, and that a task completes over the bus
+afterwards. It is reported, not gated: its own section of the log and two artifacts
+(`rollback-roundtrip.log`, `rollback-roundtrip.txt`), no case in the matrix, and no effect
+on the job's exit status. It is skipped when the job is too old for its one-hour bound to end
+inside the job's deadline, counted from its Prow `BUILD_ID` or, when that gives no start, from
+the eval script's own start plus an allowance for the deploy in front of it. The eval's gateway
+log and pod diagnostics are collected before it starts, because the flip replaces the pods
+they come from.
+
 The flag stays off by default for three reasons. Flipping the shared presubmit install changes
 what every pull request measures, and that is the eval crew's decision, not a script default.
 The next stack still has holes independent of any case (images in a private registry, and
@@ -642,8 +655,9 @@ running it: a scheduled lane on `main` under the flag, with a record of its own,
 presubmit. The flag admits that lane by name and nothing else without a pull request: section 2b
 of the deploy accepts `EVAL_MODE_NEXT=1` on a run that carries a `PULL_NUMBER` or whose `JOB_NAME`
 is one of the next lane's jobs (`EVAL_MODE_NEXT_JOB_NAMES` in `hack/ci-deploy.sh`, the on-demand
-presubmit and the periodic on main), and refuses it on any other Prow run, so the flag mis-set
-on the nightly or a postsubmit still stops the deploy before anything is built. The record of its
+presubmit, the periodic on main, and the full-catalog nightly that runs beside a today-mode nightly
+on the same agent model), and refuses it on any other Prow run, so the flag mis-set on the today
+nightly or a postsubmit still stops the deploy before anything is built. The record of its
 own does not exist yet: the baseline key has no mode field, so a next-mode sample appended to the
 store would be today's once written, and the dashboard has no next lane to file a run under. Until
 both exist, `hack/ci-eval-pr.sh` keeps every flagged run out of the baseline recorder and the
