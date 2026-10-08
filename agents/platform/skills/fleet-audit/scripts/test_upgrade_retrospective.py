@@ -129,7 +129,7 @@ class SelectionTest(unittest.TestCase):
         }}
 
     def test_new_cluster_is_first_seen_with_the_whole_window(self):
-        selected, unchanged = ur.select_clusters(self.clusters, ur.empty_ledger(), OPERATIONS, since=SINCE, forced=set())
+        selected, unchanged, _ = ur.select_clusters(self.clusters, ur.empty_ledger(), OPERATIONS, since=SINCE, forced=set())
         self.assertEqual({s.key for s in selected}, {SEEDED, GEMMA})
         self.assertEqual(unchanged, [])
         seeded = next(s for s in selected if s.key == SEEDED)
@@ -142,7 +142,7 @@ class SelectionTest(unittest.TestCase):
         ledger = copy.deepcopy(self.ledger_same)
         ledger["clusters"][SEEDED]["control_plane"] = "1.34.12-gke.1011000"
         ledger["clusters"][SEEDED]["node_pools"]["default-pool"] = "1.34.12-gke.1011000"
-        selected, unchanged = ur.select_clusters(self.clusters, ledger, [], since=SINCE, forced=set())
+        selected, unchanged, _ = ur.select_clusters(self.clusters, ledger, [], since=SINCE, forced=set())
         self.assertEqual([s.key for s in selected], [SEEDED])
         self.assertEqual(selected[0].status, "upgraded")
         self.assertIn("control plane 1.34.12-gke.1011000 -> 1.35.8-gke.1380001", selected[0].reasons)
@@ -152,18 +152,18 @@ class SelectionTest(unittest.TestCase):
     def test_upgraded_by_operation_since_last_run(self):
         ledger = copy.deepcopy(self.ledger_same)
         ledger["clusters"][SEEDED]["last_run"] = "2026-10-08T03:00:00Z"
-        selected, _ = ur.select_clusters(self.clusters, ledger, OPERATIONS, since=SINCE, forced=set())
+        selected, _, _ = ur.select_clusters(self.clusters, ledger, OPERATIONS, since=SINCE, forced=set())
         self.assertEqual([s.key for s in selected], [SEEDED])
         self.assertEqual(selected[0].reasons, ["2 upgrade operation(s) since 2026-10-08T03:00:00Z"])
         self.assertEqual([ur.operation_summary(o)["target"] for o in selected[0].operations], ["idle-batch-pool", "pinned-inference-pool"])
 
     def test_unchanged_cluster_is_listed_not_reviewed(self):
-        selected, unchanged = ur.select_clusters(self.clusters, self.ledger_same, OPERATIONS, since=SINCE, forced=set())
+        selected, unchanged, _ = ur.select_clusters(self.clusters, self.ledger_same, OPERATIONS, since=SINCE, forced=set())
         self.assertEqual(selected, [])
         self.assertEqual([(u["cluster"], u["last_run"]) for u in unchanged], [(GEMMA, "2026-10-08T10:00:00Z"), (SEEDED, "2026-10-08T10:00:00Z")])
 
     def test_forced_cluster_is_reviewed_even_if_unchanged(self):
-        selected, unchanged = ur.select_clusters(self.clusters, self.ledger_same, OPERATIONS, since=SINCE, forced={GEMMA})
+        selected, unchanged, _ = ur.select_clusters(self.clusters, self.ledger_same, OPERATIONS, since=SINCE, forced={GEMMA})
         self.assertEqual([s.key for s in selected], [GEMMA])
         self.assertEqual(selected[0].status, "forced")
         self.assertEqual(selected[0].reasons, ["forced by --cluster"])
@@ -177,7 +177,7 @@ class SelectionTest(unittest.TestCase):
         ops = copy.deepcopy(OPERATIONS)
         for op in ops:
             op["project"] = PROJECT
-        selected, _ = ur.select_clusters([other, twin], ur.empty_ledger(), ops, since=SINCE, forced=set())
+        selected, _, _ = ur.select_clusters([other, twin], ur.empty_ledger(), ops, since=SINCE, forced=set())
         by_key = {s.key: s for s in selected}
         self.assertEqual(len(by_key[SEEDED].operations), 4)
         self.assertEqual(by_key[f"other-project/{LOCATION}/seeded-a"].operations, [])
@@ -185,20 +185,20 @@ class SelectionTest(unittest.TestCase):
     def test_new_pool_is_not_an_upgrade(self):
         ledger = copy.deepcopy(self.ledger_same)
         del ledger["clusters"][SEEDED]["node_pools"]["idle-batch-pool"]
-        selected, unchanged = ur.select_clusters(self.clusters, ledger, [], since=SINCE, forced=set())
+        selected, unchanged, _ = ur.select_clusters(self.clusters, ledger, [], since=SINCE, forced=set())
         self.assertEqual(selected, [])
         self.assertEqual(len(unchanged), 2)
 
     def test_partial_read_reselects_the_cluster(self):
         ledger = copy.deepcopy(self.ledger_same)
         ledger["clusters"][SEEDED]["partial_read"] = "2026-10-08T12:00:00Z"
-        selected, _ = ur.select_clusters(self.clusters, ledger, [], since=SINCE, forced=set())
+        selected, _, _ = ur.select_clusters(self.clusters, ledger, [], since=SINCE, forced=set())
         self.assertEqual([(s.key, s.reasons) for s in selected], [(SEEDED, ["previous review at 2026-10-08T12:00:00Z read the cluster partially"])])
 
     def test_ledger_entry_never_reviewed_is_still_new(self):
         ledger = copy.deepcopy(self.ledger_same)
         ledger["clusters"][GEMMA]["last_run"] = None
-        selected, _ = ur.select_clusters(self.clusters, ledger, [], since=SINCE, forced=set())
+        selected, _, _ = ur.select_clusters(self.clusters, ledger, [], since=SINCE, forced=set())
         self.assertEqual([(s.key, s.status) for s in selected], [(GEMMA, "new")])
 
 
@@ -877,15 +877,79 @@ class LedgerAndGuardsTest(unittest.TestCase):
         self.assertEqual({g["id"] for g in fourth["guards"] if g["cluster"] == SEEDED}, before)
         self.assertTrue(fourth["reviews"][0]["reviewed"])
 
-    def test_corrupt_or_foreign_state_is_set_aside_not_overwritten(self):
-        (self.home / ur.GUARDS_FILENAME).write_text("{not json")
+    def test_corrupt_or_foreign_state_is_set_aside_and_the_run_refused(self):
         (self.home / ur.LEDGER_FILENAME).write_text(json.dumps({"version": 99, "clusters": {"keep": {}}}))
-        self.collect()
-        aside = sorted(p.name for p in self.home.glob("*.unreadable-*"))
-        self.assertEqual(len(aside), 2, aside)
-        self.assertIn("{not json", next(p for p in self.home.glob(ur.GUARDS_FILENAME + ".unreadable-*")).read_text())
-        self.assertEqual(json.loads(next(p for p in self.home.glob(ur.LEDGER_FILENAME + ".unreadable-*")).read_text())["version"], 99)
+        with self.assertRaises(ur.StateUnreadable):
+            self.collect()
+        aside = next(p for p in self.home.glob(ur.LEDGER_FILENAME + ".unreadable-*"))
+        self.assertEqual(json.loads(aside.read_text())["version"], 99)
+        self.assertFalse((self.home / ur.LEDGER_FILENAME).exists())
+        self.assertFalse((self.home / ur.GUARDS_FILENAME).exists())
+        # Through main: one line, exit 2, nothing written; a missing ledger is a first run.
+        (self.home / ur.GUARDS_FILENAME).write_text("{not json")
+        with mock.patch.object(ur, "default_run", FakeFleet()), mock.patch.object(ur, "now_utc", lambda: NOW):
+            with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()) as err:
+                rc = ur.main(["--project", PROJECT, "--no-report"])
+        self.assertEqual(rc, ur.EXIT_USAGE)
+        self.assertIn("crash record, not a re-baseline", err.getvalue())
+        self.assertFalse((self.home / ur.LEDGER_FILENAME).exists())
+        with mock.patch.object(ur, "default_run", FakeFleet()), mock.patch.object(ur, "now_utc", lambda: NOW):
+            with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                rc = ur.main(["--project", PROJECT, "--no-report"])
+        self.assertEqual(rc, 0)
         self.assertEqual(ur.load_json(self.home / ur.LEDGER_FILENAME, {})["version"], ur.LEDGER_VERSION)
+
+    def test_lock_makes_a_second_run_exit_quietly(self):
+        lock_path = self.home / ur.LOCK_FILENAME
+        held = ur.acquire_lock(lock_path)
+        self.assertIsNotNone(held)
+        try:
+            with mock.patch.object(ur, "default_run", FakeFleet()), mock.patch.object(ur, "now_utc", lambda: NOW):
+                with redirect_stdout(io.StringIO()) as out, redirect_stderr(io.StringIO()):
+                    rc = ur.main(["--project", PROJECT])
+            self.assertEqual(rc, 0)
+            self.assertEqual(out.getvalue().strip(), ur.lock_held_line(lock_path))
+            self.assertIn("another retrospective run holds", out.getvalue())
+            self.assertFalse((self.home / ur.LEDGER_FILENAME).exists())
+            self.assertFalse((self.home / ur.REPORTS_SUBDIR).exists())
+            # A dry run takes no lock and still prints its report.
+            with mock.patch.object(ur, "default_run", FakeFleet()), mock.patch.object(ur, "now_utc", lambda: NOW):
+                with redirect_stdout(io.StringIO()) as out, redirect_stderr(io.StringIO()):
+                    rc = ur.main(["--project", PROJECT, "--dry-run"])
+            self.assertEqual(rc, 0)
+            self.assertIn(ur.SECTION_ERRORS, out.getvalue())
+        finally:
+            held.close()
+        with mock.patch.object(ur, "default_run", FakeFleet()), mock.patch.object(ur, "now_utc", lambda: NOW):
+            with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                self.assertEqual(ur.main(["--project", PROJECT, "--no-report"]), 0)
+        self.assertTrue((self.home / ur.LEDGER_FILENAME).exists())
+
+    def test_in_flight_operation_holds_the_cluster_back(self):
+        ops = copy.deepcopy(OPERATIONS)
+        running = next(o for o in ops if o["operationType"] == "UPGRADE_NODES" and "/clusters/seeded-a/nodePools/pinned-inference-pool" in o["targetLink"])
+        running["status"], running["endTime"] = "RUNNING", None
+        result, fleet = self.collect(FakeFleet(operations=ops))
+        self.assertEqual([r["cluster"] for r in result["reviews"]], [GEMMA])
+        self.assertEqual([(u["cluster"], u["operation"]["type"], u["operation"]["target"]) for u in result["upgrading"]], [(SEEDED, "UPGRADE_NODES", "pinned-inference-pool")])
+        self.assertFalse(any(c[0] == "kubectl" and "seeded-a" in (c[-1] if False else " ".join(c)) for c in fleet.calls))
+        self.assertFalse(any("seeded-a" in c for c in fleet.calls if "get-credentials" in c))
+        self.assertEqual({g["cluster"] for g in result["guards"]}, {GEMMA})
+        self.assertNotIn(SEEDED, ur.load_json(self.home / ur.LEDGER_FILENAME, {})["clusters"])
+        report = ur.render_report(result)
+        self.assertIn(f"{ur.INFO_UPGRADING}\n\n- {SEEDED}: upgrading now (UPGRADE_NODES pinned-inference-pool since 2026-10-08T04:20:35Z); reviewed on the next run", report)
+        # Once it ends inside the window the cluster is reviewed as new.
+        running["status"], running["endTime"] = "DONE", "2026-10-08T05:24:10Z"
+        again, _ = self.collect(FakeFleet(operations=ops))
+        self.assertIn(SEEDED, [r["cluster"] for r in again["reviews"]])
+
+    def test_only_terminal_operations_ending_in_the_window_count(self):
+        ops = copy.deepcopy(ops_for("seeded-a"))
+        ops[0]["endTime"] = "2026-09-01T00:00:00Z"  # the master upgrade ended before the window
+        ops[0]["startTime"] = "2026-08-31T23:00:00Z"
+        selected, _, upgrading = ur.select_clusters([cluster_doc("seeded-a")], ur.empty_ledger(), ops, since=SINCE, forced=set())
+        self.assertEqual(upgrading, [])
+        self.assertEqual([ur.operation_summary(o)["target"] for o in selected[0].operations], ["default-pool", "idle-batch-pool", "pinned-inference-pool"])
 
     def test_deleted_cluster_drops_its_ledger_entry_and_guards(self):
         self.collect()
@@ -1154,7 +1218,28 @@ class ReportTest(unittest.TestCase):
         self.assertEqual(link.name, "upgrade-retro-report.md")
         self.assertFalse(list(report_path.parent.glob("*.tmp*")))
         self.assertTrue((home / "out.json").exists())
+        self.assertNotIn("report", json.loads((home / "out.json").read_text()))
         self.assertTrue((home / ur.GUARDS_FILENAME).exists())
+
+    def test_writes_are_ordered_report_then_guards_then_ledger(self):
+        home = Path(self.tmp.name)
+        order = []
+        real = ur.write_json_atomically
+
+        def spy(path, doc):
+            order.append(path.name)
+            if path.name == ur.LEDGER_FILENAME:
+                raise OSError("disk full")
+            return real(path, doc)
+
+        with mock.patch.object(ur, "default_run", FakeFleet()), mock.patch.object(ur, "now_utc", lambda: NOW), mock.patch.object(ur, "write_json_atomically", spy):
+            with redirect_stderr(io.StringIO()), redirect_stdout(io.StringIO()):
+                with self.assertRaises(OSError):
+                    ur.main(["--project", PROJECT, "--output", str(home / "out.json")])
+        self.assertEqual(order, ["out.json", ur.GUARDS_FILENAME, ur.LEDGER_FILENAME])
+        self.assertTrue((home / ur.REPORTS_SUBDIR / ur.LATEST_REPORT_LINK).exists())
+        self.assertTrue((home / ur.GUARDS_FILENAME).exists())
+        self.assertFalse((home / ur.LEDGER_FILENAME).exists())
 
     def test_main_dry_run_prints_but_writes_nothing(self):
         home = Path(self.tmp.name)
