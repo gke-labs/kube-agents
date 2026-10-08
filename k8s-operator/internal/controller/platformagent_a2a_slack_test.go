@@ -530,7 +530,11 @@ func TestNoEgressPolicySelectsTheGatewayPod(t *testing.T) {
 		matched++
 		for _, pt := range pol.Spec.PolicyTypes {
 			if pt == networkingv1.PolicyTypeEgress {
-				t.Errorf("%s fences the gateway pod's egress; Slack's websocket and Web API need admitting in it", pol.Name)
+				if pol.Name == fqdnPolicy.GetName() {
+					t.Errorf("%s fences the gateway pod's egress; the FQDN policy must not select the A2A gateway pod without this test being rewritten to read its patterns", pol.Name)
+				} else {
+					t.Errorf("%s fences the gateway pod's egress; Slack's websocket and Web API need admitting in it", pol.Name)
+				}
 			}
 		}
 	}
