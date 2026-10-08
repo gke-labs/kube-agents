@@ -106,6 +106,7 @@ Both cases converge on the same delivery path: the `no_agent` delivery job posts
 
 1. **Turn 1 (`pre_llm_call`):** With `is_first_turn=True` and a supported durable chat adapter, the plugin:
    - binds the delivery job to this chat — reads `HERMES_SESSION_PLATFORM` / `HERMES_SESSION_CHAT_ID` / `HERMES_SESSION_THREAD_ID` and calls `update_job("bootstrap-inventory-delivery", {"deliver": "origin", "origin": {...}})` — **before** touching `.user_aligned`, so the job can never fire against a stale target;
+   - makes this chat the platform's home channel when none is configured, through Hermes' `persist_home_channel` and the `GOOGLE_CHAT_HOME_CHANNEL` / `SLACK_HOME_CHANNEL` mirror in `.env`, as `/sethome` does. `deliver: chat` jobs and the chat relay post there, and a fresh install has no home channel until someone sets one, so without this every scheduled report is dropped. A channel already set by `/sethome`, the operator's overlay or an env var is left alone. The home channel is the space, without the opening message's thread, so each scheduled report starts its own thread;
    - touches `/opt/data/.user_aligned`;
    - calls `trigger_job("bootstrap-inventory-delivery")` so it fires on the next tick;
    - writes `.bootstrap_greeted` so no later session repeats any of the above;
@@ -359,6 +360,7 @@ Unit tests cover the deterministic pieces of the flow (they mock the Hermes
 - `test_plugin.py` — the `pre_llm_call` state machine: durable-platform,
   cron/first-turn/completed gating, greeting exactly once across sessions, origin binding before
   `.user_aligned` (and no markers at all when nothing can be bound), the
+  home channel set on the first durable turn and only when none is configured, the
   delivery trigger, that the inventory is never injected into the turn, and the eval seam
   (phrase-matched, answered again on a retry, no side effects, inert when absent).
 - `../../../scripts/test_bootstrap_onboarding_scripts.py` — the delivery

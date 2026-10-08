@@ -9,6 +9,7 @@ plugin's side effects (origin binding, delivery trigger, presence marker) and
 the greeting context it returns.
 """
 
+import enum
 import json
 import subprocess
 import sys
@@ -24,6 +25,11 @@ import plugin  # noqa: E402
 
 # The one bench stack that writes the eval seam's marker.
 EVAL_STACK_DIR = "bench/tf/prebuilt/first-install-hello/"
+
+
+class _Platform(enum.Enum):
+    GOOGLE_CHAT = "google_chat"
+    SLACK = "slack"
 
 
 def _fake_session_env(**values):
@@ -219,6 +225,81 @@ class PreLlmCallTest(unittest.TestCase):
         # ...and a real chat turn afterwards still gets its greeting.
         self.assertIsNotNone(self._call())
         self.assertTrue((self.data_dir / ".user_aligned").exists())
+
+    # --- the home channel ------------------------------------------------
+
+    def _arm_home_channel(self, configured=None, persist_error=None):
+        """Install doubles for Hermes' home-channel API; returns (persist, save_env_value).
+
+        HomeChannel is a recorder that returns its keyword arguments, so the
+        persisted value is the exact set of fields the plugin passed.
+        """
+        gateway_config = mock.MagicMock()
+        gateway_config.get_home_channel.return_value = configured
+        persist = mock.MagicMock(side_effect=persist_error)
+        save_env_value = mock.MagicMock()
+        for name, value in (
+            ("HomeChannel", lambda **fields: fields),
+            ("Platform", _Platform),
+            ("load_gateway_config", mock.MagicMock(return_value=gateway_config)),
+            ("persist_home_channel", persist),
+            ("save_env_value", save_env_value),
+        ):
+            patcher = mock.patch.object(plugin, name, value, create=True)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        return persist, save_env_value
+
+    def test_first_durable_turn_sets_the_home_channel(self):
+        persist, save_env_value = self._arm_home_channel()
+        self._call()
+        persist.assert_called_once()
+        (home,), _ = persist.call_args
+        self.assertEqual(home["platform"], _Platform.GOOGLE_CHAT)
+        self.assertEqual(home["chat_id"], "spaces/AAA")
+        # Scheduled reports start their own threads, not the opening message's.
+        self.assertNotIn("thread_id", home)
+        save_env_value.assert_any_call("GOOGLE_CHAT_HOME_CHANNEL", "spaces/AAA")
+        save_env_value.assert_any_call("GOOGLE_CHAT_HOME_CHANNEL_THREAD_ID", "")
+
+    def test_configured_home_channel_is_left_alone(self):
+        persist, save_env_value = self._arm_home_channel(configured=mock.sentinel.home)
+        self.assertIsNotNone(self._call())
+        persist.assert_not_called()
+        save_env_value.assert_not_called()
+
+    def test_non_durable_turn_sets_no_home_channel(self):
+        persist, save_env_value = self._arm_home_channel()
+        with mock.patch.object(
+            plugin, "get_session_env", _fake_session_env(HERMES_SESSION_PLATFORM="cli", HERMES_SESSION_CHAT_ID="c1")
+        ):
+            self._call(platform="cli")
+        self._call(platform="test-local-surface-01")
+        persist.assert_not_called()
+        save_env_value.assert_not_called()
+
+    def test_home_channel_has_every_field_load_gateway_config_reads(self):
+        # HomeChannel.from_dict indexes platform and chat_id; a block missing
+        # one raises out of load_gateway_config for every platform.
+        persist, _ = self._arm_home_channel()
+        with mock.patch.object(
+            plugin,
+            "get_session_env",
+            _fake_session_env(HERMES_SESSION_PLATFORM="google_chat", HERMES_SESSION_CHAT_ID="spaces/AAA"),
+        ):
+            self._call()
+        persist.assert_called_once()
+        (home,), _ = persist.call_args
+        for field in ("platform", "chat_id", "name"):
+            self.assertTrue(home.get(field), f"{field} is empty")
+        self.assertEqual(home["name"], "spaces/AAA")
+
+    def test_failed_home_channel_write_still_primes_onboarding(self):
+        _, save_env_value = self._arm_home_channel(persist_error=OSError("read-only"))
+        self.assertIn("SCAN IN PROGRESS", self._call()["context"])
+        self.trigger_job.assert_called_once()
+        self.assertTrue((self.data_dir / ".user_aligned").exists())
+        save_env_value.assert_not_called()
 
     # --- the eval seam ----------------------------------------------------
 
