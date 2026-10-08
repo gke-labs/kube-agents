@@ -1976,6 +1976,15 @@ class StartTest(_RuntimeCase):
         self._status(adapter, "")
         self.assertEqual(self._sent(adapter), ["processing", "closed"])
 
+    def test_a_card_waiting_on_its_parents_alone_holds_nothing(self):
+        # Its parent is not the thread's to watch, a scheduled card say, so it may not start for hours.
+        adapter = _Adapter()
+        self._expect(adapter, waiting=("t_after",))
+        self._status(adapter, "")
+        self.assertEqual(self._sent(adapter), ["closed"])
+        self._start(adapter, task="t_after", title="after the window")
+        self.assertEqual(self._sent(adapter), ["closed", "processing"], "its row holds it once it starts")
+
     def test_a_card_starting_on_its_own_holds_beside_a_card_that_waits_on_you(self):
         adapter = _Adapter()
         self._expect(adapter, "t_a", "t_b")

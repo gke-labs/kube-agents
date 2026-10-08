@@ -631,9 +631,16 @@ class RuntimeTest(unittest.TestCase):
         self.assertEqual(adapter.calls, [("hammer_and_wrench", False), ("x", False), ("hammer_and_wrench", True)])
 
     def test_a_turn_that_opened_cards_holds_working_for_those_about_to_start(self):
-        board = {**_cards("t_a"), **_cards("t_b", status="todo"), **_cards("t_later", status="scheduled")}
+        board = {
+            **_cards("t_a"), **_cards("t_ready", status="ready"),
+            **_cards("t_b", status="todo"), **_cards("t_later", status="scheduled"),
+        }
         self._turn("fix it", _cards("t_old"), {**_cards("t_old"), **board})
-        self.assertEqual(self.expected, [(CHANNEL, TEAM, THREAD, {"t_a": True, "t_b": False})], "t_b waits on its parents")
+        self.assertEqual(
+            self.expected,
+            [(CHANNEL, TEAM, THREAD, {"t_a": True, "t_b": False, "t_ready": True})],
+            "t_b waits on its parents",
+        )
 
     def test_a_direct_answer_holds_nothing(self):
         self._turn("what now?", _cards("t_old"), _cards("t_old"))

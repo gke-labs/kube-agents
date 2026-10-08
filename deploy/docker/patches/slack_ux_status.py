@@ -448,12 +448,16 @@ def _running(plan: _Plan) -> bool:
 def _expecting(plan: _Plan) -> bool:
     """Whether an expected card holds ``processing``: one about to start, or one waiting on its parents.
 
-    A card waiting on its parents holds only while nothing on the plan waits on
-    a person (:func:`_kept`): behind a card blocked on the user, or one that gave
-    up, it may never start, and the session suspends or closes as it would
-    without it.
+    A card waiting on its parents holds only beside a card of the thread's on
+    the plan, an expected one or one with a row or rolling, which may be its
+    parent; alone it may wait on a card that runs hours later, such as a
+    scheduled one. And only while nothing on the plan waits on a person
+    (:func:`_kept`): behind a card blocked on the user, or one that gave up, it
+    may never start, and the session suspends or closes as it would without it.
     """
-    return any(plan.pending.values()) or (bool(plan.pending) and not _kept(plan))
+    if any(plan.pending.values()):
+        return True
+    return bool(plan.pending) and bool(plan.rows or plan.rolling) and not _kept(plan)
 
 
 def _waiting(plan: _Plan) -> bool:
