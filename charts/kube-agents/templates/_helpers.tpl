@@ -479,6 +479,23 @@ absent renders no max_tokens).
   ceiling on one that does; values.yaml says what that means for the agent.
 */}}
 {{- $maxTokens := int (.maxTokens | default 0) -}}
+{{- /*
+  Recent Claude models (Opus 5 among them) answer temperature, top_p and top_k
+  with a 400 ("`temperature` is deprecated for this model"), and LiteLLM
+  refuses a temperature other than 1 for them before the request leaves the
+  gateway. A caller does not have to be configured by this chart to send one:
+  Hindsight needed its own opt-out (hindsight.yaml), and Hermes's auxiliary
+  title generator sent temperature until the profiles disabled it. LiteLLM's
+  per-deployment additional_drop_params
+  strips the named keys from a request before the provider sees it, whatever
+  the caller sent, so the gateway covers every caller at once. Every Claude
+  model, not only the ones that refuse: a name test that tracked which do
+  would break on each new release, and an older Claude losing a caller's
+  sampling override is a quieter failure than a 400. Claude only: anthropic
+  serves nothing else, vertex_ai serves Claude under claude-* names, and a
+  Gemini or OpenAI render stays byte-identical.
+*/}}
+{{- $claude := or (eq .provider "anthropic") (and (eq .provider "vertex_ai") (hasPrefix "claude-" .model)) -}}
 model_list:
   - model_name: model-default
     litellm_params:
@@ -486,17 +503,26 @@ model_list:
       {{- if gt $maxTokens 0 }}
       max_tokens: {{ $maxTokens }}
       {{- end }}
+      {{- if $claude }}
+      additional_drop_params: ["temperature", "top_p", "top_k"]
+      {{- end }}
   - model_name: hermes-agent
     litellm_params:
       model: {{ printf "%s/%s" .provider .model }}
       {{- if gt $maxTokens 0 }}
       max_tokens: {{ $maxTokens }}
       {{- end }}
+      {{- if $claude }}
+      additional_drop_params: ["temperature", "top_p", "top_k"]
+      {{- end }}
   - model_name: {{ .model }}
     litellm_params:
       model: {{ printf "%s/%s" .provider .model }}
       {{- if gt $maxTokens 0 }}
       max_tokens: {{ $maxTokens }}
+      {{- end }}
+      {{- if $claude }}
+      additional_drop_params: ["temperature", "top_p", "top_k"]
       {{- end }}
 litellm_settings:
   callbacks: {{ .callbacks }}

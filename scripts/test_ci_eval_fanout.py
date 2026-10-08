@@ -290,6 +290,10 @@ EVAL_CLUSTER_NAME=c; EVAL_DEFAULT_LOCATION=l; SEEDED_TASK_CLUSTER=; SEEDED_TASK_
             # this helper (the inject lane's copy, or the file under
             # bench/tasks/); with no lane directory set it is the identity.
             lifted("unit_task_path"),
+            # The count of finished repetitions the unit reads under its
+            # task lock, and the unwinding its skip paths share.
+            lifted("finished_rep_count"),
+            lifted("skip_unit"),
             lifted("run_one_unit"),
             self.UNIT_STUBS,
             extra,
@@ -393,12 +397,18 @@ EVAL_CLUSTER_NAME=c; EVAL_DEFAULT_LOCATION=l; SEEDED_TASK_CLUSTER=; SEEDED_TASK_
     def test_the_state_files_are_written_under_the_task_lock(self):
         unit = lifted("run_one_unit")
         written = unit.index('> "${STATE_DIR}/${name}.rep${rep}.end"')
-        counted = unit.index("finished_reps=$((finished_reps + 1))")
+        counted = unit.index('finished_reps="$(finished_rep_count "${name}")"')
         # The last release: the early ones are the give-up paths.
         released = unit.rindex('lock_release "${STATE_DIR}/lock-task-${name}"')
         self.assertLess(written, counted)
         self.assertLess(counted, released)
         self.assertLess(released, unit.index('finish_case "${task}" "${name}"'))
+        # A repetition the launcher could not start writes its record and is
+        # counted the same way, under the lock, before it lets go.
+        skip = lifted("skip_unit")
+        self.assertLess(skip.index('record_unit_not_run "${name}"'), skip.index("finished_rep_count"))
+        self.assertLess(skip.index("finished_rep_count"), skip.index('lock_release "${STATE_DIR}/lock-task-${name}"'))
+        self.assertLess(skip.index('lock_release "${STATE_DIR}/lock-task-${name}"'), skip.index('finish_case "${task}" "${name}"'))
 
     FINISH_STUBS = """
 lock_acquire() { echo "lock $(basename "$1")"; }

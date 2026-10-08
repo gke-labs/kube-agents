@@ -51,12 +51,29 @@ func startA2ARig(t *testing.T) *a2aRig {
 // itself, or the door under the composite the shipped gateway builds.
 func startA2ARigWith(t *testing.T, stack func(*A2ADoor) Adapter) *a2aRig {
 	t.Helper()
-	return startA2ARigOpts(t, stack, nil, nil)
+	return startA2ARigTuned(t, stack, a2aRigTuning{})
 }
 
 // startA2ARigOpts is startA2ARigWith with a session spawner (nil: none) and
 // a hook into the Config before New sees it.
 func startA2ARigOpts(t *testing.T, stack func(*A2ADoor) Adapter, spawn *fakeSpawner, tweak func(*Config)) *a2aRig {
+	t.Helper()
+	return startA2ARigTuned(t, stack, a2aRigTuning{spawn: spawn, config: tweak})
+}
+
+// a2aRigTuning holds startA2ARigTuned's hooks. Each runs at its point in
+// the build, before the gateway starts serving, so what it writes needs no
+// lock; nil leaves the default.
+type a2aRigTuning struct {
+	doorOptions func(*A2ADoorOptions)
+	builtDoor   func(*A2ADoor)
+	config      func(*Config)
+	// spawn, when set, is the gateway's session spawner.
+	spawn *fakeSpawner
+}
+
+// startA2ARigTuned is startA2ARigWith with a2aRigTuning's hooks.
+func startA2ARigTuned(t *testing.T, stack func(*A2ADoor) Adapter, tune a2aRigTuning) *a2aRig {
 	t.Helper()
 	s := startServer(t)
 	url := s.ClientURL()
@@ -89,14 +106,21 @@ func startA2ARigOpts(t *testing.T, stack func(*A2ADoor) Adapter, spawn *fakeSpaw
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
-	door, err := NewA2ADoor(ln.Addr().String(), a2aTestToken, A2ADoorOptions{
+	doorOpts := A2ADoorOptions{
 		PublicURL:        a2aTestPublicURL,
 		DefaultAddressee: "platform",
-	})
+	}
+	if tune.doorOptions != nil {
+		tune.doorOptions(&doorOpts)
+	}
+	door, err := NewA2ADoor(ln.Addr().String(), a2aTestToken, doorOpts)
 	if err != nil {
 		t.Fatalf("NewA2ADoor: %v", err)
 	}
 	door.listener = ln
+	if tune.builtDoor != nil {
+		tune.builtDoor(door)
+	}
 
 	salt := []byte("test-salt")
 	cfg := &Config{
@@ -110,12 +134,12 @@ func startA2ARigOpts(t *testing.T, stack func(*A2ADoor) Adapter, spawn *fakeSpaw
 		FirstEventGrace:         a2aTestGrace,
 		AttributionSalt:         salt,
 	}
-	if tweak != nil {
-		tweak(cfg)
+	if tune.config != nil {
+		tune.config(cfg)
 	}
 	opts := Options{Client: client, Adapter: stack(door), Config: cfg}
-	if spawn != nil {
-		opts.Spawner = spawn
+	if tune.spawn != nil {
+		opts.Spawner = tune.spawn
 	}
 	g, err := New(opts)
 	if err != nil {

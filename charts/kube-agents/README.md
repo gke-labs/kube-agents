@@ -220,7 +220,10 @@ uses Workload Identity (below); `litellm.modelDefaultName`
 overrides the per-provider default model; `litellm.maxTokens` (default `0`,
 meaning none) puts a `max_tokens` under every alias for a request that names
 none, which a self-hosted backend with one combined prompt-plus-output budget
-needs — a request's own `max_tokens` still wins. Set `litellm.enabled=false`
+needs — a request's own `max_tokens` still wins. On a Claude model the gateway
+drops `temperature`, `top_p` and `top_k` from every request
+([why](https://gke-labs.github.io/kube-agents/concepts/inference-gateway/#setting-the-default-model)).
+Set `litellm.enabled=false`
 only if you operate your own gateway at that address. LLM-call telemetry is
 opt-in (`litellm.otel=true`) — enable it only on clusters that run a reachable
 collector, since without one the otel callback aborts every LLM request on DNS

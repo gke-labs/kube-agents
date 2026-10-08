@@ -18,7 +18,8 @@
 # four audits were started.
 #
 # arm.py (beside this file) files two archived stand-in cards, a sweep and a
-# ranking card after it, points `.bootstrap_scan_filed` at the sweep, removes
+# ranking card after it, points `.bootstrap_scan_filed` at the sweep and the
+# hand-off's `.bootstrap_handoff_filed` at the ranking card, removes
 # `.oobe_audits_fired`, and puts back the `oobe` job when the deployed image ships
 # one: an install that finished onboarding before the job existed never got it.
 # An image without the job gets nothing put back, so nothing starts the audits.
@@ -37,7 +38,7 @@
 # (hack/ci-eval-pr.sh: wait_platform_runs). Run by hand, without the runner, the
 # stage itself holds its first mark until an earlier repetition's audit has ended.
 #
-# The teardown, and the exit trap on a failed apply, run disarm.py: both markers
+# The teardown, and the exit trap on a failed apply, run disarm.py: the markers
 # go back as they were and the `oobe` job comes out if this stack put it there.
 # The audits the stage started are left to finish. Each writes its ledger issue in
 # the install's GitOps repository and posts its summary where it always does.

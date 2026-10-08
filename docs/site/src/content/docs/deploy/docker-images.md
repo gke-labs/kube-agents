@@ -98,7 +98,7 @@ Needed only to rebuild the images above from source, not to run an install. Each
 | `node` | `docker.io/library/node` | `22-slim` | `NODE_IMAGE` | a2a/Dockerfile.worker runtime stage and a2a/Dockerfile.console page build stage. |
 | `python` | `docker.io/library/python` | `3.14-slim` | `PYTHON_IMAGE` | examples/inference-replay/replay-proxy/Dockerfile and deploy/sandbox/Dockerfile. |
 | `distroless-static` | `gcr.io/distroless/static` | `nonroot` | `DISTROLESS_IMAGE` | k8s-operator/Dockerfile, a2a/Dockerfile.authcallout, a2a/Dockerfile.gateway, a2a/Dockerfile.verifier and a2a/Dockerfile.console runtime stages. |
-| `busybox` | `docker.io/library/busybox` | `musl@sha256:32b5cdad7cce41dfd53d0ae06baebcf8357a147ee7694dc706911c373bc30c37` | — | agentplugins/*/Dockerfile base images. |
+| `busybox` | `docker.io/library/busybox` | `musl@sha256:ea2b9914a16a4ac1981994af97b318f7c7d4db76b580c56177f08bf76f4a0be8` | — | agentplugins/*/Dockerfile base images. |
 
 <!-- prettier-ignore-end -->
 <!-- END GENERATED: container-images -->

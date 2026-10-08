@@ -401,9 +401,10 @@ says how to read its manifest and what is still yours to write — the upgrade a
 stream, whose `governance/security_patch_orchestrator_sop.md` §3 does the same, and the three
 streams `collect.py` covers: compliance (`governance/compliance_audit_sop.md` §2), obtainability
 (`governance/obtainability_audit_sop.md` §2) and AI security (`governance/ai_security_audit_sop.md`
-§3), the cost stream (`fleet_waste.py`, `governance/fleet_wide_cost_analysis_sop.md` §2) and the
-stockout stream (`fleet_stockout.py`, `governance/stockout_prevention_sop.md` §3).
-The compliance, obtainability, stockout and cost collectors may also give a target `checks_unevaluated`,
+§3), the cost stream (`fleet_waste.py`, `governance/fleet_wide_cost_analysis_sop.md` §2), the
+stockout stream (`fleet_stockout.py`, `governance/stockout_prevention_sop.md` §3) and the GCE
+compute stream (`compute_fleet_audit.py`, `governance/gce_compute_fleet_sop.md` §2).
+The compliance, obtainability, stockout, cost and GCE compute collectors may also give a target `checks_unevaluated`,
 `{check, reason}` for a check whose own read failed or whose inputs could not decide it: it did not run and is not inapplicable, so it
 goes in neither `checks_run` nor `checks_not_applicable` but in that target's `limitations`, which
 keeps the run partial and leaves open every finding that check filed there. `finish` rejects the
@@ -642,7 +643,9 @@ field, and publishes nothing:
     into `audit_report.py`, and anything under eight characters are all rejected. One command per
     entry — the one that produced the evidence, not a summary of your approach.
 
-  An empty list is rejected too, unless that cluster's `limitations` says why nothing ran.
+  An empty list is rejected too, unless that cluster's `limitations` says why nothing ran, or, on a
+  collector stream (above), every check it is answerable for is in its `checks_not_applicable` with a
+  reason and the manifest names it as collected (that one adds no gap).
   Enumerating a cluster and checking nothing on it is not a clean cluster — it is an audit that did
   not happen, and without this field the harness cannot tell the two apart. See
   [Scope, skipped, and limitations](#scope-skipped-and-limitations).

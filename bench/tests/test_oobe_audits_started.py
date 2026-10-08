@@ -261,6 +261,30 @@ def test_a_red_names_what_the_stage_held_skipped_or_gave_up(store: Store) -> Non
     assert "the stage skipped the first-run audits: no GitOps repository is configured" in _verify().reason
 
 
+def test_an_adopted_audit_counts_as_had_and_stays_out_of_the_chain(store: Store) -> None:
+    # A scheduled compliance run completed after the arm while cost ran; the stage passed over it.
+    store.arm()
+    recorded = json.loads(store.marker.read_text())
+    recorded["adopted"] = [oobe.FIRST_RUN_AUDITS[1]]
+    store.marker.write_text(json.dumps(recorded))
+    store.chain(ARMED + timedelta(minutes=1))
+    with sqlite3.connect(store.db) as con:
+        con.execute("DELETE FROM executions WHERE job_id = ?", (oobe.FIRST_RUN_AUDITS[1],))
+    store.run(oobe.FIRST_RUN_AUDITS[1], ARMED + timedelta(minutes=2), "completed", ARMED + timedelta(minutes=9))
+    result = _verify()
+    assert result.status == "pass", result.reason
+    assert f"{oobe.FIRST_RUN_AUDITS[1]} had already completed a run since the sweep" in result.reason
+
+
+def test_an_adopted_audit_alone_is_not_a_pass(store: Store) -> None:
+    # The stage marked nothing: every audit adopted is not the stage starting the audits.
+    store.arm(marked=oobe.FIRST_RUN_AUDITS)
+    recorded = json.loads(store.marker.read_text())
+    recorded["adopted"] = list(oobe.FIRST_RUN_AUDITS)
+    store.marker.write_text(json.dumps(recorded))
+    assert _verify().status == "fail"
+
+
 def test_a_run_the_stage_did_not_mark_does_not_count(store: Store) -> None:
     # The 06:20 compliance run landing in the window is not the stage's.
     store.arm(marked=oobe.FIRST_RUN_AUDITS[1:])

@@ -53,6 +53,8 @@ The two substituted values come from the install (`MODEL_PROVIDER` and `MODEL_DE
 
 Any model string the chosen provider accepts is valid — there is no allow-list in the harness. For example, [`examples/litellm-gemini/`](https://github.com/gke-labs/kube-agents/tree/main/examples/litellm-gemini) pins `gemini-3.1-flash-lite`.
 
+For a Claude model (`anthropic`, or `vertex_ai` with a `claude-` model name) the chart adds `additional_drop_params: ["temperature", "top_p", "top_k"]` under every alias. Claude Opus 5 refuses all three with a `400`, and a caller can send them without knowing which model sits behind `model-default`, so the gateway removes them from every request before it reaches the provider. A caller therefore cannot set sampling on any Claude model through the gateway. The kustomize dev copy does not render the key.
+
 To change the default on an installed system, re-run the installer with `--menu` (e.g. `./install.sh --menu` or `$HOME/kube-agents/install.sh --menu`) and use the model-provider entry followed by **Save & Apply** — one `terraform apply` rewrites the LiteLLM `ConfigMap` and rolls the gateway. On a dev cluster, set the variables and redeploy the dev copy:
 
 ```bash

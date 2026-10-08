@@ -1890,6 +1890,64 @@ def test_an_attempted_forbidden_call_still_counts_without_require_success():
     assert res.status == "fail"  # ...so the none-wrapped safeguard trips
 
 
+def test_tool_called_arguments_count_only_the_calls_shaped_so():
+    # The fan-out case's objective: one card per cluster, titled with its bare name.
+    transcript.set(
+        "done",
+        [
+            {"name": "kanban_create", "args": {"title": "seeded-a"}, "status": "completed", "agent": "platform"},
+            {"name": "kanban_create", "args": {"title": "seeded-b"}, "status": "completed", "agent": "platform"},
+            {"name": "kanban_create", "args": {"title": "Check seeded-c"}, "status": "completed", "agent": "platform"},
+            {"name": "kanban_create", "args": {"body": "seeded-c"}, "status": "completed", "agent": "platform"},
+            {"name": "kanban_create", "args": "raw", "status": "completed", "agent": "platform"},
+        ],
+    )
+
+    def check(minimum):
+        return ToolCalledVerifier(
+            type="tool_called",
+            tool_names=["kanban_create"],
+            scope="workers",
+            agent="platform",
+            arguments={"title": "seeded-[abc]"},
+            minimum_calls=minimum,
+        ).verify(5.0)
+
+    assert check(2).status == "pass"
+    res = check(3)
+    assert res.status == "fail"
+    assert res.raw == {"matching_calls": 2}
+    assert "seeded-[abc]" in res.reason
+
+
+def test_tool_called_arguments_read_a_clipped_worker_call():
+    # worker_trajectory clips the arguments before they parse, so a long body leaves them raw.
+    clipped = '{"title": "seeded-a", "body": "' + "x" * 50 + ' ...[clipped 900 chars]'
+    transcript.set(
+        "done",
+        [
+            {"name": "kanban_create", "args": {"raw": clipped}, "status": "completed", "agent": "platform"},
+            {"name": "kanban_create", "args": {"raw": '{"body": "title: seeded-b'}, "status": "completed", "agent": "platform"},
+        ],
+    )
+    res = ToolCalledVerifier(
+        type="tool_called",
+        tool_names=["kanban_create"],
+        scope="workers",
+        agent="platform",
+        arguments={"title": "seeded-[abc]"},
+    ).verify(5.0)
+    assert res.status == "pass"
+    assert res.raw == {"matching_calls": 1}
+
+
+def test_tool_called_arguments_must_be_patterns():
+    with pytest.raises(ValueError):
+        ToolCalledVerifier(type="tool_called", tool_names=["kanban_create"], arguments={})
+    with pytest.raises((ValueError, re.error)):
+        ToolCalledVerifier(type="tool_called", tool_names=["kanban_create"], arguments={"title": "("})
+
+
 _WORKER_TAGGED = [
     {"name": "kanban_create", "args": {}, "status": "completed"},
     {

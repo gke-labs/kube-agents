@@ -700,12 +700,8 @@ func (a *InjectAdapter) authorized(w http.ResponseWriter, r *http.Request) bool 
 // body says a token is required and never whether one was presented or how
 // it was wrong.
 func bearerAuthorized(w http.ResponseWriter, r *http.Request, token, refusal string) bool {
-	header := r.Header.Get(authorizationHeader)
-	if len(header) > len(bearerScheme) && strings.EqualFold(header[:len(bearerScheme)], bearerScheme) {
-		presented := strings.TrimSpace(header[len(bearerScheme):])
-		if subtle.ConstantTimeCompare([]byte(presented), []byte(token)) == 1 {
-			return true
-		}
+	if presented, ok := bearerOf(r); ok && subtle.ConstantTimeCompare([]byte(presented), []byte(token)) == 1 {
+		return true
 	}
 	w.Header().Set("WWW-Authenticate", "Bearer")
 	injectError(w, http.StatusUnauthorized, refusal)
