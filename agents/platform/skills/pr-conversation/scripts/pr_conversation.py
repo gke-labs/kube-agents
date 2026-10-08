@@ -91,11 +91,12 @@ def _fail(message: str):
 
 
 def validate_repo(repo: str) -> str:
-    """Ensure repo is formatted as owner/name and is in the managed repos allowlist if configured."""
-    from gitops_workspace import get_managed_github_repos, is_valid_repo_slug, validate_repo_org
+    """Ensure repo is a repository name and is in the managed repos allowlist if configured."""
+    from gitops_workspace import get_managed_repos, is_valid_repo_slug, qualify, validate_repo_org
     if not repo or not is_valid_repo_slug(repo):
-        raise ValueError(f"Invalid repository format: {repo!r}. Expected 'owner/name'.")
-    managed = get_managed_github_repos()
+        raise ValueError(f"Invalid repository format: {repo!r}. Expected 'owner/name', or '<host>/<path>' for a repository on another forge.")
+    managed = get_managed_repos()
+    repo = qualify(repo, managed)
     if managed and repo not in managed:
         raise ValueError(
             f"Repository {repo!r} is not in the managed repositories list: {managed}"
@@ -298,11 +299,11 @@ def handle_poll(args) -> int:
     operator-facing glossary covers both halves of the watcher.
     """
     try:
-        from gitops_workspace import get_managed_github_repos
+        from gitops_workspace import get_managed_repos
         if getattr(args, "repo", None):
             repos = [validate_repo(args.repo)]
         else:
-            repos = get_managed_github_repos()
+            repos = get_managed_repos()
     except ValueError as error:
         print(json.dumps({"status": "ERROR", "reason": "INVALID_REPOSITORY", "value": str(error)}))
         return 0

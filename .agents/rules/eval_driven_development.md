@@ -22,9 +22,16 @@ INSTALL.md "Method 3" is the local-iteration path). `hack/ci-deploy.sh` itself i
 secrets. For cases that read the seeded fleet, whether through `fixtures:` or by naming
 `seeded-a`/`-b`/`-c` directly, the fleet must be applied to the dev project once
 ([`bench/tf/fleet/README.md`](../../bench/tf/fleet/README.md)). Every contributor, human or
-agent, is expected to have one. A stock install sandboxes the agent, which the harness's
-`kubectl port-forward` cannot reach; [`bench/README.md`](../../bench/README.md#sandboxed-installs)
-has the ways round that. There is no path around the loop: a pull request that changes agent
+agent, is expected to have one. Cases whose run writes to GitHub, such as the fleet audits and
+the remediation and issue cases, also need the install's GitOps repository, owned by an
+organization, and its token minter
+([`token-minter.md`](../../docs/site/src/content/docs/deploy/token-minter.md)); cases graded
+against GitHub also need the runner's read token
+([`bench/CUSTOM-TASKS.md`](../../bench/CUSTOM-TASKS.md#grading-a-fleet-audit)). Without any of
+them the run cannot clone, mint or read, which is broken, not red. A stock install sandboxes the
+agent, which the harness's `kubectl port-forward` cannot reach;
+[`bench/README.md`](../../bench/README.md#sandboxed-installs) has the ways round that. There is no
+path around the loop: a pull request that changes agent
 behaviour without eval evidence is not ready for review; being one change in a stack is not an
 exception, and "What does not count" says why.
 

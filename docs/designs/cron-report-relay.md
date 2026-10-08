@@ -101,8 +101,8 @@ reach seeded-c, so this run didn't check it." when every reason says the cluster
 was unreachable, "Didn't check seeded-c this run." otherwise, or a count past
 three names), or, when the body has no such table, gives the relayed line's own
 words for what was not scanned, since a silent gap reads as clean; then the
-ledger link. The relayed line itself, which alone carries resolved counts and
-remediation pull requests, is left off the headline and goes in its thread. The relayed line is the report's last line; when that line is only the ledger link,
+ledger link. The relayed line itself, which carries the resolved count and any
+remediation pull requests, is left off the headline and is not posted under it either: every headline links the ledger issue, whose delta comment lists the resolved findings and which the remediation pull requests link back to. The relayed line is the report's last line; when that line is only the ledger link,
 the last unindented, non-list line above it that reads as the audit line (its coverage, a
 findings total or a change count) stands in for it, else the last such line with any count. A closed issue is a clean run, which closes the ledger without rewriting its
 title, so the headline is "<Name>: clean. Ledger closed." and the link, unless the
@@ -115,10 +115,11 @@ resolved or severity count or calls the run clean, held, carried or nothing
 reproduced (a zero-finding partial or held run leaves the ledger open over its old
 title). A report whose last line is only the link and with no line carrying a
 count has no headline and goes out unchanged. A truncation notice leads the leg's
-message but is never read as the relayed line. The full report is also posted into the
-headline's thread whenever it is longer than one line or the headline does not show
-its line whole (always, for a headline built from the issue), and the incident row
-stores the full report either way, so a reply in the thread is answered with the whole report.
+message but is never read as the relayed line. Nothing is posted into the headline's
+thread, but the incident row stores the full report, so a reply in the thread is
+answered with the whole report. Under a fallback headline, that reply is the only
+way to what the report said beyond its line, such as lines above it or the link
+targets the bold line drops.
 Every other report (Google Chat, an unrelayed report, one that does not end with
 a managed-repository issue link, a job the scheduler already delivered to Slack
 itself when it also left another platform to the relay, or any report with the
@@ -146,13 +147,10 @@ so declining to post the text would trade a possible second headline for a missi
 report. A post Slack accepted without returning a message ts counts as delivered,
 with nothing threaded under it. The caller gives up after the relay plugin's
 `RELAY_TIMEOUT_SECONDS` (360 s), its clock starting first, and the relay turn alone
-can take most of that. So the ledger read, the Block Kit posts and the posts into
-the headline's thread share a budget of half that timeout from the route's start:
-the Block Kit posts stop short of it with room left for the text send, a thread
-post with too little of it left is skipped and logged, and when too little is left
-to read the ledger the composed message goes out as text in one send. A headline
-whose full report did not follow it, skipped, refused or with no ts to thread
-under, still counts as delivered, with `"relay": "degraded"`.
+can take most of that. So the ledger read and the Block Kit post share a budget of
+half that timeout from the route's start: the Block Kit post stops short of it with
+room left for the text send, and when too little is left to read the ledger the
+composed message goes out as text in one send.
 
 ## Why the Chat Agent composes but does not send
 
@@ -652,10 +650,9 @@ every one of them is visible to a job author:
   unnoticed. So the degradation is stated twice: the posted message is prefixed
   `[unrelayed]`, naming the profile and job, and the response body carries
   `"relay": "degraded"` next to `"status": "delivered"`.
-  The other cause is a Slack headline whose full report did not post under it.
-  Both callers had hard-coded the sentence for the first cause, so the body also
+  Both callers had hard-coded the sentence for that cause, so the body also
   carries `relay_detail`: the route's own wording, which
-  names the cause and never a platform, and which lets a second cause land in
+  names the cause and never a platform, and which lets another cause land in
   the route without a client change.
   A send that lands on one platform and not another is a different case, and not
   a degradation — the report reached a channel, so `relay` stays `ok` — but one

@@ -224,6 +224,11 @@ def is_token(token: str) -> bool:
 class StaticFileCredential:
     """A long-lived token an administrator put in a Secret, read from its file.
 
+    `stored_token` marks it for the content workspace: nothing ambient stands
+    behind a stored token, so a clone that holds one presents it on its own
+    push, and asks again before every presentation whether the repository
+    still earns it.
+
     Nothing to acquire and nothing to refresh, so `ensure` does nothing -- the
     strategy says the token does not need it rather than implementing a step
     that returns at once. The file is read on every call instead of once at
@@ -242,6 +247,8 @@ class StaticFileCredential:
     answers a private repository with 404 and reads like the repository is
     gone.
     """
+
+    stored_token = True
 
     def __init__(
         self,

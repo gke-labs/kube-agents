@@ -18,6 +18,7 @@ package controller
 
 import (
 	"context"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -732,4 +733,55 @@ func TestTheAgentRoutesSlackProactivePostsExactlyWhenArmed(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestTheStampedSlackGatewayKeepsItsMetricsListenerAndFence: #2401 stamps the
+// secret-env digest onto the A2A gateway's pod template and #2473 gives the
+// same template a metrics-only port and the pod its own fence. They landed on
+// separate branches; this holds them together on one applied Deployment, so a
+// later edit to either cannot drop the other's half without a red.
+func TestTheStampedSlackGatewayKeepsItsMetricsListenerAndFence(t *testing.T) {
+	t.Setenv(a2aInjectBackendEnvVar, "")
+	t.Setenv(a2aAgentDoorEnvVar, "")
+	agent := slackTestAgent("next", true)
+	r, cl, _ := a2aGateTestReconcilerWithoutABackend(t, agent)
+	ctx := context.Background()
+	if err := cl.Create(ctx, secretHashTestSecret(slackTestSecret, map[string][]byte{
+		slackTestBotKey: []byte("xoxb-token"),
+		slackTestAppKey: []byte("xapp-token"),
+	})); err != nil {
+		t.Fatal(err)
+	}
+	theCalloutIsServing(t, ctx, cl, r, agent)
+
+	if digest := gatewayDigestAfterPass(t, ctx, r, agent); digest == "" {
+		t.Fatalf("the Slack-armed gateway carries no %s", secretEnvHashAnnotation)
+	}
+	dep := &appsv1.Deployment{}
+	if err := r.Get(ctx, types.NamespacedName{Name: a2aGatewayName(agent), Namespace: agent.Namespace}, dep); err != nil {
+		t.Fatal(err)
+	}
+	c := dep.Spec.Template.Spec.Containers[0]
+	var port bool
+	for _, p := range c.Ports {
+		if p.Name == a2aGatewayMetricsPortName && p.ContainerPort == a2aGatewayMetricsPort {
+			port = true
+		}
+	}
+	if !port {
+		t.Errorf("the stamped gateway declares no %s port %d: %+v", a2aGatewayMetricsPortName, a2aGatewayMetricsPort, c.Ports)
+	}
+	if got := envMapOf(c.Env)[a2aGatewayMetricsPortEnvVar].Value; got != strconv.Itoa(int(a2aGatewayMetricsPort)) {
+		t.Errorf("%s = %q on the stamped gateway, want %d", a2aGatewayMetricsPortEnvVar, got, a2aGatewayMetricsPort)
+	}
+	for _, name := range []string{a2aSlackBotTokenEnvVar, a2aSlackAppTokenEnvVar} {
+		if _, ok := envMapOf(c.Env)[name]; !ok {
+			t.Errorf("%s is missing from the gateway the metrics listener rides", name)
+		}
+	}
+	fence := &networkingv1.NetworkPolicy{}
+	if err := r.Get(ctx, types.NamespacedName{Name: a2aGatewayNetpolName(agent), Namespace: agent.Namespace}, fence); err != nil {
+		t.Fatalf("the stamped gateway has no fence of its own: %v", err)
+	}
+	assertA2AGatewayFenceAdmitsOnlyTheCollector(t, fence)
 }
