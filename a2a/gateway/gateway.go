@@ -719,10 +719,15 @@ func (g *Gateway) routeTurn(ctx context.Context, msg InboundMessage, backend, pr
 	// terminal on the stream (the relay's ack raced a transient failure, or
 	// the gateway was down when the terminal fired and the redelivery
 	// hasn't landed), release the serialization instead of steering the
-	// user into a finished task. The heal posts the replayed status card
-	// and delivers the terminal outcome (answer text or terminal notice),
-	// then retires the task route so a queued or redelivered terminal
-	// is dropped rather than posting twice or double-counting in metrics.
+	// user into a finished task. Only the serialization: the task index
+	// stays until the relay retires it, so a queued terminal event still
+	// posts its result. Healing at all means the render was probably lost
+	// (an acked event is never redelivered), so post the replayed status
+	// card rather than clearing silently — the same deterministic template
+	// the status ask uses. In the relay-lag case this duplicates the
+	// rolling-line edit that follows; redundant beats swallowed.
+	// MarkTerminalObserved on the record dedupes the relay's observeTaskTerminal
+	// call so metrics are not double-counted.
 	//
 	// The other stale shape has no terminal to find: a task with NO events
 	// at all (TasksGet answers TaskNotFound) because its executor never
@@ -736,11 +741,11 @@ func (g *Gateway) routeTurn(ctx context.Context, msg InboundMessage, backend, pr
 	// age alone is not evidence, a first event that is merely late could
 	// still arrive, and no supervisor path ever sees a task with no pod —
 	// so a task released here ages out with the stream's retention, the
-	// residue Session lifecycle names. For a never-started task, the task
-	// index stays so a late start can still post; its key is retired only if
-	// the task ever terminates. A delegated child is the exception in both
-	// shapes: its index is the one-live-child rule's liveness, so the heal
-	// retires it (healActiveTask says why).
+	// residue Session lifecycle names. The task index stays, as in the
+	// terminal case, so a late start still renders; its key is retired
+	// only if the task ever terminates. A delegated child is the exception
+	// in both shapes: its index is the one-live-child rule's liveness, so
+	// the heal retires it (healActiveTask says why).
 	//
 	// This is the heal's only caller. The inject door's read route
 	// (probeConversation) reports the same facts and heals nothing: the
@@ -1023,45 +1028,14 @@ func (g *Gateway) healActiveTask(ctx context.Context, rec *SessionRecord) {
 		if terminalSubject == lib.TaskSupervisorSubject(addressee, active.TaskID) {
 			source = TerminalFromSupervisor
 		}
-		ref, known := rec.TaskRefFor(active.TaskID)
-		child := known && ref.Role == taskRoleChild
-		result := ""
-		if art := task.Artifact(lib.ArtifactResult); art != nil {
-			result = joinTextParts(art.Parts)
-		}
 		// The deliverable too, from the stream, for the same program: the
 		// status card posted above never carries the result's text, and
 		// a door that inferred its artifact from the last post would hand
 		// the card over as the answer.
-		if task.State == lib.StateCompleted && result != "" {
-			g.observeDelivered(rec, active.TaskID, result)
-		}
-		// Post the deliverable or terminal notice for a human turn (a child
-		// hands its result to wakeSession instead), matching what relayTerminal
-		// delivers so retiring the route below does not drop the answer.
-		if !child {
-			switch task.State {
-			case lib.StateCompleted:
-				postResult := result
-				if postResult == "" {
-					postResult = completedNonTextResult
-				}
-				if !isConsoleConversation(rec.Key) {
-					g.post(rec.Key, postResult)
-				}
-			case lib.StateFailed:
-				if reason := finalMessageText(task); reason != "" {
-					g.post(rec.Key, "❌ failed: "+reason)
-				} else {
-					g.post(rec.Key, "❌ the task failed")
-				}
-			case lib.StateCanceled:
-				g.post(rec.Key, "🛑 canceled")
-			case lib.StateRejected:
-				if reason := finalMessageText(task); reason != "" {
-					g.post(rec.Key, "🚫 the executor rejected the task: "+reason)
-				} else {
-					g.post(rec.Key, "🚫 the executor rejected the task")
+		if task.State == lib.StateCompleted {
+			if art := task.Artifact(lib.ArtifactResult); art != nil {
+				if result := joinTextParts(art.Parts); result != "" {
+					g.observeDelivered(rec, active.TaskID, result)
 				}
 			}
 		}
@@ -1071,6 +1045,7 @@ func (g *Gateway) healActiveTask(ctx context.Context, rec *SessionRecord) {
 		// root's end comes from the wake below or, with no wake, from
 		// observeChildEnd.
 		g.observeEnded(rec, active.TaskID, task.State, source, finalMessageText(task))
+		rec.MarkTerminalObserved(active.TaskID)
 		healed, healedSource, healedTask = true, source, task
 	case isTaskNotFound(err) && !active.SubmittedAt.IsZero() &&
 		time.Since(active.SubmittedAt) > g.cfg.FirstEventGrace:
@@ -1087,6 +1062,7 @@ func (g *Gateway) healActiveTask(ctx context.Context, rec *SessionRecord) {
 		// says, age is not evidence.
 		g.logTaskTerminal(rec, addressee, active.TaskID, lib.StateFailed, TerminalNeverStarted, "")
 		g.observeEnded(rec, active.TaskID, lib.StateFailed, TerminalNeverStarted, "")
+		rec.MarkTerminalObserved(active.TaskID)
 		healed, healedSource = true, TerminalNeverStarted
 	}
 	if healed {
@@ -1099,18 +1075,19 @@ func (g *Gateway) healActiveTask(ctx context.Context, rec *SessionRecord) {
 		if rs != nil {
 			g.flushNotices(rec.Key, rs)
 		}
-		// A task's route is retired here when the terminal was found on the
-		// stream (healedTask != nil), as relayTerminal retires it: dropping
-		// the routing entry ensures that if the relay still had the same
-		// terminal queued behind the session lock, its later delivery finds
-		// no route and is a no-op rather than posting twice or double-counting
-		// in task_terminals_total. For a delegated child that never started,
-		// the route is retired for the same reason (and so liveChild does not
-		// refuse later delegations); a never-started human turn keeps its
-		// index so a late start can still post.
+		// A delegated child's route is retired here, as relayTerminal
+		// retires it: its index is the liveness the one-live-child rule
+		// reads (liveChild), so a healed child left indexed would refuse
+		// every later delegation in the conversation until the reap. It is
+		// also what keeps the wake below to one: a duplicate of the
+		// terminal the heal found finds no route and is dropped, so it
+		// neither posts nor wakes. A never-started child's late events are
+		// dropped the same way. A human turn keeps its index, so its late
+		// result still posts; MarkTerminalObserved on the record prevents
+		// double-counting in metrics when the relay arrives.
 		ref, known := rec.TaskRefFor(active.TaskID)
 		child := known && ref.Role == taskRoleChild
-		if child || healedTask != nil {
+		if child {
 			g.retireTaskRoute(ctx, active.TaskID)
 		}
 		rec.ActiveTask = nil
