@@ -24,8 +24,9 @@ import (
 // session and carries no authority block: it is text the agent could already
 // post through `hermes send` on a today install, now posted by the process
 // that owns the backend. What bounds it is where it may land - the configured
-// home space only, a new thread there or a reply on one of that space's
-// threads - and who may send it, which is the bus grant: the agent principal
+// home space (a new thread there or a reply on one of that space's threads),
+// or a conversation the gateway holds a live session record for, named with
+// that record's context id - and who may send it, which is the bus grant: the agent principal
 // publishes chat.notify.<backend>, the gateway alone subscribes, and the answer
 // travels on chat.notify.reply.agent.>, which only the gateway may publish and
 // only the agent may read (platformagent_a2a_identities.go). The answer does
@@ -60,7 +61,29 @@ const (
 	// notifyLostLineMax bounds how much of a lost request's text the error
 	// log carries: enough to find the post it was, not the whole report.
 	notifyLostLineMax = 120
+	// notifyLookupTimeout bounds the session-record read a conversation
+	// request is checked against.
+	notifyLookupTimeout = 5 * time.Second
+	// notifyNoHome refuses a home-channel post on an install that names no
+	// home channel: the route then serves conversation requests only.
+	notifyNoHome = "no home channel is configured; only a request naming a conversation is posted"
+	// notifyNoConversations refuses a conversation request on a notifier
+	// armed without the gateway's conversations.
+	notifyNoConversations = "this route does not post into conversations"
+	// notifyConversationRefused is the one refusal for a conversation the
+	// request may not post into, whatever the reason: no session record, a
+	// context id that does not match, or a record that cannot be read.
+	notifyConversationRefused = "not a live conversation with that context"
 )
+
+// NotifyConversations is the gateway's side of a request aimed at a
+// conversation rather than the home channel: the context id of the
+// conversation's session record ("" when it has none), and a post into it
+// with the gateway's own adapter.
+type NotifyConversations interface {
+	ConversationContext(ctx context.Context, key string) (string, error)
+	Post(conversation, text string) (messageID string, err error)
+}
 
 // notifyPoster is the backend half: post text into a space, new thread or
 // reply, and say where it landed. GoogleChatAdapter.PostNotify is the one
@@ -74,9 +97,13 @@ type Notifier struct {
 	subject string
 	home    string
 	poster  notifyPoster
-	log     *slog.Logger
-	jobs    chan notifyJob
-	done    chan struct{}
+	// convPrefix is the conversation-key prefix of this backend, and conv
+	// the gateway's conversations; nil leaves conversation requests refused.
+	convPrefix string
+	conv       NotifyConversations
+	log        *slog.Logger
+	jobs       chan notifyJob
+	done       chan struct{}
 
 	// mu orders handle's enqueue against Stop's close of jobs: a request that
 	// arrives while Stop runs is refused under the lock rather than sent on a
@@ -86,16 +113,29 @@ type Notifier struct {
 }
 
 // NewGchatNotifier builds the Google Chat notifier. home is the configured
-// home space ("spaces/AAA"); anything else is refused here, at start, rather
-// than on the first alert.
+// home space ("spaces/AAA"), or "" when there is none, which leaves the route
+// serving conversation requests only; anything else is refused here, at
+// start, rather than on the first alert.
 func NewGchatNotifier(poster notifyPoster, home string, log *slog.Logger) (*Notifier, error) {
-	if !gchatIsSpaceName(home) {
+	if home != "" && !gchatIsSpaceName(home) {
 		return nil, fmt.Errorf("notify: home channel %q is not a Chat space name (spaces/<id>)", home)
 	}
 	if log == nil {
 		log = slog.Default()
 	}
-	return &Notifier{subject: lib.NotifySubjectGchat, home: home, poster: poster, log: log}, nil
+	return &Notifier{subject: lib.NotifySubjectGchat, home: home, poster: poster, log: log,
+		convPrefix: gchatKeyPrefix}, nil
+}
+
+// SetConversations arms requests aimed at a conversation the gateway holds.
+// Call it before Start.
+func (n *Notifier) SetConversations(c NotifyConversations) {
+	n.conv = c
+}
+
+// ServesConversations reports whether conversation requests are armed.
+func (n *Notifier) ServesConversations() bool {
+	return n.conv != nil
 }
 
 // Start subscribes the notifier on client and starts the worker that posts.
@@ -109,7 +149,7 @@ func (n *Notifier) Start(client *lib.Client) (lib.Subscription, error) {
 		return nil, fmt.Errorf("notify: %w", err)
 	}
 	go n.work()
-	n.log.Info("chat.notify route armed", "subject", n.subject, "home", n.home)
+	n.log.Info("chat.notify route armed", "subject", n.subject, "home", n.home, "conversations", n.ServesConversations())
 	return &notifierSub{sub: sub, n: n}, nil
 }
 
@@ -290,8 +330,53 @@ func (n *Notifier) validate(data []byte) (lib.NotifyRequest, *lib.NotifyReply) {
 		r := lib.NotifyReply{Error: notifyEmptyText}
 		return req, &r
 	}
+	if req.Conversation != "" || req.ContextID != "" {
+		return n.validateConversation(req)
+	}
+	if n.home == "" {
+		return refuse(notifyNoHome)
+	}
 	if req.Thread != "" && !n.inHome(req.Thread) {
 		return refuse(fmt.Sprintf("thread %q is not a thread of the home channel", req.Thread))
+	}
+	return req, nil
+}
+
+// validateConversation admits a request aimed at a conversation only when
+// the gateway holds a session record for it whose context id is the one the
+// request carries: a conversation the agent is working in. The bound is the
+// set of live records, not a secret: the agent principal, the one sender, can
+// read every live conversation's context id (its Hermes sessions are named
+// for them), so this refuses a conversation with no record, a made-up key
+// and a stale route, not a post into another conversation the agent holds a
+// session for. Anything else is refused before any post.
+func (n *Notifier) validateConversation(req lib.NotifyRequest) (lib.NotifyRequest, *lib.NotifyReply) {
+	refuse := func(reason string) (lib.NotifyRequest, *lib.NotifyReply) {
+		r := n.refuse(reason)
+		return req, &r
+	}
+	if n.conv == nil {
+		return refuse(notifyNoConversations)
+	}
+	if req.Thread != "" {
+		return refuse("a request names a thread or a conversation, not both")
+	}
+	if req.Conversation == "" || req.ContextID == "" {
+		return refuse("a conversation request needs both the conversation and its context id")
+	}
+	if !strings.HasPrefix(req.Conversation, n.convPrefix) || len(req.Conversation) == len(n.convPrefix) {
+		return refuse(fmt.Sprintf("conversation %q is not on this route's backend", req.Conversation))
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), notifyLookupTimeout)
+	defer cancel()
+	have, err := n.conv.ConversationContext(ctx, req.Conversation)
+	if err != nil {
+		n.log.Warn("notify: session record unreadable", "conversation", req.Conversation, "err", err)
+		return refuse(notifyConversationRefused)
+	}
+	if have == "" || have != req.ContextID {
+		n.log.Warn("notify refused: no live conversation with that context", "conversation", req.Conversation)
+		return refuse(notifyConversationRefused)
 	}
 	return req, nil
 }
@@ -303,10 +388,19 @@ func (n *Notifier) validate(data []byte) (lib.NotifyRequest, *lib.NotifyReply) {
 // text is in the channel.
 func (n *Notifier) post(job notifyJob) {
 	thread := job.req.Thread
+	if job.req.Conversation != "" {
+		thread = job.req.Conversation
+	}
 	var first string
 	answered := false
 	for i, chunk := range chatChunks(job.req.Text, discordChunk) {
-		message, landed, err := n.poster.PostNotify(n.home, thread, chunk)
+		var message, landed string
+		var err error
+		if job.req.Conversation != "" {
+			message, err = n.conv.Post(job.req.Conversation, chunk)
+		} else {
+			message, landed, err = n.poster.PostNotify(n.home, thread, chunk)
+		}
 		if err != nil {
 			n.log.Error("notify post failed", "home", n.home, "thread", thread, "chunk", i+1, "err", err)
 			if !answered {
@@ -336,4 +430,30 @@ func (n *Notifier) inHome(thread string) bool {
 func (n *Notifier) refuse(reason string) lib.NotifyReply {
 	n.log.Warn("notify refused", "reason", reason)
 	return lib.NotifyReply{Error: reason}
+}
+
+// gatewayConversations is the gateway's NotifyConversations: session records
+// from its registry, posts through the backend adapter.
+type gatewayConversations struct {
+	g      *Gateway
+	poster Adapter
+}
+
+func (c gatewayConversations) ConversationContext(ctx context.Context, key string) (string, error) {
+	rec, err := c.g.reg.Get(ctx, key)
+	if err != nil || rec == nil {
+		return "", err
+	}
+	return rec.ContextID, nil
+}
+
+func (c gatewayConversations) Post(conversation, text string) (string, error) {
+	return c.poster.Post(conversation, text)
+}
+
+// Conversations is what Notifier.SetConversations takes: the gateway's
+// session records, and poster (the backend adapter, not the composite) to post
+// with.
+func (g *Gateway) Conversations(poster Adapter) NotifyConversations {
+	return gatewayConversations{g: g, poster: poster}
 }

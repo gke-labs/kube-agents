@@ -486,35 +486,39 @@ func TestTheHomeChannelReachesTheArmedGateway(t *testing.T) {
 
 // TestTheAgentRoutesProactivePostsToTheGatewayExactlyWhenArmed: the agent
 // container is told to send proactive posts through chat.notify exactly when
-// the next stack holds Google Chat AND the home channel is a space name, which
-// is when the gateway arms the route. Telling it with no route behind it
-// would send every post to a subject nobody answers.
+// the next stack holds Google Chat and the home channel is a space name, and
+// the kanban notifier to send a card's report back to its conversation
+// whenever the gateway arms the route (home channel unset or a space name).
+// Telling either with no route behind it sends posts to a subject nobody
+// answers.
 func TestTheAgentRoutesProactivePostsToTheGatewayExactlyWhenArmed(t *testing.T) {
 	for _, tc := range []struct {
-		name  string
-		agent *agentv1alpha1.PlatformAgent
-		want  bool
+		name               string
+		agent              *agentv1alpha1.PlatformAgent
+		home, conversation bool
 	}{
-		{"today with chat", gchatTestAgent("", true), false},
-		{"skew with chat", gchatTestAgent("later", true), false},
-		{"next with chat", withHome(gchatTestAgent("next", true), "spaces/AAAA"), true},
-		{"next with chat, no home channel", gchatTestAgent("next", true), false},
-		{"next with chat, not a space", withHome(gchatTestAgent("next", true), "spaces/AAAA/threads/B"), false},
-		{"next with chat, bare id", withHome(gchatTestAgent("next", true), "AAAA"), false},
-		{"next without chat", withHome(gchatTestAgent("next", false), "spaces/AAAA"), false},
-		{"today with chat and home", withHome(gchatTestAgent("", true), "spaces/AAAA"), false},
+		{"today with chat", gchatTestAgent("", true), false, false},
+		{"skew with chat", gchatTestAgent("later", true), false, false},
+		{"next with chat", withHome(gchatTestAgent("next", true), "spaces/AAAA"), true, true},
+		{"next with chat, no home channel", gchatTestAgent("next", true), false, true},
+		{"next with chat, not a space", withHome(gchatTestAgent("next", true), "spaces/AAAA/threads/B"), false, false},
+		{"next with chat, bare id", withHome(gchatTestAgent("next", true), "AAAA"), false, false},
+		{"next without chat", withHome(gchatTestAgent("next", false), "spaces/AAAA"), false, false},
+		{"today with chat and home", withHome(gchatTestAgent("", true), "spaces/AAAA"), false, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			pod := buildPodTemplateSpec(tc.agent, "h", "h", "h", "h", nil, renderOptions{})
 			env := envMapOf(brokerContainerNamed(pod.Spec.Containers, "platform-agent").Env)
-			got, ok := env[a2aNotifyPlatformEnvVar]
-			if ok != tc.want {
-				t.Fatalf("%s present = %v, want %v", a2aNotifyPlatformEnvVar, ok, tc.want)
+			for name, want := range map[string]bool{a2aNotifyPlatformEnvVar: tc.home, a2aNotifyConversationsEnvVar: tc.conversation} {
+				got, ok := env[name]
+				if ok != want {
+					t.Fatalf("%s present = %v, want %v", name, ok, want)
+				}
+				if ok && got.Value != "google_chat" {
+					t.Errorf("%s = %q, want google_chat (the platform name the agent-side callers use)", name, got.Value)
+				}
 			}
-			if ok && got.Value != "google_chat" {
-				t.Errorf("%s = %q, want google_chat (the platform name the agent-side callers use)", a2aNotifyPlatformEnvVar, got.Value)
-			}
-			if tc.want && legacyChatConsumer(tc.agent) {
+			if (tc.home || tc.conversation) && legacyChatConsumer(tc.agent) {
 				t.Error("the notify route and the legacy Hermes platform both render")
 			}
 		})

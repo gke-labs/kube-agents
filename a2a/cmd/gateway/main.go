@@ -161,35 +161,9 @@ func realMain(ctx context.Context, log *slog.Logger) error {
 		log.Error("adapter", "backend", backend, "err", err)
 		return err
 	}
-	// The chat.notify route posts the agent's proactive messages to the home
-	// channel (gateway/notify.go). It needs the backend adapter itself, not
-	// the composite the doors and console wrap it in below. A malformed home
-	// channel leaves the route unarmed rather than the gateway down: chat
-	// ingress matters more than proactive posts.
-	if _, ok := adapter.(*gateway.GoogleChatAdapter); ok && cfg.GchatHomeChannel == "" {
-		log.Info("chat.notify route not armed: no home channel configured")
-	}
-	if gchat, ok := adapter.(*gateway.GoogleChatAdapter); ok && cfg.GchatHomeChannel != "" {
-		notifier, err := gateway.NewGchatNotifier(gchat, cfg.GchatHomeChannel, log)
-		if err != nil {
-			log.Error("chat.notify route not armed", "err", err)
-		} else {
-			// Run retries a failed bind and stops the route when its
-			// context ends. This defer runs before client.Close (defers
-			// are LIFO), so every request the route accepted is answered
-			// on an open connection.
-			notifyCtx, cancelNotify := context.WithCancel(ctx)
-			notifierDone := make(chan struct{})
-			go func() {
-				defer close(notifierDone)
-				notifier.Run(notifyCtx, client)
-			}()
-			defer func() {
-				cancelNotify()
-				<-notifierDone
-			}()
-		}
-	}
+	// The chat.notify route needs the backend adapter itself, not the
+	// composite the doors and console wrap it in below.
+	backendAdapter := adapter
 	// The door is a side door, not a backend: it can be armed beside either
 	// of the above, and the composite routes by conversation key. Dev and
 	// eval installs only; the operator renders A2A_INJECT_LISTEN and the
@@ -238,6 +212,22 @@ func realMain(ctx context.Context, log *slog.Logger) error {
 		log.Error("gateway", "err", err)
 		return err
 	}
+	if notifier := chatNotifier(cfg, backendAdapter, gw.Conversations, log); notifier != nil {
+		// Run retries a failed bind and stops the route when its context
+		// ends. This defer runs before client.Close (defers are LIFO), so
+		// every request the route accepted is answered on an open
+		// connection.
+		notifyCtx, cancelNotify := context.WithCancel(ctx)
+		notifierDone := make(chan struct{})
+		go func() {
+			defer close(notifierDone)
+			notifier.Run(notifyCtx, client)
+		}()
+		defer func() {
+			cancelNotify()
+			<-notifierDone
+		}()
+	}
 
 	log.Info("a2a gateway starting",
 		"nats", cfg.NATSURL,
@@ -248,6 +238,32 @@ func realMain(ctx context.Context, log *slog.Logger) error {
 		"spawnSessions", cfg.SpawnSessions,
 		"idleTTL", cfg.IdleTTL.String())
 	return serve(ctx, cfg, metrics, log, gw.Run)
+}
+
+// chatNotifier builds the chat.notify route for the backend adapter, or nil
+// when the backend has none. The route posts the agent's messages that answer
+// no live turn: proactive posts to the home channel, and a kanban card's
+// report back into the conversation it came from, checked against the
+// gateway's session records (conversations is gw.Conversations). With no home
+// channel it serves conversation requests only. A malformed home channel
+// leaves the route unarmed rather than the gateway down: chat ingress matters
+// more than these posts.
+func chatNotifier(cfg *gateway.Config, backend gateway.Adapter, conversations func(gateway.Adapter) gateway.NotifyConversations,
+	log *slog.Logger) *gateway.Notifier {
+	gchat, ok := backend.(*gateway.GoogleChatAdapter)
+	if !ok {
+		return nil
+	}
+	if cfg.GchatHomeChannel == "" {
+		log.Info("chat.notify home posts not armed: no home channel configured; conversation posts are")
+	}
+	n, err := gateway.NewGchatNotifier(gchat, cfg.GchatHomeChannel, log)
+	if err != nil {
+		log.Error("chat.notify route not armed", "err", err)
+		return nil
+	}
+	n.SetConversations(conversations(gchat))
+	return n
 }
 
 // serve is realMain's last step: the metrics listener beside the gateway,

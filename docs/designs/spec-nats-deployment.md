@@ -581,7 +581,8 @@ Layout:
   the console pod is enough, because `/config.json` hands the password to the page, and to
   any other process running locally while the forward is open.
 
-- **The notify route.** The agent's proactive posts to the chat home channel under `next`
+- **The notify route.** The agent's proactive posts to the chat home channel under `next`, and a
+  kanban card's report back to the gateway conversation it was filed in
   (spec-chatops-gateway.md, "Proactive posts: the chat.notify route"). The `agent` user gains
   publish on `chat.notify.gchat` and subscribe on `chat.notify.reply.agent.>`; the gateway
   user gains the matching pair (subscribe on the first, publish on the second). No other

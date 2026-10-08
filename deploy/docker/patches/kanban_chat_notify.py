@@ -34,10 +34,16 @@ platform, and only inside the notifier:
    ``$HERMES_HOME`` (the agent's volume), so this is a one-time skip: an
    outage after the rollout delays events, and drops none.
 
-Only the subscription's thread is forwarded, and the gateway posts only into
-threads of the home channel, so a thread of another space is refused (and the
-notifier drops that subscription after its consecutive-failure limit, as for
-any destination that cannot be reached). A subscription with no thread (a DM,
+Two kinds of subscription reach it. An alert's triage card names a thread of
+the home channel, which is forwarded as ``--thread``; the gateway posts only
+into threads of the home channel, so a thread of another space is refused (and
+the notifier drops that subscription after its consecutive-failure limit, as
+for any destination that cannot be reached). A card filed in a gateway
+conversation (the hermes-bridge's ``a2a-*`` session) names that conversation's
+key and context id, recorded by the bridge and swapped in by
+``kanban_event_routing``; it is forwarded as ``--conversation`` and
+``--context``, and the gateway posts it only into the live conversation whose
+session record carries that context. A subscription with no thread (a DM,
 or a space as a whole) is not delivered at all: posting it as a new thread in
 the home channel would move text meant for one space into another.
 
@@ -71,8 +77,10 @@ import asyncio
 import json
 import logging
 import os
+import sqlite3
 import subprocess
 import time
+from contextlib import closing
 from typing import Any, Dict, Optional
 
 from gateway.config import Platform, PlatformConfig
@@ -83,6 +91,10 @@ logger = logging.getLogger(__name__)
 # The operator's switch (written by platformagent_manifests.go, defined as
 # a2aNotifyPlatformEnvVar in platformagent_a2a_manifests.go).
 NOTIFY_PLATFORM_ENV = "A2A_NOTIFY_PLATFORM"
+# The platform whose gateway conversations a card can report back to
+# (a2aNotifyConversationsEnvVar). Rendered whenever the gateway arms the route,
+# home channel or not; A2A_NOTIFY_PLATFORM above is home posts, and needs one.
+NOTIFY_CONVERSATIONS_ENV = "A2A_NOTIFY_CONVERSATIONS"
 # The bus CLI in the agent image, on PATH.
 A2A_CLI = "a2a"
 # `a2a notify` exit statuses (a2a/cmd/a2a/notify.go): the gateway took the
@@ -119,9 +131,30 @@ ROUTED_SINCE_FILE = "kanban_chat_notify.routed_since"
 # not, so this bounds the probes an idle install makes.
 ROUTE_PROBE_TTL_SECONDS = 300
 ROUTE_PROBE_TIMEOUT_SECONDS = 5
+# The gateway's conversation-key prefixes (gchatConversationID,
+# slackConversationID). A subscription whose thread is one of these was routed
+# to a gateway conversation by kanban_event_routing (the hermes-bridge records
+# the route), and its chat_id is that conversation's context id: the report is
+# sent with --conversation and --context rather than --thread.
+CONVERSATION_KEY_PREFIXES = ("gchat:", "slack:")
 # The attribute the stand-in is cached under on the runner, which outlives the
 # per-tick collector and the per-delivery notification.
 RUNNER_ATTR = "_kage_chat_notify_adapter"
+RUNNER_CONVERSATION_ATTR = "_kage_chat_notify_conversation_adapter"
+# Where a gateway conversation's route is read back: session-kv's routing
+# table, the same database and key kanban_event_routing reads
+# (session_kv_server.CONVERSATION_ROUTE_KEY).
+SESSION_KV_DB_ENV = "SESSION_KV_DB_PATH"
+SESSION_KV_DEFAULT_DB = "/var/lib/kube-agents/session/session_kv.db"
+CONVERSATION_ROUTE_KEY = "conversation_route"
+SESSION_KV_TIMEOUT_SECONDS = 2.0
+# The in-pod API server a conversation card's wake self-posts into, as the
+# hermes-bridge's api executor posts its turns (a2a/hermes-bridge/api.go,
+# DefaultAPIURL and DefaultAPIModel), with the pod's key.
+API_SERVER_HOST = "127.0.0.1"
+API_SERVER_PORT = 8642
+API_SERVER_MODEL = "model-default"
+API_SERVER_KEY_ENV = "API_SERVER_KEY"
 
 # routed_since's answer, read or written once per process.
 _routed_since: Optional[float] = None
@@ -146,24 +179,47 @@ def routes(platform: Any) -> bool:
     return bool(name) and name == routed_platform()
 
 
+def conversation_platform() -> str:
+    """The platform whose gateway conversations cards report back to, or "" when none."""
+    return os.environ.get(NOTIFY_CONVERSATIONS_ENV, "").strip()
+
+
+def is_conversation(sub: Optional[dict]) -> bool:
+    """Whether ``sub`` is addressed to a gateway conversation (its thread is a conversation key)."""
+    return str((sub or {}).get("thread_id") or "").strip().startswith(CONVERSATION_KEY_PREFIXES)
+
+
 def active_platforms(names: set) -> set:
-    """``names`` plus the routed platform, when there is one."""
-    routed = routed_platform()
-    return names | {routed} if routed else names
+    """``names`` plus the routed platforms, when there are any."""
+    return names | {p for p in (routed_platform(), conversation_platform()) if p}
 
 
 def resolve(runner: Any, platform: Any, adapter: Any, sub: Optional[dict] = None) -> Any:
-    """The adapter to deliver ``sub`` with: ``adapter`` when there is one, else the stand-in, or None."""
-    if adapter is not None or not routes(platform):
+    """The adapter to deliver ``sub`` with: ``adapter`` when there is one, else a stand-in, or None.
+
+    A subscription addressed to a gateway conversation gets the conversation
+    stand-in, armed by A2A_NOTIFY_CONVERSATIONS; any other gets the home stand-in,
+    armed by A2A_NOTIFY_PLATFORM.
+    """
+    if adapter is not None:
+        return adapter
+    conversation = is_conversation(sub)
+    name = str(getattr(platform, "value", platform) or "").lower()
+    if conversation:
+        if not name or name != conversation_platform():
+            return None
+    elif not routes(platform):
         return adapter
     if getattr(getattr(runner, "config", None), "multiplex_profiles", False):
         return None
     if sub is not None and not str(sub.get("thread_id") or "").strip():
         return None
-    stand_in = getattr(runner, RUNNER_ATTR, None)
+    attr, cls = ((RUNNER_CONVERSATION_ATTR, ConversationNotifyAdapter) if conversation
+                 else (RUNNER_ATTR, ChatNotifyAdapter))
+    stand_in = getattr(runner, attr, None)
     if stand_in is None or stand_in.platform != platform:
-        stand_in = ChatNotifyAdapter(platform, runner)
-        setattr(runner, RUNNER_ATTR, stand_in)
+        stand_in = cls(platform, runner)
+        setattr(runner, attr, stand_in)
     if not stand_in.route_up():
         return None
     return stand_in
@@ -230,6 +286,10 @@ class ChatNotifyAdapter(BasePlatformAdapter):
         handler_factory = getattr(runner, "_primary_message_handler", None)
         if callable(handler_factory):
             self.set_message_handler(handler_factory())
+
+    def notify_target(self, chat_id: str, thread: str) -> list:
+        """The argv that addresses the post: a home-channel thread, or none for a new one."""
+        return ["--thread", thread] if thread else []
 
     def route_down(self) -> bool:
         return time.monotonic() < self._route_down_until
@@ -300,8 +360,11 @@ class ChatNotifyAdapter(BasePlatformAdapter):
                    metadata: Optional[Dict[str, Any]] = None) -> SendResult:
         thread = str((metadata or {}).get("thread_id") or "").strip()
         argv = [A2A_CLI, "notify", "--platform", self.platform.value, "--timeout", f"{NOTIFY_WAIT_SECONDS}s"]
-        if thread:
-            argv += ["--thread", thread]
+        try:
+            argv += self.notify_target(str(chat_id or "").strip(), thread)
+        except LookupError as exc:
+            logger.warning("chat.notify: %s; the card's report is not posted", exc)
+            return SendResult(success=False, error=str(exc))
         argv += ["--", content]
         proc = None
         try:
@@ -334,3 +397,55 @@ class ChatNotifyAdapter(BasePlatformAdapter):
         if not isinstance(answer, dict):
             answer = {}
         return SendResult(success=True, message_id=answer.get("message_id") or None, raw_response=answer)
+
+
+def conversation_context(session_id: str) -> str:
+    """The context id of the gateway conversation ``session_id`` holds the route for, or ""."""
+    path = os.environ.get(SESSION_KV_DB_ENV) or SESSION_KV_DEFAULT_DB
+    if not session_id or not os.path.exists(path):
+        return ""
+    try:
+        with closing(sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=SESSION_KV_TIMEOUT_SECONDS)) as conn:
+            row = conn.execute("SELECT metadata FROM session_metadata WHERE session_id = ?", (session_id,)).fetchone()
+        route = (json.loads(row[0]) if row and row[0] else {}).get(CONVERSATION_ROUTE_KEY)
+    except Exception as exc:  # noqa: BLE001 - an unreadable route is a failed send, said in the log
+        logger.warning("chat.notify: route for %s unreadable: %s", session_id, exc)
+        return ""
+    return str(route.get("context_id") or "") if isinstance(route, dict) else ""
+
+
+class ConversationNotifyAdapter(ChatNotifyAdapter):
+    """The stand-in for a card filed in a gateway conversation.
+
+    The subscription is (platform, the bridge session holding the route, the
+    conversation key). Its report goes out with ``--conversation`` and the
+    route's context id. It stays push-capable, because the notifier skips a
+    non-push adapter's text pings in notify+wake and the report would never be
+    posted. A wake for the card is not run as a turn in a new session that
+    posts into the conversation: ``handle_message`` self-posts it into the
+    bridge's own session (the source's chat_id) through the in-pod API server,
+    where the conversation's history is, and its reply goes nowhere, as a wake
+    for the bridge's session did before.
+    """
+
+    def __init__(self, platform: Platform, runner: Any) -> None:
+        super().__init__(platform, runner)
+        self._host, self._port, self._model_name = API_SERVER_HOST, API_SERVER_PORT, API_SERVER_MODEL
+        self._api_key = os.environ.get(API_SERVER_KEY_ENV, "")
+
+    def notify_target(self, chat_id: str, thread: str) -> list:
+        context = conversation_context(chat_id)
+        if not context:
+            raise LookupError(f"no conversation route recorded for {chat_id}")
+        return ["--conversation", thread, "--context", context]
+
+    async def handle_message(self, event: Any) -> None:
+        if not getattr(event, "internal", False):
+            # Nothing inbound reaches a send-only stand-in; say so if it does.
+            logger.warning("chat.notify: conversation stand-in got a non-internal event; ignored")
+            return
+        from gateway.wake import _self_post_chat_completion
+
+        session = str(getattr(getattr(event, "source", None), "chat_id", "") or "")
+        await _self_post_chat_completion(self, text=event.text, session_id=session)
+        event._gateway_accepted = True

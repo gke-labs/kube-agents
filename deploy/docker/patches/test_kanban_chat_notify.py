@@ -6,6 +6,8 @@ file runs on every pull request, where Hermes is not installed.
 
 import asyncio
 import enum
+import json
+import sqlite3
 import os
 import subprocess
 import sys
@@ -182,6 +184,19 @@ class ResolveTest(unittest.TestCase):
             self.assertIs(kanban_chat_notify.resolve(runner, Platform.GOOGLE_CHAT, None), stand_in)
             self.assertEqual(run.call_count, 3)
 
+    def test_a_conversation_subscription_gets_the_conversation_stand_in(self):
+        sub = {"thread_id": "gchat:spaces/A/threads/B", "chat_id": "a2a-ctx-1"}
+        conv_only = {kanban_chat_notify.NOTIFY_PLATFORM_ENV: "", kanban_chat_notify.NOTIFY_CONVERSATIONS_ENV: "google_chat"}
+        with mock.patch.dict(os.environ, conv_only):
+            got = kanban_chat_notify.resolve(_Runner(), Platform.GOOGLE_CHAT, None, sub)
+            self.assertIsInstance(got, kanban_chat_notify.ConversationNotifyAdapter)
+            # A home-thread subscription is not served by the conversation switch.
+            self.assertIsNone(kanban_chat_notify.resolve(_Runner(), Platform.GOOGLE_CHAT, None, {"thread_id": "spaces/H/threads/T"}))
+            self.assertEqual(kanban_chat_notify.active_platforms(set()), {"google_chat"})
+        with mock.patch.dict(os.environ, ROUTED):
+            # A2A_NOTIFY_PLATFORM alone does not route conversations.
+            self.assertIsNone(kanban_chat_notify.resolve(_Runner(), Platform.GOOGLE_CHAT, None, sub))
+
     def test_active_platforms(self):
         with mock.patch.dict(os.environ, ROUTED):
             self.assertEqual(kanban_chat_notify.active_platforms({"api_server"}), {"api_server", "google_chat"})
@@ -218,6 +233,57 @@ class SendTest(unittest.TestCase):
         self.assertIs(kwargs["stdin"], asyncio.subprocess.DEVNULL)
         self.assertTrue(result.success)
         self.assertEqual(result.message_id, "m1")
+
+    def test_a_gateway_conversation_is_sent_with_its_context(self):
+        # The subscription is (platform, the bridge session holding the route,
+        # the conversation key); the context id is read back from the route.
+        home = tempfile.TemporaryDirectory()
+        self.addCleanup(home.cleanup)
+        db = os.path.join(home.name, "session_kv.db")
+        with sqlite3.connect(db) as conn:
+            conn.execute("CREATE TABLE session_metadata (session_id TEXT PRIMARY KEY, metadata TEXT NOT NULL)")
+            conn.execute("INSERT INTO session_metadata VALUES (?, ?)", ("a2a-ctx-1", json.dumps(
+                {"conversation_route": {"platform": "google_chat", "conversation": "gchat:spaces/A/threads/B",
+                                        "context_id": "ctx-1"}})))
+        adapter = kanban_chat_notify.ConversationNotifyAdapter(Platform.GOOGLE_CHAT, _Runner())
+        calls = []
+
+        async def fake_exec(*argv, **kwargs):
+            calls.append(argv)
+            return _Proc(0, b'{"message_id":"m"}')
+
+        with mock.patch.dict(os.environ, {kanban_chat_notify.SESSION_KV_DB_ENV: db}), \
+                mock.patch.object(kanban_chat_notify.asyncio, "create_subprocess_exec", fake_exec):
+            result = asyncio.run(adapter.send("a2a-ctx-1", "- 3 nodes", metadata={"thread_id": "gchat:spaces/A/threads/B"}))
+            missing = asyncio.run(adapter.send("a2a-ctx-gone", "- 3 nodes", metadata={"thread_id": "gchat:spaces/A/threads/B"}))
+        self.assertTrue(result.success)
+        self.assertEqual(list(calls[0]), ["a2a", "notify", "--platform", "google_chat", "--timeout", "60s",
+                                          "--conversation", "gchat:spaces/A/threads/B", "--context", "ctx-1",
+                                          "--", "- 3 nodes"])
+        self.assertFalse(missing.success, "a session with no recorded route is a failed send, not a guess")
+        self.assertEqual(len(calls), 1)
+
+    def test_a_conversation_cards_wake_self_posts_into_the_bridge_session(self):
+        # Push-capable, so the notifier still sends the report; but a wake is
+        # self-posted into the bridge session (the source's chat_id) through
+        # the API server, never run as a fresh-session turn.
+        with mock.patch.dict(os.environ, {kanban_chat_notify.API_SERVER_KEY_ENV: "k"}):
+            adapter = kanban_chat_notify.ConversationNotifyAdapter(Platform.GOOGLE_CHAT, _Runner())
+        self.assertTrue(getattr(adapter, "supports_async_delivery", True), "push-capable, or the report is skipped")
+        self.assertEqual((adapter._host, adapter._port, adapter._api_key), ("127.0.0.1", 8642, "k"))
+        posted = []
+
+        async def self_post(a, *, text, session_id):
+            posted.append((a, text, session_id))
+
+        wake_mod = types.ModuleType("gateway.wake")
+        wake_mod._self_post_chat_completion = self_post
+        event = types.SimpleNamespace(internal=True, text="[kanban] t_1 blocked",
+                                      source=types.SimpleNamespace(chat_id="a2a-ctx-1"))
+        with mock.patch.dict(sys.modules, {"gateway.wake": wake_mod}):
+            asyncio.run(adapter.handle_message(event))
+        self.assertEqual(posted, [(adapter, "[kanban] t_1 blocked", "a2a-ctx-1")])
+        self.assertTrue(event._gateway_accepted)
 
     def test_no_thread_is_a_new_thread(self):
         _, calls = self._send(0, b"{}")
@@ -337,6 +403,22 @@ class ContractTest(unittest.TestCase):
         self.assertEqual(kanban_chat_notify.NOTIFY_PLATFORM_ENV, chat_notify.NOTIFY_PLATFORM_ENV)
         self.assertEqual(kanban_chat_notify.A2A_CLI, chat_notify.A2A_CLI)
         self.assertEqual(kanban_chat_notify.NOTIFY_OUTCOME_UNKNOWN, chat_notify.NOTIFY_OUTCOME_UNKNOWN)
+
+    def test_the_conversation_route_is_spelled_alike_where_it_is_written_and_read(self):
+        # session_kv_server writes it, kanban_event_routing addresses the card
+        # by it, and this module reads the context id back from it.
+        import ast
+        import kanban_event_routing
+        scripts = Path(__file__).resolve().parents[3] / "agents" / "platform" / "scripts"
+        tree = ast.parse((scripts / "session_kv_server.py").read_text())
+        consts = {t.id: node.value for node in tree.body if isinstance(node, ast.Assign)
+                  for t in node.targets if isinstance(t, ast.Name)}
+        self.assertEqual(ast.literal_eval(consts["CONVERSATION_ROUTE_KEY"]), kanban_chat_notify.CONVERSATION_ROUTE_KEY)
+        self.assertEqual(kanban_event_routing.CONVERSATION_ROUTE_KEY, kanban_chat_notify.CONVERSATION_ROUTE_KEY)
+        self.assertEqual(sorted(ast.literal_eval(consts["CONVERSATION_KEY_PREFIXES"]).values()),
+                         sorted(kanban_chat_notify.CONVERSATION_KEY_PREFIXES))
+        self.assertEqual(ast.literal_eval(consts["SESSION_KV_DB_PATH"].args[1]) if isinstance(consts["SESSION_KV_DB_PATH"], ast.Call)
+                         else None, kanban_chat_notify.SESSION_KV_DEFAULT_DB)
 
 
 # The upstream shapes the applier anchors on and wraps, as in v2026.9.14.

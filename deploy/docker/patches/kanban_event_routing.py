@@ -80,10 +80,87 @@ NON_CHAT_ORIGINS = frozenset({"api_server", "k8s-watcher"})
 #: than stalling the create.
 DB_TIMEOUT_SECONDS = 2.0
 
+#: Hermes's session store, where a compressed session's continuation records
+#: the session it continues (``parent_session_id``, with the parent ended
+#: ``'compression'``). The API server binds a card's ``chat_id`` to the raw
+#: session id, which compression replaces, so a route recorded under the
+#: original id is found by walking back along those edges.
+HERMES_HOME_ENV = "HERMES_HOME"
+STATE_DB_NAME = "state.db"
+#: The compression edge, and only it: a delegate's or branch's parent is
+#: another conversation, whose route is not this one's.
+COMPRESSION_END_REASON = "compression"
+#: How many compressions back to look. A long thread compresses a handful of
+#: times; the bound stops a cycle in a damaged store.
+COMPRESSION_WALK_MAX = 32
+
+#: Where the hermes-bridge's route for a gateway conversation sits in a
+#: session's metadata (session_kv_server.put_conversation_route): the
+#: platform, the gateway's conversation key and the context id. A card filed
+#: in that session is addressed to (platform, the session id holding the
+#: route, the conversation key); the kanban stand-in reads the context id back
+#: from here, and a wake self-posts into that session.
+CONVERSATION_ROUTE_KEY = "conversation_route"
+
 
 def session_kv_db_path() -> str:
     """The routing database this process should read."""
     return os.environ.get(DB_PATH_ENV) or DEFAULT_DB_PATH
+
+
+def state_db_path() -> str:
+    """Hermes's session store for this process's profile, or "" when unknown.
+
+    Hermes's own resolution first (it honours a profile override in context),
+    then the environment.
+    """
+    home = ""
+    try:
+        from hermes_constants import get_hermes_home
+
+        home = str(get_hermes_home() or "")
+    except Exception:  # not inside Hermes (tests), or a Hermes without it
+        home = os.environ.get(HERMES_HOME_ENV, "").strip()
+    return os.path.join(home, STATE_DB_NAME) if home else ""
+
+
+def _conversation_route(session_id: str, metadata: Optional[dict[str, Any]]) -> Optional[tuple[str, str, str]]:
+    """The subscription address a gateway conversation's route gives, or None."""
+    route = (metadata or {}).get(CONVERSATION_ROUTE_KEY)
+    if not isinstance(route, dict):
+        return None
+    platform = str(route.get("platform") or "")
+    conversation = str(route.get("conversation") or "")
+    if not platform or not conversation or not route.get("context_id"):
+        return None
+    return platform, session_id, conversation
+
+
+def _compression_ancestors(session_id: str, state_db: str) -> list[str]:
+    """The sessions ``session_id`` continues through compression, nearest first.
+
+    Read-only, and empty when the store is absent or unreadable: the walk only
+    ever adds a route, never stands in the way of the direct lookup.
+    """
+    if not state_db or not os.path.exists(state_db):
+        return []
+    found: list[str] = []
+    try:
+        with closing(sqlite3.connect(f"file:{state_db}?mode=ro", uri=True, timeout=DB_TIMEOUT_SECONDS)) as conn:
+            current = session_id
+            for _ in range(COMPRESSION_WALK_MAX):
+                row = conn.execute(
+                    "SELECT s.parent_session_id FROM sessions s JOIN sessions p ON p.id = s.parent_session_id "
+                    "WHERE s.id = ? AND p.end_reason = ?",
+                    (current, COMPRESSION_END_REASON),
+                ).fetchone()
+                if not row or not row[0] or row[0] in found or row[0] == session_id:
+                    break
+                current = row[0]
+                found.append(current)
+    except Exception as exc:  # sqlite, permissions, schema: fail open
+        log.debug("kanban event routing: compression lineage for %s unreadable: %s", session_id, exc)
+    return found
 
 
 def _stored_route(session_id: str, db_path: str) -> Optional[dict[str, Any]]:
@@ -155,6 +232,21 @@ def resolve_chat_route(
         _log_undeliverable(chat_id, f"the routing database could not be read: {exc}")
         return platform, chat_id, thread_id
 
+    holder = chat_id
+    if not metadata:
+        # A compressed session continues under a new id; its route is under
+        # the id the conversation started with.
+        for ancestor in _compression_ancestors(chat_id, state_db_path()):
+            try:
+                metadata = _stored_route(ancestor, db_path or session_kv_db_path())
+            except Exception:  # fail open, as the direct lookup does
+                metadata = None
+            if metadata:
+                holder = ancestor
+                break
+    conversation = _conversation_route(holder, metadata)
+    if conversation:
+        return conversation
     if not metadata:
         _log_undeliverable(chat_id, "no chat route was recorded for it")
         return platform, chat_id, thread_id
