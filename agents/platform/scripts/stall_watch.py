@@ -256,12 +256,13 @@ CLUSTER_LIST_TIMEOUT_SECONDS = 120
 #: listing still running at the deadline is unlisted this tick. One at a time,
 #: a hundred projects (the scope's cap) each hanging to the gcloud timeout would
 #: outlast the whole tick.
-#: Every listing is a gcloud process the credential proxy runs, and the proxy
-#: admits four requests at once under its child memory budget at the
-#: operator's default limit (docs/designs/credential-proxy-child-memory-budget.md
-#: §2.2), so a wider pool only queues the rest at the proxy, where a listing
-#: still waiting at its 60 s admission bound is refused busy and reads
-#: unlisted. The pool is the admitted count, as in cluster_agent_reconcile.py.
+#: Every listing is a gcloud process the credential proxy runs. The pool was
+#: sized to the four requests the proxy admitted at its old 1Gi default
+#: (docs/designs/credential-proxy-child-memory-budget.md §2.2), past which a
+#: listing queues at the proxy and one still waiting at its 60 s admission
+#: bound is refused busy and reads unlisted. The 2Gi default now admits eight
+#: (#2678); four wide leaves the rest for kanban workers' own commands, as in
+#: cluster_agent_reconcile.py.
 LIST_WORKERS = 4
 #: 12 s per listing at four wide: the per-listing share the 150 s budget gave
 #: at eight. The listing runs inside TICK_BUDGET_SECONDS, so it leaves the

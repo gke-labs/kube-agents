@@ -176,6 +176,10 @@ test models, counted for the slots in use now rather than for the cap, so a brok
 requests in flight is not charged for eight. A request is admitted when a slot is free and the
 sum of live reservations plus its own fits `children_budget` with its slot counted.
 
+(Since gke-labs/kube-agents#2678 the default limit is 2Gi: 1728 MiB after the reserves admits nine,
+and the slot cap of eight binds. The figures below are the 1Gi limit this design was written
+against.)
+
 At the operator's defaults (1Gi limit, 8 MiB output cap) a request costs 128 MiB plus 48 MiB of
 output allowance, 176 MiB, against 704 MiB after the two fixed reserves: four requests that run
 commands are in flight at once (4 × 176 = 704), whatever order they arrive in, where the slot cap

@@ -845,8 +845,9 @@ Consequences:
   API `resourceFieldRef` the operator renders; the cgroup's `memory.max` when it is
   absent or not a positive integer; no budget when neither is readable) less 192 MiB for the broker and Envoy and
   128 MiB for the content workspace's one process tree at a time. At the operator's
-  defaults that admits four requests at once, whatever executable fills them; the slot
-  cap is the upper bound. The container's limit moves through the CR,
+  defaults (a 2Gi limit since gke-labs/kube-agents#2678, 1Gi before) that admits nine
+  requests at once, whatever executable fills them; the slot cap of eight is the upper
+  bound. The container's limit moves through the CR,
   `spec.deployment.credentialProxy.resources`, which merges over the operator's
   defaults per key; raising it raises the admitted count. The caps stay the
   operator's, because a CR override of a cap would detach it from the limit. A limit under which the budget would admit fewer than two

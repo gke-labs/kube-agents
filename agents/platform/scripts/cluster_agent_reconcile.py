@@ -160,14 +160,15 @@ _api_disabled_this_run: set[str] = set()
 # with nothing written. The listing budget caps the phase at LIST_BUDGET_SECONDS whatever
 # hangs, with the rest recorded unlisted, and the gate's 390s ceiling leaves the prune and
 # settle time after it. Creates still run in the fixed order.
-# Every lookup is a gcloud process the credential proxy runs, and the proxy admits four
-# requests at once under its child memory budget at the operator's default limit
+# Every lookup is a gcloud process the credential proxy runs. The pool was sized to the
+# four requests the proxy admitted under its child memory budget at the old 1Gi default
 # (docs/designs/credential-proxy-child-memory-budget.md §2.2): credential_proxy.py's
 # children budget, 704 MiB of the 1 GiB limit after BROKER_RESIDENT_RESERVE_BYTES and
 # CONTENT_WORKSPACE_RESERVE_BYTES, over one request's cost, 176 MiB
 # (REQUEST_CHILD_MEMORY_RESERVE_BYTES plus OUTPUT_COPIES_PER_COMMAND of the 8 MiB output
-# cap). A wider pool only queues the rest at the proxy, where a lookup still waiting at its
-# 60s admission bound is refused busy and reads unlisted for the tick.
+# cap). The 2Gi default now admits eight (#2678); four wide leaves the rest for the kanban
+# workers' own commands. Past the admitted count a lookup queues at the proxy, and one
+# still waiting at its 60s admission bound is refused busy and reads unlisted for the tick.
 LIST_WORKERS = 4
 LIST_TIMEOUT_SECONDS = 120
 # 12s per listing at four wide: the per-listing share the 150s budget gave at eight.

@@ -1387,7 +1387,7 @@ The defaults carry no ephemeral-storage request because the operator renders non
 {{- define "kube-agents.credentialProxyDefaults" -}}
 {{- dict
       "requests" (dict "cpu" "500m" "memory" "512Mi")
-      "limits" (dict "cpu" "1" "memory" "1Gi" "ephemeral-storage" "2Gi")
+      "limits" (dict "cpu" "1" "memory" "2Gi" "ephemeral-storage" "2Gi")
    | toJson -}}
 {{- end }}
 
