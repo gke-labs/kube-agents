@@ -372,6 +372,12 @@ An eval run can drive the agent against a GitLab repository instead ([#2394](htt
 
 The Prow job and the sweep's GitLab pass in `oss-test-infra` are the rest of #2394.
 
+### 5.7 The Compute plant sweep
+
+A bench stack that plants project-level Compute resources (such as prebuilt subnet exhaustion stacks) creates a VPC network, subnet, and internal addresses. When an evaluation run is killed hard (SIGTERM / timeout / runner loss) before `tofu destroy` runs, those resources are orphaned. The Boskos janitor is disabled for the pool (section 8), and `hack/ci-teardown.sh` is Kubernetes-only.
+
+**The sweep.** `hack/ci_sweep_compute_plants.py` provides cleanup for these leftovers. The script can be run manually against one project (`--project <id>`, with `--dry-run` to inspect without deleting) or across the Boskos pool (`--pool`). In `--project` mode, it acquires the named project from Boskos out of `free` into `cleaning` and refuses if it is leased, busy, or not registered there, ensuring active evaluation runs are not swept. It sweeps Compute addresses, subnets, and networks whose `description` starts with `kube-agents-bench plant`. Gating is rooted on the VPC network: plant networks older than `--max-age-hours` (default 4 hours; missing or unparseable timestamps are treated as old) are selected along with their child plant subnets and internal addresses, while plant subnets and addresses attached to non-plant networks (or orphaned) are gated on their own creation timestamp. Deletion runs in dependency order: addresses first, then subnets, then networks.
+
 ## 6. The seeded dirty fleet
 
 Six of the evaluation scenarios assert on defects that were planted on purpose — a crashlooping `payments-api`, a workload with no PodDisruptionBudget, an idle node pool, a control plane held a minor behind, a cluster missing master authorized networks. Those fixtures are not provisioned per run. They live on four small standing GKE clusters, `seeded-a` to `seeded-d`, and **each pool project needs its own set**: Boskos leases at random, so a project without them is a project where every fleet check reports `status: "error"` and `VerificationCoverage` drops below 1.0 for that run.

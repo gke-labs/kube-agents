@@ -228,6 +228,13 @@ func startRig(t *testing.T) *rig {
 // reach into a running gateway.
 func startRigWith(t *testing.T, tweak func(*Config)) *rig {
 	t.Helper()
+	return startRigWithLogger(t, tweak, nil)
+}
+
+// startRigWithLogger is startRigWith with the gateway's logger supplied, for
+// the cases that assert on what the gateway logs. nil is the default logger.
+func startRigWithLogger(t *testing.T, tweak func(*Config), logger *slog.Logger) *rig {
+	t.Helper()
 	s := startServer(t)
 	url := s.ClientURL()
 	provision(t, url)
@@ -262,7 +269,7 @@ func startRigWith(t *testing.T, tweak func(*Config)) *rig {
 	if tweak != nil {
 		tweak(cfg)
 	}
-	g, err := New(Options{Client: client, Adapter: adapter, Config: cfg, Backend: "discord"})
+	g, err := New(Options{Client: client, Adapter: adapter, Config: cfg, Backend: "discord", Logger: logger})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}

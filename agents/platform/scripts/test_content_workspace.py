@@ -2181,6 +2181,87 @@ class CloneCredentialTest(unittest.TestCase):
         self.assertEqual([], list(store.tree_root.iterdir()))
 
 
+class OtherForgeTest(unittest.TestCase):
+    """A repository on another forge: cloned from the URL its forge composes."""
+
+    HELPER = (
+        ("credential.helper", ""),
+        ("credential.https://gitlab.com.helper", "/opt/helper /var/run/token oauth2"),
+    )
+    URL = "https://gitlab.com/acme/platform/infra.git"
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.base = Path(self.tmp.name)
+        self.agent = self.base / "data"
+        self.agent.mkdir()
+        self.addCleanup(self.tmp.cleanup)
+        self.located = []
+
+    def locate(self, repo):
+        self.located.append(repo)
+        if repo.startswith("gitlab.com/"):
+            return repo, self.URL
+        raise ContentWorkspaceError(f"{repo} is not a repository on a forge this install serves")
+
+    def store(self, runner, credential_for=None, locate=True):
+        return ContentWorkspaceStore(
+            self.base / "trees", self.agent, runner, credential_for=credential_for,
+            locate=self.locate if locate else None,
+        )
+
+    def test_a_host_qualified_repository_clones_from_its_forges_url_with_its_credential(self):
+        credential = FakeCredential(self.HELPER)
+        asked = []
+        runner = ConfigRecordingRunner()
+        store = self.store(runner, lambda repo: asked.append(repo) or credential)
+        workspace = store.open("gitlab.com/acme/platform/infra")
+        clone = runner.subcommands.index("clone")
+        self.assertIn(self.URL, runner.calls[clone][0])
+        self.assertNotIn("github.com", " ".join(runner.calls[clone][0]))
+        self.assertEqual(self.HELPER, runner.configs[clone])
+        self.assertEqual(["gitlab.com/acme/platform/infra"], asked)
+        self.assertEqual("gitlab.com/acme/platform/infra", workspace.repo)
+
+    def test_a_pinned_base_applies_to_a_repository_on_another_forge(self):
+        # #2306's pins are keyed by the forge's canonical host and path; a
+        # GitLab workspace looks its pin up under the name it is stored by.
+        runner = ConfigRecordingRunner()
+        store = ContentWorkspaceStore(
+            self.base / "trees", self.agent, runner, locate=self.locate,
+            pinned_bases={("gitlab.com", "acme/platform/infra"): "release",
+                          ("github.com", "acme/platform/infra"): "other"},
+        )
+        store.open("gitlab.com/acme/platform/infra", depth=1)
+        probe = runner.subcommands.index("ls-remote")
+        self.assertIn(self.URL, runner.calls[probe][0])
+        self.assertIn("refs/heads/release", runner.calls[probe][0])
+        clone = runner.subcommands.index("clone")
+        argv = runner.calls[clone][0]
+        self.assertEqual("release", argv[argv.index("--branch") + 1])
+
+    def test_a_bare_name_is_still_githubs_and_never_asks_the_locator(self):
+        runner = ConfigRecordingRunner()
+        store = self.store(runner)
+        store.open("acme/fleet")
+        clone = runner.subcommands.index("clone")
+        self.assertIn("https://github.com/acme/fleet.git", runner.calls[clone][0])
+        self.assertEqual([], self.located)
+
+
+    def test_a_host_and_one_segment_is_not_a_slug_and_is_never_cloned_from_github(self):
+        # Review (#2549): `github.com/acme` passed the two-part check and was
+        # cloned from https://github.com/github.com/acme.git on the ambient
+        # credential. A GitHub owner never has a dot; a host always does.
+        for name in ("github.com/acme", "github.com/acme.git", "gitlab.com/acme"):
+            with self.subTest(name=name):
+                runner = ConfigRecordingRunner()
+                store = self.store(runner, locate=False)
+                with self.assertRaises(ContentWorkspaceError):
+                    store.open(name)
+                self.assertNotIn("clone", runner.subcommands)
+
+
 class IdleReclaimTest(unittest.TestCase):
     """A dead worker's workspace expires and a live one's does not.
 

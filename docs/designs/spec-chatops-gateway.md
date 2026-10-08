@@ -2,7 +2,7 @@
 
 - **Author:** [@bnaylor]
 - **Date:** 2026-08-24
-- **Status:** merged design of record; the gateway program is implemented (`a2a/gateway`: session registry, authority block, interceptors, supervisor duties, Discord, Google Chat and Slack adapters, the console adapter, and the A2A door); the operator renders the gateway Deployment, its env and the `A2A_SPAWN_SESSIONS` arming under `mode: next` (`platformagent_a2a_manifests.go`) plus, under its own eval flag, the inject backend below and its Service, principal map, token Secret and gateway fence, and under its own flag the A2A door and the same four objects; and, when `spec.integration.googleChat` is enabled under `next`, the Google Chat adapter's env, its projected relay token, and the broker's side of it (the A2A relay instance on the install's one subscription, `CREDENTIAL_PROXY_A2A_CHAT_AUDIENCE`, the gateway's ServiceAccount on `CREDENTIAL_PROXY_ALLOWED_CALLERS`, and the broker NetworkPolicy admitting the A2A gateway pod); the legacy Hermes consumer is not rendered under `next`, so the composition's one Chat subscription is the whole of the Pub/Sub the install needs; and, when `spec.integration.slack` is enabled under `next` and Chat is not, the Slack adapter's env (`SLACK_BOT_TOKEN` and `SLACK_APP_TOKEN` through the CR's `botTokenSecretRef` and `appTokenSecretRef`, and the CR's `allowedUsers` as `A2A_SLACK_ALLOWED_USERS` and `A2A_SLACK_ALLOW_ALL_USERS`), with the legacy consumer - the broker's Socket Mode relay and the Hermes slack platform - not rendered, so one Slack app has one Socket Mode connection; and the `a2a-slack-principal-map` mount either; of the pieces "Sessions by default" names as transition work, the `/session` opt-in is built (`a2a/gateway`: `/session`, `/session <text>`, `/session off`); the session pod's temporary read-only cluster view (a third broker caller under the operator's `A2A_SESSION_CLUSTER_VIEW` flag, off by default) is built, and now that gateway-side `AllowedUsers` enforcement has shipped it retires on the default flip (#2371), not at that enforcement's landing; the gateway-minted child task is built (a session asks with the `delegate` artifact; the gateway checks the platform agent's allowlist - the turn's requester, every steer author, and every author the conversation's current incarnation has seen - mints with the turn's authority and `via`, and wakes the session on the child's terminal; one child at a time, `A2A_DELEGATION_DEPTH_MAX` 3); not yet the `chat` profile's skills or the default flip
+- **Status:** merged design of record; the gateway program is implemented (`a2a/gateway`: session registry, authority block, interceptors, supervisor duties, Discord, Google Chat and Slack adapters, the console adapter, and the A2A door); the operator renders the gateway Deployment, its env and the `A2A_SPAWN_SESSIONS` arming under `mode: next` (`platformagent_a2a_manifests.go`), with the metrics listener (`A2A_METRICS_PORT`, container port `a2a-metrics`) and the gateway's own collector-only NetworkPolicy on every next gateway (see "Metrics"), plus, under its own eval flag, the inject backend below and its Service, principal map, token Secret and gateway fence, and under its own flag the A2A door and the same four objects; and, when `spec.integration.googleChat` is enabled under `next`, the Google Chat adapter's env, its projected relay token, and the broker's side of it (the A2A relay instance on the install's one subscription, `CREDENTIAL_PROXY_A2A_CHAT_AUDIENCE`, the gateway's ServiceAccount on `CREDENTIAL_PROXY_ALLOWED_CALLERS`, and the broker NetworkPolicy admitting the A2A gateway pod); the legacy Hermes consumer is not rendered under `next`, so the composition's one Chat subscription is the whole of the Pub/Sub the install needs; and, when `spec.integration.slack` is enabled under `next` and Chat is not, the Slack adapter's env (`SLACK_BOT_TOKEN` and `SLACK_APP_TOKEN` through the CR's `botTokenSecretRef` and `appTokenSecretRef`, and the CR's `allowedUsers` as `A2A_SLACK_ALLOWED_USERS` and `A2A_SLACK_ALLOW_ALL_USERS`), with the legacy consumer - the broker's Socket Mode relay and the Hermes slack platform - not rendered, so one Slack app has one Socket Mode connection; and the `a2a-slack-principal-map` mount either; of the pieces "Sessions by default" names as transition work, the `/session` opt-in is built (`a2a/gateway`: `/session`, `/session <text>`, `/session off`); the session pod's temporary read-only cluster view (a third broker caller under the operator's `A2A_SESSION_CLUSTER_VIEW` flag, off by default) is built, and now that gateway-side `AllowedUsers` enforcement has shipped it retires on the default flip (#2371), not at that enforcement's landing; the gateway-minted child task is built (a session asks with the `delegate` artifact; the gateway checks the platform agent's allowlist - the turn's requester, every steer author, and every author the conversation's current incarnation has seen - mints with the turn's authority and `via`, and wakes the session on the child's terminal; one child at a time, `A2A_DELEGATION_DEPTH_MAX` 3); not yet the `chat` profile's skills or the default flip
 
 ## Purpose
 
@@ -989,9 +989,10 @@ classifies the executors' own reasons (`bridge-shutdown`, `bridge-queue-overflow
 `hermes-api-unreachable`, `hermes-api-refused`, `session-busy`, `worker-evicted`, `bus-subscribe-failed`), a `rejected` terminal and a `canceled-before-start` as infrastructure,
 and grades the persona's (`hermes-exited-nonzero`, `deadline-exceeded`, `hermes-api-failed`,
 `hermes-api-unreadable`, `hermes-api-read-failed`, `hermes-api-oversize`) and any reason it does not
-know; a `canceled` after the harness's own cancel is the graded timeout. An eval install that
-declares the bridge sidecar sets `BRIDGE_CONCURRENCY` to at least the harness's parallelism
-(`EVAL_TASK_PARALLELISM`), because the bridge publishes `submitted` when it queues a task behind
+know; a `canceled` after the harness's own cancel is the graded timeout. An eval install's bridge
+runs at least the harness's parallelism (`EVAL_TASK_PARALLELISM`) in workers - the operator
+renders the bridge, so the setting is the operator's `A2A_BRIDGE_CONCURRENCY`, or
+`BRIDGE_CONCURRENCY` on a bridge sidecar the install declares itself - because the bridge publishes `submitted` when it queues a task behind
 its cap and `working` only when it spawns, and a unit queued for the whole budget is
 infrastructure, not a graded answer.
 
@@ -1044,7 +1045,8 @@ that treated the three alike is what this value exists to stop.
    it exists so that `kubectl port-forward svc/<cr>-a2a-inject` resolves to the pod and the
    port.
 5. **While it is armed, a NetworkPolicy fences the gateway pod against every pod on the cluster
-   network**: ingress with no rules. It is a second control over the edge the bind already
+   network**: one ingress rule, which admits the managed-Prometheus collector's namespace to
+   the metrics-only port and nothing to the door (see "Metrics" below). The gateway's own fence, which renders on every next gateway whether or not a door is armed, admits the same, so this copy is the door's record of the intent rather than the pod's only fence. It is a second control over the edge the bind already
    closes, kept so that a reader of the rendered objects sees the intent and so that a later
    change to the bind address does not open the pod network by itself. Neither it nor the bind
    governs the port-forward, which the kubelet serves from inside the pod's network namespace;
@@ -1607,6 +1609,52 @@ install with no `discord-bot` Secret and this door armed gets its gateway rather
 `NoChatBackend` condition, which is what the gateway's own start-up check already accepts. The
 identity classes above are what will let it be rendered on an install a customer reaches; until
 then it is a dev and eval door like the other.
+
+## Metrics (added 10/6)
+
+The gateway serves Prometheus counters on a metrics-only listener, the credential broker's
+pattern copied: its own port, `/metrics` and nothing else (any other path is 404, any method
+but GET or HEAD 405), every interface rather than loopback because its caller is the managed-Prometheus
+collector on the pod network. `A2A_METRICS_PORT` names the port; unset means no listener, and a
+value that is not a port, or is either door's port, refuses the boot. A port that will not bind
+costs the gateway its metrics and logs an `ALERT` line; conversations carry on. The operator
+renders `A2A_METRICS_PORT=9096` and declares container port `a2a-metrics` on 9096 from one
+constant (`a2aGatewayMetricsPort`), and the chart's `<name>-a2a-gateway-monitoring`
+`PodMonitoring` scrapes 9096 every 30 seconds behind the `platformAgent.podMonitoring` switch. The
+gateway's own NetworkPolicy, `<name>-a2a-gateway-netpol`, renders wherever the gateway Deployment
+does, door or no door, and admits one peer: the `gke-gmp-system` namespace, to 9096 alone, the
+broker's second rule with the gateway's port in it. Each armed door renders a copy under its own
+name, and the doors' ports admit no pod. The gateway's fence used to render only with a door, which
+left the metrics port, bound on every interface, reachable from the whole pod network on an install
+with neither door armed; it renders on every `next` install now so that it is not (decided
+10/6 on #2473). It is Ingress-only, so the gateway's own dials to the bus are untouched.
+
+The site's [Observability page](../site/src/content/docs/concepts/observability.md) is
+canonical for what an operator reads off these series; this section is the design. Every label
+value comes from a closed list, never from a task, a conversation or an executor's
+text, so nothing a chat user or an executor sends can mint a series:
+
+| Metric                                               | Labels                                                                                                                                           | Counts                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| ---------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `kubeagents_a2a_gateway_task_terminals_total`        | `state`: `completed`, `failed`, `canceled`, `rejected`, `other`; `source`: `executor`, `supervisor`, `gateway`, `gateway-never-started`, `other` | Each task terminal the gateway delivers to a conversation, counted once where every terminal path converges (`observeTaskTerminal`), by its final state and by whose word it is (`TerminalSource`): the executor's on the events subject, the supervisor's on the supervisor subject, or the gateway's own for a task whose submission never reached the bus (`gateway`) or that no executor took inside `A2A_FIRST_EVENT_GRACE` (`gateway-never-started`). |
+| `kubeagents_a2a_gateway_gchat_events_received_total` | none                                                                                                                                             | Google Chat events pulled from the broker's relay, before parsing or classification. A payload that does not parse, or an event that is not a turn, still counts.                                                                                                                                                                                                                                                                                           |
+| `kubeagents_a2a_gateway_gchat_pulls_total`           | `outcome`: `events`, `empty`, `failed`                                                                                                           | Pulls of the Chat relay: one that returned an event, one that returned nothing, one the relay refused or that never answered. The same counts as the 15-minute `gchat events received` line, without the reset.                                                                                                                                                                                                                                             |
+
+Every series is created at zero, so a `rate()` over a state that has not happened reads 0
+rather than no data. A pull carries at most one event today, so `gchat_events_received_total`
+equals `gchat_pulls_total{outcome="events"}`; they are separate so the first keeps its meaning if a
+pull ever returns more than one. An install that Chat publishes nothing to shows `empty` rising
+and `events` flat; a refused relay shows `failed` rising.
+
+The terminal counter counts every terminal the gateway hands its adapter, not only the relay's.
+It counts in `observeTaskTerminal`, the funnel each route ends in once: the relay; the stale-task
+heal, which delivers the terminal the relay missed, under the source its subject gives it; the
+never-started heal (`gateway-never-started`); and a submission that never reached the bus
+(`gateway`). The last two are failures the gateway declares itself, so a bus outage or an install
+with no executor shows `failed` rising under them rather than reading zero failed tasks while
+the chat shows ❌. The executor's reason token is not a label.
+The gateway does not know the executors' tokens, which are theirs to define, so it has no closed
+list to draw one from, and an open one is the cardinality the labels exist to avoid.
 
 ## What stage 2 builds from this doc
 

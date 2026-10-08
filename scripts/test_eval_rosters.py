@@ -162,6 +162,7 @@ ADDED_AFTER_THE_MOVE = [
     "chat-voice-final-attempt-is-not-retried",  # the front door's reply to a card's last attempt
     "chat-voice-failure-leads-with-fact",  # the front door's reply to a blocked card
     "upgrades-zonal-control-plane-outage-warned",  # upgrade-failure catalogue entry 11, the first scenario case
+    "oobe-first-run-audits",  # the oobe job's first-run audits stage
 ]
 
 # Admitted after the split, each by a pull request that cited the record

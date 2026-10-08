@@ -1290,6 +1290,47 @@ Mutation(
         "pod, which the API server reports as success",
     ),
     Mutation(
+        "C1-a2a-gateway-collector-from-every-namespace",
+        "k8s-operator/internal/controller/testdata/a2a-gateway-ingress.yaml",
+        ("        - namespaceSelector:\n            matchLabels:\n              kubernetes.io/metadata.name: gke-gmp-system\n",
+         "        - namespaceSelector: {}\n"),
+        "test_C1_the_a2a_gateway_admits_the_collector_to_the_metrics_port_and_nobody_else",
+        "drop the matchLabels from the inject fence's collector peer, the edit "
+        "that reads as \"admit Prometheus wherever it runs\" and admits every "
+        "pod in every namespace to the gateway's metrics port",
+    ),
+    Mutation(
+        "C1-a2a-gateway-collector-to-a-door-port",
+        "k8s-operator/internal/controller/testdata/a2a-gateway-ingress.yaml",
+        ("      ports:\n        - port: 9096\n", "      ports:\n        - port: 8099\n"),
+        "test_C1_the_a2a_gateway_admits_the_collector_to_the_metrics_port_and_nobody_else",
+        "point the inject fence's collector rule at the inject door's port, so "
+        "the collector's namespace reaches a task-submission endpoint guarded "
+        "by its bearer token alone",
+    ),
+    Mutation(
+        "C1-a2a-gateway-second-ingress-rule",
+        "k8s-operator/internal/controller/testdata/a2a-gateway-ingress.yaml",
+        ("      ports:\n        - port: 9096\n          protocol: TCP\n  podSelector:",
+         "      ports:\n        - port: 9096\n          protocol: TCP\n    - from:\n        - podSelector: {}\n"
+         "      ports:\n        - port: 8098\n          protocol: TCP\n  podSelector:"),
+        "test_C1_the_a2a_gateway_admits_the_collector_to_the_metrics_port_and_nobody_else",
+        "add a second rule beside the collector's, admitting every pod in the "
+        "namespace to the A2A door's port: the 'an in-cluster caller needs the "
+        "door' edit made without the decision the fence's comment asks for",
+    ),
+    Mutation(
+        "C1-a2a-gateway-fence-selects-a-label-the-pod-lacks",
+        "k8s-operator/internal/controller/testdata/a2a-gateway-ingress.yaml",
+        ("  podSelector:\n    matchLabels:\n      app: test-agent-a2a-gateway\n",
+         "  podSelector:\n    matchLabels:\n      app.kubernetes.io/name: test-agent-a2a-gateway\n"),
+        "test_C1_the_a2a_gateway_admits_the_collector_to_the_metrics_port_and_nobody_else",
+        "move the inject fence's selector to an app.kubernetes.io/name key the "
+        "gateway pod carries with another value, the half-done label migration: "
+        "the fence still names the Deployment, selects no pod, and the API "
+        "server reports that as success",
+    ),
+    Mutation(
         "C1-session-pod-gets-a-second-token",
         "a2a/gateway/spawn.go",
         ("AutomountServiceAccountToken: ptr.To(false),",
@@ -1542,6 +1583,24 @@ Mutation(
         "reads like the executor's own business. The subject then no longer "
         "says who wrote there. Retargeted from `worker` when A5 retired that "
         "user; the static credential it names is the half the bridge inherited",
+    ),
+    Mutation(
+        "C1-rendered-bridge-keeps-the-bus-token",
+        "k8s-operator/internal/controller/platformagent_a2a_bridge.go",
+        ("\t\tif !a2aIsBusTokenMount(m) {\n\t\t\tmounts = append(mounts, m)\n\t\t}",
+         "\t\tmounts = append(mounts, m)"),
+        "test_C1_the_rendered_bridge_is_not_the_agent_principal",
+        "copy every agent mount into the rendered bridge, bus token included: "
+        "the bridge then authenticates as the agent principal and the A5 split "
+        "is undone by a volumeMount",
+    ),
+    Mutation(
+        "C1-rendered-bridge-inherits-the-agent-bus-user",
+        "k8s-operator/internal/controller/platformagent_a2a_bridge.go",
+        ("\ta2aBusUserEnv:               true,\n", ""),
+        "test_C1_the_rendered_bridge_is_not_the_agent_principal",
+        "let the rendered bridge inherit A2A_BUS_USER=agent, the agent "
+        "principal's name and inbox prefix",
     ),
     Mutation(
         "A3-session-writes-its-own-supervisor-subject",

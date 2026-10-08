@@ -477,6 +477,74 @@ class C1IsolationIsStructural(unittest.TestCase):
             "fences no pod: fence requires %r, spawner stamps %r" % (required, stamped),
         )
 
+    def test_C1_the_a2a_gateway_admits_the_collector_to_the_metrics_port_and_nobody_else(self) -> None:
+        """The gateway's fences admit one peer, to one port: the collector, to metrics.
+
+        The A2A gateway's doors listen on loopback, and its fences deny every
+        pod on their ports; a door reached from the pod network is a task
+        submission endpoint guarded by a bearer token alone. The metrics
+        listener is the one port on that pod the pod network is meant to
+        reach, and only from the managed-Prometheus collector's namespace --
+        the credential broker's second rule, copied. A rule that admits any
+        other peer, or admits the collector to any other port, widens the
+        gateway past what the metrics listener needed.
+
+        Read from the operator's real render (the fixture its Go test keeps
+        equal to the builder), with both doors armed so all three fences
+        exist: each door's, and the gateway's own, which renders on every next
+        gateway door or no door because the metrics listener binds every
+        interface (#2473).
+        """
+        documents = h.yaml_documents("a2a_gateway_ingress_fixture")
+        policies = h.objects_of_kind(documents, "NetworkPolicy")
+        deployments = h.objects_of_kind(documents, "Deployment")
+        self.assertEqual(len(policies), 3, "the fixture no longer renders the three gateway fences")
+        self.assertTrue(
+            any(p["metadata"]["name"].endswith("-a2a-gateway-netpol") for p in policies),
+            "the fixture no longer renders the gateway's own fence, the one no door flag decides",
+        )
+        self.assertEqual(len(deployments), 1, "the fixture no longer carries the gateway's ports")
+
+        gateway = deployments[0]
+        ports = [p for c in h.containers_of(gateway) for p in c.get("ports") or []]
+        metrics = [p["containerPort"] for p in ports if p.get("name") == "a2a-metrics"]
+        doors = {p["containerPort"] for p in ports if p.get("name") != "a2a-metrics"}
+        self.assertEqual(len(metrics), 1, "the gateway declares no single a2a-metrics port")
+        self.assertTrue(doors, "the fixture renders no door port, so nothing here is fenced")
+        self.assertNotIn(metrics[0], doors, "the metrics port is also a door's port")
+        collector = {"matchLabels": {"kubernetes.io/metadata.name": "gke-gmp-system"}}
+        # The labels the gateway pod carries, not the Deployment's name: a
+        # fence requiring a label the pod lacks selects nothing, and the API
+        # server reports that as success.
+        pod_labels = ((gateway["spec"].get("template") or {}).get("metadata") or {}).get("labels") or {}
+        self.assertTrue(pod_labels, "the fixture carries no gateway pod labels, so no selector can be checked")
+
+        for policy in policies:
+            name = policy["metadata"]["name"]
+            spec = policy["spec"]
+            with self.subTest(policy=name):
+                selector = spec.get("podSelector") or {}
+                required = selector.get("matchLabels") or {}
+                self.assertEqual(set(selector), {"matchLabels"}, "the fence's podSelector is not plain matchLabels")
+                self.assertTrue(required, "the fence's podSelector is empty, so it selects every pod")
+                self.assertEqual(
+                    required, {key: pod_labels.get(key) for key in required},
+                    "the fence selects labels the gateway pod does not carry, so it fences no pod: "
+                    "fence requires %r, pod carries %r" % (required, pod_labels),
+                )
+                self.assertIn("Ingress", spec.get("policyTypes") or [], "the fence governs no ingress")
+                rules = spec.get("ingress") or []
+                self.assertEqual(len(rules), 1, "the fence admits more than the collector's rule")
+                rule = rules[0]
+                self.assertEqual(
+                    rule.get("from"), [{"namespaceSelector": collector}],
+                    "the fence admits a peer other than the collector's namespace, alone",
+                )
+                self.assertEqual(
+                    rule.get("ports"), [{"port": metrics[0], "protocol": "TCP"}],
+                    "the collector is admitted to a port other than the metrics listener's",
+                )
+
     def test_C1_a_session_pod_carries_no_kubernetes_identity(self) -> None:
         """The premise the fence's rule set rests on.
 
@@ -1339,6 +1407,38 @@ class C1IsolationIsStructural(unittest.TestCase):
             "a2aBusTokenFileEnv by that constant; the name this test compared "
             "across the module boundary is not the name the operator refuses",
         )
+
+    def test_C1_the_rendered_bridge_is_not_the_agent_principal(self) -> None:
+        """The operator renders the bridge from the agent container, and the
+        copy is where the A5 split could be undone without a grant changing.
+
+        The pod's ServiceAccount resolves to the `agent` principal at the
+        callout, so a bridge holding the projected bus token would be a second
+        workload wearing the agent's identity; and the agent's `A2A_BUS_USER`
+        names that principal's inbox, which the bridge's grants do not cover.
+        The bridge is the static `bridge` principal, with the password from its
+        own Secret key. This reads the three places the render decides that:
+        the mount filter, the dropped env names, and the env it adds.
+        """
+        src = h.text("a2a_bridge_render")
+        build = h.go_function_body(src, "buildA2ABridgeContainer")
+        self.assertIn(
+            "!a2aIsBusTokenMount(m)",
+            build,
+            "the rendered bridge copies the agent's mounts without dropping the "
+            "bus token; it would authenticate as the agent principal",
+        )
+        dropped = src[src.index("var a2aBridgeDroppedAgentEnv"):]
+        dropped = dropped[: dropped.index("\n}")]
+        self.assertIn(
+            "a2aBusUserEnv:",
+            dropped,
+            "the rendered bridge inherits the agent's A2A_BUS_USER, the agent "
+            "principal's name and inbox",
+        )
+        own = h.go_function_body(src, "a2aBridgeOwnEnv")
+        self.assertIn("a2aBridgePasswordKey", own, "the rendered bridge is not given the static bridge principal's password")
+        self.assertNotIn("a2aBusToken", own, "the rendered bridge's own env names the bus token")
 
     # The fourth cross-module literal: the operator renders the static
     # principal names into the callout under this name, and the callout reads

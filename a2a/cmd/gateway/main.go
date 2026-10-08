@@ -32,6 +32,10 @@ const (
 	// dial, adapter and run failures all leave through it, each having
 	// logged its own reason at the site that found it.
 	exitFailure = 1
+
+	// metricsUnavailableAlert is the one line a metrics listener that could
+	// not start leaves, whichever step refused it.
+	metricsUnavailableAlert = "ALERT metrics listener unavailable; the gateway serves no /metrics until it restarts, and conversations are unaffected"
 )
 
 func main() {
@@ -131,10 +135,19 @@ func realMain(ctx context.Context, log *slog.Logger) error {
 	// FromEnv already enforced at most one real backend, and that the door
 	// carries a token if it is armed at all.
 	backend := cfg.Backend()
+	// One set of counters for the whole process: the gateway counts what it
+	// relays, the Chat adapter counts its pulls, and the metrics listener
+	// serves both (gateway/metrics.go).
+	metrics := gateway.NewMetrics()
 	var adapter gateway.Adapter
 	switch backend {
 	case "gchat":
-		adapter, err = gateway.NewGoogleChatAdapter(cfg.GchatRelayURL, cfg.GchatTokenPath, log)
+		var chat *gateway.GoogleChatAdapter
+		chat, err = gateway.NewGoogleChatAdapter(cfg.GchatRelayURL, cfg.GchatTokenPath, log)
+		if err == nil {
+			chat.SetMetrics(metrics)
+			adapter = chat
+		}
 	case "slack":
 		adapter, err = gateway.NewSlackAdapter(cfg.SlackBotToken, cfg.SlackAppToken, log)
 	case "":
@@ -190,6 +203,7 @@ func realMain(ctx context.Context, log *slog.Logger) error {
 		Config:  cfg,
 		Logger:  log,
 		Backend: backend,
+		Metrics: metrics,
 	})
 	if err != nil {
 		log.Error("gateway", "err", err)
@@ -204,9 +218,39 @@ func realMain(ctx context.Context, log *slog.Logger) error {
 		"defaultAddressee", cfg.DefaultAddressee,
 		"spawnSessions", cfg.SpawnSessions,
 		"idleTTL", cfg.IdleTTL.String())
-	if err := gw.Run(ctx); err != nil && ctx.Err() == nil {
+	return serve(ctx, cfg, metrics, log, gw.Run)
+}
+
+// serve is realMain's last step: the metrics listener beside the gateway,
+// then the gateway until ctx is done. run is gw.Run; it is a parameter so a
+// test can reach this step without a bus and see that a metrics listener
+// which cannot start leaves its ALERT line and does not stop the gateway.
+func serve(ctx context.Context, cfg *gateway.Config, metrics *gateway.Metrics, log *slog.Logger, run func(context.Context) error) error {
+	startMetricsListener(ctx, cfg, metrics, log)
+	if err := run(ctx); err != nil && ctx.Err() == nil {
 		log.Error("gateway exited", "err", err)
 		return err
 	}
 	return nil
+}
+
+// startMetricsListener serves the counters on A2A_METRICS_PORT when it is
+// set, on a goroutine of its own. Never fatal, the broker's rule for its own
+// listener: a port that will not bind costs the gateway its metrics, not the
+// conversations it exists to carry, and the ALERT line is the signal.
+func startMetricsListener(ctx context.Context, cfg *gateway.Config, metrics *gateway.Metrics, log *slog.Logger) {
+	if cfg.MetricsPort == 0 {
+		log.Info("metrics listener disabled: A2A_METRICS_PORT is unset")
+		return
+	}
+	srv, err := gateway.NewMetricsServer(cfg.MetricsPort, metrics, log)
+	if err != nil {
+		log.Error(metricsUnavailableAlert, "err", err)
+		return
+	}
+	go func() {
+		if err := srv.Run(ctx); err != nil {
+			log.Error(metricsUnavailableAlert, "err", err)
+		}
+	}()
 }
