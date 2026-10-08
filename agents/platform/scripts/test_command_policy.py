@@ -1576,7 +1576,7 @@ class TheAllowlistCoversWhatTheProductActuallyRuns(unittest.TestCase):
              "gce-startup-script-status evidence read"),
             (["gcloud", "compute", "instances", "describe", "vm-1",
               "--zone=us-east4-a", "--project=p", "--format=json"],
-             "the SOP's 2.3 ops-agent-guest-health read"),
+             "the gke-managed-node triage read behind SOP 2.1"),
         ):
             with self.subTest(desc=desc):
                 decision = evaluate(argv)
