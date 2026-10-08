@@ -195,14 +195,20 @@ version table is a handful of `gcloud` list calls and the readiness report
 runs only on the day a version appears or its week comes round, once per
 project that holds a pending cluster with its own timeout, so one project the
 sandbox cannot finish leaves only its own clusters ungraded and the others'
-versions still reported. Three guards keep the ledger honest: a version is
+versions still reported. The whole tick keeps to forty-five minutes of the
+hour Hermes gives a `no_agent` script: each project's run gets what the budget
+has left, a project it cannot reach is left unread and named in the line, and
+the order turns daily so that is not the same project every day. Three guards
+keep the ledger honest: a version is
 retired only on a tick whose version table read every project, a report that
 graded none of a version's pending clusters is written but not recorded (the
 chat line says "none graded" and the version is tried again tomorrow), and the
 weekly comparison carries ten minutes of slack so the tick's own drift cannot
-push a refresh to day eight. A partial table or an ungraded version is
-announced once, not daily: the ledger keeps what was announced and the next
-line is the recovery. A version none of whose clusters can be read is retried
+push a refresh to day eight. A partial table, an ungraded version or a failed
+tick is announced once, not daily: the ledger keeps what was announced, a
+failed tick (which writes nothing to the ledger) keeps its line in
+`last-failure.txt` beside it, and the next line is the recovery. A version
+none of whose clusters can be read is retried
 three days running and then recorded, so an unreachable cluster costs its
 project one readiness sweep a week rather than one a day; a `blocked` verdict
 the script grades from cluster metadata stands even when the kubectl read
