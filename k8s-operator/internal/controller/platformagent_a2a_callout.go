@@ -19,6 +19,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -107,6 +108,20 @@ const (
 	// worker (the comment on a2aGatewayImageName says how).
 	a2aCalloutImageName   = "a2a-authcallout"
 	a2aCalloutImageEnvVar = "A2A_CALLOUT_IMAGE"
+
+	// a2aCalloutReservedPrincipalsEnvVar names the callout's list of static
+	// principal names (renderA2AReservedPrincipals). The callout refuses to
+	// start without it, so it and the image that reads it ship together.
+	a2aCalloutReservedPrincipalsEnvVar = "A2A_RESERVED_PRINCIPALS"
+
+	// a2aCalloutReservedAddresseesEnvVar names the callout's list of
+	// addressee names (renderA2AReservedAddressees). The callout refuses to
+	// start without it, so it and the image that reads it ship together.
+	a2aCalloutReservedAddresseesEnvVar = "A2A_RESERVED_ADDRESSEES"
+
+	// a2aReservedAddresseesSeparator joins the list. The callout's
+	// authcallout.ParseReservedAddressees splits on a bare comma.
+	a2aReservedAddresseesSeparator = ","
 
 	// a2aBusTokenAudience is the audience every bus token is bound to.
 	//
@@ -419,6 +434,31 @@ func a2aExecutorSidecarEnv(containers []corev1.Container) []corev1.Container {
 	return out
 }
 
+// a2aReservedAddressees is every addressee whose task subjects are keyed on a
+// fixed name, which a narrowed pod may therefore not be named after.
+//
+// A narrowed user is named for its pod, and the callout keys its task subjects
+// on that name: events, the consumers over `.in`, the capability verify and
+// reply subjects. A pod named after an addressee is handed that addressee's
+// subjects, so it can read the prompts sent to it and publish its events.
+//
+// On this render the set is one name. The gateway's A2A_DEFAULT_ADDRESSEE is
+// not rendered, so it keeps its own default, and the bridge's grants name
+// a2aBridgeAddressee and nothing else, which is also the bridge's
+// BRIDGE_PROFILE default. TestTheCalloutReservesTheConfiguredAddressees holds
+// this list to every addressee the bridge's grants name and to both defaults in
+// the a2a module, so widening the grant means adding the name here. Session pods are addressees
+// too, but under gateway-minted names, which are not reserved because each is
+// the name of the pod that is that addressee.
+func a2aReservedAddressees() []string {
+	return []string{a2aBridgeAddressee}
+}
+
+// renderA2AReservedAddressees is the callout's A2A_RESERVED_ADDRESSEES value.
+func renderA2AReservedAddressees() string {
+	return strings.Join(a2aReservedAddressees(), a2aReservedAddresseesSeparator)
+}
+
 // buildA2ACalloutServiceAccount is the identity the callout runs as. It is not
 // a bus identity: the callout authenticates to NATS with a password, because it
 // cannot authenticate through itself.
@@ -670,6 +710,14 @@ func buildA2ACalloutDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 							{Name: "A2A_AUTHMAP_NAME", Value: a2aAuthMapName(agent)},
 							{Name: "A2A_AUTHMAP_KEY", Value: a2aAuthMapKey},
 							{Name: "A2A_TOKEN_AUDIENCE", Value: a2aBusTokenAudience},
+							// The static nats.conf users, which no identity map
+							// carries: a narrowed pod named after one would
+							// hold its inbox. Plain names, no password.
+							{Name: a2aCalloutReservedPrincipalsEnvVar, Value: renderA2AReservedPrincipals(agent)},
+							// The addressees whose task subjects are keyed
+							// on a fixed name: a narrowed pod named after
+							// one would be handed them. Plain names.
+							{Name: a2aCalloutReservedAddresseesEnvVar, Value: renderA2AReservedAddressees()},
 							// The seeds. This Deployment is the only
 							// thing that reads them, and the issuer is the
 							// key that decides what every connection on

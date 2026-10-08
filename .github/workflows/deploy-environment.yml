@@ -327,10 +327,12 @@ jobs:
           # mechanism the GITOPS_* pair above already relies on. The exceptions
           # are the ones provision_environment.sh turns into flags before it
           # calls the installer: ALLOWED_USERS, NAMESPACE, CLUSTER_MODE and the
-          # SLACK_* set. A flag beats whatever the rendered install.env says,
-          # which is why that script passes them that way -- so for those, this
-          # block is the source and the flag is the route, not an alternative
-          # to it.
+          # SLACK_* set. A flag beats whatever the rendered install.env says
+          # (the chat flags excepted: install.sh refuses one that disagrees with
+          # the rendered file, and the render this job makes carries no chat
+          # key), which is why that script passes them that way -- so for
+          # those, this block is the source and the flag is the route, not an
+          # alternative to it.
           ALLOWED_USERS: ${{ vars.ALLOWED_USERS }}
           # Not install settings — the empty allowlist is already what produces
           # allow-all. Their only job is to let an operator SAY that the open

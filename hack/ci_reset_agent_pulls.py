@@ -208,6 +208,7 @@ def new_record(repo: str, project: str, build: str, scope: str, dry_run: bool) -
     every exit, so the reset that faulted is the one with a record too."""
     return {
         "schema_version": RECORD_SCHEMA_VERSION,
+        "forge": ledgers.FORGE_GITHUB,
         "repo": repo,
         "project": project,
         "build": build,
@@ -332,27 +333,46 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--scope", default="at lease time", help="what this reset is for, in the record and the log")
     parser.add_argument("--record", default="", help="write the JSON record of what happened here")
     parser.add_argument("--dry-run", action="store_true", help="list what would go; write nothing")
+    parser.add_argument(
+        "--forge", choices=(ledgers.FORGE_GITHUB, ledgers.FORGE_GITLAB), default=ledgers.FORGE_GITHUB,
+        help="github: --repo is owner/name on github.com; gitlab: --repo is the project path under the pool's group, and merge requests are what close (hack/ci_gitlab_forge.py)",
+    )
     args = parser.parse_args(argv)
     token = os.environ.get(TOKEN_ENV, "")
     if not token:
         print(f"ERROR: {TOKEN_ENV} is not set; nothing to authenticate with", file=sys.stderr)
         return 2
     record = new_record(args.repo, args.project, args.build, args.scope, args.dry_run)
+    forge = "GitLab" if args.forge == ledgers.FORGE_GITLAB else "GitHub"
+    host = ledgers.FORGE_HOSTS[args.forge]
+    limited: tuple = ()
     try:
-        reset(args.repo, args.project, args.build, args.scope, token, args.dry_run, record)
+        if args.forge == ledgers.FORGE_GITLAB:
+            import ci_gitlab_forge as gitlab
+
+            limited = (gitlab.RateLimited,)
+            gitlab.reset_merge_requests(args.repo, args.project, args.build, args.scope, token, args.dry_run, record)
+        else:
+            reset(args.repo, args.project, args.build, args.scope, token, args.dry_run, record)
     except ResetError as exc:
         record["error"] = str(exc)
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2
+    except limited as exc:
+        # GitLab's limit, reported as the GitHub path reports its HTTPError:
+        # in the record and on stderr, and the repository is not clean.
+        record["error"] = str(exc)
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
     except urllib.error.HTTPError as exc:
-        record["error"] = f"GitHub answered {describe(exc)} reading {args.repo}"
+        record["error"] = f"{forge} answered {describe(exc)} reading {args.repo}"
         print(
             f"ERROR: {record['error']}; a 403 or 404 here is the token's reach, not an empty repository",
             file=sys.stderr,
         )
         return 1
     except (OSError, http.client.HTTPException) as exc:
-        record["error"] = f"could not reach api.github.com ({type(exc).__name__}: {exc})"
+        record["error"] = f"could not reach {host} ({type(exc).__name__}: {exc})"
         print(f"ERROR: {record['error']}", file=sys.stderr)
         return 1
     finally:

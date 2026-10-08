@@ -100,6 +100,14 @@ def publisher_gate() -> str:
     return match.group(0)
 
 
+def rollback_function() -> str:
+    """run_rollback_roundtrip(), as written."""
+    match = re.search(r"^run_rollback_roundtrip\(\) \{\n.*?^\}$", text(_CI_EVAL), re.DOTALL | re.MULTILINE)
+    if match is None:
+        raise AssertionError(f"run_rollback_roundtrip() not found in {_CI_EVAL}")
+    return match.group(0)
+
+
 def recorder_step_message() -> str:
     """The record step after the fan-out: the if/elif/else that either
     records or says why it did not."""
@@ -175,12 +183,14 @@ class FlagUnsetIsTodayTest(unittest.TestCase):
                 self.assertEqual(len(calls), 1, calls)
                 self.assertIn("secret platform-agent-secrets", calls[0])
 
-    def test_the_flag_is_read_in_section_4_the_recorder_and_the_publisher_and_nowhere_else(self) -> None:
-        """The header promises three places: section 4, the baseline recorder
-        (its decision and the log line at the record step) and the dashboard
-        publisher's gate. Another reader is another behaviour under the flag
-        that this test suite does not cover. The publisher's gate is run in
-        scripts/test_eval_dashboard_publish.py; the other three here."""
+    def test_the_flag_is_read_in_section_4_the_recorder_the_publisher_and_the_rollback_and_nowhere_else(self) -> None:
+        """The header promises four places: section 4, the baseline recorder
+        (its decision and the log line at the record step), the dashboard
+        publisher's gate and the rollback round trip. Another reader is another
+        behaviour under the flag that this test suite does not cover. The
+        publisher's gate is run in scripts/test_eval_dashboard_publish.py, the
+        rollback round trip in tests/test_rollback_roundtrip.py; the others
+        here."""
         script = text(_CI_EVAL)
         # Any spelling of an expansion (`${EVAL_MODE_NEXT...}` or bare `$EVAL_MODE_NEXT`),
         # on a line that is not a comment; the log lines that name the flag as
@@ -189,7 +199,7 @@ class FlagUnsetIsTodayTest(unittest.TestCase):
             m.start()
             for m in re.finditer(r"^[^#\n]*\$\{?EVAL_MODE_NEXT\b", script, re.MULTILINE)
         ]
-        self.assertEqual(len(reads), 4, "EVAL_MODE_NEXT is read at a site in hack/ci-eval-pr.sh this suite does not cover")
+        self.assertEqual(len(reads), 5, "EVAL_MODE_NEXT is read at a site in hack/ci-eval-pr.sh this suite does not cover")
         publisher = script.index(publisher_gate())
         self.assertTrue(publisher <= reads[0] < publisher + len(publisher_gate()))
         start = script.index(section())
@@ -198,6 +208,8 @@ class FlagUnsetIsTodayTest(unittest.TestCase):
         self.assertTrue(decision <= reads[2] < decision + len(recorder_decision()))
         step = script.index(recorder_step_message())
         self.assertTrue(step <= reads[3] < step + len(recorder_step_message()))
+        rollback = script.index(rollback_function())
+        self.assertTrue(rollback <= reads[4] < rollback + len(rollback_function()))
 
 
 class FlagSetIsInjectTest(unittest.TestCase):

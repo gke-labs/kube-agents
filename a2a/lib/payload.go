@@ -46,7 +46,28 @@ const (
 	ArtifactThinking = "thinking"
 	ArtifactActivity = "activity"
 	ArtifactProgress = "progress"
+	// ArtifactDelegate is the session's request to the gateway to mint a
+	// child task: one data part {"addressee","text"} on the session's own
+	// task events. Reserved so the relay and the adapter spell it once
+	// (spec-a2a-payloads.md, "Reserved artifact names").
+	ArtifactDelegate = "delegate"
 )
+
+// DelegateRequest is the ArtifactDelegate data part's shape: one child task
+// to mint, addressee and the task text. It is also the wire shape the
+// session pod's MCP server sends over the adapter's unix socket (the socket
+// hop is how the call gets from the harness's delegate tool to the adapter
+// that actually publishes the artifact), so it is named here, beside
+// ArtifactDelegate, rather than duplicated per caller.
+type DelegateRequest struct {
+	Addressee string `json:"addressee"`
+	Text      string `json:"text"`
+}
+
+// DelegateTextCap bounds DelegateRequest.Text in bytes: the adapter refuses a
+// longer request before it reaches the bus and the gateway ignores one that
+// arrives anyway, so the two sides cannot disagree on the number.
+const DelegateTextCap = 16 * 1024
 
 // The A2A object shapes below carry only the fields the library consults.
 // Payloads travel as raw bytes end to end (assertion 6); these views are for

@@ -117,7 +117,7 @@ and purposes:
 
 When diagnosing failures or reporting incidents, name the specific job rather than saying "the nightly":
 
-`ci-kube-agents-eval-nightly` is the Prow periodic eval grading `main` against the full evaluation catalog (`presubmit-cases.txt` plus `nightly-cases.txt`).
+`ci-kube-agents-eval-nightly` is the Prow periodic eval grading `main` against the full evaluation catalog (`presubmit-cases.txt` plus `nightly-cases.txt`). `EVAL_NIGHTLY_PART` in `hack/ci-eval-pr.sh` can split that catalog between two periodics; unset, this one job runs all of it.
 
 `staging-promotion-pipeline.yml` is the GitHub Actions workflow that runs the full E2E matrix and promotes validated release candidates to staging.
 

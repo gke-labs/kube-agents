@@ -245,6 +245,7 @@ AUDITS: dict[str, AuditSpec] = {
             "rwo-claim-contended",
             "hpa-floors-at-one",
             "pdb-overlapping",
+            "untargeted-compute-class-workload",
         ),
         # §4a of the SOP: the four checks that judge a posture rather than a
         # fault, and so the only four a repository declaration may keep off the
@@ -1364,17 +1365,6 @@ CLONE_TMP_PREFIX = "declared-intent-"
 CLONE_LEASE_SUFFIX = "-declared-intent"
 CLONE_MODE_CONTENT = "content"
 CLONE_MODE_DIRECTORY = "directory"
-# The GitOps base-branch override, which `gitops_workspace.resolve_base_branch`
-# consults before the remote's HEAD, names the branch the fleet deploys from
-# in that one repository. The sibling script inherits the environment, and a
-# directory-mode clone with no `--ref` asks that function which branch to
-# check out, so a context repository copied with the override in place was
-# read at the GitOps repository's branch, not its own default, and one with
-# no branch of that name failed to clone every run. Every copy the search
-# makes runs without the two variables: a pinned entry passes `--ref` and
-# never consulted them, and in content mode the broker resolves the default
-# branch per repository and never reads the agent container's environment.
-BASE_BRANCH_OVERRIDE_VARS = ("CREDENTIAL_PROXY_BASE_BRANCH", "GITOPS_BASE_BRANCH")
 
 # The most remediation pull requests one stream may have. Past it the listing
 # stops reading, and a branch that reads as "no pull request exists" is one the
@@ -2954,26 +2944,44 @@ def report_filed(envelope: dict | None) -> tuple[set[str], set[tuple[str, str]]]
     return ids, looked
 
 
-def base_branch() -> str:
-    """The branch remediation pull requests target: this repository's own default.
+def base_branch(repo: str) -> str:
+    """The branch remediation pull requests onto `repo` target.
 
     Not the constant `main` it used to be. A GitOps repository on `master`, or
     one whose fleet configuration lives on a long-running `production` trunk,
     made every audit fetch a ref that is not there — `checkout -B <branch>
     origin/main` then failed, and the whole remediation half of the run died
     after the findings had already been written. Resolution lives in
-    `gitops_workspace` so that `submit-suggestion` gets the same answer; see
-    `resolve_base_branch` for the order (`CREDENTIAL_PROXY_BASE_BRANCH` /
-    `GITOPS_BASE_BRANCH`, then `origin/HEAD`, then `main`).
+    `gitops_workspace`; see `resolve_base_branch` for the order (the base the
+    broker pins `repo` to, then `origin/HEAD`, then `main`). The broker refuses a
+    proposal onto any branch but the pinned one, so the pin has to win.
 
     Answering `main` with no workspace is deliberate, not a fallback that got
     forgotten: `resolve_base_branch` cannot ask a clone that does not exist yet,
     and the callers that reach it in that state are the dry run's renderers,
     which print the base rather than push to it.
+
+    A broker that answers the question with a refusal raises `ForgeError`, so
+    the group being published is skipped as for any other forge refusal; one
+    that does not answer at all raises `BrokerUnavailable`, as `forge` does.
     """
     import gitops_workspace
+    import vcs_client
 
-    return gitops_workspace.resolve_base_branch(workspace(), _workspace_runner)
+    try:
+        return gitops_workspace.resolve_base_branch(workspace(), _workspace_runner, repo)
+    except vcs_client.VcsError as exc:
+        code = f" [{exc.code}]" if exc.code else ""
+        log(f"FAILED: asking the broker for the base branch of {repo}{code}: {exc}")
+        if not exc.code and broker_lost(exc):
+            raise BrokerUnavailable(
+                f"asking for the base branch of {repo}: {exc} This sandbox has no "
+                "other way to publish; check the credential-proxy pod and re-run "
+                "this command."
+            ) from exc
+        raise ForgeError(
+            f"asking the broker for the base branch of {repo} failed{code}: {exc}"
+        ) from exc
 
 
 def assert_pushable(branch: str) -> str:
@@ -2983,18 +2991,7 @@ def assert_pushable(branch: str) -> str:
         short = short[len("refs/heads/"):]
     elif short.startswith("heads/"):
         short = short[len("heads/"):]
-    protected = set(PROTECTED_BRANCHES)
-    override = (
-        os.environ.get("CREDENTIAL_PROXY_BASE_BRANCH", "").strip().lower()
-        or os.environ.get("GITOPS_BASE_BRANCH", "").strip().lower()
-    )
-    if override:
-        if override.startswith("refs/heads/"):
-            override = override[len("refs/heads/"):]
-        elif override.startswith("heads/"):
-            override = override[len("heads/"):]
-        protected.add(override)
-    if short in protected or any(short.startswith(p) for p in PROTECTED_BRANCH_PREFIXES):
+    if short in PROTECTED_BRANCHES or any(short.startswith(p) for p in PROTECTED_BRANCH_PREFIXES):
         raise ValueError(
             f"CRITICAL SECURITY REFUSAL: Force-pushing to protected branch "
             f"'{branch}' is strictly blocked by GKE SRE guardrails!"
@@ -10583,7 +10580,6 @@ def run_cmd(
     check: bool = True,
     capture: bool = True,
     cwd: str | Path | None = None,
-    env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess:
     """Run one subprocess, always from a known directory.
 
@@ -10593,9 +10589,6 @@ def run_cmd(
     nothing else's. It never crossed to the credential container — the shim
     that used to stand in for `git` here sent argv alone — and forge calls do
     not come through here at all; see `forge`.
-
-    `env` replaces the child's environment when given; None inherits this
-    process's, as `subprocess.run` does.
     """
     target = Path(cwd) if cwd is not None else _WORKSPACE
     where = f" (in {target})" if target is not None else ""
@@ -10607,7 +10600,6 @@ def run_cmd(
             text=True,
             capture_output=capture,
             cwd=str(target) if target is not None else None,
-            env=env,
         )
     except subprocess.CalledProcessError as exc:
         log(f"FAILED ({exc.returncode}): {' '.join(cmd)}")
@@ -10867,6 +10859,7 @@ def pr_record(proposal: dict) -> dict:
     return {
         "number": proposal.get("number"),
         "headRefName": str(proposal.get("source") or ""),
+        "baseRefName": str(proposal.get("target") or ""),
         "state": state,
         "mergedAt": closed if state == "MERGED" else "",
         "closedAt": closed,
@@ -11274,8 +11267,9 @@ def list_remediation_prs(repo: str, audit_id: str) -> list[dict]:
     `audit:stale-closed` is what tells a close the harness made from a close a
     human made. And when it closed, for the other half of the same rule: a
     `/remediate` only overrules a human close if it was written after it, and
-    that comparison needs a time on both sides. Both come back as `pr_record`
-    names them.
+    that comparison needs a time on both sides. And the branch it targets, so a
+    refresh of an open pull request is cut from that branch. All three come back
+    as `pr_record` names them.
 
     Read to the last page. A page that is missing reads as "no pull request"
     for every finding it would have covered, so a lookup that fails partway
@@ -11499,8 +11493,9 @@ class _GroupPush(NamedTuple):
     """What landing a group's files learned, for the pull-request step after it.
 
     `base` is the branch the pull request targets, which the two mechanisms
-    answer differently: the clone asks its own `origin/HEAD`, the broker reports
-    the base of the repository it cloned. `proposable` is False when there is
+    answer differently: the clone takes the base `base_branch` resolves (or the
+    one an open pull request already targets), the broker reports the base of
+    the repository it cloned. `proposable` is False when there is
     nothing to propose — the fix is already on the base — and the caller returns
     without opening anything.
     """
@@ -11510,14 +11505,19 @@ class _GroupPush(NamedTuple):
 
 
 def _land_group_via_clone(
+    repo: str,
     audit_id: str,
     group: list[dict],
     branch: str,
     paths: list[str],
     snapshot: dict[str, bytes],
     root: Path,
+    base: str | None = None,
 ) -> _GroupPush:
     """Cut the branch in the leased clone, stage the files, commit, force-push.
+
+    `base` is the branch an open pull request for `branch` already targets.
+    Without one, the branch is cut from the repository's base branch.
 
     `finish` owns the working tree while it runs: the checkout is forced, and
     the caller re-materialises the files from `snapshot` afterwards, because a
@@ -11526,7 +11526,7 @@ def _land_group_via_clone(
     untracked. Do not leave unrelated uncommitted work in the tree during an
     audit.
     """
-    base = base_branch()
+    base = base or base_branch(repo)
 
     git(["fetch", "origin", base])
     git(["checkout", "--force", "-B", branch, f"origin/{base}"])
@@ -11638,13 +11638,38 @@ def open_remediation_pr(
     — the title, the body, the labels — does not, so the pull-request half is
     written once and both mechanisms feed it.
     """
+    import gitops_workspace
+
     branch = assert_pushable(group_branch_for(audit_id, group))
     paths = group_paths(group)
-    landed = (
-        _land_group_via_broker(repo, audit_id, group, branch, paths, snapshot)
-        if content_mode()
-        else _land_group_via_clone(audit_id, group, branch, paths, snapshot, root)
-    )
+    if content_mode():
+        # The broker's workspace continues the branch when the remote has it
+        # and takes no base, so nothing is derived or checked for one here.
+        landed = _land_group_via_broker(repo, audit_id, group, branch, paths, snapshot)
+    else:
+        # The clone recuts the branch, so an open pull request's branch is cut
+        # from the base it targets. Cut from a newly configured base instead,
+        # its diff would carry every commit the new base has that the old one
+        # lacks.
+        open_base = (
+            str(existing.get("baseRefName") or "")
+            if existing and str(existing.get("state", "")).upper() == "OPEN"
+            else ""
+        )
+        # The target is the forge's answer, and anyone who can retarget the
+        # pull request chooses it. It reaches `git fetch` as an argument, so a
+        # value not shaped like a branch name -- `--depth=1` reads as an option
+        # -- is dropped for the resolved base rather than handed to git.
+        if open_base and not gitops_workspace.is_valid_ref(open_base):
+            log(
+                f"WARNING: {branch}: the open pull request targets {open_base!r}, "
+                "which is not a branch name this harness will pass to git; using "
+                "the resolved base instead."
+            )
+            open_base = ""
+        landed = _land_group_via_clone(
+            repo, audit_id, group, branch, paths, snapshot, root, base=open_base or None
+        )
     if not landed.proposable:
         return None
     base = landed.base
@@ -13430,8 +13455,7 @@ def _clone_step(
         cmd.append(f"--prefix={prefix}")
     if force:
         cmd.append("--force")
-    env = {k: v for k, v in os.environ.items() if k not in BASE_BRANCH_OVERRIDE_VARS}
-    result = run_cmd(cmd, check=False, env=env)
+    result = run_cmd(cmd, check=False)
     if result.returncode != 0:
         at = f" at {ref}" if ref else ""
         log(f"WARNING: {slug}: clone{at} exited {result.returncode}; not searched.")

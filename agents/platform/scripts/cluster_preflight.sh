@@ -32,6 +32,70 @@
 
 set -u
 
+# Check 3's reader of the pinned kubeconfig, run as `python3 -I -c` with the
+# path and the size cap as arguments. It answers with its exit status, and on
+# success prints the `current-context` (nothing when the file names none).
+#
+# PyYAML's `safe_load` on the text decoded as UTF-8 with replacement, because
+# that is how the kubectl shim reads the same key out of the same file
+# (credential_proxy_client.kubeconfig_context and read_current_context), so the
+# two take the same context from it. The sandbox image installs it for the bare python3
+# (deploy/sandbox/Dockerfile, `pip install ... pyyaml`). `-I` keeps a `yaml.py`
+# in the caller's working directory, or a PYTHONPATH, from standing in for it.
+readonly KUBECONFIG_READ_MAX_BYTES=1048576
+readonly KUBECONFIG_READ_RC_UNREADABLE=10
+readonly KUBECONFIG_READ_RC_INVALID=11
+readonly KUBECONFIG_READ_RC_NO_PARSER=12
+# The wall-clock cap `capped` puts on a kubectl call, and what `timeout` exits
+# with when it fires.
+readonly KUBECTL_CAP_SECONDS=15
+readonly RC_TIMED_OUT=124
+# What a shell returns for a command it cannot find or cannot execute.
+readonly RC_COMMAND_NOT_FOUND=127
+readonly RC_COMMAND_NOT_EXECUTABLE=126
+# How much of a failing command's stderr goes into the evidence, so it stays one
+# readable line on the kanban card.
+readonly ERR_MAX_CHARS=500
+readonly KUBECONFIG_CONTEXT_READER='
+import sys
+UNREADABLE, INVALID, NO_PARSER = int(sys.argv[3]), int(sys.argv[4]), int(sys.argv[5])
+try:
+    import yaml
+except ImportError as exc:
+    print(exc, file=sys.stderr)
+    sys.exit(NO_PARSER)
+path, limit = sys.argv[1], int(sys.argv[2])
+try:
+    with open(path, "rb") as stream:
+        raw = stream.read(limit + 1)
+except OSError as exc:
+    print(exc, file=sys.stderr)
+    sys.exit(UNREADABLE)
+if len(raw) > limit:
+    print(f"larger than {limit} bytes", file=sys.stderr)
+    sys.exit(INVALID)
+try:
+    document = yaml.safe_load(raw.decode("utf-8", errors="replace"))
+# The safe constructors raise plain exceptions, not YAMLError, for a scalar they
+# cannot build: an unquoted 2001-13-45 anywhere in the file is a ValueError, and
+# an explicit tag on a value that does not fit it can be a ValueError, KeyError,
+# IndexError or AttributeError. Only safe_load runs in this try, so each is the
+# file, not the reader.
+except (yaml.YAMLError, RecursionError, ValueError, LookupError, AttributeError) as exc:
+    print(f"not parseable as YAML: {exc}", file=sys.stderr)
+    sys.exit(INVALID)
+if not isinstance(document, dict):
+    print("the top level is not a mapping", file=sys.stderr)
+    sys.exit(INVALID)
+context = document.get("current-context")
+if context is None:
+    sys.exit(0)
+if not isinstance(context, str):
+    print(f"current-context is a {type(context).__name__}, not a string", file=sys.stderr)
+    sys.exit(INVALID)
+print(context.strip())
+'
+
 JSON=0
 [ "${1:-}" = "--json" ] && JSON=1
 
@@ -69,7 +133,7 @@ EVIDENCE=""
 # image; off-image (a developer shell, a test harness) run uncapped rather than
 # failing every check with "command not found".
 if command -v timeout >/dev/null 2>&1; then
-    capped() { timeout 15 "$@"; }
+    capped() { timeout "$KUBECTL_CAP_SECONDS" "$@"; }
 else
     capped() { "$@"; }
 fi
@@ -141,7 +205,9 @@ if [ "$STATUS" = "ok" ]; then
     fi
 fi
 
-# 2b. kubectl present. Checks 3-5 all need it, so establish it once.
+# 2b. kubectl present. Checks 4 and 5 need it, so establish it once. Check 3
+#     does not, but this stays ahead of it so a missing kubectl reports as 2b
+#     whatever the pin says.
 if [ "$STATUS" = "ok" ] && ! command -v kubectl >/dev/null 2>&1; then
     fail "2b" "kubectl is not available in this agent's environment." \
          "This indicates a broken image/toolset; escalate to the Platform Agent." \
@@ -156,34 +222,51 @@ fi
 #    else in the pipeline compares the credentials to the identity, so this is the
 #    only place a mis-targeted pin can be caught.
 #
-#    `--kubeconfig` (not the environment) on purpose: this must read the pinned
-#    file itself, independent of whatever the ambient context resolves to. Check 4
-#    is what tests the environment path.
+#    Read from the file itself, not through kubectl. The question is what the
+#    pinned file says, independent of whatever the ambient context resolves to,
+#    and check 4 is what tests the environment path. In the sandbox `kubectl` is
+#    the credential-proxy shim, which sends even `config current-context` to the
+#    broker as an exec request; on a busy install that request queued behind
+#    fleet sweeps for longer than the 15s cap, and a correct pin failed here.
+#    The shim reads this key out of the file locally before it sends anything,
+#    with the same parser as below, so the round trip added a queue and no
+#    information.
 #
-#    Failure of the command itself is reported separately from the command
-#    running and printing nothing. They call for opposite remediations: an empty
-#    current-context really is a broken pin and re-scaffolding fixes it, whereas
-#    a non-zero exit here usually means the credential proxy is unreachable — the
-#    kubeconfig is fine, and re-scaffolding would have to go through that same
-#    proxy to succeed. Swallowing stderr made every proxy outage look like the
-#    former.
+#    Each way the read can fail gets its own report, because they call for
+#    different remediations: a file the agent cannot read, a file that is not a
+#    kubeconfig, an image with no parser, and a kubeconfig that names no context.
+#    Only the second and the last are a broken pin that re-scaffolding fixes.
 if [ "$STATUS" = "ok" ]; then
     CTX_ERR_FILE="$(mktemp 2>/dev/null || printf '%s' "${TMPDIR:-/tmp}/preflight_ctx_err.$$")"
-    PINNED_RAW="$(capped kubectl --kubeconfig="$KUBECONFIG" config current-context 2>"$CTX_ERR_FILE")"
+    PINNED_CONTEXT="$(python3 -I -c "$KUBECONFIG_CONTEXT_READER" "$KUBECONFIG" \
+        "$KUBECONFIG_READ_MAX_BYTES" "$KUBECONFIG_READ_RC_UNREADABLE" \
+        "$KUBECONFIG_READ_RC_INVALID" "$KUBECONFIG_READ_RC_NO_PARSER" 2>"$CTX_ERR_FILE")"
     CTX_RC=$?
-    PINNED_CONTEXT="$(printf '%s' "$PINNED_RAW" | tr -d '[:space:]')"
-    CTX_ERR="$(tr '\n' ' ' <"$CTX_ERR_FILE" 2>/dev/null | sed 's/  */ /g' | cut -c1-500)"
+    CTX_ERR="$(tr '\n' ' ' <"$CTX_ERR_FILE" 2>/dev/null | sed 's/  */ /g' | cut -c1-"$ERR_MAX_CHARS")"
     rm -f "$CTX_ERR_FILE"
-    [ "$CTX_RC" -eq 124 ] && CTX_ERR="timed out after 15s"
 
-    if [ "$CTX_RC" -ne 0 ]; then
-        fail "3" "Could not read the pinned kubeconfig: kubectl itself failed." \
-             "This is not a bad pin — the command did not run. The credential proxy sidecar is the usual cause; check it is up and reachable, then re-run preflight. Do not re-scaffold: that runs through the same proxy." \
-             "kubectl --kubeconfig=$KUBECONFIG config current-context exited $CTX_RC: ${CTX_ERR:-no error output}"
+    if [ "$CTX_RC" -eq "$KUBECONFIG_READ_RC_UNREADABLE" ]; then
+        fail "3" "This agent cannot read the pinned kubeconfig at $KUBECONFIG." \
+             "Check the file's owner and mode: the agent user must be able to read it. Re-scaffold the profile if it cannot be repaired in place." \
+             "reading $KUBECONFIG failed: ${CTX_ERR:-no error output}"
+    elif [ "$CTX_RC" -eq "$KUBECONFIG_READ_RC_INVALID" ]; then
+        fail "3" "The pinned kubeconfig at $KUBECONFIG is not a valid kubeconfig." \
+             "Re-scaffold the profile to re-fetch cluster credentials." \
+             "$KUBECONFIG: ${CTX_ERR:-no error output}"
+    elif [ "$CTX_RC" -eq "$KUBECONFIG_READ_RC_NO_PARSER" ] \
+        || [ "$CTX_RC" -eq "$RC_COMMAND_NOT_FOUND" ] \
+        || [ "$CTX_RC" -eq "$RC_COMMAND_NOT_EXECUTABLE" ]; then
+        fail "3" "Preflight cannot parse the kubeconfig: python3 with PyYAML is not available." \
+             "This indicates a broken image/toolset; escalate to the Platform Agent." \
+             "python3 -I could not load a YAML parser (exit $CTX_RC): ${CTX_ERR:-no error output}"
+    elif [ "$CTX_RC" -ne 0 ]; then
+        fail "3" "Could not read the pinned kubeconfig: the reader failed unexpectedly." \
+             "Re-run preflight; if it fails the same way, escalate to the Platform Agent with this evidence." \
+             "reading $KUBECONFIG exited $CTX_RC: ${CTX_ERR:-no error output}"
     elif [ -z "$PINNED_CONTEXT" ]; then
         fail "3" "The pinned kubeconfig does not select a cluster (no current-context)." \
              "Re-scaffold the profile to re-fetch cluster credentials." \
-             "kubectl --kubeconfig=$KUBECONFIG config current-context returned nothing"
+             "$KUBECONFIG has no current-context"
     elif [ "$PINNED_CONTEXT" != "$EXPECTED_CONTEXT" ]; then
         fail "3" "The pinned kubeconfig is for a different cluster than this agent is scoped to." \
              "Do not proceed: any finding would describe the wrong cluster. Escalate to the Platform Agent to re-pin this profile's kubeconfig for $CLUSTER." \
@@ -212,8 +295,23 @@ if [ "$STATUS" = "ok" ]; then
              "Do not proceed: the pinned kubeconfig exists but no command will use it, so every kubectl resolves to the credential proxy's own cluster. Escalate to the Platform Agent to re-pin the profile (cluster_agent_profile.py writes KUBECONFIG into <home>/.env)." \
              "$KUBECONFIG selects $PINNED_CONTEXT, but KUBECONFIG is unset in the environment; preflight only found the file by falling back to \$HERMES_HOME/kubeconfig.yaml"
     else
-        EFFECTIVE_CONTEXT="$(capped kubectl config current-context 2>/dev/null | tr -d '[:space:]')"
-        if [ "$EFFECTIVE_CONTEXT" != "$PINNED_CONTEXT" ]; then
+        # A kubectl that failed is reported as such, not as a mismatch: an empty
+        # answer from a command that never ran said "talking to another cluster"
+        # about what is really the credential proxy failing to answer. With check 3
+        # reading the file, this is the preflight's first call through the proxy,
+        # so a saturated broker shows up here.
+        EFFECTIVE_ERR_FILE="$(mktemp 2>/dev/null || printf '%s' "${TMPDIR:-/tmp}/preflight_eff_err.$$")"
+        EFFECTIVE_RAW="$(capped kubectl config current-context 2>"$EFFECTIVE_ERR_FILE")"
+        EFFECTIVE_RC=$?
+        EFFECTIVE_CONTEXT="$(printf '%s' "$EFFECTIVE_RAW" | tr -d '[:space:]')"
+        EFFECTIVE_ERR="$(tr '\n' ' ' <"$EFFECTIVE_ERR_FILE" 2>/dev/null | sed 's/  */ /g' | cut -c1-"$ERR_MAX_CHARS")"
+        rm -f "$EFFECTIVE_ERR_FILE"
+        [ "$EFFECTIVE_RC" -eq "$RC_TIMED_OUT" ] && EFFECTIVE_ERR="timed out after ${KUBECTL_CAP_SECONDS}s"
+        if [ "$EFFECTIVE_RC" -ne 0 ]; then
+            fail "4" "Could not ask kubectl which context it uses: kubectl itself failed." \
+                 "This is not a bad pin; the command did not run. The pinned kubeconfig passed check 3. The credential proxy is the usual cause: check it is up and not saturated, then re-run preflight. Do not re-scaffold: that runs through the same proxy." \
+                 "kubectl config current-context exited $EFFECTIVE_RC: ${EFFECTIVE_ERR:-no error output}"
+        elif [ "$EFFECTIVE_CONTEXT" != "$PINNED_CONTEXT" ]; then
             fail "4" "kubectl in this environment does not use this agent's pinned kubeconfig." \
                  "Do not proceed: plain kubectl is talking to another cluster. Escalate to the Platform Agent — the agent image or its credential proxy is not carrying KUBECONFIG through to the command." \
                  "KUBECONFIG=$KUBECONFIG selects ${EFFECTIVE_CONTEXT:-<none>}, but the file itself selects $PINNED_CONTEXT"

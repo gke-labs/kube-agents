@@ -228,7 +228,8 @@ code-scanning tab on the merged head is still the final check.
 `make terraform-test`. It runs the `terraform test` suite of each directory under
 `terraform/modules/` and `terraform/examples/` that has a `tests/`, against mocked providers, so it
 needs no credentials and makes no cloud call (`terraform init` still fetches the providers on a cold
-plugin cache); it needs Terraform 1.7 or newer for `mock_provider`, above the 1.5 floor the modules
+plugin cache); it needs Terraform 1.11 or newer — `mock_provider` from 1.7 and `override_during`
+from 1.11 — above the 1.5 floor the modules
 and the installer declare, and the `validate` job runs it on the version it pins. `make verify`
 below includes it.
 

@@ -139,16 +139,16 @@ resource "google_container_node_pool" "no_surge_pool" {
   # Never updated in place, replaced at a minor roll. An in-place version
   # change is a drain, and pinned-batch-runner's budget holds a drain for up
   # to an hour: longer than the provider's 30-minute node-pool update timeout,
-  # so tracking the pin would run the weekly reconcile into that timeout in
-  # every project and the serial sweep into its four-hour ceiling, once per
-  # patch roll. Deleting a node pool is different: GKE does not respect
+  # so tracking the pin would run the reconcile into that timeout in every
+  # project, once per patch roll. Deleting a node pool is different: GKE does not respect
   # PodDisruptionBudgets on deletion unless the pool opts in, so a replace
   # takes minutes. Patches are therefore ignored (GKE applies them within the
   # held minor on its own, and no readiness role asserts the patch), and the
   # pool is replaced when the lagging MINOR moves, which keeps it level with
   # seeded-b's control plane and off the upgrade audit's pool-skew check.
-  # hack/fleet_reconcile.py applies this one replacement by address; it
-  # refuses every other.
+  # hack/fleet_reconcile.py applies this replacement because reconcile-allow.json
+  # lists the address as a standing entry; any other replace or delete needs
+  # an entry of its own, reviewed with the change.
   lifecycle {
     ignore_changes       = [version]
     replace_triggered_by = [terraform_data.no_surge_pool_minor]

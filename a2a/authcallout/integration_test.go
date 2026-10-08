@@ -221,6 +221,14 @@ func startHarness(t *testing.T, identityMap string, tokens map[string]Attested, 
 	svc, err := NewService(store, validator, Config{
 		IssuerSeed: string(issuerSeed),
 		XKeySeed:   string(xkeySeed),
+		// The reserved names come from the same rendered file the server
+		// was started from, so the callout refuses exactly the static
+		// users this server authenticates by password.
+		ReservedPrincipals: renderedAuthUsers(t, string(rendered)),
+
+		// The reserved addressees the operator renders, from the fixture it
+		// keeps equal to its render.
+		ReservedAddressees: renderedFixtureAddressees(t),
 	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
 		t.Fatalf("NewService: %v", err)

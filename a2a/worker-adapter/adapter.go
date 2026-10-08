@@ -120,6 +120,11 @@ type Config struct {
 	// long a failed start waits for the killed harness's stderr to close.
 	KillGrace time.Duration
 
+	// DelegateSocket is the unix socket the session's delegate tool reaches
+	// the adapter on (the `worker-adapter mcp` subcommand dials it). Empty
+	// disables the listener, and the harness has no way to delegate.
+	DelegateSocket string
+
 	Logger *slog.Logger
 }
 
@@ -280,7 +285,8 @@ type adapter struct {
 // terminal state it published. Context cancellation is the eviction path:
 // SIGTERM from the kubelet lands here, and the contract is flush, publish
 // terminal failed reason worker-evicted, exit 143 (spec-subagent-profiles.md
-// "Evicted").
+// "Evicted"). The one exception is a turn that has delegated: its deliverable
+// was decided at the delegate call, so it completes with it, exit 0.
 func Run(ctx context.Context, cfg Config) (Result, error) {
 	cfg.applyDefaults()
 	if err := cfg.validate(); err != nil {
@@ -445,6 +451,17 @@ func Run(ctx context.Context, cfg Config) (Result, error) {
 		return Result{State: lib.StateFailed}, fmt.Errorf("publish working: %w", err)
 	}
 
+	// The listener is up before the harness starts, so the tool can never
+	// race it. Under an A2A_HARNESS_CMD override the harness may never be
+	// told about the tool; the socket then simply goes unused.
+	delegateCh, stopDelegate, err := startDelegateListener(cfg.DelegateSocket, log)
+	if err != nil {
+		state := lib.StateFailed
+		ferr := a.finalize(state, "reason: delegate-socket-failed - "+err.Error(), "")
+		return Result{State: state}, ferr
+	}
+	defer stopDelegate()
+
 	proc, err := startHarness(cfg.HarnessCommand, cfg.HarnessEnv, prompt, cfg.KillGrace, log)
 	if err != nil {
 		state := lib.StateFailed
@@ -452,14 +469,14 @@ func Run(ctx context.Context, cfg Config) (Result, error) {
 		return Result{State: state}, ferr
 	}
 
-	return a.supervise(ctx, proc, steerCh, cancelCh)
+	return a.supervise(ctx, proc, steerCh, cancelCh, delegateCh)
 }
 
 // supervise is the main loop: harness stdout events out, steering in, cancel
 // and eviction and the deadline racing all of it. The terminal decision
 // waits until the harness has exited AND its stdout is fully drained - a
 // result event buffered behind a fast exit must still win.
-func (a *adapter) supervise(ctx context.Context, proc *harnessProc, steerCh <-chan string, cancelCh <-chan struct{}) (Result, error) {
+func (a *adapter) supervise(ctx context.Context, proc *harnessProc, steerCh <-chan string, cancelCh <-chan struct{}, delegateCh <-chan delegateAsk) (Result, error) {
 	log := a.log
 	deadline := time.NewTimer(a.cfg.TaskDeadline)
 	defer deadline.Stop()
@@ -481,6 +498,10 @@ func (a *adapter) supervise(ctx context.Context, proc *harnessProc, steerCh <-ch
 		waitErr     error
 		resultText  string
 		resultErr   string // failure subtype from the harness, if any
+		// delegated is set once a delegate request is published: the
+		// turn's deliverable is decided, and nothing the harness says
+		// after it changes that.
+		delegated bool
 		// pendingTurns counts user messages written minus result events
 		// seen: the opening prompt is turn one, every absorbed steer runs
 		// another turn, and the task's deliverable is the result that
@@ -504,6 +525,10 @@ func (a *adapter) supervise(ctx context.Context, proc *harnessProc, steerCh <-ch
 			case "assistant":
 				a.publishAssistant(ctx, ev)
 			case "result":
+				if delegated {
+					log.Info("harness result after delegation ignored", "task", a.taskID)
+					continue
+				}
 				// Drain steers that raced this result: they were published
 				// while the task was working and must be delivered, not
 				// dropped (assertion 21).
@@ -560,6 +585,44 @@ func (a *adapter) supervise(ctx context.Context, proc *harnessProc, steerCh <-ch
 			pendingTurns++
 			log.Info("steer forwarded onto harness stdin", "task", a.taskID)
 
+		case ask := <-delegateCh:
+			// One child at a time, and the turn ends on the first one. A
+			// request after the turn is decided (the harness's own result, an
+			// earlier delegation, cancel or the deadline) is refused rather than
+			// published: there is no turn left for it to belong to.
+			if delegated {
+				ask.reply <- delegateReply{Message: "a task is already delegated this turn"}
+				continue
+			}
+			// Cancel and the deadline end the turn when they fire, not when
+			// the harness finally dies: a call in that window would publish
+			// a child and turn the canceled task into a completed one.
+			if sawResult || exited || canceled || deadlineHit {
+				ask.reply <- delegateReply{Message: "this turn has already ended"}
+				continue
+			}
+			if why := validateDelegate(ask.req); why != "" {
+				ask.reply <- delegateReply{Message: why}
+				continue
+			}
+			if err := a.publishDelegate(ctx, ask.req); err != nil {
+				log.Warn("delegate artifact publish failed", "task", a.taskID, "err", err)
+				ask.reply <- delegateReply{Message: "could not publish the delegation; try again"}
+				continue
+			}
+			delegated = true
+			addressee := ask.req.Addressee
+			ask.reply <- delegateReply{OK: true, Message: "delegated to " + addressee + "; this turn ends now and the result arrives as your next turn"}
+			log.Info("delegation published; ending the turn", "task", a.taskID, "addressee", addressee)
+			sawResult, resultErr, resultText = true, "", "delegated to "+addressee
+			// End the harness the way cancel does: closed stdin, SIGTERM to
+			// the process group, SIGKILL after KillGrace. Whatever it does
+			// next cannot change the deliverable, so waiting on it only
+			// spends model time; the loop still drains its stdout and reaps
+			// it before the terminal decision below.
+			proc.closeStdin()
+			proc.kill(a.cfg.KillGrace)
+
 		case <-cancelCh:
 			if canceled {
 				continue
@@ -576,6 +639,14 @@ func (a *adapter) supervise(ctx context.Context, proc *harnessProc, steerCh <-ch
 			// Eviction: kubelet SIGTERM landed. Flush what the harness
 			// already produced, state the reason honestly, exit 143.
 			proc.kill(0)
+			// A turn that delegated has its deliverable already: the
+			// one-line result. The SIGTERM is not a failure of it, and is
+			// expected: a child that ends fast wakes the session, and the
+			// wake's fresh incarnation retires this pod while the harness
+			// is still inside KillGrace.
+			if delegated {
+				return a.completeWith(resultText)
+			}
 			state := lib.StateFailed
 			err := a.finalize(state, "reason: worker-evicted - infrastructure delivered SIGTERM before the task finished", resultText)
 			return Result{State: state, Evicted: true}, err
@@ -593,13 +664,7 @@ func (a *adapter) supervise(ctx context.Context, proc *harnessProc, steerCh <-ch
 	// failure with evidence.
 	switch {
 	case sawResult && resultErr == "":
-		if err := a.publishResult(resultText); err != nil {
-			state := lib.StateFailed
-			ferr := a.finalize(state, "reason: bus-publish-failed at result - "+err.Error(), "")
-			return Result{State: state}, ferr
-		}
-		state := lib.StateCompleted
-		return Result{State: state}, a.finalize(state, "", "")
+		return a.completeWith(resultText)
 	case sawResult:
 		state := lib.StateFailed
 		return Result{State: state}, a.finalize(state,
@@ -632,6 +697,19 @@ func (a *adapter) supervise(ctx context.Context, proc *harnessProc, steerCh <-ch
 		reason += proc.stderrEvidence()
 		return Result{State: state}, a.finalize(state, reason, "")
 	}
+}
+
+// completeWith publishes the deliverable and the completed terminal: the
+// harness's clean result, or a delegating turn's one-line result. A result
+// that cannot be published fails the task with the publish error.
+func (a *adapter) completeWith(resultText string) (Result, error) {
+	if err := a.publishResult(resultText); err != nil {
+		state := lib.StateFailed
+		ferr := a.finalize(state, "reason: bus-publish-failed at result - "+err.Error(), "")
+		return Result{State: state}, ferr
+	}
+	state := lib.StateCompleted
+	return Result{State: state}, a.finalize(state, "", "")
 }
 
 // publishAssistant maps one assistant message's content blocks onto the
@@ -676,6 +754,15 @@ func (a *adapter) publishArtifactChunk(ctx context.Context, name string, part li
 	appendChunk := a.appended[name]
 	a.appended[name] = true
 	a.mu.Unlock()
+	if err := a.publishArtifactPart(ctx, name, part, appendChunk, last); err != nil {
+		a.log.Warn("artifact publish failed", "name", name, "err", err)
+	}
+}
+
+// publishArtifactPart is the one place an artifact-update for this task is
+// built and published: one part on the named artifact, whose id is derived
+// from the task and the name. Callers own the chunking and the error policy.
+func (a *adapter) publishArtifactPart(ctx context.Context, name string, part lib.Part, appendChunk, last bool) error {
 	update := lib.ArtifactUpdate{
 		TaskID:    a.taskID,
 		ContextID: a.contextID,
@@ -689,17 +776,28 @@ func (a *adapter) publishArtifactChunk(ctx context.Context, name string, part li
 	}
 	payload, err := json.Marshal(update)
 	if err != nil {
-		a.log.Warn("artifact marshal failed", "name", name, "err", err)
-		return
+		return fmt.Errorf("marshal: %w", err)
 	}
 	env, err := lib.NewArtifactUpdateEnvelope(a.from, a.taskID, a.contextID, a.correlationID, payload)
 	if err != nil {
-		a.log.Warn("artifact envelope failed", "name", name, "err", err)
-		return
+		return fmt.Errorf("envelope: %w", err)
 	}
-	if err := a.c.Publish(ctx, lib.TaskEventsSubject(a.cfg.Addressee(), a.taskID), env); err != nil {
-		a.log.Warn("artifact publish failed", "name", name, "err", err)
+	return a.c.Publish(ctx, lib.TaskEventsSubject(a.cfg.Addressee(), a.taskID), env)
+}
+
+// publishDelegate publishes the session's delegate request as the reserved
+// artifact: one data part, one chunk. Unlike the stream artifacts its failure
+// is returned, because the tool call has to fail with it - a session told
+// "delegated" for a request the gateway never saw waits for a wake that
+// never comes.
+func (a *adapter) publishDelegate(ctx context.Context, req lib.DelegateRequest) error {
+	data, err := json.Marshal(req)
+	if err != nil {
+		return err
 	}
+	ctx, cancel := context.WithTimeout(ctx, delegatePublishTimeout)
+	defer cancel()
+	return a.publishArtifactPart(ctx, lib.ArtifactDelegate, lib.Part{Kind: "data", Data: data}, false, true)
 }
 
 // publishResult publishes the deliverable as the result artifact, chunked.
@@ -710,26 +808,8 @@ func (a *adapter) publishResult(text string) error {
 	defer cancel()
 	chunks := chunkString(text, resultChunkSize)
 	for i, chunk := range chunks {
-		update := lib.ArtifactUpdate{
-			TaskID:    a.taskID,
-			ContextID: a.contextID,
-			Artifact: lib.Artifact{
-				ArtifactID: "artifact-" + a.taskID + "-result",
-				Name:       lib.ArtifactResult,
-				Parts:      []lib.Part{{Kind: "text", Text: chunk}},
-			},
-			Append:    i > 0,
-			LastChunk: i == len(chunks)-1,
-		}
-		payload, err := json.Marshal(update)
-		if err != nil {
-			return err
-		}
-		env, err := lib.NewArtifactUpdateEnvelope(a.from, a.taskID, a.contextID, a.correlationID, payload)
-		if err != nil {
-			return err
-		}
-		if err := a.c.Publish(ctx, lib.TaskEventsSubject(a.cfg.Addressee(), a.taskID), env); err != nil {
+		if err := a.publishArtifactPart(ctx, lib.ArtifactResult, lib.Part{Kind: "text", Text: chunk},
+			i > 0, i == len(chunks)-1); err != nil {
 			return err
 		}
 	}

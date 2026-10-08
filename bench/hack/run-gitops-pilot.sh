@@ -590,9 +590,10 @@ fi
 # for its default before each PR (decision 3 in the pilot notes). One run at a
 # time (the stack refuses to switch when the default already points at a
 # run/** branch), and BENCH_NO_TEARDOWN=true leaves the repository's default on
-# the run branch until the destroy is run by hand. Pilot-only: the per-run
-# base is the credential broker's to enforce (#1498; its direct-push half
-# landed as #1669, the base-branch half is #1848). Runs 1 to 13 set
+# the run branch until the destroy is run by hand. A case that pins the base
+# has the GitOps repository's baseBranch in spec.integration.repositories set
+# for the run instead, which the operator renders into the credential broker
+# and the broker enforces (#1970). Runs 1 to 13 set
 # GITOPS_BASE_BRANCH on the PlatformAgent instead, on a 0.4.0 install whose
 # operator copied it into the agent container; on the shell-sandbox layout
 # every command runs in platform-agent-shell-0, whose environment does not
