@@ -727,16 +727,17 @@ def pool_size(ci_deploy_script=fixture_state.CI_DEPLOY_SCRIPT):
 
 
 def git_output(args):
-    """stdout of `git <args>` in the repository, stripped; ReconcileError on a failure."""
+    """stdout of `git <args>` in the repository, its trailing newline dropped;
+    ReconcileError on a failure. Decoded here, not by text mode: text mode
+    also folds CR and CRLF into LF, and a path git prints must arrive as the
+    bytes it has (surrogateescape carries one that is not UTF-8)."""
     try:
-        # surrogateescape: a path git prints that is not UTF-8 (ls-tree -z
-        # emits raw bytes) is carried through, not a decode error.
-        result = subprocess.run(["git", "-C", str(REPO_ROOT)] + list(args), capture_output=True, text=True, encoding=GIT_TEXT_ENCODING, errors=GIT_TEXT_ERRORS, timeout=GIT_TIMEOUT_SECONDS)
+        result = subprocess.run(["git", "-C", str(REPO_ROOT)] + list(args), capture_output=True, timeout=GIT_TIMEOUT_SECONDS)
     except (OSError, subprocess.SubprocessError) as exc:
         raise ReconcileError("git %s: %s" % (" ".join(args), exc))
     if result.returncode != 0:
-        raise ReconcileError("git %s exited %d: %s" % (" ".join(args), result.returncode, _tail(result.stderr)))
-    return result.stdout.strip()
+        raise ReconcileError("git %s exited %d: %s" % (" ".join(args), result.returncode, _tail(result.stderr.decode(GIT_TEXT_ENCODING, GIT_TEXT_ERRORS))))
+    return result.stdout.decode(GIT_TEXT_ENCODING, GIT_TEXT_ERRORS).rstrip("\n")
 
 
 def _iso(epoch):
@@ -755,18 +756,20 @@ class NoStackError(ReconcileError):
 
 def fleet_tree(rev):
     """A hash over the stack's inputs under FLEET_SUBDIR at `rev`: each input's
-    mode, blob and path from `git ls-tree`, so a change to any of them moves it
-    and a change to anything else there does not. A rev with no inputs there
+    mode, blob and path from `git ls-tree`, NUL between entries as git gives
+    them (the one byte a path cannot hold, so no two trees share an input), so
+    a change to any of them moves it and a change to anything else there does
+    not. A rev with no inputs there
     raises NoStackError, never a hash: at the run's first check that is a
     configuration error that fails the run; later in the run it means main
     has moved away from the stack and the run stops."""
     # -z: NUL-separated entries with the path unquoted, so a non-ASCII name is
-    # still matched by its suffix.
+    # still matched by its suffix, and a newline inside a name stays inside it.
     listing = git_output(["ls-tree", "-r", "-z", "--full-tree", rev, "--", FLEET_SUBDIR])
     lines = sorted(entry for entry in listing.split("\0") if "\t" in entry and is_fleet_input(entry.split("\t", 1)[1]))
     if not lines:
         raise NoStackError("no stack inputs (%s, %s) under %s at %s" % ("/".join(FLEET_INPUT_SUFFIXES), "/".join(FLEET_INPUT_NAMES), FLEET_SUBDIR, rev))
-    return hashlib.sha256("\n".join(lines).encode(GIT_TEXT_ENCODING, GIT_TEXT_ERRORS)).hexdigest()
+    return hashlib.sha256("\0".join(lines).encode(GIT_TEXT_ENCODING, GIT_TEXT_ERRORS)).hexdigest()
 
 
 class Run:

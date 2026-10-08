@@ -66,8 +66,8 @@ FORGET = _plan((["forget"], "google_compute_disk.orphan"), (["update"], "google_
 KNOWN = {P7, P8}
 
 # The fleet tree is a hash over the stack's inputs under bench/tf/fleet as
-# `git ls-tree` lists them; the recipe is pinned here, independent of the code:
-# sha256 over the sorted input lines, docs left out.
+# `git ls-tree -z` lists them; the recipe is pinned here, independent of the
+# code: sha256 over the sorted input entries joined by NUL, docs left out.
 LS_TREE_HEAD = ["ls-tree", "-r", "-z", "--full-tree", "HEAD", "--", "bench/tf/fleet"]
 LS_TREE_FETCHED = ["ls-tree", "-r", "-z", "--full-tree", "FETCH_HEAD", "--", "bench/tf/fleet"]
 FLEET_INPUTS = {"main.tf": "aaa1", "versions.tf": "aaa2", ".terraform.lock.hcl": "aaa3", "reconcile-allow.json": "aaa4"}
@@ -94,7 +94,7 @@ def _fleet_listing(**blobs):
 
 
 def _fleet_hash(**inputs):
-    return hashlib.sha256("\n".join(_fleet_lines(**inputs)).encode()).hexdigest()
+    return hashlib.sha256("\0".join(_fleet_lines(**inputs)).encode()).hexdigest()
 
 
 FLEET_A = _fleet_listing(**FLEET_INPUTS, **FLEET_DOCS)
@@ -1507,19 +1507,19 @@ class FleetTreeTest(unittest.TestCase):
         self.assertNotEqual(self._tree(listing), TREE_A)
 
     def test_the_hash_does_not_depend_on_the_process_locale(self):
-        # The decode names utf-8 outright: a valid UTF-8 name hashes the same
-        # whatever locale the interpreter runs under, so the daily, the
-        # postsubmit and a hand run write one value for one tree.
-        calls = []
+        # git's bytes are decoded as utf-8 here, never by text mode under the
+        # process locale: a valid UTF-8 name hashes the same wherever the
+        # interpreter runs, so the daily, the postsubmit and a hand run write
+        # one value for one tree.
+        listing = _fleet_listing(**FLEET_INPUTS, **{"caf\u00e9.tf": "cccc"}).encode("utf-8")
 
         def run(argv, **kw):
-            calls.append(kw)
-            return subprocess.CompletedProcess(argv, 0, _fleet_listing(**FLEET_INPUTS, **{"caf\u00e9.tf": "cccc"}), "")
+            self.assertNotIn("text", kw)
+            return subprocess.CompletedProcess(argv, 0, listing, b"")
 
-        with mock.patch.object(reconcile.subprocess, "run", run):
-            reconcile.fleet_tree("HEAD")
-        self.assertEqual(calls[0].get("encoding"), "utf-8")
-        self.assertEqual(calls[0].get("errors"), "surrogateescape")
+        with mock.patch.object(reconcile.subprocess, "run", run), mock.patch.dict(os.environ, {"LC_ALL": "C", "LANG": "C"}):
+            tree = reconcile.fleet_tree("HEAD")
+        self.assertEqual(tree, _fleet_hash(**FLEET_INPUTS, **{"caf\u00e9.tf": "cccc"}))
 
     def test_the_scrubbed_git_environment_drops_every_inherited_git_variable(self):
         with mock.patch.dict(os.environ, {"GIT_DIR": "/elsewhere/.git", "GIT_CONFIG_PARAMETERS": "'commit.gpgsign=true'", "GIT_OBJECT_DIRECTORY": "/elsewhere/objects", "GIT_EXEC_PATH": "/usr/lib/git-core", "HOME": os.environ.get("HOME", "/tmp")}):
@@ -1574,6 +1574,26 @@ class FleetTreeTest(unittest.TestCase):
         self.assertGreater(len(tracked), 5)
         strangers = [path for path in tracked if not reconcile.is_fleet_input(path) and path.rsplit("/", 1)[-1] not in bystanders]
         self.assertEqual(strangers, [], "add it to FLEET_INPUT_SUFFIXES/NAMES and the postsubmit's run_if_changed, or to the bystanders here")
+
+    def test_a_newline_inside_a_name_cannot_make_two_stacks_hash_alike(self):
+        # Git allows any byte but NUL and "/" in a name. One entry whose path
+        # carries "\n100644 blob B\tbench/tf/fleet/b.tf" must not hash like
+        # the two entries it imitates: NUL stays the separator all the way.
+        two = _fleet_listing(**{"a.tf": "aaaa", "b.tf": "bbbb"})
+        forged = "100644 blob aaaa\tbench/tf/fleet/a.tf\n100644 blob bbbb\tbench/tf/fleet/b.tf"
+        self.assertNotEqual(self._tree(two), self._tree(forged))
+        self.assertEqual(self._tree(two), _fleet_hash(**{"a.tf": "aaaa", "b.tf": "bbbb"}))
+
+    def test_git_output_keeps_carriage_returns_and_only_the_trailing_newline_goes(self):
+        # Not text mode: a CR inside a name is a byte of the name, and a path
+        # ending in whitespace keeps it; only the trailing LF git adds goes.
+        def run(argv, **kw):
+            self.assertNotIn("text", kw)
+            self.assertNotIn("encoding", kw)
+            return subprocess.CompletedProcess(argv, 0, b"a\r\nb \n", b"")
+
+        with mock.patch.object(reconcile.subprocess, "run", run):
+            self.assertEqual(reconcile.git_output(["rev-parse", "HEAD"]), "a\r\nb ")
 
     def test_the_inputs_are_the_stack_its_lock_and_the_allowlist(self):
         self.assertTrue(all(reconcile.is_fleet_input("bench/tf/fleet/" + n) for n in ("main.tf", "defects-b.tf", ".terraform.lock.hcl", "reconcile-allow.json")))
