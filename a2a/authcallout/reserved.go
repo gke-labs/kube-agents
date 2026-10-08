@@ -17,7 +17,7 @@ import (
 // principal; a pod someone created by hand under a narrowed ServiceAccount can
 // be named anything.
 //
-// Two kinds of name are reserved, and one check covers both:
+// Three kinds of name are reserved, and one check covers all of them:
 //
 //   - The static users nats.conf authenticates by password (gateway, bridge,
 //     seed, web, console, sys, and the callout's own user). They are in no
@@ -43,11 +43,16 @@ import (
 //     since the operator does not set A2A_GRANT_TTL_SECONDS), and a narrowed
 //     pod named after it can be minted the same inbox inside that window.
 //     Only an operator re-render removes a map user; the window is accepted.
+//   - The fixed-name addressees (the bridge's `platform`). A narrowed pod's
+//     task subjects are keyed on its name, so a pod named after one would be
+//     handed that addressee's subjects rather than an inbox. The operator
+//     renders them separately, as A2A_RESERVED_ADDRESSEES; see addressees.go.
 //
-// A name in both is reported as a static principal. That cannot happen in a
-// rendered config (the operator's contract test keeps the static residue out
-// of the map), and the static wording is the one the refusal has always
-// carried.
+// A name in more than one is reported as a static principal first, then as an
+// addressee, then as a map user. Neither overlap happens in a rendered config
+// (the operator's contract test keeps the static residue out of the map, and
+// no static user is named after an addressee), and the static wording is the
+// one the refusal has always carried.
 
 const (
 	// reservedPrincipalSeparator splits the operator-rendered list.
@@ -93,19 +98,40 @@ func ParseReservedPrincipals(raw string) ([]string, error) {
 type reservedKind string
 
 const (
-	reservedStatic  reservedKind = "a static principal"
-	reservedMapUser reservedKind = "an identity-map user"
+	reservedStatic    reservedKind = "a static principal"
+	reservedMapUser   reservedKind = "an identity-map user"
+	reservedAddressee reservedKind = "an addressee"
 )
 
-// reservedSet builds the static half of the lookup the callout refuses against. It refuses an
-// empty input for the same reason ParseReservedPrincipals does, so a caller
-// that skipped the parser cannot construct a Service that reserves nothing.
-func reservedSet(names []string) (map[string]reservedKind, error) {
-	if len(names) == 0 {
+// copied completes the refusal: what the pod would have been handed.
+func (k reservedKind) copied() string {
+	if k == reservedAddressee {
+		return "its task subjects are that addressee's"
+	}
+	return "its inbox is that principal's"
+}
+
+// reservedSet builds the fixed half of the lookup the callout refuses against:
+// the static principals and the fixed-name addressees. It refuses an empty
+// input on either side for the same reasons ParseReservedPrincipals and
+// ParseReservedAddressees do, so a caller that skipped the parsers cannot
+// construct a Service that reserves nothing of either kind.
+func reservedSet(principals, addressees []string) (map[string]reservedKind, error) {
+	if len(principals) == 0 {
 		return nil, fmt.Errorf("the callout needs the static principal names; with none, a narrowed pod could take any of their inboxes")
 	}
-	set := make(map[string]reservedKind, len(names))
-	for _, n := range names {
+	if len(addressees) == 0 {
+		return nil, fmt.Errorf("the callout needs the reserved addressee names; with none, a narrowed pod could take any addressee's task subjects")
+	}
+	set := make(map[string]reservedKind, len(principals)+len(addressees))
+	for _, n := range addressees {
+		if !lib.ValidSubjectToken(n) {
+			return nil, fmt.Errorf("reserved addressee %q is not a dot-free DNS-1123 label, so no pod could be refused for it", n)
+		}
+		set[n] = reservedAddressee
+	}
+	// Static second, so a name in both is reported as a static principal.
+	for _, n := range principals {
 		if !lib.ValidSubjectToken(n) {
 			return nil, fmt.Errorf("reserved principal %q is not a dot-free DNS-1123 label, so no pod could be refused for it", n)
 		}

@@ -153,6 +153,26 @@ LOGGER = logging.getLogger(__name__)
 #: there.
 GITHUB_REPO_TYPE = "github"
 
+#: What a forge with no noun of its own calls a change proposal, and what every
+#: name that is not a managed repository on another forge is spoken of as.
+DEFAULT_PROPOSAL_NOUN = "pull request"
+
+#: The managed-entry types a forge in this image serves, and what each calls a
+#: change proposal. A table rather than a read of `providers.AVAILABLE`: this
+#: module runs in the sandbox, whose image ships neither `providers/` nor the
+#: broker's dependencies, and an import there would fail every consumer on
+#: every install. Kept in step with the forge classes by
+#: `test_gitops_workspace.TestForgeTable`, which runs where `providers` is.
+FORGE_PROPOSAL_NOUNS = {GITHUB_REPO_TYPE: "pull request", "gitlab": "merge request"}
+
+#: How a host-qualified name's `/` is spelt in its workspace directory name.
+ENCODED_SEPARATOR = "%2F"
+
+#: The first segment of a host-qualified repository name: a hostname, which has
+#: a dot in it. A GitHub owner cannot contain one, so a name whose first segment
+#: has a dot is never a GitHub `owner/name` read the wrong way round.
+HOSTNAME_RE = re.compile(r"[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)+")
+
 #: The optional `ref` on a `context_repos` entry: the branch the declared-intent
 #: search reads instead of the remote's HEAD. Held to the shape of a git branch
 #: name and, above all, never allowed to begin with `-`, because the value is
@@ -363,11 +383,27 @@ def lease_dir(root: str | Path, lease: str) -> Path:
 def workspace_path(
     repo: str, root: str | Path | None = None, *, lease: str
 ) -> Path:
-    """Where `owner/name` is cloned for `lease`. One clone per lease, per repo."""
-    owner, _, name = str(repo).partition("/")
-    if not owner or not name:
+    """Where a repository is cloned for `lease`. One clone per lease, per repo.
+
+    `owner/name` lands at `owner__name`, as it always has, and so does
+    `github.com/owner/name`: one repository, one tree, however it is named. A
+    host-qualified name on another forge, at any depth, is one directory with
+    every `/` written as `%2F` -- `gitlab.com%2Facme%2Fplatform%2Finfra`.
+    Joining on `__` would not do: a segment may contain `__`, so `a/b__c` and
+    `a__b/c` would share a tree. `%` is in no segment's charset, so this
+    spelling is injective, never collides with a GitHub `owner__name`, and
+    `resolve_repo` can read the name back off it.
+    """
+    host, path = split_host(str(repo))
+    if host == repo_ref.GITHUB_CANONICAL_HOST:
+        host, repo = "", path
+    segments = str(path if host else repo).split("/")
+    if len(segments) < 2 or not all(segments):
         raise ValueError(f"expected a repository as owner/name, got {repo!r}")
-    return lease_dir(root if root is not None else default_root(), lease) / f"{owner}__{name}"
+    holder = lease_dir(root if root is not None else default_root(), lease)
+    if host:
+        return holder / f"{host}/{path}".replace("/", ENCODED_SEPARATOR)
+    return holder / "__".join(segments)
 
 
 @contextmanager
@@ -583,7 +619,18 @@ def ensure_workspace(
     lease = sanitize_lease(lease)
     holder = lease_dir(root, lease)
     target = workspace_path(repo, root, lease=lease)
-    url = remote_url or f"https://github.com/{repo}.git"
+    host = split_host(repo)[0]
+    if not remote_url and host and host != repo_ref.GITHUB_CANONICAL_HOST:
+        # Directory mode clones with the credential the GitHub CLI installed in
+        # this container, which no other forge's host answers to; a private
+        # project would fail mid-clone as an authentication error naming
+        # nothing. Said up front instead.
+        raise RuntimeError(
+            f"{repo} is on {host}, and a local clone reaches GitHub only: this "
+            "container holds no credential for another forge. Repositories on "
+            "other forges are reached through the broker's verbs."
+        )
+    url = remote_url or clone_url(repo)
 
     # Short and shared: everything after it happens inside a directory no other
     # caller will name.
@@ -718,12 +765,76 @@ def _remove_tree(path: Path) -> None:
         pass
 
 
+def clone_url(repo: str) -> str:
+    """The HTTPS remote for a repository name this module hands out.
+
+    A bare `owner/name` is GitHub's, as it always was. A host-qualified name
+    carries its own host -- a self-managed instance has no canonical one to
+    fall back to -- so its remote is that host.
+    """
+    host, path = split_host(repo)
+    return f"https://{host or repo_ref.GITHUB_CANONICAL_HOST}/{path}.git"
+
+
+def qualify(repo: str, managed: list[str] | None = None) -> str:
+    """`repo` as the managed list and the broker spell it on this install.
+
+    GitHub's repositories have two spellings and the list uses one at a time:
+    bare `owner/name` while GitHub is the only forge it names, and
+    `github.com/owner/name` once it names a second -- the broker then refuses
+    a hostless name. A name from somewhere that saw the other period -- a
+    cron's `--repo`, a lease record, a workspace directory, the list's own
+    output copied while a second forge was registered -- is turned into the
+    current spelling either way, so every gate can compare it with the list
+    as written. A repository on another forge is returned unchanged.
+
+    `managed` is the list when the caller has read it already; otherwise it is
+    read here, and a list that cannot be read leaves the name as it was for the
+    caller's own read to fail on.
+    """
+    if not isinstance(repo, str):
+        return repo
+    host, path = split_host(repo)
+    if repo_ref.is_github_slug(repo):
+        bare = repo
+    elif host == repo_ref.GITHUB_CANONICAL_HOST and repo_ref.is_github_slug(path):
+        bare = path
+    else:
+        return repo
+    if managed is None:
+        try:
+            managed = get_managed_repos()
+        except Exception:
+            return repo
+    if any(split_host(name)[0] for name in managed):
+        return f"{repo_ref.GITHUB_CANONICAL_HOST}/{bare}"
+    return bare
+
+
+def split_host(repo: str) -> tuple[str, str]:
+    """`(host, path)` for a host-qualified name, `("", repo)` for a bare one.
+
+    Host-qualified means a hostname followed by at least two more segments.
+    Two segments are always a bare GitHub slug, dotted owner or not:
+    `repo_ref` admits `my.org/repo` as an owner and a name, and reading its
+    first segment as a host would move the org binding, the clone host and the
+    committer address for a name that is still GitHub's. Every forge path this
+    module hands out under a host has at least two segments, so nothing
+    host-qualified is two segments long.
+    """
+    first, _, rest = str(repo).partition("/")
+    if "/" in rest and HOSTNAME_RE.fullmatch(first):
+        return first, rest
+    return "", str(repo)
+
+
 def configure_identity(
     target: Path,
     runner: Runner,
     *,
     name: str | None = None,
     email: str | None = None,
+    repo: str | None = None,
 ) -> None:
     """Give the clone a committer identity.
 
@@ -733,30 +844,71 @@ def configure_identity(
     tell apart from "nothing staged" — so the cheaper fix is to make it
     impossible. Repository-local, never `--global`: the clone is disposable and
     the agent should not be rewriting a shared gitconfig.
+
+    The fallback address is on the forge's own noreply domain, so a commit
+    to a GitLab repository does not claim a GitHub address: `repo` names the
+    repository, and a bare `owner/name` or none at all is GitHub's.
     """
     name = name or os.environ.get("GIT_AUTHOR_NAME") or "Platform Agent"
+    host = split_host(repo)[0] if repo else ""
     email = (
         email
         or os.environ.get("GIT_AUTHOR_EMAIL")
-        or "platform-agent@users.noreply.github.com"
+        or f"platform-agent@users.noreply.{host or repo_ref.GITHUB_CANONICAL_HOST}"
     )
     runner(["git", "config", "user.name", name], cwd=str(target))
     runner(["git", "config", "user.email", email], cwd=str(target))
 
 
 def is_valid_repo_slug(repo: str) -> bool:
-    """Validate that repo is formatted as owner/name without path traversal or flag injection."""
-    return repo_ref.is_github_slug(repo)
+    """Whether `repo` is a repository name safe to hand to a verb or a CLI.
+
+    Two shapes. A bare GitHub `owner/name`, exactly as before. Or a
+    host-qualified `host/namespace/.../name` -- what `get_managed_repos` hands
+    out for a repository on another forge, at any depth, since GitLab nests
+    groups -- and, on an install that manages repositories on more than one
+    forge, `github.com/owner/name`. Either way the value must already *be* the
+    name rather than merely normalise to one, for the reason
+    `repo_ref.is_github_slug` gives: every caller checks the string and then
+    uses it.
+    """
+    if repo_ref.is_github_slug(repo):
+        return True
+    if not isinstance(repo, str):
+        return False
+    host, path = split_host(repo)
+    if not host:
+        return False
+    ref = repo_ref.try_parse(path)
+    if ref is None or ref.host or ref.path != path:
+        return False
+    if host in repo_ref.GITHUB_HOSTS:
+        return host == repo_ref.GITHUB_CANONICAL_HOST and len(ref.segments) == repo_ref.GITHUB_PATH_DEPTH
+    return len(ref.segments) >= 2
 
 
 def validate_repo_org(repo: str) -> str:
-    """Validate that repository slug belongs to the configured primary GitHub organization if set."""
-    primary_org = os.environ.get("GITOPS_ORG") or os.environ.get("GITHUB_ORG")
-    if primary_org and repo and "/" in repo:
-        owner = repo.split("/", 1)[0]
-        if owner.lower() != primary_org.lower():
+    """Validate that a repository sits under the configured primary namespace, if set.
+
+    `GITOPS_ORG` is compared against the namespace segment by segment, so it
+    may name a GitLab subgroup (`acme/platform`) and `acme/platform-x/infra`
+    is still outside it. `GITHUB_ORG` is the GitHub minter's binding and
+    applies to GitHub repositories only.
+    """
+    host, path = split_host(repo) if repo else ("", "")
+    github = not host or host == repo_ref.GITHUB_CANONICAL_HOST
+    primary_org = os.environ.get("GITOPS_ORG") or (
+        os.environ.get("GITHUB_ORG") if github else None
+    )
+    if primary_org and path and "/" in path:
+        want = [part.lower() for part in primary_org.strip("/").split("/")]
+        have = [part.lower() for part in path.split("/")[:-1]]
+        if have[: len(want)] != want:
             raise ValueError(
-                f"Cross-org repository {repo!r} is not supported. Platform Agent minter is bound to organization {primary_org!r}."
+                f"Repository {repo!r} is outside the namespace {primary_org!r} this "
+                "Platform Agent is bound to."
+                if not github
+                else f"Cross-org repository {repo!r} is not supported. Platform Agent minter is bound to organization {primary_org!r}."
             )
     return repo
 
@@ -953,6 +1105,21 @@ def _read_state_key(key: str) -> list[dict[str, str]]:
     return _parse_repos_json(repos_str, key)
 
 
+def mounted_repo_entries(key: str) -> list[dict[str, str]]:
+    """One repository list from the mounted state file only; [] without one.
+
+    For a caller on a hot path that must not shell out: no kubectl fallback,
+    and an unreadable or absent file answers empty rather than raising.
+    """
+    state_file = _state_key_path(key)
+    if not state_file.is_file():
+        return []
+    try:
+        return _parse_repos_json(state_file.read_text(encoding="utf-8"), key)
+    except Exception:  # noqa: BLE001 - empty is the documented answer
+        return []
+
+
 def get_managed_repo_entries() -> list[dict[str, str]]:
     """Reads managed repos from the mounted state file or falls back to ConfigMap via kubectl."""
     return _read_state_key(MANAGED_REPOS_KEY)
@@ -1108,6 +1275,105 @@ def get_context_repo_keys() -> list[str]:
     return _repository_keys(get_context_repo_entries(), CONTEXT_REPOS_KEY)
 
 
+def get_managed_repos() -> list[str]:
+    """Every managed repository, named the way the verbs take it.
+
+    A GitHub entry is its bare `owner/name`, spelt as registered -- exactly
+    what `get_managed_github_repos` answers -- as long as GitHub is the only
+    forge the list names. Every other forge's entry is `host/path`, because
+    there is no canonical host to leave off: `gitlab.com/acme/infra`, or a
+    self-managed instance's own. Once the list names a second forge, GitHub's
+    entries become `github.com/owner/name` too, because the broker refuses a
+    name with no host when it serves more than one forge.
+
+    An entry of a type no forge in this image serves, or one that names no
+    host, is logged and skipped, as an unreadable GitHub URL is.
+    """
+    return _forge_repo_names(get_managed_repo_entries(), MANAGED_REPOS_KEY)
+
+
+def _forge_repo_names(entries: list[dict[str, str]], key: str) -> list[str]:
+    served = set(FORGE_PROPOSAL_NOUNS)
+    github = [entry["repo"] for entry in _github_entries(
+        [e for e in entries if e.get("type") == GITHUB_REPO_TYPE], key, fold_case=False
+    )]
+    others: list[str] = []
+    for entry in entries:
+        kind, url = entry.get("type"), entry.get("url", "")
+        if kind == GITHUB_REPO_TYPE:
+            continue
+        if kind not in served:
+            LOGGER.warning("Skipping %s repository %r: no provider for type %r.", key, url, kind)
+            continue
+        if _names_a_port(url):
+            # Before parsing: the parser reads a URL's host without its port
+            # and a bare `host:8443/path` as an scp remote, so either would
+            # come back named on another endpoint than the one registered.
+            LOGGER.warning(
+                "Skipping %s repository %r: a host with a port is not supported; "
+                "the broker serves a forge on its standard HTTPS port only.",
+                key, url,
+            )
+            continue
+        ref = repo_ref.try_parse(url)
+        if ref is None or not ref.host or not HOSTNAME_RE.fullmatch(ref.host):
+            LOGGER.warning(
+                "Skipping %s repository %r: no host and path to name it by. "
+                "Register a %s repository by its URL (https://<host>/<path>), "
+                "with a fully qualified hostname.",
+                key, url, kind,
+            )
+            continue
+        if len(ref.segments) < MIN_REPOSITORY_DEPTH:
+            # As `_repository_keys` skips it on the broker side: one segment
+            # below the host is a group or namespace, and `host/group` would
+            # read downstream as a bare GitHub `owner/name`.
+            LOGGER.warning(
+                "Skipping %s repository %r: it names a group or namespace, not a "
+                "repository; register each repository in it by its own URL.",
+                key, url,
+            )
+            continue
+        name = f"{ref.host}/{ref.path}"
+        if name not in others:
+            others.append(name)
+    if others:
+        github = [f"{repo_ref.GITHUB_CANONICAL_HOST}/{slug}" for slug in github]
+    return github + others
+
+
+_PORT_RE = re.compile(r"^(?:[a-z][a-z0-9+.-]*://)?(?:[^/@]+@)?[^/:]+:\d+(?:/|$)", re.I)
+
+
+def _names_a_port(url: str) -> bool:
+    """Whether a registered URL, or a bare `host:port/path`, names a port."""
+    return bool(_PORT_RE.match(str(url).strip()))
+
+
+def proposal_noun(repo: str) -> str:
+    """What the forge holding `repo` calls a change proposal.
+
+    Read off the type the managed entry was registered as, so a GitLab
+    repository's ledger says "merge request" while every GitHub one, and
+    anything this cannot place, keeps saying "pull request".
+    """
+    host, _ = split_host(repo) if repo else ("", "")
+    if not host or host == repo_ref.GITHUB_CANONICAL_HOST:
+        kind = GITHUB_REPO_TYPE
+    else:
+        kind = None
+        try:
+            entries = get_managed_repo_entries()
+        except Exception:
+            entries = []
+        for entry in entries:
+            ref = repo_ref.try_parse(entry.get("url", ""))
+            if ref is not None and f"{ref.host}/{ref.path}".lower() == repo.lower():
+                kind = entry.get("type")
+                break
+    return FORGE_PROPOSAL_NOUNS.get(kind or "", DEFAULT_PROPOSAL_NOUN)
+
+
 def get_managed_github_repos() -> list[str]:
     """Extracts managed GitHub repositories ('owner/name' slugs) from the state ConfigMap.
 
@@ -1159,15 +1425,17 @@ def resolve_repo(workspace: str | Path | None = None) -> str:
                     rel = workspace_p.relative_to(holder.resolve())
                     if rel.parts:
                         clone_segment = rel.parts[0]
+                        if ENCODED_SEPARATOR in clone_segment:
+                            return clone_segment.replace(ENCODED_SEPARATOR, "/")
                         if "__" in clone_segment:
                             owner, sep, name = clone_segment.partition("__")
                             if owner and name:
-                                return f"{owner}/{name}"
+                                return qualify(f"{owner}/{name}")
                 except ValueError:
                     pass
                 record = read_lease(holder)
                 if record and record.get("repo"):
-                    return record["repo"]
+                    return qualify(record["repo"])
         except Exception:
             pass
 
@@ -1180,7 +1448,7 @@ def resolve_repo(workspace: str | Path | None = None) -> str:
         except Exception:
             pass
 
-    managed = get_managed_github_repos()
+    managed = get_managed_repos()
     if len(managed) == 1:
         return managed[0]
     elif len(managed) > 1:

@@ -4262,9 +4262,19 @@ class TestCollectCluster(unittest.TestCase):
 
     def test_the_collection_command_is_the_same_across_every_check(self):
         result, _ = self.collect([deployment("api")])
-        commands = {c["command"] for c in result["commands"]}
-        self.assertEqual(len(commands), 1)
-        self.assertIn("kubectl get", next(iter(commands)))
+        dump_commands = {
+            c["command"]
+            for c in result["commands"]
+            if c["check"] != "untargeted-compute-class-workload"
+        }
+        self.assertEqual(len(dump_commands), 1)
+        self.assertIn("kubectl get", next(iter(dump_commands)))
+        cc_cmd = next(
+            c["command"]
+            for c in result["commands"]
+            if c["check"] == "untargeted-compute-class-workload"
+        )
+        self.assertIn("kubectl get computeclasses", cc_cmd)
 
 
 class TestCollectFleet(unittest.TestCase):

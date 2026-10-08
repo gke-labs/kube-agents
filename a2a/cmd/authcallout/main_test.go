@@ -66,6 +66,9 @@ func TestTheCalloutStartsPastTheGuardWithReservedPrincipals(t *testing.T) {
 	setRequiredEnv(t)
 	t.Setenv("KUBERNETES_SERVICE_HOST", "")
 	t.Setenv(envReservedPrincipals, "callout,gateway,bridge,seed,web,console,sys")
+	// run reads the addressee list next; set so the control reaches the
+	// in-cluster config.
+	t.Setenv(envReservedAddressees, "platform")
 	err := run(slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err == nil {
 		t.Fatal("run() succeeded outside a cluster")

@@ -111,7 +111,8 @@
       "origin": "first-party",
       "repository": "ghcr.io/gke-labs/kube-agents/hermes-bridge",
       "tagPolicy": "release",
-      "pulledBy": "The hermes-bridge sidecar a spec.mode: next install declares on spec.deployment.sidecars beside the agent container. The operator renders no bridge of its own, so there is no operator override; the sidecar's image is the CR's.",
+      "override": "A2A_BRIDGE_IMAGE",
+      "pulledBy": "The hermes-bridge sidecar the operator renders beside the agent container under spec.mode: next, and nothing on a default install. The operator derives it from the agent image (registry and tag) unless the override is set; a CR that declares its own hermes-bridge sidecar on spec.deployment.sidecars keeps it, and that sidecar's image is the CR's.",
       "description": "The platform-agent image of the same commit plus the bridge binary that runs the platform persona as the bus executor (a2a/Dockerfile.hermes-bridge)."
     },
     {

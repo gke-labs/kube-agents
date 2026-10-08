@@ -339,6 +339,17 @@ type GoogleChatAdapter struct {
 	// only by Run's goroutine.
 	countInterval time.Duration
 	subscription  string
+
+	// metrics counts each pull by outcome beside the summary line's counts
+	// (SetMetrics; nil counts nothing).
+	metrics *Metrics
+}
+
+// SetMetrics gives the adapter the gateway's counters, so each pull is
+// counted by outcome where the summary line counts it. Called once, before
+// Run.
+func (a *GoogleChatAdapter) SetMetrics(m *Metrics) {
+	a.metrics = m
 }
 
 // NewGoogleChatAdapter builds the adapter against the credential proxy's
@@ -614,6 +625,7 @@ func (a *GoogleChatAdapter) Run(ctx context.Context, handler func(InboundMessage
 				return ctx.Err()
 			}
 			failedPulls++
+			a.metrics.gchatPull(gchatPullFailed)
 			a.log.Warn("gchat event pull failed", "err", err)
 			select {
 			case <-ctx.Done():
@@ -624,6 +636,7 @@ func (a *GoogleChatAdapter) Run(ctx context.Context, handler func(InboundMessage
 		}
 		if env == nil {
 			emptyPulls++
+			a.metrics.gchatPull(gchatPullEmpty)
 			// Usually the server-side long poll has already paced this;
 			// the delay only bites on an early-empty synchronous pull.
 			select {
@@ -634,6 +647,7 @@ func (a *GoogleChatAdapter) Run(ctx context.Context, handler func(InboundMessage
 			continue
 		}
 		received++
+		a.metrics.gchatPull(gchatPullEvents)
 		ev, decodeErr := decodeGchatEvent(env.Data)
 		// Acked before the handler runs, which makes ingress at-most-once —
 		// a deliberate, recorded decision, not an oversight. Acking after a

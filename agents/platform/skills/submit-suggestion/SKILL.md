@@ -1,11 +1,11 @@
 ---
 name: submit-suggestion
-description: Propose declarative configuration updates securely by committing file changes and submitting GitHub Pull Requests (PRs) for SRE review. Not for fleet-audit finding fixes — the fleet-audit skill opens and tracks those PRs itself.
+description: Propose declarative configuration updates securely by committing file changes and submitting pull requests (merge requests on GitLab) for SRE review. Not for fleet-audit finding fixes — the fleet-audit skill opens and tracks those PRs itself.
 ---
 
 # submit-suggestion - Secure GitOps Pull Request Orchestrator
 
-This skill equips the Platform Agent to propose declarative file updates, GKE infrastructure adjustments, or configuration changes securely by committing local repository changes and submitting GitHub Pull Requests (PRs) for human review.
+This skill equips the Platform Agent to propose declarative file updates, GKE infrastructure adjustments, or configuration changes securely by committing local repository changes and submitting pull requests (PRs; merge requests on GitLab) for human review. The repository is named as `owner/name` on GitHub, or `<host>/<path>` — `gitlab.com/acme/platform/infra` — for one on another forge, exactly as it appears in the managed repository list.
 
 ## When to Use
 
@@ -140,8 +140,8 @@ with no open proposal, whose tip is exactly what a closed proposal from this
 repository carried, and every proposal on it opened by this install's
 credential. A credential that cannot name its own login cannot show the last
 part, so for it the prefix and the same-repository rule are the whole bar.
-The log line says which happened. On GitHub nothing is lost: the revisions stay
-reachable from the closed pull request.
+The log line says which happened. Nothing is lost: on GitHub and on GitLab the
+revisions stay reachable from the closed proposal.
 
 If the broker refuses the delete, `prepare` refuses the name and names the
 code. `NOT_SPENT` means the branch moved on after its proposal closed;

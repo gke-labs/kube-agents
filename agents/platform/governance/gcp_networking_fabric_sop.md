@@ -215,7 +215,7 @@ Every finding must conform to the full findings schema:
 ## Red Lines
 
 - **Read-only audit.** Never delete VPC subnets, modify live firewall rules, or tear down NAT gateways directly.
-- **No hand-written issues or PRs.** `audit_report.py` owns the entire git/GitHub write path.
+- **No hand-written issues or PRs.** `audit_report.py` owns the entire git and forge write path.
 - **Never print raw credentials.** Secret tokens, certificates, private keys, and authorization headers must never reach an excerpt.
 - **No unstable finding identity.** Name the durable resource identifier (`Subnet/<name>`, `Router/<name>`), never an ephemeral execution timestamp.
 - **Never emit a manifest that directly deletes a network or subnet.** Deletion remediations are `kind: manual` or `kind: gcloud` only.

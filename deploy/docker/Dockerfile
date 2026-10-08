@@ -1266,6 +1266,14 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/kanban-scheduling/apply_kanban_scheduling
 # chat-completions handler builds its response headers adds
 # X-Hermes-Failure-Reason. See the module docstring in
 # deploy/docker/patches/apply_api_failure_reason_header.py.
+#
+# ssh_shared_master rides it too (#2174): every working environment in the pod
+# shares one ssh ControlMaster, and SSHEnvironment.cleanup() closed it when a
+# worker process that had run a command exited normally, cutting any sibling's
+# running command (exit 255, no output). cleanup() now leaves the shared master
+# to ControlPersist, and a foreground ssh exit 255 without the cwd marker carries
+# a hint when upstream attached none. See the module docstring in
+# deploy/docker/patches/apply_ssh_shared_master.py.
 COPY --chmod=0644 deploy/docker/patches/kanban_guardrail_exit.py \
      deploy/docker/patches/rate_limit_retry_delay.py \
      /opt/hermes/hermes_cli/
@@ -1281,6 +1289,8 @@ COPY deploy/docker/patches/apply_kanban_guardrail_exit.py \
      deploy/docker/patches/verify_quiet_rate_limit_exit.py \
      deploy/docker/patches/apply_api_failure_reason_header.py \
      deploy/docker/patches/verify_api_failure_reason_header.py \
+     deploy/docker/patches/apply_ssh_shared_master.py \
+     deploy/docker/patches/verify_ssh_shared_master.py \
      deploy/docker/patches/verify_policy_refusal_hint.py \
      deploy/docker/patches/patchlib.py \
      /tmp/kanban-guardrail-exit/
@@ -1290,6 +1300,7 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/apply_state_db_sync
     /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/apply_mcp_toolset_names.py /opt/hermes && \
     /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/apply_quiet_rate_limit_exit.py /opt/hermes && \
     /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/apply_api_failure_reason_header.py /opt/hermes && \
+    /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/apply_ssh_shared_master.py /opt/hermes && \
     grep -q 'if sys.platform == "linux":  # kube-agents patch: state-db-synchronous-full' /opt/hermes/hermes_state_wal.py && \
     grep -q "if _kanban_halt_nudge:" /opt/hermes/agent/turn_tool_round.py && \
     grep -q "_kanban_should_record_missing(" /opt/hermes/agent/turn_finalizer.py && \
@@ -1300,12 +1311,14 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/apply_state_db_sync
     grep -q 'mcp_names |= {f"mcp-{_kube_mcp_name}" for _kube_mcp_name in mcp_names}' /opt/hermes/cli.py && \
     grep -q 'kube-agents patch: quiet_rate_limit_exit' /opt/hermes/cli.py && \
     grep -q 'kube-agents patch: api_failure_reason_header' /opt/hermes/gateway/platforms/api_server_openai_routes.py && \
+    grep -q 'def close_master(self):' /opt/hermes/tools/environments/ssh.py && \
     cd /opt/hermes && /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/verify_state_db_synchronous_full.py && \
     /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/verify_kanban_guardrail_exit.py && \
     /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/verify_rate_limit_retry_delay.py && \
     /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/verify_mcp_toolset_names.py && \
     /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/verify_quiet_rate_limit_exit.py && \
     /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/verify_api_failure_reason_header.py && \
+    /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/verify_ssh_shared_master.py && \
     /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/verify_policy_refusal_hint.py && \
     rm -rf /tmp/kanban-guardrail-exit
 

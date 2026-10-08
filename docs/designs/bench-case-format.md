@@ -24,7 +24,7 @@ in silence — no error, no warning. The fields it reads are `id`, `name`, `prom
 means no coercion: `critical: yes` is a string, not a boolean, and fails validation.
 
 **This repository's lints** read the same file for fields devops-bench discards: `domain`,
-`fixtures` and `owner`. Those are ours. A typo in any of them cannot fail a run, which is
+`fixtures`, `owner`, `expected_fail` and `audit_streams`. Those are ours. A typo in any of them cannot fail a run, which is
 exactly why `scripts/validate_bench_cases.py` exists.
 
 ## The id key
@@ -93,7 +93,7 @@ the contract for why.
 
 A case whose spec reads live cluster state must declare it. A check that reads the
 agent's own install rather than the seeded fleet (the `bootstrap_*` checks,
-`sandbox_tree_matches_image`) is not a fixture read, and a case carrying only those needs
+`sandbox_tree_matches_image`, `oobe_audits_started`) is not a fixture read, and a case carrying only those needs
 no `fixtures:`. `fixtures: []` is the declaration for a case that plants its own state — `gpu-stress-test-diagnosis` brings up
 its own Terraform stack and depends on no fixture — and an absent key on such a case is a
 finding, because a grep that returns one case for a role has to mean one case uses it. A
@@ -114,6 +114,16 @@ declared outcome, and passing every repetition reds the job until the marker is 
 defaults to `false`, a case for your own change never carries it, and it must be a bare YAML
 boolean: `"false"` is a string, and truthy, and the validator rejects it.
 `.agents/rules/eval_driven_development.md` has the rule; devops-bench ignores the key.
+
+`audit_streams` is for a case whose stack starts real audit runs without grading their
+ledger: a list of the Platform Agent job ids it starts
+(`audit_streams: [compliance-audit, stockout-prevention]`). The runner holds each one's stream
+lock for the whole unit, beside the stream a `ledger_issue_contains` check names
+(`hack/ci-eval-pr.sh`, `task_streams`, reading the key with the YAML parser the lint uses), and
+releases them when devops-bench returns. A run that outlasts the unit is covered by the next
+unit on the stream, which waits for it first (`wait_platform_runs`), so an audit case does not
+run beside the case's runs and grade their ledger. `oobe-first-run-audits` carries the four it
+starts. devops-bench ignores the key.
 
 `verification_spec` is the exact half of the grade, and the rest of this document is
 mostly about it.
@@ -223,7 +233,7 @@ card-wake replay planted, read before the harness archives it), and `reply_is_si
 (whether the gateway would post the closing message, or with `reply: answer` a question
 replay's reply to the answer turn, at all, by its own silence rule).
 
-Six read the install under test, all from the same file. `bootstrap_fanout` compares the
+Seven read the install under test, six of them from that file. `bootstrap_fanout` compares the
 cluster cards filed for the onboarding discovery sweep, read from the agent pod's board, against the
 Cluster Agent profiles on its disk. Its `require` is `one_card_per_cluster_agent` (exactly
 one card per ready profile with a cluster identity, keyed and assigned to it, and no cluster
@@ -247,7 +257,11 @@ agent pod's `cron/executions.db` instead and passes when the delivery job's run 
 the report completed, which is the condition for the scheduler to post what it printed.
 `sandbox_tree_matches_image` execs into the agent's shell sandbox Pod and diffs the image's
 staged skills, scripts and governance against the copies the sandbox runs, so a case can
-grade an edit to them by its effect.
+grade an edit to them by its effect. `oobe_audits_started`, in its own module
+(`bench/kube_agents_bench/oobe.py`), reads the stack's state file and the Platform Agent's
+`cron/executions.db` in the agent pod, and passes when the stage's `.oobe_audits_fired` lists each
+of the four first-run audits as marked due and each has a run claimed since the stage marked it
+that got going (running, completed, or ended after its start), each starting only after the one before it in the chain ended.
 
 Two limits are worth knowing before choosing one. `tool_called` defaults to
 `scope: router`, the delegating turn's calls only — the harness appends the delegated
@@ -415,7 +429,8 @@ id that disagrees with its directory, a `domain:` that is missing or not in
 case that declares no `fixtures:` at all, a missing, empty or inline `verification_spec`,
 a check that carries no assertion and so can only pass, a missing `owner:` or one written
 as a mention or as something other than a login, an `expected_fail:` that is not a bare YAML
-boolean, and a case that is registered nowhere. It
+boolean, an `audit_streams:` that is not a non-empty list or names a job the Platform Agent
+does not have, and a case that is registered nowhere. It
 also applies the entry vocabulary above — role, the severity pairing, the rejected `hold`
 mode, a positive weight — which devops-bench enforces too, at spec-load time, after the
 lease.

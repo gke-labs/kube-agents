@@ -75,7 +75,9 @@ object per call.
   Arguments that do not parse are the exception: argparse prints usage to stderr and stdout is
   empty. Every answer carries an `error` key, null on success. `streams` exits 2 when any one stream is
   unreadable; its other rows still stand — report them and name the unreadable ones.
-- Every subcommand but `streams` takes `--repo owner/name`. Leave it off when the stream has
+- Every subcommand but `streams` takes `--repo`, the repository as the managed list or the `repos`
+  list names it: `owner/name` (or `github.com/owner/name`) on GitHub, `<host>/<path>` for a
+  repository on another forge. Leave it off when the stream has
   published to one repository; when it has published to several, the answer is exit 2 with the
   `repos` to choose from — ask which, or run once per repository, never pick one silently.
 - `--run` takes a stamp from `runs`, with or without the `.json`. Default is the newest run:

@@ -114,6 +114,8 @@ type Gateway struct {
 	ps      *Pseudonymizer
 	log     *slog.Logger
 	spawner spawner // nil until SpawnSessions arms (W4)
+	// metrics is the gateway's counters (metrics.go); never nil after New.
+	metrics *Metrics
 
 	// runCtx is Run's context; queue workers derive their timeouts from it.
 	runCtx context.Context
@@ -210,6 +212,10 @@ type Options struct {
 	Backend string
 	// Spawner overrides the k8s-backed pod spawner - test injection only.
 	Spawner spawner
+	// Metrics is where the gateway counts what it relays, shared with the
+	// metrics listener and the chat adapter that counts its own pulls. Nil
+	// means a private set nobody serves, which is what a test gets.
+	Metrics *Metrics
 	// RelayDurable overrides the event relay's durable consumer name (the
 	// default relayDurable). Two gateways bound to one durable SPLIT the
 	// event deliveries - and this relay acks what it cannot route - so an
@@ -438,8 +444,15 @@ func New(o Options) (*Gateway, error) {
 	if o.Config.SessionClusterView && o.Config.CredentialProxyURL == "" {
 		return nil, fmt.Errorf("A2A_SESSION_CLUSTER_VIEW=true requires A2A_CREDENTIAL_PROXY_URL: a session pod with the view and no broker address would have wrappers that dial nothing")
 	}
+	g.metrics = o.Metrics
+	if g.metrics == nil {
+		g.metrics = NewMetrics()
+	}
 	return g, nil
 }
+
+// Metrics is the gateway's counters, for the metrics listener to serve.
+func (g *Gateway) Metrics() *Metrics { return g.metrics }
 
 // Run subscribes the event relay, starts the reap and sweep loops, and runs
 // the adapter until ctx is done.
@@ -1033,6 +1046,7 @@ func (g *Gateway) healActiveTask(ctx context.Context, rec *SessionRecord) {
 				}
 			}
 		}
+		g.logTaskTerminal(rec, addressee, active.TaskID, task.State, source, finalMessageText(task))
 		// Under the chain's root, and not at all for a child: its result
 		// is the wake's to digest, not the root's deliverable, and the
 		// root's end comes from the wake below or, with no wake, from
@@ -1052,6 +1066,7 @@ func (g *Gateway) healActiveTask(ctx context.Context, rec *SessionRecord) {
 		// failed answer decides whether a run is the agent's fault or
 		// the install's. Nothing is published: as handleInbound's comment
 		// says, age is not evidence.
+		g.logTaskTerminal(rec, addressee, active.TaskID, lib.StateFailed, TerminalNeverStarted, "")
 		g.observeEnded(rec, active.TaskID, lib.StateFailed, TerminalNeverStarted, "")
 		healed, healedSource = true, TerminalNeverStarted
 	}
@@ -1665,10 +1680,50 @@ func (g *Gateway) observeTaskStarted(conversation, taskID string) {
 	}
 }
 
+// observeTaskTerminal is also where the task-terminal counter counts
+// (metrics.go), whatever the adapter: it is the funnel every terminal path
+// ends in, once per path -- relayTerminal, the heal (stale terminal or never
+// started) and the publish that never reached the bus -- so the failures the
+// gateway itself declares are counted beside the executor's, and a terminal
+// is counted as often as an adapter is told of it.
 func (g *Gateway) observeTaskTerminal(conversation, taskID string, state lib.TaskState, source TerminalSource, reason string) {
+	g.metrics.taskTerminal(state, source)
 	if observer, ok := g.adapter.(TaskObserver); ok {
 		observer.TaskTerminal(conversation, taskID, state, source, reason)
 	}
+}
+
+// logTaskTerminal logs a task's terminal, at each place one is handled: the
+// relay's, the heal's (a final the relay missed, a task no executor took)
+// and the gateway's own for a submission that never reached the bus. The
+// line is the outcome side of "ingress": the same keys, so one task's two
+// ends join on taskId. It is logged by the task's own id, for every task
+// that wrote an ingress line - a delegated child and a wake included - and
+// not from observeTaskTerminal, which names a chain by its root and is
+// called only for the task whose end is the chain's (observedAs). The
+// addressee is the one the task was published to, which is what ingress
+// logged; after a Delegate re-home rec.Addressee is not it, so each caller
+// passes the one it holds. Chat already showed the user the reason; the log
+// keeps only its token (reasonToken), so a failing install's log says how
+// each task ended without copying executor output into it.
+//
+// The state and reason are the ones the adapter and the read route report:
+// a session turn whose delegate request minted no child ends failed with
+// the delegation reason, not on its hand-off line's `completed`
+// (SessionRecord.handOffEnd, the same guard observeEnded applies). The
+// rewrite is here rather than at each caller so no path can log the raw
+// end; it reads the record, so a caller logs after settleHandOff.
+func (g *Gateway) logTaskTerminal(rec *SessionRecord, addressee, taskID string, state lib.TaskState, source TerminalSource, reason string) {
+	if replaced, why, handOff := rec.handOffEnd(taskID, state); handOff {
+		state, reason = replaced, why
+	}
+	g.log.Info("task terminal",
+		"taskId", taskID,
+		"conversation", rec.Key,
+		"addressee", addressee,
+		"state", state,
+		"source", source,
+		"reason", reasonToken(reason))
 }
 
 // observeDelivered, observeEnded and observeCancel are the three above as a
@@ -2052,7 +2107,9 @@ func (g *Gateway) startTaskWith(ctx context.Context, rec *SessionRecord, ts task
 		// stream, which would be a claim about a task the stream has never
 		// heard of. A child or a wake was never announced; its caller says
 		// what the chain's root is owed (handleDelegateRequest leaves the
-		// parent to end as itself, wakeSession ends the root).
+		// parent to end as itself, wakeSession ends the root). Every task
+		// is logged, though: each wrote its ingress line above.
+		g.logTaskTerminal(rec, rec.Addressee, taskID, lib.StateFailed, TerminalFromGateway, "")
 		if ts.Role == "" {
 			g.observeTaskTerminal(rec.Key, taskID, lib.StateFailed, TerminalFromGateway, "")
 		}

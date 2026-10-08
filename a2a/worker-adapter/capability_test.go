@@ -223,7 +223,7 @@ func TestAnUnauthorizedTaskIsRefusedBeforeItsContentIsJudged(t *testing.T) {
 	submitWithAuthority(t, c, session, taskID, "", authorityFor(t, forged)) // data-only parts
 
 	refuseAndFold(t, url, c, session, taskID, adapterConfig(url, taskID, session, noHarness))
-	if text := terminalText(t, url, session, taskID); strings.Contains(text, "no text parts") {
+	if text := terminalText(t, url, session, taskID); strings.Contains(text, "no-text-parts") {
 		t.Fatalf("the refusal reported the content check to a caller that was never authorized: %q", text)
 	}
 }

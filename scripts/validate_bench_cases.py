@@ -50,6 +50,11 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import eval_rosters  # noqa: E402
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
+PLATFORM_JOBS_FILE = REPO_ROOT / "agents" / "platform" / "cron" / "jobs.json"
+# The runner's reader of `audit_streams:` (hack/ci-eval-pr.sh), loaded by path so the lint applies
+# its rule rather than a second one.
+AUDIT_STREAMS_FILE = REPO_ROOT / "bench" / "kube_agents_bench" / "audit_streams.py"
+AUDIT_STREAMS_MODULE_NAME = "bench_audit_streams"
 TASKS_DIR = REPO_ROOT / "bench" / "tasks"
 # The rosters hack/ci-eval-pr.sh reads at startup (#1546): what the presubmit
 # runs, what the nightly adds. A case is registered by being in one of them.
@@ -219,6 +224,11 @@ FIXTURE_NOT_READY = {
         "each pool project's *-infra repository, so 3.3's fix is a manifest "
         "rather than manual"
     ),
+    "obtainability-untargeted-compute-class-manifest": (
+        "#2540: needs a ComputeClass cluster without default ComputeClass and with "
+        "an untargeted workload (untargeted-worker) in each pool project, so 3.24's "
+        "finding on the planted workload is verifiable"
+    ),
     "cluster-agent-stalled-controller-diagnosis": (
         "#1873: needs the stalled-controller role applied to every pool "
         "project; fixture defined in #1893, waiting on fleet re-apply and pool "
@@ -373,6 +383,9 @@ CHECK_ASSERTIONS: dict[str, tuple[str, ...]] = {
     # shell sandbox pod, not a seeded-fleet fixture, so it is not in
     # CLUSTER_READING_TYPES below.
     "sandbox_tree_matches_image": (),
+    # This repository, agent-disk-reading. No field: whether every first-run audit has a run
+    # claimed since the stage marked it is the whole assertion.
+    "oobe_audits_started": (),
 }
 
 # Check types that read live cluster state. A case using one is asserting on
@@ -439,6 +452,27 @@ def _load_yaml(path: pathlib.Path) -> Any:
         return yaml.safe_load(path.read_text(encoding="utf-8"))
     except (OSError, yaml.YAMLError) as exc:
         raise CaseError(f"{path}: could not be parsed as YAML: {exc}") from exc
+
+
+def audit_streams_reader() -> Any:
+    spec = importlib.util.spec_from_file_location(AUDIT_STREAMS_MODULE_NAME, AUDIT_STREAMS_FILE)
+    if spec is None or spec.loader is None:
+        raise CaseError(f"{AUDIT_STREAMS_FILE}: could not be loaded")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def platform_job_ids() -> set[str]:
+    """The Platform Agent's cron job ids, the audit streams among them."""
+    try:
+        data = json.loads(PLATFORM_JOBS_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise CaseError(f"{PLATFORM_JOBS_FILE}: could not be read as JSON: {exc}") from exc
+    jobs = data.get("jobs") if isinstance(data, dict) else data
+    if not isinstance(jobs, list):
+        raise CaseError(f"{PLATFORM_JOBS_FILE}: expected a list of jobs")
+    return {job["id"] for job in jobs if isinstance(job, dict) and job.get("id")}
 
 
 def known_domains() -> set[str]:
@@ -837,6 +871,26 @@ def validate_case(name: str, path: pathlib.Path, *, registered: set[str] | None)
             "single hyphens, at most 39 characters) nor the literal "
             f"{OWNER_MAINTAINERS!r}"
         )
+
+    # The audit streams a case drives without grading their ledger. The runner
+    # holds each one's lock for the unit (hack/ci-eval-pr.sh, task_streams); an
+    # id no Platform Agent job has would lock nothing real.
+    if "audit_streams" in spec:
+        reader = audit_streams_reader()
+        try:
+            streams = reader.declared_streams(path)
+        except reader.AuditStreamsError as exc:
+            streams = None
+            problems.append(f"'audit_streams:' must be a non-empty list of audit job ids: {exc}")
+        if streams == []:
+            problems.append("'audit_streams:' must be a non-empty list of audit job ids")
+        elif streams:
+            unknown = sorted(set(streams) - platform_job_ids())
+            if unknown:
+                problems.append(
+                    f"'audit_streams:' names {', '.join(unknown)}, which "
+                    f"{PLATFORM_JOBS_FILE.relative_to(REPO_ROOT)} does not define"
+                )
 
     # The expected-fail marker. bench-gate inverts a marked case's verdict,
     # and its loader (bench/kube_agents_bench/cases.py, _coerce_bool) refuses

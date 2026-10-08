@@ -666,9 +666,10 @@ type TuningSpec struct {
 	// stream is too small for the configured cap makes the provision Job
 	// fail rather than letting the shortfall surface later as a legitimate
 	// session's consumer create being refused and reported as a task
-	// failure. What that refusal names is the ways out - two, or three for
-	// a CR that declares a bridge sidecar with more workers than the
-	// bridge's default of 2, where declaring it with fewer is offered too -
+	// failure. What that refusal names is the ways out - two, or three when
+	// the bridge runs more workers than its default of 2, where fewer is
+	// offered too (the operator's A2A_BRIDGE_CONCURRENCY for the bridge it
+	// renders, BRIDGE_CONCURRENCY for a bridge sidecar the CR declares) -
 	// and none is a stream edit, because max_consumers is the one limit
 	// nats-server will not change on a stream that already exists: lower
 	// this number (or that worker count) until it fits the stream, or

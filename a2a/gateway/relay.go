@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/gke-labs/kube-agents/a2a/lib"
 )
@@ -16,6 +17,26 @@ const discordChunk = 1900
 // progressCap bounds the progress text embedded in rolling lines and status
 // answers, so one artifact can't blow a chat edit past the backend cap.
 const progressCap = 300
+
+// The terminal log line carries the executor's reason token and never the
+// detail after it. Executors write the terminal message as
+// `reason: <token>[ - detail]` (docs/designs/eval-next-transport.md), and the
+// detail is free text from the executor or the bus: the bridge puts the tails
+// of the Hermes subprocess's stdout and stderr there, which can hold anything
+// the model or a tool printed. The token follows the eval harness's rule
+// (bench/kube_agents_bench/inject_transport.py, parse_reason): strip the
+// prefix, read the first word. It is stricter than the harness: nothing is
+// trimmed first, and any whitespace ends the word, not only a space, so a
+// newline can never ride into the token. A token longer than
+// reasonTokenCap, or with a byte outside [A-Za-z0-9._-], is logged as
+// reasonTokenMalformed, which no executor token can equal because its
+// parentheses are outside that set. No prefix logs an empty reason, the
+// harness's "no token".
+const (
+	reasonPrefix         = "reason: "
+	reasonTokenCap       = 64 // the longest executor token today is 34 bytes
+	reasonTokenMalformed = "(malformed)"
+)
 
 // KV access rides withRetry with these shapes: enough to ride out a
 // connection rebuild window without inventing a second resilience layer,
@@ -432,7 +453,12 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 	if s.Status.Message != nil {
 		reason = joinTextParts(s.Status.Message.Parts)
 	}
-	//
+	// Logged by the task's own id, against the addressee it was published
+	// to (ingress logged that one, not rec.Addressee): every task, a turn
+	// that delegated and a child included, though the observers below hear
+	// only of the chain's end.
+	g.logTaskTerminal(rec, rec.AddresseeFor(taskID), taskID, s.Status.State, source, reason)
+
 	// Under the chain's root, and only for the task whose end is the
 	// chain's (observedAs): a turn that delegated and a child end quietly,
 	// and the root's one terminal comes from the wake or, when none runs,
@@ -455,6 +481,38 @@ func (g *Gateway) replayForTerminal(ctx context.Context, addressee, taskID strin
 		}
 	}
 	return g.client.TasksGet(ctx, addressee, taskID)
+}
+
+// reasonToken is the token of an executor's `reason: <token>[ - detail]`
+// terminal message, safe to log: bounded, one line, no detail. See
+// reasonPrefix for the rule and why the detail stays out.
+func reasonToken(reason string) string {
+	rest, ok := strings.CutPrefix(reason, reasonPrefix)
+	if !ok {
+		return ""
+	}
+	if end := strings.IndexFunc(rest, unicode.IsSpace); end >= 0 {
+		rest = rest[:end]
+	}
+	if rest == "" || len(rest) > reasonTokenCap {
+		return reasonTokenMalformed
+	}
+	for i := 0; i < len(rest); i++ {
+		if !isReasonTokenByte(rest[i]) {
+			return reasonTokenMalformed
+		}
+	}
+	return rest
+}
+
+func isReasonTokenByte(c byte) bool {
+	switch {
+	case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9':
+		return true
+	case c == '-', c == '_', c == '.':
+		return true
+	}
+	return false
 }
 
 // updateRollingLine edits the task's single status message in place. Under
