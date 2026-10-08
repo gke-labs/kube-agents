@@ -48,8 +48,20 @@ and the baseline recorded. Shapes are risks, never incidents; each writes a
 `risk` guard beside the symptoms' `failure` guards. The JSON carries the same
 grouping under `sections` beside the per-cluster `reviews`.
 
-Projects come from `--project`, else `MONITORED_PROJECT_IDS`, else the
-active gcloud project plus `gcloud projects list`.
+Projects come from `--project`, else the active gcloud project plus
+`gcloud projects list`, exactly as `collect.py` discovers the fleet.
+
+A run is *scoped* when it names `--cluster`, when its project set does not
+cover every project the ledger already holds, or when a listing failed; it
+reviews its targets only, prunes nothing outside its scope, reports no stale
+guard outside it, writes `reports/<finish-UTC>-scoped.md` and leaves the
+fleet link alone. A *full* run prunes departed clusters, writes
+`reports/<finish-UTC>.md` and moves `upgrade-retro-report.md` to it; the
+JSON sits beside each with the same name, and the newest fourteen of each
+kind are kept. The ledger also keeps each cluster's symptom set at its last
+review (owner, category, reason; no tenant text): a symptom is "first seen",
+"new since the last review" or "present before", and one present before an
+upgraded cluster's operations is a Warning that says it predates the upgrade.
 
 The store (`ledger.json`, `guards.json`, `reports/`) lives on the shell
 sandbox's data volume under /opt/data/upgrade-retrospective, readable by the
@@ -116,7 +128,15 @@ LOCK_HELD_TEXT = "another retrospective run holds {path} since {since}; nothing 
 STATE_UNREADABLE_DRY_RUN_TEXT = "{path} {why}; a dry run moves nothing and stops here. Nothing written."
 STATE_UNREADABLE_TEXT = "{path} {why}; moved to {aside}. A set-aside ledger is a crash record, not a re-baseline: restore it or remove it on purpose, then rerun. Nothing written."
 EXIT_USAGE = 2
-REPORT_FILENAME = "upgrade-retro-report-{date}.md"
+# Reports are named by the run's finish time in UTC; a scoped run (one that
+# did not cover the whole fleet) is marked so it never stands for the fleet.
+REPORT_TS_FORMAT = "%Y%m%dT%H%M%SZ"
+REPORT_FILENAME = "{ts}{scoped}.md"
+REPORT_JSON_FILENAME = "{ts}{scoped}.json"
+SCOPED_SUFFIX = "-scoped"
+REPORT_NAME_RE = re.compile(r"^(\d{8}T\d{6}Z)(-scoped)?\.(md|json)$")
+# How many reports of each kind the store keeps.
+REPORTS_KEPT = 14
 LATEST_REPORT_LINK = "upgrade-retro-report.md"
 # The report file and its link are swapped in through these.
 REPORT_TEMP_SUFFIX = ".tmp"
@@ -148,10 +168,10 @@ MESSAGE_EXCERPT_CHARS = 400
 FILE_MODE = 0o666
 TEMP_SUFFIX = ".tmp"
 
-# Project discovery: `--project`, else `MONITORED_PROJECT_IDS`, else the
-# active gcloud project plus `gcloud projects list`.
-MONITORED_PROJECTS_ENV = "MONITORED_PROJECT_IDS"
-PROJECT_ENV_VARS = ("GCP_PROJECT_ID", "GKE_PROJECT_ID", "PROJECT_ID")
+# Project discovery, as `collect.py`'s `discover_fleet`: `--project`, else
+# the active gcloud project plus every project `gcloud projects list`
+# returns. No environment variable: this script reads the same fleet as its
+# three siblings in this directory.
 # gcloud's words for a project whose Kubernetes Engine API is off: it cannot
 # hold a cluster, so its failed listing is an empty project, not a lost one.
 API_DISABLED_MARKERS = ("SERVICE_DISABLED", "accessNotConfigured", "has not been used in project")
@@ -189,6 +209,10 @@ CONTAINER_FAILURE_REASONS = ("OOMKilled", "CrashLoopBackOff", "ImagePullBackOff"
 # classifier and the shape detectors decide in code.
 CATEGORY_PENDING, CATEGORY_NOT_READY, CATEGORY_NODE, CATEGORY_EVENT, CATEGORY_PDB = "pending", "not-ready", "node", "event", "pdb"
 STATUS_NEW, STATUS_UPGRADED, STATUS_FORCED = "new", "upgraded", "forced"
+# A symptom against the ledger's baseline from the cluster's last review.
+SINCE_FIRST_SEEN, SINCE_NEW, SINCE_BEFORE = "first seen", "new since the last review", "present before"
+PREDATES_UPGRADE_TEXT = "predates the upgrade: present at the last review, before this window's operations; graded Warning"
+BASELINE_SEPARATOR = "|"
 ENTRY_BUDGET, ENTRY_CAPACITY, ENTRY_NODE_LOCAL_STATE, ENTRY_REMOVED_API, ENTRY_WEBHOOK = 1, 2, 4, 6, 7
 ENTRY_NODE_LABEL, ENTRY_RUNTIME, ENTRY_CGROUP_V2, ENTRY_OOM_GROUP, ENTRY_NODE_AGENT = 12, 13, 14, 15, 17
 ENTRY_GPU, ENTRY_IN_TREE_VOLUME, ENTRY_REGISTRY = 18, 19, 20
@@ -593,6 +617,7 @@ INCIDENT_SYMPTOM, INCIDENT_OPERATION, INCIDENT_STALE_GUARD = "symptom", "operati
 OPERATION_TERMINAL_STATUS = "DONE"
 OPERATION_IN_FLIGHT_STATUSES = ("PENDING", "RUNNING", "ABORTING")
 INFO_UPGRADING = "Upgrading now:"
+INFO_SCOPED = "Scoped run: {reason}. Nothing outside the scope was pruned, no stale guard outside it is reported, and the fleet link was not moved."
 UPGRADING_LINE = "{cluster}: upgrading now ({operation} {target} since {start}); reviewed on the next run"
 OPERATION_OBJECT_PREFIX = "operation/"
 NO_OPERATION_LINE = "no upgrade operation in the window"
@@ -697,18 +722,10 @@ def run_json(argv: list[str], *, run: RunFn, timeout: int = GCLOUD_TIMEOUT_S, en
 
 def discover_projects(*, run: RunFn) -> tuple[list[str], list[str]]:
     """The projects to enumerate when `--project` is absent, and the reads
-    that failed on the way: `MONITORED_PROJECT_IDS` (with any `GCP_PROJECT_ID`,
-    `GKE_PROJECT_ID`, `PROJECT_ID`) when set; otherwise the active gcloud
-    project plus every project `gcloud projects list` returns."""
+    that failed on the way: the active gcloud project plus every project
+    `gcloud projects list` returns, as `collect.py` discovers."""
     errors: list[str] = []
-    monitored = set(os.environ.get(MONITORED_PROJECTS_ENV, "").replace(",", " ").split())
-    projects = set(monitored)
-    for var in PROJECT_ENV_VARS:
-        value = os.environ.get(var, "").strip()
-        if value:
-            projects.add(value)
-    if monitored:
-        return sorted(projects), errors
+    projects: set[str] = set()
     result = run(["gcloud", "config", "get-value", "project"])
     if result.rc == 0 and result.stdout.strip():
         projects.add(result.stdout.strip())
@@ -718,7 +735,7 @@ def discover_projects(*, run: RunFn) -> tuple[list[str], list[str]]:
     else:
         projects |= {line.strip() for line in result.stdout.splitlines() if line.strip()}
     if not projects:
-        errors.append("project discovery named no project: no `--project`, no project variable, no configured project")
+        errors.append("project discovery named no project: no `--project` and no active gcloud project")
     return sorted(projects), errors
 
 
@@ -1503,6 +1520,23 @@ def classify_symptom(symptom: dict, ctx: Context) -> list[dict]:
     return found
 
 
+def symptom_key(symptom: dict) -> str:
+    """The baseline's name for a symptom: owner, category and reason, no
+    tenant text."""
+    return BASELINE_SEPARATOR.join((symptom["object"], symptom["category"], symptom.get("reason") or ""))
+
+
+def mark_since(symptoms: list[dict], baseline: list[str] | None) -> None:
+    """Against the ledger's symptom set from the last review: None means no
+    review yet, so everything is first seen."""
+    previous = set(baseline or [])
+    for symptom in symptoms:
+        if baseline is None:
+            symptom["since"] = SINCE_FIRST_SEEN
+        else:
+            symptom["since"] = SINCE_BEFORE if symptom_key(symptom) in previous else SINCE_NEW
+
+
 def collect_symptoms(cluster: dict, reads: dict[str, list], operations: list[dict], window_start: datetime) -> list[dict]:
     """Every symptom in the read, each with its classifications, user
     namespaces first."""
@@ -2105,6 +2139,7 @@ def _safe_review(selection: Selection, ledger: dict, **kwargs) -> dict:
             "managed_agents": 0,
             "next_upgrade": next_upgrade(selection.cluster, kwargs.get("server_config"), kwargs.get("now") or now_utc()),
             "baseline": None,
+            "symptom_baseline": None,
             "guards": [],
             "read_errors": [f"review failed: {exc!r}"[:ERROR_EXCERPT_CHARS]],
             "reviewed": False,
@@ -2127,6 +2162,7 @@ def review_cluster(selection: Selection, ledger: dict, *, run: RunFn, seen_at: s
         "managed_agents": 0,
         "next_upgrade": next_upgrade(cluster, server_config, now or now_utc()),
         "baseline": None,
+        "symptom_baseline": None,
         "guards": [],
         "read_errors": [],
         "reviewed": False,
@@ -2155,7 +2191,10 @@ def review_cluster(selection: Selection, ledger: dict, *, run: RunFn, seen_at: s
     # ledger moves and absent guards drop -- only when every core read answered.
     review["reviewed"] = not review["partial"]
     symptoms = collect_symptoms(cluster, {k: v for k, v in reads.items() if k not in failed}, ops, window_start)
+    entry = (ledger.get("clusters") or {}).get(selection.key) or {}
+    mark_since(symptoms, entry.get("symptoms") if entry.get("last_run") else None)
     review["what_failed"] = symptoms
+    review["symptom_baseline"] = sorted({symptom_key(sym) for sym in symptoms})
     review["mitigations"] = [mitigation_lines(s, c) for s in symptoms for c in s["classifications"] if c["entry"] is not None]
     shapes, managed_agents = collect_risks(cluster, {k: v for k, v in reads.items() if not any(e.startswith(k + ":") for e in errors)})
     review["shapes"] = shapes
@@ -2166,6 +2205,8 @@ def review_cluster(selection: Selection, ledger: dict, *, run: RunFn, seen_at: s
         "pods": len(reads.get("pods") or []),
         "budgets": len(reads.get("pdbs") or []),
         "shapes": len(shapes),
+        "symptom_count": len(symptoms),
+        "first_seen": sum(1 for sym in symptoms if sym.get("since") == SINCE_FIRST_SEEN),
         "guards": [g["id"] for g in review["guards"]],
         "shape_reads_failed": [e for e in errors if e.split(":")[0] in SHAPE_READS],
     }
@@ -2220,7 +2261,7 @@ def _incident_key(incident: dict) -> tuple[str, str]:
     return incident["cluster"], incident["object"]
 
 
-def triage(reviews: list[dict], unchanged: list[dict], failed_reads: list[str], guards: list[dict], seen_at: str, removed: list[str] | None = None, rechecks: list[dict] | None = None, upgrading: list[dict] | None = None) -> dict:
+def triage(reviews: list[dict], unchanged: list[dict], failed_reads: list[str], guards: list[dict], seen_at: str, removed: list[str] | None = None, rechecks: list[dict] | None = None, upgrading: list[dict] | None = None, in_scope: set[str] | None = None, scope_reason: str = "") -> dict:
     """Group the reviews into the report's three sections. An incident is one
     object on one cluster: its symptoms, their (C) rows and the guards it
     produced, plus the cluster's (A) summary."""
@@ -2229,6 +2270,7 @@ def triage(reviews: list[dict], unchanged: list[dict], failed_reads: list[str], 
     clean: list[dict] = []
     for review in reviews:
         incidents: dict[str, dict] = {}
+        upgraded = review["what_happened"]["status"] == STATUS_UPGRADED
         for symptom in review["what_failed"]:
             incident = incidents.get(symptom["object"])
             if incident is None:
@@ -2239,13 +2281,19 @@ def triage(reviews: list[dict], unchanged: list[dict], failed_reads: list[str], 
                     "object": symptom["object"],
                     "system": symptom["system"],
                     "entries": "",
+                    "predates_upgrade": False,
                     "what_happened": review["what_happened"],
                     "symptoms": [],
                     "mitigations": [m for m in review["mitigations"] if m["object"] == symptom["object"]],
                     "guards": [g for g in review["guards"] if g["object"] == symptom["object"]],
                 }
             incident["symptoms"].append(symptom)
-            if _symptom_severity(symptom) == SEVERITY_ERROR:
+            # A symptom the last review already saw predates this window's
+            # upgrade: it is reported, but never as the upgrade's Error.
+            predates = upgraded and symptom.get("since") == SINCE_BEFORE
+            if predates:
+                incident["predates_upgrade"] = True
+            if _symptom_severity(symptom) == SEVERITY_ERROR and not predates:
                 incident["severity"] = SEVERITY_ERROR
         for incident in incidents.values():
             incident["entries"] = _entries_label([c for s in incident["symptoms"] for c in s["classifications"]])
@@ -2285,7 +2333,10 @@ def triage(reviews: list[dict], unchanged: list[dict], failed_reads: list[str], 
     recheck_errors = {r["cluster"]: r["errors"] for r in rechecks or [] if r.get("errors")}
     for guard in guards:
         # A risk is never an incident, so only a failure guard that outlived
-        # its last review is a Warning; stale risk guards stay in the file.
+        # its last review is a Warning; stale risk guards stay in the file,
+        # and a scoped run says nothing about clusters outside its scope.
+        if in_scope is not None and guard.get("cluster") not in in_scope:
+            continue
         if guard.get("last_seen") != seen_at and guard.get("kind", GUARD_KIND_FAILURE) == GUARD_KIND_FAILURE:
             warnings.append({
                 "partial": partial_reads.get(guard["cluster"]) or [],
@@ -2307,7 +2358,7 @@ def triage(reviews: list[dict], unchanged: list[dict], failed_reads: list[str], 
     return {
         "errors": errors,
         "warnings": warnings,
-        "info": {"clean": clean, "unchanged": unchanged, "failed_reads": failed_reads, "removed": list(removed or []), "rechecked": list(rechecks or []), "upgrading": list(upgrading or [])},
+        "info": {"clean": clean, "unchanged": unchanged, "failed_reads": failed_reads, "removed": list(removed or []), "rechecked": list(rechecks or []), "upgrading": list(upgrading or []), "scoped": scope_reason},
     }
 
 
@@ -2359,13 +2410,15 @@ def _incident_lines(incident: dict) -> list[str]:
         lines.append(f"{PART_MITIGATE} GKE's error text names the cause; the catalogue's entry 2 (capacity) and 5 (window) are the usual ones for an operation that did not complete.")
         lines.append(f"{PART_MITIGATION_SET_UP} {OPERATION_GUARD_TEXT}")
         return lines + [""]
-    lines += [PART_WHAT_FAILED, "", "| Symptom | Catalogue entry | Confidence | Evidence |", "| --- | --- | --- | --- |"]
+    lines += [PART_WHAT_FAILED, "", "| Symptom | Since | Catalogue entry | Confidence | Evidence |", "| --- | --- | --- | --- | --- |"]
     for symptom in incident["symptoms"]:
         for c in symptom["classifications"]:
             entry = f"{c['entry']}. {c['title']}" if c["entry"] else UNCLASSIFIED
             if c.get("detail"):
                 entry += f" ({_cell(c['detail'])})"
-            lines.append(f"| {_cell(symptom['reason'])} | {entry} | {c['confidence']} | {_cell(c['evidence'])} |")
+            lines.append(f"| {_cell(symptom['reason'])} | {symptom.get('since') or '-'} | {entry} | {c['confidence']} | {_cell(c['evidence'])} |")
+    if incident.get("predates_upgrade"):
+        lines += ["", PREDATES_UPGRADE_TEXT + "."]
     lines += ["", PART_MITIGATE]
     if not incident["mitigations"]:
         lines.append(UNCLASSIFIED_MITIGATION_TEXT)
@@ -2411,7 +2464,8 @@ def _baseline_lines(baseline: dict | None) -> list[str]:
     versions = baseline["versions"]
     pools = ", ".join(f"{_cell(p)} {_cell(v)}" for p, v in sorted(versions["node_pools"].items()))
     failed = f" Shape reads that failed: {'; '.join(baseline['shape_reads_failed'])}." if baseline["shape_reads_failed"] else ""
-    lines = [f"{PART_BASELINE} control plane {versions['control_plane']}; pools {pools or 'none'}; {baseline['pods']} pods, {baseline['budgets']} budgets, {baseline['shapes']} shapes.{failed} Guards written: {len(baseline['guards'])}."]
+    symptoms = f" Symptom baseline recorded: {baseline.get('symptom_count', 0)} symptom(s), {baseline.get('first_seen', 0)} first seen."
+    lines = [f"{PART_BASELINE} control plane {versions['control_plane']}; pools {pools or 'none'}; {baseline['pods']} pods, {baseline['budgets']} budgets, {baseline['shapes']} shapes.{failed}{symptoms} Guards written: {len(baseline['guards'])}."]
     for gid in baseline["guards"]:
         lines.append(f"- `{_cell(gid)}`")
     return lines
@@ -2446,6 +2500,8 @@ def render_report(result: dict) -> str:
             lines += _incident_lines(incident)
     info = sections["info"]
     lines += [SECTION_INFO, ""]
+    if info.get("scoped"):
+        lines += [INFO_SCOPED.format(reason=_cell(info["scoped"])), ""]
     if not (info["clean"] or info["unchanged"] or info["failed_reads"] or info.get("removed") or info.get("rechecked") or info.get("upgrading")):
         lines += [NONE_LINE, ""]
     # Severity sections keep `_none_`; Info is never empty after a review.
@@ -2508,6 +2564,7 @@ def ledger_after(ledger: dict, reviews: list[dict], clusters: list[dict], seen_a
     a cluster its project no longer lists is dropped."""
     entries = {k: v for k, v in (ledger.get("clusters") or {}).items() if k not in (removed or set())}
     reviewed = {r["cluster"] for r in reviews if r["reviewed"]}
+    baselines = {r["cluster"]: r.get("symptom_baseline") or [] for r in reviews}
     partial = {r["cluster"] for r in reviews if r["partial"] and not r["reviewed"]}
     for cluster in clusters:
         key = cluster_key(cluster["project"], cluster["location"], cluster["name"])
@@ -2526,6 +2583,7 @@ def ledger_after(ledger: dict, reviews: list[dict], clusters: list[dict], seen_a
                 "first_seen": old.get("first_seen") or seen_at,
                 "last_run": seen_at if key in reviewed else old.get("last_run"),
                 "last_operation": fmt_ts(latest) if latest else old.get("last_operation"),
+                "symptoms": baselines.get(key) if key in reviewed else old.get("symptoms"),
             }
         if key in partial:
             entries.setdefault(key, {})["partial_read"] = seen_at
@@ -2537,6 +2595,7 @@ def ledger_after(ledger: dict, reviews: list[dict], clusters: list[dict], seen_a
 def collect(args: argparse.Namespace, *, run: RunFn | None = None, now: datetime | None = None) -> dict:
     # Resolved at call time, so a test that patches `default_run` is honoured.
     run = run or default_run
+    clock_fixed = now is not None  # a caller-fixed clock also stamps the finish
     now = now or now_utc()
     seen_at = fmt_ts(now)
     since = parse_since(args.since, now)
@@ -2595,7 +2654,18 @@ def collect(args: argparse.Namespace, *, run: RunFn | None = None, now: datetime
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
         reviews = list(pool.map(lambda s: _safe_review(s, ledger, run=run, seen_at=seen_at, server_config=server_configs.get((s.cluster["project"], s.cluster["location"])), now=now), selected))
     reviews.sort(key=lambda r: r["cluster"])
-    removed = {key for project, listed in listed_projects.items() for key in (ledger.get("clusters") or {}) if key.startswith(project + CLUSTER_KEY_SEPARATOR) and key not in listed}
+    # A run is scoped unless it covers the fleet: no --cluster, every project
+    # the ledger holds enumerated, every listing successful.
+    ledger_projects = {key.split(CLUSTER_KEY_SEPARATOR)[0] for key in (ledger.get("clusters") or {})}
+    scope_reasons = []
+    if forced:
+        scope_reasons.append("--cluster named " + ", ".join(sorted(forced)))
+    if not ledger_projects <= set(projects):
+        scope_reasons.append("projects not enumerated this run: " + ", ".join(sorted(ledger_projects - set(projects))))
+    if len(listed_projects) < len(projects):
+        scope_reasons.append("a project listing failed")
+    scoped = bool(scope_reasons)
+    removed = set() if scoped else {key for project, listed in listed_projects.items() for key in (ledger.get("clusters") or {}) if key.startswith(project + CLUSTER_KEY_SEPARATOR) and key not in listed}
     for row in unchanged:
         cluster = next(c for c in clusters if cluster_key(c["project"], c["location"], c["name"]) == row["cluster"])
         row["next_upgrade"] = next_upgrade(cluster, server_configs.get((cluster["project"], cluster["location"])), now)
@@ -2639,7 +2709,9 @@ def collect(args: argparse.Namespace, *, run: RunFn | None = None, now: datetime
         "removed_clusters": sorted(removed),
         "rechecks": rechecks,
         "upgrading": upgrading,
-        "sections": triage(reviews, unchanged, failed_reads, new_guards["guards"], seen_at, sorted(removed), rechecks, upgrading),
+        "scoped": scoped,
+        "scope_reason": "; ".join(scope_reasons),
+        "sections": triage(reviews, unchanged, failed_reads, new_guards["guards"], seen_at, sorted(removed), rechecks, upgrading, in_scope={cluster_key(c["project"], c["location"], c["name"]) for c in clusters} if scoped else None, scope_reason="; ".join(scope_reasons)),
         "ledger_path": str(ledger_path),
         "guards_path": str(guards_path),
         "guards": new_guards["guards"],
@@ -2649,25 +2721,55 @@ def collect(args: argparse.Namespace, *, run: RunFn | None = None, now: datetime
     if args.dry_run:
         return result
     # Write order: report, JSON, guards, ledger last -- each atomic -- so a
-    # crash leaves at most a report with no ledger advance.
+    # crash leaves at most a report with no ledger advance. Names carry the
+    # finish time; a scoped run never moves the fleet link.
+    finish = (now if clock_fixed else now_utc()).strftime(REPORT_TS_FORMAT)
+    suffix = SCOPED_SUFFIX if scoped else ""
+    reports_dir = data_dir() / REPORTS_SUBDIR
     if not getattr(args, "no_report", False):
-        report_path = Path(args.report) if args.report else data_dir() / REPORTS_SUBDIR / REPORT_FILENAME.format(date=now.strftime(REPORT_DATE_FORMAT))
-        write_report(report_path, result["report"])
+        report_path = Path(args.report) if args.report else reports_dir / REPORT_FILENAME.format(ts=finish, scoped=suffix)
+        write_report(report_path, result["report"], link=not scoped)
         result["report_path"] = str(report_path)
-    if args.output:
-        write_json_atomically(Path(args.output), {k: v for k, v in result.items() if k != "report"})
+    json_path = Path(args.output) if args.output else reports_dir / REPORT_JSON_FILENAME.format(ts=finish, scoped=suffix)
+    write_json_atomically(json_path, {k: v for k, v in result.items() if k != "report"})
+    result["json_path"] = str(json_path)
+    prune_reports(reports_dir)
     write_json_atomically(guards_path, new_guards)
     write_json_atomically(ledger_path, new_ledger)
     return result
 
 
-def write_report(path: Path, text: str) -> None:
+def prune_reports(reports_dir: Path) -> list[str]:
+    """Keep the newest `REPORTS_KEPT` full reports and the newest
+    `REPORTS_KEPT` scoped ones (Markdown and JSON by their shared stamp)."""
+    pruned = []
+    if not reports_dir.is_dir():
+        return pruned
+    stamps: dict[bool, set[str]] = {False: set(), True: set()}
+    for entry in reports_dir.iterdir():
+        m = REPORT_NAME_RE.match(entry.name)
+        if m:
+            stamps[bool(m.group(2))].add(m.group(1))
+    for scoped, found in stamps.items():
+        for stamp in sorted(found, reverse=True)[REPORTS_KEPT:]:
+            for ext in ("md", "json"):
+                victim = reports_dir / f"{stamp}{SCOPED_SUFFIX if scoped else ''}.{ext}"
+                with contextlib.suppress(FileNotFoundError):
+                    victim.unlink()
+                    pruned.append(victim.name)
+    return pruned
+
+
+def write_report(path: Path, text: str, *, link: bool = True) -> None:
     """The report through a temporary file, the latest link through a
-    temporary symlink, each renamed into place: a reader never sees half."""
+    temporary symlink, each renamed into place: a reader never sees half.
+    A scoped run writes no link: the link always names a fleet-wide report."""
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(path.name + REPORT_TEMP_SUFFIX)
     temporary.write_text(text, encoding="utf-8")
     os.replace(temporary, path)
+    if not link:
+        return
     link = path.parent / LATEST_REPORT_LINK
     temp_link = path.parent / (LATEST_REPORT_LINK + LINK_TEMP_SUFFIX)
     with contextlib.suppress(FileNotFoundError):
@@ -2678,13 +2780,13 @@ def write_report(path: Path, text: str) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Collect what each new or upgraded cluster's last upgrade did, and classify what failed against the upgrade failure catalogue.")
-    parser.add_argument("--project", action="append", help=f"GCP project to enumerate (repeatable); without it ${MONITORED_PROJECTS_ENV}, else the active gcloud project plus every project `gcloud projects list` returns")
+    parser.add_argument("--project", action="append", help="GCP project to enumerate (repeatable); without it the active gcloud project plus every project `gcloud projects list` returns, as collect.py discovers")
     parser.add_argument("--cluster", action="append", help="<project>/<location>/<name>: restrict to this cluster and review it even if unchanged (repeatable)")
     parser.add_argument("--since", help=f"window for a cluster not yet in the ledger: <days>, <days>d or an RFC 3339 timestamp (default {DEFAULT_SINCE_DAYS} days)")
     parser.add_argument("--ledger", help=f"ledger path (default ${STORE_HOME_ENV}/{LEDGER_FILENAME}, {DEFAULT_STORE_DIR}/{LEDGER_FILENAME})")
     parser.add_argument("--guards", help=f"guards path (default ${STORE_HOME_ENV}/{GUARDS_FILENAME})")
-    parser.add_argument("--output", help="write the JSON result here (atomically)")
-    parser.add_argument("--report", help=f"write the Markdown report here and point {LATEST_REPORT_LINK} beside it at it (default ${STORE_HOME_ENV}/{REPORTS_SUBDIR}/{REPORT_FILENAME})")
+    parser.add_argument("--output", help=f"write the JSON result here instead of ${STORE_HOME_ENV}/{REPORTS_SUBDIR}/<finish-UTC>[{SCOPED_SUFFIX}].json")
+    parser.add_argument("--report", help=f"write the Markdown report here instead of ${STORE_HOME_ENV}/{REPORTS_SUBDIR}/<finish-UTC>[{SCOPED_SUFFIX}].md (a full run also points {LATEST_REPORT_LINK} beside it at it)")
     parser.add_argument("--no-report", action="store_true", help="print the report without writing it to the store")
     parser.add_argument("--dry-run", action="store_true", help="read everything, print the report, write nothing")
     return parser

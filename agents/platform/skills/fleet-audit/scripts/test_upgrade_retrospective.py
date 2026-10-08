@@ -54,9 +54,9 @@ READS = {
     "gemma-gpu-upgraded": {key: items(f"gemma_{name}.json") for key, name in READ_FILES.items()},
 }
 SERVER_CONFIG = load("serverconfig_us-central1-a.json")
-# The project variables discovery reads; cleared so a developer's or the
-# sandbox's environment cannot change what a test sees.
-NO_PROJECT_ENV = {var: "" for var in (ur.MONITORED_PROJECTS_ENV, *ur.PROJECT_ENV_VARS)}
+# Discovery reads no environment variable; the store and kubeconfig homes
+# are the only ones the tests set.
+NO_PROJECT_ENV: dict[str, str] = {}
 KUBECTL_KINDS = {"pdb": "pdbs", "replicasets,jobs": "owners", "deploy,ds,sts,cronjobs": "workloads", "pv,storageclasses": "storage", "validatingwebhookconfigurations,mutatingwebhookconfigurations": "webhooks"}
 INFERENCE = "seeded-capacity/Deployment/inference-server"
 PAYMENTS = "seeded-debug/Deployment/payments-api"
@@ -118,7 +118,7 @@ class FakeFleet:
 
 
 def args(**overrides):
-    base = {"project": [PROJECT], "cluster": None, "since": "14", "ledger": None, "guards": None, "output": None, "report": None, "dry_run": False}
+    base = {"project": [PROJECT], "cluster": None, "since": "14", "ledger": None, "guards": None, "output": None, "report": None, "no_report": False, "dry_run": False}
     base.update(overrides)
     return mock.Mock(**base)
 
@@ -494,7 +494,8 @@ class ClassifierSignatureTest(unittest.TestCase):
         stale_first = {"type": "Warning", "reason": "FailedScheduling", "message": "0/2 nodes are available: 1 Insufficient cpu.", "involvedObject": {"kind": "Pod", "name": "x", "namespace": "apps"}, "eventTime": "2026-09-01T00:00:00Z", "series": {"count": 596, "lastObservedTime": "2026-10-08T12:00:00Z"}, "metadata": {"creationTimestamp": "2026-09-01T00:00:00Z"}}
         [row] = self.classify(events=[stale_first])
         self.assertEqual((row["count"], row["last_seen"]), (596, "2026-10-08T12:00:00Z"))
-        self.assertEqual(symptoms_of("seeded-a", reads={**READS["seeded-a"], "events": [stale_first]}, window=datetime(2026, 10, 7, tzinfo=timezone.utc))[0]["category"], "pending")
+        kept = symptoms_of("seeded-a", reads={**READS["seeded-a"], "events": [stale_first]}, window=datetime(2026, 10, 7, tzinfo=timezone.utc))
+        self.assertIn("apps/Pod/x", {s["object"] for s in kept if s["category"] == "event"})
 
     def test_long_running_pod_that_lost_readiness_in_the_window_is_kept(self):
         old = pod("api")
@@ -1012,10 +1013,11 @@ class LedgerAndGuardsTest(unittest.TestCase):
         self.assertNotIn(GEMMA, ur.load_json(self.home / ur.LEDGER_FILENAME, {})["clusters"])
         self.assertIn(f"{ur.INFO_REMOVED}\n\n- {GEMMA}: no longer listed", ur.render_report(result))
         self.assertEqual([i for i in result["sections"]["warnings"] if i["kind"] == ur.INCIDENT_STALE_GUARD], [])
-        # A listing that failed drops nothing.
+        # A listing that failed is a scoped run and drops nothing.
         self.collect()
         kept, _ = self.collect(FakeFleet(list_rc=1), now=datetime(2026, 10, 16, 18, 0, tzinfo=timezone.utc))
         self.assertEqual(kept["removed_clusters"], [])
+        self.assertTrue(kept["scoped"])
         self.assertIn(GEMMA, {g["cluster"] for g in kept["guards"]})
 
     def test_malformed_pod_is_a_failed_read_not_a_crash(self):
@@ -1091,10 +1093,8 @@ class LedgerAndGuardsTest(unittest.TestCase):
         self.assertTrue(all(i["partial"] == ["pods"] for i in stale))
         report = ur.render_report(second)
         self.assertEqual(report.count(ur.STALE_PARTIAL_TEXT.format(failed="pods")), len(stale))
-        # gemma was neither reviewed nor re-checked under --cluster: its guards keep the other wording.
-        other = [i for i in second["sections"]["warnings"] if i["kind"] == ur.INCIDENT_STALE_GUARD and i["cluster"] == GEMMA]
-        self.assertEqual(report.count("cluster not reviewed this run"), len(other))
-        self.assertTrue(other)
+        # gemma is outside this scoped run: no stale incident for it at all.
+        self.assertEqual([i for i in second["sections"]["warnings"] if i["kind"] == ur.INCIDENT_STALE_GUARD and i["cluster"] == GEMMA], [])
 
     def test_all_core_reads_failing_drops_no_guard_and_renders_no_block(self):
         first, _ = self.collect()
@@ -1171,10 +1171,74 @@ class LedgerAndGuardsTest(unittest.TestCase):
         self.assertEqual(list(self.home.glob("*.unreadable-*")), [])
         self.assertIn("a dry run moves nothing", err.getvalue())
 
+    def test_symptom_baseline_marks_since_and_demotes_pre_existing_symptoms(self):
+        first, _ = self.collect()
+        seeded = next(r for r in first["reviews"] if r["cluster"] == SEEDED)
+        self.assertEqual({s["since"] for s in seeded["what_failed"]}, {ur.SINCE_FIRST_SEEN})
+        self.assertIn("Symptom baseline recorded: 5 symptom(s), 5 first seen.", ur.render_report(first))
+        ledger = ur.load_json(self.home / ur.LEDGER_FILENAME, {})
+        self.assertIn(f"{INFERENCE}|pending|Unschedulable", ledger["clusters"][SEEDED]["symptoms"])
+        self.assertFalse(any("Insufficient" in k for k in ledger["clusters"][SEEDED]["symptoms"]))
+        # The cluster upgrades; the same symptoms are still there, plus a new one.
+        bumped = cluster_doc("seeded-a")
+        bumped["currentMasterVersion"] = "1.36.4-gke.1247000"
+        # A new symptom with no pool gate: a webhook rejection on payments-api's ReplicaSet.
+        reads = {**READS["seeded-a"], "events": READS["seeded-a"]["events"] + [event("FailedCreate", 'failed calling webhook "gate.example.io"', kind="ReplicaSet", name="payments-api-79b77b8c67", namespace="seeded-debug", last="2026-10-15T12:00:00Z")]}
+        with mock.patch.dict(READS, {"seeded-a": reads}):
+            second, _ = self.collect(FakeFleet(clusters=[bumped, cluster_doc("gemma-gpu-upgraded")]), now=datetime(2026, 10, 15, 18, 0, tzinfo=timezone.utc))
+        review = next(r for r in second["reviews"] if r["cluster"] == SEEDED)
+        self.assertEqual(review["what_happened"]["status"], ur.STATUS_UPGRADED)
+        since = {s["object"]: s["since"] for s in review["what_failed"]}
+        self.assertEqual(since[INFERENCE], ur.SINCE_BEFORE)
+        self.assertEqual(since[PAYMENTS], ur.SINCE_NEW)
+        inference = next(i for i in second["sections"]["warnings"] if i["object"] == INFERENCE)
+        self.assertTrue(inference["predates_upgrade"])
+        self.assertNotIn(INFERENCE, [i["object"] for i in second["sections"]["errors"]])
+        self.assertIn(PAYMENTS, [i["object"] for i in second["sections"]["errors"]])
+        report = ur.render_report(second)
+        self.assertIn(f"| Unschedulable | {ur.SINCE_BEFORE} | 2. No spare capacity", report)
+        self.assertIn(ur.PREDATES_UPGRADE_TEXT, report)
+
+    def test_scoped_run_by_narrower_project_set(self):
+        self.collect()
+        ledger = ur.load_json(self.home / ur.LEDGER_FILENAME, {})
+        ledger["clusters"]["other-project/us-central1-a/elsewhere"] = {"control_plane": "1.0.0", "node_pools": {}, "channel": "", "first_seen": "2026-10-01T00:00:00Z", "last_run": "2026-10-01T00:00:00Z"}
+        ur.write_json_atomically(self.home / ur.LEDGER_FILENAME, ledger)
+        result, _ = self.collect(now=datetime(2026, 10, 15, 18, 0, tzinfo=timezone.utc))
+        self.assertTrue(result["scoped"])
+        self.assertIn("projects not enumerated this run: other-project", result["scope_reason"])
+        self.assertEqual(result["removed_clusters"], [])
+        self.assertIn("other-project/us-central1-a/elsewhere", ur.load_json(self.home / ur.LEDGER_FILENAME, {})["clusters"])
+        self.assertTrue(Path(result["report_path"]).name.endswith("-scoped.md"))
+        self.assertEqual(os.readlink(self.home / ur.REPORTS_SUBDIR / ur.LATEST_REPORT_LINK), "20261008T180000Z.md")
+        full, _ = self.collect(now=datetime(2026, 10, 16, 18, 0, tzinfo=timezone.utc), project=[PROJECT, "other-project"])
+        self.assertFalse(full["scoped"])
+        self.assertEqual(os.readlink(self.home / ur.REPORTS_SUBDIR / ur.LATEST_REPORT_LINK), "20261016T180000Z.md")
+
+    def test_reports_are_pruned_to_the_newest_fourteen_of_each_kind(self):
+        reports = self.home / ur.REPORTS_SUBDIR
+        reports.mkdir()
+        for i in range(20):
+            for suffix in ("", ur.SCOPED_SUFFIX):
+                (reports / f"202609{i + 1:02}T000000Z{suffix}.md").write_text("old")
+                (reports / f"202609{i + 1:02}T000000Z{suffix}.json").write_text("{}")
+        (reports / "notes.md").write_text("kept: not a report name")
+        self.collect()
+        full = sorted(p.name for p in reports.glob("*Z.md"))
+        scoped = sorted(p.name for p in reports.glob("*-scoped.md"))
+        self.assertEqual(len(full), ur.REPORTS_KEPT)
+        self.assertEqual(full[-1], "20261008T180000Z.md")
+        self.assertEqual(full[0], "20260908T000000Z.md")
+        self.assertEqual(len(scoped), ur.REPORTS_KEPT)
+        self.assertEqual(len(list(reports.glob("*.json"))), 2 * ur.REPORTS_KEPT)
+        self.assertTrue((reports / "notes.md").exists())
+
     def test_store_defaults_live_under_the_store_home(self):
         result, _ = self.collect()
         self.assertEqual(Path(result["ledger_path"]), self.home / ur.LEDGER_FILENAME)
         self.assertEqual(Path(result["guards_path"]), self.home / ur.GUARDS_FILENAME)
+        self.assertEqual(Path(result["json_path"]), self.home / ur.REPORTS_SUBDIR / "20261008T180000Z.json")
+        self.assertEqual(Path(result["report_path"]), self.home / ur.REPORTS_SUBDIR / "20261008T180000Z.md")
         self.assertEqual(ur.DEFAULT_STORE_DIR, "/opt/data/upgrade-retrospective")
         with mock.patch.dict(os.environ, {ur.STORE_HOME_ENV: ""}):
             self.assertEqual(ur.data_dir(), Path(ur.DEFAULT_STORE_DIR))
@@ -1218,12 +1282,12 @@ class LedgerAndGuardsTest(unittest.TestCase):
         self.assertEqual([(r["cluster"], r["what_happened"]["status"]) for r in result["reviews"]], [(GEMMA, "forced")])
         self.assertEqual(result["unchanged"], [])
         self.assertFalse(any("get-credentials" in " ".join(c) and "seeded-a" in c for c in fleet.calls))
-        # seeded-a's guards from the first run are still live and unreviewed: Warnings.
-        stale = [i for i in result["sections"]["warnings"] if i["kind"] == ur.INCIDENT_STALE_GUARD]
-        self.assertEqual({i["cluster"] for i in stale}, {SEEDED})
-        self.assertEqual(len(stale), 4)
-        self.assertIn(f"### 14 — {SEEDED} — `{PAYMENTS}`", ur.render_report(result))
-        self.assertIn("still live", ur.render_report(result))
+        # A --cluster run is scoped: seeded-a's live guards are outside it and not reported as stale.
+        self.assertTrue(result["scoped"])
+        self.assertEqual([i for i in result["sections"]["warnings"] if i["kind"] == ur.INCIDENT_STALE_GUARD], [])
+        self.assertIn(ur.INFO_SCOPED.format(reason=f"--cluster named {GEMMA}"), ur.render_report(result))
+        self.assertTrue(Path(result["report_path"]).name.endswith("-scoped.md"))
+        self.assertEqual(os.readlink(self.home / ur.REPORTS_SUBDIR / ur.LATEST_REPORT_LINK), "20261008T180000Z.md")
         missing, _ = self.collect(cluster=[f"{PROJECT}/{LOCATION}/nope"])
         self.assertEqual(missing["reviews"], [])
         self.assertIn("named by --cluster but not listed", missing["failed_reads"][0])
@@ -1233,10 +1297,11 @@ class LedgerAndGuardsTest(unittest.TestCase):
             result, fleet = self.collect(project=None)
         self.assertEqual(result["projects"], [PROJECT])
         self.assertTrue(any("projects list" in " ".join(c) for c in fleet.calls))
-        with mock.patch.dict(os.environ, {**NO_PROJECT_ENV, ur.MONITORED_PROJECTS_ENV: "a-project,b-project"}):
-            result, fleet = self.collect(FakeFleet(list_rc=1), project=None)
-        self.assertEqual(result["projects"], ["a-project", "b-project"])
-        self.assertFalse(any("projects list" in " ".join(c) for c in fleet.calls))
+        # No environment variable takes part, as collect.py's discover_fleet.
+        with mock.patch.dict(os.environ, {"MONITORED_PROJECT_IDS": "a-project,b-project", "GKE_PROJECT_ID": "c-project"}):
+            result, fleet = self.collect(project=None)
+        self.assertEqual(result["projects"], [PROJECT])
+        self.assertEqual([c for c in fleet.calls if "config" in c], [["gcloud", "config", "get-value", "project"]])
 
 
 class ReportTest(unittest.TestCase):
@@ -1266,8 +1331,8 @@ class ReportTest(unittest.TestCase):
             self.assertIn(part, inference)
         self.assertIn("| UPGRADE_NODES | pinned-inference-pool | 2026-10-08T04:20:35Z | 2026-10-08T05:24:10Z | 63 min | DONE |  |", inference)
         self.assertIn("| control plane | - | 1.35.8-gke.1380001 |", inference)
-        self.assertIn("| Unschedulable | 2. No spare capacity for the displaced pods | high | 3 of 4 pods: Insufficient cpu; e.g. inference-server-778b78fdb8-cp2pf |", inference)
-        self.assertIn("| Unschedulable | 12. A node label is removed (selector seeded-role=pinned-inference) | medium |", inference)
+        self.assertIn("| Unschedulable | first seen | 2. No spare capacity for the displaced pods | high | 3 of 4 pods: Insufficient cpu; e.g. inference-server-778b78fdb8-cp2pf |", inference)
+        self.assertIn("| Unschedulable | first seen | 12. A node label is removed (selector seeded-role=pinned-inference) | medium |", inference)
         self.assertIn(f"- **12. A node label is removed** — For {INFERENCE} (selector seeded-role=pinned-inference):", inference)
         self.assertIn(f"- guard `{ur.guard_id(SEEDED, 2, INFERENCE)}` failure entry 2 (high), first seen 2026-10-08T18:00:00Z", inference)
         self.assertIn("Read today: the readiness mode of `fleet-upgrade-verification` grades it `blocked`, and the obtainability audit reports it as `blocking-pdb`.", errors)
@@ -1282,7 +1347,7 @@ class ReportTest(unittest.TestCase):
         ])
         self.assertIn(f"{ur.PART_WHAT_HAPPENED} new (first seen); channel EXTENDED; cluster status RUNNING.", warnings)
         self.assertIn(ur.NO_OPERATION_LINE, warnings.split("### 2")[1].split("### 6")[0])
-        self.assertIn("| Error | 6. A served API version is removed (best effort: a name, not an API call) | medium | 2 of 2 pods:", warnings)
+        self.assertIn("| Error | first seen | 6. A served API version is removed (best effort: a name, not an API call) | medium | 2 of 2 pods:", warnings)
         self.assertIn(f"- guard `{ur.guard_id(SEEDED, 14, PAYMENTS)}` failure entry 14 (medium), first seen 2026-10-08T18:00:00Z", warnings)
         # Info: one block per reviewed cluster, with the next upgrade, the risks and the baseline.
         self.assertIn(f"### {SEEDED} — 5 incident(s) above", info)
@@ -1290,7 +1355,7 @@ class ReportTest(unittest.TestCase):
         seeded_block = info.split(f"### {SEEDED}")[1]
         self.assertIn(f"{ur.PART_NEXT_UPGRADE} channel REGULAR; target 1.35.8-gke.1225000; cluster at 1.35.8-gke.1380001, at or ahead of the target. Window: daily at 03:00 UTC for 4h; next opens 2026-10-09T03:00:00Z. Exclusions: none.", seeded_block)
         self.assertIn("| `seeded-shapes/Deployment/legacy-registry-pull` | 20. Images on a retired registry | high | image k8s.gcr.io/pause:3.9 |", seeded_block)
-        self.assertIn(f"{ur.PART_BASELINE} control plane 1.35.8-gke.1380001; pools default-pool 1.35.8-gke.1380001, idle-batch-pool 1.35.8-gke.1380001, pinned-inference-pool 1.35.8-gke.1380001; 23 pods, 1 budgets, 9 shapes. Guards written: 13.", seeded_block)
+        self.assertIn(f"{ur.PART_BASELINE} control plane 1.35.8-gke.1380001; pools default-pool 1.35.8-gke.1380001, idle-batch-pool 1.35.8-gke.1380001, pinned-inference-pool 1.35.8-gke.1380001; 23 pods, 1 budgets, 9 shapes. Symptom baseline recorded: 5 symptom(s), 5 first seen. Guards written: 13.", seeded_block)
         gemma_block = info.split(f"### {GEMMA}")[1].split("### ")[0]
         self.assertIn("behind the target. Window: DAILY at", gemma_block)
         self.assertIn("Exclusions: hold-gpu-minor (NO_MINOR_UPGRADES) until 2026-10-21T00:00:00Z [active].", gemma_block)
@@ -1337,7 +1402,7 @@ class ReportTest(unittest.TestCase):
 
     def test_main_writes_report_and_latest_link(self):
         home = Path(self.tmp.name)
-        report_path = home / "reports" / "upgrade-retro-report-2026-10-08.md"
+        report_path = home / "reports" / "20261008T180000Z.md"
         with mock.patch.object(ur, "default_run", FakeFleet()), mock.patch.object(ur, "now_utc", lambda: NOW):
             out, err = io.StringIO(), io.StringIO()
             with redirect_stdout(out), redirect_stderr(err):
@@ -1371,6 +1436,7 @@ class ReportTest(unittest.TestCase):
                     ur.main(["--project", PROJECT, "--output", str(home / "out.json")])
         self.assertEqual(order, ["out.json", ur.GUARDS_FILENAME, ur.LEDGER_FILENAME])
         self.assertTrue((home / ur.REPORTS_SUBDIR / ur.LATEST_REPORT_LINK).exists())
+        self.assertEqual([p.name for p in (home / ur.REPORTS_SUBDIR).glob("*Z.md")], ["20261008T180000Z.md"])
         self.assertTrue((home / ur.GUARDS_FILENAME).exists())
         self.assertFalse((home / ur.LEDGER_FILENAME).exists())
 
