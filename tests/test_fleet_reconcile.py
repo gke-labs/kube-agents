@@ -1526,7 +1526,10 @@ class FleetTreeTest(unittest.TestCase):
         # source) belongs in the inputs and in the postsubmit's trigger: a
         # stranger here is a decision to make, so its arrival is red.
         bystanders = {"README.md", "fixtures.json"}
-        tracked = subprocess.run(["git", "-C", str(reconcile.REPO_ROOT), "ls-files", "--", reconcile.FLEET_SUBDIR], check=True, capture_output=True, text=True).stdout.split()
+        # -z, as the script's ls-tree: an unquoted name per entry, so a
+        # non-ASCII or space-bearing input is read as the input it is.
+        tracked = subprocess.run(["git", "-C", str(reconcile.REPO_ROOT), "ls-files", "-z", "--", reconcile.FLEET_SUBDIR], check=True, capture_output=True).stdout.decode("utf-8", "surrogateescape").split("\0")
+        tracked = [path for path in tracked if path]
         self.assertGreater(len(tracked), 5)
         strangers = [path for path in tracked if not reconcile.is_fleet_input(path) and path.rsplit("/", 1)[-1] not in bystanders]
         self.assertEqual(strangers, [], "add it to FLEET_INPUT_SUFFIXES/NAMES and the postsubmit's run_if_changed, or to the bystanders here")
