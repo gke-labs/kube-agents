@@ -3933,14 +3933,17 @@ class ProwRunnerRolesMatchGrantersTest(unittest.TestCase):
         self.assertEqual(self._loop_members(page, "docs/ci-pool-projects.md"), set(self._MEMBER_VARS))
 
 
-# What each resource type under bench/tf/fleet needs from the reconciler's
-# project roles. A fixture pull request that adds a type this table does not
-# know is red until the author maps it, adds any new role to
-# FLEET_RECONCILER_ROLES, the provisioning loop and the runbook, and the pool
-# owner grants it on every registered project before the merge: the postsubmit
-# applies the stack as the reconciler and cannot grant the reconciler its own
-# roles (#2545 shipped a VM without compute.instanceAdmin.v1 and every pool
-# project's first on-merge apply failed on it).
+# What each resource and data-source type under bench/tf/fleet needs from the
+# reconciler's project roles. A fixture pull request that adds a type this
+# table does not know is red until its author (1) maps the type here, (2) adds
+# any role it needs to FLEET_RECONCILER_ROLES, the loop in
+# scripts/provision_ci_pool_project.sh and the repair block in
+# docs/ci-pool-projects.md section 3, and (3) has the pool owner grant it on
+# every registered project before the merge. The stack grants the reconciler
+# nothing for itself, by design (a merge to main must not widen the writer),
+# so the role has to be on the project before the first apply that needs it:
+# the stack's startup-fail VM shipped without compute.instanceAdmin.v1 and the
+# first on-merge apply failed on each project it reached.
 FLEET_RESOURCE_ROLES = {
     "google_container_cluster": {"roles/container.admin"},
     "google_container_node_pool": {"roles/container.admin"},
@@ -3950,6 +3953,9 @@ FLEET_RESOURCE_ROLES = {
     "google_service_account_iam_member": {"roles/iam.serviceAccountAdmin"},
     "google_project_iam_member": {"roles/resourcemanager.projectIamAdmin"},
     "terraform_data": set(),
+    # Data sources: reads the plan makes before anything is created.
+    "google_container_engine_versions": {"roles/container.admin"},
+    "google_client_config": set(),
 }
 # Every kubernetes_* resource is an in-cluster write, which container.admin
 # grants through the GKE IAM webhook.
@@ -3959,12 +3965,24 @@ FLEET_KUBERNETES_ROLES = {"roles/container.admin"}
 class FleetResourceTypesAreCoveredByReconcilerRolesTest(unittest.TestCase):
     """Every resource type the fleet stack declares maps to roles the reconciler holds."""
 
+    _FLEET = checker._ROOT / "bench" / "tf" / "fleet"
+
     def _types(self):
+        # Comments stripped and spacing free, as tofu reads it; resource and
+        # data blocks both, since a data source is a read the plan makes.
         types = set()
-        for path in sorted((checker._ROOT / "bench" / "tf" / "fleet").glob("*.tf")):
-            types.update(re.findall(r'^resource "([a-z0-9_]+)"', path.read_text(), re.MULTILINE))
+        for path in sorted(self._FLEET.glob("*.tf")):
+            types.update(t for _, t in re.findall(r'^\s*(resource|data)\s+"([a-z0-9_]+)"', _without_hcl_comments(path.read_text()), re.MULTILINE))
         self.assertGreater(len(types), 10)
         return types
+
+    def test_the_scan_sees_everything_tofu_would_load(self):
+        # The scan reads *.tf in this one directory; a *.tf.json file or a
+        # module block would carry types it never sees, so neither may appear
+        # without extending it.
+        self.assertEqual(sorted(p.name for p in self._FLEET.glob("*.tf.json")), [])
+        modules = [p.name for p in self._FLEET.glob("*.tf") if re.search(r'^\s*module\s+"', _without_hcl_comments(p.read_text()), re.MULTILINE)]
+        self.assertEqual(modules, [])
 
     def test_every_type_in_the_stack_is_mapped_and_its_roles_are_held(self):
         unmapped, unheld = [], []
@@ -3974,7 +3992,7 @@ class FleetResourceTypesAreCoveredByReconcilerRolesTest(unittest.TestCase):
                 unmapped.append(rtype)
             elif not needed <= checker.FLEET_RECONCILER_ROLES:
                 unheld.append((rtype, sorted(needed - checker.FLEET_RECONCILER_ROLES)))
-        self.assertEqual(unmapped, [], "a new resource type: map it in FLEET_RESOURCE_ROLES, and if it needs a role the reconciler lacks, add the role to FLEET_RECONCILER_ROLES, the provisioning loop and the runbook, and have it granted on every pool project before the merge")
+        self.assertEqual(unmapped, [], "a new resource or data-source type in bench/tf/fleet: follow the three steps in the comment above FLEET_RESOURCE_ROLES")
         self.assertEqual(unheld, [], "the reconciler lacks a role a mapped type needs")
 
     def test_the_table_carries_no_type_the_stack_no_longer_uses(self):

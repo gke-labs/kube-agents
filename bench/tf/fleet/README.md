@@ -46,9 +46,7 @@ writer: from `main`, under a Boskos lease per project, creates and in-place upda
 the deletes and replaces `reconcile-allow.json` beside this file declares (one entry per
 address, or per resource to cover every instance of a `count` or `for_each` one, with its
 reason, reviewed in the pull request that needs it and removed by its follow-up; the no-surge
-pool's replace on a minor roll is the standing one). A resource type that needs a project role the
-reconciler does not hold brings the role in the same pull request and the grant before the merge
-(`docs/ci-pool-projects.md` §3). Its two Prow
+pool's replace on a minor roll is the standing one). Its two Prow
 entries in `oss-test-infra` run `main` only: a postsubmit on every merge touching this
 directory, and a daily pass at 08:30 UTC (`docs/ci-pool-projects.md` §6.2, which also states
 the rule for a fixture pull request and for proving a branch on one leased project). A hand
@@ -58,7 +56,9 @@ cluster, `inventory_api`) are the exception: the script passes no `-replace`, so
 from a `main` checkout, under a lease on the project. Its `init` runs with `-lockfile=readonly`, so the
 providers are the ones `.terraform.lock.hcl` pins; to move them, change `versions.tf` if the major
 changes and run `tofu providers lock -platform=linux_amd64 -platform=darwin_arm64 -platform=darwin_amd64`
-here, and commit the result. Detecting the drift is a separate job, and
+here, and commit the result. A resource type that needs a project role the reconciler does not hold
+brings the role in the same pull request and the grant before the merge (`docs/ci-pool-projects.md`
+§3). Detecting the drift is a separate job, and
 it is `hack/fleet-fixture-state.py`'s: the pool verifier runs it against one project
 when asked, and the CI health bot's hourly scan runs it against every pool project and
 reports a repeated drift the way it reports a lost build node
