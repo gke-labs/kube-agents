@@ -1476,6 +1476,14 @@ class SlackMomentsHookTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.settled, [("t_e0c1", "completed")], "the arrival reaction was left on")
         self.assertEqual(self.announced, [("t_e0c1", f"seeded-a: {self.PR_NOTE}", 0)], "a PR it opened lost its message")
 
+    async def test_a_folded_completion_announces_a_pr_its_summary_alone_names(self):
+        # The folded row's message is the result alone; the summary still names the PR.
+        self._plan(shows=True, folds=True)
+        self.assertIsNone(await self._child(_Adapter(), payload={"summary": self.PR_NOTE}))
+        self.assertEqual(
+            self.announced, [("t_e0c1", f"seeded-a: 1.33.4 = default.\n{self.PR_NOTE}", 0)],
+        )
+
     async def test_a_completion_the_plan_does_not_show_or_with_no_open_fan_out_posts(self):
         for shows, folds in ((False, True), (True, False)):
             with self.subTest(shows=shows, folds=folds):
