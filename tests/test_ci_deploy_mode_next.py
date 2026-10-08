@@ -90,10 +90,14 @@ _A2A_IMAGES = ("a2a-gateway", "a2a-authcallout", "a2a-worker", "a2a-verifier", "
 _A2A_DOCKERFILE_SUFFIXES = ("gateway", "authcallout", "worker", "verifier", "console")
 _PLATFORM_URI = f"{_AR_REPO}/platform-agent:{_TAG}"
 _FLAG_UNSET_SPELLINGS = (None, "", "0", "true", "yes")
-# The next lane's two Prow jobs (oss-test-infra), the only runs section 2b
-# admits the flag on without a pull request; the nightly and a made-up job
+# The next lane's Prow jobs (oss-test-infra), the only runs section 2b
+# admits the flag on without a pull request; the today nightly and a made-up job
 # stand for every other Prow run.
-_NEXT_LANE_JOB_NAMES = ("pull-kube-agents-smoke-test-next", "ci-kube-agents-eval-next")
+_NEXT_LANE_JOB_NAMES = (
+    "pull-kube-agents-smoke-test-next",
+    "ci-kube-agents-eval-next",
+    "ci-kube-agents-eval-nightly-next-claude",
+)
 _NIGHTLY_JOB_NAME = "ci-kube-agents-eval-nightly"
 _OTHER_JOB_NAME = "ci-x"
 
@@ -576,12 +580,12 @@ class FlagSetIsNextTest(unittest.TestCase):
 
     def test_a_prow_run_without_a_pull_request_refuses_the_flag_unless_the_job_is_the_lanes(self) -> None:
         """Section 2b admits the flag on a pull request's run and on the jobs
-        EVAL_MODE_NEXT_JOB_NAMES lists (the next lane's periodic has no
-        PULL_NUMBER); every other Prow run under it is still refused, with the
+        EVAL_MODE_NEXT_JOB_NAMES lists (the next lane's periodic and nightly have
+        no PULL_NUMBER); every other Prow run under it is still refused, with the
         error naming the job, and the flag unset changes nothing."""
         guard = prow_guard()
         lane_jobs = constants()["EVAL_MODE_NEXT_JOB_NAMES"].split()
-        self.assertEqual(lane_jobs, list(_NEXT_LANE_JOB_NAMES), "the allow-list is the next lane's two jobs")
+        self.assertEqual(lane_jobs, list(_NEXT_LANE_JOB_NAMES), "the allow-list is the next lane's jobs")
         cases = {
             # (flag, IS_PROW_RUN, PULL_NUMBER, JOB_NAME) -> refused
             ("1", "true", "", _OTHER_JOB_NAME): True,

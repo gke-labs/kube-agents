@@ -226,6 +226,12 @@ func TestAnUnarmedGatewayRendersAsBefore(t *testing.T) {
 			}
 			want := []string{"NATS_URL", "NATS_USER", "NATS_PASSWORD", "DISCORD_TOKEN", "A2A_MAX_SESSIONS", "A2A_SPAWN_SESSIONS", "A2A_WORKER_IMAGE", a2aStrictEventsWriterEnvVar, a2aCapabilityRequiredEnvVar,
 				"POD_NAMESPACE", "SESSION_KV_SALT", "A2A_OWNER_DEPLOYMENT", "A2A_SESSION_SERVICE_ACCOUNT", a2aPrincipalMapEnvVar}
+			// The delegation target allowlists render from the CR's lists
+			// whether or not Chat is armed; they are not the Chat adapter's
+			// env, so they sit at the tail wherever the CR carries a list.
+			for _, e := range a2aTargetAllowlistEnv(tc.agent) {
+				want = append(want, e.Name)
+			}
 			if strings.Join(names, ",") != strings.Join(want, ",") {
 				t.Errorf("unarmed env order %v, want %v", names, want)
 			}

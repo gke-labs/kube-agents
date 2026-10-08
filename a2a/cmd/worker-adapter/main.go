@@ -21,7 +21,10 @@ package main
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"os/signal"
@@ -74,6 +77,17 @@ const (
 		"commands, one per call, with no pipes or other programs; read the output yourself. A refused command prints " +
 		"`policy rule: <rule>` on stderr; report the refusal instead of retrying or working around it."
 
+	// delegateToolID is the MCP-qualified tool name the harness's
+	// --allowedTools expects: "mcp__" + server name + "__" + tool name
+	// (worker-adapter/mcp.go names both halves so this can't drift from the
+	// server it is appended alongside).
+	delegateToolID = "mcp__" + workeradapter.DelegateMCPServer + "__" + workeradapter.DelegateToolName
+	// delegatePrompt tells the model the tool exists and when to reach for
+	// it; the tool's own schema (mcp.go) covers how to call it.
+	delegatePrompt = "You can hand a task to another agent with the `delegate` tool (addressee `platform` is the platform agent, which can read and act on the fleet). " +
+		"The gateway checks that the user may reach that agent before anything runs. Calling `delegate` ends your turn; the agent's result arrives as your next turn, so say what you are delegating and why in one line first. " +
+		"Delegate when the ask needs the fleet, a cluster or privileges you do not have; answer yourself when you can."
+
 	// defaultModelBaseURL is the install's inference gateway. defaultModelAPIKey
 	// is not a credential: the gateway here runs keyless and the harness only
 	// checks that the variable is non-empty.
@@ -89,13 +103,29 @@ func run() int {
 	log := slog.New(slog.NewJSONHandler(os.Stderr, nil))
 	slog.SetDefault(log)
 
+	// `worker-adapter mcp` is not a task run: it is the stdio MCP server the
+	// harness launches as a subprocess of itself, forwarding the session's
+	// one delegate tool call to this adapter process over a unix socket
+	// (worker-adapter/mcp.go). It has none of the task env below, so it is
+	// dispatched before configFromEnv rather than folded into it.
+	if len(os.Args) > 1 && os.Args[1] == "mcp" {
+		if err := workeradapter.ServeDelegateMCP(context.Background(), os.Stdin, os.Stdout, workeradapter.DelegateSocketPath(), log); err != nil && !errors.Is(err, io.EOF) {
+			fmt.Fprintln(os.Stderr, "mcp:", err)
+			return 1
+		}
+		return 0
+	}
+
 	cfg, ok := configFromEnv(log)
 	if !ok {
 		return 1
 	}
 
 	// The harness works out of the pod's scratch emptyDir; falling back to
-	// the current directory keeps local runs working.
+	// the current directory keeps the workdir working for a run by hand. The
+	// delegate tool's socket defaults under /scratch too and has no such
+	// fallback: a run by hand sets A2A_DELEGATE_SOCKET to a writable path or
+	// A2A_DELEGATE_TOOL=off.
 	workdir := os.Getenv("A2A_WORKDIR")
 	if workdir == "" {
 		workdir = defaultWorkdir
@@ -105,7 +135,9 @@ func run() int {
 	}
 
 	// SIGTERM is the eviction path: context cancellation tells the adapter
-	// to flush, publish terminal failed reason worker-evicted, and exit 143.
+	// to flush, publish terminal failed reason worker-evicted, and exit 143 -
+	// except on a turn that has already delegated, which completes with its
+	// one-line result and exits 0 (workeradapter.Run).
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer stop()
 
@@ -181,17 +213,26 @@ func configFromEnv(log *slog.Logger) (workeradapter.Config, bool) {
 	}
 
 	originSeq, originSeqStated := originSeq(log)
+	// delegateSocket feeds Config.DelegateSocket (commented in adapter.go):
+	// it answers only the tool's own switch and knows nothing of
+	// A2A_HARNESS_CMD, so with that override set the listener can start
+	// while the harness it drives is never told the tool exists.
+	delegateSocket := ""
+	if delegateToolEnabled() {
+		delegateSocket = workeradapter.DelegateSocketPath()
+	}
 	return workeradapter.Config{
-		NATSURL:      natsURL,
-		NATSUser:     os.Getenv("NATS_USER"),
-		NATSPassword: os.Getenv("NATS_PASSWORD"),
-		BusTokenFile: busTokenFile(),
-		PodName:      os.Getenv(lib.EnvPodName),
-		TaskID:       taskID,
-		Profile:      profile,
-		Session:      os.Getenv("A2A_SESSION"),
-		Namespace:    namespace,
-		Scope:        scope,
+		NATSURL:        natsURL,
+		NATSUser:       os.Getenv("NATS_USER"),
+		NATSPassword:   os.Getenv("NATS_PASSWORD"),
+		BusTokenFile:   busTokenFile(),
+		PodName:        os.Getenv(lib.EnvPodName),
+		TaskID:         taskID,
+		Profile:        profile,
+		Session:        os.Getenv("A2A_SESSION"),
+		Namespace:      namespace,
+		Scope:          scope,
+		DelegateSocket: delegateSocket,
 		// Unset means required: a submission with no capability is
 		// refused. "false" is the mixed-version window only — a gateway
 		// that predates the mint. It does not switch enforcement off; a
@@ -253,6 +294,21 @@ func harnessCommand() []string {
 	if bashView {
 		disallowed = clusterViewDisallowed
 	}
+	// The delegate tool has its own switch, independent of
+	// A2A_ALLOWED_TOOLS: it is appended to whatever surface was resolved
+	// above, including an explicit override, because the gateway -- not
+	// this allowlist -- is what checks the addressee (worker-adapter/mcp.go).
+	// A2A_DELEGATE_TOOL=off is the one way to run without it, for a stub
+	// harness in tests or an older image.
+	delegateTool := delegateToolEnabled()
+	var prompts []string
+	if bashView {
+		prompts = append(prompts, clusterViewPrompt)
+	}
+	if delegateTool {
+		allowed += "," + delegateToolID
+		prompts = append(prompts, delegatePrompt)
+	}
 	argv := []string{
 		path,
 		"--print",
@@ -264,13 +320,40 @@ func harnessCommand() []string {
 		"--allowedTools", allowed,
 		"--disallowedTools", disallowed,
 	}
-	if bashView {
-		argv = append(argv, "--append-system-prompt", clusterViewPrompt)
+	if delegateTool {
+		// The harness launches this same binary as `mcp` (worker-adapter/mcp.go)
+		// and speaks MCP to it over stdio; --strict-mcp-config keeps a stray
+		// project or user MCP config from adding tools the gateway never vetted.
+		self, err := os.Executable()
+		if err != nil || self == "" {
+			self = "/usr/local/bin/worker-adapter"
+		}
+		sock := workeradapter.DelegateSocketPath()
+		mcpCfg, _ := json.Marshal(map[string]any{"mcpServers": map[string]any{
+			workeradapter.DelegateMCPServer: map[string]any{
+				"command": self,
+				"args":    []string{"mcp"},
+				"env":     map[string]string{workeradapter.EnvDelegateSocket: sock},
+			},
+		}})
+		argv = append(argv, "--mcp-config", string(mcpCfg), "--strict-mcp-config")
+	}
+	if len(prompts) > 0 {
+		argv = append(argv, "--append-system-prompt", strings.Join(prompts, "\n\n"))
 	}
 	if extra := os.Getenv("A2A_HARNESS_EXTRA_ARGS"); extra != "" {
 		argv = append(argv, strings.Fields(extra)...)
 	}
 	return argv
+}
+
+// delegateToolEnabled is the delegate tool's single switch: everything that
+// advertises or starts it (the harness flags below, the Config wiring in
+// configFromEnv, and the socket listener it feeds) reads this and nothing
+// else, so A2A_DELEGATE_TOOL=off is one decision rather than three that could
+// drift apart.
+func delegateToolEnabled() bool {
+	return os.Getenv("A2A_DELEGATE_TOOL") != "off"
 }
 
 // allowsBash reports whether a harness --allowedTools value names Bash, bare

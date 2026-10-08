@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -206,6 +208,12 @@ type rig struct {
 	client  *lib.Client // the gateway's client
 	bus     *lib.Client // a second client playing the executor
 	url     string
+	// logs is the gateway's log as text, on the rigs that capture it
+	// (startRigWithSpawnerCap); nil elsewhere.
+	logs *lockedBuffer
+	// stop cancels the gateway's context, on the rigs restartRig can
+	// replace (startRigWithSpawnerCap); nil elsewhere.
+	stop context.CancelFunc
 }
 
 // startRig assembles a gateway on an embedded server, with user 1001 mapped
@@ -875,7 +883,7 @@ func TestTasklessActiveTaskInsideGraceStillSteers(t *testing.T) {
 // cap returns before the end-of-turn write, and the conversation must not be
 // told it is released while the record still says otherwise.
 func TestTasklessHealPersistsAcrossCapRefusal(t *testing.T) {
-	r, spawn := startRigWithSpawnerCap(t, "platform", 1)
+	r, spawn := startRigWithSpawnerCap(t, "platform", 1, nil)
 	spawn.setLive(1)
 	conv := "discord:g1/thread-taskless-cap"
 	seedTasklessDelegate(t, r, conv, defaultFirstEventGrace+time.Minute)
@@ -1083,12 +1091,21 @@ func startRigWithSpawner(t *testing.T) (*rig, *fakeSpawner) {
 // - RouteSession is the post-flip W4 configuration.
 func startRigWithSpawnerRoute(t *testing.T, defaultAddressee string) (*rig, *fakeSpawner) {
 	t.Helper()
-	return startRigWithSpawnerCap(t, defaultAddressee, 0)
+	return startRigWithSpawnerCap(t, defaultAddressee, 0, nil)
 }
 
 // startRigWithSpawnerCap additionally pins the session-pod cap; 0 keeps the
-// default (New normalizes it), which is what every pre-cap test wants.
-func startRigWithSpawnerCap(t *testing.T, defaultAddressee string, maxSessions int) (*rig, *fakeSpawner) {
+// default (New normalizes it), which is what every pre-cap test wants. tweak,
+// when set, edits the Config before New sees it (an allowlist, a depth bound).
+func startRigWithSpawnerCap(t *testing.T, defaultAddressee string, maxSessions int, tweak func(*Config)) (*rig, *fakeSpawner) {
+	t.Helper()
+	return startRigWithSpawnerAdapter(t, defaultAddressee, maxSessions, tweak, nil)
+}
+
+// startRigWithSpawnerAdapter is startRigWithSpawnerCap with the adapter the
+// gateway drives chosen by wrap, which is handed the rig's fake (nil: the
+// fake itself). The rig's posts and edits are still the fake's.
+func startRigWithSpawnerAdapter(t *testing.T, defaultAddressee string, maxSessions int, tweak func(*Config), wrap func(*fakeAdapter) Adapter) (*rig, *fakeSpawner) {
 	t.Helper()
 	s := startServer(t)
 	url := s.ClientURL()
@@ -1123,13 +1140,76 @@ func startRigWithSpawnerCap(t *testing.T, defaultAddressee string, maxSessions i
 		IdleTTL:          30 * time.Minute,
 		AttributionSalt:  []byte("test-salt"),
 	}
-	g, err := New(Options{Client: client, Adapter: adapter, Config: cfg, Backend: "discord", Spawner: spawn})
+	if tweak != nil {
+		tweak(cfg)
+	}
+	// The log is captured as well as written, so a test can assert a path
+	// that is observable only as its log line (an ignored delegation).
+	logs := &lockedBuffer{}
+	log := slog.New(slog.NewTextHandler(io.MultiWriter(os.Stderr, logs), nil))
+	var driven Adapter = adapter
+	if wrap != nil {
+		driven = wrap(adapter)
+	}
+	g, err := New(Options{Client: client, Adapter: driven, Config: cfg, Backend: "discord", Spawner: spawn, Logger: log})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
 	go func() { _ = g.Run(ctx) }()
 
-	return &rig{g: g, adapter: adapter, client: client, bus: bus, url: url}, spawn
+	return &rig{g: g, adapter: adapter, client: client, bus: bus, url: url, logs: logs, stop: cancel}, spawn
+}
+
+// restartRig stops r's gateway and starts a second one over the same server,
+// KV and Config, with a fresh adapter, spawner and log: a gateway restart.
+// The first is stopped (context canceled, Run returned, client closed)
+// BEFORE the second starts, because the relay durable is shared and two live
+// gateways would split its deliveries. The executor client is kept.
+//
+// whileDown, when given, runs between the two: the bus traffic a gateway that
+// was down never saw.
+func restartRig(t *testing.T, r *rig, whileDown ...func()) (*rig, *fakeSpawner) {
+	t.Helper()
+	return restartRigWrapped(t, r, nil, whileDown...)
+}
+
+// restartRigWrapped is restartRig with the second gateway's adapter chosen
+// by wrap, as startRigWithSpawnerAdapter chooses the first's.
+func restartRigWrapped(t *testing.T, r *rig, wrap func(*fakeAdapter) Adapter, whileDown ...func()) (*rig, *fakeSpawner) {
+	t.Helper()
+	r.stop()
+	select {
+	case <-r.adapter.stopped:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the first gateway did not stop")
+	}
+	r.client.Close()
+	for _, f := range whileDown {
+		f()
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	client, err := lib.Connect(ctx, r.url, lib.WithName("gateway-test-2"), lib.WithAgreementPolicy(SupervisorAgreement(nil)))
+	if err != nil {
+		t.Fatalf("gateway client: %v", err)
+	}
+	t.Cleanup(client.Close)
+	adapter := newFakeAdapter()
+	spawn := &fakeSpawner{}
+	cfg := *r.g.cfg
+	logs := &lockedBuffer{}
+	log := slog.New(slog.NewTextHandler(io.MultiWriter(os.Stderr, logs), nil))
+	var driven Adapter = adapter
+	if wrap != nil {
+		driven = wrap(adapter)
+	}
+	g, err := New(Options{Client: client, Adapter: driven, Config: &cfg, Backend: "discord", Spawner: spawn, Logger: log})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	go func() { _ = g.Run(ctx) }()
+	return &rig{g: g, adapter: adapter, client: client, bus: r.bus, url: r.url, logs: logs, stop: cancel}, spawn
 }
 
 // TestDelegatePrefixSpawnsSessionWorker: the W4 amendment's flow - a
@@ -1844,7 +1924,7 @@ func TestSessionCommandOnSessionDefaultChangesNothing(t *testing.T) {
 // TestSessionCommandWithTextHonoursTheCap: a refused first turn leaves no
 // half-written record - the cap post is the only reply.
 func TestSessionCommandWithTextHonoursTheCap(t *testing.T) {
-	r, spawn := startRigWithSpawnerCap(t, "platform", 1)
+	r, spawn := startRigWithSpawnerCap(t, "platform", 1, nil)
 	spawn.mu.Lock()
 	spawn.live = 1
 	spawn.mu.Unlock()
@@ -2356,5 +2436,318 @@ func TestAMintFailureUnderCapabilityOptionalSendsGrantsNull(t *testing.T) {
 	}
 	if string(auth.Grants) != "null" {
 		t.Fatalf("grants = %s, want null -- this is the one path that may carry no capability", auth.Grants)
+	}
+}
+
+// TestStartTaskRecordsTheRequester: the history entry carries the backend and
+// the backend-native author id (what the allowlist check compares when this
+// turn asks the gateway to mint a child task) and the pseudonymized
+// attribution, never the plaintext principal.
+func TestStartTaskRecordsTheRequester(t *testing.T) {
+	r := startRig(t)
+	conv := "discord:g1/thread-req"
+	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: "m-1", Text: "how is the fleet?"}
+	r.awaitTask(t, "platform")
+	var rec *SessionRecord
+	waitFor(t, "record with a task", func() bool {
+		rec, _ = r.g.reg.Get(context.Background(), conv)
+		return rec != nil && len(rec.Tasks) == 1
+	})
+	ref := rec.Tasks[0]
+	if want := requesterSubject(r.g.ps, "discord", "1001"); ref.Requester == nil ||
+		ref.Requester.Backend != "discord" || ref.Requester.Subject != want || !strings.HasPrefix(want, "hmac:") {
+		t.Fatalf("requester = %+v, want backend discord and subject %q", ref.Requester, want)
+	}
+	if raw := rawSessionRecord(t, r.g.reg, conv); strings.Contains(raw, `"1001"`) {
+		t.Fatalf("the session KV holds the plaintext author id: %s", raw)
+	}
+	if ref.StartedAt.IsZero() {
+		t.Fatal("startedAt not recorded")
+	}
+	if strings.Contains(string(ref.Attribution), "test:bnaylor") {
+		t.Fatalf("attribution carries the plaintext principal: %s", ref.Attribution)
+	}
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(ref.Attribution, &m); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := m["requester"]; !ok {
+		t.Fatalf("attribution lacks requester: %s", ref.Attribution)
+	}
+	if _, ok := m["grants"]; ok {
+		t.Fatalf("attribution carries grants: %s", ref.Attribution)
+	}
+	// A human turn is the root of any chain: no role, no parent, no
+	// children, depth zero — and none of the four keys written at all.
+	if ref.Role != "" || ref.ParentTaskID != "" || ref.Children != nil || ref.Depth != 0 {
+		t.Fatalf("human turn carries chain fields: %+v", ref)
+	}
+	var stored struct {
+		Tasks []map[string]json.RawMessage `json:"tasks"`
+	}
+	if err := json.Unmarshal([]byte(rawSessionRecord(t, r.g.reg, conv)), &stored); err != nil || len(stored.Tasks) != 1 {
+		t.Fatalf("stored record: %v (%d tasks)", err, len(stored.Tasks))
+	}
+	for _, k := range []string{"role", "parentTaskId", "children", "depth"} {
+		if _, ok := stored.Tasks[0][k]; ok {
+			t.Fatalf("human turn's history entry writes %q", k)
+		}
+	}
+}
+
+// TestStartTaskWithCarriesTheChain: the core a child or wake turn calls
+// rides the correlationId it is handed rather than minting one, stores the
+// requester it is handed verbatim (already hashed), and writes the chain
+// fields onto the history entry.
+func TestStartTaskWithCarriesTheChain(t *testing.T) {
+	r := startRig(t)
+	if r.g.cfg.DelegationDepthMax != 3 {
+		t.Fatalf("New left DelegationDepthMax = %d on a hand-built Config, want 3", r.g.cfg.DelegationDepthMax)
+	}
+	conv := "discord:g1/thread-chain"
+	rec := &SessionRecord{Key: conv, Kind: "group", Addressee: "platform", ContextID: "ctx-chain"}
+	req := TaskRequester{Backend: "discord", Subject: requesterSubject(r.g.ps, "discord", "1001")}
+	taskID, ok := r.g.startTaskWith(context.Background(), rec, taskStart{
+		Text:          "child ask",
+		MessageID:     "",
+		Principal:     "test:bnaylor",
+		Requester:     req,
+		Authority:     Authority{Requester: AuthorityRequester{Principal: "test:bnaylor", Backend: "discord"}},
+		CorrelationID: "corr-parent",
+		Role:          taskRoleChild,
+		ParentTaskID:  "task-parent",
+		Depth:         1,
+	})
+	if !ok || taskID == "" {
+		t.Fatalf("startTaskWith = (%q, %v), want a task id and true", taskID, ok)
+	}
+	env := r.awaitTask(t, "platform")
+	if env.TaskID != taskID || env.CorrelationID != "corr-parent" {
+		t.Fatalf("envelope task %q corr %q, want %q and the parent's corr-parent", env.TaskID, env.CorrelationID, taskID)
+	}
+	if rec.ActiveTask == nil || rec.ActiveTask.CorrelationID != "corr-parent" {
+		t.Fatalf("active task = %+v, want correlationId corr-parent", rec.ActiveTask)
+	}
+	ref := rec.Tasks[len(rec.Tasks)-1]
+	if ref.ID != taskID || ref.CorrelationID != "corr-parent" || ref.Role != taskRoleChild ||
+		ref.ParentTaskID != "task-parent" || ref.Depth != 1 || ref.Children != nil {
+		t.Fatalf("history entry = %+v", ref)
+	}
+	if ref.Requester == nil || *ref.Requester != req {
+		t.Fatalf("requester = %+v, want %+v stored as handed", ref.Requester, req)
+	}
+}
+
+// TestStartTaskHashesAGchatRequester: on Google Chat the author id is the
+// sender's email, and the history entry lands in the session-state KV, which
+// the content posture holds to pseudonyms. The stored requester is the
+// backend plus the normalized id hashed under the install salt; the email
+// appears nowhere in the record, in any case.
+func TestStartTaskHashesAGchatRequester(t *testing.T) {
+	r := startGchatRig(t, []string{"alice@example.com"}, false)
+	conv := "gchat:spaces/S1/threads/T-req"
+	r.adapter.inbox <- InboundMessage{
+		Conversation: conv, Kind: "group",
+		AuthorID: "Alice@Example.com", MessageID: "spaces/S1/messages/M1", Text: "how is the fleet?",
+	}
+	r.awaitTask(t, "platform")
+	waitFor(t, "record with a task", func() bool {
+		rec, _ := r.g.reg.Get(context.Background(), conv)
+		return rec != nil && len(rec.Tasks) == 1
+	})
+	raw := rawSessionRecord(t, r.g.reg, conv)
+	if strings.Contains(strings.ToLower(raw), "alice@example.com") {
+		t.Fatalf("the session KV holds the requester's email: %s", raw)
+	}
+	var stored struct {
+		Tasks []struct {
+			Requester map[string]string `json:"requester"`
+		} `json:"tasks"`
+	}
+	if err := json.Unmarshal([]byte(raw), &stored); err != nil {
+		t.Fatal(err)
+	}
+	if len(stored.Tasks) != 1 {
+		t.Fatalf("tasks = %+v", stored.Tasks)
+	}
+	want := NewPseudonymizer([]byte("test-salt")).Hash("alice@example.com") // trimmed, lowercased, hashed
+	got := stored.Tasks[0].Requester
+	if got["backend"] != gchatBackend || got["subject"] != want || len(got) != 2 {
+		t.Fatalf("requester = %v, want backend %q and subject %q only", got, gchatBackend, want)
+	}
+}
+
+// rawSessionRecord reads a record's bytes as the KV holds them, so a test can
+// assert on what is at rest rather than on the decoded struct.
+func rawSessionRecord(t *testing.T, reg *Registry, sessionKey string) string {
+	t.Helper()
+	kv, err := reg.kv(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry, err := kv.Get(context.Background(), kvKey(sessionKey))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(entry.Value())
+}
+
+// TestAskTTLBoundaryClearsBothCopies: a copy exactly AskTTL old is past the
+// TTL (>=), for the history entry's requester exactly as for the active
+// task's ask, and a nanosecond younger is not, for either.
+func TestAskTTLBoundaryClearsBothCopies(t *testing.T) {
+	r := startRigWith(t, func(c *Config) { c.AskTTL = time.Minute })
+	conv := "discord:g1/thread-ttl-edge"
+	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: "m-1", Text: "x"}
+	r.awaitTask(t, "platform")
+	ctx := context.Background()
+	var rec *SessionRecord
+	waitFor(t, "record", func() bool {
+		rec, _ = r.g.reg.Get(ctx, conv)
+		return rec != nil && len(rec.Tasks) == 1 && rec.ActiveTask != nil
+	})
+	start := time.Now().UTC().Truncate(time.Second) // survives the JSON round trip exactly
+	rec.Tasks[0].StartedAt = start
+	rec.ActiveTask.SubmittedAt = start
+	if err := r.g.reg.Put(ctx, rec); err != nil {
+		t.Fatal(err)
+	}
+
+	r.g.boundAskCopyAt(ctx, rec, start.Add(time.Minute-time.Nanosecond))
+	fresh, _ := r.g.reg.Get(ctx, conv)
+	if fresh.Tasks[0].Requester == nil || fresh.Tasks[0].Attribution == nil {
+		t.Fatalf("requester cleared a nanosecond before the TTL: %+v", fresh.Tasks[0])
+	}
+	if fresh.ActiveTask == nil || fresh.ActiveTask.Ask == "" {
+		t.Fatalf("ask cleared a nanosecond before the TTL: %+v", fresh.ActiveTask)
+	}
+
+	r.g.boundAskCopyAt(ctx, fresh, start.Add(time.Minute))
+	fresh, _ = r.g.reg.Get(ctx, conv)
+	if fresh.Tasks[0].Requester != nil || fresh.Tasks[0].Attribution != nil {
+		t.Fatalf("requester survived at exactly the TTL: %+v", fresh.Tasks[0])
+	}
+	if fresh.ActiveTask == nil || fresh.ActiveTask.Ask != "" {
+		t.Fatalf("ask survived at exactly the TTL: %+v", fresh.ActiveTask)
+	}
+}
+
+func TestTaskRefOmitsAZeroStartedAt(t *testing.T) {
+	raw, err := json.Marshal(TaskRef{ID: "task-legacy", Addressee: "platform"}) // pre-field shape
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), "startedAt") {
+		t.Fatalf("a legacy-shaped entry marshals a zero startedAt: %s", raw)
+	}
+}
+
+// TestAskTTLClearsTheRequesterToo: past AskTTL the history entry drops its
+// requester and attribution the way ActiveTask drops its Ask; the entry itself
+// stays, as do entries written before the fields existed.
+func TestAskTTLClearsTheRequesterToo(t *testing.T) {
+	r := startRigWith(t, func(c *Config) { c.AskTTL = time.Minute })
+	conv := "discord:g1/thread-ttl"
+	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: "m-1", Text: "x"}
+	r.awaitTask(t, "platform")
+	ctx := context.Background()
+	var rec *SessionRecord
+	waitFor(t, "record", func() bool { rec, _ = r.g.reg.Get(ctx, conv); return rec != nil && len(rec.Tasks) == 1 })
+	rec.Tasks[0].StartedAt = time.Now().Add(-2 * time.Minute)
+	rec.Tasks = append(rec.Tasks, TaskRef{ID: "task-legacy", Addressee: "platform"}) // pre-field entry
+	if err := r.g.reg.Put(ctx, rec); err != nil {
+		t.Fatal(err)
+	}
+	r.g.boundAskCopy(ctx, rec)
+	fresh, _ := r.g.reg.Get(ctx, conv)
+	if fresh.Tasks[0].Requester != nil || fresh.Tasks[0].Attribution != nil {
+		t.Fatalf("requester survived the TTL: %+v", fresh.Tasks[0])
+	}
+	if fresh.Tasks[1].ID != "task-legacy" {
+		t.Fatalf("legacy entry disturbed: %+v", fresh.Tasks[1])
+	}
+	if fresh.ActiveTask == nil || fresh.ActiveTask.Ask == "" {
+		t.Fatalf("the active task's fresh ask was cleared: %+v", fresh.ActiveTask)
+	}
+}
+
+// TestAGchatSteerAuthorIsStoredHashed: the steer author lands in the
+// session-state KV as the requester does, the normalized email hashed, the
+// email nowhere in the record.
+func TestAGchatSteerAuthorIsStoredHashed(t *testing.T) {
+	r := startGchatRig(t, []string{"alice@example.com", "bob@example.com"}, false)
+	conv := "gchat:spaces/S1/threads/T-steer"
+	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "alice@example.com", MessageID: "spaces/S1/messages/M1", Text: "how is the fleet?"}
+	origin := r.awaitTask(t, "platform")
+	waitFor(t, "task on the record", func() bool {
+		rec, _ := r.g.reg.Get(context.Background(), conv)
+		return rec != nil && rec.ActiveTask != nil
+	})
+	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "Bob@Example.com", MessageID: "spaces/S1/messages/M2", Text: "and the costs"}
+	var ref TaskRef
+	waitFor(t, "steer author on the record", func() bool {
+		rec, _ := r.g.reg.Get(context.Background(), conv)
+		ref, _ = rec.TaskRefFor(origin.TaskID)
+		return len(ref.SteerAuthors) == 1
+	})
+	want := NewPseudonymizer([]byte("test-salt")).Hash("bob@example.com")
+	if ref.SteerAuthors[0] != (TaskRequester{Backend: gchatBackend, Subject: want}) {
+		t.Fatalf("steer author = %+v, want gchat/%s", ref.SteerAuthors[0], want)
+	}
+	if raw := rawSessionRecord(t, r.g.reg, conv); strings.Contains(strings.ToLower(raw), "bob@example.com") {
+		t.Fatalf("the session KV holds the steer author's email: %s", raw)
+	}
+}
+
+// TestAskTTLClearsTheSteerAuthors: the steer authors are bounded with the
+// requester, the overflow mark with them; an entry holding only steer
+// authors (its requester already cleared) is found and cleared too.
+func TestAskTTLClearsTheSteerAuthors(t *testing.T) {
+	r := startRigWith(t, func(c *Config) { c.AskTTL = time.Minute })
+	conv := "discord:g1/thread-ttl-steer"
+	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: "m-1", Text: "x"}
+	r.awaitTask(t, "platform")
+	ctx := context.Background()
+	var rec *SessionRecord
+	waitFor(t, "record", func() bool { rec, _ = r.g.reg.Get(ctx, conv); return rec != nil && len(rec.Tasks) == 1 })
+	old := time.Now().Add(-2 * time.Minute)
+	authors := []TaskRequester{{Backend: "discord", Subject: "hmac:x"}}
+	rec.Tasks[0].StartedAt = old
+	rec.Tasks[0].SteerAuthors, rec.Tasks[0].SteerAuthorsOverflow = authors, true
+	rec.Tasks = append(rec.Tasks, TaskRef{ID: "task-steer-only", Addressee: "platform", StartedAt: old, SteerAuthors: authors})
+	if err := r.g.reg.Put(ctx, rec); err != nil {
+		t.Fatal(err)
+	}
+	r.g.boundAskCopy(ctx, rec)
+	fresh, _ := r.g.reg.Get(ctx, conv)
+	for _, ref := range fresh.Tasks {
+		if ref.Requester != nil || len(ref.SteerAuthors) != 0 || ref.SteerAuthorsOverflow {
+			t.Fatalf("steer authors survived the TTL: %+v", ref)
+		}
+	}
+}
+
+// TestAskTTLBoundsTheIncarnationSet: the set is hashed ids like the
+// requester copy and is bounded the same way, from its oldest entry; cleared,
+// it is marked incomplete, so the incarnation's delegations fail closed as a
+// cleared requester's do.
+func TestAskTTLBoundsTheIncarnationSet(t *testing.T) {
+	r := startRigWith(t, func(c *Config) { c.AskTTL = time.Minute })
+	conv := "discord:g1/thread-ttl-incarnation"
+	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: "m-1", Text: "x"}
+	r.awaitTask(t, "platform")
+	ctx := context.Background()
+	var rec *SessionRecord
+	waitFor(t, "record", func() bool { rec, _ = r.g.reg.Get(ctx, conv); return rec != nil && len(rec.Tasks) == 1 })
+	rec.BusSession = "chat-x"
+	rec.addSessionAuthor(TaskRequester{Backend: "discord", Subject: "hmac:x"})
+	rec.SessionAuthorsSince = time.Now().Add(-2 * time.Minute)
+	if err := r.g.reg.Put(ctx, rec); err != nil {
+		t.Fatal(err)
+	}
+	r.g.boundAskCopy(ctx, rec)
+	fresh, _ := r.g.reg.Get(ctx, conv)
+	if len(fresh.SessionAuthors) != 0 || !fresh.SessionAuthorsUnknown {
+		t.Fatalf("incarnation set past the TTL: %+v unknown=%v", fresh.SessionAuthors, fresh.SessionAuthorsUnknown)
 	}
 }
