@@ -325,9 +325,44 @@ class Retired(Base):
             outs.append(out)
         self.assertIn("none graded", outs[0])
         self.assertEqual(outs[1], "")
-        self.assertIn("not graded on 3 consecutive days, next attempt at the weekly refresh", outs[2])
+        self.assertIn("not graded on 3 consecutive attempt(s)", outs[2])
+        self.assertIn("next attempt at the weekly refresh", outs[2])
+        self.assertNotIn("retrying tomorrow", outs[2])
         self.assertEqual(self.ledger()["targets"][TARGET]["last_report_at"], NOW.isoformat())
         self.assertEqual(outs[3], "")
+        # A week later the version is still unreadable: parked again at once, no new daily ladder.
+        with mock.patch.object(watch, "now_utc", return_value=NOW + timedelta(days=7)):
+            code, out = self.run_tick(FakeSandbox(envelope([member("a", "lagging")]), readiness))
+        self.assertIn("not graded on 4 consecutive attempt(s)", out)
+        self.assertEqual(self.ledger()["targets"][TARGET]["last_report_at"], (NOW + timedelta(days=7)).isoformat())
+        # Graded at last: the attempt record is gone.
+        with mock.patch.object(watch, "now_utc", return_value=NOW + timedelta(days=14)):
+            code, out = self.run_tick(FakeSandbox(envelope([member("a", "lagging")]), envelope([member("a", "lagging", readiness="ready")])))
+        self.assertIn("1 ready;", out)
+        self.assertNotIn(TARGET, self.ledger()["announced"].get("ungraded", {}))
+
+    def test_a_server_config_failure_leaves_the_location_s_unknown_members_unread(self) -> None:
+        readiness = envelope(
+            [member("a", "lagging", readiness="unknown")],
+            errors=[{"project": "p1", "location": "us-central1-a", "message": "get-server-config timed out"}],
+        )
+        sandbox = FakeSandbox(envelope([member("a", "lagging")]), readiness)
+        code, out = self.run_tick(sandbox)
+        self.assertEqual(code, 0)
+        self.assertIn("none graded", out)
+        self.assertIsNone(self.ledger()["targets"][TARGET]["last_report_at"])
+
+    def test_a_failed_project_run_is_named_even_when_another_project_graded(self) -> None:
+        versions = envelope([member("a", "lagging"), member("b", "lagging", project="p2")])
+        readiness = envelope([member("a", "lagging", readiness="ready"), member("b", "lagging", project="p2", readiness="ready")])
+        with mock.patch.dict(os.environ, {watch.PROJECTS_ENV: "p1,p2"}):
+            sandbox = FakeSandbox(versions, readiness, failing_projects={"p2"})
+            code, out = self.run_tick(sandbox)
+        self.assertEqual(code, 0)
+        self.assertIn("1 ready, 1 not read;", out)
+        self.assertIn("readiness run for p2 failed: sandbox exited 255 without a report: ssh: lost connection", out)
+        text = (self.home / "reports" / TARGET / "latest.md").read_text()
+        self.assertIn("- p2: readiness run for p2 failed", text)
 
     def test_a_malformed_announced_block_is_refused(self) -> None:
         for block in (None, [], {"partial": 5}, {"ungraded": "x"}, {"ungraded": {TARGET: "old-string-shape"}}):
