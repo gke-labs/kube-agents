@@ -34,8 +34,9 @@ Neither reads versions against a target.
 - `--cluster` is repeatable and, when given, restricts the report to those clusters, as
   `<location>/<name>` or a bare name; every other member of the projects is skipped, reads
   included, and the rollout record is neither read nor written, since a narrowed read would file
-  every member it did not name as gone. The fleet-audit collector passes the clusters it found
-  behind.
+  every member it did not name as gone. A spec that matches no cluster in the projects is an
+  error line and exit 1, not an empty table. The fleet-audit collector passes the clusters it
+  found behind.
 - `--project` is repeatable and, when given, is the whole scope. Without it the script takes the
   union of `GCP_PROJECT_ID`, `GKE_PROJECT_ID` and `PROJECT_ID` with `MONITORED_PROJECT_IDS`
   (comma- or whitespace-separated) when set, or with every project visible to

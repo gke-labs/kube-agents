@@ -246,6 +246,9 @@ READINESS_NO_OPENING_CELL = f"none within {readiness.DAYS_PER_WEEK} days"
 EXIT_OK = 0
 EXIT_PARTIAL = 1
 NARROWED_RUN_NOTE = "Narrowed by --cluster: the rollout record was neither read nor written."
+# A `--cluster` spec that matched nothing is an error with exit 1, like a project that
+# could not be listed: an empty table with exit 0 would read as "nothing to grade".
+UNMATCHED_CLUSTER_SPEC = "no cluster matched --cluster {spec} in {projects}"
 EXIT_USAGE = 2
 
 
@@ -632,10 +635,14 @@ def assess_readiness(cluster: dict, member: dict, items: list | None, read_error
     }
 
 
-def _wanted(cluster: dict, wanted: set[tuple[str, str]]) -> bool:
+def _wanted(cluster: dict, wanted: set[tuple[str, str]]) -> tuple[str, str] | None:
+    """The `--cluster` spec this cluster satisfies, or None."""
     name = cluster.get("name", "")
     location = cluster.get("location", "")
-    return (location, name) in wanted or ("", name) in wanted
+    for spec in ((location, name), ("", name)):
+        if spec in wanted:
+            return spec
+    return None
 
 
 def build_report(projects: list[str], explicit_target: str | None, readiness_options: dict | None = None, clusters: list[str] | None = None) -> dict:
@@ -649,6 +656,7 @@ def build_report(projects: list[str], explicit_target: str | None, readiness_opt
     # `<location>/<name>` pins one cluster; a bare name admits that name in
     # every location of the projects (GKE names are unique per location).
     wanted = {spec.partition("/")[::2] if "/" in spec else ("", spec) for spec in clusters} if clusters else None
+    matched: set[tuple[str, str]] = set()
     cache = ServerConfigCache()
     members: list[dict] = []
     errors: list[dict] = []
@@ -666,8 +674,11 @@ def build_report(projects: list[str], explicit_target: str | None, readiness_opt
         for cluster in clusters:
             if not isinstance(cluster, dict):
                 continue
-            if wanted is not None and not _wanted(cluster, wanted):
-                continue
+            if wanted is not None:
+                hit = _wanted(cluster, wanted)
+                if hit is None:
+                    continue
+                matched.add(hit)
             member = grade_member(cluster, project, explicit_target, cache)
             if readiness_options is not None:
                 items, read_error, path = read_cluster_objects(cluster, project, readiness_options["kubeconfig_dir"])
@@ -676,6 +687,9 @@ def build_report(projects: list[str], explicit_target: str | None, readiness_opt
                 member["readiness"] = assess_readiness(cluster, member, items, read_error, readiness_options["at"], path)
             members.append(member)
     errors.extend(cache.errors)
+    for location, name in sorted((wanted or set()) - matched):
+        spec = f"{location}/{name}" if location else name
+        errors.append({"project": None, "location": location or None, "cluster": name, "message": UNMATCHED_CLUSTER_SPEC.format(spec=spec, projects=", ".join(projects))})
     members.sort(key=lambda m: (m["project"], m["location"], m["cluster"]))
     report = {
         "target_version": explicit_target,
@@ -736,8 +750,12 @@ def render_table(report: dict) -> str:
         + (f"; target {report['target_version']}" if report["target_version"] else "; target: each cluster's channel default")
     )
     for err in report["errors"]:
-        where = err["project"] + (f" ({err['location']})" if err.get("location") else "") + (f" cluster {err['cluster']}" if err.get("cluster") else "")
-        lines.append(f"- read failed for {where}: {err['message']}")
+        parts = [err["project"]] if err.get("project") else []
+        if err.get("location"):
+            parts.append(f"({err['location']})" if parts else err["location"])
+        if err.get("cluster"):
+            parts.append(f"cluster {err['cluster']}")
+        lines.append(f"- read failed for {' '.join(parts) or 'the run'}: {err['message']}")
     return "\n".join(lines)
 
 
@@ -933,7 +951,7 @@ def compute_progress(report: dict, previous: dict | None, now: datetime, rollout
     """
     now_text = format_timestamp(now)
     prior_members = previous["members"] if previous else {}
-    failed_projects = {e["project"] for e in report["errors"] if e.get("location") is None}
+    failed_projects = {e["project"] for e in report["errors"] if e.get("location") is None and e.get("project")}
     read_projects = set(report["projects"]) - failed_projects
 
     record: dict[str, dict] = {}

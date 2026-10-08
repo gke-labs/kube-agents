@@ -320,6 +320,24 @@ class ProjectFailureTest(unittest.TestCase):
             both = report.build_report(["p"], target, clusters=["prod"])
         self.assertEqual(len(both["members"]), 2)
 
+    def test_an_unmatched_cluster_spec_is_an_error_and_exit_one_not_an_empty_report(self):
+        target = "1.31.0-gke.1"
+        fake = FakeGcloud({"p": [cluster("prod", "us-central1", target, [("p", target)])]}, {})
+        with patch.object(report, "run_cmd", fake):
+            result = report.build_report(["p"], target, clusters=["prd", "europe-west1/prod", "prod"])
+        self.assertEqual([m["cluster"] for m in result["members"]], ["prod"])
+        self.assertEqual(
+            [(e["location"], e["cluster"], e["message"]) for e in result["errors"]],
+            [
+                (None, "prd", "no cluster matched --cluster prd in p"),
+                ("europe-west1", "prod", "no cluster matched --cluster europe-west1/prod in p"),
+            ],
+        )
+        with tempfile.TemporaryDirectory() as state_dir, patch.object(report, "run_cmd", fake), redirect_stdout(io.StringIO()) as out:
+            rc = report.main(["--project", "p", "--cluster", "prd", "--target-version", target, "--state-dir", state_dir])
+        self.assertEqual(rc, report.EXIT_PARTIAL)
+        self.assertIn("no cluster matched --cluster prd in p", out.getvalue())
+
     def test_a_narrowed_run_leaves_the_rollout_record_alone(self):
         target = "1.31.0-gke.1"
         fake = FakeGcloud({"p": [cluster("a", "us-central1", target, [("p", target)]), cluster("b", "us-central1", target, [("p", target)])]}, {})
