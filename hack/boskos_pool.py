@@ -84,7 +84,10 @@ def terminate(signum, frame):
     # (_hold_signals), which raises the first of them: the code unwinding from
     # this raise reaches its next deferred region without a second raise
     # landing between the catch and the region's start. The unblock raises
-    # the same way, so every Terminated leaves later ones held.
+    # the same way, so a Terminated is raised with later ones held. The hold
+    # lasts until the next unblock at depth 0 that finds nothing held, which
+    # restores the live handlers: a Terminated re-raised past such a pair
+    # (tofu_runner's forward, hack/fleet_reconcile.py) propagates live.
     _defer_terminations()
     raise Terminated("signal %d" % signum)
 
