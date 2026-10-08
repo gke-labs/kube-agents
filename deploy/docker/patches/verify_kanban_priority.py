@@ -168,12 +168,20 @@ os.environ["HERMES_KANBAN_TASK"] = triage
 tchild = tool_create(
     title="Triage sub-step", priority=300, session_id="20261008_101500_ab12cd34",
 )["task_id"]
+# HERMES_KANBAN_DB points every board slug at this one file, so board="x"
+# resolves here and the handler does find the worker's card: this proves the
+# board argument does not detach a triage worker from its background parent.
+# It cannot reach the fail-closed branch for a worker whose own card is not
+# found (no second database here). Host tests cover that branch:
+# test_a_worker_naming_another_board_cannot_file_a_user_card and
+# test_a_worker_whose_card_is_missing_files_background in
+# test_kanban_priority.py.
 spoof = tool_create(title="Triage on another board", priority=300, board="x")["task_id"]
 spoof_priority = None
 for row in conn.execute("SELECT priority FROM tasks WHERE id = ?", (spoof,)):
     spoof_priority = int(row[0] or 0)
 check(
-    "a triage worker naming another board still files background",
+    "a triage worker passing board= still inherits its background parent",
     spoof_priority is not None and spoof_priority < KP.USER_PRIORITY,
     f"priority={spoof_priority}",
 )
@@ -186,18 +194,24 @@ os.environ.pop("HERMES_KANBAN_TASK", None)
 
 # --- B. kanban_create says when the card waits ---------------------------------
 print("queue note:")
-# Two cards are running (chat and triage, claimed above). Their children are
-# settled first: a coordinator with an unsettled child is discounted from the
-# running count (kanban_scheduling part 4), and this section is about a full
-# cap, not about that discount. A cap of 2 is then full.
-conn.execute("UPDATE tasks SET status = 'done' WHERE id IN (?, ?)", (child, tchild))
+# Two cards are running (chat and triage, claimed above). Every child they
+# filed is settled first (chat's child; triage's tchild and spoof): a
+# coordinator with an unsettled child is discounted from the running count
+# (kanban_scheduling part 4), and this section is about a full cap, not about
+# that discount. A cap of 2 is then full, and the check pins running == 2 so
+# the class-share branch cannot pass in its place.
+conn.execute(
+    "UPDATE tasks SET status = 'done' WHERE id IN (?, ?, ?)", (child, tchild, spoof)
+)
 conn.commit()
 KP._configured_cap = lambda: 2
 session("slack", "C0EXAMPLE", "1700000000.000200")
 queued = tool_create(title="One more question")
 check(
     "a user card filed into a full cap is reported queued, machine-readably",
-    queued.get("queued") is True and queued.get("queue", {}).get("limit") == 2,
+    queued.get("queued") is True
+    and queued.get("queue", {}).get("limit") == 2
+    and queued.get("queue", {}).get("running") == 2,
     f"{queued}",
 )
 check(
