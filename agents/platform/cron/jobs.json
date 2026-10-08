@@ -239,6 +239,22 @@
       "deliver": "chat"
     },
     {
+      "id": "upgrade-readiness-watch",
+      "name": "Upgrade Readiness Watch",
+      "schedule": {
+        "kind": "cron",
+        "expr": "10 10 * * *",
+        "display": "10 10 * * *"
+      },
+      "prompt": "",
+      "skills": [],
+      "no_agent": true,
+      "script": "upgrade_readiness_watch.py",
+      "risk": "low",
+      "enabled": true,
+      "deliver": "chat"
+    },
+    {
       "id": "chat-delivery-watch",
       "name": "Chat Delivery Watch",
       "schedule": {

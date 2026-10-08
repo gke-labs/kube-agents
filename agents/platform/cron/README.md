@@ -145,6 +145,38 @@ reasons, spec paths and event messages are text a tenant writes; the Cluster
 Agent reads that text again when it runs the skill, and its read-only skill and
 preflight bound what it does with it.
 
+## `upgrade-readiness-watch` reports before anyone asks
+
+The `fleet-upgrade-verification` skill's readiness report grades every cluster
+on what would stop its next upgrade. Until this job it ran only when a user
+asked in chat. `upgrade_readiness_watch.py` runs once a day and asks the cheap
+half first: it runs the skill's version table, with no readiness read, and
+collects the target version each cluster's release channel offers and which
+clusters sit below it. A version a cluster is below is pending; a pending
+version the job's ledger has never seen earns the full readiness report at
+once, and a version already reported is refreshed every seven days
+(`UPGRADE_READINESS_REFRESH_DAYS`) while any cluster is still pending it. A
+version no cluster is pending any more is retired from the ledger with one
+line. A tick with nothing due prints nothing, so a quiet day costs no message.
+
+It runs the skill the way `stall-watch` runs `stall_report.py`: the two scripts
+are read from the agent image's `/opt/platform-template/skills/` copy and
+handed to `python3 -I -` in the sandbox on stdin, behind a loader that
+registers `upgrade_readiness` before running `fleet_upgrade_report.main`. The
+sandbox's `/opt/data` is not this pod's, so the loader prints the report back
+as JSON and the job writes the files on this side, under
+`<agent home>/upgrade-readiness/`: `ledger.json`, and one dated `.md` and
+`.json` per report under `reports/<version>/`, with `latest.md` pointing at the
+newest. The report script's rollout record and kubeconfigs go to directories of
+the job's own in the sandbox, so a scheduled run never rewrites what a user's
+own run compares against. Its stdout, one line per report with the counts and
+the file's path, is what `deliver: "chat"` posts; `--dry-run` prints what a
+tick would do and changes nothing.
+
+Daily at 10:10 UTC, after the morning audits and before the US day; the
+version table is a handful of `gcloud` list calls and the readiness report
+runs only on the day a version appears or its week comes round.
+
 ## `kanban-workspace-gc` is neither a watchdog nor a poller
 
 The third shape, and the reason it is here rather than anywhere else: it is
