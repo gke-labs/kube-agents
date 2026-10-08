@@ -233,8 +233,10 @@ Four ways a workload breaks on a new version:
   node join make, listed with their sources as `UPGRADE_PATH_TARGETS` in
   `agents/platform/skills/fleet-upgrade-verification/scripts/upgrade_readiness.py`) and on its
   `kube-system` reach (a dead webhook whose namespace selector admits `kube-system` and whose
-  rules match the ConfigMap kube-apiserver publishes on start, `CONTROL_PLANE_KUBE_SYSTEM_WRITES`
-  in the same file; the leader-election Leases are already on the node path's list); the object selector, match conditions,
+  rules match the bootstrap Roles and RoleBindings a new master's `rbac/bootstrap-roles` hook
+  reconciles there, `CONTROL_PLANE_KUBE_SYSTEM_WRITES` in the same file; the ConfigMap write the
+  Jetstack outage deadlocked on left the start-up path in Kubernetes 1.17, and the leader-election
+  Leases are already on the node path's list); the object selector, match conditions,
   cluster-scoped reach and the would-fail-once-drained backend are still unread.
 - **Manifests in Git, and release state, not just live clusters.** Stored Helm release manifests
   carry removed kinds even when nothing in the cluster runs them, and the next `helm upgrade` of that

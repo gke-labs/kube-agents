@@ -21,8 +21,8 @@ check yet and is stated here:
   no Service port for the webhook's port, or no ready endpoint behind that port), graded
   on its rules: one that can match a write a node drain or a node join makes
   (`UPGRADE_PATH_TARGETS` below is the list, with the package behind each write) breaks
-  the upgrade; so does one whose `namespaceSelector` reaches `kube-system` and whose rules
-  match a write the control plane makes there on a master's start
+  the upgrade; so does one whose `namespaceSelector` admits `kube-system` and whose rules
+  match a Role or RoleBinding write the API server's own start-up reconciles there
   (`CONTROL_PLANE_KUBE_SYSTEM_WRITES` below); one that matches none of those is a current
   outage for what it does match and is reported, not graded. The lists are the rule's
   reading of the path, not a proof of the upgrade's safety.
@@ -193,6 +193,7 @@ GROUP_POLICY = "policy"
 GROUP_COORDINATION = "coordination.k8s.io"
 GROUP_CERTIFICATES = "certificates.k8s.io"
 GROUP_STORAGE = "storage.k8s.io"
+GROUP_RBAC = "rbac.authorization.k8s.io"
 OP_CREATE = "CREATE"
 OP_UPDATE = "UPDATE"
 OP_DELETE = "DELETE"
@@ -263,23 +264,31 @@ UPGRADE_PATH_STORAGE = (
 )
 UPGRADE_PATH_TARGETS = UPGRADE_PATH_DRAIN + UPGRADE_PATH_REPLACEMENT_PODS + UPGRADE_PATH_NODES + UPGRADE_PATH_KUBELET_IDENTITY + UPGRADE_PATH_STORAGE
 UPGRADE_PATH_LABEL = "{operation} {resource}"
-# The control plane's own write into `kube-system` when a master starts, which a
-# control-plane upgrade makes on each new master: kube-apiserver publishes the
-# `extension-apiserver-authentication` ConfigMap on every start
-# (`k8s.io/apiserver/pkg/server/options/authentication.go`), the write a fail-closed OPA
-# webhook deadlocked in Jetstack's 2019 GKE outage (`docs/designs/upgrade-readiness-checks.md`).
-# A fail-closed webhook with a dead backend whose rules match it and whose
-# `namespaceSelector` admits `kube-system` refuses the new master's first write, so it is
-# graded `blocked` like a webhook on the node path, with the cell naming the write. The
-# leader-election Leases the controller manager and scheduler take there are already on
-# UPGRADE_PATH_KUBELET_IDENTITY (the kubelet's Lease rows), so a Lease gate blocks on that
-# list. Rows as in UPGRADE_PATH_TARGETS; both Namespaced and served at v1.
+# The control plane's own writes into `kube-system` that a new master cannot start without,
+# which a control-plane upgrade makes on each new master: kube-apiserver's
+# `rbac/bootstrap-roles` post-start hook reconciles the bootstrap Roles and RoleBindings in
+# `kube-system` (`pkg/registry/rbac/rest/storage_rbac.go`, `EnsureRBACPolicy`: a 30-second
+# poll, then `unable to initialize roles`, which `runPostStartHook` turns into a fatal; the
+# objects are `bootstrappolicy.NamespaceRoles()` and `NamespaceRoleBindings()` in
+# `plugin/pkg/auth/authorizer/rbac/bootstrappolicy/namespace_policy.go`). A fail-closed webhook
+# with a dead backend whose rules match one of these writes and whose `namespaceSelector`
+# admits `kube-system` refuses that reconcile, so the master crash-loops the way Jetstack's
+# 2019 GKE outage did (`docs/designs/upgrade-readiness-checks.md`), and it is graded `blocked`
+# like a webhook on the node path, with the cell naming the write. ConfigMaps are not on the
+# list: the `ca-registration` hook that outage deadlocked on was removed in Kubernetes 1.17,
+# and its successor (`pkg/controlplane/controller/clusterauthenticationtrust`) writes from a
+# retrying background queue, so a refused ConfigMap write is an outage, not a stuck master.
+# The leader-election Leases the controller manager and scheduler take in `kube-system` are
+# already on UPGRADE_PATH_NODES (the Lease rows), so a Lease gate blocks on that list. Rows as
+# in UPGRADE_PATH_TARGETS; every one is Namespaced and served at v1.
 NAMESPACE_NAME_LABEL = "kubernetes.io/metadata.name"
 KUBE_SYSTEM_NAMESPACE = "kube-system"
 KUBE_SYSTEM_NAMESPACE_LABELS = {NAMESPACE_NAME_LABEL: KUBE_SYSTEM_NAMESPACE}
 CONTROL_PLANE_KUBE_SYSTEM_WRITES = (
-    (GROUP_CORE, VERSION_V1, "configmaps", OP_CREATE, SCOPE_NAMESPACED),
-    (GROUP_CORE, VERSION_V1, "configmaps", OP_UPDATE, SCOPE_NAMESPACED),
+    (GROUP_RBAC, VERSION_V1, "roles", OP_CREATE, SCOPE_NAMESPACED),
+    (GROUP_RBAC, VERSION_V1, "roles", OP_UPDATE, SCOPE_NAMESPACED),
+    (GROUP_RBAC, VERSION_V1, "rolebindings", OP_CREATE, SCOPE_NAMESPACED),
+    (GROUP_RBAC, VERSION_V1, "rolebindings", OP_UPDATE, SCOPE_NAMESPACED),
 )
 KUBE_SYSTEM_WRITE_LABEL = "{operation} {resource} in " + KUBE_SYSTEM_NAMESPACE
 WEBHOOK_NAME_FORMAT = "{config}/{webhook}"
@@ -326,19 +335,18 @@ def split_items(items: list) -> tuple[list[dict], list[dict]]:
     return pdbs, workloads
 
 
-def selector_matches(selector, labels: dict) -> bool:
-    """policy/v1 semantics: a null selector matches no pod, an empty one every pod."""
-    if selector is None:
-        return False
-    if not isinstance(selector, dict):
-        return False
+def _requirements_hold(selector: dict, labels: dict, *, unevaluable: bool) -> bool:
+    """Whether `labels` satisfy a label selector's `matchLabels` and `matchExpressions`;
+    `unevaluable` is the answer for a requirement this reader cannot evaluate (not a mapping,
+    an operator it does not know). The nil-versus-empty decision is each caller's, because
+    policy/v1 and admission read it differently."""
     labels = labels if isinstance(labels, dict) else {}
     for key, value in (selector.get("matchLabels") or {}).items():
         if labels.get(key) != value:
             return False
     for req in selector.get("matchExpressions") or []:
         if not isinstance(req, dict):
-            return False
+            return unevaluable
         key, op, values = req.get("key"), req.get("operator"), req.get("values") or []
         if op == OP_IN:
             if key not in labels or labels[key] not in values:
@@ -353,8 +361,15 @@ def selector_matches(selector, labels: dict) -> bool:
             if key in labels:
                 return False
         else:
-            return False
+            return unevaluable
     return True
+
+
+def selector_matches(selector, labels: dict) -> bool:
+    """policy/v1 semantics: a null selector matches no pod, an empty one every pod."""
+    if not isinstance(selector, dict):
+        return False
+    return _requirements_hold(selector, labels, unevaluable=False)
 
 
 def _percent(value) -> int | None:
@@ -868,34 +883,23 @@ def upgrade_path_matches(hook: dict) -> list[str]:
 
 def namespace_selector_reaches(hook: dict, labels: dict) -> bool:
     """Whether the webhook's `namespaceSelector` admits a namespace carrying `labels`, as
-    admission reads it: absent or empty admits every namespace. A requirement this reader
-    cannot evaluate (not a mapping, an operator it does not know) counts as admitting, which
-    errs toward naming the webhook."""
+    admission reads it: absent or empty admits every namespace, and a requirement this reader
+    cannot evaluate counts as admitting, which errs toward naming the webhook. The caller
+    passes the namespace's labels; `kube-system` is judged on its default label alone
+    (`KUBE_SYSTEM_NAMESPACE_LABELS`), so a selector keyed on a label an operator added to it
+    reads as not admitting, the one direction this reader errs away from naming."""
     selector = hook.get("namespaceSelector")
     if not isinstance(selector, dict) or not selector:
         return True
-    for key, value in (selector.get("matchLabels") or {}).items():
-        if labels.get(key) != value:
-            return False
-    for req in selector.get("matchExpressions") or []:
-        if not isinstance(req, dict):
-            return True
-        key, op, values = req.get("key"), req.get("operator"), req.get("values") or []
-        if op == OP_IN:
-            if key not in labels or labels[key] not in values:
-                return False
-        elif op == OP_NOT_IN:
-            if key in labels and labels[key] in values:
-                return False
-        elif op == OP_EXISTS:
-            if key not in labels:
-                return False
-        elif op == OP_DOES_NOT_EXIST:
-            if key in labels:
-                return False
-        else:
-            return True
-    return True
+    return _requirements_hold(selector, labels, unevaluable=True)
+
+
+def _kube_system_labels(rules: list[dict], *, read_version: bool) -> list[str]:
+    matched = []
+    for group, version, resource, operation, scope in CONTROL_PLANE_KUBE_SYSTEM_WRITES:
+        if any(_rule_reaches(rule, group, version if read_version else None, resource, operation, scope) for rule in rules):
+            matched.append(KUBE_SYSTEM_WRITE_LABEL.format(operation=operation, resource=resource))
+    return matched
 
 
 def kube_system_write_matches(hook: dict) -> list[str]:
@@ -904,17 +908,28 @@ def kube_system_write_matches(hook: dict) -> list[str]:
     `CONTROL_PLANE_KUBE_SYSTEM_WRITES` at the served version."""
     if not namespace_selector_reaches(hook, KUBE_SYSTEM_NAMESPACE_LABELS):
         return []
-    rules = _rules(hook)
-    return [
-        KUBE_SYSTEM_WRITE_LABEL.format(operation=operation, resource=resource)
-        for group, version, resource, operation, scope in CONTROL_PLANE_KUBE_SYSTEM_WRITES
-        if any(_rule_reaches(rule, group, version, resource, operation, scope) for rule in rules)
-    ]
+    return _kube_system_labels(_rules(hook), read_version=True)
 
 
-def _rule_version_pinned(rule: dict) -> bool:
+def _graded_targets(hook: dict) -> tuple:
+    """The rows this webhook is graded on: the node path always, the `kube-system` writes
+    when its `namespaceSelector` admits that namespace."""
+    if namespace_selector_reaches(hook, KUBE_SYSTEM_NAMESPACE_LABELS):
+        return UPGRADE_PATH_TARGETS + CONTROL_PLANE_KUBE_SYSTEM_WRITES
+    return UPGRADE_PATH_TARGETS
+
+
+def _pinned_labels(rules: list[dict], hook: dict) -> list[str]:
+    """The graded writes `rules` name only at a version the server does not serve, labelled."""
+    labels = _upgrade_path_labels(rules, read_version=False)
+    if CONTROL_PLANE_KUBE_SYSTEM_WRITES[0] in _graded_targets(hook):
+        labels += _kube_system_labels(rules, read_version=False)
+    return labels
+
+
+def _rule_version_pinned(rule: dict, targets: tuple) -> bool:
     """Whether the server sends this rule nothing because of its `apiVersions`: it names a
-    write on the upgrade's path (it would reach one with the version check off) at a version
+    graded write (it would reach one of `targets` with the version check off) at a version
     other than the one the server serves it at, and names nothing the list cannot vouch for,
     so no wildcard group or resource and no resource off the list, whose served versions this
     rule does not know. Decided per rule, so a webhook that pairs a pinned rule with a live
@@ -925,15 +940,17 @@ def _rule_version_pinned(rule: dict) -> bool:
     specs = [spec for spec in rule.get("resources") or [] if isinstance(spec, str)]
     if not groups or not specs or WILDCARD in groups or any(WILDCARD in spec for spec in specs):
         return False
-    on_path = {(group, resource) for group, _, resource, _, _ in UPGRADE_PATH_TARGETS}
+    on_path = {(group, resource) for group, _, resource, _, _ in targets}
     if not all((group, spec) in on_path for group in groups for spec in specs):
         return False
-    return bool(_upgrade_path_labels([rule], read_version=False))
+    return any(_rule_reaches(rule, group, None, resource, operation, scope) for group, _, resource, operation, scope in targets)
 
 
 def version_pinned_rules(hook: dict) -> list[dict]:
-    """The rules of this webhook the server sends nothing (`_rule_version_pinned`)."""
-    return [rule for rule in _rules(hook) if _rule_version_pinned(rule)]
+    """The rules of this webhook the server sends nothing (`_rule_version_pinned`), judged
+    against the rows the webhook is graded on."""
+    targets = _graded_targets(hook)
+    return [rule for rule in _rules(hook) if _rule_version_pinned(rule, targets)]
 
 
 def grade_webhooks(configs: list[dict], services: list[dict], slices: list[dict]) -> dict:
@@ -942,7 +959,7 @@ def grade_webhooks(configs: list[dict], services: list[dict], slices: list[dict]
     `blocking`: the webhook's rules can match a write in `UPGRADE_PATH_TARGETS`, one the
     drain or the node join makes and does not proceed without, so the upgrade cannot
     complete while its backend is down; or its `namespaceSelector` admits `kube-system` and
-    its rules match a write the control plane makes there on a master's start
+    its rules match a Role or RoleBinding write a new master's start-up reconciles there
     (`CONTROL_PLANE_KUBE_SYSTEM_WRITES`), so the control-plane upgrade cannot complete either.
     `outage`: the backend is unreachable but the rules match none of those; its requests fail now and the member is not graded on it, with
     what it does match named so the operator can judge it, because the list is what this
@@ -983,7 +1000,7 @@ def grade_webhooks(configs: list[dict], services: list[dict], slices: list[dict]
                 "service": WEBHOOK_SERVICE_FORMAT.format(namespace=service_ref.get("namespace", ""), name=service_ref.get("name", "")),
                 "reason": reason,
                 "upgrade_path": matches,
-                "version_pinned": _upgrade_path_labels(pinned, read_version=False),
+                "version_pinned": _pinned_labels(pinned, hook),
                 "rules": describe_rules(hook),
                 "pinned_rules": [describe_rule(rule) for rule in pinned],
                 "live_rules": [describe_rule(rule) for rule in _rules(hook) if not any(rule is p for p in pinned)],

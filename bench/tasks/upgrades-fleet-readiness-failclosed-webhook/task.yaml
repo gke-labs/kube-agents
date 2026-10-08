@@ -1,9 +1,11 @@
 # The webhook source of fleet-upgrade-verification's --readiness table: a fail-closed
 # admission webhook whose backend the API server cannot reach. Such a webhook rejects every
-# request its rules match. The table grades the member blocked only when those rules reach
+# request its rules match. The table grades the member blocked when those rules reach
 # a write a node drain or a node join makes (`UPGRADE_PATH_TARGETS` in the skill's
-# `scripts/upgrade_readiness.py` is the list, with the package behind each write); otherwise
-# it names the webhook as a current outage without grading on it. The upgrade-scenario
+# `scripts/upgrade_readiness.py` is the list, with the package behind each write), or when
+# its namespace selector admits kube-system and the rules reach the bootstrap Role and
+# RoleBinding writes a new master reconciles there (`CONTROL_PLANE_KUBE_SYSTEM_WRITES`);
+# otherwise it names the webhook as a current outage without grading on it. The upgrade-scenario
 # campaign reproduced the pod-gating form end to end on GKE (the drain's replacement pods
 # refused until the webhook was deleted).
 #
@@ -52,7 +54,9 @@
 #
 # Planted defect required: on slot b, the ValidatingWebhookConfiguration
 # seeded-fail-closed-gate, webhook gate.seeded.invalid, failurePolicy Fail, 30 s timeout,
-# objectSelector limited to the fleet's own objects, client_config pointing at Service
+# rules on ConfigMaps only, namespaceSelector naming the seeded-upgrade namespace (so the gate
+# does not reach kube-system and the script keeps it an outage) and objectSelector limited to
+# the fleet's own objects, client_config pointing at Service
 # seeded-upgrade/nonexistent-admission-gate, which does not exist (role
 # readiness-failclosed-webhook).
 #

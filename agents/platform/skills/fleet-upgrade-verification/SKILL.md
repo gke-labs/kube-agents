@@ -202,10 +202,13 @@ validatingwebhookconfigurations,mutatingwebhookconfigurations,services,endpoints
   nothing; `objectSelector` and `matchConditions` are not evaluated, and `namespaceSelector`
   is read only for the `kube-system` reach, so a webhook they narrow is otherwise reported as
   able to match. A dead webhook off the node path is graded `blocked` all the same when its
-  `namespaceSelector` admits `kube-system` and its rules match a write the control plane makes
-  there on a master's start (`CONTROL_PLANE_KUBE_SYSTEM_WRITES` in the script: the ConfigMap
-  kube-apiserver publishes, created or updated), because the new master's first write is
-  refused and the control-plane upgrade cannot complete; its cell names that write. The cell names the
+  `namespaceSelector` admits `kube-system` (absent or empty admits every namespace; `kube-system`
+  is judged on its default `kubernetes.io/metadata.name` label alone) and its rules match a
+  Role or RoleBinding write in `rbac.authorization.k8s.io` (`CONTROL_PLANE_KUBE_SYSTEM_WRITES`
+  in the script), because a new master's start-up reconciles the bootstrap Roles and
+  RoleBindings there and fatals when it cannot, so the control-plane upgrade cannot complete;
+  its cell names that write. A ConfigMap gate is not on that list: the start-up ConfigMap write
+  the Jetstack outage deadlocked on left Kubernetes in 1.17, and its successor retries. The cell names the
   configuration, the webhook, the reason and what it matches (an outage cell lists the webhook's
   own rules, with their `apiVersions` when a rule pins any); each JSON finding carries
   `reason`, `upgrade_path` and `rules`, split into `blocking` and `outage`. A fail-closed webhook with a URL backend is counted in the
