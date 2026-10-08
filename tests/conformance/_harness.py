@@ -322,6 +322,13 @@ SOURCES: dict[str, Source] = {
         "a2a/gateway/config.go",
         ("A2A_DEFAULT_ADDRESSEE", "A2A_SESSION_CLUSTER_VIEW", "A2A_CREDENTIAL_PROXY_URL"),
     ),
+    # The platform agent's allowlists as the gateway reads them: the per-target
+    # check a session's delegation is held to. The names cross the module
+    # boundary from the operator's render; C1 pins the pair.
+    "a2a_gateway_allowlist": Source(
+        "a2a/gateway/allowlist.go",
+        ("EnvTargetAllowedUsersGchat", "EnvTargetAllowedUsersSlack", "func (g *Gateway) targetAllows"),
+    ),
     # --- model egress -----------------------------------------------------
     # The redactor the chart mounts into the LiteLLM gateway. It is a copy of
     # the chat plugin's module, and tests/test_litellm_redaction.py keeps the
@@ -478,6 +485,51 @@ SOURCES: dict[str, Source] = {
     "a2a_cli_main": Source(
         "a2a/cmd/a2a/main.go",
         ("func busUser(", "lib.EnvBusUser", "lib.WithKSAToken"),
+    ),
+    # --- the delegation primitive ------------------------------------------
+    # The reserved artifact name and its data shape, defined once so the
+    # worker-adapter and the gateway relay never spell either by hand (C1's
+    # "the delegate artifact is spelled once").
+    "a2a_payload": Source(
+        "a2a/lib/payload.go",
+        ('ArtifactDelegate = "delegate"', "type DelegateRequest struct {", "DelegateTextCap = "),
+    ),
+    # The worker-adapter's publish site: the one place a session's delegate
+    # ask becomes the reserved artifact on the bus.
+    "a2a_worker_adapter": Source(
+        "a2a/worker-adapter/adapter.go",
+        ("func (a *adapter) publishDelegate(", "func (a *adapter) publishArtifactPart("),
+    ),
+    # The worker-adapter's own share of the delegate-request check: the
+    # length cap, read through the shared constant rather than a hand-copied
+    # number, so the adapter and the gateway's second check (below) cannot
+    # silently disagree on what "too long" means.
+    "a2a_worker_adapter_delegate": Source(
+        "a2a/worker-adapter/delegate.go",
+        ("func validateDelegate(", "text is too long for a delegation"),
+    ),
+    # The MCP tool schema the session's harness is actually handed. It cannot
+    # reference lib.DelegateRequest's json tags -- it is a map[string]any
+    # literal, by necessity, since that is what go over stdio as the tool
+    # definition -- so its field names and lib.DelegateRequest's are two
+    # independent spellings of the same wire shape, and only a conformance
+    # test can hold them equal.
+    "a2a_worker_adapter_mcp": Source(
+        "a2a/worker-adapter/mcp.go",
+        ("var delegateToolSchema", '"required": []string{"addressee", "text"}'),
+    ),
+    # The gateway's side of the delegate artifact: the switch that routes it
+    # off the ordinary chat-rendering path, and the gateway's own copy of the
+    # length check the adapter already enforces (a defence that matters
+    # exactly because the adapter's is bypassable by anything that can reach
+    # the bus directly).
+    "a2a_gateway_relay": Source(
+        "a2a/gateway/relay.go",
+        ("g.handleDelegateRequest(ctx, rec, subject, taskID, a.Artifact.Parts)", "func (g *Gateway) applyArtifact("),
+    ),
+    "a2a_gateway_delegation": Source(
+        "a2a/gateway/delegation.go",
+        ("func (g *Gateway) handleDelegateRequest(", "lib.DelegateTextCap"),
     ),
     # The callout's reader of the static principal list the operator renders
     # into its Deployment. The operator half is operator_a2a_callout below

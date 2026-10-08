@@ -724,6 +724,13 @@ func (g *Gateway) closeDetachedBeforeDelete(ctx context.Context, rec *SessionRec
 	// The task ran under the addressee its own subjects carried — after a
 	// Delegate re-home rec.Addressee is already the successor's.
 	addressee := rec.AddresseeFor(active.TaskID)
+	if addressee != rec.BusSession {
+		// Not this pod's task: a child the session delegated to platform
+		// runs on platform's executor, and retiring the pod that asked for
+		// it ends nothing. A supervisor terminal here would be a claim about
+		// another executor's task.
+		return true
+	}
 	// Sweep's guard, for the same reason: Detached means the terminal has
 	// not been RELAYED, not that it does not exist. A worker that confirmed
 	// the cancel before the relay clears the flag — relay lag, a restart

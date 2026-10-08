@@ -259,6 +259,12 @@ const (
 	// reason a2aInjectBackendEnvVar is: the pod executes model output, and
 	// what widens its fence is a property of who deployed the operator.
 	a2aSessionClusterViewEnvVar = "A2A_SESSION_CLUSTER_VIEW"
+	// The platform agent's trusted-human allowlists, handed to the gateway
+	// so a session's request to delegate to the platform agent is checked
+	// against the same lists the agent's own adapters enforce. Spelled the
+	// same in a2a/gateway/allowlist.go; the conformance suite pins it.
+	a2aTargetAllowedUsersGchatEnvVar = "A2A_TARGET_ALLOWED_USERS_GCHAT"
+	a2aTargetAllowedUsersSlackEnvVar = "A2A_TARGET_ALLOWED_USERS_SLACK"
 
 	// a2aInjectListenEnvVar is what the operator renders onto the gateway to
 	// select the backend; a2aInjectListenHost and a2aInjectPort are the
@@ -1101,6 +1107,41 @@ func a2aStrictEventsWriter() string {
 // here "relaxed" is the shut door.
 func a2aInjectBackendEnabled() bool {
 	return os.Getenv(a2aInjectBackendEnvVar) == "true"
+}
+
+// a2aTargetAllowlistEnv renders the CR's Chat and Slack allowlists for the
+// gateway. An absent list, or the allow-all spelling allowAllUsers accepts,
+// renders nothing: the gateway reads no var as "all authenticated users",
+// which is what the CR field promises. Any other list renders, even one that
+// is blank after trimming: the gateway reads a set-but-empty var as a list
+// with no members, so a list of blanks admits nobody, the rule #2207 set for
+// the Chat ingress list, rather than widening to everyone.
+func a2aTargetAllowlistEnv(agent *agentv1alpha1.PlatformAgent) []corev1.EnvVar {
+	integ := agent.Spec.Integration
+	if integ == nil {
+		return nil
+	}
+	join := func(ids []string, lower bool) string {
+		var out []string
+		for _, id := range ids {
+			if id = strings.TrimSpace(id); id == "" {
+				continue
+			}
+			if lower {
+				id = strings.ToLower(id)
+			}
+			out = append(out, id)
+		}
+		return strings.Join(out, ",")
+	}
+	var env []corev1.EnvVar
+	if integ.GoogleChat != nil && !allowAllUsers(integ.GoogleChat.AllowedUsers) {
+		env = append(env, corev1.EnvVar{Name: a2aTargetAllowedUsersGchatEnvVar, Value: join(integ.GoogleChat.AllowedUsers, true)})
+	}
+	if integ.Slack != nil && !allowAllUsers(integ.Slack.AllowedUsers) {
+		env = append(env, corev1.EnvVar{Name: a2aTargetAllowedUsersSlackEnvVar, Value: join(integ.Slack.AllowedUsers, false)})
+	}
+	return env
 }
 
 // a2aAgentDoorEnabled reports whether the operator was deployed with the A2A
@@ -4438,6 +4479,7 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 	env = append(env, chatEnv...)
 	env = append(env, injectEnv...)
 	env = append(env, clusterViewEnv...)
+	env = append(env, a2aTargetAllowlistEnv(agent)...)
 
 	return &appsv1.Deployment{
 		TypeMeta:   metav1.TypeMeta{APIVersion: "apps/v1", Kind: "Deployment"},
