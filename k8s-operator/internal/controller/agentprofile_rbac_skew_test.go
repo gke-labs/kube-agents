@@ -7,6 +7,7 @@ import (
 
 	authorizationv1 "k8s.io/api/authorization/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
@@ -74,5 +75,32 @@ func TestAnUnreadableAgentProfileKindIsNotListed(t *testing.T) {
 	}
 	if _, err := build(true).reconcileA2A(context.Background(), agent.DeepCopy()); err != nil && strings.Contains(err.Error(), "AgentProfiles") {
 		t.Errorf("with the kind unreadable, reconcileA2A still listed it: %v", err)
+	}
+}
+
+// The denial is decided by RBAC alone, so it makes AgentProfiles unreadable
+// whether or not the CRD is installed at boot. An operator booted with an old
+// role and no CRD, which then gets the CRD applied, must still not list the
+// kind.
+func TestADeniedRoleMakesAgentProfilesUnreadableWithOrWithoutTheCRD(t *testing.T) {
+	noMatch := &meta.NoKindMatchError{GroupKind: schema.GroupKind{Group: agentv1alpha1.GroupVersion.Group, Kind: "AgentProfile"}}
+	denied := []string{"list agentprofiles.kubeagents.x-k8s.io"}
+	for _, tc := range []struct {
+		name              string
+		mapErr            error
+		denied            []string
+		watch, unreadable bool
+	}{
+		{"CRD installed, role current", nil, nil, true, false},
+		{"CRD installed, role denied", nil, denied, false, true},
+		{"CRD missing, role denied", noMatch, denied, false, true},
+		{"CRD missing, role current", noMatch, nil, false, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			watch, unreadable := agentProfileWatchPlan(tc.mapErr, tc.denied)
+			if watch != tc.watch || unreadable != tc.unreadable {
+				t.Errorf("agentProfileWatchPlan = watch %v, unreadable %v; want %v, %v", watch, unreadable, tc.watch, tc.unreadable)
+			}
+		})
 	}
 }
