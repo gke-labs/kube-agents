@@ -124,7 +124,8 @@ the GitOps repository — rather than the record, so a tripped safeguard is
 positive evidence something acted and keeps blocking, whether the worker was still running at the
 deadline or never ran — and both apply only to a record that carries a scores map; a scoreless
 one still blocks at rung 2. The near-misses still block at rung 3:
-tokens billed with no trajectory is an inconsistent record, and the harness skeleton — an empty
+tokens billed with no trajectory is an inconsistent record (unless the case declares
+`tool_calls_optional` and carries a reply), and the harness skeleton — an empty
 trajectory with every token bucket **null**, not 0 — never billed a model call it can prove, so
 it misses the conjunction too.
 

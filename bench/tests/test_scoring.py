@@ -561,7 +561,7 @@ def test_rung_3_accepts_a_reply_with_no_tool_calls_when_the_case_declares_it(
         rec["output"] = "Hi there, I'm kube-agents. I'm taking a first look at your GKE fleet."
 
     verdict = grade_case(no_tool_spec, [make_run(mutate=greet_without_a_tool)], admitted=False)
-    assert verdict.rung is not Rung.NOT_A_REAL_RUN, verdict.reason
+    assert verdict.rung is Rung.GREEN, verdict.reason
 
 
 def test_rung_3_still_blocks_a_declared_case_with_no_reply(no_tool_spec, make_run):

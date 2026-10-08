@@ -680,6 +680,16 @@ class TestTheRulesReject(unittest.TestCase):
             with self.subTest(value=value):
                 self.assertEqual(self._validate(expected_fail=value), [])
 
+    def test_a_tool_calls_optional_that_is_not_a_boolean_is_rejected(self):
+        for value in ("false", "true", 1, ["true"]):
+            with self.subTest(value=value):
+                self._only("is not a YAML boolean", tool_calls_optional=value)
+
+    def test_a_bare_boolean_tool_calls_optional_passes(self):
+        for value in (True, False):
+            with self.subTest(value=value):
+                self.assertEqual(self._validate(tool_calls_optional=value), [])
+
     def test_an_unknown_fixture_role_is_rejected(self):
         # Deliberately not a plausible-looking slug: `hpa-saturated` used to
         # sit here and became a real role the day bench/tf/fleet/fixtures.json

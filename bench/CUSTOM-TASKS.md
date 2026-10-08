@@ -235,6 +235,11 @@ defaults to `false`, so no existing task needs the field, and like `domain:` it 
 `bench-gate` rather than by devops-bench. It must be a bare YAML boolean; the validator rejects a
 quoted one, which is a string and truthy.
 
+A task a correct agent answers without calling a tool (a first-turn greeting, a reply that names a
+command) carries a top-level `tool_calls_optional: true`, so `bench-gate`'s liveness rung reads
+its reply instead of its empty trajectory as the evidence the agent ran; see
+[bench-case-format.md](../docs/designs/bench-case-format.md).
+
 A new task must also be registered: the presubmit runs only what
 `hack/eval/presubmit-cases.txt` names, the nightly adds what `hack/eval/nightly-cases.txt`
 names (appended when the job exports `EVAL_TIER=nightly`), and
