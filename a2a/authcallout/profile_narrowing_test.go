@@ -442,3 +442,23 @@ func TestASessionPodNamedAfterAProfileIsRefused(t *testing.T) {
 	nc, violations := h.connectAs(t, podA, tokenPodA)
 	checkPublish(t, nc, violations, map[string]bool{lib.TaskEventsSubject(podA, "t"): false})
 }
+
+// The refusal for a pod named after a profile says what it would have been
+// handed: a profile is an addressee, so it is the profile's task subjects, not
+// an inbox. Asserted in-process, since the client sees only "Authorization
+// Violation".
+func TestTheRefusalForAPodNamedAfterAProfileNamesItsTaskSubjects(t *testing.T) {
+	const tokenSessionNamedAuditor = "token-for-a-session-sa-pod-named-like-the-auditor-profile-pad"
+	tokens := profileTokens()
+	tokens[tokenSessionNamedAuditor] = Attested{ServiceAccount: sessionSA, PodName: auditor, PodUID: "uid-s"}
+	svc := newReservedTestService(t, profileMap, tokens, renderedFixtureAuthUsers(t))
+	_, err := authorizeAddresseeToken(svc, tokenSessionNamedAuditor)
+	if err == nil {
+		t.Fatal("a session pod named after the auditor profile was authorized")
+	}
+	for _, want := range []string{string(reservedProfile), "its task subjects are that addressee's"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("refusal %q lacks %q", err, want)
+		}
+	}
+}

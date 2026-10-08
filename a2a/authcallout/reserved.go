@@ -111,7 +111,7 @@ const (
 
 // copied completes the refusal: what the pod would have been handed.
 func (k reservedKind) copied() string {
-	if k == reservedAddressee {
+	if k == reservedAddressee || k == reservedProfile {
 		return "its task subjects are that addressee's"
 	}
 	return "its inbox is that principal's"
