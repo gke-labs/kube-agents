@@ -804,7 +804,7 @@ class HoldTest(unittest.TestCase):
             with mock.patch.object(boskos_pool.urllib.request, "urlopen", boskos), mock.patch("sys.stdout", stdout):
                 with self.assertRaises(boskos_pool.Terminated):
                     reconcile.reconcile_named([P7], BOSKOS, OWNER, runner=_Tofu({P7: UPDATE_ONLY}), known=KNOWN, outcomes=outcomes)
-            self.assertIs(signal.getsignal(signal.SIGINT), boskos_pool.terminate, "the handler is back after the release")
+            self.assertIs(signal.getsignal(signal.SIGINT), boskos_pool._defer, "later signals are held while the termination unwinds")
         finally:
             signal.signal(signal.SIGINT, previous)
         self.assertEqual(boskos.released, [P7], "released before the termination was delivered")
@@ -904,8 +904,11 @@ class HoldTest(unittest.TestCase):
             self.assertEqual(boskos_pool._DEFERRED, [signal.SIGINT])
             with self.assertRaises(boskos_pool.Terminated):
                 boskos_pool._hold_signals(False)
-            self.assertIs(signal.getsignal(signal.SIGINT), boskos_pool.terminate, "the handler is back")
+            self.assertIs(signal.getsignal(signal.SIGINT), boskos_pool._defer, "later signals are held while the termination unwinds")
             self.assertEqual(boskos_pool._DEFERRED, [])
+            boskos_pool._hold_signals(True)
+            boskos_pool._hold_signals(False)
+            self.assertIs(signal.getsignal(signal.SIGINT), boskos_pool.terminate, "the handler is back when no signal is deferred")
         finally:
             boskos_pool._DEFERRED.clear()
             boskos_pool._HOLD_DEPTH = 0
@@ -927,7 +930,7 @@ class HoldTest(unittest.TestCase):
             self.assertEqual(boskos_pool._HOLD_DEPTH, 1)
             with self.assertRaises(boskos_pool.Terminated):
                 boskos_pool._hold_signals(False)
-            self.assertIs(signal.getsignal(signal.SIGINT), boskos_pool.terminate, "the handler is back")
+            self.assertIs(signal.getsignal(signal.SIGINT), boskos_pool._defer, "later signals remain held while the termination unwinds")
             self.assertEqual(boskos_pool._HOLD_DEPTH, 0)
         finally:
             boskos_pool._DEFERRED.clear()
