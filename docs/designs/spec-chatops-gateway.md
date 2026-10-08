@@ -334,10 +334,11 @@ gateway while that child still runs is refused with a notice naming the running 
 (`delegation.busy`) - a human asking again deserves an answer, the turn that already got one does
 not. Every refusal names the target only, held until the delegating turn's own answer has posted
 so the room reads "delegated to platform" first and the refusal after it; the audit line carries
-the rule, the backend, and the hashed subject that failed it. A known gap: a person off every list
-above can still steer the running child directly, on `platform`'s own terms - that steer is
-outside this rule, which exists to keep an off-list steer from shaping a later delegation through
-the wake, not to gate `platform` itself.
+the rule, the backend, and the hashed subject that failed it. A steer into the running child is
+checked the same way before it is recorded or published (`delegation.child-steer`, or
+`delegation.door-unlisted` for a door the target does not list): the child runs on `platform`'s
+executor, which acts on a steer as a further turn, so an author the target's list refuses is
+refused here, with the same target-only notice and an audit line, and nothing reaches the child.
 
 **The child** carries the platform agent's own `in` subject, the parent's `correlationId`, and the
 parent's stored `authority` with fresh grants and `via: {taskId, session}` naming the turn and

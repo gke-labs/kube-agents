@@ -581,8 +581,9 @@ func (g *Gateway) applySteerNotice(rec *SessionRecord, rs *relayState, taskID st
 	}
 }
 
-// steerReasonQuoteMax bounds, in runes, a refusal token this gateway does
-// not know when the room is shown it.
+// steerReasonQuoteMax bounds, in bytes cut on a rune boundary
+// (truncateRunes), a refusal token this gateway does not know when the room
+// is shown it.
 const steerReasonQuoteMax = 64
 
 // steerNotTakenNotice words a refusal for the room. A token this gateway
