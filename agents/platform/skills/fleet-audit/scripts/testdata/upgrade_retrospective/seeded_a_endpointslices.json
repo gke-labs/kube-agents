@@ -1,0 +1,172 @@
+{
+ "apiVersion": "v1",
+ "items": [
+  {
+   "addressType": "IPv4",
+   "apiVersion": "discovery.k8s.io/v1",
+   "endpoints": [],
+   "kind": "EndpointSlice",
+   "metadata": {
+    "annotations": {
+     "endpoints.kubernetes.io/last-change-trigger-time": "2026-09-25T16:55:12Z"
+    },
+    "creationTimestamp": "2026-09-25T16:55:12Z",
+    "generateName": "alertmanager-",
+    "generation": 1,
+    "labels": {
+     "addonmanager.kubernetes.io/mode": "Reconcile",
+     "endpointslice.kubernetes.io/managed-by": "endpointslice-controller.k8s.io",
+     "kubernetes.io/service-name": "alertmanager",
+     "service.kubernetes.io/headless": ""
+    },
+    "name": "alertmanager-fbrvb",
+    "namespace": "gmp-system",
+    "ownerReferences": [
+     {
+      "apiVersion": "v1",
+      "blockOwnerDeletion": true,
+      "controller": true,
+      "kind": "Service",
+      "name": "alertmanager",
+      "uid": "cce8b0e2-2314-48fb-8d1f-36f6a868bc1a"
+     }
+    ],
+    "resourceVersion": "1790355312517903021",
+    "uid": "88272394-8c90-492d-9d4b-d7359eeb10e2"
+   },
+   "ports": null
+  },
+  {
+   "addressType": "IPv4",
+   "apiVersion": "discovery.k8s.io/v1",
+   "endpoints": [
+    {
+     "conditions": {
+      "ready": true,
+      "serving": true,
+      "terminating": false
+     },
+     "targetRef": {
+      "kind": "Pod",
+      "name": "gmp-operator-5fccfdf67b-rgtmj"
+     }
+    }
+   ],
+   "kind": "EndpointSlice",
+   "metadata": {
+    "annotations": {
+     "endpoints.kubernetes.io/last-change-trigger-time": "2026-10-07T04:09:58Z"
+    },
+    "creationTimestamp": "2026-09-25T16:55:13Z",
+    "generateName": "gmp-operator-",
+    "generation": 21,
+    "labels": {
+     "addonmanager.kubernetes.io/mode": "Reconcile",
+     "endpointslice.kubernetes.io/managed-by": "endpointslice-controller.k8s.io",
+     "kubernetes.io/service-name": "gmp-operator"
+    },
+    "name": "gmp-operator-qxx5r",
+    "namespace": "gmp-system",
+    "ownerReferences": [
+     {
+      "apiVersion": "v1",
+      "blockOwnerDeletion": true,
+      "controller": true,
+      "kind": "Service",
+      "name": "gmp-operator",
+      "uid": "9be37fb4-da47-459e-a849-4543d2610610"
+     }
+    ],
+    "resourceVersion": "1791346198506431009",
+    "uid": "8caa2a53-4cc9-4f26-8a9a-b54e3c8c447f"
+   },
+   "ports": [
+    {
+     "name": "webhook",
+     "port": 10250,
+     "protocol": "TCP"
+    }
+   ]
+  },
+  {
+   "addressType": "IPv4",
+   "apiVersion": "discovery.k8s.io/v1",
+   "endpoints": [],
+   "kind": "EndpointSlice",
+   "metadata": {
+    "annotations": {
+     "endpoints.kubernetes.io/last-change-trigger-time": "2026-09-25T16:55:12Z"
+    },
+    "creationTimestamp": "2026-09-25T16:55:12Z",
+    "generateName": "rule-evaluator-",
+    "generation": 1,
+    "labels": {
+     "addonmanager.kubernetes.io/mode": "Reconcile",
+     "endpointslice.kubernetes.io/managed-by": "endpointslice-controller.k8s.io",
+     "kubernetes.io/service-name": "rule-evaluator"
+    },
+    "name": "rule-evaluator-w6crq",
+    "namespace": "gmp-system",
+    "ownerReferences": [
+     {
+      "apiVersion": "v1",
+      "blockOwnerDeletion": true,
+      "controller": true,
+      "kind": "Service",
+      "name": "rule-evaluator",
+      "uid": "863812f1-f864-4a26-a30b-9c80833f169e"
+     }
+    ],
+    "resourceVersion": "1790355312823071004",
+    "uid": "77a12f76-43f2-47ef-959c-81df1ad976c5"
+   },
+   "ports": null
+  },
+  {
+   "addressType": "IPv4",
+   "apiVersion": "discovery.k8s.io/v1",
+   "endpoints": [
+    {
+     "conditions": {
+      "ready": true
+     },
+     "targetRef": {}
+    }
+   ],
+   "kind": "EndpointSlice",
+   "metadata": {
+    "annotations": {
+     "seeded-last-run": "2026-10-08T17:50:03Z"
+    },
+    "creationTimestamp": "2026-09-25T17:02:47Z",
+    "generation": 1,
+    "labels": {
+     "endpointslice.kubernetes.io/managed-by": "endpointslicemirroring-controller.k8s.io",
+     "kubernetes.io/service-name": "legacy-endpoints-lane"
+    },
+    "name": "legacy-endpoints-lane-lk5rl",
+    "namespace": "seeded-deprecation",
+    "ownerReferences": [
+     {
+      "apiVersion": "v1",
+      "blockOwnerDeletion": true,
+      "controller": true,
+      "kind": "Endpoints",
+      "name": "legacy-endpoints-lane",
+      "uid": "7b555978-960c-452a-b8ba-a7b970d981c9"
+     }
+    ],
+    "resourceVersion": "1791481803541599014",
+    "uid": "c4107e15-ea62-4a58-90c9-d842ba54d7ef"
+   },
+   "ports": [
+    {
+     "name": "discard",
+     "port": 9,
+     "protocol": "TCP"
+    }
+   ]
+  }
+ ],
+ "kind": "List"
+}

@@ -1,9 +1,35 @@
 [
  {
+  "addonsConfig": {
+   "gcePersistentDiskCsiDriverConfig": {
+    "enabled": true
+   }
+  },
   "autopilot": {},
   "currentMasterVersion": "1.32.13-gke.2427000",
   "currentNodeVersion": "1.31.14-gke.2704000 *",
   "location": "us-central1-a",
+  "maintenancePolicy": {
+   "resourceVersion": "2c677527",
+   "window": {
+    "maintenanceExclusions": {
+     "hold-gpu-minor": {
+      "endTime": "2026-10-21T00:00:00Z",
+      "maintenanceExclusionOptions": {
+       "scope": "NO_MINOR_UPGRADES"
+      },
+      "startTime": "2026-09-24T17:41:17Z"
+     }
+    },
+    "recurringWindow": {
+     "recurrence": "FREQ=DAILY",
+     "window": {
+      "endTime": "2000-01-01T07:00:00Z",
+      "startTime": "2000-01-01T03:00:00Z"
+     }
+    }
+   }
+  },
   "name": "gemma-gpu-upgraded",
   "nodePools": [
    {
@@ -36,10 +62,24 @@
   "zone": "us-central1-a"
  },
  {
+  "addonsConfig": {
+   "gcePersistentDiskCsiDriverConfig": {
+    "enabled": true
+   }
+  },
   "autopilot": {},
   "currentMasterVersion": "1.35.8-gke.1380001",
   "currentNodeVersion": "1.35.8-gke.1380001",
   "location": "us-central1-a",
+  "maintenancePolicy": {
+   "resourceVersion": "93731cbd",
+   "window": {
+    "dailyMaintenanceWindow": {
+     "duration": "PT4H0M0S",
+     "startTime": "03:00"
+    }
+   }
+  },
   "name": "seeded-a",
   "nodePools": [
    {

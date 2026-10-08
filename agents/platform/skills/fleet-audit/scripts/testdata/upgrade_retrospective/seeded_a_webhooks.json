@@ -1,0 +1,204 @@
+{
+ "apiVersion": "v1",
+ "items": [
+  {
+   "apiVersion": "admissionregistration.k8s.io/v1",
+   "kind": "ValidatingWebhookConfiguration",
+   "metadata": {
+    "annotations": {
+     "components.gke.io/component-name": "managed-prometheus",
+     "components.gke.io/component-version": "0.18.2-gke.0",
+     "components.gke.io/layer": "addon"
+    },
+    "creationTimestamp": "2026-09-25T16:55:16Z",
+    "generation": 1,
+    "labels": {
+     "addonmanager.kubernetes.io/mode": "Reconcile"
+    },
+    "name": "gmp-operator.gmp-system.monitoring.googleapis.com",
+    "resourceVersion": "1790355316983071020",
+    "uid": "d57482e9-211b-4008-a94f-cce14d02ffa2"
+   },
+   "webhooks": [
+    {
+     "admissionReviewVersions": [
+      "v1"
+     ],
+     "clientConfig": {
+      "service": {
+       "name": "gmp-operator",
+       "namespace": "gmp-system",
+       "path": "/validate/monitoring.googleapis.com/v1/rules",
+       "port": 443
+      }
+     },
+     "failurePolicy": "Fail",
+     "matchPolicy": "Equivalent",
+     "name": "validate.rules.gmp-operator.gmp-system.monitoring.googleapis.com",
+     "sideEffects": "None",
+     "timeoutSeconds": 10
+    },
+    {
+     "admissionReviewVersions": [
+      "v1"
+     ],
+     "clientConfig": {
+      "service": {
+       "name": "gmp-operator",
+       "namespace": "gmp-system",
+       "path": "/validate/monitoring.googleapis.com/v1/clusterrules",
+       "port": 443
+      }
+     },
+     "failurePolicy": "Fail",
+     "matchPolicy": "Equivalent",
+     "name": "validate.clusterrules.gmp-operator.gmp-system.monitoring.googleapis.com",
+     "sideEffects": "None",
+     "timeoutSeconds": 10
+    },
+    {
+     "admissionReviewVersions": [
+      "v1"
+     ],
+     "clientConfig": {
+      "service": {
+       "name": "gmp-operator",
+       "namespace": "gmp-system",
+       "path": "/validate/monitoring.googleapis.com/v1/globalrules",
+       "port": 443
+      }
+     },
+     "failurePolicy": "Fail",
+     "matchPolicy": "Equivalent",
+     "name": "validate.globalrules.gmp-operator.gmp-system.monitoring.googleapis.com",
+     "sideEffects": "None",
+     "timeoutSeconds": 10
+    },
+    {
+     "admissionReviewVersions": [
+      "v1"
+     ],
+     "clientConfig": {
+      "service": {
+       "name": "gmp-operator",
+       "namespace": "gmp-system",
+       "path": "/validate/monitoring.googleapis.com/v1/operatorconfigs",
+       "port": 443
+      }
+     },
+     "failurePolicy": "Fail",
+     "matchPolicy": "Equivalent",
+     "name": "validate.operatorconfigs.gmp-operator.gmp-system.monitoring.googleapis.com",
+     "sideEffects": "None",
+     "timeoutSeconds": 10
+    }
+   ]
+  },
+  {
+   "apiVersion": "admissionregistration.k8s.io/v1",
+   "kind": "ValidatingWebhookConfiguration",
+   "metadata": {
+    "creationTimestamp": "2026-09-25T16:54:35Z",
+    "generation": 1,
+    "labels": {
+     "networking.gke.io/common-webhooks": "true"
+    },
+    "name": "warden-validating.config.common-webhooks.networking.gke.io",
+    "resourceVersion": "1790355275974079006",
+    "uid": "32b687db-4be9-4a24-8020-684e2205b86a"
+   },
+   "webhooks": [
+    {
+     "admissionReviewVersions": [
+      "v1beta1"
+     ],
+     "clientConfig": {
+      "url": "https://localhost:5443/webhook/warden-validating"
+     },
+     "failurePolicy": "Fail",
+     "matchConditions": [
+      {
+       "expression": "!(request.resource.group == '' && request.resource.resource == 'nodes' && request.name.startsWith('gke') && !('system:nodes' in request.userInfo.groups))",
+       "name": "exclude-standard-nodes"
+      }
+     ],
+     "matchPolicy": "Equivalent",
+     "name": "warden-validating.common-webhooks.networking.gke.io",
+     "sideEffects": "None",
+     "timeoutSeconds": 10
+    }
+   ]
+  },
+  {
+   "apiVersion": "admissionregistration.k8s.io/v1",
+   "kind": "MutatingWebhookConfiguration",
+   "metadata": {
+    "annotations": {
+     "components.gke.io/component-name": "managed-prometheus",
+     "components.gke.io/component-version": "0.18.2-gke.0",
+     "components.gke.io/layer": "addon"
+    },
+    "creationTimestamp": "2026-09-25T16:55:14Z",
+    "generation": 1,
+    "labels": {
+     "addonmanager.kubernetes.io/mode": "Reconcile"
+    },
+    "name": "gmp-operator.gmp-system.monitoring.googleapis.com",
+    "resourceVersion": "1790355314584079007",
+    "uid": "ef7ca3ce-4322-42c8-9d6a-e64fa32aa000"
+   },
+   "webhooks": [
+    {
+     "admissionReviewVersions": [
+      "v1"
+     ],
+     "clientConfig": {
+      "service": {
+       "name": "gmp-operator",
+       "namespace": "gmp-system",
+       "path": "/default/monitoring.googleapis.com/v1/operatorconfigs",
+       "port": 443
+      }
+     },
+     "failurePolicy": "Ignore",
+     "matchPolicy": "Equivalent",
+     "name": "default.operatorconfigs.gmp-operator.gmp-system.monitoring.googleapis.com",
+     "reinvocationPolicy": "Never",
+     "sideEffects": "None",
+     "timeoutSeconds": 10
+    }
+   ]
+  },
+  {
+   "apiVersion": "admissionregistration.k8s.io/v1",
+   "kind": "MutatingWebhookConfiguration",
+   "metadata": {
+    "creationTimestamp": "2026-09-25T16:54:35Z",
+    "generation": 1,
+    "labels": {
+     "networking.gke.io/common-webhooks": "true"
+    },
+    "name": "warden-mutating.config.common-webhooks.networking.gke.io",
+    "resourceVersion": "1790355275861535006",
+    "uid": "8c90b2bf-13f7-4304-b892-43fd95a21acb"
+   },
+   "webhooks": [
+    {
+     "admissionReviewVersions": [
+      "v1beta1"
+     ],
+     "clientConfig": {
+      "url": "https://localhost:5443/webhook/warden-mutating"
+     },
+     "failurePolicy": "Fail",
+     "matchPolicy": "Equivalent",
+     "name": "warden-mutating.common-webhooks.networking.gke.io",
+     "reinvocationPolicy": "Never",
+     "sideEffects": "None",
+     "timeoutSeconds": 10
+    }
+   ]
+  }
+ ],
+ "kind": "List"
+}
