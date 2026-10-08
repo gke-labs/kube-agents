@@ -2,7 +2,9 @@
 // platform profile: it consumes a2a.tasks.{profile}.*.in, answers each task
 // as a turn on the pod's Hermes API server (one session per contextId) or,
 // on the cli executor, by one `hermes -p {profile} chat -Q -q <prompt>` per
-// task, and publishes the payload spec's lifecycle events with the answer as
+// task, with a follow-up message that arrives mid-task queued and run as the
+// next turn in the same session (`--resume` on the cli executor), and
+// publishes the payload spec's lifecycle events with the answer as
 // the result artifact. It is
 // scaffolding for the Hermes-first world - when the stage-3 dispatcher and
 // the W4 worker adapter land, the bridge retires. Design:
@@ -287,6 +289,10 @@ type taskRun struct {
 	steers      []*lib.Envelope
 	seenSteers  map[string]bool
 	turnsClosed bool
+	// workingSent is set once the working status is on the stream
+	// (publishWorking), under mu: a notice reads it for the task's current
+	// state, so none can say submitted after working.
+	workingSent bool
 
 	canceled    atomic.Bool
 	deadlineHit atomic.Bool
@@ -874,10 +880,13 @@ func turnNote(turn int) string {
 }
 
 // noticeStateLocked is the task's current state for a non-final notice:
-// submitted while queued, or on the API executor while waiting for its
-// session's turn; working otherwise. Caller holds run.mu.
+// working once the working status is on the stream, submitted before it -
+// while queued, or on the API executor while waiting for its session's
+// turn. It reads workingSent, not anything set later (the activity state),
+// so a notice just after working never folds the task back. Caller holds
+// run.mu.
 func (b *Bridge) noticeStateLocked(run *taskRun) lib.TaskState {
-	if run.state == statePending || (b.cfg.Executor == ExecutorAPI && run.act.Load() == nil) {
+	if run.state == statePending || !run.workingSent {
 		return lib.StateSubmitted
 	}
 	return lib.StateWorking
@@ -1550,7 +1559,13 @@ func (b *Bridge) publishWorking(ctx context.Context, run *taskRun) error {
 	if !running {
 		return errRunEnded
 	}
-	return run.exec.PublishStatus(ctx, lib.StateWorking, false)
+	if err := run.exec.PublishStatus(ctx, lib.StateWorking, false); err != nil {
+		return err
+	}
+	run.mu.Lock()
+	run.workingSent = true
+	run.mu.Unlock()
+	return nil
 }
 
 // publishStatusMessage is PublishStatus with a status.message attached -

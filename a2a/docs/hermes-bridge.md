@@ -273,8 +273,7 @@ no key is refused at start.
 
 What the `api` executor does not do. A kanban card the persona creates completes after the turn
 has answered, and the API server has no channel to push that completion back, so it never reaches
-the A2A thread; the `cli` executor loses it the same way. A running turn cannot be steered: a
-follow-up to a running task gets the refusal described below. A turn the bridge stops waiting
+the A2A thread; the `cli` executor loses it the same way. A turn the bridge stops waiting
 for, on cancel or the deadline, may keep running in the server, and the next task on the same
 session can start beside it; so can a turn Hermes starts on its own, such as a background wake.
 Tool calls from either can land in the wrong task's trace. And when Hermes compresses a long
@@ -319,26 +318,30 @@ constructible. The component that does NOT get this for free is the worker adapt
 terminal its own predecessor's supervisor declared. Anything on `…in` for a task with a
 terminal event is acked with a warning and nothing else.
 
-**Steering:** a running turn cannot take input (`hermes chat -Q -q` has no stdin to inject
-into, and the `api` executor's request is already sent), so a follow-up message to a running
-task is queued, not refused. The bridge answers each one with a non-final status carrying the
-task's current state (`submitted` while queued, `working` after) and a `steerNotice` data part:
-`queued`, or `refused` with `queue-full` (16 already waiting), `task-ending` (the answer was
-already chosen), `no-text`, `capability` (the follow-up's own authority was refused, checked on
-the worker before its turn), `no-resume` (no `session_id:` line to resume, or a command that
-does not end in `-q`), or `task-ended` (the task ended first: cancel, failure, deadline,
-shutdown). On the `cli` executor, when a turn exits 0 the queued follow-ups run in arrival order
-as further turns in the same Hermes session,
-`hermes -p <profile> chat -Q --resume <session_id> -q <text>`, with the turn artifacts and the
-result described above, then the one terminal. A follow-up does not change task state (payload
-spec assertion 12). The `api` executor queues follow-ups the same way but does not run them yet:
-each is refused `task-ended` ahead of the terminal.
+**Steering:** a follow-up message to a running task is queued, not refused. The bridge answers
+each one with a non-final status carrying the task's current state (`submitted` while queued or
+waiting for the session, `working` after) and a `steerNotice` data part: `queued`, or `refused`
+with `queue-full` (16 already waiting), `task-ending` (the answer was already chosen), `no-text`,
+`capability` (the follow-up's own authority was refused, checked on the worker before its turn),
+`no-resume` (cli: no `session_id:` line to resume, or a command that does not end in `-q`), or
+`task-ended` (the task ended first: cancel, failure, deadline, shutdown). When the current turn
+ends, queued follow-ups run in arrival order as further turns in the same Hermes session: `api`
+posts another turn with the same session headers, under the same session slot, and the
+`Idempotency-Key` `<taskId>/<envelopeId>` (the opening turn's is `<taskId>`), so a follow-up
+never replays the opening answer; `cli` runs
+`hermes -p <profile> chat -Q --resume <session_id> -q <text>`. Each earlier turn's answer is
+published as a `turn` artifact as soon as the next turn is about to run; the last turn's answer
+is the `result`, then the one terminal. A failed follow-up turn names itself in the terminal
+(`; turn: N` after the session, on either executor). A follow-up does not change task state
+(payload spec assertion 12). A bridge that crashes with follow-ups queued loses them; the
+gateway's relay reports them as not run at the terminal, unless the gateway restarted too.
+Mid-turn steering through the runs API is gke-labs#2628.
 
 **Cancel:** SIGTERM to the subprocess's process group, SIGKILL after a grace period,
 then terminal `canceled` (`reason: canceled-by-request`). A task racing to completion may
 land `completed` first - both orders are legal and the terminal event wins. A per-task
-deadline (default 7200s, matching the profile's `activeDeadlineSeconds`), which on the `cli`
-executor covers every turn of the task, takes the same kill path and lands `failed`; no
+deadline (default 7200s, matching the profile's `activeDeadlineSeconds`), which covers every
+turn of the task, takes the same kill path and lands `failed`; no
 follow-up turn starts once it has passed.
 
 A cancel for a task still queued finalizes it `canceled` with `reason: canceled-before-start`

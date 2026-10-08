@@ -844,3 +844,324 @@ func TestAPI_AServerThatStartsLateStillAnswers(t *testing.T) {
 		t.Fatalf("server saw %d request(s), want 1: a refused connection sent nothing", n)
 	}
 }
+
+// keyedStub answers like a Hermes server with an idempotency cache: a repeated
+// key replays its first answer. The first request blocks until release closes.
+func keyedStub(t *testing.T, release <-chan struct{}) *apiStub {
+	var mu sync.Mutex
+	cache := map[string]string{}
+	first := true
+	return newAPIStub(t, func(w http.ResponseWriter, r *http.Request, c apiCall) {
+		mu.Lock()
+		if text, ok := cache[c.idempotency]; ok {
+			mu.Unlock()
+			writeCompletion(w, c.sessionID, text)
+			return
+		}
+		block := first
+		first = false
+		mu.Unlock()
+		if block {
+			<-release
+		}
+		text := "answer to " + c.prompt
+		mu.Lock()
+		cache[c.idempotency] = text
+		mu.Unlock()
+		writeCompletion(w, c.sessionID, text)
+	})
+}
+
+// A follow-up sent during the opening turn runs as a second turn in the same
+// session, under its own Idempotency-Key "<taskId>/<envelopeId>": the stub
+// replays on a repeated key, so a reused task-id key would hand back turn 1.
+func TestAPI_FollowUpIsASecondTurnInTheSameSession(t *testing.T) {
+	_, url := startServer(t)
+	release := make(chan struct{})
+	stub := keyedStub(t, release)
+	startAPIBridge(t, url, stub, nil)
+	c := gatewayClient(t, url)
+	origin := submitIn(t, c, "task-api-turns", "ctx-turns", "long question")
+	waitFor(t, 10*time.Second, "turn 1 in flight", func() bool { return len(stub.seen()) == 1 })
+	steer := sendSteer(t, c, origin, "also east")
+	waitFor(t, 10*time.Second, "queued", func() bool { return len(steerNotices(t, url, origin.TaskID)) == 1 })
+	if n := steerNotices(t, url, origin.TaskID)[0]; n.Steer != lib.SteerQueued || n.state != lib.StateWorking {
+		t.Fatalf("notice %+v, want queued on a working status", n)
+	}
+	close(release)
+	task := waitTerminal(t, c, origin.TaskID)
+	if task.State != lib.StateCompleted || task.PostFinalDropped != 0 {
+		t.Fatalf("state %s post-final %d", task.State, task.PostFinalDropped)
+	}
+	calls := stub.seen()
+	if len(calls) != 2 {
+		t.Fatalf("%d requests, want 2", len(calls))
+	}
+	for _, call := range calls {
+		if call.sessionID != "a2a-ctx-turns" || call.sessionKey != "a2a-ctx-turns" {
+			t.Fatalf("a turn left the session: %+v", call)
+		}
+	}
+	if calls[0].idempotency != origin.TaskID || calls[1].idempotency != origin.TaskID+"/"+steer.EnvelopeID {
+		t.Fatalf("keys %q, %q", calls[0].idempotency, calls[1].idempotency)
+	}
+	if calls[1].prompt != "also east" {
+		t.Fatalf("turn 2 prompt %q", calls[1].prompt)
+	}
+	if got := artifactsNamed(t, url, origin.TaskID, lib.ArtifactResult); !slices.Equal(got, []string{"answer to also east"}) {
+		t.Fatalf("result %q: a reused key would have replayed turn 1", got)
+	}
+	if got := artifactsNamed(t, url, origin.TaskID, lib.ArtifactTurn); !slices.Equal(got, []string{"answer to long question"}) {
+		t.Fatalf("turn answers %q", got)
+	}
+	if ns := steerNotices(t, url, origin.TaskID); len(ns) != 1 {
+		t.Fatalf("notices %+v, want only the queued one", ns)
+	}
+}
+
+func TestAPISessionTurnKey(t *testing.T) {
+	steer := &lib.Envelope{EnvelopeID: "env-7"}
+	if got := apiTurnKey("task-1", nil); got != "task-1" {
+		t.Fatalf("opening turn key %q", got)
+	}
+	if got := apiTurnKey("task-1", steer); got != "task-1/env-7" {
+		t.Fatalf("follow-up key %q", got)
+	}
+}
+
+// A follow-up turn that fails fails the task, naming the turn; a follow-up
+// still queued behind it is refused task-ended before the terminal.
+func TestAPI_FollowUpFailureNamesTheTurn(t *testing.T) {
+	_, url := startServer(t)
+	release := make(chan struct{})
+	var n atomic.Int32
+	stub := newAPIStub(t, func(w http.ResponseWriter, r *http.Request, c apiCall) {
+		if n.Add(1) == 1 {
+			<-release
+			writeCompletion(w, c.sessionID, "first")
+			return
+		}
+		http.Error(w, "boom", http.StatusBadGateway)
+	})
+	startAPIBridge(t, url, stub, nil)
+	c := gatewayClient(t, url)
+	origin := submitIn(t, c, "task-api-fail2", "ctx-fail2", "q")
+	waitFor(t, 10*time.Second, "turn 1 in flight", func() bool { return len(stub.seen()) == 1 })
+	sendSteer(t, c, origin, "second")
+	third := sendSteer(t, c, origin, "third")
+	waitFor(t, 10*time.Second, "queued", func() bool { return len(steerNotices(t, url, origin.TaskID)) == 2 })
+	close(release)
+	task := waitTerminal(t, c, origin.TaskID)
+	want := "reason: hermes-api-failed - HTTP 502; session: a2a-ctx-fail2; turn: 2; body tail: "
+	if task.State != lib.StateFailed || !strings.HasPrefix(terminalReason(t, task), want) {
+		t.Fatalf("state %s reason %q, want prefix %q", task.State, terminalReason(t, task), want)
+	}
+	if got := artifactsNamed(t, url, origin.TaskID, lib.ArtifactTurn); !slices.Equal(got, []string{"first"}) {
+		t.Fatalf("turn answers %q", got)
+	}
+	ns := steerNotices(t, url, origin.TaskID)
+	if len(ns) != 3 || ns[2].EnvelopeID != third.EnvelopeID || ns[2].Reason != lib.SteerReasonTaskEnded ||
+		ns[2].seq > finalSeq(t, url, origin.TaskID) {
+		t.Fatalf("notices %+v, want the third refused task-ended before the terminal", ns)
+	}
+}
+
+// Review Focus 10: a follow-up is a turn, so it is checked; one without a
+// capability is refused and skipped, and turn 1's answer is the deliverable.
+func TestAPI_FollowUpWithoutACapabilityIsSkipped(t *testing.T) {
+	_, url := startServer(t)
+	release := make(chan struct{})
+	stub := keyedStub(t, release)
+	startAPIBridge(t, url, stub, nil)
+	c := gatewayClient(t, url)
+	origin := submitIn(t, c, "task-api-nocap", "ctx-nocap", "q")
+	waitFor(t, 10*time.Second, "turn 1 in flight", func() bool { return len(stub.seen()) == 1 })
+	bare, err := lib.NewFollowUpEnvelope(origin, gatewayParty,
+		messagePayload(t, origin.TaskID, origin.ContextID, "unsigned"), lib.WithTo(lib.Party{Session: "platform"}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Publish(testCtx(t), lib.TaskInSubject("platform", origin.TaskID), bare); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 10*time.Second, "queued", func() bool { return len(steerNotices(t, url, origin.TaskID)) == 1 })
+	close(release)
+	task := waitTerminal(t, c, origin.TaskID)
+	if task.State != lib.StateCompleted || len(stub.seen()) != 1 {
+		t.Fatalf("state %s, %d requests; want completed on one request", task.State, len(stub.seen()))
+	}
+	ns := steerNotices(t, url, origin.TaskID)
+	if len(ns) != 2 || ns[1].Steer != lib.SteerRefused || ns[1].Reason != lib.SteerReasonCapability || ns[1].state != lib.StateWorking {
+		t.Fatalf("notices %+v, want the follow-up refused capability on a working status", ns)
+	}
+	if got := artifactsNamed(t, url, origin.TaskID, lib.ArtifactResult); !slices.Equal(got, []string{"answer to q"}) {
+		t.Fatalf("result %q", got)
+	}
+}
+
+// A cancel during a follow-up turn ends that turn's request and the task
+// canceled; a follow-up queued behind it is refused task-ended.
+func TestAPI_CancelDuringAFollowUpTurn(t *testing.T) {
+	_, url := startServer(t)
+	release, gone := make(chan struct{}), make(chan struct{})
+	var n atomic.Int32
+	stub := newAPIStub(t, func(w http.ResponseWriter, r *http.Request, c apiCall) {
+		if n.Add(1) == 1 {
+			<-release
+			writeCompletion(w, c.sessionID, "first")
+			return
+		}
+		<-r.Context().Done() // turn 2 runs until the bridge ends the request
+		close(gone)
+	})
+	// A deadline past waitTerminal's wait: only the cancel can end turn 2 in time.
+	startAPIBridge(t, url, stub, func(cfg *Config) { cfg.TaskDeadline = 2 * time.Minute })
+	c := gatewayClient(t, url)
+	origin := submitIn(t, c, "task-api-cancel2", "ctx-cancel2", "q")
+	waitFor(t, 10*time.Second, "turn 1 in flight", func() bool { return len(stub.seen()) == 1 })
+	sendSteer(t, c, origin, "second")
+	waitFor(t, 10*time.Second, "queued", func() bool { return len(steerNotices(t, url, origin.TaskID)) == 1 })
+	close(release)
+	waitFor(t, 10*time.Second, "turn 2 in flight", func() bool { return len(stub.seen()) == 2 })
+	third := sendSteer(t, c, origin, "third")
+	waitFor(t, 10*time.Second, "third queued", func() bool { return len(steerNotices(t, url, origin.TaskID)) == 2 })
+	publishCancel(t, c, origin)
+	task := waitTerminal(t, c, origin.TaskID)
+	if task.State != lib.StateCanceled || terminalReason(t, task) != "reason: canceled-by-request" {
+		t.Fatalf("state %s reason %q", task.State, terminalReason(t, task))
+	}
+	select {
+	case <-gone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("turn 2's request outlived the cancel")
+	}
+	ns := steerNotices(t, url, origin.TaskID)
+	if len(ns) != 3 || ns[2].EnvelopeID != third.EnvelopeID || ns[2].Reason != lib.SteerReasonTaskEnded ||
+		ns[2].seq > finalSeq(t, url, origin.TaskID) {
+		t.Fatalf("notices %+v, want the third refused task-ended before the terminal", ns)
+	}
+}
+
+// Once the worker has chosen the current answer as the deliverable, a
+// follow-up is refused task-ending, not queued behind the terminal.
+func TestAPI_FollowUpAfterTheQueueClosesIsRefused(t *testing.T) {
+	_, url := startServer(t)
+	release := make(chan struct{})
+	stub := keyedStub(t, release)
+	b := startAPIBridge(t, url, stub, nil)
+	c := gatewayClient(t, url)
+	origin := submitIn(t, c, "task-api-closed", "ctx-closed", "q")
+	waitFor(t, 10*time.Second, "turn 1 in flight", func() bool { return len(stub.seen()) == 1 })
+	if s := b.nextSteer(runOf(b, origin.TaskID)); s != nil { // the worker's decision, taken early
+		t.Fatalf("nextSteer = %v on an empty queue", s)
+	}
+	late := sendSteer(t, c, origin, "too late")
+	waitFor(t, 10*time.Second, "refusal", func() bool { return len(steerNotices(t, url, origin.TaskID)) == 1 })
+	if n := steerNotices(t, url, origin.TaskID)[0]; n.Reason != lib.SteerReasonTaskEnding || n.EnvelopeID != late.EnvelopeID {
+		t.Fatalf("notice = %+v, want refused task-ending", n)
+	}
+	close(release)
+	task := waitTerminal(t, c, origin.TaskID)
+	if task.State != lib.StateCompleted || task.PostFinalDropped != 0 || len(stub.seen()) != 1 {
+		t.Fatalf("state %s post-final %d requests %d", task.State, task.PostFinalDropped, len(stub.seen()))
+	}
+}
+
+// Ruling: a follow-up turn sends nothing once the task is canceled, past its
+// deadline, or finalized; the follow-up is refused task-ended exactly once,
+// before the terminal. The check and the take share one critical section.
+func TestAPI_FollowUpTurnDoesNotSendAfterTheTaskStops(t *testing.T) {
+	_, url := startServer(t)
+	stub := newAPIStub(t, nil)
+	b := startAPIBridge(t, url, stub, nil)
+	expired, cancelExpired := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+	defer cancelExpired()
+	cases := []struct {
+		name    string
+		prepare func(run *taskRun)
+		ctx     context.Context
+		state   lib.TaskState
+		reason  string
+	}{
+		{"canceled", func(run *taskRun) { run.canceled.Store(true) }, context.Background(), lib.StateCanceled, "reason: canceled-by-request"},
+		{"deadline-fired", func(run *taskRun) { run.deadlineHit.Store(true) }, context.Background(), lib.StateFailed, "reason: deadline-exceeded"},
+		{"deadline-passed", func(*taskRun) {}, expired, lib.StateFailed, "reason: deadline-exceeded"},
+		{"finalized", func(run *taskRun) { b.finalize(run, lib.StateFailed, shutdownReason, nil) }, context.Background(), lib.StateFailed, shutdownReason},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			taskID := "task-api-nosend-" + tc.name
+			run, steer := idleRun(t, b, taskID)
+			if got := b.nextSteer(run); got != steer {
+				t.Fatalf("nextSteer = %v, want the queued follow-up", got)
+			}
+			tc.prepare(run)
+			if _, ok := b.apiTurn(run, tc.ctx, "a2a-ctx-"+taskID, "next", steer, 2); ok {
+				t.Fatal("a follow-up turn answered after the task stopped")
+			}
+			if n := len(stub.seen()); n != 0 {
+				t.Fatalf("%d requests sent after the task stopped", n)
+			}
+			var final *lib.StatusUpdate
+			for _, env := range replayEvents(t, url, taskID) {
+				if lib.IsFinalStatus(env) {
+					final = &lib.StatusUpdate{}
+					_ = json.Unmarshal(env.Payload, final)
+				}
+			}
+			if final == nil || final.Status.State != tc.state || final.Status.Message == nil ||
+				!strings.HasPrefix(final.Status.Message.Parts[0].Text, tc.reason) {
+				t.Fatalf("terminal %+v, want %s %q", final, tc.state, tc.reason)
+			}
+			ns := steerNotices(t, url, taskID)
+			if len(ns) != 1 || ns[0].EnvelopeID != steer.EnvelopeID || ns[0].Reason != lib.SteerReasonTaskEnded ||
+				ns[0].seq > finalSeq(t, url, taskID) {
+				t.Fatalf("notices %+v, want the follow-up refused task-ended once, before the terminal", ns)
+			}
+		})
+	}
+	// Control: with nothing stopping it, the same call sends the turn under
+	// the follow-up's key, and the follow-up leaves the queue.
+	run, steer := idleRun(t, b, "task-api-nosend-control")
+	text, ok := b.apiTurn(run, context.Background(), "a2a-ctx-control", "next", steer, 2)
+	if !ok || text != "answer to next" {
+		t.Fatalf("control: ok %v text %q", ok, text)
+	}
+	if calls := stub.seen(); len(calls) != 1 || calls[0].idempotency != "task-api-nosend-control/"+steer.EnvelopeID {
+		t.Fatalf("control: calls %+v", calls)
+	}
+	run.mu.Lock()
+	left := len(run.steers)
+	run.mu.Unlock()
+	if left != 0 {
+		t.Fatalf("control: %d follow-ups still queued after the turn started", left)
+	}
+	b.finalize(run, lib.StateCompleted, "", nil)
+}
+
+// Ruling: a notice's state follows the working publish, not the activity
+// state, so a notice between working and the activity store on the API
+// executor does not fold the task back to submitted.
+func TestNoticeState_FollowsTheWorkingPublish(t *testing.T) {
+	_, url := startServer(t)
+	b := startAPIBridge(t, url, newAPIStub(t, nil), nil)
+	run, _ := idleRun(t, b, "task-notice-state")
+	read := func() lib.TaskState {
+		run.mu.Lock()
+		defer run.mu.Unlock()
+		return b.noticeStateLocked(run)
+	}
+	if got := read(); got != lib.StateSubmitted {
+		t.Fatalf("before working: %s, want submitted", got)
+	}
+	if err := b.publishWorking(testCtx(t), run); err != nil {
+		t.Fatal(err)
+	}
+	if run.act.Load() != nil {
+		t.Fatal("the activity state is stored; the window under test is gone")
+	}
+	if got := read(); got != lib.StateWorking {
+		t.Fatalf("after working, before the activity store: %s, want working", got)
+	}
+	b.finalize(run, lib.StateCompleted, "", nil)
+}
