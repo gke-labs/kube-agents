@@ -113,6 +113,7 @@ REPORTS_SUBDIR = "reports"
 # One run at a time per store: an exclusive, non-blocking lock on this file.
 LOCK_FILENAME = ".lock"
 LOCK_HELD_TEXT = "another retrospective run holds {path} since {since}; nothing written"
+STATE_UNREADABLE_DRY_RUN_TEXT = "{path} {why}; a dry run moves nothing and stops here. Nothing written."
 STATE_UNREADABLE_TEXT = "{path} {why}; moved to {aside}. A set-aside ledger is a crash record, not a re-baseline: restore it or remove it on purpose, then rerun. Nothing written."
 EXIT_USAGE = 2
 REPORT_FILENAME = "upgrade-retro-report-{date}.md"
@@ -180,6 +181,7 @@ PHASE_SUCCEEDED = "Succeeded"
 PHASE_RUNNING = "Running"
 PHASE_PENDING = "Pending"
 REASON_ERROR = "Error"
+REASON_COMPLETED = "Completed"
 REASON_UNSCHEDULABLE = "Unschedulable"
 REASON_FAILED_SCHEDULING = "FailedScheduling"
 CONTAINER_FAILURE_REASONS = ("OOMKilled", "CrashLoopBackOff", "ImagePullBackOff", "ErrImagePull", "CreateContainerError", REASON_ERROR)
@@ -233,7 +235,9 @@ SIGNATURES = (
     (ENTRY_GPU, HIGH, SCOPE_SCHEDULING, re.compile(r"Insufficient nvidia\.com/gpu")),
     (ENTRY_CAPACITY, HIGH, SCOPE_SCHEDULING, re.compile(r"Insufficient (?:cpu|memory)")),
     (ENTRY_REGISTRY, HIGH, SCOPE_REASON, re.compile(r"^(?:ImagePullBackOff|ErrImagePull)$")),
-    (ENTRY_GPU, HIGH, SCOPE_CONTAINER, re.compile(r"nvidia|CUDA|Error 803")),
+    # Driver and CUDA error text only: an image name containing `nvidia`
+    # in a pull back-off is entry 20, not a driver mismatch.
+    (ENTRY_GPU, HIGH, SCOPE_CONTAINER, re.compile(r"Error 803|CUDA driver version|unsupported display driver|NVML|nvidia-container-cli|could not select device driver")),
 )
 # The reads per cluster. `owners` is the intermediates a pod's
 # ownerReferences stop at: a ReplicaSet names its Deployment and a Job its
@@ -307,18 +311,22 @@ CGROUP_V2_MIGRATION_MINOR = 33
 # Kinds whose spec carries a pod template.
 TEMPLATE_KINDS = ("Deployment", "StatefulSet", "DaemonSet", "CronJob")
 # What the risks table says it looked for when it found nothing.
+# What the risks table says it looked for when it found nothing, each with
+# the reads it needs; a check whose read failed is listed as not performed.
+SPEC_CHECK_READS = ("pods", "owners", "workloads")
 SHAPE_CHECKS = (
-    "budgets allowing no disruption and single-replica workloads behind a budget (1)",
-    "selectors on beta.kubernetes.io / failure-domain.beta.kubernetes.io labels (12)",
-    "images on a retired registry host (20)",
-    "in-tree gcePersistentDisk volumes and kubernetes.io/gce-pd StorageClasses (19)",
-    "DaemonSets on hostNetwork (17) or mounting the containerd socket (13)",
-    "emptyDir or local-SSD volumes whose name suggests state (4)",
-    "GPU workloads pinning a CUDA version (18)",
-    "fail-closed webhooks whose Service has no ready endpoint (7)",
-    "pre-cgroup-v2 runtime images on a cgroup v2 pool or a v1 pool GKE will migrate at 1.33 (14; pinned tags only, floating tags such as 8-jre are not matched)",
-    "not checked statically: a multi-process container (15) is not visible from the spec",
+    ("budgets allowing no disruption and single-replica workloads behind a budget (1)", ("pdbs", "workloads")),
+    ("selectors on beta.kubernetes.io / failure-domain.beta.kubernetes.io labels (12)", SPEC_CHECK_READS),
+    ("images on a retired registry host (20)", SPEC_CHECK_READS),
+    ("in-tree gcePersistentDisk volumes and kubernetes.io/gce-pd StorageClasses (19)", ("storage",)),
+    ("DaemonSets on hostNetwork (17) or mounting the containerd socket (13)", SPEC_CHECK_READS),
+    ("emptyDir or local-SSD volumes whose name suggests state (4)", SPEC_CHECK_READS),
+    ("GPU workloads pinning a CUDA version (18)", SPEC_CHECK_READS),
+    ("fail-closed webhooks whose Service has no ready endpoint (7)", ("webhooks", "endpointslices")),
+    ("pre-cgroup-v2 runtime images on a cgroup v2 pool or a v1 pool GKE will migrate at 1.33 (14; pinned tags only, floating tags such as 8-jre are not matched)", SPEC_CHECK_READS + ("nodes",)),
+    ("not checked statically: a multi-process container (15) is not visible from the spec", ()),
 )
+NOT_CHECKED_TEXT = "; not checked, their reads failed: "
 # Guard kinds: a `failure` broke the last upgrade, a `risk` is a shape
 # present before the next one.
 GUARD_KIND_FAILURE, GUARD_KIND_RISK = "failure", "risk"
@@ -331,6 +339,8 @@ FAILURE_GUARD_READS = ("pods", "nodes", "events", "pdbs", "owners")
 GUARD_SOURCE_EVENT = CATEGORY_EVENT
 RECHECK_NOT_RECHECKABLE_TEXT = "{count} event-only guard(s) not re-checkable; cleared by the next review of the cluster"
 STALE_PARTIAL_TEXT = "cluster read partially this run ({failed}); the guard below could not be re-observed and was kept."
+STALE_EVENT_ONLY_TEXT = "cluster re-checked this run; the guard below came from an event alone and a re-check reads no events, so it is kept until the cluster's next full review."
+STALE_RECHECK_FAILED_TEXT = "cluster re-checked this run but the read failed ({errors}); the guard below was kept."
 SPEC_SHAPE_READS = ("pods", "owners", "workloads")
 SHAPE_READS_BY_ENTRY = {
     ENTRY_BUDGET: ("pdbs", "workloads"),
@@ -338,7 +348,8 @@ SHAPE_READS_BY_ENTRY = {
     ENTRY_REGISTRY: SPEC_SHAPE_READS,
     ENTRY_NODE_LOCAL_STATE: SPEC_SHAPE_READS,
     ENTRY_GPU: SPEC_SHAPE_READS,
-    ENTRY_CGROUP_V2: SPEC_SHAPE_READS,
+    # The owner's pools come from the node list; without it every pool counts.
+    ENTRY_CGROUP_V2: SPEC_SHAPE_READS + ("nodes",),
     ENTRY_RUNTIME: SPEC_SHAPE_READS,
     ENTRY_NODE_AGENT: SPEC_SHAPE_READS,
     ENTRY_IN_TREE_VOLUME: ("storage",),
@@ -798,16 +809,18 @@ class StateUnreadable(Exception):
     as a first run only when no ledger file existed at all."""
 
 
-def _set_aside(path: Path, why: str, now: datetime) -> None:
+def _set_aside(path: Path, why: str, now: datetime, move: bool = True) -> None:
     """Move a state file this run cannot use out of the way, so nothing
-    overwrites it, and stop."""
+    overwrites it, and stop. A dry run moves nothing: it only reports."""
+    if not move:
+        raise StateUnreadable(STATE_UNREADABLE_DRY_RUN_TEXT.format(path=path, why=why))
     aside = path.with_name(path.name + UNREADABLE_SUFFIX.format(ts=now.strftime("%Y%m%dT%H%M%SZ")))
     with contextlib.suppress(OSError):
         os.replace(path, aside)
     raise StateUnreadable(STATE_UNREADABLE_TEXT.format(path=path, why=why, aside=aside))
 
 
-def load_json(path: Path, default: dict, *, version: int | None = None, now: datetime | None = None) -> dict:
+def load_json(path: Path, default: dict, *, version: int | None = None, now: datetime | None = None, move_aside: bool = True) -> dict:
     now = now or now_utc()
     try:
         with open(path, encoding="utf-8") as handle:
@@ -815,11 +828,11 @@ def load_json(path: Path, default: dict, *, version: int | None = None, now: dat
     except FileNotFoundError:
         return default
     except (OSError, json.JSONDecodeError) as exc:
-        _set_aside(path, f"is unreadable ({exc})", now)
+        _set_aside(path, f"is unreadable ({exc})", now, move_aside)
     if not isinstance(loaded, dict):
-        _set_aside(path, "is not a JSON object", now)
+        _set_aside(path, "is not a JSON object", now, move_aside)
     if version is not None and loaded.get("version") != version:
-        _set_aside(path, f"has version {loaded.get('version')!r}, this collector writes {version}", now)
+        _set_aside(path, f"has version {loaded.get('version')!r}, this collector writes {version}", now, move_aside)
     return loaded
 
 
@@ -1000,6 +1013,15 @@ def _condition(obj: dict, kind: str) -> dict:
     return {}
 
 
+def _api_marker_hits(pod: dict) -> list[str]:
+    """Which of entry 6's best-effort markers the pod names, in its names,
+    images, command, args and env values. Only the marker names leave this
+    function: the text itself (an inline env value can be a credential) is
+    never stored or written."""
+    text = _pod_text(pod)
+    return [marker for marker in DEPRECATED_API_MARKERS if marker in text]
+
+
 def _pod_text(pod: dict) -> str:
     """The text entry 6's best-effort markers are searched in: names, images,
     command, args and env values of every container."""
@@ -1088,7 +1110,7 @@ def _pod_detail(pod: dict) -> dict:
         "images": [c.get("image", "") for c in containers],
         "labels": meta.get("labels") or {},
         "node_selector": spec.get("nodeSelector") or {},
-        "spec_text": _pod_text(pod),
+        "api_markers": _api_marker_hits(pod),
         "since": status.get("startTime") or meta.get("creationTimestamp"),
     }
 
@@ -1103,6 +1125,10 @@ def _pod_last_activity(pod: dict) -> datetime | None:
             terminated = (cs.get(key) or {}).get("terminated") or {}
             if terminated.get("finishedAt"):
                 stamps.append(parse_ts(terminated["finishedAt"]))
+    # A pod that lost readiness without restarting is dated by that transition.
+    ready = _condition(pod, "Ready")
+    if ready.get("status") != "True" and ready.get("lastTransitionTime"):
+        stamps.append(parse_ts(ready["lastTransitionTime"]))
     stamps = [t for t in stamps if t]
     if stamps:
         return max(stamps)
@@ -1152,7 +1178,9 @@ def pod_symptoms(pods: list[dict], resolver: Resolver, window_start: datetime | 
                     if state_name == "running":
                         continue
                     reason = state.get("reason") or ""
-                    if reason or (state_name == "terminated" and state.get("exitCode") not in (None, 0)):
+                    # A clean exit (`Completed`, exit 0) is not a failure: an init
+                    # container that finished must not headline a not-Ready pod.
+                    if (reason and reason != REASON_COMPLETED) or (state_name == "terminated" and state.get("exitCode") not in (None, 0)):
                         container_reasons.append({"container": cs.get("name"), "where": key, "reason": reason or state_name, "message": (state.get("message") or "")[:MESSAGE_EXCERPT_CHARS], "exit_code": state.get("exitCode"), "finished_at": state.get("finishedAt")})
         # The catalogue's reasons lead, so the row's headline is the one a
         # signature reads rather than whichever container came first.
@@ -1200,12 +1228,20 @@ def node_symptoms(nodes: list[dict]) -> list[dict]:
 
 
 def _event_time(event: dict) -> datetime | None:
-    for key in ("lastTimestamp", "eventTime"):
-        ts = parse_ts(event.get(key))
+    """When the event last fired. A series-shaped event (events.k8s.io read
+    back through core/v1) carries its first observation in `eventTime` and
+    its last in `series.lastObservedTime`, so the series comes first."""
+    series = event.get("series") or {}
+    for value in (series.get("lastObservedTime"), event.get("lastTimestamp"), event.get("eventTime"), (event.get("metadata") or {}).get("creationTimestamp")):
+        ts = parse_ts(value)
         if ts:
             return ts
+    return None
+
+
+def _event_count(event: dict) -> int:
     series = event.get("series") or {}
-    return parse_ts(series.get("lastObservedTime")) or parse_ts((event.get("metadata") or {}).get("creationTimestamp"))
+    return int(series.get("count") or event.get("count") or 1)
 
 
 def event_symptoms(events: list[dict], window_start: datetime, resolver: Resolver) -> list[dict]:
@@ -1247,15 +1283,33 @@ def event_symptoms(events: list[dict], window_start: datetime, resolver: Resolve
             row["pods"].append(involved_name)
             row["pods"].sort()
             row["pod_count"], row["example_pod"] = len(row["pods"]), row["pods"][0]
-        row["count"] += int(event.get("count") or 1)
+        row["count"] += _event_count(event)
         if fmt_ts(last) > row["last_seen"]:
             row["last_seen"], row["message"] = fmt_ts(last), message[:MESSAGE_EXCERPT_CHARS]
     return list(rows.values())
 
 
 def _selector_matches(selector: dict, labels: dict) -> bool:
+    """A label selector evaluated in full: `matchLabels` and `matchExpressions`
+    (In, NotIn, Exists, DoesNotExist). An empty selector matches nothing here:
+    a budget with no selector covers no pod this collector can name."""
     match = (selector or {}).get("matchLabels") or {}
-    return bool(match) and all(labels.get(k) == v for k, v in match.items())
+    expressions = (selector or {}).get("matchExpressions") or []
+    if not match and not expressions:
+        return False
+    if not all(labels.get(k) == v for k, v in match.items()):
+        return False
+    for expr in expressions:
+        key, op, values = expr.get("key"), expr.get("operator"), expr.get("values") or []
+        if op == "In" and labels.get(key) not in values:
+            return False
+        if op == "NotIn" and labels.get(key) in values:
+            return False
+        if op == "Exists" and key not in labels:
+            return False
+        if op == "DoesNotExist" and key in labels:
+            return False
+    return True
 
 
 def pdb_symptoms(pdbs: list[dict], pods: list[dict], nodes: list[dict], upgraded_pools: dict[str, dict]) -> list[dict]:
@@ -1392,10 +1446,10 @@ def classify_symptom(symptom: dict, ctx: Context) -> list[dict]:
             detail = f"webhook {name.group(1)}" if name else ""
         elif entry == ENTRY_REGISTRY:
             detail = _image_host_detail(symptom)
-        if entry in POOL_GATED_ENTRIES and scope != SCOPE_CONTAINER:
-            # Capacity, a GPU shortage and a failed pull happen without an
-            # upgrade; high only when a pool operation in the window touched
-            # the pod's pool (a Pending pod has none: any upgraded pool).
+        if entry in POOL_GATED_ENTRIES:
+            # Capacity, a GPU shortage or driver error and a failed pull happen
+            # without an upgrade; high only when a pool operation in the window
+            # touched the pod's pool (a Pending pod has none: any upgraded pool).
             pool = ctx.node_pool.get(symptom.get("node") or "", "")
             touched = pool in ctx.upgraded_pools if pool else bool(ctx.upgraded_pools)
             if not touched:
@@ -1440,7 +1494,7 @@ def classify_symptom(symptom: dict, ctx: Context) -> list[dict]:
 
     # Entry 6: a Job pod in Error whose spec names a removed API, best effort.
     if symptom["category"] == CATEGORY_NOT_READY and symptom.get("owner_kind") in JOB_OWNER_KINDS:
-        hits = [marker for marker in DEPRECATED_API_MARKERS if marker in (symptom.get("spec_text") or "")]
+        hits = symptom.get("api_markers") or []
         if hits and any(c["reason"] == REASON_ERROR for c in containers):
             add(ENTRY_REMOVED_API, MEDIUM, f"{symptom['owner_kind']} pod in Error; spec mentions {', '.join(hits)}", "best effort: a name, not an API call")
 
@@ -1562,6 +1616,8 @@ def merge_guards(existing: dict, fresh: list[dict], reviewed: set[str], seen_at:
         old = by_id.get(guard["id"])
         if old:
             old.update(last_seen=seen_at, evidence=guard["evidence"], confidence=guard["confidence"])
+            if guard.get("source"):
+                old["source"] = guard["source"]
         else:
             merged.append(guard)
     merged.sort(key=lambda g: (g["cluster"], g["entry"], g["object"]))
@@ -2091,6 +2147,9 @@ def review_cluster(selection: Selection, ledger: dict, *, run: RunFn, seen_at: s
     review["answered"] = [name for name, _ in KUBECTL_READS if name not in failed]
     review["partial"] = [name for name in CORE_READS if name in failed]
     if len(review["partial"]) == len(CORE_READS):
+        # Nothing was evaluated, so nothing counts as answered: no guard of
+        # this cluster may be dropped on this run's say-so.
+        review["answered"] = []
         return review
     # A partial read still reports what it saw; it is `reviewed` -- the
     # ledger moves and absent guards drop -- only when every core read answered.
@@ -2222,12 +2281,16 @@ def triage(reviews: list[dict], unchanged: list[dict], failed_reads: list[str], 
         for incident in sorted(incidents.values(), key=lambda i: i["object"]):
             (errors if incident["severity"] == SEVERITY_ERROR else warnings).append(incident)
     partial_reads = {r["cluster"]: r["partial"] for r in reviews if r.get("partial") and not r["reviewed"]}
+    not_recheckable = {gid for r in rechecks or [] for gid in r.get("not_recheckable") or []}
+    recheck_errors = {r["cluster"]: r["errors"] for r in rechecks or [] if r.get("errors")}
     for guard in guards:
         # A risk is never an incident, so only a failure guard that outlived
         # its last review is a Warning; stale risk guards stay in the file.
         if guard.get("last_seen") != seen_at and guard.get("kind", GUARD_KIND_FAILURE) == GUARD_KIND_FAILURE:
             warnings.append({
                 "partial": partial_reads.get(guard["cluster"]) or [],
+                "event_only": guard["id"] in not_recheckable,
+                "recheck_errors": recheck_errors.get(guard["cluster"]) or [],
                 "kind": INCIDENT_STALE_GUARD,
                 "severity": SEVERITY_WARNING,
                 "cluster": guard["cluster"],
@@ -2278,6 +2341,10 @@ def _incident_lines(incident: dict) -> list[str]:
         guard = incident["guards"][0]
         if incident.get("partial"):
             lines.append(f"{PART_WHAT_HAPPENED} {STALE_PARTIAL_TEXT.format(failed=', '.join(incident['partial']))}")
+        elif incident.get("event_only"):
+            lines.append(f"{PART_WHAT_HAPPENED} {STALE_EVENT_ONLY_TEXT}")
+        elif incident.get("recheck_errors"):
+            lines.append(f"{PART_WHAT_HAPPENED} {STALE_RECHECK_FAILED_TEXT.format(errors=_cell('; '.join(incident['recheck_errors'])))}")
         else:
             lines.append(f"{PART_WHAT_HAPPENED} cluster not reviewed this run; the guard below is from an earlier run.")
         lines.append(f"{PART_WHAT_FAILED} entry {guard['entry']}. {guard['title']} ({guard['confidence']}) last seen {guard['last_seen']}: {_cell(guard['evidence'])}")
@@ -2321,10 +2388,16 @@ def _next_upgrade_lines(nu: dict) -> list[str]:
     ]
 
 
-def _risks_lines(shapes: list[dict], managed_agents: int) -> list[str]:
+def _risks_lines(shapes: list[dict], managed_agents: int, failed_reads: list[str] | None = None) -> list[str]:
     agents = [MANAGED_AGENTS_LINE.format(count=managed_agents)] if managed_agents else []
     if not shapes:
-        return [f"{PART_RISKS} {NO_SHAPE_TEXT}{'; '.join(SHAPE_CHECKS)}."] + agents
+        failed = {e.split(":")[0] for e in failed_reads or []}
+        checked = [text for text, reads in SHAPE_CHECKS if not (set(reads) & failed)]
+        skipped = [text for text, reads in SHAPE_CHECKS if set(reads) & failed]
+        line = f"{PART_RISKS} {NO_SHAPE_TEXT}{'; '.join(checked)}"
+        if skipped:
+            line += NOT_CHECKED_TEXT + "; ".join(skipped)
+        return [line + "."] + agents
     lines = [PART_RISKS, "", "| Object | Catalogue entry | Confidence | Evidence | Mitigate before |", "| --- | --- | --- | --- | --- |"]
     for shape in shapes:
         system = " (system)" if shape["system"] else ""
@@ -2353,7 +2426,7 @@ def _cluster_block_lines(row: dict) -> list[str]:
         lines += [PARTIAL_READ_TEXT.format(failed=", ".join(row["partial"])), ""]
     lines += _next_upgrade_lines(row["next_upgrade"])
     lines.append("")
-    lines += _risks_lines(row["shapes"], row.get("managed_agents") or 0)
+    lines += _risks_lines(row["shapes"], row.get("managed_agents") or 0, (row.get("baseline") or {}).get("shape_reads_failed") or [])
     lines.append("")
     lines += _baseline_lines(row["baseline"])
     return lines + [""]
@@ -2469,8 +2542,8 @@ def collect(args: argparse.Namespace, *, run: RunFn | None = None, now: datetime
     since = parse_since(args.since, now)
     ledger_path = Path(args.ledger) if args.ledger else data_dir() / LEDGER_FILENAME
     guards_path = Path(args.guards) if args.guards else data_dir() / GUARDS_FILENAME
-    ledger = load_json(ledger_path, empty_ledger(), version=LEDGER_VERSION, now=now)
-    guards = load_json(guards_path, empty_guards(), version=GUARDS_VERSION, now=now)
+    ledger = load_json(ledger_path, empty_ledger(), version=LEDGER_VERSION, now=now, move_aside=not args.dry_run)
+    guards = load_json(guards_path, empty_guards(), version=GUARDS_VERSION, now=now, move_aside=not args.dry_run)
     forced = {c.strip() for c in args.cluster or [] if c.strip()}
 
     failed_reads: list[str] = []
