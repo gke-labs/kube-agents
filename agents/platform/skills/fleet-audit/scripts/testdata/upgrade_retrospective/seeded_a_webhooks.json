@@ -5,19 +5,10 @@
    "apiVersion": "admissionregistration.k8s.io/v1",
    "kind": "ValidatingWebhookConfiguration",
    "metadata": {
-    "annotations": {
-     "components.gke.io/component-name": "managed-prometheus",
-     "components.gke.io/component-version": "0.18.2-gke.0",
-     "components.gke.io/layer": "addon"
-    },
-    "creationTimestamp": "2026-09-25T16:55:16Z",
-    "generation": 1,
     "labels": {
      "addonmanager.kubernetes.io/mode": "Reconcile"
     },
-    "name": "gmp-operator.gmp-system.monitoring.googleapis.com",
-    "resourceVersion": "1790355316983071020",
-    "uid": "d57482e9-211b-4008-a94f-cce14d02ffa2"
+    "name": "gmp-operator.gmp-system.monitoring.googleapis.com"
    },
    "webhooks": [
     {
@@ -35,6 +26,26 @@
      "failurePolicy": "Fail",
      "matchPolicy": "Equivalent",
      "name": "validate.rules.gmp-operator.gmp-system.monitoring.googleapis.com",
+     "namespaceSelector": {},
+     "objectSelector": {},
+     "rules": [
+      {
+       "apiGroups": [
+        "monitoring.googleapis.com"
+       ],
+       "apiVersions": [
+        "v1"
+       ],
+       "operations": [
+        "CREATE",
+        "UPDATE"
+       ],
+       "resources": [
+        "rules"
+       ],
+       "scope": "*"
+      }
+     ],
      "sideEffects": "None",
      "timeoutSeconds": 10
     },
@@ -53,6 +64,26 @@
      "failurePolicy": "Fail",
      "matchPolicy": "Equivalent",
      "name": "validate.clusterrules.gmp-operator.gmp-system.monitoring.googleapis.com",
+     "namespaceSelector": {},
+     "objectSelector": {},
+     "rules": [
+      {
+       "apiGroups": [
+        "monitoring.googleapis.com"
+       ],
+       "apiVersions": [
+        "v1"
+       ],
+       "operations": [
+        "CREATE",
+        "UPDATE"
+       ],
+       "resources": [
+        "clusterrules"
+       ],
+       "scope": "*"
+      }
+     ],
      "sideEffects": "None",
      "timeoutSeconds": 10
     },
@@ -71,6 +102,26 @@
      "failurePolicy": "Fail",
      "matchPolicy": "Equivalent",
      "name": "validate.globalrules.gmp-operator.gmp-system.monitoring.googleapis.com",
+     "namespaceSelector": {},
+     "objectSelector": {},
+     "rules": [
+      {
+       "apiGroups": [
+        "monitoring.googleapis.com"
+       ],
+       "apiVersions": [
+        "v1"
+       ],
+       "operations": [
+        "CREATE",
+        "UPDATE"
+       ],
+       "resources": [
+        "globalrules"
+       ],
+       "scope": "*"
+      }
+     ],
      "sideEffects": "None",
      "timeoutSeconds": 10
     },
@@ -89,6 +140,26 @@
      "failurePolicy": "Fail",
      "matchPolicy": "Equivalent",
      "name": "validate.operatorconfigs.gmp-operator.gmp-system.monitoring.googleapis.com",
+     "namespaceSelector": {},
+     "objectSelector": {},
+     "rules": [
+      {
+       "apiGroups": [
+        "monitoring.googleapis.com"
+       ],
+       "apiVersions": [
+        "v1"
+       ],
+       "operations": [
+        "CREATE",
+        "UPDATE"
+       ],
+       "resources": [
+        "operatorconfigs"
+       ],
+       "scope": "*"
+      }
+     ],
      "sideEffects": "None",
      "timeoutSeconds": 10
     }
@@ -98,14 +169,10 @@
    "apiVersion": "admissionregistration.k8s.io/v1",
    "kind": "ValidatingWebhookConfiguration",
    "metadata": {
-    "creationTimestamp": "2026-09-25T16:54:35Z",
-    "generation": 1,
     "labels": {
      "networking.gke.io/common-webhooks": "true"
     },
-    "name": "warden-validating.config.common-webhooks.networking.gke.io",
-    "resourceVersion": "1790355275974079006",
-    "uid": "32b687db-4be9-4a24-8020-684e2205b86a"
+    "name": "warden-validating.config.common-webhooks.networking.gke.io"
    },
    "webhooks": [
     {
@@ -124,6 +191,492 @@
      ],
      "matchPolicy": "Equivalent",
      "name": "warden-validating.common-webhooks.networking.gke.io",
+     "namespaceSelector": {},
+     "objectSelector": {},
+     "rules": [
+      {
+       "apiGroups": [
+        ""
+       ],
+       "apiVersions": [
+        "*"
+       ],
+       "operations": [
+        "CREATE",
+        "UPDATE"
+       ],
+       "resources": [
+        "nodes"
+       ],
+       "scope": "Cluster"
+      },
+      {
+       "apiGroups": [
+        ""
+       ],
+       "apiVersions": [
+        "*"
+       ],
+       "operations": [
+        "CONNECT"
+       ],
+       "resources": [
+        "pods/*"
+       ],
+       "scope": "*"
+      },
+      {
+       "apiGroups": [
+        ""
+       ],
+       "apiVersions": [
+        "*"
+       ],
+       "operations": [
+        "CREATE",
+        "UPDATE"
+       ],
+       "resources": [
+        "pods/ephemeralcontainers"
+       ],
+       "scope": "*"
+      },
+      {
+       "apiGroups": [
+        ""
+       ],
+       "apiVersions": [
+        "*"
+       ],
+       "operations": [
+        "UPDATE"
+       ],
+       "resources": [
+        "pods/ephemeralcontainers"
+       ],
+       "scope": "*"
+      },
+      {
+       "apiGroups": [
+        ""
+       ],
+       "apiVersions": [
+        "*"
+       ],
+       "operations": [
+        "UPDATE"
+       ],
+       "resources": [
+        "pods/resize"
+       ],
+       "scope": "*"
+      },
+      {
+       "apiGroups": [
+        ""
+       ],
+       "apiVersions": [
+        "*"
+       ],
+       "operations": [
+        "CREATE"
+       ],
+       "resources": [
+        "pods"
+       ],
+       "scope": "*"
+      },
+      {
+       "apiGroups": [
+        ""
+       ],
+       "apiVersions": [
+        "*"
+       ],
+       "operations": [
+        "CREATE",
+        "UPDATE"
+       ],
+       "resources": [
+        "pods"
+       ],
+       "scope": "*"
+      },
+      {
+       "apiGroups": [
+        ""
+       ],
+       "apiVersions": [
+        "*"
+       ],
+       "operations": [
+        "UPDATE"
+       ],
+       "resources": [
+        "pods"
+       ],
+       "scope": "*"
+      },
+      {
+       "apiGroups": [
+        ""
+       ],
+       "apiVersions": [
+        "*"
+       ],
+       "operations": [
+        "CREATE",
+        "UPDATE"
+       ],
+       "resources": [
+        "replicationcontrollers"
+       ],
+       "scope": "*"
+      },
+      {
+       "apiGroups": [
+        ""
+       ],
+       "apiVersions": [
+        "*"
+       ],
+       "operations": [
+        "UPDATE"
+       ],
+       "resources": [
+        "replicationcontrollers"
+       ],
+       "scope": "*"
+      },
+      {
+       "apiGroups": [
+        "*"
+       ],
+       "apiVersions": [
+        "v1"
+       ],
+       "operations": [
+        "CREATE",
+        "UPDATE"
+       ],
+       "resources": [
+        "pods"
+       ],
+       "scope": "*"
+      },
+      {
+       "apiGroups": [
+        "apiextensions.k8s.io"
+       ],
+       "apiVersions": [
+        "*"
+       ],
+       "operations": [
+        "CREATE",
+        "UPDATE",
+        "DELETE"
+       ],
+       "resources": [
+        "customresourcedefinitions"
+       ],
+       "scope": "*"
+      },
+      {
+       "apiGroups": [
+        "apps"
+       ],
+       "apiVersions": [
+        "*"
+       ],
+       "operations": [
+        "CREATE",
+        "UPDATE"
+       ],
+       "resources": [
+        "daemonsets",
+        "deployments",
+        "replicasets",
+        "statefulsets"
+       ],
+       "scope": "*"
+      },
+      {
+       "apiGroups": [
+        "apps"
+       ],
+       "apiVersions": [
+        "*"
+       ],
+       "operations": [
+        "UPDATE"
+       ],
+       "resources": [
+        "daemonsets",
+        "deployments",
+        "replicasets",
+        "statefulsets"
+       ],
+       "scope": "*"
+      },
+      {
+       "apiGroups": [
+        "auto.gke.io"
+       ],
+       "apiVersions": [
+        "v1"
+       ],
+       "operations": [
+        "CREATE",
+        "UPDATE"
+       ],
+       "resources": [
+        "allowlistsynchronizers"
+       ],
+       "scope": "*"
+      },
+      {
+       "apiGroups": [
+        "auto.gke.io"
+       ],
+       "apiVersions": [
+        "v1"
+       ],
+       "operations": [
+        "CREATE",
+        "UPDATE"
+       ],
+       "resources": [
+        "workloadallowlists"
+       ],
+       "scope": "*"
+      },
+      {
+       "apiGroups": [
+        "autoscaling.x-k8s.io",
+        "autoscaling.x-k8s.io"
+       ],
+       "apiVersions": [
+        "v1",
+        "v1beta1"
+       ],
+       "operations": [
+        "CREATE"
+       ],
+       "resources": [
+        "provisioningrequests"
+       ],
+       "scope": "*"
+      },
+      {
+       "apiGroups": [
+        "batch"
+       ],
+       "apiVersions": [
+        "*"
+       ],
+       "operations": [
+        "CREATE",
+        "UPDATE"
+       ],
+       "resources": [
+        "cronjobs"
+       ],
+       "scope": "*"
+      },
+      {
+       "apiGroups": [
+        "batch"
+       ],
+       "apiVersions": [
+        "*"
+       ],
+       "operations": [
+        "UPDATE"
+       ],
+       "resources": [
+        "cronjobs"
+       ],
+       "scope": "*"
+      },
+      {
+       "apiGroups": [
+        "batch"
+       ],
+       "apiVersions": [
+        "*"
+       ],
+       "operations": [
+        "CREATE",
+        "UPDATE"
+       ],
+       "resources": [
+        "jobs"
+       ],
+       "scope": "*"
+      },
+      {
+       "apiGroups": [
+        "batch"
+       ],
+       "apiVersions": [
+        "*"
+       ],
+       "operations": [
+        "UPDATE"
+       ],
+       "resources": [
+        "jobs"
+       ],
+       "scope": "*"
+      },
+      {
+       "apiGroups": [
+        "cilium.io"
+       ],
+       "apiVersions": [
+        "v2"
+       ],
+       "operations": [
+        "CREATE",
+        "UPDATE",
+        "DELETE"
+       ],
+       "resources": [
+        "ciliumnodes"
+       ],
+       "scope": "*"
+      },
+      {
+       "apiGroups": [
+        "cloud.google.com"
+       ],
+       "apiVersions": [
+        "v1"
+       ],
+       "operations": [
+        "CREATE",
+        "UPDATE",
+        "DELETE"
+       ],
+       "resources": [
+        "computeclasses"
+       ],
+       "scope": "*"
+      },
+      {
+       "apiGroups": [
+        "networking.k8s.io"
+       ],
+       "apiVersions": [
+        "*"
+       ],
+       "operations": [
+        "CREATE"
+       ],
+       "resources": [
+        "servicecidrs"
+       ],
+       "scope": "*"
+      },
+      {
+       "apiGroups": [
+        "networking.k8s.io"
+       ],
+       "apiVersions": [
+        "v1"
+       ],
+       "operations": [
+        "CREATE",
+        "UPDATE"
+       ],
+       "resources": [
+        "ingresses"
+       ],
+       "scope": "*"
+      },
+      {
+       "apiGroups": [
+        "rbac.authorization.k8s.io"
+       ],
+       "apiVersions": [
+        "*"
+       ],
+       "operations": [
+        "CREATE",
+        "UPDATE"
+       ],
+       "resources": [
+        "clusterrolebindings",
+        "rolebindings"
+       ],
+       "scope": "*"
+      },
+      {
+       "apiGroups": [
+        ""
+       ],
+       "apiVersions": [
+        "v1"
+       ],
+       "operations": [
+        "CREATE",
+        "UPDATE",
+        "DELETE"
+       ],
+       "resources": [
+        "nodes"
+       ],
+       "scope": "*"
+      },
+      {
+       "apiGroups": [
+        ""
+       ],
+       "apiVersions": [
+        "v1"
+       ],
+       "operations": [
+        "CREATE",
+        "UPDATE"
+       ],
+       "resources": [
+        "podtemplates"
+       ],
+       "scope": "*"
+      },
+      {
+       "apiGroups": [
+        ""
+       ],
+       "apiVersions": [
+        "v1"
+       ],
+       "operations": [
+        "UPDATE"
+       ],
+       "resources": [
+        "podtemplates"
+       ],
+       "scope": "*"
+      },
+      {
+       "apiGroups": [
+        "warden.gke.io"
+       ],
+       "apiVersions": [
+        "*"
+       ],
+       "operations": [
+        "CREATE",
+        "UPDATE",
+        "DELETE"
+       ],
+       "resources": [
+        "*"
+       ],
+       "scope": "*"
+      }
+     ],
      "sideEffects": "None",
      "timeoutSeconds": 10
     }
@@ -133,19 +686,10 @@
    "apiVersion": "admissionregistration.k8s.io/v1",
    "kind": "MutatingWebhookConfiguration",
    "metadata": {
-    "annotations": {
-     "components.gke.io/component-name": "managed-prometheus",
-     "components.gke.io/component-version": "0.18.2-gke.0",
-     "components.gke.io/layer": "addon"
-    },
-    "creationTimestamp": "2026-09-25T16:55:14Z",
-    "generation": 1,
     "labels": {
      "addonmanager.kubernetes.io/mode": "Reconcile"
     },
-    "name": "gmp-operator.gmp-system.monitoring.googleapis.com",
-    "resourceVersion": "1790355314584079007",
-    "uid": "ef7ca3ce-4322-42c8-9d6a-e64fa32aa000"
+    "name": "gmp-operator.gmp-system.monitoring.googleapis.com"
    },
    "webhooks": [
     {
@@ -163,7 +707,26 @@
      "failurePolicy": "Ignore",
      "matchPolicy": "Equivalent",
      "name": "default.operatorconfigs.gmp-operator.gmp-system.monitoring.googleapis.com",
+     "namespaceSelector": {},
+     "objectSelector": {},
      "reinvocationPolicy": "Never",
+     "rules": [
+      {
+       "apiGroups": [
+        "monitoring.googleapis.com"
+       ],
+       "apiVersions": [
+        "v1"
+       ],
+       "operations": [
+        "UPDATE"
+       ],
+       "resources": [
+        "operatorconfigs"
+       ],
+       "scope": "*"
+      }
+     ],
      "sideEffects": "None",
      "timeoutSeconds": 10
     }
@@ -173,14 +736,10 @@
    "apiVersion": "admissionregistration.k8s.io/v1",
    "kind": "MutatingWebhookConfiguration",
    "metadata": {
-    "creationTimestamp": "2026-09-25T16:54:35Z",
-    "generation": 1,
     "labels": {
      "networking.gke.io/common-webhooks": "true"
     },
-    "name": "warden-mutating.config.common-webhooks.networking.gke.io",
-    "resourceVersion": "1790355275861535006",
-    "uid": "8c90b2bf-13f7-4304-b892-43fd95a21acb"
+    "name": "warden-mutating.config.common-webhooks.networking.gke.io"
    },
    "webhooks": [
     {
@@ -193,7 +752,314 @@
      "failurePolicy": "Fail",
      "matchPolicy": "Equivalent",
      "name": "warden-mutating.common-webhooks.networking.gke.io",
+     "namespaceSelector": {},
+     "objectSelector": {},
      "reinvocationPolicy": "Never",
+     "rules": [
+      {
+       "apiGroups": [
+        ""
+       ],
+       "apiVersions": [
+        "*"
+       ],
+       "operations": [
+        "CREATE",
+        "UPDATE"
+       ],
+       "resources": [
+        "pods/ephemeralcontainers"
+       ],
+       "scope": "*"
+      },
+      {
+       "apiGroups": [
+        ""
+       ],
+       "apiVersions": [
+        "*"
+       ],
+       "operations": [
+        "CREATE"
+       ],
+       "resources": [
+        "pods"
+       ],
+       "scope": "*"
+      },
+      {
+       "apiGroups": [
+        ""
+       ],
+       "apiVersions": [
+        "*"
+       ],
+       "operations": [
+        "CREATE",
+        "UPDATE"
+       ],
+       "resources": [
+        "replicationcontrollers"
+       ],
+       "scope": "*"
+      },
+      {
+       "apiGroups": [
+        "apps"
+       ],
+       "apiVersions": [
+        "*"
+       ],
+       "operations": [
+        "CREATE",
+        "UPDATE"
+       ],
+       "resources": [
+        "daemonsets",
+        "deployments",
+        "replicasets",
+        "statefulsets"
+       ],
+       "scope": "*"
+      },
+      {
+       "apiGroups": [
+        "apps"
+       ],
+       "apiVersions": [
+        "v1"
+       ],
+       "operations": [
+        "CREATE",
+        "UPDATE"
+       ],
+       "resources": [
+        "daemonsets",
+        "deployments",
+        "replicasets",
+        "statefulsets"
+       ],
+       "scope": "*"
+      },
+      {
+       "apiGroups": [
+        "apps"
+       ],
+       "apiVersions": [
+        "v1"
+       ],
+       "operations": [
+        "CREATE"
+       ],
+       "resources": [
+        "daemonsets"
+       ],
+       "scope": "*"
+      },
+      {
+       "apiGroups": [
+        "batch"
+       ],
+       "apiVersions": [
+        "*"
+       ],
+       "operations": [
+        "CREATE",
+        "UPDATE"
+       ],
+       "resources": [
+        "cronjobs"
+       ],
+       "scope": "*"
+      },
+      {
+       "apiGroups": [
+        "batch"
+       ],
+       "apiVersions": [
+        "*"
+       ],
+       "operations": [
+        "CREATE"
+       ],
+       "resources": [
+        "jobs"
+       ],
+       "scope": "*"
+      },
+      {
+       "apiGroups": [
+        "batch"
+       ],
+       "apiVersions": [
+        "v1",
+        "v1beta1"
+       ],
+       "operations": [
+        "CREATE",
+        "UPDATE"
+       ],
+       "resources": [
+        "cronjobs"
+       ],
+       "scope": "*"
+      },
+      {
+       "apiGroups": [
+        "batch"
+       ],
+       "apiVersions": [
+        "v1",
+        "v1beta1"
+       ],
+       "operations": [
+        "CREATE"
+       ],
+       "resources": [
+        "jobs"
+       ],
+       "scope": "*"
+      },
+      {
+       "apiGroups": [
+        "batch"
+       ],
+       "apiVersions": [
+        "v1"
+       ],
+       "operations": [
+        "CREATE"
+       ],
+       "resources": [
+        "jobs"
+       ],
+       "scope": "*"
+      },
+      {
+       "apiGroups": [
+        "cloud.google.com"
+       ],
+       "apiVersions": [
+        "v1"
+       ],
+       "operations": [
+        "CREATE",
+        "UPDATE"
+       ],
+       "resources": [
+        "computeclasses"
+       ],
+       "scope": "*"
+      },
+      {
+       "apiGroups": [
+        "storage.k8s.io"
+       ],
+       "apiVersions": [
+        "v1"
+       ],
+       "operations": [
+        "CREATE"
+       ],
+       "resources": [
+        "storageclasses"
+       ],
+       "scope": "*"
+      },
+      {
+       "apiGroups": [
+        ""
+       ],
+       "apiVersions": [
+        "v1"
+       ],
+       "operations": [
+        "CREATE"
+       ],
+       "resources": [
+        "persistentvolumes"
+       ],
+       "scope": "*"
+      },
+      {
+       "apiGroups": [
+        ""
+       ],
+       "apiVersions": [
+        "v1"
+       ],
+       "operations": [
+        "CREATE"
+       ],
+       "resources": [
+        "pods"
+       ],
+       "scope": "*"
+      },
+      {
+       "apiGroups": [
+        ""
+       ],
+       "apiVersions": [
+        "v1"
+       ],
+       "operations": [
+        "CREATE",
+        "UPDATE"
+       ],
+       "resources": [
+        "pods"
+       ],
+       "scope": "*"
+      },
+      {
+       "apiGroups": [
+        ""
+       ],
+       "apiVersions": [
+        "v1"
+       ],
+       "operations": [
+        "CREATE"
+       ],
+       "resources": [
+        "podtemplates"
+       ],
+       "scope": "*"
+      },
+      {
+       "apiGroups": [
+        ""
+       ],
+       "apiVersions": [
+        "v1"
+       ],
+       "operations": [
+        "CREATE",
+        "UPDATE"
+       ],
+       "resources": [
+        "podtemplates"
+       ],
+       "scope": "*"
+      },
+      {
+       "apiGroups": [
+        ""
+       ],
+       "apiVersions": [
+        "v1"
+       ],
+       "operations": [
+        "CREATE",
+        "UPDATE"
+       ],
+       "resources": [
+        "replicationcontrollers"
+       ],
+       "scope": "*"
+      }
+     ],
      "sideEffects": "None",
      "timeoutSeconds": 10
     }

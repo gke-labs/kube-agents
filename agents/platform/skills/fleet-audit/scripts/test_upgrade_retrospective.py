@@ -545,6 +545,36 @@ class ClassifierSignatureTest(unittest.TestCase):
         held = [s for s in symptoms_of("seeded-a") if s["category"] == "pdb"]
         self.assertIn("drain held past an hour per node", held[0]["classifications"][0]["detail"])
 
+    def test_entry_1_names_the_held_pool_among_several_touched(self):
+        # Spread the budget's pods over default-pool (drained in 9 min) and pinned-inference-pool (held 63 min).
+        pods = copy.deepcopy(READS["seeded-a"]["pods"])
+        running = next(p for p in pods if p["metadata"]["name"] == "inference-server-778b78fdb8-txlv7")
+        extra = copy.deepcopy(running)
+        extra["metadata"]["name"] = "inference-server-778b78fdb8-extra"
+        extra["spec"]["nodeName"] = "gke-seeded-a-default-pool-62ac8ee0-d595"
+        rows = [s for s in symptoms_of("seeded-a", reads={**READS["seeded-a"], "pods": pods + [extra]}) if s["category"] == "pdb"]
+        self.assertEqual(rows[0]["upgraded_pools"], ["default-pool", "pinned-inference-pool"])
+        [c] = rows[0]["classifications"]
+        self.assertEqual((c["entry"], c["confidence"]), (1, ur.HIGH))
+        self.assertIn("pods on default-pool, pinned-inference-pool; UPGRADE_NODES operation-1791433235916-c1860f09-e11c-4fe1-b75b-40cf815a7e81 on pinned-inference-pool took 63 min", c["evidence"])
+        self.assertIn("drain held past an hour per node on pinned-inference-pool", c["detail"])
+
+    def test_timestamps_survive_under_their_own_keys(self):
+        nodes = copy.deepcopy(READS["seeded-a"]["nodes"])
+        broken = next(n for n in nodes if n["metadata"]["labels"]["cloud.google.com/gke-nodepool"] == "idle-batch-pool")
+        for cond in broken["status"]["conditions"]:
+            if cond["type"] == "Ready":
+                cond["status"], cond["lastTransitionTime"] = "False", "2026-10-08T03:50:00Z"
+        reads = {**READS["seeded-a"], "nodes": nodes}
+        symptoms = symptoms_of("seeded-a", reads=reads)
+        ur.mark_since(symptoms, None)
+        node = next(s for s in symptoms if s["category"] == "node")
+        self.assertEqual((node["onset"], node["since"]), ("2026-10-08T03:50:00Z", ur.SINCE_FIRST_SEEN))
+        self.assertIn("NotReady since 2026-10-08T03:50:00Z after UPGRADE_NODES on idle-batch-pool", node["classifications"][0]["evidence"])
+        payments = next(s for s in symptoms if s["object"] == PAYMENTS)
+        self.assertTrue(payments["started"])
+        self.assertEqual(payments["since"], ur.SINCE_FIRST_SEEN)
+
     def test_entry_14_high_needs_a_runtime_image_on_a_touched_v2_pool(self):
         jvm = pod("jvm", images=["eclipse-temurin:8u302-jre"], statuses=[oom()])
         [row] = self.classify(pods=[jvm])
@@ -754,7 +784,8 @@ class ShapeTest(unittest.TestCase):
         self.assertEqual({(s["object"], s["confidence"]) for s in high}, {("PersistentVolume/intree-pd", ur.HIGH), ("StorageClass/standard", ur.HIGH)})
 
     def test_entry_7_fail_closed_webhook_without_endpoints(self):
-        config = {"kind": "ValidatingWebhookConfiguration", "metadata": {"name": "gate"}, "webhooks": [{"name": "gate.example.io", "failurePolicy": "Fail", "clientConfig": {"service": {"namespace": "apps", "name": "gate"}}}]}
+        pod_rule = [{"apiGroups": [""], "apiVersions": ["v1"], "resources": ["pods"], "operations": ["CREATE"]}]
+        config = {"kind": "ValidatingWebhookConfiguration", "metadata": {"name": "gate"}, "webhooks": [{"name": "gate.example.io", "failurePolicy": "Fail", "rules": pod_rule, "clientConfig": {"service": {"namespace": "apps", "name": "gate"}}}]}
         [shape] = ur.webhook_shapes([config], READS["seeded-a"]["endpointslices"])
         self.assertEqual((shape["object"], shape["entry"], shape["confidence"]), ("ValidatingWebhookConfiguration/gate", 7, ur.HIGH))
         self.assertIn("timeout 10s, no namespaceSelector; Service apps/gate has no ready endpoint", shape["evidence"])
@@ -770,6 +801,16 @@ class ShapeTest(unittest.TestCase):
         self.assertEqual(ur.webhook_shapes(READS["seeded-a"]["webhooks"], READS["seeded-a"]["endpointslices"]), [])
         # Without the endpoint read the check cannot run.
         self.assertEqual(ur.webhook_shapes([config], None), [])
+        # Rules decide whether the hook can stop a drain at all: the fleet's planted
+        # seeded-fail-closed-gate (configmaps CREATE) matches no pod and is not entry 7.
+        gate = copy.deepcopy(config)
+        gate["webhooks"][0]["rules"] = [{"apiGroups": [""], "apiVersions": ["v1"], "resources": ["configmaps"], "operations": ["CREATE"]}]
+        self.assertEqual(ur.webhook_shapes([gate], READS["seeded-a"]["endpointslices"]), [])
+        gate["webhooks"][0].pop("rules")
+        self.assertEqual(ur.webhook_shapes([gate], READS["seeded-a"]["endpointslices"]), [])
+        gate["webhooks"][0]["rules"] = [{"apiGroups": ["*"], "apiVersions": ["*"], "resources": ["*"], "operations": ["*"]}]
+        self.assertEqual(len(ur.webhook_shapes([gate], READS["seeded-a"]["endpointslices"])), 1)
+        self.assertTrue(all(w.get("rules") for i in READS["seeded-a"]["webhooks"] for w in i["webhooks"]), "the fixture carries the real rules")
 
     def test_shapes_from_a_bare_pod_and_affinity_and_local_ssd(self):
         bare = pod("edge", images=["gcr.io/google-containers/pause:3.2"])
@@ -1375,6 +1416,44 @@ class LedgerAndGuardsTest(unittest.TestCase):
         self.assertEqual(len(list(reports.glob("*.json"))), 2 * ur.REPORTS_KEPT)
         self.assertTrue((reports / "notes.md").exists())
 
+    def test_report_may_not_be_named_after_the_link(self):
+        with mock.patch.object(ur, "default_run", FakeFleet()), mock.patch.object(ur, "now_utc", lambda: NOW):
+            with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()) as err:
+                rc = ur.main(["--project", PROJECT, "--report", str(self.home / ur.REPORTS_SUBDIR / ur.LATEST_REPORT_LINK)])
+        self.assertEqual(rc, ur.EXIT_USAGE)
+        self.assertIn("must not be named", err.getvalue())
+        self.assertFalse((self.home / ur.REPORTS_SUBDIR).exists())
+        self.assertFalse((self.home / ur.LEDGER_FILENAME).exists())
+
+    def test_non_utf8_state_file_is_set_aside_like_any_other(self):
+        (self.home / ur.LEDGER_FILENAME).write_bytes(b'{"version": 1, "clusters": {}, "x": "\xff\xfe"}')
+        with self.assertRaises(ur.StateUnreadable) as caught:
+            self.collect()
+        self.assertIn("is unreadable", str(caught.exception))
+        self.assertTrue(list(self.home.glob(ur.CRASH_RECORD_GLOB)))
+
+    def test_set_aside_says_when_the_move_failed(self):
+        (self.home / ur.LEDGER_FILENAME).write_text("{broken")
+        with mock.patch.object(ur.os, "replace", side_effect=PermissionError("read-only directory")):
+            with self.assertRaises(ur.StateUnreadable) as caught:
+                self.collect()
+        self.assertIn("could not be moved aside (read-only directory); it is unchanged in place", str(caught.exception))
+        self.assertNotIn("moved to", str(caught.exception))
+        self.assertEqual((self.home / ur.LEDGER_FILENAME).read_text(), "{broken")
+
+    def test_checked_list_omits_checks_whose_core_reads_failed(self):
+        clean_reads = {**READS["seeded-a"], "events": [], "pdbs": [], "workloads": [], "storage": []}
+        with mock.patch.dict(READS, {"seeded-a": clean_reads}):
+            result, _ = self.collect(FakeFleet(kubectl_fail=[("seeded-a", "pods"), ("seeded-a", "nodes")]), cluster=[SEEDED])
+        block = ur.render_report(result).split(f"### {SEEDED}")[1]
+        self.assertIn(ur.PARTIAL_READ_TEXT.format(failed="pods, nodes"), block)
+        risks = next(line for line in block.splitlines() if line.startswith(ur.PART_RISKS))
+        checked, _, skipped = risks.partition(ur.NOT_CHECKED_TEXT)
+        for entry in ("(12)", "(20)", "(4)", "(18)", "(14;"):
+            self.assertNotIn(entry, checked)
+            self.assertIn(entry, skipped)
+        self.assertIn("(19)", checked)
+
     def test_store_defaults_live_under_the_store_home(self):
         result, _ = self.collect()
         self.assertEqual(Path(result["ledger_path"]), self.home / ur.LEDGER_FILENAME)
@@ -1638,8 +1717,10 @@ class MitigationTableTest(unittest.TestCase):
 
 class DefaultRunTest(unittest.TestCase):
     def test_timeout_and_missing_binary(self):
-        result = ur.default_run(["python3", "-c", "import time; time.sleep(5)"], timeout=1)
+        result = ur.default_run([sys.executable, "-c", "import sys, time; print('partial', flush=True); time.sleep(5)"], timeout=1)
         self.assertEqual(result.rc, ur.TIMEOUT_RC)
+        self.assertIsInstance(result.stdout, str)
+        self.assertIn("partial", result.stdout)
         self.assertEqual(ur.default_run(["/nonexistent/binary"]).rc, -1)
 
 

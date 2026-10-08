@@ -5,19 +5,10 @@
    "apiVersion": "admissionregistration.k8s.io/v1",
    "kind": "ValidatingWebhookConfiguration",
    "metadata": {
-    "annotations": {
-     "components.gke.io/component-name": "managed-prometheus",
-     "components.gke.io/component-version": "0.15.3-gke.11",
-     "components.gke.io/layer": "addon"
-    },
-    "creationTimestamp": "2026-09-24T17:38:10Z",
-    "generation": 1,
     "labels": {
      "addonmanager.kubernetes.io/mode": "Reconcile"
     },
-    "name": "gmp-operator.gmp-system.monitoring.googleapis.com",
-    "resourceVersion": "1790273065266255020",
-    "uid": "7d4ada2b-7a75-44b5-bf98-0a8d36c8db0d"
+    "name": "gmp-operator.gmp-system.monitoring.googleapis.com"
    },
    "webhooks": [
     {
@@ -35,6 +26,26 @@
      "failurePolicy": "Fail",
      "matchPolicy": "Equivalent",
      "name": "validate.podmonitorings.gmp-operator.gmp-system.monitoring.googleapis.com",
+     "namespaceSelector": {},
+     "objectSelector": {},
+     "rules": [
+      {
+       "apiGroups": [
+        "monitoring.googleapis.com"
+       ],
+       "apiVersions": [
+        "v1"
+       ],
+       "operations": [
+        "CREATE",
+        "UPDATE"
+       ],
+       "resources": [
+        "podmonitorings"
+       ],
+       "scope": "*"
+      }
+     ],
      "sideEffects": "None",
      "timeoutSeconds": 10
     },
@@ -53,6 +64,26 @@
      "failurePolicy": "Fail",
      "matchPolicy": "Equivalent",
      "name": "validate.clusterpodmonitorings.gmp-operator.gmp-system.monitoring.googleapis.com",
+     "namespaceSelector": {},
+     "objectSelector": {},
+     "rules": [
+      {
+       "apiGroups": [
+        "monitoring.googleapis.com"
+       ],
+       "apiVersions": [
+        "v1"
+       ],
+       "operations": [
+        "CREATE",
+        "UPDATE"
+       ],
+       "resources": [
+        "clusterpodmonitorings"
+       ],
+       "scope": "*"
+      }
+     ],
      "sideEffects": "None",
      "timeoutSeconds": 10
     },
@@ -71,6 +102,26 @@
      "failurePolicy": "Fail",
      "matchPolicy": "Equivalent",
      "name": "validate.clusternodemonitorings.gmp-operator.gmp-system.monitoring.googleapis.com",
+     "namespaceSelector": {},
+     "objectSelector": {},
+     "rules": [
+      {
+       "apiGroups": [
+        "monitoring.googleapis.com"
+       ],
+       "apiVersions": [
+        "v1"
+       ],
+       "operations": [
+        "CREATE",
+        "UPDATE"
+       ],
+       "resources": [
+        "clusternodemonitorings"
+       ],
+       "scope": "*"
+      }
+     ],
      "sideEffects": "None",
      "timeoutSeconds": 10
     },
@@ -89,6 +140,26 @@
      "failurePolicy": "Fail",
      "matchPolicy": "Equivalent",
      "name": "validate.rules.gmp-operator.gmp-system.monitoring.googleapis.com",
+     "namespaceSelector": {},
+     "objectSelector": {},
+     "rules": [
+      {
+       "apiGroups": [
+        "monitoring.googleapis.com"
+       ],
+       "apiVersions": [
+        "v1"
+       ],
+       "operations": [
+        "CREATE",
+        "UPDATE"
+       ],
+       "resources": [
+        "rules"
+       ],
+       "scope": "*"
+      }
+     ],
      "sideEffects": "None",
      "timeoutSeconds": 10
     },
@@ -107,6 +178,26 @@
      "failurePolicy": "Fail",
      "matchPolicy": "Equivalent",
      "name": "validate.clusterrules.gmp-operator.gmp-system.monitoring.googleapis.com",
+     "namespaceSelector": {},
+     "objectSelector": {},
+     "rules": [
+      {
+       "apiGroups": [
+        "monitoring.googleapis.com"
+       ],
+       "apiVersions": [
+        "v1"
+       ],
+       "operations": [
+        "CREATE",
+        "UPDATE"
+       ],
+       "resources": [
+        "clusterrules"
+       ],
+       "scope": "*"
+      }
+     ],
      "sideEffects": "None",
      "timeoutSeconds": 10
     },
@@ -125,6 +216,26 @@
      "failurePolicy": "Fail",
      "matchPolicy": "Equivalent",
      "name": "validate.globalrules.gmp-operator.gmp-system.monitoring.googleapis.com",
+     "namespaceSelector": {},
+     "objectSelector": {},
+     "rules": [
+      {
+       "apiGroups": [
+        "monitoring.googleapis.com"
+       ],
+       "apiVersions": [
+        "v1"
+       ],
+       "operations": [
+        "CREATE",
+        "UPDATE"
+       ],
+       "resources": [
+        "globalrules"
+       ],
+       "scope": "*"
+      }
+     ],
      "sideEffects": "None",
      "timeoutSeconds": 10
     },
@@ -143,6 +254,26 @@
      "failurePolicy": "Fail",
      "matchPolicy": "Equivalent",
      "name": "validate.operatorconfigs.gmp-operator.gmp-system.monitoring.googleapis.com",
+     "namespaceSelector": {},
+     "objectSelector": {},
+     "rules": [
+      {
+       "apiGroups": [
+        "monitoring.googleapis.com"
+       ],
+       "apiVersions": [
+        "v1"
+       ],
+       "operations": [
+        "CREATE",
+        "UPDATE"
+       ],
+       "resources": [
+        "operatorconfigs"
+       ],
+       "scope": "*"
+      }
+     ],
      "sideEffects": "None",
      "timeoutSeconds": 10
     }
@@ -152,14 +283,10 @@
    "apiVersion": "admissionregistration.k8s.io/v1",
    "kind": "ValidatingWebhookConfiguration",
    "metadata": {
-    "creationTimestamp": "2026-09-24T17:37:37Z",
-    "generation": 2,
     "labels": {
      "networking.gke.io/common-webhooks": "true"
     },
-    "name": "warden-validating.config.common-webhooks.networking.gke.io",
-    "resourceVersion": "1790273034236415006",
-    "uid": "8533e239-7515-473f-81f7-24e6190dc899"
+    "name": "warden-validating.config.common-webhooks.networking.gke.io"
    },
    "webhooks": [
     {
@@ -172,6 +299,399 @@
      "failurePolicy": "Fail",
      "matchPolicy": "Equivalent",
      "name": "warden-validating.common-webhooks.networking.gke.io",
+     "namespaceSelector": {},
+     "objectSelector": {},
+     "rules": [
+      {
+       "apiGroups": [
+        ""
+       ],
+       "apiVersions": [
+        "*"
+       ],
+       "operations": [
+        "CREATE",
+        "UPDATE"
+       ],
+       "resources": [
+        "pods/ephemeralcontainers"
+       ],
+       "scope": "*"
+      },
+      {
+       "apiGroups": [
+        ""
+       ],
+       "apiVersions": [
+        "*"
+       ],
+       "operations": [
+        "UPDATE"
+       ],
+       "resources": [
+        "pods/ephemeralcontainers"
+       ],
+       "scope": "*"
+      },
+      {
+       "apiGroups": [
+        ""
+       ],
+       "apiVersions": [
+        "*"
+       ],
+       "operations": [
+        "CREATE",
+        "UPDATE"
+       ],
+       "resources": [
+        "pods"
+       ],
+       "scope": "*"
+      },
+      {
+       "apiGroups": [
+        ""
+       ],
+       "apiVersions": [
+        "*"
+       ],
+       "operations": [
+        "UPDATE"
+       ],
+       "resources": [
+        "pods"
+       ],
+       "scope": "*"
+      },
+      {
+       "apiGroups": [
+        ""
+       ],
+       "apiVersions": [
+        "*"
+       ],
+       "operations": [
+        "CREATE",
+        "UPDATE"
+       ],
+       "resources": [
+        "replicationcontrollers"
+       ],
+       "scope": "*"
+      },
+      {
+       "apiGroups": [
+        ""
+       ],
+       "apiVersions": [
+        "*"
+       ],
+       "operations": [
+        "UPDATE"
+       ],
+       "resources": [
+        "replicationcontrollers"
+       ],
+       "scope": "*"
+      },
+      {
+       "apiGroups": [
+        "apiextensions.k8s.io"
+       ],
+       "apiVersions": [
+        "*"
+       ],
+       "operations": [
+        "CREATE",
+        "UPDATE",
+        "DELETE"
+       ],
+       "resources": [
+        "customresourcedefinitions"
+       ],
+       "scope": "*"
+      },
+      {
+       "apiGroups": [
+        "apps"
+       ],
+       "apiVersions": [
+        "*"
+       ],
+       "operations": [
+        "CREATE",
+        "UPDATE"
+       ],
+       "resources": [
+        "daemonsets",
+        "deployments",
+        "replicasets",
+        "statefulsets"
+       ],
+       "scope": "*"
+      },
+      {
+       "apiGroups": [
+        "apps"
+       ],
+       "apiVersions": [
+        "*"
+       ],
+       "operations": [
+        "UPDATE"
+       ],
+       "resources": [
+        "daemonsets",
+        "deployments",
+        "replicasets",
+        "statefulsets"
+       ],
+       "scope": "*"
+      },
+      {
+       "apiGroups": [
+        "auto.gke.io"
+       ],
+       "apiVersions": [
+        "v1"
+       ],
+       "operations": [
+        "CREATE",
+        "UPDATE"
+       ],
+       "resources": [
+        "allowlistsynchronizers"
+       ],
+       "scope": "*"
+      },
+      {
+       "apiGroups": [
+        "auto.gke.io"
+       ],
+       "apiVersions": [
+        "v1"
+       ],
+       "operations": [
+        "CREATE",
+        "UPDATE"
+       ],
+       "resources": [
+        "workloadallowlists"
+       ],
+       "scope": "*"
+      },
+      {
+       "apiGroups": [
+        "autoscaling.x-k8s.io",
+        "autoscaling.x-k8s.io"
+       ],
+       "apiVersions": [
+        "v1",
+        "v1beta1"
+       ],
+       "operations": [
+        "CREATE"
+       ],
+       "resources": [
+        "provisioningrequests"
+       ],
+       "scope": "*"
+      },
+      {
+       "apiGroups": [
+        "batch"
+       ],
+       "apiVersions": [
+        "*"
+       ],
+       "operations": [
+        "CREATE",
+        "UPDATE"
+       ],
+       "resources": [
+        "cronjobs"
+       ],
+       "scope": "*"
+      },
+      {
+       "apiGroups": [
+        "batch"
+       ],
+       "apiVersions": [
+        "*"
+       ],
+       "operations": [
+        "UPDATE"
+       ],
+       "resources": [
+        "cronjobs"
+       ],
+       "scope": "*"
+      },
+      {
+       "apiGroups": [
+        "batch"
+       ],
+       "apiVersions": [
+        "*"
+       ],
+       "operations": [
+        "CREATE",
+        "UPDATE"
+       ],
+       "resources": [
+        "jobs"
+       ],
+       "scope": "*"
+      },
+      {
+       "apiGroups": [
+        "batch"
+       ],
+       "apiVersions": [
+        "*"
+       ],
+       "operations": [
+        "UPDATE"
+       ],
+       "resources": [
+        "jobs"
+       ],
+       "scope": "*"
+      },
+      {
+       "apiGroups": [
+        "cilium.io"
+       ],
+       "apiVersions": [
+        "v2"
+       ],
+       "operations": [
+        "CREATE",
+        "UPDATE",
+        "DELETE"
+       ],
+       "resources": [
+        "ciliumnodes"
+       ],
+       "scope": "*"
+      },
+      {
+       "apiGroups": [
+        "cloud.google.com"
+       ],
+       "apiVersions": [
+        "v1"
+       ],
+       "operations": [
+        "CREATE",
+        "UPDATE",
+        "DELETE"
+       ],
+       "resources": [
+        "computeclasses"
+       ],
+       "scope": "*"
+      },
+      {
+       "apiGroups": [
+        "networking.k8s.io"
+       ],
+       "apiVersions": [
+        "*"
+       ],
+       "operations": [
+        "CREATE"
+       ],
+       "resources": [
+        "servicecidrs"
+       ],
+       "scope": "*"
+      },
+      {
+       "apiGroups": [
+        "rbac.authorization.k8s.io"
+       ],
+       "apiVersions": [
+        "*"
+       ],
+       "operations": [
+        "CREATE",
+        "UPDATE"
+       ],
+       "resources": [
+        "clusterrolebindings",
+        "rolebindings"
+       ],
+       "scope": "*"
+      },
+      {
+       "apiGroups": [
+        ""
+       ],
+       "apiVersions": [
+        "v1"
+       ],
+       "operations": [
+        "CREATE",
+        "UPDATE",
+        "DELETE"
+       ],
+       "resources": [
+        "nodes"
+       ],
+       "scope": "*"
+      },
+      {
+       "apiGroups": [
+        ""
+       ],
+       "apiVersions": [
+        "v1"
+       ],
+       "operations": [
+        "CREATE",
+        "UPDATE"
+       ],
+       "resources": [
+        "podtemplates"
+       ],
+       "scope": "*"
+      },
+      {
+       "apiGroups": [
+        ""
+       ],
+       "apiVersions": [
+        "v1"
+       ],
+       "operations": [
+        "UPDATE"
+       ],
+       "resources": [
+        "podtemplates"
+       ],
+       "scope": "*"
+      },
+      {
+       "apiGroups": [
+        "warden.gke.io"
+       ],
+       "apiVersions": [
+        "*"
+       ],
+       "operations": [
+        "CREATE",
+        "UPDATE",
+        "DELETE"
+       ],
+       "resources": [
+        "*"
+       ],
+       "scope": "*"
+      }
+     ],
      "sideEffects": "None",
      "timeoutSeconds": 10
     }
@@ -181,19 +701,10 @@
    "apiVersion": "admissionregistration.k8s.io/v1",
    "kind": "MutatingWebhookConfiguration",
    "metadata": {
-    "annotations": {
-     "components.gke.io/component-name": "managed-prometheus",
-     "components.gke.io/component-version": "0.15.3-gke.11",
-     "components.gke.io/layer": "addon"
-    },
-    "creationTimestamp": "2026-09-24T17:38:09Z",
-    "generation": 1,
     "labels": {
      "addonmanager.kubernetes.io/mode": "Reconcile"
     },
-    "name": "gmp-operator.gmp-system.monitoring.googleapis.com",
-    "resourceVersion": "1790273064966943007",
-    "uid": "8ebe1fe5-6ba0-404e-a793-efc5b64690e2"
+    "name": "gmp-operator.gmp-system.monitoring.googleapis.com"
    },
    "webhooks": [
     {
@@ -211,7 +722,27 @@
      "failurePolicy": "Fail",
      "matchPolicy": "Equivalent",
      "name": "default.podmonitorings.gmp-operator.gmp-system.monitoring.googleapis.com",
+     "namespaceSelector": {},
+     "objectSelector": {},
      "reinvocationPolicy": "Never",
+     "rules": [
+      {
+       "apiGroups": [
+        "monitoring.googleapis.com"
+       ],
+       "apiVersions": [
+        "v1"
+       ],
+       "operations": [
+        "CREATE",
+        "UPDATE"
+       ],
+       "resources": [
+        "podmonitorings"
+       ],
+       "scope": "*"
+      }
+     ],
      "sideEffects": "None",
      "timeoutSeconds": 10
     },
@@ -230,7 +761,27 @@
      "failurePolicy": "Fail",
      "matchPolicy": "Equivalent",
      "name": "default.clusterpodmonitorings.gmp-operator.gmp-system.monitoring.googleapis.com",
+     "namespaceSelector": {},
+     "objectSelector": {},
      "reinvocationPolicy": "Never",
+     "rules": [
+      {
+       "apiGroups": [
+        "monitoring.googleapis.com"
+       ],
+       "apiVersions": [
+        "v1"
+       ],
+       "operations": [
+        "CREATE",
+        "UPDATE"
+       ],
+       "resources": [
+        "clusterpodmonitorings"
+       ],
+       "scope": "*"
+      }
+     ],
      "sideEffects": "None",
      "timeoutSeconds": 10
     },
@@ -249,7 +800,26 @@
      "failurePolicy": "Ignore",
      "matchPolicy": "Equivalent",
      "name": "default.operatorconfigs.gmp-operator.gmp-system.monitoring.googleapis.com",
+     "namespaceSelector": {},
+     "objectSelector": {},
      "reinvocationPolicy": "Never",
+     "rules": [
+      {
+       "apiGroups": [
+        "monitoring.googleapis.com"
+       ],
+       "apiVersions": [
+        "v1"
+       ],
+       "operations": [
+        "UPDATE"
+       ],
+       "resources": [
+        "operatorconfigs"
+       ],
+       "scope": "*"
+      }
+     ],
      "sideEffects": "None",
      "timeoutSeconds": 10
     }
@@ -259,14 +829,10 @@
    "apiVersion": "admissionregistration.k8s.io/v1",
    "kind": "MutatingWebhookConfiguration",
    "metadata": {
-    "creationTimestamp": "2026-09-24T17:37:38Z",
-    "generation": 1,
     "labels": {
      "networking.gke.io/common-webhooks": "true"
     },
-    "name": "warden-mutating.config.common-webhooks.networking.gke.io",
-    "resourceVersion": "1790271459004783006",
-    "uid": "33b72966-e4e4-4a8b-b9cc-046ab33db6fc"
+    "name": "warden-mutating.config.common-webhooks.networking.gke.io"
    },
    "webhooks": [
     {
@@ -279,7 +845,103 @@
      "failurePolicy": "Fail",
      "matchPolicy": "Equivalent",
      "name": "warden-mutating.common-webhooks.networking.gke.io",
+     "namespaceSelector": {},
+     "objectSelector": {},
      "reinvocationPolicy": "Never",
+     "rules": [
+      {
+       "apiGroups": [
+        ""
+       ],
+       "apiVersions": [
+        "*"
+       ],
+       "operations": [
+        "CREATE"
+       ],
+       "resources": [
+        "pods"
+       ],
+       "scope": "*"
+      },
+      {
+       "apiGroups": [
+        "batch"
+       ],
+       "apiVersions": [
+        "v1"
+       ],
+       "operations": [
+        "CREATE"
+       ],
+       "resources": [
+        "jobs"
+       ],
+       "scope": "*"
+      },
+      {
+       "apiGroups": [
+        "storage.k8s.io"
+       ],
+       "apiVersions": [
+        "v1"
+       ],
+       "operations": [
+        "CREATE"
+       ],
+       "resources": [
+        "storageclasses"
+       ],
+       "scope": "*"
+      },
+      {
+       "apiGroups": [
+        ""
+       ],
+       "apiVersions": [
+        "v1"
+       ],
+       "operations": [
+        "CREATE"
+       ],
+       "resources": [
+        "persistentvolumes"
+       ],
+       "scope": "*"
+      },
+      {
+       "apiGroups": [
+        ""
+       ],
+       "apiVersions": [
+        "v1"
+       ],
+       "operations": [
+        "CREATE",
+        "UPDATE"
+       ],
+       "resources": [
+        "pods"
+       ],
+       "scope": "*"
+      },
+      {
+       "apiGroups": [
+        ""
+       ],
+       "apiVersions": [
+        "v1"
+       ],
+       "operations": [
+        "CREATE",
+        "UPDATE"
+       ],
+       "resources": [
+        "podtemplates"
+       ],
+       "scope": "*"
+      }
+     ],
      "sideEffects": "None",
      "timeoutSeconds": 10
     }
