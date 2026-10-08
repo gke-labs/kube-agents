@@ -311,6 +311,40 @@ func TestABridgeDeclaredUnderAnotherNameStillWins(t *testing.T) {
 	}
 }
 
+// The bridge runs Hermes against the agent's profile state, so it inherits the
+// agent container's env: every entry but the dropped names reaches it once,
+// value or valueFrom as written. Checked entry by entry, so a duplicated or
+// shadowed name fails rather than collapsing in an index.
+func TestTheRenderedBridgeCarriesTheAgentsEnvExceptTheDroppedNames(t *testing.T) {
+	pod := bridgeTestPod(provisionedAgent())
+	b := containersNamed(pod, a2aBridgeContainerName)[0]
+	agentC := containersNamed(pod, "platform-agent")[0]
+	dropped := a2aBridgeDroppedAgentEnv
+	carried := 0
+	for _, want := range agentC.Env {
+		var got []corev1.EnvVar
+		for _, e := range b.Env {
+			if e.Name == want.Name {
+				got = append(got, e)
+			}
+		}
+		if dropped[want.Name] {
+			// The bridge sets some of these itself (NATS_URL, the activity
+			// secret), with values that may match the agent's; the drop is
+			// held by the tests that name each one.
+			continue
+		}
+		if len(got) != 1 || !reflect.DeepEqual(got[0], want) {
+			t.Errorf("the agent's %s reaches the bridge as %+v, want it once as %+v", want.Name, got, want)
+			continue
+		}
+		carried++
+	}
+	if carried == 0 {
+		t.Fatal("no agent env entry reached the bridge; the probe is vacuous")
+	}
+}
+
 // The bridge binary doesn't need BRIDGE_CONCURRENCY set, so a sidecar running
 // the hermes-bridge image under another name, with the key unset or arriving
 // through envFrom, is a declared bridge too. Rendering a second one beside it

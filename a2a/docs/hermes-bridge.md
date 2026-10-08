@@ -106,7 +106,11 @@ both containers together; no setting sizes the bridge alone.
 **A CR-declared bridge wins.** A sidecar on `spec.deployment.sidecars` is a declared bridge
 if it is named `hermes-bridge`, if its `env` sets `BRIDGE_CONCURRENCY`, or if it runs the
 `hermes-bridge` image. The CR keeps it and the operator renders none, so an install that
-already carries one does not get two bridges. The `sidecars` field takes
+already carries one does not get two bridges. Those three are the whole contract: a
+hand-declared bridge outside them (a renamed image repository under another container
+name, with `BRIDGE_CONCURRENCY` unset or in `envFrom`) gets a second, rendered bridge beside
+it, and the two fail on the activity door's port. Name it `hermes-bridge`. An explicit
+opt-out is tracked in [#2623](https://github.com/gke-labs/kube-agents/issues/2623). The `sidecars` field takes
 ordinary `corev1.Container` entries, so a declared bridge's shape is CR-authored and
 reconcile leaves it alone: it has to carry its own `NATS_URL` and creds, and, for the `api`
 executor, `API_SERVER_KEY` and `A2A_ACTIVITY_SECRET`. The operator reads `BRIDGE_CONCURRENCY`

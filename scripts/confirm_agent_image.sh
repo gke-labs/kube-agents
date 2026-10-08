@@ -162,8 +162,11 @@ readonly PLUGIN_RELEASE_JSONPATH='{range .items[*]}{.metadata.name}={.metadata.a
 # judged like the agent's other containers. Unless A2A_BRIDGE_IMAGE pins it,
 # the operator takes its registry and tag from the agent image when that is
 # the release platform-agent image by tag, and otherwise from the operator's
-# own image, like the other release A2A images (a2aBridgeImage); either way it
-# carries a release tag for a release install. Read from the owning CR alone, by the Deployment's owner
+# own image, like the other release A2A images (a2aBridgeImage). On that
+# second rung it carries the operator's tag, not the agent's, so a redeploy
+# that moves the agent tag and not the operator's reds here naming
+# hermes-bridge: roll the operator too, or pin A2A_BRIDGE_IMAGE. Read from the
+# owning CR alone, by the Deployment's owner
 # reference: another agent's sidecar named like one of this agent's rendered
 # containers must not take that container out of the verdict.
 readonly OWNER_JSONPATH='{range .metadata.ownerReferences[?(@.kind=="PlatformAgent")]}{.name}{"\n"}{end}'

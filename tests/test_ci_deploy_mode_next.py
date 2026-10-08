@@ -1564,7 +1564,9 @@ class RenderedBridgeTest(unittest.TestCase):
     resources, minus the bus token and the agent's bus identity, plus the
     bridge's own env -- is the operator's to pin, and
     k8s-operator/internal/controller/platformagent_a2a_bridge_test.go does
-    (TestANextInstallWithNoDeclaredBridgeGetsOne). What is pinned here is the
+    (TestANextInstallWithNoDeclaredBridgeGetsOne, and the env copy entry by
+    entry in TestTheRenderedBridgeCarriesTheAgentsEnvExceptTheDroppedNames).
+    What is pinned here is the
     hand-off: nothing in the deploy writes spec.deployment.sidecars, and the
     operator renders a container under the name the log gate reads."""
 
