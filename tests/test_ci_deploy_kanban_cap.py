@@ -1,12 +1,11 @@
 """The smoke pipeline's Helm release gives the eval install a kanban board cap that fits its lanes.
 
-The image ships ``kanban.max_in_progress: 4`` (``agents/chat/config.yaml``), and the
+The image ships ``kanban.max_in_progress: 6`` (``agents/chat/config.yaml``), and the
 operator renders a different cap only when the PlatformAgent CR carries
 ``spec.harness.tuning.maxInProgress``. The eval fans its units out at
 ``EVAL_TASK_PARALLELISM`` -- 4 on a pull request, 8 on the nightly -- and nearly every
-unit's opening turn delegates one platform card, so on the image default the
-nightly's lanes queue behind four slots and a pull request's four leave none for a
-fan-out child: a queued card waits out the cards ahead of it and then runs its own 10-45
+unit's opening turn delegates one platform card. Before the image default rose to six,
+most lanes queued behind two slots: a queued card waits out the cards ahead of it and then runs its own 10-45
 minutes, past the delegation ceiling with no worker at fault, while the dispatcher
 logs the same "0 workers spawned" warning a wedged worker produces (#1879, #1880,
 and the residual after their fixes). ``hack/ci-deploy.sh`` therefore sets the cap on

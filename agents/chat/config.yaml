@@ -213,11 +213,14 @@ kanban:
   # defaultKanbanMaxInProgress in platformagent_manifests.go.
   #
   # One of these slots is held for user cards: background work (event triage,
-  # cron report relays) may hold every slot but one, so at 4 triage gets three
+  # cron report relays) may hold every slot but one, so at 6 triage gets five
   # and a chat question always has one (deploy/docker/patches/kanban_priority.py).
-  # Going higher, the credential proxy binds first: at its default 1Gi limit it
-  # admits 4 brokered commands at once, so raise its memory with this.
-  max_in_progress: 4
+  # Six workers at 400-512 MiB each over the gateway's 1.8 GiB idle floor fit
+  # its 8Gi limit, and the credential proxy's default 2Gi admits 9 brokered
+  # commands at once (8 with its slot cap), so each worker can have one in
+  # flight. Model rate limits are per install and unmeasured: if worker logs
+  # show 429s, lower this.
+  max_in_progress: 6
 
 # Denylist applied last for every platform key — the authoritative guarantee that
 # the front door cannot touch the system. Everything except the delegation

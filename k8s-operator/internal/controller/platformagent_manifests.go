@@ -1030,9 +1030,12 @@ const clusterProfileClassKey = "profileclass-cluster" + profileOverlaySuffix
 // profile's config declares no `kanban` key at all.
 //
 // One slot of the cap is held for user cards (deploy/docker/patches/kanban_priority.py),
-// so at 4 background triage gets three. Above 4 the credential proxy binds first: its
-// default 1Gi limit admits 4 brokered commands at once (credentialProxyAdmittedRequests).
-const defaultKanbanMaxInProgress = 4
+// so at 6 background triage gets five. Six workers at 400-512 MiB each over the 1.8 GiB
+// idle set fit the gateway's 8Gi limit, and the credential proxy's 2Gi default admits
+// nine brokered commands at once (credentialProxyAdmittedRequests; the slot cap holds it
+// to eight), so every worker can have one in flight. TestCredentialProxyBudgetArithmetic
+// AtTheDefaults fails if the proxy's default stops admitting this many.
+const defaultKanbanMaxInProgress = 6
 
 // defaultProfileLimits, platformProfileLimits and clusterProfileLimits read
 // spec.harness.tuning, tolerating every level being nil.

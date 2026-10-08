@@ -49,7 +49,7 @@ readonly EVAL_ALERT_DAILY_LIMIT_WARNING="0"
 # What that costs, stated rather than discovered: one lease deploys one install
 # and runs the whole matrix against it, so this ceiling is off for every case
 # rather than for drift ones, and the board it fills is shared
-# (kanban.max_in_progress is 4). A single human-tier record therefore files
+# (kanban.max_in_progress is 6). A single human-tier record therefore files
 # unbounded cards and can starve unrelated cases in the same lease. On a leased
 # pool project almost every principal is a service account and the classifier
 # drops it, so the steady state is quiet; the triggers are a maintainer running
@@ -120,14 +120,13 @@ readonly EVAL_DRIFT_READY_INTERVAL_SECONDS=5
 # record and why, and that is worth a targeted rerun rather than every lease.
 
 # The kanban board's worker cap on the eval install. The image ships
-# kanban.max_in_progress: 4 (agents/chat/config.yaml), a floor for an install
+# kanban.max_in_progress: 6 (agents/chat/config.yaml), a floor for an install
 # that has not measured its own worker footprint, and the operator renders a
 # different cap only when the CR carries spec.harness.tuning.maxInProgress.
 # The eval fans its units out at EVAL_TASK_PARALLELISM (4 on a pull request,
 # 8 on the nightly since oss-test-infra#2707), and nearly every unit's
-# opening turn delegates one platform card, so on the image default the
-# nightly's lanes queue behind four slots and a pull request's four leave no
-# slot for a fan-out child: a queued card waits out the cards ahead of
+# opening turn delegates one platform card. Before the image default rose to
+# six, most lanes queued behind two slots: a queued card waits out the cards ahead of
 # it and then runs its own 10-45 minutes, past the 2700-3000s delegation
 # ceiling with no worker at fault, while the dispatcher logs the same "ready
 # queue non-empty ... 0 workers spawned" warning a wedged worker produces

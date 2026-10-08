@@ -282,7 +282,7 @@ execution limit of their own — Hermes' defaults apply there, 3 retries and 90 
 `tuning.platform.maxTurns` here still wins — the overlay is merged after the image force-sync — and
 removing it restores the image's value rather than Hermes'.
 
-**`maxInProgress` is not.** Unset renders `4`, because the untuned case is the one that cannot
+**`maxInProgress` is not.** Unset renders `6`, because the untuned case is the one that cannot
 absorb the alternative — see [Why dispatch is capped by default](#why-dispatch-is-capped-by-default)
 below. Set it on the CR to raise or lower that.
 
@@ -290,7 +290,7 @@ below. Set it on the CR to raise or lower that.
 spec:
   harness:
     tuning:
-      maxInProgress: 6 # board-wide; raises the operator's default of 4
+      maxInProgress: 8 # board-wide; raises the operator's default of 6
       platform:
         apiMaxRetries: 8
         maxTurns: 200
@@ -352,7 +352,7 @@ only trace is `pid not alive` in the kanban ledger. The dispatcher's retry budge
 is stranded rather than re-dispatched, and the work it stood for is never done — a triage report
 that simply never arrives, with nothing anywhere reporting a failure.
 
-`4` is a floor for a deployment that has not measured itself, not a recommendation. It is chosen to
+`6` is a floor for a deployment that has not measured itself, not a recommendation. It is chosen to
 hold on the smallest pod anyone runs, and because the cost of being wrong is asymmetric: too low
 delays a delegated task, too high loses it silently. Raise it once you know your worker footprint
 and your model quota — that quota is the other shared resource, and for most deployments it binds
@@ -361,8 +361,8 @@ before memory does.
 One slot is held for user cards. A card is classed when it is filed: one filed from an event-triage
 or cron-relay session is background, and every other card (chat, the inject and A2A doors, a card
 filed by hand) is a user card. At a cap of 2 or more, background cards may hold every slot but one,
-so a question asked in chat starts at once even while triage is running. At the default of 4 that is
-three slots for triage and one for users. The price is that a burst of alerts drains more slowly
+so a question asked in chat starts at once even while triage is running. At the default of 6 that is
+five slots for triage and one for users. The price is that a burst of alerts drains more slowly
 than it would with every slot open to it. At a cap of 1 nothing is held: a user card still goes
 ahead of waiting triage, but it waits for the running card to finish. User cards can take every
 slot, and when they do, the next one waits and its thread says so:
@@ -375,7 +375,7 @@ A full board is logged as what it is. When every slot is busy for six ticks in a
 logs, at most every five minutes:
 
 ```text
-kanban dispatcher saturated: 4/4 worker slots busy (3 background, 1 user: t_ab12 @cluster-prod 14m [k8s-evt-], …); 1 user card(s) and 2 background card(s) waiting
+kanban dispatcher saturated: 6/6 worker slots busy (5 background, 1 user: t_ab12 @cluster-prod 14m [k8s-evt-], …); 1 user card(s) and 2 background card(s) waiting
 ```
 
 with `; N background card(s) held back because one slot is reserved for user cards` added when the
@@ -383,10 +383,20 @@ reserved slot is what held them. That line is load, not a fault. The older
 `kanban dispatcher stuck: … Check profile health` warning now means what it says: slots were free
 and still nothing started.
 
-Above 4, the credential proxy binds before the gateway does. At its default 1Gi memory limit the
-proxy admits 4 brokered commands at once (`credentialProxyAdmittedRequests` in
-`k8s-operator/internal/controller/credential_proxy_manifests.go`), and a fifth waits for one of
-them. If you raise `maxInProgress`, raise the memory limit in
+The arithmetic behind `6`:
+
+- **Gateway memory.** Six workers at roughly 400-512 MiB each over the gateway's 1.8 GiB idle set
+  comes to about 4.2-4.8 GiB, under the container's 8Gi limit.
+- **Credential proxy.** Every worker's `kubectl` and `gcloud` runs through the proxy, which admits a
+  request only when its children fit the proxy's memory limit: 176 MiB per request after 320 MiB of
+  fixed reserves. At its default 2Gi limit that is 9 at once
+  (`credentialProxyAdmittedRequests` in
+  `k8s-operator/internal/controller/credential_proxy_manifests.go`), held to 8 by its slot cap, so
+  each of the six workers can have a command in flight. At the old 1Gi it was 4.
+- **Model quota.** Per-install model rate limits are not measured. A small quota may see 429s at 6;
+  if worker logs show them, lower `maxInProgress`.
+
+If you raise `maxInProgress`, raise the proxy's memory limit in
 `spec.deployment.credentialProxy.resources` with it, and check your model quota.
 
 The cap counts running cards, not resident processes, and one case makes those differ: a coordinator
