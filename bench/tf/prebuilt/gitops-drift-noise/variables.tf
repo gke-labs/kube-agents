@@ -208,20 +208,44 @@ variable "agent_container" {
   default     = "platform-agent"
 }
 
-variable "poll_timeout_seconds" {
+variable "settle_seconds" {
   description = <<-EOT
-    How long the stack waits for a card carrying the human record's insertId.
+    How long to wait after the churn burst before reading the ledger.
 
-    The stack does not return until that card is on the board, and the insertId
-    is the lever: the board is shared and persists between runs, and the plant
-    is identical every repetition, so without a run-scoped poll the agent can
-    reproduce the PREVIOUS repetition's card and pass every check on the
-    repetition this case exists to red. _drift_task_body renders the id into
-    the card body verbatim (`insertId=<id>`, session_kv_server.py), so the
-    literal is what makes the poll run-scoped.
+    The churn records have to have been pulled and classified before their
+    absence from `intercepted_events` means anything. Too short and a healthy
+    filter and a broken one look identical -- no rows either way -- which is a
+    false green on the regression this case exists to catch.
   EOT
   type        = number
-  default     = 900
+  default     = 120
+}
+
+variable "card_timeout_seconds" {
+  description = <<-EOT
+    How long to wait for the human record's card to reach a terminal status
+    before the burst is published.
+
+    The human record goes first and its turn is allowed to finish before any
+    churn is published. That ordering is what makes the ledger read below
+    conclusive: every row this run added after that point is a record the
+    classifier forwarded when it should not have. It also keeps the harness's
+    opening turn off a busy agent -- the agent is one replica, and a card's
+    worker holds it for minutes.
+
+    Generous on purpose, and sized against the slow environment rather than
+    the expected one. The board runs kanban.max_in_progress cards at once
+    against that one replica, so this card queues behind whatever is already
+    there, and 900s was not enough on a dev install whose board had two other
+    cards running. A pool project should be quicker: its install is built per
+    lease, so the board starts empty and this card has nothing to queue
+    behind. Overshooting costs nothing when the card is quick, because the
+    wait ends as soon as it reaches a terminal status; undershooting writes
+    card-turn-failed and throws away a repetition on a healthy install. If the
+    nightly record shows this never approaching the ceiling, it can come down.
+  EOT
+  type        = number
+  default     = 1800
 }
 
 variable "prow_build_id" {
