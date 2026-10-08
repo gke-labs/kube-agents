@@ -26,8 +26,8 @@ change is seeded-b's exclusion re-stamp is `converged`, decided on the fields
 that changed, not the address.
 
 A run never starts a project it cannot finish inside its budget, and stops
-when main's fleet tree is no longer the one it checked out, so two runs at
-different commits never apply over each other. `--report` writes
+when main's fleet tree is no longer the one it checked out, so two runs applying
+different stacks never apply over each other. `--report` writes
 fleet-reconcile.json (mode, commit, tree, per-project outcomes with times, a
 summary), under $ARTIFACTS when Prow sets it, for the CI health bot
 (scripts/eval_dashboard/periodics.py); each applied project also gets
