@@ -295,15 +295,16 @@ notes. Prefixes are not a protocol. Instead:
 `input-required`, and one terminal event with `final: true`. Not progress, not tool
 chatter.
 
-**`artifact-update` carries the streams, as named artifacts.** Five reserved names:
+**`artifact-update` carries the streams, as named artifacts.** Six reserved names:
 
-| Artifact name | Content                                                                      | Producer                                       | Default consumer                                                                 |
-| ------------- | ---------------------------------------------------------------------------- | ---------------------------------------------- | -------------------------------------------------------------------------------- |
-| `result`      | The deliverable, chunked per A2A chunking rules                              | harness output                                 | posted to the requester verbatim, as `kanban_complete`'s `result` field is today |
-| `thinking`    | Thinking/reasoning deltas                                                    | adapter, from the harness stream               | debug views only                                                                 |
-| `activity`    | Tool-call trace: one entry per tool invocation                               | adapter                                        | debug views; always in the audit replay                                          |
-| `progress`    | Agent-authored milestones - the heartbeat-note replacement                   | an explicit progress tool exposed to the agent | rendered to chat at zero model cost                                              |
-| `delegate`    | A session's request to hand a task on: one data part (`lib.DelegateRequest`) | adapter, from the harness's delegate tool      | the gateway, which mints the child or refuses; never rendered to chat            |
+| Artifact name | Content                                                                                   | Producer                                       | Default consumer                                                                 |
+| ------------- | ----------------------------------------------------------------------------------------- | ---------------------------------------------- | -------------------------------------------------------------------------------- |
+| `result`      | The deliverable, chunked per A2A chunking rules                                           | harness output                                 | posted to the requester verbatim, as `kanban_complete`'s `result` field is today |
+| `thinking`    | Thinking/reasoning deltas                                                                 | adapter, from the harness stream               | debug views only                                                                 |
+| `activity`    | Tool-call trace: one entry per tool invocation                                            | adapter                                        | debug views; always in the audit replay                                          |
+| `progress`    | Agent-authored milestones - the heartbeat-note replacement                                | an explicit progress tool exposed to the agent | rendered to chat at zero model cost                                              |
+| `delegate`    | A session's request to hand a task on: one data part (`lib.DelegateRequest`)              | adapter, from the harness's delegate tool      | the gateway, which mints the child or refuses; never rendered to chat            |
+| `notice`      | A post of its own, mid-task, optionally with a chat message (payload spec, Chat messages) | the executor                                   | the gateway, which posts it once                                                 |
 
 This maps one-to-one onto what exists. Kanban heartbeat notes become `progress` updates:
 the gateway's notifier can render them into a rolling chat line without waking any model,
