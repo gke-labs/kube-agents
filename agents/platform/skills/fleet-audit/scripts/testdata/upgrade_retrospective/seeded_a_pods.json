@@ -5,13 +5,8 @@
    "apiVersion": "v1",
    "kind": "Pod",
    "metadata": {
-    "annotations": {
-     "cloud.google.com/cluster_autoscaler_unhelpable_since": "2026-09-25T17:02:49+0000",
-     "cloud.google.com/cluster_autoscaler_unhelpable_until": "Inf"
-    },
     "creationTimestamp": "2026-09-25T17:02:48Z",
     "generateName": "inference-server-778b78fdb8-",
-    "generation": 1,
     "labels": {
      "app": "inference-server",
      "pod-template-hash": "778b78fdb8"
@@ -27,12 +22,9 @@
       "name": "inference-server-778b78fdb8",
       "uid": "51635fc0-ec48-4a1e-994f-69a54f998449"
      }
-    ],
-    "resourceVersion": "1791437085741023014",
-    "uid": "253276f2-e0f8-49b2-9924-478f99149470"
+    ]
    },
    "spec": {
-    "automountServiceAccountToken": false,
     "containers": [
      {
       "command": [
@@ -41,7 +33,6 @@
        "while true; do :; done"
       ],
       "image": "busybox:1.36",
-      "imagePullPolicy": "IfNotPresent",
       "name": "server",
       "resources": {
        "limits": {
@@ -52,31 +43,14 @@
         "cpu": "400m",
         "memory": "64Mi"
        }
-      },
-      "terminationMessagePath": "/dev/termination-log",
-      "terminationMessagePolicy": "File"
+      }
      }
     ],
-    "dnsPolicy": "ClusterFirst",
-    "enableServiceLinks": true,
     "nodeSelector": {
      "seeded-role": "pinned-inference"
     },
-    "preemptionPolicy": "PreemptLowerPriority",
-    "priority": 0,
     "restartPolicy": "Always",
-    "schedulerName": "default-scheduler",
-    "securityContext": {
-     "runAsNonRoot": true,
-     "runAsUser": 65534,
-     "seccompProfile": {
-      "type": "RuntimeDefault"
-     }
-    },
-    "serviceAccount": "default",
-    "serviceAccountName": "default",
     "shareProcessNamespace": false,
-    "terminationGracePeriodSeconds": 30,
     "topologySpreadConstraints": [
      {
       "labelSelector": {
@@ -103,21 +77,15 @@
       "type": "PodScheduled"
      }
     ],
-    "phase": "Pending",
-    "qosClass": "Burstable"
+    "phase": "Pending"
    }
   },
   {
    "apiVersion": "v1",
    "kind": "Pod",
    "metadata": {
-    "annotations": {
-     "cloud.google.com/cluster_autoscaler_unhelpable_since": "2026-10-08T05:21:39+0000",
-     "cloud.google.com/cluster_autoscaler_unhelpable_until": "Inf"
-    },
     "creationTimestamp": "2026-10-08T05:21:39Z",
     "generateName": "inference-server-778b78fdb8-",
-    "generation": 1,
     "labels": {
      "app": "inference-server",
      "pod-template-hash": "778b78fdb8"
@@ -133,12 +101,9 @@
       "name": "inference-server-778b78fdb8",
       "uid": "51635fc0-ec48-4a1e-994f-69a54f998449"
      }
-    ],
-    "resourceVersion": "1791437085700015010",
-    "uid": "67f60856-d2bf-44ff-a608-3e484aadb195"
+    ]
    },
    "spec": {
-    "automountServiceAccountToken": false,
     "containers": [
      {
       "command": [
@@ -147,7 +112,6 @@
        "while true; do :; done"
       ],
       "image": "busybox:1.36",
-      "imagePullPolicy": "IfNotPresent",
       "name": "server",
       "resources": {
        "limits": {
@@ -158,31 +122,14 @@
         "cpu": "400m",
         "memory": "64Mi"
        }
-      },
-      "terminationMessagePath": "/dev/termination-log",
-      "terminationMessagePolicy": "File"
+      }
      }
     ],
-    "dnsPolicy": "ClusterFirst",
-    "enableServiceLinks": true,
     "nodeSelector": {
      "seeded-role": "pinned-inference"
     },
-    "preemptionPolicy": "PreemptLowerPriority",
-    "priority": 0,
     "restartPolicy": "Always",
-    "schedulerName": "default-scheduler",
-    "securityContext": {
-     "runAsNonRoot": true,
-     "runAsUser": 65534,
-     "seccompProfile": {
-      "type": "RuntimeDefault"
-     }
-    },
-    "serviceAccount": "default",
-    "serviceAccountName": "default",
     "shareProcessNamespace": false,
-    "terminationGracePeriodSeconds": 30,
     "topologySpreadConstraints": [
      {
       "labelSelector": {
@@ -209,21 +156,15 @@
       "type": "PodScheduled"
      }
     ],
-    "phase": "Pending",
-    "qosClass": "Burstable"
+    "phase": "Pending"
    }
   },
   {
    "apiVersion": "v1",
    "kind": "Pod",
    "metadata": {
-    "annotations": {
-     "cloud.google.com/cluster_autoscaler_unhelpable_since": "2026-09-25T17:02:48+0000",
-     "cloud.google.com/cluster_autoscaler_unhelpable_until": "Inf"
-    },
     "creationTimestamp": "2026-09-25T17:02:48Z",
     "generateName": "inference-server-778b78fdb8-",
-    "generation": 1,
     "labels": {
      "app": "inference-server",
      "pod-template-hash": "778b78fdb8",
@@ -241,12 +182,9 @@
       "name": "inference-server-778b78fdb8",
       "uid": "51635fc0-ec48-4a1e-994f-69a54f998449"
      }
-    ],
-    "resourceVersion": "1791433309321855010",
-    "uid": "79c186bd-5756-45a4-a04a-016fe3d9d079"
+    ]
    },
    "spec": {
-    "automountServiceAccountToken": false,
     "containers": [
      {
       "command": [
@@ -255,7 +193,6 @@
        "while true; do :; done"
       ],
       "image": "busybox:1.36",
-      "imagePullPolicy": "IfNotPresent",
       "name": "server",
       "resources": {
        "limits": {
@@ -266,32 +203,15 @@
         "cpu": "400m",
         "memory": "64Mi"
        }
-      },
-      "terminationMessagePath": "/dev/termination-log",
-      "terminationMessagePolicy": "File"
+      }
      }
     ],
-    "dnsPolicy": "ClusterFirst",
-    "enableServiceLinks": true,
     "nodeName": "gke-seeded-a-pinned-inference-pool-d08d753d-c8fk",
     "nodeSelector": {
      "seeded-role": "pinned-inference"
     },
-    "preemptionPolicy": "PreemptLowerPriority",
-    "priority": 0,
     "restartPolicy": "Always",
-    "schedulerName": "default-scheduler",
-    "securityContext": {
-     "runAsNonRoot": true,
-     "runAsUser": 65534,
-     "seccompProfile": {
-      "type": "RuntimeDefault"
-     }
-    },
-    "serviceAccount": "default",
-    "serviceAccountName": "default",
     "shareProcessNamespace": false,
-    "terminationGracePeriodSeconds": 30,
     "topologySpreadConstraints": [
      {
       "labelSelector": {
@@ -346,49 +266,20 @@
     ],
     "containerStatuses": [
      {
-      "allocatedResources": {
-       "cpu": "400m",
-       "memory": "64Mi"
-      },
-      "containerID": "containerd://f63c8a2f0048c5ebf9a2b684c2611bf650bb117b059ba43d06f63c6b3f5e9660",
       "image": "docker.io/library/busybox:1.36",
-      "imageID": "docker.io/library/busybox@sha256:73aaf090f3d85aa34ee199857f03fa3a95c8ede2ffd4cc2cdb5b94e566b11662",
       "lastState": {},
       "name": "server",
       "ready": true,
-      "resources": {
-       "limits": {
-        "cpu": "500m",
-        "memory": "128Mi"
-       },
-       "requests": {
-        "cpu": "400m",
-        "memory": "64Mi"
-       }
-      },
       "restartCount": 0,
-      "started": true,
       "state": {
        "running": {
         "startedAt": "2026-10-08T04:21:48Z"
        }
-      },
-      "user": {
-       "linux": {
-        "gid": 65534,
-        "supplementalGroups": [
-         65534
-        ],
-        "uid": 65534
-       }
       }
      }
     ],
-    "hostIP": "10.128.0.18",
     "observedGeneration": 1,
     "phase": "Running",
-    "podIP": "10.32.1.2",
-    "qosClass": "Burstable",
     "startTime": "2026-10-08T04:21:37Z"
    }
   },
@@ -396,13 +287,8 @@
    "apiVersion": "v1",
    "kind": "Pod",
    "metadata": {
-    "annotations": {
-     "cloud.google.com/cluster_autoscaler_unhelpable_since": "2026-10-08T04:22:26+0000",
-     "cloud.google.com/cluster_autoscaler_unhelpable_until": "Inf"
-    },
     "creationTimestamp": "2026-10-08T04:22:25Z",
     "generateName": "inference-server-778b78fdb8-",
-    "generation": 1,
     "labels": {
      "app": "inference-server",
      "pod-template-hash": "778b78fdb8"
@@ -418,12 +304,9 @@
       "name": "inference-server-778b78fdb8",
       "uid": "51635fc0-ec48-4a1e-994f-69a54f998449"
      }
-    ],
-    "resourceVersion": "1791437085721663022",
-    "uid": "c2ed88ab-1f5a-491d-a0ab-5c08dd273e67"
+    ]
    },
    "spec": {
-    "automountServiceAccountToken": false,
     "containers": [
      {
       "command": [
@@ -432,7 +315,6 @@
        "while true; do :; done"
       ],
       "image": "busybox:1.36",
-      "imagePullPolicy": "IfNotPresent",
       "name": "server",
       "resources": {
        "limits": {
@@ -443,31 +325,14 @@
         "cpu": "400m",
         "memory": "64Mi"
        }
-      },
-      "terminationMessagePath": "/dev/termination-log",
-      "terminationMessagePolicy": "File"
+      }
      }
     ],
-    "dnsPolicy": "ClusterFirst",
-    "enableServiceLinks": true,
     "nodeSelector": {
      "seeded-role": "pinned-inference"
     },
-    "preemptionPolicy": "PreemptLowerPriority",
-    "priority": 0,
     "restartPolicy": "Always",
-    "schedulerName": "default-scheduler",
-    "securityContext": {
-     "runAsNonRoot": true,
-     "runAsUser": 65534,
-     "seccompProfile": {
-      "type": "RuntimeDefault"
-     }
-    },
-    "serviceAccount": "default",
-    "serviceAccountName": "default",
     "shareProcessNamespace": false,
-    "terminationGracePeriodSeconds": 30,
     "topologySpreadConstraints": [
      {
       "labelSelector": {
@@ -494,8 +359,7 @@
       "type": "PodScheduled"
      }
     ],
-    "phase": "Pending",
-    "qosClass": "Burstable"
+    "phase": "Pending"
    }
   },
   {
@@ -504,7 +368,6 @@
    "metadata": {
     "creationTimestamp": "2026-10-07T04:03:40Z",
     "generateName": "payments-api-79b77b8c67-",
-    "generation": 1,
     "labels": {
      "app": "payments-api",
      "pod-template-hash": "79b77b8c67",
@@ -522,12 +385,9 @@
       "name": "payments-api-79b77b8c67",
       "uid": "368d21d0-d6ac-4823-89af-af612c641b0e"
      }
-    ],
-    "resourceVersion": "1791480353272463022",
-    "uid": "6649eebf-ee78-4e60-b214-3e6b93ce3e37"
+    ]
    },
    "spec": {
-    "automountServiceAccountToken": false,
     "containers": [
      {
       "command": [
@@ -536,7 +396,6 @@
        "tail /dev/zero"
       ],
       "image": "busybox:1.36",
-      "imagePullPolicy": "IfNotPresent",
       "name": "api",
       "resources": {
        "limits": {
@@ -546,29 +405,12 @@
         "cpu": "10m",
         "memory": "32Mi"
        }
-      },
-      "terminationMessagePath": "/dev/termination-log",
-      "terminationMessagePolicy": "File"
+      }
      }
     ],
-    "dnsPolicy": "ClusterFirst",
-    "enableServiceLinks": true,
     "nodeName": "gke-seeded-a-default-pool-62ac8ee0-d595",
-    "preemptionPolicy": "PreemptLowerPriority",
-    "priority": 0,
     "restartPolicy": "Always",
-    "schedulerName": "default-scheduler",
-    "securityContext": {
-     "runAsNonRoot": true,
-     "runAsUser": 65534,
-     "seccompProfile": {
-      "type": "RuntimeDefault"
-     }
-    },
-    "serviceAccount": "default",
-    "serviceAccountName": "default",
     "shareProcessNamespace": false,
-    "terminationGracePeriodSeconds": 30,
     "volumes": []
    },
    "status": {
@@ -615,13 +457,7 @@
     ],
     "containerStatuses": [
      {
-      "allocatedResources": {
-       "cpu": "10m",
-       "memory": "32Mi"
-      },
-      "containerID": "containerd://f137b10df847ffda407b0cc408c5459f60cf6a281086fe8df0677bad36f14452",
       "image": "docker.io/library/busybox:1.36",
-      "imageID": "docker.io/library/busybox@sha256:73aaf090f3d85aa34ee199857f03fa3a95c8ede2ffd4cc2cdb5b94e566b11662",
       "lastState": {
        "terminated": {
         "containerID": "containerd://f137b10df847ffda407b0cc408c5459f60cf6a281086fe8df0677bad36f14452",
@@ -633,39 +469,17 @@
       },
       "name": "api",
       "ready": false,
-      "resources": {
-       "limits": {
-        "memory": "64Mi"
-       },
-       "requests": {
-        "cpu": "10m",
-        "memory": "32Mi"
-       }
-      },
       "restartCount": 440,
-      "started": false,
       "state": {
        "waiting": {
         "message": "back-off 5m0s restarting failed container=api pod=payments-api-79b77b8c67-vfrh9_seeded-debug(6649eebf-ee78-4e60-b214-3e6b93ce3e37)",
         "reason": "CrashLoopBackOff"
        }
-      },
-      "user": {
-       "linux": {
-        "gid": 65534,
-        "supplementalGroups": [
-         65534
-        ],
-        "uid": 65534
-       }
       }
      }
     ],
-    "hostIP": "10.128.0.79",
     "observedGeneration": 1,
     "phase": "Running",
-    "podIP": "10.32.4.7",
-    "qosClass": "Burstable",
     "startTime": "2026-10-07T04:03:40Z"
    }
   },
@@ -675,7 +489,6 @@
    "metadata": {
     "creationTimestamp": "2026-10-07T18:27:15Z",
     "generateName": "baseline-edge-worker-7875987d97-",
-    "generation": 1,
     "labels": {
      "app": "baseline-edge-worker",
      "pod-template-hash": "7875987d97",
@@ -693,16 +506,12 @@
       "name": "baseline-edge-worker-7875987d97",
       "uid": "0f36a498-b27a-4fdf-8ba3-3e66464fe488"
      }
-    ],
-    "resourceVersion": "1791397638255375010",
-    "uid": "e68bb9cc-edda-4a24-8695-46f86669196b"
+    ]
    },
    "spec": {
-    "automountServiceAccountToken": false,
     "containers": [
      {
       "image": "registry.k8s.io/pause:3.10",
-      "imagePullPolicy": "IfNotPresent",
       "name": "worker",
       "resources": {
        "limits": {
@@ -712,29 +521,12 @@
         "cpu": "5m",
         "memory": "8Mi"
        }
-      },
-      "terminationMessagePath": "/dev/termination-log",
-      "terminationMessagePolicy": "File"
+      }
      }
     ],
-    "dnsPolicy": "ClusterFirst",
-    "enableServiceLinks": true,
     "nodeName": "gke-seeded-a-default-pool-62ac8ee0-mbzp",
-    "preemptionPolicy": "PreemptLowerPriority",
-    "priority": 0,
     "restartPolicy": "Always",
-    "schedulerName": "default-scheduler",
-    "securityContext": {
-     "runAsNonRoot": true,
-     "runAsUser": 65534,
-     "seccompProfile": {
-      "type": "RuntimeDefault"
-     }
-    },
-    "serviceAccount": "default",
-    "serviceAccountName": "default",
     "shareProcessNamespace": false,
-    "terminationGracePeriodSeconds": 30,
     "volumes": []
    },
    "status": {
@@ -777,48 +569,20 @@
     ],
     "containerStatuses": [
      {
-      "allocatedResources": {
-       "cpu": "5m",
-       "memory": "8Mi"
-      },
-      "containerID": "containerd://67e460aa997a76be6af1cb6f9ed5e30d5c36f4164b64eec99f56731ae26e08c7",
       "image": "registry.k8s.io/pause:3.10",
-      "imageID": "registry.k8s.io/pause@sha256:ee6521f290b2168b6e0935a181d4cff9be1ac3f505666ef0e3c98fae8199917a",
       "lastState": {},
       "name": "worker",
       "ready": true,
-      "resources": {
-       "limits": {
-        "memory": "16Mi"
-       },
-       "requests": {
-        "cpu": "5m",
-        "memory": "8Mi"
-       }
-      },
       "restartCount": 0,
-      "started": true,
       "state": {
        "running": {
         "startedAt": "2026-10-07T18:27:17Z"
        }
-      },
-      "user": {
-       "linux": {
-        "gid": 0,
-        "supplementalGroups": [
-         0
-        ],
-        "uid": 65534
-       }
       }
      }
     ],
-    "hostIP": "10.128.0.17",
     "observedGeneration": 1,
     "phase": "Running",
-    "podIP": "10.32.2.102",
-    "qosClass": "Burstable",
     "startTime": "2026-10-07T18:27:15Z"
    }
   },
@@ -828,7 +592,6 @@
    "metadata": {
     "creationTimestamp": "2026-10-08T17:20:00Z",
     "generateName": "legacy-endpoints-writer-29858000-",
-    "generation": 1,
     "labels": {
      "app": "legacy-endpoints-writer",
      "batch.kubernetes.io/controller-uid": "efa47501-8c44-4617-9e44-e1d64532c866",
@@ -849,12 +612,9 @@
       "name": "legacy-endpoints-writer-29858000",
       "uid": "efa47501-8c44-4617-9e44-e1d64532c866"
      }
-    ],
-    "resourceVersion": "1791480005751311013",
-    "uid": "1775f8c3-73fd-4ef9-a80a-09dcf28114cd"
+    ]
    },
    "spec": {
-    "automountServiceAccountToken": true,
     "containers": [
      {
       "command": [
@@ -862,7 +622,6 @@
        "/app/writer.py"
       ],
       "image": "docker.io/library/python:3.14-slim",
-      "imagePullPolicy": "IfNotPresent",
       "name": "writer",
       "resources": {
        "limits": {
@@ -872,29 +631,12 @@
         "cpu": "20m",
         "memory": "32Mi"
        }
-      },
-      "terminationMessagePath": "/dev/termination-log",
-      "terminationMessagePolicy": "File"
+      }
      }
     ],
-    "dnsPolicy": "ClusterFirst",
-    "enableServiceLinks": true,
     "nodeName": "gke-seeded-a-default-pool-62ac8ee0-mbzp",
-    "preemptionPolicy": "PreemptLowerPriority",
-    "priority": 0,
     "restartPolicy": "Never",
-    "schedulerName": "default-scheduler",
-    "securityContext": {
-     "runAsNonRoot": true,
-     "runAsUser": 65534,
-     "seccompProfile": {
-      "type": "RuntimeDefault"
-     }
-    },
-    "serviceAccount": "legacy-endpoints-writer",
-    "serviceAccountName": "legacy-endpoints-writer",
     "shareProcessNamespace": false,
-    "terminationGracePeriodSeconds": 30,
     "volumes": [
      {
       "configMap": {
@@ -949,27 +691,11 @@
     ],
     "containerStatuses": [
      {
-      "allocatedResources": {
-       "cpu": "20m",
-       "memory": "32Mi"
-      },
-      "containerID": "containerd://9ee9aa8d7e09ee0cc26143e655d387e21f662a912429ba9307e2b7e745216f6d",
       "image": "docker.io/library/python:3.14-slim",
-      "imageID": "docker.io/library/python@sha256:f85c5697265c178cc6887276c55fe16cf3d14ca35c3df6a5eab3b360534a55d2",
       "lastState": {},
       "name": "writer",
       "ready": false,
-      "resources": {
-       "limits": {
-        "memory": "64Mi"
-       },
-       "requests": {
-        "cpu": "20m",
-        "memory": "32Mi"
-       }
-      },
       "restartCount": 0,
-      "started": false,
       "state": {
        "terminated": {
         "containerID": "containerd://9ee9aa8d7e09ee0cc26143e655d387e21f662a912429ba9307e2b7e745216f6d",
@@ -978,37 +704,11 @@
         "reason": "Completed",
         "startedAt": "2026-10-08T17:20:02Z"
        }
-      },
-      "user": {
-       "linux": {
-        "gid": 65534,
-        "supplementalGroups": [
-         65534
-        ],
-        "uid": 65534
-       }
-      },
-      "volumeMounts": [
-       {
-        "mountPath": "/app",
-        "name": "script",
-        "readOnly": true,
-        "recursiveReadOnly": "Disabled"
-       },
-       {
-        "mountPath": "/var/run/secrets/kubernetes.io/serviceaccount",
-        "name": "kube-api-access-ncdt9",
-        "readOnly": true,
-        "recursiveReadOnly": "Disabled"
-       }
-      ]
+      }
      }
     ],
-    "hostIP": "10.128.0.17",
     "observedGeneration": 1,
     "phase": "Succeeded",
-    "podIP": "10.32.2.143",
-    "qosClass": "Burstable",
     "startTime": "2026-10-08T17:20:00Z"
    }
   },
@@ -1018,7 +718,6 @@
    "metadata": {
     "creationTimestamp": "2026-10-07T18:27:15Z",
     "generateName": "notification-relay-7d6f9fd9f5-",
-    "generation": 1,
     "labels": {
      "app": "notification-relay",
      "pod-template-hash": "7d6f9fd9f5",
@@ -1036,16 +735,12 @@
       "name": "notification-relay-7d6f9fd9f5",
       "uid": "07975a1b-8b7b-490b-9c7d-7c395c702297"
      }
-    ],
-    "resourceVersion": "1791397637308367007",
-    "uid": "552460b2-34d3-4eb5-b90e-3d23da01030b"
+    ]
    },
    "spec": {
-    "automountServiceAccountToken": false,
     "containers": [
      {
       "image": "registry.k8s.io/pause:3.9",
-      "imagePullPolicy": "IfNotPresent",
       "name": "relay",
       "resources": {
        "limits": {
@@ -1055,29 +750,12 @@
         "cpu": "10m",
         "memory": "16Mi"
        }
-      },
-      "terminationMessagePath": "/dev/termination-log",
-      "terminationMessagePolicy": "File"
+      }
      }
     ],
-    "dnsPolicy": "ClusterFirst",
-    "enableServiceLinks": true,
     "nodeName": "gke-seeded-a-default-pool-62ac8ee0-d595",
-    "preemptionPolicy": "PreemptLowerPriority",
-    "priority": 0,
     "restartPolicy": "Always",
-    "schedulerName": "default-scheduler",
-    "securityContext": {
-     "runAsNonRoot": true,
-     "runAsUser": 65534,
-     "seccompProfile": {
-      "type": "RuntimeDefault"
-     }
-    },
-    "serviceAccount": "default",
-    "serviceAccountName": "default",
     "shareProcessNamespace": false,
-    "terminationGracePeriodSeconds": 30,
     "topologySpreadConstraints": [
      {
       "labelSelector": {
@@ -1132,48 +810,20 @@
     ],
     "containerStatuses": [
      {
-      "allocatedResources": {
-       "cpu": "10m",
-       "memory": "16Mi"
-      },
-      "containerID": "containerd://3f15e8c008bb5b75b5d47bb720a66c4da7952f2ce698adc6b22d7cf2121eb00a",
       "image": "registry.k8s.io/pause:3.9",
-      "imageID": "registry.k8s.io/pause@sha256:7031c1b283388d2c2e09b57badb803c05ebed362dc88d84b480cc47f72a21097",
       "lastState": {},
       "name": "relay",
       "ready": true,
-      "resources": {
-       "limits": {
-        "memory": "32Mi"
-       },
-       "requests": {
-        "cpu": "10m",
-        "memory": "16Mi"
-       }
-      },
       "restartCount": 0,
-      "started": true,
       "state": {
        "running": {
         "startedAt": "2026-10-07T18:27:16Z"
        }
-      },
-      "user": {
-       "linux": {
-        "gid": 0,
-        "supplementalGroups": [
-         0
-        ],
-        "uid": 65534
-       }
       }
      }
     ],
-    "hostIP": "10.128.0.79",
     "observedGeneration": 1,
     "phase": "Running",
-    "podIP": "10.32.4.15",
-    "qosClass": "Burstable",
     "startTime": "2026-10-07T18:27:15Z"
    }
   },
@@ -1183,7 +833,6 @@
    "metadata": {
     "creationTimestamp": "2026-10-07T18:27:15Z",
     "generateName": "notification-relay-7d6f9fd9f5-",
-    "generation": 1,
     "labels": {
      "app": "notification-relay",
      "pod-template-hash": "7d6f9fd9f5",
@@ -1201,16 +850,12 @@
       "name": "notification-relay-7d6f9fd9f5",
       "uid": "07975a1b-8b7b-490b-9c7d-7c395c702297"
      }
-    ],
-    "resourceVersion": "1791397638206367019",
-    "uid": "1395b4c0-8556-4505-91b0-014ab10d0b5a"
+    ]
    },
    "spec": {
-    "automountServiceAccountToken": false,
     "containers": [
      {
       "image": "registry.k8s.io/pause:3.9",
-      "imagePullPolicy": "IfNotPresent",
       "name": "relay",
       "resources": {
        "limits": {
@@ -1220,29 +865,12 @@
         "cpu": "10m",
         "memory": "16Mi"
        }
-      },
-      "terminationMessagePath": "/dev/termination-log",
-      "terminationMessagePolicy": "File"
+      }
      }
     ],
-    "dnsPolicy": "ClusterFirst",
-    "enableServiceLinks": true,
     "nodeName": "gke-seeded-a-default-pool-62ac8ee0-mbzp",
-    "preemptionPolicy": "PreemptLowerPriority",
-    "priority": 0,
     "restartPolicy": "Always",
-    "schedulerName": "default-scheduler",
-    "securityContext": {
-     "runAsNonRoot": true,
-     "runAsUser": 65534,
-     "seccompProfile": {
-      "type": "RuntimeDefault"
-     }
-    },
-    "serviceAccount": "default",
-    "serviceAccountName": "default",
     "shareProcessNamespace": false,
-    "terminationGracePeriodSeconds": 30,
     "topologySpreadConstraints": [
      {
       "labelSelector": {
@@ -1297,48 +925,20 @@
     ],
     "containerStatuses": [
      {
-      "allocatedResources": {
-       "cpu": "10m",
-       "memory": "16Mi"
-      },
-      "containerID": "containerd://ff9362836f6918bd4842a420aeb93ee41d69450086242f5eb3137ad50ecc3e03",
       "image": "k8s.gcr.io/pause:3.9",
-      "imageID": "k8s.gcr.io/pause@sha256:7031c1b283388d2c2e09b57badb803c05ebed362dc88d84b480cc47f72a21097",
       "lastState": {},
       "name": "relay",
       "ready": true,
-      "resources": {
-       "limits": {
-        "memory": "32Mi"
-       },
-       "requests": {
-        "cpu": "10m",
-        "memory": "16Mi"
-       }
-      },
       "restartCount": 0,
-      "started": true,
       "state": {
        "running": {
         "startedAt": "2026-10-07T18:27:17Z"
        }
-      },
-      "user": {
-       "linux": {
-        "gid": 0,
-        "supplementalGroups": [
-         0
-        ],
-        "uid": 65534
-       }
       }
      }
     ],
-    "hostIP": "10.128.0.17",
     "observedGeneration": 1,
     "phase": "Running",
-    "podIP": "10.32.2.103",
-    "qosClass": "Burstable",
     "startTime": "2026-10-07T18:27:16Z"
    }
   },
@@ -1348,7 +948,6 @@
    "metadata": {
     "creationTimestamp": "2026-10-07T04:09:35Z",
     "generateName": "checkout-gateway-568bd768b4-",
-    "generation": 1,
     "labels": {
      "app": "checkout-gateway",
      "pod-template-hash": "568bd768b4",
@@ -1366,16 +965,12 @@
       "name": "checkout-gateway-568bd768b4",
       "uid": "7c82e8f1-92a1-49bc-8f6b-2f2cd66eebf7"
      }
-    ],
-    "resourceVersion": "1791346205673855010",
-    "uid": "0713d3e7-6258-4962-ae02-f76dffc29ab6"
+    ]
    },
    "spec": {
-    "automountServiceAccountToken": false,
     "containers": [
      {
       "image": "registry.k8s.io/pause:3.9",
-      "imagePullPolicy": "IfNotPresent",
       "name": "gateway",
       "resources": {
        "limits": {
@@ -1385,29 +980,12 @@
         "cpu": "10m",
         "memory": "16Mi"
        }
-      },
-      "terminationMessagePath": "/dev/termination-log",
-      "terminationMessagePolicy": "File"
+      }
      }
     ],
-    "dnsPolicy": "ClusterFirst",
-    "enableServiceLinks": true,
     "nodeName": "gke-seeded-a-default-pool-62ac8ee0-mbzp",
-    "preemptionPolicy": "PreemptLowerPriority",
-    "priority": 0,
     "restartPolicy": "Always",
-    "schedulerName": "default-scheduler",
-    "securityContext": {
-     "runAsNonRoot": true,
-     "runAsUser": 65534,
-     "seccompProfile": {
-      "type": "RuntimeDefault"
-     }
-    },
-    "serviceAccount": "default",
-    "serviceAccountName": "default",
     "shareProcessNamespace": false,
-    "terminationGracePeriodSeconds": 30,
     "topologySpreadConstraints": [
      {
       "labelSelector": {
@@ -1462,48 +1040,20 @@
     ],
     "containerStatuses": [
      {
-      "allocatedResources": {
-       "cpu": "10m",
-       "memory": "16Mi"
-      },
-      "containerID": "containerd://88a9b78a57ad94d95472755c87761011553fd9e9c4dfe3f13c0b88fcbd546187",
       "image": "k8s.gcr.io/pause:3.9",
-      "imageID": "k8s.gcr.io/pause@sha256:7031c1b283388d2c2e09b57badb803c05ebed362dc88d84b480cc47f72a21097",
       "lastState": {},
       "name": "gateway",
       "ready": true,
-      "resources": {
-       "limits": {
-        "memory": "32Mi"
-       },
-       "requests": {
-        "cpu": "10m",
-        "memory": "16Mi"
-       }
-      },
       "restartCount": 0,
-      "started": true,
       "state": {
        "running": {
         "startedAt": "2026-10-07T04:10:05Z"
        }
-      },
-      "user": {
-       "linux": {
-        "gid": 0,
-        "supplementalGroups": [
-         0
-        ],
-        "uid": 65534
-       }
       }
      }
     ],
-    "hostIP": "10.128.0.17",
     "observedGeneration": 1,
     "phase": "Running",
-    "podIP": "10.32.2.12",
-    "qosClass": "Burstable",
     "startTime": "2026-10-07T04:09:35Z"
    }
   },
@@ -1513,7 +1063,6 @@
    "metadata": {
     "creationTimestamp": "2026-10-07T04:03:41Z",
     "generateName": "checkout-gateway-568bd768b4-",
-    "generation": 1,
     "labels": {
      "app": "checkout-gateway",
      "pod-template-hash": "568bd768b4",
@@ -1531,16 +1080,12 @@
       "name": "checkout-gateway-568bd768b4",
       "uid": "7c82e8f1-92a1-49bc-8f6b-2f2cd66eebf7"
      }
-    ],
-    "resourceVersion": "1791345839139823013",
-    "uid": "f41a19ae-44c4-4f06-9e0d-98ffbd8223a6"
+    ]
    },
    "spec": {
-    "automountServiceAccountToken": false,
     "containers": [
      {
       "image": "registry.k8s.io/pause:3.9",
-      "imagePullPolicy": "IfNotPresent",
       "name": "gateway",
       "resources": {
        "limits": {
@@ -1550,29 +1095,12 @@
         "cpu": "10m",
         "memory": "16Mi"
        }
-      },
-      "terminationMessagePath": "/dev/termination-log",
-      "terminationMessagePolicy": "File"
+      }
      }
     ],
-    "dnsPolicy": "ClusterFirst",
-    "enableServiceLinks": true,
     "nodeName": "gke-seeded-a-default-pool-62ac8ee0-d595",
-    "preemptionPolicy": "PreemptLowerPriority",
-    "priority": 0,
     "restartPolicy": "Always",
-    "schedulerName": "default-scheduler",
-    "securityContext": {
-     "runAsNonRoot": true,
-     "runAsUser": 65534,
-     "seccompProfile": {
-      "type": "RuntimeDefault"
-     }
-    },
-    "serviceAccount": "default",
-    "serviceAccountName": "default",
     "shareProcessNamespace": false,
-    "terminationGracePeriodSeconds": 30,
     "topologySpreadConstraints": [
      {
       "labelSelector": {
@@ -1627,48 +1155,20 @@
     ],
     "containerStatuses": [
      {
-      "allocatedResources": {
-       "cpu": "10m",
-       "memory": "16Mi"
-      },
-      "containerID": "containerd://2911008bc09e0273c9c7ff2d97b780821bafb8fed1e90fec0b5c85a2115b2bdf",
       "image": "registry.k8s.io/pause:3.9",
-      "imageID": "registry.k8s.io/pause@sha256:7031c1b283388d2c2e09b57badb803c05ebed362dc88d84b480cc47f72a21097",
       "lastState": {},
       "name": "gateway",
       "ready": true,
-      "resources": {
-       "limits": {
-        "memory": "32Mi"
-       },
-       "requests": {
-        "cpu": "10m",
-        "memory": "16Mi"
-       }
-      },
       "restartCount": 0,
-      "started": true,
       "state": {
        "running": {
         "startedAt": "2026-10-07T04:03:58Z"
        }
-      },
-      "user": {
-       "linux": {
-        "gid": 0,
-        "supplementalGroups": [
-         0
-        ],
-        "uid": 65534
-       }
       }
      }
     ],
-    "hostIP": "10.128.0.79",
     "observedGeneration": 1,
     "phase": "Running",
-    "podIP": "10.32.4.9",
-    "qosClass": "Burstable",
     "startTime": "2026-10-07T04:03:41Z"
    }
   },
@@ -1678,7 +1178,6 @@
    "metadata": {
     "creationTimestamp": "2026-10-07T04:03:41Z",
     "generateName": "arch-pinned-worker-c5f7b64fb-",
-    "generation": 1,
     "labels": {
      "app": "arch-pinned-worker",
      "pod-template-hash": "c5f7b64fb",
@@ -1696,12 +1195,9 @@
       "name": "arch-pinned-worker-c5f7b64fb",
       "uid": "1791e6df-f3da-4f49-a0a1-26c747204ce0"
      }
-    ],
-    "resourceVersion": "1791345840695583007",
-    "uid": "67b6ce75-fec9-497f-8f4a-c57aa3c4b0c1"
+    ]
    },
    "spec": {
-    "automountServiceAccountToken": false,
     "containers": [
      {
       "command": [
@@ -1710,7 +1206,6 @@
        "tail -f /dev/null"
       ],
       "image": "busybox:1.36",
-      "imagePullPolicy": "IfNotPresent",
       "name": "worker",
       "resources": {
        "limits": {
@@ -1720,32 +1215,15 @@
         "cpu": "10m",
         "memory": "16Mi"
        }
-      },
-      "terminationMessagePath": "/dev/termination-log",
-      "terminationMessagePolicy": "File"
+      }
      }
     ],
-    "dnsPolicy": "ClusterFirst",
-    "enableServiceLinks": true,
     "nodeName": "gke-seeded-a-default-pool-62ac8ee0-d595",
     "nodeSelector": {
      "beta.kubernetes.io/arch": "amd64"
     },
-    "preemptionPolicy": "PreemptLowerPriority",
-    "priority": 0,
     "restartPolicy": "Always",
-    "schedulerName": "default-scheduler",
-    "securityContext": {
-     "runAsNonRoot": true,
-     "runAsUser": 65534,
-     "seccompProfile": {
-      "type": "RuntimeDefault"
-     }
-    },
-    "serviceAccount": "default",
-    "serviceAccountName": "default",
     "shareProcessNamespace": false,
-    "terminationGracePeriodSeconds": 30,
     "volumes": []
    },
    "status": {
@@ -1788,48 +1266,20 @@
     ],
     "containerStatuses": [
      {
-      "allocatedResources": {
-       "cpu": "10m",
-       "memory": "16Mi"
-      },
-      "containerID": "containerd://b1d1db6f7fbb799828386931c5c391a161a3487b1c0844d85937acb448886068",
       "image": "docker.io/library/busybox:1.36",
-      "imageID": "docker.io/library/busybox@sha256:73aaf090f3d85aa34ee199857f03fa3a95c8ede2ffd4cc2cdb5b94e566b11662",
       "lastState": {},
       "name": "worker",
       "ready": true,
-      "resources": {
-       "limits": {
-        "memory": "32Mi"
-       },
-       "requests": {
-        "cpu": "10m",
-        "memory": "16Mi"
-       }
-      },
       "restartCount": 0,
-      "started": true,
       "state": {
        "running": {
         "startedAt": "2026-10-07T04:03:59Z"
        }
-      },
-      "user": {
-       "linux": {
-        "gid": 65534,
-        "supplementalGroups": [
-         65534
-        ],
-        "uid": 65534
-       }
       }
      }
     ],
-    "hostIP": "10.128.0.79",
     "observedGeneration": 1,
     "phase": "Running",
-    "podIP": "10.32.4.10",
-    "qosClass": "Burstable",
     "startTime": "2026-10-07T04:03:41Z"
    }
   },
@@ -1839,7 +1289,6 @@
    "metadata": {
     "creationTimestamp": "2026-10-07T04:03:41Z",
     "generateName": "cache-on-emptydir-5dd89c85b5-",
-    "generation": 1,
     "labels": {
      "app": "cache-on-emptydir",
      "pod-template-hash": "5dd89c85b5",
@@ -1857,12 +1306,9 @@
       "name": "cache-on-emptydir-5dd89c85b5",
       "uid": "482f14ad-444a-48b8-b0fc-04ba5a9336fb"
      }
-    ],
-    "resourceVersion": "1791345840650127016",
-    "uid": "612689e3-de78-400c-9022-dbef6de42125"
+    ]
    },
    "spec": {
-    "automountServiceAccountToken": false,
     "containers": [
      {
       "command": [
@@ -1871,7 +1317,6 @@
        "date -u > /var/cache/queue/stamp && tail -f /dev/null"
       ],
       "image": "busybox:1.36",
-      "imagePullPolicy": "IfNotPresent",
       "name": "queue",
       "resources": {
        "limits": {
@@ -1881,29 +1326,12 @@
         "cpu": "10m",
         "memory": "16Mi"
        }
-      },
-      "terminationMessagePath": "/dev/termination-log",
-      "terminationMessagePolicy": "File"
+      }
      }
     ],
-    "dnsPolicy": "ClusterFirst",
-    "enableServiceLinks": true,
     "nodeName": "gke-seeded-a-default-pool-62ac8ee0-d595",
-    "preemptionPolicy": "PreemptLowerPriority",
-    "priority": 0,
     "restartPolicy": "Always",
-    "schedulerName": "default-scheduler",
-    "securityContext": {
-     "runAsNonRoot": true,
-     "runAsUser": 65534,
-     "seccompProfile": {
-      "type": "RuntimeDefault"
-     }
-    },
-    "serviceAccount": "default",
-    "serviceAccountName": "default",
     "shareProcessNamespace": false,
-    "terminationGracePeriodSeconds": 30,
     "volumes": [
      {
       "emptyDir": {},
@@ -1951,54 +1379,20 @@
     ],
     "containerStatuses": [
      {
-      "allocatedResources": {
-       "cpu": "10m",
-       "memory": "16Mi"
-      },
-      "containerID": "containerd://1f860854a857dc37d53a53f284907816c0c22af62d4ee69760261c6464e5d73e",
       "image": "docker.io/library/busybox:1.36",
-      "imageID": "docker.io/library/busybox@sha256:73aaf090f3d85aa34ee199857f03fa3a95c8ede2ffd4cc2cdb5b94e566b11662",
       "lastState": {},
       "name": "queue",
       "ready": true,
-      "resources": {
-       "limits": {
-        "memory": "32Mi"
-       },
-       "requests": {
-        "cpu": "10m",
-        "memory": "16Mi"
-       }
-      },
       "restartCount": 0,
-      "started": true,
       "state": {
        "running": {
         "startedAt": "2026-10-07T04:03:59Z"
        }
-      },
-      "user": {
-       "linux": {
-        "gid": 65534,
-        "supplementalGroups": [
-         65534
-        ],
-        "uid": 65534
-       }
-      },
-      "volumeMounts": [
-       {
-        "mountPath": "/var/cache/queue",
-        "name": "queue"
-       }
-      ]
+      }
      }
     ],
-    "hostIP": "10.128.0.79",
     "observedGeneration": 1,
     "phase": "Running",
-    "podIP": "10.32.4.11",
-    "qosClass": "Burstable",
     "startTime": "2026-10-07T04:03:41Z"
    }
   },
@@ -2008,7 +1402,6 @@
    "metadata": {
     "creationTimestamp": "2026-10-07T18:27:11Z",
     "generateName": "cgroup-blind-jvm-79dd4fb5c-",
-    "generation": 1,
     "labels": {
      "app": "cgroup-blind-jvm",
      "pod-template-hash": "79dd4fb5c",
@@ -2026,12 +1419,9 @@
       "name": "cgroup-blind-jvm-79dd4fb5c",
       "uid": "bb082957-7214-4448-8a95-f3677e117154"
      }
-    ],
-    "resourceVersion": "1791397644282943014",
-    "uid": "64b256f2-5b21-4a62-bbc1-bef0ae87804b"
+    ]
    },
    "spec": {
-    "automountServiceAccountToken": false,
     "containers": [
      {
       "command": [
@@ -2040,7 +1430,6 @@
        "java -version && exec sleep infinity"
       ],
       "image": "docker.io/library/eclipse-temurin:8u302-b08-jre",
-      "imagePullPolicy": "IfNotPresent",
       "name": "jvm",
       "resources": {
        "limits": {
@@ -2050,29 +1439,12 @@
         "cpu": "10m",
         "memory": "64Mi"
        }
-      },
-      "terminationMessagePath": "/dev/termination-log",
-      "terminationMessagePolicy": "File"
+      }
      }
     ],
-    "dnsPolicy": "ClusterFirst",
-    "enableServiceLinks": true,
     "nodeName": "gke-seeded-a-default-pool-62ac8ee0-mbzp",
-    "preemptionPolicy": "PreemptLowerPriority",
-    "priority": 0,
     "restartPolicy": "Always",
-    "schedulerName": "default-scheduler",
-    "securityContext": {
-     "runAsNonRoot": true,
-     "runAsUser": 65534,
-     "seccompProfile": {
-      "type": "RuntimeDefault"
-     }
-    },
-    "serviceAccount": "default",
-    "serviceAccountName": "default",
     "shareProcessNamespace": false,
-    "terminationGracePeriodSeconds": 30,
     "volumes": []
    },
    "status": {
@@ -2115,48 +1487,20 @@
     ],
     "containerStatuses": [
      {
-      "allocatedResources": {
-       "cpu": "10m",
-       "memory": "64Mi"
-      },
-      "containerID": "containerd://79009823a8c44ab1930efe04b5f7fab3131c18be4394581f3bcc60664efd7556",
       "image": "docker.io/library/eclipse-temurin:8u302-b08-jre",
-      "imageID": "docker.io/library/eclipse-temurin@sha256:df2aa55a0c191367f9c7a9445044dd58ec80222bcf5457aa410c0b0d2c9efb58",
       "lastState": {},
       "name": "jvm",
       "ready": true,
-      "resources": {
-       "limits": {
-        "memory": "192Mi"
-       },
-       "requests": {
-        "cpu": "10m",
-        "memory": "64Mi"
-       }
-      },
       "restartCount": 0,
-      "started": true,
       "state": {
        "running": {
         "startedAt": "2026-10-07T18:27:23Z"
        }
-      },
-      "user": {
-       "linux": {
-        "gid": 65534,
-        "supplementalGroups": [
-         65534
-        ],
-        "uid": 65534
-       }
       }
      }
     ],
-    "hostIP": "10.128.0.17",
     "observedGeneration": 1,
     "phase": "Running",
-    "podIP": "10.32.2.100",
-    "qosClass": "Burstable",
     "startTime": "2026-10-07T18:27:11Z"
    }
   },
@@ -2166,7 +1510,6 @@
    "metadata": {
     "creationTimestamp": "2026-10-07T18:27:11Z",
     "generateName": "cni-shaped-agent-",
-    "generation": 1,
     "labels": {
      "app": "cni-shaped-agent",
      "controller-revision-hash": "547d5c68f5",
@@ -2185,35 +1528,12 @@
       "name": "cni-shaped-agent",
       "uid": "5713909c-17e5-4564-9904-e2b97d34b56b"
      }
-    ],
-    "resourceVersion": "1791397634284591021",
-    "uid": "7dbd20ac-fd84-45d3-af22-a188e06d4f68"
+    ]
    },
    "spec": {
-    "affinity": {
-     "nodeAffinity": {
-      "requiredDuringSchedulingIgnoredDuringExecution": {
-       "nodeSelectorTerms": [
-        {
-         "matchFields": [
-          {
-           "key": "metadata.name",
-           "operator": "In",
-           "values": [
-            "gke-seeded-a-default-pool-62ac8ee0-d595"
-           ]
-          }
-         ]
-        }
-       ]
-      }
-     }
-    },
-    "automountServiceAccountToken": false,
     "containers": [
      {
       "image": "registry.k8s.io/pause:3.10",
-      "imagePullPolicy": "IfNotPresent",
       "name": "agent",
       "resources": {
        "limits": {
@@ -2223,30 +1543,13 @@
         "cpu": "5m",
         "memory": "8Mi"
        }
-      },
-      "terminationMessagePath": "/dev/termination-log",
-      "terminationMessagePolicy": "File"
+      }
      }
     ],
-    "dnsPolicy": "ClusterFirst",
-    "enableServiceLinks": true,
     "hostNetwork": true,
     "nodeName": "gke-seeded-a-default-pool-62ac8ee0-d595",
-    "preemptionPolicy": "PreemptLowerPriority",
-    "priority": 0,
     "restartPolicy": "Always",
-    "schedulerName": "default-scheduler",
-    "securityContext": {
-     "runAsNonRoot": true,
-     "runAsUser": 65534,
-     "seccompProfile": {
-      "type": "RuntimeDefault"
-     }
-    },
-    "serviceAccount": "default",
-    "serviceAccountName": "default",
     "shareProcessNamespace": false,
-    "terminationGracePeriodSeconds": 30,
     "volumes": [
      {
       "hostPath": {
@@ -2297,56 +1600,20 @@
     ],
     "containerStatuses": [
      {
-      "allocatedResources": {
-       "cpu": "5m",
-       "memory": "8Mi"
-      },
-      "containerID": "containerd://482796d10ee93aac4842a8dbb541149a8a9edb5307463083a1c17f31bbe22ac7",
       "image": "registry.k8s.io/pause:3.10",
-      "imageID": "registry.k8s.io/pause@sha256:ee6521f290b2168b6e0935a181d4cff9be1ac3f505666ef0e3c98fae8199917a",
       "lastState": {},
       "name": "agent",
       "ready": true,
-      "resources": {
-       "limits": {
-        "memory": "16Mi"
-       },
-       "requests": {
-        "cpu": "5m",
-        "memory": "8Mi"
-       }
-      },
       "restartCount": 0,
-      "started": true,
       "state": {
        "running": {
         "startedAt": "2026-10-07T18:27:13Z"
        }
-      },
-      "user": {
-       "linux": {
-        "gid": 0,
-        "supplementalGroups": [
-         0
-        ],
-        "uid": 65534
-       }
-      },
-      "volumeMounts": [
-       {
-        "mountPath": "/host/etc/cni/net.d",
-        "name": "cni-conf",
-        "readOnly": true,
-        "recursiveReadOnly": "Disabled"
-       }
-      ]
+      }
      }
     ],
-    "hostIP": "10.128.0.79",
     "observedGeneration": 1,
     "phase": "Running",
-    "podIP": "10.128.0.79",
-    "qosClass": "Burstable",
     "startTime": "2026-10-07T18:27:11Z"
    }
   },
@@ -2356,7 +1623,6 @@
    "metadata": {
     "creationTimestamp": "2026-10-07T18:27:11Z",
     "generateName": "cni-shaped-agent-",
-    "generation": 1,
     "labels": {
      "app": "cni-shaped-agent",
      "controller-revision-hash": "547d5c68f5",
@@ -2375,35 +1641,12 @@
       "name": "cni-shaped-agent",
       "uid": "5713909c-17e5-4564-9904-e2b97d34b56b"
      }
-    ],
-    "resourceVersion": "1791397634165647001",
-    "uid": "3c9d0e7d-7386-4357-8ec3-171d65fb4bae"
+    ]
    },
    "spec": {
-    "affinity": {
-     "nodeAffinity": {
-      "requiredDuringSchedulingIgnoredDuringExecution": {
-       "nodeSelectorTerms": [
-        {
-         "matchFields": [
-          {
-           "key": "metadata.name",
-           "operator": "In",
-           "values": [
-            "gke-seeded-a-default-pool-62ac8ee0-mbzp"
-           ]
-          }
-         ]
-        }
-       ]
-      }
-     }
-    },
-    "automountServiceAccountToken": false,
     "containers": [
      {
       "image": "registry.k8s.io/pause:3.10",
-      "imagePullPolicy": "IfNotPresent",
       "name": "agent",
       "resources": {
        "limits": {
@@ -2413,30 +1656,13 @@
         "cpu": "5m",
         "memory": "8Mi"
        }
-      },
-      "terminationMessagePath": "/dev/termination-log",
-      "terminationMessagePolicy": "File"
+      }
      }
     ],
-    "dnsPolicy": "ClusterFirst",
-    "enableServiceLinks": true,
     "hostNetwork": true,
     "nodeName": "gke-seeded-a-default-pool-62ac8ee0-mbzp",
-    "preemptionPolicy": "PreemptLowerPriority",
-    "priority": 0,
     "restartPolicy": "Always",
-    "schedulerName": "default-scheduler",
-    "securityContext": {
-     "runAsNonRoot": true,
-     "runAsUser": 65534,
-     "seccompProfile": {
-      "type": "RuntimeDefault"
-     }
-    },
-    "serviceAccount": "default",
-    "serviceAccountName": "default",
     "shareProcessNamespace": false,
-    "terminationGracePeriodSeconds": 30,
     "volumes": [
      {
       "hostPath": {
@@ -2487,56 +1713,20 @@
     ],
     "containerStatuses": [
      {
-      "allocatedResources": {
-       "cpu": "5m",
-       "memory": "8Mi"
-      },
-      "containerID": "containerd://3a343587ad9bac0df68cf459fccfe56a5331479ea89c78e0b1d2dba2d7e09443",
       "image": "registry.k8s.io/pause:3.10",
-      "imageID": "registry.k8s.io/pause@sha256:ee6521f290b2168b6e0935a181d4cff9be1ac3f505666ef0e3c98fae8199917a",
       "lastState": {},
       "name": "agent",
       "ready": true,
-      "resources": {
-       "limits": {
-        "memory": "16Mi"
-       },
-       "requests": {
-        "cpu": "5m",
-        "memory": "8Mi"
-       }
-      },
       "restartCount": 0,
-      "started": true,
       "state": {
        "running": {
         "startedAt": "2026-10-07T18:27:13Z"
        }
-      },
-      "user": {
-       "linux": {
-        "gid": 0,
-        "supplementalGroups": [
-         0
-        ],
-        "uid": 65534
-       }
-      },
-      "volumeMounts": [
-       {
-        "mountPath": "/host/etc/cni/net.d",
-        "name": "cni-conf",
-        "readOnly": true,
-        "recursiveReadOnly": "Disabled"
-       }
-      ]
+      }
      }
     ],
-    "hostIP": "10.128.0.17",
     "observedGeneration": 1,
     "phase": "Running",
-    "podIP": "10.128.0.17",
-    "qosClass": "Burstable",
     "startTime": "2026-10-07T18:27:11Z"
    }
   },
@@ -2546,7 +1736,6 @@
    "metadata": {
     "creationTimestamp": "2026-10-07T04:09:35Z",
     "generateName": "intree-pd-reader-5569d9d897-",
-    "generation": 1,
     "labels": {
      "app": "intree-pd-reader",
      "pod-template-hash": "5569d9d897",
@@ -2564,12 +1753,9 @@
       "name": "intree-pd-reader-5569d9d897",
       "uid": "cc39855d-2b41-4aef-b555-6edc75b8e62e"
      }
-    ],
-    "resourceVersion": "1791346222908767016",
-    "uid": "0493759d-bf8f-4fbb-8942-0ac30d0f4be0"
+    ]
    },
    "spec": {
-    "automountServiceAccountToken": false,
     "containers": [
      {
       "command": [
@@ -2578,7 +1764,6 @@
        "tail -f /dev/null"
       ],
       "image": "busybox:1.36",
-      "imagePullPolicy": "IfNotPresent",
       "name": "reader",
       "resources": {
        "limits": {
@@ -2588,30 +1773,12 @@
         "cpu": "10m",
         "memory": "16Mi"
        }
-      },
-      "terminationMessagePath": "/dev/termination-log",
-      "terminationMessagePolicy": "File"
+      }
      }
     ],
-    "dnsPolicy": "ClusterFirst",
-    "enableServiceLinks": true,
     "nodeName": "gke-seeded-a-default-pool-62ac8ee0-d595",
-    "preemptionPolicy": "PreemptLowerPriority",
-    "priority": 0,
     "restartPolicy": "Always",
-    "schedulerName": "default-scheduler",
-    "securityContext": {
-     "fsGroup": 65534,
-     "runAsNonRoot": true,
-     "runAsUser": 65534,
-     "seccompProfile": {
-      "type": "RuntimeDefault"
-     }
-    },
-    "serviceAccount": "default",
-    "serviceAccountName": "default",
     "shareProcessNamespace": false,
-    "terminationGracePeriodSeconds": 30,
     "volumes": [
      {
       "name": "data",
@@ -2661,56 +1828,20 @@
     ],
     "containerStatuses": [
      {
-      "allocatedResources": {
-       "cpu": "10m",
-       "memory": "16Mi"
-      },
-      "containerID": "containerd://87a78982b086f4dbf9d14940050a081e891f41d4a10101a4021df3d82f7b1c44",
       "image": "docker.io/library/busybox:1.36",
-      "imageID": "docker.io/library/busybox@sha256:73aaf090f3d85aa34ee199857f03fa3a95c8ede2ffd4cc2cdb5b94e566b11662",
       "lastState": {},
       "name": "reader",
       "ready": true,
-      "resources": {
-       "limits": {
-        "memory": "32Mi"
-       },
-       "requests": {
-        "cpu": "10m",
-        "memory": "16Mi"
-       }
-      },
       "restartCount": 0,
-      "started": true,
       "state": {
        "running": {
         "startedAt": "2026-10-07T04:10:22Z"
        }
-      },
-      "user": {
-       "linux": {
-        "gid": 65534,
-        "supplementalGroups": [
-         65534
-        ],
-        "uid": 65534
-       }
-      },
-      "volumeMounts": [
-       {
-        "mountPath": "/data",
-        "name": "data",
-        "readOnly": true,
-        "recursiveReadOnly": "Disabled"
-       }
-      ]
+      }
      }
     ],
-    "hostIP": "10.128.0.79",
     "observedGeneration": 1,
     "phase": "Running",
-    "podIP": "10.32.4.14",
-    "qosClass": "Burstable",
     "startTime": "2026-10-07T04:09:35Z"
    }
   },
@@ -2720,7 +1851,6 @@
    "metadata": {
     "creationTimestamp": "2026-10-07T04:09:35Z",
     "generateName": "legacy-registry-pull-7979df9ddc-",
-    "generation": 1,
     "labels": {
      "app": "legacy-registry-pull",
      "pod-template-hash": "7979df9ddc",
@@ -2738,16 +1868,12 @@
       "name": "legacy-registry-pull-7979df9ddc",
       "uid": "9336e634-4021-4460-82a9-433a3f050da0"
      }
-    ],
-    "resourceVersion": "1791346205844287000",
-    "uid": "2f7fff36-d92e-4fcc-8ea3-d055e87544ce"
+    ]
    },
    "spec": {
-    "automountServiceAccountToken": false,
     "containers": [
      {
       "image": "k8s.gcr.io/pause:3.9",
-      "imagePullPolicy": "Always",
       "name": "pause",
       "resources": {
        "limits": {
@@ -2757,29 +1883,12 @@
         "cpu": "10m",
         "memory": "16Mi"
        }
-      },
-      "terminationMessagePath": "/dev/termination-log",
-      "terminationMessagePolicy": "File"
+      }
      }
     ],
-    "dnsPolicy": "ClusterFirst",
-    "enableServiceLinks": true,
     "nodeName": "gke-seeded-a-default-pool-62ac8ee0-mbzp",
-    "preemptionPolicy": "PreemptLowerPriority",
-    "priority": 0,
     "restartPolicy": "Always",
-    "schedulerName": "default-scheduler",
-    "securityContext": {
-     "runAsNonRoot": true,
-     "runAsUser": 65534,
-     "seccompProfile": {
-      "type": "RuntimeDefault"
-     }
-    },
-    "serviceAccount": "default",
-    "serviceAccountName": "default",
     "shareProcessNamespace": false,
-    "terminationGracePeriodSeconds": 30,
     "volumes": []
    },
    "status": {
@@ -2822,48 +1931,20 @@
     ],
     "containerStatuses": [
      {
-      "allocatedResources": {
-       "cpu": "10m",
-       "memory": "16Mi"
-      },
-      "containerID": "containerd://5bb9917463da2d10407ff3c73957222fb806af8c38c0b9d1cb50006a61c41d00",
       "image": "k8s.gcr.io/pause:3.9",
-      "imageID": "k8s.gcr.io/pause@sha256:7031c1b283388d2c2e09b57badb803c05ebed362dc88d84b480cc47f72a21097",
       "lastState": {},
       "name": "pause",
       "ready": true,
-      "resources": {
-       "limits": {
-        "memory": "32Mi"
-       },
-       "requests": {
-        "cpu": "10m",
-        "memory": "16Mi"
-       }
-      },
       "restartCount": 0,
-      "started": true,
       "state": {
        "running": {
         "startedAt": "2026-10-07T04:10:05Z"
        }
-      },
-      "user": {
-       "linux": {
-        "gid": 0,
-        "supplementalGroups": [
-         0
-        ],
-        "uid": 65534
-       }
       }
      }
     ],
-    "hostIP": "10.128.0.17",
     "observedGeneration": 1,
     "phase": "Running",
-    "podIP": "10.32.2.13",
-    "qosClass": "Burstable",
     "startTime": "2026-10-07T04:09:35Z"
    }
   },
@@ -2873,7 +1954,6 @@
    "metadata": {
     "creationTimestamp": "2026-10-07T18:27:11Z",
     "generateName": "multi-process-worker-56d6db4478-",
-    "generation": 1,
     "labels": {
      "app": "multi-process-worker",
      "pod-template-hash": "56d6db4478",
@@ -2891,12 +1971,9 @@
       "name": "multi-process-worker-56d6db4478",
       "uid": "7bdd80b1-c64c-433a-b1ec-57b9c26a1420"
      }
-    ],
-    "resourceVersion": "1791397633150543013",
-    "uid": "324fd932-32b8-4fa0-813a-2606f0e1c123"
+    ]
    },
    "spec": {
-    "automountServiceAccountToken": false,
     "containers": [
      {
       "command": [
@@ -2905,7 +1982,6 @@
        "sleep infinity & sleep infinity & wait"
       ],
       "image": "busybox:1.36",
-      "imagePullPolicy": "IfNotPresent",
       "name": "supervisor",
       "resources": {
        "limits": {
@@ -2915,29 +1991,12 @@
         "cpu": "10m",
         "memory": "16Mi"
        }
-      },
-      "terminationMessagePath": "/dev/termination-log",
-      "terminationMessagePolicy": "File"
+      }
      }
     ],
-    "dnsPolicy": "ClusterFirst",
-    "enableServiceLinks": true,
     "nodeName": "gke-seeded-a-default-pool-62ac8ee0-mbzp",
-    "preemptionPolicy": "PreemptLowerPriority",
-    "priority": 0,
     "restartPolicy": "Always",
-    "schedulerName": "default-scheduler",
-    "securityContext": {
-     "runAsNonRoot": true,
-     "runAsUser": 65534,
-     "seccompProfile": {
-      "type": "RuntimeDefault"
-     }
-    },
-    "serviceAccount": "default",
-    "serviceAccountName": "default",
     "shareProcessNamespace": false,
-    "terminationGracePeriodSeconds": 30,
     "volumes": []
    },
    "status": {
@@ -2980,48 +2039,20 @@
     ],
     "containerStatuses": [
      {
-      "allocatedResources": {
-       "cpu": "10m",
-       "memory": "16Mi"
-      },
-      "containerID": "containerd://881a528350cd175ef2b3e93f53503cc4dbd788f4b9371eb8708b845b8cc5e594",
       "image": "docker.io/library/busybox:1.36",
-      "imageID": "docker.io/library/busybox@sha256:73aaf090f3d85aa34ee199857f03fa3a95c8ede2ffd4cc2cdb5b94e566b11662",
       "lastState": {},
       "name": "supervisor",
       "ready": true,
-      "resources": {
-       "limits": {
-        "memory": "32Mi"
-       },
-       "requests": {
-        "cpu": "10m",
-        "memory": "16Mi"
-       }
-      },
       "restartCount": 0,
-      "started": true,
       "state": {
        "running": {
         "startedAt": "2026-10-07T18:27:12Z"
        }
-      },
-      "user": {
-       "linux": {
-        "gid": 65534,
-        "supplementalGroups": [
-         65534
-        ],
-        "uid": 65534
-       }
       }
      }
     ],
-    "hostIP": "10.128.0.17",
     "observedGeneration": 1,
     "phase": "Running",
-    "podIP": "10.32.2.101",
-    "qosClass": "Burstable",
     "startTime": "2026-10-07T18:27:11Z"
    }
   },
@@ -3031,7 +2062,6 @@
    "metadata": {
     "creationTimestamp": "2026-10-07T04:03:34Z",
     "generateName": "node-runtime-probe-",
-    "generation": 1,
     "labels": {
      "app": "node-runtime-probe",
      "controller-revision-hash": "7c44b579f8",
@@ -3050,31 +2080,9 @@
       "name": "node-runtime-probe",
       "uid": "efbf1004-8123-4b6a-a550-5028122a6d36"
      }
-    ],
-    "resourceVersion": "1791345826236831014",
-    "uid": "d85fc452-b0a6-4e1d-b27c-ea657f9e580c"
+    ]
    },
    "spec": {
-    "affinity": {
-     "nodeAffinity": {
-      "requiredDuringSchedulingIgnoredDuringExecution": {
-       "nodeSelectorTerms": [
-        {
-         "matchFields": [
-          {
-           "key": "metadata.name",
-           "operator": "In",
-           "values": [
-            "gke-seeded-a-default-pool-62ac8ee0-d595"
-           ]
-          }
-         ]
-        }
-       ]
-      }
-     }
-    },
-    "automountServiceAccountToken": false,
     "containers": [
      {
       "command": [
@@ -3083,7 +2091,6 @@
        "test -S /run/containerd/containerd.sock; tail -f /dev/null"
       ],
       "image": "busybox:1.36",
-      "imagePullPolicy": "IfNotPresent",
       "name": "probe",
       "resources": {
        "limits": {
@@ -3093,29 +2100,12 @@
         "cpu": "10m",
         "memory": "16Mi"
        }
-      },
-      "terminationMessagePath": "/dev/termination-log",
-      "terminationMessagePolicy": "File"
+      }
      }
     ],
-    "dnsPolicy": "ClusterFirst",
-    "enableServiceLinks": true,
     "nodeName": "gke-seeded-a-default-pool-62ac8ee0-d595",
-    "preemptionPolicy": "PreemptLowerPriority",
-    "priority": 0,
     "restartPolicy": "Always",
-    "schedulerName": "default-scheduler",
-    "securityContext": {
-     "runAsNonRoot": true,
-     "runAsUser": 65534,
-     "seccompProfile": {
-      "type": "RuntimeDefault"
-     }
-    },
-    "serviceAccount": "default",
-    "serviceAccountName": "default",
     "shareProcessNamespace": false,
-    "terminationGracePeriodSeconds": 30,
     "volumes": [
      {
       "hostPath": {
@@ -3166,56 +2156,20 @@
     ],
     "containerStatuses": [
      {
-      "allocatedResources": {
-       "cpu": "10m",
-       "memory": "16Mi"
-      },
-      "containerID": "containerd://86a72f01c852e841ec9ecb7e036c37b32d4a80c5c62f6534d6e82a3e6e7637a1",
       "image": "docker.io/library/busybox:1.36",
-      "imageID": "docker.io/library/busybox@sha256:73aaf090f3d85aa34ee199857f03fa3a95c8ede2ffd4cc2cdb5b94e566b11662",
       "lastState": {},
       "name": "probe",
       "ready": true,
-      "resources": {
-       "limits": {
-        "memory": "32Mi"
-       },
-       "requests": {
-        "cpu": "10m",
-        "memory": "16Mi"
-       }
-      },
       "restartCount": 0,
-      "started": true,
       "state": {
        "running": {
         "startedAt": "2026-10-07T04:03:45Z"
        }
-      },
-      "user": {
-       "linux": {
-        "gid": 65534,
-        "supplementalGroups": [
-         65534
-        ],
-        "uid": 65534
-       }
-      },
-      "volumeMounts": [
-       {
-        "mountPath": "/run/containerd/containerd.sock",
-        "name": "sock",
-        "readOnly": true,
-        "recursiveReadOnly": "Disabled"
-       }
-      ]
+      }
      }
     ],
-    "hostIP": "10.128.0.79",
     "observedGeneration": 1,
     "phase": "Running",
-    "podIP": "10.32.4.2",
-    "qosClass": "Burstable",
     "startTime": "2026-10-07T04:03:34Z"
    }
   },
@@ -3225,7 +2179,6 @@
    "metadata": {
     "creationTimestamp": "2026-10-07T04:09:12Z",
     "generateName": "node-runtime-probe-",
-    "generation": 1,
     "labels": {
      "app": "node-runtime-probe",
      "controller-revision-hash": "7c44b579f8",
@@ -3244,31 +2197,9 @@
       "name": "node-runtime-probe",
       "uid": "efbf1004-8123-4b6a-a550-5028122a6d36"
      }
-    ],
-    "resourceVersion": "1791346167888639007",
-    "uid": "016e67de-4748-478e-9c45-7e31847ec9d3"
+    ]
    },
    "spec": {
-    "affinity": {
-     "nodeAffinity": {
-      "requiredDuringSchedulingIgnoredDuringExecution": {
-       "nodeSelectorTerms": [
-        {
-         "matchFields": [
-          {
-           "key": "metadata.name",
-           "operator": "In",
-           "values": [
-            "gke-seeded-a-default-pool-62ac8ee0-mbzp"
-           ]
-          }
-         ]
-        }
-       ]
-      }
-     }
-    },
-    "automountServiceAccountToken": false,
     "containers": [
      {
       "command": [
@@ -3277,7 +2208,6 @@
        "test -S /run/containerd/containerd.sock; tail -f /dev/null"
       ],
       "image": "busybox:1.36",
-      "imagePullPolicy": "IfNotPresent",
       "name": "probe",
       "resources": {
        "limits": {
@@ -3287,29 +2217,12 @@
         "cpu": "10m",
         "memory": "16Mi"
        }
-      },
-      "terminationMessagePath": "/dev/termination-log",
-      "terminationMessagePolicy": "File"
+      }
      }
     ],
-    "dnsPolicy": "ClusterFirst",
-    "enableServiceLinks": true,
     "nodeName": "gke-seeded-a-default-pool-62ac8ee0-mbzp",
-    "preemptionPolicy": "PreemptLowerPriority",
-    "priority": 0,
     "restartPolicy": "Always",
-    "schedulerName": "default-scheduler",
-    "securityContext": {
-     "runAsNonRoot": true,
-     "runAsUser": 65534,
-     "seccompProfile": {
-      "type": "RuntimeDefault"
-     }
-    },
-    "serviceAccount": "default",
-    "serviceAccountName": "default",
     "shareProcessNamespace": false,
-    "terminationGracePeriodSeconds": 30,
     "volumes": [
      {
       "hostPath": {
@@ -3360,56 +2273,20 @@
     ],
     "containerStatuses": [
      {
-      "allocatedResources": {
-       "cpu": "10m",
-       "memory": "16Mi"
-      },
-      "containerID": "containerd://ca4c4f88d4ea9b9b31d861734d9e6c70fc0795b5be6bd6f4078b20613bb50503",
       "image": "docker.io/library/busybox:1.36",
-      "imageID": "docker.io/library/busybox@sha256:73aaf090f3d85aa34ee199857f03fa3a95c8ede2ffd4cc2cdb5b94e566b11662",
       "lastState": {},
       "name": "probe",
       "ready": true,
-      "resources": {
-       "limits": {
-        "memory": "32Mi"
-       },
-       "requests": {
-        "cpu": "10m",
-        "memory": "16Mi"
-       }
-      },
       "restartCount": 0,
-      "started": true,
       "state": {
        "running": {
         "startedAt": "2026-10-07T04:09:27Z"
        }
-      },
-      "user": {
-       "linux": {
-        "gid": 65534,
-        "supplementalGroups": [
-         65534
-        ],
-        "uid": 65534
-       }
-      },
-      "volumeMounts": [
-       {
-        "mountPath": "/run/containerd/containerd.sock",
-        "name": "sock",
-        "readOnly": true,
-        "recursiveReadOnly": "Disabled"
-       }
-      ]
+      }
      }
     ],
-    "hostIP": "10.128.0.17",
     "observedGeneration": 1,
     "phase": "Running",
-    "podIP": "10.32.2.2",
-    "qosClass": "Burstable",
     "startTime": "2026-10-07T04:09:12Z"
    }
   },
@@ -3419,7 +2296,6 @@
    "metadata": {
     "creationTimestamp": "2026-10-08T17:20:00Z",
     "generateName": "stale-kubectl-client-29858000-",
-    "generation": 1,
     "labels": {
      "app": "stale-kubectl-client",
      "batch.kubernetes.io/controller-uid": "c2028037-5e39-4480-8334-f3110dd85819",
@@ -3440,12 +2316,9 @@
       "name": "stale-kubectl-client-29858000",
       "uid": "c2028037-5e39-4480-8334-f3110dd85819"
      }
-    ],
-    "resourceVersion": "1791480005445663012",
-    "uid": "d164d25f-fd39-4ffe-a4fe-42145bb3f443"
+    ]
    },
    "spec": {
-    "automountServiceAccountToken": true,
     "containers": [
      {
       "command": [
@@ -3453,7 +2326,6 @@
        "version"
       ],
       "image": "registry.k8s.io/kubectl:v1.29.0",
-      "imagePullPolicy": "IfNotPresent",
       "name": "kubectl",
       "resources": {
        "limits": {
@@ -3463,29 +2335,12 @@
         "cpu": "10m",
         "memory": "32Mi"
        }
-      },
-      "terminationMessagePath": "/dev/termination-log",
-      "terminationMessagePolicy": "File"
+      }
      }
     ],
-    "dnsPolicy": "ClusterFirst",
-    "enableServiceLinks": true,
     "nodeName": "gke-seeded-a-default-pool-62ac8ee0-mbzp",
-    "preemptionPolicy": "PreemptLowerPriority",
-    "priority": 0,
     "restartPolicy": "Never",
-    "schedulerName": "default-scheduler",
-    "securityContext": {
-     "runAsNonRoot": true,
-     "runAsUser": 65534,
-     "seccompProfile": {
-      "type": "RuntimeDefault"
-     }
-    },
-    "serviceAccount": "stale-kubectl-client",
-    "serviceAccountName": "stale-kubectl-client",
     "shareProcessNamespace": false,
-    "terminationGracePeriodSeconds": 30,
     "volumes": []
    },
    "status": {
@@ -3531,27 +2386,11 @@
     ],
     "containerStatuses": [
      {
-      "allocatedResources": {
-       "cpu": "10m",
-       "memory": "32Mi"
-      },
-      "containerID": "containerd://91085d319b2a096df928f409dfc0a975f2265377945ad6a9193a8b1a013b6050",
       "image": "registry.k8s.io/kubectl:v1.29.0",
-      "imageID": "registry.k8s.io/kubectl@sha256:22777ea6f2a2044f1bf0fde8f28f1e40552bf140e2e8f7cdc84ea50685ea7bc6",
       "lastState": {},
       "name": "kubectl",
       "ready": false,
-      "resources": {
-       "limits": {
-        "memory": "64Mi"
-       },
-       "requests": {
-        "cpu": "10m",
-        "memory": "32Mi"
-       }
-      },
       "restartCount": 0,
-      "started": false,
       "state": {
        "terminated": {
         "containerID": "containerd://91085d319b2a096df928f409dfc0a975f2265377945ad6a9193a8b1a013b6050",
@@ -3560,31 +2399,11 @@
         "reason": "Completed",
         "startedAt": "2026-10-08T17:20:01Z"
        }
-      },
-      "user": {
-       "linux": {
-        "gid": 65534,
-        "supplementalGroups": [
-         65534
-        ],
-        "uid": 65534
-       }
-      },
-      "volumeMounts": [
-       {
-        "mountPath": "/var/run/secrets/kubernetes.io/serviceaccount",
-        "name": "kube-api-access-kc92m",
-        "readOnly": true,
-        "recursiveReadOnly": "Disabled"
-       }
-      ]
+      }
      }
     ],
-    "hostIP": "10.128.0.17",
     "observedGeneration": 1,
     "phase": "Succeeded",
-    "podIP": "10.32.2.142",
-    "qosClass": "Burstable",
     "startTime": "2026-10-08T17:20:00Z"
    }
   },
@@ -3594,7 +2413,6 @@
    "metadata": {
     "creationTimestamp": "2026-10-07T18:27:18Z",
     "generateName": "inventory-api-5467d66b99-",
-    "generation": 1,
     "labels": {
      "app": "inventory-api",
      "pod-template-hash": "5467d66b99",
@@ -3612,12 +2430,9 @@
       "name": "inventory-api-5467d66b99",
       "uid": "ed41bbf9-bf0a-44f1-ad72-764eaa0f7ac1"
      }
-    ],
-    "resourceVersion": "1791397640251247003",
-    "uid": "c5876258-0a3e-483e-afcf-ed741ca478c1"
+    ]
    },
    "spec": {
-    "automountServiceAccountToken": false,
     "containers": [
      {
       "envFrom": [
@@ -3629,7 +2444,6 @@
        }
       ],
       "image": "registry.k8s.io/pause:3.9",
-      "imagePullPolicy": "IfNotPresent",
       "name": "api",
       "resources": {
        "limits": {
@@ -3639,29 +2453,12 @@
         "cpu": "10m",
         "memory": "16Mi"
        }
-      },
-      "terminationMessagePath": "/dev/termination-log",
-      "terminationMessagePolicy": "File"
+      }
      }
     ],
-    "dnsPolicy": "ClusterFirst",
-    "enableServiceLinks": true,
     "nodeName": "gke-seeded-a-default-pool-62ac8ee0-mbzp",
-    "preemptionPolicy": "PreemptLowerPriority",
-    "priority": 0,
     "restartPolicy": "Always",
-    "schedulerName": "default-scheduler",
-    "securityContext": {
-     "runAsNonRoot": true,
-     "runAsUser": 65534,
-     "seccompProfile": {
-      "type": "RuntimeDefault"
-     }
-    },
-    "serviceAccount": "default",
-    "serviceAccountName": "default",
     "shareProcessNamespace": false,
-    "terminationGracePeriodSeconds": 30,
     "volumes": []
    },
    "status": {
@@ -3709,12 +2506,10 @@
     "containerStatuses": [
      {
       "image": "registry.k8s.io/pause:3.9",
-      "imageID": "",
       "lastState": {},
       "name": "api",
       "ready": false,
       "restartCount": 0,
-      "started": false,
       "state": {
        "waiting": {
         "message": "configmap \"inventory-flags\" not found",
@@ -3723,11 +2518,8 @@
       }
      }
     ],
-    "hostIP": "10.128.0.17",
     "observedGeneration": 1,
     "phase": "Pending",
-    "podIP": "10.32.2.104",
-    "qosClass": "Burstable",
     "startTime": "2026-10-07T18:27:18Z"
    }
   }

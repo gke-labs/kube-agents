@@ -5,14 +5,6 @@
    "apiVersion": "v1",
    "kind": "Pod",
    "metadata": {
-    "annotations": {
-     "components.gke.io/component-name": "kubedns",
-     "components.gke.io/component-version": "31.1.22",
-     "prometheus.io/port": "10054",
-     "prometheus.io/scrape": "true",
-     "scheduler.alpha.kubernetes.io/critical-pod": "",
-     "seccomp.security.alpha.kubernetes.io/pod": "runtime/default"
-    },
     "creationTimestamp": "2026-09-24T17:37:17Z",
     "generateName": "kube-dns-68987dd499-",
     "labels": {
@@ -30,34 +22,9 @@
       "name": "kube-dns-68987dd499",
       "uid": "6b13b689-ebe6-4711-a10b-dd4750082908"
      }
-    ],
-    "resourceVersion": "1790271621037583011",
-    "uid": "1c913c8a-14d1-4172-a656-b334637ccff9"
+    ]
    },
    "spec": {
-    "affinity": {
-     "podAntiAffinity": {
-      "preferredDuringSchedulingIgnoredDuringExecution": [
-       {
-        "podAffinityTerm": {
-         "labelSelector": {
-          "matchExpressions": [
-           {
-            "key": "k8s-app",
-            "operator": "In",
-            "values": [
-             "kube-dns"
-            ]
-           }
-          ]
-         },
-         "topologyKey": "kubernetes.io/hostname"
-        },
-        "weight": 100
-       }
-      ]
-     }
-    },
     "containers": [
      {
       "args": [
@@ -73,20 +40,7 @@
        }
       ],
       "image": "us-central1-artifactregistry.gcr.io/gke-release/gke-release/k8s-dns-kube-dns:1.23.0-gke.26@sha256:41c0efce009d2218312c8a287258f33944f0d34d2663ab7cb492b06e1501acfd",
-      "imagePullPolicy": "IfNotPresent",
       "name": "kubedns",
-      "ports": [
-       {
-        "containerPort": 10053,
-        "name": "dns-local",
-        "protocol": "UDP"
-       },
-       {
-        "containerPort": 10053,
-        "name": "dns-tcp-local",
-        "protocol": "TCP"
-       }
-      ],
       "resources": {
        "limits": {
         "memory": "210Mi"
@@ -95,9 +49,7 @@
         "cpu": "100m",
         "memory": "70Mi"
        }
-      },
-      "terminationMessagePath": "/dev/termination-log",
-      "terminationMessagePolicy": "File"
+      }
      },
      {
       "args": [
@@ -119,28 +71,13 @@
        "--max-tcp-connections=200"
       ],
       "image": "us-central1-artifactregistry.gcr.io/gke-release/gke-release/k8s-dns-dnsmasq-nanny:1.23.0-gke.26@sha256:6f3fee5a8420f28cc62a72cd0fdd43abd62b9b1ba19a39ae2d11300016557eaf",
-      "imagePullPolicy": "IfNotPresent",
       "name": "dnsmasq",
-      "ports": [
-       {
-        "containerPort": 53,
-        "name": "dns",
-        "protocol": "UDP"
-       },
-       {
-        "containerPort": 53,
-        "name": "dns-tcp",
-        "protocol": "TCP"
-       }
-      ],
       "resources": {
        "requests": {
         "cpu": "150m",
         "memory": "20Mi"
        }
-      },
-      "terminationMessagePath": "/dev/termination-log",
-      "terminationMessagePolicy": "File"
+      }
      },
      {
       "args": [
@@ -150,23 +87,13 @@
        "--probe=dnsmasq,127.0.0.1:53,kubernetes.default.svc.cluster.local,5,SRV"
       ],
       "image": "us-central1-artifactregistry.gcr.io/gke-release/gke-release/k8s-dns-sidecar:1.23.0-gke.26@sha256:c88f455964a8939d8616b3214b9af689710a07a07f9a6fd4847275bfa15fa439",
-      "imagePullPolicy": "IfNotPresent",
       "name": "sidecar",
-      "ports": [
-       {
-        "containerPort": 10054,
-        "name": "metrics",
-        "protocol": "TCP"
-       }
-      ],
       "resources": {
        "requests": {
         "cpu": "10m",
         "memory": "20Mi"
        }
-      },
-      "terminationMessagePath": "/dev/termination-log",
-      "terminationMessagePolicy": "File"
+      }
      },
      {
       "command": [
@@ -187,11 +114,8 @@
        }
       ],
       "image": "us-central1-artifactregistry.gcr.io/gke-release/gke-release/prometheus-to-sd:v0.11.12-gke.51@sha256:798127b7368b1a3a2851a6a336776739f32b0ed741d5d6ee07b97d6ac2998fa3",
-      "imagePullPolicy": "IfNotPresent",
       "name": "prometheus-to-sd",
-      "resources": {},
-      "terminationMessagePath": "/dev/termination-log",
-      "terminationMessagePolicy": "File"
+      "resources": {}
      },
      {
       "env": [
@@ -209,7 +133,7 @@
        },
        {
         "name": "PROJECT_NUMBER",
-        "value": "196584622296"
+        "value": "000000000000"
        },
        {
         "name": "LOCATION",
@@ -240,7 +164,6 @@
        }
       ],
       "image": "us-central1-artifactregistry.gcr.io/gke-release/gke-release/gke-metrics-collector:20260401_2300_RC0@sha256:258912d769fd027c80bd086f5a4a6389520b698f9c851bfb4737b2ba97b19b23",
-      "imagePullPolicy": "IfNotPresent",
       "name": "kubedns-metrics-collector",
       "resources": {
        "limits": {
@@ -251,31 +174,14 @@
         "cpu": "5m",
         "memory": "30Mi"
        }
-      },
-      "terminationMessagePath": "/dev/termination-log",
-      "terminationMessagePolicy": "File"
+      }
      }
     ],
-    "dnsPolicy": "Default",
-    "enableServiceLinks": true,
     "nodeName": "gke-gemma-gpu-upgraded-default-pool-49d92e50-zcx6",
     "nodeSelector": {
      "kubernetes.io/os": "linux"
     },
-    "preemptionPolicy": "PreemptLowerPriority",
-    "priority": 2000000000,
-    "priorityClassName": "system-cluster-critical",
     "restartPolicy": "Always",
-    "schedulerName": "default-scheduler",
-    "securityContext": {
-     "fsGroup": 65534,
-     "supplementalGroups": [
-      65534
-     ]
-    },
-    "serviceAccount": "kube-dns",
-    "serviceAccountName": "kube-dns",
-    "terminationGracePeriodSeconds": 30,
     "volumes": [
      {
       "configMap": {
@@ -335,137 +241,67 @@
     ],
     "containerStatuses": [
      {
-      "containerID": "containerd://7a7e3a8767f228cd65c4b43761c9220f39eac8b15812d571d59256c74021ed5d",
       "image": "sha256:a8e3d43353b7acf469e83f43d282f8377dab8ca02e13d0b0032f2fe7daa8763c",
-      "imageID": "us-central1-artifactregistry.gcr.io/gke-release/gke-release/k8s-dns-dnsmasq-nanny@sha256:6f3fee5a8420f28cc62a72cd0fdd43abd62b9b1ba19a39ae2d11300016557eaf",
       "lastState": {},
       "name": "dnsmasq",
       "ready": true,
       "restartCount": 0,
-      "started": true,
       "state": {
        "running": {
         "startedAt": "2026-09-24T17:40:11Z"
        }
-      },
-      "volumeMounts": [
-       {
-        "mountPath": "/etc/k8s/dns/dnsmasq-nanny",
-        "name": "kube-dns-config"
-       },
-       {
-        "mountPath": "/var/run/secrets/kubernetes.io/serviceaccount",
-        "name": "kube-api-access-4kn5r",
-        "readOnly": true,
-        "recursiveReadOnly": "Disabled"
-       }
-      ]
+      }
      },
      {
-      "containerID": "containerd://3e1180358821141da29d1a5f56f175a973ae5feb9f2fa0a5ba8641e8ca104c95",
       "image": "sha256:81d82cc817499a6eef37cdd88697222113e17330ea2b7934e862aa0f996fb166",
-      "imageID": "us-central1-artifactregistry.gcr.io/gke-release/gke-release/k8s-dns-kube-dns@sha256:41c0efce009d2218312c8a287258f33944f0d34d2663ab7cb492b06e1501acfd",
       "lastState": {},
       "name": "kubedns",
       "ready": true,
       "restartCount": 0,
-      "started": true,
       "state": {
        "running": {
         "startedAt": "2026-09-24T17:40:00Z"
        }
-      },
-      "volumeMounts": [
-       {
-        "mountPath": "/kube-dns-config",
-        "name": "kube-dns-config"
-       },
-       {
-        "mountPath": "/var/run/secrets/kubernetes.io/serviceaccount",
-        "name": "kube-api-access-4kn5r",
-        "readOnly": true,
-        "recursiveReadOnly": "Disabled"
-       }
-      ]
+      }
      },
      {
-      "containerID": "containerd://37aac65b5de280f302ec196b91cf5e51a8f9600916d6e54786e9c38cf054fb01",
       "image": "sha256:36e68397d69bec5589017f391f48308fe0b2c988e3d62428428e7509e1b6ed10",
-      "imageID": "us-central1-artifactregistry.gcr.io/gke-release/gke-release/gke-metrics-collector@sha256:258912d769fd027c80bd086f5a4a6389520b698f9c851bfb4737b2ba97b19b23",
       "lastState": {},
       "name": "kubedns-metrics-collector",
       "ready": true,
       "restartCount": 0,
-      "started": true,
       "state": {
        "running": {
         "startedAt": "2026-09-24T17:40:20Z"
        }
-      },
-      "volumeMounts": [
-       {
-        "mountPath": "/conf",
-        "name": "kubedns-metrics-collector-config-map-vol"
-       },
-       {
-        "mountPath": "/var/run/secrets/kubernetes.io/serviceaccount",
-        "name": "kube-api-access-4kn5r",
-        "readOnly": true,
-        "recursiveReadOnly": "Disabled"
-       }
-      ]
+      }
      },
      {
-      "containerID": "containerd://f2e03b8e771fe1bc9d062e61553f55a2fa130ff63a44fe2afc12df8ab7d5a2a3",
       "image": "sha256:e2af0de8d45513e6a9aabff9f46fb7534009a8c5264f012656337795868efb77",
-      "imageID": "us-central1-artifactregistry.gcr.io/gke-release/gke-release/prometheus-to-sd@sha256:798127b7368b1a3a2851a6a336776739f32b0ed741d5d6ee07b97d6ac2998fa3",
       "lastState": {},
       "name": "prometheus-to-sd",
       "ready": true,
       "restartCount": 0,
-      "started": true,
       "state": {
        "running": {
         "startedAt": "2026-09-24T17:40:18Z"
        }
-      },
-      "volumeMounts": [
-       {
-        "mountPath": "/var/run/secrets/kubernetes.io/serviceaccount",
-        "name": "kube-api-access-4kn5r",
-        "readOnly": true,
-        "recursiveReadOnly": "Disabled"
-       }
-      ]
+      }
      },
      {
-      "containerID": "containerd://8580792b921be6560493adb19f0a5d962c4e9b8d89c3ed48f5e58d211da0b585",
       "image": "sha256:43e5005551e174ab71288e37f8107a0ad9e4ecbb0613a0c487dc237ac846af2d",
-      "imageID": "us-central1-artifactregistry.gcr.io/gke-release/gke-release/k8s-dns-sidecar@sha256:c88f455964a8939d8616b3214b9af689710a07a07f9a6fd4847275bfa15fa439",
       "lastState": {},
       "name": "sidecar",
       "ready": true,
       "restartCount": 0,
-      "started": true,
       "state": {
        "running": {
         "startedAt": "2026-09-24T17:40:14Z"
        }
-      },
-      "volumeMounts": [
-       {
-        "mountPath": "/var/run/secrets/kubernetes.io/serviceaccount",
-        "name": "kube-api-access-4kn5r",
-        "readOnly": true,
-        "recursiveReadOnly": "Disabled"
-       }
-      ]
+      }
      }
     ],
-    "hostIP": "10.128.15.206",
     "phase": "Running",
-    "podIP": "10.72.0.8",
-    "qosClass": "Burstable",
     "startTime": "2026-09-24T17:39:42Z"
    }
   },
@@ -473,15 +309,6 @@
    "apiVersion": "v1",
    "kind": "Pod",
    "metadata": {
-    "annotations": {
-     "cloud.google.com/cluster_autoscaler_unhelpable_since": "2026-09-24T18:04:04+0000",
-     "cloud.google.com/cluster_autoscaler_unhelpable_until": "Inf",
-     "components.gke.io/component-name": "kubedns",
-     "components.gke.io/component-version": "32.7.19",
-     "prometheus.io/port": "10054",
-     "prometheus.io/scrape": "true",
-     "scheduler.alpha.kubernetes.io/critical-pod": ""
-    },
     "creationTimestamp": "2026-09-24T18:03:57Z",
     "generateName": "kube-dns-797f658fb6-",
     "labels": {
@@ -499,34 +326,9 @@
       "name": "kube-dns-797f658fb6",
       "uid": "148adfa5-36e9-4f79-8ddb-742eeb01c834"
      }
-    ],
-    "resourceVersion": "1790277370535247000",
-    "uid": "ce64c376-a272-4738-af93-208b046d4ca2"
+    ]
    },
    "spec": {
-    "affinity": {
-     "podAntiAffinity": {
-      "preferredDuringSchedulingIgnoredDuringExecution": [
-       {
-        "podAffinityTerm": {
-         "labelSelector": {
-          "matchExpressions": [
-           {
-            "key": "k8s-app",
-            "operator": "In",
-            "values": [
-             "kube-dns"
-            ]
-           }
-          ]
-         },
-         "topologyKey": "kubernetes.io/hostname"
-        },
-        "weight": 100
-       }
-      ]
-     }
-    },
     "containers": [
      {
       "args": [
@@ -542,20 +344,7 @@
        }
       ],
       "image": "us-central1-artifactregistry.gcr.io/gke-release/gke-release/k8s-dns-kube-dns:1.25.0-gke.23@sha256:17bf1c20b0f344d3afbf09acd5a88bedc496069ac4e95ceaa96fa1f871f09bdc",
-      "imagePullPolicy": "IfNotPresent",
       "name": "kubedns",
-      "ports": [
-       {
-        "containerPort": 10053,
-        "name": "dns-local",
-        "protocol": "UDP"
-       },
-       {
-        "containerPort": 10053,
-        "name": "dns-tcp-local",
-        "protocol": "TCP"
-       }
-      ],
       "resources": {
        "limits": {
         "memory": "210Mi"
@@ -564,9 +353,7 @@
         "cpu": "100m",
         "memory": "70Mi"
        }
-      },
-      "terminationMessagePath": "/dev/termination-log",
-      "terminationMessagePolicy": "File"
+      }
      },
      {
       "args": [
@@ -588,28 +375,13 @@
        "--max-tcp-connections=200"
       ],
       "image": "us-central1-artifactregistry.gcr.io/gke-release/gke-release/k8s-dns-dnsmasq-nanny:1.25.0-gke.23@sha256:5d3bb7ddc1a00430cb109475b6415e085aaa411cd998ac77d80c96e84e212de2",
-      "imagePullPolicy": "IfNotPresent",
       "name": "dnsmasq",
-      "ports": [
-       {
-        "containerPort": 53,
-        "name": "dns",
-        "protocol": "UDP"
-       },
-       {
-        "containerPort": 53,
-        "name": "dns-tcp",
-        "protocol": "TCP"
-       }
-      ],
       "resources": {
        "requests": {
         "cpu": "150m",
         "memory": "20Mi"
        }
-      },
-      "terminationMessagePath": "/dev/termination-log",
-      "terminationMessagePolicy": "File"
+      }
      },
      {
       "args": [
@@ -618,23 +390,13 @@
        "--probe=dnsmasq,127.0.0.1:53,kubernetes.default.svc.cluster.local,5,SRV"
       ],
       "image": "us-central1-artifactregistry.gcr.io/gke-release/gke-release/k8s-dns-sidecar:1.25.0-gke.23@sha256:83c6ea849bf3421edf63ed4f3400b7f6270d38e57b7e22e685c1ebc8b765517b",
-      "imagePullPolicy": "IfNotPresent",
       "name": "sidecar",
-      "ports": [
-       {
-        "containerPort": 10054,
-        "name": "metrics",
-        "protocol": "TCP"
-       }
-      ],
       "resources": {
        "requests": {
         "cpu": "10m",
         "memory": "20Mi"
        }
-      },
-      "terminationMessagePath": "/dev/termination-log",
-      "terminationMessagePolicy": "File"
+      }
      },
      {
       "env": [
@@ -652,7 +414,7 @@
        },
        {
         "name": "PROJECT_NUMBER",
-        "value": "196584622296"
+        "value": "000000000000"
        },
        {
         "name": "LOCATION",
@@ -683,7 +445,6 @@
        }
       ],
       "image": "us-central1-artifactregistry.gcr.io/gke-release/gke-release/gke-metrics-collector:20260401_2300_RC0@sha256:258912d769fd027c80bd086f5a4a6389520b698f9c851bfb4737b2ba97b19b23",
-      "imagePullPolicy": "IfNotPresent",
       "name": "kubedns-metrics-collector",
       "resources": {
        "limits": {
@@ -694,33 +455,13 @@
         "cpu": "10m",
         "memory": "45Mi"
        }
-      },
-      "terminationMessagePath": "/dev/termination-log",
-      "terminationMessagePolicy": "File"
+      }
      }
     ],
-    "dnsPolicy": "Default",
-    "enableServiceLinks": true,
     "nodeSelector": {
      "kubernetes.io/os": "linux"
     },
-    "preemptionPolicy": "PreemptLowerPriority",
-    "priority": 2000000000,
-    "priorityClassName": "system-cluster-critical",
     "restartPolicy": "Always",
-    "schedulerName": "default-scheduler",
-    "securityContext": {
-     "fsGroup": 65534,
-     "seccompProfile": {
-      "type": "RuntimeDefault"
-     },
-     "supplementalGroups": [
-      65534
-     ]
-    },
-    "serviceAccount": "kube-dns",
-    "serviceAccountName": "kube-dns",
-    "terminationGracePeriodSeconds": 30,
     "volumes": [
      {
       "configMap": {
@@ -760,23 +501,13 @@
       "type": "PodScheduled"
      }
     ],
-    "phase": "Pending",
-    "qosClass": "Burstable"
+    "phase": "Pending"
    }
   },
   {
    "apiVersion": "v1",
    "kind": "Pod",
    "metadata": {
-    "annotations": {
-     "cloud.google.com/cluster_autoscaler_unhelpable_since": "2026-09-24T19:16:23+0000",
-     "cloud.google.com/cluster_autoscaler_unhelpable_until": "Inf",
-     "components.gke.io/component-name": "kubedns",
-     "components.gke.io/component-version": "32.7.19",
-     "prometheus.io/port": "10054",
-     "prometheus.io/scrape": "true",
-     "scheduler.alpha.kubernetes.io/critical-pod": ""
-    },
     "creationTimestamp": "2026-09-24T19:16:13Z",
     "generateName": "kube-dns-797f658fb6-",
     "labels": {
@@ -794,34 +525,9 @@
       "name": "kube-dns-797f658fb6",
       "uid": "148adfa5-36e9-4f79-8ddb-742eeb01c834"
      }
-    ],
-    "resourceVersion": "1790277383348191002",
-    "uid": "20558b7e-e73b-4172-8823-5e8576a40061"
+    ]
    },
    "spec": {
-    "affinity": {
-     "podAntiAffinity": {
-      "preferredDuringSchedulingIgnoredDuringExecution": [
-       {
-        "podAffinityTerm": {
-         "labelSelector": {
-          "matchExpressions": [
-           {
-            "key": "k8s-app",
-            "operator": "In",
-            "values": [
-             "kube-dns"
-            ]
-           }
-          ]
-         },
-         "topologyKey": "kubernetes.io/hostname"
-        },
-        "weight": 100
-       }
-      ]
-     }
-    },
     "containers": [
      {
       "args": [
@@ -837,20 +543,7 @@
        }
       ],
       "image": "us-central1-artifactregistry.gcr.io/gke-release/gke-release/k8s-dns-kube-dns:1.25.0-gke.23@sha256:17bf1c20b0f344d3afbf09acd5a88bedc496069ac4e95ceaa96fa1f871f09bdc",
-      "imagePullPolicy": "IfNotPresent",
       "name": "kubedns",
-      "ports": [
-       {
-        "containerPort": 10053,
-        "name": "dns-local",
-        "protocol": "UDP"
-       },
-       {
-        "containerPort": 10053,
-        "name": "dns-tcp-local",
-        "protocol": "TCP"
-       }
-      ],
       "resources": {
        "limits": {
         "memory": "210Mi"
@@ -859,9 +552,7 @@
         "cpu": "100m",
         "memory": "70Mi"
        }
-      },
-      "terminationMessagePath": "/dev/termination-log",
-      "terminationMessagePolicy": "File"
+      }
      },
      {
       "args": [
@@ -883,28 +574,13 @@
        "--max-tcp-connections=200"
       ],
       "image": "us-central1-artifactregistry.gcr.io/gke-release/gke-release/k8s-dns-dnsmasq-nanny:1.25.0-gke.23@sha256:5d3bb7ddc1a00430cb109475b6415e085aaa411cd998ac77d80c96e84e212de2",
-      "imagePullPolicy": "IfNotPresent",
       "name": "dnsmasq",
-      "ports": [
-       {
-        "containerPort": 53,
-        "name": "dns",
-        "protocol": "UDP"
-       },
-       {
-        "containerPort": 53,
-        "name": "dns-tcp",
-        "protocol": "TCP"
-       }
-      ],
       "resources": {
        "requests": {
         "cpu": "150m",
         "memory": "20Mi"
        }
-      },
-      "terminationMessagePath": "/dev/termination-log",
-      "terminationMessagePolicy": "File"
+      }
      },
      {
       "args": [
@@ -913,23 +589,13 @@
        "--probe=dnsmasq,127.0.0.1:53,kubernetes.default.svc.cluster.local,5,SRV"
       ],
       "image": "us-central1-artifactregistry.gcr.io/gke-release/gke-release/k8s-dns-sidecar:1.25.0-gke.23@sha256:83c6ea849bf3421edf63ed4f3400b7f6270d38e57b7e22e685c1ebc8b765517b",
-      "imagePullPolicy": "IfNotPresent",
       "name": "sidecar",
-      "ports": [
-       {
-        "containerPort": 10054,
-        "name": "metrics",
-        "protocol": "TCP"
-       }
-      ],
       "resources": {
        "requests": {
         "cpu": "10m",
         "memory": "20Mi"
        }
-      },
-      "terminationMessagePath": "/dev/termination-log",
-      "terminationMessagePolicy": "File"
+      }
      },
      {
       "env": [
@@ -947,7 +613,7 @@
        },
        {
         "name": "PROJECT_NUMBER",
-        "value": "196584622296"
+        "value": "000000000000"
        },
        {
         "name": "LOCATION",
@@ -978,7 +644,6 @@
        }
       ],
       "image": "us-central1-artifactregistry.gcr.io/gke-release/gke-release/gke-metrics-collector:20260401_2300_RC0@sha256:258912d769fd027c80bd086f5a4a6389520b698f9c851bfb4737b2ba97b19b23",
-      "imagePullPolicy": "IfNotPresent",
       "name": "kubedns-metrics-collector",
       "resources": {
        "limits": {
@@ -989,33 +654,13 @@
         "cpu": "10m",
         "memory": "45Mi"
        }
-      },
-      "terminationMessagePath": "/dev/termination-log",
-      "terminationMessagePolicy": "File"
+      }
      }
     ],
-    "dnsPolicy": "Default",
-    "enableServiceLinks": true,
     "nodeSelector": {
      "kubernetes.io/os": "linux"
     },
-    "preemptionPolicy": "PreemptLowerPriority",
-    "priority": 2000000000,
-    "priorityClassName": "system-cluster-critical",
     "restartPolicy": "Always",
-    "schedulerName": "default-scheduler",
-    "securityContext": {
-     "fsGroup": 65534,
-     "seccompProfile": {
-      "type": "RuntimeDefault"
-     },
-     "supplementalGroups": [
-      65534
-     ]
-    },
-    "serviceAccount": "kube-dns",
-    "serviceAccountName": "kube-dns",
-    "terminationGracePeriodSeconds": 30,
     "volumes": [
      {
       "configMap": {
@@ -1055,18 +700,13 @@
       "type": "PodScheduled"
      }
     ],
-    "phase": "Pending",
-    "qosClass": "Burstable"
+    "phase": "Pending"
    }
   },
   {
    "apiVersion": "v1",
    "kind": "Pod",
    "metadata": {
-    "annotations": {
-     "components.gke.io/component-name": "kubedns",
-     "components.gke.io/component-version": "32.7.19"
-    },
     "creationTimestamp": "2026-09-24T18:04:19Z",
     "generateName": "kube-dns-autoscaler-59b88c68b4-",
     "labels": {
@@ -1084,9 +724,7 @@
       "name": "kube-dns-autoscaler-59b88c68b4",
       "uid": "f3ec545c-4eb2-47f2-9a12-2053d2e69d2c"
      }
-    ],
-    "resourceVersion": "1790273063206607006",
-    "uid": "9e297134-6bdd-4e12-b102-a7a3c88c62d9"
+    ]
    },
    "spec": {
     "containers": [
@@ -1101,43 +739,20 @@
        "--v=2"
       ],
       "image": "us-central1-artifactregistry.gcr.io/gke-release/gke-release/cluster-proportional-autoscaler:v1.10.2-gke.37@sha256:c27a7214ada7532f1879bbe3e0a8035a704b5a953946c1698c9598a0ba965f9f",
-      "imagePullPolicy": "IfNotPresent",
       "name": "autoscaler",
       "resources": {
        "requests": {
         "cpu": "20m",
         "memory": "10Mi"
        }
-      },
-      "terminationMessagePath": "/dev/termination-log",
-      "terminationMessagePolicy": "File"
+      }
      }
     ],
-    "dnsPolicy": "ClusterFirst",
-    "enableServiceLinks": true,
     "nodeName": "gke-gemma-gpu-upgraded-default-pool-49d92e50-zcx6",
     "nodeSelector": {
      "kubernetes.io/os": "linux"
     },
-    "preemptionPolicy": "PreemptLowerPriority",
-    "priority": 2000000000,
-    "priorityClassName": "system-cluster-critical",
     "restartPolicy": "Always",
-    "schedulerName": "default-scheduler",
-    "securityContext": {
-     "fsGroup": 65534,
-     "runAsGroup": 1000,
-     "runAsUser": 1000,
-     "seccompProfile": {
-      "type": "RuntimeDefault"
-     },
-     "supplementalGroups": [
-      65534
-     ]
-    },
-    "serviceAccount": "kube-dns-autoscaler",
-    "serviceAccountName": "kube-dns-autoscaler",
-    "terminationGracePeriodSeconds": 30,
     "volumes": []
    },
    "status": {
@@ -1175,33 +790,19 @@
     ],
     "containerStatuses": [
      {
-      "containerID": "containerd://9e66e7ed0b80d55501fda65dc5a0f2e555dead82ad3bef765d9d11025c491f06",
       "image": "sha256:1659e0809002937b56976529ddc99b11a95d865e1ab2509b0d5d1af0298f0985",
-      "imageID": "us-central1-artifactregistry.gcr.io/gke-release/gke-release/cluster-proportional-autoscaler@sha256:c27a7214ada7532f1879bbe3e0a8035a704b5a953946c1698c9598a0ba965f9f",
       "lastState": {},
       "name": "autoscaler",
       "ready": true,
       "restartCount": 0,
-      "started": true,
       "state": {
        "running": {
         "startedAt": "2026-09-24T18:04:22Z"
        }
-      },
-      "volumeMounts": [
-       {
-        "mountPath": "/var/run/secrets/kubernetes.io/serviceaccount",
-        "name": "kube-api-access-mfd4b",
-        "readOnly": true,
-        "recursiveReadOnly": "Disabled"
-       }
-      ]
+      }
      }
     ],
-    "hostIP": "10.128.15.206",
     "phase": "Running",
-    "podIP": "10.72.0.21",
-    "qosClass": "Burstable",
     "startTime": "2026-09-24T18:04:20Z"
    }
   },
@@ -1229,9 +830,7 @@
       "name": "legacy-flowcontrol-tuner-29857980",
       "uid": "fab61bc8-870e-40fa-a3c1-21c3406ee8bd"
      }
-    ],
-    "resourceVersion": "1791478804139887005",
-    "uid": "4d0657f9-5937-4ace-a313-c5ac9f22b355"
+    ]
    },
    "spec": {
     "containers": [
@@ -1241,7 +840,6 @@
        "/app/tuner.py"
       ],
       "image": "python:3.12-slim",
-      "imagePullPolicy": "IfNotPresent",
       "name": "tuner",
       "resources": {
        "limits": {
@@ -1251,28 +849,11 @@
         "cpu": "20m",
         "memory": "32Mi"
        }
-      },
-      "terminationMessagePath": "/dev/termination-log",
-      "terminationMessagePolicy": "File"
+      }
      }
     ],
-    "dnsPolicy": "ClusterFirst",
-    "enableServiceLinks": true,
     "nodeName": "gke-gemma-gpu-upgraded-default-pool-49d92e50-zcx6",
-    "preemptionPolicy": "PreemptLowerPriority",
-    "priority": 0,
     "restartPolicy": "Never",
-    "schedulerName": "default-scheduler",
-    "securityContext": {
-     "runAsNonRoot": true,
-     "runAsUser": 65534,
-     "seccompProfile": {
-      "type": "RuntimeDefault"
-     }
-    },
-    "serviceAccount": "legacy-flowcontrol-tuner",
-    "serviceAccountName": "legacy-flowcontrol-tuner",
-    "terminationGracePeriodSeconds": 30,
     "volumes": [
      {
       "configMap": {
@@ -1320,14 +901,11 @@
     ],
     "containerStatuses": [
      {
-      "containerID": "containerd://3365554ce6ceb31a7213fe4402aea9351527c5b579d9f72301799163cac609d7",
       "image": "docker.io/library/python:3.12-slim",
-      "imageID": "docker.io/library/python@sha256:2f17fc044b579bab302c2e8054d3a686e2cb9a83de48e70534b94cd8ebbe06a9",
       "lastState": {},
       "name": "tuner",
       "ready": false,
       "restartCount": 0,
-      "started": false,
       "state": {
        "terminated": {
         "containerID": "containerd://3365554ce6ceb31a7213fe4402aea9351527c5b579d9f72301799163cac609d7",
@@ -1336,27 +914,10 @@
         "reason": "Error",
         "startedAt": "2026-10-08T17:00:01Z"
        }
-      },
-      "volumeMounts": [
-       {
-        "mountPath": "/app",
-        "name": "app",
-        "readOnly": true,
-        "recursiveReadOnly": "Disabled"
-       },
-       {
-        "mountPath": "/var/run/secrets/kubernetes.io/serviceaccount",
-        "name": "kube-api-access-6zmh6",
-        "readOnly": true,
-        "recursiveReadOnly": "Disabled"
-       }
-      ]
+      }
      }
     ],
-    "hostIP": "10.128.15.206",
     "phase": "Failed",
-    "podIP": "10.72.0.105",
-    "qosClass": "Burstable",
     "startTime": "2026-10-08T17:00:00Z"
    }
   },
@@ -1384,9 +945,7 @@
       "name": "legacy-flowcontrol-tuner-29857990",
       "uid": "edabf518-edd3-40af-b51c-962bae2a6ffa"
      }
-    ],
-    "resourceVersion": "1791479403348959015",
-    "uid": "0e3e5d64-2e77-49c1-b75d-7023989c6eb1"
+    ]
    },
    "spec": {
     "containers": [
@@ -1396,7 +955,6 @@
        "/app/tuner.py"
       ],
       "image": "python:3.12-slim",
-      "imagePullPolicy": "IfNotPresent",
       "name": "tuner",
       "resources": {
        "limits": {
@@ -1406,28 +964,11 @@
         "cpu": "20m",
         "memory": "32Mi"
        }
-      },
-      "terminationMessagePath": "/dev/termination-log",
-      "terminationMessagePolicy": "File"
+      }
      }
     ],
-    "dnsPolicy": "ClusterFirst",
-    "enableServiceLinks": true,
     "nodeName": "gke-gemma-gpu-upgraded-default-pool-49d92e50-zcx6",
-    "preemptionPolicy": "PreemptLowerPriority",
-    "priority": 0,
     "restartPolicy": "Never",
-    "schedulerName": "default-scheduler",
-    "securityContext": {
-     "runAsNonRoot": true,
-     "runAsUser": 65534,
-     "seccompProfile": {
-      "type": "RuntimeDefault"
-     }
-    },
-    "serviceAccount": "legacy-flowcontrol-tuner",
-    "serviceAccountName": "legacy-flowcontrol-tuner",
-    "terminationGracePeriodSeconds": 30,
     "volumes": [
      {
       "configMap": {
@@ -1475,14 +1016,11 @@
     ],
     "containerStatuses": [
      {
-      "containerID": "containerd://32622a3ec242674300b1ac781840063c4f2b2a382d9466c91ec07f1bf7d104eb",
       "image": "docker.io/library/python:3.12-slim",
-      "imageID": "docker.io/library/python@sha256:2f17fc044b579bab302c2e8054d3a686e2cb9a83de48e70534b94cd8ebbe06a9",
       "lastState": {},
       "name": "tuner",
       "ready": false,
       "restartCount": 0,
-      "started": false,
       "state": {
        "terminated": {
         "containerID": "containerd://32622a3ec242674300b1ac781840063c4f2b2a382d9466c91ec07f1bf7d104eb",
@@ -1491,27 +1029,10 @@
         "reason": "Error",
         "startedAt": "2026-10-08T17:10:00Z"
        }
-      },
-      "volumeMounts": [
-       {
-        "mountPath": "/app",
-        "name": "app",
-        "readOnly": true,
-        "recursiveReadOnly": "Disabled"
-       },
-       {
-        "mountPath": "/var/run/secrets/kubernetes.io/serviceaccount",
-        "name": "kube-api-access-cn47w",
-        "readOnly": true,
-        "recursiveReadOnly": "Disabled"
-       }
-      ]
+      }
      }
     ],
-    "hostIP": "10.128.15.206",
     "phase": "Failed",
-    "podIP": "10.72.0.106",
-    "qosClass": "Burstable",
     "startTime": "2026-10-08T17:10:00Z"
    }
   }

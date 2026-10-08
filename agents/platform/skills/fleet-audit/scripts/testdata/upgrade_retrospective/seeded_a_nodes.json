@@ -5,14 +5,6 @@
    "apiVersion": "v1",
    "kind": "Node",
    "metadata": {
-    "annotations": {
-     "container.googleapis.com/instance_id": "2065754679696456330",
-     "csi.volume.kubernetes.io/nodeid": "{\"pd.csi.storage.gke.io\":\"projects/haoxuw-gke-dev/zones/us-central1-a/instances/gke-seeded-a-default-pool-62ac8ee0-d595\",\"podcertificate.gke.io\":\"gke-seeded-a-default-pool-62ac8ee0-d595\"}",
-     "node.alpha.kubernetes.io/ttl": "0",
-     "node.gke.io/last-applied-node-labels": "addon.gke.io/node-local-dns-ds-ready=true,cloud.google.com/gke-boot-disk=pd-balanced,cloud.google.com/gke-container-runtime=containerd,cloud.google.com/gke-cpu-scaling-level=2,cloud.google.com/gke-logging-variant=DEFAULT,cloud.google.com/gke-max-pods-per-node=110,cloud.google.com/gke-memory-gb-scaling-level=4,cloud.google.com/gke-netd-ready=true,cloud.google.com/gke-nodepool=default-pool,cloud.google.com/gke-os-distribution=cos,cloud.google.com/gke-provisioning=standard,cloud.google.com/gke-stack-type=IPV4,cloud.google.com/machine-family=e2,cloud.google.com/private-node=false,disk-type.gke.io/pd-balanced=true,disk-type.gke.io/pd-extreme=true,disk-type.gke.io/pd-ssd=true,disk-type.gke.io/pd-standard=true,iam.gke.io/gke-metadata-server-enabled=true",
-     "node.gke.io/last-applied-node-taints": "",
-     "volumes.kubernetes.io/controller-managed-attach-detach": "true"
-    },
     "creationTimestamp": "2026-10-07T04:03:27Z",
     "labels": {
      "addon.gke.io/node-local-dns-ds-ready": "true",
@@ -47,31 +39,9 @@
      "topology.kubernetes.io/region": "us-central1",
      "topology.kubernetes.io/zone": "us-central1-a"
     },
-    "name": "gke-seeded-a-default-pool-62ac8ee0-d595",
-    "resourceVersion": "1791480166493103005",
-    "uid": "57ed6ec2-6381-4b26-b124-2ba57baa7e2d"
-   },
-   "spec": {
-    "podCIDR": "10.32.4.0/24",
-    "providerID": "gce://haoxuw-gke-dev/us-central1-a/gke-seeded-a-default-pool-62ac8ee0-d595"
+    "name": "gke-seeded-a-default-pool-62ac8ee0-d595"
    },
    "status": {
-    "allocatable": {
-     "cpu": "940m",
-     "ephemeral-storage": "4253788136",
-     "hugepages-1Gi": "0",
-     "hugepages-2Mi": "0",
-     "memory": "2866864Ki",
-     "pods": "110"
-    },
-    "capacity": {
-     "cpu": "2",
-     "ephemeral-storage": "16266500Ki",
-     "hugepages-1Gi": "0",
-     "hugepages-2Mi": "0",
-     "memory": "4012720Ki",
-     "pods": "110"
-    },
     "conditions": [
      {
       "lastHeartbeatTime": "2026-10-07T04:03:28Z",
@@ -290,51 +260,15 @@
       "type": "Ready"
      }
     ],
-    "features": {
-     "supplementalGroupsPolicy": true
-    },
     "nodeInfo": {
-     "architecture": "amd64",
-     "bootID": "3e7d37b9-b2f4-48c4-a5f6-662d174f5000",
-     "containerRuntimeVersion": "containerd://2.2.7",
-     "kernelVersion": "6.12.94+",
-     "kubeProxyVersion": "",
-     "kubeletVersion": "v1.35.8-gke.1380001",
-     "machineID": "18f294211d6af75816d777b743329ce2",
-     "operatingSystem": "linux",
-     "osImage": "Container-Optimized OS from Google",
-     "systemUUID": "18f29421-1d6a-f758-16d7-77b743329ce2"
-    },
-    "runtimeHandlers": [
-     {
-      "features": {
-       "recursiveReadOnlyMounts": true,
-       "userNamespaces": true
-      },
-      "name": ""
-     },
-     {
-      "features": {
-       "recursiveReadOnlyMounts": true,
-       "userNamespaces": true
-      },
-      "name": "runc"
-     }
-    ]
+     "kubeletVersion": "v1.35.8-gke.1380001"
+    }
    }
   },
   {
    "apiVersion": "v1",
    "kind": "Node",
    "metadata": {
-    "annotations": {
-     "container.googleapis.com/instance_id": "4075705121167145832",
-     "csi.volume.kubernetes.io/nodeid": "{\"pd.csi.storage.gke.io\":\"projects/haoxuw-gke-dev/zones/us-central1-a/instances/gke-seeded-a-default-pool-62ac8ee0-mbzp\",\"podcertificate.gke.io\":\"gke-seeded-a-default-pool-62ac8ee0-mbzp\"}",
-     "node.alpha.kubernetes.io/ttl": "0",
-     "node.gke.io/last-applied-node-labels": "addon.gke.io/node-local-dns-ds-ready=true,cloud.google.com/gke-boot-disk=pd-balanced,cloud.google.com/gke-container-runtime=containerd,cloud.google.com/gke-cpu-scaling-level=2,cloud.google.com/gke-logging-variant=DEFAULT,cloud.google.com/gke-max-pods-per-node=110,cloud.google.com/gke-memory-gb-scaling-level=4,cloud.google.com/gke-netd-ready=true,cloud.google.com/gke-nodepool=default-pool,cloud.google.com/gke-os-distribution=cos,cloud.google.com/gke-provisioning=standard,cloud.google.com/gke-stack-type=IPV4,cloud.google.com/machine-family=e2,cloud.google.com/private-node=false,disk-type.gke.io/pd-balanced=true,disk-type.gke.io/pd-extreme=true,disk-type.gke.io/pd-ssd=true,disk-type.gke.io/pd-standard=true,iam.gke.io/gke-metadata-server-enabled=true",
-     "node.gke.io/last-applied-node-taints": "",
-     "volumes.kubernetes.io/controller-managed-attach-detach": "true"
-    },
     "creationTimestamp": "2026-10-07T04:09:02Z",
     "labels": {
      "addon.gke.io/node-local-dns-ds-ready": "true",
@@ -369,31 +303,9 @@
      "topology.kubernetes.io/region": "us-central1",
      "topology.kubernetes.io/zone": "us-central1-a"
     },
-    "name": "gke-seeded-a-default-pool-62ac8ee0-mbzp",
-    "resourceVersion": "1791480206711439012",
-    "uid": "1c52267a-ae00-48a0-bd84-3f28e97a030a"
-   },
-   "spec": {
-    "podCIDR": "10.32.2.0/24",
-    "providerID": "gce://haoxuw-gke-dev/us-central1-a/gke-seeded-a-default-pool-62ac8ee0-mbzp"
+    "name": "gke-seeded-a-default-pool-62ac8ee0-mbzp"
    },
    "status": {
-    "allocatable": {
-     "cpu": "940m",
-     "ephemeral-storage": "4253788136",
-     "hugepages-1Gi": "0",
-     "hugepages-2Mi": "0",
-     "memory": "2866852Ki",
-     "pods": "110"
-    },
-    "capacity": {
-     "cpu": "2",
-     "ephemeral-storage": "16266500Ki",
-     "hugepages-1Gi": "0",
-     "hugepages-2Mi": "0",
-     "memory": "4012708Ki",
-     "pods": "110"
-    },
     "conditions": [
      {
       "lastHeartbeatTime": "2026-10-08T17:22:41Z",
@@ -612,51 +524,15 @@
       "type": "Ready"
      }
     ],
-    "features": {
-     "supplementalGroupsPolicy": true
-    },
     "nodeInfo": {
-     "architecture": "amd64",
-     "bootID": "76b6443f-e87d-4908-a1a2-f482d6990c1c",
-     "containerRuntimeVersion": "containerd://2.2.7",
-     "kernelVersion": "6.12.94+",
-     "kubeProxyVersion": "",
-     "kubeletVersion": "v1.35.8-gke.1380001",
-     "machineID": "57ae701e7af4f72092551ddbd159b928",
-     "operatingSystem": "linux",
-     "osImage": "Container-Optimized OS from Google",
-     "systemUUID": "57ae701e-7af4-f720-9255-1ddbd159b928"
-    },
-    "runtimeHandlers": [
-     {
-      "features": {
-       "recursiveReadOnlyMounts": true,
-       "userNamespaces": true
-      },
-      "name": ""
-     },
-     {
-      "features": {
-       "recursiveReadOnlyMounts": true,
-       "userNamespaces": true
-      },
-      "name": "runc"
-     }
-    ]
+     "kubeletVersion": "v1.35.8-gke.1380001"
+    }
    }
   },
   {
    "apiVersion": "v1",
    "kind": "Node",
    "metadata": {
-    "annotations": {
-     "container.googleapis.com/instance_id": "3723646170877832432",
-     "csi.volume.kubernetes.io/nodeid": "{\"pd.csi.storage.gke.io\":\"projects/haoxuw-gke-dev/zones/us-central1-a/instances/gke-seeded-a-idle-batch-pool-a5fd3288-q4ts\",\"podcertificate.gke.io\":\"gke-seeded-a-idle-batch-pool-a5fd3288-q4ts\"}",
-     "node.alpha.kubernetes.io/ttl": "0",
-     "node.gke.io/last-applied-node-labels": "addon.gke.io/node-local-dns-ds-ready=true,cloud.google.com/gke-boot-disk=pd-balanced,cloud.google.com/gke-container-runtime=containerd,cloud.google.com/gke-cpu-scaling-level=2,cloud.google.com/gke-logging-variant=DEFAULT,cloud.google.com/gke-max-pods-per-node=110,cloud.google.com/gke-memory-gb-scaling-level=2,cloud.google.com/gke-netd-ready=true,cloud.google.com/gke-nodepool=idle-batch-pool,cloud.google.com/gke-os-distribution=cos,cloud.google.com/gke-provisioning=standard,cloud.google.com/gke-stack-type=IPV4,cloud.google.com/machine-family=e2,cloud.google.com/private-node=false,disk-type.gke.io/pd-balanced=true,disk-type.gke.io/pd-extreme=true,disk-type.gke.io/pd-ssd=true,disk-type.gke.io/pd-standard=true,iam.gke.io/gke-metadata-server-enabled=true",
-     "node.gke.io/last-applied-node-taints": "seeded-role=idle-batch:NoSchedule",
-     "volumes.kubernetes.io/controller-managed-attach-detach": "true"
-    },
     "creationTimestamp": "2026-10-08T03:47:09Z",
     "labels": {
      "addon.gke.io/node-local-dns-ds-ready": "true",
@@ -691,38 +567,9 @@
      "topology.kubernetes.io/region": "us-central1",
      "topology.kubernetes.io/zone": "us-central1-a"
     },
-    "name": "gke-seeded-a-idle-batch-pool-a5fd3288-q4ts",
-    "resourceVersion": "1791480259769151001",
-    "uid": "51a53547-1b9d-40b1-9500-f8b94715763e"
-   },
-   "spec": {
-    "podCIDR": "10.32.3.0/24",
-    "providerID": "gce://haoxuw-gke-dev/us-central1-a/gke-seeded-a-idle-batch-pool-a5fd3288-q4ts",
-    "taints": [
-     {
-      "effect": "NoSchedule",
-      "key": "seeded-role",
-      "value": "idle-batch"
-     }
-    ]
+    "name": "gke-seeded-a-idle-batch-pool-a5fd3288-q4ts"
    },
    "status": {
-    "allocatable": {
-     "cpu": "940m",
-     "ephemeral-storage": "4253788136",
-     "hugepages-1Gi": "0",
-     "hugepages-2Mi": "0",
-     "memory": "1391028Ki",
-     "pods": "110"
-    },
-    "capacity": {
-     "cpu": "2",
-     "ephemeral-storage": "16266500Ki",
-     "hugepages-1Gi": "0",
-     "hugepages-2Mi": "0",
-     "memory": "2017716Ki",
-     "pods": "110"
-    },
     "conditions": [
      {
       "lastHeartbeatTime": "2026-10-08T17:23:57Z",
@@ -941,51 +788,15 @@
       "type": "Ready"
      }
     ],
-    "features": {
-     "supplementalGroupsPolicy": true
-    },
     "nodeInfo": {
-     "architecture": "amd64",
-     "bootID": "b7610258-8151-4b62-b462-841b9ba5eb54",
-     "containerRuntimeVersion": "containerd://2.2.7",
-     "kernelVersion": "6.12.94+",
-     "kubeProxyVersion": "",
-     "kubeletVersion": "v1.35.8-gke.1380001",
-     "machineID": "7c4cdccc2680cf120f7826a51b8104bb",
-     "operatingSystem": "linux",
-     "osImage": "Container-Optimized OS from Google",
-     "systemUUID": "7c4cdccc-2680-cf12-0f78-26a51b8104bb"
-    },
-    "runtimeHandlers": [
-     {
-      "features": {
-       "recursiveReadOnlyMounts": true,
-       "userNamespaces": true
-      },
-      "name": ""
-     },
-     {
-      "features": {
-       "recursiveReadOnlyMounts": true,
-       "userNamespaces": true
-      },
-      "name": "runc"
-     }
-    ]
+     "kubeletVersion": "v1.35.8-gke.1380001"
+    }
    }
   },
   {
    "apiVersion": "v1",
    "kind": "Node",
    "metadata": {
-    "annotations": {
-     "container.googleapis.com/instance_id": "6214813771918648518",
-     "csi.volume.kubernetes.io/nodeid": "{\"pd.csi.storage.gke.io\":\"projects/haoxuw-gke-dev/zones/us-central1-a/instances/gke-seeded-a-pinned-inference-pool-d08d753d-c8fk\",\"podcertificate.gke.io\":\"gke-seeded-a-pinned-inference-pool-d08d753d-c8fk\"}",
-     "node.alpha.kubernetes.io/ttl": "0",
-     "node.gke.io/last-applied-node-labels": "addon.gke.io/node-local-dns-ds-ready=true,cloud.google.com/gke-boot-disk=pd-balanced,cloud.google.com/gke-container-runtime=containerd,cloud.google.com/gke-cpu-scaling-level=2,cloud.google.com/gke-logging-variant=DEFAULT,cloud.google.com/gke-max-pods-per-node=110,cloud.google.com/gke-memory-gb-scaling-level=2,cloud.google.com/gke-netd-ready=true,cloud.google.com/gke-nodepool=pinned-inference-pool,cloud.google.com/gke-os-distribution=cos,cloud.google.com/gke-provisioning=standard,cloud.google.com/gke-stack-type=IPV4,cloud.google.com/machine-family=e2,cloud.google.com/private-node=false,disk-type.gke.io/pd-balanced=true,disk-type.gke.io/pd-extreme=true,disk-type.gke.io/pd-ssd=true,disk-type.gke.io/pd-standard=true,iam.gke.io/gke-metadata-server-enabled=true,seeded-role=pinned-inference",
-     "node.gke.io/last-applied-node-taints": "seeded-role=pinned-inference:NoSchedule",
-     "volumes.kubernetes.io/controller-managed-attach-detach": "true"
-    },
     "creationTimestamp": "2026-10-08T04:21:33Z",
     "labels": {
      "addon.gke.io/node-local-dns-ds-ready": "true",
@@ -1021,38 +832,9 @@
      "topology.kubernetes.io/region": "us-central1",
      "topology.kubernetes.io/zone": "us-central1-a"
     },
-    "name": "gke-seeded-a-pinned-inference-pool-d08d753d-c8fk",
-    "resourceVersion": "1791480189354575013",
-    "uid": "e089f280-7f66-4a58-b1f5-8f4b9f78c54e"
-   },
-   "spec": {
-    "podCIDR": "10.32.1.0/24",
-    "providerID": "gce://haoxuw-gke-dev/us-central1-a/gke-seeded-a-pinned-inference-pool-d08d753d-c8fk",
-    "taints": [
-     {
-      "effect": "NoSchedule",
-      "key": "seeded-role",
-      "value": "pinned-inference"
-     }
-    ]
+    "name": "gke-seeded-a-pinned-inference-pool-d08d753d-c8fk"
    },
    "status": {
-    "allocatable": {
-     "cpu": "940m",
-     "ephemeral-storage": "4253788136",
-     "hugepages-1Gi": "0",
-     "hugepages-2Mi": "0",
-     "memory": "1391028Ki",
-     "pods": "110"
-    },
-    "capacity": {
-     "cpu": "2",
-     "ephemeral-storage": "16266500Ki",
-     "hugepages-1Gi": "0",
-     "hugepages-2Mi": "0",
-     "memory": "2017716Ki",
-     "pods": "110"
-    },
     "conditions": [
      {
       "lastHeartbeatTime": "2026-10-08T04:21:34Z",
@@ -1271,37 +1053,9 @@
       "type": "Ready"
      }
     ],
-    "features": {
-     "supplementalGroupsPolicy": true
-    },
     "nodeInfo": {
-     "architecture": "amd64",
-     "bootID": "06f2444f-6ab5-4775-bc2d-b697b3cbc8d4",
-     "containerRuntimeVersion": "containerd://2.2.7",
-     "kernelVersion": "6.12.94+",
-     "kubeProxyVersion": "",
-     "kubeletVersion": "v1.35.8-gke.1380001",
-     "machineID": "7883d6a88950aed73d149b3cab8c4dd2",
-     "operatingSystem": "linux",
-     "osImage": "Container-Optimized OS from Google",
-     "systemUUID": "7883d6a8-8950-aed7-3d14-9b3cab8c4dd2"
-    },
-    "runtimeHandlers": [
-     {
-      "features": {
-       "recursiveReadOnlyMounts": true,
-       "userNamespaces": true
-      },
-      "name": ""
-     },
-     {
-      "features": {
-       "recursiveReadOnlyMounts": true,
-       "userNamespaces": true
-      },
-      "name": "runc"
-     }
-    ]
+     "kubeletVersion": "v1.35.8-gke.1380001"
+    }
    }
   }
  ],

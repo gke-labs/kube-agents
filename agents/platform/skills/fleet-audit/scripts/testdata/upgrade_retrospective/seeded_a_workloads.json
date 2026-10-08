@@ -5,31 +5,15 @@
    "apiVersion": "apps/v1",
    "kind": "Deployment",
    "metadata": {
-    "annotations": {
-     "deployment.kubernetes.io/revision": "1"
-    },
-    "creationTimestamp": "2026-09-25T17:02:07Z",
-    "generation": 3,
     "name": "inference-server",
-    "namespace": "seeded-capacity",
-    "resourceVersion": "1791436932604415018",
-    "uid": "f32f86b4-09be-40cb-8441-5ac66725c91b"
+    "namespace": "seeded-capacity"
    },
    "spec": {
-    "progressDeadlineSeconds": 600,
     "replicas": 4,
-    "revisionHistoryLimit": 10,
     "selector": {
      "matchLabels": {
       "app": "inference-server"
      }
-    },
-    "strategy": {
-     "rollingUpdate": {
-      "maxSurge": "25%",
-      "maxUnavailable": "25%"
-     },
-     "type": "RollingUpdate"
     },
     "template": {
      "metadata": {
@@ -38,7 +22,6 @@
       }
      },
      "spec": {
-      "automountServiceAccountToken": false,
       "containers": [
        {
         "command": [
@@ -47,7 +30,6 @@
          "while true; do :; done"
         ],
         "image": "busybox:1.36",
-        "imagePullPolicy": "IfNotPresent",
         "name": "server",
         "resources": {
          "limits": {
@@ -58,35 +40,14 @@
           "cpu": "400m",
           "memory": "64Mi"
          }
-        },
-        "terminationMessagePath": "/dev/termination-log",
-        "terminationMessagePolicy": "File"
+        }
        }
       ],
-      "dnsPolicy": "ClusterFirst",
-      "enableServiceLinks": true,
       "nodeSelector": {
        "seeded-role": "pinned-inference"
       },
       "restartPolicy": "Always",
-      "schedulerName": "default-scheduler",
-      "securityContext": {
-       "runAsNonRoot": true,
-       "runAsUser": 65534,
-       "seccompProfile": {
-        "type": "RuntimeDefault"
-       }
-      },
       "shareProcessNamespace": false,
-      "terminationGracePeriodSeconds": 30,
-      "tolerations": [
-       {
-        "effect": "NoSchedule",
-        "key": "seeded-role",
-        "operator": "Equal",
-        "value": "pinned-inference"
-       }
-      ],
       "topologySpreadConstraints": [
        {
         "labelSelector": {
@@ -108,31 +69,15 @@
    "apiVersion": "apps/v1",
    "kind": "Deployment",
    "metadata": {
-    "annotations": {
-     "deployment.kubernetes.io/revision": "1"
-    },
-    "creationTimestamp": "2026-09-25T17:02:46Z",
-    "generation": 1,
     "name": "payments-api",
-    "namespace": "seeded-debug",
-    "resourceVersion": "1791482418665663002",
-    "uid": "acc7b757-6dfb-47bf-846a-8cc4d24831b5"
+    "namespace": "seeded-debug"
    },
    "spec": {
-    "progressDeadlineSeconds": 600,
     "replicas": 1,
-    "revisionHistoryLimit": 10,
     "selector": {
      "matchLabels": {
       "app": "payments-api"
      }
-    },
-    "strategy": {
-     "rollingUpdate": {
-      "maxSurge": "25%",
-      "maxUnavailable": "25%"
-     },
-     "type": "RollingUpdate"
     },
     "template": {
      "metadata": {
@@ -141,7 +86,6 @@
       }
      },
      "spec": {
-      "automountServiceAccountToken": false,
       "containers": [
        {
         "command": [
@@ -150,7 +94,6 @@
          "tail /dev/zero"
         ],
         "image": "busybox:1.36",
-        "imagePullPolicy": "IfNotPresent",
         "name": "api",
         "resources": {
          "limits": {
@@ -160,24 +103,11 @@
           "cpu": "10m",
           "memory": "32Mi"
          }
-        },
-        "terminationMessagePath": "/dev/termination-log",
-        "terminationMessagePolicy": "File"
+        }
        }
       ],
-      "dnsPolicy": "ClusterFirst",
-      "enableServiceLinks": true,
       "restartPolicy": "Always",
-      "schedulerName": "default-scheduler",
-      "securityContext": {
-       "runAsNonRoot": true,
-       "runAsUser": 65534,
-       "seccompProfile": {
-        "type": "RuntimeDefault"
-       }
-      },
       "shareProcessNamespace": false,
-      "terminationGracePeriodSeconds": 30,
       "volumes": []
      }
     }
@@ -187,31 +117,15 @@
    "apiVersion": "apps/v1",
    "kind": "Deployment",
    "metadata": {
-    "annotations": {
-     "deployment.kubernetes.io/revision": "1"
-    },
-    "creationTimestamp": "2026-10-07T18:27:15Z",
-    "generation": 1,
     "name": "baseline-edge-worker",
-    "namespace": "seeded-defaults",
-    "resourceVersion": "1791397638318287000",
-    "uid": "5927f704-fba5-4aa5-b8ed-dade2bd3ed0f"
+    "namespace": "seeded-defaults"
    },
    "spec": {
-    "progressDeadlineSeconds": 600,
     "replicas": 1,
-    "revisionHistoryLimit": 10,
     "selector": {
      "matchLabels": {
       "app": "baseline-edge-worker"
      }
-    },
-    "strategy": {
-     "rollingUpdate": {
-      "maxSurge": "25%",
-      "maxUnavailable": "25%"
-     },
-     "type": "RollingUpdate"
     },
     "template": {
      "metadata": {
@@ -220,11 +134,9 @@
       }
      },
      "spec": {
-      "automountServiceAccountToken": false,
       "containers": [
        {
         "image": "registry.k8s.io/pause:3.10",
-        "imagePullPolicy": "IfNotPresent",
         "name": "worker",
         "resources": {
          "limits": {
@@ -234,24 +146,11 @@
           "cpu": "5m",
           "memory": "8Mi"
          }
-        },
-        "terminationMessagePath": "/dev/termination-log",
-        "terminationMessagePolicy": "File"
+        }
        }
       ],
-      "dnsPolicy": "ClusterFirst",
-      "enableServiceLinks": true,
       "restartPolicy": "Always",
-      "schedulerName": "default-scheduler",
-      "securityContext": {
-       "runAsNonRoot": true,
-       "runAsUser": 65534,
-       "seccompProfile": {
-        "type": "RuntimeDefault"
-       }
-      },
       "shareProcessNamespace": false,
-      "terminationGracePeriodSeconds": 30,
       "volumes": []
      }
     }
@@ -261,31 +160,15 @@
    "apiVersion": "apps/v1",
    "kind": "Deployment",
    "metadata": {
-    "annotations": {
-     "deployment.kubernetes.io/revision": "1"
-    },
-    "creationTimestamp": "2026-10-07T18:27:15Z",
-    "generation": 1,
     "name": "notification-relay",
-    "namespace": "seeded-intent",
-    "resourceVersion": "1791397638292751021",
-    "uid": "b6c31669-d8c3-430e-b38b-2484ed7e2598"
+    "namespace": "seeded-intent"
    },
    "spec": {
-    "progressDeadlineSeconds": 600,
     "replicas": 2,
-    "revisionHistoryLimit": 10,
     "selector": {
      "matchLabels": {
       "app": "notification-relay"
      }
-    },
-    "strategy": {
-     "rollingUpdate": {
-      "maxSurge": "25%",
-      "maxUnavailable": "25%"
-     },
-     "type": "RollingUpdate"
     },
     "template": {
      "metadata": {
@@ -294,11 +177,9 @@
       }
      },
      "spec": {
-      "automountServiceAccountToken": false,
       "containers": [
        {
         "image": "registry.k8s.io/pause:3.9",
-        "imagePullPolicy": "IfNotPresent",
         "name": "relay",
         "resources": {
          "limits": {
@@ -308,24 +189,11 @@
           "cpu": "10m",
           "memory": "16Mi"
          }
-        },
-        "terminationMessagePath": "/dev/termination-log",
-        "terminationMessagePolicy": "File"
+        }
        }
       ],
-      "dnsPolicy": "ClusterFirst",
-      "enableServiceLinks": true,
       "restartPolicy": "Always",
-      "schedulerName": "default-scheduler",
-      "securityContext": {
-       "runAsNonRoot": true,
-       "runAsUser": 65534,
-       "seccompProfile": {
-        "type": "RuntimeDefault"
-       }
-      },
       "shareProcessNamespace": false,
-      "terminationGracePeriodSeconds": 30,
       "topologySpreadConstraints": [
        {
         "labelSelector": {
@@ -347,31 +215,15 @@
    "apiVersion": "apps/v1",
    "kind": "Deployment",
    "metadata": {
-    "annotations": {
-     "deployment.kubernetes.io/revision": "1"
-    },
-    "creationTimestamp": "2026-09-25T17:02:46Z",
-    "generation": 1,
     "name": "checkout-gateway",
-    "namespace": "seeded-reliability",
-    "resourceVersion": "1791346205754159010",
-    "uid": "56eb97ad-260f-4f8f-9d54-7e6d5f431061"
+    "namespace": "seeded-reliability"
    },
    "spec": {
-    "progressDeadlineSeconds": 600,
     "replicas": 2,
-    "revisionHistoryLimit": 10,
     "selector": {
      "matchLabels": {
       "app": "checkout-gateway"
      }
-    },
-    "strategy": {
-     "rollingUpdate": {
-      "maxSurge": "25%",
-      "maxUnavailable": "25%"
-     },
-     "type": "RollingUpdate"
     },
     "template": {
      "metadata": {
@@ -380,11 +232,9 @@
       }
      },
      "spec": {
-      "automountServiceAccountToken": false,
       "containers": [
        {
         "image": "registry.k8s.io/pause:3.9",
-        "imagePullPolicy": "IfNotPresent",
         "name": "gateway",
         "resources": {
          "limits": {
@@ -394,24 +244,11 @@
           "cpu": "10m",
           "memory": "16Mi"
          }
-        },
-        "terminationMessagePath": "/dev/termination-log",
-        "terminationMessagePolicy": "File"
+        }
        }
       ],
-      "dnsPolicy": "ClusterFirst",
-      "enableServiceLinks": true,
       "restartPolicy": "Always",
-      "schedulerName": "default-scheduler",
-      "securityContext": {
-       "runAsNonRoot": true,
-       "runAsUser": 65534,
-       "seccompProfile": {
-        "type": "RuntimeDefault"
-       }
-      },
       "shareProcessNamespace": false,
-      "terminationGracePeriodSeconds": 30,
       "topologySpreadConstraints": [
        {
         "labelSelector": {
@@ -433,31 +270,15 @@
    "apiVersion": "apps/v1",
    "kind": "Deployment",
    "metadata": {
-    "annotations": {
-     "deployment.kubernetes.io/revision": "1"
-    },
-    "creationTimestamp": "2026-10-03T10:31:38Z",
-    "generation": 1,
     "name": "arch-pinned-worker",
-    "namespace": "seeded-shapes",
-    "resourceVersion": "1791345851840367004",
-    "uid": "bcbbe238-8e31-473b-8eb0-3ea927bff36a"
+    "namespace": "seeded-shapes"
    },
    "spec": {
-    "progressDeadlineSeconds": 600,
     "replicas": 1,
-    "revisionHistoryLimit": 10,
     "selector": {
      "matchLabels": {
       "app": "arch-pinned-worker"
      }
-    },
-    "strategy": {
-     "rollingUpdate": {
-      "maxSurge": "25%",
-      "maxUnavailable": "25%"
-     },
-     "type": "RollingUpdate"
     },
     "template": {
      "metadata": {
@@ -466,7 +287,6 @@
       }
      },
      "spec": {
-      "automountServiceAccountToken": false,
       "containers": [
        {
         "command": [
@@ -475,7 +295,6 @@
          "tail -f /dev/null"
         ],
         "image": "busybox:1.36",
-        "imagePullPolicy": "IfNotPresent",
         "name": "worker",
         "resources": {
          "limits": {
@@ -485,27 +304,14 @@
           "cpu": "10m",
           "memory": "16Mi"
          }
-        },
-        "terminationMessagePath": "/dev/termination-log",
-        "terminationMessagePolicy": "File"
+        }
        }
       ],
-      "dnsPolicy": "ClusterFirst",
-      "enableServiceLinks": true,
       "nodeSelector": {
        "beta.kubernetes.io/arch": "amd64"
       },
       "restartPolicy": "Always",
-      "schedulerName": "default-scheduler",
-      "securityContext": {
-       "runAsNonRoot": true,
-       "runAsUser": 65534,
-       "seccompProfile": {
-        "type": "RuntimeDefault"
-       }
-      },
       "shareProcessNamespace": false,
-      "terminationGracePeriodSeconds": 30,
       "volumes": []
      }
     }
@@ -515,31 +321,15 @@
    "apiVersion": "apps/v1",
    "kind": "Deployment",
    "metadata": {
-    "annotations": {
-     "deployment.kubernetes.io/revision": "1"
-    },
-    "creationTimestamp": "2026-10-03T10:31:38Z",
-    "generation": 1,
     "name": "cache-on-emptydir",
-    "namespace": "seeded-shapes",
-    "resourceVersion": "1791345851985679004",
-    "uid": "b9068284-7110-4758-ac88-4c42ebff9bdc"
+    "namespace": "seeded-shapes"
    },
    "spec": {
-    "progressDeadlineSeconds": 600,
     "replicas": 1,
-    "revisionHistoryLimit": 10,
     "selector": {
      "matchLabels": {
       "app": "cache-on-emptydir"
      }
-    },
-    "strategy": {
-     "rollingUpdate": {
-      "maxSurge": "25%",
-      "maxUnavailable": "25%"
-     },
-     "type": "RollingUpdate"
     },
     "template": {
      "metadata": {
@@ -548,7 +338,6 @@
       }
      },
      "spec": {
-      "automountServiceAccountToken": false,
       "containers": [
        {
         "command": [
@@ -557,7 +346,6 @@
          "date -u > /var/cache/queue/stamp && tail -f /dev/null"
         ],
         "image": "busybox:1.36",
-        "imagePullPolicy": "IfNotPresent",
         "name": "queue",
         "resources": {
          "limits": {
@@ -567,31 +355,11 @@
           "cpu": "10m",
           "memory": "16Mi"
          }
-        },
-        "terminationMessagePath": "/dev/termination-log",
-        "terminationMessagePolicy": "File",
-        "volumeMounts": [
-         {
-          "mountPath": "/var/cache/queue",
-          "mountPropagation": "None",
-          "name": "queue"
-         }
-        ]
+        }
        }
       ],
-      "dnsPolicy": "ClusterFirst",
-      "enableServiceLinks": true,
       "restartPolicy": "Always",
-      "schedulerName": "default-scheduler",
-      "securityContext": {
-       "runAsNonRoot": true,
-       "runAsUser": 65534,
-       "seccompProfile": {
-        "type": "RuntimeDefault"
-       }
-      },
       "shareProcessNamespace": false,
-      "terminationGracePeriodSeconds": 30,
       "volumes": [
        {
         "emptyDir": {},
@@ -606,31 +374,15 @@
    "apiVersion": "apps/v1",
    "kind": "Deployment",
    "metadata": {
-    "annotations": {
-     "deployment.kubernetes.io/revision": "1"
-    },
-    "creationTimestamp": "2026-10-07T18:27:11Z",
-    "generation": 1,
     "name": "cgroup-blind-jvm",
-    "namespace": "seeded-shapes",
-    "resourceVersion": "1791397644351423013",
-    "uid": "6b583b4b-bd9d-4e8a-993a-5803611addd9"
+    "namespace": "seeded-shapes"
    },
    "spec": {
-    "progressDeadlineSeconds": 600,
     "replicas": 1,
-    "revisionHistoryLimit": 10,
     "selector": {
      "matchLabels": {
       "app": "cgroup-blind-jvm"
      }
-    },
-    "strategy": {
-     "rollingUpdate": {
-      "maxSurge": "25%",
-      "maxUnavailable": "25%"
-     },
-     "type": "RollingUpdate"
     },
     "template": {
      "metadata": {
@@ -639,7 +391,6 @@
       }
      },
      "spec": {
-      "automountServiceAccountToken": false,
       "containers": [
        {
         "command": [
@@ -648,7 +399,6 @@
          "java -version && exec sleep infinity"
         ],
         "image": "docker.io/library/eclipse-temurin:8u302-b08-jre",
-        "imagePullPolicy": "IfNotPresent",
         "name": "jvm",
         "resources": {
          "limits": {
@@ -658,24 +408,11 @@
           "cpu": "10m",
           "memory": "64Mi"
          }
-        },
-        "terminationMessagePath": "/dev/termination-log",
-        "terminationMessagePolicy": "File"
+        }
        }
       ],
-      "dnsPolicy": "ClusterFirst",
-      "enableServiceLinks": true,
       "restartPolicy": "Always",
-      "schedulerName": "default-scheduler",
-      "securityContext": {
-       "runAsNonRoot": true,
-       "runAsUser": 65534,
-       "seccompProfile": {
-        "type": "RuntimeDefault"
-       }
-      },
       "shareProcessNamespace": false,
-      "terminationGracePeriodSeconds": 30,
       "volumes": []
      }
     }
@@ -685,31 +422,15 @@
    "apiVersion": "apps/v1",
    "kind": "Deployment",
    "metadata": {
-    "annotations": {
-     "deployment.kubernetes.io/revision": "1"
-    },
-    "creationTimestamp": "2026-10-05T14:48:07Z",
-    "generation": 1,
     "name": "intree-pd-reader",
-    "namespace": "seeded-shapes",
-    "resourceVersion": "1791346222970783003",
-    "uid": "f2f5bbe2-92f9-4192-97fc-1e2d47621a33"
+    "namespace": "seeded-shapes"
    },
    "spec": {
-    "progressDeadlineSeconds": 600,
     "replicas": 1,
-    "revisionHistoryLimit": 10,
     "selector": {
      "matchLabels": {
       "app": "intree-pd-reader"
      }
-    },
-    "strategy": {
-     "rollingUpdate": {
-      "maxSurge": "25%",
-      "maxUnavailable": "25%"
-     },
-     "type": "RollingUpdate"
     },
     "template": {
      "metadata": {
@@ -718,7 +439,6 @@
       }
      },
      "spec": {
-      "automountServiceAccountToken": false,
       "containers": [
        {
         "command": [
@@ -727,7 +447,6 @@
          "tail -f /dev/null"
         ],
         "image": "busybox:1.36",
-        "imagePullPolicy": "IfNotPresent",
         "name": "reader",
         "resources": {
          "limits": {
@@ -737,33 +456,11 @@
           "cpu": "10m",
           "memory": "16Mi"
          }
-        },
-        "terminationMessagePath": "/dev/termination-log",
-        "terminationMessagePolicy": "File",
-        "volumeMounts": [
-         {
-          "mountPath": "/data",
-          "mountPropagation": "None",
-          "name": "data",
-          "readOnly": true
-         }
-        ]
+        }
        }
       ],
-      "dnsPolicy": "ClusterFirst",
-      "enableServiceLinks": true,
       "restartPolicy": "Always",
-      "schedulerName": "default-scheduler",
-      "securityContext": {
-       "fsGroup": 65534,
-       "runAsNonRoot": true,
-       "runAsUser": 65534,
-       "seccompProfile": {
-        "type": "RuntimeDefault"
-       }
-      },
       "shareProcessNamespace": false,
-      "terminationGracePeriodSeconds": 30,
       "volumes": [
        {
         "name": "data",
@@ -780,31 +477,15 @@
    "apiVersion": "apps/v1",
    "kind": "Deployment",
    "metadata": {
-    "annotations": {
-     "deployment.kubernetes.io/revision": "1"
-    },
-    "creationTimestamp": "2026-10-03T10:31:38Z",
-    "generation": 1,
     "name": "legacy-registry-pull",
-    "namespace": "seeded-shapes",
-    "resourceVersion": "1791346205925823007",
-    "uid": "7fcce3d5-c4ce-4acf-a762-3181f13c64de"
+    "namespace": "seeded-shapes"
    },
    "spec": {
-    "progressDeadlineSeconds": 600,
     "replicas": 1,
-    "revisionHistoryLimit": 10,
     "selector": {
      "matchLabels": {
       "app": "legacy-registry-pull"
      }
-    },
-    "strategy": {
-     "rollingUpdate": {
-      "maxSurge": "25%",
-      "maxUnavailable": "25%"
-     },
-     "type": "RollingUpdate"
     },
     "template": {
      "metadata": {
@@ -813,11 +494,9 @@
       }
      },
      "spec": {
-      "automountServiceAccountToken": false,
       "containers": [
        {
         "image": "k8s.gcr.io/pause:3.9",
-        "imagePullPolicy": "Always",
         "name": "pause",
         "resources": {
          "limits": {
@@ -827,24 +506,11 @@
           "cpu": "10m",
           "memory": "16Mi"
          }
-        },
-        "terminationMessagePath": "/dev/termination-log",
-        "terminationMessagePolicy": "File"
+        }
        }
       ],
-      "dnsPolicy": "ClusterFirst",
-      "enableServiceLinks": true,
       "restartPolicy": "Always",
-      "schedulerName": "default-scheduler",
-      "securityContext": {
-       "runAsNonRoot": true,
-       "runAsUser": 65534,
-       "seccompProfile": {
-        "type": "RuntimeDefault"
-       }
-      },
       "shareProcessNamespace": false,
-      "terminationGracePeriodSeconds": 30,
       "volumes": []
      }
     }
@@ -854,31 +520,15 @@
    "apiVersion": "apps/v1",
    "kind": "Deployment",
    "metadata": {
-    "annotations": {
-     "deployment.kubernetes.io/revision": "1"
-    },
-    "creationTimestamp": "2026-10-07T18:27:11Z",
-    "generation": 1,
     "name": "multi-process-worker",
-    "namespace": "seeded-shapes",
-    "resourceVersion": "1791397633225423020",
-    "uid": "0de42ef4-1cf8-416e-a4a7-353547a253f3"
+    "namespace": "seeded-shapes"
    },
    "spec": {
-    "progressDeadlineSeconds": 600,
     "replicas": 1,
-    "revisionHistoryLimit": 10,
     "selector": {
      "matchLabels": {
       "app": "multi-process-worker"
      }
-    },
-    "strategy": {
-     "rollingUpdate": {
-      "maxSurge": "25%",
-      "maxUnavailable": "25%"
-     },
-     "type": "RollingUpdate"
     },
     "template": {
      "metadata": {
@@ -887,7 +537,6 @@
       }
      },
      "spec": {
-      "automountServiceAccountToken": false,
       "containers": [
        {
         "command": [
@@ -896,7 +545,6 @@
          "sleep infinity & sleep infinity & wait"
         ],
         "image": "busybox:1.36",
-        "imagePullPolicy": "IfNotPresent",
         "name": "supervisor",
         "resources": {
          "limits": {
@@ -906,24 +554,11 @@
           "cpu": "10m",
           "memory": "16Mi"
          }
-        },
-        "terminationMessagePath": "/dev/termination-log",
-        "terminationMessagePolicy": "File"
+        }
        }
       ],
-      "dnsPolicy": "ClusterFirst",
-      "enableServiceLinks": true,
       "restartPolicy": "Always",
-      "schedulerName": "default-scheduler",
-      "securityContext": {
-       "runAsNonRoot": true,
-       "runAsUser": 65534,
-       "seccompProfile": {
-        "type": "RuntimeDefault"
-       }
-      },
       "shareProcessNamespace": false,
-      "terminationGracePeriodSeconds": 30,
       "volumes": []
      }
     }
@@ -933,31 +568,15 @@
    "apiVersion": "apps/v1",
    "kind": "Deployment",
    "metadata": {
-    "annotations": {
-     "deployment.kubernetes.io/revision": "1"
-    },
-    "creationTimestamp": "2026-10-07T18:27:18Z",
-    "generation": 1,
     "name": "inventory-api",
-    "namespace": "seeded-stall",
-    "resourceVersion": "1791397759013951019",
-    "uid": "df5362d2-a188-4cbe-b6e2-77e99093e59e"
+    "namespace": "seeded-stall"
    },
    "spec": {
-    "progressDeadlineSeconds": 120,
     "replicas": 1,
-    "revisionHistoryLimit": 10,
     "selector": {
      "matchLabels": {
       "app": "inventory-api"
      }
-    },
-    "strategy": {
-     "rollingUpdate": {
-      "maxSurge": "25%",
-      "maxUnavailable": "25%"
-     },
-     "type": "RollingUpdate"
     },
     "template": {
      "metadata": {
@@ -966,7 +585,6 @@
       }
      },
      "spec": {
-      "automountServiceAccountToken": false,
       "containers": [
        {
         "envFrom": [
@@ -978,7 +596,6 @@
          }
         ],
         "image": "registry.k8s.io/pause:3.9",
-        "imagePullPolicy": "IfNotPresent",
         "name": "api",
         "resources": {
          "limits": {
@@ -988,24 +605,11 @@
           "cpu": "10m",
           "memory": "16Mi"
          }
-        },
-        "terminationMessagePath": "/dev/termination-log",
-        "terminationMessagePolicy": "File"
+        }
        }
       ],
-      "dnsPolicy": "ClusterFirst",
-      "enableServiceLinks": true,
       "restartPolicy": "Always",
-      "schedulerName": "default-scheduler",
-      "securityContext": {
-       "runAsNonRoot": true,
-       "runAsUser": 65534,
-       "seccompProfile": {
-        "type": "RuntimeDefault"
-       }
-      },
       "shareProcessNamespace": false,
-      "terminationGracePeriodSeconds": 30,
       "volumes": []
      }
     }
@@ -1015,18 +619,10 @@
    "apiVersion": "apps/v1",
    "kind": "DaemonSet",
    "metadata": {
-    "annotations": {
-     "deprecated.daemonset.template.generation": "1"
-    },
-    "creationTimestamp": "2026-10-07T18:27:11Z",
-    "generation": 1,
     "name": "cni-shaped-agent",
-    "namespace": "seeded-shapes",
-    "resourceVersion": "1791397634315215012",
-    "uid": "5713909c-17e5-4564-9904-e2b97d34b56b"
+    "namespace": "seeded-shapes"
    },
    "spec": {
-    "revisionHistoryLimit": 10,
     "selector": {
      "matchLabels": {
       "app": "cni-shaped-agent"
@@ -1039,11 +635,9 @@
       }
      },
      "spec": {
-      "automountServiceAccountToken": false,
       "containers": [
        {
         "image": "registry.k8s.io/pause:3.10",
-        "imagePullPolicy": "IfNotPresent",
         "name": "agent",
         "resources": {
          "limits": {
@@ -1053,33 +647,12 @@
           "cpu": "5m",
           "memory": "8Mi"
          }
-        },
-        "terminationMessagePath": "/dev/termination-log",
-        "terminationMessagePolicy": "File",
-        "volumeMounts": [
-         {
-          "mountPath": "/host/etc/cni/net.d",
-          "mountPropagation": "None",
-          "name": "cni-conf",
-          "readOnly": true
-         }
-        ]
+        }
        }
       ],
-      "dnsPolicy": "ClusterFirst",
-      "enableServiceLinks": true,
       "hostNetwork": true,
       "restartPolicy": "Always",
-      "schedulerName": "default-scheduler",
-      "securityContext": {
-       "runAsNonRoot": true,
-       "runAsUser": 65534,
-       "seccompProfile": {
-        "type": "RuntimeDefault"
-       }
-      },
       "shareProcessNamespace": false,
-      "terminationGracePeriodSeconds": 30,
       "volumes": [
        {
         "hostPath": {
@@ -1090,13 +663,6 @@
        }
       ]
      }
-    },
-    "updateStrategy": {
-     "rollingUpdate": {
-      "maxSurge": 0,
-      "maxUnavailable": 1
-     },
-     "type": "RollingUpdate"
     }
    }
   },
@@ -1104,18 +670,10 @@
    "apiVersion": "apps/v1",
    "kind": "DaemonSet",
    "metadata": {
-    "annotations": {
-     "deprecated.daemonset.template.generation": "1"
-    },
-    "creationTimestamp": "2026-10-03T10:31:38Z",
-    "generation": 1,
     "name": "node-runtime-probe",
-    "namespace": "seeded-shapes",
-    "resourceVersion": "1791346380985679017",
-    "uid": "efbf1004-8123-4b6a-a550-5028122a6d36"
+    "namespace": "seeded-shapes"
    },
    "spec": {
-    "revisionHistoryLimit": 10,
     "selector": {
      "matchLabels": {
       "app": "node-runtime-probe"
@@ -1128,7 +686,6 @@
       }
      },
      "spec": {
-      "automountServiceAccountToken": false,
       "containers": [
        {
         "command": [
@@ -1137,7 +694,6 @@
          "test -S /run/containerd/containerd.sock; tail -f /dev/null"
         ],
         "image": "busybox:1.36",
-        "imagePullPolicy": "IfNotPresent",
         "name": "probe",
         "resources": {
          "limits": {
@@ -1147,32 +703,11 @@
           "cpu": "10m",
           "memory": "16Mi"
          }
-        },
-        "terminationMessagePath": "/dev/termination-log",
-        "terminationMessagePolicy": "File",
-        "volumeMounts": [
-         {
-          "mountPath": "/run/containerd/containerd.sock",
-          "mountPropagation": "None",
-          "name": "sock",
-          "readOnly": true
-         }
-        ]
+        }
        }
       ],
-      "dnsPolicy": "ClusterFirst",
-      "enableServiceLinks": true,
       "restartPolicy": "Always",
-      "schedulerName": "default-scheduler",
-      "securityContext": {
-       "runAsNonRoot": true,
-       "runAsUser": 65534,
-       "seccompProfile": {
-        "type": "RuntimeDefault"
-       }
-      },
       "shareProcessNamespace": false,
-      "terminationGracePeriodSeconds": 30,
       "volumes": [
        {
         "hostPath": {
@@ -1183,13 +718,6 @@
        }
       ]
      }
-    },
-    "updateStrategy": {
-     "rollingUpdate": {
-      "maxSurge": 0,
-      "maxUnavailable": 1
-     },
-     "type": "RollingUpdate"
     }
    }
   },
@@ -1197,19 +725,13 @@
    "apiVersion": "batch/v1",
    "kind": "CronJob",
    "metadata": {
-    "creationTimestamp": "2026-09-25T17:02:47Z",
-    "generation": 4,
     "labels": {
      "app": "legacy-endpoints-writer"
     },
     "name": "legacy-endpoints-writer",
-    "namespace": "seeded-deprecation",
-    "resourceVersion": "1791482400156959010",
-    "uid": "3d6ade84-11f8-460d-8bc3-7e59a7a91f15"
+    "namespace": "seeded-deprecation"
    },
    "spec": {
-    "concurrencyPolicy": "Forbid",
-    "failedJobsHistoryLimit": 1,
     "jobTemplate": {
      "metadata": {
       "labels": {
@@ -1229,7 +751,6 @@
         }
        },
        "spec": {
-        "automountServiceAccountToken": true,
         "containers": [
          {
           "command": [
@@ -1237,7 +758,6 @@
            "/app/writer.py"
           ],
           "image": "docker.io/library/python:3.14-slim",
-          "imagePullPolicy": "IfNotPresent",
           "name": "writer",
           "resources": {
            "limits": {
@@ -1247,34 +767,11 @@
             "cpu": "20m",
             "memory": "32Mi"
            }
-          },
-          "terminationMessagePath": "/dev/termination-log",
-          "terminationMessagePolicy": "File",
-          "volumeMounts": [
-           {
-            "mountPath": "/app",
-            "mountPropagation": "None",
-            "name": "script",
-            "readOnly": true
-           }
-          ]
+          }
          }
         ],
-        "dnsPolicy": "ClusterFirst",
-        "enableServiceLinks": true,
         "restartPolicy": "Never",
-        "schedulerName": "default-scheduler",
-        "securityContext": {
-         "runAsNonRoot": true,
-         "runAsUser": 65534,
-         "seccompProfile": {
-          "type": "RuntimeDefault"
-         }
-        },
-        "serviceAccount": "legacy-endpoints-writer",
-        "serviceAccountName": "legacy-endpoints-writer",
         "shareProcessNamespace": false,
-        "terminationGracePeriodSeconds": 30,
         "volumes": [
          {
           "configMap": {
@@ -1292,7 +789,6 @@
     },
     "schedule": "*/10 * * * *",
     "startingDeadlineSeconds": 300,
-    "successfulJobsHistoryLimit": 3,
     "suspend": false
    }
   },
@@ -1300,16 +796,10 @@
    "apiVersion": "batch/v1",
    "kind": "CronJob",
    "metadata": {
-    "creationTimestamp": "2026-10-07T18:27:11Z",
-    "generation": 1,
     "name": "cuda-pinned-trainer",
-    "namespace": "seeded-shapes",
-    "resourceVersion": "1791397631264911012",
-    "uid": "c2a02e8b-ed18-46e7-8554-af88b82b0105"
+    "namespace": "seeded-shapes"
    },
    "spec": {
-    "concurrencyPolicy": "Forbid",
-    "failedJobsHistoryLimit": 1,
     "jobTemplate": {
      "metadata": {
       "labels": {
@@ -1328,14 +818,12 @@
         }
        },
        "spec": {
-        "automountServiceAccountToken": false,
         "containers": [
          {
           "command": [
            "nvidia-smi"
           ],
           "image": "docker.io/nvidia/cuda:12.2.0-base-ubuntu22.04",
-          "imagePullPolicy": "IfNotPresent",
           "name": "trainer",
           "resources": {
            "limits": {
@@ -1347,41 +835,20 @@
             "memory": "256Mi",
             "nvidia.com/gpu": "1"
            }
-          },
-          "terminationMessagePath": "/dev/termination-log",
-          "terminationMessagePolicy": "File"
+          }
          }
         ],
-        "dnsPolicy": "ClusterFirst",
-        "enableServiceLinks": true,
         "nodeSelector": {
          "cloud.google.com/gke-accelerator": "nvidia-l4"
         },
         "restartPolicy": "Never",
-        "schedulerName": "default-scheduler",
-        "securityContext": {
-         "runAsNonRoot": true,
-         "runAsUser": 65534,
-         "seccompProfile": {
-          "type": "RuntimeDefault"
-         }
-        },
         "shareProcessNamespace": false,
-        "terminationGracePeriodSeconds": 30,
-        "tolerations": [
-         {
-          "effect": "NoSchedule",
-          "key": "nvidia.com/gpu",
-          "operator": "Exists"
-         }
-        ],
         "volumes": []
        }
       }
      }
     },
     "schedule": "0 3 * * *",
-    "successfulJobsHistoryLimit": 1,
     "suspend": true
    }
   },
@@ -1389,16 +856,10 @@
    "apiVersion": "batch/v1",
    "kind": "CronJob",
    "metadata": {
-    "creationTimestamp": "2026-10-07T18:27:18Z",
-    "generation": 1,
     "name": "stale-kubectl-client",
-    "namespace": "seeded-shapes",
-    "resourceVersion": "1791482400153199019",
-    "uid": "ccd38936-550a-48e5-a8e4-05e3c8d4e18c"
+    "namespace": "seeded-shapes"
    },
    "spec": {
-    "concurrencyPolicy": "Forbid",
-    "failedJobsHistoryLimit": 1,
     "jobTemplate": {
      "metadata": {
       "labels": {
@@ -1418,7 +879,6 @@
         }
        },
        "spec": {
-        "automountServiceAccountToken": true,
         "containers": [
          {
           "command": [
@@ -1426,7 +886,6 @@
            "version"
           ],
           "image": "registry.k8s.io/kubectl:v1.29.0",
-          "imagePullPolicy": "IfNotPresent",
           "name": "kubectl",
           "resources": {
            "limits": {
@@ -1436,26 +895,11 @@
             "cpu": "10m",
             "memory": "32Mi"
            }
-          },
-          "terminationMessagePath": "/dev/termination-log",
-          "terminationMessagePolicy": "File"
+          }
          }
         ],
-        "dnsPolicy": "ClusterFirst",
-        "enableServiceLinks": true,
         "restartPolicy": "Never",
-        "schedulerName": "default-scheduler",
-        "securityContext": {
-         "runAsNonRoot": true,
-         "runAsUser": 65534,
-         "seccompProfile": {
-          "type": "RuntimeDefault"
-         }
-        },
-        "serviceAccount": "stale-kubectl-client",
-        "serviceAccountName": "stale-kubectl-client",
         "shareProcessNamespace": false,
-        "terminationGracePeriodSeconds": 30,
         "volumes": []
        }
       },
@@ -1463,7 +907,6 @@
      }
     },
     "schedule": "*/10 * * * *",
-    "successfulJobsHistoryLimit": 1,
     "suspend": false
    }
   }

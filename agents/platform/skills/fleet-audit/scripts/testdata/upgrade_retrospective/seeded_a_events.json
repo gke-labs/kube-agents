@@ -4,7 +4,6 @@
   {
    "apiVersion": "v1",
    "count": 491,
-   "eventTime": null,
    "firstTimestamp": "2026-10-07T04:25:09Z",
    "involvedObject": {
     "apiVersion": "v1",
@@ -17,13 +16,9 @@
    "metadata": {
     "creationTimestamp": "2026-10-07T04:25:09Z",
     "name": "gke-seeded-a-default-pool-62ac8ee0-d595.18dc24b47c9dd37c",
-    "namespace": "default",
-    "resourceVersion": "1791480273582223001",
-    "uid": "ec6e5dda-a686-4fd1-81ed-529950d01c87"
+    "namespace": "default"
    },
    "reason": "OOMKilling",
-   "reportingComponent": "",
-   "reportingInstance": "",
    "source": {
     "component": "kernel-monitor",
     "host": "gke-seeded-a-default-pool-62ac8ee0-d595"
@@ -33,7 +28,6 @@
   {
    "apiVersion": "v1",
    "count": 1,
-   "eventTime": null,
    "firstTimestamp": "2026-10-08T17:09:04Z",
    "involvedObject": {
     "apiVersion": "v1",
@@ -46,9 +40,7 @@
    "metadata": {
     "creationTimestamp": "2026-10-08T17:09:04Z",
     "name": "gke-seeded-a-default-pool-62ac8ee0-d595.18dc9cf8e28a1c03",
-    "namespace": "default",
-    "resourceVersion": "1791479344606623013",
-    "uid": "482b8a0c-ecef-4457-a1a4-e05de58c0c41"
+    "namespace": "default"
    },
    "reason": "OOMKilling",
    "reportingComponent": "kernel-monitor",
@@ -62,7 +54,6 @@
   {
    "apiVersion": "v1",
    "count": 906,
-   "eventTime": null,
    "firstTimestamp": "2026-10-06T04:30:04Z",
    "involvedObject": {
     "apiVersion": "v1",
@@ -78,13 +69,10 @@
    "metadata": {
     "creationTimestamp": "2026-10-08T05:30:03Z",
     "name": "inference-server-778b78fdb8-cp2pf.18dbd66497f31f07",
-    "namespace": "seeded-capacity",
-    "resourceVersion": "1791480309291327007",
-    "uid": "4246ef58-479c-4db4-ae79-b44ab2465803"
+    "namespace": "seeded-capacity"
    },
    "reason": "FailedScheduling",
    "reportingComponent": "default-scheduler",
-   "reportingInstance": "",
    "source": {
     "component": "default-scheduler"
    },
@@ -93,7 +81,6 @@
   {
    "apiVersion": "v1",
    "count": 224,
-   "eventTime": null,
    "firstTimestamp": "2026-10-08T05:24:45Z",
    "involvedObject": {
     "apiVersion": "v1",
@@ -109,13 +96,10 @@
    "metadata": {
     "creationTimestamp": "2026-10-08T05:24:45Z",
     "name": "inference-server-778b78fdb8-ld26r.18dc7689b99b0880",
-    "namespace": "seeded-capacity",
-    "resourceVersion": "1791480309211439018",
-    "uid": "6f196b0d-2fbc-42b5-a628-4ae8bce8eb57"
+    "namespace": "seeded-capacity"
    },
    "reason": "FailedScheduling",
    "reportingComponent": "default-scheduler",
-   "reportingInstance": "",
    "source": {
     "component": "default-scheduler"
    },
@@ -124,7 +108,6 @@
   {
    "apiVersion": "v1",
    "count": 224,
-   "eventTime": null,
    "firstTimestamp": "2026-10-08T05:24:45Z",
    "involvedObject": {
     "apiVersion": "v1",
@@ -140,13 +123,10 @@
    "metadata": {
     "creationTimestamp": "2026-10-08T05:24:45Z",
     "name": "inference-server-778b78fdb8-zxlkz.18dc7689baff4ec8",
-    "namespace": "seeded-capacity",
-    "resourceVersion": "1791480309250287004",
-    "uid": "8ab84275-c50a-4df7-a5af-54131c6f3b54"
+    "namespace": "seeded-capacity"
    },
    "reason": "FailedScheduling",
    "reportingComponent": "default-scheduler",
-   "reportingInstance": "",
    "source": {
     "component": "default-scheduler"
    },
@@ -155,7 +135,6 @@
   {
    "apiVersion": "v1",
    "count": 1930,
-   "eventTime": null,
    "firstTimestamp": "2026-10-07T04:04:01Z",
    "involvedObject": {
     "apiVersion": "v1",
@@ -172,9 +151,7 @@
    "metadata": {
     "creationTimestamp": "2026-10-07T04:04:01Z",
     "name": "payments-api-79b77b8c67-vfrh9.18dc238d51f5558d",
-    "namespace": "seeded-debug",
-    "resourceVersion": "1791480248307647001",
-    "uid": "14a91001-0bd9-4a2b-a6bb-eeed0e0f068f"
+    "namespace": "seeded-debug"
    },
    "reason": "BackOff",
    "reportingComponent": "kubelet",
@@ -188,7 +165,6 @@
   {
    "apiVersion": "v1",
    "count": 3,
-   "eventTime": null,
    "firstTimestamp": "2026-10-08T17:10:04Z",
    "involvedObject": {
     "apiVersion": "batch/v1",
@@ -204,13 +180,10 @@
    "metadata": {
     "creationTimestamp": "2026-10-08T17:10:04Z",
     "name": "stale-kubectl-client.18dc9d06f1125f0e",
-    "namespace": "seeded-shapes",
-    "resourceVersion": "1791479405931935012",
-    "uid": "842797ed-ff71-42bd-b3dd-d5b380754071"
+    "namespace": "seeded-shapes"
    },
    "reason": "FailedDelete",
    "reportingComponent": "cronjob-controller",
-   "reportingInstance": "",
    "source": {
     "component": "cronjob-controller"
    },
@@ -219,7 +192,6 @@
   {
    "apiVersion": "v1",
    "count": 6343,
-   "eventTime": null,
    "firstTimestamp": "2026-10-07T18:27:19Z",
    "involvedObject": {
     "apiVersion": "v1",
@@ -236,9 +208,7 @@
    "metadata": {
     "creationTimestamp": "2026-10-07T18:27:19Z",
     "name": "inventory-api-5467d66b99-gmclr.18dc52a96965c800",
-    "namespace": "seeded-stall",
-    "resourceVersion": "1791480143380143002",
-    "uid": "9f0374ef-d814-4631-b4cb-ff00d71ab9b9"
+    "namespace": "seeded-stall"
    },
    "reason": "Failed",
    "reportingComponent": "kubelet",
