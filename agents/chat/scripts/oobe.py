@@ -384,8 +384,16 @@ def audits_in_flight(runs: list[tuple[str, str, float]], now: float) -> set[str]
 
 
 def completed_since(runs: list[tuple[str, str, float]], job_id: str, since: float) -> bool:
-    """Whether ``job_id`` has a completed run claimed at or after ``since``."""
-    return any(job == job_id and status == COMPLETED_STATUS and claimed >= since for job, status, claimed in runs)
+    """Whether ``job_id`` has a completed run that was going at or after ``since``.
+
+    Claimed after it, or up to ``RUN_LIMIT_SECONDS`` before it: a scheduled run already under way
+    when the sweep was filed (the gate files only after the reconcile, which can take half an
+    hour) completes during onboarding as much as one claimed after.
+    """
+    return any(
+        job == job_id and status == COMPLETED_STATUS and claimed >= since - RUN_LIMIT_SECONDS
+        for job, status, claimed in runs
+    )
 
 
 def advance_chain(data_dir: Path, state: dict, now: float, since: float | None = None) -> dict:

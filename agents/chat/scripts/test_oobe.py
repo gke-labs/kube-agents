@@ -426,7 +426,7 @@ class StageTest(unittest.TestCase):
 
     def test_a_run_from_before_the_mark_does_not_count(self):
         # Yesterday's scheduled run of the same audit is not this mark's.
-        self._ledger(FIRST[0], "completed", NOW_SETTLED - 3600)
+        self._ledger(FIRST[0], "completed", NOW_SETTLED - oobe.NEW_INSTALL_SECONDS)
         self._file_scan()
         _board(self.board, [_ranking("done")])
         self._main(now=NOW_SETTLED)
@@ -462,6 +462,15 @@ class StageTest(unittest.TestCase):
         self._main(now=NOW_SETTLED + oobe.START_LIMIT_SECONDS + MINUTE)
         self.assertEqual(self._started_ids(), FIRST * 2)
         self.assertEqual(oobe.read_state(self.d)[oobe.STATE_ATTEMPTS], {FIRST[0]: 1})
+
+    def test_a_run_past_an_hour_still_holds_the_chain(self):
+        # Single audit runs on CI have reached 46 minutes; a slow one at 90 still holds.
+        self._file_scan()
+        _board(self.board, [_ranking("done")])
+        self._main(now=NOW_SETTLED)
+        self._ledger(FIRST[0], "running", NOW_SETTLED + MINUTE)
+        self._main(now=NOW_SETTLED + 90 * MINUTE)
+        self.assertEqual(self._started_ids(), FIRST)
 
     def test_a_run_that_never_ends_stops_holding_the_chain(self):
         # A row a gateway restart left at running.
@@ -510,9 +519,17 @@ class StageTest(unittest.TestCase):
         self.assertIn("compliance-audit", state[oobe.STATE_FIRED])
         self.assertEqual(state[oobe.STATE_ADOPTED], ["compliance-audit"])
 
+    def test_a_run_under_way_when_the_sweep_was_filed_is_adopted(self):
+        # The 06:20 run claimed while the reconcile held the gate, completed during onboarding.
+        self._ledger("compliance-audit", "completed", FILED_AT - 20 * MINUTE)
+        self._file_scan()
+        _board(self.board, [_ranking("done")])
+        self._drive()
+        self.assertNotIn("compliance-audit", self._started_ids())
+
     def test_a_run_from_before_the_sweep_is_not_adopted(self):
         # Yesterday's scheduled run is not this install's first run.
-        self._ledger("compliance-audit", "completed", FILED_AT - 2 * MINUTE)
+        self._ledger("compliance-audit", "completed", FILED_AT - oobe.RUN_LIMIT_SECONDS - MINUTE)
         self._file_scan()
         _board(self.board, [_ranking("done")])
         self._drive()
