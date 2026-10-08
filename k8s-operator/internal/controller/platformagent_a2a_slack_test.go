@@ -471,8 +471,8 @@ func TestNoRenderedRoleReachesASecret(t *testing.T) {
 
 // TestNoEgressPolicySelectsTheGatewayPod: Slack is reached outbound (the
 // Socket Mode websocket and the Web API), and the gateway pod carries no
-// egress fence - any policy that selects it (the inject door fence and the
-// A2A door fence) is ingress-only - so no rule has to admit those hosts, and
+// egress fence - any policy that selects it (the inject door fence, the
+// A2A door fence, and the gateway's own fence) is ingress-only - so no rule has to admit those hosts, and
 // none could name them: the repository's standard policies are selector and CIDR
 // based (with the exception of buildFQDNNetworkPolicy, which fences the legacy
 // gateway pod rather than the A2A gateway pod).
@@ -486,6 +486,7 @@ func TestNoEgressPolicySelectsTheGatewayPod(t *testing.T) {
 	policies := []*networkingv1.NetworkPolicy{
 		buildA2AGatewayNetworkPolicy(agent),
 		buildA2ADoorNetworkPolicy(agent),
+		buildA2AGatewayFencePolicy(agent),
 		buildA2ASessionNetworkPolicy(agent, dns),
 		buildA2ANATSNetworkPolicy(agent),
 		buildA2AVerifierNetworkPolicy(agent, dns),
@@ -496,27 +497,24 @@ func TestNoEgressPolicySelectsTheGatewayPod(t *testing.T) {
 		buildNetworkPolicy(agent, []string{"10.0.0.0/8"}, netpolProfile{DNSClusterIPs: dns}, false, "", false),
 		buildLiteLLMNetworkPolicy(agent, netpolProfile{DNSClusterIPs: dns}),
 	}
-	if fqdnPolicy := buildFQDNNetworkPolicy(agent); fqdnPolicy != nil {
-		rawSel, _, err := unstructured.NestedMap(fqdnPolicy.Object, "spec", "podSelector")
-		if err != nil {
-			t.Fatalf("buildFQDNNetworkPolicy podSelector: %v", err)
-		}
-		var sel metav1.LabelSelector
-		if rawSel != nil {
-			if err := runtime.DefaultUnstructuredConverter.FromUnstructured(rawSel, &sel); err != nil {
-				t.Fatalf("buildFQDNNetworkPolicy FromUnstructured: %v", err)
-			}
-		}
-		policies = append(policies, &networkingv1.NetworkPolicy{
-			ObjectMeta: metav1.ObjectMeta{
-				Name: fqdnPolicy.GetName(),
-			},
-			Spec: networkingv1.NetworkPolicySpec{
-				PodSelector: sel,
-				PolicyTypes: []networkingv1.PolicyType{networkingv1.PolicyTypeEgress},
-			},
-		})
+	fqdnPolicy := buildFQDNNetworkPolicy(agent)
+	rawSel, _, err := unstructured.NestedMap(fqdnPolicy.Object, "spec", "podSelector")
+	if err != nil {
+		t.Fatalf("buildFQDNNetworkPolicy podSelector: %v", err)
 	}
+	var sel metav1.LabelSelector
+	if err := runtime.DefaultUnstructuredConverter.FromUnstructured(rawSel, &sel); err != nil {
+		t.Fatalf("buildFQDNNetworkPolicy FromUnstructured: %v", err)
+	}
+	policies = append(policies, &networkingv1.NetworkPolicy{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: fqdnPolicy.GetName(),
+		},
+		Spec: networkingv1.NetworkPolicySpec{
+			PodSelector: sel,
+			PolicyTypes: []networkingv1.PolicyType{networkingv1.PolicyTypeEgress},
+		},
+	})
 	matched := 0
 	for _, pol := range policies {
 		if pol == nil {
