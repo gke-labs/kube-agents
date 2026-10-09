@@ -94,6 +94,9 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 MODULE_MAIN = REPO_ROOT / "terraform" / "modules" / "drift-pubsub" / "main.tf"
+COMPOSITION_MAIN = (
+    REPO_ROOT / "terraform" / "examples" / "full-install" / "main.tf"
+)
 
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
@@ -109,6 +112,18 @@ _SEPARATORS = (",", "[")
 _DEPENDS_ON = "depends_on"
 _RESOURCE = "resource"
 _RESOURCE_LABELS = 2
+_MODULE = "module"
+_MODULE_LABELS = 1
+
+# The composition's half of the ordering, which the module cannot express.
+# gke_cluster names drift_pubsub so that Terraform, destroying dependents
+# first, tears the cluster down BEFORE the topic. drift_pubsub must in turn
+# name nothing cluster-side, or the edge is a cycle; kube_agents_iam is the
+# one that used to creep back in, through detector_service_account_email.
+INGRESS_MODULE = "drift_pubsub"
+CLUSTER_MODULE = "gke_cluster"
+IAM_MODULE = "kube_agents_iam"
+IAM_MODULE_REFERENCE = f"{_MODULE}.{IAM_MODULE}"
 
 GRANT = ("google_pubsub_topic_iam_member", "sink_writer")
 DRAIN = ("time_sleep", "sink_drain")
@@ -185,6 +200,17 @@ def _depends_on_references(body: list) -> list | None:
     return None
 
 
+def _module_body(tokens: list, name: str) -> list:
+    """The tokenized body of one top-level `module "<name>"` block."""
+    for labels, body in _blocks(tokens, _MODULE, _MODULE_LABELS):
+        if labels == [name]:
+            return body
+    raise AssertionError(
+        f"terraform/examples/full-install/main.tf declares no "
+        f'module "{name}"'
+    )
+
+
 def _code_text(body: list) -> str:
     """A block's tokens rejoined, strings excluded.
 
@@ -199,6 +225,7 @@ class DriftPubsubOrdering(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls.tokens = _tokens(MODULE_MAIN.read_text(encoding="utf-8"))
+        cls.composition = _tokens(COMPOSITION_MAIN.read_text(encoding="utf-8"))
 
     def test_the_sink_is_the_last_link_in_the_ordering_chain(self) -> None:
         for edge in REQUIRED_EDGES:
@@ -240,6 +267,38 @@ class DriftPubsubOrdering(unittest.TestCase):
             "the publish grant reads writer_identity off the sink again, which orders the "
             "grant after the sink and reopens the apply-side window; derive the identity "
             "from the project number instead (local.expected_sink_writer_identity)",
+        )
+
+    def test_the_cluster_is_destroyed_before_the_ingress(self) -> None:
+        body = _module_body(self.composition, CLUSTER_MODULE)
+        references = _depends_on_references(body)
+        self.assertIsNotNone(
+            references,
+            f'module "{CLUSTER_MODULE}" declares no depends_on at all, so nothing orders '
+            f"the cluster's teardown ahead of the topic's deletion",
+        )
+        self.assertIn(
+            f"{_MODULE}.{INGRESS_MODULE}",
+            references,
+            f'module "{CLUSTER_MODULE}" must depend on {_MODULE}.{INGRESS_MODULE}. Terraform '
+            f"destroys dependents before dependencies, so this edge is the only thing "
+            f"keeping the topic alive until the control plane has stopped emitting; "
+            f"without it the topic goes minutes early and every audit record that lands "
+            f"after it mails the project's owners (#2426). The edge is for the destroy "
+            f"order, so no apply and no plan will show it missing",
+        )
+
+    def test_the_ingress_does_not_depend_on_the_iam_module(self) -> None:
+        body = _module_body(self.composition, INGRESS_MODULE)
+        self.assertNotIn(
+            IAM_MODULE_REFERENCE,
+            _code_text(body),
+            f'module "{INGRESS_MODULE}" references {IAM_MODULE_REFERENCE} again. That module '
+            f'depends on module.{CLUSTER_MODULE}, so this makes the ingress a dependent of '
+            f"the cluster and inverts the destroy order the test above pins -- and because "
+            f"the cluster now depends on the ingress, it is also a dependency cycle. The "
+            f"detector's subscription grants are what used to carry this reference; they "
+            f"live beside the module call in the composition for exactly that reason",
         )
 
 

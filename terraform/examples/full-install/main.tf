@@ -369,7 +369,22 @@ module "gke_cluster" {
     "kube-agents-host" = "true"
   }
 
-  depends_on = [google_project_service.required]
+  # module.drift_pubsub is here for the DESTROY order, not the apply one.
+  # Terraform destroys dependents before dependencies, so naming the ingress
+  # here is what puts the cluster's teardown ahead of the topic's deletion.
+  # The cluster emits mutating audit records for as long as its control plane
+  # is up -- measured at ~4 minutes past the point the topic used to be deleted
+  # -- and each one that lands on a missing topic mails every project owner
+  # (#2426). The module's sink_drain cannot cover that: it is a fixed timer and
+  # the teardown's length varies with the cluster. This edge removes the race
+  # instead of widening the margin, leaving the drain to do the job it is
+  # actually sized for, the Log Router's own propagation lag once the cluster
+  # has gone quiet -- which is also the whole of it when create_cluster is
+  # false and no cluster is in this state's destroy graph at all.
+  #
+  # On apply it means the ingress is built before the cluster, which costs
+  # nothing: a sink with no cluster to watch exports nothing.
+  depends_on = [google_project_service.required, module.drift_pubsub]
 }
 
 module "gke_backup_plan" {
@@ -538,12 +553,20 @@ module "drift_pubsub" {
   source = "../../modules/drift-pubsub"
   count  = var.enable_drift_pubsub ? 1 : 0
 
-  project_id                     = var.project_id
-  detector_service_account_email = module.kube_agents_iam.service_account_email
-  topic_name                     = var.drift_pubsub_topic
-  subscription_name              = var.drift_pubsub_subscription
-  sink_name                      = var.drift_pubsub_sink
-  topic_publishers               = var.drift_pubsub_topic_publishers
+  # No kube_agents_iam input here on purpose, and the detector's subscription
+  # grants are below rather than inside the module. That one argument used to
+  # make this module a dependent of kube_agents_iam, which depends on
+  # gke_cluster -- so Terraform, destroying dependents first, tore the whole
+  # ingress down ahead of the cluster. The topic went at t+124s while the
+  # control plane kept emitting matching audit records until t+366s, and every
+  # one of them mailed the project's owners (#2426's destroy half). Without the
+  # argument this module depends on nothing cluster-side, so gke_cluster can
+  # depend on IT instead and the topic is destroyed last of all.
+  project_id        = var.project_id
+  topic_name        = var.drift_pubsub_topic
+  subscription_name = var.drift_pubsub_subscription
+  sink_name         = var.drift_pubsub_sink
+  topic_publishers  = var.drift_pubsub_topic_publishers
 
   # Exposed because the module's sink postcondition names them in its error:
   # a project whose sink reports some other writer identity fails that check on
@@ -566,6 +589,63 @@ module "drift_pubsub" {
   # needs does not help, because Terraform resolves an indexed depends_on
   # reference to the whole resource.
   depends_on = [google_project_service.required]
+}
+
+# The detector's access to its own subscription. These lived in the module
+# until the destroy ordering above made them the wrong thing to keep there:
+# they are the only part of the ingress that names the agent's GSA, so holding
+# them here is what lets the module stay clear of kube_agents_iam.
+#
+# They are also the one part that genuinely cannot be reordered. Pub/Sub IAM
+# validates that a principal exists -- a grant naming a service account that
+# has not been created yet fails outright, measured on #2480 against the
+# Logging service agent -- so these have to follow the GSA however the rest is
+# arranged. Referencing module.kube_agents_iam is what puts them there.
+#
+# `moved` from the module rather than recreated: the bindings are identical, and
+# an address change alone would otherwise plan a destroy/create of the
+# detector's own access on every existing install.
+moved {
+  from = module.drift_pubsub[0].google_pubsub_subscription_iam_member.detector_subscriber
+  to   = google_pubsub_subscription_iam_member.detector_subscriber[0]
+}
+
+moved {
+  from = module.drift_pubsub[0].google_pubsub_subscription_iam_member.detector_viewer
+  to   = google_pubsub_subscription_iam_member.detector_viewer[0]
+}
+
+resource "google_pubsub_subscription_iam_member" "detector_subscriber" {
+  count = var.enable_drift_pubsub ? 1 : 0
+
+  project      = var.project_id
+  subscription = module.drift_pubsub[0].subscription_id
+  role         = "roles/pubsub.subscriber"
+  member       = "serviceAccount:${module.kube_agents_iam.service_account_email}"
+}
+
+# roles/pubsub.subscriber covers consuming messages but not reading the
+# subscription's own metadata. It grants subscriptions.consume, snapshots.seek,
+# and topics.attachSubscription -- notably not subscriptions.get. A client that
+# confirms the subscription exists before pulling (the chat adapter's
+# _check_subscription_exists) needs viewer as well, and without it fails with a
+# PermissionDenied that reads nothing like a missing grant.
+#
+# The drift detector makes one: a startup subscriptions.get reading the
+# configured ackDeadlineSeconds, so it can warn when --batch-join-budget would
+# hold a batch past it. This grant is what keeps that call from failing. It is
+# advisory on the detector's side -- a probe that is denied logs that the budget
+# went unchecked and the loop pulls anyway -- so removing viewer degrades the
+# warning rather than breaking ingestion. Viewer would stay regardless: `gcloud
+# pubsub subscriptions describe` needs it, and that is the first command anyone
+# runs against an empty topic.
+resource "google_pubsub_subscription_iam_member" "detector_viewer" {
+  count = var.enable_drift_pubsub ? 1 : 0
+
+  project      = var.project_id
+  subscription = module.drift_pubsub[0].subscription_id
+  role         = "roles/pubsub.viewer"
+  member       = "serviceAccount:${module.kube_agents_iam.service_account_email}"
 }
 
 module "github_minter" {

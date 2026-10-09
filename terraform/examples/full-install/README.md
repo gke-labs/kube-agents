@@ -765,10 +765,21 @@ exports mutating GKE audit-log calls (`drift_pubsub_sink`, default
 `platform-agent-drift-audit-sink`), the topic it publishes to
 (`drift_pubsub_topic`, default `platform-agent-drift-audit`), the pull
 subscription (`drift_pubsub_subscription`, default
-`platform-agent-drift-audit-sub`), `roles/pubsub.publisher` on the topic for
-the sink's writer identity, and `roles/pubsub.subscriber` plus
-`roles/pubsub.viewer` on the subscription for the agent's GSA. It also adds
-`pubsub.googleapis.com` to the enabled APIs.
+`platform-agent-drift-audit-sub`), and `roles/pubsub.publisher` on the topic
+for the sink's writer identity. It also adds `pubsub.googleapis.com` to the
+enabled APIs.
+
+`roles/pubsub.subscriber` and `roles/pubsub.viewer` on the subscription for the
+agent's GSA are granted here rather than inside the module, next to the module
+call. That is what keeps the module clear of `kube-agents-iam`, and so clear of
+the cluster: the cluster module depends on the ingress, which makes Terraform
+destroy the cluster first and delete the topic last. Without that ordering the
+topic goes while the control plane is still emitting matching audit records,
+and each one mails every project owner. The module README's
+[ordering section](../../modules/drift-pubsub/README.md#why-the-sink-is-created-last-and-destroyed-first)
+is canonical; `moved` blocks beside the two grants keep an existing install
+from planning a destroy and create of the detector's access on the first apply
+after this change.
 
 `drift_pubsub_topic_publishers` (default `[]`) grants `roles/pubsub.publisher`
 on the topic to each member it lists, on top of the sink's writer identity.

@@ -3,16 +3,6 @@ variable "project_id" {
   type        = string
 }
 
-variable "detector_service_account_email" {
-  description = "Email of the Google Service Account the drift detector runs as (granted subscriber and viewer on the subscription). The GSA itself and its Workload Identity binding belong to the kube-agents-iam module, not to this one."
-  type        = string
-
-  validation {
-    condition     = can(regex(".+@.+\\.iam\\.gserviceaccount\\.com$", var.detector_service_account_email))
-    error_message = "detector_service_account_email must be a service account email (name@project.iam.gserviceaccount.com)."
-  }
-}
-
 variable "cluster_names" {
   description = "GKE clusters to export audit logs for. Empty (the default) exports every cluster in the project, leaving the detector to route on resource.labels.cluster_name."
   type        = list(string)
