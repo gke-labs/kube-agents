@@ -38,7 +38,12 @@ sys.path.insert(0, os.getcwd())
 
 from gateway import kanban_watchers_notifier as notifier  # noqa: E402
 from gateway.config import Platform  # noqa: E402
-from gateway.kanban_chat_notify import NOTIFY_PLATFORM_ENV, ChatNotifyAdapter  # noqa: E402
+from gateway.kanban_chat_notify import (  # noqa: E402
+    NOTIFY_CONVERSATIONS_ENV,
+    NOTIFY_PLATFORM_ENV,
+    ChatNotifyAdapter,
+    ConversationNotifyAdapter,
+)
 
 GCHAT = None
 
@@ -128,6 +133,39 @@ def main() -> None:
     check(notifier._adapter_for_subscription(runner, GCHAT, sub, None) is None,
           "routed: no stand-in under multiplex_profiles")
     runner.config.multiplex_profiles = False
+    # A card filed in a gateway conversation: its own stand-in, armed by
+    # A2A_NOTIFY_CONVERSATIONS. Push-capable, so Hermes still sends the card's
+    # report; a wake admitted through Hermes's own admit_internal_event is
+    # self-posted into the bridge session instead of run as a fresh turn.
+    import gateway.wake as wake
+    from gateway.platforms.base import MessageEvent, MessageType
+    from gateway.session import SessionSource
+
+    conv_sub = dict(sub, chat_id="a2a-ctx-verify", thread_id="gchat:spaces/H/threads/T")
+    os.environ[NOTIFY_CONVERSATIONS_ENV] = "google_chat"
+    conv = notifier._adapter_for_subscription(runner, GCHAT, conv_sub, None)
+    check(isinstance(conv, ConversationNotifyAdapter), "conversation: a gateway conversation's card gets the conversation stand-in")
+    check(wake.adapter_supports_push(conv), "conversation: push-capable, so the notifier sends the card's report")
+    self_posts = []
+    real_self_post = wake._self_post_chat_completion
+
+    async def record_self_post(a, *, text, session_id):
+        self_posts.append(session_id)
+
+    wake._self_post_chat_completion = record_self_post
+    try:
+        handled_before = len(runner.handled)
+        conv_source = SessionSource(platform=GCHAT, chat_id="a2a-ctx-verify", chat_type="group",
+                                    thread_id="gchat:spaces/H/threads/T")
+        asyncio.run(wake.admit_internal_event(conv, MessageEvent(text="[wake] t_1 blocked", message_type=MessageType.TEXT,
+                                                                   source=conv_source, internal=True)))
+    finally:
+        wake._self_post_chat_completion = real_self_post
+    check(self_posts == ["a2a-ctx-verify"], f"conversation: the wake self-posts into the bridge session ({self_posts})")
+    check(len(runner.handled) == handled_before, "conversation: no fresh-session turn runs for the wake")
+    os.environ.pop(NOTIFY_CONVERSATIONS_ENV)
+    check(notifier._adapter_for_subscription(runner, GCHAT, conv_sub, None) is None,
+          "conversation: without A2A_NOTIFY_CONVERSATIONS a conversation's card gets no stand-in")
     check(notifier._Collector._claim_for_sub.__name__ == "_kage_claim_for_sub",
           "the collector's claim is wrapped to drop stale events")
 

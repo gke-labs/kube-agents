@@ -667,6 +667,61 @@ SKILL_FILE_SUBSTITUTIONS = {
     },
 }
 
+# gke-basics' tool-preference reference upstream ranks only the interfaces for live cluster
+# operations, so a GKE fact the agent needs (a field, a version lifecycle, a quota) falls through
+# to web search. This repository ranks Developer Knowledge first for those lookups and web search
+# as the fallback; the replacement adds that hierarchy above upstream's, which it renames.
+GKE_BASICS_CLI_REFERENCE_OLD_TOOL_PREFERENCE_SNIPPET = """## Tool Preference
+
+Default preference order:
+"""
+
+GKE_BASICS_CLI_REFERENCE_NEW_TOOL_PREFERENCE_SNIPPET = """## Tool Preference
+
+Tool usage follows two distinct, domain-specific preference hierarchies:
+
+### 1. Knowledge & Documentation Lookups (GKE Facts, Schemas, Best Practices)
+
+Default preference order:
+
+```
+1. Developer Knowledge MCP  (preferred — authoritative, curated first-party documentation)
+2. Web Search               (fallback — third-party tooling, open-source CVEs, or DK cache miss)
+```
+
+| Interface                                               | When to Use                                                                                                           | Examples                                                                                                      |
+| ------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------- |
+| **Developer Knowledge MCP** (`mcp-developer_knowledge`) | Default for all GKE/GCP facts, API schemas, version lifecycles, and configuration semantics.                          | GKE Autopilot constraints, Ingress/Gateway API spec fields, release version deprecations, quota requirements. |
+| **Web Search** (`web_search`)                           | Third-party software documentation, non-Google helm charts, community error discussions, or when DK returns no match. | Investigating an open-source operator error, third-party CNI details, or external blog posts.                 |
+
+### 2. Live Cluster Operations & State Management
+
+Default preference order:
+"""
+
+GKE_BASICS_CLI_REFERENCE_OLD_WHEN_TO_USE_SNIPPET = "### When to use each\n"
+
+GKE_BASICS_CLI_REFERENCE_NEW_WHEN_TO_USE_SNIPPET = "### When to use each (Cluster Operations)\n"
+
+# The same corrections for a file in a skill other than its SKILL.md, keyed by skill and then by
+# the file's path inside the skill directory. A skill's reference files are wiped and re-copied
+# with the rest of it, so an edit made to one by hand lasts until the next sync unless it is
+# registered here. Every rule SKILL_SUBSTITUTIONS follows applies.
+SKILL_FILE_SUBSTITUTIONS = {
+    "gke-basics": {
+        os.path.join("references", "cli-reference.md"): [
+            (
+                GKE_BASICS_CLI_REFERENCE_OLD_TOOL_PREFERENCE_SNIPPET,
+                GKE_BASICS_CLI_REFERENCE_NEW_TOOL_PREFERENCE_SNIPPET,
+            ),
+            (
+                GKE_BASICS_CLI_REFERENCE_OLD_WHEN_TO_USE_SNIPPET,
+                GKE_BASICS_CLI_REFERENCE_NEW_WHEN_TO_USE_SNIPPET,
+            ),
+        ],
+    },
+}
+
 # Marker that identifies our auto-injected footer, so injection is idempotent and
 # the footer can be recognized/stripped later if needed.
 FOOTER_MARKER = "<!-- kube-agents: local addition (auto-injected by sync-upstream-skills.py) -->"
