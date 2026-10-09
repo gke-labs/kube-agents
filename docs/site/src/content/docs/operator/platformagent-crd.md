@@ -368,7 +368,8 @@ says nothing. Hermes applies that file over the agent's config on every load, so
 volume was first seeded with, a removed override, or an edit the agent made to its own file has no
 effect. An install upgraded onto an operator that changes the default takes the new number on its
 first reconcile and the pod roll that follows; the dispatcher logs
-`kanban dispatcher: max_in_progress=<n>` at startup. The `max_in_progress` line in
+`kanban dispatcher: max_in_progress=<n>` at startup (Hermes' `_positive_int_setting` in
+`gateway/kanban_watchers_common.py`, which logs each configured kanban cap as it reads it). The `max_in_progress` line in
 `agents/chat/config.yaml` applies only to an image run without the operator.
 
 One slot is guaranteed to each class of card. A card is classed when an agent files it with
