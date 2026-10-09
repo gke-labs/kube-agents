@@ -1022,12 +1022,15 @@ const clusterProfileClassKey = "profileclass-cluster" + profileOverlaySuffix
 // process: a burst of cards spawns them until the cgroup OOM killer intervenes, which
 // kills a child rather than the container and so produces no restart and no event.
 //
-// The operator does NOT render this default for the default profile —
-// agents/chat/config.yaml carries the same number, which is what caps an install that
-// runs the image without the operator too. The constant exists so the CR override below
-// can be compared against it, and so the two files can be kept in step. The one place it
-// IS rendered is frontDoorKanban, where there is no image copy to defer to: the platform
-// profile's config declares no `kanban` key at all.
+// The operator pins the resolved cap (resolveKanbanMaxInProgress: the CR's value, else this
+// one) in the managed scope, so it applies on every load over whatever the agent's own
+// config.yaml holds. agents/chat/config.yaml carries the same number for an install that
+// runs the image without the operator, and TestChatConfigCapsTheBoardAndWakesOnFailuresOnly
+// keeps the two in step.
+//
+// Deferring the untuned case to that file, which an earlier shape did, did not work on an
+// existing volume: the image template reaches it only for keys it is missing (step 2d's
+// fill-only back-fill), so a volume seeded at 2 kept 2 after this constant became 6.
 //
 // One slot of the cap is guaranteed to each class of card, user and background
 // (deploy/docker/patches/kanban_priority.py), and the four between are shared. A worker
@@ -1248,8 +1251,8 @@ const (
 var kanbanWakeOnEvents = []string{"gave_up", "crashed", "timed_out", "blocked"}
 
 // resolveKanbanMaxInProgress is the live board-wide worker cap: the CR's
-// spec.harness.tuning.maxInProgress, or the number agents/chat/config.yaml already
-// carries for an install that does not set it.
+// spec.harness.tuning.maxInProgress, or defaultKanbanMaxInProgress when it says nothing.
+// renderConfigYAML pins it in the managed scope.
 func resolveKanbanMaxInProgress(agent *agentv1alpha1.PlatformAgent) int {
 	if limits := agentTuning(agent); limits != nil && limits.MaxInProgress != nil {
 		return *limits.MaxInProgress
@@ -1272,17 +1275,19 @@ func resolveKanbanMaxInProgress(agent *agentv1alpha1.PlatformAgent) int {
 // off it would be dead config on every install, and the whole claim of an experimental
 // flag is that an install which does not set it is untouched.
 //
-// Without it the front door silently reverts to upstream Hermes: unbounded dispatch, a
-// 60s tick, and `completed` back in the wake set, with spec.harness.tuning.maxInProgress
-// quietly having no effect at all.
-func frontDoorKanban(agent *agentv1alpha1.PlatformAgent) map[string]any {
+// Without it the front door silently reverts to upstream Hermes: a 60s tick and
+// `completed` back in the wake set.
+//
+// `max_in_progress` is not in the block. The managed scope pins it, and that scope is
+// machine-global, so the pin lands on this profile as it lands on the default one; a copy
+// here would be one operator setting on two routes (see buildConfigMapData).
+func frontDoorKanban() map[string]any {
 	return map[string]any{
 		"dispatch_in_gateway":            true,
 		"auto_subscribe_on_create":       true,
 		"dispatch_interval_seconds":      kanbanDispatchIntervalSeconds,
 		"dispatch_stale_timeout_seconds": kanbanDispatchStaleTimeoutSeconds,
 		"wake_on_events":                 slices.Clone(kanbanWakeOnEvents),
-		"max_in_progress":                resolveKanbanMaxInProgress(agent),
 	}
 }
 
@@ -1336,7 +1341,7 @@ func frontDoorOverlay(agent *agentv1alpha1.PlatformAgent) map[string]any {
 	return map[string]any{
 		"platform_toolsets": platformToolsets,
 		"plugins":           map[string]any{"enabled": slices.Clone(frontDoorPlugins)},
-		"kanban":            frontDoorKanban(agent),
+		"kanban":            frontDoorKanban(),
 	}
 }
 
@@ -1519,35 +1524,12 @@ func renderProfileOverlayYAML(plugins []*agentv1alpha1.AgentPlugin, limits *agen
 // spec.harness.tuning.default, for the same machine-global reason: one profile's turn
 // budget must not become every profile's.
 //
-// The maxInProgress cap is the CR's override only. Its default lives in
-// agents/chat/config.yaml (defaultKanbanMaxInProgress), so an unset CR leaves the image's
-// number in force rather than having the operator restate it on every reconcile.
+// spec.harness.tuning.maxInProgress is NOT here. It is board-wide, so renderConfigYAML pins
+// it in the managed scope. It used to ride this overlay, only when the CR set it, and that
+// left the live cap to the agent's own config.yaml: an unset CR fell back to whatever the
+// volume was first seeded with, and a removed override left its value behind.
 func renderDefaultProfileOverlayYAML(agent *agentv1alpha1.PlatformAgent, plugins []*agentv1alpha1.AgentPlugin) string {
-	overlay := renderProfileOverlayYAML(plugins, defaultProfileLimits(agent), nil, nil)
-
-	tuning := agentTuning(agent)
-	if tuning == nil || tuning.MaxInProgress == nil {
-		return overlay
-	}
-
-	var parsed map[string]any
-	if overlay != "" {
-		if err := yaml.Unmarshal([]byte(overlay), &parsed); err != nil {
-			return overlay
-		}
-	}
-	if parsed == nil {
-		parsed = map[string]any{}
-	}
-	parsed = mergeMaps(parsed, map[string]any{
-		"kanban": map[string]any{"max_in_progress": *tuning.MaxInProgress},
-	})
-
-	data, err := yaml.Marshal(parsed)
-	if err != nil {
-		return overlay
-	}
-	return string(data)
+	return renderProfileOverlayYAML(plugins, defaultProfileLimits(agent), nil, nil)
 }
 
 // pluginConfigIssues reports problems with a plugin's spec.config: YAML that does not
@@ -1720,18 +1702,19 @@ func seededGitOpsEntry(agent *agentv1alpha1.PlatformAgent) *agentv1alpha1.Manage
 // merging into it — a list is a leaf too, so `platform_toolsets.cli` rendered here
 // rewrote every specialist's toolset list to the front door's two-tool delegation
 // surface, and `agent.disabled_toolsets` took the specialists' terminal away. Nothing
-// profile-shaped may be rendered here for that reason: toolsets, disabled toolsets,
-// kanban tuning, terminal cwd, mcp servers, the plugin roster and the memory provider
-// are each profile's own, and stay in that profile's config.yaml in the image.
+// profile-shaped may be rendered here for that reason: toolsets, disabled toolsets, the
+// dispatcher's tick and wake set, terminal cwd, mcp servers, the plugin roster and the
+// memory provider are each profile's own, and stay in that profile's config.yaml in the
+// image.
 //
 // WHAT BELONGS HERE is the intersection of two tests: identical for every profile in
 // the pod, AND beyond the agent's own repair once broken. That is the model endpoint —
 // an agent that repoints base_url at nothing cannot be told to put it back, because
 // being told requires the endpoint — and the chat platform wiring that carries the
 // human's only channel to it. `approvals.cron_mode` rides along as a third: it is
-// uniform by design, and Hermes' own default is `deny`. Everything else is recoverable
-// the way it was broken, by a human telling the agent to fix its own config, and so
-// stays writable.
+// uniform by design, and Hermes' own default is `deny`. `kanban.max_in_progress` is a
+// fourth, for the reason given where it is set. Everything else is recoverable the way it
+// was broken, by a human telling the agent to fix its own config, and so stays writable.
 //
 // Keys this function says nothing about stay the image's, and stay writable: that is
 // what keeps `/sethome`, the monitoring install id and saved slash-command preferences
@@ -1881,6 +1864,10 @@ func renderConfigYAML(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agentv
 		// declared (a2aActivityHook); absent otherwise, so a today
 		// install's config is unchanged.
 		Hooks *managedHooks `json:"hooks,omitempty"`
+		// The board-wide kanban worker cap. Always rendered; see where it is set.
+		Kanban struct {
+			MaxInProgress int `json:"max_in_progress"`
+		} `json:"kanban"`
 	}{}
 
 	// Model. The endpoint every profile in the pod reasons through, and the setting
@@ -1932,6 +1919,24 @@ func renderConfigYAML(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agentv
 	}
 
 	cfg.Hooks = a2aActivityHook(agent)
+
+	// The kanban worker cap: the CR's spec.harness.tuning.maxInProgress, else
+	// defaultKanbanMaxInProgress. It meets the uniformity test because it is not a
+	// profile's setting at all. The board is shared by every profile in the pod
+	// (kanban.db), and every dispatch entry point reads the cap from whichever profile it
+	// runs as: the gateway's dispatcher from the profile it is homed at, `hermes kanban
+	// dispatch` from the caller's. A pin gives them all the same number, where a profile
+	// key gave each its own or, on a profile that declared none, Hermes' memory-derived
+	// default. It is the operator's to own rather than the agent's because the failure it
+	// prevents, a burst of workers taken by the OOM killer, raises no restart and no
+	// event, so the agent cannot see what it would be repairing.
+	//
+	// It is pinned rather than merged into the profile's config because a merged value
+	// is only as good as the file it lands in: the image template reaches an existing
+	// volume only for keys it is missing, so a volume seeded at 2 kept 2 when the default
+	// became 6. A pin is applied over the persisted config on every load, whatever that
+	// file's history.
+	cfg.Kanban.MaxInProgress = resolveKanbanMaxInProgress(agent)
 
 	cfg.Display.Platforms = map[string]map[string]any{}
 
@@ -2913,6 +2918,18 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 			}
 			extEnvs = kept
 		}
+		// A2A_NOTIFY_PLATFORM is dropped on every install, not only while the
+		// A2A surface is up: on a today install a plugin's value would reroute
+		// every Google Chat post from hermes send to a chat.notify route that
+		// does not exist there. The operator renders it only under next, after
+		// this merge.
+		kept := extEnvs[:0]
+		for _, e := range extEnvs {
+			if e.Name != a2aNotifyPlatformEnvVar {
+				kept = append(kept, e)
+			}
+		}
+		extEnvs = kept
 		if len(extEnvs) > 0 {
 			envVars = mergeEnvVars(envVars, extEnvs)
 		}
@@ -3078,6 +3095,15 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 				Value: a2aAgentBusUser,
 			},
 		)
+	}
+	// The Hermes Google Chat platform is off under next (legacyChatConsumer),
+	// so the agent-side callers that used to `hermes send` a proactive post
+	// route it to the gateway's chat.notify instead. This names the platform
+	// they reroute; the bus identity above is what sends it. Only when the
+	// home channel is one the gateway will arm the route for: otherwise every
+	// post would go to a subject nobody answers.
+	if a2aAgentSurface(agent) && a2aChatArmed(agent) && a2aGchatHomeSpace(agent) != "" {
+		envVars = append(envVars, corev1.EnvVar{Name: a2aNotifyPlatformEnvVar, Value: a2aNotifyPlatformGchat})
 	}
 	if a2aActivityHookWanted(agent) {
 		envVars = append(envVars, a2aActivitySecretEnv(agent))
@@ -3950,8 +3976,10 @@ func buildAgentAPIAuthSidecar(agent *agentv1alpha1.PlatformAgent, homeDir string
 			FailureThreshold:    3,
 		},
 		Resources: corev1.ResourceRequirements{
-			// Memory request covers the watcher's informer and dedup caches, which
-			// scale with the number of watched clusters.
+			// Memory request covers the watcher's dedup and scale-up memos, which
+			// scale with the number of watched clusters, and the initial list of
+			// each cluster's events, which it holds only until delivered: the
+			// watcher keeps no store of Events (watcher.go, Run).
 			Requests: corev1.ResourceList{
 				corev1.ResourceCPU:    resource.MustParse(agentAPIAuthCPURequest),
 				corev1.ResourceMemory: resource.MustParse(agentAPIAuthMemoryRequest),
