@@ -74,11 +74,14 @@ restarted), never its latest crash. A pod created inside a pool
 operation's window is marked recreated, which is ambiguous only for a
 failure a recreation carries over (a crash loop, an OOM kill, an image pull
 failure); for those the owner is consulted as proof of age only: a
-Deployment whose `Available=False` or `Progressing=False` transition, or
-whose current ReplicaSet's creation, predates the window makes the symptom
-predate the upgrade, a transition inside the window proves nothing, and with
-no proof a first run grades it medium with the recreated-pod reason until a
-later full run settles it through the stored set. A Pending replica created
+Deployment whose `Available=False` or `Progressing=False` transition
+predates the window makes the symptom predate the upgrade; a transition
+inside the window proves nothing, a ReplicaSet's age proves nothing (a pod
+can run for months on an old ReplicaSet and fail only on the rebuilt node,
+entry 14's own mechanism; a ReplicaSet created inside the window is noted
+as a rollout during it), and with no proof a first run grades it medium
+with the recreated-pod reason until a later full run settles it through the
+stored set. A Pending replica created
 inside the window is the one the drain displaced and is new. Events carry
 their first observation, nodes their condition's transition; a budget hold
 and a node not back are keyed by their operation in the stored set, so this
@@ -498,6 +501,7 @@ PRE_EXISTING_PODS_FORMAT = "; {count} pre-existing since {earliest} (e.g. {examp
 ONSET_FROM_OWNER, ONSET_FROM_POD = "owner", "pod"
 OWNER_FAILURE_CONDITIONS = ("Available", "Progressing")
 AGE_PROOF_FORMAT = "; owner proves age: {proof} since {since}"
+ROLLOUT_IN_WINDOW_FORMAT = "; rollout during the window: current ReplicaSet created {created}"
 # The stored-set key of an operation-bound symptom (a budget hold, a node
 # not back) names the operation, so a hold against this upgrade is never
 # "already recorded" from the last one.
@@ -1248,14 +1252,10 @@ def _pod_last_activity(pod: dict) -> datetime | None:
     return parse_ts(status.get("startTime")) or parse_ts((pod.get("metadata") or {}).get("creationTimestamp"))
 
 
-def owner_age_proofs(workloads: list[dict], owners: list[dict]) -> dict[str, tuple[str, str]]:
-    """What a Deployment can prove about a failure's age: its earliest
-    `Available=False` or `Progressing=False` transition, else its newest
-    ReplicaSet's creation, as (what, when). Consulted only for a
-    container-level failure on a pod a drain recreated; a date inside the
-    window proves nothing, and the caller decides that. StatefulSets,
-    DaemonSets and Jobs carry no such date and are absent."""
-    out: dict[str, tuple[str, str]] = {}
+def owner_rollouts(owners: list[dict]) -> dict[str, str]:
+    """Each Deployment's newest ReplicaSet creation: evidence that a rollout
+    happened, deciding nothing about a failure's age (a pod can run for
+    months on an old ReplicaSet and fail only on the rebuilt node)."""
     newest_rs: dict[str, datetime] = {}
     for obj in owners:
         if obj.get("kind") != "ReplicaSet":
@@ -1265,6 +1265,17 @@ def owner_age_proofs(workloads: list[dict], owners: list[dict]) -> dict[str, tup
         if controller and created:
             key = _object_ref((obj.get("metadata") or {}).get("namespace", ""), controller[0], controller[1])
             newest_rs[key] = max(created, newest_rs.get(key, created))
+    return {key: fmt_ts(created) for key, created in newest_rs.items()}
+
+
+def owner_age_proofs(workloads: list[dict]) -> dict[str, tuple[str, str]]:
+    """What a Deployment can prove about a failure's age: its earliest
+    `Available=False` or `Progressing=False` transition, as (what, when).
+    Consulted only for a container-level failure on a pod a drain
+    recreated; a transition inside the window proves nothing, and the
+    caller decides that. A ReplicaSet's age is no proof, and StatefulSets,
+    DaemonSets and Jobs carry no such date; all are absent."""
+    out: dict[str, tuple[str, str]] = {}
     for workload in workloads:
         if workload.get("kind") != "Deployment":
             continue
@@ -1275,8 +1286,6 @@ def owner_age_proofs(workloads: list[dict], owners: list[dict]) -> dict[str, tup
         if failures:
             earliest, what = min(failures)
             out[key] = (what, fmt_ts(earliest))
-        elif key in newest_rs:
-            out[key] = ("current ReplicaSet created", fmt_ts(newest_rs[key]))
     return out
 
 
@@ -1324,7 +1333,7 @@ def _pod_onset(pod: dict, activity: datetime | None) -> datetime | None:
     return transition or started
 
 
-def pod_symptoms(pods: list[dict], resolver: Resolver, window_start: datetime | None = None, age_proofs: dict[str, tuple[str, str]] | None = None, pool_spans: dict[str, list[tuple[datetime, datetime]]] | None = None, node_pool: dict[str, str] | None = None) -> list[dict]:
+def pod_symptoms(pods: list[dict], resolver: Resolver, window_start: datetime | None = None, age_proofs: dict[str, tuple[str, str]] | None = None, pool_spans: dict[str, list[tuple[datetime, datetime]]] | None = None, node_pool: dict[str, str] | None = None, rollouts: dict[str, str] | None = None) -> list[dict]:
     """One row per (top owner, category, reason), carrying the pods behind
     it; the row's detail (node, containers, images) is the example pod's.
     A pod whose last activity predates `window_start` is not the upgrade's."""
@@ -1365,6 +1374,7 @@ def pod_symptoms(pods: list[dict], resolver: Resolver, window_start: datetime | 
             "onset_source": source,
             "recreated_pods": [pod_name] if recreated else [],
             "age_proof": {"what": proof[0], "since": proof[1]} if proof else None,
+            "rollout_at": (rollouts or {}).get(obj),
             "pod_nodes": {pod_name: (pod.get("spec") or {}).get("nodeName")},
             **_pod_detail(pod),
         }
@@ -1807,6 +1817,11 @@ def mark_since(symptoms: list[dict], baseline: list[str] | None, first_operation
             proof = symptom.get("age_proof") or {}
             proof_at = parse_ts(proof.get("since"))
             proven_old = bool(ambiguous and proof_at and proof_at < first_operation)
+            rollout_at = parse_ts(symptom.get("rollout_at"))
+            if ambiguous and rollout_at and rollout_at >= first_operation:
+                # Evidence that a rollout happened during the window; it decides nothing.
+                for c in symptom["classifications"]:
+                    c["evidence"] = (c["evidence"] + ROLLOUT_IN_WINDOW_FORMAT.format(created=symptom["rollout_at"]))[:MESSAGE_EXCERPT_CHARS]
             if new_pods and not ambiguous:
                 symptom["since"] = SINCE_FIRST_SEEN if baseline is None else SINCE_NEW
                 symptom["predates_upgrade"] = False
@@ -1864,7 +1879,7 @@ def collect_symptoms(cluster: dict, reads: dict[str, list], operations: list[dic
     )
     resolver = Resolver(reads.get("pods") or [], reads.get("owners") or [], reads.get("workloads") or [])
     node_pool_of = {(n.get("metadata") or {}).get("name"): ((n.get("metadata") or {}).get("labels") or {}).get(NODEPOOL_LABEL, "") for n in nodes}
-    pods = pod_symptoms(reads.get("pods") or [], resolver, window_start, owner_age_proofs(reads.get("workloads") or [], reads.get("owners") or []), pool_operation_windows(operations), node_pool_of)
+    pods = pod_symptoms(reads.get("pods") or [], resolver, window_start, owner_age_proofs(reads.get("workloads") or []), pool_operation_windows(operations), node_pool_of, owner_rollouts(reads.get("owners") or []))
     pod_objects = {s["object"] for s in pods}
     # An event on a pod that is gone carries no pool; its owner's template
     # nodeSelector is the pool evidence it can still have.
