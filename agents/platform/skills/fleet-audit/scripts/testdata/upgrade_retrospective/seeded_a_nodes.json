@@ -1,0 +1,1063 @@
+{
+ "apiVersion": "v1",
+ "items": [
+  {
+   "apiVersion": "v1",
+   "kind": "Node",
+   "metadata": {
+    "creationTimestamp": "2026-10-07T04:03:27Z",
+    "labels": {
+     "addon.gke.io/node-local-dns-ds-ready": "true",
+     "beta.kubernetes.io/arch": "amd64",
+     "beta.kubernetes.io/instance-type": "e2-medium",
+     "beta.kubernetes.io/os": "linux",
+     "cloud.google.com/gke-boot-disk": "pd-balanced",
+     "cloud.google.com/gke-container-runtime": "containerd",
+     "cloud.google.com/gke-cpu-scaling-level": "2",
+     "cloud.google.com/gke-logging-variant": "DEFAULT",
+     "cloud.google.com/gke-max-pods-per-node": "110",
+     "cloud.google.com/gke-memory-gb-scaling-level": "4",
+     "cloud.google.com/gke-netd-ready": "true",
+     "cloud.google.com/gke-nodepool": "default-pool",
+     "cloud.google.com/gke-os-distribution": "cos",
+     "cloud.google.com/gke-provisioning": "standard",
+     "cloud.google.com/gke-stack-type": "IPV4",
+     "cloud.google.com/machine-family": "e2",
+     "cloud.google.com/private-node": "false",
+     "disk-type.gke.io/pd-balanced": "true",
+     "disk-type.gke.io/pd-extreme": "true",
+     "disk-type.gke.io/pd-ssd": "true",
+     "disk-type.gke.io/pd-standard": "true",
+     "failure-domain.beta.kubernetes.io/region": "us-central1",
+     "failure-domain.beta.kubernetes.io/zone": "us-central1-a",
+     "iam.gke.io/gke-metadata-server-enabled": "true",
+     "kubernetes.io/arch": "amd64",
+     "kubernetes.io/hostname": "gke-seeded-a-default-pool-62ac8ee0-d595",
+     "kubernetes.io/os": "linux",
+     "node.kubernetes.io/instance-type": "e2-medium",
+     "topology.gke.io/zone": "us-central1-a",
+     "topology.kubernetes.io/region": "us-central1",
+     "topology.kubernetes.io/zone": "us-central1-a"
+    },
+    "name": "gke-seeded-a-default-pool-62ac8ee0-d595"
+   },
+   "status": {
+    "conditions": [
+     {
+      "lastHeartbeatTime": "2026-10-07T04:03:28Z",
+      "lastTransitionTime": "2026-10-07T04:03:28Z",
+      "message": "NodeController create implicit route",
+      "reason": "RouteCreated",
+      "status": "False",
+      "type": "NetworkUnavailable"
+     },
+     {
+      "lastHeartbeatTime": "2026-10-08T17:22:46Z",
+      "lastTransitionTime": "2026-10-07T04:03:26Z",
+      "message": "Swap is not active",
+      "reason": "SwapNotDetected",
+      "status": "False",
+      "type": "Swap"
+     },
+     {
+      "lastHeartbeatTime": "2026-10-08T17:22:46Z",
+      "lastTransitionTime": "2026-10-07T04:03:26Z",
+      "message": "Root filesystem is not read only",
+      "reason": "ReadOnlyRootFileSystemNotDetected",
+      "status": "False",
+      "type": "ReadOnlyRootFileSystem"
+     },
+     {
+      "lastHeartbeatTime": "2026-10-08T17:22:46Z",
+      "lastTransitionTime": "2026-10-07T04:03:27Z",
+      "message": "{\"unmanaged\": {\"kernel.cad_pid\": \"1\"}}",
+      "reason": "NodeSysctlChange",
+      "status": "True",
+      "type": "SysctlChanged"
+     },
+     {
+      "lastHeartbeatTime": "2026-10-08T17:22:46Z",
+      "lastTransitionTime": "2026-10-07T04:03:26Z",
+      "message": "docker overlay2 is functioning properly",
+      "reason": "NoCorruptDockerOverlay2",
+      "status": "False",
+      "type": "CorruptDockerOverlay2"
+     },
+     {
+      "lastHeartbeatTime": "2026-10-08T17:22:46Z",
+      "lastTransitionTime": "2026-10-07T04:03:26Z",
+      "message": "Root filesystem has no storage pressure",
+      "reason": "StoragePressureRootFileSystemNotDetected",
+      "status": "False",
+      "type": "StoragePressureRootFileSystem"
+     },
+     {
+      "lastHeartbeatTime": "2026-10-08T17:22:46Z",
+      "lastTransitionTime": "2026-10-07T04:03:26Z",
+      "message": "kubelet is functioning properly",
+      "reason": "NoFrequentKubeletRestart",
+      "status": "False",
+      "type": "FrequentKubeletRestart"
+     },
+     {
+      "lastHeartbeatTime": "2026-10-08T17:22:46Z",
+      "lastTransitionTime": "2026-10-07T04:03:26Z",
+      "message": "kernel has no deadlock",
+      "reason": "KernelHasNoDeadlock",
+      "status": "False",
+      "type": "KernelDeadlock"
+     },
+     {
+      "lastHeartbeatTime": "2026-10-08T17:22:46Z",
+      "lastTransitionTime": "2026-10-07T04:03:26Z",
+      "message": "UEFI CPER has no fatal error",
+      "reason": "CperHardwareHasNoFatalError",
+      "status": "False",
+      "type": "CperHardwareErrorFatal"
+     },
+     {
+      "lastHeartbeatTime": "2026-10-08T17:22:46Z",
+      "lastTransitionTime": "2026-10-07T04:03:26Z",
+      "message": "No unsupported EBPF programs detected",
+      "reason": "UnsupportedEBPFProgramsNotDetected",
+      "status": "False",
+      "type": "UnsupportedEBPFPrograms"
+     },
+     {
+      "lastHeartbeatTime": "2026-10-08T17:22:46Z",
+      "lastTransitionTime": "2026-10-07T04:03:26Z",
+      "message": "No deprecation risk: did not find any deprecated 'auths' field in containerd's config",
+      "reason": "DeprecatedAuthsFieldInContainerdConfigurationNotDetected",
+      "status": "False",
+      "type": "DeprecatedAuthsFieldInContainerdConfiguration"
+     },
+     {
+      "lastHeartbeatTime": "2026-10-08T17:22:46Z",
+      "lastTransitionTime": "2026-10-07T04:03:26Z",
+      "message": "containerd is functioning properly",
+      "reason": "NoFrequentContainerdRestart",
+      "status": "False",
+      "type": "FrequentContainerdRestart"
+     },
+     {
+      "lastHeartbeatTime": "2026-10-08T17:22:46Z",
+      "lastTransitionTime": "2026-10-07T04:03:26Z",
+      "message": "No deprecation risk: did not find any deprecated 'configs' field in containerd's config",
+      "reason": "DeprecatedConfigsFieldInContainerdConfigurationNotDetected",
+      "status": "False",
+      "type": "DeprecatedConfigsFieldInContainerdConfiguration"
+     },
+     {
+      "lastHeartbeatTime": "2026-10-08T17:22:46Z",
+      "lastTransitionTime": "2026-10-07T04:03:26Z",
+      "message": "XFS has not shutdown",
+      "reason": "XfsHasNotShutDown",
+      "status": "False",
+      "type": "XfsShutdown"
+     },
+     {
+      "lastHeartbeatTime": "2026-10-08T17:22:46Z",
+      "lastTransitionTime": "2026-10-07T04:03:26Z",
+      "message": "No deprecation risk: did not find any deprecations other than 3 configs fields (auths/configs/mirrors), pulling schema v1 images and using v1alpha2 CRI.",
+      "reason": "DeprecatedOtherContainerdFeaturesNotDetected",
+      "status": "False",
+      "type": "DeprecatedOtherContainerdFeatures"
+     },
+     {
+      "lastHeartbeatTime": "2026-10-08T17:22:46Z",
+      "lastTransitionTime": "2026-10-07T04:03:26Z",
+      "message": "node is functioning properly",
+      "reason": "NoFrequentUnregisterNetDevice",
+      "status": "False",
+      "type": "FrequentUnregisterNetDevice"
+     },
+     {
+      "lastHeartbeatTime": "2026-10-08T17:22:46Z",
+      "lastTransitionTime": "2026-10-07T04:03:26Z",
+      "message": "No unsupported CNI detected for DPv2 migration",
+      "reason": "DPv2MigrationUnsupportedCNINotDetected",
+      "status": "False",
+      "type": "DPv2MigrationUnsupportedCNI"
+     },
+     {
+      "lastHeartbeatTime": "2026-10-08T17:22:46Z",
+      "lastTransitionTime": "2026-10-07T04:03:26Z",
+      "message": "No deprecation risk: did not find any deprecated 'mirrors' field in containerd's config",
+      "reason": "DeprecatedMirrorsFieldInContainerdConfigurationNotDetected",
+      "status": "False",
+      "type": "DeprecatedMirrorsFieldInContainerdConfiguration"
+     },
+     {
+      "lastHeartbeatTime": "2026-10-08T17:22:46Z",
+      "lastTransitionTime": "2026-10-07T04:03:26Z",
+      "message": "System resources are within normal range.",
+      "reason": "ResourcesOK",
+      "status": "False",
+      "type": "ResourceExhausted"
+     },
+     {
+      "lastHeartbeatTime": "2026-10-08T17:22:46Z",
+      "lastTransitionTime": "2026-10-07T04:03:26Z",
+      "message": "No deprecation risk: did not use v1alpha2 CRI",
+      "reason": "DeprecatedUsingV1Alpha2CriNotDetected",
+      "status": "False",
+      "type": "DeprecatedUsingV1Alpha2Cri"
+     },
+     {
+      "lastHeartbeatTime": "2026-10-08T17:22:46Z",
+      "lastTransitionTime": "2026-10-07T04:03:26Z",
+      "message": "No changes detected to the kubelet configuration file.",
+      "reason": "NoKubeletConfigChangeDetected",
+      "status": "False",
+      "type": "KubeletConfigChanged"
+     },
+     {
+      "lastHeartbeatTime": "2026-10-08T17:22:46Z",
+      "lastTransitionTime": "2026-10-07T04:03:26Z",
+      "message": "No deprecation risk: did not pull any schema v1 images",
+      "reason": "DeprecatedPullingSchemaV1ImageDetected",
+      "status": "False",
+      "type": "DeprecatedPullingSchemaV1Image"
+     },
+     {
+      "lastHeartbeatTime": "2026-10-08T17:22:46Z",
+      "lastTransitionTime": "2026-10-07T04:03:26Z",
+      "message": "docker is functioning properly",
+      "reason": "NoFrequentDockerRestart",
+      "status": "False",
+      "type": "FrequentDockerRestart"
+     },
+     {
+      "lastHeartbeatTime": "2026-10-08T17:22:16Z",
+      "lastTransitionTime": "2026-10-07T04:03:26Z",
+      "message": "kubelet has sufficient memory available",
+      "reason": "KubeletHasSufficientMemory",
+      "status": "False",
+      "type": "MemoryPressure"
+     },
+     {
+      "lastHeartbeatTime": "2026-10-08T17:22:16Z",
+      "lastTransitionTime": "2026-10-07T04:03:26Z",
+      "message": "kubelet has no disk pressure",
+      "reason": "KubeletHasNoDiskPressure",
+      "status": "False",
+      "type": "DiskPressure"
+     },
+     {
+      "lastHeartbeatTime": "2026-10-08T17:22:16Z",
+      "lastTransitionTime": "2026-10-07T04:03:26Z",
+      "message": "kubelet has sufficient PID available",
+      "reason": "KubeletHasSufficientPID",
+      "status": "False",
+      "type": "PIDPressure"
+     },
+     {
+      "lastHeartbeatTime": "2026-10-08T17:22:16Z",
+      "lastTransitionTime": "2026-10-07T04:03:34Z",
+      "message": "kubelet is posting ready status",
+      "reason": "KubeletReady",
+      "status": "True",
+      "type": "Ready"
+     }
+    ],
+    "nodeInfo": {
+     "kubeletVersion": "v1.35.8-gke.1380001"
+    }
+   }
+  },
+  {
+   "apiVersion": "v1",
+   "kind": "Node",
+   "metadata": {
+    "creationTimestamp": "2026-10-07T04:09:02Z",
+    "labels": {
+     "addon.gke.io/node-local-dns-ds-ready": "true",
+     "beta.kubernetes.io/arch": "amd64",
+     "beta.kubernetes.io/instance-type": "e2-medium",
+     "beta.kubernetes.io/os": "linux",
+     "cloud.google.com/gke-boot-disk": "pd-balanced",
+     "cloud.google.com/gke-container-runtime": "containerd",
+     "cloud.google.com/gke-cpu-scaling-level": "2",
+     "cloud.google.com/gke-logging-variant": "DEFAULT",
+     "cloud.google.com/gke-max-pods-per-node": "110",
+     "cloud.google.com/gke-memory-gb-scaling-level": "4",
+     "cloud.google.com/gke-netd-ready": "true",
+     "cloud.google.com/gke-nodepool": "default-pool",
+     "cloud.google.com/gke-os-distribution": "cos",
+     "cloud.google.com/gke-provisioning": "standard",
+     "cloud.google.com/gke-stack-type": "IPV4",
+     "cloud.google.com/machine-family": "e2",
+     "cloud.google.com/private-node": "false",
+     "disk-type.gke.io/pd-balanced": "true",
+     "disk-type.gke.io/pd-extreme": "true",
+     "disk-type.gke.io/pd-ssd": "true",
+     "disk-type.gke.io/pd-standard": "true",
+     "failure-domain.beta.kubernetes.io/region": "us-central1",
+     "failure-domain.beta.kubernetes.io/zone": "us-central1-a",
+     "iam.gke.io/gke-metadata-server-enabled": "true",
+     "kubernetes.io/arch": "amd64",
+     "kubernetes.io/hostname": "gke-seeded-a-default-pool-62ac8ee0-mbzp",
+     "kubernetes.io/os": "linux",
+     "node.kubernetes.io/instance-type": "e2-medium",
+     "topology.gke.io/zone": "us-central1-a",
+     "topology.kubernetes.io/region": "us-central1",
+     "topology.kubernetes.io/zone": "us-central1-a"
+    },
+    "name": "gke-seeded-a-default-pool-62ac8ee0-mbzp"
+   },
+   "status": {
+    "conditions": [
+     {
+      "lastHeartbeatTime": "2026-10-08T17:22:41Z",
+      "lastTransitionTime": "2026-10-07T04:09:03Z",
+      "message": "docker overlay2 is functioning properly",
+      "reason": "NoCorruptDockerOverlay2",
+      "status": "False",
+      "type": "CorruptDockerOverlay2"
+     },
+     {
+      "lastHeartbeatTime": "2026-10-08T17:22:41Z",
+      "lastTransitionTime": "2026-10-07T10:09:04Z",
+      "message": "{\"unmanaged\": {\"kernel.cad_pid\": \"1\"}}",
+      "reason": "NodeSysctlChange",
+      "status": "True",
+      "type": "SysctlChanged"
+     },
+     {
+      "lastHeartbeatTime": "2026-10-08T17:22:41Z",
+      "lastTransitionTime": "2026-10-07T04:09:04Z",
+      "message": "docker is functioning properly",
+      "reason": "NoFrequentDockerRestart",
+      "status": "False",
+      "type": "FrequentDockerRestart"
+     },
+     {
+      "lastHeartbeatTime": "2026-10-08T17:22:41Z",
+      "lastTransitionTime": "2026-10-07T04:09:04Z",
+      "message": "kubelet is functioning properly",
+      "reason": "NoFrequentKubeletRestart",
+      "status": "False",
+      "type": "FrequentKubeletRestart"
+     },
+     {
+      "lastHeartbeatTime": "2026-10-08T17:22:41Z",
+      "lastTransitionTime": "2026-10-07T04:09:03Z",
+      "message": "node is functioning properly",
+      "reason": "NoFrequentUnregisterNetDevice",
+      "status": "False",
+      "type": "FrequentUnregisterNetDevice"
+     },
+     {
+      "lastHeartbeatTime": "2026-10-08T17:22:41Z",
+      "lastTransitionTime": "2026-10-07T04:09:03Z",
+      "message": "No deprecation risk: did not find any deprecated 'configs' field in containerd's config",
+      "reason": "DeprecatedConfigsFieldInContainerdConfigurationNotDetected",
+      "status": "False",
+      "type": "DeprecatedConfigsFieldInContainerdConfiguration"
+     },
+     {
+      "lastHeartbeatTime": "2026-10-08T17:22:41Z",
+      "lastTransitionTime": "2026-10-07T04:09:03Z",
+      "message": "Root filesystem has no storage pressure",
+      "reason": "StoragePressureRootFileSystemNotDetected",
+      "status": "False",
+      "type": "StoragePressureRootFileSystem"
+     },
+     {
+      "lastHeartbeatTime": "2026-10-08T17:22:41Z",
+      "lastTransitionTime": "2026-10-07T04:09:03Z",
+      "message": "No deprecation risk: did not find any deprecations other than 3 configs fields (auths/configs/mirrors), pulling schema v1 images and using v1alpha2 CRI.",
+      "reason": "DeprecatedOtherContainerdFeaturesNotDetected",
+      "status": "False",
+      "type": "DeprecatedOtherContainerdFeatures"
+     },
+     {
+      "lastHeartbeatTime": "2026-10-08T17:22:41Z",
+      "lastTransitionTime": "2026-10-07T04:09:03Z",
+      "message": "XFS has not shutdown",
+      "reason": "XfsHasNotShutDown",
+      "status": "False",
+      "type": "XfsShutdown"
+     },
+     {
+      "lastHeartbeatTime": "2026-10-08T17:22:41Z",
+      "lastTransitionTime": "2026-10-07T04:09:03Z",
+      "message": "Root filesystem is not read only",
+      "reason": "ReadOnlyRootFileSystemNotDetected",
+      "status": "False",
+      "type": "ReadOnlyRootFileSystem"
+     },
+     {
+      "lastHeartbeatTime": "2026-10-08T17:22:41Z",
+      "lastTransitionTime": "2026-10-07T04:09:03Z",
+      "message": "No deprecation risk: did not find any deprecated 'auths' field in containerd's config",
+      "reason": "DeprecatedAuthsFieldInContainerdConfigurationNotDetected",
+      "status": "False",
+      "type": "DeprecatedAuthsFieldInContainerdConfiguration"
+     },
+     {
+      "lastHeartbeatTime": "2026-10-08T17:22:41Z",
+      "lastTransitionTime": "2026-10-07T04:09:03Z",
+      "message": "No unsupported EBPF programs detected",
+      "reason": "UnsupportedEBPFProgramsNotDetected",
+      "status": "False",
+      "type": "UnsupportedEBPFPrograms"
+     },
+     {
+      "lastHeartbeatTime": "2026-10-08T17:22:41Z",
+      "lastTransitionTime": "2026-10-07T04:09:04Z",
+      "message": "System resources are within normal range.",
+      "reason": "ResourcesOK",
+      "status": "False",
+      "type": "ResourceExhausted"
+     },
+     {
+      "lastHeartbeatTime": "2026-10-08T17:22:41Z",
+      "lastTransitionTime": "2026-10-07T04:09:03Z",
+      "message": "No deprecation risk: did not find any deprecated 'mirrors' field in containerd's config",
+      "reason": "DeprecatedMirrorsFieldInContainerdConfigurationNotDetected",
+      "status": "False",
+      "type": "DeprecatedMirrorsFieldInContainerdConfiguration"
+     },
+     {
+      "lastHeartbeatTime": "2026-10-08T17:22:41Z",
+      "lastTransitionTime": "2026-10-07T04:09:03Z",
+      "message": "UEFI CPER has no fatal error",
+      "reason": "CperHardwareHasNoFatalError",
+      "status": "False",
+      "type": "CperHardwareErrorFatal"
+     },
+     {
+      "lastHeartbeatTime": "2026-10-08T17:22:41Z",
+      "lastTransitionTime": "2026-10-07T04:09:03Z",
+      "message": "Swap is not active",
+      "reason": "SwapNotDetected",
+      "status": "False",
+      "type": "Swap"
+     },
+     {
+      "lastHeartbeatTime": "2026-10-08T17:22:41Z",
+      "lastTransitionTime": "2026-10-07T04:09:04Z",
+      "message": "containerd is functioning properly",
+      "reason": "NoFrequentContainerdRestart",
+      "status": "False",
+      "type": "FrequentContainerdRestart"
+     },
+     {
+      "lastHeartbeatTime": "2026-10-08T17:22:41Z",
+      "lastTransitionTime": "2026-10-07T04:09:03Z",
+      "message": "No changes detected to the kubelet configuration file.",
+      "reason": "NoKubeletConfigChangeDetected",
+      "status": "False",
+      "type": "KubeletConfigChanged"
+     },
+     {
+      "lastHeartbeatTime": "2026-10-08T17:22:41Z",
+      "lastTransitionTime": "2026-10-07T04:09:03Z",
+      "message": "No deprecation risk: did not use v1alpha2 CRI",
+      "reason": "DeprecatedUsingV1Alpha2CriNotDetected",
+      "status": "False",
+      "type": "DeprecatedUsingV1Alpha2Cri"
+     },
+     {
+      "lastHeartbeatTime": "2026-10-08T17:22:41Z",
+      "lastTransitionTime": "2026-10-07T04:09:03Z",
+      "message": "No deprecation risk: did not pull any schema v1 images",
+      "reason": "DeprecatedPullingSchemaV1ImageDetected",
+      "status": "False",
+      "type": "DeprecatedPullingSchemaV1Image"
+     },
+     {
+      "lastHeartbeatTime": "2026-10-08T17:22:41Z",
+      "lastTransitionTime": "2026-10-07T04:09:03Z",
+      "message": "No unsupported CNI detected for DPv2 migration",
+      "reason": "DPv2MigrationUnsupportedCNINotDetected",
+      "status": "False",
+      "type": "DPv2MigrationUnsupportedCNI"
+     },
+     {
+      "lastHeartbeatTime": "2026-10-08T17:22:41Z",
+      "lastTransitionTime": "2026-10-07T04:09:03Z",
+      "message": "kernel has no deadlock",
+      "reason": "KernelHasNoDeadlock",
+      "status": "False",
+      "type": "KernelDeadlock"
+     },
+     {
+      "lastHeartbeatTime": "2026-10-07T04:09:03Z",
+      "lastTransitionTime": "2026-10-07T04:09:03Z",
+      "message": "NodeController create implicit route",
+      "reason": "RouteCreated",
+      "status": "False",
+      "type": "NetworkUnavailable"
+     },
+     {
+      "lastHeartbeatTime": "2026-10-08T17:23:26Z",
+      "lastTransitionTime": "2026-10-07T04:09:02Z",
+      "message": "kubelet has sufficient memory available",
+      "reason": "KubeletHasSufficientMemory",
+      "status": "False",
+      "type": "MemoryPressure"
+     },
+     {
+      "lastHeartbeatTime": "2026-10-08T17:23:26Z",
+      "lastTransitionTime": "2026-10-07T04:09:02Z",
+      "message": "kubelet has no disk pressure",
+      "reason": "KubeletHasNoDiskPressure",
+      "status": "False",
+      "type": "DiskPressure"
+     },
+     {
+      "lastHeartbeatTime": "2026-10-08T17:23:26Z",
+      "lastTransitionTime": "2026-10-07T04:09:02Z",
+      "message": "kubelet has sufficient PID available",
+      "reason": "KubeletHasSufficientPID",
+      "status": "False",
+      "type": "PIDPressure"
+     },
+     {
+      "lastHeartbeatTime": "2026-10-08T17:23:26Z",
+      "lastTransitionTime": "2026-10-07T04:09:12Z",
+      "message": "kubelet is posting ready status",
+      "reason": "KubeletReady",
+      "status": "True",
+      "type": "Ready"
+     }
+    ],
+    "nodeInfo": {
+     "kubeletVersion": "v1.35.8-gke.1380001"
+    }
+   }
+  },
+  {
+   "apiVersion": "v1",
+   "kind": "Node",
+   "metadata": {
+    "creationTimestamp": "2026-10-08T03:47:09Z",
+    "labels": {
+     "addon.gke.io/node-local-dns-ds-ready": "true",
+     "beta.kubernetes.io/arch": "amd64",
+     "beta.kubernetes.io/instance-type": "e2-small",
+     "beta.kubernetes.io/os": "linux",
+     "cloud.google.com/gke-boot-disk": "pd-balanced",
+     "cloud.google.com/gke-container-runtime": "containerd",
+     "cloud.google.com/gke-cpu-scaling-level": "2",
+     "cloud.google.com/gke-logging-variant": "DEFAULT",
+     "cloud.google.com/gke-max-pods-per-node": "110",
+     "cloud.google.com/gke-memory-gb-scaling-level": "2",
+     "cloud.google.com/gke-netd-ready": "true",
+     "cloud.google.com/gke-nodepool": "idle-batch-pool",
+     "cloud.google.com/gke-os-distribution": "cos",
+     "cloud.google.com/gke-provisioning": "standard",
+     "cloud.google.com/gke-stack-type": "IPV4",
+     "cloud.google.com/machine-family": "e2",
+     "cloud.google.com/private-node": "false",
+     "disk-type.gke.io/pd-balanced": "true",
+     "disk-type.gke.io/pd-extreme": "true",
+     "disk-type.gke.io/pd-ssd": "true",
+     "disk-type.gke.io/pd-standard": "true",
+     "failure-domain.beta.kubernetes.io/region": "us-central1",
+     "failure-domain.beta.kubernetes.io/zone": "us-central1-a",
+     "iam.gke.io/gke-metadata-server-enabled": "true",
+     "kubernetes.io/arch": "amd64",
+     "kubernetes.io/hostname": "gke-seeded-a-idle-batch-pool-a5fd3288-q4ts",
+     "kubernetes.io/os": "linux",
+     "node.kubernetes.io/instance-type": "e2-small",
+     "topology.gke.io/zone": "us-central1-a",
+     "topology.kubernetes.io/region": "us-central1",
+     "topology.kubernetes.io/zone": "us-central1-a"
+    },
+    "name": "gke-seeded-a-idle-batch-pool-a5fd3288-q4ts"
+   },
+   "status": {
+    "conditions": [
+     {
+      "lastHeartbeatTime": "2026-10-08T17:23:57Z",
+      "lastTransitionTime": "2026-10-08T03:47:08Z",
+      "message": "No unsupported EBPF programs detected",
+      "reason": "UnsupportedEBPFProgramsNotDetected",
+      "status": "False",
+      "type": "UnsupportedEBPFPrograms"
+     },
+     {
+      "lastHeartbeatTime": "2026-10-08T17:23:57Z",
+      "lastTransitionTime": "2026-10-08T03:47:08Z",
+      "message": "Root filesystem has no storage pressure",
+      "reason": "StoragePressureRootFileSystemNotDetected",
+      "status": "False",
+      "type": "StoragePressureRootFileSystem"
+     },
+     {
+      "lastHeartbeatTime": "2026-10-08T17:23:57Z",
+      "lastTransitionTime": "2026-10-08T03:47:08Z",
+      "message": "No deprecation risk: did not find any deprecations other than 3 configs fields (auths/configs/mirrors), pulling schema v1 images and using v1alpha2 CRI.",
+      "reason": "DeprecatedOtherContainerdFeaturesNotDetected",
+      "status": "False",
+      "type": "DeprecatedOtherContainerdFeatures"
+     },
+     {
+      "lastHeartbeatTime": "2026-10-08T17:23:57Z",
+      "lastTransitionTime": "2026-10-08T03:47:08Z",
+      "message": "kernel has no deadlock",
+      "reason": "KernelHasNoDeadlock",
+      "status": "False",
+      "type": "KernelDeadlock"
+     },
+     {
+      "lastHeartbeatTime": "2026-10-08T17:23:57Z",
+      "lastTransitionTime": "2026-10-08T03:47:08Z",
+      "message": "XFS has not shutdown",
+      "reason": "XfsHasNotShutDown",
+      "status": "False",
+      "type": "XfsShutdown"
+     },
+     {
+      "lastHeartbeatTime": "2026-10-08T17:23:57Z",
+      "lastTransitionTime": "2026-10-08T03:47:08Z",
+      "message": "Swap is not active",
+      "reason": "SwapNotDetected",
+      "status": "False",
+      "type": "Swap"
+     },
+     {
+      "lastHeartbeatTime": "2026-10-08T17:23:57Z",
+      "lastTransitionTime": "2026-10-08T03:47:08Z",
+      "message": "node is functioning properly",
+      "reason": "NoFrequentUnregisterNetDevice",
+      "status": "False",
+      "type": "FrequentUnregisterNetDevice"
+     },
+     {
+      "lastHeartbeatTime": "2026-10-08T17:23:57Z",
+      "lastTransitionTime": "2026-10-08T03:47:08Z",
+      "message": "kubelet is functioning properly",
+      "reason": "NoFrequentKubeletRestart",
+      "status": "False",
+      "type": "FrequentKubeletRestart"
+     },
+     {
+      "lastHeartbeatTime": "2026-10-08T17:23:57Z",
+      "lastTransitionTime": "2026-10-08T03:47:08Z",
+      "message": "docker overlay2 is functioning properly",
+      "reason": "NoCorruptDockerOverlay2",
+      "status": "False",
+      "type": "CorruptDockerOverlay2"
+     },
+     {
+      "lastHeartbeatTime": "2026-10-08T17:23:57Z",
+      "lastTransitionTime": "2026-10-08T03:47:08Z",
+      "message": "UEFI CPER has no fatal error",
+      "reason": "CperHardwareHasNoFatalError",
+      "status": "False",
+      "type": "CperHardwareErrorFatal"
+     },
+     {
+      "lastHeartbeatTime": "2026-10-08T17:23:57Z",
+      "lastTransitionTime": "2026-10-08T03:47:08Z",
+      "message": "Root filesystem is not read only",
+      "reason": "ReadOnlyRootFileSystemNotDetected",
+      "status": "False",
+      "type": "ReadOnlyRootFileSystem"
+     },
+     {
+      "lastHeartbeatTime": "2026-10-08T17:23:57Z",
+      "lastTransitionTime": "2026-10-08T03:47:08Z",
+      "message": "No deprecation risk: did not find any deprecated 'mirrors' field in containerd's config",
+      "reason": "DeprecatedMirrorsFieldInContainerdConfigurationNotDetected",
+      "status": "False",
+      "type": "DeprecatedMirrorsFieldInContainerdConfiguration"
+     },
+     {
+      "lastHeartbeatTime": "2026-10-08T17:23:57Z",
+      "lastTransitionTime": "2026-10-08T03:47:08Z",
+      "message": "System resources are within normal range.",
+      "reason": "ResourcesOK",
+      "status": "False",
+      "type": "ResourceExhausted"
+     },
+     {
+      "lastHeartbeatTime": "2026-10-08T17:23:57Z",
+      "lastTransitionTime": "2026-10-08T03:47:08Z",
+      "message": "No changes detected to the kubelet configuration file.",
+      "reason": "NoKubeletConfigChangeDetected",
+      "status": "False",
+      "type": "KubeletConfigChanged"
+     },
+     {
+      "lastHeartbeatTime": "2026-10-08T17:23:57Z",
+      "lastTransitionTime": "2026-10-08T03:47:08Z",
+      "message": "No unsupported CNI detected for DPv2 migration",
+      "reason": "DPv2MigrationUnsupportedCNINotDetected",
+      "status": "False",
+      "type": "DPv2MigrationUnsupportedCNI"
+     },
+     {
+      "lastHeartbeatTime": "2026-10-08T17:23:57Z",
+      "lastTransitionTime": "2026-10-08T03:47:08Z",
+      "message": "No deprecation risk: did not find any deprecated 'auths' field in containerd's config",
+      "reason": "DeprecatedAuthsFieldInContainerdConfigurationNotDetected",
+      "status": "False",
+      "type": "DeprecatedAuthsFieldInContainerdConfiguration"
+     },
+     {
+      "lastHeartbeatTime": "2026-10-08T17:23:57Z",
+      "lastTransitionTime": "2026-10-08T03:47:09Z",
+      "message": "{\"unmanaged\": {\"kernel.cad_pid\": \"1\"}}",
+      "reason": "NodeSysctlChange",
+      "status": "True",
+      "type": "SysctlChanged"
+     },
+     {
+      "lastHeartbeatTime": "2026-10-08T17:23:57Z",
+      "lastTransitionTime": "2026-10-08T03:47:08Z",
+      "message": "containerd is functioning properly",
+      "reason": "NoFrequentContainerdRestart",
+      "status": "False",
+      "type": "FrequentContainerdRestart"
+     },
+     {
+      "lastHeartbeatTime": "2026-10-08T17:23:57Z",
+      "lastTransitionTime": "2026-10-08T03:47:08Z",
+      "message": "docker is functioning properly",
+      "reason": "NoFrequentDockerRestart",
+      "status": "False",
+      "type": "FrequentDockerRestart"
+     },
+     {
+      "lastHeartbeatTime": "2026-10-08T17:23:57Z",
+      "lastTransitionTime": "2026-10-08T03:47:08Z",
+      "message": "No deprecation risk: did not find any deprecated 'configs' field in containerd's config",
+      "reason": "DeprecatedConfigsFieldInContainerdConfigurationNotDetected",
+      "status": "False",
+      "type": "DeprecatedConfigsFieldInContainerdConfiguration"
+     },
+     {
+      "lastHeartbeatTime": "2026-10-08T17:23:57Z",
+      "lastTransitionTime": "2026-10-08T03:47:08Z",
+      "message": "No deprecation risk: did not pull any schema v1 images",
+      "reason": "DeprecatedPullingSchemaV1ImageDetected",
+      "status": "False",
+      "type": "DeprecatedPullingSchemaV1Image"
+     },
+     {
+      "lastHeartbeatTime": "2026-10-08T17:23:57Z",
+      "lastTransitionTime": "2026-10-08T03:47:08Z",
+      "message": "No deprecation risk: did not use v1alpha2 CRI",
+      "reason": "DeprecatedUsingV1Alpha2CriNotDetected",
+      "status": "False",
+      "type": "DeprecatedUsingV1Alpha2Cri"
+     },
+     {
+      "lastHeartbeatTime": "2026-10-08T03:47:10Z",
+      "lastTransitionTime": "2026-10-08T03:47:10Z",
+      "message": "NodeController create implicit route",
+      "reason": "RouteCreated",
+      "status": "False",
+      "type": "NetworkUnavailable"
+     },
+     {
+      "lastHeartbeatTime": "2026-10-08T17:24:19Z",
+      "lastTransitionTime": "2026-10-08T03:47:07Z",
+      "message": "kubelet has sufficient memory available",
+      "reason": "KubeletHasSufficientMemory",
+      "status": "False",
+      "type": "MemoryPressure"
+     },
+     {
+      "lastHeartbeatTime": "2026-10-08T17:24:19Z",
+      "lastTransitionTime": "2026-10-08T03:47:07Z",
+      "message": "kubelet has no disk pressure",
+      "reason": "KubeletHasNoDiskPressure",
+      "status": "False",
+      "type": "DiskPressure"
+     },
+     {
+      "lastHeartbeatTime": "2026-10-08T17:24:19Z",
+      "lastTransitionTime": "2026-10-08T03:47:07Z",
+      "message": "kubelet has sufficient PID available",
+      "reason": "KubeletHasSufficientPID",
+      "status": "False",
+      "type": "PIDPressure"
+     },
+     {
+      "lastHeartbeatTime": "2026-10-08T17:24:19Z",
+      "lastTransitionTime": "2026-10-08T03:47:12Z",
+      "message": "kubelet is posting ready status",
+      "reason": "KubeletReady",
+      "status": "True",
+      "type": "Ready"
+     }
+    ],
+    "nodeInfo": {
+     "kubeletVersion": "v1.35.8-gke.1380001"
+    }
+   }
+  },
+  {
+   "apiVersion": "v1",
+   "kind": "Node",
+   "metadata": {
+    "creationTimestamp": "2026-10-08T04:21:33Z",
+    "labels": {
+     "addon.gke.io/node-local-dns-ds-ready": "true",
+     "beta.kubernetes.io/arch": "amd64",
+     "beta.kubernetes.io/instance-type": "e2-small",
+     "beta.kubernetes.io/os": "linux",
+     "cloud.google.com/gke-boot-disk": "pd-balanced",
+     "cloud.google.com/gke-container-runtime": "containerd",
+     "cloud.google.com/gke-cpu-scaling-level": "2",
+     "cloud.google.com/gke-logging-variant": "DEFAULT",
+     "cloud.google.com/gke-max-pods-per-node": "110",
+     "cloud.google.com/gke-memory-gb-scaling-level": "2",
+     "cloud.google.com/gke-netd-ready": "true",
+     "cloud.google.com/gke-nodepool": "pinned-inference-pool",
+     "cloud.google.com/gke-os-distribution": "cos",
+     "cloud.google.com/gke-provisioning": "standard",
+     "cloud.google.com/gke-stack-type": "IPV4",
+     "cloud.google.com/machine-family": "e2",
+     "cloud.google.com/private-node": "false",
+     "disk-type.gke.io/pd-balanced": "true",
+     "disk-type.gke.io/pd-extreme": "true",
+     "disk-type.gke.io/pd-ssd": "true",
+     "disk-type.gke.io/pd-standard": "true",
+     "failure-domain.beta.kubernetes.io/region": "us-central1",
+     "failure-domain.beta.kubernetes.io/zone": "us-central1-a",
+     "iam.gke.io/gke-metadata-server-enabled": "true",
+     "kubernetes.io/arch": "amd64",
+     "kubernetes.io/hostname": "gke-seeded-a-pinned-inference-pool-d08d753d-c8fk",
+     "kubernetes.io/os": "linux",
+     "node.kubernetes.io/instance-type": "e2-small",
+     "seeded-role": "pinned-inference",
+     "topology.gke.io/zone": "us-central1-a",
+     "topology.kubernetes.io/region": "us-central1",
+     "topology.kubernetes.io/zone": "us-central1-a"
+    },
+    "name": "gke-seeded-a-pinned-inference-pool-d08d753d-c8fk"
+   },
+   "status": {
+    "conditions": [
+     {
+      "lastHeartbeatTime": "2026-10-08T04:21:34Z",
+      "lastTransitionTime": "2026-10-08T04:21:34Z",
+      "message": "NodeController create implicit route",
+      "reason": "RouteCreated",
+      "status": "False",
+      "type": "NetworkUnavailable"
+     },
+     {
+      "lastHeartbeatTime": "2026-10-08T17:23:01Z",
+      "lastTransitionTime": "2026-10-08T04:21:32Z",
+      "message": "No unsupported EBPF programs detected",
+      "reason": "UnsupportedEBPFProgramsNotDetected",
+      "status": "False",
+      "type": "UnsupportedEBPFPrograms"
+     },
+     {
+      "lastHeartbeatTime": "2026-10-08T17:23:01Z",
+      "lastTransitionTime": "2026-10-08T04:21:32Z",
+      "message": "kubelet is functioning properly",
+      "reason": "NoFrequentKubeletRestart",
+      "status": "False",
+      "type": "FrequentKubeletRestart"
+     },
+     {
+      "lastHeartbeatTime": "2026-10-08T17:23:01Z",
+      "lastTransitionTime": "2026-10-08T04:21:32Z",
+      "message": "XFS has not shutdown",
+      "reason": "XfsHasNotShutDown",
+      "status": "False",
+      "type": "XfsShutdown"
+     },
+     {
+      "lastHeartbeatTime": "2026-10-08T17:23:01Z",
+      "lastTransitionTime": "2026-10-08T04:21:32Z",
+      "message": "No unsupported CNI detected for DPv2 migration",
+      "reason": "DPv2MigrationUnsupportedCNINotDetected",
+      "status": "False",
+      "type": "DPv2MigrationUnsupportedCNI"
+     },
+     {
+      "lastHeartbeatTime": "2026-10-08T17:23:01Z",
+      "lastTransitionTime": "2026-10-08T04:21:32Z",
+      "message": "Root filesystem is not read only",
+      "reason": "ReadOnlyRootFileSystemNotDetected",
+      "status": "False",
+      "type": "ReadOnlyRootFileSystem"
+     },
+     {
+      "lastHeartbeatTime": "2026-10-08T17:23:01Z",
+      "lastTransitionTime": "2026-10-08T04:21:32Z",
+      "message": "System resources are within normal range.",
+      "reason": "ResourcesOK",
+      "status": "False",
+      "type": "ResourceExhausted"
+     },
+     {
+      "lastHeartbeatTime": "2026-10-08T17:23:01Z",
+      "lastTransitionTime": "2026-10-08T04:21:32Z",
+      "message": "UEFI CPER has no fatal error",
+      "reason": "CperHardwareHasNoFatalError",
+      "status": "False",
+      "type": "CperHardwareErrorFatal"
+     },
+     {
+      "lastHeartbeatTime": "2026-10-08T17:23:01Z",
+      "lastTransitionTime": "2026-10-08T04:21:32Z",
+      "message": "No deprecation risk: did not find any deprecated 'configs' field in containerd's config",
+      "reason": "DeprecatedConfigsFieldInContainerdConfigurationNotDetected",
+      "status": "False",
+      "type": "DeprecatedConfigsFieldInContainerdConfiguration"
+     },
+     {
+      "lastHeartbeatTime": "2026-10-08T17:23:01Z",
+      "lastTransitionTime": "2026-10-08T04:21:32Z",
+      "message": "docker is functioning properly",
+      "reason": "NoFrequentDockerRestart",
+      "status": "False",
+      "type": "FrequentDockerRestart"
+     },
+     {
+      "lastHeartbeatTime": "2026-10-08T17:23:01Z",
+      "lastTransitionTime": "2026-10-08T04:21:33Z",
+      "message": "{\"unmanaged\": {\"kernel.cad_pid\": \"1\"}}",
+      "reason": "NodeSysctlChange",
+      "status": "True",
+      "type": "SysctlChanged"
+     },
+     {
+      "lastHeartbeatTime": "2026-10-08T17:23:01Z",
+      "lastTransitionTime": "2026-10-08T04:21:32Z",
+      "message": "node is functioning properly",
+      "reason": "NoFrequentUnregisterNetDevice",
+      "status": "False",
+      "type": "FrequentUnregisterNetDevice"
+     },
+     {
+      "lastHeartbeatTime": "2026-10-08T17:23:01Z",
+      "lastTransitionTime": "2026-10-08T04:21:32Z",
+      "message": "No deprecation risk: did not find any deprecations other than 3 configs fields (auths/configs/mirrors), pulling schema v1 images and using v1alpha2 CRI.",
+      "reason": "DeprecatedOtherContainerdFeaturesNotDetected",
+      "status": "False",
+      "type": "DeprecatedOtherContainerdFeatures"
+     },
+     {
+      "lastHeartbeatTime": "2026-10-08T17:23:01Z",
+      "lastTransitionTime": "2026-10-08T04:21:32Z",
+      "message": "No deprecation risk: did not find any deprecated 'auths' field in containerd's config",
+      "reason": "DeprecatedAuthsFieldInContainerdConfigurationNotDetected",
+      "status": "False",
+      "type": "DeprecatedAuthsFieldInContainerdConfiguration"
+     },
+     {
+      "lastHeartbeatTime": "2026-10-08T17:23:01Z",
+      "lastTransitionTime": "2026-10-08T04:21:32Z",
+      "message": "No changes detected to the kubelet configuration file.",
+      "reason": "NoKubeletConfigChangeDetected",
+      "status": "False",
+      "type": "KubeletConfigChanged"
+     },
+     {
+      "lastHeartbeatTime": "2026-10-08T17:23:01Z",
+      "lastTransitionTime": "2026-10-08T04:21:32Z",
+      "message": "kernel has no deadlock",
+      "reason": "KernelHasNoDeadlock",
+      "status": "False",
+      "type": "KernelDeadlock"
+     },
+     {
+      "lastHeartbeatTime": "2026-10-08T17:23:01Z",
+      "lastTransitionTime": "2026-10-08T04:21:32Z",
+      "message": "No deprecation risk: did not use v1alpha2 CRI",
+      "reason": "DeprecatedUsingV1Alpha2CriNotDetected",
+      "status": "False",
+      "type": "DeprecatedUsingV1Alpha2Cri"
+     },
+     {
+      "lastHeartbeatTime": "2026-10-08T17:23:01Z",
+      "lastTransitionTime": "2026-10-08T04:21:32Z",
+      "message": "No deprecation risk: did not find any deprecated 'mirrors' field in containerd's config",
+      "reason": "DeprecatedMirrorsFieldInContainerdConfigurationNotDetected",
+      "status": "False",
+      "type": "DeprecatedMirrorsFieldInContainerdConfiguration"
+     },
+     {
+      "lastHeartbeatTime": "2026-10-08T17:23:01Z",
+      "lastTransitionTime": "2026-10-08T04:21:32Z",
+      "message": "containerd is functioning properly",
+      "reason": "NoFrequentContainerdRestart",
+      "status": "False",
+      "type": "FrequentContainerdRestart"
+     },
+     {
+      "lastHeartbeatTime": "2026-10-08T17:23:01Z",
+      "lastTransitionTime": "2026-10-08T04:21:32Z",
+      "message": "Swap is not active",
+      "reason": "SwapNotDetected",
+      "status": "False",
+      "type": "Swap"
+     },
+     {
+      "lastHeartbeatTime": "2026-10-08T17:23:01Z",
+      "lastTransitionTime": "2026-10-08T04:21:32Z",
+      "message": "No deprecation risk: did not pull any schema v1 images",
+      "reason": "DeprecatedPullingSchemaV1ImageDetected",
+      "status": "False",
+      "type": "DeprecatedPullingSchemaV1Image"
+     },
+     {
+      "lastHeartbeatTime": "2026-10-08T17:23:01Z",
+      "lastTransitionTime": "2026-10-08T04:21:32Z",
+      "message": "docker overlay2 is functioning properly",
+      "reason": "NoCorruptDockerOverlay2",
+      "status": "False",
+      "type": "CorruptDockerOverlay2"
+     },
+     {
+      "lastHeartbeatTime": "2026-10-08T17:23:01Z",
+      "lastTransitionTime": "2026-10-08T04:21:32Z",
+      "message": "Root filesystem has no storage pressure",
+      "reason": "StoragePressureRootFileSystemNotDetected",
+      "status": "False",
+      "type": "StoragePressureRootFileSystem"
+     },
+     {
+      "lastHeartbeatTime": "2026-10-08T17:23:09Z",
+      "lastTransitionTime": "2026-10-08T04:21:32Z",
+      "message": "kubelet has sufficient memory available",
+      "reason": "KubeletHasSufficientMemory",
+      "status": "False",
+      "type": "MemoryPressure"
+     },
+     {
+      "lastHeartbeatTime": "2026-10-08T17:23:09Z",
+      "lastTransitionTime": "2026-10-08T04:21:32Z",
+      "message": "kubelet has no disk pressure",
+      "reason": "KubeletHasNoDiskPressure",
+      "status": "False",
+      "type": "DiskPressure"
+     },
+     {
+      "lastHeartbeatTime": "2026-10-08T17:23:09Z",
+      "lastTransitionTime": "2026-10-08T04:21:32Z",
+      "message": "kubelet has sufficient PID available",
+      "reason": "KubeletHasSufficientPID",
+      "status": "False",
+      "type": "PIDPressure"
+     },
+     {
+      "lastHeartbeatTime": "2026-10-08T17:23:09Z",
+      "lastTransitionTime": "2026-10-08T04:21:36Z",
+      "message": "kubelet is posting ready status",
+      "reason": "KubeletReady",
+      "status": "True",
+      "type": "Ready"
+     }
+    ],
+    "nodeInfo": {
+     "kubeletVersion": "v1.35.8-gke.1380001"
+    }
+   }
+  }
+ ],
+ "kind": "List"
+}

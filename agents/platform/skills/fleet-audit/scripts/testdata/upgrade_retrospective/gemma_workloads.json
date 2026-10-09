@@ -1,0 +1,500 @@
+{
+ "apiVersion": "v1",
+ "items": [
+  {
+   "apiVersion": "apps/v1",
+   "kind": "Deployment",
+   "metadata": {
+    "labels": {
+     "addonmanager.kubernetes.io/mode": "Reconcile",
+     "k8s-app": "kube-dns",
+     "kubernetes.io/cluster-service": "true"
+    },
+    "name": "kube-dns",
+    "namespace": "kube-system"
+   },
+   "spec": {
+    "replicas": 2,
+    "selector": {
+     "matchLabels": {
+      "k8s-app": "kube-dns"
+     }
+    },
+    "template": {
+     "metadata": {
+      "labels": {
+       "k8s-app": "kube-dns"
+      }
+     },
+     "spec": {
+      "containers": [
+       {
+        "args": [
+         "--domain=cluster.local.",
+         "--dns-port=10053",
+         "--config-dir=/kube-dns-config",
+         "--v=2"
+        ],
+        "env": [
+         {
+          "name": "PROMETHEUS_PORT",
+          "value": "10055"
+         }
+        ],
+        "image": "us-central1-artifactregistry.gcr.io/gke-release/gke-release/k8s-dns-kube-dns:1.25.0-gke.23@sha256:17bf1c20b0f344d3afbf09acd5a88bedc496069ac4e95ceaa96fa1f871f09bdc",
+        "name": "kubedns",
+        "resources": {
+         "limits": {
+          "memory": "210Mi"
+         },
+         "requests": {
+          "cpu": "100m",
+          "memory": "70Mi"
+         }
+        }
+       },
+       {
+        "args": [
+         "-v=2",
+         "-logtostderr",
+         "-configDir=/etc/k8s/dns/dnsmasq-nanny",
+         "-restartDnsmasq=true",
+         "--",
+         "-k",
+         "--cache-size=1000",
+         "--no-negcache",
+         "--dns-forward-max=1500",
+         "--log-facility=-",
+         "--server=/cluster.local/127.0.0.1#10053",
+         "--server=/in-addr.arpa/127.0.0.1#10053",
+         "--server=/ip6.arpa/127.0.0.1#10053",
+         "--max-ttl=30",
+         "--max-cache-ttl=30",
+         "--max-tcp-connections=200"
+        ],
+        "image": "us-central1-artifactregistry.gcr.io/gke-release/gke-release/k8s-dns-dnsmasq-nanny:1.25.0-gke.23@sha256:5d3bb7ddc1a00430cb109475b6415e085aaa411cd998ac77d80c96e84e212de2",
+        "name": "dnsmasq",
+        "resources": {
+         "requests": {
+          "cpu": "150m",
+          "memory": "20Mi"
+         }
+        }
+       },
+       {
+        "args": [
+         "--v=2",
+         "--probe=kubedns,127.0.0.1:10053,kubernetes.default.svc.cluster.local,5,SRV",
+         "--probe=dnsmasq,127.0.0.1:53,kubernetes.default.svc.cluster.local,5,SRV"
+        ],
+        "image": "us-central1-artifactregistry.gcr.io/gke-release/gke-release/k8s-dns-sidecar:1.25.0-gke.23@sha256:83c6ea849bf3421edf63ed4f3400b7f6270d38e57b7e22e685c1ebc8b765517b",
+        "name": "sidecar",
+        "resources": {
+         "requests": {
+          "cpu": "10m",
+          "memory": "20Mi"
+         }
+        }
+       },
+       {
+        "env": [
+         {
+          "name": "GOMAXPROCS",
+          "value": "2"
+         },
+         {
+          "name": "COLLECTOR_CONFIG_PATH",
+          "value": "/conf/kubedns-metrics-collector-config-data.textproto,/conf/sidecar-metrics-collector-config-data.textproto"
+         },
+         {
+          "name": "SPLIT_GAUGE_BUFFER",
+          "value": "true"
+         },
+         {
+          "name": "PROJECT_NUMBER",
+          "value": "000000000000"
+         },
+         {
+          "name": "LOCATION",
+          "value": "us-central1-a"
+         },
+         {
+          "name": "CLUSTER_NAME",
+          "value": "gemma-gpu-upgraded"
+         },
+         {
+          "name": "POD_NAMESPACE"
+         },
+         {
+          "name": "NODE_NAME"
+         },
+         {
+          "name": "POD_NAME"
+         },
+         {
+          "name": "CONTAINER_NAME",
+          "value": "kubedns-metrics-collector"
+         },
+         {
+          "name": "COMPONENT_VERSION"
+         },
+         {
+          "name": "COMPONENT_NAME"
+         }
+        ],
+        "image": "us-central1-artifactregistry.gcr.io/gke-release/gke-release/gke-metrics-collector:20260401_2300_RC0@sha256:258912d769fd027c80bd086f5a4a6389520b698f9c851bfb4737b2ba97b19b23",
+        "name": "kubedns-metrics-collector",
+        "resources": {
+         "limits": {
+          "cpu": "1",
+          "memory": "45Mi"
+         },
+         "requests": {
+          "cpu": "10m",
+          "memory": "45Mi"
+         }
+        }
+       }
+      ],
+      "nodeSelector": {
+       "kubernetes.io/os": "linux"
+      },
+      "restartPolicy": "Always",
+      "volumes": [
+       {
+        "configMap": {
+         "defaultMode": 420,
+         "name": "kube-dns",
+         "optional": true
+        },
+        "name": "kube-dns-config"
+       },
+       {
+        "configMap": {
+         "defaultMode": 420,
+         "items": [
+          {
+           "key": "kubedns-metrics-collector-config-data",
+           "path": "kubedns-metrics-collector-config-data.textproto"
+          },
+          {
+           "key": "sidecar-metrics-collector-config-data",
+           "path": "sidecar-metrics-collector-config-data.textproto"
+          }
+         ],
+         "name": "kubedns-metrics-collector-config-map"
+        },
+        "name": "kubedns-metrics-collector-config-map-vol"
+       }
+      ]
+     }
+    }
+   },
+   "status": {
+    "conditions": [
+     {
+      "lastTransitionTime": "2026-09-24T19:16:13Z",
+      "reason": "MinimumReplicasUnavailable",
+      "status": "False",
+      "type": "Available"
+     },
+     {
+      "lastTransitionTime": "2026-09-24T19:26:14Z",
+      "reason": "ProgressDeadlineExceeded",
+      "status": "False",
+      "type": "Progressing"
+     }
+    ]
+   }
+  },
+  {
+   "apiVersion": "apps/v1",
+   "kind": "Deployment",
+   "metadata": {
+    "labels": {
+     "addonmanager.kubernetes.io/mode": "Reconcile",
+     "k8s-app": "kube-dns-autoscaler",
+     "kubernetes.io/cluster-service": "true"
+    },
+    "name": "kube-dns-autoscaler",
+    "namespace": "kube-system"
+   },
+   "spec": {
+    "replicas": 1,
+    "selector": {
+     "matchLabels": {
+      "k8s-app": "kube-dns-autoscaler"
+     }
+    },
+    "template": {
+     "metadata": {
+      "labels": {
+       "k8s-app": "kube-dns-autoscaler"
+      }
+     },
+     "spec": {
+      "containers": [
+       {
+        "command": [
+         "/cluster-proportional-autoscaler",
+         "--namespace=kube-system",
+         "--configmap=kube-dns-autoscaler",
+         "--target=Deployment/kube-dns",
+         "--default-params={\"linear\":{\"coresPerReplica\":256,\"nodesPerReplica\":16,\"preventSinglePointFailure\":true,\"includeUnschedulableNodes\":true}}",
+         "--logtostderr=true",
+         "--v=2"
+        ],
+        "image": "us-central1-artifactregistry.gcr.io/gke-release/gke-release/cluster-proportional-autoscaler:v1.10.2-gke.37@sha256:c27a7214ada7532f1879bbe3e0a8035a704b5a953946c1698c9598a0ba965f9f",
+        "name": "autoscaler",
+        "resources": {
+         "requests": {
+          "cpu": "20m",
+          "memory": "10Mi"
+         }
+        }
+       }
+      ],
+      "nodeSelector": {
+       "kubernetes.io/os": "linux"
+      },
+      "restartPolicy": "Always",
+      "volumes": []
+     }
+    }
+   },
+   "status": {
+    "conditions": [
+     {
+      "lastTransitionTime": "2026-09-24T17:39:58Z",
+      "reason": "MinimumReplicasAvailable",
+      "status": "True",
+      "type": "Available"
+     },
+     {
+      "lastTransitionTime": "2026-09-24T17:37:57Z",
+      "reason": "NewReplicaSetAvailable",
+      "status": "True",
+      "type": "Progressing"
+     }
+    ]
+   }
+  },
+  {
+   "apiVersion": "apps/v1",
+   "kind": "Deployment",
+   "metadata": {
+    "name": "vllm-gemma-deployment",
+    "namespace": "kubeagents-system"
+   },
+   "spec": {
+    "replicas": 1,
+    "selector": {
+     "matchLabels": {
+      "app": "gemma-server"
+     }
+    },
+    "template": {
+     "metadata": {
+      "labels": {
+       "ai.gke.io/inference-server": "vllm",
+       "ai.gke.io/model": "gemma-4-e2b-it",
+       "app": "gemma-server",
+       "examples.ai.gke.io/source": "user-guide"
+      }
+     },
+     "spec": {
+      "containers": [
+       {
+        "args": [
+         "--model=$(MODEL_ID)",
+         "--host=0.0.0.0",
+         "--port=8000",
+         "--tensor-parallel-size=1",
+         "--enable-log-requests",
+         "--enable-chunked-prefill",
+         "--enable-prefix-caching",
+         "--enable-auto-tool-choice",
+         "--generation-config=auto",
+         "--tool-call-parser=gemma4",
+         "--dtype=bfloat16",
+         "--max-num-seqs=16",
+         "--max-model-len=131072",
+         "--gpu-memory-utilization=0.95",
+         "--reasoning-parser=gemma4",
+         "--trust-remote-code"
+        ],
+        "command": [
+         "python3",
+         "-m",
+         "vllm.entrypoints.api_server"
+        ],
+        "env": [
+         {
+          "name": "LD_LIBRARY_PATH",
+          "value": "${LD_LIBRARY_PATH}:/usr/local/nvidia/lib64"
+         },
+         {
+          "name": "MODEL_ID",
+          "value": "google/gemma-4-E2B-it"
+         },
+         {
+          "name": "OTEL_SERVICE_NAME",
+          "value": "vllm-gemma"
+         }
+        ],
+        "image": "us-docker.pkg.dev/vertex-ai/vertex-vision-model-garden-dockers/pytorch-vllm-serve:gemma4",
+        "name": "inference-server",
+        "resources": {
+         "limits": {
+          "cpu": "2",
+          "ephemeral-storage": "10Gi",
+          "memory": "10Gi",
+          "nvidia.com/gpu": "1"
+         },
+         "requests": {
+          "cpu": "2",
+          "ephemeral-storage": "10Gi",
+          "memory": "10Gi",
+          "nvidia.com/gpu": "1"
+         }
+        }
+       },
+       {
+        "command": [
+         "python3",
+         "/proxy/traffic_log_proxy.py"
+        ],
+        "env": [
+         {
+          "name": "UPSTREAM_HOST",
+          "value": "127.0.0.1"
+         },
+         {
+          "name": "UPSTREAM_PORT",
+          "value": "8000"
+         },
+         {
+          "name": "LISTEN_PORT",
+          "value": "8080"
+         }
+        ],
+        "image": "python:3.12-slim",
+        "name": "traffic-log",
+        "resources": {
+         "limits": {
+          "memory": "256Mi"
+         },
+         "requests": {
+          "cpu": "100m",
+          "memory": "128Mi"
+         }
+        }
+       }
+      ],
+      "nodeSelector": {
+       "cloud.google.com/gke-accelerator": "nvidia-l4",
+       "cloud.google.com/gke-gpu-driver-version": "latest"
+      },
+      "restartPolicy": "Always",
+      "volumes": [
+       {
+        "emptyDir": {
+         "medium": "Memory"
+        },
+        "name": "dshm"
+       },
+       {
+        "configMap": {
+         "defaultMode": 420,
+         "name": "traffic-log-proxy"
+        },
+        "name": "proxy"
+       },
+       {
+        "emptyDir": {
+         "sizeLimit": "40Gi"
+        },
+        "name": "model-cache"
+       }
+      ]
+     }
+    }
+   },
+   "status": {
+    "conditions": [
+     {
+      "lastTransitionTime": "2026-09-24T17:41:30Z",
+      "reason": "NewReplicaSetAvailable",
+      "status": "True",
+      "type": "Progressing"
+     },
+     {
+      "lastTransitionTime": "2026-09-24T19:28:52Z",
+      "reason": "MinimumReplicasAvailable",
+      "status": "True",
+      "type": "Available"
+     }
+    ]
+   }
+  },
+  {
+   "apiVersion": "batch/v1",
+   "kind": "CronJob",
+   "metadata": {
+    "name": "legacy-flowcontrol-tuner",
+    "namespace": "kubeagents-system"
+   },
+   "spec": {
+    "jobTemplate": {
+     "metadata": {
+      "creationTimestamp": null
+     },
+     "spec": {
+      "backoffLimit": 0,
+      "template": {
+       "metadata": {
+        "labels": {
+         "app": "legacy-flowcontrol-tuner"
+        }
+       },
+       "spec": {
+        "containers": [
+         {
+          "command": [
+           "python3",
+           "/app/tuner.py"
+          ],
+          "image": "python:3.12-slim",
+          "name": "tuner",
+          "resources": {
+           "limits": {
+            "memory": "64Mi"
+           },
+           "requests": {
+            "cpu": "20m",
+            "memory": "32Mi"
+           }
+          }
+         }
+        ],
+        "restartPolicy": "Never",
+        "volumes": [
+         {
+          "configMap": {
+           "defaultMode": 420,
+           "name": "legacy-flowcontrol-tuner"
+          },
+          "name": "app"
+         }
+        ]
+       }
+      }
+     }
+    },
+    "schedule": "*/10 * * * *",
+    "suspend": false
+   }
+  }
+ ],
+ "kind": "List"
+}

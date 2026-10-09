@@ -1,0 +1,248 @@
+[
+ {
+  "endTime": "2026-09-25T14:58:00.587429143Z",
+  "name": "operation-1790348280095-88ebc0da-f65f-4819-b9ed-6351ba68e0c8",
+  "operationType": "UPDATE_CLUSTER",
+  "startTime": "2026-09-25T14:58:00.095582474Z",
+  "status": "DONE",
+  "targetLink": "https://container.googleapis.com/v1/projects/000000000000/zones/us-central1-a/clusters/seeded-a",
+  "zone": "us-central1-a"
+ },
+ {
+  "endTime": "2026-09-29T13:43:47.98840553Z",
+  "name": "operation-1790689427583-7202cf7d-d0cf-4093-9bb4-4ddce9dddcdd",
+  "operationType": "UPDATE_CLUSTER",
+  "startTime": "2026-09-29T13:43:47.583522148Z",
+  "status": "DONE",
+  "targetLink": "https://container.googleapis.com/v1/projects/000000000000/zones/us-central1-a/clusters/seeded-a",
+  "zone": "us-central1-a"
+ },
+ {
+  "endTime": "2026-09-29T13:46:15.769769861Z",
+  "name": "operation-1790689575251-e57fe8f2-ddc4-441d-8f3b-15367a9fbf54",
+  "operationType": "UPDATE_CLUSTER",
+  "startTime": "2026-09-29T13:46:15.251404516Z",
+  "status": "DONE",
+  "targetLink": "https://container.googleapis.com/v1/projects/000000000000/zones/us-central1-a/clusters/seeded-a",
+  "zone": "us-central1-a"
+ },
+ {
+  "endTime": "2026-09-30T14:55:08.399596262Z",
+  "name": "operation-1790779718053-da7faa4b-f4ea-4427-9ca9-ec1f6ecd9bec",
+  "operationType": "UPGRADE_MASTER",
+  "startTime": "2026-09-30T14:48:38.053176271Z",
+  "status": "DONE",
+  "targetLink": "https://container.googleapis.com/v1/projects/000000000000/zones/us-central1-a/clusters/seeded-b",
+  "zone": "us-central1-a"
+ },
+ {
+  "endTime": "2026-09-30T15:00:44.837138262Z",
+  "name": "operation-1790780127002-1c8270be-ce2d-4ad6-b6b6-f11e96693586",
+  "operationType": "UPGRADE_NODES",
+  "progress": {
+   "metrics": [
+    {
+     "intValue": "1",
+     "name": "NODES_TOTAL"
+    },
+    {
+     "intValue": "0",
+     "name": "NODES_FAILED"
+    },
+    {
+     "intValue": "1",
+     "name": "NODES_COMPLETE"
+    },
+    {
+     "intValue": "1",
+     "name": "NODES_DONE"
+    },
+    {
+     "intValue": "0",
+     "name": "NODE_PDB_DELAY_SECONDS"
+    }
+   ]
+  },
+  "startTime": "2026-09-30T14:55:27.0023691Z",
+  "status": "DONE",
+  "targetLink": "https://container.googleapis.com/v1/projects/000000000000/zones/us-central1-a/clusters/seeded-b/nodePools/default-pool",
+  "zone": "us-central1-a"
+ },
+ {
+  "endTime": "2026-10-06T04:30:57.338171809Z",
+  "name": "operation-1791260532307-50b9f0e6-599a-417f-90d0-772e31410f71",
+  "operationType": "UPGRADE_MASTER",
+  "startTime": "2026-10-06T04:22:12.307438729Z",
+  "status": "DONE",
+  "targetLink": "https://container.googleapis.com/v1/projects/000000000000/zones/us-central1-a/clusters/seeded-a",
+  "zone": "us-central1-a"
+ },
+ {
+  "endTime": "2026-10-07T04:12:09.752536573Z",
+  "name": "operation-1791345747420-340e78e6-3868-4267-a04b-9db624275fa3",
+  "operationType": "UPGRADE_NODES",
+  "progress": {
+   "metrics": [
+    {
+     "intValue": "2",
+     "name": "NODES_TOTAL"
+    },
+    {
+     "intValue": "0",
+     "name": "NODES_FAILED"
+    },
+    {
+     "intValue": "2",
+     "name": "NODES_COMPLETE"
+    },
+    {
+     "intValue": "2",
+     "name": "NODES_DONE"
+    },
+    {
+     "intValue": "0",
+     "name": "NODE_PDB_DELAY_SECONDS"
+    }
+   ]
+  },
+  "startTime": "2026-10-07T04:02:27.420649656Z",
+  "status": "DONE",
+  "targetLink": "https://container.googleapis.com/v1/projects/000000000000/zones/us-central1-a/clusters/seeded-a/nodePools/default-pool",
+  "zone": "us-central1-a"
+ },
+ {
+  "endTime": "2026-10-07T18:34:06.632252342Z",
+  "name": "operation-1791397632455-b8e9830e-7684-4d5c-b08e-921cac72dd95",
+  "operationType": "UPGRADE_MASTER",
+  "startTime": "2026-10-07T18:27:12.455938157Z",
+  "status": "DONE",
+  "targetLink": "https://container.googleapis.com/v1/projects/000000000000/zones/us-central1-a/clusters/seeded-b",
+  "zone": "us-central1-a"
+ },
+ {
+  "endTime": "2026-10-07T18:38:01.638627815Z",
+  "name": "operation-1791398058861-79f9472d-6079-48fc-838f-2e47f8b578dc",
+  "operationType": "UPGRADE_NODES",
+  "progress": {
+   "metrics": [
+    {
+     "intValue": "1",
+     "name": "NODES_TOTAL"
+    },
+    {
+     "intValue": "0",
+     "name": "NODES_FAILED"
+    },
+    {
+     "intValue": "1",
+     "name": "NODES_COMPLETE"
+    },
+    {
+     "intValue": "1",
+     "name": "NODES_DONE"
+    },
+    {
+     "intValue": "0",
+     "name": "NODE_PDB_DELAY_SECONDS"
+    }
+   ]
+  },
+  "startTime": "2026-10-07T18:34:18.86189527Z",
+  "status": "DONE",
+  "targetLink": "https://container.googleapis.com/v1/projects/000000000000/zones/us-central1-a/clusters/seeded-b/nodePools/default-pool",
+  "zone": "us-central1-a"
+ },
+ {
+  "endTime": "2026-10-08T03:49:13.020142889Z",
+  "name": "operation-1791431182233-9a3d3c4a-2886-45d1-92a6-b975af8a3cec",
+  "operationType": "UPGRADE_NODES",
+  "progress": {
+   "metrics": [
+    {
+     "intValue": "1",
+     "name": "NODES_TOTAL"
+    },
+    {
+     "intValue": "0",
+     "name": "NODES_FAILED"
+    },
+    {
+     "intValue": "1",
+     "name": "NODES_COMPLETE"
+    },
+    {
+     "intValue": "1",
+     "name": "NODES_DONE"
+    },
+    {
+     "intValue": "0",
+     "name": "NODE_PDB_DELAY_SECONDS"
+    }
+   ]
+  },
+  "startTime": "2026-10-08T03:46:22.233805609Z",
+  "status": "DONE",
+  "targetLink": "https://container.googleapis.com/v1/projects/000000000000/zones/us-central1-a/clusters/seeded-a/nodePools/idle-batch-pool",
+  "zone": "us-central1-a"
+ },
+ {
+  "endTime": "2026-10-08T05:24:10.379632696Z",
+  "name": "operation-1791433235916-c1860f09-e11c-4fe1-b75b-40cf815a7e81",
+  "operationType": "UPGRADE_NODES",
+  "progress": {
+   "metrics": [
+    {
+     "intValue": "1",
+     "name": "NODES_TOTAL"
+    },
+    {
+     "intValue": "0",
+     "name": "NODES_FAILED"
+    },
+    {
+     "intValue": "1",
+     "name": "NODES_COMPLETE"
+    },
+    {
+     "intValue": "1",
+     "name": "NODES_DONE"
+    },
+    {
+     "intValue": "3598",
+     "name": "NODE_PDB_DELAY_SECONDS"
+    }
+   ]
+  },
+  "startTime": "2026-10-08T04:20:35.916682589Z",
+  "status": "DONE",
+  "targetLink": "https://container.googleapis.com/v1/projects/000000000000/zones/us-central1-a/clusters/seeded-a/nodePools/pinned-inference-pool",
+  "zone": "us-central1-a"
+ },
+ {
+  "clusterConditions": [
+   {
+    "canonicalCode": "UNAVAILABLE",
+    "code": "GCE_STOCKOUT",
+    "message": "Instance 'gke-upg-18d-work-pool-4e6064cb-d7l2' creation failed: The zone 'projects/example-project/zones/us-east4-c' does not have enough resources available to fulfill the request.  'NULL:0/NULL:0/NULL:0 (state:STOCKOUT, sub-state:STOCKOUT, resource type:compute)'."
+   },
+   {
+    "canonicalCode": "UNAVAILABLE",
+    "code": "GCE_STOCKOUT",
+    "message": "Google Compute Engine: Not all instances running in IGM after 35m5.651642282s. Expected 1, running 0, transitioning 1. Current errors: [GCE_STOCKOUT]: Instance 'gke-upg-18d-work-pool-4e6064cb-d7l2' creation failed: The zone 'projects/example-project/zones/us-east4-c' does not have enough resources available to fulfill the request.  'NULL:0/NULL:0/NULL:0 (state:STOCKOUT, sub-state:STOCKOUT, resource type:compute)'."
+   }
+  ],
+  "detail": "Google Compute Engine: Not all instances running in IGM after 35m5.651642282s. Expected 1, running 0, transitioning 1. Current errors: [GCE_STOCKOUT]: Instance 'gke-upg-18d-work-pool-4e6064cb-d7l2' creation failed: The zone 'projects/example-project/zones/us-east4-c' does not have enough resources available to fulfill the request.  'NULL:0/NULL:0/NULL:0 (state:STOCKOUT, sub-state:STOCKOUT, resource type:compute)'.",
+  "endTime": "2026-09-29T16:39:36.680791756Z",
+  "error": {
+   "code": 14,
+   "message": "Instance 'gke-upg-18d-work-pool-4e6064cb-d7l2' creation failed: The zone 'projects/example-project/zones/us-east4-c' does not have enough resources available to fulfill the request.  'NULL:0/NULL:0/NULL:0 (state:STOCKOUT, sub-state:STOCKOUT, resource type:compute)'."
+  },
+  "name": "operation-1790697849488-1bdedeed-14f7-41d0-9198-09a2def9957e",
+  "operationType": "CREATE_NODE_POOL",
+  "startTime": "2026-09-29T16:04:09.488768125Z",
+  "status": "DONE",
+  "statusMessage": "Google Compute Engine: Not all instances running in IGM after 35m5.651642282s. Expected 1, running 0, transitioning 1. Current errors: [GCE_STOCKOUT]: Instance 'gke-upg-18d-work-pool-4e6064cb-d7l2' creation failed: The zone 'projects/example-project/zones/us-east4-c' does not have enough resources available to fulfill the request.  'NULL:0/NULL:0/NULL:0 (state:STOCKOUT, sub-state:STOCKOUT, resource type:compute)'.",
+  "targetLink": "https://container.googleapis.com/v1/projects/000000000000/zones/us-east4-c/clusters/upg-18d/nodePools/work-pool",
+  "zone": "us-east4-c"
+ }
+]
