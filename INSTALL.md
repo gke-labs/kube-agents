@@ -1117,20 +1117,13 @@ make uninstall
 
 When a Slack bot connects or is online in your workspace but never replies to messages, DMs, or mentions, verify each of the following:
 
-- **Socket Mode:** Ensure **Socket Mode** is enabled in your Slack App console (**Settings → Socket Mode**). The app-level token (`SLACK_APP_TOKEN`, prefixed with `xapp-`) in your secret must carry the `connections:write` scope.
-- **Bot Token Scopes:** Verify that your Bot Token (`SLACK_BOT_TOKEN`, prefixed with `xoxb-`) has every required scope (**Features → OAuth & Permissions**).
+- **Socket Mode, Scopes, and Events:** Ensure Socket Mode is enabled in your Slack App console (**Settings → Socket Mode**) and the app-level token (`SLACK_APP_TOKEN`, prefixed with `xapp-`) carries `connections:write`. Bot tokens (`SLACK_BOT_TOKEN`, prefixed with `xoxb-`) must hold every required scope and Event Subscriptions (`app_mention`, `message.*`) must be enabled.
   - The `*:history` scopes (`im:history`, `channels:history`, `groups:history`, `mpim:history`) are the most common cause of silent failures: without them, Socket Mode connects successfully, but Slack never forwards message contents to the bot.
   - Omitting `files:write` drops report artifact uploads quietly (logged as a warning).
-  - Omitting `reactions:write` silently prevents reaction emoji (👀, ⏸️, ✅, ❌) from appearing on user messages.
-  - Reinstall the Slack app to your workspace after updating scopes.
-- **Event Subscriptions:** In the Slack App console (**Features → Event Subscriptions**), verify **Enable Events** is turned on, and bot events are subscribed: `app_mention`, `message.im`, `message.channels`, `message.groups`, and `message.mpim`.
-- **User Allowlist:** Check `spec.integration.slack.allowedUsers` on the `PlatformAgent` CR (or `SLACK_ALLOWED_USERS` in `install.env`).
-  - When set, only members whose Slack member IDs (e.g. `U0123456789`) match an entry are answered; unlisted users are ignored without a reply.
-  - An absent or empty allowlist admits all members in the workspace.
-  - Members of external workspaces posting in Slack Connect channels shared with your workspace are never answered under any list.
-- **Single-Workspace vs Multi-Workspace (`spec.mode: next`):**
-  - Under the unsupported `spec.mode: next` toggle, the A2A gateway supports only a single workspace bot token. If your secret holds a comma-separated list of tokens (supported under `mode: today`), the gateway pod fails on boot.
-  - Because the operator arms on the CR alone, the CR's `.status` does not surface this failure; the error appears only in the gateway pod's log.
+  - Omitting `reactions:write` silently prevents reaction emoji from appearing on user messages.
+  - For the complete manifest, instructions on generating it with `hermes slack manifest`, and event subscriptions, see [Step 5 §2 (Slack Configuration)](#2-slack-configuration-slack_enabledtrue) or run `./scripts/installer/print_instructions_slack.sh`.
+- **User Allowlist:** Check `spec.integration.slack.allowedUsers` on the `PlatformAgent` CR (or `SLACK_ALLOWED_USERS` in `install.env`). Unlisted users are ignored without a reply; an empty allowlist admits all members in the workspace. Under `spec.mode: next`, the A2A gateway refuses a message from a member of another workspace (a Slack Connect guest) before consulting the list; under `mode: today`, the legacy consumer has no such check: a guest in a shared channel is admitted by the allowlist alone, and under an empty list that is everyone. See the site's [ChatOps guide](docs/site/src/content/docs/concepts/chatops.md#slack) and the [PlatformAgent CRD reference](docs/site/src/content/docs/operator/platformagent-crd.md#slack).
+- **Single-Workspace vs Multi-Workspace (`spec.mode: next`):** Under the unsupported `spec.mode: next` toggle, the A2A gateway takes a single workspace bot token. If your secret holds a comma-separated list of tokens (supported under `mode: today`), Slack rejects it at `auth.test`; the gateway pod stays Running and Ready, retrying the Slack backend on a backoff, and Slack has no consumer until the secret holds one workspace's token or the install goes back to `today`. Because the operator arms on the CR alone, the CR's `.status` does not surface this failure; the error appears only in the gateway pod's log.
 
 **Which logs to read:**
 

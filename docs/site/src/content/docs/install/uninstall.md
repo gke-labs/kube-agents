@@ -22,15 +22,18 @@ Use this to remove the agent while leaving the GKE cluster and operator in place
      --type=merge -p '{"metadata":{"finalizers":null}}'
    ```
 
-   **Note:** the `kubeagents.x-k8s.io/finalizer` finalizer is what deletes the agent's **cluster-scoped** RBAC — a ClusterRole and a ClusterRoleBinding that Kubernetes cannot garbage-collect via owner references. Under `spec.mode: next`, the finalizer also deletes the auth callout's cluster-scoped ClusterRoleBinding (`kubeagents:a2a-callout-tokenreview:<namespace>:<name>`) and the NATS JetStream PersistentVolumeClaim (`data-<agent>-a2a-nats-0`). Bypassing the finalizer leaves these behind, so delete them manually (names are derived from the CR's namespace and name):
+   **Note:** the `kubeagents.x-k8s.io/finalizer` finalizer is what deletes the agent's **cluster-scoped** RBAC — the minimal and tokenreview `ClusterRole` and `ClusterRoleBinding` pairs that Kubernetes cannot garbage-collect via owner references. Under `spec.mode: next`, the finalizer also deletes the auth callout's cluster-scoped ClusterRoleBinding (`kubeagents:a2a-callout-tokenreview:<namespace>:<name>`) and the NATS JetStream PersistentVolumeClaim (`data-<agent>-a2a-nats-0`). Bypassing the finalizer leaves these behind, so delete them manually (names are derived from the CR's namespace and name):
 
    ```bash
    kubectl delete clusterrolebinding \
      kubeagents:minimal:kubeagents-system:platform-agent \
+     kubeagents:tokenreview:kubeagents-system:platform-agent \
      kubeagents:a2a-callout-tokenreview:kubeagents-system:platform-agent \
      --ignore-not-found=true
    kubectl delete clusterrole \
-     kubeagents:minimal:kubeagents-system:platform-agent --ignore-not-found=true
+     kubeagents:minimal:kubeagents-system:platform-agent \
+     kubeagents:tokenreview:kubeagents-system:platform-agent \
+     --ignore-not-found=true
    kubectl delete pvc data-platform-agent-a2a-nats-0 -n kubeagents-system --ignore-not-found=true
    ```
 
@@ -43,7 +46,7 @@ Use this to remove the agent while leaving the GKE cluster and operator in place
 
    `github-app-credentials` only exists if you configured the GitHub integration. `a2a-slack-principal-map` is the optional user-created Slack identity mapping under `spec.mode: next`.
 
-   **Note on `platform-agent-secrets`:** The core `platform-agent-secrets` Secret is managed by the Helm release rather than owned by the CR. Deleting only the CR leaves it in place for re-installations. If you delete it manually while the Helm release remains installed, Helm will recreate it on the next upgrade. If you want to purge all credentials without a full teardown, delete it explicitly:
+   **Note on `platform-agent-secrets`:** If installed via Terraform or with Helm's `platformAgent.credentials.create=true`, the core `platform-agent-secrets` Secret is managed by the Helm release rather than owned by the CR. Deleting only the CR leaves it in place for re-installations, and Helm will recreate it on the next upgrade. If `platformAgent.credentials.create=false` (the Helm default), the Secret is externally managed and will not be recreated by Helm. To purge credentials without a full teardown, delete it explicitly:
 
    ```bash
    kubectl delete secret platform-agent-secrets -n kubeagents-system --ignore-not-found=true

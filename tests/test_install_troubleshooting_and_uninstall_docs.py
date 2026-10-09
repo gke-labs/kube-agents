@@ -65,6 +65,7 @@ class UninstallDocsTest(unittest.TestCase):
     def test_uninstall_page_documents_cluster_scoped_and_secret_cleanup(self):
         content = UNINSTALL_MD.read_text(encoding="utf-8")
         self.assertIn("kubeagents:minimal:kubeagents-system:platform-agent", content)
+        self.assertIn("kubeagents:tokenreview:kubeagents-system:platform-agent", content)
         self.assertIn("kubeagents:a2a-callout-tokenreview:kubeagents-system:platform-agent", content)
         self.assertIn("platform-agent-secrets", content)
 
