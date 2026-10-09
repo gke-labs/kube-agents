@@ -335,6 +335,20 @@ def _write(method: str, path: str, token: str, body: dict | None, host: str):
         pause(WRITE_PAUSE_SECONDS)
 
 
+def branch_exists(path: str, name: str, token: str, host: str = DEFAULT_HOST) -> bool:
+    """Whether the branch is there now, by the single-branch read. The branch
+    LISTING lags a delete on gitlab.com (measured 2026-10-09 on a pool
+    project: a deleted branch stayed listed for about 24 s while this read
+    answered 404 at once), so the listing names candidates and this decides."""
+    try:
+        call("GET", f"/projects/{encoded(path)}/repository/branches/{urllib.parse.quote(name, safe='')}", token, host=host)
+    except urllib.error.HTTPError as exc:
+        if exc.code in REF_GONE_CODES:
+            return False
+        raise
+    return True
+
+
 def delete_branch(path: str, name: str, token: str, host: str = DEFAULT_HOST) -> None:
     try:
         _write("DELETE", f"/projects/{encoded(path)}/repository/branches/{urllib.parse.quote(name, safe='')}", token, None, host)
@@ -392,7 +406,17 @@ def reset_merge_requests(path: str, project: str, build: str, scope: str, token:
             heads_in_use |= _branches_in_use(mr, project_id)
             continue
         record["closed"].append(iid)
-    leftover = [n for n in branch_names(path, token, host) if n != default]
+    # The listing names the candidates; a name it still carries from a delete
+    # seconds ago (an earlier repetition's reset, this run's own) is not a
+    # branch, and must not read as one left behind.
+    leftover = []
+    for name in branch_names(path, token, host):
+        if name == default:
+            continue
+        if not branch_exists(path, name, token, host):
+            print(f"  branch {name} is listed but already gone (the listing lags a delete)")
+            continue
+        leftover.append(name)
     record["branches_before"] = len(leftover)
     for name in leftover:
         if name in heads_in_use:
@@ -419,7 +443,7 @@ def reset_merge_requests(path: str, project: str, build: str, scope: str, token:
     heads_after: set[str] = set()
     for mr in after:
         heads_after |= _branches_in_use(mr, project_id)
-    still_branches = [n for n in branch_names(path, token, host) if n != default and n not in heads_after]
+    still_branches = [n for n in branch_names(path, token, host) if n != default and n not in heads_after and branch_exists(path, n, token, host)]
     record["open_after"] = len(still_agent)
     record["branches_after"] = len(still_branches)
     record["clean"] = not still_agent and not still_branches

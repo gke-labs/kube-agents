@@ -1,9 +1,11 @@
 """The eval rosters under hack/eval/, read the way hack/ci-eval-pr.sh reads them.
 
-Three files hold what the eval gate runs and what blocks (#1546, 2026-09-15):
+Four files hold what the eval gate runs and what blocks (#1546, 2026-09-15):
 
 - ``hack/eval/presubmit-cases.txt`` -- the presubmit matrix, one
   ``./tasks/<id>/task.yaml`` path per line (the script's ``TASKS``);
+- ``hack/eval/gitlab-presubmit-cases.txt`` -- what the GitLab lane runs in
+  its place under ``EVAL_FORGE=gitlab`` (kube-agents#2394), registered cases;
 - ``hack/eval/nightly-cases.txt`` -- what ``EVAL_TIER=nightly`` appends
   (``NIGHTLY_TASKS``);
 - ``hack/eval/blocking-roster.txt`` -- one case id per line, the default of
@@ -35,6 +37,9 @@ EVAL_DIR = REPO_ROOT / "hack" / "eval"
 PRESUBMIT_CASES_FILE = EVAL_DIR / "presubmit-cases.txt"
 NIGHTLY_CASES_FILE = EVAL_DIR / "nightly-cases.txt"
 BLOCKING_ROSTER_FILE = EVAL_DIR / "blocking-roster.txt"
+# The GitLab lane's presubmit matrix (kube-agents#2394): what EVAL_FORGE=gitlab
+# runs on a pull request, a subset of presubmit-cases.txt.
+GITLAB_PRESUBMIT_CASES_FILE = EVAL_DIR / "gitlab-presubmit-cases.txt"
 # The inject lane's exclusions (#2039): case ids the script drops from TASKS
 # under AGENT_TRANSPORT=inject, each with its reason as the comment block
 # directly above it.
@@ -138,6 +143,10 @@ def nightly_cases(path: pathlib.Path = NIGHTLY_CASES_FILE) -> list[str]:
 
 def blocking_roster(path: pathlib.Path = BLOCKING_ROSTER_FILE) -> list[str]:
     return parse_blocking_roster(path.read_text(encoding="utf-8"))
+
+
+def gitlab_presubmit_cases(path: pathlib.Path = GITLAB_PRESUBMIT_CASES_FILE) -> list[str]:
+    return case_names(path.read_text(encoding="utf-8"))
 
 
 def parse_lane_exclusions(text: str) -> dict[str, str]:

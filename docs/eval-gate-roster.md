@@ -424,6 +424,33 @@ into the unit before.
 `scripts/test_eval_rosters.py` pins the file's shape, that no case reuses an entry's name, and
 the set of requesting cases. The same approvers as the exclusion list, for the same reason.
 
+## The GitLab lane
+
+The GitLab eval job (`pull-kube-agents-smoke-test-gitlab`, `EVAL_FORGE=gitlab`,
+[#2394](https://github.com/gke-labs/kube-agents/issues/2394)) deploys the agent against the leased
+project's GitLab repository instead of its GitHub one, in a run of its own beside the GitHub
+presubmit. On a pull request it runs `hack/eval/gitlab-presubmit-cases.txt`, not
+`presubmit-cases.txt`: registered cases that grade the forge, a `pull_request_opened` or
+`pull_request_diff_contains` check (a merge request) or a `ledger_issue_contains` check (a ledger
+issue), since a chat probe passes the same on either forge and the GitHub run already grades it.
+Every entry is a registered case, from `presubmit-cases.txt` or `nightly-cases.txt`; the lane picks
+from the catalogue and registers nothing. `hack/ci-eval-pr.sh` refuses an entry in neither file,
+and `scripts/test_eval_rosters.py` pins the set and that each entry requires a positive forge check
+(not negated, not one alternative under an `any`). Today that is three merge-request cases; no
+ledger case passes three repetitions anywhere, so the ledger path is the harness's to prove. A GitLab nightly would run the
+whole catalogue, as the GitHub nightly does, but none exists yet (#2832): nothing
+runs the cases this file leaves out against GitLab today.
+
+The roster above is still the roster, intersected with the lane's list: a roster case in the
+lane arms rung 4 there, and a held-out seat runs and reports without arming it, exactly as on
+the GitHub presubmit. The lane's first two seats are held out, so the job cannot red a pull
+request on a graded failure yet, and the job stays optional in Prow until it has a green
+history; rungs 1 to 3 red it like every case. Bringing GitLab into the gate is a later edit in
+two places: a forge-grading case earning its roster line on the record, and the job's `optional`
+flag in oss-test-infra. Until then the file needs the normal approvers, like `nightly-cases.txt`
+and the inject-lane files: it changes what one optional lane runs, not what can red a pull
+request. It moves under the eval-crew rule the day the lane gates.
+
 ## Demoting a flaky case
 
 If an admitted case reds a pull request its diff cannot explain on a graded failure,

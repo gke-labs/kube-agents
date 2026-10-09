@@ -396,6 +396,74 @@ INJECT_LANE_EXCLUDED_TIER = {
 }
 
 
+def positive_check_types(node, negations: int = 0) -> set:
+    """The check types a task REQUIRES to pass: every `type:` under an even
+    number of negating `type: none` compounds (parity, as the bench's
+    `_negates_every_leaf` reads them) and under no `any` compound, where a
+    leaf is one alternative and not required. The other compounds
+    (`sequence`, `parallel`, `all`) are conjunctive and transparent."""
+    if isinstance(node, dict):
+        if node.get("type") == "any":
+            return set()
+        if node.get("type") == "none":
+            found = set()
+            for value in node.values():
+                found |= positive_check_types(value, negations + 1)
+            return found
+        found = {node["type"]} if isinstance(node.get("type"), str) and negations % 2 == 0 else set()
+        for value in node.values():
+            found |= positive_check_types(value, negations)
+        return found
+    if isinstance(node, list):
+        found = set()
+        for item in node:
+            found |= positive_check_types(item, negations)
+        return found
+    return set()
+
+
+class GitLabLaneTest(unittest.TestCase):
+    """hack/eval/gitlab-presubmit-cases.txt: what the GitLab lane's presubmit
+    runs (kube-agents#2394). Registered cases only, every entry a case that
+    grades the forge."""
+
+    FORGE_CHECKS = {"pull_request_opened", "pull_request_diff_contains", "ledger_issue_contains"}
+    PINNED = ["vcs-spent-branch-reuse", "vcs-review-feedback-read-back", "pdb-remediation-pr"]
+
+    def test_the_file_is_the_pinned_set(self):
+        self.assertEqual(eval_rosters.gitlab_presubmit_cases(), self.PINNED)
+
+    def test_every_lane_case_is_registered(self):
+        registered = eval_rosters.presubmit_cases() + eval_rosters.nightly_cases()
+        for case in eval_rosters.gitlab_presubmit_cases():
+            with self.subTest(case=case):
+                self.assertIn(case, registered, "the lane picks from the catalogue, it does not register")
+
+    def test_every_lane_case_grades_the_forge(self):
+        import yaml
+
+        for case in eval_rosters.gitlab_presubmit_cases():
+            with self.subTest(case=case):
+                doc = yaml.safe_load((REPO_ROOT / "bench" / "tasks" / case / "task.yaml").read_text(encoding="utf-8"))
+                self.assertTrue(positive_check_types(doc) & self.FORGE_CHECKS, f"{case} grades nothing on the forge; a chat probe proves nothing about GitLab")
+
+    def test_a_negated_forge_check_does_not_count(self):
+        # "The agent did not open a merge request" proves nothing on GitLab.
+        negated = {"verification_spec": [{"type": "none", "checks": [{"type": "pull_request_opened"}]}]}
+        self.assertFalse(positive_check_types(negated) & self.FORGE_CHECKS)
+        self.assertTrue(positive_check_types({"verification_spec": [{"type": "pull_request_opened"}]}) & self.FORGE_CHECKS)
+        # A none under a none undoes it, as the bench reads it (bench/tests/test_cases.py, doubly-negated).
+        double = {"verification_spec": [{"type": "none", "checks": [{"type": "none", "checks": [{"type": "pull_request_opened"}]}]}]}
+        self.assertTrue(positive_check_types(double) & self.FORGE_CHECKS)
+        # Under `any` the forge check is one alternative, not a requirement: a chat answer could pass the case instead.
+        either = {"verification_spec": [{"type": "any", "checks": [{"type": "pull_request_opened"}, {"type": "report_contains"}]}]}
+        self.assertFalse(positive_check_types(either) & self.FORGE_CHECKS)
+        self.assertTrue(positive_check_types({"verification_spec": [{"type": "all", "checks": [{"type": "ledger_issue_contains"}]}]}) & self.FORGE_CHECKS)
+
+    def test_no_commented_out_case_path(self):
+        self.assertEqual(eval_rosters.commented_out_cases(eval_rosters.GITLAB_PRESUBMIT_CASES_FILE.read_text(encoding="utf-8")), [])
+
+
 class InjectLaneExclusionsTest(unittest.TestCase):
     """hack/eval/inject-lane-exclusions.txt: the lane-level list, checked here.
 

@@ -27,20 +27,23 @@ set -euo pipefail
 # start-by bound when BUILD_ID does not give one (job_started_epoch).
 EVAL_SCRIPT_STARTED_EPOCH="$(date +%s)"
 
-# The eval rosters, three files beside this script under hack/eval/ (#1546):
-# what every pull request runs, what can red one on a graded failure, and
-# what the nightly adds. Section 6 reads the first and third into TASKS and
-# NIGHTLY_TASKS; the BOOTSTRAP_ADMITTED export reads the second. Files rather
-# than arrays here so OWNERS can put the eval-crew rule on the presubmit
-# pair alone. Relative to this script's directory.
+# The eval rosters, four files beside this script under hack/eval/ (#1546):
+# what every pull request runs, what can red one on a graded failure, what
+# the nightly adds, and what the GitLab lane runs on a pull request (#2394).
+# Section 6 reads the first and third into TASKS and NIGHTLY_TASKS and, under
+# EVAL_FORGE=gitlab, the fourth in place of the first; the BOOTSTRAP_ADMITTED
+# export reads the second. Files rather than arrays here so OWNERS can put
+# the eval-crew rule on the presubmit pair alone. Relative to this script's
+# directory.
 readonly EVAL_PRESUBMIT_CASES_FILE="eval/presubmit-cases.txt"
 readonly EVAL_BLOCKING_ROSTER_FILE="eval/blocking-roster.txt"
 readonly EVAL_NIGHTLY_CASES_FILE="eval/nightly-cases.txt"
-# A fourth file, read beside them and applied on one lane only (#2039): the
+readonly EVAL_GITLAB_PRESUBMIT_CASES_FILE="eval/gitlab-presubmit-cases.txt"
+# A fifth file, read beside them and applied on one lane only (#2039): the
 # cases the inject lane does not run, because their premise needs the chat
 # front door. The lane is the one EVAL_INJECT_TRANSPORT below names.
 readonly EVAL_INJECT_LANE_EXCLUSIONS_FILE="eval/inject-lane-exclusions.txt"
-# A fifth, applied on the same lane (#2079): the safeguards every case the
+# A sixth, applied on the same lane (#2079): the safeguards every case the
 # lane runs carries beside its own -- today the one that fails a repetition
 # on a GitHub write the case did not request. Appended to a copy of each
 # task file before devops-bench reads it (bench/kube_agents_bench/lane.py);
@@ -1649,9 +1652,11 @@ if ! command -v uv >/dev/null 2>&1; then
 fi
 
 # 6. Task Matrix Execution Loop
-# The matrix is data, not code: five files under hack/eval/, read here at
+# The matrix is data, not code: six files under hack/eval/, read here at
 # startup (#1546, 2026-09-15). presubmit-cases.txt is what every pull request
-# runs (TASKS), nightly-cases.txt is what EVAL_TIER=nightly appends
+# runs (TASKS), gitlab-presubmit-cases.txt is what the GitLab lane runs in
+# its place under EVAL_FORGE=gitlab (#2394, at the tier switch),
+# nightly-cases.txt is what EVAL_TIER=nightly appends
 # (NIGHTLY_TASKS), blocking-roster.txt, read further down, is what can red
 # a pull request on a graded failure (BOOTSTRAP_ADMITTED),
 # inject-lane-exclusions.txt, read after the tier switch, is what the inject
@@ -1675,6 +1680,7 @@ BENCH_DIR="${SCRIPT_DIR}/../bench"
 PRESUBMIT_CASES_FILE="${SCRIPT_DIR}/${EVAL_PRESUBMIT_CASES_FILE}"
 NIGHTLY_CASES_FILE="${SCRIPT_DIR}/${EVAL_NIGHTLY_CASES_FILE}"
 BLOCKING_ROSTER_FILE="${SCRIPT_DIR}/${EVAL_BLOCKING_ROSTER_FILE}"
+GITLAB_PRESUBMIT_CASES_FILE="${SCRIPT_DIR}/${EVAL_GITLAB_PRESUBMIT_CASES_FILE}"
 
 # One roster file's entries, one per line: `#` to end of line is a comment,
 # blank lines are skipped, surrounding whitespace is trimmed. Called inside a
@@ -1774,8 +1780,47 @@ done
 # both. Anything else is a typo that would silently run the wrong matrix,
 # so it stops the job before it spends a cluster.
 EVAL_TIER="${EVAL_TIER:-presubmit}"
+# The GitLab lane (kube-agents#2394): under EVAL_FORGE=gitlab a presubmit
+# runs hack/eval/gitlab-presubmit-cases.txt instead of the presubmit file --
+# the cases that grade the forge, each a registered case (presubmit or nightly
+# file), sized by that file's BUDGET note against the job's 360-minute deadline. A
+# nightly under gitlab would be the whole catalogue, as on GitHub; no such
+# periodic exists yet (#2832). The presubmit
+# names the lane left out are kept in GITLAB_LANE_DROPPED for the
+# BOOTSTRAP_ADMITTED export, as the nightly part's are.
+GITLAB_LANE_DROPPED=""
 case "${EVAL_TIER}" in
-  presubmit) ;;
+  presubmit)
+    if [ "${EVAL_FORGE:-github}" = "gitlab" ]; then
+      GITLAB_LANE_ENTRIES="$(roster_entries "${GITLAB_PRESUBMIT_CASES_FILE}")"
+      GITLAB_LANE_TASKS=()
+      while IFS= read -r ENTRY; do
+        if [ -n "${ENTRY}" ]; then GITLAB_LANE_TASKS+=("${ENTRY}"); fi
+      done <<< "${GITLAB_LANE_ENTRIES}"
+      if [ "${#GITLAB_LANE_TASKS[@]}" -eq 0 ]; then
+        echo "ERROR: ${GITLAB_PRESUBMIT_CASES_FILE} names no case; the GitLab lane would run nothing and report green." >&2
+        exit 1
+      fi
+      # Every entry must be a registered case, a presubmit or nightly entry,
+      # which check_case_entries has already proven to be a case path with a
+      # directory behind it; the lane picks from the catalogue, it does not
+      # register.
+      for ENTRY in "${GITLAB_LANE_TASKS[@]}"; do
+        if ! printf '%s\n' "${PRESUBMIT_ENTRIES}" "${NIGHTLY_ENTRIES}" | grep -qxF -- "${ENTRY}"; then
+          echo "ERROR: ${GITLAB_PRESUBMIT_CASES_FILE}: '${ENTRY}' is in neither ${PRESUBMIT_CASES_FILE} nor ${NIGHTLY_CASES_FILE}; the GitLab lane runs registered cases only." >&2
+          exit 1
+        fi
+      done
+      for ENTRY in "${TASKS[@]}"; do
+        if ! grep -qxF -- "${ENTRY}" <<< "${GITLAB_LANE_ENTRIES}"; then
+          GITLAB_LANE_DROPPED="${GITLAB_LANE_DROPPED}$(basename "$(dirname "${ENTRY}")")
+"
+        fi
+      done
+      TASKS=("${GITLAB_LANE_TASKS[@]}")
+      echo "EVAL_FORGE=gitlab: the GitLab lane runs ${#TASKS[@]} case(s) (${EVAL_GITLAB_PRESUBMIT_CASES_FILE}); presubmit cases left out: $(printf '%s' "${GITLAB_LANE_DROPPED}" | paste -sd, -)"
+    fi
+    ;;
   nightly)
     TASKS+=("${NIGHTLY_TASKS[@]}")
     echo "EVAL_TIER=nightly: ${#NIGHTLY_TASKS[@]} nightly-only task(s) join the matrix, ${#TASKS[@]} tasks total"
@@ -2304,6 +2349,10 @@ if [ -z "${BLOCKING_ROSTER_ENTRIES}" ]; then
 fi
 BLOCKING_ROSTER_DEFAULT=""
 BLOCKING_ROSTER_ON_LANE=""
+# Set when the inject lane's exclusion list drops a ROSTER case: what the
+# every-roster-case-excluded guard below tests, since an empty
+# BLOCKING_ROSTER_ON_LANE has a second cause on the GitLab lane.
+INJECT_LANE_DROPPED_ROSTER=""
 while IFS= read -r NAME; do
   if [ -z "${NAME}" ]; then continue; fi
   if ! grep -qxF -- "${NAME}" <<< "${PRESUBMIT_CASE_NAMES}"; then
@@ -2318,6 +2367,13 @@ while IFS= read -r NAME; do
   # names no graded case" banner on every run of the lane, and that banner
   # exists to catch a misspelled roster entry.
   if [ -n "${INJECT_LANE_DROPPED:-}" ] && grep -qxF -- "${NAME}" <<< "${INJECT_LANE_DROPPED:-}"; then
+    INJECT_LANE_DROPPED_ROSTER="true"
+    continue
+  fi
+  # A roster case outside the GitLab lane's list (GITLAB_LANE_DROPPED, empty
+  # off that lane) leaves the export too, and is not "on the lane" for the
+  # guard below: the GitHub presubmit grades it.
+  if [ -n "${GITLAB_LANE_DROPPED:-}" ] && grep -qxF -- "${NAME}" <<< "${GITLAB_LANE_DROPPED:-}"; then
     continue
   fi
   BLOCKING_ROSTER_ON_LANE="true"
@@ -2339,9 +2395,21 @@ done <<< "${BLOCKING_ROSTER_ENTRIES}"
 # environment, empty included, is the stated way to mean it, and wins below.
 # Read before the nightly part's drop, which empties the export by design
 # when the part holds no roster case, and is not the lane's doing.
-if [ -z "${BLOCKING_ROSTER_ON_LANE}" ] && [ -n "${INJECT_LANE_DROPPED:-}" ] && [ -z "${BOOTSTRAP_ADMITTED+set}" ]; then
-  echo "ERROR: every case in ${BLOCKING_ROSTER_FILE} is excluded on the inject lane (${EVAL_INJECT_LANE_EXCLUSIONS_FILE}); the lane would run with rung 4 disarmed for every case. Trim the exclusion list, or set BOOTSTRAP_ADMITTED explicitly if that is the intent." >&2
+if [ -z "${BLOCKING_ROSTER_ON_LANE}" ] && [ -n "${INJECT_LANE_DROPPED_ROSTER}" ] && [ -z "${BOOTSTRAP_ADMITTED+set}" ]; then
+  if [ -n "${GITLAB_LANE_DROPPED:-}" ]; then
+    echo "ERROR: every blocking-roster case in ${EVAL_GITLAB_PRESUBMIT_CASES_FILE} is excluded on the inject lane (${EVAL_INJECT_LANE_EXCLUSIONS_FILE}); the lane would run with rung 4 disarmed for every case. Seat another roster case there, trim the exclusion list, or set BOOTSTRAP_ADMITTED explicitly if that is the intent." >&2
+  else
+    echo "ERROR: every case in ${BLOCKING_ROSTER_FILE} is excluded on the inject lane (${EVAL_INJECT_LANE_EXCLUSIONS_FILE}); the lane would run with rung 4 disarmed for every case. Trim the exclusion list, or set BOOTSTRAP_ADMITTED explicitly if that is the intent." >&2
+  fi
   exit 1
+fi
+
+# The GitLab lane's list may hold no roster case (its first two seats are
+# held out), which empties the export by design, like a nightly part: said
+# in the log, not stopped. After the inject guard, so a lane the guard stops
+# does not also hear this.
+if [ -n "${GITLAB_LANE_DROPPED:-}" ] && [ -z "${BLOCKING_ROSTER_DEFAULT}" ] && [ -z "${BOOTSTRAP_ADMITTED+set}" ]; then
+  echo "EVAL_FORGE=gitlab: no blocking-roster case is in the GitLab lane, so rung 4 is disarmed on this lane (rungs 1-3 still red it); a forge-grading case arms it by earning a roster seat."
 fi
 
 export BOOTSTRAP_ADMITTED="${BOOTSTRAP_ADMITTED:-${BLOCKING_ROSTER_DEFAULT}}"

@@ -183,8 +183,9 @@ env:
   # threshold written into data.json (this job's 15m cadence with slack for
   # ~2 missed ticks).
   PR_GLOB: gs://kube-agents-prow/pr-logs/pull/gke-labs_kube-agents/*/pull-kube-agents-smoke-test/*
-  # The GitLab lane (kube-agents#2394): the same matrix against a pool
-  # project's GitLab repository, collected as tier gitlab with a watermark
+  # The GitLab lane (kube-agents#2394): the forge-grading cases of the
+  # catalogue against a pool project's GitLab repository, collected
+  # as tier gitlab with a watermark
   # of its own and shown in the Brief's "GitLab lane" section only.
   GITLAB_PR_GLOB: gs://kube-agents-prow/pr-logs/pull/gke-labs_kube-agents/*/pull-kube-agents-smoke-test-gitlab/*
   NIGHTLY_PREFIX: gs://kube-agents-evals-nightly-logs/logs/ci-kube-agents-eval-nightly/

@@ -85,6 +85,9 @@ class FakeGitLab:
         self.issues = list(issues)
         self.mrs = list(mrs)
         self.branches = list(branches)
+        # What the branch LISTING answers, when it lags the truth (gitlab.com
+        # keeps a deleted branch listed for ~24 s); None means it is current.
+        self.listed = None
         self.default = default
         self.calls = []
         self.fail = set(fail)  # (method, path-suffix) pairs that raise 403
@@ -104,7 +107,13 @@ class FakeGitLab:
             if bare == f"/projects/{ENC}/merge_requests":
                 return [m for m in self.mrs if m.get("state", "opened") == "opened"] if page == 1 else []
             if bare == f"/projects/{ENC}/repository/branches":
-                return [{"name": n} for n in self.branches] if page == 1 else []
+                names = self.branches if self.listed is None else self.listed
+                return [{"name": n} for n in names] if page == 1 else []
+            if bare.startswith(f"/projects/{ENC}/repository/branches/"):
+                name = urllib.parse.unquote(bare.rsplit("/", 1)[1])
+                if name not in self.branches:
+                    raise urllib.error.HTTPError(path, 404, "Not Found", {}, io.BytesIO(b""))
+                return {"name": name}
             if bare == "/user":
                 return {"username": self.login}
             if bare == gitlab.TOKEN_SELF_PATH:
@@ -315,6 +324,33 @@ class MergeRequestResetTest(unittest.TestCase):
         record, _, _, _ = self._reset(racing)
         self.assertEqual(record["deleted"], ["ghost"])
         self.assertTrue(record["clean"])
+
+    def test_a_listing_that_lags_a_delete_does_not_read_as_a_branch_left_behind(self):
+        """gitlab.com keeps a deleted branch in the branch listing for ~24 s
+        (measured 2026-10-09 on kube-agents-evals-13-infra) while the
+        single-branch read says 404 at once. The first live GitLab run
+        (build 2108585203671764992) refused two repetitions on exactly that:
+        the reset deleted the branch, listed it again, and read "1 remain"."""
+        fake = FakeGitLab(mrs=[mr(1, source="platform-agent/fix")], branches=["main", "platform-agent/fix"])
+        original = fake.__call__
+
+        def lagging(method, path, token, body=None, host=gitlab.DEFAULT_HOST):
+            result = original(method, path, token, body, host)
+            if method == "DELETE":
+                fake.listed = ["main", "platform-agent/fix"]  # the listing keeps it; existence does not
+            return result
+
+        record, out, _, _ = self._reset(lagging)
+        self.assertEqual(record["deleted"], ["platform-agent/fix"])
+        self.assertEqual(record["branches_after"], 0)
+        self.assertTrue(record["clean"])
+        # The next reset, seconds later, still sees the stale name in the
+        # listing: it is reported as gone, not deleted again, and not counted.
+        fake.listed = ["main", "platform-agent/fix"]
+        record, out, _, _ = self._reset(fake)
+        self.assertIn("branch platform-agent/fix is listed but already gone", out)
+        self.assertEqual(record["deleted"], [])
+        self.assertEqual((record["branches_before"], record["branches_after"], record["clean"]), (0, 0, True))
 
     def test_dry_run_lists_and_writes_nothing(self):
         fake = FakeGitLab(mrs=[mr(1)], branches=["main", "platform-agent/fix"])
