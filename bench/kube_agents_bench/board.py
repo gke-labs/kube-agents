@@ -26,8 +26,11 @@ the harness already relies on for artifacts and session stores:
 
 Best effort in the same sense as the artifact read-back: a pod that cannot
 be reached or a store that cannot be opened returns ``None`` for that read,
-and the caller decides what to do without it -- a status turn on the api
-transport, a retry and then a fallback on the inject one. A wrong reading is
+and the caller decides what to do without it. The api transport spends a
+status turn. The inject one retries a read three times; if the first read of
+a wait never succeeds it falls back to the reply with a line on the record's
+errors, and if a later one never does the repetition is infrastructure. A
+wrong reading is
 worse than no reading, so each in-pod script prints a sentinel before its JSON
 and a reply without it is a failed read, never an empty one.
 """
@@ -38,7 +41,7 @@ import json
 import logging
 import re
 import shlex
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -118,11 +121,15 @@ STORE_FILE = "state.db"
 # Line the session-cards script prints before its JSON.
 SESSION_CARDS_PRESENT = "__KANBAN_SESSION_CARDS__"
 
-# Bounds applied inside the pod. A turn files a handful of cards; the caps are
-# runaway guards that keep the exec output bounded. A create result is a small
-# JSON object; the clip only stops a pathological one carrying the record away.
-MAX_SESSION_CARDS = 64
-MAX_CREATE_RESULT_CHARS = 2000
+# How many of a session's card ids the read reports, with their statuses. It
+# is not the wait's cap -- that is the harness's _MAX_AWAITED_TASKS, applied to
+# this list pending-first -- but a guard on the exec output, set well above
+# that cap so the pending-first order sees every card a real fan-out files and
+# not only its first few: one id and one status word per card, a few kilobytes
+# at the bound. Cards' deliverables are read only for the ids the caller names
+# (``want``, at most its cap), so their size does not scale with the scan. A
+# session past the bound has its total reported, so the overflow is not silent.
+MAX_SESSION_IDS_SCANNED = 1024
 # How many compression continuations the session read follows, the defensive
 # bound the pinned hermes' own get_compression_chain uses
 # (hermes_state_compression.py); a chain this deep is pathological.
@@ -131,16 +138,20 @@ MAX_CHAIN_STEPS = 100
 
 # Runs inside the agent container, read-only like the status read. Positional
 # arguments: data root, board file, store file, sentinel, session id, the
-# create tool's name, the card cap, the create-result clip, the chain bound.
+# create tool's name, the id scan bound, the caller's cap on ``want``, the
+# chain bound, then the ``want`` ids whose deliverables to read.
 _SESSION_CARDS_SCRIPT = r"""
 import json, sqlite3, sys
 
 ROOT, BOARD, STORE, SENTINEL, SID, CREATE = sys.argv[1:7]
-MAX_CARDS, MAX_CHARS, MAX_CHAIN_STEPS = (int(a) for a in sys.argv[7:10])
+MAX_IDS, MAX_WANT, MAX_CHAIN_STEPS = (int(a) for a in sys.argv[7:10])
+WANT = [a for a in sys.argv[10:] if a][:MAX_WANT]
 SQLITE_BUSY_TIMEOUT = 10
+# Rows per IN (...) query, under every sqlite's bound-parameter limit.
+CHUNK = 500
 JSON_PREFIX = "\x00json:"
-out = {"session": False, "sessions": [], "created": [], "subscribed": [], "cards": {},
-       "error": None}
+out = {"session": False, "sessions": [], "created": [], "created_total": 0,
+       "subscribed": [], "subscribed_total": 0, "cards": {}, "error": None}
 
 
 def ro(name):
@@ -158,19 +169,23 @@ def columns(conn, table):
     return {r[1] for r in conn.execute("PRAGMA table_info(%s)" % table)}
 
 
-def text(content):
+def created_id(content):
+    # The create result's task_id, whatever its type; the caller validates it.
     if isinstance(content, str) and content.startswith(JSON_PREFIX):
-        try:
-            content = json.loads(content[len(JSON_PREFIX):])
-        except ValueError:
-            pass
-    if not isinstance(content, str):
-        content = json.dumps(content)
-    return content[:MAX_CHARS]
+        content = content[len(JSON_PREFIX):]
+    try:
+        parsed = json.loads(content) if isinstance(content, str) else content
+    except ValueError:
+        return None
+    return parsed.get("task_id") if isinstance(parsed, dict) else None
 
 
 def marks(values):
     return ",".join("?" for _ in values)
+
+
+def chunks(values):
+    return [values[i:i + CHUNK] for i in range(0, len(values), CHUNK)]
 
 
 try:
@@ -219,6 +234,7 @@ try:
         out["session"] = True
     out["sessions"] = sessions
     calls = set()
+    seen = set()
     for role, content, tool_calls, call_id, tool_name in rows:
         if role == "assistant" and tool_calls:
             try:
@@ -232,8 +248,16 @@ try:
                 if fn.get("name") == CREATE and (tc.get("id") or tc.get("call_id")):
                     calls.add(tc.get("id") or tc.get("call_id"))
         elif role == "tool" and (tool_name == CREATE or (call_id and call_id in calls)):
-            if len(out["created"]) < MAX_CARDS:
-                out["created"].append(text(content))
+            tid = created_id(content)
+            if tid is None:
+                continue
+            key = json.dumps(tid)
+            if key in seen:
+                continue
+            seen.add(key)
+            out["created_total"] += 1
+            if len(out["created"]) < MAX_IDS:
+                out["created"].append(tid)
 except sqlite3.Error as exc:
     out["error"] = "session store: %s" % exc
 
@@ -248,25 +272,29 @@ if out["error"] is None:
             # every other transport.
             if has_table(board, "kanban_worker_children"):
                 query += " AND task_id NOT IN (SELECT child_id FROM kanban_worker_children)"
-            query += " ORDER BY rowid LIMIT %d" % MAX_CARDS
-            out["subscribed"] = [str(r[0]) for r in board.execute(query, out["sessions"])]
+            query += " ORDER BY rowid"
+            subscribed = [str(r[0]) for r in board.execute(query, out["sessions"])]
+            out["subscribed_total"] = len(subscribed)
+            out["subscribed"] = subscribed[:MAX_IDS]
         ids = list(out["subscribed"])
-        for created in out["created"]:
-            try:
-                tid = json.loads(created).get("task_id")
-            except (ValueError, AttributeError):
-                tid = None
+        for tid in out["created"]:
             if isinstance(tid, str) and tid and tid not in ids:
                 ids.append(tid)
-        ids = ids[:MAX_CARDS]
-        if ids:
-            result_col = "result" if "result" in columns(board, "tasks") else "NULL"
-            for tid, status, result in board.execute(
-                "SELECT id, status, %s FROM tasks WHERE id IN (%s)" % (result_col, marks(ids)), ids
+        # Every scanned card's status; a deliverable only for the ids wanted.
+        for part in chunks(ids):
+            for tid, status in board.execute(
+                "SELECT id, status FROM tasks WHERE id IN (%s)" % marks(part), part
             ):
-                out["cards"][str(tid)] = {"status": str(status), "result": result, "summary": None}
+                out["cards"][str(tid)] = {"status": str(status), "result": None, "summary": None}
+        wanted = [t for t in WANT if t in out["cards"]]
+        if wanted:
+            if "result" in columns(board, "tasks"):
+                for tid, result in board.execute(
+                    "SELECT id, result FROM tasks WHERE id IN (%s)" % marks(wanted), wanted
+                ):
+                    out["cards"][str(tid)]["result"] = result
             if has_table(board, "task_runs") and "summary" in columns(board, "task_runs"):
-                for tid in out["cards"]:
+                for tid in wanted:
                     row = board.execute(
                         "SELECT summary FROM task_runs WHERE task_id = ? AND summary IS NOT NULL "
                         "AND summary != '' ORDER BY id DESC LIMIT 1", (tid,)).fetchone()
@@ -354,15 +382,20 @@ class SessionCards:
     ``card_ids`` are the cards the session filed, from its ``kanban_create``
     results when the store kept them (``source`` ``"state.db"``), else from
     the board's subscriptions addressed to it (``"kanban_notify_subs"``).
-    ``cards`` maps each id the board knows to its ``status``, ``result``
-    (``tasks.result``) and ``summary`` (the newest non-empty
-    ``task_runs.summary``).
+    ``cards`` maps each id the board knows to its ``status``, and, for the
+    ids the read was asked for (``want``), its ``result`` (``tasks.result``)
+    and ``summary`` (the newest non-empty ``task_runs.summary``); ``None``
+    for the rest. An id in ``card_ids`` and not in ``cards`` is one the board
+    has no row for.
     """
 
     session_found: bool
     card_ids: list[str] = field(default_factory=list)
     source: str = ""
     cards: dict[str, dict[str, Any]] = field(default_factory=dict)
+    #: How many cards the source names in all, past :data:`MAX_SESSION_IDS_SCANNED`
+    #: included; ``card_ids`` is at most that many.
+    total: int = 0
 
     def as_shown(self, task_id: str) -> dict[str, Any] | None:
         """``task_id`` as one ``kanban_show`` tool entry, or ``None`` if unknown.
@@ -389,7 +422,7 @@ class SessionCards:
         }
 
 
-def session_cards_command(session_id: str) -> str:
+def session_cards_command(session_id: str, want: Sequence[str] = (), max_want: int = 0) -> str:
     """The ``sh -c`` line that reads ``session_id``'s cards in the pod."""
     args = " ".join(
         shlex.quote(a)
@@ -400,9 +433,10 @@ def session_cards_command(session_id: str) -> str:
             SESSION_CARDS_PRESENT,
             session_id,
             DELEGATION_TOOL,
-            str(MAX_SESSION_CARDS),
-            str(MAX_CREATE_RESULT_CHARS),
+            str(MAX_SESSION_IDS_SCANNED),
+            str(max_want),
             str(MAX_CHAIN_STEPS),
+            *want,
         ]
     )
     return (
@@ -412,9 +446,19 @@ def session_cards_command(session_id: str) -> str:
 
 
 def read_session_cards(
-    shell: Callable[[str, float], str], session_id: str, timeout: float
+    shell: Callable[[str, float], str],
+    session_id: str,
+    timeout: float,
+    *,
+    want: Sequence[str] = (),
+    max_want: int = 0,
 ) -> SessionCards | None:
     """The cards ``session_id`` filed and their board state, or ``None``.
+
+    Every scanned card comes back with its status. Deliverables are read only
+    for ``want``, at most ``max_want`` of them: the caller's cap over the
+    cards it awaits (``harness._MAX_AWAITED_TASKS``), so a poll that needs
+    only statuses reads none.
 
     ``None`` is a read that cannot be trusted, by the same rule as
     :func:`read_statuses`: no sentinel, a reply that is not JSON, or a store
@@ -422,7 +466,7 @@ def read_session_cards(
     """
     if not session_id:
         return None
-    reply = shell(session_cards_command(session_id), timeout)
+    reply = shell(session_cards_command(session_id, want, max_want), timeout)
     marker = reply.find(SESSION_CARDS_PRESENT)
     if marker < 0:
         _log.debug("the session store could not be read for %s", session_id)
@@ -440,19 +484,21 @@ def read_session_cards(
     created = payload.get("created")
     subscribed = payload.get("subscribed")
     raw_cards = payload.get("cards")
-    # The create results go through the same parser the other transports use,
-    # so an id is accepted here by exactly the rule it is accepted there.
+    # The create results' ids go through the same parser the other transports
+    # use, so an id is accepted here by exactly the rule it is accepted there.
     ids = delegated_task_ids(
-        [{"name": DELEGATION_TOOL, "result": c} for c in created if isinstance(c, str)]
+        [{"name": DELEGATION_TOOL, "result": json.dumps({"task_id": c})} for c in created]
         if isinstance(created, list)
         else []
     )
     source = "state.db" if ids else ""
+    total = int(payload.get("created_total") or 0) if ids else 0
     if not ids and isinstance(subscribed, list):
         ids = list(
             dict.fromkeys(t for t in subscribed if isinstance(t, str) and _TASK_ID_RE.match(t))
         )
         source = "kanban_notify_subs" if ids else ""
+        total = int(payload.get("subscribed_total") or 0) if ids else 0
     cards: dict[str, dict[str, Any]] = {}
     if isinstance(raw_cards, dict):
         for tid, card in raw_cards.items():
@@ -465,5 +511,9 @@ def read_session_cards(
                     else None,
                 }
     return SessionCards(
-        session_found=bool(payload.get("session")), card_ids=ids, source=source, cards=cards
+        session_found=bool(payload.get("session")),
+        card_ids=ids,
+        source=source,
+        cards=cards,
+        total=max(total, len(ids)),
     )

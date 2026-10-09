@@ -702,6 +702,10 @@ _POLL_PROMPT = (
 # run record on every turn, so an agent looping on kanban_create would inflate
 # both without bound. Far above any real fan-out.
 _MAX_AWAITED_TASKS = 32
+# Reads in a row on which the inject wait's board has no row for an awaited
+# card before the card is dropped from the wait. The status-turn wait ends the
+# same case after _MAX_SILENT_TURNS turns that report nothing for it.
+_MAX_UNKNOWN_CARD_READS = 3
 
 # Consecutive status turns that may report nothing before the wait is
 # abandoned. One off-turn is cheap to absorb; a run of them means the agent will
@@ -2368,62 +2372,115 @@ class KubeAgentsHarness(AgentHarness):
         store rather than in the trajectory, and a status turn cannot carry a
         card's result back through the door either, so both the ids and the
         results come from the pod (:func:`board.read_session_cards`, one
-        ``kubectl exec`` per poll and no model turn). Each awaited card the
-        board shows is handed to :meth:`_settle` shaped as the ``kanban_show``
-        result an agent would have read back, so the delivered results, the
-        graded ``final_message`` and everything after are what the other
-        waits produce. Like those waits it follows the cards the front agent
-        filed, not their workers' children (:mod:`worker_trajectory` reads
-        those), caps them pending-first (:func:`_pending_first`), and lets a
-        card the session files later join the wait.
+        ``kubectl exec`` per poll and no model turn). Polls read statuses
+        only. Once no awaited card is moving, one last read takes the
+        deliverables of the cards the board shows terminal, and each is handed
+        to :meth:`_settle` shaped as the ``kanban_show`` result an agent would
+        have read back, so the delivered results, the graded
+        ``final_message`` and everything after are what the other waits
+        produce. A card still moving at the ceiling is read back with nothing:
+        it delivers no text, is recorded at the ceiling, and is only archived
+        and purged. Like the other waits this one follows the cards the front
+        agent filed, not their workers' children (:mod:`worker_trajectory`
+        reads those), caps them pending-first (:func:`_pending_first`) at
+        :data:`_MAX_AWAITED_TASKS`, and lets a card the session files later
+        join the wait. A card the board has no row for on
+        :data:`_MAX_UNKNOWN_CARD_READS` reads running is dropped from the
+        wait with a line on ``errors``, and nothing is graded for it.
 
-        Every board read, the first included, is retried up to
-        :data:`_MAX_TRANSPORT_FAILURES` times running. Returns ``False``,
-        having changed nothing else, when the store holds no card for the
-        session -- an install whose turns do not run there, or a turn that did
-        not delegate -- and the caller waits the way it always has. A first
-        read that never succeeds falls back the same way, with a line on
-        ``errors`` saying a delegated answer may be graded on the
-        acknowledgement: ``errors`` is kept in the record, ``metadata`` is not.
-        Mid-wait, the same exhaustion makes the run infrastructure, as a
-        status turn's transport failures do.
+        Every read is retried up to :data:`_MAX_TRANSPORT_FAILURES` times
+        running. Returns ``False``, having changed nothing else, when the store
+        holds no card for the session -- an install whose turns do not run
+        there, or a turn that did not delegate -- and the caller waits the way
+        it always has. A first read that never succeeds falls back the same
+        way, with a line on ``errors`` saying a delegated answer may be graded
+        on the acknowledgement: ``errors`` is kept in the record, ``metadata``
+        is not. After the first read, the same exhaustion makes the run
+        infrastructure, as a status turn's transport failures do.
 
         Raises:
             _DelegationTransportExhausted: The board could not be read
-                :data:`_MAX_TRANSPORT_FAILURES` times running mid-wait.
+                :data:`_MAX_TRANSPORT_FAILURES` times running after the first
+                read succeeded.
         """
-        read = board.read_session_cards(_agent_shell, session_id, _EXEC_TIMEOUT)
-        failures = 0
-        while read is None:
-            failures += 1
-            _log.warning(
-                "session store read failed (%d/%d)", failures, _MAX_TRANSPORT_FAILURES
-            )
-            if failures >= _MAX_TRANSPORT_FAILURES:
-                result.errors.append(
-                    f"the session store for {session_id} could not be read {failures} times "
-                    "running; the delegation wait fell back to the trajectory's cards, so a "
-                    "delegated answer may be graded on the acknowledgement"
+
+        def _read(want: Sequence[str] = ()) -> board.SessionCards | None:
+            """One read, retried; ``None`` once every try has failed."""
+            for attempt in range(1, _MAX_TRANSPORT_FAILURES + 1):
+                got = board.read_session_cards(
+                    _agent_shell,
+                    session_id,
+                    _EXEC_TIMEOUT,
+                    want=want,
+                    max_want=_MAX_AWAITED_TASKS,
                 )
-                return False
-            time.sleep(max(0.0, poll_interval))
-            read = board.read_session_cards(_agent_shell, session_id, _EXEC_TIMEOUT)
+                if got is not None:
+                    return got
+                _log.warning(
+                    "session cards read failed (%d/%d)", attempt, _MAX_TRANSPORT_FAILURES
+                )
+                if attempt < _MAX_TRANSPORT_FAILURES:
+                    time.sleep(max(0.0, poll_interval))
+            return None
+
+        read = _read()
+        if read is None:
+            result.errors.append(
+                f"the session store for {session_id} could not be read "
+                f"{_MAX_TRANSPORT_FAILURES} times running; the delegation wait fell back to the "
+                "trajectory's cards, so a delegated answer may be graded on the acknowledgement"
+            )
+            return False
         if not read.session_found or not read.card_ids:
             why = "is not in the store" if not read.session_found else "filed no card"
             _log.info("session %s %s; waiting on the trajectory's cards instead", session_id, why)
             return False
         result.metadata["delegated_cards_source"] = f"{read.source} ({session_id})"
+        if read.total > len(read.card_ids):
+            result.errors.append(
+                f"the session filed {read.total} cards; the read scanned the first "
+                f"{len(read.card_ids)}"
+            )
 
         def _status(task_id: str) -> str:
             return str(read.cards.get(task_id, {}).get("status") or "unknown")
 
-        filed = {t: _status(t) for t in read.card_ids}
-        awaited = self._capped(_pending_first(read.card_ids, filed), result)
-        capped = len(read.card_ids) > _MAX_AWAITED_TASKS
+        def _exhausted(still: list[str]) -> _DelegationTransportExhausted:
+            _purge_card_state(awaited, _EXEC_TIMEOUT)
+            return _DelegationTransportExhausted(
+                f"the kanban board could not be read {_MAX_TRANSPORT_FAILURES} times running; "
+                "still waiting on: " + (", ".join(still) or "nothing (reading results)")
+            )
+
+        # Cards the board has had no row for on consecutive reads, and the
+        # ones dropped for it: a create on another board, or a card deleted
+        # after filing, would otherwise hold the wait to the ceiling.
+        unknown: dict[str, int] = {}
+        missing: list[str] = []
+        awaited: list[str] = []
+        capped = False
+
+        def _merge() -> list[str]:
+            nonlocal awaited, capped
+            merged = [t for t in dict.fromkeys(awaited + read.card_ids) if t not in missing]
+            statuses = {t: _status(t) for t in merged}
+            awaited = self._capped(_pending_first(merged, statuses), None if capped else result)
+            capped = capped or len(merged) > _MAX_AWAITED_TASKS
+            for t in awaited:
+                unknown[t] = unknown.get(t, 0) + 1 if t not in read.cards else 0
+            gone = [t for t in awaited if unknown[t] >= _MAX_UNKNOWN_CARD_READS]
+            for t in gone:
+                result.errors.append(
+                    f"card {t} not on the board after {_MAX_UNKNOWN_CARD_READS} reads; "
+                    "dropped from the delegation wait, nothing graded for it"
+                )
+            missing.extend(gone)
+            awaited = [t for t in awaited if t not in gone]
+            return [t for t in awaited if _status(t) not in _TERMINAL_STATUSES]
+
+        outstanding = _merge()
         deadline = time.monotonic() + delegation_timeout
-        failures = 0
         timed_out = False
-        outstanding = [t for t in awaited if _status(t) not in _TERMINAL_STATUSES]
         while outstanding:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
@@ -2431,26 +2488,12 @@ class KubeAgentsHarness(AgentHarness):
                 break
             _log.info("waiting %.0fs on delegated tasks: %s", poll_interval, ", ".join(outstanding))
             time.sleep(max(0.0, min(poll_interval, remaining)))
-            fresh = board.read_session_cards(_agent_shell, session_id, _EXEC_TIMEOUT)
+            fresh = _read()
             if fresh is None:
-                failures += 1
-                _log.warning("board read failed (%d/%d)", failures, _MAX_TRANSPORT_FAILURES)
-                if failures >= _MAX_TRANSPORT_FAILURES:
-                    _purge_card_state(awaited, _EXEC_TIMEOUT)
-                    raise _DelegationTransportExhausted(
-                        f"the kanban board could not be read {failures} times running; "
-                        "still waiting on: " + ", ".join(outstanding)
-                    )
-                continue
-            failures = 0
+                raise _exhausted(outstanding)
             read = fresh
-            merged = list(dict.fromkeys(awaited + read.card_ids))
-            statuses = {t: _status(t) for t in merged}
-            awaited = self._capped(_pending_first(merged, statuses), None if capped else result)
-            capped = capped or len(merged) > _MAX_AWAITED_TASKS
-            outstanding = [t for t in awaited if _status(t) not in _TERMINAL_STATUSES]
+            outstanding = _merge()
 
-        observed: list[dict[str, Any]] = list(result.trajectory)
         # Only a card the board shows terminal is read back, as the status-turn
         # wait only ever reads a card it has seen terminal. A card still moving
         # at the ceiling can carry text that is not its answer -- an earlier
@@ -2458,12 +2501,22 @@ class KubeAgentsHarness(AgentHarness):
         # the card is unblocked to run again), or a ``tasks.result`` stashed
         # before a refused completion -- and delivering it would both grade
         # that text and hide the ceiling from the scorer.
+        settled = [t for t in awaited if _status(t) in _TERMINAL_STATUSES]
+        if settled:
+            final = _read(settled)
+            if final is None:
+                raise _exhausted(outstanding)
+            final.cards = {**read.cards, **{t: c for t, c in final.cards.items() if t in settled}}
+            read = final
+        observed: list[dict[str, Any]] = list(result.trajectory)
         observed.extend(
             e
-            for t in awaited
+            for t in settled
             if _status(t) in _TERMINAL_STATUSES and (e := read.as_shown(t)) is not None
         )
         result.metadata["delegated_cards"] = {t: _status(t) for t in awaited}
+        if missing:
+            result.metadata["delegated_cards_missing"] = list(missing)
         if timed_out:
             _record_ceiling(
                 result,
@@ -2762,9 +2815,11 @@ class KubeAgentsHarness(AgentHarness):
 
         The workers' token counts land under ``tokens["workers"]`` in the
         record's buckets, per profile and summed, or ``None`` when no session
-        could be billed. They are added into the run's top-level buckets later,
-        in :meth:`_execute`, after the front door's session row is read
-        (:func:`_fold_worker_tokens` says why the order matters).
+        could be billed. On the api transport they are added into the run's
+        top-level buckets later, in :meth:`_execute`, after the front door's
+        session row is read (:func:`_fold_worker_tokens` says why the order
+        matters). On the inject transport the top-level buckets stay null (the
+        gateway reports no usage) and the counts stay under ``workers``.
         """
         _append_delivered(result, observed, awaited)
         _append_artifacts(result, awaited, _EXEC_TIMEOUT)

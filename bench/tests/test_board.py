@@ -268,8 +268,14 @@ def test_a_sessions_creates_name_its_cards_with_their_state(
     build_session_store(tmp_path, created=[FRONT, CHILD])
     set_card(tmp_path, FRONT, "done", result="three clusters, all healthy")
     set_card(tmp_path, CHILD, "done", summary="node pool resized")
-    read = board.read_session_cards(local_shell(tmp_path, monkeypatch), SESSION, 5)
+    shell = local_shell(tmp_path, monkeypatch)
+    # Without ``want`` a read carries statuses alone.
+    plain = board.read_session_cards(shell, SESSION, 5)
+    assert plain is not None
+    assert plain.cards[FRONT] == {"status": "done", "result": None, "summary": None}
+    read = board.read_session_cards(shell, SESSION, 5, want=[FRONT, CHILD], max_want=32)
     assert read is not None and read.session_found
+    assert read.total == 2
     assert read.card_ids == [FRONT, CHILD]
     assert read.source == "state.db"
     assert read.cards[FRONT] == {
@@ -364,3 +370,14 @@ def test_an_unreadable_store_is_no_reading(tmp_path: Path, monkeypatch: pytest.M
     """No store at all is a failed read (``None``), never "no cards"."""
     assert board.read_session_cards(local_shell(tmp_path, monkeypatch), SESSION, 5) is None
     assert board.read_session_cards(lambda script, timeout: "", SESSION, 5) is None
+
+
+def test_a_session_past_the_scan_bound_reports_its_total(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cards = [f"t_{n:08x}" for n in range(5)]
+    build_session_store(tmp_path, created=cards)
+    monkeypatch.setattr(board, "MAX_SESSION_IDS_SCANNED", 3)
+    read = board.read_session_cards(local_shell(tmp_path, monkeypatch), SESSION, 5)
+    assert read is not None
+    assert (read.card_ids, read.total) == (cards[:3], 5)

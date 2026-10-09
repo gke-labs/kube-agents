@@ -2595,8 +2595,9 @@ def test_a_delegated_card_is_graded_on_its_result_not_the_acknowledgement(
     assert "all 3 clusters healthy" in result.output
     assert result.metadata["delegated_cards"] == {CARD_A: "done"}
     assert result.metadata["delegated_cards_source"] == f"state.db ({API_SESSION})"
-    # ready, running, done: three reads, and not one further turn.
-    assert len(shell.reads) == 3
+    # ready, running, done: three status reads and one for the result, and
+    # not one further turn.
+    assert len(shell.reads) == 4
     assert len(api_executor.submissions) == 1
 
 
@@ -2623,7 +2624,7 @@ def test_two_cards_are_each_waited_for_and_graded(
     final = result.metadata["final_message"]
     assert f"Result of delegated task {CARD_A}:\nfleet report" in final
     assert f"Result of delegated task {CARD_B}:\nnode pool resized" in final
-    assert len(shell.reads) == 3
+    assert len(shell.reads) == 4
     assert len(api_executor.submissions) == 1
 
 
@@ -2725,7 +2726,7 @@ def test_without_the_session_the_wait_is_todays(
     assert len(api_executor.submissions) == 1
 
 
-def test_the_probe_carries_the_context_id(api_executor: _StubGatewayServer) -> None:
+def test_the_probe_carries_the_context_id() -> None:
     assert inject.Probe.from_body({"probe": {"contextId": CONTEXT_ID}}).context_id == CONTEXT_ID
     assert inject.Probe.from_body({"probe": {}}).context_id == ""
 
@@ -2920,5 +2921,59 @@ def test_over_the_cap_the_cards_still_moving_are_the_ones_awaited(
     final = result.metadata["final_message"]
     for tid in late:
         assert f"Result of delegated task {tid}:\nlate {tid}" in final
-    assert len(shell.reads) == 2
+    assert len(shell.reads) == 3
     assert result.errors == [f"too many delegated tasks: awaiting {cap}, ignoring 4"]
+
+
+def test_a_card_the_board_does_not_know_is_dropped_not_waited_on_to_the_ceiling(
+    api_executor: _StubGatewayServer, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A create on another board, or a card deleted after filing, names an id
+    with no row in ``kanban.db``. The status-turn wait ends that in three
+    silent turns; this one drops the card after three reads with no row."""
+    build_session_store(tmp_path, created=[CARD_A, CARD_B])
+    set_card(tmp_path, CARD_B, "done", result="fleet report")
+    with sqlite3.connect(tmp_path / board.BOARD_FILE) as conn:
+        conn.execute("DELETE FROM tasks WHERE id = ?", (CARD_A,))
+    monkeypatch.setenv("AGENT_DELEGATION_TIMEOUT", "5")
+    monkeypatch.setenv("AGENT_DELEGATION_POLL_INTERVAL", "0.05")
+    monkeypatch.setattr(harness, "_agent_shell", local_shell(tmp_path, monkeypatch))
+
+    result = KubeAgentsHarness().run("check the fleet")
+
+    assert result.errors == [
+        f"card {CARD_A} not on the board after 3 reads; dropped from the delegation wait, "
+        "nothing graded for it"
+    ]
+    assert f"Result of delegated task {CARD_B}:\nfleet report" in result.metadata["final_message"]
+    assert CARD_A not in result.metadata["final_message"]
+    assert result.metadata["delegated_cards_missing"] == [CARD_A]
+
+
+def test_one_cap_counts_every_card_and_awaits_the_moving_ones_first(
+    api_executor: _StubGatewayServer, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A 100-card fan-out whose first 70 are done: the cap is the harness's,
+    its message counts all 100, and the 30 still moving are the ones awaited."""
+    cap = harness._MAX_AWAITED_TASKS
+    cards = [f"t_{n:08x}" for n in range(100)]
+    build_session_store(tmp_path, created=cards)
+    for tid in cards[:70]:
+        set_card(tmp_path, tid, "done", result=f"early {tid}")
+    late = cards[70:]
+    for tid in late:
+        set_card(tmp_path, tid, "running")
+
+    def advance(n: int) -> None:
+        if n == 2:
+            for tid in late:
+                set_card(tmp_path, tid, "done", result=f"late {tid}")
+
+    monkeypatch.setattr(harness, "_agent_shell", local_shell(tmp_path, monkeypatch, advance))
+
+    result = KubeAgentsHarness().run("audit every cluster")
+
+    assert result.errors == [f"too many delegated tasks: awaiting {cap}, ignoring {100 - cap}"]
+    final = result.metadata["final_message"]
+    for tid in late:
+        assert f"Result of delegated task {tid}:\nlate {tid}" in final
