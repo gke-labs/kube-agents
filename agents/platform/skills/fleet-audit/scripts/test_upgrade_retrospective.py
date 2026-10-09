@@ -124,7 +124,7 @@ def args(**overrides):
     with --cluster or --since, or says otherwise."""
     base = {"project": [PROJECT], "cluster": None, "since": None, "ledger": None, "guards": None, "output": None, "report": None, "no_report": False, "dry_run": False, "reset_ledger": False}
     base.update(overrides)
-    base.setdefault("full", base["cluster"] is None and base["since"] is None)
+    base.setdefault("full", base["cluster"] is None and base["since"] is None and bool(base["project"]))
     if "full" in overrides:
         base["full"] = overrides["full"]
     return mock.Mock(**base)
@@ -497,6 +497,26 @@ class ClassifierSignatureTest(unittest.TestCase):
         [row] = self.classify(pods=[pod("big", scheduled_message="0/4 nodes are available: 4 Insufficient memory.")])
         self.assertEqual(entries(row), {(2, ur.HIGH)})
 
+    def test_event_only_scheduling_failure_needs_pool_evidence(self):
+        gpu_pool_only = [o for o in ops_for("seeded-a") if "pinned-inference-pool" in o["targetLink"]]
+        # The dead pods' events resolve to a Deployment whose template pins default-pool: untouched, medium.
+        workloads = copy.deepcopy(READS["seeded-a"]["workloads"])
+        payments = next(w for w in workloads if w["metadata"]["name"] == "payments-api")
+        payments["spec"]["template"]["spec"]["nodeSelector"] = {"cloud.google.com/gke-nodepool": "default-pool"}
+        pods = [p for p in READS["seeded-a"]["pods"] if "payments-api" not in p["metadata"]["name"]]
+        events = [event("FailedScheduling", "0/4 nodes are available: 4 Insufficient cpu.", name="payments-api-79b77b8c67-gone1", namespace="seeded-debug")]
+        reads = {**READS["seeded-a"], "pods": pods, "workloads": workloads, "events": events}
+        [row] = by_object(symptoms_of("seeded-a", reads=reads, ops=gpu_pool_only), PAYMENTS)
+        self.assertEqual(entries(row), {(2, ur.MEDIUM)})
+        # Pinned to the touched pool: high.
+        payments["spec"]["template"]["spec"]["nodeSelector"] = {"cloud.google.com/gke-nodepool": "pinned-inference-pool"}
+        [row] = by_object(symptoms_of("seeded-a", reads=reads, ops=gpu_pool_only), PAYMENTS)
+        self.assertEqual(entries(row), {(2, ur.HIGH)})
+        # No pool evidence at all on an event row: closed.
+        payments["spec"]["template"]["spec"].pop("nodeSelector")
+        [row] = by_object(symptoms_of("seeded-a", reads=reads, ops=gpu_pool_only), PAYMENTS)
+        self.assertEqual(entries(row), {(2, ur.MEDIUM)})
+
     def test_pending_pod_pinned_to_an_untouched_pool_is_medium(self):
         # Friday's rollout touched gpu-pool only; a pod pinned to default-pool that cannot schedule is not its doing.
         gpu_pool_only = copy.deepcopy([o for o in ops_for("seeded-a") if "pinned-inference-pool" in o["targetLink"]])
@@ -604,6 +624,27 @@ class ClassifierSignatureTest(unittest.TestCase):
         self.assertTrue(payments["started"])
         self.assertEqual(payments["since"], ur.SINCE_FIRST_SEEN)
 
+    def test_merged_row_is_graded_by_its_strongest_replica_whatever_the_order(self):
+        cluster = cluster_doc("seeded-a")
+        cluster["nodePools"][1]["config"]["effectiveCgroupMode"] = ur.CGROUP_V1_MODE  # idle-batch-pool on v1
+        ops = [o for o in ops_for("seeded-a") if "idle-batch-pool" not in o["targetLink"]]  # untouched
+        on_v1 = pod("jvm-aaaaa", images=["eclipse-temurin:8u302-jre"], statuses=[oom()], node="gke-seeded-a-idle-batch-pool-a5fd3288-q4ts")
+        on_v2 = pod("jvm-zzzzz", images=["eclipse-temurin:8u302-jre"], statuses=[oom()], node="gke-seeded-a-default-pool-62ac8ee0-d595")
+        for p in (on_v1, on_v2):
+            p["metadata"]["ownerReferences"] = [{"kind": "ReplicaSet", "name": "jvm-rs"}]
+        for first, second in ((on_v1, on_v2), (on_v2, on_v1)):
+            reads = {"pods": [first, second], "nodes": READS["seeded-a"]["nodes"], "events": [], "pdbs": [], "owners": []}
+            [row] = ur.collect_symptoms(cluster, reads, ops, SINCE)
+            self.assertEqual(entries(row), {(14, ur.HIGH)}, f"order {first['metadata']['name']}, {second['metadata']['name']}")
+        # Entry 2/20 gate: any replica on a touched pool opens it.
+        failing_a = pod("pull-aaaaa", statuses=[waiting("ImagePullBackOff")], images=["k8s.gcr.io/pause:3.9"], node="gke-seeded-a-idle-batch-pool-a5fd3288-q4ts")
+        failing_b = pod("pull-zzzzz", statuses=[waiting("ImagePullBackOff")], images=["k8s.gcr.io/pause:3.9"], node="gke-seeded-a-default-pool-62ac8ee0-d595")
+        for p in (failing_a, failing_b):
+            p["metadata"]["ownerReferences"] = [{"kind": "ReplicaSet", "name": "pull-rs"}]
+        for first, second in ((failing_a, failing_b), (failing_b, failing_a)):
+            [row] = self.classify(pods=[first, second], ops=ops)
+            self.assertNotIn(ur.GATE_CLOSED_TEXT, row["classifications"][0]["detail"])
+
     def test_entry_14_high_needs_a_runtime_image_on_a_touched_v2_pool(self):
         jvm = pod("jvm", images=["eclipse-temurin:8u302-jre"], statuses=[oom()])
         [row] = self.classify(pods=[jvm])
@@ -636,8 +677,13 @@ class ClassifierSignatureTest(unittest.TestCase):
         crashed["status"]["startTime"] = "2026-10-04T00:00:00Z"
         rows = {s["name"]: s for s in self.classify(pods=[pending, crashed], events=[event("Unhealthy", "probe failed", name="other", last="2026-10-08T12:00:00Z")])}
         self.assertEqual(rows["waiting"]["onset"], "2026-10-01T00:00:00Z")
-        # The Ready transition, never the latest crash.
-        self.assertEqual(rows["crash"]["onset"], "2026-10-05T00:00:00Z")
+        # A restarted pod: the earlier of its start and the Ready transition, never the latest crash.
+        self.assertEqual(rows["crash"]["onset"], "2026-10-04T00:00:00Z")
+        # Not restarted: the Ready transition dates the loss of readiness.
+        probe_fail = pod("probe", statuses=[{"name": "c0", "state": {"running": {}}, "restartCount": 0}])
+        probe_fail["status"]["startTime"] = "2026-10-04T00:00:00Z"
+        probe_fail["status"]["conditions"] = [{"type": "Ready", "status": "False", "lastTransitionTime": "2026-10-05T00:00:00Z"}]
+        self.assertEqual(self.classify(pods=[probe_fail])[0]["onset"], "2026-10-05T00:00:00Z")
         crashed["status"]["conditions"] = []
         no_condition = {s["name"]: s for s in self.classify(pods=[crashed])}
         self.assertEqual(no_condition["crash"]["onset"], "2026-10-04T00:00:00Z")
@@ -803,9 +849,23 @@ class ShapeTest(unittest.TestCase):
         self.assertNotIn(("seeded-shapes/DaemonSet/cni-shaped-agent", 13), self.by_object)
 
     def test_entry_1_budget(self):
+        # maxUnavailable 1: zero now because the pods are not ready, so a lesser risk.
         shape = self.shape("seeded-capacity/PodDisruptionBudget/inference-server", 1)
+        self.assertEqual(shape["confidence"], ur.MEDIUM)
+        self.assertIn("allows disruption once its pods are ready", shape["evidence"])
+        gemma = {(s["object"], s["entry"]): s for s in ur.collect_shapes(cluster_doc("gemma-gpu-upgraded"), READS["gemma-gpu-upgraded"])}
+        budget = gemma[("kubeagents-system/PodDisruptionBudget/gemma-server", 1)]
+        self.assertEqual(budget["confidence"], ur.HIGH)
+        self.assertIn('disruptionsAllowed=0 by spec {"maxUnavailable": 0} over 1 replica(s)', budget["evidence"])
+        pdb = {"kind": "PodDisruptionBudget", "metadata": {"name": "all", "namespace": "seeded-capacity"}, "spec": {"minAvailable": 4, "selector": {"matchLabels": {"app": "inference-server"}}}, "status": {"disruptionsAllowed": 0}}
+        [shape] = [s for s in ur.budget_shapes([pdb], READS["seeded-a"]["workloads"]) if s["kind"] == "PodDisruptionBudget"]
         self.assertEqual(shape["confidence"], ur.HIGH)
-        self.assertTrue(shape["evidence"].startswith("disruptionsAllowed=0"))
+        pdb["spec"]["minAvailable"] = 3
+        [shape] = [s for s in ur.budget_shapes([pdb], READS["seeded-a"]["workloads"]) if s["kind"] == "PodDisruptionBudget"]
+        self.assertEqual(shape["confidence"], ur.MEDIUM)
+        pdb["spec"] = {"minAvailable": "100%", "selector": {"matchLabels": {"app": "inference-server"}}}
+        [shape] = [s for s in ur.budget_shapes([pdb], READS["seeded-a"]["workloads"]) if s["kind"] == "PodDisruptionBudget"]
+        self.assertEqual(shape["confidence"], ur.HIGH)
 
     def test_entry_1_single_replica_behind_a_budget(self):
         pdb = {"kind": "PodDisruptionBudget", "metadata": {"name": "payments", "namespace": "seeded-debug"}, "spec": {"minAvailable": 1, "selector": {"matchLabels": {"app": "payments-api"}}}, "status": {"disruptionsAllowed": 1}}
@@ -1050,6 +1110,7 @@ class LedgerAndGuardsTest(unittest.TestCase):
         self.assertFalse(review["reviewed"])
         self.assertEqual(review["partial"], ["pods"])
         self.assertIn(ur.PARTIAL_READ_TEXT.format(failed="pods"), ur.render_report(second))
+        self.assertNotIn("the guards were kept", ur.render_report(second))
         # The next ordinary run re-selects it and, reading in full, reviews it.
         third, _ = self.collect(now=datetime(2026, 10, 16, 18, 0, tzinfo=timezone.utc))
         self.assertIn(SEEDED, [r["cluster"] for r in third["reviews"]])
@@ -1577,6 +1638,28 @@ class LedgerAndGuardsTest(unittest.TestCase):
         self.assertIn(INFERENCE, [i["object"] for i in second["sections"]["errors"]])
         self.assertIn("; 3 pre-existing since 2026-09-25T17:02:48Z (e.g. inference-server-778b78fdb8-cp2pf)", row["classifications"][0]["evidence"])
 
+    def test_probe_less_crash_loop_is_dated_by_its_start_not_its_last_flip(self):
+        # The fixture's own shape: Ready flipped a second after the latest crash, 440 restarts, started before the window.
+        looping = pod("legacy-worker", statuses=[{"name": "c0", "state": {"waiting": {"reason": "CrashLoopBackOff"}}, "lastState": {"terminated": {"reason": "Error", "exitCode": 1, "finishedAt": "2026-10-08T17:24:33Z"}}, "restartCount": 440}])
+        looping["status"]["startTime"] = "2026-09-01T00:00:00Z"
+        looping["status"]["conditions"] = [{"type": "Ready", "status": "False", "lastTransitionTime": "2026-10-08T17:24:34Z"}]
+        reads = {**READS["seeded-a"], "pods": READS["seeded-a"]["pods"] + [looping]}
+        with mock.patch.dict(READS, {"seeded-a": reads}):
+            first, _ = self.collect()
+        row = next(s for r in first["reviews"] for s in r["what_failed"] if s["name"] == "legacy-worker")
+        self.assertEqual(row["onset"], "2026-09-01T00:00:00Z")
+        self.assertTrue(row["predates_upgrade"])
+        # A later upgrade with the symptom recorded: still "present before".
+        bumped = cluster_doc("seeded-a")
+        bumped["currentMasterVersion"] = "1.36.4-gke.1247000"
+        master = copy.deepcopy(next(o for o in OPERATIONS if o["operationType"] == "UPGRADE_MASTER" and "/clusters/seeded-a" in o["targetLink"]))
+        master.update(name="operation-later", startTime="2026-10-15T09:00:00Z", endTime="2026-10-15T09:10:00Z")
+        looping["status"]["conditions"][0]["lastTransitionTime"] = "2026-10-15T17:59:00Z"
+        with mock.patch.dict(READS, {"seeded-a": reads}):
+            second, _ = self.collect(FakeFleet(clusters=[bumped, cluster_doc("gemma-gpu-upgraded")], operations=OPERATIONS + [master]), now=datetime(2026, 10, 15, 18, 0, tzinfo=timezone.utc))
+        row = next(s for r in second["reviews"] for s in r["what_failed"] if s["name"] == "legacy-worker")
+        self.assertEqual((row["since"], row["predates_upgrade"]), (ur.SINCE_BEFORE, True))
+
     def test_crash_loop_since_before_the_window_predates_the_upgrade(self):
         looping = pod("legacy-worker", statuses=[{"name": "c0", "state": {"waiting": {"reason": "CrashLoopBackOff"}}, "lastState": {"terminated": {"reason": "Error", "exitCode": 1, "finishedAt": "2026-10-08T17:55:00Z"}}}])
         looping["status"]["startTime"] = "2026-09-01T00:00:00Z"
@@ -1589,12 +1672,69 @@ class LedgerAndGuardsTest(unittest.TestCase):
             result, _ = self.collect()
         review = next(r for r in result["reviews"] if r["cluster"] == SEEDED)
         row = next(s for s in review["what_failed"] if s["name"] == "legacy-worker")
-        self.assertEqual((row["onset"], row["since"]), ("2026-09-08T00:00:00Z", ur.SINCE_FIRST_SEEN))
+        # Restarted since, so the earlier of its start (09-01) and the Ready transition (09-08) dates it.
+        self.assertEqual((row["onset"], row["since"]), ("2026-09-01T00:00:00Z", ur.SINCE_FIRST_SEEN))
         self.assertTrue(row["predates_upgrade"])
         self.assertEqual(row["classifications"][0]["confidence"], ur.HIGH)  # the signature is the mechanism; the grade is a Warning all the same
         incident = next(i for i in result["sections"]["warnings"] if i["object"] == "apps/Pod/legacy-worker")
         self.assertTrue(incident["predates_upgrade"])
         self.assertNotIn("apps/Pod/legacy-worker", [i["object"] for i in result["sections"]["errors"]])
+
+    def test_full_needs_a_project_set_and_no_since(self):
+        with self.assertRaises(argparse.ArgumentTypeError) as caught:
+            self.collect(full=True, project=None)
+        self.assertEqual(str(caught.exception), ur.FULL_WITHOUT_PROJECT_TEXT)
+        with self.assertRaises(argparse.ArgumentTypeError) as caught:
+            self.collect(full=True, since="30")
+        self.assertEqual(str(caught.exception), ur.FULL_WITH_SINCE_TEXT)
+        self.assertFalse((self.home / ur.LEDGER_FILENAME).exists())
+
+    def test_reset_ledger_archives_beside_a_named_ledger_path(self):
+        elsewhere = self.home / "elsewhere"
+        elsewhere.mkdir()
+        ledger = elsewhere / "my-ledger.json"
+        ledger.write_text("{broken")
+        with self.assertRaises(ur.StateUnreadable):
+            self.collect(ledger=str(ledger))
+        self.assertTrue(list(elsewhere.glob("my-ledger.json.unreadable-*")))
+        with mock.patch.object(ur, "now_utc", lambda: NOW):
+            with redirect_stdout(io.StringIO()) as out:
+                self.assertEqual(ur.main(["--reset-ledger"]), 0)
+            self.assertIn(ur.RESET_LEDGER_NOTHING_TEXT, out.getvalue())
+            with redirect_stdout(io.StringIO()) as out:
+                self.assertEqual(ur.main(["--reset-ledger", "--ledger", str(ledger)]), 0)
+        self.assertIn("archived 1 crash record(s)", out.getvalue())
+        self.assertEqual(list(elsewhere.glob("my-ledger.json.unreadable-*")), [])
+        result, _ = self.collect(ledger=str(ledger))
+        self.assertFalse(result["scoped"])
+
+    def test_budget_failure_guard_survives_a_master_only_review(self):
+        first, _ = self.collect()
+        gid = ur.guard_id(SEEDED, 1, "seeded-capacity/PodDisruptionBudget/inference-server")
+        self.assertIn(gid, {g["id"] for g in first["guards"]})
+        bumped = cluster_doc("seeded-a")
+        bumped["currentMasterVersion"] = "1.36.4-gke.1247000"
+        master = copy.deepcopy(next(o for o in OPERATIONS if o["operationType"] == "UPGRADE_MASTER" and "/clusters/seeded-a" in o["targetLink"]))
+        master.update(name="operation-master-only", startTime="2026-10-15T09:00:00Z", endTime="2026-10-15T09:10:00Z")
+        second, _ = self.collect(FakeFleet(clusters=[bumped, cluster_doc("gemma-gpu-upgraded")], operations=OPERATIONS + [master]), now=datetime(2026, 10, 15, 18, 0, tzinfo=timezone.utc))
+        kept = next(g for g in second["guards"] if g["id"] == gid)
+        self.assertEqual((kept["first_seen"], kept["last_seen"]), ("2026-10-08T18:00:00Z", "2026-10-15T18:00:00Z"))
+        # The budget lets a disruption through: the review drops it like any other.
+        pdbs = copy.deepcopy(READS["seeded-a"]["pdbs"])
+        pdbs[0]["status"]["disruptionsAllowed"] = 1
+        with mock.patch.dict(READS, {"seeded-a": {**READS["seeded-a"], "pdbs": pdbs}}):
+            third, _ = self.collect(FakeFleet(clusters=[bumped, cluster_doc("gemma-gpu-upgraded")], operations=OPERATIONS + [master]), now=datetime(2026, 10, 16, 18, 0, tzinfo=timezone.utc), cluster=[SEEDED])
+        self.assertNotIn(gid, {g["id"] for g in third["guards"]})
+
+    def test_unchanged_cluster_versions_are_refreshed(self):
+        self.collect()
+        grown = cluster_doc("seeded-a")
+        grown["nodePools"].append({"name": "new-pool", "version": "1.35.8-gke.1380001", "status": "RUNNING", "config": {"effectiveCgroupMode": ur.CGROUP_V2_MODE}})
+        result, _ = self.collect(FakeFleet(clusters=[grown, cluster_doc("gemma-gpu-upgraded")]), now=datetime(2026, 10, 15, 18, 0, tzinfo=timezone.utc))
+        self.assertEqual(result["reviews"], [])
+        entry = ur.load_json(self.home / ur.LEDGER_FILENAME, {})["clusters"][SEEDED]
+        self.assertIn("new-pool", entry["node_pools"])
+        self.assertEqual(entry["last_run"], "2026-10-08T18:00:00Z")
 
     def test_store_defaults_live_under_the_store_home(self):
         result, _ = self.collect()
