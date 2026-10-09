@@ -118,6 +118,9 @@ locals {
   # with itself, and OOBE_JOB_ID, the job whose delivery stage posts the report.
   scan_job     = "bootstrap-inventory-scan"
   delivery_job = "oobe"
+  # The other disabled entry: oobe removes it with the scan entry once the
+  # report is claimed, so the disarm puts it back too when it was there.
+  old_delivery_job = "bootstrap-inventory-delivery"
   state_file   = "${local.home}/.bench-onboarding-jobs.json"
   # agents/chat/defaults/plugins/bootstrap_onboarding/plugin.py: GREETED_MARKER.
   greeted = "${local.home}/.bootstrap_greeted"
@@ -148,7 +151,8 @@ locals {
     try:
         fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         with os.fdopen(fd, "w") as fh:
-            json.dump({"jobs": [jobs[i] for i in ids]}, fh)
+            kept = [jobs[i] for i in ids] + [jobs[i] for i in ("${local.old_delivery_job}",) if i in jobs]
+            json.dump({"jobs": kept}, fh)
         os.replace(tmp, state)
     except BaseException:
         if os.path.exists(tmp):

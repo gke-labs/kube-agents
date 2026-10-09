@@ -146,13 +146,14 @@ class PreLlmCallTest(unittest.TestCase):
         )
         self.trigger_job.assert_called_once_with("oobe")
 
-    def test_both_delivery_jobs_present_are_bound_and_triggered(self):
+    def test_both_delivery_jobs_present_are_bound_and_only_oobe_triggered(self):
         # A post-fold install still carries the disabled old entry; binding it keeps the link if
         # the install is rolled back to an image from before the fold.
         self.store_ids = {"oobe", "bootstrap-inventory-delivery"}
         self._call()
         self.assertEqual([c.args[0] for c in self.update_job.call_args_list], ["oobe", "bootstrap-inventory-delivery"])
-        self.assertEqual([c.args[0] for c in self.trigger_job.call_args_list], ["oobe", "bootstrap-inventory-delivery"])
+        # Triggering also enables a job; the old entry stays disabled.
+        self.trigger_job.assert_called_once_with("oobe")
 
     def test_an_install_without_oobe_binds_the_old_delivery_job(self):
         # oobe removed itself under an earlier image; the old job still delivers.

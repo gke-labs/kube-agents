@@ -78,6 +78,7 @@ _IN_POD = {
     "local.home": "/opt/data",
     "local.scan_job": "bootstrap-inventory-scan",
     "local.delivery_job": "oobe",
+    "local.old_delivery_job": "bootstrap-inventory-delivery",
     "local.state_file": "/opt/data/.bench-onboarding-jobs.json",
     "local.settle_wait": "120",
     "local.settle_poll": "2",
@@ -999,6 +1000,17 @@ class ArmDisarmTest(unittest.TestCase):
         self.assertEqual(sorted(p.name for p in self._home.iterdir()), ["cron"])
         self.assertIn("was not armed", self._py(self._disarm).stdout)
         self.assertEqual(self._py(self._arm).returncode, 0)
+
+    def test_disarm_puts_back_the_old_delivery_entry_oobe_removed(self):
+        old = {"id": "bootstrap-inventory-delivery", "schedule": {"expr": "* * * * *"}, "deliver": "local",
+               "enabled": False, "next_run_at": "t0"}
+        self._jobs([_SCAN, _DELIVERY, old])
+        self.assertEqual(self._py(self._arm).returncode, 0)
+        self._jobs([_DELIVERY])
+        out = self._py(self._disarm)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertIn("put back: bootstrap-inventory-scan, bootstrap-inventory-delivery", out.stdout)
+        self.assertEqual([j["id"] for j in self._jobs()], ["oobe", "bootstrap-inventory-scan", "bootstrap-inventory-delivery"])
 
     def test_disarm_puts_back_the_removed_jobs_and_clears_the_markers(self):
         self.assertEqual(self._py(self._arm).returncode, 0)
