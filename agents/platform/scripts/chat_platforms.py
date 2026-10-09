@@ -3,7 +3,7 @@
 #
 # One question, answered separately in several files, which is why the Cluster Agent
 # reconcile summary reached Google Chat and nothing else on every install (#989). The
-# other answers, and where each stands:
+# other answers, the callers that have converged on this one, and where each stands:
 #
 #   - `session_kv_server.enabled_chat_platforms` — the same three-source, per-platform
 #     resolution as this module, landed by #1111 for the cron report relay. It is the
@@ -11,8 +11,13 @@
 #     precedence; `get_active_platform` is now a single-destination reader on top of
 #     it, for the alert path, which needs exactly one platform because a thread
 #     belongs to one.
-#   - `platform_mcp_server.get_enabled_platforms` — still keyed on SLACK_BOT_TOKEN;
-#     #742/#743 record the defect and PR #735 is open against it.
+#   - `platform_mcp_server.send_notification` — a caller since #743, not an answer.
+#     It used to answer the question locally off CONFIG_PATH and then
+#     `SLACK_BOT_TOKEN or SLACK_HOME_CHANNEL` / `GOOGLE_CHAT_PROJECT_ID or
+#     GOOGLE_CHAT_HOME_CHANNEL`, never reading the managed scope. Under the
+#     credential proxy the token half is unsatisfiable and the home channel is
+#     rendered regardless, so on a managed pod it resolved off the environment and
+#     could disagree with the alert half of its own pipeline.
 #   - `profile_cron_tick.home_target_env` / `HOME_TARGET_ENV_KEYS` — a different
 #     question (which home *target* a cron child gets, re-read from config.yaml
 #     because the environment cannot carry it) but the same per-platform table.
@@ -96,6 +101,20 @@ _ENV_SIGNALS = {
 # caller had before this module existed, so an install this function cannot read is
 # no worse off than it was.
 DEFAULT_PLATFORM = "google_chat"
+
+# The suffix on the variable naming a platform's home channel — where a notification
+# goes when it has no session thread to reply under. Derived from the platform name
+# rather than tabulated against it, as `deploy/docker/plugins/chat/adapter.py` already
+# does, so that a platform added to CHAT_PLATFORMS cannot silently miss an entry. A
+# platform whose variable is unset is addressed by bare name: `hermes send` resolves
+# the channel from Hermes' own config, which is what an install that enables a
+# platform without rendering a home channel relies on.
+#
+# Here rather than beside its one reader in `platform_mcp_server`, because the guard
+# that holds the `platform_control` allowlist in step with CHAT_PLATFORMS has to pair
+# the two, and this module is the one of the pair a test can import without the
+# FastMCP dependency this file's header refuses to make callers pay for.
+HOME_CHANNEL_ENV_SUFFIX = "_HOME_CHANNEL"
 
 
 def _mapping(value: object) -> dict:
