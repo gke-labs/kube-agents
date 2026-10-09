@@ -413,6 +413,18 @@ class FreshEventsTest(unittest.TestCase):
                 self.assertEqual(float(path.read_text().strip()), live)
                 self.assertEqual(sorted(os.listdir(self.home)), [kanban_chat_notify.ROUTED_SINCE_FILE])
 
+    def test_a_record_that_cannot_be_rewritten_still_yields_its_mtime(self):
+        # The volume that cut the first write short may still be full or
+        # read-only: the rewrite fails, and the mtime stands for this process
+        # rather than the error escaping and halting routed delivery.
+        path = Path(self.home, kanban_chat_notify.ROUTED_SINCE_FILE)
+        live, now = 1_000_000.0, 1_000_000.0 + 3600
+        path.write_text("")
+        os.utime(path, (live, live))
+        os.chmod(self.home, 0o500)
+        self.addCleanup(os.chmod, self.home, 0o700)
+        self.assertEqual(kanban_chat_notify.routed_since(now), live)
+
     def test_an_absent_record_is_written_whole_as_now(self):
         now = 1_000_000.0
         self.assertEqual(kanban_chat_notify.routed_since(now), now)

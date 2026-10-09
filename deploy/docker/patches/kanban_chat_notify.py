@@ -137,8 +137,9 @@ ROUTE_PROBE_TIMEOUT_SECONDS = 5
 # The gateway's conversation-key prefixes (gchatConversationID,
 # slackConversationID). A subscription whose thread is one of these was routed
 # to a gateway conversation by kanban_event_routing (the hermes-bridge records
-# the route), and its chat_id is that conversation's context id: the report is
-# sent with --conversation and --context rather than --thread.
+# the route), and its chat_id is the session that holds the route, whose
+# context id conversation_context reads back: the report is sent with
+# --conversation and --context rather than --thread.
 CONVERSATION_KEY_PREFIXES = ("gchat:", "slack:")
 # The attribute the stand-in is cached under on the runner, which outlives the
 # per-tick collector and the per-delivery notification.
@@ -273,7 +274,13 @@ def routed_since(now: float) -> float:
             logger.warning("kanban notifier: %s unreadable (%s); using %s", path, exc,
                            "its mtime" if value is not None else "now")
             if value is not None:
-                _write_routed_since(path, value)
+                try:
+                    _write_routed_since(path, value)
+                except OSError as write_exc:
+                    # A full or read-only volume, the likeliest cause of the
+                    # short write: the mtime still stands for this process.
+                    logger.warning("kanban notifier: cannot rewrite %s (%s); "
+                                   "a restart will read its mtime again", path, write_exc)
     if value is None:
         value = now
         try:

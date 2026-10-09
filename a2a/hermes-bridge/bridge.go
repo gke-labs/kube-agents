@@ -418,7 +418,7 @@ type Bridge struct {
 	// (route.go), so a failed PUT that would have written the same route
 	// is not reported as a lost one.
 	routesMu sync.Mutex
-	routes   map[string]conversationRoute
+	routes   map[string]rememberedRoute
 	// The activity door (activity.go); nil when Config.ActivityListen is "".
 	activityLn   net.Listener
 	activitySrv  *http.Server

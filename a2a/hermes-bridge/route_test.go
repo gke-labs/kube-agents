@@ -3,11 +3,13 @@ package hermesbridge
 import (
 	"encoding/json"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/gke-labs/kube-agents/a2a/lib"
 )
@@ -153,6 +155,42 @@ func TestAPI_AFailedPUTOfAnAlreadyRecordedRouteIsNotALoss(t *testing.T) {
 	}
 	if puts := store.seen(); len(puts) != 2 {
 		t.Fatalf("route PUTs = %d, want 2: the second task still tries", len(puts))
+	}
+}
+
+func discardLogger() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard, nil)) }
+
+// routeEnvelope is a submission whose gateway authority names conversation.
+func routeEnvelope(t *testing.T, contextID, conversation string) *lib.Envelope {
+	t.Helper()
+	raw, err := json.Marshal(map[string]any{"audience": map[string]any{"conversation": conversation}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return &lib.Envelope{ContextID: contextID, Authority: raw}
+}
+
+// A remembered record older than routeMemoryTTL is not trusted: session-kv
+// may have pruned it, so a failed PUT then is reported as a lost route.
+func TestRecordRoute_AStaleMemoryIsNotTrusted(t *testing.T) {
+	store := newRouteStore(t, http.StatusOK)
+	b := &Bridge{cfg: Config{RouteURL: store.srv.URL, RouteKey: "kv-key", Logger: discardLogger()}, routeClient: http.DefaultClient}
+	env := routeEnvelope(t, "ctx-old", "slack:dm/D9")
+	now := time.Unix(1_000_000, 0)
+	routeNow = func() time.Time { return now }
+	t.Cleanup(func() { routeNow = time.Now })
+
+	if err := b.recordRoute(testCtx(t), "a2a-ctx-old", env); err != nil {
+		t.Fatalf("first record: %v", err)
+	}
+	store.setStatus(http.StatusInternalServerError)
+	now = now.Add(routeMemoryTTL - time.Minute)
+	if err := b.recordRoute(testCtx(t), "a2a-ctx-old", env); err != nil {
+		t.Fatalf("a failed PUT inside the TTL = %v, want nil: the earlier record stands", err)
+	}
+	now = now.Add(2 * time.Minute)
+	if err := b.recordRoute(testCtx(t), "a2a-ctx-old", env); err == nil {
+		t.Fatal("a failed PUT past the TTL = nil, want the error: the store may have pruned the record")
 	}
 }
 

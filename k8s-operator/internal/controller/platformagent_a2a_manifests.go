@@ -553,7 +553,8 @@ const (
 	// The shortest Slack channel id a2aSlackHomeChannel takes: the prefix
 	// letter and at least two characters after it, as the gateway checks.
 	a2aSlackMinChannelIDLen = 3
-	// The kanban notifier's half (deploy/docker/patches/kanban_chat_notify.py):
+	// The kanban notifier's half (deploy/docker/patches/kanban_chat_notify.py,
+	// and kanban_event_routing.py, which addresses a card to the conversation):
 	// the platform whose gateway conversations a card reports back to. Its own
 	// variable because the route serves conversations with no home channel,
 	// while A2A_NOTIFY_PLATFORM sends every proactive post to the home channel
