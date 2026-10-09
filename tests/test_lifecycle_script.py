@@ -1155,9 +1155,28 @@ exit 0
         proc, _ = self._run_delete(wedged=True)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         calls = self.kubectl_args.splitlines()
-        self.assertEqual(len(calls), 5, self.kubectl_args)
+        self.assertEqual(len(calls), 6, self.kubectl_args)
         for call in calls:
             self.assertTrue(call.startswith("--context gke_test-project_us-central1_test-cluster "), call)
+
+    def test_wedged_finalizer_cleans_tokenreview_callout_rbac_and_jetstream_pvc(self):
+        # When the operator's finalizer fails to clear in time, the script strips
+        # the finalizer and manually cleans cluster-scoped RBAC (minimal,
+        # tokenreview, callout tokenreview) and the next-mode JetStream PVC (#2795).
+        proc, _ = self._run_delete(wedged=True)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn(
+            "delete clusterrolebinding kubeagents:minimal:kubeagents-system:agent kubeagents:tokenreview:kubeagents-system:agent kubeagents:a2a-callout-tokenreview:kubeagents-system:agent --ignore-not-found",
+            self.kubectl_args,
+        )
+        self.assertIn(
+            "delete clusterrole kubeagents:minimal:kubeagents-system:agent kubeagents:tokenreview:kubeagents-system:agent --ignore-not-found",
+            self.kubectl_args,
+        )
+        self.assertIn(
+            "delete pvc data-agent-a2a-nats-0 -n kubeagents-system --ignore-not-found",
+            self.kubectl_args,
+        )
 
     def test_it_uses_the_dns_endpoint_when_one_accepts_external_traffic(self):
         proc, args = self._run_delete()

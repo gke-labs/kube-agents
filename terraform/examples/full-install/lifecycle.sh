@@ -1102,7 +1102,7 @@ fetch_cluster_credentials() {
 }
 
 delete_agent_cr() {
-  local namespace names
+  local namespace names agent_name
   namespace=$(tfvar namespace)
 
   if ! fetch_cluster_credentials; then
@@ -1130,16 +1130,26 @@ delete_agent_cr() {
     # deleting the agent's cluster-scoped RBAC, which no owner reference
     # garbage-collects (docs/site .../install/uninstall.md). The cluster is
     # normally destroyed moments later, but a destroy can stop between the
-    # release and the cluster, so delete the two objects here as well.
+    # release and the cluster, so delete the objects here as well.
     warn "finalizer did not clear in time; removing it so the namespace can terminate"
     kubectl --context "$CLUSTER_CONTEXT" patch "$ref" -n "$namespace" --type=merge \
       -p '{"metadata":{"finalizers":[]}}' >/dev/null 2>&1 || true
-    # The operator's naming, kubeagents:minimal:<namespace>:<name>, from
-    # k8s-operator/internal/controller/platformagent_manifests.go; a bash
-    # script cannot import it, so this must move when that does.
-    kubectl --context "$CLUSTER_CONTEXT" delete clusterrolebinding "kubeagents:minimal:${namespace}:${ref##*/}" \
+    # The operator's naming from k8s-operator/internal/controller
+    # (platformagent_manifests.go, platformagent_controller.go, and
+    # platformagent_a2a_callout.go): cluster-scoped RBAC and the next-mode
+    # JetStream PVC that no owner reference reaps when the finalizer is stripped.
+    agent_name="${ref##*/}"
+    kubectl --context "$CLUSTER_CONTEXT" delete clusterrolebinding \
+      "kubeagents:minimal:${namespace}:${agent_name}" \
+      "kubeagents:tokenreview:${namespace}:${agent_name}" \
+      "kubeagents:a2a-callout-tokenreview:${namespace}:${agent_name}" \
       --ignore-not-found >/dev/null 2>&1 || true
-    kubectl --context "$CLUSTER_CONTEXT" delete clusterrole "kubeagents:minimal:${namespace}:${ref##*/}" \
+    kubectl --context "$CLUSTER_CONTEXT" delete clusterrole \
+      "kubeagents:minimal:${namespace}:${agent_name}" \
+      "kubeagents:tokenreview:${namespace}:${agent_name}" \
+      --ignore-not-found >/dev/null 2>&1 || true
+    kubectl --context "$CLUSTER_CONTEXT" delete pvc \
+      "data-${agent_name}-a2a-nats-0" -n "$namespace" \
       --ignore-not-found >/dev/null 2>&1 || true
   done <<<"$names"
 }
