@@ -3,9 +3,9 @@
 # scripts carry for it, the patch that applies `next` after an install, and the
 # gate that waits for what `next` renders.
 #
-# PLATFORM_AGENT_MODE is the install.env key the install's planned --mode
-# flag (#2524) will read and record, so the release path spells it the same
-# way. Unset or `today` is the default and changes nothing:
+# PLATFORM_AGENT_MODE is the install.env key the install's --mode flag reads
+# and records, so the release path spells it the same way, and an exported
+# `next` reaches install.sh as well. Unset or `today` is the default and changes nothing:
 # platform_agent_mode_resolve unsets the variable, so a release script and
 # everything it runs see exactly the environment they saw before the mode
 # existed, and render_install_env.sh writes no key for it (an absent spec.mode
@@ -30,8 +30,8 @@ readonly PLATFORM_AGENT_MODE_A2A_GATEWAY="deployment/${PLATFORM_AGENT_MODE_CR_NA
 readonly PLATFORM_AGENT_MODE_AGENT="deployment/${PLATFORM_AGENT_MODE_CR_NAME}-gateway"
 
 # The two values the CRD's spec.mode enum takes, and the merge patch that sets
-# the second. The chart renders no spec.mode, so a later helm upgrade leaves a
-# patched value alone.
+# the second. The chart renders spec.mode from its platformAgent.mode value,
+# so a later full upgrade renders whatever install.env records.
 readonly PLATFORM_AGENT_MODE_TODAY="today"
 readonly PLATFORM_AGENT_MODE_NEXT="next"
 readonly PLATFORM_AGENT_MODE_NEXT_PATCH='{"spec":{"mode":"next"}}'
@@ -88,18 +88,17 @@ platform_agent_mode_resolve() {
 }
 
 # Refuses `next` on a long-lived environment (autopush, autopush-next,
-# staging). The patch
-# outlives the run there: the chart renders no spec.mode and the installer
-# does not read the key, so no later upgrade or reconcile puts it back, drift
-# detection plans nothing for it, and Google Chat stays moved off the legacy
-# consumer onto the A2A gateway until somebody rebuilds the environment on
-# `today`. rc and nightly are destroyed and rebuilt every run, so the mode
-# goes with them. Call after platform_agent_mode_resolve.
+# staging). A long-lived environment's mode is its PLATFORM_AGENT_MODE
+# variable, which the reconcile path renders into the chart; the rebuild's
+# mode input is not consulted for it, so a rebuild installs `today` and the
+# next reconcile moves the environment to its declared mode. rc and nightly
+# are destroyed and rebuilt every run, so the mode goes with them. Call after
+# platform_agent_mode_resolve.
 platform_agent_mode_refuse_long_lived() {
   local long_lived="${1:-}" environment="${2:-this environment}"
   [ "${RELEASE_PLATFORM_AGENT_MODE}" = "${PLATFORM_AGENT_MODE_NEXT}" ] || return 0
   [ -n "${long_lived}" ] || return 0
-  echo "::error title=spec.mode next is for the ephemeral environments::Refusing spec.mode ${PLATFORM_AGENT_MODE_NEXT} on '${environment}', a long-lived environment. Nothing that later moves it (an upgrade, a reconcile, drift detection) knows about the patched mode, so it would stay next, with Google Chat moved to the A2A gateway, until a ${PLATFORM_AGENT_MODE_TODAY} rebuild. Use the ephemeral rc or nightly environment for next."
+  echo "::error title=spec.mode next is for the ephemeral environments::Refusing spec.mode ${PLATFORM_AGENT_MODE_NEXT} on '${environment}', a long-lived environment. Its mode is its PLATFORM_AGENT_MODE variable, applied by the reconcile path, not this input. A rebuild installs ${PLATFORM_AGENT_MODE_TODAY} and the next reconcile moves it to the declared mode. Use the ephemeral rc or nightly environment for next."
   echo "==> spec.mode ${PLATFORM_AGENT_MODE_NEXT} refused on long-lived '${environment}'." >&2
   return 1
 }

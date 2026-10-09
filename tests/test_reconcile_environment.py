@@ -536,6 +536,214 @@ class DriftWorkflowTest(unittest.TestCase):
         self.assertIn("schedule", self.doc[True])
 
 
+_FAKE_GCLOUD = """#!/usr/bin/env bash
+# Every read of the cluster answers what FAKE_CLUSTER says, as the real
+# gcloud does: describe and get-credentials both 404 on an absent cluster.
+# The Terraform state probe answers what FAKE_STATE says.
+echo "$*" >> "${FAKE_DIR}/calls"
+case "$*" in
+  *"container clusters "*)
+    case "${FAKE_CLUSTER}" in
+      found)     echo "platform-agent-host" ;;
+      notfound)  echo "ERROR: (gcloud.container.clusters.describe) ResponseError: code=404, message=Not found: projects/p/locations/us-central1/clusters/platform-agent-host." >&2; exit 1 ;;
+      forbidden) echo "ERROR: (gcloud.container.clusters.describe) ResponseError: code=403, message=Required container.clusters.get permission(s) for projects/p/locations/us-central1/clusters/platform-agent-host." >&2; exit 1 ;;
+      api-off)   echo "ERROR: (gcloud.container.clusters.describe) ResponseError: code=403, message=Kubernetes Engine API has not been used in project p before or it is disabled. Enable it by visiting https://console.developers.google.com/apis/api/container.googleapis.com/overview?project=p then retry." >&2; exit 1 ;;
+    esac ;;
+  *"storage cat"*)
+    case "${FAKE_STATE}" in
+      cluster-here)  echo '{"version": 4, "resources": [{"mode": "managed", "type": "google_container_cluster", "name": "autopilot", "instances": [{"attributes": {"name": "platform-agent-host", "project": "p", "location": "us-central1"}}]}]}' ;;
+      cluster-else)  echo '{"version": 4, "resources": [{"mode": "managed", "type": "google_container_cluster", "name": "autopilot", "instances": [{"attributes": {"name": "platform-agent-host", "project": "p", "location": "us-east1"}}]}]}' ;;
+      other-cluster) echo '{"version": 4, "resources": [{"mode": "managed", "type": "google_container_cluster", "name": "autopilot", "instances": [{"attributes": {"name": "somebody-elses-cluster", "project": "p", "location": "us-central1"}}]}]}' ;;
+      mixed)         echo '{"version": 4, "resources": [{"mode": "managed", "type": "google_container_cluster", "name": "autopilot", "instances": [{"attributes": {"name": "platform-agent-host", "project": "p", "location": "us-central1"}}, {"attributes": {"name": "somebody-elses-cluster", "project": "p", "location": "us-central1"}}]}]}' ;;
+      no-cluster)    echo '{"version": 4, "resources": [{"mode": "managed", "type": "google_kms_key_ring", "name": "gke_keyring", "instances": [{"attributes": {"location": "us-central1"}}]}]}' ;;
+      garbage)       echo 'not json' ;;
+      absent)        echo "ERROR: (gcloud.storage.cat) The following URLs matched no objects or files: gs://p-kube-agents-tfstate/kube-agents/platform-agent-host/default.tfstate" >&2; exit 1 ;;
+      unreadable)    echo "ERROR: (gcloud.storage.cat) HTTPError 403: does-not-matter@p.iam.gserviceaccount.com does not have storage.objects.get access to the Google Cloud Storage object." >&2; exit 1 ;;
+    esac ;;
+esac
+"""
+
+# The real defaults file, so the object the step names is pinned against the
+# installer's own values rather than a copy of them.
+_FAKE_DEFAULTS = (_REPO_ROOT / "install.defaults.env").read_text()
+
+_FAKE_LEASE = """import json, os, sys
+with open(os.path.join(os.environ["FAKE_DIR"], "calls"), "a") as f:
+    f.write("lease " + " ".join(sys.argv[1:]) + "\\n")
+print(json.dumps([{"name": "x", "state": os.environ["FAKE_LEASE"]}]))
+"""
+
+
+class RebuildLeaseGuardTest(unittest.TestCase):
+    """The lease guard, run against a fake gcloud and a fake lease tool.
+
+    The lease ConfigMap lives on the cluster the rebuild is about to destroy.
+    A project with no cluster yet has nothing to ask and nothing to tear down:
+    that is how a long-lived environment is first created, and the guard must
+    let it through rather than read the missing cluster as an unreadable
+    lease. Only a genuine NOT_FOUND is that case; every other failure to reach
+    the cluster still fails closed, as does a held or unreadable lease.
+    """
+
+    def setUp(self):
+        steps = _doc(_DEPLOY_WF)["jobs"]["deploy-environment"]["steps"]
+        self.script = next(s for s in steps
+                           if s["name"] == "Refuse while somebody is live-testing")["run"]
+
+    def _run(self, cluster, lease="free", state="absent", defaults=_FAKE_DEFAULTS):
+        with tempfile.TemporaryDirectory() as tmp:
+            fake = pathlib.Path(tmp)
+            (fake / "calls").write_text("")
+            (fake / "gcloud").write_text(_FAKE_GCLOUD)
+            (fake / "gcloud").chmod(0o755)
+            # The step runs from the candidate's checkout and wants the
+            # renderer, the lease tool and the install defaults at their
+            # repository paths.
+            cwd = fake / "checkout"
+            (cwd / "scripts" / "release").mkdir(parents=True)
+            renderer = cwd / "scripts" / "release" / "render_install_env.sh"
+            renderer.write_text("#!/bin/sh\nexit 0\n")
+            renderer.chmod(0o755)
+            (cwd / "scripts" / "live_test_lease.py").write_text(_FAKE_LEASE)
+            (cwd / "install.defaults.env").write_text(defaults)
+            env = {
+                **os.environ,
+                "PATH": f"{fake}{os.pathsep}{os.environ['PATH']}",
+                "FAKE_DIR": str(fake),
+                "FAKE_CLUSTER": cluster,
+                "FAKE_LEASE": lease,
+                "FAKE_STATE": state,
+                "TARGET": "autopush-next",
+                "GCP_PROJECT_ID": "p",
+                "GCP_REGION": "us-central1",
+                "GKE_CLUSTER_NAME": "platform-agent-host",
+                "NAMESPACE": "kubeagents-system",
+            }
+            proc = subprocess.run(["bash", "-c", self.script], cwd=cwd, env=env,
+                                  capture_output=True, text=True, check=False)
+            return proc.returncode, (fake / "calls").read_text(), proc.stdout + proc.stderr
+
+    def test_no_cluster_yet_is_nothing_to_live_test_against(self):
+        code, calls, out = self._run("notfound")
+        self.assertEqual(code, 0, out)
+        self.assertNotIn("get-credentials", calls)
+        self.assertNotIn("lease ", calls)
+        self.assertIn("::notice", out)
+
+    def test_state_recording_the_cluster_elsewhere_is_a_coordinates_mismatch(self):
+        """The teardown finds an install by project and cluster name, not by
+        location. A describe that 404s while the state records the cluster at
+        another location means the region variable is wrong, and proceeding
+        would destroy a live cluster without its lease having been read."""
+        code, calls, out = self._run("notfound", state="cluster-else")
+        self.assertEqual(code, 1)
+        self.assertNotIn("lease ", calls)
+        self.assertIn("::error", out)
+        self.assertIn("us-east1", out)
+
+    def test_state_recording_the_cluster_here_means_it_is_gone(self):
+        """State whose cluster sits at the configured location, where describe
+        found none, is an install whose cluster is gone: nothing can hold a
+        lease, and the teardown's own stale-state path clears the rest."""
+        code, calls, out = self._run("notfound", state="cluster-here")
+        self.assertEqual(code, 0, out)
+        self.assertNotIn("lease ", calls)
+        self.assertIn("::notice", out)
+
+    def test_state_naming_another_cluster_refuses(self):
+        """State accretes across runs that computed different answers, and an
+        entry that names some other cluster is not ownership of this one: the
+        installer's tf_state_has_cluster matches the name as well as the
+        location. A destroy of that state would take the other cluster with it."""
+        code, calls, out = self._run("notfound", state="other-cluster")
+        self.assertEqual(code, 1)
+        self.assertNotIn("lease ", calls)
+        self.assertIn("::error", out)
+        self.assertIn("somebody-elses-cluster", out)
+
+    def test_state_recording_this_cluster_and_another_refuses(self):
+        """A destroy of the state takes every cluster in it, so this cluster
+        being gone does not make the other one safe to destroy unread."""
+        code, calls, out = self._run("notfound", state="mixed")
+        self.assertEqual(code, 1)
+        self.assertNotIn("lease ", calls)
+        self.assertIn("::error", out)
+        self.assertIn("somebody-elses-cluster", out)
+
+    def test_a_candidate_without_the_state_defaults_is_refused_by_name(self):
+        """A candidate between the lease check and the state-location defaults
+        passes the predates guard; it must still fail with a named reason, not
+        an unbound-variable abort."""
+        code, calls, out = self._run("notfound", defaults='DEFAULT_KUBE_AGENTS_STATE_BUCKET="auto"\n')
+        self.assertEqual(code, 1)
+        self.assertNotIn("lease ", calls)
+        self.assertIn("::error", out)
+        self.assertNotIn("unbound variable", out)
+
+    def test_state_with_no_cluster_is_an_earlier_attempt(self):
+        """A first dispatch that failed after writing state but before the
+        cluster existed leaves state with no cluster in it. The retry has to
+        get through, or the only way forward is deleting the object by hand."""
+        code, calls, out = self._run("notfound", state="no-cluster")
+        self.assertEqual(code, 0, out)
+        self.assertNotIn("lease ", calls)
+        self.assertIn("::notice", out)
+
+    def test_state_that_cannot_be_read_as_state_fails_closed(self):
+        code, calls, out = self._run("notfound", state="garbage")
+        self.assertEqual(code, 1)
+        self.assertNotIn("lease ", calls)
+        self.assertIn("::error", out)
+
+    def test_an_absent_cluster_with_unreadable_state_fails_closed(self):
+        code, calls, out = self._run("notfound", state="unreadable")
+        self.assertEqual(code, 1)
+        self.assertNotIn("lease ", calls)
+        self.assertIn("::error", out)
+
+    def test_the_state_probe_names_the_installers_object(self):
+        """The same object uninstall.sh's resolve_state_location reads."""
+        _, calls, _ = self._run("notfound")
+        self.assertIn("storage cat gs://p-kube-agents-tfstate/kube-agents/platform-agent-host/default.tfstate", calls)
+
+    def test_the_absence_pattern_is_the_installers(self):
+        """The step cannot source installer_common.sh, so it carries a copy of
+        GCS_OBJECT_ABSENT_PATTERN. A copy that drifts reads a later gcloud
+        wording of "absent" as "unknown" and blocks every first creation."""
+        common = (_REPO_ROOT / "scripts" / "installer" / "installer_common.sh").read_text()
+        pattern = re.search(r"readonly GCS_OBJECT_ABSENT_PATTERN='([^']+)'", common).group(1)
+        self.assertIn(f"grep -qiE '{pattern}'", self.script)
+
+    def test_an_existing_cluster_is_asked_for_its_lease(self):
+        code, calls, out = self._run("found", lease="free")
+        self.assertEqual(code, 0, out)
+        self.assertIn("get-credentials", calls)
+        self.assertIn("lease status --json", calls)
+
+    def test_a_held_lease_still_refuses(self):
+        code, calls, out = self._run("found", lease="held")
+        self.assertEqual(code, 1)
+        self.assertIn("::error", out)
+
+    def test_a_disabled_kubernetes_engine_api_is_named(self):
+        """A fresh project answers SERVICE_DISABLED, not NOT_FOUND. It is still
+        a refusal, but one that names the API to enable rather than a blind
+        teardown, because the project setup script enables it and the
+        installer's own probe would refuse the same answer later."""
+        code, calls, out = self._run("api-off")
+        self.assertEqual(code, 1)
+        self.assertNotIn("lease ", calls)
+        self.assertIn("::error", out)
+        self.assertIn("container.googleapis.com", out)
+
+    def test_any_other_failure_to_reach_the_cluster_fails_closed(self):
+        """A 403 is not an absent cluster; reading it as one would tear down blind."""
+        code, calls, out = self._run("forbidden")
+        self.assertEqual(code, 1)
+        self.assertNotIn("lease ", calls)
+        self.assertIn("::error", out)
+
+
 class DeployEnvironmentGuardTest(unittest.TestCase):
     """The teardown-and-rebuild workflow can target a long-lived environment.
 

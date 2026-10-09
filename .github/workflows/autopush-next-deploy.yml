@@ -7,9 +7,8 @@ name: "Autopush-Next: Deploy"
 # one, and a slow or leased autopush-next never holds up autopush.
 #
 # autopush-next has its own GitHub environment and GCP project, whose
-# PLATFORM_AGENT_MODE is next. It holds next only once the chart and installer
-# render spec.mode (#2740, product item 1); until then the reconcile installs
-# today there, as on autopush. Until the environment is provisioned its deploy
+# PLATFORM_AGENT_MODE is next; the reconcile renders that into the chart, so
+# the environment runs next. Until the environment is provisioned its deploy
 # reports `skipped` with a notice (skip_unconfigured).
 
 on:

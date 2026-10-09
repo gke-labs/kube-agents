@@ -322,9 +322,9 @@ jobs:
           # The PlatformAgent's spec.mode. Unset or `today` renders no key, so
           # an environment that does not set it renders the file it always
           # did; anything but today or next is refused by the renderer. The
-          # installer on main does not read the key yet: until the install's
-          # --mode flag (#2524) lands, `next` reaches a cluster only through
-          # deploy-environment.yml's mode input, which patches the CR itself.
+          # installer reads the key, so a full upgrade renders the mode into
+          # the chart: this is how a long-lived environment's declared mode
+          # reaches its cluster, and how one a rebuild left on today returns.
           PLATFORM_AGENT_MODE: ${{ vars.PLATFORM_AGENT_MODE }}
           MEMORY_PROVIDER: ${{ vars.MEMORY_PROVIDER }}
           USER_PROFILE_ENABLED: ${{ vars.USER_PROFILE_ENABLED }}
