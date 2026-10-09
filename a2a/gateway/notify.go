@@ -501,8 +501,10 @@ func (n *Notifier) post(job notifyJob) {
 func blocksMention(v any) string {
 	switch node := v.(type) {
 	case string:
+		// Lowercased: Slack reads the broadcast words in any case.
+		lower := strings.ToLower(node)
 		for _, token := range notifyMentionTokens {
-			if strings.Contains(node, token) {
+			if strings.Contains(lower, token) {
 				return token
 			}
 		}

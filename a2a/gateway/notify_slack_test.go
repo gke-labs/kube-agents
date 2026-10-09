@@ -216,6 +216,7 @@ func TestSlackNotifyRefusesMentionsInBlocks(t *testing.T) {
 		"rich user":     `[{"type":"rich_text","elements":[{"type":"rich_text_section","elements":[{"type":"user","user_id":"U1"}]}]}]`,
 		"bare here":     `[{"type":"section","text":{"type":"mrkdwn","text":"heads up @here"}}]`,
 		"bare everyone": `[{"type":"context","elements":[{"type":"mrkdwn","text":"@everyone look"}]}]`,
+		"mixed case":    `[{"type":"section","text":{"type":"mrkdwn","text":"see @Channel now"}}]`,
 	} {
 		if got := serveJSON(t, n, lib.NotifyRequest{Text: "x", Blocks: json.RawMessage(blocks)}); got.Error == "" {
 			t.Errorf("%s: blocks with a mention were accepted", name)
