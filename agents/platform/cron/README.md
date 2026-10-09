@@ -203,8 +203,9 @@ runs go project by project, the table within the first fifteen minutes and the
 readiness runs with the rest, each run gets what its share has left, a project
 the budget cannot reach or finish is left unread and named in the line (a
 version none of whose projects ran is not recorded and is retried tomorrow),
-and the next sweep starts at that project, so a budget that never reaches the
-end of the list does not leave the same project unread twice. Three guards
+and each sweep runs the projects least recently run first, so a budget that
+never reaches the end of the list does not leave the same project unread
+twice, whichever versions are due. Three guards
 keep the ledger honest: a version is
 retired only when the version table read every project, or read every project
 that still pended it and none does, a report that

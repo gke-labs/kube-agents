@@ -497,7 +497,7 @@ class Budget(Base):
         self.assertIn("the version table was partial (1 read error(s), exit 0)", out)
         self.assertIn(f"scheduled refresh {TARGET}, 2 cluster(s) pending (a, b): 0 blocked, 2 ready;", out)
         self.assertEqual(self.ledger()["targets"][TARGET]["last_report_at"], NOW.isoformat())
-        self.assertEqual(self.ledger()["table_resume_from"], "p2")
+        self.assertEqual(sorted(self.ledger()["table_runs"]), ["p1"], "the unread project is not stamped, so it goes first tomorrow")
 
     def test_a_project_the_budget_cannot_reach_is_left_unread_and_named(self) -> None:
         versions, readiness = self.two_projects()
@@ -511,7 +511,7 @@ class Budget(Base):
         self.assertIn("next refresh after 2026-10-15; readiness run for p2 not started: tick budget exhausted before project p2 could run", out)
         self.assertNotIn("retried tomorrow", out)
         self.assertEqual(self.ledger()["targets"][TARGET]["last_report_at"], NOW.isoformat())
-        self.assertEqual(self.ledger()["readiness_resume_from"], "p2")
+        self.assertEqual(sorted(self.ledger()["readiness_runs"]), ["p1"], "only the project that ran is stamped")
         text = (self.home / "reports" / TARGET / "latest.md").read_text()
         self.assertIn("- p2: readiness run for p2 not started", text)
 
@@ -528,7 +528,7 @@ class Budget(Base):
         self.assertEqual(code, 0)
         self.assertEqual([c[1][1] for c in sandbox.calls if c[0] == "readiness"], ["p2", "p1"])
         self.assertIn("2 cluster(s) pending (a, b): 0 blocked, 2 ready;", out)
-        self.assertIsNone(self.ledger()["readiness_resume_from"])
+        self.assertEqual(sorted(self.ledger()["readiness_runs"]), ["p1", "p2"])
 
     def test_a_version_whose_only_project_was_not_started_is_not_recorded_or_parked(self) -> None:
         versions = envelope([member("a", "lagging"), member("b", "lagging", project="p2", target=OLDER_TARGET)])
@@ -538,7 +538,7 @@ class Budget(Base):
             code, out = self.run_tick(sandbox)
         self.assertEqual(code, 0)
         self.assertIn(f"new target version {TARGET}, 1 cluster(s) pending (a): 0 blocked, 1 ready;", out)
-        self.assertIn(f"new target version {OLDER_TARGET}, 1 cluster(s) pending (b): not run; the tick budget was spent before p2 ran; retried tomorrow, starting there", out)
+        self.assertIn(f"new target version {OLDER_TARGET}, 1 cluster(s) pending (b): not run to completion; the tick budget was spent before p2 finished; retried tomorrow, starting there", out)
         self.assertNotIn("none graded", out)
         self.assertIsNone(self.ledger()["targets"][OLDER_TARGET]["last_report_at"])
         self.assertEqual(self.ledger()["announced"].get("ungraded", {}), {})
@@ -560,14 +560,14 @@ class Budget(Base):
         self.assertEqual(code, 0)
         self.assertEqual([c[1][1] for c in sandbox.calls if c[0] == "versions"], ["p1"])
         self.assertIn("the version table was partial (1 read error(s), exit 0); nothing retired while it stays so", out)
-        self.assertEqual(self.ledger()["table_resume_from"], "p2")
+        self.assertEqual(sorted(self.ledger()["table_runs"]), ["p1"])
         self.assertEqual(self.ledger()["targets"][TARGET]["pending"], ["p1/us-central1-a/a", "p2/us-central1-a/b"])
         with mock.patch.dict(os.environ, {watch.PROJECTS_ENV: "p1,p2"}):
             sandbox = FakeSandbox(versions, readiness)
             code, out = self.run_tick(sandbox)
         self.assertEqual([c[1][1] for c in sandbox.calls if c[0] == "versions"], ["p2", "p1"])
         self.assertIn("the version table reads every project again", out)
-        self.assertIsNone(self.ledger()["table_resume_from"])
+        self.assertEqual(sorted(self.ledger()["table_runs"]), ["p1", "p2"])
 
     def test_a_failed_table_for_one_project_is_that_project_s_gap(self) -> None:
         self.seed(TARGET, NOW - timedelta(days=8), ["p1/us-central1-a/a", "p2/us-central1-a/b"])
@@ -594,9 +594,10 @@ class Budget(Base):
         self.assertEqual(code, 0)
         self.assertEqual([c[2] for c in sandbox.calls if c[0] == "readiness"], [watch.READINESS_TIMEOUT_SECONDS, 400.0])
         self.assertIn("1 ready, 1 not read;", out)
-        self.assertIn("readiness run for p2 not started: tick budget exhausted before project p2 could run", out)
+        self.assertIn("readiness run for p2 cut short by the tick budget; it goes first next time", out)
+        self.assertNotIn("not started", out)
         self.assertNotIn("timed out", out)
-        self.assertEqual(self.ledger()["readiness_resume_from"], "p2")
+        self.assertEqual(sorted(self.ledger()["readiness_runs"]), ["p1"], "a cut-short run is not stamped")
         self.assertEqual(self.ledger()["announced"].get("ungraded", {}), {})
 
     def test_a_run_that_times_out_at_its_own_cap_is_a_failed_attempt_with_a_whole_number(self) -> None:
@@ -604,26 +605,48 @@ class Budget(Base):
         code, out = self.run_tick(sandbox)
         self.assertEqual(code, 0)
         self.assertIn(f"none graded (readiness run for p1 failed: the sandbox run timed out after {watch.READINESS_TIMEOUT_SECONDS}s)", out)
-        self.assertIsNone(self.ledger()["readiness_resume_from"])
+        self.assertIn("p1", self.ledger()["readiness_runs"], "a run that hit its own cap is an attempt and is stamped")
         self.assertEqual(self.ledger()["announced"]["ungraded"][TARGET]["attempts"], 1)
 
     def test_the_partial_line_is_keyed_on_the_kind_of_error_so_a_turning_window_posts_once(self) -> None:
         versions = envelope([member("a", "lagging"), member("b", "lagging", project="p2"), member("c", "lagging", project="p3")])
         readiness = envelope([member("a", "lagging", readiness="ready"), member("b", "lagging", project="p2", readiness="ready"), member("c", "lagging", project="p3", readiness="ready")])
         outs = []
-        for _ in range(3):
+        for day in range(3):
             # started, table first, table second, table third (past the share), then readiness runs with room
             late = watch.TABLE_BUDGET_SECONDS - 10.0
-            with mock.patch.dict(os.environ, {watch.PROJECTS_ENV: "p1,p2,p3"}), self.monotonic_readings(0.0, 0.0, 0.0, late, late, late, late):
+            with mock.patch.dict(os.environ, {watch.PROJECTS_ENV: "p1,p2,p3"}), mock.patch.object(watch, "now_utc", return_value=NOW + timedelta(days=day)), self.monotonic_readings(0.0, 0.0, 0.0, late, late, late, late):
                 sandbox = FakeSandbox(versions, readiness)
                 code, out = self.run_tick(sandbox)
-            outs.append((out, [c[1][1] for c in sandbox.calls if c[0] == "versions"], self.ledger()["table_resume_from"]))
+            outs.append((out, [c[1][1] for c in sandbox.calls if c[0] == "versions"]))
         self.assertIn("the version table was partial (1 read error(s), exit 0)", outs[0][0])
-        self.assertEqual(outs[0][1], ["p1", "p2"])
-        self.assertEqual(outs[0][2], "p3")
-        self.assertEqual(outs[1][1], ["p3", "p1"], "the next table starts at the project the budget left")
+        self.assertEqual([o[1] for o in outs], [["p1", "p2"], ["p3", "p1"], ["p2", "p1"]], "the least recently read projects go first, then by name")
         self.assertNotIn("partial", outs[1][0], "a turning unread window is the same kind of partial table, announced once")
         self.assertNotIn("partial", outs[2][0])
+
+    def test_a_sweep_over_another_version_does_not_reset_which_project_goes_first(self) -> None:
+        versions = envelope([member("a", "lagging"), member("b", "lagging", project="p2")])
+        readiness = envelope([member("a", "lagging", readiness="ready"), member("b", "lagging", project="p2", readiness="ready")])
+        env = {watch.PROJECTS_ENV: "p1,p2"}
+        # day 0: p2's readiness run is cut short
+        with mock.patch.dict(os.environ, env), self.monotonic_readings(0.0, 0.0, 0.0, 0.0, watch.TICK_BUDGET_SECONDS - 400.0):
+            self.run_tick(FakeSandbox(versions, readiness, timeout_projects={"p2"}))
+        # day 1: a new version in p1 alone sweeps p1 and completes
+        versions2 = envelope([member("a", "lagging"), member("b", "lagging", project="p2"), member("d", "lagging", target=OLDER_TARGET)])
+        readiness2 = envelope([member("a", "lagging", readiness="ready"), member("b", "lagging", project="p2", readiness="ready"), member("d", "lagging", target=OLDER_TARGET, readiness="ready")])
+        with mock.patch.dict(os.environ, env), mock.patch.object(watch, "now_utc", return_value=NOW + timedelta(days=1)):
+            sandbox = FakeSandbox(versions2, readiness2)
+            self.run_tick(sandbox)
+        self.assertEqual([c[1][1] for c in sandbox.calls if c[0] == "readiness"], ["p1"])
+        # day 8: the first version's refresh starts at p2, the project still owed a run
+        ledger = self.ledger()
+        ledger["targets"][TARGET]["last_report_at"] = NOW.isoformat()
+        watch.save_ledger(self.home / watch.LEDGER_FILE_NAME, ledger)
+        with mock.patch.dict(os.environ, env), mock.patch.object(watch, "now_utc", return_value=NOW + timedelta(days=8)):
+            sandbox = FakeSandbox(versions2, readiness2)
+            code, out = self.run_tick(sandbox)
+        self.assertEqual([c[1][1] for c in sandbox.calls if c[0] == "readiness"], ["p2", "p1"])
+        self.assertIn(f"scheduled refresh {TARGET}, 2 cluster(s) pending (a, b): 0 blocked, 2 ready;", out)
 
     def test_a_table_that_fails_for_every_project_is_one_failure_line(self) -> None:
         versions, readiness = self.two_projects()
