@@ -281,9 +281,12 @@
 #
 # The three exits are the three things the install owes the case and did not
 # provide, so _provision_death excludes the repetition and the safeguard
-# never runs. The ConfigMap is written on those paths too, but only as a
-# record for whoever reads the run directory; nothing grades it, because
-# there is nothing about the agent to grade. Terraform failing means the
+# never runs. The ConfigMap is written on those paths too, but it does not
+# survive them: a non-zero exit trips the stack's own cleanup, which deletes
+# both namespaces and the ConfigMap with them. The record that lasts is the
+# `verdict=... detail=...` line the stack writes to stderr, which the failed
+# repetition keeps in its error text. Nothing grades either, because there is
+# nothing about the agent to grade. Terraform failing means the
 # fixture could not be built, which is the environment's fault and is
 # excluded correctly; a built fixture that watched the pipeline forward
 # churn, or watched the human record fail to reach the ledger while the
@@ -472,10 +475,12 @@
 #   found the human card, and to a short token otherwise --
 #   churn-forwarded, fixture-invalid, forwarded-not-recorded,
 #   ingress-silent, card-quota-refused, card-turn-failed -- with `detail`
-#   carrying the human-readable form,
-#   including the fixture's twelve insertIds so a failing run can be traced
-#   without the apply log. Written last, after the settle, so a "ok" means
-#   both observations were actually made.
+#   carrying the human-readable form, including the fixture's twelve insertIds
+#   so a failing run can be traced. On the ok path the ConfigMap is what the
+#   safeguard reads and it stays on the cluster; on every path that exits
+#   non-zero the cleanup removes it, so the stderr copy is the trace. Written
+#   last, after the settle, so a "ok" means both observations were actually
+#   made.
 #
 #   human-filtered is specified above and the stack does not write it, because
 #   on an eval install it cannot be told apart from ingress-silent: both show

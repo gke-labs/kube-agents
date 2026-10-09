@@ -97,6 +97,11 @@ variable "churn_workloads" {
   EOT
   type        = list(string)
   default     = ["eval-drift-ledger-worker", "eval-drift-checkout-web"]
+
+  validation {
+    condition     = length(var.churn_workloads) > 0
+    error_message = "churn_workloads must name at least one workload. The publish loop indexes it modulo its length, so an empty list divides by zero and aborts the apply with the fixture-invalid placeholder as the only explanation."
+  }
 }
 
 # ─── The change under test ───────────────────────────────────────────────────
@@ -149,13 +154,13 @@ variable "human_principal" {
   default     = "ada@example.com"
 
   validation {
-    condition     = can(regex("^[^@[:space:]]+@[^@[:space:]]+$", var.human_principal))
-    error_message = "human_principal needs an @ with something either side, or isHuman rejects it and the record never reaches the inject."
+    condition     = can(regex("^[^@\"\\\\[:space:]]+@[^@\"\\\\[:space:]]+$", var.human_principal))
+    error_message = "human_principal needs an @ with something either side, or isHuman rejects it and the record never reaches the inject. Quotes and backslashes are excluded too: the fixture interpolates this into a JSON heredoc unescaped, and a record that fails json.Unmarshal is nacked and redelivers on its own backoff until the subscription's retention expires, since drift-pubsub deliberately sets no dead_letter_policy."
   }
 
   validation {
-    condition     = !startswith(var.human_principal, "system:") && !endswith(var.human_principal, ".gserviceaccount.com")
-    error_message = "human_principal must survive Classify's prefix and suffix tests; a system: prefix or a .gserviceaccount.com suffix is sorted as automation before isHuman is consulted."
+    condition     = !startswith(var.human_principal, "system:") && !endswith(lower(var.human_principal), ".gserviceaccount.com")
+    error_message = "human_principal must survive Classify's prefix and suffix tests; a system: prefix or a .gserviceaccount.com suffix is sorted as automation before isHuman is consulted. The suffix test folds case because Classify folds it (classify.go: the suffix is a DNS domain), so an upper-cased .GSERVICEACCOUNT.COM would pass an unfolded check here and still be filed as automation."
   }
 }
 
@@ -175,9 +180,9 @@ variable "churn_principals" {
   ]
 
   validation {
-    condition = alltrue([
+    condition = length(var.churn_principals) > 0 && alltrue([
       for p in var.churn_principals :
-      startswith(p, "system:") || endswith(p, ".gserviceaccount.com")
+      startswith(p, "system:") || endswith(lower(p), ".gserviceaccount.com")
     ])
     error_message = "every churn principal must be one Classify drops: a system: prefix or a .gserviceaccount.com suffix. One that reaches the human tier would file a card the case grades as unfiltered noise."
   }
@@ -195,8 +200,8 @@ variable "churn_record_count" {
   default     = 11
 
   validation {
-    condition     = var.churn_record_count >= 1
-    error_message = "churn_record_count must be at least 1; with no churn the case measures delivery, which is the sibling's job."
+    condition     = var.churn_record_count >= 1 && floor(var.churn_record_count) == var.churn_record_count
+    error_message = "churn_record_count must be a whole number of at least 1. A fractional value is worse than a rejected one: bash's -lt errors on it, errexit does not fire on a while condition, so the burst is never published, the ledger read finds nothing, and the run records ok for a filter it never exercised."
   }
 }
 
