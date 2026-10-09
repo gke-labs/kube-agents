@@ -827,8 +827,9 @@ def pool_numbers(pool: dict) -> list[str]:
     """What tripped the verdict, with each figure beside its own limit.
     "against 15/45" makes the reader pair four numbers positionally, and gets
     it wrong. The periodic breaches on a day's row, on runs queued past p95
-    right now, or on both, so the message quotes whichever it was -- the
-    seven-day window it is not judged on can sit well inside its own limit.
+    right now, or on runs refused a project in its recent window, so the
+    message quotes whichever it was, under every header -- the seven-day
+    window it is not judged on can sit well inside its own limit.
 
     The recent stretch leads when the periodic could judge it, and the worst
     breached day stands in when it could not; `pool_note` picks between them
@@ -847,6 +848,8 @@ def pool_numbers(pool: dict) -> list[str]:
             f"{waiting} {plural(waiting, 'run')} waiting right now,"
             f" past the {minutes_text(pool.get('threshold_p95_s'))} min p95 limit."
         )
+    if pool.get("lease_failures"):
+        lines.append(f"{pool_refusals(pool).capitalize()}.")
     return lines
 
 
@@ -864,16 +867,23 @@ def pool_cause_text(pool: dict) -> str:
     nothing."""
     cause = pool.get("cause")
     if cause == CAUSE_CAPACITY:
-        # The full pool is this hour's Boskos reading and carries the remedy on
-        # its own. The clause needs a backlog Deck actually saw: unread, it would
-        # assert one from a verdict up to a week old, and under the limit there
-        # may be no run queued at all.
+        # The counts are this hour's Boskos reading and carry the remedy on
+        # their own. The clause needs a backlog Deck actually saw: unread, it
+        # would assert one from a verdict up to a week old, and under the limit
+        # there may be no run queued at all. A refusal in the recent window
+        # keeps the cause once the pool has drained, so the header says "was"
+        # over a reading with projects free rather than calling them leased.
         queuing = " and runs are queuing" if pool.get("waiting_now") else ""
         held = f", {pool['held_by_hand']} held by hand" if pool.get("held_by_hand") else ""
-        refused = f"; {pool_refusals(pool)}" if pool.get("lease_failures") else ""
+        free = pool.get("free")
+        if isinstance(free, int) and free > 0:
+            return (
+                f"*Smoke gate: pool was full* — {free} of {figure(pool.get('total'))} projects"
+                f" are free now{held}. Consider onboarding a project."
+            )
         return (
             f"*Smoke gate: pool full* — all {figure(pool.get('total'))} projects are leased"
-            f"{held}{queuing}{refused}. Consider onboarding a project."
+            f"{held}{queuing}. Consider onboarding a project."
         )
     if cause == CAUSE_CONCURRENCY_CAP:
         return (

@@ -1550,8 +1550,9 @@ def pool_note(artifact: dict | None, now: datetime, prev: dict | None) -> dict |
     pool = _section(artifact, "pool")
     thresholds = _section(artifact, "thresholds")
     # The numbers that justify the verdict, not the window's. The periodic
-    # breaches on a single day's row or on a run waiting past p95 right now
-    # (pool_pressure.py's `breached_days or live_breach`) and never on the
+    # breaches on a single day's row, on a run waiting past p95 right now, or
+    # on a run refused a project in its recent window (pool_pressure.py's
+    # `breached_days or live_breach or recent_failed`) and never on the
     # seven-day aggregate, which after one bad day sits back inside its own
     # limit -- printing it under "onboard a project" contradicts the alert.
     #

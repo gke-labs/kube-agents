@@ -15,6 +15,8 @@ This measures the wait directly, from data Prow already writes, and prints:
   * a roll-call of individual runs that waited too long, because a single
     75-minute wait among five runs moves no percentile and is exactly the case
     that goes unseen;
+  * the runs Boskos refused a project outright, which no percentile sees
+    either: they stop at the acquire and never wait;
   * whether a breach is the pool being full (onboard another project) or the
     Prow control plane not dispatching (oss-test-infra#2666, where onboarding
     would spend money and fix nothing).
@@ -55,9 +57,9 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
-# The presubmit whose queue wait this measures. It is the only job in the pool
-# that takes a Boskos lease, so it is the only one whose wait says anything
-# about pool capacity.
+# The presubmit whose queue wait this measures. Every job in the pool leases
+# from it, but this is the one that runs often enough, and under a concurrency
+# cap, for its wait to say anything about capacity.
 JOB_NAME = "pull-kube-agents-smoke-test"
 
 # Prow writes one tiny object per build under pr-logs/directory/<job>/, holding
@@ -220,6 +222,12 @@ BOSKOS_NO_OWNER = ""
 # snowflake (SNOWFLAKE_* below): 19 digits since 2018 and until the epoch runs
 # out. An owner that does not end in one was taken by a person, for a repair.
 BUILD_ID_SUFFIX = re.compile(r"-(\d{19})$")
+# Jobs that lease under a fixed owner rather than `<job name>-<build ID>`: the
+# defaults in hack/fleet_reconcile.py and hack/ci_sweep_compute_plants.py,
+# which the Prow jobs running them do not override. Deck cannot vouch for a
+# lease with no build ID in it, so these are reported as a job's, apart from
+# the hand holds, and are never compared against it.
+BOSKOS_JOB_OWNERS = ("fleet-reconcile", "ci-kube-agents-compute-sweep")
 
 # The policy in docs/ci-pool-projects.md. A breach
 # of either is the signal to onboard the next project -- if, and only if, the
@@ -579,8 +587,17 @@ class PoolState:
     def lease_holders(self) -> List[str]:
         return sorted(k for k in self.owners if k != BOSKOS_NO_OWNER)
 
+    def held_by_job(self) -> Dict[str, int]:
+        """Owners in BOSKOS_JOB_OWNERS, with how many projects each holds."""
+        return {
+            owner: self.owners[owner]
+            for owner in self.lease_holders()
+            if owner in BOSKOS_JOB_OWNERS
+        }
+
     def held_by_hand(self) -> Dict[str, int]:
-        """Owners that are not a Prow run, with how many projects each holds.
+        """Owners that are neither a Prow run nor a known job, with how many
+        projects each holds.
 
         A person leasing a project for a repair names the lease however they
         like, and Deck has never heard of them, so these are reported as held
@@ -589,7 +606,7 @@ class PoolState:
         return {
             owner: self.owners[owner]
             for owner in self.lease_holders()
-            if not BUILD_ID_SUFFIX.search(owner)
+            if not BUILD_ID_SUFFIX.search(owner) and owner not in BOSKOS_JOB_OWNERS
         }
 
 
@@ -715,22 +732,31 @@ def lease_window(text: str) -> Tuple[Optional[datetime], Optional[datetime]]:
     preamble, or killed before it got there. The release banner names Boskos
     too, so the first match is taken rather than any of them.
     """
-    found = banners(text)
-    for index, (moment, label) in enumerate(found):
-        if BANNER_LEASE_KEYWORD in label.lower():
-            following = found[index + 1][0] if index + 1 < len(found) else None
-            return moment, following
+    lease, following = _lease_banners(text)
+    if lease is None:
+        return None, None
+    return (
+        parse_rfc3339(lease.group(1)),
+        parse_rfc3339(following.group(1)) if following is not None else None,
+    )
+
+
+def _lease_banners(text: str) -> Tuple[Optional[re.Match], Optional[re.Match]]:
+    """The first timestamped banner naming Boskos, and the banner after it."""
+    found = [m for m in BANNER_PATTERN.finditer(text) if parse_rfc3339(m.group(1))]
+    for index, match in enumerate(found):
+        if BANNER_LEASE_KEYWORD in match.group(2).lower():
+            following = found[index + 1] if index + 1 < len(found) else None
+            return match, following
     return None, None
 
 
 def _lease_output(text: str) -> str:
     """What the run printed between the lease banner and the banner after it."""
-    found = [m for m in BANNER_PATTERN.finditer(text) if parse_rfc3339(m.group(1))]
-    for index, match in enumerate(found):
-        if BANNER_LEASE_KEYWORD in match.group(2).lower():
-            end = found[index + 1].start() if index + 1 < len(found) else len(text)
-            return text[match.end() : end]
-    return ""
+    lease, following = _lease_banners(text)
+    if lease is None:
+        return ""
+    return text[lease.end() : following.start() if following is not None else len(text)]
 
 
 def lease_failed(text: str) -> bool:
@@ -1391,7 +1417,8 @@ def leaked_leases(pool: Optional[PoolState], queue: Optional[LiveQueue]) -> List
 
     Compared against every tenant's running job, not this job's alone: the
     nightlies and the next lane lease from the same pool. A holder with no
-    build ID was taken by hand and is reported as held, never as leaked.
+    build ID is a known job's fixed owner or a hand hold, and is reported as
+    held, never as leaked: nothing in Deck can vouch for it either way.
 
     Needs both sources: with no list of running jobs to compare against, every
     holder looks orphaned.
@@ -1590,6 +1617,7 @@ def summarise(
         # Boskos's states by name, and the owners that are not a Prow run,
         # each with its count; None when the pool was not read.
         "states": dict(pool_state.counts) if pool_state else None,
+        "held_by_job": pool_state.held_by_job() if pool_state else None,
         "held_by_hand": pool_state.held_by_hand() if pool_state else None,
         "leaked_leases": leaked,
         "cause": cause_label,
@@ -1743,6 +1771,12 @@ def render(summary: dict) -> str:
                 f"  {pool['in_transition']} project(s) out of rotation, not leasable:"
                 f" {_states_text(summary['states'])}"
             )
+        by_job = summary["held_by_job"]
+        if by_job:
+            out.append(
+                f"  {sum(by_job.values())} project(s) held by a job without a run ID:"
+                f" {_holders_text(by_job)}"
+            )
         held = summary["held_by_hand"]
         if held:
             out.append(
@@ -1839,6 +1873,9 @@ def _pool_now_lines(pool_state: PoolState, leaked: Sequence[str]) -> List[str]:
     rotation = _states_text(pool_state.counts)
     if rotation:
         lines.append(f"  out of rotation: {rotation}")
+    by_job = pool_state.held_by_job()
+    if by_job:
+        lines.append(f"  held by a job without a run ID: {_holders_text(by_job)}")
     held = pool_state.held_by_hand()
     if held:
         lines.append(f"  held by hand: {_holders_text(held)}")
@@ -1921,11 +1958,13 @@ def cause(
         ]
 
     if lease_failures:
+        # Not the cap caveat: a refused run never waited anywhere, and the
+        # lines above already name what is out of rotation.
         return CAUSE_CAPACITY, ["CAPACITY. " + refused[0]] + refused[1:] + [
             "What the projects are doing decides the remedy: a repair ends, a leak is",
             "released, and demand needs the next project, per the pool runbook:",
             "docs/ci-pool-projects.md",
-        ] + _pool_now_lines(pool_state, leaked) + _cap_at_pool_caveat(pool_state, concurrency)
+        ] + _pool_now_lines(pool_state, leaked)
 
     if pool_state.free == 0:
         return CAUSE_CAPACITY, [

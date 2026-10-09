@@ -1029,15 +1029,21 @@ it is set.
 `pool` is `null` or the pool-pressure note (`docs/ci-health.md`, "A backed-up
 pool"): `{since, verdict, breach_seen, measured_at}` always, plus `{day,
 window_hours, p50_s, p95_s, waiting_longest_s, waiting_now, waiting_since, over_threshold,
-threshold_p50_s, threshold_p95_s, free, total, cause, max_concurrency}` when
-`verdict` is `BREACH` or `UNMEASURED`. `waiting_longest_s` is how long the
+threshold_p50_s, threshold_p95_s, free, total, lease_failures, lease_failures_hours,
+held_by_hand, cause, max_concurrency}` when
+`verdict` is `BREACH` or `UNMEASURED`. `lease_failures` is how many runs Boskos
+refused a project in the periodic's recent window of `lease_failures_hours`
+hours, and `held_by_hand` how many projects are leased under an owner that is
+neither a Prow run nor a known job's fixed owner; all three are `null` from an
+artifact written before the
+periodic reported them. `waiting_longest_s` is how long the
 longest run has been waiting for a project right now, `0` for an empty queue
 and `null` when Deck was not read; `over_threshold` is the count already past
 the p95 limit. `waiting_now` is whether that wait is past the p50 limit — a
 live backlog — and `null` when Deck was unread or no limit was given. A verdict
 lasts a week, so every present-tense reader asks it: the alert is withheld on
-`false`, `CONTROL_PLANE` drops its diagnosis on `null`, and the digest and
-Brief go past tense on either. `waiting_since` dates the backlog from its
+`false` unless `lease_failures` is non-zero, `CONTROL_PLANE` drops its
+diagnosis on `null`, and the digest and Brief go past tense on either. `waiting_since` dates the backlog from its
 oldest queued run, and is `null` when there is none; the Brief's present-tense
 sentence prefers it to `since`, which can be days older.
 `breach_seen` says whether the open episode has ever measured a breach, and
@@ -1045,15 +1051,17 @@ sentence prefers it to `since`, which can be days older.
 a stretch that only ever said the queue could not be read. `metrics` carries
 both across a tick that read no artifact, as `pool_since` and
 `pool_breach_seen`. The two
-figures are never the seven-day window's — the periodic breaches on a day's row
-or on runs queued past p95 right now, and the window sits back inside its own
-limit after one bad day. Exactly one of `window_hours` and `day` says which
+figures are never the seven-day window's — the periodic breaches on a day's row,
+on runs queued past p95 right now, or on a run refused a project in its recent
+window, and the seven-day window sits back inside its own limit after one bad
+day. Exactly one of `window_hours` and `day` says which
 stretch they cover: the periodic's recent window when it had the runs to judge
 it and went over a limit, the worst breached day otherwise. A verdict lasts a
 week, so the recent window comes first — a Thursday incident evidenced by
 Monday reads as a contradiction — but a compliant stretch is the same
-contradiction, only newer. Both are `null` when only the live queue breached;
-`over_threshold` counts those runs. A `STALE` verdict carries no numbers: the
+contradiction, only newer. Both are `null` when only the live queue or only a
+refusal breached; `over_threshold` counts the queued runs and `lease_failures`
+the refused ones. A `STALE` verdict carries no numbers: the
 periodic stopped publishing, and the last reading is not evidence about now.
 Unlike `slow` it is set in every state, and the pages read `verdict`, `since`,
 `measured_at`, `day`, `window_hours`, `p50_s`, `p95_s`, `over_threshold`,

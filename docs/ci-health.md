@@ -19,8 +19,9 @@ it beside the grader's reason (builds graded before 2026-09-15 carry none).
 `scripts/eval_dashboard/post_health.py` tells `#kube-agents-ci-health` on Google
 Chat — only when the state changes, plus one digest a day at 9 AM Toronto time,
 plus one line, once per episode, when the gate is slow without being broken
-([below](#a-slow-gate)), plus one when runs start waiting to be scheduled and
-one when they stop ([below](#a-backed-up-pool)), plus, for the watched Prow
+([below](#a-slow-gate)), plus one when runs start waiting to be scheduled or
+are refused a project and one when they stop ([below](#a-backed-up-pool)),
+plus, for the watched Prow
 periodics, one when a run fails or a job stops and one when it passes again
 ([below](#the-watched-periodics)).
 The digest also carries one line on last night's run of the nightly tier

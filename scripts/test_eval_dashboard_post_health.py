@@ -1036,12 +1036,30 @@ class PoolNote(RunHarness):
         self.assertTrue(post_health.pool_advisable(note, drained=True))
         self.assertEqual(
             post_health.pool_cause_text(note),
-            "*Smoke gate: pool full* — all 30 projects are leased, 2 held by hand;"
-            " 2 runs refused a project in the last 3h. Consider onboarding a project.",
+            "*Smoke gate: pool full* — all 30 projects are leased, 2 held by hand."
+            " Consider onboarding a project.",
+        )
+        # The refusal line rides under every header, the UNKNOWN one included:
+        # a Boskos read that failed must not drop the one fact behind the ⏳.
+        self.assertEqual(
+            post_health.pool_numbers(note), ["2 runs refused a project in the last 3h."]
+        )
+        self.assertEqual(
+            post_health.pool_numbers(note | {"cause": "UNKNOWN"}),
+            ["2 runs refused a project in the last 3h."],
         )
         self.assertEqual(
             post_health.pool_digest_line(note),
             "⏳ Queue was backed up — 2 runs refused a project in the last 3h. No backlog right now.",
+        )
+
+    def test_a_refusal_breach_over_a_drained_pool_does_not_call_it_full(self):
+        # The cause stays CAPACITY for three hours after a refusal, and the
+        # free count is this hour's; "all leased" over seven free is false.
+        note = pool_note(free=7, lease_failures=2, lease_failures_hours=3)
+        self.assertEqual(
+            post_health.pool_cause_text(note),
+            "*Smoke gate: pool was full* — 7 of 30 projects are free now. Consider onboarding a project.",
         )
 
     def test_the_remedy_already_named_is_not_replaced_by_a_vaguer_one(self):

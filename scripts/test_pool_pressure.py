@@ -366,6 +366,17 @@ class PoolStateFields(unittest.TestCase):
             {"": 0, "pull-kube-agents-smoke-test-2108236254767222784": 1, "hangdng-rebuild": 2},
         )
         self.assertEqual({"hangdng-rebuild": 2}, pool.held_by_hand())
+        self.assertEqual({}, pool.held_by_job())
+
+    def test_a_jobs_fixed_owner_is_held_by_a_job_not_by_hand(self):
+        """hack/fleet_reconcile.py leases four projects under `fleet-reconcile`
+        on every merge and every morning; a row that calls those a person's
+        would be wrong twice a day."""
+        pool = pp.PoolState({"busy": 5}, {"fleet-reconcile": 4, "hangdng-rebuild": 1})
+        self.assertEqual({"fleet-reconcile": 4}, pool.held_by_job())
+        self.assertEqual({"hangdng-rebuild": 1}, pool.held_by_hand())
+        self.assertEqual([], pp.leaked_leases(pool, pp.LiveQueue([], set(), set())))
+        self.assertEqual(("fleet-reconcile", "ci-kube-agents-compute-sweep"), pp.BOSKOS_JOB_OWNERS)
 
     def test_a_third_state_is_counted_as_neither_leased_nor_available(self):
         """`cleaning` and `dirty` are projects nothing can lease right now. Read
@@ -1240,6 +1251,7 @@ class JsonOutput(unittest.TestCase):
              for f in payload["lease_failures"]],
         )
         self.assertEqual({"hangdng-rebuild": 2}, payload["held_by_hand"])
+        self.assertEqual({}, payload["held_by_job"])
         self.assertEqual({"busy": 3, "rebuilding": 2}, payload["states"])
         self.assertEqual(2, payload["recent"]["lease_failures"])
         self.assertEqual(2, payload["trend"]["lease_failures"])
@@ -1255,6 +1267,7 @@ class JsonOutput(unittest.TestCase):
                 os.symlink(os.path.join(SATURATED_DIR, name), os.path.join(tmp, name))
             payload = self._payload(from_dir=tmp, as_of=SATURATED_AS_OF, window_days=1)
         self.assertIsNone(payload["held_by_hand"])
+        self.assertIsNone(payload["held_by_job"])
         self.assertIsNone(payload["states"])
         self.assertEqual(pp.CAUSE_UNKNOWN, payload["cause"])
 

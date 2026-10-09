@@ -160,6 +160,9 @@ if verdict == "BREACH":
     waiting = queue.get("over_threshold") or 0
     if waiting:
         detail += f", {waiting} waiting now"
+    refused = payload["recent"].get("lease_failures") or 0
+    if refused:
+        detail += f", {refused} refused a project in the last {payload['recent']['hours']}h"
     subject = f"[pool-pressure] BREACH ({cause}) -- {detail}"
 elif verdict == "UNMEASURED":
     subject = "[pool-pressure] COULD NOT MEASURE -- the queue wait was not read"

@@ -13,11 +13,10 @@ asks that a simulated breach go red; a fixture built to breach proves the
 arithmetic, and this one proves the check would have caught the thing it was
 written for.
 
-## What is real and what is not
-
 ## Which builds, and why those
 
-Five per day. Five is `MIN_SAMPLES_FOR_DAILY_VERDICT`, below which no day is
+Five per day in the two captured days (`saturated/`, below, has three). Five
+is `MIN_SAMPLES_FOR_DAILY_VERDICT`, below which no day is
 judged at all, so it is the smallest set the breach tests can run on. Adding
 more buys no coverage: what the percentiles need is spread, not volume.
 
@@ -83,7 +82,7 @@ read the GCS path makes, so `--from-dir` exercises the parser on the same shape
 of input — including a log that ends mid-run. The head cut is housekeeping:
 `BANNER_PATTERN` matches nothing in the clone and setup output that precedes the
 first banner, so five lines of context are kept for a reader and the rest
-dropped. That took the ten logs from 164 kB to 10 kB. Under a kilobyte each.
+dropped. That took the first ten logs from 164 kB to 10 kB. Under a kilobyte each.
 
 The two `clone-failure-no-lease-*` builds failed in `clone` before the test
 script ran, so they hold no banners at all — their logs are the last 20 lines
