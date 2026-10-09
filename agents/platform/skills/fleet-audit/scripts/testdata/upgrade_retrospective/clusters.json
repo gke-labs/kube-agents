@@ -36,6 +36,7 @@
     "config": {
      "effectiveCgroupMode": "EFFECTIVE_CGROUP_MODE_V2",
      "imageType": "COS_CONTAINERD",
+     "labels": {},
      "machineType": "e2-small"
     },
     "initialNodeCount": 1,
@@ -47,6 +48,9 @@
     "config": {
      "effectiveCgroupMode": "EFFECTIVE_CGROUP_MODE_V2",
      "imageType": "COS_CONTAINERD",
+     "labels": {
+      "workload": "gemma"
+     },
      "machineType": "g2-standard-4"
     },
     "initialNodeCount": 1,
@@ -86,6 +90,7 @@
     "config": {
      "effectiveCgroupMode": "EFFECTIVE_CGROUP_MODE_V2",
      "imageType": "COS_CONTAINERD",
+     "labels": {},
      "machineType": "e2-medium"
     },
     "initialNodeCount": 2,
@@ -97,6 +102,7 @@
     "config": {
      "effectiveCgroupMode": "EFFECTIVE_CGROUP_MODE_V2",
      "imageType": "COS_CONTAINERD",
+     "labels": {},
      "machineType": "e2-small"
     },
     "initialNodeCount": 1,
@@ -108,6 +114,9 @@
     "config": {
      "effectiveCgroupMode": "EFFECTIVE_CGROUP_MODE_V2",
      "imageType": "COS_CONTAINERD",
+     "labels": {
+      "seeded-role": "pinned-inference"
+     },
      "machineType": "e2-small"
     },
     "initialNodeCount": 1,
