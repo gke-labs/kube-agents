@@ -102,8 +102,10 @@ sandbox hop once it ships.
 
 ```
 upgrade-retrospective (Platform Agent roster: Sunday 18:00 UTC; once, from the Chat Agent's
-                       first-run stage after the inventory scan settles; and scoped to one
-                       cluster when upgrade_retrospective_watch.py marks it due after an upgrade)
+                       first-run stage after the inventory scan settles)
+upgrade-retrospective-after-upgrade (daily 05:00 UTC as a sweep, and woken early by
+                       upgrade_retrospective_watch.py within fifteen minutes of an upgrade;
+                       a scoped run over the clusters whose operations are not yet reviewed)
   └─ collector  upgrade_retrospective.py                          deterministic, no model
        ├─ ledger: versions per cluster, last run                   /opt/data/upgrade-retrospective/ledger.json (the shell's volume)
        ├─ select: new (not in ledger) or upgraded (version differs, or an
@@ -149,23 +151,29 @@ included, and the first-run stage marks this job due without one. That is the "c
 scoped to this one stream. An install that onboarded before the job existed gets its baseline from
 the first Sunday tick.
 
-A third trigger reviews a cluster soon after its upgrade rather than at the weekend. A `no_agent`
-script, `upgrade_retrospective_watch.py`, runs every fifteen minutes on the gateway pod and reads,
-through the sandbox hop the readiness watch uses (`sandbox_exec` as its default principal, read
-only), the GKE operations of each roster project. When an `UPGRADE_MASTER` or `UPGRADE_NODES`
-operation on a cluster reached `DONE` at least fifteen minutes earlier and the watch has not marked
-that operation, it marks the `upgrade-retrospective` job due for that cluster, the way the
-first-run stage marks the audits due, and records the operation in its own ledger on the profile
-volume. The job then runs as the agent, in the agent's shell, which is the only principal that may
-write the store (§3.6): a scoped run for that cluster (§3.2) that posts its lines. The hop itself
-writes nothing, so a `hermes` caller never touches `/opt/data`, and the model turn is spent only
-when an upgrade completed. The review lands fifteen to twenty-nine minutes after `DONE` plus the
-job's start: the replacement pods have had time to settle, and the events of the operation's last
-half hour are still inside the API server's hour; events emitted earlier in a long drain are
-already gone, which is why (B) reads pod and node state first and treats events as corroboration.
-The Sunday run stays the fleet-wide baseline and the only run that files the ledger issue; the
-Sunday run reports an operation the watch already had reviewed as such. The watch is the last part
-of the second work item (§5), after the scheduled run and the on-demand route.
+A third trigger reviews a cluster soon after its upgrade rather than at the weekend. It is a
+second roster entry, `upgrade-retrospective-after-upgrade`, whose prompt is the SOP's
+after-upgrade route: the collector run with `--after-upgrade`, which selects the clusters whose
+`UPGRADE_MASTER` or `UPGRADE_NODES` operation reached `DONE` since the collector's last review and
+is not recorded in its ledger as reviewed, as a scoped run (§3.2) that posts its lines and files no
+ledger issue. The entry has a daily schedule as a sweep, 05:00 UTC, and is woken early by a
+`no_agent` script, `upgrade_retrospective_watch.py`, which runs every fifteen minutes on the gateway
+pod, reads the roster projects' operations through the sandbox hop the readiness watch uses
+(`sandbox_exec` as its default principal, read only) and, when an operation reached `DONE` at least
+fifteen minutes earlier that it has not seen, marks the after-upgrade job due with the same
+`trigger_job` call the first-run stage uses, which carries a job id and nothing else; the job finds
+its own scope from GKE and the collector's ledger, so nothing has to cross from the watch to the
+agent. The job runs as the agent, in the agent's shell, the only principal that may write the
+store (§3.6); the hop writes nothing, so a `hermes` caller never touches `/opt/data`, and a model
+turn is spent only when an upgrade completed (or once a day for the sweep). A second wake for the
+same operation finds it reviewed and prints nothing. The review lands fifteen to twenty-nine minutes
+after `DONE` plus the job's start: the replacement pods have had time to settle, and the events of
+the operation's last half hour are still inside the API server's hour; events emitted earlier in a
+long drain are already gone, which is why (B) reads pod and node state first and treats events as
+corroboration. The Sunday run stays the fleet-wide baseline and the only run that files the ledger
+issue; it reports an operation the after-upgrade job already reviewed as such. The watch and the
+second entry are the last part of the second work item (§5), after the scheduled run and the
+on-demand route.
 
 ### 3.1a On demand: the same report, from a generic question
 
@@ -296,6 +304,17 @@ signatures:
 | `Insufficient cpu` / `memory` on a Pending pod after a node-pool operation                | 2     |
 | a budget with no allowance left on a drained node; a node operation past an hour per node | 1     |
 | `no matches for kind`; a Job or CronJob pod in `Error` whose spec names a removed API     | 6     |
+
+Rows overlap, and a symptom carries exactly one entry, so the rows are tried in a fixed order and
+the first that holds wins; the order is the most specific discriminator first, so a finding id (the
+manifest derives it from the check id, cluster, namespace and object) never flips between runs on
+the same evidence: 7 (a webhook named), 6 (a removed API named), 19 (a PersistentVolume's node
+affinity, an attach or mount failure) before 12 (any other selector or affinity miss), 18 (a
+scheduling message that names `nvidia.com/gpu`, or a driver error text in a container whose image
+or command names a GPU driver component) before 14 and 15, 14 (the pool's cgroup mode and the
+runtime floor are facts of the pool and the image) before 15 (several processes), then 20, 17, 2
+and 1. An `OOMKilled` container on a migrated pool with an old runtime that also runs several
+processes is entry 14, with entry 15 named in the evidence as a second cause.
 
 A match is _sure_ (`high`) when the signature names the entry's own mechanism and the pool the
 object sits on had an operation in the window: a webhook named in the rejection, a selector that
@@ -457,8 +476,10 @@ comes from the collector's JSON, which keeps the per-cluster data and the same t
    (`0 18 * * 0`, `skills: ["fleet-audit"]`, the `AUDITS` allowlist so findings file, with check
    ids off `MAJOR_SWEEP_CHECKS`); the SOP's two paths (`start`, the collector and `finish` with its
    manifest where a repository is linked; the collector alone without one) and the first-run stage
-   marking this job due without a repository; `agents/platform/scripts/upgrade_retrospective_watch.py`
-   and its roster entry (`*/15 * * * *`, `no_agent`, §3.1); the readiness
+   marking this job due without a repository; the `upgrade-retrospective-after-upgrade` roster
+   entry (daily 05:00 UTC, the SOP's after-upgrade route, the collector's `--after-upgrade`
+   selection) and `agents/platform/scripts/upgrade_retrospective_watch.py` with its `no_agent`
+   entry (`*/15 * * * *`), which wakes it (§3.1); the readiness
    watch reading `guards.json` through its sandbox hop once it ships; the cron README section and
    the generated cron reference.
 3. **The proof.** The first report over the test fleet; one nightly case per catalogue entry the
@@ -472,7 +493,8 @@ comes from the collector's JSON, which keeps the per-cluster data and the same t
   `agents/platform/AGENTS.md` (the on-demand route).
 - `agents/platform/cron/jobs.json`, `agents/platform/cron/README.md`,
   `agents/platform/skills/fleet-audit/scripts/audit_report.py` (`AUDITS`, `COLLECTOR_AUDITS`).
-- `agents/platform/scripts/upgrade_retrospective_watch.py` and its test (the after-upgrade mark).
+- `agents/platform/scripts/upgrade_retrospective_watch.py` and its test (the after-upgrade wake),
+  and the collector's `--after-upgrade` selection.
 - The Chat Agent's first-run stage (`agents/chat/scripts/oobe.py`: the list of audits it starts
   after the inventory scan, and its repository skip).
 - The readiness watch's script, once it is on `main` (reads `guards.json` through its sandbox hop).
