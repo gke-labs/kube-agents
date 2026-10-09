@@ -296,6 +296,18 @@ def check_fold(tmp: Path, runner: Any) -> None:
     check(claim(child) is None, "fold: a second child is held while its parent works")
     kanban_db.block_task(conn, parent, reason="gave up")
     check("completed" in kinds(claim(child)), "fold: a parent that blocks releases its child's answer")
+
+    # A child that finishes after its parent's answer has posted (the parent
+    # completed over a live child) still posts, led as a late result.
+    parent, child = pair("count services")
+    kanban_db.complete_task(conn, parent, result="4 services")
+    deliver(parent)
+    kanban_db.complete_task(conn, child, result="4 services, 1 headless", summary="4 services, 1 headless")
+    late = claim(child)
+    done = [e for e in (late or {}).get("events", []) if e.kind == "completed"]
+    check(len(done) == 1 and str((done[0].payload or {}).get("summary", "")).startswith("Late result from count services (cluster):"),
+          "fold: a child's answer after its parent's posts, led as a late result")
+    check(str(getattr(late["task"], "result", "")).startswith("Late result from"), "fold: and the card's result is led too")
     conn.close()
 
 if __name__ == "__main__":

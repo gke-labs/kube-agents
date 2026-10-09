@@ -74,6 +74,7 @@ attachments are not posted (there is no file route), and say so in the log.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import json
 import logging
 import math
@@ -427,6 +428,26 @@ def _log_once(task_id: str, event_id: int, message: str, *args: Any) -> None:
     logger.info(message, *args)
 
 
+#: The line a child's answer opens with when it arrives after its parent's has
+#: posted, so it reads as a late finding and not a duplicate.
+LATE_RESULT_LEAD = "Late result from {title}:"
+
+
+def _late(ev: Any, claim: dict, title: str) -> tuple:
+    """``(event, claim)`` with the answer led by LATE_RESULT_LEAD. The
+    completion text is the event's run summary, or the card's result when the
+    event has none (upstream's ``_fmt_completed``), so both are led."""
+    lead = LATE_RESULT_LEAD.format(title=title or "a subtask")
+    payload = dict(getattr(ev, "payload", None) or {})
+    if payload.get("summary"):
+        payload["summary"] = f"{lead}\n{payload['summary']}"
+        ev = dataclasses.replace(ev, payload=payload) if dataclasses.is_dataclass(ev) else ev
+    task = claim.get("task")
+    if task is not None and getattr(task, "result", None) and dataclasses.is_dataclass(task):
+        claim = dict(claim, task=dataclasses.replace(task, result=f"{lead}\n{task.result}"))
+    return ev, claim
+
+
 def fold_fanout(conn: Any, claim: Optional[dict], now: Optional[float] = None) -> Optional[dict]:
     """``claim`` with a fanned-out child's answer folded into its parent's.
 
@@ -451,7 +472,9 @@ def fold_fanout(conn: Any, claim: Optional[dict], now: Optional[float] = None) -
     - otherwise (the parent blocked, failed or gave up, its answer came before
       the child's, its subscription is gone, or the hold ran out): it delivers
       as upstream would, so nothing a child found is lost when its parent's
-      answer does not post.
+      answer does not post. One that arrives after the parent's answer has
+      posted opens with "Late result from <card title>:", so it does not read
+      as a duplicate.
 
     Every other event kind (blocked, gave_up, crashed, progress) delivers.
 
@@ -470,7 +493,7 @@ def fold_fanout(conn: Any, claim: Optional[dict], now: Optional[float] = None) -
     events = list(claim.get("events") or [])
     now = time.time() if now is None else now
     kept: list = []
-    dropped = False
+    dropped = late = False
     for index, ev in enumerate(events):
         if getattr(ev, "kind", "") != "completed":
             kept.append(ev)
@@ -504,7 +527,16 @@ def fold_fanout(conn: Any, claim: Optional[dict], now: Optional[float] = None) -
             if not kept:
                 return None
             return dict(claim, events=kept, cursor=event_id - 1)
+        if parent_done and not later and delivered >= parent_done:
+            try:
+                title = conn.execute("SELECT title FROM tasks WHERE id = ?", (child,)).fetchone()
+            except sqlite3.Error:
+                title = None
+            ev, claim = _late(ev, claim, (title[0] if title else "") or "")
+            late = True
         kept.append(ev)
+    if late:
+        claim = dict(claim, events=kept)
     if not dropped:
         return claim
     if kept:

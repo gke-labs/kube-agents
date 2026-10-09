@@ -506,6 +506,12 @@ class _Ev:
     id: int
     kind: str
     created_at: int
+    payload: Optional[dict] = None
+
+
+@dataclass
+class _Task:
+    result: str
 
 
 class FoldFanoutTest(unittest.TestCase):
@@ -521,7 +527,7 @@ class FoldFanoutTest(unittest.TestCase):
     def setUp(self):
         self.conn = sqlite3.connect(":memory:")
         self.conn.executescript(
-            "CREATE TABLE tasks (id TEXT PRIMARY KEY, status TEXT);"
+            "CREATE TABLE tasks (id TEXT PRIMARY KEY, status TEXT, title TEXT);"
             "CREATE TABLE task_events (id INTEGER PRIMARY KEY, task_id TEXT, kind TEXT);"
             "CREATE TABLE kanban_worker_children (child_id TEXT PRIMARY KEY, creator_id TEXT, created_at INTEGER);"
             "CREATE TABLE task_links (parent_id TEXT, child_id TEXT);"
@@ -554,7 +560,7 @@ class FoldFanoutTest(unittest.TestCase):
         return self.conn.execute("SELECT last_event_id FROM kanban_notify_subs WHERE task_id = ?", (task,)).fetchone()[0]
 
     def parent(self, status, completed_event=None, delivered=None):
-        self.conn.execute("INSERT OR REPLACE INTO tasks VALUES ('t_parent', ?)", (status,))
+        self.conn.execute("INSERT OR REPLACE INTO tasks (id, status) VALUES ('t_parent', ?)", (status,))
         if completed_event is not None:
             self.conn.execute("INSERT INTO task_events VALUES (?, 't_parent', 'completed')", (completed_event,))
         if delivered is not None:
@@ -609,9 +615,21 @@ class FoldFanoutTest(unittest.TestCase):
         claim = self.claim(_Ev(7, "completed", 2000 - kanban_chat_notify.FOLD_HOLD_SECONDS - 1))
         self.assertIs(self.fold(claim), claim)
 
-    def test_a_parent_that_answered_first_does_not_swallow_its_childs_answer(self):
+    def test_a_late_answer_posts_and_says_it_is_late(self):
+        # The parent answered first (completed over a live child); the child's
+        # answer still posts, led so it does not read as a duplicate.
+        self.conn.execute("INSERT INTO tasks VALUES ('t_child', 'done', 'count pods (delegate)')")
         self.parent("done", completed_event=5, delivered=5)
-        claim = self.claim(_Ev(7, "completed", 1900))
+        claim = self.claim(_Ev(7, "completed", 1900, {"summary": "13 pods"}))
+        claim["task"] = _Task(result="13 pods, all healthy")
+        got = self.fold(claim)
+        self.assertEqual([e.id for e in got["events"]], [7])
+        self.assertEqual(got["events"][0].payload["summary"], "Late result from count pods (delegate):\n13 pods")
+        self.assertEqual(got["task"].result, "Late result from count pods (delegate):\n13 pods, all healthy")
+
+    def test_an_answer_ahead_of_an_undelivered_parent_is_not_called_late(self):
+        self.parent("done", completed_event=5, delivered=0)
+        claim = self.claim(_Ev(7, "completed", 1900, {"summary": "13 pods"}))
         self.assertIs(self.fold(claim), claim)
 
     def test_a_parent_whose_subscription_is_gone_does_not_fold(self):
