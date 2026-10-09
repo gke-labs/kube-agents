@@ -396,6 +396,25 @@ INJECT_LANE_EXCLUDED_TIER = {
 }
 
 
+def positive_check_types(node) -> set:
+    """Every `type:` in a task document outside a negating `type: none`
+    compound (bench/kube_agents_bench/cases.py): the checks that assert a
+    write happened, not that one did not."""
+    if isinstance(node, dict):
+        if node.get("type") == "none":
+            return set()
+        found = {node["type"]} if isinstance(node.get("type"), str) else set()
+        for value in node.values():
+            found |= positive_check_types(value)
+        return found
+    if isinstance(node, list):
+        found = set()
+        for item in node:
+            found |= positive_check_types(item)
+        return found
+    return set()
+
+
 class GitLabLaneTest(unittest.TestCase):
     """hack/eval/gitlab-presubmit-cases.txt: what the GitLab lane's presubmit
     runs (kube-agents#2394). A subset of the presubmit, every entry a case
@@ -416,20 +435,16 @@ class GitLabLaneTest(unittest.TestCase):
     def test_every_lane_case_grades_the_forge(self):
         import yaml
 
-        def check_types(node):
-            if isinstance(node, dict):
-                found = {node["type"]} if isinstance(node.get("type"), str) else set()
-                for value in node.values():
-                    found |= check_types(value)
-                return found
-            if isinstance(node, list):
-                return set().union(*(check_types(item) for item in node)) if node else set()
-            return set()
-
         for case in eval_rosters.gitlab_presubmit_cases():
             with self.subTest(case=case):
                 doc = yaml.safe_load((REPO_ROOT / "bench" / "tasks" / case / "task.yaml").read_text(encoding="utf-8"))
-                self.assertTrue(check_types(doc) & self.FORGE_CHECKS, f"{case} grades nothing on the forge; a chat probe proves nothing about GitLab")
+                self.assertTrue(positive_check_types(doc) & self.FORGE_CHECKS, f"{case} grades nothing on the forge; a chat probe proves nothing about GitLab")
+
+    def test_a_negated_forge_check_does_not_count(self):
+        # "The agent did not open a merge request" proves nothing on GitLab.
+        negated = {"verification_spec": [{"type": "none", "checks": [{"type": "pull_request_opened"}]}]}
+        self.assertFalse(positive_check_types(negated) & self.FORGE_CHECKS)
+        self.assertTrue(positive_check_types({"verification_spec": [{"type": "pull_request_opened"}]}) & self.FORGE_CHECKS)
 
     def test_no_commented_out_case_path(self):
         self.assertEqual(eval_rosters.commented_out_cases(eval_rosters.GITLAB_PRESUBMIT_CASES_FILE.read_text(encoding="utf-8")), [])

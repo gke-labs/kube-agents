@@ -2361,6 +2361,12 @@ while IFS= read -r NAME; do
   if [ -n "${INJECT_LANE_DROPPED:-}" ] && grep -qxF -- "${NAME}" <<< "${INJECT_LANE_DROPPED:-}"; then
     continue
   fi
+  # A roster case outside the GitLab lane's list (GITLAB_LANE_DROPPED, empty
+  # off that lane) leaves the export too, and is not "on the lane" for the
+  # guard below: the GitHub presubmit grades it.
+  if [ -n "${GITLAB_LANE_DROPPED:-}" ] && grep -qxF -- "${NAME}" <<< "${GITLAB_LANE_DROPPED:-}"; then
+    continue
+  fi
   BLOCKING_ROSTER_ON_LANE="true"
   # A roster case outside this night's part (NIGHTLY_PART_DROPPED, empty
   # unless EVAL_NIGHTLY_PART names one) leaves the export for the same
@@ -2368,19 +2374,8 @@ while IFS= read -r NAME; do
   if [ -n "${NIGHTLY_PART_DROPPED:-}" ] && grep -qxF -- "${NAME}" <<< "${NIGHTLY_PART_DROPPED:-}"; then
     continue
   fi
-  # A roster case outside the GitLab lane's list (GITLAB_LANE_DROPPED, empty
-  # off that lane) leaves the export too: the GitHub presubmit grades it.
-  if [ -n "${GITLAB_LANE_DROPPED:-}" ] && grep -qxF -- "${NAME}" <<< "${GITLAB_LANE_DROPPED:-}"; then
-    continue
-  fi
   BLOCKING_ROSTER_DEFAULT="${BLOCKING_ROSTER_DEFAULT:+${BLOCKING_ROSTER_DEFAULT},}${NAME}"
 done <<< "${BLOCKING_ROSTER_ENTRIES}"
-# The GitLab lane's list may hold no roster case (its first two seats are
-# held out), which empties the export by design, like a nightly part: said
-# in the log, not stopped.
-if [ -n "${GITLAB_LANE_DROPPED:-}" ] && [ -z "${BLOCKING_ROSTER_DEFAULT}" ] && [ -z "${BOOTSTRAP_ADMITTED+set}" ]; then
-  echo "EVAL_FORGE=gitlab: no blocking-roster case is in the GitLab lane, so rung 4 is disarmed on this lane (rungs 1-3 still red it); a forge-grading case arms it by earning a roster seat."
-fi
 # The file guard above cannot see the lane's drop: an exclusion list that
 # names every roster case would leave the export empty on the inject lane
 # with rung 4 disarmed for whatever the matrix still holds (the nightly tier
@@ -2394,6 +2389,14 @@ fi
 if [ -z "${BLOCKING_ROSTER_ON_LANE}" ] && [ -n "${INJECT_LANE_DROPPED:-}" ] && [ -z "${BOOTSTRAP_ADMITTED+set}" ]; then
   echo "ERROR: every case in ${BLOCKING_ROSTER_FILE} is excluded on the inject lane (${EVAL_INJECT_LANE_EXCLUSIONS_FILE}); the lane would run with rung 4 disarmed for every case. Trim the exclusion list, or set BOOTSTRAP_ADMITTED explicitly if that is the intent." >&2
   exit 1
+fi
+
+# The GitLab lane's list may hold no roster case (its first two seats are
+# held out), which empties the export by design, like a nightly part: said
+# in the log, not stopped. After the inject guard, so a lane the guard stops
+# does not also hear this.
+if [ -n "${GITLAB_LANE_DROPPED:-}" ] && [ -z "${BLOCKING_ROSTER_DEFAULT}" ] && [ -z "${BOOTSTRAP_ADMITTED+set}" ]; then
+  echo "EVAL_FORGE=gitlab: no blocking-roster case is in the GitLab lane, so rung 4 is disarmed on this lane (rungs 1-3 still red it); a forge-grading case arms it by earning a roster seat."
 fi
 
 export BOOTSTRAP_ADMITTED="${BOOTSTRAP_ADMITTED:-${BLOCKING_ROSTER_DEFAULT}}"
