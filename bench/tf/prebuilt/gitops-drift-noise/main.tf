@@ -109,8 +109,37 @@ resource "null_resource" "drift_noise" {
 
   provisioner "local-exec" {
     interpreter = ["/bin/bash", "-c"]
-    command     = <<-EOT
+
+    # Values an operator can set reach the script as environment, never as
+    # text Terraform splices into it. A principal or a workload name is data
+    # here; spliced, `system:$(id)` would be a command substitution bash runs
+    # in the apply's own shell, and no character class keeps up with that --
+    # the quoting clauses on these variables were patched three review rounds
+    # running before the rendering was the thing that changed. The two lists
+    # travel as JSON and are read back with the same json the payload uses.
+    # bench/tf/prebuilt/gitops-fix-cycle does the same for the same reason.
+    environment = {
+      HUMAN_NAMESPACE  = var.human_namespace
+      CHURN_NAMESPACE  = var.churn_namespace
+      HUMAN_WORKLOAD   = var.human_workload
+      HUMAN_CONTAINER  = var.human_container
+      HUMAN_PRINCIPAL  = var.human_principal
+      GITOPS_MANAGER   = var.gitops_field_manager
+      DRIFT_MANAGER    = var.drift_field_manager
+      DECLARED_MEMORY  = var.declared_memory
+      DRIFTED_MEMORY   = var.drifted_memory
+      CHURN_WORKLOADS  = jsonencode(var.churn_workloads)
+      CHURN_PRINCIPALS = jsonencode(var.churn_principals)
+    }
+
+    command = <<-EOT
       set -euo pipefail
+
+      # Read the two lists back as bash arrays. json rather than word
+      # splitting, so a space or a metacharacter in a value stays one element
+      # and stays data.
+      mapfile -t churn_workloads < <(python3 -c 'import json,os,sys; [sys.stdout.write(v + chr(10)) for v in json.loads(os.environ["CHURN_WORKLOADS"])]')
+      mapfile -t churn_principals < <(python3 -c 'import json,os,sys; [sys.stdout.write(v + chr(10)) for v in json.loads(os.environ["CHURN_PRINCIPALS"])]')
 
       # ---- 0. Point kubectl at the cluster the agent is on ------------------
       # Fetched rather than inherited: devops-bench moves the ambient
@@ -129,10 +158,10 @@ resource "null_resource" "drift_noise" {
         set +e
         if [ "$status" -ne 0 ] && [ -n "$planted" ]; then
           echo "Plant failed (exit $status). Namespaces before cleanup:" >&2
-          ${local.kubectl} get deployments -n "${var.human_namespace}" -o wide >&2
-          ${local.kubectl} get deployments -n "${var.churn_namespace}" -o wide >&2
+          ${local.kubectl} get deployments -n "$HUMAN_NAMESPACE" -o wide >&2
+          ${local.kubectl} get deployments -n "$CHURN_NAMESPACE" -o wide >&2
           echo "Deleting both namespaces so the next run starts clean." >&2
-          ${local.kubectl} delete namespace "${var.human_namespace}" "${var.churn_namespace}" \
+          ${local.kubectl} delete namespace "$HUMAN_NAMESPACE" "$CHURN_NAMESPACE" \
             --ignore-not-found --wait=false >&2
         fi
         rm -rf "$kubeconfig_dir"
@@ -163,7 +192,7 @@ resource "null_resource" "drift_noise" {
       # memory limit are already what this run is about to assert, so the
       # grading would pass on last run's state. Deleting someone else's
       # namespace is worse, so this refuses rather than cleans.
-      for ns in "${var.human_namespace}" "${var.churn_namespace}"; do
+      for ns in "$HUMAN_NAMESPACE" "$CHURN_NAMESPACE"; do
         if ${local.kubectl} get namespace "$ns" >/dev/null 2>&1; then
           owner="$(${local.kubectl} get namespace "$ns" \
             -o jsonpath='{.metadata.labels.managed-by}' 2>/dev/null || true)"
@@ -183,19 +212,19 @@ resource "null_resource" "drift_noise" {
 
       # ---- 1. Plant the namespaces and the three Deployments ----------------
       planted=1
-      for ns in "${var.human_namespace}" "${var.churn_namespace}"; do
+      for ns in "$HUMAN_NAMESPACE" "$CHURN_NAMESPACE"; do
         ${local.kubectl} create namespace "$ns"
         ${local.kubectl} label namespace "$ns" ${local.label_args} --overwrite
       done
 
-      # The declared spec is applied server-side AS ${var.gitops_field_manager},
+      # The declared spec is applied server-side AS $GITOPS_MANAGER,
       # which is what puts that name in the object's managedFields. The report
       # has to name it as the manager the drifting write took the field from,
       # and the join reads it off the live object rather than off the record.
       plant_deployment() {
         ns="$1"; name="$2"; container="$3"; memory="$4"
         cat <<YAML | ${local.kubectl} apply --server-side \
-          --field-manager="${var.gitops_field_manager}" -n "$ns" -f -
+          --field-manager="$GITOPS_MANAGER" -n "$ns" -f -
       apiVersion: apps/v1
       kind: Deployment
       metadata:
@@ -221,47 +250,47 @@ resource "null_resource" "drift_noise" {
       YAML
       }
 
-      plant_deployment "${var.human_namespace}" "${var.human_workload}" \
-        "${var.human_container}" "${var.declared_memory}"
-      %{for w in var.churn_workloads~}
-      plant_deployment "${var.churn_namespace}" "${w}" "app" "${var.declared_memory}"
-      %{endfor~}
+      plant_deployment "$HUMAN_NAMESPACE" "$HUMAN_WORKLOAD" \
+        "$HUMAN_CONTAINER" "$DECLARED_MEMORY"
+      for w in "$${churn_workloads[@]}"; do
+        plant_deployment "$CHURN_NAMESPACE" "$w" "app" "$DECLARED_MEMORY"
+      done
 
       # ---- 2. The one human change ------------------------------------------
       # A server-side apply, not a patch: --force-conflicts is an apply flag
       # (`kubectl patch` rejects it outright), and taking the field from
-      # ${var.gitops_field_manager} is the point rather than a side effect.
+      # $GITOPS_MANAGER is the point rather than a side effect.
       # The manifest carries only the field being claimed, so SSA leaves the
       # rest of the spec owned by the GitOps manager and the join can say who
       # took what from whom -- which is what expected_output requires the
       # report to name.
       cat <<YAML | ${local.kubectl} apply --server-side \
-        --field-manager="${var.drift_field_manager}" --force-conflicts \
-        -n "${var.human_namespace}" -f -
+        --field-manager="$DRIFT_MANAGER" --force-conflicts \
+        -n "$HUMAN_NAMESPACE" -f -
       apiVersion: apps/v1
       kind: Deployment
       metadata:
-        name: ${var.human_workload}
+        name: $HUMAN_WORKLOAD
       spec:
         template:
           spec:
             containers:
-              - name: ${var.human_container}
+              - name: $HUMAN_CONTAINER
                 resources:
                   limits:
-                    memory: "${var.drifted_memory}"
+                    memory: "$DRIFTED_MEMORY"
       YAML
 
       # Prove the field actually changed hands. SSA can decline to move it --
       # a mutating webhook rewriting `resources`, a container-name mismatch, a
       # kubectl that takes the partial manifest without claiming the field --
       # and the apply still exits 0. The join then reports the GitOps manager
-      # still owning it, the card says nothing about ${var.drift_field_manager},
+      # still owning it, the card says nothing about $DRIFT_MANAGER,
       # and the case reds as a pipeline fault with nothing pointing at the
       # plant. The sibling stack checks the same thing for the same reason.
-      owners="$(${local.kubectl} get deployment "${var.human_workload}" \
-        -n "${var.human_namespace}" -o jsonpath='{range .metadata.managedFields[*]}{.manager}{" "}{end}')"
-      for required in "${var.gitops_field_manager}" "${var.drift_field_manager}"; do
+      owners="$(${local.kubectl} get deployment "$HUMAN_WORKLOAD" \
+        -n "$HUMAN_NAMESPACE" -o jsonpath='{range .metadata.managedFields[*]}{.manager}{" "}{end}')"
+      for required in "$GITOPS_MANAGER" "$DRIFT_MANAGER"; do
         case " $owners " in
           *" $required "*) ;;
           *)
@@ -272,11 +301,11 @@ resource "null_resource" "drift_noise" {
             ;;
         esac
       done
-      live_memory="$(${local.kubectl} get deployment "${var.human_workload}" \
-        -n "${var.human_namespace}" \
-        -o jsonpath="{.spec.template.spec.containers[?(@.name=='${var.human_container}')].resources.limits.memory}")"
-      if [ "$live_memory" != "${var.drifted_memory}" ]; then
-        echo "ERROR: ${var.human_container} limit is '$live_memory', expected '${var.drifted_memory}'." >&2
+      live_memory="$(${local.kubectl} get deployment "$HUMAN_WORKLOAD" \
+        -n "$HUMAN_NAMESPACE" \
+        -o jsonpath="{.spec.template.spec.containers[?(@.name=='$HUMAN_CONTAINER')].resources.limits.memory}")"
+      if [ "$live_memory" != "$DRIFTED_MEMORY" ]; then
+        echo "ERROR: $HUMAN_CONTAINER limit is '$live_memory', expected '$DRIFTED_MEMORY'." >&2
         exit 1
       fi
 
@@ -335,7 +364,7 @@ resource "null_resource" "drift_noise" {
           --from-literal=detail="$2" \
           --from-literal=human_insert_id="$${human_insert_id:-}" \
           --from-literal=churn_insert_ids="$(IFS=,; echo "$${churn_ids[*]:-}")" \
-          --from-literal=drifted_memory="${var.drifted_memory}" \
+          --from-literal=drifted_memory="$DRIFTED_MEMORY" \
           --dry-run=client -o yaml | ${local.kubectl} apply -f - >/dev/null
         ${local.kubectl} label configmap "${local.verdict_configmap}" \
           -n "${local.verdict_namespace}" ${local.label_args} --overwrite >/dev/null
@@ -400,12 +429,6 @@ resource "null_resource" "drift_noise" {
       # ran and filed nothing: _inject_drift writes notified=0 with an empty
       # delivery_error when the quota refused the record, while a set
       # delivery_error is chat failing, which does not stop the turn.
-      ledger_has_row() {
-        ${local.kubectl} exec -n kubeagents-system "$pod" -c "${var.agent_container}" -- \
-          "$agent_python" -c "import sqlite3,sys; sys.exit(0 if sqlite3.connect('file:${local.ledger_db}',uri=True).execute('select count(*) from intercepted_events where object_uid = ?', (sys.argv[1],)).fetchone()[0] else 1)" \
-          "$1" >/dev/null 2>&1
-      }
-
       ledger_row() {
         ${local.kubectl} exec -n kubeagents-system "$pod" -c "${var.agent_container}" -- \
           "$agent_python" -c "import sqlite3,sys; r=sqlite3.connect('file:${local.ledger_db}',uri=True).execute('select notified, delivery_error from intercepted_events where object_uid = ? order by id desc limit 1', (sys.argv[1],)).fetchone(); print('%s|%s' % (r[0], r[1]) if r else '')" \
@@ -445,19 +468,44 @@ resource "null_resource" "drift_noise" {
           | grep -F "dropped " | grep -F "insert_id=$1" >/dev/null
       }
 
-      # ---- 4. The human record, and its turn, before any churn --------------
-      # The head start is what makes the ledger read below conclusive. If the
-      # burst went out alongside the human record, a forwarded churn card could
-      # still be in flight when the board is read, and the case would score a
-      # green on a filter that had already failed -- the newest card concerning
-      # either namespace would be the human one either way.
-      human_insert_id="$(mint_id)"
+      # ---- 4. The burst, then the human record ------------------------------
+      # Churn first, human second, and the ordering is the consumption proof.
+      # A human card that FINISHED means the detector pulled and classified a
+      # record published after the churn, so whatever it would have done with
+      # the burst it has already done, using a wait this case already has to
+      # make rather than a probe record of its own.
+      #
+      # Attribution does not depend on the order: a row counts as leaked
+      # because its object_uid is one of THIS run's minted churn ids, not
+      # because of when it arrived. What the order does buy is that on a
+      # working filter no churn card exists, so nothing competes with the
+      # agent's turn for the one-replica agent.
       churn_ids=()
+      human_insert_id=""
       write_verdict fixture-invalid "the run did not reach its own observations"
-      publish_record "$human_insert_id" "${var.human_principal}" \
-        "${var.human_namespace}" "${var.human_workload}" "kubectl-edit/v1.31.0"
+
+      i=0
+      while [ "$i" -lt "${var.churn_record_count}" ]; do
+        id="$(mint_id)"
+        churn_ids+=("$id")
+        publish_record "$id" \
+          "$${churn_principals[$(( i % $${#churn_principals[@]} ))]}" \
+          "$CHURN_NAMESPACE" \
+          "$${churn_workloads[$(( i % $${#churn_workloads[@]} ))]}" \
+          "kube-controller-manager/v1.31.0"
+        i=$(( i + 1 ))
+        # Distinct seconds in the minted ids, and a gentler publish rate than
+        # a tight loop would give the subscription.
+        sleep 1
+      done
+      echo "churn records: $${#churn_ids[@]} published"
+
+      human_insert_id="$(mint_id)"
+      publish_record "$human_insert_id" "$HUMAN_PRINCIPAL" \
+        "$HUMAN_NAMESPACE" "$HUMAN_WORKLOAD" "kubectl-edit/v1.31.0"
       echo "human record: insertId=$human_insert_id"
 
+      # ---- 5. Wait for the human card ---------------------------------------
       # The loop's answer is remembered rather than asked again. card_is_finished
       # returns 1 both for "no terminal card" and for "the exec did not run",
       # so a 502 or a rolled pod in the gap between the loop and a re-probe
@@ -471,122 +519,15 @@ resource "null_resource" "drift_noise" {
         waited=$(( waited + 15 ))
       done
 
-      if [ -z "$card_finished" ]; then
-        # Two different worlds, and only one of them is this case's finding.
-        # A ledger row means the record reached the daemon and the front door
-        # or the ceiling is what failed -- an install fault, which must NOT be
-        # graded as the agent doing something forbidden. No row means Classify
-        # never forwarded it, which IS the finding, in the direction opposite
-        # to churn-forwarded.
-        row="$(ledger_row "$human_insert_id")"
-        if [ -n "$row" ]; then
-          notified="$${row%%|*}"
-          delivery_error="$${row#*|}"
-          if [ "$notified" = "0" ] && [ -z "$delivery_error" ]; then
-            write_verdict card-quota-refused \
-              "the daily drift ceiling refused the record before any turn was scheduled; raise ALERT_DAILY_LIMIT_DRIFT or use a fresh install"
-            echo "ERROR: the alert ceiling refused the record; no card was ever coming." >&2
-          else
-            write_verdict card-turn-failed \
-              "the record was accepted (notified=$notified) but the front-door turn filed no card in ${var.card_timeout_seconds}s"
-            echo "ERROR: the inject landed and the turn filed no card." >&2
-          fi
-          echo "       This is the install, not the agent. Exiting non-zero so the repetition is excluded." >&2
-          exit 1
-        fi
-
-        if detector_forwarded "$human_insert_id"; then
-          write_verdict forwarded-not-recorded \
-            "the detector forwarded the record (DRIFT line present) and no ledger row followed; the loss is downstream of the filter"
-          echo "ERROR: Classify passed the record and the daemon recorded nothing." >&2
-          echo "       Downstream of the filter, so not this case's finding. Excluding the repetition." >&2
-          exit 1
-        fi
-        # A dropped line naming this id is the classifier refusing a human-tier
-        # write, which IS this case's finding in the direction opposite to
-        # churn-forwarded. It is only ever present when --log-dropped is on,
-        # which the eval install leaves off, so this branch is reachable on a
-        # re-run rather than in the nightly -- but when the evidence is there
-        # the case reports it rather than throwing the repetition away.
-        if detector_dropped "$human_insert_id"; then
-          write_verdict human-filtered \
-            "the classifier dropped the human record: a dropped line names its insert_id"
-          echo "ERROR: Classify refused a human-tier write. That is the regression." >&2
-          exit 0
-        fi
-
-        # No row and no line of either kind. Two worlds this install cannot
-        # tell apart with --log-dropped off: Classify dropped it silently, or
-        # nothing reached the detector at all. So this exits non-zero and the
-        # repetition is excluded. Reporting it as the finding would accuse the
-        # agent on evidence that does not distinguish the two, and a false
-        # accusation on a nightly record is worse than one nobody scored.
-        write_verdict ingress-silent \
-          "no ledger row for the human record: Classify dropped it or it never arrived; DRIFT_DETECTOR_LOG_DROPPED tells which"
-        echo "ERROR: the human record left no ledger row after ${var.card_timeout_seconds}s." >&2
-        echo "       Either the classifier dropped a human-tier write, or nothing arrived." >&2
-        echo "       Re-run with DRIFT_DETECTOR_LOG_DROPPED=true on the install to tell which." >&2
-        exit 1
-      fi
-      echo "human card finished; publishing the churn burst"
-
-      # ---- 5. The churn burst -----------------------------------------------
-      churn_principals=(%{for p in var.churn_principals}"${p}" %{endfor})
-      churn_workloads=(%{for w in var.churn_workloads}"${w}" %{endfor})
-      i=0
-      while [ "$i" -lt "${var.churn_record_count}" ]; do
-        id="$(mint_id)"
-        churn_ids+=("$id")
-        publish_record "$id" \
-          "$${churn_principals[$(( i % $${#churn_principals[@]} ))]}" \
-          "${var.churn_namespace}" \
-          "$${churn_workloads[$(( i % $${#churn_workloads[@]} ))]}" \
-          "kube-controller-manager/v1.31.0"
-        i=$(( i + 1 ))
-        # Distinct seconds in the minted ids, and a gentler publish rate than
-        # a tight loop would give the subscription.
-        sleep 1
-      done
-      echo "churn records: $${#churn_ids[@]} published"
-
-      # ---- 6. Prove the burst was consumed, then read the ledger ------------
-      # A timer is not evidence. A fixed settle says only that time passed:
-      # if the detector is backing off (pullBackoffMax 60s) or has just been
-      # relaunched by start-services, the churn is still sitting in the
-      # subscription when the verdict is written, and on a broken filter the
-      # eleven cards land afterwards with nobody reading them -- green on the
-      # regression, which is what this whole fixture exists to prevent.
-      #
-      # So a tracer goes out AFTER the burst, carrying a human-tier principal
-      # so Classify is bound to forward it, and the stack waits for its ledger
-      # row. _inject_drift writes that row at inject time, before any turn and
-      # before the alert ceiling can refuse it, so the row means the detector
-      # pulled and classified something published later than the churn.
-      # Whatever it would have done with the churn, it has already done.
-      tracer_insert_id="$(mint_id)"
-      publish_record "$tracer_insert_id" "${var.human_principal}" \
-        "${var.human_namespace}" "${var.human_workload}" "kubectl-edit/v1.31.0"
-      echo "tracer record: insertId=$tracer_insert_id"
-
-      settled=""
-      waited=0
-      while [ "$waited" -lt "${var.settle_seconds}" ]; do
-        if ledger_has_row "$tracer_insert_id"; then settled=1; break; fi
-        sleep 10
-        waited=$(( waited + 10 ))
-      done
-
-      if [ -z "$settled" ]; then
-        # No tracer row means the pipeline was not consuming during the
-        # settle, so the churn's absence from the ledger says nothing. An
-        # absence that proves nothing must not be scored as a filter holding.
-        write_verdict ingress-silent \
-          "the tracer published after the burst left no ledger row in ${var.settle_seconds}s, so the pipeline was not consuming and the churn read proves nothing"
-        echo "ERROR: the pipeline did not consume a record published after the burst." >&2
-        echo "       The churn read would be an absence with no meaning, so this is excluded." >&2
-        exit 1
-      fi
-
+      # ---- 6. Read the ledger, whatever the card did ------------------------
+      # Unconditional on purpose. A broken filter files eleven extra cards, and
+      # on a board running kanban.max_in_progress at a time that is exactly
+      # what can starve the human card past its timeout -- so the old shape,
+      # which exited on a card timeout before publishing any churn, lost the
+      # finding on the failure most likely to accompany it. The settle is
+      # short insurance against unordered delivery; the card wait above is
+      # what proves the pipeline was consuming.
+      sleep ${var.settle_seconds}
       leaked="$(forwarded_churn "$${churn_ids[@]}")"
       if [ -n "$leaked" ]; then
         write_verdict churn-forwarded \
@@ -595,8 +536,64 @@ resource "null_resource" "drift_noise" {
         exit 0
       fi
 
+      # ---- 7. No leak. Either the filter held, or the card never came -------
+      # Reached only with no churn row, so nothing here is this case's
+      # finding except human-filtered: the rest are the install failing to
+      # give the case what it needs, and each exits non-zero so the
+      # repetition is excluded rather than graded as the agent misbehaving.
+      if [ -z "$card_finished" ]; then
+        row="$(ledger_row "$human_insert_id")"
+        if [ -n "$row" ]; then
+          notified="$${row%%|*}"
+          delivery_error="$${row#*|}"
+          if [ "$notified" = "0" ] && [ -z "$delivery_error" ]; then
+            write_verdict card-quota-refused \
+              "the daily drift ceiling refused the human record before any turn was scheduled; raise ALERT_DAILY_LIMIT_DRIFT or use a fresh install"
+            echo "ERROR: the alert ceiling refused the record; no card was ever coming." >&2
+          else
+            write_verdict card-turn-failed \
+              "the human record was accepted (notified=$notified) but the front-door turn filed no card in ${var.card_timeout_seconds}s"
+            echo "ERROR: the inject landed and the turn filed no card." >&2
+          fi
+          echo "       This is the install, not the agent. Exiting non-zero so the repetition is excluded." >&2
+          exit 1
+        fi
+
+        if detector_forwarded "$human_insert_id"; then
+          write_verdict forwarded-not-recorded \
+            "the detector forwarded the human record (DRIFT line present) and no ledger row followed; the loss is downstream of the filter"
+          echo "ERROR: Classify passed the record and the daemon recorded nothing." >&2
+          echo "       Downstream of the filter, so not this case's finding. Excluding the repetition." >&2
+          exit 1
+        fi
+
+        # A dropped line naming this id is the classifier refusing a human-tier
+        # write, which IS this case's finding in the direction opposite to
+        # churn-forwarded. The line only exists with --log-dropped on, which
+        # the eval install leaves off, so this is reachable on a re-run rather
+        # than in the nightly -- but where the evidence exists the case
+        # reports it instead of throwing the repetition away.
+        if detector_dropped "$human_insert_id"; then
+          write_verdict human-filtered \
+            "the classifier dropped the human record: a dropped line names its insert_id"
+          echo "ERROR: Classify refused a human-tier write. That is the regression." >&2
+          exit 0
+        fi
+
+        # No row and no line of either kind. With --log-dropped off this
+        # install cannot tell a silent classifier drop from a dead ingress,
+        # so it exits non-zero and the repetition is excluded: accusing the
+        # agent on evidence that does not distinguish the two is worse than
+        # scoring nothing.
+        write_verdict ingress-silent \
+          "no ledger row and no detector line for the human record: Classify dropped it or it never arrived; DRIFT_DETECTOR_LOG_DROPPED tells which"
+        echo "ERROR: the human record left no ledger row after ${var.card_timeout_seconds}s." >&2
+        echo "       Re-run with DRIFT_DETECTOR_LOG_DROPPED=true on the install to tell which." >&2
+        exit 1
+      fi
+
       write_verdict ok \
-        "human card finished; tracer $tracer_insert_id consumed after the burst, and no ledger row for any of $${#churn_ids[@]} churn records"
+        "human card finished after the burst, so the pipeline was consuming; no ledger row for any of $${#churn_ids[@]} churn records"
       echo "filter held: card for $human_insert_id finished, no churn forwarded"
     EOT
   }

@@ -216,33 +216,39 @@ variable "agent_container" {
 
 variable "settle_seconds" {
   description = <<-EOT
-    How long to wait after the churn burst before reading the ledger.
+    How long to wait after the card wait before reading the ledger.
 
-    The churn records have to have been pulled and classified before their
-    absence from `intercepted_events` means anything. Too short and a healthy
-    filter and a broken one look identical -- no rows either way -- which is a
-    false green on the regression this case exists to catch.
+    Insurance, not the proof. What establishes that the churn was pulled and
+    classified is the human record's card finishing, because that record was
+    published after the burst. This covers the gap that argument leaves:
+    Pub/Sub makes no ordering guarantee here, so a churn record could in
+    principle still be in flight when a record published after it has already
+    been handled. Short, because the card wait it follows is measured in
+    minutes.
   EOT
   type        = number
   default     = 120
 
   validation {
     condition     = var.settle_seconds >= 30 && floor(var.settle_seconds) == var.settle_seconds
-    error_message = "settle_seconds must be a whole number of at least 30. Zero is the dangerous value, not an invalid one: sleep 0 returns at once, the ledger is read before anything could have been pulled and classified, and a healthy filter and a broken one both show no rows -- the false green this settle exists to prevent."
+    error_message = "settle_seconds must be a whole number of at least 30. Zero is the dangerous value, not an invalid one: sleep 0 removes the only cover for a churn record Pub/Sub delivered out of order, and an absence of rows then means nothing."
   }
 }
 
 variable "card_timeout_seconds" {
   description = <<-EOT
-    How long to wait for the human record's card to reach a terminal status
-    before the burst is published.
+    How long to wait for the human record's card to reach a terminal status.
 
-    The human record goes first and its turn is allowed to finish before any
-    churn is published. That ordering is what makes the ledger read below
-    conclusive: every row this run added after that point is a record the
-    classifier forwarded when it should not have. It also keeps the harness's
-    opening turn off a busy agent -- the agent is one replica, and a card's
-    worker holds it for minutes.
+    The human record is published after the burst, so a card that finished is
+    a record the detector pulled, classified and injected later than the
+    churn -- which is what makes the ledger read below mean a filter that
+    held rather than a queue nobody had drained yet. The wait also keeps the
+    harness's opening turn off a busy agent: the agent is one replica, and a
+    card's worker holds it for minutes.
+
+    Rows are attributed by this run's minted insertIds, not by arrival time,
+    so the publish order never affected attribution -- only what the board
+    looks like while the run is in flight.
 
     Generous on purpose, and sized against the slow environment rather than
     the expected one. The board runs kanban.max_in_progress cards at once
