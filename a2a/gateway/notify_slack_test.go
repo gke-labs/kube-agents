@@ -298,5 +298,29 @@ func TestSlackNotifyRefusesInteractiveBlocks(t *testing.T) {
 	}
 }
 
+// TestSlackNotifyChecksAQualifiedThreadsChannel: a thread qualified by its
+// channel ("<channel>/<ts>", as the kanban stand-in sends it) is admitted
+// only for the home channel and posted on its bare ts; a DM's or another
+// channel's thread is refused, so a card filed there never reports into home.
+func TestSlackNotifyChecksAQualifiedThreadsChannel(t *testing.T) {
+	p := &fakeNotifyPoster{}
+	n := newTestSlackNotifier(t, p)
+	got := serveJSON(t, n, lib.NotifyRequest{Text: "report", Thread: testSlackHome + "/1700000000.000100"})
+	if got.Error != "" {
+		t.Fatalf("a home thread was refused: %+v", got)
+	}
+	if posts := p.all(); len(posts) != 1 || posts[0].space != testSlackHome || posts[0].thread != "1700000000.000100" {
+		t.Fatalf("posts = %+v, want one on the bare ts in home", posts)
+	}
+	for _, thread := range []string{"D0DM/1700000000.000100", "C0OTHER/1700000000.000100", testSlackHome + "/not-a-ts", "/1700000000.000100"} {
+		if got := serveJSON(t, n, lib.NotifyRequest{Text: "report", Thread: thread}); !strings.Contains(got.Error, "not a thread of the home channel") {
+			t.Errorf("thread %q: reply = %+v, want a refusal", thread, got)
+		}
+	}
+	if len(p.all()) != 1 {
+		t.Errorf("a refused thread posted: %+v", p.all())
+	}
+}
+
 var _ notifyPoster = (*SlackAdapter)(nil)
 var _ notifyBlocksPoster = (*SlackAdapter)(nil)

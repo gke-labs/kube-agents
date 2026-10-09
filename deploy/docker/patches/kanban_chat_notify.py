@@ -140,6 +140,9 @@ CONVERSATION_KEY_PREFIXES = ("gchat:", "slack:")
 # The attribute the stand-in is cached under on the runner, which outlives the
 # per-tick collector and the per-delivery notification.
 RUNNER_ATTR = "_kage_chat_notify_adapter"
+# The Slack platform value, whose home threads go out channel-qualified
+# (ChatNotifyAdapter.notify_target).
+SLACK_PLATFORM = "slack"
 RUNNER_CONVERSATION_ATTR = "_kage_chat_notify_conversation_adapter"
 # Where a gateway conversation's route is read back: session-kv's routing
 # table, the same database and key kanban_event_routing reads
@@ -288,8 +291,22 @@ class ChatNotifyAdapter(BasePlatformAdapter):
             self.set_message_handler(handler_factory())
 
     def notify_target(self, chat_id: str, thread: str) -> list:
-        """The argv that addresses the post: a home-channel thread, or none for a new one."""
-        return ["--thread", thread] if thread else []
+        """The argv that addresses the post: a home-channel thread, or none for a new one.
+
+        A Slack thread is a bare ts, which names no channel, so it goes out
+        qualified by the card's own channel ("<channel>/<ts>"); the gateway
+        posts it only when that channel is home. Without that, a card filed in
+        a DM or another channel (under today, delivered after the switch to
+        next) would report into home. A Slack thread with no channel is not
+        sent at all. Chat's thread names its space, which the gateway checks.
+        """
+        if not thread:
+            return []
+        if self.platform.value == SLACK_PLATFORM:
+            if not chat_id:
+                raise LookupError(f"Slack thread {thread} has no channel")
+            return ["--thread", f"{chat_id}/{thread}"]
+        return ["--thread", thread]
 
     def route_down(self) -> bool:
         return time.monotonic() < self._route_down_until

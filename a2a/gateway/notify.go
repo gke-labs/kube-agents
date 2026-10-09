@@ -117,9 +117,13 @@ type Notifier struct {
 	// threadOK is the backend's test that a requested thread may be
 	// replied on. The home channel is the bound either way: Chat's thread
 	// names its space, so it is checked against the home space (inHome);
-	// a Slack thread ts names no channel, so it is only checked for shape
-	// and is always posted into the home channel.
+	// Slack's is "<channel>/<ts>", checked against the home channel, or a
+	// bare ts, which names no channel and is always posted into home
+	// (slackThreadOK).
 	threadOK func(string) bool
+	// threadTS turns an admitted thread into the one the poster takes (Slack's
+	// channel-qualified thread to its bare ts); nil leaves it as it is.
+	threadTS func(string) string
 	// convPrefix is the conversation-key prefix of this backend, and conv
 	// the gateway's conversations; nil leaves conversation requests refused.
 	convPrefix string
@@ -166,8 +170,10 @@ func NewSlackNotifier(poster notifyPoster, home string, log *slog.Logger) (*Noti
 	if log == nil {
 		log = slog.Default()
 	}
-	return &Notifier{subject: lib.NotifySubjectSlack, home: home, poster: poster, log: log,
-		threadOK: slackIsTS, convPrefix: slackKeyPrefix}, nil
+	n := &Notifier{subject: lib.NotifySubjectSlack, home: home, poster: poster, log: log,
+		convPrefix: slackKeyPrefix}
+	n.threadOK, n.threadTS = n.slackThreadOK, slackThreadTS
+	return n, nil
 }
 
 // SetConversations arms requests aimed at a conversation the gateway holds.
@@ -383,6 +389,9 @@ func (n *Notifier) validate(data []byte) (lib.NotifyRequest, *lib.NotifyReply) {
 	if req.Thread != "" && !n.threadOK(req.Thread) {
 		return refuse(fmt.Sprintf("thread %q is not a thread of the home channel", req.Thread))
 	}
+	if req.Thread != "" && n.threadTS != nil {
+		req.Thread = n.threadTS(req.Thread)
+	}
 	if len(req.Blocks) > 0 {
 		if _, ok := n.poster.(notifyBlocksPoster); !ok {
 			return refuse("this backend posts text only; send the request without blocks")
@@ -560,6 +569,27 @@ func blocksInteractive(v any) string {
 		}
 	}
 	return ""
+}
+
+// slackThreadOK admits a Slack reply thread: "<channel>/<ts>" when channel
+// is home, or a bare ts. A bare ts names no channel, so it can only ever
+// thread (or fail to thread) inside home; the qualified form is what a sender
+// that knows the thread's channel sends, so a thread from a DM or another
+// channel is refused rather than posted into home.
+func (n *Notifier) slackThreadOK(thread string) bool {
+	channel, ts, qualified := strings.Cut(thread, "/")
+	if !qualified {
+		return slackIsTS(thread)
+	}
+	return channel == n.home && slackIsTS(ts)
+}
+
+// slackThreadTS is the ts of an admitted Slack thread, qualified or bare.
+func slackThreadTS(thread string) string {
+	if _, ts, qualified := strings.Cut(thread, "/"); qualified {
+		return ts
+	}
+	return thread
 }
 
 // postBlocks writes a Block Kit request as one message: blocks are not
