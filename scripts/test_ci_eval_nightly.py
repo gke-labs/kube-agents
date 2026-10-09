@@ -275,6 +275,20 @@ class GitLabLaneTest(unittest.TestCase):
         self.assertIn("excluded on the inject lane", result.stderr)
         self.assertNotIn("rung 4 is disarmed", result.stdout)
 
+    def test_a_roster_free_lane_with_an_excluded_held_out_case_is_not_stopped(self):
+        """The guard asks whether the exclusion list emptied the roster, not
+        whether the lane holds no roster case: a lane whose cases are all
+        held out, one of them inject-excluded, runs with rung 4 disarmed."""
+        with tempfile.TemporaryDirectory() as tmp:
+            hack = pathlib.Path(tmp) / "hack"
+            shutil.copytree(HACK_DIR / "eval", hack / "eval")
+            (hack / "eval" / "inject-lane-exclusions.txt").write_text("# #2039: a scratch exclusion for the test\npdb-remediation-pr\n")
+            result = load_matrix_through_the_lane_step({"EVAL_FORGE": "gitlab", "AGENT_TRANSPORT": "inject"}, hack_dir=hack)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(lines_tagged(result, "TASK"), ["./tasks/compliance-rbac-overgrant/task.yaml"])
+        self.assertNotIn("excluded on the inject lane", result.stderr)
+        self.assertIn("rung 4 is disarmed on this lane", result.stdout)
+
     def test_a_gitlab_nightly_is_the_whole_catalogue(self):
         result = load_matrix({"EVAL_FORGE": "gitlab", "EVAL_TIER": "nightly"})
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -311,7 +325,7 @@ class GitLabLaneTest(unittest.TestCase):
     def test_an_empty_file_a_missing_file_and_a_bad_path_stop_the_job(self):
         self.refused("# nothing\n", "gitlab-presubmit-cases.txt names no case")
         self.refused(None, "gitlab-presubmit-cases.txt is missing")
-        self.refused("./tasks/no-such-case/task.yaml\n", "gitlab-presubmit-cases.txt", "names no case under bench/tasks/")
+        self.refused("./tasks/no-such-case/task.yaml\n", "gitlab-presubmit-cases.txt", "subset of the presubmit")
 
     def test_the_lane_file_does_not_change_the_github_run_when_broken(self):
         # The file is read only under gitlab, so a GitHub presubmit is not
