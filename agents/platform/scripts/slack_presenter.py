@@ -22,7 +22,7 @@ Every caller reaches it through ``PYTHONPATH=/opt/defaults/scripts``, which the
 operator sets on the agent container.
 
 Everything a caller changes on screen is gated on :func:`enabled`, the
-``KAGE_SLACK_UX`` environment variable, off by default. With it off, callers
+``KAGE_SLACK_UX`` environment variable, on by default. With it off, callers
 take their upstream path unchanged; this module only answers questions.
 
 Layout: :func:`split_answer` takes the headline off an agent's markdown
@@ -62,7 +62,8 @@ from collections.abc import Iterable, Mapping, Sequence
 from typing import Any
 from urllib.parse import urlsplit
 
-#: The flag, and the values that turn it on. Anything else (unset included) is off.
+#: The flag, and the values that keep it on once it is set. Unset is on; any
+#: other value (``false``, ``0``, empty) turns it off.
 FLAG_ENV = "KAGE_SLACK_UX"
 FLAG_ON_VALUES = frozenset({"1", "true", "yes", "on"})
 
@@ -381,8 +382,9 @@ LOWER_WORD = re.compile(r"[a-z]+(?![\w-])")
 
 
 def enabled() -> bool:
-    """Whether ``KAGE_SLACK_UX`` is on in this process's environment."""
-    return os.environ.get(FLAG_ENV, "").strip().lower() in FLAG_ON_VALUES
+    """Whether ``KAGE_SLACK_UX`` is on in this process's environment: unset, or an on value."""
+    value = os.environ.get(FLAG_ENV)
+    return value is None or value.strip().lower() in FLAG_ON_VALUES
 
 
 # --- reactions -------------------------------------------------------------

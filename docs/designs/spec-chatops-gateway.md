@@ -176,7 +176,8 @@ not the whole output story: the gateway authors a small set of posts of its own.
 placeholder that opens a task ("submitted…", which becomes the rolling line the relay
 edits), the status card, the steer acknowledgement, the release line for a task that
 produced no first event inside the grace (its id and the grace; Session lifecycle
-below), and failure notices (a submission or steer that never reached the bus). All
+below), the notice the reap scan posts once when that grace passes with no turn to
+carry the release line, and failure notices (a submission or steer that never reached the bus). All
 are deterministic templates over facts the
 gateway itself owns - its own publishes, its own registry, stream replay - which is
 what keeps them inside the no-model rule. They also say only what the gateway knows:
@@ -185,8 +186,12 @@ next is conditioned on the route the same way the width bias above is, because t
 gateway knows the route and the two executors do different things: on a
 session-routed conversation, that the worker picks it up at its next turn boundary
 if the task is still running; on a fixed-routed one, that the standing executor does
-not take mid-task input and the reply will say so. Neither claims the steer was
-absorbed, which the gateway cannot know. The payload spec's refusal posture - both
+not take mid-task input and the reply will say so. A task with nothing on its stream
+yet gets neither, on either route: both assume an executor holds the task, and none
+has shown it does (a session pod may still be starting, or nothing took the task), so
+the line promises no reply and, when the task has a submission time to measure from,
+says when the conversation frees up. None of these claims
+the steer was absorbed, which the gateway cannot know. The payload spec's refusal posture - both
 the fixed-route refusal and the race-window one - is what closes the loop on the
 stream.
 
@@ -527,7 +532,16 @@ and assertion 9 exists because a task whose only event is its supervisor's termi
 empty. That release publishes no terminal: age alone is not
 evidence, a first event that is merely late could still arrive, and no supervisor path
 ever sees a task with no pod, so its submission ages out with the stream's retention -
-named here rather than papered over. Otherwise the terminal event this chain
+named here rather than papered over. A human who waits rather than writes is told too: the reap scan
+posts one line once the grace has passed with nothing on the stream, naming the task and
+saying the next message starts a new task. It marks the active-task record before it
+posts, so the line goes out at most once per task, across gateway restarts, and it
+releases nothing; the release stays with the next turn, which reads the stream again
+first. The line is for a placeholder somebody may still be watching, so it has a ceiling:
+a task older than three graces (30 minutes by default) gets none, and neither does a
+record the same reap pass deletes past `A2A_SESSION_TTL`. Without the ceiling the first
+pass after a rollout, or after an outage longer than the grace, would post into every
+conversation that wedged in the last week. Otherwise the terminal event this chain
 guarantees is what deletes the active-task record (and the `ask` copy riding it). A
 detached task is the exception on both counts: it does
 not exempt the session, so reap may delete a pod whose harness is still working, and
@@ -1048,9 +1062,17 @@ namespace, no door armed and neither `spec.integration.googleChat` nor `spec.int
 enabled - gets no gateway Deployment at all, its `Ready` counts the rest
 of the stack (NATS, the auth callout, the provisioning Job's first completion, the sandbox, the
 broker, today's gateway), and an `A2AGateway` condition (`status: False`, `Reason: NoChatBackend`) names what
-would render it. The rule is creation-only, like the callout ordering gate: a gateway that
-exists keeps reconciling whatever happened to its backend, because deleting it would take
-every session pod that hangs off its UID. An eval install with this door armed has an ingress
+would render it. A gateway that already exists when its last backend goes is not deleted,
+because deleting it would take every session pod that hangs off its UID, and it is not left at
+one replica either, because that replica exits on `no chat backend` and crash-loops. The
+operator applies it at zero replicas, keeping the object and its UID, and its own NetworkPolicy
+(see "Metrics" below), and writes the same `A2AGateway` condition; `Ready` does not wait on it. So the backend question is asked on every
+pass: the door flags, Chat and Slack answer it without a read, and an install whose only backend is a
+Secret pays one uncached read per pass. When a backend comes back, the next pass applies one
+replica on the same Deployment, and the condition stays, as `WaitingForReplica`, until that
+replica is ready. The dark state shares the reconcile's 30 s requeue, so a Secret, which is
+not watched, is seen within one requeue; a door flag comes back with the operator restart that
+changing it causes, and Chat or Slack with the CR edit. An eval install with this door armed has an ingress
 the guard accepts, by the decision recorded above, and the render counts the door as a backend
 for the same reason. An install that enables Google Chat or Slack under `next` has a backend
 by that fact alone: the render asks the CR before it reads any Secret, and, because the gateway
@@ -1060,12 +1082,13 @@ or Slack gateway starting. With both integrations enabled, Chat holds the gatewa
 stays on the legacy consumer rather than reaching nobody. The Slack refs are rendered on the
 gateway as required references, whatever the CR's own copy says, because the gateway refuses
 half a pair at boot: a missing Secret or key holds the pod at container creation, named in its
-events, instead of starting a pod that exits. The
-rule is creation-only in this direction too: disabling Google Chat on an install whose gateway
-has no other backend re-renders the existing gateway without one, and it exits on
-`no chat backend` until the admin flips the CR to `today` (which tears the stack down), enables
-Slack, creates a `discord-bot` Secret, or deletes the gateway Deployment and its session pods with it - the
-same shape as removing the Secret from under a Discord gateway, reached through the CR.
+events, instead of starting a pod that exits. Disabling Google Chat or Slack on an install whose
+gateway has no other backend takes the same path as removing the Secret from under a Discord
+gateway, or turning off the door an eval gateway started on: the existing gateway goes to zero
+replicas with the condition, its session pods stay, and enabling Chat or Slack again, creating a
+`discord-bot` Secret or arming a door brings it back on the same object. The gateway's
+secret-env digest is stamped only on a pass that renders it with a backend, never on the zero
+apply, so a dark gateway whose Secret is gone costs no read of it.
 
 ## The Google Chat adapter (added 9/5)
 
@@ -1637,7 +1660,8 @@ renders `A2A_METRICS_PORT=9096` and declares container port `a2a-metrics` on 909
 constant (`a2aGatewayMetricsPort`), and the chart's `<name>-a2a-gateway-monitoring`
 `PodMonitoring` scrapes 9096 every 30 seconds behind the `platformAgent.podMonitoring` switch. The
 gateway's own NetworkPolicy, `<name>-a2a-gateway-netpol`, renders wherever the gateway Deployment
-does, door or no door, and admits one peer: the `gke-gmp-system` namespace, to 9096 alone, the
+does, door or no door, including a gateway scaled to zero replicas for want of a backend (only the
+stack's teardown removes it), and admits one peer: the `gke-gmp-system` namespace, to 9096 alone, the
 broker's second rule with the gateway's port in it. Each armed door renders a copy under its own
 name, and the doors' ports admit no pod. The gateway's fence used to render only with a door, which
 left the metrics port, bound on every interface, reachable from the whole pod network on an install

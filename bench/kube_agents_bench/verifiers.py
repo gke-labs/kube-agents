@@ -3435,8 +3435,10 @@ class GitHubWritesVerifier(BaseVerifier):
     with ``op: exists`` under ``none``. The inject lane appends exactly that
     entry to every case it runs (``hack/eval/inject-lane-safeguards.yaml``,
     applied by ``hack/ci-eval-pr.sh``), because the cluster safeguards say
-    nothing about GitHub and the platform persona the door addresses opens a
-    pull request where the chat path inlined a manifest (#2037).
+    nothing about GitHub and the platform persona the door's task reaches
+    (directly under the bridge's ``cli`` executor, through a card under the
+    bridge's default ``api``) opens a pull request where the chat path
+    inlined a manifest (#2037).
 
     WHAT IT READS. :func:`kube_agents_bench.github_writes.find_writes` over
     the repository ``BENCH_GITOPS_REPO`` names, from
@@ -3477,7 +3479,12 @@ class GitHubWritesVerifier(BaseVerifier):
     ``EVAL_GITHUB_WRITE_SETTLE_SECONDS``, pinned equal by a test), so two
     requesting cases never see each other's by-design pull requests and no
     window reaches back into the unit before; each is graded on the pull
-    requests its own reply names.
+    requests its own reply names. That ordering holds only while a task's
+    writes land before its terminal. On the inject lane under the bridge's
+    ``api`` executor, the Planning Agent can file a kanban card and answer,
+    and the card's worker opens the pull request after the terminal, so the
+    write can land in the next unit's window and be charged to it (#2619,
+    #2611).
     A pull request that was only commented on, labelled or closed in the
     window is not a write: :func:`kube_agents_bench.github_writes.find_writes`
     reads the head commit before it counts an ``updated_at`` that moved.

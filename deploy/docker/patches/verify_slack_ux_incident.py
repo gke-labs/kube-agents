@@ -39,6 +39,8 @@ NOTIFIER = "gateway/kanban_watchers_notifier.py"
 RUNTIME = "gateway/slack_ux_incident.py"
 BLOCK_KIT = "plugins/platforms/slack/block_kit.py"
 FLAG_ENV = "KAGE_SLACK_UX"
+#: Unset is on, so the flag-off path needs a value.
+FLAG_OFF = "false"
 DB_PATH_ENV = "SESSION_KV_DB_PATH"
 
 METHOD = "_send_event"
@@ -158,11 +160,14 @@ async def _drive(module, db_path: str, expected_fold: list[dict]) -> None:
     event = SimpleNamespace(kind="completed")
     task = SimpleNamespace(result=REPORT)
     sub = {"chat_id": CHANNEL, "thread_id": ALERT_TS}
-    os.environ.pop(FLAG_ENV, None)
+    os.environ[FLAG_ENV] = FLAG_OFF
     os.environ[DB_PATH_ENV] = db_path
     try:
         if module.adapter_for(adapter, "slack", event, task, sub) is not adapter:
-            raise _fail(f"adapter_for() wrapped the adapter with {FLAG_ENV} unset")
+            raise _fail(f"adapter_for() wrapped the adapter with {FLAG_ENV}={FLAG_OFF}")
+        os.environ.pop(FLAG_ENV, None)
+        if not module.enabled():
+            raise _fail(f"enabled() is false with {FLAG_ENV} unset, which is on")
         os.environ[FLAG_ENV] = "1"
         wrapped = module.adapter_for(adapter, "slack", event, task, sub)
         if wrapped is adapter:

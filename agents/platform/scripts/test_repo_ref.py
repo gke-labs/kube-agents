@@ -209,8 +209,9 @@ class IsGithubSlugTest(unittest.TestCase):
     def test_the_owner_slot_may_not_be_a_spelling_of_github(self):
         """`github.com/acme` fails on depth; the other two need the host check.
 
-        Only `github.com` is in `KNOWN_HOSTS`, so it alone is lifted out of the
-        path and leaves a one-segment remainder. `www.` and `ssh.` stay in the
+        Of GitHub's spellings only `github.com` is in `KNOWN_HOSTS` (beside
+        `gitlab.com`), so it alone is lifted out of the path and leaves a
+        one-segment remainder. `www.` and `ssh.` stay in the
         path and would otherwise read as an owner — one GitHub cannot issue,
         since a namespace may not contain a dot, and one that reaches Minty as
         an org name if this predicate says yes.
@@ -305,6 +306,20 @@ class KnownHostsTest(unittest.TestCase):
 
     def test_the_canonical_spelling_lifts(self):
         self.assertEqual(repo_ref.parse("github.com/acme/toolkit").host, "github.com")
+
+    def test_gitlab_com_lifts_and_is_no_github_owner(self):
+        """Before gitlab.com was a known host, `gitlab.com/acme` read as a
+        hostless GitHub slug whose owner was `gitlab.com` -- a repository on a
+        forge the value did not name."""
+        ref = repo_ref.parse("gitlab.com/acme/platform/infra")
+        self.assertEqual((ref.host, ref.path), ("gitlab.com", "acme/platform/infra"))
+        self.assertTrue(ref.host_inferred)
+        self.assertFalse(repo_ref.is_github_slug("gitlab.com/acme"))
+        self.assertIsNone(repo_ref.try_github_slug("gitlab.com/acme"))
+
+    def test_a_self_managed_host_is_not_lifted_here(self):
+        ref = repo_ref.parse("gitlab.example.com/acme/infra")
+        self.assertEqual(ref.host, "")
 
     def test_a_remote_only_spelling_does_not(self):
         """`KNOWN_HOSTS` is not `GITHUB_HOSTS`: git produces `ssh.github.com`

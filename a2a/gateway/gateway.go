@@ -50,6 +50,17 @@ const relayDurable = "gateway-relay"
 // the evidence (nothing on the stream in that long), not the inference.
 const neverStartedNotice = "⚠️ task `%s` has produced nothing on its event stream in %s, so this conversation is released and this message is handled as a new turn"
 
+// steerNoFirstEventAck is the steer acknowledgement for a task with nothing
+// on its event stream yet: the steer is on the stream, but no executor has
+// shown it holds the task (a session pod may still be starting, or nothing
+// took it), so the line promises no reply. When the task has
+// an age, steerNoFirstEventRelease follows it and says when the conversation
+// is released instead (the grace the heal judges by).
+const (
+	steerNoFirstEventAck     = "✏️ steering sent — task `%s` has shown nothing on its event stream yet, so no reply is promised: it may still be starting, or nothing may have taken it"
+	steerNoFirstEventRelease = "; if it is still silent %s after it was submitted, your next message here starts a new task"
+)
+
 // Hex-suffix widths for the ids the gateway mints. Context and correlation
 // ids are wider than task and message ids: they outlive one task and join
 // records across surfaces, so a collision costs more.
@@ -143,6 +154,11 @@ type Gateway struct {
 	// reapScanHook is an optional test hook invoked during reap passes on each visited record.
 	// Returning false halts the reap scan early.
 	reapScanHook func(rec *SessionRecord) bool
+	// noticeStreamReadHook is an optional test hook invoked with the task ID
+	// each time firstEventOverdue gets past its age and prune bounds and
+	// reads the stream, so a test can show the notice's read was reached
+	// rather than answered by a bound.
+	noticeStreamReadHook func(taskID string)
 	// terminalReplayHook is an optional test hook: a non-nil error from it
 	// fails relayTerminal's replay of the task's stream, as a transport
 	// error would.
@@ -1053,8 +1069,7 @@ func (g *Gateway) healActiveTask(ctx context.Context, rec *SessionRecord) {
 		// observeChildEnd.
 		g.observeEnded(rec, active.TaskID, task.State, source, finalMessageText(task))
 		healed, healedSource, healedTask = true, source, task
-	case isTaskNotFound(err) && !active.SubmittedAt.IsZero() &&
-		time.Since(active.SubmittedAt) > g.cfg.FirstEventGrace:
+	case noFirstEventPastGrace(active, isTaskNotFound(err), g.cfg.FirstEventGrace, time.Now()):
 		g.log.Info("healing an active task with no first event inside the grace",
 			"conversation", rec.Key, "taskId", active.TaskID, "addressee", addressee,
 			"age", time.Since(active.SubmittedAt).Round(time.Second), "grace", g.cfg.FirstEventGrace)
@@ -2194,10 +2209,23 @@ func (g *Gateway) steerTask(ctx context.Context, rec *SessionRecord, msg Inbound
 	// amended 8/31) - a session worker absorbs at its next turn boundary if
 	// the task is still running; the fixed-route executor refuses mid-task
 	// input and publishes its refusal itself. Neither line claims the steer
-	// was absorbed, which the gateway cannot know.
-	if rec.AddressedToOwnSession() {
+	// was absorbed, which the gateway cannot know. Both assume an executor
+	// holds the task, so a task with nothing on its stream gets neither: no
+	// executor has shown it took the task, which is a pod still starting or
+	// nothing at all, and the line promises no reply. A read that fails says
+	// nothing either way and keeps the route's line. The read is direct gets
+	// (taskStreamEmpty), not a replay, so a steer opens no consumer.
+	empty, emptyErr := g.taskStreamEmpty(ctx, rec.AddresseeFor(active.TaskID), active.TaskID)
+	switch {
+	case emptyErr == nil && empty:
+		ack := fmt.Sprintf(steerNoFirstEventAck, active.TaskID)
+		if !active.SubmittedAt.IsZero() {
+			ack += fmt.Sprintf(steerNoFirstEventRelease, g.cfg.FirstEventGrace)
+		}
+		g.post(rec.Key, ack)
+	case rec.AddressedToOwnSession():
 		g.post(rec.Key, "✏️ steering sent — the worker picks it up at its next turn boundary if the task is still running")
-	} else {
+	default:
 		g.post(rec.Key, "✏️ steering sent — the standing executor does not take mid-task input; its reply will say so")
 	}
 }

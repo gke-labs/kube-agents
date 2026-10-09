@@ -102,8 +102,11 @@ const (
 	// credentialProxyRequestReserveBytes per admitted request, and admits a
 	// request only when the reservations plus the output allowance of the
 	// slots in use fit the limit less credentialProxyResidentReserveBytes and
-	// credentialProxyWorkspaceReserveBytes -- four at once at the 1Gi below,
-	// with the slot cap as the upper bound. The sizing test in
+	// credentialProxyWorkspaceReserveBytes -- nine at once at the 2Gi below,
+	// held to eight by the slot cap (credentialProxyMaxConcurrentCommands),
+	// which is the upper bound. 2Gi rather than the earlier 1Gi (four at once)
+	// because the default kanban cap is six workers, and each can have a
+	// brokered command in flight. The sizing test in
 	// platformagent_manifests_test.go and ValidateCredentialProxyResources
 	// hold the limit to at least two. An install raises the limit through
 	// spec.deployment.credentialProxy.resources (resolveCredentialProxyResources
@@ -127,7 +130,7 @@ const (
 	// the container's allowance rather than the node's disk. A CR override
 	// that sets only limits.memory keeps all three of the others.
 	credentialProxyCPULimit              = "1"
-	credentialProxyMemoryLimit           = "1Gi"
+	credentialProxyMemoryLimit           = "2Gi"
 	credentialProxyEphemeralStorageLimit = "2Gi"
 	// The emptyDir sizeLimits of the broker's /tmp and of its state volume (the
 	// content workspace and vcs scratch). The kubelet evicts the pod when either
@@ -525,7 +528,7 @@ func buildCredentialProxyVolumeMounts(agent *agentv1alpha1.PlatformAgent) []core
 			ReadOnly:  true,
 		})
 	}
-	return mounts
+	return append(mounts, buildVCSForgesVolumeMounts(agent)...)
 }
 
 // buildCredentialProxyFederationEnv points the proxy's Google clients at a token
@@ -733,6 +736,7 @@ func buildCredentialProxyRuntimeVolumes(agent *agentv1alpha1.PlatformAgent) []co
 		}
 	}
 	volumes = append(volumes, buildGitopsStateVolume(agent))
+	volumes = append(volumes, buildVCSForgesVolumes(agent)...)
 	return append(volumes, buildCredentialProxyFederationVolume(agent)...)
 }
 

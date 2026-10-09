@@ -31,8 +31,11 @@ package v1alpha1
 // The two are counterparts, not a port: they agree on every shape an install
 // produces, and knowingly differ on one. A schemeless `www.github.com/o/r` or
 // `ssh.github.com/o/r` is lifted here to a GitHub host, because the CRD has
-// admitted it, while `repo_ref.py` lifts only `github.com` and reads the rest
-// as a three-segment hostless path. The operator therefore never writes either
+// admitted it, while `repo_ref.py` lifts only each forge's default host
+// (`github.com`, `gitlab.com`) and reads the rest as a three-segment hostless
+// path. A self-managed GitLab host is lifted here from the forge it was
+// declared on; on the agent side the broker's registry, which knows the hosts
+// the install configured, lifts it. The operator therefore never writes either
 // spelling into the state ConfigMap, and does not count one written there by
 // hand as the repository it seeds.
 //

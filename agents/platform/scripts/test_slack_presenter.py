@@ -28,9 +28,9 @@ MARKUP_REPEATS = 10_000
 
 
 class FlagTest(unittest.TestCase):
-    def test_off_by_default(self):
+    def test_on_by_default(self):
         with mock.patch.dict(os.environ, {}, clear=True):
-            self.assertFalse(sp.enabled())
+            self.assertTrue(sp.enabled())
 
     def test_on_values(self):
         for value in ("1", "true", "TRUE", " yes ", "on"):

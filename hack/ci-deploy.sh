@@ -49,7 +49,7 @@ readonly EVAL_ALERT_DAILY_LIMIT_WARNING="0"
 # What that costs, stated rather than discovered: one lease deploys one install
 # and runs the whole matrix against it, so this ceiling is off for every case
 # rather than for drift ones, and the board it fills is shared
-# (kanban.max_in_progress is 2). A single human-tier record therefore files
+# (kanban.max_in_progress is 5 on this install). A single human-tier record therefore files
 # unbounded cards and can starve unrelated cases in the same lease. On a leased
 # pool project almost every principal is a service account and the classifier
 # drops it, so the steady state is quiet; the triggers are a maintainer running
@@ -120,13 +120,13 @@ readonly EVAL_DRIFT_READY_INTERVAL_SECONDS=5
 # record and why, and that is worth a targeted rerun rather than every lease.
 
 # The kanban board's worker cap on the eval install. The image ships
-# kanban.max_in_progress: 2 (agents/chat/config.yaml), a floor for an install
-# that has not measured its own worker footprint, and the operator renders a
-# different cap only when the CR carries spec.harness.tuning.maxInProgress.
-# The eval fans its units out at EVAL_TASK_PARALLELISM (4 on a pull request,
-# 8 on the nightly since oss-test-infra#2707), and nearly every unit's
-# opening turn delegates one platform card, so on the image default most
-# lanes queue behind two slots: a queued card waits out the cards ahead of
+# kanban.max_in_progress: 6 (agents/chat/config.yaml), and the operator renders
+# a different cap only when the CR carries spec.harness.tuning.maxInProgress.
+# The eval deliberately runs below that production default, at five. It fans
+# its units out at EVAL_TASK_PARALLELISM (4 on a pull request, 8 on the
+# nightly since oss-test-infra#2707), and nearly every unit's opening turn
+# delegates one platform card. The override was added when the image default
+# was two, where most lanes queued: a queued card waits out the cards ahead of
 # it and then runs its own 10-45 minutes, past the 2700-3000s delegation
 # ceiling with no worker at fault, while the dispatcher logs the same "ready
 # queue non-empty ... 0 workers spawned" warning a wedged worker produces
@@ -135,24 +135,29 @@ readonly EVAL_DRIFT_READY_INTERVAL_SECONDS=5
 # delegation by the v2026.9.14 base's approval-regex hang on large terminal
 # commands, a separate holder of the same slots that the Hermes bump removes.
 #
-# Five, not the lane count. The cap bounds ACTIVE workers, and a coordinator
-# waiting on the children it fanned out gives its slot back but stays
-# resident (deploy/docker/patches/kanban_scheduling.py, Part 4), so the
-# process count is the cap plus the waiting coordinators. The gateway
-# container's 8Gi memory limit (resolveResources in
-# k8s-operator/internal/controller/manifest_helpers.go) was sized for five
-# concurrent workers over a 1.8GiB idle set, and a worker the cgroup OOM
-# killer takes strands its card with no restart and no event: the same shape
-# as the queue this removes, indistinguishable from it in the run record. So
-# the cap stops where the sizing stops: five covers the pull request's four
-# lanes with one slot for a fan-out child, and the nightly's eight lanes
-# still queue three deep until the working set at five is measured and the
-# eval install's memory limit is raised together with the cap (the CR patch
-# hack/kind-up.sh makes after helm is the shape; #2032 carries the
-# measurement). Set on this install only, so the production default stays
-# where the CRD reference argues it should. tests/test_ci_deploy_kanban_cap.py
-# pins the flag, the floor under the pull request's lanes, the ceiling the
-# memory limit was sized for, and the chart rendering the value onto the CR.
+# Five, not the lane count and not the production six. The cap bounds ACTIVE
+# workers, and a coordinator waiting on the children it fanned out gives its
+# slot back but stays resident (deploy/docker/patches/kanban_scheduling.py,
+# Part 4), so the process count is the cap plus the waiting coordinators. A
+# worker the cgroup OOM killer takes strands its card with no restart and no
+# event: the same shape as the queue this removes, indistinguishable from it
+# in the run record. The gateway's 8Gi limit (resolveResources in
+# k8s-operator/internal/controller/manifest_helpers.go) holds about fourteen
+# workers at the ~430 MiB one measured live over the 1.8 GiB idle set, so six
+# active plus their waiting coordinators fit on paper, but the eval's working
+# set at more than five has not been measured (#2032), so the eval holds at
+# five. The lanes' cards arrive through the inject and A2A doors and are user
+# cards, and at a cap of 2 or more each class may hold every slot but the one
+# guaranteed to the other (deploy/docker/patches/kanban_priority.py). At five
+# that leaves four for user cards: exactly the pull request's four lanes
+# (EVAL_TASK_PARALLELISM_DEFAULT below), with the fifth held for event triage.
+# A lane's fan-out child runs in the slot its waiting coordinator gives back.
+# The nightly's eight lanes still queue four deep. Raising the cap belongs with
+# that measurement. Each class may hold four of the five slots here, against
+# five of six in production. Set on this install only.
+# tests/test_ci_deploy_kanban_cap.py pins the flag, the floor (the lanes plus
+# triage's slot), the eval's ceiling, and the chart rendering the value onto
+# the CR.
 readonly EVAL_KANBAN_MAX_IN_PROGRESS="5"
 
 # The release step 5 installs, and — for the poisoned-record guard (#1172) —
@@ -209,7 +214,7 @@ readonly SANDBOX_SSH_KEY_COMMENT="kube-agents-ci-eval"
 #     the platform-agent image of the same build;
 #   - step 5 passes those references to the operator through the chart's
 #     operator.extraEnv, which the operator reads as its image overrides,
-#     with the bridge's concurrency and executor pin beside them, and arms
+#     with the bridge's concurrency beside them, and arms
 #     the gateway's inject door the same way (A2A_INJECT_BACKEND=true);
 #   - step 6b patches the CR (the mode, and the maxSessions section 2b sized
 #     for the bridge's workers), waits for the agent Deployment to roll, gates
@@ -273,13 +278,16 @@ readonly A2A_INJECT_BACKEND_ON="true"
 # it must not mount are the operator's, not this script's. The script names
 # the container only to read its log (a2aBridgeContainerName).
 readonly BRIDGE_SIDECAR_NAME="hermes-bridge"
-# The lane pins the bridge's subprocess executor. The rendered bridge copies
-# the agent container's API_SERVER_KEY, so left unset the bridge would pick
-# its api executor, whose turns the pod's API server answers with its own
-# profile rather than the platform persona the lane's cases were graded
-# against. The pin holds until cases have been graded on api
-# (docs/designs/eval-next-transport.md).
-readonly BRIDGE_EXECUTOR_PINNED="cli"
+# The lane runs the bridge's shipped default executor, api, the one a customer
+# install runs. Nothing here sets it: with the operator's A2A_BRIDGE_EXECUTOR
+# unset the rendered bridge carries no BRIDGE_EXECUTOR, and the bridge picks
+# api when BRIDGE_EXECUTOR is unset and the API_SERVER_KEY it copies from the
+# agent container is present (bridgeExecutor in a2a/cmd/hermes-bridge/main.go).
+# A bridge without the key falls back to cli with a warning, so the start-line
+# wait below requires this executor rather than trusting the default. Under api
+# a task is a turn in the pod's Hermes API server, whose profile is the chat
+# path's own (docs/designs/eval-next-transport.md, "What the lane grades").
+readonly BRIDGE_EXECUTOR_EXPECTED="api"
 # BRIDGE_CONCURRENCY is sized against the matrix's fan-out: hack/ci-eval-pr.sh
 # runs EVAL_TASK_PARALLELISM units at once from the same job environment,
 # defaulting to 4 (the nightly sets 8), and every unit past the bridge's
@@ -289,7 +297,11 @@ readonly BRIDGE_EXECUTOR_PINNED="cli"
 # tests/test_ci_deploy_mode_next.py. The queue behind the workers holds 1024
 # (taskQueueCapacity in a2a/hermes-bridge/bridge.go) before the bridge
 # finalizes an accepted task as `bridge-queue-overflow`; a fan-out of 4 or 8
-# never approaches it, so the bound below catches a typo, not a sizing.
+# never approaches it, so the bound below catches a typo, not a sizing. Under
+# the api executor each worker's turn also counts against the pod's Hermes API
+# server cap, gateway.api_server.max_concurrent_runs (10 by default at the
+# pinned hermes-agent tag), which kanban card-completion wakes share; a turn
+# refused there ends `hermes-rate-limited`, infrastructure, not graded.
 readonly EVAL_TASK_PARALLELISM_DEFAULT=4
 readonly BRIDGE_QUEUE_CAPACITY=1024
 # The TASKS consumer budget's terms, as the operator sizes it
@@ -315,12 +327,14 @@ readonly A2A_SESSION_CONSUMERS=3
 readonly A2A_RESERVE_FIXED=20
 readonly A2A_RESERVE_PER_WORKER=6
 # The line the bridge logs once its durable consumer is bound
-# (a2a/hermes-bridge/bridge.go, Run): a JSON record with these two fields.
+# (a2a/hermes-bridge/bridge.go, Run): a JSON record with these three fields.
 # Until it appears the bus has an executor for nobody, and every case on the
 # inject transport ends as infrastructure.
 readonly BRIDGE_CONSUMING_LOG_MSG='"msg":"hermes bridge consuming"'
 readonly BRIDGE_CONSUMING_LOG_PROFILE='"profile":"platform"'
-readonly BRIDGE_CONSUMING_LOG_EXECUTOR='"executor":"cli"'
+# The executor field of that line, for BRIDGE_EXECUTOR_EXPECTED; a bridge that
+# fell back to cli logs the same line with "executor":"cli" and fails the wait.
+readonly BRIDGE_CONSUMING_LOG_EXECUTOR='"executor":"api"'
 readonly MODE_NEXT_BRIDGE_LOG_ATTEMPTS=60
 # The provisioning Job depends on NATS and on the callout. The operator now
 # creates it only once a callout replica serves (#1702); before that its
@@ -405,14 +419,15 @@ readonly A2A_CALLOUT_IMAGE_ENV_VAR="A2A_CALLOUT_IMAGE"
 readonly A2A_WORKER_IMAGE_ENV_VAR="A2A_WORKER_IMAGE"
 readonly A2A_VERIFIER_IMAGE_ENV_VAR="A2A_VERIFIER_IMAGE"
 readonly A2A_CONSOLE_IMAGE_ENV_VAR="A2A_CONSOLE_IMAGE"
-# The rendered bridge's three operator settings (a2aBridgeImageEnvVar,
-# a2aBridgeConcurrencyOperatorEnvVar and a2aBridgeExecutorOperatorEnvVar in
-# platformagent_a2a_bridge.go): its image, its BRIDGE_CONCURRENCY and its
-# BRIDGE_EXECUTOR. The operator reads them from its own environment, as it
-# does the overrides above; no CR field carries them.
+# Two of the rendered bridge's three operator settings (a2aBridgeImageEnvVar
+# and a2aBridgeConcurrencyOperatorEnvVar in platformagent_a2a_bridge.go): its
+# image and its BRIDGE_CONCURRENCY. The operator reads them from its own
+# environment, as it does the overrides above; no CR field carries them. The
+# third, A2A_BRIDGE_EXECUTOR, is left unset (BRIDGE_EXECUTOR_EXPECTED says why).
 readonly A2A_BRIDGE_IMAGE_ENV_VAR="A2A_BRIDGE_IMAGE"
 readonly A2A_BRIDGE_CONCURRENCY_ENV_VAR="A2A_BRIDGE_CONCURRENCY"
-readonly A2A_BRIDGE_EXECUTOR_ENV_VAR="A2A_BRIDGE_EXECUTOR"
+# Named only for the diagnosis when the bridge logs another executor.
+readonly A2A_BRIDGE_EXECUTOR_OPERATOR_ENV_VAR="A2A_BRIDGE_EXECUTOR"
 readonly A2A_GATEWAY_IMAGE_NAME="a2a-gateway"
 readonly A2A_CALLOUT_IMAGE_NAME="a2a-authcallout"
 readonly A2A_WORKER_IMAGE_NAME="a2a-worker"
@@ -489,9 +504,9 @@ if [ -n "${RC_COMMIT_SHA:-}" ]; then
   # others, and the operator derives the references it renders, but this
   # path hands the operator none of the settings step 4 puts
   # in A2A_OPERATOR_ENV_ARGS: no inject door, so the eval's transport has no
-  # Service to reach, and no bridge concurrency or executor pin, so the
-  # bridge would run 2 workers on the api executor. Refuse the pair here
-  # rather than forty minutes in.
+  # Service to reach, and no bridge concurrency, so the bridge would not be
+  # sized to the matrix's fan-out. Refuse the pair here rather than forty
+  # minutes in.
   if [ "${EVAL_MODE_NEXT:-}" = "1" ]; then
     echo "ERROR: EVAL_MODE_NEXT=1 is set together with RC_COMMIT_SHA. The mode-next flip needs" >&2
     echo "       the pull-request build path, which hands the operator the inject door and the" >&2
@@ -1178,8 +1193,9 @@ else
   # reads from its own environment and never from the CR (a2aInjectBackendEnvVar
   # says why): without it there is no Service for the eval's transport to
   # reach. The bridge's reference goes to the operator the same way, with its
-  # concurrency and executor pin: the operator renders the bridge sidecar
-  # into the agent pod under next and reads all three from its environment.
+  # concurrency: the operator renders the bridge sidecar into the agent pod
+  # under next and reads both from its environment. Its executor is left to
+  # the bridge's default (BRIDGE_EXECUTOR_EXPECTED).
   A2A_BUILD_SUBSTITUTIONS=""
   if [ "${EVAL_MODE_NEXT:-}" = "1" ]; then
     A2A_GATEWAY_URI="${AR_REPO}/${A2A_GATEWAY_IMAGE_NAME}:${TAG}"
@@ -1206,14 +1222,13 @@ else
       --set-string "operator.extraEnv[4].value=${A2A_CONSOLE_URI}"
       --set-string "operator.extraEnv[5].name=${A2A_INJECT_BACKEND_ENV_VAR}"
       --set-string "operator.extraEnv[5].value=${A2A_INJECT_BACKEND_ON}"
-      # The rendered bridge: its image, the concurrency section 2b admitted
-      # (the TASKS budget reads the same value), and the executor pin.
+      # The rendered bridge: its image and the concurrency section 2b admitted
+      # (the TASKS budget reads the same value). No executor: the lane runs
+      # the bridge's default, api.
       --set-string "operator.extraEnv[6].name=${A2A_BRIDGE_IMAGE_ENV_VAR}"
       --set-string "operator.extraEnv[6].value=${A2A_BRIDGE_URI}"
       --set-string "operator.extraEnv[7].name=${A2A_BRIDGE_CONCURRENCY_ENV_VAR}"
       --set-string "operator.extraEnv[7].value=${MODE_NEXT_BRIDGE_CONCURRENCY}"
-      --set-string "operator.extraEnv[8].name=${A2A_BRIDGE_EXECUTOR_ENV_VAR}"
-      --set-string "operator.extraEnv[8].value=${BRIDGE_EXECUTOR_PINNED}"
     )
     echo "EVAL_MODE_NEXT=1: also building the A2A gateway, auth callout, worker, verifier and console images and the Hermes bridge sidecar"
   fi
@@ -1503,8 +1518,8 @@ echo "✓ Rollout verification finished in $((SECONDS - STEP_START))s"
 # waited for (the operator renders them only with the flag step 5 set on it;
 # hack/ci-eval-pr.sh reads that Secret). The bridge sidecar is the
 # operator's: it budgets it from the first next render and adds it to the
-# agent pod once the bus is provisioned, with the image, BRIDGE_CONCURRENCY
-# and executor pin step 5 set on it
+# agent pod once the bus is provisioned, with the image and BRIDGE_CONCURRENCY
+# step 5 set on it and the bridge's default executor
 # (a2a/docs/hermes-bridge.md, "Where it runs"), so the mode patch is the only
 # patch and the first provisioning Job already budgets the bridge's workers:
 # no second render re-measures that budget against the stream the Job
@@ -1948,6 +1963,8 @@ if [ "${EVAL_MODE_NEXT:-}" = "1" ]; then
   done
   if [ -z "${BRIDGE_CONSUMING}" ]; then
     echo "ERROR: the ${BRIDGE_SIDECAR_NAME} sidecar never logged ${BRIDGE_CONSUMING_LOG_MSG} with ${BRIDGE_CONSUMING_LOG_PROFILE} and ${BRIDGE_CONSUMING_LOG_EXECUTOR}"
+    echo "       The lane runs the bridge's default executor, ${BRIDGE_EXECUTOR_EXPECTED}. A consuming line with another executor means the"
+    echo "       bridge started without the agent container's API_SERVER_KEY, or the operator sets ${A2A_BRIDGE_EXECUTOR_OPERATOR_ENV_VAR}."
     echo "--- ${BRIDGE_SIDECAR_NAME} log ---"
     kubectl logs -n "${NAMESPACE}" "deployment/${AGENT_DEPLOYMENT_NAME}" -c "${BRIDGE_SIDECAR_NAME}" --tail="${MODE_NEXT_DIAG_LOG_LINES}" || true
     kubectl logs -n "${NAMESPACE}" "deployment/${AGENT_DEPLOYMENT_NAME}" -c "${BRIDGE_SIDECAR_NAME}" --previous --tail="${MODE_NEXT_DIAG_LOG_LINES}" 2>/dev/null || true

@@ -539,6 +539,11 @@ spec:
   {{- if not (hasKey $props "forges") }}
   {{- fail "platformAgent.integration.forges needs a PlatformAgent CRD that has the field, and helm upgrade does not update CRDs; apply charts/kube-agents/crds/ first (kubectl apply --server-side -f charts/kube-agents/crds/)" }}
   {{- end }}
+  {{- /* The same for the provider enum: an installed CRD older than gitlab refuses the CR at apply, after helm has started. */}}
+  {{- $enum := dig "forges" "items" "properties" "provider" "enum" (list) $props }}
+  {{- if and (has "gitlab" (splitList "," $providers)) (not (has "gitlab" $enum)) }}
+  {{- fail "platformAgent.integration.forges declares a gitlab forge, but the installed PlatformAgent CRD does not accept provider gitlab, and helm upgrade does not update CRDs; apply charts/kube-agents/crds/ first (kubectl apply --server-side -f charts/kube-agents/crds/)" }}
+  {{- end }}
   {{- if and $pinned (not (hasKey (dig "repositories" "items" "properties" (dict) $props) "baseBranch")) }}
   {{- fail "platformAgent.integration.repositories[].baseBranch needs a PlatformAgent CRD that has the field, and helm upgrade does not update CRDs; apply charts/kube-agents/crds/ first (kubectl apply --server-side -f charts/kube-agents/crds/)" }}
   {{- end }}

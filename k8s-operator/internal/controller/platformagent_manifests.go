@@ -1028,7 +1028,17 @@ const clusterProfileClassKey = "profileclass-cluster" + profileOverlaySuffix
 // can be compared against it, and so the two files can be kept in step. The one place it
 // IS rendered is frontDoorKanban, where there is no image copy to defer to: the platform
 // profile's config declares no `kanban` key at all.
-const defaultKanbanMaxInProgress = 2
+//
+// One slot of the cap is guaranteed to each class of card, user and background
+// (deploy/docker/patches/kanban_priority.py), and the four between are shared. A worker
+// measured about 430 MiB, so six are about 2.6 GiB over the 1.8 GiB idle set, under the
+// gateway's 8Gi limit (resolveResources), with room for waiting coordinators, which stay
+// resident without holding a slot. The credential proxy's 2Gi default admits nine
+// brokered commands at once (credentialProxyAdmittedRequests; the slot cap holds it to
+// eight, shared with the listing pools).
+// TestCredentialProxyBudgetArithmeticAtTheDefaults fails if the proxy's default stops
+// admitting at least this many.
+const defaultKanbanMaxInProgress = 6
 
 // defaultProfileLimits, platformProfileLimits and clusterProfileLimits read
 // spec.harness.tuning, tolerating every level being nil.
@@ -3664,6 +3674,9 @@ func buildCredentialProxyPolicyConfigMap(agent *agentv1alpha1.PlatformAgent) *co
 	if pool := scopedSAPoolJSON(agent); pool != "" {
 		data[scopedSAPoolKey] = pool
 	}
+	if forges := vcsForgesJSON(agent); forges != "" {
+		data[vcsForgesKey] = forges
+	}
 	return &corev1.ConfigMap{
 		TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "ConfigMap"},
 		ObjectMeta: metav1.ObjectMeta{
@@ -4123,6 +4136,10 @@ func buildCredentialProxyEnv(agent *agentv1alpha1.PlatformAgent) []corev1.EnvVar
 	} else {
 		envVars = append(envVars, corev1.EnvVar{Name: "CREDENTIAL_PROXY_SCOPED_SA_POOL", Value: "0"})
 	}
+	// Declared here, in the managed set, so mergeCredentialProxyEnv reserves
+	// the name: a CR env entry must not point the broker at a configuration
+	// the operator did not render.
+	envVars = append(envVars, buildVCSForgesEnv(agent)...)
 	// What the broker's own Pod changes about its configuration. The agent-API
 	// front door is gone — it stayed in the agent Pod, so none of its three
 	// variables are set here — Envoy listens on the Pod IP rather than loopback,
@@ -4344,6 +4361,13 @@ func mergeCredentialProxyEnv(managed, custom []corev1.EnvVar) []corev1.EnvVar {
 		// one, or, naming the same subscription, refuse the broker's start.
 		legacyGoogleChatSubscriptionEnvVar,
 		"CREDENTIAL_PROXY_BOOTSTRAP_COMMAND",
+		// The forge configuration is reserved whether or not the operator
+		// renders one. It names which forges the broker builds and where
+		// their tokens are, so a CR that could set it could hand the broker a
+		// forge no declaration admitted -- or, on a GitHub-only install where
+		// the operator sets nothing, point it at a file that is not there and
+		// keep it from starting.
+		vcsForgesEnv,
 		// The listen address is reserved for the placements as well as for the
 		// authentication: it is appended after this merge in every container
 		// the sidecar split into, and an operator who set it to 127.0.0.1
@@ -4492,7 +4516,8 @@ func safeSandboxEnvOverrides(custom []corev1.EnvVar) []corev1.EnvVar {
 	//
 	// KAGE_SLACK_UX switches between code paths already in the image, all of
 	// them about Slack. It is compared against `FLAG_ON_VALUES` in
-	// `slack_presenter.py`; any other value is off, the image default. It names
+	// `slack_presenter.py`; unset is on, the image default, and any other value
+	// is off, so passing it through is how an install opts out. It names
 	// no path, URL, credential or image, and no value of it adds a destination
 	// or a credential. Its writes go only to Slack, in the channels and threads
 	// the gateway already serves, among them a reaction on an ask, a click's
