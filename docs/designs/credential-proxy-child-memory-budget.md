@@ -215,6 +215,10 @@ slot freed, polled every `COMMAND_SLOT_POLL_SECONDS` with the same check that a 
 hung up while queued is dropped before anything starts, and bounded by the same
 `COMMAND_SLOT_WAIT_SECONDS` (60). A request still queued at the bound raises
 `CommandSlotUnavailable` with a message that names the memory budget rather than the slot count.
+Both the wait and the refusal are measured on the broker's metrics listener: every admission
+is observed in a histogram by the bound that held it, every busy answer counted by bound, and
+the slots and bytes in use are gauges beside their caps, with the budget gauge absent while the
+budget is off (the site's observability page names the series).
 On the exec and vcs routes the exception is raised where a slot refusal is raised, before any
 command has run and, on the vcs route, before the body is read, so each route's existing handler
 and the vcs route's body drain apply unchanged and answer `503 CREDENTIAL_PROXY_BUSY`. The
