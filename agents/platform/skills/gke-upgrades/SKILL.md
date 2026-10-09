@@ -1,6 +1,7 @@
 ---
 name: gke-upgrades
 metadata:
+  version: "1.1.0"
   category: Containers
 description: >-
   Plans, executes, and validates Google Kubernetes Engine (GKE) cluster upgrades
@@ -65,6 +66,14 @@ Standard GKE versions are supported for 14 months after they become available in
 - **Stable** channel versions may be supported for less than 14 months (since they enter Stable after Regular).
 - **Extended** support extends this period up to 24 months. Note that extra cost applies only during the extended support period (months 15-24).
 
+### Current Capabilities
+
+- **Extended channel math**: 14 months of standard support + ~10 months of extended support ≈ 24 months total per minor version. Even on Extended, forced upgrades still occur: if you take no action, GKE auto-upgrades the cluster at End of Support — averaging a minor version bump roughly every 4 months, the same cadence as other channels (features just arrive later).
+- **Upgrade reliability (KubeCon NA 2025)**: Google reports a 99.99% upgrade success rate across GKE control planes and nodes, with safe rollback and skip-version upgrade support positioned to let teams upgrade less often (e.g., annually instead of quarterly). Pilot skip-version upgrades in non-production clusters first.
+- **Autoscaled blue-green node upgrades** (Preview): a blue-green variant that scales the green pool on demand instead of pre-provisioning a full duplicate pool — for disruption-sensitive workloads that cannot reserve 2x capacity.
+- **Scheduled cluster upgrade notifications** (Preview): opt in to be notified ahead of scheduled minor upgrades and wire the notifications into alerting.
+- **Graceful termination and PDBs during drains**: blue-green (including autoscaled blue-green, Preview) is the *only* strategy that honors `terminationGracePeriodSeconds` for up to 24 hours; surge upgrades honor it for up to 60 minutes. During node drains, GKE respects PDBs for a maximum of 60 minutes, after which pods are force-deleted (a notification is sent).
+
 ## Maintenance Windows & Exclusions
 
 Configure maintenance windows to control auto-upgrade timing. GKE also supports node pool level maintenance exclusions (in addition to cluster level) to block upgrades for specific workloads.
@@ -72,19 +81,18 @@ Configure maintenance windows to control auto-upgrade timing. GKE also supports 
 **Exclusion types & Limits:**
 
 - **"No upgrades" (Scope: `no_upgrades`)**: Blocks all upgrades (minor, patch, node).
-  - **Limit**: Max **90 days** of total exclusion duration in any **rolling 365-day window**.
-  - **Chaining constraint**: Because of the rolling 365-day limit, you cannot chain multiple exclusions to cover a continuous period longer than 90 days (e.g., you cannot cover a 100-day freeze using `no_upgrades`).
+  - **Limits**: Max **90 days per exclusion**, and a cluster can have at most **3** such exclusions. Together they must still allow at least **48 hours of maintenance availability in any rolling 92-day window** — so you cannot chain them into a continuous freeze longer than 90 days. GKE recommends keeping these under 30 days.
 - **"No minor or node upgrades" (Scope: `no_minor_or_node_upgrades`)**: Blocks minor and node upgrades, but allows control plane patch upgrades (low risk).
-  - **Limit**: Up to **180 days per exclusion**. Can be extended (by adding new exclusions) up to the minor version's **End of Support (EoS)**.
+  - **Limit**: No fixed day cap — bounded by the minor version's **End of Support (EoS)**. Recommendation: keep under ~6 months.
 - **"No minor upgrades" (Scope: `no_minor_upgrades`)**: Blocks minor upgrades, but allows control plane patches and node upgrades.
-  - **Limit**: Up to **180 days per exclusion**. Can be extended up to EoS.
+  - **Limit**: No fixed day cap — bounded by EoS. Recommendation: keep under ~6 months.
 
 **Important Exclusion Rules (MUST follow when recommending exclusions and MUST include in the final text response):**
 
 1. **Auto-upgrades only**: Maintenance exclusions **only block automatic upgrades**. Manual upgrades initiated by the user will bypass exclusions. You MUST explain this to the user.
 2. **Warn against "No channel"**: You MUST explicitly warn that disabling release channels ("No channel" / static versioning) is deprecated and must not be used as a replacement for exclusions.
 3. **Compare Scopes**: You MUST explain the difference between 'No upgrades' (limitations, blocks patches) and 'No minor or node upgrades' (allows patches, longer duration). Recommend 'No minor or node upgrades' when the user wants to allow security patches/fixes while blocking minor version jumps.
-4. **Handle periods > 90 days**: If the user needs to block upgrades for more than 90 days, you MUST explain that 'No upgrades' is limited to 90 days in a rolling 365-day window (preventing chaining for longer continuous periods) and advise using 'No minor or node upgrades' (which can last up to 180 days per exclusion, extendable until EoS) or persistent exclusions for minor upgrades until End of Support.
+4. **Handle periods > 90 days**: If the user needs to block upgrades for more than 90 days, you MUST explain that 'No upgrades' is limited to 90 days per exclusion (max 3 per cluster, and 48 hours of maintenance availability must remain in any rolling 92-day window, preventing chaining into longer continuous freezes) and advise using scoped exclusions ('No minor or node upgrades' / 'No minor upgrades'), which have no fixed day cap and can run until the minor version's End of Support.
 5. **Version skew**: Be mindful of version skew (between control plane and node pools) when using exclusions. Ensure skew does not exceed the supported 2 minor versions. Use `--add-maintenance-exclusion-until-end-of-support` for persistent exclusions.
 6. **Correct gcloud syntax**: When providing `gcloud` commands for exclusions, you MUST use the separate flag syntax: `--add-maintenance-exclusion-name`, `--add-maintenance-exclusion-start`, `--add-maintenance-exclusion-end` (or `--add-maintenance-exclusion-until-end-of-support`), and `--add-maintenance-exclusion-scope` (do NOT use a single comma-separated `--add-maintenance-exclusion` flag).
 
@@ -97,7 +105,7 @@ GKE reserves the right to override user-defined maintenance windows and exclusio
 - **Critical Security Patches**: Urgent vulnerability fixes that must be applied immediately to protect infrastructure.
 - **End of Support (EoS) / End of Life (EOL) Enforcement**: If a cluster is running an unsupported version, GKE will force upgrade it to a supported version.
 - **Expiring Certificates**: If control plane certificates (CAs) are expiring (within 30 days) and rotation is required to prevent cluster unrecoverability.
-- **Maintenance Starvation**: GKE requires at least 48 hours of maintenance availability in any rolling 32-day window. If exclusions block too much, GKE may force an upgrade.
+- **Maintenance Starvation**: GKE requires at least 48 hours of maintenance availability in any rolling 92-day window. If exclusions block too much, GKE may force an upgrade.
 
 **Guidance (MUST follow when overrides are discussed):**
 
@@ -139,21 +147,12 @@ For standard command sequences and runbook templates, see [`references/runbook-t
 
 ### Large-Scale AI/ML Clusters (GPU/TPU)
 
-- **No Live Migration**: GPU VMs do not support live migration; GKE upgrades will force pod restarts. You MUST explain this.
-- **Fixed Reservations & Quota**: H100/A100 typically use fixed reservations with no spare quota.
-  - Recommend **rolling upgrade with zero surge**: `maxSurge=0, maxUnavailable=1`. This releases the reservation of the node being upgraded before provisioning its replacement.
-  - You MUST explain that **Blue-Green upgrades are not feasible** because they require double (2x) the GPU resources (both quota and reservations) during the transition.
-- **Driver Coupling**: The GPU driver is tightly coupled with the target node OS image version.
-  - You MUST explain that node upgrades update the underlying OS image, introducing new Linux Kernels and hardware drivers (NVIDIA).
-  - You MUST warn that driver updates can break CUDA compatibility.
-  - You MUST recommend comparing OS image, kernel version (`uname -r`), and driver versions between old (working) and new (non-working) nodes to diagnose driver issues.
-  - You MUST recommend deploying a test pod (e.g., vector addition) to verify GPU access.
-  - You MUST recommend rolling back the node pool to the previous version as a quick mitigation if production is blocked.
-  - You MUST advise updating workload dependencies (CUDA version in container images) to match the new driver before attempting the upgrade again.
-  - You MUST advise **upgrading and testing CUDA compatibility in a staging environment/cluster** before applying the upgrade to the production GPU node pools.
-- **Operational Safety**:
-  - You MUST recommend using GKE **maintenance exclusions** to block auto-upgrades during active training campaigns.
-  - Prior to manual upgrades, cordon GPU nodes and wait for active training jobs to checkpoint/complete.
+When advising on GPU/TPU upgrades, you MUST cover all of the following:
+
+- **No Live Migration**: GPU VMs do not support live migration; GKE upgrades will force pod restarts. Explain this to the user.
+- **Fixed Reservations & Quota**: H100/A100 typically use fixed reservations with no spare quota. Recommend a **rolling upgrade with zero surge** (`maxSurge=0, maxUnavailable=1`), which releases the reservation of the node being upgraded before provisioning its replacement. Explain that **Blue-Green upgrades are not feasible** here because they require double (2x) the GPU resources (both quota and reservations) during the transition.
+- **Driver Coupling**: The GPU driver is tightly coupled to the node OS image, so node upgrades introduce new Linux kernels and NVIDIA drivers that can break CUDA compatibility. Advise upgrading and testing CUDA compatibility in a staging environment/cluster first, and updating workload dependencies (CUDA version in container images) to match the new driver before attempting the upgrade again. To diagnose driver regressions, compare OS image, kernel version (`uname -r`), and driver versions between old (working) and new (non-working) nodes, and deploy a test pod (e.g., vector addition) to verify GPU access. If production is blocked, rolling the node pool back to the previous version is the quickest mitigation.
+- **Operational Safety**: Recommend GKE **maintenance exclusions** to block auto-upgrades during active training campaigns. Prior to manual upgrades, cordon GPU nodes and wait for active training jobs to checkpoint/complete.
 - **TPU Considerations**: TPU slices are recreated atomically (not rolling); maintenance on one slice restarts all slices in the environment.
 
 ## Checklists
@@ -174,11 +173,13 @@ Produce checklists as copyable markdown with checkboxes. See [`references/checkl
 
 Produce step-by-step runbooks with actual `gcloud` and `kubectl` commands. See `references/runbook-template.md` for the standard command sequences.
 
+**Any runbook that relaxes a safety control must restore it in the same runbook.** This applies above all to PDBs during a node-pool migration or rollback: back the PDBs up before draining, and make restoring them by patch a numbered step with its own verification, not a closing remark. A runbook that patches `maxUnavailable: 100%` to unblock a drain and never reverts it leaves the cluster without disruption protection, and the gap is invisible until the next voluntary eviction. The same rule covers maintenance exclusions, cordons, and autoscaler `minNodes` overrides added to get through the procedure.
+
 ## Maintenance Window Pauses
 
 When diagnosing a \"stuck\" upgrade, consider if it was paused by a maintenance window:
 
-- **Silent Pause Behavior:** If a maintenance window closes before an upgrade (auto or manual) completes, GKE intentionally pauses the rollout to prevent disruption outside allowed times.
+- **Silent Pause Behavior:** If a maintenance window closes before a surge upgrade (auto or manual) completes, GKE intentionally pauses the rollout to prevent disruption outside allowed times. A blue-green node-pool upgrade does not pause: it continues past the window to completion (`references/troubleshooting.md` §11), so for a blue-green pool the window is not the cause and the rest of this section does not apply.
 - **Mixed-Version State:** The cluster is left in a stable mixed-version state (some nodes upgraded, some not). You MUST explicitly state that this is a supported and safe intended outcome.
 - **Resumption:** The upgrade will automatically resume when the next maintenance window opens.
 - **Mitigation for immediate completion:** If the user wants to complete the upgrade immediately, you MUST suggest **temporarily widening the maintenance window** to include the current time (e.g., using `gcloud container clusters update ... --maintenance-window-start ... --maintenance-window-duration ...`). Do not suggest re-triggering the manual upgrade or bypassing the window.
@@ -206,9 +207,12 @@ Refer to [`references/troubleshooting.md`](references/troubleshooting.md) for th
 
 - [GKE Release Notes](https://cloud.google.com/kubernetes-engine/docs/release-notes)
 - [Upgrading GKE Clusters](https://cloud.google.com/kubernetes-engine/docs/how-to/upgrading-a-cluster)
+- [Troubleshoot GKE upgrades](https://docs.cloud.google.com/kubernetes-engine/docs/troubleshooting/upgrades.md.txt)
+- [Get upgrade information (upgrade assist)](https://docs.cloud.google.com/kubernetes-engine/docs/how-to/upgrade-assist.md.txt)
+- [Node pool upgrade strategies (surge & blue-green)](https://docs.cloud.google.com/kubernetes-engine/docs/how-to/node-pool-upgrade-strategies.md.txt)
 - [Maintenance Windows & Exclusions](https://cloud.google.com/kubernetes-engine/docs/concepts/maintenance-windows-and-exclusions)
 - [Rollout Sequencing Concepts](https://docs.cloud.google.com/kubernetes-engine/docs/concepts/rollout-sequencing/about-rollout-sequencing)
-- [Configure Rollout Sequencing](https://cloud.google.com/kubernetes-engine/docs/how-to/rollout-sequencing)
+- [Configure Rollout Sequencing](https://cloud.google.com/kubernetes-engine/docs/how-to/rollout-sequencing/manage-upgrades-with-rollout-sequencing)
 
 <!-- kube-agents: local addition (auto-injected by sync-upstream-skills.py) -->
 

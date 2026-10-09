@@ -57,7 +57,7 @@ SUBSTITUTION_UNDECIDABLE = "undecidable"
 class UpstreamDriftError(Exception):
     """A registered local correction can no longer be applied to what upstream now ships.
 
-    Both registries below name an upstream skill and the text they expect to find in it. When
+    Each registry below names an upstream skill and the text they expect to find in it. When
     upstream edits that text — even by a bullet marker — renames the skill, or drops it, the
     correction stops being applied. Warning and carrying on published the uncorrected upstream
     content with the run still reporting success, so the sync refuses instead.
@@ -184,6 +184,28 @@ GKE_BASICS_NEW_CREDENTIALS_SNIPPET = """4. **Cluster Credentials:**
      gcloud container clusters get-credentials "$CLUSTER" --location="$LOCATION" --project="$PROJECT" --quiet
      ```"""
 
+# gke-basics' Reference Directory upstream describes cli-reference.md and mcp-usage.md as covering
+# the cluster-operation tools alone. The cli-reference.md correction in SKILL_FILE_SUBSTITUTIONS
+# adds the knowledge-lookup hierarchy, and mcp-usage.md documents the Developer Knowledge server,
+# so the two entries name what the agent finds when it opens them.
+GKE_BASICS_OLD_CLI_REFERENCE_ENTRY_SNIPPET = (
+    "Tool preference hierarchy (MCP vs gcloud vs kubectl)"
+)
+
+GKE_BASICS_NEW_CLI_REFERENCE_ENTRY_SNIPPET = (
+    "Tool preference hierarchies (Knowledge lookups vs Cluster Operations)"
+)
+
+GKE_BASICS_OLD_MCP_USAGE_ENTRY_SNIPPET = (
+    "Connecting to and using the 23 structured GKE MCP tools for cluster management, K8s "
+    "resources, and diagnostics."
+)
+
+GKE_BASICS_NEW_MCP_USAGE_ENTRY_SNIPPET = (
+    "Connecting to and using the GKE MCP and Developer Knowledge MCP tools for cluster "
+    "management, K8s resources, and authoritative documentation."
+)
+
 # gke-manifest-generation's grounding step upstream prefers Developer Knowledge's `answer_query`,
 # whose default quota is 50 requests per day per project (developers.google.com/knowledge/quota),
 # shared by every agent in an install; once spent, every lookup 429s for the rest of the day.
@@ -204,6 +226,64 @@ GKE_MANIFEST_GENERATION_NEW_DEVELOPER_KNOWLEDGE_SNIPPET = """        -   **`sear
         -   Do not call **`answer_query`**: its quota is 50 requests per day per
             project, shared by every agent in the install, and it reads the
             same corpus as `search_documents`. Never retry its `429`."""
+
+# The Workload Identity split moved WI routing out of gke-workload-security in the skills'
+# descriptions only; the bodies an agent reads after routing still send it there, and
+# gke-workload-security's §2 still teaches GSA impersonation as the recommended path, which
+# gke-workload-identity calls legacy. These pairs point the bodies at gke-workload-identity.
+GKE_WORKLOAD_SECURITY_OLD_SCOPE_SNIPPET = """covers security auditing, Identity and Access Management (Workload Identity),
+Network Security (Network Policies), and Node Security."""
+
+GKE_WORKLOAD_SECURITY_NEW_SCOPE_SNIPPET = """covers security auditing, Network Security (Network Policies), and Node Security.
+For Workload Identity setup, use the `gke-workload-identity` skill."""
+
+GKE_WORKLOAD_SECURITY_OLD_WI_INTRO_SNIPPET = """### 2. Configure Workload Identity
+
+Workload Identity allows Kubernetes Service Accounts (KSAs) to impersonate
+Google Service Accounts (GSAs). This is the recommended method for workloads to
+access Google Cloud APIs.
+"""
+
+GKE_WORKLOAD_SECURITY_NEW_WI_INTRO_SNIPPET = """### 2. Configure Workload Identity (legacy GSA impersonation)
+
+Load the `gke-workload-identity` skill first: binding IAM roles to the
+Kubernetes Service Account (KSA) principal directly is the current default, and
+that skill diagnoses both models. Use the impersonation setup below, where a KSA
+impersonates a Google Service Account (GSA), only when a GSA must be the
+identity: an existing GSA already holds the roles the workload needs, or the
+Google Cloud API it calls does not accept Workload Identity Federation
+principals (the GKE documentation lists those limitations).
+"""
+
+# Upstream's description claims pod securityContext coverage the body does not carry; container
+# security contexts are gke-manifest-generation's, and the description is what the agent routes on.
+GKE_WORKLOAD_SECURITY_OLD_DESCRIPTION_SNIPPET = (
+    "Security Standards (`restricted` labeling) and pod securityContext, and mounting"
+)
+
+GKE_WORKLOAD_SECURITY_NEW_DESCRIPTION_SNIPPET = "Security Standards (`restricted` labeling), and mounting"
+
+GKE_PLATFORM_SECURITY_OLD_SCOPE_SNIPPET = """controls (such as Workload Identity Service Account bindings,
+SecretProviderClass volume mounts, Network Policies, and Pod Security
+Standards), refer to the `gke-workload-security` skill."""
+
+GKE_PLATFORM_SECURITY_NEW_SCOPE_SNIPPET = """controls (such as SecretProviderClass volume mounts, Network Policies, and Pod
+Security Standards), refer to the `gke-workload-security` skill; for Workload
+Identity Service Account bindings, the `gke-workload-identity` skill."""
+
+GKE_PLATFORM_SECURITY_OLD_WI_IAM_SNIPPET = """    Service Accounts (`roles/iam.workloadIdentityUser`), refer to the
+    `gke-workload-security` skill."""
+
+GKE_PLATFORM_SECURITY_NEW_WI_IAM_SNIPPET = """    Service Accounts (`roles/iam.workloadIdentityUser`), refer to the
+    `gke-workload-identity` skill."""
+
+GKE_PRODUCTIONIZE_OLD_SECURITY_ACTION_SNIPPET = """-   **Action**: You MUST run the `gke-platform-security` and
+    `gke-workload-security` skills for Workload Identity, Network Policies, and
+    Shielded Nodes."""
+
+GKE_PRODUCTIONIZE_NEW_SECURITY_ACTION_SNIPPET = """-   **Action**: You MUST run the `gke-workload-identity` skill for Workload
+    Identity, and the `gke-platform-security` and `gke-workload-security` skills
+    for Network Policies and Shielded Nodes."""
 
 # gke-backup-dr upstream fuses the end of best practice 5 into the next heading: the sentence
 # stops at "Service**," and "## Golden Path Backup Defaults" follows on the same line, so the
@@ -242,6 +322,29 @@ GKE_BACKUP_DR_NEW_BETA_COMPONENT_SNIPPET = """-   The `backup-restore` command g
     proxy refuses it.
 """
 
+# gke-upgrades' SKILL.md tells a runbook to make "re-applying" the PDB backup its restore step, the
+# re-apply the runbook template and troubleshooting corrections below replace because the API server
+# rejects it with a conflict. The replacement names the restore those references now give.
+GKE_UPGRADES_OLD_PDB_RESTORE_RULE_SNIPPET = "make re-applying them a numbered step"
+
+GKE_UPGRADES_NEW_PDB_RESTORE_RULE_SNIPPET = "make restoring them by patch a numbered step"
+
+# gke-upgrades' SKILL.md says every upgrade pauses when its maintenance window closes, while the
+# troubleshooting reference it routes stuck upgrades to says blue-green node-pool upgrades run past
+# the window to completion. The replacement scopes the pause to surge upgrades.
+GKE_UPGRADES_OLD_WINDOW_PAUSE_SNIPPET = (
+    "If a maintenance window closes before an upgrade (auto or manual) completes, GKE intentionally"
+    " pauses the rollout to prevent disruption outside allowed times."
+)
+
+GKE_UPGRADES_NEW_WINDOW_PAUSE_SNIPPET = (
+    "If a maintenance window closes before a surge upgrade (auto or manual) completes, GKE"
+    " intentionally pauses the rollout to prevent disruption outside allowed times. A blue-green"
+    " node-pool upgrade does not pause: it continues past the window to completion"
+    " (`references/troubleshooting.md` §11), so for a blue-green pool the window is not the cause"
+    " and the rest of this section does not apply."
+)
+
 # In-place content substitutions applied to freshly-synced skills to correct upstream defects
 # where an appended footer is insufficient (e.g. multi-step remediation commands), to route to a
 # skill only this repository has from a passage upstream cannot know about, or to drop a name this
@@ -252,6 +355,34 @@ SKILL_SUBSTITUTIONS = {
         (
             GKE_WORKLOAD_SECURITY_OLD_NETPOL_SNIPPET,
             GKE_WORKLOAD_SECURITY_NEW_NETPOL_SNIPPET,
+        ),
+        (
+            GKE_WORKLOAD_SECURITY_OLD_SCOPE_SNIPPET,
+            GKE_WORKLOAD_SECURITY_NEW_SCOPE_SNIPPET,
+        ),
+        (
+            GKE_WORKLOAD_SECURITY_OLD_WI_INTRO_SNIPPET,
+            GKE_WORKLOAD_SECURITY_NEW_WI_INTRO_SNIPPET,
+        ),
+        (
+            GKE_WORKLOAD_SECURITY_OLD_DESCRIPTION_SNIPPET,
+            GKE_WORKLOAD_SECURITY_NEW_DESCRIPTION_SNIPPET,
+        ),
+    ],
+    "gke-platform-security": [
+        (
+            GKE_PLATFORM_SECURITY_OLD_SCOPE_SNIPPET,
+            GKE_PLATFORM_SECURITY_NEW_SCOPE_SNIPPET,
+        ),
+        (
+            GKE_PLATFORM_SECURITY_OLD_WI_IAM_SNIPPET,
+            GKE_PLATFORM_SECURITY_NEW_WI_IAM_SNIPPET,
+        ),
+    ],
+    "gke-productionize": [
+        (
+            GKE_PRODUCTIONIZE_OLD_SECURITY_ACTION_SNIPPET,
+            GKE_PRODUCTIONIZE_NEW_SECURITY_ACTION_SNIPPET,
         ),
     ],
     "gke-manifest-generation": [
@@ -277,6 +408,14 @@ SKILL_SUBSTITUTIONS = {
             GKE_BASICS_OLD_CREDENTIALS_SNIPPET,
             GKE_BASICS_NEW_CREDENTIALS_SNIPPET,
         ),
+        (
+            GKE_BASICS_OLD_CLI_REFERENCE_ENTRY_SNIPPET,
+            GKE_BASICS_NEW_CLI_REFERENCE_ENTRY_SNIPPET,
+        ),
+        (
+            GKE_BASICS_OLD_MCP_USAGE_ENTRY_SNIPPET,
+            GKE_BASICS_NEW_MCP_USAGE_ENTRY_SNIPPET,
+        ),
     ],
     "gke-backup-dr": [
         (
@@ -292,6 +431,295 @@ SKILL_SUBSTITUTIONS = {
             GKE_BACKUP_DR_NEW_BETA_COMPONENT_SNIPPET,
         ),
     ],
+    "gke-upgrades": [
+        (
+            GKE_UPGRADES_OLD_PDB_RESTORE_RULE_SNIPPET,
+            GKE_UPGRADES_NEW_PDB_RESTORE_RULE_SNIPPET,
+        ),
+        (
+            GKE_UPGRADES_OLD_WINDOW_PAUSE_SNIPPET,
+            GKE_UPGRADES_NEW_WINDOW_PAUSE_SNIPPET,
+        ),
+    ],
+}
+
+# gke-basics' tool-preference reference upstream ranks only the interfaces for live cluster
+# operations, so a GKE fact the agent needs (a field, a version lifecycle, a quota) falls through
+# to web search. This repository ranks Developer Knowledge first for those lookups and web search
+# as the fallback; the replacement adds that hierarchy above upstream's, which it renames.
+GKE_BASICS_CLI_REFERENCE_OLD_TOOL_PREFERENCE_SNIPPET = """## Tool Preference
+
+Default preference order:
+"""
+
+GKE_BASICS_CLI_REFERENCE_NEW_TOOL_PREFERENCE_SNIPPET = """## Tool Preference
+
+Tool usage follows two distinct, domain-specific preference hierarchies:
+
+### 1. Knowledge & Documentation Lookups (GKE Facts, Schemas, Best Practices)
+
+Default preference order:
+
+```
+1. Developer Knowledge MCP  (preferred — authoritative, curated first-party documentation)
+2. Web Search               (fallback — third-party tooling, open-source CVEs, or DK cache miss)
+```
+
+| Interface                                               | When to Use                                                                                                           | Examples                                                                                                      |
+| ------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------- |
+| **Developer Knowledge MCP** (`mcp-developer_knowledge`) | Default for all GKE/GCP facts, API schemas, version lifecycles, and configuration semantics.                          | GKE Autopilot constraints, Ingress/Gateway API spec fields, release version deprecations, quota requirements. |
+| **Web Search** (`web_search`)                           | Third-party software documentation, non-Google helm charts, community error discussions, or when DK returns no match. | Investigating an open-source operator error, third-party CNI details, or external blog posts.                 |
+
+### 2. Live Cluster Operations & State Management
+
+Default preference order:
+"""
+
+GKE_BASICS_CLI_REFERENCE_OLD_WHEN_TO_USE_SNIPPET = "### When to use each\n"
+
+GKE_BASICS_CLI_REFERENCE_NEW_WHEN_TO_USE_SNIPPET = "### When to use each (Cluster Operations)\n"
+
+# gke-upgrades' troubleshooting reference offers four node-pool fixes with no word that they apply
+# to Standard clusters only, so fleet audits on Autopilot recommended surge and driver changes GKE
+# does not let the user make. The replacements restore the qualifiers this repository had added by
+# hand before references could be registered here.
+GKE_UPGRADES_TROUBLESHOOTING_OLD_SURGE_SNIPPET = "**Fix — increase surge capacity:**\n"
+
+GKE_UPGRADES_TROUBLESHOOTING_NEW_SURGE_SNIPPET = (
+    "**Fix — increase surge capacity (Standard clusters only; Autopilot manages node upgrades "
+    "automatically):**\n"
+)
+
+GKE_UPGRADES_TROUBLESHOOTING_OLD_STRATEGY_SNIPPET = "1. **Change Upgrade Strategy**: "
+
+GKE_UPGRADES_TROUBLESHOOTING_NEW_STRATEGY_SNIPPET = (
+    "1. **Change Upgrade Strategy (Standard clusters only)**: "
+)
+
+GKE_UPGRADES_TROUBLESHOOTING_OLD_DRIVER_SNIPPET = "1. **Pin Driver Version**: "
+
+GKE_UPGRADES_TROUBLESHOOTING_NEW_DRIVER_SNIPPET = "1. **Pin Driver Version (Standard clusters only)**: "
+
+# Its §10 resume fix and §11 blue-green update are node-pool operations too, which Autopilot does
+# not expose, and they need the same qualifier.
+GKE_UPGRADES_TROUBLESHOOTING_OLD_RESUME_SNIPPET = (
+    "**Fix — resume a canceled/partially-completed node pool upgrade** by re-issuing"
+)
+
+GKE_UPGRADES_TROUBLESHOOTING_NEW_RESUME_SNIPPET = (
+    "**Fix — resume a canceled/partially-completed node pool upgrade (Standard clusters only)** "
+    "by re-issuing"
+)
+
+GKE_UPGRADES_TROUBLESHOOTING_OLD_BLUE_GREEN_UPDATE_SNIPPET = "**Update an existing node pool:**\n"
+
+GKE_UPGRADES_TROUBLESHOOTING_NEW_BLUE_GREEN_UPDATE_SNIPPET = (
+    "**Update an existing node pool (Standard clusters only):**\n"
+)
+
+# The same reference rolls a node pool back with `gcloud container node-pools upgrade`, a command
+# that does not exist; the skill's own runbook template says node pools upgrade through
+# `clusters upgrade --node-pool`. The replacement also restores the Standard-only qualifier.
+GKE_UPGRADES_TROUBLESHOOTING_OLD_ROLLBACK_SNIPPET = """3. **Rollback Node Pool**: If production is blocked, roll back the node pool to the previous GKE version:
+   ```bash
+   gcloud container node-pools upgrade NODE_POOL_NAME \\
+     --cluster CLUSTER_NAME \\
+     --zone ZONE \\
+     --cluster-version PREVIOUS_VERSION
+   ```
+"""
+
+GKE_UPGRADES_TROUBLESHOOTING_NEW_ROLLBACK_SNIPPET = """3. **Rollback Node Pool (Standard clusters only)**: If production is blocked, roll back the node pool to the previous GKE version:
+   ```bash
+   gcloud container clusters upgrade CLUSTER_NAME \\
+     --node-pool NODE_POOL_NAME \\
+     --zone ZONE \\
+     --cluster-version PREVIOUS_VERSION
+   ```
+"""
+
+# gke-upgrades' runbook template relaxes a blocking PDB by merging maxUnavailable into it, which
+# the API server rejects on a PDB that sets minAvailable ("minAvailable and maxUnavailable cannot be
+# both set"). The replacement clears minAvailable in the same patch.
+GKE_UPGRADES_RUNBOOK_OLD_PDB_RELAX_SNIPPET = """kubectl patch pdb PDB_NAME -n NAMESPACE \\
+  --type merge -p '{"spec":{"maxUnavailable":"100%"}}'"""
+
+GKE_UPGRADES_RUNBOOK_NEW_PDB_RELAX_SNIPPET = """kubectl patch pdb PDB_NAME -n NAMESPACE \\
+  --type merge -p '{"spec":{"minAvailable":null,"maxUnavailable":"100%"}}'"""
+
+# Its restore step then re-applies a `kubectl get pdb -A -o yaml` dump. The dump carries each PDB's
+# resourceVersion, which the relax patch has since changed, so the API server answers the apply with
+# a 409 conflict; and a three-way apply would not remove the maxUnavailable the relax step set, so a
+# PDB that used minAvailable would end with both fields set. The replacement restores by patch: the
+# recorded value back, the other field cleared.
+GKE_UPGRADES_RUNBOOK_OLD_PDB_RESTORE_SNIPPET = """# 3. RESTORE the original PDB — mandatory, not optional. Re-apply from the
+#    backup rather than retyping the values.
+kubectl apply -f /tmp/pdb-backup-TIMESTAMP.yaml"""
+
+GKE_UPGRADES_RUNBOOK_NEW_PDB_RESTORE_SNIPPET = """# 3. RESTORE the original PDB — mandatory, not optional. Patch back the value
+#    the backup records for PDB_NAME and clear the field step 1 set. Do not
+#    `kubectl apply` the backup: its stale resourceVersion is rejected with a
+#    conflict. If the PDB originally set minAvailable:
+kubectl patch pdb PDB_NAME -n NAMESPACE \\
+  --type merge -p '{"spec":{"maxUnavailable":null,"minAvailable":ORIGINAL_MIN_AVAILABLE}}'
+#    If it originally set maxUnavailable:
+kubectl patch pdb PDB_NAME -n NAMESPACE \\
+  --type merge -p '{"spec":{"maxUnavailable":ORIGINAL_MAX_UNAVAILABLE}}'
+#    (an integer as-is, a percentage quoted, e.g. "50%")"""
+
+# troubleshooting.md §1 relaxes a PDB with no backup and leaves the restore as a closing remark,
+# against SKILL.md's own rule that a runbook relaxing a safety control restores it as a numbered,
+# verified step; its Option B re-applies a dump the same way the runbook template did. The
+# replacement records, relaxes, restores by patch and verifies, in order.
+GKE_UPGRADES_TROUBLESHOOTING_OLD_PDB_FIX_SNIPPET = """**Fix — temporarily relax the PDB:**
+```bash
+# Option A: Allow all disruptions temporarily
+kubectl patch pdb PDB_NAME -n NAMESPACE \\
+  -p '{"spec":{"minAvailable":null,"maxUnavailable":"100%"}}'
+
+# Option B: Back up and edit
+kubectl get pdb PDB_NAME -n NAMESPACE -o yaml > pdb-backup.yaml
+# Edit minAvailable/maxUnavailable, then:
+kubectl apply -f pdb-backup.yaml
+```
+
+Restore original PDB after upgrade completes."""
+
+GKE_UPGRADES_TROUBLESHOOTING_NEW_PDB_FIX_SNIPPET = """**Fix — temporarily relax the PDB, and restore it in the same procedure:**
+```bash
+# 1. Record the original values before touching anything
+kubectl get pdb PDB_NAME -n NAMESPACE -o yaml > pdb-backup.yaml
+
+# 2. Allow all disruptions temporarily
+kubectl patch pdb PDB_NAME -n NAMESPACE \\
+  --type merge -p '{"spec":{"minAvailable":null,"maxUnavailable":"100%"}}'
+
+# 3. Once the upgrade completes, RESTORE (mandatory): patch back the value
+#    pdb-backup.yaml records and clear the other field. If it set minAvailable:
+kubectl patch pdb PDB_NAME -n NAMESPACE \\
+  --type merge -p '{"spec":{"maxUnavailable":null,"minAvailable":ORIGINAL_MIN_AVAILABLE}}'
+#    If it set maxUnavailable:
+kubectl patch pdb PDB_NAME -n NAMESPACE \\
+  --type merge -p '{"spec":{"maxUnavailable":ORIGINAL_MAX_UNAVAILABLE}}'
+
+# 4. Verify the restore: the spec matches pdb-backup.yaml again
+kubectl get pdb PDB_NAME -n NAMESPACE -o yaml | grep -E 'minAvailable|maxUnavailable'
+```"""
+
+# The same corrections for a file in a skill other than its SKILL.md, keyed by skill and then by
+# the file's path inside the skill directory. A skill's reference files are wiped and re-copied
+# with the rest of it, so an edit made to one by hand lasts until the next sync unless it is
+# registered here. Every rule SKILL_SUBSTITUTIONS follows applies.
+SKILL_FILE_SUBSTITUTIONS = {
+    "gke-basics": {
+        os.path.join("references", "cli-reference.md"): [
+            (
+                GKE_BASICS_CLI_REFERENCE_OLD_TOOL_PREFERENCE_SNIPPET,
+                GKE_BASICS_CLI_REFERENCE_NEW_TOOL_PREFERENCE_SNIPPET,
+            ),
+            (
+                GKE_BASICS_CLI_REFERENCE_OLD_WHEN_TO_USE_SNIPPET,
+                GKE_BASICS_CLI_REFERENCE_NEW_WHEN_TO_USE_SNIPPET,
+            ),
+        ],
+    },
+    "gke-upgrades": {
+        os.path.join("references", "runbook-template.md"): [
+            (
+                GKE_UPGRADES_RUNBOOK_OLD_PDB_RELAX_SNIPPET,
+                GKE_UPGRADES_RUNBOOK_NEW_PDB_RELAX_SNIPPET,
+            ),
+            (
+                GKE_UPGRADES_RUNBOOK_OLD_PDB_RESTORE_SNIPPET,
+                GKE_UPGRADES_RUNBOOK_NEW_PDB_RESTORE_SNIPPET,
+            ),
+        ],
+        os.path.join("references", "troubleshooting.md"): [
+            (
+                GKE_UPGRADES_TROUBLESHOOTING_OLD_PDB_FIX_SNIPPET,
+                GKE_UPGRADES_TROUBLESHOOTING_NEW_PDB_FIX_SNIPPET,
+            ),
+            (
+                GKE_UPGRADES_TROUBLESHOOTING_OLD_SURGE_SNIPPET,
+                GKE_UPGRADES_TROUBLESHOOTING_NEW_SURGE_SNIPPET,
+            ),
+            (
+                GKE_UPGRADES_TROUBLESHOOTING_OLD_STRATEGY_SNIPPET,
+                GKE_UPGRADES_TROUBLESHOOTING_NEW_STRATEGY_SNIPPET,
+            ),
+            (
+                GKE_UPGRADES_TROUBLESHOOTING_OLD_DRIVER_SNIPPET,
+                GKE_UPGRADES_TROUBLESHOOTING_NEW_DRIVER_SNIPPET,
+            ),
+            (
+                GKE_UPGRADES_TROUBLESHOOTING_OLD_ROLLBACK_SNIPPET,
+                GKE_UPGRADES_TROUBLESHOOTING_NEW_ROLLBACK_SNIPPET,
+            ),
+            (
+                GKE_UPGRADES_TROUBLESHOOTING_OLD_RESUME_SNIPPET,
+                GKE_UPGRADES_TROUBLESHOOTING_NEW_RESUME_SNIPPET,
+            ),
+            (
+                GKE_UPGRADES_TROUBLESHOOTING_OLD_BLUE_GREEN_UPDATE_SNIPPET,
+                GKE_UPGRADES_TROUBLESHOOTING_NEW_BLUE_GREEN_UPDATE_SNIPPET,
+            ),
+        ],
+    },
+}
+
+# gke-basics' tool-preference reference upstream ranks only the interfaces for live cluster
+# operations, so a GKE fact the agent needs (a field, a version lifecycle, a quota) falls through
+# to web search. This repository ranks Developer Knowledge first for those lookups and web search
+# as the fallback; the replacement adds that hierarchy above upstream's, which it renames.
+GKE_BASICS_CLI_REFERENCE_OLD_TOOL_PREFERENCE_SNIPPET = """## Tool Preference
+
+Default preference order:
+"""
+
+GKE_BASICS_CLI_REFERENCE_NEW_TOOL_PREFERENCE_SNIPPET = """## Tool Preference
+
+Tool usage follows two distinct, domain-specific preference hierarchies:
+
+### 1. Knowledge & Documentation Lookups (GKE Facts, Schemas, Best Practices)
+
+Default preference order:
+
+```
+1. Developer Knowledge MCP  (preferred — authoritative, curated first-party documentation)
+2. Web Search               (fallback — third-party tooling, open-source CVEs, or DK cache miss)
+```
+
+| Interface                                               | When to Use                                                                                                           | Examples                                                                                                      |
+| ------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------- |
+| **Developer Knowledge MCP** (`mcp-developer_knowledge`) | Default for all GKE/GCP facts, API schemas, version lifecycles, and configuration semantics.                          | GKE Autopilot constraints, Ingress/Gateway API spec fields, release version deprecations, quota requirements. |
+| **Web Search** (`web_search`)                           | Third-party software documentation, non-Google helm charts, community error discussions, or when DK returns no match. | Investigating an open-source operator error, third-party CNI details, or external blog posts.                 |
+
+### 2. Live Cluster Operations & State Management
+
+Default preference order:
+"""
+
+GKE_BASICS_CLI_REFERENCE_OLD_WHEN_TO_USE_SNIPPET = "### When to use each\n"
+
+GKE_BASICS_CLI_REFERENCE_NEW_WHEN_TO_USE_SNIPPET = "### When to use each (Cluster Operations)\n"
+
+# The same corrections for a file in a skill other than its SKILL.md, keyed by skill and then by
+# the file's path inside the skill directory. A skill's reference files are wiped and re-copied
+# with the rest of it, so an edit made to one by hand lasts until the next sync unless it is
+# registered here. Every rule SKILL_SUBSTITUTIONS follows applies.
+SKILL_FILE_SUBSTITUTIONS = {
+    "gke-basics": {
+        os.path.join("references", "cli-reference.md"): [
+            (
+                GKE_BASICS_CLI_REFERENCE_OLD_TOOL_PREFERENCE_SNIPPET,
+                GKE_BASICS_CLI_REFERENCE_NEW_TOOL_PREFERENCE_SNIPPET,
+            ),
+            (
+                GKE_BASICS_CLI_REFERENCE_OLD_WHEN_TO_USE_SNIPPET,
+                GKE_BASICS_CLI_REFERENCE_NEW_WHEN_TO_USE_SNIPPET,
+            ),
+        ],
+    },
 }
 
 # Marker that identifies our auto-injected footer, so injection is idempotent and
@@ -301,13 +729,16 @@ FOOTER_MARKER = "<!-- kube-agents: local addition (auto-injected by sync-upstrea
 # Upstream skills are copied over verbatim on every sync (the local dir is rmtree'd first), so any
 # local edits are wiped. Anything this repository needs an upstream skill to say therefore belongs
 # here rather than in the skill file: these footers are the single source of truth for it and are
-# re-appended after each sync. Four things need saying today — the GKE create/lifecycle skills must
+# re-appended after each sync. Today: the GKE create/lifecycle skills must
 # keep pointing at this repo's Cluster Agent profile lifecycle, which upstream knows nothing about
 # (see agents/platform/skills/cluster-agent-lifecycle/SKILL.md for the mechanics they reference),
 # gke-networking must not present `--dns-endpoint` as unconditionally safe, gke-upgrades must
-# point at this repo's fleet-upgrade-verification skill for executed per-member version checks, and
+# point at this repo's fleet-upgrade-verification skill for executed per-member version checks,
 # gke-batch-hpc and gke-workload-scaling must preflight GPU/TPU and large-shape requests into
-# capacity-obtainability.
+# capacity-obtainability, gke-platform-security must carry the secrets-encryption and Security
+# Posture procedures its description and the gke-basics and gke-workload-security routing notes
+# send those flags to, which its body upstream does not have, and gke-workload-identity must say
+# which of its IAM and exec reads this install's command gate withholds.
 SKILL_FOOTERS = {
     "gke-cluster-creation": f"""{FOOTER_MARKER}
 
@@ -422,6 +853,53 @@ When the checklist's deprecated-API item comes up, the same skill's `api_depreca
 the linked GitOps repositories' manifests for apiVersions the target removes and reports each with
 its replacement and the commit it read; run it with `--target-version` and the version report's
 `--output`. It reads Git only: point at GKE Deprecation Insights for live client usage.
+""",
+    "gke-platform-security": f"""{FOOTER_MARKER}
+
+## Application-layer secrets encryption and Security Posture
+
+The description and the gke-basics and gke-workload-security routing notes send these two flags
+here.
+
+**Secrets encryption (`--database-encryption-key`)** envelope-encrypts Secrets in etcd with a
+Cloud KMS key. The key must be in the cluster's region (`KMS_LOCATION`; for a zonal cluster, the
+region that contains its zone, since Cloud KMS has no zonal locations), and the GKE service agent
+of the cluster's project (`CLUSTER_PROJECT_NUMBER`, not the key project's number) needs
+`roles/cloudkms.cryptoKeyEncrypterDecrypter` on it before the cluster can use it:
+
+```bash
+gcloud kms keys add-iam-policy-binding KEY_NAME \\
+  --keyring KEYRING_NAME --location KMS_LOCATION --project KMS_PROJECT_ID \\
+  --member serviceAccount:service-CLUSTER_PROJECT_NUMBER@container-engine-robot.iam.gserviceaccount.com \\
+  --role roles/cloudkms.cryptoKeyEncrypterDecrypter
+
+gcloud container clusters update CLUSTER_NAME --location LOCATION \\
+  --database-encryption-key projects/KMS_PROJECT_ID/locations/KMS_LOCATION/keyRings/KEYRING_NAME/cryptoKeys/KEY_NAME
+
+# CURRENT_STATE_ENCRYPTED once encryption completes (`state` is the requested setting, not the observed one)
+gcloud container clusters describe CLUSTER_NAME --location LOCATION \\
+  --format="value(databaseEncryption.currentState)"
+```
+
+**Security Posture (`--security-posture`)** turns on configuration auditing (`standard`) and,
+with `--workload-vulnerability-scanning`, OS vulnerability scanning of running workloads:
+
+```bash
+gcloud container clusters update CLUSTER_NAME --location LOCATION \\
+  --security-posture=standard --workload-vulnerability-scanning=standard
+```
+""",
+    "gke-workload-identity": f"""{FOOTER_MARKER}
+
+## Reads this install withholds
+
+The Platform Agent's command gate refuses three reads this skill uses:
+`gcloud iam service-accounts get-iam-policy` (Step 3), `gcloud asset search-all-iam-policies`
+(Step 4) and `kubectl exec` (Step 5). Do not retry them in another spelling. Run the steps you can,
+then hand the refused commands to the user with the placeholders filled in, say which output
+decides the diagnosis, and ask for the result. A role granted on the whole project is readable
+here: `gcloud projects get-iam-policy PROJECT_ID --format=json` shows it, so search its bindings
+for the principal before handing Step 4 over.
 """,
     "gke-batch-hpc": f"""{FOOTER_MARKER}
 
@@ -575,6 +1053,20 @@ def substitute(content, pairs):
     return content, problems
 
 
+def substituted_files(skill_name):
+    """Every file of a skill that has pairs registered, as (path inside the skill, pairs).
+
+    SKILL.md comes from SKILL_SUBSTITUTIONS and the rest from SKILL_FILE_SUBSTITUTIONS; the
+    pre-flight and apply_substitutions both read this, so neither can cover a file the other
+    skips.
+    """
+    files = []
+    if skill_name in SKILL_SUBSTITUTIONS:
+        files.append((SKILL_MD_FILENAME, SKILL_SUBSTITUTIONS[skill_name]))
+    files.extend(sorted(SKILL_FILE_SUBSTITUTIONS.get(skill_name, {}).items()))
+    return files
+
+
 def verify_local_corrections(upstream_skills_dir, discovered_skills, skip=frozenset()):
     """Check every registered correction against the clone before anything is written.
 
@@ -590,6 +1082,7 @@ def verify_local_corrections(upstream_skills_dir, discovered_skills, skip=frozen
 
     for registry_name, registry in (
         ("SKILL_SUBSTITUTIONS", SKILL_SUBSTITUTIONS),
+        ("SKILL_FILE_SUBSTITUTIONS", SKILL_FILE_SUBSTITUTIONS),
         ("SKILL_FOOTERS", SKILL_FOOTERS),
     ):
         for skill_name in sorted(registry):
@@ -606,29 +1099,34 @@ def verify_local_corrections(upstream_skills_dir, discovered_skills, skip=frozen
                     f"(renamed or removed). Move the entry to the new name, or drop it."
                 )
                 continue
-            skill_md = os.path.join(upstream_skills_dir, skill_name, SKILL_MD_FILENAME)
-            if not os.path.isfile(skill_md):
-                problems.append(
-                    f"{registry_name}[{skill_name!r}]: upstream skill has no {SKILL_MD_FILENAME}."
-                )
-                continue
-            if registry_name != "SKILL_SUBSTITUTIONS":
-                continue
-            with open(skill_md, "r", encoding=UTF_8_ENCODING) as f:
-                content = f.read()
-            _, undecidable = substitute(content, registry[skill_name])
-            for target, reason in undecidable:
-                problems.append(
-                    f"{registry_name}[{skill_name!r}]: {reason} "
-                    f"Target begins: {target.splitlines()[0]!r}"
-                )
+            if registry_name == "SKILL_FILE_SUBSTITUTIONS":
+                files = sorted(registry[skill_name].items())
+            else:
+                files = [(SKILL_MD_FILENAME, registry[skill_name])]
+            for relpath, pairs in files:
+                path = os.path.join(upstream_skills_dir, skill_name, relpath)
+                if not os.path.isfile(path):
+                    problems.append(
+                        f"{registry_name}[{skill_name!r}]: upstream skill has no {relpath}."
+                    )
+                    continue
+                if registry_name == "SKILL_FOOTERS":
+                    continue
+                with open(path, "r", encoding=UTF_8_ENCODING) as f:
+                    content = f.read()
+                _, undecidable = substitute(content, pairs)
+                for target, reason in undecidable:
+                    problems.append(
+                        f"{registry_name}[{skill_name!r}] {relpath}: {reason} "
+                        f"Target begins: {target.splitlines()[0]!r}"
+                    )
 
     if problems:
         raise UpstreamDriftError("\n".join(f"  - {p}" for p in problems))
 
 
 def apply_substitutions(dest_path, skill_name):
-    """Apply in-place string substitutions to a freshly-synced skill's SKILL.md.
+    """Apply in-place string substitutions to a freshly-synced skill's registered files.
 
     Used when an upstream defect must be corrected in-place (such as a remediation
     sequence where an appended footer would still leave the broken command in the
@@ -643,32 +1141,33 @@ def apply_substitutions(dest_path, skill_name):
     so reaching one here means the copy and the clone disagree; the raise keeps the defect out
     of the tree.
     """
-    substitutions = SKILL_SUBSTITUTIONS.get(skill_name)
-    if not substitutions:
-        return False
+    applied = False
+    for relpath, substitutions in substituted_files(skill_name):
+        path = os.path.join(dest_path, relpath)
+        if not os.path.isfile(path):
+            raise LocalCorrectionLost(
+                f"{skill_name} has substitutions configured but {path} does not exist."
+            )
 
-    skill_md = os.path.join(dest_path, SKILL_MD_FILENAME)
-    if not os.path.isfile(skill_md):
-        raise LocalCorrectionLost(
-            f"{skill_name} has substitutions configured but {skill_md} does not exist."
-        )
+        with open(path, "r", encoding=UTF_8_ENCODING) as f:
+            content = f.read()
 
-    with open(skill_md, "r", encoding=UTF_8_ENCODING) as f:
-        content = f.read()
+        substituted, problems = substitute(content, substitutions)
+        if problems:
+            target, reason = problems[0]
+            registry_name = (
+                "SKILL_SUBSTITUTIONS" if relpath == SKILL_MD_FILENAME else "SKILL_FILE_SUBSTITUTIONS"
+            )
+            raise LocalCorrectionLost(
+                f"{skill_name}/{relpath}: {reason} The entry is in "
+                f"{registry_name}. Target begins: {target.splitlines()[0]!r}"
+            )
 
-    substituted, problems = substitute(content, substitutions)
-    if problems:
-        target, reason = problems[0]
-        raise LocalCorrectionLost(
-            f"{skill_name}/{SKILL_MD_FILENAME}: {reason} The entry is in "
-            f"SKILL_SUBSTITUTIONS. Target begins: {target.splitlines()[0]!r}"
-        )
-
-    if substituted == content:
-        return False
-    with open(skill_md, "w", encoding=UTF_8_ENCODING) as f:
-        f.write(substituted)
-    return True
+        if substituted != content:
+            with open(path, "w", encoding=UTF_8_ENCODING) as f:
+                f.write(substituted)
+            applied = True
+    return applied
 
 
 def inject_footer(dest_path, skill_name):
@@ -797,7 +1296,7 @@ def main():
 
                     # Apply in-place substitutions to correct upstream defects.
                     if apply_substitutions(dest_path, skill_name):
-                        print(f"  Applied substitutions to {skill_name}/{SKILL_MD_FILENAME}")
+                        print(f"  Applied substitutions to {skill_name}")
 
                     # Re-inject the Cluster Agent coupling footer (wiped by the copy above).
                     if inject_footer(dest_path, skill_name):

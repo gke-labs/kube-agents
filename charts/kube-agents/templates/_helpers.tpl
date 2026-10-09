@@ -879,6 +879,23 @@ honest — a quota that large cannot constrain this release either way.
 {{- end -}}
 {{- end }}
 
+{{- /* Saturating int64 add and multiply for the quota sums. Sprig's add and mul are
+       plain int64 and wrap. A sidecar or proxy resource limit the validator admits
+       (any byte count under 2^63; bytesExceedInt64 refuses the rest) can still carry
+       the agent-pod sum or the replica multiply past int64, wrapping a `required`
+       figure negative so the quota check passes every quota -- the exact failure the
+       preflight exists to prevent. These compute in float64 and clamp with clampInt64,
+       so an over-large figure makes `required` read as the MaxInt64 ceiling, which no
+       real quota satisfies, rather than negative. float64 loses integer precision above
+       2^53, which only shifts a figure already far larger than any quota, where the
+       ceiling is the intended answer. Take (dict "a" <int64> "b" <int64>). */ -}}
+{{- define "kube-agents.satAdd" -}}
+{{- include "kube-agents.clampInt64" (addf (float64 .a) (float64 .b)) -}}
+{{- end }}
+{{- define "kube-agents.satMul" -}}
+{{- include "kube-agents.clampInt64" (mulf (float64 .a) (float64 .b)) -}}
+{{- end }}
+
 {{- define "kube-agents.parseCpuMillis" -}}
 {{- $raw := include "kube-agents.normalizeQuantity" . -}}
 {{- $numeric := "^[0-9]+(\\.[0-9]+)?([eE][-+]?[0-9]+)?$" -}}
@@ -1312,39 +1329,50 @@ please report it" message before the CR template could name the key. The checks 
 compare parsed values (zero limit, floor, crossed pair) stay in the CR template, after
 these have passed.
 */}}
-{{- define "kube-agents.credentialProxyResourcesCheck" -}}
-{{- $proxyResources := . | default dict -}}
-{{- $proxyPrefix := "platformAgent.deployment.credentialProxy.resources" -}}
-{{- $proxyUnknown := keys (omit $proxyResources "limits" "requests" "claims") | sortAlpha -}}
-{{- if $proxyUnknown -}}
-{{- fail (printf "%s carries %s, which the PlatformAgent CRD does not declare; the accepted keys are requests, limits and claims. The API server would prune it, and the override would be lost silently" $proxyPrefix (join ", " $proxyUnknown)) -}}
+{{- /* Shape, grammar and representability check for a container's resources override,
+       shared by the credential proxy and the agent-api-auth sidecar. Both the quota
+       preflight and the CR template call it, so a mistyped side key, an unsupported
+       claims, a non-map side, an unknown resource name or a quantity the preflight
+       arithmetic cannot represent (a value float64 reads as zero, a byte count over an
+       int64, a CPU past the millicore range) fails the render naming the key, rather
+       than being pruned silently or reaching the footprint math as garbage. Caller
+       passes resources, prefix, container, pod and consumer (the Downward API reader). */ -}}
+{{- define "kube-agents.containerResourcesCheck" -}}
+{{- $resources := .resources | default dict -}}
+{{- $prefix := .prefix -}}
+{{- $container := .container -}}
+{{- $pod := .pod -}}
+{{- $consumer := .consumer -}}
+{{- $unknown := keys (omit $resources "limits" "requests" "claims") | sortAlpha -}}
+{{- if $unknown -}}
+{{- fail (printf "%s carries %s, which the PlatformAgent CRD does not declare; the accepted keys are requests, limits and claims. The API server would prune it, and the override would be lost silently" $prefix (join ", " $unknown)) -}}
 {{- end -}}
-{{- if index $proxyResources "claims" -}}
-{{- fail (printf "%s.claims is not supported -- the credential-proxy pod declares no resourceClaims, so the operator refuses the key. Remove it." $proxyPrefix) -}}
+{{- if index $resources "claims" -}}
+{{- fail (printf "%s.claims is not supported -- the %s declares no resourceClaims, so the operator refuses the key. Remove it." $prefix $pod) -}}
 {{- end -}}
-{{- $proxyNames := list "cpu" "memory" "ephemeral-storage" -}}
+{{- $names := list "cpu" "memory" "ephemeral-storage" -}}
 {{- /* The CRD's quantity grammar, the sign already stripped, with the
        exponent narrowed to the integer form resource.ParseQuantity reads.
        parseCpuMillis and parseBytes read every form this admits. */ -}}
-{{- $proxyQuantityPattern := "^(([0-9]+(\\.[0-9]*)?)|(\\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE][-+]?[0-9]+))?$" -}}
+{{- $quantityPattern := "^(([0-9]+(\\.[0-9]*)?)|(\\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE][-+]?[0-9]+))?$" -}}
 {{- range $side := list "limits" "requests" -}}
-{{- $quantities := index $proxyResources $side -}}
+{{- $quantities := index $resources $side -}}
 {{- /* `--set ...limits=2Gi` hands range a string, which it cannot walk, and a list
        gives it integer names; either is a shape the CRD refuses. */ -}}
 {{- if not (or (empty $quantities) (kindIs "map" $quantities)) -}}
-{{- fail (printf "%s.%s is %v, which is not a map of resource name to quantity, for example `limits: {memory: 2Gi}`" $proxyPrefix $side $quantities) -}}
+{{- fail (printf "%s.%s is %v, which is not a map of resource name to quantity, for example `limits: {memory: 2Gi}`" $prefix $side $quantities) -}}
 {{- end -}}
 {{- range $name, $quantity := $quantities | default dict -}}
 {{- if not (or (kindIs "invalid" $quantity) (and (kindIs "string" $quantity) (eq $quantity ""))) -}}
 {{- $raw := toString $quantity | trim -}}
-{{- if not (has $name $proxyNames) -}}
-{{- fail (printf "%s.%s.%s: the credential-proxy container declares cpu, memory and ephemeral-storage only, and the operator refuses any other resource name" $proxyPrefix $side $name) -}}
+{{- if not (has $name $names) -}}
+{{- fail (printf "%s.%s.%s: the %s container declares cpu, memory and ephemeral-storage only, and the operator refuses any other resource name" $prefix $side $name $container) -}}
 {{- end -}}
 {{- if hasPrefix "-" $raw -}}
-{{- fail (printf "%s.%s.%s is %s; a quantity must not be negative, and the operator refuses it" $proxyPrefix $side $name $raw) -}}
+{{- fail (printf "%s.%s.%s is %s; a quantity must not be negative, and the operator refuses it" $prefix $side $name $raw) -}}
 {{- end -}}
-{{- if not (regexMatch $proxyQuantityPattern (trimPrefix "+" $raw)) -}}
-{{- fail (printf "%s.%s.%s is %q, which is not a Kubernetes quantity the operator can read (a number with an optional suffix: Ki, Mi, Gi, Ti, Pi, Ei, n, u, m, k, M, G, T, P, E, or an integer exponent such as e3)" $proxyPrefix $side $name $raw) -}}
+{{- if not (regexMatch $quantityPattern (trimPrefix "+" $raw)) -}}
+{{- fail (printf "%s.%s.%s is %q, which is not a Kubernetes quantity the operator can read (a number with an optional suffix: Ki, Mi, Gi, Ti, Pi, Ei, n, u, m, k, M, G, T, P, E, or an integer exponent such as e3)" $prefix $side $name $raw) -}}
 {{- end -}}
 {{- /* float64 holds 15 significant decimal digits exactly; a 16th lets two quantities
        within one part in 10^16 of each other, or of a bound, read as equal, and the
@@ -1354,31 +1382,35 @@ these have passed.
 {{- $significand := regexReplaceAll "([KMGTPE]i|[numkMGTPE])$" (regexReplaceAll "[eE][-+]?[0-9]+$" (trimPrefix "+" $raw) "") "" -}}
 {{- $significand = regexReplaceAll "0+$" (regexReplaceAll "^0+" (replace "." "" $significand) "") "" -}}
 {{- if gt (len $significand) 15 -}}
-{{- fail (printf "%s.%s.%s is %s, which has more than 15 significant digits: the chart compares quantities as float64, which holds 15 exactly, so it cannot check this one against the operator's rules. Write it with a larger unit or fewer digits" $proxyPrefix $side $name $raw) -}}
+{{- fail (printf "%s.%s.%s is %s, which has more than 15 significant digits: the chart compares quantities as float64, which holds 15 exactly, so it cannot check this one against the operator's rules. Write it with a larger unit or fewer digits" $prefix $side $name $raw) -}}
 {{- end -}}
 {{- if include "kube-agents.quantityOverflowsFloat64" $raw -}}
 {{- if eq $name "cpu" -}}
-{{- fail (printf "%s.%s.%s is %s, which is not a representable quantity: it is past the range of a float64, which the chart would read as zero, and its millicore value exceeds the 9223372036854775807 an int64 holds, so the operator refuses it" $proxyPrefix $side $name $raw) -}}
+{{- fail (printf "%s.%s.%s is %s, which is not a representable quantity: it is past the range of a float64, which the chart would read as zero, and its millicore value exceeds the 9223372036854775807 an int64 holds, so the operator refuses it" $prefix $side $name $raw) -}}
 {{- else -}}
-{{- fail (printf "%s.%s.%s is %s, which is not a representable byte count: it exceeds the 9223372036854775807 bytes an int64 holds, which is what the Downward API hands the broker, and the operator refuses it" $proxyPrefix $side $name $raw) -}}
+{{- fail (printf "%s.%s.%s is %s, which is not a representable byte count: it exceeds the 9223372036854775807 bytes an int64 holds, which is what the Downward API hands the %s, and the operator refuses it" $prefix $side $name $raw $consumer) -}}
 {{- end -}}
 {{- end -}}
 {{- if and (ne $name "cpu") (include "kube-agents.bytesExceedInt64" $raw) -}}
-{{- fail (printf "%s.%s.%s is %s, which is not a representable byte count: it exceeds the 9223372036854775807 bytes an int64 holds, which is what the Downward API hands the broker, and the operator refuses it" $proxyPrefix $side $name $raw) -}}
+{{- fail (printf "%s.%s.%s is %s, which is not a representable byte count: it exceeds the 9223372036854775807 bytes an int64 holds, which is what the Downward API hands the %s, and the operator refuses it" $prefix $side $name $raw $consumer) -}}
 {{- end -}}
 {{- /* The operator reads a CPU quantity in millicores (MilliValue), which wraps past
        2^63; it refuses one there, so the render does too. A suffix that carries a
        finite number past float64's range (a 1 and 306 zeros, then k) fails inside
        quantityExact, naming the key. */ -}}
 {{- if eq $name "cpu" -}}
-{{- $cores := include "kube-agents.quantityExact" (dict "raw" $raw "cpu" false "key" (printf "%s.%s.%s" $proxyPrefix $side $name)) | float64 -}}
+{{- $cores := include "kube-agents.quantityExact" (dict "raw" $raw "cpu" false "key" (printf "%s.%s.%s" $prefix $side $name)) | float64 -}}
 {{- if ge (mulf $cores 1000.0) 9223372036854775808.0 -}}
-{{- fail (printf "%s.%s.%s is %s, which is not a CPU count the scheduler can represent in millicores: its millicore value exceeds the 9223372036854775807 an int64 holds, and the operator refuses it" $proxyPrefix $side $name $raw) -}}
+{{- fail (printf "%s.%s.%s is %s, which is not a CPU count the scheduler can represent in millicores: its millicore value exceeds the 9223372036854775807 an int64 holds, and the operator refuses it" $prefix $side $name $raw) -}}
 {{- end -}}
 {{- end -}}
 {{- end -}}
 {{- end -}}
 {{- end -}}
+{{- end }}
+
+{{- define "kube-agents.credentialProxyResourcesCheck" -}}
+{{- include "kube-agents.containerResourcesCheck" (dict "resources" . "prefix" "platformAgent.deployment.credentialProxy.resources" "container" "credential-proxy" "pod" "credential-proxy pod" "consumer" "broker") -}}
 {{- end }}
 
 {{/*
@@ -1458,6 +1490,21 @@ The defaults carry no ephemeral-storage request because the operator renders non
       "requests" (dict "cpu" "500m" "memory" "512Mi")
       "limits" (dict "cpu" "1" "memory" "2Gi" "ephemeral-storage" "2Gi")
    | toJson -}}
+{{- end }}
+
+{{- /* The agent-api-auth sidecar's defaults, the agentAPIAuth* constants in
+       k8s-operator/internal/controller/platformagent_manifests.go. Declared once so
+       the footprint delta reads them here rather than as scattered literals;
+       tests/test_agent_api_auth_sizing_parity.py holds this equal to the operator. */ -}}
+{{- define "kube-agents.agentAPIAuthDefaults" -}}
+{{- dict
+      "requests" (dict "cpu" "150m" "memory" "384Mi")
+      "limits" (dict "cpu" "1" "memory" "2Gi" "ephemeral-storage" "2Gi")
+   | toJson -}}
+{{- end }}
+
+{{- define "kube-agents.agentAPIAuthResourcesCheck" -}}
+{{- include "kube-agents.containerResourcesCheck" (dict "resources" . "prefix" "platformAgent.deployment.agentAPIAuth.resources" "container" "agent-api-auth" "pod" "gateway pod" "consumer" "event watcher") -}}
 {{- end }}
 
 {{- define "kube-agents.credentialProxyMemoryFloorBytes" -}}
@@ -1582,6 +1629,82 @@ The defaults carry no ephemeral-storage request because the operator renders non
   {{- $podReqEph := $base.ephemeralStorageBytesRequest | default 0 | int64 -}}
   {{- $podLimEph := $base.ephemeralStorageBytesLimit | default 0 | int64 -}}
 
+  {{- /* The agent-api-auth sidecar is one container of this pod, so its default
+         requests and limits are already in agentPod.base above. A
+         spec.deployment.agentAPIAuth.resources override (resolveAgentAPIAuthResources
+         in the operator) changes them per key, so add the override-minus-default
+         delta here before the pod is multiplied by replicas, the same accounting
+         kube-agents.credentialProxyFootprint does for the proxy's own pod. Without
+         it the preflight passes a quota the raised sidecar will not fit, and the
+         gateway's Recreate rollout then deletes the running Pod before the quota
+         refuses the larger one. The defaults are the agentAPIAuth* constants in
+         k8s-operator/internal/controller/platformagent_manifests.go: 150m and 384Mi
+         requests, 1 CPU, 2Gi memory and 2Gi ephemeral-storage limits; the sidecar
+         declares no ephemeral request, which the API server defaults to the limit,
+         so the base counts 2Gi on both ephemeral sides. */ -}}
+  {{- $aaResources := (((.Values.platformAgent.deployment | default dict).agentAPIAuth | default dict).resources) | default dict -}}
+  {{- include "kube-agents.agentAPIAuthResourcesCheck" $aaResources -}}
+  {{- $aaReq := (index $aaResources "requests") | default dict -}}
+  {{- $aaLim := (index $aaResources "limits") | default dict -}}
+  {{- $aaDefaults := include "kube-agents.agentAPIAuthDefaults" . | fromJson -}}
+  {{- $aaReqDef := index $aaDefaults "requests" -}}
+  {{- $aaLimDef := index $aaDefaults "limits" -}}
+  {{- /* Default sidecar figures as the numbers the footprint uses. */ -}}
+  {{- $defCpuReq := include "kube-agents.parseCpuMillis" (index $aaReqDef "cpu") | int64 -}}
+  {{- $defCpuLim := include "kube-agents.parseCpuMillis" (index $aaLimDef "cpu") | int64 -}}
+  {{- $defMemReq := include "kube-agents.parseBytes" (index $aaReqDef "memory") | int64 -}}
+  {{- $defMemLim := include "kube-agents.parseBytes" (index $aaLimDef "memory") | int64 -}}
+  {{- $defEph := include "kube-agents.parseBytes" (index $aaLimDef "ephemeral-storage") | int64 -}}
+  {{- /* Merged over the defaults, the pod the operator would render. The sidecar declares
+         no ephemeral request, which the API server defaults to the limit, so both ephemeral
+         sides start at the default limit and the request follows an override of the limit
+         unless set explicitly. */ -}}
+  {{- $mCpuReq := $defCpuReq -}}{{- with include "kube-agents.declaredQuantity" (dict "value" (index $aaReq "cpu") "fallback" "") -}}{{- $mCpuReq = include "kube-agents.parseCpuMillis" . | int64 -}}{{- end -}}
+  {{- $mCpuLim := $defCpuLim -}}{{- with include "kube-agents.declaredQuantity" (dict "value" (index $aaLim "cpu") "fallback" "") -}}{{- $mCpuLim = include "kube-agents.parseCpuMillis" . | int64 -}}{{- end -}}
+  {{- $mMemReq := $defMemReq -}}{{- with include "kube-agents.declaredQuantity" (dict "value" (index $aaReq "memory") "fallback" "") -}}{{- $mMemReq = include "kube-agents.parseBytes" . | int64 -}}{{- end -}}
+  {{- $mMemLim := $defMemLim -}}{{- with include "kube-agents.declaredQuantity" (dict "value" (index $aaLim "memory") "fallback" "") -}}{{- $mMemLim = include "kube-agents.parseBytes" . | int64 -}}{{- end -}}
+  {{- $mEphLim := $defEph -}}{{- $mEphReq := $defEph -}}
+  {{- with include "kube-agents.declaredQuantity" (dict "value" (index $aaLim "ephemeral-storage") "fallback" "") -}}{{- $mEphLim = include "kube-agents.parseBytes" . | int64 -}}{{- $mEphReq = $mEphLim -}}{{- end -}}
+  {{- with include "kube-agents.declaredQuantity" (dict "value" (index $aaReq "ephemeral-storage") "fallback" "") -}}{{- $mEphReq = include "kube-agents.parseBytes" . | int64 -}}{{- end -}}
+  {{- /* The operator refuses a zero limit or a request above its limit (validateContainerResources)
+         and renders the sidecar at its defaults, Degraded. agentAPIAuthResourcesCheck above does not
+         refuse those -- they stay the operator's and the webhook's -- so the preflight must count the
+         override's delta only for an override the operator will actually render, or it under- or
+         over-counts the pod against the quota the operator never asks for. */ -}}
+  {{- /* The refusal is the operator's exact resource.Quantity comparison, so it reads the
+         merged raw quantities through kube-agents.quantityExact rather than the rounded
+         $mMemLim/$mMemReq integers above: parseBytes and parseCpuMillis ceil an m/u/n
+         quantity, so a limit half a byte under a default request rounds up onto it and the
+         integer gate would miss a crossed pair the operator refuses. The proxy's CR block
+         decides the same thing on the same exact figures (platform-agent-cr.yaml). The
+         rounded integers stay the quota-sum arithmetic, which wants the whole-byte figure. */ -}}
+  {{- $mCpuLimRaw := include "kube-agents.declaredQuantity" (dict "value" (index $aaLim "cpu") "fallback" (index $aaLimDef "cpu")) -}}
+  {{- $mCpuReqRaw := include "kube-agents.declaredQuantity" (dict "value" (index $aaReq "cpu") "fallback" (index $aaReqDef "cpu")) -}}
+  {{- $mMemLimRaw := include "kube-agents.declaredQuantity" (dict "value" (index $aaLim "memory") "fallback" (index $aaLimDef "memory")) -}}
+  {{- $mMemReqRaw := include "kube-agents.declaredQuantity" (dict "value" (index $aaReq "memory") "fallback" (index $aaReqDef "memory")) -}}
+  {{- $mEphLimRaw := include "kube-agents.declaredQuantity" (dict "value" (index $aaLim "ephemeral-storage") "fallback" (index $aaLimDef "ephemeral-storage")) -}}
+  {{- $mEphReqRaw := include "kube-agents.declaredQuantity" (dict "value" (index $aaReq "ephemeral-storage") "fallback" $mEphLimRaw) -}}
+  {{- $xCpuLim := include "kube-agents.quantityExact" (dict "raw" $mCpuLimRaw "cpu" true "key" "platformAgent.deployment.agentAPIAuth.resources.limits.cpu") | float64 -}}
+  {{- $xCpuReq := include "kube-agents.quantityExact" (dict "raw" $mCpuReqRaw "cpu" true "key" "platformAgent.deployment.agentAPIAuth.resources.requests.cpu") | float64 -}}
+  {{- $xMemLim := include "kube-agents.quantityExact" (dict "raw" $mMemLimRaw "cpu" false "key" "platformAgent.deployment.agentAPIAuth.resources.limits.memory") | float64 -}}
+  {{- $xMemReq := include "kube-agents.quantityExact" (dict "raw" $mMemReqRaw "cpu" false "key" "platformAgent.deployment.agentAPIAuth.resources.requests.memory") | float64 -}}
+  {{- $xEphLim := include "kube-agents.quantityExact" (dict "raw" $mEphLimRaw "cpu" false "key" "platformAgent.deployment.agentAPIAuth.resources.limits.ephemeral-storage") | float64 -}}
+  {{- $xEphReq := include "kube-agents.quantityExact" (dict "raw" $mEphReqRaw "cpu" false "key" "platformAgent.deployment.agentAPIAuth.resources.requests.ephemeral-storage") | float64 -}}
+  {{- $aaRefused := false -}}
+  {{- if or (eq $xCpuLim 0.0) (eq $xMemLim 0.0) (eq $xEphLim 0.0) -}}{{- $aaRefused = true -}}{{- end -}}
+  {{- if or (gt $xCpuReq $xCpuLim) (gt $xMemReq $xMemLim) (gt $xEphReq $xEphLim) -}}{{- $aaRefused = true -}}{{- end -}}
+  {{- if not $aaRefused -}}
+  {{- /* satAdd, not add: an admitted sidecar limit near 2^63 carries the pod sum past
+         int64 and would wrap `required` negative. The sub stays plain -- a merged
+         figure minus its default is always below the merged figure and cannot wrap. */ -}}
+  {{- $podReqCpu = include "kube-agents.satAdd" (dict "a" $podReqCpu "b" (sub $mCpuReq $defCpuReq)) | int64 -}}
+  {{- $podLimCpu = include "kube-agents.satAdd" (dict "a" $podLimCpu "b" (sub $mCpuLim $defCpuLim)) | int64 -}}
+  {{- $podReqMem = include "kube-agents.satAdd" (dict "a" $podReqMem "b" (sub $mMemReq $defMemReq)) | int64 -}}
+  {{- $podLimMem = include "kube-agents.satAdd" (dict "a" $podLimMem "b" (sub $mMemLim $defMemLim)) | int64 -}}
+  {{- $podLimEph = include "kube-agents.satAdd" (dict "a" $podLimEph "b" (sub $mEphLim $defEph)) | int64 -}}
+  {{- $podReqEph = include "kube-agents.satAdd" (dict "a" $podReqEph "b" (sub $mEphReq $defEph)) | int64 -}}
+  {{- end -}}
+
   {{- /* The dashboard is another container in the agent pod rather than a pod of its own,
          so it scales with the same replica count and adds no pod. Its flag is
          harness.hermes.dashboardEnabled; reading it one level up at harness.dashboardEnabled
@@ -1594,21 +1717,26 @@ The defaults carry no ephemeral-storage request because the operator renders non
   {{- end -}}
   {{- if $dashEnabled -}}
     {{- $dash := (index $op "agentPod" "dashboard") | default dict -}}
-    {{- $podReqCpu = add $podReqCpu ($dash.cpuMillisRequest | default 0 | int64) -}}
-    {{- $podLimCpu = add $podLimCpu ($dash.cpuMillisLimit | default 0 | int64) -}}
-    {{- $podReqMem = add $podReqMem ($dash.memoryBytesRequest | default 0 | int64) -}}
-    {{- $podLimMem = add $podLimMem ($dash.memoryBytesLimit | default 0 | int64) -}}
-    {{- $podReqEph = add $podReqEph ($dash.ephemeralStorageBytesRequest | default 0 | int64) -}}
-    {{- $podLimEph = add $podLimEph ($dash.ephemeralStorageBytesLimit | default 0 | int64) -}}
+    {{- /* satAdd: the pod sum above may already be the saturated ceiling from a huge
+           sidecar override, which a plain add would wrap. */ -}}
+    {{- $podReqCpu = include "kube-agents.satAdd" (dict "a" $podReqCpu "b" ($dash.cpuMillisRequest | default 0 | int64)) | int64 -}}
+    {{- $podLimCpu = include "kube-agents.satAdd" (dict "a" $podLimCpu "b" ($dash.cpuMillisLimit | default 0 | int64)) | int64 -}}
+    {{- $podReqMem = include "kube-agents.satAdd" (dict "a" $podReqMem "b" ($dash.memoryBytesRequest | default 0 | int64)) | int64 -}}
+    {{- $podLimMem = include "kube-agents.satAdd" (dict "a" $podLimMem "b" ($dash.memoryBytesLimit | default 0 | int64)) | int64 -}}
+    {{- $podReqEph = include "kube-agents.satAdd" (dict "a" $podReqEph "b" ($dash.ephemeralStorageBytesRequest | default 0 | int64)) | int64 -}}
+    {{- $podLimEph = include "kube-agents.satAdd" (dict "a" $podLimEph "b" ($dash.ephemeralStorageBytesLimit | default 0 | int64)) | int64 -}}
   {{- end -}}
 
-  {{- $reqPods = add $reqPods (mul ($base.pods | default 1 | int64) $agentReplicas) -}}
-  {{- $reqCpu = add $reqCpu (mul $podReqCpu $agentReplicas) -}}
-  {{- $limCpu = add $limCpu (mul $podLimCpu $agentReplicas) -}}
-  {{- $reqMem = add $reqMem (mul $podReqMem $agentReplicas) -}}
-  {{- $limMem = add $limMem (mul $podLimMem $agentReplicas) -}}
-  {{- $reqEph = add $reqEph (mul $podReqEph $agentReplicas) -}}
-  {{- $limEph = add $limEph (mul $podLimEph $agentReplicas) -}}
+  {{- /* satMul/satAdd: the pod sum times the replica count is where an admitted
+         override most easily passes int64 -- a figure under 2^63 doubles over it at
+         two replicas -- so both the multiply and the accumulation saturate. */ -}}
+  {{- $reqPods = include "kube-agents.satAdd" (dict "a" $reqPods "b" (include "kube-agents.satMul" (dict "a" ($base.pods | default 1 | int64) "b" $agentReplicas))) | int64 -}}
+  {{- $reqCpu = include "kube-agents.satAdd" (dict "a" $reqCpu "b" (include "kube-agents.satMul" (dict "a" $podReqCpu "b" $agentReplicas))) | int64 -}}
+  {{- $limCpu = include "kube-agents.satAdd" (dict "a" $limCpu "b" (include "kube-agents.satMul" (dict "a" $podLimCpu "b" $agentReplicas))) | int64 -}}
+  {{- $reqMem = include "kube-agents.satAdd" (dict "a" $reqMem "b" (include "kube-agents.satMul" (dict "a" $podReqMem "b" $agentReplicas))) | int64 -}}
+  {{- $limMem = include "kube-agents.satAdd" (dict "a" $limMem "b" (include "kube-agents.satMul" (dict "a" $podLimMem "b" $agentReplicas))) | int64 -}}
+  {{- $reqEph = include "kube-agents.satAdd" (dict "a" $reqEph "b" (include "kube-agents.satMul" (dict "a" $podReqEph "b" $agentReplicas))) | int64 -}}
+  {{- $limEph = include "kube-agents.satAdd" (dict "a" $limEph "b" (include "kube-agents.satMul" (dict "a" $podLimEph "b" $agentReplicas))) | int64 -}}
   {{- /* Only an HA gateway surges. The operator gives the gateway Deployment a
          RollingUpdate strategy only when availability.replicas is above 1 and renders
          `strategy: Recreate` otherwise (resolveDeploymentReplicasAndStrategy in
@@ -1633,26 +1761,30 @@ The defaults carry no ephemeral-storage request because the operator renders non
          generic keys here ensures that any workload summed into extract_footprint is
          automatically counted by the preflight without requiring manual template edits.
          agentPod and storage are handled separately above and below. */ -}}
-  {{- /* The one operator-rendered workload with a sizing override in values: the proxy's
-         footprint entry takes platformAgent.deployment.credentialProxy.resources over it
-         per key (kube-agents.credentialProxyFootprint) before it is summed, so a raised
-         memory limit is counted here as the pod the operator will write, rather than the
-         preflight passing a quota the release will not fit. An ephemeral-storage limit set
-         alone is counted as a request of that size too: the operator renders no
-         ephemeral-storage request and the API server defaults it to the limit. */ -}}
+  {{- /* The credential proxy is the one operator-rendered workload of its own pod with a
+         sizing override: its footprint entry takes platformAgent.deployment.credentialProxy.resources
+         over it per key (kube-agents.credentialProxyFootprint) before it is summed, so a
+         raised memory limit is counted here as the pod the operator will write, rather than
+         the preflight passing a quota the release will not fit. An ephemeral-storage limit
+         set alone is counted as a request of that size too: the operator renders no
+         ephemeral-storage request and the API server defaults it to the limit. The
+         agent-api-auth sidecar has a sizing override too, but it is a container of the agent
+         pod, so its delta is added to agentPod above rather than counted here. */ -}}
   {{- $proxyOverride := (((.Values.platformAgent.deployment | default dict).credentialProxy | default dict).resources) | default dict -}}
   {{- range $key, $workload := $op -}}
     {{- if and (ne $key "agentPod") (ne $key "storage") -}}
       {{- if and (eq $key "credentialProxy") $proxyOverride -}}
         {{- $workload = include "kube-agents.credentialProxyFootprint" (dict "workload" $workload "override" $proxyOverride) | fromJson -}}
       {{- end -}}
-      {{- $reqPods = add $reqPods (include "kube-agents.replicaCount" $workload.pods | int64) -}}
-      {{- $reqCpu = add $reqCpu ($workload.cpuMillisRequest | default 0 | int64) -}}
-      {{- $limCpu = add $limCpu ($workload.cpuMillisLimit | default 0 | int64) -}}
-      {{- $reqMem = add $reqMem ($workload.memoryBytesRequest | default 0 | int64) -}}
-      {{- $limMem = add $limMem ($workload.memoryBytesLimit | default 0 | int64) -}}
-      {{- $reqEph = add $reqEph ($workload.ephemeralStorageBytesRequest | default 0 | int64) -}}
-      {{- $limEph = add $limEph ($workload.ephemeralStorageBytesLimit | default 0 | int64) -}}
+      {{- /* satAdd: a total above may already be the saturated ceiling from a huge
+             agent-pod override, which a plain add here would wrap back negative. */ -}}
+      {{- $reqPods = include "kube-agents.satAdd" (dict "a" $reqPods "b" (include "kube-agents.replicaCount" $workload.pods | int64)) | int64 -}}
+      {{- $reqCpu = include "kube-agents.satAdd" (dict "a" $reqCpu "b" ($workload.cpuMillisRequest | default 0 | int64)) | int64 -}}
+      {{- $limCpu = include "kube-agents.satAdd" (dict "a" $limCpu "b" ($workload.cpuMillisLimit | default 0 | int64)) | int64 -}}
+      {{- $reqMem = include "kube-agents.satAdd" (dict "a" $reqMem "b" ($workload.memoryBytesRequest | default 0 | int64)) | int64 -}}
+      {{- $limMem = include "kube-agents.satAdd" (dict "a" $limMem "b" ($workload.memoryBytesLimit | default 0 | int64)) | int64 -}}
+      {{- $reqEph = include "kube-agents.satAdd" (dict "a" $reqEph "b" ($workload.ephemeralStorageBytesRequest | default 0 | int64)) | int64 -}}
+      {{- $limEph = include "kube-agents.satAdd" (dict "a" $limEph "b" ($workload.ephemeralStorageBytesLimit | default 0 | int64)) | int64 -}}
     {{- end -}}
   {{- end -}}
 

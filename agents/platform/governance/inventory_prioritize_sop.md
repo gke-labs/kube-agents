@@ -5,17 +5,19 @@ findings queue that later publishers read, and the short ranked report the user 
 `/opt/data/INVENTORY.raw.md`, registers every finding through
 `/opt/data/scripts/inventory_findings.py`, writes `/opt/data/INVENTORY.md`.
 
-**You do not decide what the findings are, and you do not make the registration call.** The
-onboarding hand-off wrote a machine-readable block into the raw file; `inventory_findings.py extract` turns it into a
-numbered list, `register` refuses to send anything until every number on that list carries a score,
-and `ranked` reads the order back. Your job between those commands is judgement — scoring, and
-choosing what the report shows — and nothing else.
+**You do not decide what the findings are, you do not make the registration call, and you do not
+choose what the report lists.** The onboarding hand-off wrote a machine-readable block into the raw
+file; `inventory_findings.py extract` turns it into a numbered list, `register` refuses to send
+anything until every number on that list carries a score, and `select` picks the report's items from
+those scores. Your job between those commands is judgement — scoring, and writing the report — and
+nothing else.
 
 This is the last stage before delivery. The file you write is posted to the user **verbatim** by the
 `bootstrap-inventory-delivery` job — no agent edits or reformats it afterward.
 
-The report shows at most five items and the queue holds all of them, so a finding that does not
-reach the report is deferred rather than discarded.
+The report lists only the most urgent critical findings, up to a limit the install sets, and the
+queue holds all of them, so a finding that does not reach the report is deferred rather than
+discarded: the findings nudge brings the rest to chat a few a day.
 
 ---
 
@@ -49,7 +51,7 @@ context to gather. The findings file plus the rules below are sufficient, and an
 is either irrelevant or will tempt you into reporting something the sweep did not find.
 
 `inventory_findings.py` is the exception, and it runs the other direction: it reads the raw file
-you already have, records it, and reads back the order the queue computed. It is not a place to
+you already have, records it, and chooses what the report lists from your scores. It is not a place to
 look for findings the raw file does not contain, and it is not a licence to run anything else.
 
 **The findings file is complete, however short it looks.** Read it once, whole. Do not page through
@@ -112,7 +114,8 @@ only set.** Do not add an item you noticed in the prose and the block missed, do
 reads like a duplicate, and do not merge two into one. The block's lines were written per affected
 object on purpose: a missing `readinessProbe` on three Deployments is three rows in the queue,
 because each has its own manifest to change and its own life — one gets fixed next week and the other
-two do not. Step 5 gathers them back into a single report line ("3 Deployments in `payments`").
+two do not. Step 5's `select` gathers them back into a single report line ("3 Deployments in
+`payments`").
 
 `extract` writes the list to `/opt/data/INVENTORY.items.json`, which is what Step 4's `register`
 reads. Leave both at their defaults.
@@ -227,7 +230,7 @@ be catastrophic if someone first compromised a node".
 matching `gke-*` or `gmp-*` is not the operator's to fix. They do not own the manifest, cannot change
 it, and a recommendation to do so is not weak advice, it is impossible advice. Score and register
 these rows like any other and set `provider_managed: true`; the queue never opens a pull request
-against one. In the report they do not compete for a slot — see Step 5.
+against one. The report does not list them — see Step 5.
 
 The queue derives this flag from the namespace as well, so it is set whether or not you pass it. Pass
 it anyway when you know it, and pass it for a provider-managed object that sits outside those
@@ -352,74 +355,64 @@ was sent. Fix every problem it listed and run it again; the run is repeatable an
 is safe.
 
 **Exit 13 — one or more clusters could not be sent.** **Write the report anyway.** The clusters it
-did not name are registered; the ones it named are not. Say which in the card's completion summary,
-do not block the card, do not retry more than once, and do not skip Step 5. A user waiting on their
-first report is not served by a stage that stops because a background queue was unavailable.
+did not name are registered; the ones it named are not yet. The delivery job registers the whole
+batch again from the agent pod when it delivers the report, from the items and scores files this
+step read, so leave both in place. Where your terminal cannot reach the queue at all, every cluster
+fails this way. Say which clusters failed in the card's completion summary, do not block the card,
+do not retry more than once, and do not skip Step 5. A user waiting on their first report is not
+served by a stage that stops because a background queue was unavailable.
 
 On success the script prints each cluster's outcomes and a final `registered N of N`. It also names
 any finding that came back **`suppressed`**, meaning the user has already dismissed it permanently: a
-suppressed finding must not appear in the report or in the roll-up count.
+suppressed finding must not appear in the report or in the roll-up count, so Step 5 passes its id to
+`select`.
 
 ---
 
 ## Step 5: Select What to Show
 
 ```
-python3 /opt/data/scripts/inventory_findings.py ranked
+python3 /opt/data/scripts/inventory_findings.py select
 ```
 
-**Take the order it gives you.** It is computed from the vectors you just registered, by the same
-rule for every source, and it is the reason this stage is reproducible. Do not re-sort it, do not
-second-guess a placement, and do not promote a finding because it reads worse than the one above it.
-Each row carries its score, severity, check, object and the `provider_managed` and `not_actionable`
-flags the rules below turn on, and the `total:` line is what the roll-up counts from.
+Add `--exclude <id>` once for each id Step 4 named as suppressed.
 
-If it exits 13 the queue is unreachable: rank by the scores you computed in Step 3 instead —
-actionable before unactionable, then highest score first — and say so in the card summary.
+**List exactly the items it prints, in the order it prints them, and nothing else.** It scores the
+vectors in `/opt/data/INVENTORY.scores.json` by the queue's own rule, so it gives the same answer
+whether or not Step 4 reached the queue, and it applies the rules the queue's pacing runs on: rows
+with the same check on one cluster are one item, an item is as severe as its worst row, a
+provider-managed observation is never an item, and the report lists the top critical items up to the
+install's limit, which `select` reads from a file the hand-off wrote. Do not add an item it left out,
+drop one it printed, or reorder them. It also writes `/opt/data/INVENTORY.shown.json`, which the
+delivery job uses to record those items as shown; leave it where it is.
 
-From the top of that order:
+Each printed item gives its check, project and cluster, then one line per row: the row's Step 2 id,
+severity, namespace and object, and title. Write one report item for each printed item. An item with
+several rows is one gathered line: name the count and the objects, "3 Deployments in `payments`",
+listing names where there are few enough to be useful and a count where there are not.
 
-- **The list holds at most 5 items in total**, counting everything — criticals included. The one
-  exception is when critical findings alone exceed 5: those are never capped and never rolled up, so
-  the list is exactly those criticals and nothing else.
-- **Gather rows that share a condition into one line.** The same missing probe on three Deployments
-  was registered as three rows and appears once, naming the count and the objects: "3 Deployments in
-  `payments`", listing names where there are few enough to be useful and a count where there are not.
-  A gathered line takes one slot and sits at its highest-scoring member's place.
-- **Rows flagged `provider_managed` do not take a slot.** All of them together become at most one
-  informational item, phrased as an observation rather than an instruction ("14 GKE-managed workloads
-  in `kube-system` and `gmp-system` run without explicit resource limits; these are managed by GKE
-  and not yours to change"), or are folded into the roll-up when there is no room. A provider-managed
-  workload that is actively failing is the exception and is reported normally, at its rank.
-- **All informational findings share a single item between them.** However many `minor` and
-  unactionable findings survive, they get one slot in the list, not one each. Write that item at the
-  level of the shared risk, name the worst instance concretely, and name or count the others inside
-  it. Informational findings never occupy more than one slot while any `major` finding exists.
-- **Anything not shown is rolled up**, not dropped: one line giving the count and where it lives,
-  e.g. `Also found: 14 more items, tracked in the findings queue — ask for the full list.` The count
-  is the `total:` line `ranked` printed minus the rows you showed or gathered into a shown line —
-  count it off that list, not off what you remember registering. A run that
-  reported "6 more items" against a queue holding three, all three of them shown, is what this
-  sentence is here to stop. **Omit
-  this line entirely when nothing remains** — printing `Also found: 0 items` is noise, and it is a
-  sign the selection was padded to a target.
+**Criticals past the limit and every non-critical finding are deferred, not dropped.** `select`
+prints a `roll-up:` line with how many items it did not list and how many of those are critical.
+Write the report's roll-up line from it: one line giving the count, saying how many are critical
+when any are, and where the rest lives, e.g. `Also found: 14 more items, 2 of them critical,
+tracked in the findings queue — I'll bring them to you a few a day.` When it prints a `pace:` line,
+say when the rest arrives, using the times and counts it prints, or, when it says they are not added
+in chat, that they wait in the queue until the user asks. **Omit the roll-up line entirely
+when it prints `roll-up: none`** — printing `Also found: 0 items` is noise.
 
-**Five is a ceiling, not a quota.** Report the number of distinct problems the cluster actually has.
-If that number is two, the report has two items and is a better report for it. Never pad toward five
-by splitting a gathered line back into its objects, by giving informational findings a slot each, or
-by listing a category rollup as though it were a finding. Padding is the failure this stage was built
-to fix; a short report is the success case, not an incomplete one.
+**A report that lists no item is a correct report.** When `select` prints `list no item; there are
+no critical findings`, say so plainly in the posture, give the roll-up line, and say when the rest
+arrives. A quiet cluster is a good result and should read like one. When it prints `list no item;
+the limit is 0`, the install has turned the list off: write the posture and the roll-up line only.
+Never fill the list with non-critical findings. They reach the user through the nudge, which adds
+them only once nothing critical is waiting, and a report padded with them is the failure this stage
+was rebuilt to stop.
 
-Grouping informational findings is deliberate even when they have genuinely different owners and
-different fixes. A first report exists to tell someone what to look at first. A list where one item
-is a real problem and four are low-severity latent risks reads as five problems, and buries the one
-that matters — which is the same failure as listing the same finding five times, arrived at honestly.
+If it exits 12, the scores file no longer matches the extracted list; fix every problem it names and
+run it again.
 
-If there are no `critical` or `major` findings at all, say that plainly and show at most the top 3
-informational items. A quiet cluster is a good result and should read like one.
-
-**Nothing is dropped, and now nothing needs to be.** Every finding is registered, and every
-registered finding is either shown, gathered into a shown line, or counted in the roll-up.
+**Nothing is dropped.** Every finding is registered, and every registered finding is either listed,
+gathered into a listed line, or counted in the roll-up.
 
 ---
 
@@ -430,17 +423,18 @@ Write clean Markdown that reads well in a chat client. Structure:
 1. **One-line heading**, e.g. `# GKE Environment Scan`.
 2. **One or two sentences of posture:** what was scanned (clusters, nodes, workloads) and the
    headline judgement. Give the reader the shape of their environment before the problems.
-3. **The selected findings**, in the queue's order, as a numbered list. **Two lines each, no
-   sub-bullets:** a bold one-line headline naming the problem and where it is (cluster, namespace and
-   object, or for a gathered line the count and affected objects), then one sentence covering what
-   breaks if it is left alone and the action to take, in that order.
+3. **The selected findings**, in the order `select` printed, as a numbered list. **Two lines each,
+   no sub-bullets:** a bold one-line headline that opens with the severity label `Critical:` and names
+   the problem and where it is (cluster, namespace and object, or for a gathered line the count and
+   affected objects), then one sentence covering what breaks if it is left alone and the action to
+   take, in that order. When `select` listed no item, there is no list.
 
    Resist expanding this into a labelled block per finding. The reader is deciding what to look at
    first, not executing the fix from a chat window. Config snippets, exact field paths and
    step-by-step remediation belong in the full inventory or in a remediation pull request, not here.
    A report that takes a screen to skim has failed even if every word in it is correct.
 
-4. **The roll-up line** for everything not shown.
+4. **The roll-up line** for everything not listed, when Step 5 says to write one.
 5. **A closing line** telling the user the full inventory is available on request.
 
 ### Hard constraints
@@ -448,8 +442,8 @@ Write clean Markdown that reads well in a chat client. Structure:
 - **Aim for 2000 characters; 4000 is the hard ceiling.** The delivery router truncates longer messages with
   a `... [truncated]` footer on adapters that do not declare `splits_long_messages`. Check the length
   before you finish; if it is over, tighten the prose — do not drop a finding to fit.
-- **Report only what came back from the queue.** The raw file is the only thing you may register
-  from, and the ranked list is the only thing you may report from. Do not add findings, infer
+- **Report only what `select` chose.** The raw file is the only thing you may register from, and
+  the items `select` printed are the only ones you may list. Do not add findings, infer
   problems the sweep did not record, or supplement from your own knowledge of the environment. If the
   raw file is thin, the report is short.
 - **Do not reproduce the raw file's tables.** The full fleet and workload tables stay in

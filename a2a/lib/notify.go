@@ -1,5 +1,7 @@
 package lib
 
+import "encoding/json"
+
 // The chat.notify wire contract, shared by the gateway that answers it
 // (a2a/gateway/notify.go) and the `a2a notify` command that sends it from the
 // agent container. The grants that bound who may do either are rendered by
@@ -34,6 +36,20 @@ type NotifyRequest struct {
 	// requester has recorded it as possibly posted, so the gateway logs the
 	// loss as an error rather than as an ordinary refusal. Zero is unknown.
 	WaitMillis int64 `json:"wait_ms,omitempty"`
+	// Conversation, with ContextID, aims the request at a conversation the
+	// gateway holds (its session-record key, e.g. "gchat:spaces/A/threads/B")
+	// rather than the home channel. The gateway posts it only when that
+	// conversation's session record carries ContextID: the context id the
+	// conversation's own tasks brought to the agent. Thread must be empty.
+	Conversation string `json:"conversation,omitempty"`
+	ContextID    string `json:"context_id,omitempty"`
+	// Chat and Update are reserved for a card's work after its task ends:
+	// Chat a kube-agents.chat/v1 object, with Text its fallback, and Update
+	// a sender-chosen key whose later request edits the message the first
+	// posted in the same conversation. This gateway does not read them yet;
+	// a request carrying them is posted as its Text.
+	Chat   json.RawMessage `json:"chat,omitempty"`
+	Update string          `json:"update,omitempty"`
 }
 
 // NotifyReply is the answer: the first message posted and the thread it

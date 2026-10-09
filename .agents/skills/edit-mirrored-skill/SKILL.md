@@ -122,7 +122,7 @@ a skill otherwise, patch it at its current pin ("Make a change").
      `git log -- agents/platform/skills/<skill>`.
   2. Run `make skills-import SKILL=<skill> REF=<commit>`.
   3. Diff `third_party/google-skills/<skill>/` against the shipped skill. Every difference must
-     trace to a `SKILL_SUBSTITUTIONS` or `SKILL_FOOTERS` entry in
+     trace to a `SKILL_SUBSTITUTIONS`, `SKILL_FILE_SUBSTITUTIONS` or `SKILL_FOOTERS` entry in
      `scripts/sync-upstream-skills.py`, or to a known local edit. If any other hunk remains, `REF`
      is wrong: delete the copy and lock and import again with another commit.
   4. Run `make skills-generate SKILL=<skill>`. This resets the shipped skill to the copy; the

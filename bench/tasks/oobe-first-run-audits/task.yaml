@@ -1,3 +1,11 @@
+# PARKED -- a KNOWN_UNREGISTERED entry in scripts/validate_bench_cases.py, in
+# no roster file under hack/eval/, since 2026-10-09, until #2806 lands. Its first nightly held the
+# infra lock 140 minutes and the deadline cut the main part; every repetition
+# graded blocked, because the no-tool turn below leaves an empty trajectory and
+# the gate's liveness rung reads that as no agent run (#2699's
+# tool_calls_optional is the open fix). hack/eval/nightly-cases.txt
+# (the 2026-10-09 paragraph) has the night's numbers.
+#
 # Domain: fleet audits. Journey: a fresh install's onboarding inventory scan has
 # settled, and the four fleet audits it would otherwise leave to their schedules
 # (the next 06:20 UTC, the next Monday for cost) start at once.
