@@ -30,7 +30,8 @@
 # it starts are real runs: each writes its ledger issue in the install's GitOps
 # repository (with none, its report in the report store) and, when it changed
 # something, posts its summary wherever the install sends audit reports. The
-# runner holds their four streams' locks for the unit (`audit_streams` below), and
+# runner holds their streams' locks for the unit (`audit_streams` below; the stage
+# also starts the upgrade retrospective after the four, so its stream is listed), and
 # every unit on one of those streams first waits up to two hours for a run the
 # install started there, so no audit case runs beside them and the next repetition
 # arms only once they have ended. The runner does not hold the infra lock for it
@@ -69,12 +70,16 @@ tool_calls_optional: true
 # The streams whose audits the stack starts. The runner holds their locks for the
 # whole unit (hack/ci-eval-pr.sh: task_streams), so no audit case on one of them
 # runs beside these real runs and grades the other's ledger.
+# The retrospective is the fifth audit the stage marks, after the four this case
+# grades; it is listed so the runner waits for its run before the next repetition
+# arms, not because the verifier reads it.
 audit_streams:
   [
     fleet-wide-cost-analysis,
     compliance-audit,
     obtainability-audit,
     stockout-prevention,
+    upgrade-retrospective,
   ]
 
 # A turn that needs no tools. The session this reaches is the Planning Agent's,

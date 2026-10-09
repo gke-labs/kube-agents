@@ -130,7 +130,11 @@ chains them (cost, security, reliability, capacity), by their job ids in
 | 2     | `compliance-audit`         | Security and RBAC posture        | Daily 06:20           |
 | 3     | `obtainability-audit`      | Workload reliability             | Daily 06:50           |
 | 4     | `stockout-prevention`      | Stockout prevention and capacity | Daily 09:20           |
+| 5     | `upgrade-retrospective`    | Upgrade retrospective            | Sundays 18:00         |
 
+The upgrade retrospective is chained after the four, so they keep #1866's order and the review of
+every cluster's last upgrade follows the audits whose findings it cites; its first run is the
+baseline of every cluster the install manages ([`upgrade-retrospective.md`](upgrade-retrospective.md)).
 The other five governance jobs keep their schedules.
 
 ### 4.3 Firing

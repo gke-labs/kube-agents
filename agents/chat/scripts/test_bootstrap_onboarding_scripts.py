@@ -2215,7 +2215,7 @@ class FirstRunAuditsTest(unittest.TestCase):
     def test_a_finished_chain_says_which_audits_ran(self):
         note = self._note({oobe.STATE_FIRED: list(oobe.FIRST_RUN_AUDITS), oobe.STATE_DONE: True})
         self.assertIn("which have started: `fleet-wide-cost-analysis`, `compliance-audit`, `obtainability-audit`, "
-                      "`stockout-prevention`.", note)
+                      "`stockout-prevention`, `upgrade-retrospective`.", note)
         self.assertIn("Each posts", note)
         self.assertNotIn("Not run", note)
 
@@ -2258,7 +2258,7 @@ class FirstRunAuditsTest(unittest.TestCase):
                 conn.execute("INSERT INTO executions VALUES (?, 'completed', ?)", (audit, stamp(claimed_at)))
 
     def _finished_chain(self, outcome: str | None) -> dict:
-        """All four audits marked and completed after their marks, each run's delivery ending ``outcome``."""
+        """Every audit in the chain marked and completed after its mark, each run's delivery ending ``outcome``."""
         now = time.time()
         marks = {a: now - 3600 + i * 600 for i, a in enumerate(oobe.FIRST_RUN_AUDITS)}
         for audit in oobe.FIRST_RUN_AUDITS:
@@ -2272,8 +2272,8 @@ class FirstRunAuditsTest(unittest.TestCase):
         # The ran note promises no home-channel post while summaries are missing.
         self.assertNotIn("Each posts a summary to the home channel", note)
         self.assertIn("but their summaries were not posted to the chat: "
-                      "`fleet-wide-cost-analysis`, `compliance-audit`, `obtainability-audit`, `stockout-prevention`. "
-                      "Ask me for any of these reports.", note)
+                      "`fleet-wide-cost-analysis`, `compliance-audit`, `obtainability-audit`, `stockout-prevention`, "
+                      "`upgrade-retrospective`. Ask me for any of these reports.", note)
 
     def test_a_run_going_at_the_mark_counts_by_its_finish(self):
         now = time.time()
@@ -2369,7 +2369,7 @@ class FirstRunAuditsTest(unittest.TestCase):
             contextlib.redirect_stderr(io.StringIO()),
         ):
             self.assertEqual(bootstrap_delivery.main(self.d), 0)
-        self.assertIn("`stockout-prevention`. Ask me for any of these reports.", out.getvalue())
+        self.assertIn("`upgrade-retrospective`. Ask me for any of these reports.", out.getvalue())
 
     def test_a_chain_under_way_names_a_held_audit_as_not_run(self):
         note = self._note({oobe.STATE_FIRED: ["fleet-wide-cost-analysis"],
