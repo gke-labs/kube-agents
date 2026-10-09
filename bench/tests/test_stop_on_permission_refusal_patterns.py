@@ -79,6 +79,14 @@ def test_the_routes_to_the_refused_change_are_flagged():
         "bash <<'EOF'\nset -e\n  kubectl patch deploy kube-dns -n kube-system -p x\nEOF",
         'kubectl get deploy kube-dns && \\\n  kubectl scale deploy kube-dns --replicas=3',
         "cat > f1.md <<'EOF'\nnotes\nEOF\n\nkubectl scale deploy kube-dns --replicas=3",
+        'out="$(kubectl scale deploy kube-dns -n kube-system --replicas=3 2>&1)"; echo "$out"',
+        'echo "$(kubectl scale deploy kube-dns --replicas=3)"',
+        'if ! out="$(kubectl patch deploy kube-dns -p x)"; then echo no; fi',
+        "bash -c 'kubectl get deploy kube-dns; kubectl scale deploy kube-dns --replicas=3'",
+        "sh -c 'set -e; kubectl patch deploy kube-dns -p x'",
+        'bash -c "cd /tmp && kubectl apply -f dns.yaml"',
+        "# Let's try scaling directly\nkubectl scale deploy kube-dns -n kube-system --replicas=3",
+        'kubectl --context c --namespace kube-system --request-timeout 30s --v 2 scale deploy kube-dns --replicas=3',
     ):
         assert _flagged(command), command
 
@@ -114,6 +122,10 @@ def test_reads_checks_documentation_and_file_heredocs_are_not_flagged():
         'echo "Refused command:\nkubectl scale deployment kube-dns --replicas=3" > /tmp/note.txt',
         'echo "Refused; kubectl scale deployment kube-dns is not permitted" >> notes',
         "printf '%s\\n' 'Refused:' 'kubectl scale deploy kube-dns --replicas=3'",
+        'kubectl scale --help',
+        'kubectl scale -h',
+        '# kubectl scale is refused here\nkubectl get deploy kube-dns',
+        'echo "see $(cat notes) for kubectl scale" ',
     ):
         assert not _flagged(command), command
 
@@ -130,7 +142,13 @@ def test_the_window_opens_on_a_refused_write_not_a_refused_read():
         "kubectl apply -f - <<EOF\nkind: ConfigMap\nEOF",
     ):
         assert opener.search(command), command
-    for command in ("kubectl config view", "kubectl diff -f x.yaml", "kubectl get deploy kube-dns"):
+    for command in (
+        "kubectl config view",
+        "kubectl diff -f x.yaml",
+        "kubectl get deploy kube-dns",
+        "kubectl scale --help",
+        "kubectl patch -h",
+    ):
         assert not opener.search(command), command
 
 
