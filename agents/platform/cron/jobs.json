@@ -127,6 +127,20 @@
       "deliver": "chat"
     },
     {
+      "id": "upgrade-retrospective",
+      "name": "Upgrade Retrospective",
+      "schedule": {
+        "kind": "cron",
+        "expr": "0 18 * * 0",
+        "display": "0 18 * * 0"
+      },
+      "prompt": "Run the weekly upgrade retrospective. Read the SOP at 'governance/upgrade_retrospective_sop.md' in your profile home — all 197 lines of it, before you run anything. Its seven checks are section 3, lines 56-137, so a read that stops early skips the grading and reports a clean fleet it never looked at. Section 2 opens by running the collector (`skills/fleet-audit/scripts/upgrade_retrospective.py --full`) with --project for the management project and every project a Cluster Agent profile names, in the foreground with a terminal timeout of at least 900 seconds: run it before grading anything by hand, read its JSON the way section 2 says, and grade every incident by section 3. Then execute the SOP exactly; section 5 says when the fleet-audit skill opens and closes the audit run and when a run has no repository and reports in chat alone. This review is read-only: never upgrade, roll back, cordon, delete or patch anything.",
+      "skills": ["fleet-audit"],
+      "risk": "low",
+      "enabled": true,
+      "deliver": "chat"
+    },
+    {
       "id": "findings-morning-nudge",
       "name": "Findings Queue Nudge",
       "schedule": {

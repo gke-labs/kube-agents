@@ -99,6 +99,7 @@ SOP_FILENAMES = {
     "stockout-prevention": "stockout_prevention_sop.md",
     "gcp-networking-fabric-audit": "gcp_networking_fabric_sop.md",
     "gce-compute-fleet-audit": "gce_compute_fleet_sop.md",
+    "upgrade-retrospective": "upgrade_retrospective_sop.md",
 }
 
 # Rules that hold on every stream — because the harness enforces them, or
@@ -20568,6 +20569,23 @@ class TestTriageMarkedFindings(BaseTestCase):
                 [_pub("f1", "idle-workload", "c1", "Deployment/a")], None
             ),
             set(),
+        )
+
+    def test_the_retrospective_stays_off_the_major_sweep(self):
+        """The retrospective files an Error at `major` and a Warning at `minor`
+        and never at `critical`, so the one way `finish` could still open a
+        pull request on its own is a slug on `MAJOR_SWEEP_CHECKS`. The design
+        keeps every one of them off it; the SOP states both halves as rules.
+        """
+        import upgrade_retrospective
+
+        checks = set(audit_report.AUDITS["upgrade-retrospective"].checks)
+        self.assertFalse(checks & audit_report.MAJOR_SWEEP_CHECKS)
+        # The collector's roster is the SOP's, in the SOP's order: `commands`
+        # it emits per cluster are copied straight into `checks_run`.
+        self.assertEqual(
+            [check for check, _ in upgrade_retrospective.CHECK_READS],
+            list(audit_report.AUDITS["upgrade-retrospective"].checks),
         )
 
     def test_the_sweep_passes_over_it(self):

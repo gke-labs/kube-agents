@@ -29,9 +29,10 @@ streams `collect.py` covers: compliance (`/opt/data/profiles/platform/governance
 (`/opt/data/profiles/platform/governance/obtainability_audit_sop.md` §2) and AI security (`/opt/data/profiles/platform/governance/ai_security_audit_sop.md`
 §3), the cost stream (`fleet_waste.py`, `/opt/data/profiles/platform/governance/fleet_wide_cost_analysis_sop.md` §2), the
 stockout stream (`fleet_stockout.py`, `/opt/data/profiles/platform/governance/stockout_prevention_sop.md` §3), the GCE
-compute stream (`compute_fleet_audit.py`, `/opt/data/profiles/platform/governance/gce_compute_fleet_sop.md` §2) and the networking
-stream (`networking_audit.py`, `/opt/data/profiles/platform/governance/gcp_networking_fabric_sop.md` §2).
-The compliance, obtainability, stockout, cost, GCE compute, networking and upgrade collectors may also give a target `checks_unevaluated`,
+compute stream (`compute_fleet_audit.py`, `/opt/data/profiles/platform/governance/gce_compute_fleet_sop.md` §2), the networking
+stream (`networking_audit.py`, `/opt/data/profiles/platform/governance/gcp_networking_fabric_sop.md` §2) and the upgrade
+retrospective (`upgrade_retrospective.py`, `/opt/data/profiles/platform/governance/upgrade_retrospective_sop.md` §2).
+The compliance, obtainability, stockout, cost, GCE compute, networking, patch readiness (`patch_readiness.py`) and upgrade retrospective collectors may also give a target `checks_unevaluated`,
 `{check, reason}` for a check whose own read failed or whose inputs could not decide it: it did not run and is not inapplicable, so it
 goes in neither `checks_run` nor `checks_not_applicable` but in that target's `limitations`, which
 keeps the run partial and leaves open every finding that check filed there. `finish` rejects the

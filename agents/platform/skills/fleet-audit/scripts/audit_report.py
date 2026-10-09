@@ -478,6 +478,25 @@ AUDITS: dict[str, AuditSpec] = {
             ),
         ),
     ),
+    "upgrade-retrospective": AuditSpec(
+        "Upgrade Retrospective",
+        "upgrade_retrospective_sop.md",
+        # The collector (`upgrade_retrospective.py`, `CHECK_READS`) grades
+        # every one of these; the SOP files an Error at `major` and a Warning
+        # at `minor`, never `critical`, and none of these slugs is on
+        # `MAJOR_SWEEP_CHECKS`, so `finish` opens no pull request on its own
+        # for this stream -- the design's guard against a retrospective that
+        # proposes manifest changes nobody asked for.
+        (
+            "upgrade-operation-failed",
+            "upgrade-broke-workload",
+            "node-broken-after-upgrade",
+            "upgrade-symptom-tentative",
+            "upgrade-symptom-unclassified",
+            "symptom-predates-upgrade",
+            "upgrade-failure-persists",
+        ),
+    ),
 }
 
 # The streams whose SOP runs a collector, and so the streams whose `finish`
