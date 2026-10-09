@@ -171,10 +171,12 @@ onset), a node condition's transition, an event's first observation. A node-pool
 every node and recreates every pod on it, so a pod created inside a pool operation's window is
 ambiguous for the failures a recreation carries over (a crash loop, an OOM kill, an image that will
 not pull), and for those the owner is consulted as proof of age only: a Deployment whose
-`Available=False` or `Progressing=False` transition, or whose current ReplicaSet's creation,
-predates the window makes the symptom "predates the upgrade", a Warning; an owner transition inside
-the window proves nothing (on a probe-less crash loop `Available` trails the latest crash), and a
-Deployment whose conditions never flipped proves nothing either. With no proof of age, a first run
+`Available=False` or `Progressing=False` transition predates the window makes the symptom "predates
+the upgrade", a Warning. Nothing else at the owner is proof: a transition inside the window proves
+nothing (on a probe-less crash loop `Available` trails the latest crash), conditions that never
+flipped prove nothing, and the ReplicaSet's age proves nothing either, since a pod can run for months
+on an old ReplicaSet and fail only on the rebuilt node (a ReplicaSet created inside the window merely
+says a rollout happened during it). With no proof of age, a first run
 (no stored set) grades the symptom `medium`, a Warning with the reason "the pod was recreated by the
 upgrade; the failure may predate it", never an Error; a later full run settles it by the stored set.
 A Pending pod created inside the window is not ambiguous: it is the replica the drain displaced,
