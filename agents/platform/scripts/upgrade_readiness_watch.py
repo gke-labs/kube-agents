@@ -14,10 +14,10 @@ target version a cluster is below is *pending*. A pending version the ledger
 has never seen is *new*, and a new version earns a readiness report at once.
 After that the report is refreshed every ``REFRESH_DAYS_DEFAULT`` days (with
 ten minutes of slack for the tick's own drift) while a cluster is still pending
-it, and a version no cluster is pending any more is retired from the ledger,
-but only on a tick whose version table read every project: a partial table
-retires nothing, so a failed listing cannot erase a version and have it come
-back as new. A report whose readiness reads graded none of a version's
+it, and a version no cluster is pending any more is retired from the ledger
+once every project that pended it has been read: a project the table did not
+read keeps its clusters pending from the ledger, so a failed listing cannot
+erase a version and have it come back as new. A report whose readiness reads graded none of a version's
 pending clusters is written but not recorded, and the version is tried again
 the next day, up to ``UNGRADED_ATTEMPTS_BEFORE_WEEKLY`` days in a row, after
 which it is recorded as reported and stays on the weekly cadence until a
@@ -252,7 +252,7 @@ BLOCKED_NAMES = " ({names})"
 FAILED_LINE = "{prefix} watch: {what} failed: {detail}"
 FAILED_WHAT_TICK = "the tick"
 FAILED_WHAT_WRITE = "writing the ledger or the report"
-PARTIAL_LINE = "{prefix} watch: the version table was partial ({errors} read error(s), exit {code}); nothing retired while it stays so"
+PARTIAL_LINE = "{prefix} watch: the version table was partial ({errors} read error(s), exit {code}); a version is retired only once every project that pends it has been read"
 PARTIAL_CLEARED_LINE = "{prefix} watch: the version table reads every project again"
 DRY_RUN_WOULD_RETIRE = "dry run: would retire {version} (no cluster is pending it)"
 UNGRADED_LINE = (
@@ -283,8 +283,11 @@ NEXT_WEEKLY_PHRASE = "None of the pending clusters was graded on {attempts} cons
 # What the partial-table announcement is keyed on: the kinds of read error and
 # how many of each, not their text, so a window of unread projects that turns
 # daily, or a timeout's figure, does not re-post the line.
-ERROR_KIND_UNRUN = "table not run"
+ERROR_KIND_UNRUN = "table not run to completion by the budget"
 ERROR_KIND_TABLE_FAILED = "table failed"
+# The watch writes its own read errors with the kind on them; the report
+# script's carry no kind and are classified by their shape.
+ERROR_KIND_KEY = "kind"
 ERROR_KIND_LISTING = "listing failed"
 ERROR_KIND_SERVER_CONFIG = "server config failed"
 ERROR_KIND_READ = "read failed"
@@ -521,11 +524,8 @@ def pending_targets(report: dict) -> dict[str, list[str]]:
 
 
 def error_kind(error: dict) -> str:
-    message = str(error.get(MESSAGE_KEY) or "")
-    if message.startswith(TABLE_UNRUN_DETAIL.split("{")[0]):
-        return ERROR_KIND_UNRUN
-    if message.startswith(TABLE_FAILED_DETAIL.split("{")[0]):
-        return ERROR_KIND_TABLE_FAILED
+    if error.get(ERROR_KIND_KEY):
+        return str(error[ERROR_KIND_KEY])
     if not error.get(MEMBER_ID_KEYS[1]):
         return ERROR_KIND_LISTING
     if not error.get(MEMBER_ID_KEYS[-1]):
@@ -700,6 +700,29 @@ def decide(
 # --- the report files ------------------------------------------------------
 
 
+def settle_from_readiness(report: dict, pending: dict[str, list[str]], ledger: dict) -> list[str]:
+    """A readiness run lists every cluster of its project, including one the
+    version table did not reach this tick. A listed cluster that is no longer
+    below a version leaves that version's pending set, here and in the ledger,
+    so it is neither reported pending nor graded against a version it has
+    passed. Returns the versions left with no pending cluster, for retirement."""
+    listed: dict[str, tuple[str, str]] = {}
+    for member in report.get(MEMBERS_KEY) or []:
+        listed[member_key(member)] = (str(member.get(STATUS_KEY) or ""), str(member.get(TARGET_KEY) or "").strip())
+    emptied: list[str] = []
+    for version in list(pending):
+        kept = [
+            key for key in pending[version]
+            if key not in listed or (listed[key][0] in BEHIND_STATUSES and listed[key][1] == version)
+        ]
+        pending[version] = kept
+        if version in ledger[TARGETS_KEY]:
+            ledger[TARGETS_KEY][version][PENDING_KEY] = kept
+        if not kept:
+            emptied.append(version)
+    return emptied
+
+
 def readiness_verdicts(report: dict, clusters: list[str]) -> tuple[list[str], list[str], list[str], list[str]]:
     """The blocked, ready, unknown and unread clusters among ``clusters``, by
     member key. ``unknown`` is a verdict the script gave (an exclusion or a pool
@@ -788,7 +811,7 @@ def versions_by_project(names: list[str], deadline: float, last_runs: dict[str, 
             last_runs[project] = iso(now)
             failed[project] = exc
             merged[ENVELOPE_REPORT_KEY][ERRORS_KEY].append(
-                {MEMBER_ID_KEYS[0]: project, MEMBER_ID_KEYS[1]: None, MESSAGE_KEY: TABLE_FAILED_DETAIL.format(project=project, error=str(exc))}
+                {MEMBER_ID_KEYS[0]: project, MEMBER_ID_KEYS[1]: None, ERROR_KIND_KEY: ERROR_KIND_TABLE_FAILED, MESSAGE_KEY: TABLE_FAILED_DETAIL.format(project=project, error=str(exc))}
             )
             continue
         except (RuntimeError, ValueError, KeyError, TypeError) as exc:
@@ -796,7 +819,7 @@ def versions_by_project(names: list[str], deadline: float, last_runs: dict[str, 
             failed[project] = exc
             error = f"{type(exc).__name__}: {exc}" if not isinstance(exc, RuntimeError) else str(exc)
             merged[ENVELOPE_REPORT_KEY][ERRORS_KEY].append(
-                {MEMBER_ID_KEYS[0]: project, MEMBER_ID_KEYS[1]: None, MESSAGE_KEY: TABLE_FAILED_DETAIL.format(project=project, error=error)}
+                {MEMBER_ID_KEYS[0]: project, MEMBER_ID_KEYS[1]: None, ERROR_KIND_KEY: ERROR_KIND_TABLE_FAILED, MESSAGE_KEY: TABLE_FAILED_DETAIL.format(project=project, error=error)}
             )
             continue
         last_runs[project] = iso(now)
@@ -806,13 +829,15 @@ def versions_by_project(names: list[str], deadline: float, last_runs: dict[str, 
         # project: one failure line for the tick, announced once, rather than a
         # partial table nobody can act on.
         raise next(iter(failed.values()))
+    # Both budget shapes are one kind: the announcement must not re-post when a
+    # cut-short run comes and goes beside the projects never reached.
     for project in unrun:
         merged[ENVELOPE_REPORT_KEY][ERRORS_KEY].append(
-            {MEMBER_ID_KEYS[0]: project, MEMBER_ID_KEYS[1]: None, MESSAGE_KEY: TABLE_UNRUN_DETAIL.format(project=project)}
+            {MEMBER_ID_KEYS[0]: project, MEMBER_ID_KEYS[1]: None, ERROR_KIND_KEY: ERROR_KIND_UNRUN, MESSAGE_KEY: TABLE_UNRUN_DETAIL.format(project=project)}
         )
     for project in cut_short:
         merged[ENVELOPE_REPORT_KEY][ERRORS_KEY].append(
-            {MEMBER_ID_KEYS[0]: project, MEMBER_ID_KEYS[1]: None, MESSAGE_KEY: TABLE_CUT_SHORT_DETAIL.format(project=project)}
+            {MEMBER_ID_KEYS[0]: project, MEMBER_ID_KEYS[1]: None, ERROR_KIND_KEY: ERROR_KIND_UNRUN, MESSAGE_KEY: TABLE_CUT_SHORT_DETAIL.format(project=project)}
         )
     return merged
 
@@ -1010,6 +1035,12 @@ def tick(dry_run: bool = False) -> list[str]:
     announced(ledger)[ANNOUNCED_PARTIAL_KEY] = signature
     if due:
         readiness, failures, unfinished = readiness_by_project(pending, due, deadline, ledger[READINESS_RUNS_KEY], now)
+        for version in settle_from_readiness(readiness[ENVELOPE_REPORT_KEY], pending, ledger):
+            if version in due and version in ledger[TARGETS_KEY]:
+                del ledger[TARGETS_KEY][version]
+                due.pop(version)
+                retired.append(version)
+                lines.append(RETIRED_LINE.format(prefix=LINE_PREFIX, version=version))
         for version, reason in due.items():
             clusters = pending[version]
             blocked, ready, unknown, unread = readiness_verdicts(readiness[ENVELOPE_REPORT_KEY], clusters)
