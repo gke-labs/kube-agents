@@ -16,7 +16,10 @@ With `--readiness` it also says, per member, what would stop the upgrade: a PodD
 that blocks every node drain, a fail-closed admission webhook with an unreachable backend in the upgrade's path or able to
 refuse the control plane's bootstrap RBAC writes (ClusterRoles and ClusterRoleBindings; Roles and RoleBindings in kube-system and kube-public), a maintenance exclusion or window, or node pools too far below the target
 (see "Check upgrade readiness"). For upgrade plans, runbooks and checklists, use the
-`gke-upgrades` skill; it links back here when the question is one these two scripts answer.
+`gke-upgrades` skill; it links back here when the question is one these two scripts answer. For
+what an upgrade already did — "how did the upgrades go", "did anything break", "any upgrade
+problems to fix first" — the answer is the upgrade retrospective's report, not a version table:
+follow the on-demand section of `governance/upgrade_retrospective_sop.md`.
 
 "Version skew" here is the gap between a member's versions and the target. It is not
 configuration drift: the fleet-consistency audit compares a cluster's configuration against its
