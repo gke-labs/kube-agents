@@ -78,10 +78,11 @@ const (
 )
 
 // notifyMentionTokens and notifyMentionElements are what blocksMention
-// refuses: the mrkdwn spellings that ping, and the rich_text element types
-// that do.
+// refuses: the mrkdwn spellings that ping, the bare broadcast words a mrkdwn
+// text object without verbatim may parse into one, and the rich_text element
+// types that do.
 var (
-	notifyMentionTokens   = []string{"<!", "<@"}
+	notifyMentionTokens   = []string{"<!", "<@", "@here", "@channel", "@everyone"}
 	notifyMentionElements = []string{"broadcast", "user", "usergroup"}
 )
 
@@ -394,7 +395,7 @@ func (n *Notifier) validate(data []byte) (lib.NotifyRequest, *lib.NotifyReply) {
 			return refuse("blocks carry a mention (" + why + "); the notify route posts no mentions, send them as text")
 		}
 		if kind := blocksInteractive(blocks); kind != "" {
-			return refuse("blocks carry an interactive element (a " + kind + "); the gateway answers no clicks, so strip it")
+			return refuse("blocks carry an interactive element (type " + kind + "); the gateway answers no clicks, so strip it")
 		}
 	}
 	return req, nil

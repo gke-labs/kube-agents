@@ -57,7 +57,7 @@ const notifyExitRouteUnavailable = 4
 // notifyExitRouteUnavailable.
 var errNotifyRouteUnavailable = errors.New("route unavailable")
 
-const notifyUsage = `usage: a2a notify --platform <platform> [--thread <thread> | --conversation <key> --context <id>] [--timeout <d>] [--] [text]
+const notifyUsage = `usage: a2a notify --platform <platform> [--thread <thread> | --conversation <key> --context <id>] [--blocks-file <path>] [--timeout <d>] [--] [text]
 
 Post text to the install's chat home channel through the A2A gateway: a new
 thread, or a reply on --thread, which must be a thread of the home channel.

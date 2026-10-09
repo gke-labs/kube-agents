@@ -1373,7 +1373,7 @@ also takes Block Kit: a request may carry `blocks`, a JSON array posted as one m
 rather than dropping them, and Slack's own refusal (`invalid_blocks`) comes back as the
 `error`, so the caller falls back to text. Blocks cannot be escaped the way text is, so the
 gateway refuses any block that carries a mention (`<!channel>`, `<!here>`, `<!subteam^…>`,
-`<@U…>`, or a rich_text `broadcast`, `user` or `usergroup` element), and the caller posts the
+`<@U…>`, a bare `@here`, `@channel` or `@everyone`, which a mrkdwn text object may parse into one, or a rich_text `broadcast`, `user` or `usergroup` element), and the caller posts the
 escaped text instead. The gateway acks no Slack interaction, so a button on such a card would
 be clicked into a timeout: the gateway refuses any interactive block or element (an `actions`
 or `input` block, a button, a select, a date or time picker, a text input), and the agent sends

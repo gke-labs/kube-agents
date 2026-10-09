@@ -208,12 +208,14 @@ func TestSlackNotifyRefusesMentionsInBlocks(t *testing.T) {
 	adapter, stub := startSlackStubAdapter(t)
 	n := newTestSlackNotifier(t, adapter)
 	for name, blocks := range map[string]string{
-		"channel":   `[{"type":"section","text":{"type":"mrkdwn","text":"<!channel> drift"}}]`,
-		"here":      `[{"type":"section","text":{"type":"mrkdwn","text":"see <!here>"}}]`,
-		"subteam":   `[{"type":"context","elements":[{"type":"mrkdwn","text":"<!subteam^S1> look"}]}]`,
-		"user":      `[{"type":"section","fields":[{"type":"mrkdwn","text":"<@U123>"}]}]`,
-		"broadcast": `[{"type":"rich_text","elements":[{"type":"rich_text_section","elements":[{"type":"broadcast","range":"channel"}]}]}]`,
-		"rich user": `[{"type":"rich_text","elements":[{"type":"rich_text_section","elements":[{"type":"user","user_id":"U1"}]}]}]`,
+		"channel":       `[{"type":"section","text":{"type":"mrkdwn","text":"<!channel> drift"}}]`,
+		"here":          `[{"type":"section","text":{"type":"mrkdwn","text":"see <!here>"}}]`,
+		"subteam":       `[{"type":"context","elements":[{"type":"mrkdwn","text":"<!subteam^S1> look"}]}]`,
+		"user":          `[{"type":"section","fields":[{"type":"mrkdwn","text":"<@U123>"}]}]`,
+		"broadcast":     `[{"type":"rich_text","elements":[{"type":"rich_text_section","elements":[{"type":"broadcast","range":"channel"}]}]}]`,
+		"rich user":     `[{"type":"rich_text","elements":[{"type":"rich_text_section","elements":[{"type":"user","user_id":"U1"}]}]}]`,
+		"bare here":     `[{"type":"section","text":{"type":"mrkdwn","text":"heads up @here"}}]`,
+		"bare everyone": `[{"type":"context","elements":[{"type":"mrkdwn","text":"@everyone look"}]}]`,
 	} {
 		if got := serveJSON(t, n, lib.NotifyRequest{Text: "x", Blocks: json.RawMessage(blocks)}); got.Error == "" {
 			t.Errorf("%s: blocks with a mention were accepted", name)
