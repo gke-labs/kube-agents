@@ -1040,10 +1040,11 @@ class LedgerAndGuardsTest(unittest.TestCase):
         self.assertEqual(seeded["baseline"]["shapes"], 9)
         self.assertEqual(seeded["next_upgrade"]["target"], "1.35.8-gke.1225000")
         sections = doc["sections"]
-        self.assertEqual([(i["cluster"], i["object"], i["entries"]) for i in sections["errors"]], [(SEEDED, INFERENCE, "2, 12"), (SEEDED, "seeded-capacity/PodDisruptionBudget/inference-server", "1")])
-        self.assertEqual([i["object"] for i in sections["warnings"]], [KUBE_DNS, TUNER, PAYMENTS, "seeded-stall/Deployment/inventory-api"])
+        self.assertEqual([(i["cluster"], i["object"], i["entries"]) for i in sections["errors"]], [(SEEDED, "seeded-capacity/PodDisruptionBudget/inference-server", "1")])
+        self.assertEqual([i["object"] for i in sections["warnings"]], [KUBE_DNS, TUNER, INFERENCE, PAYMENTS, "seeded-stall/Deployment/inventory-api"])
         inference_row = next(s for r in doc["reviews"] for s in r["what_failed"] if s["object"] == INFERENCE)
-        self.assertEqual((inference_row["new_pods"], inference_row["pre_existing_pods"]), (["inference-server-778b78fdb8-ld26r", "inference-server-778b78fdb8-zxlkz"], ["inference-server-778b78fdb8-cp2pf"]))
+        self.assertEqual((inference_row["onset_source"], inference_row["onset"], inference_row["new_pods"], len(inference_row["pre_existing_pods"])), (ur.ONSET_FROM_OWNER, "2026-09-25T17:02:48Z", [], 3))
+        self.assertTrue(next(i for i in sections["warnings"] if i["object"] == INFERENCE)["predates_upgrade"])
         self.assertEqual([(c["cluster"], c["incidents"]) for c in sections["info"]["clean"]], [(GEMMA, 2), (SEEDED, 4)])
         self.assertEqual((sections["info"]["unchanged"], sections["info"]["failed_reads"]), ([], []))
 
@@ -1617,26 +1618,33 @@ class LedgerAndGuardsTest(unittest.TestCase):
         self.assertEqual(os.readlink(self.home / ur.REPORTS_SUBDIR / ur.LATEST_REPORT_LINK), "20261015T180000Z.md")
 
     def test_newly_displaced_replicas_make_an_already_recorded_row_new(self):
-        first, _ = self.collect()
+        # A StatefulSet carries no dated failure condition, so its pods are dated by their own evidence.
+        def sts_pod(name, scheduled_at, created_at):
+            p = pod(name, namespace="seeded-capacity", scheduled_message="0/4 nodes are available: 4 Insufficient cpu.", owner="StatefulSet")
+            p["metadata"]["ownerReferences"][0]["name"] = "cache"
+            p["metadata"]["creationTimestamp"] = created_at
+            p["status"]["conditions"][0]["lastTransitionTime"] = scheduled_at
+            return p
+        sts = {"kind": "StatefulSet", "metadata": {"name": "cache", "namespace": "seeded-capacity"}, "spec": {"replicas": 2, "template": {"metadata": {"labels": {"app": "cache"}}, "spec": {"containers": [{"name": "c", "image": "busybox:1.36"}]}}}}
+        old = sts_pod("cache-0", "2026-09-20T00:00:00Z", "2026-09-20T00:00:00Z")
+        reads = {**READS["seeded-a"], "pods": READS["seeded-a"]["pods"] + [old], "workloads": READS["seeded-a"]["workloads"] + [sts]}
+        with mock.patch.dict(READS, {"seeded-a": reads}):
+            first, _ = self.collect()
+        row = next(s for r in first["reviews"] for s in r["what_failed"] if s["object"] == "seeded-capacity/StatefulSet/cache")
+        self.assertEqual((row["onset_source"], row["predates_upgrade"]), (ur.ONSET_FROM_POD, True))
         # Next week the cluster upgrades again; one more replica is displaced inside that window.
         bumped = cluster_doc("seeded-a")
         bumped["currentMasterVersion"] = "1.36.4-gke.1247000"
-        pods = copy.deepcopy(READS["seeded-a"]["pods"])
-        fresh = copy.deepcopy(next(p for p in pods if p["metadata"]["name"] == "inference-server-778b78fdb8-cp2pf"))
-        fresh["metadata"]["name"] = "inference-server-778b78fdb8-newpd"
-        for cond in fresh["status"]["conditions"]:
-            if cond["type"] == "PodScheduled":
-                cond["lastTransitionTime"] = "2026-10-15T09:30:00Z"
-        master = copy.deepcopy(next(o for o in OPERATIONS if o["operationType"] == "UPGRADE_NODES" and "/clusters/seeded-a/nodePools/pinned-inference-pool" in o["targetLink"]))
-        master.update(name="operation-second-drain", startTime="2026-10-15T09:00:00Z", endTime="2026-10-15T09:20:00Z")
-        with mock.patch.dict(READS, {"seeded-a": {**READS["seeded-a"], "pods": pods + [fresh]}}):
-            second, _ = self.collect(FakeFleet(clusters=[bumped, cluster_doc("gemma-gpu-upgraded")], operations=OPERATIONS + [master]), now=datetime(2026, 10, 15, 18, 0, tzinfo=timezone.utc))
-        row = next(s for r in second["reviews"] for s in r["what_failed"] if s["object"] == INFERENCE)
-        self.assertEqual(row["new_pods"], ["inference-server-778b78fdb8-newpd"])
-        self.assertEqual(len(row["pre_existing_pods"]), 3)
+        new = sts_pod("cache-1", "2026-10-15T09:30:00Z", "2026-10-15T09:30:00Z")
+        drain = copy.deepcopy(next(o for o in OPERATIONS if o["operationType"] == "UPGRADE_NODES" and "/clusters/seeded-a/nodePools/pinned-inference-pool" in o["targetLink"]))
+        drain.update(name="operation-second-drain", startTime="2026-10-15T09:00:00Z", endTime="2026-10-15T09:20:00Z")
+        with mock.patch.dict(READS, {"seeded-a": {**reads, "pods": reads["pods"] + [new]}}):
+            second, _ = self.collect(FakeFleet(clusters=[bumped, cluster_doc("gemma-gpu-upgraded")], operations=OPERATIONS + [drain]), now=datetime(2026, 10, 15, 18, 0, tzinfo=timezone.utc))
+        row = next(s for r in second["reviews"] for s in r["what_failed"] if s["object"] == "seeded-capacity/StatefulSet/cache")
+        self.assertEqual((row["new_pods"], row["pre_existing_pods"]), (["cache-1"], ["cache-0"]))
         self.assertEqual((row["since"], row["predates_upgrade"]), (ur.SINCE_NEW, False))
-        self.assertIn(INFERENCE, [i["object"] for i in second["sections"]["errors"]])
-        self.assertIn("; 3 pre-existing since 2026-09-25T17:02:48Z (e.g. inference-server-778b78fdb8-cp2pf)", row["classifications"][0]["evidence"])
+        self.assertIn("seeded-capacity/StatefulSet/cache", [i["object"] for i in second["sections"]["errors"]])
+        self.assertIn("; 1 pre-existing since 2026-09-20T00:00:00Z (e.g. cache-0)", row["classifications"][0]["evidence"])
 
     def test_probe_less_crash_loop_is_dated_by_its_start_not_its_last_flip(self):
         # The fixture's own shape: Ready flipped a second after the latest crash, 440 restarts, started before the window.
@@ -1659,6 +1667,68 @@ class LedgerAndGuardsTest(unittest.TestCase):
             second, _ = self.collect(FakeFleet(clusters=[bumped, cluster_doc("gemma-gpu-upgraded")], operations=OPERATIONS + [master]), now=datetime(2026, 10, 15, 18, 0, tzinfo=timezone.utc))
         row = next(s for r in second["reviews"] for s in r["what_failed"] if s["name"] == "legacy-worker")
         self.assertEqual((row["since"], row["predates_upgrade"]), (ur.SINCE_BEFORE, True))
+
+    def test_owner_onset_dates_a_pod_the_drain_recreated(self):
+        # payments-api's pod was created inside the default-pool drain on 10-07 (Saturday's rebuild);
+        # its Deployment has been Available=False for a month: the symptom predates the upgrade.
+        workloads = copy.deepcopy(READS["seeded-a"]["workloads"])
+        payments = next(w for w in workloads if w["metadata"]["name"] == "payments-api")
+        payments["status"] = {"conditions": [{"type": "Available", "status": "False", "lastTransitionTime": "2026-09-08T00:00:00Z"}, {"type": "Progressing", "status": "True", "lastTransitionTime": "2026-09-25T17:02:46Z"}]}
+        with mock.patch.dict(READS, {"seeded-a": {**READS["seeded-a"], "workloads": workloads}}):
+            result, _ = self.collect()
+        row = next(s for r in result["reviews"] for s in r["what_failed"] if s["object"] == PAYMENTS)
+        self.assertEqual((row["onset_source"], row["onset"], row["predates_upgrade"], row["recreated_pods"]), (ur.ONSET_FROM_OWNER, "2026-09-08T00:00:00Z", True, []))
+        self.assertTrue(next(i for i in result["sections"]["warnings"] if i["object"] == PAYMENTS)["predates_upgrade"])
+        # With no dated condition the newest ReplicaSet's creation stands in.
+        payments["status"] = {"conditions": [{"type": "Available", "status": "True", "lastTransitionTime": "2026-10-01T00:00:00Z"}]}
+        self.assertEqual(ur.owner_onsets(workloads, READS["seeded-a"]["owners"])[PAYMENTS], "2026-09-25T17:02:46Z")
+
+    def test_recreated_pod_without_owner_date_is_medium_on_a_first_run(self):
+        # A StatefulSet pod created inside the default-pool drain, Pending on a dropped node label: entry 12
+        # names the mechanism and the pool was touched, but the pod's onset is the drain's own doing.
+        p = pod("legacy-db-0", namespace="seeded-shapes", scheduled_message="0/4 nodes are available: 4 node(s) didn't match Pod's node affinity/selector.", owner="StatefulSet", node_selector={"beta.kubernetes.io/arch": "amd64"})
+        p["metadata"]["ownerReferences"][0]["name"] = "legacy-db"
+        p["metadata"]["creationTimestamp"] = "2026-10-07T04:05:00Z"
+        p["status"]["conditions"][0]["lastTransitionTime"] = "2026-10-07T04:05:10Z"
+        sts = {"kind": "StatefulSet", "metadata": {"name": "legacy-db", "namespace": "seeded-shapes"}, "spec": {"replicas": 1, "template": {"metadata": {"labels": {"app": "legacy-db"}}, "spec": {"containers": [{"name": "c", "image": "busybox:1.36"}]}}}}
+        reads = {**READS["seeded-a"], "pods": READS["seeded-a"]["pods"] + [p], "workloads": READS["seeded-a"]["workloads"] + [sts]}
+        with mock.patch.dict(READS, {"seeded-a": reads}):
+            first, _ = self.collect()
+        obj = "seeded-shapes/StatefulSet/legacy-db"
+        row = next(s for r in first["reviews"] for s in r["what_failed"] if s["object"] == obj)
+        self.assertEqual((row["onset_source"], row["recreated_pods"], row.get("recreated_only")), (ur.ONSET_FROM_POD, ["legacy-db-0"], True))
+        self.assertEqual({(c["entry"], c["confidence"]) for c in row["classifications"]}, {(12, ur.MEDIUM)})
+        self.assertIn(ur.RECREATED_DETAIL, row["classifications"][0]["detail"])
+        incident = next(i for i in first["sections"]["warnings"] if i["object"] == obj)
+        self.assertTrue(incident["recreated_only"])
+        self.assertNotIn(obj, [i["object"] for i in first["sections"]["errors"]])
+        self.assertIn(ur.RECREATED_TEXT, ur.render_report(first))
+        # A later full run grades it by the stored set: recorded, so present before.
+        bumped = cluster_doc("seeded-a")
+        bumped["currentMasterVersion"] = "1.36.4-gke.1247000"
+        drain = copy.deepcopy(next(o for o in OPERATIONS if o["operationType"] == "UPGRADE_NODES" and "/clusters/seeded-a/nodePools/default-pool" in o["targetLink"]))
+        drain.update(name="operation-second-drain", startTime="2026-10-15T09:00:00Z", endTime="2026-10-15T09:20:00Z")
+        p["metadata"]["creationTimestamp"] = "2026-10-15T09:05:00Z"
+        p["status"]["conditions"][0]["lastTransitionTime"] = "2026-10-15T09:05:10Z"
+        with mock.patch.dict(READS, {"seeded-a": reads}):
+            second, _ = self.collect(FakeFleet(clusters=[bumped, cluster_doc("gemma-gpu-upgraded")], operations=OPERATIONS + [drain]), now=datetime(2026, 10, 15, 18, 0, tzinfo=timezone.utc))
+        row = next(s for r in second["reviews"] for s in r["what_failed"] if s["object"] == obj)
+        self.assertEqual((row["since"], row["predates_upgrade"], row.get("recreated_only")), (ur.SINCE_BEFORE, True, None))
+        self.assertEqual({c["confidence"] for c in row["classifications"]}, {ur.HIGH})
+        self.assertNotIn(obj, [i["object"] for i in second["sections"]["errors"]])
+        # Not recorded by the previous full run: new, and the high signature stands as an Error.
+        reads_without = {**READS["seeded-a"], "workloads": READS["seeded-a"]["workloads"] + [sts]}
+        with mock.patch.dict(READS, {"seeded-a": reads_without}):
+            self.collect(now=datetime(2026, 10, 16, 18, 0, tzinfo=timezone.utc))
+        bumped["currentMasterVersion"] = "1.36.5-gke.1000000"
+        drain.update(name="operation-third-drain", startTime="2026-10-22T09:00:00Z", endTime="2026-10-22T09:20:00Z")
+        p["metadata"]["creationTimestamp"] = "2026-10-22T09:05:00Z"
+        p["status"]["conditions"][0]["lastTransitionTime"] = "2026-10-22T09:05:10Z"
+        with mock.patch.dict(READS, {"seeded-a": reads}):
+            third, _ = self.collect(FakeFleet(clusters=[bumped, cluster_doc("gemma-gpu-upgraded")], operations=OPERATIONS + [drain]), now=datetime(2026, 10, 22, 18, 0, tzinfo=timezone.utc))
+        row = next(s for r in third["reviews"] for s in r["what_failed"] if s["object"] == obj)
+        self.assertEqual((row["since"], row["predates_upgrade"]), (ur.SINCE_NEW, False))
+        self.assertIn(obj, [i["object"] for i in third["sections"]["errors"]])
 
     def test_crash_loop_since_before_the_window_predates_the_upgrade(self):
         looping = pod("legacy-worker", statuses=[{"name": "c0", "state": {"waiting": {"reason": "CrashLoopBackOff"}}, "lastState": {"terminated": {"reason": "Error", "exitCode": 1, "finishedAt": "2026-10-08T17:55:00Z"}}}])
@@ -1826,20 +1896,19 @@ class ReportTest(unittest.TestCase):
         errors, rest = report.split(ur.SECTION_ERRORS)[1].split(ur.SECTION_WARNINGS)
         warnings, info = rest.split(ur.SECTION_INFO)
         # Errors: entry numbers first, then cluster, then object; the four parts inline.
-        # Two of inference-server's three Pending pods were displaced inside the pinned-inference-pool
-        # drain; the third has waited since 09-25 and is noted as pre-existing. The row is new: an Error.
+        # inference-server's onset is read at its Deployment: Available=False since 2026-09-25, before
+        # the 10-06 master upgrade. The displaced replicas inherit that date; the row predates the upgrade.
         self.assertEqual([line for line in errors.splitlines() if line.startswith("### ")], [
-            f"### 2, 12 — {SEEDED} — `{INFERENCE}`",
             f"### 1 — {SEEDED} — `seeded-capacity/PodDisruptionBudget/inference-server`",
         ])
-        inference = errors.split("### 2, 12")[1].split("### 1 —")[0]
-        self.assertNotIn(ur.PREDATES_UPGRADE_TEXT, inference)
-        self.assertIn("; 1 pre-existing since 2026-09-25T17:02:48Z (e.g. inference-server-778b78fdb8-cp2pf)", inference)
+        inference = warnings.split("### 2, 12")[1].split("### ")[0]
+        self.assertIn(ur.PREDATES_UPGRADE_TEXT, inference)
+        self.assertIn("; 3 pre-existing since 2026-09-25T17:02:48Z (e.g. inference-server-778b78fdb8-cp2pf)", inference)
         for part in (ur.PART_WHAT_HAPPENED, ur.PART_WHAT_FAILED, ur.PART_MITIGATE, ur.PART_MITIGATION_SET_UP):
             self.assertIn(part, inference)
         self.assertIn("| UPGRADE_NODES | pinned-inference-pool | 2026-10-08T04:20:35Z | 2026-10-08T05:24:10Z | 63 min | DONE |  |", inference)
         self.assertIn("| control plane | - | 1.35.8-gke.1380001 |", inference)
-        self.assertIn("| Unschedulable | first seen | 2. No spare capacity for the displaced pods | high | 3 of 4 pods: Insufficient cpu; e.g. inference-server-778b78fdb8-cp2pf; 1 pre-existing since 2026-09-25T17:02:48Z (e.g. inference-server-778b78fdb8-cp2pf) |", inference)
+        self.assertIn("| Unschedulable | first seen | 2. No spare capacity for the displaced pods | high | 3 of 4 pods: Insufficient cpu; e.g. inference-server-778b78fdb8-cp2pf; 3 pre-existing since 2026-09-25T17:02:48Z (e.g. inference-server-778b78fdb8-cp2pf) |", inference)
         self.assertIn("| Unschedulable | first seen | 12. A node label is removed (selector seeded-role=pinned-inference) | medium |", inference)
         self.assertIn(f"- **12. A node label is removed** — For {INFERENCE} (selector seeded-role=pinned-inference):", inference)
         self.assertIn(f"- guard `{ur.guard_id(SEEDED, 2, INFERENCE)}` failure entry 2 (high), first seen 2026-10-08T18:00:00Z", inference)
@@ -1849,6 +1918,7 @@ class ReportTest(unittest.TestCase):
         self.assertEqual(headings, [
             f"### 2 — {GEMMA} — `{KUBE_DNS}` (system)",
             f"### 6 — {GEMMA} — `{TUNER}`",
+            f"### 2, 12 — {SEEDED} — `{INFERENCE}`",
             f"### 14 — {SEEDED} — `{PAYMENTS}`",
             f"### unclassified — {SEEDED} — `seeded-stall/Deployment/inventory-api`",
         ])

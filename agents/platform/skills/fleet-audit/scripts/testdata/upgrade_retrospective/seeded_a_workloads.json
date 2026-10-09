@@ -63,6 +63,22 @@
       "volumes": []
      }
     }
+   },
+   "status": {
+    "conditions": [
+     {
+      "lastTransitionTime": "2026-09-25T17:02:07Z",
+      "reason": "NewReplicaSetAvailable",
+      "status": "True",
+      "type": "Progressing"
+     },
+     {
+      "lastTransitionTime": "2026-09-25T17:02:48Z",
+      "reason": "MinimumReplicasUnavailable",
+      "status": "False",
+      "type": "Available"
+     }
+    ]
    }
   },
   {
@@ -111,6 +127,22 @@
       "volumes": []
      }
     }
+   },
+   "status": {
+    "conditions": [
+     {
+      "lastTransitionTime": "2026-09-25T17:02:46Z",
+      "reason": "NewReplicaSetAvailable",
+      "status": "True",
+      "type": "Progressing"
+     },
+     {
+      "lastTransitionTime": "2026-10-08T18:00:18Z",
+      "reason": "MinimumReplicasUnavailable",
+      "status": "False",
+      "type": "Available"
+     }
+    ]
    }
   },
   {
@@ -154,6 +186,22 @@
       "volumes": []
      }
     }
+   },
+   "status": {
+    "conditions": [
+     {
+      "lastTransitionTime": "2026-10-07T18:27:18Z",
+      "reason": "MinimumReplicasAvailable",
+      "status": "True",
+      "type": "Available"
+     },
+     {
+      "lastTransitionTime": "2026-10-07T18:27:15Z",
+      "reason": "NewReplicaSetAvailable",
+      "status": "True",
+      "type": "Progressing"
+     }
+    ]
    }
   },
   {
@@ -209,6 +257,22 @@
       "volumes": []
      }
     }
+   },
+   "status": {
+    "conditions": [
+     {
+      "lastTransitionTime": "2026-10-07T18:27:18Z",
+      "reason": "MinimumReplicasAvailable",
+      "status": "True",
+      "type": "Available"
+     },
+     {
+      "lastTransitionTime": "2026-10-07T18:27:15Z",
+      "reason": "NewReplicaSetAvailable",
+      "status": "True",
+      "type": "Progressing"
+     }
+    ]
    }
   },
   {
@@ -264,6 +328,22 @@
       "volumes": []
      }
     }
+   },
+   "status": {
+    "conditions": [
+     {
+      "lastTransitionTime": "2026-09-25T17:02:46Z",
+      "reason": "NewReplicaSetAvailable",
+      "status": "True",
+      "type": "Progressing"
+     },
+     {
+      "lastTransitionTime": "2026-10-07T04:10:05Z",
+      "reason": "MinimumReplicasAvailable",
+      "status": "True",
+      "type": "Available"
+     }
+    ]
    }
   },
   {
@@ -315,6 +395,22 @@
       "volumes": []
      }
     }
+   },
+   "status": {
+    "conditions": [
+     {
+      "lastTransitionTime": "2026-10-03T10:31:38Z",
+      "reason": "NewReplicaSetAvailable",
+      "status": "True",
+      "type": "Progressing"
+     },
+     {
+      "lastTransitionTime": "2026-10-07T04:04:00Z",
+      "reason": "MinimumReplicasAvailable",
+      "status": "True",
+      "type": "Available"
+     }
+    ]
    }
   },
   {
@@ -368,6 +464,22 @@
       ]
      }
     }
+   },
+   "status": {
+    "conditions": [
+     {
+      "lastTransitionTime": "2026-10-03T10:31:38Z",
+      "reason": "NewReplicaSetAvailable",
+      "status": "True",
+      "type": "Progressing"
+     },
+     {
+      "lastTransitionTime": "2026-10-07T04:04:00Z",
+      "reason": "MinimumReplicasAvailable",
+      "status": "True",
+      "type": "Available"
+     }
+    ]
    }
   },
   {
@@ -416,6 +528,22 @@
       "volumes": []
      }
     }
+   },
+   "status": {
+    "conditions": [
+     {
+      "lastTransitionTime": "2026-10-07T18:27:24Z",
+      "reason": "MinimumReplicasAvailable",
+      "status": "True",
+      "type": "Available"
+     },
+     {
+      "lastTransitionTime": "2026-10-07T18:27:11Z",
+      "reason": "NewReplicaSetAvailable",
+      "status": "True",
+      "type": "Progressing"
+     }
+    ]
    }
   },
   {
@@ -471,6 +599,22 @@
       ]
      }
     }
+   },
+   "status": {
+    "conditions": [
+     {
+      "lastTransitionTime": "2026-10-05T14:48:07Z",
+      "reason": "NewReplicaSetAvailable",
+      "status": "True",
+      "type": "Progressing"
+     },
+     {
+      "lastTransitionTime": "2026-10-07T04:10:22Z",
+      "reason": "MinimumReplicasAvailable",
+      "status": "True",
+      "type": "Available"
+     }
+    ]
    }
   },
   {
@@ -514,6 +658,22 @@
       "volumes": []
      }
     }
+   },
+   "status": {
+    "conditions": [
+     {
+      "lastTransitionTime": "2026-10-03T10:31:38Z",
+      "reason": "NewReplicaSetAvailable",
+      "status": "True",
+      "type": "Progressing"
+     },
+     {
+      "lastTransitionTime": "2026-10-07T04:10:05Z",
+      "reason": "MinimumReplicasAvailable",
+      "status": "True",
+      "type": "Available"
+     }
+    ]
    }
   },
   {
@@ -562,6 +722,22 @@
       "volumes": []
      }
     }
+   },
+   "status": {
+    "conditions": [
+     {
+      "lastTransitionTime": "2026-10-07T18:27:13Z",
+      "reason": "MinimumReplicasAvailable",
+      "status": "True",
+      "type": "Available"
+     },
+     {
+      "lastTransitionTime": "2026-10-07T18:27:11Z",
+      "reason": "NewReplicaSetAvailable",
+      "status": "True",
+      "type": "Progressing"
+     }
+    ]
    }
   },
   {
@@ -613,6 +789,22 @@
       "volumes": []
      }
     }
+   },
+   "status": {
+    "conditions": [
+     {
+      "lastTransitionTime": "2026-10-07T18:27:18Z",
+      "reason": "MinimumReplicasUnavailable",
+      "status": "False",
+      "type": "Available"
+     },
+     {
+      "lastTransitionTime": "2026-10-07T18:29:19Z",
+      "reason": "ProgressDeadlineExceeded",
+      "status": "False",
+      "type": "Progressing"
+     }
+    ]
    }
   },
   {
