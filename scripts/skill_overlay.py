@@ -130,15 +130,18 @@ GIT_ENV = {
     "GIT_CONFIG_NOSYSTEM": "1",
     # No user ignore file either: a scratch repository must record every file it is given.
     # and paths printed verbatim, so the diff text the tool parses names a non-ASCII file as is.
-    # Never spawn background gc or maintenance processes that can race finish_sync's rmtree (#2817).
+    # Do not let auto gc or maintenance detach into the background: background processes
+    # can delete loose objects while finish_sync's rmtree walks the scratch tree (#2817).
+    # Running housekeeping in the foreground ensures git finishes before rmtree runs,
+    # while allowing the persistent upstream cache to still be compacted.
     "GIT_CONFIG_COUNT": "4",
     "GIT_CONFIG_KEY_0": "core.excludesFile",
     "GIT_CONFIG_VALUE_0": os.devnull,
     "GIT_CONFIG_KEY_1": "core.quotePath",
     "GIT_CONFIG_VALUE_1": "false",
-    "GIT_CONFIG_KEY_2": "gc.auto",
-    "GIT_CONFIG_VALUE_2": "0",
-    "GIT_CONFIG_KEY_3": "maintenance.auto",
+    "GIT_CONFIG_KEY_2": "gc.autoDetach",
+    "GIT_CONFIG_VALUE_2": "false",
+    "GIT_CONFIG_KEY_3": "maintenance.autoDetach",
     "GIT_CONFIG_VALUE_3": "false",
     "GIT_TERMINAL_PROMPT": "0",
     "GIT_AUTHOR_NAME": "skill-overlay",
@@ -159,12 +162,7 @@ class OverlayError(Exception):
 
 
 def git(args, cwd, check=True, extra_env=None, input_text=None):
-    env = {
-        k: v for k, v in os.environ.items()
-        if k not in REPO_LOCAL_GIT_ENV
-        and not k.startswith("GIT_CONFIG_KEY_")
-        and not k.startswith("GIT_CONFIG_VALUE_")
-    }
+    env = {k: v for k, v in os.environ.items() if k not in REPO_LOCAL_GIT_ENV}
     env.update(GIT_ENV)
     env.update(extra_env or {})
     res = subprocess.run(["git", *args], cwd=cwd, env=env, capture_output=True,
