@@ -10,7 +10,7 @@ kube-agents talks to Slack through one Slack app that you create in your workspa
 
 The two need different app settings, so follow the section for your mode. The tokens and the allowlist work the same way in both.
 
-To install with the `next` path, pass `--mode=next` to the installer (`./install.sh --mode=next`, with the Slack flags below). `next` is an unsupported development stack; `today` is the default. The installer records the mode in `install.env` as `PLATFORM_AGENT_MODE`; to switch a running install later, edit that key and re-run the installer.
+To install with the `next` path, pass `--mode=next` to the installer (`./install.sh --mode=next`, with the Slack flags below). `next` is an unsupported development stack; `today` is the default. The `--mode` flag is in releases after 0.9.0 and on `main`. The installer records the mode in `install.env` as `PLATFORM_AGENT_MODE`; to switch a running install later, edit that key and re-run the installer.
 
 ## Before you start
 
