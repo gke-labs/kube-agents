@@ -311,9 +311,12 @@ func harnessCommand() []string {
 	// harness in tests or an older image.
 	delegateTool := delegateToolEnabled()
 	var prompts []string
+	// The no-cluster line keys on the view, not on Bash: a view pod whose
+	// override leaves Bash out still holds the broker's URL, token file and
+	// shims, so telling it they aren't there would be false. It gets neither.
 	if bashView {
 		prompts = append(prompts, clusterViewPrompt)
-	} else if os.Getenv(lib.EnvProfileExecutor) != "true" {
+	} else if !clusterView && os.Getenv(lib.EnvProfileExecutor) != "true" {
 		prompts = append(prompts, noClusterPrompt)
 	}
 	if delegateTool {
