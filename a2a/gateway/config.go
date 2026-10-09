@@ -69,6 +69,9 @@ const (
 	metricsPortMax = 65535
 )
 
+// busyNoticeAtEnv names the busy notice's threshold (Config.BusyNoticeAt).
+const busyNoticeAtEnv = "A2A_BUSY_NOTICE_AT"
+
 // The display-mode values, matching the GoogleChatSpec.Mode enum.
 const (
 	displayModeDefault = "default"
@@ -445,6 +448,22 @@ type Config struct {
 	// it: 0 would be "delegation off", which is a different switch
 	// (A2A_DELEGATE_TOOL on the worker side), not a typo to paper over.
 	DelegationDepthMax int
+
+	// BusyNoticeAt is how many tasks have to be ahead of a new fixed-route
+	// turn before the gateway marks the turn's status line queued
+	// (A2A_BUSY_NOTICE_AT). The count is the fixed addressee's outstanding
+	// work, read from session-state (fixedRouteBacklog in busy.go); at or
+	// above this number the turn's task is still submitted, and its status
+	// line is edited to a queued state that says how many are ahead
+	// (showBusy). Nothing is refused or dropped.
+	//
+	// Zero means 10, the rendered bridge's default BRIDGE_CONCURRENCY. The
+	// operator renders the bridge's worker count here, so a turn is told it
+	// is waiting exactly when every worker is taken; raising it past the
+	// worker count makes the notice rarer and later, lowering it under the
+	// count tells people about a wait that is not there. FromEnv refuses a
+	// value under 1.
+	BusyNoticeAt int
 }
 
 // Backend names the REAL chat backend this config arms: "gchat", "slack",
@@ -659,6 +678,12 @@ func FromEnv() (*Config, error) {
 		return nil, fmt.Errorf("A2A_DELEGATION_DEPTH_MAX %q: need an integer >= 1", depthMax)
 	}
 	cfg.DelegationDepthMax = dm
+	busyAt := envOr(busyNoticeAtEnv, strconv.Itoa(defaultBusyNoticeAt))
+	ba, err := strconv.Atoi(busyAt)
+	if err != nil || ba < 1 {
+		return nil, fmt.Errorf("%s %q: need an integer >= 1", busyNoticeAtEnv, busyAt)
+	}
+	cfg.BusyNoticeAt = ba
 	ttl := envOr("A2A_IDLE_TTL", "30m")
 	d, err := time.ParseDuration(ttl)
 	if err != nil {

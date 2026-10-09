@@ -712,3 +712,9 @@
 # cluster name the Slack plan row renders (agents/platform/SOUL.md, fan-out).
 # deployer: noop; reads the seeded fleet's crashloop-workload role.
 ./tasks/chat-fanout-fleet-restarts-rows/task.yaml
+
+# gke-backup-dr skill probe: a CMEK-encrypted backup plan for two namespaces
+# uses the flags gcloud accepts (--update-addons=BackupRestore=ENABLED,
+# --selected-namespaces, --backup-retain-days, --encryption-key). deployer:
+# noop, transcript-only.
+./tasks/backup-dr-cmek-selected-namespaces-probe/task.yaml
