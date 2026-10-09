@@ -1262,7 +1262,7 @@ NetworkPolicy, the cluster's Workload Identity setting and pod security. Four st
 (`fleet-wide-cost-analysis`, `compliance-audit`, `obtainability-audit`, `stockout-prevention`) now
 also run once right after the scan as the first-run audits (`oobe.md`), so the sweep leaves their
 checks to them (`cluster_inventory_audit_sop.md`, Step 5). The exception is an install with no
-GitOps repository: the first-run audits do not run there, and the sweep's cards keep the checks under the
+GitOps repository: those four do not run there (the upgrade retrospective does, and owns none of these checks), and the sweep's cards keep the checks under the
 audits' own slugs (that SOP's "Without a GitOps repository" section). What the sweep still shares
 with a stream everywhere is four cluster settings whose owners are not in the first-run chain:
 

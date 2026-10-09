@@ -180,8 +180,13 @@ An audit on an install with no GitOps repository runs without a forge: it keeps 
 report store and posts a chat summary, with no ledger issue and no pull request (the `fleet-audit`
 skill's "No forge configured"). `oobe.py` still starts none of the four there. It reads the managed repositories
 from `/etc/gitops/managed_repos`, which the operator mounts into the gateway container
-(`platformagent_manifests.go`, `gitopsStateDir`), through `gitops_workspace.get_managed_github_repos`.
-With none, it writes the marker with the reason and starts nothing.
+(`platformagent_manifests.go`, `gitopsStateDir`), through `gitops_workspace.get_managed_github_repo_names`.
+With none, it records the four as held with that reason and starts none of them (§7 lists starting
+them there as a separate change). The fifth audit in the chain, the upgrade retrospective
+(`REPOSITORY_FREE_AUDITS`), is marked regardless: its collector writes the report to the shell
+volume and its SOP runs the collector alone there, with no audit run or ledger issue, the report on the
+volume being the record, so on such an install it is the whole chain and the first report is still a
+baseline of every cluster.
 
 The onboarding scan reads the same list (`oobe.managed_repositories`) once, when it files the sweep
 card, and records the answer in `.bootstrap_scan_filed` for the Cluster Agents' cards. With none,
@@ -195,12 +200,14 @@ It does not exit non-zero. No repository is a configuration the installer offers
 a failing per-minute job repeats until something changes. The operator is told instead: the
 interactive installer's "GitOps repository connection skipped" line says the scheduled audits run
 without one but write no ledger issue or pull request,
-and the delivered report closes with a note saying the first-run audits did not run, why, and, when a
-cluster was audited, whether the report covers their workload checks instead. That last part follows what
-`.bootstrap_scan_filed` recorded the cards were told, not the skip's reason, since the list can change between the two
+and the delivered report closes with a note saying the four workload audits did not run, why, and, when a
+cluster was audited, whether the report covers their workload checks instead, then that the upgrade retrospective,
+which needs no repository, has started or is still to (`bootstrap_delivery.py`, `_audits_note`; a skip of the
+whole chain, the retrospective with it, keeps the note as it was: the skip sentence and the coverage sentence). The coverage part follows what
+`.bootstrap_scan_filed` recorded the cards were told, not the hold's reason, since the list can change between the two
 reads: it covers them for `yes` or `unknown` (the cards ran the section either way), does not for `no`, and the note hedges for a marker with no answer.
-Delivery can run before the stage has recorded the skip; a recorded `yes` then gives the same note. Beside a Slack Block
-Kit card the note is a second message.
+Delivery can run before the stage has recorded the hold; a recorded `yes` then gives the same note with the
+retrospective still to start. Beside a Slack Block Kit card the note is a second message.
 
 ### 4.5 What the operator sees
 
@@ -278,7 +285,9 @@ times. It rides with the audits stage, whose eval case covers both.
 - **Reaching an install with no home channel.** Audit summaries go to the home channel only.
   Posting the report there at T+0 when one is set is a separate change.
 - **First-run audits without a GitOps repository.** The audits can run with no forge now; starting
-  them from `oobe` on such an install is a separate change.
+  the four from `oobe` on such an install is a separate change. The upgrade retrospective is the one
+  the stage starts there (§4.4): its report is its record and the ledger issue is what a repository
+  adds.
 - **An install self-check.** Not asked for by any issue.
 
 ## 8. Build order and evaluation

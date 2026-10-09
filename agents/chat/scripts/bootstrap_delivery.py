@@ -198,7 +198,7 @@ AUDITS_MAYBE_COVERED_NOTE = (
 )
 # The no-repository skip when the report is the hand-off's no-coverage report
 # (bootstrap_handoff.NO_RANKING): no cluster was audited, so the scan checked nothing in the audits'
-# place, and with no repository the first-run audits do not run either.
+# place, and with no repository the four workload audits do not run either.
 AUDITS_UNCHECKED_NOTE = (
     "No cluster was audited either, so nothing has checked probes, requests and limits, autoscaling, "
     "NetworkPolicy or pod security yet."
@@ -229,6 +229,15 @@ AUDITS_NONE_RAN_NOTE = (
 AUDITS_NOT_RUN_NOTE = "Not run: {audits}."
 # oobe gives up on an audit it could not start; the audit still runs on its own schedule.
 AUDITS_GAVE_UP_REASON = "it did not start, and runs on its own schedule"
+# With no repository the stage holds the workload audits (_workload_audits) with
+# oobe.SKIP_NO_REPOSITORY and starts the retrospective alone (oobe.py, first_run_audits), so that
+# hold reads as the skip it was before the retrospective joined the chain, with the retrospective's
+# own line after the coverage sentence.
+AUDITS_WORKLOAD_HELD_NOTE = "The cost, security, reliability and capacity audits did not run: {reason}."
+RETROSPECTIVE_STARTED_NOTE = (
+    "The upgrade retrospective, which needs no repository, has started; it posts a summary to the home channel."
+)
+RETROSPECTIVE_PENDING_NOTE = "The upgrade retrospective, which needs no repository, starts once this scan is done."
 
 # The delivery job's ``origin`` and the keys the plugin writes into it.
 ORIGIN_KEY = "origin"
@@ -614,21 +623,35 @@ def _presented(content: str) -> str:
         return content
 
 
+def _workload_audits() -> tuple[str, ...]:
+    """The first-run audits whose workload checks the note is about: the ones that need a repository.
+
+    The upgrade retrospective (``oobe.REPOSITORY_FREE_AUDITS``) checks none of them and runs without
+    one. Read when called, not at import: ``oobe`` imports this module, so its tuples are not defined
+    yet when ``oobe`` is imported first.
+    """
+    return tuple(a for a in oobe.FIRST_RUN_AUDITS if a not in oobe.REPOSITORY_FREE_AUDITS)
+
+
 def _audits_note(data_dir: Path, no_coverage: bool) -> str:
     """The note on the first-run audits the delivery closes with, from oobe's marker.
 
     Whether the report covers those checks after a skip is what the gate recorded the scan's cards
     were told (``bootstrap_handoff.recorded_no_repository``). Before oobe's marker exists the stage
-    has not decided, so a recorded "no repository" stands in for the skip it will record; anything
-    else is the chain. ``no_coverage`` is a report no cluster's audit reached (``_no_ranking``),
-    which covers nothing.
+    has not decided, so a recorded "no repository" stands in for the hold it will record: the
+    workload audits held with that reason and the retrospective started alone; anything else is the
+    chain. ``no_coverage`` is a report no cluster's audit reached (``_no_ranking``), which covers
+    nothing.
     """
     recorded = bootstrap_handoff.recorded_no_repository(data_dir / oobe.SCAN_FILED_MARKER)
     state = oobe.read_state(data_dir)
     if not state and recorded == bootstrap_handoff.RECORDED_YES:
-        state = {oobe.STATE_SKIPPED: True, oobe.STATE_REASON: oobe.SKIP_NO_REPOSITORY}
-    if state.get(oobe.STATE_SKIPPED):
-        reason = str(state.get(oobe.STATE_REASON) or AUDITS_NO_REASON)
+        state = {oobe.STATE_HELD: {a: oobe.SKIP_NO_REPOSITORY for a in _workload_audits()}}
+    held = state.get(oobe.STATE_HELD) if isinstance(state.get(oobe.STATE_HELD), dict) else {}
+    skipped = bool(state.get(oobe.STATE_SKIPPED))
+    workload_held = all(held.get(a) == oobe.SKIP_NO_REPOSITORY for a in _workload_audits())
+    if skipped or workload_held:
+        reason = str(state.get(oobe.STATE_REASON) or AUDITS_NO_REASON) if skipped else oobe.SKIP_NO_REPOSITORY
         if no_coverage:
             coverage = AUDITS_UNCHECKED_NOTE if reason == oobe.SKIP_NO_REPOSITORY else AUDITS_UNCHECKED_SCHEDULED_NOTE
         elif recorded in (bootstrap_handoff.RECORDED_YES, bootstrap_handoff.RECORDED_UNKNOWN):
@@ -637,9 +660,11 @@ def _audits_note(data_dir: Path, no_coverage: bool) -> str:
             coverage = AUDITS_NOT_COVERED_NOTE
         else:
             coverage = AUDITS_MAYBE_COVERED_NOTE
-        return f"{AUDITS_SKIPPED_NOTE.format(reason=reason)} {coverage}"
-    fired = [a for a in oobe.FIRST_RUN_AUDITS if a in _list(state.get(oobe.STATE_FIRED))]
-    held = state.get(oobe.STATE_HELD) if isinstance(state.get(oobe.STATE_HELD), dict) else {}
+        if skipped:
+            # The stage skipped the whole chain, the retrospective with it.
+            return f"{AUDITS_SKIPPED_NOTE.format(reason=reason)} {coverage}"
+        return f"{AUDITS_WORKLOAD_HELD_NOTE.format(reason=reason)} {coverage} {_retrospective_note(state)}"
+    fired = [a for a in _workload_audits() if a in _list(state.get(oobe.STATE_FIRED))]
     gave_up = _list(state.get(oobe.STATE_GAVE_UP))
     not_run = [f"`{a}` ({held[a]})" for a in oobe.FIRST_RUN_AUDITS if a in held]
     not_run += [f"`{a}` ({AUDITS_GAVE_UP_REASON})" for a in oobe.FIRST_RUN_AUDITS if a in gave_up]
@@ -650,6 +675,19 @@ def _audits_note(data_dir: Path, no_coverage: bool) -> str:
     else:
         note = AUDITS_NONE_RAN_NOTE
     return f"{note} {AUDITS_NOT_RUN_NOTE.format(audits=', '.join(not_run))}" if not_run else note
+
+
+def _retrospective_note(state: dict) -> str:
+    """The retrospective's line after a no-repository hold: not run (with the reason), started, or still to start."""
+    held = state.get(oobe.STATE_HELD) if isinstance(state.get(oobe.STATE_HELD), dict) else {}
+    gave_up = _list(state.get(oobe.STATE_GAVE_UP))
+    not_run = [f"`{a}` ({held[a]})" for a in oobe.REPOSITORY_FREE_AUDITS if a in held]
+    not_run += [f"`{a}` ({AUDITS_GAVE_UP_REASON})" for a in oobe.REPOSITORY_FREE_AUDITS if a in gave_up]
+    if not_run:
+        return AUDITS_NOT_RUN_NOTE.format(audits=", ".join(not_run))
+    if any(a in _list(state.get(oobe.STATE_FIRED)) for a in oobe.REPOSITORY_FREE_AUDITS):
+        return RETROSPECTIVE_STARTED_NOTE
+    return RETROSPECTIVE_PENDING_NOTE
 
 
 def _list(value) -> list:

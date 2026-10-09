@@ -387,10 +387,12 @@ class StageTest(unittest.TestCase):
             self.assertEqual(env["HERMES_HOME"], str(self.d / "profiles" / "platform"))
 
     def test_the_chain_follows_1866s_order(self):
+        # #1866's four in its order, then the upgrade retrospective.
         self.assertEqual(
             oobe.FIRST_RUN_AUDITS,
-            ("fleet-wide-cost-analysis", "compliance-audit", "obtainability-audit", "stockout-prevention"),
+            ("fleet-wide-cost-analysis", "compliance-audit", "obtainability-audit", "stockout-prevention", "upgrade-retrospective"),
         )
+        self.assertEqual(oobe.REPOSITORY_FREE_AUDITS, ("upgrade-retrospective",))
 
     def test_the_trigger_marks_the_job_due_and_does_not_run_it(self):
         # `hermes cron run` runs the job in the calling process; trigger_job only schedules it.
@@ -799,11 +801,12 @@ class StageTest(unittest.TestCase):
             {"id": "obtainability-audit", "enabled": False, "state": "paused", "paused_at": "2026-10-06T00:00:00"},
             {"id": "stockout-prevention", "enabled": True, "paused_at": "2026-10-06T00:00:00"},
             {"id": "fleet-wide-cost-analysis", "enabled": True},
+            {"id": "upgrade-retrospective", "enabled": True},
         ])
         self._file_scan()
         _board(self.board, [_ranking("done")])
         self._drive()
-        self.assertEqual(self._started_ids(), ["fleet-wide-cost-analysis"])
+        self.assertEqual(self._started_ids(), ["fleet-wide-cost-analysis", "upgrade-retrospective"])
         state = oobe.read_state(self.d)
         self.assertEqual(state[oobe.STATE_HELD], {
             "compliance-audit": "disabled",
@@ -861,15 +864,39 @@ class StageTest(unittest.TestCase):
 
     # --- no GitOps repository -------------------------------------------------
 
-    def test_no_repository_skips_and_finishes(self):
+    def test_no_repository_holds_the_fleet_audits_and_runs_the_retrospective(self):
+        # The stage holds the four without a repository (starting them there is a separate change);
+        # the retrospective's record is its report on the volume, so it is the one started.
         self._file_scan()
         _board(self.board, [_ranking("done")])
         self.repos = []
-        self._main()
+        self._drive()
+        self.assertEqual(self._started_ids(), ["upgrade-retrospective"])
+        state = oobe.read_state(self.d)
+        self.assertTrue(state[oobe.STATE_DONE])
+        self.assertEqual(state[oobe.STATE_FIRED], ["upgrade-retrospective"])
+        self.assertEqual(
+            state[oobe.STATE_HELD],
+            {job_id: oobe.SKIP_NO_REPOSITORY for job_id in oobe.FIRST_RUN_AUDITS if job_id != "upgrade-retrospective"},
+        )
+        self.assertNotIn(oobe.STATE_REASON, state)
+
+    def test_no_repository_still_waits_for_a_retrospective_run_in_flight(self):
+        # A Sunday tick's run going when the scan settles: the chain waits for it like any other,
+        # and once it has completed since the sweep was filed, adopts it rather than marking again.
+        self._ledger("upgrade-retrospective", "running", NOW_SETTLED - MINUTE)
+        self._file_scan()
+        _board(self.board, [_ranking("done")])
+        self.repos = []
+        self._main(now=NOW_SETTLED)
+        self.assertEqual(self.started, [])
+        self.assertFalse(oobe.read_state(self.d)[oobe.STATE_DONE])
+        self._ledger("upgrade-retrospective", "completed", NOW_SETTLED - MINUTE)
+        self._main(now=NOW_SETTLED + MINUTE)
         self.assertEqual(self.started, [])
         state = oobe.read_state(self.d)
         self.assertTrue(state[oobe.STATE_DONE])
-        self.assertEqual(state[oobe.STATE_REASON], oobe.SKIP_NO_REPOSITORY)
+        self.assertEqual(state[oobe.STATE_ADOPTED], ["upgrade-retrospective"])
 
     def test_an_unreadable_repository_list_is_retried(self):
         self._file_scan()
