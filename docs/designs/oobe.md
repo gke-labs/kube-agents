@@ -9,7 +9,7 @@ within about two hours of install. It also runs the inventory scan and the repor
 so first-run work lives in one place.
 
 > **Status:** §4, the first-run audits, and §5, the fold of the bootstrap jobs, are implemented. §8 is
-> the build order; dropping the disabled ids is what remains of it.
+> the build order; its step 3 is what remains.
 
 ## 1. Why
 
