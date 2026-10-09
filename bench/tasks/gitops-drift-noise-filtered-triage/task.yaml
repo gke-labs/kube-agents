@@ -95,8 +95,10 @@
 # directly: a ceiling refusal is a ledger row with notified=0 and an empty
 # delivery_error, which it writes as card-quota-refused. Raise the limit or
 # use a fresh install rather than reading that as a finding. card-turn-failed
-# is the other shape -- a row the daemon accepted whose turn filed no card --
-# so on that token the ceiling is precisely what the explanation is not.
+# is the other shape -- a row the daemon accepted whose card never reached a
+# terminal status, whether because the turn filed none or because it was still
+# running when the timeout elapsed -- so on that token the ceiling is precisely
+# what the explanation is not.
 #
 # WHY THE WORKLOAD NAMES CARRY A PREFIX
 #
@@ -254,13 +256,6 @@
 # detector was plainly seeing its principal, is the case's finding, and it
 # reds.
 #
-# Arrival position, not publish position. The subscription carries no ordering
-# key — terraform/modules/drift-pubsub/main.tf says so where it explains why
-# there is no dead-letter policy — so the fixture cannot lean on Pub/Sub to
-# deliver in the order it published. It has to space the human record far
-# enough ahead of the burst that its delivery cannot be overtaken, which is
-# what the pacing bullet below asks for.
-#
 # This is also why the prompt names both namespaces rather than only the one
 # holding the human change. Scoping the search to that namespace would tell the
 # agent to skip exactly the cards an unfiltered pipeline files, and the case
@@ -339,8 +334,9 @@
 #   copy away rather than a hypothetical, and it fails as a silent filter:
 #   no ledger row, no DRIFT line, and no explanation unless --log-dropped is
 #   on to name the reason.
-# - The stack does not return until a card carrying the human record's
-#   insertId is on the board. Without that poll the spec grades a board that
+# - The stack waits for a card carrying the human record's insertId to reach a
+#   terminal status, bounded by card_timeout_seconds, and the verdict it writes
+#   names what that wait found. Without that poll the spec grades a board that
 #   is shared and persists between runs, against a
 #   plant that is identical every repetition — same two namespaces, same three
 #   workload names, same 512Mi. So on the repetition where the pipeline files
@@ -490,8 +486,8 @@
 #   broken filter a churn card can still be in flight when the agent reads,
 #   both phrase objectives pass, and the pipeline filtered nothing. That is
 #   why the verdict rests on the ledger rather than the board, and why the
-#   ledger is read whatever the card did. The settle after the burst is
-#   measured front-door turn, before the stack returns. The ledger check
+#   ledger is read whatever the card did. settle_seconds runs after the card
+#   wait and before the ledger read. The ledger check
 #   above is what runs at the end of that settle, and it does not depend on a
 #   churn card existing: the intercepted_events row is written when the
 #   record reaches the daemon, whatever the ceiling said and before any
@@ -681,11 +677,14 @@ verification_spec:
     mode: assert
     check:
       type: report_contains
-      # The discrimination CUJ 3 is about. Not the only check an unfiltered
-      # pipeline fails — because the human change is not the newest, the newest
-      # card would be churn and triage-names-the-human-change would go red
-      # alongside this one — but the only one whose red says the filter is what
-      # broke. Both workloads were written to repeatedly during the window by
+      # The discrimination CUJ 3 is about, and the only phrase objective an
+      # unfiltered pipeline is certain to fail. It is not what reds the
+      # repetition: the human record is published last, so on a broken filter
+      # its card is the newest and triage-names-the-human-change passes, and
+      # this one reds only if the agent read the board after a churn card
+      # landed. What reds a broken filter on every repetition is the safeguard
+      # below, which grades the stack's own observation rather than the
+      # report. Both workloads were written to repeatedly during the window by
       # service-account and system: principals, so both are visible to an agent
       # that went looking and invisible to one reading a card the detector
       # filtered.
