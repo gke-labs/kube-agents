@@ -1,5 +1,5 @@
 {
-  "version": "7bfeb839b77e575c",
+  "version": "5ca003ff28bd2c5c",
   "identities": [
     {
       "serviceAccount": "system:serviceaccount:kubeagents-system:agent-a2a-provision",
@@ -58,10 +58,12 @@
           "$JS.API.DIRECT.GET.TOPICS-STATE.>",
           "$JS.API.STREAM.INFO.TOPICS-JOURNAL",
           "$JS.API.DIRECT.GET.TOPICS-JOURNAL.>",
+          "chat.notify.gchat",
           "_INBOX.agent.>"
         ],
         "subscribe": [
           "a2a.topics.>",
+          "chat.notify.reply.agent.>",
           "_INBOX.agent.>"
         ]
       }

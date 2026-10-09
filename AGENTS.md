@@ -410,16 +410,17 @@ high-severity finding just under that bar, marked as such. `/review all` re-read
 review's width and adds findings it believes are real without being sure. The `agent:ignore` label
 opts a pull request out and outranks both.
 
-**A human reviewer is requested only once its check passes.** The bot posts an `AI Review` check
-run, and `.github/workflows/auto_request_review.yml` waits for it to go green before assigning
-anyone from `.github/auto_request_review.yml`. A first review is green only if it found nothing; a
-later review of it holds the check on 🔴 High alone, with 🟠 Medium posted, not held
-([the cases](docs/pull-request-workflow.md#what-the-check-means)). A green
-pass after `/review` is what reaches a reviewer. Exceptions: a pull request opened by a bot is
-assigned as soon as the check completes, whatever the conclusion, because Dependabot cannot re-run `/review` on itself; and an
-owner, member, or collaborator can comment `/request-review` (at the start of the comment) to
-assign a reviewer immediately — the override for a finding you have answered but disagree with, or
-for a review that never arrived. Nothing here changes who is picked; that is still the config file.
+**A human reviewer is requested once its check passes, or at the bot's third round.** The bot posts
+an `AI Review` check run, and `.github/workflows/auto_request_review.yml` assigns someone from
+`.github/auto_request_review.yml` when it goes green — a first review is green only if it found
+nothing; a later review of it holds the check on 🔴 High alone, with 🟠 Medium posted, not held
+([the cases](docs/pull-request-workflow.md#what-the-check-means)) — or, once, when the bot has
+reviewed three commits and the check is still grey. The first request posts a hand-off comment:
+from there the reviewer decides, and you reply in the threads rather than asking for another round.
+Exceptions: a pull request opened by a bot is assigned as soon as the check completes, because
+Dependabot cannot re-run `/review`; and an owner, member, or collaborator can comment
+`/request-review` (at the start of the comment) to assign a reviewer immediately — for a missing
+review or a finding you dispute.
 
 **What agents must do.** After creating a pull request, tell the user the bot review is on its way
 and **offer to wait for it** instead of reporting the work as finished — unless you opened a draft,
