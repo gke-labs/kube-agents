@@ -2913,6 +2913,18 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 			}
 			extEnvs = kept
 		}
+		// A2A_NOTIFY_PLATFORM is dropped on every install, not only while the
+		// A2A surface is up: on a today install a plugin's value would reroute
+		// every Google Chat post from hermes send to a chat.notify route that
+		// does not exist there. The operator renders it only under next, after
+		// this merge.
+		kept := extEnvs[:0]
+		for _, e := range extEnvs {
+			if e.Name != a2aNotifyPlatformEnvVar {
+				kept = append(kept, e)
+			}
+		}
+		extEnvs = kept
 		if len(extEnvs) > 0 {
 			envVars = mergeEnvVars(envVars, extEnvs)
 		}
@@ -3078,6 +3090,15 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 				Value: a2aAgentBusUser,
 			},
 		)
+	}
+	// The Hermes Google Chat platform is off under next (legacyChatConsumer),
+	// so the agent-side callers that used to `hermes send` a proactive post
+	// route it to the gateway's chat.notify instead. This names the platform
+	// they reroute; the bus identity above is what sends it. Only when the
+	// home channel is one the gateway will arm the route for: otherwise every
+	// post would go to a subject nobody answers.
+	if a2aAgentSurface(agent) && a2aChatArmed(agent) && a2aGchatHomeSpace(agent) != "" {
+		envVars = append(envVars, corev1.EnvVar{Name: a2aNotifyPlatformEnvVar, Value: a2aNotifyPlatformGchat})
 	}
 	if a2aActivityHookWanted(agent) {
 		envVars = append(envVars, a2aActivitySecretEnv(agent))

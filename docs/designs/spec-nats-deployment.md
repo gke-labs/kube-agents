@@ -581,6 +581,14 @@ Layout:
   the console pod is enough, because `/config.json` hands the password to the page, and to
   any other process running locally while the forward is open.
 
+- **The notify route.** The agent's proactive posts to the chat home channel under `next`
+  (spec-chatops-gateway.md, "Proactive posts: the chat.notify route"). The `agent` user gains
+  publish on `chat.notify.gchat` and subscribe on `chat.notify.reply.agent.>`; the gateway
+  user gains the matching pair (subscribe on the first, publish on the second). No other
+  principal holds either subject. The reply namespace is its own rather than the agent's
+  `_INBOX`, so the gateway cannot publish into the inbox where the agent reads its JetStream
+  replies. Core NATS, like the console subjects: the provision Job is untouched.
+
 - **Bucket access is subject access.** KV and the Object Store ride internal subjects -
   `$KV.{bucket}.>`, `$O.{bucket}.C.>` / `$O.{bucket}.M.>`, plus the `$JS.API` surface for
   their streams - and the deny-by-default map grants them explicitly per role: the

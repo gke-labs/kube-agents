@@ -65,6 +65,7 @@ from contextlib import contextmanager
 from pathlib import Path
 
 import sandbox_exec
+import chat_notify
 from chat_platforms import enabled_chat_platforms
 from cluster_agent_profile import (
     HERMES_BIN,
@@ -79,6 +80,9 @@ from cluster_agent_profile import (
 )
 
 DESCRIBE_TIMEOUT_SECONDS = 30
+# The reconcile notice's kill timeout for `hermes send`; a routed send gets
+# at least `a2a notify`'s own bound (chat_notify.subprocess_timeout).
+NOTIFY_SEND_TIMEOUT_SECONDS = 30
 _MD_BASE = "http://metadata.google.internal/computeMetadata/v1/"
 EXTRA_EXCLUDE = {c for c in os.environ.get("RECONCILE_EXCLUDE", "").split(",") if c}
 
@@ -2051,9 +2055,16 @@ def _notify(message: str) -> None:
     for platform in enabled_chat_platforms():
         try:
             subprocess.run(
-                [HERMES_BIN, "send", "--to", platform, message],
-                capture_output=True, text=True, check=True, timeout=30, env=_run_env(),
+                chat_notify.command(platform, message, json_output=False, hermes_bin=HERMES_BIN),
+                capture_output=True, text=True, check=True, env=_run_env(),
+                timeout=chat_notify.subprocess_timeout(platform, NOTIFY_SEND_TIMEOUT_SECONDS),
+                stdin=subprocess.DEVNULL,
             )
+        except subprocess.CalledProcessError as e:
+            if chat_notify.outcome_unknown(e.returncode):
+                log(f"Reconcile notification to {platform} got no answer in time; it may have posted")
+                continue
+            log(f"Failed to post reconcile notification to {platform}: {e}")
         except Exception as e:  # noqa: BLE001 - notification is best-effort; never fail the run
             log(f"Failed to post reconcile notification to {platform}: {e}")
 

@@ -71,6 +71,12 @@ the investigation already happened and the turn only presents. The three pieces
 that make an alert answerable — a thread, a session bound to it, and the report
 stored against that thread — are reused unchanged.
 
+Under `spec.mode: next` the post leg is `a2a notify` through the A2A gateway rather
+than `hermes send`, for the platform the gateway holds (spec-chatops-gateway.md,
+"Proactive posts: the chat.notify route"). The report still lands in a thread, but a
+reply typed into it reaches the gateway, which has no binding to the report, so the
+`incident_context` step above does not apply there.
+
 With `KAGE_SLACK_UX` on, the Slack leg of a fleet-audit job's report sends a
 headline in place of the composed message (`slack_audit_report.py`, called from
 `relay_cron_report`), provided the Chat Agent composed it, a chat id or a Slack

@@ -1,6 +1,8 @@
 // Command a2a is the topics client: read the current answer on a provisioned
 // topic, or write one. It is the reader beat 3 needs before any session pod
 // exists, and the thing the platform agent's a2a-topics skill shells out to.
+// Its `notify` command asks the A2A gateway to post a proactive message to the
+// chat backend it holds (notify.go).
 //
 // Credentials: in the platform-agent container, which is where this binary
 // mostly runs, it authenticates through the auth callout as `agent` -- the
@@ -34,6 +36,7 @@ usage:
   a2a topics list                  list the provisioned topics and their retention class
   a2a topics read <topic>          print the latest entry on a topic
   a2a topics write <topic> [flags] publish one entry to a topic
+  a2a notify --platform <p> [text] post to the chat home channel via the gateway
 
 <topic> is a bare name (upgrade-readiness), a scope-qualified name
 (shared.blueprint, agent.platform.upgrade-readiness), or a full subject. A bare
@@ -60,6 +63,12 @@ const cliTimeout = 30 * time.Second
 func main() {
 	if err := run(os.Args[1:]); err != nil {
 		fmt.Fprintf(os.Stderr, "a2a: %v\n", err)
+		if errors.Is(err, errNotifyOutcomeUnknown) {
+			os.Exit(notifyExitOutcomeUnknown)
+		}
+		if errors.Is(err, errNotifyRouteUnavailable) {
+			os.Exit(notifyExitRouteUnavailable)
+		}
 		os.Exit(1)
 	}
 }
@@ -72,6 +81,8 @@ func run(args []string) error {
 	switch args[0] {
 	case "topics":
 		return runTopics(args[1:])
+	case "notify":
+		return runNotify(args[1:])
 	case "-h", "--help", "help":
 		fmt.Print(usage)
 		return nil

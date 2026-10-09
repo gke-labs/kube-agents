@@ -538,7 +538,17 @@ const (
 	a2aGchatRelayURLEnvVar      = "A2A_GCHAT_RELAY_URL"
 	a2aGchatAllowedUsersEnvVar  = "A2A_GCHAT_ALLOWED_USERS"
 	a2aGchatAllowAllUsersEnvVar = "A2A_GCHAT_ALLOW_ALL_USERS"
-	a2aChatDisplayModeEnvVar    = "A2A_CHAT_DISPLAY_MODE"
+	// The home space the gateway's chat.notify route posts to
+	// (a2a/gateway/config.go, notify.go), from googleChat.homeChannel.
+	a2aGchatHomeChannelEnvVar = "A2A_GCHAT_HOME_CHANNEL"
+	// The agent container's half of the same route: which platform name
+	// the agent-side callers route through `a2a notify` instead of
+	// `hermes send` (agents/platform/scripts/chat_notify.py).
+	a2aNotifyPlatformEnvVar = "A2A_NOTIFY_PLATFORM"
+	a2aNotifyPlatformGchat  = "google_chat"
+	// The prefix of a Chat space resource name.
+	a2aGchatSpacePrefix      = "spaces/"
+	a2aChatDisplayModeEnvVar = "A2A_CHAT_DISPLAY_MODE"
 	// The CR field's own default. The gateway's unset resolves to "debug"
 	// so Discord installs render as they always have; the operator is what
 	// makes the CR and the env agree, so unset on the CR renders this.
@@ -1173,6 +1183,23 @@ func a2aTargetAllowlistEnv(agent *agentv1alpha1.PlatformAgent) []corev1.EnvVar {
 // door flag, read the same way and failing shut the same way.
 func a2aAgentDoorEnabled() bool {
 	return os.Getenv(a2aAgentDoorEnvVar) == "true"
+}
+
+// a2aGchatHomeSpace is googleChat.homeChannel trimmed, when it is a Chat space
+// name ("spaces/<id>", nothing nested), and "" otherwise. It is the condition
+// the gateway arms its chat.notify route on (a2a/gateway/notify.go,
+// NewGchatNotifier), so the agent is told to route proactive posts there
+// exactly when something will answer them.
+func a2aGchatHomeSpace(agent *agentv1alpha1.PlatformAgent) string {
+	if !googleChatEnabled(agent) {
+		return ""
+	}
+	home := strings.TrimSpace(agent.Spec.Integration.GoogleChat.HomeChannel)
+	id, ok := strings.CutPrefix(home, a2aGchatSpacePrefix)
+	if !ok || id == "" || strings.Contains(id, "/") {
+		return ""
+	}
+	return home
 }
 
 // a2aChatArmed reports whether this install's Google Chat is consumed by the
@@ -4452,6 +4479,12 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 			// Rendered explicitly at the gateway's default, like
 			// A2A_MAX_SESSIONS: the path and the mount below are one fact.
 			{Name: a2aGchatTokenPathEnvVar, Value: a2aGchatTokenPath},
+		}
+		// Proactive posts land here (the chat.notify route). Unset leaves
+		// the route unarmed, which is what an install with no home channel
+		// had under today too: nowhere to post.
+		if home := strings.TrimSpace(gchat.HomeChannel); home != "" {
+			chatEnv = append(chatEnv, corev1.EnvVar{Name: a2aGchatHomeChannelEnvVar, Value: home})
 		}
 		chatMounts = []corev1.VolumeMount{{Name: a2aGchatTokenVolume, MountPath: a2aGchatTokenDir, ReadOnly: true}}
 		chatVolumes = []corev1.Volume{{
