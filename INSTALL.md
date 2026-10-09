@@ -1112,3 +1112,44 @@ make uninstall
   kubectl logs -n kubeagents-system deploy/platform-agent-credential-proxy
   ```
 - For the symptoms, what they mean, and how to check the Pod's identity from outside the sandbox, see the [credential isolation troubleshooting section](docs/site/src/content/docs/reference/credential-isolation.md#troubleshooting).
+
+### 5. Slack Bot Doesn't Answer
+
+When a Slack bot connects or is online in your workspace but never replies to messages, DMs, or mentions, verify each of the following:
+
+- **Socket Mode:** Ensure **Socket Mode** is enabled in your Slack App console (**Settings → Socket Mode**). The app-level token (`SLACK_APP_TOKEN`, prefixed with `xapp-`) in your secret must carry the `connections:write` scope.
+- **Bot Token Scopes:** Verify that your Bot Token (`SLACK_BOT_TOKEN`, prefixed with `xoxb-`) has every required scope (**Features → OAuth & Permissions**).
+  - The `*:history` scopes (`im:history`, `channels:history`, `groups:history`, `mpim:history`) are the most common cause of silent failures: without them, Socket Mode connects successfully, but Slack never forwards message contents to the bot.
+  - Omitting `files:write` drops report artifact uploads quietly (logged as a warning).
+  - Omitting `reactions:write` silently prevents reaction emoji (👀, ⏸️, ✅, ❌) from appearing on user messages.
+  - Reinstall the Slack app to your workspace after updating scopes.
+- **Event Subscriptions:** In the Slack App console (**Features → Event Subscriptions**), verify **Enable Events** is turned on, and bot events are subscribed: `app_mention`, `message.im`, `message.channels`, `message.groups`, and `message.mpim`.
+- **User Allowlist:** Check `spec.integration.slack.allowedUsers` on the `PlatformAgent` CR (or `SLACK_ALLOWED_USERS` in `install.env`).
+  - When set, only members whose Slack member IDs (e.g. `U0123456789`) match an entry are answered; unlisted users are ignored without a reply.
+  - An absent or empty allowlist admits all members in the workspace.
+  - Members of external workspaces posting in Slack Connect channels shared with your workspace are never answered under any list.
+- **Single-Workspace vs Multi-Workspace (`spec.mode: next`):**
+  - Under the unsupported `spec.mode: next` toggle, the A2A gateway supports only a single workspace bot token. If your secret holds a comma-separated list of tokens (supported under `mode: today`), the gateway pod fails on boot.
+  - Because the operator arms on the CR alone, the CR's `.status` does not surface this failure; the error appears only in the gateway pod's log.
+
+**Which logs to read:**
+
+- **Default (`mode: today`):**
+  - Check Socket Mode connectivity and token validation in the credential proxy:
+    ```bash
+    kubectl logs -n kubeagents-system deploy/platform-agent-credential-proxy
+    ```
+  - Check message reception, allowlist filtering, and agent processing in the gateway pod:
+    ```bash
+    kubectl logs -n kubeagents-system deploy/platform-agent-gateway -c platform-agent
+    ```
+- **A2A Stack (`spec.mode: next`):**
+  - Check the A2A gateway pod for Socket Mode connection, token errors, and session spawning:
+    ```bash
+    kubectl logs -n kubeagents-system deploy/platform-agent-a2a-gateway
+    ```
+  - Check the `PlatformAgent` CR status for gateway enablement:
+    ```bash
+    kubectl get platformagent platform-agent -n kubeagents-system -o yaml
+    ```
+    (Look for the `A2AGateway` condition. If `googleChat` is also enabled, Slack is held on the legacy path instead of the A2A gateway).

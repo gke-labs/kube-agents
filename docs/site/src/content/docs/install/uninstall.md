@@ -9,8 +9,7 @@ There are two levels of cleanup: removing just the Platform Agent (keeping the c
 
 Use this to remove the agent while leaving the GKE cluster and operator in place.
 
-1. **Stop the heartbeat.** Delete or disable the recurring 1-minute cron in your agent harness so no new runs fire.
-2. **Delete the `PlatformAgent` CR.**
+1. **Delete the `PlatformAgent` CR.**
 
    ```bash
    kubectl delete platformagent platform-agent -n kubeagents-system --ignore-not-found=true
@@ -23,27 +22,52 @@ Use this to remove the agent while leaving the GKE cluster and operator in place
      --type=merge -p '{"metadata":{"finalizers":null}}'
    ```
 
-   **Note:** the `kubeagents.x-k8s.io/finalizer` finalizer is what deletes the agent's **cluster-scoped** RBAC — a ClusterRole and a ClusterRoleBinding that Kubernetes cannot garbage-collect via owner references. Bypassing it leaves these behind, so delete them manually (names are derived from the CR's namespace and name):
+   **Note:** the `kubeagents.x-k8s.io/finalizer` finalizer is what deletes the agent's **cluster-scoped** RBAC — a ClusterRole and a ClusterRoleBinding that Kubernetes cannot garbage-collect via owner references. Under `spec.mode: next`, the finalizer also deletes the auth callout's cluster-scoped ClusterRoleBinding (`kubeagents:a2a-callout-tokenreview:<namespace>:<name>`) and the NATS JetStream PersistentVolumeClaim (`data-<agent>-a2a-nats-0`). Bypassing the finalizer leaves these behind, so delete them manually (names are derived from the CR's namespace and name):
 
    ```bash
    kubectl delete clusterrolebinding \
-     kubeagents:minimal:kubeagents-system:platform-agent --ignore-not-found=true
+     kubeagents:minimal:kubeagents-system:platform-agent \
+     kubeagents:a2a-callout-tokenreview:kubeagents-system:platform-agent \
+     --ignore-not-found=true
    kubectl delete clusterrole \
      kubeagents:minimal:kubeagents-system:platform-agent --ignore-not-found=true
+   kubectl delete pvc data-platform-agent-a2a-nats-0 -n kubeagents-system --ignore-not-found=true
    ```
 
-3. **Delete the agent secrets.**
+2. **Delete unmanaged or integration secrets (optional).**
 
    ```bash
-   kubectl delete secret platform-agent-secrets github-app-credentials \
+   kubectl delete secret github-app-credentials a2a-slack-principal-map \
      -n kubeagents-system --ignore-not-found=true
    ```
 
-   (`github-app-credentials` only exists if you configured the GitHub integration.)
+   `github-app-credentials` only exists if you configured the GitHub integration. `a2a-slack-principal-map` is the optional user-created Slack identity mapping under `spec.mode: next`.
 
-4. **Remove the workspace** — delete the `agents/platform` directory from your harness workspace if you installed it there.
+   **Note on `platform-agent-secrets`:** The core `platform-agent-secrets` Secret is managed by the Helm release rather than owned by the CR. Deleting only the CR leaves it in place for re-installations. If you delete it manually while the Helm release remains installed, Helm will recreate it on the next upgrade. If you want to purge all credentials without a full teardown, delete it explicitly:
 
-Once the CR is gone, the operator's finalizer first removes the cluster-scoped RBAC (the ClusterRole and ClusterRoleBinding above), then Kubernetes garbage-collects the namespaced resources it owns — the agent's Deployment, Service, ServiceAccount, PersistentVolumeClaims, and ConfigMaps.
+   ```bash
+   kubectl delete secret platform-agent-secrets -n kubeagents-system --ignore-not-found=true
+   ```
+
+Once the CR is gone, the operator's finalizer first removes the cluster-scoped RBAC (and the JetStream PVC under `next`), then Kubernetes garbage-collects the namespaced resources the CR owns — the agent's Deployment, StatefulSet, Service, ServiceAccount, PersistentVolumeClaims, and ConfigMaps.
+
+### What `spec.mode: next` leaves behind
+
+Under the unsupported dev toggle `spec.mode: next`, toggling the mode back to `today` (`kubectl edit platformagent platform-agent`) tears down the stage-1 A2A stack (the gateway, verifier, and callout Deployments, along with their NetworkPolicies), but intentionally preserves two stateful items:
+
+1. **The generated NATS credentials Secret** (`<agent>-a2a-nats-creds`, e.g. `platform-agent-a2a-nats-creds`): Kept so toggling `next` back on does not re-roll bus passwords or invalidate client credentials.
+2. **The NATS JetStream PersistentVolumeClaim** (`data-<agent>-a2a-nats-0`, e.g. `data-platform-agent-a2a-nats-0`): JetStream's file store is the audit substrate; flipping a mode is not license to destroy audit evidence.
+
+In addition, any user-created Slack principal map Secret (`a2a-slack-principal-map`) is not owned by the CR or operator and is left untouched.
+
+To discard these stateful remnants after flipping to `today` (or when performing manual cleanup):
+
+```bash
+kubectl delete secret platform-agent-a2a-nats-creds a2a-slack-principal-map -n kubeagents-system --ignore-not-found=true
+kubectl delete pvc data-platform-agent-a2a-nats-0 -n kubeagents-system --ignore-not-found=true
+```
+
+When deleting the `PlatformAgent` CR itself (rather than flipping to `today`), the operator's finalizer deletes the NATS JetStream PVC and the generated credentials Secret is garbage-collected via owner reference; only the user-created `a2a-slack-principal-map` Secret needs manual deletion.
 
 ## Full teardown
 
