@@ -1705,8 +1705,9 @@ class PoolNote(unittest.TestCase):
         self.assertEqual(note["p95_s"], 18000)
 
     def test_a_breach_with_no_bad_day_quotes_the_runs_queued_right_now(self):
-        # pool_pressure.py breaches on `breached_days or live_breach`, so one
-        # run stuck past p95 breaches a week that has no bad day in it at all.
+        # pool_pressure.py breaches on `breached_days or live_breach or
+        # recent_failed`, so one run stuck past p95 breaches a week that has
+        # no bad day in it at all.
         result = pooled(verdict="BREACH", cause="CAPACITY", free=0, bad_day=None, over_threshold=3)
         note = result["pool"]
         self.assertIsNone(note["day"])

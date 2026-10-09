@@ -705,19 +705,19 @@ def started_time(document: Optional[dict]) -> Optional[datetime]:
     return datetime.fromtimestamp(stamp, tz=timezone.utc)
 
 
-def banners(text: str) -> List[Tuple[datetime, str]]:
-    """Every timestamped phase banner in a build log, in order.
+def _timestamped_banners(text: str) -> List[re.Match]:
+    """Every phase banner whose stamp parses, in order.
 
     The script prints a few untimestamped ones too, like
     `=== Target Cluster Context ===`. They do not match, which is what pinning
     the grammar to the bracketed stamp is for.
     """
-    found = []
-    for stamp, label in BANNER_PATTERN.findall(text):
-        moment = parse_rfc3339(stamp)
-        if moment is not None:
-            found.append((moment, label))
-    return found
+    return [m for m in BANNER_PATTERN.finditer(text) if parse_rfc3339(m.group(1))]
+
+
+def banners(text: str) -> List[Tuple[datetime, str]]:
+    """Every timestamped phase banner in a build log, as (moment, label)."""
+    return [(parse_rfc3339(m.group(1)), m.group(2)) for m in _timestamped_banners(text)]
 
 
 def lease_window(text: str) -> Tuple[Optional[datetime], Optional[datetime]]:
@@ -743,7 +743,7 @@ def lease_window(text: str) -> Tuple[Optional[datetime], Optional[datetime]]:
 
 def _lease_banners(text: str) -> Tuple[Optional[re.Match], Optional[re.Match]]:
     """The first timestamped banner naming Boskos, and the banner after it."""
-    found = [m for m in BANNER_PATTERN.finditer(text) if parse_rfc3339(m.group(1))]
+    found = _timestamped_banners(text)
     for index, match in enumerate(found):
         if BANNER_LEASE_KEYWORD in match.group(2).lower():
             following = found[index + 1] if index + 1 < len(found) else None
@@ -1517,7 +1517,7 @@ def summarise(
     # still reported, under `max_concurrency` and `pool.stranded`.
     leaked = leaked_leases(pool_state, queue)
     cause_label, cause_text = (
-        cause(pool_state, queue, concurrency, len(recent_failed), leaked)
+        cause(pool_state, queue, concurrency, len(recent_failed), leaked, bool(live_breach))
         if breached
         else (None, [])
     )
@@ -1531,8 +1531,9 @@ def summarise(
             "p95_minutes": p95_limit,
             "outlier_minutes": outlier_limit,
         },
-        # Evidence, not a verdict: `breached` stays on the daily rows and the
-        # live queue, so TestGrid's row does not move with this block.
+        # Its percentiles are evidence, not a verdict: `breached` stays on the
+        # daily rows, the live queue and this block's `lease_failures` count,
+        # so TestGrid's row does not move with its p50 or p95.
         "recent": recent_row(waits, window_end),
         "trend": {
             "read": trend.ok,
@@ -1880,7 +1881,7 @@ def _pool_now_lines(pool_state: PoolState, leaked: Sequence[str]) -> List[str]:
     if held:
         lines.append(f"  held by hand: {_holders_text(held)}")
     if leaked:
-        lines.append(f"  {len(leaked)} lease(s) leaked, listed above")
+        lines.append(f"  {len(leaked)} lease(s) leaked, named under leaked_leases")
     return lines
 
 
@@ -1922,6 +1923,7 @@ def cause(
     concurrency: Optional[int],
     lease_failures: int = 0,
     leaked: Sequence[str] = (),
+    live_backlog: bool = False,
 ) -> Tuple[str, List[str]]:
     """Why runs are waiting, and therefore what to do about it.
 
@@ -1942,7 +1944,10 @@ def cause(
     asked Boskos and got nothing for the whole acquire, which is the pool full
     at that moment whatever it holds now. That is CAPACITY, and the text says
     what the projects are doing, because the remedy differs when two of them
-    are a repair or a leak (#2747).
+    are a repair or a leak (#2747). It is evidence about that moment only, so
+    a live reading that contradicts it wins: `live_backlog` (a run queued past
+    the limit right now) over projects sitting free is the control plane or
+    the cap, diagnosed below with the refusal still stated first.
     """
     refused = [
         f"{lease_failures} run(s) in the last {RECENT_WINDOW_HOURS}h asked Boskos for a"
@@ -1957,7 +1962,7 @@ def cause(
             "the tie: late lease, real contention; prompt lease, control plane.",
         ]
 
-    if lease_failures:
+    if lease_failures and not (live_backlog and pool_state.free > 0):
         # Not the cap caveat: a refused run never waited anywhere, and the
         # lines above already name what is out of rotation.
         return CAUSE_CAPACITY, ["CAPACITY. " + refused[0]] + refused[1:] + [
@@ -1966,6 +1971,14 @@ def cause(
             "docs/ci-pool-projects.md",
         ] + _pool_now_lines(pool_state, leaked)
 
+    label, lines = _wait_cause(pool_state, queue, concurrency)
+    return label, (refused + [""] + lines) if lease_failures else lines
+
+
+def _wait_cause(
+    pool_state: PoolState, queue: Optional[LiveQueue], concurrency: Optional[int]
+) -> Tuple[str, List[str]]:
+    """The ladder for a wait: full pool, then the cap, then the control plane."""
     if pool_state.free == 0:
         return CAUSE_CAPACITY, [
             "CAPACITY. Every project was leased while runs were waiting, so the",

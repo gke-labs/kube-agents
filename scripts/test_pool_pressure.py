@@ -108,11 +108,12 @@ class Percentile(unittest.TestCase):
 
 
 class Banners(unittest.TestCase):
-    """The one thing this check reads out of another repository.
+    """The two things this check reads out of other repositories.
 
     kube-agents-presubmits.yaml prints these lines and nobody editing it knows
     they are parsed here, so the grammar is what is pinned and the wording is
-    not.
+    not. The refusal is boskosctl's own last line, and that one is pinned by
+    wording: it is the only sign the acquire gave up.
     """
 
     LOG = "\n".join((
@@ -376,7 +377,6 @@ class PoolStateFields(unittest.TestCase):
         self.assertEqual({"fleet-reconcile": 4}, pool.held_by_job())
         self.assertEqual({"hangdng-rebuild": 1}, pool.held_by_hand())
         self.assertEqual([], pp.leaked_leases(pool, pp.LiveQueue([], set(), set())))
-        self.assertEqual(("fleet-reconcile", "ci-kube-agents-compute-sweep"), pp.BOSKOS_JOB_OWNERS)
 
     def test_a_third_state_is_counted_as_neither_leased_nor_available(self):
         """`cleaning` and `dirty` are projects nothing can lease right now. Read
@@ -495,6 +495,16 @@ class Cause(unittest.TestCase):
         self.assertEqual(pp.CAUSE_CAPACITY, label)
         self.assertIn("30 leased, 5 free, 35 total", "\n".join(text))
 
+    def test_a_live_backlog_over_free_projects_outranks_a_stale_refusal(self):
+        """A refusal is evidence about the moment of the ask. A run queued past
+        the limit while projects sit free is the #2666 shape right now, and
+        that diagnosis must not wait three hours for the refusal to age out."""
+        label, text = pp.cause(
+            self._pool(18, 12), pp.LiveQueue([], set()), None, lease_failures=1, live_backlog=True
+        )
+        self.assertEqual(pp.CAUSE_CONTROL_PLANE, label)
+        self.assertIn("1 run(s) in the last 3h", text[0], "the refusal still leads the text")
+
     def test_lease_failures_with_an_unreadable_pool_stay_unknown(self):
         label, text = pp.cause(None, None, None, lease_failures=1)
         self.assertEqual(pp.CAUSE_UNKNOWN, label)
@@ -603,8 +613,9 @@ class DailyRows(unittest.TestCase):
 
 class RecentRow(unittest.TestCase):
     """The stretch the chat alert quotes, so its numbers and its remedy share
-    a clock. Evidence only: `breached` stays on the daily rows and the live
-    queue, so TestGrid's row does not move with it."""
+    a clock. Its percentiles are evidence only -- `breached` stays on the daily
+    rows, the live queue and the refusal count, so TestGrid's row does not
+    move with them; its `lease_failures` is that third trigger."""
 
     END = pp.parse_rfc3339("2026-08-27T12:00:00Z")
 
@@ -631,9 +642,14 @@ class RecentRow(unittest.TestCase):
                            lease_failed=True)
         inside = failed(8, created_back=200, asked_back=100)
         outside = failed(9, created_back=400, asked_back=300)
-        row = pp.recent_row(self._waits([30, 60, 90, 120, 150]) + [inside, outside], self.END)
-        self.assertEqual(row["runs"], 5)
-        self.assertEqual(row["lease_failures"], 1)
+        # Created inside the window too: the one that reaches the
+        # `not w.lease_failed` filter rather than the creation filter.
+        fresh = failed(10, created_back=100, asked_back=50)
+        row = pp.recent_row(
+            self._waits([30, 60, 90, 120, 150]) + [inside, outside, fresh], self.END
+        )
+        self.assertEqual(row["runs"], 5, "a refused run is not a sample, whenever it was created")
+        self.assertEqual(row["lease_failures"], 2)
         self.assertEqual(row["p50_minutes"], 20.0)
 
     def test_a_stretch_under_the_sample_floor_withholds_its_percentiles(self):
@@ -654,9 +670,9 @@ class RecentRow(unittest.TestCase):
         self.assertIsNone(row["p50_minutes"])
 
     def test_a_terrible_recent_stretch_does_not_breach_on_its_own(self):
-        # Evidence, not a verdict. `breached` is breached_days or the live
-        # queue; wiring this block into it would move TestGrid's row and the
-        # JUnit exit code with a three-hour reading. Six 200-minute waits
+        # Evidence, not a verdict. `breached` is breached_days, the live queue
+        # or a refusal; wiring these percentiles into it would move TestGrid's
+        # row and the JUnit exit code with a three-hour reading. Six 200-minute waits
         # straddling midnight: enough to judge the stretch, three a side and so
         # too few to judge either day.
         end = pp.parse_rfc3339("2026-08-27T01:00:00Z")
