@@ -257,7 +257,7 @@ WATCHED = (
         f"{RUNBOOK_ROOT}docs/ci-pool-projects.md#62-the-scheduled-reconcile",
     ),
     Periodic(
-        RECONCILE_POSTSUBMIT_JOB, "seeded-fleet reconcile (on merge)", None, RECONCILE_ARTIFACT,
+        RECONCILE_POSTSUBMIT_JOB, "seeded-fleet reconcile (postsubmit)", None, RECONCILE_ARTIFACT,
         "Eval seeded fleet", "planted defects are not being re-applied", "planted defects are being re-applied again",
         "runs on every merge to main that changes the stack under bench/tf/fleet and applies it to every pool project", RECONCILE_EFFECT,
         f"{RUNBOOK_ROOT}docs/ci-pool-projects.md#62-the-scheduled-reconcile",
@@ -265,7 +265,7 @@ WATCHED = (
 )
 WATCHED_BY_JOB = {p.job: p for p in WATCHED}
 # The reconcile jobs, for the digest's run line; the words name the trigger.
-RECONCILE_RUN_WORDS = {RECONCILE_DAILY_JOB: "daily run", RECONCILE_POSTSUBMIT_JOB: "on-merge run"}
+RECONCILE_RUN_WORDS = {RECONCILE_DAILY_JOB: "daily run", RECONCILE_POSTSUBMIT_JOB: "postsubmit run"}
 
 
 def history_url(job: str) -> str:

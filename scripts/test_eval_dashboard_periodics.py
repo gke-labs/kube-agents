@@ -392,7 +392,7 @@ class AssessTest(unittest.TestCase):
         # Trees of different kinds are not compared. The report of a build
         # written before the input hash carries a 40-hex git tree id, every
         # later one the 64-hex hash; no later daily could ever match the
-        # old one, so the reach check decides alone (the 2026-10-08 on-merge
+        # old one, so the reach check decides alone (the 2026-10-08 postsubmit
         # failure, otherwise orange until the next stack merge).
         git_id, input_hash = "d" * 40, "7" * 64
         old_kind = self.reading(POST, NOW - timedelta(days=2), passed=False, artifact={"fleet_tree": git_id, "summary": {"failed": 1}, "outcomes": {"kube-agents-evals-9": {"outcome": "failed", "detail": "forbidden"}}})

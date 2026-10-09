@@ -425,7 +425,7 @@ jobs:
           fi
 
       # The watched Prow periodics (scripts/eval_dashboard/periodics.py:
-      # the pull sweep, the daily seeded-fleet reconcile and its on-merge run): their latest
+      # the pull sweep, the daily seeded-fleet reconcile and its postsubmit run): their latest
       # finished build each, for the note health.py carries and the poster
       # sends once when one fails or stops running. Best-effort like the
       # read above: a job that has never run writes nothing, a denied read
