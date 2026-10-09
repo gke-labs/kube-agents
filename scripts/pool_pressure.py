@@ -223,11 +223,16 @@ BOSKOS_NO_OWNER = ""
 # out. An owner that does not end in one was taken by a person, for a repair.
 BUILD_ID_SUFFIX = re.compile(r"-(\d{19})$")
 # Jobs that lease under a fixed owner rather than `<job name>-<build ID>`: the
-# defaults in hack/fleet_reconcile.py and hack/ci_sweep_compute_plants.py,
-# which the fleet reconcile's Prow jobs do not override. Deck cannot vouch for a
-# lease with no build ID in it, so these are reported as a job's, apart from
-# the hand holds, and are never compared against it.
-BOSKOS_JOB_OWNERS = ("fleet-reconcile", "ci-kube-agents-compute-sweep")
+# defaults of the hack/ scripts that lease through boskos_pool.py, which their
+# Prow jobs do not override (test_integration_contracts.py pins the list to
+# those scripts). Deck cannot vouch for a lease with no build ID in it, so
+# these are reported as a job's, apart from the hand holds, and are never
+# compared against it.
+BOSKOS_JOB_OWNERS = (
+    "fleet-reconcile",
+    "ci-kube-agents-compute-sweep",
+    "ci-kube-agents-pull-sweep",
+)
 
 # The policy in docs/ci-pool-projects.md. A breach
 # of either is the signal to onboard the next project -- if, and only if, the
@@ -375,6 +380,8 @@ JUNIT_ROW_NAMES = (
 # fewer days that would sit on the graph beside whole-window points and read as
 # one of them. The trend source carries no error string in either case.
 JUNIT_NO_RUNS_MESSAGE = "no runs were created in the window"
+# A window whose every run was refused a project has runs and no percentile.
+JUNIT_ALL_REFUSED_MESSAGE = "every run in the window was refused a project"
 JUNIT_TRUNCATED_MESSAGE = (
     "the sweep ran out of time and covers only {window_start} onward, "
     "not the whole window"
@@ -2110,6 +2117,8 @@ def junit_report(summary: dict) -> str:
     elif trend["truncated"]:
         setup_measured = False
         setup_skip = JUNIT_TRUNCATED_MESSAGE.format(window_start=trend["window_start"])
+    elif trend["runs"] == 0 and trend["lease_failures"]:
+        setup_measured, setup_skip = False, JUNIT_ALL_REFUSED_MESSAGE
     elif trend["runs"] == 0:
         setup_measured, setup_skip = False, JUNIT_NO_RUNS_MESSAGE
     else:
@@ -2133,15 +2142,22 @@ def junit_report(summary: dict) -> str:
         add(JUNIT_ROW_FREE, JUNIT_TAG_SKIPPED, _junit_skip(pool["error"]))
 
     # The recent window is the newest stretch, which a cut-short sweep still
-    # covers, so this row needs only the trend to have been read.
-    if trend["read"]:
+    # covers unless the cut fell inside it: the sweep walks whole days and
+    # drops the unfinished ones, so between 00:00 and 03:00 UTC a truncated
+    # sweep can start after the window does, and a count over the remainder
+    # would graph as a measured zero. Both stamps are TIMESTAMP_FORMAT, so the
+    # string compare is the chronological one.
+    recent = summary["recent"]
+    if not trend["read"]:
+        add(JUNIT_ROW_LEASE_FAILURES, JUNIT_TAG_SKIPPED, _junit_skip(trend["error"]))
+    elif trend["truncated"] and trend["window_start"] > recent["window_start"]:
         add(
             JUNIT_ROW_LEASE_FAILURES,
-            "properties",
-            _junit_value(summary["recent"]["lease_failures"]),
+            JUNIT_TAG_SKIPPED,
+            _junit_skip(JUNIT_TRUNCATED_MESSAGE.format(window_start=trend["window_start"])),
         )
     else:
-        add(JUNIT_ROW_LEASE_FAILURES, JUNIT_TAG_SKIPPED, _junit_skip(trend["error"]))
+        add(JUNIT_ROW_LEASE_FAILURES, "properties", _junit_value(recent["lease_failures"]))
     held = sum((summary["held_by_hand"] or {}).values())
     for name, value in (
         (JUNIT_ROW_HELD_BY_HAND, held),

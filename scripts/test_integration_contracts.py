@@ -549,24 +549,38 @@ class PoolPressureJobOwnersContractTest(unittest.TestCase):
     def _script(name):
         import importlib.util
 
-        spec = importlib.util.spec_from_file_location(
-            f"job_owner_{name}", REPO_SCRIPTS.parent / "hack" / f"{name}.py"
-        )
+        hack = REPO_SCRIPTS.parent / "hack"
+        spec = importlib.util.spec_from_file_location(f"job_owner_{name}", hack / f"{name}.py")
         module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
+        # The scripts import their hack/ siblings by bare name.
+        sys.path.insert(0, str(hack))
+        try:
+            spec.loader.exec_module(module)
+        finally:
+            sys.path.remove(str(hack))
         return module
 
     def test_the_fixed_job_owners_are_the_scripts_defaults(self):
+        # Discovered, not enumerated: every hack/ script that leases through
+        # boskos_pool and names a default owner is in the tuple, so the next
+        # such script goes red here rather than into "held by hand".
         sys.path.insert(0, str(REPO_SCRIPTS))
         import pool_pressure
 
+        owners = set()
+        for path in sorted((REPO_SCRIPTS.parent / "hack").glob("*.py")):
+            if "import boskos_pool" not in path.read_text(encoding="utf-8"):
+                continue
+            script = self._script(path.stem)
+            for name in ("DEFAULT_OWNER", "DEFAULT_BOSKOS_OWNER"):
+                if hasattr(script, name):
+                    owners.add(getattr(script, name))
         self.assertEqual(
-            (
-                self._script("fleet_reconcile").DEFAULT_OWNER,
-                self._script("ci_sweep_compute_plants").DEFAULT_BOSKOS_OWNER,
-            ),
-            pool_pressure.BOSKOS_JOB_OWNERS,
+            {"fleet-reconcile", "ci-kube-agents-compute-sweep", "ci-kube-agents-pull-sweep"},
+            owners,
+            "the scripts this test expects to find; a new one is added to both sets",
         )
+        self.assertEqual(owners, set(pool_pressure.BOSKOS_JOB_OWNERS))
 
 
 class PoolPressureArtifactContractTest(unittest.TestCase):

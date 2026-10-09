@@ -1391,14 +1391,19 @@ def pool_digest_line(pool: dict) -> str:
     # waiting would be wrong on most mornings of most episodes.
     cleared = "" if live is not False else " No backlog right now."
     span = pool_span(pool)
-    if not span and pool.get("lease_failures"):
-        return f"{headline} — {pool_refusals(pool)}.{cleared}"
     if not span:
+        # Both counts when both are set: the queue is the live fact, the
+        # refusal the reason there may be no queue to see.
         waiting = pool.get("over_threshold") or 0
-        return (
-            f"{headline} — {waiting} {plural(waiting, 'run')} waiting"
-            f" past the {minutes_text(pool.get('threshold_p95_s'))} min p95 limit.{cleared}"
-        )
+        parts = []
+        if waiting or not pool.get("lease_failures"):
+            parts.append(
+                f"{waiting} {plural(waiting, 'run')} waiting"
+                f" past the {minutes_text(pool.get('threshold_p95_s'))} min p95 limit"
+            )
+        if pool.get("lease_failures"):
+            parts.append(pool_refusals(pool))
+        return f"{headline} — {'; '.join(parts)}.{cleared}"
     # Both figures, as pool_numbers does: the stretch breaches on p50 or p95, so
     # the median on its own can be a passing number standing in as the reason.
     return (

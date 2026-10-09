@@ -1441,6 +1441,40 @@ class JunitOutput(unittest.TestCase):
         self.assertEqual("2", self._value(rows[pp.JUNIT_ROW_OUT_OF_ROTATION]))
         self.assertIn("2 run(s)", rows[pp.JUNIT_ROW_VERDICT].find("failure").text)
 
+    def test_a_window_where_every_run_was_refused_says_so_on_the_setup_rows(self):
+        """Runs were created; none leased. "No runs were created" beside a
+        lease-failures row that may read 0 (the refusals older than three
+        hours) would make a refused morning look like a quiet one."""
+        with tempfile.TemporaryDirectory() as tmp:
+            for sub in ("prowjobs", "started", "logs"):
+                os.mkdir(os.path.join(tmp, sub))
+                for name in os.listdir(os.path.join(SATURATED_DIR, sub)):
+                    if name.startswith("lease-failed"):
+                        os.symlink(os.path.join(SATURATED_DIR, sub, name), os.path.join(tmp, sub, name))
+            _, root = self._junit(from_dir=tmp, as_of=SATURATED_AS_OF + timedelta(hours=4),
+                                  window_days=1)
+        rows = self._rows(root)
+        for name in (pp.JUNIT_ROW_P50, pp.JUNIT_ROW_P95):
+            self.assertEqual("every run in the window was refused a project",
+                             rows[name].find("skipped").get("message"), name)
+        self.assertEqual("0", self._value(rows[pp.JUNIT_ROW_LEASE_FAILURES]),
+                         "the refusals are older than the recent window")
+
+    def test_the_lease_failures_row_is_skipped_when_the_cut_fell_inside_its_window(self):
+        """Between 00:00 and 03:00 UTC a truncated sweep can start after the
+        recent window does; a count over the remainder would graph as zero."""
+        payload = self._payload(from_dir=SATURATED_DIR, as_of=SATURATED_AS_OF, window_days=1)
+        payload["trend"]["truncated"] = True
+        payload["trend"]["window_start"] = "2026-10-08T17:00:00Z"  # after 15:30Z
+        rows = self._rows(ET.fromstring(pp.junit_report(payload)))
+        skipped = rows[pp.JUNIT_ROW_LEASE_FAILURES].find("skipped")
+        self.assertIsNotNone(skipped)
+        self.assertIn("ran out of time", skipped.get("message"))
+        # A cut before the window leaves the count whole.
+        payload["trend"]["window_start"] = "2026-10-08T00:00:00Z"
+        rows = self._rows(ET.fromstring(pp.junit_report(payload)))
+        self.assertEqual("2", self._value(rows[pp.JUNIT_ROW_LEASE_FAILURES]))
+
     def test_the_two_pool_rows_are_skipped_when_boskos_was_not_read(self):
         with tempfile.TemporaryDirectory() as tmp:
             for name in ("prowjobs", "started", "logs"):

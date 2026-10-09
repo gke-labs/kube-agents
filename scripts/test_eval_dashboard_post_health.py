@@ -1052,6 +1052,13 @@ class PoolNote(RunHarness):
             post_health.pool_digest_line(note),
             "⏳ Queue was backed up — 2 runs refused a project in the last 3h. No backlog right now.",
         )
+        # A live queue beside the refusals is the fact a reader can act on
+        # this morning, so the refusal joins it rather than displacing it.
+        self.assertEqual(
+            post_health.pool_digest_line(note | {"over_threshold": 3, "waiting_now": True}),
+            "⏳ Queue backed up — 3 runs waiting past the 45 min p95 limit;"
+            " 2 runs refused a project in the last 3h.",
+        )
 
     def test_a_refusal_breach_over_a_drained_pool_does_not_call_it_full(self):
         # The cause stays CAPACITY for three hours after a refusal, and the
