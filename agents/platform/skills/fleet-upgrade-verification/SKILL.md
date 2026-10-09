@@ -1,6 +1,6 @@
 ---
 name: fleet-upgrade-verification
-description: Reports every GKE cluster's control-plane and node-pool versions against a target version or each cluster's release-channel default, naming the members that lag and by how many minors; run again during a rollout, it shows which members started, completed or stalled since the previous run; with --readiness, it also grades each member on what would stop the upgrade, naming drain-blocking PodDisruptionBudgets, fail-closed admission webhooks in the upgrade's path or able to refuse the control plane's bootstrap Role and RoleBinding writes with an unreachable backend, maintenance exclusions and windows, and node-pool version skew. Scans the linked GitOps repositories' manifests for apiVersions the target removes, with each hit's replacement. Read-only against GCP, the clusters and Git, from gcloud container, kubectl get and repository reads, keeping only its own record of each run and per-member kubeconfig files; the executed counterpart to gke-upgrades' advice.
+description: Reports every GKE cluster's control-plane and node-pool versions against a target version or each cluster's release-channel default, naming the members that lag and by how many minors; run again during a rollout, it shows which members started, completed or stalled since the previous run; with --readiness, it also grades each member on what would stop the upgrade, naming drain-blocking PodDisruptionBudgets, fail-closed admission webhooks in the upgrade's path or able to refuse the control plane's bootstrap RBAC writes (ClusterRoles and ClusterRoleBindings; Roles and RoleBindings in kube-system and kube-public) with an unreachable backend, maintenance exclusions and windows, and node-pool version skew. Scans the linked GitOps repositories' manifests for apiVersions the target removes, with each hit's replacement. Read-only against GCP, the clusters and Git, from gcloud container, kubectl get and repository reads, keeping only its own record of each run and per-member kubeconfig files; the executed counterpart to gke-upgrades' advice.
 ---
 
 # Fleet upgrade verification
@@ -14,7 +14,7 @@ version. Run the version report again during a rollout and it also says, per mem
 since the previous run and which members have stopped moving (see "Track a rollout across runs").
 With `--readiness` it also says, per member, what would stop the upgrade: a PodDisruptionBudget
 that blocks every node drain, a fail-closed admission webhook with an unreachable backend in the upgrade's path or able to
-refuse the control plane's bootstrap Role and RoleBinding writes, a maintenance exclusion or window, or node pools too far below the target
+refuse the control plane's bootstrap RBAC writes (ClusterRoles and ClusterRoleBindings; Roles and RoleBindings in kube-system and kube-public), a maintenance exclusion or window, or node pools too far below the target
 (see "Check upgrade readiness"). For upgrade plans, runbooks and checklists, use the
 `gke-upgrades` skill; it links back here when the question is one these two scripts answer.
 

@@ -1137,7 +1137,7 @@ class ReadinessTest(unittest.TestCase):
         self.assertEqual([e["cluster"] for e in data["errors"]], ["seeded-a"])
         self.assertIn("- read failed for p1 (us-central1-a) cluster seeded-a: kubectl get pdb,deploy,statefulset -A -o json failed (1)", text)
         self.assertEqual([l for l in text.splitlines() if l.startswith("- read failed") and "skipped" in l], [])
-        self.assertIn("PDB read failed; PDBs not graded; webhook read skipped: the PDB read got no answer from the API server (a connection failure, or the 60 s deadline); webhooks not graded", by_name["seeded-a"]["note"])
+        self.assertIn("PDB read failed; PDBs not graded; webhook read skipped: the PDB read failed before the API server answered it (a connection, credential-plugin or certificate failure, or the 60 s deadline); webhooks not graded", by_name["seeded-a"]["note"])
         self.assertNotIn("webhook read failed", by_name["seeded-a"]["note"])
         self.assertTrue(by_name["seeded-a"]["webhook_read_skipped"])
         self.assertIn("| read failed | read skipped |", text)

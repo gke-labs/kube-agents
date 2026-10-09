@@ -212,22 +212,25 @@ VERSION_PAIR_SEPARATOR = " / "
 # workspace, which is why the default is not /tmp. `--kubeconfig-dir` overrides it.
 KUBECTL = "kubectl"
 KUBECTL_TIMEOUT_SECONDS = 60
-# Error text from the first `kubectl get` that says no answer came back from the API server
-# (a connection failure, or run_cmd's own deadline, which a slow server also trips), in which
-# case the second read against the same kubeconfig would only spend a second timeout to
-# fail the same way.
-UNREACHABLE_MARKERS = ("timed out after", "Unable to connect to the server", "i/o timeout", "connection refused", "no such host")
-WEBHOOK_READ_SKIPPED = f"skipped: the PDB read got no answer from the API server (a connection failure, or the {KUBECTL_TIMEOUT_SECONDS} s deadline)"
+# Error text from the first `kubectl get` after which the second read, against the same
+# kubeconfig, would fail the same way and only spend a second timeout: kubectl's transport
+# prefix, which a connection failure, a credential-plugin failure (`getting credentials:`) and a
+# certificate failure (`tls:`) all carry; a dial or resolver failure; or run_cmd's own deadline,
+# which a slow server also trips. The note names that class, not an unreachable server, and
+# kubectl's message stays in the error row so the operator reads which it was.
+FIRST_READ_SKIP_MARKERS = ("timed out after", "Unable to connect to the server", "i/o timeout", "connection refused", "no such host")
+WEBHOOK_READ_SKIPPED = f"skipped: the PDB read failed before the API server answered it (a connection, credential-plugin or certificate failure, or the {KUBECTL_TIMEOUT_SECONDS} s deadline)"
 # The member's note names the one cause its reads failed for, so an operator goes to the
 # step that failed: the directory, the credentials, the first read, the second read, or the
-# second read skipped because the first got no answer (a connection failure, or run_cmd's
-# deadline, which the note names rather than calling the server unreachable). A skipped
-# read is not a failed one: it gets no error row of its own under the table.
+# second read skipped because the first failed before the server answered it (the note names
+# the classes that produce that and the error row carries kubectl's message, rather than the
+# note calling the server unreachable). A skipped read is not a failed one: it gets no error
+# row of its own under the table.
 NOTE_DIRECTORY_FAILED = "kubeconfig directory could not be created; PDBs and webhooks not graded"
 NOTE_CREDENTIALS_FAILED = "credentials for the cluster could not be fetched; PDBs and webhooks not graded"
 NOTE_PDB_READ_FAILED = "PDB read failed; PDBs not graded"
 NOTE_WEBHOOK_READ_FAILED = "webhook read failed; webhooks not graded"
-NOTE_WEBHOOK_READ_SKIPPED = f"webhook read skipped: the PDB read got no answer from the API server (a connection failure, or the {KUBECTL_TIMEOUT_SECONDS} s deadline); webhooks not graded"
+NOTE_WEBHOOK_READ_SKIPPED = f"webhook read skipped: the PDB read failed before the API server answered it (a connection, credential-plugin or certificate failure, or the {KUBECTL_TIMEOUT_SECONDS} s deadline); webhooks not graded"
 # Two reads, so a failure listing the webhook side (a large EndpointSlice list timing out, a
 # custom role without webhook-configuration reads) costs the webhook rule only, never the PDBs.
 KUBECTL_RESOURCES = "pdb,deploy,statefulset"
@@ -604,9 +607,10 @@ def read_cluster_objects(cluster: dict, project: str, kubeconfig_dir: str) -> di
     configurations, Services and EndpointSlices. Returns `items`/`error` for the first,
     `webhook_items`/`webhook_error` for the second, and `kubeconfig`. A failed
     `get-credentials` fails both, and so does a kubeconfig directory that cannot be created
-    (`directory_error`); a first read that could not reach the API server skips the second
-    rather than spend a second timeout on it (`webhook_skipped`, with `webhook_error` saying
-    so); otherwise each read fails alone, grading only its own rule `unknown`, and any
+    (`directory_error`); a first read that failed before the server answered it (a connection,
+    credential-plugin or certificate failure, or the deadline) skips the second rather than
+    spend a second timeout on it (`webhook_skipped`, with `webhook_error` saying so); otherwise
+    each read fails alone, grading only its own rule `unknown`, and any
     failure makes the run exit 1.
     """
     path = kubeconfig_path(kubeconfig_dir, project, cluster.get("name", ""), cluster.get("location", ""))
@@ -623,7 +627,7 @@ def read_cluster_objects(cluster: dict, project: str, kubeconfig_dir: str) -> di
         result["error"] = result["webhook_error"] = result["credentials_error"] = f"{' '.join(cmd)} failed ({rc}): {stderr.strip()}"
         return result
     result["items"], result["error"] = _kubectl_items(KUBECTL_RESOURCES, env)
-    if result["error"] and any(marker in result["error"] for marker in UNREACHABLE_MARKERS):
+    if result["error"] and any(marker in result["error"] for marker in FIRST_READ_SKIP_MARKERS):
         result["webhook_skipped"] = True
         result["webhook_error"] = f"{WEBHOOK_READ_SKIPPED} ({result['error']})"
         return result
@@ -860,7 +864,7 @@ def render_readiness(report: dict) -> str:
     lines.append(
         f"Readiness at {report['readiness']['evaluated_at']}: "
         + ", ".join(f"{summary[s]} {s}" for s in readiness.READINESS_ORDER)
-        + "; a maintenance exclusion holds back GKE's automatic upgrades only, a drain-blocking PDB, a fail-closed webhook with an unreachable backend in the upgrade's path or able to refuse the control plane's bootstrap Role and RoleBinding writes, or skew any upgrade."
+        + "; a maintenance exclusion holds back GKE's automatic upgrades only, a drain-blocking PDB, a fail-closed webhook with an unreachable backend in the upgrade's path or able to refuse the control plane's bootstrap RBAC writes (ClusterRoles and ClusterRoleBindings; Roles and RoleBindings in kube-system and kube-public), or skew any upgrade."
     )
     return "\n".join(lines)
 
@@ -1106,7 +1110,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--output", help="Path to write the report as JSON.")
     parser.add_argument("--state-dir", default=DEFAULT_STATE_DIR, help=f"Directory holding one record per target from the previous run (default: {DEFAULT_STATE_DIR}).")
     parser.add_argument("--rollout-in-progress", action="store_true", help="Assert a rollout is under way, so an unchanged, behind member is flagged stalled even when no other member moved.")
-    parser.add_argument("--readiness", action="store_true", help="Also grade each member's readiness for the upgrade: drain-blocking PDBs and fail-closed webhooks with an unreachable backend in the upgrade's path or able to refuse the control plane's bootstrap Role and RoleBinding writes (two kubectl reads per member), maintenance exclusions and window, node-pool skew.")
+    parser.add_argument("--readiness", action="store_true", help="Also grade each member's readiness for the upgrade: drain-blocking PDBs and fail-closed webhooks with an unreachable backend in the upgrade's path or able to refuse the control plane's bootstrap RBAC writes (ClusterRoles and ClusterRoleBindings; Roles and RoleBindings in kube-system and kube-public) (two kubectl reads per member), maintenance exclusions and window, node-pool skew.")
     parser.add_argument("--at", help="RFC 3339 instant to evaluate maintenance exclusions and the window at (default: now). Only with --readiness.")
     parser.add_argument("--kubeconfig-dir", help="Directory for the per-member kubeconfig files --readiness writes (default: $HERMES_HOME/.kubeconfigs).")
     args = parser.parse_args(argv)
