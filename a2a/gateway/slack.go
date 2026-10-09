@@ -572,7 +572,14 @@ func (s *SlackAdapter) Post(conversation, text string) (string, error) {
 	if !ok {
 		return "", fmt.Errorf("malformed conversation id %q", conversation)
 	}
-	opts := []slack.MsgOption{slack.MsgOptionText(toMrkdwn(text), false)}
+	// No unfurls: an answer cites console and documentation links, and each
+	// unfurled into a preview card (a console link previews as the Google
+	// sign-in page), three or four under every answer.
+	opts := []slack.MsgOption{
+		slack.MsgOptionText(toMrkdwn(text), false),
+		slack.MsgOptionDisableLinkUnfurl(),
+		slack.MsgOptionDisableMediaUnfurl(),
+	}
 	if threadTS != "" {
 		opts = append(opts, slack.MsgOptionTS(threadTS))
 	}

@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"slices"
@@ -26,12 +27,15 @@ import (
 // on what was posted/updated.
 type fakeSlackAPI struct {
 	// team is the team id auth.test answers with.
-	team     string
-	posted   []struct{ channel, thread, text string }
-	updated  []struct{ channel, ts, text string }
-	members  []string
-	cursor   string
-	openedIM string
+	team   string
+	posted []struct{ channel, thread, text string }
+	// postValues is every chat.postMessage's full form, for the fields
+	// posted does not name.
+	postValues []url.Values
+	updated    []struct{ channel, ts, text string }
+	members    []string
+	cursor     string
+	openedIM   string
 }
 
 func (f *fakeSlackAPI) AuthTestContext(context.Context) (*slack.AuthTestResponse, error) {
@@ -46,6 +50,7 @@ func (f *fakeSlackAPI) PostMessage(channelID string, options ...slack.MsgOption)
 	f.posted = append(f.posted, struct{ channel, thread, text string }{
 		values.Get("channel"), values.Get("thread_ts"), values.Get("text"),
 	})
+	f.postValues = append(f.postValues, values)
 	return channelID, "999.001", nil
 }
 
@@ -845,6 +850,11 @@ func TestSlackPostThreadsAndTranslates(t *testing.T) {
 	}
 	if api.posted[1].thread != "" {
 		t.Error("DM posts must not set thread_ts")
+	}
+	for i, v := range api.postValues {
+		if v.Get("unfurl_links") != "false" || v.Get("unfurl_media") != "false" {
+			t.Errorf("post %d: unfurl_links=%q unfurl_media=%q, want both false", i, v.Get("unfurl_links"), v.Get("unfurl_media"))
+		}
 	}
 	if _, err := a.Post("discord:1/2", "x"); err == nil {
 		t.Error("malformed conversation must error")

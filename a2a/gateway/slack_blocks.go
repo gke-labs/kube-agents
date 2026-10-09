@@ -25,12 +25,13 @@ var (
 	// whitespace, the text, and an optional closing run of # set off by
 	// whitespace (so "## Using C#" keeps its #).
 	slackHeadingRE = regexp.MustCompile(`^ {0,3}#{1,6}[ \t]+(.*?)(?:[ \t]+#+)?[ \t]*$`)
-	// slackHeadingWrapRE is a heading whose whole text is already one bold
-	// pair, which it sheds before it is wrapped as one bold line.
-	slackHeadingWrapRE = regexp.MustCompile(`^(?:\*\*(.+)\*\*|__(.+)__)$`)
+	// slackHeadingWrapRE is a heading whose whole text is one underscore bold
+	// pair, which it sheds before it is wrapped as one bold line; star pairs
+	// anywhere in it are shed by shedBoldPairs.
+	slackHeadingWrapRE = regexp.MustCompile(`^__(.+)__$`)
 	// slackRuleRE is a thematic break: three or more of one of - * _, with
-	// optional spaces between them.
-	slackRuleRE = regexp.MustCompile(`^ {0,3}([-*_])(?:[ \t]*([-*_]))+[ \t]*$`)
+	// optional spaces between them, so "--" or a stray "**" line stays.
+	slackRuleRE = regexp.MustCompile(`^ {0,3}(?:(?:-[ \t]*){3,}|(?:\*[ \t]*){3,}|(?:_[ \t]*){3,})$`)
 	// slackBulletRE is an unordered list item: indentation, one of - * +,
 	// whitespace, the item.
 	slackBulletRE = regexp.MustCompile(`^([ \t]*)[-*+][ \t]+(.*)$`)
@@ -57,8 +58,6 @@ const (
 	// mdCodeTick is the backtick that delimits a code span, which a table
 	// cell sheds (its content stays) since the whole table is a code block.
 	mdCodeTick = "`"
-	// mdIndent is the whitespace a fence line or heading may be indented by.
-	mdIndent = " \t"
 	// slackGluedHeadingSplit puts a glued heading on its own paragraph.
 	slackGluedHeadingSplit = "$1\n\n$2$3"
 	// slackLineCR is the carriage return a CRLF answer ends each line with,
@@ -81,6 +80,9 @@ const (
 	// (slackLinkRE's groups): inside the code block a table becomes, Slack
 	// renders no link, so the destination is shown rather than lost.
 	slackCellLinkForm = "$1 ($2)"
+	// slackBoldPairText keeps a bold pair's content (mdBoldRE's second group)
+	// and drops its marks.
+	slackBoldPairText = "${2}"
 )
 
 // rewriteSlackBlocks applies the line-level rewrites above to text, leaving
@@ -104,13 +106,13 @@ func rewriteSlackBlocks(text string) string {
 			i = end - 1
 			continue
 		}
-		if slackRuleRE.MatchString(line) && sameRuleMarks(line) {
+		if slackRuleRE.MatchString(line) {
 			continue
 		}
 		if m := slackHeadingRE.FindStringSubmatch(line); m != nil {
-			heading := strings.TrimSpace(m[1])
+			heading := strings.TrimSpace(shedBoldPairs(m[1]))
 			if w := slackHeadingWrapRE.FindStringSubmatch(heading); w != nil {
-				heading = strings.TrimSpace(w[1] + w[2])
+				heading = strings.TrimSpace(w[1])
 			}
 			if heading != "" {
 				out = append(out, mdBoldMark+heading+mdBoldMark)
@@ -184,18 +186,6 @@ func splitGluedHeadings(lines []string) []string {
 		out = append(out, strings.Split(slackGluedHeadingRE.ReplaceAllString(line, slackGluedHeadingSplit), "\n")...)
 	}
 	return out
-}
-
-// sameRuleMarks reports whether every mark in a thematic break is the same
-// character, as CommonMark requires ("- * -" is not a rule).
-func sameRuleMarks(line string) bool {
-	marks := strings.Map(func(r rune) rune {
-		if strings.ContainsRune(mdIndent, r) {
-			return -1
-		}
-		return r
-	}, line)
-	return strings.Count(marks, marks[:1]) == len(marks)
 }
 
 // renderSlackTable renders a markdown table (its header line and body rows;
@@ -275,6 +265,13 @@ func cellTexts(line string) []string {
 // cellProse renders the prose between a cell's code spans: links as
 // "label (url)", bold marks dropped.
 func cellProse(s string) string {
-	s = slackLinkRE.ReplaceAllString(s, slackCellLinkForm)
-	return strings.ReplaceAll(s, mdBoldMark, "")
+	return shedBoldPairs(slackLinkRE.ReplaceAllString(s, slackCellLinkForm))
+}
+
+// shedBoldPairs removes the marks of every closed bold pair (mdBoldRE) outside
+// code spans, keeping the text between them: a heading is about to be bolded
+// whole, and a table cell is about to sit in a code block. A `**` that is not
+// half of a pair, as in `**kwargs` or `**/*.yaml`, stays.
+func shedBoldPairs(s string) string {
+	return rewriteOutsideCode(s, func(t string) string { return mdBoldRE.ReplaceAllString(t, slackBoldPairText) })
 }

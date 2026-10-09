@@ -1527,16 +1527,19 @@ principal, and `slack-socket-mode` when it did not: either way Slack authenticat
 sender over the socket and asserted the `user_id`. Rendering
 into mrkdwn is a narrow deterministic translation; the legacy Hermes converter stays
 where it is. A line pass runs first, outside fenced blocks, for the forms mrkdwn has no
-syntax for: a heading becomes a bold line, a thematic break is dropped, a list marker
+syntax for: a heading becomes a bold line (shedding any bold pairs inside it), a
+thematic break is dropped, a list marker
 becomes `•`, and a pipe table becomes a fenced block with its columns padded (a cell
-keeps a code span's content without its backticks, sheds bold marks, and shows a link as
+keeps a code span's content without its backticks, sheds the marks of closed bold pairs, and shows a link as
 its label and URL, since a code block renders no link; only an escaped `\|` stays inside
 a cell). A table the chunker cuts renders as a block up to the cut and raw after it. A
 heading run onto the end of a sentence with no line break is moved to its own line
 first. Bold and links are translated after it. The translation leaves
 code spans as written, converts bold only on a closed `**` pair, never alters a
 link's destination, and refuses a link whose label carries a URL naming a host other
-than the one it opens. Everything posted is escaped first (`&`, `<`, `>`) - relayed
+than the one it opens. Posts ask Slack not to unfurl links or media: an answer cites
+console and documentation links, and each unfurled into a preview card under it.
+Everything posted is escaped first (`&`, `<`, `>`) - relayed
 text is executor-authored, ie model output, and an unescaped `<!channel>` in a result
 would ping the room. The Google Chat adapter applies the same markdown rules behind its
 own defang, in two halves: the link defang reads prose, link text and an unclosed fence
