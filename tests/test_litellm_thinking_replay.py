@@ -48,7 +48,9 @@ _HELM_BASE_ARGS = [
 
 def _load_hook():
     """Import the hook with a stand-in for LiteLLM's CustomLogger base class."""
-    if "litellm.integrations.custom_logger" not in sys.modules:
+    # A real LiteLLM, where installed, is used as it is; the stand-in is only
+    # for the environments that have none, as in test_litellm_redaction.py.
+    if "litellm" not in sys.modules and importlib.util.find_spec("litellm") is None:
         litellm = types.ModuleType("litellm")
         integrations = types.ModuleType("litellm.integrations")
         custom_logger = types.ModuleType("litellm.integrations.custom_logger")
@@ -101,13 +103,18 @@ class TestHook(unittest.TestCase):
         self.hook = _load_hook()
 
     def test_gemini_models_are_recognised_by_provider_and_name(self):
-        for model in ("gemini/gemini-3.5-flash", "vertex_ai/gemini-3.1-pro-preview"):
+        for model in (
+            "gemini/gemini-3.5-flash",
+            "vertex_ai/gemini-3.1-pro-preview",
+            "vertex_ai/publishers/google/models/gemini-3.5-flash",
+        ):
             self.assertTrue(self.hook.is_gemini_model(model), model)
         for model in (
             "vertex_ai/claude-opus-5",
             "anthropic/claude-opus-5",
             "openai/gpt-5.4",
             "openai/gemini-3.5-flash",
+            "vertex_ai/publishers/anthropic/models/claude-opus-5",
             "gemini-3.5-flash",
             "",
         ):
@@ -126,6 +133,14 @@ class TestHook(unittest.TestCase):
         self.assertFalse(self.hook.routes_to_gemini("claude", router))
         self.assertFalse(self.hook.routes_to_gemini("unknown", router))
         self.assertFalse(self.hook.routes_to_gemini("model-default", None))
+
+    def test_a_hook_that_cannot_see_the_router_says_so_once(self):
+        self.hook._blind_warned = False
+        with self.assertLogs("kube_agents.litellm_thinking_replay", level="WARNING") as logs:
+            self.assertFalse(self.hook.routes_to_gemini("model-default", None))
+            self.assertFalse(self.hook.routes_to_gemini("model-default", None))
+        self.assertEqual(len(logs.records), 1)
+        self.assertIn("hook inactive", logs.output[0])
 
     def test_replayed_thinking_goes_and_everything_else_stays(self):
         messages = _session()
@@ -146,6 +161,25 @@ class TestHook(unittest.TestCase):
         claude = {"model": "claude", "messages": _session()}
         asyncio.run(self.hook.proxy_handler_instance.async_pre_call_hook(None, None, claude, "anthropic_messages"))
         self.assertEqual(claude["messages"], _session())
+
+
+@unittest.skipUnless(importlib.util.find_spec("litellm"), "litellm is not installed")
+class TestAgainstARealRouter(unittest.TestCase):
+    """The router contract the hook reads, against LiteLLM itself where it is installed."""
+
+    def test_the_base_config_aliases_resolve_and_a_claude_alias_does_not(self):
+        from litellm import Router
+
+        hook = _load_hook()
+        model_list = [
+            {"model_name": alias, "litellm_params": {"model": "vertex_ai/gemini-3.5-flash"}}
+            for alias in ("model-default", "hermes-agent", "gemini-3.5-flash")
+        ] + [{"model_name": "claude", "litellm_params": {"model": "anthropic/claude-opus-5", "api_key": "unused"}}]
+        router = Router(model_list=model_list)
+        for alias in ("model-default", "hermes-agent", "gemini-3.5-flash"):
+            self.assertTrue(hook.routes_to_gemini(alias, router), alias)
+        self.assertFalse(hook.routes_to_gemini("claude", router))
+        self.assertIn("async_pre_call_hook", vars(type(hook.proxy_handler_instance)))
 
 
 class TestBothPathsShipIt(unittest.TestCase):

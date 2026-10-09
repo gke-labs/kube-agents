@@ -11,9 +11,15 @@ answers. No prompt reaches that text.
 
 This pre-call hook drops those blocks from assistant messages before LiteLLM
 converts the request, for an alias whose every deployment is a Gemini model.
-Gemini's own signatures still ride the tool calls, and ``reasoning_content``,
-which LiteLLM does send as ``thought: true``, is left alone. Any other model,
-Claude above all, needs its thinking replayed and is not touched.
+Gemini's own signatures still ride the tool calls. On ``/v1/chat/completions``
+an OpenAI-format ``reasoning_content``, which LiteLLM does send as
+``thought: true``, is left alone. On ``/v1/messages`` LiteLLM builds that same
+thought part from the blocks this hook drops, so a Claude Code session's later
+turns carry no earlier thinking at all: more than the upstream fix removes, and
+measured to answer cleanly. Any other model, Claude above all, needs its
+thinking replayed and is not touched. The gate reads the alias's own
+deployments only; a router fallback to a Claude group from a Gemini alias
+would receive the stripped history, and neither shipped config has one.
 
 Fixed upstream in BerriAI/litellm#44661 (the Gemini request no longer builds a
 part from ``thinking_blocks``). Delete this hook, its mounts and its callback
@@ -39,8 +45,19 @@ THINKING_BLOCK_TYPES = frozenset({"thinking", "redacted_thinking"})
 # The OpenAI-format assistant message key that carries the same blocks.
 THINKING_BLOCKS_KEY = "thinking_blocks"
 ASSISTANT_ROLE = "assistant"
+# Request and message fields the hook reads, in both formats.
+MODEL_KEY = "model"
+MESSAGES_KEY = "messages"
+ROLE_KEY = "role"
+CONTENT_KEY = "content"
+PART_TYPE_KEY = "type"
+# A deployment's parameters, and the provider-qualified model string in them.
+DEPLOYMENT_PARAMS_KEY = "litellm_params"
+DEPLOYMENT_MODEL_KEY = "model"
 # LiteLLM providers that serve Gemini, and the model-name prefix that marks a
-# Gemini model under them (vertex_ai also serves Claude, as claude-*).
+# Gemini model under them (vertex_ai also serves Claude, as claude-*). The
+# prefix is matched on the last path segment, so a Model Garden path such as
+# vertex_ai/publishers/google/models/gemini-3.5-flash counts too.
 GEMINI_PROVIDERS = frozenset({"gemini", "vertex_ai"})
 GEMINI_MODEL_PREFIX = "gemini-"
 PROVIDER_SEPARATOR = "/"
@@ -50,11 +67,15 @@ PROVIDER_SEPARATOR = "/"
 LOG_LEVEL = logging.INFO
 LOG_FORMAT = "%(asctime)s %(name)s %(levelname)s %(message)s"
 
+# Whether the hook has already said it cannot see the router, so a LiteLLM
+# change that blinds it is logged once rather than on every request.
+_blind_warned = False
+
 
 def is_gemini_model(model: str) -> bool:
     """Whether a deployment's ``litellm_params.model`` names a Gemini model."""
     provider, _, name = str(model or "").partition(PROVIDER_SEPARATOR)
-    return provider in GEMINI_PROVIDERS and name.startswith(GEMINI_MODEL_PREFIX)
+    return provider in GEMINI_PROVIDERS and name.rsplit(PROVIDER_SEPARATOR, 1)[-1].startswith(GEMINI_MODEL_PREFIX)
 
 
 def routes_to_gemini(model_name: str, router: Any) -> bool:
@@ -63,13 +84,17 @@ def routes_to_gemini(model_name: str, router: Any) -> bool:
     False when the alias cannot be resolved: the hook then leaves the request
     as it is, which is right for any model that is not Gemini.
     """
-    if router is None or not model_name:
+    if router is None:
+        _warn_blind("no LiteLLM router to resolve aliases with")
+        return False
+    if not model_name:
         return False
     try:
         deployments = router.get_model_list(model_name=model_name) or []
-    except Exception:  # noqa: BLE001 - an unresolvable alias is left alone
+    except Exception as exc:  # noqa: BLE001 - an unresolvable alias is left alone
+        _warn_blind(f"the router could not resolve {model_name!r} ({exc})")
         return False
-    models = [(d.get("litellm_params") or {}).get("model", "") for d in deployments]
+    models = [(d.get(DEPLOYMENT_PARAMS_KEY) or {}).get(DEPLOYMENT_MODEL_KEY, "") for d in deployments]
     return bool(models) and all(is_gemini_model(m) for m in models)
 
 
@@ -77,17 +102,24 @@ def strip_replayed_thinking(messages: Any) -> int:
     """Drop replayed thinking from assistant messages in place; return how many blocks went."""
     stripped = 0
     for message in messages if isinstance(messages, list) else []:
-        if not isinstance(message, dict) or message.get("role") != ASSISTANT_ROLE:
+        if not isinstance(message, dict) or message.get(ROLE_KEY) != ASSISTANT_ROLE:
             continue
-        content = message.get("content")
+        content = message.get(CONTENT_KEY)
         if isinstance(content, list):
-            kept = [b for b in content if not (isinstance(b, dict) and b.get("type") in THINKING_BLOCK_TYPES)]
+            kept = [b for b in content if not (isinstance(b, dict) and b.get(PART_TYPE_KEY) in THINKING_BLOCK_TYPES)]
             stripped += len(content) - len(kept)
-            message["content"] = kept
+            message[CONTENT_KEY] = kept
         blocks = message.pop(THINKING_BLOCKS_KEY, None)
         if isinstance(blocks, list):
             stripped += len(blocks)
     return stripped
+
+
+def _warn_blind(reason: str) -> None:
+    global _blind_warned
+    if not _blind_warned:
+        _blind_warned = True
+        logger.warning("thinking replay: hook inactive, %s; Gemini requests keep their replayed thinking", reason)
 
 
 def _configure_logger() -> None:
@@ -109,8 +141,8 @@ def _router() -> Any:
 
 class ThinkingReplayStripper(CustomLogger):
     async def async_pre_call_hook(self, user_api_key_dict: Any, cache: Any, data: dict, call_type: Any) -> dict:
-        if routes_to_gemini(data.get("model", ""), _router()):
-            stripped = strip_replayed_thinking(data.get("messages"))
+        if routes_to_gemini(data.get(MODEL_KEY, ""), _router()):
+            stripped = strip_replayed_thinking(data.get(MESSAGES_KEY))
             if stripped:
                 logger.info("thinking replay: dropped %d replayed thinking block(s) bound for a Gemini model", stripped)
         return data
