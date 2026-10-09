@@ -1034,7 +1034,8 @@ held_by_hand, cause, max_concurrency}` when
 `verdict` is `BREACH` or `UNMEASURED`. `lease_failures` is how many runs Boskos
 refused a project in the periodic's recent window of `lease_failures_hours`
 hours, and `held_by_hand` how many projects are leased under an owner that is
-neither a Prow run nor a known job's fixed owner; all three are `null` from an
+neither a Prow run nor a known job's fixed owner; `lease_failures` and
+`held_by_hand` are `null` from an
 artifact written before the
 periodic reported them. `waiting_longest_s` is how long the
 longest run has been waiting for a project right now, `0` for an empty queue

@@ -540,6 +540,35 @@ class WorkflowNameJoinTest(unittest.TestCase):
         )
 
 
+class PoolPressureJobOwnersContractTest(unittest.TestCase):
+    """pool_pressure.py's BOSKOS_JOB_OWNERS copies the fixed Boskos owners two
+    hack/ scripts lease under. A rename there and not here would move that
+    job's leases under "held by hand" with nothing red."""
+
+    @staticmethod
+    def _script(name):
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location(
+            f"job_owner_{name}", REPO_SCRIPTS.parent / "hack" / f"{name}.py"
+        )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    def test_the_fixed_job_owners_are_the_scripts_defaults(self):
+        sys.path.insert(0, str(REPO_SCRIPTS))
+        import pool_pressure
+
+        self.assertEqual(
+            (
+                self._script("fleet_reconcile").DEFAULT_OWNER,
+                self._script("ci_sweep_compute_plants").DEFAULT_BOSKOS_OWNER,
+            ),
+            pool_pressure.BOSKOS_JOB_OWNERS,
+        )
+
+
 class PoolPressureArtifactContractTest(unittest.TestCase):
     """The CI-health bot's rule-8 note against the artifact it reads (#1607).
 

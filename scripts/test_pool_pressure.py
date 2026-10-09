@@ -1095,8 +1095,8 @@ class EndToEnd(unittest.TestCase):
     def test_a_failed_acquire_in_the_last_three_hours_breaches_on_its_own(self):
         """The requirement from #2747: runs refused a project on an afternoon
         whose percentiles never moved, and the check said OK. Real artifacts
-        of two of them, with the pool as Boskos reported it: full, two
-        projects held by hand for a repair, one lease nobody is running."""
+        of two of them, with a Boskos map built to that afternoon's shape: full,
+        two projects held by hand for a repair, one lease nobody is running."""
         code, out = run(from_dir=SATURATED_DIR, as_of=SATURATED_AS_OF, window_days=1)
         self.assertEqual(pp.EXIT_BREACH, code)
         self.assertIn("LEASE FAILED: 2 run(s)", out)
@@ -1241,8 +1241,8 @@ class JsonOutput(unittest.TestCase):
         self.assertIn("last 3h", payload["report"])
 
     def test_lease_failures_hand_holds_and_states_reach_the_payload(self):
-        # The health bot reads these three top-level fields and the recent
-        # count; the day rows carry the failures so the trend keeps them.
+        # The health bot reads `held_by_hand` and the recent count; the day
+        # rows carry the failures so the trend keeps them.
         payload = self._payload(from_dir=SATURATED_DIR, as_of=SATURATED_AS_OF, window_days=1)
         self.assertEqual(
             [("2108249555685347328", "2703", "2026-10-08T17:34:26Z", True),

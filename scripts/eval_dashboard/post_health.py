@@ -464,11 +464,12 @@ def decide(health: dict, prev: dict | None, now: datetime, digest_hour: int, tz=
         kinds.append(KIND_SLOW)
 
     # Rule 8, once per episode, plus a re-post on a verdict change or a cause
-    # not yet named this episode. A breach message also needs a live queue: the
-    # verdict spans seven days while the remedy is read live, so one bad day
-    # keeps the verdict for a week and the remedy tracks a pool that has since
-    # drained. `over_threshold` shares the cause's instant. The two monitoring
-    # verdicts are exempt -- neither advises anything.
+    # not yet named this episode. A breach message also needs a live queue or
+    # a refusal in the periodic's recent window: the verdict spans seven days
+    # while the remedy is read live, so one bad day keeps the verdict for a
+    # week and the remedy tracks a pool that has since drained.
+    # `over_threshold` shares the cause's instant. The two monitoring verdicts
+    # are exempt -- neither advises anything.
     pool = health.get("pool") or {}
     told = prev or {}
     if (
