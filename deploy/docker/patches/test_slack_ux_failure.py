@@ -509,8 +509,7 @@ class MarkTest(FlagOn):
 class FlagOff(unittest.TestCase):
     def test_nothing_is_marked(self):
         runtime._marks.clear()
-        with mock.patch.dict(os.environ, {}, clear=False):
-            os.environ.pop(FLAG_ENV, None)
+        with mock.patch.dict(os.environ, {FLAG_ENV: "false"}):
             runtime.note_wake(SUB, {"gave_up"}, WAKE)
         self.assertEqual(runtime._marks, {})
         self.assertIsNone(runtime.begin(_event()))

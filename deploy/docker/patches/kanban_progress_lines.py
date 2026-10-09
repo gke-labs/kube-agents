@@ -137,7 +137,24 @@ def progress_note(payload: object, limit: int = DEFAULT_NOTE_LIMIT) -> str:
 #: upstream's ``_EVENT_FORMATTERS["status"]`` renders it. Listing it here means
 #: such a move folds into the card's trail as ``→ <status>`` rather than
 #: posting upstream's ``🔄`` line as a message of its own.
-ROLLING_KINDS = ("heartbeat", "status")
+#:
+#: ``queued`` is the dispatcher's notice that a user card is waiting for a
+#: worker slot (``hermes_cli/kanban_priority.py``). It rolls so the
+#: card's first progress note joins the queued line instead of posting under
+#: it, and so a card queued twice reads as one message.
+ROLLING_KINDS = ("heartbeat", "status", "queued")
+
+#: The rolling kinds whose trail entry is the ``note`` on the event payload.
+NOTE_KINDS = ("heartbeat", "queued")
+
+#: A queued line that opens a card's rolling message is posted bare, without
+#: the card's header, because it is worded for the user as a whole sentence
+#: (bnaylor). The header joins once the worker's first note arrives.
+QUEUED_KIND = "queued"
+
+#: Where a card's map entry remembers which of its trail lines were queued
+#: notices, so the terminal settle can drop them.
+QUEUED_LINES_KEY = "queued_lines"
 
 #: With ``KAGE_SLACK_UX`` on, the blocked kind that may post a question, and
 #: the terminal kind whose report may announce a PR (see ``slack_ux_moments``).
@@ -328,7 +345,7 @@ def rolling_line(kind: str, payload: object) -> str:
     being non-empty — an event that rolls must not fall through and settle the
     message just because its payload was thin.
     """
-    if kind == "heartbeat":
+    if kind in NOTE_KINDS:
         return progress_note(payload)
     if kind == "status":
         status = payload.get("status") if isinstance(payload, dict) else None
@@ -886,7 +903,10 @@ async def deliver(
             result = result_line(kind, getattr(ev, "payload", None))
             shown = await _settle_plan_row(plan, adapter, sub, kind, result, title)
         if entry and entry["message_id"] and entry["lines"]:
-            settled = entry["lines"][-1:] if quiet else entry["lines"]
+            # A queued line says the card is waiting; once it settles that is
+            # stale, so the settled message keeps only the card's own notes.
+            notes = [line for line in entry["lines"] if line not in entry.get(QUEUED_LINES_KEY, ())]
+            settled = notes[-1:] if quiet else notes
             try:
                 await adapter.edit_message(
                     chat_id,
@@ -931,12 +951,16 @@ async def deliver(
 
     payload = getattr(ev, "payload", None)
     line = rolling_line(kind, payload) or message
+    if kind == QUEUED_KIND and not entry:
+        header = ""
     moments = _slack_moments(quiet)
     await _settle_question(moments, adapter, sub, kind, event_id)
     result = await _roll(
         adapter, sub, metadata, header, title, line, _moved_to(kind, payload),
         _slack_plan(quiet), event_id, tracked,
     )
+    if kind == QUEUED_KIND and tracked.get(key):
+        tracked[key].setdefault(QUEUED_LINES_KEY, []).append(line)
     # The whole note, not the clipped line: a url past the clip is cut whole.
     note = progress_note(payload, limit=0) if kind == "heartbeat" else ""
     await _pr_opened(moments, adapter, sub, note or line, result)

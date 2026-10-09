@@ -125,16 +125,16 @@ func TestCredentialProxyMemoryLimitAtTheFloorIsAdmitted(t *testing.T) {
 	}
 }
 
-// The case the field exists for (#2324): the limit raised to 2Gi and nothing
-// else. Admitted, with one note: GKE Autopilot without bursting sets the limit
-// equal to the 512Mi default request, so there the raise has no effect.
-func TestCredentialProxyTwoGiLimitIsAdmittedWithTheLimitWithoutRequestNote(t *testing.T) {
+// The case the field exists for (#2324): the limit raised past the 2Gi default
+// and nothing else. Admitted, with one note: GKE Autopilot without bursting sets
+// the limit equal to the 512Mi default request, so there the raise has no effect.
+func TestCredentialProxyRaisedLimitIsAdmittedWithTheLimitWithoutRequestNote(t *testing.T) {
 	val := &PlatformAgentCustomValidator{}
 	warnings, err := val.ValidateCreate(context.Background(), proxyResourcesAgent(&corev1.ResourceRequirements{
-		Limits: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("2Gi")},
+		Limits: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("3Gi")},
 	}))
 	if err != nil {
-		t.Fatalf("a 2Gi memory limit was refused: %v", err)
+		t.Fatalf("a 3Gi memory limit was refused: %v", err)
 	}
 	if len(warnings) != 1 {
 		t.Fatalf("expected one warning, got %v", warnings)
@@ -223,10 +223,10 @@ func TestCredentialProxyLimitEqualToTheRequestIsNotNoted(t *testing.T) {
 func TestCredentialProxyRequestAboveTheDefaultLimitIsRefused(t *testing.T) {
 	val := &PlatformAgentCustomValidator{}
 	_, err := val.ValidateCreate(context.Background(), proxyResourcesAgent(&corev1.ResourceRequirements{
-		Requests: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("2Gi")},
+		Requests: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("3Gi")},
 	}))
 	msg := fieldErrorMessage(t, err, "spec.deployment.credentialProxy.resources.requests.memory")
-	if !strings.Contains(msg, "operator's default 1Gi memory limit") || !strings.Contains(msg, "set limits.memory as well") {
+	if !strings.Contains(msg, "operator's default 2Gi memory limit") || !strings.Contains(msg, "set limits.memory as well") {
 		t.Errorf("message %q does not name the default limit it collides with", msg)
 	}
 }
