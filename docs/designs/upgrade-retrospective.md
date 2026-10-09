@@ -147,15 +147,20 @@ included, and the first-run stage marks this job due without one. That is the "c
 scoped to this one stream. An install that onboarded before the job existed gets its baseline from
 the first Sunday tick.
 
-A third trigger reviews a cluster soon after its upgrade rather than at the weekend. An hourly
-`no_agent` job lists GKE operations per project; when an `UPGRADE_MASTER` or `UPGRADE_NODES`
-operation on a cluster reached `DONE` at least thirty minutes earlier and the ledger has not
-reviewed that operation, the job runs the collector for that cluster alone (a scoped run, §3.2) and
-posts its lines. Thirty minutes lets the replacement pods settle while most of the hour of events
-the API server keeps is still there. The Sunday run stays the fleet-wide baseline and the only run
-that files the ledger issue; the hourly job records the operations it reviewed so the Sunday run
-reports them as already reviewed. It is the last part of the second work item (§5), after the
-scheduled run and the on-demand route.
+A third trigger reviews a cluster soon after its upgrade rather than at the weekend. A `no_agent`
+job runs every fifteen minutes on the gateway pod, where such scripts run, and does its work in the
+shell sandbox through the same hop the readiness watch uses (`sandbox_exec`, the script handed to
+the sandbox's `python3` on stdin): it lists GKE operations per project, and when an
+`UPGRADE_MASTER` or `UPGRADE_NODES` operation on a cluster reached `DONE` at least fifteen minutes
+earlier and the ledger has not reviewed that operation, it runs the collector in the sandbox for that
+cluster alone (a scoped run, §3.2), where the store is, and posts the lines the collector prints. The
+review therefore lands fifteen to twenty-nine minutes after `DONE`: the replacement pods have had
+time to settle, and the events of the operation's last half hour are still inside the API server's
+hour; events emitted earlier in a long drain are already gone, which is why (B) reads pod and node
+state first and treats events as corroboration. The Sunday run stays the fleet-wide baseline and the
+only run that files the ledger issue; the fifteen-minute job records the operations it reviewed so
+the Sunday run reports them as already reviewed. It is the last part of the second work item (§5),
+after the scheduled run and the on-demand route.
 
 ### 3.1a On demand: the same report, from a generic question
 
@@ -292,7 +297,13 @@ names a dropped label, a runtime image below the catalogue's floor on a pool mig
 an image that pulls on untouched nodes and fails on rebuilt ones, a volume attach error naming a
 PersistentVolume, a driver error text, a budget with no allowance on a drained node. On a first run a match whose only onset is a recreated pod's is capped at `medium` (§3.2). Anything less,
 a generic `OOMKilled`, an image pull failure with no untouched node to compare, a Pending pod with
-no pool operation, is _tentative_ (`medium`). A symptom that matches nothing is reported as a
+no pool operation, is _tentative_ (`medium`). Text a namespace user can write is never enough for
+`high` on its own: an Event's `reason` and `message` and a container's termination message are
+tenant-authored, so a signature matched only there (row 7's `failed calling webhook`, row 19's
+`FailedMount`, row 18's driver text) is `medium` and marked "from event text" unless a field the
+API server sets agrees with it, a pod phase or container state, a node condition, a scheduling
+status; and wherever the excerpt travels, the guard, the manifest candidate, the ledger issue, it is
+quoted as the object's own text, not stated as the review's finding. A symptom that matches nothing is reported as a
 Warning, unclassified, rather than dropped: the report is a record of the upgrade, not only of the
 catalogue's part of it. The entries not in the table (3, 4,
 5, 8, 9, 10, 11, 13, 16) have no symptom a single read identifies with confidence; they are the
