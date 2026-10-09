@@ -4591,6 +4591,9 @@ func safeSandboxEnvOverrides(custom []corev1.EnvVar) []corev1.EnvVar {
 	//   - Harness messages: the harness's own Slack messages (the
 	//     scheduled-report wrapper, the heartbeat, restart and shutdown
 	//     notices, command and system replies) are reworded or left out.
+	//   - Finished answers: a completed card's answer posts as its first
+	//     sentence in bold with the rest in a collapsed "why" fold and a
+	//     closing question below it, in the same thread, with the same text.
 	allowed := map[string]struct{}{
 		"ALERT_DAILY_LIMIT_CRITICAL": {},
 		// Not a severity, unlike its three neighbours: the drift detector's

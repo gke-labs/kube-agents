@@ -9,7 +9,8 @@ Two things are checked:
 
 1. The notifier. ``_send_event`` hands ``_progress_deliver`` the adapter
    ``_kage_slack_incident.adapter_for(adapter, self.platform_str, ev,
-   self.task, sub)`` returns, and that name is bound at module level.
+   self.task, sub)`` returns, and that name is bound at module level. The
+   first argument may be ``slack_ux_answer``'s adapter for the same event.
 2. The runtime module, loaded by path from ``gateway/``: flag off,
    ``adapter_for`` returns the notifier's own adapter; flag on, a triage
    report for an open alert thread edits the alert with one button per
@@ -47,6 +48,9 @@ DELIVER = "_progress_deliver"
 ALIAS = "_kage_slack_incident"
 FACTORY = "adapter_for"
 EXPECTED_ARGS = "adapter, self.platform_str, ev, self.task, sub"
+#: ``apply_slack_ux_answer`` wraps the first argument; the rest stay.
+ANSWER_WRAPPED = "_kage_slack_answer.adapter_for(" + EXPECTED_ARGS + ")"
+REST_ARGS = EXPECTED_ARGS.split(", ", 1)[1]
 
 CHANNEL = "C0KAGE"
 ALERT_TS = "1700000000.000100"
@@ -90,7 +94,9 @@ def check_notifier(root: Path) -> None:
         and factory.func.attr == FACTORY
         and isinstance(factory.func.value, ast.Name)
         and factory.func.value.id == ALIAS
-        and ", ".join(ast.unparse(a) for a in factory.args) == EXPECTED_ARGS
+        and factory.args
+        and ast.unparse(factory.args[0]) in ("adapter", ANSWER_WRAPPED)
+        and ", ".join(ast.unparse(a) for a in factory.args[1:]) == REST_ARGS
     ):
         raise _fail(f"{DELIVER}()'s adapter argument is not {ALIAS}.{FACTORY}({EXPECTED_ARGS})")
     bound = any(

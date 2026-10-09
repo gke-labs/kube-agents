@@ -164,6 +164,13 @@ class SplitAnswerTest(unittest.TestCase):
         self.assertEqual(headline, "Yes, seeded-a is healthy")
         self.assertEqual(body, ["- one\n- two"])
 
+    def test_split_lead_keeps_the_sentence_as_written(self):
+        sentence = "The [pool](https://x) is at `4/4` nodes" + " and busy" * 20 + "."
+        md = sentence + " It needs more.\n\nScale it."
+        lead, body = sp.split_lead(md)
+        self.assertEqual((lead, body), (sentence, ["It needs more.", "Scale it."]))
+        self.assertEqual((sp._clip(sp._plain(lead), sp.HEADLINE_MAX), body), sp.split_answer(md))
+
     def test_empty(self):
         self.assertEqual(sp.split_answer(""), ("", []))
         self.assertEqual(sp.split_answer("   \n\n "), ("", []))
@@ -265,6 +272,22 @@ class SplitAnswerTest(unittest.TestCase):
     def test_more_abbreviations_do_not_end_the_headline(self):
         for line in ("Node pool np-1 at rev. 7 is cordoned.", "Certs expired Sept. 30 on seeded-a."):
             self.assertEqual(sp.split_answer(line), (line, []))
+
+    def test_a_bold_lead_ends_at_its_closer_whatever_word_it_ends_on(self):
+        for line, headline, body in (
+            ("**Replicas are at max.** 3 pods run.", "Replicas are at max.", ["3 pods run."]),
+            ("__Etc.__ Done.", "Etc.", ["Done."]),
+            (
+                "Yes — **replicas are at max.** 3 of 3 are ready. Nothing to do.",
+                "Yes — replicas are at max.",
+                ["3 of 3 are ready. Nothing to do."],
+            ),
+            ("Replicas are **at max.** 3 of 4 are ready.", "Replicas are at max.", ["3 of 4 are ready."]),
+            ("*Replicas are at max.* 3 pods run.", "Replicas are at max.", ["3 pods run."]),
+            ("The answer is _no._ 3 pods are down.", "The answer is no.", ["3 pods are down."]),
+        ):
+            self.assertEqual(sp.split_answer(line), (headline, body))
+        self.assertEqual(sp.split_answer("Scale to max. 3 pods run."), ("Scale to max. 3 pods run.", []))
 
     def test_an_abbreviation_in_parentheses_does_not_end_the_headline(self):
         for line, headline in (

@@ -171,12 +171,18 @@ __all__ = [
 # for reports that outgrow a status line.
 #
 # Appending cannot fix that — only the caller of the clip can decide the clip
-# was a mistake — so the hook returns the finished tail instead. When the status
-# line is merely a clipped prefix of the report, it is dropped and the report is
-# sent once, whole. That branch got *more* reachable, not less, when
-# ``tools/kanban_result_required.py`` began folding a whitespace-only
-# ``summary`` to ``None`` to stop ``complete_task`` indexing line zero of a
-# blank string and wedging the card.
+# was a mistake — so the hook returns the finished tail instead.
+#
+# The status line goes whenever there is a report to send
+# -------------------------------------------------------
+# A worker's ``summary`` is the one-line status of its card, and the report
+# stanza (``tools/kanban_report_format.py``) asks the ``result`` to open on one
+# bold sentence answering the ask. Those are the same sentence twice: a health
+# check arrived as the summary, then the result's bold lead saying it again.
+# So when a report goes out, it goes out alone, whether the status line was a
+# clipped prefix of it or a separate sentence. The status line still carries a
+# card that closed with nothing in ``result``, or with a ``result`` the status
+# line already contains.
 #
 # Length is safe on both platforms this harness ships to. The notifier calls
 # ``adapter.send()`` directly, and ``send()`` chunks: the Slack adapter declares
@@ -194,9 +200,11 @@ __all__ = [
 #: alongside it.
 RESULT_LIMIT = 30000
 
-#: Separates the status line from the report. A blank line is enough: the
-#: status line is already on its own line under the ``✔ … done — <title>``
-#: header (flag off; on Slack with ``KAGE_SLACK_UX`` the handoff leads), so the
+#: How much of a dropped status line the log keeps.
+SUMMARY_LOG_CHARS = 200
+
+#: Separates the ``✔ … done — <title>`` header from the report (flag off; on
+#: Slack with ``KAGE_SLACK_UX`` the report leads). A blank line is enough: the
 #: result reads as the body of the same message.
 SEPARATOR = "\n\n"
 
@@ -216,7 +224,7 @@ def result_block(
     result: object,
     limit: int = RESULT_LIMIT,
 ) -> str:
-    """Return the text to append to a completion message, or ``""`` for none.
+    """Return the report that replaces the status line, or ``""`` for none.
 
     ``delivered`` is the handoff the message already carries (the clipped
     status line). When the result is contained in it there is nothing new to
@@ -357,25 +365,8 @@ def _log_result_shape(task: object, result: object) -> None:
         logger.debug("[kanban] result-shape check failed", exc_info=True)
 
 
-def _is_clipped_prefix_of(delivered: str, body: str) -> bool:
-    """Whether ``delivered`` is just the opening of ``body``, possibly clipped.
-
-    Written as a prefix test rather than an equality test against
-    ``clip_handoff(body)`` so it still holds if the notifier's status line is
-    built some other way. Upstream's own version of that line was a raw
-    ``lines[0][:160]`` slice before the clip wiring replaced it, and either
-    shape is the same fact about the message: the reader has seen this text
-    already, and is about to see all of it.
-    """
-    head = _normalise(delivered)
-    marker = _normalise(ELLIPSIS)
-    if marker and head.endswith(marker):
-        head = head[: -len(marker)].rstrip()
-    return bool(head) and _normalise(body).startswith(head)
-
-
 def handoff_with_result(delivered: object, task: object) -> str:
-    """Return the completion message's whole tail: status line and report.
+    """Return the completion message's whole tail: the report, or the status line.
 
     Replaces the notifier's ``handoff`` — see the comment block above for why
     appending to it cannot work. ``delivered`` is what the notifier built,
@@ -383,20 +374,24 @@ def handoff_with_result(delivered: object, task: object) -> str:
     that vanished between the claim and the send.
 
     Fails to ``delivered`` unchanged rather than raising. This runs on the
-    delivery path: a completion notification that loses its report is bad, one
-    that raises, rewinds the cursor and re-sends forever is worse, and one that
-    drops the status line it already had is worse again.
+    delivery path: a completion notification that loses its report is bad, and
+    one that raises, rewinds the cursor and re-sends forever is worse. A status
+    line that gives way to the report stays on the card (``kanban_show``), so a
+    fact a worker put only in ``summary`` can still be found; the swap is logged
+    at DEBUG.
     """
     text = "" if delivered is None else str(delivered)
     try:
         result = getattr(task, "result", None)
         _log_result_shape(task, result)
         block = result_block(text, result)
-        if not block:
-            return text
-        if _is_clipped_prefix_of(text, str(result).strip()):
-            return block
-        return text + block
+        if block and text.strip():
+            logger.debug(
+                "[kanban] card %s: sending its result without the status line %r.",
+                getattr(task, "id", "<unknown>"),
+                text.strip()[:SUMMARY_LOG_CHARS],
+            )
+        return block or text
     except Exception:  # pragma: no cover - defensive
         return text
 
@@ -408,9 +403,10 @@ def handoff_with_result(delivered: object, task: object) -> str:
 # When a card reaches a terminal state the notifier does two separate things
 # for the same event:
 #
-# 1. ``adapter.send(...)`` posts the completion line — the worker's own summary,
-#    plus whatever :func:`handoff_with_result` added to it — straight into the
-#    originating chat thread. The user has the answer at this point.
+# 1. ``adapter.send(...)`` posts the completion line — the card's ``result``
+#    when it has one (:func:`handoff_with_result`), otherwise the worker's
+#    summary — straight into the originating chat thread. The user has the
+#    answer at this point.
 # 2. ``adapter.handle_message(...)`` then injects a synthetic ``MessageEvent``
 #    to *wake the agent that created the card*, which costs a full model turn.
 #
@@ -423,7 +419,7 @@ def handoff_with_result(delivered: object, task: object) -> str:
 #                    "review_requested", "changes_requested", "block_loop_detected")
 #
 # There is no config key for it anywhere in Hermes. For the Chat Agent front
-# door that makes ``completed`` pure overhead: the summary has already been
+# door that makes ``completed`` pure overhead: the answer has already been
 # delivered, so the woken turn re-reads the card with ``kanban_show`` and
 # paraphrases a message the user is already looking at. Measured on task
 # ``t_c31a1f00`` (2026-08-05): **5.9 s and 32,460 input tokens** for that third
@@ -1534,9 +1530,10 @@ def completion_text(head: str, title: str, handoff: str, platform: object = None
     """Return the completion message: upstream's, or on Slack the handoff alone.
 
     Flag off, or any platform but Slack, this is upstream's f-string exactly.
-    On Slack it drops the head line and leads with the worker's summary and
-    report; a card that completed with neither keeps the head line, since an
-    empty message is worse than a terse one.
+    On Slack it drops the head line and leads with the worker's report, or
+    its summary when there is no report (:func:`handoff_with_result`); a card
+    that completed with neither keeps the head line, since an empty message
+    is worse than a terse one.
     """
     upstream = COMPLETION_HEAD.format(head=head, title=title) + (handoff or "")
     if not slack_ux_on(platform):

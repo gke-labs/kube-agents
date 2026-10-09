@@ -1519,6 +1519,14 @@ class SlackMomentsHookTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.settled, [("t_e0c1", "completed")], "the arrival reaction was left on")
         self.assertEqual(self.announced, [("t_e0c1", f"seeded-a: {self.PR_NOTE}", 0)], "a PR it opened lost its message")
 
+    async def test_a_folded_completion_announces_a_pr_its_summary_alone_names(self):
+        # The folded row's message is the result alone; the summary still names the PR.
+        self._plan(shows=True, folds=True)
+        self.assertIsNone(await self._child(_Adapter(), payload={"summary": self.PR_NOTE}))
+        self.assertEqual(
+            self.announced, [("t_e0c1", f"seeded-a: 1.33.4 = default.\n{self.PR_NOTE}", 0)],
+        )
+
     async def test_a_completion_the_plan_does_not_show_or_with_no_open_fan_out_posts(self):
         for shows, folds in ((False, True), (True, False)):
             with self.subTest(shows=shows, folds=folds):
@@ -1641,6 +1649,17 @@ class SlackMomentsHookTest(unittest.IsolatedAsyncioTestCase):
             [(text, sent) for _task, text, sent in self.announced],
             [("Checking seeded-a.", 1), (self.PR_NOTE, 1), (f"Done. {self.PR_NOTE}", 2)],
         )
+
+    async def test_an_opened_pr_in_the_summary_alone_is_announced(self):
+        adapter, report = _Adapter(), "Both overlays reconcile."
+        ev = SimpleNamespace(id=3, kind="completed", payload={"summary": self.PR_NOTE})
+        await deliver(SimpleNamespace(), adapter, SLACK_SUB, "completed", ev, report, None, HEADER)
+        self.assertEqual([text for _task, text, _sent in self.announced], [f"{report}\n{self.PR_NOTE}"])
+
+    async def test_a_summary_already_in_the_message_is_scanned_once(self):
+        ev = SimpleNamespace(id=3, kind="completed", payload={"summary": self.PR_NOTE})
+        await deliver(SimpleNamespace(), _Adapter(), SLACK_SUB, "completed", ev, f"Done. {self.PR_NOTE}", None, HEADER)
+        self.assertEqual([text for _task, text, _sent in self.announced], [f"Done. {self.PR_NOTE}"])
 
     async def test_a_long_note_is_scanned_whole(self):
         # The rolling line clips at 300 characters, cutting a url past it whole.
