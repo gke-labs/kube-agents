@@ -108,6 +108,12 @@ The system prompt takes the 1h tier because it is the largest static span, every
 
 Nothing here is provider-specific. Non-Anthropic backends drop the markers in their provider transforms — Gemini and Gemma routes answer normally with unchanged token counts — and Gemini's own implicit caching, which needs no markers at all, is unaffected. Leaving the block in place on a Gemini install costs nothing and means switching to `MODEL_PROVIDER=anthropic` doesn't quietly switch caching off.
 
+### Replayed thinking on Gemini
+
+A client that turns thinking on, as the session pods' Claude Code does, sends each earlier turn's thinking back in the next request. LiteLLM passes that thinking to a Gemini model as ordinary text rather than as a thought, so Gemini reads its earlier thought summaries as things it said and opens its next answers with more of them: a bold step title and a line such as "I will now draft the report". No prompt reaches that text.
+
+Both the chart and the kustomize base therefore load a pre-call hook that drops replayed thinking blocks from earlier assistant turns before the request goes to a Gemini model. Thinking still streams back, and requests to any other model, Claude above all, go out as sent. The gateway log records each request it changed, as `kube_agents.litellm_thinking_replay INFO thinking replay: dropped N replayed thinking block(s)`. The hook is removed once the pinned LiteLLM release handles replayed thinking itself.
+
 ### Redaction at the gateway
 
 Everything the agent observes on a cluster goes up in the next request: pod IPs, cluster and project names, and whatever credential material a command printed. The gateway is the one point every provider request transits, so it is where redaction runs. `litellm.redaction.enabled=true` in the chart values mounts the shared redactor module (a copy of the chat plugins' `AuditRedactor`, kept identical by a test) and a LiteLLM pre-call hook beside `config.yaml`, and the hook rewrites `messages[].content` (strings and `text` parts), each assistant message's `tool_calls[].function.arguments` (parsed, so a key name such as `password` counts as it does in a mapping), embeddings `input` and completion `prompt` before LiteLLM calls the provider. The rendered default config does not change while the value is off.

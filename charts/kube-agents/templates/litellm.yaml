@@ -90,6 +90,16 @@
   mounted beside config.yaml below.
 */}}
 {{- $callbackList := ternary (list "otel" "prometheus") (list "prometheus") .Values.litellm.otel }}
+{{- /*
+  The thinking-replay hook runs on every install: it acts only on a request
+  bound for a Gemini model, and leaves every other model's request as sent.
+  Its header says what it works around and when to delete it.
+*/}}
+{{- $thinkingReplaySource := .Files.Get "files/litellm_thinking_replay_callback.py" }}
+{{- if empty $thinkingReplaySource }}
+{{- fail "the chart's files/litellm_thinking_replay_callback.py is missing" }}
+{{- end }}
+{{- $callbackList = append $callbackList "litellm_thinking_replay_callback.proxy_handler_instance" }}
 {{- if $redactionEnabled }}
 {{- $callbackList = append $callbackList "litellm_redaction_callback.proxy_handler_instance" }}
 {{- end }}
@@ -108,12 +118,12 @@
 */}}
 {{- $config := include "kube-agents.litellmConfig" (dict "provider" $provider "model" $model "callbacks" $callbacks "maxTokens" .Values.litellm.maxTokens) }}
 {{- /*
-  Every key the ConfigMap carries feeds the checksum: the rule file and the
-  two modules are subPath mounts too, so an edit to any of them has to roll
-  the pods the same way an edit to config.yaml does. With redaction off the
-  three extras are empty strings and the hash is the one it always was.
+  Every key the ConfigMap carries feeds the checksum: the thinking-replay
+  hook, the rule file and the two redaction modules are subPath mounts too, so
+  an edit to any of them has to roll the pods the same way an edit to
+  config.yaml does. With redaction off its three extras are empty strings.
 */}}
-{{- $checksumInput := printf "%s%s%s%s" $config $redactionConfig $redactorSource $redactionCallbackSource }}
+{{- $checksumInput := printf "%s%s%s%s%s" $config $thinkingReplaySource $redactionConfig $redactorSource $redactionCallbackSource }}
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -125,6 +135,8 @@ metadata:
 data:
   config.yaml: |
     {{- $config | nindent 4 }}
+  litellm_thinking_replay_callback.py: |
+    {{- $thinkingReplaySource | nindent 4 }}
   {{- if $redactionEnabled }}
   redaction.yaml: |
     {{- $redactionConfig | nindent 4 }}
@@ -318,6 +330,10 @@ spec:
             - name: config-volume
               mountPath: /app/config.yaml
               subPath: config.yaml
+            # Beside config.yaml, where LiteLLM resolves a custom callback module.
+            - name: config-volume
+              mountPath: /app/litellm_thinking_replay_callback.py
+              subPath: litellm_thinking_replay_callback.py
             {{- if $redactionEnabled }}
             # Beside config.yaml, because LiteLLM resolves a custom callback
             # module relative to the config file's directory and the callback

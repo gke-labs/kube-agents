@@ -9,7 +9,10 @@ model_list:
     litellm_params:
       model: ${MODEL_PROVIDER}/${MODEL_DEFAULT_NAME}
 litellm_settings:
-  callbacks: ["otel", "prometheus"]
+  callbacks:
+    - otel
+    - prometheus
+    - litellm_thinking_replay_callback.proxy_handler_instance
 # Prompt caching, injected gateway-side so the agent config stays free of model
 # identity. Hermes reaches us as `provider: custom` on the OpenAI wire asking
 # for "model-default", and its own Anthropic cache_control layout only engages

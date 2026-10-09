@@ -9,6 +9,9 @@ configMapGenerator:
   - name: litellm-config
     files:
       - config.yaml
+      # A copy of charts/kube-agents/files/litellm_thinking_replay_callback.py
+      # (kustomize loads nothing outside this directory); its header says why.
+      - litellm_thinking_replay_callback.py
 
 # See config/default/kustomization.yaml for why includeSelectors stays false.
 labels:
