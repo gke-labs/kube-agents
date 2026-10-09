@@ -114,30 +114,39 @@ class StageTest(unittest.TestCase):
         return [argv[-1] for argv, _env in self.started]
 
     def _ledger(
-        self, job_id: str, status: str, claimed_at: float, replace: bool = True, skip_reason: str | None = None
+        self,
+        job_id: str,
+        status: str,
+        claimed_at: float,
+        replace: bool = True,
+        skip_reason: str | None = None,
+        finished_at: float | None = None,
     ) -> None:
         """A run row in the Platform Agent's cron store, as profile-cron-tick leaves one.
 
-        The skip ledger's ``skip_reason`` column is added only for a row that carries one, so the
-        other tests read a store without it.
+        The ``skip_reason`` and ``finished_at`` columns are added only for a row that carries one,
+        so the other tests read a store without them.
         """
         db = self.d / "profiles" / "platform" / "cron" / oobe.EXECUTIONS_DB
         with sqlite3.connect(db) as conn:
             conn.execute("CREATE TABLE IF NOT EXISTS executions (id INTEGER PRIMARY KEY, job_id TEXT, status TEXT, claimed_at TEXT)")
+            columns = {"job_id": job_id, "status": status}
             if skip_reason is not None:
-                with contextlib.suppress(sqlite3.OperationalError):
-                    conn.execute("ALTER TABLE executions ADD COLUMN skip_reason TEXT")
+                columns["skip_reason"] = skip_reason
+            if finished_at is not None:
+                columns["finished_at"] = datetime.fromtimestamp(finished_at, timezone.utc).isoformat()
+            for optional in ("skip_reason", "finished_at"):
+                if optional in columns:
+                    with contextlib.suppress(sqlite3.OperationalError):
+                        conn.execute(f"ALTER TABLE executions ADD COLUMN {optional} TEXT")
             # A run's row is updated in place as it ends; a new status replaces the job's in-flight row.
             if replace:
                 conn.execute("DELETE FROM executions WHERE job_id = ? AND status IN ('claimed', 'running')", (job_id,))
-            claimed = datetime.fromtimestamp(claimed_at, timezone.utc).isoformat()
-            if skip_reason is None:
-                conn.execute("INSERT INTO executions (job_id, status, claimed_at) VALUES (?, ?, ?)", (job_id, status, claimed))
-            else:
-                conn.execute(
-                    "INSERT INTO executions (job_id, status, claimed_at, skip_reason) VALUES (?, ?, ?, ?)",
-                    (job_id, status, claimed, skip_reason),
-                )
+            columns["claimed_at"] = datetime.fromtimestamp(claimed_at, timezone.utc).isoformat()
+            conn.execute(
+                f"INSERT INTO executions ({', '.join(columns)}) VALUES ({', '.join('?' * len(columns))})",
+                tuple(columns.values()),
+            )
 
     def _drive(self, now: float = NOW_SETTLED, ticks: int = 20) -> float:
         """Tick the stage, completing each audit's run a minute after it is marked, until done."""
@@ -521,11 +530,20 @@ class StageTest(unittest.TestCase):
 
     def test_a_run_under_way_when_the_sweep_was_filed_is_adopted(self):
         # The 06:20 run claimed while the reconcile held the gate, completed during onboarding.
-        self._ledger("compliance-audit", "completed", FILED_AT - 20 * MINUTE)
+        self._ledger("compliance-audit", "completed", FILED_AT - 20 * MINUTE, finished_at=FILED_AT + 5 * MINUTE)
         self._file_scan()
         _board(self.board, [_ranking("done")])
         self._drive()
         self.assertNotIn("compliance-audit", self._started_ids())
+
+    def test_a_run_that_finished_before_the_sweep_was_filed_is_not_adopted(self):
+        # Claimed inside the run limit, but it saw the fleet before onboarding.
+        self._ledger("compliance-audit", "completed", FILED_AT - 20 * MINUTE, finished_at=FILED_AT - 5 * MINUTE)
+        self._file_scan()
+        _board(self.board, [_ranking("done")])
+        self._drive()
+        self.assertEqual(self._started_ids(), list(oobe.FIRST_RUN_AUDITS))
+        self.assertEqual(oobe.read_state(self.d)[oobe.STATE_ADOPTED], [])
 
     def test_a_run_from_before_the_sweep_is_not_adopted(self):
         # Yesterday's scheduled run is not this install's first run.
