@@ -149,9 +149,13 @@ var SensitiveEnvVars = map[string]struct{}{
 	// the next stack holds the chat backend; an override either way leaves
 	// posts going to a platform that is not there.
 	"A2A_NOTIFY_PLATFORM": {},
-	"NATS_URL":            {},
-	"NATS_USER":           {},
-	"NATS_PASSWORD":       {},
+	// A2A_NOTIFY_CONVERSATIONS arms the kanban notifier's report back to the
+	// gateway conversation a card was filed in, on the same route. The
+	// operator renders it exactly when the gateway arms the route.
+	"A2A_NOTIFY_CONVERSATIONS": {},
+	"NATS_URL":                 {},
+	"NATS_USER":                {},
+	"NATS_PASSWORD":            {},
 }
 
 // ReservedVolumeNames defines pod volume names the operator renders itself and
@@ -932,6 +936,12 @@ type DeploymentSpec struct {
 	// +optional
 	CredentialProxy *CredentialProxySpec `json:"credentialProxy,omitempty"`
 
+	// AgentAPIAuth configures the agent-api-auth sidecar in the gateway pod, the
+	// native container that authenticates the agent's API-server calls and also
+	// runs the event watcher and the drift detector.
+	// +optional
+	AgentAPIAuth *AgentAPIAuthSpec `json:"agentAPIAuth,omitempty"`
+
 	// DefaultStorageClassName specifies the default storage class to use for the system and data PVCs.
 	// +optional
 	DefaultStorageClassName *string `json:"defaultStorageClassName,omitempty"`
@@ -977,6 +987,35 @@ type CredentialProxySpec struct {
 	// without bursting sets the limits equal to the requests, so there the
 	// proxy runs at the request and the limit has no effect. With bursting the
 	// declared limits stand.
+	// +optional
+	Resources *corev1.ResourceRequirements `json:"resources,omitempty"`
+}
+
+// AgentAPIAuthSpec configures the agent-api-auth sidecar in the gateway pod.
+type AgentAPIAuthSpec struct {
+	// Resources overrides the agent-api-auth container's requests and limits.
+	// Each key set here replaces the operator's default for that key and the
+	// rest keep their defaults, unlike spec.deployment.resources, which replaces
+	// the agent container's block wholesale: a CR that sets only limits.memory
+	// keeps the default 150m CPU request, 384Mi memory request, 1 CPU limit and
+	// 2Gi ephemeral-storage limit. The container runs the event watcher, the
+	// drift detector and the API authenticator together; the event watcher
+	// reads the memory limit through the Downward API and sets its Go soft
+	// memory limit to half of it, so raising the memory limit is the knob for an
+	// install whose fleet of watched clusters outgrows the 2Gi default (#2648).
+	// Only cpu, memory and ephemeral-storage are accepted, the quantities the
+	// container declares. The operator refuses a request above its limit, a
+	// negative quantity, a zero limit, an unrepresentable byte or CPU count and
+	// claims, because the gateway pod declares no resourceClaims. A refused
+	// override, including an edit of one that was valid, renders the sidecar at
+	// the operator's defaults until it is corrected, and the operator reports
+	// Degraded with reason InvalidAgentAPIAuthResources when no higher-ranked
+	// Degraded cause is present, the agent staying Ready, whether or not the
+	// validating webhook is enabled. Where the webhook is on, it refuses the
+	// edit at apply. The webhook warns when memory per CPU on the requests pair
+	// leaves the band GKE Autopilot admits unchanged, and when a cpu or memory
+	// limit is set without the same key under requests, for the reasons the
+	// credential-proxy field documents.
 	// +optional
 	Resources *corev1.ResourceRequirements `json:"resources,omitempty"`
 }

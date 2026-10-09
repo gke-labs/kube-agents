@@ -42,6 +42,95 @@ spec:
                 deployment:
                   description: Deployment abstracts the Kubernetes Pod/Deployment configuration.
                   properties:
+                    agentAPIAuth:
+                      description: |-
+                        AgentAPIAuth configures the agent-api-auth sidecar in the gateway pod, the
+                        native container that authenticates the agent's API-server calls and also
+                        runs the event watcher and the drift detector.
+                      properties:
+                        resources:
+                          description: |-
+                            Resources overrides the agent-api-auth container's requests and limits.
+                            Each key set here replaces the operator's default for that key and the
+                            rest keep their defaults, unlike spec.deployment.resources, which replaces
+                            the agent container's block wholesale: a CR that sets only limits.memory
+                            keeps the default 150m CPU request, 384Mi memory request, 1 CPU limit and
+                            2Gi ephemeral-storage limit. The container runs the event watcher, the
+                            drift detector and the API authenticator together; the event watcher
+                            reads the memory limit through the Downward API and sets its Go soft
+                            memory limit to half of it, so raising the memory limit is the knob for an
+                            install whose fleet of watched clusters outgrows the 2Gi default (#2648).
+                            Only cpu, memory and ephemeral-storage are accepted, the quantities the
+                            container declares. The operator refuses a request above its limit, a
+                            negative quantity, a zero limit, an unrepresentable byte or CPU count and
+                            claims, because the gateway pod declares no resourceClaims. A refused
+                            override, including an edit of one that was valid, renders the sidecar at
+                            the operator's defaults until it is corrected, and the operator reports
+                            Degraded with reason InvalidAgentAPIAuthResources when no higher-ranked
+                            Degraded cause is present, the agent staying Ready, whether or not the
+                            validating webhook is enabled. Where the webhook is on, it refuses the
+                            edit at apply. The webhook warns when memory per CPU on the requests pair
+                            leaves the band GKE Autopilot admits unchanged, and when a cpu or memory
+                            limit is set without the same key under requests, for the reasons the
+                            credential-proxy field documents.
+                          properties:
+                            claims:
+                              description: |-
+                                Claims lists the names of resources, defined in spec.resourceClaims,
+                                that are used by this container.
+
+                                This field depends on the
+                                DynamicResourceAllocation feature gate.
+
+                                This field is immutable. It can only be set for containers.
+                              items:
+                                description: ResourceClaim references one entry in PodSpec.ResourceClaims.
+                                properties:
+                                  name:
+                                    description: |-
+                                      Name must match the name of one entry in pod.spec.resourceClaims of
+                                      the Pod where this field is used. It makes that resource available
+                                      inside a container.
+                                    type: string
+                                  request:
+                                    description: |-
+                                      Request is the name chosen for a request in the referenced claim.
+                                      If empty, everything from the claim is made available, otherwise
+                                      only the result of this request.
+                                    type: string
+                                required:
+                                  - name
+                                type: object
+                              type: array
+                              x-kubernetes-list-map-keys:
+                                - name
+                              x-kubernetes-list-type: map
+                            limits:
+                              additionalProperties:
+                                anyOf:
+                                  - type: integer
+                                  - type: string
+                                pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                                x-kubernetes-int-or-string: true
+                              description: |-
+                                Limits describes the maximum amount of compute resources allowed.
+                                More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
+                              type: object
+                            requests:
+                              additionalProperties:
+                                anyOf:
+                                  - type: integer
+                                  - type: string
+                                pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                                x-kubernetes-int-or-string: true
+                              description: |-
+                                Requests describes the minimum amount of compute resources required.
+                                If Requests is omitted for a container, it defaults to Limits if that is explicitly specified,
+                                otherwise to an implementation-defined value. Requests cannot exceed Limits.
+                                More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
+                              type: object
+                          type: object
+                      type: object
                     availability:
                       description:
                         Availability configures high availability and scheduling

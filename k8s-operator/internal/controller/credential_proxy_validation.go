@@ -102,20 +102,21 @@ const credentialProxyResourceNameBudget = 128
 // credentialProxyResourcesPath is where the override sits on the CR.
 var credentialProxyResourcesPath = field.NewPath("spec", "deployment", "credentialProxy", "resources")
 
-// credentialProxyResourceNames are the only names the override may carry: the
-// quantities the proxy container declares. Anything else (an extended
-// resource, hugepages, a misspelt name) reaches the API server unchecked here,
-// which refuses several such shapes as Invalid, and the reconciler would read
-// that as an immutable-field change and recreate the proxy.
-var credentialProxyResourceNames = []corev1.ResourceName{corev1.ResourceCPU, corev1.ResourceMemory, corev1.ResourceEphemeralStorage}
+// acceptedContainerResourceNames are the only names an override may carry, for
+// the credential proxy and the agent-api-auth sidecar alike: the quantities a
+// container declares. Anything else (an extended resource, hugepages, a
+// misspelt name) reaches the API server unchecked here, which refuses several
+// such shapes as Invalid, and the reconciler would read that as an
+// immutable-field change and recreate the workload.
+var acceptedContainerResourceNames = []corev1.ResourceName{corev1.ResourceCPU, corev1.ResourceMemory, corev1.ResourceEphemeralStorage}
 
 // byteCountResources are the names whose quantity is a count of bytes, and so
 // has to fit the int64 the Downward API and the kubelet carry it in.
 var byteCountResources = []corev1.ResourceName{corev1.ResourceMemory, corev1.ResourceEphemeralStorage}
 
-// credentialProxyResourcePath is path.side.name with name cut to
+// boundedResourceFieldPath is path.side.name with name cut to
 // credentialProxyResourceNameBudget, marked with credentialProxyRefusalEllipsis.
-func credentialProxyResourcePath(path *field.Path, side string, name corev1.ResourceName) *field.Path {
+func boundedResourceFieldPath(path *field.Path, side string, name corev1.ResourceName) *field.Path {
 	key := string(name)
 	if len(key) > credentialProxyResourceNameBudget {
 		key = truncateToValidUTF8(key, credentialProxyResourceNameBudget-len(credentialProxyRefusalEllipsis)) + credentialProxyRefusalEllipsis
@@ -131,56 +132,54 @@ var maxByteCount = *resource.NewQuantity(math.MaxInt64, resource.BinarySI)
 // which past this wraps (10E reads as 0, 9223372036854775808m as negative).
 var maxCPUMilli = resource.NewMilliQuantity(math.MaxInt64, resource.DecimalSI)
 
-// ValidateCredentialProxyResources checks spec.deployment.credentialProxy.resources
-// on the result the operator renders: its defaults with the CR's keys merged
-// over them (resolveCredentialProxyResources). The admission webhook calls it
-// at apply, and the reconciler calls it before writing the proxy Deployment,
-// so an install that runs without the webhook (the chart's default) refuses
-// the same override rather than rendering it. The refusals:
-//
-//   - claims. The proxy pod declares no resourceClaims, so the key cannot
-//     take effect and the render drops it.
-//   - Any resource name other than cpu, memory and ephemeral-storage
-//     (credentialProxyResourceNames).
-//   - A negative quantity on either side, a zero limit, a byte count beyond
-//     an int64, or a CPU quantity whose millicore value is beyond one. The
-//     API server refuses the first; the second leaves the container nothing;
-//     the third cannot reach the broker as the byte count it reads its limit
-//     as; the fourth the scheduler and kubelet read wrapped, as zero or
-//     negative.
-//   - A memory limit under the floor at which the broker's child memory
-//     budget admits two commands. Below it the broker does not run a smaller
-//     budget: it turns the budget off and admits by the slot cap alone, so a
-//     limit set too low is the unbudgeted exposure, not an error anywhere
-//     else.
-//   - A request above its limit, on any name the merged result carries. The
-//     API server would refuse the Deployment, which the reconciler would read
-//     as an immutable-field change; refusing here puts the error on the field
-//     that has the problem, and names which side is the operator's default
-//     when the CR set only the other one.
-//
-// And two kinds of warning, for GKE Autopilot (the constants above): when
-// the requests pair leaves the memory-per-vCPU band, that Autopilot resizes
-// the pod; and for each of cpu and memory the override sets under limits
-// without the same key under requests, that Autopilot without bursting sets
-// the limit equal to the request, so the limit has no effect there. The
-// second is about shape, not ratio: Autopilot applies the band to requests
-// only, and clamps the limits to them unconditionally. A refused quantity, or
-// either half of a crossed pair, draws neither.
-//
-// Nothing runs when the CR carries no override: the defaults satisfy every
-// check by construction, and the sizing test pins that.
-func ValidateCredentialProxyResources(deployment *agentv1alpha1.DeploymentSpec, path *field.Path) (field.ErrorList, admission.Warnings) {
-	if deployment == nil || deployment.CredentialProxy == nil || deployment.CredentialProxy.Resources == nil {
-		return nil, nil
-	}
-	override := deployment.CredentialProxy.Resources
-	merged := resolveCredentialProxyResources(deployment)
+// containerResourceMessages carries the container-specific text the generic
+// validateContainerResources puts on each refusal and warning, so the
+// credential proxy and the agent-api-auth sidecar share one validator and
+// differ only in wording.
+type containerResourceMessages struct {
+	resourceName           string
+	claims                 string
+	negative               string
+	zeroLimit              string
+	unrepresentableFmt     string
+	unrepresentableCPUFmt  string
+	crossedBesideFmt       string
+	crossedDefLimitFmt     string
+	crossedDefRequestFmt   string
+	requestsBandFmt        string
+	limitWithoutRequestFmt string
+}
+
+// memoryLimitFloor is an optional lower bound on the merged memory limit, with
+// the message for a limit below it. The credential proxy sets one, because its
+// child memory budget needs room to admit two commands; the agent-api-auth
+// sidecar passes nil, because its event watcher derives no admission count from
+// the limit, only a Go soft limit at half of it.
+type memoryLimitFloor struct {
+	bytes   int64
+	message func(limit resource.Quantity) string
+}
+
+// validateContainerResources checks a container's merged requests and limits,
+// the operator's defaults with the CR's keys over them, against the shape the
+// API server, the kubelet and GKE Autopilot accept. The caller passes the
+// accepted resource names, the per-container message set, and an optional
+// memory floor. The refusals: claims (the pods declare none); any name outside
+// accepted; a negative quantity, a zero limit, a byte count beyond an int64,
+// or a CPU quantity whose millicore value is beyond one; a merged memory limit
+// under the floor, when a floor is set; and a request above its limit on any
+// name. The warnings, both for GKE Autopilot: a requests pair outside the
+// memory-per-vCPU band it admits unchanged, and a cpu or memory limit set
+// without the same key under requests, which Autopilot without bursting clamps
+// to the request. A quantity already refused draws no further comparison or
+// warning that would only restate it. The caller returns early when the CR
+// carries no override, so the defaults never reach here.
+func validateContainerResources(override, merged corev1.ResourceRequirements, path *field.Path, accepted []corev1.ResourceName, msgs containerResourceMessages, floor *memoryLimitFloor) (field.ErrorList, admission.Warnings) {
 	var errs field.ErrorList
 	var warnings admission.Warnings
 
 	if len(override.Claims) > 0 {
-		errs = append(errs, field.Forbidden(path.Child(credentialProxyClaimsField), credentialProxyClaimsRefusal))
+		errs = append(errs, field.Forbidden(path.Child(credentialProxyClaimsField), msgs.claims))
 	}
 
 	sides := []struct {
@@ -194,22 +193,22 @@ func ValidateCredentialProxyResources(deployment *agentv1alpha1.DeploymentSpec, 
 	for _, side := range sides {
 		for _, name := range sortedResourceNames(side.list) {
 			quantity := side.list[name]
-			at := credentialProxyResourcePath(path, side.name, name)
-			if !slices.Contains(credentialProxyResourceNames, name) {
-				errs = append(errs, field.Forbidden(at, credentialProxyResourceNameRefusal))
+			at := boundedResourceFieldPath(path, side.name, name)
+			if !slices.Contains(accepted, name) {
+				errs = append(errs, field.Forbidden(at, msgs.resourceName))
 				refused[at.String()] = true
 				continue
 			}
 			var msg string
 			switch {
 			case quantity.Sign() < 0:
-				msg = credentialProxyNegativeRefusal
+				msg = msgs.negative
 			case quantity.IsZero() && side.name == credentialProxyLimitsField:
-				msg = credentialProxyZeroLimitRefusal
+				msg = msgs.zeroLimit
 			case slices.Contains(byteCountResources, name) && quantity.Cmp(maxByteCount) > 0:
-				msg = fmt.Sprintf(credentialProxyUnrepresentableFmt, int64(math.MaxInt64))
+				msg = fmt.Sprintf(msgs.unrepresentableFmt, int64(math.MaxInt64))
 			case name == corev1.ResourceCPU && quantity.Cmp(*maxCPUMilli) > 0:
-				msg = fmt.Sprintf(credentialProxyUnrepresentableCPUFmt, int64(math.MaxInt64))
+				msg = fmt.Sprintf(msgs.unrepresentableCPUFmt, int64(math.MaxInt64))
 			default:
 				continue
 			}
@@ -218,20 +217,20 @@ func ValidateCredentialProxyResources(deployment *agentv1alpha1.DeploymentSpec, 
 		}
 	}
 
-	limitPath := credentialProxyResourcePath(path, credentialProxyLimitsField, corev1.ResourceMemory)
-	limit := merged.Limits[corev1.ResourceMemory]
-	floor := credentialProxyMinimumMemoryLimitBytes(credentialProxyOutputCapBytes)
-	if !refused[limitPath.String()] && limit.CmpInt64(floor) < 0 {
-		errs = append(errs, field.Invalid(limitPath, limit.String(),
-			fmt.Sprintf(credentialProxyFloorRefusalFmt, limit.String(), floor/bytesPerMiB, credentialProxyMinimumAdmittedRequests)))
-		refused[limitPath.String()] = true
+	if floor != nil {
+		limitPath := boundedResourceFieldPath(path, credentialProxyLimitsField, corev1.ResourceMemory)
+		limit := merged.Limits[corev1.ResourceMemory]
+		if !refused[limitPath.String()] && limit.CmpInt64(floor.bytes) < 0 {
+			errs = append(errs, field.Invalid(limitPath, limit.String(), floor.message(limit)))
+			refused[limitPath.String()] = true
+		}
 	}
 
 	for _, name := range sortedResourceNames(merged.Requests) {
 		request := merged.Requests[name]
 		limit, hasLimit := merged.Limits[name]
-		requestPath := credentialProxyResourcePath(path, credentialProxyRequestsField, name)
-		limitPath := credentialProxyResourcePath(path, credentialProxyLimitsField, name)
+		requestPath := boundedResourceFieldPath(path, credentialProxyRequestsField, name)
+		limitPath := boundedResourceFieldPath(path, credentialProxyLimitsField, name)
 		if !hasLimit || refused[requestPath.String()] || refused[limitPath.String()] || request.Cmp(limit) <= 0 {
 			continue
 		}
@@ -245,57 +244,89 @@ func ValidateCredentialProxyResources(deployment *agentv1alpha1.DeploymentSpec, 
 		switch {
 		case overrodeRequest && overrodeLimit:
 			errs = append(errs, field.Invalid(requestPath, request.String(),
-				fmt.Sprintf(credentialProxyCrossedBesideFmt, limit.String(), name)))
+				fmt.Sprintf(msgs.crossedBesideFmt, limit.String(), name)))
 		case overrodeRequest:
 			errs = append(errs, field.Invalid(requestPath, request.String(),
-				fmt.Sprintf(credentialProxyCrossedDefLimitFmt, limit.String(), name, name)))
+				fmt.Sprintf(msgs.crossedDefLimitFmt, limit.String(), name, name)))
 		default:
 			errs = append(errs, field.Invalid(limitPath, limit.String(),
-				fmt.Sprintf(credentialProxyCrossedDefRequestFmt, request.String(), name, name)))
+				fmt.Sprintf(msgs.crossedDefRequestFmt, request.String(), name, name)))
 		}
 	}
 
 	// The band applies to the requests pair only.
 	cpu, hasCPU := merged.Requests[corev1.ResourceCPU]
 	memory, hasMemory := merged.Requests[corev1.ResourceMemory]
-	cpuPath := credentialProxyResourcePath(path, credentialProxyRequestsField, corev1.ResourceCPU)
-	memoryPath := credentialProxyResourcePath(path, credentialProxyRequestsField, corev1.ResourceMemory)
-	// A quantity already refused, alone or as half of a crossed pair, draws
-	// no band warning: the warning would restate the refusal.
+	cpuPath := boundedResourceFieldPath(path, credentialProxyRequestsField, corev1.ResourceCPU)
+	memoryPath := boundedResourceFieldPath(path, credentialProxyRequestsField, corev1.ResourceMemory)
 	if hasCPU && hasMemory && cpu.Sign() > 0 && memory.Sign() > 0 &&
 		!refused[cpuPath.String()] && !refused[memoryPath.String()] {
-		// memory against cpu × each edge, in Quantity arithmetic, which falls
-		// back to arbitrary precision rather than wrapping: memory × 1000 / cpu
-		// in int64 overflows above about 8 PiB.
 		low, high := cpu.DeepCopy(), cpu.DeepCopy()
 		low.Mul(autopilotMinMemoryBytesPerVCPU)
 		high.Mul(autopilotMaxMemoryBytesPerVCPU)
 		if memory.Cmp(low) < 0 || memory.Cmp(high) > 0 {
 			gibPerVCPU := memory.AsApproximateFloat64() / cpu.AsApproximateFloat64() / float64(bytesPerGiB)
-			warnings = append(warnings, fmt.Sprintf(credentialProxyRequestsBandWarningFmt,
+			warnings = append(warnings, fmt.Sprintf(msgs.requestsBandFmt,
 				path.Child(credentialProxyRequestsField), memory.String(), cpu.String(), gibPerVCPU,
 				autopilotMinMemoryBytesPerVCPU/bytesPerGiB, float64(autopilotMaxMemoryBytesPerVCPU)/float64(bytesPerGiB)))
 		}
 	}
 
 	// A limit the override sets without its request: Autopilot without
-	// bursting replaces it with the request. One equal to the request it
-	// would be replaced by changes nothing, and is not named.
+	// bursting replaces it with the request.
 	for _, name := range []corev1.ResourceName{corev1.ResourceCPU, corev1.ResourceMemory} {
 		limit, hasLimit := override.Limits[name]
 		if _, hasRequest := override.Requests[name]; !hasLimit || hasRequest {
 			continue
 		}
-		limitPath := credentialProxyResourcePath(path, credentialProxyLimitsField, name)
+		limitPath := boundedResourceFieldPath(path, credentialProxyLimitsField, name)
 		request := merged.Requests[name]
 		if refused[limitPath.String()] || limit.Cmp(request) == 0 {
 			continue
 		}
 		requestKey := credentialProxyRequestsField + credentialProxyKeySeparator + string(name)
-		warnings = append(warnings, fmt.Sprintf(credentialProxyLimitWithoutRequestFmt,
+		warnings = append(warnings, fmt.Sprintf(msgs.limitWithoutRequestFmt,
 			limitPath, requestKey, request.String(), requestKey))
 	}
 	return errs, warnings
+}
+
+// credentialProxyMessages is the credential-proxy container's wording for
+// validateContainerResources.
+var credentialProxyMessages = containerResourceMessages{
+	resourceName:           credentialProxyResourceNameRefusal,
+	claims:                 credentialProxyClaimsRefusal,
+	negative:               credentialProxyNegativeRefusal,
+	zeroLimit:              credentialProxyZeroLimitRefusal,
+	unrepresentableFmt:     credentialProxyUnrepresentableFmt,
+	unrepresentableCPUFmt:  credentialProxyUnrepresentableCPUFmt,
+	crossedBesideFmt:       credentialProxyCrossedBesideFmt,
+	crossedDefLimitFmt:     credentialProxyCrossedDefLimitFmt,
+	crossedDefRequestFmt:   credentialProxyCrossedDefRequestFmt,
+	requestsBandFmt:        credentialProxyRequestsBandWarningFmt,
+	limitWithoutRequestFmt: credentialProxyLimitWithoutRequestFmt,
+}
+
+// ValidateCredentialProxyResources checks spec.deployment.credentialProxy.resources
+// on the result the operator renders (resolveCredentialProxyResources). The
+// admission webhook calls it at apply, and the reconciler calls it before
+// writing the proxy Deployment, so an install without the webhook refuses the
+// same override rather than rendering it. It adds one refusal to the shared
+// validateContainerResources: a memory limit under the floor at which the
+// broker's child memory budget admits two commands.
+func ValidateCredentialProxyResources(deployment *agentv1alpha1.DeploymentSpec, path *field.Path) (field.ErrorList, admission.Warnings) {
+	if deployment == nil || deployment.CredentialProxy == nil || deployment.CredentialProxy.Resources == nil {
+		return nil, nil
+	}
+	floorBytes := credentialProxyMinimumMemoryLimitBytes(credentialProxyOutputCapBytes)
+	floor := &memoryLimitFloor{
+		bytes: floorBytes,
+		message: func(limit resource.Quantity) string {
+			return fmt.Sprintf(credentialProxyFloorRefusalFmt, limit.String(), floorBytes/bytesPerMiB, credentialProxyMinimumAdmittedRequests)
+		},
+	}
+	return validateContainerResources(*deployment.CredentialProxy.Resources, resolveCredentialProxyResources(deployment),
+		path, acceptedContainerResourceNames, credentialProxyMessages, floor)
 }
 
 // sortedResourceNames is list's keys in order, so the errors a CR gets back
@@ -321,7 +352,7 @@ func credentialProxyResourcesRefusal(agent *agentv1alpha1.PlatformAgent) (string
 
 // boundCredentialProxyRefusal is errs' first refusal with the count of the
 // rest, cut to credentialProxyRefusalMessageBudget, or "" for none. The cut is
-// a backstop: credentialProxyResourcePath already bounds the one part of a
+// a backstop: boundedResourceFieldPath already bounds the one part of a
 // refusal the author controls the length of.
 func boundCredentialProxyRefusal(errs field.ErrorList) string {
 	if len(errs) == 0 {

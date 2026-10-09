@@ -244,6 +244,8 @@ func configFromEnv(log *slog.Logger) (hermesbridge.Config, error) {
 		APIURL:         envOr("BRIDGE_API_URL", hermesbridge.DefaultAPIURL),
 		APIModel:       envOr("BRIDGE_API_MODEL", hermesbridge.DefaultAPIModel),
 		APIKey:         os.Getenv(apiServerKeyEnv),
+		RouteURL:       envOr("BRIDGE_ROUTE_URL", hermesbridge.DefaultRouteURL),
+		RouteKey:       os.Getenv(hermesbridge.RouteKeyEnv),
 		ActivitySecret: os.Getenv(hermesbridge.ActivitySecretEnv),
 		Logger:         log,
 		// Unset means required: a submission with no capability is

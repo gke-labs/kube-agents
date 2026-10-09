@@ -49,7 +49,7 @@ terraform {
 
 locals {
   marker_name = ".bootstrap_greet_eval-${var.case_suffix}"
-  request     = jsonencode({ phrase = var.phrase, variant = var.variant })
+  request     = jsonencode({ phrase = var.phrase, variant = var.variant, home_channel_set = var.home_channel_set })
 }
 
 resource "null_resource" "greet_request" {

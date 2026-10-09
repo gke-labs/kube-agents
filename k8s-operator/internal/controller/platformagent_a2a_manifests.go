@@ -546,6 +546,13 @@ const (
 	// `hermes send` (agents/platform/scripts/chat_notify.py).
 	a2aNotifyPlatformEnvVar = "A2A_NOTIFY_PLATFORM"
 	a2aNotifyPlatformGchat  = "google_chat"
+	// The kanban notifier's half (deploy/docker/patches/kanban_chat_notify.py,
+	// and kanban_event_routing.py, which addresses a card to the conversation):
+	// the platform whose gateway conversations a card reports back to. Its own
+	// variable because the route serves conversations with no home channel,
+	// while A2A_NOTIFY_PLATFORM sends every proactive post to the home channel
+	// and so needs one.
+	a2aNotifyConversationsEnvVar = "A2A_NOTIFY_CONVERSATIONS"
 	// The prefix of a Chat space resource name.
 	a2aGchatSpacePrefix      = "spaces/"
 	a2aChatDisplayModeEnvVar = "A2A_CHAT_DISPLAY_MODE"
@@ -1185,11 +1192,22 @@ func a2aAgentDoorEnabled() bool {
 	return os.Getenv(a2aAgentDoorEnvVar) == "true"
 }
 
+// a2aGchatNotifyArmed reports whether the gateway arms its chat.notify route
+// for this install's Google Chat: Chat consumed by the next stack, and a home
+// channel that is either unset (the route then serves conversation requests,
+// a kanban card's report back to the conversation it came from) or a Chat
+// space name (home posts too). A malformed one leaves the route unarmed
+// (a2a/gateway/notify.go, NewGchatNotifier).
+func a2aGchatNotifyArmed(agent *agentv1alpha1.PlatformAgent) bool {
+	if !a2aChatArmed(agent) {
+		return false
+	}
+	return strings.TrimSpace(agent.Spec.Integration.GoogleChat.HomeChannel) == "" || a2aGchatHomeSpace(agent) != ""
+}
+
 // a2aGchatHomeSpace is googleChat.homeChannel trimmed, when it is a Chat space
-// name ("spaces/<id>", nothing nested), and "" otherwise. It is the condition
-// the gateway arms its chat.notify route on (a2a/gateway/notify.go,
-// NewGchatNotifier), so the agent is told to route proactive posts there
-// exactly when something will answer them.
+// name ("spaces/<id>", nothing nested), and "" otherwise: the home channel the
+// gateway's chat.notify route posts proactive messages to.
 func a2aGchatHomeSpace(agent *agentv1alpha1.PlatformAgent) string {
 	if !googleChatEnabled(agent) {
 		return ""
@@ -4503,8 +4521,9 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 			{Name: a2aGchatTokenPathEnvVar, Value: a2aGchatTokenPath},
 		}
 		// Proactive posts land here (the chat.notify route). Unset leaves
-		// the route unarmed, which is what an install with no home channel
-		// had under today too: nowhere to post.
+		// the route serving a kanban card's report back to its conversation
+		// only: proactive posts have nowhere to go, as on today with no home
+		// channel.
 		if home := strings.TrimSpace(gchat.HomeChannel); home != "" {
 			chatEnv = append(chatEnv, corev1.EnvVar{Name: a2aGchatHomeChannelEnvVar, Value: home})
 		}

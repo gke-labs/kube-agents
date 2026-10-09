@@ -87,7 +87,7 @@ func serveBytes(t *testing.T, n *Notifier, body []byte) lib.NotifyReply {
 }
 
 func TestNotifyRefusesAHomeThatIsNotASpace(t *testing.T) {
-	for _, home := range []string{"", "spaces/", "spaces/A/threads/B", "AAAA", "users/123"} {
+	for _, home := range []string{"spaces/", "spaces/A/threads/B", "AAAA", "users/123"} {
 		if _, err := NewGchatNotifier(&fakeNotifyPoster{}, home, nil); err == nil {
 			t.Errorf("home %q accepted; want refused at start", home)
 		}
@@ -520,5 +520,125 @@ func TestNotifyRequestCarriesTheWait(t *testing.T) {
 	job := <-n.jobs
 	if d := job.deadline.Sub(before); d < 59*time.Second || d > 61*time.Second {
 		t.Fatalf("deadline is %s after receipt, want the request's 60s", d)
+	}
+}
+
+type fakeConversations struct {
+	mu       sync.Mutex
+	contexts map[string]string
+	err      error
+	posts    []notifyPost
+}
+
+func (f *fakeConversations) ConversationContext(_ context.Context, key string) (string, error) {
+	return f.contexts[key], f.err
+}
+
+func (f *fakeConversations) Post(conversation, text string) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.posts = append(f.posts, notifyPost{thread: conversation, text: text})
+	return conversation + "/messages/c" + string(rune('0'+len(f.posts))), nil
+}
+
+const (
+	testConversation = "gchat:spaces/OTHER/threads/T7"
+	testContext      = "ctx-0011aabb"
+)
+
+// A request aimed at a conversation posts there, through the gateway's own
+// adapter, when the conversation's session record carries the request's
+// context id: the card's answer goes back to the thread that asked, which
+// need not be in the home space.
+func TestNotifyPostsIntoALiveConversationWithItsContext(t *testing.T) {
+	conv := &fakeConversations{contexts: map[string]string{testConversation: testContext}}
+	home := &fakeNotifyPoster{}
+	n := newTestNotifier(t, home)
+	n.SetConversations(conv)
+	got := serveJSON(t, n, lib.NotifyRequest{Text: "3 nodes", Conversation: testConversation, ContextID: testContext})
+	if got.Error != "" || got.MessageID == "" || got.ThreadID != testConversation {
+		t.Fatalf("reply = %+v, want a post into the conversation", got)
+	}
+	if len(conv.posts) != 1 || conv.posts[0] != (notifyPost{thread: testConversation, text: "3 nodes"}) {
+		t.Fatalf("conversation posts = %+v", conv.posts)
+	}
+	if len(home.all()) != 0 {
+		t.Fatalf("home posts = %+v, want none", home.all())
+	}
+}
+
+// Anything but a live conversation with that context is refused before any
+// post, with one refusal whatever the reason.
+func TestNotifyRefusesAConversationItCannotMatch(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		conv *fakeConversations
+		req  lib.NotifyRequest
+		want string
+	}{
+		{"another conversation's context", &fakeConversations{contexts: map[string]string{testConversation: "ctx-other"}},
+			lib.NotifyRequest{Conversation: testConversation, ContextID: testContext}, notifyConversationRefused},
+		{"no session record", &fakeConversations{contexts: map[string]string{}},
+			lib.NotifyRequest{Conversation: testConversation, ContextID: testContext}, notifyConversationRefused},
+		{"an unreadable record", &fakeConversations{err: errors.New("kv down")},
+			lib.NotifyRequest{Conversation: testConversation, ContextID: testContext}, notifyConversationRefused},
+		{"another backend's conversation", &fakeConversations{contexts: map[string]string{"slack:C1/1.2": testContext}},
+			lib.NotifyRequest{Conversation: "slack:C1/1.2", ContextID: testContext}, "not on this route's backend"},
+		{"no context id", &fakeConversations{contexts: map[string]string{testConversation: ""}},
+			lib.NotifyRequest{Conversation: testConversation}, "needs both"},
+		{"a thread as well", &fakeConversations{contexts: map[string]string{testConversation: testContext}},
+			lib.NotifyRequest{Conversation: testConversation, ContextID: testContext, Thread: testHome + "/threads/T"}, "not both"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			n := newTestNotifier(t, &fakeNotifyPoster{})
+			n.SetConversations(tc.conv)
+			tc.req.Text = "report"
+			got := serveJSON(t, n, tc.req)
+			if !strings.Contains(got.Error, tc.want) || got.MessageID != "" {
+				t.Fatalf("reply = %+v, want a refusal containing %q", got, tc.want)
+			}
+			if len(tc.conv.posts) != 0 {
+				t.Fatalf("posted %+v", tc.conv.posts)
+			}
+		})
+	}
+	n := newTestNotifier(t, &fakeNotifyPoster{})
+	if got := serveJSON(t, n, lib.NotifyRequest{Text: "x", Conversation: testConversation, ContextID: testContext}); got.Error != notifyNoConversations {
+		t.Fatalf("reply = %+v, want the not-armed refusal from a notifier without conversations", got)
+	}
+}
+
+// With no home channel the route serves conversation requests and refuses
+// a home post.
+func TestNotifyWithNoHomeServesConversationsOnly(t *testing.T) {
+	n, err := NewGchatNotifier(&fakeNotifyPoster{}, "", nil)
+	if err != nil {
+		t.Fatalf("NewGchatNotifier with no home: %v", err)
+	}
+	conv := &fakeConversations{contexts: map[string]string{testConversation: testContext}}
+	n.SetConversations(conv)
+	if got := serveJSON(t, n, lib.NotifyRequest{Text: "alert"}); got.Error != notifyNoHome {
+		t.Fatalf("home post reply = %+v, want refused", got)
+	}
+	if got := serveJSON(t, n, lib.NotifyRequest{Text: "3 nodes", Conversation: testConversation, ContextID: testContext}); got.Error != "" {
+		t.Fatalf("conversation post reply = %+v, want posted", got)
+	}
+}
+
+// The gateway's side reads the session record's context id from its
+// registry, and "" for a conversation it holds no record for.
+func TestTheGatewaysConversationsReadTheSessionRecord(t *testing.T) {
+	r := startRig(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := r.g.reg.Create(ctx, &SessionRecord{Key: testConversation, ContextID: testContext}); err != nil {
+		t.Fatal(err)
+	}
+	conv := r.g.Conversations(r.adapter)
+	if got, err := conv.ConversationContext(ctx, testConversation); err != nil || got != testContext {
+		t.Fatalf("ConversationContext = %q, %v; want %q", got, err, testContext)
+	}
+	if got, err := conv.ConversationContext(ctx, "gchat:spaces/NONE/threads/X"); err != nil || got != "" {
+		t.Fatalf("ConversationContext(unknown) = %q, %v; want empty", got, err)
 	}
 }
