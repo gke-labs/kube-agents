@@ -24,7 +24,7 @@ The loop ends at the repo. A watchdog's findings reach you as the ledger issue a
 
 ## What runs on its own
 
-Ten fleet audits run enabled, each on its own schedule and each maintaining a single GitHub issue as its standing report:
+Ten fleet audits run enabled, each on its own schedule and each maintaining a single GitHub issue as its standing report where a repository is linked; the upgrade retrospective also keeps its report on the agent's volume, which is its record without one:
 
 - **Security & RBAC posture** (daily) — privileged and host-namespace containers, over-privileged RBAC bindings, namespaces with no `NetworkPolicy`, Workload Identity and metadata-concealment gaps.
 - **Workload reliability** (daily) — missing resource requests, drain-blocking or absent PodDisruptionBudgets, unscalable Deployments, zone-pinned scheduling, missing probes.
@@ -35,7 +35,7 @@ Ten fleet audits run enabled, each on its own schedule and each maintaining a si
 - **Capacity & stockout prevention** (daily) — capacity obtainability, ComputeClass resilience, and single-zone stockouts.
 - **GCP networking fabric** (daily) — subnet IP exhaustion, Cloud NAT, PSC, MTU, Cloud Armor, firewall rules opening management ports to the internet.
 - **GCE compute fleet** (daily) — Compute Engine VMs and MIGs: startup-script failures, stalled MIG convergence, sole-tenant headroom, orphaned snapshots.
-- **Upgrade retrospective** (Sunday evening, and once at onboarding) — what the weekend's GKE upgrades did: which operations ran on each cluster, what stayed down, stuck or restarting afterwards and which of the twenty catalogued upgrade failures it matches, the fix for this object before the next upgrade, and a guard the next readiness report carries. Reported in chat one line per reviewed cluster; the ledger issue is the one part that needs a GitHub repository.
+- **Upgrade retrospective** (Sunday evening, and once at onboarding) — what the weekend's GKE upgrades did: which operations ran on each cluster, what stayed down, stuck or restarting afterwards and which of the twenty catalogued upgrade failures it matches, the fix for this object before the next upgrade, and a guard recorded in its store for the readiness watch to read once it ships. Reported in chat one line per reviewed cluster; the ledger issue is the one part that needs a GitHub repository.
 
 Alongside them, `github-repo-watcher` polls the target repo every 10 minutes and hands what it finds to one of two skills. An unaddressed open issue goes to `github-issue-resolver`, which triages it within tight guardrails — the machine-owned ledgers, audit ledgers carrying `agent:audit` and the chat-delivery ledger carrying `agent:delivery-watch`, are excluded from the poll. A review request on one of the agent's own pull requests — a comment that _begins_ with `/agent` or with an @-mention, from someone with write access — goes to [`pr-conversation`](/kube-agents/concepts/declarative-workflow/#answering-a-reviewer-on-the-pr), which answers in the thread or amends the branch under review. The poll itself runs no model: a tick with nothing to do costs an API call and no tokens.
 

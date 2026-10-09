@@ -1,7 +1,12 @@
 # Upgrade retrospective: what the last upgrade did, and the fix set up before the next one
 
-**Status:** design. Nothing here is built on `main`. The collector it specifies is the first of
-three changes; the schedule and the agent's part follow it. The
+**Status:** the collector (work item 1, §5) and the weekly job (work item 2) are on `main`:
+`agents/platform/skills/fleet-audit/scripts/upgrade_retrospective.py`; the `upgrade-retrospective`
+roster entry and its SOP; the first-run stage's start of it, with or without a repository; the
+on-demand route; and the stream's `AUDITS` and `COLLECTOR_AUDITS` entries. Not built: the
+`upgrade-retrospective-after-upgrade` roster entry and `upgrade_retrospective_watch.py` (§3.1, and
+the SOP's after-upgrade route with them), the readiness watch's `guards.json` reader (§3.5), and
+the proof (work item 3). The
 [upgrade failure catalogue](upgrade-failure-catalogue.md) is the list of failures it classifies
 against, and the [readiness checks](upgrade-readiness-checks.md) are the before-the-upgrade half it
 feeds.
@@ -117,11 +122,13 @@ stays a user's "apply", through the route the agent uses for every other propose
 The [readiness checks](upgrade-readiness-checks.md) end with "a diff after the upgrade", and the
 [catalogue](upgrade-failure-catalogue.md) says post-upgrade detection is one mechanism for every
 entry: watch the operation, then compare pod health against the same measurements taken before.
-Neither is built. The reproductions behind the catalogue measured why it matters: on a surge
+The diff after the upgrade now runs as the `upgrade-retrospective` job; the guards reader is not
+built. The reproductions behind the catalogue measured why it matters: on a surge
 upgrade GKE refused the eviction a budget protected for an hour, force-killed the pod, and reported
 the operation `DONE` two minutes later while the replacement was still Pending. The symptoms of the
 twenty failures sit in pod status, node conditions and `Warning` events that nothing scheduled
-reads, and what one cluster's upgrade broke never reaches the next cluster's readiness report.
+read until the retrospective, and what one cluster's upgrade broke never reaches the next cluster's
+readiness report.
 
 One thing on the roster and one design shape this one. The fleet audits pair a deterministic
 collector (`collect.py`, `patch_readiness.py`) with a governance SOP the Platform Agent follows,
