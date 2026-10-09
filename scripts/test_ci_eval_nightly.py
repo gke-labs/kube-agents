@@ -257,10 +257,10 @@ class GitLabLaneTest(unittest.TestCase):
         result = load_matrix({"EVAL_FORGE": "gitlab", "EVAL_TIER": "presubmit"})
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(lines_tagged(result, "TASK"), self.lane_entries())
-        self.assertIn("EVAL_FORGE=gitlab: the GitLab lane runs 2 of the presubmit's cases", result.stdout)
-        self.assertIn("left out: reliability-pdb-probe,", result.stdout)
-        # Both seats are held out, so no roster case is in the lane: the
-        # export is empty by design and the log says rung 4 is disarmed.
+        self.assertIn("EVAL_FORGE=gitlab: the GitLab lane runs 3 case(s)", result.stdout)
+        self.assertIn("presubmit cases left out: reliability-pdb-probe,", result.stdout)
+        # No seat is a roster case (two are nightly cases, one held out), so
+        # the export is empty by design and the log says rung 4 is disarmed.
         self.assertEqual(lines_tagged(result, "ROSTER"), [""])
         self.assertIn("rung 4 is disarmed on this lane", result.stdout)
 
@@ -298,7 +298,7 @@ class GitLabLaneTest(unittest.TestCase):
             (hack / "eval" / "inject-lane-exclusions.txt").write_text("# #2039: a scratch exclusion for the test\npdb-remediation-pr\n")
             result = load_matrix_through_the_lane_step({"EVAL_FORGE": "gitlab", "AGENT_TRANSPORT": "inject"}, hack_dir=hack)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(lines_tagged(result, "TASK"), ["./tasks/compliance-rbac-overgrant/task.yaml"])
+        self.assertEqual(lines_tagged(result, "TASK"), ["./tasks/vcs-spent-branch-reuse/task.yaml", "./tasks/vcs-review-feedback-read-back/task.yaml"])
         self.assertNotIn("excluded on the inject lane", result.stderr)
         self.assertIn("rung 4 is disarmed on this lane", result.stdout)
 
@@ -335,13 +335,22 @@ class GitLabLaneTest(unittest.TestCase):
         for needle in needles:
             self.assertIn(needle, result.stderr)
 
-    def test_an_entry_outside_the_presubmit_stops_the_job(self):
-        self.refused("./tasks/obtainability-planted-pdb/task.yaml\n", "gitlab-presubmit-cases.txt", "obtainability-planted-pdb", "subset of the presubmit")
+    def test_a_nightly_case_is_a_valid_lane_entry_and_an_unregistered_one_is_not(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            hack = pathlib.Path(tmp) / "hack"
+            shutil.copytree(HACK_DIR / "eval", hack / "eval")
+            (hack / "eval" / "gitlab-presubmit-cases.txt").write_text("./tasks/obtainability-planted-pdb/task.yaml\n")
+            result = load_matrix({"EVAL_FORGE": "gitlab"}, hack_dir=hack)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(lines_tagged(result, "TASK"), ["./tasks/obtainability-planted-pdb/task.yaml"])
+        # A real case directory that neither roster file names is not registered.
+        unregistered = next(d.name for d in sorted(TASKS_DIR.iterdir()) if d.is_dir() and d.name not in eval_rosters.presubmit_cases() + eval_rosters.nightly_cases())
+        self.refused(f"./tasks/{unregistered}/task.yaml\n", "gitlab-presubmit-cases.txt", unregistered, "registered cases only")
 
     def test_an_empty_file_a_missing_file_and_a_bad_path_stop_the_job(self):
         self.refused("# nothing\n", "gitlab-presubmit-cases.txt names no case")
         self.refused(None, "gitlab-presubmit-cases.txt is missing")
-        self.refused("./tasks/no-such-case/task.yaml\n", "gitlab-presubmit-cases.txt", "subset of the presubmit")
+        self.refused("./tasks/no-such-case/task.yaml\n", "gitlab-presubmit-cases.txt", "registered cases only")
 
     def test_the_lane_file_does_not_change_the_github_run_when_broken(self):
         # The file is read only under gitlab, so a GitHub presubmit is not

@@ -2,8 +2,8 @@
 """The ``gitlab`` block of brief.json: the GitLab lane's last runs.
 
 The lane (``pull-kube-agents-smoke-test-gitlab``, kube-agents#2394) is the
-forge-grading subset of the presubmit's matrix driven against a pool
-project's GitLab repository. Its
+forge-grading cases of the catalogue driven against a pool project's
+GitLab repository. Its
 runs carry ``tier: gitlab`` (tiers.py) and so reach no gate verdict, no case
 history and no digest number; this block is where they are seen at all: the
 newest ``RUNS_LISTED`` runs with Prow's result, the eval's own verdict, how

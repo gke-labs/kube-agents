@@ -6,11 +6,10 @@
 # this file leaves out, or the nightly-only cases, against GitLab.
 #
 # One `./tasks/<id>/task.yaml` path per line, relative to bench/. `#` starts
-# a comment, blank lines are skipped. Every entry must also be a line in
-# presubmit-cases.txt: the lane is a subset of the presubmit, so a case earns
-# its presubmit seat first and its GitLab seat second. The script refuses to
-# start on an entry outside the presubmit, on a path with no case behind it,
-# and on a file that names nothing.
+# a comment, blank lines are skipped. Every entry must be a registered case,
+# a line in presubmit-cases.txt or nightly-cases.txt: the lane picks from the
+# catalogue, it does not register. The script refuses to start on an entry
+# in neither file and on a file that names nothing.
 #
 # WHAT BELONGS HERE. Cases that grade the forge: a `pull_request_opened` or
 # `pull_request_diff_contains` check (a merge request on GitLab) or a
@@ -32,19 +31,30 @@
 # not what can red a pull request. It moves under the eval-crew rule in
 # hack/OWNERS the day the lane gates.
 #
-# BUDGET. Two cases, six units at EVAL_REPETITIONS of 3, each case's three
-# serialized on its task lock, and the two cases back to back, not side by
-# side: pdb-remediation-pr requests a pull request, so its units run in the
-# fan-out's second phase after every other unit (unit_phase in the script).
-# compliance-rbac-overgrant (hinted 1000s) then pdb-remediation-pr (hinted
-# 1250s) is ~115 minutes of units at the hints and up to ~200 at their p90,
-# plus ~16 minutes of lease, build and deploy: inside the job's 360-minute
-# deadline, and beside the GitHub presubmit's ~136-minute median rather
-# than under it. One case here would be the lighter lane.
+# BUDGET. Three cases, nine units at EVAL_REPETITIONS of 3, every one in the
+# fan-out's second phase (each requests a merge request; unit_phase in the
+# script), so they run one at a time: pdb-remediation-pr (hinted 1250s),
+# vcs-spent-branch-reuse (1000s) and vcs-review-feedback-read-back (700s)
+# are ~150 minutes of units at the hints, plus ~16 minutes of lease, build
+# and deploy: inside the job's 360-minute deadline, and longer than the
+# GitHub presubmit's ~136-minute median. Dropping pdb-remediation-pr is the
+# lighter lane, if the lane ever runs on every pull request.
+#
+# WHY THESE. The two vcs cases exist to exercise the forge (a branch reused
+# after its first proposal closed; a second revision read back before it is
+# described) and pass 100 % and 92 % on the GitHub nightly over 30 days, so
+# a red here points at GitLab, not at the agent. No ledger case is in the
+# lane: none passes three repetitions anywhere today (the compliance canary
+# publishes a ledger in about half its runs on either forge, the agent's
+# doing), so the ledger path is proven by the harness (the per-repetition
+# ledger reset, and a harness-side probe to come), not by a case.
 
-# The merge-request path: the remediation lands as a merge request on the
-# project's GitLab repository, never on the cluster (pull_request_opened).
+# A second proposal under a branch name whose first proposal was closed:
+# branch lookup, delete, push and open on the forge (pull_request_opened).
+./tasks/vcs-spent-branch-reuse/task.yaml
+# A second revision on an existing merge request, read back from the forge
+# before it is described (pull_request_opened).
+./tasks/vcs-review-feedback-read-back/task.yaml
+# The remediation path: the fix lands as a merge request on the project's
+# GitLab repository, never on the cluster (pull_request_opened).
 ./tasks/pdb-remediation-pr/task.yaml
-# The ledger path: the audit's findings land in a ledger issue on the
-# GitLab project and the lease-time reset retires it (ledger_issue_contains).
-./tasks/compliance-rbac-overgrant/task.yaml

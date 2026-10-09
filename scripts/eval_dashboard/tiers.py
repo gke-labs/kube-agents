@@ -7,8 +7,8 @@ The collector records three kinds of run under one schema (SCHEMA.md,
 ``ci-kube-agents-eval-nightly`` (and of ``ci-kube-agents-eval-nightly-writers``
 when a night is split across two jobs, ``nightly.py``) against ``main`` with
 no pull request; and the GitLab lane's, one per build of
-``pull-kube-agents-smoke-test-gitlab``, the forge-grading subset of the
-presubmit matrix driven against a pool project's GitLab repository
+``pull-kube-agents-smoke-test-gitlab``, the forge-grading cases of the
+catalogue driven against a pool project's GitLab repository
 (``EVAL_FORGE=gitlab``, kube-agents#2394). Every
 gate verdict -- the health adjudicator's rules, the "is this red mine?"
 classification, the Brief's runs list -- is a statement about the presubmit,

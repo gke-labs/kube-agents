@@ -5,7 +5,7 @@ Four files hold what the eval gate runs and what blocks (#1546, 2026-09-15):
 - ``hack/eval/presubmit-cases.txt`` -- the presubmit matrix, one
   ``./tasks/<id>/task.yaml`` path per line (the script's ``TASKS``);
 - ``hack/eval/gitlab-presubmit-cases.txt`` -- what the GitLab lane runs in
-  its place under ``EVAL_FORGE=gitlab`` (kube-agents#2394), a subset of it;
+  its place under ``EVAL_FORGE=gitlab`` (kube-agents#2394), registered cases;
 - ``hack/eval/nightly-cases.txt`` -- what ``EVAL_TIER=nightly`` appends
   (``NIGHTLY_TASKS``);
 - ``hack/eval/blocking-roster.txt`` -- one case id per line, the default of

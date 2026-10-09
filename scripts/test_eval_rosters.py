@@ -424,20 +424,20 @@ def positive_check_types(node, negations: int = 0) -> set:
 
 class GitLabLaneTest(unittest.TestCase):
     """hack/eval/gitlab-presubmit-cases.txt: what the GitLab lane's presubmit
-    runs (kube-agents#2394). A subset of the presubmit, every entry a case
-    that grades the forge."""
+    runs (kube-agents#2394). Registered cases only, every entry a case that
+    grades the forge."""
 
     FORGE_CHECKS = {"pull_request_opened", "pull_request_diff_contains", "ledger_issue_contains"}
-    PINNED = ["pdb-remediation-pr", "compliance-rbac-overgrant"]
+    PINNED = ["vcs-spent-branch-reuse", "vcs-review-feedback-read-back", "pdb-remediation-pr"]
 
     def test_the_file_is_the_pinned_set(self):
         self.assertEqual(eval_rosters.gitlab_presubmit_cases(), self.PINNED)
 
-    def test_the_lane_is_a_subset_of_the_presubmit(self):
-        presubmit = eval_rosters.presubmit_cases()
+    def test_every_lane_case_is_registered(self):
+        registered = eval_rosters.presubmit_cases() + eval_rosters.nightly_cases()
         for case in eval_rosters.gitlab_presubmit_cases():
             with self.subTest(case=case):
-                self.assertIn(case, presubmit, "a GitLab seat comes after a presubmit seat")
+                self.assertIn(case, registered, "the lane picks from the catalogue, it does not register")
 
     def test_every_lane_case_grades_the_forge(self):
         import yaml

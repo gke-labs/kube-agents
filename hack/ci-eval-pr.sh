@@ -1782,8 +1782,8 @@ done
 EVAL_TIER="${EVAL_TIER:-presubmit}"
 # The GitLab lane (kube-agents#2394): under EVAL_FORGE=gitlab a presubmit
 # runs hack/eval/gitlab-presubmit-cases.txt instead of the presubmit file --
-# the cases that grade the forge, a subset of the presubmit by construction,
-# sized by that file's BUDGET note against the job's 360-minute deadline. A
+# the cases that grade the forge, each a registered case (presubmit or nightly
+# file), sized by that file's BUDGET note against the job's 360-minute deadline. A
 # nightly under gitlab would be the whole catalogue, as on GitHub; no such
 # periodic exists yet (#2832). The presubmit
 # names the lane left out are kept in GITLAB_LANE_DROPPED for the
@@ -1801,11 +1801,13 @@ case "${EVAL_TIER}" in
         echo "ERROR: ${GITLAB_PRESUBMIT_CASES_FILE} names no case; the GitLab lane would run nothing and report green." >&2
         exit 1
       fi
-      # Every entry must be a presubmit entry, which check_case_entries has
-      # already proven to be a case path with a directory behind it.
+      # Every entry must be a registered case, a presubmit or nightly entry,
+      # which check_case_entries has already proven to be a case path with a
+      # directory behind it; the lane picks from the catalogue, it does not
+      # register.
       for ENTRY in "${GITLAB_LANE_TASKS[@]}"; do
-        if ! grep -qxF -- "${ENTRY}" <<< "${PRESUBMIT_ENTRIES}"; then
-          echo "ERROR: ${GITLAB_PRESUBMIT_CASES_FILE}: '${ENTRY}' is not in ${PRESUBMIT_CASES_FILE}; the GitLab lane is a subset of the presubmit." >&2
+        if ! printf '%s\n' "${PRESUBMIT_ENTRIES}" "${NIGHTLY_ENTRIES}" | grep -qxF -- "${ENTRY}"; then
+          echo "ERROR: ${GITLAB_PRESUBMIT_CASES_FILE}: '${ENTRY}' is in neither ${PRESUBMIT_CASES_FILE} nor ${NIGHTLY_CASES_FILE}; the GitLab lane runs registered cases only." >&2
           exit 1
         fi
       done
@@ -1816,7 +1818,7 @@ case "${EVAL_TIER}" in
         fi
       done
       TASKS=("${GITLAB_LANE_TASKS[@]}")
-      echo "EVAL_FORGE=gitlab: the GitLab lane runs ${#TASKS[@]} of the presubmit's cases (${EVAL_GITLAB_PRESUBMIT_CASES_FILE}); left out: $(printf '%s' "${GITLAB_LANE_DROPPED}" | paste -sd, -)"
+      echo "EVAL_FORGE=gitlab: the GitLab lane runs ${#TASKS[@]} case(s) (${EVAL_GITLAB_PRESUBMIT_CASES_FILE}); presubmit cases left out: $(printf '%s' "${GITLAB_LANE_DROPPED}" | paste -sd, -)"
     fi
     ;;
   nightly)
