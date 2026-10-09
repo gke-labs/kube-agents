@@ -1268,6 +1268,17 @@ def _readiness_cause(readiness: dict, *, budget_applies: bool = True, skew_appli
     return None
 
 
+def _applicable_causes(lag: str) -> tuple[bool, bool]:
+    """`(budget_applies, skew_applies)`: which causes can block the upgrade a
+    cluster with this lag is due. A pool ahead of its control plane: the
+    control plane's move is due, which evicts no pod, so a budget cannot
+    hold it and a skew ceiling can. A pool behind a current control plane:
+    the pool's move is due, which a budget can hold and the ceiling does
+    not refuse (it is what closes the skew, and 3.2 already carries the
+    pool). A behind control plane: both apply."""
+    return lag != LAG_POOL_AHEAD, lag not in (LAG_POOL_ONLY, LAG_POOL_MAJOR)
+
+
 def _lag_phrase(entry: dict) -> str:
     """What the cluster's own version candidates say it is behind by."""
     master = next((c for c in entry.get("candidates") or [] if c.get("check") == MASTER_BEHIND_CHECK), None)
@@ -1298,14 +1309,8 @@ def _upgrade_blocked_hit(entry: dict, member: dict) -> dict | None:
     if readiness.get("status") != READINESS_BLOCKED:
         return None
     lag = _lag_phrase(entry)
-    # Which upgrade is due decides which causes can block it. A pool ahead of
-    # its control plane: the control plane's move is due, which evicts no
-    # pod, so a budget cannot hold it and a skew ceiling can. A pool behind a
-    # current control plane: the pool's move is due, which a budget can hold
-    # and the ceiling does not refuse (it is what closes the skew, and 3.2
-    # already carries the pool), so skew alone is the check running clean
-    # there. A behind control plane: both apply.
-    found = _readiness_cause(readiness, budget_applies=lag != LAG_POOL_AHEAD, skew_applies=lag not in (LAG_POOL_ONLY, LAG_POOL_MAJOR))
+    budget_applies, skew_applies = _applicable_causes(lag)
+    found = _readiness_cause(readiness, budget_applies=budget_applies, skew_applies=skew_applies)
     if found is None:
         return None
     impact_format, cause, workloads = found
@@ -1471,10 +1476,16 @@ def _join_readiness(project: str, behind: list[dict], argv: list[str], result: R
     for entry in behind:
         member = members.get((entry["_bare_name"], entry["location"]))
         readiness = (member or {}).get("readiness") or {}
-        # A skew block is definite whatever the PDB read did: the reporter
-        # grades `blocked` on skew with `read_error` set beside it, and a
-        # blocker it positively identified is a finding, not a gap.
-        skew_blocked = readiness.get("status") == READINESS_BLOCKED and bool((readiness.get("skew") or {}).get("blocking"))
+        # A skew block is definite whatever the PDB read did, when the ceiling
+        # can block the upgrade due: the reporter grades `blocked` on skew
+        # with `read_error` set beside it, and a blocker it positively
+        # identified is a finding, not a gap. On a pool-only lag the ceiling
+        # blocks nothing that is due, so the one cause that could (a budget
+        # on the pool drain) was never read, and the row is the gap it would
+        # be without the skew. Decided here, before the shortcut, from the
+        # same lag `_upgrade_blocked_hit` reads.
+        _, skew_applies = _applicable_causes(_lag_phrase(entry))
+        skew_blocked = skew_applies and readiness.get("status") == READINESS_BLOCKED and bool((readiness.get("skew") or {}).get("blocking"))
         why = None
         if not members:
             why = no_report

@@ -2269,6 +2269,18 @@ class UpgradeBlockedTest(unittest.TestCase):
         self.assertIn(pr.UPGRADE_BLOCKED_CHECK, self.ran(entry))
         self.assertEqual([c for c in entry["candidates"] if c["check"] == pr.UPGRADE_BLOCKED_CHECK], [])
 
+    def test_a_pool_only_lag_with_a_failed_budget_read_is_unevaluated_even_when_skew_blocks(self):
+        """The ceiling blocks nothing that is due on a pool-only lag, so the
+        one cause that could, a budget on the pool drain, is the read that
+        failed: a gap, not a clean run, whatever the skew arm says."""
+        pools = [pool("default-pool", "1.27.0-gke.1")]
+        row = self.member("skewed", skew=["default-pool"], read_error="kubectl: forbidden", gap=0)
+        by = self.collect([cluster(name="skewed", master=self.CURRENT, node_pools=pools)], [row])
+        entry = by["skewed"]
+        self.assertNotIn(pr.UPGRADE_BLOCKED_CHECK, self.ran(entry))
+        self.assertEqual([c for c in entry["candidates"] if c["check"] == pr.UPGRADE_BLOCKED_CHECK], [])
+        self.assertIn("kubectl: forbidden", self.unevaluated(entry)[pr.UPGRADE_BLOCKED_CHECK])
+
     def test_a_pool_only_lag_blocked_by_a_budget_and_skew_names_the_held_pool_drain_only(self):
         pools = [pool("default-pool", "1.27.0-gke.1")]
         by = self.collect([cluster(name="skewed", master=self.CURRENT, node_pools=pools)], [self.member("skewed", pdbs=[self.BUDGET], skew=["default-pool"], gap=0)])

@@ -265,8 +265,10 @@ each is waiting for whoever schedules it.
   read, the reporter failed for that cluster or ran out of its four-minute budget, or it graded
   `blocked` for a cause this check does not know — and a cluster 3.1 never judged, carry
   `upgrade-blocked` in the entry's `checks_unevaluated` with the reason. A `blocked` grade whose
-  cause is node-pool skew is a finding even when the budget read failed beside it: the skew is
-  definite. That
+  cause is node-pool skew is a finding even when the budget read failed beside it, when the
+  ceiling can block the upgrade due (a behind control plane, or a pool ahead of it): the skew is
+  definite. On a cluster whose only lag is a pool behind its control plane the ceiling blocks
+  nothing that is due, so that row is unevaluated with the read error, as it is without the skew. That
   is a `limitations` line naming the check and the reason, never an asserted blocker and never a
   clean pass; `finish` refuses the slug in `checks_run` or `checks_not_applicable` there. Do not
   run the reporter yourself to fill it: the cross-check rejects a `checks_run` the manifest does
