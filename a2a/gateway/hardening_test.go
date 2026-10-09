@@ -70,14 +70,19 @@ func TestSpawnFailureClosesTheTaskAsItsSupervisor(t *testing.T) {
 
 // TestSteerAckIsRouteConditioned: the spec's gateway-authored-posts rule
 // (amended 8/31) — the acknowledgement reports the steer is on the stream,
-// and what it says next depends on what the executor will do with it.
+// and what it says next depends on what the executor will do with it. Each
+// task has its first event on the stream before the steer: a task with none
+// gets a line that promises nothing (TestSteerIntoTaskWithNoFirstEventPromisesNoReply).
 func TestSteerAckIsRouteConditioned(t *testing.T) {
 	t.Run("fixed route says the executor refuses", func(t *testing.T) {
 		r := startRig(t)
 		conv := "discord:g1/thread-ackfixed"
 		r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group",
 			AuthorID: "1001", MessageID: "af-1", Text: "check the fleet"}
-		r.awaitTask(t, "platform")
+		origin := r.awaitTask(t, "platform")
+		if err := r.execFor(t, origin, "platform").PublishStatus(context.Background(), lib.StateSubmitted, false); err != nil {
+			t.Fatal(err)
+		}
 		r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group",
 			AuthorID: "1001", MessageID: "af-2", Text: "actually only prod"}
 		waitFor(t, "fixed-route steer ack", func() bool {
@@ -94,10 +99,19 @@ func TestSteerAckIsRouteConditioned(t *testing.T) {
 		conv := "discord:g1/thread-acksession"
 		r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group",
 			AuthorID: "1001", MessageID: "as-1", Text: "check the fleet"}
+		var addressee string
 		waitFor(t, "session task recorded", func() bool {
 			rec, err := r.g.reg.Get(context.Background(), conv)
-			return err == nil && rec != nil && rec.ActiveTask != nil
+			if err == nil && rec != nil && rec.ActiveTask != nil {
+				addressee = rec.Addressee
+				return true
+			}
+			return false
 		})
+		origin := r.awaitTask(t, addressee)
+		if err := r.execFor(t, origin, addressee).PublishStatus(context.Background(), lib.StateSubmitted, false); err != nil {
+			t.Fatal(err)
+		}
 		r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group",
 			AuthorID: "1001", MessageID: "as-2", Text: "actually only prod"}
 		waitFor(t, "session-route steer ack", func() bool {

@@ -441,3 +441,51 @@ func TestARefusedExecutorSettingIsLoggedOnce(t *testing.T) {
 		t.Error("the refused value was not logged")
 	}
 }
+
+// The gateway's busy-notice threshold is the bridge's worker count: the turn
+// that finds every worker taken is the first one told it waits. It follows
+// the rendered bridge's default and the operator setting that sizes it, and a
+// declared bridge's own count; the operator's A2A_BUSY_NOTICE_AT overrides
+// all three, and a value that is not a count falls back instead of reaching
+// a gateway that would refuse it at boot.
+func TestTheBusyNoticeThresholdIsTheBridgeWorkerCount(t *testing.T) {
+	rendered := func(agent *agentv1alpha1.PlatformAgent) string {
+		t.Helper()
+		dep := buildA2AGatewayDeployment(agent)
+		for _, e := range dep.Spec.Template.Spec.Containers[0].Env {
+			if e.Name == a2aBusyNoticeAtEnvVar {
+				return e.Value
+			}
+		}
+		t.Fatalf("the gateway Deployment does not render %s", a2aBusyNoticeAtEnvVar)
+		return ""
+	}
+	if got := rendered(a2aTestAgent()); got != strconv.Itoa(a2aRenderedBridgeDefaultConcurrency) {
+		t.Errorf("default threshold = %q, want the rendered bridge's %d", got, a2aRenderedBridgeDefaultConcurrency)
+	}
+
+	t.Setenv(a2aBridgeConcurrencyOperatorEnvVar, "4")
+	if got := rendered(a2aTestAgent()); got != "4" {
+		t.Errorf("threshold with the bridge at 4 workers = %q, want 4", got)
+	}
+
+	declared := a2aTestAgent()
+	declared.Spec.Deployment = &agentv1alpha1.DeploymentSpec{Sidecars: []corev1.Container{{
+		Name: a2aBridgeContainerName, Image: "registry.example/declared-bridge:1",
+		Env: []corev1.EnvVar{{Name: a2aBridgeConcurrencyEnvVar, Value: "3"}},
+	}}}
+	if got := rendered(declared); got != "3" {
+		t.Errorf("threshold with a declared 3-worker bridge = %q, want 3", got)
+	}
+
+	t.Setenv(a2aBusyNoticeAtEnvVar, "7")
+	if got := rendered(declared); got != "7" {
+		t.Errorf("threshold with the operator override = %q, want 7", got)
+	}
+	for _, bad := range []string{"0", "-2", "junk"} {
+		t.Setenv(a2aBusyNoticeAtEnvVar, bad)
+		if got := rendered(declared); got != "3" {
+			t.Errorf("threshold with override %q = %q, want the worker count 3", bad, got)
+		}
+	}
+}
