@@ -15,13 +15,6 @@ import tempfile
 import time
 import unittest
 
-_REPO_ROOT_FOR_IMPORTS = pathlib.Path(__file__).resolve().parent.parent
-if str(_REPO_ROOT_FOR_IMPORTS) not in sys.path:
-    sys.path.insert(0, str(_REPO_ROOT_FOR_IMPORTS))
-try:
-    from tests.test_terraform_module_tests import _CLOSE as _HCL_CLOSE, _OPEN as _HCL_OPEN, _STR as _HCL_STR, _WORD as _HCL_WORD, _tokens as _hcl_tokens
-except ImportError:  # run from inside tests/
-    from test_terraform_module_tests import _CLOSE as _HCL_CLOSE, _OPEN as _HCL_OPEN, _STR as _HCL_STR, _WORD as _HCL_WORD, _tokens as _hcl_tokens
 import urllib.error
 from datetime import datetime, timezone
 from pathlib import Path
@@ -3989,26 +3982,44 @@ class FleetResourceTypesAreCoveredByReconcilerRolesTest(unittest.TestCase):
     # than enumerated: a file that is not *.tf and not one of the directory's
     # known inert files, a top-level block kind that is neither read nor known
     # to load no provider, and a read block whose header the scan cannot read.
+    # The names tofu's loader skips are skipped here too, so a parked file
+    # neither demands a role nor keeps one accounted for.
     _INERT_FILES = {"README.md", ".terraform.lock.hcl", "fixtures.json", "reconcile-allow.json"}
     _READ_BLOCKS = {"resource", "data"}
     _INERT_BLOCKS = {"terraform", "provider", "variable", "output", "locals"}
 
-    def _headers(self):
+    @staticmethod
+    def _tokenizer():
+        # Imported here, not at module level: the tokenizer lives in a test
+        # module that loads PyYAML, which the rest of this file runs without.
+        if str(checker._ROOT) not in sys.path:
+            sys.path.insert(0, str(checker._ROOT))
+        from tests import test_terraform_module_tests as hcl
+        return hcl
+
+    @staticmethod
+    def _tofu_ignores(name):
+        # configs.IsIgnoredFile in tofu: dot-prefixed, ~-suffixed, #...#.
+        return name.startswith(".") or name.endswith("~") or (name.startswith("#") and name.endswith("#"))
+
+    def _headers(self, fleet=None):
         """(kind, label tokens) for every top-level block in the stack."""
-        headers = []
-        for path in sorted(self._FLEET.glob("*.tf")):
-            tokens, depth, start = _hcl_tokens(path.read_text()), 0, 0
+        hcl, headers = self._tokenizer(), []
+        for path in sorted((fleet or self._FLEET).glob("*.tf")):
+            if self._tofu_ignores(path.name):
+                continue
+            tokens, depth, start = hcl._tokens(path.read_text()), 0, 0
             for index, token in enumerate(tokens):
-                if token[0] == _HCL_OPEN:
+                if token[0] == hcl._OPEN:
                     if depth == 0:
                         # The header is every token since the previous
                         # top-level block closed: the keyword, then the labels,
                         # whatever they are (a naked label is a label, not a kind).
                         head = tokens[start:index]
-                        self.assertTrue(head and head[0][0] == _HCL_WORD, f"{path.name}: a top-level block with no keyword before its brace: {head!r}")
+                        self.assertTrue(head and head[0][0] == hcl._WORD, f"{path.name}: a top-level block with no keyword before its brace: {head!r}")
                         headers.append((head[0][1], head[1:]))
                     depth += 1
-                elif token[0] == _HCL_CLOSE:
+                elif token[0] == hcl._CLOSE:
                     depth -= 1
                     if depth == 0:
                         start = index + 1
@@ -4016,19 +4027,30 @@ class FleetResourceTypesAreCoveredByReconcilerRolesTest(unittest.TestCase):
         return headers
 
     def _types(self):
-        types = set()
+        hcl, types = self._tokenizer(), set()
         for kind, labels in self._headers():
             if kind in self._READ_BLOCKS:
-                self.assertTrue(len(labels) == 2 and all(l[0] == _HCL_STR for l in labels), f"a {kind} block whose header the scan cannot read: {labels!r}; write it as tofu fmt does")
+                self.assertTrue(len(labels) == 2 and all(l[0] == hcl._STR for l in labels), f"a {kind} block whose header the scan cannot read: {labels!r}; write it as tofu fmt does")
                 types.add(labels[0][1])
         self.assertGreater(len(types), 10)
         return types
 
+    def _strangers(self, fleet):
+        return sorted(p.name for p in fleet.iterdir() if p.is_file() and not self._tofu_ignores(p.name) and not p.name.endswith(".tf") and p.name not in self._INERT_FILES)
+
     def test_the_scan_sees_everything_tofu_would_load(self):
-        strangers = sorted(p.name for p in self._FLEET.iterdir() if p.is_file() and not p.name.endswith(".tf") and p.name not in self._INERT_FILES)
-        self.assertEqual(strangers, [], "a file the scan does not read (tofu also loads *.tofu, *.tf.json, *.tofu.json): extend the scan or name it inert here")
+        self.assertEqual(self._strangers(self._FLEET), [], "a file the scan does not read (tofu also loads *.tofu, *.tf.json, *.tofu.json): extend the scan or name it inert here")
         kinds = sorted({kind for kind, _ in self._headers()} - self._READ_BLOCKS - self._INERT_BLOCKS)
         self.assertEqual(kinds, [], "a top-level block kind the scan does not read (module, ephemeral, action, ...): extend the scan")
+
+    def test_files_tofu_ignores_do_not_drive_the_table(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fleet = pathlib.Path(tmp)
+            (fleet / "main.tf").write_text('resource "google_live" "a" {}\n')
+            for parked in (".parked.tf", "main.tf~", "#main.tf#"):
+                (fleet / parked).write_text('resource "google_parked" "b" {}\n')
+            self.assertEqual([labels[0][1] for _, labels in self._headers(fleet)], ["google_live"])
+            self.assertEqual(self._strangers(fleet), [])
 
     def test_every_type_in_the_stack_is_mapped_and_its_roles_are_held(self):
         unmapped, unheld = [], []
