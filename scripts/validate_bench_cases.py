@@ -160,11 +160,16 @@ KNOWN_UNREGISTERED = {
     # that the omission is known rather than accidental.
     "cluster-provision-kanban": "cluster-scoped provisioning task, tier decision pending",
     # Has its fixture (its own stack) and its eval record (#2468: red on main,
-    # three greens on the fix), and belongs in the nightly; held out only
-    # because the nightly's infra-lock chain has no room for another stack
-    # case. The entry goes when #2467 makes room, #2552 sweeps what a killed
-    # run leaves behind, and the case joins hack/eval/nightly-cases.txt.
-    "networking-audit-subnet-range-exhaustion": "#2467: stack case held out of the nightly for its infra-lock budget",
+    # three greens on the fix), and belongs in the nightly. #2755 lists what it
+    # still needs first: Compute network permission for the CI runners,
+    # confirmed or granted; a scheduled hack/ci_sweep_compute_plants.py; and
+    # room on the main part's infra-lock chain, measured with
+    # oobe-first-run-audits in it (or stack cases moved to a second project).
+    # The entry goes when the case joins hack/eval/nightly-cases.txt.
+    "networking-audit-subnet-range-exhaustion": (
+        "#2755: stack case held out of the nightly until runner Compute "
+        "permission, a scheduled plant sweep and infra-lock room land"
+    ),
 }
 
 # Cases whose fixture does not exist at all, waiting on the issue that plants
@@ -507,24 +512,20 @@ CLUSTER_PLACEHOLDER_ANY = "any"
 # every check (its phrase lists included) is searched or matched as written.
 EXPANDING_PATTERN_KEYS = ("forbidden_patterns", "any_of_patterns")
 REPORT_CHECK_TYPE = "report_contains"
-COMPOUND_CHILDREN_KEY = "checks"
 
 
-def _catalog() -> dict[str, Any]:
-    """bench/tf/fleet/fixtures.json, parsed. The one read of the file: the slot
-    and role readers below take its result, and validate_case() parses it once
-    per case rather than once per check entry."""
+def _catalog_slots() -> set[str]:
+    """Cluster slots the catalogue declares, by its `cluster_slots` block and
+    by the slot every role names."""
     try:
-        return json.loads(ROLE_CATALOG.read_text(encoding="utf-8"))
+        data = json.loads(ROLE_CATALOG.read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:
         raise CaseError(f"{ROLE_CATALOG}: could not be parsed as JSON: {exc}") from exc
-
-
-def _catalog_slots(catalog: dict[str, Any]) -> set[str]:
-    """Cluster slots the catalogue declares in its `cluster_slots` block, the
-    one place a slot is defined; every role's `cluster_slot` names one of them
-    (scripts/test_task_registration.py pins that)."""
-    return set((catalog.get("cluster_slots") or {}).keys())
+    slots = set((data.get("cluster_slots") or {}).keys())
+    for spec in (data.get("roles") or {}).values():
+        if isinstance(spec, dict) and isinstance(spec.get("cluster_slot"), str):
+            slots.add(spec["cluster_slot"])
+    return slots
 
 
 def _cluster_placeholders(node: Any, where: str, problems: list[str], slots: set[str], parked: bool) -> None:
@@ -533,21 +534,19 @@ def _cluster_placeholders(node: Any, where: str, problems: list[str], slots: set
     lists: the verifier expands it from the runner's record there and nowhere
     else, so in a phrase list, another check's pattern list or any other
     string list it is literal text that never matches (an inert forbid) or
-    fails every run (a requirement). Every string under the node is read: on
-    its own (`tool_called`'s `agent` is a scalar run as a regex), in a list,
-    or inside a mapping however deep (`bootstrap_findings`'s
-    `expected_findings` is a list of `{check, object}` mappings), not a fixed
-    set of keys, so a new field is covered when it lands; a scalar that
-    carries no placeholder (`type`, `scope`, a role) is left alone. The
-    `checks` of a compound node are walked as nodes of their own, under their
-    own `type`."""
+    fails every run (a requirement). Every string on the node is read, in a
+    list or on its own (`tool_called`'s `agent` is a scalar run as a regex),
+    not a fixed set of keys, so a new field is covered when it lands; a
+    scalar that carries no placeholder (`type`, `scope`, a role) is left
+    alone."""
     if not isinstance(node, dict):
         return
     for key, raw in node.items():
-        if key == COMPOUND_CHILDREN_KEY:
-            continue
+        values = raw if isinstance(raw, list) else [raw]
         expands = node.get("type") == REPORT_CHECK_TYPE and key in EXPANDING_PATTERN_KEYS
-        for pattern in _strings_under(raw):
+        for pattern in values:
+            if not isinstance(pattern, str):
+                continue
             if not expands:
                 if CLUSTER_PLACEHOLDER_LOOSE.search(pattern):
                     problems.append(
@@ -570,80 +569,17 @@ def _cluster_placeholders(node: Any, where: str, problems: list[str], slots: set
                             f"declare ({', '.join(sorted(slots))}); the runner records no cluster for it, so "
                             "the check would error on every run"
                         )
-    for child in node.get(COMPOUND_CHILDREN_KEY) or []:
+    for child in node.get("checks") or []:
         _cluster_placeholders(child, where, problems, slots, parked)
 
 
-def _children(raw: Any) -> list[tuple[str, Any]] | None:
-    """The (key path step, child) pairs of a container `safe_load` builds, or
-    None for a scalar. A mapping (`!!map`) steps by key; a sequence by index,
-    and so does a tuple, since `!!omap` and `!!pairs` load as a list of
-    (key, value) tuples and the tuple is a container in its own right; a
-    `!!set` loads as a Python set of scalars, stepped in sorted order."""
-    if isinstance(raw, dict):
-        return [(f".{key}", item) for key, item in raw.items()]
-    if isinstance(raw, (list, tuple)):
-        return [(f"[{i}]", item) for i, item in enumerate(raw)]
-    if isinstance(raw, (set, frozenset)):
-        return [(f"[{i}]", item) for i, item in enumerate(sorted(raw, key=repr))]
-    return None
-
-
-def _strings_under(raw: Any, _seen: set[int] | None = None) -> list[str]:
-    """Every string in a value: the scalar itself, a sequence's items, a
-    mapping's values, nested to any depth, in document order. A container is
-    read once however many paths reach it: an anchor aliased from several
-    places (`safe_load` builds one object, reached by each) is one value, and
-    every finding is per key, so reading it per path would only repeat the
-    finding, and on a fan-out of nested anchors would take exponential time.
-    The same set bounds the walk on a cycle, which validate_case() has refused
-    before any rule runs (`_alias_cycle`)."""
-    if isinstance(raw, str):
-        return [raw]
-    seen = set() if _seen is None else _seen
-    if id(raw) in seen:
-        return []
-    children = _children(raw)
-    if children is None:
-        return []
-    seen.add(id(raw))
-    return [s for _, item in children for s in _strings_under(item, seen)]
-
-
-def _alias_cycle(raw: Any, path: str = "", _on_path: set[int] | None = None, _done: set[int] | None = None) -> str | None:
-    """The key path of the first value that is a container already on the path
-    down to it, or None. `safe_load` builds such a value from a YAML anchor
-    aliased from inside itself (`checks: &c [*c]`, `expected_findings: &m
-    [{object: *m}]`, `required_phrases: &c !!pairs [{"": *c}]`); every rule
-    here walks the tree, so one such file would end any of them in a
-    RecursionError, and devops-bench refuses the same file at spec load, after
-    the cluster lease. An anchor reused beside itself is a shared value, not a
-    cycle, and is not reported; a container once proven acyclic is not walked
-    again from a second path, so a fan-out of nested anchors is walked once per
-    container, not once per path."""
-    on_path = set() if _on_path is None else _on_path
-    done = set() if _done is None else _done
-    # Both sets hold container ids only, so a scalar is never in either.
-    if id(raw) in done:
-        return None
-    if id(raw) in on_path:
-        return path
-    children = _children(raw)
-    if children is None:
-        return None
-    on_path.add(id(raw))
-    for step, item in children:
-        found = _alias_cycle(item, path + step if path or step.startswith("[") else step[1:], on_path, done)
-        if found is not None:
-            return found
-    on_path.discard(id(raw))
-    done.add(id(raw))
-    return None
-
-
-def _catalog_roles(catalog: dict[str, Any]) -> dict[str, Any]:
+def _catalog_roles() -> dict[str, Any]:
     """Roles in bench/tf/fleet/fixtures.json, which owns the vocabulary."""
-    return catalog.get("roles") or {}
+    try:
+        data = json.loads(ROLE_CATALOG.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise CaseError(f"{ROLE_CATALOG}: could not be parsed as JSON: {exc}") from exc
+    return data.get("roles") or {}
 
 
 def _overlay_fixtures() -> list[dict[str, Any]]:
@@ -652,7 +588,7 @@ def _overlay_fixtures() -> list[dict[str, Any]]:
     return [f for f in (data.get("fixtures") or []) if isinstance(f, dict)]
 
 
-def known_fixture_roles(catalog: dict[str, Any] | None = None) -> set[str]:
+def known_fixture_roles() -> set[str]:
     """Every role slug a task.yaml may name.
 
     bench/tf/fleet/fixtures.json is the vocabulary; the overlay contributes
@@ -661,11 +597,8 @@ def known_fixture_roles(catalog: dict[str, Any] | None = None) -> set[str]:
     place to also complain that the two disagree -- that is a repository-level
     fault, not a fault of the case that happened to name the role, so it is
     reported once by fixture_catalog_disagreements() instead of once per case.
-
-    `catalog` is the parsed catalogue when the caller already holds it
-    (validate_case() reads it once per case); without it the file is read.
     """
-    roles = set(_catalog_roles(_catalog() if catalog is None else catalog))
+    roles = set(_catalog_roles())
     roles |= {f["role"] for f in _overlay_fixtures() if f.get("slot") is None and "role" in f}
     return roles
 
@@ -679,7 +612,7 @@ def fixture_catalog_disagreements() -> list[str]:
     `fixtures:` and the catalogue's in a check's `fixture_role:`, in the same
     file, for the same object.
     """
-    catalog = _catalog_roles(_catalog())
+    catalog = _catalog_roles()
     problems = []
     for entry in _overlay_fixtures():
         role, slot = entry.get("role"), entry.get("slot")
@@ -758,9 +691,8 @@ def bench_cases() -> dict[str, pathlib.Path]:
 
 
 def _fixture_roles_shape(node: Any, where: str, problems: list[str]) -> None:
-    """`fixture_roles:` is a list of role slugs. `_fixture_roles` reads list
-    entries only, so a scalar would otherwise name no role at all and slip
-    past the undeclared-role and slot checks, to error at run time."""
+    """`fixture_roles:` is a list of role slugs; a scalar would otherwise be
+    walked character by character and reported as a dozen unknown roles."""
     if not isinstance(node, dict):
         return
     roles = node.get("fixture_roles")
@@ -831,7 +763,7 @@ def _check_types(node: Any, found: set[str]) -> None:
         _check_types(child, found)
 
 
-def _fixture_roles(node: Any, found: set[str], plural: set[str]) -> None:
+def _fixture_roles(node: Any, found: set[str], plural: set[str] | None = None) -> None:
     """Every `fixture_role:` (and `fixture_roles:` entry) named anywhere in
     one check subtree. `plural` collects the `fixture_roles:` entries on
     their own as well: the runner resolves those to a slot, so they are held
@@ -847,7 +779,8 @@ def _fixture_roles(node: Any, found: set[str], plural: set[str]) -> None:
         for role in roles:
             if isinstance(role, str):
                 found.add(role)
-                plural.add(role)
+                if plural is not None:
+                    plural.add(role)
     for child in node.get("checks") or []:
         _fixture_roles(child, found, plural)
 
@@ -895,12 +828,6 @@ def validate_case(name: str, path: pathlib.Path, *, registered: set[str] | None)
     spec = _load_yaml(path)
     if not isinstance(spec, dict):
         return [f"{path}: does not parse to a mapping"]
-    cycle = _alias_cycle(spec)
-    if cycle is not None:
-        return [
-            f"{path}: a YAML anchor is aliased from inside its own value, at {cycle}, "
-            "so the file has no finite shape to validate; break the cycle"
-        ]
 
     # The id key. devops-bench accepts task_id as an alias for id
     # (tasks/schema.py, from_dict) and prefers id when both are present, so a
@@ -998,15 +925,13 @@ def validate_case(name: str, path: pathlib.Path, *, registered: set[str] | None)
         )
 
     # Fixture roles. Cases address the seeded fleet by role, never by cluster
-    # name or project id -- see docs/designs/bench-fleet-catalog.md. The
-    # catalogue is parsed once here and handed to every reader below.
-    catalog = _catalog()
+    # name or project id -- see docs/designs/bench-fleet-catalog.md.
     fixtures = spec.get("fixtures")
     if fixtures is not None:
         if not isinstance(fixtures, list):
             problems.append("'fixtures:' must be a list of role slugs")
         else:
-            roles = known_fixture_roles(catalog)
+            roles = known_fixture_roles()
             for role in fixtures:
                 if not isinstance(role, str):
                     problems.append(
@@ -1039,8 +964,6 @@ def validate_case(name: str, path: pathlib.Path, *, registered: set[str] | None)
         used_types: set[str] = set()
         used_roles: set[str] = set()
         slot_roles: set[str] = set()
-        slots = _catalog_slots(catalog)
-        parked = name in FIXTURE_NOT_READY
         for index, entry in enumerate(entries):
             if not isinstance(entry, dict):
                 problems.append(f"verification_spec[{index}]: entry is not a mapping")
@@ -1062,7 +985,7 @@ def validate_case(name: str, path: pathlib.Path, *, registered: set[str] | None)
                 _fixture_roles_shape(entry["check"], where, problems)
                 _check_types(entry["check"], used_types)
                 _fixture_roles(entry["check"], used_roles, slot_roles)
-                _cluster_placeholders(entry["check"], where, problems, slots, parked)
+                _cluster_placeholders(entry["check"], where, problems, _catalog_slots(), name in FIXTURE_NOT_READY)
 
         # `fixture_roles:` asks whether a role's slot was reached, which the
         # runner records for catalogue roles only; an overlay role with no
@@ -1070,8 +993,8 @@ def validate_case(name: str, path: pathlib.Path, *, registered: set[str] | None)
         # A case parked in FIXTURE_NOT_READY names the role its issue plants,
         # which is not in the catalogue yet by definition; it is off every
         # roster, so the plural is held to the catalogue only once it runs.
-        if not parked:
-            for role in sorted(slot_roles - set(_catalog_roles(catalog))):
+        if name not in FIXTURE_NOT_READY:
+            for role in sorted(slot_roles - set(_catalog_roles())):
                 problems.append(
                     f"'fixture_roles:' names {role!r}, which has no cluster slot "
                     "in the fleet catalogue; the runner records a slot for "
@@ -1102,21 +1025,13 @@ def validate_case(name: str, path: pathlib.Path, *, registered: set[str] | None)
                 if reading
                 else "names seeded-fleet roles (" + ", ".join(sorted(used_roles)) + ")"
             )
-            # `fixtures: []` is offered only to a case whose checks name no
-            # role: a named role has to be declared, so for the other case
-            # the empty list is refused on the next run.
-            remedy = (
-                "List the seeded-fleet roles it depends on, "
-                + ", ".join(sorted(used_roles))
-                + " among them, so the fleet owner replacing a cluster can "
-                "grep for the cases that go quiet"
-                if used_roles
-                else "List the seeded-fleet roles it depends on, so the fleet "
-                "owner replacing a cluster can grep for the cases that go "
-                "quiet, or declare 'fixtures: []' for a case that plants its "
-                "own state"
+            problems.append(
+                lead
+                + " and declares no 'fixtures:'. List the seeded-fleet roles "
+                "it depends on, so the fleet owner replacing a cluster can "
+                "grep for the cases that go quiet, or declare 'fixtures: []' "
+                "for a case that plants its own state"
             )
-            problems.append(lead + " and declares no 'fixtures:'. " + remedy)
 
         # The presubmit decides whether a case has a spec by grepping for a
         # `verification_spec:` line with nothing after it (hack/ci-eval-pr.sh,

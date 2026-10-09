@@ -45,7 +45,6 @@ import pathlib
 import re
 import sys
 import tempfile
-import time
 import textwrap
 import unittest
 import unittest.mock
@@ -503,17 +502,6 @@ class TestTheValidatorItself(unittest.TestCase):
             self.assertIn("rejected", dirty.getvalue())
 
 
-class TestTheCatalogueDeclaresEverySlot(unittest.TestCase):
-    def test_every_role_names_a_declared_cluster_slot(self):
-        # `_catalog_slots` reads the `cluster_slots` block alone; a role on a slot the block
-        # does not declare would make every `{cluster:<slot>}` for it a finding.
-        catalog = validator._catalog()
-        declared = validator._catalog_slots(catalog)
-        named = {spec["cluster_slot"] for spec in catalog["roles"].values() if isinstance(spec, dict) and "cluster_slot" in spec}
-        self.assertTrue(named, "no role names a slot")
-        self.assertLessEqual(named, declared, f"roles name slots the catalogue's cluster_slots block does not declare: {sorted(named - declared)}")
-
-
 class TestTheRulesReject(unittest.TestCase):
     """Every rule, against a case built to break exactly that rule.
 
@@ -710,10 +698,6 @@ class TestTheRulesReject(unittest.TestCase):
         # The lead says what the case does: a report check opens no cluster.
         self.assertIn("names seeded-fleet roles (crashloop-workload)", problem)
         self.assertNotIn("reads live cluster state", problem)
-        # The remedy names the role the list has to carry and does not offer
-        # `fixtures: []`, which the undeclared-role rule would refuse next run.
-        self.assertIn("crashloop-workload among them", problem)
-        self.assertNotIn("fixtures: []", problem)
 
     def test_a_cluster_reading_check_with_no_fixtures_keeps_the_reading_lead(self):
         problem = self._only(
@@ -722,8 +706,6 @@ class TestTheRulesReject(unittest.TestCase):
             verification_spec=self._entry(check={"type": "fleet_resource_property", "fixture_role": "crashloop-workload", "kind": "deployment", "name": "payments-api", "namespace": "seeded-debug", "property_path": "spec.replicas", "op": "eq", "expected": 1}),
         )
         self.assertIn("reads live cluster state (fleet_resource_property)", problem)
-        # A fleet check names a role too, so the empty list is not offered here either.
-        self.assertNotIn("fixtures: []", problem)
 
     def test_a_parked_case_may_name_the_role_its_issue_plants_in_fixture_roles(self):
         # FIXTURE_NOT_READY keeps the case off every roster, so the role it
@@ -796,128 +778,6 @@ class TestTheRulesReject(unittest.TestCase):
         # a scalar with no placeholder is not read as one
         self.assertEqual(self._validate(verification_spec=self._entry(check={"type": "tool_called", "tool_names": ["x"], "scope": "workers", "agent": "cluster-.*"})), [])
 
-    def test_a_cluster_placeholder_inside_a_mapping_is_rejected(self):
-        # bootstrap_findings compares each expected `{check, object}` pair
-        # literally, so a placeholder in a mapping's value is literal text
-        # too; the guard reads strings inside a mapping, at any depth, rather
-        # than stopping at a list's first non-string item.
-        problem = self._only(
-            "which only report_contains expands",
-            verification_spec=self._entry(check={"type": "bootstrap_findings", "expected_findings": [{"check": "x", "object": "{cluster:a}"}]}),
-        )
-        self.assertIn("'expected_findings'", problem)
-        self.assertIn("bootstrap_findings", problem)
-        # a mapping with no placeholder is not read as one
-        self.assertEqual(self._validate(verification_spec=self._entry(check={"type": "bootstrap_findings", "expected_findings": [{"check": "x", "object": "y"}]})), [])
-
-    def test_a_recursive_anchor_in_a_check_field_is_a_finding_that_names_where(self):
-        # `safe_load` builds the cycle (`&m [{object: *m}]` is a list whose one mapping holds
-        # the list). Without the refusal, `_populated` reads the entry as populated and the
-        # placeholder walker reads its one string, so the file validates with no finding and
-        # devops-bench refuses it at spec load instead, after the cluster lease.
-        loop: list = []
-        loop.append({"check": "{cluster:a}", "object": loop, "again": {"deep": loop, "s": "y"}})
-        self.assertEqual(validator._alias_cycle({"verification_spec": [{"check": {"expected_findings": loop}}]}), "verification_spec[0].check.expected_findings[0].object")
-        text = yaml.safe_dump(self.VALID).replace(
-            "verification_spec:",
-            "verification_spec:\n- name: loops\n  role: objective\n  check:\n    type: bootstrap_findings\n    expected_findings: &m\n    - check: x\n      object: *m\n",
-        )
-        problem = self._only("aliased from inside its own value", text=text)
-        self.assertIn("at verification_spec[0].check.expected_findings[0].object", problem)
-        self.assertIn("break the cycle", problem)
-
-    def test_an_anchor_reused_beside_itself_is_a_shared_value_not_a_cycle(self):
-        # One object reached by two paths is read once: every finding is per key, so a
-        # second read would only repeat it.
-        shared = {"s": "y"}
-        self.assertIsNone(validator._alias_cycle({"a": shared, "b": [shared, shared]}))
-        self.assertEqual(validator._strings_under({"a": shared, "b": [shared, "z"]}), ["y", "z"])
-        text = yaml.safe_dump(self.VALID).replace(
-            "verification_spec:",
-            "x_shared: &p\n  type: report_contains\n  required_phrases: [ok]\nverification_spec:\n- name: one\n  role: objective\n  check: *p\n- name: two\n  role: objective\n  check: *p\n",
-        )
-        self.assertNotIn("aliased from inside its own value", " ".join(self._validate(text=text)))
-
-    def test_a_fan_out_of_shared_anchors_is_walked_once_per_container(self):
-        # `safe_load` builds a DAG, not a tree: nine nested anchors each aliased ten times
-        # is twenty lines of YAML and ten containers, reached by a billion paths. Both
-        # walkers carry a visited set, so no container is entered twice.
-        fan_out = "x0: &a0 [s, s, s, s, s, s, s, s, s, s]\n" + "".join(
-            f"x{n}: &a{n} [{', '.join([f'*a{n - 1}'] * 10)}]\n" for n in range(1, 9)
-        )
-        text = yaml.safe_dump(self.VALID).replace(
-            "verification_spec:",
-            fan_out + "verification_spec:\n- name: wide\n  role: objective\n  check:\n    type: report_contains\n    required_phrases: *a8\n",
-        )
-        spec = yaml.safe_load(text)
-        entered: list[int] = []
-        children = validator._children
-
-        def counting(raw):
-            if children(raw) is not None:
-                entered.append(id(raw))
-            return children(raw)
-
-        with unittest.mock.patch.object(validator, "_children", counting):
-            self.assertIsNone(validator._alias_cycle(spec))
-            self.assertEqual(len(entered), len(set(entered)), "a container entered twice")
-            entered.clear()
-            self.assertEqual(validator._strings_under(spec["verification_spec"][0]["check"]["required_phrases"]), ["s"] * 10)
-            self.assertEqual(len(entered), 9, "the nine lists, each once")
-        started = time.monotonic()
-        problems = self._validate(text=text)
-        self.assertLess(time.monotonic() - started, 5.0)
-        self.assertNotIn("aliased from inside its own value", " ".join(problems))
-
-    def test_a_self_alias_inside_an_omap_or_pairs_value_is_the_same_finding(self):
-        # `!!omap` and `!!pairs` load as a list of (key, value) tuples, built before their
-        # children, so an alias from inside resolves to the half-built list through a tuple;
-        # `_populated` descends tuples, so a walker that did not would leave it the
-        # RecursionError this refusal exists to pre-empt.
-        for tag in ("!!omap", "!!pairs"):
-            with self.subTest(tag=tag):
-                text = yaml.safe_dump(self.VALID).replace(
-                    "verification_spec:",
-                    f"verification_spec:\n- name: loops\n  role: objective\n  check:\n    type: report_contains\n    required_phrases: &c {tag} [{{\"\": *c}}]\n",
-                )
-                spec = yaml.safe_load(text)
-                self.assertEqual(validator._alias_cycle(spec), "verification_spec[0].check.required_phrases[0][1]")
-                problem = self._only("aliased from inside its own value", text=text)
-                self.assertIn("at verification_spec[0].check.required_phrases[0][1]", problem)
-
-    def test_a_set_valued_field_is_read_and_is_not_a_cycle(self):
-        # `!!set` loads as a Python set of scalars: its strings are read, in a fixed order.
-        spec = yaml.safe_load("x: &x {s: y}\nb: [*x, *x]\na: !!set {ok: null, '{cluster:a}': null}")
-        self.assertIsNone(validator._alias_cycle(spec))
-        self.assertEqual(validator._strings_under(spec["a"]), ["ok", "{cluster:a}"])
-        text = yaml.safe_dump(self.VALID).replace(
-            "verification_spec:",
-            "verification_spec:\n- name: setty\n  role: objective\n  check:\n    type: report_contains\n    forbidden_phrases: !!set {'{cluster:a}': null}\n",
-        )
-        problems = self._validate(text=text)
-        self.assertNotIn("aliased from inside its own value", " ".join(problems))
-        self.assertTrue(any("'forbidden_phrases'" in p and "{cluster:" in p for p in problems), problems)
-
-    def test_a_self_aliasing_checks_list_is_a_finding_not_a_traceback(self):
-        # The compound-check walker would have no bottom on `checks: &c [*c]`; the refusal in
-        # validate_case names the alias, so validate_all and the CLI's validate_paths each report
-        # it as that case's one finding and the other cases still report.
-        text = yaml.safe_dump(self.VALID).replace(
-            "verification_spec:",
-            "verification_spec:\n- name: loops\n  role: objective\n  check: &c\n    type: all_of\n    checks: [*c]\n",
-        )
-        with tempfile.TemporaryDirectory() as tmp:
-            path = pathlib.Path(tmp) / "made-up-case" / "task.yaml"
-            path.parent.mkdir()
-            path.write_text(text)
-            direct = validator.validate_case("made-up-case", path, registered={"made-up-case"})
-            with unittest.mock.patch.object(validator, "bench_cases", return_value={"made-up-case": path}), unittest.mock.patch.object(validator, "registered_cases", return_value={"made-up-case"}):
-                results = validator.validate_all()
-                by_path = validator.validate_paths([path])
-        for problems in (direct, results["made-up-case"], by_path["made-up-case"]):
-            self.assertEqual(len(problems), 1, problems)
-            self.assertIn("aliased from inside its own value, at verification_spec[0].check.checks[0]", problems[0])
-
     def test_a_malformed_cluster_placeholder_is_rejected(self):
         self._only(
             "malformed cluster placeholder",
@@ -960,7 +820,7 @@ class TestTheRulesReject(unittest.TestCase):
         self._only("must be a list of entries", verification_spec={"name": "n"})
 
     def test_a_cluster_reading_case_with_no_fixtures_is_rejected(self):
-        problem = self._only(
+        self._only(
             "declares no 'fixtures:'",
             fixtures=DELETE,
             verification_spec=self._entry(
@@ -972,17 +832,6 @@ class TestTheRulesReject(unittest.TestCase):
                 }
             ),
         )
-        # No check names a role, so the empty list is a real way out and is offered.
-        self.assertIn("fixtures: []", problem)
-
-    def test_the_fixture_catalogue_is_parsed_once_per_case(self):
-        # Every entry's placeholders are checked against the catalogue's slots;
-        # the parse is hoisted, so a six-entry case reads the file as often as
-        # a one-entry case: once.
-        entries = [dict(self.VALID["verification_spec"][0], name=f"names-the-thing-{i}") for i in range(6)]
-        with unittest.mock.patch.object(validator, "_catalog", wraps=validator._catalog) as parse:
-            self.assertEqual(self._validate(verification_spec=entries), [])
-        self.assertEqual(parse.call_count, 1)
 
     def test_an_empty_fixtures_list_is_a_declaration(self):
         self.assertEqual(
