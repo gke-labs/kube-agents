@@ -446,14 +446,15 @@ not run at the terminal, unless the gateway restarted too. The count is best-eff
 whose turn had started when the bridge crashed counts as run, though its answer never arrives.
 Mid-turn steering through the runs API is gke-labs#2628.
 
-**Upgrade order for steering.** The gateway and the bridge do not roll together. The gateway's
-image follows the operator. Under `spec.mode: next` the operator renders the bridge container, and
-its image is the operator's `A2A_BRIDGE_IMAGE` when that is set, otherwise derived from the CR's
-agent image (`a2aBridgeImage` in `k8s-operator/internal/controller/platformagent_a2a_bridge.go`).
-So until someone edits the CR's agent tag the two can be a release apart, and a rollback produces
-the reverse skew. Upgrade the operator (and with it the gateway) first, then bump the CR's agent
-tag. On a rollback, move the CR's agent tag back first, then the operator. A CR-declared bridge
-(above) takes its own sidecar tag in place of the agent tag. The two skews look like this:
+**Upgrade order for steering.** The gateway and the bridge do not always roll together. The
+gateway's image follows the operator; the rendered bridge's image is chosen as
+[Where it runs](#where-it-runs) describes. Only one case can leave the two a release apart: the
+agent container runs the release `platform-agent` image pinned by tag and `A2A_BRIDGE_IMAGE` is
+unset, so the bridge follows the CR's agent tag. There, upgrade the operator (and with it the
+gateway) first, then bump the CR's agent tag; on a rollback, move the CR's agent tag back first,
+then the operator. With `A2A_BRIDGE_IMAGE` set, with a custom or digest-pinned agent image, or with
+no image on the CR, the bridge follows the operator, and there is no tag skew to order. A
+CR-declared bridge (above) follows its own sidecar tag, in the same order. The two skews look like this:
 
 - **Old gateway, new bridge (the order to avoid).** The old relay has no case for `turn`
   artifacts, so every earlier turn's answer is dropped. The room gets the old "does not take
