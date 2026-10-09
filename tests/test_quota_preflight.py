@@ -35,6 +35,10 @@ _FOOTPRINT = _CHART / "files" / "footprint.yaml"
 _SCHEMA = _CHART / "values.schema.json"
 _PREFLIGHT_TPL = _CHART / "templates" / "quota-preflight.yaml"
 _HELPERS = _CHART / "templates" / "_helpers.tpl"
+_SPAWN_GO = _ROOT / "a2a" / "gateway" / "spawn.go"
+_A2A_MANIFESTS = _ROOT / "k8s-operator" / "internal" / "controller" / "platformagent_a2a_manifests.go"
+_A2A_BRIDGE = _ROOT / "k8s-operator" / "internal" / "controller" / "platformagent_a2a_bridge.go"
+_IAM_MAIN_TF = _ROOT / "terraform" / "modules" / "kube-agents-iam" / "main.tf"
 
 _HELM = shutil.which("helm")
 
@@ -1352,21 +1356,113 @@ class DocumentedFootprintTest(unittest.TestCase):
             math.floor((required["limitsMemory"] / gib) * 10 + 0.5) / 10,
         )
 
+    def _extract_match(
+        self, pattern: str, text: str, description: str, flags: int = 0
+    ) -> str:
+        m = re.search(pattern, text, flags)
+        self.assertIsNotNone(m, f"failed to find {description}")
+        assert m is not None
+        return m.group(1)
+
     def test_the_prerequisites_page_documents_mode_next_footprint(self) -> None:
-        page = self._PREREQUISITES.read_text()
-        self.assertIn("spec.mode: next", page)
-        self.assertIn("JetStream", page)
-        self.assertIn("40 GiB", page)
-        self.assertIn("a2a-worker", page)
-        self.assertIn("250m CPU", page)
-        self.assertIn("512Mi memory", page)
+        spawn_src = _SPAWN_GO.read_text()
+        worker_cpu = self._extract_match(
+            r'workerCPURequest\s*=\s*"([^"]+)"', spawn_src, "workerCPURequest"
+        )
+        worker_mem = self._extract_match(
+            r'workerMemoryRequest\s*=\s*"([^"]+)"', spawn_src, "workerMemoryRequest"
+        )
+        worker_cpu_limit = self._extract_match(
+            r'workerCPULimit\s*=\s*"([^"]+)"', spawn_src, "workerCPULimit"
+        )
+        worker_mem_limit = self._extract_match(
+            r'workerMemoryLimit\s*=\s*"([^"]+)"', spawn_src, "workerMemoryLimit"
+        )
+
+        manifests_src = _A2A_MANIFESTS.read_text()
+        nats_cpu = self._extract_match(
+            r'a2aNATSCPURequest\s*=\s*"([^"]+)"', manifests_src, "a2aNATSCPURequest"
+        )
+        nats_mem = self._extract_match(
+            r'a2aNATSMemoryRequest\s*=\s*"([^"]+)"', manifests_src, "a2aNATSMemoryRequest"
+        )
+        jetstream_gib = int(
+            self._extract_match(
+                r'a2aNATSDataClaim.*?resource\.MustParse\("(\d+)Gi"\)',
+                manifests_src,
+                "JetStream PVC storage request",
+                flags=re.DOTALL,
+            )
+        )
+        max_sessions = int(
+            self._extract_match(
+                r'defaultA2AMaxSessions\s*=\s*(\d+)',
+                manifests_src,
+                "defaultA2AMaxSessions",
+            )
+        )
+        headroom = int(
+            self._extract_match(
+                r'a2aQuotaHeadroom\s*=\s*(\d+)', manifests_src, "a2aQuotaHeadroom"
+            )
+        )
+
+        bridge_src = _A2A_BRIDGE.read_text()
+        bridge_cpu = self._extract_match(
+            r'corev1\.ResourceCPU:\s*resource\.MustParse\("([^"]+)"\)',
+            bridge_src,
+            "bridge CPU request",
+        )
+        bridge_mem = self._extract_match(
+            r'corev1\.ResourceMemory:\s*resource\.MustParse\("([^"]+)"\)',
+            bridge_src,
+            "bridge memory request",
+        )
+
+        page = " ".join(self._PREREQUISITES.read_text().split())
+
+        # Check NATS standing workload requests:
+        self.assertIn(f"NATS ({nats_cpu} CPU, {nats_mem} memory)", page)
+
+        # Check bridge container default sizing:
+        self.assertIn(
+            f"`hermes-bridge` container in the agent pod ({bridge_cpu} CPU, {bridge_mem} memory under the default `api` executor",
+            page,
+        )
+
+        # Check a2a-worker session pod requests and limits:
+        worker_mem_limit_prose = worker_mem_limit.replace("Gi", " GiB")
+        worker_clause = (
+            rf"`a2a-worker` session pod requesting {re.escape(worker_cpu)} CPU "
+            rf"and {re.escape(worker_mem)} memory \(limits {re.escape(worker_cpu_limit)} CPU, "
+            rf"(?:{re.escape(worker_mem_limit)}|{re.escape(worker_mem_limit_prose)})\)"
+        )
+        self.assertRegex(page, worker_clause)
+
+        # Check JetStream persistent volume claim:
+        self.assertIn(f"{jetstream_gib} GiB JetStream persistent volume claim", page)
+
+        # Check namespace-wide ResourceQuota capping pods:
+        quota_clause = (
+            rf"renders a namespace-wide `ResourceQuota` on `pods` of "
+            rf"`maxSessions \+ {headroom}` \({max_sessions + headroom} pods by default"
+        )
+        self.assertRegex(page, quota_clause)
 
     def test_the_prerequisites_page_documents_minimum_iam_roles(self) -> None:
+        iam_tf = _IAM_MAIN_TF.read_text()
+        self.assertIn('resource "google_project_iam_member"', iam_tf)
+        self.assertIn('resource "google_service_account_iam_member"', iam_tf)
+
         page = self._PREREQUISITES.read_text()
+        self.assertIn("`google_project_iam_member`", page)
+        self.assertIn("`google_service_account_iam_member`", page)
         self.assertIn("resourcemanager.projects.setIamPolicy", page)
         self.assertIn("iam.serviceAccounts.setIamPolicy", page)
         self.assertIn("roles/resourcemanager.projectIamAdmin", page)
         self.assertIn("roles/iam.serviceAccountAdmin", page)
+        self.assertIn("roles/owner", page)
+        self.assertIn("roles/editor", page)
 
 
 
