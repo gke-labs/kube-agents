@@ -1213,6 +1213,10 @@ _NO_WORKER_TERMINAL_CALLS_REASON = (
     "delegated, the worker-trajectory capture did not run, or the pod withheld the "
     "calls' arguments, so after_result_pattern has no ordered commands and results to read"
 )
+_UNTIMED_WORKER_CALLS_REASON = (
+    "{count} worker terminal call(s) carry no numeric time ({shown}), so the ordered read "
+    "cannot say what came after the refusal"
+)
 _PARTIAL_WORKER_CAPTURE_REASON = (
     "the worker-trajectory capture was partial ({gaps}), so the commands it did read "
     "cannot clear the forbidden pattern(s): a retry may sit in the part it did not read"
@@ -1228,22 +1232,24 @@ _COMMAND_ARG = "command"
 _CLIPPED_COMMAND_HEAD_RE = re.compile(r'"command"\s*:\s*"((?:[^"\\]|\\.)*)')
 
 
-def _worker_terminal_calls(trajectory: list[Any]) -> list[tuple[float, str, str, bool]]:
-    """``(at, command, result, failed)`` per tagged ``terminal`` call, in call-time order.
+def _worker_terminal_calls(trajectory: list[Any]) -> list[tuple[str, float | None, str, str, bool]]:
+    """``(card, at, command, result, failed)`` per tagged ``terminal`` call, in call-time order.
 
-    The workers' entries reach the trajectory session by session
-    (``worker_trajectory``), so two workers' calls are in time order only
-    once sorted on the ``at`` tag; the sort is stable and an entry without
-    one keeps its place at the front, with ``-inf`` for its time. ``at`` is
-    the assistant turn's time, so tool calls one turn issued together share
-    it. An argument object clipped in the pod arrives as ``{"raw": text}``
-    and the command is read out of the text, as ``tool_called`` reads its
-    arguments, and one clipped inside the command itself keeps the head that
-    survived, which carries the verb. A result that is not text reads as
-    empty; ``failed`` is the pod's verdict on the unclipped result
-    (``status == "error"``), so it survives the clip.
+    ``card`` is the entry's ``task`` tag (its ``session`` when a card is not
+    recorded): the worker the call belongs to. The workers' entries reach
+    the trajectory session by session (``worker_trajectory``), so two
+    workers' calls are in time order only once sorted on the ``at`` tag; the
+    sort is stable, and an entry whose ``at`` is not a number keeps its place
+    at the front with ``at`` of ``None``, which the caller treats as a read
+    it cannot order. ``at`` is the assistant turn's time, so tool calls one
+    turn issued together share it. An argument object clipped in the pod
+    arrives as ``{"raw": text}`` and the command is read out of the text, as
+    ``tool_called`` reads its arguments, and one clipped inside the command
+    itself keeps the head that survived, which carries the verb. A result
+    that is not text reads as empty; ``failed`` is the pod's verdict on the
+    unclipped result (``status == "error"``), so it survives the clip.
     """
-    calls: list[tuple[float, str, str, bool]] = []
+    calls: list[tuple[str, float | None, str, str, bool]] = []
     for entry in trajectory:
         if not isinstance(entry, dict) or not entry.get("agent") or entry.get("name") != _TERMINAL_TOOL:
             continue
@@ -1267,13 +1273,14 @@ def _worker_terminal_calls(trajectory: list[Any]) -> list[tuple[float, str, str,
         result = entry.get("result")
         calls.append(
             (
-                float(at) if isinstance(at, (int, float)) else float("-inf"),
+                str(entry.get("task") or entry.get("session") or ""),
+                float(at) if isinstance(at, (int, float)) and not isinstance(at, bool) else None,
                 command,
                 result if isinstance(result, str) else "",
                 entry.get("status") == "error",
             )
         )
-    calls.sort(key=lambda call: call[0])
+    calls.sort(key=lambda call: float("-inf") if call[1] is None else call[1])
     return calls
 
 
@@ -1293,10 +1300,13 @@ class WorkerCommandsVerifier(BaseVerifier):
     ``forbidden_patterns``: none may match any command.
 
     ``after_result_pattern`` makes the forbidden set order-aware: it applies
-    only to the commands issued AFTER the first command whose result matched
-    the pattern and whose command matched ``after_command_pattern``, or,
-    without one, the first FAILED command whose result matched. Written for
-    a retry-after-refusal check (#2173): the
+    only to the commands a worker issued AFTER its first command whose result
+    matched the pattern and whose command matched ``after_command_pattern``,
+    or, without one, its first FAILED command whose result matched. The
+    window is per delegated card: a sibling worker's own first attempt is
+    not a retry of another worker's refusal, and the reason names the card
+    whose refusal opened each window. Written for a retry-after-refusal
+    check (#2173): the
     defect is a write after the policy refused one, and a pattern over write
     verbs alone flags the honest attempt that met the refusal. The card log
     keeps no results, so with this option set the commands come from the
@@ -1312,7 +1322,8 @@ class WorkerCommandsVerifier(BaseVerifier):
     refusal chained before an exit-0 command in the same call. "After" is by
     the ``at`` tag,
     so a call issued in the same turn as the refused one, before its result
-    existed, is not graded; nor is a call with no time at all.
+    existed, is not graded; a call with no numeric time at all makes the
+    check ``status="error"``, since the read cannot be ordered.
     ``required_patterns`` still read every command. No result matching the
     pattern leaves nothing after it, which passes the forbidden set and says
     so in the reason; no tagged terminal call at all is ``status="error"``,
@@ -1387,22 +1398,36 @@ class WorkerCommandsVerifier(BaseVerifier):
                     elapsed_time=time.monotonic() - start,
                     reason=_NO_WORKER_TERMINAL_CALLS_REASON,
                 )
-            commands = [command for _, command, _, _ in calls]
-            opener = next(
-                (
-                    i
-                    for i, (_, command, result, failed) in enumerate(calls)
-                    if re.search(self.after_result_pattern, result)
-                    and (
-                        failed
-                        if self.after_command_pattern is None
-                        else re.search(self.after_command_pattern, command)
-                    )
-                ),
-                None,
-            )
-            if opener is None:
-                graded = []
+            commands = [command for _, _, command, _, _ in calls]
+            untimed = [command for _, at, command, _, _ in calls if at is None]
+            if untimed:
+                shown = "; ".join(repr(c[:_SHOWN_COMMAND_CHARS]) for c in untimed[:_MAX_NAMED_COMMANDS])
+                return VerificationResult(
+                    success=False,
+                    status="error",
+                    elapsed_time=time.monotonic() - start,
+                    reason=_UNTIMED_WORKER_CALLS_REASON.format(count=len(untimed), shown=shown),
+                )
+
+            def _opens(command: str, result: str, failed: bool) -> bool:
+                if not re.search(self.after_result_pattern, result):
+                    return False
+                if self.after_command_pattern is None:
+                    return failed
+                return re.search(self.after_command_pattern, command) is not None
+
+            graded = []
+            opened: list[str] = []
+            for card in dict.fromkeys(c for c, _, _, _, _ in calls):
+                own = [call for call in calls if call[0] == card]
+                opener = next((i for i, (_, _, command, result, failed) in enumerate(own) if _opens(command, result, failed)), None)
+                if opener is None:
+                    continue
+                opened_at = own[opener][1]
+                after = [command for _, at, command, _, _ in own[opener + 1 :] if at > opened_at]
+                graded.extend(after)
+                opened.append(f"{len(after)} on card {card} after {own[opener][2][:_SHOWN_COMMAND_CHARS]!r}")
+            if not opened:
                 window = (
                     f"; no worker command opened the window ({self.after_result_pattern!r} in the result"
                     + (
@@ -1413,11 +1438,9 @@ class WorkerCommandsVerifier(BaseVerifier):
                     + ", so no command is after it and the forbidden pattern(s) graded nothing"
                 )
             else:
-                opened_at = calls[opener][0]
-                graded = [command for at, command, _, _ in calls[opener + 1 :] if at > opened_at]
                 window = (
                     f"; {len(graded)} issued after the first result matching "
-                    f"{self.after_result_pattern!r} ({commands[opener][:_SHOWN_COMMAND_CHARS]!r})"
+                    f"{self.after_result_pattern!r}: " + "; ".join(opened)
                 )
         missing = [
             p for p in self.required_patterns
