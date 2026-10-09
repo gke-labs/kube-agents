@@ -397,11 +397,14 @@ INJECT_LANE_EXCLUDED_TIER = {
 
 
 def positive_check_types(node, negations: int = 0) -> set:
-    """Every `type:` in a task document under an even number of negating
-    `type: none` compounds, read as the bench reads them (`_negates_every_leaf`
-    in bench/kube_agents_bench/cases.py counts negations by parity): the
-    checks that assert a write happened, not that one did not."""
+    """The check types a task REQUIRES to pass: every `type:` under an even
+    number of negating `type: none` compounds (parity, as the bench's
+    `_negates_every_leaf` reads them) and under no `any` compound, where a
+    leaf is one alternative and not required. The other compounds
+    (`sequence`, `parallel`, `all`) are conjunctive and transparent."""
     if isinstance(node, dict):
+        if node.get("type") == "any":
+            return set()
         if node.get("type") == "none":
             found = set()
             for value in node.values():
@@ -452,6 +455,10 @@ class GitLabLaneTest(unittest.TestCase):
         # A none under a none undoes it, as the bench reads it (bench/tests/test_cases.py, doubly-negated).
         double = {"verification_spec": [{"type": "none", "checks": [{"type": "none", "checks": [{"type": "pull_request_opened"}]}]}]}
         self.assertTrue(positive_check_types(double) & self.FORGE_CHECKS)
+        # Under `any` the forge check is one alternative, not a requirement: a chat answer could pass the case instead.
+        either = {"verification_spec": [{"type": "any", "checks": [{"type": "pull_request_opened"}, {"type": "report_contains"}]}]}
+        self.assertFalse(positive_check_types(either) & self.FORGE_CHECKS)
+        self.assertTrue(positive_check_types({"verification_spec": [{"type": "all", "checks": [{"type": "ledger_issue_contains"}]}]}) & self.FORGE_CHECKS)
 
     def test_no_commented_out_case_path(self):
         self.assertEqual(eval_rosters.commented_out_cases(eval_rosters.GITLAB_PRESUBMIT_CASES_FILE.read_text(encoding="utf-8")), [])

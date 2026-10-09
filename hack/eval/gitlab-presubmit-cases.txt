@@ -16,7 +16,8 @@
 # `ledger_issue_contains` check (a ledger issue). A chat probe passes the
 # same on either forge and proves nothing about GitLab; the GitHub run
 # already grades it on every pull request. scripts/test_eval_rosters.py pins
-# that rule.
+# the set, and that each entry requires a positive forge check (not under a
+# `none`, not one alternative under an `any`).
 #
 # WHAT CAN RED THE LANE. The blocking roster still applies, intersected with
 # this list: a roster case here arms rung 4 on the lane; a held-out case here

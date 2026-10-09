@@ -47,6 +47,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 
@@ -84,13 +85,24 @@ def roster_block() -> str:
     return lifted_block(r"^BLOCKING_ROSTER_ENTRIES=.*?^export BOOTSTRAP_ADMITTED=[^\n]*")
 
 
+# The variables that shape the matrix, scrubbed from the developer's
+# environment under every lifted-shell run, so a shell with one of them
+# exported (EVAL_FORGE=gitlab for a local GitLab eval, say) does not turn the
+# default-matrix assertions into the lane's.
+MATRIX_SHAPING = ("AGENT_TRANSPORT", "EVAL_TIER", "EVAL_NIGHTLY_PART", "BOOTSTRAP_ADMITTED", "EVAL_FORGE")
+
+
+def clean_env(env: dict | None = None) -> dict:
+    return {**{k: v for k, v in os.environ.items() if k not in MATRIX_SHAPING}, **(env or {})}
+
+
 def run_bash(body: str, env: dict | None = None) -> subprocess.CompletedProcess:
     return subprocess.run(
         ["bash", "-c", "set -euo pipefail\n" + body],
         capture_output=True,
         text=True,
         check=False,
-        env={**os.environ, **(env or {})},
+        env=clean_env(env),
     )
 
 
@@ -272,7 +284,8 @@ class GitLabLaneTest(unittest.TestCase):
             (hack / "eval" / "gitlab-presubmit-cases.txt").write_text("./tasks/agent-kanban-smoke/task.yaml\n./tasks/pdb-remediation-pr/task.yaml\n")
             result = load_matrix_through_the_lane_step({"EVAL_FORGE": "gitlab", "AGENT_TRANSPORT": "inject"}, hack_dir=hack)
         self.assertNotEqual(result.returncode, 0, result.stdout)
-        self.assertIn("excluded on the inject lane", result.stderr)
+        self.assertIn("every blocking-roster case in eval/gitlab-presubmit-cases.txt is excluded on the inject lane", result.stderr)
+        self.assertIn("Seat another roster case there", result.stderr)
         self.assertNotIn("rung 4 is disarmed", result.stdout)
 
     def test_a_roster_free_lane_with_an_excluded_held_out_case_is_not_stopped(self):
@@ -299,6 +312,9 @@ class GitLabLaneTest(unittest.TestCase):
         result = load_matrix({"EVAL_FORGE": "github"})
         self.assertEqual(lines_tagged(result, "TASK"), presubmit_entries())
         self.assertNotIn("GitLab lane", result.stdout)
+        # And a developer's exported EVAL_FORGE does not reach the loaders.
+        with mock.patch.dict(os.environ, {"EVAL_FORGE": "gitlab"}):
+            self.assertEqual(lines_tagged(load_matrix(), "TASK"), presubmit_entries())
 
     def test_the_env_override_of_the_roster_still_wins_on_the_lane(self):
         result = load_matrix({"EVAL_FORGE": "gitlab", "BOOTSTRAP_ADMITTED": ""})
@@ -609,10 +625,7 @@ def load_matrix_through_the_part(
             PRINT_ARRAYS,
         ]
     )
-    clean = {k: v for k, v in os.environ.items() if k not in ("AGENT_TRANSPORT", "EVAL_TIER", "EVAL_NIGHTLY_PART", "BOOTSTRAP_ADMITTED")}
-    return subprocess.run(
-        ["bash", "-c", "set -euo pipefail\n" + body], capture_output=True, text=True, check=False, env={**clean, **(env or {})}
-    )
+    return subprocess.run(["bash", "-c", "set -euo pipefail\n" + body], capture_output=True, text=True, check=False, env=clean_env(env))
 
 
 class NightlyPartTest(unittest.TestCase):
