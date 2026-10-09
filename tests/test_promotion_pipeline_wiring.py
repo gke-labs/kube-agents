@@ -747,9 +747,18 @@ class AutopushNextDeployWiringTest(unittest.TestCase):
         self.autopush = _doc(_WORKFLOWS / _AUTOPUSH_DEPLOY)
 
     def test_it_has_its_own_workflow_level_lock(self):
+        """Shared only by runs that deploy.
+
+        A run created for a failed or cancelled publish deploys nothing, but in
+        the shared group it would still cancel a pending deploy of a good one.
+        """
         concurrency = self.doc.get("concurrency", {})
-        self.assertEqual(concurrency.get("group"), "autopush-next-deploy")
-        self.assertNotEqual(concurrency.get("group"), self.autopush["concurrency"]["group"])
+        self.assertEqual(
+            concurrency.get("group"),
+            "${{ (github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success')"
+            " && 'autopush-next-deploy' || format('autopush-next-deploy-noop-{0}', github.run_id) }}",
+        )
+        self.assertNotIn(f"'{self.autopush['concurrency']['group']}'", concurrency["group"])
         self.assertFalse(concurrency.get("cancel-in-progress"), "running deploys must not be cancelled mid-flight")
         for name, job in self.jobs.items():
             with self.subTest(job=name):

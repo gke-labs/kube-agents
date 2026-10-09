@@ -47,8 +47,12 @@ on:
 permissions:
   contents: read
 
+# A run takes its group when it is created, before resolve-candidate's `if:`
+# reads the publish's conclusion, and a newer run cancels a pending one. So a
+# failed or cancelled publish on main gets a group of its own: otherwise its
+# run, which deploys nothing, would evict a pending deploy of a good publish.
 concurrency:
-  group: autopush-next-deploy
+  group: ${{ (github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success') && 'autopush-next-deploy' || format('autopush-next-deploy-noop-{0}', github.run_id) }}
   cancel-in-progress: false
 
 jobs:
