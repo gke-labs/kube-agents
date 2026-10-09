@@ -449,6 +449,10 @@ refuses `PLATFORM_AGENT_MODE=next` in `install.env` for the same reason. An olde
 the release rollback runbook's route, has no such refusal and drops it with its generic
 "Dropping" line, so roll a `next` install back only after switching it to `today` on purpose. A value outside the enum stops every front door but `uninstall.sh`, which exports it empty
 before it regenerates.
+Under `next` with Slack on, `install.sh`, the menu's apply and a full upgrade refuse a
+`SLACK_ALLOWED_USERS` entry with an `@`, split as the tfvars render the list, before their apply
+(`refuse_next_slack_allowlist_emails`): the A2A gateway matches the list against Slack member IDs
+exactly, so an email matches nobody.
 
 Before a full apply the front doors read the live `PlatformAgent` through the install's own
 kubeconfig context and refuse when it carries a scope that neither the release record nor the
