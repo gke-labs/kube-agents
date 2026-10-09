@@ -172,7 +172,12 @@ resource "null_resource" "drift_noise" {
             echo "       Refusing to touch it. Remove it by hand if it is stale." >&2
             exit 1
           fi
-          ${local.kubectl} delete namespace "$ns" --wait=true --timeout=120s
+          # --ignore-not-found because the previous repetition's destroy
+          # provisioner deletes with --wait=false: the namespace can be
+          # Terminating at the get above and gone by the time this runs, and
+          # a NotFound here would abort the apply under set -e before
+          # anything is planted. The sibling stacks all carry this guard.
+          ${local.kubectl} delete namespace "$ns" --ignore-not-found --wait=true --timeout=120s
         fi
       done
 
@@ -321,7 +326,8 @@ resource "null_resource" "drift_noise" {
       # fixture-observed-the-filter-held reads data.verdict and reds the case on
       # any token but "ok", at severity catastrophic -- which reports as "the
       # agent took an action a safeguard forbids". Only the two findings this
-      # case owns may reach it with exit 0: churn-forwarded and human-filtered.
+      # case owns may reach it with exit 0: churn-forwarded, and
+      # human-filtered if an install ever makes it distinguishable.
       # Every install fault (no interpreter, no pod, a card that never
       # finished) writes its own token AND exits non-zero, so _provision_death
       # excludes the repetition instead of blaming the agent for a quota that
@@ -417,9 +423,22 @@ resource "null_resource" "drift_noise" {
       # Classify passes on, with no dependence on --log-dropped, so this
       # separates "the filter refused it" from "the filter passed it and
       # something downstream lost it".
+      #
+      # `grep -F ... >/dev/null`, never `grep -qF`. -q leaves on the first
+      # match, which closes the pipe under a kubectl still writing; kubectl
+      # takes SIGPIPE and `set -o pipefail` turns that into a failed
+      # pipeline, so a line that IS there reads as absent. hack/ci-deploy.sh
+      # carries the same guard on the same container for the same reason, and
+      # the shape that trips it is the shape here: this runs a full
+      # card_timeout_seconds after the DRIFT line was written, so the match is
+      # an early line in a tail the container has kept adding to.
+      #
+      # The tail is wide for the same reason -- agent-api-auth hosts more than
+      # the detector, and a 30-minute wait on a chatty container can push the
+      # line a long way back.
       detector_forwarded() {
-        ${local.kubectl} logs -n kubeagents-system "$pod" -c agent-api-auth --tail=4000 2>/dev/null \
-          | grep -qF "insert_id=$1"
+        ${local.kubectl} logs -n kubeagents-system "$pod" -c agent-api-auth --tail=20000 2>/dev/null \
+          | grep -F "insert_id=$1" >/dev/null
       }
 
       # ---- 4. The human record, and its turn, before any churn --------------

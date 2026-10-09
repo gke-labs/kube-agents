@@ -731,6 +731,7 @@
 # noop, transcript-only.
 ./tasks/backup-dr-cmek-selected-namespaces-probe/task.yaml
 
+<<<<<<< HEAD
 # The findings queue's item-wide decision: the user dismisses the one id the
 # nudge names for a gathered line, and every row of that line has to end up
 # dismissed while the line beside it stays open. prebuilt/findings-item plants
@@ -738,14 +739,5 @@
 # destroy. No fixture; the host install only.
 ./tasks/findings-decision-covers-item/task.yaml
 
-# gitops-drift-noise-filtered-triage (#2424, #911). gitops-drift-out-of-band-
-# triage grades the drift pipeline's delivery with one record and no noise;
-# this one grades the discrimination, which is CUJ 3 of
-# docs/designs/drift-detection.md and the part nothing exercised before. Its fixture publishes twelve synthetic
-# audit records to the drift-audit topic -- one human write and eleven by
-# controllers -- so Classify itself is under test rather than bypassed, which
-# is what separates it from the sibling's direct inject. Unparked once #2425
-# gave the eval installs the ingress it needs. Nightly from its first merge;
-# a presubmit seat is a later pull request that cites its record, and cannot
-# be taken while any pool project lacks the ingress (#2616).
-./tasks/gitops-drift-noise-filtered-triage/task.yaml
+=======
+>>>>>>> 0b52a91f (fix(bench): hold the drift-noise case out of the nightly, and close three more findings)
