@@ -72,6 +72,9 @@ Use this skill when asked to upgrade the `kube-agents` Platform Agent or operato
   actually succeeded and what remains, and
   provide any issue URL already created. For an ambiguous write response, check GitHub before
   retrying; do not blindly create a duplicate.
+- Read back the resulting issue/comment and labels before reporting completion. GitHub can
+  silently omit labels for callers without sufficient access. If labels are missing, retain the
+  ticket URL and report the incomplete labeling; do not create another issue to retry it.
 - Return the issue URL and whether it was created, updated or reopened, plus the installation's
   current state and next recovery step. A successful retry alone is not proof the repository bug
   is fixed: leave issue closure to verified resolution.
