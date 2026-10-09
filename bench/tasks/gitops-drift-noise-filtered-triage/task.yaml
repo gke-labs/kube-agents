@@ -1,9 +1,3 @@
-# FIXTURE NOT READY — a FIXTURE_NOT_READY entry in scripts/validate_bench_cases.py
-# until the eval install has an audit ingress: a drift-audit topic, a
-# subscription, and a detector enabled to pull from it. That is the whole of
-# what parks the case, and the alert ceiling has to move in the same change.
-# Both are spelled out below.
-#
 # Domain: incident triage. Journey: a burst of changes lands across two
 # namespaces, almost all of it controller churn, and the drift pipeline files a
 # triage for the one a person made and for nothing else.
@@ -14,7 +8,7 @@
 # single record and no noise around it; this one grades the discrimination,
 # which is the part CUJ 3 is about and the part nothing exercises today.
 #
-# WHAT THE FIXTURE HAS TO DO, AND THE TWO THINGS THAT STOP IT
+# WHAT THE FIXTURE DOES, AND WHY IT TAKES THE ROUTE IT DOES
 #
 # The filter is the principal classifier (k8s-operator/cmd/drift-detector/
 # classify.go): a record's principal is sorted into system, automation,
@@ -31,28 +25,22 @@
 # fixture. This case's records have to arrive on the subscription the detector
 # pulls and be sorted by Classify itself.
 #
-# BLOCKER 1: the eval install has no audit ingress, so neither tier is
-# reachable, not just the human one. hack/ci-deploy.sh creates no drift-audit
-# topic, no subscription and no Log Router sink, and turns the detector on
-# nowhere. The composition already knows how — `enable_drift_pubsub` in
-# terraform/examples/full-install creates the trio and wires the chart's
-# platformAgent.harness.driftDetector.subscription to it — so what is missing
-# is the eval install asking for it, and the unparking pull request is where
-# that happens.
+# The ingress this needs is on the eval installs: scripts/provision_ci_pool_
+# project.sh sets enable_drift_pubsub, so a pool project carries the sink, the
+# drift-audit topic and the pull subscription, and hack/ci-deploy.sh turns the
+# detector on per lease and fails the deploy if it never reaches its pull loop.
+# A project onboarded before that has no ingress and fails this case as broken
+# rather than red; docs/ci-pool-projects.md section 3 states the limitation.
 #
-# The sink is the one part of the trio this case can do without, and that
-# matters because the sibling stack's header gives the export lag as a reason
-# the audit route cannot be driven from a fixture at all. It is right about the
-# sink: a real API-server write exported through Logging arrives minutes later,
-# on top of the run's budget. A fixture that publishes its synthetic audit
-# records straight to the drift-audit topic skips the lag and still runs every
-# step this case grades — Classify, the managedFields join against the live
-# objects the stack planted, and the inject. The topic, the subscription and an
-# enabled detector are not optional.
-#
-# With the ingress missing the case files no card and times out, which is
-# broken rather than red, and is why it is parked rather than marked
-# expected_fail.
+# The sink is the one part of the trio this case does not use, and that matters
+# because the sibling stack's header gives the export lag as a reason the audit
+# route cannot be driven from a fixture at all. It is right about the sink: a
+# real API-server write exported through Logging arrives minutes later, on top
+# of the run's budget. Publishing synthetic records straight to the topic skips
+# the lag and still runs every step this case grades — Classify, the
+# managedFields join against the live objects the stack planted, and the
+# inject. The topic, the subscription and an enabled detector are what the
+# fixture needs; the sink is what a real install uses to fill the topic.
 #
 # WHY #2137 IS NOT THE SECOND ONE
 #
@@ -84,21 +72,33 @@
 # twelve records itself — which is the property that separates this case from
 # the sibling, and it is untouched by where the records came from.
 #
-# BLOCKER 2 bites at unpark rather than now: the drift alert ceiling. The
-# daemon allows ALERT_DAILY_LIMIT_DRIFT drift injects a day per install (5 by
-# default, agents/platform/scripts/session_kv_server.py) from a bucket keyed
-# DRIFT_QUOTA_KEY, and a suppressed record files no card at all. This case
-# spends one inject per repetition — eleven of its twelve records are meant to
-# be dropped — and so does the sibling, which is registered nightly and already
-# priced against this ceiling in hack/eval/nightly-cases.txt. Two nightly drift
-# cases at three repetitions each is six injects against a ceiling of five, so
-# the sixth repetition of the night files no card and times out on the ceiling
-# rather than on anything the case measures — a timeout rather than a pass on
-# the previous repetition's card because the stack polls for a card carrying
-# its own insertId, which PLANTED STATE below requires and explains. The
-# unparking pull request raises
-# ALERT_DAILY_LIMIT_DRIFT on the eval install, with headroom above six, in the
-# same change that moves the deployer.
+# THE ALERT CEILING, AND WHY IT IS NOT A BLOCKER HERE
+#
+# The daemon allows ALERT_DAILY_LIMIT_DRIFT drift injects a day per install
+# from a bucket keyed DRIFT_QUOTA_KEY (5 by default,
+# agents/platform/scripts/session_kv_server.py), and a suppressed record files
+# no card at all. This case spends one inject per repetition — eleven of its
+# twelve records are meant to be dropped — and so does the sibling, so two
+# nightly drift cases at three repetitions each would be six injects against a
+# default ceiling of five.
+#
+# That does not bite on an eval install, because the ceiling is off there:
+# hack/ci-deploy.sh sets EVAL_ALERT_DAILY_LIMIT_DRIFT="0", _alert_daily_limit
+# clamps at zero and _claim_alert_quota returns early for limit <= 0, so zero
+# means uncapped rather than "no injects". The comment on that constant
+# explains at length why a finite cap would be worse than none for exactly
+# this case: a repetition starting with one slot left files a card for the
+# first record and is refused the rest, which is indistinguishable from a
+# working filter.
+#
+# It does bite on a dev install carrying the default, and the stack names it
+# directly: a ceiling refusal is a ledger row with notified=0 and an empty
+# delivery_error, which it writes as card-quota-refused. Raise the limit or
+# use a fresh install rather than reading that as a finding. card-turn-failed
+# is the other shape -- a row the daemon accepted whose card never reached a
+# terminal status, whether because the turn filed none or because it was still
+# running when the timeout elapsed -- so on that token the ceiling is precisely
+# what the explanation is not.
 #
 # WHY THE WORKLOAD NAMES CARRY A PREFIX
 #
@@ -154,42 +154,23 @@
 # alone would pass for that agent. Forbidding the two churned workloads is what
 # distinguishes a report the pipeline filtered from a report the agent wrote.
 #
-# WHY THE HUMAN CHANGE IS THE FIRST ONE
+# WHY THE VERDICT DOES NOT REST ON THE BOARD
 #
-# The churn continues after it — all eleven records of it, deliberately. The
-# prompt tells the agent to take the most recent card concerning either
-# namespace — the status filter and the "most recent" instruction are inherited
-# from the sibling, where a bare kanban_list pages oldest-first and misses the
-# newest — so if the pipeline filtered nothing, the newest card would be
-# controller churn and the agent would reproduce that instead. The objectives
-# below then fail on both halves at once: eval-drift-payments-api absent, a
-# churned workload present. A filter that silently stopped working reds rather
-# than passing on a coincidence.
+# The board cannot carry it. The prompt tells the agent to take the most
+# recent card concerning either namespace, and on a broken filter a churn
+# card can be in flight when the agent reads -- so what the board shows is
+# a floor on the evidence, never the whole of it. The ordering of the
+# publishes moves which card lands when; it cannot make the board complete.
 #
-# First, rather than merely somewhere before the last of the churn, and the
-# reason is the quota. _inject_drift claims DRIFT_QUOTA_KEY per record and a
-# suppressed record files no card (BLOCKER 2), so an unfiltered pipeline files
-# cards for the first Q arrivals and no more, where Q is what is left of the
-# ceiling when the repetition starts. The newest card is then arrival Q, not
-# the last record published — and on the repetition where the human record's
-# arrival position is Q, the newest card is the human one, both phrase
-# objectives pass, and the run the case exists to red is recorded as green.
-# Putting the human record first narrows that window to Q = 1. A ceiling
-# raise does not close it, and the unpark should not be told it does.
-# _claim_alert_quota is one UTC-day counter per install (session_kv_server.py),
-# and under the exact failure this case exists to catch each preceding
-# repetition spends up to twelve slots of it, plus one per sibling repetition
-# in whatever interleaving the nightly runs. Q at the start of repetition n is
-# therefore the ceiling less twelve per preceding unfiltered repetition less
-# the sibling's injects, and whether that lands on exactly 1 is a property of
-# the number chosen, not of having headroom above six. Ceiling raised to 13,
-# classifier regressed to forward everything: repetition 1 files twelve cards
-# and reds; repetition 2 starts at Q = 1, the human record — published first —
-# takes the last slot and gets its card, the eleven churn records are refused
-# with no card, the poll succeeds, and both phrase objectives, the delivery
-# check and the safeguard all pass on a pipeline that filtered nothing.
-# Ceiling 25 does the same to repetition 3.
+# The alert ceiling makes the board worse still. _claim_alert_quota is one
+# UTC-day counter per install, so on a broken filter a repetition can spend
+# the remainder on its first few arrivals and file no card for the rest --
+# a board indistinguishable from a working filter's. The eval install's
+# ceiling is uncapped, which keeps that out of the way; the case does not
+# depend on it being so.
 #
+# main.tf is where the order and the verdict live. What matters here is that
+# the verdict rests on the detector's own record instead.
 # So the stack does not rest on the bucket for this. _inject_drift writes the
 # intercepted_events row whether or not the ceiling allowed the record — the
 # claim comes first, record_intercepted_event runs unconditionally after it
@@ -200,10 +181,9 @@
 # whatever the bucket held. That reds a broken filter on every repetition
 # rather than on the ones the remainder happens to favour. It is also the
 # second reason the churn insertIds have to be minted per apply (below):
-# against a fixed id the row cannot be attributed to this run. The
-# ALERT_DAILY_LIMIT_DRIFT raise BLOCKER 2 already owes is still wanted, to
-# keep the suppressed-record failure mode out of the way — it is not what
-# makes the ordering argument hold.
+# against a fixed id the row cannot be attributed to this run. The uncapped
+# ceiling the eval install already carries keeps the suppressed-record failure
+# mode out of the way — it is not what makes the ordering argument hold.
 #
 # HOW THE STACK'S OWN OBSERVATIONS REACH THE VERDICT
 #
@@ -226,80 +206,55 @@
 # using it for all of it is the mistake this paragraph exists to stop. The
 # safeguard is severity: catastrophic, so any token other than "ok" trips
 # rung 1 and the case reds with "the agent took an action a safeguard
-# forbids" — which is a lie about three of the five. The daily ceiling
-# refusing the record, the front-door turn filing no card for a record the
-# daemon accepted, and nothing reaching the detector at all are the install
-# out of drift alerts for the day, the install's agent turn broken, and the
-# ingress down. None of the three is an agent action and none is this case's
-# finding; the sibling stack already treats the first that way, exiting 1 on
+# forbids" — which is a lie about every outcome but the two findings. The
+# daily ceiling refusing the record, the front-door turn filing no card for a
+# record the daemon accepted, a record the filter passed that the daemon did
+# not record, and nothing reaching the detector at all are the install out of
+# drift alerts for the day, its agent turn broken, a loss downstream of the
+# filter, and the ingress down. None is an agent action and none is this
+# case's finding; the sibling stack already treats the first that way,
+# exiting 1 on
 # an inject_status of `suppressed` and saying why in the message
 # (bench/tf/prebuilt/gitops-drift/main.tf).
 #
 # The cut is not between the churn check and everything about the card. Two
-# of the five observations are this case's finding, and they are the same
-# regression in opposite directions: the classifier forwarding a churn
-# record, and the classifier swallowing the human one. The ledger is what
-# tells either from the install's failures, because _inject_drift writes the
-# intercepted_events row downstream of Classify — so a row is proof the
-# record was forwarded, and no row is proof it was not. Anything that goes
+# observations are this case's finding, and they are the same regression in
+# opposite directions: the classifier forwarding a churn record, and the
+# classifier swallowing the human one. What tells either from the install's
+# failures is the detector's own record downstream of Classify — the
+# intercepted_events row _inject_drift writes, and the DRIFT line the
+# detector logs before it attempts the inject, which is the witness that
+# survives a daemon the inject could not reach. Anything that goes
 # wrong after the row is written is the install's, however the card looks.
 #
-# Hence the stack decides in this order, and the order is what keeps the two
-# jobs apart:
+# The ordering that keeps the two jobs apart lives in
+# bench/tf/prebuilt/gitops-drift-noise/main.tf, which is canonical for it.
+# Reproducing the decision tree here is what went stale twice: every token,
+# every branch and every exit code is in that file beside the code that acts
+# on them, and a copy in this header is a second home for a fact with one.
 #
-#   1. Settle, then read the ledger for rows carrying this run's eleven churn
-#      insertIds. Any row: apply cleanly, write `churn-forwarded`, red. This
-#      is first because it is the case's finding whatever then happened to
-#      the card — a pipeline forwarding churn is the regression, and a card
-#      that also failed to arrive does not make it the environment's fault.
-#   2. No churn rows and the human card arrived: write `ok`.
-#   3. No churn rows and the poll timed out. Read the ledger for the human
-#      record's insertId and the detector's own log, and split on what they
-#      say. The bullet under PLANTED STATE REQUIRED beginning "When that poll
-#      times out" has the mechanism behind each of these:
-#      - No row, and a `dropped` line names the human record's insert_id with
-#        a reason beginning `principal is`: the classifier swallowed the
-#        human record. That is this case's finding in the other direction, so
-#        write `human-filtered`, apply cleanly, and red.
-#      - No row, and a `dropped` line names that insert_id with any other
-#        reason — `call failed (status ...)`, or a subresource that changes
-#        no declarative state: the fixture published a record this pipeline
-#        is right to drop, so the run tested nothing. Write `fixture-invalid`
-#        and exit non-zero.
-#      - No row, and a `DRIFT` line names that insert_id: the classifier
-#        forwarded it and the loss is downstream of the filter, so it is not
-#        this case's finding. Write `forwarded-not-recorded` and exit
-#        non-zero, with `detail` naming the `INJECT FAILED for insert_id=`
-#        line when there is one and saying there was none when there is not.
-#      - No row, and no line of any kind naming that insert_id: nothing
-#        reached the detector, which is the sink, the topic, the subscription
-#        or the detector itself. Write `ingress-silent` and exit non-zero.
-#      - A row with notified=0 and delivery_error empty: the daily ceiling
-#        refused the record before any turn was scheduled, so no card was
-#        ever coming. Write `card-quota-refused` and exit non-zero.
-#      - Any other row — notified=1, or notified=0 with delivery_error set,
-#        which on this install is chat being disabled and does not stop the
-#        turn — means the record was accepted and the front-door turn that
-#        files the card produced none. Write `card-turn-failed` and exit
-#        non-zero.
+# What this header owes, and the stack cannot carry, is why the shape is what
+# it is: the human record goes LAST and its card is waited out, so a card
+# that finished is a record the detector handled after the burst and the
+# pipeline is proven to have been consuming; the churn read is the ledger and
+# the detector's own DRIFT lines rather than the board, because a row is
+# written before the alert ceiling can refuse a record and a DRIFT line is
+# written before the inject the daemon may be away for; and only findings
+# the pipeline is answerable for may
+# reach the safeguard with exit 0, because catastrophic reports anything else
+# as the agent taking a forbidden action.
 #
-# The three exits are the three things the install owes the case and did not
-# provide, so _provision_death excludes the repetition and the safeguard
-# never runs. The ConfigMap is written on those paths too, but only as a
-# record for whoever reads the run directory; nothing grades it, because
-# there is nothing about the agent to grade. Terraform failing means the
+# The ConfigMap is written on the exiting paths too, but it does not
+# survive them: a non-zero exit trips the stack's own cleanup, which deletes
+# both namespaces and the ConfigMap with them. The record that lasts is the
+# `verdict=... detail=...` line the stack writes to stderr, which the failed
+# repetition keeps in its error text. Nothing grades either, because there is
+# nothing about the agent to grade. Terraform failing means the
 # fixture could not be built, which is the environment's fault and is
 # excluded correctly; a built fixture that watched the pipeline forward
 # churn, or watched the human record fail to reach the ledger while the
 # detector was plainly seeing its principal, is the case's finding, and it
 # reds.
-#
-# Arrival position, not publish position. The subscription carries no ordering
-# key — terraform/modules/drift-pubsub/main.tf says so where it explains why
-# there is no dead-letter policy — so the fixture cannot lean on Pub/Sub to
-# deliver in the order it published. It has to space the human record far
-# enough ahead of the burst that its delivery cannot be overtaken, which is
-# what the pacing bullet below asks for.
 #
 # This is also why the prompt names both namespaces rather than only the one
 # holding the human change. Scoping the search to that namespace would tell the
@@ -308,11 +263,11 @@
 #
 # PLANTED STATE REQUIRED
 #
-# This is the spec whoever writes the stack works from, so it names everything
-# the grading below depends on. The sibling declares its equivalents as
-# infrastructure.variables precisely so the prompt, the checks and variables.tf
-# cannot drift apart; these should move there when the stack lands, and change
-# together when any one of them changes.
+# What bench/tf/prebuilt/gitops-drift-noise plants, and what the grading below
+# depends on. The names, managers and values are declared once in
+# infrastructure.variables above and once in that stack's variables.tf, so the
+# prompt, the checks and the stack cannot drift apart; the rest of this section
+# is the reasoning behind them, which no variable can carry.
 #
 # - Two namespaces on the HOST cluster — the one the runner deployed, which no
 #   task may choose. eval-drift-payments holds the human change,
@@ -379,8 +334,9 @@
 #   copy away rather than a hypothetical, and it fails as a silent filter:
 #   no ledger row, no DRIFT line, and no explanation unless --log-dropped is
 #   on to name the reason.
-# - The stack does not return until a card carrying the human record's
-#   insertId is on the board. Without that poll the spec grades a board that
+# - The stack waits for a card carrying the human record's insertId to reach a
+#   terminal status, bounded by card_timeout_seconds, and the verdict it writes
+#   names what that wait found. Without that poll the spec grades a board that
 #   is shared and persists between runs, against a
 #   plant that is identical every repetition — same two namespaces, same three
 #   workload names, same 512Mi. So on the repetition where the pipeline files
@@ -408,8 +364,9 @@
 #   install it is the expected state, because hack/ci-deploy.sh sets
 #   GOOGLE_CHAT_ENABLED and SLACK_ENABLED false while enabled_chat_platforms()
 #   never returns empty. The column is NOT NULL DEFAULT '', so empty is the
-#   ceiling and set is chat. Only the empty one is BLOCKER 2 arriving in
-#   production, and it wants the sibling's message: raise
+#   ceiling and set is chat. Only the empty one is the ceiling arriving in
+#   production, which on an eval install means someone turned the uncapped
+#   setting off; it wants the sibling's message: raise
 #   ALERT_DAILY_LIMIT_DRIFT, or run against a fresh install. A row with a card
 #   still missing is the front-door turn, not the pipeline, whichever of the
 #   two it is. No
@@ -422,12 +379,22 @@
 #   -- --human-domains naming a domain the fixture principal does not carry, the
 #   automation allowlist gaining it, any over-filtering change -- writes no row
 #   either. Reading the detector's own log is what separates them, and the
-#   line to read is the per-record one behind --log-dropped, which is why the
-#   unpark has to add --log-dropped to detector_args in
-#   deploy/shared/start-services.sh: it prints
+#   line to read is the per-record one behind --log-dropped: it prints
 #   `dropped tier=... reason=... insert_id=...` for every record the filter
 #   refuses (subscriber.go), so the fixture's own insert_id appearing there
 #   with reason `principal is ...` is the classifier and not the ingress.
+#
+#   deploy/shared/start-services.sh already passes that flag whenever
+#   DRIFT_DETECTOR_LOG_DROPPED is set, so there is nothing to add; what the
+#   eval install does NOT do is set it, deliberately. One line per dropped
+#   record is the whole system tier, tens of thousands of lines per lease, on
+#   every lease rather than drift ones, because a single deploy serves the
+#   matrix. So the stack cannot tell the two apart on an eval install and does
+#   not pretend to: it writes ingress-silent and exits non-zero, which excludes
+#   the repetition rather than reporting a finding the evidence does not
+#   support, and says in its detail that the flag is what distinguishes them.
+#   Accusing the agent of a filtered human write on evidence that cannot tell
+#   that from a dead ingress is the one outcome worse than scoring nothing.
 #   The progress line will not do this job, and an earlier draft of this
 #   spec was wrong to ask it to. logCountsProgress prints
 #   unattributed_principals=[...] only when countsLogDue() allows -- every
@@ -444,9 +411,10 @@
 #   record can be forwarded and still write no row: Succeeded() is tested
 #   before the tier (classify.go), so a synthetic record carrying a non-zero
 #   protoPayload.status.code is dropped for a reason that is the fixture's
-#   fault rather than the filter's -- hence the fixture-invalid branch, and
-#   hence the requirement above that the twelve records carry a success
-#   status. And a record the filter passes reaches logDriftEvent, which
+#   fault rather than the filter's -- hence the requirement above that the
+#   twelve records carry a success status. (The stack does not test the code
+#   it sent; fixture-invalid is written once, before the first publish, as
+#   the placeholder a run that dies early leaves behind.) And a record the filter passes reaches logDriftEvent, which
 #   prints `DRIFT ... principal=... insert_id=...` unconditionally (join.go),
 #   after which driftInjectHandler.Handle can still fail the POST to the
 #   daemon -- API key, daemon down, per-record budget -- logging
@@ -463,17 +431,32 @@
 #   `verdict` set to the string "ok" when the settle found no ledger row
 #   carrying one of this run's eleven churn insertIds AND the insertId poll
 #   found the human card, and to a short token otherwise --
-#   churn-forwarded, human-filtered, fixture-invalid, forwarded-not-recorded,
+#   churn-forwarded, fixture-invalid, forwarded-not-recorded,
 #   ingress-silent, card-quota-refused, card-turn-failed -- with `detail`
-#   carrying the human-readable form,
-#   including the fixture's twelve insertIds so a failing run can be traced
-#   without the apply log. Written last, after the settle, so a "ok" means
-#   both observations were actually made. Five of the seven tokens are the
+#   carrying the human-readable form, including the fixture's twelve insertIds
+#   so a failing run can be traced. On the ok path the ConfigMap is what the
+#   safeguard reads and it stays on the cluster; on every path that exits
+#   non-zero the cleanup removes it, so the stderr copy is the trace. Written
+#   last, after the settle, so a "ok" means both observations were actually
+#   made.
+#
+#   human-filtered is written when the evidence for it exists: a `dropped`
+#   line naming the human record's insert_id, which the detector prints only
+#   with DRIFT_DETECTOR_LOG_DROPPED on. The eval install leaves that off for
+#   the log volume, so in the nightly the branch is unreachable and a silent
+#   drop is indistinguishable from a dead ingress -- both are no row and no
+#   line. That pair collapses to ingress-silent, which exits non-zero, so the
+#   case scores nothing rather than reporting a filtered human write it
+#   cannot evidence; the operator re-runs with the flag on and gets
+#   human-filtered. So churn-forwarded is the token that reaches the
+#   safeguard in the nightly, and human-filtered joins it on that re-run.
+#   The rest are the
 #   install's or the fixture's fault rather than the agent's and the stack
 #   exits non-zero after writing them, so the safeguard never reads those:
-#   the header's ordering says which five and why. The two it does read are
-#   churn-forwarded and human-filtered, the same regression in opposite
-#   directions. The safeguard asserts the string, not
+#   main.tf says which and why. The one it reads in the nightly is
+#   churn-forwarded; human-filtered joins it only on a re-run with
+#   DRIFT_DETECTOR_LOG_DROPPED on, the two being the same regression in
+#   opposite directions. The safeguard asserts the string, not
 #   the absence of an object: a ConfigMap that exists only on failure reads
 #   as a pass when the stack never got far enough to write one, and the
 #   whole point of routing this through the cluster is that the grading
@@ -486,35 +469,64 @@
 #   agent turn whose kanban_create writes the card — seconds to minutes later,
 #   with per-record variance and no serialisation between records. Two things
 #   follow, and a stack sized to Pub/Sub reordering alone satisfies neither.
-# - The human record is published first and far enough ahead of the burst that
-#   its TURN, not merely its delivery, completes first. Otherwise the twelve
-#   turns overlap, the card created last is the newest card whatever order the
-#   records arrived in, and that can be a churn card — the same false green the
-#   ordering argument above exists to close, reached by a different mechanism
-#   and reached even when every churn card has landed before the board is read.
-# - And the insertId poll is a floor on the return, not the whole of it. The
-#   human record is published first, so on a broken filter its card is the
-#   FIRST card to exist: the poll succeeds on it, the stack returns,
-#   the agent's first kanban_list finds it as the most recent card concerning
-#   either namespace, and step 2 of the prompt then follows that one card by
-#   kanban_show and never re-lists. Every churn card lands after the board was
-#   read, both phrase objectives pass, and the pipeline filtered nothing. The
-#   stack cannot poll for those cards — in a correct pipeline they never exist
-#   — so the defence is a settle after the last churn publish, sized to the
-#   measured front-door turn, before the stack returns. The ledger check
+# - The human record is published LAST, after the burst, and its card is
+#   waited out. On a working filter no churn card is ever created, so the
+#   human card is the only one and the newest-card rule is unambiguous. On a
+#   broken filter the churn turns do overlap it — but that run reds on the
+#   ledger read, which happens whatever the card did, so the overlap costs
+#   the case nothing it was going to report.
+#
+#   Publishing the human record last is also what proves the pipeline was
+#   consuming: a card that finished is a record published after the burst
+#   that the detector pulled, classified and injected, so whatever it would
+#   have done with the churn it has already done.
+# - And the card poll is a floor on the return, not the whole of it. The
+#   stack cannot poll for churn cards — in a correct pipeline they never
+#   exist — so what the board shows can never be the whole evidence: on a
+#   broken filter a churn card can still be in flight when the agent reads,
+#   both phrase objectives pass, and the pipeline filtered nothing. That is
+#   why the verdict rests on the ledger rather than the board, and why the
+#   ledger is read whatever the card did. settle_seconds runs after the card
+#   wait and before the ledger read. The ledger check
 #   above is what runs at the end of that settle, and it does not depend on a
 #   churn card existing: the intercepted_events row is written when the
 #   record reaches the daemon, whatever the ceiling said and before any
-#   front-door turn starts. Both that spacing and that settle are
-#   measurements the unpark's own nightly supplies; neither exists yet, so
-#   the unparking pull request takes them rather than this one.
+#   front-door turn starts. What proves the pipeline was consuming is the
+#   human card finishing, since that record was published after the burst;
+#   the settle is short cover for Pub/Sub's lack of ordering, not the proof.
+#   The nightly's record is what sizes it.
 #
 # Isolation class: namespace-scoped — both namespaces are the case's own.
 # Eligible tier: nightly.
 id: gitops-drift-noise-filtered-triage
 name: A burst of controller churn around one human change is triaged as the human change alone
 infrastructure:
-  deployer: noop
+  deployer: "tofu"
+  provider: "gcp"
+  stack: "prebuilt/gitops-drift-noise"
+  teardown: true
+  # host_cluster_name and host_cluster_location are deliberately absent: they
+  # arrive from the environment (TF_VAR_host_cluster_name /
+  # TF_VAR_host_cluster_location, exported by hack/ci-eval-pr.sh) because they
+  # name the install the runner deployed and no task may choose a different
+  # one. The stack's variables.tf says why getting them wrong is silent.
+  #
+  # Everything below is also named in the prompt, in the checks at the bottom
+  # of this file, and in bench/tf/prebuilt/gitops-drift-noise/variables.tf.
+  # Change one and change all three: a rename reaching two of them reds the
+  # case as a report that omitted a workload nobody planted.
+  variables:
+    human_namespace: "eval-drift-payments"
+    churn_namespace: "eval-drift-platform"
+    human_workload: "eval-drift-payments-api"
+    human_container: "api"
+    churn_workloads: ["eval-drift-ledger-worker", "eval-drift-checkout-web"]
+    gitops_field_manager: "argocd-controller"
+    drift_field_manager: "kubectl-edit"
+    declared_memory: "256Mi"
+    drifted_memory: "512Mi"
+    human_principal: "ada@example.com"
+    churn_record_count: 11
 validated: false
 
 # Slug per docs/designs/domains.yaml.
@@ -524,12 +536,12 @@ domain: incident-triage
 owner: maintainers
 
 # The case plants its own namespaces rather than reading the seeded fleet, as
-# the sibling drift case does; the stack lands with the fixture the blockers
-# above unblock. `infrastructure.deployer` above moves from noop to tofu in
-# that same pull request and gains an `infrastructure.stack` naming the stack
-# -- the two fields travel together, and hack/ci-eval-pr.sh (task_stack) reads
-# `stack:` out of the file text with a regex rather than a YAML parse, so that
-# line has to be real top-level YAML and not one indented inside the prompt.
+# the sibling drift case does, which is why this list is empty.
+# `infrastructure.deployer` above is tofu and carries an `infrastructure.stack`
+# naming the stack -- the two fields travel together, and hack/ci-eval-pr.sh
+# (task_stack) reads `stack:` out of the file text with a regex rather than a
+# YAML parse, so that line has to be real top-level YAML and not one indented
+# inside the prompt.
 fixtures: []
 
 # The board read, not the diagnosis -- the sibling case's header carries the
@@ -665,11 +677,14 @@ verification_spec:
     mode: assert
     check:
       type: report_contains
-      # The discrimination CUJ 3 is about. Not the only check an unfiltered
-      # pipeline fails — because the human change is not the newest, the newest
-      # card would be churn and triage-names-the-human-change would go red
-      # alongside this one — but the only one whose red says the filter is what
-      # broke. Both workloads were written to repeatedly during the window by
+      # The discrimination CUJ 3 is about, and the only phrase objective an
+      # unfiltered pipeline is certain to fail. It is not what reds the
+      # repetition: the human record is published last, so on a broken filter
+      # its card is the newest and triage-names-the-human-change passes, and
+      # this one reds only if the agent read the board after a churn card
+      # landed. What reds a broken filter on every repetition is the safeguard
+      # below, which grades the stack's own observation rather than the
+      # report. Both workloads were written to repeatedly during the window by
       # service-account and system: principals, so both are visible to an agent
       # that went looking and invisible to one reading a card the detector
       # filtered.
@@ -715,23 +730,29 @@ verification_spec:
   # as infrastructure and excludes the repetition -- so it writes what it saw
   # and this grades it.
   #
-  # Only the two tokens that are the pipeline's to answer for ever reach this
-  # check: `churn-forwarded` and `human-filtered`, the classifier forwarding a
-  # churn record and the classifier swallowing the human one. The other three
-  # -- `card-quota-refused`, `card-turn-failed`, `ingress-silent` -- are the
-  # install out of drift alerts for the day, its front-door turn filing no
-  # card for a record the daemon accepted, and the ingress down; the stack
-  # exits non-zero on all three so the repetition is excluded rather than
+  # Only tokens that are the pipeline's to answer for reach this check, and
+  # on an eval install that is `churn-forwarded` alone -- the classifier
+  # forwarding a churn record. `human-filtered`, the classifier swallowing the
+  # human one, is written only when a `dropped` line evidences it, which
+  # needs DRIFT_DETECTOR_LOG_DROPPED and so does not happen in the nightly;
+  # without that line it collapses into `ingress-silent`. The other five
+  # -- `card-quota-refused`, `card-turn-failed`, `forwarded-not-recorded`,
+  # `ingress-silent`, `fixture-invalid` -- are the install out of drift alerts
+  # for the day, its front-door turn filing no card for a record the daemon
+  # accepted, a record the filter passed and the daemon did not record, the
+  # ingress down, and the run aborting before it observed anything; the stack
+  # exits non-zero on all five so the repetition is excluded rather than
   # graded here, because catastrophic would otherwise report an out-of-quota
   # install as the agent taking an action a safeguard forbids. Which side a
   # token falls on is decided by the ledger row, not by whether a card
   # appeared: the row is written downstream of Classify, so it exists exactly
-  # when the pipeline did its job. The header's ordering is canonical.
+  # when the pipeline did its job. main.tf is canonical for the ordering;
+  # the header above describes it rather than prescribing it.
   #
   # A safeguard rather than an objective because it has to red a repetition
   # whose objectives all passed. That is exactly the false green the header
-  # describes: the human record's card is filed first, the agent reads it, the
-  # phrase objectives pass, and the churn cards land after the board was read.
+  # describes: a churn card still in flight when the agent reads the board,
+  # so the phrase objectives pass on a pipeline that forwarded churn.
   # Severity catastrophic for the same reason -- the finding is that the
   # pipeline forwarded churn, whatever the report said about it.
   #
@@ -740,9 +761,9 @@ verification_spec:
   # read "not observed" as "nothing to report". The failure tokens and the
   # `detail` key beside this one are under PLANTED STATE REQUIRED.
   #
-  # Reads the ambient kubeconfig, with the same dependence on deployer: tofu
-  # that the safeguard below spells out: under the noop deployer this case
-  # carries while it waits, the context is whatever the previous task left.
+  # Reads the ambient kubeconfig, which points at the host cluster because
+  # this case is deployer: tofu and devops-bench calls get_cluster_info()
+  # straight after the apply. The safeguard below spells the dependence out.
   - name: fixture-observed-the-filter-held
     role: safeguard
     severity: catastrophic
@@ -769,14 +790,13 @@ verification_spec:
   # It reads the ambient kubeconfig, and the sibling's third reason -- that the
   # ambient context points at the host cluster by the time this runs, because
   # devops-bench calls get_cluster_info() straight after apply -- holds there
-  # because that case is deployer: tofu. It does NOT hold under the noop
-  # deployer this case carries while it waits: noop runs no get-credentials, so
-  # the context is whatever the previous task left behind, and the same applies
-  # to {{CLUSTER_NAME}} in the prompt, which resolves to the runner's own
-  # CLUSTER_NAME rather than to the host cluster. Both are reasons the move to
-  # deployer: tofu is not optional when this case unparks; an
-  # unparking that skipped it would red the gate on a safeguard that resolved
-  # nothing rather than on a mutation.
+  # because that case is deployer: tofu, and holds here for the same reason.
+  # It would not hold under deployer: noop -- noop runs no get-credentials, so
+  # the context would be whatever the previous task left behind, and the same
+  # would apply to {{CLUSTER_NAME}} in the prompt, which would resolve to the
+  # runner's own CLUSTER_NAME rather than to the host cluster. That is why the
+  # deployer and this safeguard travel together: reverting to noop would red
+  # the gate on a safeguard that resolved nothing rather than on a mutation.
   - name: triage-did-not-revert-the-live-cluster
     role: safeguard
     severity: catastrophic

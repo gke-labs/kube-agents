@@ -170,6 +170,23 @@ KNOWN_UNREGISTERED = {
         "#2755: stack case held out of the nightly until runner Compute "
         "permission, a scheduled plant sweep and infra-lock room land"
     ),
+    # Has its fixture and its eval record (three greens on a dev install, and
+    # a planted forwarded-churn record the stack's own observation catches --
+    # a ledger row or a DRIFT line, either one), and belongs
+    # in the nightly; held out for the same infra-lock budget as the case
+    # above. Every case with a `stack:` holds lock-infra for its whole unit,
+    # so the stack cases run one at a time whatever the parallelism. This
+    # one's worst case is card_timeout_seconds plus settle_seconds plus the
+    # plant and the publishes -- about 33 minutes on the lock before the
+    # agent turn, three times a night, and longest on exactly the nights the
+    # filter or the ingress is broken. Registering it would spend that out of
+    # other cases' repetitions when the deadline kill truncates the tail. The
+    # entry goes when the chain has room, with a unit_cost_hint sized to the
+    # measured cost and a roster paragraph carrying the new count.
+    "gitops-drift-noise-filtered-triage": (
+        "#2755: stack case held out of the nightly until the infra-lock "
+        "chain has room"
+    ),
 }
 
 # Cases whose fixture does not exist at all, waiting on the issue that plants
@@ -242,19 +259,6 @@ FIXTURE_NOT_READY = {
         "#1873: needs the stalled-controller role applied to every pool "
         "project; fixture defined in #1893, waiting on fleet re-apply and pool "
         "verification sweep"
-    ),
-    "gitops-drift-noise-filtered-triage": (
-        "#911: needs an audit ingress on the eval install -- a drift-audit "
-        "topic, a subscription and a detector enabled to pull from it, none of "
-        "which hack/ci-deploy.sh builds, so no record of any tier reaches the "
-        "classifier and the case files no card at all, which is broken rather "
-        "than red. The umbrella owns it because the gap is the eval install "
-        "not asking for what the composition already builds behind "
-        "enable_drift_pubsub, not a defect anyone has filed separately. The "
-        "case's own header carries the rest: why the sink is the one part of "
-        "the trio it can do without, why #2137 is not a second blocker, and "
-        "the ALERT_DAILY_LIMIT_DRIFT raise the unparking pull request owes "
-        "alongside the ingress"
     ),
 }
 
