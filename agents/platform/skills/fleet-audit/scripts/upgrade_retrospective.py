@@ -173,7 +173,9 @@ REPORT_IS_LINK_TEXT = "--report must not be named {name}: that is the link a ful
 LOCK_HELD_TEXT = "another retrospective run holds {path} since {since}; waited {minutes} min for it; nothing written"
 # Three triggers write the same files: a run that finds the lock held waits
 # this long for it, polling, and only then prints the line above and exits.
-LOCK_WAIT = timedelta(minutes=20)
+# Ten minutes: the SOP runs the collector as a background terminal command
+# with a 1500-second budget, and the wait and the run both fit inside it.
+LOCK_WAIT = timedelta(minutes=10)
 LOCK_POLL_INTERVAL = timedelta(seconds=15)
 STATE_UNREADABLE_DRY_RUN_TEXT = "{path} {why}; a dry run moves nothing and stops here. Nothing written."
 STATE_NOT_MOVED_TEXT = "{path} {why} and could not be moved aside ({error}); it is unchanged in place. Fix or move it by hand, then rerun. Nothing written."
@@ -269,6 +271,28 @@ CONTAINER_FAILURE_REASONS = ("OOMKilled", "CrashLoopBackOff", "ImagePullBackOff"
 # Symptom categories, selection statuses, and the catalogue entries the
 # classifier and the shape detectors decide in code.
 CATEGORY_PENDING, CATEGORY_NOT_READY, CATEGORY_NODE, CATEGORY_EVENT, CATEGORY_PDB = "pending", "not-ready", "node", "event", "pdb"
+# Entry 3: a Deployment or StatefulSet every replica of which sat on the
+# drained nodes or in the drained zone and whose availability fell to zero
+# inside one pool operation. Entry 5: a pool two minors from its control
+# plane, or one pool's nodes on two versions, still so a day after the last
+# maintenance window closed or exclusion ended.
+CATEGORY_UNAVAILABLE, CATEGORY_VERSION_SKEW = "unavailable", "version-skew"
+UNAVAILABLE_REASON = "Available=False"
+SPREAD_KINDS = ("Deployment", "StatefulSet")
+ZONE_LABEL = "topology.kubernetes.io/zone"
+SPREAD_POOL_DETAIL = "every replica sat on the drained pool"
+SPREAD_ZONE_DETAIL = "every replica sat in the drained zone, not all on the drained pool"
+SKEW_REASON = "version skew"
+SKEW_MINORS = 2
+SKEW_GRACE = timedelta(days=1)
+SKEW_CONTROL_PLANE_FORMAT = "pool {pool} at {pool_version}, control plane at {master} ({minors} minors apart)"
+SKEW_WITHIN_POOL_FORMAT = "pool {pool} nodes on {versions}"
+SKEW_REFERENCE_FORMAT = "{what} ended {at}, {hours} h before this run"
+SKEW_WINDOW_WHAT = "the maintenance window"
+SKEW_EXCLUSION_WHAT = "exclusion {name}"
+WINDOW_OPEN_STATE = "the maintenance window is open now"
+EXCLUSION_ACTIVE_FORMAT = "exclusion {name} ({scope}) is active until {end}"
+SKEW_OPEN_TEXT = "Version skew held: {skews}; {state}, so the roll may still complete; graded on a later run."
 STATUS_NEW, STATUS_UPGRADED, STATUS_FORCED = "new", "upgraded", "forced"
 # A symptom against the ledger's baseline from the cluster's last review.
 SINCE_FIRST_SEEN, SINCE_NEW, SINCE_BEFORE = "first seen", "new since the last review", "present before"
@@ -295,7 +319,7 @@ RESET_LEDGER_NOTHING_TEXT = "no crash record to archive."
 # symptoms, nodes for the pools, owners so the keys match the review's.
 REFRESH_READS = ("pods", "nodes", "owners")
 BASELINE_SEPARATOR = "|"
-ENTRY_BUDGET, ENTRY_CAPACITY, ENTRY_NODE_LOCAL_STATE, ENTRY_REMOVED_API, ENTRY_WEBHOOK = 1, 2, 4, 6, 7
+ENTRY_BUDGET, ENTRY_CAPACITY, ENTRY_SPREAD, ENTRY_NODE_LOCAL_STATE, ENTRY_WINDOW, ENTRY_REMOVED_API, ENTRY_WEBHOOK = 1, 2, 3, 4, 5, 6, 7
 ENTRY_NODE_LABEL, ENTRY_RUNTIME, ENTRY_CGROUP_V2, ENTRY_OOM_GROUP, ENTRY_NODE_AGENT = 12, 13, 14, 15, 17
 ENTRY_GPU, ENTRY_IN_TREE_VOLUME, ENTRY_REGISTRY = 18, 19, 20
 # Entries whose signature is text an upgrade did not necessarily cause: high
@@ -367,7 +391,7 @@ SIGNATURES = (
 # named, a volume, a GPU, the pool's cgroup mode and the runtime floor before
 # "several processes", a registry, a node, capacity on the targeted pool, a
 # budget) and 12, the generic selector miss, goes last.
-ENTRY_ORDER = (ENTRY_WEBHOOK, ENTRY_REMOVED_API, ENTRY_IN_TREE_VOLUME, ENTRY_GPU, ENTRY_CGROUP_V2, ENTRY_OOM_GROUP, ENTRY_REGISTRY, ENTRY_NODE_AGENT, ENTRY_CAPACITY, ENTRY_BUDGET, ENTRY_NODE_LABEL)
+ENTRY_ORDER = (ENTRY_WEBHOOK, ENTRY_REMOVED_API, ENTRY_IN_TREE_VOLUME, ENTRY_GPU, ENTRY_CGROUP_V2, ENTRY_OOM_GROUP, ENTRY_REGISTRY, ENTRY_NODE_AGENT, ENTRY_SPREAD, ENTRY_CAPACITY, ENTRY_BUDGET, ENTRY_WINDOW, ENTRY_NODE_LABEL)
 SIGNATURE_ROWS = {entry: [(confidence, scope, pattern) for e, confidence, scope, pattern in SIGNATURES if e == entry] for entry in ENTRY_ORDER}
 OOM_SECOND_CAUSE_FORMAT = "entry {entry} may also apply: {count} containers in the pod"
 # Text a namespace user can write: an Event's reason and message, and a
@@ -440,6 +464,10 @@ MANIFEST_OUTCOME_COLLECTED = "collected"
 MANIFEST_OUTCOME_UNREACHABLE = "unreachable"
 MANIFEST_OUTCOME_GATE_FAILED = "gate-failed"
 MANIFEST_OUTCOME_OUT_OF_SCOPE = "out-of-scope"
+# A cluster upgrading now is collected with every check not applicable, so one
+# cluster mid-window does not make the Sunday run partial; its held guards are
+# re-emitted as candidates.
+UPGRADING_NOT_APPLICABLE_REASON = "upgrading now; reviewed after the operation ends"
 # The SOP files an Error at `major` and a Warning at `minor`, never `critical`.
 MANIFEST_SEVERITY_MAJOR, MANIFEST_SEVERITY_MINOR = "major", "minor"
 # A failed operation's candidate names the operation.
@@ -456,6 +484,18 @@ CORE_READS = ("pods", "nodes", "events", "pdbs", "owners")
 # the containerd socket a node agent couples itself to (13), and the names
 # that say a node-local volume holds state (4).
 DEPRECATED_NODE_LABEL_PREFIXES = ("beta.kubernetes.io/", "failure-domain.beta.kubernetes.io/")
+# Entry 12's after-signal grades high only when the selector names a label a
+# kubelet or node image stopped setting at or before the pool's minor; a
+# `didn't match` clause alone also fits an autoscaled pool at zero, a label a
+# pool never carried or a deleted pool. The table is the catalogue entry's
+# "labels dropped" list by (major, minor): kubeadm stopped applying
+# `node-role.kubernetes.io/master` in v1.24 (kubernetes/kubeadm#2200 and the
+# v1.24 changelog); the beta labels above are deprecated but still set
+# (https://kubernetes.io/docs/reference/labels-annotations-taints/), so they
+# are the before-signal, not a drop.
+DROPPED_NODE_LABELS = {"node-role.kubernetes.io/master": (1, 24)}
+LABEL_DROPPED_FORMAT = "{label} dropped in {major}.{minor}"
+LABEL_NOT_DROPPED_TEXT = "selector names no label the catalogue lists as dropped by the pool's minor"
 RETIRED_IMAGE_HOSTS = ("k8s.gcr.io/", "gcr.io/google-containers/", "gcr.io/google_containers/", "gcr.io/kubernetes-helm/")
 IN_TREE_PD_PROVISIONER = "kubernetes.io/gce-pd"
 IN_TREE_PD_VOLUME_KEY = "gcePersistentDisk"
@@ -568,6 +608,9 @@ EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
 # risk guard the shape's feeding reads.
 RECHECK_FAILURE_READS = ("pods", "owners", "nodes")
 RECHECK_BUDGET_READS = ("pdbs",)
+# An entry-3 guard is re-observed from the workload's own availability, which
+# needs the workloads read; the operation it fell inside cannot be re-read.
+RECHECK_SPREAD_READS = ("workloads",)
 # Tenant text reaches the Markdown only through `_cell`: control characters
 # go, and the three characters that could open a cell, a code span or a line.
 CONTROL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f]+")
@@ -1866,6 +1909,8 @@ class Context(NamedTuple):
     label_pools: dict = {}  # (label, value) -> the pools whose nodes carry it
     failing_pods: dict = {}  # (namespace, pod) -> the API-set field that shows it failing
     failing_objects: dict = {}  # owner object -> the API-set field that shows it failing
+    pool_versions: dict = {}  # pool -> its version from the cluster describe
+    control_plane: str = ""
 
 
 def pool_labels(cluster: dict, nodes: list[dict]) -> dict[tuple[str, str], set[str]]:
@@ -1999,6 +2044,20 @@ def _api_agreement(symptom: dict, container: str | None, ctx: Context) -> str:
     return ""
 
 
+def _dropped_label(symptom: dict, ctx: Context) -> str:
+    """The selector label the catalogue lists as dropped at or before the
+    minor of the pool the pod targets (its control plane's when it names no
+    pool), or "" when it names none."""
+    selector = symptom.get("node_selector") or {}
+    pool = selector.get(NODEPOOL_LABEL) or next(iter(sorted(_selector_pools(selector, ctx.label_pools))), "")
+    parsed = parse_version(ctx.pool_versions.get(pool) or ctx.control_plane or "")
+    for label in sorted(selector):
+        dropped_at = DROPPED_NODE_LABELS.get(label)
+        if dropped_at and parsed and (parsed[0], parsed[1]) >= dropped_at:
+            return LABEL_DROPPED_FORMAT.format(label=label, major=dropped_at[0], minor=dropped_at[1])
+    return ""
+
+
 def _match_signature(symptom: dict, entry: int, ctx: Context) -> dict | None:
     """The entry's first signature row that matches, preferring text the API
     server set over text a namespace user could have written; None when no
@@ -2020,6 +2079,13 @@ def _match_signature(symptom: dict, entry: int, ctx: Context) -> dict | None:
             if total and missed and int(missed.group(1)) < int(total.group(1)):
                 return None
             detail = _selector_detail(symptom)
+            dropped = _dropped_label(symptom, ctx)
+            if dropped:
+                detail += f"; {dropped}"
+            else:
+                # The clause alone does not say the pool lost the label.
+                confidence = MEDIUM
+                detail += f"; {LABEL_NOT_DROPPED_TEXT}"
         elif entry == ENTRY_WEBHOOK:
             name = WEBHOOK_NAME_RE.search(text)
             detail = f"webhook {name.group(1)}" if name else ""
@@ -2174,6 +2240,31 @@ def _match_budget(symptom: dict, entry: int, ctx: Context) -> dict | None:
     return _classification(entry, HIGH, f"disruptionsAllowed=0 with pods on {', '.join(touched)}; UPGRADE_NODES {info['operation']} on {named} took {info['longest_s'] // SECONDS_PER_MINUTE} min over {info['nodes']} node(s); {source}", detail)
 
 
+def _match_spread(symptom: dict, entry: int, ctx: Context) -> dict | None:
+    """Entry 3: every replica unavailable during one pool operation; high
+    when the pods' nodes were all in the operation's pool, medium when they
+    were all in the drained zone."""
+    if symptom["category"] != CATEGORY_UNAVAILABLE:
+        return None
+    count, pool = len(symptom.get("pods") or []), symptom.get("pool") or ""
+    start, end = symptom.get("operation_span") or ("?", "?")
+    if symptom.get("all_in_pool"):
+        where, confidence, detail = f"all {count} pod(s) on pool {pool}", HIGH, SPREAD_POOL_DETAIL
+    else:
+        where, confidence, detail = f"all {count} pod(s) in zone {symptom.get('zone') or '?'} (pools {', '.join(sorted(symptom.get('pod_pools') or [])) or '?'})", MEDIUM, SPREAD_ZONE_DETAIL
+    evidence = f"{symptom['reason']} since {symptom.get('onset') or '?'} during UPGRADE_NODES {symptom.get('operation') or '?'} on {pool} ({start} to {end}); {where}"
+    return _classification(entry, confidence, evidence, detail)
+
+
+def _match_window(symptom: dict, entry: int, ctx: Context) -> dict | None:
+    """Entry 5: a version skew that stands more than a day after the last
+    maintenance window closed or exclusion ended; medium, from the cluster
+    describe and the maintenance policy."""
+    if symptom["category"] != CATEGORY_VERSION_SKEW:
+        return None
+    return _classification(entry, MEDIUM, symptom.get("message") or "", symptom.get("reference") or "")
+
+
 ENTRY_MATCHERS: dict[int, Callable[[dict, int, Context], dict | None]] = {
     ENTRY_WEBHOOK: _match_signature,
     ENTRY_REMOVED_API: _match_removed_api,
@@ -2183,8 +2274,10 @@ ENTRY_MATCHERS: dict[int, Callable[[dict, int, Context], dict | None]] = {
     ENTRY_OOM_GROUP: _match_oom_group,
     ENTRY_REGISTRY: _match_signature,
     ENTRY_NODE_AGENT: _match_node_agent,
+    ENTRY_SPREAD: _match_spread,
     ENTRY_CAPACITY: _match_signature,
     ENTRY_BUDGET: _match_budget,
+    ENTRY_WINDOW: _match_window,
     ENTRY_NODE_LABEL: _match_signature,
 }
 
@@ -2303,6 +2396,193 @@ def mark_since(symptoms: list[dict], baseline: list[str] | None, first_operation
         symptom["predates_upgrade"] = recorded or before_operation
 
 
+def _unavailable_workloads(workloads: list[dict]) -> dict[str, tuple[datetime | None, str]]:
+    """Deployments whose `Available` condition is False, with the transition
+    and message, and StatefulSets with no ready replica (no condition and no
+    date: the pods date those), by object."""
+    out: dict[str, tuple[datetime | None, str]] = {}
+    for workload in workloads:
+        kind, meta, status = workload.get("kind") or "", workload.get("metadata") or {}, workload.get("status") or {}
+        if kind not in SPREAD_KINDS:
+            continue
+        obj = _object_ref(meta.get("namespace", ""), kind, meta.get("name", ""))
+        if kind == "Deployment":
+            cond = _condition(workload, "Available")
+            if cond.get("status") == "False":
+                out[obj] = (parse_ts(cond.get("lastTransitionTime")), (cond.get("message") or cond.get("reason") or "")[:MESSAGE_EXCERPT_CHARS])
+        elif (status.get("replicas") or 0) > 0 and not (status.get("readyReplicas") or 0):
+            out[obj] = (None, f"readyReplicas 0 of {status.get('replicas')}")
+    return out
+
+
+def unavailable_symptoms(workloads: list[dict], pods: list[dict], nodes: list[dict], operations: list[dict], resolver: Resolver) -> list[dict]:
+    """Entry 3's after-signal: a Deployment or StatefulSet whose availability
+    fell to zero inside one pool operation's span, every pod of which sits on
+    that pool or in the zone it drained. Keyed by the operation, like a
+    budget hold, so the next upgrade's outage is a new finding."""
+    spans: list[tuple[str, str, datetime, datetime]] = []
+    for op in operations:
+        target = parse_target_link(op.get("targetLink", ""))
+        start, end = parse_ts(op.get("startTime")), parse_ts(op.get("endTime"))
+        if op.get("operationType") == OP_UPGRADE_NODES and target and target[2] and start and end:
+            spans.append((target[2], op.get("name") or "", start, end))
+    if not spans:
+        return []
+    node_pool, node_zone = {}, {}
+    for node in nodes:
+        meta = node.get("metadata") or {}
+        labels = meta.get("labels") or {}
+        node_pool[meta.get("name")] = labels.get(NODEPOOL_LABEL, "")
+        node_zone[meta.get("name")] = labels.get(ZONE_LABEL, "")
+    pool_zones: dict[str, set[str]] = {}
+    for name, pool in node_pool.items():
+        if pool and node_zone.get(name):
+            pool_zones.setdefault(pool, set()).add(node_zone[name])
+    owned: dict[str, list[dict]] = {}
+    for pod in pods:
+        meta = pod.get("metadata") or {}
+        kind, name = resolver.resolve(meta.get("namespace", ""), "Pod", meta.get("name", ""))
+        owned.setdefault(_object_ref(meta.get("namespace", ""), kind, name), []).append(pod)
+    rows = []
+    for obj, (onset, message) in _unavailable_workloads(workloads).items():
+        pods_of = owned.get(obj) or []
+        if not pods_of:
+            continue
+        if onset is None:
+            # A StatefulSet carries no date: the earliest pod the drain recreated.
+            created = [parse_ts((p.get("metadata") or {}).get("creationTimestamp")) for p in pods_of]
+            inside = [c for c in created if c and any(start <= c <= end for _, _, start, end in spans)]
+            onset = min(inside) if inside else None
+        if onset is None:
+            continue
+        hit = next(((pool, name, start, end) for pool, name, start, end in spans if start <= onset <= end), None)
+        if hit is None:
+            continue
+        pool, op_name, start, end = hit
+        pod_nodes = {(p.get("metadata") or {}).get("name", ""): (p.get("spec") or {}).get("nodeName") for p in pods_of}
+        pools = {node_pool.get(n or "", "") for n in pod_nodes.values()}
+        zones = {node_zone.get(n or "", "") for n in pod_nodes.values()}
+        all_in_pool = pools == {pool}
+        all_in_zone = len(zones) == 1 and "" not in zones and zones <= pool_zones.get(pool, set())
+        if not (all_in_pool or all_in_zone):
+            continue
+        namespace, kind, name = obj.split("/", 2)
+        rows.append({
+            "kind": kind,
+            "namespace": namespace,
+            "name": name,
+            "object": obj,
+            "system": is_system_namespace(namespace),
+            "category": CATEGORY_UNAVAILABLE,
+            "reason": UNAVAILABLE_REASON,
+            "message": message,
+            "onset": fmt_ts(onset),
+            "operation": op_name,
+            "operation_span": (fmt_ts(start), fmt_ts(end)),
+            "pool": pool,
+            "pods": sorted(pod_nodes),
+            "pod_nodes": pod_nodes,
+            "pod_pools": sorted(p for p in pools if p),
+            "zone": next(iter(zones)) if len(zones) == 1 else "",
+            "all_in_pool": all_in_pool,
+        })
+    return rows
+
+
+def _last_closing(window: dict, now: datetime) -> tuple[bool, datetime | None]:
+    """Whether the maintenance window is open now and, when it is not, when
+    its most recent occurrence closed; (False, None) for a rule this does
+    not parse, or none at all."""
+    daily, recurring = window.get("dailyMaintenanceWindow"), window.get("recurringWindow")
+    try:
+        if daily:
+            start_t = datetime.strptime(daily.get("startTime") or "00:00", DAILY_WINDOW_TIME_FORMAT).time().replace(tzinfo=timezone.utc)
+            length, days = _parse_iso_duration(daily.get("duration") or "") or DEFAULT_DAILY_WINDOW, []
+        elif recurring:
+            rule = {k: v for k, v in (part.split("=", 1) for part in (recurring.get("recurrence") or "").split(";") if "=" in part)}
+            start, end = parse_ts((recurring.get("window") or {}).get("startTime")), parse_ts((recurring.get("window") or {}).get("endTime"))
+            freq = rule.get("FREQ")
+            if start is None or freq not in (RRULE_FREQ_DAILY, RRULE_FREQ_WEEKLY):
+                return False, None
+            days = [RRULE_WEEKDAYS[d] for d in (rule.get("BYDAY") or "").split(",") if d in RRULE_WEEKDAYS]
+            if freq == RRULE_FREQ_WEEKLY and not days:
+                days = [start.weekday()]
+            start_t, length = start.timetz(), (end - start) if end else timedelta(0)
+        else:
+            return False, None
+    except ValueError:
+        return False, None
+    for offset in range(NEXT_WINDOW_SEARCH_DAYS + 1):
+        candidate = datetime.combine((now - timedelta(days=offset)).date(), start_t)
+        if candidate > now or (days and candidate.weekday() not in days):
+            continue
+        return (True, None) if now < candidate + length else (False, candidate + length)
+    return False, None
+
+
+def version_skew(cluster: dict, nodes: list[dict], now: datetime) -> dict:
+    """Entry 5's after-signal from the cluster describe and the maintenance
+    policy: a pool two minors from its control plane, or one pool's nodes on
+    two versions. Overdue when the skew stands more than `SKEW_GRACE` after
+    the last window closed or the last exclusion ended; while a window is
+    open or an exclusion active the roll may still complete, which is Info."""
+    versions = versions_of(cluster)
+    master = parse_version(versions["control_plane"] or "")
+    skews: list[tuple[str, str]] = []
+    for pool, version in sorted(versions["node_pools"].items()):
+        parsed = parse_version(version or "")
+        if master and parsed and master[0] == parsed[0] and abs(master[1] - parsed[1]) >= SKEW_MINORS:
+            skews.append((pool, SKEW_CONTROL_PLANE_FORMAT.format(pool=pool, pool_version=version, master=versions["control_plane"], minors=abs(master[1] - parsed[1]))))
+    by_pool: dict[str, set[str]] = {}
+    for node in nodes:
+        labels = (node.get("metadata") or {}).get("labels") or {}
+        kubelet = ((node.get("status") or {}).get("nodeInfo") or {}).get("kubeletVersion") or ""
+        if labels.get(NODEPOOL_LABEL) and kubelet:
+            by_pool.setdefault(labels[NODEPOOL_LABEL], set()).add(kubelet.lstrip("v"))
+    for pool, found in sorted(by_pool.items()):
+        if len(found) >= SKEW_MINORS:
+            skews.append((pool, SKEW_WITHIN_POOL_FORMAT.format(pool=pool, versions=", ".join(sorted(found)))))
+    policy = ((cluster.get("maintenancePolicy") or {}).get("window") or {})
+    open_now, last_close = _last_closing(policy, now)
+    state = WINDOW_OPEN_STATE if open_now else ""
+    last_end: tuple[datetime, str] | None = None
+    for name, exclusion in sorted((policy.get("maintenanceExclusions") or {}).items()):
+        start, end = parse_ts(exclusion.get("startTime")), parse_ts(exclusion.get("endTime"))
+        if start and end and start <= now <= end:
+            state = state or EXCLUSION_ACTIVE_FORMAT.format(name=name, scope=((exclusion.get("maintenanceExclusionOptions") or {}).get("scope")) or DEFAULT_EXCLUSION_SCOPE, end=fmt_ts(end))
+        elif end and end <= now and (last_end is None or end > last_end[0]):
+            last_end = (end, name)
+    reference: tuple[datetime, str] | None = None
+    if last_close and (last_end is None or last_close >= last_end[0]):
+        reference = (last_close, SKEW_WINDOW_WHAT)
+    elif last_end:
+        reference = (last_end[0], SKEW_EXCLUSION_WHAT.format(name=last_end[1]))
+    reference_text = SKEW_REFERENCE_FORMAT.format(what=reference[1], at=fmt_ts(reference[0]), hours=int((now - reference[0]).total_seconds() // SECONDS_PER_HOUR)) if reference else ""
+    return {"skews": skews, "state": state, "reference": reference_text, "overdue": bool(skews) and not state and reference is not None and now - reference[0] > SKEW_GRACE}
+
+
+def version_skew_symptoms(cluster: dict, nodes: list[dict], now: datetime | None) -> list[dict]:
+    """One row per skewed pool once the skew is overdue; nothing without a
+    clock to measure the day against."""
+    if now is None:
+        return []
+    reading = version_skew(cluster, nodes, now)
+    if not reading["overdue"]:
+        return []
+    return [{
+        "kind": "NodePool",
+        "namespace": "",
+        "name": pool,
+        "object": _object_ref("", "NodePool", pool),
+        "system": True,
+        "category": CATEGORY_VERSION_SKEW,
+        "reason": SKEW_REASON,
+        "message": text,
+        "onset": None,
+        "reference": reading["reference"],
+    } for pool, text in reading["skews"]]
+
+
 def _api_set_failures(pods: list[dict], owners: list[dict], resolver: Resolver) -> tuple[dict[tuple[str, str], str], dict[str, str]]:
     """What the API server itself says is failing: a pod whose phase, or a
     container state the kubelet wrote, shows it, and an owner whose
@@ -2364,6 +2644,8 @@ def collect_symptoms(cluster: dict, reads: dict[str, list], operations: list[dic
         label_pools=pool_labels(cluster, nodes),
         failing_pods=failing_pods,
         failing_objects=failing_objects,
+        pool_versions=versions_of(cluster)["node_pools"],
+        control_plane=versions_of(cluster)["control_plane"] or "",
     )
     node_pool_of = {(n.get("metadata") or {}).get("name"): ((n.get("metadata") or {}).get("labels") or {}).get(NODEPOOL_LABEL, "") for n in nodes}
     pods = pod_symptoms(reads.get("pods") or [], resolver, window_start, owner_age_proofs(reads.get("workloads") or []), pool_operation_windows(operations), node_pool_of, owner_rollouts(reads.get("owners") or []), now, starting)
@@ -2382,6 +2664,7 @@ def collect_symptoms(cluster: dict, reads: dict[str, list], operations: list[dic
     for e in events:
         e.setdefault("node_selector", owner_selectors.get(e["object"], {}))
     symptoms = pods + node_symptoms(nodes) + events + pdb_symptoms(reads.get("pdbs") or [], reads.get("pods") or [], nodes, upgraded, pool_operation_windows(operations), owner_selectors, resolver, ctx.label_pools)
+    symptoms += unavailable_symptoms(reads.get("workloads") or [], reads.get("pods") or [], nodes, operations, resolver) + version_skew_symptoms(cluster, nodes, now)
     for symptom in symptoms:
         symptom["classifications"] = classify_symptom(symptom, ctx)
         if symptom.get("pod_count"):
@@ -2936,6 +3219,8 @@ def recheck_cluster(key: str, cluster: dict, cluster_guards: list[dict], *, run:
             needed |= set(RECHECK_FAILURE_READS)
             if guard.get("entry") == ENTRY_BUDGET:
                 needed |= set(RECHECK_BUDGET_READS)
+            if guard.get("entry") == ENTRY_SPREAD:
+                needed |= set(RECHECK_SPREAD_READS)
     result = {"cluster": key, "guards": len(cluster_guards), "cleared": [], "refreshed": [], "not_recheckable": [], "errors": [], "symptom_baseline": None, "commands": {}}
     kubeconfig, error = fetch_credentials(cluster, run=run)
     if error:
@@ -2956,6 +3241,9 @@ def recheck_cluster(key: str, cluster: dict, cluster_guards: list[dict], *, run:
     # A budget still allowing no disruption keeps its entry-1 failure guard:
     # the drain it held cannot be re-observed without the operation.
     budgets_at_zero = {_object_ref((b.get("metadata") or {}).get("namespace", ""), "PodDisruptionBudget", (b.get("metadata") or {}).get("name", "")) for b in reads.get("pdbs") or [] if (b.get("status") or {}).get("disruptionsAllowed") == 0}
+    # A workload still unavailable keeps its entry-3 guard: the operation its
+    # outage fell inside cannot be re-observed, the outage can.
+    unavailable = set(_unavailable_workloads(reads.get("workloads") or []))
     symptoms = collect_symptoms(cluster, reads, [], EPOCH, now=now)
     if refresh and set(REFRESH_READS) <= answered:
         result["symptom_baseline"] = sorted({symptom_key(sym) for sym in symptoms})
@@ -2966,8 +3254,8 @@ def recheck_cluster(key: str, cluster: dict, cluster_guards: list[dict], *, run:
         if kind == GUARD_KIND_FAILURE and guard.get("source") == GUARD_SOURCE_EVENT:
             result["not_recheckable"].append(guard["id"])
             continue
-        reads_needed = set(guard.get("reads") or SPEC_SHAPE_READS) if kind == GUARD_KIND_RISK else set(RECHECK_FAILURE_READS) | (set(RECHECK_BUDGET_READS) if guard.get("entry") == ENTRY_BUDGET else set())
-        present = guard["id"] in fresh or (kind == GUARD_KIND_FAILURE and guard.get("entry") == ENTRY_BUDGET and guard.get("object") in budgets_at_zero)
+        reads_needed = set(guard.get("reads") or SPEC_SHAPE_READS) if kind == GUARD_KIND_RISK else set(RECHECK_FAILURE_READS) | (set(RECHECK_BUDGET_READS) if guard.get("entry") == ENTRY_BUDGET else set()) | (set(RECHECK_SPREAD_READS) if guard.get("entry") == ENTRY_SPREAD else set())
+        present = guard["id"] in fresh or (kind == GUARD_KIND_FAILURE and guard.get("entry") == ENTRY_BUDGET and guard.get("object") in budgets_at_zero) or (kind == GUARD_KIND_FAILURE and guard.get("entry") == ENTRY_SPREAD and guard.get("object") in unavailable)
         if present:
             result["refreshed"].append(guard["id"])
         elif reads_needed <= answered:
@@ -3051,6 +3339,7 @@ def _safe_review(selection: Selection, ledger: dict, **kwargs) -> dict:
             "answered": [],
             "commands": [],
             "starting": [],
+            "skew_open": [],
         }
 
 
@@ -3079,6 +3368,7 @@ def review_cluster(selection: Selection, ledger: dict, *, run: RunFn, seen_at: s
         "answered": [],
         "commands": [],
         "starting": [],
+        "skew_open": [],
     }
     review["next_upgrade"] = _safe_next_upgrade(cluster, server_config, now or now_utc(), review["read_errors"])
     ops = selection.operations
@@ -3111,6 +3401,8 @@ def review_cluster(selection: Selection, ledger: dict, *, run: RunFn, seen_at: s
     starting: list[str] = []
     symptoms = collect_symptoms(cluster, {k: v for k, v in reads.items() if k not in failed}, ops, window_start, operations_known=operations_command is not None, now=now, starting=starting)
     review["starting"] = starting
+    skew = version_skew(cluster, reads.get("nodes") or [], now or now_utc())
+    review["skew_open"] = [SKEW_OPEN_TEXT.format(skews="; ".join(text for _, text in skew["skews"]), state=skew["state"])] if skew["skews"] and skew["state"] else []
     entry = (ledger.get("clusters") or {}).get(selection.key) or {}
     mark_since(symptoms, entry.get("symptoms") if entry.get("last_run") else None, first_op)
     review["what_failed"] = symptoms
@@ -3249,6 +3541,7 @@ def triage(reviews: list[dict], unchanged: list[dict], failed_reads: list[str], 
                 "partial": review.get("partial") or [],
                 "outside_fleet": bool(review.get("outside_fleet")),
                 "starting": review.get("starting") or [],
+                "skew_open": review.get("skew_open") or [],
                 "next_upgrade": review["next_upgrade"],
                 "shapes": review["shapes"],
                 "managed_agents": review["managed_agents"],
@@ -3260,7 +3553,7 @@ def triage(reviews: list[dict], unchanged: list[dict], failed_reads: list[str], 
     upgrading_keys = {row["cluster"] for row in upgrading or []}
     not_recheckable = {gid for r in rechecks or [] for gid in r.get("not_recheckable") or []}
     recheck_errors = {r["cluster"]: r["errors"] for r in rechecks or [] if r.get("errors")}
-    stale: dict[tuple[str, str], dict] = {}
+    stale: dict[str, list[dict]] = {}
     for guard in guards:
         # A risk is never an incident, so only a failure guard that outlived
         # its last review is a Warning; stale risk guards stay in the file,
@@ -3276,32 +3569,9 @@ def triage(reviews: list[dict], unchanged: list[dict], failed_reads: list[str], 
             # now" and is reviewed next run, guards included.
             continue
         if guard.get("last_seen") != seen_at and guard.get("kind", GUARD_KIND_FAILURE) == GUARD_KIND_FAILURE:
-            # One incident per object, whatever the number of entries its
-            # guards carry: a finding is identified by check, cluster,
-            # namespace and object, so two guards here are one finding.
-            incident = stale.get((guard["cluster"], guard["object"]))
-            if incident is None:
-                stale[(guard["cluster"], guard["object"])] = incident = {
-                    "partial": partial_reads.get(guard["cluster"]) or [],
-                    "event_only": True,
-                    "recheck_errors": recheck_errors.get(guard["cluster"]) or [],
-                    "kind": INCIDENT_STALE_GUARD,
-                    "severity": SEVERITY_WARNING,
-                    "cluster": guard["cluster"],
-                    "object": guard["object"],
-                    "system": False,
-                    "entries": "",
-                    "what_happened": None,
-                    "symptoms": [],
-                    "mitigations": [],
-                    "guards": [],
-                }
-                warnings.append(incident)
-            incident["guards"].append(guard)
-            incident["event_only"] = incident["event_only"] and guard["id"] in not_recheckable
-    for incident in stale.values():
-        incident["guards"].sort(key=lambda g: (g.get("entry") or 0, g["id"]))
-        incident["entries"] = ", ".join(str(e) for e in sorted({g["entry"] for g in incident["guards"]}))
+            stale.setdefault(guard["cluster"], []).append(guard)
+    for cluster, held in stale.items():
+        warnings.extend(fold_held_guards(cluster, held, not_recheckable, partial_reads.get(cluster) or [], recheck_errors.get(cluster) or []))
     errors.sort(key=_incident_key)
     warnings.sort(key=_incident_key)
     return {
@@ -3309,6 +3579,38 @@ def triage(reviews: list[dict], unchanged: list[dict], failed_reads: list[str], 
         "warnings": warnings,
         "info": {"clean": clean, "unchanged": unchanged, "failed_reads": failed_reads, "removed": list(removed or []), "rechecked": list(rechecks or []), "upgrading": list(upgrading or []), "scoped": scope_reason},
     }
+
+
+def fold_held_guards(cluster: str, held: list[dict], not_recheckable: set[str] | None = None, partial: list[str] | None = None, recheck_errors: list[str] | None = None) -> list[dict]:
+    """Failure guards held on a cluster this run did not re-observe, as one
+    stale-guard incident per object whatever the number of entries its
+    guards carry: a finding is identified by check, cluster, namespace and
+    object, so two guards on one object are one finding."""
+    by_object: dict[str, dict] = {}
+    for guard in held:
+        incident = by_object.get(guard["object"])
+        if incident is None:
+            by_object[guard["object"]] = incident = {
+                "partial": list(partial or []),
+                "event_only": True,
+                "recheck_errors": list(recheck_errors or []),
+                "kind": INCIDENT_STALE_GUARD,
+                "severity": SEVERITY_WARNING,
+                "cluster": cluster,
+                "object": guard["object"],
+                "system": False,
+                "entries": "",
+                "what_happened": None,
+                "symptoms": [],
+                "mitigations": [],
+                "guards": [],
+            }
+        incident["guards"].append(guard)
+        incident["event_only"] = incident["event_only"] and guard["id"] in (not_recheckable or set())
+    for incident in by_object.values():
+        incident["guards"].sort(key=lambda g: (g.get("entry") or 0, g["id"]))
+        incident["entries"] = ", ".join(str(e) for e in sorted({g["entry"] for g in incident["guards"]}))
+    return sorted(by_object.values(), key=_incident_key)
 
 
 def _operations_lines(wh: dict) -> list[str]:
@@ -3438,6 +3740,8 @@ def _cluster_block_lines(row: dict) -> list[str]:
         lines += [PARTIAL_READ_TEXT.format(failed=", ".join(row["partial"])), ""]
     if row.get("starting"):
         lines += [STARTING_TEXT.format(count=len(row["starting"]), minutes=int(STARTING_GRACE.total_seconds() // SECONDS_PER_MINUTE), pods=", ".join(_cell(p) for p in row["starting"])), ""]
+    for note in row.get("skew_open") or []:
+        lines += [_cell(note), ""]
     lines += _next_upgrade_lines(row["next_upgrade"])
     lines.append("")
     lines += _risks_lines(row["shapes"], row.get("managed_agents") or 0, list(row.get("partial") or []) + list((row.get("baseline") or {}).get("shape_reads_failed") or []))
@@ -3571,12 +3875,27 @@ def build_manifest(result: dict, ledger: dict, *, started_at: str, finished_at: 
             "outcome": MANIFEST_OUTCOME_COLLECTED, "commands": commands, "candidates": candidates_of(key, commands),
             "facts": {"status": "unchanged", "control_plane": row["control_plane"], "last_operation": row.get("last_operation"), "next_upgrade": row.get("next_upgrade"), "last_run": row.get("last_run")},
         })
+    held_by_cluster: dict[str, list[dict]] = {}
+    for guard in result.get("guards") or []:
+        if guard.get("kind", GUARD_KIND_FAILURE) == GUARD_KIND_FAILURE:
+            held_by_cluster.setdefault(guard["cluster"], []).append(guard)
+    held_incidents: list[dict] = []
     for row in result["upgrading"]:
         key = row["cluster"]
         seen.add(key)
         project, location, _ = key.split(CLUSTER_KEY_SEPARATOR, 2)
-        op = row["operation"]
-        entries.append({"name": key, "project": project, "location": location, "outcome": MANIFEST_OUTCOME_GATE_FAILED, "error": _upgrading_line(row, str), "facts": {"operation": op}})
+        # Mid-window: nothing could be checked, so every check is not
+        # applicable rather than unevaluated, and the guards the cluster
+        # holds are re-emitted so the harness keeps their findings open.
+        incidents = fold_held_guards(key, held_by_cluster.get(key, []))
+        held_incidents.extend(incidents)
+        entries.append({
+            "name": key, "project": project, "location": location,
+            "outcome": MANIFEST_OUTCOME_COLLECTED, "commands": [],
+            "checks_not_applicable": [{"check": check, "reason": UPGRADING_NOT_APPLICABLE_REASON} for check, _ in CHECK_READS],
+            "candidates": [_incident_candidate(i, None) for i in incidents],
+            "facts": {"status": "upgrading", "operation": row["operation"], "held": _upgrading_line(row, str)},
+        })
     for line in result["failed_reads"]:
         key, _, reason = line.partition(": ")
         if key in seen or key.count(CLUSTER_KEY_SEPARATOR) != 2 or not reason.startswith("its project's listing failed"):
@@ -3588,7 +3907,7 @@ def build_manifest(result: dict, ledger: dict, *, started_at: str, finished_at: 
     # derives the still-flagged ids from (carried; `finish` builds the set from
     # the `upgrade-failure-persists` candidates above).
     still_flagged = []
-    for incident in sections["warnings"]:
+    for incident in [i for i in sections["warnings"] if i["kind"] == INCIDENT_STALE_GUARD] + held_incidents:
         if incident["kind"] == INCIDENT_STALE_GUARD:
             namespace, obj = _split_object(incident["object"])
             ids = [g["id"] for g in incident["guards"]]
