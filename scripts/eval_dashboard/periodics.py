@@ -889,7 +889,7 @@ def _supersession(job: str, readings: dict[str, dict]) -> str | None:
     """How the superseding job's latest build relates to this job's failed
     one: SUPERSEDED_RECOVERY when it passed later having reached every
     project the failed build named (a build naming none needs a whole pass),
-    at the same fleet tree (trees of different kinds are not compared), SUPERSEDED_SILENCE
+    at the same fleet tree (a failed build's pre-input-hash git id is not compared), SUPERSEDED_SILENCE
     when it failed later (its own note is the current story; nothing
     recovered), None otherwise. A later pass that never reached them (busy,
     not reached), or applied another tree of the same kind, is None."""
@@ -912,14 +912,17 @@ def _supersession(job: str, readings: dict[str, dict]) -> str | None:
     tree, later_tree = _fleet_tree(mine.get(KEY_ARTIFACT)), _fleet_tree(theirs.get(KEY_ARTIFACT))
     if not tree or not later_tree:
         return None
-    if len(tree) == len(later_tree) and tree != later_tree:
+    legacy = bool(_LEGACY_FLEET_TREE.fullmatch(tree)) and not _LEGACY_FLEET_TREE.fullmatch(later_tree)
+    if not legacy and tree != later_tree:
         # A daily that reached the project at another tree (one it started
         # from before the merge the failed build applied) proves nothing
         # about this one; the same tree from main, or the next merge's own
-        # build, does. Trees of different lengths are hashes of different
-        # kinds (a 40-hex git tree id from a report written before the
-        # input hash, against the 64-hex hash): neither equal nor unequal
-        # says anything, so the reach check decides alone.
+        # build, does. The one exception is a failed build whose report
+        # predates the input hash (a 40-hex git tree id) against a daily
+        # that carries the hash: no such daily could match, and it checked
+        # out main after that build's merge, so the reach check decides
+        # alone. The other way round (an old-kind daily, a new-kind failure)
+        # is a daily from before the merge, and proves nothing.
         return None
     named = _named_failures(mine.get(KEY_ARTIFACT))
     if not named:
@@ -928,6 +931,12 @@ def _supersession(job: str, readings: dict[str, dict]) -> str | None:
         # tree has done what it did not.
         return SUPERSEDED_RECOVERY if _whole_pass(theirs.get(KEY_ARTIFACT) or {}) else None
     return SUPERSEDED_RECOVERY if _reached(theirs.get(KEY_ARTIFACT), named) else None
+
+
+# The fleet tree reports carried before 2026-10-08 (#2645): `git rev-parse
+# HEAD:bench/tf/fleet`, a 40-hex tree id. Since then, a 64-hex sha256 over the
+# stack's inputs.
+_LEGACY_FLEET_TREE = re.compile(r"[0-9a-f]{40}")
 
 
 def _fleet_tree(artifact) -> str | None:

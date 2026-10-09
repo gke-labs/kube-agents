@@ -400,9 +400,13 @@ class AssessTest(unittest.TestCase):
         self.assertEqual(periodics.superseded_jobs({POST.job: old_kind, DAILY.job: new_kind})[POST.job]["recovery"], True)
         new_kind_missed = self.reading(DAILY, NOW - timedelta(hours=1), artifact={"fleet_tree": input_hash, "summary": {"applied": 34, "not_reached": 1}, "outcomes": {"kube-agents-evals-9": {"outcome": "not_reached", "detail": "busy"}}})
         self.assertEqual(periodics.superseded_jobs({POST.job: old_kind, DAILY.job: new_kind_missed}), {})
+        new_failed = self.reading(POST, NOW - timedelta(days=2), passed=False, artifact={"fleet_tree": input_hash, "summary": {"failed": 1}, "outcomes": {"kube-agents-evals-9": {"outcome": "failed", "detail": "forbidden"}}})
+        # The other way round, an old-kind daily against a new-kind failure,
+        # is a daily from before the merge the failure applied: no recovery.
+        old_daily = self.reading(DAILY, NOW - timedelta(hours=1), artifact={"fleet_tree": git_id, "summary": {"applied": 35}, "outcomes": {"kube-agents-evals-9": {"outcome": "applied", "detail": ""}}})
+        self.assertEqual(periodics.superseded_jobs({POST.job: new_failed, DAILY.job: old_daily}), {})
         # Same kind, different tree, stays what it was: no recovery.
         other_hash = self.reading(DAILY, NOW - timedelta(hours=1), artifact={"fleet_tree": "8" * 64, "summary": {"applied": 35}, "outcomes": {"kube-agents-evals-9": {"outcome": "applied", "detail": ""}}})
-        new_failed = self.reading(POST, NOW - timedelta(days=2), passed=False, artifact={"fleet_tree": input_hash, "summary": {"failed": 1}, "outcomes": {"kube-agents-evals-9": {"outcome": "failed", "detail": "forbidden"}}})
         self.assertEqual(periodics.superseded_jobs({POST.job: new_failed, DAILY.job: other_hash}), {})
         # A failed build that names no project (the pool busy for its whole
         # budget, a Boskos fault before the walk) reached nothing: only a
