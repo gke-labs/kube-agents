@@ -389,6 +389,21 @@ class AssessTest(unittest.TestCase):
         self.assertEqual(periodics.superseded_jobs({POST.job: failed, DAILY.job: gone})[POST.job]["recovery"], True)
         partial = self.reading(DAILY, NOW - timedelta(hours=1), artifact={"fleet_tree": "t1", "mode": "all", "visited": 1, "mapped": 2, "summary": {"converged": 1}, "outcomes": {"kube-agents-evals-3": {"outcome": "converged", "detail": ""}}})
         self.assertEqual(periodics.superseded_jobs({POST.job: failed, DAILY.job: partial}), {})
+        # Trees of different kinds are not compared. The report of a build
+        # written before the input hash carries a 40-hex git tree id, every
+        # later one the 64-hex hash; no later daily could ever match the
+        # old one, so the reach check decides alone (the 2026-10-08 on-merge
+        # failure, otherwise orange until the next stack merge).
+        git_id, input_hash = "d" * 40, "7" * 64
+        old_kind = self.reading(POST, NOW - timedelta(days=2), passed=False, artifact={"fleet_tree": git_id, "summary": {"failed": 1}, "outcomes": {"kube-agents-evals-9": {"outcome": "failed", "detail": "forbidden"}}})
+        new_kind = self.reading(DAILY, NOW - timedelta(hours=1), artifact={"fleet_tree": input_hash, "summary": {"applied": 35}, "outcomes": {"kube-agents-evals-9": {"outcome": "applied", "detail": ""}}})
+        self.assertEqual(periodics.superseded_jobs({POST.job: old_kind, DAILY.job: new_kind})[POST.job]["recovery"], True)
+        new_kind_missed = self.reading(DAILY, NOW - timedelta(hours=1), artifact={"fleet_tree": input_hash, "summary": {"applied": 34, "not_reached": 1}, "outcomes": {"kube-agents-evals-9": {"outcome": "not_reached", "detail": "busy"}}})
+        self.assertEqual(periodics.superseded_jobs({POST.job: old_kind, DAILY.job: new_kind_missed}), {})
+        # Same kind, different tree, stays what it was: no recovery.
+        other_hash = self.reading(DAILY, NOW - timedelta(hours=1), artifact={"fleet_tree": "8" * 64, "summary": {"applied": 35}, "outcomes": {"kube-agents-evals-9": {"outcome": "applied", "detail": ""}}})
+        new_failed = self.reading(POST, NOW - timedelta(days=2), passed=False, artifact={"fleet_tree": input_hash, "summary": {"failed": 1}, "outcomes": {"kube-agents-evals-9": {"outcome": "failed", "detail": "forbidden"}}})
+        self.assertEqual(periodics.superseded_jobs({POST.job: new_failed, DAILY.job: other_hash}), {})
         # A failed build that names no project (the pool busy for its whole
         # budget, a Boskos fault before the walk) reached nothing: only a
         # whole pass at its tree recovers it, not any pass that reached
