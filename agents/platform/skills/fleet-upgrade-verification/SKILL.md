@@ -27,7 +27,7 @@ Neither reads versions against a target.
 ```bash
 ./skills/fleet-upgrade-verification/scripts/fleet_upgrade_report.py \
   <collector_args from the fleet_scope tool, verbatim, or nothing on an install that declares no scope> \
-  [--project <project>]... [--cluster <name>]... [--target-version <version>] [--rollout-in-progress] \
+  [--project <project>]... [--cluster <location>/<name>... | --rollout-in-progress] [--target-version <version>] \
   [--readiness [--at <RFC 3339>] [--kubeconfig-dir <dir>]] \
   --output /opt/data/scratch/fleet_versions.json
 ```
