@@ -317,6 +317,9 @@ FOLD_HOLD_SECONDS = 30 * 60
 #: parent (failed, gave up, or waiting on the user) releases the child's
 #: answer at once.
 FOLD_WAITING_STATUSES = frozenset({"triage", "todo", "scheduled", "ready", "running", "review"})
+#: Parent statuses that mean it has completed (kanban_children_settled's
+#: settled set).
+FOLD_DONE_STATUSES = frozenset({"done", "archived"})
 #: kanban_children_settled's record of the card each worker's card was
 #: created by.
 WORKER_CHILDREN_TABLE = "kanban_worker_children"
@@ -380,13 +383,11 @@ def _fold_parent(conn: Any, child_id: str, sub: dict) -> Optional[tuple]:
             return None
         delivered = _sub_cursor(conn, parent, sub)
         if delivered is None:
-            # The notifier unsubscribes an archived card after delivering its
-            # last events, so an archived parent with no subscription has said
-            # its answer; any other missing subscription (dropped after send
-            # failures) has not, and does not fold.
-            if task[0] != "archived":
-                return None
-            delivered = 1 << 62
+            # No subscription: the notifier drops one after delivering an
+            # archived card's last events, and also after repeated send
+            # failures, and the row does not say which. Nothing proves the
+            # parent's answer posted, so the child's does not fold.
+            return None
         done = conn.execute(
             "SELECT MAX(id) FROM task_events WHERE task_id = ? AND kind = 'completed'", (parent,),
         ).fetchone()
@@ -418,7 +419,7 @@ def _advance(conn: Any, sub: dict, frm: int, to: int) -> bool:
 
 
 def _log_once(task_id: str, event_id: int, message: str, *args: Any) -> None:
-    key = (task_id, event_id)
+    key = (task_id, event_id, message)
     if key in _FOLD_LOGGED:
         logger.debug(message, *args)
         return
@@ -509,7 +510,7 @@ def fold_fanout(conn: Any, claim: Optional[dict], now: Optional[float] = None) -
             _log_once(child, event_id, "kanban notifier: %s's answer folded into its parent's, already posted; not posted", child)
             dropped = True
             continue
-        waiting = status in FOLD_WAITING_STATUSES or (status in ("done", "archived") and later)
+        waiting = status in FOLD_WAITING_STATUSES or (status in FOLD_DONE_STATUSES and later)
         if waiting and now - (getattr(ev, "created_at", 0) or 0) < FOLD_HOLD_SECONDS:
             committed = _durable_cursor(conn, child, sub) == int(claim.get("cursor") or 0) != int(claim.get("old_cursor") or 0)
             if committed:

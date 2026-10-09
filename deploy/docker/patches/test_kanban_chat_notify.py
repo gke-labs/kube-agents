@@ -691,12 +691,22 @@ class FoldFanoutTest(unittest.TestCase):
         self.assertIsNone(self.fold(claim), "held, not released: the ping is not a committed claim")
         self.assertEqual(self.cursor(), 6)
 
-    def test_an_archived_parent_that_answered_still_folds(self):
-        # The notifier unsubscribes an archived card after its last events.
+    def test_an_archived_parent_with_no_subscription_releases_the_answer(self):
+        # The notifier drops a sub both after an archived card's last events
+        # and after repeated send failures; the row cannot tell which, so the
+        # child's answer is not risked.
         self.parent("archived", completed_event=9)
         self.conn.execute("DELETE FROM kanban_notify_subs WHERE task_id = 't_parent'")
-        self.assertIsNone(self.fold(self.claim(_Ev(7, "completed", 1900))))
-        self.assertEqual(self.cursor(), 7)
+        claim = self.claim(_Ev(7, "completed", 1900))
+        self.assertIs(self.fold(claim), claim)
+
+    def test_a_drop_after_a_hold_is_logged(self):
+        with self.assertLogs(kanban_chat_notify.logger, level="DEBUG") as logs:
+            self.fold(self.claim(_Ev(7, "completed", 1900)))
+            self.parent("done", completed_event=9, delivered=9)
+            self.fold(self.claim(_Ev(7, "completed", 1900)))
+        infos = [r.getMessage() for r in logs.records if r.levelname == "INFO"]
+        self.assertTrue(any("holding" in m for m in infos) and any("folded" in m for m in infos), infos)
 
     def test_a_hold_logs_once(self):
         with self.assertLogs(kanban_chat_notify.logger, level="DEBUG") as logs:
