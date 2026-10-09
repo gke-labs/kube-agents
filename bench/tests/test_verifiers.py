@@ -1040,6 +1040,15 @@ def test_worker_commands_after_result_a_partial_capture_is_error_unless_a_hit_wa
     entries.append(_terminal("kubectl apply -f /tmp/dns.yaml", at=3))
     transcript.set("ok", _TRAJECTORY + entries, worker_capture_gaps=["card t_9: locked"])
     assert _RETRY.verify(5.0).status == "fail"
+    # A required command missing from a gapped capture may be in the unread
+    # part: error, as worker_agents reports it, not fail.
+    transcript.set("ok", _TRAJECTORY + entries[:2], worker_capture_gaps=["card t_9: locked"])
+    required = WorkerCommandsVerifier(
+        type="worker_commands", after_result_pattern=r"kubernetes\.read-only", required_patterns=[r"kubectl describe"]
+    )
+    assert required.verify(5.0).status == "error"
+    transcript.set("ok", _TRAJECTORY + entries[:2])
+    assert required.verify(5.0).status == "fail"
 
 
 def test_worker_commands_after_result_a_clipped_head_with_a_cut_escape_is_kept_raw():

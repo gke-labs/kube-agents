@@ -1313,7 +1313,8 @@ class WorkerCommandsVerifier(BaseVerifier):
     pattern leaves nothing after it, which passes the forbidden set and says
     so in the reason; no tagged terminal call at all is ``status="error"``,
     and so is a capture with gaps (``worker_capture_gaps``) that found no
-    forbidden command: the retry may be in the part it did not read.
+    forbidden command, a required one missing or not: the retry, or the
+    required command, may be in the part it did not read.
 
     Limits, stated so a case is not written against them: only terminal
     commands are visible, not MCP tool calls; only delegated workers'
@@ -1413,7 +1414,11 @@ class WorkerCommandsVerifier(BaseVerifier):
         hits = [
             (p, c) for p in self.forbidden_patterns for c in graded if re.search(p, c)
         ]
-        if missing or hits:
+        # A forbidden command that was read is conclusive whatever else was
+        # not; a missing required command, or a clean read, is not when the
+        # capture has gaps (the siblings' rule, ``worker_agents`` first).
+        partial = self.after_result_pattern is not None and snap.worker_capture_gaps
+        if hits or (missing and not partial):
             parts = []
             if missing:
                 parts.append(
@@ -1431,7 +1436,7 @@ class WorkerCommandsVerifier(BaseVerifier):
                 elapsed_time=time.monotonic() - start,
                 reason="; ".join(parts) + window,
             )
-        if self.after_result_pattern is not None and snap.worker_capture_gaps:
+        if partial:
             return VerificationResult(
                 success=False,
                 status="error",
