@@ -590,11 +590,14 @@ class KubeSystemReachTest(unittest.TestCase):
         self.assertEqual(outage[0]["version_pinned"], ["CREATE roles in kube-system,kube-public"])
         self.assertIn("the server serves CREATE roles in kube-system,kube-public at v1 alone, so it sends this webhook none of them", r.describe_webhook_finding(outage[0]))
 
-    def test_a_pinned_role_gate_scoped_off_kube_system_is_a_plain_outage(self):
+    def test_a_pinned_role_gate_scoped_off_kube_system_is_sent_nothing_and_says_so_without_a_namespace(self):
+        # The served version is the server's fact: a selector that admits neither bootstrap
+        # namespace changes the label, not the sentence.
         gate = scoped(hook("opa.example.com", [rule(["roles"], groups=("rbac.authorization.k8s.io",), versions=("v1beta1",))], policy="Fail"), self.SEEDED_SCOPE)
-        _, outage = self._one([gate])
-        self.assertEqual(outage[0]["version_pinned"], [])
-        self.assertIn("it fails its own requests now", r.describe_webhook_finding(outage[0]))
+        blocking, outage = self._one([gate])
+        self.assertEqual(blocking, [])
+        self.assertEqual(outage[0]["version_pinned"], ["CREATE roles"])
+        self.assertIn("the server serves CREATE roles at v1 alone, so it sends this webhook none of them", r.describe_webhook_finding(outage[0]))
 
     def test_the_node_path_match_is_named_ahead_of_the_kube_system_reach(self):
         gate = hook("opa.example.com", [rule(["pods", "roles"], groups=("", "rbac.authorization.k8s.io"))], policy="Fail")

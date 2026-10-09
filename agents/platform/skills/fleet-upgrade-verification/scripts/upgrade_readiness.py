@@ -287,7 +287,8 @@ UPGRADE_PATH_LABEL = "{operation} {resource}"
 # queue, so a refused ConfigMap write is an outage, not a stuck master. The leader-election
 # Leases the controller manager and scheduler take in `kube-system` are already on
 # UPGRADE_PATH_NODES (the Lease rows), so a Lease gate blocks on that list. Rows as in
-# UPGRADE_PATH_TARGETS; every one is Namespaced and served at v1. The namespaces are judged on
+# UPGRADE_PATH_TARGETS, all served at v1: CONTROL_PLANE_KUBE_SYSTEM_WRITES holds the Namespaced
+# rows and CONTROL_PLANE_CLUSTER_WRITES the Cluster ones. The namespaces are judged on
 # their default `kubernetes.io/metadata.name` label alone (`namespace_selector_reaches`).
 NAMESPACE_NAME_LABEL = "kubernetes.io/metadata.name"
 KUBE_SYSTEM_NAMESPACE = "kube-system"
@@ -305,7 +306,13 @@ CONTROL_PLANE_CLUSTER_WRITES = (
     (GROUP_RBAC, VERSION_V1, "clusterrolebindings", OP_CREATE, SCOPE_CLUSTER),
     (GROUP_RBAC, VERSION_V1, "clusterrolebindings", OP_UPDATE, SCOPE_CLUSTER),
 )
+# Every row a dead webhook can be graded on, for the served-version question alone: whether a
+# rule's `apiVersions` pins a graded write to a version the server does not serve is the
+# server's fact, not the selector's; the selector decides which rows the webhook is graded
+# blocked on and whether a pinned namespaced write is labelled with the namespaces admitted.
+GRADED_TARGETS = UPGRADE_PATH_TARGETS + CONTROL_PLANE_CLUSTER_WRITES + CONTROL_PLANE_KUBE_SYSTEM_WRITES
 KUBE_SYSTEM_WRITE_LABEL = "{operation} {resource} in {namespaces}"
+BOOTSTRAP_WRITE_LABEL = "{operation} {resource}"
 NAMESPACE_JOIN = ","
 WEBHOOK_NAME_FORMAT = "{config}/{webhook}"
 WEBHOOK_SERVICE_FORMAT = "{namespace}/{name}"
@@ -917,10 +924,13 @@ def bootstrap_namespaces_admitted(hook: dict) -> list[str]:
 
 
 def _kube_system_labels(rules: list[dict], namespaces: list[str], *, read_version: bool) -> list[str]:
+    """The namespaced bootstrap writes `rules` reach, labelled with `namespaces` when the selector
+    admits any, and without a namespace clause when it admits none (a pinned write's label)."""
     matched = []
     for group, version, resource, operation, scope in CONTROL_PLANE_KUBE_SYSTEM_WRITES:
         if any(_rule_reaches(rule, group, version if read_version else None, resource, operation, scope) for rule in rules):
-            matched.append(KUBE_SYSTEM_WRITE_LABEL.format(operation=operation, resource=resource, namespaces=NAMESPACE_JOIN.join(namespaces)))
+            matched.append(KUBE_SYSTEM_WRITE_LABEL.format(operation=operation, resource=resource, namespaces=NAMESPACE_JOIN.join(namespaces))
+                           if namespaces else BOOTSTRAP_WRITE_LABEL.format(operation=operation, resource=resource))
     return matched
 
 
@@ -945,23 +955,12 @@ def kube_system_write_matches(hook: dict) -> list[str]:
     return labels
 
 
-def _graded_targets(hook: dict) -> tuple:
-    """The rows this webhook is graded on: the node path and the cluster-scoped bootstrap
-    writes always, the namespaced bootstrap writes when its `namespaceSelector` admits
-    `kube-system` or `kube-public`."""
-    targets = UPGRADE_PATH_TARGETS + CONTROL_PLANE_CLUSTER_WRITES
-    if bootstrap_namespaces_admitted(hook):
-        targets = targets + CONTROL_PLANE_KUBE_SYSTEM_WRITES
-    return targets
-
-
 def _pinned_labels(rules: list[dict], hook: dict) -> list[str]:
-    """The graded writes `rules` name only at a version the server does not serve, labelled."""
-    labels = _upgrade_path_labels(rules, read_version=False) + _cluster_write_labels(rules, read_version=False)
-    admitted = bootstrap_namespaces_admitted(hook)
-    if admitted:
-        labels += _kube_system_labels(rules, admitted, read_version=False)
-    return labels
+    """The graded writes `rules` name only at a version the server does not serve, labelled; a
+    namespaced bootstrap write carries the namespaces the selector admits, or no namespace clause
+    when it admits neither, since what the server serves does not depend on the selector."""
+    return (_upgrade_path_labels(rules, read_version=False) + _cluster_write_labels(rules, read_version=False)
+            + _kube_system_labels(rules, bootstrap_namespaces_admitted(hook), read_version=False))
 
 
 def _rule_version_pinned(rule: dict, targets: tuple) -> bool:
@@ -985,9 +984,8 @@ def _rule_version_pinned(rule: dict, targets: tuple) -> bool:
 
 def version_pinned_rules(hook: dict) -> list[dict]:
     """The rules of this webhook the server sends nothing (`_rule_version_pinned`), judged
-    against the rows the webhook is graded on."""
-    targets = _graded_targets(hook)
-    return [rule for rule in _rules(hook) if _rule_version_pinned(rule, targets)]
+    against every graded row whatever the selector admits: the served version is the server's."""
+    return [rule for rule in _rules(hook) if _rule_version_pinned(rule, GRADED_TARGETS)]
 
 
 def grade_webhooks(configs: list[dict], services: list[dict], slices: list[dict]) -> dict:
