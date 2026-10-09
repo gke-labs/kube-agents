@@ -275,7 +275,7 @@ The resident reserve assumes the layout this operator deploys, the `broker` role
 container holds the broker and Envoy alone. The image's default role is `combined`, which also
 runs the event watcher and drift detector, and it is the compatibility arrangement for an image
 paired with an older operator, the pairing the cgroup fallback serves. There the reserve omits
-the watcher's informer caches, so the budget is generous by that amount: a budget that is too
+the watcher's memos and initial lists, so the budget is generous by that amount: a budget that is too
 large by a known term for one transitional pairing, where before this change there was none.
 
 The operator reserves the variable's name in `mergeCredentialProxyEnv` by setting it in the base

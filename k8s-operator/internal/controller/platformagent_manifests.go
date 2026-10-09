@@ -3950,8 +3950,10 @@ func buildAgentAPIAuthSidecar(agent *agentv1alpha1.PlatformAgent, homeDir string
 			FailureThreshold:    3,
 		},
 		Resources: corev1.ResourceRequirements{
-			// Memory request covers the watcher's informer and dedup caches, which
-			// scale with the number of watched clusters.
+			// Memory request covers the watcher's dedup and scale-up memos, which
+			// scale with the number of watched clusters, and the initial list of
+			// each cluster's events, which it holds only until delivered: the
+			// watcher keeps no store of Events (watcher.go, Run).
 			Requests: corev1.ResourceList{
 				corev1.ResourceCPU:    resource.MustParse(agentAPIAuthCPURequest),
 				corev1.ResourceMemory: resource.MustParse(agentAPIAuthMemoryRequest),

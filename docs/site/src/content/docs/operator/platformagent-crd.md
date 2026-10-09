@@ -169,7 +169,7 @@ Three consequences before you press it:
 - **It stops the inflow only.** Kanban cards and sessions created from events already delivered keep
   running and still have to be dealt with on the board. It reclaims nothing either: the watcher's
   kubeconfig, token projection, and mounts stay in place, and the sidecar keeps the memory request
-  sized for the informer and dedup caches it is no longer running.
+  sized for the caches it is no longer running.
 - **Nothing turns it back on.** An install left with the watcher off has no incident detection at
   all, and the container stays Ready throughout — the readiness probe covers the credential proxy,
   not the watcher. Two things say otherwise: a line in the sidecar log naming the consequence, and
