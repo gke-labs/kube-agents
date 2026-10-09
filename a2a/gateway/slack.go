@@ -239,8 +239,10 @@ func slackChannelThread(conversation string) (channel, threadTS string, ok bool)
 	return channel, threadTS, true
 }
 
-// toMrkdwn escapes Slack's control characters, then translates the two
-// markdown forms the relay emits (bold pairs, links) into mrkdwn. Escaping
+// toMrkdwn rewrites the line-level markdown Slack cannot show (headings,
+// rules, list markers, tables: rewriteSlackBlocks), escapes Slack's control
+// characters, then translates the two inline markdown forms the relay emits
+// (bold pairs, links) into mrkdwn. Escaping
 // first, over the whole text, so the only < and > on the wire are the ones
 // our own deterministic link translation writes, and so a prompt-injected
 // <!channel> inside a code span is as inert as one in prose; the two
@@ -251,7 +253,7 @@ func slackChannelThread(conversation string) (channel, threadTS string, ok bool)
 // presentation polish, and the legacy Hermes path's converter is not this
 // code path's to reuse.
 func toMrkdwn(text string) string {
-	return rewriteMarkdown(slackEscaper.Replace(text), slackLinkRE)
+	return rewriteMarkdown(slackEscaper.Replace(rewriteSlackBlocks(text)), slackLinkRE)
 }
 
 var (
@@ -570,7 +572,14 @@ func (s *SlackAdapter) Post(conversation, text string) (string, error) {
 	if !ok {
 		return "", fmt.Errorf("malformed conversation id %q", conversation)
 	}
-	opts := []slack.MsgOption{slack.MsgOptionText(toMrkdwn(text), false)}
+	// No unfurls: an answer cites console and documentation links, and each
+	// unfurled into a preview card (a console link previews as the Google
+	// sign-in page), three or four under every answer.
+	opts := []slack.MsgOption{
+		slack.MsgOptionText(toMrkdwn(text), false),
+		slack.MsgOptionDisableLinkUnfurl(),
+		slack.MsgOptionDisableMediaUnfurl(),
+	}
 	if threadTS != "" {
 		opts = append(opts, slack.MsgOptionTS(threadTS))
 	}
