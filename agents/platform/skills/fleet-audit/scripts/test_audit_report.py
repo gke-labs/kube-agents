@@ -20099,6 +20099,7 @@ class TestCollectorStreamsRequireAManifest(HarnessTestCase):
         import fleet_stockout
         import fleet_waste
         import patch_readiness
+        import upgrade_retrospective
 
         # The GCE compute and networking collectors ship in their own skills,
         # beside their SOPs.
@@ -20115,7 +20116,7 @@ class TestCollectorStreamsRequireAManifest(HarnessTestCase):
 
         expected = set(collect.CHECK_TABLES) | {
             fleet_drift.AUDIT_ID, patch_readiness.AUDIT_ID, fleet_waste.AUDIT_NAME, fleet_stockout.AUDIT_ID,
-            compute_fleet_audit.AUDIT_ID, networking_audit.AUDIT_SLUG,
+            compute_fleet_audit.AUDIT_ID, networking_audit.AUDIT_SLUG, upgrade_retrospective.AUDIT_ID,
         }
         self.assertEqual(set(REAL_COLLECTOR_AUDITS), expected)
         self.assertLessEqual(set(REAL_COLLECTOR_AUDITS), set(audit_report.AUDITS))
