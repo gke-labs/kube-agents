@@ -434,8 +434,8 @@ build (in orange; a newer build that fails the same way is not news, and the
 digest carries it daily), a job that has stopped (in grey, whether or not its
 last build failed; the same grey when its latest build carries no readable
 finish time, since the window cannot be measured), and one when a job the space
-was told about passes again, on a reading only, or, for the on-merge
-reconcile, when a later daily pass at the same fleet tree reached the projects it failed on. The failed and stopped
+was told about passes again, on a reading only, or, for the postsubmit
+reconcile, when a later daily pass at the same fleet tree reached the projects it failed on (a failed build's git id, the tree reports carried before the input hash, is not compared with the daily's hash). The failed and stopped
 messages are four lines, the failed one with the report's detail lines under its
 second: a headline naming where and what stopped happening ("Eval GitOps repos:
 leftover pull requests from eval runs are not being cleaned up"); the job, what

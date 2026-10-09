@@ -1166,7 +1166,7 @@ def _is_dated(finished: datetime, now: datetime | None) -> bool:
 
 def dated_clock(finished: datetime | None, now: datetime | None) -> str:
     """A finish time for the digest: the clock alone within a day, the
-    weekday and date before it past that, so last month's on-merge run does
+    weekday and date before it past that, so last month's postsubmit run does
     not read as this morning's."""
     if finished is None:
         return "?"

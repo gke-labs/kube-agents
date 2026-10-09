@@ -1782,13 +1782,13 @@ class FixtureDrift(RunHarness):
         )
         self.assertEqual(
             lines({post: {"build": "7", "finished_at": "2026-09-14T13:10:00+00:00", "passed": False, "summary": "1 refused, 34 converged", "dry_run": False}, "ci-kube-agents-pull-sweep": {"build": "1", "finished_at": "2026-09-14T13:10:00+00:00", "passed": True, "summary": "x"}}),
-            ["🔁 *Seeded-fleet reconcile:* on-merge run at 9:10 AM ET (build 7) failed: 1 refused, 34 converged."],
+            ["🔁 *Seeded-fleet reconcile:* postsubmit run at 9:10 AM ET (build 7) failed: 1 refused, 34 converged."],
         )
         # The postsubmit has no cadence: a run older than a day carries its
         # day, so last month's merge does not read as this morning's run.
         self.assertEqual(
             lines({post: {"build": "7", "finished_at": "2026-09-01T13:10:00+00:00", "passed": True, "summary": "35 visited: 35 converged", "dry_run": False}}),
-            ["🔁 *Seeded-fleet reconcile:* on-merge run on Tue Sep 1 9:10 AM ET (build 7) passed: 35 visited: 35 converged."],
+            ["🔁 *Seeded-fleet reconcile:* postsubmit run on Tue Sep 1 9:10 AM ET (build 7) passed: 35 visited: 35 converged."],
         )
         self.assertEqual(
             lines({daily: {"build": "9", "finished_at": None, "passed": True, "summary": "nothing to do", "dry_run": False}}),
@@ -2090,16 +2090,16 @@ class WatchedPeriodics(RunHarness):
         doc["periodics_read"] = [self.DAILY]
         rendered = post_health.render_digest(doc, T14)
         self.assertIn("🟠 Eval seeded fleet: planted defects are not being re-applied (build 100 failed 9:40 AM ET);", rendered)
-        # A failed on-merge build from weeks ago carries its date in every
+        # A failed postsubmit build from weeks ago carries its date in every
         # digest until the next fleet merge replaces it.
         post = "post-kube-agents-fleet-reconcile"
         old_doc = health("GREEN")
-        old_doc["periodics"] = {post: periodic_note(job=post, label="seeded-fleet reconcile (on merge)", finished="2026-09-01T13:10:00+00:00", stale_after_h=None)}
+        old_doc["periodics"] = {post: periodic_note(job=post, label="seeded-fleet reconcile (postsubmit)", finished="2026-09-01T13:10:00+00:00", stale_after_h=None)}
         self.assertIn("🟠 Eval seeded fleet: planted defects are not being re-applied (build 100 failed on Tue Sep 1 9:10 AM ET);", post_health.render_digest(old_doc, T14))
         # A postsubmit build with no finish time is not a job that stopped.
         no_time = health("GREEN")
-        no_time["periodics"] = {post: periodic_note(job=post, label="seeded-fleet reconcile (on merge)", verdict="STALE", finished=None, stale_after_h=None)}
-        self.assertIn("⚪ Eval seeded fleet: seeded-fleet reconcile (on merge)'s latest build cannot be placed in time; build 100 finished at a time its finished.json does not give.", post_health.render_digest(no_time, T14))
+        no_time["periodics"] = {post: periodic_note(job=post, label="seeded-fleet reconcile (postsubmit)", verdict="STALE", finished=None, stale_after_h=None)}
+        self.assertIn("⚪ Eval seeded fleet: seeded-fleet reconcile (postsubmit)'s latest build cannot be placed in time; build 100 finished at a time its finished.json does not give.", post_health.render_digest(no_time, T14))
         self.assertNotIn("has stopped running", post_health.render_digest(no_time, T14))
         # A stale job's last run is by definition more than a day old: dated.
         stale = health("GREEN")
