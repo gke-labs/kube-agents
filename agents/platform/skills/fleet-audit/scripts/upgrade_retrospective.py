@@ -288,6 +288,15 @@ ENTRY_GPU, ENTRY_IN_TREE_VOLUME, ENTRY_REGISTRY = 18, 19, 20
 # only when a node-pool operation in the window touched the pod's pool.
 POOL_GATED_ENTRIES = (ENTRY_CAPACITY, ENTRY_GPU, ENTRY_REGISTRY)
 GATE_CLOSED_TEXT = "no operation in the window touched this object's pool"
+# The operations listing failed: nothing can say what touched the pool.
+GATE_UNKNOWN_TEXT = "operations listing failed; pool evidence unknown"
+# A pod caught mid-start is not a symptom yet: these waiting reasons, younger
+# than the grace, with no restart, are listed under Info as starting.
+STARTING_REASONS = ("ContainerCreating", "PodInitializing")
+STARTING_GRACE = timedelta(minutes=10)
+OUTSIDE_FLEET_GUARD_TEXT = "no guard: the cluster is outside the fleet and is not recorded."
+STARTING_TEXT = "Starting, not graded ({count} pod(s) under {minutes} min with containers still being created): {pods}."
+SECONDS_PER_MINUTE = 60
 # Entries whose mechanism is the control plane's; their gate is an
 # UPGRADE_MASTER in the window rather than a node-pool operation.
 CONTROL_PLANE_ENTRIES = (ENTRY_REMOVED_API, ENTRY_WEBHOOK)
@@ -552,6 +561,9 @@ OWNER_MAX_HOPS = 3
 # How a pod-backed symptom's evidence names the pods behind it.
 POD_EVIDENCE_FORMAT = "{count} of {total} pods: {evidence}; e.g. {example}"
 PRE_EXISTING_PODS_FORMAT = "; {count} pre-existing since {earliest} (e.g. {example})"
+# The joint between a pod row's core evidence and its example pod; the notes
+# (pre-existing, age proof, rollout) follow and are never cut.
+POD_EVIDENCE_EXAMPLE_FORMAT = "; e.g. {example}"
 # Where a pod symptom's onset came from: the owner's dated failure
 # condition (or its current ReplicaSet's creation when it has none), or the
 # pod's own evidence. A pool upgrade recreates every pod on the pool, so a
@@ -1414,7 +1426,20 @@ def _pod_onset(pod: dict, activity: datetime | None) -> datetime | None:
     return transition or started
 
 
-def pod_symptoms(pods: list[dict], resolver: Resolver, window_start: datetime | None = None, age_proofs: dict[str, tuple[str, str]] | None = None, pool_spans: dict[str, list[tuple[datetime, datetime]]] | None = None, node_pool: dict[str, str] | None = None, rollouts: dict[str, str] | None = None) -> list[dict]:
+def _pod_is_starting(pod: dict, now: datetime | None) -> bool:
+    """A pod younger than the grace whose containers are still being created
+    or initialised, with no restart: not a symptom yet."""
+    status = pod.get("status") or {}
+    statuses = (status.get("containerStatuses") or []) + (status.get("initContainerStatuses") or [])
+    if not statuses or not now:
+        return False
+    reasons = {((cs.get("state") or {}).get("waiting") or {}).get("reason") for cs in statuses}
+    restarted = any((cs.get("restartCount") or 0) > 0 or (cs.get("lastState") or {}).get("terminated") for cs in statuses)
+    started = parse_ts(status.get("startTime")) or parse_ts((pod.get("metadata") or {}).get("creationTimestamp"))
+    return bool(reasons & set(STARTING_REASONS)) and not (reasons - set(STARTING_REASONS) - {None}) and not restarted and started is not None and now - started < STARTING_GRACE
+
+
+def pod_symptoms(pods: list[dict], resolver: Resolver, window_start: datetime | None = None, age_proofs: dict[str, tuple[str, str]] | None = None, pool_spans: dict[str, list[tuple[datetime, datetime]]] | None = None, node_pool: dict[str, str] | None = None, rollouts: dict[str, str] | None = None, now: datetime | None = None, starting: list[str] | None = None) -> list[dict]:
     """One row per (top owner, category, reason), carrying the pods behind
     it; the row's detail (node, containers, images) is the example pod's.
     A pod whose last activity predates `window_start` is not the upgrade's."""
@@ -1427,6 +1452,10 @@ def pod_symptoms(pods: list[dict], resolver: Resolver, window_start: datetime | 
             continue
         # A Pending pod is a present condition; a pod whose last container
         # exit or start predates the window is an older story.
+        if _pod_is_starting(pod, now):
+            if starting is not None:
+                starting.append(f"{meta.get('namespace', '')}/{meta.get('name', '')}")
+            continue
         activity = _pod_last_activity(pod)
         if window_start and activity and activity < window_start and phase != PHASE_PENDING:
             continue
@@ -1594,6 +1623,10 @@ def event_symptoms(events: list[dict], window_start: datetime, resolver: Resolve
             row["pods"].append(involved_name)
             row["pods"].sort()
             row["pod_count"], row["example_pod"] = len(row["pods"]), row["pods"][0]
+        # The earliest first observation across the merged events dates the row.
+        first = fmt_ts(parse_ts(event.get("firstTimestamp")) or parse_ts(event.get("eventTime")) or last)
+        if first < row["first_seen"]:
+            row["first_seen"] = row["onset"] = first
         row["count"] += _event_count(event)
         if fmt_ts(last) > row["last_seen"]:
             row["last_seen"], row["message"] = fmt_ts(last), message[:MESSAGE_EXCERPT_CHARS]
@@ -1715,6 +1748,35 @@ class Context(NamedTuple):
     upgraded_pools: dict[str, dict]  # pool -> what `upgraded_pools_of` returns
     master_upgraded: bool = False  # an UPGRADE_MASTER ended in the window
     images_on_untouched_pools: frozenset = frozenset()  # images Running on a pool no operation touched
+    operations_known: bool = True  # False when the project's operations listing failed
+    label_pools: dict = {}  # (label, value) -> the pools whose nodes carry it
+
+
+def pool_labels(cluster: dict, nodes: list[dict]) -> dict[tuple[str, str], set[str]]:
+    """Which pools carry each label: from each pool's `config.labels` in the
+    cluster record, and from the nodes' own labels, so a pod's preference on
+    a custom label resolves to a pool."""
+    out: dict[tuple[str, str], set[str]] = {}
+    for pool in cluster.get("nodePools") or []:
+        for key, value in ((pool.get("config") or {}).get("labels") or {}).items():
+            out.setdefault((key, value), set()).add(pool.get("name", ""))
+    for node in nodes:
+        labels = (node.get("metadata") or {}).get("labels") or {}
+        pool = labels.get(NODEPOOL_LABEL, "")
+        if pool:
+            for key, value in labels.items():
+                out.setdefault((key, value), set()).add(pool)
+    return out
+
+
+def _selector_pools(selector: dict, label_pools: dict[tuple[str, str], set[str]]) -> set[str]:
+    """The pools whose labels satisfy every pair of a nodeSelector; empty when
+    a pair matches no pool or the selector is empty."""
+    pools: set[str] | None = None
+    for key, value in (selector or {}).items():
+        matching = set(label_pools.get((key, value), set()))
+        pools = matching if pools is None else pools & matching
+    return pools or set()
 
 
 def _classification(entry: int | None, confidence: str, evidence: str, detail: str = "") -> dict:
@@ -1769,12 +1831,17 @@ def _gate_open(symptom: dict, entry: int, ctx: Context) -> bool:
     pools.discard("")
     if pools:
         return any(pool in ctx.upgraded_pools for pool in pools)
-    # No node: a Pending pod names its pool through a nodeSelector on the
-    # pool label; only a pod with no pool preference counts any upgraded
-    # pool, and an event row with no pool evidence at all stays closed.
-    selector_pool = (symptom.get("node_selector") or {}).get(NODEPOOL_LABEL, "")
+    # No node: a Pending pod names its pool through its nodeSelector -- the
+    # pool label, or any label the pools' nodes carry; only a pod with no
+    # pool preference counts any upgraded pool, and an event row with no pool
+    # evidence at all stays closed.
+    selector = symptom.get("node_selector") or {}
+    selector_pool = selector.get(NODEPOOL_LABEL, "")
     if selector_pool:
         return selector_pool in ctx.upgraded_pools
+    preferred = _selector_pools(selector, ctx.label_pools)
+    if preferred:
+        return any(pool in ctx.upgraded_pools for pool in preferred)
     if symptom["category"] == CATEGORY_EVENT:
         return False
     return bool(ctx.upgraded_pools)
@@ -1813,7 +1880,11 @@ def classify_symptom(symptom: dict, ctx: Context) -> list[dict]:
         # High only when the signature names the entry's own mechanism and the
         # object's pool had an operation in the window (for a control-plane
         # mechanism, an UPGRADE_MASTER); otherwise medium.
-        if confidence == HIGH and not _gate_open(symptom, entry, ctx):
+        if confidence == HIGH and not ctx.operations_known:
+            # The listing failed: nothing can say what touched the pool.
+            confidence = MEDIUM
+            detail = (detail + "; " if detail else "") + GATE_UNKNOWN_TEXT
+        elif confidence == HIGH and not _gate_open(symptom, entry, ctx):
             confidence = MEDIUM
             detail = (detail + "; " if detail else "") + GATE_CLOSED_TEXT
         if entry == ENTRY_REGISTRY and confidence == HIGH:
@@ -1849,8 +1920,10 @@ def classify_symptom(symptom: dict, ctx: Context) -> list[dict]:
         runtime = next((f"{img} ({cgroup_v1_runtime(img)})" for img in symptom.get("images") or [] if cgroup_v1_runtime(img)), None)
         # The gate is the same replica's pool as the cgroup grade; only a pod
         # with no known node counts any upgraded pool.
-        own_pool_touched = pool in ctx.upgraded_pools if pool else bool(ctx.upgraded_pools)
-        if mode == CGROUP_V2_MODE and runtime and own_pool_touched:
+        own_pool_touched = ctx.operations_known and (pool in ctx.upgraded_pools if pool else bool(ctx.upgraded_pools))
+        if mode == CGROUP_V2_MODE and runtime and not ctx.operations_known:
+            add(ENTRY_CGROUP_V2, MEDIUM, f"{evidence}; runtime image {runtime}", f"cgroup v1 runtime on cgroup v2; {count}; {GATE_UNKNOWN_TEXT}")
+        elif mode == CGROUP_V2_MODE and runtime and own_pool_touched:
             add(ENTRY_CGROUP_V2, HIGH, f"{evidence}; runtime image {runtime}", f"cgroup v1 runtime on cgroup v2; {count}")
         elif mode == CGROUP_V2_MODE:
             add(OOM_UNDECIDED_ENTRIES[0], MEDIUM, evidence, f"{undecided} on cgroup v2; {count}")
@@ -1867,7 +1940,8 @@ def classify_symptom(symptom: dict, ctx: Context) -> list[dict]:
         if touched:
             symptom["operation"] = str(touched["operation"])
         transition = f" since {symptom['onset']}" if symptom.get("onset") else ""
-        add(ENTRY_NODE_AGENT, HIGH if touched else MEDIUM, f"node {symptom['name']} {symptom['reason']}{transition}" + (f" after UPGRADE_NODES on {pool} at {touched['start']}" if touched else ""), f"pool {pool}")
+        node_detail = f"pool {pool}" + ("" if ctx.operations_known else f"; {GATE_UNKNOWN_TEXT}")
+        add(ENTRY_NODE_AGENT, HIGH if touched else MEDIUM, f"node {symptom['name']} {symptom['reason']}{transition}" + (f" after UPGRADE_NODES on {pool} at {touched['start']}" if touched else ""), node_detail)
 
     # Entry 1: a budget allowing no disruption on an upgraded pool, or an
     # upgrade that ran longer than the hour-per-node a drain is held.
@@ -1894,6 +1968,16 @@ def classify_symptom(symptom: dict, ctx: Context) -> list[dict]:
     if not found:
         found.append(_classification(None, MEDIUM, f"{symptom.get('reason') or ''} {symptom.get('message') or ''}".strip()))
     return found
+
+
+def compose_pod_evidence(core: str, count: int, total: int, example: str, notes: list[str]) -> str:
+    """A pod row's evidence from its parts, cut once: the notes (pre-existing
+    pods, the owner's proof of age, a rollout) always fit, the core message
+    gives way."""
+    head = POD_EVIDENCE_FORMAT.format(count=count, total=max(total, count), evidence="", example="").rsplit(": ", 1)[0] + ": "
+    tail = POD_EVIDENCE_EXAMPLE_FORMAT.format(example=example) + "".join(notes)
+    room = max(MESSAGE_EXCERPT_CHARS - len(head) - len(tail), 0)
+    return head + core[:room] + tail
 
 
 def symptom_key(symptom: dict) -> str:
@@ -1924,6 +2008,11 @@ def mark_since(symptoms: list[dict], baseline: list[str] | None, first_operation
             new_pods = sorted(pod for pod, onset in pod_onsets.items() if onset and onset >= first_operation)
             old_pods = sorted(pod for pod, onset in pod_onsets.items() if onset and onset < first_operation)
             symptom["new_pods"], symptom["pre_existing_pods"] = new_pods, old_pods
+            notes: list[str] = []
+            # The example names a displaced replica when there is one, never
+            # the pre-existing pod the row also reports.
+            if new_pods:
+                symptom["example_pod"] = new_pods[0]
             recreated = set(symptom.get("recreated_pods") or [])
             # A recreation carries a container-level failure over (crash
             # loop, OOM kill, image pull); a Pending replica created inside
@@ -1936,8 +2025,7 @@ def mark_since(symptoms: list[dict], baseline: list[str] | None, first_operation
             rollout_at = parse_ts(symptom.get("rollout_at"))
             if ambiguous and rollout_at and rollout_at >= first_operation:
                 # Evidence that a rollout happened during the window; it decides nothing.
-                for c in symptom["classifications"]:
-                    c["evidence"] = (c["evidence"] + ROLLOUT_IN_WINDOW_FORMAT.format(created=symptom["rollout_at"]))[:MESSAGE_EXCERPT_CHARS]
+                notes.append(ROLLOUT_IN_WINDOW_FORMAT.format(created=symptom["rollout_at"]))
             if new_pods and not ambiguous:
                 symptom["since"] = SINCE_FIRST_SEEN if baseline is None else SINCE_NEW
                 symptom["predates_upgrade"] = False
@@ -1945,8 +2033,7 @@ def mark_since(symptoms: list[dict], baseline: list[str] | None, first_operation
                 # The owner proves the failure predates the window.
                 symptom["since"] = SINCE_FIRST_SEEN if baseline is None else (SINCE_BEFORE if recorded else SINCE_NEW)
                 symptom["predates_upgrade"] = True
-                for c in symptom["classifications"]:
-                    c["evidence"] = (c["evidence"] + AGE_PROOF_FORMAT.format(proof=proof["what"], since=proof["since"]))[:MESSAGE_EXCERPT_CHARS]
+                notes.append(AGE_PROOF_FORMAT.format(proof=proof["what"], since=proof["since"]))
             elif ambiguous and baseline is None:
                 # No proof of age on a first run: medium, a Warning, until a
                 # later full run settles it through the stored set.
@@ -1965,9 +2052,9 @@ def mark_since(symptoms: list[dict], baseline: list[str] | None, first_operation
                 symptom["predates_upgrade"] = recorded or bool(old_pods)
             if old_pods:
                 earliest = min(pod_onsets[pod] for pod in old_pods)
-                note = PRE_EXISTING_PODS_FORMAT.format(count=len(old_pods), earliest=fmt_ts(earliest), example=old_pods[0])
-                for c in symptom["classifications"]:
-                    c["evidence"] = (c["evidence"] + note)[:MESSAGE_EXCERPT_CHARS]
+                notes.append(PRE_EXISTING_PODS_FORMAT.format(count=len(old_pods), earliest=fmt_ts(earliest), example=old_pods[0]))
+            for c in symptom["classifications"]:
+                c["evidence"] = compose_pod_evidence(c.get("evidence_core", c["evidence"]), symptom["pod_count"], symptom["pod_total"], symptom["example_pod"], notes)
             continue
         symptom["since"] = SINCE_FIRST_SEEN if baseline is None else (SINCE_BEFORE if recorded else SINCE_NEW)
         onset = parse_ts(symptom.get("onset"))
@@ -1975,7 +2062,7 @@ def mark_since(symptoms: list[dict], baseline: list[str] | None, first_operation
         symptom["predates_upgrade"] = recorded or before_operation
 
 
-def collect_symptoms(cluster: dict, reads: dict[str, list], operations: list[dict], window_start: datetime) -> list[dict]:
+def collect_symptoms(cluster: dict, reads: dict[str, list], operations: list[dict], window_start: datetime, *, operations_known: bool = True, now: datetime | None = None, starting: list[str] | None = None) -> list[dict]:
     """Every symptom in the read, each with its classifications, user
     namespaces first."""
     nodes = reads.get("nodes") or []
@@ -1992,10 +2079,12 @@ def collect_symptoms(cluster: dict, reads: dict[str, list], operations: list[dic
         upgraded_pools=upgraded,
         master_upgraded=any(op.get("operationType") == OP_UPGRADE_MASTER for op in operations),
         images_on_untouched_pools=frozenset(untouched_images),
+        operations_known=operations_known,
+        label_pools=pool_labels(cluster, nodes),
     )
     resolver = Resolver(reads.get("pods") or [], reads.get("owners") or [], reads.get("workloads") or [])
     node_pool_of = {(n.get("metadata") or {}).get("name"): ((n.get("metadata") or {}).get("labels") or {}).get(NODEPOOL_LABEL, "") for n in nodes}
-    pods = pod_symptoms(reads.get("pods") or [], resolver, window_start, owner_age_proofs(reads.get("workloads") or []), pool_operation_windows(operations), node_pool_of, owner_rollouts(reads.get("owners") or []))
+    pods = pod_symptoms(reads.get("pods") or [], resolver, window_start, owner_age_proofs(reads.get("workloads") or []), pool_operation_windows(operations), node_pool_of, owner_rollouts(reads.get("owners") or []), now, starting)
     pod_objects = {s["object"] for s in pods}
     # An event on a pod that is gone carries no pool; its owner's template
     # nodeSelector is the pool evidence it can still have.
@@ -2016,7 +2105,8 @@ def collect_symptoms(cluster: dict, reads: dict[str, list], operations: list[dic
         symptom["classifications"] = classify_symptom(symptom, ctx)
         if symptom.get("pod_count"):
             for c in symptom["classifications"]:
-                c["evidence"] = POD_EVIDENCE_FORMAT.format(count=symptom["pod_count"], total=max(symptom["pod_total"], symptom["pod_count"]), evidence=c["evidence"], example=symptom["example_pod"])[:MESSAGE_EXCERPT_CHARS]
+                c["evidence_core"] = c["evidence"]
+                c["evidence"] = compose_pod_evidence(c["evidence_core"], symptom["pod_count"], symptom["pod_total"], symptom["example_pod"], [])
     symptoms.sort(key=lambda s: (s["system"], s["namespace"], s["kind"], s["name"], s.get("reason") or ""))
     return symptoms
 
@@ -2666,6 +2756,7 @@ def review_cluster(selection: Selection, ledger: dict, *, run: RunFn, seen_at: s
         "partial": [],
         "answered": [],
         "commands": [],
+        "starting": [],
     }
     ops = selection.operations
     first_op = min((parse_ts(op.get("startTime")) for op in ops if parse_ts(op.get("startTime"))), default=None)
@@ -2673,7 +2764,9 @@ def review_cluster(selection: Selection, ledger: dict, *, run: RunFn, seen_at: s
     review["what_happened"]["symptom_window_start"] = fmt_ts(window_start)
     kubeconfig, error = fetch_credentials(cluster, run=run)
     if error:
+        # Nothing was read: a partial attempt, re-selected next run.
         review["read_errors"].append(error)
+        review["partial"] = list(CORE_READS)
         return review
     reads, errors = read_cluster(kubeconfig, run=run)
     review["read_errors"].extend(errors)
@@ -2692,7 +2785,9 @@ def review_cluster(selection: Selection, ledger: dict, *, run: RunFn, seen_at: s
     # A partial read still reports what it saw; it is `reviewed` -- the
     # ledger moves and absent guards drop -- only when every core read answered.
     review["reviewed"] = not review["partial"]
-    symptoms = collect_symptoms(cluster, {k: v for k, v in reads.items() if k not in failed}, ops, window_start)
+    starting: list[str] = []
+    symptoms = collect_symptoms(cluster, {k: v for k, v in reads.items() if k not in failed}, ops, window_start, operations_known=operations_command is not None, now=now, starting=starting)
+    review["starting"] = starting
     entry = (ledger.get("clusters") or {}).get(selection.key) or {}
     mark_since(symptoms, entry.get("symptoms") if entry.get("last_run") else None, first_op)
     review["what_failed"] = symptoms
@@ -2786,6 +2881,7 @@ def triage(reviews: list[dict], unchanged: list[dict], failed_reads: list[str], 
                     "system": symptom["system"],
                     "entries": "",
                     "predates_upgrade": False,
+                    "outside_fleet": bool(review.get("outside_fleet")),
                     "what_happened": review["what_happened"],
                     "symptoms": [],
                     "mitigations": [m for m in review["mitigations"] if m["object"] == symptom["object"]],
@@ -2829,6 +2925,7 @@ def triage(reviews: list[dict], unchanged: list[dict], failed_reads: list[str], 
                 "incidents": len(incidents),
                 "partial": review.get("partial") or [],
                 "outside_fleet": bool(review.get("outside_fleet")),
+                "starting": review.get("starting") or [],
                 "next_upgrade": review["next_upgrade"],
                 "shapes": review["shapes"],
                 "managed_agents": review["managed_agents"],
@@ -2945,7 +3042,7 @@ def _incident_lines(incident: dict) -> list[str]:
         lines.append(f"- **{m['entry']}. {m['title']}** — {_cell(m['before_signal'])} Read today: {m['read_today']}. Mitigate before: {m['mitigate_before']} Mitigate after: {m['mitigate_after']}")
     lines += ["", PART_MITIGATION_SET_UP]
     if not incident["guards"]:
-        lines.append(UNCLASSIFIED_GUARD_TEXT)
+        lines.append(OUTSIDE_FLEET_GUARD_TEXT if incident.get("outside_fleet") else UNCLASSIFIED_GUARD_TEXT)
     for g in incident["guards"]:
         lines.append(f"- guard `{_cell(g['id'])}` {g['kind']} entry {g['entry']} ({g['confidence']}), first seen {g['first_seen']}")
     return lines + [""]
@@ -3001,6 +3098,8 @@ def _cluster_block_lines(row: dict) -> list[str]:
     lines.append("")
     if row.get("partial"):
         lines += [PARTIAL_READ_TEXT.format(failed=", ".join(row["partial"])), ""]
+    if row.get("starting"):
+        lines += [STARTING_TEXT.format(count=len(row["starting"]), minutes=int(STARTING_GRACE.total_seconds() // SECONDS_PER_MINUTE), pods=", ".join(_cell(p) for p in row["starting"])), ""]
     lines += _next_upgrade_lines(row["next_upgrade"])
     lines.append("")
     lines += _risks_lines(row["shapes"], row.get("managed_agents") or 0, list(row.get("partial") or []) + list((row.get("baseline") or {}).get("shape_reads_failed") or []))
@@ -3244,7 +3343,7 @@ def parse_since(text: str | None, now: datetime) -> datetime:
     return parsed
 
 
-def ledger_after(ledger: dict, reviews: list[dict], clusters: list[dict], seen_at: str, operations: dict[str, list[dict]] | None = None, removed: set[str] | None = None, skip: set[str] | None = None, refreshed: dict[str, list[str]] | None = None, advance: bool = True) -> dict:
+def ledger_after(ledger: dict, reviews: list[dict], clusters: list[dict], seen_at: str, operations: dict[str, list[dict]] | None = None, removed: set[str] | None = None, skip: set[str] | None = None, refreshed: dict[str, list[str]] | None = None, advance: bool = True, attempted: set[str] | None = None) -> dict:
     """Every enumerated cluster's current versions; `last_run` moves only for
     a cluster this run reviewed in full, so a failed or partial read is
     retried next time (`partial_read` records the attempt and re-selects
@@ -3269,10 +3368,12 @@ def ledger_after(ledger: dict, reviews: list[dict], clusters: list[dict], seen_a
             continue
         current = versions_of(cluster)
         old = entries.get(key) or {}
-        if old and key not in reviewed:
-            # Unchanged or partially read: the versions and channel are what
-            # the listing says now (a pool added or removed is recorded);
-            # last_run and the symptom set stay.
+        if old and key not in reviewed and key not in (attempted or set()):
+            # Unchanged: the versions and channel are what the listing says
+            # now (a pool added or removed is recorded); last_run and the
+            # symptom set stay. A selected cluster whose review did not
+            # complete keeps its pre-upgrade versions, so the retry still
+            # diffs before and after.
             old.update(control_plane=current["control_plane"], node_pools=current["node_pools"], channel=current["channel"])
         if key in reviewed or not old:
             starts = [op.get("startTime") for op in (operations or {}).get(key) or [] if op.get("startTime")]
@@ -3469,7 +3570,7 @@ def collect(args: argparse.Namespace, *, run: RunFn | None = None, now: datetime
     recheck_commands = {r["cluster"]: r.get("commands") or {} for r in rechecks}
     for row in unchanged:
         row["commands"] = checks_run(recheck_commands.get(row["cluster"], {}), fallback=operations_commands.get(row["cluster"].split(CLUSTER_KEY_SEPARATOR)[0]))
-    new_ledger = ledger_after(ledger, reviews, clusters, seen_at, {s.key: s.operations for s in selected}, removed, {row["cluster"] for row in upgrading} | outside, refreshed_baselines, advance=not hand_run)
+    new_ledger = ledger_after(ledger, reviews, clusters, seen_at, {s.key: s.operations for s in selected}, removed, {row["cluster"] for row in upgrading} | outside, refreshed_baselines, advance=not hand_run, attempted={s.key for s in selected})
     new_ledger[LEDGER_PROJECTS_KEY] = sorted(new_fleet)
 
     # Read failures from inside a review join the top-level list so Info

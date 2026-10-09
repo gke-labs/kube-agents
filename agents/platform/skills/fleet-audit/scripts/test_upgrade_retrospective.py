@@ -662,6 +662,51 @@ class ClassifierSignatureTest(unittest.TestCase):
             [row] = self.classify(pods=[first, second])
             self.assertEqual(entries(row), {(14, ur.HIGH)}, f"order {first['metadata']['name']}, {second['metadata']['name']}")
 
+    def test_merged_event_row_dates_from_the_earliest_event(self):
+        early = event("Unhealthy", "probe failed", name="web-aaaaa", namespace="apps", last="2026-10-08T12:00:00Z")
+        early["firstTimestamp"] = "2026-10-07T06:00:00Z"
+        late = event("Unhealthy", "probe failed", name="web-zzzzz", namespace="apps", last="2026-10-08T13:00:00Z")
+        late["firstTimestamp"] = "2026-10-08T12:30:00Z"
+        rs = {"kind": "ReplicaSet", "metadata": {"name": "web-rs", "namespace": "apps", "ownerReferences": [{"kind": "Deployment", "name": "web"}]}}
+        pods = [pod("web-aaaaa", namespace="apps"), pod("web-zzzzz", namespace="apps")]
+        for p in pods:
+            p["metadata"]["ownerReferences"] = [{"kind": "ReplicaSet", "name": "web-rs"}]
+            p["status"]["conditions"] = [{"type": "Ready", "status": "True"}]
+            p["status"]["phase"] = "Running"
+        for first, second in ((early, late), (late, early)):
+            reads = {"pods": pods, "nodes": READS["seeded-a"]["nodes"], "events": [first, second], "pdbs": [], "owners": [rs]}
+            [row] = ur.collect_symptoms(cluster_doc("seeded-a"), reads, ops_for("seeded-a"), SINCE)
+            self.assertEqual((row["object"], row["first_seen"], row["onset"], row["last_seen"]), ("apps/Deployment/web", "2026-10-07T06:00:00Z", "2026-10-07T06:00:00Z", "2026-10-08T13:00:00Z"))
+
+    def test_pod_caught_mid_start_is_not_a_symptom(self):
+        young = pod("fresh", statuses=[{"name": "c0", "state": {"waiting": {"reason": "ContainerCreating"}}, "restartCount": 0}])
+        young["status"]["startTime"] = "2026-10-08T17:55:00Z"
+        young["status"]["conditions"] = [{"type": "Ready", "status": "False", "lastTransitionTime": "2026-10-08T17:55:00Z"}]
+        starting: list[str] = []
+        rows = ur.collect_symptoms(cluster_doc("seeded-a"), {"pods": [young], "nodes": READS["seeded-a"]["nodes"], "events": [], "pdbs": [], "owners": []}, ops_for("seeded-a"), SINCE, now=NOW, starting=starting)
+        self.assertEqual((rows, starting), ([], ["apps/fresh"]))
+        # Older than the grace, or restarted, it is a symptom.
+        young["status"]["startTime"] = "2026-10-08T17:00:00Z"
+        rows = ur.collect_symptoms(cluster_doc("seeded-a"), {"pods": [young], "nodes": READS["seeded-a"]["nodes"], "events": [], "pdbs": [], "owners": []}, ops_for("seeded-a"), SINCE, now=NOW)
+        self.assertEqual([r["reason"] for r in rows], ["ContainerCreating"])
+        young["status"]["startTime"] = "2026-10-08T17:55:00Z"
+        young["status"]["containerStatuses"][0]["restartCount"] = 2
+        rows = ur.collect_symptoms(cluster_doc("seeded-a"), {"pods": [young], "nodes": READS["seeded-a"]["nodes"], "events": [], "pdbs": [], "owners": []}, ops_for("seeded-a"), SINCE, now=NOW)
+        self.assertEqual(len(rows), 1)
+
+    def test_pending_pod_preference_on_a_custom_label_gates_on_that_pool(self):
+        # inference-server pins `seeded-role: pinned-inference`, a label only pinned-inference-pool's node carries.
+        pools_only_default = [o for o in ops_for("seeded-a") if "/nodePools/default-pool" in o["targetLink"]]
+        rows = by_object(symptoms_of("seeded-a", ops=pools_only_default), INFERENCE, "pending")
+        self.assertEqual({(c["entry"], c["confidence"]) for c in rows[0]["classifications"]}, {(12, ur.MEDIUM), (2, ur.MEDIUM)})
+        pinned_only = [o for o in ops_for("seeded-a") if "/nodePools/pinned-inference-pool" in o["targetLink"]]
+        rows = by_object(symptoms_of("seeded-a", ops=pinned_only), INFERENCE, "pending")
+        self.assertIn((2, ur.HIGH), {(c["entry"], c["confidence"]) for c in rows[0]["classifications"]})
+        labels = ur.pool_labels(cluster_doc("seeded-a"), READS["seeded-a"]["nodes"])
+        self.assertEqual(labels[("seeded-role", "pinned-inference")], {"pinned-inference-pool"})
+        self.assertEqual(ur._selector_pools({"seeded-role": "pinned-inference"}, labels), {"pinned-inference-pool"})
+        self.assertEqual(ur._selector_pools({"no-such-label": "x"}, labels), set())
+
     def test_entry_14_gates_on_the_oom_pods_own_pool(self):
         # idle-batch-pool (cgroup v2) was not touched this week; default-pool was. The OOM pod on the untouched pool is medium.
         ops = [o for o in ops_for("seeded-a") if "idle-batch-pool" not in o["targetLink"]]
@@ -2001,6 +2046,44 @@ class LedgerAndGuardsTest(unittest.TestCase):
         self.assertEqual((row["since"], row["predates_upgrade"], row["operation"]), (ur.SINCE_NEW, False, "operation-second-hold"))
         self.assertIn("seeded-capacity/PodDisruptionBudget/inference-server", [i["object"] for i in second["sections"]["errors"]])
 
+    def test_failed_review_keeps_the_pre_upgrade_versions_for_the_retry(self):
+        self.collect()
+        bumped = cluster_doc("seeded-a")
+        bumped["currentMasterVersion"] = "1.36.4-gke.1247000"
+        later = datetime(2026, 10, 15, 18, 0, tzinfo=timezone.utc)
+        failed, _ = self.collect(FakeFleet(clusters=[bumped, cluster_doc("gemma-gpu-upgraded")], broken=["seeded-a"]), now=later)
+        review = next(r for r in failed["reviews"] if r["cluster"] == SEEDED)
+        self.assertEqual((review["reviewed"], review["partial"]), (False, list(ur.CORE_READS)))
+        entry = ur.load_json(self.home / ur.LEDGER_FILENAME, {})["clusters"][SEEDED]
+        self.assertEqual((entry["control_plane"], entry["last_run"], entry["partial_read"]), ("1.35.8-gke.1380001", "2026-10-08T18:00:00Z", "2026-10-15T18:00:00Z"))
+        # The retry, even with the operations listing down, is selected by the version diff and reports before and after.
+        retry, _ = self.collect(FakeFleet(clusters=[bumped, cluster_doc("gemma-gpu-upgraded")], ops_fail=[PROJECT]), now=datetime(2026, 10, 16, 18, 0, tzinfo=timezone.utc))
+        review = next(r for r in retry["reviews"] if r["cluster"] == SEEDED)
+        self.assertTrue(review["reviewed"])
+        self.assertEqual((review["what_happened"]["versions_before"]["control_plane"], review["what_happened"]["versions_after"]["control_plane"]), ("1.35.8-gke.1380001", "1.36.4-gke.1247000"))
+        self.assertEqual(ur.load_json(self.home / ur.LEDGER_FILENAME, {})["clusters"][SEEDED]["control_plane"], "1.36.4-gke.1247000")
+
+    def test_unread_operations_leave_the_pool_gate_unknown(self):
+        bumped = cluster_doc("seeded-a")
+        bumped["currentMasterVersion"] = "1.36.4-gke.1247000"
+        self.collect()
+        result, _ = self.collect(FakeFleet(clusters=[bumped, cluster_doc("gemma-gpu-upgraded")], ops_fail=[PROJECT]), now=datetime(2026, 10, 15, 18, 0, tzinfo=timezone.utc))
+        review = next(r for r in result["reviews"] if r["cluster"] == SEEDED)
+        details = [c["detail"] for s in review["what_failed"] for c in s["classifications"] if c["entry"] is not None]
+        self.assertTrue(details)
+        # Entry 2 names its mechanism and would be high: it says the gate is unknown, never closed.
+        capacity = [c["detail"] for s in review["what_failed"] for c in s["classifications"] if c["entry"] == 2]
+        self.assertTrue(capacity and all(ur.GATE_UNKNOWN_TEXT in d for d in capacity), capacity)
+        self.assertFalse(any(ur.GATE_CLOSED_TEXT in d for d in details))
+        self.assertEqual({c["confidence"] for s in review["what_failed"] for c in s["classifications"] if c["entry"] is not None}, {ur.MEDIUM})
+        self.assertEqual(result["sections"]["errors"], [])
+
+    def test_outside_fleet_incident_says_why_it_has_no_guard(self):
+        result, _ = self.collect(project=None, full=False)
+        report = ur.render_report(result)
+        self.assertIn(ur.OUTSIDE_FLEET_GUARD_TEXT, report)
+        self.assertNotIn(ur.UNCLASSIFIED_GUARD_TEXT, report.split(f"### 2, 12 — {SEEDED}")[1].split("### ")[0])
+
     def test_store_defaults_live_under_the_store_home(self):
         result, _ = self.collect()
         self.assertEqual(Path(result["ledger_path"]), self.home / ur.LEDGER_FILENAME)
@@ -2099,12 +2182,12 @@ class ReportTest(unittest.TestCase):
         ])
         inference = errors.split("### 2, 12")[1].split("### 1 —")[0]
         self.assertNotIn(ur.PREDATES_UPGRADE_TEXT, inference)
-        self.assertIn("; 1 pre-existing since 2026-09-25T17:02:48Z (e.g. inference-server-778b78fdb8-cp2pf)", inference)
+        self.assertIn("; e.g. inference-server-778b78fdb8-ld26r; 1 pre-existing since 2026-09-25T17:02:48Z (e.g. inference-server-778b78fdb8-cp2pf)", inference)
         for part in (ur.PART_WHAT_HAPPENED, ur.PART_WHAT_FAILED, ur.PART_MITIGATE, ur.PART_MITIGATION_SET_UP):
             self.assertIn(part, inference)
         self.assertIn("| UPGRADE_NODES | pinned-inference-pool | 2026-10-08T04:20:35Z | 2026-10-08T05:24:10Z | 63 min | DONE |  |", inference)
         self.assertIn("| control plane | - | 1.35.8-gke.1380001 |", inference)
-        self.assertIn("| Unschedulable | first seen | 2. No spare capacity for the displaced pods | high | 3 of 4 pods: Insufficient cpu; e.g. inference-server-778b78fdb8-cp2pf; 1 pre-existing since 2026-09-25T17:02:48Z (e.g. inference-server-778b78fdb8-cp2pf) |", inference)
+        self.assertIn("| Unschedulable | first seen | 2. No spare capacity for the displaced pods | high | 3 of 4 pods: Insufficient cpu; e.g. inference-server-778b78fdb8-ld26r; 1 pre-existing since 2026-09-25T17:02:48Z (e.g. inference-server-778b78fdb8-cp2pf) |", inference)
         self.assertIn("| Unschedulable | first seen | 12. A node label is removed (selector seeded-role=pinned-inference) | medium |", inference)
         self.assertIn(f"- **12. A node label is removed** — For {INFERENCE} (selector seeded-role=pinned-inference):", inference)
         self.assertIn(f"- guard `{ur.guard_id(SEEDED, 2, INFERENCE)}` failure entry 2 (high), first seen 2026-10-08T18:00:00Z", inference)
@@ -2338,13 +2421,20 @@ class ManifestTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.home = Path(self.tmp.name)
-        self.env = mock.patch.dict(os.environ, {ur.HERMES_HOME_ENV: self.tmp.name, ur.STORE_HOME_ENV: self.tmp.name, **NO_PROJECT_ENV})
+        scratch = self.home / "scratch"
+        scratch.mkdir()
+        self.env = mock.patch.dict(os.environ, {ur.HERMES_HOME_ENV: self.tmp.name, ur.STORE_HOME_ENV: self.tmp.name, "FLEET_AUDIT_SCRATCH_DIR": str(scratch), **NO_PROJECT_ENV})
         self.env.start()
         import audit_report
 
         self.audit_report = audit_report
+        # `SCRATCH_DIR` is bound at import; the run record a real `start` writes there
+        # must not reach this suite.
+        self.scratch = mock.patch.object(audit_report, "SCRATCH_DIR", str(scratch))
+        self.scratch.start()
 
     def tearDown(self):
+        self.scratch.stop()
         self.env.stop()
         self.tmp.cleanup()
 
