@@ -237,6 +237,7 @@ def load_intercepted_events(
                 # checked, and the recap keeps working against a ledger written
                 # by an older session server mid-rollout.
                 delivery_col = "delivery_error" if "delivery_error" in columns else "''"
+                duplicate_col = "duplicate_of" if "duplicate_of" in columns else "0"
                 # `intercepted_events` has had a second writer since the drift
                 # detector landed: session_kv_server.py records every
                 # out-of-band-change inject in it too, under
@@ -256,7 +257,7 @@ def load_intercepted_events(
                 # reads these rows next.
                 cursor.execute(
                     "SELECT cluster, namespace, workload, object_uid, object_kind, reason, message, "
-                    f"severity, occurrences, notified, created_at, {delivery_col} "
+                    f"severity, occurrences, notified, created_at, {delivery_col}, {duplicate_col} "
                     "FROM intercepted_events "
                     "WHERE created_at >= datetime('now', ?) "
                     "AND reason NOT IN (?, ?) "
@@ -294,6 +295,7 @@ def load_intercepted_events(
                 "notified": bool(r[9]),
                 "created_at": r[10],
                 "delivery_error": r[11] or "",
+                "duplicate_of": int(r[12] or 0),
             }
             for r in rows
         ]
@@ -449,6 +451,13 @@ def filter_and_aggregate_events(events: List[Dict[str, Any]]) -> Dict[str, Any]:
         elif severity == "Info":
             if not excluded:
                 suppressed_info += count
+        elif int(event.get("duplicate_of") or 0) > 0:
+            # Folded into an earlier live incident for the same workload by
+            # INCIDENT_WORKLOAD_DEDUP_SECONDS: the workload's alert already
+            # went to chat on the anchor row, so this row is neither an
+            # informational event held back nor an alert the daily ceiling
+            # withheld.
+            pass
         else:
             cap_dropped += 1
             cap_row = True

@@ -20,6 +20,7 @@ It binds loopback rather than `0.0.0.0` because every one of its callers shares 
 4. **Gateway Message Rewriting Hook:** Integrates the `incident_context` plugin to intercept user replies on active incident threads and automatically prepend the triage report, allowing the fixer agent session to run with full context.
 5. **Severity Gate & Event Ledger:** Records every forwarded event in `intercepted_events`, then alerts on the warning ones only. The drift detector and the stall watch write to the same table under `reason`s of their own; see [the second producer](#the-second-producer-gitops-drift) and [the third](#the-third-producer-controller-stall). Informational events are held back from chat and reported as a count by the daily recap.
 6. **Daily Alert Ceiling:** Caps how many alerts of each severity reach chat in one UTC day, bounding the volume that survives deduplication.
+   - **Workload window (opt-in):** The watcher deduplicates per object UID, so two failing replicas of one Deployment, or a rollout that replaces one failing pod with another, each offer an event and each opens a triage session (and, under `incidentTriage.openPullRequest`, a pull request for the same fix). `INCIDENT_WORKLOAD_DEDUP_SECONDS` — set by the operator from `spec.harness.incidentTriage.workloadDedupSeconds`, default `0` (off) — folds a further Warning event for the same cluster, namespace and workload, within that many seconds of the workload's last delivered event, into that incident: the ledger row carries `duplicate_of` (the delivered row's id), no quota is spent, the watcher is answered `filtered` (or `suppressed` when it did not claim `policy-filtered`), and no session is started. Only a delivered row (`notified = 1`, no `delivery_error`) anchors the window, so a refused first event never silences the second. It runs between the severity gate and the ceiling.
 7. **Scheduled-Report Relay:** Accepts a finished report from a specialist's cron job on `POST /v1/cron-reports` and gives the Chat Agent one turn to present it, so a scheduled finding lands in a thread the Chat Agent can answer follow-up questions about. Its caller is the scheduler, not the model: `deliver: "chat"` resolves to a delivery-only platform plugin whose sender POSTs here, and `report_to_chat` remains for a job that needs to report mid-run. Deliberately not a mode of `/sessions/{id}/inject`: a scheduled report has no severity and must not spend the alert ceiling above. See [the design](../../../docs/designs/cron-report-relay.md).
 8. **Triage Routing:** Instructs the front door to hand the diagnosis to the Cluster Agent of the cluster the event came from, and records the chat route that carries the report back.
 
@@ -27,7 +28,7 @@ It binds loopback rather than `0.0.0.0` because every one of its callers shares 
 
 The session lands on the front door and cannot land anywhere else. Hermes selects a profile by URL prefix (`POST /p/<profile>/api/sessions`), only when `gateway.multiplex_profiles` is enabled — it is off by default and this install does not set it — and only against that profile's own `API_SERVER_KEY`. A `profile` key in the request body is accepted with a `201` and dropped, so it looks like routing and is not. Routing is therefore a prompt, not a parameter.
 
-`_build_agent_query` writes that prompt for the front door — for an event; a `gitops-drift` or `controller-stall` inject is routed to its own builder at the top of the same function — and it is addressed to a router rather than to a diagnostician: make exactly one `kanban_create` call, assign it to the `cluster-*` agent scoped to the event's cluster, and copy the body between two markers verbatim. `_triage_task_body` builds that body — the event details and the report template — and it is the front door's job to move it across unread. Everything in that design is a response to the front door being helpful: given the brief as instructions rather than as cargo, it summarised, and filed extra cards asking other agents to deliver the report.
+`_build_agent_query` writes that prompt for the front door — for an event; a `gitops-drift` or `controller-stall` inject is routed to its own builder at the top of the same function — and it is addressed to a router rather than to a diagnostician: make one `kanban_create` call, assign it to the `cluster-*` agent scoped to the event's cluster, and copy the body between two markers verbatim. `_triage_task_body` builds that body — the event details and the report template — and it is the front door's job to move it across unread. Everything in that design is a response to the front door being helpful: given the brief as instructions rather than as cargo, it summarised, and filed extra cards asking other agents to deliver the report. When `INCIDENT_TRIAGE_OPEN_PULL_REQUEST=true` (`spec.harness.incidentTriage.openPullRequest: true`), `_build_agent_query_with_pull_request` asks the front door for a second `kanban_create` call assigned to `platform` with `parents: ["<triage_card_id>"]` and a verbatim body from `_triage_pr_task_body`; the dispatcher holds that second card until the diagnosis card completes, and the Platform Agent then opens the GitOps Pull Request for the recommended fix without waiting for a chat reply.
 
 Delivery is the card itself. Hermes subscribes every card to the session it was filed from, and posts a subscribed card's `result` to chat when it turns terminal — so the Cluster Agent finishes with `kanban_complete` and nothing else, and the report reaches the thread the alert was raised in. The body's whole job on that point is to insist the entire report goes in `result`, since `result` is verbatim what the reader sees.
 
@@ -220,6 +221,9 @@ sequenceDiagram
     Proxy->>Gateway: POST /api/sessions/k8s-evt-abc123/chat (Route this triage)
     Gateway->>Front: Wake up the front door
     Front->>Agent: kanban_create(assignee=cluster-proj-x-loc, body=the brief, verbatim)
+    opt spec.harness.incidentTriage.openPullRequest = true
+        Front->>Fixer: kanban_create(assignee=platform, parents=[triage_card_id], body=PR brief, verbatim)
+    end
     Note over Front, Agent: The card is subscribed to the alert's thread, not to the api_server origin
     Agent->>Agent: Diagnose (read-only), write the report
     Agent->>Agent: kanban_complete(result=the full report)
@@ -297,14 +301,18 @@ number instead of losing them; the watcher's own dedup snapshot cannot substitut
 rolling window of _active_ incidents keyed by `(uid, reason)`, carries no namespace or workload
 name, and resets each entry's `count` when its window rolls over.
 
-`notified = 0` covers three unrelated outcomes and the recap must not conflate them. The [severity
+`notified = 0` covers four unrelated outcomes and the recap must not conflate them. The [severity
 gate](#severity-gate) holds back events Kubernetes itself graded informational, and those are the
 recap's subject — reported as a count. An alert the [daily ceiling](#daily-alert-ceiling) dropped
 carries the same flag but was graded `Critical` or `Warning` and was on its way to chat, so the
 recap reads `severity` to tell the two apart. It does not report those: they are outside its scope,
 and counting them as informational would inflate the one number it exists to publish. It does count
 them privately, because a day that withheld alerts may not be reported as a clean one — the SOP's
-"What this recap does not report" owns that contract.
+"What this recap does not report" owns that contract. A sibling replica folded into an earlier live
+incident by the workload deduplication window (`INCIDENT_WORKLOAD_DEDUP_SECONDS`) is also recorded
+with `notified = 0`, and carries `duplicate_of > 0` pointing at the anchor row whose alert already
+went to chat; the recap excludes `duplicate_of > 0` rows from its ceiling-drop count so folded
+duplicates are not misreported as withheld alerts.
 
 The third is `delivery_error`, and it exists because `notified` is an _intent_ at the moment it is
 written. The row goes in before the chat post is attempted: the send runs in a background task, so a
@@ -363,8 +371,9 @@ CREATE TABLE intercepted_events(
   message     TEXT NOT NULL DEFAULT '',
   severity    TEXT NOT NULL DEFAULT '',
   occurrences INTEGER NOT NULL DEFAULT 1,
-  notified    INTEGER NOT NULL DEFAULT 0,  -- 0 when the gate, the ceiling or a failed send held it back
+  notified    INTEGER NOT NULL DEFAULT 0,  -- 0 when the gate, the ceiling, the workload window or a failed send held it back
   delivery_error TEXT NOT NULL DEFAULT '',  -- non-empty when the chat post failed after notified = 1
+  duplicate_of INTEGER NOT NULL DEFAULT 0,  -- id of the anchor row when INCIDENT_WORKLOAD_DEDUP_SECONDS folded this event
   created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 ```
@@ -387,7 +396,7 @@ time and bounds nothing on disk; 512 keeps more than it shows, which leaves room
 
 ##### A pre-release table, and no migration
 
-`init_db` runs `CREATE TABLE IF NOT EXISTS` and nothing else: there is no `ALTER TABLE` for
+`init_db` runs `CREATE TABLE IF NOT EXISTS` (plus an `ALTER TABLE` that adds `duplicate_of` to tables created before the workload window existed): there is no `ALTER TABLE` for
 `cluster`, `object_uid` or `delivery_error` anywhere in the tree. The table has never been in a release, so the
 only databases carrying an earlier shape are dev installs that ran an intermediate commit of the
 change that introduced it, and a migration maintained for a shape no user has is machinery that
