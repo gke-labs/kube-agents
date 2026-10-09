@@ -77,7 +77,8 @@ def _in_pod(name: str, interpolations: dict) -> str:
 _IN_POD = {
     "local.home": "/opt/data",
     "local.scan_job": "bootstrap-inventory-scan",
-    "local.delivery_job": "bootstrap-inventory-delivery",
+    "local.delivery_job": "oobe",
+    "local.old_delivery_job": "bootstrap-inventory-delivery",
     "local.state_file": "/opt/data/.bench-onboarding-jobs.json",
     "local.settle_wait": "120",
     "local.settle_poll": "2",
@@ -866,7 +867,7 @@ def _jobs_lock():
 
 _SCAN = {"id": "bootstrap-inventory-scan", "schedule": {"expr": "* * * * *"}, "deliver": "local", "next_run_at": "t0"}
 _DELIVERY = {
-    "id": "bootstrap-inventory-delivery",
+    "id": "oobe",
     "schedule": {"expr": "* * * * *"},
     "deliver": "local",
     "next_run_at": "t0",
@@ -911,12 +912,18 @@ class ArmDisarmTest(unittest.TestCase):
             [sys.executable, "-"], input=code, env=self._env, capture_output=True, text=True, timeout=60
         )
 
+    def test_arm_needs_only_oobe_and_records_the_disabled_entries_present(self):
+        self._jobs([_DELIVERY])
+        out = self._py(self._arm)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertEqual(json.loads((self._home / ".bench-onboarding-jobs.json").read_text())["jobs"], [_DELIVERY])
+
     def test_arm_refuses_a_missing_paused_or_bound_job_and_changes_nothing(self):
         for jobs, message in (
-            ([_SCAN], "bootstrap-inventory-delivery are not in the cron store"),
-            ([_SCAN, {**_DELIVERY, "enabled": False}], "bootstrap-inventory-delivery is paused"),
-            ([_SCAN, {**_DELIVERY, "state": "paused"}], "bootstrap-inventory-delivery is paused"),
-            ([_SCAN, {**_DELIVERY, "paused_at": "t0"}], "bootstrap-inventory-delivery is paused"),
+            ([_SCAN], "oobe is not in the cron store"),
+            ([_SCAN, {**_DELIVERY, "enabled": False}], "oobe is paused"),
+            ([_SCAN, {**_DELIVERY, "state": "paused"}], "oobe is paused"),
+            ([_SCAN, {**_DELIVERY, "paused_at": "t0"}], "oobe is paused"),
             ([_SCAN, {**_DELIVERY, "deliver": "origin"}], "delivers to 'origin', not local"),
         ):
             with self.subTest(message=message):
@@ -1000,18 +1007,29 @@ class ArmDisarmTest(unittest.TestCase):
         self.assertIn("was not armed", self._py(self._disarm).stdout)
         self.assertEqual(self._py(self._arm).returncode, 0)
 
+    def test_disarm_puts_back_the_old_delivery_entry_oobe_removed(self):
+        old = {"id": "bootstrap-inventory-delivery", "schedule": {"expr": "* * * * *"}, "deliver": "local",
+               "enabled": False, "next_run_at": "t0"}
+        self._jobs([_SCAN, _DELIVERY, old])
+        self.assertEqual(self._py(self._arm).returncode, 0)
+        self._jobs([_DELIVERY])
+        out = self._py(self._disarm)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertIn("put back: bootstrap-inventory-scan, bootstrap-inventory-delivery", out.stdout)
+        self.assertEqual([j["id"] for j in self._jobs()], ["oobe", "bootstrap-inventory-scan", "bootstrap-inventory-delivery"])
+
     def test_disarm_puts_back_the_removed_jobs_and_clears_the_markers(self):
         self.assertEqual(self._py(self._arm).returncode, 0)
         self._jobs([_SCAN])
         (self._home / ".bootstrap_completed").write_text("")
         out = self._py(self._disarm)
         self.assertEqual(out.returncode, 0, out.stderr)
-        self.assertIn("put back: bootstrap-inventory-delivery", out.stdout)
+        self.assertIn("put back: oobe", out.stdout)
         scan, delivery = self._jobs()
         self.assertEqual(scan, _SCAN)
         self.assertEqual(
             delivery,
-            {"id": "bootstrap-inventory-delivery", "schedule": {"expr": "* * * * *"}, "deliver": "local",
+            {"id": "oobe", "schedule": {"expr": "* * * * *"}, "deliver": "local",
              "next_run_at": "next:* * * * *"},
         )
         self.assertEqual(sorted(p.name for p in self._home.iterdir()), ["cron"])
@@ -1027,7 +1045,7 @@ class ArmDisarmTest(unittest.TestCase):
         self.assertEqual(self._py(self._arm).returncode, 0)
         conn = sqlite3.connect(self._home / "cron" / "executions.db")
         conn.execute("CREATE TABLE executions (id INTEGER PRIMARY KEY, job_id TEXT, status TEXT)")
-        conn.execute("INSERT INTO executions (job_id, status) VALUES ('bootstrap-inventory-delivery', 'running')")
+        conn.execute("INSERT INTO executions (job_id, status) VALUES ('oobe', 'running')")
         conn.commit()
         conn.close()
         started = time.monotonic()

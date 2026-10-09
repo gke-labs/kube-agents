@@ -57,7 +57,10 @@ class PreLlmCallTest(unittest.TestCase):
         self._env = mock.patch.dict("os.environ", {"HERMES_HOME": str(self.data_dir)})
         self._env.start()
         # Inject framework doubles.
-        self.update_job = mock.MagicMock()
+        # A store with oobe only, unless a test says otherwise: update_job answers None for a
+        # job it does not have, as Hermes' does.
+        self.store_ids = {"oobe"}
+        self.update_job = mock.MagicMock(side_effect=lambda job_id, updates: {} if job_id in self.store_ids else None)
         self.trigger_job = mock.MagicMock()
         self._patches = [
             mock.patch.object(plugin, "update_job", self.update_job),
@@ -130,8 +133,8 @@ class PreLlmCallTest(unittest.TestCase):
         self.assertNotIn("COMPLETED-INSTRUCTIONS", result["context"])
         # Presence marker set, delivery bound to origin and triggered.
         self.assertTrue((self.data_dir / ".user_aligned").exists())
-        self.update_job.assert_called_once_with(
-            "bootstrap-inventory-delivery",
+        self.update_job.assert_any_call(
+            "oobe",
             {
                 "deliver": "origin",
                 "origin": {
@@ -141,7 +144,28 @@ class PreLlmCallTest(unittest.TestCase):
                 },
             },
         )
+        self.trigger_job.assert_called_once_with("oobe")
+
+    def test_both_delivery_jobs_present_are_bound_and_only_oobe_triggered(self):
+        # A post-fold install still carries the disabled old entry; binding it keeps the link if
+        # the install is rolled back to an image from before the fold.
+        self.store_ids = {"oobe", "bootstrap-inventory-delivery"}
+        self._call()
+        self.assertEqual([c.args[0] for c in self.update_job.call_args_list], ["oobe", "bootstrap-inventory-delivery"])
+        # Triggering also enables a job; the old entry stays disabled.
+        self.trigger_job.assert_called_once_with("oobe")
+
+    def test_an_install_without_oobe_binds_the_old_delivery_job(self):
+        # oobe removed itself under an earlier image; the old job still delivers.
+        self.store_ids = {"bootstrap-inventory-delivery"}
+        self._call()
+        self.assertTrue((self.data_dir / ".user_aligned").exists())
         self.trigger_job.assert_called_once_with("bootstrap-inventory-delivery")
+
+    def test_no_delivery_job_at_all_primes_nothing(self):
+        self.store_ids = set()
+        self.assertIsNone(self._call())
+        self.assertFalse((self.data_dir / ".user_aligned").exists())
 
     # --- Case B: user connects after scan finished (INVENTORY.md present) -
 
@@ -153,7 +177,7 @@ class PreLlmCallTest(unittest.TestCase):
         # The plugin must NOT inject the inventory itself (delivery is verbatim).
         self.assertNotIn("SECRET-FLEET-DATA", result["context"])
         self.assertTrue((self.data_dir / ".user_aligned").exists())
-        self.trigger_job.assert_called_once_with("bootstrap-inventory-delivery")
+        self.trigger_job.assert_called_once_with("oobe")
 
     def test_origin_binding_happens_before_user_aligned(self):
         # update_job (origin binding) must precede touching .user_aligned so the
@@ -161,9 +185,10 @@ class PreLlmCallTest(unittest.TestCase):
         calls = []
         self.update_job.side_effect = lambda *a, **k: calls.append(
             ("bind", (self.data_dir / ".user_aligned").exists())
-        )
+        ) or {}
         self._call()
-        self.assertEqual(calls, [("bind", False)])
+        self.assertEqual(calls, [("bind", False)] * len(plugin.DELIVERY_JOB_IDS))
+        self.assertTrue((self.data_dir / ".user_aligned").exists())
 
     def test_missing_thread_id_omitted_from_origin(self):
         with mock.patch.object(
@@ -194,7 +219,8 @@ class PreLlmCallTest(unittest.TestCase):
 
         second = self._call(session_id="20260720_130000_efgh5678")
         self.assertIsNone(second)
-        self.update_job.assert_called_once()  # delivery still bound to the first chat
+        # Delivery still bound to the first chat: no bind and no trigger for the second session.
+        self.assertEqual(self.update_job.call_count, len(plugin.DELIVERY_JOB_IDS))
         self.trigger_job.assert_called_once()
 
     def test_greeted_marker_is_written(self):
@@ -525,7 +551,7 @@ class PreLlmCallTest(unittest.TestCase):
         self.assertIsNone(self._eval_call())
         result = self._call(user_message="hi! priya here, just installed you")
         self.assertIn("SCAN IN PROGRESS", result["context"])
-        self.update_job.assert_called_once()
+        self.assertEqual(self.update_job.call_count, len(plugin.DELIVERY_JOB_IDS))
         self.assertTrue((self.data_dir / plugin.GREETED_MARKER).exists())
 
 

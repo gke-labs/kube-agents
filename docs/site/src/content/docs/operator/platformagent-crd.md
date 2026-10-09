@@ -513,9 +513,9 @@ leave the Platform Agent unable to do the work the flag exists to let it do.
   `HERMES_HOME` — the job store, the execution ledger and `.tick.lock` all resolve from the gateway
   process's own home — so the one roster that ticks becomes `profiles/platform/cron/jobs.json`. The
   Platform Agent's own watchdogs therefore tick natively, which is the upside; the cost is that the
-  five jobs on the `default` roster never come due. Those are `cluster-agent-reconcile`, which
+  three jobs on the `default` roster never come due. Those are `cluster-agent-reconcile`, which
   scaffolds a profile for a newly onboarded cluster and prunes one for a deleted cluster;
-  `bootstrap-inventory-scan`, `bootstrap-inventory-delivery` and `oobe`, which are first-run onboarding; and
+  `oobe`, which runs first-run onboarding (the `bootstrap-inventory-*` entries ship disabled); and
   `profile-cron-tick`, the only thing that ticks a **named** profile's own store — so every
   `cluster-*` roster goes quiet with it. Nothing errors and nothing is logged: a job that is never
   ticked simply stays `scheduled` with a `next_run_at` in the past.
@@ -532,7 +532,7 @@ leave the Platform Agent unable to do the work the flag exists to let it do.
   writes into one anonymous bucket, since a specialist carries no gateway identity to scope a
   per-user store by. Carrying memory to the front door needs those settings to be per-process
   rather than per-profile.
-- **First-run onboarding does not follow the gateway.** Its three jobs are on the `default` roster the
+- **First-run onboarding does not follow the gateway.** Its job, `oobe`, is on the `default` roster the
   bullet above stops ticking, and its greeting hook — the `bootstrap_onboarding` plugin — resolves
   its once-per-deployment markers from the gateway's home, so on the platform profile it would greet
   an already-onboarded install and promise a report nothing can deliver. The operator therefore

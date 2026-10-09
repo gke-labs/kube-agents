@@ -28,7 +28,10 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
-DELIVERY_JOB_ID = "bootstrap-inventory-delivery"
+# The jobs that can post the report: oobe's delivery stage (agents/chat/scripts/oobe.py), and the
+# old delivery job, which still delivers on an install whose oobe removed itself before this image,
+# and again after a rollback to an image from before the fold. Each one present is bound.
+DELIVERY_JOB_IDS = ("oobe", "bootstrap-inventory-delivery")
 # Only adapters with a durable destination may own the one-time report. Use a
 # positive allowlist so new local or request/response surfaces fail closed until
 # they explicitly implement durable delivery.
@@ -132,7 +135,7 @@ def _load_instructions(data_dir: Path, name: str, fallback: str) -> str:
     return fallback
 
 
-def _bind_delivery_to_origin(**kwargs: Any) -> bool:
+def _bind_delivery_to_origin(**kwargs: Any) -> list:
     """Point the delivery job at the chat this turn originated from.
 
     The delivery cron job runs with no session identity of its own, so it can
@@ -140,7 +143,7 @@ def _bind_delivery_to_origin(**kwargs: Any) -> bool:
     persist here from the live session. Bound BEFORE ``.user_aligned`` is
     touched so the job never fires against a stale target.
 
-    Returns True only when a real chat origin was persisted. A False return
+    Returns the jobs a real chat origin was persisted on. An empty return
     means this turn has nowhere to deliver to (a CLI/API session with no chat
     id, or the cron API is unavailable), and the caller must NOT mark human
     presence: the delivery job would then fire while still set to
@@ -148,22 +151,29 @@ def _bind_delivery_to_origin(**kwargs: Any) -> bool:
     void.
     """
     if get_session_env is None or update_job is None:
-        return False
+        return []
     try:
         platform = get_session_env("HERMES_SESSION_PLATFORM") or str(kwargs.get("platform") or "")
         chat_id = get_session_env("HERMES_SESSION_CHAT_ID")
         thread_id = get_session_env("HERMES_SESSION_THREAD_ID")
         if not (platform and chat_id) or platform.lower() == "cron":
-            return False
+            return []
         origin: Dict[str, str] = {"platform": platform, "chat_id": str(chat_id)}
         if thread_id:
             origin["thread_id"] = str(thread_id)
-        update_job(DELIVERY_JOB_ID, {"deliver": "origin", "origin": origin})
-        logger.info("Bound %s delivery to %s (chat_id=%s)", DELIVERY_JOB_ID, platform, chat_id)
-        return True
     except Exception as e:
-        logger.warning("Could not bind %s origin: %s", DELIVERY_JOB_ID, e)
-        return False
+        logger.warning("Could not read the chat origin: %s", e)
+        return []
+    bound = []
+    for job_id in DELIVERY_JOB_IDS:
+        try:
+            # update_job answers None for a job not in the store.
+            if update_job(job_id, {"deliver": "origin", "origin": origin}) is not None:
+                bound.append(job_id)
+                logger.info("Bound %s delivery to %s (chat_id=%s)", job_id, platform, chat_id)
+        except Exception as e:
+            logger.warning("Could not bind %s origin: %s", job_id, e)
+    return bound
 
 
 def _set_home_channel_if_unset(**kwargs: Any) -> bool:
@@ -333,7 +343,8 @@ def handle_pre_llm_call(**kwargs: Any) -> Optional[Dict[str, str]]:
     # job can only ever fire once it already knows where to send the report.
     # An unbindable turn is not an onboarding turn: leave every marker alone
     # so the next real chat turn primes the flow instead.
-    if not _bind_delivery_to_origin(**kwargs):
+    bound = _bind_delivery_to_origin(**kwargs)
+    if not bound:
         logger.info("No deliverable chat origin on this turn; leaving onboarding unprimed.")
         return None
 
@@ -345,11 +356,12 @@ def handle_pre_llm_call(**kwargs: Any) -> Optional[Dict[str, str]]:
     except Exception as e:
         logger.warning("Could not touch .user_aligned: %s", e)
 
+    # Only the first: trigger_job also enables a job, and the old entry ships disabled beside oobe.
     if trigger_job is not None:
         try:
-            trigger_job(DELIVERY_JOB_ID)
+            trigger_job(bound[0])
         except Exception as e:
-            logger.warning("Could not trigger %s: %s", DELIVERY_JOB_ID, e)
+            logger.warning("Could not trigger %s: %s", bound[0], e)
 
     # Last, so that a failure above retries on the next turn rather than
     # burning the one-shot. A failure HERE only costs a repeated greeting.

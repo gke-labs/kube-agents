@@ -28,9 +28,8 @@
 #
 # It refuses an install where a person has connected (`.user_aligned`) or
 # onboarding already delivered (`.bootstrap_completed`): a fresh sweep there
-# ends in a report sent to a real chat. It also refuses one whose
-# `bootstrap-inventory-scan` job is missing or paused, where nothing would
-# file the sweep.
+# ends in a report sent to a real chat. It also refuses one whose `oobe` job,
+# which runs the scan, is missing or paused, where nothing would file the sweep.
 
 terraform {
   required_version = ">= 1.5.0"
@@ -51,14 +50,18 @@ locals {
   run_wait  = 900
   poll      = 15
   inventory = "${local.home}/INVENTORY.raw.md ${local.home}/INVENTORY.md"
-  # The gate as the cron job launches it, and the longest one run of it can
+  # The longest one run of the gate can
   # take at the default scope cap, which is what this stack installs:
   # bootstrap_scan_gate.py's RECONCILE_TIMEOUT_SECONDS (390) plus one cron
   # tick. A declared spec.scope.maxProjects raises the gate's ceiling with
   # the reconcile's budget.
-  gate_script = "bootstrap_scan_gate.py"
+  # The processes the gate runs in: oobe.py, whose scan stage calls it in-process, and the
+  # gate script itself, which the old scan job still runs on an install with no oobe job.
+  gate_script = "oobe.py bootstrap_scan_gate.py"
   gate_wait   = 450
-  scan_job    = "bootstrap-inventory-scan"
+  # The job whose scan stage files the sweep (agents/chat/scripts/oobe.py); the old
+  # bootstrap-inventory-scan entry ships disabled.
+  scan_job    = "oobe"
   # bootstrap_scan_gate.py's CLUSTER_IDEMPOTENCY_KEY_PREFIX.
   cluster_key_like = "bootstrap-inventory-cluster-%"
   # bootstrap_scan_gate.py's PRIORITIZE_IDEMPOTENCY_KEY: the ranking card the
@@ -223,7 +226,7 @@ resource "null_resource" "sweep" {
         fi
         for pod in $pods; do
           state="$(kubectl exec -i -n "${var.agent_namespace}" "$pod" -c "${var.agent_container}" -- \
-            ${local.python} - "${local.gate_script}" <<'PY' || true
+            ${local.python} - ${local.gate_script} <<'PY' || true
       import os, sys
       me = os.getpid()
       for pid in filter(str.isdigit, os.listdir("/proc")):
@@ -232,7 +235,7 @@ resource "null_resource" "sweep" {
                   argv = fh.read().decode(errors="replace").split("\0")
           except OSError:
               continue
-          if int(pid) != me and any(os.path.basename(a) == sys.argv[1] for a in argv[1:]):
+          if int(pid) != me and any(os.path.basename(a) in sys.argv[1:] for a in argv[1:]):
               print("running")
               break
       else:
@@ -295,10 +298,10 @@ resource "null_resource" "sweep" {
           echo "ERROR: ${local.home}/.user_aligned exists on ${var.host_cluster_name}: a person has connected, and the report a fresh sweep writes would be delivered to their chat. Run this case on an install nobody is chatting with." >&2
           exit 1 ;;
         completed)
-          echo "ERROR: onboarding already delivered on ${var.host_cluster_name} (${local.home}/.bootstrap_completed), and delivery removed the bootstrap-inventory-scan job with it. There is no gate left to re-arm." >&2
+          echo "ERROR: onboarding already delivered on ${var.host_cluster_name} (${local.home}/.bootstrap_completed), and the ${local.scan_job} job removes itself after delivery. There is no gate left to re-arm." >&2
           exit 1 ;;
         nojob)
-          echo "ERROR: the bootstrap-inventory-scan cron job is not in ${local.home}/cron/jobs.json on ${var.host_cluster_name}, so nothing will file a sweep." >&2
+          echo "ERROR: the ${local.scan_job} cron job is not in ${local.home}/cron/jobs.json on ${var.host_cluster_name}, so nothing will file a sweep." >&2
           exit 1 ;;
         paused)
           echo "ERROR: the ${local.scan_job} cron job is paused (\"enabled\": false in ${local.home}/cron/jobs.json) on ${var.host_cluster_name}, so nothing will file a sweep. The agent pod's next start re-enables it." >&2
