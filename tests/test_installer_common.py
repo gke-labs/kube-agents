@@ -4801,9 +4801,19 @@ class NextSlackGatewaySettingsRefusalTest(unittest.TestCase):
                 self.assertNotIn("secretpart", out)
 
     def test_one_bot_token_or_none_passes(self):
-        for token in (self._TOKEN, f" {self._TOKEN} ", f"{self._TOKEN},", ""):
+        for token in (self._TOKEN, f" {self._TOKEN} ", ""):
             with self.subTest(token=token.replace("secretpart", "*")):
                 self._passes(token=token)
+
+    def test_one_token_with_a_stray_separator_is_refused(self):
+        # The legacy broker drops the empty piece; the gateway takes the
+        # value whole, and Slack refuses it.
+        for token in (f"{self._TOKEN},", f",{self._TOKEN}", f"{self._TOKEN},,", f"{self._TOKEN} ,"):
+            with self.subTest(token=token.replace("secretpart", "*")):
+                proc = self._run(token=token)
+                self.assertIn("rc=1", proc.stdout, proc.stderr)
+                self.assertIn("SLACK_BOT_TOKEN holds one token with a comma or space left in it.", proc.stdout)
+                self.assertNotIn("secretpart", proc.stdout + proc.stderr)
 
     # ── the three together, and when none applies ──
 

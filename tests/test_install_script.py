@@ -5975,7 +5975,9 @@ class NextSlackGatewaySettingsWiringTest(unittest.TestCase):
             + "ASKED=0\n"
             # The default is echoed as prompt_read prints it ("[default: …]",
             # the label over the value), so a secret shown there is caught.
-            'prompt_read() { echo "PROMPT: $1 [default: ${5:-${3:-}}]"; printf -v "$2" "%s" "${ANSWERS[$ASKED]}"; ASKED=$((ASKED + 1)); }\n'
+            # An answer of "<enter>" takes the default, as an empty one does.
+            'prompt_read() { echo "PROMPT: $1 [default: ${5:-${3:-}}]"; local a="${ANSWERS[$ASKED]}"; '
+            '[ "$a" = "<enter>" ] && a="${3:-}"; printf -v "$2" "%s" "$a"; ASKED=$((ASKED + 1)); }\n'
         )
         # The values are main()'s locals, so they are echoed inside the slice.
         body, tail = self._chat_step().rsplit("\n}\n", 1)
@@ -6017,6 +6019,26 @@ class NextSlackGatewaySettingsWiringTest(unittest.TestCase):
         self.assertEqual(out.count("PROMPT: Slack Bot Token"), 2)
         self.assertEqual(out.count("PROMPT: Allowed Slack member IDs"), 2)
         self.assertEqual(out.count("PROMPT: Slack Home Channel ID"), 2)
+        self.assertNotIn("secretpart", out)
+
+    def test_a_re_ask_offers_only_a_default_it_shows(self):
+        # Bot token: a stray comma, then one token. Allowlist: emails, then
+        # Enter, which keeps the refused list (an empty one would admit
+        # everyone) under a default that shows it, then IDs. Home channel: a
+        # DM, then Enter, which clears it.
+        answers = ["xoxb-1-secretpart,", "xoxb-1-secretpart", "xapp-1",
+                   "U0123ABCD,alice@example.com", "<enter>", "U0123ABCD",
+                   "D0123ABCD", "<enter>", "#ops"]
+        proc = self._interview("--mode=next", "", answers)
+        out = proc.stdout + proc.stderr
+        self.assertIn("went on ASKED=9", proc.stdout, out)
+        self.assertIn("USERS=[U0123ABCD] HOME=[] TOKENS=", proc.stdout)
+        self.assertIn("SLACK_BOT_TOKEN holds a comma or space.", out)
+        self.assertEqual(out.count("These look like emails: alice@example.com."), 2)
+        self.assertIn("PROMPT: Allowed Slack member IDs (comma-separated, such as U0123ABCD; not emails) "
+                      "[default: U0123ABCD,alice@example.com]", out)
+        self.assertNotIn("[default: empty list]", out.split("These look like emails", 1)[1])
+        self.assertIn("PROMPT: Slack Home Channel ID (optional, a channel ID such as C0123456789) [default: ]", out)
         self.assertNotIn("secretpart", out)
 
     def test_the_interview_keeps_the_today_prompts_where_slack_stays_on_the_today_path(self):

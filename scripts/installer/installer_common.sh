@@ -659,6 +659,17 @@ slack_bot_token_list_count() {
   if [ "$count" -gt 1 ]; then printf '%s' "$count"; fi
 }
 
+# True when a Slack bot token ($1), trimmed, still holds a separator: one
+# token with a stray comma or space, as hand-trimming a list leaves it. The
+# legacy broker drops the empty piece; the gateway takes the string whole.
+slack_bot_token_has_separator() {
+  local token="${1:-}"
+  token="${token#"${token%%[![:space:]]*}"}"
+  token="${token%"${token##*[![:space:]]}"}"
+  case "$token" in *[,[:space:]]*) return 0 ;; esac
+  return 1
+}
+
 # Three Slack settings that the today path accepts and the A2A gateway does
 # not. They are refused before the front door applies anything (#2812), and
 # only when Slack moves to the gateway (slack_moves_to_a2a_gateway). Every
@@ -676,7 +687,8 @@ slack_bot_token_list_count() {
 # - SLACK_BOT_TOKEN must be one token. The legacy broker takes a
 #   comma-separated list for several workspaces; the gateway takes the
 #   string whole, Slack refuses it at auth.test, and the Slack backend
-#   retries on a backoff without ever connecting. Only the
+#   retries on a backoff without ever connecting. One token with a stray
+#   comma or space left in it fails the same way. Only the
 #   count is printed, never the value. An empty token is skipped: it is
 #   recovered from the live Secret later, so the front doors call again
 #   after recovery.
@@ -714,6 +726,11 @@ refuse_next_slack_gateway_settings() {
     via="install.env"; [ "$flags" = "flags" ] && via="install.env or --slack-bot-token"
     "$say" "${lead}SLACK_BOT_TOKEN holds ${count} tokens, a list for several workspaces. Under spec.mode next the A2A gateway's Slack backend takes one workspace's bot token, and Slack refuses a list, so that backend retries without end and nothing answers on Slack."
     print_info "Set SLACK_BOT_TOKEN to one workspace's bot token (xoxb-...) in ${via} and run again, or keep this install on PLATFORM_AGENT_MODE=today."
+    refused=true
+  elif slack_bot_token_has_separator "$token"; then
+    via="install.env"; [ "$flags" = "flags" ] && via="install.env or --slack-bot-token"
+    "$say" "${lead}SLACK_BOT_TOKEN holds one token with a comma or space left in it. Under spec.mode next the A2A gateway's Slack backend takes the value whole, and Slack refuses it, so that backend retries without end and nothing answers on Slack."
+    print_info "Remove the comma or space from SLACK_BOT_TOKEN in ${via} and run again."
     refused=true
   fi
   if $refused && [ "$mode" != "$SCOPE_CHECK_MODE_WARN" ]; then return 1; fi

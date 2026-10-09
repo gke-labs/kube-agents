@@ -3653,7 +3653,7 @@ class FullArmRefusesNextSlackGatewaySettingsTest(unittest.TestCase):
     other guard and both writes stubbed, so it can observe that nothing was
     applied."""
 
-    _CALL = "refuse_next_slack_gateway_settings_from_env || exit 1"
+    _CALL = "if ! refuse_next_slack_gateway_settings_from_env; then"
 
     def _arm(self):
         source = _UPGRADE_SH.read_text()
@@ -3662,7 +3662,7 @@ class FullArmRefusesNextSlackGatewaySettingsTest(unittest.TestCase):
         end = source.index("\n      ;;\n", body_start)
         return source[body_start:end]
 
-    def _run(self, keys):
+    def _run(self, keys, tfvars_file="/nonexistent"):
         stubs = (
             "print_step() { :; }\n"
             "refuse_apply_over_undeclared_scope() { :; }\n"
@@ -3677,7 +3677,7 @@ class FullArmRefusesNextSlackGatewaySettingsTest(unittest.TestCase):
             f'KUBE_AGENTS_SOURCE_ONLY=true source "{_UPGRADE_SH}"\n'
             f'source "{_REPO_ROOT}/scripts/installer/installer_common.sh"\n'
             f"{stubs}{exports}"
-            f'repo_dir="{_REPO_ROOT}"; tfvars_file=/nonexistent; target_namespace=kube-agents\n'
+            f'repo_dir="{_REPO_ROOT}"; tfvars_file={shlex.quote(tfvars_file)}; target_namespace=kube-agents\n'
             f"_full() {{\n{self._arm()}\n}}\n"
             "_full\n"
         )
@@ -3704,6 +3704,18 @@ class FullArmRefusesNextSlackGatewaySettingsTest(unittest.TestCase):
                 self.assertIn("in install.env and run again", out)
                 self.assertNotIn("--slack-", out)
                 self.assertNotIn("secretpart", out)
+
+    def test_a_refusal_removes_the_tfvars_the_generator_wrote(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tfvars = pathlib.Path(tmp) / "terraform.tfvars"
+            tfvars.write_text('slack_bot_token = "xoxb-1-secretpart,xoxb-2-secretpart"\n')
+            proc = self._run({"PLATFORM_AGENT_MODE": "next", "SLACK_ENABLED": "true",
+                              "SLACK_BOT_TOKEN": "xoxb-1-secretpart,xoxb-2-secretpart"}, str(tfvars))
+            left = tfvars.exists()
+        out = proc.stdout + proc.stderr
+        self.assertEqual(proc.returncode, 1, out)
+        self.assertNotIn("APPLIED", out)
+        self.assertFalse(left, "the tfvars rendering the refused token list were left for a hand-run apply")
 
     def test_the_cases_the_refusal_leaves_alone_apply(self):
         for keys in (

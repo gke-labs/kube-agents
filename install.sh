@@ -5263,9 +5263,12 @@ run_menu_system() {
         if ! refuse_next_slack_gateway_settings_from_env; then
           if [ -n "$install_env_before" ]; then
             # Into the existing file, which keeps its 0600.
-            cat "$install_env_before" >"$INSTALL_ENV_FILE"
-            rm -f "$install_env_before"
+            # Moved into place complete, as save_env_var writes it (on_error
+            # removes a half-written .tmp), before the copy is let go.
+            (umask 077; cat "$install_env_before" >"${INSTALL_ENV_FILE}.tmp")
+            mv -f "${INSTALL_ENV_FILE}.tmp" "$INSTALL_ENV_FILE"
             trap - EXIT
+            rm -f "$install_env_before"
             print_info "${INSTALL_ENV_FILE} is put back as it was before this Save & Apply."
           fi
           rm -f "$(tf_compose_dir "$repo_dir")/terraform.tfvars"
@@ -5843,8 +5846,13 @@ main() {
       prompt_read "Slack Bot Token (xoxb-..., one workspace: spec.mode next takes a single token)" \
         slack_bot_token "$slack_bot_token" true "$bot_hint"
       bad="$(slack_bot_token_list_count "$slack_bot_token")"
+      if [ -z "$bad" ] && slack_bot_token_has_separator "$slack_bot_token"; then bad=stray; fi
       { [ -n "$bad" ] && $can_ask; } || break
-      print_error "SLACK_BOT_TOKEN holds ${bad} tokens. Under spec.mode next the A2A gateway takes one workspace's bot token; enter one."
+      if [ "$bad" = stray ]; then
+        print_error "SLACK_BOT_TOKEN holds a comma or space. Under spec.mode next the A2A gateway takes one bot token as it is; enter it without one."
+      else
+        print_error "SLACK_BOT_TOKEN holds ${bad} tokens. Under spec.mode next the A2A gateway takes one workspace's bot token; enter one."
+      fi
       # Not the re-ask's default: prompt_read prints a default it has no
       # label for, and this one is the list just typed under read -s.
       slack_bot_token="" bot_hint=""
@@ -5856,6 +5864,9 @@ main() {
       bad="$(slack_allowlist_emails "$slack_allowed_users")"
       { [ -n "$bad" ] && $can_ask; } || break
       print_error "These look like emails: ${bad}. Under spec.mode next the allowlist matches Slack member IDs exactly. Find one in Slack: open the person's profile, choose ⋮ (More), then Copy member ID."
+      # The refused list stays the default (an empty one would admit
+      # everyone), so the hint shows it rather than a label for another.
+      slack_allowed_hint=""
     done
     while :; do
       prompt_read "Slack Home Channel ID (optional, a channel ID such as C0123456789)" \
@@ -5863,6 +5874,10 @@ main() {
       bad="$(slack_home_channel_not_an_id "$slack_home_channel")"
       { [ -n "$bad" ] && $can_ask; } || break
       print_error "'${bad}' is not a Slack channel id (C... or G...). The id is at the bottom of the channel details' About tab."
+      # Not the re-ask's default: the value is optional, and prompt_read
+      # turns an empty answer into the default, so a bad one could never be
+      # cleared.
+      slack_home_channel=""
     done
     prompt_read "Slack Home Channel Name (optional, e.g. #gke-alerts)" \
       slack_home_channel_name "$slack_home_channel_name"

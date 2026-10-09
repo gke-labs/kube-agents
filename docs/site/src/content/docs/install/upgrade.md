@@ -221,8 +221,9 @@ skips those — but still before any CRD, chart or Terraform change of the new r
   - a `SLACK_HOME_CHANNEL` that is not a channel ID (`C...` or `G...`): the gateway's notify route
     does not arm, so proactive posts and board-card reports stop. The ID is at the bottom of the
     channel details' About tab.
-  - a `SLACK_BOT_TOKEN` that holds several tokens: the gateway takes one workspace's token. The
-    run gives the count, never the token. Keep a multi-workspace install on `today`.
+  - a `SLACK_BOT_TOKEN` that holds several tokens, or one with a comma or space left in it: the
+    gateway takes one workspace's token, whole. The run gives the count, never the token. Keep a
+    multi-workspace install on `today`.
 
   `--plan` warns of the same three without refusing.
 

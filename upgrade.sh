@@ -2012,8 +2012,14 @@ main() {
       # bot tokens. The generator above has already recovered a token the
       # live Secret holds. Guarded: a target tree whose installer_common.sh
       # predates the check does not define it.
+      # A refusal removes the tfvars the generator just wrote, which render
+      # the refused settings, as install.sh does; a moved checkout's previous
+      # tfvars come back from restore_moved_checkout.
       if declare -F refuse_next_slack_gateway_settings_from_env >/dev/null; then
-        refuse_next_slack_gateway_settings_from_env || exit 1
+        if ! refuse_next_slack_gateway_settings_from_env; then
+          rm -f "$tfvars_file"
+          exit 1
+        fi
       fi
       # The mode. A full apply carries PLATFORM_AGENT_MODE forward from
       # install.env, so a key edited since the last apply switches the install

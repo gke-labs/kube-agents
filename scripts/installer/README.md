@@ -458,8 +458,8 @@ three settings the gateway cannot use (`refuse_next_slack_gateway_settings`):
   matches member IDs exactly.
 - a `SLACK_HOME_CHANNEL` that is not a channel ID (`C` or `G`, then two or more of `A-Z0-9`).
   Its notify route does not arm.
-- a `SLACK_BOT_TOKEN` that holds more than one comma-separated token, reported by count. The
-  gateway takes one.
+- a `SLACK_BOT_TOKEN` that holds more than one comma-separated token, reported by count, or one
+  token with a comma or space left in it. The gateway takes one token, whole.
 
 A token that only the live Secret holds is checked after the generator recovers it. That
 refusal also removes the `terraform.tfvars` just written, and in the menu restores
