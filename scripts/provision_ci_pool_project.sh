@@ -402,6 +402,7 @@ done
 # managers on refresh, which no other role here carries (seen live 2026-09-28).
 echo "Granting the seeded-fleet reconciler access to ${PROJECT_ID}..."
 for role in \
+  roles/compute.instanceAdmin.v1 \
   roles/compute.storageAdmin \
   roles/compute.viewer \
   roles/container.admin \
