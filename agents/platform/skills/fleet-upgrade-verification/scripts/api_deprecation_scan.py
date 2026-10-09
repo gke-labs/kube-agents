@@ -790,8 +790,15 @@ def main(argv: list[str] | None = None) -> int:
             sys.stderr.write(f"--versions {args.versions}: {e}\n")
             return EXIT_USAGE
         narrowed_to = fleet.get(REPORT_NARROWED_KEY) if isinstance(fleet, dict) else None
-        if narrowed_to:
-            sys.stderr.write(NARROWED_VERSIONS_FORMAT.format(path=args.versions, specs=", ".join(str(s) for s in narrowed_to)) + "\n")
+        # The reporter writes a list of specs or null, and `--versions` is any
+        # file the operator points at. Null is a full run; a non-empty list is
+        # the reporter's mark; anything else is not a full run's file either
+        # and is refused the same way, with the value as written rather than
+        # iterated (a bool or a number would raise, a string would be spelled
+        # out letter by letter).
+        if narrowed_to is not None and (not isinstance(narrowed_to, list) or narrowed_to):
+            specs = ", ".join(str(s) for s in narrowed_to) if isinstance(narrowed_to, list) else json.dumps(narrowed_to)
+            sys.stderr.write(NARROWED_VERSIONS_FORMAT.format(path=args.versions, specs=specs) + "\n")
             return EXIT_USAGE
         members = members_from_fleet_json(fleet if isinstance(fleet, dict) else {})
         fleet_target = fleet.get("target_version") if isinstance(fleet, dict) else None

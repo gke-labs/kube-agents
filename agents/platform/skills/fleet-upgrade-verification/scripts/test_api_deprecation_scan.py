@@ -479,6 +479,26 @@ class MainTest(unittest.TestCase):
             self.assertEqual(rc, scan.EXIT_OK)
             self.assertIn("# API deprecation scan: 1.24 -> 1.27", out)
 
+    def test_a_malformed_narrowed_to_is_refused_as_narrowed_not_crashed(self):
+        """`--versions` is any file the operator hands over. A value that is
+        neither null nor a list is refused with the same usage line and exit
+        code, never iterated into a traceback; an empty list is a full run."""
+        with tempfile.TemporaryDirectory() as tmp:
+            write_tree(tmp, {"tree/pdb.yaml": PDB_V1BETA1})
+            versions = Path(tmp) / "fleet.json"
+            argv = ["--versions", str(versions), "--target-version", "1.27.0", "--manifests-dir", str(Path(tmp) / "tree")]
+            for value in ("us-central1/prod", {"spec": "us-central1/prod"}, 1, True):
+                with self.subTest(narrowed_to=value):
+                    versions.write_text(json.dumps({**FLEET_JSON, "narrowed_to": value}))
+                    rc, out, err = self.run_main(argv)
+                    self.assertEqual(rc, scan.EXIT_USAGE)
+                    self.assertIn(f"narrowed by --cluster to {json.dumps(value)}", err)
+                    self.assertNotIn("API deprecation scan", out)
+            versions.write_text(json.dumps({**FLEET_JSON, "narrowed_to": []}))
+            rc, out, _ = self.run_main(argv)
+            self.assertEqual(rc, scan.EXIT_OK)
+            self.assertIn("# API deprecation scan: 1.24 -> 1.27", out)
+
     def test_current_version_flag(self):
         with tempfile.TemporaryDirectory() as tmp:
             write_tree(tmp, {"pdb.yaml": PDB_V1BETA1})
