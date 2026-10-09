@@ -193,8 +193,10 @@ TABLE_BUDGET_SECONDS = 900
 MIN_PROJECT_RUN_SECONDS = 120
 BUDGET_EXHAUSTED_DETAIL = "tick budget exhausted before project {project} could run"
 TABLE_UNRUN_DETAIL = "tick budget exhausted before the version table read project {project}"
+TABLE_CUT_SHORT_DETAIL = "the version table's run for project {project} was cut short by its share of the budget"
 TABLE_FAILED_DETAIL = "version table for {project} failed: {error}"
 PROJECT_NOT_RUN_DETAIL = "readiness run for {project} not started: {error}"
+PROJECT_CUT_SHORT_DETAIL = "readiness run for {project} cut short by the tick budget; it goes first next time"
 STDERR_EXCERPT_CHARS = 300
 
 # The report's vocabulary this job reads (fleet_upgrade_report.py, upgrade_readiness.py).
@@ -221,11 +223,12 @@ FIRST_SEEN_KEY = "first_seen"
 LAST_REPORT_KEY = "last_report_at"
 PENDING_KEY = "pending"
 LAST_TICK_KEY = "last_tick"
-# Where the next sweep starts: the first project the budget left unread, so a
-# budget that never reaches the end of the list does not leave the same project
-# unread every time. None, or a project no longer in scope, means the sorted order.
-TABLE_RESUME_KEY = "table_resume_from"
-READINESS_RESUME_KEY = "readiness_resume_from"
+# When each project's version table and readiness run last ran to completion or
+# to its own cap: each sweep runs the least recently run projects first, so a
+# project the budget left unread or cut short goes first next time, whichever
+# versions are due then.
+TABLE_RUNS_KEY = "table_runs"
+READINESS_RUNS_KEY = "readiness_runs"
 ANNOUNCED_KEY = "announced"
 ANNOUNCED_PARTIAL_KEY = "partial"
 ANNOUNCED_UNGRADED_KEY = "ungraded"
@@ -257,8 +260,8 @@ UNGRADED_LINE = (
     "report on the gateway pod at {path}; retrying tomorrow"
 )
 NOT_RUN_LINE = (
-    "{prefix}: {reason} {version}, {pending} cluster(s) pending ({names}): not run; the tick budget was spent "
-    "before {projects} ran; retried tomorrow, starting there"
+    "{prefix}: {reason} {version}, {pending} cluster(s) pending ({names}): not run to completion; the tick budget "
+    "was spent before {projects} finished; retried tomorrow, starting there"
 )
 UNKNOWN_COUNT = ", {count} unknown"
 UNREAD_COUNT = ", {count} not read"
@@ -531,12 +534,10 @@ def error_kind(error: dict) -> str:
 
 
 def partial_signature(read_errors: list) -> str:
-    """The announcement key for a partial table: each kind of read error and its count."""
-    counts: dict[str, int] = {}
-    for error in read_errors:
-        kind = error_kind(error)
-        counts[kind] = counts.get(kind, 0) + 1
-    return json.dumps(sorted(counts.items()))
+    """The announcement key for a partial table: the kinds of read error, not
+    their count, since how many projects a morning's latency leaves unread
+    moves day to day while the condition is the same."""
+    return json.dumps(sorted({error_kind(error) for error in read_errors}))
 
 
 def unlisted_projects(read_errors: list) -> set[str]:
@@ -594,7 +595,7 @@ def carry_forward_unlisted(pending: dict[str, list[str]], ledger: dict, read_err
 
 
 def empty_ledger() -> dict:
-    return {LEDGER_SCHEMA_KEY: LEDGER_SCHEMA_VERSION, TARGETS_KEY: {}, LAST_TICK_KEY: None, ANNOUNCED_KEY: {}}
+    return {LEDGER_SCHEMA_KEY: LEDGER_SCHEMA_VERSION, TARGETS_KEY: {}, LAST_TICK_KEY: None, ANNOUNCED_KEY: {}, TABLE_RUNS_KEY: {}, READINESS_RUNS_KEY: {}}
 
 
 def announced(ledger: dict) -> dict:
@@ -630,9 +631,9 @@ def load_ledger(path: Path) -> dict:
     # hand the None back on the next due or retired version.
     if data[ANNOUNCED_KEY].get(ANNOUNCED_UNGRADED_KEY) is None:
         data[ANNOUNCED_KEY][ANNOUNCED_UNGRADED_KEY] = {}
-    for key in (TABLE_RESUME_KEY, READINESS_RESUME_KEY):
-        if not isinstance(data.get(key), str):
-            data[key] = None
+    for key in (TABLE_RUNS_KEY, READINESS_RUNS_KEY):
+        runs = data.get(key)
+        data[key] = {k: v for k, v in runs.items() if isinstance(k, str) and isinstance(v, str)} if isinstance(runs, dict) else {}
     return data
 
 
@@ -739,15 +740,11 @@ def project_of(member_key_text: str) -> str:
     return member_key_text.split(MEMBER_KEY_SEPARATOR, 1)[0]
 
 
-def ordered_projects(names: set[str] | list[str], resume_from: str | None) -> list[str]:
-    """The sorted project list, turned to start at ``resume_from`` when that
-    project is still in scope: the project the last sweep's budget left unread
-    runs first, so it is not the one left unread again."""
-    order = sorted(names)
-    if resume_from in order:
-        start = order.index(resume_from)
-        order = order[start:] + order[:start]
-    return order
+def ordered_projects(names: set[str] | list[str], last_runs: dict[str, str]) -> list[str]:
+    """The projects least recently run first (never run before any), then by
+    name: a project the last sweep left unread or cut short goes first next
+    time, whichever versions are due then."""
+    return sorted(names, key=lambda project: (last_runs.get(project, ""), project))
 
 
 def empty_envelope() -> dict:
@@ -762,18 +759,20 @@ def merge_envelope(merged: dict, envelope: dict) -> None:
         merged[ENVELOPE_EXIT_KEY] = envelope.get(ENVELOPE_EXIT_KEY)
 
 
-def versions_by_project(names: list[str], deadline: float, resume_from: str | None) -> tuple[dict, str | None]:
+def versions_by_project(names: list[str], deadline: float, last_runs: dict[str, str], now: datetime) -> dict:
     """The version table, one sandbox run per project under its own timeout and
     what is left of the table's share of the budget before ``deadline``, merged
     into one envelope. A project whose run failed, or that the budget did not reach, is a
     read error with no location, the shape a failed ``clusters list`` has, so
     the table counts as partial: nothing is retired, and the ledger's pending
-    clusters of that project are carried forward. The second value is the first
-    project not reached, where the next tick's table starts."""
+    clusters of that project are carried forward. ``last_runs`` is stamped for
+    every project that ran to completion or to its own cap, so the next table
+    starts with the ones it did not."""
     merged = empty_envelope()
     unrun: list[str] = []
+    cut_short: list[str] = []
     failed: dict[str, Exception] = {}
-    for project in ordered_projects(names, resume_from):
+    for project in ordered_projects(names, last_runs):
         remaining = deadline - time.monotonic()
         if remaining < MIN_PROJECT_RUN_SECONDS:
             unrun.append(project)
@@ -783,21 +782,24 @@ def versions_by_project(names: list[str], deadline: float, resume_from: str | No
             envelope = run_report([project], readiness=False, timeout=timeout)
         except SandboxTimedOut as exc:
             if timeout < VERSION_TABLE_TIMEOUT_SECONDS:
-                # Killed by the budget, not by its own cap: the sweep resumes here.
-                unrun.append(project)
+                # Killed by the budget, not by its own cap: not stamped, so it goes first next time.
+                cut_short.append(project)
                 continue
+            last_runs[project] = iso(now)
             failed[project] = exc
             merged[ENVELOPE_REPORT_KEY][ERRORS_KEY].append(
                 {MEMBER_ID_KEYS[0]: project, MEMBER_ID_KEYS[1]: None, MESSAGE_KEY: TABLE_FAILED_DETAIL.format(project=project, error=str(exc))}
             )
             continue
         except (RuntimeError, ValueError, KeyError, TypeError) as exc:
+            last_runs[project] = iso(now)
             failed[project] = exc
             error = f"{type(exc).__name__}: {exc}" if not isinstance(exc, RuntimeError) else str(exc)
             merged[ENVELOPE_REPORT_KEY][ERRORS_KEY].append(
                 {MEMBER_ID_KEYS[0]: project, MEMBER_ID_KEYS[1]: None, MESSAGE_KEY: TABLE_FAILED_DETAIL.format(project=project, error=error)}
             )
             continue
+        last_runs[project] = iso(now)
         merge_envelope(merged, envelope)
     if failed and len(failed) == len(names):
         # No project read at all is the sandbox or the credential, not a
@@ -808,50 +810,58 @@ def versions_by_project(names: list[str], deadline: float, resume_from: str | No
         merged[ENVELOPE_REPORT_KEY][ERRORS_KEY].append(
             {MEMBER_ID_KEYS[0]: project, MEMBER_ID_KEYS[1]: None, MESSAGE_KEY: TABLE_UNRUN_DETAIL.format(project=project)}
         )
-    return merged, (unrun[0] if unrun else None)
+    for project in cut_short:
+        merged[ENVELOPE_REPORT_KEY][ERRORS_KEY].append(
+            {MEMBER_ID_KEYS[0]: project, MEMBER_ID_KEYS[1]: None, MESSAGE_KEY: TABLE_CUT_SHORT_DETAIL.format(project=project)}
+        )
+    return merged
 
 
 def readiness_by_project(
-    pending: dict[str, list[str]], due: dict[str, str], deadline: float, resume_from: str | None = None
-) -> tuple[dict, dict[str, str], list[str]]:
+    pending: dict[str, list[str]], due: dict[str, str], deadline: float, last_runs: dict[str, str], now: datetime
+) -> tuple[dict, dict[str, str], dict[str, str]]:
     """One readiness run per project that holds a due version's pending
     clusters, each capped by its own timeout and by what is left of the tick's
     budget before ``deadline`` (a ``time.monotonic`` instant), merged into one
     envelope. A project whose run failed leaves its clusters ungraded and is
-    named in the second value; a project the budget did not reach is named in
-    the third, so the caller can tell a failed read from a read that never
-    started. Both are read errors in the envelope, so the report names them."""
+    named in the second value; a project the budget did not reach, or cut
+    short under a shrunk timeout, is named in the third with the phrase that
+    says which, so the caller can tell a failed read from a read that never
+    finished. All are read errors in the envelope, so the report names them.
+    ``last_runs`` is stamped for a run that completed or hit its own cap, so
+    the least recently run projects go first next time."""
     needed = {project_of(key) for version in due for key in pending[version]}
     merged = empty_envelope()
     failures: dict[str, str] = {}
-    unrun: list[str] = []
-    for project in ordered_projects(needed, resume_from):
+    unfinished: dict[str, str] = {}
+    for project in ordered_projects(needed, last_runs):
         remaining = deadline - time.monotonic()
         if remaining < MIN_PROJECT_RUN_SECONDS:
-            unrun.append(project)
+            unfinished[project] = PROJECT_NOT_RUN_DETAIL.format(project=project, error=BUDGET_EXHAUSTED_DETAIL.format(project=project))
             continue
         timeout = min(READINESS_TIMEOUT_SECONDS, remaining)
         try:
             envelope = run_report([project], readiness=True, timeout=timeout)
         except SandboxTimedOut as exc:
             if timeout < READINESS_TIMEOUT_SECONDS:
-                # Killed by the budget, not by its own cap: not an attempt, and
-                # the next sweep starts here.
-                unrun.append(project)
+                # Killed by the budget, not by its own cap: not an attempt, not
+                # stamped, so it goes first next time.
+                unfinished[project] = PROJECT_CUT_SHORT_DETAIL.format(project=project)
                 continue
+            last_runs[project] = iso(now)
             failures[project] = str(exc)
             continue
         except (RuntimeError, ValueError, KeyError, TypeError) as exc:
+            last_runs[project] = iso(now)
             failures[project] = f"{type(exc).__name__}: {exc}" if not isinstance(exc, RuntimeError) else str(exc)
             continue
+        last_runs[project] = iso(now)
         merge_envelope(merged, envelope)
     for project, error in failures.items():
         merged[ENVELOPE_REPORT_KEY][ERRORS_KEY].append({MEMBER_ID_KEYS[0]: project, MESSAGE_KEY: PROJECT_RUN_FAILED_DETAIL.format(project=project, error=error)})
-    for project in unrun:
-        merged[ENVELOPE_REPORT_KEY][ERRORS_KEY].append(
-            {MEMBER_ID_KEYS[0]: project, MESSAGE_KEY: PROJECT_NOT_RUN_DETAIL.format(project=project, error=BUDGET_EXHAUSTED_DETAIL.format(project=project))}
-        )
-    return merged, failures, unrun
+    for project, detail in unfinished.items():
+        merged[ENVELOPE_REPORT_KEY][ERRORS_KEY].append({MEMBER_ID_KEYS[0]: project, MESSAGE_KEY: detail})
+    return merged, failures, unfinished
 
 
 def cluster_names(clusters: list[str]) -> str:
@@ -973,8 +983,7 @@ def tick(dry_run: bool = False) -> list[str]:
     ledger = load_ledger(ledger_path)
     names = projects()
     deadline = started + TICK_BUDGET_SECONDS
-    versions, table_unrun = versions_by_project(names, started + TABLE_BUDGET_SECONDS, ledger.get(TABLE_RESUME_KEY))
-    ledger[TABLE_RESUME_KEY] = table_unrun
+    versions = versions_by_project(names, started + TABLE_BUDGET_SECONDS, ledger[TABLE_RUNS_KEY], now)
     read_errors = versions[ENVELOPE_REPORT_KEY].get(ERRORS_KEY) or []
     complete = versions.get(ENVELOPE_EXIT_KEY) == EXIT_OK and not read_errors
     pending = pending_targets(versions[ENVELOPE_REPORT_KEY])
@@ -1000,14 +1009,13 @@ def tick(dry_run: bool = False) -> list[str]:
         lines.append(PARTIAL_CLEARED_LINE.format(prefix=LINE_PREFIX))
     announced(ledger)[ANNOUNCED_PARTIAL_KEY] = signature
     if due:
-        readiness, failures, unrun = readiness_by_project(pending, due, deadline, ledger.get(READINESS_RESUME_KEY))
-        ledger[READINESS_RESUME_KEY] = unrun[0] if unrun else None
+        readiness, failures, unfinished = readiness_by_project(pending, due, deadline, ledger[READINESS_RUNS_KEY], now)
         for version, reason in due.items():
             clusters = pending[version]
             blocked, ready, unknown, unread = readiness_verdicts(readiness[ENVELOPE_REPORT_KEY], clusters)
             version_projects = {project_of(k) for k in clusters}
             failed_projects = sorted(version_projects & set(failures))
-            unrun_projects = sorted(version_projects & set(unrun))
+            unrun_projects = sorted(version_projects & set(unfinished))
             if not blocked and not ready and not unknown and unrun_projects and not failed_projects and len(unrun_projects) == len(version_projects):
                 # Nothing was attempted for this version: not a report, not an
                 # ungraded attempt, and not recorded, so it is due again tomorrow,
@@ -1021,7 +1029,7 @@ def tick(dry_run: bool = False) -> list[str]:
                 continue
             failure_text = "; ".join(
                 [PROJECT_RUN_FAILED_DETAIL.format(project=p, error=failures[p]) for p in failed_projects]
-                + [PROJECT_NOT_RUN_DETAIL.format(project=p, error=BUDGET_EXHAUSTED_DETAIL.format(project=p)) for p in unrun_projects]
+                + [unfinished[p] for p in unrun_projects]
             )
             graded = bool(blocked or ready or unknown)
             ungraded_announced = announced(ledger).setdefault(ANNOUNCED_UNGRADED_KEY, {})
