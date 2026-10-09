@@ -7,6 +7,54 @@ description: Upgrade kube-agents (the Kubernetes Agentic Harness) and its operat
 
 Use this skill when asked to upgrade the `kube-agents` Platform Agent or operator on an active GKE cluster.
 
+## Report confirmed upgrade bugs
+
+- After an upgrade attempt, check its exit code and verify the affected workloads and preserved
+  history/memory before declaring success. Check that any JSON report belongs to this attempt;
+  an early refusal can leave a previous report behind. For `--plan`, exit 2 means changes, not a
+  failed upgrade. For a healthy success, tell the user what was verified and stop.
+- Diagnose failures before filing. Expired credentials, missing tools, quotas, network failures
+  and invalid installation configuration need recovery guidance; file only when reproduction or
+  source evidence confirms a defect in the official repository. A failed verification can reveal
+  a defect even when the upgrade exited 0. Report observed availability/data impact and recovery
+  options; do not automatically roll back, delete data, or change the selected installation.
+- Use the session's existing authorization to report to `gke-labs/kube-agents`. If GitHub writes
+  have not been authorized, prepare the report and ask once before posting. An upgrade request
+  alone does not authorize publishing installation details.
+- Search `gke-labs/kube-agents` issues, open **and closed**, using the distinctive error, affected
+  component and root cause. Do not filter by `upgrade-failure`: older matching issues may lack it.
+  Read candidate bodies and comments; a similar title or symptom with a different cause is not a
+  duplicate. Narrow or paginate incomplete results. If search fails or remains incomplete, keep a
+  draft and tell the user why; do not create an issue without a completed duplicate check.
+- For a matching open issue, add a comment with new evidence and keep its body and assignees.
+  Skip a comment if this exact attempt is already recorded and adds nothing. For a matching closed
+  issue, check the resolution and release containing the fix: point to that release if the install
+  predates it. For a confirmed recurrence after the fix shipped, comment on and reopen the issue
+  if permitted; otherwise link the closed issue and report the inability to reopen it.
+- With no matching issue, repeat the search immediately before creating one to reduce races.
+  Give it a concrete title naming the component, affected release and failure.
+- Apply `bug` and `upgrade-failure` to a created or updated defect report. Create missing labels
+  only within the authorized reporting action; preserve existing label definitions.
+  Use the description `Confirmed repository defects encountered during upgrades` for
+  `upgrade-failure`. Add `priority:p0` only for confirmed data loss, an ongoing outage caused by
+  the defect, or a blocked release. Remove conflicting lower `priority:` labels when escalating
+  to p0; preserve existing priorities otherwise. A failed upgrade with a healthy existing install
+  is not automatically p0.
+- Include the previous and target versions, upgrade mode, failing stage, exit code, expected and
+  actual behaviour, minimal reproduction or source evidence, sanitized command/error excerpts,
+  availability/data impact, and recovery or workaround. Mark unavailable facts as unknown.
+  Before posting, remove credentials, tokens, session salts, customer/project/cluster identifiers
+  and user identifiers. Never attach raw `install.env`, Terraform state, kubeconfig or unfiltered
+  logs. Use placeholders that preserve the failure mechanism.
+- Use `gh` with an explicit `--repo gke-labs/kube-agents` and `--body-file` for issue bodies and
+  comments. Keep exact multiline text in a temporary file. If permissions, label creation or a
+  write fail, retain the sanitized draft, explain what actually succeeded and what remains, and
+  provide any issue URL already created. For an ambiguous write response, check GitHub before
+  retrying; do not blindly create a duplicate.
+- Return the issue URL and whether it was created, updated or reopened, plus the installation's
+  current state and next recovery step. A successful retry alone is not proof the repository bug
+  is fixed: leave issue closure to verified resolution.
+
 ## One-Liner Execution Mode (Non-Interactive)
 
 Upgrade an install with the `upgrade.sh` published for the release you are moving to, substituting
