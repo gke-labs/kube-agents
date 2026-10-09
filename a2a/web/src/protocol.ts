@@ -52,8 +52,10 @@ export const TERMINAL_STATES: readonly TaskState[] = [
   "rejected",
 ];
 
-/** The four reserved artifact names. The set of names is open; only these carry semantics. */
+/** Reserved artifact names. The set of names is open; only these carry semantics. */
 export const ARTIFACT_RESULT = "result";
+/** An earlier turn's answer on a task with follow-up turns; shown like a result, never the deliverable. */
+export const ARTIFACT_TURN = "turn";
 export const ARTIFACT_THINKING = "thinking";
 export const ARTIFACT_ACTIVITY = "activity";
 export const ARTIFACT_PROGRESS = "progress";
