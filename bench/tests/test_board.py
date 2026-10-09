@@ -130,7 +130,8 @@ SESSION = "a2a-ctx-67aed1ee09f614850d05a55e"
 OTHER_SESSION = "a2a-ctx-0000000000000000000000ff"
 
 STORE_DDL = (
-    "CREATE TABLE sessions (id TEXT PRIMARY KEY, parent_session_id TEXT)",
+    "CREATE TABLE sessions (id TEXT PRIMARY KEY, parent_session_id TEXT, end_reason TEXT,"
+    " source TEXT, model_config TEXT, started_at REAL, ended_at REAL)",
     "CREATE TABLE messages (id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT, role TEXT,"
     " content TEXT, tool_call_id TEXT, tool_calls TEXT, tool_name TEXT, timestamp REAL)",
 )
@@ -321,9 +322,40 @@ def test_a_compressed_session_is_followed_to_its_continuation(
         conn.execute(
             "UPDATE sessions SET parent_session_id = ? WHERE id = ?", (SESSION, child_session)
         )
-        conn.execute("INSERT INTO sessions (id) VALUES (?)", (SESSION,))
+        conn.execute("INSERT INTO sessions (id, end_reason) VALUES (?, 'compression')", (SESSION,))
     read = board.read_session_cards(local_shell(tmp_path, monkeypatch), SESSION, 5)
     assert read is not None and read.card_ids == [FRONT]
+
+
+@pytest.mark.parametrize(
+    "end_reason, source, model_config",
+    [
+        pytest.param("user_exit", None, None, id="a parent that did not end in compression"),
+        pytest.param("compression", None, '{"_branched_from": "x"}', id="a /branch child"),
+        pytest.param("compression", None, '{"_delegate_from": "x"}', id="a delegate child"),
+        pytest.param("compression", "tool", None, id="a tool child"),
+    ],
+)
+def test_only_a_compression_continuation_joins_the_chain(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    end_reason: str,
+    source: str | None,
+    model_config: str | None,
+) -> None:
+    """Hermes' _CHAIN_STEP_SQL rule: any other child of the session is someone
+    else's work, and its cards are not this run's."""
+    child_session = SESSION + "-2"
+    build_session_store(tmp_path, session=child_session, created=[FRONT])
+    with sqlite3.connect(tmp_path / board.STORE_FILE) as conn:
+        conn.execute(
+            "UPDATE sessions SET parent_session_id = ?, source = ?, model_config = ? WHERE id = ?",
+            (SESSION, source, model_config, child_session),
+        )
+        conn.execute("INSERT INTO sessions (id, end_reason) VALUES (?, ?)", (SESSION, end_reason))
+    read = board.read_session_cards(local_shell(tmp_path, monkeypatch), SESSION, 5)
+    assert read is not None and read.session_found
+    assert read.card_ids == []
 
 
 def test_an_unreadable_store_is_no_reading(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

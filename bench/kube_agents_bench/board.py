@@ -84,55 +84,6 @@ print(json.dumps(out))
 """
 
 
-def command(task_ids: list[str]) -> str:
-    """The ``sh -c`` line that reads ``task_ids``' statuses in the pod."""
-    args = " ".join(
-        shlex.quote(a) for a in [DATA_ROOT, BOARD_FILE, BOARD_PRESENT, *task_ids]
-    )
-    return (
-        f'PY={shlex.quote(HERMES_PYTHON)}; [ -x "$PY" ] || PY={shlex.quote(FALLBACK_PYTHON)}; '
-        f'"$PY" -c {shlex.quote(_IN_POD_SCRIPT)} {args}'
-    )
-
-
-def read_statuses(
-    shell: Callable[[str, float], str], task_ids: list[str], timeout: float
-) -> dict[str, str] | None:
-    """The board's current status for each of ``task_ids``, or ``None``.
-
-    ``shell`` is :func:`harness._agent_shell`, taken as a parameter so this
-    module stays importable without the harness and testable with a canned
-    reply.
-
-    ``None`` means the read cannot be trusted: no card was asked for, the
-    script did not run to completion, its reply was not JSON, or the board
-    could not be opened. A card the board does not know is simply absent from
-    the returned map; the caller decides what an unknown card means.
-    """
-    if not task_ids:
-        return None
-    reply = shell(command(task_ids), timeout)
-    marker = reply.find(BOARD_PRESENT)
-    if marker < 0:
-        _log.debug("kanban board could not be read for %s", ", ".join(task_ids))
-        return None
-    body = reply[marker + len(BOARD_PRESENT) :].strip()
-    try:
-        payload = json.loads(body)
-    except json.JSONDecodeError as exc:
-        _log.warning("kanban board reply is not JSON: %s", exc)
-        return None
-    if not isinstance(payload, dict):
-        return None
-    if payload.get("error"):
-        _log.warning("kanban board: %s", payload["error"])
-        return None
-    statuses = payload.get("statuses")
-    if not isinstance(statuses, dict):
-        return None
-    return {str(k): str(v) for k, v in statuses.items() if k in task_ids}
-
-
 # --- the cards one Hermes session filed ---------------------------------------
 #
 # Under the hermes bridge's ``api`` executor an inject conversation's turns run
@@ -164,14 +115,6 @@ SESSION_CARDS_PRESENT = "__KANBAN_SESSION_CARDS__"
 # JSON object; the clip only stops a pathological one carrying the record away.
 MAX_SESSION_CARDS = 64
 MAX_CREATE_RESULT_CHARS = 2000
-
-
-def api_session_id(context_id: str) -> str:
-    """The Hermes session the bridge's api executor runs ``context_id``'s turns in."""
-    if len(context_id) <= API_CONTEXT_ID_MAX_LEN and _API_SAFE_CONTEXT_ID.match(context_id):
-        return API_SESSION_PREFIX + context_id
-    digest = hashlib.sha256(context_id.encode()).hexdigest()[:API_HASHED_SESSION_HEX_LEN]
-    return API_SESSION_PREFIX + API_HASHED_SESSION_PREFIX + digest
 
 
 # Runs inside the agent container, read-only like the status read. Positional
@@ -224,12 +167,38 @@ try:
     if has_table(store, "sessions"):
         if store.execute("SELECT 1 FROM sessions WHERE id = ?", (SID,)).fetchone():
             out["session"] = True
-        # A compressed session continues under a child id; follow the chain.
-        if "parent_session_id" in columns(store, "sessions"):
-            sessions = [r[0] for r in store.execute(
-                "WITH RECURSIVE chain(id) AS (SELECT ? UNION "
-                "SELECT s.id FROM sessions s JOIN chain c ON s.parent_session_id = c.id) "
-                "SELECT id FROM chain", (SID,))]
+        # A compressed session continues under a child id. Follow that chain
+        # and nothing else, one step at a time, by the pinned hermes' own rule
+        # (_CHAIN_STEP_SQL, hermes_state_compression.py): the parent ended in
+        # compression, and the child is not a /branch, delegate or tool child.
+        # Its ordering is kept less the last-activity term. A store too old
+        # for a column skips the condition that reads it.
+        cols = columns(store, "sessions")
+        if {"parent_session_id", "end_reason"} <= cols:
+            where = ["parent.id = ?", "parent.end_reason = 'compression'"]
+            if "model_config" in cols:
+                for marker in ("$._branched_from", "$._delegate_from"):
+                    where.append(
+                        "json_extract(CASE WHEN json_valid(child.model_config) "
+                        "THEN child.model_config ELSE json_object() END, '%s') IS NULL" % marker)
+            if "source" in cols:
+                where.append("COALESCE(child.source, '') != 'tool'")
+            order = ["CASE WHEN child.end_reason = 'compression' THEN 0 "
+                     + ("WHEN child.ended_at IS NULL THEN 1 " if "ended_at" in cols else "")
+                     + "ELSE 2 END"]
+            if "started_at" in cols:
+                order.append("child.started_at DESC")
+            order.append("child.id DESC")
+            step = ("SELECT child.id FROM sessions parent "
+                    "JOIN sessions child ON child.parent_session_id = parent.id "
+                    "WHERE %s ORDER BY %s LIMIT 1" % (" AND ".join(where), ", ".join(order)))
+            current = SID
+            for _ in range(100):
+                row = store.execute(step, (current,)).fetchone()
+                if row is None or row[0] in sessions:
+                    break
+                current = row[0]
+                sessions.append(current)
     rows = store.execute(
         "SELECT role, content, tool_calls, tool_call_id, tool_name FROM messages "
         "WHERE session_id IN (%s) ORDER BY id" % marks(sessions), sessions).fetchall()
@@ -297,6 +266,65 @@ if out["error"] is None:
 print(SENTINEL)
 print(json.dumps(out))
 """
+
+
+def command(task_ids: list[str]) -> str:
+    """The ``sh -c`` line that reads ``task_ids``' statuses in the pod."""
+    args = " ".join(
+        shlex.quote(a) for a in [DATA_ROOT, BOARD_FILE, BOARD_PRESENT, *task_ids]
+    )
+    return (
+        f'PY={shlex.quote(HERMES_PYTHON)}; [ -x "$PY" ] || PY={shlex.quote(FALLBACK_PYTHON)}; '
+        f'"$PY" -c {shlex.quote(_IN_POD_SCRIPT)} {args}'
+    )
+
+
+def read_statuses(
+    shell: Callable[[str, float], str], task_ids: list[str], timeout: float
+) -> dict[str, str] | None:
+    """The board's current status for each of ``task_ids``, or ``None``.
+
+    ``shell`` is :func:`harness._agent_shell`, taken as a parameter so this
+    module stays importable without the harness and testable with a canned
+    reply.
+
+    ``None`` means the read cannot be trusted: no card was asked for, the
+    script did not run to completion, its reply was not JSON, or the board
+    could not be opened. A card the board does not know is simply absent from
+    the returned map; the caller decides what an unknown card means.
+    """
+    if not task_ids:
+        return None
+    reply = shell(command(task_ids), timeout)
+    marker = reply.find(BOARD_PRESENT)
+    if marker < 0:
+        _log.debug("kanban board could not be read for %s", ", ".join(task_ids))
+        return None
+    body = reply[marker + len(BOARD_PRESENT) :].strip()
+    try:
+        payload = json.loads(body)
+    except json.JSONDecodeError as exc:
+        _log.warning("kanban board reply is not JSON: %s", exc)
+        return None
+    if not isinstance(payload, dict):
+        return None
+    if payload.get("error"):
+        _log.warning("kanban board: %s", payload["error"])
+        return None
+    statuses = payload.get("statuses")
+    if not isinstance(statuses, dict):
+        return None
+    return {str(k): str(v) for k, v in statuses.items() if k in task_ids}
+
+
+def api_session_id(context_id: str) -> str:
+    """The Hermes session the bridge's api executor runs ``context_id``'s turns in."""
+    if len(context_id) <= API_CONTEXT_ID_MAX_LEN and _API_SAFE_CONTEXT_ID.match(context_id):
+        return API_SESSION_PREFIX + context_id
+    digest = hashlib.sha256(context_id.encode()).hexdigest()[:API_HASHED_SESSION_HEX_LEN]
+    return API_SESSION_PREFIX + API_HASHED_SESSION_PREFIX + digest
+
+
 
 
 @dataclass
