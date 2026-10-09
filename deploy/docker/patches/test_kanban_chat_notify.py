@@ -547,8 +547,8 @@ class FoldFanoutTest(unittest.TestCase):
                            (to, sub["task_id"], claimed))
         return cur.rowcount > 0
 
-    def _advance(self, conn, sub, to):
-        conn.execute("UPDATE kanban_notify_subs SET last_event_id = ? WHERE task_id = ?", (to, sub["task_id"]))
+    def _advance(self, conn, sub, frm, to):
+        return self._rewind(conn, sub, frm, to)
 
     def cursor(self, task="t_child"):
         return self.conn.execute("SELECT last_event_id FROM kanban_notify_subs WHERE task_id = ?", (task,)).fetchone()[0]
@@ -654,6 +654,31 @@ class FoldFanoutTest(unittest.TestCase):
         self.conn.execute("DROP TABLE kanban_worker_children")
         claim = self.claim(_Ev(7, "completed", 1900))
         self.assertIs(self.fold(claim), claim)
+
+    def ping(self, event_id, task="t_child"):
+        self.conn.execute("UPDATE kanban_notify_subs SET last_ping_event_id = ? WHERE task_id = ?", (event_id, task))
+
+    def test_a_dropped_answer_whose_ping_landed_still_moves_the_cursor(self):
+        # The child's ping posted, its wake failed, so the durable cursor
+        # stayed behind; the drop must still move it past the answer.
+        self.parent("done", completed_event=9, delivered=9)
+        claim = self.claim(_Ev(7, "completed", 1900))
+        self.ping(7)
+        self.assertIsNone(self.fold(claim))
+        self.assertEqual(self.cursor(), 7)
+
+    def test_a_ping_does_not_make_a_read_only_claim_look_committed(self):
+        claim = self.claim(_Ev(7, "completed", 1900))
+        self.ping(7)
+        self.assertIsNone(self.fold(claim), "held, not released: the ping is not a committed claim")
+        self.assertEqual(self.cursor(), 6)
+
+    def test_an_archived_parent_that_answered_still_folds(self):
+        # The notifier unsubscribes an archived card after its last events.
+        self.parent("archived", completed_event=9)
+        self.conn.execute("DELETE FROM kanban_notify_subs WHERE task_id = 't_parent'")
+        self.assertIsNone(self.fold(self.claim(_Ev(7, "completed", 1900))))
+        self.assertEqual(self.cursor(), 7)
 
     def test_a_hold_logs_once(self):
         with self.assertLogs(kanban_chat_notify.logger, level="DEBUG") as logs:

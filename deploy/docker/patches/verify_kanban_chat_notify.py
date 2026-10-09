@@ -285,9 +285,11 @@ def check_fold(tmp: Path, runner: Any) -> None:
     kanban_db.complete_task(conn, parent, result="13 pods in kubeagents-system")
     check(claim(child) is None, "fold: still held while the parent's answer has not been delivered")
     check("completed" in kinds(deliver(parent)), "fold: the parent's answer delivers")
+    child_done = conn.execute("SELECT MAX(id) FROM task_events WHERE task_id = ? AND kind = 'completed'", (child,)).fetchone()[0]
     check(claim(child) is None, "fold: once the parent's answer is delivered, the child's is not posted")
-    check(sub_of(child)["last_event_id"] > start, "fold: the dropped answer's cursor is moved past it")
-    check(claim(child) is None, "fold: and it is not read again")
+    check(sub_of(child)["last_event_id"] >= child_done, "fold: the dropped answer's cursor is moved past it")
+    _, unread = kanban_db_notify.unseen_events_for_sub(conn, task_id=child, kinds=notifier.TERMINAL_KINDS, **where)
+    check(not any(e.kind == "completed" for e in unread), "fold: and it is not read again")
 
     parent, child = pair("count nodes")
     kanban_db.complete_task(conn, child, result="3 nodes")

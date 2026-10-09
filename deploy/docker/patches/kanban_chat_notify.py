@@ -345,6 +345,15 @@ def _sub_cursor(conn: Any, task_id: str, sub: dict) -> Optional[int]:
     return None if row is None else max(int(row[0] or 0), int(row[1] or 0))
 
 
+def _durable_cursor(conn: Any, task_id: str, sub: dict) -> Optional[int]:
+    """The subscription's durable cursor alone (``last_event_id``), or None.
+    Not ping-inclusive: a ping that posted before its wake failed leaves this
+    behind, and that is exactly the case where the cursor did not move."""
+    row = conn.execute(f"SELECT last_event_id FROM kanban_notify_subs WHERE {_SUB_WHERE}",
+                       _sub_args(task_id, sub)).fetchone()
+    return None if row is None else int(row[0] or 0)
+
+
 def _fold_parent(conn: Any, child_id: str, sub: dict) -> Optional[tuple]:
     """``(status, completed_event_id, delivered_cursor)`` for the card that
     created ``child_id``, when that card is subscribed to the same thread; else
@@ -365,12 +374,18 @@ def _fold_parent(conn: Any, child_id: str, sub: dict) -> Optional[tuple]:
         if not row:
             return None
         parent = row[0]
-        delivered = _sub_cursor(conn, parent, sub)
-        if delivered is None:
-            return None
         task = conn.execute("SELECT status FROM tasks WHERE id = ?", (parent,)).fetchone()
         if not task:
             return None
+        delivered = _sub_cursor(conn, parent, sub)
+        if delivered is None:
+            # The notifier unsubscribes an archived card after delivering its
+            # last events, so an archived parent with no subscription has said
+            # its answer; any other missing subscription (dropped after send
+            # failures) has not, and does not fold.
+            if task[0] != "archived":
+                return None
+            delivered = 1 << 62
         done = conn.execute(
             "SELECT MAX(id) FROM task_events WHERE task_id = ? AND kind = 'completed'", (parent,),
         ).fetchone()
@@ -391,12 +406,13 @@ def _rewind(conn: Any, sub: dict, claimed: int, to: int) -> bool:
     )
 
 
-def _advance(conn: Any, sub: dict, to: int) -> None:
-    """Advance the subscription's durable cursor to ``to``."""
+def _advance(conn: Any, sub: dict, frm: int, to: int) -> bool:
+    """Advance the subscription's durable cursor from ``frm`` to ``to`` (CAS:
+    only if no other writer moved it, so it never goes backwards)."""
     from hermes_cli import kanban_db_notify
-    kanban_db_notify.advance_notify_cursor(
+    return kanban_db_notify.rewind_notify_cursor(
         conn, task_id=sub["task_id"], platform=sub["platform"], chat_id=sub["chat_id"],
-        thread_id=sub.get("thread_id") or "", new_cursor=to,
+        thread_id=sub.get("thread_id") or "", claimed_cursor=frm, old_cursor=to,
     )
 
 
@@ -472,7 +488,7 @@ def fold_fanout(conn: Any, claim: Optional[dict], now: Optional[float] = None) -
             continue
         waiting = status in FOLD_WAITING_STATUSES or (status in ("done", "archived") and later)
         if waiting and now - (getattr(ev, "created_at", 0) or 0) < FOLD_HOLD_SECONDS:
-            committed = _sub_cursor(conn, child, sub) == int(claim.get("cursor") or 0) != int(claim.get("old_cursor") or 0)
+            committed = _durable_cursor(conn, child, sub) == int(claim.get("cursor") or 0) != int(claim.get("old_cursor") or 0)
             if committed:
                 try:
                     rewound = _rewind(conn, sub, int(claim["cursor"]), event_id - 1)
@@ -496,9 +512,9 @@ def fold_fanout(conn: Any, claim: Optional[dict], now: Optional[float] = None) -
     # Nothing left to deliver, so deliver() will not run to advance the cursor:
     # under the read-only claim, move it past the dropped answer here, or the
     # next tick reads and drops it again.
-    if _sub_cursor(conn, child, sub) != int(claim.get("cursor") or 0):
+    if _durable_cursor(conn, child, sub) != int(claim.get("cursor") or 0):
         try:
-            _advance(conn, sub, int(claim["cursor"]))
+            _advance(conn, sub, int(claim.get("old_cursor") or 0), int(claim["cursor"]))
         except Exception as exc:
             logger.warning("kanban notifier: could not move %s's cursor past its folded answer: %s", child, exc)
     return None
