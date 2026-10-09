@@ -1,4 +1,4 @@
-"""Read delegated cards' statuses straight off the kanban board, without a model turn.
+"""Read delegated cards straight off the kanban board, without a model turn.
 
 The delegation wait in :mod:`kube_agents_bench.harness` used to learn whether a
 card had settled by re-prompting the front door every poll interval to call
@@ -10,24 +10,30 @@ trying to use.
 
 The board itself is a SQLite file on the agent's data volume, the same one
 :mod:`kube_agents_bench.worker_trajectory` reads the workers' cards from once
-they settle. This module reads one thing from it, the ``status`` column of
-the awaited cards, through the same ``kubectl exec`` the harness already
-relies on for artifacts and session stores. The harness asks the board each
-poll and spends a front-door turn only when the board says a card has
-stopped moving, which is the one turn that can carry the card's result back
-into the conversation.
+they settle. This module has two reads, each one ``kubectl exec`` of the kind
+the harness already relies on for artifacts and session stores:
+
+- :func:`read_statuses`, the ``status`` column of the awaited cards. The api
+  transport's wait asks the board each poll and spends a front-door turn only
+  when the board says a card has stopped moving, which is the one turn that
+  can carry the card's result back into the conversation.
+- :func:`read_session_cards`, for the inject transport under the bridge's
+  ``api`` executor, where no turn can carry a result back. It finds the cards
+  one Hermes session filed, from that session's ``kanban_create`` results in
+  the session store or the board's subscriptions addressed to it, and reads
+  each card's status and deliverable (``tasks.result``, the newest
+  ``task_runs.summary``). The wait polls it alone and sends no turn.
 
 Best effort in the same sense as the artifact read-back: a pod that cannot
-be reached, a board that cannot be opened, or a card the board does not know
-all return ``None`` for that read, and the harness falls back to the status
-turn it always made. A wrong reading is worse than no reading, so the in-pod
-script prints a sentinel before its JSON and a reply without it is a failed
-read, never an empty one.
+be reached or a store that cannot be opened returns ``None`` for that read,
+and the caller decides what to do without it -- a status turn on the api
+transport, a retry and then a fallback on the inject one. A wrong reading is
+worse than no reading, so each in-pod script prints a sentinel before its JSON
+and a reply without it is a failed read, never an empty one.
 """
 
 from __future__ import annotations
 
-import hashlib
 import json
 import logging
 import re
@@ -95,12 +101,14 @@ print(json.dumps(out))
 # board's notify subscriptions addressed to it. Then it reads each card's status
 # and deliverable off the board, the same columns ``kanban_show`` returns.
 
-# Mirrors of apiSessionIDPrefix, apiHashedSessionPrefix, apiContextIDMaxLen and
-# apiHashedSessionHexLen in a2a/hermes-bridge/api.go.
+# Mirrors of apiSessionIDPrefix, apiContextIDMaxLen and apiSafeContextID in
+# a2a/hermes-bridge/api.go: the bridge uses a contextId verbatim under the
+# prefix when it is path-safe and no longer than the cap, and hashes it
+# otherwise. Only the verbatim half is mirrored. The gateway mints every
+# contextId as ``ctx-<hex>`` (gateway.go, the session record), which is always
+# verbatim, so an id the bridge would hash is not one this wait can be handed.
 API_SESSION_PREFIX = "a2a-"
-API_HASHED_SESSION_PREFIX = "h-"
 API_CONTEXT_ID_MAX_LEN = 128
-API_HASHED_SESSION_HEX_LEN = 32
 _API_SAFE_CONTEXT_ID = re.compile(r"\A[A-Za-z0-9_-]+\Z")
 
 # The default profile's session store under DATA_ROOT, the store the API server
@@ -115,16 +123,20 @@ SESSION_CARDS_PRESENT = "__KANBAN_SESSION_CARDS__"
 # JSON object; the clip only stops a pathological one carrying the record away.
 MAX_SESSION_CARDS = 64
 MAX_CREATE_RESULT_CHARS = 2000
+# How many compression continuations the session read follows, the defensive
+# bound the pinned hermes' own get_compression_chain uses
+# (hermes_state_compression.py); a chain this deep is pathological.
+MAX_CHAIN_STEPS = 100
 
 
 # Runs inside the agent container, read-only like the status read. Positional
 # arguments: data root, board file, store file, sentinel, session id, the
-# create tool's name, the card cap, the create-result clip.
+# create tool's name, the card cap, the create-result clip, the chain bound.
 _SESSION_CARDS_SCRIPT = r"""
 import json, sqlite3, sys
 
 ROOT, BOARD, STORE, SENTINEL, SID, CREATE = sys.argv[1:7]
-MAX_CARDS, MAX_CHARS = int(sys.argv[7]), int(sys.argv[8])
+MAX_CARDS, MAX_CHARS, MAX_CHAIN_STEPS = (int(a) for a in sys.argv[7:10])
 SQLITE_BUSY_TIMEOUT = 10
 JSON_PREFIX = "\x00json:"
 out = {"session": False, "sessions": [], "created": [], "subscribed": [], "cards": {},
@@ -193,7 +205,7 @@ try:
                     "JOIN sessions child ON child.parent_session_id = parent.id "
                     "WHERE %s ORDER BY %s LIMIT 1" % (" AND ".join(where), ", ".join(order)))
             current = SID
-            for _ in range(100):
+            for _ in range(MAX_CHAIN_STEPS):
                 row = store.execute(step, (current,)).fetchone()
                 if row is None or row[0] in sessions:
                     break
@@ -318,11 +330,16 @@ def read_statuses(
 
 
 def api_session_id(context_id: str) -> str:
-    """The Hermes session the bridge's api executor runs ``context_id``'s turns in."""
+    """The Hermes session the bridge's api executor runs ``context_id``'s turns in.
+
+    ``""`` for a contextId the bridge would hash rather than use verbatim (over
+    :data:`API_CONTEXT_ID_MAX_LEN`, or not path-safe). The gateway never mints
+    one, so this side does not mirror the hash; the caller treats ``""`` as no
+    session and waits the way it always has.
+    """
     if len(context_id) <= API_CONTEXT_ID_MAX_LEN and _API_SAFE_CONTEXT_ID.match(context_id):
         return API_SESSION_PREFIX + context_id
-    digest = hashlib.sha256(context_id.encode()).hexdigest()[:API_HASHED_SESSION_HEX_LEN]
-    return API_SESSION_PREFIX + API_HASHED_SESSION_PREFIX + digest
+    return ""
 
 
 
@@ -383,6 +400,7 @@ def session_cards_command(session_id: str) -> str:
             DELEGATION_TOOL,
             str(MAX_SESSION_CARDS),
             str(MAX_CREATE_RESULT_CHARS),
+            str(MAX_CHAIN_STEPS),
         ]
     )
     return (

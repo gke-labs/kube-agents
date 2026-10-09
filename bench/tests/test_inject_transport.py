@@ -2669,10 +2669,11 @@ def test_a_board_that_stops_answering_is_infrastructure(
 
 
 @pytest.mark.parametrize(
-    "context_id, in_store",
+    "context_id, in_store, reads",
     [
-        pytest.param("", True, id="a door too old to report the contextId"),
-        pytest.param(CONTEXT_ID, False, id="a session the store does not hold (cli executor)"),
+        pytest.param("", True, 0, id="a door too old to report the contextId"),
+        pytest.param("ctx/odd", True, 0, id="a contextId the bridge would hash"),
+        pytest.param(CONTEXT_ID, False, 1, id="a session the store does not hold (cli executor)"),
     ],
 )
 def test_without_the_session_the_wait_is_todays(
@@ -2681,6 +2682,7 @@ def test_without_the_session_the_wait_is_todays(
     monkeypatch: pytest.MonkeyPatch,
     context_id: str,
     in_store: bool,
+    reads: int,
 ) -> None:
     """Nothing in the trajectory names a card, so the old wait settles at once
     on the acknowledgement, exactly as it did before the store was read."""
@@ -2694,7 +2696,7 @@ def test_without_the_session_the_wait_is_todays(
     assert not result.errors, result.errors
     assert result.metadata["final_message"] == ACK
     assert "delegated_cards" not in result.metadata
-    assert len(shell.reads) == (1 if context_id else 0)
+    assert len(shell.reads) == reads
     assert len(api_executor.submissions) == 1
 
 

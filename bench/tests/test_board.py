@@ -254,10 +254,12 @@ def local_shell(root: Path, monkeypatch: pytest.MonkeyPatch, on_read=None):
 
 
 def test_the_api_session_id_matches_the_bridge() -> None:
-    """Mirrors apiSessionID: verbatim when path-safe, else a hash (checked against Go)."""
+    """Mirrors apiSessionID's verbatim half; an id the bridge would hash (unsafe,
+    or over the cap) names no session here rather than a guessed one."""
     assert board.api_session_id("ctx-67aed1ee09f614850d05a55e") == SESSION
-    assert board.api_session_id("a/b") == "a2a-h-c14cddc033f64b9dea80ea675cf280a0"
-    assert board.api_session_id("x" * 129).startswith("a2a-h-")
+    assert board.api_session_id("x" * board.API_CONTEXT_ID_MAX_LEN) == "a2a-" + "x" * 128
+    assert board.api_session_id("a/b") == ""
+    assert board.api_session_id("x" * (board.API_CONTEXT_ID_MAX_LEN + 1)) == ""
 
 
 def test_a_sessions_creates_name_its_cards_with_their_state(

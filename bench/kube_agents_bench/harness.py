@@ -2288,11 +2288,12 @@ class KubeAgentsHarness(AgentHarness):
             # install whose turns do not run in that session (the cli
             # executor), falls through to the wait below.
             context_id = exchange.probe.context_id if exchange.probe else ""
-            if context_id:
+            session_id = board.api_session_id(context_id) if context_id else ""
+            if session_id:
                 try:
                     if self._await_delegated_cards(
                         result,
-                        board.api_session_id(context_id),
+                        session_id,
                         delegation_timeout=delegation_timeout,
                         poll_interval=poll_interval,
                     ):
