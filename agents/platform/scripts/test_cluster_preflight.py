@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import shutil
 import subprocess
 import textwrap
@@ -9,15 +10,38 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 SCRIPT = Path(__file__).parent.absolute() / "cluster_preflight.sh"
+# The terminal tool's default call timeout is Hermes' (`TERMINAL_TIMEOUT` in
+# tools/terminal_tool.py), out of this tree: deploy/shared/terminal_env_pin.py
+# --build-check holds the script's mirror equal to it at image build. Here the
+# mirror is held equal to the figure the SOP states, so the two in-tree copies
+# cannot drift apart, and the budget under both.
+SOP = Path(__file__).parent.parent / "governance" / "obtainability_audit_sop.md"
+SOP_TERMINAL_DEFAULT_RE = r"the default (\d+)-second timeout"
+BROKER = Path(__file__).parent.absolute() / "credential_proxy.py"
+# The two broker bounds the per-call cap is built from, as each side declares
+# them: the broker holds a request in admission for this long before refusing
+# it, then bounds a one-shot read.
+BROKER_BOUNDS = (
+    ("COMMAND_SLOT_WAIT_SECONDS", "BROKER_ADMISSION_WAIT_SECONDS"),
+    ("DEFAULT_KUBECTL_TIMEOUT_SECONDS", "BROKER_KUBECTL_RUN_SECONDS"),
+)
+SCRIPT_CAP_MARGIN = "CAP_MARGIN_SECONDS"
 
 PROJECT = "demo-project"
 CLUSTER = "cluster-a"
 LOCATION = "us-central1"
 EXPECTED_CONTEXT = f"gke_{PROJECT}_{LOCATION}_{CLUSTER}"
 
-# Well under the 15s cap the preflight puts on a kubectl call, and under the 20s
-# the hanging fake sleeps: a run this fast cannot have waited on either.
+# Well under the budget the preflight shares across its kubectl calls, and under
+# the 20s the hanging fake sleeps: a run this fast cannot have waited on either.
 PREFLIGHT_FAST_SECONDS = 10
+# A check 4 wait just past the cap the preflight had before #2632 (15s): long
+# enough that the old cap would have fired, short enough to keep the suite fast.
+QUEUED_PAST_OLD_CAP_SECONDS = 16
+# A small budget and a hang that outlasts it, for the test that the preflight
+# still answers with JSON when a brokered call never returns.
+SHORT_BUDGET_SECONDS = 4
+HANG_PAST_SHORT_BUDGET_SECONDS = 8
 
 # Padding one byte longer than the reader's 1 MiB cap (KUBECONFIG_READ_MAX_BYTES),
 # so the file is over it however small the rest of the fixture gets.
@@ -38,13 +62,19 @@ KUBECONFIG_OVER_CAP_BYTES = (1 << 20) + 1
 #                            credential-proxy outage does: non-zero, error on
 #                            stderr, nothing on stdout.
 #   FAKE_KUBECONFIG_FLAG_HANGS - make `--kubeconfig=<file> config current-context`
-#                            hang past the preflight's 15s cap, the way a request
-#                            queued behind a saturated credential broker does.
+#                            hang for 20s, the way a request queued behind a
+#                            saturated credential broker does (longer than the
+#                            15s cap the preflight had when check 3 made this call).
 #                            Only that form, the one check 3 used to run: a real
 #                            broker queues check 4's call too (see the timeout
 #                            test below).
 #   FAKE_CONFIG_TIMES_OUT  - make `config current-context` exit 124, as the
 #                            preflight's `timeout` wrapper does when it fires.
+#   FAKE_CONFIG_HANG_SECONDS - make the plain `config current-context` (check 4's
+#                            call) answer only after this many seconds, the way
+#                            a request queued at a busy broker is answered once
+#                            admitted.
+#   FAKE_CLUSTER_INFO_TIMES_OUT - the same for `cluster-info`, check 5's call.
 #   FAKE_KUBECTL_LOG       - append every argv the fake receives to this file.
 #
 # The context is read with PyYAML, as the credential-proxy shim reads it, so a
@@ -72,6 +102,7 @@ FAKE_KUBECTL = textwrap.dedent(
     case "${ARGS[*]}" in
         "config current-context")
             [ -n "${FAKE_CONFIG_TIMES_OUT:-}" ] && exit 124
+            [ -z "$KCFG" ] && [ -n "${FAKE_CONFIG_HANG_SECONDS:-}" ] && sleep "$FAKE_CONFIG_HANG_SECONDS"
             if [ -n "${FAKE_CONFIG_FAILS:-}" ]; then
                 echo "credential proxy unavailable: [Errno 111] Connection refused" >&2
                 exit 1
@@ -88,6 +119,7 @@ FAKE_KUBECTL = textwrap.dedent(
             fi
             ;;
         "cluster-info"*)
+            [ -n "${FAKE_CLUSTER_INFO_TIMES_OUT:-}" ] && exit 124
             if [ -n "${FAKE_UNREACHABLE:-}" ]; then
                 echo "Unable to connect to the server: dial tcp: i/o timeout" >&2
                 exit 1
@@ -107,6 +139,49 @@ This Cluster Agent is permanently scoped to the following GKE cluster:
 - cluster: {CLUSTER}
 - location: {LOCATION}
 """
+
+
+def _declared(pattern: str, text: str, where: Path) -> int:
+    match = re.search(pattern, text, re.MULTILINE)
+    assert match, f"{where.name} no longer declares {pattern!r}"
+    return int(match.group(1))
+
+
+def _script() -> str:
+    return SCRIPT.read_text(encoding="utf-8")
+
+
+def terminal_tool_timeout_seconds() -> int:
+    return _declared(r"^readonly TERMINAL_TOOL_TIMEOUT_SECONDS=(\d+)$", _script(), SCRIPT)
+
+
+def budget_margin_seconds() -> int:
+    return _declared(r"^readonly PREFLIGHT_BUDGET_MARGIN_SECONDS=(\d+)$", _script(), SCRIPT)
+
+
+def default_budget_seconds() -> int:
+    """The budget as the script computes it: the tool's default less the margin."""
+    return terminal_tool_timeout_seconds() - budget_margin_seconds()
+
+
+def sop_terminal_default_seconds() -> int:
+    return _declared(SOP_TERMINAL_DEFAULT_RE, SOP.read_text(encoding="utf-8"), SOP)
+
+
+def broker_bounds() -> dict[str, int]:
+    text = BROKER.read_text(encoding="utf-8")
+    return {name: _declared(rf"^{name} = (\d+)$", text, BROKER) for name, _ in BROKER_BOUNDS}
+
+
+def script_bounds() -> dict[str, int]:
+    bounds = {name: _declared(rf"^readonly {name}=(\d+)$", _script(), SCRIPT) for _, name in BROKER_BOUNDS}
+    bounds[SCRIPT_CAP_MARGIN] = _declared(rf"^readonly {SCRIPT_CAP_MARGIN}=(\d+)$", _script(), SCRIPT)
+    return bounds
+
+
+def kubectl_cap_seconds() -> int:
+    """The per-call cap as the script computes it: the two mirrored broker bounds plus the margin."""
+    return sum(script_bounds().values())
 
 
 class ClusterPreflightTest(unittest.TestCase):
@@ -272,9 +347,101 @@ class ClusterPreflightTest(unittest.TestCase):
         result = self.run_preflight(FAKE_CONFIG_TIMES_OUT="1")
         self.assertEqual("4", result["check"])
         self.assertIn("kubectl itself failed", result["reason"])
-        self.assertIn("timed out after 15s", result["evidence"])
+        self.assertPerCallCapNamed(result["evidence"])
         self.assertIn("not saturated", result["remediation"])
         self.assertNotIn("another cluster", result["remediation"])
+
+    def assertPerCallCapNamed(self, evidence: str) -> None:
+        # A call cut at the per-call cap says so exactly, and names the two
+        # broker bounds the cap is built from.
+        self.assertIn(f"timed out after {kubectl_cap_seconds()}s", evidence)
+        self.assertIn("cap on one brokered call", evidence)
+        bounds = script_bounds()
+        for _, name in BROKER_BOUNDS:
+            self.assertIn(f"{bounds[name]}s", evidence)
+
+    def assertBudgetCapNamed(self, evidence: str, budget: int) -> None:
+        # A call cut by the budget got the budget less the seconds already
+        # spent, so it reads within a few seconds of the budget, and the text
+        # names the budget rather than the per-call cap.
+        match = re.search(r"timed out after (\d+)s", evidence)
+        self.assertIsNotNone(match, evidence)
+        self.assertLessEqual(budget - 3, int(match.group(1)), evidence)
+        self.assertLessEqual(int(match.group(1)), budget, evidence)
+        self.assertIn(f"what was left of the preflight's {budget}s budget", evidence)
+        self.assertNotIn("cap on one brokered call", evidence)
+
+    def test_the_budget_stays_under_the_terminal_tools_default(self):
+        # The Cluster Agent runs the preflight with no `timeout` argument, so the
+        # terminal tool's default is the bound the whole run has to fit under:
+        # past it the tool kills the script and no JSON reaches the agent. The
+        # script's mirror of that default is held to Hermes at image build
+        # (terminal_env_pin.py --build-check); here it is held to the figure the
+        # SOP states, and the budget and the per-call cap under it.
+        self.assertEqual(sop_terminal_default_seconds(), terminal_tool_timeout_seconds())
+        self.assertGreater(budget_margin_seconds(), 0)
+        self.assertLess(default_budget_seconds(), terminal_tool_timeout_seconds())
+        self.assertLess(kubectl_cap_seconds(), default_budget_seconds())
+
+    def test_the_kubectl_cap_outlasts_the_brokers_admission_wait_and_command_bound(self):
+        # In the sandbox every kubectl is a request the broker holds in
+        # admission for COMMAND_SLOT_WAIT_SECONDS before refusing it, and then
+        # bounds by DEFAULT_KUBECTL_TIMEOUT_SECONDS. A cap under their sum fails
+        # a correct pin while its call is still queued: at 15s, #2632. The
+        # script mirrors the two figures; this holds the mirrors equal to the
+        # broker's and the cap above their sum.
+        broker, script = broker_bounds(), script_bounds()
+        for broker_name, script_name in BROKER_BOUNDS:
+            self.assertEqual(
+                broker[broker_name], script[script_name],
+                f"{script_name} in cluster_preflight.sh != {broker_name} in credential_proxy.py",
+            )
+        self.assertGreater(script[SCRIPT_CAP_MARGIN], 0)
+        self.assertGreater(kubectl_cap_seconds(), sum(broker.values()))
+        self.assertLess(QUEUED_PAST_OLD_CAP_SECONDS, kubectl_cap_seconds())
+
+    def test_check_4_queued_past_the_old_cap_and_under_the_cap_passes(self):
+        # The #2632 symptom: a correct pin whose check 4 call the broker admits
+        # after a wait longer than 15s. This pins the wiring, so a `timeout 15`
+        # put back in front of check 4 fails here rather than shipping.
+        start = time.monotonic()
+        result = self.run_preflight(FAKE_CONFIG_HANG_SECONDS=str(QUEUED_PAST_OLD_CAP_SECONDS))
+        self.assertEqual("ok", result["status"], result)
+        self.assertGreaterEqual(time.monotonic() - start, QUEUED_PAST_OLD_CAP_SECONDS)
+
+    def test_a_call_that_never_returns_still_gets_json_inside_the_budget(self):
+        # A broker that never answers, under a budget smaller than the per-call
+        # cap: the call is cut at what the budget has left and the JSON is
+        # printed, naming the budget. Run with a small budget so the suite stays
+        # fast; the knob is the one an instruction passing a larger `timeout`
+        # would use.
+        start = time.monotonic()
+        result = self.run_preflight(
+            CLUSTER_PREFLIGHT_BUDGET_SECONDS=str(SHORT_BUDGET_SECONDS),
+            FAKE_CONFIG_HANG_SECONDS=str(HANG_PAST_SHORT_BUDGET_SECONDS),
+        )
+        elapsed = time.monotonic() - start
+        self.assertEqual("4", result["check"], result)
+        self.assertIn("kubectl itself failed", result["reason"])
+        self.assertBudgetCapNamed(result["evidence"], SHORT_BUDGET_SECONDS)
+        self.assertIn("CLUSTER_PREFLIGHT_BUDGET_SECONDS", result["evidence"])
+        self.assertLess(elapsed, HANG_PAST_SHORT_BUDGET_SECONDS)
+
+    def test_a_budget_override_that_is_not_a_positive_integer_keeps_the_default(self):
+        # With the default budget the per-call cap is the smaller bound, so the
+        # evidence names the cap, not the budget.
+        result = self.run_preflight(CLUSTER_PREFLIGHT_BUDGET_SECONDS="soon", FAKE_CONFIG_TIMES_OUT="1")
+        self.assertEqual("4", result["check"])
+        self.assertPerCallCapNamed(result["evidence"])
+
+    def test_check_5_timing_out_names_the_cap_it_timed_out_at(self):
+        # Check 5 names its own --request-timeout, which opts it out of the
+        # broker's command bound, so its evidence must not claim that bound.
+        result = self.run_preflight(FAKE_CLUSTER_INFO_TIMES_OUT="1")
+        self.assertEqual("5", result["check"])
+        self.assertPerCallCapNamed(result["evidence"])
+        self.assertIn("its own --request-timeout", result["evidence"])
+        self.assertNotIn("command bound", result["evidence"])
 
     def test_a_non_utf8_byte_reads_as_the_shim_reads_it(self):
         # The shim decodes with replacement before parsing; a stray Latin-1 byte

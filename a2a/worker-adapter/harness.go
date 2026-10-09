@@ -13,9 +13,11 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"os"
 	"os/exec"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 )
@@ -119,8 +121,20 @@ type harnessProc struct {
 	stderr  *tailBuffer
 	log     *slog.Logger
 
+	// writeMu serializes writes to stdin, so two user messages never
+	// interleave on the pipe. It is held across a Write that blocks while the
+	// harness is not reading, so nothing the stdout scanner runs may take it:
+	// the scanner is what drains the harness's stdout, and a harness blocked
+	// writing stdout never reads stdin again.
+	writeMu sync.Mutex
+	// stdinDead is set once the input stream is closed or a write to it has
+	// failed, and makes every later writeUser refuse. It is atomic rather than
+	// under a lock so the scanner's overflow path can set it without waiting
+	// on a writer.
+	stdinDead atomic.Bool
+
+	// mu guards the reap bookkeeping below. No pipe I/O happens under it.
 	mu         sync.Mutex
-	stdinDead  bool
 	reapedAt   bool
 	killTimers []*time.Timer
 }
@@ -128,8 +142,9 @@ type harnessProc struct {
 // startHarness launches argv with the given extra environment appended to
 // the parent's, writes the opening prompt as the first stdin line, and
 // starts the stdout scanner. The process runs in its own process group so a
-// kill reaches the harness's own children. reapBound caps how long a failed
-// start waits for the killed harness's stderr to close.
+// kill reaches the harness's own children. reapBound caps how long every reap
+// of the harness, here after a failed start or in supervise, waits for its
+// stderr to close once the harness itself has exited.
 func startHarness(argv []string, env []string, prompt string, reapBound time.Duration, log *slog.Logger) (*harnessProc, error) {
 	if len(argv) == 0 {
 		return nil, fmt.Errorf("empty harness command")
@@ -148,6 +163,15 @@ func startHarness(argv []string, env []string, prompt string, reapBound time.Dur
 	}
 	stderr := &tailBuffer{max: stderrTailBytes}
 	cmd.Stderr = stderr
+	// WaitDelay bounds every reap. A descendant that left the process group
+	// survives the group kill and can hold stderr open, and Wait reads stderr
+	// to EOF, so without a bound Wait blocks until that descendant exits.
+	// Wait reads the field when it runs, and Start consults it only for a
+	// command built with a Context, which this one is not, so setting it once
+	// here covers both reaps: the failed start's below and supervise's. It
+	// bounds Wait's own copying only, which for this command is stderr;
+	// stdout is a pipe the scanner reads to EOF, and nothing here bounds that.
+	cmd.WaitDelay = reapBound
 
 	if err := cmd.Start(); err != nil {
 		return nil, fmt.Errorf("spawn harness: %w", err)
@@ -157,18 +181,28 @@ func startHarness(argv []string, env []string, prompt string, reapBound time.Dur
 	scanDone := make(chan struct{})
 	var scanFailed error
 	var scanMu sync.Mutex
-	// closeStdinOnce ends the input stream at most once. Shared by the scan-
-	// error path above and harnessProc.closeStdin, which can both reach it.
-	var stdinOnce sync.Once
-	var markDead func()
-	stdinMarkDead := func() {
-		if markDead != nil {
-			markDead()
-		}
+	p := &harnessProc{
+		cmd:      cmd,
+		stdin:    stdin,
+		events:   events,
+		scanDone: scanDone,
+		scanErr: func() error {
+			scanMu.Lock()
+			defer scanMu.Unlock()
+			return scanFailed
+		},
+		stderr: stderr,
+		log:    log,
 	}
-	closeStdinOnce := func() {
+	// closeInput ends the input stream at most once. Shared by the scan-error
+	// path below and harnessProc.closeStdin, which can both reach it. It marks
+	// the stream dead first, so writeUser refuses instead of writing to a
+	// closed pipe, and it takes no lock: a writer blocked on the full pipe
+	// holds writeMu, and the Close here is what fails that Write and frees it.
+	var stdinOnce sync.Once
+	p.closeInput = func() {
 		stdinOnce.Do(func() {
-			stdinMarkDead()
+			p.stdinDead.Store(true)
 			_ = stdin.Close()
 		})
 	}
@@ -213,54 +247,69 @@ func startHarness(argv []string, env []string, prompt string, reapBound time.Dur
 			// Closing stdin is the same signal the result arm sends to end a
 			// turn, so the harness shuts down the way it normally does rather
 			// than being killed.
-			closeStdinOnce()
+			p.closeInput()
 			// Discarding rather than buffering, deliberately: the line that
 			// overflowed is the one we already refused to hold in memory.
 			_, _ = io.Copy(io.Discard, stdout)
 		}
 	}()
 
-	p := &harnessProc{
-		cmd:        cmd,
-		stdin:      stdin,
-		closeInput: closeStdinOnce,
-		events:     events,
-		scanDone:   scanDone,
-		scanErr: func() error {
-			scanMu.Lock()
-			defer scanMu.Unlock()
-			return scanFailed
-		},
-		stderr: stderr,
-		log:    log,
-	}
-	// Now that p exists, a close from the scan-error path also marks the
-	// stream dead, so writeUser refuses instead of writing to a closed pipe.
-	markDead = func() {
-		p.mu.Lock()
-		p.stdinDead = true
-		p.mu.Unlock()
-	}
 	if err := p.writeUser(prompt); err != nil {
 		// The usual cause is a harness that exited before reading its
 		// prompt, and then its exit status and stderr are the only account
-		// of why. Kill what is left, reap it, and carry both in the error the
-		// way supervise's failure arm does.
+		// of why. Kill what is left, reap it (WaitDelay, set above, bounds
+		// the reap), and carry both in the error the way supervise's failure
+		// arm does.
 		//
-		// WaitDelay bounds the reap. A descendant that left the process group
-		// survives the kill and can hold stderr open, and Wait reads stderr
-		// to EOF, so without a bound it would block until that descendant
-		// exits. Start consults WaitDelay only for a command built with a
-		// Context, which this one is not, so setting it here takes effect.
+		// The other cause is the scanner closing stdin after an overflowing
+		// stdout line, which fails a write blocked on the full pipe. The
+		// scanner records its error before it closes stdin, so it is already
+		// readable here and names the real cause, not just the closed pipe.
+		//
+		// Unlike supervise, this path does not wait for scanDone before Wait,
+		// and cannot: a process outside the group that holds stdout keeps the
+		// scanner reading until it exits, and nothing drains events here, so
+		// the scanner can also be parked on a full channel. Wait then closes
+		// the stdout read end under the scanner, whose Read fails with
+		// os.ErrClosed. That is Wait's teardown, not the harness's output, so
+		// it is dropped rather than relayed as a stdout failure. Wait is the
+		// only thing that closes that descriptor, so the error never means
+		// anything else. Whether the scanner has stored it yet is a race, and
+		// dropping it makes both outcomes read the same.
 		p.kill(0)
-		cmd.WaitDelay = reapBound
 		reapStart := time.Now()
 		waitErr := cmd.Wait()
 		reapTook := time.Since(reapStart)
 		p.reaped()
-		return nil, fmt.Errorf("write opening prompt: %w%s%s", err, reapEvidence(waitErr, reapTook, reapBound), p.stderrEvidence())
+		serr := p.scanErr()
+		if errors.Is(serr, os.ErrClosed) {
+			serr = nil
+		}
+		return nil, fmt.Errorf("write opening prompt: %w%s%s%s", err, reapEvidence(waitErr, reapTook, reapBound), scanEvidence(serr), p.stderrEvidence())
 	}
 	return p, nil
+}
+
+// scanEvidence is a stdout read failure as a failure reason carries it, or
+// nothing when the scanner reached EOF cleanly. A line over the ceiling is
+// named with the ceiling and its value rather than relayed as "token too
+// long", which says nothing an operator can act on. The deliverable is
+// refused, never truncated: a silently shortened answer is worse than a loud
+// failure.
+func scanEvidence(serr error) string {
+	switch {
+	case serr == nil:
+		return ""
+	case errors.Is(serr, bufio.ErrTooLong):
+		return fmt.Sprintf(
+			reasonDetailSeparator+"the harness emitted a single output line over the %d-byte limit"+
+				" (%d MiB, scannerMaxBytes in harness.go); the deliverable was refused"+
+				" rather than truncated. A line this size is usually a file dumped"+
+				" into the answer.",
+			scannerMaxBytes, scannerMaxBytes/(1024*1024))
+	default:
+		return reasonDetailSeparator + "stdout: " + serr.Error()
+	}
 }
 
 // reapEvidence is exitEvidence for a reap that WaitDelay bounds, which can
@@ -314,11 +363,13 @@ func (p *harnessProc) stderrEvidence() string {
 }
 
 // writeUser writes one user message line onto the harness stdin. Steers
-// reuse it verbatim: same shape, later turn.
+// reuse it verbatim: same shape, later turn. Writes are serialized by
+// writeMu, and a write after the stream is dead refuses. A close that lands
+// while a write is blocked fails that write rather than waiting for it.
 func (p *harnessProc) writeUser(text string) error {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if p.stdinDead {
+	p.writeMu.Lock()
+	defer p.writeMu.Unlock()
+	if p.stdinDead.Load() {
 		return fmt.Errorf("harness stdin closed")
 	}
 	line, err := json.Marshal(userMessage{
@@ -329,7 +380,7 @@ func (p *harnessProc) writeUser(text string) error {
 		return err
 	}
 	if _, err := p.stdin.Write(append(line, '\n')); err != nil {
-		p.stdinDead = true
+		p.stdinDead.Store(true)
 		return err
 	}
 	return nil
@@ -338,9 +389,6 @@ func (p *harnessProc) writeUser(text string) error {
 // closeStdin ends the harness's input stream - the signal that the
 // conversation is over and it should finish and exit.
 func (p *harnessProc) closeStdin() {
-	p.mu.Lock()
-	p.stdinDead = true
-	p.mu.Unlock()
 	p.closeInput()
 }
 
