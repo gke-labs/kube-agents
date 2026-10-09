@@ -256,7 +256,10 @@ each is waiting for whoever schedules it.
   upgrade is in flight; nothing further is due; the next run grades it once it has settled). A behind cluster on no release channel has an
   upgrade but no target version for the reporter to grade it against, so its row comes back
   `unknown` every week (the collector still reads its budget grade, and a blocking budget on it
-  is a candidate as on any behind cluster); the version finding stands on its own. The collector
+  is a candidate as on any behind cluster); the version finding stands on its own. The target
+  matters only to the skew ceiling, so when that cluster's only lag is a node pool behind its
+  control plane, the pool's move is what is due and a clean budget read is the check running
+  clean, in `commands`, not a declaration. The collector
   writes `upgrade-blocked` into that entry's `checks_not_applicable` with the reason; copy the
   entry into the document's `checks_not_applicable` verbatim, or the ledger stays partial on a
   current fleet. It is the one check in this audit the collector ever declares inapplicable, and
