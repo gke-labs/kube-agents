@@ -147,6 +147,16 @@ included, and the first-run stage marks this job due without one. That is the "c
 scoped to this one stream. An install that onboarded before the job existed gets its baseline from
 the first Sunday tick.
 
+A third trigger reviews a cluster soon after its upgrade rather than at the weekend. An hourly
+`no_agent` job lists GKE operations per project; when an `UPGRADE_MASTER` or `UPGRADE_NODES`
+operation on a cluster reached `DONE` at least thirty minutes earlier and the ledger has not
+reviewed that operation, the job runs the collector for that cluster alone (a scoped run, §3.2) and
+posts its lines. Thirty minutes lets the replacement pods settle while most of the hour of events
+the API server keeps is still there. The Sunday run stays the fleet-wide baseline and the only run
+that files the ledger issue; the hourly job records the operations it reviewed so the Sunday run
+reports them as already reviewed. It is the last part of the second work item (§5), after the
+scheduled run and the on-demand route.
+
 ### 3.1a On demand: the same report, from a generic question
 
 The routing that sends "is the fleet ready to upgrade" to the readiness report sends "how did the
@@ -189,8 +199,8 @@ already recorded, is graded a Warning with the reason "predates the upgrade", ne
 symptom with no readable onset falls back to the stored set alone. The first run has no stored set
 and grades by onset only, which it says. A cluster is _new_ when absent, _upgraded_ when a version differs or when
 `gcloud container operations list` shows an `UPGRADE_MASTER` or `UPGRADE_NODES` operation targeting
-it that reached a terminal status (`DONE`, `ABORTING`, an error) with an end time after the last
-run, and _re-checked_ when it is unchanged but holds a live guard:
+it that reached `DONE`, with or without an `error` (a failed or cancelled operation finishes as
+`DONE` with `error` set; `ABORTING` is still in progress), with an end time after the last run, and _re-checked_ when it is unchanged but holds a live guard:
 only the reads that guard needs run, and a guard whose symptom or shape is gone is cleared. A
 cluster a successful listing no longer names leaves the ledger and loses its guards, and the report
 says so, but only on a _full_ run. The ledger records the fleet's project set, written by the last
@@ -215,7 +225,7 @@ reviews outside the fleet is reported and marked "outside the fleet; not recorde
 report under a `-scoped` name, does not move the latest link, and never calls the fleet-audit
 `start` or `finish`, so a question about one clean cluster cannot close the fleet's ledger issue.
 `--since` is a hand-run flag that widens the window a scoped run reviews; it never replaces the
-ledger's last-run time. A cluster with an operation still `RUNNING` is not reviewed: a drain in progress shows a
+ledger's last-run time. A cluster with an operation still `PENDING`, `RUNNING` or `ABORTING` is not reviewed: a drain in progress shows a
 budget with no allowance, a Pending replacement and a `NotReady` node, which are the signatures of
 entries 1, 2 and 17 on a cluster that is simply not finished; it is listed under Info as upgrading
 now and reviewed on the next run, and the on-demand route says the same when asked mid-upgrade. The
@@ -246,8 +256,10 @@ design's own. On a full run the collector writes it beside the report (`--manife
 per check that ran, or `outcome: unreachable` or `gate-failed` with the error for a cluster whose
 project listing failed, whose reads failed, or that is upgrading now; `candidates[]` for every
 incident the report files, an Error at `major` and a Warning at `minor`, with the check id, object,
-excerpt and the mitigation text; `still_flagged_ids` for the guards the run held but did not
-re-observe; `partial` when any read failed; and, in the carried keys the manifest reserves for
+excerpt and the mitigation text, including a candidate for every guard the run still observes,
+which is how the harness holds a finding on the ledger (its `still_flagged_ids` are the candidates
+the collector still emits); `checks_unevaluated[]` and `limitations` on a cluster whose read
+failed; and, in the carried keys the manifest reserves for
 collector-resolved fleet facts, the versions, operations and incident kinds the SOP copies. The
 stream is in `COLLECTOR_AUDITS`, the SOP passes the manifest to `finish`, and `cross_check_manifest`
 enforces what this design would otherwise state as prose: an unreachable cluster must be in
@@ -426,8 +438,9 @@ comes from the collector's JSON, which keeps the per-cluster data and the same t
    (including the freshness rule for a question); the routing lines in `CAPABILITIES.md` and the
    platform `AGENTS.md`; the roster entry
    (`0 18 * * 0`, `skills: ["fleet-audit"]`, the `AUDITS` allowlist so findings file, with check
-   ids off `MAJOR_SWEEP_CHECKS`); the SOP's no-repository path (collector first, `start`/`finish`
-   only with a repository, the manifest passed to `finish`) and the first-run stage marking this job due without one; the readiness
+   ids off `MAJOR_SWEEP_CHECKS`); the SOP's two paths (`start`, the collector and `finish` with its
+   manifest where a repository is linked; the collector alone without one) and the first-run stage
+   marking this job due without a repository; the hourly after-upgrade job (§3.1); the readiness
    watch reading `guards.json` through its sandbox hop once it ships; the cron README section and
    the generated cron reference.
 3. **The proof.** The first report over the test fleet; one nightly case per catalogue entry the
