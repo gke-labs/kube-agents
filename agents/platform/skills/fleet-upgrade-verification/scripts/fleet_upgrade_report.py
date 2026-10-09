@@ -248,12 +248,12 @@ EXIT_PARTIAL = 1
 NARROWED_RUN_NOTE = "Narrowed by --cluster: the rollout record was neither read nor written."
 # A `--cluster` spec that matched nothing is an error with exit 1, like a project that
 # could not be listed: an empty table with exit 0 would read as "nothing to grade".
-UNMATCHED_CLUSTER_SPEC = "no cluster matched --cluster {spec} in {projects}"
+UNMATCHED_CLUSTER_SPEC = "no cluster matched --cluster {spec!r} in {projects}"
 # When a project's listing failed, the run cannot say the spec matched nothing
 # there: the line names the projects it did list and the ones it could not,
 # rather than sending the operator after a typo or a deleted cluster.
-UNMATCHED_CLUSTER_SPEC_PARTIAL = "no cluster matched --cluster {spec} in {listed}; {unlisted} could not be listed, so whether it is there is unknown"
-UNMATCHED_CLUSTER_SPEC_UNLISTED = "--cluster {spec} could not be matched: {unlisted} could not be listed"
+UNMATCHED_CLUSTER_SPEC_PARTIAL = "no cluster matched --cluster {spec!r} in {listed}; {unlisted} could not be listed, so whether it is there is unknown"
+UNMATCHED_CLUSTER_SPEC_UNLISTED = "--cluster {spec!r} could not be matched: {unlisted} could not be listed"
 EXIT_USAGE = 2
 # `--rollout-in-progress` speaks to the rollout record, which a `--cluster` run neither
 # reads nor writes: the pair is refused, as `--at` without `--readiness` is, rather than
@@ -265,7 +265,13 @@ ROLLOUT_FLAG_NEEDS_FULL_READ = "--rollout-in-progress needs a full read: a --clu
 # opposite of what its slash says, and the unmatched-spec line would then name
 # a spec the operator did not type.
 CLUSTER_SPEC_SEPARATOR = "/"
-INVALID_CLUSTER_SPEC = "--cluster {spec!r} is neither <location>/<name> nor a bare name: give a location before the slash and a name after it, or the name alone"
+# Each half of a spec is a GKE name: lowercase letters, digits and hyphens, as
+# GKE spells every location and cluster name. Anything else -- whitespace from a
+# pasted terminal line, an uppercase letter, a stray character -- can match
+# nothing, so the parser refuses it before any read instead of letting the run
+# report a miss that reads as a typo or a deleted cluster.
+CLUSTER_SPEC_HALF_RE = re.compile(r"[a-z0-9-]+")
+INVALID_CLUSTER_SPEC = "--cluster {spec!r} is neither <location>/<name> nor a bare name: each half is a GKE name (lowercase letters, digits and hyphens), a location before the slash and a name after it, or the name alone"
 
 
 def run_cmd(cmd: list[str], timeout: int = GCLOUD_TIMEOUT_SECONDS, env: dict | None = None) -> tuple[int, str, str]:
@@ -653,12 +659,14 @@ def assess_readiness(cluster: dict, member: dict, items: list | None, read_error
 
 def parse_cluster_spec(spec: str) -> tuple[str, str] | None:
     """`(location, name)` for `<location>/<name>`, `("", name)` for a bare name, and
-    None for anything else: an empty spec, an empty half, or a second slash, which
-    no GKE location or cluster name carries."""
+    None for anything else: an empty spec, an empty half, a second slash, or a
+    half outside the GKE name grammar (`CLUSTER_SPEC_HALF_RE`), none of which any
+    GKE location or cluster name carries. The grammar lives here alone; `main`
+    refuses what this rejects before any read."""
     location, slash, name = spec.partition(CLUSTER_SPEC_SEPARATOR)
     if not slash:
-        return ("", spec) if spec else None
-    if not location or not name or CLUSTER_SPEC_SEPARATOR in name:
+        return ("", spec) if CLUSTER_SPEC_HALF_RE.fullmatch(spec) else None
+    if not (CLUSTER_SPEC_HALF_RE.fullmatch(location) and CLUSTER_SPEC_HALF_RE.fullmatch(name)):
         return None
     return location, name
 

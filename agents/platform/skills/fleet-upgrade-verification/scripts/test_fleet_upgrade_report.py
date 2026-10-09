@@ -329,14 +329,14 @@ class ProjectFailureTest(unittest.TestCase):
         self.assertEqual(
             [(e["location"], e["cluster"], e["message"]) for e in result["errors"]],
             [
-                (None, "prd", "no cluster matched --cluster prd in p"),
-                ("europe-west1", "prod", "no cluster matched --cluster europe-west1/prod in p"),
+                (None, "prd", "no cluster matched --cluster 'prd' in p"),
+                ("europe-west1", "prod", "no cluster matched --cluster 'europe-west1/prod' in p"),
             ],
         )
         with tempfile.TemporaryDirectory() as state_dir, patch.object(report, "run_cmd", fake), redirect_stdout(io.StringIO()) as out:
             rc = report.main(["--project", "p", "--cluster", "prd", "--target-version", target, "--state-dir", state_dir])
         self.assertEqual(rc, report.EXIT_PARTIAL)
-        self.assertIn("no cluster matched --cluster prd in p", out.getvalue())
+        self.assertIn("no cluster matched --cluster 'prd' in p", out.getvalue())
 
     def test_an_unmatched_spec_over_a_failed_listing_says_the_listing_failed_not_no_match(self):
         """A project the run could not list may hold the cluster: the line says
@@ -349,10 +349,10 @@ class ProjectFailureTest(unittest.TestCase):
         messages = [e["message"] for e in result["errors"]]
         self.assertEqual(len(messages), 2)
         self.assertIn("permission denied on acme", messages[0])
-        self.assertEqual(messages[1], "no cluster matched --cluster us-central1/prod in other; acme could not be listed, so whether it is there is unknown")
+        self.assertEqual(messages[1], "no cluster matched --cluster 'us-central1/prod' in other; acme could not be listed, so whether it is there is unknown")
         with patch.object(report, "run_cmd", fake):
             alone = report.build_report(["acme"], target, clusters=["us-central1/prod"])
-        self.assertEqual([e["message"] for e in alone["errors"]][1], "--cluster us-central1/prod could not be matched: acme could not be listed")
+        self.assertEqual([e["message"] for e in alone["errors"]][1], "--cluster 'us-central1/prod' could not be matched: acme could not be listed")
         self.assertNotIn("no cluster matched", " ".join(e["message"] for e in alone["errors"]))
 
     def test_a_qualified_and_a_bare_spec_naming_one_cluster_are_both_matched(self):
@@ -367,10 +367,14 @@ class ProjectFailureTest(unittest.TestCase):
         self.assertEqual(rc, report.EXIT_OK)
         self.assertNotIn("no cluster matched", out.getvalue())
 
-    def test_a_cluster_spec_with_an_empty_half_is_a_usage_error_before_any_read(self):
+    def test_a_cluster_spec_outside_the_gke_name_grammar_is_a_usage_error_before_any_read(self):
+        """Each half is a GKE name, lowercase letters, digits and hyphens: an
+        empty half, a second slash, whitespace from a pasted line or an
+        uppercase letter can match nothing, and is refused with the spec as
+        typed rather than reported as a miss."""
         target = "1.31.0-gke.1"
         fake = FakeGcloud({"p": [cluster("prod", "us-central1", target, [("p", target)])]}, {})
-        for spec in ("/prod", "prod/", "", "us-central1/prod/extra"):
+        for spec in ("/prod", "prod/", "", "us-central1/prod/extra", "us-central1/prod ", " prod", "us-central1/Prod", "us central1/prod"):
             with self.subTest(spec=spec):
                 err = io.StringIO()
                 with patch.object(report, "run_cmd", fake), redirect_stdout(io.StringIO()), redirect_stderr(err):

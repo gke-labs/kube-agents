@@ -32,8 +32,9 @@ Neither reads versions against a target.
 ```
 
 - `--cluster` is repeatable and, when given, restricts the report to those clusters, as
-  `<location>/<name>` or a bare name and in no other form: a spec with an empty half (`/prod`,
-  `prod/`) is a usage error (exit 2), not a bare name. Every other member of the projects is
+  `<location>/<name>` or a bare name and in no other form: each half is a GKE name, lowercase
+  letters, digits and hyphens, so an empty half (`/prod`, `prod/`), whitespace or an uppercase
+  letter is a usage error (exit 2), not a bare name and not a miss. Every other member of the projects is
   skipped, reads included, and the rollout record is neither read nor written, since a narrowed
   read would file every member it did not name as gone. A spec that matches no cluster in the
   projects is an error line and exit 1, not an empty table, and when a project's listing failed
