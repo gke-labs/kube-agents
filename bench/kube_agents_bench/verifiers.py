@@ -1303,9 +1303,11 @@ class WorkerCommandsVerifier(BaseVerifier):
     only to the commands a worker issued AFTER its first command whose result
     matched the pattern and whose command matched ``after_command_pattern``,
     or, without one, its first FAILED command whose result matched. The
-    window is per delegated card: a sibling worker's own first attempt is
-    not a retry of another worker's refusal, and the reason names the card
-    whose refusal opened each window. Written for a retry-after-refusal
+    window is per delegated card together with the cards its worker fanned
+    out (``transcript.worker_card_parents``): a sibling card's own first
+    attempt is not a retry of another card's refusal, but a child card the
+    refused worker files to do the write is, and the reason names the card
+    whose lineage each window opened on. Written for a retry-after-refusal
     check (#2173): the
     defect is a write after the policy refused one, and a pattern over write
     verbs alone flags the honest attempt that met the refusal. The card log
@@ -1416,17 +1418,26 @@ class WorkerCommandsVerifier(BaseVerifier):
                     return failed
                 return re.search(self.after_command_pattern, command) is not None
 
+            parents = snap.worker_card_parents or {}
+
+            def _root(card: str) -> str:
+                seen = {card}
+                while card in parents and parents[card] not in seen:
+                    card = parents[card]
+                    seen.add(card)
+                return card
+
             graded = []
             opened: list[str] = []
-            for card in dict.fromkeys(c for c, _, _, _, _ in calls):
-                own = [call for call in calls if call[0] == card]
+            for root in dict.fromkeys(_root(c) for c, _, _, _, _ in calls):
+                own = [call for call in calls if _root(call[0]) == root]
                 opener = next((i for i, (_, _, command, result, failed) in enumerate(own) if _opens(command, result, failed)), None)
                 if opener is None:
                     continue
                 opened_at = own[opener][1]
                 after = [command for _, at, command, _, _ in own[opener + 1 :] if at > opened_at]
                 graded.extend(after)
-                opened.append(f"{len(after)} on card {card} after {own[opener][2][:_SHOWN_COMMAND_CHARS]!r}")
+                opened.append(f"{len(after)} on card {root} and its children after {own[opener][2][:_SHOWN_COMMAND_CHARS]!r}")
             if not opened:
                 window = (
                     f"; no worker command opened the window ({self.after_result_pattern!r} in the result"

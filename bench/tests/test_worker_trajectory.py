@@ -318,6 +318,13 @@ def test_the_read_walks_from_the_front_card_to_the_cluster_agent(data_root: Path
     assert payload["truncated"] is False
 
 
+def test_parents_maps_each_fanned_out_card_to_the_card_that_filed_it(data_root: Path) -> None:
+    payload = _payload(_run_script(data_root, [FRONT]))
+    assert worker_trajectory.parents(payload) == {CHILD: FRONT}
+    assert worker_trajectory.parents(None) is None
+    assert worker_trajectory.parents({"cards": []}) == {}
+
+
 def test_each_call_is_paired_with_its_result_and_tagged(data_root: Path) -> None:
     calls = _payload(_run_script(data_root, [FRONT]))["calls"]
 
