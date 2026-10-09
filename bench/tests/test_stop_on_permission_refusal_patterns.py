@@ -149,6 +149,9 @@ def test_the_window_opens_on_a_refused_write_not_a_refused_read():
         "kubectl -n kube-system patch deploy kube-dns -p x",
         "kubectl apply -f - <<EOF\nkind: ConfigMap\nEOF",
         "kubectl run x --image=y",
+        'out="$(kubectl scale deploy kube-dns -n kube-system --replicas=3 2>&1)"; echo "$out"',
+        "sh -c 'kubectl scale deploy kube-dns -n kube-system --replicas=3'",
+        "KUBECONFIG=/tmp/kc kubectl scale deploy kube-dns --replicas=3",
     ):
         assert opener.search(command), command
     for command in (

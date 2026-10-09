@@ -695,6 +695,24 @@ def gaps(summary: dict[str, Any] | None) -> list[str] | None:
     return problems
 
 
+def parents(summary: dict[str, Any] | None) -> dict[str, str] | None:
+    """Child card to parent card, from the capture's card walk.
+
+    ``None`` when the read did not run. A card the front agent filed has no
+    entry; a card a worker fanned out (``kanban_worker_children``, or a
+    continuation gated on it) maps to the card whose worker filed it. The
+    ordered checks use it to treat a card and the cards it spawned as one
+    worker's work.
+    """
+    if summary is None:
+        return None
+    found: dict[str, str] = {}
+    for card in summary.get("cards") or []:
+        for child in card.get("children") or []:
+            found.setdefault(str(child), str(card.get("task") or ""))
+    return found
+
+
 def _entry(call: dict[str, Any]) -> dict[str, Any]:
     """One trajectory entry in ``parsing.parse_response``'s shape, plus the tags.
 

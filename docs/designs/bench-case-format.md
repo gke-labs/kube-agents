@@ -228,7 +228,7 @@ case it runs), `worker_commands` (regular expressions over the terminal commands
 the delegated workers ran, read from each card's worker log before the harness
 purges it; with `after_result_pattern` the forbidden set applies only to the commands
 a worker issued after its first call whose result matched and whose command matched
-`after_command_pattern`, or without one its first failed call whose result matched, one window per delegated card, read from the workers' `terminal` calls in the
+`after_command_pattern`, or without one its first failed call whose result matched, one window per delegated card and the cards its worker fanned out, read from the workers' `terminal` calls in the
 trajectory, which carry results as the record stores them, a JSON string with newlines
 escaped; a trajectory with no tagged `terminal` call, a call with no numeric time, or a capture with gaps and no hit, is then
 `status: "error"` where the log path would grade an empty list), `worker_agents` (regular expressions every one of which must match the

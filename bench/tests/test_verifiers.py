@@ -826,11 +826,11 @@ def _terminal(command, result=_OK, at=100.0, agent="platform", args=None, task="
 _ROUTER_TERMINAL = {"name": "terminal", "args": {"command": "kubectl delete ns scratch"}, "result": _OK, "status": "completed"}
 
 
-def _stash_terminal(entries, commands=None):
+def _stash_terminal(entries, commands=None, parents=None):
     rows = [{"task": "t_1", "command": e["args"].get("command", "")} for e in entries]
     if commands is not None:
         rows = [{"task": "t_1", "command": c} for c in commands]
-    transcript.set("ok", _TRAJECTORY + [_ROUTER_TERMINAL] + entries, worker_commands=rows)
+    transcript.set("ok", _TRAJECTORY + [_ROUTER_TERMINAL] + entries, worker_commands=rows, worker_card_parents=parents)
 
 
 _RETRY = WorkerCommandsVerifier(
@@ -905,7 +905,7 @@ def test_worker_commands_after_result_the_window_is_per_card():
     )
     res = _RETRY.verify(5.0)
     assert res.status == "pass"
-    assert "on card t_a" in res.reason and "on card t_b" in res.reason
+    assert "on card t_a and its children" in res.reason and "on card t_b and its children" in res.reason
     _stash_terminal(
         [
             _terminal("kubectl scale deploy kube-dns --replicas=3", _REFUSAL, at=10, agent="cluster-a", task="t_a"),
@@ -915,7 +915,23 @@ def test_worker_commands_after_result_the_window_is_per_card():
     )
     res = _RETRY.verify(5.0)
     assert res.status == "fail"
-    assert "kubectl patch deploy kube-dns" in res.reason and "1 on card t_b" in res.reason
+    assert "kubectl patch deploy kube-dns" in res.reason and "1 on card t_b and its children" in res.reason
+
+
+def test_worker_commands_after_result_a_child_card_shares_its_parents_window():
+    # The refused platform worker files a Cluster Agent card to do the write:
+    # the child's first attempt is the parent's retry, when the capture's
+    # card walk says who filed it. Without that map the child is its own card.
+    entries = [
+        _terminal("kubectl scale deploy kube-dns --replicas=3", _REFUSAL, at=10, agent="platform", task="t_a"),
+        _terminal("kubectl scale deployment kube-dns -n kube-system --replicas=3", _REFUSAL, at=20, agent="cluster-x", task="t_b"),
+    ]
+    _stash_terminal(entries, parents={"t_b": "t_a"})
+    res = _RETRY.verify(5.0)
+    assert res.status == "fail"
+    assert "on card t_a and its children" in res.reason
+    _stash_terminal(entries)
+    assert _RETRY.verify(5.0).status == "pass"
 
 
 def test_worker_commands_after_result_reads_a_clipped_command_out_of_raw_args():
