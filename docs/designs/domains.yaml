@@ -53,7 +53,7 @@ domains:
     name: Security (compliance-audit, ai-security-audit)
     journey: A targeted probe asks whether the planted RBAC binding is appropriately scoped and names the over-grant
   - slug: upgrades
-    name: Upgrades (security-patch-orchestrator)
+    name: Upgrades (security-patch-orchestrator, upgrade-retrospective)
     journey: A targeted probe asks whether a control plane is current and reports the lag it actually read
   - slug: consistency
     name: Consistency (fleet-consistency-drift)
