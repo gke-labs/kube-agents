@@ -5190,10 +5190,16 @@ run_menu_system() {
         refuse_next_slack_gateway_settings_from_env || return 1
         # Kept until the check after the generator has passed, so that a
         # refusal there puts install.env back as it was.
+        # The copy holds install.env's credentials, so it is 0600 under a
+        # recognisable name, and an EXIT trap removes it if the arm dies
+        # before either path below does (a generator failure exits through
+        # on_error, and Ctrl-C exits too).
         local install_env_before=""
         if [ -f "$INSTALL_ENV_FILE" ]; then
-          install_env_before="$(mktemp)"
-          cp -p "$INSTALL_ENV_FILE" "$install_env_before"
+          install_env_before="$(umask 077; mktemp "${TMPDIR:-/tmp}/kube-agents-install-env.XXXXXX")"
+          cat "$INSTALL_ENV_FILE" >"$install_env_before"
+          # shellcheck disable=SC2064 # expand now: the local is gone at exit.
+          trap "rm -f $(printf '%q' "$install_env_before")" EXIT
         fi
 
         # Into install.env, one key at a time, leaving the operator's comments
@@ -5256,14 +5262,19 @@ run_menu_system() {
         # removes the tfvars that render the refused settings.
         if ! refuse_next_slack_gateway_settings_from_env; then
           if [ -n "$install_env_before" ]; then
-            cp -p "$install_env_before" "$INSTALL_ENV_FILE"
+            # Into the existing file, which keeps its 0600.
+            cat "$install_env_before" >"$INSTALL_ENV_FILE"
             rm -f "$install_env_before"
+            trap - EXIT
             print_info "${INSTALL_ENV_FILE} is put back as it was before this Save & Apply."
           fi
           rm -f "$(tf_compose_dir "$repo_dir")/terraform.tfvars"
           return 1
         fi
-        [ -z "$install_env_before" ] || rm -f "$install_env_before"
+        if [ -n "$install_env_before" ]; then
+          rm -f "$install_env_before"
+          trap - EXIT
+        fi
         # A provider or minter switch is where a new fixed-name GSA is first
         # planned on an existing install, so the 409 check runs here too.
         check_service_account_ownership || exit 1
@@ -5834,6 +5845,9 @@ main() {
       bad="$(slack_bot_token_list_count "$slack_bot_token")"
       { [ -n "$bad" ] && $can_ask; } || break
       print_error "SLACK_BOT_TOKEN holds ${bad} tokens. Under spec.mode next the A2A gateway takes one workspace's bot token; enter one."
+      # Not the re-ask's default: prompt_read prints a default it has no
+      # label for, and this one is the list just typed under read -s.
+      slack_bot_token="" bot_hint=""
     done
     prompt_read "Slack App Token (xapp-...)" slack_app_token "$slack_app_token" true "$app_hint"
     while :; do

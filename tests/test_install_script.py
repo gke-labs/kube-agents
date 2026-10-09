@@ -5973,7 +5973,9 @@ class NextSlackGatewaySettingsWiringTest(unittest.TestCase):
             "ANSWERS=()\n"
             + "".join(f"ANSWERS+=({shlex.quote(a)})\n" for a in answers)
             + "ASKED=0\n"
-            'prompt_read() { echo "PROMPT: $1"; printf -v "$2" "%s" "${ANSWERS[$ASKED]}"; ASKED=$((ASKED + 1)); }\n'
+            # The default is echoed as prompt_read prints it ("[default: …]",
+            # the label over the value), so a secret shown there is caught.
+            'prompt_read() { echo "PROMPT: $1 [default: ${5:-${3:-}}]"; printf -v "$2" "%s" "${ANSWERS[$ASKED]}"; ASKED=$((ASKED + 1)); }\n'
         )
         # The values are main()'s locals, so they are echoed inside the slice.
         body, tail = self._chat_step().rsplit("\n}\n", 1)
@@ -6099,7 +6101,16 @@ class NextSlackGatewaySettingsWiringTest(unittest.TestCase):
 
     # ── the menu's Save & Apply ──
 
-    def test_the_menu_puts_install_env_back_when_the_check_after_its_generator_refuses(self):
+    _MENU_GENERATOR_RECOVERS_A_LIST = (
+        "write_tfvars_from_state() { echo generated > \"$1\"; "
+        "export SLACK_BOT_TOKEN='xoxb-1-secretpart,xoxb-2-secretpart'; }\n"
+    )
+
+    def _menu_apply(self, generator, call='rc=0; _menu_apply || rc=$?; echo "rc=$rc"\n'):
+        """The menu's Save & Apply arm, run as a function with `generator`
+        standing in for write_tfvars_from_state. mktemp records each file it
+        makes, so a copy of install.env left behind can be found (macOS's
+        mktemp ignores TMPDIR when given no template)."""
         text = _INSTALL_SH.read_text()
         start = text.index(self._MENU_ARM) + len("      6)\n")
         end = text.index("\n        ;;\n", start)
@@ -6110,7 +6121,7 @@ class NextSlackGatewaySettingsWiringTest(unittest.TestCase):
         stubs = (
             "resolve_effective_image_tag() { :; }\nvalidate_immutable_ref() { :; }\nverify_local_source_ref() { :; }\n"
             "tf_compose_dir() { printf '%s' \"$TF_DIR\"; }\n"
-            "write_tfvars_from_state() { echo generated > \"$1\"; export SLACK_BOT_TOKEN='xoxb-1-secretpart,xoxb-2-secretpart'; }\n"
+            f"{generator}"
             "check_service_account_ownership() { :; }\ngke_dns_endpoint_flag() { :; }\ngcloud() { :; }\n"
             "refuse_apply_over_undeclared_scope() { :; }\nannounce_platform_agent_mode_for_apply() { :; }\n"
             "check_scope_container_access() { :; }\nenable_scope_selector_apis() { :; }\n"
@@ -6121,27 +6132,58 @@ class NextSlackGatewaySettingsWiringTest(unittest.TestCase):
             path = self._file(tmp, content)
             tf_dir = pathlib.Path(tmp) / "tf"
             tf_dir.mkdir()
+            made = pathlib.Path(tmp) / "mktemp.log"
+            made.touch()
             script = (
                 f"{stubs}"
                 + "".join(f"{n}=v-{n}\n" for n in names)
                 + 'permission_set=read-only slack_enabled=true google_chat_enabled=false\n'
                 f'TF_DIR="{tf_dir}" SLACK_BOT_TOKEN=""\n'
+                f'mktemp() {{ local p; p="$(command mktemp "$@")" || return; echo "$p" >>"{made}"; printf "%s\\n" "$p"; }}\n'
                 f"_menu_apply() {{\n{text[start:end]}\n}}\n"
-                'rc=0; _menu_apply || rc=$?; echo "rc=$rc"\n'
+                f"{call}"
             )
             proc = self._run(script, install_env=path)
-            after = path.read_text()
-            mode = stat.S_IMODE(path.stat().st_mode)
-            tfvars_left = (tf_dir / "terraform.tfvars").exists()
+            result = {
+                "content": content,
+                "after": path.read_text(),
+                "mode": stat.S_IMODE(path.stat().st_mode),
+                "tfvars_left": (tf_dir / "terraform.tfvars").exists(),
+                "leftovers": [m for m in made.read_text().split() if pathlib.Path(m).exists()],
+                "made": made.read_text().split(),
+            }
+        return proc, result
+
+    def test_the_menu_puts_install_env_back_when_the_check_after_its_generator_refuses(self):
+        proc, r = self._menu_apply(self._MENU_GENERATOR_RECOVERS_A_LIST)
         out = proc.stdout + proc.stderr
         self.assertIn("rc=1", proc.stdout, out)
         self.assertIn("SLACK_BOT_TOKEN holds 2 tokens", out)
         self.assertNotIn("APPLIED", out)
         self.assertNotIn("secretpart", out)
-        self.assertEqual(after, content, "install.env was left with the refused Save & Apply's keys")
-        self.assertEqual(mode, 0o600)
-        self.assertFalse(tfvars_left)
+        self.assertEqual(r["after"], r["content"], "install.env was left with the refused Save & Apply's keys")
+        self.assertEqual(r["mode"], 0o600)
+        self.assertFalse(r["tfvars_left"])
+        self.assertEqual(r["leftovers"], [], "the copy of install.env was left behind")
         self.assertIn("put back as it was before this Save & Apply", out)
+
+    def test_the_menu_leaves_no_copy_of_install_env_when_its_generator_fails(self):
+        # The generator's own failures (no memory answer, say) exit through
+        # on_error, past both of the arm's clean-up paths. Called bare, as
+        # the menu calls it: under `||` the ERR trap would not fire.
+        proc, r = self._menu_apply("write_tfvars_from_state() { return 1; }\n",
+                                   call='_menu_apply; echo "rc=$?"\n')
+        out = proc.stdout + proc.stderr
+        self.assertNotIn("APPLIED", out)
+        self.assertNotIn("rc=0", proc.stdout, out)
+        self.assertEqual(len(r["made"]), 1, out)
+        self.assertEqual(r["leftovers"], [], "the copy of install.env, with its credentials, was left behind")
+
+    def test_the_menu_leaves_no_copy_of_install_env_after_a_clean_apply(self):
+        proc, r = self._menu_apply("write_tfvars_from_state() { echo generated > \"$1\"; }\n")
+        out = proc.stdout + proc.stderr
+        self.assertIn("APPLIED terraform", out)
+        self.assertEqual(r["leftovers"], [], out)
 
 
 class FrontDoorsAgreeOnTheRepositoryTest(unittest.TestCase):
