@@ -558,7 +558,8 @@ module "chat_pubsub" {
 }
 
 # The drift detector's audit-log ingress: Log Router sink, drift-audit topic
-# and pull subscription, and the sink-writer and detector IAM. The three names
+# and pull subscription, and the sink-writer IAM from the module, with the
+# detector's own subscription IAM below rather than inside it. The three names
 # are composition variables, as the stockout trio's are, because a second
 # install in the project has to be able to name its own -- lifecycle.sh's
 # guard_drift_adoption refuses an apply that would otherwise find all three

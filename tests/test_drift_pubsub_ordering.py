@@ -115,9 +115,21 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 try:
-    from tests.test_terraform_module_tests import _STR, _WORD, _blocks, _tokens
+    from tests.test_terraform_module_tests import (
+        _EQUALS,
+        _STR,
+        _WORD,
+        _blocks,
+        _tokens,
+    )
 except ImportError:  # run from inside tests/
-    from test_terraform_module_tests import _STR, _WORD, _blocks, _tokens
+    from test_terraform_module_tests import (
+        _EQUALS,
+        _STR,
+        _WORD,
+        _blocks,
+        _tokens,
+    )
 
 _LIST_OPEN = "["
 _LIST_CLOSE = "]"
@@ -127,6 +139,10 @@ _RESOURCE = "resource"
 _RESOURCE_LABELS = 2
 _MODULE = "module"
 _MODULE_LABELS = 1
+_LOCALS = "locals"
+_LOCALS_LABELS = 0
+_MODULE_REFERENCE = r"module\.([A-Za-z0-9_-]+)"
+_LOCAL_REFERENCE = r"local\.([A-Za-z0-9_-]+)"
 
 # The composition's half of the ordering, which the module cannot express.
 # gke_cluster names drift_pubsub so that Terraform, destroying dependents
@@ -240,9 +256,91 @@ def _module_body(tokens: list, name: str) -> list:
     )
 
 
-def _module_references(code: str) -> list:
-    """Every `module.<name>` a block's code (strings excluded) reaches."""
-    return re.findall(r"module\.([A-Za-z0-9_-]+)", code)
+def _reference_text(body: list) -> str:
+    """A block's code and its string interpolations, safe to scan for refs.
+
+    The tokenizer splits `module.x.y` into word and `.` tokens, so the halves
+    have to be rejoined with nothing between them -- but joining *everything*
+    with nothing also welds unrelated neighbours together, and
+    `local.smuggled source` then reads as one identifier `local.smuggledsource`
+    that matches no name. A separator goes in only where neither side is a
+    dot, which keeps dotted references whole and everything else apart.
+    """
+    pieces = []
+    for (kind, value), _depth in body:
+        if kind == _STR:
+            for interpolation in re.findall(r"\$\{([^}]*)\}", value):
+                pieces.append(" ")
+                pieces.append(interpolation)
+            continue
+        if pieces and value != "." and pieces[-1] != ".":
+            pieces.append(" ")
+        pieces.append(value)
+    return "".join(pieces)
+
+
+def _module_references(body: list) -> set:
+    """Every `module.<name>` a block reaches directly.
+
+    Both halves matter and the string half is the easy one to forget.
+    Terraform's reference graph is not lexical: the tokenizer keeps
+    `"serviceAccount:${module.x.y}"` as a single string token, so a scan of
+    the code-only view sees nothing -- and that interpolated spelling is the
+    composition's own idiom for principals, so it is what an author reaching
+    for a module output would copy. Interpolations inside string tokens are
+    read here for exactly that reason.
+    """
+    return set(re.findall(_MODULE_REFERENCE, _reference_text(body)))
+
+
+def _local_references(body: list) -> set:
+    """Every `local.<name>` a block reaches, in code or in an interpolation."""
+    return set(re.findall(_LOCAL_REFERENCE, _reference_text(body)))
+
+
+def _locals_definitions(tokens: list) -> dict:
+    """Each `locals` entry's name mapped to the tokens of its value.
+
+    A depth-1 word followed by `=` opens an entry; it runs to the next one.
+    """
+    definitions = {}
+    for _labels, body in _blocks(tokens, _LOCALS, _LOCALS_LABELS):
+        flat = [(token, depth) for token, depth in body]
+        current, start = None, 0
+        for index, ((kind, value), depth) in enumerate(flat):
+            opens = (
+                depth == 1
+                and kind == _WORD
+                and index + 1 < len(flat)
+                and flat[index + 1][0][1] == _EQUALS
+            )
+            if not opens:
+                continue
+            if current is not None:
+                definitions[current] = flat[start:index]
+            current, start = value, index + 2
+        if current is not None:
+            definitions[current] = flat[start:]
+    return definitions
+
+
+def _modules_reached(body: list, definitions: dict) -> set:
+    """Modules a block reaches directly or through any chain of locals.
+
+    A local is the laundering path the assertion's own advice recommends
+    ("pass a var or a local instead"), so following them is not optional.
+    """
+    reached = _module_references(body)
+    seen, pending = set(), list(_local_references(body))
+    while pending:
+        name = pending.pop()
+        if name in seen or name not in definitions:
+            continue
+        seen.add(name)
+        value = definitions[name]
+        reached |= _module_references(value)
+        pending.extend(_local_references(value))
+    return reached
 
 
 def _block_strings(body: list) -> list:
@@ -361,15 +459,21 @@ class DriftPubsubOrdering(unittest.TestCase):
         damage, and most of them do -- the composition hangs nearly everything
         off gke_cluster. Asserting the ingress call reaches no module at all is
         both the real invariant and the cheaper thing to keep true: it takes
-        only var and local inputs today.
+        only variables today.
+
+        "Reaches" is three things, because Terraform's graph is not lexical
+        and a guard that reads only bare code text misses two of them. A
+        reference can be bare (module.x.y), interpolated inside a string
+        ("serviceAccount:${module.x.y}", which the tokenizer hands over as one
+        opaque string token and which is this composition's own idiom for
+        principals), or laundered through a local -- the shape this very
+        assertion used to recommend as the safe alternative. All three are
+        followed, locals transitively.
         """
         body = _module_body(self.composition, INGRESS_MODULE)
+        definitions = _locals_definitions(self.composition)
         referenced = sorted(
-            {
-                name
-                for name in _module_references(_code_text(body))
-                if name != INGRESS_MODULE
-            }
+            _modules_reached(body, definitions) - {INGRESS_MODULE}
         )
         self.assertEqual(
             [],
