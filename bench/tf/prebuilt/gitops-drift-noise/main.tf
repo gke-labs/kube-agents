@@ -327,10 +327,15 @@ resource "null_resource" "drift_noise" {
       # excludes the repetition instead of blaming the agent for a quota that
       # ran out or a pod that rolled.
       #
-      # `detail` carries the human-readable reason, so a failing nightly leaves
-      # something on the cluster besides a bare token whose only explanation is
-      # an apply log nobody kept.
+      # `detail` carries the human-readable reason. It goes to stderr as well
+      # as to the cluster, and the stderr copy is the one that survives: every
+      # non-ok path but churn-forwarded exits non-zero, which trips the EXIT
+      # trap above, which deletes both namespaces -- the verdict ConfigMap's
+      # among them. Leaving the namespaces standing instead would hand the
+      # next repetition a plant it did not make, so the record moves to the
+      # log rather than the cleanup being weakened.
       write_verdict() {
+        echo "verdict=$1 detail=$2" >&2
         ${local.kubectl} create configmap "${local.verdict_configmap}" \
           -n "${local.verdict_namespace}" \
           --from-literal=verdict="$1" \
