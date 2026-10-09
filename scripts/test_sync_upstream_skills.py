@@ -2,16 +2,20 @@
 
 Run: python3 -m unittest scripts.test_sync_upstream_skills
 
-Three invariants:
+Four invariants:
 
 - after a sync wipes a skill dir, inject_footer restores the Cluster Agent coupling footer
   exactly once (idempotent), and only for skills that have one;
 - the in-tree copy of every skill with a registered correction already reads as the next sync
   would leave it, so the mirror and the registries cannot drift apart unnoticed;
 - a registered correction that no longer matches upstream aborts the sync before anything is
-  written, rather than publishing the uncorrected upstream content with exit 0.
+  written, rather than publishing the uncorrected upstream content with exit 0;
+- no module-level name and no key of a dict literal is declared twice, since the later copy
+  silently replaces the earlier and drops its corrections.
 """
 
+import ast
+import collections
 import fnmatch
 import importlib.util
 import io
@@ -889,6 +893,36 @@ class AbortTest(unittest.TestCase):
         self.assertEqual(caught.exception.code, 1)
         self.assertEqual(err.getvalue(), "the message\n")
         self.assertEqual(out.getvalue(), "progress")
+
+
+class ModuleAssignmentTest(unittest.TestCase):
+    def setUp(self):
+        self.tree = ast.parse(Path(_SPEC.origin).read_text(encoding="utf-8"))
+
+    def test_no_module_level_name_is_assigned_twice(self):
+        # Two branches that each add a registry entry can auto-merge into a second assignment of the
+        # same registry, and the later one silently replaces the earlier: the merge of one sync pull
+        # request re-declared SKILL_FILE_SUBSTITUTIONS with gke-basics alone and dropped gke-upgrades'
+        # reference corrections while every other test stayed green.
+        counts = collections.Counter()
+        for node in self.tree.body:
+            targets = node.targets if isinstance(node, ast.Assign) else []
+            if isinstance(node, ast.AnnAssign):
+                targets = [node.target]
+            counts.update(target.id for target in targets if isinstance(target, ast.Name))
+        self.assertEqual({name: n for name, n in counts.items() if n > 1}, {})
+
+    def test_no_dict_literal_repeats_a_key(self):
+        # The same merge one level down: two branches each adding a "gke-upgrades" entry at
+        # different positions in one registry merge cleanly, and Python keeps the last.
+        repeated = []
+        for node in ast.walk(self.tree):
+            if isinstance(node, ast.Dict):
+                keys = collections.Counter(
+                    ast.unparse(key) for key in node.keys if key is not None
+                )
+                repeated += [(node.lineno, key) for key, n in keys.items() if n > 1]
+        self.assertEqual(repeated, [])
 
 
 if __name__ == "__main__":
