@@ -38,6 +38,9 @@ _HELPERS = _CHART / "templates" / "_helpers.tpl"
 _SPAWN_GO = _ROOT / "a2a" / "gateway" / "spawn.go"
 _A2A_MANIFESTS = _ROOT / "k8s-operator" / "internal" / "controller" / "platformagent_a2a_manifests.go"
 _A2A_BRIDGE = _ROOT / "k8s-operator" / "internal" / "controller" / "platformagent_a2a_bridge.go"
+_A2A_CONSOLE = _ROOT / "k8s-operator" / "internal" / "controller" / "platformagent_a2a_console.go"
+_A2A_CALLOUT = _ROOT / "k8s-operator" / "internal" / "controller" / "platformagent_a2a_callout.go"
+_A2A_VERIFIER = _ROOT / "k8s-operator" / "internal" / "controller" / "platformagent_a2a_verifier.go"
 _IAM_MAIN_TF = _ROOT / "terraform" / "modules" / "kube-agents-iam" / "main.tf"
 
 _HELM = shutil.which("helm")
@@ -1365,6 +1368,20 @@ class DocumentedFootprintTest(unittest.TestCase):
         return m.group(1)
 
     def test_the_prerequisites_page_documents_mode_next_footprint(self) -> None:
+        def parse_cpu_m(cpu_str: str) -> int:
+            if cpu_str.endswith("m"):
+                return int(cpu_str[:-1])
+            return int(float(cpu_str) * 1000)
+
+        def parse_mem_bytes(mem_str: str) -> int:
+            if mem_str.endswith("Mi"):
+                return int(mem_str[:-2]) * 1024 * 1024
+            if mem_str.endswith("Gi"):
+                return int(mem_str[:-2]) * 1024 * 1024 * 1024
+            if mem_str.endswith("Ki"):
+                return int(mem_str[:-2]) * 1024
+            return int(mem_str)
+
         spawn_src = _SPAWN_GO.read_text()
         worker_cpu = self._extract_match(
             r'workerCPURequest\s*=\s*"([^"]+)"', spawn_src, "workerCPURequest"
@@ -1385,6 +1402,24 @@ class DocumentedFootprintTest(unittest.TestCase):
         )
         nats_mem = self._extract_match(
             r'a2aNATSMemoryRequest\s*=\s*"([^"]+)"', manifests_src, "a2aNATSMemoryRequest"
+        )
+        gateway_cpu = self._extract_match(
+            r'a2aGatewayCPURequest\s*=\s*"([^"]+)"', manifests_src, "a2aGatewayCPURequest"
+        )
+        gateway_mem = self._extract_match(
+            r'a2aGatewayMemoryRequest\s*=\s*"([^"]+)"', manifests_src, "a2aGatewayMemoryRequest"
+        )
+        verifier_cpu = self._extract_match(
+            r'a2aVerifierCPURequest\s*=\s*"([^"]+)"', manifests_src, "a2aVerifierCPURequest"
+        )
+        verifier_mem = self._extract_match(
+            r'a2aVerifierMemoryRequest\s*=\s*"([^"]+)"', manifests_src, "a2aVerifierMemoryRequest"
+        )
+        provision_cpu = self._extract_match(
+            r'a2aProvisionCPURequest\s*=\s*"([^"]+)"', manifests_src, "a2aProvisionCPURequest"
+        )
+        provision_mem = self._extract_match(
+            r'a2aProvisionMemoryRequest\s*=\s*"([^"]+)"', manifests_src, "a2aProvisionMemoryRequest"
         )
         jetstream_gib = int(
             self._extract_match(
@@ -1407,6 +1442,40 @@ class DocumentedFootprintTest(unittest.TestCase):
             )
         )
 
+        console_src = _A2A_CONSOLE.read_text()
+        console_cpu = self._extract_match(
+            r'a2aConsoleCPURequest\s*=\s*"([^"]+)"', console_src, "a2aConsoleCPURequest"
+        )
+        console_mem = self._extract_match(
+            r'a2aConsoleMemoryRequest\s*=\s*"([^"]+)"', console_src, "a2aConsoleMemoryRequest"
+        )
+
+        callout_src = _A2A_CALLOUT.read_text()
+        callout_replicas = int(
+            self._extract_match(
+                r'Replicas:\s*ptr\.To\(int32\((\d+)\)\)', callout_src, "callout replicas"
+            )
+        )
+        callout_cpu = self._extract_match(
+            r'Requests:\s*corev1\.ResourceList\{[^}]*ResourceCPU:\s*resource\.MustParse\("([^"]+)"\)',
+            callout_src,
+            "callout CPU request",
+            flags=re.DOTALL,
+        )
+        callout_mem = self._extract_match(
+            r'Requests:\s*corev1\.ResourceList\{[^}]*ResourceMemory:\s*resource\.MustParse\("([^"]+)"\)',
+            callout_src,
+            "callout memory request",
+            flags=re.DOTALL,
+        )
+
+        verifier_src = _A2A_VERIFIER.read_text()
+        verifier_replicas = int(
+            self._extract_match(
+                r'Replicas:\s*ptr\.To\(int32\((\d+)\)\)', verifier_src, "verifier replicas"
+            )
+        )
+
         bridge_src = _A2A_BRIDGE.read_text()
         bridge_cpu = self._extract_match(
             r'corev1\.ResourceCPU:\s*resource\.MustParse\("([^"]+)"\)',
@@ -1420,17 +1489,59 @@ class DocumentedFootprintTest(unittest.TestCase):
         )
 
         page = " ".join(self._PREREQUISITES.read_text().split())
+        gib = 1024**3
 
-        # Check NATS standing workload requests:
+        # Compute standing delta across additional pods:
+        # 1 NATS + callout_replicas + verifier_replicas + 1 gateway + 1 console = 7 additional pods
+        additional_pods = 1 + callout_replicas + verifier_replicas + 1 + 1
+        standing_cpu_m = (
+            parse_cpu_m(nats_cpu)
+            + callout_replicas * parse_cpu_m(callout_cpu)
+            + verifier_replicas * parse_cpu_m(verifier_cpu)
+            + parse_cpu_m(gateway_cpu)
+            + parse_cpu_m(console_cpu)
+            + parse_cpu_m(bridge_cpu)
+        )
+        standing_mem_bytes = (
+            parse_mem_bytes(nats_mem)
+            + callout_replicas * parse_mem_bytes(callout_mem)
+            + verifier_replicas * parse_mem_bytes(verifier_mem)
+            + parse_mem_bytes(gateway_mem)
+            + parse_mem_bytes(console_mem)
+            + parse_mem_bytes(bridge_mem)
+        )
+        standing_cpu_vcpu = math.floor((standing_cpu_m / 1000) * 10 + 0.5) / 10
+        standing_mem_gib = math.floor((standing_mem_bytes / gib) * 10 + 0.5) / 10
+
+        # Assert individual workload clauses:
         self.assertIn(f"NATS ({nats_cpu} CPU, {nats_mem} memory)", page)
-
-        # Check bridge container default sizing:
+        self.assertIn(
+            f"two auth callout replicas ({callout_cpu} CPU, {callout_mem} memory each)",
+            page,
+        )
+        self.assertIn(
+            f"two capability verifier replicas ({verifier_cpu} CPU, {verifier_mem} memory each)",
+            page,
+        )
+        self.assertIn(f"the A2A gateway ({gateway_cpu} CPU, {gateway_mem} memory)", page)
+        self.assertIn(f"the console ({console_cpu} CPU, {console_mem} memory)", page)
         self.assertIn(
             f"`hermes-bridge` container in the agent pod ({bridge_cpu} CPU, {bridge_mem} memory under the default `api` executor",
             page,
         )
+        self.assertIn(
+            f"one-time {provision_cpu} CPU / {provision_mem} memory provisioning Job",
+            page,
+        )
 
-        # Check a2a-worker session pod requests and limits:
+        # Assert standing delta totals:
+        standing_delta_pattern = (
+            rf"standing delta of ~{standing_cpu_vcpu}\s+vCPU and ~{standing_mem_gib}\s+GiB "
+            rf"across {additional_pods}\s+additional pods plus the bridge container"
+        )
+        self.assertRegex(page, standing_delta_pattern)
+
+        # Assert a2a-worker session pod requests and limits:
         worker_mem_limit_prose = worker_mem_limit.replace("Gi", " GiB")
         worker_clause = (
             rf"`a2a-worker` session pod requesting {re.escape(worker_cpu)} CPU "
@@ -1439,21 +1550,32 @@ class DocumentedFootprintTest(unittest.TestCase):
         )
         self.assertRegex(page, worker_clause)
 
-        # Check JetStream persistent volume claim:
+        # Assert JetStream persistent volume claim:
         self.assertIn(f"{jetstream_gib} GiB JetStream persistent volume claim", page)
 
-        # Check namespace-wide ResourceQuota capping pods:
+        # Mode-next PVC total: 4 stock + 1 JetStream = 5 claims totalling 22 + 40 = 62 GiB
+        # Stock totals from the chart footprint / prerequisites page:
+        m_stock_storage = re.search(r"(\d+)\s+persistent volume claims totalling\s+(\d+)\s+GiB", page)
+        self.assertIsNotNone(m_stock_storage, "stock storage clause not found")
+        assert m_stock_storage is not None
+        stock_claims = int(m_stock_storage.group(1))
+        stock_gib = int(m_stock_storage.group(2))
+        next_total_claims = stock_claims + 1
+        next_total_gib = stock_gib + jetstream_gib
+        self.assertIn(
+            f"{next_total_claims} claims totalling {next_total_gib} GiB of `requests.storage`",
+            page,
+        )
+
+        # Assert namespace-wide ResourceQuota capping pods:
         quota_clause = (
             rf"renders a namespace-wide `ResourceQuota` on `pods` of "
             rf"`maxSessions \+ {headroom}` \({max_sessions + headroom} pods by default"
         )
         self.assertRegex(page, quota_clause)
 
-    def test_the_prerequisites_page_documents_minimum_iam_roles(self) -> None:
-        iam_tf = _IAM_MAIN_TF.read_text()
-        self.assertIn('resource "google_project_iam_member"', iam_tf)
-        self.assertIn('resource "google_service_account_iam_member"', iam_tf)
-
+    def test_the_prerequisites_page_names_the_iam_roles(self) -> None:
+        """Verifies the prerequisites page names the minimum required GCP IAM roles and permissions."""
         page = self._PREREQUISITES.read_text()
         self.assertIn("`google_project_iam_member`", page)
         self.assertIn("`google_service_account_iam_member`", page)
