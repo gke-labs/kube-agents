@@ -569,7 +569,7 @@ class PoolPressureJobOwnersContractTest(unittest.TestCase):
 
         owners = set()
         for path in sorted((REPO_SCRIPTS.parent / "hack").glob("*.py")):
-            if "import boskos_pool" not in path.read_text(encoding="utf-8"):
+            if not re.search(r"^\s*(?:import|from)\s+boskos_pool\b", path.read_text(encoding="utf-8"), re.M):
                 continue
             script = self._script(path.stem)
             for name in ("DEFAULT_OWNER", "DEFAULT_BOSKOS_OWNER"):

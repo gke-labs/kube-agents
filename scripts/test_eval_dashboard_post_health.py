@@ -1052,6 +1052,15 @@ class PoolNote(RunHarness):
             post_health.pool_digest_line(note),
             "⏳ Queue was backed up — 2 runs refused a project in the last 3h. No backlog right now.",
         )
+        # The page has no stretch and no queue to show for this note, and its
+        # Brief reads healthy, so the alert links the job's history instead.
+        self.assertEqual(
+            post_health.render_pool({"pool": note}).split("\n")[-1], post_health.POOL_JOB_HISTORY_URL
+        )
+        self.assertEqual(
+            post_health.render_pool({"pool": note | {"over_threshold": 3}}).split("\n")[-1],
+            post_health.dashboard_link(post_health.DASHBOARD_VIEW_AGENT),
+        )
         # A live queue beside the refusals is the fact a reader can act on
         # this morning, so the refusal joins it rather than displacing it.
         self.assertEqual(
