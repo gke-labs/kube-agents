@@ -519,6 +519,7 @@ COLLECTOR_AUDITS = frozenset(
         "obtainability-audit",
         "security-patch-orchestrator",
         "stockout-prevention",
+        "upgrade-retrospective",
     }
 )
 
