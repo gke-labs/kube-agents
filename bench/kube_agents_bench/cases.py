@@ -56,7 +56,8 @@ NOOP_DEPLOYER = "noop"
 
 # The check types that read the run's own tool calls or worker logs rather
 # than the answer or the cluster: ``tool_called`` reads the trajectory,
-# ``worker_commands`` the delegated cards' worker logs, ``worker_agents`` the
+# ``worker_commands`` the delegated cards' worker logs (or, with
+# ``after_result_pattern``, the workers' trajectory entries), ``worker_agents`` the
 # ``agent`` tags the harness puts on the workers' trajectory entries. On the
 # inject transport they are blind in two different ways, and the scorer
 # sets each aside under its own condition (``scoring.py``, the inject lane).
