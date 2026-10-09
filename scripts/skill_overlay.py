@@ -130,10 +130,9 @@ GIT_ENV = {
     "GIT_CONFIG_NOSYSTEM": "1",
     # No user ignore file either: a scratch repository must record every file it is given.
     # and paths printed verbatim, so the diff text the tool parses names a non-ASCII file as is.
-    # Do not let auto gc or maintenance detach into the background: background processes
-    # can delete loose objects while finish_sync's rmtree walks the scratch tree (#2817).
-    # Running housekeeping in the foreground ensures git finishes before rmtree runs,
-    # while allowing the persistent upstream cache to still be compacted.
+    # Do not let auto gc or maintenance detach into the background: ensure any housekeeping
+    # triggered by porcelain commands runs synchronously in the foreground before subprocess.run
+    # returns, while allowing the persistent upstream cache to still be compacted.
     "GIT_CONFIG_COUNT": "4",
     "GIT_CONFIG_KEY_0": "core.excludesFile",
     "GIT_CONFIG_VALUE_0": os.devnull,

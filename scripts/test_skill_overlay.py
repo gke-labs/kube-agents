@@ -633,7 +633,7 @@ class Helpers(unittest.TestCase):
 
             # Porcelain commit triggers auto gc.
             # With gc.autoDetach=false, housekeeping completes synchronously in the foreground
-            # before git() returns, eliminating the race with subsequent rmtree (#2817).
+            # before git() returns, ensuring repacking finishes before subsequent filesystem operations.
             self.tool.git(["commit", "-q", "-m", "3"], cwd=d)
 
             # Assert foreground completion on return: packs consolidated and loose objects pruned
