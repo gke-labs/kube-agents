@@ -74,6 +74,7 @@ attachments are not posted (there is no file route), and say so in the log.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import json
 import logging
 import math
@@ -305,6 +306,272 @@ def fresh_events(claim: Optional[dict], now: Optional[float] = None) -> Optional
                     claim["sub"].get("task_id"), claim["sub"].get("platform"))
         claim = dict(claim, events=kept)
     return claim
+
+
+#: How long a fanned-out child's answer waits for its parent's answer to post
+#: before it is posted anyway: the parent's answer is the one the thread
+#: wants, but a parent whose answer never posts must not swallow what its
+#: child found. Measured from the child's completion, and long enough for a
+#: fleet-wide fan-out whose children finish far apart (the parent completes
+#: only after its last child settles).
+FOLD_HOLD_SECONDS = 2 * 3600
+#: Parent statuses that mean it is still working toward its answer. A blocked
+#: parent (failed, gave up, or waiting on the user) releases the child's
+#: answer at once.
+FOLD_WAITING_STATUSES = frozenset({"triage", "todo", "scheduled", "ready", "running", "review"})
+#: Parent statuses that mean it has completed (kanban_children_settled's
+#: settled set).
+FOLD_DONE_STATUSES = frozenset({"done", "archived"})
+#: kanban_children_settled's record of the card each worker's card was
+#: created by.
+WORKER_CHILDREN_TABLE = "kanban_worker_children"
+#: (task id, event id, message) already logged, so a hold re-read on every
+#: tick logs once, and a later drop of the same event logs once too.
+#: Bounded: cleared when it grows past this.
+_FOLD_LOGGED: set = set()
+_FOLD_LOGGED_MAX = 4096
+
+_SUB_WHERE = "task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?"
+
+
+def _sub_args(task_id: str, sub: dict) -> tuple:
+    return (task_id, sub.get("platform") or "", sub.get("chat_id") or "", sub.get("thread_id") or "")
+
+
+def _sub_cursor(conn: Any, task_id: str, sub: dict) -> Optional[int]:
+    """How far ``task_id``'s subscription on ``sub``'s thread has delivered, or
+    None when it has none: the durable cursor, or a sent ping past it."""
+    try:
+        row = conn.execute(
+            f"SELECT last_event_id, last_ping_event_id FROM kanban_notify_subs WHERE {_SUB_WHERE}",
+            _sub_args(task_id, sub),
+        ).fetchone()
+    except sqlite3.OperationalError:  # a base without the ping column
+        row = conn.execute(f"SELECT last_event_id, 0 FROM kanban_notify_subs WHERE {_SUB_WHERE}",
+                           _sub_args(task_id, sub)).fetchone()
+    return None if row is None else max(int(row[0] or 0), int(row[1] or 0))
+
+
+def _durable_cursor(conn: Any, task_id: str, sub: dict) -> Optional[int]:
+    """The subscription's durable cursor alone (``last_event_id``), or None.
+    Not ping-inclusive: a ping that posted before its wake failed leaves this
+    behind, and that is exactly the case where the cursor did not move."""
+    row = conn.execute(f"SELECT last_event_id FROM kanban_notify_subs WHERE {_SUB_WHERE}",
+                       _sub_args(task_id, sub)).fetchone()
+    return None if row is None else int(row[0] or 0)
+
+
+def _fold_parent(conn: Any, child_id: str, sub: dict) -> Optional[tuple]:
+    """``(status, completed_event_id, delivered_cursor)`` for the card that
+    created ``child_id``, when that card is subscribed to the same thread; else
+    None. ``completed_event_id`` is the id of the parent's latest ``completed``
+    event (0 when it has none), ``delivered_cursor`` how far the parent's own
+    subscription has delivered.
+
+    A child its parent gates (a ``task_links`` edge from the parent, the
+    continuation kanban_children_settled exempts) is never folded: it runs
+    after its parent completes, so its answer is the answer.
+    """
+    try:
+        row = conn.execute(
+            f"SELECT c.creator_id FROM {WORKER_CHILDREN_TABLE} c WHERE c.child_id = ?"
+            " AND NOT EXISTS (SELECT 1 FROM task_links l WHERE l.parent_id = c.creator_id AND l.child_id = c.child_id)",
+            (child_id,),
+        ).fetchone()
+        if not row:
+            return None
+        parent = row[0]
+        task = conn.execute("SELECT status FROM tasks WHERE id = ?", (parent,)).fetchone()
+        if not task:
+            return None
+        delivered = _sub_cursor(conn, parent, sub)
+        if delivered is None:
+            # No subscription: the notifier drops one after delivering an
+            # archived card's last events, and also after repeated send
+            # failures, and the row does not say which. Nothing proves the
+            # parent's answer posted, so the child's does not fold.
+            return None
+        done = conn.execute(
+            "SELECT MAX(id) FROM task_events WHERE task_id = ? AND kind = 'completed'", (parent,),
+        ).fetchone()
+        return task[0], int((done[0] if done else 0) or 0), delivered
+    except sqlite3.Error as exc:
+        # No children table on an install without kanban_children_settled,
+        # or a schema change: deliver as upstream would.
+        logger.debug("kanban notifier: fan-out fold skipped for %s: %s", child_id, exc)
+        return None
+
+
+def _rewind(conn: Any, sub: dict, claimed: int, to: int) -> bool:
+    """Move the subscription's cursor back from ``claimed`` to ``to`` (CAS)."""
+    from hermes_cli import kanban_db_notify
+    return kanban_db_notify.rewind_notify_cursor(
+        conn, task_id=sub["task_id"], platform=sub["platform"], chat_id=sub["chat_id"],
+        thread_id=sub.get("thread_id") or "", claimed_cursor=claimed, old_cursor=to,
+    )
+
+
+def _advance(conn: Any, sub: dict, frm: int, to: int) -> bool:
+    """Advance the subscription's durable cursor from ``frm`` to ``to`` (CAS:
+    only if no other writer moved it, so it never goes backwards)."""
+    from hermes_cli import kanban_db_notify
+    return kanban_db_notify.rewind_notify_cursor(
+        conn, task_id=sub["task_id"], platform=sub["platform"], chat_id=sub["chat_id"],
+        thread_id=sub.get("thread_id") or "", claimed_cursor=frm, old_cursor=to,
+    )
+
+
+def _log_once(task_id: str, event_id: int, message: str, *args: Any) -> None:
+    key = (task_id, event_id, message)
+    if key in _FOLD_LOGGED:
+        logger.debug(message, *args)
+        return
+    if len(_FOLD_LOGGED) >= _FOLD_LOGGED_MAX:
+        _FOLD_LOGGED.clear()
+    _FOLD_LOGGED.add(key)
+    logger.info(message, *args)
+
+
+#: The line a child's answer opens with when it arrives after its parent's has
+#: posted, so it reads as a late finding and not a duplicate.
+LATE_RESULT_LEAD = "Late result from {title}:"
+#: The line a child's answer opens with when the hold runs out while its
+#: parent is still working: the parent's fuller answer may still follow.
+INTERIM_RESULT_LEAD = "Interim result from {title} (the full answer is still being put together):"
+
+
+def _late(ev: Any, claim: dict, title: str, template: str = LATE_RESULT_LEAD) -> tuple:
+    """``(event, claim)`` with the answer led by ``template``. The completion
+    text is the event's run summary, or the card's result when the event has
+    none (upstream's ``_fmt_completed``), so both are led."""
+    lead = template.format(title=title or "a subtask")
+    payload = dict(getattr(ev, "payload", None) or {})
+    if payload.get("summary"):
+        payload["summary"] = f"{lead}\n{payload['summary']}"
+        ev = dataclasses.replace(ev, payload=payload) if dataclasses.is_dataclass(ev) else ev
+    task = claim.get("task")
+    if task is not None and getattr(task, "result", None) and dataclasses.is_dataclass(task):
+        claim = dict(claim, task=dataclasses.replace(task, result=f"{lead}\n{task.result}"))
+    return ev, claim
+
+
+def _title(conn: Any, child: str, claim: dict) -> str:
+    """The child card's title: from the claim's task, else the board."""
+    title = getattr(claim.get("task"), "title", None)
+    if title:
+        return str(title)
+    try:
+        row = conn.execute("SELECT title FROM tasks WHERE id = ?", (child,)).fetchone()
+    except sqlite3.Error:
+        row = None
+    return (row[0] if row else "") or ""
+
+
+def fold_fanout(conn: Any, claim: Optional[dict], now: Optional[float] = None) -> Optional[dict]:
+    """``claim`` with a fanned-out child's answer folded into its parent's.
+
+    A worker that fans a question out to child cards completes its own card
+    with the synthesis, and kanban_children_settled holds that completion until
+    the children settle. Each child inherited the thread's subscription
+    (kanban_auto_subscribe), so without this the thread gets every child's
+    answer and then the parent's: the same answer, two or more times. Routed
+    delivery only (the A2A gateway's platforms); the Hermes path and its own
+    Slack fold are untouched.
+
+    For a child's ``completed`` event whose parent is subscribed to the same
+    thread:
+
+    - the parent's own ``completed`` (a later event) has been delivered on that
+      thread: the child's event is dropped, and its cursor moved past it, so
+      neither its post nor its wake runs;
+    - the parent is still working, or has completed but its answer has not
+      posted yet, for under FOLD_HOLD_SECONDS: the child's event is held.
+      Events before it deliver, and the claim stops just before it, so the
+      next tick reads it again;
+    - otherwise (the parent blocked, failed or gave up, its answer came before
+      the child's, its subscription is gone, or the hold ran out): it delivers
+      as upstream would, so nothing a child found is lost when its parent's
+      answer does not post. One that arrives after the parent's answer has
+      posted opens with "Late result from <card title>:", and one whose hold
+      ran out while the parent still works opens with "Interim result from
+      <card title> …", so neither reads as a duplicate.
+
+    Every other event kind (blocked, gave_up, crashed, progress) delivers.
+
+    Two claim models are handled: kanban_notify_delivery's read-only claim (the
+    durable cursor is still at ``old_cursor``; a hold writes nothing and a drop
+    with nothing left to deliver advances the cursor), and upstream's committed
+    claim (the cursor already moved; a hold rewinds it and a drop writes
+    nothing). Which one ran is read from the subscription's row.
+    """
+    if not claim:
+        return claim
+    sub = claim.get("sub") or {}
+    if (sub.get("platform") or "").lower() not in {p for p in (routed_platform(), conversation_platform()) if p}:
+        return claim
+    child = sub.get("task_id") or ""
+    events = list(claim.get("events") or [])
+    now = time.time() if now is None else now
+    kept: list = []
+    dropped = late = False
+    for index, ev in enumerate(events):
+        if getattr(ev, "kind", "") != "completed":
+            kept.append(ev)
+            continue
+        parent = _fold_parent(conn, child, sub)
+        if parent is None:
+            kept.append(ev)
+            continue
+        status, parent_done, delivered = parent
+        event_id = int(getattr(ev, "id"))
+        later = parent_done > event_id
+        if later and delivered >= parent_done:
+            _log_once(child, event_id, "kanban notifier: %s's answer folded into its parent's, already posted; not posted", child)
+            dropped = True
+            continue
+        waiting = status in FOLD_WAITING_STATUSES or (status in FOLD_DONE_STATUSES and later)
+        if waiting and now - (getattr(ev, "created_at", 0) or 0) < FOLD_HOLD_SECONDS:
+            committed = _durable_cursor(conn, child, sub) == int(claim.get("cursor") or 0) != int(claim.get("old_cursor") or 0)
+            if committed:
+                try:
+                    rewound = _rewind(conn, sub, int(claim["cursor"]), event_id - 1)
+                except Exception as exc:
+                    rewound = False
+                    logger.warning("kanban notifier: could not hold %s's answer for its parent: %s", child, exc)
+                if not rewound:
+                    logger.warning("kanban notifier: could not hold %s's answer for its parent; posting it", child)
+                    kept.extend(events[index:])
+                    break
+            _log_once(child, event_id, "kanban notifier: holding %s's answer until its parent's posts (parent %s)",
+                      child, status)
+            if not kept:
+                return None
+            return dict(claim, events=kept, cursor=event_id - 1)
+        lead = None
+        if parent_done and not later and delivered >= parent_done:
+            lead = LATE_RESULT_LEAD
+        elif waiting:
+            # The hold ran out with the parent still working toward its answer.
+            lead = INTERIM_RESULT_LEAD
+        if lead:
+            ev, claim = _late(ev, claim, _title(conn, child, claim), lead)
+            late = True
+        kept.append(ev)
+    if late:
+        claim = dict(claim, events=kept)
+    if not dropped:
+        return claim
+    if kept:
+        return dict(claim, events=kept)
+    # Nothing left to deliver, so deliver() will not run to advance the cursor:
+    # under the read-only claim, move it past the dropped answer here, or the
+    # next tick reads and drops it again.
+    if _durable_cursor(conn, child, sub) != int(claim.get("cursor") or 0):
+        try:
+            _advance(conn, sub, int(claim.get("old_cursor") or 0), int(claim["cursor"]))
+        except Exception as exc:
+            logger.warning("kanban notifier: could not move %s's cursor past its folded answer: %s", child, exc)
+    return None
 
 
 class ChatNotifyAdapter(BasePlatformAdapter):

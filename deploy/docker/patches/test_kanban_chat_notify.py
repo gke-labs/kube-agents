@@ -500,5 +500,237 @@ class ApplierTest(unittest.TestCase):
                 apply_kanban_chat_notify.apply(Path(root))
 
 
+
+@dataclass
+class _Ev:
+    id: int
+    kind: str
+    created_at: int
+    payload: Optional[dict] = None
+
+
+@dataclass
+class _Task:
+    result: str
+
+
+class FoldFanoutTest(unittest.TestCase):
+    """A fanned-out child's answer folds into its parent's on the routed path.
+
+    The board is real SQLite with the columns the fold reads; the cursor
+    writes (_rewind, _advance) are SQL against the same table, so a hold or a
+    drop is judged by what the cursor really does. verify_kanban_chat_notify's
+    check_fold runs the same through real Hermes."""
+
+    THREAD = {"platform": "google_chat", "chat_id": "spaces/H", "thread_id": "spaces/H/threads/T"}
+
+    def setUp(self):
+        self.conn = sqlite3.connect(":memory:")
+        self.conn.executescript(
+            "CREATE TABLE tasks (id TEXT PRIMARY KEY, status TEXT, title TEXT);"
+            "CREATE TABLE task_events (id INTEGER PRIMARY KEY, task_id TEXT, kind TEXT);"
+            "CREATE TABLE kanban_worker_children (child_id TEXT PRIMARY KEY, creator_id TEXT, created_at INTEGER);"
+            "CREATE TABLE task_links (parent_id TEXT, child_id TEXT);"
+            "CREATE TABLE kanban_notify_subs (task_id TEXT, platform TEXT, chat_id TEXT, thread_id TEXT,"
+            " last_event_id INTEGER, last_ping_event_id INTEGER DEFAULT 0);"
+        )
+        self.conn.execute("INSERT INTO kanban_worker_children VALUES ('t_child', 't_parent', 1)")
+        for task in ("t_child", "t_parent"):
+            self.conn.execute("INSERT INTO kanban_notify_subs (task_id, platform, chat_id, thread_id, last_event_id) VALUES (?, ?, ?, ?, 0)",
+                              (task, self.THREAD["platform"], self.THREAD["chat_id"], self.THREAD["thread_id"]))
+        self.parent("running")
+        for name, fake in (("_rewind", self._rewind), ("_advance", self._advance)):
+            patcher = mock.patch.object(kanban_chat_notify, name, side_effect=fake)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        env = mock.patch.dict(os.environ, ROUTED)
+        env.start()
+        self.addCleanup(env.stop)
+        kanban_chat_notify._FOLD_LOGGED.clear()
+
+    def _rewind(self, conn, sub, claimed, to):
+        cur = conn.execute("UPDATE kanban_notify_subs SET last_event_id = ? WHERE task_id = ? AND last_event_id = ?",
+                           (to, sub["task_id"], claimed))
+        return cur.rowcount > 0
+
+    def _advance(self, conn, sub, frm, to):
+        return self._rewind(conn, sub, frm, to)
+
+    def cursor(self, task="t_child"):
+        return self.conn.execute("SELECT last_event_id FROM kanban_notify_subs WHERE task_id = ?", (task,)).fetchone()[0]
+
+    def parent(self, status, completed_event=None, delivered=None):
+        self.conn.execute("INSERT OR REPLACE INTO tasks (id, status) VALUES ('t_parent', ?)", (status,))
+        if completed_event is not None:
+            self.conn.execute("INSERT INTO task_events VALUES (?, 't_parent', 'completed')", (completed_event,))
+        if delivered is not None:
+            self.conn.execute("UPDATE kanban_notify_subs SET last_event_id = ? WHERE task_id = 't_parent'", (delivered,))
+
+    def claim(self, *events, committed=False):
+        """A claim as kanban_notify_delivery reads it (cursor untouched), or,
+        ``committed``, as upstream's claim commits it (cursor moved)."""
+        old = events[0].id - 1
+        self.conn.execute("UPDATE kanban_notify_subs SET last_event_id = ? WHERE task_id = 't_child'",
+                          (events[-1].id if committed else old,))
+        return {"sub": dict(self.THREAD, task_id="t_child"), "old_cursor": old, "cursor": events[-1].id, "events": list(events)}
+
+    def fold(self, claim, now=2000):
+        return kanban_chat_notify.fold_fanout(self.conn, claim, now=now)
+
+    def test_the_answer_is_dropped_once_the_parents_answer_is_delivered(self):
+        self.parent("done", completed_event=9, delivered=9)
+        self.assertIsNone(self.fold(self.claim(_Ev(7, "completed", 1900))))
+        self.assertEqual(self.cursor(), 7, "a dropped answer's cursor moves past it, or it is read again every tick")
+
+    def test_a_drop_under_the_committed_claim_writes_nothing(self):
+        self.parent("done", completed_event=9, delivered=9)
+        self.assertIsNone(self.fold(self.claim(_Ev(7, "completed", 1900), committed=True)))
+        self.assertEqual(self.cursor(), 7)
+
+    def test_the_answer_is_held_while_the_parent_works(self):
+        self.assertIsNone(self.fold(self.claim(_Ev(7, "completed", 1900))))
+        self.assertEqual(self.cursor(), 6, "a hold under the read-only claim writes nothing")
+
+    def test_a_hold_under_the_committed_claim_rewinds(self):
+        self.assertIsNone(self.fold(self.claim(_Ev(7, "completed", 1900), committed=True)))
+        self.assertEqual(self.cursor(), 6, "a hold under the committed claim rewinds to just before the answer")
+
+    def test_held_while_the_parents_answer_has_not_been_delivered(self):
+        self.parent("done", completed_event=9, delivered=0)
+        self.assertIsNone(self.fold(self.claim(_Ev(7, "completed", 1900))))
+        self.assertEqual(self.cursor(), 6, "held, not dropped: the cursor stays before the answer")
+
+    def test_events_before_a_held_answer_still_deliver(self):
+        got = self.fold(self.claim(_Ev(5, "blocked", 1800), _Ev(7, "completed", 1900)))
+        self.assertEqual([e.id for e in got["events"]], [5])
+        self.assertEqual(got["cursor"], 6)
+
+    def test_a_parent_that_blocks_releases_its_childs_answer(self):
+        # Blocked is where a failed, gave_up, crashed or timed-out card lands.
+        self.parent("blocked")
+        claim = self.claim(_Ev(7, "completed", 1900))
+        self.assertIs(self.fold(claim), claim)
+
+    def test_a_hold_that_runs_out_posts_the_answer_as_interim(self):
+        # A fan-out whose children finish far apart: the parent still works,
+        # so the child's answer posts, led so it does not read as the answer.
+        self.conn.execute("INSERT INTO tasks (id, status, title) VALUES ('t_child', 'done', 'prod-eu')")
+        claim = self.claim(_Ev(7, "completed", 2000 - kanban_chat_notify.FOLD_HOLD_SECONDS - 1, {"summary": "3 nodes"}))
+        got = self.fold(claim)
+        self.assertEqual([e.id for e in got["events"]], [7])
+        self.assertTrue(got["events"][0].payload["summary"].startswith("Interim result from prod-eu"), got["events"][0].payload)
+
+    def test_the_hold_outlasts_a_slow_fan_out(self):
+        # Children of a fleet-wide fan-out can finish an hour apart.
+        self.assertIsNone(self.fold(self.claim(_Ev(7, "completed", 2000 - 3600))))
+
+    def test_a_parent_whose_answer_pinged_counts_as_delivered(self):
+        # The parent's text posted (ping recorded) but its wake has not
+        # advanced the durable cursor yet: its answer is in the thread.
+        self.parent("done", completed_event=9, delivered=0)
+        self.ping(9, task="t_parent")
+        self.assertIsNone(self.fold(self.claim(_Ev(7, "completed", 1900))))
+        self.assertEqual(self.cursor(), 7, "dropped, not held")
+
+    def test_a_late_answer_posts_and_says_it_is_late(self):
+        # The parent answered first (completed over a live child); the child's
+        # answer still posts, led so it does not read as a duplicate.
+        self.conn.execute("INSERT INTO tasks VALUES ('t_child', 'done', 'count pods (delegate)')")
+        self.parent("done", completed_event=5, delivered=5)
+        claim = self.claim(_Ev(7, "completed", 1900, {"summary": "13 pods"}))
+        claim["task"] = _Task(result="13 pods, all healthy")
+        got = self.fold(claim)
+        self.assertEqual([e.id for e in got["events"]], [7])
+        self.assertEqual(got["events"][0].payload["summary"], "Late result from count pods (delegate):\n13 pods")
+        self.assertEqual(got["task"].result, "Late result from count pods (delegate):\n13 pods, all healthy")
+
+    def test_an_answer_ahead_of_an_undelivered_parent_is_not_called_late(self):
+        self.parent("done", completed_event=5, delivered=0)
+        claim = self.claim(_Ev(7, "completed", 1900, {"summary": "13 pods"}))
+        self.assertIs(self.fold(claim), claim)
+
+    def test_a_parent_whose_subscription_is_gone_does_not_fold(self):
+        # The notifier unsubscribes a sub after repeated send failures.
+        self.conn.execute("DELETE FROM kanban_notify_subs WHERE task_id = 't_parent'")
+        self.parent("done", completed_event=9)
+        claim = self.claim(_Ev(7, "completed", 1900))
+        self.assertIs(self.fold(claim), claim)
+
+    def test_a_continuation_child_is_never_folded(self):
+        self.conn.execute("INSERT INTO task_links VALUES ('t_parent', 't_child')")
+        self.parent("done", completed_event=9, delivered=9)
+        claim = self.claim(_Ev(7, "completed", 1900))
+        self.assertIs(self.fold(claim), claim)
+
+    def test_a_parent_on_another_thread_does_not_fold(self):
+        self.conn.execute("UPDATE kanban_notify_subs SET thread_id = 'spaces/H/threads/OTHER' WHERE task_id = 't_parent'")
+        self.parent("done", completed_event=9, delivered=9)
+        claim = self.claim(_Ev(7, "completed", 1900))
+        self.assertIs(self.fold(claim), claim)
+
+    def test_only_completed_events_fold(self):
+        self.parent("done", completed_event=9, delivered=9)
+        claim = self.claim(_Ev(6, "gave_up", 1900))
+        self.assertIs(self.fold(claim), claim)
+
+    def test_a_failed_rewind_delivers_rather_than_loses(self):
+        # Another notifier moved the cursor first, so the CAS rewind fails.
+        claim = self.claim(_Ev(7, "completed", 1900), committed=True)
+        with mock.patch.object(kanban_chat_notify, "_rewind", return_value=False):
+            self.assertEqual([e.id for e in self.fold(claim)["events"]], [7])
+
+    def test_the_hermes_path_is_untouched(self):
+        self.parent("done", completed_event=9, delivered=9)
+        claim = self.claim(_Ev(7, "completed", 1900))
+        with mock.patch.dict(os.environ, UNROUTED):
+            self.assertIs(self.fold(claim), claim)
+
+    def test_no_children_table_delivers_as_upstream(self):
+        self.conn.execute("DROP TABLE kanban_worker_children")
+        claim = self.claim(_Ev(7, "completed", 1900))
+        self.assertIs(self.fold(claim), claim)
+
+    def ping(self, event_id, task="t_child"):
+        self.conn.execute("UPDATE kanban_notify_subs SET last_ping_event_id = ? WHERE task_id = ?", (event_id, task))
+
+    def test_a_dropped_answer_whose_ping_landed_still_moves_the_cursor(self):
+        # The child's ping posted, its wake failed, so the durable cursor
+        # stayed behind; the drop must still move it past the answer.
+        self.parent("done", completed_event=9, delivered=9)
+        claim = self.claim(_Ev(7, "completed", 1900))
+        self.ping(7)
+        self.assertIsNone(self.fold(claim))
+        self.assertEqual(self.cursor(), 7)
+
+    def test_a_ping_does_not_make_a_read_only_claim_look_committed(self):
+        claim = self.claim(_Ev(7, "completed", 1900))
+        self.ping(7)
+        self.assertIsNone(self.fold(claim), "held, not released: the ping is not a committed claim")
+        self.assertEqual(self.cursor(), 6)
+
+    def test_an_archived_parent_with_no_subscription_releases_the_answer(self):
+        # The notifier drops a sub both after an archived card's last events
+        # and after repeated send failures; the row cannot tell which, so the
+        # child's answer is not risked.
+        self.parent("archived", completed_event=9)
+        self.conn.execute("DELETE FROM kanban_notify_subs WHERE task_id = 't_parent'")
+        claim = self.claim(_Ev(7, "completed", 1900))
+        self.assertIs(self.fold(claim), claim)
+
+    def test_a_drop_after_a_hold_is_logged(self):
+        with self.assertLogs(kanban_chat_notify.logger, level="DEBUG") as logs:
+            self.fold(self.claim(_Ev(7, "completed", 1900)))
+            self.parent("done", completed_event=9, delivered=9)
+            self.fold(self.claim(_Ev(7, "completed", 1900)))
+        infos = [r.getMessage() for r in logs.records if r.levelname == "INFO"]
+        self.assertTrue(any("holding" in m for m in infos) and any("folded" in m for m in infos), infos)
+
+    def test_a_hold_logs_once(self):
+        with self.assertLogs(kanban_chat_notify.logger, level="DEBUG") as logs:
+            for _ in range(3):
+                self.fold(self.claim(_Ev(7, "completed", 1900)))
+        infos = [r for r in logs.records if r.levelname == "INFO" and "holding" in r.getMessage()]
+        self.assertEqual(len(infos), 1)
+
 if __name__ == "__main__":
     unittest.main()

@@ -31,6 +31,7 @@ import os
 import stat
 import sys
 import tempfile
+from typing import Any
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -232,8 +233,82 @@ def main() -> None:
         reply = log.read_text().splitlines() if log.exists() else []
         check(reply[:3] == ["notify", "--platform", "google_chat"] and reply[-1] == "the wake turn's reply",
               f"wake: the turn's reply went out through a2a notify ({reply})")
+    check_fold(Path(tmp), runner)
     print("kanban_chat_notify: verified")
 
+
+
+def check_fold(tmp: Path, runner: Any) -> None:
+    """The fan-out fold through the patched ``_Collector._claim_for_sub`` the
+    image runs (kanban_notify_delivery's read-only claim), on a real board:
+    a child's answer is held while its parent works and until the parent's
+    answer has been delivered, then dropped with its cursor moved past it; a
+    parent that blocks releases it. kanban_children_settled's table is created
+    here, as its own patch would."""
+    from hermes_cli import kanban_db, kanban_db_connect, kanban_db_notify
+    from gateway.kanban_chat_notify import WORKER_CHILDREN_TABLE
+
+    conn = kanban_db_connect.connect(tmp / "fold.db")
+    conn.execute(f"CREATE TABLE IF NOT EXISTS {WORKER_CHILDREN_TABLE} (child_id TEXT PRIMARY KEY, creator_id TEXT NOT NULL, created_at INTEGER NOT NULL)")
+    where = {"platform": "google_chat", "chat_id": "spaces/H", "thread_id": "spaces/H/threads/T"}
+    collector = notifier._Collector(runner, kb=kanban_db, notifier_profile=None, gc_due=False, gc_retention_days=30)
+
+    def pair(title):
+        parent = kanban_db.create_task(conn, title=title, assignee="platform")
+        child = kanban_db.create_task(conn, title=title + " (cluster)", assignee="platform")
+        conn.execute(f"INSERT INTO {WORKER_CHILDREN_TABLE} VALUES (?, ?, 0)", (child, parent))
+        for task in (parent, child):
+            kanban_db_notify.add_notify_sub(conn, task_id=task, **where)
+        return parent, child
+
+    def sub_of(task):
+        return dict(conn.execute("SELECT * FROM kanban_notify_subs WHERE task_id = ?", (task,)).fetchone())
+
+    def claim(task):
+        return collector._claim_for_sub(conn, "default", sub_of(task))
+
+    def deliver(task):
+        # What deliver()'s tail does after a successful send.
+        got = claim(task)
+        kanban_db_notify.advance_notify_cursor(conn, task_id=task, new_cursor=got["cursor"], **where)
+        return got
+
+    def kinds(got):
+        return [e.kind for e in got["events"]] if got else []
+
+    parent, child = pair("count pods")
+    kanban_db.complete_task(conn, child, result="13 pods")
+    start = sub_of(child)["last_event_id"]
+    check(claim(child) is None, "fold: the child's answer is held while its parent works")
+    check(claim(child) is None and sub_of(child)["last_event_id"] == start,
+          "fold: a hold writes nothing; the next tick reads the answer again")
+    kanban_db.complete_task(conn, parent, result="13 pods in kubeagents-system")
+    check(claim(child) is None, "fold: still held while the parent's answer has not been delivered")
+    check("completed" in kinds(deliver(parent)), "fold: the parent's answer delivers")
+    child_done = conn.execute("SELECT MAX(id) FROM task_events WHERE task_id = ? AND kind = 'completed'", (child,)).fetchone()[0]
+    check(claim(child) is None, "fold: once the parent's answer is delivered, the child's is not posted")
+    check(sub_of(child)["last_event_id"] >= child_done, "fold: the dropped answer's cursor is moved past it")
+    _, unread = kanban_db_notify.unseen_events_for_sub(conn, task_id=child, kinds=notifier.TERMINAL_KINDS, **where)
+    check(not any(e.kind == "completed" for e in unread), "fold: and it is not read again")
+
+    parent, child = pair("count nodes")
+    kanban_db.complete_task(conn, child, result="3 nodes")
+    check(claim(child) is None, "fold: a second child is held while its parent works")
+    kanban_db.block_task(conn, parent, reason="gave up")
+    check("completed" in kinds(claim(child)), "fold: a parent that blocks releases its child's answer")
+
+    # A child that finishes after its parent's answer has posted (the parent
+    # completed over a live child) still posts, led as a late result.
+    parent, child = pair("count services")
+    kanban_db.complete_task(conn, parent, result="4 services")
+    deliver(parent)
+    kanban_db.complete_task(conn, child, result="4 services, 1 headless", summary="4 services, 1 headless")
+    late = claim(child)
+    done = [e for e in (late or {}).get("events", []) if e.kind == "completed"]
+    check(len(done) == 1 and str((done[0].payload or {}).get("summary", "")).startswith("Late result from count services (cluster):"),
+          "fold: a child's answer after its parent's posts, led as a late result")
+    check(str(getattr(late["task"], "result", "")).startswith("Late result from"), "fold: and the card's result is led too")
+    conn.close()
 
 if __name__ == "__main__":
     main()
