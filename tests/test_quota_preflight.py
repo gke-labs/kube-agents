@@ -1352,6 +1352,22 @@ class DocumentedFootprintTest(unittest.TestCase):
             math.floor((required["limitsMemory"] / gib) * 10 + 0.5) / 10,
         )
 
+    def test_the_prerequisites_page_documents_mode_next_footprint(self) -> None:
+        page = self._PREREQUISITES.read_text()
+        self.assertIn("spec.mode: next", page)
+        self.assertIn("JetStream", page)
+        self.assertIn("40 GiB", page)
+        self.assertIn("a2a-worker", page)
+        self.assertIn("250m CPU", page)
+        self.assertIn("512Mi memory", page)
+
+    def test_the_prerequisites_page_documents_minimum_iam_roles(self) -> None:
+        page = self._PREREQUISITES.read_text()
+        self.assertIn("resourcemanager.projects.setIamPolicy", page)
+        self.assertIn("iam.serviceAccounts.setIamPolicy", page)
+        self.assertIn("roles/resourcemanager.projectIamAdmin", page)
+        self.assertIn("roles/iam.serviceAccountAdmin", page)
+
 
 
 if __name__ == "__main__":
