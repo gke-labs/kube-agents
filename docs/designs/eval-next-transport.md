@@ -360,7 +360,7 @@ the chat profile's `kanban_create` — is a different matter:
 api lane's roster is untouched. The lane runs the bridge's shipped default executor, `api`, the
 one a customer install runs: `hack/ci-deploy.sh` leaves the operator's `A2A_BRIDGE_EXECUTOR`
 unset, so the rendered bridge carries no `BRIDGE_EXECUTOR` and picks `api` from the
-`API_SERVER_KEY` it copies from the agent container, and the deploy's start-line wait requires
+`API_SERVER_KEY` the operator sets on it, and the deploy's start-line wait requires
 `"executor":"api"`, which a bridge that fell back to `cli` for want of the key fails. Under `api`
 the turn runs under the pod's API server, whose profile is the chat path's own (`default` on a
 stock install), so the agent that answers a case on this lane is the one the chat path reaches

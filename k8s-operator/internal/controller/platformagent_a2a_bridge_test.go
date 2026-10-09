@@ -527,33 +527,46 @@ func TestACLIBridgeWithoutAnOverrideKeepsTheAgentsResources(t *testing.T) {
 	}
 }
 
-// The bridge runs cli when BRIDGE_EXECUTOR is unset and API_SERVER_KEY is
-// blank, which an AgentPlugin's env can arrange. Sizing reads the executor
-// from the container's env the way the binary and the activity hook do, so
-// that bridge keeps the agent's resources instead of the api defaults.
-func TestABridgeWhoseEnvSelectsCLIIsSizedForCLI(t *testing.T) {
-	pod := bridgeTestPod(provisionedAgent())
-	agentC := containersNamed(pod, "platform-agent")[0]
-	blanked := agentC.DeepCopy()
-	found := false
-	for i := range blanked.Env {
-		if blanked.Env[i].Name == a2aBridgeAPIServerKeyEnvVar {
-			blanked.Env[i] = corev1.EnvVar{Name: a2aBridgeAPIServerKeyEnvVar, Value: " "}
-			found = true
-		}
-	}
-	if !found {
-		t.Fatalf("the agent container carries no %s; the probe is vacuous", a2aBridgeAPIServerKeyEnvVar)
-	}
-	b := buildA2ABridgeContainer(provisionedAgent(), *blanked)
-	if a2aBridgeRunsAPIExecutor(b) {
-		t.Fatal("precondition: a bridge with a blank API_SERVER_KEY should run cli")
-	}
-	if !reflect.DeepEqual(b.Resources, agentC.Resources) {
-		t.Errorf("a bridge whose env selects cli got %+v, want the agent container's %+v", b.Resources, agentC.Resources)
-	}
-	// The stock bridge, whose key is set, is api and gets the defaults.
-	if b := buildA2ABridgeContainer(provisionedAgent(), agentC); !reflect.DeepEqual(b.Resources, a2aRenderedBridgeDefaultResources()) {
-		t.Errorf("the stock bridge got %+v, want the api defaults", b.Resources)
+// The agent container's API_SERVER_KEY can come from an AgentPlugin's env, and
+// a blank or unresolvable one would switch the bridge to cli, which the api
+// defaults can't hold. The bridge sets its own key instead of inheriting it,
+// so whatever the agent container carries, the bridge runs api, is sized for
+// api, and its executor, sizing and activity hook agree.
+func TestAPluginsAPIServerKeyDoesNotReachTheBridge(t *testing.T) {
+	agentC := containersNamed(bridgeTestPod(provisionedAgent()), "platform-agent")[0]
+	for name, key := range map[string]corev1.EnvVar{
+		"blank": {Name: a2aBridgeAPIServerKeyEnvVar, Value: " "},
+		"valueFrom": {Name: a2aBridgeAPIServerKeyEnvVar, ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{
+			LocalObjectReference: corev1.LocalObjectReference{Name: "plugin-secret"}, Key: "k", Optional: ptr.To(true)}}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			c := agentC.DeepCopy()
+			replaced := false
+			for i := range c.Env {
+				if c.Env[i].Name == a2aBridgeAPIServerKeyEnvVar {
+					c.Env[i] = key
+					replaced = true
+				}
+			}
+			if !replaced {
+				t.Fatalf("the agent container carries no %s; the probe is vacuous", a2aBridgeAPIServerKeyEnvVar)
+			}
+			b := buildA2ABridgeContainer(provisionedAgent(), *c)
+			var keys []corev1.EnvVar
+			for _, e := range b.Env {
+				if e.Name == a2aBridgeAPIServerKeyEnvVar {
+					keys = append(keys, e)
+				}
+			}
+			if len(keys) != 1 || keys[0].Value != loopbackAgentAPIKey || keys[0].ValueFrom != nil {
+				t.Errorf("the bridge's %s = %+v, want the bridge's own %q once", a2aBridgeAPIServerKeyEnvVar, keys, loopbackAgentAPIKey)
+			}
+			if !a2aBridgeRunsAPIExecutor(b) {
+				t.Error("the bridge would run cli")
+			}
+			if !reflect.DeepEqual(b.Resources, a2aRenderedBridgeDefaultResources()) {
+				t.Errorf("the bridge got %+v, want the api defaults", b.Resources)
+			}
+		})
 	}
 }

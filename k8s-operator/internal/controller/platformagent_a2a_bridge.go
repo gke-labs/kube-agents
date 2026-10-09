@@ -295,6 +295,11 @@ func a2aBridgeOwnEnv(agent *agentv1alpha1.PlatformAgent) []corev1.EnvVar {
 		}}},
 		{Name: a2aBridgeConcurrencyEnvVar, Value: a2aRenderedBridgeConcurrency()},
 		a2aActivitySecretEnv(agent),
+		// The bearer the agent's API server accepts (the managed .env pins the
+		// same). Set here rather than inherited: the agent container's entry
+		// can come from an AgentPlugin's env, and a blank or unresolvable one
+		// would silently switch the bridge to its cli executor.
+		{Name: a2aBridgeAPIServerKeyEnvVar, Value: loopbackAgentAPIKey},
 	}
 	if executor := a2aRenderedBridgeExecutor(); executor != "" {
 		env = append(env, corev1.EnvVar{Name: a2aBridgeExecutorEnvVar, Value: executor})
@@ -303,8 +308,9 @@ func a2aBridgeOwnEnv(agent *agentv1alpha1.PlatformAgent) []corev1.EnvVar {
 }
 
 // a2aBridgeDroppedAgentEnv are agent env names the bridge must not inherit:
-// its own settings (replaced above), and the agent's bus identity, which names
-// the `agent` principal and its inbox rather than the bridge's.
+// its own settings (replaced above, API_SERVER_KEY among them, so no plugin
+// value picks its executor), and the agent's bus identity, which names the
+// `agent` principal and its inbox rather than the bridge's.
 var a2aBridgeDroppedAgentEnv = map[string]bool{
 	sharedStateSetupEnvVar:      true,
 	a2aBridgeNATSURLEnvVar:      true,
@@ -314,6 +320,7 @@ var a2aBridgeDroppedAgentEnv = map[string]bool{
 	a2aBridgeExecutorEnvVar:     true,
 	a2aActivitySecretEnvVar:     true,
 	a2aBusUserEnv:               true,
+	a2aBridgeAPIServerKeyEnvVar: true,
 }
 
 // buildA2ABridgeContainer renders the bridge from the finished agent
@@ -347,8 +354,8 @@ func buildA2ABridgeContainer(agent *agentv1alpha1.PlatformAgent, agentContainer 
 	}
 	// Sized for the executor the bridge will actually run, read from the
 	// finished env the way the bridge binary and the activity hook read it
-	// (a2aBridgeRunsAPIExecutor), not from the operator setting alone: an
-	// AgentPlugin's env can blank API_SERVER_KEY, and the bridge then runs cli.
+	// (a2aBridgeRunsAPIExecutor). The bridge sets its own API_SERVER_KEY, so
+	// that is the operator's A2A_BRIDGE_EXECUTOR, else api.
 	c.Resources = a2aRenderedBridgeResources(agentContainer.Resources, !a2aBridgeRunsAPIExecutor(c))
 	return c
 }
