@@ -1456,8 +1456,8 @@ class DeliveryFlagTest(unittest.TestCase):
         self.assertEqual(rc, 0)
         return buf.getvalue()
 
-    def test_flag_unset_delivers_verbatim(self):
-        self.assertEqual(self._run(None), REPORT)
+    def test_flag_unset_delivers_presented(self):
+        self.assertEqual(self._run(None), PRESENTED)
 
     def test_flag_off_delivers_verbatim(self):
         self.assertEqual(self._run("0"), REPORT)

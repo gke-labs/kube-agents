@@ -703,8 +703,8 @@ check(
 # --- 8. What rolls and what does not -------------------------------------------
 print("routing:")
 check(
-    "the rolling kinds are the two non-terminal ones",
-    ROLLING_KINDS == ("heartbeat", "status"),
+    "the rolling kinds are the three non-terminal ones",
+    ROLLING_KINDS == ("heartbeat", "status", "queued"),
     f"got {ROLLING_KINDS!r}",
 )
 check(

@@ -4581,6 +4581,11 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 		// the same one the session quota was sized above,
 		// so the two halves cannot drift apart silently.
 		{Name: "A2A_MAX_SESSIONS", Value: strconv.Itoa(resolveA2AMaxSessions(agent))},
+		// The busy notice's threshold, rendered explicitly
+		// for the same reason: the number a reader of the
+		// live Deployment sees is the bridge worker count it
+		// was derived from (a2aBusyNoticeAt).
+		{Name: a2aBusyNoticeAtEnvVar, Value: a2aBusyNoticeAt(agent)},
 		// The metrics-only listener's port (see
 		// a2aGatewayMetricsPort): the container port below
 		// and the collector's ingress rule name the same one.

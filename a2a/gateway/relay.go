@@ -58,6 +58,14 @@ type relayState struct {
 	// drops the narration does not burn a backend edit per progress artifact
 	// re-rendering an unchanged line.
 	lastLine string
+	// busyShown is set when the gateway's busy notice is on the line
+	// (showBusy). The line then stays on it through the executor's own
+	// submitted event, which would otherwise re-render it as "⏳ submitted"
+	// and move it back; the first state past submitted replaces it. Cache
+	// like the rest: a restart forgets it, and a submitted-state event after
+	// the restart (a steer refusal on a still-queued task) re-renders the
+	// line as submitted. Cosmetic, and the next state replaces it anyway.
+	busyShown bool
 	// notices wait for the task's terminal and post after its deliverable:
 	// a delegation refusal follows the turn's "delegated to platform".
 	notices []string
@@ -522,6 +530,9 @@ func isReasonTokenByte(c byte) bool {
 func (g *Gateway) updateRollingLine(rec *SessionRecord, taskID string, rs *relayState) {
 	active := rec.ActiveTask
 	if active == nil || active.TaskID != taskID || active.StatusMsgID == "" {
+		return
+	}
+	if rs.busyShown && lineStillSubmitted(rs) {
 		return
 	}
 	progress := rs.progress
