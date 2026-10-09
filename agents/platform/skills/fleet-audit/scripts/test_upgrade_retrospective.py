@@ -421,6 +421,19 @@ class ClassifierFixtureTest(unittest.TestCase):
         self.assertEqual(entries(row), {(6, ur.MEDIUM)})
         self.assertEqual(row["classifications"][0]["evidence"], "2 of 2 pods: CronJob pod in Error; name mentions flowcontrol; e.g. legacy-flowcontrol-tuner-29857980-9r4jr")
 
+    def test_unclassified_symptom_writes_a_guard_the_recheck_reads(self):
+        # inventory-api's CreateContainerConfigError matches no row: a Warning with a failure guard,
+        # `unclassified` in the entry slot, sourced from pod state; the guard is cleared by a re-check
+        # that finds the pod gone.
+        [row] = by_object(symptoms_of("seeded-a"), "seeded-stall/Deployment/inventory-api")
+        [guard] = ur.guards_for(SEEDED, [row], "2026-10-08T18:00:00Z")
+        self.assertEqual((guard["id"], guard["entry"], guard["title"], guard["source"], guard["check"], guard["reviews"]), (f"{SEEDED}#failure#unclassified#seeded-stall/Deployment/inventory-api", None, ur.UNCLASSIFIED, "not-ready", ur.CHECK_SYMPTOM_UNCLASSIFIED, 1))
+        # An event-only unclassified symptom (a ConfigMap mount failure) is held as not re-checkable.
+        mount = event("FailedMount", 'MountVolume.SetUp failed for volume "config" : object "apps"/"settings" not registered', name="web-7d9f8b6c5-abcde")
+        [row] = [s for s in symptoms_of("seeded-a", reads={**READS["seeded-a"], "events": READS["seeded-a"]["events"] + [mount]}) if s["object"] == "apps/Pod/web-7d9f8b6c5-abcde"]
+        [guard] = ur.guards_for(SEEDED, [row], "2026-10-08T18:00:00Z")
+        self.assertEqual((guard["entry"], guard["source"], guard["check"]), (None, ur.GUARD_SOURCE_EVENT, ur.CHECK_SYMPTOM_UNCLASSIFIED))
+
     def test_unclassified_symptom_is_still_reported(self):
         rows = by_object(self.seeded, "seeded-stall/Deployment/inventory-api", "not-ready")
         self.assertEqual(rows[0]["reason"], "CreateContainerConfigError")
@@ -981,6 +994,11 @@ class ClassifierSignatureTest(unittest.TestCase):
         replica = next(p for p in pods if p["metadata"]["name"].startswith("inventory-api-"))
         replica["spec"]["nodeName"] = "gke-seeded-a-default-pool-62ac8ee0-d595"
         reads = {**READS["seeded-a"], "workloads": workloads, "pods": pods}
+        # The catalogue's floor: a workload of one replica is never entry 3 (its displaced replica
+        # is entry 2, or its budget entry 1); the fixture Deployment has one, so the test gives it two.
+        inventory["spec"]["replicas"] = 1
+        self.assertEqual([s for s in symptoms_of("seeded-a", reads=reads) if s["category"] == ur.CATEGORY_UNAVAILABLE], [])
+        inventory["spec"]["replicas"] = 2
         [row] = [s for s in symptoms_of("seeded-a", reads=reads) if s["category"] == ur.CATEGORY_UNAVAILABLE]
         self.assertEqual((row["object"], row["pool"], row["all_in_pool"], row["pods"]), ("seeded-stall/Deployment/inventory-api", "default-pool", True, [replica["metadata"]["name"]]))
         self.assertEqual(entries(row), {(3, ur.HIGH)})
@@ -1548,7 +1566,8 @@ class LedgerAndGuardsTest(unittest.TestCase):
         self.assertNotIn("spec_text", json.dumps(doc))
         self.assertTrue(seeded["mitigations"])
         self.assertTrue(all(m["entry"] in ur.MITIGATIONS for m in seeded["mitigations"]))
-        self.assertEqual({g["entry"] for g in seeded["guards"] if g["kind"] == ur.GUARD_KIND_FAILURE}, {1, 2, 14})
+        self.assertEqual({g["entry"] for g in seeded["guards"] if g["kind"] == ur.GUARD_KIND_FAILURE}, {None, 1, 2, 14})
+        self.assertEqual([g["check"] for g in seeded["guards"] if g["entry"] is None], [ur.CHECK_SYMPTOM_UNCLASSIFIED])
         self.assertEqual({g["entry"] for g in seeded["guards"] if g["kind"] == ur.GUARD_KIND_RISK}, {1, 4, 12, 13, 14, 17, 18, 19, 20})
         self.assertEqual(doc["guards"], result["guards"])
         self.assertEqual(seeded["baseline"]["shapes"], 9)
@@ -1566,7 +1585,7 @@ class LedgerAndGuardsTest(unittest.TestCase):
         fresh = ur.guards_for(SEEDED, symptoms_of("seeded-a"), seen)
         first = ur.merge_guards(ur.empty_guards(), fresh, {SEEDED}, seen)
         ids = {g["id"] for g in first["guards"]}
-        self.assertEqual(ids, {ur.guard_id(SEEDED, 14, PAYMENTS), ur.guard_id(SEEDED, 2, INFERENCE), ur.guard_id(SEEDED, 1, "seeded-capacity/PodDisruptionBudget/inference-server")})
+        self.assertEqual(ids, {ur.guard_id(SEEDED, 14, PAYMENTS), ur.guard_id(SEEDED, 2, INFERENCE), ur.guard_id(SEEDED, 1, "seeded-capacity/PodDisruptionBudget/inference-server"), ur.guard_id(SEEDED, None, "seeded-stall/Deployment/inventory-api")})
         self.assertTrue(all(g["first_seen"] == g["last_seen"] == seen for g in first["guards"]))
         # Seen again under a replacement pod: the owner key matches, so
         # last_seen moves and first_seen stays; an unreviewed cluster's guard is kept.
@@ -1575,7 +1594,7 @@ class LedgerAndGuardsTest(unittest.TestCase):
         later = "2026-10-15T18:00:00Z"
         replaced = {**READS["seeded-a"], "pods": rename_pod(READS["seeded-a"]["pods"], "payments-api-79b77b8c67-vfrh9", "payments-api-79b77b8c67-zz9zz")}
         second = ur.merge_guards(first, ur.guards_for(SEEDED, symptoms_of("seeded-a", reads=replaced), later), {SEEDED}, later)
-        self.assertEqual(len(second["guards"]), 4)
+        self.assertEqual(len(second["guards"]), 5)
         payments = next(g for g in second["guards"] if g["entry"] == 14)
         self.assertEqual((payments["first_seen"], payments["last_seen"]), (seen, later))
         self.assertIn("e.g. payments-api-79b77b8c67-zz9zz", payments["evidence"])
@@ -1616,7 +1635,10 @@ class LedgerAndGuardsTest(unittest.TestCase):
         later = datetime(2026, 10, 15, 18, 0, tzinfo=timezone.utc)
         second, _ = self.collect(FakeFleet(kubectl_fail=[("seeded-a", "pods")]), now=later, cluster=[SEEDED])
         after = {g["id"] for g in second["guards"] if g["cluster"] == SEEDED}
-        self.assertEqual(after, before)
+        # Every guard is kept; the partial review's event rows (no pod list to collapse them into)
+        # add event-only unclassified guards of their own.
+        self.assertTrue(before <= after)
+        self.assertTrue(all(g["entry"] is None and g["source"] == ur.GUARD_SOURCE_EVENT for g in second["guards"] if g["cluster"] == SEEDED and g["id"] not in before))
         ledger = ur.load_json(self.home / ur.LEDGER_FILENAME, {})
         self.assertEqual(ledger["clusters"][SEEDED]["last_run"], "2026-10-08T18:00:00Z")
         self.assertEqual(ledger["clusters"][SEEDED]["partial_read"], "2026-10-15T18:00:00Z")
@@ -1671,8 +1693,8 @@ class LedgerAndGuardsTest(unittest.TestCase):
         held = ur.acquire_lock(lock_path)
         self.assertIsNotNone(held)
         try:
-            # A fake clock advanced by each sleep: the budget is ten minutes in fifteen-second polls
-            # (the SOP's 1500-second background budget holds the wait and the run), then None.
+            # A fake clock advanced by each sleep: the budget is two minutes in fifteen-second polls
+            # (the SOP runs the collector in the foreground under a 600-second budget), then None.
             now = [0.0]
             slept = []
 
@@ -1681,7 +1703,7 @@ class LedgerAndGuardsTest(unittest.TestCase):
                 now[0] += seconds
 
             self.assertIsNone(ur.acquire_lock(lock_path, sleep=sleep, clock=lambda: now[0]))
-            self.assertEqual((sum(slept), len(slept), ur.LOCK_WAIT, ur.LOCK_POLL_INTERVAL), (600.0, 40, timedelta(minutes=10), timedelta(seconds=15)))
+            self.assertEqual((sum(slept), len(slept), ur.LOCK_WAIT, ur.LOCK_POLL_INTERVAL), (120.0, 8, timedelta(minutes=2), timedelta(seconds=15)))
             # Released during the wait: the lock is taken and the run proceeds.
             released = []
 
@@ -2227,16 +2249,33 @@ class LedgerAndGuardsTest(unittest.TestCase):
         self.assertIn("| DONE; " + ur.ALREADY_REVIEWED_FORMAT.format(route=ur.ROUTE_AFTER_UPGRADE, at="2026-10-15T18:00:00Z") + " |", ur.render_report(full))
         self.assertEqual(ur.load_json(self.home / ur.LEDGER_FILENAME, {})["clusters"][SEEDED]["last_run"], "2026-10-18T18:00:00Z")
 
+    def test_after_upgrade_without_a_full_run_says_no_baseline_and_writes_nothing(self):
+        # No full run has recorded the fleet: the route has nothing to diff against. One line, exit
+        # 0, nothing read, nothing written.
+        result, fleet = self.collect(full=False, after_upgrade=True)
+        self.assertEqual((result["quiet"], result["no_baseline"], result["report"]), (True, True, ur.NO_BASELINE_TEXT + "\n"))
+        self.assertEqual(fleet.calls, [])
+        self.assertEqual(sorted(p.name for p in self.home.iterdir()), [])
+        with mock.patch.object(ur, "default_run", FakeFleet()), mock.patch.object(ur, "now_utc", lambda: NOW):
+            with redirect_stdout(io.StringIO()) as out, redirect_stderr(io.StringIO()):
+                rc = ur.main(["--after-upgrade", "--project", PROJECT])
+        self.assertEqual((rc, out.getvalue()), (0, ur.NO_BASELINE_TEXT + "\n"))
+        self.assertEqual(sorted(p.name for p in self.home.iterdir()), [ur.LOCK_FILENAME])
+
     def test_after_upgrade_wake_outside_the_fleet_reviews_an_operation_once(self):
-        # No --full has recorded the project (the bootstrap window): the first wake reviews the
-        # settled operations and records them for the cluster; the second wake is quiet.
-        first, _ = self.collect(full=False, after_upgrade=True)
-        self.assertEqual(sorted(r["cluster"] for r in first["reviews"]), [SEEDED])
-        self.assertEqual(first["outside_fleet"], [SEEDED])
+        # The fleet records one project; a wake over another (a project that joined between two
+        # Sunday runs) reviews the settled operations once, records them for the cluster, and the
+        # next wake is quiet.
+        self.collect()
+        twin = cluster_doc("seeded-a")
+        twin["project"] = "other-project"
+        other_key = f"other-project/{LOCATION}/seeded-a"
+        first, _ = self.collect(FakeFleet(clusters=[twin]), now=NOW + timedelta(hours=1), full=False, after_upgrade=True, project=["other-project"])
+        self.assertEqual(([r["cluster"] for r in first["reviews"]], first["outside_fleet"]), ([other_key], [other_key]))
         ledger = ur.load_json(self.home / ur.LEDGER_FILENAME, {})
-        self.assertEqual((ledger[ur.LEDGER_PROJECTS_KEY], set(ledger["clusters"][SEEDED])), ([], {ur.LEDGER_OPERATIONS_KEY}))
-        self.assertEqual([o["route"] for o in ledger["clusters"][SEEDED][ur.LEDGER_OPERATIONS_KEY]], [ur.ROUTE_AFTER_UPGRADE] * 4)
-        second, fleet = self.collect(now=NOW + timedelta(minutes=15), full=False, after_upgrade=True)
+        self.assertEqual((ledger[ur.LEDGER_PROJECTS_KEY], set(ledger["clusters"][other_key])), ([PROJECT], {ur.LEDGER_OPERATIONS_KEY}))
+        self.assertEqual([o["route"] for o in ledger["clusters"][other_key][ur.LEDGER_OPERATIONS_KEY]], [ur.ROUTE_AFTER_UPGRADE] * 4)
+        second, fleet = self.collect(FakeFleet(clusters=[twin]), now=NOW + timedelta(hours=2), full=False, after_upgrade=True, project=["other-project"])
         self.assertTrue(second["quiet"])
         self.assertFalse(any("get-credentials" in " ".join(c) for c in fleet.calls))
 
@@ -2327,6 +2366,7 @@ class LedgerAndGuardsTest(unittest.TestCase):
     def test_entry_3_guard_survives_a_recheck_while_the_workload_stays_unavailable(self):
         workloads = copy.deepcopy(READS["seeded-a"]["workloads"])
         inventory = next(w for w in workloads if w["metadata"]["name"] == "inventory-api")
+        inventory["spec"]["replicas"] = 2
         for cond in inventory["status"]["conditions"]:
             if cond["type"] == "Available":
                 cond["lastTransitionTime"] = "2026-10-07T04:08:00Z"
@@ -2357,6 +2397,7 @@ class LedgerAndGuardsTest(unittest.TestCase):
     def test_entry_3_guard_survives_a_full_review_while_the_workload_stays_unavailable(self):
         workloads = copy.deepcopy(READS["seeded-a"]["workloads"])
         inventory = next(w for w in workloads if w["metadata"]["name"] == "inventory-api")
+        inventory["spec"]["replicas"] = 2
         for cond in inventory["status"]["conditions"]:
             if cond["type"] == "Available":
                 cond["lastTransitionTime"] = "2026-10-07T04:08:00Z"
@@ -2892,7 +2933,7 @@ class LedgerAndGuardsTest(unittest.TestCase):
         result, _ = self.collect(project=None, full=False)
         report = ur.render_report(result)
         self.assertIn(ur.OUTSIDE_FLEET_GUARD_TEXT, report)
-        self.assertNotIn(ur.UNCLASSIFIED_GUARD_TEXT, report.split(f"### 2 — {SEEDED}")[1].split("### ")[0])
+        self.assertNotIn(ur.NO_GUARD_TEXT, report.split(f"### 2 — {SEEDED}")[1].split("### ")[0])
 
     def test_store_defaults_live_under_the_store_home(self):
         result, _ = self.collect()
@@ -3021,7 +3062,7 @@ class ReportTest(unittest.TestCase):
         seeded_block = info.split(f"### {SEEDED}")[1]
         self.assertIn(f"{ur.PART_NEXT_UPGRADE} channel REGULAR; target 1.35.8-gke.1225000; cluster at 1.35.8-gke.1380001, at or ahead of the target. Window: daily at 03:00 UTC for 4h; next opens 2026-10-09T03:00:00Z. Exclusions: none.", seeded_block)
         self.assertIn("| `seeded-shapes/Deployment/legacy-registry-pull` | 20. Images on a retired registry | high | image k8s.gcr.io/pause:3.9 |", seeded_block)
-        self.assertIn(f"{ur.PART_BASELINE} control plane 1.35.8-gke.1380001; pools default-pool 1.35.8-gke.1380001, idle-batch-pool 1.35.8-gke.1380001, pinned-inference-pool 1.35.8-gke.1380001; 23 pods, 1 budgets, 9 shapes. Symptom baseline recorded: 4 symptom(s), 4 first seen. first run: graded by onset only, no previous symptom set. Guards written: 12.", seeded_block)
+        self.assertIn(f"{ur.PART_BASELINE} control plane 1.35.8-gke.1380001; pools default-pool 1.35.8-gke.1380001, idle-batch-pool 1.35.8-gke.1380001, pinned-inference-pool 1.35.8-gke.1380001; 23 pods, 1 budgets, 9 shapes. Symptom baseline recorded: 4 symptom(s), 4 first seen. first run: graded by onset only, no previous symptom set. Guards written: 13.", seeded_block)
         gemma_block = info.split(f"### {GEMMA}")[1].split("### ")[0]
         self.assertIn("behind the target. Window: DAILY at", gemma_block)
         self.assertIn("Exclusions: hold-gpu-minor (NO_MINOR_UPGRADES) until 2026-10-21T00:00:00Z [active].", gemma_block)
@@ -3030,7 +3071,8 @@ class ReportTest(unittest.TestCase):
         # incident says what it lacks instead.
         self.assertNotIn(ur.NONE_LINE, report)
         self.assertIn(ur.UNCLASSIFIED_MITIGATION_TEXT, warnings)
-        self.assertIn(ur.UNCLASSIFIED_GUARD_TEXT, warnings)
+        self.assertIn(f"- guard `{SEEDED}#failure#unclassified#seeded-stall/Deployment/inventory-api` failure entry unclassified (medium), first seen 2026-10-08T18:00:00Z", warnings)
+        self.assertNotIn(ur.NO_GUARD_TEXT, warnings)
 
     def test_info_lists_clean_unchanged_and_failed(self):
         reads_clean = {**READS["seeded-a"], "pods": [p for p in READS["seeded-a"]["pods"] if p["status"]["phase"] == "Running" and "payments" not in p["metadata"]["name"]], "events": [], "pdbs": []}
@@ -3155,8 +3197,9 @@ class ChecksRunTest(unittest.TestCase):
         pods = by_check[ur.CHECK_BROKE_WORKLOAD]
         self.assertEqual(pods, f"KUBECONFIG={self.tmp.name}/.kubeconfigs/kubeconfig_{PROJECT}_seeded-a_{LOCATION}.yaml kubectl get pods -A -o json")
         self.assertTrue(by_check[ur.CHECK_NODE_BROKEN].endswith(" kubectl get nodes -o json"))
-        for check in (ur.CHECK_SYMPTOM_TENTATIVE, ur.CHECK_SYMPTOM_UNCLASSIFIED, ur.CHECK_SYMPTOM_PREDATES, ur.CHECK_FAILURE_PERSISTS):
+        for check in (ur.CHECK_SYMPTOM_TENTATIVE, ur.CHECK_SYMPTOM_UNCLASSIFIED, ur.CHECK_SYMPTOM_PREDATES):
             self.assertEqual(by_check[check], pods)
+        self.assertEqual([check for check, _ in ur.CHECK_READS], [ur.CHECK_OPERATION_FAILED, ur.CHECK_BROKE_WORKLOAD, ur.CHECK_NODE_BROKEN, ur.CHECK_SYMPTOM_TENTATIVE, ur.CHECK_SYMPTOM_UNCLASSIFIED, ur.CHECK_SYMPTOM_PREDATES])
 
     def test_a_failed_read_drops_the_checks_it_backs(self):
         result, _ = self.collect(FakeFleet(kubectl_fail={("seeded-a", "pods")}))
@@ -3179,7 +3222,7 @@ class ChecksRunTest(unittest.TestCase):
             self.assertEqual(list(by_check), [check for check, _ in ur.CHECK_READS])
             self.assertTrue(by_check[ur.CHECK_OPERATION_FAILED].startswith("gcloud container operations list"))
             # A full run refreshes every fleet cluster's pods, so the checks that read pods name that read.
-            self.assertIn(" kubectl get pods -A -o json", by_check[ur.CHECK_FAILURE_PERSISTS])
+            self.assertIn(" kubectl get pods -A -o json", by_check[ur.CHECK_SYMPTOM_TENTATIVE])
             self.assertIn(" kubectl get nodes -o json", by_check[ur.CHECK_NODE_BROKEN])
 
     def test_a_scoped_unchanged_cluster_without_guards_is_backed_by_the_listing_alone(self):
@@ -3262,10 +3305,7 @@ class ManifestTest(unittest.TestCase):
         clusters, skipped, findings = [], [], []
         for entry in manifest["clusters"]:
             if entry["outcome"] == ur.MANIFEST_OUTCOME_COLLECTED:
-                cluster = {"name": entry["name"], "checks_run": [{"check": c["check"], "command": c["command"]} for c in entry["commands"]]}
-                if entry.get("checks_not_applicable"):
-                    cluster["checks_not_applicable"] = entry["checks_not_applicable"]
-                clusters.append(cluster)
+                clusters.append({"name": entry["name"], "checks_run": [{"check": c["check"], "command": c["command"]} for c in entry["commands"]]})
                 findings.extend({"check": c["check"], "cluster": c["cluster"], "namespace": c["namespace"], "object": c["object"]} for c in entry["candidates"])
             elif entry["outcome"] != ur.MANIFEST_OUTCOME_OUT_OF_SCOPE:
                 skipped.append({"cluster": entry["name"], "reason": entry["error"]})
@@ -3331,7 +3371,7 @@ class ManifestTest(unittest.TestCase):
         seeded = next(c for c in manifest["clusters"] if c["name"] == SEEDED)
         self.assertEqual(seeded["outcome"], ur.MANIFEST_OUTCOME_COLLECTED)
         self.assertEqual([c["check"] for c in seeded["commands"]], [ur.CHECK_OPERATION_FAILED, ur.CHECK_NODE_BROKEN])
-        self.assertEqual({c["check"] for c in seeded["checks_unevaluated"]}, {ur.CHECK_BROKE_WORKLOAD, ur.CHECK_SYMPTOM_TENTATIVE, ur.CHECK_SYMPTOM_UNCLASSIFIED, ur.CHECK_SYMPTOM_PREDATES, ur.CHECK_FAILURE_PERSISTS})
+        self.assertEqual({c["check"] for c in seeded["checks_unevaluated"]}, {ur.CHECK_BROKE_WORKLOAD, ur.CHECK_SYMPTOM_TENTATIVE, ur.CHECK_SYMPTOM_UNCLASSIFIED, ur.CHECK_SYMPTOM_PREDATES})
         self.assertTrue(seeded["limitations"].startswith("reads that failed: pods:"))
         self.assertTrue(manifest["partial"])
         document = self.document_from(manifest)
@@ -3340,7 +3380,7 @@ class ManifestTest(unittest.TestCase):
                 cluster["limitations"] = seeded["limitations"]
         self.audit_report.cross_check_manifest(document, manifest)
 
-    def test_failed_listing_is_gate_failed_and_an_upgrading_cluster_is_collected_with_nothing_applicable(self):
+    def test_failed_listing_and_upgrading_clusters_are_gate_failed(self):
         self.collect(project=[PROJECT, "other-project"])
         ledger = ur.load_json(self.home / ur.LEDGER_FILENAME, {})
         other = "other-project/us-central1-a/elsewhere"
@@ -3354,46 +3394,82 @@ class ManifestTest(unittest.TestCase):
         by_name = {c["name"]: c for c in manifest["clusters"]}
         self.assertEqual(by_name[other]["outcome"], ur.MANIFEST_OUTCOME_GATE_FAILED)
         self.assertIn("listing failed", by_name[other]["error"])
-        # Mid-window: collected, every check not applicable, its held failure guards re-emitted as
-        # candidates (one per object) so the harness keeps their findings open.
+        # Mid-window the run read nothing on it: a skipped target with the operation in flight as
+        # its error, no candidate (nothing was observed), so `finish` holds the stream's findings on
+        # it rather than resolving them; that costs a partial run.
         seeded = by_name[SEEDED]
-        self.assertEqual((seeded["outcome"], seeded["commands"]), (ur.MANIFEST_OUTCOME_COLLECTED, []))
-        self.assertEqual(seeded["checks_not_applicable"], [{"check": check, "reason": ur.UPGRADING_NOT_APPLICABLE_REASON} for check, _ in ur.CHECK_READS])
-        self.assertIn("upgrading now", seeded["facts"]["held"])
-        self.assertEqual({(c["check"], c["namespace"], c["object"], c["entries"], c["severity"]) for c in seeded["candidates"]}, {
-            (ur.CHECK_FAILURE_PERSISTS, "seeded-capacity", "Deployment/inference-server", "2", ur.MANIFEST_SEVERITY_MINOR),
-            (ur.CHECK_FAILURE_PERSISTS, "seeded-capacity", "PodDisruptionBudget/inference-server", "1", ur.MANIFEST_SEVERITY_MINOR),
-            (ur.CHECK_FAILURE_PERSISTS, "seeded-debug", "Deployment/payments-api", "14", ur.MANIFEST_SEVERITY_MINOR),
-        })
-        self.assertEqual({h["object"] for h in manifest["still_flagged"] if h["cluster"] == SEEDED}, {"Deployment/inference-server", "PodDisruptionBudget/inference-server", "Deployment/payments-api"})
-        self.assertTrue(manifest["partial"])  # the listing that failed, not the cluster mid-window
-        self.audit_report.cross_check_manifest(self.document_from(manifest), manifest)
-        # One cluster mid-window alone leaves the Sunday run whole.
+        self.assertEqual(seeded["outcome"], ur.MANIFEST_OUTCOME_GATE_FAILED)
+        self.assertIn("upgrading now", seeded["error"])
+        self.assertNotIn("candidates", seeded)
+        self.assertNotIn("checks_not_applicable", seeded)
+        self.assertEqual([h for h in manifest["still_flagged"] if h["cluster"] == SEEDED], [])
+        self.assertTrue(manifest["partial"])
+        document = self.document_from(manifest)
+        self.assertIn(SEEDED, {s["cluster"] for s in document["scope"]["skipped"]})
+        self.audit_report.cross_check_manifest(document, manifest)
+        # One cluster mid-window alone still makes the run partial: a cluster nobody read.
         alone, _ = self.collect(FakeFleet(operations=ops), now=datetime(2026, 10, 16, 18, 0, tzinfo=timezone.utc))
         manifest = json.loads(Path(alone["manifest_path"]).read_text())
-        self.assertFalse(manifest["partial"])
-        self.assertEqual([(c["name"], c["outcome"]) for c in manifest["clusters"]], [(GEMMA, ur.MANIFEST_OUTCOME_COLLECTED), (SEEDED, ur.MANIFEST_OUTCOME_COLLECTED)])
-        self.assertEqual(len(next(c for c in manifest["clusters"] if c["name"] == SEEDED)["candidates"]), 3)
+        self.assertTrue(manifest["partial"])
+        self.assertEqual([(c["name"], c["outcome"]) for c in manifest["clusters"]], [(GEMMA, ur.MANIFEST_OUTCOME_COLLECTED), (SEEDED, ur.MANIFEST_OUTCOME_GATE_FAILED)])
         self.audit_report.cross_check_manifest(self.document_from(manifest), manifest)
 
     def test_held_guards_are_still_flagged_candidates(self):
         reads = {**READS["seeded-a"], "events": READS["seeded-a"]["events"] + [event("FailedAttachVolume", "AttachVolume.Attach failed for volume pv-1", name="inference-server-778b78fdb8-zzzzz", namespace="seeded-capacity")]}
         with mock.patch.dict(READS, {"seeded-a": reads}):
             self.collect()
+        # The first run filed inference-server as an Error (`upgrade-broke-workload`); its guards,
+        # the event-only attach one among them, carry that check. The second run re-observes the
+        # pod guard and cannot re-check the event one: one candidate under the original check, a
+        # Warning, with each guard's persistence, so the harness holds the finding by its own id.
         second, _ = self.collect(now=datetime(2026, 10, 15, 18, 0, tzinfo=timezone.utc))
         manifest = json.loads(Path(second["manifest_path"]).read_text())
-        [held] = manifest["still_flagged"]
-        self.assertEqual((held["check"], held["cluster"], held["namespace"], held["object"]), (ur.CHECK_FAILURE_PERSISTS, SEEDED, "seeded-capacity", "Deployment/inference-server"))
+        [held] = [h for h in manifest["still_flagged"] if h["object"] == "Deployment/inference-server"]
+        self.assertEqual((held["check"], held["cluster"], held["namespace"], held["guards"]), (ur.CHECK_BROKE_WORKLOAD, SEEDED, "seeded-capacity", [ur.guard_id(SEEDED, 2, INFERENCE), ur.guard_id(SEEDED, 19, INFERENCE)]))
         seeded = next(c for c in manifest["clusters"] if c["name"] == SEEDED)
         self.assertEqual(seeded["outcome"], ur.MANIFEST_OUTCOME_COLLECTED)
-        [candidate] = [c for c in seeded["candidates"] if c["check"] == ur.CHECK_FAILURE_PERSISTS]
-        self.assertEqual(candidate["severity"], ur.MANIFEST_SEVERITY_MINOR)
-        self.assertIn("guard ", candidate["excerpt"])
-        # `finish` spells the set the way the ledger spells ids: derived, then clipped.
+        [candidate] = [c for c in seeded["candidates"] if c["object"] == "Deployment/inference-server"]
+        self.assertEqual((candidate["check"], candidate["severity"], candidate["entries"]), (ur.CHECK_BROKE_WORKLOAD, ur.MANIFEST_SEVERITY_MINOR, "2, 19"))
+        self.assertEqual(candidate["persistence"], ["persists since 2026-10-08T18:00:00Z, 2 review(s)", "persists since 2026-10-08T18:00:00Z, 1 review(s)"])
+        self.assertEqual(candidate["not_recheckable"], [ur.guard_id(SEEDED, 19, INFERENCE)])
+        self.assertTrue(candidate["excerpt"].startswith(f"guard {ur.guard_id(SEEDED, 2, INFERENCE)} persists since 2026-10-08T18:00:00Z, 2 review(s): "))
+        self.assertTrue(candidate["command"].endswith(" kubectl get pods -A -o json"))
+        # `finish` spells the set the way the ledger spells ids: derived, then clipped; the id is the
+        # first run's finding id, so the finding is held, not resolved and refiled.
         held_id = self.audit_report.published_id(held)
         self.assertIn(held_id, self.audit_report.collector_flagged_ids(manifest))
         self.assertIn(held_id, self.audit_report.still_flagged_ids(manifest, {"findings": []}))
+        self.assertEqual(held_id, self.audit_report.published_id({"check": ur.CHECK_BROKE_WORKLOAD, "cluster": SEEDED, "namespace": "seeded-capacity", "object": "Deployment/inference-server"}))
         self.audit_report.cross_check_manifest(self.document_from(manifest), manifest)
+
+    def test_persisting_guard_keeps_its_check_id_and_a_cleared_guard_emits_nothing(self):
+        # payments-api's entry-14 guard (pod-sourced, a Warning) persists through two re-checks under
+        # `upgrade-symptom-tentative` with its review count; once the pods are healthy the re-check
+        # clears it and the manifest emits nothing for it, so the harness resolves the finding.
+        first, _ = self.collect()
+        first_manifest = json.loads(Path(first["manifest_path"]).read_text())
+        [filed] = [c for c in next(e for e in first_manifest["clusters"] if e["name"] == SEEDED)["candidates"] if c["object"] == "Deployment/payments-api"]
+        filed_id = self.audit_report.published_id(filed)
+        self.assertEqual(filed["check"], ur.CHECK_SYMPTOM_TENTATIVE)
+        guard = ur.guard_id(SEEDED, 14, PAYMENTS)
+        self.assertEqual([(g["check"], g["reviews"]) for g in first["guards"] if g["id"] == guard], [(ur.CHECK_SYMPTOM_TENTATIVE, 1)])
+        for week, reviews in ((15, 2), (22, 3)):
+            run, _ = self.collect(now=datetime(2026, 10, week, 18, 0, tzinfo=timezone.utc))
+            manifest = json.loads(Path(run["manifest_path"]).read_text())
+            [candidate] = [c for c in next(e for e in manifest["clusters"] if e["name"] == SEEDED)["candidates"] if c["object"] == "Deployment/payments-api"]
+            self.assertEqual((candidate["check"], candidate["severity"], candidate["persistence"]), (ur.CHECK_SYMPTOM_TENTATIVE, ur.MANIFEST_SEVERITY_MINOR, [f"persists since 2026-10-08T18:00:00Z, {reviews} review(s)"]))
+            self.assertEqual(self.audit_report.published_id(candidate), filed_id)
+            self.assertIn(filed_id, self.audit_report.still_flagged_ids(manifest, {"findings": []}))
+            self.assertEqual([(g["check"], g["reviews"]) for g in run["guards"] if g["id"] == guard], [(ur.CHECK_SYMPTOM_TENTATIVE, reviews)])
+            self.audit_report.cross_check_manifest(self.document_from(manifest), manifest)
+        healthy = [p for p in READS["seeded-a"]["pods"] if "payments-api" not in p["metadata"]["name"]]
+        with mock.patch.dict(READS, {"seeded-a": {**READS["seeded-a"], "pods": healthy}}):
+            cleared, _ = self.collect(now=datetime(2026, 10, 29, 18, 0, tzinfo=timezone.utc))
+        self.assertNotIn(guard, {g["id"] for g in cleared["guards"]})
+        manifest = json.loads(Path(cleared["manifest_path"]).read_text())
+        self.assertEqual([c for c in next(e for e in manifest["clusters"] if e["name"] == SEEDED)["candidates"] if c["object"] == "Deployment/payments-api"], [])
+        self.assertNotIn(filed_id, self.audit_report.still_flagged_ids(manifest, {"findings": []}))
+        self.assertNotIn(filed_id, self.audit_report.collector_flagged_ids(manifest))
 
     def test_two_stale_guards_on_one_object_are_one_candidate(self):
         # Two event-only guards on inference-server (a volume attach, a webhook rejection) beside its
@@ -3414,12 +3490,13 @@ class ManifestTest(unittest.TestCase):
         self.assertIn(f"guard `{INFERENCE}` entry 7, first seen 2026-10-08T18:00:00Z, still live; guard `{INFERENCE}` entry 19, first seen 2026-10-08T18:00:00Z, still live.", report)
         manifest = json.loads(Path(second["manifest_path"]).read_text())
         seeded = next(c for c in manifest["clusters"] if c["name"] == SEEDED)
-        [candidate] = [c for c in seeded["candidates"] if c["check"] == ur.CHECK_FAILURE_PERSISTS]
-        self.assertEqual((candidate["namespace"], candidate["object"], candidate["entries"]), ("seeded-capacity", "Deployment/inference-server", "7, 19"))
-        self.assertIn(ur.guard_id(SEEDED, 7, INFERENCE), candidate["excerpt"])
-        self.assertIn(ur.guard_id(SEEDED, 19, INFERENCE), candidate["excerpt"])
+        # All three guards were filed with the object's Error (`upgrade-broke-workload`): one
+        # candidate under that check, the re-observed pod guard and the two held event guards in it.
+        [candidate] = [c for c in seeded["candidates"] if c["object"] == "Deployment/inference-server"]
+        self.assertEqual((candidate["check"], candidate["namespace"], candidate["entries"], candidate["severity"]), (ur.CHECK_BROKE_WORKLOAD, "seeded-capacity", "2, 7, 19", ur.MANIFEST_SEVERITY_MINOR))
+        self.assertEqual((len(candidate["persistence"]), candidate["not_recheckable"]), (3, [ur.guard_id(SEEDED, 7, INFERENCE), ur.guard_id(SEEDED, 19, INFERENCE)]))
         [held] = [h for h in manifest["still_flagged"] if h["object"] == "Deployment/inference-server"]
-        self.assertEqual(held["guards"], [ur.guard_id(SEEDED, 7, INFERENCE), ur.guard_id(SEEDED, 19, INFERENCE)])
+        self.assertEqual((held["check"], held["guards"]), (ur.CHECK_BROKE_WORKLOAD, [ur.guard_id(SEEDED, 2, INFERENCE), ur.guard_id(SEEDED, 7, INFERENCE), ur.guard_id(SEEDED, 19, INFERENCE)]))
         document = self.document_from(manifest)
         ids = [self.audit_report.derive_finding_id(f) for f in document["findings"]]
         self.assertEqual(len(ids), len(set(ids)))

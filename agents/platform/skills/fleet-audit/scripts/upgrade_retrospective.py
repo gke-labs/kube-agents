@@ -173,9 +173,11 @@ REPORT_IS_LINK_TEXT = "--report must not be named {name}: that is the link a ful
 LOCK_HELD_TEXT = "another retrospective run holds {path} since {since}; waited {minutes} min for it; nothing written"
 # Three triggers write the same files: a run that finds the lock held waits
 # this long for it, polling, and only then prints the line above and exits.
-# Ten minutes: the SOP runs the collector as a background terminal command
-# with a 1500-second budget, and the wait and the run both fit inside it.
-LOCK_WAIT = timedelta(minutes=10)
+# Two minutes: the SOP runs the collector in the foreground under the
+# terminal tool's 600-second budget, and the wait must fit under it with the
+# run; a scoped run of a few clusters, the collision that matters, finishes
+# inside it.
+LOCK_WAIT = timedelta(minutes=2)
 LOCK_POLL_INTERVAL = timedelta(seconds=15)
 STATE_UNREADABLE_DRY_RUN_TEXT = "{path} {why}; a dry run moves nothing and stops here. Nothing written."
 STATE_NOT_MOVED_TEXT = "{path} {why} and could not be moved aside ({error}); it is unchanged in place. Fix or move it by hand, then rerun. Nothing written."
@@ -296,6 +298,9 @@ CATEGORY_PENDING, CATEGORY_NOT_READY, CATEGORY_NODE, CATEGORY_EVENT, CATEGORY_PD
 CATEGORY_UNAVAILABLE, CATEGORY_VERSION_SKEW = "unavailable", "version-skew"
 UNAVAILABLE_REASON = "Available=False"
 SPREAD_KINDS = ("Deployment", "StatefulSet")
+# The catalogue's floor for entry 3: a workload with more than one replica.
+# A single replica displaced by a drain is entry 2 or 1, never 3.
+SPREAD_MIN_REPLICAS = 2
 ZONE_LABEL = "topology.kubernetes.io/zone"
 SPREAD_POOL_DETAIL = "every replica sat on the drained pool"
 SPREAD_ZONE_DETAIL = "every replica sat in the drained zone, not all on the drained pool"
@@ -464,7 +469,6 @@ CHECK_NODE_BROKEN = "node-broken-after-upgrade"
 CHECK_SYMPTOM_TENTATIVE = "upgrade-symptom-tentative"
 CHECK_SYMPTOM_UNCLASSIFIED = "upgrade-symptom-unclassified"
 CHECK_SYMPTOM_PREDATES = "symptom-predates-upgrade"
-CHECK_FAILURE_PERSISTS = "upgrade-failure-persists"
 OPERATIONS_READ = "operations"
 CHECK_READS = (
     (CHECK_OPERATION_FAILED, OPERATIONS_READ),
@@ -473,7 +477,6 @@ CHECK_READS = (
     (CHECK_SYMPTOM_TENTATIVE, "pods"),
     (CHECK_SYMPTOM_UNCLASSIFIED, "pods"),
     (CHECK_SYMPTOM_PREDATES, "pods"),
-    (CHECK_FAILURE_PERSISTS, "pods"),
 )
 # A kubectl read ran with KUBECONFIG in its environment; the recorded command
 # spells that out so it runs as published.
@@ -491,10 +494,12 @@ MANIFEST_OUTCOME_COLLECTED = "collected"
 MANIFEST_OUTCOME_UNREACHABLE = "unreachable"
 MANIFEST_OUTCOME_GATE_FAILED = "gate-failed"
 MANIFEST_OUTCOME_OUT_OF_SCOPE = "out-of-scope"
-# A cluster upgrading now is collected with every check not applicable, so one
-# cluster mid-window does not make the Sunday run partial; its held guards are
-# re-emitted as candidates.
-UPGRADING_NOT_APPLICABLE_REASON = "upgrading now; reviewed after the operation ends"
+# The fleet-audit harness holds a finding only while a candidate carries the
+# same (check, cluster, namespace, object): a guard records the check its
+# finding was filed under, and a held guard the run still observes, or cannot
+# re-observe, emits a candidate under that check with its persistence.
+HELD_PERSISTS_FORMAT = "persists since {since}, {reviews} review(s)"
+NOT_RECHECKABLE_SUFFIX = ", not re-checkable"
 # The SOP files an Error at `major` and a Warning at `minor`, never `critical`.
 MANIFEST_SEVERITY_MAJOR, MANIFEST_SEVERITY_MINOR = "major", "minor"
 # A failed operation's candidate names the operation.
@@ -866,7 +871,7 @@ NO_SHAPE_TEXT = "no catalogue shape found; checked: "
 # What an incident says when it has no catalogue entry to cite. `_none_` is
 # reserved for an empty Errors or Warnings section.
 UNCLASSIFIED_MITIGATION_TEXT = "no catalogue entry matched this symptom; it is reported for a reader to classify, and the entries' rows above do not apply."
-UNCLASSIFIED_GUARD_TEXT = "no guard: an unclassified symptom writes none until it has an entry."
+NO_GUARD_TEXT = "no guard written."
 OPERATION_GUARD_TEXT = "no guard: an operation carries none; its cluster's risks are in the Info block."
 INFO_UNCHANGED = "Unchanged clusters:"
 INFO_REMOVED = "Removed clusters:"
@@ -898,6 +903,10 @@ AFTER_UPGRADE_SCOPE_TEXT = "--after-upgrade reviews the clusters with an upgrade
 AFTER_UPGRADE_REASON_FORMAT = "{count} upgrade operation(s) not yet reviewed, ended by {floor}"
 SETTLING_REASON_FORMAT = "{count} operation(s) ended under {minutes} min ago wait for the next wake"
 AFTER_UPGRADE_QUIET_LOG = "after-upgrade: no settled operation awaits review; nothing written"
+# The route diffs against a baseline a full run established; without one it
+# says so and writes nothing, so an install that predates the job gets its
+# first report from a full run, never from a sweep over a fortnight.
+NO_BASELINE_TEXT = "no baseline yet; the first full run establishes it"
 SETTLING_LINE = "{cluster}: {operation} {target} ended {end}, under {minutes} min ago; reviewed on the next after-upgrade wake"
 # The ledger lists the operations each cluster's reviews covered, with the
 # route that reviewed them; a run that meets one again reports it as such.
@@ -2504,22 +2513,24 @@ def mark_since(symptoms: list[dict], baseline: list[str] | None, first_operation
         symptom["predates_upgrade"] = recorded or before_operation
 
 
-def _unavailable_workloads(workloads: list[dict]) -> dict[str, tuple[datetime | None, str]]:
+def _unavailable_workloads(workloads: list[dict]) -> dict[str, tuple[datetime | None, str, int]]:
     """Deployments whose `Available` condition is False, with the transition
     and message, and StatefulSets with no ready replica (no condition and no
-    date: the pods date those), by object."""
-    out: dict[str, tuple[datetime | None, str]] = {}
+    date: the pods date those), by object, each with its replica count."""
+    out: dict[str, tuple[datetime | None, str, int]] = {}
     for workload in workloads:
         kind, meta, status = workload.get("kind") or "", workload.get("metadata") or {}, workload.get("status") or {}
         if kind not in SPREAD_KINDS:
             continue
         obj = _object_ref(meta.get("namespace", ""), kind, meta.get("name", ""))
+        replicas = (workload.get("spec") or {}).get("replicas")
+        replicas = int(replicas if replicas is not None else status.get("replicas") or 0)
         if kind == "Deployment":
             cond = _condition(workload, "Available")
             if cond.get("status") == "False":
-                out[obj] = (parse_ts(cond.get("lastTransitionTime")), (cond.get("message") or cond.get("reason") or "")[:MESSAGE_EXCERPT_CHARS])
+                out[obj] = (parse_ts(cond.get("lastTransitionTime")), (cond.get("message") or cond.get("reason") or "")[:MESSAGE_EXCERPT_CHARS], replicas)
         elif (status.get("replicas") or 0) > 0 and not (status.get("readyReplicas") or 0):
-            out[obj] = (None, f"readyReplicas 0 of {status.get('replicas')}")
+            out[obj] = (None, f"readyReplicas 0 of {status.get('replicas')}", replicas)
     return out
 
 
@@ -2552,9 +2563,11 @@ def unavailable_symptoms(workloads: list[dict], pods: list[dict], nodes: list[di
         kind, name = resolver.resolve(meta.get("namespace", ""), "Pod", meta.get("name", ""))
         owned.setdefault(_object_ref(meta.get("namespace", ""), kind, name), []).append(pod)
     rows = []
-    for obj, (onset, message) in _unavailable_workloads(workloads).items():
+    for obj, (onset, message, replicas) in _unavailable_workloads(workloads).items():
         pods_of = owned.get(obj) or []
-        if not pods_of:
+        if not pods_of or max(replicas, len(pods_of)) < SPREAD_MIN_REPLICAS:
+            # The catalogue's floor: one replica lost to a drain is entry 2
+            # (its Pending replacement) or 1 (the budget), never 3.
             continue
         if onset is None:
             # A StatefulSet carries no date: the earliest pod the drain recreated.
@@ -2850,12 +2863,12 @@ def mitigation_lines(symptom: dict, classification: dict) -> dict:
     }
 
 
-def guard_id(cluster: str, entry: int, obj: str, kind: str = GUARD_KIND_FAILURE) -> str:
-    return f"{cluster}#{kind}#{entry}#{obj}"
+def guard_id(cluster: str, entry: int | None, obj: str, kind: str = GUARD_KIND_FAILURE) -> str:
+    return f"{cluster}#{kind}#{UNCLASSIFIED if entry is None else entry}#{obj}"
 
 
-def _guard(key: str, kind: str, entry: int, title: str, obj: str, confidence: str, evidence: str, seen_at: str, reads: tuple[str, ...]) -> dict:
-    return {
+def _guard(key: str, kind: str, entry: int | None, title: str, obj: str, confidence: str, evidence: str, seen_at: str, reads: tuple[str, ...], check: str | None = None) -> dict:
+    guard = {
         "id": guard_id(key, entry, obj, kind),
         "kind": kind,
         "reads": list(reads),
@@ -2867,17 +2880,62 @@ def _guard(key: str, kind: str, entry: int, title: str, obj: str, confidence: st
         "evidence": evidence,
         "first_seen": seen_at,
         "last_seen": seen_at,
+        "reviews": 1,
     }
+    if check:
+        guard["check"] = check
+    return guard
 
 
-def guards_for(key: str, symptoms: list[dict], seen_at: str) -> list[dict]:
+def _guard_check(guard: dict) -> str:
+    """The check a guard's finding was filed under; for a guard written
+    before checks were recorded, the nearest reading of its grade."""
+    if guard.get("check"):
+        return str(guard["check"])
+    if guard.get("entry") is None:
+        return CHECK_SYMPTOM_UNCLASSIFIED
+    return CHECK_BROKE_WORKLOAD if guard.get("confidence") == HIGH else CHECK_SYMPTOM_TENTATIVE
+
+
+def _guard_entry_text(guard: dict) -> str:
+    return UNCLASSIFIED if guard.get("entry") is None else str(guard["entry"])
+
+
+def _symptom_group_check(symptoms: list[dict], upgrade_context: bool) -> tuple[str, str, bool]:
+    """The check id, severity and predates flag an object's symptoms file
+    under: the one rule `triage` applies per incident and `guards_for`
+    records per guard, so a held guard's candidate keeps its finding's
+    identity. `upgrade_context` is whether the review saw an upgrade (the
+    status or an operation), without which "predates" means nothing."""
+    severity, predates = SEVERITY_WARNING, False
+    for symptom in symptoms:
+        symptom_predates = bool(symptom.get("predates_upgrade")) and upgrade_context
+        predates = predates or symptom_predates
+        if _symptom_severity(symptom) == SEVERITY_ERROR and not symptom_predates and not symptom.get("recreated_only"):
+            severity = SEVERITY_ERROR
+    if severity == SEVERITY_ERROR:
+        return (CHECK_NODE_BROKEN if any(s["category"] == CATEGORY_NODE for s in symptoms) else CHECK_BROKE_WORKLOAD), severity, predates
+    if predates:
+        return CHECK_SYMPTOM_PREDATES, severity, predates
+    if all(c["entry"] is None for s in symptoms for c in s["classifications"]):
+        return CHECK_SYMPTOM_UNCLASSIFIED, severity, predates
+    return CHECK_SYMPTOM_TENTATIVE, severity, predates
+
+
+def guards_for(key: str, symptoms: list[dict], seen_at: str, upgrade_context: bool = False) -> list[dict]:
+    """One `failure` guard per (entry, object), the unclassified symptom's
+    among them with `unclassified` in the entry slot: the guard is what makes
+    the next run re-check the cluster for it and re-emit its candidate while
+    it stands. Each records its source and the check its finding filed under."""
     out: dict[str, dict] = {}
+    by_object: dict[str, list[dict]] = {}
+    for symptom in symptoms:
+        by_object.setdefault(symptom["object"], []).append(symptom)
+    checks = {obj: _symptom_group_check(group, upgrade_context)[0] for obj, group in by_object.items()}
     for symptom in symptoms:
         for c in symptom["classifications"]:
-            if c["entry"] is None:
-                continue
             reads = FAILURE_GUARD_READS + RECHECK_SPREAD_READS if c["entry"] == ENTRY_SPREAD else FAILURE_GUARD_READS
-            guard = _guard(key, GUARD_KIND_FAILURE, c["entry"], c["title"], symptom["object"], c["confidence"], c["evidence"], seen_at, reads)
+            guard = _guard(key, GUARD_KIND_FAILURE, c["entry"], c["title"], symptom["object"], c["confidence"], c["evidence"], seen_at, reads, check=checks[symptom["object"]])
             guard["source"] = symptom["category"]
             existing = out.get(guard["id"])
             if existing is None:
@@ -2917,12 +2975,15 @@ def merge_guards(existing: dict, fresh: list[dict], reviewed: set[str], seen_at:
     for guard in fresh:
         old = by_id.get(guard["id"])
         if old:
-            old.update(last_seen=seen_at, evidence=guard["evidence"], confidence=guard["confidence"])
+            old.update(last_seen=seen_at, evidence=guard["evidence"], confidence=guard["confidence"], reviews=int(old.get("reviews") or 1) + 1)
             if guard.get("source"):
                 old["source"] = guard["source"]
+            if guard.get("check"):
+                # The check the finding was first filed with is its identity.
+                old.setdefault("check", guard["check"])
         else:
             merged.append(guard)
-    merged.sort(key=lambda g: (g["cluster"], g["entry"], g["object"]))
+    merged.sort(key=lambda g: (g["cluster"], g.get("entry") is None, g.get("entry") or 0, g["object"]))
     return {"version": GUARDS_VERSION, "updated_at": seen_at, "guards": merged}
 
 
@@ -3581,7 +3642,7 @@ def review_cluster(selection: Selection, ledger: dict, *, run: RunFn, seen_at: s
     shapes, managed_agents = collect_risks(cluster, {k: v for k, v in reads.items() if not any(e.startswith(k + ":") for e in errors)})
     review["shapes"] = shapes
     review["managed_agents"] = managed_agents
-    review["guards"] = guards_for(selection.key, symptoms, seen_at) + risk_guards_for(selection.key, shapes, seen_at)
+    review["guards"] = guards_for(selection.key, symptoms, seen_at, upgrade_context=selection.status == STATUS_UPGRADED or bool(ops)) + risk_guards_for(selection.key, shapes, seen_at)
     review["baseline"] = {
         "versions": versions_of(cluster),
         "pods": len(reads.get("pods") or []),
@@ -3672,17 +3733,15 @@ def triage(reviews: list[dict], unchanged: list[dict], failed_reads: list[str], 
                     "guards": [g for g in review["guards"] if g["object"] == symptom["object"]],
                 }
             incident["symptoms"].append(symptom)
-            # A symptom that predates the window's operations, or that the
-            # previous full run recorded, is reported but never as the
-            # upgrade's Error.
-            predates = bool(symptom.get("predates_upgrade")) and (upgraded or bool(review["what_happened"]["operations"]))
-            if predates:
-                incident["predates_upgrade"] = True
             if symptom.get("recreated_only"):
                 incident["recreated_only"] = True
-            if _symptom_severity(symptom) == SEVERITY_ERROR and not predates and not symptom.get("recreated_only"):
-                incident["severity"] = SEVERITY_ERROR
+        upgrade_context = upgraded or bool(review["what_happened"]["operations"])
         for incident in incidents.values():
+            # A symptom that predates the window's operations, or that the
+            # previous full run recorded, is reported but never as the
+            # upgrade's Error; the check and the severity come from the one
+            # rule the guards record too.
+            incident["check"], incident["severity"], incident["predates_upgrade"] = _symptom_group_check(incident["symptoms"], upgrade_context)
             incident["entries"] = _entries_label([c for s in incident["symptoms"] for c in s["classifications"]])
         for op in review["what_happened"]["operations"]:
             if _operation_failed(op):
@@ -3778,8 +3837,13 @@ def fold_held_guards(cluster: str, held: list[dict], not_recheckable: set[str] |
         incident["event_only"] = incident["event_only"] and guard["id"] in (not_recheckable or set())
     for incident in by_object.values():
         incident["guards"].sort(key=lambda g: (g.get("entry") or 0, g["id"]))
-        incident["entries"] = ", ".join(str(e) for e in sorted({g["entry"] for g in incident["guards"]}))
+        incident["entries"] = _guard_entries_label(incident["guards"])
+        incident["check"] = _guard_check(incident["guards"][0])
     return sorted(by_object.values(), key=_incident_key)
+
+
+def _guard_entries_label(guards: list[dict]) -> str:
+    return _entries_label([{"entry": g.get("entry")} for g in guards])
 
 
 def _operations_lines(wh: dict) -> list[str]:
@@ -3821,9 +3885,10 @@ def _incident_lines(incident: dict) -> list[str]:
         else:
             lines.append(f"{PART_WHAT_HAPPENED} cluster not reviewed this run; the guard below is from an earlier run.")
         for guard in incident["guards"]:
-            lines.append(f"{PART_WHAT_FAILED} entry {guard['entry']}. {guard['title']} ({guard['confidence']}) last seen {guard['last_seen']}: {_cell(guard['evidence'])}")
+            heading = f"entry {guard['entry']}. {guard['title']}" if guard.get("entry") is not None else UNCLASSIFIED
+            lines.append(f"{PART_WHAT_FAILED} {heading} ({guard['confidence']}) last seen {guard['last_seen']}: {_cell(guard['evidence'])}")
         lines.append(f"{PART_MITIGATE} the entry's row applies until the cluster is reviewed again.")
-        lines.append(f"{PART_MITIGATION_SET_UP} " + "; ".join(f"guard `{_cell(g['object'])}` entry {g['entry']}, first seen {g['first_seen']}, still live" for g in incident["guards"]) + ".")
+        lines.append(f"{PART_MITIGATION_SET_UP} " + "; ".join(f"guard `{_cell(g['object'])}` entry {_guard_entry_text(g)}, first seen {g['first_seen']}, still live" for g in incident["guards"]) + ".")
         return lines + [""]
     lines += _what_happened_lines(incident["what_happened"])
     lines.append("")
@@ -3851,9 +3916,9 @@ def _incident_lines(incident: dict) -> list[str]:
         lines.append(f"- **{m['entry']}. {m['title']}** — {_cell(m['before_signal'])} Read today: {m['read_today']}. Mitigate before: {m['mitigate_before']} Mitigate after: {m['mitigate_after']}")
     lines += ["", PART_MITIGATION_SET_UP]
     if not incident["guards"]:
-        lines.append(OUTSIDE_FLEET_GUARD_TEXT if incident.get("outside_fleet") else UNCLASSIFIED_GUARD_TEXT)
+        lines.append(OUTSIDE_FLEET_GUARD_TEXT if incident.get("outside_fleet") else NO_GUARD_TEXT)
     for g in incident["guards"]:
-        lines.append(f"- guard `{_cell(g['id'])}` {g['kind']} entry {g['entry']} ({g['confidence']}), first seen {g['first_seen']}")
+        lines.append(f"- guard `{_cell(g['id'])}` {g['kind']} entry {_guard_entry_text(g)} ({g['confidence']}), first seen {g['first_seen']}")
     return lines + [""]
 
 
@@ -3926,7 +3991,9 @@ def _incident_check(incident: dict) -> str:
     if incident["kind"] == INCIDENT_OPERATION:
         return CHECK_OPERATION_FAILED
     if incident["kind"] == INCIDENT_STALE_GUARD:
-        return CHECK_FAILURE_PERSISTS
+        return _guard_check(incident["guards"][0])
+    if incident.get("check"):
+        return str(incident["check"])
     if incident["severity"] == SEVERITY_ERROR:
         return CHECK_NODE_BROKEN if any(s["category"] == CATEGORY_NODE for s in incident["symptoms"]) else CHECK_BROKE_WORKLOAD
     if incident.get("predates_upgrade"):
@@ -3985,6 +4052,51 @@ def _incident_candidate(incident: dict, command: str | None) -> dict:
     return candidate
 
 
+def _held_candidates(cluster: str, guards: list[dict], covered: set[tuple[str, str, str]], not_recheckable: set[str], commands: dict[str, str]) -> tuple[list[dict], list[dict]]:
+    """One candidate per (check, object) for the failure guards a run still
+    holds on a cluster and no incident filed this run -- re-observed by the
+    re-check, kept by a keep rule, or held as not re-checkable -- under the
+    check its finding was filed under, with its persistence; and the
+    still-flagged identities beside them."""
+    groups: dict[tuple[str, str], list[dict]] = {}
+    for guard in guards:
+        check = _guard_check(guard)
+        namespace, obj = _split_object(guard["object"])
+        if (check, namespace, obj) in covered:
+            continue
+        groups.setdefault((check, guard["object"]), []).append(guard)
+    candidates, flagged = [], []
+    for (check, full_object), held in sorted(groups.items()):
+        held.sort(key=lambda g: (g.get("entry") or 0, g["id"]))
+        namespace, obj = _split_object(full_object)
+        excerpt = "; ".join(
+            f"guard {g['id']} {HELD_PERSISTS_FORMAT.format(since=g['first_seen'], reviews=int(g.get('reviews') or 1))}{NOT_RECHECKABLE_SUFFIX if g['id'] in not_recheckable else ''}: {g['evidence']}"
+            for g in held
+        )
+        impact = " ".join(MITIGATIONS[g["entry"]]["mitigate_after"] for g in held if g.get("entry") in MITIGATIONS) or UNCLASSIFIED_MITIGATION_TEXT
+        candidate = {
+            "check": check,
+            "cluster": cluster,
+            "namespace": namespace,
+            "object": obj,
+            # A persisting finding is the Warning requirement 3 makes it,
+            # under the check id it was first filed with.
+            "severity": MANIFEST_SEVERITY_MINOR,
+            "excerpt": _cell(excerpt)[:MESSAGE_EXCERPT_CHARS],
+            "impact": impact[:MANIFEST_IMPACT_CHARS],
+            "impact_authoritative": False,
+            "needs_triage": None,
+            "entries": _guard_entries_label(held),
+            "persistence": [HELD_PERSISTS_FORMAT.format(since=g["first_seen"], reviews=int(g.get("reviews") or 1)) for g in held],
+            "not_recheckable": [g["id"] for g in held if g["id"] in not_recheckable],
+        }
+        if commands.get(check):
+            candidate["command"] = commands[check]
+        candidates.append(candidate)
+        flagged.append({"guard": held[0]["id"], "guards": [g["id"] for g in held], "check": check, "cluster": cluster, "namespace": namespace, "object": obj})
+    return candidates, flagged
+
+
 def build_manifest(result: dict, ledger: dict, *, started_at: str, finished_at: str) -> dict:
     """The collector manifest `finish` cross-checks the SOP's document
     against: every enumerated target with an outcome, the commands behind
@@ -4000,9 +4112,23 @@ def build_manifest(result: dict, ledger: dict, *, started_at: str, finished_at: 
     def commands_of(rows: list[dict]) -> list[dict]:
         return [{"check": c["check"], "command": c["command"], "rc": 0} for c in rows]
 
+    not_recheckable = {gid for r in result.get("rechecks") or [] for gid in r.get("not_recheckable") or []}
+    guards_by_cluster: dict[str, list[dict]] = {}
+    for guard in result.get("guards") or []:
+        if guard.get("kind", GUARD_KIND_FAILURE) == GUARD_KIND_FAILURE:
+            guards_by_cluster.setdefault(guard["cluster"], []).append(guard)
+    still_flagged: list[dict] = []
+
     def candidates_of(key: str, commands: list[dict]) -> list[dict]:
+        # The incidents this run filed, then every failure guard the run
+        # still holds on the cluster under its own finding's check (one per
+        # check and object), so the harness holds rather than resolves it.
         by_check = {c["check"]: c["command"] for c in commands}
-        return [_incident_candidate(i, by_check.get(_incident_check(i))) for i in incidents_by_cluster.get(key, [])]
+        fresh = [_incident_candidate(i, by_check.get(_incident_check(i))) for i in incidents_by_cluster.get(key, []) if i["kind"] != INCIDENT_STALE_GUARD]
+        covered = {(c["check"], c["namespace"], c["object"]) for c in fresh}
+        held, flagged = _held_candidates(key, guards_by_cluster.get(key, []), covered, not_recheckable, by_check)
+        still_flagged.extend(flagged)
+        return fresh + held
 
     for review in result["reviews"]:
         key = review["cluster"]
@@ -4044,27 +4170,15 @@ def build_manifest(result: dict, ledger: dict, *, started_at: str, finished_at: 
             "outcome": MANIFEST_OUTCOME_COLLECTED, "commands": commands, "candidates": candidates_of(key, commands),
             "facts": {"status": "unchanged", "control_plane": row["control_plane"], "last_operation": row.get("last_operation"), "next_upgrade": row.get("next_upgrade"), "last_run": row.get("last_run")},
         })
-    held_by_cluster: dict[str, list[dict]] = {}
-    for guard in result.get("guards") or []:
-        if guard.get("kind", GUARD_KIND_FAILURE) == GUARD_KIND_FAILURE:
-            held_by_cluster.setdefault(guard["cluster"], []).append(guard)
-    held_incidents: list[dict] = []
     for row in result["upgrading"]:
         key = row["cluster"]
         seen.add(key)
         project, location, _ = key.split(CLUSTER_KEY_SEPARATOR, 2)
-        # Mid-window: nothing could be checked, so every check is not
-        # applicable rather than unevaluated, and the guards the cluster
-        # holds are re-emitted so the harness keeps their findings open.
-        incidents = fold_held_guards(key, held_by_cluster.get(key, []))
-        held_incidents.extend(incidents)
-        entries.append({
-            "name": key, "project": project, "location": location,
-            "outcome": MANIFEST_OUTCOME_COLLECTED, "commands": [],
-            "checks_not_applicable": [{"check": check, "reason": UPGRADING_NOT_APPLICABLE_REASON} for check, _ in CHECK_READS],
-            "candidates": [_incident_candidate(i, None) for i in incidents],
-            "facts": {"status": "upgrading", "operation": row["operation"], "held": _upgrading_line(row, str)},
-        })
+        # Mid-window the run read nothing on it: a skipped target, with the
+        # operation in flight as the error, so `finish` holds the stream's
+        # findings on it rather than resolving them. No candidate: a
+        # candidate with no read behind it would vouch for nothing.
+        entries.append({"name": key, "project": project, "location": location, "outcome": MANIFEST_OUTCOME_GATE_FAILED, "error": _upgrading_line(row, str), "facts": {"status": "upgrading", "operation": row["operation"]}})
     for line in result["failed_reads"]:
         key, _, reason = line.partition(": ")
         if key in seen or key.count(CLUSTER_KEY_SEPARATOR) != 2 or not reason.startswith("its project's listing failed"):
@@ -4072,15 +4186,6 @@ def build_manifest(result: dict, ledger: dict, *, started_at: str, finished_at: 
         seen.add(key)
         project, location, _ = key.split(CLUSTER_KEY_SEPARATOR, 2)
         entries.append({"name": key, "project": project, "location": location, "outcome": MANIFEST_OUTCOME_GATE_FAILED, "error": reason[:ERROR_EXCERPT_CHARS]})
-    # Guards held but not re-observed this run: the identity tuples `finish`
-    # derives the still-flagged ids from (carried; `finish` builds the set from
-    # the `upgrade-failure-persists` candidates above).
-    still_flagged = []
-    for incident in [i for i in sections["warnings"] if i["kind"] == INCIDENT_STALE_GUARD] + held_incidents:
-        if incident["kind"] == INCIDENT_STALE_GUARD:
-            namespace, obj = _split_object(incident["object"])
-            ids = [g["id"] for g in incident["guards"]]
-            still_flagged.append({"guard": ids[0], "guards": ids, "check": CHECK_FAILURE_PERSISTS, "cluster": incident["cluster"], "namespace": namespace, "object": obj})
     manifest = {
         "version": MANIFEST_VERSION,
         "checks_revision": CHECKS_REVISION,
@@ -4088,9 +4193,9 @@ def build_manifest(result: dict, ledger: dict, *, started_at: str, finished_at: 
         "started_at": started_at,
         "finished_at": finished_at,
         "scoped": result["scoped"],
-        "partial": bool(result["failed_reads"]) or any(r.get("partial") for r in result["reviews"]),
+        "partial": bool(result["failed_reads"]) or any(r.get("partial") for r in result["reviews"]) or bool(result["upgrading"]),
         "clusters": entries,
-        "still_flagged": still_flagged,
+        "still_flagged": sorted(still_flagged, key=lambda h: (h["cluster"], h["check"], h["namespace"], h["object"])),
         "fleet": result.get("fleet") or [],
     }
     if not entries:
@@ -4298,6 +4403,10 @@ def collect(args: argparse.Namespace, *, run: RunFn | None = None, now: datetime
             raise argparse.ArgumentTypeError(AFTER_UPGRADE_WITH_CLUSTER_TEXT)
     if args.report and Path(args.report).name == LATEST_REPORT_LINK:
         raise argparse.ArgumentTypeError(REPORT_IS_LINK_TEXT.format(name=LATEST_REPORT_LINK))
+    if after_upgrade and not ledger.get(LEDGER_PROJECTS_KEY):
+        # No full run has recorded the fleet: nothing to diff against.
+        log(NO_BASELINE_TEXT)
+        return {"generated_at": seen_at, "since": fmt_ts(since), "projects": [], "reviews": [], "unchanged": [], "upgrading": [], "failed_reads": [], "scoped": True, "after_upgrade": True, "scope_reason": AFTER_UPGRADE_SCOPE_TEXT, "quiet": True, "no_baseline": True, "report": NO_BASELINE_TEXT + "\n", "guards": guards.get("guards") or [], "dry_run": bool(args.dry_run)}
 
     failed_reads: list[str] = []
     if args.project:
@@ -4460,6 +4569,7 @@ def collect(args: argparse.Namespace, *, run: RunFn | None = None, now: datetime
     for guard in new_guards["guards"]:
         if guard["id"] in refreshed_ids:
             guard["last_seen"] = seen_at
+            guard["reviews"] = int(guard.get("reviews") or 1) + 1
     for r in rechecks:
         failed_reads.extend(f"{r['cluster']}: re-check: {e}" for e in r["errors"])
     # An unchanged cluster's checks ran as the operations listing that found no
