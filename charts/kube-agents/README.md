@@ -644,8 +644,8 @@ Five knobs need context beyond the chart:
   asks for the second without the first; an install that renders this chart
   without the composition applies the module itself **and makes the detector's
   two subscription grants itself**, which the module does not make — without
-  them the detector starts, is denied on every pull, and stays Ready. The chart does not check,
-  and neither does
+  them the detector starts, is denied on every pull, and stays Ready.
+  The chart does not check, and neither does
   the detector: enabled without a subscription to read, it comes up and retries
   a pull that cannot succeed for the life of the pod, never exits, and leaves
   the pod Ready. That is why it defaults to off.
@@ -906,6 +906,7 @@ helm uninstall kube-agents -n kubeagents-system
   `terraform/examples/full-install` does both in one apply.
 
   Two behaviours worth knowing before you enable them:
+
   - **`failurePolicy` defaults to `Ignore`, where the kustomize path uses
     `Fail`.** Helm applies the webhook configurations before both the
     `Certificate` and the `PlatformAgent` CR, so under `Fail` the API server

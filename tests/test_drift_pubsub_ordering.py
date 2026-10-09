@@ -62,8 +62,8 @@ than a transcription of its suite. The drain's shape and the sink's
 postcondition are values, and the tftest suite reaches both; asserting them
 again here would duplicate it without covering anything the plan cannot see.
 
-The other two tests are the composition's, and the module cannot express what
-they pin. `full-install`'s `gke_cluster` declares `depends_on` on the ingress
+The other three tests are the composition's, and the module cannot express
+what they pin. `full-install`'s `gke_cluster` declares `depends_on` on the ingress
 module, which reverses their teardown: Terraform destroys dependents before
 dependencies, so the cluster goes first and the topic last. Without that edge
 the topic is deleted while the control plane is still up and still emitting
@@ -100,6 +100,7 @@ Run:
 
 from __future__ import annotations
 
+import re
 import sys
 import unittest
 from pathlib import Path
@@ -239,6 +240,11 @@ def _module_body(tokens: list, name: str) -> list:
     )
 
 
+def _module_references(code: str) -> list:
+    """Every `module.<name>` a block's code (strings excluded) reaches."""
+    return re.findall(r"module\.([A-Za-z0-9_-]+)", code)
+
+
 def _block_strings(body: list) -> list:
     """Every string literal in a block, which _code_text deliberately drops.
 
@@ -347,17 +353,34 @@ class DriftPubsubOrdering(unittest.TestCase):
                     f"the detector starts, is denied on every pull, and the pod stays Ready",
                 )
 
-    def test_the_ingress_does_not_depend_on_the_iam_module(self) -> None:
+    def test_the_ingress_references_no_other_module(self) -> None:
+        """The class, not one member of it.
+
+        kube_agents_iam is how the dependency got in and is the one to expect
+        back, but any module whose own graph reaches the cluster does the same
+        damage, and most of them do -- the composition hangs nearly everything
+        off gke_cluster. Asserting the ingress call reaches no module at all is
+        both the real invariant and the cheaper thing to keep true: it takes
+        only var and local inputs today.
+        """
         body = _module_body(self.composition, INGRESS_MODULE)
-        self.assertNotIn(
-            IAM_MODULE_REFERENCE,
-            _code_text(body),
-            f'module "{INGRESS_MODULE}" references {IAM_MODULE_REFERENCE} again. That module '
-            f'depends on module.{CLUSTER_MODULE}, so this makes the ingress a dependent of '
-            f"the cluster and inverts the destroy order the test above pins -- and because "
-            f"the cluster now depends on the ingress, it is also a dependency cycle. The "
-            f"detector's subscription grants are what used to carry this reference; they "
-            f"live beside the module call in the composition for exactly that reason",
+        referenced = sorted(
+            {
+                name
+                for name in _module_references(_code_text(body))
+                if name != INGRESS_MODULE
+            }
+        )
+        self.assertEqual(
+            [],
+            referenced,
+            f'module "{INGRESS_MODULE}" now references {", ".join(referenced)}. Any module '
+            f"reference risks reaching module.{CLUSTER_MODULE} -- {IAM_MODULE} is the one "
+            f"that used to, through the detector's GSA -- which makes the ingress a "
+            f"dependent of the cluster, inverts the destroy order the test above pins, and, "
+            f"since the cluster now depends on the ingress, is a dependency cycle besides. "
+            f"Pass a var or a local instead, or move the resource that needs the reference "
+            f"out of the module the way the detector's subscription grants were",
         )
 
 
