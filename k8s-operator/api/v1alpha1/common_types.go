@@ -390,6 +390,12 @@ type HarnessSpec struct {
 	// +optional
 	DriftDetector *DriftDetectorSpec `json:"driftDetector,omitempty"`
 
+	// IncidentTriage configures what happens after the k8s-event-watcher's
+	// triage report. Unset keeps the shipped behaviour: the report proposes
+	// fixes and a human replies to have one opened as a pull request.
+	// +optional
+	IncidentTriage *IncidentTriageSpec `json:"incidentTriage,omitempty"`
+
 	// Tuning sets per-persona execution limits. Unset values keep the defaults
 	// baked into the agent image.
 	// +optional
@@ -520,6 +526,26 @@ type EventWatcherSpec struct {
 	// +kubebuilder:default=true
 	// +optional
 	Enabled *bool `json:"enabled,omitempty"`
+}
+
+// IncidentTriageSpec configures the event-triggered triage flow: the session
+// the k8s-event-watcher starts for a Warning event, whose Cluster Agent card
+// returns a report of proposed GitOps fixes.
+type IncidentTriageSpec struct {
+	// OpenPullRequest has the Platform Agent open the report's recommended fix
+	// as a pull request against the GitOps repository without waiting for a
+	// human to reply `apply`. The front door files a second card, assigned to
+	// the Platform Agent and parented on the triage card, that opens it on a
+	// branch keyed to the incident, so a retried event revises its pull request
+	// rather than opening another. A human still reviews and merges it, and
+	// nothing is written to the live cluster. Drift records are not affected.
+	//
+	// The operator sets INCIDENT_TRIAGE_OPEN_PULL_REQUEST=true on the platform
+	// agent container when this is true, and sets nothing otherwise, so an
+	// install that never sets it keeps the pod it had.
+	// +kubebuilder:default=false
+	// +optional
+	OpenPullRequest *bool `json:"openPullRequest,omitempty"`
 }
 
 // DriftDetectorSpec configures the drift-detector, which runs as a peer service

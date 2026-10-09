@@ -657,6 +657,15 @@ platformAgent:
       # but never marks a change as one a controller may already have
       # reverted.
       gitopsManagers: ""
+    # What happens after the k8s-event-watcher's triage report. By default the
+    # report proposes GitOps fixes and a human replies `apply` to have one
+    # opened as a pull request. openPullRequest: true has the Platform Agent
+    # open the recommended fix as a pull request without the reply, on a
+    # branch keyed to the incident, for a human to review and merge. Nothing
+    # is written to the live cluster either way, and drift reports are not
+    # affected. Left null, the block is omitted.
+    incidentTriage:
+      openPullRequest: null # CRD default: false
     # Unsupported switches. Nothing under here carries a compatibility promise:
     # a field may change meaning, change default, or be removed between
     # releases, and an install that sets one is expected to re-check it at every

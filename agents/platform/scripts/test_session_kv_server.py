@@ -2298,6 +2298,104 @@ class TestFrontDoorDelegation(unittest.TestCase):
         self.assertLess(query.index("Leave `goal_mode` off"), query.index("--- BEGIN TASK BODY"))
 
 
+class TestIncidentTriagePullRequestOptIn(unittest.TestCase):
+    """spec.harness.incidentTriage.openPullRequest, as the env var it becomes.
+
+    Off is the shipped behaviour and must not move: one card, the footer that
+    leaves the pull request to a human's reply. On, the front door files a
+    second card for the Platform Agent, parented on the triage card, that opens
+    the pull request on a branch keyed to the incident.
+    """
+
+    PAYLOAD = {
+        "reason": "OOMKilled",
+        "namespace": "test-ns",
+        "kind_of_object": "Pod",
+        "name": "test-pod",
+        "message": "some message",
+        "cluster": "prod-us-central1",
+    }
+    SESSION = "evt-Prod_us/OOM:42"
+    ENV = "INCIDENT_TRIAGE_OPEN_PULL_REQUEST"
+    OFF_FOOTER = "A human reads your options and the agent that holds the GitOps write path opens the Pull Request"
+
+    def query(self, value):
+        env = {self.ENV: value} if value is not None else {}
+        with patch.dict(os.environ, env, clear=False):
+            if value is None:
+                os.environ.pop(self.ENV, None)
+            return session_kv_server._build_agent_query(self.PAYLOAD, self.SESSION)
+
+    def test_unset_and_false_leave_the_default_query_alone(self):
+        default = self.query(None)
+        self.assertEqual(default, self.query("false"))
+        self.assertEqual(default, self.query(""))
+        self.assertIn("Make exactly one `kanban_create` call", default)
+        self.assertIn(self.OFF_FOOTER, default)
+        self.assertNotIn("parents", default)
+        self.assertNotIn("platform-agent/incident-", default)
+
+    def test_the_default_body_is_the_one_the_old_signature_built(self):
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop(self.ENV, None)
+            self.assertEqual(
+                session_kv_server._triage_task_body(self.PAYLOAD),
+                session_kv_server._triage_task_body(self.PAYLOAD, open_pull_request=False),
+            )
+
+    def test_on_asks_for_two_cards_the_second_parented_on_the_first(self):
+        query = self.query("true")
+        self.assertIn("Make exactly two `kanban_create` calls", query)
+        self.assertIn("`assignee`: `platform`", query)
+        self.assertIn("`parents`: a list holding the one card id call 1 returned", query)
+        self.assertIn("`title`: `Open GitOps PR for test-ns/Pod/test-pod (OOMKilled) on prod-us-central1`", query)
+        self.assertIn("`title`: `Triage test-ns/Pod/test-pod (OOMKilled) on prod-us-central1`", query)
+        self.assertIn("do not file a third card", query)
+        self.assertIn("**Leave `goal_mode` off.**", query)
+
+    def test_on_carries_both_bodies_whole_between_their_markers(self):
+        query = self.query("TRUE ")
+        triage = query.split("--- BEGIN TASK BODY (copy verbatim) ---\n", 1)[1].split("\n--- END TASK BODY ---", 1)[0]
+        self.assertEqual(triage, session_kv_server._triage_task_body(self.PAYLOAD, open_pull_request=True))
+        pr = query.split("--- BEGIN PULL REQUEST TASK BODY (copy verbatim) ---\n", 1)[1]
+        pr = pr.split("\n--- END PULL REQUEST TASK BODY ---", 1)[0]
+        self.assertEqual(pr, session_kv_server._triage_pr_task_body(self.PAYLOAD, self.SESSION))
+
+    def test_on_keeps_the_report_template_the_notifier_gates_on(self):
+        body = session_kv_server._triage_task_body(self.PAYLOAD, open_pull_request=True)
+        self.assertNotIn(self.OFF_FOOTER, body)
+        self.assertIn("To authorize", body)
+        self.assertIn("do not tell the reader to reply **'apply'** to open the recommended Pull Request", body)
+        self.assertIn("## What to do", body)
+        headings = [line for line in body.splitlines() if line.startswith("## ")]
+        self.assertEqual(len(headings), 3, headings)
+
+    def test_the_pull_request_card_names_the_branch_and_forbids_cluster_writes(self):
+        body = session_kv_server._triage_pr_task_body(self.PAYLOAD, self.SESSION)
+        self.assertIn("`platform-agent/incident-evt-prod-us-oom-42`", body)
+        self.assertIn("**submit-suggestion**", body)
+        self.assertIn("`kanban_show` this card's parent", body)
+        self.assertIn("If the parent card has no report (`result` is empty or its `status` is not `done`)", body)
+        self.assertIn("Never change the live cluster directly", body)
+        self.assertIn("open nothing", body)
+
+    def test_the_branch_is_stable_and_one_safe_segment(self):
+        first = session_kv_server._incident_branch(self.SESSION, self.PAYLOAD)
+        self.assertEqual(first, session_kv_server._incident_branch(self.SESSION, self.PAYLOAD))
+        self.assertEqual(first, "platform-agent/incident-evt-prod-us-oom-42")
+        fallback = session_kv_server._incident_branch("", self.PAYLOAD)
+        self.assertEqual(fallback, "platform-agent/incident-prod-us-central1-test-ns-pod-test-pod-oomkilled")
+        hostile = session_kv_server._incident_branch("../`x` y\n", {})
+        self.assertRegex(hostile.removeprefix("platform-agent/incident-"), r"^[a-z0-9-]+$")
+
+    def test_drift_records_ignore_the_setting(self):
+        drift = {"kind": session_kv_server.INJECT_KIND_DRIFT, "summary": "s"}
+        with patch.object(session_kv_server, "_drift_agent_query", return_value="drift") as drift_query:
+            with patch.dict(os.environ, {self.ENV: "true"}):
+                self.assertEqual(session_kv_server._build_agent_query(drift, self.SESSION), "drift")
+        drift_query.assert_called_once_with(drift)
+
+
 class TestGatewaySessionBody(unittest.TestCase):
 
     def test_no_profile_key_is_sent(self):

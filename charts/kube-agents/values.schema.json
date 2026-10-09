@@ -550,6 +550,15 @@
                 }
               }
             },
+            "incidentTriage": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "openPullRequest": {
+                  "type": ["boolean", "null"]
+                }
+              }
+            },
             "experimental": {
               "type": "object",
               "additionalProperties": false,

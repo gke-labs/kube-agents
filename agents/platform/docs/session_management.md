@@ -27,7 +27,7 @@ It binds loopback rather than `0.0.0.0` because every one of its callers shares 
 
 The session lands on the front door and cannot land anywhere else. Hermes selects a profile by URL prefix (`POST /p/<profile>/api/sessions`), only when `gateway.multiplex_profiles` is enabled — it is off by default and this install does not set it — and only against that profile's own `API_SERVER_KEY`. A `profile` key in the request body is accepted with a `201` and dropped, so it looks like routing and is not. Routing is therefore a prompt, not a parameter.
 
-`_build_agent_query` writes that prompt for the front door — for an event; a `gitops-drift` or `controller-stall` inject is routed to its own builder at the top of the same function — and it is addressed to a router rather than to a diagnostician: make exactly one `kanban_create` call, assign it to the `cluster-*` agent scoped to the event's cluster, and copy the body between two markers verbatim. `_triage_task_body` builds that body — the event details and the report template — and it is the front door's job to move it across unread. Everything in that design is a response to the front door being helpful: given the brief as instructions rather than as cargo, it summarised, and filed extra cards asking other agents to deliver the report.
+`_build_agent_query` writes that prompt for the front door — for an event; a `gitops-drift` or `controller-stall` inject is routed to its own builder at the top of the same function — and it is addressed to a router rather than to a diagnostician: make one `kanban_create` call, assign it to the `cluster-*` agent scoped to the event's cluster, and copy the body between two markers verbatim. `_triage_task_body` builds that body — the event details and the report template — and it is the front door's job to move it across unread. Everything in that design is a response to the front door being helpful: given the brief as instructions rather than as cargo, it summarised, and filed extra cards asking other agents to deliver the report. When `INCIDENT_TRIAGE_OPEN_PULL_REQUEST=true` (`spec.harness.incidentTriage.openPullRequest: true`), `_build_agent_query_with_pull_request` asks the front door for a second `kanban_create` call assigned to `platform` with `parents: ["<triage_card_id>"]` and a verbatim body from `_triage_pr_task_body`; the dispatcher holds that second card until the diagnosis card completes, and the Platform Agent then opens the GitOps Pull Request for the recommended fix without waiting for a chat reply.
 
 Delivery is the card itself. Hermes subscribes every card to the session it was filed from, and posts a subscribed card's `result` to chat when it turns terminal — so the Cluster Agent finishes with `kanban_complete` and nothing else, and the report reaches the thread the alert was raised in. The body's whole job on that point is to insist the entire report goes in `result`, since `result` is verbatim what the reader sees.
 
@@ -220,6 +220,9 @@ sequenceDiagram
     Proxy->>Gateway: POST /api/sessions/k8s-evt-abc123/chat (Route this triage)
     Gateway->>Front: Wake up the front door
     Front->>Agent: kanban_create(assignee=cluster-proj-x-loc, body=the brief, verbatim)
+    opt spec.harness.incidentTriage.openPullRequest = true
+        Front->>Fixer: kanban_create(assignee=platform, parents=[triage_card_id], body=PR brief, verbatim)
+    end
     Note over Front, Agent: The card is subscribed to the alert's thread, not to the api_server origin
     Agent->>Agent: Diagnose (read-only), write the report
     Agent->>Agent: kanban_complete(result=the full report)
