@@ -374,7 +374,7 @@ resource "null_resource" "drift_noise" {
       # load-bearing: under `set -e` a failing kubectl in a bare assignment
       # aborts the script, so the `if [ -z ]` branch after it could never run
       # and the operator would get a jsonpath error instead of this message.
-      pod="$(${local.kubectl} get pod -n kubeagents-system \
+      pod="$(${local.kubectl} get pod -n "${var.agent_namespace}" \
         -l app=platform-agent-gateway -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
       if [ -z "$pod" ]; then
         echo "ERROR: no platform-agent-gateway pod to read the board and the ledger from." >&2
@@ -386,7 +386,7 @@ resource "null_resource" "drift_noise" {
       # resolve it for that reason.
       agent_python=""
       for candidate in python3 /opt/hermes/.venv/bin/python3; do
-        if ${local.kubectl} exec -n kubeagents-system "$pod" -c "${var.agent_container}" -- \
+        if ${local.kubectl} exec -n "${var.agent_namespace}" "$pod" -c "${var.agent_container}" -- \
           "$candidate" -c "pass" >/dev/null 2>&1; then
           agent_python="$candidate"
           break
@@ -400,7 +400,7 @@ resource "null_resource" "drift_noise" {
       # The board's schema is upstream Hermes' and is not in this repository to
       # check a column name against, so check it here rather than letting a
       # rename turn every probe into a silent timeout.
-      if ! ${local.kubectl} exec -n kubeagents-system "$pod" -c "${var.agent_container}" -- \
+      if ! ${local.kubectl} exec -n "${var.agent_namespace}" "$pod" -c "${var.agent_container}" -- \
         "$agent_python" -c "import sqlite3,sys; cols={r[1] for r in sqlite3.connect('file:${local.kanban_board}',uri=True).execute('pragma table_info(tasks)')}; sys.exit(0 if {'body','status'} <= cols else 1)" \
         >/dev/null 2>&1; then
         echo "ERROR: the kanban tasks table has no 'body'/'status' columns; upstream renamed them." >&2
@@ -409,7 +409,7 @@ resource "null_resource" "drift_noise" {
       fi
 
       card_is_finished() {
-        ${local.kubectl} exec -n kubeagents-system "$pod" -c "${var.agent_container}" -- \
+        ${local.kubectl} exec -n "${var.agent_namespace}" "$pod" -c "${var.agent_container}" -- \
           "$agent_python" -c "import sqlite3,sys; sys.exit(0 if sqlite3.connect('file:${local.kanban_board}',uri=True).execute(\"select count(*) from tasks where body like ? and status in ('done','blocked','archived')\", ('%'+sys.argv[1]+'%',)).fetchone()[0] else 1)" \
           "$1" >/dev/null 2>&1
       }
@@ -419,7 +419,7 @@ resource "null_resource" "drift_noise" {
       # alert ceiling -- which is the whole reason the case keys its finding on
       # the ledger rather than on what reached the board.
       forwarded_churn() {
-        ${local.kubectl} exec -n kubeagents-system "$pod" -c "${var.agent_container}" -- \
+        ${local.kubectl} exec -n "${var.agent_namespace}" "$pod" -c "${var.agent_container}" -- \
           "$agent_python" -c "import sqlite3,sys; db=sqlite3.connect('file:${local.ledger_db}',uri=True); ids=sys.argv[1:]; q='select object_uid from intercepted_events where object_uid in (%s)' % ','.join('?'*len(ids)); print(' '.join(r[0] for r in db.execute(q, ids)))" \
           "$@" 2>/dev/null
       }
@@ -430,7 +430,7 @@ resource "null_resource" "drift_noise" {
       # delivery_error when the quota refused the record, while a set
       # delivery_error is chat failing, which does not stop the turn.
       ledger_row() {
-        ${local.kubectl} exec -n kubeagents-system "$pod" -c "${var.agent_container}" -- \
+        ${local.kubectl} exec -n "${var.agent_namespace}" "$pod" -c "${var.agent_container}" -- \
           "$agent_python" -c "import sqlite3,sys; r=sqlite3.connect('file:${local.ledger_db}',uri=True).execute('select notified, delivery_error from intercepted_events where object_uid = ? order by id desc limit 1', (sys.argv[1],)).fetchone(); print('%s|%s' % (r[0], r[1]) if r else '')" \
           "$1" 2>/dev/null
       }
@@ -453,8 +453,33 @@ resource "null_resource" "drift_noise" {
       # the detector, and a 30-minute wait on a chatty container can push the
       # line a long way back.
       detector_forwarded() {
-        ${local.kubectl} logs -n kubeagents-system "$pod" -c agent-api-auth --tail=20000 2>/dev/null \
+        ${local.kubectl} logs -n "${var.agent_namespace}" "$pod" -c agent-api-auth --tail=20000 2>/dev/null \
           | grep -F ": DRIFT " | grep -F "insert_id=$1 " >/dev/null
+      }
+
+      # Which of this run's churn ids the detector logged a DRIFT line for.
+      #
+      # The ledger alone is not enough, and the gap is not hypothetical. The
+      # detector runs in the agent-api-auth sidecar and posts to the daemon in
+      # the agent container over localhost; if the daemon is away for the
+      # minute the burst takes, every forwarded churn record gets its DRIFT
+      # line, fails its inject inside the per-record budget, is logged as
+      # INJECT FAILED and acked -- and writes no intercepted_events row,
+      # because _inject_drift is the only thing that writes one and it never
+      # ran. A filter that forwarded all eleven would then read as a filter
+      # that held. The DRIFT line is written before the inject is attempted,
+      # so it survives exactly the outage the ledger does not.
+      #
+      # One `kubectl logs` for all eleven ids rather than one per id: the tail
+      # is large and the ids are matched in the shell.
+      drift_logged_churn() {
+        logs="$(${local.kubectl} logs -n "${var.agent_namespace}" "$pod" -c agent-api-auth \
+          --tail=20000 2>/dev/null | grep -F ": DRIFT " || true)"
+        for id in "$${churn_ids[@]}"; do
+          case "$logs" in
+            *"insert_id=$id "*) echo "$id" ;;
+          esac
+        done
       }
 
       # The classifier's own refusal, when --log-dropped is on. logDroppedRecord
@@ -464,7 +489,7 @@ resource "null_resource" "drift_noise" {
       # the finding, reported as not the pipeline's, on exactly the re-run the
       # ingress-silent branch tells the operator to make.
       detector_dropped() {
-        ${local.kubectl} logs -n kubeagents-system "$pod" -c agent-api-auth --tail=20000 2>/dev/null \
+        ${local.kubectl} logs -n "${var.agent_namespace}" "$pod" -c agent-api-auth --tail=20000 2>/dev/null \
           | grep -F "dropped " | grep -F "insert_id=$1" >/dev/null
       }
 
@@ -528,11 +553,19 @@ resource "null_resource" "drift_noise" {
       # short insurance against unordered delivery; the card wait above is
       # what proves the pipeline was consuming.
       sleep ${var.settle_seconds}
-      leaked="$(forwarded_churn "$${churn_ids[@]}")"
-      if [ -n "$leaked" ]; then
+
+      # Two independent witnesses, because they fail in different directions.
+      # The ledger row is quota-independent and survives a detector that logs
+      # nothing useful; the DRIFT line survives a daemon that was away when
+      # the record was forwarded. Either one naming a churn id is the filter
+      # forwarding churn, so the verdict takes their union.
+      leaked_ledger="$(forwarded_churn "$${churn_ids[@]}")"
+      leaked_log="$(drift_logged_churn)"
+      leaked="$(printf '%s\n%s\n' "$leaked_ledger" "$leaked_log" | grep -v '^$' | sort -u | tr '\n' ' ' || true)"
+      if [ -n "$${leaked// /}" ]; then
         write_verdict churn-forwarded \
-          "Classify forwarded churn this run published: $leaked"
-        echo "ERROR: churn reached the daemon -- the filter is broken: $leaked" >&2
+          "Classify forwarded churn this run published: $leaked(ledger: $${leaked_ledger:-none}; DRIFT lines: $${leaked_log:-none})"
+        echo "ERROR: churn was forwarded -- the filter is broken: $leaked" >&2
         exit 0
       fi
 
@@ -593,7 +626,7 @@ resource "null_resource" "drift_noise" {
       fi
 
       write_verdict ok \
-        "human card finished after the burst, so the pipeline was consuming; no ledger row for any of $${#churn_ids[@]} churn records"
+        "human card finished after the burst, so the pipeline was consuming; no ledger row and no DRIFT line for any of $${#churn_ids[@]} churn records"
       echo "filter held: card for $human_insert_id finished, no churn forwarded"
     EOT
   }

@@ -208,6 +208,21 @@ variable "churn_record_count" {
 
 # ─── Reading the result back ─────────────────────────────────────────────────
 
+variable "agent_namespace" {
+  description = <<-EOT
+    Namespace of the kube-agents install on host_cluster_name.
+
+    Declared rather than hardcoded because hack/ci-eval-pr.sh exports
+    TF_VAR_agent_namespace for the whole run and Terraform only picks that up
+    for a variable the stack declares. An install placed anywhere else would
+    otherwise have every exec below look in the wrong namespace, find no
+    gateway pod, and fail the repetition as infrastructure on a healthy
+    install. Every sibling stack that execs into the agent pod declares it.
+  EOT
+  type        = string
+  default     = "kubeagents-system"
+}
+
 variable "agent_container" {
   description = "The container on the gateway pod holding the kanban board, read by the poll."
   type        = string

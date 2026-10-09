@@ -166,10 +166,7 @@ ADDED_AFTER_THE_MOVE = [
     "observability-watcher-scrape-state",  # the event watcher's scrape state, #2141
     "chat-fanout-fleet-restarts-rows",  # a fleet question fanned out one titled card per cluster
     "backup-dr-cmek-selected-namespaces-probe",  # the gke-backup-dr skill sync
-<<<<<<< HEAD
     "findings-decision-covers-item",  # the findings queue's item-wide decision
-=======
->>>>>>> 0b52a91f (fix(bench): hold the drift-noise case out of the nightly, and close three more findings)
 ]
 
 # Admitted after the split, each by a pull request that cited the record
