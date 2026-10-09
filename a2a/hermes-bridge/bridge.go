@@ -392,6 +392,11 @@ type Bridge struct {
 	apiClient *http.Client
 	// routeClient records conversation routes (route.go).
 	routeClient *http.Client
+	// routesMu guards routes, the route each session last recorded
+	// (route.go), so a failed PUT that would have written the same route
+	// is not reported as a lost one.
+	routesMu sync.Mutex
+	routes   map[string]conversationRoute
 	// The activity door (activity.go); nil when Config.ActivityListen is "".
 	activityLn   net.Listener
 	activitySrv  *http.Server

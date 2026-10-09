@@ -37,6 +37,10 @@ const (
 	routeTimeout = 5 * time.Second
 	// routeErrorTailBytes bounds the server's refusal quoted in the log.
 	routeErrorTailBytes = 200
+	// routeMemoryMax bounds the sessions whose last recorded route the
+	// bridge remembers; past it the memory is cleared, and a failed PUT is
+	// then reported as lost, as it is after a restart.
+	routeMemoryMax = 4096
 	// routeLostNote follows a completed answer whose route could not be
 	// recorded, so the user is told rather than left waiting for a card's
 	// answer that cannot arrive.
@@ -91,7 +95,9 @@ func routeFor(env *lib.Envelope) (conversationRoute, error) {
 
 // recordRoute records env's conversation route against sessionID. It returns
 // errNoChatConversation when there is none to record, and an error when the
-// store refused or could not be reached.
+// store refused or could not be reached, unless an earlier task of the same
+// session recorded the same route: the store still holds it, so nothing is
+// lost.
 func (b *Bridge) recordRoute(ctx context.Context, sessionID string, env *lib.Envelope) error {
 	if b.cfg.RouteURL == "" {
 		return errRouteDisabled
@@ -100,6 +106,38 @@ func (b *Bridge) recordRoute(ctx context.Context, sessionID string, env *lib.Env
 	if err != nil {
 		return err
 	}
+	if err := b.putRoute(ctx, sessionID, route); err != nil {
+		if b.recordedRoute(sessionID) == route {
+			b.cfg.Logger.Warn("conversation route PUT failed; the session's earlier record of the same route stands",
+				"session", sessionID, "err", err)
+			return nil
+		}
+		return err
+	}
+	b.rememberRoute(sessionID, route)
+	return nil
+}
+
+// recordedRoute is the route sessionID last recorded in this process, or the
+// zero route.
+func (b *Bridge) recordedRoute(sessionID string) conversationRoute {
+	b.routesMu.Lock()
+	defer b.routesMu.Unlock()
+	return b.routes[sessionID]
+}
+
+// rememberRoute notes route as sessionID's recorded route.
+func (b *Bridge) rememberRoute(sessionID string, route conversationRoute) {
+	b.routesMu.Lock()
+	defer b.routesMu.Unlock()
+	if b.routes == nil || len(b.routes) >= routeMemoryMax {
+		b.routes = make(map[string]conversationRoute)
+	}
+	b.routes[sessionID] = route
+}
+
+// putRoute writes route against sessionID in the store.
+func (b *Bridge) putRoute(ctx context.Context, sessionID string, route conversationRoute) error {
 	if strings.TrimSpace(b.cfg.RouteKey) == "" {
 		return fmt.Errorf("%s is not set", RouteKeyEnv)
 	}
