@@ -607,6 +607,47 @@ class Helpers(unittest.TestCase):
         finally:
             shutil.rmtree(d)
 
+    def test_auto_gc_runs_synchronously_in_foreground(self):
+        d = Path(tempfile.mkdtemp())
+        try:
+            self.tool.git(["init", "-q"], cwd=d)
+            # gc.autoPackLimit=1 ensures auto gc triggers on porcelain operations once >= 2 packs exist
+            self.tool.git(["config", "gc.autoPackLimit", "1"], cwd=d)
+            (d / "f1").write_text("1")
+            self.tool.git(["add", "f1"], cwd=d)
+            self.tool.git(["commit", "-q", "-m", "1"], cwd=d)
+            self.tool.git(["repack", "-d"], cwd=d)
+
+            (d / "f2").write_text("2")
+            self.tool.git(["add", "f2"], cwd=d)
+            self.tool.git(["commit", "-q", "-m", "2"], cwd=d)
+            self.tool.git(["repack"], cwd=d)
+
+            (d / "f3").write_text("3")
+            self.tool.git(["add", "f3"], cwd=d)
+
+            loose_before = [p for p in (d / ".git" / "objects").iterdir() if p.is_dir() and p.name not in ("info", "pack")]
+            packs_before = list((d / ".git" / "objects" / "pack").glob("*.pack"))
+            self.assertGreaterEqual(len(packs_before), 2)
+            self.assertGreater(len(loose_before), 0)
+
+            # Porcelain commit triggers auto gc.
+            # With gc.autoDetach=false, housekeeping completes synchronously in the foreground
+            # before git() returns, eliminating the race with subsequent rmtree (#2817).
+            self.tool.git(["commit", "-q", "-m", "3"], cwd=d)
+
+            # Assert foreground completion on return: packs consolidated and loose objects pruned
+            packs_after = list((d / ".git" / "objects" / "pack").glob("*.pack"))
+            loose_after = [p for p in (d / ".git" / "objects").iterdir() if p.is_dir() and p.name not in ("info", "pack")]
+            self.assertEqual(len(packs_after), 1)
+            self.assertEqual(len(loose_after), 0)
+
+            # shutil.rmtree succeeds immediately without concurrent background file deletion
+            shutil.rmtree(d)
+        finally:
+            if d.exists():
+                shutil.rmtree(d)
+
 
 if __name__ == "__main__":
     unittest.main()
