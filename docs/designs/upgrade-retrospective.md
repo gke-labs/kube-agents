@@ -47,7 +47,10 @@ This design adds a scheduled review, the **upgrade retrospective**. The requirem
      learns the failure, so the next pre-upgrade report says that the last upgrade damaged this
      object, for as long as the damage is present. If the install has a GitHub repository, the
      review's one tracked issue carries the checklist of fixes, one entry per cluster and object.
-     The next review rewrites the checklist. The review closes the issue when it finds nothing.
+     The next review rewrites the checklist. A failure that is still present keeps its entry. The
+     entry says when the review first saw the failure and how many reviews have seen it. The
+     review removes the entry when the failure is gone. The review closes the issue when it finds
+     nothing.
 
    An incident is an **Error** when the match is certain and the object belongs to the user, when
    GKE reported the upgrade as failed, or when a node did not become ready after its recreation. An
@@ -317,10 +320,17 @@ is for a check that cannot apply to a cluster (Autopilot, no such resource kind)
 deferred, and a candidate re-emitted from `guards.json` with no read behind it would make the
 manifest vouch for an observation nobody made. Then `candidates[]` for every
 incident the report files, an Error at `major` and a Warning at `minor`, with the check id, object,
-excerpt and the mitigation text, including a candidate for every `failure` guard the run still
-observes or cannot re-observe, the unclassified Warning's guard among them (§3.5), which is how the
-harness holds a finding on the ledger (its `still_flagged_ids` are the candidates the collector
-still emits); a `risk` guard is Info, filed nowhere, and is no candidate,
+excerpt and the mitigation text. The hold follows the rule the harness implements and no other: a
+previous finding is held, rather than announced resolved, only while a candidate carries the same
+`(check, cluster, namespace, object)` id (`still_flagged_ids` is that set of candidate ids). So a
+`failure` guard the run still observes, or cannot re-observe (event-only, or a re-check whose reads
+failed), emits a candidate under the check id its finding was first filed with, the unclassified
+Warning's guard among them (§3.5), graded the Warning requirement 3 makes it and carrying the
+persistence in its detail: first seen, and the number of reviews that have seen it. A guard the
+re-check clears emits nothing, and the harness resolves the finding. A persisting finding has no
+check id of its own: a candidate under a new id would file a new finding and let the harness
+announce the old one fixed, the resolved-plus-new pair the fixed row order (§3.4) exists to
+prevent. A `risk` guard is Info, filed nowhere, and is no candidate,
 so a clean Sunday discloses nothing and runs silent; `checks_unevaluated[]` and `limitations` on a
 cluster whose read failed; and, in the carried keys the manifest reserves for
 collector-resolved fleet facts, the versions, operations and incident kinds the SOP copies. The
@@ -425,15 +435,18 @@ automatic and both reversible:
 - **Guards.** `guards.json` beside the ledger holds one entry per filed incident, classified or
   not, and one per risk shape found on a clean cluster, each marked `failure` or `risk`: cluster,
   entry (`unclassified` for a symptom no row holds for), object (`namespace/kind/name`), evidence,
-  source (pod or node state, or events alone), first and last seen. An unclassified Warning carries
+  source (pod or node state, or events alone), the check id its incident was filed under, first and
+  last seen, and the number of reviews that have seen it; the last three are what its re-emitted
+  candidate carries (§3.3). An unclassified Warning carries
   a `failure` guard like a classified one, because the guard is what makes the next run re-check
   the cluster for it (§3.2) and re-emit its candidate while it stands (§3.3); without one the
   finding is filed once and announced fixed by the first run that does not re-read the cluster. The
   re-check reads what the symptom came from: a symptom read from pod or node state is looked for
-  again with those reads and cleared when absent; one whose only source was events, such as §4's
-  probe failures, cannot be re-observed after the API server's hour, so its guard is held, reported
-  as still live and not re-checkable, and cleared by the cluster's next full review when the
-  symptom is absent. The collector merges the file on
+  again with those reads and, when absent, cleared, which emits no candidate and lets the harness
+  resolve the finding; one whose only source was events, such as §4's probe failures, cannot be
+  re-observed after the API server's hour, so its guard is held and its candidate re-emitted,
+  marked not re-checkable, until the cluster's next full review clears it with the symptom absent.
+  The collector merges the file on
   every run (new, seen again, gone when the cluster is reviewed or re-checked and the symptom or
   shape is absent, and dropped with a cluster that left the fleet). The daily readiness watch, once
   it ships, reads the file through its own sandbox hop and adds a line per live guard to its next
@@ -441,8 +454,9 @@ automatic and both reversible:
   the drain on `seeded-upgrade/pinned-batch-runner`'s budget; it still allows no disruption".
 - **The stream's ledger issue.** Where the install has a repository, the retrospective is a
   fleet-audit stream and keeps what every stream keeps: exactly one open issue, rewritten in full
-  on every run, with each finding identified by cluster and object and closed by a run that finds
-  nothing. That one issue is the (C) checklist for the whole fleet; a per-cluster issue would need a
+  on every run, with each finding identified by check id, cluster, namespace and object, held
+  across runs by §3.3's rule, and closed by a run that finds nothing. That one issue is the (C)
+  checklist for the whole fleet; a per-cluster issue would need a
   ledger mode the skill does not have and the skill forbids opening issues any other way.
 
 Opening a pull request for a manifest change is not (D). The retrospective is a fleet-audit stream,
@@ -617,7 +631,9 @@ comes from the collector's JSON, which keeps the per-cluster data and the same t
   operation, unchanged, forced; `--after-upgrade` against the window's two bounds, the reviewed
   list pruned at the window, and the no-baseline line when no full run is recorded); the ledger
   and guards round trips, an unclassified symptom's guard among them, held when event-only and
-  cleared by a review; an unreachable cluster and an upgrading cluster recorded without failing
+  cleared by a review; a persisting guard's candidate under its original check id with first seen
+  and the review count, and a cleared guard emitting nothing (the manifest against
+  `still_flagged_ids`); an unreachable cluster and an upgrading cluster recorded without failing
   the run and without a candidate; the watch marking nothing for a paused, disabled or absent
   job; the report rendering, including an empty section and the severity of each fixture
   incident.
