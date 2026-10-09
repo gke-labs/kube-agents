@@ -966,15 +966,14 @@ It lives in **`GoogleCloudPlatform/oss-test-infra`** — where this repo's Prow 
 `hack/ci-env.sh`'s reference to `oss-test-infra#2655` — not in this repo, which is why no change
 here can alter its schedule, budget or identity. What it has to be:
 
-| Requirement                                                   | Why                                                                                                                                                                                                                                                                                       |
-| ------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| A **nightly periodic** on `main`, not a postsubmit            | Cost, and it is not close — see below. The evidence stays attributable: `extra_refs` checks out `main`'s head and `record` stamps each line with the SHA it ran on, so a periodic identifies its commit exactly as a postsubmit would.                                                    |
-| `JOB_TYPE` in {`periodic`, `postsubmit`}, `PULL_NUMBER` unset | Both guards key on this. The empty `PULL_NUMBER` is the one doing the real work — neither job type is a pull request.                                                                                                                                                                     |
-| Sets `EVAL_BASELINE_STORE` to the bucket                      | Unset, the append lands in the git checkout and dies with the workspace. This is what closes the loop.                                                                                                                                                                                    |
-| Sets `PULL_PULL_SHA` from the checkout                        | A periodic has none, and `hack/ci-deploy.sh` falls back to the literal `latest`, so every night tags its build `pr-local-latest`. The evidence's own `commit` does not depend on it: `hack/ci-eval-pr.sh` stamps `record` with the checkout's HEAD when Prow supplies no `PULL_BASE_SHA`. |
-| Runs as an SA with `objectCreator` **and** `objectViewer`     | It appends, and it reads the store to compute its own verdict. Creator alone cannot read back.                                                                                                                                                                                            |
-| Alerts on failure; `optional` must not appear                 | A periodic gates nothing, so nothing downstream notices it break. `optional` is a presubmit-only Tide field.                                                                                                                                                                              |
-| `EVAL_REPETITIONS` need not match the presubmit's             | See "why the counts may differ" below. What must match is how a single run is produced, not how many were taken; the nights to admission are `ceil(20 / EVAL_REPETITIONS)`.                                                                                                               |
+| Requirement                                                   | Why                                                                                                                                                                                                                                    |
+| ------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| A **nightly periodic** on `main`, not a postsubmit            | Cost, and it is not close — see below. The evidence stays attributable: `extra_refs` checks out `main`'s head and `record` stamps each line with the SHA it ran on, so a periodic identifies its commit exactly as a postsubmit would. |
+| `JOB_TYPE` in {`periodic`, `postsubmit`}, `PULL_NUMBER` unset | Both guards key on this. The empty `PULL_NUMBER` is the one doing the real work — neither job type is a pull request.                                                                                                                  |
+| Sets `EVAL_BASELINE_STORE` to the bucket                      | Unset, the append lands in the git checkout and dies with the workspace. This is what closes the loop.                                                                                                                                 |
+| Runs as an SA with `objectCreator` **and** `objectViewer`     | It appends, and it reads the store to compute its own verdict. Creator alone cannot read back.                                                                                                                                         |
+| Alerts on failure; `optional` must not appear                 | A periodic gates nothing, so nothing downstream notices it break. `optional` is a presubmit-only Tide field.                                                                                                                           |
+| `EVAL_REPETITIONS` need not match the presubmit's             | See "why the counts may differ" below. What must match is how a single run is produced, not how many were taken; the nights to admission are `ceil(20 / EVAL_REPETITIONS)`.                                                            |
 
 **Why nightly and not per-merge.** This was specified as a postsubmit and the arithmetic overturned
 it. `main` takes about ten merges a day — 310 in the thirty days to 2026-08-26 — and the job
@@ -1027,9 +1026,8 @@ reproduced here — a copy in a second repository is a copy that goes stale, and
 the part that matters.
 
 **Its script body is the presubmit's, byte-for-byte, plus its exports** — `EVAL_TIER` to select
-the nightly matrix, `EVAL_BASELINE_STORE` to close the loop, `PULL_PULL_SHA` from the checkout (the
-table above), and `EVAL_REPETITIONS` only if the job overrides the script's default — with their
-comments, and nothing removed. That is a
+the nightly matrix, `EVAL_BASELINE_STORE` to close the loop, and `EVAL_REPETITIONS` only if the
+job overrides the script's default — with their comments, and nothing removed. That is a
 deliberate choice over factoring: the two jobs must agree on how a single run is produced, and a
 copy that is obviously a copy fails loudly under `diff` where a subtly different harness does not.
 It duplicates ~140 lines of Boskos lease, heartbeat and cleanup logic, and the right fix is to move
@@ -1153,12 +1151,6 @@ periodics:
               # Wider fan-out than the presubmit's 4: the nightly runs alone on
               # the model quota at this hour (see the timeout comment above).
               export EVAL_TASK_PARALLELISM="6"
-              # A periodic has no PULL_PULL_SHA, and ci-deploy.sh falls back to
-              # the literal "latest", so every night would tag its build
-              # pr-local-latest. extra_refs has already checked out main's
-              # head. (The evidence's commit does not depend on this: the
-              # script stamps record with HEAD when PULL_BASE_SHA is absent.)
-              export PULL_PULL_SHA="$(git rev-parse HEAD)"
               # The one line that makes this job a baseline recorder.
               # Unset, bench-gate record appends into the git checkout and
               # the append dies with the workspace -- which is exactly what

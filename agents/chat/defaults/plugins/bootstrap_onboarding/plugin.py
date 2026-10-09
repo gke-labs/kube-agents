@@ -14,6 +14,18 @@ except ImportError:
     update_job = None  # type: ignore[assignment]
     trigger_job = None  # type: ignore[assignment]
 
+# Apart from the imports above, so a Hermes without these names still binds the
+# delivery job and greets.
+try:
+    from gateway.config import HomeChannel, Platform, load_gateway_config, persist_home_channel
+    from hermes_cli.config import save_env_value
+except ImportError:
+    HomeChannel = None  # type: ignore[assignment,misc]
+    Platform = None  # type: ignore[assignment,misc]
+    load_gateway_config = None  # type: ignore[assignment]
+    persist_home_channel = None  # type: ignore[assignment]
+    save_env_value = None  # type: ignore[assignment]
+
 logger = logging.getLogger(__name__)
 
 DELIVERY_JOB_ID = "bootstrap-inventory-delivery"
@@ -21,6 +33,15 @@ DELIVERY_JOB_ID = "bootstrap-inventory-delivery"
 # positive allowlist so new local or request/response surfaces fail closed until
 # they explicitly implement durable delivery.
 DURABLE_CHAT_PLATFORMS = {"google_chat", "slack"}
+# The legacy home-channel env var /sethome mirrors. Hermes names both durable
+# platforms' by this pattern; the thread id's is the same name plus a suffix.
+HOME_CHANNEL_ENV_FORMAT = "{}_HOME_CHANNEL"
+HOME_THREAD_ENV_SUFFIX = "_THREAD_ID"
+SESSION_PLATFORM_ENV = "HERMES_SESSION_PLATFORM"
+SESSION_CHAT_ID_ENV = "HERMES_SESSION_CHAT_ID"
+SESSION_CHAT_NAME_ENV = "HERMES_SESSION_CHAT_NAME"
+SESSION_USER_ID_ENV = "HERMES_SESSION_USER_ID"
+SESSION_SCOPE_ID_ENV = "HERMES_SESSION_SCOPE_ID"
 
 # Written once the opening turn has been primed. Onboarding is a ONE-TIME
 # event, but ``.bootstrap_completed`` only appears at the very end of the
@@ -132,6 +153,50 @@ def _bind_delivery_to_origin(**kwargs: Any) -> bool:
         return False
 
 
+def _set_home_channel_if_unset(**kwargs: Any) -> None:
+    """Make this chat the platform's home channel when none is configured.
+
+    ``deliver: chat`` jobs and the chat relay post to the home channel, and a
+    fresh install has none until someone runs ``/sethome``, so every scheduled
+    report is dropped until then. A configured channel is left alone, whether
+    ``/sethome`` or the CR's ``homeChannel`` (a home-channel env var) set it.
+    The write goes through ``persist_home_channel``, as ``/sethome``'s does: a
+    ``home_channel`` block without ``platform`` or ``chat_id`` raises out of
+    ``load_gateway_config`` and stops cron delivery for every platform.
+    """
+    if None in (get_session_env, HomeChannel, Platform, load_gateway_config, persist_home_channel):
+        return
+    try:
+        platform = Platform(get_session_env(SESSION_PLATFORM_ENV) or str(kwargs.get("platform") or ""))
+        chat_id = str(get_session_env(SESSION_CHAT_ID_ENV) or "")
+        if not chat_id or load_gateway_config().get_home_channel(platform) is not None:
+            return
+        # No thread_id: a home channel pinned to the opening message's thread would
+        # put every scheduled report into that one thread.
+        persist_home_channel(
+            HomeChannel(
+                platform=platform,
+                chat_id=chat_id,
+                name=get_session_env(SESSION_CHAT_NAME_ENV) or chat_id,
+                user_id=get_session_env(SESSION_USER_ID_ENV) or None,
+                scope_id=get_session_env(SESSION_SCOPE_ID_ENV) or None,
+            )
+        )
+        logger.info("Set the %s home channel to %s.", platform.value, chat_id)
+    except Exception as e:
+        logger.warning("Could not set the home channel: %s", e)
+        return
+    # The legacy env mirror /sethome also writes, for consumers that read it.
+    if save_env_value is None:
+        return
+    env_var = HOME_CHANNEL_ENV_FORMAT.format(platform.value.upper())
+    try:
+        save_env_value(env_var, chat_id)
+        save_env_value(env_var + HOME_THREAD_ENV_SUFFIX, "")
+    except Exception as e:
+        logger.warning("Home channel saved but %s was not: %s", env_var, e)
+
+
 def _eval_request(data_dir: Path, user_message: str) -> Optional[bool]:
     """The eval seam's request whose phrase is in this turn's message, if any.
 
@@ -198,7 +263,7 @@ def handle_pre_llm_call(**kwargs: Any) -> Optional[Dict[str, str]]:
     turn that primes it, this:
       1. binds the delivery job to this chat and, only if that succeeded,
          marks ``.user_aligned`` so the delivery job may fire against a valid
-         target;
+         target, and makes this chat the home channel if none is configured;
       2. triggers the delivery job so the report arrives promptly;
       3. injects a short greeting instruction — never the inventory itself. The
          report is delivered by the ``no_agent`` delivery job, verbatim, or
@@ -251,6 +316,8 @@ def handle_pre_llm_call(**kwargs: Any) -> Optional[Dict[str, str]]:
     if not _bind_delivery_to_origin(**kwargs):
         logger.info("No deliverable chat origin on this turn; leaving onboarding unprimed.")
         return None
+
+    _set_home_channel_if_unset(**kwargs)
 
     try:
         (data_dir / ".user_aligned").touch(exist_ok=True)

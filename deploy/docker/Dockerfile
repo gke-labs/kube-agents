@@ -2262,6 +2262,13 @@ RUN set -eu; \
 # ignored context_file_max_chars, would otherwise drop the middle of the prompt
 # with nothing but a log line. Each check runs in a scratch HERMES_HOME holding a
 # copy of the template's config.yaml, so Hermes writes nothing into the template.
+#
+# The same --build-check also reads the terminal tool's default call timeout out
+# of this Hermes (TERMINAL_TIMEOUT in tools/terminal_tool.py) and fails the build
+# when /opt/defaults/scripts/cluster_preflight.sh's mirror of it disagrees: the
+# preflight budgets its brokered calls under that default, and a Hermes bump that
+# moves it has to move the mirror with it rather than leave the preflight to be
+# killed by the tool before it prints its JSON.
 RUN set -eu; \
     if [ -e /opt/credential-proxy ]; then \
       echo "credential-proxy shims are back in the agent image: /opt/credential-proxy exists" >&2; \

@@ -120,6 +120,67 @@ resource "google_project_service_identity" "logging" {
   service = "logging.googleapis.com"
 }
 
+# Minting the agent and being able to bind it are not the same moment. The call
+# above returns as soon as Service Usage has accepted the request, and on a
+# project that did not already have the agent, IAM will not resolve the account
+# for some seconds after that. With only a depends_on edge between the call and
+# the grant below, the grant is what ran into that:
+#
+#   Error applying IAM policy for pubsub topic ".../platform-agent-drift-audit":
+#   googleapi: Error 400: Service account
+#   service-<n>@gcp-sa-logging.iam.gserviceaccount.com does not exist.
+#
+# Six of 32 projects in the #2424 backfill sweep -- about one in five, and
+# exactly the projects whose agent did not pre-exist (#2693). Not a backfill
+# problem: a fresh install on a project with no Logging agent hits the same
+# ordering. The apply stops there, leaving the topic created and both the grant
+# and the sink absent, so the pipeline that results is not the silently-inert
+# one the grant's own comment describes -- nothing is exporting at all -- but it
+# does take a second run by hand to finish.
+#
+# There is nothing to wait on: IAM reports a missing account and a
+# not-yet-propagated one identically, which is why this is the same kind of
+# timer as sink_drain below rather than a poll. Paid on the first apply that
+# carries this resource -- a new install pays it on its first apply of the
+# module, and an install that already had the ingress pays it on the next
+# apply of any kind, because the wait is new to its state even though the
+# identity is not -- and after that only when one of the triggers below moves,
+# which is a re-minted identity or a changed duration.
+# A project whose agent already existed gains nothing from it and cannot be
+# told apart from one that needs it.
+resource "time_sleep" "logging_identity" {
+  create_duration = var.logging_identity_propagation_duration
+
+  # Both keys are load-bearing, and the ordering is a side effect of the first
+  # rather than the reason for it: referencing the identity is what puts this
+  # after the mint, so there is no depends_on here and adding one would say
+  # nothing the reference does not.
+  #
+  # logging_service_identity re-pays the wait when the identity is re-minted,
+  # which an ordering edge alone would not do -- depends_on orders, it does not
+  # propagate replacement. Changing project_id is the case: project is ForceNew
+  # on the identity and member is ForceNew on the grant, so both are replaced
+  # and the race is live again, while a sleep keyed on nothing sits in state
+  # contributing no delay.
+  #
+  # duration is what makes "raise it and re-apply" work, which is the remedy
+  # this module's variable, the composition's, and both READMEs all offer for a
+  # project that still loses the race. Without it they promise something the
+  # resource does not do. Measured against the time provider: raising
+  # create_duration from 5s to 60s on an existing time_sleep plans as "updated
+  # in-place" and applies in 1s -- "Modifications complete after 0s", no delay
+  # at all -- where the same raise with a moved trigger forces replacement and
+  # takes the full 60s. The sleep is always already in state by the time a
+  # grant can fail, since the grant depends on it, so without this key the
+  # re-apply retries the grant with no wait and succeeds or fails on whatever
+  # wall-clock passed between the two runs. The cost is that lowering the value
+  # also re-pays the wait once, at the new lower figure.
+  triggers = {
+    logging_service_identity = google_project_service_identity.logging.id
+    duration                 = var.logging_identity_propagation_duration
+  }
+}
+
 resource "google_pubsub_topic" "drift_audit" {
   #checkov:skip=CKV_GCP_83:Drift audit topic uses default Google-managed encryption keys
   project = var.project_id
@@ -206,7 +267,10 @@ resource "google_pubsub_topic_iam_member" "sink_writer" {
   role    = "roles/pubsub.publisher"
   member  = local.expected_sink_writer_identity
 
-  depends_on = [google_project_service_identity.logging]
+  # time_sleep.logging_identity, not google_project_service_identity.logging:
+  # the identity resource returning is not the point at which IAM will bind
+  # what it minted. The comment above that wait has the measurement.
+  depends_on = [time_sleep.logging_identity]
 }
 
 # Deleting a sink does not stop the export at the same instant. The Log Router

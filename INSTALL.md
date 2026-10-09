@@ -494,6 +494,7 @@ If you enabled Google Chat or Slack during the install, perform the following re
    - Under **Visibility**, select **Specific people and groups in your domain** and enter your email address (`ALLOWED_USERS`).
 2. **Send a Test Direct Message**:
    - Send a DM to the bot in Google Chat with the message `"Hi Platform Agent"`.
+   - If you left `GOOGLE_CHAT_HOME_CHANNEL` empty and this is the install's first chat message on either platform, it makes its space the home channel, where scheduled reports post. To send them to a team space instead, send the first message there, or run `/sethome` there afterwards.
 3. **Approve Pairing Code (Optional / First-time setup)**:
    - If pairing mode is enabled, approve the pairing code displayed in the gateway logs:
      ```bash
@@ -514,6 +515,7 @@ If you enabled Google Chat or Slack during the install, perform the following re
    - `reactions:write` fails more quietly still. The agent adds a reaction for the kind of ask when it picks the work up, ⏸️ while work waits on you, and ❌ on failure (with `KAGE_SLACK_UX=false` it puts 👀 on a message when it picks the work up and adds ✅ or ❌ beside it when the turn ends); without the scope Slack rejects each of those with `missing_scope`, the adapter logs it at debug and carries on, and the answer still arrives. The only symptom is that no reaction ever appears. Add the scope and reinstall.
 2. **Test Bot Connection**:
    - Invite the bot to a channel or send a direct message: `"Hi Platform Agent"`.
+   - If you left `SLACK_HOME_CHANNEL` empty and this is the install's first chat message on either platform, it makes its channel or DM the home channel, where scheduled audits post (step 5).
 3. **Approve Pairing Code (Optional / First-time setup)**:
    - If pairing mode is enabled, approve the pairing code displayed in the gateway logs:
      ```bash
@@ -526,8 +528,8 @@ If you enabled Google Chat or Slack during the install, perform the following re
      ```
    - Paste the JSON into the Slack App Console (**Features → App Manifest → Edit**), save, and reinstall when Slack prompts. That manifest replaces the whole app definition — to keep an app you have already configured, add `--slashes-only` and merge the printed array into the existing `features.slash_commands`.
    - This adds Slack's autocomplete, not the behaviour: a typed `/hermes <subcommand>` works either way, because the Planning Agent's `legacy_slash_commands` plugin unwraps it before the gateway resolves the command.
-5. **Set the Home Channel (if you left `SLACK_HOME_CHANNEL` empty)**:
-   - Scheduled audits have nowhere to post until one is set. From the Slack channel you want, run `/sethome` (or `/hermes sethome`). It takes effect immediately and persists across restarts.
+5. **Set or Move the Home Channel (if you left `SLACK_HOME_CHANNEL` empty)**:
+   - If step 2's message was the install's first chat message, it set the home channel to the channel or DM it came from. If Google Chat received the first message instead, Slack has none, and scheduled audits have nowhere to post on Slack. Either way, run `/sethome` (or `/hermes sethome`) from the Slack channel you want. It takes effect immediately and persists across restarts.
 
 - Re-display these instructions at any time from the repository root:
   ```bash
@@ -1002,8 +1004,9 @@ kubectl exec deploy/platform-agent-gateway -n kubeagents-system -c platform-agen
 Each audit's report is a ledger issue in the GitOps repository, so the audits need the GitHub
 integration: with no GitOps repository configured, every run fails before it audits anything. A
 run that changed something since the last one also posts a one-line summary linking the issue to
-the home channel of each enabled chat platform (the Slack channel is set in Step 5, the Google Chat
-one by `GOOGLE_CHAT_HOME_CHANNEL`), and an audit can open remediation pull requests in the
+the home channel of each enabled chat platform (wherever `/sethome` last ran; otherwise the chat
+the install's first chat message came from; otherwise `SLACK_HOME_CHANNEL` or
+`GOOGLE_CHAT_HOME_CHANNEL` from the install), and an audit can open remediation pull requests in the
 repository.
 [Autonomous watchdogs](docs/site/src/content/docs/concepts/autonomous-watchdogs.md) covers the
 schedule and delivery, and

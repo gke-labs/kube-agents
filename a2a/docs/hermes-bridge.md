@@ -33,20 +33,22 @@ cross-pod, which RWO only allows with same-node scheduling games. Not worth it f
 component we intend to delete.
 
 The rendered container is the agent container, copied: its env, `envFrom`, mounts,
-`securityContext`, resources and pull policy, so it runs Hermes against the agent's profile
+`securityContext` and pull policy (but not its resources, below), so it runs Hermes against the agent's profile
 state on the agent's PVC, as the pod's KSA (model auth via Workload Identity for free). Two
 things are taken out. The agent's own values for the names the bridge sets for itself, and
 the agent's bus identity: `AGENT_SHARED_STATE_SETUP`, `NATS_URL`, `NATS_USER`,
-`NATS_PASSWORD`, `BRIDGE_CONCURRENCY`, `BRIDGE_EXECUTOR`, `A2A_ACTIVITY_SECRET` and
-`A2A_BUS_USER`. And the `a2a-bus-token` mount, the `agent` principal's credential, which the
+`NATS_PASSWORD`, `BRIDGE_CONCURRENCY`, `BRIDGE_EXECUTOR`, `A2A_ACTIVITY_SECRET`,
+`API_SERVER_KEY` and `A2A_BUS_USER`. And the `a2a-bus-token` mount, the `agent` principal's credential, which the
 bridge never holds ([Bus user and grants](#bus-user-and-grants)). Ports and probes are not
 copied. On top go the bridge's own: `AGENT_SHARED_STATE_SETUP=skip`, so the image's
 entrypoint runs its container-local init and execs the bridge as it does for the dashboard
 container; `NATS_URL` for the `<agent>-a2a-nats` Service; `NATS_USER=bridge` and
 `NATS_PASSWORD` from the `bridge-password` key of `<agent>-a2a-nats-creds`;
 `BRIDGE_CONCURRENCY`; and `A2A_ACTIVITY_SECRET` from the same Secret's `bridge-activity-key`,
-optional. The `api` executor needs the pod's `API_SERVER_KEY`, which the copy carries
-([Executors](#executors)).
+optional; and `API_SERVER_KEY`, the bearer the agent's API server accepts, which the `api`
+executor needs ([Executors](#executors)). It is set rather than inherited because the agent
+container's entry can come from an AgentPlugin's env, and a blank or unresolvable one would
+quietly switch the bridge to `cli`.
 
 The image is `A2A_BRIDGE_IMAGE` when that is set. Unset, and when the agent container runs
 the release `platform-agent` image by tag, it is that image's registry and tag with the last
@@ -55,15 +57,16 @@ of the same commit, so the two containers are one build. Otherwise - an agent im
 custom repository name, which has no bridge published beside it, or one pinned by digest
 alone, which the swap cannot carry over - it is the image the other release A2A images
 resolve to, derived from the operator image the way `A2A_GATEWAY_IMAGE` and the rest are
-when unset. An install that runs a custom agent image sets `A2A_BRIDGE_IMAGE`. Three
+when unset. An install that runs a custom agent image sets `A2A_BRIDGE_IMAGE`. Four
 operator settings shape the rendered bridge. The operator reads them from its own
 environment, as it reads `A2A_INJECT_BACKEND`; no CR field carries them.
 
-| Operator env             | What it sets                      | Unset                                                                                                                                                                     |
-| ------------------------ | --------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `A2A_BRIDGE_IMAGE`       | the bridge's image                | derived as above                                                                                                                                                          |
-| `A2A_BRIDGE_CONCURRENCY` | the bridge's `BRIDGE_CONCURRENCY` | 10, Hermes's own gateway pool (not the bridge's default of 2)                                                                                                             |
-| `A2A_BRIDGE_EXECUTOR`    | the bridge's `BRIDGE_EXECUTOR`    | not rendered, so the bridge's shipped default decides: `api`, given the key. A value other than exactly `api` or `cli` is treated as unset, and the operator logs it once |
+| Operator env             | What it sets                                                         | Unset                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| ------------------------ | -------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `A2A_BRIDGE_IMAGE`       | the bridge's image                                                   | derived as above                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| `A2A_BRIDGE_CONCURRENCY` | the bridge's `BRIDGE_CONCURRENCY`                                    | 10, Hermes's own gateway pool (not the bridge's default of 2)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| `A2A_BRIDGE_EXECUTOR`    | the bridge's `BRIDGE_EXECUTOR`                                       | not rendered, so the bridge's shipped default decides: `api`, given the key. A value other than exactly `api` or `cli` is treated as unset, and the operator logs it once                                                                                                                                                                                                                                                                                                                                                                               |
+| `A2A_BRIDGE_RESOURCES`   | the bridge's resources, a `ResourceRequirements` in JSON, used whole | the `api`-sized defaults below, or under `cli` a copy of the agent container's. A value that isn't one `ResourceRequirements` (not JSON, an unknown field, neither requests nor limits, or content after it), or that the API server would refuse or the scheduler misread (a resource other than cpu, memory or ephemeral-storage, a negative quantity, a zero limit, a CPU quantity past what an int64 holds in millicores (a memory quantity that large is clamped by the parser), claims, or a request above its limit), is ignored and logged once |
 
 The TASKS consumer reserve reads the same `A2A_BRIDGE_CONCURRENCY` the bridge is given
 ([sizing](#sizing-against-the-eval-harness)), and the `api` executor's pod-wide hook is
@@ -100,12 +103,22 @@ mode and again when the bridge arrives after the Job. The agent Deployment's str
 agent outage: the old pod stops before the new one starts. Once `BusProvisioned` has been
 `True` the bridge stays in the pod on later renders.
 
-**It doubles the agent container's share of the pod.** The rendered container copies the
-agent container's resources, so the pod carries two of them. With the defaults (requests 1
-CPU and 2Gi, limits 3 CPU and 8Gi) the bridge adds another 1 CPU/2Gi of requests and 3
-CPU/8Gi of limits, roughly doubling the agent pod's requests, and a node or namespace quota
-sized for the `today` pod may not schedule the `next` one. `spec.deployment.resources` sizes
-both containers together; no setting sizes the bridge alone.
+**It has its own resources, sized for the `api` executor.** The rendered bridge requests 100m
+CPU and 256Mi, with limits of 1 CPU and 512Mi. The request is sized to live under on its
+own, since GKE Autopilot without Pod bursting sets every limit to its request. On `api`, the default, it's a Go relay that
+holds one HTTP request per task to the agent container's API server, and the turn itself
+runs in the agent container. Measured idle it uses about 1m CPU and 5Mi
+([#2748](https://github.com/gke-labs/kube-agents/issues/2748)). It used to copy the agent
+container's resources, which doubled the agent pod's requests and could leave a `next` pod
+unschedulable on a cluster sized for `today`.
+
+The `cli` executor doesn't fit these. It runs a one-shot `hermes chat` per task, about
+430Mi each, up to `BRIDGE_CONCURRENCY` of them. So under `cli` with no `A2A_BRIDGE_RESOURCES`
+the bridge keeps the copy of the agent container's resources it had before, and an install
+that pinned `cli` upgrades with its bridge unchanged. The operator logs that once and names
+the override. To size a `cli` bridge on purpose, set `A2A_BRIDGE_RESOURCES` with a memory
+limit of about 430Mi times the concurrency, plus headroom. A set override wins under either
+executor.
 
 **A CR-declared bridge wins.** A sidecar on `spec.deployment.sidecars` is a declared bridge
 if it is named `hermes-bridge`, if its `env` sets `BRIDGE_CONCURRENCY`, or if it runs the
@@ -354,8 +367,7 @@ up to `BRIDGE_CONCURRENCY`, and a task waiting for its session's turn holds a wo
 The sidecar starts with the agent container, so the bridge can be consuming before the API
 server listens. A refused connection is retried every second for two minutes; it never reached
 the server, so the retry cannot run a turn twice. The server ignores the session headers
-without `API_SERVER_KEY`, so the executor needs it. The rendered bridge copies the agent
-container's env, which carries it; a hand-declared sidecar must set it, and
+without `API_SERVER_KEY`, so the executor needs it. The rendered bridge sets it itself; a hand-declared sidecar must set it, and
 `A2A_ACTIVITY_SECRET` from the `bridge-activity-key` entry of the a2a creds Secret for the tool
 trace. With `BRIDGE_EXECUTOR` unset and no key, the bridge logs a warning and runs the `cli`
 executor, so a sidecar declared before `api` existed keeps working; `BRIDGE_EXECUTOR=api` with
@@ -466,6 +478,16 @@ deadline (default 7200s, matching the profile's `activeDeadlineSeconds`), which 
 turn of the task, takes the same kill path and lands `failed` (`reason: deadline-exceeded - killed
 after …`; on `api`, `request ended after …`, with `; turn: N` for a follow-up turn); no follow-up
 turn starts once it has passed.
+
+The reap after any exit is bounded by the same grace. A process the subprocess started outside
+its group survives the group kill and can hold stdout or stderr open; the bridge stops waiting
+for the output one grace after the subprocess is reaped. A run killed by the deadline or a cancel
+whose reap ran that long adds `the reap after the kill ran the full <grace>, so a process hermes
+started may still hold its output` to its reason as detail, keeping the token intact:
+`reason: canceled-by-request - the reap after the kill ...`. A run killed by bridge shutdown
+carries the plain `bridge-shutdown` reason, published before the reap ends. A run that exited 0
+still completes: what it wrote was copied during the grace, and only the escaped process's later
+output is dropped.
 
 A cancel for a task still queued finalizes it `canceled` with `reason: canceled-before-start`
 and nothing is spawned, and the worker looks for one itself before it spawns. The durable

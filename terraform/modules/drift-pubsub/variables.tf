@@ -74,6 +74,19 @@ variable "sink_drain_duration" {
   }
 }
 
+variable "logging_identity_propagation_duration" {
+  description = "How long the apply waits, after asking Service Usage to mint the project's Logging service agent, before granting it roles/pubsub.publisher on the topic. A project that did not already have the agent cannot bind it the instant the call returns, and the grant fails with \"Service account service-<project-number>@gcp-sa-logging.iam.gserviceaccount.com does not exist\" -- measured at about one in five projects. The wait is a timer because IAM reports a missing account and a not-yet-propagated one identically, so there is nothing to poll. The 60s default is a chosen margin, not a measured propagation time; raise it if the apply still fails that way, and the raised value is paid on the re-apply -- the wait is keyed on this variable as well as on the identity, because raising create_duration on its own is an in-place update that runs no delay. Paid on the first apply that carries this resource -- the first apply of the module on a new install, the next apply of any kind on an install that already had it -- and after that only on an apply that re-mints the identity or changes this value, the two things the wait is keyed on. Lower it only on a project whose Logging agent already exists, where the wait buys nothing -- and before the first apply that carries the wait, because lowering it afterwards re-creates the wait and pays the new lower figure once rather than refunding the one already paid."
+  type        = string
+  default     = "60s"
+
+  # Same form as sink_drain_duration above, for the same reason: time_sleep
+  # takes a number and exactly one of ms, s, m or h.
+  validation {
+    condition     = can(regex("^[0-9]+(\\.[0-9]+)?(ms|s|m|h)$", var.logging_identity_propagation_duration))
+    error_message = "logging_identity_propagation_duration must be a number followed by one of ms, s, m or h, e.g. 60s or 2m. time_sleep does not accept the multi-unit form (1m30s). An empty value is not the default: a blank TF_VAR_ line exports \"\" and overrides the default, so remove the line rather than blanking it."
+  }
+}
+
 variable "sink_writer_identity_override" {
   description = "The principal to grant roles/pubsub.publisher on the topic, overriding the service-<project-number>@gcp-sa-logging.iam.gserviceaccount.com the module derives. Include the \"serviceAccount:\" prefix. The module derives the identity rather than reading it off the sink so the grant can precede the sink, and a sink carrying some other writer identity would otherwise fail the sink's postcondition on every subsequent plan with no way out short of editing the module. Set this to whatever Logging reports for the sink and both the grant and the postcondition follow it. Leave null unless an apply has told you to set it."
   type        = string
