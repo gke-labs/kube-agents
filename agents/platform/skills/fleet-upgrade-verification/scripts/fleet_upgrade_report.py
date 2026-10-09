@@ -250,6 +250,10 @@ NARROWED_RUN_NOTE = "Narrowed by --cluster: the rollout record was neither read 
 # could not be listed: an empty table with exit 0 would read as "nothing to grade".
 UNMATCHED_CLUSTER_SPEC = "no cluster matched --cluster {spec} in {projects}"
 EXIT_USAGE = 2
+# `--rollout-in-progress` speaks to the rollout record, which a `--cluster` run neither
+# reads nor writes: the pair is refused, as `--at` without `--readiness` is, rather than
+# accepted and ignored.
+ROLLOUT_FLAG_NEEDS_FULL_READ = "--rollout-in-progress needs a full read: a --cluster run neither reads nor writes the rollout record"
 
 
 def run_cmd(cmd: list[str], timeout: int = GCLOUD_TIMEOUT_SECONDS, env: dict | None = None) -> tuple[int, str, str]:
@@ -635,14 +639,12 @@ def assess_readiness(cluster: dict, member: dict, items: list | None, read_error
     }
 
 
-def _wanted(cluster: dict, wanted: set[tuple[str, str]]) -> tuple[str, str] | None:
-    """The `--cluster` spec this cluster satisfies, or None."""
+def _wanted(cluster: dict, wanted: set[tuple[str, str]]) -> list[tuple[str, str]]:
+    """Every `--cluster` spec this cluster satisfies: its qualified form, its bare form,
+    or both when the caller named it both ways. Empty when it was not asked for."""
     name = cluster.get("name", "")
     location = cluster.get("location", "")
-    for spec in ((location, name), ("", name)):
-        if spec in wanted:
-            return spec
-    return None
+    return [spec for spec in ((location, name), ("", name)) if spec in wanted]
 
 
 def build_report(projects: list[str], explicit_target: str | None, readiness_options: dict | None = None, clusters: list[str] | None = None) -> dict:
@@ -675,10 +677,12 @@ def build_report(projects: list[str], explicit_target: str | None, readiness_opt
             if not isinstance(cluster, dict):
                 continue
             if wanted is not None:
-                hit = _wanted(cluster, wanted)
-                if hit is None:
+                hits = _wanted(cluster, wanted)
+                if not hits:
                     continue
-                matched.add(hit)
+                # Every spec the cluster satisfies counts, not the first: a bare and a
+                # qualified spec for one cluster are one request, not a hit and a miss.
+                matched.update(hits)
             member = grade_member(cluster, project, explicit_target, cache)
             if readiness_options is not None:
                 items, read_error, path = read_cluster_objects(cluster, project, readiness_options["kubeconfig_dir"])
@@ -1086,6 +1090,9 @@ def main(argv: list[str] | None = None) -> int:
         readiness_options = {"at": at, "kubeconfig_dir": args.kubeconfig_dir or default_kubeconfig_dir()}
     elif args.at or args.kubeconfig_dir:
         sys.stderr.write("--at and --kubeconfig-dir need --readiness\n")
+        return EXIT_USAGE
+    if args.cluster and args.rollout_in_progress:
+        sys.stderr.write(ROLLOUT_FLAG_NEEDS_FULL_READ + "\n")
         return EXIT_USAGE
 
     listing_errors: list[str] = []

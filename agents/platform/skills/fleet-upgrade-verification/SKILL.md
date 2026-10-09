@@ -35,8 +35,10 @@ Neither reads versions against a target.
   `<location>/<name>` or a bare name; every other member of the projects is skipped, reads
   included, and the rollout record is neither read nor written, since a narrowed read would file
   every member it did not name as gone. A spec that matches no cluster in the projects is an
-  error line and exit 1, not an empty table. The fleet-audit collector passes the clusters it
-  found behind.
+  error line and exit 1, not an empty table; one cluster named in both forms is one request, not
+  a hit and a miss. `--rollout-in-progress` beside `--cluster` is a usage error (exit 2): the flag
+  speaks to the rollout record, which a narrowed run does not touch. The fleet-audit collector
+  passes the clusters it found behind.
 - `--project` is repeatable and, when given, is the whole scope. Without it the script takes the
   union of `GCP_PROJECT_ID`, `GKE_PROJECT_ID` and `PROJECT_ID` with `MONITORED_PROJECT_IDS`
   (comma- or whitespace-separated) when set, or with every project visible to
