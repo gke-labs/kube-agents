@@ -290,34 +290,21 @@ resource "null_resource" "drift_noise" {
       # form, eval-drift-$(date -u +%s)-$RANDOM.
       mint_id() { echo "eval-drift-$(date -u +%s)-$RANDOM"; }
 
+      # Built with python rather than by hand, so the escaping is the
+      # language's problem and not a quoting bug. Every value arrives as a
+      # positional argument and goes through json.dumps, which makes a quote
+      # or a backslash in a principal a non-event instead of a record that
+      # fails json.Unmarshal -- and an unparseable record is nacked and
+      # redelivers on its own backoff until retention expires, because
+      # drift-pubsub deliberately sets no dead_letter_policy. The sibling
+      # stack builds its payload the same way for the same reason.
+      #
+      # status.code 0 is a success. tally tests Succeeded() before it tests
+      # the tier (classify.go), so a record that looks failed is dropped for
+      # the outcome and never reaches the decision this case grades.
       publish_record() {
-        insert_id="$1"; principal="$2"; ns="$3"; workload="$4"; agent="$5"
-        # status.code 0 is a success. tally tests Succeeded() before it tests
-        # the tier (classify.go), so a record that looks failed is dropped for
-        # the outcome and never reaches the decision this case grades.
-        payload="$(cat <<JSON
-      {
-        "insertId": "$insert_id",
-        "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
-        "resource": {
-          "type": "k8s_cluster",
-          "labels": {
-            "project_id": "$project",
-            "location": "${var.host_cluster_location}",
-            "cluster_name": "${var.host_cluster_name}"
-          }
-        },
-        "protoPayload": {
-          "serviceName": "k8s.io",
-          "methodName": "io.k8s.apps.v1.deployments.patch",
-          "resourceName": "apps/v1/namespaces/$ns/deployments/$workload",
-          "authenticationInfo": { "principalEmail": "$principal" },
-          "requestMetadata": { "callerSuppliedUserAgent": "$agent" },
-          "status": { "code": 0 }
-        }
-      }
-      JSON
-      )"
+        payload="$(python3 -c 'import json,sys,datetime; i,pr,ns,wl,ag,proj,loc,cl = sys.argv[1:]; print(json.dumps({"insertId": i, "timestamp": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"), "resource": {"type": "k8s_cluster", "labels": {"project_id": proj, "location": loc, "cluster_name": cl}}, "protoPayload": {"serviceName": "k8s.io", "methodName": "io.k8s.apps.v1.deployments.patch", "resourceName": "apps/v1/namespaces/%s/deployments/%s" % (ns, wl), "authenticationInfo": {"principalEmail": pr}, "requestMetadata": {"callerSuppliedUserAgent": ag}, "status": {"code": 0}}}))' \
+          "$1" "$2" "$3" "$4" "$5" "$project" "${var.host_cluster_location}" "${var.host_cluster_name}")"
         gcloud pubsub topics publish "${var.drift_topic}" --project "$project" \
           --message="$payload" >/dev/null
       }
@@ -413,6 +400,12 @@ resource "null_resource" "drift_noise" {
       # ran and filed nothing: _inject_drift writes notified=0 with an empty
       # delivery_error when the quota refused the record, while a set
       # delivery_error is chat failing, which does not stop the turn.
+      ledger_has_row() {
+        ${local.kubectl} exec -n kubeagents-system "$pod" -c "${var.agent_container}" -- \
+          "$agent_python" -c "import sqlite3,sys; sys.exit(0 if sqlite3.connect('file:${local.ledger_db}',uri=True).execute('select count(*) from intercepted_events where object_uid = ?', (sys.argv[1],)).fetchone()[0] else 1)" \
+          "$1" >/dev/null 2>&1
+      }
+
       ledger_row() {
         ${local.kubectl} exec -n kubeagents-system "$pod" -c "${var.agent_container}" -- \
           "$agent_python" -c "import sqlite3,sys; r=sqlite3.connect('file:${local.ledger_db}',uri=True).execute('select notified, delivery_error from intercepted_events where object_uid = ? order by id desc limit 1', (sys.argv[1],)).fetchone(); print('%s|%s' % (r[0], r[1]) if r else '')" \
@@ -438,7 +431,18 @@ resource "null_resource" "drift_noise" {
       # line a long way back.
       detector_forwarded() {
         ${local.kubectl} logs -n kubeagents-system "$pod" -c agent-api-auth --tail=20000 2>/dev/null \
-          | grep -F "insert_id=$1" >/dev/null
+          | grep -F ": DRIFT " | grep -F "insert_id=$1 " >/dev/null
+      }
+
+      # The classifier's own refusal, when --log-dropped is on. logDroppedRecord
+      # ends its line with insert_id= too, which is why detector_forwarded
+      # anchors on the DRIFT marker: an unanchored needle matches this line and
+      # reports a filtered human record as a loss downstream of the filter --
+      # the finding, reported as not the pipeline's, on exactly the re-run the
+      # ingress-silent branch tells the operator to make.
+      detector_dropped() {
+        ${local.kubectl} logs -n kubeagents-system "$pod" -c agent-api-auth --tail=20000 2>/dev/null \
+          | grep -F "dropped " | grep -F "insert_id=$1" >/dev/null
       }
 
       # ---- 4. The human record, and its turn, before any churn --------------
@@ -454,14 +458,20 @@ resource "null_resource" "drift_noise" {
         "${var.human_namespace}" "${var.human_workload}" "kubectl-edit/v1.31.0"
       echo "human record: insertId=$human_insert_id"
 
+      # The loop's answer is remembered rather than asked again. card_is_finished
+      # returns 1 both for "no terminal card" and for "the exec did not run",
+      # so a 502 or a rolled pod in the gap between the loop and a re-probe
+      # would send a finished card down the install-fault branch and exclude a
+      # healthy repetition with a detail blaming the front door.
       waited=0
+      card_finished=""
       while [ "$waited" -lt "${var.card_timeout_seconds}" ]; do
-        card_is_finished "$human_insert_id" && break
+        if card_is_finished "$human_insert_id"; then card_finished=1; break; fi
         sleep 15
         waited=$(( waited + 15 ))
       done
 
-      if ! card_is_finished "$human_insert_id"; then
+      if [ -z "$card_finished" ]; then
         # Two different worlds, and only one of them is this case's finding.
         # A ledger row means the record reached the daemon and the front door
         # or the ceiling is what failed -- an install fault, which must NOT be
@@ -492,18 +502,25 @@ resource "null_resource" "drift_noise" {
           echo "       Downstream of the filter, so not this case's finding. Excluding the repetition." >&2
           exit 1
         fi
-        # No ledger row splits two ways and this install cannot tell them
-        # apart: Classify dropped a human-tier write (this case's finding in
-        # the other direction), or the record never reached the detector at
-        # all (a dead ingress, the environment's fault). The per-record line
-        # behind --log-dropped is what separates them, and that flag is off on
-        # eval installs by design -- one line per dropped record is tens of
-        # thousands per lease, on every lease.
-        #
-        # So this exits non-zero and the repetition is excluded. Reporting it
-        # as the finding would accuse the agent on evidence that does not
-        # distinguish the two, and a false accusation on a nightly record is
-        # worse than a repetition nobody scored.
+        # A dropped line naming this id is the classifier refusing a human-tier
+        # write, which IS this case's finding in the direction opposite to
+        # churn-forwarded. It is only ever present when --log-dropped is on,
+        # which the eval install leaves off, so this branch is reachable on a
+        # re-run rather than in the nightly -- but when the evidence is there
+        # the case reports it rather than throwing the repetition away.
+        if detector_dropped "$human_insert_id"; then
+          write_verdict human-filtered \
+            "the classifier dropped the human record: a dropped line names its insert_id"
+          echo "ERROR: Classify refused a human-tier write. That is the regression." >&2
+          exit 0
+        fi
+
+        # No row and no line of either kind. Two worlds this install cannot
+        # tell apart with --log-dropped off: Classify dropped it silently, or
+        # nothing reached the detector at all. So this exits non-zero and the
+        # repetition is excluded. Reporting it as the finding would accuse the
+        # agent on evidence that does not distinguish the two, and a false
+        # accusation on a nightly record is worse than one nobody scored.
         write_verdict ingress-silent \
           "no ledger row for the human record: Classify dropped it or it never arrived; DRIFT_DETECTOR_LOG_DROPPED tells which"
         echo "ERROR: the human record left no ledger row after ${var.card_timeout_seconds}s." >&2
@@ -532,10 +549,44 @@ resource "null_resource" "drift_noise" {
       done
       echo "churn records: $${#churn_ids[@]} published"
 
-      # ---- 6. Settle, then read the ledger ----------------------------------
-      # Without the settle a healthy filter and a broken one look identical --
-      # no rows either way, because nothing has been classified yet.
-      sleep ${var.settle_seconds}
+      # ---- 6. Prove the burst was consumed, then read the ledger ------------
+      # A timer is not evidence. A fixed settle says only that time passed:
+      # if the detector is backing off (pullBackoffMax 60s) or has just been
+      # relaunched by start-services, the churn is still sitting in the
+      # subscription when the verdict is written, and on a broken filter the
+      # eleven cards land afterwards with nobody reading them -- green on the
+      # regression, which is what this whole fixture exists to prevent.
+      #
+      # So a tracer goes out AFTER the burst, carrying a human-tier principal
+      # so Classify is bound to forward it, and the stack waits for its ledger
+      # row. _inject_drift writes that row at inject time, before any turn and
+      # before the alert ceiling can refuse it, so the row means the detector
+      # pulled and classified something published later than the churn.
+      # Whatever it would have done with the churn, it has already done.
+      tracer_insert_id="$(mint_id)"
+      publish_record "$tracer_insert_id" "${var.human_principal}" \
+        "${var.human_namespace}" "${var.human_workload}" "kubectl-edit/v1.31.0"
+      echo "tracer record: insertId=$tracer_insert_id"
+
+      settled=""
+      waited=0
+      while [ "$waited" -lt "${var.settle_seconds}" ]; do
+        if ledger_has_row "$tracer_insert_id"; then settled=1; break; fi
+        sleep 10
+        waited=$(( waited + 10 ))
+      done
+
+      if [ -z "$settled" ]; then
+        # No tracer row means the pipeline was not consuming during the
+        # settle, so the churn's absence from the ledger says nothing. An
+        # absence that proves nothing must not be scored as a filter holding.
+        write_verdict ingress-silent \
+          "the tracer published after the burst left no ledger row in ${var.settle_seconds}s, so the pipeline was not consuming and the churn read proves nothing"
+        echo "ERROR: the pipeline did not consume a record published after the burst." >&2
+        echo "       The churn read would be an absence with no meaning, so this is excluded." >&2
+        exit 1
+      fi
+
       leaked="$(forwarded_churn "$${churn_ids[@]}")"
       if [ -n "$leaked" ]; then
         write_verdict churn-forwarded \
@@ -545,7 +596,7 @@ resource "null_resource" "drift_noise" {
       fi
 
       write_verdict ok \
-        "human card finished; no ledger row for any of $${#churn_ids[@]} churn records after ${var.settle_seconds}s"
+        "human card finished; tracer $tracer_insert_id consumed after the burst, and no ledger row for any of $${#churn_ids[@]} churn records"
       echo "filter held: card for $human_insert_id finished, no churn forwarded"
     EOT
   }
