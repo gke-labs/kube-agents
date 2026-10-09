@@ -579,70 +579,37 @@ def _cluster_placeholders(node: Any, where: str, problems: list[str], slots: set
         _cluster_placeholders(child, where, problems, slots, parked)
 
 
-def _children(raw: Any) -> list[tuple[str, Any]] | None:
-    """The (key path step, child) pairs of a container `safe_load` builds, or
-    None for a scalar. A mapping (`!!map`) steps by key; a sequence by index,
-    and so does a tuple, since `!!omap` and `!!pairs` load as a list of
-    (key, value) tuples and the tuple is a container in its own right; a
-    `!!set` loads as a Python set of scalars, stepped in sorted order."""
-    if isinstance(raw, dict):
-        return [(f".{key}", item) for key, item in raw.items()]
-    if isinstance(raw, (list, tuple)):
-        return [(f"[{i}]", item) for i, item in enumerate(raw)]
-    if isinstance(raw, (set, frozenset)):
-        return [(f"[{i}]", item) for i, item in enumerate(sorted(raw, key=repr))]
-    return None
-
-
-def _strings_under(raw: Any, _seen: set[int] | None = None) -> list[str]:
-    """Every string in a value: the scalar itself, a sequence's items, a
-    mapping's values, nested to any depth, in document order. A container is
-    read once however many paths reach it: an anchor aliased from several
-    places (`safe_load` builds one object, reached by each) is one value, and
-    every finding is per key, so reading it per path would only repeat the
-    finding, and on a fan-out of nested anchors would take exponential time.
-    The same set bounds the walk on a cycle, which validate_case() has refused
-    before any rule runs (`_alias_cycle`)."""
+def _strings_under(raw: Any) -> list[str]:
+    """Every string in a value: the scalar itself, a list's items, a mapping's
+    values, nested to any depth, in document order. The tree is finite by the
+    time this runs: validate_case() refuses a file whose anchor is aliased from
+    inside its own value before any rule walks it (`_alias_cycle`)."""
     if isinstance(raw, str):
         return [raw]
-    seen = set() if _seen is None else _seen
-    if id(raw) in seen:
+    if not isinstance(raw, (list, dict)):
         return []
-    children = _children(raw)
-    if children is None:
-        return []
-    seen.add(id(raw))
-    return [s for _, item in children for s in _strings_under(item, seen)]
+    items = raw if isinstance(raw, list) else raw.values()
+    return [s for item in items for s in _strings_under(item)]
 
 
-def _alias_cycle(raw: Any, path: str = "", _on_path: set[int] | None = None, _done: set[int] | None = None) -> str | None:
+def _alias_cycle(raw: Any, path: str = "", ancestors: frozenset[int] = frozenset()) -> str | None:
     """The key path of the first value that is a container already on the path
     down to it, or None. `safe_load` builds such a value from a YAML anchor
     aliased from inside itself (`checks: &c [*c]`, `expected_findings: &m
-    [{object: *m}]`, `required_phrases: &c !!pairs [{"": *c}]`); every rule
-    here walks the tree, so one such file would end any of them in a
-    RecursionError, and devops-bench refuses the same file at spec load, after
-    the cluster lease. An anchor reused beside itself is a shared value, not a
-    cycle, and is not reported; a container once proven acyclic is not walked
-    again from a second path, so a fan-out of nested anchors is walked once per
-    container, not once per path."""
-    on_path = set() if _on_path is None else _on_path
-    done = set() if _done is None else _done
-    # Both sets hold container ids only, so a scalar is never in either.
-    if id(raw) in done:
+    [{object: *m}]`); every rule here walks the tree, so one such file would
+    end any of them in a RecursionError, and devops-bench refuses the same file
+    at spec load, after the cluster lease. An anchor reused beside itself is a
+    shared value, not a cycle, and is not reported."""
+    if not isinstance(raw, (list, dict)):
         return None
-    if id(raw) in on_path:
+    if id(raw) in ancestors:
         return path
-    children = _children(raw)
-    if children is None:
-        return None
-    on_path.add(id(raw))
-    for step, item in children:
-        found = _alias_cycle(item, path + step if path or step.startswith("[") else step[1:], on_path, done)
+    below = ancestors | {id(raw)}
+    for key, item in enumerate(raw) if isinstance(raw, list) else raw.items():
+        step = f"{path}[{key}]" if isinstance(raw, list) else (f"{path}.{key}" if path else str(key))
+        found = _alias_cycle(item, step, below)
         if found is not None:
             return found
-    on_path.discard(id(raw))
-    done.add(id(raw))
     return None
 
 
