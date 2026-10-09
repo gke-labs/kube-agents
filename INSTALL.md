@@ -507,6 +507,8 @@ If you enabled Google Chat or Slack during the install, perform the following re
 
 ##### 2. Slack Configuration (`SLACK_ENABLED=true`)
 
+[Slack app setup](docs/site/src/content/docs/install/slack-app.md) covers creating the app, its tokens, the allowlist and how to verify, for both `spec.mode` values. Under `spec.mode: next` the A2A gateway holds Slack and needs a different app manifest from the one below; follow that page instead of steps 1, 3 and 4 here.
+
 1. **Verify Slack App Settings**:
    - Ensure **Socket Mode** is enabled in your Slack App console.
    - Verify that your Bot Token (`SLACK_BOT_TOKEN`) holds every bot scope in the manifest `hermes slack manifest` emits (step 4 below). At the Hermes tag in [`tags.env`](tags.env) that list is `app_mentions:read`, `assistant:write`, `channels:history`, `channels:read`, `chat:write`, `commands`, `files:read`, `files:write`, `groups:history`, `groups:read`, `im:history`, `im:read`, `im:write`, `mpim:history`, `mpim:read`, `reactions:read`, `reactions:write`, `users:read`. Regenerate it from the command rather than editing this line: `reactions:write` is added by [`deploy/docker/patches/apply_slack_reactions_scope.py`](deploy/docker/patches/apply_slack_reactions_scope.py) rather than by Hermes, and `--no-assistant` drops `assistant:write`. If the app does not exist yet, create it from that manifest (**Create New App → From a manifest**) instead of ticking scopes by hand; the command reads nothing from Slack, so it runs on an install where Slack is not configured.
@@ -517,7 +519,7 @@ If you enabled Google Chat or Slack during the install, perform the following re
    - Invite the bot to a channel or send a direct message: `"Hi Platform Agent"`.
    - If you left `SLACK_HOME_CHANNEL` empty and this is the install's first chat message on either platform, it makes its channel or DM the home channel, where scheduled audits post (step 5).
 3. **Approve Pairing Code (Optional / First-time setup)**:
-   - If pairing mode is enabled, approve the pairing code displayed in the gateway logs:
+   - Only if you set the Hermes Slack DM policy to `pairing` yourself: a kube-agents install gates Slack with the allowlist instead, and the A2A gateway under `spec.mode: next` has no pairing. A member the policy does not know gets a one-time code; approve it from the gateway logs:
      ```bash
      kubectl exec -it deploy/platform-agent-gateway -n kubeagents-system -- hermes pairing approve slack <PAIRING_CODE>
      ```
@@ -564,9 +566,10 @@ To add a chat platform later, edit `install.env` and re-run `./install.sh`, then
 
 - Google Chat: set `GOOGLE_CHAT_ENABLED=true` and `ALLOWED_USERS=` to the comma-separated emails
   allowed to use the agent. `./install.sh --menu` edits both for you.
-- Slack: set `SLACK_ENABLED=true` and `SLACK_ALLOWED_USERS=` to the comma-separated user IDs or
-  emails, and re-run with `--slack-bot-token` and `--slack-app-token`, or interactively to be asked
-  for them.
+- Slack: set `SLACK_ENABLED=true` and `SLACK_ALLOWED_USERS=` to the comma-separated Slack member
+  IDs (for example `U0123ABCD`), not emails or display names: an email matches nobody. To find a
+  member ID, open the person's Slack profile, then the **⋮** menu, then **Copy member ID**. Re-run
+  with `--slack-bot-token` and `--slack-app-token`, or interactively to be asked for them.
 
 The `install.env` a chat-less install writes records both toggles as `false` and both allowlists
 empty, and an empty allowlist admits every user. `upgrade.sh` renders the allowlist from the file,

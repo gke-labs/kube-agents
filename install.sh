@@ -5688,7 +5688,7 @@ main() {
     prompt_read "Slack Bot Tokens (xoxb-..., comma-separated for several workspaces)" \
       slack_bot_token "$slack_bot_token" true "$bot_hint"
     prompt_read "Slack App Token (xapp-...)" slack_app_token "$slack_app_token" true "$app_hint"
-    prompt_read "Allowed Slack User IDs / Emails (comma-separated)" \
+    prompt_read "Allowed Slack member IDs (comma-separated, e.g. U0123ABCD; not emails)" \
       slack_allowed_users "$slack_allowed_users" false "$slack_allowed_hint"
     prompt_read "Slack Home Channel ID (optional, e.g. C0123456789)" \
       slack_home_channel "$slack_home_channel"

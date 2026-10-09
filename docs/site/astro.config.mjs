@@ -106,6 +106,7 @@ export default defineConfig({
           items: [
             { label: 'Prerequisites', link: '/install/prerequisites/' },
             { label: 'Quick start (GKE)', link: '/install/quickstart-gke/' },
+            { label: 'Slack app setup', link: '/install/slack-app/' },
             { label: 'Manual install', link: '/install/manual/' },
             { label: 'Helm and Kind', link: '/install/helm-and-kind/' },
             { label: 'GitLab as the GitOps forge', link: '/install/gitlab/' },
