@@ -133,6 +133,10 @@ REPORT_KEY_VISITED = "visited"
 REPORT_KEY_MAPPED = "mapped"
 REPORT_KEY_MODE = "mode"
 REPORT_KEY_FLEET_TREE = "fleet_tree"
+# The fleet tree reports carried before 2026-10-08 (#2645): `git rev-parse
+# HEAD:bench/tf/fleet`, a 40-hex tree id. Since then, a 64-hex sha256 over the
+# stack's inputs.
+_LEGACY_FLEET_TREE = re.compile(r"[0-9a-f]{40}")
 REPORT_MODE_ALL = "all"
 REPORT_KEY_ALLOWLIST_UNUSED = "allowlist_unused"
 # The Prow job names (oss-test-infra, kube-agents-periodics.yaml and
@@ -931,12 +935,6 @@ def _supersession(job: str, readings: dict[str, dict]) -> str | None:
         # tree has done what it did not.
         return SUPERSEDED_RECOVERY if _whole_pass(theirs.get(KEY_ARTIFACT) or {}) else None
     return SUPERSEDED_RECOVERY if _reached(theirs.get(KEY_ARTIFACT), named) else None
-
-
-# The fleet tree reports carried before 2026-10-08 (#2645): `git rev-parse
-# HEAD:bench/tf/fleet`, a 40-hex tree id. Since then, a 64-hex sha256 over the
-# stack's inputs.
-_LEGACY_FLEET_TREE = re.compile(r"[0-9a-f]{40}")
 
 
 def _fleet_tree(artifact) -> str | None:
