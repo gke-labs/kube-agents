@@ -1,6 +1,6 @@
 # Drift Audit-Log Pub/Sub Routing Module
 
-Reusable Terraform module for provisioning the GKE audit log → Pub/Sub delivery path the drift detector consumes: the Log Router sink, the drift-audit topic and pull subscription, and the IAM bindings that let the sink publish and the detector subscribe — plus, where `topic_publishers` is set, publisher on the topic for each member it names.
+Reusable Terraform module for provisioning the GKE audit log → Pub/Sub delivery path the drift detector consumes: the Log Router sink, the drift-audit topic and pull subscription, and the IAM binding that lets the sink publish — plus, where `topic_publishers` is set, publisher on the topic for each member it names. The detector's own subscriber and viewer grants are the caller's: see "What this module does not do".
 
 The detector cannot read audit logs from the Kubernetes API. On GKE the control plane is managed, so the API server's audit backend is not the operator's to configure and the stream surfaces only in Cloud Logging — hence a sink rather than an informer.
 
@@ -14,6 +14,8 @@ Cloud Logging starts exporting the moment a sink exists and keeps exporting for 
 - **Still on apply**, `time_sleep.logging_identity` holds for `logging_identity_propagation_duration` (60s by default) between that call and the grant. Minting the agent and being able to bind it are different moments: on a project that did not already have one, the grant run straight after the call fails with the same "Service account … does not exist", at about one project in five — six of 32 in one measured sweep. This is a timer rather than a poll because IAM reports a missing account and a not-yet-propagated one identically. It is paid on the first apply that carries this resource — the first apply of the module on a new install, and the next apply of any kind on an install that already had it, where the agent exists and the wait buys nothing — and after that only on an apply that re-mints the identity or changes the duration, the two keys in the wait's `triggers`.
 - **On destroy**, `time_sleep.sink_drain` holds for `sink_drain_duration` (120s by default) between deleting the sink and removing the topic and the grant. Revoking publish early trades `topic_not_found` for `topic_permission_denied`, so both sit on the far side of the wait. Changing the duration takes an apply to land before the destroy that should honour it: `time_sleep` reads `destroy_duration` from state, since a provider's delete is handed prior state and no configuration. A caller that raises it and goes straight to `terraform destroy` waits the value already recorded.
 
+  The drain covers the Log Router's propagation lag and nothing else, which is the whole of the problem only when the clusters being exported outlive this module's destroy. Where the same state owns a cluster, there is a second and larger source: the control plane keeps emitting matching audit records until it is gone, and if the topic is deleted first every one of them mails the owners. No value of `sink_drain_duration` fixes that — a teardown's length varies with the cluster, so a timer is racing it. The caller orders it instead, by depending on this module from whatever creates the cluster, so that Terraform destroys the cluster first. `full-install` carries that edge (`depends_on = [..., module.drift_pubsub]` on its cluster module) and [`tests/test_drift_pubsub_ordering.py`](../../../tests/test_drift_pubsub_ordering.py) pins it, because no plan shows a destroy order. Measured on a CI teardown before the edge existed: topic deleted at t+124s, last matching audit record at t+366s, with the error burst in the minute after the topic went.
+
 None of the three closes its window completely. Google documents no bound on how long the Log Router takes to stop exporting, nor on how long a freshly minted service agent takes to become bindable, so both durations are chosen margins rather than measured convergence times. They take the email from every destroy to rarely, and the failed apply from one project in five to rarely. Renaming `topic_name` on a live install is a fourth case none of them covers: that replaces the topic under a sink which stays live and is only updated in place, and the drain does not participate because nothing is being destroyed.
 
 Deriving the identity means a project where Logging returns some other writer identity would be granted the wrong principal and left with an inert sink. The sink carries a `postcondition` comparing the two, so that fails the apply naming both. A postcondition runs after the resource is created and does not roll it back, so the failed apply leaves the sink live and exporting as an identity that holds no publish role: `topic_permission_denied` on every export, and the owner-wide mail this section exists to prevent, now continuous rather than momentary. Deleting the sink stops it immediately, and granting the role by hand stops it without clearing the check. Because a postcondition is re-evaluated on later plans, such a project would also be unable to apply anything in the composition — `sink_writer_identity_override` is the way out, moving the grant and the check together onto the identity Logging reported. The full-install composition passes it through as `drift_pubsub_sink_writer_identity_override`, which is the name the error gives an operator who reached it from there; `sink_drain_duration` and `logging_identity_propagation_duration` are exposed the same way. None has an installer key, so an install driven by `install.sh` or `upgrade.sh` sets them as `TF_VAR_` passthrough lines in `install.env` — the front doors regenerate `terraform.tfvars` on every run, so an override added to that file by hand survives one apply and is dropped by the next, which puts the sink back in the state this paragraph describes. A hand-driven apply uses `terraform.tfvars`.
@@ -24,7 +26,10 @@ Three of the four links in that chain are `depends_on` edges, pinned by [`tests/
 
 ## What this module does not do
 
-- **It does not create a service account.** `detector_service_account_email` names an existing GSA. The GSA and its Workload Identity binding belong to [`kube-agents-iam`](../kube-agents-iam/), which already creates both; minting one here would produce a second identity for the same workload.
+- **It does not create a service account, and no longer grants to one.** The detector's GSA and its Workload Identity binding belong to [`kube-agents-iam`](../kube-agents-iam/); minting one here would produce a second identity for the same workload. This module used to take that GSA's email and grant it subscriber and viewer on the subscription, which was the odd half of the same rule — granting on an identity it does not own. Those two bindings are now the caller's, made against the `subscription_id` output.
+
+  The reason for moving them is ordering rather than tidiness. Naming the GSA made this module a dependent of whatever creates it, and in `full-install` that is `kube-agents-iam`, which depends on the cluster. Terraform destroys dependents before dependencies, so the whole ingress — topic included — was torn down ahead of the cluster, while the control plane went on emitting matching audit records for minutes after the topic was gone, mailing the project's owners for each one. With no GSA input the module depends on nothing cluster-side, so a caller can order its cluster ahead of this module instead. `full-install` does exactly that, with `depends_on = [..., module.drift_pubsub]` on its cluster module.
+
 - **It does not enable APIs.** No module in this repository calls `google_project_service` — the root composition does, with `disable_on_destroy = false`, so that destroying one component cannot disable an API the rest of the project depends on.
 - **It does not tier principals.** Apart from the lease carve-out below, the sink exports every mutating call regardless of who made it, including the large majority from `system:` controllers. The detector classifies principals itself and needs the unfiltered volume to measure its noise profile; a sink-side tier filter would discard the denominators that make a mistuned automation allowlist debuggable.
 
@@ -57,11 +62,35 @@ Two more follow from the ordering above, and `full-install` already satisfies bo
 
 ```hcl
 module "drift_pubsub" {
-  source                         = "git::https://github.com/gke-labs/kube-agents.git//terraform/modules/drift-pubsub?ref=vX.Y.Z"
-  project_id                     = "my-gcp-project"
-  detector_service_account_email = "kubeagents-platform-gsa@my-gcp-project.iam.gserviceaccount.com"
+  source     = "git::https://github.com/gke-labs/kube-agents.git//terraform/modules/drift-pubsub?ref=vX.Y.Z"
+  project_id = "my-gcp-project"
+}
+
+# The detector's access to the subscription, which this module does not grant.
+# Keep these outside the module and downstream of whatever creates the GSA:
+# Pub/Sub IAM validates that a principal exists, so a binding that runs before
+# the account does fails outright.
+resource "google_pubsub_subscription_iam_member" "detector_subscriber" {
+  project      = "my-gcp-project"
+  subscription = module.drift_pubsub.subscription_id
+  role         = "roles/pubsub.subscriber"
+  member       = "serviceAccount:kubeagents-platform-gsa@my-gcp-project.iam.gserviceaccount.com"
+}
+
+# Both roles, not just subscriber: subscriber carries subscriptions.consume
+# but not subscriptions.get, and the detector reads the ack deadline at
+# startup. See "Lowering ack_deadline_seconds" below.
+resource "google_pubsub_subscription_iam_member" "detector_viewer" {
+  project      = "my-gcp-project"
+  subscription = module.drift_pubsub.subscription_id
+  role         = "roles/pubsub.viewer"
+  member       = "serviceAccount:kubeagents-platform-gsa@my-gcp-project.iam.gserviceaccount.com"
 }
 ```
+
+A caller upgrading from a version that made those grants itself needs `moved` blocks for the two
+bindings, or the first apply plans a destroy and create of the detector's own access;
+`full-install`'s `main.tf` has the pair to copy.
 
 `cluster_names` defaults to empty, which exports every GKE cluster in the project through one sink and leaves the detector to route on `resource.labels.cluster_name`. Set it to narrow the export:
 
@@ -99,8 +128,8 @@ Pub/Sub does not attach the publishing identity to the message, so the detector 
 record the sink exported from one a listed member composed. Anything that can publish here can
 therefore make the detector report a change nobody made, under any principal it chooses. The
 intended use is a test harness injecting synthetic audit records on a project set aside for it;
-on an install carrying real traffic, leave it empty. Never list the detector's own
-`detector_service_account_email` — the agent would be writing the stream its own pod reads.
+on an install carrying real traffic, leave it empty. Never list the detector's own service
+account — the agent would be writing the stream its own pod reads.
 
 Lowering `ack_deadline_seconds` below its 60s default means passing the detector a matching
 `--batch-join-budget`. The detector holds a whole batch while it reads live objects, and the two

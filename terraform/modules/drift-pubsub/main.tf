@@ -352,31 +352,23 @@ resource "google_pubsub_topic_iam_member" "extra_publishers" {
   member  = each.value
 }
 
-resource "google_pubsub_subscription_iam_member" "detector_subscriber" {
-  project      = var.project_id
-  subscription = google_pubsub_subscription.drift_audit.id
-  role         = "roles/pubsub.subscriber"
-  member       = "serviceAccount:${var.detector_service_account_email}"
-}
-
-# roles/pubsub.subscriber covers consuming messages but not reading the
-# subscription's own metadata. It grants subscriptions.consume, snapshots.seek,
-# and topics.attachSubscription -- notably not subscriptions.get. A client that
-# confirms the subscription exists before pulling (the chat adapter's
-# _check_subscription_exists) needs viewer as well, and without it fails with a
-# PermissionDenied that reads nothing like a missing grant.
+# The detector's own subscriber and viewer grants are deliberately NOT here,
+# and this module no longer takes the service account that would need them.
 #
-# The drift detector now makes one: a startup subscriptions.get reading the
-# configured ackDeadlineSeconds, so it can warn when --batch-join-budget would
-# hold a batch past it. This grant is what keeps that call from failing. It is
-# advisory on the detector's side -- a probe that is denied logs that the budget
-# went unchecked and the loop pulls anyway -- so removing viewer degrades the
-# warning rather than breaking ingestion. Viewer would stay regardless: `gcloud
-# pubsub subscriptions describe` needs it, and that is the first command anyone
-# runs against an empty topic.
-resource "google_pubsub_subscription_iam_member" "detector_viewer" {
-  project      = var.project_id
-  subscription = google_pubsub_subscription.drift_audit.id
-  role         = "roles/pubsub.viewer"
-  member       = "serviceAccount:${var.detector_service_account_email}"
-}
+# They are the only thing that made this module depend on whoever creates that
+# GSA, and a caller composing the two gets that dependency transitively: in
+# full-install, kube-agents-iam depends on the cluster, so this module did too.
+# Terraform destroys dependents before dependencies, which put the whole
+# ingress -- topic included -- ahead of the cluster on a destroy, while the
+# control plane went on emitting matching audit records for minutes after the
+# topic was gone. That is #2426's destroy half, and no drain can close it,
+# because the thing being waited for is a teardown whose length varies with the
+# cluster.
+#
+# So the grants belong to the caller, downstream of its own GSA, which lets the
+# caller order the cluster ahead of this module instead. The split is also the
+# honest one: the module does not create the detector's service account (see
+# the README's "What this module does not do"), and granting on an identity it
+# does not own was the odd half of that. full-install's main.tf makes both
+# grants next to the module call, with `moved` blocks so an existing install
+# sees no change; `subscription_id` is the output they bind to.

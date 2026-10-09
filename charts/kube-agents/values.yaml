@@ -654,8 +654,11 @@ platformAgent:
     # terraform/examples/full-install creates it with enable_drift_pubsub =
     # true, which defaults to false; an install that renders this chart without
     # the composition applies terraform/modules/drift-pubsub against this
-    # project itself. Left off, the whole block is omitted and the detector is
-    # shipped in the image without being started.
+    # project itself AND grants the agent's GSA subscriber and viewer on
+    # the subscription, which that module does not do -- without them the
+    # detector starts, is denied on every pull, and the pod stays Ready.
+    # Left off, the whole block is omitted and the detector is shipped in
+    # the image without being started.
     driftDetector:
       enabled: null # CRD default: false
       # The subscription carrying the audit records. Empty takes the

@@ -655,8 +655,10 @@ Five knobs need context beyond the chart:
   does that as part of its own apply when `enable_drift_pubsub = true`, and
   writes this value itself from `enable_drift_detector`, refusing an apply that
   asks for the second without the first; an install that renders this chart
-  without the composition applies the module itself. The chart does not check,
-  and neither does
+  without the composition applies the module itself **and makes the detector's
+  two subscription grants itself**, which the module does not make — without
+  them the detector starts, is denied on every pull, and stays Ready.
+  The chart does not check, and neither does
   the detector: enabled without a subscription to read, it comes up and retries
   a pull that cannot succeed for the life of the pod, never exits, and leaves
   the pod Ready. That is why it defaults to off.

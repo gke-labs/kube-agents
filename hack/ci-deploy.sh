@@ -74,8 +74,9 @@ readonly EVAL_ALERT_DAILY_LIMIT_DRIFT="0"
 # The subscription the drift detector pulls from. The pool project's own
 # provisioning owns the resource: scripts/provision_ci_pool_project.sh sets
 # enable_drift_pubsub in the full-install tfvars, and terraform/modules/
-# drift-pubsub creates the sink, the topic and this subscription and grants
-# kubeagents-platform-gsa subscriber and viewer on it. Nothing is created here
+# drift-pubsub creates the sink, the topic and this subscription, with the
+# composition granting kubeagents-platform-gsa subscriber and viewer on it
+# beside the module rather than inside it. Nothing is created here
 # — the install has one engine, and a `gcloud pubsub create` beside the module
 # would be a second expression of the same step.
 #
