@@ -63,7 +63,7 @@ Invoked by the `gcp-networking-fabric-audit` watchdog.
 
 ### `gce_compute_fleet_sop.md`
 
-GCE Compute Engine and MIG Fleet Audit, daily. Checks GCE startup script status, MIG autoscaler flapping, Ops Agent guest health, sole-tenant headroom, and orphaned snapshots.
+GCE Compute Engine and MIG fleet, daily. It checks instances, Managed Instance Groups, sole-tenant node groups and snapshots for startup-script failures in serial port output, MIGs that cannot converge on their target size, sole-tenant headroom exhaustion, and snapshots orphaned by a deleted source disk. Ops Agent guest telemetry is deliberately not audited by this stream.
 
 Invoked by the `gce-compute-fleet-audit` watchdog.
 

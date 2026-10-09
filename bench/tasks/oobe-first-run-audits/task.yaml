@@ -1,0 +1,112 @@
+# Domain: fleet audits. Journey: a fresh install's onboarding inventory scan has
+# settled, and the four fleet audits it would otherwise leave to their schedules
+# (the next 06:20 UTC, the next Monday for cost) start at once.
+#
+# Nothing in a conversation starts them. The `oobe` cron job
+# (agents/chat/scripts/oobe.py) reads the board for the scan's ranking card and,
+# once it has finished, marks the audits due one after another on the Platform
+# Agent's roster with Hermes' cron.jobs.trigger_job, each once the previous run has
+# ended; the next profile-cron-tick runs it. The design is
+# docs/designs/oobe.md. The prompt below asks for nothing that touches the cron
+# stores, and the safeguard holds the turn to that, so the grade comes from what
+# the stack set up and the verifier read.
+#
+# bench/tf/prebuilt/oobe-first-run-audits waits for the install's own first-run
+# stage to finish, then files an archived stand-in sweep
+# card and an archived ranking card after it, points `.bootstrap_scan_filed` at
+# the sweep and `.bootstrap_handoff_filed` at the ranking card, removes
+# `.oobe_audits_fired`, and puts back the `oobe` job if the
+# deployed image ships one (an install that onboarded before the job existed never
+# got it), then waits up to an hour for the stage to finish its chain. The verifier
+# reads the stage's .oobe_audits_fired and the Platform Agent's cron/executions.db,
+# and passes once the stage marked all four audits due, each has a run since its mark
+# that got going (running, completed, or ended after its start), and each started only after the one before it
+# ended. On an image without the job nothing starts them, which is this case's red.
+#
+# Isolation class: writes to the install under test. It replaces
+# `.bootstrap_scan_filed`, `.bootstrap_handoff_filed` and `.oobe_audits_fired` for
+# the run and restores them,
+# files two archived cards, and adds and removes the `oobe` job. The four audits
+# it starts are real runs: each writes its ledger issue in the install's GitOps
+# repository and posts its summary wherever the install sends audit reports. The
+# runner holds their four streams' locks for the unit (`audit_streams` below), and
+# every unit on one of those streams first waits up to two hours for a run the
+# install started there, so no audit case runs beside them and the next repetition
+# arms only once they have ended. Other stack-bearing cases are kept apart by the
+# infra lock.
+# Eligible tier: nightly -- each repetition runs the four audits one after another,
+# after the previous repetition's have finished (the runner waits for them; run by
+# hand, the stage itself holds its first mark until they end).
+---
+id: oobe-first-run-audits
+name: The first-run audits start as soon as the onboarding scan settles
+
+fixtures: []
+
+infrastructure:
+  deployer: "tofu"
+  provider: "gcp"
+  stack: "prebuilt/oobe-first-run-audits"
+  teardown: true
+  # host_cluster_* arrive from the environment (TF_VAR_host_cluster_name /
+  # TF_VAR_host_cluster_location, exported by hack/ci-eval-pr.sh), because they
+  # name the install the runner deployed and no task may choose a different one.
+
+validated: false
+
+# Slug per docs/designs/domains.yaml: what starts is four of the fleet audits.
+domain: fleet-audits
+
+# Who answers when this case flakes -- see bench/CONTRIBUTING.md.
+owner: maintainers
+
+# The streams whose audits the stack starts. The runner holds their locks for the
+# whole unit (hack/ci-eval-pr.sh: task_streams), so no audit case on one of them
+# runs beside these real runs and grades the other's ledger.
+audit_streams:
+  [
+    fleet-wide-cost-analysis,
+    compliance-audit,
+    obtainability-audit,
+    stockout-prevention,
+  ]
+
+# A turn that needs no tools. The session this reaches is the Planning Agent's,
+# which could ask the Platform Agent to start an audit; a run that started would be
+# graded as the stage's.
+prompt: |
+  In one or two sentences, say what you do on this install. Answer from what you
+  already know: do not call any tool, and do not run, trigger or schedule
+  anything.
+expected_output: |
+  critical requirements:
+  - A one- or two-sentence description of the agent's role, with no tool call.
+  - No job is run, triggered or scheduled.
+
+verification_spec:
+  # Reads the stack's state file, the stage's .oobe_audits_fired and the Platform
+  # Agent's cron/executions.db in the agent pod (kube_agents_bench/oobe.py). A run
+  # the stage marked due that got going (running, completed, or ended after its start) counts, provided it started
+  # after the previous audit in the chain ended; a scheduled run the stage did not
+  # mark does not, unless the stage recorded the audit as adopted (a run completed
+  # since the sweep), which counts as had. How each run ends is graded by the audit
+  # cases.
+  - name: first-run-audits-started
+    role: objective
+    check:
+      type: oobe_audits_started
+  # The turn must not start an audit itself: the verifier cannot tell a run the
+  # session started from one the stage started. The turn reaches the Planning
+  # Agent, which holds no cron or terminal tool; its one route to an audit is a
+  # card for the Platform Agent.
+  - name: turn-starts-no-job
+    role: safeguard
+    severity: catastrophic
+    # assert, not the converge default: the transcript is immutable once the run
+    # ends, so polling a failed check would only wait out the timeout.
+    mode: assert
+    check:
+      type: none
+      checks:
+        - type: tool_called
+          tool_names: ["kanban_create"]

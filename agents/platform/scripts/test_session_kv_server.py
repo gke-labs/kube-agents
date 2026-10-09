@@ -3488,9 +3488,9 @@ class TestSlackAuditHeadline(unittest.TestCase):
     """With KAGE_SLACK_UX on, a fleet-audit report leads with a headline in Slack.
 
     The channel message is the headline, built from the ledger issue the report
-    ends with; a composed report longer than one line goes into its thread, and
-    the full report is what the incident row stores. Flag off, every leg posts
-    the composed message exactly as before.
+    ends with and linking it; nothing follows it in its thread, and the full
+    report is what the incident row stores. Flag off, every leg posts the
+    composed message exactly as before.
     """
 
     SLACK_THREAD = "1712345678.000100"
@@ -3541,14 +3541,12 @@ class TestSlackAuditHeadline(unittest.TestCase):
             conn.execute("DELETE FROM incidents")
 
     def _post(
-        self, composed=COMPOSED, platforms=("slack",), turn_ok=True, fold_ok=True, job_id="rbac",
+        self, composed=COMPOSED, platforms=("slack",), turn_ok=True, job_id="rbac",
         issue=ISSUE, managed=True, fleet_audit=True, blocks_post=None,
     ):
         answers = {"slack": self.SLACK_THREAD, "google_chat": self.GCHAT_THREAD}
 
         def send(platform, message, chat_id="", thread_id="", timeout=None):
-            if thread_id == self.SLACK_THREAD and not fold_ok:
-                return None
             return answers[platform]
 
         with patch.object(session_kv_server, "enabled_chat_platforms", return_value=list(platforms)), \
@@ -3572,35 +3570,34 @@ class TestSlackAuditHeadline(unittest.TestCase):
             return conn.execute("SELECT chat_id, thread_id, report FROM incidents").fetchall()
 
     def test_flag_off_posts_the_composed_message_unchanged(self):
+        os.environ["KAGE_SLACK_UX"] = "false"
         response, calls = self._post()
         self.assertEqual(response.json()["status"], "delivered")
         self.assertEqual([c.args for c in calls], [("slack", self.COMPOSED, "", "")])
 
-    def test_flag_on_leads_with_the_headline_and_folds_the_report_into_its_thread(self):
+    def test_flag_on_leads_with_the_headline_and_posts_nothing_under_it(self):
         os.environ["KAGE_SLACK_UX"] = "1"
         response, calls = self._post()
         self.assertEqual(response.json()["status"], "delivered")
-        self.assertEqual(len(calls), 2)
+        self.assertEqual(response.json()["relay"], "ok")
         ref = session_kv_server.slack_audit_report.ledger_ref(self.COMPOSED)
         headline = session_kv_server.slack_audit_report.headline_from_issue(self.ISSUE, ref, self.COMPOSED)
-        self.assertEqual(calls[0].args, ("slack", headline, "", ""))
+        self.assertEqual([c.args for c in calls], [("slack", headline, "", "")])
         self.assertTrue(calls[0].args[1].startswith(self.HEADLINE))
-        self.assertEqual(calls[1].args, ("slack", self.COMPOSED, self.HOME, self.SLACK_THREAD))
         # A reply in the thread is answered with the whole report, not the headline.
         self.assertEqual(self._stored(), [(self.HOME, self.SLACK_THREAD, self.COMPOSED)])
 
-    def test_flag_on_the_sop_one_line_report_gets_the_headline_and_its_line_in_the_thread(self):
+    def test_flag_on_the_sop_one_line_report_gets_the_headline_alone(self):
         os.environ["KAGE_SLACK_UX"] = "1"
         response, calls = self._post(composed=self.ONE_LINE)
         self.assertEqual(response.json()["status"], "delivered")
-        self.assertEqual(len(calls), 2)
+        self.assertEqual(len(calls), 1)
         headline = calls[0].args[1].splitlines()
         self.assertEqual(headline[0], self.HEADLINE)
         self.assertEqual(headline[3], "5 more (3 major, 2 minor) are in the ledger issue.")
         self.assertIn(f"[Ledger issue #231 ↗]({self.LEDGER})", calls[0].args[1])
-        # The card leaves the line out, so its resolved count is read in the thread.
+        # The card leaves the line out, and the ledger issue it links holds the rest.
         self.assertNotIn("resolved", calls[0].args[1])
-        self.assertEqual(calls[1].args, ("slack", self.ONE_LINE, self.HOME, self.SLACK_THREAD))
         self.assertEqual(self._stored(), [(self.HOME, self.SLACK_THREAD, self.ONE_LINE)])
 
     def test_flag_on_an_unreadable_ledger_falls_back_to_the_line_and_its_link(self):
@@ -3620,7 +3617,7 @@ class TestSlackAuditHeadline(unittest.TestCase):
 
     def test_flag_on_the_truncation_notice_is_not_the_reports_line(self):
         # An over-cap report whose composed message is only the link: the notice
-        # leads the channel message once, and is neither the line nor a reason to fold.
+        # leads the channel message once, and is not the line.
         os.environ["KAGE_SLACK_UX"] = "1"
         composed = f"Ledger: {self.LEDGER}"
         with patch.object(session_kv_server, "CRON_REPORT_MAX_CHARS", 3):
@@ -3742,20 +3739,13 @@ class TestSlackAuditHeadline(unittest.TestCase):
             _, calls = self._post()
         self.assertEqual([c.args for c in calls], [("slack", self.COMPOSED, "", "")])
 
-    def test_a_failed_fold_still_counts_as_delivered(self):
-        os.environ["KAGE_SLACK_UX"] = "1"
-        response, calls = self._post(fold_ok=False)
-        self.assertEqual(response.json()["status"], "delivered")
-        self.assertEqual(len(calls), 2)
-        self.assertEqual(self._stored(), [(self.HOME, self.SLACK_THREAD, self.COMPOSED)])
-
-    def test_a_second_report_folds_into_the_existing_thread(self):
+    def test_a_second_report_goes_into_the_existing_thread(self):
         os.environ["KAGE_SLACK_UX"] = "1"
         self._post(job_id="rbac-2")
         _, calls = self._post(job_id="rbac-2")
-        second = [c.args for c in calls]
-        self.assertEqual(second[0][2:], (self.HOME, self.SLACK_THREAD))
-        self.assertEqual(second[1], ("slack", self.COMPOSED, self.HOME, self.SLACK_THREAD))
+        (second,) = [c.args for c in calls]
+        self.assertTrue(second[1].startswith(self.HEADLINE))
+        self.assertEqual(second[2:], (self.HOME, self.SLACK_THREAD))
 
 
     BLOCKS_TS = "1712345999.000200"
@@ -3769,6 +3759,7 @@ class TestSlackAuditHeadline(unittest.TestCase):
         return [block["type"] for block in blocks]
 
     def test_flag_off_with_a_relay_posts_no_blocks(self):
+        os.environ["KAGE_SLACK_UX"] = "false"
         os.environ["SLACK_RELAY_URL"] = "http://127.0.0.1:8765"
         _, calls = self._post(blocks_post=lambda *a, **k: self.BLOCKS_TS)
         self.assertEqual(self.posts, [])
@@ -3778,8 +3769,8 @@ class TestSlackAuditHeadline(unittest.TestCase):
         self._blocks_on()
         response, calls = self._post(blocks_post=lambda *a, **k: self.BLOCKS_TS)
         self.assertEqual(response.json()["status"], "delivered")
-        # The report is longer than one line, so it follows in the thread.
-        self.assertEqual([c.args for c in calls], [("slack", self.COMPOSED, self.HOME, self.BLOCKS_TS)])
+        # The card carries the ledger button, so nothing follows it in its thread.
+        self.assertEqual(calls, [])
         (post,) = self.posts
         channel, text, blocks, thread_ts = post.args
         self.assertEqual((channel, thread_ts), (self.HOME, ""))
@@ -3800,8 +3791,8 @@ class TestSlackAuditHeadline(unittest.TestCase):
         response, calls = self._post(blocks_post=refused)
         self.assertEqual(response.json()["status"], "delivered")
         self.assertEqual(len(self.posts), 1)
+        self.assertEqual(len(calls), 1)
         self.assertTrue(calls[0].args[1].startswith(self.HEADLINE))
-        self.assertEqual(calls[1].args, ("slack", self.COMPOSED, self.HOME, self.SLACK_THREAD))
 
     def test_a_post_that_never_reached_slack_posts_the_text_headline_without_retrying(self):
         self._blocks_on()
@@ -3816,11 +3807,17 @@ class TestSlackAuditHeadline(unittest.TestCase):
         self.assertEqual(len(self.posts), 1)
         self.assertTrue(calls[0].args[1].startswith(self.HEADLINE))
 
-    def test_the_one_line_report_goes_in_the_blocks_thread(self):
+    def test_a_ledger_backed_card_posts_no_thread_reply(self):
+        # The SOPs' one line counts what the card leaves out ("1 resolved"); the ledger issue holds it.
         self._blocks_on()
-        _, calls = self._post(composed=self.ONE_LINE, blocks_post=lambda *a, **k: self.BLOCKS_TS)
-        self.assertEqual([c.args for c in calls], [("slack", self.ONE_LINE, self.HOME, self.BLOCKS_TS)])
-        self.assertIn("5 more (3 major, 2 minor) are in the ledger issue.", str(self.posts[0].args[2]))
+        response, calls = self._post(composed=self.ONE_LINE, blocks_post=lambda *a, **k: self.BLOCKS_TS)
+        self.assertEqual(calls, [])
+        (post,) = self.posts
+        self.assertIn("5 more (3 major, 2 minor) are in the ledger issue.", str(post.args[2]))
+        self.assertEqual(post.args[2][-1]["elements"][-1]["url"], self.LEDGER)
+        self.assertNotIn("resolved", str(post.args[1:3]))
+        self.assertEqual(response.json()["relay"], "ok")
+        self.assertEqual(self._stored(), [(self.HOME, self.BLOCKS_TS, self.ONE_LINE)])
 
     def test_a_link_only_report_posts_nothing_in_the_blocks_thread(self):
         # The findings the card only counts are in the ledger issue its line points at.
@@ -3918,43 +3915,13 @@ class TestSlackAuditHeadline(unittest.TestCase):
         self.assertEqual(len(self.posts), 1)
         self.assertEqual(calls, [])
         self.assertTrue(any("posted to slack with no ts" in m for m in logs.output))
-        self.assertTrue(any("no thread to post the full report in" in m for m in logs.output))
-        self.assertEqual(response.json()["relay"], "degraded")
-        self.assertIn("not the full report", response.json()["relay_detail"])
+        self.assertEqual(response.json()["relay"], "ok")
 
     def test_blocks_posted_with_no_ts_are_not_undelivered_beside_another_leg(self):
         self._blocks_on()
         response, _ = self._post(platforms=("slack", "google_chat"), blocks_post=lambda *a, **k: "")
         self.assertEqual(response.json()["status"], "delivered")
         self.assertEqual(response.json()["undelivered"], "")
-
-    def test_the_thread_posts_take_what_is_left_of_the_posts_budget(self):
-        self._blocks_on()
-        response, calls = self._post_at(100, lambda *a, **k: self.BLOCKS_TS)
-        self.assertAlmostEqual(calls[0].kwargs["timeout"], session_kv_server.CRON_RELAY_POSTS_BUDGET_S - 100)
-        self.assertEqual(response.json()["relay"], "ok")
-
-    def test_a_thread_post_with_no_time_left_is_skipped_and_named(self):
-        self._blocks_on()
-        elapsed = session_kv_server.CRON_RELAY_POSTS_BUDGET_S - 1
-        # The route's start, the ledger check, then the blocks post.
-        readings = iter([0.0, 0.0, 0.0])
-        clock = MagicMock(monotonic=lambda: next(readings, float(elapsed)))
-        with patch.object(session_kv_server, "time", clock), self.assertLogs(session_kv_server.logger, "ERROR") as logs:
-            response, calls = self._post(blocks_post=lambda *a, **k: self.BLOCKS_TS)
-        self.assertEqual(response.json()["status"], "delivered")
-        self.assertEqual(calls, [])
-        self.assertTrue(any("no time left to post the full report" in m for m in logs.output))
-        self.assertIn("not the full report", response.json()["relay_detail"])
-
-    def test_a_failed_thread_post_names_what_it_lost(self):
-        self._blocks_on()
-        self.SLACK_THREAD = self.BLOCKS_TS  # the fake refuses posts into the blocks' thread
-        with self.assertLogs(session_kv_server.logger, "ERROR") as logs:
-            response, _ = self._post(blocks_post=lambda *a, **k: self.BLOCKS_TS, fold_ok=False)
-        self.assertTrue(any("not the full report under it" in m for m in logs.output))
-        self.assertEqual(response.json()["status"], "delivered")
-        self.assertIn("not the full report", response.json()["relay_detail"])
 
     def test_no_time_left_for_the_blocks_posts_text(self):
         self._blocks_on()

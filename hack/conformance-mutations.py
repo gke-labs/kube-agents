@@ -475,6 +475,42 @@ Mutation(
         "allows every verb beneath it, `delete` included",
     ),
     Mutation(
+        "B1-slack-remove-allowlist-widened",
+        "agents/platform/scripts/credential_proxy.py",
+        ('SLACK_REMOVE_ALLOWLIST = frozenset({"reactions.remove"})\n',
+         'SLACK_REMOVE_ALLOWLIST = frozenset({"reactions.remove", "pins.remove"})\n'),
+        "test_B1_the_slack_relay_removes_nothing_but_its_own_reaction",
+        "exempt a second remove the same way the first was, one name added to "
+        "a set that reads as already settled",
+    ),
+    Mutation(
+        "B1-slack-remove-exemption-case-folded",
+        "agents/platform/scripts/credential_proxy.py",
+        ("            method not in SLACK_REMOVE_ALLOWLIST\n",
+         "            method.lower() not in SLACK_REMOVE_ALLOWLIST\n"),
+        "test_B1_the_slack_relay_removes_nothing_but_its_own_reaction",
+        "case-fold the exemption to match the verb rule beside it, which "
+        "forwards `Reactions.Remove` past the gate",
+    ),
+    Mutation(
+        "B1-slack-verb-rule-dropped",
+        "agents/platform/scripts/credential_proxy.py",
+        ('DESTRUCTIVE_SLACK_VERBS = frozenset({"delete", "remove", "kick", "archive"})\n',
+         'DESTRUCTIVE_SLACK_VERBS = frozenset({"kick", "archive"})\n'),
+        "test_B1_the_slack_relay_removes_nothing_but_its_own_reaction",
+        "replace the remove refusal with the allowlist rather than adding the "
+        "allowlist beside it",
+    ),
+    Mutation(
+        "B1-slack-method-shape-dropped",
+        "agents/platform/scripts/credential_proxy.py",
+        ("        if not SLACK_METHOD_SHAPE.fullmatch(method):\n",
+         "        if not method:\n"),
+        "test_B1_the_slack_relay_removes_nothing_but_its_own_reaction",
+        "drop the shape check as redundant beside the verb rule, which reads "
+        "only the text after the last dot and so forwards `chat.delete#x`",
+    ),
+    Mutation(
         "B2-second-pull-requests-write",
         ".github/workflows/conformance.yml",
         ("permissions:\n  contents: read\n\njobs:\n  conformance:\n",
@@ -1254,6 +1290,91 @@ Mutation(
         "naming a cloud identity is still honoured",
     ),
     Mutation(
+        "A3-a2a-google-token-any-client",
+        "a2a/gateway/a2adoor_google.go",
+        ("\tif string(info.Aud) != v.clientID && string(info.Azp) != v.clientID {",
+         "\tif false {"),
+        "test_A3_a_google_token_is_bound_to_the_install_client_and_a_verified_email",
+        "accept a Google access token issued for any OAuth client, so a token "
+        "a developer granted some other app signs them in here",
+    ),
+    Mutation(
+        "A3-a2a-google-email-unverified",
+        "a2a/gateway/a2adoor_google.go",
+        ('\tif string(info.EmailVerified) != "true" {', "\tif false {"),
+        "test_A3_a_google_token_is_bound_to_the_install_client_and_a_verified_email",
+        "accept a token whose email Google has not verified, so the principal "
+        "is an address its holder never proved they own",
+    ),
+    Mutation(
+        "A3-a2a-google-prefix-unchecked",
+        "a2a/gateway/gchat.go",
+        ('\tif !ok || email == "" {', '\tif email == "" {'),
+        "test_A3_the_google_class_admits_only_a_prefixed_allowlisted_email",
+        "resolve an id that did not come through the door's Google check, so "
+        "any author stamped with the class's backend is admitted on the "
+        "allowlist alone",
+    ),
+    Mutation(
+        "A3-a2a-google-allowlist-bypassed",
+        "a2a/gateway/gchat.go",
+        ("\tif !g.a2aGoogleAllowed[strings.ToLower(email)] {", "\tif false {"),
+        "test_A3_the_google_class_admits_only_a_prefixed_allowlisted_email",
+        "admit every Google-verified email, so anyone with a Google account "
+        "and the install's public client id signs in",
+    ),
+    Mutation(
+        "A3-a2a-google-door-allowlist-skipped",
+        "a2a/gateway/a2adoor_google.go",
+        ("\tif err == nil && !d.googleAllowed[strings.ToLower(email)] {", "\tif false {"),
+        "test_A3_the_door_refuses_an_account_off_the_allowlist_before_holding_state",
+        "leave the allowlist to the gateway alone, so any Google account that "
+        "can mint a token for the install's client creates door conversations "
+        "and submissions that evict an allowed developer's",
+    ),
+    Mutation(
+        "A3-a2a-google-any-bearer-to-google",
+        "a2a/gateway/a2adoor_google.go",
+        ("\tif !strings.HasPrefix(token, a2aGoogleAccessTokenPrefix) {", "\tif false {"),
+        "test_A3_a_bearer_that_is_not_a_google_token_never_leaves_the_cluster",
+        "send every non-static bearer to Google's tokeninfo again, so a mistyped "
+        "door token or another secret pasted into Authorization leaves the cluster",
+    ),
+    Mutation(
+        "A3-a2a-google-prefix-spellable",
+        "a2a/gateway/a2adoor_google.go",
+        ('\ta2aGoogleCallerPrefix = ":google:"', '\ta2aGoogleCallerPrefix = "google:"'),
+        "test_A3_no_eval_caller_can_spell_a_google_caller",
+        "drop the leading colon, so an eval caller \"google\" naming the context "
+        "\"<email>:<ctx>\" spells a developer's conversation key with the "
+        "static token",
+    ),
+    Mutation(
+        "A3-a2a-eval-caller-colon-allowed",
+        "a2a/gateway/a2adoor.go",
+        ('\tif strings.Contains(caller, ":") {', "\tif false {"),
+        "test_A3_no_eval_caller_can_spell_a_google_caller",
+        "let an eval caller contain a colon, so the static token's holder can "
+        "name themselves \":google:<email>\" and read that developer's tasks",
+    ),
+    Mutation(
+        "A3-a2a-eval-caller-empty-allowed",
+        "a2a/gateway/a2adoor.go",
+        ('\tif caller == "" {', "\tif false {"),
+        "test_A3_no_eval_caller_can_spell_a_google_caller",
+        "let an eval caller be empty, so its conversation key starts a2a:: "
+        "like a Google caller's and the two namespaces meet",
+    ),
+    Mutation(
+        "A3-a2a-google-roster-chat-map",
+        "a2a/gateway/gateway.go",
+        ("\tif backend == consoleBackend || backend == a2aGoogleBackend {",
+         "\tif backend == consoleBackend {"),
+        "test_A3_the_google_class_roster_does_not_resolve_through_the_chat_map",
+        "send the Google class's roster through principalMapFor, whose default "
+        "is the chat map, so a door caller's id resolves as a chat identity",
+    ),
+    Mutation(
         "A3-slack-allowlist-skipped",
         "a2a/gateway/gchat.go",
         ('\tif authorID == "" || (!g.slackAllowAll && !g.slackAllowed[authorID]) {',
@@ -1288,6 +1409,47 @@ Mutation(
         "the shape a rename that misses the other Go module takes. Both Go "
         "suites stay green and the operator's NetworkPolicy then selects no "
         "pod, which the API server reports as success",
+    ),
+    Mutation(
+        "C1-a2a-gateway-collector-from-every-namespace",
+        "k8s-operator/internal/controller/testdata/a2a-gateway-ingress.yaml",
+        ("        - namespaceSelector:\n            matchLabels:\n              kubernetes.io/metadata.name: gke-gmp-system\n",
+         "        - namespaceSelector: {}\n"),
+        "test_C1_the_a2a_gateway_admits_the_collector_to_the_metrics_port_and_nobody_else",
+        "drop the matchLabels from the inject fence's collector peer, the edit "
+        "that reads as \"admit Prometheus wherever it runs\" and admits every "
+        "pod in every namespace to the gateway's metrics port",
+    ),
+    Mutation(
+        "C1-a2a-gateway-collector-to-a-door-port",
+        "k8s-operator/internal/controller/testdata/a2a-gateway-ingress.yaml",
+        ("      ports:\n        - port: 9096\n", "      ports:\n        - port: 8099\n"),
+        "test_C1_the_a2a_gateway_admits_the_collector_to_the_metrics_port_and_nobody_else",
+        "point the inject fence's collector rule at the inject door's port, so "
+        "the collector's namespace reaches a task-submission endpoint guarded "
+        "by its bearer token alone",
+    ),
+    Mutation(
+        "C1-a2a-gateway-second-ingress-rule",
+        "k8s-operator/internal/controller/testdata/a2a-gateway-ingress.yaml",
+        ("      ports:\n        - port: 9096\n          protocol: TCP\n  podSelector:",
+         "      ports:\n        - port: 9096\n          protocol: TCP\n    - from:\n        - podSelector: {}\n"
+         "      ports:\n        - port: 8098\n          protocol: TCP\n  podSelector:"),
+        "test_C1_the_a2a_gateway_admits_the_collector_to_the_metrics_port_and_nobody_else",
+        "add a second rule beside the collector's, admitting every pod in the "
+        "namespace to the A2A door's port: the 'an in-cluster caller needs the "
+        "door' edit made without the decision the fence's comment asks for",
+    ),
+    Mutation(
+        "C1-a2a-gateway-fence-selects-a-label-the-pod-lacks",
+        "k8s-operator/internal/controller/testdata/a2a-gateway-ingress.yaml",
+        ("  podSelector:\n    matchLabels:\n      app: test-agent-a2a-gateway\n",
+         "  podSelector:\n    matchLabels:\n      app.kubernetes.io/name: test-agent-a2a-gateway\n"),
+        "test_C1_the_a2a_gateway_admits_the_collector_to_the_metrics_port_and_nobody_else",
+        "move the inject fence's selector to an app.kubernetes.io/name key the "
+        "gateway pod carries with another value, the half-done label migration: "
+        "the fence still names the Deployment, selects no pod, and the API "
+        "server reports that as success",
     ),
     Mutation(
         "C1-session-pod-gets-a-second-token",
@@ -1544,6 +1706,24 @@ Mutation(
         "user; the static credential it names is the half the bridge inherited",
     ),
     Mutation(
+        "C1-rendered-bridge-keeps-the-bus-token",
+        "k8s-operator/internal/controller/platformagent_a2a_bridge.go",
+        ("\t\tif !a2aIsBusTokenMount(m) {\n\t\t\tmounts = append(mounts, m)\n\t\t}",
+         "\t\tmounts = append(mounts, m)"),
+        "test_C1_the_rendered_bridge_is_not_the_agent_principal",
+        "copy every agent mount into the rendered bridge, bus token included: "
+        "the bridge then authenticates as the agent principal and the A5 split "
+        "is undone by a volumeMount",
+    ),
+    Mutation(
+        "C1-rendered-bridge-inherits-the-agent-bus-user",
+        "k8s-operator/internal/controller/platformagent_a2a_bridge.go",
+        ("\ta2aBusUserEnv:               true,\n", ""),
+        "test_C1_the_rendered_bridge_is_not_the_agent_principal",
+        "let the rendered bridge inherit A2A_BUS_USER=agent, the agent "
+        "principal's name and inbox prefix",
+    ),
+    Mutation(
         "A3-session-writes-its-own-supervisor-subject",
         "a2a/authcallout/session.go",
         ('\t\tPublish: []string{\n\t\t\tlib.TaskEventsSubject(pod, "*"),\n\t\t},',
@@ -1658,6 +1838,19 @@ Mutation(
         "the env by the same constant, so they stay green; the operator is not "
         "rebuilt by this edit and goes on rendering A2A_RESERVED_PRINCIPALS. "
         "The next callout rollout's pods exit with A2A_STATIC_PRINCIPALS is "
+        "required and never go Ready",
+    ),
+    Mutation(
+        "C1-reserved-addressees-env-renamed-on-the-callout-side",
+        "a2a/cmd/authcallout/main.go",
+        ('envReservedAddressees = "A2A_RESERVED_ADDRESSEES"',
+         'envReservedAddressees = "A2A_FIXED_ADDRESSEES"'),
+        "test_C1_the_callouts_reserved_addressees_env_is_spelled_the_same_in_both_modules",
+        "rename the callout's reserved-addressees variable to say what the "
+        "names are, in the module that reads it. a2a builds and its tests set "
+        "the env by the same constant, so they stay green; the operator is not "
+        "rebuilt by this edit and goes on rendering A2A_RESERVED_ADDRESSEES. "
+        "The next callout rollout's pods exit with A2A_FIXED_ADDRESSEES is "
         "required and never go Ready",
     ),
     Mutation(

@@ -84,6 +84,14 @@ func provision(t *testing.T, url string) {
 // gateway's submission publish fail for real rather than through a fake. The
 // session-state bucket stays, so everything up to the publish still works:
 // the session is minted, the task is announced and the placeholder posted.
+//
+// Not before the gateway's relay has bound its durable on the stream, though.
+// The rig starts Run on a goroutine, and Run binds the relay before it starts
+// the adapter that reads the inbox; a stream deleted ahead of that bind leaves
+// Run retrying "stream not found" for the whole bind window (lib's
+// subscribeBindWindow, 45s), so no turn is ever read and the test times out
+// waiting for a failure the gateway never got to have. Under a loaded
+// `go test ./...` the goroutine can lose that race.
 func deleteTasksStream(t *testing.T, url string) {
 	t.Helper()
 	nc, err := nats.Connect(url)
@@ -95,10 +103,57 @@ func deleteTasksStream(t *testing.T, url string) {
 	if err != nil {
 		t.Fatalf("jetstream: %v", err)
 	}
+	waitFor(t, "the relay durable to bind", func() bool {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_, err := js.Consumer(ctx, lib.TasksStream, relayDurable)
+		return err == nil
+	})
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if err := js.DeleteStream(ctx, lib.TasksStream); err != nil {
 		t.Fatalf("delete TASKS: %v", err)
+	}
+}
+
+// The helper holds the delete until the relay's durable exists: a durable
+// created after a delay still binds, because the stream is still there. With
+// the wait gone the stream is deleted at once and the late create fails
+// "stream not found", which is the race #2696 hit from the gateway's side.
+func TestDeleteTasksStreamWaitsForTheRelayDurable(t *testing.T) {
+	s := startServer(t)
+	provision(t, s.ClientURL())
+	nc, err := nats.Connect(s.ClientURL())
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer nc.Close()
+	js, err := jetstream.New(nc)
+	if err != nil {
+		t.Fatalf("jetstream: %v", err)
+	}
+	created := make(chan error, 1)
+	go func() {
+		time.Sleep(300 * time.Millisecond)
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_, err := js.CreateOrUpdateConsumer(ctx, lib.TasksStream, jetstream.ConsumerConfig{Durable: relayDurable})
+		if err != nil {
+			// Reported here, at once: a create that fails leaves the helper
+			// waiting out its deadline, and its timeout would otherwise be
+			// the only message, naming the wait rather than the create.
+			t.Errorf("the late durable create failed: %v", err)
+		}
+		created <- err
+	}()
+	deleteTasksStream(t, s.ClientURL())
+	if err := <-created; err != nil {
+		t.Fatalf("the late durable could not bind, so the stream was deleted before it: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, err := js.Stream(ctx, lib.TasksStream); !errors.Is(err, jetstream.ErrStreamNotFound) {
+		t.Fatalf("TASKS should be gone after the helper returns, got %v", err)
 	}
 }
 
@@ -228,6 +283,13 @@ func startRig(t *testing.T) *rig {
 // reach into a running gateway.
 func startRigWith(t *testing.T, tweak func(*Config)) *rig {
 	t.Helper()
+	return startRigWithLogger(t, tweak, nil)
+}
+
+// startRigWithLogger is startRigWith with the gateway's logger supplied, for
+// the cases that assert on what the gateway logs. nil is the default logger.
+func startRigWithLogger(t *testing.T, tweak func(*Config), logger *slog.Logger) *rig {
+	t.Helper()
 	s := startServer(t)
 	url := s.ClientURL()
 	provision(t, url)
@@ -262,7 +324,7 @@ func startRigWith(t *testing.T, tweak func(*Config)) *rig {
 	if tweak != nil {
 		tweak(cfg)
 	}
-	g, err := New(Options{Client: client, Adapter: adapter, Config: cfg, Backend: "discord"})
+	g, err := New(Options{Client: client, Adapter: adapter, Config: cfg, Backend: "discord", Logger: logger})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -576,7 +638,7 @@ func TestMessageDuringWorkingIsSteeringOnSameTask(t *testing.T) {
 	// a dropped message live.
 	waitFor(t, "steer acknowledgement", func() bool {
 		for _, p := range r.adapter.postTexts() {
-			if strings.Contains(p, "steering sent") {
+			if strings.Contains(p, ackSteerQueued) {
 				return true
 			}
 		}
@@ -721,10 +783,9 @@ func TestNormalizePhrases(t *testing.T) {
 		"status update pls": false,
 		"do the thing":      false,
 	} {
-		// Narrow mode: these phrases exercise normalization through the
-		// exact set and classify the same way in both modes.
-		if got := isStatusQuery(phrase, false); got != want {
-			t.Errorf("isStatusQuery(%q, false) = %v, want %v", phrase, got, want)
+		// These phrases exercise normalization through the exact set.
+		if got := isStatusQuery(phrase); got != want {
+			t.Errorf("isStatusQuery(%q) = %v, want %v", phrase, got, want)
 		}
 	}
 	if !isStop("Stop!") || !isStop("cancel") || isStop("stop the deploy") {
@@ -1320,10 +1381,11 @@ func TestDelegateWithoutSpawnerRoutesDefault(t *testing.T) {
 	}
 }
 
-// TestDelegatedTaskStatusShapeSteers: the width bias inverts for executors
-// that absorb steers. During a delegated task a wide interrogative shape
-// must reach the worker as a steer - only the exact phrases stay status
-// affordances, or a correction is stolen and answered by replay.
+// TestDelegatedTaskStatusShapeSteers: the status matcher is the exact
+// phrase set everywhere. During a delegated task a status-shaped but
+// non-exact ask must reach the worker as a steer - only the exact phrases
+// stay status affordances, or a correction is stolen and answered by
+// replay.
 func TestDelegatedTaskStatusShapeSteers(t *testing.T) {
 	r, spawn := startRigWithSpawner(t)
 	conv := "discord:g1/thread-d3"
@@ -2749,5 +2811,411 @@ func TestAskTTLBoundsTheIncarnationSet(t *testing.T) {
 	fresh, _ := r.g.reg.Get(ctx, conv)
 	if len(fresh.SessionAuthors) != 0 || !fresh.SessionAuthorsUnknown {
 		t.Fatalf("incarnation set past the TTL: %+v unknown=%v", fresh.SessionAuthors, fresh.SessionAuthorsUnknown)
+	}
+}
+
+// publishSteerNotice publishes the executor's non-final notice for a follow-up.
+func publishSteerNotice(t *testing.T, r *rig, origin *lib.Envelope, addressee string, n lib.SteerNotice) {
+	t.Helper()
+	part, err := lib.SteerNoticePart(n)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload, _ := json.Marshal(lib.StatusUpdate{TaskID: origin.TaskID, ContextID: origin.ContextID,
+		Status: lib.TaskStatus{State: lib.StateWorking, Message: &lib.Message{Role: "agent", MessageID: "msg-n-" + n.EnvelopeID + "-" + n.Steer,
+			Parts: []lib.Part{{Kind: "text", Text: "follow-up " + n.Steer}, part}}}})
+	env, err := lib.NewStatusUpdateEnvelope(lib.Party{Session: addressee, AgentType: "test-executor"},
+		origin.TaskID, origin.ContextID, origin.CorrelationID, payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := r.bus.Publish(context.Background(), lib.TaskEventsSubject(addressee, origin.TaskID), env); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// publishTurnAnswer publishes one finished turn's answer, one chunk, last.
+func publishTurnAnswer(t *testing.T, r *rig, origin *lib.Envelope, addressee string, turn int, text string) {
+	t.Helper()
+	publishTurnChunk(t, r, origin, addressee, turn, text, false, true)
+}
+
+// publishTurnChunk publishes one chunk of a turn's answer.
+func publishTurnChunk(t *testing.T, r *rig, origin *lib.Envelope, addressee string, turn int, text string, appendChunk, last bool) {
+	t.Helper()
+	payload, _ := json.Marshal(lib.ArtifactUpdate{TaskID: origin.TaskID, ContextID: origin.ContextID,
+		Artifact: lib.Artifact{ArtifactID: fmt.Sprintf("artifact-%s-turn-%d", origin.TaskID, turn), Name: lib.ArtifactTurn,
+			Parts: []lib.Part{{Kind: "text", Text: text}}},
+		Append: appendChunk, LastChunk: last})
+	env, err := lib.NewArtifactUpdateEnvelope(lib.Party{Session: addressee, AgentType: "test-executor"},
+		origin.TaskID, origin.ContextID, origin.CorrelationID, payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := r.bus.Publish(context.Background(), lib.TaskEventsSubject(addressee, origin.TaskID), env); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// lastInSubject is the newest follow-up envelope on platform's in subject for origin.
+func lastInSubject(t *testing.T, r *rig, origin *lib.Envelope) *lib.Envelope {
+	t.Helper()
+	var last *lib.Envelope
+	for _, e := range inSubjectEnvelopes(t, r.url, "platform") {
+		if e.TaskID == origin.TaskID && e.Kind == lib.KindMessage && e.EnvelopeID != origin.EnvelopeID {
+			last = e
+		}
+	}
+	if last == nil {
+		t.Fatal("no follow-up on the in subject")
+	}
+	return last
+}
+
+func TestRelayPostsEachTurnAnswerThenTheDeliverable(t *testing.T) {
+	r := startRig(t)
+	conv := "discord:g1/thread-turns"
+	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: "tu-1", Text: "check the fleet"}
+	origin := r.awaitTask(t, "platform")
+	exec := r.execFor(t, origin, "platform")
+	_ = exec.PublishStatus(context.Background(), lib.StateWorking, false)
+	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: "tu-2", Text: "only prod"}
+	waitFor(t, "ack", postedContaining(r, ackSteerQueued))
+	steer := lastInSubject(t, r, origin)
+	publishSteerNotice(t, r, origin, "platform", lib.SteerNotice{Steer: lib.SteerQueued, EnvelopeID: steer.EnvelopeID})
+	publishTurnAnswer(t, r, origin, "platform", 1, "fleet: 3 clusters green")
+	waitFor(t, "turn 1 posted before the terminal", postedContaining(r, "fleet: 3 clusters green"))
+	completeTask(t, exec, "prod: green")
+	waitFor(t, "deliverable", postedContaining(r, "prod: green"))
+	if a, b := postIndex(r, "fleet: 3 clusters green"), postIndex(r, "prod: green"); a < 0 || a > b {
+		t.Fatalf("turn 1 at %d, deliverable at %d", a, b)
+	}
+	for _, p := range r.adapter.postTexts() {
+		if strings.Contains(p, "ℹ️") || strings.Contains(p, "⚠️") {
+			t.Fatalf("a queued notice or a shortfall line posted: %q", p)
+		}
+	}
+}
+
+func TestRelayRendersARefusedFollowUp(t *testing.T) {
+	r := startRig(t)
+	conv := "discord:g1/thread-refused"
+	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: "rf-1", Text: "check the fleet"}
+	origin := r.awaitTask(t, "platform")
+	_ = r.execFor(t, origin, "platform").PublishStatus(context.Background(), lib.StateWorking, false)
+	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: "rf-2", Text: "seventeenth"}
+	waitFor(t, "ack", postedContaining(r, ackSteerQueued))
+	steer := lastInSubject(t, r, origin)
+	publishSteerNotice(t, r, origin, "platform", lib.SteerNotice{Steer: lib.SteerRefused, EnvelopeID: steer.EnvelopeID, Reason: lib.SteerReasonQueueFull})
+	waitFor(t, "refusal", postedContaining(r, fmt.Sprintf(noticeSteerNotTaken, steerRefusalWhy[lib.SteerReasonQueueFull])))
+}
+
+// TestRelayWordsARefusalWithNoReason: a refused notice with no reason token
+// says none was given; quoting the empty token would post "the executor said
+// ." to the room.
+func TestRelayWordsARefusalWithNoReason(t *testing.T) {
+	r := startRig(t)
+	conv := "discord:g1/thread-refused-bare"
+	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: "rb-1", Text: "check the fleet"}
+	origin := r.awaitTask(t, "platform")
+	_ = r.execFor(t, origin, "platform").PublishStatus(context.Background(), lib.StateWorking, false)
+	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: "rb-2", Text: "only prod"}
+	waitFor(t, "ack", postedContaining(r, ackSteerQueued))
+	steer := lastInSubject(t, r, origin)
+	publishSteerNotice(t, r, origin, "platform", lib.SteerNotice{Steer: lib.SteerRefused, EnvelopeID: steer.EnvelopeID})
+	waitFor(t, "refusal", postedContaining(r, fmt.Sprintf(noticeSteerNotTaken, "the executor gave no reason")))
+	for _, p := range r.adapter.postTexts() {
+		if strings.Contains(p, "the executor said") {
+			t.Fatalf("an empty reason was quoted: %q", p)
+		}
+	}
+
+	// An unknown token is quoted, bounded.
+	long := strings.Repeat("x", 2*steerReasonQuoteMax)
+	if got, want := steerNotTakenNotice(long), fmt.Sprintf(noticeSteerNotTaken, "the executor said "+truncateRunes(long, steerReasonQuoteMax)); got != want {
+		t.Fatalf("unknown token = %q, want %q", got, want)
+	}
+	if got := steerNotTakenNotice(" "); got != fmt.Sprintf(noticeSteerNotTaken, "the executor gave no reason") {
+		t.Fatalf("blank token = %q", got)
+	}
+}
+
+// The follow-up reached the stream after the executor's terminal, so
+// nothing answered it; the room is told at the terminal. The executor has
+// shown it answers follow-ups: on an earlier follow-up of the same task, or
+// on an earlier task to the same addressee since the gateway started.
+func TestRelayReportsAFollowUpNoExecutorAnswered(t *testing.T) {
+	t.Run("a notice earlier in the task", func(t *testing.T) {
+		r := startRig(t)
+		conv := "discord:g1/thread-missed"
+		r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: "ms-1", Text: "check the fleet"}
+		origin := r.awaitTask(t, "platform")
+		exec := r.execFor(t, origin, "platform")
+		_ = exec.PublishStatus(context.Background(), lib.StateWorking, false)
+		r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: "ms-2", Text: "only prod"}
+		waitFor(t, "steer published", func() bool { return len(inSubjectEnvelopes(t, r.url, "platform")) == 2 })
+		publishSteerNotice(t, r, origin, "platform", lib.SteerNotice{Steer: lib.SteerQueued, EnvelopeID: lastInSubject(t, r, origin).EnvelopeID})
+		publishTurnAnswer(t, r, origin, "platform", 1, "fleet: 3 clusters")
+		waitFor(t, "turn 1 posted", postedContaining(r, "fleet: 3 clusters"))
+		r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: "ms-3", Text: "and staging"}
+		waitFor(t, "second steer published", func() bool { return len(inSubjectEnvelopes(t, r.url, "platform")) == 3 })
+		waitFor(t, "second ack", func() bool { return strings.Count(strings.Join(r.adapter.postTexts(), "\n"), ackSteerQueued) == 2 })
+		completeTask(t, exec, "prod: green")
+		missed := fmt.Sprintf(noticeSteerMissed, 1)
+		waitFor(t, "missed line", postedContaining(r, missed))
+		if a, b := postIndex(r, "prod: green"), postIndex(r, missed); a < 0 || a > b {
+			t.Fatalf("deliverable at %d, missed line at %d: the missed line must follow the deliverable", a, b)
+		}
+		if strings.Contains(strings.Join(r.adapter.postTexts(), "\n"), "did not run") {
+			t.Fatal("the follow-up that ran was counted as not run")
+		}
+	})
+	t.Run("a notice on an earlier task", func(t *testing.T) {
+		r := startRig(t)
+		first := "discord:g1/thread-spoke"
+		r.adapter.inbox <- InboundMessage{Conversation: first, Kind: "group", AuthorID: "1001", MessageID: "sp-1", Text: "check the fleet"}
+		origin := r.awaitTask(t, "platform")
+		exec := r.execFor(t, origin, "platform")
+		_ = exec.PublishStatus(context.Background(), lib.StateWorking, false)
+		r.adapter.inbox <- InboundMessage{Conversation: first, Kind: "group", AuthorID: "1001", MessageID: "sp-2", Text: "too many"}
+		waitFor(t, "steer published", func() bool { return len(inSubjectEnvelopes(t, r.url, "platform")) == 2 })
+		publishSteerNotice(t, r, origin, "platform", lib.SteerNotice{Steer: lib.SteerRefused,
+			EnvelopeID: lastInSubject(t, r, origin).EnvelopeID, Reason: lib.SteerReasonQueueFull})
+		completeTask(t, exec, "fleet: green")
+		waitFor(t, "first task done", postedContaining(r, "fleet: green"))
+
+		conv := "discord:g1/thread-missed-2"
+		r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: "ms-1", Text: "check the nodes"}
+		waitFor(t, "second task", func() bool { return len(inSubjectEnvelopes(t, r.url, "platform")) == 3 })
+		second := inSubjectEnvelopes(t, r.url, "platform")[2]
+		exec2 := r.execFor(t, second, "platform")
+		_ = exec2.PublishStatus(context.Background(), lib.StateWorking, false)
+		r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: "ms-2", Text: "only prod"}
+		waitFor(t, "second ack", func() bool { return strings.Count(strings.Join(r.adapter.postTexts(), "\n"), ackSteerQueued) == 2 })
+		completeTask(t, exec2, "nodes: green")
+		waitFor(t, "missed line", postedContaining(r, fmt.Sprintf(noticeSteerMissed, 1)))
+	})
+	// Three follow-ups nothing answered are one line that counts them, so
+	// the room is not told to resend "it" when there were three.
+	t.Run("three unanswered, one counted line", func(t *testing.T) {
+		r := startRig(t)
+		conv := "discord:g1/thread-missed-3"
+		r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: "m3-1", Text: "check the fleet"}
+		origin := r.awaitTask(t, "platform")
+		exec := r.execFor(t, origin, "platform")
+		_ = exec.PublishStatus(context.Background(), lib.StateWorking, false)
+		r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: "m3-2", Text: "only prod"}
+		waitFor(t, "steer published", func() bool { return len(inSubjectEnvelopes(t, r.url, "platform")) == 2 })
+		publishSteerNotice(t, r, origin, "platform", lib.SteerNotice{Steer: lib.SteerQueued, EnvelopeID: lastInSubject(t, r, origin).EnvelopeID})
+		publishTurnAnswer(t, r, origin, "platform", 1, "fleet: 3 clusters")
+		waitFor(t, "turn 1 posted", postedContaining(r, "fleet: 3 clusters"))
+		for i, text := range []string{"and staging", "and dev", "and qa"} {
+			r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: fmt.Sprintf("m3-s%d", i), Text: text}
+			waitFor(t, "steer published", func() bool { return len(inSubjectEnvelopes(t, r.url, "platform")) == i+3 })
+		}
+		waitFor(t, "four acks", func() bool { return strings.Count(strings.Join(r.adapter.postTexts(), "\n"), ackSteerQueued) == 4 })
+		completeTask(t, exec, "prod: green")
+		want := fmt.Sprintf(noticeSteerMissed, 3)
+		waitFor(t, "missed line", postedContaining(r, want))
+		waitFor(t, "terminal line", terminalEdited(r, lib.StateCompleted))
+		if n := strings.Count(strings.Join(r.adapter.postTexts(), "\n"), "as the task finished"); n != 1 {
+			t.Fatalf("%d missed lines, want the one counted line", n)
+		}
+	})
+}
+
+// An executor that predates steer notices (an older bridge sidecar in front
+// of this gateway) answers none, so the gateway has no evidence any
+// follow-up was missed and posts no missed line: the ack and the old
+// "steering received" text are all the room sees.
+func TestRelayPostsNoMissedLineForAnExecutorThatSendsNoNotices(t *testing.T) {
+	r := startRig(t)
+	conv := "discord:g1/thread-oldbridge"
+	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: "ob-1", Text: "check the fleet"}
+	origin := r.awaitTask(t, "platform")
+	exec := r.execFor(t, origin, "platform")
+	_ = exec.PublishStatus(context.Background(), lib.StateWorking, false)
+	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: "ob-2", Text: "only prod"}
+	waitFor(t, "ack", postedContaining(r, ackSteerQueued))
+	completeTask(t, exec, "fleet: green")
+	waitFor(t, "deliverable", postedContaining(r, "fleet: green"))
+	waitFor(t, "terminal line", terminalEdited(r, lib.StateCompleted))
+	for _, p := range r.adapter.postTexts() {
+		if strings.Contains(p, "⚠️") {
+			t.Fatalf("a shortfall line posted for an executor that never spoke steer notices: %q", p)
+		}
+	}
+}
+
+// terminalEdited is true once the task's rolling line has been edited to
+// its terminal line, which the relay does after the shortfall lines.
+func terminalEdited(r *rig, state lib.TaskState) func() bool {
+	return func() bool {
+		for _, e := range r.adapter.editTexts() {
+			if strings.HasPrefix(e, terminalLine(state, "")) {
+				return true
+			}
+		}
+		return false
+	}
+}
+
+// A follow-up the executor counted as started (its turn answer posted) but
+// stopped before its turn ran is refused task-ended, and still gets its
+// "did not run" line: the cancel landed between the turn answer and the
+// spawn.
+func TestRelayCountsAFollowUpStoppedBeforeItsTurnRan(t *testing.T) {
+	r := startRig(t)
+	conv := "discord:g1/thread-gap"
+	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: "gp-1", Text: "check the fleet"}
+	origin := r.awaitTask(t, "platform")
+	_ = r.execFor(t, origin, "platform").PublishStatus(context.Background(), lib.StateWorking, false)
+	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: "gp-2", Text: "only prod"}
+	waitFor(t, "steer published", func() bool { return len(inSubjectEnvelopes(t, r.url, "platform")) == 2 })
+	id := lastInSubject(t, r, origin).EnvelopeID
+	publishSteerNotice(t, r, origin, "platform", lib.SteerNotice{Steer: lib.SteerQueued, EnvelopeID: id})
+	publishTurnAnswer(t, r, origin, "platform", 1, "fleet: 3 clusters")
+	publishSteerNotice(t, r, origin, "platform", lib.SteerNotice{Steer: lib.SteerRefused, EnvelopeID: id, Reason: lib.SteerReasonTaskEnded})
+	publishFinal(t, r, origin, "platform", lib.StateCanceled, "reason: canceled-by-request")
+	waitFor(t, "unrun line", postedContaining(r, fmt.Sprintf(noticeSteersUnrun, 1)))
+	if a, b := postIndex(r, "fleet: 3 clusters"), postIndex(r, fmt.Sprintf(noticeSteersUnrun, 1)); a < 0 || a > b {
+		t.Fatalf("turn 1 at %d, unrun line at %d", a, b)
+	}
+}
+
+// Two queued follow-ups that both ran: two turn answers post in order, then
+// the deliverable, and no shortfall line.
+func TestRelayPostsTwoTurnAnswersInOrder(t *testing.T) {
+	r := startRig(t)
+	conv := "discord:g1/thread-two-turns"
+	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: "tt-1", Text: "check the fleet"}
+	origin := r.awaitTask(t, "platform")
+	exec := r.execFor(t, origin, "platform")
+	_ = exec.PublishStatus(context.Background(), lib.StateWorking, false)
+	for i, text := range []string{"only prod", "and staging"} {
+		r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: fmt.Sprintf("tt-s%d", i), Text: text}
+		waitFor(t, "steer published", func() bool { return len(inSubjectEnvelopes(t, r.url, "platform")) == i+2 })
+		publishSteerNotice(t, r, origin, "platform", lib.SteerNotice{Steer: lib.SteerQueued, EnvelopeID: lastInSubject(t, r, origin).EnvelopeID})
+	}
+	publishTurnAnswer(t, r, origin, "platform", 1, "fleet: 3 clusters")
+	publishTurnAnswer(t, r, origin, "platform", 2, "prod: green")
+	completeTask(t, exec, "staging: green")
+	waitFor(t, "deliverable", postedContaining(r, "staging: green"))
+	waitFor(t, "terminal line", terminalEdited(r, lib.StateCompleted))
+	a, b, c := postIndex(r, "fleet: 3 clusters"), postIndex(r, "prod: green"), postIndex(r, "staging: green")
+	if a < 0 || a > b || b > c {
+		t.Fatalf("turn 1 at %d, turn 2 at %d, deliverable at %d: want that order", a, b, c)
+	}
+	for _, p := range r.adapter.postTexts() {
+		if strings.Contains(p, "⚠️") {
+			t.Fatalf("a shortfall line posted when both follow-ups ran: %q", p)
+		}
+	}
+}
+
+// A turn answer whose last chunk never came is posted, whole, when the next
+// turn's first (non-append) chunk arrives, ahead of that turn.
+func TestRelayFlushesAChunkedTurnAtTheNextNonAppendChunk(t *testing.T) {
+	r := startRig(t)
+	conv := "discord:g1/thread-chunked"
+	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: "ch-1", Text: "check the fleet"}
+	origin := r.awaitTask(t, "platform")
+	exec := r.execFor(t, origin, "platform")
+	_ = exec.PublishStatus(context.Background(), lib.StateWorking, false)
+	publishTurnChunk(t, r, origin, "platform", 1, "fleet: ", false, false)
+	publishTurnChunk(t, r, origin, "platform", 1, "3 clusters", true, false)
+	publishTurnAnswer(t, r, origin, "platform", 2, "prod: green")
+	waitFor(t, "turn 2 posted", postedContaining(r, "prod: green"))
+	if a, b := postIndex(r, "fleet: 3 clusters"), postIndex(r, "prod: green"); a < 0 || a > b {
+		t.Fatalf("turn 1 at %d (want it whole), turn 2 at %d", a, b)
+	}
+	if postIndex(r, "fleet: ") != postIndex(r, "fleet: 3 clusters") {
+		t.Fatal("turn 1's first chunk posted on its own")
+	}
+	completeTask(t, exec, "done")
+	waitFor(t, "deliverable", postedContaining(r, "done"))
+}
+
+// An executor that cannot continue a session (the bridge's cli executor)
+// refuses each follow-up no-resume as it arrives, and the room is told at
+// once, one line per follow-up, while the task still runs: not the ack and
+// then silence until the terminal. Nothing more is said at the terminal.
+func TestRelayPostsANoResumeRefusalAtOnce(t *testing.T) {
+	r := startRig(t)
+	conv := "discord:g1/thread-noresume"
+	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: "nr-1", Text: "check the fleet"}
+	origin := r.awaitTask(t, "platform")
+	exec := r.execFor(t, origin, "platform")
+	_ = exec.PublishStatus(context.Background(), lib.StateWorking, false)
+	want := steerNotTakenNotice(lib.SteerReasonNoResume)
+	if !strings.Contains(want, "can't continue a session") || !strings.Contains(want, "after the answer") {
+		t.Fatalf("no-resume wording %q does not say the executor can't continue a session", want)
+	}
+	for i, text := range []string{"one", "two", "three"} {
+		r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: fmt.Sprintf("nr-s%d", i), Text: text}
+		waitFor(t, "steer published", func() bool { return len(inSubjectEnvelopes(t, r.url, "platform")) == i+2 })
+		publishSteerNotice(t, r, origin, "platform", lib.SteerNotice{Steer: lib.SteerRefused,
+			EnvelopeID: lastInSubject(t, r, origin).EnvelopeID, Reason: lib.SteerReasonNoResume})
+		waitFor(t, fmt.Sprintf("refusal %d posted while the task runs", i+1), func() bool {
+			return strings.Count(strings.Join(r.adapter.postTexts(), "\n"), want) == i+1
+		})
+	}
+	completeTask(t, exec, "fleet: green")
+	waitFor(t, "deliverable", postedContaining(r, "fleet: green"))
+	waitFor(t, "terminal line", terminalEdited(r, lib.StateCompleted))
+	all := strings.Join(r.adapter.postTexts(), "\n")
+	if n := strings.Count(all, "can't continue a session"); n != 3 {
+		t.Fatalf("%d no-resume lines, want one per follow-up and none at the terminal:\n%s", n, all)
+	}
+	if strings.Contains(all, "did not run") || strings.Contains(all, "as the task finished") {
+		t.Fatalf("a refused follow-up was also counted as unrun or missed:\n%s", all)
+	}
+	if a, b := postIndex(r, want), postIndex(r, "fleet: green"); a < 0 || a > b {
+		t.Fatalf("first refusal at %d, deliverable at %d: the refusal must post before the terminal", a, b)
+	}
+}
+
+// Queued follow-ups that never started (refused task-ended at a cancel, or
+// lost to a crash with only a failed terminal) are one line at the
+// terminal, not one per follow-up.
+func TestRelayReportsQueuedFollowUpsThatNeverRan(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		refuseAtEnd bool
+		state       lib.TaskState
+	}{
+		{"refused task-ended at a cancel", true, lib.StateCanceled},
+		{"a crash: no refusals, a failed terminal", false, lib.StateFailed},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := startRig(t)
+			conv := "discord:g1/thread-unrun-" + string(tc.state)
+			r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: "ur-1", Text: "check the fleet"}
+			origin := r.awaitTask(t, "platform")
+			_ = r.execFor(t, origin, "platform").PublishStatus(context.Background(), lib.StateWorking, false)
+			var ids []string
+			for i, text := range []string{"one", "two"} {
+				r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: fmt.Sprintf("ur-s%d", i), Text: text}
+				waitFor(t, "steer published", func() bool { return len(inSubjectEnvelopes(t, r.url, "platform")) == i+2 })
+				ids = append(ids, lastInSubject(t, r, origin).EnvelopeID)
+			}
+			for _, id := range ids {
+				publishSteerNotice(t, r, origin, "platform", lib.SteerNotice{Steer: lib.SteerQueued, EnvelopeID: id})
+			}
+			if tc.refuseAtEnd {
+				for _, id := range ids {
+					publishSteerNotice(t, r, origin, "platform", lib.SteerNotice{Steer: lib.SteerRefused, EnvelopeID: id, Reason: lib.SteerReasonTaskEnded})
+				}
+			}
+			publishFinal(t, r, origin, "platform", tc.state, "reason: test")
+			want := fmt.Sprintf(noticeSteersUnrun, 2)
+			waitFor(t, "unrun line", postedContaining(r, want))
+			if n := strings.Count(strings.Join(r.adapter.postTexts(), "\n"), "did not run"); n != 1 {
+				t.Fatalf("%d did-not-run lines, want 1", n)
+			}
+			if strings.Contains(strings.Join(r.adapter.postTexts(), "\n"), "not taken") {
+				t.Fatal("a task-ended refusal posted its own line")
+			}
+		})
 	}
 }

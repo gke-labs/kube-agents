@@ -2320,5 +2320,165 @@ class TestNotEvaluatedRun(unittest.TestCase):
         self.assertEqual((lost["runs_on_record"], lost["pass_rate"], lost["last3"]), (1, None, ["infra"]))
 
 
+
+FAKE_GITLAB_JOB = "pull-kube-agents-smoke-test-gitlab"
+FAKE_GITLAB_GLOB = FAKE_BUCKET + f"pull/gke-labs_kube-agents/998/{FAKE_GITLAB_JOB}/*"
+# The lane's glob in the shape its index derives from, and that index.
+FAKE_GITLAB_INDEXED_GLOB = FAKE_BUCKET + f"pr-logs/pull/gke-labs_kube-agents/998/{FAKE_GITLAB_JOB}/*"
+FAKE_GITLAB_INDEX_PREFIX = FAKE_BUCKET + f"pr-logs/directory/{FAKE_GITLAB_JOB}/"
+
+
+class TestGitLabLane(_MergeBase):
+    """The GitLab lane (kube-agents#2394): a third source of pull-request
+    builds, tagged tier gitlab, with a watermark of its own, listed on the
+    Brief by itself and counted in no gate verdict."""
+
+    def place_gitlab_build(self, build, pr=998) -> pathlib.Path:
+        root = self.bucket_root()
+        dst = root / f"pull/gke-labs_kube-agents/{pr}/{FAKE_GITLAB_JOB}/{build}"
+        shutil.copytree(TESTDATA / build, dst)
+        return dst
+
+    def test_gitlab_builds_parse_with_their_tier_and_job_and_feed_no_case_history(self):
+        gsutil, _ = self.fake_gsutil([])
+        self.place_gitlab_build(BUILD_998_FULL)
+        now = datetime(2026, 9, 1, tzinfo=timezone.utc)
+        data, stderr = self.quiet_collect(gitlab_globs=[FAKE_GITLAB_GLOB], gsutil=gsutil, now=now)
+        self.assertEqual([(r["build_id"], r["tier"], r["job"], r["pr"]) for r in data["runs"]], [(BUILD_998_FULL, "gitlab", FAKE_GITLAB_JOB, 998)])
+        self.assertEqual(tiers.gitlab_runs(data["runs"]), data["runs"])
+        self.assertEqual(tiers.presubmit_runs(data["runs"]), [], "the gate's filters never see it")
+        # The per-case record is the presubmit's and the nightly's; a GitLab
+        # run feeds neither, so a GitLab-only case is not on the Cases page.
+        self.assertEqual(data["cases"], [])
+
+    def test_each_source_resumes_above_its_own_watermark_gitlab_included(self):
+        """The newest presubmit id sits far above every GitLab id (the lane
+        runs rarely), so a shared watermark would skip every GitLab build."""
+        gsutil, log = self.fake_gsutil([BUILD_998_INFRA])  # presubmit candidate, old
+        self.place_gitlab_build(BUILD_956_TRUNCATED)  # the lowest id, under the GitLab job
+        prior_data = json.loads(pathlib.Path(self.prior_with([BUILD_998_FULL])).read_text())
+        prior_data["runs"].append(dict(prior_data["runs"][0], build_id="1", tier="gitlab", job=FAKE_GITLAB_JOB))
+        prior = self.write_prior(prior_data)
+        merged, stderr = self.quiet_collect(
+            pr_globs=[FAKE_GLOB], gitlab_globs=[FAKE_GITLAB_GLOB], merge_with=prior, gsutil=gsutil, index_prefix="",
+        )
+        by_id = {run["build_id"]: run for run in merged["runs"]}
+        self.assertEqual(by_id[BUILD_956_TRUNCATED]["tier"], "gitlab", "below the presubmit watermark, above the lane's own")
+        self.assertNotIn(BUILD_998_INFRA, by_id, "below the presubmit's own watermark: skipped")
+        self.assertIn(f"GCS scan resumed above build {BUILD_998_FULL}", stderr)
+        self.assertIn("gitlab scan resumed above build 1, 1 new", stderr)
+        # And the presubmit watermark ignores the lane's ids, as it ignores the nightly's.
+        self.assertEqual(collect.newest_build_id(tiers.presubmit_runs(merged["runs"])), int(BUILD_998_FULL))
+
+    def test_a_lane_that_has_not_run_yet_is_a_note_not_the_refusal_line(self):
+        """`gsutil ls` exits non-zero on a glob matching no objects, and the
+        refresh workflow refuses to publish on `warning: gsutil ls ... failed`;
+        until the lane's first build that must be a note, or every tick is red."""
+        gsutil, _ = self.fake_gsutil([BUILD_998_FULL])
+        data, stderr = self.quiet_collect(pr_globs=[FAKE_GLOB], gitlab_globs=[FAKE_GITLAB_GLOB], gsutil=gsutil)
+        self.assertEqual([r["build_id"] for r in data["runs"]], [BUILD_998_FULL])
+        self.assertIn(f"note: glob {FAKE_GITLAB_GLOB} did not list", stderr)
+        self.assertNotRegex(stderr, r"warning: gsutil (ls|cat) .*(failed|timed out)")
+        # The presubmit's own glob keeps the warning: the gate's listing failing is a stall.
+        data, stderr = self.quiet_collect(pr_globs=[FAKE_BUCKET + "pull/gke-labs_kube-agents/1/nowhere/*"], gsutil=gsutil)
+        self.assertIn("warning: gsutil ls failed for", stderr)
+
+    def test_the_cold_path_lists_the_lanes_index_not_the_archive_wide_glob(self):
+        """With no lane run on record the archive-wide glob walks every pull
+        request's directory on every tick (bnaylor measured 2 min 15 s over
+        962 of them, read-only, against about 1 s for the index), and past
+        the listing timeout that is the refusal line, indefinitely for an
+        on-demand lane. The index answers "nothing yet" as a note, and lists
+        the first build when it lands."""
+        gsutil, log = self.fake_gsutil([BUILD_998_FULL])
+        _, stderr = self.quiet_collect(pr_globs=[FAKE_GLOB], gitlab_globs=[FAKE_GITLAB_INDEXED_GLOB], gsutil=gsutil, index_prefix=FAKE_INDEX_PREFIX)
+        self.assertIn(f"ls {FAKE_GITLAB_INDEX_PREFIX}", log.read_text(), "the lane's index, cold")
+        self.assertNotIn(f"ls {FAKE_GITLAB_INDEXED_GLOB}", log.read_text(), "never the archive-wide glob")
+        self.assertIn(f"note: directory index {FAKE_GITLAB_INDEX_PREFIX} did not list", stderr)
+        self.assertNotRegex(stderr, r"warning: gsutil (ls|cat) .*(failed|timed out)")
+        # The first lane build lands: read through the index, no watermark yet.
+        root = self.bucket_root()
+        url = FAKE_GITLAB_INDEXED_GLOB.rstrip("*") + BUILD_956_TRUNCATED
+        shutil.copytree(TESTDATA / BUILD_956_TRUNCATED, root / url[len(FAKE_BUCKET):])
+        index = root / FAKE_GITLAB_INDEX_PREFIX[len(FAKE_BUCKET):]
+        index.mkdir(parents=True)
+        (index / f"{BUILD_956_TRUNCATED}.txt").write_text(url + "\n")
+        data, stderr = self.quiet_collect(pr_globs=[FAKE_GLOB], gitlab_globs=[FAKE_GITLAB_INDEXED_GLOB], gsutil=gsutil, index_prefix=FAKE_INDEX_PREFIX)
+        self.assertEqual({r["build_id"]: r["tier"] for r in data["runs"]}, {BUILD_998_FULL: "presubmit", BUILD_956_TRUNCATED: "gitlab"})
+        self.assertNotIn(f"ls {FAKE_GITLAB_INDEXED_GLOB}", log.read_text())
+
+    def test_a_known_but_empty_lane_index_is_a_note_and_a_denied_one_the_warning(self):
+        """The nightly's rule: once a lane run is on record its index is
+        listed, and an index that matched no objects (purged or moved while
+        the on-demand lane sat idle) must not stop the gate's dashboard
+        publishing for the weeks until the lane next builds; a listing that
+        fails any other way is the bucket or the grant, the refusal line."""
+        gsutil, log = self.fake_gsutil([BUILD_998_FULL])
+        prior_data = json.loads(pathlib.Path(self.prior_with([BUILD_998_FULL])).read_text())
+        prior_data["runs"].append(dict(prior_data["runs"][0], build_id="1", tier="gitlab", job=FAKE_GITLAB_JOB))
+        prior = self.write_prior(prior_data)
+        merged, stderr = self.quiet_collect(pr_globs=[FAKE_GLOB], gitlab_globs=[FAKE_GITLAB_INDEXED_GLOB], merge_with=prior, gsutil=gsutil, index_prefix=FAKE_INDEX_PREFIX)
+        self.assertIn(f"ls {FAKE_GITLAB_INDEX_PREFIX}", log.read_text(), "the index path, not the glob")
+        self.assertIn(f"note: directory index {FAKE_GITLAB_INDEX_PREFIX} did not list", stderr)
+        self.assertNotRegex(stderr, r"warning: gsutil (ls|cat) .*(failed|timed out)")
+        self.assertEqual(len(merged["runs"]), 2, "the old lane run stays on record")
+        # The glob path with a watermark (index disabled) is the same note.
+        _, stderr = self.quiet_collect(pr_globs=[FAKE_GLOB], gitlab_globs=[FAKE_GITLAB_GLOB], merge_with=prior, gsutil=gsutil, index_prefix="")
+        self.assertIn(f"note: glob {FAKE_GITLAB_GLOB} did not list", stderr)
+        self.assertNotRegex(stderr, r"warning: gsutil (ls|cat) .*(failed|timed out)")
+        # Denied is not "no objects": with a run on record that is the warning line.
+        os.environ["FAKE_GSUTIL_DENY"] = FAKE_GITLAB_INDEX_PREFIX
+        self.addCleanup(os.environ.pop, "FAKE_GSUTIL_DENY", None)
+        _, stderr = self.quiet_collect(pr_globs=[FAKE_GLOB], gitlab_globs=[FAKE_GITLAB_INDEXED_GLOB], merge_with=prior, gsutil=gsutil, index_prefix=FAKE_INDEX_PREFIX)
+        self.assertIn(f"warning: gsutil ls failed for {FAKE_GITLAB_INDEX_PREFIX}", stderr)
+
+    def test_with_a_lane_run_on_record_the_lane_lists_its_own_index_not_the_presubmits(self):
+        """`--index-prefix` names the presubmit's index; handed to the lane it
+        would list every presubmit build above the lane's low watermark and
+        re-tag them gitlab, emptying the gate's history."""
+        gsutil, log = self.fake_gsutil([BUILD_998_FULL])  # in the presubmit's index
+        root = self.bucket_root()
+        url = FAKE_GITLAB_INDEXED_GLOB.rstrip("*") + BUILD_956_TRUNCATED
+        shutil.copytree(TESTDATA / BUILD_956_TRUNCATED, root / url[len(FAKE_BUCKET):])
+        index = root / FAKE_GITLAB_INDEX_PREFIX[len(FAKE_BUCKET):]
+        index.mkdir(parents=True)
+        (index / f"{BUILD_956_TRUNCATED}.txt").write_text(url + "\n")
+        prior_data = json.loads(pathlib.Path(self.prior_with([BUILD_998_FULL])).read_text())
+        prior_data["runs"].append(dict(prior_data["runs"][0], build_id="1", tier="gitlab", job=FAKE_GITLAB_JOB))
+        prior = self.write_prior(prior_data)
+        merged, stderr = self.quiet_collect(
+            pr_globs=[FAKE_GLOB], gitlab_globs=[FAKE_GITLAB_INDEXED_GLOB], merge_with=prior, gsutil=gsutil, index_prefix=FAKE_INDEX_PREFIX,
+        )
+        self.assertEqual({r["build_id"]: r["tier"] for r in merged["runs"]}, {BUILD_998_FULL: "presubmit", "1": "gitlab", BUILD_956_TRUNCATED: "gitlab"})
+        self.assertIn(f"ls {FAKE_GITLAB_INDEX_PREFIX}", log.read_text())
+        self.assertNotIn(f"ls {FAKE_GITLAB_INDEXED_GLOB}", log.read_text(), "with a watermark the lane reads its index, not the glob")
+
+    def test_an_unfinished_gitlab_build_rides_pending_with_its_tier(self):
+        gsutil, _ = self.fake_gsutil([])
+        built = self.place_gitlab_build(BUILD_998_FULL)
+        (built / "finished.json").unlink()
+        now = datetime(2026, 9, 10, 12, 0, tzinfo=timezone.utc)
+        data, _ = self.quiet_collect(gitlab_globs=[FAKE_GITLAB_GLOB], gsutil=gsutil, now=now)
+        self.assertEqual(data["runs"], [])
+        self.assertEqual(data["pending_builds"], [{"build_id": BUILD_998_FULL, "first_seen": now.isoformat(), "tier": "gitlab"}])
+        # The tag survives a scan that lists nothing new, and the presubmit
+        # source never retries it: its retry set is the presubmit's own.
+        prior = self.write_prior(data)
+        gsutil, log = self.fake_gsutil([])
+        merged, _ = self.quiet_collect(pr_globs=[FAKE_GLOB], gitlab_globs=[FAKE_GITLAB_GLOB], merge_with=prior, gsutil=gsutil, now=now + timedelta(minutes=15), index_prefix="")
+        self.assertEqual(merged["pending_builds"], [{"build_id": BUILD_998_FULL, "first_seen": now.isoformat(), "tier": "gitlab"}])
+
+    def test_the_cli_takes_the_lane_glob_and_counts_it(self):
+        gsutil, _ = self.fake_gsutil([])
+        self.place_gitlab_build(BUILD_998_FULL)
+        out = self.tmp / "out.json"
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            rc = collect.main(["--gitlab-pr-glob", FAKE_GITLAB_GLOB, "--gsutil", gsutil, "--gh", "", "--out", str(out), "--since-days", "100000"])
+        self.assertEqual(rc, 0)
+        self.assertIn("0 presubmit, 0 nightly, 1 gitlab", stderr.getvalue())
+        self.assertEqual(json.loads(out.read_text())["runs"][0]["tier"], "gitlab")
+
+
 if __name__ == "__main__":
     unittest.main()

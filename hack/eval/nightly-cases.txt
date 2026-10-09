@@ -2,8 +2,8 @@
 #
 # One `./tasks/<id>/task.yaml` path per line, relative to bench/. `#` starts
 # a comment, blank lines are skipped. hack/ci-eval-pr.sh reads this file at
-# startup into NIGHTLY_TASKS and, under EVAL_TIER=nightly (exported by the
-# Prow periodic ci-kube-agents-eval-nightly and nothing else), appends it to
+# startup into NIGHTLY_TASKS and, under EVAL_TIER=nightly (exported only by
+# the nightly Prow periodics in oss-test-infra), appends it to
 # the presubmit matrix in this order, so the nightly is a superset of the
 # presubmit by construction and a case in presubmit-cases.txt runs
 # identically in both. The script refuses to start on a line that names no
@@ -11,9 +11,12 @@
 # night). The registration lint (scripts/validate_bench_cases.py) reads this
 # file as well as the presubmit one; the domain-coverage lint reads only
 # blocking-roster.txt, so neither an entry here nor a held-out presubmit
-# seat counts as coverage. EVAL_NIGHTLY_PART in the script can split the
-# nightly matrix between two periodics (its comment says how); unset, one
-# job runs all of it, and the budget below prices that.
+# seat counts as coverage. The Gemini nightly runs as two periodics:
+# ci-kube-agents-eval-nightly with EVAL_NIGHTLY_PART=main, and
+# ci-kube-agents-eval-nightly-writers with EVAL_NIGHTLY_PART=writers, the
+# cases that request a pull request, on a second project (the variable's
+# comment in the script says why). The budget below prices the whole matrix
+# on one job, as it ran before that split.
 #
 # WHO APPROVES. The normal approvers (root OWNERS). Only the presubmit files
 # beside this one carry the eval-crew rule (#1546, decided 2026-09-15).
@@ -128,9 +131,17 @@
 # sixty-six (198), +3 more: one front-door turn on a planted card, no worker.
 # chat-voice-final-attempt-is-not-retried (after it) makes it fifty-three
 # (159) of sixty-seven (201), +3 more: the same shape on the card's last
-# attempt. chat-voice-failure-leads-with-fact (the last entry below) makes
+# attempt. chat-voice-failure-leads-with-fact (after it) makes
 # it fifty-four (162) of sixty-eight (204), +3 more: the same shape on a
-# blocked card.
+# blocked card. oobe-first-run-audits (the second-last entry below) makes it
+# sixty-two (186) of seventy-six (228), counted from the lists with
+# upgrades-zonal-control-plane-outage-warned (2026-10-05, below), +3 more at its 2400s hint: a unit
+# that waits out the previous repetition's audits (the runner's wait_platform_runs), a stack that
+# waits out the stage's chain, then a turn with no tools,
+# holding the four audit streams' locks throughout, so their audit cases queue behind it.
+# chat-fanout-fleet-restarts-rows (the last entry below) makes it sixty-three
+# (189) of seventy-seven (231), +3 more: one front-door turn and a four-card
+# fan-out.
 # Whether the worst night fits is a question about the whole matrix, and the
 # six measured nights (2026-09-16 to 09-21, oss-test-infra#2707's table)
 # answer it plainly: 1734-2693 serial minutes of work at a realised
@@ -202,9 +213,9 @@
 # minutes a repetition on the dev install). Counted from the lists rather
 # than the paragraphs above (the chat-voice trio and the declared-intent
 # trio landed beside each other, each counted without the other, and two
-# chat cases registered since without a paragraph): this case, the last
-# entry below, makes it sixty-one cases (183 units) of a seventy-five-case,
-# 225-unit matrix.
+# chat cases registered since without a paragraph): this case, the entry
+# before oobe-first-run-audits below, makes it sixty-one cases (183 units) of a
+# seventy-five-case, 225-unit matrix.
 
 # ── The four full audits recast out of the presubmit on 2026-08-26 ──────────
 # Spec-ready, each domain covered in the presubmit by its probe:
@@ -687,3 +698,23 @@
 # mutate. Nightly from its first merge; a presubmit seat is a later pull
 # request that cites its record.
 ./tasks/upgrades-zonal-control-plane-outage-warned/task.yaml
+
+# The oobe job's first-run audits stage (docs/designs/oobe.md): once the
+# onboarding scan settles, four fleet audits start instead of waiting for their
+# schedules, one after another. The stack arms the stage with two archived
+# stand-in cards, the scan marker and the hand-off's record, and puts back the
+# oobe job the image ships;
+# the verifier reads the Platform Agent's cron runs. Nightly rather than presubmit
+# because each repetition runs four real audits back to back.
+./tasks/oobe-first-run-audits/task.yaml
+
+# A fleet question fanned out one card per cluster, each titled with the bare
+# cluster name the Slack plan row renders (agents/platform/SOUL.md, fan-out).
+# deployer: noop; reads the seeded fleet's crashloop-workload role.
+./tasks/chat-fanout-fleet-restarts-rows/task.yaml
+
+# gke-backup-dr skill probe: a CMEK-encrypted backup plan for two namespaces
+# uses the flags gcloud accepts (--update-addons=BackupRestore=ENABLED,
+# --selected-namespaces, --backup-retain-days, --encryption-key). deployer:
+# noop, transcript-only.
+./tasks/backup-dr-cmek-selected-namespaces-probe/task.yaml

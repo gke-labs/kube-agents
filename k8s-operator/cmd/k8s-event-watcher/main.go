@@ -80,6 +80,10 @@ type flags struct {
 	// long its TriggeredScaleUp holds the pod's events. See filter.go.
 	failedSchedulingMinCount int
 	scaleUpHold              time.Duration
+	// autopilotScaleToZeroHold holds the FailedScheduling an Autopilot cluster
+	// emits for GKE's own system pods once it has scaled to zero nodes. On by
+	// default, so the flag exists to turn it off; see filter.go.
+	autopilotScaleToZeroHold bool
 
 	inCluster        bool
 	kubeconfig       string
@@ -118,6 +122,7 @@ func parseFlags(args []string) (*flags, error) {
 	fs.IntVar(&f.imagePullTransientMinCount, "imagepull-transient-min-count", 3, "Require this many consecutive image-pull failures before firing, when the error looks self-clearing (registry 429/5xx, timeouts). Terminal causes such as a bad tag, and any cause the classifier does not recognize, always fire on the first event. 1 = fire on the first event.")
 	fs.IntVar(&f.failedSchedulingMinCount, "failedscheduling-min-count", defaultFailedSchedulingMinCount, "Require this many consecutive FailedScheduling events before firing, when cluster-autoscaler has recorded no verdict on the pod. A NotTriggerScaleUp on the pod fires at any count; a TriggeredScaleUp holds at any count for --scaleup-hold. Both need their reason in --reason. 1 = fire on the first event.")
 	fs.DurationVar(&f.scaleUpHold, "scaleup-hold", defaultScaleUpHold, "How long a TriggeredScaleUp on a pod holds its FailedScheduling events, measured from the autoscaler's event to the FailedScheduling's own last sighting. Past it the count threshold applies again. Cluster-autoscaler's default node-provision timeout.")
+	fs.BoolVar(&f.autopilotScaleToZeroHold, "autopilot-scale-to-zero-hold", true, "Hold FailedScheduling saying 'no nodes available to schedule pods' on an Autopilot cluster with no cluster-autoscaler verdict on the pod: an Autopilot cluster with no user workloads scales to zero and leaves GKE's own system pods Pending by design. =false reports them, on the count backstop as before. Zero nodes on a GKE Standard cluster is a fault and still fires. Requires both TriggeredScaleUp and NotTriggerScaleUp in --reason, without which no verdict can be recorded and 'no verdict' would not distinguish an abandoned pod from a declined one; the hold turns itself off and logs when either is missing, which includes the shipped --reason default.")
 
 	// Kubernetes client.
 	fs.BoolVar(&f.inCluster, "in-cluster", false, "Use in-cluster service account credentials. Auto-detected inside a pod.")
@@ -135,6 +140,26 @@ func parseFlags(args []string) (*flags, error) {
 		return nil, err
 	}
 	return f, nil
+}
+
+// filterThresholds maps the parsed flags onto the filter's threshold group. A
+// method rather than a literal at the one call site because of the sign flip
+// it carries: --autopilot-scale-to-zero-hold reads positively and the group's
+// field negatively (filterThresholds explains why), and a stray edit to that
+// one "!" ships a binary with the hold off by default — the exact behaviour
+// the hold exists to prevent, and invisible, since every other test builds its
+// own filterThresholds and would stay green. Inlined at the call site that
+// negation sat inside realMain, which no test calls; here it is the unit
+// TestFlagsFilterThresholds covers.
+func (f *flags) filterThresholds() filterThresholds {
+	return filterThresholds{
+		unhealthyMinCount:               f.unhealthyMinCount,
+		backoffMinCount:                 f.backoffMinCount,
+		imagePullTransientMinCount:      f.imagePullTransientMinCount,
+		failedSchedulingMinCount:        f.failedSchedulingMinCount,
+		scaleUpHold:                     f.scaleUpHold,
+		disableAutopilotScaleToZeroHold: !f.autopilotScaleToZeroHold,
+	}
 }
 
 // validate checks for invalid or missing flag combinations before starting services.
@@ -268,6 +293,24 @@ type targetCluster struct {
 	// filename for dedup snapshots, where the bare name would collide.
 	Profile string
 	Client  kubernetes.Interface
+	// Autopilot says this is a GKE Autopilot cluster, read off the describe
+	// call discovery already makes (clusterprofiles.Cluster.Autopilot). The
+	// FailedScheduling gate is the only reader: an Autopilot cluster with no
+	// user workloads scales itself to zero nodes, which looks from inside
+	// exactly like a Standard cluster whose nodes have gone, and means the
+	// opposite thing.
+	//
+	// The direct --in-cluster/--kubeconfig cluster has no cluster_identity of
+	// its own and so no describe behind it. Where a profile covers that same
+	// cluster — the ordinary install — buildWatchSet carries the bit over from
+	// the profile it absorbs, so only an uncovered direct cluster reads false.
+	// Uncovered and --in-cluster is fail-open and costs nothing: the agent's
+	// own pod runs there, so the cluster always has a node and can never emit
+	// the message the gate reads. Uncovered and --kubeconfig can be any
+	// cluster at all, including an Autopilot one at zero nodes, where the hold
+	// would then not apply; that combination is not a deployed path, since the
+	// entrypoint passes --in-cluster with --profiles-dir.
+	Autopilot bool
 }
 
 // identity names this cluster in logs and in the startup line, in the form
@@ -348,6 +391,7 @@ func discoverClusterProfiles(ctx context.Context, dir string, m *metrics) ([]tar
 			Location:  c.Identity.Location,
 			Profile:   c.Profile,
 			Client:    client,
+			Autopilot: c.Autopilot,
 		})
 	}
 	return clusters, nil
@@ -739,13 +783,7 @@ func realMain(argv []string) error {
 	}
 
 	// Build components.
-	filterCfg := newFilterConfig(splitCSV(f.reasons), splitCSV(f.namespaces), splitCSV(f.excludeNamespaces), filterThresholds{
-		unhealthyMinCount:          f.unhealthyMinCount,
-		backoffMinCount:            f.backoffMinCount,
-		imagePullTransientMinCount: f.imagePullTransientMinCount,
-		failedSchedulingMinCount:   f.failedSchedulingMinCount,
-		scaleUpHold:                f.scaleUpHold,
-	})
+	filterCfg := newFilterConfig(splitCSV(f.reasons), splitCSV(f.namespaces), splitCSV(f.excludeNamespaces), f.filterThresholds())
 	filter := newFilter(filterCfg)
 
 	m := newMetrics()
@@ -1018,7 +1056,12 @@ func buildWatchSet(ctx context.Context, f *flags, m *metrics) ([]targetCluster, 
 			if len(candidates) == 1 {
 				covered := candidates[0]
 				clusters = removeProfile(clusters, covered.Profile)
+				// Autopilot travels with the identity: the absorbed profile's
+				// describe call already answered it, and dropping it here
+				// would leave the one cluster the watcher knows most about
+				// reading as Standard.
 				direct.ProjectID, direct.Location = covered.ProjectID, covered.Location
+				direct.Autopilot = covered.Autopilot
 				log.Printf("k8s-event-watcher: %s is covered by profile %s and by the direct client; watching it once, directly, as %s (the pod's own credential cannot be denied by IAM or by master authorized networks)",
 					f.clusterName, covered.Profile, direct.identity())
 			}

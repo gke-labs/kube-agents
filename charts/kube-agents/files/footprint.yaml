@@ -60,12 +60,12 @@ operatorRendered:
       ephemeral-storage: 2Gi
     limits:
       cpu: "1"
-      memory: 1Gi
+      memory: 2Gi
       ephemeral-storage: 2Gi
     cpuMillisRequest: 500
     cpuMillisLimit: 1000
     memoryBytesRequest: 536870912
-    memoryBytesLimit: 1073741824
+    memoryBytesLimit: 2147483648
     ephemeralStorageBytesRequest: 2147483648
     ephemeralStorageBytesLimit: 2147483648
     pods: 1

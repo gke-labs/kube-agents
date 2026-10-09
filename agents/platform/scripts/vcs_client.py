@@ -25,6 +25,7 @@ printed one.
 from __future__ import annotations
 
 import base64
+import functools
 import json
 import os
 import shutil
@@ -129,7 +130,46 @@ BROKER_ROUTE_UNSUPPORTED = "BROKER_ROUTE_UNSUPPORTED"
 BROKER_ENDPOINT_VAR = "CREDENTIAL_PROXY_URL"
 
 
+@functools.lru_cache(maxsize=1)
+def _registered_urls() -> dict[str, str]:
+    """Map each bare `owner/name` to the URL of its GitHub registration.
+
+    The function reads the managed list and the context list from the
+    mounted state file, one time for each process. It applies
+    `gitops_workspace.sendable_github_slugs`. `get_managed_repos` applies the
+    same rule. Thus the client can send each name that the list keeps bare.
+    If the file is missing or unreadable, the map is empty. Then the client
+    sends every name as written, and the refusal of the broker is the
+    answer. The URL is the text of the registration. This client does not
+    make a forge URL, because the allowlist of the broker controls that.
+    """
+    import gitops_workspace
+
+    # The mounted file only: this runs on every verb, and the kubectl fallback
+    # the full readers have would put a subprocess on each one.
+    return gitops_workspace.sendable_github_slugs(
+        gitops_workspace.mounted_repo_entries(gitops_workspace.MANAGED_REPOS_KEY)
+        + gitops_workspace.mounted_repo_entries(gitops_workspace.CONTEXT_REPOS_KEY)
+    )
+
+
+def _on_the_wire(repository: object) -> object:
+    """A bare name registered as GitHub, sent as the URL it was registered by.
+
+    The broker refuses a hostless name whenever it is configured with more
+    than one forge, and the sandbox cannot see that configuration: a second
+    forge can be declared before any repository on it is registered. A name
+    the install registered as GitHub is GitHub's either way, so it travels as
+    its registration spells it; with one forge the broker resolves both alike.
+    """
+    if not isinstance(repository, str) or "://" in repository or repository.count("/") != 1:
+        return repository
+    return _registered_urls().get(repository.lower(), repository)
+
+
 def call(verb: str, payload: dict) -> dict:
+    if "repository" in payload:
+        payload = {**payload, "repository": _on_the_wire(payload["repository"])}
     endpoint = os.environ.get(BROKER_ENDPOINT_VAR, "").strip()
     if not endpoint:
         raise VcsError(

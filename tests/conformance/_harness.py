@@ -115,6 +115,9 @@ SOURCES: dict[str, Source] = {
             "def _sanitize_for_logging(",
             "def blocked_by(",
             "os.umask(0o177)",
+            "DESTRUCTIVE_SLACK_VERBS",
+            "SLACK_REMOVE_ALLOWLIST",
+            "SLACK_METHOD_SHAPE",
         ),
     ),
     "session_kv_server": Source(
@@ -244,6 +247,16 @@ SOURCES: dict[str, Source] = {
         "k8s-operator/internal/controller/platformagent_a2a_manifests.go",
         ("func buildA2ASessionNetworkPolicy", "a2aSessionComponent", "a2aPartOf ="),
     ),
+    # The A2A gateway's rendered ingress: its three fences and the gateway
+    # container's declared ports, written by an operator Go test
+    # (TestRenderedA2AGatewayIngressMatchesTheConformanceFixture) because no
+    # golden renders mode next. The anchors are the collector's namespace and
+    # the metrics port's name: lose either and C1's assertion has nothing to
+    # hold the fences to.
+    "a2a_gateway_ingress_fixture": Source(
+        "k8s-operator/internal/controller/testdata/a2a-gateway-ingress.yaml",
+        ("kind: NetworkPolicy", "gke-gmp-system", "name: a2a-metrics"),
+    ),
     # The eval-only inject door. Two files, two modules: the operator decides
     # whether the door is rendered at all (Go module k8s-operator) and the
     # gateway decides what it does once it is (Go module a2a). A3's darkness
@@ -271,6 +284,13 @@ SOURCES: dict[str, Source] = {
         "k8s-operator/internal/controller/platformagent_a2a_manifests.go",
         ("func buildA2AGatewayRole(", '[]string{"deployments"},', "a2aSlackPrincipalMapSecretName ="),
     ),
+    # The operator-rendered Hermes bridge: built from the agent container, so
+    # what it drops from that copy is the whole of what keeps it a separate
+    # principal from the agent beside it.
+    "a2a_bridge_render": Source(
+        "k8s-operator/internal/controller/platformagent_a2a_bridge.go",
+        ("func buildA2ABridgeContainer(", "func a2aBridgeOwnEnv(", "var a2aBridgeDroppedAgentEnv"),
+    ),
     "a2a_callout_role": Source(
         "k8s-operator/internal/controller/platformagent_a2a_callout.go",
         ("func buildA2ACalloutRole(", '[]string{"configmaps"},'),
@@ -288,6 +308,25 @@ SOURCES: dict[str, Source] = {
     "a2a_door_identity": Source(
         "a2a/gateway/gchat.go",
         ("func (g *Gateway) resolveA2APrincipal", "a2aPrincipalPrefix + authorID"),
+    ),
+    # The A2A door's developer class: the verifier, the gateway's resolver
+    # for what it verified, the eval-caller grammar the class's prefix is
+    # disjoint from, and the roster arm that keeps it off the chat map.
+    "a2a_door_google": Source(
+        "a2a/gateway/a2adoor_google.go",
+        ("func (v *googleTokenVerifier) check", "a2aGoogleCallerPrefix =", ") identify("),
+    ),
+    "a2a_door_google_identity": Source(
+        "a2a/gateway/gchat.go",
+        ("func (g *Gateway) resolveA2AGooglePrincipal", "a2aGoogleCallerPrefix"),
+    ),
+    "a2a_door_callers": Source(
+        "a2a/gateway/a2adoor.go",
+        ("func callerOf(",),
+    ),
+    "a2a_door_roster": Source(
+        "a2a/gateway/gateway.go",
+        ("func (g *Gateway) rosterResolver", "a2aGoogleBackend"),
     ),
     # The gateway's Slack identity rule: the allowlist gates, the map
     # overrides, and the member id is the principal otherwise.
@@ -428,6 +467,7 @@ SOURCES: dict[str, Source] = {
             "a2aBusTokenPath",
             "a2aBusTokenFile",
             "a2aCalloutReservedPrincipalsEnvVar = ",
+            "a2aCalloutReservedAddresseesEnvVar = ",
             "func buildA2ACalloutDeployment(",
             "a2aBusTokenVolume",
             "func a2aBusTokenVolumeSource(",
@@ -525,13 +565,20 @@ SOURCES: dict[str, Source] = {
         "a2a/gateway/delegation.go",
         ("func (g *Gateway) handleDelegateRequest(", "lib.DelegateTextCap"),
     ),
-    # The callout's reader of the static principal list the operator renders
-    # into its Deployment. The operator half is operator_a2a_callout below
-    # (a2aCalloutReservedPrincipalsEnvVar); the two modules cannot import
-    # each other, so C1 compares the two literals.
+    # The callout's reader of the static principal list and the fixed-name
+    # addressee list the operator renders into its Deployment. The operator
+    # half is operator_a2a_callout above (a2aCalloutReservedPrincipalsEnvVar,
+    # a2aCalloutReservedAddresseesEnvVar); the two modules cannot import each
+    # other, so C1 compares the two literals of each pair.
     "a2a_callout_main": Source(
         "a2a/cmd/authcallout/main.go",
-        ("envReservedPrincipals = ", "os.LookupEnv(envReservedPrincipals)", "func run("),
+        (
+            "envReservedPrincipals = ",
+            "os.LookupEnv(envReservedPrincipals)",
+            "envReservedAddressees = ",
+            "os.LookupEnv(envReservedAddressees)",
+            "func run(",
+        ),
     ),
     # --- supply chain -----------------------------------------------------
     "skill_sync": Source(

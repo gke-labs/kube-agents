@@ -37,6 +37,7 @@ _ROOT = pathlib.Path(__file__).resolve().parents[1]
 _MANIFESTS_GO = _ROOT / "k8s-operator" / "internal" / "controller" / "platformagent_manifests.go"
 _UPGRADE_SCRIPT = _ROOT / "upgrade.sh"
 _READINESS_SCRIPT = _ROOT / "scripts" / "release" / "wait_for_gke_readiness.sh"
+_MODE_GATE_SCRIPT = _ROOT / "scripts" / "release" / "platform_agent_mode.sh"
 _CONFIRM_IMAGE_SCRIPT = _ROOT / "scripts" / "confirm_agent_image.sh"
 # Where the front doors' constants for the chart's fixed object names live.
 # upgrade.sh spells a Deployment through one of them ("deployment/${NAME}"),
@@ -289,6 +290,23 @@ def _confirm_agent_image_timeout_seconds():
     return int(match.group(1))
 
 
+def _mode_next_gate_seconds():
+    """The whole spec.mode `next` gate in platform_agent_mode.sh: one budget, every wait inside it.
+
+    wait_for_gke_readiness.sh runs it after its own two gates when the caller
+    passes `mode: next`, so such a caller's job has to cover it once on top of
+    them. The default is read rather than restated, so raising it reds a
+    caller whose timeout no longer covers the gate.
+    """
+    match = re.search(
+        r'^readonly PLATFORM_AGENT_MODE_GATE_TIMEOUT_SECONDS="\$\{PLATFORM_AGENT_MODE_GATE_TIMEOUT_SECONDS:-(\d+)\}"$',
+        _MODE_GATE_SCRIPT.read_text(),
+        re.MULTILINE,
+    )
+    assert match, f"could not find PLATFORM_AGENT_MODE_GATE_TIMEOUT_SECONDS in {_MODE_GATE_SCRIPT.name}"
+    return int(match.group(1))
+
+
 def _sandbox_rollout_timeout_seconds():
     """SANDBOX_ROLLOUT_TIMEOUT in upgrade.sh, waited twice (shell + credential-proxy)."""
     match = re.search(r'^SANDBOX_ROLLOUT_TIMEOUT="(\d+)s"$', _UPGRADE_SCRIPT.read_text(), re.MULTILINE)
@@ -517,11 +535,21 @@ class SiblingGatewayRolloutGatesTest(unittest.TestCase):
                         if files == all_e2e_files or "stockout-full" in suites
                         else _E2E_RC_SUITE_ALLOWANCE_SECONDS
                     )
+                    # `next` adds its gate once, after the two above; `today`
+                    # (the input's default) adds nothing. Anything else -- an
+                    # expression forwarding a caller's own input -- may be
+                    # `next` at run time, so it is budgeted as `next`.
+                    mode_gate = (
+                        0
+                        if with_args.get("mode", "today") == "today"
+                        else _mode_next_gate_seconds()
+                    )
                     required = (
                         gates_paid_twice
                         + confirm_image
                         + _E2E_RUNNER_SETUP_SECONDS
                         + suite_allowance
+                        + mode_gate
                     )
                     e2e_callers.append((f"{wf_path.name}:{job_id}", int(minutes), required))
 

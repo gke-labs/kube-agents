@@ -104,6 +104,7 @@ ENABLE_DRIFT_DETECTOR:ENABLE_DRIFT_DETECTOR
 REGISTRY_PREFIX:REGISTRY_PREFIX
 THIRD_PARTY_REGISTRY_PREFIX:THIRD_PARTY_REGISTRY_PREFIX
 NAMESPACE:NAMESPACE
+PLATFORM_AGENT_MODE:PLATFORM_AGENT_MODE
 "
 
 # Always required: without these the script cannot name an install at all, so
@@ -247,6 +248,16 @@ case "${MEMORY_PROVIDER:-}" in
   *)                            MEMORY="file" ;;
 esac
 export MEMORY
+
+# PLATFORM_AGENT_MODE, the PlatformAgent's spec.mode, is copied rather than
+# translated, but checked first: a value that is neither `today` nor `next` is
+# refused here rather than by the installer later. `today` is written as no
+# key at all, which the installer reads as `today` too, so an environment that
+# says `today` or says nothing renders the same file it rendered before the
+# key was mapped. platform_agent_mode_resolve unsets the variable for both.
+# shellcheck source=scripts/release/platform_agent_mode.sh
+. "$(dirname "${BASH_SOURCE[0]}")/platform_agent_mode.sh"
+platform_agent_mode_resolve
 
 
 # ---------------------------------------------------------------------------

@@ -61,6 +61,22 @@ AUDIT_IDS = {
 }
 
 
+_streams_spec = importlib.util.spec_from_file_location(
+    "audit_streams", REPO_ROOT / "bench" / "kube_agents_bench" / "audit_streams.py"
+)
+audit_streams = importlib.util.module_from_spec(_streams_spec)
+_streams_spec.loader.exec_module(audit_streams)
+
+
+def task_streams_lines(tasks):
+    """TASK_STREAMS built as the fan-out builds it, from the declared streams the runner's reader returns."""
+    lines = [lifted("ledger_audit_id_for_task"), lifted("task_streams"), "TASK_STREAMS=()"]
+    for task in tasks:
+        declared = " ".join(audit_streams.declared_streams(REPO_ROOT / "bench" / task))
+        lines.append(f'TASK_STREAMS+=("$(task_streams "$(ledger_audit_id_for_task {task})" "{declared}")")')
+    return lines
+
+
 def issue(number, audit_id="compliance-audit", title=None, author=BOT, labels=None, pull=False):
     names = ["agent:audit", f"audit:{audit_id}", "severity:major"] if labels is None else labels
     record = {
@@ -586,37 +602,54 @@ class CallSiteTest(unittest.TestCase):
         # and the other's finish lands in this lane's fresh one. The stream
         # lock is taken after the task lock and before the infra lock (one
         # order everywhere, no cycle), only when the case names a stream, and
-        # released on every exit.
+        # released on every exit. A case holds every stream task_streams names:
+        # the one it grades and any its task.yaml declares, decided before the
+        # fan-out and handed in. Holding them, it waits out a run the install
+        # started on one of them before anything on the stream is reset, and
+        # before the infra lock so no tofu unit queues behind the wait.
         unit = lifted("run_one_unit")
         task_lock = unit.index('lock_acquire "${STATE_DIR}/lock-task-${name}"')
-        stream_lock = unit.index('lock_acquire "${STATE_DIR}/lock-stream-${audit_id}"')
+        stream_lock = unit.index('lock_acquire "${STATE_DIR}/lock-stream-${s}"')
         reset = unit.index('reset_audit_ledgers "${name} rep ${rep}" "${audit_id}"')
         launch = unit.index("uv run devops-bench")
-        stream_release = unit.index('lock_release "${STATE_DIR}/lock-stream-${audit_id}"', launch)
+        stream_release = unit.index('release_streams "${streams}"', launch)
         task_release = unit.index('lock_release "${STATE_DIR}/lock-task-${name}"', launch)
         self.assertLess(task_lock, stream_lock)
         self.assertLess(stream_lock, reset)
         self.assertLess(reset, launch)
         self.assertLess(launch, stream_release)
         self.assertLess(stream_release, task_release)
-        self.assertIn('if [ -n "${audit_id}" ] && ! lock_acquire "${STATE_DIR}/lock-stream-${audit_id}"', unit)
-        # Released on the infra-lock, mint-failure and repository-reset paths
-        # as well as after the run.
-        self.assertEqual(unit.count('[ -n "${audit_id}" ] && lock_release "${STATE_DIR}/lock-stream-${audit_id}"'), 4)
+        self.assertIn('streams="${7:-}"', unit)
+        self.assertIn("for s in ${streams}; do", unit)
+        wait = unit.index('wait_platform_runs "${name} rep ${rep}" "${streams}"')
+        self.assertLess(stream_lock, wait)
+        self.assertLess(wait, reset)
+        self.assertLess(wait, unit.index('lock_acquire "${STATE_DIR}/lock-infra"'))
+        # A failed acquisition gives back the streams already held.
+        self.assertIn('release_streams "${held}"', unit)
+        # Released on the infra-lock path and after the run here, and on the
+        # mint-failure and repository-reset paths through skip_unit, which
+        # both hand it the streams.
+        self.assertEqual(unit.count('release_streams "${streams}"'), 2)
+        self.assertEqual(unit.count('skip_unit "${task}" "${name}" "${rep}" "${streams}" "${has_stack}"'), 2)
+        self.assertIn('release_streams "${streams}"', lifted("skip_unit"))
         # Before the infra lock: a stack-bearing unit waiting on its stream
         # must not hold the one tofu lane while it waits.
         infra_lock = unit.index('lock_acquire "${STATE_DIR}/lock-infra"')
         self.assertLess(stream_lock, infra_lock)
-        # One deadline for both locks, and it is the single-unit figure times
-        # the cases on the stream: a task-lock holder on a shared stream waits
-        # its turn on the stream before its own run, so a same-task successor
-        # has to outlast the sibling case's unit as well as the predecessor's.
+        # The task lock's deadline is the single-unit figure times the cases on
+        # the graded stream: a task-lock holder on a shared stream waits its
+        # turn on the stream before its own run, so a same-task successor has
+        # to outlast the sibling case's unit as well as the predecessor's. Each
+        # stream lock's is the same figure for that stream.
+        self.assertIn('lock_deadline="$(stream_lock_deadline "${name}" "${audit_id}" "${streams}")"', unit)
+        self.assertEqual(unit.count('"${lock_deadline}"'), 1)
+        self.assertIn('"$(stream_lock_deadline "${name}" "${s}" "${streams}")"', unit)
         self.assertIn(
-            'lock_deadline="$(( $(stream_case_count "${audit_id}") * ($(unit_delegation_timeout "${name}") + 600 + EVAL_INFLIGHT_GRACE_SECONDS) + $(stream_stack_wait "${audit_id}") ))"',
-            unit,
+            'echo $(( $(stream_case_count "$2") * ($(unit_delegation_timeout "$1") + UNIT_LOCK_ALLOWANCE_SECONDS + EVAL_INFLIGHT_GRACE_SECONDS + run_wait) + $(stream_stack_wait "$2") ))',
+            lifted("stream_lock_deadline"),
         )
-        self.assertEqual(unit.count('"${lock_deadline}"'), 2)
-        self.assertLess(unit.index('lock_deadline="$(('), task_lock)
+        self.assertLess(unit.index('lock_deadline="$(stream_lock_deadline'), task_lock)
         # A stack-bearing case writing no ledger has no stream term, yet its
         # previous rep holds the task lock while queued on lock-infra, so the
         # task-lock deadline carries that queue itself.
@@ -629,12 +662,11 @@ class CallSiteTest(unittest.TestCase):
         # security-patch-orchestrator, every other stream has one case, and a
         # case that writes no ledger (or an empty id) keeps the single-unit
         # figure.
-        tasks = " ".join(f"./tasks/{case}/task.yaml" for case in AUDIT_IDS) + " ./tasks/reliability-pdb-probe/task.yaml"
+        tasks = [f"./tasks/{case}/task.yaml" for case in AUDIT_IDS] + ["./tasks/reliability-pdb-probe/task.yaml"]
         body = "\n".join(
             [
                 f'BENCH_DIR="{REPO_ROOT / "bench"}"',
-                f"TASKS=({tasks})",
-                lifted("ledger_audit_id_for_task"),
+                *task_streams_lines(tasks),
                 lifted("stream_case_count"),
                 'echo "drift=$(stream_case_count fleet-consistency-drift)"',
                 'echo "compliance=$(stream_case_count compliance-audit)"',
@@ -664,7 +696,7 @@ class CallSiteTest(unittest.TestCase):
                 f"TASKS=({' '.join(tasks)})",
                 'TASK_HAS_STACK=("" "true" "true")',
                 "INFRA_LOCK_DEADLINE=5400",
-                lifted("ledger_audit_id_for_task"),
+                *task_streams_lines(tasks),
                 lifted("stream_stack_wait"),
                 'echo "obtainability=$(stream_stack_wait obtainability-audit)"',
                 'echo "compliance=$(stream_stack_wait compliance-audit)"',
@@ -675,6 +707,83 @@ class CallSiteTest(unittest.TestCase):
         got = dict(line.split("=", 1) for line in result.stdout.splitlines())
         self.assertEqual(got, {"obtainability": "5400", "compliance": "0", "none": "0"}, result.stderr)
         self.assertEqual(result.stderr, "")
+
+    def test_a_case_holds_the_streams_it_declares(self):
+        # oobe-first-run-audits grades no ledger, but its stack starts four real
+        # audit runs; it holds their streams, sorted, and is counted on each, so
+        # an audit case waiting behind it on one of them waits long enough.
+        tasks = (
+            "./tasks/oobe-first-run-audits/task.yaml",
+            "./tasks/compliance-declared-intent-no-finding/task.yaml",
+            "./tasks/reliability-pdb-probe/task.yaml",
+        )
+        body = "\n".join(
+            [
+                f'BENCH_DIR="{REPO_ROOT / "bench"}"',
+                f"TASKS=({' '.join(tasks)})",
+                'TASK_HAS_STACK=("true" "" "true")',
+                "INFRA_LOCK_DEADLINE=5400",
+                *task_streams_lines(tasks),
+                lifted("stream_case_count"),
+                lifted("stream_stack_wait"),
+                'echo "oobe=${TASK_STREAMS[0]}"',
+                'echo "compliance_case=${TASK_STREAMS[1]}"',
+                'echo "probe=${TASK_STREAMS[2]}"',
+                'echo "compliance_count=$(stream_case_count compliance-audit)"',
+                'echo "compliance_wait=$(stream_stack_wait compliance-audit)"',
+                'echo "drift_count=$(stream_case_count fleet-consistency-drift)"',
+            ]
+        )
+        result = run_bash(body)
+        got = dict(line.split("=", 1) for line in result.stdout.splitlines())
+        self.assertEqual(
+            got,
+            {
+                "oobe": "compliance-audit fleet-wide-cost-analysis obtainability-audit stockout-prevention",
+                "compliance_case": "compliance-audit",
+                "probe": "",
+                "compliance_count": "2",
+                "compliance_wait": "5400",
+                "drift_count": "1",
+            },
+            result.stderr,
+        )
+        self.assertEqual(result.stderr, "")
+
+    def test_the_fan_out_reads_the_declared_streams_once_and_hands_each_unit_its_own(self):
+        # One YAML read of every task before the fan-out (the layouts are
+        # bench/tests/test_audit_streams.py's), a read that fails stops the run,
+        # and each unit is launched with its task's streams.
+        src = SCRIPT.read_text(encoding="utf-8")
+        read = src.index("uv run python -m kube_agents_bench.audit_streams")
+        self.assertLess(src.index("TASK_STREAMS=()"), read)
+        self.assertIn("so the run does not start.\" >&2\n  exit 1", src[read:read + 400])
+        self.assertIn('TASK_STREAMS+=("$(task_streams "$(ledger_audit_id_for_task "${TASK}" 2>/dev/null)"', src)
+        self.assertIn('"${UNIT_SEQ}" "${TASK_STREAMS[IDX]}" &', src)
+        self.assertNotIn("declared_audit_streams_for_task", src)
+
+    def test_task_streams_sorts_and_dedupes_the_graded_and_declared_ids(self):
+        body = "\n".join(
+            [
+                lifted("task_streams"),
+                'echo "both=$(task_streams compliance-audit "stockout-prevention compliance-audit")"',
+                'echo "graded=$(task_streams compliance-audit "")"',
+                'echo "declared=$(task_streams "" "stockout-prevention fleet-wide-cost-analysis")"',
+                'echo "none=$(task_streams "" "")"',
+            ]
+        )
+        result = run_bash(body)
+        got = dict(line.split("=", 1) for line in result.stdout.splitlines())
+        self.assertEqual(
+            got,
+            {
+                "both": "compliance-audit stockout-prevention",
+                "graded": "compliance-audit",
+                "declared": "fleet-wide-cost-analysis stockout-prevention",
+                "none": "",
+            },
+            result.stderr,
+        )
 
     def test_two_units_on_one_stream_serialise_and_two_on_different_streams_do_not(self):
         # The lock helpers as shipped, with mkdir as the mutex: the second

@@ -54,6 +54,82 @@ class ForgeCallTest(unittest.TestCase):
         self.assertEqual(answer, {"ok": True})
         self.assertEqual(seen, [("issue-update", {"number": 7, "labelsAdd": ["a"], "repository": "acme/infra"})])
 
+    def test_a_name_registered_as_github_travels_with_its_host(self):
+        # Review round 4: the broker refuses a bare name whenever it is
+        # configured with two forges, which the managed list cannot see (a
+        # GitLab forge declared before any GitLab repository is registered).
+        # A name registered as GitHub is GitHub's whatever the broker serves,
+        # so it goes on the wire as the URL it was registered by; one another
+        # forge's entry shares, or nothing registers, is sent as written.
+        sent = []
+        entries = [
+            {"type": "github", "url": "https://github.com/acme/fleet"},
+            {"type": "gitlab", "url": "https://gitlab.com/acme/both"},
+            {"type": "github", "url": "https://github.com/acme/both"},
+            # Review (#2549): an scp remote on another forge collides too.
+            {"type": "gitlab", "url": "git@gitlab.com:acme/scp.git"},
+            {"type": "github", "url": "https://github.com/acme/scp"},
+        ]
+        with mock.patch.dict(os.environ, {"CREDENTIAL_PROXY_URL": "http://127.0.0.1:1"}), \
+                mock.patch.object(vcs_client.credential_proxy_client, "vcs_call",
+                                  lambda endpoint, verb, payload: sent.append(payload["repository"]) or {}), \
+                mock.patch("gitops_workspace.mounted_repo_entries",
+                           side_effect=lambda key: entries if key == "managed_repos" else []):
+            vcs_client._registered_urls.cache_clear()
+            for name in ("acme/fleet", "Acme/Fleet", "acme/both", "acme/unregistered",
+                         "gitlab.com/acme/both", "https://github.com/acme/fleet", "acme/scp"):
+                vcs_client.call("issue-list", {"repository": name})
+        self.assertEqual(
+            ["https://github.com/acme/fleet", "https://github.com/acme/fleet", "acme/both",
+             "acme/unregistered", "gitlab.com/acme/both", "https://github.com/acme/fleet", "acme/scp"],
+            sent,
+        )
+
+    def test_every_managed_name_reaches_a_two_forge_broker_with_a_host(self):
+        # Review (#2437): `get_managed_repos` no longer qualifies every GitHub
+        # name beside a second forge, so each name it hands out must leave
+        # this client host-qualified, whichever of the two did the work.
+        import gitops_workspace
+
+        entries = [
+            {"type": "github", "url": "https://github.com/acme/fleet"},
+            {"type": "github", "url": "https://github.com/acme/both"},
+            {"type": "github", "url": "acme/hand"},
+            {"type": "gitlab", "url": "https://gitlab.com/acme/both"},
+            {"type": "gitlab", "url": "git@gitlab.com:group/sub/proj.git"},
+            # Fresh-context review (#2437): the list skips these entries, but
+            # they still collide on the client. They are a host with a port
+            # and an unserved type.
+            {"type": "github", "url": "https://github.com/acme/ported"},
+            {"type": "gitlab", "url": "https://gitlab.example.com:8443/acme/ported"},
+            {"type": "github", "url": "https://github.com/acme/gitea"},
+            {"type": "gitea", "url": "https://gitea.example.com/acme/gitea"},
+            {"type": "github", "url": "https://github.com/acme/mirror"},
+        ]
+        # A context entry on another forge also collides.
+        context = [{"type": "gitlab", "url": "https://gitlab.com/acme/mirror"}]
+        lists = {"managed_repos": entries, "context_repos": context}
+        sent = []
+        with mock.patch.dict(os.environ, {"CREDENTIAL_PROXY_URL": "http://127.0.0.1:1"}), \
+                mock.patch.object(vcs_client.credential_proxy_client, "vcs_call",
+                                  lambda endpoint, verb, payload: sent.append(payload["repository"]) or {}), \
+                mock.patch("gitops_workspace.mounted_repo_entries", side_effect=lambda key: lists.get(key, [])), \
+                mock.patch("gitops_workspace.get_managed_repo_entries", return_value=entries):
+            vcs_client._registered_urls.cache_clear()
+            names = gitops_workspace.get_managed_repos()
+            for name in names:
+                vcs_client.call("issue-list", {"repository": name})
+        vcs_client._registered_urls.cache_clear()
+        self.assertEqual(
+            ["acme/fleet", "github.com/acme/both", "github.com/acme/hand", "github.com/acme/ported",
+             "github.com/acme/gitea", "github.com/acme/mirror",
+             "gitlab.com/acme/both", "gitlab.com/group/sub/proj"],
+            names,
+        )
+        for repository in sent:
+            with self.subTest(repository=repository):
+                self.assertTrue(gitops_workspace.split_host(repository.split("://")[-1])[0])
+
     def test_capabilities_takes_a_repository_without_a_working_copy(self):
         with mock.patch.object(vcs_client, "call", lambda verb, payload: {"verb": verb, **payload}):
             self.assertEqual(

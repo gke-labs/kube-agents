@@ -353,11 +353,19 @@ calls and become properties of the stream:
 - Steering (added 8/24; refusal posture recorded 8/31): a follow-up `message` on `…in`
   while the task is `working` is legal. It is steering input - delivered to the
   executor, incorporated at its next turn boundary, no state transition implied. The
-  hard interrupt is `cancel`, not a steer. An executor that cannot absorb input
-  mid-turn (today's standing front door) refuses instead: a non-final `status-update`
-  carrying the task's CURRENT state, visible on the stream - never a silent drop, and
-  never a state change caused by the follow-up alone. Assertion 21's stdin delivery
-  applies to absorbing executors; a refusal satisfies its never-silently-dropped half.
+  hard interrupt is `cancel`, not a steer. An executor that cannot absorb input mid-turn
+  may queue it instead (the standing front door, 10/8): it answers each follow-up with a
+  non-final `status-update` carrying the task's CURRENT state and a `data` part
+  `{"steerNotice": {"steer": "queued"|"refused", "envelopeId", "reason"}}`, runs queued
+  follow-ups as further turns after the current one, publishes each earlier turn's
+  answer as a `turn` artifact and the last as the `result`. The executor bounds the
+  follow-ups it takes per task, counting those already run, not only those waiting. A
+  refusal (`queue-full` past that bound, `task-ending`, `task-ended`, `no-text`,
+  `capability`, `no-resume`) is that non-final `status-update` with
+  `"steer": "refused"`: never a silent drop, never a state change caused by the
+  follow-up alone.
+  Assertion 21's stdin delivery applies to absorbing executors; a refusal satisfies its
+  never-silently-dropped half.
 - Turn accounting is the steering contract (amended 8/31, from the worker adapter). A
   harness driven over stream-json emits one `result` per user turn, so once steers
   exist, "the harness produced a result" no longer means "the task is done." The
@@ -404,7 +412,7 @@ calls and become properties of the stream:
 ### Reserved artifact names
 
 Added 8/24, ratified with the subagent framework. `artifact-update` payloads name their
-artifact, and six names are reserved so renderers and audit tooling can rely on them:
+artifact, and seven names are reserved so renderers and audit tooling can rely on them:
 
 | Name       | Content                                                                                                                                                                                                                                                                                                                                                    |
 | ---------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -413,10 +421,11 @@ artifact, and six names are reserved so renderers and audit tooling can rely on 
 | `activity` | Tool-call trace, one entry per invocation. Always in the audit replay                                                                                                                                                                                                                                                                                      |
 | `progress` | Agent-authored milestones, renderable to chat at zero model cost. Stage 1 derives these from model narration; the subagent framework spec records the deviation. May carry a chat message (Chat messages, below), the live message's whole state, so `progress` is text plus at most one chat message DataPart (assertion 18's validator owes that change) |
 | `delegate` | The session's request to the gateway to mint a child task: one `data` part `{"addressee", "text"}` on the session's own task events. Consumed by the gateway's relay, never rendered to chat; reserved 10/5, used from the delegation primitive onward                                                                                                     |
+| `turn`     | One finished turn's answer on a task with more turns queued (an executor that queues follow-ups). Chunked like `result`, posted by renderers as it completes, never the deliverable; the last turn's answer is the `result`.                                                                                                                               |
 | `notice`   | A message the task posts on its own, beside its live message and its answer (a PR it opened, say): a TextPart, optionally with a chat message. Each `notice` artifact posts once and is never edited. Not the gateway's own notices. A gateway older than 10/8 drops it, so a fact that matters is in the result too; reserved 10/8                        |
 
 Artifact names are data, so the set can grow without touching the envelope; only these
-six carry reserved semantics. An `activity` entry is one `data` part whose object carries
+seven carry reserved semantics. An `activity` entry is one `data` part whose object carries
 `tool`, `input` when the call had one, and may carry `callId`, `status` (`completed`, `error`,
 `interrupted` for a call still open at the terminal, or `truncated` on the one entry an executor
 publishes in place of the calls missing from the trace: past its budget, failed to publish,
@@ -536,6 +545,7 @@ artifact names).
 | Carrier                                                | Renders as                                       | Its text fallback                                    |
 | ------------------------------------------------------ | ------------------------------------------------ | ---------------------------------------------------- |
 | `result` artifact, on the chunk with `lastChunk: true` | the answer                                       | the artifact's text as folded per A2A chunking rules |
+| `turn` artifact, on the chunk with `lastChunk: true`   | a finished turn's answer, posted as it completes | the artifact's text as folded per A2A chunking rules |
 | `progress` artifact                                    | the task's one live message, edited in place     | the TextPart in the same part list                   |
 | `notice` artifact                                      | one message of its own, posted once              | the TextPart in the same part list                   |
 | the message of an `input-required` `status-update`     | the question                                     | the TextPart in the same message                     |
@@ -933,7 +943,7 @@ Verified identity (added 9/9):
 Chat messages (added 10/8). Their home is `tests/conformance/`, with the bridge emitter and the gateway renderer that make them testable:
 
 27. A chat message is never emitted without its text fallback, except the mark-only
-    chat message on a terminal `status-update`, and a `result` carries one only on its
+    chat message on a terminal `status-update`, and a `result` or `turn` carries one only on its
     last chunk, with the artifact's text as folded per A2A chunking rules as its fallback.
 28. A renderer given a chat message that breaks a rule in the Chat messages section posts
     the fallback and nothing from the chat message, and logs the reason; a bad `mark` alone

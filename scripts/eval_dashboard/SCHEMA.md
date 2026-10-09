@@ -61,24 +61,29 @@ only — anything that renames, removes or re-types a field bumps
 
 Parsed from `build-log.txt` plus Prow's `started.json`/`finished.json`.
 A build with no `finished.json` is still running and is skipped entirely.
-One job feeds it today, the presubmit gate (`pull-kube-agents-smoke-test`,
-one build per pull-request push). The collector also reads a second, the
-nightly periodic (`ci-kube-agents-eval-nightly`, `EVAL_TIER=nightly` in the
-same `hack/ci-eval-pr.sh`, against `main`, no pull request), which archives
-the same layout and is collected from the moment it starts running. A
-night split across two pool projects adds the nightly's writers periodic
-(`ci-kube-agents-eval-nightly-writers`, the cases that request a pull
-request): its runs are `nightly` runs too, told apart by `job`.
+Three jobs feed it, each a source with a watermark of its own: the
+presubmit gate (`pull-kube-agents-smoke-test`, one build per pull-request
+push), the nightly periodic (`ci-kube-agents-eval-nightly`,
+`EVAL_TIER=nightly` in the same `hack/ci-eval-pr.sh`, against `main`, no
+pull request; a night split across two pool projects adds the nightly's
+writers periodic, `ci-kube-agents-eval-nightly-writers`, the cases that
+request a pull request, whose runs are `nightly` runs too, told apart by
+`job`) and the GitLab lane (`pull-kube-agents-smoke-test-gitlab`, a
+pull-request build against a GitLab repository). All archive the same
+layout and are collected from the moment they start running.
 
 - `build_id` — the Prow build directory name, as a **string** (the ids
   overflow 53-bit JSON-consumer integers).
-- `tier` — **optional, additive**: `"presubmit"` or `"nightly"`, from the
+- `tier` — **optional, additive**: `"presubmit"`, `"nightly"` or `"gitlab"`, from the
   source the build was discovered through, never from the build's own
   metadata. **Absent means `presubmit`** — every run written before the
   field existed was one — and consumers read it through `tiers.py`'s
-  `run_tier` / `presubmit_runs` / `nightly_runs`. A value outside the two
-  is neither tier and counts nowhere: a run tagged some new way is never
-  the gate's by default. Every gate verdict — the
+  `run_tier` / `presubmit_runs` / `nightly_runs` / `gitlab_runs`. A value
+  outside the three is no tier and counts nowhere: a run tagged some new
+  way is never the gate's by default. A `gitlab` run is the GitLab lane's
+  (`pull-kube-agents-smoke-test-gitlab`, `--gitlab-pr-glob`): listed in
+  `brief.json`'s `gitlab` block and the Brief's "GitLab lane" section,
+  in no case history and no gate number. Every gate verdict — the
   health adjudicator's rules and 24-hour metrics, `classify.py`'s "is this
   mine?" (other PRs, the only-this-PR passes, the 30-day pass rate), the
   red comment's "runs from other PRs" count (`gate_comment.py`), the
@@ -294,7 +299,7 @@ never an error. A task line whose name matches nothing under `bench/tasks/`
 on the current checkout still parses; only its domain lookup degrades (see
 below).
 
-### `cases[]` — one entry per task name seen in any run of either tier, sorted by name
+### `cases[]` — one entry per task name seen in any presubmit or nightly run, sorted by name
 
 The per-case fields are the **presubmit's** record, exactly as they were
 before the nightly existed; the nightly's record sits beside them under
@@ -356,10 +361,11 @@ Additive, optional, and safe to omit — consumers must default them.
   `{"build_id": "<id>", "first_seen": "<iso8601>"}`, plus `"tier": "nightly"`
   and `"log_url"` (Spyglass's page for the build directory, as for
   `runs[].log_url`) when either nightly periodic's listing (the main or
-  the writers job) named the build (absent: the presubmit's, as for
-  `runs[].tier`; both are kept across scans). `nightly.py` reads a running
-  nightly build's part from the job segment of its `log_url`; an entry
-  without one counts as the main part. Lowest
+  the writers job) named the build, or `"tier": "gitlab"` when the GitLab
+  lane's did (absent: the presubmit's, as for `runs[].tier`; all are kept
+  across scans, and each source retries its own). `nightly.py` reads a
+  running nightly build's part from the job segment of its `log_url`; an
+  entry without one counts as the main part. Lowest
   id first; `first_seen` is when the collector first listed the build. The next
   incremental scan re-reads exactly these ids even though they sit at or
   below the watermark, and drops an entry once it is recorded or once
@@ -538,6 +544,30 @@ what the renderer does with them.
   build deferred to `pending_builds`. The refresh workflow greps for either
   line and does not publish, so a stall is never republished under a fresh
   `generated_at`.
+- `--gitlab-pr-glob <gs glob>` (repeatable) — the GitLab lane's build-dir
+  glob (`.../pull-kube-agents-smoke-test-gitlab/*`), read through the job's
+  directory index derived from it, above the lane's own watermark when a
+  lane run is on record and whole (under `--since-days`) when none is; the
+  glob itself is listed only when no index is derivable from it, or
+  `--index-prefix ""` disabled the index. Every run is tagged
+  `tier: "gitlab"` and its unfinished builds the same on `pending_builds`.
+  The presubmit's watermark ignores the lane's ids and the lane's ignores
+  the presubmit's, as the nightly's does. An explicit `--index-prefix` is
+  the presubmit's; the lane's index is always derived from its own glob.
+  The lane takes its index on the cold path too, unlike the presubmit,
+  because the archive-wide glob walks every pull request's directory on
+  every tick until the lane's first run is on record (minutes, and past
+  the listing timeout as the archive grows), while the index answers
+  "nothing yet" in one flat listing. The lane, like the nightly, must never
+  stop the gate's dashboard publishing, so it follows the nightly's rule:
+  with no lane run on record any listing that fails is a
+  `note: directory index ... did not list` line (`note: glob ...` on the
+  glob fallback) and nothing from it (the job may not exist yet); with
+  one, a listing that matched no objects (the
+  index purged or moved, the job renamed, while a run from before sits on
+  record) is the same note, and any other failure is the refusal line, as
+  it is for the presubmit. A listing that hangs past `GSUTIL_TIMEOUT_S` is
+  the refusal line either way, as for the nightly.
 - `--nightly-prefix [<gs prefix>]` — the nightly periodic's Prow log
   prefix, `gs://<bucket>/logs/<job>/`. For a periodic that prefix **is**
   the directory index: one `<build_id>/` directory per build beside a
@@ -629,7 +659,7 @@ America/Toronto ("ET"), formatted in the browser with
 
 | Page           | What it is                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
 | -------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `index.html`   | **The Brief**: the gate's state and why, what the agent saw, what changed right before, what is being done, the runs in the window with a "See it in the grid" link, and the last release-candidate eval runs (`releases[]`). Healthy: the last 24 hours in numbers and the last incident.                                                                                                                                                                                                                                                  |
+| `index.html`   | **The Brief**: the gate's state and why, what the agent saw, what changed right before, what is being done, the runs in the window with a "See it in the grid" link, the GitLab lane's last runs (`brief.json` `gitlab`), and the last release-candidate eval runs (`releases[]`). Healthy: the last 24 hours in numbers and the last incident.                                                                                                                                                                                             |
 | `run.html`     | **The PR view**, `run.html#build=<prow build id>`: one run, each failed gate case tagged `failing on N other PRs` / `only your PR` / `quota storm` / `unexplained` with its check reason, 30-day pass rate, transcript link, a link to its row on the Cases page and a one-line Do; a "what to do" box.                                                                                                                                                                                                                                     |
 | `grid.html`    | **The Grid**: one row per case (blocking cases by domain, then the held-out ones, folded away when they passed everything in the window), one column per presubmit run in a window of 6 h, 24 h, 36 h or 7 days (header: PR # and ET start; a green run that recorded no cases gets no column); cells passed / failed all reps / failed some / quota-infra / died before the cases / still running (`pending_builds`); merges to main and incident starts and ends marked between the columns; a cell opens that run's detail for the case. |
 | `cases.html`   | **The Cases page** ("How reliable is each test?"): one row per case by domain — its last `STRIP_RUNS` presubmit outcomes, pass rate over reps at 7 and 30 days for the presubmit and the nightly apart (`—` when a tier has no graded run), its roster status (blocking / held out / demoted with its date / nightly only / not in any matrix), its last failure with the grader's reason, and its issues from `case-notes.yaml`.                                                                                                           |
@@ -720,7 +750,7 @@ gate comment, the tracking issue) and `briefHref` / `gridHref` / `runHref`
 
 `{schema_version, generated_at, stale_after_s, run_days, rate_windows_days,
 strip_runs, admitted[], health, history, merges, catches, cases{}, runs[],
-pending[], releases[], nightly{}, trend{}}`. `runs[]` is the **presubmit's** last `run_days` of
+pending[], releases[], nightly{}, gitlab{}, trend{}}`. `runs[]` is the **presubmit's** last `run_days` of
 `data.json`, oldest first — a nightly run is nobody's pull request and is
 not listed — each carrying its identity and timing plus
 `classify.classify_run(...)`: `verdict` (`red` = looks like the PR, `green`,
@@ -858,6 +888,20 @@ first seen inside `RUNNING_MAX_AGE` (9 hours: the periodic's 8-hour budget
 and Prow's time to write `finished.json`) of `generated_at`, oldest first,
 each `{build, first_seen, log_url}` — a night in flight, which the Brief's
 block, the report page and the digest say instead of "no night".
+
+`gitlab` is `{job, runs[], running[], counts{on_record, green, red}}` from
+`forge_lane.py`: the GitLab lane's runs (`runs[].tier == "gitlab"`) **newest
+first**, the last `RUNS_LISTED` (20), each `{build, job, pr, head_sha,
+project, started, finished, duration_s, result, eval_verdict, green,
+tasks{pass, fail, infra}}` (`green` is Prow's `SUCCESS`; `tasks` counts the
+run's task rows by result); `running[]` the lane's `pending_builds` as
+`{build, first_seen}`, only those first seen inside `RUNNING_MAX_AGE` (8 h,
+the presubmit's ceiling plus upload time) of the reference time, as the Grid's
+columns and the nightly's `running[]` are bounded; `counts` over every lane
+run on record. `job` is the
+name the newest lane run carries, else the default. The Brief's "GitLab
+lane" section is this block and nothing else reads it: the lane's runs are
+in no gate number, no case history and no digest line.
 
 `trend` is `null` in the published `brief.json` (every page polls that
 file every minute and only the Trend page reads the block, which grows a
@@ -1033,9 +1077,13 @@ and any run-based condition take over as before.
 
 `periodics` is the watched Prow periodics' notes, by job name, one for each job
 whose latest finished build failed (`verdict: FAILED`) or is older than the
-job's stale window, or carries no readable finish time (`STALE`): `{job, label, verdict, since, build,
+job's stale window, or carries no readable finish time (`STALE`), or passed
+while its GitLab sweep report names a token that is due, dead or unreadable
+(`TOKEN`, the sweep only; its `detail` is those token lines, its `summary`
+"the run passed; N token(s) to rotate", and its `absence`, `effect` and
+`runbook` are the credential's words rather than the sweep's): `{job, label, verdict, since, build,
 finished_at, result, stale_after_h, dry_run, detail[], summary, history_url,
-place, absence, does, effect, runbook}`. `detail` (on `FAILED` only)
+place, absence, does, effect, runbook}`. `detail` (on `FAILED`, and the token lines on `TOKEN`)
 is the report's lines, the projects capped at five (then `and N more`) and the
 run's lines after the cap: for the reconcile the
 projects it refused, failed or was interrupted in, each with its one next
@@ -1046,7 +1094,7 @@ run's own `error` line; for the sweep the projects whose sweep failed with GitHu
 the writes left for the next run under its budget, then the projects held and
 released unswept after the run stopped, then why the run ended early or its
 `error` line; either says when the report was not a JSON object.
-`summary` (on `FAILED` only) is one clause on what the run did ("failed in 11
+`summary` (on `FAILED`, and "the run passed; N token(s) to rotate" on `TOKEN`) is one clause on what the run did ("failed in 11
 of 11 project(s)", "3 applied, 9 unchanged"); `since` is carried from the
 previous `health.json`;
 `place`, `absence`, `does`, `effect` and `runbook` are the words and
@@ -1058,7 +1106,9 @@ finished_at, exit, exit_code, error, mapped, visited, outcomes{project:
 {outcome, detail, started_at?, finished_at?, allowlist_unused[]?}}, summary}`
 (`mapped` is how many projects the run set out to visit and `visited` how
 many it held; a held project carries its times, and `allowlist_unused` only
-when its plan was read; `main_check_error` is set when the moved-check could
+when its plan was read; `fleet_tree` is the hash `hack/fleet_reconcile.py` computes
+over the stack's inputs (`docs/ci-pool-projects.md` §6.2 names them);
+`main_check_error` is set when the moved-check could
 not read main; outcomes are applied, converged, unchanged, planned, busy,
 refused, failed, interrupted, not_reached); the sweep's,
 `pull-sweep.json` from `hack/ci_sweep_agent_pulls.py --report`, is
@@ -1090,13 +1140,17 @@ projects.
 `periodics` notes every watched job whose latest build failed or is stale,
 less those superseded. `periodics_runs` is, per read
 job, `{build, finished_at, passed, summary, dry_run}` of its latest finished build, what
-the recovery message and the digest's reconcile run line say. `periodics_streaks` is, per watched job, `{build,
+the recovery message and the digest's reconcile run line say, plus
+`tokens_current` for the sweep: true when its GitLab report was read and
+names no token to rotate, false when it names one, null when the report was
+not read. `periodics_streaks` is, per watched job, `{build,
 projects{project: n}, runs}`: the last build counted, each project's
 consecutive failed checks (dropped at zero; every count cleared by a clean
 build) and the run's; a failed build is a note only once the run's count
 reaches the job's threshold (two consecutive checks for the sweep, the first
 failure for the reconciles), and the poster treats a told job as recovered only
-on a build that passed (`periodics_runs`), not on a sub-threshold failure. `periodics_since` is each open note's start, kept
+on a build that passed (`periodics_runs`), not on a sub-threshold failure, and
+a told `TOKEN` note only on a passed build whose `tokens_current` is true. `periodics_since` is each open note's start, kept
 for a job across the ticks with no reading for it (which write no note for it)
 and dropped once a tick with a reading for it writes no note
 (`scripts/eval_dashboard/periodics.py` owns the notes).

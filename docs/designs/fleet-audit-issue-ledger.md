@@ -759,7 +759,9 @@ the check, and the literal invocation that ran it. `AUDITS` carries the roster p
 `AuditSpec`, which makes four things enforceable that were not: an unknown or duplicated slug is
 rejected; an absent field is rejected outright; an entry whose `command` is missing, is a call back
 into this harness, or names none of `kubectl`/`gcloud`/`gsutil`/`bq`/`helm`/`curl` is rejected; and
-an empty list is rejected unless that cluster's `limitations` says why nothing ran. The last of those
+an empty list is rejected unless that cluster's `limitations` says why nothing ran, or, on a stream
+in `COLLECTOR_AUDITS` whose manifest names the target as collected, every check the target answers
+for is declared inapplicable with a reason, which accounts for all of them and adds no gap. The `limitations` case
 is a concession, not an oversight — a drift cohort below the comparability floor legitimately
 compares nothing on a cluster it read perfectly well, and a hard non-empty rule would force the agent
 to invent a slug to get published. An explained zero is still a coverage gap, so it stays partial and

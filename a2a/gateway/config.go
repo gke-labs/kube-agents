@@ -4,6 +4,7 @@ import (
 	"crypto/hkdf"
 	"crypto/sha256"
 	"fmt"
+	"net"
 	"os"
 	"strconv"
 	"strings"
@@ -57,6 +58,19 @@ const (
 // defaultA2ADoorPrincipalMapPath is the same for the A2A door's map: its own
 // file, keys prefixed a2a:, for the reason the inject door's is.
 const defaultA2ADoorPrincipalMapPath = "/etc/a2a/a2a-door-principal-map/principals"
+
+// metricsPortEnv names the metrics listener's port (see MetricsPath in
+// metrics.go). Unset or empty means no listener, the broker's rule for
+// CREDENTIAL_PROXY_METRICS_PORT; metricsPortMin and metricsPortMax are the
+// range a set value has to fall in.
+const (
+	metricsPortEnv = "A2A_METRICS_PORT"
+	metricsPortMin = 1
+	metricsPortMax = 65535
+)
+
+// busyNoticeAtEnv names the busy notice's threshold (Config.BusyNoticeAt).
+const busyNoticeAtEnv = "A2A_BUSY_NOTICE_AT"
 
 // The display-mode values, matching the GoogleChatSpec.Mode enum.
 const (
@@ -199,6 +213,27 @@ type Config struct {
 	// which behind a port-forward or an ingress is not the listen address.
 	// Empty makes the card advertise the address it was fetched from.
 	A2ADoorPublicURL string
+
+	// A2ADoorGoogleClientID arms the door's developer identity class
+	// (A2A_DOOR_GOOGLE_CLIENT_ID): a bearer that is not A2ADoorToken is
+	// checked with Google as an access token issued for this OAuth client,
+	// the install's one pre-registered client. Empty leaves the class off.
+	// It needs the door: set without A2A_DOOR_LISTEN it is refused.
+	A2ADoorGoogleClientID string
+	// A2ADoorAllowedUsers is the developer class's allowlist
+	// (A2A_DOOR_ALLOWED_USERS, comma-separated emails): the door refuses a
+	// verified email off it (403) before it holds any state for the caller,
+	// and the gateway checks the same list again. Empty admits nobody. There is no allow-all, unlike Chat's legacy
+	// posture: a door any Google account can sign in to is not a default
+	// anyone should get by leaving a list blank.
+	A2ADoorAllowedUsers []string
+	// MetricsPort is the metrics-only listener's port (A2A_METRICS_PORT);
+	// zero means no listener. It binds every interface, because its caller
+	// is the managed-Prometheus collector on the pod network, and serves
+	// MetricsPath and nothing else. It may not be either door's port: a door
+	// that lost its port to this listener would fail to bind, and a door
+	// that won it would be what the collector's NetworkPolicy rule admits.
+	MetricsPort int
 
 	// DisplayMode is the existing Chat integration's default-vs-debug split
 	// (GoogleChatSpec.Mode), honoured by this relay rather than reinvented:
@@ -413,6 +448,22 @@ type Config struct {
 	// it: 0 would be "delegation off", which is a different switch
 	// (A2A_DELEGATE_TOOL on the worker side), not a typo to paper over.
 	DelegationDepthMax int
+
+	// BusyNoticeAt is how many tasks have to be ahead of a new fixed-route
+	// turn before the gateway marks the turn's status line queued
+	// (A2A_BUSY_NOTICE_AT). The count is the fixed addressee's outstanding
+	// work, read from session-state (fixedRouteBacklog in busy.go); at or
+	// above this number the turn's task is still submitted, and its status
+	// line is edited to a queued state that says how many are ahead
+	// (showBusy). Nothing is refused or dropped.
+	//
+	// Zero means 10, the rendered bridge's default BRIDGE_CONCURRENCY. The
+	// operator renders the bridge's worker count here, so a turn is told it
+	// is waiting exactly when every worker is taken; raising it past the
+	// worker count makes the notice rarer and later, lowering it under the
+	// count tells people about a wait that is not there. FromEnv refuses a
+	// value under 1.
+	BusyNoticeAt int
 }
 
 // Backend names the REAL chat backend this config arms: "gchat", "slack",
@@ -509,6 +560,17 @@ func FromEnv() (*Config, error) {
 	cfg.A2ADoorToken = strings.TrimSpace(os.Getenv("A2A_DOOR_TOKEN"))
 	cfg.A2ADoorPrincipalMapPath = envOr("A2A_DOOR_PRINCIPAL_MAP", defaultA2ADoorPrincipalMapPath)
 	cfg.A2ADoorPublicURL = strings.TrimSpace(os.Getenv("A2A_DOOR_PUBLIC_URL"))
+	cfg.A2ADoorGoogleClientID = strings.TrimSpace(os.Getenv("A2A_DOOR_GOOGLE_CLIENT_ID"))
+	for _, u := range strings.Split(os.Getenv("A2A_DOOR_ALLOWED_USERS"), ",") {
+		if u = strings.TrimSpace(u); u != "" {
+			cfg.A2ADoorAllowedUsers = append(cfg.A2ADoorAllowedUsers, u)
+		}
+	}
+	metricsPort, err := metricsPortFromEnv(cfg)
+	if err != nil {
+		return nil, err
+	}
+	cfg.MetricsPort = metricsPort
 	cfg.DisplayMode = envOr("A2A_CHAT_DISPLAY_MODE", displayModeDebug)
 	if cfg.DisplayMode != displayModeDefault && cfg.DisplayMode != displayModeDebug {
 		return nil, fmt.Errorf("A2A_CHAT_DISPLAY_MODE %q: want %q or %q", cfg.DisplayMode, displayModeDefault, displayModeDebug)
@@ -574,6 +636,9 @@ func FromEnv() (*Config, error) {
 	if cfg.InjectListen != "" && cfg.InjectToken == "" {
 		return nil, fmt.Errorf("A2A_INJECT_TOKEN is required when A2A_INJECT_LISTEN is set: the inject door authenticates every request with a bearer token, because neither its loopback bind nor the NetworkPolicy in front of it governs the port-forward path its caller uses")
 	}
+	if cfg.A2ADoorGoogleClientID != "" && cfg.A2ADoorListen == "" {
+		return nil, fmt.Errorf("A2A_DOOR_GOOGLE_CLIENT_ID is set but A2A_DOOR_LISTEN is not: the Google sign-in class is part of the A2A door and has nothing to arm without it")
+	}
 	if cfg.A2ADoorListen != "" && cfg.A2ADoorToken == "" {
 		return nil, fmt.Errorf("A2A_DOOR_TOKEN is required when A2A_DOOR_LISTEN is set: the A2A door authenticates every RPC request with a bearer token (the agent card alone is open), for the reason the inject door does; see Config.A2ADoorToken")
 	}
@@ -613,6 +678,12 @@ func FromEnv() (*Config, error) {
 		return nil, fmt.Errorf("A2A_DELEGATION_DEPTH_MAX %q: need an integer >= 1", depthMax)
 	}
 	cfg.DelegationDepthMax = dm
+	busyAt := envOr(busyNoticeAtEnv, strconv.Itoa(defaultBusyNoticeAt))
+	ba, err := strconv.Atoi(busyAt)
+	if err != nil || ba < 1 {
+		return nil, fmt.Errorf("%s %q: need an integer >= 1", busyNoticeAtEnv, busyAt)
+	}
+	cfg.BusyNoticeAt = ba
 	ttl := envOr("A2A_IDLE_TTL", "30m")
 	d, err := time.ParseDuration(ttl)
 	if err != nil {
@@ -702,6 +773,44 @@ func FromEnv() (*Config, error) {
 		cfg.AttributionSalt = derived
 	}
 	return cfg, nil
+}
+
+// metricsPortFromEnv reads A2A_METRICS_PORT: zero when unset or empty, else
+// a port in range that neither door's listen address already names. A bad
+// value refuses the boot, like every other setting FromEnv reads; the
+// operator renders a valid one, so only a hand edit reaches these refusals.
+func metricsPortFromEnv(cfg *Config) (int, error) {
+	raw := strings.TrimSpace(os.Getenv(metricsPortEnv))
+	if raw == "" {
+		return 0, nil
+	}
+	port, err := strconv.Atoi(raw)
+	if err != nil || port < metricsPortMin || port > metricsPortMax {
+		return 0, fmt.Errorf("%s %q: need a port in %d-%d", metricsPortEnv, raw, metricsPortMin, metricsPortMax)
+	}
+	for _, door := range []struct{ name, listen string }{
+		{"the inject door", cfg.InjectListen},
+		{"the A2A door", cfg.A2ADoorListen},
+	} {
+		if door.listen == "" {
+			continue
+		}
+		// Compared as the number net.Listen will bind, not as the string:
+		// net.LookupPort is the parse net.Listen runs on the port, so a
+		// zero-padded, signed or named spelling of this port is caught here
+		// rather than as a door that loses the bind to this listener. An
+		// address or port it cannot read is skipped, because the door's own
+		// net.Listen refuses it the same way when it binds; that failure is
+		// the door's, and not a collision with this listener.
+		_, doorPortRaw, err := net.SplitHostPort(door.listen)
+		if err != nil {
+			continue
+		}
+		if doorPort, err := net.LookupPort("tcp", doorPortRaw); err == nil && doorPort == port {
+			return 0, fmt.Errorf("%s %d is the port %s listens on (%q); the metrics listener needs a port of its own", metricsPortEnv, port, door.name, door.listen)
+		}
+	}
+	return port, nil
 }
 
 // pyStrip trims what Python's str.strip() trims and nothing more. The Slack

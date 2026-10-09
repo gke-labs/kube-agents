@@ -220,7 +220,10 @@ uses Workload Identity (below); `litellm.modelDefaultName`
 overrides the per-provider default model; `litellm.maxTokens` (default `0`,
 meaning none) puts a `max_tokens` under every alias for a request that names
 none, which a self-hosted backend with one combined prompt-plus-output budget
-needs — a request's own `max_tokens` still wins. Set `litellm.enabled=false`
+needs — a request's own `max_tokens` still wins. On a Claude model the gateway
+drops `temperature`, `top_p` and `top_k` from every request
+([why](https://gke-labs.github.io/kube-agents/concepts/inference-gateway/#setting-the-default-model)).
+Set `litellm.enabled=false`
 only if you operate your own gateway at that address. LLM-call telemetry is
 opt-in (`litellm.otel=true`) — enable it only on clusters that run a reachable
 collector, since without one the otel callback aborts every LLM request on DNS
@@ -397,11 +400,14 @@ ladder and discovery rules: [Deploy → Telemetry](https://gke-labs.github.io/ku
 pods that serves metrics: the gateway pod, so GKE Managed Prometheus scrapes the
 event watcher's `k8s_event_watcher_*` metrics from the `agent-api-auth` sidecar's
 port 9095, and the credential-proxy pod, so it scrapes the broker's `kubeagents_*`
-tool-invocation and request metrics from its metrics-only port 8766. The
-operator's policies on both pods admit the collector's namespace, `gke-gmp-system`,
-and the operator's own pods on those ports either way; the value only decides whether a
-scrape is configured, and the operator's own read of the two counters into `status.usage`
-does not depend on it.
+tool-invocation and request metrics from its metrics-only port 8766, and the A2A
+gateway pod a `spec.mode: next` install runs, so it scrapes the gateway's task
+terminal and Google Chat pull counters from its metrics-only port 9096 (elsewhere
+that one selects no pod). The operator's policies on all three pods admit the
+collector's namespace, `gke-gmp-system`, on those ports either way, and on the
+first two they admit the operator's own pods as well; the value only decides
+whether a scrape is configured, and the operator's own read of the two counters
+into `status.usage` does not depend on it.
 It is a tri-state: `null`,
 the default, renders them when the cluster serves the `PodMonitoring` API and
 nothing elsewhere, so an install off GKE, or on a GKE cluster with Managed
@@ -479,8 +485,15 @@ Use `telemetry.otlpEndpoint` instead when you do have a collector to point at.
   `platformAgent.integration.repositories` the repositories on them (`forge`,
   `repository`, optional `namespace`, and `role`: `gitops` for the one the
   agent publishes to, `managed` for others it may change, `context` for
-  read-only reference). `provider` defaults to `github`, the only one
-  registered today, and `credentialsRef` is ignored for it. A GitHub forge's
+  read-only reference). `provider` is `github` (the default) or `gitlab`. `credentialsRef` is
+  ignored for `github` and required for `gitlab`: a Secret holding the access
+  token under the key `token`, mounted into the credential broker only. A
+  `gitlab` forge's `host` is gitlab.com by default or a self-managed instance,
+  never a GitHub name, and one `gitlab` forge per host. With a `gitlab` forge
+  declared beside GitHub, a bare `owner/name` still works for a GitHub
+  repository that the install registered by URL. Name a GitLab repository, or
+  a GitHub repository that the install did not register, by its URL. Apply `crds/` before upgrading
+  to a release that adds a provider, since `helm upgrade` does not update CRDs. A GitHub forge's
   `host` must be a GitHub spelling (`github.com`, `www.github.com`,
   `ssh.github.com`), and a repository must name a declared forge.
   `platformAgent.integration.github.org` / `.gitRepo` remain as a deprecated
@@ -529,7 +542,7 @@ means zero rather than unset.
 container, the broker that runs every credentialed command in a pod of its own.
 It is forwarded to the CR's `spec.deployment.credentialProxy.resources` when any
 key is set, and the operator merges it over its defaults per key, so
-`limits: {memory: 2Gi}` raises the memory limit and keeps the rest. The
+`limits: {memory: 3Gi}` raises the memory limit and keeps the rest. The
 [`spec.deployment` section of the CRD reference](https://gke-labs.github.io/kube-agents/operator/platformagent-crd/#specdeployment)
 is canonical for the defaults, what the operator refuses and how it reports it,
 and the Autopilot warnings;

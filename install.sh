@@ -81,6 +81,28 @@ readonly NETWORK_POLICY_REPORT_FIELD="network_policy_enforcement"
 NETWORK_POLICY_ENFORCEMENT=""
 # Whether note_stale_network_policy_acceptance has spoken this run.
 NETWORK_POLICY_STALE_ACCEPTANCE_NOTED="false"
+# How check_flag_against_install_env compares a typed chat flag with the key
+# install.env records: a boolean read through is_truthy, a literal string, a
+# list read through hcl_csv_list (the form write_tfvars_from_state renders), or
+# a credential, whose value is never printed and whose home is the live Secret
+# rather than the file.
+readonly INSTALL_ENV_FLAG_KIND_BOOL="bool"
+readonly INSTALL_ENV_FLAG_KIND_STRING="string"
+readonly INSTALL_ENV_FLAG_KIND_LIST="list"
+readonly INSTALL_ENV_FLAG_KIND_CREDENTIAL="credential"
+# The keys among those that the Day-2 menu's chat screen edits and its Save &
+# Apply writes, so a refusal names --menu only where the menu can make the
+# edit. Not CHAT_TOPIC_NAME, which the panel saves as loaded and never asks
+# about, and not SLACK_ENABLED: the panel turns Slack on without asking for
+# the tokens, and its apply does not check for them.
+readonly INSTALL_ENV_KEYS_THE_MENU_SAVES="GOOGLE_CHAT_ENABLED ALLOWED_USERS GOOGLE_CHAT_HOME_CHANNEL"
+# The chat flags this run typed, one KEY|FLAG|KIND|PARAM|DEFAULT_VAR line each,
+# noted by parse_args; and the keys among them that install.env does not
+# assign, for record_flags_into_install_env to append once the run commits.
+INSTALL_ENV_FLAGS_TYPED=""
+INSTALL_ENV_KEYS_TO_RECORD=""
+# Those keys with their companions, toggles last (resolve_install_env_record_keys).
+INSTALL_ENV_RECORD_KEYS=""
 
 # ─── ANSI Colors & Terminal Responsive Helpers ─────────────────────────────────
 # A function because scripts/installer/common.sh defines the same variables
@@ -194,8 +216,11 @@ unset _install_defaults_dir
 # something each flag has to remember to do and becomes the default path.
 #
 # An input the installer reads and does not rewrite. It creates one at the end
-# of a first install, when there is nothing there, and never touches it again:
-# a file the documentation tells you to edit and the next run overwrites is
+# of a first install, when there is nothing there, and after that changes no
+# line of it; the one thing it adds is a chat key the file lacks, from a chat
+# flag, with the settings a toggle recorded true brings
+# (record_flags_into_install_env). A file the documentation tells you to
+# edit and the next run overwrites is
 # exactly the complaint against vars.sh, whose header said "auto-generated"
 # while INSTALL.md told you to hand-edit it.
 #
@@ -297,6 +322,10 @@ bootstrap_install_env() {
   # inherited SCOPED_SA_POOL_ENABLED=true would arm the pool for one run, on
   # accounts the next run from a clean shell deletes again.
   unset SCOPED_SA_POOL_ENABLED SCOPED_SA_POOL_MAX_ACCOUNTS
+  # The GitOps forge keys likewise: an inherited GITOPS_FORGE=gitlab would
+  # switch a recorded GitHub install's forge for this run. --gitops-forge is
+  # the per-run way in.
+  unset GITOPS_FORGE GITOPS_HOST GITLAB_TOKEN_SECRET
   # Checked before sourcing: a stray quote would otherwise abort the run through
   # the ERR trap with a bash parse error and no indication of which file.
   if ! bash -n "$file" 2>/dev/null; then
@@ -394,6 +423,18 @@ PARAM_GITHUB_APP_ID="${GITHUB_APP_ID:-}"
 PARAM_GITHUB_PEM_PATH="${GITHUB_PEM_PATH:-}"
 PARAM_KMS_KEYRING="${KMS_KEYRING:-}"
 PARAM_KMS_KEY="${KMS_KEY:-}"
+# GitLab: the forge, a self-managed host, the Secret's name, and a FILE the
+# token is read from. There is deliberately no token-value input: a value in
+# argv or the environment is a value in `ps`, shell history and CI logs.
+PARAM_GITOPS_FORGE="${GITOPS_FORGE:-}"
+PARAM_GITOPS_HOST="${GITOPS_HOST:-}"
+PARAM_GITLAB_TOKEN_SECRET="${GITLAB_TOKEN_SECRET:-}"
+PARAM_GITLAB_TOKEN_FILE="${GITLAB_TOKEN_FILE:-}"
+# Whether a value came from a flag rather than install.env: a switch of forge
+# by flag drops what the file recorded for the other forge, but refuses a flag
+# that contradicts it.
+PARAM_GITOPS_HOST_FROM_FLAG="false"
+PARAM_GITHUB_APP_FROM_FLAG="false"
 # Left empty where installer_common.sh owns the default, the way
 # PARAM_MODEL_PROVIDER above is: resolve_shared_defaults fills them in once the
 # helpers are sourced, so no default is spelled twice.
@@ -600,6 +641,16 @@ Flags for AI Agents & Automation:
   --gitops-org=ORG              GitHub Org for GitOps repo
   --gitops-repo=REPO            GitOps IaC Repository Name (default: DEFAULT_GITOPS_REPO,
                                 currently gke-fleet-iac)
+  --gitops-forge=FORGE          Forge holding the GitOps repo: github or gitlab (default: github).
+                                For gitlab, --gitops-repo is the project's full path
+                                (group/subgroup/project) and --gitops-org is not used
+  --gitops-host=HOST            Self-managed GitLab hostname (default: gitlab.com)
+  --gitlab-token-file=PATH      File holding the GitLab access token (scopes: api,
+                                write_repository); read into the Kubernetes Secret after the
+                                apply and never stored. Without it the installer prompts, or,
+                                non-interactively, leaves the Secret for you to create
+  --gitlab-token-secret=NAME    Kubernetes Secret holding the GitLab token
+                                (default: gitlab-forge-token)
   --github-app-id=ID            Numeric GitHub App ID for GitOps token minter
   --github-pem-path=PATH        Local path to downloaded GitHub App private key (.pem)
   --kms-keyring=KEYRING         Cloud KMS Keyring Name for token minter (default: DEFAULT_KMS_KEYRING,
@@ -684,7 +735,14 @@ Flags for AI Agents & Automation:
   --enable-google-chat[=true|false]
                                 Enable Google Chat integration
   --enable-slack[=true|false]   Enable the Slack socket-mode relay. Non-interactively
-                                this requires --slack-bot-token and --slack-app-token
+                                this requires --slack-bot-token and --slack-app-token.
+                                Against an existing install.env, --enable-slack,
+                                --enable-google-chat, --google-chat and the
+                                --slack-*, --google-chat-allowed-users,
+                                --google-chat-home-channel, --google-chat-mode and
+                                --chat-topic-name flags must agree with the key the file
+                                assigns (a disagreement is refused: edit the key); a key
+                                the file lacks is recorded there, tokens excepted
   --enable-pubsub-platform[=true|false]
                                 Enable Pub/Sub platform adapter AgentPlugin (default: false)
   --enable-stockout-investigator[=true|false]
@@ -737,7 +795,8 @@ Configuration file:
   install.env beside this script (override with KUBE_AGENTS_INSTALL_ENV) is
   loaded first, and a flag beats it. It is sourced with 'set -a', so a key it
   carries also beats an exported variable of the same name -- a flag is what
-  overrides a recorded value for one run. Start from install.env.example.
+  overrides a recorded value for one run, except the chat flags, which must
+  agree with it (see --enable-slack). Start from install.env.example.
   Anything it sets is inherited by later runs, so a re-run that omits a flag
   keeps the value rather than reverting it to the default above.
 EOF
@@ -791,6 +850,22 @@ validate_bool_flag_value() {
     print_error "${flag} must be either true or false."
     exit 1
   fi
+}
+
+# The two chat flags with a default, given nothing. resolve_shared_defaults
+# turns an empty value into the default, so over an install.env recording
+# another topic or mode the refusal in check_flag_against_install_env would
+# name a value nobody typed and tell the operator to adopt it, and with no file
+# the run would apply the default where a wrapper meant to pass something.
+# Refused, like an empty toggle. A blank value (whitespace only) counts as
+# empty: resolve_shared_defaults would keep it, and a blank topic would be held
+# to the file or recorded into it.
+require_defaulted_flag_value() {
+  local flag="$1" value="${2:-}"
+  [ -z "${value//[[:space:]]/}" ] || return 0
+  print_error "${flag}= was given an empty value."
+  print_info "Pass ${flag} with a value, or leave it out to take the one install.env records (or the default)."
+  exit 1
 }
 
 # A scope flag given nothing cannot mean "leave the recorded scope alone" (the
@@ -856,8 +931,12 @@ parse_args() {
       --anthropic-api-key=*) PARAM_ANTHROPIC_API_KEY="${1#*=}"; shift ;;
       --gitops-org=*) PARAM_GITOPS_ORG="${1#*=}"; shift ;;
       --gitops-repo=*) PARAM_GITOPS_REPO="${1#*=}"; shift ;;
-      --github-app-id=*) PARAM_GITHUB_APP_ID="${1#*=}"; shift ;;
-      --github-pem-path=*) PARAM_GITHUB_PEM_PATH="${1#*=}"; shift ;;
+      --gitops-forge=*) PARAM_GITOPS_FORGE="${1#*=}"; shift ;;
+      --gitops-host=*) PARAM_GITOPS_HOST="${1#*=}"; PARAM_GITOPS_HOST_FROM_FLAG="true"; shift ;;
+      --gitlab-token-file=*) PARAM_GITLAB_TOKEN_FILE="${1#*=}"; shift ;;
+      --gitlab-token-secret=*) PARAM_GITLAB_TOKEN_SECRET="${1#*=}"; shift ;;
+      --github-app-id=*) PARAM_GITHUB_APP_ID="${1#*=}"; PARAM_GITHUB_APP_FROM_FLAG="true"; shift ;;
+      --github-pem-path=*) PARAM_GITHUB_PEM_PATH="${1#*=}"; PARAM_GITHUB_APP_FROM_FLAG="true"; shift ;;
       --kms-keyring=*) PARAM_KMS_KEYRING="${1#*=}"; shift ;;
       --kms-key=*) PARAM_KMS_KEY="${1#*=}"; shift ;;
       --permission-set=*) PARAM_PERMISSION_SET="${1#*=}"; shift ;;
@@ -944,20 +1023,59 @@ parse_args() {
       --allow-unverified-source|--allow-dirty) PARAM_ALLOW_UNVERIFIED_SOURCE="true"; shift ;;
       --enable-google-chat|--google-chat|--enable-google-chat=*|--google-chat=*)
         PARAM_ENABLE_GOOGLE_CHAT="$(flag_bool_value "$1")"
-        validate_bool_flag_value "${1%%=*}" "$PARAM_ENABLE_GOOGLE_CHAT"; shift ;;
+        validate_bool_flag_value "${1%%=*}" "$PARAM_ENABLE_GOOGLE_CHAT"
+        note_install_env_flag GOOGLE_CHAT_ENABLED "${1%%=*}" "$INSTALL_ENV_FLAG_KIND_BOOL" PARAM_ENABLE_GOOGLE_CHAT DEFAULT_GOOGLE_CHAT_ENABLED
+        shift ;;
       --enable-slack|--enable-slack=*)
         PARAM_ENABLE_SLACK="$(flag_bool_value "$1")"
-        validate_bool_flag_value "${1%%=*}" "$PARAM_ENABLE_SLACK"; shift ;;
-      --google-chat-allowed-users=*) PARAM_ALLOWED_USERS="${1#*=}"; shift ;;
-      --slack-bot-token=*) PARAM_SLACK_BOT_TOKEN="${1#*=}"; shift ;;
-      --slack-app-token=*) PARAM_SLACK_APP_TOKEN="${1#*=}"; shift ;;
-      --slack-allowed-users=*) PARAM_SLACK_ALLOWED_USERS="${1#*=}"; shift ;;
-      --slack-home-channel=*) PARAM_SLACK_HOME_CHANNEL="${1#*=}"; shift ;;
-      --slack-home-channel-name=*) PARAM_SLACK_HOME_CHANNEL_NAME="${1#*=}"; shift ;;
-      --chat-topic-name=*) PARAM_CHAT_TOPIC_NAME="${1#*=}"; shift ;;
+        validate_bool_flag_value "${1%%=*}" "$PARAM_ENABLE_SLACK"
+        note_install_env_flag SLACK_ENABLED "${1%%=*}" "$INSTALL_ENV_FLAG_KIND_BOOL" PARAM_ENABLE_SLACK DEFAULT_SLACK_ENABLED
+        shift ;;
+      --google-chat-allowed-users=*)
+        PARAM_ALLOWED_USERS="${1#*=}"
+        note_install_env_flag ALLOWED_USERS "${1%%=*}" "$INSTALL_ENV_FLAG_KIND_LIST" PARAM_ALLOWED_USERS
+        shift ;;
+      --slack-bot-token=*)
+        PARAM_SLACK_BOT_TOKEN="${1#*=}"
+        note_install_env_flag SLACK_BOT_TOKEN "${1%%=*}" "$INSTALL_ENV_FLAG_KIND_CREDENTIAL" PARAM_SLACK_BOT_TOKEN
+        shift ;;
+      --slack-app-token=*)
+        PARAM_SLACK_APP_TOKEN="${1#*=}"
+        note_install_env_flag SLACK_APP_TOKEN "${1%%=*}" "$INSTALL_ENV_FLAG_KIND_CREDENTIAL" PARAM_SLACK_APP_TOKEN
+        shift ;;
+      --slack-allowed-users=*)
+        PARAM_SLACK_ALLOWED_USERS="${1#*=}"
+        note_install_env_flag SLACK_ALLOWED_USERS "${1%%=*}" "$INSTALL_ENV_FLAG_KIND_LIST" PARAM_SLACK_ALLOWED_USERS
+        shift ;;
+      --slack-home-channel=*)
+        PARAM_SLACK_HOME_CHANNEL="${1#*=}"
+        note_install_env_flag SLACK_HOME_CHANNEL "${1%%=*}" "$INSTALL_ENV_FLAG_KIND_STRING" PARAM_SLACK_HOME_CHANNEL
+        shift ;;
+      --slack-home-channel-name=*)
+        PARAM_SLACK_HOME_CHANNEL_NAME="${1#*=}"
+        note_install_env_flag SLACK_HOME_CHANNEL_NAME "${1%%=*}" "$INSTALL_ENV_FLAG_KIND_STRING" PARAM_SLACK_HOME_CHANNEL_NAME
+        shift ;;
+      --chat-topic-name=*)
+        PARAM_CHAT_TOPIC_NAME="${1#*=}"
+        require_defaulted_flag_value "${1%%=*}" "$PARAM_CHAT_TOPIC_NAME"
+        note_install_env_flag CHAT_TOPIC_NAME "${1%%=*}" "$INSTALL_ENV_FLAG_KIND_STRING" PARAM_CHAT_TOPIC_NAME DEFAULT_CHAT_TOPIC_NAME
+        shift ;;
       --chat-sub-name=*) PARAM_CHAT_SUB_NAME="${1#*=}"; CLI_CHAT_SUB_NAME="${1#*=}"; shift ;;
-      --google-chat-mode=*) PARAM_GOOGLE_CHAT_MODE="${1#*=}"; shift ;;
-      --google-chat-home-channel=*) PARAM_GOOGLE_CHAT_HOME_CHANNEL="${1#*=}"; shift ;;
+      --google-chat-mode=*)
+        PARAM_GOOGLE_CHAT_MODE="${1#*=}"
+        require_defaulted_flag_value "${1%%=*}" "$PARAM_GOOGLE_CHAT_MODE"
+        # Here and not only at step 6, so the step-2 install.env check never
+        # tells the operator to record a mode step 6 and variables.tf refuse.
+        if [[ ! "$PARAM_GOOGLE_CHAT_MODE" =~ ^(default|debug)$ ]]; then
+          print_error "--google-chat-mode must be either 'default' or 'debug'."
+          exit 1
+        fi
+        note_install_env_flag GOOGLE_CHAT_MODE "${1%%=*}" "$INSTALL_ENV_FLAG_KIND_STRING" PARAM_GOOGLE_CHAT_MODE DEFAULT_GOOGLE_CHAT_MODE
+        shift ;;
+      --google-chat-home-channel=*)
+        PARAM_GOOGLE_CHAT_HOME_CHANNEL="${1#*=}"
+        note_install_env_flag GOOGLE_CHAT_HOME_CHANNEL "${1%%=*}" "$INSTALL_ENV_FLAG_KIND_STRING" PARAM_GOOGLE_CHAT_HOME_CHANNEL
+        shift ;;
       --migrate-node-pools=*)
         PARAM_MIGRATE_NODE_POOLS="${1#*=}"
         PARAM_MIGRATE_NODE_POOLS_PASSED="true"
@@ -1592,20 +1710,22 @@ install_env_records_key() {
 # differently.
 #
 # install.env is an input: install.sh creates one when there is none and never
-# rewrites it. The interview, though, still runs in full on every interactive
+# rewrites a line of it. The interview, though, still runs in full on every interactive
 # invocation, and its answers go straight into the environment
 # write_tfvars_from_state reads. So an operator who answers "None" at the chat
 # menu gets the Pub/Sub topic destroyed by this apply and re-created by the
 # next run, because the file still says the integration is on. Nothing else
-# tells them: "Left your install configuration as you wrote it" reads as
-# reassurance, and the Day-2 menu's Save & Apply is the only path that writes a
-# key back.
+# tells them: "Kept your install configuration" reads as reassurance, and the
+# Day-2 menu's Save & Apply is the only path that writes a changed key back.
 #
 # A warning rather than a write, deliberately. Making install.sh persist here
 # would contradict the contract stated in install.env.example, INSTALL.md and
 # the chart's CI story -- #1117 renders this file on an ephemeral runner and
-# needs the installer to treat it as read-only. Naming the drift costs nothing
-# and leaves the decision where it belongs.
+# needs the installer not to rewrite it. Naming the drift costs nothing
+# and leaves the decision where it belongs. The one write install.sh does make
+# is narrower: a chat key the file does not assign, appended from a chat flag
+# with the settings a toggle recorded true brings (record_flags_into_install_env);
+# it never changes a key the file sets.
 #
 # The list is the interview's own settings, not everything the file holds:
 # IMAGE_TAG and the recovered secrets legitimately differ on a normal run and
@@ -1613,8 +1733,13 @@ install_env_records_key() {
 warn_unrecorded_interview_answers() {
   local file="${1:-}"
   [ -n "$file" ] && [ -f "$file" ] || return 0
-  # A non-interactive run typed nothing; its answers came from flags and this
-  # very file, so there is no drift to report that the operator did not author.
+  # A non-interactive run answered no prompt, so the drift this names (an
+  # answer typed at the interview) cannot happen there. A flag can still beat
+  # the file on such a run: the chat flags are refused, or queued for the
+  # record, before this runs (check_flags_against_install_env), and the other
+  # keys in the list below that have a flag (--model-max-tokens, --memory,
+  # --permission-set and the rest) still apply for one run with no warning on a
+  # non-interactive run.
   [ "$PARAM_NON_INTERACTIVE" != "true" ] || return 0
   has_controlling_tty || return 0
   [ "$PARAM_DRY_RUN" != "true" ] || return 0
@@ -1642,7 +1767,7 @@ warn_unrecorded_interview_answers() {
     SLACK_BOT_TOKEN SLACK_APP_TOKEN SLACK_HOME_CHANNEL SLACK_HOME_CHANNEL_NAME
     CHAT_TOPIC_NAME CHAT_SUB_NAME MODEL_PROVIDER MODEL_DEFAULT_NAME MODEL_MAX_TOKENS PLATFORM_AGENT_PERMISSION_SET
     PLATFORM_AGENT_CUSTOM_ROLES ENABLE_GVISOR HERMES_DASHBOARD_ENABLED MEMORY
-    USER_PROFILE_ENABLED GITOPS_ORG GITOPS_REPO GITHUB_APP_ID)
+    USER_PROFILE_ENABLED GITOPS_ORG GITOPS_REPO GITHUB_APP_ID GITOPS_FORGE GITOPS_HOST GITLAB_TOKEN_SECRET)
   # One evaluation of the file for the whole list, in this shell, so the reads
   # below land on the cache instead of re-running whatever the file's lines run.
   read_recorded_install_env_values "$file" "${interview_keys[@]}"
@@ -1659,7 +1784,7 @@ warn_unrecorded_interview_answers() {
   [ -n "$drifted" ] || return 0
 
   print_warning "This run applied answers that ${file} does not record."
-  print_info "install.env is an input: install.sh reads it and never rewrites it."
+  print_info "install.env is an input: install.sh reads it and never changes a key it sets, except its GitOps forge keys when an applied run changes them."
   print_info "The next run -- or upgrade.sh, or the Day-2 menu -- regenerates from"
   print_info "the file, which will revert what you just changed. Update these keys:"
   for key in $drifted; do
@@ -1817,16 +1942,325 @@ warn_flag_beats_unrecorded_file_value() {
   print_info "Set ${key}=$(printf '%q' "$value") in ${file}, or repeat ${repeat_flag} on ${repeat_on}."
 }
 
+# The one exception to "an existing install.env is never rewritten": the
+# GitOps forge. upgrade.sh and the Day-2 menu render from the file alone, so a
+# forge this run chose and the file does not record would be reverted to
+# GitHub by the next of them -- the alias back in the CR, the GitLab forge
+# gone, nothing saying why. So when the file's forge differs from this run's,
+# or this run's is GitLab, the forge keys and the repository coordinates they
+# qualify are rewritten in place (those lines only; every other line is kept
+# as written). The token and its source are never among them.
+record_gitops_forge_keys() {
+  local file="$1"
+  [ -f "$file" ] || return 0
+  [ "${PARAM_DRY_RUN:-false}" = "true" ] && return 0
+  local current="${GITOPS_FORGE:-github}" recorded=""
+  read_recorded_install_env_values "$file" GITOPS_FORGE
+  if install_env_records_key "$file" GITOPS_FORGE; then
+    recorded="$(recorded_install_env_value "$file" GITOPS_FORGE)"
+  fi
+  [ -z "$recorded" ] && recorded="github"
+  [ "$current" = "gitlab" ] || [ "$recorded" != "$current" ] || return 0
+  if [ "$recorded" = "gitlab" ] && [ "$current" = "gitlab" ]; then
+    read_recorded_install_env_values "$file" GITOPS_HOST GITLAB_TOKEN_SECRET GITOPS_REPO
+    if [ "$(recorded_install_env_value "$file" GITOPS_HOST)" = "${GITOPS_HOST:-}" ] &&
+      [ "$(recorded_install_env_value "$file" GITLAB_TOKEN_SECRET)" = "${GITLAB_TOKEN_SECRET:-${DEFAULT_GITLAB_TOKEN_SECRET:-gitlab-forge-token}}" ] &&
+      [ "$(recorded_install_env_value "$file" GITOPS_REPO)" = "${GITOPS_REPO:-}" ]; then
+      return 0
+    fi
+  fi
+  # GITHUB_APP_ID with them: left in a file that now records GitLab, the next
+  # run's validator would refuse the pair.
+  local keys=(GITOPS_FORGE GITOPS_HOST GITLAB_TOKEN_SECRET GITOPS_ORG GITOPS_REPO GITHUB_APP_ID GITHUB_PEM_PATH)
+  local tmp="${file}.tmp.$$"
+  ( umask 077; : >"$tmp" )
+  grep -E -v "^[[:space:]]*(export[[:space:]]+)?($(IFS='|'; echo "${keys[*]}"))=" "$file" >"$tmp" || true
+  if [ "$current" = "gitlab" ]; then
+    write_env_var "$tmp" GITOPS_FORGE "gitlab"
+    write_env_var "$tmp" GITOPS_HOST "${GITOPS_HOST:-}"
+    write_env_var "$tmp" GITLAB_TOKEN_SECRET "${GITLAB_TOKEN_SECRET:-${DEFAULT_GITLAB_TOKEN_SECRET:-gitlab-forge-token}}"
+    write_env_var "$tmp" GITOPS_REPO "${GITOPS_REPO:-}"
+  else
+    write_env_var "$tmp" GITOPS_ORG "${GITOPS_ORG:-}"
+    write_env_var "$tmp" GITOPS_REPO "${GITOPS_REPO:-}"
+    write_env_var "$tmp" GITHUB_APP_ID "${GITHUB_APP_ID:-}"
+  fi
+  chmod 600 "$tmp" 2>/dev/null || true
+  mv "$tmp" "$file"
+  print_info "Recorded the GitOps forge (${current}) and its repository in ${file}, so upgrade.sh renders the same forge."
+  # The recorded-value cache read the file before this rewrite.
+  RECORDED_INSTALL_ENV_FILE=""
+}
+
+# The chat flags are held to install.env rather than warned about. Each of them
+# configures something upgrade.sh renders from the file alone, and upgrade.sh
+# takes none of them, so one that beat the file for a single run would be undone
+# by the next upgrade with no one told: a Slack relay switched off, a home
+# channel or an allowlist put back. So against an existing install.env:
+#
+#   - a flag that disagrees with the key the file assigns is refused before
+#     anything is applied, naming the file and the key;
+#   - a flag whose key the file does not assign at all (a hand-written file, or
+#     one copied from install.env.example with the line commented out) has
+#     nothing to disagree with, and the value the run applies is appended to
+#     the file once the run commits, so upgrade.sh renders what is running;
+#     a toggle recorded true brings the integration's other settings the file
+#     lacks, the allowlist first among them, since an empty one admits everyone;
+#   - a flag that agrees changes nothing.
+#
+# Credentials are the exception to the second rule: a Slack token the file does
+# not carry is never written there, because its home is the live Secret, which
+# write_tfvars_from_state recovers it from on every later run, and
+# PERSIST_SECRETS_ON_DISK=false keeps credentials out of every file. A token the
+# file does carry is still held to it, since the file's copy is the one a later
+# run renders.
+#
+# A file the installer created assigns every one of these keys but the tokens,
+# so on such a file nothing is ever appended; only a refusal or a no-op can
+# follow. --chat-sub-name is left out: the subscription name is read back from
+# Terraform state, which outranks both the flag and the file on a running
+# install (write_tfvars_from_state). The same holds for an
+# install.env rendered for CI from a full set of variables. A rendered file
+# that omits a key gets the key appended, on the runner that owns the file.
+
+# The keys an integration renders beside its toggle, recorded with a toggle
+# recorded true where the file lacks them (record_flags_into_install_env). Not
+# the tokens, whose home is the live Secret, and not CHAT_SUB_NAME, which a
+# running install reads from Terraform state.
+install_env_toggle_companions() {
+  case "${1:-}" in
+    SLACK_ENABLED) printf '%s' "SLACK_ALLOWED_USERS SLACK_HOME_CHANNEL SLACK_HOME_CHANNEL_NAME" ;;
+    GOOGLE_CHAT_ENABLED) printf '%s' "ALLOWED_USERS CHAT_TOPIC_NAME GOOGLE_CHAT_HOME_CHANNEL GOOGLE_CHAT_MODE" ;;
+    *) ;;
+  esac
+}
+
+# A chat flag this run typed, noted for check_flags_against_install_env. Its
+# value is read from the PARAM_* at check time, so a flag given twice is checked
+# at the value that won.
+note_install_env_flag() {
+  local key="$1" flag="$2" kind="$3" param="$4" default_var="${5:-}"
+  case $'\n'"$INSTALL_ENV_FLAGS_TYPED" in
+    *$'\n'"${key}|"*) return 0 ;;
+  esac
+  INSTALL_ENV_FLAGS_TYPED="${INSTALL_ENV_FLAGS_TYPED}${key}|${flag}|${kind}|${param}|${default_var}"$'\n'
+}
+
+# One flag against the key an existing install.env records. Returns 1, having
+# said why, when the two disagree; queues the key for
+# record_flags_into_install_env when the file does not assign it. A key with a
+# default that the file sets empty resolves to the default, as
+# write_tfvars_from_state reads it, so that is the value compared; the chat
+# strings pass no default, because for them empty is the value rendered.
+# Needs installer_common.sh sourced.
+check_flag_against_install_env() {
+  local file="$1" key="$2" flag="$3" kind="$4" value="$5" default="${6:-}"
+  [ -n "$file" ] && [ -f "$file" ] || return 0
+  if ! install_env_records_key "$file" "$key"; then
+    [ "$kind" != "$INSTALL_ENV_FLAG_KIND_CREDENTIAL" ] || return 0
+    case " ${INSTALL_ENV_KEYS_TO_RECORD} " in
+      *" ${key} "*) ;;
+      *) INSTALL_ENV_KEYS_TO_RECORD="${INSTALL_ENV_KEYS_TO_RECORD}${INSTALL_ENV_KEYS_TO_RECORD:+ }${key}" ;;
+    esac
+    if [ "${PARAM_DRY_RUN:-false}" = "true" ]; then
+      print_info "${file} assigns no ${key}; a run without --dry-run records the ${key} it applies there, from ${flag}."
+      local companions
+      companions="$(install_env_toggle_companions "$key")"
+      if [ -n "$companions" ]; then
+        print_info "If that is true, it also records the ${companions// /, } it applies, where ${file} assigns none."
+      fi
+    fi
+    return 0
+  fi
+  local recorded recorded_shown
+  recorded="$(recorded_install_env_value "$file" "$key")"
+  recorded_shown="${key}=$(printf '%q' "$recorded")"
+  if [ -z "$recorded" ] && [ -n "$default" ]; then
+    recorded="$default"
+    recorded_shown="${key} empty, which is ${default}"
+  fi
+  case "$kind" in
+    "$INSTALL_ENV_FLAG_KIND_BOOL")
+      if is_truthy "$recorded"; then
+        if is_truthy "$value"; then return 0; fi
+      else
+        if ! is_truthy "$value"; then return 0; fi
+      fi
+      ;;
+    "$INSTALL_ENV_FLAG_KIND_CREDENTIAL")
+      # Empty is not a value, recorded or typed: the generator recovers an
+      # empty credential from the live Secret, as it does a missing one. A
+      # typed empty is a wrapper's unset variable (provision_environment.sh
+      # passes --slack-bot-token="${SLACK_BOT_TOKEN:-}"), not a new token.
+      [ -n "$recorded" ] || return 0
+      [ -n "$value" ] || return 0
+      [ "$recorded" != "$value" ] || return 0
+      print_error "${flag} gives a different ${key} from the one ${file} records, so it would hold for this run only."
+      print_info "The next install.sh run without the flag, and every upgrade.sh, renders the ${key} the file records."
+      print_info "Replace ${key} in ${file} with the new value and re-run without ${flag}."
+      return 1
+      ;;
+    "$INSTALL_ENV_FLAG_KIND_LIST")
+      [ "$(hcl_csv_list "$recorded")" != "$(hcl_csv_list "$value")" ] || return 0
+      ;;
+    *)
+      [ "$recorded" != "$value" ] || return 0
+      ;;
+  esac
+  print_error "${flag}=$(printf '%q' "$value") disagrees with the install configuration, so it would hold for this run only: ${file} records ${recorded_shown}."
+  print_info "The next install.sh run without the flag, and every upgrade.sh, renders from the file and goes back to it. install.sh records a chat flag only where install.env assigns no such key; it does not change a key the file assigns."
+  local remedy
+  remedy="Set ${key}=$(printf '%q' "$value") in ${file}"
+  case " ${INSTALL_ENV_KEYS_THE_MENU_SAVES} " in
+    *" ${key} "*) remedy="${remedy}, or change it with './install.sh --menu'" ;;
+  esac
+  remedy="${remedy}, and re-run without ${flag}"
+  if [ "$key" = "SLACK_ENABLED" ] && is_truthy "$value"; then
+    remedy="${remedy}, passing --slack-bot-token and --slack-app-token (or answering their prompts on an interactive run)"
+  fi
+  print_info "${remedy}."
+  return 1
+}
+
+# Every chat flag this run typed, against an existing install.env. Each
+# disagreement is named before the run stops, so one run lists them all.
+check_flags_against_install_env() {
+  local file="${INSTALL_ENV_FILE:-}" entry key flag kind param default_var default refused="false"
+  [ -n "$INSTALL_ENV_FLAGS_TYPED" ] && [ -n "$file" ] && [ -f "$file" ] || return 0
+  # Read into arrays before anything evaluates the file, which a here-string
+  # still open on stdin would hand to any line of it that reads input.
+  local entries=() keys=()
+  while IFS= read -r entry; do
+    if [ -n "$entry" ]; then
+      entries+=("$entry")
+      keys+=("${entry%%|*}")
+    fi
+  done <<< "$INSTALL_ENV_FLAGS_TYPED"
+  # One evaluation of the file for every key, in this shell, so the reads
+  # below land on the cache.
+  read_recorded_install_env_values "$file" "${keys[@]}"
+  for entry in "${entries[@]}"; do
+    IFS='|' read -r key flag kind param default_var <<< "$entry"
+    default=""
+    [ -z "$default_var" ] || default="${!default_var-}"
+    check_flag_against_install_env "$file" "$key" "$flag" "$kind" "${!param-}" "$default" || refused="true"
+  done
+  # A key to record into a file this run cannot write would fail at the record,
+  # which sits after the existing-cluster changes; say so now instead.
+  if [ -n "$INSTALL_ENV_KEYS_TO_RECORD" ] && [ "${PARAM_DRY_RUN:-false}" != "true" ] && [ ! -w "$file" ]; then
+    print_error "${file} assigns no ${INSTALL_ENV_KEYS_TO_RECORD// /, }, which this run would record there, and it is not writable."
+    print_info "Make it writable, or add the keys to it yourself, and re-run."
+    refused="true"
+  fi
+  [ "$refused" = "false" ]
+}
+
+# The keys check_flags_against_install_env found install.env not to assign,
+# appended with the value this run applies: the exported KEY that
+# write_tfvars_from_state rendered, which on an interactive run is the
+# interview's answer and not necessarily the flag. The one write install.sh
+# makes to an install.env it did not create, and only of keys the file lacks,
+# so nothing the operator wrote changes. main calls it on each route as the last
+# step before the handoff or the apply, past the confirmation and every step
+# that can stop the run, so a run refused, declined or failed before the apply,
+# and a --dry-run, leave the file as it was. An apply that then fails has
+# recorded what it was applying, which is what the next run should retry.
+#
+# Answering `n` at the step-11 confirmation records nothing. The pause message
+# names a lifecycle.sh apply, but `n` is also the answer of an operator who saw
+# something wrong in the summary and walked away, and a file that then records
+# the integration on would have the next upgrade.sh provision what they
+# declined. warn_install_env_keys_not_recorded names the lines instead.
+#
+# A toggle recorded true brings the settings of its integration that the file
+# also lacks (install_env_toggle_companions), with the values this run applied
+# to them. Without them the next upgrade.sh would render the integration on
+# with an empty allowlist, which admits everyone, and with no home channel,
+# when this run applied an allowlist the operator gave at the prompt or as an
+# export. The file install.sh writes on a first install records the toggle and
+# these keys together, and the Day-2 menu saves the Google Chat toggle with its
+# allowlist, topic and home channel; the tokens are still never written.
+record_flags_into_install_env() {
+  local file="${INSTALL_ENV_FILE:-}" key value
+  [ -n "$INSTALL_ENV_KEYS_TO_RECORD" ] && [ -n "$file" ] && [ -f "$file" ] || return 0
+  resolve_install_env_record_keys "$file"
+  # A last line with no newline would run into the appended assignment.
+  if [ -s "$file" ] && [ -n "$(tail -c 1 "$file")" ]; then
+    printf '\n' >> "$file"
+  fi
+  for key in $INSTALL_ENV_RECORD_KEYS; do
+    value="${!key-}"
+    write_env_var "$file" "$key" "$value"
+    print_info "Recorded ${key}=$(printf '%q' "$value") in ${file}, which assigned no ${key}, so later runs and upgrade.sh render it."
+  done
+  INSTALL_ENV_KEYS_TO_RECORD=""
+  # The cache read_recorded_install_env_values keeps is keyed by path, and the
+  # file just changed under it.
+  RECORDED_INSTALL_ENV_FILE=""
+}
+
+# The step-11 `n`: what record_flags_into_install_env would have appended, as
+# the lines to append, so an operator who does go on to apply the tfvars by
+# hand can make the file match first. Never a token: those are never queued.
+warn_install_env_keys_not_recorded() {
+  local file="${INSTALL_ENV_FILE:-}" key
+  [ -n "$INSTALL_ENV_KEYS_TO_RECORD" ] && [ -n "$file" ] && [ -f "$file" ] || return 0
+  resolve_install_env_record_keys "$file"
+  print_warning "${file} assigns no ${INSTALL_ENV_RECORD_KEYS// /, }, and pausing here did not record them: a run abandoned at this prompt leaves the file as it was."
+  print_info "If you go on to run lifecycle.sh apply by hand, first add these lines to ${file}, so a later upgrade.sh renders what you applied:"
+  for key in $INSTALL_ENV_RECORD_KEYS; do
+    printf '    %s=%q\n' "$key" "${!key-}"
+  done
+}
+
+# The keys record_flags_into_install_env appends, in INSTALL_ENV_RECORD_KEYS:
+# the queued ones, each toggle queued true followed by the companions the file
+# lacks, and the toggles last. Computed in full before the first write, while
+# the file still reads as the run found it. The toggles go last: a write that
+# stops partway (Ctrl-C before the apply, a full disk) then leaves settings
+# with the integration off, never the integration on with no allowlist, which
+# admits everyone and which no re-run repairs, since the flag then agrees with
+# the file.
+resolve_install_env_record_keys() {
+  local file="$1" key companion record_keys="" toggles=""
+  # Every companion in one read of the file rather than one per key.
+  # shellcheck disable=SC2046
+  read_recorded_install_env_values "$file" $(install_env_toggle_companions SLACK_ENABLED) $(install_env_toggle_companions GOOGLE_CHAT_ENABLED)
+  for key in $INSTALL_ENV_KEYS_TO_RECORD; do
+    if [ -z "$(install_env_toggle_companions "$key")" ]; then
+      record_keys="${record_keys}${record_keys:+ }${key}"
+      continue
+    fi
+    toggles="${toggles}${toggles:+ }${key}"
+    is_truthy "${!key-}" || continue
+    for companion in $(install_env_toggle_companions "$key"); do
+      case " ${record_keys} ${INSTALL_ENV_KEYS_TO_RECORD} " in
+        *" ${companion} "*) continue ;;
+      esac
+      if ! install_env_records_key "$file" "$companion"; then
+        record_keys="${record_keys}${record_keys:+ }${companion}"
+      fi
+    done
+  done
+  INSTALL_ENV_RECORD_KEYS="${record_keys}${record_keys:+${toggles:+ }}${toggles}"
+}
+
 bootstrap_install_env_file() {
   local destination="${1:-}" image_tag="${2:-}"
   [ -n "$destination" ] || return 0
   if [ -f "$destination" ]; then
-    print_info "Left your install configuration as you wrote it: ${destination}"
+    print_info "Kept your install configuration: ${destination}"
+    # The chat flags check_flags_against_install_env queued: written only once
+    # this run goes on to the apply or the handoff (record_flags_into_install_env).
+    if [ -n "$INSTALL_ENV_KEYS_TO_RECORD" ] && [ "${PARAM_DRY_RUN:-false}" != "true" ]; then
+      print_info "${destination} assigns no ${INSTALL_ENV_KEYS_TO_RECORD// /, }: the values this run applies to them are recorded there if it goes on to the apply or the handoff."
+    fi
     warn_unrecorded_interview_answers "$destination"
     note_unrecorded_network_policy_acceptance "$destination"
     # The flags that override a recorded value for one run. This function
-    # never rewrites an existing file, so only a first install can record any of
-    # them on the operator's behalf.
+    # never rewrites an existing file (record_gitops_forge_keys, after the
+    # apply is chosen, is the one writer of an existing file), so only a
+    # first install can record any of them on the operator's behalf.
     warn_flag_beats_unrecorded_file_value "$destination" NAMESPACE --agent-namespace \
       "${PARAM_AGENT_NAMESPACE:-}" \
       "A later run without it resolves the default namespace, renders tfvars for that one, looks for the recovered Secret there, and is refused by lifecycle.sh's guard_release_namespace." \
@@ -2066,7 +2500,7 @@ bootstrap_install_env_file() {
   local tmp="${destination}.tmp"
   {
     printf '%s\n' "# kube-agents install configuration, created by install.sh on $(date -u +%Y-%m-%dT%H:%M:%SZ)."
-    printf '%s\n' "# This file is yours now: install.sh reads it and never rewrites it."
+    printf '%s\n' "# This file is yours now: install.sh reads it and never changes a line of it, except the GitOps forge keys when an applied run changes them."
     printf '%s\n' "# Edit it and re-run the installer to change the install."
     printf '%s\n' "# See install.env.example for every supported key and what it does."
     printf '%s\n' "#"
@@ -2125,6 +2559,13 @@ bootstrap_install_env_file() {
   write_env_var "$tmp" GITOPS_ORG "${GITOPS_ORG:-}"
   write_env_var "$tmp" GITOPS_REPO "${GITOPS_REPO:-}"
   write_env_var "$tmp" GITHUB_APP_ID "${GITHUB_APP_ID:-}"
+  # The forge, host and Secret NAME only. The token, and the path of the file
+  # it came from, are never recorded: a re-run asks again or keeps the Secret.
+  if [ "${GITOPS_FORGE:-github}" = "gitlab" ]; then
+    write_env_var "$tmp" GITOPS_FORGE "gitlab"
+    write_env_var "$tmp" GITOPS_HOST "${GITOPS_HOST:-}"
+    write_env_var "$tmp" GITLAB_TOKEN_SECRET "${GITLAB_TOKEN_SECRET:-}"
+  fi
   write_env_var "$tmp" KMS_KEYRING "${KMS_KEYRING:-}"
   write_env_var "$tmp" KMS_KEY "${KMS_KEY:-}"
   write_env_var "$tmp" MEMORY "$PARAM_MEMORY"
@@ -2480,7 +2921,20 @@ resolve_shared_defaults() {
   PARAM_GOOGLE_CHAT_MODE="${PARAM_GOOGLE_CHAT_MODE:-$DEFAULT_GOOGLE_CHAT_MODE}"
   PARAM_CHAT_TOPIC_NAME="${PARAM_CHAT_TOPIC_NAME:-$DEFAULT_CHAT_TOPIC_NAME}"
   PARAM_CHAT_SUB_NAME="${PARAM_CHAT_SUB_NAME:-}"
-  PARAM_GITOPS_REPO="${PARAM_GITOPS_REPO:-$DEFAULT_GITOPS_REPO}"
+  # Whether the forge is already settled -- by a flag, install.env, or an
+  # install.env that records a GitHub org or App -- so the interview asks only
+  # when nothing has said. A re-run of a GitHub install sees no new question.
+  PARAM_GITOPS_FORGE_GIVEN="false"
+  if [ -n "${PARAM_GITOPS_FORGE:-}" ] || [ -n "${PARAM_GITOPS_ORG:-}" ] || [ -n "${PARAM_GITHUB_APP_ID:-}" ]; then
+    PARAM_GITOPS_FORGE_GIVEN="true"
+  fi
+  PARAM_GITOPS_FORGE="${PARAM_GITOPS_FORGE:-$DEFAULT_GITOPS_FORGE}"
+  PARAM_GITLAB_TOKEN_SECRET="${PARAM_GITLAB_TOKEN_SECRET:-$DEFAULT_GITLAB_TOKEN_SECRET}"
+  # DEFAULT_GITOPS_REPO is a GitHub repository name; a GitLab project has no
+  # default path, so the validator asks for one instead of inventing it.
+  if [ "$PARAM_GITOPS_FORGE" != "gitlab" ]; then
+    PARAM_GITOPS_REPO="${PARAM_GITOPS_REPO:-$DEFAULT_GITOPS_REPO}"
+  fi
   PARAM_KMS_KEYRING="${PARAM_KMS_KEYRING:-$DEFAULT_KMS_KEYRING}"
   PARAM_KMS_KEY="${PARAM_KMS_KEY:-$DEFAULT_KMS_KEY}"
   PARAM_ENABLE_PUBSUB_PLATFORM="${PARAM_ENABLE_PUBSUB_PLATFORM:-$DEFAULT_ENABLE_PUBSUB_PLATFORM}"
@@ -2977,7 +3431,9 @@ write_json_report() {
   timestamp=$(date -u +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || echo "2026-08-05T00:00:00Z")
 
   local report_gitops_repo=""
-  if [ -n "${github_org:-}" ] && [ -n "${github_repo:-}" ]; then
+  if [ "${GITOPS_FORGE:-github}" = "gitlab" ] && [ -n "${GITOPS_REPO:-}" ]; then
+    report_gitops_repo="$(gitlab_repo_url)"
+  elif [ -n "${github_org:-}" ] && [ -n "${github_repo:-}" ]; then
     report_gitops_repo="https://github.com/${github_org}/${github_repo}"
   fi
 
@@ -3854,6 +4310,248 @@ validate_existing_cluster_opt_in_flags() {
   fi
 }
 
+# ─── GitLab as the GitOps forge ───────────────────────────────────────────────
+# The repository is a GitLab project path, the credential an access token the
+# operator mounts into the credential broker from a Kubernetes Secret. The
+# installer creates that Secret after the apply, from a prompt or a file, and
+# never holds the token anywhere it persists: not install.env, not the tfvars,
+# not the Terraform state, not argv, not an exported variable.
+
+# The bare-hostname rule the operator and the broker apply to a forge host.
+GITLAB_HOST_RE='^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$'
+
+# GITOPS_REPO as the project's path: a URL on the forge's host, or a path,
+# with a trailing .git or / dropped. Prints nothing for anything else. The
+# segment grammar is the operator's (k8s-operator/api/v1alpha1/gitprovider.go):
+# a letter, digit or underscore first, no dot last, and no .git or .atom
+# ending, which GitLab reserves.
+gitlab_repo_path() {
+  local repo="$1" host="${2:-gitlab.com}"
+  # Whitespace, a newline included, is in no segment the grammar admits; the
+  # split below reads one line, so it is refused here, whole.
+  [[ "$repo" =~ [[:space:]] ]] && return 0
+  repo="${repo%/}"
+  repo="${repo%.git}"
+  case "$repo" in
+    https://"$host"/*) repo="${repo#https://"$host"/}" ;;
+    http://*|https://*|*://*|*@*:*) return 0 ;;
+  esac
+  local seg lower n=0 segs=()
+  IFS=/ read -r -a segs <<<"$repo"
+  [[ "$repo" == */ ]] && return 0
+  for seg in "${segs[@]}"; do
+    # The reserved endings in any case, as the operator compares them.
+    lower="$(printf '%s' "$seg" | tr '[:upper:]' '[:lower:]')"
+    if ! [[ "$seg" =~ ^[A-Za-z0-9_]([A-Za-z0-9_.-]*[A-Za-z0-9_-])?$ ]] || [[ "$lower" == *.git ]] || [[ "$lower" == *.atom ]]; then
+      return 0
+    fi
+    n=$((n + 1))
+  done
+  [ "$n" -ge 2 ] && printf '%s' "$repo"
+}
+
+# Whether a path's first segment is a forge host rather than a group: GitLab's
+# group grammar admits a dot, so `gitlab.com/acme/infra` would otherwise read
+# as a group named gitlab.com. The broker lifts such a segment off as a host and
+# refuses it, so the operator refuses it too; the installer says so first.
+gitlab_path_starts_with_host() {
+  local first="${1%%/*}" host="${2:-gitlab.com}"
+  first="$(printf '%s' "$first" | tr '[:upper:]' '[:lower:]')"
+  case "$first" in
+    gitlab.com|www.gitlab.com|github.com|www.github.com|ssh.github.com|"$host") return 0 ;;
+  esac
+  return 1
+}
+
+# The broker reads no repository reference longer than this
+# (gitprovider.go's BrokerMaxRepoRefLength).
+GITLAB_MAX_REPO_URL_LENGTH=256
+
+gitlab_repo_url() {
+  printf 'https://%s/%s' "${GITOPS_HOST:-gitlab.com}" "${GITOPS_REPO:-}"
+}
+
+# Checks the GitLab inputs, and that a GitHub install was given none of them.
+validate_gitops_forge_flags() {
+  case "${PARAM_GITOPS_FORGE:-github}" in
+    github|gitlab) ;;
+    *)
+      print_error "--gitops-forge must be github or gitlab (got '${PARAM_GITOPS_FORGE}')."
+      return 1
+      ;;
+  esac
+  if [ "${PARAM_GITOPS_FORGE:-github}" != "gitlab" ]; then
+    # A host install.env recorded for a GitLab install is that install's, not
+    # this run's: a switch back to GitHub drops it.
+    if [ -n "${PARAM_GITOPS_HOST:-}" ] && [ "${PARAM_GITOPS_HOST_FROM_FLAG:-false}" != "true" ]; then
+      print_info "Dropping the recorded GitLab host '${PARAM_GITOPS_HOST}': this run's GitOps forge is GitHub."
+      PARAM_GITOPS_HOST=""
+    fi
+    if [ -n "${PARAM_GITOPS_HOST:-}" ] || [ -n "${PARAM_GITLAB_TOKEN_FILE:-}" ]; then
+      print_error "--gitops-host and --gitlab-token-file apply only with --gitops-forge=gitlab."
+      return 1
+    fi
+    return 0
+  fi
+  if [ -n "${PARAM_GITOPS_HOST:-}" ]; then
+    if ! [[ "$PARAM_GITOPS_HOST" =~ $GITLAB_HOST_RE ]]; then
+      print_error "--gitops-host must be a bare lowercase hostname, with no scheme, path or port (got '${PARAM_GITOPS_HOST}')."
+      return 1
+    fi
+    case "$PARAM_GITOPS_HOST" in
+      github.com|*.github.com|githubusercontent.com|*.githubusercontent.com)
+        print_error "'${PARAM_GITOPS_HOST}' is a GitHub host, not a GitLab one."
+        return 1
+        ;;
+    esac
+  fi
+  if [ -n "${PARAM_GITHUB_APP_ID:-}" ] || [ -n "${PARAM_GITHUB_PEM_PATH:-}" ]; then
+    if [ "${PARAM_GITHUB_APP_FROM_FLAG:-false}" = "true" ]; then
+      print_error "--github-app-id and --github-pem-path configure the GitHub token minter, which a GitLab install does not have."
+      return 1
+    fi
+    # Recorded by a GitHub install this run switches to GitLab: the minter
+    # goes with the forge, and install.env stops recording it once the
+    # switch is applied.
+    print_info "Dropping the recorded GitHub App (GITHUB_APP_ID, GITHUB_PEM_PATH): a GitLab install has no token minter."
+    PARAM_GITHUB_APP_ID=""
+    PARAM_GITHUB_PEM_PATH=""
+  fi
+  if [ -n "${PARAM_GITOPS_REPO:-}" ]; then
+    local path
+    path="$(gitlab_repo_path "$PARAM_GITOPS_REPO" "${PARAM_GITOPS_HOST:-gitlab.com}")"
+    if [ -n "$path" ] && gitlab_path_starts_with_host "$path" "${PARAM_GITOPS_HOST:-gitlab.com}"; then
+      print_error "--gitops-repo '${PARAM_GITOPS_REPO}' starts with a host. Give the project path alone (group/project), and the host with --gitops-host."
+      return 1
+    fi
+    local url="https://${PARAM_GITOPS_HOST:-gitlab.com}/${path}"
+    if [ -n "$path" ] && [ "${#url}" -gt "$GITLAB_MAX_REPO_URL_LENGTH" ]; then
+      print_error "The GitOps project's URL is ${#url} characters; the credential broker reads at most ${GITLAB_MAX_REPO_URL_LENGTH}."
+      return 1
+    fi
+    if [ -z "$path" ]; then
+      print_error "--gitops-repo must be the GitLab project's full path, group/project or group/subgroup/project, or its https URL on ${PARAM_GITOPS_HOST:-gitlab.com} (got '${PARAM_GITOPS_REPO}')."
+      return 1
+    fi
+    PARAM_GITOPS_REPO="$path"
+  elif [ "$PARAM_NON_INTERACTIVE" = "true" ]; then
+    print_error "A GitLab install needs --gitops-repo: the project's full path (group/project)."
+    return 1
+  fi
+  PARAM_GITLAB_TOKEN_SECRET="${PARAM_GITLAB_TOKEN_SECRET:-${DEFAULT_GITLAB_TOKEN_SECRET:-gitlab-forge-token}}"
+  if ! [[ "${PARAM_GITLAB_TOKEN_SECRET:-}" =~ ^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$ ]]; then
+    print_error "--gitlab-token-secret must be a valid Kubernetes Secret name (got '${PARAM_GITLAB_TOKEN_SECRET:-}')."
+    return 1
+  fi
+  if [ -n "${PARAM_GITLAB_TOKEN_FILE:-}" ]; then
+    # Any readable source, not only a regular file: /dev/stdin and a process
+    # substitution (<(pass show ...)) keep the token off the disk altogether.
+    # Expanded here because this runs before installer_common.sh is sourced.
+    case "$PARAM_GITLAB_TOKEN_FILE" in
+      \~/*) PARAM_GITLAB_TOKEN_FILE="${HOME}/${PARAM_GITLAB_TOKEN_FILE#\~/}" ;;
+    esac
+    if [ ! -r "$PARAM_GITLAB_TOKEN_FILE" ] || [ -d "$PARAM_GITLAB_TOKEN_FILE" ]; then
+      print_error "--gitlab-token-file '${PARAM_GITLAB_TOKEN_FILE}' is not readable."
+      return 1
+    fi
+  fi
+  return 0
+}
+
+# Writes the token on stdin into Secret NAME, key `token`. Server-side apply,
+# because a client-side apply copies the whole object, token included, into
+# the kubectl.kubernetes.io/last-applied-configuration annotation, where
+# anyone who can read the Secret's metadata reads it again. Both kubectl
+# processes have their stderr discarded: a failed request echoes the object it
+# was sent, and that object carries the token. A failure prints a fixed
+# message and kubectl's exit codes, never kubectl's text.
+apply_gitlab_token_secret() {
+  local name="$1" namespace="$2" context="$3"
+  kubectl create secret generic "$name" -n "$namespace" --context "$context" \
+    --from-file=token=/dev/stdin --dry-run=client -o yaml 2>/dev/null |
+    kubectl apply --server-side --force-conflicts --field-manager=kube-agents-installer \
+      -n "$namespace" --context "$context" -f - >/dev/null 2>&1
+  local rcs=("${PIPESTATUS[@]}")
+  if [ "${rcs[0]}" -ne 0 ] || [ "${rcs[1]}" -ne 0 ]; then
+    print_error "Could not write the GitLab token Secret '${name}' in namespace ${namespace} (kubectl exit codes: create ${rcs[0]}, apply ${rcs[1]}). kubectl's output is withheld because it can carry the token."
+    return 1
+  fi
+}
+
+# A token as GitLab issues it is one line; a file or a paste often carries a
+# trailing newline, a CR, or spaces around it. All whitespace goes.
+gitlab_token_strip() {
+  local t="$1"
+  t="${t//[[:space:]]/}"
+  printf '%s' "$t"
+}
+
+# Creates (or replaces) the Secret the GitLab forge's credentialsRef names, in
+# the agent's namespace, after the apply has made the namespace. The token
+# reaches kubectl through a pipe -- read from the named source, or from a
+# no-echo prompt, into a local that is cleared at once -- so it is never in
+# argv, an exported variable, a file this installer writes, or its output. The
+# broker reads the token on every call, so a Secret created after the agent
+# started needs no restart.
+create_gitlab_token_secret() {
+  local namespace="$1" context="$2"
+  local name="${GITLAB_TOKEN_SECRET:-${DEFAULT_GITLAB_TOKEN_SECRET:-gitlab-forge-token}}"
+  local exists="false" token="" rc=0
+  if kubectl get secret "$name" -n "$namespace" --context "$context" >/dev/null 2>&1; then
+    exists="true"
+  fi
+  if [ -n "${PARAM_GITLAB_TOKEN_FILE:-}" ]; then
+    # read, a builtin: the token never passes through another process's argv.
+    # -d '' reads to end of input; its status at EOF is 1, which is expected.
+    IFS= read -r -d '' token <"$PARAM_GITLAB_TOKEN_FILE" || true
+    token="$(gitlab_token_strip "$token")"
+    if [ -z "$token" ]; then
+      print_error "The GitLab token source '${PARAM_GITLAB_TOKEN_FILE}' is empty; nothing was stored."
+      return 1
+    fi
+    printf '%s' "$token" | apply_gitlab_token_secret "$name" "$namespace" "$context" || rc=$?
+    token=""
+    unset token
+    [ "$rc" -eq 0 ] || return 1
+    print_success "GitLab token stored in Secret '${name}' (namespace ${namespace})."
+    return 0
+  fi
+  if [ "$PARAM_NON_INTERACTIVE" = "true" ] || ! has_controlling_tty; then
+    if [ "$exists" = "true" ]; then
+      print_info "Keeping the existing GitLab token Secret '${name}'."
+    else
+      print_warning "No GitLab token was given (--gitlab-token-file), so the agent cannot reach GitLab yet."
+      print_info "Create the Secret yourself; the agent picks it up with no restart:"
+      print_info "  kubectl create secret generic ${name} -n ${namespace} --context ${context} --from-file=token=<path-to-token-file> --dry-run=client -o yaml | kubectl apply --server-side -f -"
+    fi
+    return 0
+  fi
+  if [ "$exists" = "true" ]; then
+    local replace_choice="1"
+    prompt_menu "A GitLab token Secret '${name}' already exists." \
+      "Keep it" \
+      "Replace it with a new token" \
+      replace_choice
+    if [ "$replace_choice" = "1" ]; then
+      print_info "Keeping the existing GitLab token Secret '${name}'."
+      return 0
+    fi
+  fi
+  print_info "Paste the GitLab access token (scopes: api, write_repository). It is not echoed and not saved anywhere but the Secret."
+  read -r -s token </dev/tty || true
+  echo "" >/dev/tty
+  token="$(gitlab_token_strip "$token")"
+  if [ -z "$token" ]; then
+    print_warning "No token entered; nothing was stored. Create Secret '${name}' later (see the install guide)."
+    return 0
+  fi
+  printf '%s' "$token" | apply_gitlab_token_secret "$name" "$namespace" "$context" || rc=$?
+  token=""
+  unset token
+  [ "$rc" -eq 0 ] || return 1
+  print_success "GitLab token stored in Secret '${name}' (namespace ${namespace})."
+}
+
 # Validates that non-interactive minter configuration has either an ENABLED KMS key
 # (Path 2: AOT) or a valid PEM file path (Path 1: automated import) whenever there
 # is an explicit intention to configure the token minter.
@@ -4385,6 +5083,14 @@ run_menu_system() {
         esac
         ;;
       5)
+        if [ "${GITOPS_FORGE:-github}" = "gitlab" ]; then
+          # This panel edits the GitHub coordinates only. Saving them on a
+          # GitLab install would leave GITOPS_REPO a GitHub name.
+          print_info "This install's GitOps repository is on GitLab: $(gitlab_repo_url)."
+          print_info "Re-run ./install.sh to change it, or replace the token with:"
+          print_info "  kubectl create secret generic ${GITLAB_TOKEN_SECRET:-${DEFAULT_GITLAB_TOKEN_SECRET}} -n ${NAMESPACE:-$DEFAULT_NAMESPACE} --from-file=token=<path-to-token-file> --dry-run=client -o yaml | kubectl apply --server-side --force-conflicts -f -"
+          continue
+        fi
         # An organization, never a login: the minter resolves App installations
         # at /orgs/{org}/installation, so a personal account deploys cleanly and
         # then 404s every token request. The fresh-install interview settles
@@ -4551,6 +5257,13 @@ main() {
       print_info "Set SCOPE_PROJECTS, SCOPE_FOLDERS, SCOPE_ORGANIZATIONS, SCOPE_SHARED_VPC_HOSTS, SCOPE_METRICS_SCOPES, SCOPE_MAX_PROJECTS, SCOPE_EXCLUDE_PROJECTS, SCOPE_EXCLUDE_CLUSTERS, SCOPED_SA_POOL_ENABLED or SCOPED_SA_POOL_MAX_ACCOUNTS in install.env, or pass the flag to a plain install.sh run."
       exit 1
     fi
+    # The chat flags likewise: the menu applies the keys install.env records
+    # and edits them on its own screens, so a flag here would be dropped.
+    if [ -n "$INSTALL_ENV_FLAGS_TYPED" ]; then
+      print_error "--menu takes no chat flag (--enable-slack, --enable-google-chat, --slack-*, --google-chat-allowed-users, --google-chat-home-channel, --google-chat-mode, --chat-topic-name): it applies the chat keys install.env records."
+      print_info "The menu's chat screen turns Google Chat on or off and edits its allowlist and home channel; set the other keys in install.env (to turn Slack on, SLACK_ENABLED=true, with the tokens on a plain install.sh run), or pass the flags to a plain install.sh run."
+      exit 1
+    fi
     run_menu_system
     exit 0
   fi
@@ -4611,6 +5324,11 @@ main() {
     fi
   fi
 
+  # The GitOps forge's inputs need nothing but themselves, so they are judged
+  # before any work: a GitLab install handed a GitHub App, a bad host or an
+  # unreadable token source stops here, not after the cluster is built.
+  validate_gitops_forge_flags || exit 1
+
   # 2. Prerequisite CLI Tools Check & Auto-Installation
   print_step "1. Checking Prerequisites & Installing Missing Tools"
   # terraform is the install engine (terraform/examples/full-install through
@@ -4635,6 +5353,10 @@ main() {
   acquire_source_repo repo_dir "$image_tag"
   source_provisioning_helpers "$repo_dir"
   resolve_shared_defaults
+  # The chat flags against an existing install.env, as soon as is_truthy and
+  # the defaults are loaded: a flag that disagrees with the file stops the run
+  # here, before the interview and long before anything is applied.
+  check_flags_against_install_env || exit 1
 
   # 3. Google Cloud Authentication Check
   print_step "3. Verifying Google Cloud Authentication"
@@ -5046,7 +5768,16 @@ main() {
     echo -e "  ${C_CYAN}-p ${PLATFORM_AGENT_HERMES_PROFILE} reaches the Platform Agent directly, bypassing the Planning${C_RESET}"
     echo -e "  ${C_CYAN}Agent front door where a chat message would have landed.${C_RESET}"
     echo ""
-    echo -e "  To add a chat platform later, re-run ${C_BOLD}./install.sh --enable-google-chat${C_RESET} or ${C_BOLD}./install.sh --enable-slack${C_RESET}."
+    # The file this install writes records both toggles as false, and a
+    # --enable-google-chat or --enable-slack that disagrees with it is refused
+    # (check_flag_against_install_env), so the key is the way to turn one on.
+    # It records both allowlists empty too, and install.sh does not change a
+    # key the file assigns, so the allowlist is set in the file beside the
+    # toggle.
+    echo -e "  To add a chat platform later, edit install.env and re-run ${C_BOLD}./install.sh${C_RESET}:"
+    echo -e "    Google Chat: ${C_BOLD}GOOGLE_CHAT_ENABLED=true${C_RESET} and ${C_BOLD}ALLOWED_USERS=${C_RESET}<emails> (or use ${C_BOLD}./install.sh --menu${C_RESET})"
+    echo -e "    Slack: ${C_BOLD}SLACK_ENABLED=true${C_RESET} and ${C_BOLD}SLACK_ALLOWED_USERS=${C_RESET}<user IDs>, re-run with --slack-bot-token and --slack-app-token"
+    echo -e "  An allowlist left empty admits every user. --enable-google-chat and --enable-slack are refused over a file that records the key the other way."
   }
 
   case "$chat_choice" in
@@ -5258,7 +5989,57 @@ main() {
   local kms_key="$PARAM_KMS_KEY"
   local github_pem_path="$PARAM_GITHUB_PEM_PATH"
 
-  if [ "$PARAM_NON_INTERACTIVE" != "true" ]; then
+  # The forge comes first: a GitLab repository has no GitHub organization, App
+  # or token minter, so the GitHub interview below does not apply to it.
+  if [ "$PARAM_NON_INTERACTIVE" != "true" ] && [ "${PARAM_GITOPS_FORGE_GIVEN:-false}" != "true" ]; then
+    local forge_choice="1"
+    [ "$PARAM_GITOPS_FORGE" = "gitlab" ] && forge_choice="2"
+    prompt_menu "Where does the GitOps repository live?" \
+      "GitHub" \
+      "GitLab (gitlab.com or self-managed)" \
+      forge_choice
+    if [ "$forge_choice" = "2" ]; then
+      PARAM_GITOPS_FORGE="gitlab"
+    else
+      PARAM_GITOPS_FORGE="github"
+      PARAM_GITOPS_HOST=""
+    fi
+  fi
+
+  if [ "$PARAM_GITOPS_FORGE" = "gitlab" ]; then
+    # No GitHub org and no minter: write_tfvars_from_state renders neither for
+    # GitLab, and the CR names the forge and its token Secret instead.
+    github_org=""
+    github_app_id=""
+    github_pem_path=""
+    PARAM_GITHUB_APP_ID=""
+    PARAM_GITHUB_PEM_PATH=""
+    if [ "$PARAM_NON_INTERACTIVE" != "true" ]; then
+      # A single name is the GitHub default (or a GitHub repository) the
+      # forge question was asked over; a GitLab project has no default path.
+      [[ "$github_repo" == */* ]] || github_repo=""
+      while true; do
+        prompt_read "GitLab host (gitlab.com, or your self-managed instance's hostname)" PARAM_GITOPS_HOST "${PARAM_GITOPS_HOST:-gitlab.com}"
+        [ "$PARAM_GITOPS_HOST" = "gitlab.com" ] && PARAM_GITOPS_HOST=""
+        prompt_read "GitLab project path (group/project or group/subgroup/project)" github_repo "${github_repo}"
+        prompt_read "Kubernetes Secret to hold the GitLab token" PARAM_GITLAB_TOKEN_SECRET "${PARAM_GITLAB_TOKEN_SECRET}"
+        PARAM_GITOPS_REPO="$github_repo"
+        if [ -n "$github_repo" ] && validate_gitops_forge_flags; then
+          github_repo="$PARAM_GITOPS_REPO"
+          break
+        fi
+        [ -z "$github_repo" ] && print_error "A GitLab install needs the project's full path."
+        # With no terminal every answer is the same default, so asking again
+        # would spin.
+        has_controlling_tty || exit 1
+      done
+      print_info "The token is asked for after the cluster is up, and goes straight into Secret '${PARAM_GITLAB_TOKEN_SECRET}'."
+      print_info "It needs the api and write_repository scopes, with Developer access to the project."
+    else
+      validate_gitops_forge_flags || exit 1
+      github_repo="$PARAM_GITOPS_REPO"
+    fi
+  elif [ "$PARAM_NON_INTERACTIVE" != "true" ]; then
     # An install that already names an org has a repository to connect, so
     # option 2 is what pressing enter should mean. Options 1 and 2 run the same
     # block, so this only makes the offered wording match the install — what
@@ -5377,7 +6158,7 @@ main() {
       if [ -n "$github_org" ] || [ -n "$github_app_id" ]; then
         print_info "GitOps interview skipped; keeping the GitOps configuration this install already records."
       else
-        print_info "GitOps repository connection skipped."
+        print_info "GitOps repository connection skipped. Scheduled fleet audits need one and fail without it."
       fi
     fi
   else
@@ -5461,6 +6242,7 @@ main() {
   # holds whatever install.env seeded, where True/yes/on are spellings the
   # documentation invites and is_truthy honours.
   validate_existing_cluster_opt_in_flags
+  validate_gitops_forge_flags || exit 1
   # An agent that forgets every conversation is the worse default, so memory is
   # on unless it is turned off. The choice decides two things: whether the
   # harness keeps memory at all, and — when it does — whether that costs an
@@ -5770,6 +6552,9 @@ main() {
   export SCOPED_SA_POOL_MAX_ACCOUNTS="$scoped_sa_pool_max_accounts"
   export GITOPS_ORG="$github_org"
   export GITOPS_REPO="$github_repo"
+  export GITOPS_FORGE="$PARAM_GITOPS_FORGE"
+  export GITOPS_HOST="$PARAM_GITOPS_HOST"
+  export GITLAB_TOKEN_SECRET="$PARAM_GITLAB_TOKEN_SECRET"
   # One release of overlap: the agent runtime and the chart still speak
   # GITHUB_*, and normalize_gitops_repo_vars keeps them equal to the GITOPS_*
   # values rather than letting them be a second source of truth.
@@ -5923,7 +6708,9 @@ main() {
     echo -e "  • ${C_CYAN}Container Registry:${C_RESET} ${registry_prefix}"
     echo -e "  • ${C_CYAN}Third-Party Images:${C_RESET} ${third_party_registry_prefix:-upstream registries (quay.io, ghcr.io, docker.io, us-docker.pkg.dev)}"
   fi
-  if [ -n "$github_org" ] && [ -n "$github_repo" ]; then
+  if [ "${PARAM_GITOPS_FORGE:-github}" = "gitlab" ] && [ -n "$github_repo" ]; then
+    echo -e "  • ${C_CYAN}GitOps Infrastructure Repo:${C_RESET} $(GITOPS_HOST="$PARAM_GITOPS_HOST" GITOPS_REPO="$github_repo" gitlab_repo_url) (GitLab; token in Secret ${PARAM_GITLAB_TOKEN_SECRET})"
+  elif [ -n "$github_org" ] && [ -n "$github_repo" ]; then
     echo -e "  • ${C_CYAN}GitOps Infrastructure Repo:${C_RESET} https://github.com/${github_org}/${github_repo}"
   fi
   echo -e "${C_CYAN}${C_BOLD}"
@@ -6051,7 +6838,11 @@ main() {
         check_scope_container_access "$SCOPE_CHECK_MODE_WARN"
         ;;
       *)
-        print_warning "Provisioning paused by user. Configuration saved to: $INSTALL_ENV_FILE"
+        # Not a hand-off like `g`: `n` is also a decline, so nothing is
+        # recorded, and the operator is told which lines a hand-run apply
+        # needs in install.env.
+        warn_install_env_keys_not_recorded
+        print_warning "Provisioning paused by user. Install configuration: $INSTALL_ENV_FILE"
         print_info "To launch provisioning later, run: ${C_BOLD}cd terraform/examples/full-install && KUBE_AGENTS_STATE_BUCKET=${DEFAULT_KUBE_AGENTS_STATE_BUCKET} ./lifecycle.sh apply${C_RESET}"
         write_json_report "PAUSED"
         exit 0
@@ -6062,6 +6853,9 @@ main() {
   if [ "$PARAM_GENERATE_ONLY" = "true" ]; then
     print_info "Generate-only: configuration files written. Running pre-apply validation checks..."
     check_github_org_is_organization "${GITOPS_ORG:-}"
+    # Past every gate that can stop this route: a chat flag whose key the
+    # install.env lacks is recorded for the handoff.
+    record_flags_into_install_env
     print_generate_only_handoff "$repo_dir" "$project_id" "$cluster_name" "$region" "$tfvars_file"
     write_json_report "GENERATE_ONLY_SUCCESS"
     exit 0
@@ -6134,6 +6928,14 @@ main() {
   local provisioning_log
   provisioning_log="/tmp/kube-agents-provision-$(date -u +%Y%m%dT%H%M%SZ).log"
   print_info "Provisioning output is also being saved to: ${C_BOLD}${provisioning_log}${C_RESET}"
+  # Past every gate that can stop this route (set -e makes each step above
+  # one): a chat flag whose key the install.env lacks is recorded for the
+  # apply.
+  # The forge keys likewise, and only here: a forge switch the operator
+  # previewed (--generate-only) or declined must leave install.env as it was,
+  # or the next upgrade.sh would render the forge nobody applied.
+  record_gitops_forge_keys "$INSTALL_ENV_FILE"
+  record_flags_into_install_env
   run_lifecycle_apply "$repo_dir" "$provisioning_log"
 
   # The one post-apply step Terraform cannot carry: the managed-OTel scope
@@ -6169,6 +6971,9 @@ main() {
   if ! kubectl get ns "$namespace" --context "$expected_ctx" >/dev/null 2>&1; then
     print_error "Namespace '${namespace}' was not created. Installation is incomplete."
     exit 1
+  fi
+  if [ "${GITOPS_FORGE:-github}" = "gitlab" ]; then
+    create_gitlab_token_secret "$namespace" "$expected_ctx" || exit 1
   fi
   local slow_rollouts=()
   for deployment in "$KUBE_AGENTS_OPERATOR_DEPLOYMENT" "$LITELLM_DEPLOYMENT" "$PLATFORM_AGENT_DEPLOYMENT"; do

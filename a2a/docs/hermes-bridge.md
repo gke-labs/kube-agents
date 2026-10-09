@@ -13,7 +13,7 @@ nothing answers on that subject yet - the worker adapter (W4) fast-follows, and 
 dispatcher is stage 3. The bridge is the stand-in executor: a small Go daemon on
 `a2a/lib` that consumes tasks addressed to `platform`, runs each as a turn in its
 conversation's Hermes session through the pod's API server (or, as the fallback, as a
-`hermes -p platform chat -Q -q <prompt>` subprocess; [executors](#executors)), and publishes
+`hermes -p platform chat -Q --query=<prompt>` subprocess; [executors](#executors)), and publishes
 the lifecycle events with the answer as the `result` artifact and the persona's tool calls as
 `activity`. It is scaffolding with a planned demolition date:
 when the dispatcher and worker adapter land, the bridge retires. Nothing here is
@@ -21,78 +21,177 @@ protocol - the wire contract is the payload spec's, unchanged.
 
 ## Where it runs
 
-**Sidecar in the platform-agent pod, declared via the CR's `spec.deployment.sidecars`
-field.** The bridge needs two things that only exist in that pod: the `hermes` CLI (it lives in the
+**Sidecar in the platform-agent pod, rendered by the operator.** Under `mode: next` the
+operator renders the bridge as a container named `hermes-bridge` beside the agent container,
+and so it does under version skew (a mode this operator build does not recognize), where a
+frozen bus that is still running keeps its executor. Under `today` it renders none. The
+bridge needs two things that only exist in that pod: the `hermes` CLI (it lives in the
 platform-agent image, so the bridge image builds FROM it and adds one static binary) and
 the persona state - `$HERMES_HOME` is the agent's data PVC, RWO, holding the platform
 profile's config, memory, and skills. A separate Deployment would need that PVC mounted
 cross-pod, which RWO only allows with same-node scheduling games. Not worth it for a
 component we intend to delete.
 
-The `sidecars` field takes ordinary `corev1.Container` entries, so most of the bridge's
-pod shape is CR-authored and reconcile leaves it alone: the sidecar mounts the same data
-volume, runs as the pod's KSA (model auth via Workload Identity for free), and gets
-`NATS_URL` plus creds from the a2a creds Secret out of its own `env`. The `api` executor also
-needs the pod's `API_SERVER_KEY` and, for the tool trace, `A2A_ACTIVITY_SECRET`
-([Executors](#executors)). The operator reads `BRIDGE_CONCURRENCY` back out of the entry, to
-size the TASKS consumer reserve ([sizing](#sizing-against-the-eval-harness)), and
-`BRIDGE_EXECUTOR`, `API_SERVER_KEY` and `BRIDGE_ACTIVITY_LISTEN`, to decide whether the
-`api` executor's pod-wide hook is rendered ([Executors](#executors)); it writes none of those.
+The rendered container is the agent container, copied: its env, `envFrom`, mounts,
+`securityContext` and pull policy (but not its resources, below), so it runs Hermes against the agent's profile
+state on the agent's PVC, as the pod's KSA (model auth via Workload Identity for free). Two
+things are taken out. The agent's own values for the names the bridge sets for itself, and
+the agent's bus identity: `AGENT_SHARED_STATE_SETUP`, `NATS_URL`, `NATS_USER`,
+`NATS_PASSWORD`, `BRIDGE_CONCURRENCY`, `BRIDGE_EXECUTOR`, `A2A_ACTIVITY_SECRET`,
+`API_SERVER_KEY` and `A2A_BUS_USER`. And the `a2a-bus-token` mount, the `agent` principal's credential, which the
+bridge never holds ([Bus user and grants](#bus-user-and-grants)). Ports and probes are not
+copied. On top go the bridge's own: `AGENT_SHARED_STATE_SETUP=skip`, so the image's
+entrypoint runs its container-local init and execs the bridge as it does for the dashboard
+container; `NATS_URL` for the `<agent>-a2a-nats` Service; `NATS_USER=bridge` and
+`NATS_PASSWORD` from the `bridge-password` key of `<agent>-a2a-nats-creds`;
+`BRIDGE_CONCURRENCY`; and `A2A_ACTIVITY_SECRET` from the same Secret's `bridge-activity-key`,
+optional; and `API_SERVER_KEY`, the bearer the agent's API server accepts, which the `api`
+executor needs ([Executors](#executors)). It is set rather than inherited because the agent
+container's entry can come from an AgentPlugin's env, and a blank or unresolvable one would
+quietly switch the bridge to `cli`.
 
-**Two names it does write, and they are the exception.** Under the A2A surface the
-render writes `POD_NAMESPACE` and `A2A_CAPABILITY_REQUIRED` onto every sidecar it emits
-(`a2aExecutorSidecarEnv`), but not with the same precedence.
+The image is `A2A_BRIDGE_IMAGE` when that is set. Unset, and when the agent container runs
+the release `platform-agent` image by tag, it is that image's registry and tag with the last
+path segment swapped for `hermes-bridge`: the bridge is built `FROM` the platform-agent image
+of the same commit, so the two containers are one build. Otherwise - an agent image under a
+custom repository name, which has no bridge published beside it, or one pinned by digest
+alone, which the swap cannot carry over - it is the image the other release A2A images
+resolve to, derived from the operator image the way `A2A_GATEWAY_IMAGE` and the rest are
+when unset. An install that runs a custom agent image sets `A2A_BRIDGE_IMAGE`. Four
+operator settings shape the rendered bridge. The operator reads them from its own
+environment, as it reads `A2A_INJECT_BACKEND`; no CR field carries them.
+
+| Operator env             | What it sets                                                         | Unset                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| ------------------------ | -------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `A2A_BRIDGE_IMAGE`       | the bridge's image                                                   | derived as above                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| `A2A_BRIDGE_CONCURRENCY` | the bridge's `BRIDGE_CONCURRENCY`                                    | 10, Hermes's own gateway pool (not the bridge's default of 2)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| `A2A_BRIDGE_EXECUTOR`    | the bridge's `BRIDGE_EXECUTOR`                                       | not rendered, so the bridge's shipped default decides: `api`, given the key. A value other than exactly `api` or `cli` is treated as unset, and the operator logs it once                                                                                                                                                                                                                                                                                                                                                                               |
+| `A2A_BRIDGE_RESOURCES`   | the bridge's resources, a `ResourceRequirements` in JSON, used whole | the `api`-sized defaults below, or under `cli` a copy of the agent container's. A value that isn't one `ResourceRequirements` (not JSON, an unknown field, neither requests nor limits, or content after it), or that the API server would refuse or the scheduler misread (a resource other than cpu, memory or ephemeral-storage, a negative quantity, a zero limit, a CPU quantity past what an int64 holds in millicores (a memory quantity that large is clamped by the parser), claims, or a request above its limit), is ignored and logged once |
+
+The TASKS consumer reserve reads the same `A2A_BRIDGE_CONCURRENCY` the bridge is given
+([sizing](#sizing-against-the-eval-harness)), and the `api` executor's pod-wide hook is
+rendered by the same rule as for a declared bridge ([Executors](#executors)): the operator
+counts a rendered bridge exactly like a declared one. The gateway's busy notice reads the
+same worker count: the operator renders it onto the gateway as `A2A_BUSY_NOTICE_AT`, the
+number of tasks ahead of a turn at which the gateway edits the turn's status line to a
+queued state saying how many are ahead, unless the operator's own `A2A_BUSY_NOTICE_AT` is
+set to a count ([the gateway spec](../../docs/designs/spec-chatops-gateway.md)).
+
+The rendered default is 10, not the bridge's own 2, because 10 is what the Hermes gateway
+runs agent turns on (its `ThreadPoolExecutor(max_workers=10)`), and the rendered bridge is that
+gateway's replacement on `next`. More workers don't let two turns race on one conversation's
+history. The `api` executor runs turns in one Hermes session one at a time (`sessionTurns`), and
+the `cli` executor starts every task as a fresh one-shot session with no history to share. At the default `maxSessions`
+of 10 the TASKS budget for 10 workers is 110, above the 64-consumer floor. A `next` install
+whose TASKS stream was created at the floor, before the rendered default was 10, is refused by
+its provision Job with the ways out named: delete TASKS and let provisioning recreate it, lower
+`maxSessions`, or set `A2A_BRIDGE_CONCURRENCY` lower. While that `A2AProvisionFailed`
+stands, the bridge is already in the agent pod at the new concurrency (the workload renders before
+the refusal parks the CR), running over the undersized stream, so consumer creates can be refused
+under load. That's the shape [#2043](https://github.com/gke-labs/kube-agents/issues/2043) describes. A fresh install creates TASKS at 110 from the first
+render.
+
+**It enters the pod once the bus is provisioned.** The rendered bridge is withheld from the
+agent pod until the CR's `BusProvisioned` condition is `True`: before that it has no bus to
+connect to and no runtime-state bucket, exits, and would hold the agent pod in
+`CrashLoopBackOff` through the bring-up. The TASKS consumer reserve does not wait; it counts
+the bridge from the first `next` render, so the one provisioning Job is already sized for it
+and the bridge's arrival does not re-render the Job. The cost is a second roll. On a fresh
+`next` install, and on a flip from `today` back to `next`, the agent pod rolls once for the
+mode and again when the bridge arrives after the Job. The agent Deployment's strategy is
+`Recreate` at one replica (`resolveDeploymentReplicasAndStrategy`), so each roll is a brief
+agent outage: the old pod stops before the new one starts. Once `BusProvisioned` has been
+`True` the bridge stays in the pod on later renders.
+
+**It has its own resources, sized for the `api` executor.** The rendered bridge requests 100m
+CPU and 256Mi, with limits of 1 CPU and 512Mi. The request is sized to live under on its
+own, since GKE Autopilot without Pod bursting sets every limit to its request. On `api`, the default, it's a Go relay that
+holds one HTTP request per task to the agent container's API server, and the turn itself
+runs in the agent container. Measured idle it uses about 1m CPU and 5Mi
+([#2748](https://github.com/gke-labs/kube-agents/issues/2748)). It used to copy the agent
+container's resources, which doubled the agent pod's requests and could leave a `next` pod
+unschedulable on a cluster sized for `today`.
+
+The `cli` executor doesn't fit these. It runs a one-shot `hermes chat` per task, about
+430Mi each, up to `BRIDGE_CONCURRENCY` of them. So under `cli` with no `A2A_BRIDGE_RESOURCES`
+the bridge keeps the copy of the agent container's resources it had before, and an install
+that pinned `cli` upgrades with its bridge unchanged. The operator logs that once and names
+the override. To size a `cli` bridge on purpose, set `A2A_BRIDGE_RESOURCES` with a memory
+limit of about 430Mi times the concurrency, plus headroom. A set override wins under either
+executor.
+
+**A CR-declared bridge wins.** A sidecar on `spec.deployment.sidecars` is a declared bridge
+if it is named `hermes-bridge`, if its `env` sets `BRIDGE_CONCURRENCY`, or if it runs the
+`hermes-bridge` image. The CR keeps it and the operator renders none, so an install that
+already carries one does not get two bridges. Those three are the whole contract: a
+hand-declared bridge outside them (a renamed image repository under another container
+name, with `BRIDGE_CONCURRENCY` unset or in `envFrom`) gets a second, rendered bridge beside
+it, and the two fail on the activity door's port. Name it `hermes-bridge`. An explicit
+opt-out is tracked in [#2623](https://github.com/gke-labs/kube-agents/issues/2623). The `sidecars` field takes
+ordinary `corev1.Container` entries, so a declared bridge's shape is CR-authored and
+reconcile leaves it alone: it has to carry its own `NATS_URL` and creds, and, for the `api`
+executor, `API_SERVER_KEY` and `A2A_ACTIVITY_SECRET`. The operator reads `BRIDGE_CONCURRENCY`
+back out of the entry, to size the TASKS consumer reserve, and `BRIDGE_EXECUTOR`,
+`API_SERVER_KEY` and `BRIDGE_ACTIVITY_LISTEN`, to decide whether the `api` executor's
+pod-wide hook is rendered; it writes none of those.
+
+**Two names it writes on a declared sidecar too.** Under the A2A surface the render writes
+`POD_NAMESPACE` and `A2A_CAPABILITY_REQUIRED` onto every sidecar it emits, rendered or
+declared (`a2aExecutorSidecarEnv`), but not with the same precedence.
 `A2A_CAPABILITY_REQUIRED` goes to `mergeEnvVars` as the override, so a CR value for it is
 discarded on every reconcile: the switch is the install's, not the sidecar author's.
 `POD_NAMESPACE` goes in underneath the container's own env, as a default, so a CR that
 sets it deliberately wins. Both are inputs to the capability check below rather than
 deployment preferences - see "What scope the check runs at" for why the render has to
-supply `POD_NAMESPACE` at all, and for what a default install did before it did. This
-paragraph used to say the bridge needed no operator code at all; between the reads above,
-these two writes and the `api` executor's hook entry, it needs exactly this much.
+supply `POD_NAMESPACE` at all, and for what a default install did before it did.
 
 Concurrent hermes processes under one `$HERMES_HOME` is the kanban dispatcher's existing
 posture (`deploy/docker/patches/kanban_result_required.py` documents `_default_spawn`
 spawning the same kind of one-shot `hermes chat -q` process), so the bridge inherits a
 known-working concurrency story. Cap is 2, matching the platform profile's `concurrency` in the profiles spec.
 
-## What this deployment method costs
+## What a declared sidecar costs
 
-Two properties of riding `spec.deployment.sidecars`. Neither is fixed, for the same
-reason in both cases: screening a user-supplied container means overriding user intent,
-and the operator does that only where it owns the meaning of the field - the capability
-switch above, and the reserved volume names the webhook refuses. `POD_NAMESPACE` is the
-other name the render writes, but it goes in as a default a CR beats, so it overrides
-nothing.
+Two properties of riding `spec.deployment.sidecars`, which a rendered bridge does not
+have. Neither is fixed, for the same reason in both cases: screening a user-supplied
+container means overriding user intent, and the operator does that only where it owns the
+meaning of the field - the capability switch above, and the reserved volume names the
+webhook refuses. `POD_NAMESPACE` is the other name the render writes, but it goes in as a
+default a CR beats, so it overrides nothing.
 
-**Flipping to `mode: today` with the sidecar still set takes the agent down.** The
-operator copies `spec.deployment.sidecars` into the pod without consulting the mode, so
-the flip removes the NATS Service and leaves the bridge dialling a host that no longer
-resolves. Confirmed live 2026-09-05: the sidecar crash-loops, and because it shares the
-agent's pod the pod never reaches Ready - the whole agent is down, not merely carrying
-an A2A trace. Unset `spec.deployment.sidecars` _before_ flipping to `today`. In any
-flip runbook that step is a blocker, not tidiness. `hack/rollback-roundtrip.sh` follows
-it: it unsets the whole list, not only the sidecars that look like bus clients, flips,
-and declares the saved list again once `next` is back.
+**Flipping to `mode: today` with a declared bridge still set takes the agent down.** A
+rendered bridge leaves the pod with the mode: the flip renders none, so it needs no CR edit
+first. A declared one does not leave. The operator copies `spec.deployment.sidecars` into
+the pod without consulting the mode, so the flip removes the NATS Service and leaves the
+bridge dialling a host that no longer resolves. Confirmed live 2026-09-05: the sidecar
+crash-loops, and because it shares the agent's pod the pod never reaches Ready - the whole
+agent is down, not merely carrying an A2A trace. On an install that declares its own
+bridge, unset `spec.deployment.sidecars` _before_ flipping to `today`. In any flip runbook
+for such an install that step is a blocker, not tidiness. `hack/rollback-roundtrip.sh`
+follows it: a CR with declared sidecars has the whole list unset, not only the sidecars
+that look like bus clients, flipped, and the saved list declared again once `next` is back;
+a CR with none, the lane's own, is only flipped.
 
 **The webhook does not screen sidecar env, on purpose.** The `SensitiveEnvVars`
 refusal applies to `spec.deployment.env` only; a sidecar's own `env` is unscreened (the
 webhook checks a sidecar's `securityContext`, and checks its `volumeMounts` against the
-reserved volume names, and nothing else about it). The bridge depends on exactly that
-gap - its `NATS_URL` and credentials arrive as sidecar env.
-Closing it breaks this deployment method, so it stays open as a stated trade while the
-bridge exists; the bridge's demolition removes the reason.
+reserved volume names, and nothing else about it). A declared bridge depends on exactly
+that gap - its `NATS_URL` and credentials arrive as sidecar env. Closing it breaks that
+deployment method, so it stays open as a stated trade while the bridge exists; the
+bridge's demolition removes the reason.
 
 One provenance note: the bridge image is release surface. `a2a/Dockerfile.hermes-bridge`
 builds it (`FROM` the platform-agent image plus the one static binary above), the release
 workflow publishes it as `hermes-bridge` beside the other first-party images, `FROM` the
 platform-agent image the same run pushed under the same commit tag, and `images.json`
-carries it with no operator override, since the operator renders no bridge and the
-sidecar's image is the CR's. `deploy/docker/cloudbuild-ci.yaml` builds the presubmit's own
-in its `a2a-bridge` step when `hack/ci-deploy.sh` runs under `EVAL_MODE_NEXT=1`, `FROM` the
+carries it with `A2A_BRIDGE_IMAGE` as its operator override, which the operator reads when
+it renders the bridge. `deploy/docker/cloudbuild-ci.yaml` builds the presubmit's own in its
+`a2a-bridge` step when `hack/ci-deploy.sh` runs under `EVAL_MODE_NEXT=1`, `FROM` the
 platform-agent image that same build produced, by the tag it just pushed and never from a
-registry default; the deploy then declares it on the CR for the eval install
-(`docs/designs/eval-next-transport.md`, "The CI flag"). Either way the sidecar and the agent
+registry default; the deploy then hands it to the operator as `A2A_BRIDGE_IMAGE`, with
+`A2A_BRIDGE_CONCURRENCY`, for the eval install, and leaves `A2A_BRIDGE_EXECUTOR` unset, so the
+eval runs the `api` executor a customer install runs (`docs/designs/eval-next-transport.md`,
+"The CI flag"). Either way the sidecar and the agent
 container it shares a pod with are one build. The static `bridge` bus user the next section
 describes is the released mechanism, not scaffolding graduation removes: the password arrives
 as sidecar env from the operator's creds Secret, and it stays a password principal for the
@@ -228,7 +327,10 @@ is not in the publish list, so the publish is refused, the submission is dropped
 Hermes is never spawned. The refusal does not read as one: a rejected JetStream publish is
 a reply that never arrives, so the bridge logs a timeout and the submitter waits on a task
 that got no terminal event and was never run. Leave the env unset, or widen the grant in
-the operator to match — the two have to move together.
+the operator to match — and add the new addressee to `a2aReservedAddressees()` in the same
+change, so the auth callout's `A2A_RESERVED_ADDRESSEES` refuses a narrowed pod named after it.
+The three have to move together: a grant widened without the reservation lets a session pod
+named after the second addressee read and publish its task subjects.
 
 The agent container is the other half of the same change and needs no edit: the operator
 stops rendering `NATS_USER`/`NATS_PASSWORD` there and mounts a projected token instead.
@@ -246,7 +348,8 @@ Hermes API server in the same pod (`BRIDGE_API_URL`, default
 `http://127.0.0.1:8642/v1/chat/completions`, model `BRIDGE_API_MODEL`, default
 `model-default`) with `Authorization: Bearer $API_SERVER_KEY` and three headers:
 `X-Hermes-Session-Key` and `X-Hermes-Session-Id`, both set to the session id below, and
-`Idempotency-Key`, set to the task id so a redelivered task does not run its turn twice. The
+`Idempotency-Key`, set to the task id so a redelivered task does not run its turn twice (a
+follow-up turn's key adds its envelope id; see **Steering** below). The
 server loads the session's history from its own store before the turn and appends to it after,
 so the second task in a thread sees the first. The session id is `a2a-` plus the task's
 `contextId`, which the gateway mints once per backend conversation. A `contextId` that is not
@@ -264,8 +367,7 @@ up to `BRIDGE_CONCURRENCY`, and a task waiting for its session's turn holds a wo
 The sidecar starts with the agent container, so the bridge can be consuming before the API
 server listens. A refused connection is retried every second for two minutes; it never reached
 the server, so the retry cannot run a turn twice. The server ignores the session headers
-without `API_SERVER_KEY`, so the executor needs it. `hack/ci-deploy.sh` copies the agent
-container's env into the sidecar, which carries it; a hand-declared sidecar must set it, and
+without `API_SERVER_KEY`, so the executor needs it. The rendered bridge sets it itself; a hand-declared sidecar must set it, and
 `A2A_ACTIVITY_SECRET` from the `bridge-activity-key` entry of the a2a creds Secret for the tool
 trace. With `BRIDGE_EXECUTOR` unset and no key, the bridge logs a warning and runs the `cli`
 executor, so a sidecar declared before `api` existed keeps working; `BRIDGE_EXECUTOR=api` with
@@ -273,17 +375,20 @@ no key is refused at start.
 
 What the `api` executor does not do. A kanban card the persona creates completes after the turn
 has answered, and the API server has no channel to push that completion back, so it never reaches
-the A2A thread; the `cli` executor loses it the same way. A running turn cannot be steered: a
-follow-up to a running task gets the refusal described below. A turn the bridge stops waiting
+the A2A thread; the `cli` executor loses it the same way. A turn the bridge stops waiting
 for, on cancel or the deadline, may keep running in the server, and the next task on the same
 session can start beside it; so can a turn Hermes starts on its own, such as a background wake.
 Tool calls from either can land in the wrong task's trace. And when Hermes compresses a long
 session it continues it under a new session id, which the hook reports and the trace's key does
 not match, so the trace stops for that conversation while the answers keep arriving.
 
-**`cli`: a subprocess per task.** `hermes -p <BRIDGE_PROFILE> chat -Q -q <prompt>`, a fresh
-session for every task, with no memory of the thread's earlier tasks. The rest of this page
-describes it where the two differ.
+**`cli`: a subprocess per task.** `hermes -p <BRIDGE_PROFILE> chat -Q --query=<prompt>`, a fresh
+session for every task, with no memory of the thread's earlier tasks. The prompt is one
+`--query=` token, so a message that starts with `-` stays the query rather than reading as an
+option, with any NUL byte dropped, since no argument can carry one. It cannot continue a
+session, so a follow-up to one of its tasks is refused `no-resume` when it arrives: follow-ups run
+on the `api` executor only ("Steering" below). The rest of this page describes it where the two
+differ.
 
 ## Lifecycle, steering, cancel
 
@@ -291,9 +396,12 @@ Per task: `submitted` on accept (before the consumer ack, so a bridge death befo
 ack just redelivers), `working` when the subprocess spawns, the persona's tool calls as
 an `activity` artifact and a heartbeat as a `progress` artifact while it runs ("Activity"
 below), the stdout as a `result` artifact (chunked if large), one terminal
-`status-update` with `final: true`. A nonzero
-exit is terminal `failed` with the evidence in the status message: `reason: hermes-exited-nonzero -
-exit status N; session: <id>; stdout tail: …; stderr tail: …`. Both tails are bounded (2 KiB each),
+`status-update` with `final: true`. On the `api` executor, when follow-ups ran as further turns
+("Steering" below), each earlier turn's answer is a `turn` artifact of its own
+(`artifact-<taskId>-turn-<N>`), published just before the next turn starts, and the `result` is
+the last turn's answer. A nonzero exit is terminal `failed` with the evidence in the status
+message: `reason: hermes-exited-nonzero - exit status N; session: <id>; stdout tail: …; stderr
+tail: …`. Both tails are bounded (2 KiB each),
 and `session:` carries the id when `hermes chat -Q` printed its `session_id:` line on stderr (it
 is the last thing the CLI writes before exiting), so the transcript under the profile's session
 store can be found from the terminal alone. Exit 75 is Hermes's `EX_TEMPFAIL` for a turn that
@@ -314,20 +422,62 @@ constructible. The component that does NOT get this for free is the worker adapt
 terminal its own predecessor's supervisor declared. Anything on `…in` for a task with a
 terminal event is acked with a warning and nothing else.
 
-**Steering:** the bridge sends a task's instruction once: `hermes chat -Q -q` has no stdin to
-inject into, and the `api` executor's request is already sent. A
-follow-up message to a running task is acked and answered with a non-final status
-echoing the task's current state (`working` once the subprocess spawned, `submitted`
-while still queued) whose message says the input cannot be absorbed mid-run and cancel
-is available.
-Honest, never silent. This does not change task state (payload spec assertion 12). The
-`api` executor answers the same way.
+**Steering:** on the `api` executor a follow-up message to a running task is queued, not
+refused. Follow-ups run on the `api` executor only: the `cli` executor cannot continue a session.
+The bridge answers each follow-up with a non-final status carrying the task's current state
+(`submitted` while queued or waiting for the session, `working` after) and a `steerNotice` data
+part: `queued`, or `refused` with `no-resume` (the task runs on the `cli` executor, which can't
+continue a session; every follow-up to it is refused so when it arrives, the notice's text says
+to send it again after the answer, and the gateway posts that to the room at once),
+`queue-full` (a task takes at most 16 follow-ups, counted per task: those already run count, not
+only those waiting), `task-ending` (the answer was already
+chosen), `no-text` (no text part holds anything but white space, U+001C-U+001F or NUL: Hermes's API
+server refuses a turn that Python's `str.strip()` empties, which strips U+001C-U+001F too, and a
+NUL alone asks nothing), `capability` (the task's capability, carried on the follow-up, did not pass
+when checked on the worker before its turn: refused, or the verifier could not be reached; the one
+token covers both), or `task-ended` (the task ended first: cancel, failure, deadline, shutdown).
+When the current turn ends, queued follow-ups run in arrival order as further turns in the same
+Hermes session: the bridge posts another turn with the same session headers, under the same session
+slot, and the `Idempotency-Key` `<taskId>/<envelopeId>` (the opening turn's is `<taskId>`), so a
+follow-up never replays the opening answer. A follow-up's text needs no length check of its own: the
+gateway's doors cap a text at 65,536 runes, the server's own cap on a message
+(`MAX_NORMALIZED_TEXT_LENGTH`, 65,536 characters), and the bus's 1 MiB message limit keeps the
+request far under the server's 10 MB body limit. Each earlier turn's answer is published as a
+`turn` artifact as soon as the next turn is about to run; the last turn's answer is the `result`,
+then the one terminal. A turn's answer the bridge holds between turns, while the next follow-up's
+capability is checked, is not lost to a shutdown: the worker ends the task with it as the `result`,
+and the queue is refused `task-ended`. A failed follow-up turn names itself in the terminal
+(`; turn: N` after the session). A follow-up does not change task state (payload spec assertion
+12). A bridge that crashes with follow-ups queued loses them; the gateway's relay reports them as
+not run at the terminal, unless the gateway restarted too. The count is best-effort: a follow-up
+whose turn had started when the bridge crashed counts as run, though its answer never arrives.
+Mid-turn steering through the runs API is gke-labs#2628.
+
+**Upgrade order for steering.** The gateway and the bridge do not roll together. The gateway's
+image follows the operator, but the sidecar's image is whatever the CR names, so until someone
+edits the CR the two can be a release apart, and a rollback produces the reverse skew. Upgrade the
+operator (and with it the gateway) first, then bump the CR's `hermes-bridge` sidecar tag. On a
+rollback, move the sidecar tag back first, then the operator. The two skews look like this:
+
+- **Old gateway, new bridge (the order to avoid).** The old relay has no case for `turn`
+  artifacts, so every earlier turn's answer is dropped. The room gets the old "does not take
+  mid-task input" ack, the notice's text part as "ℹ️ follow-up queued …", and then only the last
+  follow-up's answer. The answer to the original question never posts.
+- **New gateway, old bridge.** Noisy, but nothing is lost. The room gets "✏️ got it, I'll take
+  that next", which is wrong, then the old bridge's "ℹ️ steering received but not absorbed …",
+  and the task's one answer. The gateway posts its "N follow-up(s) arrived as the task finished"
+  line only after it has heard a steer notice from that addressee since it started, and an old
+  bridge sends none. That memory outlives the bridge, though: until the gateway restarts, a
+  gateway that heard notices from that addressee before the rollback can still post one false
+  "follow-up(s) arrived as the task finished" line at the end of a task that had a follow-up.
 
 **Cancel:** SIGTERM to the subprocess's process group, SIGKILL after a grace period,
 then terminal `canceled` (`reason: canceled-by-request`). A task racing to completion may
 land `completed` first - both orders are legal and the terminal event wins. A per-task
-deadline (default 7200s, matching the profile's `activeDeadlineSeconds`) takes the same
-kill path and lands `failed`.
+deadline (default 7200s, matching the profile's `activeDeadlineSeconds`), which covers every
+turn of the task, takes the same kill path and lands `failed` (`reason: deadline-exceeded - killed
+after …`; on `api`, `request ended after …`, with `; turn: N` for a follow-up turn); no follow-up
+turn starts once it has passed.
 
 A cancel for a task still queued finalizes it `canceled` with `reason: canceled-before-start`
 and nothing is spawned, and the worker looks for one itself before it spawns. The durable
@@ -347,7 +497,8 @@ speed, and the replay that remains is paced: at most `BRIDGE_CONCURRENCY` of the
 at once, each held until its ephemeral's five-second threshold has run after it returned, so the
 look-ahead holds that many live consumer slots at most, plus whatever the server has not yet
 reaped at the window's edge. The operator's reserve counts this look-ahead row, and the asks
-row beside it, per worker at the `BRIDGE_CONCURRENCY` the sidecar's own env entry declares, read
+row beside it, per worker at the `BRIDGE_CONCURRENCY` the bridge is given (the operator's
+`A2A_BRIDGE_CONCURRENCY` for a rendered bridge, the sidecar's own env entry for a declared one), read
 at render time, with the bridge's default of 2 standing in for an entry that is absent or that
 the render cannot read as a count (a `valueFrom`, or a reference to one); a sidecar started with
 a higher value, as the eval's is, widens the reserve with it, and a value the stream's floor
@@ -391,24 +542,26 @@ failures name themselves in the status message:
 
 This section is the canonical statement of the sizing; the eval transport design
 ([`eval-next-transport.md`](../../docs/designs/eval-next-transport.md), stage 1) summarises it.
-An eval install that declares the bridge sidecar runs it against the presubmit's fan-out, and
+An eval install runs the bridge against the presubmit's fan-out, and
 two numbers bound what it can take. `BRIDGE_CONCURRENCY` (default 2, the cap above) is the worker
 count: a task past it is accepted and `submitted` and then queued with no subprocess until a
 worker frees, and the harness classifies a repetition that reaches its budget still
 `submitted` as infrastructure rather than a graded case - it cancels the task and the bridge
 answers `canceled-before-start`. The presubmit fans units out at `EVAL_TASK_PARALLELISM`,
-default 4, the nightly at 8, so the sidecar declares `BRIDGE_CONCURRENCY` at or above that
-value; at the defaults two of every four concurrent units wait for as long as the two ahead of
-them run. The queue behind the workers is fixed at `taskQueueCapacity`, 1024 in `bridge.go`,
+default 4, the nightly at 8, so the install gives the bridge a `BRIDGE_CONCURRENCY` at or above
+that value; at the defaults two of every four concurrent units wait for as long as the two ahead
+of them run. The queue behind the workers is fixed at `taskQueueCapacity`, 1024 in `bridge.go`,
 and a submission past it is finalized `failed` with `reason: bridge-queue-overflow`, also
 infrastructure in the harness's classification. Size the parallelism against both: concurrency
 at or above the parallelism, and the number of submissions a run can have outstanding at once,
 the units in flight plus anything abandoned and not yet cancelled, well under the queue
-capacity. `hack/ci-deploy.sh` declares that sidecar under `EVAL_MODE_NEXT=1` and sets
-`BRIDGE_CONCURRENCY` to the run's `EVAL_TASK_PARALLELISM`. The operator reads that value from
-the sidecar entry and sizes the TASKS consumer reserve from it, so a concurrency the stream
-cannot hold is a refused provision and a `Degraded` CR, not a silent shortfall; the read is
-the only operator code the bridge has, and it retires with the bridge.
+capacity. `hack/ci-deploy.sh` under `EVAL_MODE_NEXT=1` sets the operator's
+`A2A_BRIDGE_CONCURRENCY` to the run's `EVAL_TASK_PARALLELISM`, and the operator renders that
+into the bridge. It sizes the TASKS consumer reserve from the same value, so a concurrency the
+stream cannot hold is a refused provision and a `Degraded` CR, not a silent shortfall. That
+read, the render in [Where it runs](#where-it-runs), the two env names it writes on every
+sidecar and the `api` executor's hook entry are the operator code the bridge has, and they
+retire with the bridge.
 
 ## Activity: the persona's tool calls, and a heartbeat
 
@@ -515,7 +668,7 @@ Under the `api` executor there is no child to hand a key or a scope to: the turn
 the long-lived gateway process, which serves the chat platforms, cron and kanban dispatch too.
 So the operator renders the entry in the pod's managed config instead, when the CR renders
 the agent's A2A surface (`mode: next`, or a mode this operator build does not recognize) and
-declares a bridge sidecar (a sidecar whose env sets `BRIDGE_CONCURRENCY`) that runs `api` and
+renders a bridge, or declares a bridge sidecar (a sidecar whose env sets `BRIDGE_CONCURRENCY`), that runs `api` and
 whose door the entry reaches. It runs `api` by the bridge's own rule: `BRIDGE_EXECUTOR=api`, or
 that entry empty and `API_SERVER_KEY` non-blank or taken from a reference. The door is reached
 when `BRIDGE_ACTIVITY_LISTEN` is unset or names the hook's port on `127.0.0.1` or a wildcard

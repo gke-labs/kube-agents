@@ -155,7 +155,9 @@ finishing again (the gateway log in a run's artifacts says whether the
 dispatcher stalled); for fixture drift, once the daily reconcile has re-applied
 the stack — a red on a case that depends on the drifted fixture, from a run
 that leased one of those projects, is the fixture's, not the change's; for pool
-drift, once the pool owner has run the repair the issue carries.
+drift, once the pool owner has run the repair the issue carries. Who the
+fleet owner, the pool owner and the person who owns the gate are is recorded
+in [`docs/ownership.md`](ownership.md).
 
 A pull request that will not merge into `main` dies in the same seconds with
 no tasks and is not a setup death either (`merge_conflict` in SCHEMA.md,
@@ -186,7 +188,11 @@ Only presubmit runs reach these rules and the digest's numbers. `data.json`
 also carries the nightly periodics' runs (`runs[].tier`, see
 `scripts/eval_dashboard/SCHEMA.md`); a nightly has no pull request to count
 towards a distinct-PR floor, and a nightly collapsing is a case's record on
-`main`, not a gate incident.
+`main`, not a gate incident. It carries the GitLab lane's runs too
+(`pull-kube-agents-smoke-test-gitlab`, `tier: gitlab`): the same matrix
+against a pool project's GitLab repository, listed in the Brief's "GitLab
+lane" section with its own counts and links, and in no gate number, case
+history or digest line.
 
 ## Hysteresis
 
@@ -368,8 +374,7 @@ Three Prow jobs keep the pool in shape from outside any run, and until this
 rule existed they reported nowhere but TestGrid: `ci-kube-agents-pull-sweep`
 (the GitOps stale-pull-request sweep, every ten minutes) and the seeded-fleet
 reconcile, as a postsubmit on every merge that changes the stack and as a
-daily pass over every project (the hourly and weekly entries it replaces stay
-in the list, with no stale window, until the Prow change retires them). `scripts/eval_dashboard/periodics.py` lists them in `WATCHED`, one entry
+daily pass over every project. `scripts/eval_dashboard/periodics.py` lists them in `WATCHED`, one entry
 per job with its label, its stale window, the report it writes, and the words
 its messages are built from, so adding the next periodic is one entry. The 15-minute tick's `Fetch the watched periodics'
 latest builds` step reads each job's `latest-build.txt` from
@@ -377,9 +382,17 @@ latest builds` step reads each job's `latest-build.txt` from
 identities cannot write the Prow archive),
 walks back to a build with a `finished.json` (the newest is often still
 running), keeps the job's report when the build wrote one (the reconcile's
-`fleet-reconcile.json`, the sweep's `pull-sweep.json`; the sweep's GitLab pass
-writes `pull-sweep-gitlab.json`, which is not read), and hands the readings
-to `health.py --periodics-dir`.
+`fleet-reconcile.json`, the sweep's `pull-sweep.json`, and beside it the
+sweep's GitLab pass's `pull-sweep-gitlab.json` when the build wrote one: its
+failed projects, its run error and every GitLab token that is due, dead or
+unreadable join the note's detail, marked `gitlab`, and its counts join the
+summary as a `GitLab:` clause), and hands the readings to
+`health.py --periodics-dir`. A sweep build that passed while that report names
+a token due, dead or unreadable is a `TOKEN` note of its own (the sweep stays
+green on a due token, so this is where it is said): posted once per episode
+with the token lines, tracked apart from the sweep's own failed-and-recovered
+episode, and cleared by the first passed build whose report was read and
+names none.
 
 Like the pool note it rides beside the state and never becomes one. A job whose
 latest finished build failed is a `FAILED` note, once it is news: the sweep runs

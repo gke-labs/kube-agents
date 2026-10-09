@@ -247,6 +247,10 @@ litellm:
   # Workload Identity instead.
   modelProvider: gemini
   # Empty selects the per-provider default (mirrors common.sh).
+  # A Claude model (anthropic, or vertex_ai with a claude-* name) gets
+  # additional_drop_params: temperature, top_p and top_k under every alias,
+  # because Claude Opus 5 refuses them and a caller may send them anyway.
+  # Chart-only; the kustomize dev base carries no such key.
   modelDefaultName: ""
   # Output-token budget the gateway asks the provider for on a request that
   # names none, rendered as max_tokens under every model_list alias. 0 leaves
@@ -594,12 +598,13 @@ platformAgent:
   # GKE managed-Prometheus PodMonitorings for the agent's pods: the gateway,
   # where the k8s-event-watcher serves its metrics on the agent-api-auth
   # sidecar's event-metrics port (9095), and the credential proxy, where the
-  # broker serves its own on the metrics-only cred-metrics port (8766). The
-  # operator's policies on both pods admit the collector's namespace,
-  # gke-gmp-system, and the operator's own pods on those ports whatever this
-  # is set to; this decides only whether a scrape is configured, and the
-  # operator's own read of the two counters into status.usage does not
-  # depend on it.
+  # broker serves its own on the metrics-only cred-metrics port (8766), and
+  # the A2A gateway a spec.mode next install runs, which serves its counters on
+  # the metrics-only a2a-metrics port (9096). The operator's policies admit the
+  # collector's namespace, gke-gmp-system, on those ports whatever this is set
+  # to, and on the first two the operator's own pods as well; this decides
+  # only whether a scrape is configured, and the operator's own read of the
+  # two counters into status.usage does not depend on it.
   # A tri-state: null (the default) renders them when the cluster serves
   # monitoring.googleapis.com/v1/PodMonitoring, which is where Managed
   # Prometheus is installed, and renders nothing elsewhere, so an install on a
@@ -759,12 +764,12 @@ platformAgent:
     # The credential-proxy container's requests and limits, forwarded to the CR as
     # spec.deployment.credentialProxy.resources when any key is set. Each key
     # merges over the operator's defaults (500m CPU and 512Mi requests; 1 CPU,
-    # 1Gi memory and 2Gi ephemeral-storage limits), so
+    # 2Gi memory and 2Gi ephemeral-storage limits), so
     #
     #   credentialProxy:
     #     resources:
     #       limits:
-    #         memory: 2Gi
+    #         memory: 3Gi
     #
     # raises the memory limit and keeps the rest. The broker sizes how many
     # commands it admits at once from that limit, so it is the setting to raise
@@ -1024,11 +1029,17 @@ platformAgent:
     #
     # forges:
     #   - name: github            # what repositories[].forge refers to
-    #     provider: github        # the only registered provider; default github
+    #     provider: github        # github or gitlab; default github
     #     host: ""                # empty is the provider's default (github.com)
     #     namespace: my-org       # default owner for this forge's repositories
     #     credentialsRef:         # Secret for providers that need one; ignored
     #       name: ""              # for github, which uses the GitHub App
+    #   - name: gitlab
+    #     provider: gitlab
+    #     host: ""                # gitlab.com, or a self-managed instance's hostname
+    #     namespace: my-group     # group path; bounds which projects the agent may reach
+    #     credentialsRef:         # required for gitlab: a Secret holding an access
+    #       name: gitlab-token    # token under the key `token`, created out of band
     forges: []
     # repositories:
     #   - forge: github
