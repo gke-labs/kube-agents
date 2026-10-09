@@ -320,7 +320,7 @@ class Retired(Base):
         sandbox = FakeSandbox(partial)
         code, out = self.run_tick(sandbox)
         self.assertEqual(code, 0)
-        self.assertEqual(out.strip(), "upgrade readiness watch: the version table was partial (1 read error(s), exit 1); nothing retired while it stays so")
+        self.assertEqual(out.strip(), "upgrade readiness watch: the version table was partial (1 read error(s), exit 1); a version is retired only once every project that pends it has been read")
         self.assertIn(OLDER_TARGET, self.ledger()["targets"])
 
 
@@ -553,13 +553,14 @@ class Budget(Base):
     def test_the_version_table_stops_at_the_budget_and_resumes_there(self) -> None:
         self.seed(TARGET, NOW - timedelta(days=8), ["p1/us-central1-a/a", "p2/us-central1-a/b"])
         versions, readiness = self.two_projects()
-        # started, table p1, table p2 (too late), readiness p1
-        with mock.patch.dict(os.environ, {watch.PROJECTS_ENV: "p1,p2"}), self.monotonic_readings(0.0, 0.0, watch.TICK_BUDGET_SECONDS - 10.0, watch.TICK_BUDGET_SECONDS - 10.0):
+        # started, table p1, table p2 (past the table's share), then readiness runs with room
+        late = watch.TABLE_BUDGET_SECONDS - 10.0
+        with mock.patch.dict(os.environ, {watch.PROJECTS_ENV: "p1,p2"}), self.monotonic_readings(0.0, 0.0, late, late):
             sandbox = FakeSandbox(versions, readiness)
             code, out = self.run_tick(sandbox)
         self.assertEqual(code, 0)
         self.assertEqual([c[1][1] for c in sandbox.calls if c[0] == "versions"], ["p1"])
-        self.assertIn("the version table was partial (1 read error(s), exit 0); nothing retired while it stays so", out)
+        self.assertIn("the version table was partial (1 read error(s), exit 0); a version is retired only once every project that pends it has been read", out)
         self.assertEqual(sorted(self.ledger()["table_runs"]), ["p1"])
         self.assertEqual(self.ledger()["targets"][TARGET]["pending"], ["p1/us-central1-a/a", "p2/us-central1-a/b"])
         with mock.patch.dict(os.environ, {watch.PROJECTS_ENV: "p1,p2"}):
@@ -647,6 +648,46 @@ class Budget(Base):
             code, out = self.run_tick(sandbox)
         self.assertEqual([c[1][1] for c in sandbox.calls if c[0] == "readiness"], ["p2", "p1"])
         self.assertIn(f"scheduled refresh {TARGET}, 2 cluster(s) pending (a, b): 0 blocked, 2 ready;", out)
+
+    def test_a_readiness_run_settles_the_clusters_the_table_did_not_reach(self) -> None:
+        # The ledger says b (p2) pends TARGET; the table's share reaches p1 only; p2's readiness run lists b as current.
+        self.seed(TARGET, NOW - timedelta(days=8), ["p1/us-central1-a/a", "p2/us-central1-a/b"])
+        versions = envelope([member("a", "lagging"), member("b", "lagging", project="p2")])
+        readiness = envelope([member("a", "lagging", readiness="ready"), member("b", "current", project="p2", readiness="ready")])
+        late = watch.TABLE_BUDGET_SECONDS - 10.0
+        with mock.patch.dict(os.environ, {watch.PROJECTS_ENV: "p1,p2"}), self.monotonic_readings(0.0, 0.0, late, late, late):
+            code, out = self.run_tick(FakeSandbox(versions, readiness))
+        self.assertEqual(code, 0)
+        self.assertIn(f"scheduled refresh {TARGET}, 1 cluster(s) pending (a): 0 blocked, 1 ready;", out)
+        self.assertEqual(self.ledger()["targets"][TARGET]["pending"], ["p1/us-central1-a/a"])
+        text = (self.home / "reports" / TARGET / "latest.md").read_text()
+        self.assertIn("1 cluster(s) are below this version: p1/us-central1-a/a.", text)
+
+    def test_a_readiness_run_that_shows_every_pending_cluster_current_retires_the_version(self) -> None:
+        self.seed(OLDER_TARGET, NOW - timedelta(days=8), ["p2/us-central1-a/b"])
+        versions = envelope([member("a", "lagging")])
+        readiness = envelope([member("a", "lagging", readiness="ready"), member("b", "current", project="p2", readiness="ready")])
+        late = watch.TABLE_BUDGET_SECONDS - 10.0
+        with mock.patch.dict(os.environ, {watch.PROJECTS_ENV: "p1,p2"}), self.monotonic_readings(0.0, 0.0, late, late, late):
+            code, out = self.run_tick(FakeSandbox(versions, readiness))
+        self.assertEqual(code, 0)
+        self.assertIn(f"{OLDER_TARGET} is no longer pending", out)
+        self.assertNotIn(OLDER_TARGET, self.ledger()["targets"])
+        self.assertFalse((self.home / "reports" / OLDER_TARGET).exists())
+
+    def test_a_cut_short_table_run_is_the_same_kind_of_partial_table_as_an_unreached_one(self) -> None:
+        self.seed(TARGET, NOW, ["p1/us-central1-a/a", "p2/us-central1-a/b", "p3/us-central1-a/c"])
+        versions = envelope([member("a", "lagging"), member("b", "lagging", project="p2"), member("c", "lagging", project="p3")])
+        outs = []
+        for day, cut in enumerate(({"p2"}, set(), {"p3"})):
+            late = watch.TABLE_BUDGET_SECONDS - 10.0
+            # started, first table run, second table run under a shrunk timeout, third past the share
+            with mock.patch.dict(os.environ, {watch.PROJECTS_ENV: "p1,p2,p3"}), mock.patch.object(watch, "now_utc", return_value=NOW + timedelta(days=day)), self.monotonic_readings(0.0, 0.0, watch.TABLE_BUDGET_SECONDS - 550.0, late, late):
+                code, out = self.run_tick(FakeSandbox(versions, table_timeout_projects=cut))
+            outs.append(out)
+        self.assertIn("the version table was partial", outs[0])
+        self.assertEqual(outs[1], "", "a day the budget merely stopped short posts nothing new")
+        self.assertEqual(outs[2], "", "a day a run was cut short posts nothing new either")
 
     def test_a_table_that_fails_for_every_project_is_one_failure_line(self) -> None:
         versions, readiness = self.two_projects()
