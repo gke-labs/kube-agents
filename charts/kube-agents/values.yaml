@@ -379,8 +379,8 @@ litellm:
   networkPolicy: true
   podMonitoring: true
   # Redaction of every request body the gateway forwards to a provider. Off by
-  # default: on, the ConfigMap also carries the shared redactor module and a
-  # LiteLLM pre-call hook, mounted beside /app/config.yaml, and the hook runs
+  # default: on, the ConfigMap also carries the shared redactor module and the
+  # redaction pre-call hook, mounted beside /app/config.yaml, and the hook runs
   # the built-in credential patterns plus the rules below over messages,
   # tool-call arguments, embeddings input and completion prompts before the
   # provider sees them.
