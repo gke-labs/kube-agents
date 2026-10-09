@@ -110,9 +110,9 @@ Nothing here is provider-specific. Non-Anthropic backends drop the markers in th
 
 ### Replayed thinking on Gemini
 
-A client that turns thinking on, as the session pods' Claude Code does, sends each earlier turn's thinking back in the next request. LiteLLM passes that thinking to a Gemini model as ordinary text rather than as a thought, so Gemini reads its earlier thought summaries as things it said and opens its next answers with more of them: a bold step title and a line such as "I will now draft the report". No prompt reaches that text.
+A client that turns thinking on, as Claude Code does in the session pods of an install on the unsupported `spec.mode: next` stack, sends each earlier turn's thinking back in the next request. LiteLLM passes that thinking to a Gemini model as ordinary text rather than as a thought, so Gemini reads its earlier thought summaries as things it said and opens its next answers with more of them: a bold step title and a line such as "I will now draft the report". No prompt reaches that text.
 
-Both the chart and the kustomize base therefore load a pre-call hook that drops replayed thinking blocks from earlier assistant turns before the request goes to a Gemini model. Thinking still streams back, and requests to any other model, Claude above all, go out as sent. The gateway log records each request it changed, as `kube_agents.litellm_thinking_replay INFO thinking replay: dropped N replayed thinking block(s)`. The hook is removed once the pinned LiteLLM release handles replayed thinking itself.
+Both the chart and the kustomize base therefore load a pre-call hook that drops replayed thinking blocks from earlier assistant turns before the request goes to a Gemini model. Thinking still streams back, and requests to any other model, Claude above all, go out as sent. The gateway log records each request it changed, as `kube_agents.litellm_thinking_replay INFO thinking replay: dropped N replayed thinking block(s)`.
 
 ### Redaction at the gateway
 

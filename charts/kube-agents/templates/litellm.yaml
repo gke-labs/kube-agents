@@ -30,8 +30,9 @@
 {{- $redactionEnabled := $redaction.enabled | default false }}
 {{- /*
   The redaction rule file and the two Python modules that consume it, rendered
-  only when the feature is on so the default ConfigMap, and with it the
-  checksum below and the kustomize dev base, stay byte-identical. The action
+  only when the feature is on, so with it off the ConfigMap and the checksum
+  below carry none of the three, like the kustomize dev base, which has no
+  redaction. The action
   checks duplicate what the hook checks at import on purpose: a typo here
   should fail the render, not the rollout.
 */}}
@@ -84,8 +85,8 @@
 {{- end }}
 {{- end }}
 {{- /*
-  Rendered as the flow list LiteLLM's config expects, byte-identical to the
-  kustomize base for the default cases. The redaction callback is a module
+  Rendered as the flow list LiteLLM's config expects, the same callbacks the
+  kustomize base names when otel is on. The redaction callback is a module
   path relative to the config directory, which is why its two files are
   mounted beside config.yaml below.
 */}}
