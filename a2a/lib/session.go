@@ -57,6 +57,12 @@ const (
 	// session pod whose spawner dropped its session name still fails at
 	// startup rather than publishing as its profile.
 	EnvProfileExecutor = "A2A_PROFILE_EXECUTOR"
+	// EnvDelegateTool turns the session's delegate tool off when it is
+	// "off". The spawner sets it on a wake turn's pod: the wake exists to
+	// report a delegation's outcome, and a wake that delegates again on an
+	// interim answer ("still running, results will post here") loops until
+	// the depth bound refuses, with nothing answered.
+	EnvDelegateTool = "A2A_DELEGATE_TOOL"
 )
 
 const (

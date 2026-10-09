@@ -755,3 +755,10 @@
 # clusters upgrade --node-pool, and the no_upgrades limits name the rolling
 # 92-day window. deployer: noop, transcript-only, one delegation round trip.
 ./tasks/upgrades-freeze-runbook-probe/task.yaml
+
+# A /session turn that delegates a cluster question ends in one wake's answer,
+# not in the delegation depth bound (#2819). Real only on the next lane's
+# inject transport, where the gateway routes /session to a session pod; on
+# the api lane it reaches the platform agent as a plain prompt and its
+# forbidden-phrase check passes without testing anything. deployer: noop.
+./tasks/session-cluster-question-wake-answers-once/task.yaml

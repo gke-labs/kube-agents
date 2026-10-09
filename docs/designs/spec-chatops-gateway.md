@@ -418,7 +418,8 @@ by the `chat` profile's own deadline, and the executors it delegates to run to t
 two do not nest. When the session delegates, its turn completes with a reply that says so
 ("delegated to `platform`, task `t_…`"), the gateway relays the child's events into the
 thread as it does for any task, and the child's terminal wakes the session for one more turn
-with the child's result as its input, so the session can synthesize or follow up. A follow-up
+with the child's result as its input, so the session can synthesize it (the wake can't delegate
+again; below). A follow-up
 the human sends while the child runs steers the child, through the gateway, as follow-ups do
 today: the platform executor queues each one and answers it after the current turn (on its
 `api` executor; the `cli` executor refuses it `no-resume`), and
@@ -469,7 +470,16 @@ so the chain is minted or refused as the relay would have done it. The relay doe
 turn's terminal when the request's own event was lost before it ran (acked, then a gateway crash):
 a session turn's `completed` with neither a child nor a refusal on record runs the request read
 off the stream first. Both outcomes are written to the record when they are made - the child's
-link in the mint's own write, the refusal in its own - so neither path runs a request twice.
+link in the mint's own write, the refusal in its own - so neither path runs a request twice. The wake's text then closes with a guide chosen by where the chain's answer goes. In a chat the
+child's result is already posted, so it tells the session to reply with what it means rather than
+repeat it; to a program behind a door, which sees only the wake's reply, it asks for the whole
+answer. Either way it says to state plainly when the child failed or reports more work still
+running. The wake's pod has no delegate tool (`A2A_DELEGATE_TOOL=off`, set by the
+spawner for a wake turn): a wake that could delegate read an interim answer such as "still
+checking, the results will post here" as a reason to ask again, and each ask woke another pod
+until the depth bound refused, with nothing answered. A message the person sends while the wake
+runs steers the wake like any other running turn, so it is answered without the tool as well. A
+question sent after the wake answers is a new human turn and has the tool.
 
 **To a program behind a door, the chain is one task.** A caller through the A2A door (or the
 inject door) submitted one task, so the gateway tells the adapter's task observers about the chain

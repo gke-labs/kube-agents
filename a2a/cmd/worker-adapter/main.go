@@ -355,7 +355,7 @@ func harnessCommand() []string {
 // else, so A2A_DELEGATE_TOOL=off is one decision rather than three that could
 // drift apart.
 func delegateToolEnabled() bool {
-	return os.Getenv("A2A_DELEGATE_TOOL") != "off"
+	return os.Getenv(lib.EnvDelegateTool) != "off"
 }
 
 // allowsBash reports whether a harness --allowedTools value names Bash, bare
