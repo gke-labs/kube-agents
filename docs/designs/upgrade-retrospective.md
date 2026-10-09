@@ -191,11 +191,13 @@ A question that names a cluster the last run did not review forces that cluster 
 The ledger holds, per cluster, the control-plane version, every node pool's version, the time of
 the last run, the symptom set seen at the last full run (owner, category, reason and onset, no
 tenant text), and the operations reviewed (id, type, target and end time, kept while inside the
-selection window). A scoped run writes only the reviewed operations of the clusters it reviewed
-and its report; versions, last-run time and the symptom set are the full run's, so the next Sunday
-still selects the cluster on the operation's end time, refreshes its baseline, and reports the
-operation as already reviewed by the after-upgrade route; a second wake for an operation already
-in that list prints nothing. The before side of the catalogue's diff is established two ways, and the stronger one
+selection window). A scoped run writes, for the clusters it reviewed, its report, the reviewed
+operations and the guards (so the readiness check learns a failure the same day, requirement 3);
+versions, last-run time and the symptom set stay the full run's, so the next Sunday still selects
+the cluster on the operation's end time, refreshes its baseline, and reports an incident the
+after-upgrade run already filed as already reviewed, carrying its guard forward rather than grading
+it again; a second wake for an operation already in the list prints nothing. This is the one
+statement of what a scoped run writes; §3.5 and §3.6 defer to it. The before side of the catalogue's diff is established two ways, and the stronger one
 decides. Every full run reads pods and nodes on every fleet cluster, upgraded or not (one list call
 each), so the stored set is at most a week old rather than as old as the previous upgrade. And each
 symptom carries its own onset. The default is the pod's own evidence: a Pending pod's start, a
@@ -278,7 +280,10 @@ already uses, the collector manifest
 design's own. On a full run the collector writes it beside the report (`--manifest-file`): one
 `clusters[]` entry per cluster it enumerated, with `outcome: collected` and a `commands[]` record
 per check that ran, or `outcome: unreachable` or `gate-failed` with the error for a cluster whose
-project listing failed, whose reads failed, or that is upgrading now; `candidates[]` for every
+project listing failed or whose reads failed; a cluster upgrading now is `collected` with every
+check in `checks_not_applicable` (reason: upgrading now, reviewed after the operation ends) and its
+held guards re-emitted as candidates, so a Sunday with one cluster mid-window is not a partial run
+and its ledger can still close; `candidates[]` for every
 incident the report files, an Error at `major` and a Warning at `minor`, with the check id, object,
 excerpt and the mitigation text, including a candidate for every `failure` guard the run still
 observes, which is how the harness holds a finding on the ledger (its `still_flagged_ids` are the
@@ -322,7 +327,11 @@ processes), then 20, 17, 2 (`Insufficient cpu` or `memory` in the clause for the
 targets, after a node-pool operation), 1, and 12 last. Row 12 is the generic one: the scheduler
 writes a `didn't match Pod's node affinity/selector` clause for every node group a pinned pod does
 not target, beside the clause that says why its own pool refused it, so row 12 holds only when every
-clause is a selector or affinity miss, which is a selector that names a label the pool lost. An
+clause is a selector or affinity miss. That alone does not say the pool lost the label: an
+autoscaled pool at zero nodes, a label a pool never carried or a deleted pool write the same
+message, and the collector holds no before-state of node labels. Row 12 is therefore `medium`
+unless the selector names a label the catalogue lists as dropped in the target minor, which the
+collector carries as a table, and then it is `high`. An
 `OOMKilled` container on a migrated pool with an old runtime that also runs several processes is
 entry 14, with entry 15 named in the evidence as a second cause.
 
@@ -385,10 +394,12 @@ another. Under the root: `reports/<timestamp>.md`, `upgrade-retro-report.md` bes
 at the latest full run, the same report as `.json`, `ledger.json` and `guards.json`. The volume survives a
 pod restart, every session's tools can read it, and the on-demand route finds the Sunday report
 there. Three triggers write the same files, so one run holds an exclusive lock on `.lock` under the
-root for its duration; a second run, scheduled, after-upgrade or on demand, waits for it up to
-twenty minutes (an after-upgrade wake can land in the same minute as the Sunday run), and only a
-run still locked out after that prints one line and exits without writing (a dry run reads without
-the lock). An after-upgrade run that waited and then finds its operations already in the reviewed
+root for its duration; a second run, scheduled, after-upgrade or on demand, waits for it up to ten
+minutes (an after-upgrade wake can land in the same minute as the Sunday run), and only a run still
+locked out after that prints one line and exits without writing (a dry run reads without the lock).
+The SOP runs the collector the way the obtainability SOP runs its collector, as a background
+terminal command with a 1500-second budget, so the wait and the run fit inside it and the default
+180-second foreground timeout never cuts the run. An after-upgrade run that waited and then finds its operations already in the reviewed
 list prints nothing. Reports are named by their finish time in UTC, full
 runs as `reports/<timestamp>.md` and scoped runs as `reports/<timestamp>-scoped.md`, so two runs on
 one day never replace each other; each ring is pruned to the newest fourteen, the retention the
