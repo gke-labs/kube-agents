@@ -146,6 +146,9 @@ readonly PLATFORM_AGENT_SHELL_STATEFULSET="platform-agent-shell"
 readonly PLATFORM_AGENT_CREDENTIAL_PROXY_DEPLOYMENT="platform-agent-credential-proxy"
 # The design document a spec.mode switch points the operator at.
 readonly PLATFORM_AGENT_MODE_SWITCH_DOC="docs/designs/spec-mode-switch.md"
+# The Slack app setup page's allowlist section, which says how to find a
+# member ID; refuse_next_slack_allowlist_emails points at it.
+readonly SLACK_ALLOWLIST_DOC="https://gke-labs.github.io/kube-agents/install/slack-app/#allowed-users"
 # What platform_agent_mode_in_values and platform_agent_mode_on_cr print for
 # a field that is not there: a record that carries no platformAgent.mode, or a
 # CR with no spec.mode. Told apart from printing nothing, which means there is
@@ -603,6 +606,28 @@ note_platform_agent_mode_not_applied() {
   print_warning "install.env sets PLATFORM_AGENT_MODE=${key}, but this --upgrade-mode=${upgrade_mode} run re-tags the release's recorded values and leaves it at spec.mode ${running}."
   print_info "A full upgrade applies the switch to ${full} (${PLATFORM_AGENT_MODE_SWITCH_DOC}). To stay on ${running}, set PLATFORM_AGENT_MODE=${running} in install.env."
   platform_agent_mode_extra_values_caveat
+}
+
+# Under spec.mode next the A2A gateway matches SLACK_ALLOWED_USERS against
+# Slack member IDs exactly (U.../W...). The installer's prompt in 0.7 and 0.8
+# asked for "User IDs / Emails", so an install can carry an email, which
+# matches nobody under next: that person is refused after the switch, and a
+# list of only emails is non-empty, so it does not fall back to allow-all
+# either. Refused before the front door changes anything (#2812); a today
+# install, or next with Slack off, is left alone. No email-to-ID lookup. $1
+# the mode the apply renders, $2 SLACK_ENABLED, $3 the allowlist, split as
+# hcl_csv_list renders it, $4 where to fix it (default install.env).
+refuse_next_slack_allowlist_emails() {
+  local mode="${1:-}" slack_enabled="${2:-}" allowlist="${3:-}" where="${4:-install.env}" item emails=""
+  [ "$mode" = "next" ] || return 0
+  is_truthy "$slack_enabled" || return 0
+  while IFS= read -r item; do
+    case "$item" in *@*) emails="${emails:+${emails}, }${item}" ;; esac
+  done <<< "$(csv_list_items "$allowlist")"
+  [ -n "$emails" ] || return 0
+  print_error "SLACK_ALLOWED_USERS holds entries that look like emails: ${emails}. Under spec.mode next the A2A gateway matches this allowlist against Slack member IDs exactly (such as U0123ABCD), so an email matches nobody and the person it names would be locked out after this apply."
+  print_info "Find each person's member ID in Slack: open their profile, choose ⋮ (More), then Copy member ID. Replace the emails with those IDs in ${where} and run again. Slack app setup for next: ${SLACK_ALLOWLIST_DOC}"
+  return 1
 }
 
 # Said when a read the notice needs failed, so the run does not go on as if
@@ -1271,11 +1296,12 @@ hcl_bool() {
   if is_truthy "${1:-}"; then printf 'true'; else printf 'false'; fi
 }
 
-# Comma- or space-separated string → HCL list of strings, dropping empty
-# items. Both separators, because --custom-roles documents "space- or
-# comma-separated".
-hcl_csv_list() {
-  local csv="${1:-}" out="[" first=true item had_noglob=false
+# Comma- or space-separated string → its items, one per line, trimmed, empty
+# items dropped. Both separators, because --custom-roles documents "space- or
+# comma-separated". hcl_csv_list renders every list key through this, so a
+# check that reads a list sees the items the tfvars carry.
+csv_list_items() {
+  local csv="${1:-}" item had_noglob=false
   local IFS=$', \t\n'
   # Globbing off around the unquoted split: an entry such as *-sandbox (a
   # scope exclusion) would otherwise be replaced by whatever files match it
@@ -1287,11 +1313,20 @@ hcl_csv_list() {
     item="${item#"${item%%[![:space:]]*}"}"
     item="${item%"${item##*[![:space:]]}"}"
     [ -n "$item" ] || continue
+    printf '%s\n' "$item"
+  done
+  $had_noglob || set +f
+}
+
+# Comma- or space-separated string → HCL list of strings (csv_list_items).
+hcl_csv_list() {
+  local out="[" first=true item
+  while IFS= read -r item; do
+    [ -n "$item" ] || continue
     $first || out+=", "
     out+="$(hcl_str "$item")"
     first=false
-  done
-  $had_noglob || set +f
+  done <<< "$(csv_list_items "${1:-}")"
   printf '%s]' "$out"
 }
 

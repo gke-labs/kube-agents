@@ -5802,6 +5802,121 @@ class PlatformAgentModeTest(unittest.TestCase):
         )
 
 
+class NextSlackAllowlistRefusalWiringTest(unittest.TestCase):
+    """#2812 on install.sh: a run whose mode is next (--mode=next, or
+    PLATFORM_AGENT_MODE=next in install.env) with Slack on refuses an email in
+    the Slack allowlist once the chat interview has settled the list, before
+    the generator, install.env or any apply. The check itself is
+    refuse_next_slack_allowlist_emails (tests/test_installer_common.py)."""
+
+    _CALL = (
+        'refuse_next_slack_allowlist_emails "${PARAM_PLATFORM_AGENT_MODE:-$DEFAULT_PLATFORM_AGENT_MODE}" '
+        '"$slack_enabled" "$slack_allowed_users" "install.env or --slack-allowed-users" || exit 1'
+    )
+    _MENU_CALL = (
+        'refuse_next_slack_allowlist_emails "${PLATFORM_AGENT_MODE:-$DEFAULT_PLATFORM_AGENT_MODE}" '
+        '"$slack_enabled" "${SLACK_ALLOWED_USERS:-}" || return 1'
+    )
+    _CHAT_STEP = '  print_step "6. Chat & Messaging Integrations Setup"\n'
+
+    _env = staticmethod(PlatformAgentModeTest._env)
+    _run = PlatformAgentModeTest._run
+    _file = PlatformAgentModeTest._file
+
+    def _chat_step(self):
+        """main()'s step 6 through the refusal, as a function: the real
+        interview code, run non-interactively, then the check."""
+        text = _INSTALL_SH.read_text()
+        main_start = text.index("\nmain() {")
+        start = text.index(self._CHAT_STEP, main_start)
+        end = text.index(self._CALL, start) + len(self._CALL)
+        return f"_chat_step() {{\n{text[start:end]}\n}}\n"
+
+    def _step(self, flags, content):
+        stubs = (
+            "has_controlling_tty() { return 1; }\n"
+            "gke_dns_endpoint_flag() { GKE_DNS_ENDPOINT_FLAG=\"\"; }\n"
+            "tf_state_chat_subscription_name() { :; }\n"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._file(tmp, content)
+            proc = self._run(
+                f"{stubs}{self._chat_step()}parse_args --non-interactive {flags}\n"
+                # As main's step 2 runs them.
+                "resolve_shared_defaults\n"
+                "validate_platform_agent_mode || exit 1\n"
+                "check_flags_against_install_env || exit 1\n"
+                # Set by steps 4 and 5; the no-chat arm prints them.
+                "project_id=p region=r cluster_name=c\n"
+                '_chat_step; echo "went on"',
+                install_env=path,
+            )
+            after = path.read_text()
+        self.assertEqual(after, content, "the refusal rewrote install.env")
+        return proc
+
+    def test_next_with_slack_and_an_email_is_refused_before_anything_is_written(self):
+        for flags, content in (
+            ("--mode=next --enable-slack --slack-allowed-users=U0123ABCD,alice@example.com", ""),
+            ("", "PLATFORM_AGENT_MODE=next\nSLACK_ENABLED=true\nSLACK_ALLOWED_USERS=\"U0123ABCD, alice@example.com\"\n"),
+        ):
+            with self.subTest(flags=flags, content=content):
+                proc = self._step(flags, content)
+                out = proc.stdout + proc.stderr
+                self.assertNotIn("went on", proc.stdout, out)
+                self.assertEqual(proc.returncode, 1, out)
+                self.assertIn("SLACK_ALLOWED_USERS holds entries that look like emails: alice@example.com.", out)
+                self.assertIn("matches this allowlist against Slack member IDs exactly", out)
+                self.assertIn("Copy member ID", out)
+                self.assertIn("in install.env or --slack-allowed-users and run again", out)
+                self.assertIn("/kube-agents/install/slack-app/#allowed-users", out)
+
+    def test_the_cases_the_refusal_leaves_alone_go_on(self):
+        for flags, content in (
+            # next with member IDs.
+            ("--mode=next --enable-slack --slack-allowed-users=U0123ABCD,W0456EFGH", ""),
+            ("", "PLATFORM_AGENT_MODE=next\nSLACK_ENABLED=true\nSLACK_ALLOWED_USERS=U0123ABCD\n"),
+            # today with an email: the today path is not changed here.
+            ("--enable-slack --slack-allowed-users=alice@example.com", ""),
+            ("", "PLATFORM_AGENT_MODE=today\nSLACK_ENABLED=true\nSLACK_ALLOWED_USERS=alice@example.com\n"),
+            # next without Slack: the list is inert.
+            ("", "PLATFORM_AGENT_MODE=next\nSLACK_ENABLED=false\nSLACK_ALLOWED_USERS=alice@example.com\n"),
+        ):
+            with self.subTest(flags=flags, content=content):
+                proc = self._step(flags, content)
+                out = proc.stdout + proc.stderr
+                self.assertIn("went on", proc.stdout, out)
+                self.assertNotIn("look like emails", out)
+
+    def test_main_refuses_after_the_interview_and_before_any_write(self):
+        text = _INSTALL_SH.read_text()
+        main_start = text.index("\nmain() {")
+        self.assertEqual(text.count(self._CALL), 1)
+        call = text.index(self._CALL, main_start)
+        # After the Slack prompts settle the list, so an interactive answer is
+        # checked too.
+        self.assertLess(text.index("      _prompt_slack_settings\n      ;;\n    4)", main_start), call)
+        for later in (
+            'print_step "7. AI Model Provider Credentials"',
+            'write_tfvars_from_state "$tfvars_file" "$image_tag"',
+            'bootstrap_install_env_file "$INSTALL_ENV_FILE" "$image_tag"',
+            "\n  record_flags_into_install_env\n",
+            "\n    record_flags_into_install_env\n",
+            'print_step "12. Applying the Install (Terraform + Helm)"',
+        ):
+            with self.subTest(later=later):
+                self.assertLess(call, text.index(later, main_start))
+
+    def test_the_menu_apply_refuses_before_it_saves(self):
+        text = _INSTALL_SH.read_text()
+        arm = text.index('        print_step "Saving & Re-applying Configuration State"\n')
+        self.assertEqual(text.count(self._MENU_CALL), 1)
+        call = text.index(self._MENU_CALL)
+        self.assertLess(arm, call)
+        self.assertLess(call, text.index("save_env_var PROJECT_ID", arm))
+        self.assertLess(call, text.index("run_lifecycle_apply", arm))
+
+
 class FrontDoorsAgreeOnTheRepositoryTest(unittest.TestCase):
     """Each front door clones the install sources before it has a checkout to
     read the URL from, so each carries the URL; this pins the three equal."""

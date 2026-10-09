@@ -4669,5 +4669,87 @@ class ScopeContainerPreflightTest(unittest.TestCase):
         self.assertNotIn("ERROR", proc.stdout)
 
 
+class NextSlackAllowlistRefusalTest(unittest.TestCase):
+    """refuse_next_slack_allowlist_emails (#2812): under spec.mode next the A2A
+    gateway matches SLACK_ALLOWED_USERS against Slack member IDs exactly, so an
+    email entry (the 0.7/0.8 prompt asked for "User IDs / Emails") matches
+    nobody and locks that user out. The front doors call this before they
+    change anything; a today install, or next without Slack, is unaffected."""
+
+    _DOC = "https://gke-labs.github.io/kube-agents/install/slack-app/#allowed-users"
+
+    def _run(self, mode, enabled, allowlist, where=None, cwd=None):
+        args = " ".join(shlex.quote(a) for a in (mode, enabled, allowlist) + ((where,) if where else ()))
+        script = (
+            'print_info() { echo "INFO: $*"; }\n'
+            'print_success() { :; }\n'
+            'print_warning() { echo "WARN: $*"; }\n'
+            'print_error() { echo "ERROR: $*"; }\n'
+            f'source "{_INSTALLER_COMMON}"\n'
+            f'rc=0; refuse_next_slack_allowlist_emails {args} || rc=$?; echo "rc=$rc"\n'
+            'case "$-" in *f*) echo "noglob-left-on" ;; esac\n'
+        )
+        return subprocess.run(
+            ["bash", "-c", script], capture_output=True, text=True,
+            env=get_isolated_test_env(), cwd=str(cwd or _REPO_ROOT),
+        )
+
+    def test_next_with_slack_refuses_an_email_and_names_it(self):
+        proc = self._run("next", "true", "U0123ABCD,alice@example.com")
+        out = proc.stdout + proc.stderr
+        self.assertIn("rc=1", proc.stdout, out)
+        self.assertIn(
+            "ERROR: SLACK_ALLOWED_USERS holds entries that look like emails: alice@example.com. "
+            "Under spec.mode next the A2A gateway matches this allowlist against Slack member IDs "
+            "exactly (such as U0123ABCD), so an email matches nobody and the person it names "
+            "would be locked out after this apply.",
+            out,
+        )
+        self.assertIn(
+            "INFO: Find each person's member ID in Slack: open their profile, choose \u22ee (More), "
+            "then Copy member ID. Replace the emails with those IDs in install.env and run again. "
+            f"Slack app setup for next: {self._DOC}",
+            out,
+        )
+        self.assertNotIn("U0123ABCD,", out)
+
+    def test_every_email_entry_is_named_after_the_allowlists_own_splitting(self):
+        # Commas and whitespace both separate, empty items drop, as
+        # hcl_csv_list renders the list into the tfvars.
+        proc = self._run("next", "True", " U1 ,alice@example.com  bob@example.com,,\tW2 ")
+        self.assertIn("rc=1", proc.stdout, proc.stderr)
+        self.assertIn("look like emails: alice@example.com, bob@example.com. ", proc.stdout)
+
+    def test_the_remedy_names_the_callers_source(self):
+        proc = self._run("next", "true", "alice@example.com", where="install.env or --slack-allowed-users")
+        self.assertIn("rc=1", proc.stdout, proc.stderr)
+        self.assertIn("Replace the emails with those IDs in install.env or --slack-allowed-users and run again.", proc.stdout)
+
+    def test_member_ids_pass(self):
+        for allowlist in ("U0123ABCD", "U0123ABCD, W0456EFGH", "U1 W2", ""):
+            with self.subTest(allowlist=allowlist):
+                proc = self._run("next", "true", allowlist)
+                self.assertEqual(proc.stdout, "rc=0\n", proc.stderr)
+
+    def test_today_keeps_an_email(self):
+        for mode in ("today", ""):
+            with self.subTest(mode=mode):
+                proc = self._run(mode, "true", "alice@example.com")
+                self.assertEqual(proc.stdout, "rc=0\n", proc.stderr)
+
+    def test_next_without_slack_keeps_an_email(self):
+        for enabled in ("false", "", "no"):
+            with self.subTest(enabled=enabled):
+                proc = self._run("next", enabled, "alice@example.com")
+                self.assertEqual(proc.stdout, "rc=0\n", proc.stderr)
+
+    def test_an_entry_is_never_expanded_against_the_working_directory(self):
+        with tempfile.TemporaryDirectory() as cwd:
+            (pathlib.Path(cwd) / "x@example.com").write_text("")
+            proc = self._run("next", "true", "*@example.com", cwd=cwd)
+        self.assertIn("look like emails: *@example.com. ", proc.stdout, proc.stderr)
+        self.assertNotIn("noglob-left-on", proc.stdout)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -3643,5 +3643,84 @@ class ScopeCheckWiringTest(unittest.TestCase):
         self.assertIn('kubectl --context "$(gke_context_name)" apply --server-side --force-conflicts', common)
 
 
+class FullArmRefusesNextSlackAllowlistEmailsTest(unittest.TestCase):
+    """#2812 on upgrade.sh: the full arm applies PLATFORM_AGENT_MODE from
+    install.env, so a next install with Slack whose SLACK_ALLOWED_USERS holds
+    an email is refused there, beside refuse_full_apply_dropping_next and
+    before the arm's first write. The arm is run from the source with every
+    other guard and both writes stubbed, so "nothing applied" is observed."""
+
+    _CALL = (
+        'refuse_next_slack_allowlist_emails "${PLATFORM_AGENT_MODE:-$DEFAULT_PLATFORM_AGENT_MODE}" '
+        '"${SLACK_ENABLED:-$DEFAULT_SLACK_ENABLED}" "${SLACK_ALLOWED_USERS:-}" || exit 1'
+    )
+
+    def _arm(self):
+        source = _UPGRADE_SH.read_text()
+        start = source.index("\n    full)\n", source.index('case "$PARAM_UPGRADE_MODE" in\n    operator)'))
+        body_start = start + len("\n    full)\n")
+        end = source.index("\n      ;;\n", body_start)
+        return source[body_start:end]
+
+    def _run(self, keys):
+        stubs = (
+            "print_step() { :; }\n"
+            "refuse_apply_over_undeclared_scope() { :; }\n"
+            "announce_platform_agent_mode_for_apply() { :; }\n"
+            "check_scope_container_access() { :; }\n"
+            "check_service_account_ownership() { :; }\n"
+            'apply_crd_upgrades() { echo "APPLIED crds"; }\n'
+            'run_lifecycle() { echo "APPLIED terraform"; }\n'
+        )
+        exports = "".join(f"export {k}={shlex.quote(v)}\n" for k, v in keys.items())
+        script = (
+            f'KUBE_AGENTS_SOURCE_ONLY=true source "{_UPGRADE_SH}"\n'
+            f'source "{_REPO_ROOT}/scripts/installer/installer_common.sh"\n'
+            f"{stubs}{exports}"
+            f'repo_dir="{_REPO_ROOT}"; tfvars_file=/nonexistent; target_namespace=kube-agents\n'
+            f"_full() {{\n{self._arm()}\n}}\n"
+            "_full\n"
+        )
+        return subprocess.run(
+            ["bash", "-c", script], capture_output=True, text=True,
+            env=get_isolated_test_env(), cwd=str(_REPO_ROOT),
+        )
+
+    def test_next_with_slack_and_an_email_is_refused_and_nothing_is_applied(self):
+        proc = self._run({"PLATFORM_AGENT_MODE": "next", "SLACK_ENABLED": "true",
+                          "SLACK_ALLOWED_USERS": "U0123ABCD, alice@example.com"})
+        out = proc.stdout + proc.stderr
+        self.assertEqual(proc.returncode, 1, out)
+        self.assertNotIn("APPLIED", out)
+        self.assertIn("SLACK_ALLOWED_USERS holds entries that look like emails: alice@example.com.", out)
+        self.assertIn("matches this allowlist against Slack member IDs exactly", out)
+        self.assertIn("Copy member ID", out)
+        self.assertIn("in install.env and run again", out)
+        self.assertIn("/kube-agents/install/slack-app/#allowed-users", out)
+
+    def test_the_cases_the_refusal_leaves_alone_apply(self):
+        for keys in (
+            {"PLATFORM_AGENT_MODE": "next", "SLACK_ENABLED": "true", "SLACK_ALLOWED_USERS": "U0123ABCD,W0456EFGH"},
+            {"PLATFORM_AGENT_MODE": "today", "SLACK_ENABLED": "true", "SLACK_ALLOWED_USERS": "alice@example.com"},
+            {"SLACK_ENABLED": "true", "SLACK_ALLOWED_USERS": "alice@example.com"},
+            {"PLATFORM_AGENT_MODE": "next", "SLACK_ENABLED": "false", "SLACK_ALLOWED_USERS": "alice@example.com"},
+            {"PLATFORM_AGENT_MODE": "next", "SLACK_ALLOWED_USERS": "alice@example.com"},
+        ):
+            with self.subTest(keys=keys):
+                proc = self._run(keys)
+                out = proc.stdout + proc.stderr
+                self.assertEqual(proc.returncode, 0, out)
+                self.assertIn("APPLIED crds\nAPPLIED terraform", proc.stdout, out)
+                self.assertNotIn("look like emails", out)
+
+    def test_the_refusal_sits_beside_the_dropped_next_refusal_before_the_gate(self):
+        arm = self._arm()
+        self.assertEqual(arm.count(self._CALL), 1)
+        call = arm.index(self._CALL)
+        self.assertLess(arm.index('refuse_full_apply_dropping_next "${repo_dir}/${KUBE_AGENTS_VALUES_SCHEMA}" || exit 1'), call)
+        self.assertLess(call, arm.index("declare -F announce_platform_agent_mode_for_apply"))
+        self.assertLess(call, arm.index('UPGRADE_APPLY_STARTED="true"'))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -5176,6 +5176,10 @@ run_menu_system() {
         ;;
       6)
         print_step "Saving & Re-applying Configuration State"
+        # Before anything is saved: this apply renders PLATFORM_AGENT_MODE
+        # from install.env, and under next an email in the Slack allowlist
+        # matches nobody.
+        refuse_next_slack_allowlist_emails "${PLATFORM_AGENT_MODE:-$DEFAULT_PLATFORM_AGENT_MODE}" "$slack_enabled" "${SLACK_ALLOWED_USERS:-}" || return 1
         resolve_effective_image_tag image_tag "$repo_dir" "$image_tag" || return 1
         validate_immutable_ref "$image_tag" || return 1
         verify_local_source_ref "$repo_dir" "$image_tag"
@@ -5889,6 +5893,10 @@ main() {
       _prompt_no_chat_enabled
       ;;
   esac
+  # The Slack allowlist is settled here, flag, install.env or answer, and an
+  # email in it matches nobody once the A2A gateway holds Slack under next.
+  # Refused now, before the generator, install.env or any apply.
+  refuse_next_slack_allowlist_emails "${PARAM_PLATFORM_AGENT_MODE:-$DEFAULT_PLATFORM_AGENT_MODE}" "$slack_enabled" "$slack_allowed_users" "install.env or --slack-allowed-users" || exit 1
 
   # 7. LLM Model Provider Selection & API Key Auto-Discovery
   print_step "7. AI Model Provider Credentials"
