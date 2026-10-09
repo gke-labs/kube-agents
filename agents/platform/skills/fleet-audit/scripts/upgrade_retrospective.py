@@ -51,8 +51,8 @@ grouping under `sections` beside the per-cluster `reviews`.
 Projects come from `--project`, else the active gcloud project plus
 `gcloud projects list`, exactly as `collect.py` discovers the fleet.
 
-Only a run invoked with `--full` is *full* (`--full` with `--cluster` is a
-usage error): it records the fleet's project set in the ledger and may
+Only a run invoked with `--full` is *full* (`--full` needs an explicit
+`--project` set and cannot be combined with `--cluster` or `--since`): it records the fleet's project set in the ledger and may
 change it (a project absent from its `--project` set is pruned with its
 clusters and guards, a joined project is added), prunes departed clusters,
 refreshes every fleet cluster's stored symptom set (pods, nodes and owners,
@@ -237,11 +237,14 @@ FIRST_RUN_GRADING_TEXT = "first run: graded by onset only, no previous symptom s
 LEDGER_PROJECTS_KEY = "projects"
 OUTSIDE_FLEET_TEXT = "outside the fleet; not recorded"
 FULL_WITH_CLUSTER_TEXT = "--full names a fleet-wide run and cannot be combined with --cluster"
+FULL_WITHOUT_PROJECT_TEXT = "--full needs an explicit --project set: a discovered project list can be short, and a full run prunes what it does not see"
+FULL_WITH_SINCE_TEXT = "--full names the scheduled fleet-wide run and cannot be combined with --since (a hand run)"
 NOT_FULL_TEXT = "no --full: a scoped run"
 LISTING_FAILED_TEXT = "{cluster}: its project's listing failed ({error}); ledger entry and guards kept unchanged"
 # A crash record beside no ledger blocks every run until it is archived.
-CRASH_RECORD_GLOB = LEDGER_FILENAME + ".unreadable-*"
-GUARDS_RECORD_GLOB = GUARDS_FILENAME + ".unreadable-*"
+UNREADABLE_GLOB_SUFFIX = ".unreadable-*"
+CRASH_RECORD_GLOB = LEDGER_FILENAME + UNREADABLE_GLOB_SUFFIX
+GUARDS_RECORD_GLOB = GUARDS_FILENAME + UNREADABLE_GLOB_SUFFIX
 ARCHIVE_SUBDIR = "archive"
 CRASH_RECORD_TEXT = "{path} sits beside no live state file: a crash record, not a re-baseline. Restore it as the ledger or run --reset-ledger to archive it; until then nothing starts from empty. Nothing written."
 RESET_LEDGER_TEXT = "archived {count} crash record(s) under {archive}; the next run starts fresh."
@@ -361,6 +364,7 @@ WEBHOOK_POD_OPERATIONS = ("CREATE", "*")
 WEBHOOK_CONFIGURATION_KINDS = ("ValidatingWebhookConfiguration", "MutatingWebhookConfiguration")
 ENDPOINTSLICE_SERVICE_LABEL = "kubernetes.io/service-name"
 SINGLE_REPLICA = 1
+PERCENT_ALL = 100
 # Namespaces whose DaemonSets are GKE's own agents: they move with the node
 # image, so 13 and 17 there are counted on one line, not reported or guarded.
 # `is_system_namespace` covers kube-system, gmp-system and every `gke-*`
@@ -519,7 +523,7 @@ MITIGATIONS = {
     5: {
         "title": "Maintenance window too short, or an exclusion ends mid-roll",
         "before": "Window length against node count times drain time; an exclusion ending inside the planned change.",
-        "read_today": "the readiness mode grades the covering exclusion; the security-patch orchestrator reads the window",
+        "read_today": "the readiness mode grades the covering exclusion; the security-patch orchestrator reads the window and the exclusions (`no-maintenance-window`, `blocking-exclusion`)",
         "mitigate_before": "A window long enough for node count times drain time, exclusions that end outside the change, blue-green where the window is tight.",
         "mitigate_after": "Extend the window or finish the upgrade by hand so the pool stops running two versions.",
     },
@@ -561,7 +565,7 @@ MITIGATIONS = {
     11: {
         "title": "The control plane is unreachable for minutes on a zonal cluster",
         "before": "The cluster is zonal; whether its clients retry is not readable from the cluster.",
-        "read_today": "nothing as an upgrade risk; the cluster inventory audit records each control plane's location, and the upgrade skill recommends regional control planes when asked",
+        "read_today": "nothing as an upgrade risk; the cluster inventory audit, run once per cluster by the onboarding sweep, records each control plane's location, and the upgrade skill recommends regional control planes when asked",
         "mitigate_before": "A regional cluster for anything automation depends on, and retries with backoff in the clients.",
         "mitigate_after": "Wait for the control plane; GitOps resyncs on its own.",
     },
@@ -655,7 +659,7 @@ OPERATION_GUARD_TEXT = "no guard: an operation carries none; its cluster's risks
 INFO_UNCHANGED = "Unchanged clusters:"
 INFO_REMOVED = "Removed clusters:"
 INFO_RECHECKED = "Re-checked for live guards and refreshed symptom sets:"
-PARTIAL_READ_TEXT = "Partially read ({failed}): the guards were kept and the cluster is re-read next run."
+PARTIAL_READ_TEXT = "Partially read ({failed}): a guard whose finding could not be re-observed was kept, and the cluster is re-read next run."
 INFO_FAILED_READS = "Reads that failed:"
 NONE_LINE = "_none_"
 SEVERITY_ERROR, SEVERITY_WARNING = "error", "warning"
@@ -1219,18 +1223,26 @@ def _pod_last_activity(pod: dict) -> datetime | None:
 def _pod_onset(pod: dict, activity: datetime | None) -> datetime | None:
     """When the symptom began, read from the object: a Pending pod's
     scheduling transition or start; for a pod that is not Ready, the Ready
-    condition's transition to False, else the pod's start. The last
-    termination is the latest crash, never the onset (`activity` dates the
-    window bound, not the symptom)."""
+    condition's transition to False, else the pod's start -- and for a pod
+    that has restarted, the earlier of the two, because kubelet rewrites the
+    transition at every crash. The last termination is the latest crash,
+    never the onset (`activity` dates the window bound, not the symptom)."""
     status = pod.get("status") or {}
     meta = pod.get("metadata") or {}
     if status.get("phase") == PHASE_PENDING:
         scheduled = _condition(pod, "PodScheduled")
         return parse_ts(scheduled.get("lastTransitionTime")) or parse_ts(status.get("startTime")) or parse_ts(meta.get("creationTimestamp"))
     ready = _condition(pod, "Ready")
-    if ready.get("status") == "False" and parse_ts(ready.get("lastTransitionTime")):
-        return parse_ts(ready["lastTransitionTime"])
-    return parse_ts(status.get("startTime")) or parse_ts(meta.get("creationTimestamp"))
+    transition = parse_ts(ready.get("lastTransitionTime")) if ready.get("status") == "False" else None
+    started = parse_ts(status.get("startTime")) or parse_ts(meta.get("creationTimestamp"))
+    restarted = any((cs.get("restartCount") or 0) > 0 or (cs.get("lastState") or {}).get("terminated") for cs in (status.get("containerStatuses") or []) + (status.get("initContainerStatuses") or []))
+    if restarted:
+        # A probe-less crash loop flips Ready at every restart, so the
+        # transition trails the latest crash: the earliest evidence is the
+        # pod's own start, or the transition if that is older.
+        candidates = [t for t in (started, transition) if t]
+        return min(candidates) if candidates else None
+    return transition or started
 
 
 def pod_symptoms(pods: list[dict], resolver: Resolver, window_start: datetime | None = None) -> list[dict]:
@@ -1266,6 +1278,7 @@ def pod_symptoms(pods: list[dict], resolver: Resolver, window_start: datetime | 
             "example_pod": pod_name,
             "onset": fmt_ts(onset) if onset else None,
             "pod_onsets": {pod_name: fmt_ts(onset) if onset else None},
+            "pod_nodes": {pod_name: (pod.get("spec") or {}).get("nodeName")},
             **_pod_detail(pod),
         }
         scheduled = _condition(pod, "PodScheduled")
@@ -1288,7 +1301,8 @@ def pod_symptoms(pods: list[dict], resolver: Resolver, window_start: datetime | 
         container_reasons.sort(key=lambda c: c["reason"] not in CONTAINER_FAILURE_REASONS)
         reason = container_reasons[0]["reason"] if container_reasons else (status.get("reason") or ("NotReady" if phase == PHASE_RUNNING else phase or "NotReady"))
         message = container_reasons[0]["message"] if container_reasons else (status.get("message") or "")[:MESSAGE_EXCERPT_CHARS]
-        _merge_pod_row(rows, {**base, "category": CATEGORY_NOT_READY, "reason": reason, "message": message, "containers": container_reasons})
+        oom_nodes = {pod_name: (pod.get("spec") or {}).get("nodeName")} if any(c["reason"] == OOM_REASON for c in container_reasons) else {}
+        _merge_pod_row(rows, {**base, "category": CATEGORY_NOT_READY, "reason": reason, "message": message, "containers": container_reasons, "oom_nodes": oom_nodes})
     return list(rows.values())
 
 
@@ -1298,6 +1312,8 @@ def _merge_pod_row(rows: dict[tuple, dict], row: dict) -> None:
     if existing is None:
         rows[key] = row
         return
+    existing["pod_nodes"].update(row.get("pod_nodes") or {})
+    existing.setdefault("oom_nodes", {}).update(row.get("oom_nodes") or {})
     existing["pods"].append(row["example_pod"])
     existing["pods"].sort()
     existing["pod_count"] = len(existing["pods"])
@@ -1532,12 +1548,21 @@ def _gate_open(symptom: dict, entry: int, ctx: Context) -> bool:
     upgraded pool counts."""
     if entry in CONTROL_PLANE_ENTRIES:
         return ctx.master_upgraded
-    pool = symptom.get("pool") or ctx.node_pool.get(symptom.get("node") or "", "")
-    if not pool:
-        # A Pending pod names its pool through a nodeSelector on the pool
-        # label; only a pod with no pool preference counts any upgraded pool.
-        pool = (symptom.get("node_selector") or {}).get(NODEPOOL_LABEL, "")
-    return pool in ctx.upgraded_pools if pool else bool(ctx.upgraded_pools)
+    # Every pod of a merged row speaks: any replica on a touched pool opens.
+    nodes = [symptom.get("node")] + list((symptom.get("pod_nodes") or {}).values())
+    pools = {symptom.get("pool") or ""} | {ctx.node_pool.get(n or "", "") for n in nodes}
+    pools.discard("")
+    if pools:
+        return any(pool in ctx.upgraded_pools for pool in pools)
+    # No node: a Pending pod names its pool through a nodeSelector on the
+    # pool label; only a pod with no pool preference counts any upgraded
+    # pool, and an event row with no pool evidence at all stays closed.
+    selector_pool = (symptom.get("node_selector") or {}).get(NODEPOOL_LABEL, "")
+    if selector_pool:
+        return selector_pool in ctx.upgraded_pools
+    if symptom["category"] == CATEGORY_EVENT:
+        return False
+    return bool(ctx.upgraded_pools)
 
 
 def classify_symptom(symptom: dict, ctx: Context) -> list[dict]:
@@ -1596,7 +1621,11 @@ def classify_symptom(symptom: dict, ctx: Context) -> list[dict]:
     containers = symptom.get("containers") or []
     oom = [c for c in containers if c["reason"] == OOM_REASON]
     if oom:
-        pool = ctx.node_pool.get(symptom.get("node") or "", "")
+        # Among the OOM-killed replicas the strongest decides: a pod on a
+        # touched cgroup v2 pool, else any v2 pool, else the example's.
+        candidates = [ctx.node_pool.get(n or "", "") for n in (symptom.get("oom_nodes") or {}).values()] or [ctx.node_pool.get(symptom.get("node") or "", "")]
+        v2 = [p for p in candidates if ctx.cgroup_modes.get(p, "") == CGROUP_V2_MODE]
+        pool = next((p for p in v2 if p in ctx.upgraded_pools), v2[0] if v2 else candidates[0])
         mode = ctx.cgroup_modes.get(pool, "")
         evidence = f"container {oom[0]['container']} {OOM_REASON} exit {oom[0]['exit_code']} (pool {pool or '?'} {mode or 'cgroup mode unknown'})"
         undecided = f"{OOM_UNDECIDED_ENTRIES[0]} or {OOM_UNDECIDED_ENTRIES[1]}"
@@ -1708,6 +1737,9 @@ def collect_symptoms(cluster: dict, reads: dict[str, list], operations: list[dic
     resolver = Resolver(reads.get("pods") or [], reads.get("owners") or [], reads.get("workloads") or [])
     pods = pod_symptoms(reads.get("pods") or [], resolver, window_start)
     pod_objects = {s["object"] for s in pods}
+    # An event on a pod that is gone carries no pool; its owner's template
+    # nodeSelector is the pool evidence it can still have.
+    owner_selectors = {obj["object"]: (spec.get("nodeSelector") or {}) for obj, spec, _ in pod_specs_by_owner(reads.get("workloads") or [], reads.get("pods") or [], resolver).values()}
     # A FailedScheduling or BackOff event on a workload the pod list already
     # reports as Pending or crash-looping says the same thing twice.
     oom_nodes = {s.get("node") for s in pods if any(c["reason"] == OOM_REASON for c in s.get("containers") or [])}
@@ -1716,6 +1748,8 @@ def collect_symptoms(cluster: dict, reads: dict[str, list], operations: list[dic
         if not (e["reason"] in EVENT_REASONS_IMPLIED_BY_POD and e["object"] in pod_objects)
         and not (e["reason"] == OOM_NODE_EVENT_REASON and e["kind"] == "Node" and e["name"] in oom_nodes)
     ]
+    for e in events:
+        e.setdefault("node_selector", owner_selectors.get(e["object"], {}))
     symptoms = pods + node_symptoms(nodes) + events + pdb_symptoms(reads.get("pdbs") or [], reads.get("pods") or [], nodes, upgraded)
     for symptom in symptoms:
         symptom["classifications"] = classify_symptom(symptom, ctx)
@@ -1939,23 +1973,44 @@ def shapes_in_spec(obj: dict, spec: dict) -> list[dict]:
     return out
 
 
+def _budget_allows_no_disruption(spec: dict, replicas: int | None) -> bool:
+    """The catalogue's before-signal for entry 1: `maxUnavailable` 0, or
+    `minAvailable` at (or above) the replica count the budget covers. A
+    budget at `disruptionsAllowed` 0 for another reason (pods not ready
+    behind a `maxUnavailable` 1) clears on its own."""
+    max_unavailable = spec.get("maxUnavailable")
+    if max_unavailable is not None:
+        return str(max_unavailable).rstrip("%") == "0"
+    min_available = spec.get("minAvailable")
+    if isinstance(min_available, str) and min_available.endswith("%"):
+        return min_available.rstrip("%").isdigit() and int(min_available.rstrip("%")) >= PERCENT_ALL
+    if isinstance(min_available, int) and replicas is not None:
+        return min_available >= replicas
+    return False
+
+
 def budget_shapes(pdbs: list[dict], workloads: list[dict]) -> list[dict]:
-    """Entry 1: a budget allowing no disruption, and a one-replica
-    Deployment or StatefulSet a budget selects."""
+    """Entry 1: a budget whose spec allows no disruption (high), one at
+    `disruptionsAllowed` 0 for a reason that will clear (medium), and a
+    one-replica Deployment or StatefulSet a budget selects."""
     out = []
     for pdb in pdbs:
         meta, status = pdb.get("metadata") or {}, pdb.get("status") or {}
         namespace, name = meta.get("namespace", ""), meta.get("name", "")
         obj = _object_of(namespace, "PodDisruptionBudget", name)
-        spec = {k: v for k, v in (pdb.get("spec") or {}).items() if k != "selector"}
+        full_spec = pdb.get("spec") or {}
+        spec = {k: v for k, v in full_spec.items() if k != "selector"}
+        selector = full_spec.get("selector") or {}
+        covered = [w for w in workloads if w.get("kind") in ("Deployment", "StatefulSet") and (w.get("metadata") or {}).get("namespace") == namespace and _selector_matches(selector, _template_labels(w))]
+        replicas = sum((w.get("spec") or {}).get("replicas") or 0 for w in covered) if covered else None
         if status.get("disruptionsAllowed") == 0:
-            out.append(_shape(obj, ENTRY_BUDGET, HIGH, f"disruptionsAllowed=0, spec {json.dumps(spec, sort_keys=True)}", f"budget {name}"))
-        selector = (pdb.get("spec") or {}).get("selector") or {}
-        for workload in workloads:
+            if _budget_allows_no_disruption(spec, replicas):
+                out.append(_shape(obj, ENTRY_BUDGET, HIGH, f"disruptionsAllowed=0 by spec {json.dumps(spec, sort_keys=True)}" + (f" over {replicas} replica(s)" if replicas is not None else ""), f"budget {name}"))
+            else:
+                out.append(_shape(obj, ENTRY_BUDGET, MEDIUM, f"disruptionsAllowed=0 now, spec {json.dumps(spec, sort_keys=True)} allows disruption once its pods are ready", f"budget {name}"))
+        for workload in covered:
             wmeta = workload.get("metadata") or {}
-            if workload.get("kind") not in ("Deployment", "StatefulSet") or wmeta.get("namespace") != namespace:
-                continue
-            if (workload.get("spec") or {}).get("replicas") == SINGLE_REPLICA and _selector_matches(selector, _template_labels(workload)):
+            if (workload.get("spec") or {}).get("replicas") == SINGLE_REPLICA:
                 wobj = _object_of(namespace, workload["kind"], wmeta.get("name", ""))
                 out.append(_shape(wobj, ENTRY_BUDGET, HIGH, f"one replica behind budget {name} ({json.dumps(spec, sort_keys=True)})", f"budget {name}"))
     return out
@@ -2371,6 +2426,7 @@ def review_cluster(selection: Selection, ledger: dict, *, run: RunFn, seen_at: s
     mark_since(symptoms, entry.get("symptoms") if entry.get("last_run") else None, first_op)
     review["what_failed"] = symptoms
     review["symptom_baseline"] = sorted({symptom_key(sym) for sym in symptoms})
+    review["budgets_at_zero"] = sorted(_object_ref((b.get("metadata") or {}).get("namespace", ""), "PodDisruptionBudget", (b.get("metadata") or {}).get("name", "")) for b in reads.get("pdbs") or [] if (b.get("status") or {}).get("disruptionsAllowed") == 0)
     review["mitigations"] = [mitigation_lines(s, c) for s in symptoms for c in s["classifications"] if c["entry"] is not None]
     shapes, managed_agents = collect_risks(cluster, {k: v for k, v in reads.items() if not any(e.startswith(k + ":") for e in errors)})
     review["shapes"] = shapes
@@ -2769,6 +2825,11 @@ def ledger_after(ledger: dict, reviews: list[dict], clusters: list[dict], seen_a
             continue
         current = versions_of(cluster)
         old = entries.get(key) or {}
+        if old and key not in reviewed:
+            # Unchanged or partially read: the versions and channel are what
+            # the listing says now (a pool added or removed is recorded);
+            # last_run and the symptom set stay.
+            old.update(control_plane=current["control_plane"], node_pools=current["node_pools"], channel=current["channel"])
         if key in reviewed or not old:
             starts = [op.get("startTime") for op in (operations or {}).get(key) or [] if op.get("startTime")]
             latest = parse_ts(max(starts)) if starts else None
@@ -2797,9 +2858,11 @@ def collect(args: argparse.Namespace, *, run: RunFn | None = None, now: datetime
     since = parse_since(args.since, now)
     ledger_path = Path(args.ledger) if args.ledger else data_dir() / LEDGER_FILENAME
     guards_path = Path(args.guards) if args.guards else data_dir() / GUARDS_FILENAME
-    for state_path, pattern in ((ledger_path, CRASH_RECORD_GLOB), (guards_path, GUARDS_RECORD_GLOB)):
+    for state_path in (ledger_path, guards_path):
         if not state_path.exists():
-            crash_records = sorted(state_path.parent.glob(pattern))
+            # Records are named after the file they came from, so a --ledger
+            # or --guards path finds its own.
+            crash_records = sorted(state_path.parent.glob(state_path.name + UNREADABLE_GLOB_SUFFIX))
             if crash_records:
                 # A set-aside guards file blocks like a ledger's: restarting
                 # with no guards while the ledger says "unchanged" loses them.
@@ -2807,8 +2870,13 @@ def collect(args: argparse.Namespace, *, run: RunFn | None = None, now: datetime
     ledger = load_json(ledger_path, empty_ledger(), version=LEDGER_VERSION, now=now, move_aside=not args.dry_run)
     guards = load_json(guards_path, empty_guards(), version=GUARDS_VERSION, now=now, move_aside=not args.dry_run)
     forced = {c.strip() for c in args.cluster or [] if c.strip()}
-    if getattr(args, "full", False) and forced:
-        raise argparse.ArgumentTypeError(FULL_WITH_CLUSTER_TEXT)
+    if getattr(args, "full", False):
+        if forced:
+            raise argparse.ArgumentTypeError(FULL_WITH_CLUSTER_TEXT)
+        if not args.project:
+            raise argparse.ArgumentTypeError(FULL_WITHOUT_PROJECT_TEXT)
+        if args.since:
+            raise argparse.ArgumentTypeError(FULL_WITH_SINCE_TEXT)
 
     failed_reads: list[str] = []
     if args.project:
@@ -2904,8 +2972,18 @@ def collect(args: argparse.Namespace, *, run: RunFn | None = None, now: datetime
     # A partially read cluster is "reviewed" for the merge so a finding seen
     # again is refreshed; `answered` keeps it from dropping what it could not see.
     reviewed = {r["cluster"] for r in reviews if (r["reviewed"] or r["partial"]) and r["cluster"] not in outside}
+    for review in reviews:
+        review.setdefault("budgets_at_zero", [])
     answered = {r["cluster"]: set(r["answered"]) for r in reviews}
     fresh_guards = [g for r in reviews for g in r["guards"]]
+    # One rule for the review and the re-check: an entry-1 failure guard
+    # stays while its budget still allows no disruption, because the drain
+    # it held cannot be re-observed without the operation.
+    fresh_ids = {g["id"] for g in fresh_guards}
+    zero_budgets = {(r["cluster"], obj) for r in reviews for obj in r.get("budgets_at_zero") or []}
+    for guard in guards.get("guards") or []:
+        if guard.get("kind", GUARD_KIND_FAILURE) == GUARD_KIND_FAILURE and guard.get("entry") == ENTRY_BUDGET and (guard.get("cluster"), guard.get("object")) in zero_budgets and guard["id"] not in fresh_ids:
+            fresh_guards.append({**guard, "last_seen": seen_at})
     new_guards = merge_guards(guards, fresh_guards, reviewed, seen_at, answered, removed)
     # Unchanged clusters holding live guards: re-read only what the guards
     # need, clear what is gone, refresh what is still there.
@@ -3030,7 +3108,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output", help=f"write the JSON result here instead of ${STORE_HOME_ENV}/{REPORTS_SUBDIR}/<finish-UTC>[{SCOPED_SUFFIX}].json")
     parser.add_argument("--report", help=f"write the Markdown report here instead of ${STORE_HOME_ENV}/{REPORTS_SUBDIR}/<finish-UTC>[{SCOPED_SUFFIX}].md (a full run also points {LATEST_REPORT_LINK} beside it at it)")
     parser.add_argument("--no-report", action="store_true", help="print the report without writing it to the store")
-    parser.add_argument("--reset-ledger", action="store_true", help=f"archive the crash records ({CRASH_RECORD_GLOB}) under {ARCHIVE_SUBDIR}/ so the next run may start fresh; does nothing else")
+    parser.add_argument("--reset-ledger", action="store_true", help=f"archive the crash records ({CRASH_RECORD_GLOB}, {GUARDS_RECORD_GLOB}) beside the ledger and guards files (the store's, or --ledger/--guards) under the store's {ARCHIVE_SUBDIR}/ so the next run may start fresh; does nothing else")
     parser.add_argument("--full", action="store_true", help=f"the fleet-wide run: records and may change the ledger's fleet set, prunes departed projects and clusters, writes {REPORTS_SUBDIR}/<finish-UTC>.md and moves {LATEST_REPORT_LINK}; without it a run is scoped whatever its --project set")
     parser.add_argument("--dry-run", action="store_true", help="read everything, print the report, write nothing")
     return parser
@@ -3058,10 +3136,13 @@ def lock_held_line(path: Path) -> str:
     return LOCK_HELD_TEXT.format(path=path, since=since)
 
 
-def reset_ledger(store: Path, now: datetime) -> str:
-    """Archive the crash records beside a missing ledger. The archive keeps
-    them readable; only the operator's choice to run this clears the block."""
-    records = sorted(store.glob(CRASH_RECORD_GLOB)) + sorted(store.glob(GUARDS_RECORD_GLOB))
+def reset_ledger(store: Path, now: datetime, ledger_path: Path | None = None, guards_path: Path | None = None) -> str:
+    """Archive the crash records beside the ledger and guards files (the
+    store's, or the paths --ledger/--guards name). The archive keeps them
+    readable; only the operator's choice to run this clears the block."""
+    ledger_file = ledger_path or store / LEDGER_FILENAME
+    guards_file = guards_path or store / GUARDS_FILENAME
+    records = sorted(ledger_file.parent.glob(ledger_file.name + UNREADABLE_GLOB_SUFFIX)) + sorted(guards_file.parent.glob(guards_file.name + UNREADABLE_GLOB_SUFFIX))
     if not records:
         return RESET_LEDGER_NOTHING_TEXT
     archive = store / ARCHIVE_SUBDIR / now.strftime(REPORT_TS_FORMAT)
@@ -3074,7 +3155,7 @@ def reset_ledger(store: Path, now: datetime) -> str:
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if args.reset_ledger:
-        print(reset_ledger(data_dir(), now_utc()))
+        print(reset_ledger(data_dir(), now_utc(), Path(args.ledger) if args.ledger else None, Path(args.guards) if args.guards else None))
         return 0
     lock = None
     if not args.dry_run:
