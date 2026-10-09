@@ -164,23 +164,24 @@ the last run, and the symptom set seen at the last full run (owner, category, re
 tenant text). The before side of the catalogue's diff is established two ways, and the stronger one
 decides. Every full run reads pods and nodes on every fleet cluster, upgraded or not (one list call
 each), so the stored set is at most a week old rather than as old as the previous upgrade. And each
-symptom carries its own onset, the earliest evidence the objects hold. A pod is the wrong place to
-read it when the pod is owned: a node-pool upgrade drains every node, every pod on it is deleted
-and recreated, and the replacement's creation, start and `Ready=False` transition all fall inside
-the window by construction. So an owned pod's onset is read at the owner first, and only from evidence that says something
-failed: a Deployment's `Available=False` or `Progressing=False` condition transition when one of
-them is `False`, or the current ReplicaSet's creation when it falls inside the window (a rollout
-during the upgrade is when a ReplicaSet dates a failure; an older ReplicaSet dates nothing). A
-Deployment whose conditions never flipped, which a partial failure under its `maxUnavailable`
-leaves `Available=True`, and whose ReplicaSet predates the window has no owner evidence, so its pod
-is read like any other. Where the owner carries no dated condition (StatefulSet, DaemonSet,
-Job) or the pod is bare, the pod's own evidence is used: a Pending pod's start, a crash-looping or
-not-ready pod's `Ready=False` transition time (falling back to its start; a container's last
-termination is the latest crash, not the first, and is never the onset), a node condition's
-transition, an event's first observation. A pod-sourced onset on a pod created after the drain of
-its node began is marked as such, and on a first run (no stored set) a symptom whose only onset is
-that one is graded `medium`: a Warning with the reason "the pod was recreated by the upgrade; the
-failure may predate it", never an Error; the next full run, keyed by owner, settles it. A symptom whose onset is
+symptom carries its own onset. The default is the pod's own evidence: a Pending pod's start, a
+crash-looping or not-ready pod's `Ready=False` transition (falling back to its start when the pod
+has restarted; a container's last termination is the latest crash, not the first, and is never the
+onset), a node condition's transition, an event's first observation. A node-pool upgrade drains
+every node and recreates every pod on it, so a pod created inside a pool operation's window is
+ambiguous for the failures a recreation carries over (a crash loop, an OOM kill, an image that will
+not pull), and for those the owner is consulted as proof of age only: a Deployment whose
+`Available=False` or `Progressing=False` transition, or whose current ReplicaSet's creation,
+predates the window makes the symptom "predates the upgrade", a Warning; an owner transition inside
+the window proves nothing (on a probe-less crash loop `Available` trails the latest crash), and a
+Deployment whose conditions never flipped proves nothing either. With no proof of age, a first run
+(no stored set) grades the symptom `medium`, a Warning with the reason "the pod was recreated by the
+upgrade; the failure may predate it", never an Error; a later full run settles it by the stored set.
+A Pending pod created inside the window is not ambiguous: it is the replica the drain displaced,
+and it is new. Symptoms bound to an operation, a budget that held a drain (entry 1), a displaced
+replica (entry 2), a node that did not come back (entry 17), are incidents of that operation: the
+stored set keys them by the operation, so the same budget holding the next upgrade's drain is a new
+Error, not "already recorded". A symptom whose onset is
 earlier than the first operation of the cluster's upgrade window, or that the previous full run
 already recorded, is graded a Warning with the reason "predates the upgrade", never an Error; a
 symptom with no readable onset falls back to the stored set alone. The first run has no stored set
