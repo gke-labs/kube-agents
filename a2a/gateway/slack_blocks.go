@@ -25,10 +25,9 @@ var (
 	// whitespace, the text, and an optional closing run of # set off by
 	// whitespace (so "## Using C#" keeps its #).
 	slackHeadingRE = regexp.MustCompile(`^ {0,3}#{1,6}[ \t]+(.*?)(?:[ \t]+#+)?[ \t]*$`)
-	// slackHeadingWrapRE is a heading whose whole text is one underscore bold
-	// pair, which it sheds before it is wrapped as one bold line; star pairs
-	// anywhere in it are shed by shedBoldPairs.
-	slackHeadingWrapRE = regexp.MustCompile(`^__(.+)__$`)
+	// slackSetextRE is a setext heading's underline: a run of = or of -
+	// with no spaces inside it, under a paragraph line.
+	slackSetextRE = regexp.MustCompile(`^ {0,3}(?:=+|-+)[ \t]*$`)
 	// slackRuleRE is a thematic break: three or more of one of - * _, with
 	// optional spaces between them, so "--" or a stray "**" line stays.
 	slackRuleRE = regexp.MustCompile(`^ {0,3}(?:(?:-[ \t]*){3,}|(?:\*[ \t]*){3,}|(?:_[ \t]*){3,})$`)
@@ -92,13 +91,24 @@ func rewriteSlackBlocks(text string) string {
 	for i, line := range lines {
 		lines[i] = strings.TrimSuffix(line, slackLineCR)
 	}
-	lines = splitGluedHeadings(lines)
+	lines = strings.Split(rewriteOutsideCode(strings.Join(lines, "\n"), func(s string) string {
+		return slackGluedHeadingRE.ReplaceAllString(s, slackGluedHeadingSplit)
+	}), "\n")
 	code := fencedLines(lines)
 	out := make([]string, 0, len(lines))
+	// paragraph is whether the last line out is a prose line as written,
+	// which a setext underline turns into a heading.
+	paragraph := false
 	for i := 0; i < len(lines); i++ {
 		line := lines[i]
+		wasParagraph := paragraph
+		paragraph = false
 		if code[i] {
 			out = append(out, line)
+			continue
+		}
+		if wasParagraph && slackSetextRE.MatchString(line) {
+			out[len(out)-1] = slackBoldLine(out[len(out)-1])
 			continue
 		}
 		if end := tableEnd(lines, code, i); end > i {
@@ -110,12 +120,8 @@ func rewriteSlackBlocks(text string) string {
 			continue
 		}
 		if m := slackHeadingRE.FindStringSubmatch(line); m != nil {
-			heading := strings.TrimSpace(shedBoldPairs(m[1]))
-			if w := slackHeadingWrapRE.FindStringSubmatch(heading); w != nil {
-				heading = strings.TrimSpace(w[1])
-			}
-			if heading != "" {
-				out = append(out, mdBoldMark+heading+mdBoldMark)
+			if heading := strings.TrimSpace(m[1]); heading != "" {
+				out = append(out, slackBoldLine(heading))
 			}
 			continue
 		}
@@ -124,8 +130,21 @@ func rewriteSlackBlocks(text string) string {
 			continue
 		}
 		out = append(out, line)
+		paragraph = strings.TrimSpace(line) != ""
 	}
 	return strings.Join(out, "\n")
+}
+
+// slackBoldLine renders a heading's text as one bold line: the bold pairs
+// inside it are shed first, and a text that still holds a `**` of its own
+// (`**/*.yaml`, `**kwargs`) is left plain, since wrapping it would pair the
+// added marks with the wrong ones.
+func slackBoldLine(text string) string {
+	text = strings.TrimSpace(shedBoldPairs(text))
+	if strings.Contains(mdCodeSpanRE.ReplaceAllString(text, ""), mdBoldMark) {
+		return text
+	}
+	return mdBoldMark + text + mdBoldMark
 }
 
 // fencedLines reports, per line, whether any part of it sits in a fenced
@@ -160,7 +179,7 @@ func fencedLines(lines []string) []bool {
 // the header, and the body runs to the first line without a pipe, blank or
 // fenced.
 func tableEnd(lines []string, code []bool, i int) int {
-	if i+1 >= len(lines) || code[i+1] || !strings.Contains(lines[i], slackTablePipe) ||
+	if i+1 >= len(lines) || code[i+1] || !strings.Contains(lines[i], slackTablePipe) || slackHeadingRE.MatchString(lines[i]) ||
 		!strings.Contains(lines[i+1], slackTablePipe) || !slackTableSepRE.MatchString(lines[i+1]) ||
 		len(tableCells(lines[i])) != len(tableCells(lines[i+1])) {
 		return i
@@ -171,21 +190,6 @@ func tableEnd(lines []string, code []bool, i int) int {
 		end++
 	}
 	return end
-}
-
-// splitGluedHeadings moves a heading run onto the end of a sentence to its
-// own paragraph, on lines with no code in them.
-func splitGluedHeadings(lines []string) []string {
-	code := fencedLines(lines)
-	out := make([]string, 0, len(lines))
-	for i, line := range lines {
-		if code[i] || !slackGluedHeadingRE.MatchString(line) || mdCodeSpanRE.MatchString(line) {
-			out = append(out, line)
-			continue
-		}
-		out = append(out, strings.Split(slackGluedHeadingRE.ReplaceAllString(line, slackGluedHeadingSplit), "\n")...)
-	}
-	return out
 }
 
 // renderSlackTable renders a markdown table (its header line and body rows;

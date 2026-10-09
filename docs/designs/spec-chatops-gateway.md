@@ -1527,7 +1527,8 @@ principal, and `slack-socket-mode` when it did not: either way Slack authenticat
 sender over the socket and asserted the `user_id`. Rendering
 into mrkdwn is a narrow deterministic translation; the legacy Hermes converter stays
 where it is. A line pass runs first, outside fenced blocks, for the forms mrkdwn has no
-syntax for: a heading becomes a bold line (shedding any bold pairs inside it), a
+syntax for: a heading, ATX or setext, becomes a bold line (shedding any bold pairs
+inside it, and left plain when a `**` that is not half of a pair remains), a
 thematic break is dropped, a list marker
 becomes `•`, and a pipe table becomes a fenced block with its columns padded (a cell
 keeps a code span's content without its backticks, sheds the marks of closed bold pairs, and shows a link as
