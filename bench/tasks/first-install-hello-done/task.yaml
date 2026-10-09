@@ -5,8 +5,9 @@ name: The first-install hello, scan already done, is short, read-only and asks o
 # The greeting a new user gets on their first chat turn after install, once the
 # first-look scan has finished and its summary is in the chat. The sibling of
 # first-install-hello-running; the differences are where the results are, the
-# closing question, and that it must not place the summary "above" or "below"
-# (the report may arrive either side of the greeting). See that case for the
+# closing question, that it must not place the summary "above" or "below"
+# (the report may arrive either side of the greeting), and that it must not say
+# scheduled reports come to this chat. See that case for the
 # seam this stack arms.
 
 fixtures: []
@@ -111,8 +112,8 @@ verification_spec:
         # The last character is not a question mark.
         - '[^?\s]\s*\Z'
 
-  # No home_channel_set in this case's request, so the plugin adds no sentence
-  # about scheduled reports. A greeting that says it anyway tells the user
+  # This case's request has home_channel_set false, so the plugin adds no
+  # sentence about scheduled reports. A greeting that says it anyway tells the user
   # something the install did not do.
   - name: no-scheduled-report-claim
     role: objective

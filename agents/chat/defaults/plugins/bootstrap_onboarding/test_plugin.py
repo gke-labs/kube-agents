@@ -332,6 +332,18 @@ class PreLlmCallTest(unittest.TestCase):
         self._arm_home_channel()
         self.assertIn(plugin.HOME_CHANNEL_INSTRUCTION, self._call()["context"])
 
+    def test_completed_greeting_also_gets_the_sentence(self):
+        self._arm_home_channel()
+        (self.data_dir / "INVENTORY.md").write_text("REPORT", encoding="utf-8")
+        context = self._call()["context"]
+        self.assertIn("SCAN COMPLETED", context)
+        self.assertIn(plugin.HOME_CHANNEL_INSTRUCTION, context)
+
+    def test_home_channel_sentence_promises_no_later_post(self):
+        # The completed greeting says the summary is already here, so the
+        # sentence must not promise a later post.
+        self.assertNotIn("I'll post", plugin.HOME_CHANNEL_INSTRUCTION)
+
     def test_greeting_says_nothing_about_reports_when_a_home_channel_was_configured(self):
         self._arm_home_channel(configured=mock.sentinel.home)
         self.assertNotIn(plugin.HOME_CHANNEL_INSTRUCTION, self._call()["context"])

@@ -93,8 +93,8 @@ GREETING_MAX_WORDS = 60
 # channel is different on each platform.
 HOME_CHANNEL_INSTRUCTION = (
     "This turn made this chat the home channel, so scheduled reports also come here. "
-    "In the point about where the results appear, say that scheduled reports come here too, "
-    "for example: \"I'll post what I find here, and scheduled reports come here too.\" "
+    "After the point about where the results appear, add one short sentence that says this, "
+    "for example: \"Scheduled reports come here too.\" "
     "Name no command. Stay inside the word limit."
 )
 

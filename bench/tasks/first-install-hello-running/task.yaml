@@ -4,8 +4,8 @@ name: The first-install hello, scan still running, is short, read-only and asks 
 
 # The greeting a new user gets on their first chat turn after install, while the
 # first-look scan is still running: who it is in one word, that it only reads,
-# where the results will appear, that changes come as reviewed pull requests,
-# and one question (agents/chat/defaults/onboarding/scan_in_progress.md). The stack arms the bootstrap_onboarding plugin's eval seam, because
+# where the results will appear, that scheduled reports come to this chat too,
+# that changes come as reviewed pull requests, and one question (agents/chat/defaults/onboarding/scan_in_progress.md). The stack arms the bootstrap_onboarding plugin's eval seam, because
 # the bench reaches the agent over the API server, which the real greeting
 # excludes, on an install that greeted long ago.
 
