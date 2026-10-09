@@ -110,7 +110,8 @@ upgrade-retrospective (Platform Agent roster: Sunday 18:00 UTC; and once, from t
        ├─ (B) symptoms read from the cluster, classified against the catalogue
        ├─ (C) detect-and-mitigate rows from the catalogue table, per finding
        ├─ (D) guards.json merged: new, seen again, gone
-       └─ report.json + the Markdown report (A, B, C, D per cluster)
+       ├─ report.json + the Markdown report (A, B, C, D per cluster)
+       └─ the fleet-audit collector manifest: the contract `finish` reads
   └─ Platform Agent, following governance/upgrade_retrospective_sop.md
        ├─ reads the collector's output, tailors (C) to the cluster's objects
        ├─ (D) the stream's one ledger issue, an entry per cluster and object, where a repository is linked
@@ -201,11 +202,11 @@ joined is added. A project the roster still names whose listing failed (a delete
 removed binding, the Container API disabled) does not demote the run: its ledger entries and guards
 are held unchanged, its clusters are listed under "Reads that failed", and the run stays full and
 moves the latest link, the way `fleet_drift.py` and `patch_readiness.py` keep a failed project as
-that project's gap rather than the sweep's. The findings document the SOP hands to `finish` lists
-every ledger-known cluster of that project under `scope.skipped` with the listing error as the
-reason, the harness's own mechanism for a cluster a run could not read: the stream's previous
-findings on those clusters are held rather than resolved, the ledger issue stays open, and nothing
-is posted as fixed because a project went unread. Every run without `--full` is _scoped_, whatever its
+that project's gap rather than the sweep's. In the collector manifest (§3.3) those clusters are
+entries with `outcome: unreachable` and the listing error, which the harness's cross-check turns
+into the `scope.skipped` requirement on the findings document: the stream's previous findings on
+those clusters are held rather than resolved, the ledger issue stays open, and nothing is posted as
+fixed because a project went unread. Every run without `--full` is _scoped_, whatever its
 `--project` set: a run narrowed by `--cluster`, by the question that invoked it, or any hand run,
 with or without `--project`. A scoped run reviews only its targets, never
 prunes a ledger entry or a guard outside them, never adds a project to the fleet set (a cluster it
@@ -235,6 +236,23 @@ before-signal, the reader that covers it today, mitigate before, mitigate after)
 the SOP's job is to tailor those sentences to the cluster's own objects and to do (D)'s ledger
 issue, which needs the forge. A run with no model available still produces a complete report with
 generic (C) text, which is the out-of-the-box experience.
+
+The boundary between the collector and the fleet-audit harness is the one every sibling collector
+already uses, the collector manifest
+([`fleet-audit-collector-manifest.md`](fleet-audit-collector-manifest.md)), not a contract of this
+design's own. On a full run the collector writes it beside the report (`--manifest-file`): one
+`clusters[]` entry per cluster it enumerated, with `outcome: collected` and a `commands[]` record
+per check that ran, or `outcome: unreachable` or `gate-failed` with the error for a cluster whose
+project listing failed, whose reads failed, or that is upgrading now; `candidates[]` for every
+incident the report files, an Error at `major` and a Warning at `minor`, with the check id, object,
+excerpt and the mitigation text; `still_flagged_ids` for the guards the run held but did not
+re-observe; `partial` when any read failed; and, in the carried keys the manifest reserves for
+collector-resolved fleet facts, the versions, operations and incident kinds the SOP copies. The
+stream is in `COLLECTOR_AUDITS`, the SOP passes the manifest to `finish`, and `cross_check_manifest`
+enforces what this design would otherwise state as prose: an unreachable cluster must be in
+`scope.skipped`, a check the collector did not run cannot be claimed, every candidate is published
+or disclosed, and the held set is the manifest's. `report.json` and the Markdown remain the human
+report; they are not what `finish` reads.
 
 ### 3.4 Classification by signature, with the evidence attached
 
@@ -293,9 +311,8 @@ opens a remediation pull request on its own for every `critical` finding and for
 whose check id is on its `MAJOR_SWEEP_CHECKS` allowlist. So the stream grades its findings
 deliberately: an Error files at `major`, a Warning at `minor`, nothing ever at `critical`, and its
 check ids stay off `MAJOR_SWEEP_CHECKS` (a reused `no-pdb` slug would put the budget finding on
-it). Both halves together are the guard, and the SOP states them as rules rather than leaving the
-grade to the author's judgement; the report names the file and the change a user's "apply" would
-make.
+it). The grade is the collector's, written on each manifest candidate (§3.3), so the SOP copies it
+rather than judging it; the report names the file and the change a user's "apply" would make.
 
 ### 3.6 Where the report lives
 
@@ -400,15 +417,16 @@ comes from the collector's JSON, which keeps the per-cluster data and the same t
 
 1. **The collector.** `agents/platform/skills/fleet-audit/scripts/upgrade_retrospective.py`: the
    ledger, selection, (A), (B), the signature table, the catalogue table for (C), the guards merge,
-   JSON and Markdown output, `--dry-run`, `--full`, `--cluster`, `--since` and `--reset-ledger` as §3.2 and
-   §3.6 define them; unit tests on fixtures captured
-   from the test fleet.
+   JSON and Markdown output, the collector manifest (`--manifest-file`, §3.3) with the stream's
+   check ids and its `COLLECTOR_AUDITS` entry, `--dry-run`, `--full`, `--cluster`, `--since` and
+   `--reset-ledger` as §3.2 and §3.6 define them; unit tests on fixtures captured from the test
+   fleet, including the manifest against `cross_check_manifest`.
 2. **The job and the on-demand route.** `agents/platform/governance/upgrade_retrospective_sop.md`
    (including the freshness rule for a question); the routing lines in `CAPABILITIES.md` and the
    platform `AGENTS.md`; the roster entry
    (`0 18 * * 0`, `skills: ["fleet-audit"]`, the `AUDITS` allowlist so findings file, with check
    ids off `MAJOR_SWEEP_CHECKS`); the SOP's no-repository path (collector first, `start`/`finish`
-   only with a repository) and the first-run stage marking this job due without one; the readiness
+   only with a repository, the manifest passed to `finish`) and the first-run stage marking this job due without one; the readiness
    watch reading `guards.json` through its sandbox hop once it ships; the cron README section and
    the generated cron reference.
 3. **The proof.** The first report over the test fleet; one nightly case per catalogue entry the
@@ -421,7 +439,7 @@ comes from the collector's JSON, which keeps the per-cluster data and the same t
 - `agents/platform/governance/upgrade_retrospective_sop.md`, `agents/platform/CAPABILITIES.md`,
   `agents/platform/AGENTS.md` (the on-demand route).
 - `agents/platform/cron/jobs.json`, `agents/platform/cron/README.md`,
-  `agents/platform/skills/fleet-audit/scripts/audit_report.py` (`AUDITS`).
+  `agents/platform/skills/fleet-audit/scripts/audit_report.py` (`AUDITS`, `COLLECTOR_AUDITS`).
 - The Chat Agent's first-run stage (`agents/chat/scripts/oobe.py`: the list of audits it starts
   after the inventory scan, and its repository skip).
 - The readiness watch's script, once it is on `main` (reads `guards.json` through its sandbox hop).
