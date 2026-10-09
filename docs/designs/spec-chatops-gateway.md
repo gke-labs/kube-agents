@@ -1346,8 +1346,9 @@ gateway conversation key (below) goes as `--conversation` with `--context`. A su
 no thread is not delivered. A fanned-out child card's answer folds into its parent's on this
 path (`fold_fanout`): each child inherits the thread's subscription, and the parent completes
 only after its children with the synthesis, so the child's `completed` is held while the parent
-works, dropped once the parent has answered, and posted after all if the parent ends blocked or
-the hold passes 30 minutes. Its other events (blocked, gave up, progress) post as before. A route probe (an empty notify, which an armed gateway refuses at once) tells the
+works and until the parent's own answer has been delivered on that thread, then dropped with its
+cursor moved past it, and posted after all if the parent ends blocked, its subscription is gone,
+or the hold passes 30 minutes. Its other events (blocked, gave up, progress) post as before. A route probe (an empty notify, which an armed gateway refuses at once) tells the
 notifier when the route is unavailable (the gateway restarting), and it holds deliveries
 unclaimed then; only a send that meets the outage before the next probe spends one unit of
 the subscription's failure budget. Once, when routed delivery first goes live on an install,
