@@ -439,7 +439,9 @@ turns, while the next follow-up's capability is checked, is not lost to a shutdo
 the task with it as the `result`, and the queue is refused `task-ended`. Nor is it lost when its
 `turn` artifact fails to publish (the task completes with it as the `result`), or when a cancel,
 the deadline or a shutdown lands after the next follow-up was chosen but before its request was
-sent (the terminal that cause calls for carries it as the `result`). A failed follow-up turn names itself in the terminal
+sent (the terminal that cause calls for carries it as the `result`, best-effort: the answer is
+already on the stream as a `turn`, so a failed publish of that copy leaves the terminal's state as
+it was, and a cancel still ends `canceled`). A failed follow-up turn names itself in the terminal
 (`; turn: N` after the session). A follow-up does not change task state (payload spec assertion
 12). A bridge that crashes with follow-ups queued loses them; the gateway's relay reports them as
 not run at the terminal, unless the gateway restarted too. The count is best-effort: a follow-up
@@ -448,13 +450,16 @@ Mid-turn steering through the runs API is gke-labs#2628.
 
 **Upgrade order for steering.** The gateway and the bridge do not always roll together. The
 gateway's image follows the operator; the rendered bridge's image is chosen as
-[Where it runs](#where-it-runs) describes. Only one case can leave the two a release apart: the
-agent container runs the release `platform-agent` image pinned by tag and `A2A_BRIDGE_IMAGE` is
-unset, so the bridge follows the CR's agent tag. There, upgrade the operator (and with it the
-gateway) first, then bump the CR's agent tag; on a rollback, move the CR's agent tag back first,
-then the operator. With `A2A_BRIDGE_IMAGE` set, with a custom or digest-pinned agent image, or with
-no image on the CR, the bridge follows the operator, and there is no tag skew to order. A
-CR-declared bridge (above) follows its own sidecar tag, in the same order. The two skews look like this:
+[Where it runs](#where-it-runs) describes. Two cases can leave the two a release apart. One is the
+release `platform-agent` agent image pinned by tag with `A2A_BRIDGE_IMAGE` unset, where the bridge
+follows the CR's agent tag. The other is `A2A_BRIDGE_IMAGE` set: the operator uses the override
+verbatim, so the bridge runs whatever it names. It moves with the operator only when whoever rolls
+the operator rewrites that env in the same step, as `hack/ci-deploy.sh` does; a value set by hand
+stays where it was. In either case upgrade the operator (and with it the gateway) first, then bump
+the CR's agent tag or the override; on a rollback, move the agent tag or the override back first,
+then the operator. With a custom or digest-pinned agent image and no override, or no image on the
+CR, the bridge follows the operator and there is no skew to order. A CR-declared bridge (above)
+follows its own sidecar tag, in the same order. The two skews look like this:
 
 - **Old gateway, new bridge (the order to avoid).** The old relay has no case for `turn`
   artifacts, so every earlier turn's answer is dropped. The room gets the old "does not take
