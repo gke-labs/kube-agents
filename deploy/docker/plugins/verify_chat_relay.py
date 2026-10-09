@@ -154,10 +154,10 @@ def main() -> None:
     #    operator's allowlist, then through this scrub to `feedback_prompt.py`.
     #    Scrubbed, `FEEDBACK_PROMPT_ENABLED=false` on the CR would still render
     #    and the prompt would post on an install that turned it off. The
-    #    findings queue's pacing limits take it to `findings_nudge.py`, where a
-    #    scrubbed one would silently fall back to its default
-    #    (`FINDINGS_FIRST_REPORT_CRITICALS` is reserved for the first inventory
-    #    report's selection and read by nothing yet).
+    #    findings queue's pacing limits take it to `findings_nudge.py` and to
+    #    `bootstrap_handoff.py`, which hands them to the first inventory
+    #    report's selection; a scrubbed one would silently fall back to its
+    #    default.
     for name in (
         "SESSION_KV_API_KEY",
         "CRON_REPORT_RELAY_URL",

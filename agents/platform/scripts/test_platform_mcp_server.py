@@ -1227,7 +1227,7 @@ class TestFindingsQueueTools(unittest.TestCase):
         )
 
     def test_marking_surfaced_never_claims_to_be_a_paced_publisher(self):
-        # Only the nudge may mark a finding shown; a model naming one in
+        # Only a paced publisher may mark a finding shown; a model naming one in
         # answer to a pull must not spend a day's budget or stop additions.
         platform_mcp_server.mark_finding_surfaced("f-1", "spaces/AAA", "spaces/AAA/threads/T")
         _, _, body = self.captured[-1]
