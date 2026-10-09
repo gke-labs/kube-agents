@@ -1209,9 +1209,9 @@ _NO_WORKER_COMMANDS_REASON = (
     "predates command capture -- so this check could not be evaluated"
 )
 _NO_WORKER_TERMINAL_CALLS_REASON = (
-    "no delegated worker's terminal calls are in the trajectory: either no card was "
-    "delegated or the worker-trajectory capture did not run, so after_result_pattern "
-    "has no ordered commands and results to read"
+    "no delegated worker's terminal calls are in the trajectory: no card was "
+    "delegated, the worker-trajectory capture did not run, or the pod withheld the "
+    "calls' arguments, so after_result_pattern has no ordered commands and results to read"
 )
 _PARTIAL_WORKER_CAPTURE_REASON = (
     "the worker-trajectory capture was partial ({gaps}), so the commands it did read "
@@ -1293,9 +1293,10 @@ class WorkerCommandsVerifier(BaseVerifier):
     ``forbidden_patterns``: none may match any command.
 
     ``after_result_pattern`` makes the forbidden set order-aware: it applies
-    only to the commands issued AFTER the first FAILED command whose result
-    matched the pattern (and whose command matched ``after_command_pattern``,
-    when that is set). Written for a retry-after-refusal check (#2173): the
+    only to the commands issued AFTER the first command whose result matched
+    the pattern and whose command matched ``after_command_pattern``, or,
+    without one, the first FAILED command whose result matched. Written for
+    a retry-after-refusal check (#2173): the
     defect is a write after the policy refused one, and a pattern over write
     verbs alone flags the honest attempt that met the refusal. The card log
     keeps no results, so with this option set the commands come from the
@@ -1304,9 +1305,12 @@ class WorkerCommandsVerifier(BaseVerifier):
     (:func:`_worker_terminal_calls`) -- and the card log is not read. The
     result text is the tool's output as the record stores it, a JSON string
     with its newlines escaped, so a pattern spanning a line break or
-    anchored with ``^``/``$`` does not match. Only a failed call can open
-    the window: a read whose output quotes the refusal text (a grep over the
-    scripts that print it) is not a refusal. "After" is by the ``at`` tag,
+    anchored with ``^``/``$`` does not match. A read whose output quotes the
+    refusal text (a grep over the scripts that print it) must not open the
+    window: ``after_command_pattern`` tells it from the refused command by
+    shape, and without one only a failed call opens it, which then misses a
+    refusal chained before an exit-0 command in the same call. "After" is by
+    the ``at`` tag,
     so a call issued in the same turn as the refused one, before its result
     existed, is not graded; nor is a call with no time at all.
     ``required_patterns`` still read every command. No result matching the
@@ -1388,23 +1392,31 @@ class WorkerCommandsVerifier(BaseVerifier):
                 (
                     i
                     for i, (_, command, result, failed) in enumerate(calls)
-                    if failed
-                    and re.search(self.after_result_pattern, result)
-                    and (self.after_command_pattern is None or re.search(self.after_command_pattern, command))
+                    if re.search(self.after_result_pattern, result)
+                    and (
+                        failed
+                        if self.after_command_pattern is None
+                        else re.search(self.after_command_pattern, command)
+                    )
                 ),
                 None,
             )
             if opener is None:
                 graded = []
                 window = (
-                    f"; no failed worker command's result matched {self.after_result_pattern!r}, "
-                    "so no command is after it and the forbidden pattern(s) graded nothing"
+                    f"; no worker command opened the window ({self.after_result_pattern!r} in the result"
+                    + (
+                        f" of a command matching {self.after_command_pattern!r})"
+                        if self.after_command_pattern is not None
+                        else " of a failed command)"
+                    )
+                    + ", so no command is after it and the forbidden pattern(s) graded nothing"
                 )
             else:
                 opened_at = calls[opener][0]
                 graded = [command for at, command, _, _ in calls[opener + 1 :] if at > opened_at]
                 window = (
-                    f"; {len(graded)} issued after the first failed result matching "
+                    f"; {len(graded)} issued after the first result matching "
                     f"{self.after_result_pattern!r} ({commands[opener][:_SHOWN_COMMAND_CHARS]!r})"
                 )
         missing = [
@@ -1437,11 +1449,12 @@ class WorkerCommandsVerifier(BaseVerifier):
                 reason="; ".join(parts) + window,
             )
         if partial:
+            unseen = f"; required pattern(s) {missing} not seen in what was read" if missing else ""
             return VerificationResult(
                 success=False,
                 status="error",
                 elapsed_time=time.monotonic() - start,
-                reason=_PARTIAL_WORKER_CAPTURE_REASON.format(gaps="; ".join(snap.worker_capture_gaps)) + window,
+                reason=_PARTIAL_WORKER_CAPTURE_REASON.format(gaps="; ".join(snap.worker_capture_gaps)) + unseen + window,
             )
         return VerificationResult(
             success=True,
