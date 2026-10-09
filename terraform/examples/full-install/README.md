@@ -79,9 +79,10 @@ install without the interview.
   sink exporting GKE audit logs (`drift_pubsub_sink`), one more in each project
   the scope lists, the drift-audit Pub/Sub
   topic (`drift_pubsub_topic`) and pull subscription
-  (`drift_pubsub_subscription`), the sink-writer and agent-GSA IAM on
-  them, and publisher on the topic for anything
-  `drift_pubsub_topic_publishers` names; and, with
+  (`drift_pubsub_subscription`), the sink-writer IAM on the topic, and
+  publisher on it for anything `drift_pubsub_topic_publishers` names — plus
+  the agent GSA's subscription grants, which this composition makes beside the
+  module rather than inside it; and, with
   `enable_drift_detector = true` alongside it, the
   `spec.harness.driftDetector.enabled` field that starts the consumer. See
   [Drift audit-log ingress](#drift-audit-log-ingress).
@@ -792,9 +793,9 @@ destroy the cluster first and delete the topic last. Without that ordering the
 topic goes while the control plane is still emitting matching audit records,
 and each one mails every project owner. The module README's
 [ordering section](../../modules/drift-pubsub/README.md#why-the-sink-is-created-last-and-destroyed-first)
-is canonical; `moved` blocks beside the two grants keep an existing install
-from planning a destroy and create of the detector's access on the first apply
-after this change.
+is canonical; `moved` blocks beside the two grants keep an install created
+by an earlier version, which had them inside the module, from planning a
+destroy and create of the detector's access on its next apply.
 
 `drift_pubsub_topic_publishers` (default `[]`) grants `roles/pubsub.publisher`
 on the topic to each member it lists, on top of the sink's writer identity.
@@ -804,7 +805,7 @@ not attach the publisher's identity to the message, so anything that can
 publish here can make the detector report a change nobody made, under any
 principal it names. Never list the agent's own GSA.
 
-Beyond the three names and that list, the module's two required inputs are
+Beyond the three names and that list, the module's one required input is
 passed and four more of its optional ones:
 `drift_pubsub_sink_writer_identity_override`, which the module's own
 postcondition tells an operator to set when a project's sink reports a writer
@@ -893,7 +894,8 @@ wait already paid — the wait is keyed on this value, so a change re-creates it
 and pays the new, lower figure once — it only shortens any later one.
 
 [The module's README](../../modules/drift-pubsub/README.md#why-the-sink-is-created-last-and-destroyed-first)
-is canonical for all three orderings.
+is canonical for all four orderings — the three inside the module, and the
+cluster-before-ingress edge this composition adds on top of them.
 
 Four outputs, each `null` while the flag is off: `drift_pubsub_topic`,
 `drift_pubsub_subscription`, `drift_pubsub_subscription_id`, the

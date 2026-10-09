@@ -207,7 +207,8 @@ module, `enable_drift_detector = true` writes the field, and a precondition refu
 for the second without the first. Both come from one `ENABLE_DRIFT_DETECTOR` key through the
 installer front doors, which defaults to `true`, so a front-door install gets the pair without
 asking; `ENABLE_DRIFT_DETECTOR=false` in `install.env` is the opt-out. An install that does not use
-the composition applies the module itself and sets the field by hand, in that order.
+the composition applies the module itself, makes the two subscription grants below itself —
+the module does not — and sets the field by hand, in that order.
 
 Enabling it is necessary and not sufficient: the operator also requires `spec.harness.projectId`,
 `.location` and `.clusterName`, because `--cluster-name` is checked at startup against the cluster
@@ -220,11 +221,12 @@ where the process runs. `--in-cluster` and `--profiles-dir` are always on, so a 
 joins its own cluster and every Cluster Agent profile, whichever project it names, without being asked.
 
 Application Default Credentials need `roles/pubsub.subscriber` on the subscription — inside the
-agent pod, the Workload Identity the `drift-pubsub` module grants it to. Add `roles/pubsub.viewer`
+agent pod, the Workload Identity the composition grants it to. Add `roles/pubsub.viewer`
 for the startup ack-deadline check described under
 [Three things to know before changing it](#three-things-to-know-before-changing-it): subscriber does
-not carry `subscriptions.get`. The module grants both, so this is a note for a
-hand-made subscription or a local run, where the check is skipped with a log line rather than
+not carry `subscriptions.get`. `full-install` grants both when `enable_drift_pubsub` is on, so this is a note
+for a standalone caller of the `drift-pubsub` module, a hand-made subscription, or a local run,
+where the check is skipped with a log line rather than
 failing the process.
 
 The join needs Kubernetes permissions on top of that, and they are not the same grant. With
@@ -697,8 +699,10 @@ warning says Pub/Sub _may_ redeliver rather than that it will. The warning is ad
 directions. A budget that overruns costs redelivery rather than correctness, so it does not refuse
 to start; and the probe needs `pubsub.subscriptions.get`, which `roles/pubsub.subscriber` does not
 carry but `roles/pubsub.viewer` does, so a probe that fails says the budget went unchecked and the
-detector pulls anyway. The `drift-pubsub` module grants viewer alongside subscriber, so the check is
-live in an install built from it.
+detector pulls anyway. `full-install` grants viewer alongside subscriber, so the check is live in an
+install built from the composition. The `drift-pubsub` module grants neither — a standalone
+caller makes both itself, and the detector's README for that path is the module's own Usage
+section.
 
 **Settling is three-way.** A record that parses is handled and acked. One that is understood and
 not actionable — another service's audit entry, or a call that named no object, such as a subject
