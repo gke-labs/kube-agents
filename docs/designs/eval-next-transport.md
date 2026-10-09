@@ -338,7 +338,7 @@ webhooks (`a2a/docs/hermes-bridge.md`, "Activity"), one entry per invocation wit
 its input; the bridge's entries also carry the call's status, and the bridge alone publishes a
 `progress` heartbeat. `worker_commands` reads
 the kanban worker logs by card id (with `after_result_pattern`, the tagged `terminal` entries
-of the trace instead); on
+of the trace instead, present under the `worker_agents` conditions below); on
 this path it has data when the case runner's delegation wait finds the cards in the session store
 (Completion signals), and none when the wait falls back. Neither is graded
 as a failure here: on this transport's record the scorer sets every `worker_commands` and

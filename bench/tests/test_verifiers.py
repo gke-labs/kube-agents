@@ -821,11 +821,16 @@ def _terminal(command, result=_OK, at=100.0, agent="platform", args=None):
     }
 
 
+# The router's own shell call carries no agent tag and must never be graded as
+# a worker's: it would trip every forbidden set below.
+_ROUTER_TERMINAL = {"name": "terminal", "args": {"command": "kubectl delete ns scratch"}, "result": _OK, "status": "completed"}
+
+
 def _stash_terminal(entries, commands=None):
     rows = [{"task": "t_1", "command": e["args"].get("command", "")} for e in entries]
     if commands is not None:
         rows = [{"task": "t_1", "command": c} for c in commands]
-    transcript.set("ok", _TRAJECTORY + entries, worker_commands=rows)
+    transcript.set("ok", _TRAJECTORY + [_ROUTER_TERMINAL] + entries, worker_commands=rows)
 
 
 _RETRY = WorkerCommandsVerifier(

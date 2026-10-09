@@ -1298,10 +1298,14 @@ class WorkerCommandsVerifier(BaseVerifier):
     so in the reason; no tagged terminal call at all is ``status="error"``.
 
     Limits, stated so a case is not written against them: only terminal
-    commands are visible, not MCP tool calls; only delegated workers' logs
-    are read, never the router's; and a command the shell resolved through an
-    alias appears as typed. Fails closed like its siblings -- a run with no
-    captured worker commands is ``status="error"``, not a pass.
+    commands are visible, not MCP tool calls; only delegated workers'
+    commands are read (their logs, or their tagged ``terminal`` calls),
+    never the router's; a command the shell resolved through an alias
+    appears as typed; and a result is clipped in the pod at
+    ``worker_trajectory.MAX_RESULT_CHARS``, so a refusal chained behind a
+    long output in one call can lose the text ``after_result_pattern`` looks
+    for. Fails closed like its siblings -- a run with no captured worker
+    commands is ``status="error"``, not a pass.
     """
 
     type: Literal["worker_commands"]
