@@ -693,14 +693,45 @@ class ClassifierSignatureTest(unittest.TestCase):
         self.assertEqual(entries(rows[0]), {(1, ur.HIGH)})
 
     def test_entry_1_is_high_on_a_drained_pool_held_or_not(self):
+        def metric(op, name, value):
+            for m in op["progress"]["metrics"]:
+                if m["name"] == name:
+                    m["intValue"] = str(value)
+
         ops = copy.deepcopy(ops_for("seeded-a"))
         quick = next(o for o in ops if "pinned-inference-pool" in o["targetLink"])
         quick["endTime"] = "2026-10-08T04:30:00Z"
+        metric(quick, ur.OPERATION_METRIC_PDB_DELAY, 0)
         rows = [s for s in symptoms_of("seeded-a", ops=ops) if s["category"] == "pdb"]
         self.assertEqual(entries(rows[0]), {(1, ur.HIGH)})
         self.assertNotIn("drain held", rows[0]["classifications"][0]["detail"])
+        # The captured operation carries GKE's own measure of the hold: read, and named as measured.
         held = [s for s in symptoms_of("seeded-a") if s["category"] == "pdb"]
-        self.assertIn("drain held past an hour per node", held[0]["classifications"][0]["detail"])
+        self.assertEqual(held[0]["classifications"][0]["detail"], "budget inference-server; drain held by the budget on pinned-inference-pool (NODE_PDB_DELAY_SECONDS 3598 s, measured by GKE)")
+        self.assertIn("took 63 min over 1 node(s); NODE_PDB_DELAY_SECONDS 3598 s", held[0]["classifications"][0]["evidence"])
+        # Over the hour with the metric at zero (a stockout, a slow boot): the budget held nothing.
+        stockout = copy.deepcopy(ops_for("seeded-a"))
+        metric(next(o for o in stockout if "pinned-inference-pool" in o["targetLink"]), ur.OPERATION_METRIC_PDB_DELAY, 0)
+        rows = [s for s in symptoms_of("seeded-a", ops=stockout) if s["category"] == "pdb"]
+        self.assertNotIn("drain held", rows[0]["classifications"][0]["detail"])
+        # Without metrics the hour-per-node estimate speaks, and says it is an estimate.
+        bare = copy.deepcopy(ops_for("seeded-a"))
+        next(o for o in bare if "pinned-inference-pool" in o["targetLink"]).pop("progress")
+        rows = [s for s in symptoms_of("seeded-a", ops=bare) if s["category"] == "pdb"]
+        self.assertEqual(rows[0]["classifications"][0]["detail"], "budget inference-server; drain held by the budget on pinned-inference-pool (estimated from the operation's duration, 63 min over 1 node(s); no progress metrics)")
+        self.assertTrue(rows[0]["classifications"][0]["evidence"].endswith(f"over 1 node(s); {ur.NO_PROGRESS_METRICS_TEXT}"))
+        # The pool autoscaled since: three nodes now, one upgraded. The metrics count the one.
+        nodes = copy.deepcopy(READS["seeded-a"]["nodes"])
+        pinned = next(n for n in nodes if n["metadata"]["labels"]["cloud.google.com/gke-nodepool"] == "pinned-inference-pool")
+        for suffix in ("new1", "new2"):
+            extra = copy.deepcopy(pinned)
+            extra["metadata"]["name"] = f"{pinned['metadata']['name']}-{suffix}"
+            nodes.append(extra)
+        rows = [s for s in symptoms_of("seeded-a", reads={**READS["seeded-a"], "nodes": nodes}) if s["category"] == "pdb"]
+        self.assertIn("took 63 min over 1 node(s); NODE_PDB_DELAY_SECONDS 3598 s", rows[0]["classifications"][0]["evidence"])
+        self.assertIn("measured by GKE", rows[0]["classifications"][0]["detail"])
+        rows = [s for s in symptoms_of("seeded-a", reads={**READS["seeded-a"], "nodes": nodes}, ops=bare) if s["category"] == "pdb"]
+        self.assertNotIn("drain held", rows[0]["classifications"][0]["detail"])  # the estimate over three nodes does not cross
 
     def test_entry_14_reads_gate_and_cgroup_mode_from_the_same_replica(self):
         # A sibling OOM-killed on a touched cgroup v1 pool must not lend its drain to the replica on an
@@ -845,7 +876,7 @@ class ClassifierSignatureTest(unittest.TestCase):
         [c] = rows[0]["classifications"]
         self.assertEqual((c["entry"], c["confidence"]), (1, ur.HIGH))
         self.assertIn("pods on default-pool, pinned-inference-pool; UPGRADE_NODES operation-1791433235916-c1860f09-e11c-4fe1-b75b-40cf815a7e81 on pinned-inference-pool took 63 min", c["evidence"])
-        self.assertIn("drain held past an hour per node on pinned-inference-pool", c["detail"])
+        self.assertIn("drain held by the budget on pinned-inference-pool (NODE_PDB_DELAY_SECONDS 3598 s, measured by GKE)", c["detail"])
 
     def test_timestamps_survive_under_their_own_keys(self):
         nodes = copy.deepcopy(READS["seeded-a"]["nodes"])
@@ -1560,6 +1591,21 @@ class LedgerAndGuardsTest(unittest.TestCase):
         self.assertTrue(failed)
         self.assertTrue(all(r["next_upgrade"]["window"] == ur.NO_WINDOW_TEXT and r["next_upgrade"]["target"] is None for r in failed))
         ur.render_report(result)
+        # A window the parser rejects on a cluster that is otherwise read in full loses the
+        # next-upgrade line, not the review: reviewed, with the error under its read errors.
+        with mock.patch.object(ur, "next_upgrade", boom):
+            reviewed, _ = self.collect(now=datetime(2026, 10, 16, 18, 0, tzinfo=timezone.utc))
+        self.assertTrue(all(r["reviewed"] for r in reviewed["reviews"]))
+        self.assertTrue(all(r["read_errors"] == [f"{ur.NEXT_UPGRADE_ERROR_PREFIX}RuntimeError('planted')"] and r["next_upgrade"]["window"] == ur.NO_WINDOW_TEXT for r in reviewed["reviews"]))
+        # And on an unchanged cluster, where no review boundary stands: the run still writes, the
+        # row carries the bare line and Info names the failure.
+        with mock.patch.object(ur, "next_upgrade", boom):
+            later, _ = self.collect(now=datetime(2026, 10, 17, 18, 0, tzinfo=timezone.utc))
+        self.assertEqual([u["cluster"] for u in later["unchanged"]], [GEMMA, SEEDED])
+        self.assertTrue(all(u["next_upgrade"] == ur._bare_next_upgrade() for u in later["unchanged"]))
+        self.assertIn(f"{SEEDED}: {ur.NEXT_UPGRADE_ERROR_PREFIX}RuntimeError('planted')", later["failed_reads"])
+        self.assertIn(ur.INFO_UNCHANGED, ur.render_report(later))
+        self.assertEqual(ur.load_json(self.home / ur.LEDGER_FILENAME, {})["updated_at"], "2026-10-17T18:00:00Z")
 
     def test_malformed_pod_is_a_failed_read_not_a_crash(self):
         reads = {**READS["seeded-a"], "pods": READS["seeded-a"]["pods"] + ["garbage", {"metadata": None, "spec": 3}]}
@@ -2889,6 +2935,36 @@ class ManifestTest(unittest.TestCase):
         self.assertIn(held_id, self.audit_report.collector_flagged_ids(manifest))
         self.assertIn(held_id, self.audit_report.still_flagged_ids(manifest, {"findings": []}))
         self.audit_report.cross_check_manifest(self.document_from(manifest), manifest)
+
+    def test_two_stale_guards_on_one_object_are_one_candidate(self):
+        # Two event-only guards on inference-server (a volume attach, a webhook rejection) beside its
+        # pod-sourced entry-2 guard. The next run re-observes the pod guard; the event-only ones cannot
+        # be re-checked and go stale together: one Warning, one candidate, one still-flagged identity.
+        events = READS["seeded-a"]["events"] + [
+            event("FailedAttachVolume", "AttachVolume.Attach failed for volume pv-1", name="inference-server-778b78fdb8-zzzzz", namespace="seeded-capacity"),
+            event("FailedCreate", 'failed calling webhook "gate.example.io"', kind="ReplicaSet", name="inference-server-778b78fdb8", namespace="seeded-capacity"),
+        ]
+        with mock.patch.dict(READS, {"seeded-a": {**READS["seeded-a"], "events": events}}):
+            first, _ = self.collect()
+        self.assertEqual({g["entry"] for g in first["guards"] if g["object"] == INFERENCE and g["kind"] == ur.GUARD_KIND_FAILURE}, {2, 7, 19})
+        second, _ = self.collect(now=datetime(2026, 10, 15, 18, 0, tzinfo=timezone.utc))
+        stale = [w for w in second["sections"]["warnings"] if w["kind"] == ur.INCIDENT_STALE_GUARD and w["object"] == INFERENCE]
+        self.assertEqual([(w["entries"], sorted(g["entry"] for g in w["guards"]), w["event_only"]) for w in stale], [("7, 19", [7, 19], True)])
+        report = ur.render_report(second)
+        self.assertEqual(report.count(f"### 7, 19 — {SEEDED} — `{INFERENCE}`"), 1)
+        self.assertIn(f"guard `{INFERENCE}` entry 7, first seen 2026-10-08T18:00:00Z, still live; guard `{INFERENCE}` entry 19, first seen 2026-10-08T18:00:00Z, still live.", report)
+        manifest = json.loads(Path(second["manifest_path"]).read_text())
+        seeded = next(c for c in manifest["clusters"] if c["name"] == SEEDED)
+        [candidate] = [c for c in seeded["candidates"] if c["check"] == ur.CHECK_FAILURE_PERSISTS]
+        self.assertEqual((candidate["namespace"], candidate["object"], candidate["entries"]), ("seeded-capacity", "Deployment/inference-server", "7, 19"))
+        self.assertIn(ur.guard_id(SEEDED, 7, INFERENCE), candidate["excerpt"])
+        self.assertIn(ur.guard_id(SEEDED, 19, INFERENCE), candidate["excerpt"])
+        [held] = [h for h in manifest["still_flagged"] if h["object"] == "Deployment/inference-server"]
+        self.assertEqual(held["guards"], [ur.guard_id(SEEDED, 7, INFERENCE), ur.guard_id(SEEDED, 19, INFERENCE)])
+        document = self.document_from(manifest)
+        ids = [self.audit_report.derive_finding_id(f) for f in document["findings"]]
+        self.assertEqual(len(ids), len(set(ids)))
+        self.audit_report.cross_check_manifest(document, manifest)
 
     def test_dry_run_and_no_flag_write_no_manifest(self):
         result, _ = self.collect(manifest_file=None)

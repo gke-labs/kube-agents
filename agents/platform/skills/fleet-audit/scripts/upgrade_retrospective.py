@@ -236,6 +236,16 @@ CONTROL_PLANE_TARGET = "control plane"
 # Entry 1's after-signal: a surge upgrade honours a budget for up to an hour
 # per node, so an `UPGRADE_NODES` that ran longer than that per node was held.
 DRAIN_HOLD_PER_NODE = timedelta(hours=1)
+# GKE's own measure of a drain: an UPGRADE_NODES operation's `progress.metrics`
+# carry the nodes it upgraded and how long disruption budgets delayed it. Read
+# when present; the wall-clock estimate above is the fallback when they are
+# absent, and the evidence says which one spoke.
+OPERATION_METRIC_NODES_TOTAL = "NODES_TOTAL"
+OPERATION_METRIC_PDB_DELAY = "NODE_PDB_DELAY_SECONDS"
+DRAIN_HELD_PREFIX = "drain held by the budget on "
+DRAIN_HELD_MEASURED_FORMAT = "{pool} ({metric} {seconds} s, measured by GKE)"
+DRAIN_HELD_ESTIMATED_FORMAT = "{pool} (estimated from the operation's duration, {minutes} min over {nodes} node(s); no progress metrics)"
+NO_PROGRESS_METRICS_TEXT = "no progress metrics"
 
 CLUSTER_KEY_SEPARATOR = "/"
 NODEPOOL_LABEL = "cloud.google.com/gke-nodepool"
@@ -565,6 +575,9 @@ CELL_ESCAPES = (("|", "/"), ("`", "'"))
 
 # The next upgrade, from the cluster record and `get-server-config`.
 NO_WINDOW_TEXT = "no maintenance window: an upgrade may start at any hour"
+# A maintenance window the parser rejects loses the cluster's next-upgrade
+# line, recorded under its read errors with this prefix, never the run.
+NEXT_UPGRADE_ERROR_PREFIX = "next upgrade: "
 DEFAULT_EXCLUSION_SCOPE = "NO_UPGRADES"
 RRULE_FREQ_DAILY, RRULE_FREQ_WEEKLY = "DAILY", "WEEKLY"
 RRULE_WEEKDAYS = {"MO": 0, "TU": 1, "WE": 2, "TH": 3, "FR": 4, "SA": 5, "SU": 6}
@@ -1799,9 +1812,26 @@ def pdb_symptoms(pdbs: list[dict], pods: list[dict], nodes: list[dict], upgraded
     return out
 
 
+def operation_metrics(op: dict) -> dict[str, int]:
+    """The integer metrics an operation's `progress` carries, by name."""
+    out: dict[str, int] = {}
+    for metric in (op.get("progress") or {}).get("metrics") or []:
+        name, value = metric.get("name"), metric.get("intValue")
+        if not name or value is None:
+            continue
+        try:
+            out[name] = int(value)
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
 def upgraded_pools_of(operations: list[dict], nodes: list[dict]) -> dict[str, dict]:
     """Node pools an `UPGRADE_NODES` touched in the window, with the longest
-    operation's duration and the pool's current node count."""
+    operation's duration, the nodes it upgraded (`NODES_TOTAL` when it
+    carries progress metrics, else the pool's current node count) and the
+    delay its disruption budgets caused (`NODE_PDB_DELAY_SECONDS`; None
+    without metrics)."""
     counts: dict[str, int] = {}
     for node in nodes:
         pool = ((node.get("metadata") or {}).get("labels") or {}).get(NODEPOOL_LABEL, "")
@@ -1814,9 +1844,10 @@ def upgraded_pools_of(operations: list[dict], nodes: list[dict]) -> dict[str, di
         if not target or not target[2]:
             continue
         summary = operation_summary(op)
-        row = pools.setdefault(target[2], {"nodes": counts.get(target[2], 0), "longest_s": 0, "operation": summary["name"], "start": summary["start"]})
+        metrics = operation_metrics(op)
+        row = pools.setdefault(target[2], {"nodes": counts.get(target[2], 0), "longest_s": 0, "operation": summary["name"], "start": summary["start"], "pdb_delay_s": None})
         if (summary["duration_s"] or 0) > row["longest_s"]:
-            row.update(longest_s=summary["duration_s"] or 0, operation=summary["name"], start=summary["start"])
+            row.update(longest_s=summary["duration_s"] or 0, operation=summary["name"], start=summary["start"], nodes=metrics.get(OPERATION_METRIC_NODES_TOTAL) or counts.get(target[2], 0), pdb_delay_s=metrics.get(OPERATION_METRIC_PDB_DELAY))
     return pools
 
 
@@ -2126,11 +2157,21 @@ def _match_budget(symptom: dict, entry: int, ctx: Context) -> dict | None:
     if symptom["category"] != CATEGORY_PDB or not symptom.get("upgraded_pools"):
         return None
     touched = {pool: ctx.upgraded_pools[pool] for pool in symptom["upgraded_pools"]}
-    held_pools = [pool for pool, info in touched.items() if info["nodes"] > 0 and info["longest_s"] > info["nodes"] * DRAIN_HOLD_PER_NODE.total_seconds()]
-    named = held_pools[0] if held_pools else next(iter(touched))
+    # The hold is read from the operation's own metrics when it carries them;
+    # the hour-per-node estimate from its duration is the fallback.
+    held: dict[str, str] = {}
+    for pool, info in touched.items():
+        delay = info.get("pdb_delay_s")
+        if delay is not None:
+            if delay > 0:
+                held[pool] = DRAIN_HELD_MEASURED_FORMAT.format(pool=pool, metric=OPERATION_METRIC_PDB_DELAY, seconds=delay)
+        elif info["nodes"] > 0 and info["longest_s"] > info["nodes"] * DRAIN_HOLD_PER_NODE.total_seconds():
+            held[pool] = DRAIN_HELD_ESTIMATED_FORMAT.format(pool=pool, minutes=info["longest_s"] // SECONDS_PER_MINUTE, nodes=info["nodes"])
+    named = next(iter(held)) if held else next(iter(touched))
     info = touched[named]
-    detail = f"budget {symptom['name']}" + (f"; drain held past an hour per node on {', '.join(held_pools)}" if held_pools else "")
-    return _classification(entry, HIGH, f"disruptionsAllowed=0 with pods on {', '.join(touched)}; UPGRADE_NODES {info['operation']} on {named} took {info['longest_s'] // 60} min over {info['nodes']} node(s)", detail)
+    source = f"{OPERATION_METRIC_PDB_DELAY} {info['pdb_delay_s']} s" if info.get("pdb_delay_s") is not None else NO_PROGRESS_METRICS_TEXT
+    detail = f"budget {symptom['name']}" + (f"; {DRAIN_HELD_PREFIX}{', '.join(held.values())}" if held else "")
+    return _classification(entry, HIGH, f"disruptionsAllowed=0 with pods on {', '.join(touched)}; UPGRADE_NODES {info['operation']} on {named} took {info['longest_s'] // SECONDS_PER_MINUTE} min over {info['nodes']} node(s); {source}", detail)
 
 
 ENTRY_MATCHERS: dict[int, Callable[[dict, int, Context], dict | None]] = {
@@ -2962,6 +3003,19 @@ def _bare_next_upgrade() -> dict:
     return {"channel": "", "current": "", "target": None, "below_target": None, "window": NO_WINDOW_TEXT, "next_opens": None, "exclusions": []}
 
 
+def _safe_next_upgrade(cluster: dict, server_config: dict | None, now: datetime, errors: list[str] | None = None) -> dict:
+    """`next_upgrade` under the per-cluster boundary: a maintenance window in
+    a shape the parser rejects loses that cluster's next-upgrade line, not
+    the run. The error joins the caller's read errors when it keeps any."""
+    try:
+        return next_upgrade(cluster, server_config, now)
+    except Exception as exc:  # noqa: BLE001 -- the boundary is the point
+        log(f"{cluster_key(cluster.get('project', ''), cluster.get('location', ''), cluster.get('name', ''))}: next upgrade failed: {exc!r}")
+        if errors is not None:
+            errors.append(f"{NEXT_UPGRADE_ERROR_PREFIX}{exc!r}"[:ERROR_EXCERPT_CHARS])
+        return _bare_next_upgrade()
+
+
 def _safe_review(selection: Selection, ledger: dict, **kwargs) -> dict:
     """`review_cluster` with the exception boundary the docstring promises:
     an object shape this collector did not expect is a failed read of that
@@ -2976,10 +3030,7 @@ def _safe_review(selection: Selection, ledger: dict, **kwargs) -> dict:
             happened = what_happened(selection, ledger)
         except Exception:  # noqa: BLE001 -- the fallback must not raise
             happened = _bare_what_happened(selection)
-        try:
-            upcoming = next_upgrade(selection.cluster, kwargs.get("server_config"), kwargs.get("now") or now_utc())
-        except Exception:  # noqa: BLE001 -- the fallback must not raise
-            upcoming = _bare_next_upgrade()
+        upcoming = _safe_next_upgrade(selection.cluster, kwargs.get("server_config"), kwargs.get("now") or now_utc())
         return {
             "cluster": selection.key,
             "project": selection.cluster.get("project", ""),
@@ -3018,7 +3069,7 @@ def review_cluster(selection: Selection, ledger: dict, *, run: RunFn, seen_at: s
         "mitigations": [],
         "shapes": [],
         "managed_agents": 0,
-        "next_upgrade": next_upgrade(cluster, server_config, now or now_utc()),
+        "next_upgrade": _bare_next_upgrade(),
         "baseline": None,
         "symptom_baseline": None,
         "guards": [],
@@ -3029,6 +3080,7 @@ def review_cluster(selection: Selection, ledger: dict, *, run: RunFn, seen_at: s
         "commands": [],
         "starting": [],
     }
+    review["next_upgrade"] = _safe_next_upgrade(cluster, server_config, now or now_utc(), review["read_errors"])
     ops = selection.operations
     first_op = min((parse_ts(op.get("startTime")) for op in ops if parse_ts(op.get("startTime"))), default=None)
     window_start = first_op or selection.window_start
@@ -3208,6 +3260,7 @@ def triage(reviews: list[dict], unchanged: list[dict], failed_reads: list[str], 
     upgrading_keys = {row["cluster"] for row in upgrading or []}
     not_recheckable = {gid for r in rechecks or [] for gid in r.get("not_recheckable") or []}
     recheck_errors = {r["cluster"]: r["errors"] for r in rechecks or [] if r.get("errors")}
+    stale: dict[tuple[str, str], dict] = {}
     for guard in guards:
         # A risk is never an incident, so only a failure guard that outlived
         # its last review is a Warning; stale risk guards stay in the file,
@@ -3223,21 +3276,32 @@ def triage(reviews: list[dict], unchanged: list[dict], failed_reads: list[str], 
             # now" and is reviewed next run, guards included.
             continue
         if guard.get("last_seen") != seen_at and guard.get("kind", GUARD_KIND_FAILURE) == GUARD_KIND_FAILURE:
-            warnings.append({
-                "partial": partial_reads.get(guard["cluster"]) or [],
-                "event_only": guard["id"] in not_recheckable,
-                "recheck_errors": recheck_errors.get(guard["cluster"]) or [],
-                "kind": INCIDENT_STALE_GUARD,
-                "severity": SEVERITY_WARNING,
-                "cluster": guard["cluster"],
-                "object": guard["object"],
-                "system": False,
-                "entries": str(guard["entry"]),
-                "what_happened": None,
-                "symptoms": [],
-                "mitigations": [],
-                "guards": [guard],
-            })
+            # One incident per object, whatever the number of entries its
+            # guards carry: a finding is identified by check, cluster,
+            # namespace and object, so two guards here are one finding.
+            incident = stale.get((guard["cluster"], guard["object"]))
+            if incident is None:
+                stale[(guard["cluster"], guard["object"])] = incident = {
+                    "partial": partial_reads.get(guard["cluster"]) or [],
+                    "event_only": True,
+                    "recheck_errors": recheck_errors.get(guard["cluster"]) or [],
+                    "kind": INCIDENT_STALE_GUARD,
+                    "severity": SEVERITY_WARNING,
+                    "cluster": guard["cluster"],
+                    "object": guard["object"],
+                    "system": False,
+                    "entries": "",
+                    "what_happened": None,
+                    "symptoms": [],
+                    "mitigations": [],
+                    "guards": [],
+                }
+                warnings.append(incident)
+            incident["guards"].append(guard)
+            incident["event_only"] = incident["event_only"] and guard["id"] in not_recheckable
+    for incident in stale.values():
+        incident["guards"].sort(key=lambda g: (g.get("entry") or 0, g["id"]))
+        incident["entries"] = ", ".join(str(e) for e in sorted({g["entry"] for g in incident["guards"]}))
     errors.sort(key=_incident_key)
     warnings.sort(key=_incident_key)
     return {
@@ -3277,7 +3341,6 @@ def _cell(text: object) -> str:
 def _incident_lines(incident: dict) -> list[str]:
     lines = [f"### {incident['entries']} — {_cell(incident['cluster'])} — `{_cell(incident['object'])}`" + (" (system)" if incident["system"] else ""), ""]
     if incident["kind"] == INCIDENT_STALE_GUARD:
-        guard = incident["guards"][0]
         if incident.get("partial"):
             lines.append(f"{PART_WHAT_HAPPENED} {STALE_PARTIAL_TEXT.format(failed=', '.join(incident['partial']))}")
         elif incident.get("event_only"):
@@ -3286,9 +3349,10 @@ def _incident_lines(incident: dict) -> list[str]:
             lines.append(f"{PART_WHAT_HAPPENED} {STALE_RECHECK_FAILED_TEXT.format(errors=_cell('; '.join(incident['recheck_errors'])))}")
         else:
             lines.append(f"{PART_WHAT_HAPPENED} cluster not reviewed this run; the guard below is from an earlier run.")
-        lines.append(f"{PART_WHAT_FAILED} entry {guard['entry']}. {guard['title']} ({guard['confidence']}) last seen {guard['last_seen']}: {_cell(guard['evidence'])}")
+        for guard in incident["guards"]:
+            lines.append(f"{PART_WHAT_FAILED} entry {guard['entry']}. {guard['title']} ({guard['confidence']}) last seen {guard['last_seen']}: {_cell(guard['evidence'])}")
         lines.append(f"{PART_MITIGATE} the entry's row applies until the cluster is reviewed again.")
-        lines.append(f"{PART_MITIGATION_SET_UP} guard `{_cell(guard['object'])}` entry {guard['entry']}, first seen {guard['first_seen']}, still live.")
+        lines.append(f"{PART_MITIGATION_SET_UP} " + "; ".join(f"guard `{_cell(g['object'])}` entry {g['entry']}, first seen {g['first_seen']}, still live" for g in incident["guards"]) + ".")
         return lines + [""]
     lines += _what_happened_lines(incident["what_happened"])
     lines.append("")
@@ -3417,10 +3481,10 @@ def _incident_candidate(incident: dict, command: str | None) -> dict:
         excerpt = f"{op['type']} on {op['target']} ended {op['status']}: {op['error'] or 'no error text'}"
         impact = MITIGATIONS[ENTRY_CAPACITY]["mitigate_after"]
     elif incident["kind"] == INCIDENT_STALE_GUARD:
-        guard = incident["guards"][0]
-        namespace, obj = _split_object(guard["object"])
-        excerpt = f"guard {guard['id']} last seen {guard['last_seen']}: {guard['evidence']}"
-        impact = MITIGATIONS[guard["entry"]]["mitigate_after"] if guard.get("entry") in MITIGATIONS else ""
+        # Every guard on the object in one candidate: one finding per object.
+        namespace, obj = _split_object(incident["object"])
+        excerpt = "; ".join(f"guard {g['id']} last seen {g['last_seen']}: {g['evidence']}" for g in incident["guards"])
+        impact = " ".join(MITIGATIONS[g["entry"]]["mitigate_after"] for g in incident["guards"] if g.get("entry") in MITIGATIONS)
     else:
         namespace, obj = _split_object(incident["object"])
         excerpt = "; ".join(f"{s['reason']}: {c['evidence']}" for s in incident["symptoms"] for c in s["classifications"])
@@ -3526,9 +3590,9 @@ def build_manifest(result: dict, ledger: dict, *, started_at: str, finished_at: 
     still_flagged = []
     for incident in sections["warnings"]:
         if incident["kind"] == INCIDENT_STALE_GUARD:
-            guard = incident["guards"][0]
-            namespace, obj = _split_object(guard["object"])
-            still_flagged.append({"guard": guard["id"], "check": CHECK_FAILURE_PERSISTS, "cluster": incident["cluster"], "namespace": namespace, "object": obj})
+            namespace, obj = _split_object(incident["object"])
+            ids = [g["id"] for g in incident["guards"]]
+            still_flagged.append({"guard": ids[0], "guards": ids, "check": CHECK_FAILURE_PERSISTS, "cluster": incident["cluster"], "namespace": namespace, "object": obj})
     manifest = {
         "version": MANIFEST_VERSION,
         "checks_revision": CHECKS_REVISION,
@@ -3853,7 +3917,9 @@ def collect(args: argparse.Namespace, *, run: RunFn | None = None, now: datetime
             review["what_happened"]["reasons"] = list(review["what_happened"]["reasons"]) + [OUTSIDE_FLEET_TEXT]
     for row in unchanged:
         cluster = next(c for c in clusters if cluster_key(c["project"], c["location"], c["name"]) == row["cluster"])
-        row["next_upgrade"] = next_upgrade(cluster, server_configs.get((cluster["project"], cluster["location"])), now)
+        window_errors: list[str] = []
+        row["next_upgrade"] = _safe_next_upgrade(cluster, server_configs.get((cluster["project"], cluster["location"])), now, window_errors)
+        failed_reads.extend(f"{row['cluster']}: {e}" for e in window_errors)
         row["last_operation"] = ((ledger.get("clusters") or {}).get(row["cluster"]) or {}).get("last_operation")
 
     # A partially read cluster is "reviewed" for the merge so a finding seen
