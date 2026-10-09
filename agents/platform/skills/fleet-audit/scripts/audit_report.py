@@ -1476,14 +1476,25 @@ CLUSTERS_LISTED_KEY = "clusters_listed"
 # except `out-of-scope`, the collector saying the target is not this audit's,
 # which is neither cross-checked nor owed by the document.
 # The collector's wall-clock stop. Carried, not read, everywhere except the
-# staleness guard in `load_manifest`.
+# staleness guard in `load_manifest` and the `collect_s` timer.
 MANIFEST_FINISHED_KEY = "finished_at"
+# The collector's wall-clock start. Read only for the `collect_s` timer.
+MANIFEST_STARTED_KEY = "started_at"
 MANIFEST_OUTCOME_COLLECTED = "collected"
 MANIFEST_OUTCOME_OUT_OF_SCOPE = "out-of-scope"
 # How much of a collector's `error` a refusal quotes back.
 MANIFEST_ERROR_EXCERPT = 200
 # How many finding ids a log line names before eliding the rest.
 MANIFEST_LOG_IDS = 5
+# The phase timers that `finish` adds to its JSON line and to the report
+# envelope, in seconds. Report data only: nothing decides on them. A timer
+# whose input is missing is left out, never given as zero.
+INSPECT_SECONDS_KEY = "inspect_s"
+PUBLISH_SECONDS_KEY = "publish_s"
+COLLECT_SECONDS_KEY = "collect_s"
+PHASE_TIMER_KEYS = (INSPECT_SECONDS_KEY, PUBLISH_SECONDS_KEY, COLLECT_SECONDS_KEY)
+# Decimal places a phase timer keeps.
+PHASE_TIMER_DIGITS = 1
 # What the held comment shows as the collector's command when the manifest
 # recorded a candidate for a check and no `rc == 0` command on that target.
 COLLECTOR_COMMAND_UNRECORDED = "(the collector recorded no command for this check here)"
@@ -2244,6 +2255,9 @@ def inflight_path_for(audit_id: str) -> str:
 # it sooner is an operator's action from outside the session, described in
 # agents/platform/cron/README.md; the CLI has no flag for it on purpose.
 INFLIGHT_TTL_SECONDS = 2 * 60 * 60
+# The keys of the in-flight note that `start` writes.
+INFLIGHT_AUDIT_KEY = "audit"
+INFLIGHT_STARTED_KEY = "started_at"
 
 
 def _in_flight_since(path: Path) -> float | None:
@@ -2391,7 +2405,7 @@ def claim_in_flight(audit_id: str) -> None:
         staged = Path(f"{path}.tmp")
         try:
             staged.write_text(
-                json.dumps({"audit": audit_id, "started_at": time.time()}),
+                json.dumps({INFLIGHT_AUDIT_KEY: audit_id, INFLIGHT_STARTED_KEY: time.time()}),
                 encoding="utf-8",
             )
             os.replace(staged, path)
@@ -2425,6 +2439,67 @@ def release_in_flight(audit_id: str) -> None:
     is a change to the SOP contract and not made here.
     """
     Path(inflight_path_for(audit_id)).unlink(missing_ok=True)
+
+
+def inflight_started_at(audit_id: str, now: float) -> float | None:
+    """The `started_at` that `start` wrote in this stream's in-flight note.
+
+    `None` when the note is missing, does not parse, names a different
+    stream, or gives a time outside `(0, now]` or `datetime`'s range.
+    `_in_flight_since` uses the mtime of a note that does not parse, because
+    a lease must fail closed. A timer must not: that mtime is not the start
+    of this run. A note older than the lease stays valid here, so a run
+    longer than the lease keeps its timer while no later `start` has
+    replaced the note. As in `release_in_flight`, `start` and `finish` share
+    no run identity: if a run outlives the lease (or an operator releases
+    the note) and a later `start` replaces the note before this run's
+    `finish`, `inspect_s` reads that later `start` time.
+    """
+    try:
+        note = json.loads(Path(inflight_path_for(audit_id)).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(note, dict) or note.get(INFLIGHT_AUDIT_KEY) != audit_id:
+        return None
+    started = note.get(INFLIGHT_STARTED_KEY)
+    if not isinstance(started, (int, float)) or isinstance(started, bool):
+        return None
+    try:
+        datetime.fromtimestamp(started, timezone.utc)
+    except (OverflowError, ValueError, OSError):
+        return None
+    if started <= 0 or started > now:
+        return None
+    return float(started)
+
+
+def inspect_seconds(audit_id: str, now: datetime) -> float | None:
+    """Seconds from `start` to `now`, the time the worker used to inspect.
+
+    `start` and `finish` are different processes. The in-flight note is the
+    one record of the start time that `finish` can read, so read it before
+    `handle_finish` releases the note. `None` when the note gives no time.
+    """
+    started = inflight_started_at(audit_id, now.timestamp())
+    if started is None:
+        return None
+    return round(now.timestamp() - started, PHASE_TIMER_DIGITS)
+
+
+def collector_seconds(manifest: dict | None) -> float | None:
+    """Seconds from the manifest's `started_at` to its `finished_at`.
+
+    `None` when there is no manifest, when a stamp is missing or does not
+    parse, or when the stop is before the start. A timer is report data, so
+    a bad stamp gives no number and does not stop the run.
+    """
+    if not isinstance(manifest, dict):
+        return None
+    started = parse_gh_timestamp(manifest.get(MANIFEST_STARTED_KEY))
+    finished = parse_gh_timestamp(manifest.get(MANIFEST_FINISHED_KEY))
+    if started is None or finished is None or finished < started:
+        return None
+    return round((finished - started).total_seconds(), PHASE_TIMER_DIGITS)
 
 
 # --------------------------------------------------------------------------- #
@@ -2557,6 +2632,8 @@ def report_envelope(
     rather than print a zero.
     `finished_at` is the run's own generation timestamp, the one the ledger
     footer prints, so the envelope and the body agree about when it ran.
+    The phase timers (`PHASE_TIMER_KEYS`) are copied from `payload`, and a
+    timer that `payload` does not have is left out.
 
     `repo` names the store directory the envelope is written under, and is
     checked again on the read: issue numbers are per repository, so a store
@@ -2587,6 +2664,8 @@ def report_envelope(
         "resolved_ids": sorted(resolved_ids),
         "current_ids": sorted(set(rendered_ids)),
         "id_scheme": ID_SCHEME,
+        # The phase timers, copied from the JSON line when it has them.
+        **{key: payload[key] for key in PHASE_TIMER_KEYS if payload.get(key) is not None},
         "ledger_body": ledger_body,
         "document": _redact_document(document),
         **(
@@ -15326,6 +15405,21 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
     findings = list(data["findings"])
     declared = list(data.get("declared") or [])
     now = datetime.now(timezone.utc)
+    # The phase timers. `inspect_s` is from `start` to here, `publish_s` is
+    # from here to the JSON line, and `collect_s` is the collector's own run.
+    # They are report data only and cannot make the run fail.
+    inspect_s = inspect_seconds(audit_id, now)
+    collect_s = collector_seconds(manifest)
+    publish_clock = time.monotonic()
+
+    def timer_payload() -> dict:
+        """The phase timers for the JSON line, without a timer that has no value."""
+        timers = {
+            INSPECT_SECONDS_KEY: inspect_s,
+            PUBLISH_SECONDS_KEY: round(time.monotonic() - publish_clock, PHASE_TIMER_DIGITS),
+            COLLECT_SECONDS_KEY: collect_s,
+        }
+        return {key: value for key, value in timers.items() if value is not None}
 
     if args.dry_run:
         _handle_finish_dry_run(
@@ -16050,6 +16144,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
             UNACCOUNTED_KEY: [entry["id"] for entry in unaccounted],
             # No findings, so no sweep and nothing for it to pass over.
             **collector_payload([]),
+            **timer_payload(),
         }
         # The store's claim about the live ledger. A ledger held open was only
         # commented on, so its body still renders what the previous run put
@@ -16525,6 +16620,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
         # empty here; carried so the line has one shape.
         UNACCOUNTED_KEY: [],
         **collector_payload(plan.uncorroborated),
+        **timer_payload(),
     }
     write_report(
         audit_id,
