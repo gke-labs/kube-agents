@@ -370,8 +370,15 @@ class ClassifierFixtureTest(unittest.TestCase):
         next(w for w in workloads if w["metadata"]["name"] == "inference-server")["spec"]["template"]["spec"]["nodeSelector"] = {"cloud.google.com/gke-nodepool": "pinned-inference-pool"}
         rows = [s for s in symptoms_of("seeded-a", reads={**READS["seeded-a"], "pods": pods, "workloads": workloads}) if s["category"] == "pdb"]
         self.assertEqual(len(rows), 1)
-        # With no placement, no selector and no drain-time creation, nothing links the budget to a pool.
+        # The fixture's own template selector is a custom label (`seeded-role: pinned-inference`): it
+        # resolves to the pool through the pools' labels, the same way the Pending-pod gate reads it.
         rows = [s for s in symptoms_of("seeded-a", reads={**READS["seeded-a"], "pods": pods}) if s["category"] == "pdb"]
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["upgraded_pools"], ["pinned-inference-pool"])
+        # With no placement, no selector on pod or template and no drain-time creation, nothing links the budget.
+        bare = copy.deepcopy(workloads)
+        next(w for w in bare if w["metadata"]["name"] == "inference-server")["spec"]["template"]["spec"].pop("nodeSelector")
+        rows = [s for s in symptoms_of("seeded-a", reads={**READS["seeded-a"], "pods": pods, "workloads": bare}) if s["category"] == "pdb"]
         self.assertEqual(rows, [])
 
     def test_budget_on_a_pool_nothing_drained_is_not_a_failure(self):
@@ -706,6 +713,30 @@ class ClassifierSignatureTest(unittest.TestCase):
         self.assertEqual(labels[("seeded-role", "pinned-inference")], {"pinned-inference-pool"})
         self.assertEqual(ur._selector_pools({"seeded-role": "pinned-inference"}, labels), {"pinned-inference-pool"})
         self.assertEqual(ur._selector_pools({"no-such-label": "x"}, labels), set())
+
+    def test_pre_existing_sibling_proves_an_ambiguous_rows_age(self):
+        # One replica crash-looping on an untouched pool since before the window, one recreated by the
+        # default-pool drain on a touched cgroup v2 node: the row predates the upgrade, whatever the order.
+        ops = [o for o in ops_for("seeded-a") if "idle-batch-pool" not in o["targetLink"]]
+        old = pod("jvm-aaaaa", images=["eclipse-temurin:8u302-jre"], statuses=[{"name": "c0", "state": {"waiting": {"reason": "CrashLoopBackOff"}}, "lastState": {"terminated": {"reason": "OOMKilled", "exitCode": 137, "finishedAt": "2026-10-08T17:00:00Z"}}, "restartCount": 40}], node="gke-seeded-a-idle-batch-pool-a5fd3288-q4ts")
+        old["status"]["startTime"] = "2026-09-20T00:00:00Z"
+        old["metadata"]["creationTimestamp"] = "2026-09-20T00:00:00Z"
+        old["status"]["conditions"] = [{"type": "Ready", "status": "False", "lastTransitionTime": "2026-10-08T17:00:01Z"}]
+        new = pod("jvm-zzzzz", images=["eclipse-temurin:8u302-jre"], statuses=[{"name": "c0", "state": {"waiting": {"reason": "CrashLoopBackOff"}}, "lastState": {"terminated": {"reason": "OOMKilled", "exitCode": 137, "finishedAt": "2026-10-08T17:30:00Z"}}, "restartCount": 12}], node="gke-seeded-a-default-pool-62ac8ee0-d595")
+        new["status"]["startTime"] = "2026-10-07T04:05:00Z"
+        new["metadata"]["creationTimestamp"] = "2026-10-07T04:05:00Z"
+        new["status"]["conditions"] = [{"type": "Ready", "status": "False", "lastTransitionTime": "2026-10-08T17:30:01Z"}]
+        for p in (old, new):
+            p["metadata"]["ownerReferences"] = [{"kind": "ReplicaSet", "name": "jvm-rs"}]
+        first_op = datetime(2026, 10, 6, 4, 22, 12, tzinfo=timezone.utc)
+        for first, second in ((old, new), (new, old)):
+            reads = {"pods": [first, second], "nodes": READS["seeded-a"]["nodes"], "events": [], "pdbs": [], "owners": []}
+            [row] = ur.collect_symptoms(cluster_doc("seeded-a"), reads, ops, SINCE)
+            for baseline in (None, []):
+                ur.mark_since([row], baseline, first_op)
+                self.assertEqual((row["new_pods"], row["pre_existing_pods"], row["predates_upgrade"], row.get("recreated_only")), (["jvm-zzzzz"], ["jvm-aaaaa"], True, None), f"order {first['metadata']['name']} first, baseline {baseline!r}")
+                self.assertIn("; 1 new since the operation (e.g. jvm-zzzzz)", row["classifications"][0]["evidence"])
+                self.assertIn("; 1 pre-existing since 2026-09-20T00:00:00Z (e.g. jvm-aaaaa)", row["classifications"][0]["evidence"])
 
     def test_entry_14_gates_on_the_oom_pods_own_pool(self):
         # idle-batch-pool (cgroup v2) was not touched this week; default-pool was. The OOM pod on the untouched pool is medium.
@@ -1374,6 +1405,24 @@ class LedgerAndGuardsTest(unittest.TestCase):
         self.assertIn(GEMMA, {g["cluster"] for g in kept["guards"]})
         self.assertIn(f"{GEMMA}: its project's listing failed (clusters list rc=1: PERMISSION_DENIED); ledger entry and guards kept unchanged", kept["failed_reads"])
 
+    def test_review_boundary_survives_a_raise_in_its_own_fallback_inputs(self):
+        def boom(*args, **kwargs):
+            raise RuntimeError("planted")
+
+        with mock.patch.object(ur, "collect_symptoms", boom), mock.patch.object(ur, "what_happened", boom):
+            result, _ = self.collect()
+        failed = [r for r in result["reviews"] if not r["reviewed"]]
+        self.assertEqual(len(failed), 2)
+        self.assertTrue(all(r["what_happened"]["status"] in (ur.STATUS_NEW, ur.STATUS_UPGRADED, ur.STATUS_FORCED) and r["what_happened"]["operations"] == [] for r in failed))
+        self.assertTrue(all(any(e.startswith("review failed: RuntimeError('planted')") for e in r["read_errors"]) for r in failed))
+        self.assertIn(ur.SECTION_INFO, ur.render_report(result))
+        with mock.patch.object(ur, "collect_symptoms", boom), mock.patch.object(ur, "next_upgrade", boom):
+            result, _ = self.collect(now=datetime(2026, 10, 15, 18, 0, tzinfo=timezone.utc))
+        failed = [r for r in result["reviews"] if not r["reviewed"]]
+        self.assertTrue(failed)
+        self.assertTrue(all(r["next_upgrade"]["window"] == ur.NO_WINDOW_TEXT and r["next_upgrade"]["target"] is None for r in failed))
+        ur.render_report(result)
+
     def test_malformed_pod_is_a_failed_read_not_a_crash(self):
         reads = {**READS["seeded-a"], "pods": READS["seeded-a"]["pods"] + ["garbage", {"metadata": None, "spec": 3}]}
         with mock.patch.dict(READS, {"seeded-a": reads}):
@@ -1461,6 +1510,18 @@ class LedgerAndGuardsTest(unittest.TestCase):
         self.assertEqual(review["answered"], [])
         self.assertEqual(second["sections"]["info"]["clean"], [])
         self.assertNotIn(f"### {SEEDED} —", ur.render_report(second).split(ur.SECTION_INFO)[1])
+
+    def test_recheck_refresh_skips_pods_still_starting(self):
+        self.collect()
+        young = pod("fresh", namespace="seeded-debug", statuses=[{"name": "c0", "state": {"waiting": {"reason": "ContainerCreating"}}, "restartCount": 0}])
+        young["status"]["startTime"] = "2026-10-15T17:55:00Z"
+        young["metadata"]["creationTimestamp"] = "2026-10-15T17:55:00Z"
+        young["status"]["conditions"] = [{"type": "Ready", "status": "False", "lastTransitionTime": "2026-10-15T17:55:00Z"}]
+        with mock.patch.dict(READS, {"seeded-a": {**READS["seeded-a"], "pods": READS["seeded-a"]["pods"] + [young]}}):
+            second, _ = self.collect(now=datetime(2026, 10, 15, 18, 0, tzinfo=timezone.utc))
+        [recheck] = [r for r in second["rechecks"] if r["cluster"] == SEEDED]
+        self.assertFalse(any("fresh" in key for key in recheck["symptom_baseline"]), recheck["symptom_baseline"])
+        self.assertFalse(any("fresh" in key for key in ur.load_json(self.home / ur.LEDGER_FILENAME, {})["clusters"][SEEDED]["symptoms"]))
 
     def test_recheck_for_risk_guards_reads_nodes(self):
         self.collect()

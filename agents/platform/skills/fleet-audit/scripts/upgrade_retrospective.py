@@ -564,6 +564,7 @@ PRE_EXISTING_PODS_FORMAT = "; {count} pre-existing since {earliest} (e.g. {examp
 # The joint between a pod row's core evidence and its example pod; the notes
 # (pre-existing, age proof, rollout) follow and are never cut.
 POD_EVIDENCE_EXAMPLE_FORMAT = "; e.g. {example}"
+NEW_PODS_FORMAT = "; {count} new since the operation (e.g. {example})"
 # Where a pod symptom's onset came from: the owner's dated failure
 # condition (or its current ReplicaSet's creation when it has none), or the
 # pod's own evidence. A pool upgrade recreates every pod on the pool, so a
@@ -1656,24 +1657,33 @@ def _selector_matches(selector: dict, labels: dict) -> bool:
     return True
 
 
-def _covered_pod_pool(pod: dict, node_pool: dict[str, str], owner_pool: str, pool_spans: dict[str, list[tuple[datetime, datetime]]]) -> str:
-    """The pool a budget's pod belongs to: where it sits, else the pool its
-    own or its owner's nodeSelector names, else, for a Pending pod, the pool
-    whose drain was running when it was created (the replica the drain
-    displaced)."""
+def _selector_pool_set(selector: dict, label_pools: dict[tuple[str, str], set[str]]) -> set[str]:
+    """The pools a nodeSelector names: by the pool label, or by any label the
+    pools carry -- the same mapping the Pending-pod gate reads."""
+    pool = (selector or {}).get(NODEPOOL_LABEL, "")
+    return {pool} if pool else _selector_pools(selector, label_pools)
+
+
+def _covered_pod_pools(pod: dict, node_pool: dict[str, str], owner_selector: dict, pool_spans: dict[str, list[tuple[datetime, datetime]]], label_pools: dict[tuple[str, str], set[str]]) -> set[str]:
+    """The pools a budget's pod belongs to: where it sits, else the pools its
+    own or its owner's nodeSelector names (by the pool label or any pool
+    label), else, for a Pending pod, the pool whose drain was running when it
+    was created (the replica the drain displaced)."""
     spec = pod.get("spec") or {}
-    pool = node_pool.get(spec.get("nodeName") or "", "") or (spec.get("nodeSelector") or {}).get(NODEPOOL_LABEL, "") or owner_pool
-    if pool:
-        return pool
+    placed = node_pool.get(spec.get("nodeName") or "", "")
+    if placed:
+        return {placed}
+    for selector in (spec.get("nodeSelector") or {}, owner_selector or {}):
+        pools = _selector_pool_set(selector, label_pools)
+        if pools:
+            return pools
     created = parse_ts((pod.get("metadata") or {}).get("creationTimestamp"))
     if created and (pod.get("status") or {}).get("phase") == PHASE_PENDING:
-        for candidate, spans in pool_spans.items():
-            if any(start <= created <= end for start, end in spans):
-                return candidate
-    return ""
+        return {candidate for candidate, spans in pool_spans.items() if any(start <= created <= end for start, end in spans)}
+    return set()
 
 
-def pdb_symptoms(pdbs: list[dict], pods: list[dict], nodes: list[dict], upgraded_pools: dict[str, dict], pool_spans: dict[str, list[tuple[datetime, datetime]]] | None = None, owner_pools: dict[str, str] | None = None, resolver: Resolver | None = None) -> list[dict]:
+def pdb_symptoms(pdbs: list[dict], pods: list[dict], nodes: list[dict], upgraded_pools: dict[str, dict], pool_spans: dict[str, list[tuple[datetime, datetime]]] | None = None, owner_selectors: dict[str, dict] | None = None, resolver: Resolver | None = None, label_pools: dict[tuple[str, str], set[str]] | None = None) -> list[dict]:
     """Entry 1's after-signal: a budget allowing no disruption whose pods
     belong to a pool an `UPGRADE_NODES` touched in the window -- where they
     sit, or, for the replicas the drain displaced, where they came from."""
@@ -1689,11 +1699,11 @@ def pdb_symptoms(pdbs: list[dict], pods: list[dict], nodes: list[dict], upgraded
         pools = set()
         for p in covered:
             meta = p.get("metadata") or {}
-            owner_pool = ""
+            owner_selector: dict = {}
             if resolver is not None:
                 kind, oname = resolver.resolve(meta.get("namespace", ""), "Pod", meta.get("name", ""))
-                owner_pool = (owner_pools or {}).get(_object_ref(meta.get("namespace", ""), kind, oname), "")
-            pools.add(_covered_pod_pool(p, node_pool, owner_pool, pool_spans or {}))
+                owner_selector = (owner_selectors or {}).get(_object_ref(meta.get("namespace", ""), kind, oname), {})
+            pools |= _covered_pod_pools(p, node_pool, owner_selector, pool_spans or {}, label_pools or {})
         pools = sorted(pools - {""})
         touched = [pool for pool in pools if pool in upgraded_pools]
         if not touched:
@@ -2029,6 +2039,12 @@ def mark_since(symptoms: list[dict], baseline: list[str] | None, first_operation
             if new_pods and not ambiguous:
                 symptom["since"] = SINCE_FIRST_SEEN if baseline is None else SINCE_NEW
                 symptom["predates_upgrade"] = False
+            elif ambiguous and old_pods:
+                # A sibling replica whose own onset predates the window is the
+                # proof of age: the recreated replicas carried the failure over.
+                symptom["since"] = SINCE_FIRST_SEEN if baseline is None else (SINCE_BEFORE if recorded else SINCE_NEW)
+                symptom["predates_upgrade"] = True
+                notes.append(NEW_PODS_FORMAT.format(count=len(new_pods), example=new_pods[0]))
             elif proven_old:
                 # The owner proves the failure predates the window.
                 symptom["since"] = SINCE_FIRST_SEEN if baseline is None else (SINCE_BEFORE if recorded else SINCE_NEW)
@@ -2099,8 +2115,7 @@ def collect_symptoms(cluster: dict, reads: dict[str, list], operations: list[dic
     ]
     for e in events:
         e.setdefault("node_selector", owner_selectors.get(e["object"], {}))
-    owner_pools = {obj: (selector or {}).get(NODEPOOL_LABEL, "") for obj, selector in owner_selectors.items()}
-    symptoms = pods + node_symptoms(nodes) + events + pdb_symptoms(reads.get("pdbs") or [], reads.get("pods") or [], nodes, upgraded, pool_operation_windows(operations), owner_pools, resolver)
+    symptoms = pods + node_symptoms(nodes) + events + pdb_symptoms(reads.get("pdbs") or [], reads.get("pods") or [], nodes, upgraded, pool_operation_windows(operations), owner_selectors, resolver, ctx.label_pools)
     for symptom in symptoms:
         symptom["classifications"] = classify_symptom(symptom, ctx)
         if symptom.get("pod_count"):
@@ -2643,7 +2658,7 @@ def parse_version(v: str) -> tuple[int, int, int, int] | None:
 # --------------------------------------------------------------------------- #
 
 
-def recheck_cluster(key: str, cluster: dict, cluster_guards: list[dict], *, run: RunFn, refresh: bool = False) -> dict:
+def recheck_cluster(key: str, cluster: dict, cluster_guards: list[dict], *, run: RunFn, refresh: bool = False, now: datetime | None = None) -> dict:
     """Re-read an unchanged cluster for the guards it holds: the symptom or
     shape behind each is looked for again with only the reads it needs. A
     guard whose finding is gone, and whose reads all answered, is cleared."""
@@ -2675,7 +2690,7 @@ def recheck_cluster(key: str, cluster: dict, cluster_guards: list[dict], *, run:
     # A budget still allowing no disruption keeps its entry-1 failure guard:
     # the drain it held cannot be re-observed without the operation.
     budgets_at_zero = {_object_ref((b.get("metadata") or {}).get("namespace", ""), "PodDisruptionBudget", (b.get("metadata") or {}).get("name", "")) for b in reads.get("pdbs") or [] if (b.get("status") or {}).get("disruptionsAllowed") == 0}
-    symptoms = collect_symptoms(cluster, reads, [], EPOCH)
+    symptoms = collect_symptoms(cluster, reads, [], EPOCH, now=now)
     if refresh and set(REFRESH_READS) <= answered:
         result["symptom_baseline"] = sorted({symptom_key(sym) for sym in symptoms})
     fresh = {g["id"] for g in guards_for(key, symptoms, "")}
@@ -2694,33 +2709,63 @@ def recheck_cluster(key: str, cluster: dict, cluster_guards: list[dict], *, run:
     return result
 
 
-def _safe_recheck(key: str, cluster: dict, cluster_guards: list[dict], *, run: RunFn, refresh: bool = False) -> dict:
+def _safe_recheck(key: str, cluster: dict, cluster_guards: list[dict], *, run: RunFn, refresh: bool = False, now: datetime | None = None) -> dict:
     try:
-        return recheck_cluster(key, cluster, cluster_guards, run=run, refresh=refresh)
+        return recheck_cluster(key, cluster, cluster_guards, run=run, refresh=refresh, now=now)
     except Exception as exc:  # noqa: BLE001 -- the boundary is the point
         log(f"{key}: re-check failed: {exc!r}")
         return {"cluster": key, "guards": len(cluster_guards), "cleared": [], "refreshed": [], "not_recheckable": [], "errors": [f"re-check failed: {exc!r}"[:ERROR_EXCERPT_CHARS]], "symptom_baseline": None, "commands": {}}
 
 
+def _bare_what_happened(selection: Selection) -> dict:
+    """What a failed review can still say about the cluster without reading
+    anything that can raise: the selection's own facts."""
+    return {
+        "status": selection.status,
+        "reasons": list(selection.reasons),
+        "window_start": fmt_ts(selection.window_start),
+        "channel": "",
+        "versions_before": None,
+        "versions_after": {"control_plane": "", "node_pools": {}},
+        "cluster_status": "",
+        "operations": [],
+        "symptom_window_start": fmt_ts(selection.window_start),
+    }
+
+
+def _bare_next_upgrade() -> dict:
+    return {"channel": "", "current": "", "target": None, "below_target": None, "window": NO_WINDOW_TEXT, "next_opens": None, "exclusions": []}
+
+
 def _safe_review(selection: Selection, ledger: dict, **kwargs) -> dict:
     """`review_cluster` with the exception boundary the docstring promises:
     an object shape this collector did not expect is a failed read of that
-    cluster, not the end of the run."""
+    cluster, not the end of the run. The fallback calls nothing that reads
+    the cluster record, so it cannot raise in turn; the record's own parts
+    are attempted one at a time."""
     try:
         return review_cluster(selection, ledger, **kwargs)
     except Exception as exc:  # noqa: BLE001 -- the boundary is the point
         log(f"{selection.key}: review failed: {exc!r}")
+        try:
+            happened = what_happened(selection, ledger)
+        except Exception:  # noqa: BLE001 -- the fallback must not raise
+            happened = _bare_what_happened(selection)
+        try:
+            upcoming = next_upgrade(selection.cluster, kwargs.get("server_config"), kwargs.get("now") or now_utc())
+        except Exception:  # noqa: BLE001 -- the fallback must not raise
+            upcoming = _bare_next_upgrade()
         return {
             "cluster": selection.key,
-            "project": selection.cluster["project"],
-            "location": selection.cluster["location"],
-            "name": selection.cluster["name"],
-            "what_happened": what_happened(selection, ledger),
+            "project": selection.cluster.get("project", ""),
+            "location": selection.cluster.get("location", ""),
+            "name": selection.cluster.get("name", ""),
+            "what_happened": happened,
             "what_failed": [],
             "mitigations": [],
             "shapes": [],
             "managed_agents": 0,
-            "next_upgrade": next_upgrade(selection.cluster, kwargs.get("server_config"), kwargs.get("now") or now_utc()),
+            "next_upgrade": upcoming,
             "baseline": None,
             "symptom_baseline": None,
             "guards": [],
@@ -2729,6 +2774,7 @@ def _safe_review(selection: Selection, ledger: dict, **kwargs) -> dict:
             "partial": list(CORE_READS),
             "answered": [],
             "commands": [],
+            "starting": [],
         }
 
 
@@ -3555,7 +3601,7 @@ def collect(args: argparse.Namespace, *, run: RunFn | None = None, now: datetime
         if row["cluster"] in by_key and (row["cluster"] in held or (not scoped and row["cluster"].split(CLUSTER_KEY_SEPARATOR)[0] in new_fleet))
     ]
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
-        rechecks = list(pool.map(lambda item: _safe_recheck(item[0], item[1], item[2], run=run, refresh=item[3]), to_recheck))
+        rechecks = list(pool.map(lambda item: _safe_recheck(item[0], item[1], item[2], run=run, refresh=item[3], now=now), to_recheck))
     refreshed_baselines = {r["cluster"]: r["symptom_baseline"] for r in rechecks if r.get("symptom_baseline") is not None}
     cleared_ids = {gid for r in rechecks for gid in r["cleared"]}
     refreshed_ids = {gid for r in rechecks for gid in r["refreshed"]}
