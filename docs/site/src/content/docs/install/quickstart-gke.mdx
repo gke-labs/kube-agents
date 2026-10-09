@@ -95,7 +95,7 @@ Only run the real install after I say yes.
    cd kube-agents
    ```
 
-2. **Run the installer.**
+2. **Run the installer.** If you enable Slack, create the Slack app and its tokens first ([Slack app setup](/kube-agents/install/slack-app/)): the installer asks for both tokens.
 
    ```bash
    ./install.sh
@@ -114,7 +114,7 @@ Only run the real install after I say yes.
      with uncommitted or unverified changes, pass `--allow-unverified-source`.
    </Aside>
 
-3. **Configure Google Chat** (only if you enabled the Google Chat integration). In the [Chat API console](https://console.cloud.google.com/apis/api/chat.googleapis.com), point the bot's Pub/Sub connection at the created topic (`projects/<PROJECT_ID>/topics/<CHAT_TOPIC_NAME>`). The installer prints the exact topic name and step-by-step instructions when it finishes. If you enabled Slack instead, create the Slack app and its tokens before you run the installer: [Slack app setup](/kube-agents/install/slack-app/).
+3. **Configure Google Chat** (only if you enabled the Google Chat integration). In the [Chat API console](https://console.cloud.google.com/apis/api/chat.googleapis.com), point the bot's Pub/Sub connection at the created topic (`projects/<PROJECT_ID>/topics/<CHAT_TOPIC_NAME>`). The installer prints the exact topic name and step-by-step instructions when it finishes.
 
 4. **Verify.**
 

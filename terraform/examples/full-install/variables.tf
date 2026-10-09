@@ -521,7 +521,7 @@ variable "session_kv_salt" {
 }
 
 variable "slack_allowed_users" {
-  description = "Slack users allowed to talk to the agent (empty list = all users allowed). Only used when enable_slack is true."
+  description = "Slack member IDs (e.g. U0123ABCD; not emails) allowed to talk to the agent (empty list = every workspace member allowed). Only used when enable_slack is true."
   type        = list(string)
   default     = []
 }

@@ -923,10 +923,10 @@ leaves the ingress running, still exporting and still billing.
   the agent's own GSA. Then DM the bot; on
   first contact, optionally approve the pairing code via
   `hermes pairing approve google_chat <CODE>` in the gateway pod.
-- **Slack:** in the Slack app console enable Socket Mode and grant the bot
-  scopes listed in the walkthrough, then pass the resulting tokens as
-  `slack_bot_token` / `slack_app_token`; pairing approval works the same way
-  (`hermes pairing approve slack <CODE>`).
+- **Slack:** create the Slack app and its tokens as the site's Slack app setup
+  page describes (`docs/site/src/content/docs/install/slack-app.md`), pass the
+  tokens as `slack_bot_token` / `slack_app_token`, and set
+  `slack_allowed_users` to Slack member IDs (`U0123ABCD`), not emails.
 
 ## Standalone use outside this repository
 
