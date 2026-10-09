@@ -324,12 +324,15 @@ queue read too: it means the pool looked fine so Prow must be at fault, which
 holds only while something is queued. Unread, the message gives the free count
 and apportions no blame. `pool full` keeps its remedy either way and drops "and
 runs are queuing" whenever Deck did not see a backlog — the leased count is this
-hour's, the queue is Deck's.
+hour's, the queue is Deck's. A refusal keeps the cause for three hours, so once
+the pool has drained the header reads `pool was full` with the free count
+instead of calling the projects leased.
 
 A drained queue also ends what the jam said. The verdict holds for a week, so a
 pool that fills every afternoon would otherwise be announced on Monday and
 silent for the rest of it; the causes already named are forgotten on a reading
-that shows nothing waiting, and the next jam is news again — a next jam that has
+that shows nothing waiting and no refusal in the last three hours, and the next
+jam is news again — a next jam that has
 to be measured, since an hour Deck could not be read has seen no queue at all.
 The dashboard dates
 a jam from its own oldest queued run rather than from the episode, for the same

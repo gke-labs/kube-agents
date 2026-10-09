@@ -224,7 +224,7 @@ BOSKOS_NO_OWNER = ""
 BUILD_ID_SUFFIX = re.compile(r"-(\d{19})$")
 # Jobs that lease under a fixed owner rather than `<job name>-<build ID>`: the
 # defaults in hack/fleet_reconcile.py and hack/ci_sweep_compute_plants.py,
-# which the Prow jobs running them do not override. Deck cannot vouch for a
+# which the fleet reconcile's Prow jobs do not override. Deck cannot vouch for a
 # lease with no build ID in it, so these are reported as a job's, apart from
 # the hand holds, and are never compared against it.
 BOSKOS_JOB_OWNERS = ("fleet-reconcile", "ci-kube-agents-compute-sweep")
