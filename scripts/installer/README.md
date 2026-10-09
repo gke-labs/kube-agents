@@ -153,7 +153,8 @@ one-run override would be undone by the next full upgrade without a word. They a
 Against an existing `install.env`, a flag that disagrees with the key the file assigns is
 refused before anything is applied, naming the file and the key: edit the key (or, for
 `GOOGLE_CHAT_ENABLED` and the Google Chat allowlist and home channel, use the Day-2 menu) and
-re-run without the flag. The menu is not offered for the topic, which it does not ask about, or
+re-run without the flag. A home channel changed this way does not replace one that `/sethome` or
+the install's first chat message already set; run `/sethome` in the new channel instead. The menu is not offered for the topic, which it does not ask about, or
 for `SLACK_ENABLED`, which it turns on without asking for the tokens; to turn Slack on, set the
 key and re-run with `--slack-bot-token` and `--slack-app-token`. A key with a default (the toggles, the topic, the Chat mode) that
 the file sets empty counts as that default, and the two allowlists compare as the lists they

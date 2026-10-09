@@ -1150,7 +1150,11 @@ Hermes keys into each profile's `.env` and asks Hermes to confirm they resolve: 
 start-up (entrypoint step 4b; [Container entrypoint](/kube-agents/deploy/docker-images/#container-entrypoint)
 says which failures stop the container) and when `cluster_agent_profile.py` scaffolds a profile. The image build's
 `--build-check` fails when a Hermes bump breaks the copy, and warns once Hermes
-resolves the managed backend without it.
+resolves the managed backend without it. The same check reads the terminal tool's
+default call timeout out of that Hermes and fails the build when the Cluster Agent
+preflight's mirror of it (`TERMINAL_TOOL_TIMEOUT_SECONDS` in `cluster_preflight.sh`,
+which budgets the preflight's brokered calls under it) disagrees; the identifier
+sources table in [`docs/README.md`](../README.md) names both.
 
 #### Two sharp edges left
 

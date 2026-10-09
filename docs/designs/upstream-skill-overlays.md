@@ -1,8 +1,10 @@
 # Upstream skill overlays
 
-> **STATUS — design; partly implemented.** `scripts/skill_overlay.py` and the `make skills-*`
-> targets exist, but no skill is mirrored with them yet: `scripts/sync-upstream-skills.py` and its
-> string registries still sync every `gke-*` skill on `main`. The implementation plan is tracked in
+> **STATUS — design; partly implemented.** `scripts/skill_overlay.py`, the `make skills-*`
+> targets and both checks in `validate` run on `main`, and `gke-workload-troubleshooting` is
+> mirrored with them. The other mirrored skills still come from `scripts/sync-upstream-skills.py`
+> and its string registries, which skip any skill with an `upstream.lock`. The implementation
+> plan is tracked in
 > [#2374](https://github.com/gke-labs/kube-agents/issues/2374); the policy questions it answers
 > were raised in [#1450](https://github.com/gke-labs/kube-agents/issues/1450).
 
@@ -88,7 +90,7 @@ flowchart LR
 | ③ Generated skill | `agents/platform/skills/<skill>/`         | ① with ② applied; committed                                      | Contributors directly; `make skills-generate`; the sync                 |
 
 - **Upstream copy:** outside `agents/platform/skills/`, so the image build, catalogue generator and skill command check never see it.
-  - Keeps today's `.prettierignore` and `make shellcheck` exclusions; `docs/README.md` gains inventory rows for it and for `append.md`.
+  - Keeps today's `.prettierignore` and `make shellcheck` exclusions; the map's tree in `docs/README.md` gains a `third_party/` line.
   - A sync PR shows upstream's change as a diff of this directory.
 - **`upstream.lock`:** two values, rewritten by the sync in the PR that replaces the copy, so copy and lock match unless the copy was edited by hand. One per skill, so per-skill PRs share no file.
 
@@ -353,10 +355,10 @@ GitHub cannot make a directory read-only, so the design adds these checks, as st
 
 ### Where the checks run
 
-| Check                           | Runs as              | Runs on                                                                                         |
-| ------------------------------- | -------------------- | ----------------------------------------------------------------------------------------------- |
-| `make skills-check`             | A step in `validate` | Every PR, offline                                                                               |
-| Comparison with `google/skills` | A step in `validate` | Every PR; skips itself unless the PR changes `third_party/google-skills/` or an `upstream.lock` |
+| Check                           | Runs as              | Runs on                                                                                                                                                  |
+| ------------------------------- | -------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `make skills-check`             | A step in `validate` | Every PR, offline                                                                                                                                        |
+| Comparison with `google/skills` | A step in `validate` | Every PR and merge-queue entry; skips itself unless the change touches `third_party/google-skills/` or an `upstream.lock`; a push to main always runs it |
 
 - `validate` is already required, so its steps block merge from day one; a new job would need an admin to make it required.
 - The comparison skips itself rather than using a workflow path filter, because a required check that never starts blocks every PR.
@@ -390,12 +392,12 @@ Optional, not part of this design: an `OWNERS` file on `third_party/google-skill
 
 Four PRs implement the design: about four days for one engineer working with a coding agent. None changes what the agent sees, since every migrated skill stays byte-identical to `main`, so none needs the eval loop; live validation is the byte-identical proof plus a spot check of a skill file in the agent pod. Each PR still runs the presubmit smoke test (1.5 to 3.5 hours per push), which is waiting time.
 
-| PR  | Delivers                                                                                                                                                                                                                                            | Depends on  | Days |
-| --- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------- | ---- |
-| 1   | `scripts/skill_overlay.py` (`sync`, `continue`, `import`, `refresh`, `generate`, `check`, `status`, `verify-upstream`), the lock format, make targets and tests. No skill migrated.                                                                 | this design | 1–2  |
-| 2   | Pilot: `gke-workload-troubleshooting` migrated (copy, lock, one patch); `third_party/google-skills/` with docs-map rows and exclusions; `make skills-check` and the upstream comparison as steps in `validate`; the old script skips locked skills. | PR 1        | 1    |
-| 3   | The other 28 skills migrated: copies, locks, the remaining patches, five `append.md` files, and the in-tree edits no registry records. Generated tree byte-identical to `main`.                                                                     | PR 2        | 1    |
-| 4   | Old script, registries and their tests removed; references updated (list below).                                                                                                                                                                    | PR 3        | 0.5  |
+| PR  | Delivers                                                                                                                                                                                                                                                     | Depends on  | Days |
+| --- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ----------- | ---- |
+| 1   | `scripts/skill_overlay.py` (`sync`, `continue`, `import`, `refresh`, `generate`, `check`, `status`, `verify-upstream`), the lock format, make targets and tests. No skill migrated.                                                                          | this design | 1–2  |
+| 2   | Pilot: `gke-workload-troubleshooting` migrated (copy, lock, two patches); `third_party/google-skills/` with a docs-map tree line and exclusions; `make skills-check` and the upstream comparison as steps in `validate`; the old script skips locked skills. | PR 1        | 1    |
+| 3   | The other 28 skills migrated: copies, locks, the remaining patches, five `append.md` files, and the in-tree edits no registry records. Generated tree byte-identical to `main`.                                                                              | PR 2        | 1    |
+| 4   | Old script, registries and their tests removed; references updated (list below).                                                                                                                                                                             | PR 3        | 0.5  |
 
 - Not in the estimate: the first syncs after migration. They land what upstream has added since the last sync (new skills, two renamed TPU skills), which the agent does see, so each follows the eval loop like any skill change.
 - Outside the engineer's control, and worth starting first: landing or pausing the open skill-sync PRs before PR 3.

@@ -107,6 +107,38 @@ readonly AGENT_DIAG_WATCH_EVENT_COLUMNS="FIRST:.firstTimestamp,LAST:.lastTimesta
 # carry their reason at pod level, so the pod line has status.reason.
 readonly AGENT_DIAG_POD_STATUS_JSONPATH='{range .items[*]}{.metadata.name}{"\tphase="}{.status.phase}{"\treason="}{.status.reason}{"\tstarted="}{.status.startTime}{"\n"}{range .status.containerStatuses[*]}{"  "}{.name}{"\trestarts="}{.restartCount}{"\tlast="}{.lastState.terminated.reason}{"\texit="}{.lastState.terminated.exitCode}{"\tfinished="}{.lastState.terminated.finishedAt}{"\trunningSince="}{.state.running.startedAt}{"\n"}{end}{end}'
 
+# ─── A2A component logs ──────────────────────────────────────────────────────
+# Under spec.mode: next the operator renders the bus stack (NATS, the auth
+# callout, the verifier, the gateway, the console, the provision Job) and the
+# gateway spawns session (worker) pods. A crash-looping one of these fails the
+# deploy, and `describe` says only "exit code 1": the reason is a line in the
+# container's own log. collect_a2a_component_logs keeps, for every such pod,
+# the current log and, when a container has restarted, the previous one, as
+# a2a-<component>-<pod>.log and a2a-<component>-<pod>-previous.log.
+# Operator-rendered pods carry this label, its value the component.
+readonly A2A_DIAG_COMPONENT_LABEL="kubeagents.x-k8s.io/a2a-component"
+# Session pods are the gateway's, not the operator's, so they carry the
+# standard component key instead (sessionRole in a2a/gateway/spawn.go, which
+# stamps them). They run the a2a-worker image, and their files are named for
+# that.
+readonly A2A_DIAG_SESSION_SELECTOR="app.kubernetes.io/component=a2a-session"
+readonly A2A_DIAG_SESSION_COMPONENT="worker"
+# One line per pod: name, component label (empty for a session pod), and the
+# restart count of each container. The label key's dots are escaped for
+# kubectl's JSONPath.
+readonly A2A_DIAG_PODS_JSONPATH='{range .items[*]}{.metadata.name}{"\t"}{.metadata.labels.kubeagents\.x-k8s\.io/a2a-component}{"\t"}{.status.containerStatuses[*].restartCount}{"\n"}{end}'
+# The agent's line tail, half its byte cap: there are up to A2A_DIAG_MAX_PODS
+# of these, two files each. Most are quiet (a start, a bus connection, the
+# failure), and a crash's previous log is a few lines. The A2A gateway is not:
+# it logs every task's ingress, spawn and end, so on a long nightly its file
+# keeps the most recent stretch, cut by the byte cap.
+readonly A2A_DIAG_LOG_TAIL_LINES=20000
+readonly A2A_DIAG_LOG_MAX_BYTES=$((4 * 1024 * 1024))
+# A bound on the pods read, so a session leak cannot turn one run's artifacts
+# into hundreds of files. The operator renders under a dozen pods and the
+# gateway caps sessions at A2A_MAX_SESSIONS, so a healthy install is well under.
+readonly A2A_DIAG_MAX_PODS=40
+
 ensure_helm() {
   if command -v helm >/dev/null 2>&1; then
     return 0
@@ -335,6 +367,69 @@ collect_agent_pod_diagnostics() {
         | tail -c "${AGENT_DIAG_LOG_MAX_BYTES}" > "${artifact_dir}/${prefix}hermes-bridge-previous.log" || true
       ;;
   esac
+
+  collect_a2a_component_logs "${artifact_dir}" "${prefix}" "${ns}" "${kctl[@]}"
+}
+
+# ─── A2A Component Logs ──────────────────────────────────────────────────────
+# The A2A_DIAG_ constants above say what and why. Called by
+# collect_agent_pod_diagnostics, so it inherits that function's once-per-run
+# guard, its artifact prefix and its context pin; `$4...` is that function's
+# kubectl command line. Same contract: every command ends in `|| true`. A
+# today-mode install has no pods under either selector and gains no log files.
+# The pod list goes to a2a-component-pods.txt, so a list that failed (an
+# unreachable cluster) is on record rather than looking like no A2A stack.
+#
+# `--previous` only for a pod with a restarted container. `--all-containers`
+# with `--ignore-errors`: without it kubectl stops at the first container of a
+# multi-container pod whose read fails (no previous instance, or not started)
+# and never reads the rest; with it, outside --follow, kubectl prints the
+# error and goes on to the next container. `--prefix` says which container
+# each line came from.
+collect_a2a_component_logs() {
+  local artifact_dir="$1" prefix="$2" ns="$3"
+  shift 3
+  local kctl=("$@")
+  local listing="${artifact_dir}/${prefix}a2a-component-pods.txt"
+  {
+    "${kctl[@]}" get pods -n "${ns}" -l "${A2A_DIAG_COMPONENT_LABEL}" \
+      -o jsonpath="${A2A_DIAG_PODS_JSONPATH}" 2>&1 || true
+    "${kctl[@]}" get pods -n "${ns}" -l "${A2A_DIAG_SESSION_SELECTOR}" \
+      -o jsonpath="${A2A_DIAG_PODS_JSONPATH}" 2>&1 || true
+  } > "${listing}" || true
+
+  local line rest pod component restarts base read_pods=0
+  while IFS= read -r line; do
+    # Only pod lines: an error kubectl wrote into the listing has no tab.
+    [[ "${line}" == *$'\t'* ]] || continue
+    # Split by hand: tab is IFS whitespace to `read`, which would merge the
+    # empty component field of a session pod into its neighbour.
+    pod="${line%%$'\t'*}"
+    rest="${line#*$'\t'}"
+    component="${rest%%$'\t'*}"
+    restarts="${rest#*$'\t'}"
+    [ -n "${pod}" ] || continue
+    if (( read_pods >= A2A_DIAG_MAX_PODS )); then
+      echo "truncated: read the first ${A2A_DIAG_MAX_PODS} pods" >> "${listing}" || true
+      break
+    fi
+    read_pods=$((read_pods + 1))
+    component="${component:-${A2A_DIAG_SESSION_COMPONENT}}"
+    # Names come from the API, which already restricts them; this keeps a
+    # path separator out of a file name regardless.
+    base="a2a-${component//[^A-Za-z0-9._-]/_}-${pod//[^A-Za-z0-9._-]/_}"
+    "${kctl[@]}" logs "pod/${pod}" -n "${ns}" --all-containers --prefix --ignore-errors \
+      --tail="${A2A_DIAG_LOG_TAIL_LINES}" 2>&1 \
+      | tail -c "${A2A_DIAG_LOG_MAX_BYTES}" > "${artifact_dir}/${prefix}${base}.log" || true
+    case "${restarts}" in
+      *[1-9]*)
+        "${kctl[@]}" logs "pod/${pod}" -n "${ns}" --all-containers --prefix --ignore-errors \
+          --previous --tail="${A2A_DIAG_LOG_TAIL_LINES}" 2>&1 \
+          | tail -c "${A2A_DIAG_LOG_MAX_BYTES}" > "${artifact_dir}/${prefix}${base}-previous.log" || true
+        ;;
+    esac
+  done < <(cat "${listing}" 2>/dev/null || true)
+  return 0
 }
 
 # ─── Shared Artifact Collection Handler for Prow Job Failures ───────────────────

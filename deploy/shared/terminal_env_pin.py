@@ -86,6 +86,19 @@ BUILD_CHECK_PROFILE_CONFIG = BUILD_CHECK_KEPT_LINE + "terminal:\n  backend: loca
 # A named profile the sweep has to find. profile_homes imports private Hermes names that no
 # other build step touches, and a pod whose sweep cannot import them does not start.
 BUILD_CHECK_PROFILE_NAME = "check"
+# The Cluster Agent preflight (cluster_preflight.sh) budgets its brokered calls
+# under the terminal tool's default call timeout, which is Hermes' and out of
+# that script's reach; it carries a mirror, and the build check below reads
+# the default out of the Hermes this image ships and holds the mirror to it.
+# Beside this module in the image, under agents/platform/scripts in a checkout.
+PREFLIGHT_SCRIPT_NAME = "cluster_preflight.sh"
+PREFLIGHT_SCRIPT_DIRS = (
+    pathlib.Path(__file__).resolve().parent,
+    pathlib.Path(__file__).resolve().parents[2] / "agents" / "platform" / "scripts",
+)
+PREFLIGHT_TERMINAL_MIRROR_RE = re.compile(r"^readonly TERMINAL_TOOL_TIMEOUT_SECONDS=(\d+)$", re.MULTILINE)
+TERMINAL_TOOL_FILE = pathlib.Path("tools") / "terminal_tool.py"
+TERMINAL_TOOL_DEFAULT_RE = re.compile(r'_parse_env_var\("TERMINAL_TIMEOUT",\s*"(\d+)"\)')
 
 
 class PinError(Exception):
@@ -398,6 +411,48 @@ def sweep(root: pathlib.Path) -> int:
     return 0
 
 
+def hermes_root() -> pathlib.Path:
+    """The checkout or install the Hermes on the path comes from."""
+    import hermes_cli
+
+    return pathlib.Path(hermes_cli.__file__).resolve().parents[1]
+
+
+def hermes_terminal_default_seconds(root: pathlib.Path | None = None) -> int:
+    """The terminal tool's default call timeout, read from the Hermes at `root`
+    (the one on the path when None)."""
+    tool = (hermes_root() if root is None else root) / TERMINAL_TOOL_FILE
+    match = TERMINAL_TOOL_DEFAULT_RE.search(tool.read_text(encoding=PRIMARY_CODEC))
+    if match is None:
+        raise PinError(f"{tool} no longer declares the TERMINAL_TIMEOUT default the way this check reads it")
+    return int(match.group(1))
+
+
+def preflight_terminal_mirror_seconds() -> int:
+    """The preflight's mirror of that default, from the script beside this one or in the checkout."""
+    for directory in PREFLIGHT_SCRIPT_DIRS:
+        script = directory / PREFLIGHT_SCRIPT_NAME
+        if script.is_file():
+            match = PREFLIGHT_TERMINAL_MIRROR_RE.search(script.read_text(encoding=PRIMARY_CODEC))
+            if match is None:
+                raise PinError(f"{script} no longer declares TERMINAL_TOOL_TIMEOUT_SECONDS")
+            return int(match.group(1))
+    raise PinError(f"{PREFLIGHT_SCRIPT_NAME} not found in {[str(d) for d in PREFLIGHT_SCRIPT_DIRS]}")
+
+
+def terminal_default_mismatch(root: pathlib.Path | None = None) -> str | None:
+    """The error to log when the preflight's mirror disagrees with the Hermes at `root`
+    (the one on the path when None), else None."""
+    hermes, mirror = hermes_terminal_default_seconds(root), preflight_terminal_mirror_seconds()
+    if hermes == mirror:
+        return None
+    return (
+        f"the terminal tool's default call timeout is {hermes}s on this Hermes, but "
+        f"{PREFLIGHT_SCRIPT_NAME} mirrors it as {mirror}s (TERMINAL_TOOL_TIMEOUT_SECONDS); "
+        "move the mirror, and the budget it derives, with the Hermes bump"
+    )
+
+
 def build_check() -> int:
     """Against a throwaway managed dir and profile: the copy must make Hermes resolve ssh,
     including over a backend the profile's config.yaml still sets, and the sweep must find a
@@ -445,6 +500,14 @@ def build_check() -> int:
         if homes != [home, named]:
             log(f"ERROR: the sweep would not pin the named profile at {named}")
             return 1
+    try:
+        mismatch = terminal_default_mismatch()
+    except (PinError, ImportError, OSError) as exc:
+        log(f"ERROR: could not compare the preflight's terminal-timeout mirror with this Hermes: {exc}")
+        return 1
+    if mismatch is not None:
+        log(f"ERROR: {mismatch}")
+        return 1
     log("build check passed: the .env copy makes Hermes resolve the managed ssh terminal")
     return 0
 

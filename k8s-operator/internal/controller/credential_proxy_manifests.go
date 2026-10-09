@@ -472,8 +472,8 @@ func buildCredentialProxyContainer(agent *agentv1alpha1.PlatformAgent) corev1.Co
 		// Sized where the constants are declared: CPU for the warm-up after an
 		// eviction, memory for Envoy, the broker's bounded share and the child
 		// processes the broker budgets against this limit. Lower than the
-		// sidecar's limit, which sized for the event watcher's informer
-		// caches; nothing here holds cluster state.
+		// sidecar's limit, which is sized for the event watcher's memos and
+		// initial lists; nothing here holds cluster state.
 		// spec.deployment.credentialProxy.resources overrides any key of it.
 		Resources:       resolveCredentialProxyResources(agent.Spec.Deployment),
 		VolumeMounts:    volumeMounts,

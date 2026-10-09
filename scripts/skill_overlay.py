@@ -354,7 +354,13 @@ def slugify(text):
 
 
 def stage_all(repo):
-    """Stage every file in a scratch repository, ignore rules or not."""
+    """Stage every file in a scratch repository, ignore rules or not.
+
+    The index is rebuilt from the files' content rather than refreshed from their stat data: the
+    tree was just replaced with copies, and a same-size edit made within the same second can
+    keep the size, the whole-second mtime and even the inode git cached, so `git add` alone
+    would skip it (seen on Linux, where git compares whole seconds)."""
+    git(["rm", "-r", "-q", "--cached", "--ignore-unmatch", "."], cwd=repo)
     git(["add", "-A", "--force"], cwd=repo)
 
 

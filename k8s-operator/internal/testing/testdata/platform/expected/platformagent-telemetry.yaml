@@ -280,6 +280,8 @@ data:
     approvals:
       cron_mode: approve
     display: {}
+    kanban:
+      max_in_progress: 6
     model:
       api_key: none
       api_mode: chat_completions
