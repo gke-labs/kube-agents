@@ -31,7 +31,8 @@ Use this skill when asked to upgrade the `kube-agents` Platform Agent or operato
   draft and explain the restriction. Regular users must not open or modify issue tickets, even
   for p0 failures or after approving a post.
 - Search `gke-labs/kube-agents` issues, open **and closed**, using the distinctive error, affected
-  component and root cause. Do not filter by `upgrade-failure`: older matching issues may lack it.
+  component and root cause. Use anonymized search terms; do not send raw client diagnostics.
+  Do not filter by `upgrade-failure`: older matching issues may lack it.
   Read candidate bodies and comments; a similar title or symptom with a different cause is not a
   duplicate. Narrow or paginate incomplete results. If search fails or remains incomplete, keep a
   draft and tell the user why; do not create an issue without a completed duplicate check.
