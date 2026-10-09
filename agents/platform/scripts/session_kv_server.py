@@ -3962,13 +3962,32 @@ def get_findings(
 
 @app.post("/v1/findings/{finding_id}/surfaced", dependencies=[Depends(verify_api_key)])
 def mark_finding_surfaced(finding_id: str, body: Dict[str, Any] | None = None) -> Dict[str, Any]:
+    """After the send. `publisher`, `added_class` and `run` are sent by a paced publisher alone (§7.2).
+
+    The MCP tool sends none of them, so a finding a model names in answer to a pull
+    is counted as named but never as shown.
+    """
     body = body or {}
     return _findings_write(
         findings_queue.mark_surfaced,
         finding_id,
         str(body.get("chat_id") or ""),
         str(body.get("thread_id") or ""),
+        str(body.get("publisher") or ""),
+        str(body.get("added_class") or ""),
+        str(body.get("run") or ""),
     )
+
+
+@app.get("/v1/findings/additions", dependencies=[Depends(verify_api_key)])
+def get_finding_additions(day: str = "") -> Dict[str, Any]:
+    """Items added on a UTC day (default today) by class, across every state (§7.2)."""
+    day = day or datetime.now(timezone.utc).date().isoformat()
+    try:
+        with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=5.0)) as conn:
+            return findings_queue.additions_on(conn, day)
+    except findings_queue.FindingError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from None
 
 
 @app.patch("/v1/findings/{finding_id}", dependencies=[Depends(verify_api_key)])

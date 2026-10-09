@@ -24,8 +24,9 @@ profile only on a `next` install (below).
 
 The binary has a second caller: the agent-side notification callers
 (`agents/platform/scripts/chat_notify.py`) run `a2a notify` to post proactive messages
-through the gateway, and only when the operator renders `A2A_NOTIFY_PLATFORM`, which it
-does only under `next`.
+through the gateway, and so does the Hermes kanban notifier for card events
+(`deploy/docker/patches/kanban_chat_notify.py`), both only when the operator renders
+`A2A_NOTIFY_PLATFORM`, which it does only under `next`.
 
 ## The skill copy does not survive a restart, and that is by design
 

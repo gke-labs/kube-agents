@@ -486,6 +486,9 @@
         "name": {
           "type": "string"
         },
+        "mode": {
+          "enum": [null, "", "today", "next"]
+        },
         "annotations": {
           "type": "object"
         },
@@ -577,6 +580,11 @@
               "properties": {
                 "maxInProgress": {
                   "type": "integer"
+                },
+                "maxSessions": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 10000
                 },
                 "default": {
                   "type": "object"
