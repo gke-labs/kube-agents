@@ -1,9 +1,11 @@
 # PARKED — a KNOWN_UNREGISTERED entry in scripts/validate_bench_cases.py,
-# in no roster file under hack/eval/: the nightly's infra-lock chain has no
-# room for another stack case (#2467), and nothing yet sweeps what a killed
-# run leaves behind (#2552). It has its eval record (#2468:
-# red on main 83194e93, three greens on the fix, 2026-10-06). Until a nightly
-# seat opens it runs by hand against a dev install:
+# in no roster file under hack/eval/, until the preconditions #2755 lists
+# land: Compute network permission for the CI runners (confirmed or
+# granted), a scheduled sweep of what a killed run leaves behind, and room on
+# the main part's infra-lock chain (measured with oobe-first-run-audits in
+# it, or stack cases moved to a second project). It has its eval record
+# (#2468: red on main 83194e93, three greens on the fix, 2026-10-06). Until
+# then it runs by hand against a dev install:
 #   cd bench && BENCH_TF_ROOT=./tf GCP_LOCATION=<zone> \
 #     TF_VAR_host_cluster_name=<agent cluster> TF_VAR_host_cluster_location=<its location> \
 #     uv run devops-bench ./tasks/networking-audit-subnet-range-exhaustion \
@@ -35,8 +37,8 @@
 # leased project (created and torn down by the stack), read-only sweep,
 # GitOps-repo write (the ledger). Eligible tier: nightly.
 #
-# Expected cost: the full-audit shape (600-1300s a repetition for the
-# siblings) plus about a minute of stack apply and teardown.
+# Expected cost: 5-7 minutes a repetition, stack apply and teardown
+# included (four dev-install repetitions on 2026-10-06, #2468).
 id: networking-audit-subnet-range-exhaustion
 name: Networking audit files the subnet whose primary range is full
 # No summary asked for: the SOP closes with one line, and the findings go to

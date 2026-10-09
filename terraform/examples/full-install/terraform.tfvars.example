@@ -124,6 +124,14 @@ api_server_key = "REPLACE_WITH_A_STRONG_RANDOM_KEY"
 # enable_github_minter = true
 # github_repo          = "my-github-org/my-repo"
 
+# Or a GitOps project on GitLab instead (no GitHub App, no minter). The token is
+# never a variable: create Secret gitlab_token_secret_name, key `token`, in the
+# agent's namespace.
+# gitops_forge              = "gitlab"
+# gitops_host               = "gitlab.example.com" # omit for gitlab.com
+# gitlab_repo               = "platform/infra/gitops"
+# gitlab_token_secret_name  = "gitlab-forge-token"
+
 # Optional Slack integration. Needs no GCP resources: the tokens go into the
 # credentials Secret and the CR's slack section turns on. Creating the Slack
 # app (Socket Mode + bot scopes) stays manual — see the README.

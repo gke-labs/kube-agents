@@ -38,6 +38,8 @@ CALLER_IMPORT = "from gateway import slack_ux_moments"
 NOTIFIER = "gateway/kanban_watchers_notifier.py"
 NOTIFIER_IMPORT = "from gateway.slack_ux_moments import wake_text as _kage_moments_wake_text"
 FLAG_ENV = "KAGE_SLACK_UX"
+#: Unset is on, so the flag-off path needs a value.
+FLAG_OFF = "false"
 
 CHANNEL = "C0KAGE"
 THREAD = "1700000000.000100"
@@ -113,9 +115,12 @@ def _load_runtime(root: Path):
 
 
 async def _drive(module) -> None:
-    os.environ.pop(FLAG_ENV, None)
+    os.environ[FLAG_ENV] = FLAG_OFF
     if module.enabled():
-        raise _fail(f"enabled() is true with {FLAG_ENV} unset")
+        raise _fail(f"enabled() is true with {FLAG_ENV}={FLAG_OFF}")
+    os.environ.pop(FLAG_ENV, None)
+    if not module.enabled():
+        raise _fail(f"enabled() is false with {FLAG_ENV} unset, which is on")
     os.environ[FLAG_ENV] = "1"
     sub = {"platform": "slack", "chat_id": CHANNEL, "thread_id": THREAD, "task_id": "t_verify"}
 

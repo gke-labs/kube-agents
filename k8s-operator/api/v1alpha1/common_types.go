@@ -144,9 +144,14 @@ var SensitiveEnvVars = map[string]struct{}{
 	// anything but an override of the projection.
 	"A2A_BUS_TOKEN_FILE": {},
 	"A2A_BUS_USER":       {},
-	"NATS_URL":           {},
-	"NATS_USER":          {},
-	"NATS_PASSWORD":      {},
+	// A2A_NOTIFY_PLATFORM turns the agent's proactive posts from Hermes to
+	// the gateway's chat.notify route. The operator renders it exactly when
+	// the next stack holds the chat backend; an override either way leaves
+	// posts going to a platform that is not there.
+	"A2A_NOTIFY_PLATFORM": {},
+	"NATS_URL":            {},
+	"NATS_USER":           {},
+	"NATS_PASSWORD":       {},
 }
 
 // ReservedVolumeNames defines pod volume names the operator renders itself and
@@ -603,7 +608,16 @@ type TuningSpec struct {
 	// every worker it spawns — platform and cluster alike — draws on the same model
 	// quota. Setting it to 1 serialises all delegated work.
 	//
-	// Unset means 2, the operator's default — not Hermes' own behaviour, which does not
+	// One slot is guaranteed to each class of card. At 2 or more, background work (event
+	// triage and cron report relays) may hold every slot but one, so a question asked in
+	// chat starts at once even while triage runs, and user cards may hold every slot but
+	// one, so a door's fan-out cannot silence alerts. The slots between go to whoever is
+	// first, user cards sorting first; at 2 each class gets one. At 1 nothing is held: a
+	// user card still goes ahead of waiting triage but waits for the running card. When
+	// every slot is busy the gateway logs "kanban dispatcher saturated", and a user card
+	// left waiting is told in its thread that it is queued.
+	//
+	// Unset means 6, the operator's default — not Hermes' own behaviour, which does not
 	// cap concurrency at all. The default exists because a worker is a full agent process
 	// holding a few hundred MiB for the length of the task: unbounded dispatch lets a
 	// burst of queued cards spawn workers until the cgroup OOM killer takes them, and
@@ -623,12 +637,27 @@ type TuningSpec struct {
 	// counters that would settle it — so raising resources is not a guaranteed fix;
 	// measure it.
 	//
+	// The arithmetic behind 6: a worker measured about 430 MiB, so six are about 2.6 GiB
+	// over the gateway's 1.8 GiB idle set, about 4.4 GiB under its 8Gi memory limit; a
+	// coordinator waiting on its own children gives its slot back but stays resident, so
+	// processes can sit above six. The credential proxy at its default 2Gi memory limit
+	// admits 9 brokered commands at once, held to 8 by its slot cap, which the stall
+	// watch's and cluster-agent reconcile's four-wide listings share. Per-install model
+	// rate limits are not measured: a small quota may see 429s at 6, so lower this if
+	// worker logs show them.
+	//
 	// Set it higher once a deployment has measured its own worker footprint and model
-	// quota — a fleet with headroom is throttled by 2. Set it to 1 to serialise all
-	// delegated work. When quota rather than memory binds, note the related failure mode:
-	// workers that exhaust their retry budget exit without calling a terminal kanban
-	// tool, and the dispatcher reports that as a "protocol violation" rather than as the
-	// quota exhaustion it actually is.
+	// quota. The credential proxy sets the ceiling on brokered commands: its default 2Gi
+	// already admits more than its slot cap of 8, so up to about eight workers' worth of
+	// commands fit at the defaults, fewer while the listings above run. Past that the
+	// slot cap binds, and no CR field moves it, so raising the memory limit in
+	// spec.deployment.credentialProxy.resources does not help: a command beyond eight
+	// waits up to 60 s for a slot and is then refused busy. Keep that limit at 2Gi or
+	// more, since below it the memory budget (176 MiB per command after 320 MiB of fixed
+	// reserves) binds first. Set it to 1 to serialise all delegated work. When quota rather than
+	// memory binds, note the related failure mode: workers that exhaust their retry
+	// budget exit without calling a terminal kanban tool, and the dispatcher reports that
+	// as a "protocol violation" rather than as the quota exhaustion it actually is.
 	// +kubebuilder:validation:Minimum=1
 	// +optional
 	MaxInProgress *int `json:"maxInProgress,omitempty"`
@@ -1430,6 +1459,10 @@ var writeRoles = []string{RepositoryRoleGitOps, RepositoryRoleManaged}
 // repository on another host is refused rather than rewritten into a
 // same-named repository on this one. See
 // docs/designs/version-control-support.md §6.
+//
+// A gitlab forge's credentialsRef is required by the API server too, so it
+// holds with the webhook off -- the chart ships it off.
+// +kubebuilder:validation:XValidation:rule="!has(self.provider) || self.provider != 'gitlab' || has(self.credentialsRef)",message="a gitlab forge needs credentialsRef.name: the Secret holding its access token under the key token"
 type ForgeSpec struct {
 	// Name identifies the forge within this PlatformAgent. Repositories refer
 	// to it by this name. The deprecated GitHub alias is the forge "github".
@@ -1443,23 +1476,26 @@ type ForgeSpec struct {
 	// the agent reads which forge was declared rather than guessing from the
 	// URL's text.
 	//
-	// Only "github" is registered today; the enum grows with each agent-side
-	// provider. Defaults to "github".
-	// +kubebuilder:validation:Enum=github
+	// "github" and "gitlab" are registered; the enum grows with each
+	// agent-side provider. Defaults to "github".
+	// +kubebuilder:validation:Enum=github;gitlab
 	// +kubebuilder:default=github
 	// +optional
 	Provider string `json:"provider,omitempty"`
 
 	// Host is the forge hostname. Omit it for the provider's default
-	// ("github.com" for GitHub). A host the declared provider does not serve is
-	// rejected, and an alternative spelling of one it does serve resolves to the
-	// provider's canonical host.
+	// ("github.com" for GitHub, "gitlab.com" for GitLab). A host the declared
+	// provider does not serve is rejected, and an alternative spelling of one
+	// it does serve resolves to the provider's canonical host. For GitLab it may
+	// also be a self-managed instance's hostname, which every repository on the
+	// forge must then name or leave implied; a host another provider serves is
+	// rejected.
 	//
 	// The pattern is a DNS name, which every forge's host is; it is here rather
 	// than only in the webhook so the API server still refuses whitespace and
 	// control characters when the operator runs with ENABLE_WEBHOOKS=false.
 	// +kubebuilder:validation:MaxLength=253
-	// +kubebuilder:validation:Pattern=`^$|^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$`
+	// +kubebuilder:validation:Pattern=`^$|^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)*$`
 	// +optional
 	Host string `json:"host,omitempty"`
 
@@ -1473,7 +1509,9 @@ type ForgeSpec struct {
 	//
 	// On GitHub it is also the organisation the token minter scopes the
 	// agent's credentials to; a repository in another organisation is not
-	// given a token.
+	// given a token. On GitLab it, with the group of every repository declared
+	// on the forge, is the set of groups the credential broker serves, so a
+	// token that reaches further is still refused there.
 	//
 	// The schema pattern is every forge's grammar at once, not GitHub's: the
 	// tight rule depends on Provider and a CRD pattern cannot dispatch on a
@@ -1488,11 +1526,31 @@ type ForgeSpec struct {
 
 	// CredentialsRef names a Secret in the PlatformAgent's namespace holding
 	// the credentials for this forge. It is for providers whose credentials an
-	// administrator supplies. GitHub's come from the install's GitHub App
-	// through the token minter, so it is ignored for provider "github", and
-	// admission warns when it is set there.
+	// administrator supplies, and it is required for them. GitHub's come from
+	// the install's GitHub App through the token minter, so it is ignored for
+	// provider "github", and admission warns when it is set there.
+	//
+	// For GitLab the Secret holds an access token under the key `token`: a
+	// group or project access token, or a dedicated account's personal access
+	// token where the tier offers neither. It is mounted into the credential
+	// broker's pod only, never the agent's or the sandbox's, and read on every
+	// call, so rotating the token is updating the Secret.
 	// +optional
-	CredentialsRef *corev1.LocalObjectReference `json:"credentialsRef,omitempty"`
+	CredentialsRef *ForgeCredentialsRef `json:"credentialsRef,omitempty"`
+}
+
+// ForgeCredentialsRef names the Secret holding a forge's credential. The JSON
+// shape is corev1.LocalObjectReference's, so existing resources apply
+// unchanged; it is a type of its own so the name can carry the Secret-name
+// rule in the schema. The operator mounts the Secret into the broker's pod,
+// and a name the API server refuses there would otherwise pass admission and
+// then fail the broker Deployment's apply on every reconcile.
+type ForgeCredentialsRef struct {
+	// Name is the Secret's name: a lowercase DNS subdomain.
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=253
+	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$`
+	Name string `json:"name"`
 }
 
 // RepositorySpec declares one repository on a declared forge, and what the

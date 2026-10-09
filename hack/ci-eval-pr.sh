@@ -152,12 +152,12 @@ readonly EVAL_INFLIGHT_POLL_STEP_SECONDS=5
 # container, the interpreter it runs the read with and the home holding the
 # Platform Agent's cron store, how long a unit waits for a run the install started on
 # one of its streams, and how often it looks. A unit may owe two runs: the one
-# before the audit a pending stage marks next, then that audit's own. Each is
-# counted for at most an hour (the stage's RUN_LIMIT_SECONDS and the read's
-# stale cutoff), and single runs here have reached 2739 s (the delegation
-# ceilings below), so the bound is two of those hours. It is reached only
-# while runs are really going; a stage oobe-first-run-audits left armed can
-# owe more, and the bound caps that too.
+# before the audit a pending stage marks next, then that audit's own. Single
+# runs here have reached 2739 s (the delegation ceilings below), so the bound
+# is two hours. Each run is counted for up to the stage's RUN_LIMIT_SECONDS
+# (the read's stale cutoff matches it), so two slow runs, or a stage
+# oobe-first-run-audits left armed, can owe more; the bound caps that. It is
+# reached only while runs are really going.
 readonly EVAL_GATEWAY_CONTAINER="platform-agent"
 readonly EVAL_GATEWAY_PYTHON="/opt/hermes/.venv/bin/python3"
 readonly EVAL_GATEWAY_HOME="/opt/data"
@@ -1813,9 +1813,10 @@ esac
 # ─── The inject lane's exclusions (#2039) ────────────────────────────────────
 # Under AGENT_TRANSPORT=inject -- the harness's own switch, which the
 # EVAL_MODE_NEXT=1 block above exports before this point -- the matrix goes
-# through the gateway's inject door, which addresses `platform` directly: a
-# case whose premise needs the chat front door cannot hold there whatever
-# the agent does. hack/eval/inject-lane-exclusions.txt names those cases,
+# through the gateway's inject door, which carries neither a specialist's
+# answer folded back into the chat thread nor a card's wake: a case whose
+# premise needs one cannot hold there whatever the agent does.
+# hack/eval/inject-lane-exclusions.txt names those cases,
 # each with its reason as the comment block above it (the file's header and
 # scripts/test_eval_rosters.py hold every entry to one), and this drops them
 # from TASKS before TASK_NAMES and the fan-out are built from it, so the
@@ -1852,7 +1853,7 @@ if [ "${AGENT_TRANSPORT:-}" = "${EVAL_INJECT_TRANSPORT}" ] && [ -n "${INJECT_LAN
   for ENTRY in "${TASKS[@]}"; do
     NAME="$(basename "$(dirname "${ENTRY}")")"
     if grep -qxF -- "${NAME}" <<< "${INJECT_LANE_EXCLUDED}"; then
-      echo "AGENT_TRANSPORT=${AGENT_TRANSPORT}: ${NAME} leaves the matrix -- its premise needs the chat front door (${EVAL_INJECT_LANE_EXCLUSIONS_FILE})"
+      echo "AGENT_TRANSPORT=${AGENT_TRANSPORT}: ${NAME} leaves the matrix -- excluded on this lane; the reason is in ${EVAL_INJECT_LANE_EXCLUSIONS_FILE}"
       INJECT_LANE_DROPPED="${INJECT_LANE_DROPPED}${NAME}
 "
     else
@@ -1869,9 +1870,11 @@ fi
 
 # ─── The inject lane's safeguards (#2079) ────────────────────────────────────
 # The cluster safeguards a case carries say nothing about GitHub, and through
-# the inject door the platform persona opens a pull request where the chat
-# path inlined a manifest (#2037): the first matrix run through the door left
-# pull requests on the pool repository that no case had asked for.
+# the inject door the platform persona (directly under the bridge's cli
+# executor, through a card under its default api executor) opens a pull
+# request where the chat path inlined a manifest (#2037): the first matrix run
+# through the door, under cli, left pull requests on the pool repository that
+# no case had asked for.
 # hack/eval/inject-lane-safeguards.yaml holds the entries every case on the
 # lane carries beside its own -- one, a none-wrapped `github_writes` -- and
 # this step appends them to a COPY of each task file under a scratch
@@ -3141,6 +3144,10 @@ run_one_unit() { # <task-path> <task-name> <rep> <reuse:true|empty> <has-stack:t
 # and the settle plus the serial run of the requesting units (on the
 # presubmit tier, one case's repetitions, which the task lock already ran one
 # at a time, so three settles); the order inside each phase is unchanged.
+# The ordering assumes a unit's writes land before its terminal. Under the
+# bridge's api executor a delegated card's worker can open the pull request
+# after the terminal, inside the next unit's window (#2619, #2611); nothing
+# here waits for that worker.
 unit_phase() { # <task-name> -> 1 for a case that requests a pull request, 0 otherwise
   case ",${INJECT_LANE_REQUESTING:-}," in
     *",$1,"*) echo 1 ;;

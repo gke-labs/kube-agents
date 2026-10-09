@@ -331,7 +331,15 @@ the agent image patches it
 (`deploy/docker/patches/apply_ssh_shared_master.py`): `cleanup()` keeps its
 sync-back and leaves the shared master alone, so an exiting process no longer
 cuts a sibling's command; `ControlPersist=300` reaps the master once nothing has
-used it for five minutes. The eviction path after an `EnvironmentConnectionError`
+used it for five minutes. The same patch puts `ServerAliveInterval 15` and
+`ServerAliveCountMax 3` on the client's command line, where no config file, and
+no upstream option placed after them, can shadow them: a master whose peer died without a FIN or RST
+(an evicted sandbox pod) used to be cleared by the next process exit and is now
+dropped after three missed replies, about 60 s, and the next command opens a
+fresh master. The pair also caps how long a multiplexed command rides out a
+silent sandbox, where the sandbox's `sshd` allows the client five minutes;
+`sandbox_exec.py` and `sandbox_mirror.py` made the same trade for their own
+connections. The eviction path after an `EnvironmentConnectionError`
 is left as it is: nothing reaches it with a registered ssh environment, because a
 connection failure during construction fires before registration and the sync,
 foreground and background-spawn paths catch their own errors. A prompt-time
@@ -1142,7 +1150,11 @@ Hermes keys into each profile's `.env` and asks Hermes to confirm they resolve: 
 start-up (entrypoint step 4b; [Container entrypoint](/kube-agents/deploy/docker-images/#container-entrypoint)
 says which failures stop the container) and when `cluster_agent_profile.py` scaffolds a profile. The image build's
 `--build-check` fails when a Hermes bump breaks the copy, and warns once Hermes
-resolves the managed backend without it.
+resolves the managed backend without it. The same check reads the terminal tool's
+default call timeout out of that Hermes and fails the build when the Cluster Agent
+preflight's mirror of it (`TERMINAL_TOOL_TIMEOUT_SECONDS` in `cluster_preflight.sh`,
+which budgets the preflight's brokered calls under it) disagrees; the identifier
+sources table in [`docs/README.md`](../README.md) names both.
 
 #### Two sharp edges left
 

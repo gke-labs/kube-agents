@@ -22,6 +22,11 @@ profile only on a `next` install (below).
 | `SKILL.md`                                            | shipped at `/opt/a2a-template/skills/`, overlaid into the profile by `docker-entrypoint.sh` step 2.6a-bis only when `runtime_mode.is_next()`. The overlay rides step 2.6a's staged swap, which is what makes it stick — and what cleans it off on the first boot after a flip back to `today`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
 | `NATS_URL` / `A2A_BUS_USER` / the projected bus token | rendered by the operator into the agent container under `next`. The container holds no password: `A2A_BUS_USER` names the principal (`agent`) and the credential is a ServiceAccount token projected at `/var/run/secrets/a2a-bus/token`, audience `a2a-bus`, which the auth callout resolves to that principal's grants. A bridge sidecar declared in `spec.deployment.sidecars` cannot use it: its route would be a `volumeMounts` entry naming the operator's own `a2a-bus-token` volume, and that name is reserved — refused at admission and stripped from the render. Mounting it would not give the sidecar an identity of its own anyway, since the callout resolves the pod's ServiceAccount and would return the same entry. So the bridge stays on `NATS_USER`/`NATS_PASSWORD` as `bridge`, read through `env.valueFrom.secretKeyRef` against the `<agent>-a2a-nats-creds` Secret |
 
+The binary has a second caller: the agent-side notification callers
+(`agents/platform/scripts/chat_notify.py`) run `a2a notify` to post proactive messages
+through the gateway, and only when the operator renders `A2A_NOTIFY_PLATFORM`, which it
+does only under `next`.
+
 ## The skill copy does not survive a restart, and that is by design
 
 The entrypoint's step 2.6a (`sync_profile_skills` in

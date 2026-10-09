@@ -3570,6 +3570,7 @@ class TestSlackAuditHeadline(unittest.TestCase):
             return conn.execute("SELECT chat_id, thread_id, report FROM incidents").fetchall()
 
     def test_flag_off_posts_the_composed_message_unchanged(self):
+        os.environ["KAGE_SLACK_UX"] = "false"
         response, calls = self._post()
         self.assertEqual(response.json()["status"], "delivered")
         self.assertEqual([c.args for c in calls], [("slack", self.COMPOSED, "", "")])
@@ -3758,6 +3759,7 @@ class TestSlackAuditHeadline(unittest.TestCase):
         return [block["type"] for block in blocks]
 
     def test_flag_off_with_a_relay_posts_no_blocks(self):
+        os.environ["KAGE_SLACK_UX"] = "false"
         os.environ["SLACK_RELAY_URL"] = "http://127.0.0.1:8765"
         _, calls = self._post(blocks_post=lambda *a, **k: self.BLOCKS_TS)
         self.assertEqual(self.posts, [])

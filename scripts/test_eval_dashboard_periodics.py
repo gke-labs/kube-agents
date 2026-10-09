@@ -762,19 +762,18 @@ class WorkflowWiring(unittest.TestCase):
     def test_the_watched_jobs_are_the_periodics_and_the_postsubmit(self):
         # The names are the Prow job names in oss-test-infra, which nothing here
         # can check; a rename there is a rename here.
-        # The hourly and the weekly stay watched until the oss-test-infra
-        # change retires them: the watch must not go dark between the merges.
         self.assertEqual(
             [p.job for p in periodics.WATCHED],
-            ["ci-kube-agents-pull-sweep", "ci-kube-agents-fleet-reconcile", "ci-kube-agents-fleet-reconcile-all", "ci-kube-agents-fleet-reconcile-daily", "post-kube-agents-fleet-reconcile"],
+            ["ci-kube-agents-pull-sweep", "ci-kube-agents-fleet-reconcile-daily", "post-kube-agents-fleet-reconcile"],
         )
         for periodic in periodics.WATCHED:
             self.assertTrue(periodic.stale_after is None or periodic.stale_after >= timedelta(hours=1))
         self.assertIsNone(POST.stale_after, "a job that runs on merges has no cadence to be late against")
-        for job in ("ci-kube-agents-fleet-reconcile", "ci-kube-agents-fleet-reconcile-all"):
-            # Their last build stays in the bucket after Prow drops them; a
-            # merely old one must not read as "stopped running".
-            self.assertIsNone(periodics.WATCHED_BY_JOB[job].stale_after, job)
+        # The hourly and weekly jobs are gone from Prow (oss-test-infra #2715):
+        # no entry, so their last builds print no run line and hold no note.
+        self.assertNotIn("ci-kube-agents-fleet-reconcile", periodics.WATCHED_BY_JOB)
+        self.assertNotIn("ci-kube-agents-fleet-reconcile-all", periodics.WATCHED_BY_JOB)
+        self.assertEqual(set(periodics.RECONCILE_RUN_WORDS), {DAILY.job, POST.job})
         self.assertEqual(DAILY.stale_after, timedelta(hours=36))
 
     def test_main_names_what_it_wrote(self):

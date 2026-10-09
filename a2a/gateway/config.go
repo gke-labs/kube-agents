@@ -39,6 +39,10 @@ const defaultDelegationDepthMax = 3
 // relay-audience ServiceAccount token when the gchat backend is armed.
 const defaultGchatTokenPath = "/var/run/secrets/a2a-chat-relay/token"
 
+// envGchatHomeChannel carries the Chat home space the chat.notify route posts
+// to (notify.go); the operator renders it from googleChat.homeChannel.
+const envGchatHomeChannel = "A2A_GCHAT_HOME_CHANNEL"
+
 // defaultInjectPrincipalMapPath is where the operator mounts the inject
 // door's own principal map when the door is armed. A file of "id principal"
 // lines rather than a directory of one file per id, because every key carries
@@ -68,6 +72,9 @@ const (
 	metricsPortMin = 1
 	metricsPortMax = 65535
 )
+
+// busyNoticeAtEnv names the busy notice's threshold (Config.BusyNoticeAt).
+const busyNoticeAtEnv = "A2A_BUSY_NOTICE_AT"
 
 // The display-mode values, matching the GoogleChatSpec.Mode enum.
 const (
@@ -129,6 +136,10 @@ type Config struct {
 	// GchatAllowAllUsers disables the allowlist, stated explicitly —
 	// mirroring the legacy GOOGLE_CHAT_ALLOW_ALL_USERS posture.
 	GchatAllowAllUsers bool
+	// GchatHomeChannel is the install's Chat home space ("spaces/AAA"), the
+	// one place a chat.notify post may land (notify.go). Empty leaves the
+	// notify route unarmed.
+	GchatHomeChannel string
 	// SlackAllowedUsers is the Slack backend's ingress allowlist, carried
 	// from spec.integration.slack.allowedUsers the way GchatAllowedUsers is
 	// from Chat's: the gate the legacy path enforces as SLACK_ALLOWED_USERS.
@@ -445,6 +456,22 @@ type Config struct {
 	// it: 0 would be "delegation off", which is a different switch
 	// (A2A_DELEGATE_TOOL on the worker side), not a typo to paper over.
 	DelegationDepthMax int
+
+	// BusyNoticeAt is how many tasks have to be ahead of a new fixed-route
+	// turn before the gateway marks the turn's status line queued
+	// (A2A_BUSY_NOTICE_AT). The count is the fixed addressee's outstanding
+	// work, read from session-state (fixedRouteBacklog in busy.go); at or
+	// above this number the turn's task is still submitted, and its status
+	// line is edited to a queued state that says how many are ahead
+	// (showBusy). Nothing is refused or dropped.
+	//
+	// Zero means 10, the rendered bridge's default BRIDGE_CONCURRENCY. The
+	// operator renders the bridge's worker count here, so a turn is told it
+	// is waiting exactly when every worker is taken; raising it past the
+	// worker count makes the notice rarer and later, lowering it under the
+	// count tells people about a wait that is not there. FromEnv refuses a
+	// value under 1.
+	BusyNoticeAt int
 }
 
 // Backend names the REAL chat backend this config arms: "gchat", "slack",
@@ -515,6 +542,7 @@ func FromEnv() (*Config, error) {
 		}
 	}
 	cfg.GchatAllowAllUsers = os.Getenv("A2A_GCHAT_ALLOW_ALL_USERS") == "true"
+	cfg.GchatHomeChannel = strings.TrimSpace(os.Getenv(envGchatHomeChannel))
 	cfg.TargetAllowedUsers = map[string]map[string][]string{}
 	platformLists := map[string][]string{}
 	// Set is a list, even set empty: the operator renders the var empty for
@@ -659,6 +687,12 @@ func FromEnv() (*Config, error) {
 		return nil, fmt.Errorf("A2A_DELEGATION_DEPTH_MAX %q: need an integer >= 1", depthMax)
 	}
 	cfg.DelegationDepthMax = dm
+	busyAt := envOr(busyNoticeAtEnv, strconv.Itoa(defaultBusyNoticeAt))
+	ba, err := strconv.Atoi(busyAt)
+	if err != nil || ba < 1 {
+		return nil, fmt.Errorf("%s %q: need an integer >= 1", busyNoticeAtEnv, busyAt)
+	}
+	cfg.BusyNoticeAt = ba
 	ttl := envOr("A2A_IDLE_TTL", "30m")
 	d, err := time.ParseDuration(ttl)
 	if err != nil {

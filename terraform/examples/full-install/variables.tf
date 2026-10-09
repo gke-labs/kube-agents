@@ -580,6 +580,42 @@ variable "github_repo" {
   default     = ""
 }
 
+variable "gitops_forge" {
+  description = "Which forge holds the GitOps repository: github (the default; github_repo and the GitHub App minter) or gitlab (gitlab_repo, with the access token in the Kubernetes Secret gitlab_token_secret_name names). A gitlab install declares one gitlab forge and its gitops repository through spec.integration.forges/repositories; github_repo and enable_github_minter must be left unset."
+  type        = string
+  default     = "github"
+  validation {
+    condition     = contains(["github", "gitlab"], var.gitops_forge)
+    error_message = "gitops_forge must be github or gitlab."
+  }
+}
+
+variable "gitops_host" {
+  description = "Hostname of the forge holding the GitOps repository, for a self-managed GitLab instance (e.g. gitlab.example.com). Empty is the forge's own host (gitlab.com). A bare hostname: no scheme, path or port. Read only when gitops_forge is gitlab."
+  type        = string
+  default     = ""
+  validation {
+    condition     = var.gitops_host == "" || can(regex("^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$", var.gitops_host))
+    error_message = "gitops_host must be a bare lowercase hostname, with no scheme, path or port."
+  }
+}
+
+variable "gitlab_repo" {
+  description = "The GitOps repository on GitLab, as the project's full path (group/subgroup/project) or its URL. Read only when gitops_forge is gitlab."
+  type        = string
+  default     = ""
+}
+
+variable "gitlab_token_secret_name" {
+  description = "Name of the Kubernetes Secret, in the agent's namespace, holding the GitLab access token under the key `token`. The installer creates it from a prompt or a token file after the apply; Terraform only names it, so the token never reaches the plan or the state. Read only when gitops_forge is gitlab."
+  type        = string
+  default     = "gitlab-forge-token"
+  validation {
+    condition     = can(regex("^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$", var.gitlab_token_secret_name)) && length(var.gitlab_token_secret_name) <= 253
+    error_message = "gitlab_token_secret_name must be a valid Kubernetes Secret name (lowercase DNS subdomain)."
+  }
+}
+
 variable "enable_github_minter" {
   description = "Provision the GitHub token minter: its GCP resources (service account, KMS key ring and signing key) and, through the chart, its Kubernetes workload. Requires github_repo in owner/repo (or github.com URL) form. The App private key must be imported into the KMS key before the minter goes Ready."
   type        = bool
@@ -722,6 +758,12 @@ variable "drift_pubsub_sink_drain_duration" {
   description = "How long a destroy waits, after deleting the drift sink, before removing the topic and the sink's publish grant. Only used when enable_drift_pubsub is true. Cloud Logging keeps exporting for some minutes after a sink is deleted, and an export that lands in that gap mails every project owner a sink configuration error. The module's 120s default is a chosen margin rather than a measured convergence time, so raise it if the mail still arrives and lower it only to trade that risk for a faster teardown. Through the install.sh / upgrade.sh front doors, set it as a TF_VAR_drift_pubsub_sink_drain_duration line in install.env; the front doors regenerate terraform.tfvars wholesale on every run and never write this key, so a hand-added one does not survive. Setting it is not enough on its own: time_sleep reads destroy_duration from state when it is destroyed, because a provider's delete is handed prior state and no configuration, and uninstall.sh runs no apply before the destroy -- so a value raised and taken straight to uninstall.sh waits the 120s already in state and the mail arrives anyway. Run upgrade.sh (or lifecycle.sh apply) in between. Raising it after a teardown has already mailed is therefore too late for that teardown; the time to set it is at install."
   type        = string
   default     = "120s"
+}
+
+variable "drift_pubsub_logging_identity_propagation_duration" {
+  description = "How long the apply waits, after asking Service Usage to mint the project's Logging service agent, before granting it publisher on the drift topic. Only used when enable_drift_pubsub is true. A project that did not already have the agent cannot bind it the instant the call returns, and the apply fails with \"Service account service-<project-number>@gcp-sa-logging.iam.gserviceaccount.com does not exist\" -- about one project in five, leaving the topic created and neither the grant nor the sink. The module's 60s default is a chosen margin rather than a measured propagation time, so raise it if an apply still fails that way; the raised value is paid on the re-apply, because the module keys the wait on this value and not only on the identity. Paid on the first apply that carries the wait -- the first apply with enable_drift_pubsub on, and on an install that already had the ingress, the next apply of any kind after this version lands -- and after that only on an apply that re-mints the Logging identity or changes this value, the two things the wait is keyed on. A project whose Logging agent already exists gains nothing from it, and lowering the value before the first apply that carries the wait is how it keeps the time. Lowering it afterwards refunds nothing: the wait is keyed on this value, so the change re-creates it and pays the new lower figure once, and only later waits are shorter. Through the install.sh / upgrade.sh front doors, set it as a TF_VAR_drift_pubsub_logging_identity_propagation_duration line in install.env; the front doors regenerate terraform.tfvars wholesale on every run and never write this key, so a hand-added one does not survive."
+  type        = string
+  default     = "60s"
 }
 
 variable "enable_drift_detector" {

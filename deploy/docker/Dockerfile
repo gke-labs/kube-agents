@@ -714,7 +714,7 @@ RUN cp /tmp/channel-directory/channel_directory_threads.py /opt/hermes/gateway/c
 # See the module docstring in
 # deploy/docker/patches/apply_google_chat_attachment_notice.py.
 #
-# Slack agent view, behind KAGE_SLACK_UX (off by default; off leaves both files
+# Slack agent view, behind KAGE_SLACK_UX (on unless set off; off leaves both files
 # behaving as upstream). With it on, --agent-view describes the app by its
 # --name, and the adapter answers a new thread or DM open with three suggested
 # prompts when platforms.slack.extra.suggested_prompts is unset. The default
@@ -1126,9 +1126,19 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/kanban-result/apply_kanban_report_format.
 #
 # Must stay ahead of the kanban_wake_nudge block below, which anchors on
 # `create_task`, `complete_task` and `unblock_task` in hermes_cli/kanban_db.py.
-# The one anchor here in that file (`block_task`) and the five in
+# The one anchor here in that file (`block_task`) and the ten in
 # kanban_db_dispatch.py touch none of those three, and test_kanban_scheduling.py
 # asserts that rather than leaving it to a reader.
+#
+# Edits 7-10 hold one worker slot for each class of card, user and background:
+# at a cap of 2 or more, background cards (event triage, cron relays) and user
+# cards may each hold every slot but one; a full cap records what holds the slots on the
+# DispatchResult; and a user card left waiting gets one `queued` event per
+# wait. Their runtime is hermes_cli/kanban_priority.py, installed here with
+# `install -m 0644` inside the RUN rather than by a COPY of its own, to add no
+# layer. The create-time priority stamp, the gateway's saturation warning and
+# the notifier's delivery of `queued` are wired by apply_kanban_priority.py in
+# the latency block further down. See deploy/docker/patches/kanban_priority.py.
 # See the module docstring in deploy/docker/patches/kanban_scheduling.py and the
 # applier docstring in deploy/docker/patches/apply_kanban_scheduling.py.
 COPY --chmod=0644 deploy/docker/patches/kanban_scheduling.py /opt/hermes/hermes_cli/kanban_scheduling.py
@@ -1140,9 +1150,11 @@ COPY deploy/docker/patches/apply_kanban_scheduling.py \
      deploy/docker/patches/verify_kanban_scheduling.py \
      deploy/docker/patches/kanban_scheduling.py \
      deploy/docker/patches/kanban_children_settled.py \
+     deploy/docker/patches/kanban_priority.py \
      deploy/docker/patches/patchlib.py \
      /tmp/kanban-scheduling/
-RUN /opt/hermes/.venv/bin/python3 /tmp/kanban-scheduling/apply_kanban_scheduling.py /opt/hermes && \
+RUN install -m 0644 /tmp/kanban-scheduling/kanban_priority.py /opt/hermes/hermes_cli/kanban_priority.py && \
+    /opt/hermes/.venv/bin/python3 /tmp/kanban-scheduling/apply_kanban_scheduling.py /opt/hermes && \
     grep -q "_kanban_repair_inverted_deps(conn, task_id, reason)" /opt/hermes/hermes_cli/kanban_db.py && \
     grep -q "conn, _kanban_claimer, _kb._pid_alive, _kb._resolve_crash_grace_seconds" /opt/hermes/hermes_cli/kanban_db_dispatch.py && \
     grep -q "_kanban_claim_is_self(lock, _kanban_claimer)" /opt/hermes/hermes_cli/kanban_db_dispatch.py && \
@@ -1156,6 +1168,13 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/kanban-scheduling/apply_kanban_scheduling
     test "$(grep -c '(retry_status, failures, error, task_id),' /opt/hermes/hermes_cli/kanban_db_dispatch.py)" = "1" && \
     test "$(grep -c 'from hermes_cli.kanban_scheduling import' /opt/hermes/hermes_cli/kanban_db.py)" = "1" && \
     test "$(grep -c 'from hermes_cli.kanban_scheduling import' /opt/hermes/hermes_cli/kanban_db_dispatch.py)" = "1" && \
+    grep -q "if _kanban_slot.holds_back(row, result):" /opt/hermes/hermes_cli/kanban_db_dispatch.py && \
+    grep -q "_kanban_slot = _kanban_reserved_slot(conn, max_in_progress, board)" /opt/hermes/hermes_cli/kanban_db_dispatch.py && \
+    grep -q "_kanban_slot.finish(result, dry_run=dry_run)" /opt/hermes/hermes_cli/kanban_db_dispatch.py && \
+    grep -q "skipped_reserved: list\[str\] = field(default_factory=list)" /opt/hermes/hermes_cli/kanban_db_dispatch.py && \
+    test "$(grep -c '_kanban_record_saturation(' /opt/hermes/hermes_cli/kanban_db_dispatch.py)" = "1" && \
+    test "$(grep -c '_kanban_note_waiting(' /opt/hermes/hermes_cli/kanban_db_dispatch.py)" = "1" && \
+    test "$(grep -c 'from hermes_cli.kanban_priority import' /opt/hermes/hermes_cli/kanban_db_dispatch.py)" = "1" && \
     cd /opt/hermes && /opt/hermes/.venv/bin/python3 /tmp/kanban-scheduling/verify_kanban_scheduling.py && \
     rm -rf /tmp/kanban-scheduling
 
@@ -1273,8 +1292,10 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/kanban-scheduling/apply_kanban_scheduling
 # shares one ssh ControlMaster, and SSHEnvironment.cleanup() closed it when a
 # worker process that had run a command exited normally, cutting any sibling's
 # running command (exit 255, no output). cleanup() now leaves the shared master
-# to ControlPersist, and a foreground ssh exit 255 without the cwd marker carries
-# a hint when upstream attached none. See the module docstring in
+# to ControlPersist, the client argv carries ServerAliveInterval 15 /
+# ServerAliveCountMax 3 so a master whose peer died silently is dropped (the
+# exit used to clear it), and a foreground ssh exit 255 without the cwd marker
+# carries a hint when upstream attached none. See the module docstring in
 # deploy/docker/patches/apply_ssh_shared_master.py.
 COPY --chmod=0644 deploy/docker/patches/kanban_guardrail_exit.py \
      deploy/docker/patches/rate_limit_retry_delay.py \
@@ -1314,6 +1335,7 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/apply_state_db_sync
     grep -q 'kube-agents patch: quiet_rate_limit_exit' /opt/hermes/cli.py && \
     grep -q 'kube-agents patch: api_failure_reason_header' /opt/hermes/gateway/platforms/api_server_openai_routes.py && \
     grep -q 'def close_master(self):' /opt/hermes/tools/environments/ssh.py && \
+    grep -q '"ServerAliveInterval=15", "-o", "ServerAliveCountMax=3"' /opt/hermes/tools/environments/ssh.py && \
     cd /opt/hermes && /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/verify_state_db_synchronous_full.py && \
     /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/verify_kanban_guardrail_exit.py && \
     /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/verify_rate_limit_retry_delay.py && \
@@ -1444,6 +1466,21 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/apply_state_db_sync
 # itself was installed by its own stage.
 # See the module docstring in deploy/docker/patches/kanban_children_settled.py.
 #
+# kanban_priority: user cards ahead of background
+# triage. The dispatcher half (one slot held for user cards, the saturation
+# record, the `queued` events) is in the kanban-scheduling stage above, which
+# also installs hermes_cli/kanban_priority.py. This applier wires the rest:
+# kanban_create stamps a user card at priority >= 100 and clamps a background
+# one (k8s-evt-/cron- sessions) below it, and says when the new card is queued;
+# the dispatcher watcher logs "kanban dispatcher saturated: ..." instead of
+# "stuck" when every slot is busy; the notifier claims `queued` (TERMINAL_KINDS,
+# never _WAKE_KINDS) and delivers it as the first line of the card's rolling
+# progress message. Runs after wake_nudge, whose two dispatcher anchors bracket
+# the stuck counter this edits, and after the four kanban_tools.py appliers
+# above, whose lines it does not share. The _WAKE_KINDS grep repeats the one in
+# the kanban-progress stage: a queued notice must never cost an LLM turn.
+# See the module docstring in deploy/docker/patches/kanban_priority.py.
+#
 # credential-redaction: a kanban worker that pasted a GCP access token into a
 # curl left it in plaintext on the PVC (#603). Upstream already redacts
 # agent.log and the terminal-output spill; the two sinks it did not cover are
@@ -1488,6 +1525,8 @@ COPY deploy/docker/patches/kanban_wake_nudge.py \
      deploy/docker/patches/kanban_children_settled.py \
      deploy/docker/patches/apply_kanban_children_settled.py \
      deploy/docker/patches/verify_kanban_children_settled.py \
+     deploy/docker/patches/apply_kanban_priority.py \
+     deploy/docker/patches/verify_kanban_priority.py \
      deploy/docker/patches/kanban_result_required.py \
      deploy/docker/patches/credential_redaction.py \
      deploy/docker/patches/apply_credential_redaction.py \
@@ -1540,6 +1579,15 @@ RUN install -m 0644 /tmp/latency-patches/kanban_wake_nudge.py /opt/hermes/hermes
     grep -qF '_kanban_record_worker_child(conn, new_tid)' /opt/hermes/tools/kanban_tools.py && \
     grep -qF 'tid, _kanban_children_connect, result' /opt/hermes/tools/kanban_tools.py && \
     grep -q "from tools.kanban_children_settled import" /opt/hermes/tools/kanban_tools.py && \
+    /opt/hermes/.venv/bin/python3 /tmp/latency-patches/apply_kanban_priority.py /opt/hermes && \
+    grep -qF 'priority=_kanban_stamp_priority(_opt_int(args.get("priority"), 0), self_task, self_tid),' /opt/hermes/tools/kanban_tools.py && \
+    grep -qF '**_kanban_queue_fields(conn, new_tid, args.get("board")),' /opt/hermes/tools/kanban_tools.py && \
+    test "$(grep -c 'from hermes_cli.kanban_priority import' /opt/hermes/tools/kanban_tools.py)" = "1" && \
+    test "$(grep -c '_kanban_saturation_tick(' /opt/hermes/gateway/kanban_watchers.py)" = "1" && \
+    grep -q 'kanban dispatcher stuck: ready queue non-empty' /opt/hermes/gateway/kanban_watchers.py && \
+    grep -qF '+ ("heartbeat",) + ("queued",)' /opt/hermes/gateway/kanban_watchers_notifier.py && \
+    grep -qF '_EVENT_FORMATTERS["queued"] = _kanban_format_queued' /opt/hermes/gateway/kanban_watchers_notifier.py && \
+    grep -q '^_WAKE_KINDS = ("completed", "gave_up", "crashed", "timed_out", "blocked", "review_requested", "changes_requested", "block_loop_detected")' /opt/hermes/gateway/kanban_watchers_notifier.py && \
     install -m 0644 /tmp/latency-patches/credential_redaction.py /opt/hermes/agent/credential_redaction.py && \
     /opt/hermes/.venv/bin/python3 /tmp/latency-patches/apply_credential_redaction.py /opt/hermes && \
     test "$(grep -c '_kube_agents_register_patterns()' /opt/hermes/agent/redact.py)" = "1" && \
@@ -1559,6 +1607,7 @@ RUN install -m 0644 /tmp/latency-patches/kanban_wake_nudge.py /opt/hermes/hermes
     /opt/hermes/.venv/bin/python3 /tmp/latency-patches/verify_kanban_notify_delivery.py && \
     /opt/hermes/.venv/bin/python3 /tmp/latency-patches/verify_kanban_event_routing.py && \
     /opt/hermes/.venv/bin/python3 /tmp/latency-patches/verify_kanban_children_settled.py && \
+    /opt/hermes/.venv/bin/python3 /tmp/latency-patches/verify_kanban_priority.py && \
     /opt/hermes/.venv/bin/python3 /tmp/latency-patches/verify_credential_redaction.py && \
     /opt/hermes/.venv/bin/python3 /tmp/latency-patches/verify_skill_manage_image_owned.py && \
     rm -rf /tmp/latency-patches
@@ -2205,6 +2254,13 @@ RUN set -eu; \
 # ignored context_file_max_chars, would otherwise drop the middle of the prompt
 # with nothing but a log line. Each check runs in a scratch HERMES_HOME holding a
 # copy of the template's config.yaml, so Hermes writes nothing into the template.
+#
+# The same --build-check also reads the terminal tool's default call timeout out
+# of this Hermes (TERMINAL_TIMEOUT in tools/terminal_tool.py) and fails the build
+# when /opt/defaults/scripts/cluster_preflight.sh's mirror of it disagrees: the
+# preflight budgets its brokered calls under that default, and a Hermes bump that
+# moves it has to move the mirror with it rather than leave the preflight to be
+# killed by the tool before it prints its JSON.
 RUN set -eu; \
     if [ -e /opt/credential-proxy ]; then \
       echo "credential-proxy shims are back in the agent image: /opt/credential-proxy exists" >&2; \

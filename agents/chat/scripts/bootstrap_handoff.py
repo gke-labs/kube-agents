@@ -153,6 +153,30 @@ def _read_marker(path: Path) -> dict[str, str]:
     return fields
 
 
+def read_scan_marker(marker: Path, now: float | None = None) -> tuple[str, float] | None:
+    """The sweep card's id and when it was filed, from the gate's marker; None without an id.
+
+    The one reader of this marker, for the hand-off and the oobe stage alike. A ``filed_at`` that
+    is missing, hand-written, truncated or not epoch seconds (milliseconds, nan, inf) would stop
+    every clock that counts from it, so the marker's own age stands in.
+    """
+    fields = _read_marker(marker)
+    sweep_id = fields.get("task_id", "")
+    if not sweep_id:
+        return None
+    now = time.time() if now is None else now
+    try:
+        filed_at = float(fields.get("filed_at", ""))
+    except ValueError:
+        filed_at = float("nan")
+    if not 0 < filed_at <= now:
+        try:
+            filed_at = marker.stat().st_mtime
+        except OSError:
+            return None
+    return sweep_id, filed_at
+
+
 def _metadata(conn: sqlite3.Connection, task_id: str) -> dict:
     row = conn.execute(
         "SELECT metadata FROM task_runs WHERE task_id = ? AND outcome = 'completed' "
@@ -739,11 +763,11 @@ def hand_off(data_dir: Path, scan_marker: Path, parse_task_id, roster=None, now:
     filed here, once per sweep.
     """
     now = time.time() if now is None else now
-    filed = _read_marker(scan_marker)
-    sweep_id = filed.get("task_id", "")
-    if not sweep_id:
+    filed = read_scan_marker(scan_marker, now)
+    if filed is None:
         _log(f"{scan_marker} names no task_id; nothing to hand off")
         return None
+    sweep_id, filed_at = filed
     marker = data_dir / HANDOFF_MARKER
     done = _read_marker(marker)
     if done.get("sweep") == sweep_id:
@@ -765,12 +789,6 @@ def hand_off(data_dir: Path, scan_marker: Path, parse_task_id, roster=None, now:
         # The cards just filed have not run; nothing is settled this tick.
         return None
     state["unfiled"] = unfiled
-    try:
-        filed_at = float(filed["filed_at"])
-    except (KeyError, ValueError):
-        # A marker written by hand may carry only the card id; its own
-        # timestamp is when the sweep was filed, near enough.
-        filed_at = scan_marker.stat().st_mtime
     ready = settled(state) and not unfiled
     timed_out = not ready and now - filed_at >= deadline(state)
     if not ready and not timed_out:
