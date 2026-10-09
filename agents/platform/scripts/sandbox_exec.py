@@ -85,6 +85,10 @@ SANDBOX_PRINCIPAL = "hermes"
 # command's output as a fact about the cluster, and a `.bashrc` that hijacked
 # one would be doing to uid 1000's own files what uid 1000 can already do. A
 # caller that reads a command's output and believes it must use the default.
+# One reader bends that rule knowingly: `cluster_agent_profile.py`'s
+# connectivity probe runs `kubectl version` as this login because the
+# kubeconfig it reads is the 0600 file the writer above just made, and what it
+# believes drives one log line and nothing else; its comment argues the case.
 #
 # `read_bytes` is the exception, and it is this module's own default rather than
 # an argument any caller passes. It does consume the output — but as the bytes

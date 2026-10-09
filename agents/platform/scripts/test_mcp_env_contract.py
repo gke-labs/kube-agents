@@ -213,6 +213,21 @@ class LocalServersDeclareTheEnvTheyReadTest(unittest.TestCase):
     # declaration. Kept explicit rather than folded into each block's `env:`.
     ALLOWLIST_PASSTHROUGH = frozenset({"HERMES_HOME", "HOME", "LC_CTYPE", "PATH"})
 
+    def test_platform_control_is_handed_the_own_cluster_identity(self):
+        """gke_endpoint reads the agent's own cluster from three variables
+        (OWN_CLUSTER_ENV) to decide whether a fleet cluster is reachable over
+        its private endpoint. Hermes hands a stdio MCP server only the keys
+        named in its env block, so platform_control's switch_kube_context
+        would otherwise never know its own VPC. Read through the tuple, since
+        the server never spells the names itself."""
+        sys.path.insert(0, str(SCRIPTS_DIR))
+        import gke_endpoint
+
+        env = merged_config()["mcp_servers"]["platform_control"].get("env") or {}
+        for name in gke_endpoint.OWN_CLUSTER_ENV:
+            self.assertIn(name, env, f"platform_control's env block does not pass {name}")
+            self.assertEqual(env[name], "${%s}" % name)
+
     def test_each_local_python_server_declares_what_it_reads(self):
         merged = merged_config()
         checked = 0

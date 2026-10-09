@@ -42,6 +42,14 @@ mcp_servers:
       GOOGLE_CHAT_SUBSCRIPTION_NAME: "${GOOGLE_CHAT_SUBSCRIPTION_NAME}"
       GOOGLE_CLOUD_PROJECT: "${GOOGLE_CLOUD_PROJECT}"
       GCP_PROJECT_ID: "${GCP_PROJECT_ID}"
+      # The agent's own cluster, which gke_endpoint reads to decide whether a
+      # fleet cluster is reachable over its private endpoint
+      # (docs/designs/private-endpoint-selection.md). Without these three the
+      # server's switch_kube_context never knows its own VPC and leaves that
+      # decision to the credential proxy's splice, one describe later.
+      GKE_PROJECT_ID: "${GKE_PROJECT_ID}"
+      GKE_LOCATION: "${GKE_LOCATION}"
+      GKE_CLUSTER_NAME: "${GKE_CLUSTER_NAME}"
       # Hermes hands a stdio MCP server only a safe baseline (PATH, HOME, …) plus the
       # keys named here (`_build_safe_env` in hermes `tools/mcp_tool.py`), so without
       # this line the `hermes send` behind send_notification has no home channel and

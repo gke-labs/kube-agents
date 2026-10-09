@@ -19,7 +19,8 @@
 #   2. A kubeconfig is pinned and non-empty.
 #   3. That kubeconfig selects the cluster USER.md declares  <- identity.
 #   4. A plain `kubectl` resolves to that same context       <- identity.
-#   5. The cluster's API server answers.
+#   5. The cluster's API server answers (and, when it does not, which endpoint
+#      the kubeconfig names and what would open it).
 # Checks 3 and 4 are the difference between "kubectl works" and "kubectl works on
 # the right cluster". Without them 1, 2 and 5 all pass while the agent operates on
 # someone else's cluster and reports the results as its own.
@@ -97,6 +98,16 @@ readonly KUBECTL_CAP_SECONDS=$((BROKER_ADMISSION_WAIT_SECONDS + BROKER_KUBECTL_R
 # `timeout 0` runs the command uncapped. What `timeout` exits with when it fires.
 readonly KUBECTL_CAP_FLOOR_SECONDS=1
 readonly RC_TIMED_OUT=124
+# What kubectl prints when it never reached the API server; check 5 offers the
+# scaffold's endpoint remedy only for these (cluster_agent_profile.py keeps the
+# same list as CONNECTIVITY_FAILURE_RE).
+readonly CONNECTIVITY_FAILURE_RE='i/o timeout|timed out|context deadline exceeded|Client\.Timeout|no route to host|connection refused|network is unreachable|TLS handshake timeout|dial tcp'
+# ...except the shim's own messages, which are the shim or the broker and not
+# the cluster (matched on the shim's prefixes, since the cap text above
+# mentions "the credential proxy's admission wait" and is a real timeout), and
+# anything the API server answered, which "Error from server" fronts: a
+# degraded etcd's "request timed out" was reached, and the list cannot help.
+readonly NOT_A_CONNECTION_FAILURE_RE='credential proxy( token)? unavailable|credential proxy error|credential proxy:|Error from server'
 # What a shell returns for a command it cannot find or cannot execute.
 readonly RC_COMMAND_NOT_FOUND=127
 readonly RC_COMMAND_NOT_EXECUTABLE=126
@@ -233,6 +244,15 @@ fail() {
 user_md_field() {
     tr '[:upper:]' '[:lower:]' <"$USER_MD" 2>/dev/null \
         | sed -n "s/^[[:space:]]*-[[:space:]]*$1:[[:space:]]*//p" | head -n1 | tr -d '[:space:]'
+}
+
+# Like user_md_field, but keeps the value's case and inner spacing: the
+# endpoint remedy the scaffold writes is a sentence with a backticked command
+# in it, and the authorized-networks list is comma-separated. Key match is
+# case-insensitive, as above; only the first bullet counts.
+user_md_text() {
+    grep -i -m1 "^[[:space:]]*-[[:space:]]*$1:" "$USER_MD" 2>/dev/null \
+        | sed 's/^[[:space:]]*-[[:space:]]*[^:]*:[[:space:]]*//' | sed 's/[[:space:]]*$//'
 }
 
 PROJECT=""
@@ -407,9 +427,29 @@ if [ "$STATUS" = "ok" ]; then
     if [ "$rc" -ne 0 ]; then
         # Collapse to a single line so it reads cleanly on the kanban card.
         ERR_ONE="$(printf '%s' "$ERR" | tr '\n' ' ' | sed 's/  */ /g' | cut -c1-500)"
-        fail "5" "Cannot reach the target cluster's API server." \
-             "The cluster may be deleted, unreachable, or the agent's credentials lack access. Verify the cluster exists and the agent's service account has GKE access; then re-scaffold if needed." \
-             "kubectl cluster-info: $ERR_ONE"
+        REASON_5="Cannot reach the target cluster's API server."
+        REMEDIATION_5="The cluster may be deleted, unreachable, or the agent's credentials lack access. Verify the cluster exists and the agent's service account has GKE access; then re-scaffold if needed."
+        # The scaffold records which endpoint the kubeconfig names and what
+        # would open it (cluster_agent_profile.py, _endpoint_bullets). An
+        # older profile has no such bullets and reads exactly as before.
+        ENDPOINT_KIND="$(user_md_field endpoint)"
+        if [ -n "$ENDPOINT_KIND" ]; then
+            REASON_5="$REASON_5 The kubeconfig names the cluster's $ENDPOINT_KIND endpoint ($(user_md_text endpoint-address)); authorized networks: $(user_md_text authorized-networks)."
+            # The remedy is about reaching the server, so it is offered only
+            # when kubectl never did (a timeout, no route, a refused dial), not
+            # for an answer it got and disliked (401, 403, NotFound), and not
+            # when this script's own cap killed the call: the kubectl above
+            # names --request-timeout=8s, so a cluster that refuses the agent
+            # fails on that bound with kubectl's text, and reaching the cap
+            # means the broker held the call, which the list cannot fix.
+            ENDPOINT_REMEDY="$(user_md_text endpoint-remedy)"
+            if [ -n "$ENDPOINT_REMEDY" ] && [ "$rc" -ne "$RC_TIMED_OUT" ] \
+                    && printf '%s' "$ERR" | grep -Eiq "$CONNECTIVITY_FAILURE_RE" \
+                    && ! printf '%s' "$ERR" | grep -Eiq "$NOT_A_CONNECTION_FAILURE_RE"; then
+                REMEDIATION_5="$ENDPOINT_REMEDY $REMEDIATION_5"
+            fi
+        fi
+        fail "5" "$REASON_5" "$REMEDIATION_5" "kubectl cluster-info: $ERR_ONE"
     fi
 fi
 

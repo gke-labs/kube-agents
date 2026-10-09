@@ -103,6 +103,31 @@ KUBECTL_WATCH_FLAGS = ("-w", "--watch", "--watch-only")
 # A caller who named their own bound has already answered the question; honour
 # it rather than overriding it with a shorter one.
 KUBECTL_TIMEOUT_FLAGS = ("--request-timeout", "--timeout")
+# The two endpoint selectors a caller's `get-credentials` may carry; with
+# neither, the broker splices in gke_endpoint's decision (see
+# `_endpoint_flags_for_callers_fetch`).
+GET_CREDENTIALS_ENDPOINT_FLAGS = ("--dns-endpoint", "--internal-ip")
+# gcloud's spellings of the location and project on that command, with or
+# without `=`.
+GET_CREDENTIALS_LOCATION_FLAGS = ("--location", "--region", "--zone", "-z")
+GET_CREDENTIALS_PROJECT_FLAG = "--project"
+GET_CREDENTIALS_DEFAULT_PROJECT_ENV = "GKE_PROJECT_ID"
+# Beside a managed kubeconfig written from a provisional endpoint decision
+# (`_provisional_marker`): the next request refetches rather than reusing it.
+PROVISIONAL_KUBECONFIG_SUFFIX = ".provisional"
+# How long a provisional kubeconfig is served before the next request decides
+# again. Bounds the cost of an own-cluster describe that keeps failing: without
+# a window every kubectl to such a cluster would refetch under the kubeconfig
+# lock, three gcloud runs each. One minute matches gke_endpoint's target TTL.
+PROVISIONAL_RETRY_SECONDS = 60
+# How much of gcloud's stderr the refetch-failure log line keeps.
+REFETCH_FAILURE_LOG_CHARS = 200
+# The bound on each gcloud the broker runs to decide a caller's unflagged
+# fetch (help probe, target describe, own-cluster describe). They run inside
+# the caller's own bound on the whole fetch -- 30 s for switch_kube_context --
+# so each is held well under a kubectl's 60 s; a describe that cannot answer
+# in this time leaves the fetch to run as given, marked provisional.
+SPLICE_DECISION_TIMEOUT_SECONDS = 15
 
 # Bounds on what a command's output costs this process while the command runs.
 # Output is read as it streams and only the first `--max-output-bytes` of each
@@ -3057,6 +3082,65 @@ class ExecutionResult:
 # happens where the file is, which is not here.
 
 
+def _mtime_ns_or_none(path: Path) -> int | None:
+    """The file's mtime in nanoseconds, or None when it is absent or empty."""
+    try:
+        stat = path.stat()
+    except FileNotFoundError:
+        return None
+    return stat.st_mtime_ns if stat.st_size > 0 else None
+
+
+def _flags_of(decision) -> list[str]:
+    """The `get-credentials` flags an endpoint decision carries; none for None."""
+    return list(decision.flags) if decision is not None else []
+
+
+def _get_credentials_target(argv: list[str]) -> ClusterTarget | None:
+    """The (project, cluster, location) a `get-credentials` argv names, or None.
+
+    The cluster is the first positional after the verb that is not the value
+    of a flag; the location and project are read from gcloud's flags wherever
+    they sit, before or after the verb, in `--flag=value` or `--flag value`
+    form, with `-z` for `--zone`. Flags that take a detached value are the
+    ones `command_policy` already knows, so `--verbosity debug` ahead of the
+    verb does not read `debug` as the cluster. A missing project falls back
+    to the broker's own, which its bootstrap made gcloud's default; a missing
+    cluster or location is None, since gcloud's defaults for those are not
+    known here.
+    """
+    try:
+        verb_index = argv.index("get-credentials")
+    except ValueError:
+        return None
+    cluster = ""
+    location = ""
+    project = ""
+    skip = False
+    for position, argument in enumerate(argv):
+        if skip:
+            skip = False
+            continue
+        name, separator, value = argument.partition("=")
+        takes_value = name in command_policy._GCLOUD_FLAGS_WITH_VALUE
+        if takes_value and not separator:
+            value = argv[position + 1] if position + 1 < len(argv) else ""
+            skip = True
+        if name in GET_CREDENTIALS_LOCATION_FLAGS:
+            location = value
+        elif name == GET_CREDENTIALS_PROJECT_FLAG:
+            project = value
+        elif (position > verb_index and not argument.startswith("-")
+              and not cluster):
+            cluster = argument
+    # The hand-typed form omits --project. The bootstrap set gcloud's default
+    # project to GKE_PROJECT_ID, so that is the project gcloud will use.
+    project = project or os.environ.get(GET_CREDENTIALS_DEFAULT_PROJECT_ENV, "")
+    if not (project and cluster and location):
+        return None
+    return ClusterTarget(project=project, cluster=cluster, location=location)
+
+
 def _is_get_credentials(argv: list[str]) -> bool:
     """Is this the one command that legitimately authors a kubeconfig?
 
@@ -4785,6 +4869,14 @@ class CommandExecutor:
         # rare and the server is threaded, so a single lock is cheaper than the
         # bookkeeping needed to make it per-cluster.
         self._kubeconfig_lock = threading.Lock()
+        # Serialises only the two filesystem steps that file a managed
+        # kubeconfig and its provisional mark (`_file_managed_kubeconfig`), so
+        # a caller's fetch never waits behind a cold read's gcloud runs, which
+        # `_kubeconfig_lock` covers.
+        self._marker_lock = threading.Lock()
+        # Set once `_endpoint_decision` finds gke_endpoint unimportable; that
+        # None is settled, unlike the None of a describe that failed.
+        self._endpoint_module_missing = False
         # Serialises forge credential refreshes so concurrent callers do not
         # race on the global .gitconfig lock file or forge CLI state.
         self._forge_refresh_lock = threading.Lock()
@@ -6383,11 +6475,15 @@ class CommandExecutor:
     def _managed_kubeconfig(self, target: ClusterTarget) -> Path:
         return self.kubeconfig_dir / f"{target.context_name}.yaml"
 
-    def _dns_endpoint_args(self, gcloud: str, target: ClusterTarget) -> list[str]:
-        """Decide whether this cluster's credentials must name its DNS endpoint.
+    def _endpoint_decision(self, gcloud: str, target: ClusterTarget, timeout_seconds: int | None = None):
+        """Decide which endpoint this cluster's credentials must name.
 
-        The decision itself lives in `gke_endpoint`, shared with the two callers in
-        the agent container. What is local to the sidecar is *how* gcloud runs: the
+        Returns gke_endpoint's `EndpointDecision` -- its `flags` are
+        `--dns-endpoint`, `--internal-ip` or nothing, and its `provisional`
+        mark says the decision was made without the broker's own cluster -- or
+        None when nothing could be decided. The decision itself lives in
+        `gke_endpoint`, shared with the callers in the agent container
+        (`cluster_agent_profile.py`, `platform_mcp_server.py`, `stall_watch.py`). What is local to the sidecar is *how* gcloud runs: the
         binary is the resolved executable rather than whatever is on PATH, and it
         goes through `_execute` so the describe is subject to the same timeout,
         output cap, and working directory as every other command here.
@@ -6398,25 +6494,98 @@ class CommandExecutor:
         behaviour that shipped before it existed.
         """
         try:
-            from gke_endpoint import dns_endpoint_args
+            from gke_endpoint import endpoint_decision
         except ImportError as error:
             logging.warning(
                 "gke_endpoint is unavailable (%s); falling back to the IP endpoint for %s",
                 error,
                 target.context_name,
             )
-            return []
+            # Settled for the life of the pod: the module will not appear, so
+            # a file fetched without it is not provisional, or every cluster
+            # would refetch once a minute for nothing.
+            self._endpoint_module_missing = True
+            return None
+
+        bound = timeout_seconds if timeout_seconds is not None else self.kubectl_timeout_seconds
 
         def run(argv: list[str]) -> tuple[int, str]:
             # The short deadline: this is a control-plane lookup made on the
             # way to a kubectl, not a command the caller chose, and it runs
             # silently under the kubeconfig lock. See _ensure_managed_kubeconfig.
-            result = self._execute(
-                [gcloud, *argv[1:]], timeout_seconds=self.kubectl_timeout_seconds
-            )
+            # A caller's splice passes a tighter bound still.
+            result = self._execute([gcloud, *argv[1:]], timeout_seconds=bound)
             return result.exit_code, result.stdout
 
-        return dns_endpoint_args(target.project, target.cluster, target.location, run=run)
+        return endpoint_decision(target.project, target.cluster, target.location, run=run)
+
+    def _provisional_marker(self, target: ClusterTarget) -> Path:
+        """Beside the managed kubeconfig: present while that file was written
+        from a decision made without the broker's own cluster (the describe
+        failed), or from no decision at all. A request after
+        PROVISIONAL_RETRY_SECONDS treats the file as a miss and decides again,
+        so one failed describe does not pin an endpoint until the pod restarts,
+        and one that keeps failing costs a refetch a minute rather than one a
+        request."""
+        return self._managed_kubeconfig(target).with_suffix(PROVISIONAL_KUBECONFIG_SUFFIX)
+
+    def _undecided(self, decision) -> bool:
+        """Is this the answer of a decision that could not be made now?
+
+        None from a describe that failed with nothing cached, or a decision
+        marked provisional. None because the module is missing is settled, and
+        so is the empty decision gke_endpoint returns for a gcloud without the
+        flag (it is not None at all).
+        """
+        if decision is None:
+            return not self._endpoint_module_missing
+        return bool(decision.provisional)
+
+    def _provisional_window_open(self, marker: Path) -> bool:
+        """Is the provisional kubeconfig beside `marker` still inside its window?"""
+        try:
+            return time.time() - marker.stat().st_mtime < PROVISIONAL_RETRY_SECONDS
+        except FileNotFoundError:
+            return False
+
+    def _file_managed_kubeconfig(self, scratch: Path, target: ClusterTarget, provisional: bool,
+                                 seen_mtime_ns: int | None) -> None:
+        """Move gcloud's output into place and set the provisional mark.
+
+        `seen_mtime_ns` is the managed file's mtime as the caller saw it before
+        the decision and the fetch ran, or None when there was no file. It is
+        what tells a settled file that landed *during* the fetch (newer than
+        the snapshot, or present where none was) from one that was simply
+        already there: an unmarked file is the steady state of every cluster
+        filed settled, not a race signature, and a provisional result still
+        has to refresh it or a re-run of the onboarding would change nothing.
+
+        The mark goes down before the file when the decision was provisional,
+        so a crash between the two leaves an unmarked file only when it was
+        settled; and it comes off after the file when it was settled. The two
+        steps run under `_marker_lock`, so a settled fetch and a provisional
+        one cannot interleave them, whether or not the caller also holds
+        `_kubeconfig_lock`. A provisional result never replaces an unmarked
+        file that is newer than the snapshot: a caller's fetch files outside
+        `_kubeconfig_lock`, so a settled answer can land during a cold or
+        window-expired broker fetch, and it outranks the undecided one.
+        """
+        marker = self._provisional_marker(target)
+        managed = self._managed_kubeconfig(target)
+        with self._marker_lock:
+            if provisional:
+                if (managed.is_file() and managed.stat().st_size > 0 and not marker.exists()
+                        and (seen_mtime_ns is None or managed.stat().st_mtime_ns > seen_mtime_ns)):
+                    logging.info(
+                        "a settled kubeconfig for %s landed during an undecided fetch; keeping it",
+                        target.context_name,
+                    )
+                    return
+                marker.touch()
+                os.replace(scratch, managed)
+            else:
+                os.replace(scratch, managed)
+                marker.unlink(missing_ok=True)
 
     def _ensure_managed_kubeconfig(self, target: ClusterTarget) -> Path:
         """Return the proxy-authored kubeconfig for a cluster, fetching on a miss.
@@ -6429,12 +6598,17 @@ class CommandExecutor:
         pinned by some earlier process.
         """
         managed = self._managed_kubeconfig(target)
+        marker = self._provisional_marker(target)
         with self._kubeconfig_lock:
-            if managed.is_file() and managed.stat().st_size > 0:
+            if managed.is_file() and managed.stat().st_size > 0 and (
+                not marker.exists() or self._provisional_window_open(marker)
+            ):
                 return managed
+            seen_mtime_ns = _mtime_ns_or_none(managed)
             gcloud = self.executables.get("gcloud")
             if not gcloud:
                 raise RuntimeError("gcloud is unavailable; cannot materialise a kubeconfig")
+            decision = self._endpoint_decision(gcloud, target)
             scratch = self.kubeconfig_dir / f".pending-{uuid.uuid4().hex}.yaml"
             try:
                 result = self._execute(
@@ -6446,7 +6620,7 @@ class CommandExecutor:
                         target.cluster,
                         f"--location={target.location}",
                         f"--project={target.project}",
-                        *self._dns_endpoint_args(gcloud, target),
+                        *_flags_of(decision),
                     ],
                     kubeconfig_path=scratch,
                     # The short deadline, as for the describe above. A
@@ -6458,13 +6632,62 @@ class CommandExecutor:
                 )
                 if result.exit_code != 0 or not scratch.is_file():
                     detail = result.stderr.strip() or f"gcloud exited {result.exit_code}"
+                    if managed.is_file() and managed.stat().st_size > 0:
+                        # A provisional file past its window brought us here,
+                        # or a caller filed a settled one while this fetch
+                        # ran. Either way the GKE API has just failed, the
+                        # kubeconfig on disk may well still work, and serving
+                        # it beats a 400. A provisional file's window is
+                        # pushed out so the next attempt waits again rather
+                        # than retrying per request.
+                        logging.warning(
+                            "refetch of the provisional kubeconfig for %s failed (%s); serving the file on disk",
+                            target.context_name, detail[:REFETCH_FAILURE_LOG_CHARS],
+                        )
+                        # Only an existing mark is pushed out: a caller may
+                        # have filed a settled kubeconfig for this cluster
+                        # outside `_kubeconfig_lock` since the miss above, and
+                        # marking that file would send it back here a minute
+                        # later for an undecided refetch to overwrite.
+                        with self._marker_lock:
+                            if marker.exists():
+                                marker.touch()
+                        return managed
                     raise ValueError(
                         f"could not obtain credentials for {target.context_name}: {detail[:400]}"
                     )
-                os.replace(scratch, managed)
+                self._file_managed_kubeconfig(
+                    scratch, target, provisional=self._undecided(decision),
+                    seen_mtime_ns=seen_mtime_ns)
             finally:
                 scratch.unlink(missing_ok=True)
         return managed
+
+    def _decision_for_callers_fetch(self, command: list[str]) -> tuple[bool, object]:
+        """`(attempted, decision)` for a caller's `get-credentials`.
+
+        `attempted` is False when the command is run as given: the caller named
+        an endpoint flag, or no full target could be read. It is True when the
+        broker decided for the caller, in which case `decision` is gke_endpoint's
+        answer or None when it could not decide -- and None is then as
+        provisional as the broker's own undecided fetch, not a settled result.
+
+        The file that fetch produces is filed as the shared kubeconfig for its
+        cluster (`_execute_get_credentials`), so a caller that names no endpoint
+        -- the Platform Agent running the command by hand, a skill that builds
+        its own -- would otherwise move a cluster the broker reaches over its
+        DNS or private endpoint back to the public IP for every brokered kubectl
+        after it. A caller that did name one is run as given; a command whose
+        target cannot be read is run as given too, since gcloud will resolve it
+        against defaults this side does not know.
+        """
+        if any(flag in command for flag in GET_CREDENTIALS_ENDPOINT_FLAGS):
+            return False, None
+        target = _get_credentials_target(command)
+        if target is None:
+            return False, None
+        return True, self._endpoint_decision(
+            command[0], target, timeout_seconds=SPLICE_DECISION_TIMEOUT_SECONDS)
 
     def _execute_get_credentials(
         self,
@@ -6492,6 +6715,14 @@ class CommandExecutor:
         # writes the kubeconfig named by `KUBECONFIG`, the broker's own base
         # config, moving the `current-context` that every later context-less
         # kubectl resolves against.
+        # What is on disk for the cluster this fetch names, before anything
+        # runs: `_file_managed_kubeconfig` compares against it to tell a
+        # settled file that lands during the fetch from one already there.
+        seen_target = _get_credentials_target(command)
+        seen_mtime_ns = (_mtime_ns_or_none(self._managed_kubeconfig(seen_target))
+                         if seen_target is not None else None)
+        attempted, decision = self._decision_for_callers_fetch(command)
+        command = [*command, *_flags_of(decision)]
         scratch = self.kubeconfig_dir / f".pending-{uuid.uuid4().hex}.yaml"
         try:
             result = self._execute(
@@ -6502,12 +6733,21 @@ class CommandExecutor:
                 context = read_current_context(generated)
                 target = parse_gke_context(context) if context else None
                 if target is not None:
-                    # Deliberately outside `_kubeconfig_lock`: `os.replace` is
-                    # atomic, so a concurrent cache miss for the same cluster
-                    # either sees the old file or this one, and at worst does one
-                    # redundant fetch. Taking the lock here would serialise every
-                    # scaffold behind every cold read for no benefit.
-                    os.replace(scratch, self._managed_kubeconfig(target))
+                    # Outside `_kubeconfig_lock`, as before: a scaffold never
+                    # waits behind a cold read's gcloud runs. The filing step
+                    # takes `_marker_lock` by itself, so the file and its
+                    # provisional mark cannot interleave with the broker's own
+                    # fetch. The same provisional rule as that fetch: a file
+                    # written while the broker tried to decide and could not --
+                    # the own-cluster describe failed, or the target's -- is
+                    # filed under a mark and is a miss after its window, unless
+                    # a settled file landed during the fetch; one written on a
+                    # settled decision, or run as given (the caller's own flag,
+                    # no readable target), clears an older mark.
+                    self._file_managed_kubeconfig(
+                        scratch, target,
+                        provisional=attempted and self._undecided(decision),
+                        seen_mtime_ns=seen_mtime_ns if seen_target == target else None)
                 if wants_kubeconfig:
                     result = replace(result, kubeconfig=generated)
             return result

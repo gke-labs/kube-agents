@@ -12,6 +12,14 @@ fail *open* on a row with no tab in it while the awk one failed closed.
 
 The awk program is read out of the Go source rather than copied here. A copy
 would pass forever after someone edited the bootstrap.
+
+The Python copy alone also knows `--internal-ip`
+(docs/designs/private-endpoint-selection.md). That branch needs the agent's own
+cluster in the environment. The installer's shell callers run on a workstation
+and have none; the bootstrap has it but reaches only that same cluster, where
+the branch is a separate decision (the design doc says why). So the table here
+stays the DNS one, and a last case pins that the branch is inert without the
+identity.
 """
 
 from __future__ import annotations
@@ -23,6 +31,7 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+import unittest.mock
 
 import gke_endpoint
 
@@ -200,6 +209,34 @@ class PredicateParity(unittest.TestCase):
     def setUp(self):
         gke_endpoint.reset_cache()
         self.addCleanup(gke_endpoint.reset_cache)
+
+    def test_a_private_cluster_yields_no_flag_without_an_own_network(self):
+        """The Python copy alone knows --internal-ip, and only when the agent's
+        own cluster is in the environment. Scrubbed of it, a same-shape private
+        cluster with a closed DNS endpoint reads as "no flag" from all three
+        copies, which is what keeps them one truth table."""
+        private_closed = {
+            "controlPlaneEndpointsConfig": {
+                "dnsEndpointConfig": {"allowExternalTraffic": False, "endpoint": "gke-x.gke.goog"},
+                "ipEndpointsConfig": {"enabled": True, "privateEndpoint": "10.10.0.2"},
+            },
+            "endpoint": "203.0.113.10",
+            "networkConfig": {"network": "projects/p/global/networks/n"},
+            "privateClusterConfig": {"privateEndpoint": "10.10.0.2"},
+            "masterAuthorizedNetworksConfig": {"enabled": True, "cidrBlocks": [{"cidrBlock": "10.0.0.0/8"}]},
+        }
+
+        def runner(argv):
+            if "--help" in argv:
+                return 0, FLAG
+            return 0, json.dumps(private_closed)
+
+        scrubbed = {k: v for k, v in os.environ.items() if k not in gke_endpoint.OWN_CLUSTER_ENV}
+        with unittest.mock.patch.dict(os.environ, scrubbed, clear=True):
+            python_says = gke_endpoint.dns_endpoint_args("proj-a", "cluster-a", "us-central1", run=runner)
+        self.assertEqual(python_says, [])
+        self.assertEqual(run_bash("gke-x.gke.goog\tFalse"), "")
+        self.assertEqual(run_awk("gke-x.gke.goog\tFalse"), "")
 
     def test_the_three_implementations_agree(self):
         for name, value_row, endpoint, allow_external, expected in CASES:

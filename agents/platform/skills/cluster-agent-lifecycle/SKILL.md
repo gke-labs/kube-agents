@@ -20,7 +20,7 @@ python3 /opt/data/scripts/cluster_agent_profile.py create \
   --project "<project>" --cluster "<cluster>" --location "<location>"
 ```
 
-This scaffolds the profile home on the persistent data PVC, pins a kubeconfig scoped to that cluster, writes the cluster identity into the profile's `USER.md`, and registers the profile. It is **idempotent** — safe to re-run. It prints the profile name.
+This scaffolds the profile home on the persistent data PVC, pins a kubeconfig scoped to that cluster, writes the cluster identity and the control-plane endpoint it chose into the profile's `USER.md`, probes the cluster once (a failure is logged with the endpoint it chose, when one was decided, and, for a connection failure, the remedy; the scaffold still succeeds), and registers the profile. It is **idempotent** — safe to re-run. It prints the profile name.
 
 ## How to delegate a debugging / runtime-ops task (kanban board)
 

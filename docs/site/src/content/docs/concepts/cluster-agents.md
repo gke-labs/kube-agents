@@ -23,6 +23,26 @@ A managed cluster and its Cluster Agent profile are created together and deleted
 2. **On request.** "Manage my cluster `X` in `Y`" invokes the `manage-cluster` skill, which verifies the cluster exists and creates its profile (idempotent).
 3. **Reconciliation.** The hourly `cluster-agent-reconcile` job (a `no_agent` script job on the Planning Agent profile's [cron file](/kube-agents/reference/cron-jobs/)) sweeps every project in scope (the management project alone unless `spec.scope` says otherwise): it creates a profile for every cluster that lacks one — including the management cluster kube-agents itself runs on, whose own workloads fail like any other cluster's — and prunes a profile only when its cluster is _definitively_ gone (a NotFound from `gcloud container clusters describe`), when the cluster is named in [`spec.scope.exclude.clusters`](/kube-agents/operator/platformagent-crd/#specscope) (or, for one more release, in `RECONCILE_EXCLUDE`), or when its project has left the scope, over two runs that could each trust every lookup they made (the first marks the project `retiring` in `fleet_scope.json`, the next such run prunes; a management project that changes identity is marked on the run the change is seen, once the new project has listed its own clusters; [`spec.scope`](/kube-agents/operator/platformagent-crd/#specscope) states the conditions). Ambiguous errors (auth, network, quota) never trigger deletion.
 
+### Which control-plane endpoint the profile uses
+
+Scaffolding pins a kubeconfig scoped to the cluster, and which endpoint that kubeconfig names
+is decided per cluster. The DNS endpoint wins when it accepts external traffic. A cluster on
+the agent cluster's VPC whose public endpoint is absent or gated by authorized networks, and
+whose DNS endpoint is closed, is reached over its private endpoint
+(`privateClusterConfig.privateEndpoint`) when that endpoint is in the agent cluster's region
+or has control-plane global access, and when it admits the agent: no authorized-network list
+is enabled, or the list explicitly does not gate the private endpoint
+(`masterAuthorizedNetworksConfig.privateEndpointEnforcementEnabled: false`), or the two
+clusters share a subnet, or the agent cluster's Pod range (`clusterIpv4Cidr`) lies inside a
+listed range. Otherwise the kubeconfig names the endpoint `gcloud` writes by default. The
+scaffold records the endpoint it chose in the profile's `USER.md`, probes the cluster once,
+and when the connection fails the onboarding log and the Cluster Agent's preflight repeat that
+record and name what would open the cluster: the Pod range to add when the private endpoint's
+list is the block, the agent's egress address when the public endpoint's is, control-plane
+global access when the region is, and the DNS endpoint when the VPC is.
+[`private-endpoint-selection.md`](https://github.com/gke-labs/kube-agents/blob/main/docs/designs/private-endpoint-selection.md)
+has the full rule.
+
 ## How delegation works
 
 Delegation runs on the shared kanban board — agents never pass context to each other directly:
