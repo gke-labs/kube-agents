@@ -100,6 +100,17 @@ class InjectFooterTest(unittest.TestCase):
         self.assertIn("scripts/fleet_upgrade_report.py", text)
         self.assertIn("--target-version", text)
 
+    def test_repo_alert_configuration_skill_carries_its_corrections(self):
+        repo_root = Path(__file__).resolve().parent.parent
+        skill_md = repo_root / "agents" / "platform" / "skills" / "gke-alert-configuration" / "SKILL.md"
+        content = skill_md.read_text(encoding="utf-8")
+        for target, replacement in sync.SKILL_SUBSTITUTIONS["gke-alert-configuration"]:
+            self.assertNotIn(target, content)
+            self.assertEqual(content.count(replacement), 1, replacement)
+        footer = sync.SKILL_FOOTERS["gke-alert-configuration"].rstrip("\n")
+        self.assertTrue(content.rstrip("\n").endswith(footer))
+        self.assertEqual(content.count(sync.FOOTER_MARKER), 1)
+
     def test_repo_upgrades_skill_carries_the_footer(self):
         repo_root = Path(__file__).resolve().parent.parent
         skill_md = repo_root / "agents" / "platform" / "skills" / "gke-upgrades" / "SKILL.md"

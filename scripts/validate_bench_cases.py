@@ -335,6 +335,12 @@ KNOWN_NO_DOMAIN = {
         "image; it reads no fleet and no domains.yaml row describes skill or "
         "sandbox integrity"
     ),
+    "alert-config-terraform-promql-probe": (
+        "a skill-guidance probe: a Terraform alert policy written from the "
+        "gke-alert-configuration skill, graded on its PromQL condition, metric "
+        "and label; it reads no fleet and no domains.yaml row describes "
+        "alert authoring"
+    ),
 }
 
 # Cases graded by the judge alone. The OutcomeValidity >= 0.7 fallback in
