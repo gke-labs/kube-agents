@@ -12,10 +12,12 @@ from the same shapes.
 
 import argparse
 import copy
+import errno
 import io
 import json
 import os
 import re
+import stat
 import sys
 import tempfile
 import threading
@@ -60,6 +62,7 @@ SERVER_CONFIG = load("serverconfig_us-central1-a.json")
 # Discovery reads no environment variable; the store and kubeconfig homes
 # are the only ones the tests set.
 NO_PROJECT_ENV: dict[str, str] = {}
+API_OFF_STDERR = "ERROR: (gcloud.container.{api}.list) ResponseError: code=403, message=Kubernetes Engine API has not been used in project {project} before or it is disabled. Enable it by visiting https://console.developers.google.com/apis/api/container.googleapis.com/overview?project={project} then retry. reason: SERVICE_DISABLED"
 KUBECTL_KINDS = {"pdb": "pdbs", "replicasets,jobs": "owners", "deploy,ds,sts,cronjobs": "workloads", "pv,storageclasses": "storage", "validatingwebhookconfigurations,mutatingwebhookconfigurations": "webhooks"}
 INFERENCE = "seeded-capacity/Deployment/inference-server"
 PAYMENTS = "seeded-debug/Deployment/payments-api"
@@ -86,12 +89,14 @@ class FakeFleet:
     `broken` names clusters whose get-credentials fails; `kubectl_fail`
     names (cluster, kind) reads that fail."""
 
-    def __init__(self, clusters=None, operations=None, broken=(), kubectl_fail=(), list_rc=0, list_fail=(), ops_fail=()):
+    def __init__(self, clusters=None, operations=None, broken=(), kubectl_fail=(), list_rc=0, list_fail=(), ops_fail=(), api_off=()):
         self.clusters = clusters if clusters is not None else [cluster_doc("seeded-a"), cluster_doc("gemma-gpu-upgraded")]
         self.operations = operations if operations is not None else OPERATIONS
         self.broken, self.kubectl_fail, self.list_rc, self.list_fail = set(broken), set(kubectl_fail), list_rc, set(list_fail)
         # Projects whose `operations list` fails (a quota error, say).
         self.ops_fail = set(ops_fail)
+        # Projects with the Kubernetes Engine API off: both listings refuse with gcloud's words for it.
+        self.api_off = set(api_off)
         self.calls = []
 
     def __call__(self, argv, *, timeout=None, env=None):
@@ -99,10 +104,14 @@ class FakeFleet:
         joined = " ".join(argv)
         if "clusters list" in joined:
             project = argv[argv.index("--project") + 1]
+            if project in self.api_off:
+                return run_of(1, "", API_OFF_STDERR.format(project=project, api="clusters"))
             if self.list_rc or project in self.list_fail:
                 return run_of(self.list_rc or 1, "", "PERMISSION_DENIED")
             return run_of(0, json.dumps([{k: v for k, v in c.items() if k != "project"} for c in self.clusters if c.get("project", PROJECT) == project]))
         if "operations list" in joined:
+            if argv[argv.index("--project") + 1] in self.api_off:
+                return run_of(1, "", API_OFF_STDERR.format(project=argv[argv.index("--project") + 1], api="operations"))
             if argv[argv.index("--project") + 1] in self.ops_fail:
                 return run_of(1, "", "RESOURCE_EXHAUSTED: quota exceeded")
             return run_of(0, json.dumps(self.operations))
@@ -701,11 +710,31 @@ class ClassifierSignatureTest(unittest.TestCase):
         self.assertFalse(ur._selector_matches({"matchExpressions": [{"key": "tier", "operator": "NotIn", "values": ["web"]}]}, labels))
         self.assertTrue(ur._selector_matches({"matchLabels": {"app": "inference-server"}, "matchExpressions": [{"key": "tier", "operator": "Exists"}]}, labels))
         self.assertFalse(ur._selector_matches({"matchLabels": {"app": "inference-server"}, "matchExpressions": [{"key": "tier", "operator": "DoesNotExist"}]}, labels))
-        self.assertFalse(ur._selector_matches({}, labels))
+        # policy/v1: an empty selector matches every pod in the namespace.
+        self.assertTrue(ur._selector_matches({}, labels))
         pdbs = copy.deepcopy(READS["seeded-a"]["pdbs"])
         pdbs[0]["spec"]["selector"] = {"matchExpressions": [{"key": "app", "operator": "In", "values": ["inference-server"]}]}
         rows = [s for s in symptoms_of("seeded-a", reads={**READS["seeded-a"], "pdbs": pdbs}) if s["category"] == "pdb"]
         self.assertEqual(entries(rows[0]), {(1, ur.HIGH)})
+
+    def test_empty_budget_selector_covers_the_namespace_and_an_absent_one_covers_nothing(self):
+        # A namespace-wide "evict nothing" budget: `selector: {}` covers every pod in seeded-capacity,
+        # so the drained pool's replicas link it to the hold; a budget with no selector covers none.
+        pdbs = copy.deepcopy(READS["seeded-a"]["pdbs"])
+        pdbs[0]["spec"]["selector"] = {}
+        rows = [s for s in symptoms_of("seeded-a", reads={**READS["seeded-a"], "pdbs": pdbs}) if s["category"] == "pdb"]
+        self.assertEqual([(r["upgraded_pools"], r["message"].split(" pods=")[1].split(" ")[0]) for r in rows], [(["pinned-inference-pool"], str(len([p for p in READS["seeded-a"]["pods"] if p["metadata"]["namespace"] == "seeded-capacity"])))])
+        pdbs[0]["spec"].pop("selector")
+        self.assertEqual([s for s in symptoms_of("seeded-a", reads={**READS["seeded-a"], "pdbs": pdbs}) if s["category"] == "pdb"], [])
+        # The risk shape reads the same two spellings: an empty selector covers the workloads, an
+        # absent one none, so a spec that forbids disruption counts its replicas only with the former.
+        pdbs[0]["spec"]["selector"], pdbs[0]["spec"]["maxUnavailable"] = {}, 0
+        [shape] = [s for s in ur.budget_shapes(pdbs, READS["seeded-a"]["workloads"]) if s["object"].endswith("PodDisruptionBudget/inference-server")]
+        self.assertEqual(shape["confidence"], ur.HIGH)
+        self.assertIn(" over ", shape["evidence"])
+        pdbs[0]["spec"].pop("selector")
+        [shape] = [s for s in ur.budget_shapes(pdbs, READS["seeded-a"]["workloads"]) if s["object"].endswith("PodDisruptionBudget/inference-server")]
+        self.assertNotIn(" over ", shape["evidence"])
 
     def test_entry_1_is_high_on_a_drained_pool_held_or_not(self):
         def metric(op, name, value):
@@ -721,9 +750,23 @@ class ClassifierSignatureTest(unittest.TestCase):
         self.assertEqual(entries(rows[0]), {(1, ur.HIGH)})
         self.assertNotIn("drain held", rows[0]["classifications"][0]["detail"])
         # The captured operation carries GKE's own measure of the hold: read, and named as measured.
+        # The budget's spec (maxUnavailable 1) allows disruption; it sits at zero because three of its
+        # four replicas are Pending, so the detail and the mitigation point at the pods' own incident.
+        downstream = 'budget inference-server: spec {"maxUnavailable": 1} allows disruption; at zero because 3 of 4 covered pod(s) are not ready, the covered pods\' own incident'
         held = [s for s in symptoms_of("seeded-a") if s["category"] == "pdb"]
-        self.assertEqual(held[0]["classifications"][0]["detail"], "budget inference-server; drain held by the budget on pinned-inference-pool (NODE_PDB_DELAY_SECONDS 3598 s, measured by GKE)")
+        self.assertEqual(held[0]["classifications"][0]["detail"], f"{downstream}; drain held by the budget on pinned-inference-pool (NODE_PDB_DELAY_SECONDS 3598 s, measured by GKE)")
         self.assertIn("took 63 min over 1 node(s); NODE_PDB_DELAY_SECONDS 3598 s", held[0]["classifications"][0]["evidence"])
+        self.assertEqual((held[0]["budget_downstream"], held[0]["spec_forbids"], held[0]["not_ready"], held[0]["expected_pods"]), (True, False, 3, 4))
+        lines = ur.mitigation_lines(held[0], held[0]["classifications"][0])
+        self.assertEqual((lines["mitigate_before"], lines["mitigate_after"]), (ur.BUDGET_DOWNSTREAM_MITIGATE_BEFORE, ur.BUDGET_DOWNSTREAM_MITIGATE_AFTER))
+        self.assertTrue(lines["before_signal"].endswith(ur.BUDGET_DOWNSTREAM_BEFORE))
+        # A spec that forbids disruption keeps the catalogue's row: the budget is the thing to fix.
+        strict = copy.deepcopy(READS["seeded-a"]["pdbs"])
+        strict[0]["spec"]["maxUnavailable"] = 0
+        [row] = [s for s in symptoms_of("seeded-a", reads={**READS["seeded-a"], "pdbs": strict}) if s["category"] == "pdb"]
+        self.assertEqual((row["budget_downstream"], entries(row)), (False, {(1, ur.HIGH)}))
+        self.assertTrue(row["classifications"][0]["detail"].startswith("budget inference-server; drain held by the budget on pinned-inference-pool"))
+        self.assertEqual(ur.mitigation_lines(row, row["classifications"][0])["mitigate_before"], ur.MITIGATIONS[1]["mitigate_before"])
         # Over the hour with the metric at zero (a stockout, a slow boot): the budget held nothing.
         stockout = copy.deepcopy(ops_for("seeded-a"))
         metric(next(o for o in stockout if "pinned-inference-pool" in o["targetLink"]), ur.OPERATION_METRIC_PDB_DELAY, 0)
@@ -733,7 +776,7 @@ class ClassifierSignatureTest(unittest.TestCase):
         bare = copy.deepcopy(ops_for("seeded-a"))
         next(o for o in bare if "pinned-inference-pool" in o["targetLink"]).pop("progress")
         rows = [s for s in symptoms_of("seeded-a", ops=bare) if s["category"] == "pdb"]
-        self.assertEqual(rows[0]["classifications"][0]["detail"], "budget inference-server; drain held by the budget on pinned-inference-pool (estimated from the operation's duration, 63 min over 1 node(s); no progress metrics)")
+        self.assertEqual(rows[0]["classifications"][0]["detail"], f"{downstream}; drain held by the budget on pinned-inference-pool (estimated from the operation's duration, 63 min over 1 node(s); no progress metrics)")
         self.assertTrue(rows[0]["classifications"][0]["evidence"].endswith(f"over 1 node(s); {ur.NO_PROGRESS_METRICS_TEXT}"))
         # The pool autoscaled since: three nodes now, one upgraded. The metrics count the one.
         nodes = copy.deepcopy(READS["seeded-a"]["nodes"])
@@ -827,6 +870,52 @@ class ClassifierSignatureTest(unittest.TestCase):
         self.assertEqual(labels[("seeded-role", "pinned-inference")], {"pinned-inference-pool"})
         self.assertEqual(ur._selector_pools({"seeded-role": "pinned-inference"}, labels), {"pinned-inference-pool"})
         self.assertEqual(ur._selector_pools({"no-such-label": "x"}, labels), set())
+        # A label every node carries pins nothing.
+        self.assertEqual(ur._selector_pools({"kubernetes.io/os": "linux"}, labels), set())
+        nodes = READS["seeded-a"]["nodes"]
+        # The same pin spelled as a required nodeAffinity term, on the pool label or on the custom
+        # label: read like the selector, so only the pinned pool's operation opens the gate.
+        for key, value in (("cloud.google.com/gke-nodepool", "pinned-inference-pool"), ("seeded-role", "pinned-inference")):
+            gpu = pod("trainer", scheduled_message="0/4 nodes are available: 1 Insufficient nvidia.com/gpu, 3 node(s) didn't match Pod's node affinity/selector.")
+            gpu["spec"]["affinity"] = {"nodeAffinity": {"requiredDuringSchedulingIgnoredDuringExecution": {"nodeSelectorTerms": [{"matchExpressions": [{"key": key, "operator": "In", "values": [value]}]}]}}}
+            self.assertEqual(ur.pod_pins(gpu["spec"]), [{key: [value]}])
+            [row] = symptoms_of("seeded-a", reads={"pods": [gpu], "nodes": nodes, "events": [], "pdbs": []}, ops=pools_only_default)
+            self.assertEqual(entries(row), {(18, ur.MEDIUM)}, key)
+            self.assertIn(ur.GATE_CLOSED_TEXT, row["classifications"][0]["detail"])
+            [row] = symptoms_of("seeded-a", reads={"pods": [gpu], "nodes": nodes, "events": [], "pdbs": []}, ops=pinned_only)
+            self.assertEqual(entries(row), {(18, ur.HIGH)}, key)
+        # Several terms are alternatives; a term's expressions and the nodeSelector are conjoined.
+        spec = {"nodeSelector": {"seeded-role": "pinned-inference"}, "affinity": {"nodeAffinity": {"requiredDuringSchedulingIgnoredDuringExecution": {"nodeSelectorTerms": [{"matchExpressions": [{"key": "cloud.google.com/gke-nodepool", "operator": "In", "values": ["default-pool", "idle-batch-pool"]}]}, {"matchExpressions": [{"key": "kubernetes.io/arch", "operator": "In", "values": ["amd64"]}, {"key": "x", "operator": "Exists"}]}]}}}}
+        self.assertEqual(ur.pod_pins(spec), [{"cloud.google.com/gke-nodepool": ["default-pool", "idle-batch-pool"], "seeded-role": ["pinned-inference"]}, {"kubernetes.io/arch": ["amd64"], "seeded-role": ["pinned-inference"]}])
+        self.assertEqual(ur._pinned_pools(ur.pod_pins(spec), labels), {"pinned-inference-pool"})
+        # A pod pinned only by a label every node carries counts any upgraded pool, as an unpinned one.
+        plain = pod("web", scheduled_message="0/4 nodes are available: 4 Insufficient cpu.", node_selector={"kubernetes.io/os": "linux"})
+        [row] = symptoms_of("seeded-a", reads={"pods": [plain], "nodes": nodes, "events": [], "pdbs": []}, ops=pools_only_default)
+        self.assertEqual(entries(row), {(2, ur.HIGH)})
+        # An event charged to an owner whose template pins through affinity reads the owner's pin.
+        workloads = copy.deepcopy(READS["seeded-a"]["workloads"])
+        payments = next(w for w in workloads if w["metadata"]["name"] == "payments-api")
+        payments["spec"]["template"]["spec"]["affinity"] = {"nodeAffinity": {"requiredDuringSchedulingIgnoredDuringExecution": {"nodeSelectorTerms": [{"matchExpressions": [{"key": "cloud.google.com/gke-nodepool", "operator": "In", "values": ["pinned-inference-pool"]}]}]}}}
+        pods = [p for p in READS["seeded-a"]["pods"] if "payments-api" not in p["metadata"]["name"]]
+        events = [event("FailedScheduling", "0/4 nodes are available: 4 Insufficient cpu.", name="payments-api-79b77b8c67-gone1", namespace="seeded-debug")]
+        [row] = by_object(symptoms_of("seeded-a", reads={**READS["seeded-a"], "pods": pods, "workloads": workloads, "events": events}, ops=pools_only_default), PAYMENTS)
+        self.assertIn(ur.GATE_CLOSED_TEXT, row["classifications"][0]["detail"])
+        self.assertEqual((entries(row), row["node_pins"]), ({(2, ur.MEDIUM)}, [{"cloud.google.com/gke-nodepool": ["pinned-inference-pool"]}]))
+
+    def test_cluster_universal_selector_does_not_link_a_budget_to_every_pool(self):
+        # Every covered replica unplaced and pinned only by `kubernetes.io/os: linux`, the template too:
+        # the label names every pool, so it names none, and the drain that was running when the
+        # displaced replicas were created is the budget's pool evidence.
+        pods = copy.deepcopy(READS["seeded-a"]["pods"])
+        for p in pods:
+            if p["metadata"]["name"].startswith("inference-server"):
+                p["spec"]["nodeSelector"], p["spec"]["nodeName"] = {"kubernetes.io/os": "linux"}, None
+        workloads = copy.deepcopy(READS["seeded-a"]["workloads"])
+        next(w for w in workloads if w["metadata"]["name"] == "inference-server")["spec"]["template"]["spec"]["nodeSelector"] = {"kubernetes.io/os": "linux"}
+        rows = [s for s in symptoms_of("seeded-a", reads={**READS["seeded-a"], "pods": pods, "workloads": workloads}) if s["category"] == "pdb"]
+        self.assertEqual([(r["pools"], r["upgraded_pools"]) for r in rows], [(["pinned-inference-pool"], ["pinned-inference-pool"])])
+        self.assertNotIn("default-pool", rows[0]["classifications"][0]["evidence"])
+
 
     def test_pre_existing_sibling_proves_an_ambiguous_rows_age(self):
         # One replica crash-looping on an untouched pool since before the window, one recreated by the
@@ -1577,6 +1666,48 @@ class LedgerAndGuardsTest(unittest.TestCase):
             with contextlib_suppress(ValueError, OSError):
                 held.close()
 
+    def test_lock_is_read_only_world_readable_and_only_contention_is_retried(self):
+        store = self.home / "nested" / "store"
+        lock_path = store / ur.LOCK_FILENAME
+        # Under a hardened umask the lock is still 0644 and the store's directories 0777: a root
+        # hand run must not leave files or directories the uid-1000 tick cannot open or write.
+        mask = os.umask(0o077)
+        try:
+            held = ur.acquire_lock(lock_path)
+        finally:
+            os.umask(mask)
+        self.assertIsNotNone(held)
+        self.assertFalse(held.writable())
+        self.assertEqual((stat.S_IMODE(lock_path.stat().st_mode), stat.S_IMODE(store.stat().st_mode), stat.S_IMODE((self.home / "nested").stat().st_mode)), (ur.LOCK_FILE_MODE, ur.STORE_DIR_MODE, ur.STORE_DIR_MODE))
+        held.close()
+        # A lock file left read-only by another uid still opens: flock(2) needs no writable descriptor.
+        lock_path.chmod(0o444)
+        again = ur.acquire_lock(lock_path)
+        self.assertIsNotNone(again)
+        again.close()
+        # Only contention is retried: a filesystem that refuses flock raises at once, without a wait,
+        # rather than spending the budget and blaming a run that does not exist.
+        slept = []
+        with mock.patch.object(ur.fcntl, "flock", side_effect=OSError(errno.ENOLCK, "No locks available")):
+            with self.assertRaises(OSError) as caught:
+                ur.acquire_lock(lock_path, sleep=slept.append, clock=lambda: 0.0)
+        self.assertEqual((caught.exception.errno, slept), (errno.ENOLCK, []))
+        # The store's files follow the same rule.
+        mask = os.umask(0o077)
+        try:
+            ur.write_json_atomically(store / "deep" / "doc.json", {"a": 1})
+        finally:
+            os.umask(mask)
+        self.assertEqual(stat.S_IMODE((store / "deep").stat().st_mode), ur.STORE_DIR_MODE)
+
+    def test_api_disabled_project_is_empty_for_operations_too(self):
+        ops, error = ur.list_operations("no-gke-project", SINCE, run=lambda argv, **kw: run_of(1, "", API_OFF_STDERR.format(project="no-gke-project", api="operations")))
+        self.assertEqual((ops, error), ([], None))
+        result, _ = self.collect(FakeFleet(api_off=["no-gke-project"]), project=[PROJECT, "no-gke-project"])
+        self.assertEqual((result["failed_reads"], result["operations_unread"], result["projects"]), ([], [], [PROJECT, "no-gke-project"]))
+        self.assertEqual(ur.load_json(self.home / ur.LEDGER_FILENAME, {})[ur.LEDGER_PROJECTS_KEY], [PROJECT, "no-gke-project"])
+        self.assertNotIn(ur.INFO_FAILED_READS, ur.render_report(result))
+
     def test_after_upgrade_run_that_waited_prints_nothing_when_already_reviewed(self):
         # The Sunday run recorded every operation; an after-upgrade wake that lands in the same minute
         # waits for the lock, then finds its operations reviewed and prints nothing.
@@ -2175,6 +2306,13 @@ class LedgerAndGuardsTest(unittest.TestCase):
                 self.assertEqual(ur.main(["--full", "--project", PROJECT, "--no-report"]), ur.EXIT_USAGE)
             self.assertIn("sits beside no live state file", err.getvalue())
             self.assertFalse((self.home / ur.LEDGER_FILENAME).exists())
+            # --dry-run lists the records and moves none; the block stands.
+            with redirect_stdout(io.StringIO()) as out:
+                self.assertEqual(ur.main(["--reset-ledger", "--dry-run"]), 0)
+            [record] = list(self.home.glob(ur.CRASH_RECORD_GLOB))
+            self.assertIn(f"would archive 1 crash record(s) under {self.home / ur.ARCHIVE_SUBDIR}", out.getvalue())
+            self.assertIn(record.name, out.getvalue())
+            self.assertFalse((self.home / ur.ARCHIVE_SUBDIR).exists())
             with redirect_stdout(io.StringIO()) as out:
                 self.assertEqual(ur.main(["--reset-ledger"]), 0)
             self.assertIn("archived 1 crash record(s)", out.getvalue())
@@ -3004,7 +3142,8 @@ class ManifestTest(unittest.TestCase):
         self.assertTrue(unclassified["command"].endswith(" kubectl get pods -A -o json"))
         budget = next(c for c in seeded["candidates"] if c["object"] == "PodDisruptionBudget/inference-server")
         self.assertEqual((budget["check"], budget["severity"], budget["namespace"]), (ur.CHECK_BROKE_WORKLOAD, ur.MANIFEST_SEVERITY_MAJOR, "seeded-capacity"))
-        self.assertIn("Mitigate before: Give the budget room", budget["impact"])
+        self.assertIn(f"Mitigate before: {ur.BUDGET_DOWNSTREAM_MITIGATE_BEFORE}", budget["impact"])
+        self.assertNotIn("Give the budget room", budget["impact"])
         self.assertEqual(seeded["facts"]["versions_after"]["control_plane"], "1.35.8-gke.1380001")
         self.assertEqual(len(seeded["facts"]["operations"]), 4)
         self.assertEqual(manifest["partial"], False)
@@ -3136,6 +3275,14 @@ class ManifestTest(unittest.TestCase):
         ids = [self.audit_report.derive_finding_id(f) for f in document["findings"]]
         self.assertEqual(len(ids), len(set(ids)))
         self.audit_report.cross_check_manifest(document, manifest)
+
+    def test_api_disabled_project_does_not_make_the_run_partial(self):
+        result, _ = self.collect(FakeFleet(api_off=["no-gke-project"]), project=[PROJECT, "no-gke-project"])
+        manifest = json.loads(Path(result["manifest_path"]).read_text())
+        self.assertFalse(manifest["partial"])
+        self.assertEqual([c["name"] for c in manifest["clusters"]], [GEMMA, SEEDED])
+        self.assertEqual(manifest["fleet"], [PROJECT, "no-gke-project"])
+        self.audit_report.cross_check_manifest(self.document_from(manifest), manifest)
 
     def test_dry_run_and_no_flag_write_no_manifest(self):
         result, _ = self.collect(manifest_file=None)
