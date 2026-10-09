@@ -41,6 +41,11 @@ const (
 	// bridge remembers; past it the memory is cleared, and a failed PUT is
 	// then reported as lost, as it is after a restart.
 	routeMemoryMax = 4096
+	// routeMemoryTTL is how long a remembered record is trusted to still be
+	// in the store. session-kv prunes a route row 14 days after its last
+	// write (CLEANUP_TTL_DAYS in session_kv_server.py), and only a successful
+	// PUT refreshes it, so a day leaves a wide margin.
+	routeMemoryTTL = 24 * time.Hour
 	// routeLostNote follows a completed answer whose route could not be
 	// recorded, so the user is told rather than left waiting for a card's
 	// answer that cannot arrive.
@@ -118,22 +123,35 @@ func (b *Bridge) recordRoute(ctx context.Context, sessionID string, env *lib.Env
 	return nil
 }
 
-// recordedRoute is the route sessionID last recorded in this process, or the
-// zero route.
+// rememberedRoute is a route this process recorded and when it did.
+type rememberedRoute struct {
+	route conversationRoute
+	at    time.Time
+}
+
+// routeNow is the clock route memory is aged by; tests replace it.
+var routeNow = time.Now
+
+// recordedRoute is the route sessionID last recorded in this process within
+// routeMemoryTTL, or the zero route.
 func (b *Bridge) recordedRoute(sessionID string) conversationRoute {
 	b.routesMu.Lock()
 	defer b.routesMu.Unlock()
-	return b.routes[sessionID]
+	r, ok := b.routes[sessionID]
+	if !ok || routeNow().Sub(r.at) >= routeMemoryTTL {
+		return conversationRoute{}
+	}
+	return r.route
 }
 
-// rememberRoute notes route as sessionID's recorded route.
+// rememberRoute notes route as sessionID's recorded route, as of now.
 func (b *Bridge) rememberRoute(sessionID string, route conversationRoute) {
 	b.routesMu.Lock()
 	defer b.routesMu.Unlock()
 	if b.routes == nil || len(b.routes) >= routeMemoryMax {
-		b.routes = make(map[string]conversationRoute)
+		b.routes = make(map[string]rememberedRoute)
 	}
-	b.routes[sessionID] = route
+	b.routes[sessionID] = rememberedRoute{route: route, at: routeNow()}
 }
 
 // putRoute writes route against sessionID in the store.
