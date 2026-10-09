@@ -108,8 +108,8 @@ nightly evaluation case, registered where the column names one that grades the e
 tables under "How each failure is tested" say row by row whether its fixture exists, so the column
 repeats neither. The
 in-review items are the one part of this section that changes as work merges; the column was last
-reconciled on 2026-10-09. The fourth table states, per entry, what the two scheduled readers of the
-upgrade initiative cover and what is left to build.
+reconciled on 2026-10-09. The fourth table states, per entry, what the daily readiness watch and the
+upgrade retrospective cover and what is left to build.
 
 ### A scheduled audit files it, without anyone asking
 
@@ -148,39 +148,45 @@ upgrade initiative cover and what is left to build.
 
 ### Gap to scheduled coverage
 
-The goal is that every entry is caught without a request, by one of two scheduled readers: the
-daily `upgrade-readiness-watch` before an upgrade (it runs the readiness report's rules, in review),
-and the `upgrade-retrospective` after one (its collector matches symptoms to this list, in review).
-This table says, per entry, what each reader covers on `main` or in review and what is left to
-build. "Rule" is a readiness rule in `upgrade_readiness.py`; "signature" is a row in the
-retrospective's table. A fixture marked designed exists on a fixture branch and not on `main`.
+The goal is that every entry is caught without a request. Two scheduled readers do that. The daily
+job `upgrade-readiness-watch` (#2708, in review) runs the readiness report's rules before an
+upgrade. The weekly job `upgrade-retrospective` (collector #2729 and design #2722, in review) runs
+after one; its collector matches symptoms to this list, and it also reads a set of risk shapes on
+every cluster it reviews and writes them as guards for the readiness watch to print. "Rule" means a
+rule in `upgrade_readiness.py`, run daily with the target version known. "Signature" means a row in
+the retrospective's symptom table. "Shape" means one of the collector's static risk reads. The
+tables under "How each failure is tested" own which fixtures exist.
 
-| Entry | Before: daily readiness watch                                         | After: upgrade retrospective                              | To build                                                                                                |
-| ----- | --------------------------------------------------------------------- | --------------------------------------------------------- | ------------------------------------------------------------------------------------------------------- |
-| 1     | Budget rule shipped; the watch runs it (#2708).                       | Signature: a budget with no allowance on a drained node.  | Nothing once the watch and the collector merge.                                                         |
-| 2     | No rule: surge settings and headroom are not read.                    | Signature: Pending for capacity after a pool operation.   | Rule: pools whose surge or unavailability setting plus headroom cannot hold the displaced pods.         |
-| 3     | None; the daily obtainability audit files it separately.              | No signature.                                             | Signature: every replica of a workload unavailable during one pool operation; the rule stays the audit. |
-| 4     | No rule.                                                              | No signature; the loss leaves no symptom to read.         | Rule: workloads whose data lives in `emptyDir`, local SSD or `hostPath`. Fixture designed.              |
-| 5     | Maintenance rule shipped; the watch runs it.                          | No signature.                                             | Signature: a pool two versions apart for days after a window closed.                                    |
-| 6     | GitOps scan on request only; audit-log stamps read in conversation.   | Signature: `no matches for kind`, a removed API named.    | Rule: the audit log's `k8s.io/removed-release` stamps for the target minor, through the allowed read.   |
-| 7     | Webhook rule in review (#2194).                                       | Signature: `failed calling webhook`.                      | Nothing once #2194, the watch and the collector merge.                                                  |
-| 8     | No rule: nothing reads a namespace's admission pin.                   | No signature.                                             | Rule: namespaces whose admission labels differ from the target minor's default, from a per-minor table. |
-| 9     | No rule: `k8s.io/deprecated` stamps read in conversation.             | No signature; nothing breaks yet.                         | Rule: the audit log's deprecated-API stamps per caller, the same read as entry 6.                       |
-| 10    | Pool skew rule shipped; client and add-on skew not read.              | No signature.                                             | Rule: audit-log user agents and add-on versions outside the target's supported range. Fixture designed. |
-| 11    | No rule; the inventory records the location.                          | No signature.                                             | Rule: a zonal control plane, with the retry advice, on every readiness report.                          |
-| 12    | No rule.                                                              | Signature: a selector miss, tentative without the table.  | Rule and the collector's table: selectors naming a label the target minor drops. Fixture designed.      |
-| 13    | Monday audit flags a stale image type; the socket client is not read. | No signature.                                             | Rule: pods mounting the container engine's socket on pools whose image type changes. Fixture designed.  |
-| 14    | No rule.                                                              | Signature: `OOMKilled` on a cgroup v2 pool, old runtime.  | Rule: images below the runtime floor on pools that move to cgroup v2, from the collector's table.       |
-| 15    | No rule.                                                              | Signature: `OOMKilled` with several processes.            | Rule: containers whose command runs a supervisor; the collector's process read stays the after signal.  |
-| 16    | Monday drift audit compares dataplanes; behaviour not read as a risk. | No signature.                                             | Rule: clusters whose dataplane changes at the target and carry network policies. Fixture exists.        |
-| 17    | No rule; the compliance audit flags host networking as security.      | Signature: nodes `NotReady` after a pool operation.       | Rule: host-network DaemonSets pinned to node labels or kernel modules the target image changes.         |
-| 18    | No rule; the upgrade plan hands the check to the operator.            | Signature: driver and CUDA errors.                        | Rule: GPU workloads whose CUDA build the target image's driver does not support, from a table.          |
-| 19    | No rule.                                                              | Signature: volume node affinity, attach and mount errors. | Rule: in-tree persistent disks on clusters with the CSI add-on off. Fixture designed.                   |
-| 20    | No rule; the compliance audit reads floating tags, not retired hosts. | Signature: a pull failure on rebuilt nodes only.          | Rule: images on retired registry hosts, from a table. Fixture designed.                                 |
+| Entry | Before: daily readiness watch                                         | After: upgrade retrospective                                             | To build                                                                                                   |
+| ----- | --------------------------------------------------------------------- | ------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------- |
+| 1     | Budget rule shipped; the watch runs it.                               | Signature: a budget with no allowance on a drained node.                 | Nothing once the watch and the collector merge.                                                            |
+| 2     | No rule: surge settings and headroom are not read.                    | Signature: Pending for capacity after a pool operation.                  | Rule: a pool whose surge or unavailability setting and headroom cannot hold the pods it displaces.         |
+| 3     | None; the daily obtainability audit files it on its own schedule.     | No signature; the design excludes it today.                              | Signature: every replica of a workload unavailable during one pool operation (a design change).            |
+| 4     | No rule.                                                              | No signature; shape: stateful `emptyDir` and local SSD volumes.          | Rule on the same shape, daily, with the target known; the watch prints the collector's guard too.          |
+| 5     | Maintenance rule shipped; the watch runs it.                          | No signature; the design excludes it today.                              | Signature: a pool two versions apart for a day after a window closed (a design change).                    |
+| 6     | GitOps scan on request only; audit-log stamps read in conversation.   | Signature: `no matches for kind`, a removed API named.                   | Rule: the audit log's `k8s.io/removed-release` stamps for the target minor. No standing fixture.           |
+| 7     | Webhook rule in review (#2194).                                       | Signature: `failed calling webhook`.                                     | Nothing once #2194, the watch and the collector merge.                                                     |
+| 8     | No rule: nothing reads a namespace's admission pin.                   | No signature.                                                            | Rule: namespaces on `latest` or unpinned whose enforcement changes at the target minor, from a table.      |
+| 9     | No rule: `k8s.io/deprecated` stamps read in conversation.             | No signature; nothing breaks yet.                                        | Rule: the audit log's deprecated-API stamps per caller, the same read as entry 6.                          |
+| 10    | Pool skew rule shipped; client and add-on skew not read.              | No signature.                                                            | Rule: audit-log user agents and add-on versions outside the target's supported range (a `logs` read).      |
+| 11    | No rule; the inventory records the location.                          | No signature.                                                            | Rule: a zonal control plane, with the retry advice, on every readiness report.                             |
+| 12    | No rule.                                                              | Signature: a selector miss; shape: deprecated label prefixes.            | Rule: selectors naming a label the target minor drops, from the shared table.                              |
+| 13    | Monday audit flags a stale image type; the socket client is not read. | No signature; shape: a DaemonSet mounting the container engine socket.   | Rule: socket mounts on pools whose target node image ships a different containerd major.                   |
+| 14    | No rule.                                                              | Signature: `OOMKilled` on a cgroup v2 pool; shape: old runtime images.   | Rule: images below the runtime floor on pools that move to cgroup v2 at the target, from the shared table. |
+| 15    | No rule.                                                              | Signature: `OOMKilled` on a cgroup v2 pool, reported as 14 or 15.        | Rule: a heuristic on commands that run a supervisor; the process count is not readable from the API.       |
+| 16    | Monday drift audit compares dataplanes; enforcement not read as risk. | No signature.                                                            | Rule: policies present but not enforced, which start to apply when enforcement turns on.                   |
+| 17    | No rule; the compliance audit flags host networking as security.      | Signature: nodes `NotReady`; shape: `hostNetwork` DaemonSets.            | Rule: host-network DaemonSets tied to node labels or kernel modules the target image changes.              |
+| 18    | No rule; the upgrade plan hands the check to the operator.            | Signature: driver and CUDA errors; shape: CUDA pins on GPU workloads.    | Rule: CUDA builds the target image's driver does not support, from the shared table.                       |
+| 19    | No rule.                                                              | Signature: volume affinity, attach and mount errors; shape: in-tree PDs. | Rule: in-tree persistent disks on clusters with the CSI add-on off, blocking for the bound workloads.      |
+| 20    | No rule; the compliance audit reads floating tags, not retired hosts. | Signature: a pull failure on rebuilt nodes only; shape: retired hosts.   | Rule: images on retired registry hosts, from the shared table.                                             |
 
-Every rule lands with its unit tests and a nightly case graded on a declared line, and runs under
-the daily watch with no further wiring; every signature lands in the collector with a test on a
-captured fixture. The rows move to the tables above as the work merges.
+Three things cross every row. The fact tables (dropped labels, runtime floors, retired hosts,
+driver and CUDA support) get one module in the `fleet-upgrade-verification` skill that the rules
+and the collector's shapes both read. The watch reading the collector's guards is its own change,
+after the collector merges. Every rule lands with unit tests and a nightly case graded on a declared
+line where a fixture can stand; entry 6 has none, so its rule is covered by a captured log sample
+and entry 9's case. As the work merges, a cell here becomes "Nothing" and the entry's row above moves
+to the reader that files it.
 
 ## The list
 
