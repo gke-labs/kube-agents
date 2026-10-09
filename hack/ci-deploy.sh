@@ -276,8 +276,8 @@ readonly BRIDGE_SIDECAR_NAME="hermes-bridge"
 # The lane runs the bridge's shipped default executor, api, the one a customer
 # install runs. Nothing here sets it: with the operator's A2A_BRIDGE_EXECUTOR
 # unset the rendered bridge carries no BRIDGE_EXECUTOR, and the bridge picks
-# api when BRIDGE_EXECUTOR is unset and the API_SERVER_KEY it copies from the
-# agent container is present (bridgeExecutor in a2a/cmd/hermes-bridge/main.go).
+# api when BRIDGE_EXECUTOR is unset and the API_SERVER_KEY the operator sets on
+# it is present (bridgeExecutor in a2a/cmd/hermes-bridge/main.go).
 # A bridge without the key falls back to cli with a warning, so the start-line
 # wait below requires this executor rather than trusting the default. Under api
 # a task is a turn in the pod's Hermes API server, whose profile is the chat
@@ -414,11 +414,12 @@ readonly A2A_CALLOUT_IMAGE_ENV_VAR="A2A_CALLOUT_IMAGE"
 readonly A2A_WORKER_IMAGE_ENV_VAR="A2A_WORKER_IMAGE"
 readonly A2A_VERIFIER_IMAGE_ENV_VAR="A2A_VERIFIER_IMAGE"
 readonly A2A_CONSOLE_IMAGE_ENV_VAR="A2A_CONSOLE_IMAGE"
-# Two of the rendered bridge's three operator settings (a2aBridgeImageEnvVar
+# Two of the rendered bridge's four operator settings (a2aBridgeImageEnvVar
 # and a2aBridgeConcurrencyOperatorEnvVar in platformagent_a2a_bridge.go): its
 # image and its BRIDGE_CONCURRENCY. The operator reads them from its own
 # environment, as it does the overrides above; no CR field carries them. The
-# third, A2A_BRIDGE_EXECUTOR, is left unset (BRIDGE_EXECUTOR_EXPECTED says why).
+# third, A2A_BRIDGE_EXECUTOR, is left unset (BRIDGE_EXECUTOR_EXPECTED says why),
+# and so is the fourth, A2A_BRIDGE_RESOURCES, so the lane runs the default sizing.
 readonly A2A_BRIDGE_IMAGE_ENV_VAR="A2A_BRIDGE_IMAGE"
 readonly A2A_BRIDGE_CONCURRENCY_ENV_VAR="A2A_BRIDGE_CONCURRENCY"
 # Named only for the diagnosis when the bridge logs another executor.

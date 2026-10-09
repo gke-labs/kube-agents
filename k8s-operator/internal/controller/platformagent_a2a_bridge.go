@@ -98,8 +98,9 @@ const (
 
 	// a2aBridgeResourcesOperatorEnvVar overrides the rendered bridge's
 	// resources: a corev1.ResourceRequirements in JSON, used whole. Unset, or
-	// not one the operator can read, the bridge gets
-	// a2aRenderedBridgeDefaultResources.
+	// not one the operator can use, the bridge gets
+	// a2aRenderedBridgeDefaultResources under api and a copy of the agent
+	// container's under cli (a2aRenderedBridgeResources).
 	a2aBridgeResourcesOperatorEnvVar = "A2A_BRIDGE_RESOURCES"
 
 	// a2aBridgeConcurrencyOperatorEnvVar sets the rendered bridge's
@@ -111,7 +112,7 @@ const (
 
 	// a2aBridgeExecutorOperatorEnvVar pins the rendered bridge's
 	// BRIDGE_EXECUTOR. Unset, the bridge's shipped default decides (api,
-	// since the agent's API_SERVER_KEY is copied), and the next eval lane
+	// since the operator sets the bridge's API_SERVER_KEY), and the next eval lane
 	// leaves it unset so it measures that default.
 	a2aBridgeExecutorOperatorEnvVar = "A2A_BRIDGE_EXECUTOR"
 
@@ -456,8 +457,15 @@ func a2aBridgeResourcesRefusal(r corev1.ResourceRequirements) error {
 	if len(r.Claims) > 0 {
 		return fmt.Errorf("claims are not supported on the bridge")
 	}
-	for side, list := range map[string]corev1.ResourceList{"request": r.Requests, "limit": r.Limits} {
-		for name, q := range list {
+	// Requests before limits, names in order, so a value with two faults is
+	// always refused for the same one.
+	for _, sl := range []struct {
+		side string
+		list corev1.ResourceList
+	}{{"request", r.Requests}, {"limit", r.Limits}} {
+		side, list := sl.side, sl.list
+		for _, name := range sortedResourceNames(list) {
+			q := list[name]
 			if !slices.Contains(credentialProxyResourceNames, name) {
 				return fmt.Errorf("%s is not cpu, memory or ephemeral-storage", name)
 			}

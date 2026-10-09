@@ -428,8 +428,9 @@ against the stream the Job created. The rendered bridge carries the agent contai
 environment, mounts and security context, copied by the operator from the agent
 container it renders (its resources are its own, sized for the `api` executor the lane runs, gke-labs/kube-agents#2748): the bridge's `cli` subprocess stands in for the `hermes chat -q` a kanban worker spawns
 inside the agent container, and that is the environment such a worker inherits; under the
-default `api` executor the same copy is what carries `API_SERVER_KEY` into the bridge, which is
-how the lane gets `api` without setting `A2A_BRIDGE_EXECUTOR`. The
+default `api` executor the operator sets `API_SERVER_KEY` on the bridge itself (the loopback
+bearer, not a copy, gke-labs/kube-agents#2753), which is how the lane gets `api` without setting
+`A2A_BRIDGE_EXECUTOR`. The
 operator adds `A2A_ACTIVITY_SECRET` from the creds Secret's `bridge-activity-key` itself. The one
 mount not carried is the projected bus token, the agent principal's credential. The
 third piece was decided the same day and is built: a look-ahead in the bridge's worker that
