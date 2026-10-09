@@ -66,7 +66,17 @@ What the manifest covers, so you can check an existing app instead:
 - **Events.** The gateway reads messages only: `message.im` for DMs, and `message.channels`, `message.groups` and `message.mpim` for public, private and group channels. Each event needs its history scope (`im:history`, `channels:history`, `groups:history`, `mpim:history`); without it the app connects normally and is never sent the message. In a channel the gateway answers only a message that mentions the app, or a reply in a thread it is already answering; it finds mentions in the message text, so `app_mention` is not needed.
 - **Scopes.** `chat:write` covers every post and edit the gateway makes. `channels:read`, `groups:read`, `im:read` and `mpim:read` read who is in a conversation. A reply goes into the conversation or thread the message came from, so no other scope is needed, in a DM either.
 - **Messages tab.** Without it, members cannot DM the app.
-- **No slash commands and no interactivity.** The gateway does not acknowledge them, so a member who used one would see Slack's timeout error. If you are moving an app from `today`, remove its slash commands and turn interactivity off.
+- **No slash commands and no interactivity.** The gateway does not acknowledge them, so a member who used one would see Slack's timeout error.
+
+### Moving an existing app to `next`
+
+An app made for `today` from the `hermes slack manifest` output already has every scope and event the gateway needs, so it keeps its tokens and needs no new install. Edit it rather than pasting the manifest above, which would rename the app and drop the scopes `today` needs if you switch back:
+
+1. After the switch, open the app's **App Manifest** page.
+2. Delete the `features.slash_commands` block, and set `settings.interactivity.is_enabled` to `false`.
+3. Save. The edit changes no scopes; if Slack still asks you to reinstall, do so.
+
+Do it after the switch rather than before, because the `today` listener answers both until then. Until you do, a slash command or a button click under `next` shows the member Slack's timeout error. Switching back to `today` means putting both back, which the full manifest from `hermes slack manifest` does.
 
 ### For `spec.mode: today` (the Hermes listener)
 
@@ -90,6 +100,15 @@ The Hermes listener needs more than the gateway: slash commands, reactions, file
 Pass them to the installer as `--slack-bot-token` and `--slack-app-token`. Under `next`, give exactly one bot token: the gateway cannot use a comma-separated list.
 
 Once the app is installed, invite it to any channel it should answer in, using the bot's display name from the manifest (`/invite @kube-agents` for the manifest above). It receives a channel's messages only once it is a member; DMs need no invite.
+
+## Home channel
+
+The home channel is where the agent posts unprompted: alerts, scheduled reports, and the fleet audit's report card.
+
+- **`next`:** only the resource field counts, `spec.integration.slack.homeChannel`, which the installer sets from `SLACK_HOME_CHANNEL` (`--slack-home-channel`). It must be a channel ID (`C0123ABCD`, or `G…` for a private channel), not a name: open the channel's details and copy the **Channel ID** at the bottom. Invite the app to that channel, or its posts are refused. With the field unset or not a channel ID, the agent posts nothing to Slack unprompted, though it still answers in the conversation you asked in. `/sethome` does not reach it.
+- **`today`:** the field, or `/sethome` (`/hermes sethome`) run in the channel you want, which writes the Planning Agent's profile. [`INSTALL.md` Step 5](https://github.com/gke-labs/kube-agents/blob/main/INSTALL.md#2-slack-configuration-slack_enabledtrue) has the detail.
+
+A home channel set with `/sethome` under `today` does not carry over to `next`. Before or at the switch, set `SLACK_HOME_CHANNEL` in `install.env` to that channel's ID and re-run the installer.
 
 ## Allowed users
 
