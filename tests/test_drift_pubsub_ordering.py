@@ -143,6 +143,10 @@ _LOCALS = "locals"
 _LOCALS_LABELS = 0
 _MODULE_REFERENCE = r"module\.([A-Za-z0-9_-]+)"
 _LOCAL_REFERENCE = r"local\.([A-Za-z0-9_-]+)"
+_DOT = "."
+# A following `=` or `>` means the `=` just matched was half of `==` or `=>`,
+# not an assignment.
+_NOT_AN_ASSIGNMENT = ("=", ">")
 
 # The composition's half of the ordering, which the module cannot express.
 # gke_cluster names drift_pubsub so that Terraform, destroying dependents
@@ -308,11 +312,22 @@ def _locals_definitions(tokens: list) -> dict:
         flat = [(token, depth) for token, depth in body]
         current, start = None, 0
         for index, ((kind, value), depth) in enumerate(flat):
+            after = flat[index + 1][0] if index + 1 < len(flat) else None
+            beyond = flat[index + 2][0] if index + 2 < len(flat) else None
+            previous = flat[index - 1][0] if index else None
             opens = (
                 depth == 1
                 and kind == _WORD
-                and index + 1 < len(flat)
-                and flat[index + 1][0][1] == _EQUALS
+                # `var.model_provider == "x"` is not an entry named
+                # model_provider: the tokenizer emits `==` as two `=`, and the
+                # name half is the tail of a dotted reference. Both halves of
+                # that have to be excluded, and missing either one truncates
+                # the real entry's value at the comparison -- which hides any
+                # reference after it, the shape a ternary puts there.
+                and (previous is None or previous[1] != _DOT)
+                and after is not None
+                and after[0] == _EQUALS
+                and (beyond is None or beyond[1] not in _NOT_AN_ASSIGNMENT)
             )
             if not opens:
                 continue
