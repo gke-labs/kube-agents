@@ -1023,6 +1023,22 @@ class StageTest(unittest.TestCase):
         self.assertEqual(log.count("subprocess stderr"), 2)
         self.assertEqual(log.count("subprocess stdout"), 2)
 
+    def test_a_stage_log_that_cannot_open_still_runs_the_stages_unheard(self):
+        def speaks(_d, *_rest):
+            print("scan chatter")
+
+        self.scan.side_effect = speaks
+        self.deliver.return_value = 0
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(oobe, "_open_stage_log", side_effect=PermissionError("read-only")), mock.patch.object(
+            oobe, "first_run_audits"
+        ) as audits, contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            self.assertEqual(oobe.main(self.d, now=NOW_SETTLED), 0)
+        self.scan.assert_called_once()
+        audits.assert_called_once()
+        self.assertEqual(out.getvalue(), "")
+        self.assertNotIn("scan chatter", err.getvalue())
+
     def test_the_stage_log_is_rotated_past_its_cap(self):
         log = self.d / oobe.STAGE_LOG
         log.parent.mkdir(parents=True)

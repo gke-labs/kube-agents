@@ -912,9 +912,15 @@ class ArmDisarmTest(unittest.TestCase):
             [sys.executable, "-"], input=code, env=self._env, capture_output=True, text=True, timeout=60
         )
 
+    def test_arm_needs_only_oobe_and_records_the_disabled_entries_present(self):
+        self._jobs([_DELIVERY])
+        out = self._py(self._arm)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertEqual(json.loads((self._home / ".bench-onboarding-jobs.json").read_text())["jobs"], [_DELIVERY])
+
     def test_arm_refuses_a_missing_paused_or_bound_job_and_changes_nothing(self):
         for jobs, message in (
-            ([_SCAN], "oobe are not in the cron store"),
+            ([_SCAN], "oobe is not in the cron store"),
             ([_SCAN, {**_DELIVERY, "enabled": False}], "oobe is paused"),
             ([_SCAN, {**_DELIVERY, "state": "paused"}], "oobe is paused"),
             ([_SCAN, {**_DELIVERY, "paused_at": "t0"}], "oobe is paused"),

@@ -13,8 +13,8 @@ The design is ``docs/designs/oobe.md``. Each tick runs three stages in order:
    cost), one after another.
 
 Delivery's stdout is the report, and the scheduler posts whatever this job prints to
-that chat, and a non-zero exit as a failure. So the other two stages run with stdout
-sent to stderr, their subprocesses' included, and an exception in either is logged
+that chat, and a failed run with its stderr. So the other two stages write to
+``logs/oobe.log``, their subprocesses' included, and an exception in either is logged
 rather than raised: neither may post, or change delivery's exit.
 
 The first-run audits stage fires when the ranking card the hand-off recorded for the scan has
@@ -572,8 +572,9 @@ def _quiet_stage(name: str, stage, data_dir: Path, *args) -> None:
     try:
         log = _open_stage_log(data_dir)
     except OSError as e:
-        _log(f"cannot open the stage log, so the {name} stage waits for the next tick: {e}")
-        return
+        # Losing the log must not stop onboarding: the stage still runs, unheard.
+        _log(f"cannot open the stage log, so the {name} stage runs without one: {e}")
+        log = open(os.devnull, "w", encoding="utf-8")
     with log, _quiet(log):
         try:
             stage(data_dir, *args)
