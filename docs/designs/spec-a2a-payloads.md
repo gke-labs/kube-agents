@@ -629,9 +629,9 @@ then the buttons, choices before links. In `progress` the `plan` follows the hea
 takes the place of the rows. The caps on headline, row text and row detail, button
 labels, the url rule and the plan are the `today` presenter's (`slack_presenter.py`,
 `slack_status.py`), and fold text is #2360's. The rest are chosen here and sit inside Slack's own
-limits. The `today` path clips where this spec refuses, so the emitter applies the same
-windows the presenter does: the newest 20 plan items (settled ones first to go) and the last
-6 steps of each, and the first 5 `after` lines.
+limits. The `today` path clips where this spec refuses, so the emitter applies windows:
+the presenter's newest 20 plan items (settled ones first to go) and last 6 steps of each,
+and the first 5 `after` lines, which the presenter leaves uncapped.
 
 **The emitter composes, the renderer lays out.** A plan item's `title` arrives finished
 (`today`'s `row_title`: "waiting on you", the result, or the note and "step N ▸"), and a
