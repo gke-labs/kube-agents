@@ -311,8 +311,10 @@ def fresh_events(claim: Optional[dict], now: Optional[float] = None) -> Optional
 #: How long a fanned-out child's answer waits for its parent's answer to post
 #: before it is posted anyway: the parent's answer is the one the thread
 #: wants, but a parent whose answer never posts must not swallow what its
-#: child found.
-FOLD_HOLD_SECONDS = 30 * 60
+#: child found. Measured from the child's completion, and long enough for a
+#: fleet-wide fan-out whose children finish far apart (the parent completes
+#: only after its last child settles).
+FOLD_HOLD_SECONDS = 2 * 3600
 #: Parent statuses that mean it is still working toward its answer. A blocked
 #: parent (failed, gave up, or waiting on the user) releases the child's
 #: answer at once.
@@ -323,8 +325,9 @@ FOLD_DONE_STATUSES = frozenset({"done", "archived"})
 #: kanban_children_settled's record of the card each worker's card was
 #: created by.
 WORKER_CHILDREN_TABLE = "kanban_worker_children"
-#: (task id, event id) already logged as held or folded, so a hold re-read on
-#: every tick logs once. Bounded: cleared when it grows past this.
+#: (task id, event id, message) already logged, so a hold re-read on every
+#: tick logs once, and a later drop of the same event logs once too.
+#: Bounded: cleared when it grows past this.
 _FOLD_LOGGED: set = set()
 _FOLD_LOGGED_MAX = 4096
 
@@ -432,13 +435,16 @@ def _log_once(task_id: str, event_id: int, message: str, *args: Any) -> None:
 #: The line a child's answer opens with when it arrives after its parent's has
 #: posted, so it reads as a late finding and not a duplicate.
 LATE_RESULT_LEAD = "Late result from {title}:"
+#: The line a child's answer opens with when the hold runs out while its
+#: parent is still working: the parent's fuller answer may still follow.
+INTERIM_RESULT_LEAD = "Interim result from {title} (the full answer is still being put together):"
 
 
-def _late(ev: Any, claim: dict, title: str) -> tuple:
-    """``(event, claim)`` with the answer led by LATE_RESULT_LEAD. The
-    completion text is the event's run summary, or the card's result when the
-    event has none (upstream's ``_fmt_completed``), so both are led."""
-    lead = LATE_RESULT_LEAD.format(title=title or "a subtask")
+def _late(ev: Any, claim: dict, title: str, template: str = LATE_RESULT_LEAD) -> tuple:
+    """``(event, claim)`` with the answer led by ``template``. The completion
+    text is the event's run summary, or the card's result when the event has
+    none (upstream's ``_fmt_completed``), so both are led."""
+    lead = template.format(title=title or "a subtask")
     payload = dict(getattr(ev, "payload", None) or {})
     if payload.get("summary"):
         payload["summary"] = f"{lead}\n{payload['summary']}"
@@ -447,6 +453,18 @@ def _late(ev: Any, claim: dict, title: str) -> tuple:
     if task is not None and getattr(task, "result", None) and dataclasses.is_dataclass(task):
         claim = dict(claim, task=dataclasses.replace(task, result=f"{lead}\n{task.result}"))
     return ev, claim
+
+
+def _title(conn: Any, child: str, claim: dict) -> str:
+    """The child card's title: from the claim's task, else the board."""
+    title = getattr(claim.get("task"), "title", None)
+    if title:
+        return str(title)
+    try:
+        row = conn.execute("SELECT title FROM tasks WHERE id = ?", (child,)).fetchone()
+    except sqlite3.Error:
+        row = None
+    return (row[0] if row else "") or ""
 
 
 def fold_fanout(conn: Any, claim: Optional[dict], now: Optional[float] = None) -> Optional[dict]:
@@ -474,8 +492,9 @@ def fold_fanout(conn: Any, claim: Optional[dict], now: Optional[float] = None) -
       the child's, its subscription is gone, or the hold ran out): it delivers
       as upstream would, so nothing a child found is lost when its parent's
       answer does not post. One that arrives after the parent's answer has
-      posted opens with "Late result from <card title>:", so it does not read
-      as a duplicate.
+      posted opens with "Late result from <card title>:", and one whose hold
+      ran out while the parent still works opens with "Interim result from
+      <card title> …", so neither reads as a duplicate.
 
     Every other event kind (blocked, gave_up, crashed, progress) delivers.
 
@@ -528,12 +547,14 @@ def fold_fanout(conn: Any, claim: Optional[dict], now: Optional[float] = None) -
             if not kept:
                 return None
             return dict(claim, events=kept, cursor=event_id - 1)
+        lead = None
         if parent_done and not later and delivered >= parent_done:
-            try:
-                title = conn.execute("SELECT title FROM tasks WHERE id = ?", (child,)).fetchone()
-            except sqlite3.Error:
-                title = None
-            ev, claim = _late(ev, claim, (title[0] if title else "") or "")
+            lead = LATE_RESULT_LEAD
+        elif waiting:
+            # The hold ran out with the parent still working toward its answer.
+            lead = INTERIM_RESULT_LEAD
+        if lead:
+            ev, claim = _late(ev, claim, _title(conn, child, claim), lead)
             late = True
         kept.append(ev)
     if late:

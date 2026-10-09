@@ -611,9 +611,26 @@ class FoldFanoutTest(unittest.TestCase):
         claim = self.claim(_Ev(7, "completed", 1900))
         self.assertIs(self.fold(claim), claim)
 
-    def test_a_hold_that_runs_out_posts_the_answer(self):
-        claim = self.claim(_Ev(7, "completed", 2000 - kanban_chat_notify.FOLD_HOLD_SECONDS - 1))
-        self.assertIs(self.fold(claim), claim)
+    def test_a_hold_that_runs_out_posts_the_answer_as_interim(self):
+        # A fan-out whose children finish far apart: the parent still works,
+        # so the child's answer posts, led so it does not read as the answer.
+        self.conn.execute("INSERT INTO tasks (id, status, title) VALUES ('t_child', 'done', 'prod-eu')")
+        claim = self.claim(_Ev(7, "completed", 2000 - kanban_chat_notify.FOLD_HOLD_SECONDS - 1, {"summary": "3 nodes"}))
+        got = self.fold(claim)
+        self.assertEqual([e.id for e in got["events"]], [7])
+        self.assertTrue(got["events"][0].payload["summary"].startswith("Interim result from prod-eu"), got["events"][0].payload)
+
+    def test_the_hold_outlasts_a_slow_fan_out(self):
+        # Children of a fleet-wide fan-out can finish an hour apart.
+        self.assertIsNone(self.fold(self.claim(_Ev(7, "completed", 2000 - 3600))))
+
+    def test_a_parent_whose_answer_pinged_counts_as_delivered(self):
+        # The parent's text posted (ping recorded) but its wake has not
+        # advanced the durable cursor yet: its answer is in the thread.
+        self.parent("done", completed_event=9, delivered=0)
+        self.ping(9, task="t_parent")
+        self.assertIsNone(self.fold(self.claim(_Ev(7, "completed", 1900))))
+        self.assertEqual(self.cursor(), 7, "dropped, not held")
 
     def test_a_late_answer_posts_and_says_it_is_late(self):
         # The parent answered first (completed over a live child); the child's
