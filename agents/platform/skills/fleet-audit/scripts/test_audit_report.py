@@ -14604,22 +14604,45 @@ class TestRemediateRefusesWhereNoProposalCanLand(unittest.TestCase):
                         audit_report.handle_remediate(args)
                 self.assertIn("directory mode", str(caught.exception))
 
+    def setUp(self):
+        # Directory mode unless a test arms a broker: no endpoint, so the mode
+        # that `handle_remediate` decides is False.
+        env = patch.dict(os.environ, {"CREDENTIAL_PROXY_URL": ""})
+        env.start()
+        self.addCleanup(env.stop)
+        self.addCleanup(audit_report.set_content_mode, False)
+
     def test_in_content_mode_a_gitlab_repository_goes_on_to_plan(self):
         # The content workspace clones from the repository's own forge, so the
         # refusal is directory mode's alone: here `remediate` reaches planning.
-        audit_report.set_content_mode(True)
-        self.addCleanup(audit_report.set_content_mode, False)
-        args = argparse.Namespace(
-            audit="compliance-audit", findings_file="f.json", repo="gitlab.com/acme/infra",
-            finding=["f1"], dry_run=False, manifest_file=None, issue=None,
-        )
-        reached = RuntimeError("reached planning")
-        with patch.object(audit_report, "load_findings", return_value={"findings": []}), \
-                patch.object(audit_report, "resolve_repo", return_value="gitlab.com/acme/infra"), \
-                patch.object(audit_report, "read_run_record", side_effect=reached):
-            with self.assertRaises(RuntimeError) as caught:
-                audit_report.handle_remediate(args)
-        self.assertIs(reached, caught.exception)
+        # Live test on main: a new `remediate` process did not decide the mode
+        # before the refusal, so it refused every GitLab repository as
+        # "directory mode". Nothing presets the mode here; only the configured
+        # broker endpoint decides it.
+        import credential_proxy_client
+
+        # The refusal needs no answer from the broker: a broker that is down
+        # does not change the decision, and a dry run does not call it.
+        down = AssertionError("remediate asked the broker before the refusal")
+        for dry_run in (False, True):
+            with self.subTest(dry_run=dry_run):
+                audit_report.set_content_mode(False)
+                args = argparse.Namespace(
+                    audit="compliance-audit", findings_file="f.json", repo="gitlab.com/acme/infra",
+                    finding=["f1"], dry_run=dry_run, manifest_file=None, issue=None,
+                )
+                reached = RuntimeError("reached planning")
+                with patch.dict(os.environ, {"CREDENTIAL_PROXY_URL": "http://127.0.0.1:8765"}), \
+                        patch.object(credential_proxy_client, "workspaces_available", side_effect=down), \
+                        patch.object(audit_report, "load_findings", return_value={"findings": []}), \
+                        patch.object(audit_report, "resolve_repo", return_value="gitlab.com/acme/infra"), \
+                        patch.object(audit_report, "_dry_run_repo", return_value="gitlab.com/acme/infra"), \
+                        patch.object(audit_report, "_proposal_noun", return_value="merge request"), \
+                        patch("gitops_workspace.get_managed_repos", return_value=["gitlab.com/acme/infra"]), \
+                        patch.object(audit_report, "read_run_record", side_effect=reached):
+                    with self.assertRaises(RuntimeError) as caught:
+                        audit_report.handle_remediate(args)
+                self.assertIs(reached, caught.exception)
 
     def test_a_dry_run_without_repo_refuses_what_it_resolves(self):
         # Review round 5: with no `--repo` the dry run resolved the repository

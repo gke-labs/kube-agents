@@ -260,6 +260,13 @@ func (v *PlatformAgentCustomValidator) validatePlatformAgent(ctx context.Context
 		proxyErrs, proxyWarnings := controller.ValidateCredentialProxyResources(platformAgent.Spec.Deployment, depPath.Child("credentialProxy", "resources"))
 		allErrs = append(allErrs, proxyErrs...)
 		warnings = append(warnings, proxyWarnings...)
+
+		// 2g. The agent-api-auth sidecar's requests and limits, checked the same
+		// way: merged over the defaults per key, so the reconciler refuses at
+		// reconcile what this refuses at apply.
+		apiAuthErrs, apiAuthWarnings := controller.ValidateAgentAPIAuthResources(platformAgent.Spec.Deployment, depPath.Child("agentAPIAuth", "resources"))
+		allErrs = append(allErrs, apiAuthErrs...)
+		warnings = append(warnings, apiAuthWarnings...)
 	}
 
 	// 3. Validate Security ServiceAccountName

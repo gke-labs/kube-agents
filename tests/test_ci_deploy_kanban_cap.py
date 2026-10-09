@@ -1,8 +1,8 @@
 """The smoke pipeline's Helm release gives the eval install a kanban board cap that fits its lanes.
 
-The image ships ``kanban.max_in_progress: 6`` (``agents/chat/config.yaml``), and the
-operator renders a different cap only when the PlatformAgent CR carries
-``spec.harness.tuning.maxInProgress``. The eval fans its units out at
+The operator pins ``kanban.max_in_progress`` in its managed scope: 6
+(``defaultKanbanMaxInProgress``), or the PlatformAgent CR's
+``spec.harness.tuning.maxInProgress`` when it carries one. The eval fans its units out at
 ``EVAL_TASK_PARALLELISM`` -- 4 on a pull request, 8 on the nightly -- and nearly every
 unit's opening turn delegates one platform card. The override dates from an image
 default of two, where most lanes queued: a queued card waits out the cards ahead of it and
@@ -14,9 +14,9 @@ the eval install and nowhere else, deliberately below the production default of 
 The value rides three hops: the ``--set`` in ``ci-deploy.sh`` (``--set`` rather than
 ``--set-string``, because the chart schema types the key as an integer and a string
 fails validation at ``helm upgrade``), the chart template that renders
-``platformAgent.harness.tuning`` onto the CR, and the operator writing
-``kanban.max_in_progress`` into the default profile's overlay, which the operator's
-own ``TestMaxInProgressReachesTheDefaultOverlay`` covers. One test per hop this
+``platformAgent.harness.tuning`` onto the CR, and the operator pinning
+``kanban.max_in_progress`` in the managed scope, which the operator's own
+``TestMaxInProgressIsPinnedInTheManagedScope`` covers. One test per hop this
 repository can see from Python, plus the two bounds: a cap whose user share is
 below the pull request's lane count recreates the queue the flag exists to
 remove, and a cap

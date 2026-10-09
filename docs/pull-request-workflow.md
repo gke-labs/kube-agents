@@ -272,7 +272,8 @@ and common enough that you must not wait forever.
 ### What the check means
 
 The `AI Review` check run beside the review is what `.github/workflows/auto_request_review.yml`
-waits on before it assigns a human, and what it says depends on the round. The reason it depends
+reads before it assigns a human — green on any round, or the third round whatever the colour (below)
+— and what it says depends on the round. The reason it depends
 on the round: once a first round was answered, further rounds kept about 2.5 findings each without
 decaying, two thirds of them on code the previous round had already read, and most held checks held
 on Medium alone — pull requests stopped converging on green while nearly everything they were shown
@@ -285,8 +286,9 @@ was being fixed (gke-labs/kube-agents-bot#191 has the measurement).
   owes an answer, whether or not its thread is resolved. 🟠 Medium findings are still posted as threads with their fix and still
   counted in the title, but the check is `success` under `Found N issues, none holding`, and the
   review body carries a _Second look_ sentence beside the bar it applied. A Medium here needs no
-  further round: fix it, or answer it in its thread and resolve — the thread still has to be
-  resolved before the merge, per the section below, but the check is not waiting on it.
+  further round: fix it only if you would have unasked, saying so in the thread, or answer it there
+  for the reviewer the green summons ([green is settled](#green-is-settled)) — the thread still has
+  to be resolved before the merge, per the section below, but the check is not waiting on it.
 - **Back on the first review's bar:** a diff that has more than doubled in lines since the commit
   the bot last reviewed — the softer bar is earned by a review of roughly this change, not by a
   commit count — and, silently, a pull request whose earlier round the bot could not read back (a
@@ -299,6 +301,15 @@ was being fixed (gke-labs/kube-agents-bot#191 has the measurement).
 - **`neutral` on any round** also covers the description finding, a change not fully checked, a
   review that broke, and a push since the last review (the pushed commit carries the previous title
   and no verdict).
+- **The third round summons a human whatever the colour.** Once the bot has reviewed three distinct
+  commits of a pull request, a grey check on a review it finished (its summary ends in the
+  `ai-review:` tally with `findings` or `clean`) requests a reviewer exactly as green does, once:
+  the workflow posts a hand-off comment carrying a marker, and a later grey round with that marker
+  on the pull request asks nobody again. A pushed commit's carried-title row, a broken or superseded
+  entry, and a re-cut of a commit already read do not count as rounds and never clear it. Measured
+  before the rule (gke-labs/kube-agents-bot#191, 2026-10-08): the first human review arrived a median
+  eleven hours and two rounds after round three, and two thirds of pull requests saw no further bot
+  round once a human had reviewed — the human is what ends the loop, so the human comes earlier.
 
 ### Waiting for it
 
@@ -342,6 +353,83 @@ gh api repos/gke-labs/kube-agents/pulls/<number>/comments --paginate \
         | "\(.path):\(.line // .original_line) [id \(.id)]\n\(.body)\n"'
 ```
 
+### Green is settled
+
+The bot's part of a review ends on green, and the author does not reopen it. Measured before this
+rule (gke-labs/kube-agents-bot#191, 2026-10-08): the second look made a later round green once only
+🟠 Medium remained, and authors typed `/review` again after 79% of those rounds; 38% of the pull
+requests since 09-21 went five rounds or more and took 86% of the review spend. The bot keeps
+posting every Medium as a thread and sets no round budget of its own — the stop is this rule, which
+`AGENTS.md`, "Automated Review After Opening a Pull Request", states in one sentence each.
+
+- **Green is settled.** A `success` `AI Review` entry the bot wrote for a review of this pull
+  request — `No findings`, `No findings above low severity`, and `Found N issues, none holding` are
+  all green — ends the bot's part. After it, no author `/review` in any form (`all`, `fresh`, or
+  any argument), and no draft-to-ready or close-and-reopen to buy one. Answer each open 🟠 Medium
+  by reply; push a fix only for a defect you would have fixed unasked, and say so in the thread;
+  otherwise reply with the reason or a filed follow-up. The human reviewer the green summons rules
+  on the rest. Settled ends, and one further `/review` is owed, only when a human review requests
+  changes, a non-author types `/review`, or the diff has grown past twice the green head's size —
+  the bot's own growth cap, [back on the first review's bar](#what-the-check-means).
+- **Before green, at most two re-reads of your own.** The automatic first review, then at most two
+  `/review`s of your own: after a push, or `/review fresh` after an edit to the body alone, which
+  is one of the two; a retry of a review that never arrived ([waiting for it](#waiting-for-it)) is
+  not. At the third reviewed commit, or once both are spent, the pull request goes to a human
+  whatever the colour: comment `/request-review` if no human is on it yet (**who counts**, below) —
+  the command on the first line, then a line for the reviewer naming the commit that fixed any 🔴 High and saying that
+  the bot re-runs on their `/review` and you will not ask for one — and stop. A requested reviewer
+  is the end of self-service — reply in the threads and wait for them. The reviewer-request
+  workflow posts a hand-off comment, opening `<!-- auto-request-review:handoff -->`, whenever it
+  requests one, at green or at the third reviewed commit; that comment is the end of self-service
+  whether or not you typed anything.
+- **Decline by default on a later round.** On a round after the first, fix a 🟠 Medium only when
+  its **Kind** line says `behaviour`, it is on code this pull request added, and the fix is one
+  mechanical edit per site that adds no file, helper, branch, flag, dependency or regex
+  alternative; a class is fixed whole or deferred whole. Otherwise reply
+  `declined: <reason about this change>` or `deferred to #N`, record it in **Self-Review**, leave
+  the thread open for the approving human, and request no re-read; a round that pushed nothing —
+  every finding declined, deferred or refuted — goes to the human instead: `/request-review` if
+  no human is on it yet. A finding that correctly applies a rule with no exemption is still a fix
+  on a first review and, when it is a 🔴 High, on any round; a High you can show wrong is a
+  refutation in its thread like any other, and a High whose fix would add a mechanism is the design
+  question below, not a build.
+- **A review round may not add a mechanism.** A finding, whatever its severity, whose fix would add
+  a module or file, an exported type, command, flag, environment variable, config key or
+  dependency, a test that parses or simulates another system, or more than about forty net lines,
+  or would touch a non-test, non-doc file the pull request did not touch, is a design question:
+  reply in its thread that it is, defer it to a follow-up issue, and leave the decision to the
+  human reviewer (`/request-review` if no human is on it yet). Do not build it on a review round.
+- **The body moves with the push.** Bring **Testing**, **Live validation** and **Self-Review**
+  current in the same push as the fix, before any `/review`; write a skipped live run as
+  `Not live-tested: <what a run would show, why no install reaches it>`. A description ask the bot
+  repeats after your reply is a dispute for the human reviewer, not another edit.
+- **A merge of `main` or a rebase that changes nothing of yours earns no `/review`.** The bot
+  re-reads the whole pull request at full price and samples a large diff differently each time;
+  eleven of the eighteen rounds on #2360 were on merges of `main`.
+- **Resolving.** An unattended agent replies and leaves a declined bot thread open until a human
+  rules on it, and then resolves the thread citing the ruling (**who counts**, next). With a user in
+  the loop you may resolve a declined `kube-agents-bot` finding earlier, once the reply and
+  **Self-Review** give the reason, but a resolved thread collapses and the summoned reviewer may
+  never see it, so prefer leaving it open with the reply
+  ([resolving conversations](#resolving-conversations)).
+- **Who counts, and what a ruling is.** A human is _on_ a pull request when a reviewer is requested,
+  or a non-robot human other than the author has filed `CHANGES_REQUESTED`, or an `APPROVED` that
+  `scripts/request_reviewers.py` counts (an `OWNERS` approver's, or an `OWNERS` reviewer's on a change
+  the author's own approval already covers), or a requested or `OWNERS`-listed reviewer has replied
+  in one of its threads. The author's own replies, a bystander's comment, an approval from outside
+  `OWNERS`, `kube-agents-bot` and the `robot_accounts` of `.github/auto_request_review.yml` never
+  count. A
+  **ruling** on a declined bot thread is read for its content, not for the event GitHub files: a
+  human's approval of the pull request, or their reply in the thread that accepts the decline, is
+  the ruling, and you then resolve the thread citing it; a `CHANGES_REQUESTED` review, or a reply or
+  comment that asks for the fix, is a disagreement and owes the fix (or the design-question reply of
+  the mechanism rule) with the thread left open for them. A `COMMENTED` review on its own is a reply,
+  not a ruling — GitHub files one for every thread reply. When the human on it has replied without a
+  verdict, their review request is cleared: answer them and re-request the same reviewer
+  (`gh pr edit <n> --add-reviewer <login>`, the hand-back under
+  [who owns an open pull request](#who-owns-an-open-pull-request)), not `/request-review`, which
+  draws a new one.
+
 ### Replying to a finding
 
 A finding you disagree with gets answered in its thread, not silently dropped:
@@ -354,10 +442,14 @@ gh api repos/gke-labs/kube-agents/pulls/<number>/comments/<comment-id>/replies \
 ## Resolving conversations
 
 Reply first — `AGENTS.md` says why — naming what changed and the commit that changed it, or, for a
-`kube-agents-bot` finding you decline with a user in the loop, the reason, which **Self-Review**
-gives too. Then resolve, except the description thread, which waits for the body edit described
-below. A pull request carrying both `lgtm` and `approved` with a thread still open also carries the
-`do-not-merge` label,
+`kube-agents-bot` finding you decline, the reason, which **Self-Review** gives too. Then resolve
+what a commit fixed or you showed wrong, except the description thread, which waits for the body
+edit described below or for a ruling on a disputed ask. A declined bot finding is better left open with its reply until a human
+rules on it — an approval, or a reply in the thread that accepts the decline — which hands the
+thread back to you to resolve, citing it; a reply that asks for the fix is a disagreement and owes
+the fix with the thread left open ([green is settled](#green-is-settled), _who counts_); with a user
+in the loop you may resolve it earlier once the reply and **Self-Review** give the reason. A pull request carrying
+both `lgtm` and `approved` with a thread still open also carries the `do-not-merge` label,
 applied by a workflow so that Tide does not spend the queue retrying a merge GitHub will refuse;
 resolving the last thread is what removes it ([how a change merges](#how-a-change-merges)).
 
@@ -410,10 +502,14 @@ Five ways that goes wrong quietly:
   finding in its summary body, under **The pull request description is still unanswered.**, and
   opens a new thread only for a section no earlier thread named. A pull request with every thread
   resolved can therefore still hold the `AI Review` check. Resolve the description thread only after
-  the body is edited. Editing the body starts no review, and a plain `/review` on an unchanged commit
-  is a re-cut that checks only for missing and empty sections, so comment `/review fresh` and read
-  the body of a review newer than your edit, with the first poll command in
-  [Waiting for it](#waiting-for-it), before reporting the pull request clear.
+  the body is edited, or on a ruling. Editing the body starts no review, and a plain `/review` on an unchanged commit
+  is a re-cut that checks only for missing and empty sections, so comment `/review fresh` — one of
+  the two re-reads of your own — and read the body of a review newer than your edit, with the first
+  poll command in [Waiting for it](#waiting-for-it), before reporting the pull request clear. An ask
+  that newer review repeats after your reply is a dispute for the human reviewer, not another edit:
+  reply `declined: <reason>`, and once both re-reads are spent leave the thread open for them; a
+  ruling returns it to you to resolve like any other declined thread
+  ([green is settled](#green-is-settled), _who counts_).
 
 ## How a change merges
 
@@ -468,7 +564,7 @@ approver's review, so the draw is narrowed to the `OWNERS` approvers for the cha
 same test decides what counts as already reviewed — an approval from a `reviewers`-only account
 settles a self-approved change and nothing else. The `hack/eval/presubmit-cases.txt` and
 `hack/eval/blocking-roster.txt` entries send a change there to its own `eval-crew` group, so the
-reviewer the bot's green check summons can clear both labels in one action. Not every `eval-crew`
+reviewer the workflow summons can clear both labels in one action. Not every `eval-crew`
 member is a root approver, so a change that also touches root-owned paths still waits on a root
 approver's `/approve` after that review. The bot never requests the author, so a member's own case
 or roster change goes to the rest of the group, with the author's `approved` already on it. That
@@ -643,8 +739,12 @@ Every open pull request has exactly one party whose move it is, and the commones
 a fortnight is that both sides believe it is the other's. The rule:
 
 **The author owns it while it is blocked on them** — a draft, a failing or cancelled check that
-`tide` names, merge conflicts, unresolved review threads, changes requested, or no human reviewer
-requested yet.
+`tide` names, merge conflicts, unresolved review threads (bar a `kube-agents-bot` thread whose last
+comment is the author's `declined:` or `deferred to #N` reply, which waits for the reviewer's
+ruling; an approval, or a reply in the thread that accepts the decline, is that ruling, and the
+thread is the author's again, to resolve citing it; a reply that asks for the fix is theirs to
+answer, thread open — [green is settled](#green-is-settled), _who counts_), changes requested, or
+no human reviewer requested yet.
 **Otherwise the requested reviewers own it.** A past reviewer does not: an approval already given
 is not an outstanding obligation. `kube-agents-bot` and other bot reviewers never count either way.
 
@@ -657,12 +757,14 @@ Four states that look like somebody else's problem and are not:
   review. Pushing the fix does not clear it, resolving every thread does not clear it, and GitHub
   will report `CHANGES_REQUESTED` and "review requested from X" in the same breath. Re-requesting
   review is the explicit hand-back — do that rather than assuming the push spoke for itself.
-- **Nobody is requested at all.** Because a human is only assigned once the `AI Review` check goes
-  green, an author with outstanding bot findings has no reviewer and no notification saying so.
-  A green pass after `/review` is what summons one — clean on a first review, or nothing above
-  Medium on a later one (`AGENTS.md`, "Automated Review After Opening a Pull Request");
-  `/request-review` is the override. Answering every bot thread does not summon one by itself, so
-  an author who has done everything asked of them can still be sitting with nobody assigned.
+- **Nobody is requested at all.** A human is assigned once the `AI Review` check goes green, or
+  once the bot has reviewed three commits whatever the colour (`AGENTS.md`, "Automated Review After
+  Opening a Pull Request"); before either, an author with outstanding bot findings has no reviewer
+  and no notification saying so. A green pass after `/review` summons one — clean on a first review,
+  or nothing above Medium on a later one — and so does the third round; `/request-review` is the
+  override. Answering every bot thread does not summon one by itself. The hand-off comment the
+  workflow posts on its first request is the sign one has been asked: after it, reply in the
+  threads (with the fixing commit for any 🔴 High) and wait rather than typing `/review` again.
 - **A red check that is not required.** It still blocks the merge if it is red on the head: Tide
   refuses any posted context that is not green unless Prow marks it `optional`, not only the ones on
   the two lists above, so a cancelled run of a non-required job is the author's problem too. `tide`
@@ -685,8 +787,8 @@ robot that reviews under a user account re-reviews every push and files its foll
 `COMMENTED`, so a `CHANGES_REQUESTED` it once filed would otherwise stand for the life of the pull
 request and the check-run path would never request a human, and a review request outstanding to it
 is answered by the robot and cleared, so it counts as nobody asked. An approval from an account in
-neither `OWNERS` list is never a hand-off, and one from `reviewers` alone is a hand-off only when
-the author's own approval already covers the change: on any other pull request it cannot produce
+neither `OWNERS` list never counts as already reviewed, and one from `reviewers` alone counts only
+when the author's own approval already covers the change: on any other pull request it cannot produce
 the `approved` label, so the auto-request counts it no more than a comment and still asks someone
 who can `/approve`. Of these reasons, `/request-review`
 skips the verdict check alone (it also bypasses the

@@ -472,8 +472,8 @@ func buildCredentialProxyContainer(agent *agentv1alpha1.PlatformAgent) corev1.Co
 		// Sized where the constants are declared: CPU for the warm-up after an
 		// eviction, memory for Envoy, the broker's bounded share and the child
 		// processes the broker budgets against this limit. Lower than the
-		// sidecar's limit, which sized for the event watcher's informer
-		// caches; nothing here holds cluster state.
+		// sidecar's limit, which is sized for the event watcher's memos and
+		// initial lists; nothing here holds cluster state.
 		// spec.deployment.credentialProxy.resources overrides any key of it.
 		Resources:       resolveCredentialProxyResources(agent.Spec.Deployment),
 		VolumeMounts:    volumeMounts,
@@ -721,8 +721,8 @@ var (
 //
 // The /tmp and state emptyDirs are widened here, not in
 // buildCredentialProxyVolumes, because the gateway pod shares the /tmp volume's
-// definition and sizes its own container independently of the broker's
-// override.
+// definition and sizes it from its own agentAPIAuth override, not the broker's.
+// buildAgentAPIAuthVolumes applies that override to the gateway pod's copy.
 func buildCredentialProxyRuntimeVolumes(agent *agentv1alpha1.PlatformAgent) []corev1.Volume {
 	volumes := filterVolumes(buildCredentialProxyVolumes(agent), credentialProxyRuntimeVolumeNames)
 	ephemeralLimit := resolveCredentialProxyResources(agent.Spec.Deployment).Limits[corev1.ResourceEphemeralStorage]
@@ -752,8 +752,24 @@ func credentialProxyEmptyDirSizeLimit(defaultSize string, ephemeralLimit resourc
 
 // buildAgentAPIAuthVolumes is the gateway pod's remaining share. The data volume
 // the watcher reads is not here: the gateway pod already declares it.
+//
+// The /tmp emptyDir is widened to the sidecar's own merged ephemeral-storage
+// limit, as buildCredentialProxyRuntimeVolumes widens the broker's: the sidecar
+// is the gateway pod's container and the kubelet evicts the pod when the volume
+// passes its sizeLimit, whatever the container's ephemeral-storage limit. The
+// override read here is agentAPIAuth's, not the broker's, so the gateway pod
+// sizes its /tmp from the knob written for it. A refused override is stripped to
+// nil before this builder (gatewayAgent), so it widens nothing, and a nil
+// override keeps the 2Gi default byte-identical.
 func buildAgentAPIAuthVolumes(agent *agentv1alpha1.PlatformAgent) []corev1.Volume {
-	return filterVolumes(buildCredentialProxyVolumes(agent), agentAPIAuthVolumeNames)
+	volumes := filterVolumes(buildCredentialProxyVolumes(agent), agentAPIAuthVolumeNames)
+	ephemeralLimit := resolveAgentAPIAuthResources(agent.Spec.Deployment).Limits[corev1.ResourceEphemeralStorage]
+	for i := range volumes {
+		if volumes[i].Name == credentialProxyTmpVolumeName {
+			volumes[i].EmptyDir.SizeLimit = credentialProxyEmptyDirSizeLimit(credentialProxyTmpSizeLimit, ephemeralLimit)
+		}
+	}
+	return volumes
 }
 
 func filterVolumes(volumes []corev1.Volume, keep map[string]bool) []corev1.Volume {

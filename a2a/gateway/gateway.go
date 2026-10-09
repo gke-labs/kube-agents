@@ -21,7 +21,7 @@ import (
 )
 
 // sessionProfile is the AgentProfile a /session conversation runs as - the
-// conversation front door of spec-subagent-profiles.md (a2a/profiles/chat.yaml).
+// conversation front door of spec-subagent-profiles.md (k8s-operator/examples/agentprofile-chat.yaml).
 const sessionProfile = "chat"
 
 // sessionKindDM is the SessionRecord.Kind of a direct message, the one Slack
@@ -175,6 +175,14 @@ type Gateway struct {
 	// notice from since it started, under mu: the relay's evidence that the
 	// executor answers follow-ups at all (postSteerShortfall).
 	steerNoticesFrom map[string]bool
+	// steersRefusedBy is each addressee whose newest steer notice to this
+	// gateway was a no-resume refusal - an executor that cannot continue a
+	// session, the bridge's cli executor - under mu, and cleared by a
+	// queued notice from it. routeTurn gives such an addressee the wide
+	// status matcher (isStatusQuery says why). The gateway cannot see the
+	// executor, so the first follow-up to one is acknowledged and refused
+	// before this is learned.
+	steersRefusedBy map[string]bool
 
 	// backend names the gateway's configured chat backend, which is what a
 	// message that names none is attributed to. Since the mux and the side
@@ -418,6 +426,7 @@ func New(o Options) (*Gateway, error) {
 		taskSessions:     map[string]string{},
 		relays:           map[string]*relayState{},
 		steerNoticesFrom: map[string]bool{},
+		steersRefusedBy:  map[string]bool{},
 		backend:          backend,
 		injectPM:         injectPM,
 		injectAudience:   injectAudience,
@@ -787,6 +796,12 @@ func (g *Gateway) routeTurn(ctx context.Context, msg InboundMessage, backend, pr
 	g.healActiveTask(ctx, rec)
 
 	active := rec.ActiveTask
+	// The status matcher's wide rule only where a stolen steer costs
+	// nothing: a running task whose executor refuses follow-ups
+	// (steersRefusedBy). A detached task gets the exact phrases: after a
+	// stop, the wide reading of "any update on the rollout" would steal a
+	// NEW task to replay a dead one.
+	wideStatus := active != nil && !active.Detached && g.refusesFollowUps(rec.AddresseeFor(active.TaskID))
 	// A slash command resolves before everything else (architecture 02,
 	// "Chat entrypoints"): it is not a status ask, not a stop, and never a
 	// steer. Text only - a programmatic cancel keeps its intent whatever
@@ -830,7 +845,7 @@ func (g *Gateway) routeTurn(ctx context.Context, msg InboundMessage, backend, pr
 		if !g.sessionCommand(ctx, rec, msg, backend, sessionRest, principal, authority) {
 			return
 		}
-	case msg.Intent == "" && active != nil && isStatusQuery(msg.Text):
+	case msg.Intent == "" && active != nil && isStatusQuery(msg.Text, wideStatus):
 		g.answerStatusByReplay(ctx, rec)
 	case stopping && msg.TaskID != "" && (active == nil || active.TaskID != msg.TaskID):
 		// A cancel that names a task the conversation no longer holds as
@@ -1321,6 +1336,7 @@ func (g *Gateway) probeConversation(ctx context.Context, key, taskID string) (Co
 	if rec == nil {
 		return state, nil
 	}
+	state.ContextID = rec.ContextID
 	active := rec.ActiveTask
 	if taskID == "" {
 		if active == nil {

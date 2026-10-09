@@ -7,7 +7,12 @@ name: "Drift: Long-Lived Environments"
 # Read-only. It runs `terraform plan`, never an apply, so it is safe on an
 # environment somebody is live-testing against and needs no lease. Closing the
 # drift it reports is `Shared: Reconcile Environment` with `mode: apply`, or
-# the atomic deploy workflows (`autopush-deploy.yml` and `staging-deploy.yml`).
+# the atomic deploy workflows (`autopush-deploy.yml`, `autopush-next-deploy.yml`
+# and `staging-deploy.yml`).
+#
+# `autopush-next` is planned with skip_unconfigured until it is provisioned:
+# a missing environment, or one with no GCP_PROJECT_ID, posts a notice and
+# leaves no plan, which the report step reads as "leave any report alone".
 #
 # `rc` and `nightly` are deliberately absent: both are destroyed and rebuilt
 # from the composition on every pipeline run, so they cannot drift, and a plan
@@ -40,10 +45,10 @@ jobs:
     if: github.repository == 'gke-labs/kube-agents'
     strategy:
       # Each environment is a separate project and a separate report; one
-      # failing plan must not cancel the other's.
+      # failing plan must not cancel the others'.
       fail-fast: false
       matrix:
-        environment: [autopush, staging]
+        environment: [autopush, autopush-next, staging]
     uses: ./.github/workflows/reconcile-environment.yml # zizmor: ignore[secrets-inherit]
     permissions:
       contents: read
@@ -52,6 +57,9 @@ jobs:
     with:
       github_environment: ${{ matrix.environment }}
       mode: "plan"
+      # Drop once autopush-next is provisioned, so losing its configuration
+      # reds the plan as it would for the other two.
+      skip_unconfigured: ${{ matrix.environment == 'autopush-next' }}
       # No image_tag: the plan holds the tag at whatever the last apply
       # RECORDED, read out of Terraform state. That is what separates "the
       # infrastructure is behind" from "the images are behind" -- the second is
@@ -71,7 +79,7 @@ jobs:
   report:
     name: Report drift for ${{ matrix.environment }}
     needs: plan
-    # always(), so a plan that failed for one environment still lets the other
+    # always(), so a plan that failed for one environment still lets the others
     # be reported -- and so a failed plan reaches report_drift.py, which leaves
     # an existing report alone rather than closing it on no evidence.
     if: always() && github.repository == 'gke-labs/kube-agents'
@@ -79,7 +87,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        environment: [autopush, staging]
+        environment: [autopush, autopush-next, staging]
     timeout-minutes: 10
     permissions:
       contents: read

@@ -201,7 +201,11 @@ lets the budget admit more, up to the slot cap, and lowering it cannot OOM while
 such a limit at reconcile, and the webhook refuses it at apply where it is enabled. The output term is
 the worst case, a request holding its full capped output, which a listing never does; charging
 captured bytes instead of the cap would roughly double the concurrency and is the refinement to
-measure first if four proves tight.
+measure first if four proves tight. One install in this repository does raise it: the smoke
+pipeline's (`hack/ci-deploy.sh`, `EVAL_CREDENTIAL_PROXY_MEMORY_LIMIT`), whose lanes of Platform
+Agents fanning Cluster Agents out over the seeded fleet queued behind four slots to median
+waits of 8 to 22 s and a longest wait inside the refusal bound, so it runs the proxy at 2Gi,
+where the budget admits nine and the slot cap binds again.
 
 ### 2.3 Waiting, refusing, and the degenerate case
 
@@ -211,6 +215,10 @@ slot freed, polled every `COMMAND_SLOT_POLL_SECONDS` with the same check that a 
 hung up while queued is dropped before anything starts, and bounded by the same
 `COMMAND_SLOT_WAIT_SECONDS` (60). A request still queued at the bound raises
 `CommandSlotUnavailable` with a message that names the memory budget rather than the slot count.
+Both the wait and the refusal are measured on the broker's metrics listener: every admission
+is observed in a histogram by the bound that held it, every busy answer counted by bound, and
+the slots and bytes in use are gauges beside their caps, with the budget gauge absent while the
+budget is off (the site's observability page names the series).
 On the exec and vcs routes the exception is raised where a slot refusal is raised, before any
 command has run and, on the vcs route, before the body is read, so each route's existing handler
 and the vcs route's body drain apply unchanged and answer `503 CREDENTIAL_PROXY_BUSY`. The
@@ -275,7 +283,7 @@ The resident reserve assumes the layout this operator deploys, the `broker` role
 container holds the broker and Envoy alone. The image's default role is `combined`, which also
 runs the event watcher and drift detector, and it is the compatibility arrangement for an image
 paired with an older operator, the pairing the cgroup fallback serves. There the reserve omits
-the watcher's informer caches, so the budget is generous by that amount: a budget that is too
+the watcher's memos and initial lists, so the budget is generous by that amount: a budget that is too
 large by a known term for one transitional pairing, where before this change there was none.
 
 The operator reserves the variable's name in `mergeCredentialProxyEnv` by setting it in the base

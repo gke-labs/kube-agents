@@ -33,6 +33,18 @@ sync = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(sync)
 
 
+def write_registered_files(skill_dir, skill_name):
+    """Write each file SKILL_FILE_SUBSTITUTIONS registers for a skill, carrying its targets.
+
+    A fixture skill without them reads as upstream having dropped the file, which the pre-flight
+    and the backstop both refuse.
+    """
+    for relpath, pairs in sync.SKILL_FILE_SUBSTITUTIONS.get(skill_name, {}).items():
+        path = Path(skill_dir) / relpath
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("\n\n".join(t for t, _ in pairs) + "\n# reference\n", encoding="utf-8")
+
+
 class InjectFooterTest(unittest.TestCase):
     def _skill_dir(self, body="# Upstream skill\n\nSome content.\n"):
         d = Path(tempfile.mkdtemp())
@@ -106,7 +118,9 @@ class ApplySubstitutionsTest(unittest.TestCase):
         return (d / sync.SKILL_MD_FILENAME).read_text(encoding=sync.UTF_8_ENCODING)
 
     def test_applies_substitution_for_configured_skill(self):
-        d = self._skill_dir(body=sync.GKE_WORKLOAD_SECURITY_OLD_NETPOL_SNIPPET + "\n")
+        d = self._skill_dir_covering(
+            "gke-workload-security", sync.GKE_WORKLOAD_SECURITY_OLD_NETPOL_SNIPPET
+        )
         self.assertTrue(sync.apply_substitutions(str(d), "gke-workload-security"))
         text = self._read(d)
         self.assertNotIn(sync.GKE_WORKLOAD_SECURITY_OLD_NETPOL_SNIPPET, text)
@@ -114,7 +128,9 @@ class ApplySubstitutionsTest(unittest.TestCase):
         self.assertIn("--enable-network-policy", text)
 
     def test_idempotent_no_duplicate(self):
-        d = self._skill_dir(body=sync.GKE_WORKLOAD_SECURITY_OLD_NETPOL_SNIPPET + "\n")
+        d = self._skill_dir_covering(
+            "gke-workload-security", sync.GKE_WORKLOAD_SECURITY_OLD_NETPOL_SNIPPET
+        )
         self.assertTrue(sync.apply_substitutions(str(d), "gke-workload-security"))
         # Second call must be a no-op (replacement already present).
         self.assertFalse(sync.apply_substitutions(str(d), "gke-workload-security"))
@@ -245,28 +261,9 @@ class ApplySubstitutionsTest(unittest.TestCase):
             self.assertNotIn(sync.GKE_WORKLOAD_SECURITY_OLD_NETPOL_SNIPPET, content)
             self.assertIn(sync.GKE_WORKLOAD_SECURITY_NEW_NETPOL_SNIPPET, content)
 
-    def test_applies_workload_troubleshooting_submit_substitution(self):
-        d = self._skill_dir(body=sync.GKE_WORKLOAD_TROUBLESHOOTING_OLD_STEP5_SUBMIT_SNIPPET + "\n")
-        self.assertTrue(sync.apply_substitutions(d, "gke-workload-troubleshooting"))
-        content = self._read(d)
-        self.assertNotIn(sync.GKE_WORKLOAD_TROUBLESHOOTING_OLD_STEP5_SUBMIT_SNIPPET, content)
-        self.assertEqual(content.count(sync.GKE_WORKLOAD_TROUBLESHOOTING_NEW_STEP5_SUBMIT_SNIPPET), 1)
-        # Idempotent: a second application finds the replacement and leaves it.
-        self.assertFalse(sync.apply_substitutions(d, "gke-workload-troubleshooting"))
-
-    def test_repo_workload_troubleshooting_skill_carries_the_submit_substitution(self):
-        # The in-tree copy is rmtree'd and re-copied on every sync, so the
-        # condition on Step 5 (#2037) survives only as a registered pair, and
-        # the copy has to already read as a fresh sync would leave it.
-        repo_root = Path(__file__).resolve().parent.parent
-        skill_md = repo_root / "agents" / "platform" / "skills" / "gke-workload-troubleshooting" / "SKILL.md"
-        content = skill_md.read_text(encoding="utf-8")
-        for target, replacement in sync.SKILL_SUBSTITUTIONS["gke-workload-troubleshooting"]:
-            self.assertNotIn(target, content)
-            self.assertEqual(content.count(replacement), 1, replacement)
-
     def test_applies_basics_credentials_substitution(self):
-        d = self._skill_dir(body=sync.GKE_BASICS_OLD_CREDENTIALS_SNIPPET + "\n")
+        d = self._skill_dir_covering("gke-basics", sync.GKE_BASICS_OLD_CREDENTIALS_SNIPPET)
+        write_registered_files(d, "gke-basics")
         self.assertTrue(sync.apply_substitutions(str(d), "gke-basics"))
         text = self._read(d)
         self.assertNotIn(sync.GKE_BASICS_OLD_CREDENTIALS_SNIPPET, text)
@@ -276,27 +273,39 @@ class ApplySubstitutionsTest(unittest.TestCase):
         self.assertFalse(sync.apply_substitutions(str(d), "gke-basics"))
         self.assertEqual(text.count(sync.GKE_BASICS_NEW_CREDENTIALS_SNIPPET), 1)
 
+    def _basics_body_with_credentials_as(self, credentials):
+        # Every other gke-basics target verbatim, so a backstop failure can only come from
+        # what `credentials` does to the credentials pair.
+        others = [
+            target
+            for target, _ in sync.SKILL_SUBSTITUTIONS["gke-basics"]
+            if target != sync.GKE_BASICS_OLD_CREDENTIALS_SNIPPET
+        ]
+        return "\n\n".join([credentials] + others) + "\n"
+
     def test_drifted_target_is_a_backstop_failure(self):
         # Unreachable while verify_local_corrections runs first, but it is what keeps the
         # uncorrected upstream text out of the tree if the clone and the copy ever disagree.
-        drifted = sync.GKE_BASICS_OLD_CREDENTIALS_SNIPPET.replace("   * Always", "   - Always")
-        d = self._skill_dir(body=drifted + "\n")
+        drifted = self._basics_body_with_credentials_as(
+            sync.GKE_BASICS_OLD_CREDENTIALS_SNIPPET.replace("   * Always", "   - Always")
+        )
+        d = self._skill_dir(body=drifted)
+        write_registered_files(d, "gke-basics")
         with self.assertRaises(sync.LocalCorrectionLost) as caught:
             sync.apply_substitutions(str(d), "gke-basics")
         self.assertIn("gke-basics/SKILL.md", str(caught.exception))
+        self.assertIn("target snippet not found", str(caught.exception))
         # Left as upstream wrote it rather than half-rewritten.
-        self.assertEqual(self._read(d), drifted + "\n")
+        self.assertEqual(self._read(d), drifted)
 
     def test_target_and_replacement_both_present_is_a_backstop_failure(self):
         # Skipping on the replacement alone would leave the target in the tree and return
         # False, so the sync would report success over the uncorrected passage.
-        body = (
-            sync.GKE_BASICS_OLD_CREDENTIALS_SNIPPET
-            + "\n\n"
-            + sync.GKE_BASICS_NEW_CREDENTIALS_SNIPPET
-            + "\n"
+        body = self._basics_body_with_credentials_as(
+            sync.GKE_BASICS_OLD_CREDENTIALS_SNIPPET + "\n\n" + sync.GKE_BASICS_NEW_CREDENTIALS_SNIPPET
         )
         d = self._skill_dir(body=body)
+        write_registered_files(d, "gke-basics")
         with self.assertRaises(sync.LocalCorrectionLost) as caught:
             sync.apply_substitutions(str(d), "gke-basics")
         self.assertIn("the target and the replacement are both present", str(caught.exception))
@@ -306,8 +315,9 @@ class ApplySubstitutionsTest(unittest.TestCase):
         # replace(..., SUBSTITUTION_COUNT) rewrites the first occurrence only, so applying a
         # pair whose target upstream repeats leaves the rest uncorrected and returns True.
         target = sync.GKE_BASICS_OLD_CREDENTIALS_SNIPPET
-        body = target + "\n\nAnd again:\n\n" + target + "\n"
+        body = self._basics_body_with_credentials_as(target + "\n\nAnd again:\n\n" + target)
         d = self._skill_dir(body=body)
+        write_registered_files(d, "gke-basics")
         with self.assertRaises(sync.LocalCorrectionLost) as caught:
             sync.apply_substitutions(str(d), "gke-basics")
         self.assertIn("occurs 2 times", str(caught.exception))
@@ -335,13 +345,48 @@ class ApplySubstitutionsTest(unittest.TestCase):
         # Pairs of one skill are applied in order to the same text, so the same holds across
         # them: a replacement that contains another pair's target or replacement changes that
         # pair's verdict once applied.
-        for skill_name, pairs in sync.SKILL_SUBSTITUTIONS.items():
+        registered = list(sync.SKILL_SUBSTITUTIONS.items()) + [
+            (f"{skill_name}/{relpath}", pairs)
+            for skill_name, files in sync.SKILL_FILE_SUBSTITUTIONS.items()
+            for relpath, pairs in files.items()
+        ]
+        for skill_name, pairs in registered:
             for target, replacement in pairs:
                 for other_target, other_replacement in pairs:
                     self.assertNotIn(other_target, replacement, skill_name)
                     self.assertNotIn(other_replacement, target, skill_name)
                     if (other_target, other_replacement) != (target, replacement):
                         self.assertNotIn(other_replacement, replacement, skill_name)
+
+    def test_applies_file_substitutions_beside_skill_md(self):
+        d = self._skill_dir_covering("gke-basics", sync.GKE_BASICS_OLD_CREDENTIALS_SNIPPET)
+        write_registered_files(d, "gke-basics")
+        self.assertTrue(sync.apply_substitutions(str(d), "gke-basics"))
+        for relpath, pairs in sync.SKILL_FILE_SUBSTITUTIONS["gke-basics"].items():
+            text = (d / relpath).read_text(encoding="utf-8")
+            for target, replacement in pairs:
+                self.assertNotIn(target, text, relpath)
+                self.assertEqual(text.count(replacement), 1, relpath)
+        self.assertFalse(sync.apply_substitutions(str(d), "gke-basics"))
+
+    def test_missing_registered_file_is_a_backstop_failure(self):
+        d = self._skill_dir_covering("gke-basics", sync.GKE_BASICS_OLD_CREDENTIALS_SNIPPET)
+        with self.assertRaises(sync.LocalCorrectionLost) as caught:
+            sync.apply_substitutions(str(d), "gke-basics")
+        self.assertIn("cli-reference.md", str(caught.exception))
+
+    def test_repo_skills_carry_every_substitution(self):
+        # The in-tree copy already reads as the next sync leaves it, so the hand edit and the
+        # registry entry cannot drift apart. substituted_files() is the one list of what a sync
+        # rewrites for a skill, so every registry apply_substitutions reads is one this loop reads.
+        skills_dir = Path(__file__).resolve().parent.parent / "agents" / "platform" / "skills"
+        for skill_name in sorted(set(sync.SKILL_SUBSTITUTIONS) | set(sync.SKILL_FILE_SUBSTITUTIONS)):
+            for relpath, pairs in sync.substituted_files(skill_name):
+                content = (skills_dir / skill_name / relpath).read_text(encoding="utf-8")
+                for target, replacement in pairs:
+                    with self.subTest(skill=skill_name, file=relpath, target=target[:40]):
+                        self.assertNotIn(target, content)
+                        self.assertEqual(content.count(replacement), 1)
 
     def test_repo_backup_dr_skill_carries_every_substitution(self):
         # The Golden Path heading on a line of its own, so it renders, and a restore plan that
@@ -431,12 +476,15 @@ class VerifyLocalCorrectionsTest(unittest.TestCase):
             (root / name).mkdir()
             if body is not None:
                 (root / name / "SKILL.md").write_text(body, encoding="utf-8")
+            write_registered_files(root / name, name)
         return root
 
     def _faithful_upstream(self):
         # Every registered skill present, carrying every target the registries expect.
         skills = {}
-        for name in set(sync.SKILL_SUBSTITUTIONS) | set(sync.SKILL_FOOTERS):
+        for name in (
+            set(sync.SKILL_SUBSTITUTIONS) | set(sync.SKILL_FILE_SUBSTITUTIONS) | set(sync.SKILL_FOOTERS)
+        ):
             targets = sync.SKILL_SUBSTITUTIONS.get(name, [])
             skills[name] = "\n\n".join(t for t, _ in targets) + "\n# skill\n"
         return skills
@@ -459,6 +507,16 @@ class VerifyLocalCorrectionsTest(unittest.TestCase):
             sync.verify_local_corrections(str(root), sorted(skills))
         self.assertIn(dropped, str(caught.exception))
         self.assertIn("renamed or removed", str(caught.exception))
+
+    def test_entry_for_an_overlay_mirrored_skill_is_reported(self):
+        # The entry would never apply: scripts/skill_overlay.py writes that skill, not this script.
+        skills = self._faithful_upstream()
+        mirrored = sorted(sync.SKILL_FOOTERS)[0]
+        root = self._upstream(skills)
+        with self.assertRaises(sync.UpstreamDriftError) as caught:
+            sync.verify_local_corrections(str(root), sorted(skills), skip={mirrored})
+        self.assertIn(mirrored, str(caught.exception))
+        self.assertIn(sync.SKILL_OVERLAY_LOCK, str(caught.exception))
 
     def test_drifted_target_is_reported(self):
         skills = self._faithful_upstream()
@@ -528,6 +586,26 @@ class VerifyLocalCorrectionsTest(unittest.TestCase):
         self.assertIn("gke-basics", message)
         self.assertIn("gke-workload-security", message)
 
+    def test_drifted_file_target_is_reported(self):
+        skills = self._faithful_upstream()
+        root = self._upstream(skills)
+        relpath = sorted(sync.SKILL_FILE_SUBSTITUTIONS["gke-basics"])[0]
+        (root / "gke-basics" / relpath).write_text("# rewritten upstream\n", encoding="utf-8")
+        with self.assertRaises(sync.UpstreamDriftError) as caught:
+            sync.verify_local_corrections(str(root), sorted(skills))
+        self.assertIn("SKILL_FILE_SUBSTITUTIONS", str(caught.exception))
+        self.assertIn(relpath, str(caught.exception))
+        self.assertIn("target snippet not found", str(caught.exception))
+
+    def test_missing_registered_file_upstream_is_reported(self):
+        skills = self._faithful_upstream()
+        root = self._upstream(skills)
+        relpath = sorted(sync.SKILL_FILE_SUBSTITUTIONS["gke-basics"])[0]
+        (root / "gke-basics" / relpath).unlink()
+        with self.assertRaises(sync.UpstreamDriftError) as caught:
+            sync.verify_local_corrections(str(root), sorted(skills))
+        self.assertIn(f"upstream skill has no {relpath}", str(caught.exception))
+
     def test_missing_skill_md_upstream_is_reported(self):
         skills = self._faithful_upstream()
         skills["gke-basics"] = None
@@ -537,9 +615,11 @@ class VerifyLocalCorrectionsTest(unittest.TestCase):
         self.assertIn("no SKILL.md", str(caught.exception))
 
     def test_every_registered_skill_is_covered(self):
-        # The pre-flight is only a guard if it reads both registries.
+        # The pre-flight is only a guard if it reads every registry.
         skills = self._faithful_upstream()
-        for name in sorted(set(sync.SKILL_SUBSTITUTIONS) | set(sync.SKILL_FOOTERS)):
+        for name in sorted(
+            set(sync.SKILL_SUBSTITUTIONS) | set(sync.SKILL_FILE_SUBSTITUTIONS) | set(sync.SKILL_FOOTERS)
+        ):
             missing = {k: v for k, v in skills.items() if k != name}
             root = self._upstream(missing)
             with self.assertRaises(sync.UpstreamDriftError, msg=name):
@@ -555,13 +635,15 @@ class SyncExitStatusTest(unittest.TestCase):
 
     SCRIPT = Path(__file__).resolve().parent / "sync-upstream-skills.py"
 
-    def _fixture_upstream(self, mutate=None, rename=None):
+    def _fixture_upstream(self, mutate=None, rename=None, extra=()):
         # A git repo the script can `git clone --depth 1`, holding the skills the registries
-        # name. Cloning a local path keeps the test off the network.
+        # name, plus any `extra` ones. Cloning a local path keeps the test off the network.
         root = Path(tempfile.mkdtemp())
         skills_dir = root / "skills" / "cloud"
         skills_dir.mkdir(parents=True)
-        for name in set(sync.SKILL_SUBSTITUTIONS) | set(sync.SKILL_FOOTERS):
+        for name in (
+            set(sync.SKILL_SUBSTITUTIONS) | set(sync.SKILL_FILE_SUBSTITUTIONS) | set(sync.SKILL_FOOTERS) | set(extra)
+        ):
             targets = sync.SKILL_SUBSTITUTIONS.get(name, [])
             body = "\n\n".join(t for t, _ in targets) + "\n# skill\n"
             if mutate:
@@ -569,6 +651,7 @@ class SyncExitStatusTest(unittest.TestCase):
             dir_name = rename(name) if rename else name
             (skills_dir / dir_name).mkdir()
             (skills_dir / dir_name / "SKILL.md").write_text(body, encoding="utf-8")
+            write_registered_files(skills_dir / dir_name, name)
         env = {**os.environ, "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_SYSTEM": "/dev/null"}
         for cmd in (
             ["git", "init", "-q", "-b", "main"],
@@ -612,6 +695,26 @@ class SyncExitStatusTest(unittest.TestCase):
         result = self._run_sync(self._fixture_upstream(), repo_root)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("Synchronization complete!", result.stdout)
+
+    def test_skill_with_an_overlay_lock_is_left_alone(self):
+        # A skill scripts/skill_overlay.py mirrors keeps its upstream.lock in its overlay. The
+        # sync must neither overwrite it (it is in upstream) nor prune it (were it not).
+        repo_root = Path(tempfile.mkdtemp())
+        mirrored = "gke-unregistered-and-mirrored"
+        upstream = self._fixture_upstream(extra=[mirrored])
+        for name in (mirrored, "gke-only-in-the-overlay"):
+            overlay = repo_root / sync.SKILL_OVERLAY_ROOT / name
+            overlay.mkdir(parents=True)
+            (overlay / sync.SKILL_OVERLAY_LOCK).write_text("commit: x\nsha256: y\n", encoding="utf-8")
+            skill = repo_root / "agents" / "platform" / "skills" / name
+            skill.mkdir(parents=True)
+            (skill / "SKILL.md").write_text("ours\n", encoding="utf-8")
+        result = self._run_sync(upstream, repo_root)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Skipping 2 skill(s) mirrored by scripts/skill_overlay.py", result.stdout)
+        for name in (mirrored, "gke-only-in-the-overlay"):
+            skill_md = repo_root / "agents" / "platform" / "skills" / name / "SKILL.md"
+            self.assertEqual(skill_md.read_text(encoding="utf-8"), "ours\n")
 
     def test_drifted_upstream_exits_one_and_writes_nothing(self):
         def drift(name, body):
@@ -691,12 +794,32 @@ class WrittenPathspecsTest(unittest.TestCase):
 
     REPO_ROOT = Path(__file__).resolve().parent.parent
 
+    def _pathspecs(self):
+        return sync.written_pathspecs(str(self.REPO_ROOT))
+
+    def _covered(self, relative):
+        # Git's reading of the list: some include matches and no exclude does.
+        includes = [p for p in self._pathspecs() if not p.startswith(":(exclude)")]
+        excludes = [p.removeprefix(":(exclude)") for p in self._pathspecs() if p.startswith(":(exclude)")]
+        return any(fnmatch.fnmatchcase(relative, p) for p in includes) and relative not in excludes
+
     def test_every_pathspec_is_scoped_to_one_agent_and_the_prefix(self):
+        mirrored = sync.overlay_mirrored_skills(str(self.REPO_ROOT))
         self.assertEqual(
-            sync.written_pathspecs(),
-            [f"agents/{agent}/skills/{sync.SKILL_PREFIX}*" for agent in sync.target_agents()],
+            self._pathspecs(),
+            [f"agents/{agent}/skills/{sync.SKILL_PREFIX}*" for agent in sync.target_agents()]
+            + [f":(exclude){sync.SKILL_OVERLAY_SKILLS}/{name}" for name in sorted(mirrored)],
         )
-        self.assertTrue(sync.written_pathspecs(), "the sync writes somewhere")
+        self.assertTrue(self._pathspecs(), "the sync writes somewhere")
+
+    def test_overlay_mirrored_skills_are_excluded(self):
+        repo_root = Path(tempfile.mkdtemp())
+        overlay = repo_root / sync.SKILL_OVERLAY_ROOT / "gke-mirrored"
+        overlay.mkdir(parents=True)
+        (overlay / sync.SKILL_OVERLAY_LOCK).write_text("commit: x\nsha256: y\n", encoding="utf-8")
+        self.assertIn(
+            f":(exclude){sync.SKILL_OVERLAY_SKILLS}/gke-mirrored", sync.written_pathspecs(str(repo_root))
+        )
 
     def test_target_agents_covers_the_defaults_and_every_override(self):
         agents = sync.target_agents()
@@ -710,6 +833,7 @@ class WrittenPathspecsTest(unittest.TestCase):
     def test_pathspecs_match_exactly_the_skills_in_the_tree_the_sync_writes(self):
         # Read against the real tree rather than a fixture: the skills the recovery commands
         # must spare are the ones that actually sit beside the synced ones.
+        mirrored = sync.overlay_mirrored_skills(str(self.REPO_ROOT))
         matched, written = set(), set()
         for agent_dir in sorted((self.REPO_ROOT / "agents").iterdir()):
             skills_dir = agent_dir / "skills"
@@ -719,10 +843,12 @@ class WrittenPathspecsTest(unittest.TestCase):
                 if not skill.is_dir():
                     continue
                 relative = f"agents/{agent_dir.name}/skills/{skill.name}"
-                if any(fnmatch.fnmatchcase(relative, p) for p in sync.written_pathspecs()):
+                if self._covered(relative):
                     matched.add(relative)
-                if agent_dir.name in sync.target_agents() and skill.name.startswith(
-                    sync.SKILL_PREFIX
+                if (
+                    agent_dir.name in sync.target_agents()
+                    and skill.name.startswith(sync.SKILL_PREFIX)
+                    and skill.name not in mirrored
                 ):
                     written.add(relative)
         self.assertTrue(written, "no synced skills found in the tree")
@@ -732,29 +858,25 @@ class WrittenPathspecsTest(unittest.TestCase):
         # An operator runs these verbatim mid-abort. A pathspec one level broader reaches the
         # skills this repository maintains rather than syncs, and discards uncommitted work on
         # them that no run of this script could have produced.
-        message = sync.local_correction_lost_message("some detail")
+        message = sync.local_correction_lost_message("some detail", str(self.REPO_ROOT))
         commands = [line.strip() for line in message.splitlines() if line.startswith("  git ")]
-        self.assertEqual(
-            commands,
-            [
-                command
-                for pathspec in sync.written_pathspecs()
-                for command in (f"git checkout -- '{pathspec}'", f"git clean -fd '{pathspec}'")
-            ],
-        )
-        # Every unsynced skill in the tree survives both commands.
+        pathspecs = " ".join(f"'{p}'" for p in self._pathspecs())
+        self.assertEqual(commands, [f"git checkout -- {pathspecs}", f"git clean -fd -- {pathspecs}"])
+        # Every skill the sync does not write survives both commands.
+        mirrored = sync.overlay_mirrored_skills(str(self.REPO_ROOT))
         for agent_dir in sorted((self.REPO_ROOT / "agents").iterdir()):
             for skill in sorted((agent_dir / "skills").glob("*")):
                 relative = f"agents/{agent_dir.name}/skills/{skill.name}"
-                if agent_dir.name in sync.target_agents() and skill.name.startswith(
-                    sync.SKILL_PREFIX
+                if (
+                    agent_dir.name in sync.target_agents()
+                    and skill.name.startswith(sync.SKILL_PREFIX)
+                    and skill.name not in mirrored
                 ):
                     continue
-                for command in commands:
-                    self.assertFalse(
-                        fnmatch.fnmatchcase(relative, command.split("'")[1]),
-                        f"{command} would discard {relative}, which the sync never writes",
-                    )
+                self.assertFalse(
+                    self._covered(relative),
+                    f"the recovery commands would discard {relative}, which the sync never writes",
+                )
 
 
 class AbortTest(unittest.TestCase):

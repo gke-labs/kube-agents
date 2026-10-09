@@ -450,3 +450,82 @@ func TestTheAllowAllDecisionMatchesTheLegacyConsumer(t *testing.T) {
 		}
 	}
 }
+
+// TestTheHomeChannelReachesTheArmedGateway: the chat.notify route posts
+// proactive messages to googleChat.homeChannel, so the armed gateway carries
+// it, trimmed, and an install with no home channel renders none, which leaves
+// the route serving conversation requests only.
+func TestTheHomeChannelReachesTheArmedGateway(t *testing.T) {
+	t.Setenv(a2aInjectBackendEnvVar, "")
+	for _, tc := range []struct {
+		name, home, want string
+		present          bool
+	}{
+		{"set", "spaces/AAAA", "spaces/AAAA", true},
+		{"padded", "  spaces/AAAA ", "spaces/AAAA", true},
+		{"unset", "", "", false},
+		{"blank", "   ", "", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			agent := gchatTestAgent("next", true)
+			agent.Spec.Integration.GoogleChat.HomeChannel = tc.home
+			env := envMapOf(buildA2AGatewayDeployment(agent).Spec.Template.Spec.Containers[0].Env)
+			got, ok := env[a2aGchatHomeChannelEnvVar]
+			if ok != tc.present || got.Value != tc.want {
+				t.Errorf("%s = %q (present=%v), want %q (present=%v)", a2aGchatHomeChannelEnvVar, got.Value, ok, tc.want, tc.present)
+			}
+		})
+	}
+	// Not under today: the legacy Hermes platform has the channel there.
+	today := gchatTestAgent("", true)
+	today.Spec.Integration.GoogleChat.HomeChannel = "spaces/AAAA"
+	if _, ok := envMapOf(buildA2AGatewayDeployment(today).Spec.Template.Spec.Containers[0].Env)[a2aGchatHomeChannelEnvVar]; ok {
+		t.Errorf("%s rendered on an unarmed gateway", a2aGchatHomeChannelEnvVar)
+	}
+}
+
+// TestTheAgentRoutesProactivePostsToTheGatewayExactlyWhenArmed: the agent
+// container is told to send proactive posts through chat.notify exactly when
+// the next stack holds Google Chat and the home channel is a space name, and
+// the kanban notifier to send a card's report back to its conversation
+// whenever the gateway arms the route (home channel unset or a space name).
+// Telling either with no route behind it sends posts to a subject nobody
+// answers.
+func TestTheAgentRoutesProactivePostsToTheGatewayExactlyWhenArmed(t *testing.T) {
+	for _, tc := range []struct {
+		name               string
+		agent              *agentv1alpha1.PlatformAgent
+		home, conversation bool
+	}{
+		{"today with chat", gchatTestAgent("", true), false, false},
+		{"skew with chat", gchatTestAgent("later", true), false, false},
+		{"next with chat", withHome(gchatTestAgent("next", true), "spaces/AAAA"), true, true},
+		{"next with chat, no home channel", gchatTestAgent("next", true), false, true},
+		{"next with chat, not a space", withHome(gchatTestAgent("next", true), "spaces/AAAA/threads/B"), false, false},
+		{"next with chat, bare id", withHome(gchatTestAgent("next", true), "AAAA"), false, false},
+		{"next without chat", withHome(gchatTestAgent("next", false), "spaces/AAAA"), false, false},
+		{"today with chat and home", withHome(gchatTestAgent("", true), "spaces/AAAA"), false, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			pod := buildPodTemplateSpec(tc.agent, "h", "h", "h", "h", nil, renderOptions{})
+			env := envMapOf(brokerContainerNamed(pod.Spec.Containers, "platform-agent").Env)
+			for name, want := range map[string]bool{a2aNotifyPlatformEnvVar: tc.home, a2aNotifyConversationsEnvVar: tc.conversation} {
+				got, ok := env[name]
+				if ok != want {
+					t.Fatalf("%s present = %v, want %v", name, ok, want)
+				}
+				if ok && got.Value != "google_chat" {
+					t.Errorf("%s = %q, want google_chat (the platform name the agent-side callers use)", name, got.Value)
+				}
+			}
+			if (tc.home || tc.conversation) && legacyChatConsumer(tc.agent) {
+				t.Error("the notify route and the legacy Hermes platform both render")
+			}
+		})
+	}
+}
+
+func withHome(agent *agentv1alpha1.PlatformAgent, home string) *agentv1alpha1.PlatformAgent {
+	agent.Spec.Integration.GoogleChat.HomeChannel = home
+	return agent
+}

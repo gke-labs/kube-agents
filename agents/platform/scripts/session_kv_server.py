@@ -6,6 +6,7 @@ from __future__ import annotations
 import hmac
 import json
 import os
+import hashlib
 import re
 import sqlite3
 import subprocess
@@ -23,6 +24,7 @@ import logging
 
 from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException
 from agent_common_server import _run_env, CONFIG_PATH, DOTENV_PATH
+import chat_notify
 import findings_queue
 import slack_audit_report
 import slack_blocks_post
@@ -88,6 +90,32 @@ SESSION_KV_AUTH_ENV = "SESSION_KV_API_KEY"
 # sentinel after all — see _gateway_api_token — but the name is resolved rather
 # than read, because which file answers it is the whole of issue #786.
 GATEWAY_AUTH_ENV = "API_SERVER_KEY"
+
+# A route the hermes-bridge records for a gateway conversation's Hermes
+# session (PUT /v1/sessions/{id}/route): only the bridge's session ids, which
+# all start with this, so the route cannot re-address an alert or cron session.
+CONVERSATION_SESSION_PREFIX = "a2a-"
+# How the hermes-bridge names a conversation's session from its context id
+# (a2a/hermes-bridge/api.go, apiSessionID): the context id verbatim when it is
+# path-safe and short enough, else a truncated SHA-256 under "h-". A route is
+# recorded only for the session its own context id names, so one session's
+# cards cannot be re-addressed to another conversation's context.
+CONVERSATION_SAFE_CONTEXT_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+CONVERSATION_CONTEXT_MAX_CHARS = 128
+CONVERSATION_HASHED_PREFIX = "h-"
+CONVERSATION_HASHED_HEX_CHARS = 32
+# The conversation key's prefix for each platform the A2A gateway can hold, as
+# the gateway spells its session-record keys (gchatConversationID,
+# slackConversationID); a key for another backend is refused.
+CONVERSATION_KEY_PREFIXES = {"google_chat": "gchat:", "slack": "slack:"}
+# The metadata key the route is kept under. Its own key, not the row's
+# platform/chat_id/thread_id: those are a chat thread's address, which other
+# readers (send_notification, the delegation headers) use as one, and a
+# gateway conversation is not addressed that way.
+CONVERSATION_ROUTE_KEY = "conversation_route"
+# Bounds on what a route carries: a gateway conversation key and context id
+# are short, and anything longer is not one.
+CONVERSATION_FIELD_MAX_CHARS = 512
 
 # Hermes' managed scope, the administrator-pinned layer `load_hermes_dotenv`
 # applies LAST with override=True. The operator mounts it at /etc/hermes and
@@ -1087,6 +1115,13 @@ def enabled_chat_platforms() -> list[str]:
        than dropped because it is the truth on the installs that do write it.
     3. The environment signals above, for an install neither file describes.
 
+    One thing outranks all three: the platform the operator names in
+    ``A2A_NOTIFY_PLATFORM`` (chat_notify.py). Under ``spec.mode: next`` the
+    managed scope says that platform's Hermes consumer is off because the A2A
+    gateway holds the backend, and posts to it go through the gateway instead,
+    so it is still a platform this install posts to. The operator renders the
+    variable only then, and it is reserved against every other source.
+
     Never returns an empty list — an install that resolves to nothing gets
     DEFAULT_CHAT_PLATFORM.
 
@@ -1124,7 +1159,13 @@ def enabled_chat_platforms() -> list[str]:
 
     resolved = []
     for name in CHAT_PLATFORMS:
-        if name in from_managed:
+        # Under next the managed scope says the Hermes platform is off, because
+        # the A2A gateway holds the backend; posts to it go through the
+        # gateway's chat.notify route instead (chat_notify.py), so it is
+        # still a platform this install posts to.
+        if chat_notify.routes(name):
+            enabled = True
+        elif name in from_managed:
             enabled = from_managed[name]
         elif name in from_profile:
             enabled = from_profile[name]
@@ -1168,8 +1209,10 @@ def get_active_platform(platforms: Optional[list[str]] = None) -> str:
     return platforms[0]
 
 
-#: Returned by :func:`_post_initial_alert` when `hermes send` reported success
-#: but no message id could be read out of its `--json` stdout. Distinct from
+#: Returned by :func:`_post_initial_alert` when the send (`hermes send`, or
+#: `a2a notify` under next) reported success but no message id could be read
+#: out of its JSON stdout, or when `a2a notify` reported that the gateway took
+#: the request and did not answer in time. Distinct from
 #: `None`, which means the send itself failed. The caller must not try the next
 #: platform on this one: the alert IS in the first platform's channel, and
 #: falling through would post it a second time somewhere else. Deliberately not
@@ -1177,31 +1220,47 @@ def get_active_platform(platforms: Optional[list[str]] = None) -> str:
 ALERT_SENT_WITHOUT_THREAD = "\x00alert-sent-without-thread"
 
 
-def _post_initial_alert(active_platform: str, alert_msg: str) -> str | None:
-    """Send initial warning alert via hermes CLI and return the thread/message ID.
+def _run_alert_send(active_platform: str, alert_msg: str) -> subprocess.CompletedProcess:
+    """Run the alert's send, waiting out a gateway route that is briefly not there.
 
-    Three outcomes, not two: a thread id, `None` when the send failed, and
-    :data:`ALERT_SENT_WITHOUT_THREAD` when it succeeded and the id could not be
-    parsed. The route's own docstring names that third case as one that has
+    The alert has one shot, so `a2a notify`'s "route unavailable" (a gateway
+    roll, or its bind retry) is retried on chat_notify's schedule rather than
+    dropping the alert; every other outcome is the caller's to read.
+    """
+    delays = chat_notify.NOTIFY_ROUTE_RETRY_DELAYS_SECONDS if chat_notify.routes(active_platform) else ()
+    for delay in (*delays, None):
+        try:
+            return subprocess.run(
+                chat_notify.command(active_platform, alert_msg),
+                check=True,
+                capture_output=True,
+                text=True,
+                stdin=subprocess.DEVNULL,
+                env=_run_env()
+            )
+        except subprocess.CalledProcessError as exc:
+            if delay is None or not chat_notify.route_unavailable(exc.returncode):
+                raise
+            logger.warning(f"Alert to '{active_platform}': the gateway's route is not there; retrying in {delay}s")
+            time.sleep(delay)
+    raise AssertionError("unreachable: the last attempt returns or raises")
+
+
+def _post_initial_alert(active_platform: str, alert_msg: str) -> str | None:
+    """Send the initial warning alert and return the thread/message ID.
+
+    Posts with `hermes send`, or with `a2a notify` for the platform the A2A
+    gateway holds under next (chat_notify.py). Three outcomes, not two: a thread
+    id, `None` when the send failed, and :data:`ALERT_SENT_WITHOUT_THREAD` when
+    it succeeded (or may have) and the id could not be read. The route's own docstring names that third case as one that has
     happened here, and it is the one where a retry does damage rather than good.
     """
     try:
-        res = subprocess.run(
-            ["hermes", "send", "--json", "--to", active_platform, alert_msg],
-            check=True,
-            capture_output=True,
-            text=True,
-            env=_run_env()
-        )
+        res = _run_alert_send(active_platform, alert_msg)
         resp = json.loads(res.stdout)
         msg_id = resp.get("message_id", "")
         if msg_id:
-            # Google Chat message IDs contain space and message parts; we extract the thread key.
-            if active_platform == "google_chat" and "/messages/" in msg_id:
-                space_part, msg_part = msg_id.split("/messages/", 1)
-                thread_key = msg_part.split(".")[0]
-                return f"{space_part}/threads/{thread_key}"
-            return msg_id
+            return chat_notify.thread_from_response(active_platform, resp)
         # Sent, but unaddressable. Say which, so the caller does not re-send.
         logger.error(
             f"Alert posted to '{active_platform}' but its response carried no message id; "
@@ -1209,6 +1268,11 @@ def _post_initial_alert(active_platform: str, alert_msg: str) -> str | None:
         )
         return ALERT_SENT_WITHOUT_THREAD
     except subprocess.CalledProcessError as exc:
+        if chat_notify.outcome_unknown(exc.returncode):
+            # The gateway took the request and did not answer in time: the
+            # alert may well be in the channel, so it must not be sent again.
+            logger.error(f"Alert to '{active_platform}' got no answer in time; treating it as sent. Stderr: {exc.stderr}")
+            return ALERT_SENT_WITHOUT_THREAD
         logger.error(f"Failed to post warning alert. Stdout: {exc.stdout}. Stderr: {exc.stderr}. Exc: {exc}")
     except Exception as exc:
         logger.error(f"Failed to post warning alert or parse message_id response: {exc}")
@@ -2620,8 +2684,9 @@ def _send_to_chat(
 ) -> str | None:
     """Post `message`, into an existing thread when one is known, within `timeout` seconds if given.
 
-    Returns the thread id to route replies to, or None if the send failed.
-    Generalises _post_initial_alert's target handling: `hermes send --to` takes
+    Returns the thread id to route replies to, None if the send failed, or
+    :data:`ALERT_SENT_WITHOUT_THREAD` when a fresh post succeeded (or, exit 3,
+    may have) with no thread to read. Generalises _post_initial_alert's target handling: `hermes send --to` takes
     `<platform>:<chat>:<thread>` for a threaded reply, which is the same target
     shape send_notification builds in platform_mcp_server.py.
     """
@@ -2630,15 +2695,26 @@ def _send_to_chat(
     if threaded:
         target = f"{active_platform}:{chat_id}:{thread_id}"
     try:
+        # A deadline shorter than the CLI's own wait is passed down to it, so it
+        # answers (exit 3) before this kills it.
+        wait = None
+        if timeout is not None and chat_notify.routes(active_platform):
+            wait = max(1, timeout - chat_notify.NOTIFY_CONNECT_SECONDS)
         res = subprocess.run(
-            ["hermes", "send", "--json", "--to", target, message],
+            chat_notify.command(target, message, wait_seconds=wait),
             check=True,
             capture_output=True,
             text=True,
+            stdin=subprocess.DEVNULL,
             env=_run_env(),
             timeout=timeout,
         )
     except subprocess.CalledProcessError as exc:
+        if chat_notify.outcome_unknown(exc.returncode):
+            # May have posted. A reply into a known thread keeps that thread,
+            # as a success does; a fresh post has no thread to register.
+            logger.warning(f"Relayed report to {target} got no answer in time; treating it as sent")
+            return thread_id if threaded else ALERT_SENT_WITHOUT_THREAD
         logger.error(f"Failed to post relayed report to {target}. Stderr: {exc.stderr}")
         return None
     except Exception as exc:
@@ -2650,16 +2726,15 @@ def _send_to_chat(
     if threaded:
         return thread_id
     try:
-        msg_id = (json.loads(res.stdout) or {}).get("message_id", "")
+        resp = json.loads(res.stdout) or {}
     except Exception as exc:
-        logger.error(f"Failed to parse message_id from hermes send: {exc}")
+        logger.error(f"Failed to parse message_id from the send: {exc}")
         return None
-    if not msg_id:
+    if not isinstance(resp, dict) or not resp.get("message_id"):
+        # A send that printed something other than an object landed nowhere
+        # this caller can address; it must not raise into the relay loop.
         return None
-    if active_platform == "google_chat" and "/messages/" in msg_id:
-        space_part, msg_part = msg_id.split("/messages/", 1)
-        return f"{space_part}/threads/{msg_part.split('.')[0]}"
-    return msg_id
+    return chat_notify.thread_from_response(active_platform, resp) or None
 
 
 # Tokens that end a turn or open a role in a chat template. None of them has a
@@ -3157,6 +3232,10 @@ def relay_cron_report(
         else:
             leg_message = truncation_notice + headline.text if headline else message
             new_thread_id = _send_to_chat(platform, leg_message, leg_chat_id, leg_thread_id)
+            if new_thread_id == ALERT_SENT_WITHOUT_THREAD:
+                # Posted (or may have): delivered, with no thread to register.
+                unthreaded.append(platform)
+                new_thread_id = None
         # Nothing is posted under the headline: every headline links the ledger
         # issue, and the incident row stored below keeps the full report for a
         # reply in the thread.
@@ -3168,6 +3247,11 @@ def relay_cron_report(
                 f"so replies are not routed"
             )
             unthreaded.append(platform)
+        elif platform in unthreaded:
+            logger.warning(
+                f"Relay for {profile}/{job_id}: report to {platform} got no answer in time; "
+                f"treated as delivered, with no thread to register"
+            )
         else:
             logger.error(
                 f"Relay for {profile}/{job_id}: report composed but not delivered to {platform}"
@@ -3661,6 +3745,77 @@ def inject_message(
     return {"status": "injected"}
 
 
+def _conversation_session_id(context_id: str) -> str:
+    """The hermes-bridge's session id for a context id (apiSessionID in a2a/hermes-bridge/api.go)."""
+    if len(context_id) <= CONVERSATION_CONTEXT_MAX_CHARS and CONVERSATION_SAFE_CONTEXT_RE.match(context_id):
+        return CONVERSATION_SESSION_PREFIX + context_id
+    digest = hashlib.sha256(context_id.encode()).hexdigest()[:CONVERSATION_HASHED_HEX_CHARS]
+    return CONVERSATION_SESSION_PREFIX + CONVERSATION_HASHED_PREFIX + digest
+
+
+@app.put("/v1/sessions/{session_id}/route", dependencies=[Depends(verify_api_key)])
+def put_conversation_route(session_id: str, request_data: Dict[str, Any]) -> Dict[str, str]:
+    """Record the gateway conversation a bridge session answers, so its cards report back there.
+
+    The hermes-bridge calls this before each turn of an `a2a-*` session (the
+    api executor's Hermes session for one gateway conversation). A kanban card
+    the turn files subscribes to `api_server` and this session id, and
+    `deploy/docker/patches/kanban_event_routing.py` reads what this stores under
+    `conversation_route` (`platform`, `conversation`, the gateway's key, and
+    `context_id`) and addresses the subscription to the conversation. The
+    kanban notifier then posts the card's report with `a2a notify
+    --conversation`, and the gateway posts it only if the conversation's
+    session record carries that context id.
+
+    The row is upserted, keeping any other keys on it; the route stays out of
+    the row's platform/chat_id/thread_id, which address a chat thread.
+    """
+    if not session_id.startswith(CONVERSATION_SESSION_PREFIX):
+        raise HTTPException(status_code=400, detail=f"a route is recorded only for {CONVERSATION_SESSION_PREFIX}* sessions")
+    platform = str(request_data.get("platform") or "").strip()
+    conversation = str(request_data.get("conversation") or "").strip()
+    context_id = str(request_data.get("context_id") or "").strip()
+    prefix = CONVERSATION_KEY_PREFIXES.get(platform)
+    if prefix is None:
+        raise HTTPException(status_code=400, detail=f"platform {platform!r} is not one the gateway holds")
+    if not conversation.startswith(prefix) or len(conversation) == len(prefix):
+        raise HTTPException(status_code=400, detail=f"conversation is not a {platform} conversation key ({prefix}...)")
+    if not context_id:
+        raise HTTPException(status_code=400, detail="context_id is required")
+    if max(len(conversation), len(context_id)) > CONVERSATION_FIELD_MAX_CHARS:
+        raise HTTPException(status_code=400, detail="conversation or context_id is too long")
+    if session_id != _conversation_session_id(context_id):
+        raise HTTPException(status_code=400, detail="context_id is not this session's")
+    with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=5.0, isolation_level=None)) as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            row = conn.execute(
+                "SELECT metadata FROM session_metadata WHERE session_id = ?", (session_id,)
+            ).fetchone()
+            meta: Dict[str, Any] = {}
+            if row:
+                try:
+                    loaded = json.loads(row[0])
+                    meta = loaded if isinstance(loaded, dict) else {}
+                except ValueError:
+                    meta = {}
+            meta[CONVERSATION_ROUTE_KEY] = {
+                "platform": platform,
+                "conversation": conversation,
+                "context_id": context_id,
+            }
+            conn.execute(
+                "INSERT INTO session_metadata (session_id, metadata) VALUES (?, ?) "
+                "ON CONFLICT(session_id) DO UPDATE SET metadata = excluded.metadata, updated_at = CURRENT_TIMESTAMP",
+                (session_id, json.dumps(meta)),
+            )
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+    return {"status": "recorded"}
+
+
 @app.get("/v1/sessions/{session_id}/metadata", dependencies=[Depends(verify_api_key)])
 def get_metadata(session_id: str) -> Dict[str, Any]:
     if not session_id:
@@ -3905,13 +4060,32 @@ def get_findings(
 
 @app.post("/v1/findings/{finding_id}/surfaced", dependencies=[Depends(verify_api_key)])
 def mark_finding_surfaced(finding_id: str, body: Dict[str, Any] | None = None) -> Dict[str, Any]:
+    """After the send. `publisher`, `added_class` and `run` are sent by a paced publisher alone (§7.2).
+
+    The MCP tool sends none of them, so a finding a model names in answer to a pull
+    is counted as named but never as shown.
+    """
     body = body or {}
     return _findings_write(
         findings_queue.mark_surfaced,
         finding_id,
         str(body.get("chat_id") or ""),
         str(body.get("thread_id") or ""),
+        str(body.get("publisher") or ""),
+        str(body.get("added_class") or ""),
+        str(body.get("run") or ""),
     )
+
+
+@app.get("/v1/findings/additions", dependencies=[Depends(verify_api_key)])
+def get_finding_additions(day: str = "") -> Dict[str, Any]:
+    """Items added on a UTC day (default today) by class, across every state (§7.2)."""
+    day = day or datetime.now(timezone.utc).date().isoformat()
+    try:
+        with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=5.0)) as conn:
+            return findings_queue.additions_on(conn, day)
+    except findings_queue.FindingError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from None
 
 
 @app.patch("/v1/findings/{finding_id}", dependencies=[Depends(verify_api_key)])

@@ -39,6 +39,10 @@ const defaultDelegationDepthMax = 3
 // relay-audience ServiceAccount token when the gchat backend is armed.
 const defaultGchatTokenPath = "/var/run/secrets/a2a-chat-relay/token"
 
+// envGchatHomeChannel carries the Chat home space the chat.notify route posts
+// to (notify.go); the operator renders it from googleChat.homeChannel.
+const envGchatHomeChannel = "A2A_GCHAT_HOME_CHANNEL"
+
 // defaultInjectPrincipalMapPath is where the operator mounts the inject
 // door's own principal map when the door is armed. A file of "id principal"
 // lines rather than a directory of one file per id, because every key carries
@@ -132,6 +136,10 @@ type Config struct {
 	// GchatAllowAllUsers disables the allowlist, stated explicitly —
 	// mirroring the legacy GOOGLE_CHAT_ALLOW_ALL_USERS posture.
 	GchatAllowAllUsers bool
+	// GchatHomeChannel is the install's Chat home space ("spaces/AAA"), where
+	// a chat.notify proactive post lands (notify.go). Empty leaves the route
+	// serving conversation requests only.
+	GchatHomeChannel string
 	// SlackAllowedUsers is the Slack backend's ingress allowlist, carried
 	// from spec.integration.slack.allowedUsers the way GchatAllowedUsers is
 	// from Chat's: the gate the legacy path enforces as SLACK_ALLOWED_USERS.
@@ -534,6 +542,7 @@ func FromEnv() (*Config, error) {
 		}
 	}
 	cfg.GchatAllowAllUsers = os.Getenv("A2A_GCHAT_ALLOW_ALL_USERS") == "true"
+	cfg.GchatHomeChannel = strings.TrimSpace(os.Getenv(envGchatHomeChannel))
 	cfg.TargetAllowedUsers = map[string]map[string][]string{}
 	platformLists := map[string][]string{}
 	// Set is a list, even set empty: the operator renders the var empty for

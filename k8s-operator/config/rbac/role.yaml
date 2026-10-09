@@ -142,6 +142,7 @@ rules:
       - kubeagents.x-k8s.io
     resources:
       - agentplugins/status
+      - agentprofiles/status
     verbs:
       - get
       - patch
@@ -149,10 +150,9 @@ rules:
   - apiGroups:
       - kubeagents.x-k8s.io
     resources:
-      - platformagents
+      - agentprofiles
+      - platformagents/status
     verbs:
-      - create
-      - delete
       - get
       - list
       - patch
@@ -161,14 +161,17 @@ rules:
   - apiGroups:
       - kubeagents.x-k8s.io
     resources:
+      - agentprofiles/finalizers
       - platformagents/finalizers
     verbs:
       - update
   - apiGroups:
       - kubeagents.x-k8s.io
     resources:
-      - platformagents/status
+      - platformagents
     verbs:
+      - create
+      - delete
       - get
       - list
       - patch

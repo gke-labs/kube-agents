@@ -50,6 +50,13 @@ const (
 	// worker adapter's steer bound (16). The next one is refused queue-full
 	// with a notice, never dropped silently.
 	steerQueueCapacity = 16
+	// seenRefusedCapacity bounds the refused follow-ups a run remembers for
+	// redelivery (taskRun.seenRefused). A queued one is remembered for the
+	// task's life, at most steerQueueCapacity of them: forgotten, its
+	// redelivery could run a second turn. A refused one forgotten costs at
+	// most a second refusal notice for a redelivery, and a redelivery
+	// comes within the durable's ack wait, so the oldest go first.
+	seenRefusedCapacity = 4 * steerQueueCapacity
 	// stderrTailBytes and stdoutTailBytes are how much of each stream a
 	// failed task's status message carries. stdout matters on failure too:
 	// `hermes chat -Q` prints a failed turn's final_response (its own
@@ -128,6 +135,12 @@ type Config struct {
 	APIURL   string
 	APIKey   string
 	APIModel string
+	// RouteURL and RouteKey are the session-kv server the API executor
+	// records each turn's conversation route with, and its bearer
+	// (route.go). An empty RouteURL records nothing: a bridge under test
+	// calls no server it did not ask for. The daemon sets DefaultRouteURL.
+	RouteURL string
+	RouteKey string
 	// APIConnectRetry is how long a refused connection to the API server is
 	// retried before the task ends hermes-api-unreachable; zero is
 	// DefaultAPIConnectRetry.
@@ -276,12 +289,17 @@ type taskRun struct {
 	// queued behind noticeMu, still writes its terminal after every notice.
 	// Lock order: noticeMu, then mu; never the reverse.
 	noticeMu sync.Mutex
-	// mu guards state, proc, and killTimers - and is held across the
+	// mu guards state, proc, killTimers and killedAt - and is held across the
 	// finalize's terminal publish: whoever holds it sees the true state.
 	mu         sync.Mutex
 	state      runState
 	proc       *exec.Cmd
 	killTimers []*time.Timer
+	// killedAt is when killGroup first signalled the process group: the
+	// deadline or a cancel. Under mu. Zero for a run that exited on its own
+	// or was killed by shutdownTasks, whose own finalize wins before the
+	// bounded reap ends, so there is no reason left to note it in.
+	killedAt time.Time
 	// cancelReq ends the API executor's request (api.go); nil outside one.
 	// Under mu like proc, which it is the counterpart of.
 	cancelReq context.CancelFunc
@@ -290,8 +308,9 @@ type taskRun struct {
 	// first. steersQueued counts every follow-up this run has queued, the
 	// ones since taken off steers included, and is what steerQueueCapacity
 	// bounds: the task's total, not what waits at one moment. seenSteers is
-	// every follow-up envelope this run has answered, so a redelivery is
-	// answered once.
+	// the follow-up envelopes this run has answered, so a redelivery is
+	// answered once: every queued one, and the newest seenRefusedCapacity
+	// refused ones, oldest first in seenRefused (rememberSteerLocked).
 	// turnsClosed is set when the worker has chosen the current answer as
 	// the deliverable (nothing queued to run) or finalize began: a
 	// follow-up after the first is refused task-ending, never queued behind
@@ -301,7 +320,13 @@ type taskRun struct {
 	steers       []*lib.Envelope
 	steersQueued int
 	seenSteers   map[string]bool
+	seenRefused  []string
 	turnsClosed  bool
+	// turn is the follow-up turn whose request is in flight or done, set
+	// under mu as its follow-up leaves the queue (apiTurn); 0 until the
+	// first follow-up's. shutdownTasks names it in its terminal, as
+	// finalizeAPIError does.
+	turn int
 	// workingSent is set once the working status is on the stream
 	// (publishWorking), under mu: a notice reads it for the task's current
 	// state, so none can say submitted after working.
@@ -377,8 +402,23 @@ type Bridge struct {
 	// racing the timer.
 	holdReplaySlot func(release func())
 
+	// publishTurn publishes a finished turn's answer as a turn artifact,
+	// publishTextArtifact by default; a field so a test can fail it, or hold
+	// it while a cancel lands, without a bus that misbehaves on cue.
+	publishTurn func(ctx context.Context, run *taskRun, artifactID, text string) error
+	// resultPublish publishes a task's result artifact, publishResult by
+	// default; a field so a test can fail it.
+	resultPublish func(ctx context.Context, run *taskRun, output string) error
+
 	// apiClient is the API executor's HTTP client (api.go).
 	apiClient *http.Client
+	// routeClient records conversation routes (route.go).
+	routeClient *http.Client
+	// routesMu guards routes, the route each session last recorded
+	// (route.go), so a failed PUT that would have written the same route
+	// is not reported as a lost one.
+	routesMu sync.Mutex
+	routes   map[string]rememberedRoute
 	// The activity door (activity.go); nil when Config.ActivityListen is "".
 	activityLn   net.Listener
 	activitySrv  *http.Server
@@ -413,10 +453,15 @@ func New(ctx context.Context, cfg Config) (*Bridge, error) {
 		queue:       make(chan *taskRun, taskQueueCapacity),
 		replaySlots: make(chan struct{}, cfg.Concurrency),
 		apiClient:   newAPIClient(),
+		routeClient: newAPIClient(),
 	}
 	b.lookAhead = b.cancelInStream
 	b.holdReplaySlot = func(release func()) { time.AfterFunc(lib.EphemeralConsumerInactiveThreshold, release) }
 	b.deliver = b.handle
+	b.resultPublish = b.publishResult
+	b.publishTurn = func(ctx context.Context, run *taskRun, artifactID, text string) error {
+		return b.publishTextArtifact(ctx, run, artifactID, lib.ArtifactTurn, text)
+	}
 	var err error
 	b.c, err = lib.Connect(ctx, cfg.NATSURL,
 		lib.WithName(b.from.Session),
@@ -558,8 +603,11 @@ func (b *Bridge) shutdownTasks() {
 		if r.state == stateRunning && r.cancelReq != nil {
 			r.cancelReq()
 		}
+		// A follow-up turn's request ended here is named, as the worker's
+		// finalizeAPIError would name it if it won the race.
+		reason := shutdownReason + turnNote(r.turn)
 		r.mu.Unlock()
-		b.finalize(r, lib.StateFailed, shutdownReason, nil)
+		b.finalize(r, lib.StateFailed, reason, nil)
 	}
 }
 
@@ -753,10 +801,6 @@ func (b *Bridge) queueSteer(ctx context.Context, run *taskRun, steer *lib.Envelo
 		run.mu.Unlock()
 		return // the submission or a follow-up redelivered: already answered
 	}
-	if run.seenSteers == nil {
-		run.seenSteers = make(map[string]bool)
-	}
-	run.seenSteers[steer.EnvelopeID] = true
 	n := lib.SteerNotice{Steer: lib.SteerRefused, EnvelopeID: steer.EnvelopeID}
 	_, hasText := promptFromMessage(steer.Payload)
 	switch {
@@ -773,8 +817,29 @@ func (b *Bridge) queueSteer(ctx context.Context, run *taskRun, steer *lib.Envelo
 		run.steersQueued++
 		n = lib.SteerNotice{Steer: lib.SteerQueued, EnvelopeID: steer.EnvelopeID}
 	}
+	rememberSteerLocked(run, steer.EnvelopeID, n.Steer == lib.SteerQueued)
 	run.mu.Unlock()
 	b.publishSteerNotices(ctx, run, []lib.SteerNotice{n})
+}
+
+// rememberSteerLocked records a follow-up envelope as answered, so its
+// redelivery is answered once. A queued one is kept for the task's life
+// (steerQueueCapacity bounds those); a refused one is kept among the newest
+// seenRefusedCapacity, and the oldest is forgotten past that. Caller holds
+// run.mu.
+func rememberSteerLocked(run *taskRun, id string, queued bool) {
+	if run.seenSteers == nil {
+		run.seenSteers = make(map[string]bool)
+	}
+	run.seenSteers[id] = true
+	if queued {
+		return
+	}
+	run.seenRefused = append(run.seenRefused, id)
+	if len(run.seenRefused) > seenRefusedCapacity {
+		delete(run.seenSteers, run.seenRefused[0])
+		run.seenRefused = run.seenRefused[1:]
+	}
 }
 
 // refuseQueued closes the run's turns and refuses every follow-up still
@@ -836,13 +901,22 @@ func takeSteerLocked(run *taskRun, steer *lib.Envelope) bool {
 // the durable's callback, for capabilityPermits's reason. nil means there is
 // none to run and the caller's answer is the deliverable; anything still
 // queued is refused task-ended by the caller's finalize.
+//
+// One call is one turn boundary, and it asks the verifier once per distinct
+// capability reference (boundaryVerdicts): the follow-ups of a task usually
+// carry the same one, and the previous turn's answer waits unposted while
+// they are checked, so a verifier that hangs would otherwise cost one
+// timeout per queued follow-up. The verdicts die with the call, so the
+// follow-up that runs was still checked at the boundary just before its
+// own turn.
 func (b *Bridge) runnableSteer(ctx context.Context, run *taskRun) (*lib.Envelope, string) {
+	verdicts := boundaryVerdicts{}
 	for {
 		steer := b.nextSteer(run)
 		if steer == nil {
 			return nil, ""
 		}
-		reason := b.capabilityRefusal(ctx, steer)
+		reason := verdicts.refusal(ctx, b, steer)
 		if reason == "" {
 			if b.nextSteer(run) != steer {
 				// Canceled, past the deadline or stopping during the
@@ -873,6 +947,25 @@ func (b *Bridge) runnableSteer(ctx context.Context, run *taskRun) (*lib.Envelope
 	}
 }
 
+// boundaryVerdicts is one turn boundary's capability verdicts, by the
+// reference each follow-up carries (runnableSteer). An authority block that
+// does not parse or carries no reference is not cached: its verdict needs
+// no verifier.
+type boundaryVerdicts map[capability.Ref]string
+
+func (v boundaryVerdicts) refusal(ctx context.Context, b *Bridge, env *lib.Envelope) string {
+	ref, present, err := capability.RefFromAuthority(env.Authority)
+	if err != nil || !present {
+		return b.capabilityRefusal(ctx, env)
+	}
+	if reason, ok := v[ref]; ok {
+		return reason
+	}
+	reason := b.capabilityRefusal(ctx, env)
+	v[ref] = reason
+	return reason
+}
+
 // closeTurns closes the queue and refuses what it holds, for reason. A no-op
 // once the task is final: its finalize refused the queue already.
 func (b *Bridge) closeTurns(run *taskRun, reason string) {
@@ -890,7 +983,8 @@ func (b *Bridge) closeTurns(run *taskRun, reason string) {
 // because a follow-up is about to run after it. Under noticeMu with the run
 // still running, so it lands before the final event finalize writes behind
 // noticeMu. false means the task is final: it already was, or the publish
-// failed and this finalized it failed. Either way the follow-up is still at
+// failed and this finalized it with the answer as the result, so the answer
+// is not lost with the turn artifact. Either way the follow-up is still at
 // the head of the queue, and that finalize refused it task-ended.
 func (b *Bridge) publishTurnAnswer(run *taskRun, turn int, text string) bool {
 	run.noticeMu.Lock()
@@ -902,12 +996,16 @@ func (b *Bridge) publishTurnAnswer(run *taskRun, turn int, text string) bool {
 		return false
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), finalizePublishTimeout)
-	err := b.publishTextArtifact(ctx, run, fmt.Sprintf("artifact-%s-turn-%d", run.origin.TaskID, turn), lib.ArtifactTurn, text)
+	err := b.publishTurn(ctx, run, fmt.Sprintf("artifact-%s-turn-%d", run.origin.TaskID, turn), text)
 	cancel()
 	run.noticeMu.Unlock()
 	if err != nil {
-		b.cfg.Logger.Error("turn answer publish failed", "task", run.origin.TaskID, "turn", turn, "err", err)
-		b.finalize(run, lib.StateFailed, fmt.Sprintf("reason: bus-publish-failed at turn %d - %s", turn, tail(err.Error(), publishErrTailBytes)), nil)
+		// The answer is still the task's: it goes out as the result, and
+		// the follow-up that was to run after it is refused task-ended. A
+		// result publish that fails too ends the task failed, as any does.
+		b.cfg.Logger.Error("turn answer publish failed; delivering it as the result",
+			"task", run.origin.TaskID, "turn", turn, "err", err)
+		b.finalize(run, lib.StateCompleted, "", &text)
 		return false
 	}
 	return true
@@ -1258,6 +1356,15 @@ func (b *Bridge) runTask(ctx context.Context, run *taskRun) {
 	stderr := newTailBuffer(stderrTailBytes)
 	cmd.Stdout = &stdout
 	cmd.Stderr = stderr
+	// WaitDelay bounds the reap. Neither stream is an *os.File, so os/exec
+	// copies each through a pipe and Wait joins the copies, which end at
+	// EOF. A process hermes started outside its group survives the group
+	// kill and can hold either pipe, and without a bound Wait, and the task,
+	// would wait until that process exits, past the deadline, with no
+	// terminal event. KillGrace is the bound, as in the worker adapter's
+	// startHarness. After a clean exit Wait reports a bound that fired as
+	// exec.ErrWaitDelay; after a failed one it returns the exit status alone.
+	cmd.WaitDelay = b.cfg.KillGrace
 	// The activity door's side of this task: a signing key in the child's
 	// environment when the door is open, and the heartbeat either way.
 	act := newActivityState(b.activityLn != nil)
@@ -1309,6 +1416,7 @@ func (b *Bridge) runTask(ctx context.Context, run *taskRun) {
 		run.mu.Unlock()
 	})
 	err := cmd.Wait()
+	reaped := time.Now()
 	deadline.Stop()
 	// The group is gone; stop any armed grace-period SIGKILLs before the
 	// pgid can be recycled onto an innocent process.
@@ -1317,7 +1425,19 @@ func (b *Bridge) runTask(ctx context.Context, run *taskRun) {
 		t.Stop()
 	}
 	run.killTimers = nil
+	note := reapCutNote(run.killedAt, reaped, cmd.WaitDelay)
 	run.mu.Unlock()
+
+	if errors.Is(err, exec.ErrWaitDelay) {
+		// Hermes exited 0, and only the copy of output a process it started
+		// still held was cut. Everything hermes wrote was in the pipe before
+		// it exited, and the copy drained it during the bound, so the answer
+		// is whole: completed, like the worker adapter's result arm, which
+		// also ignores this error. The orphan is logged, not reported.
+		b.cfg.Logger.Warn("a process hermes started held its output past the reap bound; the copy was cut",
+			"task", taskID, "bound", cmd.WaitDelay)
+		err = nil
+	}
 
 	switch {
 	case err == nil:
@@ -1327,14 +1447,46 @@ func (b *Bridge) runTask(ctx context.Context, run *taskRun) {
 		b.finalize(run, lib.StateCompleted, "", &out)
 	case run.deadlineHit.Load():
 		b.finalize(run, lib.StateFailed,
-			fmt.Sprintf("reason: deadline-exceeded - killed after %s", b.cfg.TaskDeadline), nil)
+			withDetail(fmt.Sprintf("reason: deadline-exceeded - killed after %s", b.cfg.TaskDeadline), note), nil)
 	case run.canceled.Load():
-		b.finalize(run, lib.StateCanceled, "reason: canceled-by-request", nil)
+		b.finalize(run, lib.StateCanceled, withDetail("reason: canceled-by-request", note), nil)
 	case b.closing.Load():
 		// Killed by shutdownTasks; name the real cause, not the exit code.
+		// No reap note: shutdownTasks finalized this run right after its
+		// kill, so this arm wins only when the reap was quick.
 		b.finalize(run, lib.StateFailed, shutdownReason, nil)
 	default:
 		b.finalize(run, lib.StateFailed, failureReason(err, stdout.String(), stderr.String()), nil)
+	}
+}
+
+// reapCutNote is the detail a killed run's reason adds when the reap after
+// the kill ran the full bound, or "". withDetail attaches it. A failed exit hides whether WaitDelay
+// fired (Wait returns the exit status and drops exec.ErrWaitDelay), so the
+// time from the first kill to the reap stands in for it. It is a hint, not
+// proof: a run that ignores SIGTERM until the SIGKILL a grace later is
+// reaped about one bound after the kill with nothing held, which is why the
+// note says "may". A run that exited non-zero on its own has no kill to
+// time from and gets no note; its reap is still bounded.
+func reapCutNote(killedAt, reaped time.Time, bound time.Duration) string {
+	if killedAt.IsZero() || bound <= 0 || reaped.Sub(killedAt) < bound {
+		return ""
+	}
+	return fmt.Sprintf("the reap after the kill ran the full %s, so a process hermes started may still hold its output", bound)
+}
+
+// withDetail appends detail to a reason in the executors' grammar,
+// `reason: <token>[ - detail]`: after " - " when the reason is the bare
+// token, after "; " when it already has a detail. Readers take the token as
+// the word after the prefix, so the token must stay followed by a space.
+func withDetail(reason, detail string) string {
+	switch {
+	case detail == "":
+		return reason
+	case strings.Contains(reason, " - "):
+		return reason + "; " + detail
+	default:
+		return reason + " - " + detail
 	}
 }
 
@@ -1451,8 +1603,22 @@ func (b *Bridge) lookupTask(ctx context.Context, taskID string, maxAttempts int,
 // inside the same critical section, so a racing finalizer cannot slip its
 // final in between. Publishes ride a fresh bounded context, never the
 // caller's - the terminal event must go out even when the caller's context
-// is already canceled, which is exactly what shutdown looks like.
+// is already canceled, which is exactly what shutdown looks like. A result
+// that fails to publish ends the task failed, because the result was the
+// only copy of the deliverable; finalizeCopy is the exception.
 func (b *Bridge) finalize(run *taskRun, state lib.TaskState, msg string, resultOutput *string) {
+	b.finalizeResult(run, state, msg, resultOutput, false)
+}
+
+// finalizeCopy is finalize for a result that is a copy of an answer already
+// on the stream (a turn artifact): its publish is best-effort, and one that
+// fails is logged and leaves state and msg as the cause set them, so a
+// cancel still ends canceled (payload spec assertion 13).
+func (b *Bridge) finalizeCopy(run *taskRun, state lib.TaskState, msg string, resultCopy string) {
+	b.finalizeResult(run, state, msg, &resultCopy, true)
+}
+
+func (b *Bridge) finalizeResult(run *taskRun, state lib.TaskState, msg string, resultOutput *string, copyOnly bool) {
 	// noticeMu first and for the whole of it: no steer notice can be in
 	// flight past this, and a second finalizer waits here, then leaves on
 	// stateDone, as it always waited on mu.
@@ -1479,7 +1645,10 @@ func (b *Bridge) finalize(run *taskRun, state lib.TaskState, msg string, resultO
 	run.state = stateDone
 	ctx, cancel := context.WithTimeout(context.Background(), finalizePublishTimeout)
 	if resultOutput != nil {
-		if err := b.publishResult(ctx, run, *resultOutput); err != nil {
+		if err := b.resultPublish(ctx, run, *resultOutput); err != nil && copyOnly {
+			b.cfg.Logger.Error("result publish failed; the answer is on the stream as a turn, so the terminal keeps its state",
+				"task", run.origin.TaskID, "state", state, "err", err)
+		} else if err != nil {
 			b.cfg.Logger.Error("result publish failed", "task", run.origin.TaskID, "err", err)
 			state, msg = lib.StateFailed, resultPublishFailedReason(err)
 		}
@@ -1616,6 +1785,9 @@ func (b *Bridge) publishTextArtifact(ctx context.Context, run *taskRun, artifact
 // it once the group is gone - an unstopped timer could SIGKILL a recycled
 // pgid belonging to somebody else.
 func (b *Bridge) killGroup(run *taskRun, pid int) {
+	if run.killedAt.IsZero() {
+		run.killedAt = time.Now()
+	}
 	_ = syscall.Kill(-pid, syscall.SIGTERM)
 	t := time.AfterFunc(b.cfg.KillGrace, func() {
 		_ = syscall.Kill(-pid, syscall.SIGKILL)

@@ -55,7 +55,12 @@ install without the interview.
   the gateway asks for on a request that names none; `litellm_redaction`
   (off by default) redacts every request body the gateway forwards to the
   provider, and `install.sh` sets it from the `LITELLM_REDACTION_*` keys in
-  `install.env`.
+  `install.env`; `platform_agent_mode` (default `"today"`, which passes the
+  chart nothing, so the CR carries no `mode` field) sets the `PlatformAgent`'s
+  `spec.mode`, and `"next"` also renders the NATS bus and the A2A gateway, a
+  development stack. `install.sh` sets it from `PLATFORM_AGENT_MODE` in
+  `install.env`. Changing it on a running install is a mode switch
+  ([`docs/designs/spec-mode-switch.md`](../../../docs/designs/spec-mode-switch.md)).
 - Two `random_password` values added to that Secret rather than asked for:
   `SESSION_KV_API_KEY`, the bearer token for the pod-local Session KV server,
   and `SESSION_KV_SALT`, the HMAC salt that pseudonymises chat identities.
@@ -779,18 +784,22 @@ publish here can make the detector report a change nobody made, under any
 principal it names. Never list the agent's own GSA.
 
 Beyond the three names and that list, the module's two required inputs are
-passed and two more of its optional ones:
+passed and three more of its optional ones:
 `drift_pubsub_sink_writer_identity_override`, which the module's own
 postcondition tells an operator to set when a project's sink reports a writer
-identity the module did not derive, and `drift_pubsub_sink_drain_duration`,
-the destroy-time wait below. Neither has an installer key, so through the
-front doors both are passthrough lines in `install.env`
+identity the module did not derive, and the module's two timers —
+`drift_pubsub_sink_drain_duration`, the destroy-time wait below, and
+`drift_pubsub_logging_identity_propagation_duration`, the apply-time one. None
+has an installer key, so through the front doors all three are passthrough
+lines in `install.env`
 (`TF_VAR_drift_pubsub_sink_writer_identity_override`,
-`TF_VAR_drift_pubsub_sink_drain_duration`) rather than entries in
-`terraform.tfvars`, which `write_tfvars_from_state` regenerates wholesale on
-every `install.sh` and `upgrade.sh` run — a hand-added key there is gone on the
-next one, and for the override that means the failure it cleared comes back.
-A hand-driven apply sets them in `terraform.tfvars`. Everything else is left to the module's defaults,
+`TF_VAR_drift_pubsub_sink_drain_duration`,
+`TF_VAR_drift_pubsub_logging_identity_propagation_duration`) rather than
+entries in `terraform.tfvars`, which `write_tfvars_from_state` regenerates
+wholesale on every `install.sh` and `upgrade.sh` run — a hand-added key there
+is gone on the next one, and for the override that means the failure it
+cleared comes back. A hand-driven apply sets them in `terraform.tfvars`.
+Everything else is left to the module's defaults,
 which decide the 31-day retention and the cluster scope, every GKE cluster in
 the project; a caller that needs the module's remaining knobs instantiates it
 directly.
@@ -805,8 +814,25 @@ an apply to land before the destroy that should honour it: `time_sleep` reads
 and no configuration, and `uninstall.sh` runs no apply of its own. Setting the
 variable and going straight to `uninstall.sh` waits whatever an earlier apply
 recorded, so run `upgrade.sh` in between.
+
+An apply pauses too, for
+`drift_pubsub_logging_identity_propagation_duration` (60s by default), between
+minting the project's Logging service agent and granting it publisher on the
+topic. GCP cannot bind a service agent the instant it is minted, and without
+that wait the apply fails on about one project in five with "Service account
+… does not exist", leaving the topic behind and no sink. It is paid on
+the first apply that carries the wait — the first apply with
+`enable_drift_pubsub` on, or, on an install that already had the ingress, the
+next apply of any kind after this version lands — and after that only on an
+apply that re-mints the Logging identity or changes this value, the two things
+the wait is keyed on. A project whose Logging agent
+already exists gains nothing from it, and lowering the value before that first
+apply is how it keeps the minute. Lowering it afterwards does not refund the
+wait already paid — the wait is keyed on this value, so a change re-creates it
+and pays the new, lower figure once — it only shortens any later one.
+
 [The module's README](../../modules/drift-pubsub/README.md#why-the-sink-is-created-last-and-destroyed-first)
-is canonical for both orderings.
+is canonical for all three orderings.
 
 Three outputs, each `null` while the flag is off: `drift_pubsub_topic`,
 `drift_pubsub_subscription`, and `drift_pubsub_subscription_id`, the

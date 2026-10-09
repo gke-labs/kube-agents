@@ -119,9 +119,9 @@ readonly EVAL_DRIFT_READY_INTERVAL_SECONDS=5
 # noise-filter case asserts on. What --log-dropped adds over that is which
 # record and why, and that is worth a targeted rerun rather than every lease.
 
-# The kanban board's worker cap on the eval install. The image ships
-# kanban.max_in_progress: 6 (agents/chat/config.yaml), and the operator renders
-# a different cap only when the CR carries spec.harness.tuning.maxInProgress.
+# The kanban board's worker cap on the eval install. The operator pins
+# kanban.max_in_progress in its managed scope: 6 (defaultKanbanMaxInProgress),
+# or spec.harness.tuning.maxInProgress when the CR carries it.
 # The eval deliberately runs below that production default, at five. It fans
 # its units out at EVAL_TASK_PARALLELISM (4 on a pull request, 8 on the
 # nightly since oss-test-infra#2707), and nearly every unit's opening turn
@@ -159,6 +159,34 @@ readonly EVAL_DRIFT_READY_INTERVAL_SECONDS=5
 # triage's slot), the eval's ceiling, and the chart rendering the value onto
 # the CR.
 readonly EVAL_KANBAN_MAX_IN_PROGRESS="5"
+
+# The credential-proxy container's memory limit on the eval install. The broker
+# admits a request only while its child memory reservation fits the budget it
+# derives from this limit (agents/platform/scripts/credential_proxy.py,
+# docs/designs/credential-proxy-child-memory-budget.md): at the operator's 1Gi
+# default that is four requests at once, under its slot cap of eight. The eval
+# runs EVAL_TASK_PARALLELISM lanes of Platform Agents, each fanning Cluster
+# Agents out over the seeded fleet, and on the default the queue behind those
+# four reached p50 waits of 8-22s and a longest wait of 56.7s against the
+# broker's 60s refusal: Cluster Agents' commands timed out and the judge graded
+# the answers as regressions on pull requests that never touched the path
+# (#2632). At 2Gi the budget admits nine, so the slot cap is the binding bound
+# again and the queue is the one the broker had before the budget existed,
+# with the OOM the budget exists to prevent still held off by the budget
+# (#2455's live test ran this figure: the broker's startup line read "admits 9
+# requests at once beside the slot cap of 8"). Set on this install only, through
+# spec.deployment.credentialProxy.resources, so the production default stays
+# where the CRD reference argues it should and an install that outgrows it
+# raises the same field. A string, because the CRD's quantity is int-or-string.
+# Limits only: the pool's host clusters are Autopilot with bursting, where a
+# limit above its request stands (the #2454 presubmit's proxy pod rendered
+# limits.memory 1Gi over a 512Mi request, QoS Burstable, and its broker read
+# the 1Gi), so requests.memory stays at the operator's default. On an Autopilot
+# cluster without bursting this override would be inert, as the CRD field doc
+# says, and requests.memory is the figure to raise there.
+# tests/test_ci_deploy_credential_proxy_limit.py pins the flag, that the limit
+# admits at least the slot cap, and the chart rendering it onto the CR.
+readonly EVAL_CREDENTIAL_PROXY_MEMORY_LIMIT="2Gi"
 
 # The release step 5 installs, and — for the poisoned-record guard (#1172) —
 # the label pair Helm stamps on every release-record Secret it writes
@@ -216,17 +244,22 @@ readonly SANDBOX_SSH_KEY_COMMENT="kube-agents-ci-eval"
 #     operator.extraEnv, which the operator reads as its image overrides,
 #     with the bridge's concurrency beside them, and arms
 #     the gateway's inject door the same way (A2A_INJECT_BACKEND=true);
-#   - step 6b patches the CR (the mode, and the maxSessions section 2b sized
-#     for the bridge's workers), waits for the agent Deployment to roll, gates
+#   - step 6b sets the mode through the chart's platformAgent.mode, with the
+#     maxSessions section 2b sized for the bridge's workers, in one `helm
+#     upgrade` of the release step 5 installed, waits for the agent Deployment
+#     to roll, gates
 #     on the NATS StatefulSet, the callout Deployment, the provisioning Job
 #     and the agent Deployment, in that order, waits
 #     for the inject door's Service and token Secret, and waits for the bridge
 #     sidecar the operator rendered into the agent pod to log that it is
 #     consuming `platform` tasks.
 # hack/ci-eval-pr.sh then runs the matrix through the door (AGENT_TRANSPORT=
-# inject) under the same flag. The chart deliberately renders no spec.mode
-# (docs/designs/spec-mode-switch.md), so the flip is a merge patch on the CR
-# the chart created. The names below are what the operator renders for a CR
+# inject) under the same flag. The flip goes through the chart value rather
+# than a patch on the CR so that the next lane exercises the value an
+# installer-driven next install sets (install.sh --mode, the composition's
+# platform_agent_mode), and it is still a second release after the today-mode
+# install has passed step 6 rather than a value on step 5's install, so the
+# order the gates below rely on is the one the patch had. The names below are what the operator renders for a CR
 # of this name (a2aNATSName, a2aCalloutName, a2aGatewayName, a2aInjectName and
 # the provision Job's component label in
 # k8s-operator/internal/controller/platformagent_a2a_manifests.go; the managed
@@ -235,6 +268,11 @@ readonly SANDBOX_SSH_KEY_COMMENT="kube-agents-ci-eval"
 # password key in platformagent_a2a_manifests.go). The CR name is the chart's
 # platformAgent.name default, which this deploy does not override.
 readonly PLATFORM_AGENT_CR_NAME="platform-agent"
+# The chart's CRDs, applied server-side before the release (5b′ below); the
+# same literal hack/ci-teardown.sh declares, relative to the checkout, joined
+# to SCRIPT_DIR at the use site because the tests that lift this file's
+# readonly lines into a harness run them without SCRIPT_DIR.
+readonly CHART_CRD_DIR="charts/kube-agents/crds/"
 # Timeout for deleting the PlatformAgent CR during retry, allowing the live
 # operator to clear its finalizer before uninstallation. Matches
 # charts/kube-agents/values.yaml cleanupHook.timeout (120s).
@@ -255,13 +293,19 @@ readonly PLATFORM_AGENT_CR_DELETE_TIMEOUT="120s"
 readonly EVAL_MODE_NEXT_JOB_NAMES="pull-kube-agents-smoke-test-next ci-kube-agents-eval-next ci-kube-agents-eval-nightly-next-claude"
 readonly AGENT_DEPLOYMENT_NAME="${PLATFORM_AGENT_CR_NAME}-gateway"
 readonly OPERATOR_DEPLOYMENT_NAME="${HELM_RELEASE_NAME}-controller-manager"
-# The first patch: the mode, and the maxSessions section 2b sizes for the
-# rendered bridge's workers, in one merge so the first render -- and so the
-# first provision Job -- sees both. A printf format; %d is MODE_NEXT_MAX_SESSIONS.
-# The field path is the CRD's (HarnessSpec.Tuning.MaxSessions in
-# k8s-operator/api/v1alpha1), which TestCiDeploySizesMaxSessionsToTheTasksFloor
-# holds by decoding this patch into the type.
-readonly MODE_NEXT_PATCH_FORMAT='{"spec":{"mode":"next","harness":{"tuning":{"maxSessions":%d}}}}'
+# The first change: the mode, and the maxSessions section 2b sizes for the
+# rendered bridge's workers, as one values document for one `helm upgrade`, so
+# the first render -- and so the first provision Job -- sees both. A printf
+# format; %d is MODE_NEXT_MAX_SESSIONS. The chart renders platformAgent.mode
+# as spec.mode and platformAgent.harness.tuning.maxSessions as
+# spec.harness.tuning.maxSessions, so under platformAgent the document is the
+# CR's own field paths, which TestCiDeploySizesMaxSessionsToTheTasksFloor
+# holds by decoding it into the type and tests/test_ci_deploy_mode_next.py by
+# rendering it through the chart.
+readonly MODE_NEXT_HELM_VALUES_FORMAT='{"platformAgent":{"mode":"next","harness":{"tuning":{"maxSessions":%d}}}}'
+# The flip's own `helm upgrade` waits on the chart's workloads as step 5's
+# does, but changes none of them, so it needs only the rollout budget.
+readonly MODE_NEXT_HELM_TIMEOUT="600s"
 readonly MODE_NEXT_GENERATION_ATTEMPTS=60
 readonly MODE_NEXT_POLL_SECONDS=5
 readonly MODE_NEXT_ROLLOUT_TIMEOUT="600s"
@@ -281,8 +325,8 @@ readonly BRIDGE_SIDECAR_NAME="hermes-bridge"
 # The lane runs the bridge's shipped default executor, api, the one a customer
 # install runs. Nothing here sets it: with the operator's A2A_BRIDGE_EXECUTOR
 # unset the rendered bridge carries no BRIDGE_EXECUTOR, and the bridge picks
-# api when BRIDGE_EXECUTOR is unset and the API_SERVER_KEY it copies from the
-# agent container is present (bridgeExecutor in a2a/cmd/hermes-bridge/main.go).
+# api when BRIDGE_EXECUTOR is unset and the API_SERVER_KEY the operator sets on
+# it is present (bridgeExecutor in a2a/cmd/hermes-bridge/main.go).
 # A bridge without the key falls back to cli with a warning, so the start-line
 # wait below requires this executor rather than trusting the default. Under api
 # a task is a turn in the pod's Hermes API server, whose profile is the chat
@@ -419,11 +463,12 @@ readonly A2A_CALLOUT_IMAGE_ENV_VAR="A2A_CALLOUT_IMAGE"
 readonly A2A_WORKER_IMAGE_ENV_VAR="A2A_WORKER_IMAGE"
 readonly A2A_VERIFIER_IMAGE_ENV_VAR="A2A_VERIFIER_IMAGE"
 readonly A2A_CONSOLE_IMAGE_ENV_VAR="A2A_CONSOLE_IMAGE"
-# Two of the rendered bridge's three operator settings (a2aBridgeImageEnvVar
+# Two of the rendered bridge's four operator settings (a2aBridgeImageEnvVar
 # and a2aBridgeConcurrencyOperatorEnvVar in platformagent_a2a_bridge.go): its
 # image and its BRIDGE_CONCURRENCY. The operator reads them from its own
 # environment, as it does the overrides above; no CR field carries them. The
-# third, A2A_BRIDGE_EXECUTOR, is left unset (BRIDGE_EXECUTOR_EXPECTED says why).
+# third, A2A_BRIDGE_EXECUTOR, is left unset (BRIDGE_EXECUTOR_EXPECTED says why),
+# and so is the fourth, A2A_BRIDGE_RESOURCES, so the lane runs the default sizing.
 readonly A2A_BRIDGE_IMAGE_ENV_VAR="A2A_BRIDGE_IMAGE"
 readonly A2A_BRIDGE_CONCURRENCY_ENV_VAR="A2A_BRIDGE_CONCURRENCY"
 # Named only for the diagnosis when the bridge logs another executor.
@@ -436,6 +481,17 @@ readonly A2A_CONSOLE_IMAGE_NAME="a2a-console"
 # The bridge image goes to the operator too (A2A_BRIDGE_IMAGE_ENV_VAR), which
 # renders the bridge sidecar from it.
 readonly A2A_BRIDGE_IMAGE_NAME="hermes-bridge"
+
+# The image tag's parts (section 2 assembles them). The prefix is the pool
+# repository's cleanup key: scripts/provision_ci_pool_project.sh deletes tagged
+# images whose tag starts with it once they are 14 days old, so a tag outside
+# it would be kept forever, one set of images per run.
+readonly CI_IMAGE_TAG_PREFIX="pr-"
+# Stands in for PULL_NUMBER on a run that is not a presubmit.
+readonly CI_IMAGE_TAG_NO_PULL="local"
+# Stands in for the commit when neither PULL_PULL_SHA nor a git checkout names one.
+readonly CI_IMAGE_TAG_NO_COMMIT="latest"
+readonly CI_IMAGE_TAG_SHA_CHARS=7
 
 # ─── 1. Validation & Pre-checks ───────────────────────────────────────────────
 # Still required with the agent path on vertex_ai below: the judge reads it
@@ -462,9 +518,29 @@ source "${SCRIPT_DIR}/../tags.env"
 trap dump_prow_artifacts_on_failure EXIT
 ensure_helm
 
-RAW_PULL_SHA="${PULL_PULL_SHA:-latest}"
-PULL_SHA_SHORT="${RAW_PULL_SHA:0:7}"
-export TAG="pr-${PULL_NUMBER:-local}-${PULL_SHA_SHORT:-latest}"
+# The image tag, carried by every image this run builds and installs. It has
+# to be one no node has seen: pool clusters keep their nodes' image cache
+# between leases and these images pull IfNotPresent, so a reused tag runs
+# whatever it pointed at the last time that node pulled it, and a run can
+# install a mix of its own images and older ones (gke-labs/kube-agents#2766).
+# BUILD_ID, which Prow sets on every job type, makes it unique per run. Without
+# it a periodic reused one tag forever, and a presubmit re-run of the same head
+# reused its tag after main had moved, though Prow builds the head merged onto
+# the current main. The commit is there to be read: the pull request's head on
+# a presubmit, otherwise the checkout's HEAD, since Prow sets no PULL_* on a
+# periodic (EnvForSpec returns before them) and on a batch HEAD is the merge
+# the run builds.
+if [ -n "${PULL_PULL_SHA:-}" ]; then
+  TAG_COMMIT="${PULL_PULL_SHA}"
+else
+  TAG_COMMIT="$(git -C "${SCRIPT_DIR}/.." rev-parse HEAD 2>/dev/null || true)"
+fi
+TAG_COMMIT="${TAG_COMMIT:-${CI_IMAGE_TAG_NO_COMMIT}}"
+TAG="${CI_IMAGE_TAG_PREFIX}${PULL_NUMBER:-${CI_IMAGE_TAG_NO_PULL}}-${TAG_COMMIT:0:${CI_IMAGE_TAG_SHA_CHARS}}"
+if [ -n "${BUILD_ID:-}" ]; then
+  TAG="${TAG}-${BUILD_ID}"
+fi
+export TAG
 export AR_REPO="${AR_REPO:-us-central1-docker.pkg.dev/${PROJECT_ID}/kube-agents}"
 
 export IMG="${AR_REPO}/kube-agents-operator:${TAG}"
@@ -1343,10 +1419,27 @@ if [ "${EVAL_FORGE}" = "gitlab" ]; then
   materialize_gitlab_forge_secret
 fi
 
+# ─── 5b′. The chart's CRDs, before the chart ─────────────────────────────────
+# Helm never touches crds/ on upgrade, and `helm upgrade --install` below takes
+# the upgrade path whenever a release record survived the last teardown (5a
+# keeps a deployed one, and hack/ci-teardown.sh keeps the CRDs with it). The
+# chart then renders against whatever CRD that project last installed: a field
+# the served CRD lacks is pruned from the CR on write, and the chart's own guard
+# refuses to render credentialProxy.resources against a CRD that predates it,
+# which is a render failure the retry loop below does not retry. The front
+# doors apply the chart's CRDs server-side before every re-apply for exactly
+# this (apply_crd_upgrades in scripts/installer/installer_common.sh); this
+# deploy does the same. On a fresh project it installs the objects Helm would
+# have installed, so it is idempotent there.
+echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Applying the chart's CRDs (server-side) ==="
+kubectl apply --server-side --force-conflicts -f "${SCRIPT_DIR}/../${CHART_CRD_DIR}" >/dev/null
+echo "✓ CRDs applied from ${CHART_CRD_DIR}"
+
 # ─── 5c. Deploy the chart ─────────────────────────────────────────────────────
 # Named in the build log so a run's dispatcher behaviour can be read against
 # the cap it was given without opening the rendered CR.
 echo "Kanban board cap for this install: max_in_progress=${EVAL_KANBAN_MAX_IN_PROGRESS} (spec.harness.tuning.maxInProgress)"
+echo "Credential-proxy memory limit for this install: ${EVAL_CREDENTIAL_PROXY_MEMORY_LIMIT} (spec.deployment.credentialProxy.resources.limits.memory)"
 
 HELM_INSTALL_OUT="$(mktemp)"
 HELM_EXIT=0
@@ -1371,6 +1464,7 @@ for ((attempt=1; attempt<=HELM_DEPLOY_ATTEMPTS; attempt++)); do
     --set-string "litellm.vertex.serviceAccountAnnotations.iam\.gke\.io/gcp-service-account=${LITELLM_GSA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com" \
     --set "platformAgent.deployment.availability.runtimeClassName=" \
     --set "platformAgent.harness.tuning.maxInProgress=${EVAL_KANBAN_MAX_IN_PROGRESS}" \
+    --set-string "platformAgent.deployment.credentialProxy.resources.limits.memory=${EVAL_CREDENTIAL_PROXY_MEMORY_LIMIT}" \
     --set-string "platformAgent.deployment.env[0].name=ALERT_DAILY_LIMIT_WARNING" \
     --set-string "platformAgent.deployment.env[0].value=${EVAL_ALERT_DAILY_LIMIT_WARNING}" \
     --set-string "platformAgent.deployment.env[1].name=ALERT_DAILY_LIMIT_DRIFT" \
@@ -1503,14 +1597,16 @@ fi
 echo "✓ Rollout verification finished in $((SECONDS - STEP_START))s"
 
 # ─── 6b. EVAL_MODE_NEXT: switch to spec.mode: next and gate the bus ──────────
-# Everything above proved the today-mode install. From here the CR is patched
-# and the gates run over what `mode: next` adds, in dependency order: the NATS
+# Everything above proved the today-mode install. From here the mode is set
+# through the chart (a `helm upgrade --reuse-values` of step 5's release with
+# platformAgent.mode, which the chart renders as spec.mode) and the gates run
+# over what `mode: next` adds, in dependency order: the NATS
 # StatefulSet (the bus), the callout Deployment (the Job below cannot
 # authenticate to NATS without it), the provisioning Job (the streams; until
 # it completes there is nothing on the bus), and then the agent Deployment,
 # which the operator rolls when it pins the mode into the managed .env and
 # the config hash moves. The Deployment's generation is recorded before the
-# patch: `rollout status` right after it would answer for the today
+# upgrade: `rollout status` right after it would answer for the today
 # ReplicaSet, before the operator has reconciled anything.
 #
 # Then the door and the executor, which the eval's transport needs and the
@@ -1520,12 +1616,12 @@ echo "✓ Rollout verification finished in $((SECONDS - STEP_START))s"
 # operator's: it budgets it from the first next render and adds it to the
 # agent pod once the bus is provisioned, with the image and BRIDGE_CONCURRENCY
 # step 5 set on it and the bridge's default executor
-# (a2a/docs/hermes-bridge.md, "Where it runs"), so the mode patch is the only
-# patch and the first provisioning Job already budgets the bridge's workers:
+# (a2a/docs/hermes-bridge.md, "Where it runs"), so the mode upgrade is the only
+# change and the first provisioning Job already budgets the bridge's workers:
 # no second render re-measures that budget against the stream the Job
 # created, so the refusal #2077 guarded against cannot arise. The bridge
 # enters the agent pod only once the bus is provisioned (BusProvisioned), so
-# the agent Deployment rolls twice: once for the mode patch and once, after
+# the agent Deployment rolls twice: once for the mode upgrade and once, after
 # the Job, for the bridge. The step gates both rolls. Then the step ends on the bridge's own word that it is
 # consuming `platform` tasks; until then the bus has an executor for nobody
 # and every case on the inject transport ends as infrastructure. A rendered
@@ -1591,7 +1687,7 @@ gate_mode_next_rollout() {
     dump_mode_next_state
     exit 1
   fi
-  echo "✓ ${workload} rolled out $((gate_start - MODE_NEXT_START))s..$((SECONDS - MODE_NEXT_START))s after the patch"
+  echo "✓ ${workload} rolled out $((gate_start - MODE_NEXT_START))s..$((SECONDS - MODE_NEXT_START))s after the mode switch"
 }
 
 # Waits for the agent Deployment's generation to move past the one given,
@@ -1729,9 +1825,9 @@ wait_provision_job() {
     exit 1
   fi
   if [ "${PROVISION_JOB_RERENDERED}" = "false" ]; then
-    echo "✓ ${what} left the A2A provisioning Job's render unchanged (${PROVISION_JOB_NAME} is still the current run) $((gate_start - MODE_NEXT_START))s..$((SECONDS - MODE_NEXT_START))s after the patch"
+    echo "✓ ${what} left the A2A provisioning Job's render unchanged (${PROVISION_JOB_NAME} is still the current run) $((gate_start - MODE_NEXT_START))s..$((SECONDS - MODE_NEXT_START))s after the mode switch"
   else
-    echo "✓ A2A provisioning Job ${PROVISION_JOB_NAME} complete $((gate_start - MODE_NEXT_START))s..$((SECONDS - MODE_NEXT_START))s after the patch"
+    echo "✓ A2A provisioning Job ${PROVISION_JOB_NAME} complete $((gate_start - MODE_NEXT_START))s..$((SECONDS - MODE_NEXT_START))s after the mode switch"
   fi
 }
 
@@ -1878,19 +1974,25 @@ gate_cr_not_degraded() {
 if [ "${EVAL_MODE_NEXT:-}" = "1" ]; then
   STEP_START=$SECONDS
   MODE_NEXT_START=$SECONDS
-  echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Switching ${PLATFORM_AGENT_CR_NAME} to mode: next (EVAL_MODE_NEXT=1) ==="
-  # The mode and the session cap in one patch, so the first render -- and the
-  # first provisioning Job -- sees both. Section 2b sized the cap so the
-  # budget that Job measures, which counts the rendered bridge's workers, fits
-  # the floor; the arithmetic is in the log for a reader of the artifact who
-  # finds a non-default maxSessions on the eval CR.
+  echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Switching ${PLATFORM_AGENT_CR_NAME} to mode: next through platformAgent.mode (EVAL_MODE_NEXT=1) ==="
+  # The mode and the session cap in one values document, so the first render
+  # -- and the first provisioning Job -- sees both. Section 2b sized the cap so
+  # the budget that Job measures, which counts the rendered bridge's workers,
+  # fits the floor; the arithmetic is in the log for a reader of the artifact
+  # who finds a non-default maxSessions on the eval CR.
   echo "setting spec.harness.tuning.maxSessions=${MODE_NEXT_MAX_SESSIONS} so the ${A2A_TASKS_FLOOR}-wide TASKS holds the ${MODE_NEXT_BRIDGE_CONCURRENCY}-worker bridge's budget (${MODE_NEXT_MAX_SESSIONS}*${A2A_SESSION_CONSUMERS} + ${A2A_RESERVE_FIXED} + ${A2A_RESERVE_PER_WORKER}*${MODE_NEXT_BRIDGE_CONCURRENCY} <= ${A2A_TASKS_FLOOR})"
   # The format is a named constant, which is the point of it (SC2059 wants a literal).
   # shellcheck disable=SC2059
-  printf -v MODE_NEXT_PATCH "${MODE_NEXT_PATCH_FORMAT}" "${MODE_NEXT_MAX_SESSIONS}"
+  printf -v MODE_NEXT_HELM_VALUES "${MODE_NEXT_HELM_VALUES_FORMAT}" "${MODE_NEXT_MAX_SESSIONS}"
   GEN_BEFORE="$(kubectl get "deployment/${AGENT_DEPLOYMENT_NAME}" -n "${NAMESPACE}" -o jsonpath='{.metadata.generation}')"
-  kubectl patch platformagent "${PLATFORM_AGENT_CR_NAME}" -n "${NAMESPACE}" --type merge -p "${MODE_NEXT_PATCH}"
-  wait_agent_generation_past "${GEN_BEFORE}" "the mode patch"
+  # --reuse-values keeps everything step 5 set (the images, the credentials,
+  # the operator's extraEnv) and adds the document on stdin, which is JSON and
+  # so YAML. The newline is not optional: Helm 4 drops an unterminated last
+  # line of a length that is a multiple of 4096 bytes (upgrade.sh, helm_retag).
+  printf '%s\n' "${MODE_NEXT_HELM_VALUES}" | helm upgrade "${HELM_RELEASE_NAME}" ./charts/kube-agents \
+    --namespace "${NAMESPACE}" --reuse-values --values - \
+    --wait --timeout "${MODE_NEXT_HELM_TIMEOUT}"
+  wait_agent_generation_past "${GEN_BEFORE}" "the mode upgrade"
   echo "managed .env now reads:"
   # Whole, not grepped for the mode key: the key is named in exactly two
   # places by design (tests/test_mode_grep.py), and this script is not one.
@@ -1905,7 +2007,7 @@ if [ "${EVAL_MODE_NEXT:-}" = "1" ]; then
   # render on, so no later render re-measures it against the stream it
   # creates and there is no refusal for gate_cr_not_degraded to catch
   # (#2077).
-  wait_provision_job "the mode patch"
+  wait_provision_job "the mode upgrade"
 
   gate_mode_next_rollout "deployment/${AGENT_DEPLOYMENT_NAME}"
 
@@ -1929,7 +2031,7 @@ if [ "${EVAL_MODE_NEXT:-}" = "1" ]; then
       exit 1
       ;;
   esac
-  echo "✓ ${BRIDGE_SIDECAR_NAME} in the agent pod template $((BRIDGE_TEMPLATE_START - MODE_NEXT_START))s..$((SECONDS - MODE_NEXT_START))s after the patch"
+  echo "✓ ${BRIDGE_SIDECAR_NAME} in the agent pod template $((BRIDGE_TEMPLATE_START - MODE_NEXT_START))s..$((SECONDS - MODE_NEXT_START))s after the mode switch"
   gate_mode_next_rollout "deployment/${AGENT_DEPLOYMENT_NAME}"
 
   # The inject door. The operator renders its Service and token Secret on the
@@ -1949,7 +2051,7 @@ if [ "${EVAL_MODE_NEXT:-}" = "1" ]; then
     dump_mode_next_state
     exit 1
   fi
-  echo "✓ inject door rendered (${A2A_INJECT_NAME} Service, and token Secret with key ${A2A_INJECT_TOKEN_KEY} for the eval) $((INJECT_GATE_START - MODE_NEXT_START))s..$((SECONDS - MODE_NEXT_START))s after the patch"
+  echo "✓ inject door rendered (${A2A_INJECT_NAME} Service, and token Secret with key ${A2A_INJECT_TOKEN_KEY} for the eval) $((INJECT_GATE_START - MODE_NEXT_START))s..$((SECONDS - MODE_NEXT_START))s after the mode switch"
 
   # Ready is not consuming: the bridge sweeps its registry and binds its
   # durable consumer after the container starts, and only its own log line
@@ -1972,7 +2074,7 @@ if [ "${EVAL_MODE_NEXT:-}" = "1" ]; then
     dump_mode_next_state
     exit 1
   fi
-  echo "✓ bridge consuming $((BRIDGE_LOG_START - MODE_NEXT_START))s..$((SECONDS - MODE_NEXT_START))s after the patch: ${BRIDGE_CONSUMING}"
+  echo "✓ bridge consuming $((BRIDGE_LOG_START - MODE_NEXT_START))s..$((SECONDS - MODE_NEXT_START))s after the mode switch: ${BRIDGE_CONSUMING}"
 
   # Last, for the reason in this step's header: the bucket it needs exists by
   # now, and the backoff it may still be in has been running against the two

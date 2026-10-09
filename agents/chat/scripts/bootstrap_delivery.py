@@ -39,6 +39,18 @@ Then nothing is printed; any failure prints the text. A failure after the reques
 sent may have posted, so that path can send the report twice; see
 ``_posted_as_blocks``.
 
+Just before the claim, the run registers the sweep's findings in the
+findings queue from this pod, from the items and scores the prioritization
+worker left beside the report (``_register_findings`` says why the worker's
+own registration is not enough). Between the claim and the first byte of
+stdout, it marks the report's findings shown in the findings queue, as the paced publisher ``first_report``,
+from ``INVENTORY.shown.json`` (what ``inventory_findings.py select`` chose).
+That counts them against the day's limit and keeps the hourly findings nudge,
+whose hold ends at the claim, from announcing them again as new. The marks are
+best-effort: a missing file or an unreachable queue is logged to stderr and the
+report is delivered regardless, and the registration is best-effort the
+same way.
+
 The claim is what makes "one delivery run per report" true rather than merely likely.
 ``.bootstrap_completed`` is created with ``O_CREAT | O_EXCL`` *before* anything
 reaches stdout, so of two runs racing on the same report — a scheduled tick and
@@ -54,10 +66,15 @@ what the user sees, verbatim or, on Slack with the flag on, laid out again by
 (``INVENTORY.raw.md``) and are never delivered from here.
 """
 
+import json
 import os
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from datetime import datetime, timezone
 from pathlib import Path
 
 import sandbox_exec
@@ -70,6 +87,45 @@ DELIVERY_JOB_ID = "bootstrap-inventory-delivery"
 # is easy to lose; keeping it means a re-send is a `cat`, not a re-scan.
 DELIVERED_REPORT_NAME = "INVENTORY.delivered.md"
 REPORT_NAME = "INVENTORY.md"
+
+# The items the report lists, written by ``inventory_findings.py select``
+# (its DEFAULT_SHOWN_PATH and the keys below; test_bootstrap_onboarding_scripts.py
+# holds the copies equal), and set aside beside the delivered report once read.
+SHOWN_NAME = "INVENTORY.shown.json"
+DELIVERED_SHOWN_NAME = "INVENTORY.shown.delivered.json"
+SHOWN_ITEMS = "items"
+SHOWN_CLASS = "class"
+SHOWN_IDS = "ids"
+# A few ids per item; far above any real file.
+SHOWN_MAX_BYTES = 64 * 1024
+# The sweep's extracted findings and the worker's scores, which this run
+# registers in the queue: inventory_findings.py's DEFAULT_ITEMS_PATH and
+# DEFAULT_SCORES_PATH (test_bootstrap_onboarding_scripts.py holds them equal).
+ITEMS_NAME = "INVENTORY.items.json"
+SCORES_NAME = "INVENTORY.scores.json"
+ITEMS_KEY = "items"
+SCORES_KEY = "scores"
+# A few KB per finding; far above any fleet's sweep.
+BATCH_MAX_BYTES = 4 * 1024 * 1024
+# The outcome the queue gives a row the user dismissed (findings_queue._register_one).
+SUPPRESSED = "suppressed"
+
+# The findings queue on this pod's loopback, as findings_nudge.py reaches it.
+# The cron child inherits SESSION_KV_API_KEY (deploy/docker/plugins/verify_chat_relay.py).
+FINDINGS_ENDPOINT_ENV = "SESSION_KV_ENDPOINT"
+SESSION_KV_AUTH_ENV = "SESSION_KV_API_KEY"
+DEFAULT_FINDINGS_ENDPOINT = "http://127.0.0.1:8699"
+SURFACED_PATH = "/v1/findings/{id}/surfaced"
+JSON_HEADERS = {"Content-Type": "application/json"}
+AUTH_HEADER = "Authorization"
+BEARER_PREFIX = "Bearer "
+# The paced publisher this report marks as (findings_queue.PACED_PUBLISHERS).
+PUBLISHER = "first_report"
+# One run id per delivery, so the rows of one item are one addition.
+RUN_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
+# Short: the report waits on these. A queue that does not answer one mark is
+# not asked for the rest.
+MARK_TIMEOUT_SECONDS = 5
 
 # The sandbox's data volume, whatever HERMES_HOME says on this side: the same
 # path by construction (deploy/sandbox/Dockerfile), and a separate constant
@@ -85,8 +141,9 @@ SANDBOX_TIMEOUT_SECONDS = 30
 # How old ``.bootstrap_completed`` must be before a run removes the jobs. A
 # younger marker may belong to a racing run that is still delivering (see the
 # claim in the module docstring), and removing the delivery job under it would discard its
-# report. Far above that run's post-claim work: a stdout write and one archive
-# over ssh bounded by SANDBOX_TIMEOUT_SECONDS.
+# report. Far above that run's post-claim work: one read and two archives over
+# ssh, each bounded by SANDBOX_TIMEOUT_SECONDS, marks that stop at the first
+# MARK_TIMEOUT_SECONDS timeout, and a stdout write.
 RETIRE_AFTER_SECONDS = 300
 
 # By absolute path, so no PATH entry picks the binary. A function defined under
@@ -171,35 +228,213 @@ def _claim_delivery(data_dir: Path) -> bool:
     return True
 
 
-def _archive_report(data_dir: Path, in_sandbox: bool) -> None:
-    """Rename the delivered report to ``DELIVERED_REPORT_NAME`` where it was read."""
+def _archive(data_dir: Path, in_sandbox: bool, name: str = REPORT_NAME, archived: str = DELIVERED_REPORT_NAME) -> None:
+    """Rename ``name`` to ``archived`` where it was read."""
     if not in_sandbox:
         try:
-            report = data_dir / REPORT_NAME
-            if report.exists():
-                report.replace(data_dir / DELIVERED_REPORT_NAME)
+            source = data_dir / name
+            if source.exists():
+                source.replace(data_dir / archived)
         except OSError as e:
-            sys.stderr.write(f"bootstrap_delivery: could not archive INVENTORY.md: {e}\n")
+            sys.stderr.write(f"bootstrap_delivery: could not archive {name}: {e}\n")
         return
     # As the terminal's login: the sandbox's /opt/data is that account's and
     # mode 755, so the default login cannot rename inside it.
     try:
         moved = sandbox_exec.run(
-            [REMOTE_MV, "-f", "--", f"{SANDBOX_HOME}/{REPORT_NAME}", f"{SANDBOX_HOME}/{DELIVERED_REPORT_NAME}"],
+            [REMOTE_MV, "-f", "--", f"{SANDBOX_HOME}/{name}", f"{SANDBOX_HOME}/{archived}"],
             principal=sandbox_exec.TERMINAL_PRINCIPAL,
             timeout=SANDBOX_TIMEOUT_SECONDS,
         )
     except Exception as e:
-        sys.stderr.write(f"bootstrap_delivery: could not archive INVENTORY.md in the sandbox: {e}\n")
+        sys.stderr.write(f"bootstrap_delivery: could not archive {name} in the sandbox: {e}\n")
         return
     if moved.returncode != 0:
         sys.stderr.write(
-            "bootstrap_delivery: could not archive INVENTORY.md in the sandbox: "
+            f"bootstrap_delivery: could not archive {name} in the sandbox: "
             f"{(moved.stderr or '').strip()}\n"
         )
 
 
-def _cleanup(data_dir: Path, in_sandbox: bool) -> None:
+def _read_beside(data_dir: Path, in_sandbox: bool, name: str, max_bytes: int) -> bytes | None:
+    """Up to ``max_bytes + 1`` bytes of ``name`` where the report was read, or None if there is none."""
+    if in_sandbox:
+        return sandbox_exec.read_bytes(
+            f"{SANDBOX_HOME}/{name}", max_bytes=max_bytes + 1, timeout=SANDBOX_TIMEOUT_SECONDS
+        )
+    try:
+        with open(data_dir / name, "rb") as handle:
+            return handle.read(max_bytes + 1)
+    except FileNotFoundError:
+        return None
+
+
+def _read_shown(data_dir: Path, in_sandbox: bool) -> bytes | None:
+    """``SHOWN_NAME``'s bytes where the report was read, or None if there is none."""
+    return _read_beside(data_dir, in_sandbox, SHOWN_NAME, SHOWN_MAX_BYTES)
+
+
+def _read_json_beside(data_dir: Path, in_sandbox: bool, name: str) -> dict | None:
+    """``name`` parsed where the report was read, or None if there is none. Raises on anything unusable."""
+    raw = _read_beside(data_dir, in_sandbox, name, BATCH_MAX_BYTES)
+    if raw is None:
+        return None
+    if len(raw) > BATCH_MAX_BYTES:
+        raise ValueError(f"{name} is larger than {BATCH_MAX_BYTES} bytes")
+    parsed = json.loads(raw.decode("utf-8"))
+    if not isinstance(parsed, dict):
+        raise ValueError(f"{name} is not a JSON object")
+    return parsed
+
+
+def _findings_endpoint() -> str:
+    return (os.environ.get(FINDINGS_ENDPOINT_ENV) or DEFAULT_FINDINGS_ENDPOINT).rstrip("/")
+
+
+def _register_findings(data_dir: Path, in_sandbox: bool) -> set[str]:
+    """Register every finding the sweep extracted in the findings queue, as
+    ``inventory_findings.py register`` does, from this pod.
+
+    The worker runs ``register`` through its terminal. With the shell sandbox
+    on, that terminal cannot reach the queue on this pod's loopback, so
+    ``register`` exits 13 and nothing reaches the queue; the findings the report
+    leaves out would then never reach the findings nudge, which reads only the
+    queue, and the report's marks would find no rows. This run can reach it.
+    Registering is an upsert, so a batch the worker did register is written
+    again unchanged.
+
+    Nothing is registered when the hand-off filed no prioritization card
+    (``bootstrap_handoff.NO_RANKING``): no cluster was audited, nothing
+    rewrote the items and scores, and any left beside the report are an
+    earlier sweep's, whose complete scopes would re-open findings and mark
+    current ones absent.
+
+    Returns the ids the queue answered ``suppressed``: rows the user
+    dismissed. With the shell sandbox on, ``select`` never learned them, so
+    the report may list one; ``_mark_shown`` leaves them unmarked.
+
+    Never raises. Runs before the claim, so it adds nothing to the claimed
+    run's work (``RETIRE_AFTER_SECONDS``), and the nudge holds until the claim.
+    """
+    suppressed: set[str] = set()
+    try:
+        import bootstrap_handoff  # beside this script in the pod
+        import inventory_findings  # beside this script in the pod
+
+        handed_off = bootstrap_handoff._read_marker(data_dir / bootstrap_handoff.HANDOFF_MARKER)
+        if handed_off.get("task_id") == bootstrap_handoff.NO_RANKING:
+            sys.stderr.write(
+                "bootstrap_delivery: the hand-off filed no prioritization card, so any "
+                f"{ITEMS_NAME} is an earlier sweep's; registering nothing\n"
+            )
+            return suppressed
+        extracted = _read_json_beside(data_dir, in_sandbox, ITEMS_NAME)
+        if extracted is None:
+            sys.stderr.write(f"bootstrap_delivery: no {ITEMS_NAME}; registering nothing\n")
+            return suppressed
+        items = extracted[ITEMS_KEY]
+        if not items:
+            return suppressed  # a clean fleet: nothing to register, and no scores file
+        raw_scores = _read_json_beside(data_dir, in_sandbox, SCORES_NAME)
+        if raw_scores is None:
+            sys.stderr.write(f"bootstrap_delivery: no {SCORES_NAME}; registering nothing\n")
+            return suppressed
+        payloads = inventory_findings.build_payloads(items, raw_scores[SCORES_KEY])
+        batches = inventory_findings.cluster_batches(payloads, inventory_findings.complete_clusters(raw_scores))
+    except Exception as e:
+        detail = "; ".join(getattr(e, "errors", None) or [str(e)])
+        sys.stderr.write(f"bootstrap_delivery: could not read the sweep's findings; registering nothing: {detail}\n")
+        return suppressed
+    endpoint = _findings_endpoint()
+    for where, batch, scope in batches:
+        try:
+            result = inventory_findings.post_batch(endpoint, batch, scope)
+        except urllib.error.HTTPError as e:
+            # This cluster only.
+            sys.stderr.write(f"bootstrap_delivery: the findings queue refused {where}'s findings: {e.code}\n")
+            continue
+        except Exception as e:
+            sys.stderr.write(
+                f"bootstrap_delivery: the findings queue at {endpoint} did not answer ({e}); "
+                "not registering the rest\n"
+            )
+            return suppressed
+        outcomes = result.get("results") if isinstance(result, dict) else None
+        for entry in outcomes if isinstance(outcomes, list) else []:
+            if isinstance(entry, dict) and entry.get("outcome") == SUPPRESSED:
+                suppressed.add(str(entry.get("id")))
+    return suppressed
+
+
+def _post_surfaced(endpoint: str, finding_id: str, body: dict) -> None:
+    headers = dict(JSON_HEADERS)
+    token = (os.environ.get(SESSION_KV_AUTH_ENV) or "").strip()
+    if token:
+        headers[AUTH_HEADER] = f"{BEARER_PREFIX}{token}"
+    path = SURFACED_PATH.format(id=urllib.parse.quote(finding_id, safe=""))
+    request = urllib.request.Request(
+        f"{endpoint}{path}", data=json.dumps(body).encode("utf-8"), headers=headers, method="POST"
+    )
+    with urllib.request.urlopen(request, timeout=MARK_TIMEOUT_SECONDS) as response:
+        response.read()
+
+
+def _mark_shown(data_dir: Path, in_sandbox: bool, suppressed: set[str] = frozenset()) -> bool:
+    """Mark every row of every item the report lists shown, as ``PUBLISHER``,
+    except the ``suppressed`` ids registration reported: the user dismissed
+    them, so they are never pending and spend no slot of the day's limit.
+    The queue refuses such a mark anyway; skipping it saves the request.
+
+    Returns whether to set the shown file aside: True unless there is none,
+    so a file this run could not read is not marked by a later report.
+    Never raises: the claim is taken, so nothing here may stop the report
+    going out.
+    """
+    try:
+        raw = _read_shown(data_dir, in_sandbox)
+    except Exception as e:
+        sys.stderr.write(f"bootstrap_delivery: could not read {SHOWN_NAME}; marking nothing: {e}\n")
+        return True
+    if raw is None:
+        sys.stderr.write(f"bootstrap_delivery: no {SHOWN_NAME}; marking nothing\n")
+        return False
+    try:
+        if len(raw) > SHOWN_MAX_BYTES:
+            raise ValueError(f"larger than {SHOWN_MAX_BYTES} bytes")
+        items = json.loads(raw.decode("utf-8"))[SHOWN_ITEMS]
+        marks = [(str(item[SHOWN_CLASS]), [str(fid) for fid in item[SHOWN_IDS]]) for item in items]
+    except Exception as e:
+        sys.stderr.write(f"bootstrap_delivery: {SHOWN_NAME} is not readable; marking nothing: {e}\n")
+        return True
+    endpoint = _findings_endpoint()
+    run = datetime.now(timezone.utc).strftime(RUN_FORMAT)
+    for added_class, ids in marks:
+        body = {"publisher": PUBLISHER, "added_class": added_class, "run": run}
+        for finding_id in ids:
+            if finding_id in suppressed:
+                sys.stderr.write(f"bootstrap_delivery: not marking {finding_id} shown: the user dismissed it\n")
+                continue
+            try:
+                _post_surfaced(endpoint, finding_id, body)
+            except urllib.error.HTTPError as e:
+                # This row only: an unregistered one is a 404, one the user
+                # decided since registration a 400. Reading the
+                # body can itself time out, which must not escape.
+                try:
+                    detail = e.read().decode("utf-8", "replace").strip()
+                except Exception:
+                    detail = ""
+                sys.stderr.write(f"bootstrap_delivery: could not mark {finding_id} shown: {e.code} {detail}\n")
+            except Exception as e:
+                sys.stderr.write(
+                    f"bootstrap_delivery: the findings queue at {endpoint} did not answer ({e}); "
+                    "not marking the rest\n"
+                )
+                return True
+    return True
+
+
+def _cleanup(data_dir: Path, in_sandbox: bool, shown: bool = False) -> None:
     """Tidy up after the report has been posted as blocks or emitted to stdout.
 
     Onboarding is already marked complete by the delivery claim, so everything
@@ -210,9 +445,12 @@ def _cleanup(data_dir: Path, in_sandbox: bool) -> None:
     it out of the way still matters: the sweep and prioritization SOPs, which
     run where the report is, treat a present ``INVENTORY.md`` as "already done",
     so leaving it in place would make a later, deliberate re-run of onboarding a
-    no-op.
+    no-op. ``shown`` sets the shown file aside beside it, so a later report
+    whose worker never ran ``select`` is not marked with this one's items.
     """
-    _archive_report(data_dir, in_sandbox)
+    _archive(data_dir, in_sandbox)
+    if shown:
+        _archive(data_dir, in_sandbox, SHOWN_NAME, DELIVERED_SHOWN_NAME)
 
 
 def _retire_jobs() -> None:
@@ -359,10 +597,18 @@ def main(data_dir: Path | None = None) -> int:
         return 1
     content = raw.decode("utf-8", errors="replace")
 
+    # Before the claim, which ends the nudge's hold, so the rows exist when
+    # the marks below are sent.
+    suppressed = _register_findings(data_dir, in_sandbox)
+
     # The cheap check above is advisory; this is the decision. Nothing may be
     # written to stdout before it succeeds.
     if not _claim_delivery(data_dir):
         return 0  # another run is delivering this report — stay silent
+
+    # Right after the claim, which ends the nudge's hold, so a nudge run has
+    # the shortest window in which to announce these findings as new.
+    shown = _mark_shown(data_dir, in_sandbox, suppressed)
 
     if not _posted_as_blocks(content):
         sys.stdout.write(_presented(content))
@@ -370,7 +616,7 @@ def main(data_dir: Path | None = None) -> int:
 
     # Cleanup runs only after the report is posted or safely on stdout (already
     # captured by the scheduler), so removing INVENTORY.md here cannot truncate delivery.
-    _cleanup(data_dir, in_sandbox)
+    _cleanup(data_dir, in_sandbox, shown)
     return 0
 
 

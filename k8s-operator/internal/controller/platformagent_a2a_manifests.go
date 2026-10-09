@@ -538,7 +538,24 @@ const (
 	a2aGchatRelayURLEnvVar      = "A2A_GCHAT_RELAY_URL"
 	a2aGchatAllowedUsersEnvVar  = "A2A_GCHAT_ALLOWED_USERS"
 	a2aGchatAllowAllUsersEnvVar = "A2A_GCHAT_ALLOW_ALL_USERS"
-	a2aChatDisplayModeEnvVar    = "A2A_CHAT_DISPLAY_MODE"
+	// The home space the gateway's chat.notify route posts to
+	// (a2a/gateway/config.go, notify.go), from googleChat.homeChannel.
+	a2aGchatHomeChannelEnvVar = "A2A_GCHAT_HOME_CHANNEL"
+	// The agent container's half of the same route: which platform name
+	// the agent-side callers route through `a2a notify` instead of
+	// `hermes send` (agents/platform/scripts/chat_notify.py).
+	a2aNotifyPlatformEnvVar = "A2A_NOTIFY_PLATFORM"
+	a2aNotifyPlatformGchat  = "google_chat"
+	// The kanban notifier's half (deploy/docker/patches/kanban_chat_notify.py,
+	// and kanban_event_routing.py, which addresses a card to the conversation):
+	// the platform whose gateway conversations a card reports back to. Its own
+	// variable because the route serves conversations with no home channel,
+	// while A2A_NOTIFY_PLATFORM sends every proactive post to the home channel
+	// and so needs one.
+	a2aNotifyConversationsEnvVar = "A2A_NOTIFY_CONVERSATIONS"
+	// The prefix of a Chat space resource name.
+	a2aGchatSpacePrefix      = "spaces/"
+	a2aChatDisplayModeEnvVar = "A2A_CHAT_DISPLAY_MODE"
 	// The CR field's own default. The gateway's unset resolves to "debug"
 	// so Discord installs render as they always have; the operator is what
 	// makes the CR and the env agree, so unset on the CR renders this.
@@ -1173,6 +1190,34 @@ func a2aTargetAllowlistEnv(agent *agentv1alpha1.PlatformAgent) []corev1.EnvVar {
 // door flag, read the same way and failing shut the same way.
 func a2aAgentDoorEnabled() bool {
 	return os.Getenv(a2aAgentDoorEnvVar) == "true"
+}
+
+// a2aGchatNotifyArmed reports whether the gateway arms its chat.notify route
+// for this install's Google Chat: Chat consumed by the next stack, and a home
+// channel that is either unset (the route then serves conversation requests,
+// a kanban card's report back to the conversation it came from) or a Chat
+// space name (home posts too). A malformed one leaves the route unarmed
+// (a2a/gateway/notify.go, NewGchatNotifier).
+func a2aGchatNotifyArmed(agent *agentv1alpha1.PlatformAgent) bool {
+	if !a2aChatArmed(agent) {
+		return false
+	}
+	return strings.TrimSpace(agent.Spec.Integration.GoogleChat.HomeChannel) == "" || a2aGchatHomeSpace(agent) != ""
+}
+
+// a2aGchatHomeSpace is googleChat.homeChannel trimmed, when it is a Chat space
+// name ("spaces/<id>", nothing nested), and "" otherwise: the home channel the
+// gateway's chat.notify route posts proactive messages to.
+func a2aGchatHomeSpace(agent *agentv1alpha1.PlatformAgent) string {
+	if !googleChatEnabled(agent) {
+		return ""
+	}
+	home := strings.TrimSpace(agent.Spec.Integration.GoogleChat.HomeChannel)
+	id, ok := strings.CutPrefix(home, a2aGchatSpacePrefix)
+	if !ok || id == "" || strings.Contains(id, "/") {
+		return ""
+	}
+	return home
 }
 
 // a2aChatArmed reports whether this install's Google Chat is consumed by the
@@ -2473,7 +2518,7 @@ func buildA2ANATSNetworkPolicy(agent *agentv1alpha1.PlatformAgent) *networkingv1
 				Ports: []networkingv1.NetworkPolicyPort{
 					{Protocol: &tcp, Port: ptr.To(intstr.FromInt32(a2aNATSClientPort))},
 				},
-				From: []networkingv1.NetworkPolicyPeer{
+				From: append([]networkingv1.NetworkPolicyPeer{
 					// The auth callout, FIRST, and the ordering is the
 					// point rather than tidiness.
 					//
@@ -2535,7 +2580,7 @@ func buildA2ANATSNetworkPolicy(agent *agentv1alpha1.PlatformAgent) *networkingv1
 						labelPartOf:       a2aPartOf,
 						a2aComponentLabel: "seed",
 					}}},
-				},
+				}, a2aOperatorNATSPeers()...),
 			}, {
 				// 9222 from the console server alone. See the doc comment
 				// for why it is the only one.
@@ -2550,6 +2595,28 @@ func buildA2ANATSNetworkPolicy(agent *agentv1alpha1.PlatformAgent) *networkingv1
 			}},
 		},
 	}
+}
+
+// a2aOperatorNATSPeers admits the operator's own pod, which publishes
+// AgentProfile cards. It runs in the operator's namespace rather than the
+// agent's, so the peer pairs a namespace selector with the bus-client label the
+// manager's pod template carries; the callout, not this fence, is what decides
+// whether a pod there is the operator. No peer when the manager does not know
+// its own namespace, or holds one that is not a label value: it renders no bus
+// identity then either.
+func a2aOperatorNATSPeers() []networkingv1.NetworkPolicyPeer {
+	ns, _, ok := operatorBusPrincipal()
+	if !ok {
+		return nil
+	}
+	return []networkingv1.NetworkPolicyPeer{{
+		NamespaceSelector: &metav1.LabelSelector{MatchLabels: map[string]string{
+			corev1.LabelMetadataName: ns,
+		}},
+		PodSelector: &metav1.LabelSelector{MatchLabels: map[string]string{
+			a2aOperatorBusClientLabel: a2aOperatorBusClientLabelValue,
+		}},
+	}}
 }
 
 // a2aProvisionScript is the provisioning payload: the four streams, three KV
@@ -4453,6 +4520,13 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 			// A2A_MAX_SESSIONS: the path and the mount below are one fact.
 			{Name: a2aGchatTokenPathEnvVar, Value: a2aGchatTokenPath},
 		}
+		// Proactive posts land here (the chat.notify route). Unset leaves
+		// the route serving a kanban card's report back to its conversation
+		// only: proactive posts have nowhere to go, as on today with no home
+		// channel.
+		if home := strings.TrimSpace(gchat.HomeChannel); home != "" {
+			chatEnv = append(chatEnv, corev1.EnvVar{Name: a2aGchatHomeChannelEnvVar, Value: home})
+		}
 		chatMounts = []corev1.VolumeMount{{Name: a2aGchatTokenVolume, MountPath: a2aGchatTokenDir, ReadOnly: true}}
 		chatVolumes = []corev1.Volume{{
 			Name: a2aGchatTokenVolume,
@@ -4847,7 +4921,14 @@ func (r *PlatformAgentReconciler) reconcileA2A(ctx context.Context, agent *agent
 	// it: the callout refuses connections until it is serving a map, so
 	// rendering the map first shortens the window in which a restarting bus
 	// has a callout with nothing to say.
-	authMap, authMapVersion, err := buildA2AAuthMapConfigMap(agent)
+	var profiles []agentv1alpha1.AgentProfile
+	if !r.agentProfilesUnreadable {
+		var err error
+		if profiles, err = boundAgentProfiles(ctx, r.Client, agent); err != nil {
+			return state, fmt.Errorf("failed to list AgentProfiles: %w", err)
+		}
+	}
+	authMap, authMapVersion, err := buildA2AAuthMapConfigMap(agent, profiles)
 	if err != nil {
 		return state, fmt.Errorf("failed to render the A2A identity map: %w", err)
 	}

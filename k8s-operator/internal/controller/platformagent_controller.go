@@ -262,6 +262,12 @@ const (
 	// proxy Deployment is rendered at the operator's default resources.
 	conditionReasonInvalidCredentialProxyResources = "InvalidCredentialProxyResources"
 	invalidCredentialProxyResourcesMsgFmt          = "Invalid spec.deployment.credentialProxy.resources (%s); the override is ignored and the credential-proxy Deployment runs at the operator's default resources until it is corrected" // #nosec G101 -- Condition message, not a credential
+	// conditionReasonInvalidAgentAPIAuthResources: the CR's
+	// spec.deployment.agentAPIAuth.resources fails ValidateAgentAPIAuthResources,
+	// so the override is ignored and the agent-api-auth sidecar is rendered at
+	// the operator's default resources.
+	conditionReasonInvalidAgentAPIAuthResources = "InvalidAgentAPIAuthResources"
+	invalidAgentAPIAuthResourcesMsgFmt          = "Invalid spec.deployment.agentAPIAuth.resources (%s); the override is ignored and the agent-api-auth sidecar runs at the operator's default resources until it is corrected" // #nosec G101 -- Condition message, not a credential
 	// conditionReasonMinterPruningHeld: a GitHub repository entry the minter
 	// sync cannot read holds every tracked policy, so a repository removed
 	// from the lists keeps its write policy until the entry is fixed.
@@ -319,6 +325,13 @@ type PlatformAgentReconciler struct {
 	// cleared when the CR is deleted.
 	credentialProxyWarningsLogged sync.Map
 
+	// agentAPIAuthWarningsLogged records, per CR, the spec generation whose
+	// agent-api-auth resources warnings reconcileWorkload last logged, so each
+	// generation logs them once. Keyed by ObjectKey, value int64; cleared when
+	// the CR is deleted. Separate from the proxy's gate: the two containers'
+	// overrides change independently.
+	agentAPIAuthWarningsLogged sync.Map
+
 	// APIReader reads straight from the API server, bypassing the manager's cache.
 	// Collector discovery looks at Services in namespaces this operator otherwise never
 	// touches, and a cached read there would have the manager start — and keep — an
@@ -331,6 +344,12 @@ type PlatformAgentReconciler struct {
 	// (#1009). Nil never probes, which is what tests and the golden harness
 	// supply; see rbac_selfcheck.go.
 	RBAC *RBACChecker
+
+	// agentProfilesUnreadable is set at setup when the role cannot read
+	// AgentProfiles (AgentProfileAccessDenied). The watch is skipped then, and
+	// the identity map renders no profiles rather than listing a kind whose
+	// informer would never sync.
+	agentProfilesUnreadable bool
 
 	// Recorder writes Events on the PlatformAgent. Nil records nothing, which
 	// is what tests and the golden harness supply (recordEvent).
@@ -1093,6 +1112,7 @@ func (r *PlatformAgentReconciler) handleDeletion(ctx context.Context, agent *age
 		// Resource is deleted. Safe to remove finalizer and update.
 		r.forgetUsageStatus(agent)
 		r.credentialProxyWarningsLogged.Delete(client.ObjectKeyFromObject(agent))
+		r.agentAPIAuthWarningsLogged.Delete(client.ObjectKeyFromObject(agent))
 		controllerutil.RemoveFinalizer(agent, platformAgentFinalizer)
 		if err := r.Update(ctx, agent); err != nil {
 			return ctrl.Result{}, err
@@ -1941,13 +1961,39 @@ func (r *PlatformAgentReconciler) reconcileWorkload(ctx context.Context, agent *
 	// Note: Switching between Deployment and StatefulSet causes a full delete+recreate of the workload.
 	// This will incur downtime and potentially stuck pods if RWO volumes take time to unbind.
 	// This is an acceptable tradeoff since switching replicas/storage requires an explicit CRD update.
+	// A refused spec.deployment.agentAPIAuth.resources renders the sidecar at the
+	// operator's defaults rather than withholding the gateway, so the rest of the
+	// Pod keeps flowing and updateStatusReady reports the refusal as Degraded.
+	// Computed above the Deployment/StatefulSet fork so both gateway builders
+	// receive the stripped CR, not only the Deployment. The webhook, where it is
+	// on, has already refused the edit at apply.
+	gatewayAgent := agent
+	apiAuthRefusal, apiAuthWarnings := agentAPIAuthResourcesRefusal(agent)
+	// Logged once per spec generation (as the proxy's warnings are), so a
+	// webhook-off install still hears the Autopilot band and limit-without-request
+	// notes the validator computes for a valid-but-shaped override.
+	apiAuthKey := client.ObjectKeyFromObject(agent)
+	if logged, ok := r.agentAPIAuthWarningsLogged.Load(apiAuthKey); !ok || logged.(int64) != agent.Generation {
+		for _, warning := range apiAuthWarnings {
+			logf.FromContext(ctx).Info("WARNING: "+warning, "name", agent.Name, "namespace", agent.Namespace)
+		}
+		r.agentAPIAuthWarningsLogged.Store(apiAuthKey, agent.Generation)
+	}
+	if apiAuthRefusal != "" {
+		logf.FromContext(ctx).Info("refusing spec.deployment.agentAPIAuth.resources; the agent-api-auth sidecar is rendered at the operator's default resources",
+			"name", agent.Name, "namespace", agent.Namespace, "refusal", apiAuthRefusal)
+		r.recordEvent(agent, corev1.EventTypeWarning, conditionReasonInvalidAgentAPIAuthResources, apiAuthRefusal)
+		gatewayAgent = agent.DeepCopy()
+		gatewayAgent.Spec.Deployment.AgentAPIAuth = nil
+	}
+
 	if useStatefulSet(agent) {
 		dep := &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: agent.Name + "-gateway", Namespace: agent.Namespace}}
 		if err := client.IgnoreNotFound(r.Delete(ctx, dep)); err != nil {
 			return fmt.Errorf("failed to cleanup legacy Deployment: %w", err)
 		}
 
-		sts := buildStatefulSet(agent, configHash, fluentBitHash, settingsHash, policyHash, agentPlugins, opts)
+		sts := buildStatefulSet(gatewayAgent, configHash, fluentBitHash, settingsHash, policyHash, agentPlugins, opts)
 		if err := r.stampSecretEnvHash(ctx, agent, sts, &sts.Spec.Template); err != nil {
 			return err
 		}
@@ -1962,7 +2008,7 @@ func (r *PlatformAgentReconciler) reconcileWorkload(ctx context.Context, agent *
 		return fmt.Errorf("failed to cleanup legacy StatefulSet: %w", err)
 	}
 
-	dep := buildDeployment(agent, configHash, fluentBitHash, settingsHash, policyHash, agentPlugins, opts)
+	dep := buildDeployment(gatewayAgent, configHash, fluentBitHash, settingsHash, policyHash, agentPlugins, opts)
 	if err := r.stampSecretEnvHash(ctx, agent, dep, &dep.Spec.Template); err != nil {
 		return err
 	}
@@ -3619,6 +3665,7 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 	}
 
 	proxyResourcesRefusal, _ := credentialProxyResourcesRefusal(agent)
+	agentAPIAuthRefusal, _ := agentAPIAuthResourcesRefusal(agent)
 
 	degradedStatus := metav1.ConditionFalse
 	degradedReason := ""
@@ -3675,6 +3722,14 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 		degradedStatus = metav1.ConditionTrue
 		degradedReason = conditionReasonInvalidCredentialProxyResources
 		degradedMsg = fmt.Sprintf(invalidCredentialProxyResourcesMsgFmt, proxyResourcesRefusal)
+	} else if agentAPIAuthRefusal != "" {
+		// Same shape as the credential-proxy refusal above and last for the same
+		// reason: the sidecar runs at the operator's defaults, so Ready and the
+		// phase keep what the workload says, and a reason reporting lost function
+		// must not be masked by it.
+		degradedStatus = metav1.ConditionTrue
+		degradedReason = conditionReasonInvalidAgentAPIAuthResources
+		degradedMsg = fmt.Sprintf(invalidAgentAPIAuthResourcesMsgFmt, agentAPIAuthRefusal)
 	}
 	if degradedMsg == "" {
 		degradedMsg = condMsg
@@ -4661,6 +4716,49 @@ func (r *PlatformAgentReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		}
 	}
 
+	// AgentProfiles feed the identity map, so a profile created, edited or
+	// deleted re-renders it. Registered only when the CRD is installed, like
+	// AgentPlugin's watch above.
+	profileGVK := agentv1alpha1.GroupVersion.WithKind("AgentProfile")
+	if mgr != nil && mgr.GetRESTMapper() != nil {
+		_, err := mgr.GetRESTMapper().RESTMapping(profileGVK.GroupKind(), profileGVK.Version)
+		denied := AgentProfileAccessDenied(r.RBAC)
+		watch, unreadable := agentProfileWatchPlan(err, denied)
+		switch {
+		case unreadable:
+			r.agentProfilesUnreadable = true
+			logf.Log.WithName("platformagent-controller").Info(
+				"The operator's role cannot read AgentProfiles; skipping the AgentProfile watch and rendering no profile identities. Restart the operator after applying the current ClusterRole.",
+				"denied", denied)
+		case watch:
+			bld = bld.Watches(
+				&agentv1alpha1.AgentProfile{},
+				handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []reconcile.Request {
+					return enqueueAgentsInNamespace(ctx, obj.GetNamespace())
+				}),
+				// The AgentProfile reconciler writes status; only spec
+				// changes, creates and deletes change the map.
+				builder.WithPredicates(predicate.GenerationChangedPredicate{}),
+			).Watches(
+				// Whether a profile gets a map entry also depends on its
+				// operator-created ServiceAccount (a foreign one under that
+				// name keeps it out: agentProfileServiceAccountIsForeign),
+				// and that ServiceAccount is the profile's, not the agent's,
+				// so Owns() above never fires for it.
+				&corev1.ServiceAccount{},
+				handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []reconcile.Request {
+					return enqueueAgentsInNamespace(ctx, obj.GetNamespace())
+				}),
+				builder.WithPredicates(predicate.NewPredicateFuncs(func(obj client.Object) bool {
+					return strings.HasPrefix(obj.GetName(), agentProfileServiceAccountPrefix)
+				})),
+			)
+		default:
+			logf.Log.WithName("platformagent-controller").Info(
+				"AgentProfile CRD is not installed on cluster; skipping AgentProfile watch.")
+		}
+	}
+
 	return bld.
 		Watches(
 			&rbacv1.ClusterRoleBinding{},
@@ -5266,4 +5364,18 @@ func pluginStatusEqual(a, b *agentv1alpha1.AgentPluginStatus) bool {
 		}
 	}
 	return true
+}
+
+// agentProfileWatchPlan decides, once at setup, whether the PlatformAgent
+// controller watches AgentProfiles and whether the identity map may list them.
+// A role that cannot read them makes them unreadable whether or not the CRD is
+// installed yet: the denial is RBAC's answer alone, and a CRD applied after
+// boot would otherwise send the render's cached List into an informer that
+// never syncs, blocking the reconcile worker. With the role able to read
+// them, the kind is watched when the CRD is installed.
+func agentProfileWatchPlan(mapErr error, denied []string) (watch, unreadable bool) {
+	if len(denied) > 0 {
+		return false, true
+	}
+	return mapErr == nil, false
 }

@@ -42,6 +42,17 @@ metadata:
     {{- toYaml . | nindent 4 }}
   {{- end }}
 spec:
+  {{- /*
+    `with`, so the null default renders no field at all: the operator reads an
+    absent mode as "today", and leaving it out keeps the CR of an install that
+    never set the value what it was before the chart knew the key. Helm patches a
+    custom resource from the difference between its renders, so a mode set on the
+    CR by hand survives an upgrade that leaves this null, and a value set here
+    and later cleared removes the field again, which is "today".
+  */}}
+  {{- with .Values.platformAgent.mode }}
+  mode: {{ . | quote }}
+  {{- end }}
   harness:
     clusterName: {{ required "platformAgent.harness.clusterName is required" .Values.platformAgent.harness.clusterName | quote }}
     location: {{ required "platformAgent.harness.location is required" .Values.platformAgent.harness.location | quote }}
@@ -90,10 +101,13 @@ spec:
     {{- $defaultStockoutTuning := dict "maxInProgress" 3 "platform" (dict "apiMaxRetries" 8 "maxTurns" 200) "cluster" (dict "apiMaxRetries" 8 "maxTurns" 150) }}
     {{- $tuning = merge $tuning $defaultStockoutTuning }}
     {{- end }}
-    {{- if or (hasKey $tuning "maxInProgress") $tuning.platform $tuning.cluster $tuning.default }}
+    {{- if or (hasKey $tuning "maxInProgress") (hasKey $tuning "maxSessions") $tuning.platform $tuning.cluster $tuning.default }}
     tuning:
       {{- if hasKey $tuning "maxInProgress" }}
       maxInProgress: {{ $tuning.maxInProgress }}
+      {{- end }}
+      {{- if hasKey $tuning "maxSessions" }}
+      maxSessions: {{ $tuning.maxSessions }}
       {{- end }}
       {{- with $tuning.default }}
       default:
@@ -316,6 +330,61 @@ spec:
         {{- range $side := keys $proxyQuantities | sortAlpha }}
         {{ $side }}:
           {{- $set := index $proxyRendered $side }}
+          {{- range $name := keys $set | sortAlpha }}
+          {{ $name }}: {{ index $set $name | quote }}
+          {{- end }}
+        {{- end }}
+    {{- end }}
+    {{- /*
+      The agent-api-auth sidecar's requests and limits, forwarded to the CR as
+      spec.deployment.agentAPIAuth.resources. Lean by design: the operator and its
+      webhook validate the override (floor-free — the event watcher derives no
+      admission count from the limit), so the chart forwards it and guards only
+      the shape it can catch cheaply — an override set against a CRD that predates
+      the field, which the API server would prune silently. Emitted only when a
+      key is set, each quantity quoted, for the reasons the credentialProxy block
+      above gives.
+    */}}
+    {{- $apiAuthResources := ((.Values.platformAgent.deployment.agentAPIAuth | default dict).resources) | default dict }}
+    {{- /* Shape and grammar check, shared with the quota preflight so a mistyped side
+           key, an unsupported claims, a non-map side or an unparseable quantity fails
+           the render naming the key, rather than being pruned silently or reaching the
+           operator as garbage. The floor and crossed-pair checks stay the operator's
+           and the webhook's. */}}
+    {{- include "kube-agents.agentAPIAuthResourcesCheck" $apiAuthResources }}
+    {{- $apiAuthQuantities := dict }}
+    {{- range $side := list "limits" "requests" }}
+      {{- $set := dict }}
+      {{- range $name, $quantity := (index $apiAuthResources $side) | default dict }}
+        {{- if not (or (kindIs "invalid" $quantity) (and (kindIs "string" $quantity) (eq $quantity ""))) }}
+          {{- /* Trimmed as the check validated it and the proxy block emits it, so a
+                 value with surrounding whitespace is not emitted raw for the API server
+                 to refuse against the CRD's no-whitespace quantity pattern. */}}
+          {{- $_ := set $set $name (toString $quantity | trim) }}
+        {{- end }}
+      {{- end }}
+      {{- if $set }}
+        {{- $_ := set $apiAuthQuantities $side $set }}
+      {{- end }}
+    {{- end }}
+    {{- if $apiAuthQuantities }}
+    {{- $apiAuthCrd := lookup "apiextensions.k8s.io/v1" "CustomResourceDefinition" "" "platformagents.kubeagents.x-k8s.io" }}
+    {{- if $apiAuthCrd }}
+    {{- $apiAuthDeploymentProps := dict }}
+    {{- range $apiAuthCrd.spec.versions }}
+    {{- if .storage }}
+    {{- $apiAuthDeploymentProps = dig "schema" "openAPIV3Schema" "properties" "spec" "properties" "deployment" "properties" (dict) . }}
+    {{- end }}
+    {{- end }}
+    {{- if not (hasKey $apiAuthDeploymentProps "agentAPIAuth") }}
+    {{- fail "platformAgent.deployment.agentAPIAuth.resources is set, but the installed PlatformAgent CRD predates spec.deployment.agentAPIAuth and helm upgrade does not update CRDs; apply charts/kube-agents/crds/ first (kubectl apply --server-side -f charts/kube-agents/crds/, or run upgrade.sh, which does). Otherwise the API server prunes the value silently while the release record keeps it" }}
+    {{- end }}
+    {{- end }}
+    agentAPIAuth:
+      resources:
+        {{- range $side := keys $apiAuthQuantities | sortAlpha }}
+        {{ $side }}:
+          {{- $set := index $apiAuthQuantities $side }}
           {{- range $name := keys $set | sortAlpha }}
           {{ $name }}: {{ index $set $name | quote }}
           {{- end }}

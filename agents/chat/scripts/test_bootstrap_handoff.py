@@ -81,6 +81,9 @@ class SharedNamesTest(unittest.TestCase):
         self.assertEqual(h.PRIORITIZE_INSTRUCTIONS_PATHS, g.PRIORITIZE_INSTRUCTIONS_PATHS)
         self.assertEqual(h.CLUSTER_AUDIT_INSTRUCTIONS_PATHS, g.CLUSTER_AUDIT_INSTRUCTIONS_PATHS)
 
+    def test_the_limits_path_is_the_one_select_reads(self):
+        self.assertEqual(h.LIMITS_PATH, inventory_findings.DEFAULT_LIMITS_PATH)
+
 
 class MarkerTest(unittest.TestCase):
     def test_a_marker_with_a_space_after_the_equals_sign_still_names_the_sweep(self):
@@ -393,6 +396,36 @@ class HandOffTest(unittest.TestCase):
         (self.d / "INVENTORY.md").unlink()
         self.assertIsNone(self._run_roster([]))
         self.assertFalse((self.d / "INVENTORY.md").exists())
+        # Nothing is selected, so nothing reads the limits.
+        self.assertFalse((self.d / "INVENTORY.limits.json").exists())
+
+    def test_the_ranking_card_gets_the_limits_this_pod_is_set_to(self):
+        _board(self.board, clusters=_all_done())
+        with mock.patch.dict(os.environ, {"FINDINGS_FIRST_REPORT_CRITICALS": "3"}):
+            self.assertEqual(self._run(), "t_rank1")
+        limits = json.loads((self.d / "INVENTORY.limits.json").read_text())
+        self.assertEqual(limits["first_report_criticals"], 3)
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "limits.json"
+            path.write_text(json.dumps(limits))
+            self.assertEqual(inventory_findings.read_limits(str(path)).first_report_criticals, 3)
+        # Not in the body, the card's identity: a changed limit would archive a live card.
+        self.assertNotIn("3", h._prioritize_body())
+
+    def test_an_unset_limit_writes_the_default(self):
+        _board(self.board, clusters=_all_done())
+        with mock.patch.dict(os.environ, {"FINDINGS_FIRST_REPORT_CRITICALS": ""}):
+            self._run()
+        limits = json.loads((self.d / "INVENTORY.limits.json").read_text())
+        self.assertEqual(limits["first_report_criticals"], inventory_findings.fq.DEFAULT_FIRST_REPORT_CRITICALS)
+
+    def test_no_ranking_card_without_the_limits_file(self):
+        _board(self.board, clusters=_all_done())
+        real = h.write_raw
+        with mock.patch.object(h, "write_raw", lambda d, text, path=h.RAW_PATH: path != h.LIMITS_PATH and real(d, text, path)):
+            self.assertIsNone(self._run())
+        self.assertEqual(self.filed, [])
+        self.assertEqual(self._run(), "t_rank1")
 
     def test_the_no_coverage_report_lists_only_the_first_gaps(self):
         raw = "# r\n\n## Gaps\n\n" + "".join(f"- gap {i}\n" for i in range(25)) + "\n## Machine-Readable Findings\n"
@@ -734,6 +767,10 @@ class HandOffTest(unittest.TestCase):
         self.assertEqual(argv[-1], h.RAW_PATH)
         self.assertEqual(kw["principal"], "agent")
         inventory_findings.parse_block(kw["stdin"])
+        argv, kw = calls[1]
+        self.assertEqual(argv[-1], h.LIMITS_PATH)
+        self.assertEqual(kw["principal"], "agent")
+        self.assertIn("first_report_criticals", json.loads(kw["stdin"]))
         self.assertFalse((self.d / "INVENTORY.raw.md").exists())
 
 

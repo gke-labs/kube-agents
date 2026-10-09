@@ -40,6 +40,17 @@ func proxyAgentWithResources(override *corev1.ResourceRequirements) *agentv1alph
 	return agent
 }
 
+func agentAPIAuthAgentWithResources(override *corev1.ResourceRequirements) *agentv1alpha1.PlatformAgent {
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"},
+		Spec:       agentv1alpha1.PlatformAgentSpec{AgentSpec: agentv1alpha1.AgentSpec{Deployment: &agentv1alpha1.DeploymentSpec{}}},
+	}
+	if override != nil {
+		agent.Spec.Deployment.AgentAPIAuth = &agentv1alpha1.AgentAPIAuthSpec{Resources: override}
+	}
+	return agent
+}
+
 func assertQuantity(t *testing.T, list corev1.ResourceList, name corev1.ResourceName, want string) {
 	t.Helper()
 	got, ok := list[name]
@@ -149,6 +160,42 @@ func TestCredentialProxyEmptyDirsFollowARaisedEphemeralStorageLimit(t *testing.T
 		if gateway := emptyDirSizeLimits(buildAgentAPIAuthVolumes(agent))["credential-proxy-tmp"]; gateway != "2Gi" {
 			t.Errorf("limit %q: gateway /tmp %s, want the 2Gi default", tc.limit, gateway)
 		}
+	}
+}
+
+// TestAgentAPIAuthEmptyDirFollowsARaisedEphemeralStorageLimit: the sidecar's /tmp
+// is the credential-proxy-tmp emptyDir, and the kubelet evicts the gateway pod
+// when it passes its sizeLimit. So a raised agentAPIAuth ephemeral limit must
+// widen that volume, a limit at or under the 2Gi default moves it not at all, and
+// the sidecar's own override drives it, independently of the broker's.
+func TestAgentAPIAuthEmptyDirFollowsARaisedEphemeralStorageLimit(t *testing.T) {
+	cases := []struct {
+		limit, tmp string
+	}{
+		{"", "2Gi"},
+		{"1Gi", "2Gi"},
+		{"3Gi", "3Gi"},
+		{"10Gi", "10Gi"},
+	}
+	for _, tc := range cases {
+		var override *corev1.ResourceRequirements
+		if tc.limit != "" {
+			override = &corev1.ResourceRequirements{
+				Limits: corev1.ResourceList{corev1.ResourceEphemeralStorage: resource.MustParse(tc.limit)},
+			}
+		}
+		agent := agentAPIAuthAgentWithResources(override)
+		if got := emptyDirSizeLimits(buildAgentAPIAuthVolumes(agent))["credential-proxy-tmp"]; got != tc.tmp {
+			t.Errorf("limit %q: gateway /tmp %s, want %s", tc.limit, got, tc.tmp)
+		}
+	}
+
+	// The sidecar's override widens the gateway pod's volume, not the broker's.
+	agent := agentAPIAuthAgentWithResources(&corev1.ResourceRequirements{
+		Limits: corev1.ResourceList{corev1.ResourceEphemeralStorage: resource.MustParse("10Gi")},
+	})
+	if got := emptyDirSizeLimits(buildCredentialProxyRuntimeVolumes(agent))["credential-proxy-tmp"]; got != "2Gi" {
+		t.Errorf("broker /tmp %s, want the 2Gi default; the sidecar's override must not widen the broker's volume", got)
 	}
 }
 

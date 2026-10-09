@@ -583,6 +583,16 @@ agentSandbox:
 platformAgent:
   enabled: true
   name: platform-agent
+  # The PlatformAgent's spec.mode: which component stack the operator renders.
+  # "today" is the current architecture; "next" also renders the NATS bus and
+  # the A2A gateway, a development stack (docs/designs/spec-mode-switch.md).
+  # null, the default, leaves the field out of the CR, which the operator reads
+  # as "today", so an install that never sets it renders the CR it always did.
+  # Changing it on a running install is a mode switch, not a setting: the
+  # operator rolls the agent and renders or retires the A2A stack. A mode set on
+  # the CR by hand with kubectl is left alone while this stays null, because
+  # Helm patches only the fields its renders differ in.
+  mode: null
   # Annotations to add to the PlatformAgent custom resource metadata. The
   # operator reads its kubeagents.x-k8s.io/* keys from here (chart README,
   # "PlatformAgent annotations"). Two of them the chart also derives from
@@ -699,6 +709,9 @@ platformAgent:
     # cluster.maxTurns: 150) unless overridden here.
     tuning: {}
       # maxInProgress: 3
+      # maxSessions caps the A2A session pods a "next" install runs at once;
+      # the operator's default applies when it is unset, and "today" ignores it.
+      # maxSessions: 10
       # platform:
       #   apiMaxRetries: 8
       #   maxTurns: 200
@@ -794,6 +807,34 @@ platformAgent:
     # when the installed CRD predates the field; apply crds/ first (upgrade.sh
     # does).
     credentialProxy:
+      resources: {}
+    # The agent-api-auth sidecar's requests and limits, forwarded to the CR as
+    # spec.deployment.agentAPIAuth.resources when any key is set. Each key merges
+    # over the operator's defaults (150m CPU and 384Mi requests; 1 CPU, 2Gi memory
+    # and 2Gi ephemeral-storage limits), so
+    #
+    #   agentAPIAuth:
+    #     resources:
+    #       limits:
+    #         memory: 4Gi
+    #
+    # raises the memory limit and keeps the rest. The container runs the event
+    # watcher, the drift detector and the API authenticator; the watcher reads the
+    # memory limit through the Downward API and sets its Go soft memory limit to
+    # half of it, so raise this when the watcher is OOM-killed under a large fleet
+    # of watched clusters (#2648).
+    # Overriding limits.cpu also changes the watcher's GOMAXPROCS (the Go runtime
+    # derives it from the container's CPU limit), so leave limits.cpu at the default unless you mean to. The operator refuses a request above its limit,
+    # a negative quantity, a zero limit, claims, and any name other than cpu,
+    # memory and ephemeral-storage, whether or not its webhook is enabled: it
+    # ignores the override, renders the sidecar at its defaults and reports
+    # Degraded with reason InvalidAgentAPIAuthResources, the agent staying Ready.
+    # The webhook, where enabled, refuses the override at apply, and warns on the
+    # Autopilot memory-per-vCPU band and on a limit set without its request. There
+    # is no child-budget floor as there is for the credential proxy. On an existing
+    # install the chart fails the upgrade when the installed CRD predates the field;
+    # apply crds/ first (upgrade.sh does).
+    agentAPIAuth:
       resources: {}
   # pre-delete hook that removes the PlatformAgent CR and waits for the operator
   # to clear its finalizer, before Helm deletes the operator itself. Without it,

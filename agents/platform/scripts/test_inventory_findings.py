@@ -342,55 +342,293 @@ class RegisterTests(unittest.TestCase):
         self.assertEqual(self.sent, [])
 
 
-class RankedTests(unittest.TestCase):
+# 288 critical; 90 critical by the floor; 120 major; 90 major; 36 critical by the floor.
+CRITICAL = {"B": 8, "L": 6, "detect": 3, "recover": 3, "C": 1.0}
+FLOORED = {"B": 3, "L": 10, "detect": 1, "recover": 2, "C": 1.0}
+MAJOR_HIGH = {"B": 5, "L": 4, "detect": 3, "recover": 3, "C": 1.0}
+MAJOR = RUBRIC
+FLOORED_LOW = {"B": 3, "L": 10, "detect": 1, "recover": 1, "C": 0.6}
+
+
+def batch(*specs) -> tuple[list[dict], dict]:
+    """Extracted items and their scores from (rubric, item overrides[, score overrides]) specs."""
+    items, scores = [], {}
+    for index, spec in enumerate(specs, 1):
+        rubric, overrides = spec[0], spec[1]
+        item = json.loads(item_line(**overrides))
+        item["id"] = f"f{index:03d}"
+        items.append(item)
+        scores[item["id"]] = {**SCORE, "rubric": rubric, **(spec[2] if len(spec) > 2 else {})}
+    return items, scores
+
+
+def criticals(count: int) -> list:
+    # Distinct checks, so each is its own item, scored 288 down to a floored 90.
+    rubrics = [CRITICAL, {**CRITICAL, "L": 4}, {**CRITICAL, "B": 5}, FLOORED, FLOORED, FLOORED]
+    return [(rubrics[i], {"check": f"check-{i}", "object": f"obj-{i}"}) for i in range(count)]
+
+
+def refs(shown: list[list[dict]]) -> list[list[str]]:
+    return [[row["ref"] for row in members] for members in shown]
+
+
+class SelectItemsTests(unittest.TestCase):
+    def select(self, specs, limit=2, exclude=frozenset()):
+        items, scores = batch(*specs)
+        return inv.select_items(items, scores, limit, exclude)
+
+    def test_six_criticals_list_the_top_two_and_defer_the_rest(self):
+        shown, deferred, others = self.select(criticals(6) + [(MAJOR, {"check": "major", "object": "m"})])
+        self.assertEqual(refs(shown), [["f001"], ["f002"]])
+        self.assertEqual((deferred, others), (4, 1))
+
+    def test_exactly_two_criticals_are_both_listed(self):
+        shown, deferred, others = self.select(criticals(2))
+        self.assertEqual(refs(shown), [["f001"], ["f002"]])
+        self.assertEqual((deferred, others), (0, 0))
+
+    def test_one_critical_is_listed_alone_and_never_padded(self):
+        specs = criticals(1) + [(MAJOR_HIGH, {"check": f"major-{i}", "object": "m"}) for i in range(3)]
+        shown, deferred, others = self.select(specs)
+        self.assertEqual(refs(shown), [["f001"]])
+        self.assertEqual((deferred, others), (0, 3))
+
+    def test_no_critical_lists_nothing(self):
+        shown, deferred, others = self.select([(MAJOR_HIGH, {"check": "a"}), (MAJOR, {"check": "b"})])
+        self.assertEqual((shown, deferred, others), ([], 0, 2))
+
+    def test_a_limit_of_zero_lists_none(self):
+        shown, deferred, others = self.select(criticals(2), limit=0)
+        self.assertEqual((shown, deferred, others), ([], 2, 0))
+
+    def test_a_limit_of_three_lists_three(self):
+        shown, deferred, _ = self.select(criticals(6), limit=3)
+        self.assertEqual(refs(shown), [["f001"], ["f002"], ["f003"]])
+        self.assertEqual(deferred, 3)
+
+    def test_a_gathered_line_is_one_item_of_its_most_severe_rows_class(self):
+        # One check on one cluster: a major scoring 120 and a floored critical
+        # scoring 90 are one critical item, at the major's place, ahead of a
+        # critical item scoring 36.
+        specs = [
+            (FLOORED_LOW, {"check": "lone-critical", "object": "x"}),
+            (FLOORED, {"check": "crashloop", "object": "api"}),
+            (MAJOR_HIGH, {"check": "crashloop", "object": "web"}),
+            (MAJOR, {"check": "crashloop", "cluster": "dev", "object": "api"}),
+        ]
+        shown, deferred, others = self.select(specs, limit=1)
+        self.assertEqual(refs(shown), [["f003", "f002"]])
+        self.assertEqual([row["severity"] for row in shown[0]], ["major", "critical"])
+        # The lone critical waits; the same check on another cluster is another item.
+        self.assertEqual((deferred, others), (1, 1))
+
+    def test_a_provider_managed_observation_is_dropped_and_a_fault_is_listed(self):
+        specs = [
+            (CRITICAL, {"check": "observation", "namespace": "kube-system", "object": "kube-dns"}, {"actionable": False}),
+            (FLOORED, {"check": "fault", "namespace": "kube-system", "object": "konnectivity"}),
+        ]
+        shown, deferred, others = self.select(specs)
+        self.assertEqual(refs(shown), [["f002"]])
+        self.assertEqual((deferred, others), (0, 1))
+
+    def test_provider_managed_observations_are_counted_by_line(self):
+        # Three observations of one check on one cluster are one line; the
+        # same check on another cluster is another, as the nudge counts them.
+        observation = {"actionable": False}
+        specs = [
+            (MAJOR, {"check": "observation", "namespace": "kube-system", "object": name}, observation)
+            for name in ("kube-dns", "konnectivity", "metrics-server")
+        ] + [(MAJOR, {"check": "observation", "cluster": "dev", "namespace": "kube-system"}, observation)]
+        shown, deferred, others = self.select(specs)
+        self.assertEqual((shown, deferred, others), ([], 0, 2))
+
+    def test_a_line_with_an_observation_and_an_ordinary_row_counts_once(self):
+        # One check on one cluster, on a kube-system workload and on a user one.
+        specs = [
+            (MAJOR, {"check": "observation", "namespace": "kube-system", "object": "kube-dns"}, {"actionable": False}),
+            (MAJOR, {"check": "observation", "namespace": "payments", "object": "api"}),
+        ]
+        shown, deferred, others = self.select(specs)
+        self.assertEqual((shown, deferred, others), ([], 0, 1))
+
+    def test_an_excluded_row_is_neither_listed_nor_counted(self):
+        items, scores = batch(*criticals(3))
+        dismissed = inv.fq.derive_finding_id("check-0", "acme", "prod", "payments", "obj-0")
+        shown, deferred, others = inv.select_items(items, scores, 2, frozenset({dismissed}))
+        self.assertEqual(refs(shown), [["f002"], ["f003"]])
+        self.assertEqual((deferred, others), (0, 0))
+
+    def test_the_order_does_not_depend_on_the_input_order(self):
+        # Equal scores: the queue's tie-break, by object, decides.
+        specs = [(CRITICAL, {"check": f"c{i}", "object": name}) for i, name in enumerate(("zeta", "alpha", "mid"))]
+        forward = self.select(specs)[0]
+        backward = self.select(list(reversed(specs)))[0]
+        self.assertEqual([m[0]["object"] for m in forward], ["alpha", "mid"])
+        self.assertEqual([m[0]["object"] for m in backward], ["alpha", "mid"])
+
+    def test_an_unscored_item_selects_nothing(self):
+        items, scores = batch(*criticals(2))
+        del scores["f002"]
+        with self.assertRaises(inv.Failure) as caught:
+            inv.select_items(items, scores, 2)
+        self.assertEqual(caught.exception.code, inv.EXIT_INCOMPLETE)
+
+
+class ReadLimitsTests(unittest.TestCase):
     def setUp(self):
-        self.real = inv.fetch_ranked
-        self.addCleanup(setattr, inv, "fetch_ranked", self.real)
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.path = Path(self.tmp.name) / "limits.json"
 
-    def test_the_order_and_the_total_are_printed(self):
-        inv.fetch_ranked = lambda endpoint: [
-            {
-                "rank_score": 90,
-                "severity": "major",
-                "check": "probes-readiness",
-                "project": "acme",
-                "cluster": "prod",
-                "namespace": "payments",
-                "object": "api",
-                "title": "no readinessProbe",
-                "actionable": True,
-            }
+    def read(self, text=None):
+        if text is not None:
+            self.path.write_text(text, encoding="utf-8")
+        with unittest.mock.patch("sys.stderr", new_callable=io.StringIO) as err:
+            limits = inv.read_limits(str(self.path))
+        return limits, err.getvalue()
+
+    def test_the_hand_offs_limits_are_read(self):
+        limits, err = self.read(json.dumps({"first_report_criticals": 1, "noncritical_after_hour": 9}))
+        self.assertEqual((limits.first_report_criticals, limits.noncritical_after_hour), (1, 9))
+        self.assertEqual(err, "")
+
+    def test_a_missing_file_is_the_default(self):
+        limits, err = self.read()
+        self.assertEqual(limits.first_report_criticals, inv.fq.DEFAULT_FIRST_REPORT_CRITICALS)
+        self.assertIn("using the default limits", err)
+
+    def test_an_unusable_file_or_value_is_the_default(self):
+        for text in ("{not json", "[2]", '{"first_report_criticals": -1}', '{"first_report_criticals": "x"}',
+                     '{"first_report_criticals": true}', '{"first_report_criticals": 1.5}'):
+            with self.subTest(text=text):
+                limits, err = self.read(text)
+                self.assertEqual(limits.first_report_criticals, inv.fq.DEFAULT_FIRST_REPORT_CRITICALS)
+                self.assertTrue(err)
+
+
+    def test_bytes_that_are_not_utf8_are_the_default(self):
+        self.path.write_bytes(b"\xff")
+        limits, err = self.read()
+        self.assertEqual(limits.first_report_criticals, inv.fq.DEFAULT_FIRST_REPORT_CRITICALS)
+        self.assertIn("cannot read", err)
+
+
+class SelectCommandTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.dir = Path(self.tmp.name)
+        self.shown = self.dir / "shown.json"
+
+    def run_select(self, specs, limits=None, *extra):
+        items, scores = batch(*specs)
+        (self.dir / "items.json").write_text(json.dumps({"items": items}), encoding="utf-8")
+        (self.dir / "scores.json").write_text(json.dumps({"scores": scores}), encoding="utf-8")
+        if limits is not None:
+            (self.dir / "limits.json").write_text(json.dumps(limits), encoding="utf-8")
+        argv = [
+            "select",
+            "--items", str(self.dir / "items.json"),
+            "--scores", str(self.dir / "scores.json"),
+            "--limits", str(self.dir / "limits.json"),
+            "--out", str(self.shown),
+            *extra,
         ]
-        with unittest.mock.patch("sys.stdout", new_callable=io.StringIO) as out:
-            self.assertEqual(inv.main(["ranked"]), 0)
-        self.assertIn("total: 1", out.getvalue())
-        self.assertIn("acme/prod/payments/api", out.getvalue())
+        with unittest.mock.patch("sys.stdout", new_callable=io.StringIO) as out, \
+                unittest.mock.patch("sys.stderr", new_callable=io.StringIO) as err:
+            code = inv.main(argv)
+        return code, out.getvalue(), err.getvalue()
 
-    def test_the_flags_the_report_rules_key_off_are_shown(self):
-        inv.fetch_ranked = lambda endpoint: [
+    def test_the_listed_items_and_every_row_id_are_written(self):
+        specs = criticals(3) + [(FLOORED, {"check": "check-0", "object": "obj-0b"})]
+        code, out, _ = self.run_select(specs, {"first_report_criticals": 2})
+        self.assertEqual(code, 0)
+        record = json.loads(self.shown.read_text(encoding="utf-8"))
+        self.assertEqual(
+            record,
             {
-                "rank_score": 3,
-                "severity": "minor",
-                "check": "no-memory-limit",
-                "project": "acme",
-                "cluster": "prod",
-                "namespace": "kube-system",
-                "object": "kube-dns",
-                "title": "no limit",
-                "provider_managed": True,
-                "actionable": False,
-            }
-        ]
-        with unittest.mock.patch("sys.stdout", new_callable=io.StringIO) as out:
-            inv.main(["ranked"])
-        self.assertIn("provider_managed,not_actionable", out.getvalue())
+                "items": [
+                    {"class": "critical", "ids": ["check-0.acme.prod.payments.obj-0", "check-0.acme.prod.payments.obj-0b"]},
+                    {"class": "critical", "ids": ["check-1.acme.prod.payments.obj-1"]},
+                ]
+            },
+        )
+        self.assertIn("list exactly 2 critical items, in this order", out)
+        self.assertIn("f001", out)
+        self.assertIn("f004", out)
+        self.assertIn("roll-up: 1 more item, 1 of them critical", out)
+        # The two listed fill the delivery day's allowance of 2.
+        self.assertIn(
+            "pace: the critical items not listed are added in chat from 12:00 UTC the day after the report "
+            "arrives, at most 2 a day",
+            out,
+        )
 
-    def test_an_unreachable_queue_exits_5_rather_than_tracing(self):
-        def boom(endpoint):
-            raise OSError("connection refused")
+    def test_criticals_left_out_start_the_same_day_while_the_allowance_lasts(self):
+        _, out, _ = self.run_select(criticals(3), {"first_report_criticals": 1, "daily_criticals": 2})
+        self.assertIn("pace: the critical items not listed are added in chat from 12:00 UTC, at most 2 a day", out)
 
-        inv.fetch_ranked = boom
-        self.assertEqual(inv.main(["ranked"]), inv.EXIT_POST_FAILED)
+    def test_a_daily_limit_of_zero_gives_no_arrival_time(self):
+        _, out, _ = self.run_select(criticals(3), {"daily_criticals": 0})
+        self.assertIn("pace: the critical items not listed are not added in chat; the daily limit is 0", out)
+        _, out, _ = self.run_select([(MAJOR, {"check": "a"})], {"noncritical_max": 0})
+        self.assertIn("pace: non-critical items are not added in chat; the daily limit is 0", out)
+
+    def test_no_critical_says_so_and_when_the_rest_arrives(self):
+        code, out, _ = self.run_select(
+            [(MAJOR, {"check": "a"}), (MAJOR, {"check": "b"})], {"noncritical_after_hour": 15, "noncritical_max": 4}
+        )
+        self.assertEqual(code, 0)
+        self.assertIn("list no item; there are no critical findings", out)
+        self.assertIn("roll-up: 2 more items, none of them critical", out)
+        self.assertIn("pace: non-critical items are added in chat from 15:00 UTC, at most 4 a day", out)
+        self.assertEqual(json.loads(self.shown.read_text(encoding="utf-8")), {"items": []})
+
+    def test_a_limit_of_zero_says_so(self):
+        _, out, _ = self.run_select(criticals(2), {"first_report_criticals": 0})
+        self.assertIn("list no item; the limit is 0", out)
+        self.assertIn("roll-up: 2 more items, 2 of them critical", out)
+
+    def test_nothing_left_over_means_no_roll_up_line(self):
+        _, out, _ = self.run_select(criticals(2))
+        self.assertIn("roll-up: none; the report has no roll-up line", out)
+        self.assertNotIn("pace:", out)
+
+    def test_no_limits_file_uses_the_default(self):
+        code, out, err = self.run_select(criticals(3))
+        self.assertEqual(code, 0)
+        self.assertIn("list exactly 2 critical items", out)
+        self.assertIn("using the default limits", err)
+
+    def test_exclude_takes_a_suppressed_queue_id(self):
+        dismissed = inv.fq.derive_finding_id("check-0", "acme", "prod", "payments", "obj-0")
+        _, out, _ = self.run_select(criticals(2), None, "--exclude", dismissed)
+        self.assertIn("list exactly 1 critical item,", out)
+        self.assertNotIn("f001", out)
+
+    def test_a_clean_fleet_needs_no_scores_file(self):
+        # Step 2 sends a clean fleet past scoring, so no scores file exists.
+        (self.dir / "items.json").write_text(json.dumps({"items": []}), encoding="utf-8")
+        with unittest.mock.patch("sys.stdout", new_callable=io.StringIO) as out, \
+                unittest.mock.patch("sys.stderr", new_callable=io.StringIO):
+            code = inv.main(["select", "--items", str(self.dir / "items.json"),
+                             "--scores", str(self.dir / "absent.json"), "--out", str(self.shown)])
+        self.assertEqual(code, 0)
+        self.assertIn("list no item; there are no critical findings", out.getvalue())
+        self.assertIn("roll-up: none", out.getvalue())
+        self.assertEqual(json.loads(self.shown.read_text(encoding="utf-8")), {"items": []})
+
+    def test_an_incomplete_score_set_writes_nothing(self):
+        items, scores = batch(*criticals(2))
+        del scores["f001"]
+        (self.dir / "items.json").write_text(json.dumps({"items": items}), encoding="utf-8")
+        (self.dir / "scores.json").write_text(json.dumps({"scores": scores}), encoding="utf-8")
+        with unittest.mock.patch("sys.stderr", new_callable=io.StringIO) as err:
+            code = inv.main(["select", "--items", str(self.dir / "items.json"),
+                             "--scores", str(self.dir / "scores.json"), "--out", str(self.shown)])
+        self.assertEqual(code, inv.EXIT_INCOMPLETE)
+        self.assertIn("Nothing was selected", err.getvalue())
+        self.assertFalse(self.shown.exists())
 
 
 if __name__ == "__main__":
