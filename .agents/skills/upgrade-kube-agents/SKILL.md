@@ -21,6 +21,15 @@ Use this skill when asked to upgrade the `kube-agents` Platform Agent or operato
 - Use the session's existing authorization to report to `gke-labs/kube-agents`. If GitHub writes
   have not been authorized, prepare the report and ask once before posting. An upgrade request
   alone does not authorize publishing installation details.
+- Before any issue, comment, reopening or label write, verify the requesting user's GitHub
+  identity and repository access. Use `gh api user` and the explicit
+  `repos/gke-labs/kube-agents/collaborators/<LOGIN>/permission` API path for that verified identity.
+  Require repository permission `write`, `maintain` or `admin`; read/triage access, past
+  contributions and organization membership alone do not qualify. Do not infer the requester's
+  access from bot, application or shared administrator credentials. If the identity cannot be
+  tied to the requester, permission is lower, or either check fails, keep an anonymized local
+  draft and explain the restriction. Regular users must not open or modify issue tickets, even
+  for p0 failures or after approving a post.
 - Search `gke-labs/kube-agents` issues, open **and closed**, using the distinctive error, affected
   component and root cause. Do not filter by `upgrade-failure`: older matching issues may lack it.
   Read candidate bodies and comments; a similar title or symptom with a different cause is not a
@@ -43,12 +52,18 @@ Use this skill when asked to upgrade the `kube-agents` Platform Agent or operato
 - Include the previous and target versions, upgrade mode, failing stage, exit code, expected and
   actual behaviour, minimal reproduction or source evidence, sanitized command/error excerpts,
   availability/data impact, and recovery or workaround. Mark unavailable facts as unknown.
-  Before posting, remove credentials, tokens, session salts, customer/project/cluster identifiers
-  and user identifiers. Never attach raw `install.env`, Terraform state, kubeconfig or unfiltered
-  logs. Use placeholders that preserve the failure mechanism.
-- Use `gh` with an explicit `--repo gke-labs/kube-agents` and `--body-file` for issue bodies and
-  comments. Keep exact multiline text in a temporary file. If permissions, label creation or a
-  write fail, retain the sanitized draft, explain what actually succeeded and what remains, and
+  Anonymize the title, body, comments and any attachments before posting. Allow only official
+  repository identifiers, release versions, generic failure details and anonymized impact.
+  Remove credentials, tokens, session salts, client/customer and user names, project/cluster/org
+  identifiers, custom workload/namespace names, private repository names, URLs, domains, IP/email
+  addresses, filesystem paths and other client-specific details. Use placeholders that preserve
+  the failure mechanism; omit an excerpt or attachment if it cannot be safely anonymized. Never
+  attach raw `install.env`, Terraform state, kubeconfig or unfiltered logs. Review the complete
+  public payload for client information before sending; if unsure, keep the local draft.
+- Use `gh` with an explicit `--repo gke-labs/kube-agents` for issue and label operations, and
+  `--body-file` for issue bodies and comments. Keep exact multiline text in a temporary file.
+  If permissions, label creation or a write fail, retain the sanitized draft, explain what
+  actually succeeded and what remains, and
   provide any issue URL already created. For an ambiguous write response, check GitHub before
   retrying; do not blindly create a duplicate.
 - Return the issue URL and whether it was created, updated or reopened, plus the installation's
