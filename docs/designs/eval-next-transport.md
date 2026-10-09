@@ -374,7 +374,7 @@ it works on any transport that maps a result into the final message, which both 
 do, and its grade depends on that mapping: the fleet-audit cases get the URL from the delegated
 worker's card result, which the delegation wait folds into the final message. On this path it
 has the URL when the wait finds the cards in the session store; when it does not (a door that
-reports no `contextId`, or a store that cannot be read), it fails as a graded failure with no
+reports no `contextId`, or a store whose first read fails), it fails as a graded failure with no
 issue URL in the report, not as an error.
 
 **The executor is the Hermes persona through the bridge sidecar (decided 2026-09-17).** The
@@ -607,10 +607,12 @@ reaches the settle step shaped as a `kanban_show` result, so the delivered card 
 appended to the graded answer as today's wait appends them, `ledger_issue_contains` and
 `report_contains` see what the worker returned, and the worker logs are read by those ids for
 `worker_commands`. A door that reports no `contextId`, a session the store does not hold (the
-`cli` executor), or a store that cannot be read three times running falls back to the status-turn
-wait. That wait takes its card ids from the trajectory, which holds none on this path, so it
-settles at once on the reply and sends no status turn; the last of the three cases also puts a
-line on the record's errors. It
+`cli` executor), or a first read of the store that fails three times running, before any card is
+found, falls back to the status-turn wait. That wait takes its card ids from the trajectory, which
+holds none on this path, so it settles at once on the reply and sends no status turn; the last of
+the three cases also puts a line on the record's errors. Once the wait has found the cards and is
+polling, three failed reads in a row end it differently: the repetition is classed as
+infrastructure, the awaited cards' state is purged, and nothing is graded. It
 lives in the case runner and not in the transport, so it can be deleted without touching the
 transport, and it is the first thing child tasks delete.
 When child tasks exist, the parent's events name the child's task id, the same await code awaits
