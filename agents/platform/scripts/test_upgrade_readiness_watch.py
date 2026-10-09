@@ -664,7 +664,13 @@ class Budget(Base):
         self.assertIn("1 cluster(s) are below this version: p1/us-central1-a/a.", text)
 
     def test_a_readiness_run_that_shows_every_pending_cluster_current_retires_the_version(self) -> None:
-        self.seed(OLDER_TARGET, NOW - timedelta(days=8), ["p2/us-central1-a/b"])
+        # A report for the version exists from an earlier tick, so retirement has a directory to remove.
+        with mock.patch.dict(os.environ, {watch.PROJECTS_ENV: "p2"}):
+            self.run_tick(FakeSandbox(envelope([member("b", "lagging", project="p2", target=OLDER_TARGET)]), envelope([member("b", "lagging", project="p2", target=OLDER_TARGET, readiness="ready")])))
+        self.assertTrue((self.home / "reports" / OLDER_TARGET / "latest.md").exists())
+        ledger = self.ledger()
+        ledger["targets"][OLDER_TARGET]["last_report_at"] = (NOW - timedelta(days=8)).isoformat()
+        watch.save_ledger(self.home / watch.LEDGER_FILE_NAME, ledger)
         versions = envelope([member("a", "lagging")])
         readiness = envelope([member("a", "lagging", readiness="ready"), member("b", "current", project="p2", readiness="ready")])
         late = watch.TABLE_BUDGET_SECONDS - 10.0
@@ -673,7 +679,21 @@ class Budget(Base):
         self.assertEqual(code, 0)
         self.assertIn(f"{OLDER_TARGET} is no longer pending", out)
         self.assertNotIn(OLDER_TARGET, self.ledger()["targets"])
-        self.assertFalse((self.home / "reports" / OLDER_TARGET).exists())
+        self.assertFalse((self.home / "reports" / OLDER_TARGET).exists(), "the retired version's directory goes with it")
+
+    def test_a_readiness_run_that_cannot_resolve_a_cluster_s_target_settles_nothing(self) -> None:
+        self.seed(TARGET, NOW - timedelta(days=8), ["p2/us-central1-a/b"])
+        versions = envelope([member("a", "current")])
+        unknown = dict(member("b", "unknown", project="p2", target=None, readiness="unknown"))
+        readiness = envelope([unknown], errors=[{"project": "p2", "location": "us-central1-a", "message": "get-server-config timed out"}])
+        late = watch.TABLE_BUDGET_SECONDS - 10.0
+        with mock.patch.dict(os.environ, {watch.PROJECTS_ENV: "p1,p2"}), self.monotonic_readings(0.0, 0.0, late, late, late):
+            code, out = self.run_tick(FakeSandbox(versions, readiness))
+        self.assertEqual(code, 0)
+        self.assertNotIn("no longer pending", out)
+        self.assertIn(f"scheduled refresh {TARGET}, 1 cluster(s) pending (b): none graded", out)
+        self.assertEqual(self.ledger()["targets"][TARGET]["pending"], ["p2/us-central1-a/b"])
+        self.assertEqual(self.ledger()["targets"][TARGET]["last_report_at"], (NOW - timedelta(days=8)).isoformat(), "still due tomorrow")
 
     def test_a_cut_short_table_run_is_the_same_kind_of_partial_table_as_an_unreached_one(self) -> None:
         self.seed(TARGET, NOW, ["p1/us-central1-a/a", "p2/us-central1-a/b", "p3/us-central1-a/c"])
