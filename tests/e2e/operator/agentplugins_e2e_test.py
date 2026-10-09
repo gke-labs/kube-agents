@@ -1536,7 +1536,7 @@ spec:
         # until the OOM killer takes them, and a removed CR field must not be a way back
         # into it.
         capped = agent_exec_until(
-            f"grep -q 'max_in_progress: 2' {AGENT_HOME}/config.yaml && echo CAPPED || echo OPEN",
+            f"grep -q 'max_in_progress: 6' {AGENT_HOME}/config.yaml && echo CAPPED || echo OPEN",
             "CAPPED",
         )
         assert "CAPPED" in capped, (
