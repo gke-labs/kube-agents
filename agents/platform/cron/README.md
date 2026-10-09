@@ -409,7 +409,8 @@ collector, `skills/fleet-audit/scripts/upgrade_retrospective.py`, with `--full`
 and one `--project` per roster project (the management project and every
 project a Cluster Agent profile names, read with `list_cluster_profiles`), so
 the scheduled run reads the reconciler's roster rather than every project the
-credential can list. The collector keeps a ledger of versions per cluster,
+credential can list, and with `--manifest-file`, so `finish` holds the findings
+document to what the collector read. The collector keeps a ledger of versions per cluster,
 reviews every cluster that is new or was upgraded since the last run, reads
 pods, nodes, events and budgets, classifies what it finds against the upgrade
 failure catalogue, and writes the three-section report (Errors, Warnings, Info)
