@@ -63,7 +63,7 @@ create with the old card, so no sweep runs.
 While the marker exists and ``.bootstrap_completed`` does not, each tick runs
 the hand-off instead of filing; it is a no-op once it has filed its card.
 
-Output is intentionally empty: ``oobe`` sends this stage's stdout to stderr, and the old job
+Output is intentionally empty: ``oobe`` sends this stage's output to ``logs/oobe.log``, and the old job
 delivers locally, so no run of it posts anything. The report reaches the user through
 ``bootstrap_delivery.py``, not through this stage.
 """

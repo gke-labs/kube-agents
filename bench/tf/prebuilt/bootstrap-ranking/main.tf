@@ -132,16 +132,15 @@ locals {
     import json, os, sys
     from cron.jobs import is_job_runnable, load_jobs
 
-    ids = ("${local.scan_job}", "${local.delivery_job}")
+    job = "${local.delivery_job}"
     jobs = {j.get("id"): j for j in load_jobs()}
-    missing = [i for i in ids if i not in jobs]
-    if missing:
-        sys.exit("onboarding job(s) %s are not in the cron store" % ", ".join(missing))
-    if not is_job_runnable(jobs[ids[1]]):
-        sys.exit("%s is paused" % ids[1])
-    deliver = jobs[ids[1]].get("deliver")
+    if job not in jobs:
+        sys.exit("onboarding job %s is not in the cron store" % job)
+    if not is_job_runnable(jobs[job]):
+        sys.exit("%s is paused" % job)
+    deliver = jobs[job].get("deliver")
     if deliver != "local":
-        sys.exit("%s delivers to %r, not local" % (ids[1], deliver))
+        sys.exit("%s delivers to %r, not local" % (job, deliver))
     state = "${local.state_file}"
     if os.path.exists(state):
         sys.exit("%s exists: delivery is already armed" % state)
@@ -151,7 +150,8 @@ locals {
     try:
         fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         with os.fdopen(fd, "w") as fh:
-            kept = [jobs[i] for i in ids] + [jobs[i] for i in ("${local.old_delivery_job}",) if i in jobs]
+            # oobe, and either disabled entry it removes after the claim, so the disarm can put them back.
+            kept = [jobs[i] for i in ("${local.scan_job}", job, "${local.old_delivery_job}") if i in jobs]
             json.dump({"jobs": kept}, fh)
         os.replace(tmp, state)
     except BaseException:
@@ -409,7 +409,7 @@ resource "null_resource" "ranking" {
           print("completed")
       elif not os.path.exists(home + "/.bootstrap_scan_filed"):
           print("unfiled")
-      elif "${local.scan_job}" not in jobs or "${local.delivery_job}" not in jobs:
+      elif "${local.delivery_job}" not in jobs:
           print("nojobs")
       elif not is_job_runnable(jobs["${local.delivery_job}"]):
           print("paused")
@@ -450,7 +450,7 @@ resource "null_resource" "ranking" {
           echo "ERROR: the onboarding gate on ${var.host_cluster_name} has not filed its discovery sweep (no ${local.home}/.bootstrap_scan_filed). A sweep filed during this case writes its own INVENTORY.raw.md over the planted one once its cards settle, and files a ranking card of its own; wait for the gate to file, or run the case elsewhere." >&2
           exit 1 ;;
         nojobs)
-          echo "ERROR: ${local.scan_job} or ${local.delivery_job} is not in the cron store on ${var.host_cluster_name}, so nothing would deliver the report this case grades." >&2
+          echo "ERROR: ${local.delivery_job} is not in the cron store on ${var.host_cluster_name}, so nothing would deliver the report this case grades." >&2
           exit 1 ;;
         paused)
           echo "ERROR: ${local.delivery_job} is paused on ${var.host_cluster_name}, so the delivery this case grades would never run. Resume it with '${local.hermes} cron resume ${local.delivery_job}' in the agent container." >&2

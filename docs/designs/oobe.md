@@ -231,8 +231,9 @@ claimed within seconds of that, as the old delivery job's was. Behind the scan a
   for the stage), so a failed delivery posts only delivery's own error; an exception in either is
   caught so it neither posts nor blocks delivery. The plugin triggers only the first job it binds,
   because `trigger_job` also enables a job and the old delivery entry ships disabled.
-- **Removal.** Once its first-run audits stage is done and `.bootstrap_completed` is five minutes
-  old, `oobe` removes the two disabled entries (`bootstrap_delivery._retire_jobs`) and then itself.
+- **Removal.** Five minutes after the report is claimed (`.bootstrap_completed`), the delivery
+  stage removes the two disabled entries (`bootstrap_delivery._retire_jobs`). Once the first-run
+  audits stage is also done, `oobe` removes itself.
   On an install nobody speaks to, the report is never claimed and `oobe` stays, doing nothing.
 - **Finished installs.** Already in step 1: the entrypoint passes `oobe` in `--assume-retired`
   when `.bootstrap_completed` exists, beside the two bootstrap ids, so an install that onboarded
