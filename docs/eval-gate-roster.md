@@ -435,8 +435,9 @@ presubmit. On a pull request it runs `hack/eval/gitlab-presubmit-cases.txt`, not
 issue), since a chat probe passes the same on either forge and the GitHub run already grades it.
 The file is a subset of the presubmit by construction; `hack/ci-eval-pr.sh` refuses an entry
 that is not a presubmit case, and `scripts/test_eval_rosters.py` pins the set and that each entry requires a positive
-forge check (not negated, not one alternative under an `any`). A GitLab
-nightly runs the whole catalogue, as the GitHub nightly does.
+forge check (not negated, not one alternative under an `any`). A GitLab nightly would run the
+whole catalogue, as the GitHub nightly does, but none exists yet (#2832): nothing
+runs the cases this file leaves out against GitLab today.
 
 The roster above is still the roster, intersected with the lane's list: a roster case in the
 lane arms rung 4 there, and a held-out seat runs and reports without arming it, exactly as on

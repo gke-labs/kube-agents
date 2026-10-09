@@ -1,8 +1,9 @@
 # The GitLab lane's presubmit matrix: what pull-kube-agents-smoke-test-gitlab
 # runs (kube-agents#2394). hack/ci-eval-pr.sh reads this file instead of
-# presubmit-cases.txt when EVAL_FORGE=gitlab and EVAL_TIER is presubmit; the
-# nightly under EVAL_FORGE=gitlab runs the whole catalogue, as the GitHub
-# nightly does, so this file is the only place the two lanes differ.
+# presubmit-cases.txt when EVAL_FORGE=gitlab and EVAL_TIER is presubmit. A
+# GitLab nightly would run the whole catalogue, as the GitHub nightly does,
+# but none exists yet (#2832): today nothing runs the twelve cases
+# this file leaves out, or the nightly-only cases, against GitLab.
 #
 # One `./tasks/<id>/task.yaml` path per line, relative to bench/. `#` starts
 # a comment, blank lines are skipped. Every entry must also be a line in

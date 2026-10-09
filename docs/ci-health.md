@@ -190,8 +190,8 @@ also carries the nightly periodics' runs (`runs[].tier`, see
 towards a distinct-PR floor, and a nightly collapsing is a case's record on
 `main`, not a gate incident. It carries the GitLab lane's runs too
 (`pull-kube-agents-smoke-test-gitlab`, `tier: gitlab`): on a pull request the
-forge-grading subset of the presubmit matrix (`hack/eval/gitlab-presubmit-cases.txt`), on a
-nightly the whole matrix, against a pool project's GitLab repository, listed in the Brief's "GitLab
+forge-grading subset of the presubmit matrix (`hack/eval/gitlab-presubmit-cases.txt`; a GitLab
+nightly, #2832, does not exist yet), against a pool project's GitLab repository, listed in the Brief's "GitLab
 lane" section with its own counts and links, and in no gate number, case
 history or digest line.
 

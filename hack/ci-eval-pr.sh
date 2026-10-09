@@ -1783,8 +1783,9 @@ EVAL_TIER="${EVAL_TIER:-presubmit}"
 # The GitLab lane (kube-agents#2394): under EVAL_FORGE=gitlab a presubmit
 # runs hack/eval/gitlab-presubmit-cases.txt instead of the presubmit file --
 # the cases that grade the forge, a subset of the presubmit by construction,
-# sized by that file's BUDGET note against the job's 360-minute deadline. The
-# nightly under gitlab is the whole catalogue, as on GitHub. The presubmit
+# sized by that file's BUDGET note against the job's 360-minute deadline. A
+# nightly under gitlab would be the whole catalogue, as on GitHub; no such
+# periodic exists yet (#2832). The presubmit
 # names the lane left out are kept in GITLAB_LANE_DROPPED for the
 # BOOTSTRAP_ADMITTED export, as the nightly part's are.
 GITLAB_LANE_DROPPED=""
