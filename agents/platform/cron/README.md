@@ -450,9 +450,10 @@ nothing.
 the volume, the ledger issue through `audit_report.py`, and the chat message,
 and the `high` tier's command allowlist would refuse the collector itself, a
 Python script. `deliver: chat`, so the Chat Agent owns the thread a reply lands
-in. The daily readiness watch, once it ships, reads the collector's `guards.json`
-beside the ledger and names each live guard in its next report, which is how a
-failure one upgrade caused reaches the operator planning the next.
+in. The collector also keeps a guard per classified failure and per risk shape
+in `guards.json` beside its ledger, for the readiness watch to read once it
+ships ([the readiness design](../../../docs/designs/upgrade-readiness-checks.md));
+nothing reads the file today.
 
 ## Never put an id on both rosters
 
