@@ -57,13 +57,35 @@ var statusQueries = map[string]bool{
 
 // isStatusQuery reports whether a mid-task message asks what the task is
 // doing rather than telling it something. Deterministic by design - the
-// gateway holds no model - so this is a phrase set and nothing wider. A
-// wider interrogative rule existed while the fixed-route executor refused
-// steers, where a stolen steer cost nothing; now every executor acts
-// on a steer, and a status-shaped steer is a question the agent can answer
-// itself.
-func isStatusQuery(text string) bool {
-	return statusQueries[normalize(text)]
+// gateway holds no model - so this is a phrase set plus a narrow
+// interrogative rule, not understanding. The interrogative rule is the wide
+// half and it misfires ("any update to the config should be reverted" is a
+// steer), so it applies only when wide is true. The caller sets wide by
+// what the executor does with a steer: one that runs follow-ups (the
+// bridge's api executor, a session worker) gets the exact phrases only,
+// because a stolen steer there is a lost correction and a status-shaped
+// steer is a question the agent can answer itself; one that refuses them
+// (the bridge's cli executor, which refuses each no-resume) gets the wide
+// rule, because a stolen false positive there costs nothing and the
+// alternative is an ack followed by a refusal.
+//
+// wideMatchLenCap bounds the wide interrogative match: past this length a
+// message is a composed instruction, not a status poke, however it starts.
+const wideMatchLenCap = 48
+
+func isStatusQuery(text string, wide bool) bool {
+	n := normalize(text)
+	if statusQueries[n] {
+		return true
+	}
+	if !wide || len(n) > wideMatchLenCap {
+		return false
+	}
+	statusish := strings.Contains(n, "doing") || strings.Contains(n, "happening") ||
+		strings.Contains(n, "going on") || strings.Contains(n, "update")
+	interrogative := strings.HasPrefix(n, "what") || strings.HasPrefix(n, "how") ||
+		strings.HasPrefix(n, "any") || strings.HasPrefix(n, "is ") || strings.HasPrefix(n, "are ")
+	return statusish && interrogative
 }
 
 // isDelegate reports whether the turn asks for a delegated session worker -
