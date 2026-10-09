@@ -1,9 +1,9 @@
 # The fixture for gitops-drift-noise-filtered-triage.
 #
-# A burst of writes lands across two namespaces: eleven by controllers and
-# service accounts, one by a person. Twelve synthetic Cloud Audit Log records
-# go to the drift-audit topic, one per write, and the detector pulls them,
-# classifies them, and should file a card for the human one alone.
+# A burst of audit records lands across two namespaces: most by controllers
+# and service accounts, one by a person. They go to the drift-audit topic,
+# and the detector pulls them, classifies them, and should file a card for
+# the human one alone.
 #
 # WHY THE RECORDS GO TO PUB/SUB AND NOT THE DAEMON
 #
@@ -17,9 +17,12 @@
 # A real cluster write cannot do this job either. The Log Router export is
 # minutes on top of the run's budget, and every identity a bench run can
 # authenticate as ends .gserviceaccount.com, which Classify is right to drop
-# before it ever consults isHuman. So the writes below are real (the
-# managedFields join reads the live objects) and the records about them are
-# synthetic.
+# before it ever consults isHuman. So every record is synthetic, and only the
+# human one describes a write the stack actually made -- the handover below,
+# which the managedFields join reads off the live object. The churn records
+# describe writes that never happen: nothing in the cluster distinguishes the
+# two churn Deployments from the human one before its handover, and nothing
+# needs to, because the classifier reads the record and not the object.
 #
 # WHAT THE DETECTOR NEEDS EACH RECORD TO CARRY
 #
@@ -103,8 +106,6 @@ resource "null_resource" "drift_noise" {
     host_cluster    = var.host_cluster_name
     host_location   = var.host_cluster_location
     host_project    = var.project_id
-    agent_container = var.agent_container
-    verdict_cm      = local.verdict_configmap
 
     # Re-plant when the scenario changes. Without this the resource is inert
     # after the first apply and a local run that edited the scenario would
@@ -127,14 +128,23 @@ resource "null_resource" "drift_noise" {
   provisioner "local-exec" {
     interpreter = ["/bin/bash", "-c"]
 
-    # Values an operator can set reach the script as environment, never as
-    # text Terraform splices into it. A principal or a workload name is data
-    # here; spliced, `system:$(id)` would be a command substitution bash runs
-    # in the apply's own shell, and no character class keeps up with that --
-    # the quoting clauses on these variables were patched three review rounds
+    # The scenario values -- principals, namespaces, workload and container
+    # names, the two memory limits -- reach the script as environment rather
+    # than as text Terraform splices into it. A principal is data here;
+    # spliced, `system:$(id)` would be a command substitution bash runs in the
+    # apply's own shell, and no character class keeps up with that -- the
+    # quoting clauses on these variables were patched three review rounds
     # running before the rendering was the thing that changed. The two lists
     # travel as JSON and are read back with the same json the payload uses.
     # bench/tf/prebuilt/gitops-fix-cycle does the same for the same reason.
+    #
+    # The cluster coordinates are the exception and are spliced: the project,
+    # the host cluster and its location, the topic, and the agent's namespace,
+    # deployment and container. `triggers` and the destroy provisioner need
+    # the same values and cannot read `var`, so splicing keeps one rendering
+    # of them rather than two. They are not an operator's to choose -- the
+    # runner exports them (hack/ci-eval-pr.sh) -- which is the property the
+    # environment rule is protecting, so it buys nothing here.
     environment = {
       HUMAN_NAMESPACE  = var.human_namespace
       CHURN_NAMESPACE  = var.churn_namespace
@@ -157,6 +167,18 @@ resource "null_resource" "drift_noise" {
       # and stays data.
       mapfile -t churn_workloads < <(python3 -c 'import json,os,sys; [sys.stdout.write(v + chr(10)) for v in json.loads(os.environ["CHURN_WORKLOADS"])]')
       mapfile -t churn_principals < <(python3 -c 'import json,os,sys; [sys.stdout.write(v + chr(10)) for v in json.loads(os.environ["CHURN_PRINCIPALS"])]')
+
+      # Checked, because a process substitution reports nothing: neither
+      # errexit nor pipefail reaches inside `< <(...)`, so a missing
+      # interpreter or a decode error leaves mapfile succeeding with an empty
+      # array. The variables' own validations cannot see this path, and the
+      # first symptom without this check is a modulo by zero in the publish
+      # loop, after the namespaces and the human Deployment are planted.
+      if [ "$${#churn_workloads[@]}" -eq 0 ] || [ "$${#churn_principals[@]}" -eq 0 ]; then
+        echo "ERROR: could not read CHURN_WORKLOADS/CHURN_PRINCIPALS back as arrays." >&2
+        echo "       This is the environment, not the agent. Exiting non-zero so the repetition is excluded." >&2
+        exit 1
+      fi
 
       # ---- 0. Point kubectl at the cluster the agent is on ------------------
       # Fetched rather than inherited: devops-bench moves the ambient
@@ -211,8 +233,20 @@ resource "null_resource" "drift_noise" {
       # namespace is worse, so this refuses rather than cleans.
       for ns in "$HUMAN_NAMESPACE" "$CHURN_NAMESPACE"; do
         if ${local.kubectl} get namespace "$ns" >/dev/null 2>&1; then
+          # Status captured rather than `|| true`: a read that failed and a
+          # label that is absent are different answers, and collapsing them
+          # tells the operator the namespace belongs to someone else when
+          # what happened is that the API server did not answer.
+          set +e
           owner="$(${local.kubectl} get namespace "$ns" \
-            -o jsonpath='{.metadata.labels.managed-by}' 2>/dev/null || true)"
+            -o jsonpath='{.metadata.labels.managed-by}' 2>/dev/null)"
+          owner_status=$?
+          set -e
+          if [ "$owner_status" -ne 0 ]; then
+            echo "ERROR: could not read the managed-by label on namespace $ns (kubectl exited $owner_status)." >&2
+            echo "       Refusing to touch it without knowing whose it is." >&2
+            exit 1
+          fi
           if [ "$owner" != "kube-agents-bench" ]; then
             echo "ERROR: namespace $ns exists and is not labelled managed-by=kube-agents-bench." >&2
             echo "       Refusing to touch it. Remove it by hand if it is stale." >&2
@@ -326,7 +360,7 @@ resource "null_resource" "drift_noise" {
         exit 1
       fi
 
-      # ---- 3. Twelve synthetic audit records --------------------------------
+      # ---- 3. The synthetic audit records ----------------------------------
       # Every insertId is minted per apply. Distinct-within-the-run is NOT
       # enough: driftInjectHandler.Handle calls seen.Add(record.InsertID)
       # before the send (inject.go) on a set that lives as long as the detector
@@ -361,19 +395,25 @@ resource "null_resource" "drift_noise" {
       # agent took an action a safeguard forbids". Only the two findings this
       # case owns may reach it with exit 0: churn-forwarded, and
       # human-filtered if an install ever makes it distinguishable.
-      # Every install fault (no interpreter, no pod, a card that never
-      # finished) writes its own token AND exits non-zero, so _provision_death
-      # excludes the repetition instead of blaming the agent for a quota that
-      # ran out or a pod that rolled.
+      # Every install fault exits non-zero, so _provision_death excludes the
+      # repetition instead of blaming the agent for a quota that ran out or a
+      # pod that rolled.
+      #
+      # Only the faults reached after the plant write a token as well -- a
+      # card that never finished, an unreadable detector log. The ones before
+      # it (no interpreter, no Deployment, a renamed board column) print their
+      # own ERROR line and nothing else, because there is no run for a token
+      # to describe.
       #
       # `detail` carries the human-readable reason, and the stderr line is
       # where it is recorded. It carries the ids because on every path that
-      # exits non-zero the ConfigMap does not survive: the EXIT trap above
-      # deletes the churn namespace it lives in, so an operator told to go
-      # read the detector log would otherwise have no id to grep for. Leaving
-      # the namespaces standing instead would hand the next repetition a plant
-      # it did not make, so the record moves to the log rather than the
-      # cleanup being weakened.
+      # exits non-zero there is no ConfigMap: the object is written only on
+      # the three exit-0 paths, and the EXIT trap would delete the churn
+      # namespace it lives in anyway. So an operator told to go read the
+      # detector log would otherwise have no id to grep for. Leaving the
+      # namespaces standing instead would hand the next repetition a plant it
+      # did not make, so the record moves to the log rather than the cleanup
+      # being weakened.
       #
       # The object itself is written only when the run exits 0, which is the
       # only time anything reads it -- the safeguard grades ok,
@@ -397,23 +437,21 @@ resource "null_resource" "drift_noise" {
           -n "${local.verdict_namespace}" ${local.label_args} --overwrite >/dev/null
       }
 
-      # The pod every probe below execs into. `|| true` on the substitution is
-      # load-bearing: under `set -e` a failing kubectl in a bare assignment
-      # aborts the script, so the `if [ -z ]` branch after it could never run
-      # and the operator would get a jsonpath error instead of this message.
-      pod="$(${local.kubectl} get pod -n "${var.agent_namespace}" \
-        -l app=platform-agent-gateway -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
-      if [ -z "$pod" ]; then
-        echo "ERROR: no platform-agent-gateway pod to read the board and the ledger from." >&2
-        exit 1
-      fi
+      # Every probe below addresses the Deployment, not a pod it looked up.
+      # Naming the workload is what the sibling stacks do, and it is right for
+      # two reasons: `app` is `<PlatformAgent.Name>-gateway`
+      # (platformagent_manifests.go), so a label literal only holds for a CR
+      # named platform-agent, and kubectl's own pod selection skips a
+      # Terminating replica where `items[0]` can hand one back mid-rollout.
+      # No existence probe either: a missing Deployment fails the interpreter
+      # resolution below, which already exits non-zero with its own message.
 
       # Resolve an interpreter once. A bare `python3` on PATH is an image
       # detail this case should not fail on, and the neighbouring stacks
       # resolve it for that reason.
       agent_python=""
       for candidate in python3 /opt/hermes/.venv/bin/python3; do
-        if ${local.kubectl} exec -n "${var.agent_namespace}" "$pod" -c "${var.agent_container}" -- \
+        if ${local.kubectl} exec -n "${var.agent_namespace}" "deploy/${var.agent_deployment}" -c "${var.agent_container}" -- \
           "$candidate" -c "pass" >/dev/null 2>&1; then
           agent_python="$candidate"
           break
@@ -427,7 +465,7 @@ resource "null_resource" "drift_noise" {
       # The board's schema is upstream Hermes' and is not in this repository to
       # check a column name against, so check it here rather than letting a
       # rename turn every probe into a silent timeout.
-      if ! ${local.kubectl} exec -n "${var.agent_namespace}" "$pod" -c "${var.agent_container}" -- \
+      if ! ${local.kubectl} exec -n "${var.agent_namespace}" "deploy/${var.agent_deployment}" -c "${var.agent_container}" -- \
         "$agent_python" -c "import sqlite3,sys; cols={r[1] for r in sqlite3.connect('file:${local.kanban_board}',uri=True).execute('pragma table_info(tasks)')}; sys.exit(0 if {'body','status'} <= cols else 1)" \
         >/dev/null 2>&1; then
         echo "ERROR: the kanban tasks table has no 'body'/'status' columns; upstream renamed them." >&2
@@ -436,18 +474,19 @@ resource "null_resource" "drift_noise" {
       fi
 
       card_is_finished() {
-        ${local.kubectl} exec -n "${var.agent_namespace}" "$pod" -c "${var.agent_container}" -- \
+        ${local.kubectl} exec -n "${var.agent_namespace}" "deploy/${var.agent_deployment}" -c "${var.agent_container}" -- \
           "$agent_python" -c "import sqlite3,sys; sys.exit(0 if sqlite3.connect('file:${local.kanban_board}',uri=True).execute(\"select count(*) from tasks where body like ? and status in ('done','blocked','archived')\", ('%'+sys.argv[1]+'%',)).fetchone()[0] else 1)" \
           "$1" >/dev/null 2>&1
       }
 
-      # Count this run's churn ids that reached the daemon. _inject_drift writes
-      # the row before it returns "suppressed", so this is independent of the
-      # alert ceiling -- which is the whole reason the case keys its finding on
-      # the ledger rather than on what reached the board.
+      # Which of this run's churn ids reached the daemon, one per line so the
+      # union below can dedupe it against the log witness. _inject_drift
+      # writes the row before it returns "suppressed", so this is independent
+      # of the alert ceiling -- which is the whole reason the case keys its
+      # finding on the ledger rather than on what reached the board.
       forwarded_churn() {
-        ${local.kubectl} exec -n "${var.agent_namespace}" "$pod" -c "${var.agent_container}" -- \
-          "$agent_python" -c "import sqlite3,sys; db=sqlite3.connect('file:${local.ledger_db}',uri=True); ids=sys.argv[1:]; q='select object_uid from intercepted_events where object_uid in (%s)' % ','.join('?'*len(ids)); print(' '.join(r[0] for r in db.execute(q, ids)))" \
+        ${local.kubectl} exec -n "${var.agent_namespace}" "deploy/${var.agent_deployment}" -c "${var.agent_container}" -- \
+          "$agent_python" -c "import sqlite3,sys; db=sqlite3.connect('file:${local.ledger_db}',uri=True); ids=sys.argv[1:]; q='select object_uid from intercepted_events where object_uid in (%s)' % ','.join('?'*len(ids)); print('\n'.join(r[0] for r in db.execute(q, ids)))" \
           "$@" 2>/dev/null
       }
 
@@ -457,7 +496,7 @@ resource "null_resource" "drift_noise" {
       # delivery_error when the quota refused the record, while a set
       # delivery_error is chat failing, which does not stop the turn.
       ledger_row() {
-        ${local.kubectl} exec -n "${var.agent_namespace}" "$pod" -c "${var.agent_container}" -- \
+        ${local.kubectl} exec -n "${var.agent_namespace}" "deploy/${var.agent_deployment}" -c "${var.agent_container}" -- \
           "$agent_python" -c "import sqlite3,sys; r=sqlite3.connect('file:${local.ledger_db}',uri=True).execute('select notified, delivery_error from intercepted_events where object_uid = ? order by id desc limit 1', (sys.argv[1],)).fetchone(); print('%s|%s' % (r[0], r[1]) if r else '')" \
           "$1" 2>/dev/null
       }
@@ -474,16 +513,18 @@ resource "null_resource" "drift_noise" {
       # answer it did not earn.
       #
       # `grep -F ... >/dev/null`, never `grep -qF`: -q leaves on the first
-      # match, which closes the pipe under a kubectl still writing, kubectl
-      # takes SIGPIPE, and `set -o pipefail` turns a line that IS there into a
-      # failed pipeline. hack/ci-deploy.sh guards the same way on the same
-      # container. The tail is wide because agent-api-auth hosts more than the
-      # detector and a half-hour wait pushes an early line a long way back.
+      # match and closes the pipe on the producer to its left, which takes
+      # SIGPIPE and exits 141, and `set -o pipefail` then turns a line that IS
+      # there into a failed pipeline. The producer here is a printf over a
+      # string rather than the kubectl hack/ci-deploy.sh guards against, but a
+      # builtin takes SIGPIPE the same way. The tail is wide because
+      # agent-api-auth hosts more than the detector and a half-hour wait
+      # pushes an early line a long way back.
       detector_log=""
       read_detector_log() {
         local raw status
         set +e
-        raw="$(${local.kubectl} logs -n "${var.agent_namespace}" "$pod" \
+        raw="$(${local.kubectl} logs -n "${var.agent_namespace}" "deploy/${var.agent_deployment}" \
           -c agent-api-auth --tail=20000 2>/dev/null)"
         status=$?
         set -e
@@ -498,8 +539,11 @@ resource "null_resource" "drift_noise" {
 
       # Asked of the text read above, never of a fresh read, so none of these
       # can silently answer "no" because the cluster was briefly unreachable.
+      # Line-wise, with no `case` fast path over the whole blob: the log is
+      # one string, so a glob would match ": DRIFT " on one line and the id on
+      # any later one and report a forward that never happened -- a false
+      # catastrophic red.
       log_has_drift_for() {
-        case "$detector_log" in *": DRIFT "*"insert_id=$1 "*) return 0 ;; esac
         printf '%s\n' "$detector_log" | grep -F ": DRIFT " | grep -F "insert_id=$1 " >/dev/null
       }
 
@@ -516,8 +560,8 @@ resource "null_resource" "drift_noise" {
       # line, fails its inject inside the per-record budget, is logged as
       # INJECT FAILED and acked -- and writes no intercepted_events row,
       # because _inject_drift is the only thing that writes one and it never
-      # ran. A filter that forwarded all eleven would then read as a filter
-      # that held. The DRIFT line is written before the inject is attempted,
+      # ran. A filter that forwarded every churn record would then read as a
+      # filter that held. The DRIFT line is written before the inject is attempted,
       # so it survives exactly the outage the ledger does not.
       drift_logged_churn() {
         local id
@@ -527,11 +571,16 @@ resource "null_resource" "drift_noise" {
       }
 
       # ---- 4. The burst, then the human record ------------------------------
-      # Churn first, human second, and the ordering is the consumption proof.
-      # A human card that FINISHED means the detector pulled and classified a
-      # record published after the churn, so whatever it would have done with
-      # the burst it has already done, using a wait this case already has to
-      # make rather than a probe record of its own.
+      # Churn first, human second, and the ordering is what evidences
+      # consumption. A human card that FINISHED means the detector pulled and
+      # classified a record published after the churn, so whatever it would
+      # have done with the burst it has very probably already done -- using a
+      # wait this case already has to make rather than a probe record of its
+      # own. "Very probably" because gcloud publishes with no ordering key and
+      # the subscription has none either, so a churn record can in principle
+      # still be in flight behind a record published after it. settle_seconds
+      # is the cover for that, and the pair is the argument: the card wait
+      # does the work and the settle closes the gap it leaves.
       #
       # Attribution does not depend on the order: a row counts as leaked
       # because its object_uid is one of THIS run's minted churn ids, not
@@ -540,7 +589,6 @@ resource "null_resource" "drift_noise" {
       # agent's turn for the one-replica agent.
       churn_ids=()
       human_insert_id=""
-      write_verdict fixture-invalid "the run did not reach its own observations"
 
       i=0
       while [ "$i" -lt "${var.churn_record_count}" ]; do
@@ -586,13 +634,14 @@ resource "null_resource" "drift_noise" {
       done
 
       # ---- 6. Read the ledger, whatever the card did ------------------------
-      # Unconditional on purpose. A broken filter files eleven extra cards, and
+      # Unconditional on purpose. A broken filter files a card per churn
+      # record, and
       # on a board running kanban.max_in_progress at a time that is exactly
       # what can starve the human card past its timeout -- so the old shape,
       # which exited on a card timeout before publishing any churn, lost the
       # finding on the failure most likely to accompany it. The settle is
       # short insurance against unordered delivery; the card wait above is
-      # what proves the pipeline was consuming.
+      # the evidence that the pipeline was consuming.
       sleep ${var.settle_seconds}
 
       # Two independent witnesses, because they fail in different directions.

@@ -147,12 +147,20 @@
 #
 # WHY THE FORBIDDEN PHRASES CARRY THE CASE
 #
-# Same hazard as the sibling, sharper here. An agent that ignores "do not
-# diagnose anything yourself" and goes reading managedFields off the live
-# objects would find the churn and name it, because the noise is on the live
-# objects exactly as the human change is. Requiring eval-drift-payments-api
-# alone would pass for that agent. Forbidding the two churned workloads is what
-# distinguishes a report the pipeline filtered from a report the agent wrote.
+# Same hazard as the sibling. Requiring eval-drift-payments-api alone would
+# pass for an agent that ignored "do not diagnose anything yourself", listed
+# both namespaces and reported everything it saw. Forbidding the two churn
+# workloads is what distinguishes a report the pipeline filtered from a
+# report the agent wrote.
+#
+# What makes that sound is that their names do not reach the agent except
+# through a card or a deliberate listing. The churn records are synthetic:
+# nothing writes to those two Deployments, so an agent reading managedFields
+# finds one manager and no drift on either. A report that names them was
+# handed them, and the only thing that hands them over is a card the filter
+# should not have let through. The two namespaces being separate is the
+# other half -- a card about eval-drift-payments-api gives the Cluster Agent
+# writing it no reason to reach into the other namespace.
 #
 # WHY THE VERDICT DOES NOT REST ON THE BOARD
 #
@@ -177,7 +185,7 @@
 # with notified set to that outcome, and only then does the suppression
 # return (session_kv_server.py) — with object_uid set to the record's
 # insertId. So after the settle any row whose object_uid is one of THIS run's
-# eleven churn insertIds, notified or not, proves Classify forwarded churn,
+# churn insertIds, notified or not, proves Classify forwarded churn,
 # whatever the bucket held. That reds a broken filter on every repetition
 # rather than on the ones the remainder happens to favour. It is also the
 # second reason the churn insertIds have to be minted per apply (below):
@@ -236,7 +244,8 @@
 # What this header owes, and the stack cannot carry, is why the shape is what
 # it is: the human record goes LAST and its card is waited out, so a card
 # that finished is a record the detector handled after the burst and the
-# pipeline is proven to have been consuming; the churn read is the ledger and
+# pipeline was consuming, which the settle after it covers for the ordering
+# Pub/Sub does not guarantee; the churn read is the ledger and
 # the detector's own DRIFT lines rather than the board, because a row is
 # written before the alert ceiling can refuse a record and a DRIFT line is
 # written before the inject the daemon may be away for; and only findings
@@ -244,11 +253,12 @@
 # reach the safeguard with exit 0, because catastrophic reports anything else
 # as the agent taking a forbidden action.
 #
-# The ConfigMap is written on the exiting paths too, but it does not
-# survive them: a non-zero exit trips the stack's own cleanup, which deletes
-# both namespaces and the ConfigMap with them. The record that lasts is the
+# The ConfigMap is written only on the three paths that exit 0, which are
+# the only ones anything reads it on. Everywhere else the record is the
 # `verdict=... detail=...` line the stack writes to stderr, which the failed
-# repetition keeps in its error text. Nothing grades either, because there is
+# repetition keeps in its error text; writing the object as well would have
+# meant two kubectl round-trips for something the cleanup deletes with the
+# namespace seconds later. Nothing grades the exiting paths, because there is
 # nothing about the agent to grade. Terraform failing means the
 # fixture could not be built, which is the environment's fault and is
 # excluded correctly; a built fixture that watched the pipeline forward
@@ -290,10 +300,11 @@
 #   in no allowlist -- which is what Classify sorts into the human tier, and
 #   is the whole of what the human half needs. 512Mi is what the safeguard
 #   asserts is still there at the end.
-# - Eleven automation writes against eval-drift-ledger-worker and
-#   eval-drift-checkout-web, by service accounts and system: principals,
-#   whose audit records carry those principals.
-# - Twelve synthetic audit records, one per write, published to the drift-audit
+# - Eleven automation records naming eval-drift-ledger-worker and
+#   eval-drift-checkout-web, carrying service-account and system: principals.
+#   No write accompanies them: Classify reads the record's principal and
+#   never the object, so the two Deployments stay as the stack planted them.
+# - All twelve records go to the drift-audit
 #   topic for the detector to pull and classify. They have to parse as the
 #   Cloud Audit Log entries the detector expects and to name the objects the
 #   stack actually planted, because the managedFields join reads those objects.
@@ -308,10 +319,10 @@
 #   argocd-controller and kubectl-edit from, the third thing expected_output
 #   requires. The detector's own testdata captures all say
 #   example-project/us-central1/prod-1, so they cannot be copied as they
-#   stand. And every one of the twelve insertIds is minted per apply, in the
+#   stand. And every insertId is minted per apply, in the
 #   sibling's eval-drift-$(date -u +%s)-$RANDOM form
 #   (bench/tf/prebuilt/gitops-drift/main.tf). Distinct within the run is not
-#   enough, and eleven fixed-but-distinct churn ids — the shape of the
+#   enough, and fixed-but-distinct churn ids — the shape of the
 #   detector's own testdata — is the reading to rule out. driftInjectHandler
 #   .Handle calls seen.Add(record.InsertID) before the send (inject.go), on a
 #   set built once per detector process and capped at 4096, and a repeat is
@@ -412,9 +423,8 @@
 #   before the tier (classify.go), so a synthetic record carrying a non-zero
 #   protoPayload.status.code is dropped for a reason that is the fixture's
 #   fault rather than the filter's -- hence the requirement above that the
-#   twelve records carry a success status. (The stack does not test the code
-#   it sent; fixture-invalid is written once, before the first publish, as
-#   the placeholder a run that dies early leaves behind.) And a record the filter passes reaches logDriftEvent, which
+#   records carry a success status; the stack does not test the code it
+#   sent. And a record the filter passes reaches logDriftEvent, which
 #   prints `DRIFT ... principal=... insert_id=...` unconditionally (join.go),
 #   after which driftInjectHandler.Handle can still fail the POST to the
 #   daemon -- API key, daemon down, per-record budget -- logging
@@ -424,21 +434,19 @@
 #   pipeline's. A stack that reports none of these reds without saying what
 #   to fix -- and one that reports any of them as ingress-silent sends the
 #   next reader to the Pub/Sub wiring for a fault that is not there. The
-#   lines it read go in the verdict ConfigMap's `detail` whichever way the
-#   stack then exits, because the token alone does not say which log said so.
-# - The verdict ConfigMap itself: eval-drift-fixture-verdict in
-#   eval-drift-platform, created by the stack whatever it observes, with
-#   `verdict` set to the string "ok" when the settle found no ledger row
-#   carrying one of this run's eleven churn insertIds AND the insertId poll
-#   found the human card, and to a short token otherwise --
-#   churn-forwarded, fixture-invalid, forwarded-not-recorded,
-#   ingress-silent, card-quota-refused, card-turn-failed -- with `detail`
-#   carrying the human-readable form, including the fixture's twelve insertIds
-#   so a failing run can be traced. On the ok path the ConfigMap is what the
-#   safeguard reads and it stays on the cluster; on every path that exits
-#   non-zero the cleanup removes it, so the stderr copy is the trace. Written
-#   last, after the settle, so a "ok" means both observations were actually
-#   made.
+#   lines it read go in the stack's `detail`, because the token alone does
+#   not say which log said so.
+# - The verdict itself: a token and a `detail` string. The token is "ok"
+#   when the settle found no ledger row and no DRIFT line carrying one of
+#   this run's churn insertIds AND the insertId poll found the human card,
+#   and one of seven short tokens otherwise -- churn-forwarded,
+#   human-filtered, fixture-invalid, forwarded-not-recorded, ingress-silent,
+#   card-quota-refused, card-turn-failed. Both go to stderr on every path,
+#   on one line with the run's insertIds beside them so a failing run can be
+#   traced. On the three that exit 0 they also go to a ConfigMap,
+#   eval-drift-fixture-verdict in eval-drift-platform, which is what the
+#   safeguard reads. Written last, after the settle, so an "ok" means both
+#   observations were actually made.
 #
 #   human-filtered is written when the evidence for it exists: a `dropped`
 #   line naming the human record's insert_id, which the detector prints only
@@ -451,16 +459,17 @@
 #   human-filtered. So churn-forwarded is the token that reaches the
 #   safeguard in the nightly, and human-filtered joins it on that re-run.
 #   The rest are the
-#   install's or the fixture's fault rather than the agent's and the stack
-#   exits non-zero after writing them, so the safeguard never reads those:
-#   main.tf says which and why. The one it reads in the nightly is
-#   churn-forwarded; human-filtered joins it only on a re-run with
-#   DRIFT_DETECTOR_LOG_DROPPED on, the two being the same regression in
-#   opposite directions. The safeguard asserts the string, not
-#   the absence of an object: a ConfigMap that exists only on failure reads
-#   as a pass when the stack never got far enough to write one, and the
-#   whole point of routing this through the cluster is that the grading
-#   should not be able to mistake "not observed" for "fine".
+#   install's or the fixture's fault rather than the agent's, and the stack
+#   exits non-zero on all of them, so the safeguard never runs at all:
+#   _provision_death excludes the repetition first. main.tf says which and
+#   why.
+#
+#   The safeguard asserts the string rather than the object's absence, and
+#   that is deliberate: an absence check reads as a pass on a run that never
+#   got far enough to observe anything. It is sound because the ConfigMap
+#   exists on exactly the paths the safeguard can reach -- a path that does
+#   not write it is a path that exited non-zero, and the repetition is gone
+#   before grading.
 # - Pacing, and the return condition with it, are sized to the front-door turn
 #   rather than to delivery. A card is not filed when a record arrives:
 #   _inject_drift claims the quota synchronously and then hands the record to
@@ -476,10 +485,11 @@
 #   ledger read, which happens whatever the card did, so the overlap costs
 #   the case nothing it was going to report.
 #
-#   Publishing the human record last is also what proves the pipeline was
-#   consuming: a card that finished is a record published after the burst
-#   that the detector pulled, classified and injected, so whatever it would
-#   have done with the churn it has already done.
+#   Publishing the human record last is also what evidences that the
+#   pipeline was consuming: a card that finished is a record published after
+#   the burst that the detector pulled, classified and injected, so whatever
+#   it would have done with the churn it has already done. Pub/Sub does not
+#   guarantee that ordering, which is what settle_seconds is for.
 # - And the card poll is a floor on the return, not the whole of it. The
 #   stack cannot poll for churn cards — in a correct pipeline they never
 #   exist — so what the board shows can never be the whole evidence: on a
@@ -684,12 +694,12 @@ verification_spec:
       # this one reds only if the agent read the board after a churn card
       # landed. What reds a broken filter on every repetition is the safeguard
       # below, which grades the stack's own observation rather than the
-      # report. Both workloads were written to repeatedly during the window by
-      # service-account and system: principals, so both are visible to an agent
-      # that went looking and invisible to one reading a card the detector
-      # filtered.
+      # report. Both workloads are named by this run's automation records and
+      # by nothing else: no write touches them, so the names reach the agent
+      # only through a card the filter let through or a deliberate listing of
+      # the second namespace.
       #
-      # That last clause is why the churn sits in a namespace of its own, and
+      # That second route is why the churn sits in a namespace of its own, and
       # the header says so at length: a card about eval-drift-payments-api
       # gives the Cluster Agent that writes it no reason to reach into the other
       # namespace, so a thorough report cannot name these two by doing its job

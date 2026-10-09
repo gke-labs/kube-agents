@@ -69,9 +69,9 @@ variable "churn_namespace" {
   default     = "eval-drift-platform"
 }
 
-# ─── The three workloads ─────────────────────────────────────────────────────
+# ─── The workloads ───────────────────────────────────────────────────────────
 #
-# All three carry the eval-drift- prefix so a sweep can tell this case's
+# All carry the eval-drift- prefix so a sweep can tell this case's
 # objects from another's. The namespace name is a prefix of the human change's
 # workload name (eval-drift-payments / eval-drift-payments-api) on purpose:
 # see the case header on why a report that names a namespace cannot be graded
@@ -100,7 +100,7 @@ variable "churn_workloads" {
 
   validation {
     condition     = length(var.churn_workloads) > 0
-    error_message = "churn_workloads must name at least one workload. The publish loop indexes it modulo its length, so an empty list divides by zero and aborts the apply with the fixture-invalid placeholder as the only explanation."
+    error_message = "churn_workloads must name at least one workload. The publish loop indexes it modulo its length, so an empty list divides by zero part-way through the apply, after the namespaces are planted."
   }
 }
 
@@ -166,10 +166,10 @@ variable "human_principal" {
 
 variable "churn_principals" {
   description = <<-EOT
-    The principals on the eleven automation records, spread across the two
-    shapes Classify drops before isHuman: a `system:` prefix and a
-    .gserviceaccount.com suffix. Eleven records are minted from this list by
-    cycling it, so its length need not be eleven.
+    The principals on the automation records, spread across the two shapes
+    Classify drops before isHuman: a `system:` prefix and a
+    .gserviceaccount.com suffix. churn_record_count records are minted from
+    this list by cycling it, so its length need not match.
   EOT
   type        = list(string)
   default = [
@@ -201,7 +201,7 @@ variable "churn_record_count" {
 
   validation {
     condition     = var.churn_record_count >= 1 && floor(var.churn_record_count) == var.churn_record_count
-    error_message = "churn_record_count must be a whole number of at least 1. A fractional value is worse than a rejected one: bash's -lt errors on it, errexit does not fire on a while condition, so the burst is never published, the ledger read finds nothing, and the run records ok for a filter it never exercised."
+    error_message = "churn_record_count must be a whole number of at least 1. A fractional value is worse than a rejected one: bash's -lt errors on it, and errexit does not fire on a while loop's own condition, so the burst is never published, the ledger read finds nothing, and the run records ok for a filter it never exercised."
   }
 }
 
@@ -222,6 +222,21 @@ variable "agent_namespace" {
   default     = "kubeagents-system"
 }
 
+variable "agent_deployment" {
+  description = <<-EOT
+    The gateway Deployment every probe execs into.
+
+    Declared rather than selected by label, as the sibling stacks do. The
+    gateway's `app` label is `<PlatformAgent.Name>-gateway`
+    (platformagent_manifests.go), so a hardcoded `app=platform-agent-gateway`
+    silently finds nothing on an install whose CR carries another name, and a
+    `{.items[0]}` lookup can return a Terminating replica mid-rollout.
+    Addressing the workload leaves both to kubectl.
+  EOT
+  type        = string
+  default     = "platform-agent-gateway"
+}
+
 variable "agent_container" {
   description = "The container on the gateway pod holding the kanban board, read by the poll."
   type        = string
@@ -232,20 +247,17 @@ variable "settle_seconds" {
   description = <<-EOT
     How long to wait after the card wait before reading the ledger.
 
-    Insurance, not the proof. What establishes that the churn was pulled and
-    classified is the human record's card finishing, because that record was
-    published after the burst. This covers the gap that argument leaves:
-    Pub/Sub makes no ordering guarantee here, so a churn record could in
-    principle still be in flight when a record published after it has already
-    been handled. Short, because the card wait it follows is measured in
-    minutes.
+    This covers the gap the card wait leaves. main.tf's step 4 has the
+    argument: the card wait does the work, and this closes the hole Pub/Sub's
+    missing ordering guarantee leaves in it. Short, because the card wait it
+    follows is measured in minutes.
   EOT
   type        = number
   default     = 120
 
   validation {
     condition     = var.settle_seconds >= 30 && floor(var.settle_seconds) == var.settle_seconds
-    error_message = "settle_seconds must be a whole number of at least 30. Zero is the dangerous value, not an invalid one: sleep 0 removes the only cover for a churn record Pub/Sub delivered out of order, and an absence of rows then means nothing."
+    error_message = "settle_seconds must be a whole number of at least 30. A floor rather than a bare integer check because sleep 0 removes the only cover for a churn record Pub/Sub delivered out of order, and an absence of rows then means nothing."
   }
 }
 
@@ -255,14 +267,10 @@ variable "card_timeout_seconds" {
 
     The human record is published after the burst, so a card that finished is
     a record the detector pulled, classified and injected later than the
-    churn -- which is what makes the ledger read below mean a filter that
-    held rather than a queue nobody had drained yet. The wait also keeps the
+    churn -- which is what makes the ledger read mean a filter that held
+    rather than a queue nobody had drained yet. The wait also keeps the
     harness's opening turn off a busy agent: the agent is one replica, and a
     card's worker holds it for minutes.
-
-    Rows are attributed by this run's minted insertIds, not by arrival time,
-    so the publish order never affected attribution -- only what the board
-    looks like while the run is in flight.
 
     Generous on purpose, and sized against the slow environment rather than
     the expected one. The board runs kanban.max_in_progress cards at once
@@ -280,7 +288,7 @@ variable "card_timeout_seconds" {
 
   validation {
     condition     = var.card_timeout_seconds >= 15 && floor(var.card_timeout_seconds) == var.card_timeout_seconds
-    error_message = "card_timeout_seconds must be a whole number of at least 15, the poll's own step. A fractional value makes bash's -ge a test error, errexit does not fire on a while condition, and the wait then runs forever instead of ending at the deadline."
+    error_message = "card_timeout_seconds must be a whole number of at least 15, the poll's own step. A fractional value makes bash's -ge a test error. The deadline test sits in an && list, where a failing left-hand command is exempt from errexit, so the break never fires and the wait runs until the card finishes or the job is killed."
   }
 }
 
