@@ -2272,6 +2272,7 @@ class TestAuditCatalogue(unittest.TestCase):
                 "findings-morning-nudge",
                 "chat-delivery-watch",
                 "feedback-prompt",
+                "upgrade-readiness-watch",
             },
             set(live) - prompted,
             "the platform roster's `no_agent` entries are not the expected "

@@ -161,6 +161,88 @@ reasons, spec paths and event messages are text a tenant writes; the Cluster
 Agent reads that text again when it runs the skill, and its read-only skill and
 preflight bound what it does with it.
 
+## `upgrade-readiness-watch` reports before anyone asks
+
+The `fleet-upgrade-verification` skill's readiness report grades every cluster
+on what would stop its next upgrade. Until this job it ran only when a user
+asked in chat. `upgrade_readiness_watch.py` runs once a day and asks the cheap
+half first: it runs the skill's version table, with no readiness read, and
+collects the target version each cluster's release channel offers and which
+clusters sit below it. A version a cluster is below is pending; a pending
+version the job's ledger has never seen earns the full readiness report at
+once, and a version already reported is refreshed every seven days while any
+cluster is still pending it. A version no cluster is pending any more is
+retired from the ledger with one line. A tick with nothing due prints nothing,
+so a quiet day costs no message.
+
+Which clusters it reads is decided on the agent pod: `UPGRADE_READINESS_PROJECTS`
+when set, otherwise the management project and every project a Cluster Agent
+profile's identity names, the roster `stall-watch` follows; with neither, the
+sandbox's configured project; and with nothing at all the tick fails closed,
+because the report script's own fallback is every project the credential can
+list. Within those projects the report script
+enumerates every cluster, so a cluster `spec.scope.exclude.clusters` keeps a
+Cluster Agent from is still read here. That read is `gcloud` cluster metadata
+for the version table and, on a report day, one `get-credentials` and one
+`kubectl get pdb,deploy,statefulset -A` per cluster for the readiness grade;
+the budget names those objects in the saved report, which is tenant-written
+text, so the entry declares `risk: high` as `stall-watch` does.
+
+It runs the skill the way `stall-watch` runs `stall_report.py`: the two scripts
+are read from the agent image's `/opt/platform-template/skills/` copy and
+handed to `python3 -I -` in the sandbox on stdin, behind a loader that
+registers `upgrade_readiness` before running `fleet_upgrade_report.main`. The
+loader gives the report a private `tempfile.mkdtemp` directory for its JSON
+output and rollout record, so nothing the model can write to is on the path
+the result crosses, and removes it afterwards; the sandbox's `/opt/data` is
+not this pod's, so the loader prints the report back as JSON and the job
+writes the files on this side, under `<agent home>/upgrade-readiness/`:
+`ledger.json`, and one dated `.md` and `.json` per report under
+`reports/<version>/`, with `latest.md` pointing at the newest, the ten newest
+kept per version and a retired version's directory removed with it. Each run starts
+from an empty rollout record, so a saved report's progress table is a
+first-run baseline, not a week-over-week comparison. Its stdout, one line per
+report with the pending clusters, the blocked ones, and the file's path on the
+gateway pod, is what `deliver: "chat"` posts; the agent's own tools run in the
+sandbox and cannot open that path, which is why the line carries the verdicts.
+`--dry-run` prints what a tick would do and changes nothing, the failure
+marker included.
+
+Daily at 10:10 UTC, after the morning audits and before the US day; the
+version table is a handful of `gcloud` list calls and the readiness report
+runs only on the day a version appears or its week comes round, once per
+project that holds a pending cluster with its own timeout, so one project the
+sandbox cannot finish leaves only its own clusters ungraded and the others'
+versions still reported. The whole tick keeps to forty-five minutes of the
+hour Hermes gives a `no_agent` script: the version table and the readiness
+runs go project by project, the table within the first fifteen minutes and the
+readiness runs with the rest, each run gets what its share has left, a project
+the budget cannot reach or finish is left unread and named in the line (a
+version none of whose projects ran is not recorded and is retried tomorrow),
+and each sweep runs the projects least recently run first, so a budget that
+never reaches the end of the list does not leave the same project unread
+twice, whichever versions are due. Three guards
+keep the ledger honest: a version is
+retired only when the version table read every project, or read every project
+that still pended it and none does, a report that
+graded none of a version's pending clusters is written but not recorded (the
+chat line says "none graded" and the version is tried again tomorrow), and the
+weekly comparison carries ten minutes of slack so the tick's own drift cannot
+push a refresh to day eight. A partial table, an ungraded version or a failed
+tick is announced once, not daily: the ledger keeps what was announced, a
+failed tick (which writes nothing to the ledger) keeps its line in
+`last-failure.txt` beside it, and the next line is the recovery. A version
+none of whose clusters can be read is retried
+three days running and then recorded, so an unreachable cluster costs its
+project one readiness sweep a week rather than one a day; a `blocked` verdict
+the script grades from cluster metadata stands even when the kubectl read
+failed. A hand run in the container finds the ticker's ledger under the
+platform profile, as `feedback-prompt` does, rather than starting a second one
+at the gateway's home. The three
+environment knobs (`UPGRADE_READINESS_REFRESH_DAYS`, `_PROJECTS`,
+`_WATCH_HOME`) are for a run started by hand in the pod; the operator's
+`spec.deployment.env` allowlist does not carry them.
+
 ## `kanban-workspace-gc` is neither a watchdog nor a poller
 
 The third shape, and the reason it is here rather than anywhere else: it is
