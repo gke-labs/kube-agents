@@ -366,15 +366,16 @@ the turn runs under the pod's API server, whose profile is the chat path's own (
 stock install), so the agent that answers a case on this lane is the one the chat path reaches
 ("What the lane grades" below). That does not return the exclusion's premise: the default
 profile may file the card, but the card's completion never reaches the A2A thread
-([`a2a/docs/hermes-bridge.md`](../../a2a/docs/hermes-bridge.md), "Executors"), and the graded
-answer gets the card's result only once the rebuilt wait lands (Completion signals), so the
-exclusion stays.
+([`a2a/docs/hermes-bridge.md`](../../a2a/docs/hermes-bridge.md), "Executors"). The delegation
+wait appends the card's result to the graded answer (Completion signals), but it reads that from
+the pod, not from the thread, so the exclusion stays.
 `ledger_issue_contains` finds the ledger by scanning the final message for a GitHub issue URL, so
 it works on any transport that maps a result into the final message, which both new transports
 do, and its grade depends on that mapping: the fleet-audit cases get the URL from the delegated
-worker's card result, which today's wait folds into the final message, so on this path it has
-the URL only once the rebuilt wait appends the delivered card results the same way, and until
-then it fails as a graded failure with no issue URL in the report, not as an error.
+worker's card result, which the delegation wait folds into the final message. On this path it
+has the URL when the wait finds the cards in the session store; when it does not (a door that
+reports no `contextId`, or a store that cannot be read), it fails as a graded failure with no
+issue URL in the report, not as an error.
 
 **The executor is the Hermes persona through the bridge sidecar (decided 2026-09-17).** The
 session worker carries only the tool-less `chat` profile; running the platform persona as a

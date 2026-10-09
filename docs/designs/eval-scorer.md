@@ -137,10 +137,13 @@ reduces to correctness. A task with no spec at all produces no correctness and i
 **The inject lane sets aside what its transport cannot show.** A record from the harness's inject
 transport carries the task's lifecycle envelope as its trajectory (`inject.task`, `inject.post`,
 `inject.edit`, `a2a.status-update`) and, when the door showed the task's tool-call trace, an
-`a2a.activity` marker followed by the task's calls in the api path's shape. There are never card
-ids to read worker logs by (the trace carries calls without their results) and never a worker's
-tagged entries, so `worker_commands`, `worker_agents` and a `tool_called` in the `workers` or
-`all` scope are blind on every such record; a router-scope `tool_called` is blind only when the
+`a2a.activity` marker followed by the task's calls in the api path's shape. The trace carries
+calls without their results, so it names no card. The delegation wait reads the cards from the
+pod instead, by the Hermes session the bridge's `api` executor ran the turn in, so such a record
+can carry the delegated workers' tagged entries and token counts. The scorer still treats
+`worker_commands`, `worker_agents` and a `tool_called` in the `workers` or `all` scope as blind on
+every such record, a policy that stays until `scoring.py` grades them on records that carry the
+workers ([#2619](https://github.com/gke-labs/kube-agents/issues/2619)); a router-scope `tool_called` is blind only when the
 door showed no trace: the first matrix run through the door (#2007, 2026-09-25) collapsed
 `agent-kanban-smoke` 0 of 3 with a correct answer in every repetition. `classify_rep()` therefore
 re-reads such a record before the rungs. The condition is the record's, not the environment's: the
@@ -180,9 +183,11 @@ it could fail a call that happened or pass a safeguard over one. One exception r
 a `none`-wrapped check ("this tool was never called", `CaseSpec.negated_trace_blind_checks`) that
 _failed_ on a record carrying the marker stays graded whatever the loss, because the trace shows
 the forbidden call and a loss cannot unmake it; rung 1 blocks on it as on the api transport. The worker
-half is keyed on the transport alone (`_inject_record()`) and stays until a later change rebuilds
-the delegation wait for this path and takes those entries out of `worker_blind_checks`. A record
-from a door that cannot show the trace carries no marker and is graded as before. A case whose
+half is keyed on the transport alone (`_inject_record()`). The delegation wait for this path is
+rebuilt, but the worker half stays until `scoring.py` takes those entries out of
+`worker_blind_checks` for a record that carries the workers. A record from a door that cannot show
+the trace carries no marker and is graded as before; the harness keeps the workers' entries off
+such a record, so they cannot make it look like one whose door showed a trace. A case whose
 _premise_ needs the chat front door is a different matter from
 a check the transport blinds, and is the lane roster's
 ([`docs/eval-gate-roster.md`](../eval-gate-roster.md), "The inject lane").
