@@ -25,6 +25,13 @@ var (
 	// whitespace, the text, and an optional closing run of # set off by
 	// whitespace (so "## Using C#" keeps its #).
 	slackHeadingRE = regexp.MustCompile(`^ {0,3}#{1,6}[ \t]+(.*?)(?:[ \t]+#+)?[ \t]*$`)
+	// slackNotParagraphRE is a line that falls through the rewrites but is
+	// not a paragraph a setext underline could make a heading: indented (a
+	// list item's continuation), an ordered-list item, or a blockquote line.
+	slackNotParagraphRE = regexp.MustCompile(`^(?:[ \t]|\d+[.)][ \t]|>)`)
+	// slackTildeFenceRE opens or closes a tilde-fenced code block, which
+	// mdCodeSpanRE (backticks only) does not see.
+	slackTildeFenceRE = regexp.MustCompile(`^ {0,3}~~~`)
 	// slackSetextRE is a setext heading's underline: a run of = or of -
 	// with no spaces inside it, under a paragraph line.
 	slackSetextRE = regexp.MustCompile(`^ {0,3}(?:=+|-+)[ \t]*$`)
@@ -54,6 +61,9 @@ const (
 	// bold pass then turns into Slack's, and is the bold mark a table cell
 	// sheds outside its code spans.
 	mdBoldMark = "**"
+	// mdEmphasisStar is the single star a heading must not start or end on
+	// to be wrapped as bold.
+	mdEmphasisStar = "*"
 	// mdCodeTick is the backtick that delimits a code span, which a table
 	// cell sheds (its content stays) since the whole table is a code block.
 	mdCodeTick = "`"
@@ -130,26 +140,30 @@ func rewriteSlackBlocks(text string) string {
 			continue
 		}
 		out = append(out, line)
-		paragraph = strings.TrimSpace(line) != ""
+		paragraph = strings.TrimSpace(line) != "" && !slackNotParagraphRE.MatchString(line)
 	}
 	return strings.Join(out, "\n")
 }
 
 // slackBoldLine renders a heading's text as one bold line: the bold pairs
 // inside it are shed first, and a text that still holds a `**` of its own
-// (`**/*.yaml`, `**kwargs`) is left plain, since wrapping it would pair the
-// added marks with the wrong ones.
+// (`**/*.yaml`, `**kwargs`) or starts or ends on a star (`kube-*`, `*.yaml`,
+// edge emphasis) is left plain, since wrapping it would run the added marks
+// into its own.
 func slackBoldLine(text string) string {
 	text = strings.TrimSpace(shedBoldPairs(text))
-	if strings.Contains(mdCodeSpanRE.ReplaceAllString(text, ""), mdBoldMark) {
+	if strings.Contains(mdCodeSpanRE.ReplaceAllString(text, ""), mdBoldMark) ||
+		strings.HasPrefix(text, mdEmphasisStar) || strings.HasSuffix(text, mdEmphasisStar) {
 		return text
 	}
 	return mdBoldMark + text + mdBoldMark
 }
 
 // fencedLines reports, per line, whether any part of it sits in a fenced
-// block: an mdCodeSpanRE match that spans a line break. A single-line code
-// span does not count, so "- run `ls`" is still a bullet.
+// block: an mdCodeSpanRE match that spans a line break, or a ~~~ fence. A
+// single-line code span does not count, so "- run `ls`" is still a bullet.
+// An indented code block is not detected: telling it from an indented list
+// item needs the list context this pass does not track.
 func fencedLines(lines []string) []bool {
 	text := strings.Join(lines, "\n")
 	var fences [][]int
@@ -159,9 +173,16 @@ func fencedLines(lines []string) []bool {
 		}
 	}
 	code := make([]bool, len(lines))
+	tilde := false
 	start := 0
 	for i, line := range lines {
 		end := start + len(line)
+		if slackTildeFenceRE.MatchString(line) {
+			tilde = !tilde
+			code[i] = true
+		} else if tilde {
+			code[i] = true
+		}
 		for _, r := range fences {
 			if r[0] <= end && r[1] > start {
 				code[i] = true
