@@ -284,6 +284,11 @@ class GitLabForge(Forge):
     def clone_url(self, repo: str) -> str:
         return f"https://{self.hosts[0]}/{repo}.git"
 
+    def file_url(self, repo: str) -> str:
+        # `/-/` separates the project path from the page: a nested group path
+        # has any number of segments, so GitLab cannot tell them apart without it.
+        return f"https://{self.hosts[0]}/{repo}/-/blob/{{ref}}/{{path}}"
+
     @staticmethod
     def _project(repo: str) -> str:
         return f"projects/{quote(repo, safe='')}"

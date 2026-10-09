@@ -136,6 +136,9 @@ class GitHubForge(Forge):
     def clone_url(self, repo: str) -> str:
         return f"https://github.com/{repo}.git"
 
+    def file_url(self, repo: str) -> str:
+        return f"https://github.com/{repo}/blob/{{ref}}/{{path}}"
+
     # -- shared by two verbs ------------------------------------------------
 
     def _comments(

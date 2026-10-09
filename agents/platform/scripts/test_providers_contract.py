@@ -593,6 +593,39 @@ class ContractTest(unittest.TestCase):
                 for verb in forge.verbs:
                     self.assertIn(verb, answer["verbs"])
 
+    def test_a_file_url_is_composed_on_the_forge_s_own_host(self):
+        # A link in an issue must open the file on this forge, and the sandbox
+        # builds no forge URL, so capabilities carries the template.
+        for name, forge, _ in self.instances():
+            with self.subTest(forge=name):
+                repo = forge.parse(f"https://{forge.hosts[0]}/acme/infra.git")
+                if forge.file_url(repo) is None:
+                    # A forge with no file page answers no `fileUrl`; the
+                    # property is about the forges that give one.
+                    continue
+                url = forge.capabilities(repo)["fileUrl"]
+                self.assertTrue(url.startswith(f"https://{forge.hosts[0]}/acme/infra/"))
+                self.assertIn("{ref}", url)
+                self.assertTrue(url.endswith("{path}"))
+                self.assertNotIn("@", url)
+
+    def test_a_github_file_url_is_exactly_the_blob_page(self):
+        # Review: the property above checks a prefix only, so a wrong page
+        # passed. `www.github.com` parses as github.com, and the link names one.
+        github = next(forge for name, forge, _ in self.instances() if name == "github")
+        for spec in ("https://github.com/acme/infra.git", "https://www.github.com/acme/infra"):
+            with self.subTest(spec=spec):
+                self.assertEqual(
+                    "https://github.com/acme/infra/blob/{ref}/{path}",
+                    github.capabilities(github.parse(spec))["fileUrl"],
+                )
+
+    def test_a_forge_this_install_does_not_serve_gives_no_file_url(self):
+        from providers.base import StubForge
+
+        stub = StubForge("gitlab", ("gitlab.com",), "merge request", ["no token"])
+        self.assertNotIn("fileUrl", stub.capabilities("acme/infra"))
+
 
 class BrokeredCredentialTest(unittest.TestCase):
     """The one refusal `ensure` must not swallow."""

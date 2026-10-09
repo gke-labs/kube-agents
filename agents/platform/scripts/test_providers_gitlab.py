@@ -91,6 +91,25 @@ class IdentityTest(unittest.TestCase):
         self.assertEqual(("user", "username"), self_managed.whoami_route)
 
 
+class FileUrlTest(unittest.TestCase):
+    def test_a_nested_project_on_a_self_managed_host(self):
+        url = forge("gitlab.example.com").capabilities("platform/infra/gitops")["fileUrl"]
+        self.assertEqual(
+            "https://gitlab.example.com/platform/infra/gitops/-/blob/{ref}/{path}", url
+        )
+        self.assertEqual(
+            "https://gitlab.example.com/platform/infra/gitops/-/blob/main/a%20b/c.yaml",
+            url.format(ref="main", path="a%20b/c.yaml"),
+        )
+
+    def test_gitlab_com_uses_its_canonical_host(self):
+        # `www.gitlab.com` parses as gitlab.com, and the link names one host.
+        self.assertEqual(
+            "https://gitlab.com/acme/infra/-/blob/{ref}/{path}",
+            forge().capabilities(forge().parse("https://www.gitlab.com/acme/infra"))["fileUrl"],
+        )
+
+
 class ConfigurationTest(unittest.TestCase):
     def test_nothing_is_built_unless_configured(self):
         self.assertEqual((), tuple(GitLabForge.for_config({})))
