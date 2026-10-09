@@ -141,9 +141,22 @@ _MODULE = "module"
 _MODULE_LABELS = 1
 _LOCALS = "locals"
 _LOCALS_LABELS = 0
-_MODULE_REFERENCE = r"module\.([A-Za-z0-9_-]+)"
-_LOCAL_REFERENCE = r"local\.([A-Za-z0-9_-]+)"
+# `(?<![\w.])` keeps the tail of a longer path out: `var.cfg.module.name` is
+# an attribute called module, not a module reference, and reporting it would
+# send an author hunting a dependency that does not exist.
+_MODULE_REFERENCE = r"(?<![\w.])module\.([A-Za-z0-9_-]+)"
+_LOCAL_REFERENCE = r"(?<![\w.])local\.([A-Za-z0-9_-]+)"
 _DOT = "."
+# HCL has two template forms and the tokenizer knows both, so this has to as
+# well: `${...}` interpolates a value, `%{...}` a directive, and either can
+# carry a reference. Doubling the sigil escapes it -- `$${` is a literal `${`
+# with no reference in it at all.
+_TEMPLATE_OPENERS = ("${", "%{")
+_TEMPLATE_ESCAPES = ("$${", "%%{")
+_OPEN_BRACE = "{"
+_CLOSE_BRACE = "}"
+_SIGIL_WIDTH = 2
+_ESCAPE_WIDTH = 3
 # A following `=` or `>` means the `=` just matched was half of `==` or `=>`,
 # not an assignment.
 _NOT_AN_ASSIGNMENT = ("=", ">")
@@ -260,6 +273,35 @@ def _module_body(tokens: list, name: str) -> list:
     )
 
 
+def _interpolations(value: str) -> list:
+    """The contents of every template in a string, braces balanced.
+
+    A regex cannot do this. `[^}]*` stops at the first `}`, so a reference
+    after an object literal in the same template -- `${coalesce(try(var.o,
+    {}), module.x.y)}` -- is lost, and principals are exactly where `try` and
+    `coalesce` wrappers accumulate. Both sigils are read, and a doubled one is
+    skipped rather than matched: Terraform treats `$${` as a literal.
+    """
+    found, index = [], 0
+    while index < len(value):
+        if value.startswith(_TEMPLATE_ESCAPES, index):
+            index += _ESCAPE_WIDTH
+            continue
+        if not value.startswith(_TEMPLATE_OPENERS, index):
+            index += 1
+            continue
+        depth, cursor = 1, index + _SIGIL_WIDTH
+        while cursor < len(value) and depth:
+            if value[cursor] == _OPEN_BRACE:
+                depth += 1
+            elif value[cursor] == _CLOSE_BRACE:
+                depth -= 1
+            cursor += 1
+        found.append(value[index + _SIGIL_WIDTH : cursor - 1 if not depth else cursor])
+        index = cursor
+    return found
+
+
 def _reference_text(body: list) -> str:
     """A block's code and its string interpolations, safe to scan for refs.
 
@@ -273,11 +315,11 @@ def _reference_text(body: list) -> str:
     pieces = []
     for (kind, value), _depth in body:
         if kind == _STR:
-            for interpolation in re.findall(r"\$\{([^}]*)\}", value):
+            for interpolation in _interpolations(value):
                 pieces.append(" ")
                 pieces.append(interpolation)
             continue
-        if pieces and value != "." and pieces[-1] != ".":
+        if pieces and value != _DOT and pieces[-1] != _DOT:
             pieces.append(" ")
         pieces.append(value)
     return "".join(pieces)
@@ -473,8 +515,17 @@ class DriftPubsubOrdering(unittest.TestCase):
         back, but any module whose own graph reaches the cluster does the same
         damage, and most of them do -- the composition hangs nearly everything
         off gke_cluster. Asserting the ingress call reaches no module at all is
-        both the real invariant and the cheaper thing to keep true: it takes
-        only variables today.
+        both the real invariant and the cheaper thing to keep true: its
+        arguments are all `var.` today.
+
+        What the walk does not follow: a reference parked in a `resource` or
+        `data` block, including the one this call already names in its
+        `depends_on`. That is the same class and it is left out on purpose --
+        following it means parsing arbitrary blocks, which is more parser to
+        get wrong, and the hole is contained: a laundered reference that
+        actually reaches the cluster is a dependency cycle, and CI runs
+        `terraform validate` over `terraform/examples/*`, which refuses it.
+        What is lost there is this test's explanation, not the protection.
 
         "Reaches" is three things, because Terraform's graph is not lexical
         and a guard that reads only bare code text misses two of them. A
@@ -498,8 +549,143 @@ class DriftPubsubOrdering(unittest.TestCase):
             f"that used to, through the detector's GSA -- which makes the ingress a "
             f"dependent of the cluster, inverts the destroy order the test above pins, and, "
             f"since the cluster now depends on the ingress, is a dependency cycle besides. "
-            f"Pass a var or a local instead, or move the resource that needs the reference "
-            f"out of the module the way the detector's subscription grants were",
+            f"Pass a variable, or move whatever needs the reference out of the module "
+            f"the way the detector's subscription grants were. A local is not a way "
+            f"round this: locals are followed, including through a chain of them",
+        )
+
+
+class ReachabilityHelpers(unittest.TestCase):
+    """The parsing behind the guard above, against HCL written for the purpose.
+
+    These exist because the guard alone exercises none of it. `module
+    "drift_pubsub"` in the real composition references no module and no local,
+    so the transitive walk never iterates and the interpolation branch never
+    sees a reference: every helper here could return an empty set and that
+    guard would still pass. Two defects shipped behind exactly that gap -- a
+    token join that welded `local.smuggled` to the next word, and an entry rule
+    that read the `==` in `var.x == "y"` as an assignment and truncated the
+    local it was in. Both were found by hand afterwards. These cases are the
+    hand-checking, written down.
+
+    `TerraformModuleTestsHelpersTest` in test_terraform_module_tests.py is the
+    same arrangement for the tokenizer this builds on.
+    """
+
+    def _reached(self, source: str) -> set:
+        tokens = _tokens(source)
+        return _modules_reached(
+            _module_body(tokens, INGRESS_MODULE), _locals_definitions(tokens)
+        )
+
+    def _call(self, argument: str, locals_body: str = "") -> str:
+        block = f"locals {{\n{locals_body}\n}}\n" if locals_body else ""
+        return f'{block}module "{INGRESS_MODULE}" {{\n  x = {argument}\n}}\n'
+
+    def test_a_bare_reference_is_reached(self) -> None:
+        self.assertEqual({IAM_MODULE}, self._reached(self._call(f"module.{IAM_MODULE}.email")))
+
+    def test_a_reference_welded_to_its_neighbour_is_still_reached(self) -> None:
+        # The tokenizer splits dotted paths, so the rejoin has to close them up
+        # without closing up unrelated neighbours. `local.a source` became the
+        # single identifier `local.asource` and resolved to nothing.
+        source = (
+            f'locals {{\n  a = module.{IAM_MODULE}.email\n}}\n'
+            f'module "{INGRESS_MODULE}" {{\n  x = local.a\n  source = "./m"\n}}\n'
+        )
+        self.assertEqual({IAM_MODULE}, self._reached(source))
+
+    def test_an_interpolated_reference_is_reached(self) -> None:
+        self.assertEqual(
+            {IAM_MODULE},
+            self._reached(self._call(f'"serviceAccount:${{module.{IAM_MODULE}.email}}"')),
+        )
+
+    def test_a_directive_template_is_read_as_well_as_an_interpolation(self) -> None:
+        self.assertEqual(
+            {CLUSTER_MODULE},
+            self._reached(self._call(f'"%{{ if module.{CLUSTER_MODULE}.on }}y%{{ endif }}"')),
+        )
+
+    def test_a_reference_after_an_object_literal_in_one_template_is_reached(self) -> None:
+        # `[^}]*` stopped at the `}` of the object literal, not the template's.
+        self.assertEqual(
+            {IAM_MODULE},
+            self._reached(
+                self._call(f'"${{coalesce(try(var.o, {{}}), module.{IAM_MODULE}.email)}}"')
+            ),
+        )
+
+    def test_an_escaped_template_opener_holds_no_reference(self) -> None:
+        # `$${` is a literal `${` to Terraform, so there is no dependency here
+        # and reporting one sends the reader after something that is not there.
+        self.assertEqual(set(), self._reached(self._call(f'"$${{module.{CLUSTER_MODULE}.name}}"')))
+
+    def test_an_attribute_named_module_is_not_a_module(self) -> None:
+        self.assertEqual(set(), self._reached(self._call("var.cfg.module.name")))
+
+    def test_a_local_is_followed(self) -> None:
+        self.assertEqual(
+            {IAM_MODULE},
+            self._reached(self._call("local.a", f"  a = module.{IAM_MODULE}.email")),
+        )
+
+    def test_locals_are_followed_transitively(self) -> None:
+        self.assertEqual(
+            {IAM_MODULE},
+            self._reached(
+                self._call("local.a", f"  a = local.b\n  b = module.{IAM_MODULE}.email")
+            ),
+        )
+
+    def test_a_comparison_does_not_truncate_the_entry_it_sits_in(self) -> None:
+        # `==` is two `=` tokens. Reading the second as an assignment opened a
+        # phantom entry and cut this local's value off before the reference.
+        #
+        # Both operands, because two separate rules carry this and only one of
+        # them is reached by each. `var.x ==` is excluded by the name being the
+        # tail of a dotted path; `true ==` has no dot and is excluded only by
+        # refusing an `=` that is followed by another. Testing the dotted form
+        # alone leaves the second rule unexercised, which is how the first
+        # version of this case passed while that rule was reverted.
+        for operand in ('var.x == "y"', "true == var.x"):
+            with self.subTest(operand=operand):
+                self.assertEqual(
+                    {IAM_MODULE},
+                    self._reached(
+                        self._call(
+                            "local.a",
+                            f'  a = {operand} ? module.{IAM_MODULE}.email : ""',
+                        )
+                    ),
+                )
+
+    def test_a_recursive_local_terminates(self) -> None:
+        self.assertEqual(set(), self._reached(self._call("local.a", "  a = local.a")))
+        self.assertEqual(
+            set(), self._reached(self._call("local.a", "  a = local.b\n  b = local.a"))
+        )
+
+    def test_an_unknown_local_reaches_nothing_rather_than_raising(self) -> None:
+        self.assertEqual(set(), self._reached(self._call("local.absent")))
+
+    def test_the_composition_locals_parse_to_what_the_file_declares(self) -> None:
+        # The count is the check that caught the `==` defect: the parser
+        # claimed more entries than the file has, and the extras were the
+        # tails of dotted references inside comparisons.
+        source = COMPOSITION_MAIN.read_text(encoding="utf-8")
+        parsed = _locals_definitions(_tokens(source))
+        declared = {
+            name
+            for block in re.findall(r"^locals \{(.*?)^\}", source, re.S | re.M)
+            for name in re.findall(r"^  ([A-Za-z_][A-Za-z0-9_-]*)\s*=", block, re.M)
+        }
+        self.assertEqual(
+            declared,
+            set(parsed),
+            "the locals parser and the file disagree; an extra name is a "
+            "mis-read assignment, and whatever it swallowed is lost from the "
+            "entry it belonged to",
         )
 
 

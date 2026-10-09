@@ -5,9 +5,9 @@ Two halves that have to agree, owned by different engines.
 The *ingress* is Terraform's. `scripts/provision_ci_pool_project.sh` sets
 `enable_drift_pubsub` in the `terraform/examples/full-install` tfvars, and
 `terraform/modules/drift-pubsub` creates the Log Router sink, the drift-audit
-topic and its pull subscription, and the composition grants the platform GSA
-subscriber and viewer on that subscription -- beside the module rather than
-inside it, so that the module stays independent of the cluster's teardown. The same tfvars sets
+topic and its pull subscription, and the composition grants the platform
+GSA subscriber and viewer on that subscription -- beside the module rather
+than inside it, so the module stays independent of the cluster's teardown. The same tfvars sets
 `drift_pubsub_topic_publishers`, the pool's one departure from what an install
 provisions, so a drift case can put a synthetic audit record on the topic.
 Nothing in `hack/ci-deploy.sh` creates any of it —
