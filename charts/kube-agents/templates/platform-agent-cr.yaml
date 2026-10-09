@@ -42,6 +42,17 @@ metadata:
     {{- toYaml . | nindent 4 }}
   {{- end }}
 spec:
+  {{- /*
+    `with`, so the null default renders no field at all: the operator reads an
+    absent mode as "today", and leaving it out keeps the CR of an install that
+    never set the value what it was before the chart knew the key. Helm patches a
+    custom resource from the difference between its renders, so a mode set on the
+    CR by hand survives an upgrade that leaves this null, and a value set here
+    and later cleared removes the field again, which is "today".
+  */}}
+  {{- with .Values.platformAgent.mode }}
+  mode: {{ . | quote }}
+  {{- end }}
   harness:
     clusterName: {{ required "platformAgent.harness.clusterName is required" .Values.platformAgent.harness.clusterName | quote }}
     location: {{ required "platformAgent.harness.location is required" .Values.platformAgent.harness.location | quote }}
@@ -90,10 +101,13 @@ spec:
     {{- $defaultStockoutTuning := dict "maxInProgress" 3 "platform" (dict "apiMaxRetries" 8 "maxTurns" 200) "cluster" (dict "apiMaxRetries" 8 "maxTurns" 150) }}
     {{- $tuning = merge $tuning $defaultStockoutTuning }}
     {{- end }}
-    {{- if or (hasKey $tuning "maxInProgress") $tuning.platform $tuning.cluster $tuning.default }}
+    {{- if or (hasKey $tuning "maxInProgress") (hasKey $tuning "maxSessions") $tuning.platform $tuning.cluster $tuning.default }}
     tuning:
       {{- if hasKey $tuning "maxInProgress" }}
       maxInProgress: {{ $tuning.maxInProgress }}
+      {{- end }}
+      {{- if hasKey $tuning "maxSessions" }}
+      maxSessions: {{ $tuning.maxSessions }}
       {{- end }}
       {{- with $tuning.default }}
       default:

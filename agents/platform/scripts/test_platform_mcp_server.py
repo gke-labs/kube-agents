@@ -1226,6 +1226,13 @@ class TestFindingsQueueTools(unittest.TestCase):
             ],
         )
 
+    def test_marking_surfaced_never_claims_to_be_a_paced_publisher(self):
+        # Only the nudge may mark a finding shown; a model naming one in
+        # answer to a pull must not spend a day's budget or stop additions.
+        platform_mcp_server.mark_finding_surfaced("f-1", "spaces/AAA", "spaces/AAA/threads/T")
+        _, _, body = self.captured[-1]
+        self.assertEqual(body, {"chat_id": "spaces/AAA", "thread_id": "spaces/AAA/threads/T"})
+
     def test_update_sends_only_the_fields_the_caller_set(self):
         platform_mcp_server.update_finding("f-1", pr_state="merged")
         self.assertEqual(self.captured[-1][2], {"pr_state": "merged"})

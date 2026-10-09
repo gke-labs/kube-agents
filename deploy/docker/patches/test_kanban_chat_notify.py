@@ -397,6 +397,28 @@ class FreshEventsTest(unittest.TestCase):
         recorded = Path(self.home, kanban_chat_notify.ROUTED_SINCE_FILE).read_text().strip()
         self.assertEqual(float(recorded), live)
 
+    def test_an_unreadable_record_falls_back_to_when_it_was_written(self):
+        # A write cut short leaves an empty file, and nan, inf or a future time
+        # is no go-live moment. Recording "now" instead would move the cutoff
+        # forward and drop events that were not stale, so the record's mtime,
+        # when it was written, stands in and is written back whole.
+        path = Path(self.home, kanban_chat_notify.ROUTED_SINCE_FILE)
+        live, now = 1_000_000.0, 1_000_000.0 + 24 * 3600
+        for body in ("", "nan", "inf", "-inf", "1e400", str(now + 60), "garbage"):
+            with self.subTest(body=body):
+                path.write_text(body)
+                os.utime(path, (live, live))
+                kanban_chat_notify._routed_since = None
+                self.assertEqual(kanban_chat_notify.routed_since(now), live)
+                self.assertEqual(float(path.read_text().strip()), live)
+                self.assertEqual(sorted(os.listdir(self.home)), [kanban_chat_notify.ROUTED_SINCE_FILE])
+
+    def test_an_absent_record_is_written_whole_as_now(self):
+        now = 1_000_000.0
+        self.assertEqual(kanban_chat_notify.routed_since(now), now)
+        self.assertEqual(os.listdir(self.home), [kanban_chat_notify.ROUTED_SINCE_FILE])
+        self.assertEqual(float(Path(self.home, kanban_chat_notify.ROUTED_SINCE_FILE).read_text()), now)
+
     def test_stale_events_are_dropped_for_the_routed_platform_only(self):
         now = 1_000_000.0
         old, new = _Event(1, int(now - kanban_chat_notify.STALE_EVENT_SECONDS - 1)), _Event(2, int(now - 60))
@@ -423,6 +445,11 @@ class ContractTest(unittest.TestCase):
         self.assertEqual(kanban_chat_notify.NOTIFY_PLATFORM_ENV, chat_notify.NOTIFY_PLATFORM_ENV)
         self.assertEqual(kanban_chat_notify.A2A_CLI, chat_notify.A2A_CLI)
         self.assertEqual(kanban_chat_notify.NOTIFY_OUTCOME_UNKNOWN, chat_notify.NOTIFY_OUTCOME_UNKNOWN)
+        self.assertEqual(kanban_chat_notify.NOTIFY_ROUTE_UNAVAILABLE, chat_notify.NOTIFY_ROUTE_UNAVAILABLE)
+        self.assertEqual(kanban_chat_notify.NOTIFY_WAIT_SECONDS, chat_notify.NOTIFY_WAIT_SECONDS)
+        self.assertEqual(kanban_chat_notify.NOTIFY_CONNECT_SECONDS, chat_notify.NOTIFY_CONNECT_SECONDS)
+        self.assertEqual(kanban_chat_notify.NOTIFY_MARGIN_SECONDS, chat_notify.NOTIFY_MARGIN_SECONDS)
+        self.assertEqual(kanban_chat_notify.SEND_TIMEOUT_SECONDS, chat_notify.NOTIFY_SUBPROCESS_TIMEOUT_SECONDS)
 
     def test_the_conversation_route_is_spelled_alike_where_it_is_written_and_read(self):
         # session_kv_server writes it, kanban_event_routing addresses the card

@@ -76,6 +76,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import os
 import sqlite3
 import subprocess
@@ -124,6 +125,8 @@ STALE_EVENT_SECONDS = 6 * 3600
 # it and the stale skip happens once per install.
 HERMES_HOME_ENV = "HERMES_HOME"
 ROUTED_SINCE_FILE = "kanban_chat_notify.routed_since"
+# The sibling the record is written to first, then renamed over it.
+ROUTED_SINCE_TMP_SUFFIX = ".tmp"
 # How long an up answer from the route probe is trusted, and how long a probe
 # may take. The probe is an empty notify: an armed gateway refuses it at once
 # ("text is empty"), and no responders (exit 4) means the route is not there.
@@ -228,6 +231,16 @@ def resolve(runner: Any, platform: Any, adapter: Any, sub: Optional[dict] = None
     return stand_in
 
 
+def _write_routed_since(path: str, value: float) -> None:
+    """Write the go-live record whole or not at all: a sibling file, then a rename over it."""
+    tmp = path + ROUTED_SINCE_TMP_SUFFIX
+    with open(tmp, "w", encoding="utf-8") as handle:
+        handle.write(f"{value}\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(tmp, path)
+
+
 def routed_since(now: float) -> float:
     """When routed delivery first went live on this install: read, or recorded as ``now``.
 
@@ -244,17 +257,29 @@ def routed_since(now: float) -> float:
         try:
             with open(path, encoding="utf-8") as handle:
                 value = float(handle.read().strip())
+            if not math.isfinite(value) or value > now:
+                raise ValueError(f"{value} is not a past time")
         except FileNotFoundError:
-            pass
+            value = None
         except (OSError, ValueError) as exc:
-            logger.warning("kanban notifier: %s unreadable (%s); recording now", path, exc)
+            # The record exists but cannot be read back: a write cut short, or
+            # a value no clock produces. It was written once, when routing went
+            # live, so its mtime is that moment; recording now instead would
+            # move the cutoff forward and drop events that are not stale.
+            try:
+                value = min(os.path.getmtime(path), now)
+            except OSError:
+                value = None
+            logger.warning("kanban notifier: %s unreadable (%s); using %s", path, exc,
+                           "its mtime" if value is not None else "now")
+            if value is not None:
+                _write_routed_since(path, value)
     if value is None:
         value = now
         try:
             if not path:
                 raise OSError(f"{HERMES_HOME_ENV} is not set")
-            with open(path, "w", encoding="utf-8") as handle:
-                handle.write(f"{value}\n")
+            _write_routed_since(path, value)
         except OSError as exc:
             logger.warning("kanban notifier: cannot record when routed delivery went live (%s); "
                            "a restart will skip stale events again", exc)

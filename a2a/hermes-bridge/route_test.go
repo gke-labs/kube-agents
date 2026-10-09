@@ -33,12 +33,19 @@ func newRouteStore(t *testing.T, status int) *routeStore {
 		_ = json.Unmarshal(raw, &body)
 		s.mu.Lock()
 		s.puts = append(s.puts, routePut{path: r.Method + " " + r.URL.Path, auth: r.Header.Get("Authorization"), body: body})
+		status := s.status
 		s.mu.Unlock()
-		w.WriteHeader(s.status)
+		w.WriteHeader(status)
 		_, _ = io.WriteString(w, `{"detail":"refused"}`)
 	}))
 	t.Cleanup(s.srv.Close)
 	return s
+}
+
+func (s *routeStore) setStatus(status int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.status = status
 }
 
 func (s *routeStore) seen() []routePut {
@@ -118,6 +125,34 @@ func TestAPI_ARouteThatCannotBeRecordedIsSaidInTheAnswer(t *testing.T) {
 	}
 	if got := task.Artifact(lib.ArtifactResult).Parts[0].Text; !strings.HasSuffix(got, routeLostNote) {
 		t.Fatalf("answer = %q, want it to end with the route-lost note", got)
+	}
+}
+
+// A later task of the same session whose PUT fails, when an earlier task
+// recorded the same route, loses nothing: the store still holds that route,
+// so the answer carries no route-lost note.
+func TestAPI_AFailedPUTOfAnAlreadyRecordedRouteIsNotALoss(t *testing.T) {
+	_, url := startServer(t)
+	store := newRouteStore(t, http.StatusOK)
+	stub := newAPIStub(t, nil)
+	startAPIBridge(t, url, stub, func(c *Config) { c.RouteURL, c.RouteKey = store.srv.URL, "kv-key" })
+	c := gatewayClient(t, url)
+
+	submitFrom(t, c, "task-first", "ctx-same", "slack:dm/D123", "how many nodes")
+	if task := waitTerminal(t, c, "task-first"); task.State != lib.StateCompleted {
+		t.Fatalf("first task state = %s, want completed", task.State)
+	}
+	store.setStatus(http.StatusInternalServerError)
+	submitFrom(t, c, "task-second", "ctx-same", "slack:dm/D123", "and pods")
+	task := waitTerminal(t, c, "task-second")
+	if task.State != lib.StateCompleted {
+		t.Fatalf("second task state = %s, want completed", task.State)
+	}
+	if got := task.Artifact(lib.ArtifactResult).Parts[0].Text; strings.Contains(got, routeLostNote) {
+		t.Fatalf("answer = %q, want no route-lost note: the earlier record of the same route stands", got)
+	}
+	if puts := store.seen(); len(puts) != 2 {
+		t.Fatalf("route PUTs = %d, want 2: the second task still tries", len(puts))
 	}
 }
 

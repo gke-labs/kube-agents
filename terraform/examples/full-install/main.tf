@@ -794,7 +794,10 @@ resource "helm_release" "kube_agents" {
         }
       } : {}
     )
-    platformAgent = {
+    # merge(), so "today" adds no key and the values this composition hands the
+    # chart stay what they were before platform_agent_mode existed; the chart
+    # leaves spec.mode out of the CR while its value is null.
+    platformAgent = merge({
       # The durable record of an adoption that accepted a cluster with no
       # NetworkPolicy enforcement. Derived from what the module read, not from
       # the variable that admitted it: a cluster that later gains Dataplane V2
@@ -908,7 +911,9 @@ resource "helm_release" "kube_agents" {
         data   = local.credentials
       }
       integration = local.platform_agent_integration
-    }
+      }, var.platform_agent_mode == "today" ? {} : {
+      mode = var.platform_agent_mode
+    })
     # The minter's Kubernetes half (Deployment, Service, NetworkPolicy, KSA,
     # minty rule ConfigMap, github-app-credentials Secret); the GCP half is
     # module.github_minter above. The App private key still has to be imported

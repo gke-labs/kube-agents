@@ -166,6 +166,7 @@ ADDED_AFTER_THE_MOVE = [
     "observability-watcher-scrape-state",  # the event watcher's scrape state, #2141
     "chat-fanout-fleet-restarts-rows",  # a fleet question fanned out one titled card per cluster
     "backup-dr-cmek-selected-namespaces-probe",  # the gke-backup-dr skill sync
+    "findings-decision-covers-item",  # the findings queue's item-wide decision
 ]
 
 # Admitted after the split, each by a pull request that cited the record
