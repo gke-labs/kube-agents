@@ -164,10 +164,19 @@ the last run, and the symptom set seen at the last full run (owner, category, re
 tenant text). The before side of the catalogue's diff is established two ways, and the stronger one
 decides. Every full run reads pods and nodes on every fleet cluster, upgraded or not (one list call
 each), so the stored set is at most a week old rather than as old as the previous upgrade. And each
-symptom carries its own onset, read from the object as the earliest evidence it holds: a Pending
-pod's start, a crash-looping or not-ready pod's `Ready=False` transition time (falling back to the
-pod's start; a container's last termination is the latest crash, not the first, and is never the
-onset), a node condition's transition, an event's first observation. A symptom whose onset is
+symptom carries its own onset, the earliest evidence the objects hold. A pod is the wrong place to
+read it when the pod is owned: a node-pool upgrade drains every node, every pod on it is deleted
+and recreated, and the replacement's creation, start and `Ready=False` transition all fall inside
+the window by construction. So an owned pod's onset is read at the owner first: a Deployment's
+`Available=False` or `Progressing=False` condition transition, a ReplicaSet's creation (a failure
+that began with a rollout). Where the owner carries no dated condition (StatefulSet, DaemonSet,
+Job) or the pod is bare, the pod's own evidence is used: a Pending pod's start, a crash-looping or
+not-ready pod's `Ready=False` transition time (falling back to its start; a container's last
+termination is the latest crash, not the first, and is never the onset), a node condition's
+transition, an event's first observation. A pod-sourced onset on a pod created after the drain of
+its node began is marked as such, and on a first run (no stored set) a symptom whose only onset is
+that one is graded `medium`: a Warning with the reason "the pod was recreated by the upgrade; the
+failure may predate it", never an Error; the next full run, keyed by owner, settles it. A symptom whose onset is
 earlier than the first operation of the cluster's upgrade window, or that the previous full run
 already recorded, is graded a Warning with the reason "predates the upgrade", never an Error; a
 symptom with no readable onset falls back to the stored set alone. The first run has no stored set
@@ -187,7 +196,11 @@ joined is added. A project the roster still names whose listing failed (a delete
 removed binding, the Container API disabled) does not demote the run: its ledger entries and guards
 are held unchanged, its clusters are listed under "Reads that failed", and the run stays full and
 moves the latest link, the way `fleet_drift.py` and `patch_readiness.py` keep a failed project as
-that project's gap rather than the sweep's. Every run without `--full` is _scoped_, whatever its
+that project's gap rather than the sweep's. The findings document the SOP hands to `finish` lists
+every ledger-known cluster of that project under `scope.skipped` with the listing error as the
+reason, the harness's own mechanism for a cluster a run could not read: the stream's previous
+findings on those clusters are held rather than resolved, the ledger issue stays open, and nothing
+is posted as fixed because a project went unread. Every run without `--full` is _scoped_, whatever its
 `--project` set: a run narrowed by `--cluster`, by the question that invoked it, or any hand run,
 with or without `--project`. A scoped run reviews only its targets, never
 prunes a ledger entry or a guard outside them, never adds a project to the fleet set (a cluster it
@@ -241,7 +254,7 @@ A match is _sure_ (`high`) when the signature names the entry's own mechanism an
 object sits on had an operation in the window: a webhook named in the rejection, a selector that
 names a dropped label, a runtime image below the catalogue's floor on a pool migrated to cgroup v2,
 an image that pulls on untouched nodes and fails on rebuilt ones, a volume attach error naming a
-PersistentVolume, a driver error text, a budget with no allowance on a drained node. Anything less,
+PersistentVolume, a driver error text, a budget with no allowance on a drained node. On a first run a match whose only onset is a recreated pod's is capped at `medium` (§3.2). Anything less,
 a generic `OOMKilled`, an image pull failure with no untouched node to compare, a Pending pod with
 no pool operation, is _tentative_ (`medium`). A symptom that matches nothing is reported as a
 Warning, unclassified, rather than dropped: the report is a record of the upgrade, not only of the
