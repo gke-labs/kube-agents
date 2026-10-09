@@ -181,6 +181,7 @@ ADDED_AFTER_THE_MOVE = [
     "manage-cluster-exclusion-installer-route-probe",  # the exclusion route on an installer-made install
     "stop-on-permission-refusal",  # retry after a command-policy refusal, #1948
     "upgrades-retrospective-on-demand",  # the upgrade retrospective's on-demand route
+    "upgrades-retrospective-drained-budget",  # the retrospective's verdict on the planted budget, entry 1
 ]
 # Taken back out of the nightly file after registering there, each with a
 # KNOWN_UNREGISTERED entry in scripts/validate_bench_cases.py that says why.
