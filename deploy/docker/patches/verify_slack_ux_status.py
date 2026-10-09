@@ -42,6 +42,8 @@ ADAPTER = "plugins/platforms/slack/adapter.py"
 ADAPTER_CLASS = "SlackAdapter"
 RUNTIME = "gateway/slack_ux_status.py"
 FLAG_ENV = "KAGE_SLACK_UX"
+#: Unset is on, so the flag-off path needs a value.
+FLAG_OFF = "false"
 
 SETTER = "_set_thread_status"
 #: ``_set_thread_status``'s positional parameters, in the order this module's
@@ -66,6 +68,9 @@ TEAM = "T0KAGE"
 CARD = "t_verify"
 QUIET_CARD = "t_verify_quiet"
 QUIET_TITLE = "seeded-a"
+STARTED_CARD = "t_verify_started"
+STARTED_TITLE = "check checkout-gateway"
+STARTED_THREAD = "1700000000.000300"
 RESULT = "1.33.4 = default"
 PLAN_TS = "1700000000.000200"
 PHRASE = "is thinking..."
@@ -242,9 +247,12 @@ def _load_runtime(root: Path):
 
 
 async def _drive(module) -> None:
-    os.environ.pop(FLAG_ENV, None)
+    os.environ[FLAG_ENV] = FLAG_OFF
     if module.enabled():
-        raise _fail(f"enabled() is true with {FLAG_ENV} unset")
+        raise _fail(f"enabled() is true with {FLAG_ENV}={FLAG_OFF}")
+    os.environ.pop(FLAG_ENV, None)
+    if not module.enabled():
+        raise _fail(f"enabled() is false with {FLAG_ENV} unset, which is on")
     os.environ[FLAG_ENV] = "1"
 
     # The session: the phrase becomes processing, sent once; the ask titles it; the clear closes it.
@@ -284,6 +292,21 @@ async def _drive(module) -> None:
     task = adapter.calls[0][1][0]["tasks"][0]
     if (task["status"], task["title"]) != ("complete", RESULT):
         raise _fail(f"a card with no note settled as {task!r}")
+
+    # A card the turn handed work to holds processing across the turn's clear,
+    # and posts its row, running and titled, when it starts.
+    adapter = _StubAdapter(module)
+    thread = STARTED_THREAD
+    sub = {"platform": "slack", "chat_id": CHANNEL, "thread_id": thread, "task_id": STARTED_CARD}
+    await module.expect_cards(adapter, CHANNEL, TEAM, thread, {STARTED_CARD: True})
+    await adapter._set_thread_status(CHANNEL, TEAM, thread, "", "clear failed")
+    if not await module.start_row(adapter, sub, STARTED_TITLE):
+        raise _fail(f"a card that started opened no row: {adapter.calls!r}")
+    if [call[0] for call in adapter.calls] != ["setStatus", "post"] or adapter.calls[0] != ("setStatus", "processing"):
+        raise _fail(f"an expected card that started made calls {adapter.calls!r}")
+    task = adapter.calls[1][1][0]["tasks"][0]
+    if (task["status"], task["title"]) != ("in_progress", STARTED_TITLE):
+        raise _fail(f"a card that started showed {task!r}")
     os.environ.pop(FLAG_ENV, None)
 
 
@@ -293,7 +316,8 @@ def main(root: Path = Path("/opt/hermes")) -> None:
     print(
         "slack_ux_status verify: status setter guarded ahead of upstream's body; adapter members in the "
         "shape the runtime calls; "
-        "runtime sends enum statuses on change, titles the session, posts, edits and settles one plan"
+        "runtime sends enum statuses on change, titles the session, posts, edits and settles one plan, "
+        "and holds processing for a card from its turn's end to its row"
     )
 
 

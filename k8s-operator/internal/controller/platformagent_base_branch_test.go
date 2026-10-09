@@ -199,6 +199,34 @@ func TestDeploymentEnvCannotChooseTheBases(t *testing.T) {
 
 // Called with an empty managed list, as for the scoped-SA pool variables: the
 // explicit entry is what reserves the list on an install with no base.
+func TestAGitLabRepositoryIsPinnedOnItsOwnHost(t *testing.T) {
+	// The pin carries the repository's own forge and host: a GitLab repository
+	// renders as its gitlab.com URL, nested path and all, beside a GitHub pin
+	// of the same group name, and the broker keys each on its own host.
+	integration := agentv1alpha1.IntegrationSpec{
+		Forges: []agentv1alpha1.ForgeSpec{
+			{Name: "github", Namespace: "acme"},
+			{Name: "gitlab", Provider: "gitlab", CredentialsRef: &agentv1alpha1.ForgeCredentialsRef{Name: "gitlab-token"}},
+		},
+		Repositories: []agentv1alpha1.RepositorySpec{
+			{Forge: "github", Repository: "infra", Role: agentv1alpha1.RepositoryRoleGitOps, BaseBranch: "release"},
+			{Forge: "gitlab", Repository: "https://gitlab.com/acme/platform/infra", Role: agentv1alpha1.RepositoryRoleManaged, BaseBranch: "main"},
+		},
+	}
+	envVars := buildCredentialProxyEnv(baseBranchAgent(integration))
+	want := `[{"repository":"https://github.com/acme/infra","branch":"release"},` +
+		`{"repository":"https://gitlab.com/acme/platform/infra","branch":"main"}]`
+	got := ""
+	for _, env := range envVars {
+		if env.Name == credentialProxyPinnedBasesEnv {
+			got = env.Value
+		}
+	}
+	if got != want {
+		t.Fatalf("CREDENTIAL_PROXY_PINNED_BASES = %s, want %s", got, want)
+	}
+}
+
 func TestTheReservedListNamesThePinnedBases(t *testing.T) {
 	merged := mergeCredentialProxyEnv(nil, pinningEnvAttempts)
 	if value, count := envValueCount(merged, "CREDENTIAL_PROXY_PINNED_BASES"); count != 0 {

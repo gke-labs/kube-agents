@@ -263,6 +263,7 @@ def _hold_signals(block):
     if _DEFERRED:
         signum = _DEFERRED[0]
         _DEFERRED.clear()
+        _defer_terminations()
         raise Terminated("signal %d" % signum)
 
 

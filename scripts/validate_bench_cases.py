@@ -160,11 +160,16 @@ KNOWN_UNREGISTERED = {
     # that the omission is known rather than accidental.
     "cluster-provision-kanban": "cluster-scoped provisioning task, tier decision pending",
     # Has its fixture (its own stack) and its eval record (#2468: red on main,
-    # three greens on the fix), and belongs in the nightly; held out only
-    # because the nightly's infra-lock chain has no room for another stack
-    # case. The entry goes when #2467 makes room, #2552 sweeps what a killed
-    # run leaves behind, and the case joins hack/eval/nightly-cases.txt.
-    "networking-audit-subnet-range-exhaustion": "#2467: stack case held out of the nightly for its infra-lock budget",
+    # three greens on the fix), and belongs in the nightly. #2755 lists what it
+    # still needs first: Compute network permission for the CI runners,
+    # confirmed or granted; a scheduled hack/ci_sweep_compute_plants.py; and
+    # room on the main part's infra-lock chain, measured with
+    # oobe-first-run-audits in it (or stack cases moved to a second project).
+    # The entry goes when the case joins hack/eval/nightly-cases.txt.
+    "networking-audit-subnet-range-exhaustion": (
+        "#2755: stack case held out of the nightly until runner Compute "
+        "permission, a scheduled plant sweep and infra-lock room land"
+    ),
 }
 
 # Cases whose fixture does not exist at all, waiting on the issue that plants
@@ -258,6 +263,13 @@ FIXTURE_NOT_READY = {
 # because a domain with no case reports as uncovered and a case with no slug
 # can stay green for months while the report shows the gap.
 KNOWN_NO_DOMAIN = {
+    "observability-watcher-scrape-state": (
+        "a question about the agent's own observability, whether the event "
+        "watcher's metrics are scraped and what proves it, graded on the "
+        "delegation, the worker's read of the PodMonitoring and the final "
+        "answer; reads the agent's own install, not the fleet, and no "
+        "domains.yaml row describes the agent's own observability"
+    ),
     "platform-worker-refuses-shipped-skill-edit": (
         "a skill-governance refusal graded on the worker's card result and on "
         "its skill_manage calls (none may succeed); reads no fleet, and no "

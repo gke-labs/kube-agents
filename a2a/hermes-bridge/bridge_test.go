@@ -7,8 +7,11 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
+	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -171,10 +174,11 @@ func testCtx(t *testing.T) context.Context {
 	return ctx
 }
 
-// script writes an executable stub standing in for the hermes CLI. The
-// bridge appends the prompt as the final argument, so stubs see it in "$5"
-// under the default arg shape ["-p", profile, "chat", "-q", prompt] - tests
-// pass Command themselves, so stubs read "$1".
+// script writes an executable stub standing in for the hermes CLI. Under
+// the default command, which ends in -q, the bridge puts the prompt in place
+// of the -q as one "--query=<prompt>" token (promptArgv); tests pass a
+// Command that does not end in -q, so the prompt is appended as it is and
+// stubs read it in "$1".
 func script(t *testing.T, body string) []string {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "hermes-stub")
@@ -493,57 +497,494 @@ func TestLifecycle_HappyPath(t *testing.T) {
 	}
 }
 
-// Assertion 12 (steering half): a follow-up during working is answered with
-// a non-final status and does not by itself change task state - the task
-// still completes on its own.
-func TestLifecycle_SteerRefusedHonestly(t *testing.T) {
-	_, url := startServer(t)
-	marker := filepath.Join(t.TempDir(), "started")
-	startBridge(t, url, script(t, fmt.Sprintf(`touch %s
-sleep 2
-echo done-after-steer`, marker)))
-	c := gatewayClient(t, url)
+// ---- follow-ups (steers) ----------------------------------------------------
 
-	origin := submit(t, c, "task-steer", "long question")
-	waitFor(t, 10*time.Second, "subprocess start", func() bool {
-		_, err := os.Stat(marker)
-		return err == nil
-	})
+// steerSeen is one steer notice on a task's events, with the status it rode.
+type steerSeen struct {
+	lib.SteerNotice
+	state lib.TaskState
+	final bool
+	seq   int    // position among the task's events
+	text  string // the notice's text part, for a reader without the data part
+}
 
+func steerNotices(t *testing.T, url, taskID string) []steerSeen {
+	t.Helper()
+	var out []steerSeen
+	for i, env := range replayEvents(t, url, taskID) {
+		if env.Kind != lib.KindStatusUpdate {
+			continue
+		}
+		var s lib.StatusUpdate
+		if json.Unmarshal(env.Payload, &s) != nil || s.Status.Message == nil {
+			continue
+		}
+		if n, ok := lib.SteerNoticeOf(s.Status.Message.Parts); ok {
+			seen := steerSeen{SteerNotice: n, state: s.Status.State, final: s.Final, seq: i}
+			for _, p := range s.Status.Message.Parts {
+				if p.Kind == "text" {
+					seen.text = p.Text
+				}
+			}
+			out = append(out, seen)
+		}
+	}
+	return out
+}
+
+// finalSeq is the position of the task's final status among its events.
+func finalSeq(t *testing.T, url, taskID string) int {
+	t.Helper()
+	for i, env := range replayEvents(t, url, taskID) {
+		if lib.IsFinalStatus(env) {
+			return i
+		}
+	}
+	t.Fatalf("no final status on %s", taskID)
+	return -1
+}
+
+func sendSteer(t *testing.T, c *lib.Client, origin *lib.Envelope, text string) *lib.Envelope {
+	t.Helper()
 	steer, err := lib.NewFollowUpEnvelope(origin, gatewayParty,
-		messagePayload(t, origin.TaskID, origin.ContextID, "also check the east region"),
-		lib.WithTo(lib.Party{Session: "platform"}))
+		messagePayload(t, origin.TaskID, origin.ContextID, text),
+		lib.WithTo(lib.Party{Session: "platform"}), lib.WithAuthority(origin.Authority))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err := c.Publish(testCtx(t), lib.TaskInSubject("platform", origin.TaskID), steer); err != nil {
 		t.Fatal(err)
 	}
+	return steer
+}
 
-	// The refusal arrives as a non-final working status with a message.
-	waitFor(t, 10*time.Second, "steer refusal status", func() bool {
-		for _, env := range replayEvents(t, url, origin.TaskID) {
-			if env.Kind != lib.KindStatusUpdate {
-				continue
-			}
-			var s lib.StatusUpdate
-			if json.Unmarshal(env.Payload, &s) != nil {
-				continue
-			}
-			if !s.Final && s.Status.State == lib.StateWorking && s.Status.Message != nil &&
-				strings.Contains(s.Status.Message.Parts[0].Text, "cannot accept mid-run input") {
-				return true
+func waitStarted(t *testing.T, path string) {
+	t.Helper()
+	waitFor(t, 10*time.Second, "subprocess start", func() bool { _, err := os.Stat(path); return err == nil })
+}
+
+// runOf is the bridge's live run for taskID, nil once finalized.
+func runOf(b *Bridge, taskID string) *taskRun {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.tasks[taskID]
+}
+
+// A follow-up during working is queued, said so on the stream as a
+// non-final working status, and changes no state by itself (assertion 12).
+// Cancelled with follow-ups queued, each is refused task-ended BEFORE the
+// terminal (assertion 10), in words that say the task ended.
+func TestSteer_QueuedThenRefusedAtCancel(t *testing.T) {
+	_, url := startServer(t)
+	stub, in, _ := holdingStub(t)
+	startAPIBridge(t, url, stub, nil)
+	c := gatewayClient(t, url)
+	origin := submit(t, c, "task-steer-q", "long question")
+	<-in
+	s1 := sendSteer(t, c, origin, "also check the east region")
+	s2 := sendSteer(t, c, origin, "and the west")
+	waitFor(t, 10*time.Second, "two queued notices", func() bool { return len(steerNotices(t, url, origin.TaskID)) == 2 })
+	for i, n := range steerNotices(t, url, origin.TaskID) {
+		want := []string{s1.EnvelopeID, s2.EnvelopeID}[i]
+		if n.Steer != lib.SteerQueued || n.EnvelopeID != want || n.state != lib.StateWorking || n.final {
+			t.Fatalf("notice %d = %+v, want queued %s on a non-final working status", i, n, want)
+		}
+	}
+	if task := fold(t, c, origin.TaskID); task.State != lib.StateWorking {
+		t.Fatalf("folded state after two follow-ups = %s, want still working", task.State)
+	}
+	publishCancel(t, c, origin)
+	task := waitTerminal(t, c, origin.TaskID)
+	if task.State != lib.StateCanceled || task.PostFinalDropped != 0 {
+		t.Fatalf("state %s, post-final %d", task.State, task.PostFinalDropped)
+	}
+	final := finalSeq(t, url, origin.TaskID)
+	var refused []string
+	for _, n := range steerNotices(t, url, origin.TaskID) {
+		if n.Steer != lib.SteerRefused {
+			continue
+		}
+		if n.Reason != lib.SteerReasonTaskEnded || n.final || n.seq > final {
+			t.Fatalf("refusal %+v (final at %d), want task-ended, non-final, before the terminal", n, final)
+		}
+		if !strings.Contains(n.text, "ended") || strings.Contains(n.text, "continues") {
+			t.Fatalf("task-ended refusal text %q does not say the task ended", n.text)
+		}
+		refused = append(refused, n.EnvelopeID)
+	}
+	if len(refused) != 2 || refused[0] != s1.EnvelopeID || refused[1] != s2.EnvelopeID {
+		t.Fatalf("refusals at cancel = %v, want [%s %s] in queue order", refused, s1.EnvelopeID, s2.EnvelopeID)
+	}
+}
+
+func TestSteer_SeventeenthIsRefused(t *testing.T) {
+	_, url := startServer(t)
+	stub, in, _ := holdingStub(t)
+	startAPIBridge(t, url, stub, nil)
+	c := gatewayClient(t, url)
+	origin := submit(t, c, "task-steer-17", "long question")
+	<-in
+	var last *lib.Envelope
+	for i := 0; i < steerQueueCapacity+1; i++ {
+		last = sendSteer(t, c, origin, fmt.Sprintf("follow-up %d", i+1))
+	}
+	waitFor(t, 15*time.Second, "17 notices", func() bool { return len(steerNotices(t, url, origin.TaskID)) == steerQueueCapacity+1 })
+	ns := steerNotices(t, url, origin.TaskID)
+	for _, n := range ns[:steerQueueCapacity] {
+		if n.Steer != lib.SteerQueued {
+			t.Fatalf("within the bound: %+v", n)
+		}
+	}
+	if n := ns[steerQueueCapacity]; n.Steer != lib.SteerRefused || n.Reason != lib.SteerReasonQueueFull || n.EnvelopeID != last.EnvelopeID {
+		t.Fatalf("17th = %+v, want refused queue-full for %s", n, last.EnvelopeID)
+	}
+	publishCancel(t, c, origin)
+	waitTerminal(t, c, origin.TaskID)
+}
+
+// A redelivered follow-up (same envelope id) is answered once; the task's own
+// submission, redelivered while it runs, is never queued as its follow-up; a
+// follow-up with no text is refused no-text.
+func TestSteer_DuplicateAndSubmissionAreNotQueued(t *testing.T) {
+	_, url := startServer(t)
+	stub, in, _ := holdingStub(t)
+	b := startAPIBridge(t, url, stub, nil)
+	c := gatewayClient(t, url)
+	origin := submit(t, c, "task-steer-dup", "long question")
+	<-in
+	steer := sendSteer(t, c, origin, "once only")
+	waitFor(t, 10*time.Second, "queued", func() bool { return len(steerNotices(t, url, origin.TaskID)) == 1 })
+	b.deliver(testCtx(t), steer)  // the durable redelivering it
+	b.deliver(testCtx(t), origin) // the submission redelivered while running
+	empty, err := lib.NewFollowUpEnvelope(origin, gatewayParty,
+		json.RawMessage(`{"role":"user","messageId":"m-empty","parts":[{"kind":"data","data":{"x":1}}]}`),
+		lib.WithTo(lib.Party{Session: "platform"}), lib.WithAuthority(origin.Authority))
+	if err != nil {
+		t.Fatal(err)
+	}
+	b.deliver(testCtx(t), empty)
+	waitFor(t, 10*time.Second, "no-text refusal", func() bool { return len(steerNotices(t, url, origin.TaskID)) == 2 })
+	ns := steerNotices(t, url, origin.TaskID)
+	if ns[1].Steer != lib.SteerRefused || ns[1].Reason != lib.SteerReasonNoText || ns[1].EnvelopeID != empty.EnvelopeID {
+		t.Fatalf("second notice = %+v, want refused no-text", ns[1])
+	}
+	run := runOf(b, origin.TaskID)
+	run.mu.Lock()
+	queued := len(run.steers)
+	run.mu.Unlock()
+	if queued != 1 {
+		t.Fatalf("queue holds %d, want 1 (no duplicate, no submission)", queued)
+	}
+	publishCancel(t, c, origin)
+	waitTerminal(t, c, origin.TaskID)
+}
+
+// Once the turns are closed (the deliverable chosen, or finalize begun), a
+// follow-up is refused task-ending, not queued behind a terminal, and the
+// words do not promise a turn that will never run.
+func TestSteer_TurnsClosedRefusesTaskEnding(t *testing.T) {
+	_, url := startServer(t)
+	stub, in, release := holdingStub(t)
+	b := startAPIBridge(t, url, stub, nil)
+	c := gatewayClient(t, url)
+	origin := submit(t, c, "task-steer-ending", "long question")
+	<-in
+	run := runOf(b, origin.TaskID)
+	run.mu.Lock()
+	run.turnsClosed = true
+	run.mu.Unlock()
+	late := sendSteer(t, c, origin, "one more thing")
+	waitFor(t, 10*time.Second, "task-ending refusal", func() bool { return len(steerNotices(t, url, origin.TaskID)) == 1 })
+	n := steerNotices(t, url, origin.TaskID)[0]
+	if n.Steer != lib.SteerRefused || n.Reason != lib.SteerReasonTaskEnding || n.EnvelopeID != late.EnvelopeID ||
+		n.state != lib.StateWorking || n.final {
+		t.Fatalf("notice = %+v, want refused task-ending on a non-final working status", n)
+	}
+	if strings.Contains(n.text, "queued") || !strings.Contains(n.text, "already chosen") {
+		t.Fatalf("task-ending text %q does not say the answer is already chosen", n.text)
+	}
+	release()
+	task := waitTerminal(t, c, origin.TaskID)
+	if task.State != lib.StateCompleted || task.PostFinalDropped != 0 {
+		t.Fatalf("state %s, post-final %d", task.State, task.PostFinalDropped)
+	}
+	if got := len(steerNotices(t, url, origin.TaskID)); got != 1 {
+		t.Fatalf("%d notices, want the one refusal (nothing was queued to refuse at the end)", got)
+	}
+}
+
+// A stalled bus holds a follow-up's notice, never run.mu: the notice
+// publishes with mu released, so a handleCancel run beside the stalled
+// delivery still ends the turn's request at once, and no notice lands after the
+// terminal once the bus is back (ruling: notices outside run.mu, bounded).
+// The test calls handleCancel itself. On the bridge's own consumer, which
+// runs one handler at a time, a cancel that arrives during the stall waits
+// behind the stalled delivery until steerNoticeTimeout ends it; what this
+// pins is that the run's lock adds no wait of its own. The stall is bounded
+// by steerNoticeTimeout, not unbounded: a notice whose publish outlives it is
+// dropped, so the test asserts no notice follows the terminal, not that the
+// queued one landed.
+func TestSteer_StalledNoticeDoesNotHoldRunLock(t *testing.T) {
+	s, url := startServer(t)
+	stub, in, _ := holdingStub(t)
+	b := startAPIBridge(t, url, stub, nil)
+	c := gatewayClient(t, url)
+	origin := submit(t, c, "task-steer-stall", "long question")
+	<-in
+	run := runOf(b, origin.TaskID)
+
+	steer, err := lib.NewFollowUpEnvelope(origin, gatewayParty,
+		messagePayload(t, origin.TaskID, origin.ContextID, "while the bus is down"),
+		lib.WithTo(lib.Party{Session: "platform"}), lib.WithAuthority(origin.Authority))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cancelEnv, err := lib.NewCancelEnvelope(gatewayParty, origin.TaskID, origin.ContextID, origin.CorrelationID,
+		lib.WithTo(lib.Party{Session: "platform"}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	storeDir, port := s.JetStreamConfig().StoreDir, s.Addr().(*net.TCPAddr).Port
+	s.Shutdown()
+	s.WaitForShutdown()
+
+	delivered := make(chan struct{})
+	go func() { defer close(delivered); b.deliver(context.Background(), steer) }()
+	// TryLock, so a notice publishing under mu reads as this failure, not
+	// as a poll that blocks until the publish gives up.
+	waitFor(t, 5*time.Second, "follow-up queued with run.mu free (a stall under mu fails here)", func() bool {
+		if !run.mu.TryLock() {
+			return false
+		}
+		defer run.mu.Unlock()
+		return len(run.steers) == 1
+	})
+	select {
+	case <-delivered:
+		t.Fatal("the notice publish returned with the bus down; this test needs it stalled")
+	case <-time.After(500 * time.Millisecond):
+	}
+	canceled := make(chan struct{})
+	go func() { defer close(canceled); b.handleCancel(context.Background(), cancelEnv) }()
+	select {
+	case <-canceled:
+	case <-time.After(2 * time.Second):
+		t.Fatal("handleCancel blocked behind a stalled steer notice: the notice holds run.mu")
+	}
+	select {
+	case <-delivered:
+		t.Fatal("the notice publish returned with the bus still down")
+	default:
+	}
+
+	// The bus comes back where it was; the notice, then the refusal, then
+	// the terminal.
+	s2, err := natsserver.NewServer(&natsserver.Options{Host: "127.0.0.1", Port: port, JetStream: true,
+		StoreDir: storeDir, NoLog: true, NoSigs: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	go s2.Start()
+	if !s2.ReadyForConnections(10 * time.Second) {
+		t.Fatal("server not back")
+	}
+	t.Cleanup(s2.Shutdown)
+	task := waitTerminal(t, c, origin.TaskID)
+	if task.State != lib.StateCanceled || task.PostFinalDropped != 0 {
+		t.Fatalf("state %s, post-final %d", task.State, task.PostFinalDropped)
+	}
+	<-delivered
+	// Out of b.tasks means finalize is done with the bus (the registry
+	// clear), so the cleanup's shutdown cannot strand it mid-write.
+	waitFor(t, 15*time.Second, "run released", func() bool { return runOf(b, origin.TaskID) == nil })
+	final := finalSeq(t, url, origin.TaskID)
+	for _, n := range steerNotices(t, url, origin.TaskID) {
+		if n.seq > final {
+			t.Fatalf("notice %+v after the terminal at %d", n, final)
+		}
+	}
+}
+
+// finalize releases run.mu while it refuses a pending task's queued
+// follow-ups. A worker freed in that gap still sees the run pending, takes
+// it, and reaches its working publish; that publish must see the run ended
+// and stay silent, never land a `working` after the canceled terminal
+// (assertion 10). The bus is down across the gap so finalize holds it open
+// on cue; the look-ahead seam holds the worker until finalize is in it.
+// Follow-ups queue on the API executor only, so that is where the gap is.
+func TestSteer_WorkerInFinalizeGapPublishesNoWorking(t *testing.T) {
+	s, url := startServer(t)
+	marker := filepath.Join(t.TempDir(), "spawned")
+	stub := newAPIStub(t, func(w http.ResponseWriter, _ *http.Request, _ apiCall) {
+		_ = os.WriteFile(marker, nil, 0o600)
+		writeCompletion(w, "sess-gap", "never")
+	})
+	cfg := Config{NATSURL: url, Executor: ExecutorAPI, APIURL: stub.srv.URL + "/v1/chat/completions", APIKey: testAPIKey,
+		Concurrency: 1, TaskDeadline: 20 * time.Second, KillGrace: 500 * time.Millisecond,
+		Scope: capability.NamespaceScope("")}
+	entered, gate := make(chan struct{}), make(chan struct{})
+	var opened atomic.Bool
+	openGate := func() {
+		if opened.CompareAndSwap(false, true) {
+			close(gate)
+		}
+	}
+	t.Cleanup(openGate)
+	b, _ := startBridgeConfig(t, cfg, func(b *Bridge) {
+		b.lookAhead = func(ctx context.Context, run *taskRun) (bool, error) {
+			close(entered)
+			<-gate
+			return false, nil
+		}
+	})
+	c := gatewayClient(t, url)
+	origin := submit(t, c, "task-steer-gap", "never runs")
+	<-entered // the worker holds the run, still pending
+	sendSteer(t, c, origin, "first follow-up")
+	sendSteer(t, c, origin, "second follow-up")
+	waitFor(t, 10*time.Second, "two queued notices", func() bool { return len(steerNotices(t, url, origin.TaskID)) == 2 })
+	run := runOf(b, origin.TaskID)
+	cancelEnv, err := lib.NewCancelEnvelope(gatewayParty, origin.TaskID, origin.ContextID, origin.CorrelationID,
+		lib.WithTo(lib.Party{Session: "platform"}))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	storeDir, port := s.JetStreamConfig().StoreDir, s.Addr().(*net.TCPAddr).Port
+	s.Shutdown()
+	s.WaitForShutdown()
+	go b.handleCancel(context.Background(), cancelEnv) // pending: finalize, stalled in its refusals
+	waitFor(t, 5*time.Second, "finalize in its refusals", func() bool {
+		if !run.mu.TryLock() {
+			return false
+		}
+		defer run.mu.Unlock()
+		return run.turnsClosed && run.state == statePending
+	})
+	openGate()
+	waitFor(t, 5*time.Second, "worker took the run in the gap", func() bool {
+		if !run.mu.TryLock() {
+			return false
+		}
+		defer run.mu.Unlock()
+		return run.state == stateRunning
+	})
+	time.Sleep(200 * time.Millisecond) // the worker reaches its working publish, behind noticeMu
+
+	s2, err := natsserver.NewServer(&natsserver.Options{Host: "127.0.0.1", Port: port, JetStream: true,
+		StoreDir: storeDir, NoLog: true, NoSigs: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	go s2.Start()
+	if !s2.ReadyForConnections(10 * time.Second) {
+		t.Fatal("server not back")
+	}
+	t.Cleanup(s2.Shutdown)
+	task := waitTerminal(t, c, origin.TaskID)
+	waitFor(t, 15*time.Second, "run released", func() bool { return runOf(b, origin.TaskID) == nil })
+	time.Sleep(500 * time.Millisecond) // room for a late working publish to land
+	task = waitTerminal(t, c, origin.TaskID)
+	if task.State != lib.StateCanceled || task.PostFinalDropped != 0 {
+		t.Fatalf("state %s, post-final %d: the worker published after the terminal", task.State, task.PostFinalDropped)
+	}
+	final := finalSeq(t, url, origin.TaskID)
+	for i, env := range replayEvents(t, url, origin.TaskID) {
+		var su lib.StatusUpdate
+		if env.Kind == lib.KindStatusUpdate && json.Unmarshal(env.Payload, &su) == nil &&
+			su.Status.State == lib.StateWorking && su.Status.Message == nil {
+			t.Fatalf("working status at %d (final at %d): a canceled-before-start task never works", i, final)
+		}
+	}
+	// The refusals were published into the outage: one whose ack the
+	// restart swallowed times out and is logged, so their count is not this
+	// test's to assert, only that none follows the terminal.
+	for _, n := range steerNotices(t, url, origin.TaskID) {
+		if n.seq > final {
+			t.Fatalf("notice %+v after the terminal at %d", n, final)
+		}
+	}
+	if _, err := os.Stat(marker); err == nil {
+		t.Fatal("the worker ran the canceled task")
+	}
+}
+
+// The cli executor cannot continue a session, so a follow-up to one of its
+// tasks is refused no-resume the moment it arrives, while the opening turn
+// still runs, in words that say why and what to do; nothing is queued, the
+// child runs once, and the task's one answer is the result, untouched.
+func TestCLI_FollowUpIsRefusedNoResumeAtOnce(t *testing.T) {
+	_, url := startServer(t)
+	dir := t.TempDir()
+	started, release, runs := filepath.Join(dir, "started"), filepath.Join(dir, "release"), filepath.Join(dir, "runs")
+	startBridge(t, url, script(t, fmt.Sprintf(`echo "$1" >> %s
+touch %s
+while [ ! -f %s ]; do sleep 0.05; done
+echo first-answer
+echo "session_id: sess-1" >&2`, runs, started, release)))
+	c := gatewayClient(t, url)
+	origin := submit(t, c, "task-cli-noresume", "long question")
+	waitStarted(t, started)
+	steer := sendSteer(t, c, origin, "and the west")
+	waitFor(t, 10*time.Second, "the refusal, during the turn", func() bool { return len(steerNotices(t, url, origin.TaskID)) == 1 })
+	n := steerNotices(t, url, origin.TaskID)[0]
+	if n.Steer != lib.SteerRefused || n.Reason != lib.SteerReasonNoResume || n.EnvelopeID != steer.EnvelopeID ||
+		n.state != lib.StateWorking || n.final {
+		t.Fatalf("notice = %+v, want refused no-resume on a non-final working status", n)
+	}
+	if !strings.Contains(n.text, "can't continue a session") || !strings.Contains(n.text, "after the answer") {
+		t.Fatalf("no-resume text %q does not say the executor can't continue a session", n.text)
+	}
+	if task := fold(t, c, origin.TaskID); task.State != lib.StateWorking {
+		t.Fatalf("folded state after the refusal = %s, want still working", task.State)
+	}
+	if err := os.WriteFile(release, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	task := waitTerminal(t, c, origin.TaskID)
+	if task.State != lib.StateCompleted || task.PostFinalDropped != 0 {
+		t.Fatalf("state %s, post-final %d", task.State, task.PostFinalDropped)
+	}
+	if got := artifactsNamed(t, url, origin.TaskID, lib.ArtifactResult); !slices.Equal(got, []string{"first-answer\n"}) {
+		t.Fatalf("result = %q, want the one answer", got)
+	}
+	if got := artifactsNamed(t, url, origin.TaskID, lib.ArtifactTurn); len(got) != 0 {
+		t.Fatalf("turn answers %q, want none", got)
+	}
+	if got := len(steerNotices(t, url, origin.TaskID)); got != 1 {
+		t.Fatalf("%d notices, want the one refusal", got)
+	}
+	if raw, err := os.ReadFile(runs); err != nil || string(raw) != "long question\n" {
+		t.Fatalf("child runs %q (%v), want the opening one only", raw, err)
+	}
+}
+
+// Every refusal's text names its own reason, and none claims the task goes
+// on where it does not: a reader without the data part reads the truth.
+func TestSteerNoticeText(t *testing.T) {
+	for _, tc := range []struct {
+		n          lib.SteerNotice
+		want, deny []string
+	}{
+		{lib.SteerNotice{Steer: lib.SteerQueued}, []string{"queued", "next turn"}, nil},
+		{lib.SteerNotice{Steer: lib.SteerRefused, Reason: lib.SteerReasonQueueFull}, []string{"queue-full", "16"}, nil},
+		{lib.SteerNotice{Steer: lib.SteerRefused, Reason: lib.SteerReasonNoText}, []string{"no-text", "no text"}, nil},
+		{lib.SteerNotice{Steer: lib.SteerRefused, Reason: lib.SteerReasonTaskEnding}, []string{"task-ending", "already chosen"}, []string{"continues"}},
+		{lib.SteerNotice{Steer: lib.SteerRefused, Reason: lib.SteerReasonTaskEnded}, []string{"task-ended", "ended"}, []string{"continues", "after the answer"}},
+		{lib.SteerNotice{Steer: lib.SteerRefused, Reason: lib.SteerReasonCapability}, []string{"capability"}, nil},
+		{lib.SteerNotice{Steer: lib.SteerRefused, Reason: lib.SteerReasonNoResume}, []string{"no-resume"}, nil},
+	} {
+		text := steerNoticeText(tc.n)
+		for _, w := range tc.want {
+			if !strings.Contains(text, w) {
+				t.Errorf("%+v: %q lacks %q", tc.n, text, w)
 			}
 		}
-		return false
-	})
-
-	task := waitTerminal(t, c, origin.TaskID)
-	if task.State != lib.StateCompleted {
-		t.Fatalf("state after steer = %s, want completed - a steer must not change state", task.State)
-	}
-	if task.PostFinalDropped != 0 {
-		t.Fatalf("assertion 10: %d events after final", task.PostFinalDropped)
+		for _, d := range tc.deny {
+			if strings.Contains(text, d) {
+				t.Errorf("%+v: %q says %q, which is not true for it", tc.n, text, d)
+			}
+		}
 	}
 }
 
@@ -1826,9 +2267,10 @@ func TestLifecycle_TerminalTaskTrafficIgnored(t *testing.T) {
 	}
 }
 
-// Assertion 12 for a QUEUED task: a steer arriving while the run waits for
-// a worker slot answers with the task's actual state (submitted), not
-// working - a follow-up must not change folded state by itself.
+// Assertion 12 for a QUEUED task: a follow-up arriving while the run waits
+// for a worker slot is answered on a submitted status, not working - a
+// follow-up must not change folded state by itself. On the cli executor the
+// answer is a no-resume refusal, given at once.
 func TestLifecycle_SteerToQueuedTaskAnswersSubmitted(t *testing.T) {
 	_, url := startServer(t)
 	marker := filepath.Join(t.TempDir(), "started")
@@ -1859,18 +2301,11 @@ echo done`, marker)), 1)
 		t.Fatal(err)
 	}
 
-	waitFor(t, 10*time.Second, "steer refusal on queued task", func() bool {
-		for _, env := range replayEvents(t, url, queued.TaskID) {
-			if env.Kind != lib.KindStatusUpdate {
-				continue
-			}
-			var s lib.StatusUpdate
-			if json.Unmarshal(env.Payload, &s) != nil {
-				continue
-			}
-			if s.Status.Message != nil && strings.Contains(s.Status.Message.Parts[0].Text, "cannot accept mid-run input") {
-				if s.Status.State != lib.StateSubmitted {
-					t.Fatalf("refusal state = %s, want submitted for a queued task", s.Status.State)
+	waitFor(t, 10*time.Second, "steer answered on queued task", func() bool {
+		for _, n := range steerNotices(t, url, queued.TaskID) {
+			if n.EnvelopeID == steer.EnvelopeID {
+				if n.Steer != lib.SteerRefused || n.Reason != lib.SteerReasonNoResume || n.state != lib.StateSubmitted || n.final {
+					t.Fatalf("notice %+v, want refused no-resume on a non-final submitted status for a queued task", n)
 				}
 				return true
 			}
@@ -1881,9 +2316,13 @@ echo done`, marker)), 1)
 	if task.State != lib.StateSubmitted {
 		t.Fatalf("folded state after steer = %s, want still submitted", task.State)
 	}
-	// Both tasks still finish clean.
-	if got := waitTerminal(t, c, "task-queued"); got.State != lib.StateCompleted {
-		t.Fatalf("queued task ended %s, want completed", got.State)
+	// Both tasks still finish clean, and the refusal was the follow-up's
+	// one notice.
+	if got := waitTerminal(t, c, "task-queued"); got.State != lib.StateCompleted || got.PostFinalDropped != 0 {
+		t.Fatalf("queued task ended %s (post-final %d), want completed", got.State, got.PostFinalDropped)
+	}
+	if ns := steerNotices(t, url, queued.TaskID); len(ns) != 1 {
+		t.Fatalf("notices %+v, want the one refusal", ns)
 	}
 }
 
@@ -2064,4 +2503,117 @@ func TestChunkString_NeverSplitsARune(t *testing.T) {
 			}
 		})
 	}
+}
+
+// ---- the cli executor's argv -------------------------------------------------
+
+// A prompt that is a dash-led token is one --query= token, so no argv token
+// equals it. That is the property the defect needed broken: Hermes scans its
+// whole argv for exact tokens before argparse runs (hermes_cli/main.py at
+// v2026.9.14: `"--tui" in argv` in _wants_tui_early, which sends a headless
+// run to the TUI's no-TTY bail-out, exit 0 with no answer; `"-h" in argv or
+// "--help" in argv` on the fast chat path), and after a bare -q argparse
+// reads such a token as an option ("expected one argument", exit 2). A
+// command not ending in -q gets the prompt appended unchanged.
+func TestPromptArgvKeepsADashLedPromptTheQuery(t *testing.T) {
+	cmd := []string{"hermes", "-p", "platform", "chat", "-Q", "-q"}
+	for _, prompt := range []string{"--tui", "--help", "-h", "-p", "--force"} {
+		want := []string{"hermes", "-p", "platform", "chat", "-Q", "--query=" + prompt}
+		got := promptArgv(cmd, prompt)
+		if !slices.Equal(got, want) {
+			t.Errorf("promptArgv(%q) = %q, want %q", prompt, got, want)
+		}
+		// The whole-token scans: the prompt must not be a token of its own.
+		// The configured command's own -p is the profile flag, not the prompt.
+		if slices.Contains(got[len(cmd)-1:], prompt) {
+			t.Errorf("prompt %q is a bare argv token in %q: Hermes's pre-parse scans would match it", prompt, got)
+		}
+	}
+	if got := promptArgv([]string{"/stub"}, "--force"); !slices.Equal(got, []string{"/stub", "--force"}) {
+		t.Errorf("promptArgv on a non -q command = %q, want the prompt appended", got)
+	}
+	if got := promptArgv(cmd, "x"); &got[0] == &cmd[0] || cmd[len(cmd)-1] != "-q" {
+		t.Error("promptArgv aliased or changed the configured command")
+	}
+}
+
+// NUL bytes leave the prompt before it becomes an argument: exec refuses an
+// argument that holds one.
+func TestArgvTextDropsNulBytes(t *testing.T) {
+	cmd := []string{"hermes", "chat", "-Q", "-q"}
+	if got := promptArgv(cmd, "a\x00b\x00"); got[len(got)-1] != "--query=ab" {
+		t.Errorf("promptArgv = %q, want the NUL bytes dropped", got)
+	}
+	if got := promptArgv([]string{"/stub"}, "d\x00"); got[len(got)-1] != "d" {
+		t.Errorf("promptArgv on a non -q command = %q, want the NUL byte dropped", got)
+	}
+}
+
+func TestTurnNote(t *testing.T) {
+	if got := turnNote(1); got != "" {
+		t.Fatalf("turnNote(1) = %q, want none on the first turn", got)
+	}
+	if got := turnNote(3); got != "; turn: 3" {
+		t.Fatalf("turnNote(3) = %q", got)
+	}
+}
+
+// artifactsNamed is each artifact of the given name on the task's events,
+// its chunks joined, in the order the artifacts first appeared.
+func artifactsNamed(t *testing.T, url, taskID, name string) []string {
+	t.Helper()
+	var ids []string
+	texts := map[string]string{}
+	for _, env := range replayEvents(t, url, taskID) {
+		if env.Kind != lib.KindArtifactUpdate {
+			continue
+		}
+		var a lib.ArtifactUpdate
+		if json.Unmarshal(env.Payload, &a) != nil || a.Artifact.Name != name {
+			continue
+		}
+		id := a.Artifact.ArtifactID
+		if _, ok := texts[id]; !ok {
+			ids = append(ids, id)
+		}
+		var sb strings.Builder
+		for _, p := range a.Artifact.Parts {
+			sb.WriteString(p.Text)
+		}
+		if a.Append {
+			texts[id] += sb.String()
+		} else {
+			texts[id] = sb.String()
+		}
+	}
+	out := make([]string, 0, len(ids))
+	for _, id := range ids {
+		out = append(out, texts[id])
+	}
+	return out
+}
+
+// idleRun is a running taskRun the bridge holds and no worker drives, with
+// one follow-up queued, for driving a turn by hand.
+func idleRun(t *testing.T, b *Bridge, taskID string) (*taskRun, *lib.Envelope) {
+	t.Helper()
+	origin, err := lib.NewMessageEnvelope(gatewayParty, taskID, "ctx-"+taskID, "corr-"+taskID,
+		messagePayload(t, taskID, "ctx-"+taskID, "q"), lib.WithTo(lib.Party{Session: "platform"}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	x, err := b.c.NewTaskExecution(origin, b.from, b.cfg.Profile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	steer, err := lib.NewFollowUpEnvelope(origin, gatewayParty,
+		messagePayload(t, taskID, origin.ContextID, "next"), lib.WithTo(lib.Party{Session: "platform"}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	run := &taskRun{origin: origin, exec: x, state: stateRunning, steers: []*lib.Envelope{steer}}
+	b.mu.Lock()
+	b.tasks[taskID] = run
+	b.mu.Unlock()
+	return run, steer
 }

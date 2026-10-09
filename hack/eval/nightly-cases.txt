@@ -2,8 +2,8 @@
 #
 # One `./tasks/<id>/task.yaml` path per line, relative to bench/. `#` starts
 # a comment, blank lines are skipped. hack/ci-eval-pr.sh reads this file at
-# startup into NIGHTLY_TASKS and, under EVAL_TIER=nightly (exported by the
-# Prow periodic ci-kube-agents-eval-nightly and nothing else), appends it to
+# startup into NIGHTLY_TASKS and, under EVAL_TIER=nightly (exported only by
+# the nightly Prow periodics in oss-test-infra), appends it to
 # the presubmit matrix in this order, so the nightly is a superset of the
 # presubmit by construction and a case in presubmit-cases.txt runs
 # identically in both. The script refuses to start on a line that names no
@@ -11,9 +11,12 @@
 # night). The registration lint (scripts/validate_bench_cases.py) reads this
 # file as well as the presubmit one; the domain-coverage lint reads only
 # blocking-roster.txt, so neither an entry here nor a held-out presubmit
-# seat counts as coverage. EVAL_NIGHTLY_PART in the script can split the
-# nightly matrix between two periodics (its comment says how); unset, one
-# job runs all of it, and the budget below prices that.
+# seat counts as coverage. The Gemini nightly runs as two periodics:
+# ci-kube-agents-eval-nightly with EVAL_NIGHTLY_PART=main, and
+# ci-kube-agents-eval-nightly-writers with EVAL_NIGHTLY_PART=writers, the
+# cases that request a pull request, on a second project (the variable's
+# comment in the script says why). The budget below prices the whole matrix
+# on one job, as it ran before that split.
 #
 # WHO APPROVES. The normal approvers (root OWNERS). Only the presubmit files
 # beside this one carry the eval-crew rule (#1546, decided 2026-09-15).
@@ -705,7 +708,17 @@
 # because each repetition runs four real audits back to back.
 ./tasks/oobe-first-run-audits/task.yaml
 
+# The agent's own observability: whether the event watcher's metrics are
+# scraped, answered from the PodMonitoring and the Cloud Monitoring series.
+./tasks/observability-watcher-scrape-state/task.yaml
+
 # A fleet question fanned out one card per cluster, each titled with the bare
 # cluster name the Slack plan row renders (agents/platform/SOUL.md, fan-out).
 # deployer: noop; reads the seeded fleet's crashloop-workload role.
 ./tasks/chat-fanout-fleet-restarts-rows/task.yaml
+
+# gke-backup-dr skill probe: a CMEK-encrypted backup plan for two namespaces
+# uses the flags gcloud accepts (--update-addons=BackupRestore=ENABLED,
+# --selected-namespaces, --backup-retain-days, --encryption-key). deployer:
+# noop, transcript-only.
+./tasks/backup-dr-cmek-selected-namespaces-probe/task.yaml

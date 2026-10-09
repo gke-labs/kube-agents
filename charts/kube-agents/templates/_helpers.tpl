@@ -627,7 +627,9 @@ this, and the minter guard is the reason it has to be one answer.
 It also carries the checks the chart can make before the API server does, so
 the failure names the values key: the two spellings are exclusive, forge names
 are unique, a provider must be registered, a GitHub forge's host must be one GitHub serves and its
-namespace a GitHub organisation or user name, and a repository must name a
+namespace a GitHub organisation or user name, a GitLab forge needs a
+credentialsRef, a host that is a hostname and not GitHub's, and a namespace that
+is a GitLab group path, and a repository must name a
 declared forge, be neither empty nor the alias's `None`, and be qualified by a
 namespace if it is a bare name; and at most one repository has role gitops. The namespace checks matter beyond the error
 text: a single-forge declaration renders as the alias, so without them the
@@ -641,11 +643,12 @@ declares nothing -- reading it as a declaration would make it collide with the
 `forges` list that replaces it, which is the migration every install has to
 make.
 
-The provider list mirrors the CRD's enum on ForgeSpec.Provider, and the host
-list mirrors githubHosts, both in k8s-operator/api/v1alpha1.
+The provider list mirrors the CRD's enum on ForgeSpec.Provider, the host list
+mirrors githubHosts, and the GitLab namespace pattern mirrors
+gitlabNamespaceRegex, all in k8s-operator/api/v1alpha1.
 */}}
 {{- define "kube-agents.forgeProviders" -}}
-{{- $registered := list "github" -}}
+{{- $registered := list "github" "gitlab" -}}
 {{- $githubHosts := list "github.com" "www.github.com" "ssh.github.com" -}}
 {{- $integ := .Values.platformAgent.integration -}}
 {{- $forges := $integ.forges | default list -}}
@@ -659,6 +662,7 @@ list mirrors githubHosts, both in k8s-operator/api/v1alpha1.
 {{- $names := list -}}
 {{- $providers := list -}}
 {{- $namespaces := dict -}}
+{{- $gitlabHosts := dict -}}
 {{- range $i, $f := $forges -}}
 {{- if not $f.name -}}
 {{- fail (printf "platformAgent.integration.forges[%d].name is required" $i) -}}
@@ -675,9 +679,48 @@ list mirrors githubHosts, both in k8s-operator/api/v1alpha1.
 {{- if and (eq $provider "github") $host (not (and (regexMatch "^[A-Za-z0-9.-]+$" $host) (has (lower $host) $githubHosts))) -}}
 {{- fail (printf "platformAgent.integration.forges[%d].host is %q, which provider github does not serve" $i $f.host) -}}
 {{- end -}}
+{{- /* On every provider: the CRD's schema refuses the name wherever it is written, so the chart does too, naming the values key. */ -}}
+{{- $secret := ($f.credentialsRef | default dict).name | default "" -}}
+{{- if and $secret (or (gt (len $secret) 253) (not (regexMatch "^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$" $secret))) -}}
+{{- fail (printf "platformAgent.integration.forges[%d].credentialsRef.name is %q, which is not a Secret name (a lowercase DNS subdomain of at most 253 characters)" $i $secret) -}}
+{{- end -}}
+{{- if eq $provider "gitlab" -}}
+{{- /* Any GitHub name, not only its three spellings: api.github.com or raw.githubusercontent.com would hand GitHub's traffic a GitLab token. */ -}}
+{{- /* Label by label, as the operator's DNS-subdomain check: no empty or dash-edged label. */ -}}
+{{- if and $host (or (not (regexMatch "^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)+$" $host)) (gt (len $host) 253) (regexMatch "(^|\\.)(github\\.com|githubusercontent\\.com)$" (lower $host))) -}}
+{{- fail (printf "platformAgent.integration.forges[%d].host is %q, which is not a hostname a gitlab forge can be at" $i $f.host) -}}
+{{- end -}}
+{{- if not $secret -}}
+{{- fail (printf "platformAgent.integration.forges[%d] is a gitlab forge with no credentialsRef.name; name the Secret that holds its access token under the key token" $i) -}}
+{{- end -}}
+{{- /* One credential per host in the broker: www.gitlab.com is gitlab.com. */ -}}
+{{- $glHost := lower ($host | default "gitlab.com") -}}
+{{- if eq $glHost "www.gitlab.com" }}{{ $glHost = "gitlab.com" }}{{ end -}}
+{{- if hasKey $gitlabHosts $glHost -}}
+{{- fail (printf "platformAgent.integration.forges[%d].host: %s is already served by forges[%s]; the broker holds one credential per host, so declare one gitlab forge there" $i $glHost (get $gitlabHosts $glHost)) -}}
+{{- end -}}
+{{- $_ := set $gitlabHosts $glHost (toString $i) -}}
+{{- end -}}
 {{- $namespace := $f.namespace | default "" -}}
 {{- if and (eq $provider "github") $namespace (not (regexMatch "^[a-zA-Z0-9]([a-zA-Z0-9-]{0,37}[a-zA-Z0-9])?$" $namespace)) -}}
 {{- fail (printf "platformAgent.integration.forges[%d].namespace is %q, which is not a GitHub organisation or user name" $i $namespace) -}}
+{{- end -}}
+{{- if and (eq $provider "gitlab") (gt (len $namespace) 255) -}}
+{{- fail (printf "platformAgent.integration.forges[%d].namespace is longer than 255 characters" $i) -}}
+{{- end -}}
+{{- if and (eq $provider "gitlab") $namespace (not (regexMatch "^[A-Za-z0-9_]([A-Za-z0-9_.-]*[A-Za-z0-9_-])?(/[A-Za-z0-9_]([A-Za-z0-9_.-]*[A-Za-z0-9_-])?)*$" $namespace)) -}}
+{{- fail (printf "platformAgent.integration.forges[%d].namespace is %q, which is not a GitLab group path" $i $namespace) -}}
+{{- end -}}
+{{- if and (eq $provider "gitlab") $namespace -}}
+{{- /* As the operator: GitLab refuses a segment ending in .git or .atom, and the broker would read such a prefix with the suffix trimmed. */ -}}
+{{- if regexMatch "(?i)\\.(git|atom)(/|$)" $namespace -}}
+{{- fail (printf "platformAgent.integration.forges[%d].namespace is %q; a GitLab group segment may not end in .git or .atom" $i $namespace) -}}
+{{- end -}}
+{{- /* A first segment that is a forge host is a host, not a group: the operator refuses it, so the chart does, naming the values key. */ -}}
+{{- $first := lower (first (splitList "/" $namespace)) -}}
+{{- if or (has $first (list "github.com" "www.github.com" "ssh.github.com" "gitlab.com" "www.gitlab.com")) (eq $first (lower ($host | default "gitlab.com"))) -}}
+{{- fail (printf "platformAgent.integration.forges[%d].namespace is %q, which starts with the forge host %q; name the group alone" $i $namespace $first) -}}
+{{- end -}}
 {{- end -}}
 {{- $names = append $names $f.name -}}
 {{- $providers = append $providers $provider -}}
@@ -1413,7 +1456,7 @@ The defaults carry no ephemeral-storage request because the operator renders non
 {{- define "kube-agents.credentialProxyDefaults" -}}
 {{- dict
       "requests" (dict "cpu" "500m" "memory" "512Mi")
-      "limits" (dict "cpu" "1" "memory" "1Gi" "ephemeral-storage" "2Gi")
+      "limits" (dict "cpu" "1" "memory" "2Gi" "ephemeral-storage" "2Gi")
    | toJson -}}
 {{- end }}
 

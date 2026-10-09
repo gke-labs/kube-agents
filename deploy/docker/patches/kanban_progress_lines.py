@@ -59,7 +59,8 @@ fallback, an opened pull request and a ``needs_input`` question post as
 messages of their own (``gateway/slack_ux_moments.py``), and any later event
 takes the buttons off the card's open question; :func:`silent_event` carries
 ``archived`` and ``unblocked``, which upstream never posts, to the plan and
-the question. See :func:`deliver`.
+the question, and opens a card's row when its first noteless heartbeat says
+it started. See :func:`deliver`.
 
 Three properties of the surrounding code make this nearly free:
 
@@ -136,7 +137,24 @@ def progress_note(payload: object, limit: int = DEFAULT_NOTE_LIMIT) -> str:
 #: upstream's ``_EVENT_FORMATTERS["status"]`` renders it. Listing it here means
 #: such a move folds into the card's trail as ``→ <status>`` rather than
 #: posting upstream's ``🔄`` line as a message of its own.
-ROLLING_KINDS = ("heartbeat", "status")
+#:
+#: ``queued`` is the dispatcher's notice that a user card is waiting for a
+#: worker slot (``hermes_cli/kanban_priority.py``). It rolls so the
+#: card's first progress note joins the queued line instead of posting under
+#: it, and so a card queued twice reads as one message.
+ROLLING_KINDS = ("heartbeat", "status", "queued")
+
+#: The rolling kinds whose trail entry is the ``note`` on the event payload.
+NOTE_KINDS = ("heartbeat", "queued")
+
+#: A queued line that opens a card's rolling message is posted bare, without
+#: the card's header, because it is worded for the user as a whole sentence
+#: (bnaylor). The header joins once the worker's first note arrives.
+QUEUED_KIND = "queued"
+
+#: Where a card's map entry remembers which of its trail lines were queued
+#: notices, so the terminal settle can drop them.
+QUEUED_LINES_KEY = "queued_lines"
 
 #: With ``KAGE_SLACK_UX`` on, the blocked kind that may post a question, and
 #: the terminal kind whose report may announce a PR (see ``slack_ux_moments``).
@@ -261,6 +279,14 @@ MARKER_MAX = 2
 #: card's row in the thread's plan; see :func:`silent_event`.
 SILENT_PLAN_KINDS = ("archived", "unblocked")
 
+#: The kind whose noteless events ``_fmt_heartbeat`` renders as ``None``, so
+#: ``_send_pings`` skips them too. With ``KAGE_SLACK_UX`` on, one opens a Slack
+#: card's row in the thread's plan, running, when the card has none yet: the
+#: worker's first automatic heartbeat, written on its first activity, is the
+#: earliest event of a run the notifier claims, since ``claimed`` and
+#: ``spawned`` are not among its kinds. See :func:`silent_event`.
+STARTED_KIND = "heartbeat"
+
 #: Kinds that settle a plan row past an earlier ``unblocked`` in the same
 #: batch: every kind ``slack_status.TASK_STATUS_BY_KIND`` maps to a status
 #: other than running, plus ``archived``. ``crashed`` and ``timed_out`` are
@@ -319,7 +345,7 @@ def rolling_line(kind: str, payload: object) -> str:
     being non-empty — an event that rolls must not fall through and settle the
     message just because its payload was thin.
     """
-    if kind == "heartbeat":
+    if kind in NOTE_KINDS:
         return progress_note(payload)
     if kind == "status":
         status = payload.get("status") if isinstance(payload, dict) else None
@@ -674,6 +700,41 @@ def _overtaken(notification: Any, ev: Any) -> bool:
     )
 
 
+def _noted_later(notification: Any, ev: Any) -> bool:
+    """Whether a heartbeat carrying a note follows this event in its batch."""
+    event_id = int(getattr(ev, "id", 0) or 0)
+    batch = getattr(notification, "d", None)
+    events = batch.get("events") if isinstance(batch, dict) else None
+    return any(
+        int(getattr(later, "id", 0) or 0) > event_id
+        and str(getattr(later, "kind", "") or "") == STARTED_KIND
+        and progress_note(getattr(later, "payload", None))
+        for later in events or ()
+    )
+
+
+async def _started(notification: Any, ev: Any) -> None:
+    """Open a Slack card's plan row, running, on a noteless heartbeat: see :data:`STARTED_KIND`.
+
+    Not for one replayed or overtaken in its batch (:func:`_overtaken`): the
+    later event opens the row settled. Nor for one a note follows in its
+    batch, which opens the row itself, in one post rather than a post and an
+    edit. Only with ``KAGE_SLACK_UX`` on for a Slack card, and never raises: it
+    runs inside the send loop.
+    """
+    try:
+        if _overtaken(notification, ev) or _noted_later(notification, ev):
+            return
+        sub = notification.sub
+        adapter = getattr(notification, "adapter", None)
+        plan = _slack_plan(_slack_quiet(sub))
+        if adapter is None or plan is None:
+            return
+        await plan.start_row(adapter, sub, str(getattr(notification, "title", "") or ""))
+    except Exception as exc:  # noqa: BLE001 — never fail a delivery on the plan
+        logger.debug("kanban progress: opening the plan row on a start failed: %s", exc)
+
+
 async def silent_event(notification: Any, ev: Any) -> None:
     """Move a Slack card's plan row on a kind upstream keeps silent.
 
@@ -688,10 +749,15 @@ async def silent_event(notification: Any, ev: Any) -> None:
     and never raises: it runs inside the send loop. An ``unblocked`` overtaken
     in its batch, not replayed, still settles the question it answered, which
     the later event would settle as unanswered; one posted for that later
-    event is newer than the unblock and left alone.
+    event is newer than the unblock and left alone. A noteless heartbeat
+    goes to :func:`_started` instead, and touches neither the question nor
+    the ask's reaction.
     """
     try:
         kind = str(getattr(ev, "kind", "") or "")
+        if kind == STARTED_KIND:
+            await _started(notification, ev)
+            return
         if kind not in SILENT_PLAN_KINDS:
             return
         overtaken = _overtaken(notification, ev)
@@ -837,7 +903,10 @@ async def deliver(
             result = result_line(kind, getattr(ev, "payload", None))
             shown = await _settle_plan_row(plan, adapter, sub, kind, result, title)
         if entry and entry["message_id"] and entry["lines"]:
-            settled = entry["lines"][-1:] if quiet else entry["lines"]
+            # A queued line says the card is waiting; once it settles that is
+            # stale, so the settled message keeps only the card's own notes.
+            notes = [line for line in entry["lines"] if line not in entry.get(QUEUED_LINES_KEY, ())]
+            settled = notes[-1:] if quiet else notes
             try:
                 await adapter.edit_message(
                     chat_id,
@@ -882,12 +951,16 @@ async def deliver(
 
     payload = getattr(ev, "payload", None)
     line = rolling_line(kind, payload) or message
+    if kind == QUEUED_KIND and not entry:
+        header = ""
     moments = _slack_moments(quiet)
     await _settle_question(moments, adapter, sub, kind, event_id)
     result = await _roll(
         adapter, sub, metadata, header, title, line, _moved_to(kind, payload),
         _slack_plan(quiet), event_id, tracked,
     )
+    if kind == QUEUED_KIND and tracked.get(key):
+        tracked[key].setdefault(QUEUED_LINES_KEY, []).append(line)
     # The whole note, not the clipped line: a url past the clip is cut whole.
     note = progress_note(payload, limit=0) if kind == "heartbeat" else ""
     await _pr_opened(moments, adapter, sub, note or line, result)

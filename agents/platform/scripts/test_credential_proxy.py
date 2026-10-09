@@ -9258,6 +9258,27 @@ class TwoForgeInstallTest(unittest.TestCase):
         with mock.patch.object(credential_proxy, "forge_registry", return_value=two):
             self.assertEqual("acme/infra", credential_proxy._hosted("acme/infra", "gitlab"))
 
+    def test_a_pin_is_one_repository_on_one_forge_however_the_paths_coincide(self):
+        # The pinned base names its host: on a broker serving GitHub and GitLab,
+        # `acme/infra` on each is a different repository with its own base, a
+        # nested GitLab path pins as the forge reads it, and `www.gitlab.com`
+        # is gitlab.com.
+        pins = credential_proxy.parse_pinned_bases(json.dumps([
+            {"repository": "https://github.com/acme/infra", "branch": "release"},
+            {"repository": "https://gitlab.com/acme/infra", "branch": "main"},
+            {"repository": "https://www.gitlab.com/acme/platform/fleet", "branch": "stable"},
+        ]))
+        self.assertEqual({
+            ("github.com", "acme/infra"): "release",
+            ("gitlab.com", "acme/infra"): "main",
+            ("gitlab.com", "acme/platform/fleet"): "stable",
+        }, pins)
+        pinned = credential_proxy.providers.pinned_base
+        self.assertEqual("release", pinned(pins, "github.com", "acme/infra"))
+        self.assertEqual("main", pinned(pins, "gitlab.com", "acme/infra"))
+        self.assertEqual("stable", pinned(pins, "gitlab.com", "acme/platform/fleet"))
+        self.assertIsNone(pinned(pins, "github.com", "acme/platform/fleet"))
+
     def _gitlab_only(self):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)

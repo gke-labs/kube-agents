@@ -163,7 +163,9 @@ ADDED_AFTER_THE_MOVE = [
     "chat-voice-failure-leads-with-fact",  # the front door's reply to a blocked card
     "upgrades-zonal-control-plane-outage-warned",  # upgrade-failure catalogue entry 11, the first scenario case
     "oobe-first-run-audits",  # the oobe job's first-run audits stage
+    "observability-watcher-scrape-state",  # the event watcher's scrape state, #2141
     "chat-fanout-fleet-restarts-rows",  # a fleet question fanned out one titled card per cluster
+    "backup-dr-cmek-selected-namespaces-probe",  # the gke-backup-dr skill sync
 ]
 
 # Admitted after the split, each by a pull request that cited the record
@@ -347,18 +349,18 @@ class SplitLostNothingTest(unittest.TestCase):
 # file edits this set in the same pull request, for the reason the sets above
 # are pinned.
 INJECT_LANE_EXCLUDED = [
-    "agent-kanban-smoke",  # #2039: grades kanban_create by the front door; the inject door addresses platform directly
-    "chat-voice-retry-says-it-is-retried",  # #2039: grades the front door's reply to a crashed card's wake; the inject door addresses platform directly
+    "agent-kanban-smoke",  # #2039: grades kanban_create by the front door and the specialist's answer folded back, which the door's thread never gets
+    "chat-voice-retry-says-it-is-retried",  # #2039: grades the front door's reply to a crashed card's wake; a card-wake replay runs on the api transport only
     "chat-voice-final-attempt-is-not-retried",  # the same for a card's last-attempt wake
-    "chat-voice-failure-leads-with-fact",  # #2039: grades the front door's reply to a blocked card's wake; same door
-    "chat-question-wake-stays-silent",  # #2039: grades the front door's silence on a posted question's wake; same door
+    "chat-voice-failure-leads-with-fact",  # #2039: grades the front door's reply to a blocked card's wake; same reason
+    "chat-question-wake-stays-silent",  # #2039: grades the front door's silence on a posted question's wake; same reason
     "chat-question-typed-answer-fresh-session",  # the same for a typed answer in a session the wake never reached
     "chat-question-click-answer-stays-silent",  # the same for an answer given by clicking the question's button
-    "chat-voice-ack-names-target",  # #2039: grades the front door's delegation ack; the inject door addresses platform directly
-    "chat-reset-history-names-the-command",  # the same for the front door's answer to a reset request
+    "chat-voice-ack-names-target",  # #2039: grades the front door's delegation ack with the specialist's answer after it, which the door's thread never gets
+    "chat-reset-history-names-the-command",  # #2039: grades the front door's answer to a reset request; excluded under cli, not yet graded on api
     "chat-routing-board-read",  # the same for the front door reading the board instead of filing a card
-    "chat-routing-fleet-question",  # the same for the front door routing a fleet question through kanban_create
-    "first-install-hello-running",  # #2039: grades the chat profile's onboarding greeting, which platform does not give
+    "chat-routing-fleet-question",  # the same as the ack: the answer is the specialist's, which the door's thread never gets
+    "first-install-hello-running",  # #2039: grades the chat profile's onboarding greeting; excluded under cli, not yet graded on api
     "first-install-hello-done",  # the same once the first-look scan has finished
     "chat-fanout-fleet-restarts-rows",  # #2039: grades the front door's ack and the fan-out under its one card; same door
 ]

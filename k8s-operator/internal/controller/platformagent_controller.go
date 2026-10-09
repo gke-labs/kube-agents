@@ -332,6 +332,12 @@ type PlatformAgentReconciler struct {
 	// supply; see rbac_selfcheck.go.
 	RBAC *RBACChecker
 
+	// agentProfilesUnreadable is set at setup when the role cannot read
+	// AgentProfiles (AgentProfileAccessDenied). The watch is skipped then, and
+	// the identity map renders no profiles rather than listing a kind whose
+	// informer would never sync.
+	agentProfilesUnreadable bool
+
 	// Recorder writes Events on the PlatformAgent. Nil records nothing, which
 	// is what tests and the golden harness supply (recordEvent).
 	//
@@ -538,6 +544,7 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 				"updates to this PlatformAgent will be rejected by the admission webhook until corrected",
 				"name", instance.Name, "namespace", instance.Namespace, "fields", gitProblemFields(&instance.Spec.Integration.IntegrationSpec))
 		}
+		r.recordIntegrationWarnings(instance)
 	}
 
 	// 1. Intercept Deletion
@@ -667,6 +674,12 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	if err != nil {
 		return ctrl.Result{}, err
 	}
+	// The gateway's annotation leaves out what only the broker reads, so a
+	// forge configuration change rolls the broker and not the gateway.
+	gatewayPolicyHash, err := getConfigMapHash(gatewayPolicyView(buildCredentialProxyPolicyConfigMap(instance)))
+	if err != nil {
+		return ctrl.Result{}, err
+	}
 
 	// 9b. Refuse a CR that mounts the broker's own volumes into the agent container.
 	//
@@ -790,7 +803,7 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	otlpEndpoint, otlpSource := r.resolveOTLPEndpoint(ctx, instance)
 	otlpDisabled := otlpSource == otlpSourceNone
 	netpolProf := r.resolveNetpolProfile(ctx, instance)
-	if err := r.reconcileWorkload(ctx, instance, configMapHash, fluentBitHash, settingsHash, proxyPolicyHash, agentPlugins, otlpEndpoint, otlpDisabled); err != nil {
+	if err := r.reconcileWorkload(ctx, instance, configMapHash, fluentBitHash, settingsHash, gatewayPolicyHash, agentPlugins, otlpEndpoint, otlpDisabled); err != nil {
 		return ctrl.Result{}, err
 	}
 
@@ -927,10 +940,14 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	// predicate's false negatives, a terminated pod still counted and an
 	// informer copy older than the pass's own apply, clear on a Deployment
 	// event the requeue does not need to wait for.
-	// gatewayDark shares it too: the discord-bot Secret is not watched, so
-	// its creation is invisible without a requeue, and the pass that renders
-	// the gateway once it exists has to be a pass that happens.
-	if a2aNext && (!a2aState.done || a2aState.gatewayHeld || a2aState.gatewayDark) {
+	// gatewayDark shares it too: a backend Secret is not watched, so its
+	// creation is invisible without a requeue, and the pass that renders the
+	// gateway (or scales a darkened one back to a replica) once it exists has
+	// to be a pass that happens. gatewayWaking rides the same term: the
+	// A2AGateway condition is kept until the scaled-up replica is ready, and
+	// the pass that clears it should not depend on the Deployment's status
+	// event alone.
+	if a2aNext && (!a2aState.done || a2aState.gatewayHeld || a2aState.gatewayDark || a2aState.gatewayWaking) {
 		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
 	}
 
@@ -3073,12 +3090,15 @@ type splitWorkloadStatus struct {
 // rather than reporting a readiness it could not check. NotFound is not an error here: it
 // is the ordinary state between applying the objects and the API server serving them back,
 // and it reads as not-ready, which is what it is.
-// The second result is non-empty when a next install's A2A gateway is
-// withheld for want of a chat backend (a2aGatewayBackend): the remedy text
-// the status writer publishes as the A2AGateway condition. A withheld gateway
-// is left out of the list rather than counted as not ready, because it is
-// absent on purpose and Ready would otherwise never be true on such an
-// install (#1660, option 1).
+// The second result is non-empty when a next install's A2A gateway runs
+// nothing for want of a chat backend (a2aGatewayBackend), withheld or scaled
+// to zero: the remedy text the status writer publishes as the A2AGateway
+// condition. Such a gateway is left out of the list rather than counted as
+// not ready, because it runs nothing on purpose and Ready would otherwise
+// never be true on such an install (#1660, option 1; #2481). It is also
+// non-empty while a darkened gateway is coming back (a2a.gatewayWaking) and
+// has no ready replica, carrying a2aGatewayWakingMessage; that gateway IS
+// counted, as the not-ready workload it is.
 func (r *PlatformAgentReconciler) readSplitWorkloads(ctx context.Context, agent *agentv1alpha1.PlatformAgent, a2a a2aProvisionState) ([]splitWorkloadStatus, string, error) {
 	shell := &appsv1.StatefulSet{}
 	shellName := shellSandboxName(agent)
@@ -3191,7 +3211,18 @@ func (r *PlatformAgentReconciler) readSplitWorkloads(ctx context.Context, agent 
 			} else {
 				workloads = append(workloads, splitWorkloadStatus{name: gatewayName, kind: "Deployment", ready: 0})
 			}
+		} else if a2a.gatewayDark {
+			// Present at zero replicas, scaled there for want of a backend:
+			// the same report as the absent case above, since what it runs
+			// is the same nothing.
+			gatewayDark = a2a.gatewayDarkReason
 		} else {
+			// Coming back from dark: the condition stays until a replica is
+			// ready, by this read rather than the render's, so a pod that
+			// turned ready since the render clears it on this pass.
+			if a2a.gatewayWaking && gateway.Status.ReadyReplicas == 0 {
+				gatewayDark = a2aGatewayWakingMessage
+			}
 			workloads = append(workloads, splitWorkloadStatus{
 				name: gatewayName, kind: "Deployment", ready: gateway.Status.ReadyReplicas,
 			})
@@ -3214,21 +3245,41 @@ func busProvisioned(agent *agentv1alpha1.PlatformAgent) bool {
 // *Current answer so a quiet pass stays quiet (#1392).
 //
 // a2aGatewayConditionCurrent reports whether the CR's A2AGateway condition
-// already says dark, where "" means the condition is to be absent.
+// already says what this pass found, where "" means the condition is to be
+// absent. The reason follows the message (a2aGatewayConditionReason).
 func a2aGatewayConditionCurrent(agent *agentv1alpha1.PlatformAgent, dark string) bool {
 	existing := meta.FindStatusCondition(agent.Status.Conditions, a2aGatewayConditionType)
 	if dark == "" {
 		return existing == nil
 	}
 	return existing != nil && existing.Status == metav1.ConditionFalse &&
-		existing.Reason == a2aGatewayDarkReason && existing.Message == dark
+		existing.Reason == a2aGatewayConditionReason(dark) && existing.Message == dark
 }
 
-// setA2AGatewayCondition writes the withheld-gateway condition on the
+// a2aGatewayConditionReason is the reason that goes with a condition
+// message: WaitingForReplica for the way back from dark, NoChatBackend for
+// every remedy a2aGatewayBackend writes.
+func a2aGatewayConditionReason(dark string) string {
+	if dark == a2aGatewayWakingMessage {
+		return a2aGatewayWakingReason
+	}
+	return a2aGatewayDarkReason
+}
+
+// a2aGatewayConditionStands reports whether the CR carries the A2AGateway
+// condition, dark or on its way back. The way back from dark reads it to
+// keep the condition until the scaled-up gateway is ready (gatewayWaking).
+func a2aGatewayConditionStands(agent *agentv1alpha1.PlatformAgent) bool {
+	existing := meta.FindStatusCondition(agent.Status.Conditions, a2aGatewayConditionType)
+	return existing != nil && existing.Status == metav1.ConditionFalse &&
+		(existing.Reason == a2aGatewayDarkReason || existing.Reason == a2aGatewayWakingReason)
+}
+
+// setA2AGatewayCondition writes the dark-gateway condition on the
 // EventWatcher pattern: present while the state holds, removed the pass it
 // stops holding. Not Degraded: the install configured no chat backend and
-// the rest of the stack is up; the message says what would render the
-// gateway.
+// the rest of the stack is up; the message says what would run the gateway,
+// or, on the way back, that it is waiting for the replica.
 func setA2AGatewayCondition(agent *agentv1alpha1.PlatformAgent, dark string, now metav1.Time) {
 	if dark == "" {
 		meta.RemoveStatusCondition(&agent.Status.Conditions, a2aGatewayConditionType)
@@ -3237,7 +3288,7 @@ func setA2AGatewayCondition(agent *agentv1alpha1.PlatformAgent, dark string, now
 	meta.SetStatusCondition(&agent.Status.Conditions, metav1.Condition{
 		Type:               a2aGatewayConditionType,
 		Status:             metav1.ConditionFalse,
-		Reason:             a2aGatewayDarkReason,
+		Reason:             a2aGatewayConditionReason(dark),
 		Message:            dark,
 		ObservedGeneration: agent.Generation,
 		LastTransitionTime: now,
@@ -3367,8 +3418,13 @@ func setBusProvisionedCondition(agent *agentv1alpha1.PlatformAgent, want bool, j
 // pass whose conditions already match writes nothing.
 func (r *PlatformAgentReconciler) syncA2AConditions(ctx context.Context, agent *agentv1alpha1.PlatformAgent, a2a a2aProvisionState) error {
 	dark := ""
-	if a2a.gatewayDark {
+	switch {
+	case a2a.gatewayDark:
 		dark = a2a.gatewayDarkReason
+	case a2a.gatewayWaking:
+		// The render's ready count, not a fresh read: this writer reads no
+		// workloads, and the requeue brings the pass that clears it.
+		dark = a2aGatewayWakingMessage
 	}
 	want := wantBusProvisioned(agent, a2a)
 	verifierNotReady, verifierKnown := r.a2aVerifierNotReady(ctx, agent)
@@ -3521,7 +3577,7 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 			condMsg = "Gateway, shell sandbox, credential broker, NATS, auth callout, bus provisioning and A2A gateway are all ready"
 			if a2aGatewayDark != "" {
 				condMsg = "Gateway, shell sandbox, credential broker, NATS, auth callout and bus provisioning are all ready; " +
-					"the A2A gateway is not rendered (no chat backend, see the A2AGateway condition)"
+					"the A2A gateway is not running (no chat backend, see the A2AGateway condition)"
 			}
 		}
 	case errWorkload == nil:
@@ -4499,6 +4555,31 @@ func (r *PlatformAgentReconciler) updateStatusDegraded(ctx context.Context, agen
 	return r.Status().Update(ctx, agent)
 }
 
+// conditionReasonIntegrationWarning is the Event reason for a declaration that
+// is valid but does nothing.
+const conditionReasonIntegrationWarning = "IntegrationWarning"
+
+// recordIntegrationWarnings writes each of the integration's Warnings() as a
+// Warning Event on the PlatformAgent. Admission returns the same warnings, but
+// the chart ships the webhook off, and on such an install a credentialed forge
+// the broker is not given would otherwise leave no trace: the status is Ready,
+// because nothing is invalid. Each warning names a field path and a provider,
+// never a repository value, so nothing a clone URL carries reaches an Event.
+// The API server aggregates a repeated Event, so writing it on every
+// reconcile raises its count rather than adding one per pass.
+func (r *PlatformAgentReconciler) recordIntegrationWarnings(agent *agentv1alpha1.PlatformAgent) {
+	if agent.Spec.Integration == nil {
+		return
+	}
+	resolved, err := agent.Spec.Integration.ResolveGit()
+	if err != nil {
+		return
+	}
+	for _, warning := range resolved.Warnings() {
+		r.recordEvent(agent, corev1.EventTypeWarning, conditionReasonIntegrationWarning, warning)
+	}
+}
+
 // recordEvent writes an Event on obj through the manager's recorder, and
 // nothing when there is none: tests and the golden harness build the
 // reconciler without one, and no pass depends on an Event having been
@@ -4583,6 +4664,49 @@ func (r *PlatformAgentReconciler) SetupWithManager(mgr ctrl.Manager) error {
 			logf.Log.WithName("platformagent-controller").Info(
 				"AgentPlugin CRD is not installed on cluster; skipping AgentPlugin watch. " +
 					"Restart the operator after installing the CRD to enable plugin reconciliation.")
+		}
+	}
+
+	// AgentProfiles feed the identity map, so a profile created, edited or
+	// deleted re-renders it. Registered only when the CRD is installed, like
+	// AgentPlugin's watch above.
+	profileGVK := agentv1alpha1.GroupVersion.WithKind("AgentProfile")
+	if mgr != nil && mgr.GetRESTMapper() != nil {
+		_, err := mgr.GetRESTMapper().RESTMapping(profileGVK.GroupKind(), profileGVK.Version)
+		denied := AgentProfileAccessDenied(r.RBAC)
+		watch, unreadable := agentProfileWatchPlan(err, denied)
+		switch {
+		case unreadable:
+			r.agentProfilesUnreadable = true
+			logf.Log.WithName("platformagent-controller").Info(
+				"The operator's role cannot read AgentProfiles; skipping the AgentProfile watch and rendering no profile identities. Restart the operator after applying the current ClusterRole.",
+				"denied", denied)
+		case watch:
+			bld = bld.Watches(
+				&agentv1alpha1.AgentProfile{},
+				handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []reconcile.Request {
+					return enqueueAgentsInNamespace(ctx, obj.GetNamespace())
+				}),
+				// The AgentProfile reconciler writes status; only spec
+				// changes, creates and deletes change the map.
+				builder.WithPredicates(predicate.GenerationChangedPredicate{}),
+			).Watches(
+				// Whether a profile gets a map entry also depends on its
+				// operator-created ServiceAccount (a foreign one under that
+				// name keeps it out: agentProfileServiceAccountIsForeign),
+				// and that ServiceAccount is the profile's, not the agent's,
+				// so Owns() above never fires for it.
+				&corev1.ServiceAccount{},
+				handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []reconcile.Request {
+					return enqueueAgentsInNamespace(ctx, obj.GetNamespace())
+				}),
+				builder.WithPredicates(predicate.NewPredicateFuncs(func(obj client.Object) bool {
+					return strings.HasPrefix(obj.GetName(), agentProfileServiceAccountPrefix)
+				})),
+			)
+		default:
+			logf.Log.WithName("platformagent-controller").Info(
+				"AgentProfile CRD is not installed on cluster; skipping AgentProfile watch.")
 		}
 	}
 
@@ -5191,4 +5315,18 @@ func pluginStatusEqual(a, b *agentv1alpha1.AgentPluginStatus) bool {
 		}
 	}
 	return true
+}
+
+// agentProfileWatchPlan decides, once at setup, whether the PlatformAgent
+// controller watches AgentProfiles and whether the identity map may list them.
+// A role that cannot read them makes them unreadable whether or not the CRD is
+// installed yet: the denial is RBAC's answer alone, and a CRD applied after
+// boot would otherwise send the render's cached List into an informer that
+// never syncs, blocking the reconcile worker. With the role able to read
+// them, the kind is watched when the CRD is installed.
+func agentProfileWatchPlan(mapErr error, denied []string) (watch, unreadable bool) {
+	if len(denied) > 0 {
+		return false, true
+	}
+	return mapErr == nil, false
 }

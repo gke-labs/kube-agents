@@ -13,7 +13,7 @@ This repository contains the Kubernetes Agentic Harness (`kube-agents`). It is a
   - `contributor/`: The contributor-agent protocol: the claim/PR/review/escalation loop for external bots (e.g. Kyber, Codebot Robot) coordinating over GitHub alone. Not a runtime blueprint; not shipped in the images.
 - `.agents/skills/`: Repository-level skills, not shipped in the agent images — review skills (adversarial change review, security audits, docs-drift, skill quality) run against pull requests and clusters, with `review-preflight` running the pre-PR set of them in a context that did not write the change, plus the `install-kube-agents`/`uninstall-kube-agents`/`upgrade-kube-agents` lifecycle skills that drive the repository's installer scripts.
 - `.agents/rules/`: Repository-level rules an agent follows, one file per family: the code (`core_engineering.md`), workflows (`github_actions.md`), the pre-PR passes (`pre_pr_review.md`), eval-driven development (`eval_driven_development.md`), docs (`documentation.md`).
-- `a2a/`: Go module for the agent-to-agent bus — wire-protocol library and `a2a` topics CLI per `docs/designs/spec-a2a-payloads.md`, plus agent profiles, persona, gateway and auth-callout.
+- `a2a/`: Go module for the agent-to-agent bus — wire-protocol library and `a2a` topics CLI per `docs/designs/spec-a2a-payloads.md`, plus persona, gateway and auth-callout.
 - `charts/`: Canonical Helm charts (`kube-agents`) for deploying the Kube-Agents operator and profiles.
 - `terraform/`: Companion reusable Terraform modules (`gke-cluster`, `kube-agents-iam`, `kube-agents-scope-resolver`, `chat-pubsub`, `github-minter`, `gke-backup-plan`, `drift-pubsub`) for infrastructure provisioning, plus `examples/full-install/`, the single-apply composition that installs the Helm chart on top.
 - `deploy/`: Deployment infrastructure code (Dockerfile, Kustomize bases, shared runtime assets).
@@ -149,7 +149,7 @@ the assignee is the claim; do not apply `status:` labels to issues in this repos
 
 - Skills live under `agents/platform/skills/` (Platform Agent) and `agents/cluster/skills/` (Cluster Agent); each holds a `SKILL.md` for an AI agent.
 - Place a skill by persona: fleet, provisioning and GitOps-write skills go to the Platform Agent; read-only, single-cluster runtime debugging to the Cluster Agent.
-- `agents/platform/skills/gke-*` are copies of `google/skills` that `scripts/sync-upstream-skills.py` overwrites wholesale, so the prefix is reserved and a direct edit lasts until the next sync. Put a `SKILL.md` change in its `SKILL_SUBSTITUTIONS` or `SKILL_FOOTERS` and make the same edit by hand; a rerun refreshes every skill, or aborts on a drifted entry.
+- `agents/platform/skills/gke-*` (a reserved prefix) are copies of `google/skills`. One with an `upstream.lock` in `agents/platform/skill-overlays/<skill>/` is edited in place and recorded with `make skills-refresh`; the rest are overwritten by `scripts/sync-upstream-skills.py`, so also put their changes in its `SKILL_SUBSTITUTIONS` or `SKILL_FOOTERS`.
 
 ## Engineering Rules
 
@@ -410,16 +410,17 @@ high-severity finding just under that bar, marked as such. `/review all` re-read
 review's width and adds findings it believes are real without being sure. The `agent:ignore` label
 opts a pull request out and outranks both.
 
-**A human reviewer is requested only once its check passes.** The bot posts an `AI Review` check
-run, and `.github/workflows/auto_request_review.yml` waits for it to go green before assigning
-anyone from `.github/auto_request_review.yml`. A first review is green only if it found nothing; a
-later review of it holds the check on 🔴 High alone, with 🟠 Medium posted, not held
-([the cases](docs/pull-request-workflow.md#what-the-check-means)). A green
-pass after `/review` is what reaches a reviewer. Exceptions: a pull request opened by a bot is
-assigned as soon as the check completes, whatever the conclusion, because Dependabot cannot re-run `/review` on itself; and an
-owner, member, or collaborator can comment `/request-review` (at the start of the comment) to
-assign a reviewer immediately — the override for a finding you have answered but disagree with, or
-for a review that never arrived. Nothing here changes who is picked; that is still the config file.
+**A human reviewer is requested once its check passes, or at the bot's third round.** The bot posts
+an `AI Review` check run, and `.github/workflows/auto_request_review.yml` assigns someone from
+`.github/auto_request_review.yml` when it goes green — a first review is green only if it found
+nothing; a later review of it holds the check on 🔴 High alone, with 🟠 Medium posted, not held
+([the cases](docs/pull-request-workflow.md#what-the-check-means)) — or, once, when the bot has
+reviewed three commits and the check is still grey. The first request posts a hand-off comment:
+from there the reviewer decides, and you reply in the threads rather than asking for another round.
+Exceptions: a pull request opened by a bot is assigned as soon as the check completes, because
+Dependabot cannot re-run `/review`; and an owner, member, or collaborator can comment
+`/request-review` (at the start of the comment) to assign a reviewer immediately — for a missing
+review or a finding you dispute.
 
 **What agents must do.** After creating a pull request, tell the user the bot review is on its way
 and **offer to wait for it** instead of reporting the work as finished — unless you opened a draft,

@@ -9,8 +9,9 @@ step 6b makes no kubectl call at all. The positive half is pinned by the same
 lifting technique tests/test_ci_deploy_rc_images.py uses: section 4 run with
 the flag set names the six next-stack images and fills the operator.extraEnv
 values the release expands (the five image overrides, the inject door's flag,
-and the three settings of the bridge the operator renders: its image, its
-concurrency and its executor pin), the Cloud Build's `a2a` and `a2a-bridge`
+and two settings of the bridge the operator renders: its image and its
+concurrency; its executor is left to the bridge's default, api, which the
+start-line wait requires), the Cloud Build's `a2a` and `a2a-bridge`
 steps run with `docker` stubbed build and push those six in order with the
 bridge FROM this build's platform image, the three guards (release-candidate
 path, Prow run with no pull request that is not a next-lane job, the
@@ -371,9 +372,9 @@ class FlagSetIsNextTest(unittest.TestCase):
             "operator.extraEnv[5].value=true",
         ]
         # The bridge the operator renders under next (#2592): its image (this
-        # build's), the concurrency section 2b admitted, and the executor pin,
-        # each under the name the operator reads it by.
-        consts = constants()
+        # build's) and the concurrency section 2b admitted, each under the name
+        # the operator reads it by. No executor setting: the lane runs the
+        # bridge's shipped default, api, as a customer install does.
         expected += [
             "--set-string",
             f"operator.extraEnv[6].name={go_constant(_A2A_BRIDGE, 'a2aBridgeImageEnvVar')}",
@@ -383,12 +384,13 @@ class FlagSetIsNextTest(unittest.TestCase):
             f"operator.extraEnv[7].name={go_constant(_A2A_BRIDGE, 'a2aBridgeConcurrencyOperatorEnvVar')}",
             "--set-string",
             f"operator.extraEnv[7].value={_BRIDGE_CONCURRENCY}",
-            "--set-string",
-            f"operator.extraEnv[8].name={go_constant(_A2A_BRIDGE, 'a2aBridgeExecutorOperatorEnvVar')}",
-            "--set-string",
-            f"operator.extraEnv[8].value={consts['BRIDGE_EXECUTOR_PINNED']}",
         ]
         self.assertEqual(args, expected)
+        # Nothing names the executor setting, under any index: set to anything,
+        # the operator renders BRIDGE_EXECUTOR and the lane stops measuring the
+        # default a customer runs.
+        executor_setting = go_constant(_A2A_BRIDGE, "a2aBridgeExecutorOperatorEnvVar")
+        self.assertFalse([a for a in args if executor_setting in a], args)
         # The chart renders the value the array names, last in the container's env.
         self.assertIn(".Values.operator.extraEnv", text(_OPERATOR_TEMPLATE))
         # And the release expands the array.
@@ -414,16 +416,16 @@ class FlagSetIsNextTest(unittest.TestCase):
         self.assertEqual(consts["A2A_INJECT_NAME"], "${PLATFORM_AGENT_CR_NAME}-a2a-inject")
         self.assertEqual(consts["A2A_INJECT_TOKEN_KEY"], go_constant(_A2A_MANIFESTS, "a2aInjectTokenKey"))
         # The rendered bridge: the container the log gate reads, the image name
-        # step 4 pushes under, and the three operator settings step 5 sets, each
-        # the operator's own spelling and each read from the operator's own
-        # environment rather than the CR's.
+        # step 4 pushes under, the two operator settings step 5 sets and the one
+        # the failure diagnosis names, each the operator's own spelling and each
+        # read from the operator's own environment rather than the CR's.
         self.assertEqual(consts["BRIDGE_SIDECAR_NAME"], go_constant(_A2A_BRIDGE, "a2aBridgeContainerName"))
         self.assertEqual(consts["A2A_BRIDGE_IMAGE_NAME"], go_constant(_A2A_BRIDGE, "a2aBridgeImageName"))
         bridge_go = text(_A2A_BRIDGE)
         for const, go_name in (
             ("A2A_BRIDGE_IMAGE_ENV_VAR", "a2aBridgeImageEnvVar"),
             ("A2A_BRIDGE_CONCURRENCY_ENV_VAR", "a2aBridgeConcurrencyOperatorEnvVar"),
-            ("A2A_BRIDGE_EXECUTOR_ENV_VAR", "a2aBridgeExecutorOperatorEnvVar"),
+            ("A2A_BRIDGE_EXECUTOR_OPERATOR_ENV_VAR", "a2aBridgeExecutorOperatorEnvVar"),
         ):
             with self.subTest(const=const):
                 self.assertEqual(consts[const], go_constant(_A2A_BRIDGE, go_name))
@@ -451,9 +453,10 @@ class FlagSetIsNextTest(unittest.TestCase):
         self.assertIn("slog.New(slog.NewJSONHandler(os.Stderr, nil))", main_go)
         self.assertEqual(consts["BRIDGE_CONSUMING_LOG_MSG"], '"msg":"hermes bridge consuming"')
         self.assertEqual(consts["BRIDGE_CONSUMING_LOG_PROFILE"], f'"profile":"{go_constant(_BRIDGE_MAIN, "defaultProfile")}"')
-        # The lane pins the subprocess executor, and the start line is where the
-        # deploy proves the pin took: the variable the operator renders the pin
-        # into is the one the bridge reads, the value is one it accepts, and the
+        # The lane runs the bridge's default executor, and the start line is
+        # where the deploy proves the default resolved to api: the variable the
+        # operator would render a setting into is the one the bridge reads, the
+        # expected value is the bridge's own name for the api executor, and the
         # field it logs the choice under is the one the wait greps.
         self.assertEqual(go_constant(_A2A_MANIFESTS, "a2aBridgeExecutorEnvVar"), go_constant(_BRIDGE_MAIN, "executorEnv"))
         # The operator spells the rest of the bridge's env itself too, since it
@@ -470,13 +473,29 @@ class FlagSetIsNextTest(unittest.TestCase):
                 self.assertIn(f'"{bridge_name}"', main_go, f"the bridge no longer reads {bridge_name}")
         self.assertEqual(go_constant(_A2A_MANIFESTS, "a2aBridgeConcurrencyEnvVar"), "BRIDGE_CONCURRENCY")
         self.assertIn('"BRIDGE_CONCURRENCY"', main_go, "the bridge no longer reads BRIDGE_CONCURRENCY")
-        self.assertEqual(consts["BRIDGE_EXECUTOR_PINNED"], go_constant(_BRIDGE_API_GO, "ExecutorCLI"))
+        self.assertEqual(consts["BRIDGE_EXECUTOR_EXPECTED"], go_constant(_BRIDGE_API_GO, "ExecutorAPI"))
         # The operator admits only these two spellings into BRIDGE_EXECUTOR and
         # drops anything else as unset, so each must be the bridge's own.
         self.assertEqual(go_constant(_A2A_BRIDGE, "a2aBridgeExecutorCLI"), go_constant(_BRIDGE_API_GO, "ExecutorCLI"))
         self.assertEqual(go_constant(_A2A_MANIFESTS, "a2aBridgeExecutorAPI"), go_constant(_BRIDGE_API_GO, "ExecutorAPI"))
         self.assertIn('"executor", b.cfg.Executor)', text(_BRIDGE_GO))
-        self.assertEqual(consts["BRIDGE_CONSUMING_LOG_EXECUTOR"], f'"executor":"{consts["BRIDGE_EXECUTOR_PINNED"]}"')
+        self.assertEqual(consts["BRIDGE_CONSUMING_LOG_EXECUTOR"], f'"executor":"{consts["BRIDGE_EXECUTOR_EXPECTED"]}"')
+        # Why the default is api on this lane: unset, the bridge picks api when
+        # it carries the pod's API server key, and the operator sets that key on
+        # the rendered bridge itself (the loopback bearer), rather than copying
+        # the agent's, so no plugin env can switch it to cli (#2753). The Go
+        # tests hold the behaviour (TestBridgeExecutorDefault in
+        # a2a/cmd/hermes-bridge, and TestAPluginsAPIServerKeyDoesNotReachTheBridge
+        # in the operator); these pin the names they rely on.
+        self.assertEqual(go_constant(_BRIDGE_MAIN, "apiServerKeyEnv"), go_constant(_A2A_MANIFESTS, "a2aBridgeAPIServerKeyEnvVar"))
+        own = text(_A2A_BRIDGE)
+        own = own[own.index("func a2aBridgeOwnEnv") :]
+        own = own[: own.index("\n}\n")]
+        self.assertIn(
+            "{Name: a2aBridgeAPIServerKeyEnvVar, Value: loopbackAgentAPIKey}",
+            own,
+            "the rendered bridge must carry the API server key, or it falls back to cli",
+        )
         self.assertIn(
             '| grep -F "${BRIDGE_CONSUMING_LOG_MSG}" | grep -F "${BRIDGE_CONSUMING_LOG_PROFILE}" | grep -F "${BRIDGE_CONSUMING_LOG_EXECUTOR}" |',
             text(_CI_DEPLOY),

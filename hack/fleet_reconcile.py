@@ -26,8 +26,8 @@ change is seeded-b's exclusion re-stamp is `converged`, decided on the fields
 that changed, not the address.
 
 A run never starts a project it cannot finish inside its budget, and stops
-when main's fleet tree is no longer the one it checked out, so two runs at
-different commits never apply over each other. `--report` writes
+when main's fleet tree is no longer the one it checked out, so two runs applying
+different stacks never apply over each other. `--report` writes
 fleet-reconcile.json (mode, commit, tree, per-project outcomes with times, a
 summary), under $ARTIFACTS when Prow sets it, for the CI health bot
 (scripts/eval_dashboard/periodics.py); each applied project also gets
@@ -37,6 +37,7 @@ summary), under $ARTIFACTS when Prow sets it, for the CI health bot
 import argparse
 import atexit
 import collections
+import hashlib
 import json
 import os
 import pathlib
@@ -147,6 +148,14 @@ DEFAULT_WORKERS = 1
 WORKER_DRAIN_SECONDS = INTERRUPT_GRACE_SECONDS + 30
 WORKER_JOIN_STEP_SECONDS = 0.2
 FLEET_SUBDIR = "bench/tf/fleet"
+# The files that change what a run applies: the stack and its lock file, and
+# the allowlist the inspection reads. README.md and fixtures.json live beside
+# them and tofu never reads them, so they do not move the fleet tree: a
+# docs-only merge neither stops a running reconcile nor needs one. A new input
+# kind (a tfvars file, a templatefile source) goes here, into the postsubmit's
+# run_if_changed in oss-test-infra, and into docs/ci-pool-projects.md 6.2.
+FLEET_INPUT_SUFFIXES = (".tf", ".hcl")
+FLEET_INPUT_NAMES = ("reconcile-allow.json",)
 GIT_TIMEOUT_SECONDS = 120
 # Prow's identifiers for the build, kept in the report and the markers.
 BUILD_ID_ENV = "BUILD_ID"
@@ -213,7 +222,17 @@ REASON_CEILING_INIT = "did not finish within %ds: its init was cut after %ds que
 REASON_RUNNER = "could not run tofu (%s: %s)"
 REASON_NOT_REACHED_BUDGET = "not started: %ds left in the run's budget, under the %ds per-project ceiling; the next run takes it"
 REASON_NOT_REACHED_BUDGET_MARK = "left in the run's budget"
-REASON_NOT_REACHED_MOVED = "not started: bench/tf/fleet on %s is now %s and this run applies %s; the next run takes it"
+REASON_NOT_REACHED_MOVED = "not started: the fleet stack under bench/tf/fleet on %s is now %s and this run applies %s; the next run takes it"
+REASON_NOT_REACHED_MOVED_AWAY = "not started: bench/tf/fleet on %s no longer holds the stack this run applies (%s); the next run takes it"
+# Appended to a definite no-stack reading at the first check, and only there: a
+# fetch that failed says nothing about the checkout or the ref.
+HINT_NO_STACK = "not a kube-agents checkout, or the wrong ref"
+# How git's bytes are decoded and the hash input re-encoded: the same encoding
+# and error handler on both sides, whatever the process locale, so a path git
+# prints that is not UTF-8 survives the round trip and two processes hash one
+# tree alike.
+GIT_TEXT_ENCODING = "utf-8"
+GIT_TEXT_ERRORS = "surrogateescape"
 REASON_NOT_REACHED_BUSY = "not free in Boskos before the run's budget ran out; the next run takes it"
 REASON_NOT_REACHED_TERMINATED = "not started: the run was terminated; the next run takes it"
 REASON_NOT_REACHED_RUN_ERROR = "not started: the run stopped on an error (%s); the next run takes it"
@@ -711,18 +730,49 @@ def pool_size(ci_deploy_script=fixture_state.CI_DEPLOY_SCRIPT):
 
 
 def git_output(args):
-    """stdout of `git <args>` in the repository, stripped; ReconcileError on a failure."""
+    """stdout of `git <args>` in the repository, its trailing newline dropped;
+    ReconcileError on a failure. Decoded here, not by text mode: text mode
+    also folds CR and CRLF into LF, and a path git prints must arrive as the
+    bytes it has (surrogateescape carries one that is not UTF-8)."""
     try:
-        result = subprocess.run(["git", "-C", str(REPO_ROOT)] + list(args), capture_output=True, text=True, timeout=GIT_TIMEOUT_SECONDS)
+        result = subprocess.run(["git", "-C", str(REPO_ROOT)] + list(args), capture_output=True, timeout=GIT_TIMEOUT_SECONDS)
     except (OSError, subprocess.SubprocessError) as exc:
         raise ReconcileError("git %s: %s" % (" ".join(args), exc))
     if result.returncode != 0:
-        raise ReconcileError("git %s exited %d: %s" % (" ".join(args), result.returncode, _tail(result.stderr)))
-    return result.stdout.strip()
+        raise ReconcileError("git %s exited %d: %s" % (" ".join(args), result.returncode, _tail(result.stderr.decode(GIT_TEXT_ENCODING, GIT_TEXT_ERRORS))))
+    return result.stdout.decode(GIT_TEXT_ENCODING, GIT_TEXT_ERRORS).rstrip("\n")
 
 
 def _iso(epoch):
     return time.strftime(ISO_UTC_FORMAT, time.gmtime(epoch))
+
+
+def is_fleet_input(path):
+    """Whether a path under the fleet directory is one of the stack's inputs."""
+    name = path.rsplit("/", 1)[-1]
+    return name.endswith(FLEET_INPUT_SUFFIXES) or name in FLEET_INPUT_NAMES
+
+
+class NoStackError(ReconcileError):
+    """A rev git answered for whose bench/tf/fleet holds no stack input."""
+
+
+def fleet_tree(rev):
+    """A hash over the stack's inputs under FLEET_SUBDIR at `rev`: each input's
+    mode, blob and path from `git ls-tree`, NUL between entries as git gives
+    them (the one byte a path cannot hold, so no two trees share an input), so
+    a change to any of them moves it and a change to anything else there does
+    not. A rev with no inputs there
+    raises NoStackError, never a hash: at the run's first check that is a
+    configuration error that fails the run; later in the run it means main
+    has moved away from the stack and the run stops."""
+    # -z: NUL-separated entries with the path unquoted, so a non-ASCII name is
+    # still matched by its suffix, and a newline inside a name stays inside it.
+    listing = git_output(["ls-tree", "-r", "-z", "--full-tree", rev, "--", FLEET_SUBDIR])
+    lines = sorted(entry for entry in listing.split("\0") if "\t" in entry and is_fleet_input(entry.split("\t", 1)[1]))
+    if not lines:
+        raise NoStackError("no stack inputs (%s, %s) under %s at %s" % ("/".join(FLEET_INPUT_SUFFIXES), "/".join(FLEET_INPUT_NAMES), FLEET_SUBDIR, rev))
+    return hashlib.sha256("\0".join(lines).encode(GIT_TEXT_ENCODING, GIT_TEXT_ERRORS)).hexdigest()
 
 
 class Run:
@@ -803,31 +853,49 @@ class Run:
 
     def require_main_readable(self):
         """The first read of `main_ref`, before anything is leased: a ref git
-        cannot fetch is a configuration error, not "main has not moved"; a
+        cannot fetch, or one with no stack under it, is a configuration error,
+        not "main has not moved"; a
         failure later in the run is a warning the report carries."""
         if not self.main_ref:
             return
-        moved = self._main_moved(force=True)
+        moved = self._main_moved(first=True)
         if self.main_check_error:
             raise ReconcileError("--stop-when-moved %s: %s" % (self.main_ref, self.main_check_error))
         if moved:
             self._stop = moved
 
-    def _main_moved(self, force=False):
+    def _main_moved(self, first=False):
         if not self.main_ref:
             return None
         now = clock()
-        if not force and self._last_main_check is not None and now - self._last_main_check < MAIN_CHECK_INTERVAL_SECONDS:
+        if not first and self._last_main_check is not None and now - self._last_main_check < MAIN_CHECK_INTERVAL_SECONDS:
             return None
         self._last_main_check = now
         remote, _, branch = self.main_ref.partition("/")
         try:
             if self.fleet_tree is None:
-                self.fleet_tree = git_output(["rev-parse", "HEAD:%s" % FLEET_SUBDIR])
+                try:
+                    self.fleet_tree = fleet_tree("HEAD")
+                except NoStackError as exc:
+                    # The checkout's own tree, not main's: a definite reading,
+                    # fatal at the first check.
+                    self.main_check_error = "this checkout: %s (%s)" % (exc, HINT_NO_STACK)
+                    return None
             # No --depth: a depth-limited fetch marks a full clone shallow,
             # and a hand run with this flag uses the operator's own checkout.
             git_output(["fetch", "--quiet", remote, branch])
-            current = git_output(["rev-parse", "FETCH_HEAD:%s" % FLEET_SUBDIR])
+            try:
+                current = fleet_tree("FETCH_HEAD")
+            except NoStackError as exc:
+                if first:
+                    # A definite reading, not a failed one: no warning here;
+                    # require_main_readable makes it the fatal configuration error.
+                    self.main_check_error = "%s (%s)" % (exc, HINT_NO_STACK)
+                    return None
+                # The fetch answered and the tree holds no stack: main has
+                # moved to a state this run must not apply over, a stop.
+                self.main_moved = True
+                return REASON_NOT_REACHED_MOVED_AWAY % (self.main_ref, self.fleet_tree)
         except ReconcileError as exc:
             # Not knowing is not the same as having moved: the run goes on
             # and tries again at the next check, and the report says so.
@@ -1174,19 +1242,25 @@ def _run_workers(worker, count):
             flag.set()
 
     threads = [threading.Thread(target=guarded, args=(flag,), name="fleet-reconcile-%d" % i, daemon=True) for i, flag in enumerate(done)]
-    for thread in threads:
-        thread.start()
+    started_flags = []
     try:
+        boskos_pool._hold_signals(True)
+        try:
+            for thread, flag in zip(threads, done):
+                thread.start()
+                started_flags.append(flag)
+        finally:
+            boskos_pool._hold_signals(False)
         while not all(flag.is_set() for flag in done):
             for flag in done:
                 flag.wait(WORKER_JOIN_STEP_SECONDS)
     except boskos_pool.Terminated:
         _begin_termination()
         deadline = clock() + WORKER_DRAIN_SECONDS
-        for flag in done:
+        for flag in started_flags:
             flag.wait(max(0, deadline - clock()))
         _children_signal(kill=True)
-        for flag in done:
+        for flag in started_flags:
             flag.wait(WORKER_JOIN_STEP_SECONDS)
         raise
     if failures:
@@ -1216,7 +1290,7 @@ def main(argv=None):
     parser.add_argument("--budget-seconds", type=int, help="how long the whole run may take; no project starts with less than the ceiling left (default: unbounded)")
     parser.add_argument("--project-ceiling-seconds", type=int, default=PROJECT_TIMEOUT_SECONDS, help="the most one project may take, init through apply (default: %(default)s)")
     parser.add_argument("--workers", type=int, default=DEFAULT_WORKERS, help="projects reconciled at once, each under its own lease (default: %(default)s)")
-    parser.add_argument("--stop-when-moved", metavar="REMOTE/BRANCH", help="stop, with the rest not reached, once this ref's bench/tf/fleet tree differs from the checkout's (the jobs pass origin/main)")
+    parser.add_argument("--stop-when-moved", metavar="REMOTE/BRANCH", help="stop, with the rest not reached, once this ref's fleet tree (a hash of the stack's files under %s: %s, %s) differs from the checkout's (the jobs pass origin/main)" % (FLEET_SUBDIR, ", ".join("*" + s for s in FLEET_INPUT_SUFFIXES), ", ".join(FLEET_INPUT_NAMES)))
     parser.add_argument("--no-publish", action="store_true", help="do not write applied.json to the project's state bucket")
     parser.add_argument(
         "--report",
@@ -1286,11 +1360,11 @@ def main(argv=None):
 def _provenance():
     """(commit, fleet tree) of the checkout; None for either git cannot answer, with a warning."""
     values = []
-    for spec in ("HEAD", "HEAD:%s" % FLEET_SUBDIR):
+    for name, read in (("commit", lambda: git_output(["rev-parse", "HEAD"])), ("fleet tree", lambda: fleet_tree("HEAD"))):
         try:
-            values.append(git_output(["rev-parse", spec]))
+            values.append(read())
         except ReconcileError as exc:
-            print("WARNING: %s; the report and the markers carry no %s" % (exc, "commit" if spec == "HEAD" else "fleet tree"), file=sys.stderr)
+            print("WARNING: %s; the report and the markers carry no %s" % (exc, name), file=sys.stderr)
             values.append(None)
     return tuple(values)
 
@@ -1306,7 +1380,7 @@ def _start(args, error):
         error.append(str(exc))
         print("ERROR: %s" % exc, file=sys.stderr)
         raise SystemExit(EXIT_FAILED)
-    commit, fleet_tree = _provenance()
+    commit, tree = _provenance()
     run = Run(
         budget_seconds=args.budget_seconds,
         ceiling_seconds=args.project_ceiling_seconds,
@@ -1314,7 +1388,7 @@ def _start(args, error):
         allow=allow,
         workers=args.workers,
         commit=commit,
-        fleet_tree=fleet_tree,
+        fleet_tree=tree,
         build=os.environ.get(BUILD_ID_ENV),
         job=os.environ.get(JOB_NAME_ENV),
         publish=not args.no_publish,

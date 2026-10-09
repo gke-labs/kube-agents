@@ -46,6 +46,7 @@ import (
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
 	"github.com/gke-labs/kube-agents/k8s-operator/internal/controller"
 	agentwebhook "github.com/gke-labs/kube-agents/k8s-operator/internal/webhook"
+	"k8s.io/apimachinery/pkg/api/meta"
 	// +kubebuilder:scaffold:imports
 )
 
@@ -323,6 +324,36 @@ func main() {
 			setupLog.Error(err, "Failed to add the usage counters poller to the manager")
 			os.Exit(1)
 		}
+	}
+
+	// The AgentProfile reconciler, when the CRD is installed. An operator
+	// upgraded ahead of its CRDs keeps running everything else. Only a real
+	// "no such kind" skips it: any other discovery error (an API server
+	// timeout during a control-plane upgrade, say) exits, so the restart
+	// tries again instead of running without the controller until the next
+	// one.
+	profileGVK := agentv1alpha1.GroupVersion.WithKind("AgentProfile")
+	_, mapErr := mgr.GetRESTMapper().RESTMapping(profileGVK.GroupKind(), profileGVK.Version)
+	profileDenied := controller.AgentProfileAccessDenied(rbacChecker)
+	switch {
+	case mapErr == nil && len(profileDenied) > 0:
+		// An informer the role cannot list never syncs, and a cache that
+		// fails to sync stops the manager, so registering it would crashloop
+		// the whole operator on an image deployed ahead of its ClusterRole.
+		setupLog.Error(nil, "The operator's role cannot read AgentProfiles; skipping the AgentProfile controller. Restart the operator after applying the current ClusterRole.", "denied", profileDenied)
+	case mapErr == nil:
+		if err := (&controller.AgentProfileReconciler{
+			Client: mgr.GetClient(),
+			Scheme: mgr.GetScheme(),
+		}).SetupWithManager(mgr); err != nil {
+			setupLog.Error(err, "Failed to create controller", "controller", "agentprofile")
+			os.Exit(1)
+		}
+	case meta.IsNoMatchError(mapErr):
+		setupLog.Info("AgentProfile CRD is not installed on cluster; skipping the AgentProfile controller. Restart the operator after installing the CRD to enable it.")
+	default:
+		setupLog.Error(mapErr, "Failed to discover the AgentProfile kind")
+		os.Exit(1)
 	}
 
 	if os.Getenv("ENABLE_WEBHOOKS") != "false" {

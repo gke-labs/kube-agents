@@ -2447,10 +2447,11 @@ def release_in_flight(audit_id: str) -> None:
 def _ledger_key(repo: object) -> str:
     """One spelling per ledger: lowercased, with GitHub's host left off.
 
-    A memory written as `acme/gitops` before a second forge was configured is
-    the same ledger as `github.com/acme/gitops` after; comparing the raw
-    strings would read the first run after the upgrade as a different
-    repository and lose the delta.
+    A memory written as `acme/gitops` is the same ledger as one written as
+    `github.com/acme/gitops` -- the managed list's spelling where another
+    forge's entry shares the path, and every GitHub name's on a release that
+    qualified them all beside a second forge; comparing the raw strings would
+    read the next run as a different repository and lose the delta.
     """
     key = str(repo).lower()
     prefix = "github.com/"
@@ -11775,10 +11776,9 @@ def _land_group_via_clone(
 def content_workspace_repo(repo: str) -> str:
     """`repo` as the broker's file workspace takes it: GitHub's bare `owner/name`.
 
-    The workspace keys GitHub's repositories by the bare slug, and an install
-    managing a second forge spells them `github.com/owner/name`
-    (`gitops_workspace.qualify`), so that spelling is put back to the slug at
-    the door. A repository on another forge is passed with its host, and the
+    The workspace keys GitHub's repositories by the bare slug, and the managed
+    list can spell one `github.com/owner/name` (`gitops_workspace.qualify`),
+    so that spelling is put back to the slug at the door. A repository on another forge is passed with its host, and the
     broker clones it from the forge that serves it.
     """
     import gitops_workspace
@@ -12420,9 +12420,9 @@ def read_declarations(audit_id: str, repo: str | None = None) -> list[dict]:
     if not isinstance(data, dict) or data.get("audit") != audit_id:
         return []
     recorded = data.get("repo")
-    # Compared as one ledger, for `read_run_record`'s reason: `start` records the
-    # lifted `github.com/owner/name` on an install with a second forge, and a
-    # dry run's bare `--repo owner/name` names the same repository.
+    # Compared as one ledger, for `read_run_record`'s reason: `start` can record
+    # `github.com/owner/name`, as the managed list spells it, and a dry run's
+    # bare `--repo owner/name` names the same repository.
     if repo and (not isinstance(recorded, str) or _ledger_key(recorded.strip()) != _ledger_key(repo.strip())):
         return []
     entries = data.get(DECLARATIONS_KEY)
@@ -12927,8 +12927,8 @@ def read_run_record(audit_id: str, repo: str | None = None) -> dict | None:
     context = data.get("context_repos")
     if not isinstance(recorded, str) or not recorded or not isinstance(context, list):
         return None
-    # Through `_ledger_key`: `start` records the name it resolved, which on an
-    # install with a second forge is `github.com/owner/name`, while a dry run
+    # Through `_ledger_key`: `start` records the name it resolved, which can be
+    # `github.com/owner/name` as the managed list spells it, while a dry run
     # takes `--repo` as given -- the bare `owner/name` the SKILL prescribes.
     if repo and _ledger_key(recorded.strip()) != _ledger_key(repo.strip()):
         return None
@@ -14909,6 +14909,14 @@ def handle_remediate(args: argparse.Namespace) -> None:
     # dry run would preview a body no run sends -- with or without `--repo`,
     # since without it the dry run still resolves the repository it previews.
     refusal_repo = _dry_run_repo(audit_id, opt_repo) if args.dry_run else repo_hint
+    # Each `remediate` call is a new process, so no step has decided the mode
+    # yet. `start` and `finish` decide it in `ensure_workspace`; this command
+    # reads it in the refusal below first. Decide it here from the endpoint
+    # alone, with no call to the broker: `detect_content_mode` answers False
+    # only when no endpoint is set, and True or a refusal when one is. Thus a
+    # dry run does not need the broker, and the real run still asks the broker
+    # in `ensure_workspace`, after the checks of the finding ids.
+    set_content_mode(bool(proxy_endpoint()))
     # Resolved once for the whole preview, as `_handle_finish_dry_run` does: a
     # failed read falls back to "pull request", so a lookup per group could
     # preview one group as a merge request and the next as a pull request.

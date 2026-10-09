@@ -2,7 +2,10 @@
 
 - **Author:** [@bnaylor]
 - **Date:** 2026-08-24
-- **Status:** draft, for review
+- **Status:** stage 3 in progress. Built: the `AgentProfile` CRD and what the operator renders
+  from one (the ServiceAccount, the callout identity, the agent card). Not built: the
+  dispatcher and janitor, the cluster-agent profile, and the gateway reading the `chat`
+  profile.
 - **Companions:** the A2A payload spec (`spec-a2a-payloads.md`) - envelope, subjects, task
   lifecycle; the NATS deployment spec (`spec-nats-deployment.md`) - streams, accounts,
   connection-time authz
@@ -91,6 +94,12 @@ per-cluster case is the reconciler stamping out one CR per cluster, exactly as i
 out profile directories today. The scaffolder is the template engine. We don't need a
 second one.
 
+"Profile" means two things in this tree, so to be plain about it: the CRD is the A2A side's
+profile. The Hermes side's profile model (the platform and cluster templates the platform
+agent scaffolds, the config overlay, `AgentPlugin.spec.targetProfile`) is a different thing
+with the same name. The CRD does not absorb it. Both stay as they are until the Hermes-side
+model is retired.
+
 Relationship to the architecture set: `docs/architecture/06-api-and-data-contracts.md`
 defines `kind: Agent` and 08 reconciles it into one isolated pod per agent.
 `AgentProfile` is the concrete stage-3 resource on that road - profile-shaped identity,
@@ -162,6 +171,10 @@ spec:
 
 Everything here is dark content: the dispatcher and the profile CRD render nothing unless
 the mode switch says `next`.
+
+As built, the CRD reserves the name `platform`, because the Hermes bridge is that addressee's
+executor, and `resources` and `concurrency` are required rather than defaulted. The example
+above and the platform worked profile below are design sketches from before the CRD existed.
 
 ## How a profile becomes a pod
 
@@ -243,7 +256,10 @@ Env is minimal, and this list is the design's intent rather than the rendered se
 gateway's own resolved settings rather than passed through from its environment,
 because the scope the executor checks a capability at has to be the scope the gateway
 minted it under, and because a mixed-version install has to relax both halves together
-or the gateway mints nothing while the executor insists on a capability. Everything else -
+or the gateway mints nothing while the executor insists on a capability. A profile pod
+also needs `A2A_POD_NAME` from the downward API and `A2A_PROFILE_EXECUTOR=true`, which
+tells the adapter it is a profile pod rather than a session pod that lost its session
+name. Everything else -
 prompt, correlation, context - is in the task message, which the adapter fetches by the
 stream sequence `A2A_ORIGIN_SEQ` names rather than by scanning the subject. The spawner
 knows that sequence because it publishes the submission before it spawns the pod, and the
@@ -273,6 +289,43 @@ front door's roster becomes a read of the directory stream instead of a listing 
 profile directories. Same information, but it exists whether or not any worker is
 running.
 
+What the operator renders per profile, as built (amended 10/6):
+
+- The ServiceAccount: `agentprofile-<profile>`, owned by the CR, token automount off, no
+  RoleBinding anywhere. A profile that names its own in `identity.serviceAccountName` gets
+  none created. A profile may not name a ServiceAccount the operator already uses for
+  something else (the agent's, the session pods', the callout's, and so on) or `default`.
+  Those are refused with a condition, and the profile renders nothing.
+- The callout identity: one entry per profile in the PlatformAgent's identity map. A static
+  entry cannot work here. Every pod of a profile publishes as the profile, but two of them
+  running at once need their own consumers and inboxes, and a shared consumer name or a
+  wildcard one is worse than either. So the entry narrows on `profile`. It carries the
+  profile name and its topic grants, never subjects, and the callout derives the task subjects
+  from the profile and the consumer names and inbox from the attested pod name, the same way
+  it already does for session pods. A refused profile is left out of the map rather than
+  failing it for everyone.
+- The card: the operator is a bus principal for this and nothing else. Its entry publishes on
+  `a2a.agents.*` and direct-gets the directory, so reconcile can tell a missing or stale card
+  from a current one. The grant is a wildcard over the profile token because callout grants are
+  fixed for the life of a connection, and a profile created later still has to be publishable.
+
+Two limits of what is built. Credentials are per profile, as decided 8/24, so two pods of one
+profile can reach each other's task subjects; per-task credentials stay with the authority
+work. And a profile deleted while its agent is on `today` releases its finalizer with no
+tombstone, because there is no bus to publish one on. The directory survives a flip to
+`today` on the bus's PVC, so that card is still there when the agent goes back to `next`.
+Nothing sweeps directory entries that have no profile. Fixing that means either holding
+deletion on a `today` install or giving the operator a read of the whole directory.
+
+Profile names and session names share the addressee space on `a2a.tasks.>`. A profile named
+exactly like a live session pod (`<profile>-<animal>-<hex>`) would get that session's events
+subject. Only `platform` is reserved. Matching the session shape would mean a regex that has
+to track how the gateway mints names, and creating an AgentProfile is already a privileged act.
+
+The CR binds to the PlatformAgent in its namespace. The field table has no agentRef, and with
+two agents in one namespace (only possible with the singleton webhook off) a profile renders
+nothing. The name `platform` is reserved: it is the Hermes bridge's addressee.
+
 Spawn latency is the demo's: roughly 5-10 seconds to first streamed output with a warm
 node and pre-pulled image. Fine for delegated tasks, which today sit in a 5-second
 dispatch poll anyway.
@@ -295,15 +348,16 @@ notes. Prefixes are not a protocol. Instead:
 `input-required`, and one terminal event with `final: true`. Not progress, not tool
 chatter.
 
-**`artifact-update` carries the streams, as named artifacts.** Five reserved names:
+**`artifact-update` carries the streams, as named artifacts.** Six reserved names:
 
-| Artifact name | Content                                                                      | Producer                                       | Default consumer                                                                 |
-| ------------- | ---------------------------------------------------------------------------- | ---------------------------------------------- | -------------------------------------------------------------------------------- |
-| `result`      | The deliverable, chunked per A2A chunking rules                              | harness output                                 | posted to the requester verbatim, as `kanban_complete`'s `result` field is today |
-| `thinking`    | Thinking/reasoning deltas                                                    | adapter, from the harness stream               | debug views only                                                                 |
-| `activity`    | Tool-call trace: one entry per tool invocation                               | adapter                                        | debug views; always in the audit replay                                          |
-| `progress`    | Agent-authored milestones - the heartbeat-note replacement                   | an explicit progress tool exposed to the agent | rendered to chat at zero model cost                                              |
-| `delegate`    | A session's request to hand a task on: one data part (`lib.DelegateRequest`) | adapter, from the harness's delegate tool      | the gateway, which mints the child or refuses; never rendered to chat            |
+| Artifact name | Content                                                                            | Producer                                               | Default consumer                                                                              |
+| ------------- | ---------------------------------------------------------------------------------- | ------------------------------------------------------ | --------------------------------------------------------------------------------------------- |
+| `result`      | The deliverable, chunked per A2A chunking rules                                    | harness output                                         | posted to the requester verbatim, as `kanban_complete`'s `result` field is today              |
+| `thinking`    | Thinking/reasoning deltas                                                          | adapter, from the harness stream                       | debug views only                                                                              |
+| `activity`    | Tool-call trace: one entry per tool invocation                                     | adapter                                                | debug views; always in the audit replay                                                       |
+| `progress`    | Agent-authored milestones - the heartbeat-note replacement                         | an explicit progress tool exposed to the agent         | rendered to chat at zero model cost                                                           |
+| `delegate`    | A session's request to hand a task on: one data part (`lib.DelegateRequest`)       | adapter, from the harness's delegate tool              | the gateway, which mints the child or refuses; never rendered to chat                         |
+| `turn`        | One finished turn's answer on a task with more turns queued, chunked like `result` | an executor that queues follow-ups (the hermes-bridge) | renderers post it as it completes; never the deliverable - the last turn's answer is `result` |
 
 This maps one-to-one onto what exists. Kanban heartbeat notes become `progress` updates:
 the gateway's notifier can render them into a rolling chat line without waking any model,
@@ -314,7 +368,7 @@ debug mode adds `activity` and `thinking` - the same split the Google Chat `mode
 draws today (`platformagent_manifests.go:1348-1371`).
 
 Artifact names are data, so the set can grow without touching the envelope or the payload
-spec. These five are reserved so that renderers and the audit tooling can rely on them.
+spec. These six are reserved so that renderers and the audit tooling can rely on them.
 
 Deviation, recorded 8/31: the worker adapter as first built (ahead of its stage 3
 slot, for the gateway's session workers) produces `progress` from the model's own

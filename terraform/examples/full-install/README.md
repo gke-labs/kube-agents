@@ -734,6 +734,8 @@ with the created topic/subscription — restrict access with
 
 With `enable_github_minter = true`, set `github_repo` to your primary GitOps repository (in `owner/repo` or GitHub URL format). Additional GitOps repositories within the same organization can also be registered in the ConfigMap by cluster administrators.
 
+With `gitops_forge = "gitlab"`, set `gitlab_repo` to the GitLab project's full path (`group/project`, nested groups allowed) and, for a self-managed instance, `gitops_host` to its hostname. The CR then declares one `gitlab` forge and the project as its `gitops` repository, with `credentialsRef` naming `gitlab_token_secret_name` (default `gitlab-forge-token`). Terraform never sees the token: create that Secret, with the token under the key `token`, in the agent's namespace yourself (`install.sh` does it for you). A GitLab install has no GitHub App, so `github_repo` and `enable_github_minter` must stay unset; the plan refuses otherwise. See [GitLab as the GitOps forge](../../../docs/site/src/content/docs/install/gitlab.md).
+
 `enable_slack = true` writes `slack_bot_token` / `slack_app_token` into the
 credentials Secret and turns on the CR's `slack` section, the same pair
 install.sh collects. Slack needs no GCP resources, so this is
@@ -777,18 +779,22 @@ publish here can make the detector report a change nobody made, under any
 principal it names. Never list the agent's own GSA.
 
 Beyond the three names and that list, the module's two required inputs are
-passed and two more of its optional ones:
+passed and three more of its optional ones:
 `drift_pubsub_sink_writer_identity_override`, which the module's own
 postcondition tells an operator to set when a project's sink reports a writer
-identity the module did not derive, and `drift_pubsub_sink_drain_duration`,
-the destroy-time wait below. Neither has an installer key, so through the
-front doors both are passthrough lines in `install.env`
+identity the module did not derive, and the module's two timers —
+`drift_pubsub_sink_drain_duration`, the destroy-time wait below, and
+`drift_pubsub_logging_identity_propagation_duration`, the apply-time one. None
+has an installer key, so through the front doors all three are passthrough
+lines in `install.env`
 (`TF_VAR_drift_pubsub_sink_writer_identity_override`,
-`TF_VAR_drift_pubsub_sink_drain_duration`) rather than entries in
-`terraform.tfvars`, which `write_tfvars_from_state` regenerates wholesale on
-every `install.sh` and `upgrade.sh` run — a hand-added key there is gone on the
-next one, and for the override that means the failure it cleared comes back.
-A hand-driven apply sets them in `terraform.tfvars`. Everything else is left to the module's defaults,
+`TF_VAR_drift_pubsub_sink_drain_duration`,
+`TF_VAR_drift_pubsub_logging_identity_propagation_duration`) rather than
+entries in `terraform.tfvars`, which `write_tfvars_from_state` regenerates
+wholesale on every `install.sh` and `upgrade.sh` run — a hand-added key there
+is gone on the next one, and for the override that means the failure it
+cleared comes back. A hand-driven apply sets them in `terraform.tfvars`.
+Everything else is left to the module's defaults,
 which decide the 31-day retention and the cluster scope, every GKE cluster in
 the project; a caller that needs the module's remaining knobs instantiates it
 directly.
@@ -803,8 +809,25 @@ an apply to land before the destroy that should honour it: `time_sleep` reads
 and no configuration, and `uninstall.sh` runs no apply of its own. Setting the
 variable and going straight to `uninstall.sh` waits whatever an earlier apply
 recorded, so run `upgrade.sh` in between.
+
+An apply pauses too, for
+`drift_pubsub_logging_identity_propagation_duration` (60s by default), between
+minting the project's Logging service agent and granting it publisher on the
+topic. GCP cannot bind a service agent the instant it is minted, and without
+that wait the apply fails on about one project in five with "Service account
+… does not exist", leaving the topic behind and no sink. It is paid on
+the first apply that carries the wait — the first apply with
+`enable_drift_pubsub` on, or, on an install that already had the ingress, the
+next apply of any kind after this version lands — and after that only on an
+apply that re-mints the Logging identity or changes this value, the two things
+the wait is keyed on. A project whose Logging agent
+already exists gains nothing from it, and lowering the value before that first
+apply is how it keeps the minute. Lowering it afterwards does not refund the
+wait already paid — the wait is keyed on this value, so a change re-creates it
+and pays the new, lower figure once — it only shortens any later one.
+
 [The module's README](../../modules/drift-pubsub/README.md#why-the-sink-is-created-last-and-destroyed-first)
-is canonical for both orderings.
+is canonical for all three orderings.
 
 Three outputs, each `null` while the flag is off: `drift_pubsub_topic`,
 `drift_pubsub_subscription`, and `drift_pubsub_subscription_id`, the
