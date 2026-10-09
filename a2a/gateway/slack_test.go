@@ -1096,10 +1096,12 @@ func TestToMrkdwnConvertsProseAfterAChunkedFence(t *testing.T) {
 func TestToMrkdwnRewritesBoldOnlyOnClosedPairs(t *testing.T) {
 	cases := map[string]string{
 		// The issue's rows: none of these is a bold pair.
-		"**kwargs":                "**kwargs",
-		"**/*.yaml":               "**/*.yaml",
-		"a ** b":                  "a ** b",
-		"***":                     "***",
+		"**kwargs":  "**kwargs",
+		"**/*.yaml": "**/*.yaml",
+		"a ** b":    "a ** b",
+		// Inline, since a line of only *** is a thematic break, which
+		// rewriteSlackBlocks drops (TestRewriteSlackBlocks).
+		"a *** b":                 "a *** b",
 		"def f(*args, **kwargs):": "def f(*args, **kwargs):",
 		// Bold-italic is the one triple that is a pair, and a single star
 		// inside a pair is emphasis inside it, not a second pair.
