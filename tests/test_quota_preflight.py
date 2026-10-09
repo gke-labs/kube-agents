@@ -41,7 +41,6 @@ _A2A_BRIDGE = _ROOT / "k8s-operator" / "internal" / "controller" / "platformagen
 _A2A_CONSOLE = _ROOT / "k8s-operator" / "internal" / "controller" / "platformagent_a2a_console.go"
 _A2A_CALLOUT = _ROOT / "k8s-operator" / "internal" / "controller" / "platformagent_a2a_callout.go"
 _A2A_VERIFIER = _ROOT / "k8s-operator" / "internal" / "controller" / "platformagent_a2a_verifier.go"
-_IAM_MAIN_TF = _ROOT / "terraform" / "modules" / "kube-agents-iam" / "main.tf"
 
 _HELM = shutil.which("helm")
 
@@ -1247,7 +1246,8 @@ class DocumentedFootprintTest(unittest.TestCase):
     """The install prerequisites page quotes figures derived from values and footprint.
 
     Nothing regenerated them, and the row that preceded this one was stale within a
-    release. These recompute each figure and look for it on the page, so a change that
+    release. These recompute each footprint figure from source definitions and look
+    for it on the page, and verify required IAM role declarations, so a change that
     moves a total fails here rather than in a reader's namespace.
     """
 
@@ -1553,13 +1553,11 @@ class DocumentedFootprintTest(unittest.TestCase):
         # Assert JetStream persistent volume claim:
         self.assertIn(f"{jetstream_gib} GiB JetStream persistent volume claim", page)
 
-        # Mode-next PVC total: 4 stock + 1 JetStream = 5 claims totalling 22 + 40 = 62 GiB
-        # Stock totals from the chart footprint / prerequisites page:
-        m_stock_storage = re.search(r"(\d+)\s+persistent volume claims totalling\s+(\d+)\s+GiB", page)
-        self.assertIsNotNone(m_stock_storage, "stock storage clause not found")
-        assert m_stock_storage is not None
-        stock_claims = int(m_stock_storage.group(1))
-        stock_gib = int(m_stock_storage.group(2))
+        # Mode-next PVC total: the stock claims from the chart footprint plus the
+        # JetStream claim, so the expected figure does not come from the page itself.
+        storage = yaml.safe_load(_FOOTPRINT.read_text())["operatorRendered"]["storage"]
+        stock_claims = int(storage["persistentVolumeClaims"])
+        stock_gib = int(storage["storageBytesRequest"]) // gib
         next_total_claims = stock_claims + 1
         next_total_gib = stock_gib + jetstream_gib
         self.assertIn(
