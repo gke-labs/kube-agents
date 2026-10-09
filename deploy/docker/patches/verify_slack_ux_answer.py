@@ -73,6 +73,8 @@ UNFURL_MARK = {"unfurl_links": False}
 #: The one decorator a member may carry: it binds the call without ``self``.
 STATIC = "staticmethod"
 FLAG_ENV = "KAGE_SLACK_UX"
+#: Unset is on, so the flag-off path needs a value.
+FLAG_OFF = "false"
 
 METHOD = "_send_event"
 DELIVER = "_progress_deliver"
@@ -310,11 +312,14 @@ async def _drive(
     task = SimpleNamespace(result=ANSWER)
     sub = {"chat_id": CHANNEL, "thread_id": THREAD_TS}
     metadata = {"thread_id": THREAD_TS}
-    os.environ.pop(FLAG_ENV, None)
+    os.environ[FLAG_ENV] = FLAG_OFF
     try:
         adapter = _StubAdapter()
         if module.adapter_for(adapter, "slack", event, task, sub) is not adapter:
-            raise _fail(f"adapter_for() wrapped the adapter with {FLAG_ENV} unset")
+            raise _fail(f"adapter_for() wrapped the adapter with {FLAG_ENV}={FLAG_OFF}")
+        os.environ.pop(FLAG_ENV, None)
+        if not module.enabled():
+            raise _fail(f"enabled() is false with {FLAG_ENV} unset, which is on")
         os.environ[FLAG_ENV] = "1"
         wrapped = module.adapter_for(adapter, "slack", event, task, sub)
         if wrapped is adapter:
