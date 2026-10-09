@@ -1619,7 +1619,7 @@ class InstallerCommonTest(unittest.TestCase):
         for args, expect in (
             # Installed today through the installer; the key now asks for next.
             ("unset unset next", ("WARN: This apply switches the install from spec.mode today to next",
-                                  "renders the NATS bus and the A2A gateway", "Google Chat moves")),
+                                  "renders the NATS bus and the A2A gateway", "chat moves from the agent to the A2A gateway: Google Chat, or Slack")),
             # Installed next through the installer; the key now asks for today,
             # which renders nothing and so removes the recorded field.
             ("next next today", ("WARN: This apply switches the install from spec.mode next to today",
@@ -1632,7 +1632,7 @@ class InstallerCommonTest(unittest.TestCase):
                 proc = self._run(f"{self._LOUD_PRINTS}announce_platform_agent_mode_switch {args}")
                 for line in expect:
                     self.assertIn(line, proc.stdout)
-                self.assertIn("docs/designs/spec-mode-switch.md", proc.stdout)
+                self.assertIn("https://gke-labs.github.io/kube-agents/install/upgrade/#switching-specmode", proc.stdout)
 
     def test_an_ungated_switch_does_not_offer_run_again(self):
         # upgrade.sh's full arm, the menu's apply and install.sh -y apply with

@@ -5396,7 +5396,7 @@ class PlatformAgentModeTest(unittest.TestCase):
                     self.assertIn("install.sh records --mode only where install.env assigns no PLATFORM_AGENT_MODE", out)
                     self.assertIn(
                         f"Set PLATFORM_AGENT_MODE={flag} in {path}, and re-run without --mode. "
-                        "On a running install that is a mode switch: docs/designs/spec-mode-switch.md.",
+                        "On a running install that is a mode switch: https://gke-labs.github.io/kube-agents/install/upgrade/#switching-specmode.",
                         out,
                     )
                     # Not a key the Day-2 menu saves, so the menu is not offered.
