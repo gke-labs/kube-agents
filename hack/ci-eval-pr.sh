@@ -3144,10 +3144,14 @@ run_one_unit() { # <task-path> <task-name> <rep> <reuse:true|empty> <has-stack:t
 # and the settle plus the serial run of the requesting units (on the
 # presubmit tier, one case's repetitions, which the task lock already ran one
 # at a time, so three settles); the order inside each phase is unchanged.
-# The ordering assumes a unit's writes land before its terminal. Under the
-# bridge's api executor a delegated card's worker can open the pull request
-# after the terminal, inside the next unit's window (#2619, #2611); nothing
-# here waits for that worker.
+# The ordering assumes a unit's writes land before the unit ends. Under the
+# bridge's api executor the harness's delegation wait holds the unit until
+# the cards the case filed are terminal, so their workers' pull requests
+# land in the unit's own window. A worker's own fan-out children, a card
+# still running at the delegation ceiling, and the wait's fallback paths
+# are not waited for, and a write from one of those can land in the next
+# unit's window (docs/designs/eval-next-transport.md, "What the lane
+# grades"; per-case attribution is #2611).
 unit_phase() { # <task-name> -> 1 for a case that requests a pull request, 0 otherwise
   case ",${INJECT_LANE_REQUESTING:-}," in
     *",$1,"*) echo 1 ;;

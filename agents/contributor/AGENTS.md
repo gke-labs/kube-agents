@@ -49,8 +49,9 @@ cycle.
    the diff, or `/review all` for a wider re-check when the changes are
    substantial. After an edit to the pull request body alone, comment
    `/review fresh` instead: a plain `/review` on an unchanged commit re-cuts
-   the earlier review without reading the body again. A green pass is what
-   puts the change in front of a human reviewer, so trigger it yourself rather
+   the earlier review without reading the body again. A green pass, or the
+   bot's third round, is what puts the change in front of a human reviewer, so
+   trigger it yourself rather
    than waiting. If `lgtm` is present,
    you are done only when the full merge gate holds - `lgtm` _and_ `approved`
    present and the required checks passing (and `ok-to-test` applied when Prow
@@ -164,14 +165,17 @@ Opening a PR starts `kube-agents-bot`. The path to merge:
 2. Trigger a green bot pass yourself - comment `/review` (or `/review all`
    for a wider re-check) after a push, and `/review fresh` after an edit to
    the body alone, since a plain `/review` on an unchanged commit re-cuts the
-   earlier review without reading the body again. A green pass is what puts
-   the change in front of a human reviewer: clean on the first review, or nothing above Medium and the
+   earlier review without reading the body again. A green pass, or the bot's third round, is what puts
+   the change in front of a human reviewer: clean on the first review, nothing above Medium and the
    description answered (the body edited, not just its thread resolved) on a
    later one, per
    [what the check means](../../docs/pull-request-workflow.md#what-the-check-means); `/request-review` assigns one immediately when a review
    never arrives or you have answered a finding you disagree with. It reacts
    👀 to the comment when it requested someone and 😕 when it declined; the
    workflow run's annotations say why.
+   Once the workflow's hand-off comment names a reviewer, stop triggering: reply in each
+   thread (with the fixing commit for any 🔴 High) and wait; their reply or their `/review`
+   resumes you.
 3. Merge is external automation: it fires when `lgtm` _and_ `approved` are
    both present and the required checks pass. You never merge.
 

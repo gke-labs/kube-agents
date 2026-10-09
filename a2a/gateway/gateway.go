@@ -21,7 +21,7 @@ import (
 )
 
 // sessionProfile is the AgentProfile a /session conversation runs as - the
-// conversation front door of spec-subagent-profiles.md (a2a/profiles/chat.yaml).
+// conversation front door of spec-subagent-profiles.md (k8s-operator/examples/agentprofile-chat.yaml).
 const sessionProfile = "chat"
 
 // sessionKindDM is the SessionRecord.Kind of a direct message, the one Slack
@@ -1317,6 +1317,7 @@ func (g *Gateway) probeConversation(ctx context.Context, key, taskID string) (Co
 	if rec == nil {
 		return state, nil
 	}
+	state.ContextID = rec.ContextID
 	active := rec.ActiveTask
 	if taskID == "" {
 		if active == nil {

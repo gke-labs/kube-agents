@@ -18,6 +18,7 @@ to stop.
 
 import contextlib
 import io
+import json
 import os
 import random
 import re
@@ -135,28 +136,62 @@ def check_run(conclusion="success", **overrides):
     return base
 
 
-def review(login, state="COMMENTED", user_type="User", submitted_at=None):
+def review(login, state="COMMENTED", user_type="User", submitted_at=None, commit_id=None):
     filed = {"user": {"login": login, "type": user_type}, "state": state}
     if submitted_at is not None:
         filed["submitted_at"] = submitted_at
+    if commit_id is not None:
+        filed["commit_id"] = commit_id
     return filed
+
+
+def bot_review(commit_id):
+    """One of the bot's own reviews, as the reviews listing returns it."""
+    return review(rr.AI_REVIEW_BOT_LOGIN, user_type="Bot", commit_id=commit_id)
+
+
+def tally(outcome="findings", **counts):
+    """The last line of a finished `AI Review` entry's summary, as the bot writes it."""
+    values = {
+        "outcome": outcome, "high": 0, "medium": 0, "low": 0, "other": 0, "folded": 0,
+        "near_miss": 0, "standing": 0, "advisory": 0, "description": False, "partial": False,
+    }
+    values.update(counts)
+    return f"{rr.AI_REVIEW_TALLY_PREFIX} {json.dumps(values, separators=(',', ':'))}"
+
+
+def tallied(conclusion="neutral", title="Found 2 issues", outcome="findings", **overrides):
+    """A finished review entry: the tally is the last line of its summary."""
+    summary = f"One automated read.\n\n{tally(outcome)}"
+    return check_run(conclusion, output={"title": title, "summary": summary}, **overrides)
 
 
 class FakeAPI:
     """Just enough of `GitHubAPI` for the functions that call it, `main` included."""
 
-    def __init__(self, pulls=(), commits=None, check_runs=None, reviews=None, files=None):
+    def __init__(
+        self, pulls=(), commits=None, check_runs=None, reviews=None, files=None, comments=None, check_runs_by_id=None
+    ):
         self.repo = "gke-labs/kube-agents"
         self.pulls = list(pulls)
         self.commits = commits or {}
         self.check_runs = check_runs or {}
         self.reviews = reviews or {}
         self.files = files or {}
+        self.comments = comments or {}
+        self.check_runs_by_id = check_runs_by_id or {}
         self.posts = []
+        self.lists = []
 
     def get_all(self, path):
+        self.lists.append(path)
+        if any(path.endswith(suffix) for suffix in getattr(self, "failing_lists", ())):
+            raise RuntimeError(f"HTTP 502 on {path}")
         if path.endswith("/pulls?state=open"):
             return self.pulls
+        matched = re.search(r"/issues/(\d+)/comments$", path)
+        if matched:
+            return self.comments.get(int(matched.group(1)), [])
         matched = re.search(r"/pulls/(\d+)/(commits|reviews|files)$", path)
         if matched:
             number, kind = int(matched.group(1)), matched.group(2)
@@ -168,6 +203,9 @@ class FakeAPI:
         raise AssertionError(f"unexpected list call: {path}")
 
     def get(self, path):
+        matched = re.search(r"/check-runs/(\d+)$", path)
+        if matched:
+            return self.check_runs_by_id[int(matched.group(1))]
         matched = re.search(r"/commits/([0-9a-f]+)/check-runs$", path)
         if matched:
             return {"check_runs": self.check_runs.get(matched.group(1), [])}
@@ -177,6 +215,8 @@ class FakeAPI:
         raise AssertionError(f"unexpected call: {path}")
 
     def post(self, path, payload=None):
+        if path in getattr(self, "failing", ()):
+            raise RuntimeError(f"HTTP 502 on {path}")
         self.posts.append((path, payload))
         return {}
 
@@ -718,11 +758,12 @@ class AlreadyReviewedTest(unittest.TestCase):
         self.assertIsNone(self.reason([review("jayantid", "DISMISSED"), review(NON_APPROVER, "DISMISSED")]))
 
 
-class MainTest(unittest.TestCase):
-    """`main` -- the check-run path and the `/request-review` override end to end."""
+class _MainHarness(unittest.TestCase):
+    """`main` end to end against `FakeAPI`; the test classes below inherit it and add nothing else here."""
 
     COMMENT_ID = 5719654130
     REQUESTED = "/repos/gke-labs/kube-agents/pulls/1/requested_reviewers"
+    HANDOFF = "/repos/gke-labs/kube-agents/issues/1/comments"
     REACTIONS = f"/repos/gke-labs/kube-agents/issues/comments/{COMMENT_ID}/reactions"
 
     def setUp(self):
@@ -730,14 +771,27 @@ class MainTest(unittest.TestCase):
         self.addCleanup(self.root.cleanup)
         write_tree(self.root.name, OWNERS_TREE)
         self.summary = Path(self.root.name) / "summary.md"
-        env = {"GITHUB_TOKEN": "t", rr.STEP_SUMMARY_ENV: str(self.summary)}
+        env = {"GITHUB_TOKEN": "t", rr.STEP_SUMMARY_ENV: str(self.summary), rr.ACTIONS_ENV: "true"}
         patcher = mock.patch.dict(os.environ, env)
         patcher.start()
         self.addCleanup(patcher.stop)
 
-    def run_main(self, pull, reviews, *extra, files=("README.md",)):
-        self.api = FakeAPI(pulls=[pull], reviews={1: reviews}, files={1: list(files)})
-        argv = ["--pr", "1", "--config", str(LIVE_CONFIG), "--owners-root", self.root.name, "--seed", "0", *extra]
+    def run_main(
+        self, pull, reviews, *extra, files=("README.md",), check_runs=None, comments=(), check_runs_by_id=None, commits=()
+    ):
+        self.api = FakeAPI(
+            pulls=[pull],
+            reviews={1: reviews},
+            files={1: list(files)},
+            check_runs=check_runs,
+            comments={1: list(comments)},
+            check_runs_by_id=check_runs_by_id,
+            commits={1: list(commits)},
+        )
+        # `--check-run-id` is the workflow's own path and excludes `--pr`: the
+        # pull request is then resolved from the commit the entry names.
+        target = [] if "--check-run-id" in extra else ["--pr", "1"]
+        argv = [*target, "--config", str(LIVE_CONFIG), "--owners-root", self.root.name, "--seed", "0", *extra]
         self.stdout, self.stderr = io.StringIO(), io.StringIO()
         with mock.patch.object(rr, "GitHubAPI", return_value=self.api):
             with contextlib.redirect_stdout(self.stdout), contextlib.redirect_stderr(self.stderr):
@@ -747,9 +801,28 @@ class MainTest(unittest.TestCase):
     def reaction(self):
         return [payload["content"] for path, payload in self.api.posts if path == self.REACTIONS]
 
+    def run_main_with_failing(self, failing, pull, reviews, *extra, failing_lists=(), **kwargs):
+        """`run_main`, with the given POST paths (and listing suffixes) raising as the API wrapper would after its retries."""
+        original = FakeAPI.__init__
+
+        def init(api, *a, **kw):
+            original(api, *a, **kw)
+            api.failing = failing
+            api.failing_lists = failing_lists
+
+        with mock.patch.object(FakeAPI, "__init__", init):
+            return self.run_main(pull, reviews, *extra, **kwargs)
+
+    def requested(self):
+        return [login for path, payload in self.api.posts if path == self.REQUESTED for login in payload["reviewers"]]
+
+
+class MainTest(_MainHarness):
+    """`main` -- the check-run path and the `/request-review` override end to end."""
+
     def test_a_non_approvers_approval_no_longer_blocks_the_check_run_path(self):
         posts = self.run_main(pull_request(), [review(NON_APPROVER, "APPROVED")])
-        self.assertEqual(posts, [self.REQUESTED])
+        self.assertEqual(posts, [self.REQUESTED, self.HANDOFF])
         self.assertEqual(self.code, 0)
 
     def test_a_listed_robots_changes_requested_does_not_block_the_check_run_path(self):
@@ -757,7 +830,7 @@ class MainTest(unittest.TestCase):
         # reads the robot's standing CHANGES_REQUESTED as no verdict at all
         # and requests a human.
         posts = self.run_main(pull_request(), [review("kyber775", "CHANGES_REQUESTED", submitted_at="1"), review("kyber775", submitted_at="2")])
-        self.assertEqual(posts, [self.REQUESTED])
+        self.assertEqual(posts, [self.REQUESTED, self.HANDOFF])
         self.assertEqual(self.code, 0)
         # The run log names the list in effect, since shape is all that can be
         # validated and a well-formed login naming no account sits inert.
@@ -765,11 +838,8 @@ class MainTest(unittest.TestCase):
 
     def test_a_request_outstanding_to_a_listed_robot_does_not_block_the_check_run_path(self):
         posts = self.run_main(pull_request(requested_reviewers=[{"login": "kyber775"}]), [])
-        self.assertEqual(posts, [self.REQUESTED])
+        self.assertEqual(posts, [self.REQUESTED, self.HANDOFF])
         self.assertEqual(self.code, 0)
-
-    def requested(self):
-        return [login for path, payload in self.api.posts if path == self.REQUESTED for login in payload["reviewers"]]
 
     def test_a_non_approver_author_is_sent_an_approver(self):
         # The live roster now lists non-approvers in the catch-all pool, and
@@ -831,7 +901,7 @@ class MainTest(unittest.TestCase):
         # The same approval on a non-approver's pull request leaves `approved`
         # outstanding, so an approver is still asked, and only an approver.
         posts = self.run_main(pull_request(), [review("stalhaali", "APPROVED")])
-        self.assertEqual(posts, [self.REQUESTED])
+        self.assertEqual(posts, [self.REQUESTED, self.HANDOFF])
         self.assertIn(self.requested()[0].lower(), ROOT_APPROVERS)
 
     def test_a_change_no_approver_covers_gets_nobody(self):
@@ -852,7 +922,7 @@ class MainTest(unittest.TestCase):
     def test_an_outsiders_approval_covers_nothing_even_for_an_approver(self):
         # Not under `reviewers` either: Prow sets no lgtm for it.
         posts = self.run_main(pull_request(user={"login": "bradhoekstra", "type": "User"}), [review(NON_APPROVER, "APPROVED")])
-        self.assertEqual(posts, [self.REQUESTED])
+        self.assertEqual(posts, [self.REQUESTED, self.HANDOFF])
 
     def test_an_approvers_approval_still_blocks_the_check_run_path(self):
         posts = self.run_main(pull_request(), [review("jayantid", "APPROVED")])
@@ -865,7 +935,7 @@ class MainTest(unittest.TestCase):
 
     def test_the_override_bypasses_the_verdict_and_acknowledges(self):
         posts = self.run_main(pull_request(), [review("jayantid", "APPROVED")], "--react-to", str(self.COMMENT_ID))
-        self.assertEqual(posts, [self.REQUESTED, self.REACTIONS])
+        self.assertEqual(posts, [self.REQUESTED, self.HANDOFF, self.REACTIONS])
         self.assertEqual(self.reaction(), [rr.REACTION_ACKNOWLEDGED])
         self.assertEqual(self.code, 0)
 
@@ -899,6 +969,297 @@ class MainTest(unittest.TestCase):
     def test_the_check_run_path_never_reacts(self):
         posts = self.run_main(pull_request(requested_reviewers=[{"login": "jayantid"}]), [])
         self.assertEqual(posts, [])
+
+
+class HandoffTest(unittest.TestCase):
+    """The third round summons a human whatever the colour, once per pull request."""
+
+    HEADS = ("1111aaa", "2222bbb", "3333ccc")
+
+    def rounds(self, *heads):
+        return [bot_review(sha) for sha in heads]
+
+    def test_a_tally_is_read_off_the_last_line_of_the_summary(self):
+        self.assertEqual(rr.ai_review_tally(tallied())["outcome"], "findings")
+        self.assertEqual(rr.ai_review_tally(tallied(outcome="clean", conclusion="success"))["outcome"], "clean")
+
+    def test_a_push_row_carries_no_tally(self):
+        # `check_pushed` writes the previous title with no tally line: nothing was read.
+        pushed = check_run("neutral", output={"title": "Found 2 issues, on an earlier commit", "summary": "Pushed."})
+        self.assertIsNone(rr.ai_review_tally(pushed))
+        self.assertIsNone(rr.ai_review_tally(check_run("neutral", output={"title": "x"})))
+        self.assertIsNone(rr.ai_review_tally(None))
+
+    def test_a_malformed_tally_reads_as_none(self):
+        broken = check_run("neutral", output={"summary": f"{rr.AI_REVIEW_TALLY_PREFIX} not json"})
+        self.assertIsNone(rr.ai_review_tally(broken))
+        wrong_shape = check_run("neutral", output={"summary": f"{rr.AI_REVIEW_TALLY_PREFIX} [1, 2]"})
+        self.assertIsNone(rr.ai_review_tally(wrong_shape))
+
+    def test_rounds_are_distinct_commits_the_bot_reviewed(self):
+        # A re-cut is a second review of the same commit and a human's review is not a round.
+        reviews = self.rounds("1111aaa", "1111aaa", "2222bbb") + [review("jayantid", commit_id="9999fff")]
+        self.assertEqual(rr.reviewed_commits(reviews), {"1111aaa", "2222bbb"})
+
+    def test_the_deciding_commit_counts_even_before_its_review_is_listed(self):
+        self.assertEqual(rr.reviewed_commits(self.rounds("1111aaa"), "2222bbb", None), {"1111aaa", "2222bbb"})
+
+    def test_the_marker_is_what_says_a_hand_off_happened(self):
+        own = {"user": {"login": rr.HANDOFF_AUTHOR}}
+        self.assertFalse(rr.handed_off([{**own, "body": "/review"}, {**own, "body": None}]))
+        self.assertTrue(rr.handed_off([{**own, "body": f"{rr.HANDOFF_MARKER}\nHanded to @x"}]))
+        # A reply quoting the hand-off carries the marker too, further down.
+        self.assertFalse(rr.handed_off([{**own, "body": f"> {rr.HANDOFF_MARKER}\n> Handed to @x"}]))
+
+    def test_a_marker_anyone_else_posted_is_not_a_hand_off(self):
+        # The marker renders as nothing, so an agent pasting a hand-off it saw
+        # elsewhere, or anyone typing it, would otherwise switch the rule off.
+        forged = [{"user": {"login": "author"}, "body": f"{rr.HANDOFF_MARKER}\nHanded to @x"}]
+        self.assertFalse(rr.handed_off(forged))
+        self.assertFalse(rr.handed_off([{"body": f"{rr.HANDOFF_MARKER}\nno user field at all"}]))
+
+    def test_the_third_round_clears_a_grey_check(self):
+        reason = rr.ai_review_block_reason(tallied(), author_is_bot=False, rounds=3, already_handed_off=False)
+        self.assertIsNone(reason)
+
+    def test_a_clean_but_partial_read_clears_it_too(self):
+        partial = tallied(conclusion="neutral", title="No findings in what could be checked", outcome="clean")
+        self.assertIsNone(rr.ai_review_block_reason(partial, author_is_bot=False, rounds=4, already_handed_off=False))
+
+    def test_two_rounds_still_hold(self):
+        reason = rr.ai_review_block_reason(tallied(), author_is_bot=False, rounds=2, already_handed_off=False)
+        self.assertIn("not success", reason)
+        self.assertIn("round 2", reason)
+
+    def test_a_hand_off_already_made_holds(self):
+        reason = rr.ai_review_block_reason(tallied(), author_is_bot=False, rounds=7, already_handed_off=True)
+        self.assertIn("already handed", reason)
+
+    def test_a_push_row_never_clears_however_many_rounds(self):
+        # The gate decides on the newest entry on the head; after a push that is
+        # the carried-title row, which read nothing.
+        pushed = check_run("neutral", output={"title": "Found 2 issues, on an earlier commit", "summary": "Pushed."})
+        self.assertIsNotNone(rr.ai_review_block_reason(pushed, author_is_bot=False, rounds=9, already_handed_off=False))
+
+    def test_a_row_the_bot_did_not_finish_reading_never_clears(self):
+        for outcome in ("broken", "conflicted", "superseded", "unparsed"):
+            entry = tallied(outcome=outcome, title="Review did not complete")
+            self.assertIsNotNone(rr.ai_review_block_reason(entry, author_is_bot=False, rounds=5, already_handed_off=False), outcome)
+
+    def test_without_the_round_count_the_old_rule_stands(self):
+        # The pure call with no rounds given is the first-review gate, unchanged.
+        self.assertIsNotNone(rr.ai_review_block_reason(tallied(), author_is_bot=False))
+        self.assertIsNone(rr.ai_review_block_reason(check_run("success"), author_is_bot=False))
+
+    def test_the_comment_names_the_reviewer_the_commit_and_the_verdict(self):
+        body = rr.handoff_comment(["jayantid"], ["eval-crew"], "deadbeefcafe", tallied(), "the bot has reviewed 3 commits")
+        self.assertTrue(body.startswith(rr.HANDOFF_MARKER))
+        for expected in ("@jayantid", "team eval-crew", "deadbee", "Found 2 issues", "3 commits"):
+            self.assertIn(expected, body)
+        # Prow reads a slash command at the start of a line; none of these lines may start one.
+        self.assertFalse(any(line.startswith("/") for line in body.splitlines()))
+        # One rule, the same one AGENTS.md and the skill state: no further `/review` after the hand-off.
+        self.assertIn("Then wait.", body)
+        self.assertNotIn("one `/review`", body)
+
+    def test_the_comment_claims_nothing_about_a_check_it_did_not_read(self):
+        body = rr.handoff_comment(["jayantid"], [], "deadbeefcafe", None, "a person asked for a reviewer with /request-review")
+        self.assertNotIn("check reads", body)
+        self.assertNotIn("no verdict", body)
+
+
+class HandoffMainTest(_MainHarness):
+    """`main` on the check-run path: round three requests and hands off, once."""
+
+    GREY = {"deadbeef": [tallied(id=7, head_sha="deadbeef")]}
+
+    def test_round_three_requests_a_human_on_a_grey_check(self):
+        posts = self.run_main(
+            pull_request(), [bot_review("1111aaa"), bot_review("2222bbb"), bot_review("deadbeef")],
+            "--require-ai-review-pass", check_runs=self.GREY,
+        )
+        self.assertEqual(posts, [self.REQUESTED, self.HANDOFF])
+        self.assertIn("round 3", self.stderr.getvalue())
+        body = self.api.posts[1][1]["body"]
+        self.assertIn(rr.HANDOFF_MARKER, body)
+        self.assertIn("3 commits", body)
+
+    def test_round_two_still_waits_for_green(self):
+        posts = self.run_main(
+            pull_request(), [bot_review("1111aaa"), bot_review("deadbeef")], "--require-ai-review-pass", check_runs=self.GREY
+        )
+        self.assertEqual(posts, [])
+        self.assertIn("not success", self.stderr.getvalue())
+
+    def test_a_re_cut_is_not_a_round(self):
+        posts = self.run_main(
+            pull_request(), [bot_review("1111aaa"), bot_review("1111aaa"), bot_review("deadbeef")],
+            "--require-ai-review-pass", check_runs=self.GREY,
+        )
+        self.assertEqual(posts, [])
+
+    def test_the_hand_off_happens_once(self):
+        handed = [{"user": {"login": rr.HANDOFF_AUTHOR}, "body": f"{rr.HANDOFF_MARKER}\nHanded to @jayantid at `1111aaa`."}]
+        posts = self.run_main(
+            pull_request(), [bot_review("1111aaa"), bot_review("2222bbb"), bot_review("deadbeef")],
+            "--require-ai-review-pass", check_runs=self.GREY, comments=handed,
+        )
+        self.assertEqual(posts, [])
+        self.assertIn("already handed", self.stderr.getvalue())
+
+    def test_a_forged_marker_does_not_switch_the_rule_off(self):
+        forged = [{"user": {"login": "author"}, "body": f"{rr.HANDOFF_MARKER}\nHanded to @jayantid at `1111aaa`."}]
+        posts = self.run_main(
+            pull_request(), [bot_review("1111aaa"), bot_review("2222bbb"), bot_review("deadbeef")],
+            "--require-ai-review-pass", check_runs=self.GREY, comments=forged,
+        )
+        self.assertEqual(posts, [self.REQUESTED, self.HANDOFF])
+
+    def test_a_hand_off_that_fails_to_post_leaves_the_request_standing(self):
+        # Two writes: the request went out, so the comment's failure is a
+        # warning in the log, never a red run and never a lost request.
+        posts = self.run_main_with_failing(
+            (self.HANDOFF,), pull_request(), [bot_review("1111aaa"), bot_review("2222bbb"), bot_review("deadbeef")],
+            "--require-ai-review-pass", check_runs=self.GREY,
+        )
+        self.assertEqual(posts, [self.REQUESTED])
+        self.assertEqual(self.code, 0)
+        self.assertIn("could not post the hand-off comment", self.stderr.getvalue())
+
+    def test_a_request_run_by_hand_announces_nothing(self):
+        # Outside Actions the comment would land under the maintainer's login,
+        # which `handed_off` never counts, so the next grey third-plus round
+        # would post a second hand-off anyway: announce nothing and say so.
+        with mock.patch.dict(os.environ, {rr.ACTIONS_ENV: ""}):
+            posts = self.run_main(pull_request(), [], check_runs={})
+        self.assertEqual(posts, [self.REQUESTED])
+        self.assertIn("not announcing the hand-off", self.stderr.getvalue())
+
+    def test_the_hand_run_reason_is_named_when_the_workflow_runs_without_flags(self):
+        # `--pr N` with neither flag under Actions (a workflow_dispatch, say): the
+        # comment attributes the request to a hand run, not to a /request-review.
+        posts = self.run_main(pull_request(), [], check_runs={})
+        self.assertEqual(posts, [self.REQUESTED, self.HANDOFF])
+        body = self.api.posts[1][1]["body"]
+        self.assertIn("ran the request by hand", body)
+        self.assertNotIn("/request-review", body)
+
+    def test_a_failed_comments_listing_never_costs_the_request_on_the_green_path(self):
+        # The listing decides decoration here; the request goes out and the
+        # hand-off is posted anyway (a duplicate is the worse case).
+        green = {"deadbeef": [tallied(conclusion="success", title="No findings", outcome="clean", head_sha="deadbeef")]}
+        posts = self.run_main_with_failing(
+            (), pull_request(), [bot_review("deadbeef")], "--require-ai-review-pass",
+            check_runs=green, failing_lists=("/issues/1/comments",),
+        )
+        self.assertEqual(posts, [self.REQUESTED, self.HANDOFF])
+        self.assertEqual(self.code, 0)
+        self.assertIn("announcing anyway", self.stderr.getvalue())
+
+    def test_a_failed_comments_listing_still_holds_the_grey_gate(self):
+        # On the grey path the same listing decides whether the third-round
+        # request fires at all; a listing that fails must not fire it blind.
+        with self.assertRaises(RuntimeError):
+            self.run_main_with_failing(
+                (), pull_request(), [bot_review("1111aaa"), bot_review("2222bbb"), bot_review("deadbeef")],
+                "--require-ai-review-pass", check_runs=self.GREY, failing_lists=("/issues/1/comments",),
+            )
+
+    def test_a_green_check_still_requests_and_hands_off(self):
+        green = {"deadbeef": [tallied(conclusion="success", title="No findings", outcome="clean", head_sha="deadbeef")]}
+        posts = self.run_main(pull_request(), [bot_review("deadbeef")], "--require-ai-review-pass", check_runs=green)
+        self.assertEqual(posts, [self.REQUESTED, self.HANDOFF])
+        self.assertIn("the check is green", self.api.posts[1][1]["body"])
+
+    def test_a_green_check_does_not_post_a_second_hand_off(self):
+        green = {"deadbeef": [tallied(conclusion="success", title="No findings", outcome="clean", head_sha="deadbeef")]}
+        handed = [{"user": {"login": rr.HANDOFF_AUTHOR}, "body": f"{rr.HANDOFF_MARKER}\nHanded to @jayantid at `1111aaa`."}]
+        posts = self.run_main(pull_request(), [bot_review("deadbeef")], "--require-ai-review-pass", check_runs=green, comments=handed)
+        self.assertEqual(posts, [self.REQUESTED])
+
+    def test_the_triggering_check_run_supplies_the_commit_it_read(self):
+        # `--check-run-id`, the workflow's own path: the review of the deciding
+        # commit may not be listed yet when the check completes, so the commit
+        # counts from the entry itself.
+        entry = tallied(id=7, head_sha="deadbeef")
+        posts = self.run_main(
+            pull_request(), [bot_review("1111aaa"), bot_review("2222bbb")], "--require-ai-review-pass",
+            "--check-run-id", "7", check_runs={}, check_runs_by_id={7: entry},
+        )
+        self.assertEqual(posts, [self.REQUESTED, self.HANDOFF])
+
+    def test_a_stale_triggering_entry_still_decides_when_the_new_head_has_none(self):
+        # The author pushed during the third read; the head carries no entry
+        # yet, so the entry that triggered this run decides, as before.
+        entry = tallied(id=7, head_sha="0000abc")
+        posts = self.run_main(
+            pull_request(), [bot_review("1111aaa"), bot_review("2222bbb"), bot_review("0000abc")],
+            "--require-ai-review-pass", "--check-run-id", "7", check_runs={"deadbeef": []}, check_runs_by_id={7: entry},
+            commits=("0000abc", "deadbeef"),
+        )
+        self.assertEqual(posts, [self.REQUESTED, self.HANDOFF])
+        # The comment names the commit the quoted verdict is on, not the head it is not on yet.
+        body = self.api.posts[1][1]["body"]
+        self.assertIn("`0000abc`", body)
+        self.assertNotIn("`deadbee`", body)
+
+    def test_a_head_with_no_entry_declines_instead_of_crashing(self):
+        # `--pr N --require-ai-review-pass` by hand before the bot has posted
+        # anything: the old decline, not an AttributeError on a missing entry.
+        posts = self.run_main(pull_request(), [bot_review("1111aaa")], "--require-ai-review-pass", check_runs={})
+        self.assertEqual(posts, [])
+        self.assertIn("there is no AI Review check run", self.stderr.getvalue())
+
+    def test_a_running_check_declines_without_counting_rounds(self):
+        running = {"deadbeef": [check_run(None, status="in_progress", id=9, head_sha="deadbeef")]}
+        posts = self.run_main(
+            pull_request(), [bot_review("1111aaa"), bot_review("2222bbb"), bot_review("3333ccc")],
+            "--require-ai-review-pass", check_runs=running,
+        )
+        self.assertEqual(posts, [])
+        self.assertIn("in_progress", self.stderr.getvalue())
+        # The guard, not only the decline: the comments listing is the one the grey path adds.
+        self.assertFalse(any(path.endswith("/issues/1/comments") for path in self.api.lists))
+
+    def test_a_push_row_on_the_head_decides_and_holds(self):
+        pushed = check_run("neutral", id=8, head_sha="deadbeef", started_at="2026-10-08T12:00:00Z",
+                           output={"title": "Found 2 issues, on an earlier commit", "summary": "Pushed."})
+        posts = self.run_main(
+            pull_request(), [bot_review("1111aaa"), bot_review("2222bbb"), bot_review("3333ccc")],
+            "--require-ai-review-pass", check_runs={"deadbeef": [pushed]},
+        )
+        self.assertEqual(posts, [])
+
+    def test_a_bot_author_is_handed_off_on_the_first_completed_check_as_before(self):
+        posts = self.run_main(
+            pull_request(user={"login": "dependabot[bot]", "type": "Bot"}), [bot_review("deadbeef")],
+            "--require-ai-review-pass", check_runs=self.GREY,
+        )
+        self.assertEqual(posts, [self.REQUESTED, self.HANDOFF])
+
+    def test_dry_run_posts_neither_the_request_nor_the_comment(self):
+        posts = self.run_main(
+            pull_request(), [bot_review("1111aaa"), bot_review("2222bbb"), bot_review("deadbeef")],
+            "--require-ai-review-pass", "--dry-run", check_runs=self.GREY,
+        )
+        self.assertEqual(posts, [])
+        self.assertIn("would post the hand-off", self.stderr.getvalue())
+
+    def test_the_override_hands_off_too(self):
+        green = {"deadbeef": [tallied(conclusion="success", title="No findings", outcome="clean", head_sha="deadbeef")]}
+        posts = self.run_main(pull_request(), [], "--react-to", str(self.COMMENT_ID), check_runs=green)
+        self.assertEqual(posts, [self.REQUESTED, self.HANDOFF, self.REACTIONS])
+        body = self.api.posts[1][1]["body"]
+        self.assertIn("asked for a reviewer", body)
+        # It did not consult the check to decide, but it reads the head's verdict for the reviewer.
+        self.assertIn("No findings", body)
+        self.assertNotIn("no verdict", body)
+
+    def test_the_override_on_a_head_with_no_entry_names_no_verdict(self):
+        posts = self.run_main(pull_request(), [], "--react-to", str(self.COMMENT_ID), check_runs={})
+        self.assertEqual(posts, [self.REQUESTED, self.HANDOFF, self.REACTIONS])
+        self.assertNotIn("check reads", self.api.posts[1][1]["body"])
+
 
 
 class AiReviewGateTest(unittest.TestCase):

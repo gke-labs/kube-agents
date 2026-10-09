@@ -67,8 +67,10 @@ NOOP_DEPLOYER = "noop"
 # and ``worker_agents``, and ``tool_called`` in the ``workers`` or ``all``
 # scope, read the delegated cards' logs and the workers' tagged entries,
 # which the trace does not carry -- it holds calls without their results,
-# so no card id can be read from it, and no worker session is read on this
-# path -- so they are set aside on every inject record, marker or not. A
+# so no card id can be read from it. The delegation wait reads them from
+# the pod instead, when the turn ran under the bridge's api executor, but
+# the scorer still sets these checks aside on every inject record, marker
+# or not, until it grades them on a record that carries the workers. A
 # check is reported as not applicable there rather than failed or errored.
 # Recorded per entry NAME, because the report devops-bench writes carries
 # the entry's name and not its check type.
@@ -161,7 +163,9 @@ class CaseSpec:
     delegated workers -- ``worker_commands``, ``worker_agents``, or a
     ``tool_called`` in the ``workers`` or ``all`` scope. Blind on every
     inject record, trace or none: the trace carries no results, so no card
-    id can be read from it, and no worker session is read on that path. A
+    id can be read from it. The delegation wait reads the workers from the
+    pod when the turn ran under the bridge's api executor; the set-aside
+    stays until the scorer grades them on a record that carries them. A
     compound mixing such a leaf with a router-scope ``tool_called`` lands
     here, not in ``trace_blind_checks``: its worker leaf would still error
     with the trace shown, and grading the compound would block on it."""

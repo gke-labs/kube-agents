@@ -108,8 +108,9 @@ const (
 
 // Conversation key prefixes for the Google Chat adapter. A space is not a
 // session; a conversation in it is — and what counts as the conversation
-// depends on the surface: a thread in a threaded space, the whole space in a
-// DM or in a space whose threading state does not support replies
+// depends on the surface: a thread in a threaded space; in a DM, the whole
+// space for top-level messages and the thread for a reply typed inside one;
+// the whole space in a space whose threading state does not support replies
 // (spec-chatops-gateway.md, "The Google Chat adapter").
 const (
 	gchatKeyPrefix      = "gchat:"
@@ -256,7 +257,15 @@ type gchatMessage struct {
 	Thread       struct {
 		Name string `json:"name"`
 	} `json:"thread"`
-	Sender gchatSender `json:"sender"`
+	// ThreadReply is Chat's own answer to "was this typed inside an
+	// existing thread": true for a reply in a thread, false (omitted on
+	// the wire) for a top-level message, even though Chat attaches the
+	// thread it auto-created for that message (Chat API Message resource,
+	// field threadReply; measured in testdata/gchat: the in-thread DM reply
+	// carries it, the top-level DMs do not). Chat sets it false in a space
+	// that does not support reply threading.
+	ThreadReply bool        `json:"threadReply"`
+	Sender      gchatSender `json:"sender"`
 }
 
 // gchatEvent is one Chat event normalized to the legacy field layout: Type
@@ -324,14 +333,6 @@ type GoogleChatAdapter struct {
 	// inverse, for OpenDirect.
 	userIDs    map[string]string
 	userEmails map[string]string
-	// dmThreads remembers, per DM space, the thread of the latest inbound
-	// message. A DM is one session for the whole space (the key never
-	// carries a thread), but a DM space is threaded and a reply belongs
-	// where the ask was made — measured live: without this the answer to
-	// a question asked inside a thread lands top-level in the DM. This is
-	// presentation, not identity: the conversation key and the session
-	// are unchanged by it.
-	dmThreads map[string]string
 
 	// countInterval paces the received-events summary line
 	// (gchatEventCountInterval; tests shorten it). subscription is the Chat
@@ -370,7 +371,6 @@ func NewGoogleChatAdapter(relayURL, tokenPath string, log *slog.Logger) (*Google
 		seen:       map[string]bool{},
 		userIDs:    map[string]string{},
 		userEmails: map[string]string{},
-		dmThreads:  map[string]string{},
 
 		countInterval: gchatEventCountInterval,
 	}, nil
@@ -452,11 +452,6 @@ func (a *GoogleChatAdapter) Post(conversation, text string) (string, error) {
 	}
 	body := map[string]any{"text": toGchatText(text)}
 	arguments := map[string]any{"parent": space, "body": body}
-	if thread == "" && strings.HasPrefix(conversation, gchatDMKeyPrefix) {
-		a.mu.Lock()
-		thread = a.dmThreads[space]
-		a.mu.Unlock()
-	}
 	if thread != "" {
 		body["thread"] = map[string]any{"name": thread}
 		arguments["messageReplyOption"] = gchatReplyOption
@@ -468,6 +463,33 @@ func (a *GoogleChatAdapter) Post(conversation, text string) (string, error) {
 		return "", err
 	}
 	return created.Name, nil
+}
+
+// PostNotify writes text into space, as a new thread when thread is empty or
+// as a reply on thread, and returns the created message's resource name and
+// the thread it landed in. It is Post for a caller with no conversation key
+// (the chat.notify route, notify.go), which also needs the thread back so the
+// next notify can reply on it.
+func (a *GoogleChatAdapter) PostNotify(space, thread, text string) (message, landed string, err error) {
+	if !gchatIsSpaceName(space) {
+		return "", "", fmt.Errorf("gchat: not a space name: %q", space)
+	}
+	body := map[string]any{"text": toGchatText(text)}
+	arguments := map[string]any{"parent": space, "body": body}
+	if thread != "" {
+		body["thread"] = map[string]any{"name": thread}
+		arguments["messageReplyOption"] = gchatReplyOption
+	}
+	var created struct {
+		Name   string `json:"name"`
+		Thread struct {
+			Name string `json:"name"`
+		} `json:"thread"`
+	}
+	if err := a.apiCall([]string{"spaces", "messages"}, "create", arguments, &created); err != nil {
+		return "", "", err
+	}
+	return created.Name, created.Thread.Name, nil
 }
 
 // Edit replaces the text of a previously posted message (Adapter.Edit) — the
@@ -942,14 +964,19 @@ func (a *GoogleChatAdapter) classify(ev *gchatEvent) (InboundMessage, string) {
 	if ev.Space.SpaceThreadingState == gchatThreadingUnthreaded || ev.Space.SpaceType == gchatSpaceTypeGroupChat {
 		thread = ""
 	}
+	// A DM is threaded too, but Chat attaches a thread to every message: a
+	// top-level DM carries the thread Chat auto-created for it. Only a
+	// message typed inside an existing thread (threadReply) is a side
+	// thread with its own conversation, answered in that thread; top-level
+	// DMs share the space's one conversation and are answered top-level.
+	// This is the default-mode Hermes Google Chat rule (main flow versus
+	// side thread), read from Chat's own flag rather than an inbound count
+	// (spec-chatops-gateway.md, "The Google Chat adapter").
+	if kind == "dm" && !ev.Message.ThreadReply {
+		thread = ""
+	}
 
 	a.mu.Lock()
-	if kind == "dm" && ev.Message.Thread.Name != "" {
-		if len(a.dmThreads) >= gchatSeenCap {
-			a.dmThreads = map[string]string{}
-		}
-		a.dmThreads[ev.Space.Name] = ev.Message.Thread.Name
-	}
 	if strings.HasPrefix(sender.Name, gchatUsersToken) {
 		// Bounded by the same cap as the dedupe memory: one entry per
 		// human who has spoken, evicted wholesale rather than leaked.
@@ -1165,13 +1192,16 @@ func (g *Gateway) resolveA2AGooglePrincipal(authorID string) string {
 
 // gchatConversationID mints the session key for one inbound message. space is
 // the Chat space resource name ("spaces/AAA"), thread the thread resource name
-// ("spaces/AAA/threads/BBB", empty when the surface has none), kind "dm" or
-// "group".
+// ("spaces/AAA/threads/BBB", empty when the message binds the whole space),
+// kind "dm" or "group". A DM side thread keeps the DM prefix, so the key
+// says what the record's Kind says.
 func gchatConversationID(space, thread, kind string) string {
-	if kind == "dm" {
+	switch {
+	case kind == "dm" && thread == "":
 		return gchatDMKeyPrefix + space
-	}
-	if thread == "" {
+	case kind == "dm":
+		return gchatDMKeyPrefix + thread
+	case thread == "":
 		return gchatSpaceKeyPrefix + space
 	}
 	return gchatKeyPrefix + thread
@@ -1180,25 +1210,36 @@ func gchatConversationID(space, thread, kind string) string {
 // gchatSpaceThread inverts gchatConversationID: the space to post into and
 // the thread to reply on (empty when the conversation is the whole space).
 func gchatSpaceThread(conversation string) (space, thread string, ok bool) {
-	rest, found := strings.CutPrefix(conversation, gchatDMKeyPrefix)
-	if !found {
-		rest, found = strings.CutPrefix(conversation, gchatSpaceKeyPrefix)
-	}
-	if found {
+	if rest, found := strings.CutPrefix(conversation, gchatSpaceKeyPrefix); found {
 		if !gchatIsSpaceName(rest) {
 			return "", "", false
 		}
 		return rest, "", true
 	}
-	rest, found = strings.CutPrefix(conversation, gchatKeyPrefix)
+	if rest, found := strings.CutPrefix(conversation, gchatDMKeyPrefix); found {
+		// A DM binds the whole space (top-level messages, and the
+		// thread-less key every pre-side-thread record carries) or one
+		// side thread.
+		if gchatIsSpaceName(rest) {
+			return rest, "", true
+		}
+		return gchatThreadName(rest)
+	}
+	rest, found := strings.CutPrefix(conversation, gchatKeyPrefix)
 	if !found {
 		return "", "", false
 	}
-	space, threadID, hasThread := strings.Cut(rest, gchatThreadsToken)
+	return gchatThreadName(rest)
+}
+
+// gchatThreadName splits a bare thread resource name ("spaces/AAA/threads/BBB",
+// nothing nested under it) into its space and the thread itself.
+func gchatThreadName(s string) (space, thread string, ok bool) {
+	space, threadID, hasThread := strings.Cut(s, gchatThreadsToken)
 	if !hasThread || !gchatIsSpaceName(space) || threadID == "" || strings.Contains(threadID, "/") {
 		return "", "", false
 	}
-	return space, rest, true
+	return space, s, true
 }
 
 // gchatIsSpaceName reports whether s is a bare space resource name
