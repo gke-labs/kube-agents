@@ -343,6 +343,19 @@ class ApplySubstitutionsTest(unittest.TestCase):
                     if (other_target, other_replacement) != (target, replacement):
                         self.assertNotIn(other_replacement, replacement, skill_name)
 
+    def test_repo_backup_dr_skill_carries_every_substitution(self):
+        # The Golden Path heading on a line of its own, so it renders, and a restore plan that
+        # restores volume data.
+        skill_md = (
+            Path(__file__).resolve().parent.parent / "agents" / "platform" / "skills" / "gke-backup-dr" / "SKILL.md"
+        )
+        content = skill_md.read_text(encoding="utf-8")
+        for target, replacement in sync.SKILL_SUBSTITUTIONS["gke-backup-dr"]:
+            self.assertNotIn(target, content)
+            self.assertEqual(content.count(replacement), 1, replacement)
+        # A second copy of the flag would leave the agent choosing between two restore policies.
+        self.assertEqual(content.count("--volume-data-restore-policy"), 1)
+
     def test_skill_without_substitutions_is_untouched(self):
         # The guard must not turn "nothing configured" into a failure.
         d = self._skill_dir()

@@ -132,6 +132,28 @@ func TestANextInstallWithNoDeclaredBridgeGetsOne(t *testing.T) {
 	}
 }
 
+// With no operator setting the rendered bridge runs the api executor, the
+// shipped default and what the next eval lane measures (hack/ci-deploy.sh sets
+// no A2A_BRIDGE_EXECUTOR): it carries no BRIDGE_EXECUTOR, and it keeps the
+// agent container's non-blank API_SERVER_KEY, which is what the bridge's
+// bridgeExecutor reads to pick api over its keyless cli fallback. The pod's
+// actual container is checked, not a2aRenderedBridgeSettings, so a copy that
+// dropped the key would show here even if the settings still listed it.
+func TestARenderedBridgeWithNoExecutorSettingRunsTheAPIExecutor(t *testing.T) {
+	t.Setenv(a2aBridgeExecutorOperatorEnvVar, "")
+	b := containersNamed(bridgeTestPod(provisionedAgent()), a2aBridgeContainerName)[0]
+	env := envIndex(b)
+	if e, ok := env[a2aBridgeExecutorEnvVar]; ok {
+		t.Errorf("the rendered bridge sets %s=%q with no operator setting", a2aBridgeExecutorEnvVar, e.Value)
+	}
+	if key := env[a2aBridgeAPIServerKeyEnvVar]; strings.TrimSpace(key.Value) == "" && key.ValueFrom == nil {
+		t.Errorf("the rendered bridge has no %s, so the bridge would fall back to the cli executor", a2aBridgeAPIServerKeyEnvVar)
+	}
+	if !a2aBridgeRunsAPIExecutor(b) {
+		t.Error("the operator reads the rendered bridge as a cli bridge, so it would render no activity hook for it")
+	}
+}
+
 // Under today nothing is rendered, which is also what ends the rollback
 // crash-loop: there is no bridge left behind to dial a torn-down bus.
 func TestATodayInstallGetsNoBridge(t *testing.T) {
@@ -417,5 +439,53 @@ func TestARefusedExecutorSettingIsLoggedOnce(t *testing.T) {
 	}
 	if _, logged := a2aRefusedBridgeExecutors.Load("Cli-refused-once"); !logged {
 		t.Error("the refused value was not logged")
+	}
+}
+
+// The gateway's busy-notice threshold is the bridge's worker count: the turn
+// that finds every worker taken is the first one told it waits. It follows
+// the rendered bridge's default and the operator setting that sizes it, and a
+// declared bridge's own count; the operator's A2A_BUSY_NOTICE_AT overrides
+// all three, and a value that is not a count falls back instead of reaching
+// a gateway that would refuse it at boot.
+func TestTheBusyNoticeThresholdIsTheBridgeWorkerCount(t *testing.T) {
+	rendered := func(agent *agentv1alpha1.PlatformAgent) string {
+		t.Helper()
+		dep := buildA2AGatewayDeployment(agent)
+		for _, e := range dep.Spec.Template.Spec.Containers[0].Env {
+			if e.Name == a2aBusyNoticeAtEnvVar {
+				return e.Value
+			}
+		}
+		t.Fatalf("the gateway Deployment does not render %s", a2aBusyNoticeAtEnvVar)
+		return ""
+	}
+	if got := rendered(a2aTestAgent()); got != strconv.Itoa(a2aRenderedBridgeDefaultConcurrency) {
+		t.Errorf("default threshold = %q, want the rendered bridge's %d", got, a2aRenderedBridgeDefaultConcurrency)
+	}
+
+	t.Setenv(a2aBridgeConcurrencyOperatorEnvVar, "4")
+	if got := rendered(a2aTestAgent()); got != "4" {
+		t.Errorf("threshold with the bridge at 4 workers = %q, want 4", got)
+	}
+
+	declared := a2aTestAgent()
+	declared.Spec.Deployment = &agentv1alpha1.DeploymentSpec{Sidecars: []corev1.Container{{
+		Name: a2aBridgeContainerName, Image: "registry.example/declared-bridge:1",
+		Env: []corev1.EnvVar{{Name: a2aBridgeConcurrencyEnvVar, Value: "3"}},
+	}}}
+	if got := rendered(declared); got != "3" {
+		t.Errorf("threshold with a declared 3-worker bridge = %q, want 3", got)
+	}
+
+	t.Setenv(a2aBusyNoticeAtEnvVar, "7")
+	if got := rendered(declared); got != "7" {
+		t.Errorf("threshold with the operator override = %q, want 7", got)
+	}
+	for _, bad := range []string{"0", "-2", "junk"} {
+		t.Setenv(a2aBusyNoticeAtEnvVar, bad)
+		if got := rendered(declared); got != "3" {
+			t.Errorf("threshold with override %q = %q, want the worker count 3", bad, got)
+		}
 	}
 }

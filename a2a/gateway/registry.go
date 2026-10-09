@@ -51,6 +51,12 @@ type ActiveTask struct {
 	// retarget). A detached task no longer serializes the session; its events,
 	// if they ever arrive, still relay.
 	Detached bool `json:"detached,omitempty"`
+	// NoFirstEventNoticeAt is when the reap scan told the conversation that
+	// this task had produced nothing past FirstEventGrace. Zero until then.
+	// On the record rather than in memory so the notice is posted once per
+	// task across gateway restarts; it goes with ActiveTask when the task is
+	// released or ends.
+	NoFirstEventNoticeAt time.Time `json:"noFirstEventNoticeAt,omitempty"`
 	// LineNote suffixes every render of the rolling line (taskStart.LineNote);
 	// on the record so a gateway restart keeps rendering it.
 	LineNote string `json:"lineNote,omitempty"`
@@ -510,9 +516,10 @@ func (rec *SessionRecord) TaskCanceled(taskID string) bool {
 // rather than a fixed executor — true on the standing session route AND
 // during a one-shot Delegate from a fixed-route conversation, which is why
 // it is not the SessionRouted field: the two executors differ on steers
-// (refused by the fixed executor, absorbed by a session worker), so the
-// status matcher's width bias and the steer acknowledgement condition on
-// where the task actually runs, not on the standing route.
+// (the fixed executor queues and answers them as further turns, a session
+// worker absorbs them at its next turn boundary), so the steer
+// acknowledgement conditions on where the task actually runs, not on the
+// standing route.
 func (rec *SessionRecord) AddressedToOwnSession() bool {
 	return rec.BusSession != "" && rec.Addressee == rec.BusSession
 }

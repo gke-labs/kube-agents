@@ -1982,8 +1982,7 @@ func TestSlackSessionLookupLogLevels(t *testing.T) {
 // letters: "&lt;stop&gt;" normalized to "ltstopgt" and matched nothing.
 // Decoded first, the same wire text normalizes to "stop" — a hard task cancel.
 // Kept deliberately: the affordances should match what the user typed, not
-// what Slack's transport did to it. The same shift shortens normalized text,
-// so an ask can newly fall under isStatusQuery's wideMatchLenCap.
+// what Slack's transport did to it.
 func TestSlackDecodedTextDrivesTheAffordances(t *testing.T) {
 	a := newTestSlackAdapter(&fakeSlackAPI{})
 
@@ -2001,19 +2000,6 @@ func TestSlackDecodedTextDrivesTheAffordances(t *testing.T) {
 	}
 	if !isStop(msg.Text) {
 		t.Error("a typed <stop> must cancel: the decode is what lets normalize see \"stop\"")
-	}
-
-	// The length half. Same words, entity-encoded and not.
-	const pokeWire = "any update on the &lt;prod&gt; rollout &amp; the canary?"
-	if isStatusQuery(pokeWire, true) {
-		t.Errorf("premise: the wire form normalizes to %d chars, over the %d cap", len(normalize(pokeWire)), wideMatchLenCap)
-	}
-	poke, ok := a.inbound(context.Background(), slackMsg("im", "D1", "U1", pokeWire, "801.0", ""))
-	if !ok {
-		t.Fatal("dm must deliver")
-	}
-	if !isStatusQuery(poke.Text, true) {
-		t.Errorf("decoded %q normalizes to %d chars and must read as a status poke", poke.Text, len(normalize(poke.Text)))
 	}
 }
 

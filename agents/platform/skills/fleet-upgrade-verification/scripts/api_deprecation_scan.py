@@ -647,7 +647,7 @@ def render_report(report: dict) -> str:
             [
                 NO_REPOS_HEADING,
                 "",
-                "No GitHub repository is registered under managed_repos, so there are no "
+                "No repository on any forge is registered under managed_repos, so there are no "
                 "manifests to scan. Name one with --repo, or a local tree with --manifests-dir.",
                 "",
             ]
@@ -736,7 +736,11 @@ def build_readers(args, endpoint: str, content_mode: bool) -> list[tuple[str, Ca
         readers.append((path, lambda p=path: read_local_directory(p, args.max_files, args.max_bytes)))
     repos = list(args.repo or [])
     if not repos and not args.manifests_dir:
-        repos = gitops_workspace.get_managed_github_repos()
+        # Every forge's repositories, not GitHub's alone: a GitLab repository
+        # skipped here would report "no removals" for manifests never read.
+        # Directory mode cannot clone one (`ensure_workspace` refuses it up
+        # front), so there it lands under errors rather than out of the report.
+        repos = gitops_workspace.get_managed_repos()
     lease = scan_lease(args.lease) if repos and not content_mode else None
     for repo in repos:
         if content_mode:
@@ -753,7 +757,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--target-version", help="Target GKE version, e.g. 1.27.3-gke.100 or 1.27. Defaults to the --versions file's target_version.")
     parser.add_argument("--versions", help="fleet_upgrade_report.py --output JSON; the floor is its lowest control-plane minor.")
     parser.add_argument("--current-version", help="The fleet's current version when there is no --versions file.")
-    parser.add_argument("--repo", action="append", help="owner/name to scan; repeatable. Default: every managed_repos GitHub entry.")
+    parser.add_argument("--repo", action="append", help="Repository to scan, as the managed list names it (owner/name, or host/path on another forge); repeatable. Default: every managed_repos entry.")
     parser.add_argument("--manifests-dir", action="append", help="Local directory to scan instead of, or as well as, repositories; repeatable.")
     parser.add_argument("--lease", help="Directory mode only: the workspace lease to check the repository out under. Default: a scan-private lease derived from the session's.")
     parser.add_argument("--max-files", type=int, default=DEFAULT_MAX_FILES, help="Manifest files read per source before the scan stops and says so.")
@@ -803,15 +807,15 @@ def main(argv: list[str] | None = None) -> int:
         sys.stderr.write(f"--target-version {target_text!r} is not MAJOR.MINOR[.PATCH][-gke.BUILD]\n")
         return EXIT_USAGE
 
-    # A --repo that is not owner/name is refused before anything reads it. The
-    # managed_repos default is built by extract_github_slug and can only yield a
-    # parsed slug, but --repo reaches workspace_path as typed, which joins the
+    # A --repo that is not a repository name is refused before anything reads
+    # it. The managed_repos default is built by the list's own parser and can
+    # only yield a name, but --repo reaches workspace_path as typed, which joins the
     # name under the lease directory after checking only that owner and name
     # are non-empty: a name carrying `..` would point ensure_workspace(reset=True)
     # at a tree outside the scan's lease. The same guard the sibling scripts apply.
     for repo in args.repo or []:
         if not gitops_workspace.is_valid_repo_slug(repo):
-            sys.stderr.write(f"--repo {repo!r} is not an owner/name slug\n")
+            sys.stderr.write(f"--repo {repo!r} is not a repository name (owner/name, or host/path on another forge)\n")
             return EXIT_USAGE
 
     endpoint = proxy_endpoint()

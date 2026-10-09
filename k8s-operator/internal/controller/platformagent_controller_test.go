@@ -997,7 +997,7 @@ func reconcileInvalidCredentialProxyResources(t *testing.T, override *corev1.Res
 		},
 		Limits: corev1.ResourceList{
 			corev1.ResourceCPU:              resource.MustParse("1"),
-			corev1.ResourceMemory:           resource.MustParse("1Gi"),
+			corev1.ResourceMemory:           resource.MustParse("2Gi"),
 			corev1.ResourceEphemeralStorage: resource.MustParse("2Gi"),
 		},
 	}
@@ -1031,7 +1031,7 @@ func TestPlatformAgentReconciler_Reconcile_CredentialProxyLimitUnderTheFloorIsRe
 // immutable-selector case and answers by deleting the running proxy.
 func TestPlatformAgentReconciler_Reconcile_CredentialProxyRequestAboveTheLimitIsRefused(t *testing.T) {
 	reconcileInvalidCredentialProxyResources(t, &corev1.ResourceRequirements{
-		Requests: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("2Gi")},
+		Requests: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("3Gi")},
 	}, "spec.deployment.credentialProxy.resources.requests.memory")
 }
 

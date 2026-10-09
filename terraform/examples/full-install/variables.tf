@@ -580,6 +580,42 @@ variable "github_repo" {
   default     = ""
 }
 
+variable "gitops_forge" {
+  description = "Which forge holds the GitOps repository: github (the default; github_repo and the GitHub App minter) or gitlab (gitlab_repo, with the access token in the Kubernetes Secret gitlab_token_secret_name names). A gitlab install declares one gitlab forge and its gitops repository through spec.integration.forges/repositories; github_repo and enable_github_minter must be left unset."
+  type        = string
+  default     = "github"
+  validation {
+    condition     = contains(["github", "gitlab"], var.gitops_forge)
+    error_message = "gitops_forge must be github or gitlab."
+  }
+}
+
+variable "gitops_host" {
+  description = "Hostname of the forge holding the GitOps repository, for a self-managed GitLab instance (e.g. gitlab.example.com). Empty is the forge's own host (gitlab.com). A bare hostname: no scheme, path or port. Read only when gitops_forge is gitlab."
+  type        = string
+  default     = ""
+  validation {
+    condition     = var.gitops_host == "" || can(regex("^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$", var.gitops_host))
+    error_message = "gitops_host must be a bare lowercase hostname, with no scheme, path or port."
+  }
+}
+
+variable "gitlab_repo" {
+  description = "The GitOps repository on GitLab, as the project's full path (group/subgroup/project) or its URL. Read only when gitops_forge is gitlab."
+  type        = string
+  default     = ""
+}
+
+variable "gitlab_token_secret_name" {
+  description = "Name of the Kubernetes Secret, in the agent's namespace, holding the GitLab access token under the key `token`. The installer creates it from a prompt or a token file after the apply; Terraform only names it, so the token never reaches the plan or the state. Read only when gitops_forge is gitlab."
+  type        = string
+  default     = "gitlab-forge-token"
+  validation {
+    condition     = can(regex("^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$", var.gitlab_token_secret_name)) && length(var.gitlab_token_secret_name) <= 253
+    error_message = "gitlab_token_secret_name must be a valid Kubernetes Secret name (lowercase DNS subdomain)."
+  }
+}
+
 variable "enable_github_minter" {
   description = "Provision the GitHub token minter: its GCP resources (service account, KMS key ring and signing key) and, through the chart, its Kubernetes workload. Requires github_repo in owner/repo (or github.com URL) form. The App private key must be imported into the KMS key before the minter goes Ready."
   type        = bool

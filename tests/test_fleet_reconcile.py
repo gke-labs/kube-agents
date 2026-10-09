@@ -19,6 +19,7 @@ tests do not reach: acquiring one project by name.
 
 import argparse
 import importlib.util
+import hashlib
 import io
 import json
 import pathlib
@@ -63,6 +64,44 @@ REPLACE_NO_SURGE = _plan((["delete", "create"], "google_container_node_pool.no_s
 DELETE = _plan((["delete"], "google_compute_disk.orphan"))
 FORGET = _plan((["forget"], "google_compute_disk.orphan"), (["update"], "google_container_cluster.seeded_b"))
 KNOWN = {P7, P8}
+
+# The fleet tree is a hash over the stack's inputs under bench/tf/fleet as
+# `git ls-tree -z` lists them; the recipe is pinned here, independent of the
+# code: sha256 over the sorted input entries joined by NUL, docs left out.
+LS_TREE_HEAD = ["ls-tree", "-r", "-z", "--full-tree", "HEAD", "--", "bench/tf/fleet"]
+LS_TREE_FETCHED = ["ls-tree", "-r", "-z", "--full-tree", "FETCH_HEAD", "--", "bench/tf/fleet"]
+FLEET_INPUTS = {"main.tf": "aaa1", "versions.tf": "aaa2", ".terraform.lock.hcl": "aaa3", "reconcile-allow.json": "aaa4"}
+FLEET_DOCS = {"README.md": "doc1", "fixtures.json": "fix1"}
+
+
+def _scrubbed_git_env():
+    """An environment the developer's git cannot reach: every inherited GIT_*
+    variable dropped (config injected by a parent `git -c`, an exported
+    GIT_DIR, GIT_OBJECT_DIRECTORY, ...), no global or system config, a fixed
+    identity. Every test that shells out to git passes it as env=."""
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_") or k == "GIT_EXEC_PATH"}
+    env.update(GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1", GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@t", GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@t")
+    return env
+
+
+def _fleet_lines(**blobs):
+    return sorted("100644 blob %s\tbench/tf/fleet/%s" % (sha, name) for name, sha in blobs.items())
+
+
+def _fleet_listing(**blobs):
+    # As `git ls-tree -z` prints it: NUL between entries, paths unquoted.
+    return "\0".join(_fleet_lines(**blobs))
+
+
+def _fleet_hash(**inputs):
+    return hashlib.sha256("\0".join(_fleet_lines(**inputs)).encode()).hexdigest()
+
+
+FLEET_A = _fleet_listing(**FLEET_INPUTS, **FLEET_DOCS)
+FLEET_A_DOCS_MOVED = _fleet_listing(**FLEET_INPUTS, **{"README.md": "doc2", "fixtures.json": "fix2"})
+FLEET_B = _fleet_listing(**{**FLEET_INPUTS, "main.tf": "bbb1"}, **FLEET_DOCS)
+TREE_A = _fleet_hash(**FLEET_INPUTS)
+TREE_B = _fleet_hash(**{**FLEET_INPUTS, "main.tf": "bbb1"})
 
 
 class _Tofu:
@@ -446,7 +485,7 @@ class LeaseTest(unittest.TestCase):
         self.assertIn("release failed", outcomes[P8][1])
 
     def test_a_named_projects_release_failure_before_a_termination_is_on_the_record(self):
-        # The hourly's path (reconcile_named): a release refused, then a
+        # The --project and --drifted path (reconcile_named): a release refused, then a
         # termination raised by the unblock, must still record the failure.
         class _Boskos_signalling_release(_Boskos):
             def __call__(self, request, timeout=None):
@@ -513,7 +552,7 @@ class MainTest(unittest.TestCase):
 
     def test_a_run_terminated_mid_walk_has_named_every_project_it_reached(self):
         # The per-project line is printed as each finishes, and the summary
-        # is printed on the way out, so a weekly killed at its deadline still
+        # is printed on the way out, so a run killed at its deadline still
         # says what it applied and refused.
         calls = []
 
@@ -693,6 +732,7 @@ class MainTest(unittest.TestCase):
         self.assertEqual(rc, reconcile.EXIT_FAILED)
         self.assertEqual(boskos.acquired, [])
         self.assertIn("could not resolve host", stderr.getvalue())
+        self.assertNotIn("wrong ref", stderr.getvalue(), "a failed fetch says nothing about the checkout or the ref")
 
     def test_a_termination_during_the_main_fetch_exits_as_terminated(self):
         # Prow aborts a superseded postsubmit; the signal can land in the
@@ -701,7 +741,7 @@ class MainTest(unittest.TestCase):
         def git(args):
             if args[:1] == ["fetch"]:
                 raise boskos_pool.Terminated("signal 15")
-            return "tree-aaa" if args[1].startswith("HEAD:") else "commit-111"
+            return FLEET_A if args[:1] == ["ls-tree"] else "commit-111"
 
         boskos = _Boskos(free=[P7])
         stderr = io.StringIO()
@@ -717,13 +757,35 @@ class MainTest(unittest.TestCase):
         self.assertEqual((doc["exit"], doc["exit_code"]), ("terminated", boskos_pool.TERMINATED_EXIT_CODE))
         self.assertIn("terminated (signal 15) after 0 project(s)", stderr.getvalue())
 
+    def test_a_main_ref_without_the_stack_fails_the_run_before_anything_is_leased(self):
+        # The ref fetches and resolves, but its tree has no stack: the first
+        # check is fatal, as for a ref git cannot read, and nothing is leased.
+        def git(args):
+            if args[:1] == ["fetch"]:
+                return ""
+            if args == LS_TREE_FETCHED:
+                return _fleet_listing(**FLEET_DOCS)
+            return FLEET_A if args[:1] == ["ls-tree"] else "commit-111"
+
+        boskos = _Boskos(free=[P7])
+        stderr = io.StringIO()
+        with mock.patch.object(reconcile, "git_output", git), mock.patch.object(boskos_pool.urllib.request, "urlopen", boskos), mock.patch.object(
+            reconcile, "tofu_runner", _Tofu({})
+        ), mock.patch.object(reconcile.signal, "signal"), mock.patch.object(reconcile, "pool_projects", lambda *a, **k: {P7}), mock.patch("sys.stdout", io.StringIO()), mock.patch("sys.stderr", stderr):
+            rc = reconcile.main(["--all", "--stop-when-moved", "origin/main", "--boskos-server", BOSKOS, "--boskos-owner", OWNER])
+        self.assertEqual(rc, reconcile.EXIT_FAILED)
+        self.assertEqual(boskos.acquired, [])
+        self.assertIn("no stack inputs", stderr.getvalue())
+        self.assertIn("wrong ref", stderr.getvalue(), "the configuration hint belongs to the first check")
+        self.assertNotIn("could not read", stderr.getvalue(), "a definite reading is not logged as a failed one")
+
     def test_a_main_that_moved_before_the_first_project_is_not_reached_and_not_blamed_on_boskos(self):
         def git(args):
             if args[:1] == ["fetch"]:
                 return ""
-            if args[1].startswith("FETCH_HEAD:"):
-                return "tree-bbb"
-            return "tree-aaa" if args[1].startswith("HEAD:") else "commit-111"
+            if args == LS_TREE_FETCHED:
+                return FLEET_B
+            return FLEET_A if args[:1] == ["ls-tree"] else "commit-111"
 
         boskos = _Boskos(free=[P7, P8])
         stderr = io.StringIO()
@@ -737,7 +799,7 @@ class MainTest(unittest.TestCase):
         self.assertEqual(rc, reconcile.EXIT_OK, "main moved under the run; the next run takes it, nothing is wrong")
         self.assertEqual(boskos.acquired, [])
         self.assertEqual({p: v["outcome"] for p, v in doc["outcomes"].items()}, {P7: reconcile.OUTCOME_NOT_REACHED, P8: reconcile.OUTCOME_NOT_REACHED})
-        self.assertIn("tree-bbb", doc["outcomes"][P7]["detail"])
+        self.assertIn(TREE_B, doc["outcomes"][P7]["detail"])
         self.assertNotIn("visited no project", stderr.getvalue())
 
     def test_a_main_ref_without_a_remote_is_refused_by_the_parser(self):
@@ -1392,7 +1454,151 @@ class PassTest(unittest.TestCase):
 def _git_whose_fetch_fails(args):
     if args[:1] == ["fetch"]:
         raise reconcile.ReconcileError("fetch: could not resolve host")
-    return "tree-aaa" if args[1].startswith("HEAD:") else "commit-111"
+    return FLEET_A if args[:1] == ["ls-tree"] else "commit-111"
+
+
+class FleetTreeTest(unittest.TestCase):
+    """The fleet tree hashes the stack's inputs and nothing else beside them."""
+
+    def _tree(self, listing):
+        calls = []
+
+        def git(args):
+            calls.append(list(args))
+            return listing
+
+        with mock.patch.object(reconcile, "git_output", git):
+            tree = reconcile.fleet_tree("HEAD")
+        self.assertEqual(calls, [LS_TREE_HEAD])
+        return tree
+
+    def test_the_tree_is_the_pinned_hash_of_the_inputs(self):
+        self.assertEqual(self._tree(FLEET_A), TREE_A)
+        self.assertEqual(len(TREE_A), 64)
+
+    def test_docs_and_strangers_do_not_move_it_and_each_input_does(self):
+        self.assertEqual(self._tree(FLEET_A_DOCS_MOVED), TREE_A, "README.md and fixtures.json are not inputs")
+        self.assertEqual(self._tree(_fleet_listing(**FLEET_INPUTS, **FLEET_DOCS, **{"notes.txt": "n1"})), TREE_A, "an unknown file beside the stack is not an input")
+        self.assertEqual(self._tree(FLEET_B), TREE_B)
+        self.assertNotEqual(TREE_A, TREE_B)
+        for name in FLEET_INPUTS:
+            moved = _fleet_listing(**{**FLEET_INPUTS, name: "zzz"}, **FLEET_DOCS)
+            self.assertNotEqual(self._tree(moved), TREE_A, name)
+
+    def test_a_rev_with_no_inputs_is_an_error_not_a_tree(self):
+        # A ref that resolves but lacks the stack (the wrong remote or branch)
+        # must fail the run, not read as "main moved" and drain it green.
+        with mock.patch.object(reconcile, "git_output", lambda args: ""):
+            with self.assertRaises(reconcile.ReconcileError) as caught:
+                reconcile.fleet_tree("FETCH_HEAD")
+        self.assertIn("no stack inputs", str(caught.exception))
+        with mock.patch.object(reconcile, "git_output", lambda args: _fleet_listing(**FLEET_DOCS)):
+            with self.assertRaises(reconcile.ReconcileError):
+                reconcile.fleet_tree("FETCH_HEAD")
+
+    def test_a_non_ascii_input_name_is_still_an_input(self):
+        # `ls-tree -z` prints the path unquoted, so the suffix test sees it.
+        listing = _fleet_listing(**FLEET_INPUTS, **{"caf\u00e9.tf": "cccc"}, **FLEET_DOCS)
+        self.assertNotEqual(self._tree(listing), TREE_A)
+
+    def test_a_path_that_is_not_utf8_still_hashes(self):
+        # ls-tree -z prints raw bytes; git_output decodes with surrogateescape,
+        # and the hash encodes them back, so such a name is an input, not a crash.
+        listing = _fleet_listing(**FLEET_INPUTS, **{"caf\udce9.tf": "cccc"}, **FLEET_DOCS)
+        self.assertNotEqual(self._tree(listing), TREE_A)
+
+    def test_the_hash_does_not_depend_on_the_process_locale(self):
+        # git's bytes are decoded as utf-8 here, never by text mode under the
+        # process locale: a valid UTF-8 name hashes the same wherever the
+        # interpreter runs, so the daily, the postsubmit and a hand run write
+        # one value for one tree.
+        listing = _fleet_listing(**FLEET_INPUTS, **{"caf\u00e9.tf": "cccc"}).encode("utf-8")
+
+        def run(argv, **kw):
+            self.assertNotIn("text", kw)
+            return subprocess.CompletedProcess(argv, 0, listing, b"")
+
+        with mock.patch.object(reconcile.subprocess, "run", run), mock.patch.dict(os.environ, {"LC_ALL": "C", "LANG": "C"}):
+            tree = reconcile.fleet_tree("HEAD")
+        self.assertEqual(tree, _fleet_hash(**FLEET_INPUTS, **{"caf\u00e9.tf": "cccc"}))
+
+    def test_the_scrubbed_git_environment_drops_every_inherited_git_variable(self):
+        with mock.patch.dict(os.environ, {"GIT_DIR": "/elsewhere/.git", "GIT_CONFIG_PARAMETERS": "'commit.gpgsign=true'", "GIT_OBJECT_DIRECTORY": "/elsewhere/objects", "GIT_EXEC_PATH": "/usr/lib/git-core", "HOME": os.environ.get("HOME", "/tmp")}):
+            env = _scrubbed_git_env()
+        self.assertEqual([k for k in env if k.startswith("GIT_") and k not in ("GIT_EXEC_PATH", "GIT_CONFIG_GLOBAL", "GIT_CONFIG_NOSYSTEM", "GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL")], [])
+        self.assertEqual((env["GIT_EXEC_PATH"], env["GIT_CONFIG_GLOBAL"], env["GIT_CONFIG_NOSYSTEM"]), ("/usr/lib/git-core", os.devnull, "1"))
+
+    def test_a_non_utf8_input_name_hashes_through_real_git(self):
+        # The index can hold a name the filesystem cannot; `ls-tree -z` prints
+        # its raw bytes and git_output decodes them with surrogateescape. Real
+        # git, so the decode half is what this pins, not the mock's string.
+        with tempfile.TemporaryDirectory() as tmp:
+            # The developer's git must not reach the scratch repository: an
+            # exported GIT_DIR would make every command below write into the
+            # developer's repository, a commit.gpgsign would prompt or fail.
+            env = _scrubbed_git_env()
+
+            def git(*args, data=None):
+                return subprocess.run([b"git", b"-C", os.fsencode(tmp), *args], check=True, capture_output=True, input=data, env=env).stdout.decode().strip()
+
+            def commit_index():
+                git(b"update-ref", b"HEAD", git(b"commit-tree", git(b"write-tree").encode(), b"-m", b"x").encode())
+
+            git(b"init", b"-q")
+            blob = git(b"hash-object", b"-w", b"--stdin", data=b"# tf\n").encode()
+            for name in (b"bench/tf/fleet/main.tf", b"bench/tf/fleet/caf\xe9.tf", b"bench/tf/fleet/README.md"):
+                git(b"update-index", b"--add", b"--cacheinfo", b"100644," + blob + b"," + name)
+            commit_index()
+            # The script's own git inherits os.environ: the same scrub applies.
+            with mock.patch.object(reconcile, "REPO_ROOT", pathlib.Path(tmp)), mock.patch.dict(os.environ, env, clear=True):
+                with_name = reconcile.fleet_tree("HEAD")
+            git(b"update-index", b"--force-remove", b"bench/tf/fleet/caf\xe9.tf")
+            commit_index()
+            with mock.patch.object(reconcile, "REPO_ROOT", pathlib.Path(tmp)), mock.patch.dict(os.environ, env, clear=True):
+                without_name = reconcile.fleet_tree("HEAD")
+        self.assertEqual(len(with_name), 64)
+        self.assertNotEqual(with_name, without_name, "the non-UTF-8 .tf counted as an input")
+
+    def test_every_tracked_file_in_the_fleet_directory_is_an_input_or_a_known_bystander(self):
+        # A new file kind tofu would read (a tfvars file, a templatefile
+        # source) belongs in the inputs and in the postsubmit's trigger: a
+        # stranger here is a decision to make, so its arrival is red.
+        bystanders = {"README.md", "fixtures.json"}
+        # -z, as the script's ls-tree: an unquoted name per entry, so a
+        # non-ASCII or space-bearing input is read as the input it is.
+        # The scrub nulls the config scopes git reads safe.directory from, and
+        # this is a read of the real checkout: assert its trust on the command
+        # line, which git honours as protected config (a checkout owned by
+        # another uid, a container or shared workspace, would otherwise refuse).
+        tracked = subprocess.run(["git", "-C", str(reconcile.REPO_ROOT), "-c", "safe.directory=%s" % reconcile.REPO_ROOT, "ls-files", "-z", "--", reconcile.FLEET_SUBDIR], check=True, capture_output=True, env=_scrubbed_git_env()).stdout.decode("utf-8", "surrogateescape").split("\0")
+        tracked = [path for path in tracked if path]
+        self.assertGreater(len(tracked), 5)
+        strangers = [path for path in tracked if not reconcile.is_fleet_input(path) and path.rsplit("/", 1)[-1] not in bystanders]
+        self.assertEqual(strangers, [], "add it to FLEET_INPUT_SUFFIXES/NAMES and the postsubmit's run_if_changed, or to the bystanders here")
+
+    def test_a_newline_inside_a_name_cannot_make_two_stacks_hash_alike(self):
+        # Git allows any byte but NUL and "/" in a name. One entry whose path
+        # carries "\n100644 blob B\tbench/tf/fleet/b.tf" must not hash like
+        # the two entries it imitates: NUL stays the separator all the way.
+        two = _fleet_listing(**{"a.tf": "aaaa", "b.tf": "bbbb"})
+        forged = "100644 blob aaaa\tbench/tf/fleet/a.tf\n100644 blob bbbb\tbench/tf/fleet/b.tf"
+        self.assertNotEqual(self._tree(two), self._tree(forged))
+        self.assertEqual(self._tree(two), _fleet_hash(**{"a.tf": "aaaa", "b.tf": "bbbb"}))
+
+    def test_git_output_keeps_carriage_returns_and_only_the_trailing_newline_goes(self):
+        # Not text mode: a CR inside a name is a byte of the name, and a path
+        # ending in whitespace keeps it; only the trailing LF git adds goes.
+        def run(argv, **kw):
+            self.assertNotIn("text", kw)
+            self.assertNotIn("encoding", kw)
+            return subprocess.CompletedProcess(argv, 0, b"a\r\nb \n", b"")
+
+        with mock.patch.object(reconcile.subprocess, "run", run):
+            self.assertEqual(reconcile.git_output(["rev-parse", "HEAD"]), "a\r\nb ")
+
+    def test_the_inputs_are_the_stack_its_lock_and_the_allowlist(self):
+        self.assertTrue(all(reconcile.is_fleet_input("bench/tf/fleet/" + n) for n in ("main.tf", "defects-b.tf", ".terraform.lock.hcl", "reconcile-allow.json")))
+        self.assertFalse(any(reconcile.is_fleet_input("bench/tf/fleet/" + n) for n in ("README.md", "fixtures.json", "notes.txt", "reconcile-allow.json.bak")))
 
 
 class MainMovedTest(unittest.TestCase):
@@ -1405,10 +1611,10 @@ class MainMovedTest(unittest.TestCase):
             calls.append(list(args))
             if args[:1] == ["fetch"]:
                 return ""
-            if args[:1] == ["rev-parse"] and args[1].startswith("FETCH_HEAD:"):
+            if args == LS_TREE_FETCHED:
                 return trees.pop(0) if len(trees) > 1 else trees[0]
-            if args[:1] == ["rev-parse"] and args[1] == "HEAD:bench/tf/fleet":
-                return "tree-aaa"
+            if args == LS_TREE_HEAD:
+                return FLEET_A
             if args[:1] == ["rev-parse"] and args[1] == "HEAD":
                 return "commit-111"
             raise AssertionError(args)
@@ -1417,7 +1623,7 @@ class MainMovedTest(unittest.TestCase):
         return git
 
     def test_the_run_stops_when_the_fleet_tree_on_main_moves(self):
-        git = self._git(["tree-aaa", "tree-bbb"])
+        git = self._git([FLEET_A, FLEET_B])
         boskos = _Boskos(free=[P7, P8])
         tofu = _Tofu({P7: UPDATE_ONLY, P8: UPDATE_ONLY})
         with mock.patch.object(reconcile, "git_output", git), mock.patch.object(boskos_pool.urllib.request, "urlopen", boskos), mock.patch.object(reconcile, "MAIN_CHECK_INTERVAL_SECONDS", 0):
@@ -1425,7 +1631,7 @@ class MainMovedTest(unittest.TestCase):
             outcomes = reconcile.reconcile_pool(BOSKOS, OWNER, runner=tofu, known=KNOWN, run=run)
         self.assertEqual(outcomes[P7][0], reconcile.OUTCOME_APPLIED)
         self.assertEqual(outcomes[P8][0], reconcile.OUTCOME_NOT_REACHED)
-        self.assertIn("tree-bbb", outcomes[P8][1])
+        self.assertIn(TREE_B, outcomes[P8][1])
         self.assertIn(["fetch", "--quiet", "origin", "main"], git.calls)
         self.assertFalse(any("--depth" in arg for call in git.calls for arg in call), "a depth-limited fetch would mark a full clone shallow")
         self.assertEqual(boskos.acquired, [P7])
@@ -1447,8 +1653,39 @@ class MainMovedTest(unittest.TestCase):
             doc = json.loads(report.read_text())
         self.assertEqual((doc["main_ref"], "could not resolve host" in doc["main_check_error"]), ("origin/main", True))
 
+    def test_a_main_that_lost_its_stack_mid_run_stops_the_run(self):
+        # The fetch answered and the tree holds no stack: main moved to a
+        # state this run must not apply over. A stop, as the old tree compare
+        # gave, not a "could not read main" the walk goes on under.
+        git = self._git([FLEET_A, _fleet_listing(**FLEET_DOCS)])
+        boskos = _Boskos(free=[P7, P8])
+        tofu = _Tofu({P7: UPDATE_ONLY, P8: UPDATE_ONLY})
+        with mock.patch.object(reconcile, "git_output", git), mock.patch.object(boskos_pool.urllib.request, "urlopen", boskos), mock.patch.object(reconcile, "MAIN_CHECK_INTERVAL_SECONDS", 0):
+            run = reconcile.Run(main_ref="origin/main")
+            outcomes = reconcile.reconcile_pool(BOSKOS, OWNER, runner=tofu, known=KNOWN, run=run)
+        self.assertEqual(outcomes[P7][0], reconcile.OUTCOME_APPLIED)
+        self.assertEqual(outcomes[P8][0], reconcile.OUTCOME_NOT_REACHED)
+        self.assertIn("no longer holds the stack", outcomes[P8][1])
+        self.assertIn(TREE_A, outcomes[P8][1], "names the tree this run applies")
+        self.assertNotIn("wrong ref", outcomes[P8][1], "the first check's hint does not belong on a legitimate move")
+        self.assertTrue(run.main_moved)
+        self.assertIsNone(run.main_check_error, "a definite reading, not a failed one")
+
+    def test_a_docs_only_change_on_main_does_not_stop_the_run(self):
+        # README.md and fixtures.json sit beside the stack and tofu never reads
+        # them: a merge touching only them changes nothing a run applies, so it
+        # is not "main moved" and the pass goes on.
+        git = self._git([FLEET_A, FLEET_A_DOCS_MOVED])
+        boskos = _Boskos(free=[P7, P8])
+        tofu = _Tofu({P7: UPDATE_ONLY, P8: UPDATE_ONLY})
+        with mock.patch.object(reconcile, "git_output", git), mock.patch.object(boskos_pool.urllib.request, "urlopen", boskos), mock.patch.object(reconcile, "MAIN_CHECK_INTERVAL_SECONDS", 0):
+            run = reconcile.Run(main_ref="origin/main")
+            outcomes = reconcile.reconcile_pool(BOSKOS, OWNER, runner=tofu, known=KNOWN, run=run)
+        self.assertEqual({p: o for p, (o, _) in outcomes.items()}, {P7: reconcile.OUTCOME_APPLIED, P8: reconcile.OUTCOME_APPLIED})
+        self.assertFalse(run.main_moved)
+
     def test_without_a_main_ref_git_is_never_fetched(self):
-        git = self._git(["tree-aaa"])
+        git = self._git([FLEET_A])
         boskos = _Boskos(free=[P7])
         with mock.patch.object(reconcile, "git_output", git), mock.patch.object(boskos_pool.urllib.request, "urlopen", boskos):
             reconcile.reconcile_pool(BOSKOS, OWNER, runner=_Tofu({P7: UPDATE_ONLY}), known={P7}, run=reconcile.Run())
@@ -1651,9 +1888,25 @@ class ReportFieldsTest(unittest.TestCase):
     def _git(self, args):
         if args == ["rev-parse", "HEAD"]:
             return "commit-111"
-        if args == ["rev-parse", "HEAD:bench/tf/fleet"]:
-            return "tree-aaa"
+        if args == LS_TREE_HEAD:
+            return FLEET_A
         raise AssertionError(args)
+
+    def test_provenance_names_what_git_could_not_answer(self):
+        # Each read fails on its own: the other value is still carried, and
+        # the warning names the one that is missing.
+        def failing(which):
+            def git(args):
+                if args[:1] == [which]:
+                    raise reconcile.ReconcileError("git %s: boom" % which)
+                return FLEET_A if args[:1] == ["ls-tree"] else "commit-111"
+            return git
+
+        for which, expected, missing in (("ls-tree", ("commit-111", None), "fleet tree"), ("rev-parse", (None, TREE_A), "commit")):
+            stderr = io.StringIO()
+            with mock.patch.object(reconcile, "git_output", failing(which)), mock.patch("sys.stderr", stderr):
+                self.assertEqual(reconcile._provenance(), expected, which)
+            self.assertIn("carry no %s" % missing, stderr.getvalue())
 
     def test_the_report_carries_the_commit_the_tree_the_times_and_the_visited_count(self):
         boskos = _Boskos(free=[P7])
@@ -1670,7 +1923,7 @@ class ReportFieldsTest(unittest.TestCase):
                 rc = reconcile.main(["--all", "--workers", "1", "--report", str(report), "--boskos-server", BOSKOS, "--boskos-owner", OWNER])
             doc = json.loads(report.read_text())
         self.assertEqual(rc, reconcile.EXIT_OK)
-        self.assertEqual((doc["commit"], doc["fleet_tree"], doc["workers"], doc["build"], doc["job"]), ("commit-111", "tree-aaa", 1, "123", "post-x"))
+        self.assertEqual((doc["commit"], doc["fleet_tree"], doc["workers"], doc["build"], doc["job"]), ("commit-111", TREE_A, 1, "123", "post-x"))
         self.assertEqual((doc["visited"], doc["mapped"]), (1, 2))
         # No budget was given, so the busy project is busy, as a hand run reports it.
         self.assertEqual(doc["outcomes"][P8]["outcome"], reconcile.OUTCOME_BUSY)

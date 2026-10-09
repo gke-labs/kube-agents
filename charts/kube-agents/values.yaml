@@ -247,6 +247,10 @@ litellm:
   # Workload Identity instead.
   modelProvider: gemini
   # Empty selects the per-provider default (mirrors common.sh).
+  # A Claude model (anthropic, or vertex_ai with a claude-* name) gets
+  # additional_drop_params: temperature, top_p and top_k under every alias,
+  # because Claude Opus 5 refuses them and a caller may send them anyway.
+  # Chart-only; the kustomize dev base carries no such key.
   modelDefaultName: ""
   # Output-token budget the gateway asks the provider for on a request that
   # names none, rendered as max_tokens under every model_list alias. 0 leaves
@@ -760,12 +764,12 @@ platformAgent:
     # The credential-proxy container's requests and limits, forwarded to the CR as
     # spec.deployment.credentialProxy.resources when any key is set. Each key
     # merges over the operator's defaults (500m CPU and 512Mi requests; 1 CPU,
-    # 1Gi memory and 2Gi ephemeral-storage limits), so
+    # 2Gi memory and 2Gi ephemeral-storage limits), so
     #
     #   credentialProxy:
     #     resources:
     #       limits:
-    #         memory: 2Gi
+    #         memory: 3Gi
     #
     # raises the memory limit and keeps the rest. The broker sizes how many
     # commands it admits at once from that limit, so it is the setting to raise
@@ -1025,11 +1029,17 @@ platformAgent:
     #
     # forges:
     #   - name: github            # what repositories[].forge refers to
-    #     provider: github        # the only registered provider; default github
+    #     provider: github        # github or gitlab; default github
     #     host: ""                # empty is the provider's default (github.com)
     #     namespace: my-org       # default owner for this forge's repositories
     #     credentialsRef:         # Secret for providers that need one; ignored
     #       name: ""              # for github, which uses the GitHub App
+    #   - name: gitlab
+    #     provider: gitlab
+    #     host: ""                # gitlab.com, or a self-managed instance's hostname
+    #     namespace: my-group     # group path; bounds which projects the agent may reach
+    #     credentialsRef:         # required for gitlab: a Secret holding an access
+    #       name: gitlab-token    # token under the key `token`, created out of band
     forges: []
     # repositories:
     #   - forge: github

@@ -98,7 +98,7 @@ THREAD = "111.000"
 TEAM = "T1"
 PLAN_TS = "222.000"
 PHRASE = "is thinking..."
-FLAG_OFF_VALUES = (None, "", "0", "false")
+FLAG_OFF_VALUES = ("", "0", "false")
 
 
 def _run(coro):
@@ -1850,6 +1850,176 @@ class PlanTest(_RuntimeCase):
         self.assertEqual([v for n, v in adapter.calls if n == "setStatus"], ["processing"])
 
 
+class StartTest(_RuntimeCase):
+    """A card's row from the moment it starts, and Working… from the acknowledgement until its cards settle."""
+
+    def _start(self, adapter, task="t_a", title="check checkout-gateway"):
+        return _run(runtime.start_row(adapter, _sub(task), title))
+
+    def _expect(self, adapter, *cards, waiting=()):
+        # waiting: cards held at todo until their parents are done.
+        own = {card: True for card in cards}
+        _run(runtime.expect_cards(adapter, CHANNEL, TEAM, THREAD, {**own, **{card: False for card in waiting}}))
+
+    def _status(self, adapter, status):
+        _run(adapter._set_thread_status(CHANNEL, TEAM, THREAD, status, "failed"))
+
+    def _kinds(self, adapter):
+        return [name for name, _value in adapter.calls]
+
+    def _sent(self, adapter):
+        return [value for name, value in adapter.calls if name == "setStatus"]
+
+    def test_a_card_that_starts_posts_its_row_running_with_its_title(self):
+        adapter = _Adapter()
+        self.assertTrue(self._start(adapter))
+        self.assertEqual(self._kinds(adapter), ["post", "setStatus"])
+        task = adapter.calls[0][1][0]["tasks"][0]
+        self.assertEqual((task["title"], task["status"]), ("check checkout-gateway", "in_progress"))
+        self.assertNotIn("details", task, "no note yet")
+        self.assertEqual(self._sent(adapter), ["processing"])
+
+    def test_notes_add_to_the_row_a_start_opened(self):
+        adapter = _Adapter()
+        self._start(adapter)
+        self.assertTrue(_run(runtime.deliver_row(adapter, _sub(), 1, "check checkout-gateway", "reading logs")))
+        self.assertEqual(self._kinds(adapter), ["post", "setStatus", "update"])
+        plan = adapter.calls[-1][1][0]
+        self.assertEqual([t["title"] for t in plan["tasks"]], ["reading logs"])
+        self.assertEqual(plan["tasks"][0]["status"], "in_progress")
+
+    def test_a_card_already_shown_opens_no_row_when_it_starts(self):
+        adapter = _Adapter()
+        _run(runtime.deliver_row(adapter, _sub(), 1, "check checkout-gateway", "reading logs"))
+        self.assertFalse(self._start(adapter), "its note opened the row")
+        self.assertTrue(self._start(adapter, task="t_b"))
+        self.assertFalse(self._start(adapter, task="t_b"), "a later heartbeat moves nothing")
+        self.assertEqual(self._kinds(adapter), ["post", "setStatus", "update"])
+
+    def test_a_started_card_completes_as_before(self):
+        adapter = _Adapter()
+        self._start(adapter)
+        _run(runtime.settle_row(adapter, _sub(), "completed", "no restarts in 24h"))
+        self.assertEqual(self._kinds(adapter), ["post", "setStatus", "update", "setStatus"])
+        task = adapter.calls[2][1][0]["tasks"][0]
+        self.assertEqual((task["status"], task["title"]), ("complete", "no restarts in 24h"))
+        self.assertEqual(self._sent(adapter), ["processing", "closed"])
+        self.assertFalse(self._start(adapter), "a heartbeat replayed after it opens no second plan")
+
+    def test_a_refused_start_rolls_the_card_until_it_settles(self):
+        adapter = _Adapter(_Client(fail={"post"}))
+        self.assertFalse(self._start(adapter))
+        self.assertEqual(self._sent(adapter), ["processing"])
+        adapter.client.fail.clear()
+        self.assertFalse(_run(runtime.deliver_row(adapter, _sub(), 1, "t", "reading logs")), "its note rolls")
+        _run(runtime.settle_row(adapter, _sub(), "completed"))
+        self.assertEqual(self._sent(adapter), ["processing", "closed"])
+        self.assertNotIn((CHANNEL, THREAD), runtime._plans)
+
+    def test_working_holds_from_the_acknowledgement_until_the_card_settles(self):
+        adapter = _Adapter()
+        self._status(adapter, PHRASE)  # the front door's turn runs
+        self._expect(adapter, "t_a")  # it handed t_a the work
+        self._status(adapter, "")  # and ended on its acknowledgement
+        self.assertEqual(self._sent(adapter), ["processing"], "the turn's clear does not close it")
+        self._start(adapter)
+        self.assertEqual(self._sent(adapter), ["processing"])
+        self.assertEqual(self._kinds(adapter).count("post"), 1, "the expectation posts nothing")
+        _run(runtime.settle_row(adapter, _sub(), "completed", "fine"))
+        self.assertEqual(self._sent(adapter), ["processing", "closed"])
+
+    def test_an_expected_card_that_ends_before_it_starts_closes_the_session(self):
+        for kind, kinds in (("archived", ["setStatus", "setStatus"]), ("gave_up", ["setStatus", "post", "setStatus"])):
+            with self.subTest(kind=kind):
+                importlib.reload(runtime)
+                adapter = _Adapter()
+                self._expect(adapter, "t_a")
+                _run(runtime.settle_row(adapter, _sub(), kind))
+                self.assertEqual(self._sent(adapter), ["processing", "closed"])
+                self.assertEqual(self._kinds(adapter), kinds)
+                self.assertNotIn((CHANNEL, THREAD), runtime._plans)
+
+    def test_a_retried_card_stays_expected(self):
+        adapter = _Adapter()
+        self._expect(adapter, "t_a")
+        _run(runtime.settle_row(adapter, _sub(), "crashed"))
+        self._status(adapter, "")
+        self.assertEqual(self._sent(adapter), ["processing"])
+
+    def test_a_card_waiting_on_its_parents_holds_until_it_starts(self):
+        adapter = _Adapter()
+        self._expect(adapter, "t_a", waiting=("t_sum",))
+        self._start(adapter)
+        _run(runtime.settle_row(adapter, _sub(), "completed", "seeded-a fine"))
+        self.assertEqual(self._sent(adapter), ["processing"], "t_sum has not started")
+        self._start(adapter, task="t_sum", title="sum up")
+        self.assertEqual(self._kinds(adapter).count("post"), 1, "it joins the same plan")
+        _run(runtime.settle_row(adapter, _sub("t_sum"), "completed", "all fine"))
+        self.assertEqual(self._sent(adapter), ["processing", "closed"])
+
+    def test_a_card_waiting_on_a_parent_that_waits_on_you_suspends(self):
+        adapter = _Adapter()
+        self._expect(adapter, "t_a", waiting=("t_sum",))
+        self._start(adapter)
+        _run(runtime.settle_row(adapter, _sub(), "blocked"))
+        self.assertEqual(self._sent(adapter), ["processing", "suspended"])
+        _run(runtime.settle_row(adapter, _sub(), "unblocked"))
+        _run(runtime.settle_row(adapter, _sub(), "completed", "fine"))
+        self.assertEqual(self._sent(adapter), ["processing", "suspended", "processing"], "t_sum still to start")
+
+    def test_a_card_waiting_on_a_parent_that_gave_up_holds_nothing(self):
+        adapter = _Adapter()
+        self._expect(adapter, "t_a", waiting=("t_sum",))
+        self._start(adapter)
+        _run(runtime.settle_row(adapter, _sub(), "gave_up"))
+        self.assertEqual(self._sent(adapter), ["processing", "closed"])
+        self._status(adapter, "")
+        self.assertEqual(self._sent(adapter), ["processing", "closed"])
+
+    def test_a_card_waiting_on_its_parents_alone_holds_nothing(self):
+        # Its parent is not the thread's to watch, a scheduled card say, so it may not start for hours.
+        adapter = _Adapter()
+        self._expect(adapter, waiting=("t_after",))
+        self._status(adapter, "")
+        self.assertEqual(self._sent(adapter), ["closed"])
+        self._start(adapter, task="t_after", title="after the window")
+        self.assertEqual(self._sent(adapter), ["closed", "processing"], "its row holds it once it starts")
+
+    def test_a_card_starting_on_its_own_holds_beside_a_card_that_waits_on_you(self):
+        adapter = _Adapter()
+        self._expect(adapter, "t_a", "t_b")
+        self._start(adapter)
+        _run(runtime.settle_row(adapter, _sub(), "blocked"))
+        self.assertEqual(self._sent(adapter), ["processing"], "t_b is about to start")
+
+    def test_an_expected_card_already_shown_is_not_held(self):
+        adapter = _Adapter()
+        self._start(adapter)
+        _run(runtime.settle_row(adapter, _sub(), "completed"))
+        self._expect(adapter, "t_a")
+        self.assertEqual(self._sent(adapter), ["processing", "closed"])
+        self.assertNotIn((CHANNEL, THREAD), runtime._plans)
+
+    def test_an_expected_card_that_never_starts_stops_holding_at_the_lapse(self):
+        adapter = _Adapter()
+        with mock.patch.object(runtime.time, "monotonic", return_value=1000.0):
+            self._expect(adapter, "t_a")
+        plan = runtime._plans[(CHANNEL, THREAD)]
+        with mock.patch.object(runtime.time, "monotonic", return_value=1001.0 + runtime.PLAN_HOLD_SECONDS):
+            _run(runtime._lapse(adapter, (CHANNEL, THREAD), plan))
+            self._status(adapter, "")
+        self.assertEqual(self._sent(adapter), ["processing", "closed"])
+        self.assertNotIn((CHANNEL, THREAD), runtime._plans)
+        self.assertNotIn((CHANNEL, THREAD), runtime._lapsed)
+
+    def test_flag_off_expects_nothing(self):
+        env = _flag("0")
+        self.addCleanup(env.stop)
+        adapter = _Adapter()
+        self._expect(adapter, "t_a")
+        self.assertEqual((adapter.calls, runtime._plans), ([], {}))
+
+
 class EnabledTest(unittest.TestCase):
     def test_missing_renderer_reads_as_off(self):
         with mock.patch.object(runtime, "_status", None), mock.patch.dict(os.environ, {"KAGE_SLACK_UX": "1"}):
@@ -1859,6 +2029,10 @@ class EnabledTest(unittest.TestCase):
         for value, expected in (("1", True), ("true", True), ("", False), ("0", False)):
             with self.subTest(value=value), mock.patch.dict(os.environ, {"KAGE_SLACK_UX": value}):
                 self.assertEqual(runtime.enabled(), expected)
+
+    def test_unset_is_on(self):
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertTrue(runtime.enabled())
 
 
 class SettlingKindsTest(unittest.TestCase):

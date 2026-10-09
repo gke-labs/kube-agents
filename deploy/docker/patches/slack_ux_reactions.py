@@ -49,7 +49,10 @@ extends its ask to the open cards created under it, directly or through
 follow-ups already completed (see :func:`settle_delegated`). A fan-out settles
 once, when all of it has. Only a finish reported while the turn runs, or after
 it, counts for its ask. Cards are read from every live board, as the notifier
-reads them, and known by board and id.
+reads them, and known by board and id. A turn that defers also hands its cards
+that are about to start to the thread's session (``slack_ux_status.expect_cards``),
+as a completion does the follow-ups it extends its ask to, so Working… stays on
+from the acknowledgement until their rows hold it.
 
 The deferred asks live in this process only (the notifier runs in the gateway
 process too). A gateway restart between the turn and the settle loses the
@@ -83,7 +86,7 @@ except ImportError:  # the scripts directory is not on PYTHONPATH
 FLAG_ENV = "KAGE_SLACK_UX"
 
 #: ``slack_presenter.FLAG_ON_VALUES``, copied because the warning below fires
-#: exactly when that module cannot be imported.
+#: exactly when that module cannot be imported. Unset is on there too.
 FLAG_ON_VALUES = frozenset({"1", "true", "yes", "on"})
 
 #: The platform name kanban subscriptions carry for Slack.
@@ -157,6 +160,15 @@ ARCHIVED_KIND = "archived"
 #: during a turn but sits in one of these at its end was resumed within it.
 RESUMED_STATUSES = frozenset({"todo", "ready", "scheduled", "running"})
 
+#: Statuses a card starts from without anyone acting, soon: such a card holds
+#: the thread's Working… until it starts (``slack_ux_status.expect_cards``).
+#: ``scheduled`` is not one, since the card may not run for hours.
+STARTING_STATUSES = frozenset({"todo", "ready", "running"})
+#: The one of those that waits on the card's parents: Hermes holds a card at
+#: ``todo`` until they are done, so it holds Working… only while nothing on
+#: the thread's plan waits on a person.
+PARENTS_STATUS = "todo"
+
 
 class _Card(NamedTuple):
     """An open card as one board read saw it."""
@@ -221,10 +233,11 @@ def enabled() -> bool:
     global _warned_missing
     if _presenter is not None:
         return _presenter.enabled()
-    if os.environ.get(FLAG_ENV, "").strip().lower() in FLAG_ON_VALUES and not _warned_missing:
+    value = os.environ.get(FLAG_ENV)
+    if (value is None or value.strip().lower() in FLAG_ON_VALUES) and not _warned_missing:
         _warned_missing = True
         logger.warning(
-            "slack_ux_reactions: %s is set but slack_presenter is not importable; "
+            "slack_ux_reactions: %s is on but slack_presenter is not importable; "
             "treating the flag as off", FLAG_ENV,
         )
     return False
@@ -363,6 +376,31 @@ def _descendants(card: tuple, creators: dict, still_open: frozenset = frozenset(
     return found
 
 
+async def _hold_session(adapter: Any, chat_id: str, team_id: Any, thread_id: str, cards: dict) -> None:
+    """Keep the thread's Working… on until ``cards`` start: see ``slack_ux_status.expect_cards``.
+
+    ``cards`` maps ``(board, id)`` to the card as a read saw it; only those in
+    :data:`STARTING_STATUSES` are held, each marked with whether it starts on
+    its own (:data:`PARENTS_STATUS`). Imported when called, as
+    ``kanban_progress_lines`` imports it; an image without it holds nothing,
+    and a failure is logged, never raised.
+    """
+    ids = {
+        task: seen.status != PARENTS_STATUS
+        for (_board, task), seen in cards.items() if seen.status in STARTING_STATUSES
+    }
+    if not ids:
+        return
+    try:
+        from gateway import slack_ux_status
+
+        await slack_ux_status.expect_cards(adapter, chat_id, team_id, thread_id, ids)
+    except ImportError:
+        return
+    except Exception as exc:  # noqa: BLE001 — Working… is cosmetic
+        logger.debug("slack_ux_reactions: holding the session in %s/%s failed: %s", chat_id, thread_id, exc)
+
+
 def _where(event: Any) -> tuple[str | None, str]:
     source = getattr(event, "source", None)
     return getattr(source, "chat_id", None), str(getattr(source, "thread_id", "") or "")
@@ -481,6 +519,8 @@ async def on_processing_complete(adapter: Any, event: Any, outcome: Any) -> None
             }
             if paused:
                 await _pause(adapter, chat_id, ask, paused)
+            # Working… from the acknowledgement until the cards' rows hold it.
+            await _hold_session(adapter, chat_id, team_id, thread_id, {c: after[c] for c in waiting if c in after})
             return
         if failed:
             settle = _presenter.SETTLE_FAILED
@@ -577,3 +617,6 @@ async def settle_delegated(adapter: Any, sub: dict, kind: str, board: str | None
             await _pause(adapter, key[0], ask, waits_on_user)
         else:
             await _resume(adapter, key[0], ask)
+    if follow_ups and asks:
+        # A follow-up gated on this card starts only now: Working… until it does.
+        await _hold_session(adapter, key[0], asks[0].team_id, key[1], follow_ups)
