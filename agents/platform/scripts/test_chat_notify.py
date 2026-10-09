@@ -288,8 +288,6 @@ class OtherCallersTest(unittest.TestCase):
         self.assertEqual(run.call_args.args[0][:4], ["a2a", "notify", "--platform", "google_chat"])
 
 
-if __name__ == "__main__":
-    unittest.main()
 
 
 SLACK_ROUTED = {chat_notify.NOTIFY_PLATFORM_ENV: "slack"}
@@ -396,3 +394,7 @@ class SlackRouteTest(unittest.TestCase):
             post = self.skv._post_audit_blocks("platform", "fleet-audit", headline, "m", "", "", float("inf"))
         self.assertEqual(post, self.skv.AuditPost("9.9"))
         via.assert_called_once()
+
+
+if __name__ == "__main__":
+    unittest.main()

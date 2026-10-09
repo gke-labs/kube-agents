@@ -145,8 +145,8 @@ type Config struct {
 	// serving conversation requests only.
 	GchatHomeChannel string
 	// SlackHomeChannel is the install's Slack home channel id ("C0123"),
-	// the one place a Slack chat.notify post may land (notify.go). Empty
-	// leaves the Slack notify route unarmed.
+	// the one place a Slack chat.notify home post may land (notify.go). Empty
+	// leaves the route serving conversation requests only.
 	SlackHomeChannel string
 	// SlackAllowedUsers is the Slack backend's ingress allowlist, carried
 	// from spec.integration.slack.allowedUsers the way GchatAllowedUsers is

@@ -594,7 +594,8 @@ func (s *SlackAdapter) Post(conversation, text string) (string, error) {
 // reply on thread (a thread root's ts), and returns the posted message's ts
 // and the thread it landed in: the given one, or the new message's own ts,
 // which is the root a later notify replies on. It is Post for a caller with
-// no conversation key (the chat.notify route, notify.go).
+// no conversation key (the chat.notify route, notify.go); it refuses a channel
+// that is not a C/G channel id, and the Notifier is what keeps it to home.
 func (s *SlackAdapter) PostNotify(channel, thread, text string) (message, landed string, err error) {
 	if !slackIsHomeChannelID(channel) {
 		return "", "", fmt.Errorf("slack: not a channel id: %q", channel)

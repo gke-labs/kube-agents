@@ -96,8 +96,8 @@ type NotifyConversations interface {
 }
 
 // notifyPoster is the backend half: post text into a space, new thread or
-// reply, and say where it landed. GoogleChatAdapter.PostNotify is the one
-// implementation.
+// reply, and say where it landed. GoogleChatAdapter and SlackAdapter
+// implement it; the Notifier, not the poster, holds the home-only bound.
 type notifyPoster interface {
 	PostNotify(space, thread, text string) (message, landed string, err error)
 }

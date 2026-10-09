@@ -667,7 +667,8 @@ func TestRotatingTheDiscordTokenRollsTheGatewayToo(t *testing.T) {
 
 // TestTheSlackHomeChannelReachesTheArmedGateway: the chat.notify route's
 // Slack arm posts to slack.homeChannel, so a Slack-armed gateway carries it,
-// trimmed, and an install with no home channel leaves the route unarmed.
+// trimmed; an install with no home channel renders none, and its route then
+// serves conversation requests only.
 func TestTheSlackHomeChannelReachesTheArmedGateway(t *testing.T) {
 	t.Setenv(a2aInjectBackendEnvVar, "")
 	for _, tc := range []struct {
@@ -738,6 +739,11 @@ func TestTheAgentRoutesSlackProactivePostsExactlyWhenArmed(t *testing.T) {
 			}
 			if (tc.home || tc.conversation) && legacySlackConsumer(tc.agent) {
 				t.Error("the notify route and the legacy Hermes slack platform both render")
+			}
+			// The audit relay reads the home channel from the agent's env; under
+			// next it rides with the home route, trimmed and validated.
+			if home, ok := env["SLACK_HOME_CHANNEL"]; tc.home && (!ok || strings.TrimSpace(home.Value) != home.Value || home.Value == "") {
+				t.Errorf("SLACK_HOME_CHANNEL = %q (present=%v), want the home channel id beside %s", home.Value, ok, a2aNotifyPlatformEnvVar)
 			}
 		})
 	}
