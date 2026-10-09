@@ -1,0 +1,144 @@
+name: "Autopush-Next: Deploy"
+
+# Deploys the latest built commit to the autopush-next environment, on the same
+# trigger as autopush-deploy.yml and resolving the same commit. Its own file,
+# so that its own workflow-level concurrency group serializes resolve and
+# deploy as a unit: a run for an older publish can never deploy after a newer
+# one, and a slow or leased autopush-next never holds up autopush.
+#
+# autopush-next has its own GitHub environment and GCP project, whose
+# PLATFORM_AGENT_MODE is next. It holds next only once the chart and installer
+# render spec.mode (#2740, product item 1); until then the reconcile installs
+# today there, as on autopush. Until the environment is provisioned its deploy
+# reports `skipped` with a notice (skip_unconfigured).
+
+on:
+  # zizmor: ignore[dangerous-triggers]
+  workflow_run:
+    workflows:
+      - "Publish Images to GHCR"
+    types:
+      - completed
+    # Only main's publishes: the publish workflow also completes for pushes to a
+    # release line, and a run created for one would enter this workflow's single
+    # concurrency group before the job's `if:` skips it, cancelling a pending
+    # main deploy. The `if:` below keeps its own head_branch check as the
+    # second layer.
+    branches:
+      - main
+  #checkov:skip=CKV_GHA_7:Standalone launch requires optional image tag and lease policy inputs
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: "Commit SHA to deploy (leave empty to deploy triggering commit or HEAD of main)"
+        required: false
+        default: ""
+        type: string
+      lease_policy:
+        description: "What to do when somebody is live-testing against autopush-next"
+        required: false
+        default: "fail"
+        type: choice
+        options:
+          - "fail"
+          - "ignore"
+          - "defer"
+
+permissions:
+  contents: read
+
+# A run takes its group when it is created, before resolve-candidate's `if:`
+# reads the publish's conclusion, and a newer run cancels a pending one. So a
+# failed or cancelled publish on main gets a group of its own: otherwise its
+# run, which deploys nothing, would evict a pending deploy of a good publish.
+concurrency:
+  group: ${{ (github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success') && 'autopush-next-deploy' || format('autopush-next-deploy-noop-{0}', github.run_id) }}
+  cancel-in-progress: false
+
+jobs:
+  # Resolves the commit exactly as autopush-deploy.yml does. Bound to autopush
+  # for vars.REGISTRY_PREFIX, which autopush-next's has to match. Binding
+  # autopush-next instead would create that environment before it is
+  # provisioned.
+  resolve-candidate:
+    if: |
+      github.repository == 'gke-labs/kube-agents' &&
+      (github.event_name == 'workflow_dispatch' || (
+        github.event.workflow_run.conclusion == 'success' &&
+        github.event.workflow_run.head_repository.full_name == github.repository &&
+        (github.event.workflow_run.event == 'push' || github.event.workflow_run.event == 'workflow_dispatch') &&
+        github.event.workflow_run.head_branch == 'main'
+      ))
+    runs-on: ubuntu-latest
+    environment: autopush
+    permissions:
+      contents: read
+    outputs:
+      commit_sha: ${{ steps.resolve.outputs.commit_sha }}
+      lease_policy: ${{ steps.resolve.outputs.lease_policy }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Resolve target commit and parameters
+        id: resolve
+        env:
+          # resolve_deploy.sh's autopush rule: the triggering commit, or the
+          # dispatched tag. autopush-next deploys what autopush deploys.
+          TARGET_ENVIRONMENT: "autopush"
+          INPUT_TAG: ${{ inputs.image_tag }}
+          INPUT_LEASE_POLICY: ${{ inputs.lease_policy }}
+          EVENT_NAME: ${{ github.event_name }}
+          RUN_HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: ./scripts/release/resolve_deploy.sh
+
+      - name: Verify candidate images exist in GHCR
+        env:
+          COMMIT_SHA: ${{ steps.resolve.outputs.commit_sha }}
+          REGISTRY_PREFIX: ${{ vars.REGISTRY_PREFIX }}
+        run: ./scripts/release/verify_candidate_images.sh
+
+  deploy:
+    needs: resolve-candidate
+    if: github.repository == 'gke-labs/kube-agents'
+    permissions:
+      contents: read
+      id-token: write
+      actions: read
+    # workflow_run is a low-trust trigger, so this run's cache access already
+    # defaults to read; the cap stops the called workflow requesting write.
+    cache-mode: read
+    uses: ./.github/workflows/reconcile-environment.yml # zizmor: ignore[secrets-inherit]
+    with:
+      github_environment: "autopush-next"
+      mode: "apply"
+      image_tag: ${{ needs.resolve-candidate.outputs.commit_sha }}
+      lease_policy: ${{ needs.resolve-candidate.outputs.lease_policy }}
+      # Until the environment exists with a GCP_PROJECT_ID. Drop it once it
+      # does, so an environment that loses its configuration reds this run.
+      skip_unconfigured: true
+    secrets: inherit
+
+  verify-deploy:
+    name: Verify Deploy Applied
+    needs: [resolve-candidate, deploy]
+    if: github.repository == 'gke-labs/kube-agents'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Verify Autopush-Next Deploy Result
+        env:
+          TARGET_ENVIRONMENT: "autopush-next"
+          DEPLOY_RESULT: ${{ needs.deploy.outputs.result }}
+          # Paired with skip_unconfigured above, and removed with it.
+          ALLOW_SKIPPED: "true"
+        run: ./scripts/release/verify_deploy_result.sh

@@ -284,7 +284,8 @@ func (n *Notifier) validate(data []byte) (lib.NotifyRequest, *lib.NotifyReply) {
 	if strings.TrimSpace(req.Text) == "" {
 		// An empty request is how the kanban notifier's stand-in probes
 		// whether the route is armed (any answer means it is), every few
-		// seconds while it has work: refused, but not worth a warning.
+		// minutes while any card subscribes to a home-space thread: refused,
+		// but not worth a warning.
 		n.log.Debug("notify: empty request (route probe) answered")
 		r := lib.NotifyReply{Error: notifyEmptyText}
 		return req, &r

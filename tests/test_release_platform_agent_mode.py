@@ -359,7 +359,7 @@ class WorkflowsCarryTheModeTest(unittest.TestCase):
         """The sibling guards match these names case-insensitively, so this does too."""
         step = _step(_workflow("deploy-environment.yml"), "deploy-environment", "Check the PlatformAgent mode")
         self.assertEqual(step["env"]["TARGET"], "${{ inputs.github_environment }}")
-        for target in ("autopush", "staging", "Staging", "AUTOPUSH"):
+        for target in ("autopush", "autopush-next", "staging", "Staging", "AUTOPUSH", "Autopush-Next"):
             with self.subTest(target=target):
                 proc, output = self._run_mode_check("next", target)
                 self.assertEqual(proc.returncode, 1)

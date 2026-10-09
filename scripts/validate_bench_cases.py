@@ -402,6 +402,10 @@ CHECK_ASSERTIONS: dict[str, tuple[str, ...]] = {
     # This repository, agent-disk-reading. No field: whether every first-run audit has a run
     # claimed since the stage marked it is the whole assertion.
     "oobe_audits_started": (),
+    # This repository, agent-pod-reading: the states of findings-queue rows a
+    # case planted. The rows it names are the assertion; with none it could
+    # only pass.
+    "findings_item_state": ("finding_ids",),
 }
 
 # Check types that read live cluster state. A case using one is asserting on

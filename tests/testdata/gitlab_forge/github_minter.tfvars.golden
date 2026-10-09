@@ -42,6 +42,10 @@ vertex_project_id  = ""
 vertex_location    = ""
 vertex_manage_serving_project = true
 
+# The PlatformAgent's spec.mode (PLATFORM_AGENT_MODE in install.env). The
+# composition passes the chart nothing for "today", so its CR carries no mode.
+platform_agent_mode = "today"
+
 # Gateway redaction (LITELLM_REDACTION_* in install.env). The composition
 # renders nothing into the chart while enabled is false.
 litellm_redaction = { enabled = false }
