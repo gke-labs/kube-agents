@@ -128,7 +128,7 @@ type stubUsageSource struct {
 	hook func(addr string)
 }
 
-func (s *stubUsageSource) Scrape(ctx context.Context, addr, _ string) (usageReading, error) {
+func (s *stubUsageSource) Scrape(ctx context.Context, addr string, counters []string) (usageReading, error) {
 	s.mu.Lock()
 	s.calls = append(s.calls, addr)
 	block := s.blocking[addr]
@@ -152,18 +152,64 @@ func (s *stubUsageSource) Scrape(ctx context.Context, addr, _ string) (usageRead
 	if !ok {
 		return usageReading{}, &usageScrapeError{Kind: usageScrapeKindConnect}
 	}
-	return reading, nil
+	// set's sample is the pod group's first counter; setSample names the rest.
+	out := usageReading{Samples: map[string]int64{}, StartTime: reading.StartTime, Clusters: reading.Clusters}
+	for i, counter := range counters {
+		value, named := reading.Samples[counter]
+		if !named && i == 0 {
+			value = reading.Samples[stubPrimarySample]
+		}
+		out.Samples[counter] = value
+	}
+	return out, nil
 }
+
+// stubPrimarySample keys the sample set gives, handed out as the first counter
+// a scrape asks for.
+const stubPrimarySample = ""
 
 func (s *stubUsageSource) set(addr string, sample int64, start *float64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	delete(s.errs, addr)
-	s.readings[addr] = usageReading{Sample: sample, StartTime: start}
+	reading := s.readings[addr]
+	if reading.Samples == nil {
+		reading.Samples = map[string]int64{}
+	}
+	reading.Samples[stubPrimarySample] = sample
+	reading.StartTime = start
+	s.readings[addr] = reading
 }
 
-// setClusters gives addr's reading the watcher's cluster gauge; set clears it,
-// as a broker's body would.
+// setSample gives addr's reading a named counter's sample beside set's.
+func (s *stubUsageSource) setSample(addr, counter string, sample int64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	reading := s.readings[addr]
+	if reading.Samples == nil {
+		reading.Samples = map[string]int64{}
+	}
+	reading.Samples[counter] = sample
+	s.readings[addr] = reading
+}
+
+// podEntry is the document's entry for the pod uid, where the pod feeds one
+// counter; a pod feeding several is indexed by usagePodEntryKey.
+func podEntry(doc *usageDocument, uid string) *usagePodEntry {
+	var found *usagePodEntry
+	for _, entry := range doc.Pods {
+		if entry.PodUID == uid {
+			if found != nil {
+				panic("podEntry on a pod with several counters: " + uid)
+			}
+			found = entry
+		}
+	}
+	return found
+}
+
+// setClusters gives addr's reading the watcher's cluster gauge, which set
+// leaves in place; a reading with none models a broker's body.
 func (s *stubUsageSource) setClusters(addr string, registered, monitored int64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -482,9 +528,11 @@ func TestUsagePoller_FindsThePortByNameOnTheSidecar(t *testing.T) {
 	}
 	addrs := map[string]string{}
 	for _, target := range targets {
-		addrs[target.counter] = target.addr
+		for _, counter := range target.counters {
+			addrs[counter] = target.addr
+		}
 	}
-	if addrs[usageCounterEventsIngested] != gatewayAddr() || addrs[usageCounterToolExecutions] != brokerAddr() {
+	if addrs[usageCounterEventsIngested] != gatewayAddr() || addrs[usageCounterToolExecutions] != brokerAddr() || addrs[usageCounterRemediationsProposed] != brokerAddr() {
 		t.Errorf("addresses: %v", addrs)
 	}
 	if !live["gw-pending"] || !live["gw-noport"] || !live["gw-a"] || !live["broker-b"] {
@@ -544,11 +592,12 @@ func TestUsagePoller_RepairsAStatusBehindTheConfigMap(t *testing.T) {
 		Version:       usageDocumentVersion,
 		AgentUID:      usageTestAgentUID,
 		FirstRecorded: metav1.NewTime(usageClock(1)),
-		Totals:        map[string]int64{usageCounterToolExecutions: 10, usageCounterEventsIngested: 4},
+		Totals:        map[string]int64{usageCounterToolExecutions: 10, usageCounterEventsIngested: 4, usageCounterRemediationsProposed: 0},
 		LastMoved:     &moved,
 		Pods: map[string]*usagePodEntry{
-			"gw-a":     {Name: "agent-gateway-aaa", Counter: usageCounterEventsIngested, Sample: 4, Marker: moved},
-			"broker-b": {Name: "agent-credential-proxy-bbb", Counter: usageCounterToolExecutions, Sample: 10, Marker: moved},
+			usagePodEntryKey("gw-a", usageCounterEventsIngested):           {Name: "agent-gateway-aaa", PodUID: "gw-a", Counter: usageCounterEventsIngested, Sample: 4, Marker: moved},
+			usagePodEntryKey("broker-b", usageCounterToolExecutions):       {Name: "agent-credential-proxy-bbb", PodUID: "broker-b", Counter: usageCounterToolExecutions, Sample: 10, Marker: moved},
+			usagePodEntryKey("broker-b", usageCounterRemediationsProposed): {Name: "agent-credential-proxy-bbb", PodUID: "broker-b", Counter: usageCounterRemediationsProposed, Sample: 0, Marker: moved},
 		},
 	})
 	h.stub.set(gatewayAddr(), 4, nil)
@@ -578,9 +627,9 @@ func TestUsagePoller_ReseedsAnInvalidDocument(t *testing.T) {
 			Version:       usageDocumentVersion,
 			AgentUID:      usageTestAgentUID,
 			FirstRecorded: stamp,
-			Totals:        map[string]int64{usageCounterToolExecutions: 10, usageCounterEventsIngested: 4},
+			Totals:        map[string]int64{usageCounterToolExecutions: 10, usageCounterEventsIngested: 4, usageCounterRemediationsProposed: 0},
 			Pods: map[string]*usagePodEntry{
-				"broker-b": {Name: "agent-credential-proxy-bbb", Counter: usageCounterToolExecutions, Sample: 10, Marker: stamp},
+				usagePodEntryKey("broker-b", usageCounterToolExecutions): {Name: "agent-credential-proxy-bbb", PodUID: "broker-b", Counter: usageCounterToolExecutions, Sample: 10, Marker: stamp},
 			},
 		}
 	}
@@ -593,7 +642,7 @@ func TestUsagePoller_ReseedsAnInvalidDocument(t *testing.T) {
 		{"a total below the status", func(d *usageDocument) { d.Totals[usageCounterToolExecutions] = 1 }},
 		{"a first-recorded time in the future", func(d *usageDocument) { d.FirstRecorded = metav1.NewTime(usageClock(59)) }},
 		{"a first-recorded time before the CR", func(d *usageDocument) { d.FirstRecorded = metav1.NewTime(created.Add(-time.Minute)) }},
-		{"a negative sample", func(d *usageDocument) { d.Pods["broker-b"].Sample = -1 }},
+		{"a negative sample", func(d *usageDocument) { podEntry(d, "broker-b").Sample = -1 }},
 		{"an unknown version", func(d *usageDocument) { d.Version = usageDocumentVersion + 1 }},
 	}
 	for _, tc := range cases {
@@ -614,7 +663,7 @@ func TestUsagePoller_ReseedsAnInvalidDocument(t *testing.T) {
 			if got.Totals[usageCounterToolExecutions] != 7 || got.Totals[usageCounterEventsIngested] != 0 {
 				t.Errorf("totals = %v, want seeded from the status (7, 0)", got.Totals)
 			}
-			if got.Pods["broker-b"] == nil || got.Pods["broker-b"].Sample != 500 || got.Pods["gw-a"] == nil || got.Pods["gw-a"].Sample != 300 {
+			if got.Pods[usagePodEntryKey("broker-b", usageCounterToolExecutions)] == nil || got.Pods[usagePodEntryKey("broker-b", usageCounterToolExecutions)].Sample != 500 || podEntry(got, "gw-a") == nil || podEntry(got, "gw-a").Sample != 300 {
 				t.Errorf("pods = %+v, want both recorded at their samples", got.Pods)
 			}
 			if h.patches != 0 {
@@ -629,7 +678,7 @@ func TestUsagePoller_ReseedsAnInvalidDocument(t *testing.T) {
 func TestUsagePoller_ReownsAPredecessorsConfigMap(t *testing.T) {
 	created := usageClock(0).Add(-time.Hour)
 	stamp := metav1.NewTime(usageClock(1))
-	doc := &usageDocument{Version: usageDocumentVersion, AgentUID: usageTestAgentUID, FirstRecorded: stamp, Totals: map[string]int64{usageCounterToolExecutions: 10, usageCounterEventsIngested: 0}, Pods: map[string]*usagePodEntry{}}
+	doc := &usageDocument{Version: usageDocumentVersion, AgentUID: usageTestAgentUID, FirstRecorded: stamp, Totals: map[string]int64{usageCounterToolExecutions: 10, usageCounterEventsIngested: 0, usageCounterRemediationsProposed: 0}, Pods: map[string]*usagePodEntry{}}
 	raw, _ := json.Marshal(doc)
 	predecessor := &corev1.ConfigMap{
 		ObjectMeta: metav1.ObjectMeta{
@@ -757,14 +806,14 @@ func TestUsagePoller_FailureStreaksAndLateRecording(t *testing.T) {
 	default:
 		t.Fatal("no event after a third failed poll; a standing failure must re-record so its cause outlives the event TTL")
 	}
-	if doc := h.document(); doc.Pods["gw-a"] != nil {
-		t.Fatalf("an unreadable pod was recorded: %+v", doc.Pods["gw-a"])
+	if doc := h.document(); podEntry(doc, "gw-a") != nil {
+		t.Fatalf("an unreadable pod was recorded: %+v", podEntry(doc, "gw-a"))
 	}
 
 	// Back, created before the document: recorded, adds nothing; then counted.
 	h.stub.set(gatewayAddr(), 400, ptr.To(1.0))
 	h.poll(20)
-	if doc := h.document(); doc.Pods["gw-a"] == nil || doc.Pods["gw-a"].Sample != 400 || doc.Totals[usageCounterEventsIngested] != 0 {
+	if doc := h.document(); podEntry(doc, "gw-a") == nil || podEntry(doc, "gw-a").Sample != 400 || doc.Totals[usageCounterEventsIngested] != 0 {
 		t.Fatalf("after recovery: %+v", doc)
 	}
 	h.stub.set(gatewayAddr(), 403, ptr.To(1.0))
@@ -926,8 +975,179 @@ func TestUsagePoller_TwoGatewayReplicas(t *testing.T) {
 	if status := h.status(); status.EventsIngestedTotal != 10 {
 		t.Fatalf("the lagger's catch-up was counted: %+v", status)
 	}
-	if doc := h.document(); !doc.Pods["gw-b"].Marker.Time.Equal(usageClock(10)) {
-		t.Fatalf("the reset replica did not take the sibling's marker: %+v", doc.Pods["gw-b"])
+	if doc := h.document(); !podEntry(doc, "gw-b").Marker.Time.Equal(usageClock(10)) {
+		t.Fatalf("the reset replica did not take the sibling's marker: %+v", podEntry(doc, "gw-b"))
+	}
+}
+
+// The broker pod feeds two counters from one body. Each has its own baseline
+// entry under the pod, both advance, both survive the pod's restart, and the
+// proposals move lastActiveTime as a brokered action does.
+func TestUsagePoller_ProposalsCountBesideToolExecutions(t *testing.T) {
+	created := usageClock(0).Add(-time.Hour)
+	h := newUsageHarness(t, usageTestAgent(created), usageDefaultObjects(created)...)
+	h.stub.set(gatewayAddr(), 0, nil)
+	h.stub.set(brokerAddr(), 70, ptr.To(200.0))
+	h.stub.setSample(brokerAddr(), usageCounterRemediationsProposed, 2)
+	h.poll(5)
+	if status := h.status(); status.RemediationsProposedTotal != 0 || status.LastActiveTime != nil {
+		t.Fatalf("the first poll wrote a counter: %+v", status)
+	}
+	doc := h.document()
+	if len(doc.Pods) != 3 {
+		t.Fatalf("the document holds %d entries, want 3 (gateway events, broker tools, broker proposals): %+v", len(doc.Pods), doc.Pods)
+	}
+
+	// A proposal opened and no command run: the proposals counter moves alone.
+	h.stub.setSample(brokerAddr(), usageCounterRemediationsProposed, 3)
+	h.poll(10)
+	status := h.status()
+	if status.RemediationsProposedTotal != 1 || status.ToolExecutionsTotal != 0 {
+		t.Fatalf("after one proposal: %+v, want 1 proposal and 0 tool executions", status)
+	}
+	if status.LastActiveTime == nil || !status.LastActiveTime.Time.Equal(usageClock(10)) {
+		t.Fatalf("a proposal did not move lastActiveTime: %v", status.LastActiveTime)
+	}
+
+	// Both move.
+	h.stub.set(brokerAddr(), 75, ptr.To(200.0))
+	h.stub.setSample(brokerAddr(), usageCounterRemediationsProposed, 4)
+	h.poll(15)
+	if status := h.status(); status.RemediationsProposedTotal != 2 || status.ToolExecutionsTotal != 5 {
+		t.Fatalf("after both moved: %+v, want 2 proposals and 5 tool executions", status)
+	}
+
+	// The broker pod restarts in place: a later start time, both counters from
+	// zero, both whole samples added, nothing lost.
+	h.stub.set(brokerAddr(), 1, ptr.To(300.0))
+	h.stub.setSample(brokerAddr(), usageCounterRemediationsProposed, 1)
+	h.poll(20)
+	if status := h.status(); status.RemediationsProposedTotal != 3 || status.ToolExecutionsTotal != 6 {
+		t.Fatalf("after the restart: %+v, want 3 proposals and 6 tool executions", status)
+	}
+}
+
+// A version-1 document, entries keyed by pod UID and two totals, is migrated
+// in place on the first poll: the totals survive, with the status pruned so a
+// re-seed would have had nothing to start from; the interval's deltas add
+// against the migrated baseline; the first-recorded time is kept; and the
+// broker's new counter gets its entry.
+func TestUsagePoller_MigratesAVersionOneDocument(t *testing.T) {
+	created := usageClock(0).Add(-time.Hour)
+	h := newUsageHarness(t, usageTestAgent(created), usageDefaultObjects(created)...)
+	moved := metav1.NewTime(usageClock(3))
+	h.writeDocument(&usageDocument{
+		Version:       usageDocumentVersionPodKeyed,
+		AgentUID:      usageTestAgentUID,
+		FirstRecorded: metav1.NewTime(usageClock(1)),
+		Totals:        map[string]int64{usageCounterToolExecutions: 10, usageCounterEventsIngested: 4},
+		LastMoved:     &moved,
+		Pods: map[string]*usagePodEntry{
+			"gw-a":     {Name: "agent-gateway-aaa", Counter: usageCounterEventsIngested, Sample: 40, Marker: moved},
+			"broker-b": {Name: "agent-credential-proxy-bbb", Counter: usageCounterToolExecutions, Sample: 100, Marker: moved},
+		},
+	})
+	h.pruning = true
+	h.stub.set(gatewayAddr(), 46, nil)
+	h.stub.set(brokerAddr(), 103, nil)
+	h.stub.setSample(brokerAddr(), usageCounterRemediationsProposed, 2)
+	h.poll(10)
+	doc := h.document()
+	if doc.Version != usageDocumentVersion || !doc.FirstRecorded.Time.Equal(usageClock(1)) {
+		t.Fatalf("migrated document: version %d, firstRecorded %v; want %d and %v", doc.Version, doc.FirstRecorded, usageDocumentVersion, usageClock(1))
+	}
+	// The two kept totals take their deltas; the counter the layout lacked,
+	// with nothing in the status, takes the broker's whole sample even though
+	// the pod predates the document: no document and no status has seen any
+	// of it.
+	if doc.Totals[usageCounterToolExecutions] != 13 || doc.Totals[usageCounterEventsIngested] != 10 || doc.Totals[usageCounterRemediationsProposed] != 2 {
+		t.Fatalf("totals after the migrating poll: %v, want 13, 10 and 2 (the deltas added to the kept totals, the whole sample to the new one)", doc.Totals)
+	}
+	for _, key := range []string{
+		usagePodEntryKey("gw-a", usageCounterEventsIngested),
+		usagePodEntryKey("broker-b", usageCounterToolExecutions),
+		usagePodEntryKey("broker-b", usageCounterRemediationsProposed),
+	} {
+		if e := doc.Pods[key]; e == nil || e.PodUID == "" {
+			t.Fatalf("entry %q after the migration: %+v", key, e)
+		}
+	}
+	if doc.Pods[usagePodEntryKey("broker-b", usageCounterRemediationsProposed)].Sample != 2 {
+		t.Fatalf("the new counter was not recorded at its sample: %+v", doc.Pods)
+	}
+}
+
+// A version-1 document read under a status that already carries the newer
+// counter -- this operator wrote it, was rolled back to one that re-seeded a
+// version-1 document, and came back -- starts the missing total at that
+// value, so the read-back floor does not refuse the migrated document and
+// re-seed it; the broker's sample is baselined and adds nothing, since the
+// status may already hold part of it.
+func TestUsagePoller_MigratesAVersionOneDocumentUnderAStatusFloor(t *testing.T) {
+	created := usageClock(0).Add(-time.Hour)
+	agent := usageTestAgent(created)
+	agent.Status.Usage.RemediationsProposedTotal = 5
+	h := newUsageHarness(t, agent, usageDefaultObjects(created)...)
+	moved := metav1.NewTime(usageClock(3))
+	h.writeDocument(&usageDocument{
+		Version:       usageDocumentVersionPodKeyed,
+		AgentUID:      usageTestAgentUID,
+		FirstRecorded: metav1.NewTime(usageClock(1)),
+		Totals:        map[string]int64{usageCounterToolExecutions: 10, usageCounterEventsIngested: 4},
+		LastMoved:     &moved,
+		Pods: map[string]*usagePodEntry{
+			"gw-a":     {Name: "agent-gateway-aaa", Counter: usageCounterEventsIngested, Sample: 40, Marker: moved},
+			"broker-b": {Name: "agent-credential-proxy-bbb", Counter: usageCounterToolExecutions, Sample: 100, Marker: moved},
+		},
+	})
+	h.stub.set(gatewayAddr(), 46, nil)
+	h.stub.set(brokerAddr(), 103, nil)
+	h.stub.setSample(brokerAddr(), usageCounterRemediationsProposed, 7)
+	h.poll(10)
+	doc := h.document()
+	if !doc.FirstRecorded.Time.Equal(usageClock(1)) {
+		t.Fatalf("the migrated document was re-seeded: firstRecorded %v, want %v", doc.FirstRecorded, usageClock(1))
+	}
+	if doc.Totals[usageCounterToolExecutions] != 13 || doc.Totals[usageCounterEventsIngested] != 10 || doc.Totals[usageCounterRemediationsProposed] != 5 {
+		t.Fatalf("totals after the migrating poll: %v, want 13, 10 and 5 (the status floor, the sample baselined)", doc.Totals)
+	}
+	if e := doc.Pods[usagePodEntryKey("broker-b", usageCounterRemediationsProposed)]; e == nil || e.Sample != 7 {
+		t.Fatalf("the new counter was not baselined at its sample: %+v", e)
+	}
+	if got := h.status().RemediationsProposedTotal; got != 5 {
+		t.Fatalf("status.usage.remediationsProposedTotal = %d, want 5", got)
+	}
+}
+
+// A failing broker's Warning names both status fields its counters project
+// to, through the poll rather than the message builder alone.
+func TestUsagePoller_WarningNamesEveryFieldOfAFailingBroker(t *testing.T) {
+	created := usageClock(0).Add(-time.Hour)
+	h := newUsageHarness(t, usageTestAgent(created), usageDefaultObjects(created)...)
+	h.stub.set(gatewayAddr(), 10, nil)
+	h.stub.fail(brokerAddr(), usageScrapeKindRefused)
+	h.poll(5)
+	h.poll(10)
+	select {
+	case ev := <-h.recorder.Events:
+		want := "agent-credential-proxy-bbb (status.usage.toolExecutionsTotal, status.usage.remediationsProposedTotal)"
+		if !strings.Contains(ev, want) {
+			t.Fatalf("event = %q, want it to name the broker's fields as %q", ev, want)
+		}
+	default:
+		t.Fatal("no event after two failed polls")
+	}
+}
+
+// The Warning names every status field a pod's counters project to, as paths.
+func TestUsageScrapeFailureMessage_NamesEachStatusField(t *testing.T) {
+	msg := usageScrapeFailureMessage([]usageScrapeFailure{{
+		name: "agent-credential-proxy-bbb", counter: usageStatusFieldList(usageBrokerCounters), detail: "connection refused",
+		err: &usageScrapeError{Kind: usageScrapeKindRefused},
+	}})
+	want := "pod agent-credential-proxy-bbb (status.usage.toolExecutionsTotal, status.usage.remediationsProposedTotal): connection refused"
+	if !strings.Contains(msg, want) {
+		t.Fatalf("message %q does not name both fields as %q", msg, want)
 	}
 }
 
@@ -1427,7 +1647,7 @@ func TestUsagePoller_ATerminatingSiblingSuppressesNoAdvance(t *testing.T) {
 		t.Fatalf("with the old pod terminating: %+v, want 18: the new replica's advance was reset against a pod that is never read again", status)
 	}
 	doc := h.document()
-	if doc.Pods["gw-old"] != nil {
+	if podEntry(doc, "gw-old") != nil {
 		t.Fatalf("the terminating pod's entry was kept: %+v", doc.Pods)
 	}
 	// Gone for good: the new replica carries on alone.
@@ -1487,7 +1707,7 @@ func TestUsagePoller_AnEvictedSiblingSuppressesNoAdvance(t *testing.T) {
 	if status := h.status(); status.EventsIngestedTotal != 18 {
 		t.Fatalf("with the old pod evicted: %+v, want 18: the new replica's advance was reset against a pod that is never read again", status)
 	}
-	if doc := h.document(); doc.Pods["gw-old"] != nil {
+	if doc := h.document(); podEntry(doc, "gw-old") != nil {
 		t.Fatalf("the evicted pod's entry was kept: %+v", doc.Pods)
 	}
 }

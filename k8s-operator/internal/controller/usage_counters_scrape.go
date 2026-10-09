@@ -69,6 +69,13 @@ const (
 	toolInvocationsSeries  = "kubeagents_tool_invocations_total"
 	eventsInjectedSeries   = "k8s_event_watcher_events_injected_total"
 	processStartTimeSeries = "process_start_time_seconds"
+	// vcsRequestsSeries is the broker's version-control counter, by verb and
+	// status; remediationsProposedTotal sums it under vcsProposalCreateVerb
+	// and vcsStatusSuccess alone: a proposal the forge accepted is a proposal.
+	vcsRequestsSeries     = "kubeagents_vcs_requests_total"
+	vcsVerbLabel          = "verb"
+	vcsProposalCreateVerb = "proposal-create"
+	vcsStatusSuccess      = "success"
 	// clusterUpSeries is the watcher's per-cluster gauge, one series per
 	// cluster it built a client for, 1 once that cluster's informer has
 	// synced and is delivering events. Read from the same body as the
@@ -112,21 +119,34 @@ const (
 
 var toolInvocationsCountedStatuses = map[string]bool{"success": true, "error": true}
 
-// usageSeriesFor is the family each counter is read from and, for the broker,
-// the status values summed; nil statuses sums every label set.
-func usageSeriesFor(counter string) (family string, statuses map[string]bool) {
-	if counter == usageCounterEventsIngested {
+// usageLabelFilter is, per label name, the values a metric must carry to be
+// summed into a counter; a nil filter sums every label set.
+type usageLabelFilter map[string]map[string]bool
+
+// usageSeriesFor is the family each counter is read from and the label values
+// summed: the broker's tool counter over its counted statuses, the proposals
+// counter over the one verb and status that is a proposal opened, the
+// watcher's injected counter over every label set.
+func usageSeriesFor(counter string) (family string, filter usageLabelFilter) {
+	switch counter {
+	case usageCounterEventsIngested:
 		return eventsInjectedSeries, nil
+	case usageCounterRemediationsProposed:
+		return vcsRequestsSeries, usageLabelFilter{
+			vcsVerbLabel:               {vcsProposalCreateVerb: true},
+			toolInvocationsStatusLabel: {vcsStatusSuccess: true},
+		}
+	default:
+		return toolInvocationsSeries, usageLabelFilter{toolInvocationsStatusLabel: toolInvocationsCountedStatuses}
 	}
-	return toolInvocationsSeries, toolInvocationsCountedStatuses
 }
 
-// usageReading is what one scrape yields: the counter summed over its label
-// sets, the start time the body carried, nil when it carried none, and, for
-// the watcher's body alone, its cluster gauges; nil for any other body, so
+// usageReading is what one scrape yields: each wanted counter summed over its
+// label sets, the start time the body carried, nil when it carried none, and,
+// for the watcher's body alone, its cluster gauges; nil for any other body, so
 // that a poll can tell a watcher reporting no clusters from no watcher read.
 type usageReading struct {
-	Sample    int64
+	Samples   map[string]int64
 	StartTime *float64
 	Clusters  *usageClusterGauges
 }
@@ -200,7 +220,7 @@ func usageTimedOut(err error) bool {
 // test supplies a stub, and a deployment that cannot admit operator-to-pod
 // traffic could gain another without changing the accumulation or the writer.
 type usageSource interface {
-	Scrape(ctx context.Context, addr, counter string) (usageReading, error)
+	Scrape(ctx context.Context, addr string, counters []string) (usageReading, error)
 }
 
 // podUsageSource reads /metrics at a pod IP and port over the pod network.
@@ -230,7 +250,7 @@ func newPodUsageSource() *podUsageSource {
 
 // Scrape GETs the listener at addr and folds the body for counter. Any status
 // other than 200 is a failed scrape.
-func (s *podUsageSource) Scrape(ctx context.Context, addr, counter string) (usageReading, error) {
+func (s *podUsageSource) Scrape(ctx context.Context, addr string, counters []string) (usageReading, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, usageScrapeScheme+addr+usageMetricsPath, nil)
 	if err != nil {
 		return usageReading{}, &usageScrapeError{Kind: usageScrapeKindConnect}
@@ -243,33 +263,43 @@ func (s *podUsageSource) Scrape(ctx context.Context, addr, counter string) (usag
 	if resp.StatusCode != http.StatusOK {
 		return usageReading{}, &usageScrapeError{Kind: usageScrapeKindStatus, Status: resp.StatusCode}
 	}
-	return foldUsageBody(resp.Body, counter)
+	return foldUsageBody(resp.Body, counters)
 }
 
 // foldUsageBody scans body line by line and keeps none of it: a line that could
-// be a wanted family -- counter's own, the start-time gauge, and for the
+// be a wanted family -- each counter's own, the start-time gauge, and for the
 // watcher's body the per-cluster up gauge, one that contains a wanted name as a
 // substring -- is parsed on its own with expfmt, and a metric expfmt names as
-// one of them is folded as it is read, the counter into the running sum and the
-// up gauge into the cluster counts; every other line is skipped unread. The substring is only a prefilter: the parser,
+// one of them is folded as it is read, a counter's into its running sum under
+// its label filter and the up gauge into the cluster counts; every other line
+// is skipped unread. The substring is only a prefilter: the parser,
 // not a hand-read of the line, names the metric, so the name in a comment or a
 // label value adds nothing and a UTF-8 name the parser accepts is not dropped by
 // a stricter hand-read. A candidate line that does not parse, or a sample that
 // is negative or not finite, is a failed scrape; a wanted line past the bound is
 // too, but a line of any other family past the bound is skipped, not a failure
 // (usageReadScrapeLine).
-func foldUsageBody(body io.Reader, counter string) (usageReading, error) {
-	family, statuses := usageSeriesFor(counter)
+func foldUsageBody(body io.Reader, counters []string) (usageReading, error) {
 	parser := expfmt.NewTextParser(model.UTF8Validation)
-	var sum float64
+	sums := make(map[string]float64, len(counters))
 	var start *float64
-	// The watcher's body is also read for its cluster gauge; wanted is every
-	// family the parser is asked to name in this body.
+	// wanted is every family the parser is asked to name in this body: each
+	// counter's, the start-time gauge, and the watcher's cluster gauge when
+	// the body is the watcher's.
 	var clusters *usageClusterGauges
-	wanted := []string{family, processStartTimeSeries}
-	if family == eventsInjectedSeries {
-		clusters = &usageClusterGauges{}
-		wanted = append(wanted, clusterUpSeries)
+	counterOf := make(map[string]string, len(counters))
+	filters := make(map[string]usageLabelFilter, len(counters))
+	wanted := []string{processStartTimeSeries}
+	for _, counter := range counters {
+		family, filter := usageSeriesFor(counter)
+		counterOf[family] = counter
+		filters[counter] = filter
+		sums[counter] = 0
+		wanted = append(wanted, family)
+		if family == eventsInjectedSeries {
+			clusters = &usageClusterGauges{}
+			wanted = append(wanted, clusterUpSeries)
+		}
 	}
 	reader := bufio.NewReaderSize(body, usageScrapeLineBuffer)
 	for {
@@ -335,10 +365,11 @@ func foldUsageBody(body io.Reader, counter string) (usageReading, error) {
 						}
 						continue
 					}
-					if statuses != nil && !statuses[usageLabelValue(metric, toolInvocationsStatusLabel)] {
+					counter := counterOf[name]
+					if !usageLabelsMatch(metric, filters[counter]) {
 						continue
 					}
-					sum += value
+					sums[counter] += value
 				}
 			}
 		}
@@ -346,10 +377,25 @@ func foldUsageBody(body io.Reader, counter string) (usageReading, error) {
 			break
 		}
 	}
-	if sum >= float64(math.MaxInt64) {
-		return usageReading{}, &usageScrapeError{Kind: usageScrapeKindSample}
+	samples := make(map[string]int64, len(sums))
+	for counter, sum := range sums {
+		if sum >= float64(math.MaxInt64) {
+			return usageReading{}, &usageScrapeError{Kind: usageScrapeKindSample}
+		}
+		samples[counter] = int64(sum)
 	}
-	return usageReading{Sample: int64(sum), StartTime: start, Clusters: clusters}, nil
+	return usageReading{Samples: samples, StartTime: start, Clusters: clusters}, nil
+}
+
+// usageLabelsMatch reports whether metric carries, for every label the filter
+// names, one of the values it allows; a nil filter matches every metric.
+func usageLabelsMatch(metric *dto.Metric, filter usageLabelFilter) bool {
+	for label, allowed := range filter {
+		if !allowed[usageLabelValue(metric, label)] {
+			return false
+		}
+	}
+	return true
 }
 
 // usageReadScrapeLine reads one line from r, bounded at usageScrapeMaxLineBytes,

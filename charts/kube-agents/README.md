@@ -400,7 +400,7 @@ ladder and discovery rules: [Deploy → Telemetry](https://gke-labs.github.io/ku
 pods that serves metrics: the gateway pod, so GKE Managed Prometheus scrapes the
 event watcher's `k8s_event_watcher_*` metrics from the `agent-api-auth` sidecar's
 port 9095, and the credential-proxy pod, so it scrapes the broker's `kubeagents_*`
-tool-invocation and request metrics from its metrics-only port 8766, and the A2A
+tool-invocation, request and version-control metrics from its metrics-only port 8766, and the A2A
 gateway pod a `spec.mode: next` install runs, so it scrapes the gateway's task
 terminal and Google Chat pull counters from its metrics-only port 9096 (elsewhere
 that one selects no pod). The operator's policies on all three pods admit the

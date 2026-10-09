@@ -1536,6 +1536,36 @@ WRITE_VERBS = frozenset(
 # accident of one forge.
 UNGATED_VERBS = frozenset({"capabilities"})
 
+# Every verb `route_table` serves, as a constant: the closed vocabulary the
+# broker's version-control counter labels a request under, so a caller's path
+# never names a series. `test_the_verb_vocabulary_is_the_route_table` holds the
+# two in step.
+VCS_VERBS = frozenset(
+    {
+        "capabilities",
+        "clone",
+        "publish",
+        "proposal-create",
+        "proposal-list",
+        "proposal-view",
+        "proposal-comment",
+        "issue-create",
+        "issue-list",
+        "issue-view",
+        "issue-comment",
+        "proposal-update",
+        "proposal-close",
+        "proposal-commits",
+        "proposal-acknowledge",
+        "issue-update",
+        "issue-close",
+        "label-ensure",
+        "identity",
+        "branch-view",
+        "branch-delete",
+    }
+)
+
 
 def route_table(broker: VcsBroker) -> dict[str, Callable[[dict], dict]]:
     """The verbs `POST /v1/vcs/<verb>` dispatches to.
@@ -1572,6 +1602,7 @@ def route_table(broker: VcsBroker) -> dict[str, Callable[[dict], dict]]:
 __all__ = [
     "Binding",
     "VcsBroker",
+    "VCS_VERBS",
     "AGENT_BRANCH_PREFIX",
     "UNGATED_VERBS",
     "WRITE_VERBS",

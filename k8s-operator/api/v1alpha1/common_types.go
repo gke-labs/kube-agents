@@ -1996,13 +1996,14 @@ type AgentStatus struct {
 // as the rest of the status.
 //
 // The operator writes ActiveInterfaces, from the spec, on every Ready status
-// update, and ToolExecutionsTotal, EventsIngestedTotal, LastActiveTime,
-// ClustersRegistered and ClustersMonitored from the broker's and the event
-// watcher's metrics listeners, which it reads every five minutes on the
-// leader; the agent's own ServiceAccount holds no write verb on this status.
-// The other counters are declared so that the schema names them, but nothing
-// writes them yet, and each is absent (omitempty) until a series exists for
-// it.
+// update, and ToolExecutionsTotal, EventsIngestedTotal,
+// RemediationsProposedTotal, LastActiveTime, ClustersRegistered and
+// ClustersMonitored from the broker's and the event watcher's metrics
+// listeners, which it reads every five minutes on the leader; the agent's own
+// ServiceAccount holds no write verb on this status. SessionsTotal and
+// RemediationsAppliedTotal are declared so that the schema names them, but
+// nothing writes them yet, and each is absent (omitempty) until a series
+// exists for it.
 type AgentUsageStatus struct {
 	// SessionsTotal is the cumulative number of interactive sessions handled.
 	// Nothing writes it yet.
@@ -2029,8 +2030,13 @@ type AgentUsageStatus struct {
 	// +optional
 	ToolExecutionsTotal int64 `json:"toolExecutionsTotal,omitempty"`
 
-	// RemediationsProposedTotal is the cumulative count of remediations generated.
-	// Nothing writes it yet.
+	// RemediationsProposedTotal is the cumulative count of proposals the
+	// credential broker's version-control route opened: proposal-create
+	// requests the forge accepted. Read from the broker's
+	// kubeagents_vcs_requests_total under verb proposal-create and status
+	// success every five minutes and kept monotonic the same way as
+	// ToolExecutionsTotal; a proposal the forge refused or that failed is not
+	// counted. Moves LastActiveTime.
 	// +optional
 	RemediationsProposedTotal int64 `json:"remediationsProposedTotal,omitempty"`
 
@@ -2082,7 +2088,8 @@ type AgentUsageStatus struct {
 	ActiveInterfaces []string `json:"activeInterfaces,omitempty"`
 
 	// LastActiveTime is the time of the last poll in which a counter above
-	// moved: a brokered command ran, or an event was accepted for triage.
+	// moved: a brokered command ran, a proposal was opened, or an event was
+	// accepted for triage.
 	// Until SessionsTotal has a source, a chat turn that runs no brokered
 	// command does not move it. Scheduled maintenance jobs that run brokered
 	// commands do move it, though -- the Controller Stall Watch cron runs some
