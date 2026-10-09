@@ -208,6 +208,11 @@ READINESS_KEY = "readiness"
 ERRORS_KEY = "errors"
 MESSAGE_KEY = "message"
 MEMBER_ID_KEYS = ("project", "location", "cluster")
+# The report's lists whose entries name a project under MEMBER_ID_KEYS[0]: the
+# members and the read errors. merge_envelope carries these across the
+# per-project runs and canonicalise_projects rewrites them before anything
+# reads the envelope, so the two cannot name different lists.
+PROJECT_KEYED_LISTS = (MEMBERS_KEY, ERRORS_KEY)
 BEHIND_STATUSES = frozenset({"lagging", "patch-behind"})
 # The statuses that settle a cluster as no longer below a version: a graded
 # position above or at it. "unknown" (a target the script could not resolve)
@@ -233,9 +238,11 @@ LAST_TICK_KEY = "last_tick"
 # versions are due then.
 TABLE_RUNS_KEY = "table_runs"
 READINESS_RUNS_KEY = "readiness_runs"
-# The report script keys members by the project id it resolved, so a project the
-# roster spells as a number must be keyed the same way in the watch's own read
-# errors and stamps; the id is learned from the first successful table run.
+# The report script keys members and read errors by the project id it resolved,
+# so a project the roster spells as a number must be keyed the same way in the
+# watch's own read errors and stamps; the id is learned from the first
+# successful table run, and every later envelope is rewritten to it
+# (canonicalise_projects) before the watch reads it.
 PROJECT_IDS_KEY = "project_ids"
 REPORT_PROJECTS_KEY = "projects"
 ANNOUNCED_KEY = "announced"
@@ -526,12 +533,18 @@ def canonical_member_key(member: dict, ids: dict[str, str]) -> str:
     return member_key(canonical)
 
 
-def canonicalise_members(report: dict, ids: dict[str, str]) -> None:
-    """Rewrite each member's project to its learned id in place, so every
-    reader of the envelope keys the cluster the way the ledger does."""
-    for member in report.get(MEMBERS_KEY) or []:
-        project = str(member.get(MEMBER_ID_KEYS[0], ""))
-        member[MEMBER_ID_KEYS[0]] = ids.get(project, project)
+def canonicalise_projects(report: dict, ids: dict[str, str]) -> None:
+    """Rewrite the project of every member and every read error to its learned
+    id in place, before anything reads the envelope. On a day ``projects
+    describe`` fails the report script keys both by the numbered spelling it
+    was asked for, and a reader that joins them against the ledger's id-keyed
+    clusters (the unlisted and unconfigured sets, the failed reads, the version
+    slice) would otherwise count a project it did not read as read."""
+    for key in PROJECT_KEYED_LISTS:
+        for entry in report.get(key) or []:
+            project = entry.get(MEMBER_ID_KEYS[0])
+            if project is not None:
+                entry[MEMBER_ID_KEYS[0]] = ids.get(str(project), str(project))
 
 
 def pending_targets(report: dict, ids: dict[str, str] | None = None) -> dict[str, list[str]]:
@@ -808,13 +821,13 @@ def ordered_projects(names: set[str] | list[str], last_runs: dict[str, str]) -> 
 
 
 def empty_envelope() -> dict:
-    return {ENVELOPE_EXIT_KEY: EXIT_OK, ENVELOPE_TABLES_KEY: "", ENVELOPE_REPORT_KEY: {MEMBERS_KEY: [], ERRORS_KEY: []}}
+    return {ENVELOPE_EXIT_KEY: EXIT_OK, ENVELOPE_TABLES_KEY: "", ENVELOPE_REPORT_KEY: {key: [] for key in PROJECT_KEYED_LISTS}}
 
 
 def merge_envelope(merged: dict, envelope: dict) -> None:
     merged[ENVELOPE_TABLES_KEY] += envelope.get(ENVELOPE_TABLES_KEY, "")
-    merged[ENVELOPE_REPORT_KEY][MEMBERS_KEY] += envelope[ENVELOPE_REPORT_KEY].get(MEMBERS_KEY) or []
-    merged[ENVELOPE_REPORT_KEY][ERRORS_KEY] += envelope[ENVELOPE_REPORT_KEY].get(ERRORS_KEY) or []
+    for key in PROJECT_KEYED_LISTS:
+        merged[ENVELOPE_REPORT_KEY][key] += envelope[ENVELOPE_REPORT_KEY].get(key) or []
     if envelope.get(ENVELOPE_EXIT_KEY) != EXIT_OK and merged[ENVELOPE_EXIT_KEY] == EXIT_OK:
         merged[ENVELOPE_EXIT_KEY] = envelope.get(ENVELOPE_EXIT_KEY)
 
@@ -1067,7 +1080,7 @@ def tick(dry_run: bool = False) -> list[str]:
     names = projects()
     deadline = started + TICK_BUDGET_SECONDS
     versions = versions_by_project(names, started + TABLE_BUDGET_SECONDS, ledger[TABLE_RUNS_KEY], now, ledger[PROJECT_IDS_KEY])
-    canonicalise_members(versions[ENVELOPE_REPORT_KEY], ledger[PROJECT_IDS_KEY])
+    canonicalise_projects(versions[ENVELOPE_REPORT_KEY], ledger[PROJECT_IDS_KEY])
     read_errors = versions[ENVELOPE_REPORT_KEY].get(ERRORS_KEY) or []
     # A table is partial when a read failed; the script's exit code alone (it
     # exits 1 on a project it had to spell by number) does not make it one.
@@ -1096,7 +1109,7 @@ def tick(dry_run: bool = False) -> list[str]:
     announced(ledger)[ANNOUNCED_PARTIAL_KEY] = signature
     if due:
         readiness, failures, unfinished = readiness_by_project(pending, due, deadline, ledger[READINESS_RUNS_KEY], now, ledger[PROJECT_IDS_KEY])
-        canonicalise_members(readiness[ENVELOPE_REPORT_KEY], ledger[PROJECT_IDS_KEY])
+        canonicalise_projects(readiness[ENVELOPE_REPORT_KEY], ledger[PROJECT_IDS_KEY])
         for version in settle_from_readiness(readiness[ENVELOPE_REPORT_KEY], pending, ledger):
             if version in due and version in ledger[TARGETS_KEY]:
                 del ledger[TARGETS_KEY][version]

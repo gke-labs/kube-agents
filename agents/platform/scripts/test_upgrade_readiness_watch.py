@@ -95,8 +95,13 @@ class FakeSandbox:
         down = {a for a in asked if a in self.describe_down}
         resolved = {a: (a if a in down else self.aliases.get(a, a)) for a in asked}
         projects = {self.aliases.get(a, a) for a in asked}
-        members = [dict(m, project=next((a for a in down if self.aliases.get(a) == m["project"]), m["project"])) for m in body["report"]["members"] if m["project"] in projects]
-        errors = [e for e in body["report"].get("errors") or [] if e.get("project") in projects]
+
+        def spelled(project: str) -> str:
+            # On a describe outage the script keys members and errors alike by the spelling it was asked for.
+            return next((a for a in down if self.aliases.get(a) == project), project)
+
+        members = [dict(m, project=spelled(m["project"])) for m in body["report"]["members"] if m["project"] in projects]
+        errors = [dict(e, project=spelled(e["project"])) for e in body["report"].get("errors") or [] if e.get("project") in projects]
         exit_code = body.get("exit", 0) if errors else (1 if down else 0)
         body = dict(body, exit=exit_code, report=dict(body["report"], members=members, errors=errors, projects=sorted(resolved.values())))
         return subprocess.CompletedProcess(argv, 0, stdout=f"noise\n{watch.ENVELOPE_SENTINEL}\n{json.dumps(body)}\n", stderr="")
@@ -777,6 +782,46 @@ class Budget(Base):
         self.assertEqual(self.ledger()["project_ids"], {"123456": "my-proj"}, "the learned id stands through the outage")
         self.assertEqual(self.ledger()["targets"][TARGET]["pending"], ["my-proj/us-central1-a/a"], "members keyed by the number are read under the id")
         self.assertIn("1 cluster(s) pending (a): 0 blocked, 1 ready;", out)
+
+    def test_a_describe_outage_beside_failed_reads_keeps_the_clusters_pending_and_the_errors_under_the_id(self) -> None:
+        clean = envelope([member("a", "lagging", project="my-proj")])
+        graded = envelope([member("a", "lagging", project="my-proj", readiness="ready")])
+        env = {watch.PROJECTS_ENV: "123456"}
+        with mock.patch.dict(os.environ, env):
+            self.run_tick(FakeSandbox(clean, graded, aliases={"123456": "my-proj"}))
+        self.assertEqual(self.ledger()["project_ids"], {"123456": "my-proj"})
+        ledger = self.ledger()
+        ledger["targets"][TARGET]["last_report_at"] = (NOW - timedelta(days=8)).isoformat()
+        watch.save_ledger(self.home / watch.LEDGER_FILE_NAME, ledger)
+        # The outage day: the script keys the failed listing, the member and its
+        # failed kubectl read by the number; the fake rewrites the id-keyed fixtures to it.
+        unlisted = envelope([], errors=[{"project": "my-proj", "location": None, "message": "clusters list failed"}], exit_code=1)
+        unread = envelope(
+            [member("a", "lagging", project="my-proj", readiness="unknown")],
+            errors=[{"project": "my-proj", "location": "us-central1-a", "cluster": "a", "message": "kubectl get failed"}],
+            exit_code=1,
+        )
+        with mock.patch.dict(os.environ, env):
+            sandbox = FakeSandbox(unlisted, unread, aliases={"123456": "my-proj"}, describe_down={"123456"})
+            code, out = self.run_tick(sandbox)
+        self.assertEqual(code, 0)
+        self.assertEqual(sandbox.kinds(), ["versions", "readiness"])
+        self.assertNotIn("is no longer pending", out, "a project whose listing failed is not a read project")
+        self.assertIn("the version table was partial (1 read error(s), exit 1)", out)
+        self.assertEqual(self.ledger()["targets"][TARGET]["pending"], ["my-proj/us-central1-a/a"], "carried forward from the ledger under the id")
+        self.assertIn("1 cluster(s) pending (a): none graded (their kubectl read failed or the run returned nothing for them)", out)
+        self.assertEqual(self.ledger()["targets"][TARGET]["last_report_at"], (NOW - timedelta(days=8)).isoformat(), "an ungraded version is not recorded")
+        text = (self.home / "reports" / TARGET / "latest.md").read_text()
+        self.assertIn("1 not read (my-proj/us-central1-a/a;", text)
+        self.assertIn("- my-proj/us-central1-a/a: kubectl get failed", text, "the read error is kept, under the id")
+        data = json.loads((self.home / "reports" / TARGET / "latest.md").resolve().with_suffix(".json").read_text())
+        self.assertEqual([e["project"] for e in data["errors"]], ["my-proj"])
+        # Describe is back: the version is a refresh, not new, and the week is recorded.
+        with mock.patch.dict(os.environ, env):
+            code, out = self.run_tick(FakeSandbox(clean, graded, aliases={"123456": "my-proj"}))
+        self.assertEqual(code, 0)
+        self.assertIn(f"scheduled refresh {TARGET}, 1 cluster(s) pending (a): 0 blocked, 1 ready;", out)
+        self.assertNotIn("new target version", out)
 
     def test_a_table_that_fails_for_every_project_is_one_failure_line(self) -> None:
         versions, readiness = self.two_projects()
