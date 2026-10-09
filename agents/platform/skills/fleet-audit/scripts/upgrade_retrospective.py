@@ -216,9 +216,11 @@ ERROR_EXCERPT_CHARS = 300
 # How much of a message a symptom keeps: enough for the signature and the
 # object it names, short enough that one FailedScheduling does not fill a page.
 MESSAGE_EXCERPT_CHARS = 400
-# What `open(..., "w")` would create before the umask; `mkstemp` makes 0600
-# and the files are read by the SOP's run and the readiness watch.
-FILE_MODE = 0o666
+# The store's files are 0644 whatever the writer's umask (`mkstemp` makes
+# 0600; a hand run under 077 would make 0600 too), set after the write as
+# the lock is: the SOP's run and the readiness watch read them, and the next
+# run replaces them through their directory, so no write bit is needed.
+STORE_FILE_MODE = 0o644
 TEMP_SUFFIX = ".tmp"
 # The lock and the store's directories are made with the umask cleared: a
 # hand run over `kubectl exec` lands as root while the tick runs as uid 1000,
@@ -308,7 +310,16 @@ SKEW_EXCLUSION_WHAT = "exclusion {name}"
 WINDOW_OPEN_STATE = "the maintenance window is open now"
 EXCLUSION_ACTIVE_FORMAT = "exclusion {name} ({scope}) is active until {end}"
 SKEW_OPEN_TEXT = "Version skew held: {skews}; {state}, so the roll may still complete; graded on a later run."
-STATUS_NEW, STATUS_UPGRADED, STATUS_FORCED = "new", "upgraded", "forced"
+# A daily window closes every day, so "a day after the last close" never
+# comes; a skew is graded instead when it was recorded at the previous full
+# run and still stands, the window having closed in between. The stored
+# symptom set carries every skew seen, graded or not, and a recorded skew
+# re-selects its cluster so the review can grade it.
+SKEW_FIRST_SEEN_TEXT = "Version skew first seen: {skews}; {reference}; graded at the next full run if it still stands."
+SKEW_PERSISTED_FORMAT = "recorded at the previous full run and still standing; {reference}"
+SKEW_NO_REFERENCE_TEXT = "no maintenance window close or exclusion end to measure against"
+SKEW_RESELECT_REASON = "version skew recorded at the previous run; graded now that the window has closed since"
+STATUS_NEW, STATUS_UPGRADED, STATUS_FORCED, STATUS_REGRADED = "new", "upgraded", "forced", "re-graded"
 # A symptom against the ledger's baseline from the cluster's last review.
 SINCE_FIRST_SEEN, SINCE_NEW, SINCE_BEFORE = "first seen", "new since the last review", "present before"
 PREDATES_UPGRADE_TEXT = "predates the upgrade: its onset is before this window's first operation, or the previous full run already recorded it; graded Warning"
@@ -316,7 +327,7 @@ FIRST_RUN_GRADING_TEXT = "first run: graded by onset only, no previous symptom s
 # The fleet: the project set a full run records in the ledger. A scoped run
 # reviews a cluster outside it but records nothing for it.
 LEDGER_PROJECTS_KEY = "projects"
-OUTSIDE_FLEET_TEXT = "outside the fleet; not recorded"
+OUTSIDE_FLEET_TEXT = "outside the fleet; not recorded beyond the operations reviewed"
 FULL_WITH_CLUSTER_TEXT = "--full names a fleet-wide run and cannot be combined with --cluster"
 FULL_WITHOUT_PROJECT_TEXT = "--full needs an explicit --project set: a discovered project list can be short, and a full run prunes what it does not see"
 FULL_WITH_SINCE_TEXT = "--full names the scheduled fleet-wide run and cannot be combined with --since (a hand run)"
@@ -1159,9 +1170,7 @@ def write_json_atomically(path: Path, doc: object) -> None:
     the whole document or the previous one, never a splice."""
     make_store_dir(path.parent)
     handle, temporary = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=TEMP_SUFFIX)
-    umask = os.umask(0)
-    os.umask(umask)
-    os.chmod(temporary, FILE_MODE & ~umask)
+    os.chmod(temporary, STORE_FILE_MODE)
     try:
         with os.fdopen(handle, "w", encoding="utf-8") as out:
             json.dump(doc, out, indent=2, sort_keys=True)
@@ -1266,6 +1275,11 @@ def select_clusters(clusters: list[dict], ledger: dict, operations: list[dict], 
             recent = [op for op in ops if _op_end(op) >= last_run]
             if recent:
                 reasons.append(f"{len(recent)} upgrade operation(s) since {fmt_ts(last_run)}")
+            if any(BASELINE_SEPARATOR + CATEGORY_VERSION_SKEW + BASELINE_SEPARATOR in key_text for key_text in entry.get("symptoms") or []):
+                # A skew the previous run recorded: the review grades it now.
+                if not reasons:
+                    status = STATUS_REGRADED
+                reasons.append(SKEW_RESELECT_REASON)
         if key in forced:
             status = status if reasons else STATUS_FORCED
             reasons.append("forced by --cluster")
@@ -1593,12 +1607,16 @@ def _pod_is_starting(pod: dict, now: datetime | None) -> bool:
     or initialised, with no restart: not a symptom yet."""
     status = pod.get("status") or {}
     statuses = (status.get("containerStatuses") or []) + (status.get("initContainerStatuses") or [])
-    if not statuses or not now:
+    if not now:
         return False
+    started = parse_ts(status.get("startTime")) or parse_ts((pod.get("metadata") or {}).get("creationTimestamp"))
+    young = started is not None and now - started < STARTING_GRACE
+    if not statuses:
+        # Bound, with no kubelet report yet: starting while younger than the grace.
+        return young and status.get("phase") == PHASE_PENDING and _condition(pod, "PodScheduled").get("status") == "True"
     reasons = {((cs.get("state") or {}).get("waiting") or {}).get("reason") for cs in statuses}
     restarted = any((cs.get("restartCount") or 0) > 0 or (cs.get("lastState") or {}).get("terminated") for cs in statuses)
-    started = parse_ts(status.get("startTime")) or parse_ts((pod.get("metadata") or {}).get("creationTimestamp"))
-    return bool(reasons & set(STARTING_REASONS)) and not (reasons - set(STARTING_REASONS) - {None}) and not restarted and started is not None and now - started < STARTING_GRACE
+    return bool(reasons & set(STARTING_REASONS)) and not (reasons - set(STARTING_REASONS) - {None}) and not restarted and young
 
 
 def pod_symptoms(pods: list[dict], resolver: Resolver, window_start: datetime | None = None, age_proofs: dict[str, tuple[str, str]] | None = None, pool_spans: dict[str, list[tuple[datetime, datetime]]] | None = None, node_pool: dict[str, str] | None = None, rollouts: dict[str, str] | None = None, now: datetime | None = None, starting: list[str] | None = None) -> list[dict]:
@@ -1846,7 +1864,9 @@ def _pinned_pools(pins: list[dict[str, list[str]]], label_pools: dict[tuple[str,
     label the pools' nodes carry; the union over the terms. Empty when
     nothing pins, and when the pins resolve to every pool there is: a label
     every node carries (`kubernetes.io/os`) is no preference."""
-    universe = set().union(*label_pools.values()) if label_pools else set()
+    # "Every pool" is every pool a node reports, not every pool the cluster
+    # record lists: a labelled pool at zero nodes carries no node label.
+    universe: set[str] = set().union(*(found for (key, _), found in label_pools.items() if key == NODEPOOL_LABEL))
     pools: set[str] = set()
     for pin in pins:
         term: set[str] | None = None
@@ -1873,10 +1893,16 @@ def _covered_pod_pools(pod: dict, node_pool: dict[str, str], owner_pins: list[di
         pools = _pinned_pools(pins, label_pools)
         if pools:
             return pools
+    return _drain_pools_at_creation(pod, pool_spans)
+
+
+def _drain_pools_at_creation(pod: dict, pool_spans: dict[str, list[tuple[datetime, datetime]]]) -> set[str]:
+    """For a Pending pod with no node, the pools whose drain was running when
+    it was created: the replica the drain displaced. Empty otherwise."""
     created = parse_ts((pod.get("metadata") or {}).get("creationTimestamp"))
-    if created and (pod.get("status") or {}).get("phase") == PHASE_PENDING:
-        return {candidate for candidate, spans in pool_spans.items() if any(start <= created <= end for start, end in spans)}
-    return set()
+    if not created or (pod.get("status") or {}).get("phase") != PHASE_PENDING or (pod.get("spec") or {}).get("nodeName"):
+        return set()
+    return {candidate for candidate, spans in pool_spans.items() if any(start <= created <= end for start, end in spans)}
 
 
 def pdb_symptoms(pdbs: list[dict], pods: list[dict], nodes: list[dict], upgraded_pools: dict[str, dict], pool_spans: dict[str, list[tuple[datetime, datetime]]] | None = None, owner_pins: dict[str, list[dict[str, list[str]]]] | None = None, resolver: Resolver | None = None, label_pools: dict[tuple[str, str], set[str]] | None = None) -> list[dict]:
@@ -2542,8 +2568,21 @@ def unavailable_symptoms(workloads: list[dict], pods: list[dict], nodes: list[di
             continue
         pool, op_name, start, end = hit
         pod_nodes = {(p.get("metadata") or {}).get("name", ""): (p.get("spec") or {}).get("nodeName") for p in pods_of}
-        pools = {node_pool.get(n or "", "") for n in pod_nodes.values()}
-        zones = {node_zone.get(n or "", "") for n in pod_nodes.values()}
+        # A replacement still Pending sits nowhere yet; the drain running
+        # when it was created places it on the pool it was evicted from.
+        span_map: dict[str, list[tuple[datetime, datetime]]] = {}
+        for span_pool, _, s0, e0 in spans:
+            span_map.setdefault(span_pool, []).append((s0, e0))
+        pools, zones = set(), set()
+        for p in pods_of:
+            node = (p.get("spec") or {}).get("nodeName")
+            if node:
+                pools.add(node_pool.get(node, ""))
+                zones.add(node_zone.get(node, ""))
+                continue
+            displaced = pool if pool in _drain_pools_at_creation(p, span_map) else ""
+            pools.add(displaced)
+            zones |= pool_zones.get(displaced, set()) if displaced and len(pool_zones.get(displaced, set())) == 1 else {""}
         all_in_pool = pools == {pool}
         all_in_zone = len(zones) == 1 and "" not in zones and zones <= pool_zones.get(pool, set())
         if not (all_in_pool or all_in_zone):
@@ -2639,30 +2678,56 @@ def version_skew(cluster: dict, nodes: list[dict], now: datetime) -> dict:
         reference = (last_close, SKEW_WINDOW_WHAT)
     elif last_end:
         reference = (last_end[0], SKEW_EXCLUSION_WHAT.format(name=last_end[1]))
+    # An exclusion that ended more than a day ago is overdue on its own: a
+    # window that closed since does not reset the hold it released.
+    overdue_refs = [c for c in ((last_end[0], SKEW_EXCLUSION_WHAT.format(name=last_end[1])) if last_end else None, (last_close, SKEW_WINDOW_WHAT) if last_close else None) if c and now - c[0] > SKEW_GRACE]
+    if overdue_refs:
+        reference = overdue_refs[0]
     reference_text = SKEW_REFERENCE_FORMAT.format(what=reference[1], at=fmt_ts(reference[0]), hours=int((now - reference[0]).total_seconds() // SECONDS_PER_HOUR)) if reference else ""
-    return {"skews": skews, "state": state, "reference": reference_text, "overdue": bool(skews) and not state and reference is not None and now - reference[0] > SKEW_GRACE}
+    return {
+        "skews": skews,
+        "state": state,
+        "reference": reference_text,
+        "overdue": bool(skews) and not state and bool(overdue_refs),
+        "keys": [BASELINE_SEPARATOR.join((_object_ref("", "NodePool", pool), CATEGORY_VERSION_SKEW, SKEW_REASON)) for pool, _ in skews],
+    }
 
 
-def version_skew_symptoms(cluster: dict, nodes: list[dict], now: datetime | None) -> list[dict]:
-    """One row per skewed pool once the skew is overdue; nothing without a
-    clock to measure the day against."""
+def skew_keys(cluster: dict, nodes: list[dict], now: datetime | None) -> list[str]:
+    """The stored symptom set's names for every skew that stands, graded or
+    not, so the next full run can grade one that persisted."""
+    return version_skew(cluster, nodes, now)["keys"] if now is not None else []
+
+
+def version_skew_symptoms(cluster: dict, nodes: list[dict], now: datetime | None, baseline: list[str] | None = None) -> list[dict]:
+    """One row per skewed pool once the skew is overdue -- by an exclusion
+    or a window close more than a day old, or because the previous full run
+    recorded it and it still stands; nothing while a window is open or an
+    exclusion active, and nothing without a clock."""
     if now is None:
         return []
     reading = version_skew(cluster, nodes, now)
-    if not reading["overdue"]:
+    if not reading["skews"] or reading["state"]:
         return []
-    return [{
-        "kind": "NodePool",
-        "namespace": "",
-        "name": pool,
-        "object": _object_ref("", "NodePool", pool),
-        "system": True,
-        "category": CATEGORY_VERSION_SKEW,
-        "reason": SKEW_REASON,
-        "message": text,
-        "onset": None,
-        "reference": reading["reference"],
-    } for pool, text in reading["skews"]]
+    previous = set(baseline or [])
+    rows = []
+    for (pool, text), key in zip(reading["skews"], reading["keys"]):
+        if not reading["overdue"] and key not in previous:
+            continue
+        detail = reading["reference"] if reading["overdue"] else SKEW_PERSISTED_FORMAT.format(reference=reading["reference"] or SKEW_NO_REFERENCE_TEXT)
+        rows.append({
+            "kind": "NodePool",
+            "namespace": "",
+            "name": pool,
+            "object": _object_ref("", "NodePool", pool),
+            "system": True,
+            "category": CATEGORY_VERSION_SKEW,
+            "reason": SKEW_REASON,
+            "message": text,
+            "onset": None,
+            "reference": detail,
+        })
+    return rows
 
 
 def _api_set_failures(pods: list[dict], owners: list[dict], resolver: Resolver) -> tuple[dict[tuple[str, str], str], dict[str, str]]:
@@ -2703,7 +2768,7 @@ def _api_set_failures(pods: list[dict], owners: list[dict], resolver: Resolver) 
     return failing_pods, failing_objects
 
 
-def collect_symptoms(cluster: dict, reads: dict[str, list], operations: list[dict], window_start: datetime, *, operations_known: bool = True, now: datetime | None = None, starting: list[str] | None = None) -> list[dict]:
+def collect_symptoms(cluster: dict, reads: dict[str, list], operations: list[dict], window_start: datetime, *, operations_known: bool = True, now: datetime | None = None, starting: list[str] | None = None, baseline: list[str] | None = None) -> list[dict]:
     """Every symptom in the read, each with its classifications, user
     namespaces first."""
     nodes = reads.get("nodes") or []
@@ -2749,7 +2814,7 @@ def collect_symptoms(cluster: dict, reads: dict[str, list], operations: list[dic
         e.setdefault("node_selector", owner_selectors.get(e["object"], {}))
         e.setdefault("node_pins", owner_pins.get(e["object"], []))
     symptoms = pods + node_symptoms(nodes) + events + pdb_symptoms(reads.get("pdbs") or [], reads.get("pods") or [], nodes, upgraded, pool_operation_windows(operations), owner_pins, resolver, ctx.label_pools)
-    symptoms += unavailable_symptoms(reads.get("workloads") or [], reads.get("pods") or [], nodes, operations, resolver) + version_skew_symptoms(cluster, nodes, now)
+    symptoms += unavailable_symptoms(reads.get("workloads") or [], reads.get("pods") or [], nodes, operations, resolver) + version_skew_symptoms(cluster, nodes, now, baseline)
     for symptom in symptoms:
         symptom["classifications"] = classify_symptom(symptom, ctx)
         if symptom.get("pod_count"):
@@ -2811,7 +2876,8 @@ def guards_for(key: str, symptoms: list[dict], seen_at: str) -> list[dict]:
         for c in symptom["classifications"]:
             if c["entry"] is None:
                 continue
-            guard = _guard(key, GUARD_KIND_FAILURE, c["entry"], c["title"], symptom["object"], c["confidence"], c["evidence"], seen_at, FAILURE_GUARD_READS)
+            reads = FAILURE_GUARD_READS + RECHECK_SPREAD_READS if c["entry"] == ENTRY_SPREAD else FAILURE_GUARD_READS
+            guard = _guard(key, GUARD_KIND_FAILURE, c["entry"], c["title"], symptom["object"], c["confidence"], c["evidence"], seen_at, reads)
             guard["source"] = symptom["category"]
             existing = out.get(guard["id"])
             if existing is None:
@@ -3334,9 +3400,12 @@ def recheck_cluster(key: str, cluster: dict, cluster_guards: list[dict], *, run:
     # A workload still unavailable keeps its entry-3 guard: the operation its
     # outage fell inside cannot be re-observed, the outage can.
     unavailable = set(_unavailable_workloads(reads.get("workloads") or []))
+    # A skew that still stands, the window closed, keeps its entry-5 guard.
+    skew = version_skew(cluster, reads.get("nodes") or [], now) if now is not None else {"skews": [], "state": "", "keys": []}
+    skewed = {_object_ref("", "NodePool", pool) for pool, _ in skew["skews"]} if not skew["state"] else set()
     symptoms = collect_symptoms(cluster, reads, [], EPOCH, now=now)
     if refresh and set(REFRESH_READS) <= answered:
-        result["symptom_baseline"] = sorted({symptom_key(sym) for sym in symptoms})
+        result["symptom_baseline"] = sorted({symptom_key(sym) for sym in symptoms} | set(skew["keys"]))
     fresh = {g["id"] for g in guards_for(key, symptoms, "")}
     fresh |= {g["id"] for g in risk_guards_for(key, collect_risks(cluster, reads)[0], "")}
     for guard in cluster_guards:
@@ -3345,7 +3414,7 @@ def recheck_cluster(key: str, cluster: dict, cluster_guards: list[dict], *, run:
             result["not_recheckable"].append(guard["id"])
             continue
         reads_needed = set(guard.get("reads") or SPEC_SHAPE_READS) if kind == GUARD_KIND_RISK else set(RECHECK_FAILURE_READS) | (set(RECHECK_BUDGET_READS) if guard.get("entry") == ENTRY_BUDGET else set()) | (set(RECHECK_SPREAD_READS) if guard.get("entry") == ENTRY_SPREAD else set())
-        present = guard["id"] in fresh or (kind == GUARD_KIND_FAILURE and guard.get("entry") == ENTRY_BUDGET and guard.get("object") in budgets_at_zero) or (kind == GUARD_KIND_FAILURE and guard.get("entry") == ENTRY_SPREAD and guard.get("object") in unavailable)
+        present = guard["id"] in fresh or (kind == GUARD_KIND_FAILURE and guard.get("entry") == ENTRY_BUDGET and guard.get("object") in budgets_at_zero) or (kind == GUARD_KIND_FAILURE and guard.get("entry") == ENTRY_SPREAD and guard.get("object") in unavailable) or (kind == GUARD_KIND_FAILURE and guard.get("entry") == ENTRY_WINDOW and guard.get("object") in skewed)
         if present:
             result["refreshed"].append(guard["id"])
         elif reads_needed <= answered:
@@ -3429,7 +3498,8 @@ def _safe_review(selection: Selection, ledger: dict, **kwargs) -> dict:
             "answered": [],
             "commands": [],
             "starting": [],
-            "skew_open": [],
+            "skew_notes": [],
+            "unavailable_workloads": [],
         }
 
 
@@ -3458,7 +3528,8 @@ def review_cluster(selection: Selection, ledger: dict, *, run: RunFn, seen_at: s
         "answered": [],
         "commands": [],
         "starting": [],
-        "skew_open": [],
+        "skew_notes": [],
+        "unavailable_workloads": [],
     }
     review["next_upgrade"] = _safe_next_upgrade(cluster, server_config, now or now_utc(), review["read_errors"])
     ops = selection.operations
@@ -3489,15 +3560,23 @@ def review_cluster(selection: Selection, ledger: dict, *, run: RunFn, seen_at: s
     # ledger moves and absent guards drop -- only when every core read answered.
     review["reviewed"] = not review["partial"]
     starting: list[str] = []
-    symptoms = collect_symptoms(cluster, {k: v for k, v in reads.items() if k not in failed}, ops, window_start, operations_known=operations_command is not None, now=now, starting=starting)
+    entry = (ledger.get("clusters") or {}).get(selection.key) or {}
+    stored = entry.get("symptoms") if entry.get("last_run") else None
+    symptoms = collect_symptoms(cluster, {k: v for k, v in reads.items() if k not in failed}, ops, window_start, operations_known=operations_command is not None, now=now, starting=starting, baseline=stored)
     review["starting"] = starting
     skew = version_skew(cluster, reads.get("nodes") or [], now or now_utc())
-    review["skew_open"] = [SKEW_OPEN_TEXT.format(skews="; ".join(text for _, text in skew["skews"]), state=skew["state"])] if skew["skews"] and skew["state"] else []
-    entry = (ledger.get("clusters") or {}).get(selection.key) or {}
-    mark_since(symptoms, entry.get("symptoms") if entry.get("last_run") else None, first_op)
+    if skew["skews"] and not any(sym["category"] == CATEGORY_VERSION_SKEW for sym in symptoms):
+        skews_text = "; ".join(text for _, text in skew["skews"])
+        review["skew_notes"] = [SKEW_OPEN_TEXT.format(skews=skews_text, state=skew["state"]) if skew["state"] else SKEW_FIRST_SEEN_TEXT.format(skews=skews_text, reference=skew["reference"] or SKEW_NO_REFERENCE_TEXT)]
+    mark_since(symptoms, stored, first_op)
     review["what_failed"] = symptoms
-    review["symptom_baseline"] = sorted({symptom_key(sym) for sym in symptoms})
+    # Every skew seen joins the stored set, graded or not, so the next full
+    # run can grade one that persisted across the window's closes.
+    review["symptom_baseline"] = sorted({symptom_key(sym) for sym in symptoms} | set(skew["keys"]))
     review["budgets_at_zero"] = sorted(_object_ref((b.get("metadata") or {}).get("namespace", ""), "PodDisruptionBudget", (b.get("metadata") or {}).get("name", "")) for b in reads.get("pdbs") or [] if (b.get("status") or {}).get("disruptionsAllowed") == 0)
+    # Workloads still unavailable, for the entry-3 keep rule: the operation
+    # the outage fell inside is outside a later window, the outage is not.
+    review["unavailable_workloads"] = sorted(_unavailable_workloads(reads.get("workloads") or [])) if "workloads" not in failed else []
     review["mitigations"] = [mitigation_lines(s, c) for s in symptoms for c in s["classifications"] if c["entry"] is not None]
     shapes, managed_agents = collect_risks(cluster, {k: v for k, v in reads.items() if not any(e.startswith(k + ":") for e in errors)})
     review["shapes"] = shapes
@@ -3631,7 +3710,7 @@ def triage(reviews: list[dict], unchanged: list[dict], failed_reads: list[str], 
                 "partial": review.get("partial") or [],
                 "outside_fleet": bool(review.get("outside_fleet")),
                 "starting": review.get("starting") or [],
-                "skew_open": review.get("skew_open") or [],
+                "skew_notes": review.get("skew_notes") or [],
                 "next_upgrade": review["next_upgrade"],
                 "shapes": review["shapes"],
                 "managed_agents": review["managed_agents"],
@@ -3830,7 +3909,7 @@ def _cluster_block_lines(row: dict) -> list[str]:
         lines += [PARTIAL_READ_TEXT.format(failed=", ".join(row["partial"])), ""]
     if row.get("starting"):
         lines += [STARTING_TEXT.format(count=len(row["starting"]), minutes=int(STARTING_GRACE.total_seconds() // SECONDS_PER_MINUTE), pods=", ".join(_cell(p) for p in row["starting"])), ""]
-    for note in row.get("skew_open") or []:
+    for note in row.get("skew_notes") or []:
         lines += [_cell(note), ""]
     lines += _next_upgrade_lines(row["next_upgrade"])
     lines.append("")
@@ -4111,7 +4190,7 @@ def _operations_record(previous: list[dict], fresh: list[dict], seen_at: str, ro
     return sorted(kept, key=lambda o: (o.get("end") or "", o["id"]))
 
 
-def ledger_after(ledger: dict, reviews: list[dict], clusters: list[dict], seen_at: str, operations: dict[str, list[dict]] | None = None, removed: set[str] | None = None, skip: set[str] | None = None, refreshed: dict[str, list[str]] | None = None, advance: bool = True, attempted: set[str] | None = None, route: str = ROUTE_FULL, since: datetime | None = None) -> dict:
+def ledger_after(ledger: dict, reviews: list[dict], clusters: list[dict], seen_at: str, operations: dict[str, list[dict]] | None = None, removed: set[str] | None = None, skip: set[str] | None = None, refreshed: dict[str, list[str]] | None = None, advance: bool = True, attempted: set[str] | None = None, route: str = ROUTE_FULL, since: datetime | None = None, outside: set[str] | None = None) -> dict:
     """Every enumerated cluster's current versions; `last_run` moves only for
     a cluster this run reviewed in full, so a failed or partial read is
     retried next time (`partial_read` records the attempt and re-selects
@@ -4119,15 +4198,19 @@ def ledger_after(ledger: dict, reviews: list[dict], clusters: list[dict], seen_a
     `operations_reviewed` every one a review covered, with its route; a
     cluster its project no longer lists is dropped. A scoped run
     (`advance=False`) writes only the operations reviewed of the clusters it
-    reviewed: versions, last_run and the symptom set stay the full run's."""
+    reviewed: versions, last_run and the symptom set stay the full run's. A
+    cluster outside the fleet (`outside`) gets no versions or symptom set,
+    only the operations its review covered: route bookkeeping, so the
+    after-upgrade route does not review the same operation on every wake."""
     entries = {k: dict(v) for k, v in (ledger.get("clusters") or {}).items() if k not in (removed or set())}
     reviewed = {r["cluster"] for r in reviews if r["reviewed"]} - (skip or set())
+    recorded_in_full = reviewed - (outside or set())
 
     def floor_of(key: str) -> datetime | None:
         last = parse_ts((entries.get(key) or {}).get("last_run"))
         return min(since, last) if since and last else since
 
-    partial = {r["cluster"] for r in reviews if r["partial"] and not r["reviewed"]} - (skip or set())
+    partial = {r["cluster"] for r in reviews if r["partial"] and not r["reviewed"]} - (skip or set()) - (outside or set())
     if not advance:
         # A partial read is still recorded as one, so the next full run
         # re-selects the cluster whichever route attempted it.
@@ -4145,12 +4228,12 @@ def ledger_after(ledger: dict, reviews: list[dict], clusters: list[dict], seen_a
             entries[key]["symptoms_refreshed"] = seen_at
     for cluster in clusters:
         key = cluster_key(cluster["project"], cluster["location"], cluster["name"])
-        if key in (skip or set()):
-            # Upgrading now: nothing recorded until it is reviewed.
+        if key in (skip or set()) or key in (outside or set()):
+            # Upgrading now, or outside the fleet: no versions, no symptom set.
             continue
         current = versions_of(cluster)
         old = entries.get(key) or {}
-        if old and key not in reviewed and key not in (attempted or set()):
+        if old and key not in recorded_in_full and key not in (attempted or set()):
             # Unchanged: the versions and channel are what the listing says
             # now (a pool added or removed is recorded); last_run and the
             # symptom set stay. A selected cluster whose review did not
@@ -4159,23 +4242,23 @@ def ledger_after(ledger: dict, reviews: list[dict], clusters: list[dict], seen_a
             old.update(control_plane=current["control_plane"], node_pools=current["node_pools"], channel=current["channel"])
             if old.get(LEDGER_OPERATIONS_KEY):
                 old[LEDGER_OPERATIONS_KEY] = _operations_record(old[LEDGER_OPERATIONS_KEY], [], seen_at, route, floor_of(key))
-        if key in reviewed or not old:
+        if key in recorded_in_full or not old:
             starts = [op.get("startTime") for op in (operations or {}).get(key) or [] if op.get("startTime")]
             latest = parse_ts(max(starts)) if starts else None
-            covered = (operations or {}).get(key) or [] if key in reviewed else []
+            covered = (operations or {}).get(key) or [] if key in recorded_in_full else []
             entries[key] = {
                 "control_plane": current["control_plane"],
                 "node_pools": current["node_pools"],
                 "channel": current["channel"],
                 "first_seen": old.get("first_seen") or seen_at,
-                "last_run": seen_at if key in reviewed else old.get("last_run"),
+                "last_run": seen_at if key in recorded_in_full else old.get("last_run"),
                 "last_operation": fmt_ts(latest) if latest else old.get("last_operation"),
-                "symptoms": baselines.get(key) if key in reviewed else old.get("symptoms"),
+                "symptoms": baselines.get(key) if key in recorded_in_full else old.get("symptoms"),
                 LEDGER_OPERATIONS_KEY: _operations_record(old.get(LEDGER_OPERATIONS_KEY) or [], covered, seen_at, route, floor_of(key)),
             }
         if key in partial:
             entries.setdefault(key, {})["partial_read"] = seen_at
-        elif key in reviewed:
+        elif key in recorded_in_full:
             entries[key].pop("partial_read", None)
     return {"version": LEDGER_VERSION, "updated_at": seen_at, LEDGER_PROJECTS_KEY: ledger.get(LEDGER_PROJECTS_KEY) or [], "clusters": entries}
 
@@ -4309,8 +4392,10 @@ def collect(args: argparse.Namespace, *, run: RunFn | None = None, now: datetime
         removed = set()
     else:
         new_fleet = set(projects)
-        left = fleet - new_fleet
-        removed = {key for key in (ledger.get("clusters") or {}) if key.split(CLUSTER_KEY_SEPARATOR)[0] in left}
+        # A project outside the fleet this run records -- one that left the
+        # roster, or one a scoped hand run recorded operations for -- goes
+        # with its clusters; a roster project whose listing failed stays.
+        removed = {key for key in (ledger.get("clusters") or {}) if key.split(CLUSTER_KEY_SEPARATOR)[0] not in new_fleet}
         removed |= {key for project, listed in listed_projects.items() for key in (ledger.get("clusters") or {}) if key.startswith(project + CLUSTER_KEY_SEPARATOR) and key not in listed}
         for key in sorted(unlisted_clusters):
             error = next((e for e in failed_reads if e.startswith(key.split(CLUSTER_KEY_SEPARATOR)[0] + ": clusters list")), "clusters list failed")
@@ -4343,8 +4428,14 @@ def collect(args: argparse.Namespace, *, run: RunFn | None = None, now: datetime
     # it held cannot be re-observed without the operation.
     fresh_ids = {g["id"] for g in fresh_guards}
     zero_budgets = {(r["cluster"], obj) for r in reviews for obj in r.get("budgets_at_zero") or []}
+    # The same rule for entry 3: a workload still unavailable keeps its guard
+    # while the operation its outage fell inside is out of the window.
+    unavailable = {(r["cluster"], obj) for r in reviews for obj in r.get("unavailable_workloads") or []}
     for guard in guards.get("guards") or []:
-        if guard.get("kind", GUARD_KIND_FAILURE) == GUARD_KIND_FAILURE and guard.get("entry") == ENTRY_BUDGET and (guard.get("cluster"), guard.get("object")) in zero_budgets and guard["id"] not in fresh_ids:
+        if guard.get("kind", GUARD_KIND_FAILURE) != GUARD_KIND_FAILURE or guard["id"] in fresh_ids:
+            continue
+        where = (guard.get("cluster"), guard.get("object"))
+        if (guard.get("entry") == ENTRY_BUDGET and where in zero_budgets) or (guard.get("entry") == ENTRY_SPREAD and where in unavailable):
             fresh_guards.append({**guard, "last_seen": seen_at})
     new_guards = merge_guards(guards, fresh_guards, reviewed, seen_at, answered, removed)
     # Unchanged clusters holding live guards: re-read only what the guards
@@ -4376,7 +4467,7 @@ def collect(args: argparse.Namespace, *, run: RunFn | None = None, now: datetime
     recheck_commands = {r["cluster"]: r.get("commands") or {} for r in rechecks}
     for row in unchanged:
         row["commands"] = checks_run(recheck_commands.get(row["cluster"], {}), fallback=operations_commands.get(row["cluster"].split(CLUSTER_KEY_SEPARATOR)[0]))
-    new_ledger = ledger_after(ledger, reviews, clusters, seen_at, {s.key: s.operations for s in selected}, removed, {row["cluster"] for row in upgrading} | outside, refreshed_baselines, advance=not scoped, attempted={s.key for s in selected}, route=route, since=since)
+    new_ledger = ledger_after(ledger, reviews, clusters, seen_at, {s.key: s.operations for s in selected}, removed, {row["cluster"] for row in upgrading}, refreshed_baselines, advance=not scoped, attempted={s.key for s in selected}, route=route, since=since, outside=outside)
     new_ledger[LEDGER_PROJECTS_KEY] = sorted(new_fleet)
 
     # Read failures from inside a review join the top-level list so Info
@@ -4458,6 +4549,7 @@ def write_report(path: Path, text: str, *, link: bool = True) -> None:
     make_store_dir(path.parent)
     temporary = path.with_name(path.name + REPORT_TEMP_SUFFIX)
     temporary.write_text(text, encoding="utf-8")
+    os.chmod(temporary, STORE_FILE_MODE)
     os.replace(temporary, path)
     if not link:
         return
