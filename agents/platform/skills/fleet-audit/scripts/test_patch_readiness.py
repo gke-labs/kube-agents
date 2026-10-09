@@ -1618,8 +1618,8 @@ class UpgradeBlockedTest(unittest.TestCase):
         pr.collect_upgrade_blocked("acme", entries, run=run, deadline=deadline)
         return entries
 
-    def report_path(self, name="lag"):
-        return os.path.join(self.scratch.name, pr.READINESS_OUTPUT_FORMAT.format(project="acme", cluster=name))
+    def report_path(self, name="lag", location="us-central1"):
+        return os.path.join(self.scratch.name, pr.READINESS_OUTPUT_FORMAT.format(project="acme", location=location, cluster=name))
 
     @staticmethod
     def unevaluated(entry):
@@ -1821,6 +1821,45 @@ class UpgradeBlockedTest(unittest.TestCase):
         recorded = next(c for c in by["lag"]["commands"] if c["check"] == pr.UPGRADE_BLOCKED_CHECK)["command"]
         self.assertIn("--cluster us-central1/lag", recorded)
         self.assertNotIn("lag2", recorded)
+
+    def test_same_named_behind_twins_in_one_project_get_a_report_file_each(self):
+        """A GKE name is unique per location, not per project, so the twins'
+        reports must not share a path: the second run would overwrite the
+        first's row, and the first entry's recorded command -- the path the SOP
+        sends a reader to for the row behind a candidate -- would name a file
+        holding the other cluster's grade."""
+        twins = [cluster(name="prod", location="us-central1", master=self.BEHIND), cluster(name="prod", location="europe-west1", master=self.BEHIND)]
+        rows = {
+            "us-central1/prod": self.member("prod", pdbs=[self.BUDGET], location="us-central1"),
+            "europe-west1/prod": self.member("prod", status="ready", location="europe-west1"),
+        }
+        self.calls = []
+
+        def run(argv, **kwargs):
+            joined = " ".join(argv)
+            if "clusters list" in joined:
+                return run_of(0, json.dumps(twins))
+            if "get-server-config" in joined:
+                return run_of(0, json.dumps(server_config(default=self.CURRENT, valid_versions=[self.BEHIND, self.CURRENT])))
+            if REPORTER_NEEDLE in joined:
+                self.calls.append(argv)
+                # The real reporter writes the named cluster's row alone.
+                with open(argv[argv.index("--output") + 1], "w", encoding="utf-8") as handle:
+                    json.dump({"members": [rows[argv[argv.index("--cluster") + 1]]], "errors": []}, handle)
+                return run_of(0)
+            raise AssertionError(f"unstubbed command: {joined}")
+
+        by = {e["location"]: e for e in self.project(run) if short(e) == "prod"}
+        outputs = {argv[argv.index("--cluster") + 1]: argv[argv.index("--output") + 1] for argv in self.calls}
+        self.assertEqual(outputs, {"us-central1/prod": self.report_path("prod", "us-central1"), "europe-west1/prod": self.report_path("prod", "europe-west1")})
+        for spec, path in outputs.items():
+            location = spec.split("/")[0]
+            with open(path, encoding="utf-8") as handle:
+                self.assertEqual(json.load(handle)["members"][0]["location"], location)
+            recorded = next(c for c in by[location]["commands"] if c["check"] == pr.UPGRADE_BLOCKED_CHECK)["command"]
+            self.assertIn(f"--output {path}", recorded)
+        self.assertEqual([c["check"] for c in by["us-central1"]["candidates"] if c["check"] == pr.UPGRADE_BLOCKED_CHECK], [pr.UPGRADE_BLOCKED_CHECK])
+        self.assertEqual([c for c in by["europe-west1"]["candidates"] if c["check"] == pr.UPGRADE_BLOCKED_CHECK], [])
 
     def test_the_reporter_is_handed_what_is_left_of_the_budget(self):
         import time as _time

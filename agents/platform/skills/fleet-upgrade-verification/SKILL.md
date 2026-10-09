@@ -67,7 +67,7 @@ exit code 1; the other projects, locations and members are still reported. A pro
 Engine API is off holds no cluster and is not a failed read; a refusal naming another project,
 such as a quota project, is one. The weekly upgrade audit's collector also runs the script, with
 `--readiness --cluster <location>/<name>`, once per behind cluster: that run writes
-`upgrade-readiness_<project>_<name>.json` under `/opt/data/scratch/`, and a `--cluster` run
+`upgrade-readiness_<project>_<location>_<name>.json` under `/opt/data/scratch/`, and a `--cluster` run
 neither reads nor writes the rollout record, so the record above is untouched by it.
 
 ## Read the table

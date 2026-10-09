@@ -216,12 +216,15 @@ UNEVALUATED_UNREADABLE_FORMAT = "the readiness reporter exited {rc} but left no 
 # written in one place and looked for in another. Overridable for the suite.
 SCRATCH_DIR_ENV = "FLEET_AUDIT_SCRATCH_DIR"
 DEFAULT_SCRATCH_DIR = "/opt/data/scratch"
-# In scratch, beside the manifest the SOP redirects stdout into. The reporter
-# keeps one record per target from its previous run for rollout tracking; the
-# audit's call gets a state directory of its own, per project because projects
-# are collected concurrently, so it neither reads nor rewrites the skill's own
-# history.
-READINESS_OUTPUT_FORMAT = "upgrade-readiness_{project}_{cluster}.json"
+# In scratch, beside the manifest the SOP redirects stdout into: one report per
+# behind cluster, named by project, location and name. A GKE name is unique per
+# location, not per project, so two behind twins named alike would otherwise
+# share a file, and the first's recorded command would point at a file holding
+# the second's row. The reporter keeps one record per target from its previous
+# run for rollout tracking; the audit's call gets a state directory of its own,
+# per project because projects are collected concurrently, so it neither reads
+# nor rewrites the skill's own history.
+READINESS_OUTPUT_FORMAT = "upgrade-readiness_{project}_{location}_{cluster}.json"
 READINESS_STATE_SUBDIR = "upgrade-readiness-state"
 READINESS_BLOCKED = "blocked"
 READINESS_READY = "ready"
@@ -1354,7 +1357,7 @@ def collect_upgrade_blocked(project: str, entries: list[dict], *, run: RunFn, de
     # clusters are behind), and one cluster's slow read cannot cost another
     # its row. The fleet budget bounds the runs together.
     for entry in behind:
-        output = os.path.join(scratch, READINESS_OUTPUT_FORMAT.format(project=project, cluster=entry["_bare_name"]))
+        output = os.path.join(scratch, READINESS_OUTPUT_FORMAT.format(project=project, location=entry["location"], cluster=entry["_bare_name"]))
         try:
             # The path is the same every week, so a reporter that dies before
             # writing -- a traceback, a failed `--output` write, both exit 1
