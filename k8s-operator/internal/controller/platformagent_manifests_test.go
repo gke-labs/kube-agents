@@ -5275,7 +5275,7 @@ func TestDefaultTuningReachesTheDefaultOverlayOnly(t *testing.T) {
 // It used to ride the default profile's overlay, and only when the CR set it, deferring the
 // untuned case to agents/chat/config.yaml. That left the cap to whatever the agent's own
 // config.yaml already held: the image template reaches an existing volume only for missing
-// keys, so a volume seeded at 2 kept 2 after #2754 raised the default to 6, and an override
+// keys, so a volume seeded at 2 kept 2 after the operator's default rose to 6, and an override
 // set and then removed left its value behind. A managed-scope leaf is applied over the
 // persisted config on every load, so neither history matters.
 func TestMaxInProgressIsPinnedInTheManagedScope(t *testing.T) {

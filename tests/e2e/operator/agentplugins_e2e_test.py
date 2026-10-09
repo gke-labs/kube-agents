@@ -151,6 +151,8 @@ AGENT_HOME: str = "/opt/data"
 # so a probe looking for the render has to read it here. Mounted on the platform-agent
 # container, which is the one agent_exec execs into.
 MANAGED_CONFIG: str = "/etc/hermes/config.yaml"
+# The image's Hermes interpreter (INSTALL_DIR in deploy/shared/docker-entrypoint.sh).
+AGENT_PYTHON: str = "/opt/hermes/.venv/bin/python3"
 # The front door's overlay, merged into $AGENT_HOME/config.yaml at startup. It carries
 # what the operator owns for the default profile but must not pin pod-wide: an
 # untargeted plugin's enablement and non-gateway config, and tuning.default's limits.
@@ -1354,6 +1356,35 @@ def agent_exec_until(script: str, expect: str, timeout_sec: int = 150) -> str:
         time.sleep(3)
 
 
+def loaded_kanban_cap_probe() -> str:
+    """A probe printing the board cap Hermes loads and the one the agent's own file holds.
+
+    The two differ by design: the operator pins kanban.max_in_progress in the managed
+    scope, which Hermes overlays on $HERMES_HOME/config.yaml at load. Reading the
+    ConfigMap or /etc/hermes proves the render; only load_config() proves the pin wins,
+    so this asks Hermes, the way the gateway's dispatcher does. Output is
+    `LOADED=<n>; FILE=<m>;`, with the `;` keeping LOADED=1 from matching LOADED=10.
+    HERMES_HOME falls back to AGENT_HOME in case the exec environment lacks it.
+    HERMES_MANAGED_DIR is left as the container has it, so a lost mount or env var
+    shows up as the file's value rather than being papered over here.
+    """
+    code = (
+        "import os, yaml\n"
+        "try:\n"
+        "    from hermes_cli.config import load_config\n"
+        "    loaded = (load_config().get(\"kanban\") or {}).get(\"max_in_progress\")\n"
+        "except Exception as exc:\n"
+        "    loaded = \"ERR-\" + type(exc).__name__\n"
+        "try:\n"
+        "    with open(os.path.join(os.environ[\"HERMES_HOME\"], \"config.yaml\")) as fh:\n"
+        "        own = ((yaml.safe_load(fh) or {}).get(\"kanban\") or {}).get(\"max_in_progress\")\n"
+        "except Exception:\n"
+        "    own = \"unreadable\"\n"
+        "print(f\"LOADED={loaded}; FILE={own};\")\n"
+    )
+    return f'export HERMES_HOME="${{HERMES_HOME:-{AGENT_HOME}}}"; {AGENT_PYTHON} -c \'{code}\''
+
+
 def profile_plugin_link(profile: str, plugin: str) -> str:
     return f"{AGENT_HOME}/profiles/{profile}/plugins/{plugin}"
 
@@ -1512,6 +1543,15 @@ spec:
         assert "max_turns: 150" in cluster_overlay, (
             f"cluster tuning should produce a class overlay:\n{cluster_overlay}"
         )
+        # What Hermes loads, not only what the operator rendered. The agent's own
+        # config.yaml does not hold 1 (the overlay no longer writes the cap, so it holds
+        # the image's 6 or whatever the volume was seeded with), so LOADED=1 here is the
+        # managed scope beating the agent's file.
+        loaded = agent_exec_until(loaded_kanban_cap_probe(), "LOADED=1;")
+        assert "LOADED=1;" in loaded, (
+            f"Hermes must load the pinned cap of 1 over the agent's own config.yaml: {loaded}"
+        )
+        log(f"Verified Hermes loads the pinned cap over the agent's file ({loaded.strip()}).")
         log("Verified tuning reaches the default overlay and both profile overlays.")
 
         # Withdrawing tuning must drop the overlays. Cluster profile configs are not
@@ -1528,18 +1568,14 @@ spec:
             f"removing tuning must drop the cluster class overlay, got keys:\n{keys}"
         )
         # Dispatch concurrency does NOT revert to Hermes' uncapped behaviour, nor keep
-        # the removed override. The pin falls back to the operator's default, and it is
-        # read where the agent reads it: the managed scope mounted in the pod, which
-        # Hermes overlays on the agent's own config.yaml at every load. That file may
-        # still say 1, or whatever the volume was seeded with, and the pin wins anyway.
-        # Uncapped is the state that lets a burst of cards spawn a worker process each
-        # until the OOM killer takes them, and a removed CR field must not be a way back
-        # into it.
-        capped = agent_exec_until(
-            f"grep -q 'max_in_progress: 6' {MANAGED_CONFIG} && echo CAPPED || echo OPEN",
-            "CAPPED",
-        )
-        assert "CAPPED" in capped, (
+        # the removed override. The pin falls back to the operator's default, and Hermes
+        # loads it from the managed scope whatever the agent's own config.yaml holds. On
+        # a fresh volume that file says 6 too, so this step alone cannot tell the pin
+        # from the file; the tuned step above is the one that does. Uncapped is the state
+        # that lets a burst of cards spawn a worker process each until the OOM killer
+        # takes them, and a removed CR field must not be a way back into it.
+        capped = agent_exec_until(loaded_kanban_cap_probe(), "LOADED=6;")
+        assert "LOADED=6;" in capped, (
             f"removing tuning must fall back to the operator's dispatch cap, not to uncapped: {capped}"
         )
         log("Verified tuning removal drops the overlays and falls back to the operator's dispatch cap.")
