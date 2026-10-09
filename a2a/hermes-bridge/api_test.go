@@ -1760,3 +1760,57 @@ func TestAPI_SeenFollowUpsAreBounded(t *testing.T) {
 		t.Fatalf("%d notices, want %d: the redelivery answered again", n, 1+blanks)
 	}
 }
+
+// A cancel between two turns keeps its canceled terminal when the copy of
+// the previous answer it attaches as the result fails to publish: that
+// answer is already on the stream as a turn, and a user's stop ends
+// canceled (payload spec assertion 13). A result that is the only copy of
+// the deliverable still ends the task failed when it cannot be published.
+func TestAPI_CancelBetweenTurnsStaysCanceledWhenTheResultCopyFails(t *testing.T) {
+	_, url := startServer(t)
+	stub := newAPIStub(t, nil)
+	b, _ := startAPIBridgeHooked(t, url, stub, nil, func(b *Bridge) {
+		b.resultPublish = func(context.Context, *taskRun, string) error {
+			return errors.New("injected result publish failure")
+		}
+	}, func(net.Addr) bool { return true })
+	terminal := func(taskID string) *lib.StatusUpdate {
+		t.Helper()
+		var final *lib.StatusUpdate
+		for _, env := range replayEvents(t, url, taskID) {
+			if lib.IsFinalStatus(env) {
+				final = &lib.StatusUpdate{}
+				_ = json.Unmarshal(env.Payload, final)
+			}
+		}
+		if final == nil || final.Status.Message == nil {
+			t.Fatalf("no terminal with a message on %s", taskID)
+		}
+		return final
+	}
+
+	run, steer := idleRun(t, b, "task-api-copyfail")
+	if got := b.nextSteer(run); got != steer {
+		t.Fatalf("nextSteer = %v, want the queued follow-up", got)
+	}
+	run.canceled.Store(true)
+	if _, ok := b.apiTurn(run, context.Background(), "a2a-ctx-copyfail", "next", steer, 2, "turn 1's answer"); ok {
+		t.Fatal("a follow-up turn answered after the cancel")
+	}
+	if final := terminal("task-api-copyfail"); final.Status.State != lib.StateCanceled ||
+		final.Status.Message.Parts[0].Text != "reason: canceled-by-request" {
+		t.Fatalf("terminal %s %q, want canceled canceled-by-request", final.Status.State, final.Status.Message.Parts[0].Text)
+	}
+
+	// Control: the deliverable's only copy failing still ends failed.
+	only, _ := idleRun(t, b, "task-api-onlycopy")
+	answer := "the answer"
+	b.finalize(only, lib.StateCompleted, "", &answer)
+	if final := terminal("task-api-onlycopy"); final.Status.State != lib.StateFailed ||
+		!strings.HasPrefix(final.Status.Message.Parts[0].Text, "reason: bus-publish-failed at result") {
+		t.Fatalf("terminal %s %q, want failed bus-publish-failed at result", final.Status.State, final.Status.Message.Parts[0].Text)
+	}
+	if n := len(stub.seen()); n != 0 {
+		t.Fatalf("%d requests sent", n)
+	}
+}

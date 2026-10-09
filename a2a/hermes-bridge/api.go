@@ -515,19 +515,21 @@ func (b *Bridge) sendAPI(ctx context.Context, req *http.Request, body []byte) (*
 // past its deadline or the bridge stopping before its request was sent. The
 // turn before's answer is already on the stream as a turn artifact, but a
 // reader of the result would not find it, so it is attached as the result
-// too, ahead of the terminal the cause calls for. The follow-up never ran,
+// too, ahead of the terminal the cause calls for. The attached result is a
+// copy (finalizeCopy): if it fails to publish, the terminal keeps the
+// cause's state, so a cancel still ends canceled. The follow-up never ran,
 // so the terminal does not name its turn.
 func (b *Bridge) finalizeTurnNotSent(run *taskRun, answer string) {
 	switch {
 	case run.canceled.Load():
-		b.finalize(run, lib.StateCanceled, "reason: canceled-by-request", &answer)
+		b.finalizeCopy(run, lib.StateCanceled, "reason: canceled-by-request", answer)
 	case b.closing.Load():
-		b.finalize(run, lib.StateFailed, shutdownReason, &answer)
+		b.finalizeCopy(run, lib.StateFailed, shutdownReason, answer)
 	default:
 		// Only the deadline is left: it passed between two turns, after
 		// the last answer went out as a turn artifact.
-		b.finalize(run, lib.StateFailed,
-			fmt.Sprintf("reason: deadline-exceeded - the task deadline %s passed before the next turn; no request was sent", b.cfg.TaskDeadline), &answer)
+		b.finalizeCopy(run, lib.StateFailed,
+			fmt.Sprintf("reason: deadline-exceeded - the task deadline %s passed before the next turn; no request was sent", b.cfg.TaskDeadline), answer)
 	}
 }
 

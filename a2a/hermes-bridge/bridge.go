@@ -395,6 +395,9 @@ type Bridge struct {
 	// publishTextArtifact by default; a field so a test can fail it, or hold
 	// it while a cancel lands, without a bus that misbehaves on cue.
 	publishTurn func(ctx context.Context, run *taskRun, artifactID, text string) error
+	// resultPublish publishes a task's result artifact, publishResult by
+	// default; a field so a test can fail it.
+	resultPublish func(ctx context.Context, run *taskRun, output string) error
 
 	// apiClient is the API executor's HTTP client (api.go).
 	apiClient *http.Client
@@ -436,6 +439,7 @@ func New(ctx context.Context, cfg Config) (*Bridge, error) {
 	b.lookAhead = b.cancelInStream
 	b.holdReplaySlot = func(release func()) { time.AfterFunc(lib.EphemeralConsumerInactiveThreshold, release) }
 	b.deliver = b.handle
+	b.resultPublish = b.publishResult
 	b.publishTurn = func(ctx context.Context, run *taskRun, artifactID, text string) error {
 		return b.publishTextArtifact(ctx, run, artifactID, lib.ArtifactTurn, text)
 	}
@@ -1526,8 +1530,22 @@ func (b *Bridge) lookupTask(ctx context.Context, taskID string, maxAttempts int,
 // inside the same critical section, so a racing finalizer cannot slip its
 // final in between. Publishes ride a fresh bounded context, never the
 // caller's - the terminal event must go out even when the caller's context
-// is already canceled, which is exactly what shutdown looks like.
+// is already canceled, which is exactly what shutdown looks like. A result
+// that fails to publish ends the task failed, because the result was the
+// only copy of the deliverable; finalizeCopy is the exception.
 func (b *Bridge) finalize(run *taskRun, state lib.TaskState, msg string, resultOutput *string) {
+	b.finalizeResult(run, state, msg, resultOutput, false)
+}
+
+// finalizeCopy is finalize for a result that is a copy of an answer already
+// on the stream (a turn artifact): its publish is best-effort, and one that
+// fails is logged and leaves state and msg as the cause set them, so a
+// cancel still ends canceled (payload spec assertion 13).
+func (b *Bridge) finalizeCopy(run *taskRun, state lib.TaskState, msg string, resultCopy string) {
+	b.finalizeResult(run, state, msg, &resultCopy, true)
+}
+
+func (b *Bridge) finalizeResult(run *taskRun, state lib.TaskState, msg string, resultOutput *string, copyOnly bool) {
 	// noticeMu first and for the whole of it: no steer notice can be in
 	// flight past this, and a second finalizer waits here, then leaves on
 	// stateDone, as it always waited on mu.
@@ -1554,7 +1572,10 @@ func (b *Bridge) finalize(run *taskRun, state lib.TaskState, msg string, resultO
 	run.state = stateDone
 	ctx, cancel := context.WithTimeout(context.Background(), finalizePublishTimeout)
 	if resultOutput != nil {
-		if err := b.publishResult(ctx, run, *resultOutput); err != nil {
+		if err := b.resultPublish(ctx, run, *resultOutput); err != nil && copyOnly {
+			b.cfg.Logger.Error("result publish failed; the answer is on the stream as a turn, so the terminal keeps its state",
+				"task", run.origin.TaskID, "state", state, "err", err)
+		} else if err != nil {
 			b.cfg.Logger.Error("result publish failed", "task", run.origin.TaskID, "err", err)
 			state, msg = lib.StateFailed, resultPublishFailedReason(err)
 		}
