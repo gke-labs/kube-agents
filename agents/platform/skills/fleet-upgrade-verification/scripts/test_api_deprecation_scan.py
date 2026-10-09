@@ -461,6 +461,24 @@ class MainTest(unittest.TestCase):
             self.assertEqual(rc, scan.EXIT_OK)
             self.assertIn("Clean:", out)
 
+    def test_a_versions_file_from_a_narrowed_run_is_refused(self):
+        """A `--cluster` run's report has one cluster's floor, not the fleet's, so
+        reading it would drop every removal the other clusters still serve;
+        the mark the report carries is what the scan refuses on."""
+        with tempfile.TemporaryDirectory() as tmp:
+            write_tree(tmp, {"tree/pdb.yaml": PDB_V1BETA1})
+            versions = Path(tmp) / "fleet.json"
+            versions.write_text(json.dumps({**FLEET_JSON, "narrowed_to": ["us-central1/old"]}))
+            rc, out, err = self.run_main(["--versions", str(versions), "--target-version", "1.27.0", "--manifests-dir", str(Path(tmp) / "tree")])
+            self.assertEqual(rc, scan.EXIT_USAGE)
+            self.assertIn("narrowed by --cluster to us-central1/old", err)
+            self.assertNotIn("API deprecation scan", out)
+            # A full run's file carries the key as null and is read as before.
+            versions.write_text(json.dumps({**FLEET_JSON, "narrowed_to": None}))
+            rc, out, _ = self.run_main(["--versions", str(versions), "--target-version", "1.27.0", "--manifests-dir", str(Path(tmp) / "tree")])
+            self.assertEqual(rc, scan.EXIT_OK)
+            self.assertIn("# API deprecation scan: 1.24 -> 1.27", out)
+
     def test_current_version_flag(self):
         with tempfile.TemporaryDirectory() as tmp:
             write_tree(tmp, {"pdb.yaml": PDB_V1BETA1})

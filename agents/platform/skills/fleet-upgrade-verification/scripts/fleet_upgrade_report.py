@@ -672,13 +672,15 @@ def build_report(projects: list[str], explicit_target: str | None, readiness_opt
     `readiness_options` (`at`, `kubeconfig_dir`) turns on the per-member readiness read and
     grade; None leaves the report as the version table alone. `clusters`, when given, is the
     names to grade; every other cluster in the projects is skipped, so a caller that wants a
-    few members' readiness does not pay for the others' reads.
+    few members' readiness does not pay for the others' reads, and the report records them
+    under `narrowed_to` (`None` on a full run).
     """
     # `<location>/<name>` pins one cluster; a bare name admits that name in
     # every location of the projects (GKE names are unique per location).
     # `main` refuses any other form before it gets here; a direct caller is
     # refused the same way rather than matched against every location.
     wanted: set[tuple[str, str]] | None = None
+    narrowed_to: list[str] | None = None
     if clusters:
         wanted = set()
         for spec in clusters:
@@ -686,14 +688,15 @@ def build_report(projects: list[str], explicit_target: str | None, readiness_opt
             if parsed is None:
                 raise ValueError(INVALID_CLUSTER_SPEC.format(spec=spec))
             wanted.add(parsed)
+        narrowed_to = sorted(set(clusters))
     matched: set[tuple[str, str]] = set()
     cache = ServerConfigCache()
     members: list[dict] = []
     errors: list[dict] = []
     for project in projects:
         cmd = [GCLOUD, "container", "clusters", "list", f"--project={project}", JSON_FORMAT_FLAG]
-        clusters, error = run_gcloud_json(cmd)
-        if error is not None or not isinstance(clusters, list):
+        listed, error = run_gcloud_json(cmd)
+        if error is not None or not isinstance(listed, list):
             if error is not None and any(marker in error for marker in API_DISABLED_MARKERS):
                 ours, why_not = refusal_names_project(project, error)
                 if ours:
@@ -701,7 +704,7 @@ def build_report(projects: list[str], explicit_target: str | None, readiness_opt
                 error = f"{error} ({why_not})"
             errors.append({"project": project, "location": None, "message": error or f"{' '.join(cmd)} returned no list"})
             continue
-        for cluster in clusters:
+        for cluster in listed:
             if not isinstance(cluster, dict):
                 continue
             if wanted is not None:
@@ -726,6 +729,12 @@ def build_report(projects: list[str], explicit_target: str | None, readiness_opt
     report = {
         "target_version": explicit_target,
         "projects": list(projects),
+        # The `--cluster` specs this run was narrowed to, `None` on a full run,
+        # so a reader of `members[]` (the deprecation scan's floor, the audit
+        # collector's join) can tell a narrowed file from a full run whose
+        # project held one cluster. A `--project` narrowing is already visible
+        # in `projects`; this is the one the file otherwise hides.
+        "narrowed_to": narrowed_to,
         "members": members,
         "errors": errors,
         "summary": {status: sum(1 for m in members if m["status"] == status) for status in STATUS_ORDER},

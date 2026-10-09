@@ -391,6 +391,27 @@ class ProjectFailureTest(unittest.TestCase):
             self.assertEqual(open(path, encoding="utf-8").read(), before)
             self.assertIn(report.NARROWED_RUN_NOTE, out.getvalue())
 
+    def test_a_narrowed_run_marks_its_report_and_a_full_run_does_not(self):
+        """A reader of the JSON (the deprecation scan's floor, the collector's
+        join) has to tell a narrowed `members[]` from a full run whose project
+        held one cluster; `narrowed_to` is that mark."""
+        target = "1.31.0-gke.1"
+        fake = FakeGcloud({"p": [cluster("a", "us-central1", target, [("p", target)]), cluster("b", "us-central1", target, [("p", target)])]}, {})
+        with tempfile.TemporaryDirectory() as tmp, patch.object(report, "run_cmd", fake), redirect_stdout(io.StringIO()):
+            output = os.path.join(tmp, "r.json")
+            rc = report.main(["--project", "p", "--cluster", "us-central1/b", "--cluster", "b", "--target-version", target, "--state-dir", tmp, "--output", output])
+            self.assertEqual(rc, report.EXIT_OK)
+            with open(output, encoding="utf-8") as handle:
+                narrowed = json.load(handle)
+            self.assertEqual(narrowed["narrowed_to"], ["b", "us-central1/b"])
+            self.assertEqual([m["cluster"] for m in narrowed["members"]], ["b"])
+            rc = report.main(["--project", "p", "--target-version", target, "--state-dir", tmp, "--output", output])
+            self.assertEqual(rc, report.EXIT_OK)
+            with open(output, encoding="utf-8") as handle:
+                full = json.load(handle)
+            self.assertIsNone(full["narrowed_to"])
+            self.assertEqual([m["cluster"] for m in full["members"]], ["a", "b"])
+
     def test_one_failed_project_does_not_abort_the_others(self):
         target = "1.31.0-gke.1"
         fake = FakeGcloud(

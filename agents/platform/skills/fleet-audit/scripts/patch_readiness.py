@@ -186,6 +186,10 @@ VERSION_RE = re.compile(r"^(\d+)\.(\d+)\.(\d+)(?:-gke\.(\d+))?$")
 # the repository alike.
 UPGRADE_BLOCKED_CHECK = "upgrade-blocked"
 READINESS_REPORTER = Path(__file__).resolve().parents[2] / "fleet-upgrade-verification" / "scripts" / "fleet_upgrade_report.py"
+# The spec the collector hands the reporter and expects back under the report's
+# `narrowed_to`: a report marked otherwise is not the one this invocation wrote.
+CLUSTER_SPEC_FORMAT = "{location}/{name}"
+REPORT_NARROWED_KEY = "narrowed_to"
 # A cluster is "behind" for 3.11 when 3.1 or 3.2 produced a candidate on it:
 # those are the two checks whose remedy is the upgrade this check asks about.
 # §3.3's spread finding attaches to the laggard after every project is in,
@@ -248,6 +252,7 @@ UNEVALUATED_REPORT_ERROR_FORMAT = "the reporter could not read the cluster: {mes
 UNEVALUATED_BUDGET_SPENT = "the collector's readiness budget ({budget}s across the fleet) was spent before this cluster's reporter run could start"
 UNEVALUATED_TIMED_OUT = "the readiness reporter ran past its budget ({seconds}s) for this cluster and was stopped"
 UNEVALUATED_REPORT_MALFORMED = "the readiness reporter's report was not in the shape this check reads ({error})"
+UNEVALUATED_REPORT_NOT_NARROWED_FORMAT = "the readiness reporter's report is not marked as narrowed to {spec} (narrowed_to: {found!r}), so its rows are not this cluster's to read"
 UNEVALUATED_STATUS_FORMAT = "status {status!r}{note}"
 UNEVALUATED_REPORT_MESSAGE_CHARS = 200
 # One tail per cause. A budget does not stop the upgrade: a surge upgrade
@@ -1393,7 +1398,7 @@ def collect_upgrade_blocked(project: str, entries: list[dict], *, run: RunFn, de
                 _unevaluated(entry, UNEVALUATED_BUDGET_SPENT.format(budget=READINESS_FLEET_BUDGET_S))
                 continue
         argv = [
-            sys.executable, str(READINESS_REPORTER), "--project", project, "--cluster", f"{entry['location']}/{entry['_bare_name']}",
+            sys.executable, str(READINESS_REPORTER), "--project", project, "--cluster", CLUSTER_SPEC_FORMAT.format(location=entry["location"], name=entry["_bare_name"]),
             "--readiness", "--output", output, "--state-dir", state_dir,
         ]
         result = run(argv, timeout=timeout)
@@ -1431,17 +1436,27 @@ def _join_readiness(project: str, behind: list[dict], argv: list[str], result: R
                 report = json.load(handle)
             if not isinstance(report, dict):
                 raise TypeError(f"report is {type(report).__name__}, not an object")
-            for member in report.get("members") or []:
-                if isinstance(member, dict):
-                    members[(str(member.get("cluster", "")), str(member.get("location", "")))] = member
-            # A report with no rows and an errors[] entry is the reporter
-            # saying why (its own `clusters list` failed, say); that reason
-            # is what the limitation should carry. No rows and no error is
-            # the reporter's listing coming back empty where the collector's
-            # did not, which `UNEVALUATED_EMPTY_REPORT` already says.
-            errors = [e for e in report.get("errors") or [] if isinstance(e, dict) and e.get("message")]
-            if not members and errors:
-                no_report = UNEVALUATED_REPORT_ERROR_FORMAT.format(message=str(errors[0]["message"])[:UNEVALUATED_REPORT_MESSAGE_CHARS])
+            # The reporter marks a `--cluster` run with the specs it was
+            # narrowed to. A report without the mark, or marked for another
+            # cluster, is not the one this invocation wrote (a full run's
+            # file, or a reporter that ignored the flag), and its rows are
+            # not this cluster's to read.
+            expected = [CLUSTER_SPEC_FORMAT.format(location=e["location"], name=e["_bare_name"]) for e in behind]
+            if report.get(REPORT_NARROWED_KEY) != expected:
+                no_report = UNEVALUATED_REPORT_NOT_NARROWED_FORMAT.format(spec=", ".join(expected), found=report.get(REPORT_NARROWED_KEY))
+                log(f"{project}: the readiness report at {output} is not marked as narrowed to {', '.join(expected)}; upgrade-blocked unevaluated there")
+            else:
+                for member in report.get("members") or []:
+                    if isinstance(member, dict):
+                        members[(str(member.get("cluster", "")), str(member.get("location", "")))] = member
+                # A report with no rows and an errors[] entry is the reporter
+                # saying why (its own `clusters list` failed, say); that reason
+                # is what the limitation should carry. No rows and no error is
+                # the reporter's listing coming back empty where the collector's
+                # did not, which `UNEVALUATED_EMPTY_REPORT` already says.
+                errors = [e for e in report.get("errors") or [] if isinstance(e, dict) and e.get("message")]
+                if not members and errors:
+                    no_report = UNEVALUATED_REPORT_ERROR_FORMAT.format(message=str(errors[0]["message"])[:UNEVALUATED_REPORT_MESSAGE_CHARS])
         except (OSError, ValueError) as exc:
             no_report = UNEVALUATED_UNREADABLE_FORMAT.format(
                 rc=result.rc, error=str(exc)[:UNEVALUATED_REPORT_MESSAGE_CHARS], stderr=_stderr_excerpt(result)[:UNEVALUATED_REPORT_MESSAGE_CHARS] or "(empty)"

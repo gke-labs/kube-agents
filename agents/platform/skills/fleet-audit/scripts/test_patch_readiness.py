@@ -1640,7 +1640,7 @@ class UpgradeBlockedTest(unittest.TestCase):
                 self.calls.append(argv)
                 if write_report:
                     with open(argv[argv.index("--output") + 1], "w", encoding="utf-8") as handle:
-                        json.dump({"members": members or [], "errors": []}, handle)
+                        json.dump({"members": members or [], "errors": [], "narrowed_to": [argv[argv.index("--cluster") + 1]]}, handle)
                 return run_of(reporter_rc, "", "" if reporter_rc == 0 else "one member unreadable")
             raise AssertionError(f"unstubbed command: {joined}")
 
@@ -1845,7 +1845,7 @@ class UpgradeBlockedTest(unittest.TestCase):
                 self.calls.append(argv)
                 # The real reporter writes the named cluster's row alone.
                 with open(argv[argv.index("--output") + 1], "w", encoding="utf-8") as handle:
-                    json.dump({"members": [rows[argv[argv.index("--cluster") + 1]]], "errors": []}, handle)
+                    json.dump({"members": [rows[argv[argv.index("--cluster") + 1]]], "errors": [], "narrowed_to": [argv[argv.index("--cluster") + 1]]}, handle)
                 return run_of(0)
             raise AssertionError(f"unstubbed command: {joined}")
 
@@ -2006,7 +2006,7 @@ class UpgradeBlockedTest(unittest.TestCase):
                 return run_of(0, json.dumps(server_config(default=self.CURRENT, valid_versions=[patch, self.CURRENT])))
             if REPORTER_NEEDLE in joined:
                 with open(argv[argv.index("--output") + 1], "w", encoding="utf-8") as handle:
-                    json.dump({"members": [row], "errors": []}, handle)
+                    json.dump({"members": [row], "errors": [], "narrowed_to": [argv[argv.index("--cluster") + 1]]}, handle)
                 return run_of(0, "", "")
             raise AssertionError(joined)
 
@@ -2041,6 +2041,34 @@ class UpgradeBlockedTest(unittest.TestCase):
         by = self.collect([cluster(name="lag", master=self.BEHIND)], reporter_rc=pr.TIMEOUT_RC, write_report=False)
         self.assertIn("ran past its budget", self.unevaluated(by["lag"])[pr.UPGRADE_BLOCKED_CHECK])
 
+    def test_a_report_not_marked_as_narrowed_to_this_cluster_is_not_read(self):
+        """The reporter marks a `--cluster` run's report with its specs. A full
+        run's file, or one narrowed to another cluster, is not the report this
+        invocation wrote, so its rows are not read as this cluster's grade."""
+        row = self.member("lag", pdbs=[self.BUDGET])
+        for found in (None, ["us-central1/other"]):
+            with self.subTest(narrowed_to=found):
+                self.calls = []
+
+                def run(argv, **kwargs):
+                    joined = " ".join(argv)
+                    if "clusters list" in joined:
+                        return run_of(0, json.dumps([cluster(name="lag", master=self.BEHIND)]))
+                    if "get-server-config" in joined:
+                        return run_of(0, json.dumps(server_config(default=self.CURRENT, valid_versions=[self.BEHIND, self.CURRENT])))
+                    if REPORTER_NEEDLE in joined:
+                        self.calls.append(argv)
+                        with open(argv[argv.index("--output") + 1], "w", encoding="utf-8") as handle:
+                            json.dump({"members": [row], "errors": [], "narrowed_to": found}, handle)
+                        return run_of(0)
+                    raise AssertionError(f"unstubbed command: {joined}")
+
+                entry = {short(e): e for e in self.project(run)}["lag"]
+                self.assertEqual(len(self.calls), 1)
+                self.assertEqual([c for c in entry["candidates"] if c["check"] == pr.UPGRADE_BLOCKED_CHECK], [])
+                self.assertNotIn(pr.UPGRADE_BLOCKED_CHECK, self.ran(entry))
+                self.assertIn("not marked as narrowed to us-central1/lag", self.unevaluated(entry)[pr.UPGRADE_BLOCKED_CHECK])
+
     def test_a_malformed_report_costs_only_this_check(self):
         def run(argv, **kwargs):
             joined = " ".join(argv)
@@ -2050,7 +2078,7 @@ class UpgradeBlockedTest(unittest.TestCase):
                 return run_of(0, json.dumps(server_config(default=self.CURRENT, valid_versions=[self.BEHIND, self.CURRENT])))
             if REPORTER_NEEDLE in joined:
                 with open(argv[argv.index("--output") + 1], "w", encoding="utf-8") as handle:
-                    json.dump({"members": [{"cluster": "lag", "location": "us-central1", "readiness": "blocked"}]}, handle)
+                    json.dump({"members": [{"cluster": "lag", "location": "us-central1", "readiness": "blocked"}], "narrowed_to": [argv[argv.index("--cluster") + 1]]}, handle)
                 return run_of(0, "", "")
             raise AssertionError(joined)
 
@@ -2091,7 +2119,7 @@ class UpgradeBlockedTest(unittest.TestCase):
                 return run_of(1, "", "denied")
             if REPORTER_NEEDLE in joined:
                 with open(argv[argv.index("--output") + 1], "w", encoding="utf-8") as handle:
-                    json.dump({"members": [row], "errors": []}, handle)
+                    json.dump({"members": [row], "errors": [], "narrowed_to": [argv[argv.index("--cluster") + 1]]}, handle)
                 return run_of(0, "", "")
             raise AssertionError(joined)
 
@@ -2172,7 +2200,7 @@ class UpgradeBlockedTest(unittest.TestCase):
                 return run_of(0, json.dumps(server_config(default=self.CURRENT, valid_versions=[self.BEHIND, self.CURRENT])))
             if REPORTER_NEEDLE in joined:
                 with open(argv[argv.index("--output") + 1], "w", encoding="utf-8") as handle:
-                    json.dump({"members": [], "errors": [{"project": "acme", "message": "clusters list: 503 backend error"}]}, handle)
+                    json.dump({"members": [], "errors": [{"project": "acme", "message": "clusters list: 503 backend error"}], "narrowed_to": [argv[argv.index("--cluster") + 1]]}, handle)
                 return run_of(pr.READINESS_EXIT_PARTIAL, "", "")
             raise AssertionError(joined)
 
@@ -2262,7 +2290,7 @@ class UpgradeBlockedTest(unittest.TestCase):
         writing must not leave last run's budget to be republished."""
         os.makedirs(os.path.dirname(self.report_path()), exist_ok=True)
         with open(self.report_path(), "w", encoding="utf-8") as handle:
-            json.dump({"members": [self.member("lag", pdbs=[self.BUDGET])]}, handle)
+            json.dump({"members": [self.member("lag", pdbs=[self.BUDGET])], "narrowed_to": ["us-central1/lag"]}, handle)
         by = self.collect([cluster(name="lag", master=self.BEHIND)], reporter_rc=pr.READINESS_EXIT_PARTIAL, write_report=False)
         entry = by["lag"]
         self.assertNotIn(pr.UPGRADE_BLOCKED_CHECK, self.ran(entry))

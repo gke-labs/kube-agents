@@ -38,8 +38,10 @@ Neither reads versions against a target.
   read would file every member it did not name as gone. A spec that matches no cluster in the
   projects is an error line and exit 1, not an empty table; one cluster named in both forms is
   one request, not a hit and a miss. `--rollout-in-progress` beside `--cluster` is a usage error
-  (exit 2): the flag speaks to the rollout record, which a narrowed run does not touch. The
-  fleet-audit collector passes the clusters it found behind.
+  (exit 2): the flag speaks to the rollout record, which a narrowed run does not touch. The JSON
+  names the specs under `narrowed_to`, so a reader can tell the narrowed `members[]` from the
+  fleet; the deprecation scan refuses such a file. The fleet-audit collector passes the clusters
+  it found behind, and reads back only a report marked as narrowed to that cluster.
 - `--project` is repeatable and, when given, is the whole scope. Without it the script takes the
   union of `GCP_PROJECT_ID`, `GKE_PROJECT_ID` and `PROJECT_ID` with `MONITORED_PROJECT_IDS`
   (comma- or whitespace-separated) when set, or with every project visible to
@@ -52,7 +54,8 @@ Neither reads versions against a target.
   location, and the target column says which baseline was used, for example
   `1.31.4-gke.1183000 channel default (REGULAR)`.
 - `--output` writes the same data as JSON: `members[]`, `errors[]`, a `summary` count per
-  status, and the `rollout` block described below.
+  status, `narrowed_to` (the `--cluster` specs of a narrowed run, `null` on a full one), and the
+  `rollout` block described below.
 - `--rollout-in-progress` and `--state-dir` belong to rollout tracking, below; `--readiness`,
   `--at` and `--kubeconfig-dir` to the readiness check, below that.
 
@@ -222,7 +225,9 @@ error (exit 2).
 
 - `--versions` is the version report's `--output`. The scan's floor is its lowest control-plane
   minor: the API server is what stops serving a removed version, so node-pool versions do not
-  enter into it. `--current-version <version>` replaces the file when there is none.
+  enter into it. A file from a `--cluster` run (`narrowed_to` set) is refused: its floor is one
+  cluster's, not the fleet's; rerun the report without `--cluster`, or pass `--current-version`.
+  `--current-version <version>` replaces the file when there is none.
   `--target-version` defaults to the file's `target_version` when the report was run with one.
 - Without `--repo` the script scans every repository under `managed_repos`, on every forge, the
   same list the GitOps skills write to; `--repo` is repeatable and, when given, is the whole scope.

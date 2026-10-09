@@ -167,6 +167,12 @@ NO_REPOS_HEADING = "## No managed repositories configured"
 EXIT_OK = 0
 EXIT_PARTIAL = 1
 EXIT_USAGE = 2
+# The version report marks a `--cluster` run under this key with the specs it
+# was narrowed to (`null` on a full run). Such a file is refused as `--versions`:
+# its lowest control-plane minor is one cluster's, not the fleet's, and a floor
+# read from it drops every removal the clusters it left out still serve.
+REPORT_NARROWED_KEY = "narrowed_to"
+NARROWED_VERSIONS_FORMAT = "--versions {path}: the report was narrowed by --cluster to {specs}, so its floor is one cluster's and not the fleet's; rerun fleet_upgrade_report.py without --cluster, or pass --current-version"
 
 
 Version = tuple[int, int]
@@ -782,6 +788,10 @@ def main(argv: list[str] | None = None) -> int:
                 fleet = json.load(f)
         except (OSError, ValueError) as e:
             sys.stderr.write(f"--versions {args.versions}: {e}\n")
+            return EXIT_USAGE
+        narrowed_to = fleet.get(REPORT_NARROWED_KEY) if isinstance(fleet, dict) else None
+        if narrowed_to:
+            sys.stderr.write(NARROWED_VERSIONS_FORMAT.format(path=args.versions, specs=", ".join(str(s) for s in narrowed_to)) + "\n")
             return EXIT_USAGE
         members = members_from_fleet_json(fleet if isinstance(fleet, dict) else {})
         fleet_target = fleet.get("target_version") if isinstance(fleet, dict) else None

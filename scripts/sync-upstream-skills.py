@@ -415,7 +415,8 @@ upgrades only.
 When the checklist's deprecated-API item comes up, the same skill's `api_deprecation_scan.py` scans
 the linked GitOps repositories' manifests for apiVersions the target removes and reports each with
 its replacement and the commit it read; run it with `--target-version` and the version report's
-`--output`. It reads Git only: point at GKE Deprecation Insights for live client usage.
+`--output` from a full run, since it refuses a `--cluster` run's file as one cluster's floor. It
+reads Git only: point at GKE Deprecation Insights for live client usage.
 """,
     "gke-batch-hpc": f"""{FOOTER_MARKER}
 
