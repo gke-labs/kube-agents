@@ -15,6 +15,8 @@ This measures the wait directly, from data Prow already writes, and prints:
   * a roll-call of individual runs that waited too long, because a single
     75-minute wait among five runs moves no percentile and is exactly the case
     that goes unseen;
+  * the runs Boskos refused a project outright, which no percentile sees
+    either: they stop at the acquire and never wait;
   * whether a breach is the pool being full (onboard another project) or the
     Prow control plane not dispatching (oss-test-infra#2666, where onboarding
     would spend money and fix nothing).
@@ -55,9 +57,9 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
-# The presubmit whose queue wait this measures. It is the only job in the pool
-# that takes a Boskos lease, so it is the only one whose wait says anything
-# about pool capacity.
+# The presubmit whose queue wait this measures. Every job in the pool leases
+# from it, but this is the one that runs often enough, and under a concurrency
+# cap, for its wait to say anything about capacity.
 JOB_NAME = "pull-kube-agents-smoke-test"
 
 # Prow writes one tiny object per build under pr-logs/directory/<job>/, holding
@@ -68,6 +70,11 @@ JOB_NAME = "pull-kube-agents-smoke-test"
 GCS_BUCKET = "kube-agents-prow"
 GCS_BUILD_INDEX = f"gs://{GCS_BUCKET}/pr-logs/directory/{JOB_NAME}"
 BUILD_INDEX_SUFFIX = ".txt"
+# The index files, and only them. `latest-build.txt` sits under the same prefix
+# and Prow rewrites it at every smoke start, so a bulk copy that includes it
+# can 404 mid-copy and turn the hour into "could not measure" for a file the
+# check never reads (2 of 716 runs by 2026-10-08).
+GCS_BUILD_INDEX_GLOB = f"{GCS_BUILD_INDEX}/[0-9]*{BUILD_INDEX_SUFFIX}"
 
 # The three artifacts setup time is read from, in the order the run writes
 # them. Only prowjob.json is required: initupload writes it when the pod starts,
@@ -125,6 +132,14 @@ BUILD_LOG_DECODE_ERRORS = "replace"
 # whatever survived.
 BANNER_PATTERN = re.compile(r"^===\s*\[([^]]+)\]\s*(.*?)\s*===\s*$", re.MULTILINE)
 BANNER_LEASE_KEYWORD = "boskos"
+# What boskosctl prints when the acquire gives up with nothing free: its
+# failure prefix with Boskos's not-found answer. The whole line, because the
+# prefix alone is also what an unreachable Boskos prints (with a dial error
+# for a tail), and that is an acquire nobody can read, not a full pool. It is
+# the last line of a run that failed at the lease: the job stops there and no
+# banner follows, so the run has no lease segment and, uncounted, its wait is
+# the minute it spent before asking (#2747).
+LEASE_FAILURE_PHRASE = "failed to acquire a resource: resources not found"
 
 # The four segments of setup time, in the order a run goes through them, with
 # the label the report prints. Keys rather than prose because --json emits them.
@@ -206,6 +221,21 @@ BOSKOS_STATE_FREE = "free"
 # nobody, not a real lease, and including it would make every idle pool look
 # like it had one mystery holder.
 BOSKOS_NO_OWNER = ""
+# A job names its lease `<job name>-<build ID>`, and a Prow build ID is a
+# snowflake (SNOWFLAKE_* below): 19 digits since 2018 and until the epoch runs
+# out. An owner that does not end in one was taken by a person, for a repair.
+BUILD_ID_SUFFIX = re.compile(r"-(\d{19})$")
+# Jobs that lease under a fixed owner rather than `<job name>-<build ID>`: the
+# defaults of the hack/ scripts that lease through boskos_pool.py, which their
+# Prow jobs do not override (test_integration_contracts.py pins the list to
+# those scripts). Deck cannot vouch for a lease with no build ID in it, so
+# these are reported as a job's, apart from the hand holds, and are never
+# compared against it.
+BOSKOS_JOB_OWNERS = (
+    "fleet-reconcile",
+    "ci-kube-agents-compute-sweep",
+    "ci-kube-agents-pull-sweep",
+)
 
 # The policy in docs/ci-pool-projects.md. A breach
 # of either is the signal to onboard the next project -- if, and only if, the
@@ -331,12 +361,21 @@ JUNIT_ROW_P50 = "setup p50 minutes"
 JUNIT_ROW_P95 = "setup p95 minutes"
 JUNIT_ROW_QUEUE = "longest live queue minutes"
 JUNIT_ROW_FREE = "free pool projects"
+# The three rows after the first five are what a full pool looks like when the
+# percentiles do not move: runs refused a project in the recent window, and
+# the projects that are leased without a run behind them.
+JUNIT_ROW_LEASE_FAILURES = "recent lease failures"
+JUNIT_ROW_HELD_BY_HAND = "projects held by hand"
+JUNIT_ROW_OUT_OF_ROTATION = "projects out of rotation"
 JUNIT_ROW_NAMES = (
     JUNIT_ROW_VERDICT,
     JUNIT_ROW_P50,
     JUNIT_ROW_P95,
     JUNIT_ROW_QUEUE,
     JUNIT_ROW_FREE,
+    JUNIT_ROW_LEASE_FAILURES,
+    JUNIT_ROW_HELD_BY_HAND,
+    JUNIT_ROW_OUT_OF_ROTATION,
 )
 # The setup rows are also skipped, not graphed, when the number does not cover
 # the window the row names: a sweep that read GCS and found no runs has
@@ -344,6 +383,8 @@ JUNIT_ROW_NAMES = (
 # fewer days that would sit on the graph beside whole-window points and read as
 # one of them. The trend source carries no error string in either case.
 JUNIT_NO_RUNS_MESSAGE = "no runs were created in the window"
+# A window whose every run was refused a project has runs and no percentile.
+JUNIT_ALL_REFUSED_MESSAGE = "every run in the window was refused a project"
 JUNIT_TRUNCATED_MESSAGE = (
     "the sweep ran out of time and covers only {window_start} onward, "
     "not the whole window"
@@ -398,6 +439,10 @@ class Wait:
     the rest need artifacts a run may not have got far enough to write. A
     segment that could not be read is None, never zero, so a run whose lease
     time is unreadable is not counted as having leased instantly.
+
+    `lease_failed` is the run that asked and was refused. Its total is a
+    lower bound on a wait that never ended, so the percentiles leave it out
+    and it is counted on its own.
     """
 
     def __init__(
@@ -410,6 +455,7 @@ class Wait:
         container_started: Optional[datetime] = None,
         lease_requested: Optional[datetime] = None,
         lease_acquired: Optional[datetime] = None,
+        lease_failed: bool = False,
     ):
         self.build_id = build_id
         self.pull = pull
@@ -419,6 +465,7 @@ class Wait:
         self.container_started = container_started
         self.lease_requested = lease_requested
         self.lease_acquired = lease_acquired
+        self.lease_failed = lease_failed
 
     @property
     def queue_seconds(self) -> float:
@@ -493,14 +540,25 @@ class LiveQueue:
 
     Two separate things, which it is worth not conflating. `waiting` is runs
     that have no pod. `running_build_ids` is runs that have one and are
-    therefore holding a Boskos lease -- that second set is what a lease-holder
-    list has to be compared against, and comparing against `waiting` instead
-    would mark every real lease as leaked, since a waiting run holds none.
+    therefore holding a Boskos lease; comparing a lease-holder list against
+    `waiting` instead would mark every real lease as leaked, since a waiting
+    run holds none. Both are this job's. `all_running_build_ids` is every
+    tenant's running job, and is what the holders are compared against: the
+    nightlies and the next lane lease from the same pool, and against the
+    smoke runs alone each of theirs read as leaked (#2747).
     """
 
-    def __init__(self, waiting: List[LiveWait], running_build_ids: set):
+    def __init__(
+        self,
+        waiting: List[LiveWait],
+        running_build_ids: set,
+        all_running_build_ids: Optional[set] = None,
+    ):
         self.waiting = waiting
         self.running_build_ids = running_build_ids
+        self.all_running_build_ids = (
+            set(running_build_ids) if all_running_build_ids is None else all_running_build_ids
+        )
 
     @property
     def running(self) -> int:
@@ -538,6 +596,28 @@ class PoolState:
 
     def lease_holders(self) -> List[str]:
         return sorted(k for k in self.owners if k != BOSKOS_NO_OWNER)
+
+    def held_by_job(self) -> Dict[str, int]:
+        """Owners in BOSKOS_JOB_OWNERS, with how many projects each holds."""
+        return {
+            owner: self.owners[owner]
+            for owner in self.lease_holders()
+            if owner in BOSKOS_JOB_OWNERS
+        }
+
+    def held_by_hand(self) -> Dict[str, int]:
+        """Owners that are neither a Prow run nor a known job, with how many
+        projects each holds.
+
+        A person leasing a project for a repair names the lease however they
+        like, and Deck has never heard of them, so these are reported as held
+        rather than compared against it and called leaked.
+        """
+        return {
+            owner: self.owners[owner]
+            for owner in self.lease_holders()
+            if not BUILD_ID_SUFFIX.search(owner) and owner not in BOSKOS_JOB_OWNERS
+        }
 
 
 class Source:
@@ -635,19 +715,19 @@ def started_time(document: Optional[dict]) -> Optional[datetime]:
     return datetime.fromtimestamp(stamp, tz=timezone.utc)
 
 
-def banners(text: str) -> List[Tuple[datetime, str]]:
-    """Every timestamped phase banner in a build log, in order.
+def _timestamped_banners(text: str) -> List[re.Match]:
+    """Every phase banner whose stamp parses, in order.
 
     The script prints a few untimestamped ones too, like
     `=== Target Cluster Context ===`. They do not match, which is what pinning
     the grammar to the bracketed stamp is for.
     """
-    found = []
-    for stamp, label in BANNER_PATTERN.findall(text):
-        moment = parse_rfc3339(stamp)
-        if moment is not None:
-            found.append((moment, label))
-    return found
+    return [m for m in BANNER_PATTERN.finditer(text) if parse_rfc3339(m.group(1))]
+
+
+def banners(text: str) -> List[Tuple[datetime, str]]:
+    """Every timestamped phase banner in a build log, as (moment, label)."""
+    return [(parse_rfc3339(m.group(1)), m.group(2)) for m in _timestamped_banners(text)]
 
 
 def lease_window(text: str) -> Tuple[Optional[datetime], Optional[datetime]]:
@@ -662,12 +742,42 @@ def lease_window(text: str) -> Tuple[Optional[datetime], Optional[datetime]]:
     preamble, or killed before it got there. The release banner names Boskos
     too, so the first match is taken rather than any of them.
     """
-    found = banners(text)
-    for index, (moment, label) in enumerate(found):
-        if BANNER_LEASE_KEYWORD in label.lower():
-            following = found[index + 1][0] if index + 1 < len(found) else None
-            return moment, following
+    lease, following = _lease_banners(text)
+    if lease is None:
+        return None, None
+    return (
+        parse_rfc3339(lease.group(1)),
+        parse_rfc3339(following.group(1)) if following is not None else None,
+    )
+
+
+def _lease_banners(text: str) -> Tuple[Optional[re.Match], Optional[re.Match]]:
+    """The first timestamped banner naming Boskos, and the banner after it."""
+    found = _timestamped_banners(text)
+    for index, match in enumerate(found):
+        if BANNER_LEASE_KEYWORD in match.group(2).lower():
+            following = found[index + 1] if index + 1 < len(found) else None
+            return match, following
     return None, None
+
+
+def _lease_output(text: str) -> str:
+    """What the run printed between the lease banner and the banner after it."""
+    lease, following = _lease_banners(text)
+    if lease is None:
+        return ""
+    return text[lease.end() : following.start() if following is not None else len(text)]
+
+
+def lease_failed(text: str) -> bool:
+    """Whether the run asked Boskos for a project and was refused.
+
+    Only LEASE_FAILURE_PHRASE says so, and only inside the acquire's own
+    output. A log that stops at the banner with nothing after it is a run
+    killed inside the acquire as often as anything else, so silence stays
+    unmeasured rather than becoming a failure.
+    """
+    return LEASE_FAILURE_PHRASE in _lease_output(text)
 
 
 def wait_from_prowjob(
@@ -696,6 +806,7 @@ def wait_from_prowjob(
     if not isinstance(max_concurrency, int):
         max_concurrency = None
     requested, acquired = lease_window(log_head)
+    failed = lease_failed(log_head)
     return Wait(
         build_id,
         _pull_of(prowjob),
@@ -704,7 +815,8 @@ def wait_from_prowjob(
         max_concurrency,
         container_started=started_time(started),
         lease_requested=requested,
-        lease_acquired=acquired,
+        lease_acquired=None if failed else acquired,
+        lease_failed=failed,
     )
 
 
@@ -717,10 +829,10 @@ def _index_entries_from_gcs(tmpdir: str) -> Tuple[Dict[int, str], Optional[str]]
     """
     dest = os.path.join(tmpdir, "index")
     os.makedirs(dest, exist_ok=True)
-    # The trailing wildcard matters. `cp -r` on the directory itself exits 0
-    # having copied nothing.
+    # A wildcard, not `cp -r` on the directory, which exits 0 having copied
+    # nothing; and the build files only, for the reason beside the constant.
     rc, _, err = run_cmd(
-        ["gcloud", "storage", "cp", f"{GCS_BUILD_INDEX}/*", dest],
+        ["gcloud", "storage", "cp", GCS_BUILD_INDEX_GLOB, dest],
         timeout=GCS_INDEX_TIMEOUT_SECONDS,
     )
     if rc != 0:
@@ -1047,11 +1159,10 @@ def fetch_live_queue(now: datetime, from_dir: Optional[str] = None) -> Source:
 
     waiting: List[LiveWait] = []
     running: set = set()
+    all_running: set = set()
     for item in document.get("items") or []:
         spec = item.get("spec") or {}
         status = item.get("status") or {}
-        if spec.get("job") != JOB_NAME:
-            continue
         # A job that has finished is neither waiting nor holding anything,
         # however it finished. Reading "no pendingTime" as "still queued" counts
         # every aborted run as a live stall, and aborted runs outnumber every
@@ -1065,17 +1176,24 @@ def fetch_live_queue(now: datetime, from_dir: Optional[str] = None) -> Source:
         # wrong for most of the runs it covers. Durations come from artifacts.
         if status.get("completionTime"):
             continue
+        ours = spec.get("job") == JOB_NAME
         if status.get("pendingTime"):
+            # Every tenant's running job goes in the leak cross-reference;
+            # only this job's go in its own count.
             build_id = str(status.get("build_id") or "")
             if build_id:
-                running.add(build_id)
+                all_running.add(build_id)
+                if ours:
+                    running.add(build_id)
+            continue
+        if not ours:
             continue
         created = parse_rfc3339((item.get("metadata") or {}).get("creationTimestamp", ""))
         if created is None:
             continue
         waiting.append(LiveWait(_pull_of(item), created, now))
     waiting.sort(key=lambda w: w.seconds, reverse=True)
-    return Source(value=LiveQueue(waiting, running))
+    return Source(value=LiveQueue(waiting, running, all_running))
 
 
 def _free_port() -> int:
@@ -1189,9 +1307,14 @@ def _pool_state_from(document: dict) -> PoolState:
 
 class DayRow:
     def __init__(self, day: str, waits: List[Wait]):
-        minutes = [w.minutes for w in waits]
+        measured = [w for w in waits if not w.lease_failed]
+        minutes = [w.minutes for w in measured]
         self.day = day
-        self.count = len(waits)
+        self.count = len(measured)
+        # Runs refused a project. Not in `count` or the percentiles: a failed
+        # run's wait is the minute before it asked, and four of them on a day
+        # of thirty cannot move a p95 (#2747).
+        self.lease_failures = len(waits) - len(measured)
         self.p50 = percentile(minutes, PERCENTILE_P50)
         self.p95 = percentile(minutes, PERCENTILE_P95)
         self.worst = max(minutes) if minutes else 0.0
@@ -1216,21 +1339,43 @@ def recent_row(waits: List[Wait], window_end: datetime) -> dict:
 
     Filters the waits the sweep already holds, so it costs no reads. Below
     MIN_SAMPLES_FOR_RECENT_VERDICT the percentiles are None rather than a
-    number over a handful of runs, and `runs` says why.
+    number over a handful of runs, and `runs` says why. `lease_failures` is
+    the count behind the third breach trigger, and is not in `runs`.
     """
     start = window_end - timedelta(hours=RECENT_WINDOW_HOURS)
-    recent = [w for w in waits if w.created >= start]
+    recent = [w for w in waits if w.created >= start and not w.lease_failed]
     minutes = [w.minutes for w in recent]
     judged = len(recent) >= MIN_SAMPLES_FOR_RECENT_VERDICT
     return {
         "hours": RECENT_WINDOW_HOURS,
         "window_start": start.strftime(TIMESTAMP_FORMAT),
         "runs": len(recent),
+        "lease_failures": len(recent_lease_failures(waits, window_end)),
         "judged": judged,
         "p50_minutes": round(percentile(minutes, PERCENTILE_P50), 1) if judged else None,
         "p95_minutes": round(percentile(minutes, PERCENTILE_P95), 1) if judged else None,
         "worst_minutes": round(max(minutes), 1) if judged else None,
     }
+
+
+def recent_lease_failures(waits: List[Wait], window_end: datetime) -> List[Wait]:
+    """Runs refused a project in the last RECENT_WINDOW_HOURS, newest first.
+
+    Dated by the ask rather than by creation: a run can queue an hour before
+    it reaches Boskos, and the failure is news for three hours from when it
+    happened, not from when the run was created.
+    """
+    start = window_end - timedelta(hours=RECENT_WINDOW_HOURS)
+    # Bounded above too: a replay's instant can fall between a run's creation
+    # and its ask, and a refusal after the instant had not happened yet.
+    failed = [
+        w for w in waits
+        if w.lease_failed
+        and w.lease_requested is not None
+        and start <= w.lease_requested <= window_end
+    ]
+    failed.sort(key=lambda w: w.lease_requested, reverse=True)
+    return failed
 
 
 def outliers(waits: List[Wait], threshold_minutes: float) -> List[Wait]:
@@ -1284,6 +1429,11 @@ def leaked_leases(pool: Optional[PoolState], queue: Optional[LiveQueue]) -> List
     would read a leak as demand and recommend buying capacity to replace
     capacity that was never released.
 
+    Compared against every tenant's running job, not this job's alone: the
+    nightlies and the next lane lease from the same pool. A holder with no
+    build ID is a known job's fixed owner or a hand hold, and is reported as
+    held, never as leaked: nothing in Deck can vouch for it either way.
+
     Needs both sources: with no list of running jobs to compare against, every
     holder looks orphaned.
     """
@@ -1291,8 +1441,8 @@ def leaked_leases(pool: Optional[PoolState], queue: Optional[LiveQueue]) -> List
         return []
     orphaned = []
     for holder in pool.lease_holders():
-        _, _, build_id = holder.rpartition("-")
-        if build_id and build_id not in queue.running_build_ids:
+        match = BUILD_ID_SUFFIX.search(holder)
+        if match and match.group(1) not in queue.all_running_build_ids:
             orphaned.append(holder)
     return orphaned
 
@@ -1335,12 +1485,23 @@ def summarise(
     # the builds that did read are still reported, under that verdict.
     sweep: Optional[Sweep] = trend.value
     waits = sweep.waits if sweep else []
+    # A run refused a project is counted and never measured: its wait is the
+    # minute before it asked, and in the percentiles it reads as a fast run
+    # on the afternoon the pool had nothing to give (#2747).
+    measured = [w for w in waits if not w.lease_failed]
+    failed = sorted(
+        (w for w in waits if w.lease_failed), key=lambda w: w.lease_requested, reverse=True
+    )
+    recent_failed = recent_lease_failures(waits, window_end)
     rows = daily_rows(waits)
     breached_days = [r for r in rows if r.breached(p50_limit, p95_limit)]
-    minutes = [w.minutes for w in waits]
+    minutes = [w.minutes for w in measured]
 
     queue: Optional[LiveQueue] = live.value if live.ok else None
     live_breach = [w for w in queue.waiting if w.minutes > p95_limit] if queue else []
+    # A backlog at the p50 bar, the bar the health bot and docs/ci-health.md
+    # use for "runs are waiting now": what a refusal yields to in cause().
+    live_backlog = any(w.minutes > p50_limit for w in queue.waiting) if queue else False
 
     pool_state: Optional[PoolState] = pool.value if pool.ok else None
     concurrency = latest_max_concurrency(waits)
@@ -1355,7 +1516,10 @@ def summarise(
         else 0
     )
 
-    breached = bool(breached_days or live_breach)
+    # The third trigger is one refusal in the recent window: it needs no
+    # sample floor, because one is Boskos saying the pool was full for the
+    # whole acquire, and it ages out with the window rather than the week.
+    breached = bool(breached_days or live_breach or recent_failed)
     if not trend.ok and not breached:
         verdict, exit_code = VERDICT_UNMEASURED, EXIT_UNMEASURED
     elif not breached:
@@ -1368,8 +1532,11 @@ def summarise(
     # emitting CONCURRENCY_CAP beside verdict OK reads as a live problem to
     # anything filtering on the label. What the cap and the pool size are is
     # still reported, under `max_concurrency` and `pool.stranded`.
+    leaked = leaked_leases(pool_state, queue)
     cause_label, cause_text = (
-        cause(pool_state, queue, concurrency) if breached else (None, [])
+        cause(pool_state, queue, concurrency, len(recent_failed), leaked, live_backlog)
+        if breached
+        else (None, [])
     )
 
     return {
@@ -1381,13 +1548,15 @@ def summarise(
             "p95_minutes": p95_limit,
             "outlier_minutes": outlier_limit,
         },
-        # Evidence, not a verdict: `breached` stays on the daily rows and the
-        # live queue, so TestGrid's row does not move with this block.
+        # Its percentiles are evidence, not a verdict: `breached` stays on the
+        # daily rows, the live queue and this block's `lease_failures` count,
+        # so TestGrid's row does not move with its p50 or p95.
         "recent": recent_row(waits, window_end),
         "trend": {
             "read": trend.ok,
             "error": trend.error,
-            "runs": len(waits),
+            "runs": len(measured),
+            "lease_failures": len(failed),
             "p50_minutes": round(percentile(minutes, PERCENTILE_P50), 1),
             "p95_minutes": round(percentile(minutes, PERCENTILE_P95), 1),
             "worst_minutes": round(max(minutes), 1) if minutes else 0.0,
@@ -1400,11 +1569,12 @@ def summarise(
             "builds_read": sweep.builds_read if sweep else 0,
             "unreadable": sweep.unreadable if sweep else [],
             "elapsed_seconds": round(sweep.elapsed_seconds, 1) if sweep else 0.0,
-            "segments": segment_breakdown(waits),
+            "segments": segment_breakdown(measured),
             "days": [
                 {
                     "day": r.day,
                     "runs": r.count,
+                    "lease_failures": r.lease_failures,
                     "p50_minutes": round(r.p50, 1),
                     "p95_minutes": round(r.p95, 1),
                     "worst_minutes": round(r.worst, 1),
@@ -1427,7 +1597,19 @@ def summarise(
                 # different remedies, so the split travels with each one.
                 "segments": _segment_minutes(w),
             }
-            for w in outliers(waits, outlier_limit)
+            for w in outliers(measured, outlier_limit)
+        ],
+        # Every refusal in the window, newest first; `recent` marks the ones
+        # inside the trigger window, which `recent.lease_failures` counts.
+        "lease_failures": [
+            {
+                "build_id": str(w.build_id),
+                "pull": w.pull,
+                "created": w.created.strftime(TIMESTAMP_FORMAT),
+                "lease_requested": w.lease_requested.strftime(TIMESTAMP_FORMAT),
+                "recent": w in recent_failed,
+            }
+            for w in failed
         ],
         "queue": {
             "read": live.ok,
@@ -1450,7 +1632,12 @@ def summarise(
             "stranded": stranded,
         },
         "max_concurrency": concurrency,
-        "leaked_leases": leaked_leases(pool_state, queue),
+        # Boskos's states by name, and the owners that are not a Prow run,
+        # each with its count; None when the pool was not read.
+        "states": dict(pool_state.counts) if pool_state else None,
+        "held_by_job": pool_state.held_by_job() if pool_state else None,
+        "held_by_hand": pool_state.held_by_hand() if pool_state else None,
+        "leaked_leases": leaked,
         "cause": cause_label,
         "cause_text": cause_text,
         "breached": breached,
@@ -1501,7 +1688,10 @@ def render(summary: dict) -> str:
             f"  (thresholds: p50 > {_fmt(limits['p50_minutes'])},"
             f" p95 > {_fmt(limits['p95_minutes'])})\n"
         )
-        out.append(f"{'day':<12}{'runs':>6}{'p50':>9}{'p95':>9}{'worst':>9}{'conc':>7}   ")
+        out.append(
+            f"{'day':<12}{'runs':>6}{'p50':>9}{'p95':>9}{'worst':>9}{'conc':>7}"
+            f"{'refused':>9}   "
+        )
         for row in trend["days"]:
             concurrency = "-" if row["max_concurrency"] is None else str(row["max_concurrency"])
             flag = "  BREACH" if row["breached"] else ""
@@ -1509,11 +1699,12 @@ def render(summary: dict) -> str:
             out.append(
                 f"{row['day']:<12}{row['runs']:>6}{_fmt(row['p50_minutes']):>9}"
                 f"{_fmt(row['p95_minutes']):>9}{_fmt(row['worst_minutes']):>9}"
-                f"{concurrency:>7}{flag}{thin}"
+                f"{concurrency:>7}{row['lease_failures']:>9}{flag}{thin}"
             )
         out.append(
             f"\n{'window':<12}{trend['runs']:>6}{_fmt(trend['p50_minutes']):>9}"
             f"{_fmt(trend['p95_minutes']):>9}{_fmt(trend['worst_minutes']):>9}"
+            f"{'':>7}{trend['lease_failures']:>9}"
         )
         # The stretch the chat alert quotes, on the same columns as the days
         # above it, so the two can be compared without arithmetic.
@@ -1523,9 +1714,11 @@ def render(summary: dict) -> str:
             out.append(
                 f"{label:<12}{recent['runs']:>6}{_fmt(recent['p50_minutes']):>9}"
                 f"{_fmt(recent['p95_minutes']):>9}{_fmt(recent['worst_minutes']):>9}"
+                f"{'':>7}{recent['lease_failures']:>9}"
             )
         else:
-            out.append(f"{label:<12}{recent['runs']:>6}   {TOO_FEW_RUNS}")
+            refused = f", {recent['lease_failures']} refused" if recent["lease_failures"] else ""
+            out.append(f"{label:<12}{recent['runs']:>6}   {TOO_FEW_RUNS}{refused}")
         if trend["elapsed_seconds"]:
             out.append(
                 f"{trend['builds_read']} builds read in "
@@ -1593,10 +1786,20 @@ def render(summary: dict) -> str:
         )
         if pool["in_transition"]:
             out.append(
-                f"  {pool['in_transition']} project(s) in neither state -- cleaning,"
-                " dirty, or mid-release,"
+                f"  {pool['in_transition']} project(s) out of rotation, not leasable:"
+                f" {_states_text(summary['states'])}"
             )
-            out.append("  and so not leasable right now.")
+        by_job = summary["held_by_job"]
+        if by_job:
+            out.append(
+                f"  {sum(by_job.values())} project(s) held by a job without a run ID:"
+                f" {_holders_text(by_job)}"
+            )
+        held = summary["held_by_hand"]
+        if held:
+            out.append(
+                f"  {sum(held.values())} project(s) held by hand: {_holders_text(held)}"
+            )
     concurrency = summary["max_concurrency"]
     out.append(
         "Concurrency cap: "
@@ -1645,6 +1848,17 @@ def render(summary: dict) -> str:
             f"QUEUE IS LONG RIGHT NOW: {queue['over_threshold']} run(s) waiting over "
             f"{_fmt(limits['p95_minutes'])} minutes."
         )
+    refused = [f for f in summary["lease_failures"] if f["recent"]]
+    if refused:
+        out.append(
+            f"LEASE FAILED: {len(refused)} run(s) asked Boskos for a project in the last"
+            f" {summary['recent']['hours']}h and got none."
+        )
+        for failure in refused:
+            out.append(
+                f"  {failure['lease_requested']}  PR {failure['pull'] or '?':<6}"
+                f"  build {failure['build_id']}"
+            )
 
     out.append("")
     out.extend(summary["cause_text"])
@@ -1652,6 +1866,40 @@ def render(summary: dict) -> str:
     out.append("Expansion is a human decision. This check does not provision anything.")
     out.append("-" * REPORT_WIDTH)
     return "\n".join(out)
+
+
+def _states_text(states: Optional[Dict[str, int]]) -> str:
+    """`rebuilding 2, cleaning 1`: the states that are neither busy nor free."""
+    return ", ".join(
+        f"{state} {count}"
+        for state, count in sorted((states or {}).items())
+        if state not in (BOSKOS_STATE_BUSY, BOSKOS_STATE_FREE) and count
+    )
+
+
+def _holders_text(held: Dict[str, int]) -> str:
+    """`hangdng-rebuild (2)`: each hand owner with how many it holds."""
+    return ", ".join(f"{owner} ({count})" for owner, count in sorted(held.items()))
+
+
+def _pool_now_lines(pool_state: PoolState, leaked: Sequence[str]) -> List[str]:
+    """What the projects are doing, for a cause that turns on it."""
+    lines = [
+        f"Pool now: {pool_state.busy} leased, {pool_state.free} free,"
+        f" {pool_state.total} total."
+    ]
+    rotation = _states_text(pool_state.counts)
+    if rotation:
+        lines.append(f"  out of rotation: {rotation}")
+    by_job = pool_state.held_by_job()
+    if by_job:
+        lines.append(f"  held by a job without a run ID: {_holders_text(by_job)}")
+    held = pool_state.held_by_hand()
+    if held:
+        lines.append(f"  held by hand: {_holders_text(held)}")
+    if leaked:
+        lines.append(f"  {len(leaked)} lease(s) leaked, named under leaked_leases")
+    return lines
 
 
 def _cap_at_pool_caveat(
@@ -1690,6 +1938,9 @@ def cause(
     pool_state: Optional[PoolState],
     queue: Optional[LiveQueue],
     concurrency: Optional[int],
+    lease_failures: int = 0,
+    leaked: Sequence[str] = (),
+    live_backlog: bool = False,
 ) -> Tuple[str, List[str]]:
     """Why runs are waiting, and therefore what to do about it.
 
@@ -1705,15 +1956,46 @@ def cause(
     checking that before blaming the control plane matters because the two are
     indistinguishable in the wait times alone: in both, runs sit in `triggered`
     while projects sit free.
+
+    A refusal outranks the wait: `lease_failures` runs in the recent window
+    asked Boskos and got nothing for the whole acquire, which is the pool full
+    at that moment whatever it holds now. That is CAPACITY, and the text says
+    what the projects are doing, because the remedy differs when two of them
+    are a repair or a leak (#2747). It is evidence about that moment only, so
+    a live reading that contradicts it wins: `live_backlog` (a run queued past
+    the p50 limit right now) over projects sitting free is the control plane
+    or the cap, diagnosed below with the refusal still stated first.
     """
+    refused = [
+        f"{lease_failures} run(s) in the last {RECENT_WINDOW_HOURS}h asked Boskos for a"
+        " project and got none",
+        "before the acquire gave up: nothing was free for that long.",
+    ]
     if pool_state is None:
-        return CAUSE_UNKNOWN, [
+        return CAUSE_UNKNOWN, (refused + [""] if lease_failures else []) + [
             "Cause unknown: the pool's occupancy could not be read, and a long wait",
             "means opposite things depending on it. Do not onboard a project on the",
             "strength of this run alone -- the Boskos acquire segment above breaks",
             "the tie: late lease, real contention; prompt lease, control plane.",
         ]
 
+    if lease_failures and not (live_backlog and pool_state.free > 0):
+        # Not the cap caveat: a refused run never waited anywhere, and the
+        # lines above already name what is out of rotation.
+        return CAUSE_CAPACITY, ["CAPACITY. " + refused[0]] + refused[1:] + [
+            "What the projects are doing decides the remedy: a repair ends, a leak is",
+            "released, and demand needs the next project, per the pool runbook:",
+            "docs/ci-pool-projects.md",
+        ] + _pool_now_lines(pool_state, leaked)
+
+    label, lines = _wait_cause(pool_state, queue, concurrency)
+    return label, (refused + [""] + lines) if lease_failures else lines
+
+
+def _wait_cause(
+    pool_state: PoolState, queue: Optional[LiveQueue], concurrency: Optional[int]
+) -> Tuple[str, List[str]]:
+    """The ladder for a wait: full pool, then the cap, then the control plane."""
     if pool_state.free == 0:
         return CAUSE_CAPACITY, [
             "CAPACITY. Every project was leased while runs were waiting, so the",
@@ -1842,6 +2124,8 @@ def junit_report(summary: dict) -> str:
     elif trend["truncated"]:
         setup_measured = False
         setup_skip = JUNIT_TRUNCATED_MESSAGE.format(window_start=trend["window_start"])
+    elif trend["runs"] == 0 and trend["lease_failures"]:
+        setup_measured, setup_skip = False, JUNIT_ALL_REFUSED_MESSAGE
     elif trend["runs"] == 0:
         setup_measured, setup_skip = False, JUNIT_NO_RUNS_MESSAGE
     else:
@@ -1863,6 +2147,33 @@ def junit_report(summary: dict) -> str:
         add(JUNIT_ROW_FREE, "properties", _junit_value(pool["free"]))
     else:
         add(JUNIT_ROW_FREE, JUNIT_TAG_SKIPPED, _junit_skip(pool["error"]))
+
+    # The recent window is the newest stretch, which a cut-short sweep still
+    # covers unless the cut fell inside it: the sweep walks whole days and
+    # drops the unfinished ones, so between 00:00 and 03:00 UTC a truncated
+    # sweep can start after the window does, and a count over the remainder
+    # would graph as a measured zero. Both stamps are TIMESTAMP_FORMAT, so the
+    # string compare is the chronological one.
+    recent = summary["recent"]
+    if not trend["read"]:
+        add(JUNIT_ROW_LEASE_FAILURES, JUNIT_TAG_SKIPPED, _junit_skip(trend["error"]))
+    elif trend["truncated"] and trend["window_start"] > recent["window_start"]:
+        add(
+            JUNIT_ROW_LEASE_FAILURES,
+            JUNIT_TAG_SKIPPED,
+            _junit_skip(JUNIT_TRUNCATED_MESSAGE.format(window_start=trend["window_start"])),
+        )
+    else:
+        add(JUNIT_ROW_LEASE_FAILURES, "properties", _junit_value(recent["lease_failures"]))
+    held = sum((summary["held_by_hand"] or {}).values())
+    for name, value in (
+        (JUNIT_ROW_HELD_BY_HAND, held),
+        (JUNIT_ROW_OUT_OF_ROTATION, pool["in_transition"]),
+    ):
+        if pool["read"]:
+            add(name, "properties", _junit_value(value))
+        else:
+            add(name, JUNIT_TAG_SKIPPED, _junit_skip(pool["error"]))
 
     suite = {
         "name": JUNIT_SUITE_NAME,

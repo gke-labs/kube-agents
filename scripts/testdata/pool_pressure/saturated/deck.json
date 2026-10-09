@@ -1,0 +1,5 @@
+{"items": [
+{"metadata": {"creationTimestamp": "2026-10-08T16:28:36Z"}, "spec": {"job": "pull-kube-agents-smoke-test", "refs": {"pulls": [{"number": 2700}]}}, "status": {"build_id": "2108236254767222784", "pendingTime": "2026-10-08T16:41:07Z", "state": "pending"}},
+{"metadata": {"creationTimestamp": "2026-10-08T17:27:05Z"}, "spec": {"job": "pull-kube-agents-smoke-test", "refs": {"pulls": [{"number": 2703}]}}, "status": {"build_id": "2108249555685347328", "pendingTime": "2026-10-08T17:33:58Z", "completionTime": "2026-10-08T17:44:26Z", "state": "failure"}},
+{"metadata": {"creationTimestamp": "2026-10-08T18:00:00Z"}, "spec": {"job": "ci-kube-agents-eval-next", "type": "periodic"}, "status": {"build_id": "2108256000000000000", "pendingTime": "2026-10-08T18:00:05Z", "state": "pending"}}
+]}

@@ -1024,6 +1024,67 @@ class PoolNote(RunHarness):
             "*Smoke gate: pool full* — all 30 projects are leased. Consider onboarding a project.",
         )
 
+    def test_a_refusal_breach_posts_with_nothing_queued_and_says_so(self):
+        # The periodic's third trigger: runs asked Boskos for a project and
+        # got none. Every run that would have waited died at the acquire, so
+        # Deck shows no backlog -- and the gate must not read that as nothing
+        # to say. The message names the refusals and the hand holds.
+        note = pool_note(waiting_longest_s=0, waiting_now=False, over_threshold=0,
+                         window_hours=None, p50_s=None, p95_s=None,
+                         lease_failures=2, lease_failures_hours=3, held_by_hand=2)
+        self.assertTrue(post_health.pool_advisable(note))
+        self.assertTrue(post_health.pool_advisable(note, drained=True))
+        self.assertEqual(
+            post_health.pool_cause_text(note),
+            "*Smoke gate: pool full* — all 30 projects are leased, 2 held by hand."
+            " Consider onboarding a project.",
+        )
+        # The refusal line rides under every header, the UNKNOWN one included:
+        # a Boskos read that failed must not drop the one fact behind the ⏳.
+        self.assertEqual(
+            post_health.pool_numbers(note), ["2 runs refused a project in the last 3h."]
+        )
+        self.assertEqual(
+            post_health.pool_numbers(note | {"cause": "UNKNOWN"}),
+            ["2 runs refused a project in the last 3h."],
+        )
+        self.assertEqual(
+            post_health.pool_digest_line(note),
+            "⏳ Queue was backed up — 2 runs refused a project in the last 3h. No backlog right now.",
+        )
+        # The page has no stretch and no queue to show for this note, and its
+        # Brief reads healthy, so the alert links the job's history instead.
+        self.assertEqual(
+            post_health.render_pool({"pool": note}).split("\n")[-1], post_health.POOL_JOB_HISTORY_URL
+        )
+        self.assertEqual(
+            post_health.render_pool({"pool": note | {"over_threshold": 3}}).split("\n")[-1],
+            post_health.dashboard_link(post_health.DASHBOARD_VIEW_AGENT),
+        )
+        # A live queue beside the refusals is the fact a reader can act on
+        # this morning, so the refusal joins it rather than displacing it.
+        self.assertEqual(
+            post_health.pool_digest_line(note | {"over_threshold": 3, "waiting_now": True}),
+            "⏳ Queue backed up — 3 runs waiting past the 45 min p95 limit;"
+            " 2 runs refused a project in the last 3h.",
+        )
+
+    def test_a_refusal_breach_over_a_drained_pool_does_not_call_it_full(self):
+        # The cause stays CAPACITY for three hours after a refusal, and the
+        # free count is this hour's; "all leased" over seven free is false.
+        note = pool_note(free=7, lease_failures=2, lease_failures_hours=3, waiting_now=False)
+        self.assertEqual(
+            post_health.pool_cause_text(note),
+            "*Smoke gate: pool was full* — 7 of 30 projects are free now. Consider onboarding a project.",
+        )
+        # With a live backlog the clause rides here too: the reader must see
+        # that runs are queuing over free projects, not only the remedy.
+        self.assertEqual(
+            post_health.pool_cause_text(note | {"waiting_now": True}),
+            "*Smoke gate: pool was full* — 7 of 30 projects are free now and runs are queuing."
+            " Consider onboarding a project.",
+        )
+
     def test_the_remedy_already_named_is_not_replaced_by_a_vaguer_one(self):
         # The other order. Once the reader has the build cluster, "cannot say
         # whose fault it is" is less than they already have, so an hour of

@@ -1,21 +1,22 @@
 # Pool-pressure fixtures
 
 Captured input for `scripts/test_pool_pressure.py`, read through
-`pool_pressure.py --from-dir`. Two directories, each a day: `breach/` is
+`pool_pressure.py --from-dir`. Three directories, each a day: `breach/` is
 2026-08-26, the day
 [oss-test-infra#2666](https://github.com/GoogleCloudPlatform/oss-test-infra/issues/2666)
-was filed about, and `quiet/` is 2026-08-27, the day after.
+was filed about, `quiet/` is 2026-08-27, the day after, and `saturated/` is
+the afternoon of 2026-10-08, when the pool had nothing free and runs failed at
+the Boskos acquire while the check read OK (#2747).
 
 Using the real incident rather than a synthetic stall is the point. Issue #1069
 asks that a simulated breach go red; a fixture built to breach proves the
 arithmetic, and this one proves the check would have caught the thing it was
 written for.
 
-## What is real and what is not
-
 ## Which builds, and why those
 
-Five per day. Five is `MIN_SAMPLES_FOR_DAILY_VERDICT`, below which no day is
+Five per day in the two captured days (`saturated/`, below, has three). Five
+is `MIN_SAMPLES_FOR_DAILY_VERDICT`, below which no day is
 judged at all, so it is the smallest set the breach tests can run on. Adding
 more buys no coverage: what the percentiles need is spread, not volume.
 
@@ -43,6 +44,20 @@ The two fast breach builds are there so the median is not made of outliers
 alone; the two aborted quiet builds are there because aborts are the most
 common terminal state and the check must not read them as stalls.
 
+| `saturated/` — 2026-10-08 | setup | PR   | build ID              |
+| ------------------------- | ----- | ---- | --------------------- |
+| `slow-lease-success`      | 22.6  | 2700 | `2108236254767222784` |
+| `lease-failed`            | —     | 2703 | `2108249555685347328` |
+| `lease-failed-2`          | —     | 2712 | `2108248670569762816` |
+
+Three, not five: the saturated day is read for its third trigger, which needs
+no sample floor, and the tests assert the day is too thin to judge on the
+percentiles alone. The two failed builds end at boskosctl's
+`failed to acquire a resource` line with no banner after it, which is the
+shape the check has to recognise; the success beside them leased in 9.3
+minutes, close to the acquire's own limit, which is what that afternoon
+looked like for the runs that got a project at all.
+
 ## What is real and what is not
 
 `prowjobs/*.json` are **real**, copied from
@@ -67,7 +82,7 @@ read the GCS path makes, so `--from-dir` exercises the parser on the same shape
 of input — including a log that ends mid-run. The head cut is housekeeping:
 `BANNER_PATTERN` matches nothing in the clone and setup output that precedes the
 first banner, so five lines of context are kept for a reader and the rest
-dropped. That took the ten logs from 164 kB to 10 kB. Under a kilobyte each.
+dropped. That took the first ten logs from 164 kB to 10 kB. Under a kilobyte each.
 
 The two `clone-failure-no-lease-*` builds failed in `clone` before the test
 script ran, so they hold no banners at all — their logs are the last 20 lines
@@ -99,9 +114,20 @@ asserts is not there. `quiet/` did exactly that once — its owners came from th
 real capture while its Deck items were synthesized — and reported ten leaks
 against an idle pool.
 
-Owner strings take the form `pull-kube-agents-smoke-test-<build_id>`, matching
-what Boskos records. The empty-string owner is Boskos filing its unleased
-resources; it is a count of nobody, not a holder.
+Owner strings take the form `<job name>-<build_id>`, matching what Boskos
+records. The empty-string owner is Boskos filing its unleased resources; it is
+a count of nobody, not a holder.
+
+`saturated/` is built to exercise the rest of the owner vocabulary against a
+Deck snapshot that carries a running periodic as well as the smoke runs: a
+smoke lease Deck is running (not a leak), a `ci-kube-agents-eval-next` lease
+Deck is running under its own job (not a leak, though it would read as one
+against the smoke runs alone), a smoke lease no running job accounts for (the
+one leak), `fleet-reconcile`, the reconcile's fixed owner with no build ID
+(held by a job, never a hand hold or a leak), and `hangdng-rebuild`, an owner
+with no build ID, holding two projects in Boskos's custom `rebuilding` state
+(held by hand, never leaked). `current` has no `free` key, so the pool reads
+full.
 
 ## Re-capturing
 

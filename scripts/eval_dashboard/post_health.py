@@ -376,13 +376,18 @@ def pool_advisable(pool: dict, drained: bool = False) -> bool:
     reads later as already said, and the next live queue under the same cause
     would go unannounced.
 
-    A breach needs a live backlog, because the verdict lasts a week while the
-    remedy is read fresh each hour. Unknown is not a refusal -- an unreadable
+    A breach needs a live backlog, or a refused acquire in the periodic's
+    recent window, because the verdict lasts a week while the remedy is read
+    fresh each hour. Unknown is not a refusal -- an unreadable
     queue withholds nothing, and `pool_cause_text` drops the diagnosis instead
     -- except after the queue was last seen drained, when a Deck that fails
     every other hour would announce a jam nothing has measured since.
     """
     if pool.get("verdict") != POOL_BREACH:
+        return True
+    # A refused acquire is a backlog that has already cost a run: nothing is
+    # queued because the runs that would be waiting died at the lease.
+    if pool.get("lease_failures"):
         return True
     live = pool.get("waiting_now")
     return live is True or (live is None and not drained)
@@ -460,11 +465,12 @@ def decide(health: dict, prev: dict | None, now: datetime, digest_hour: int, tz=
         kinds.append(KIND_SLOW)
 
     # Rule 8, once per episode, plus a re-post on a verdict change or a cause
-    # not yet named this episode. A breach message also needs a live queue: the
-    # verdict spans seven days while the remedy is read live, so one bad day
-    # keeps the verdict for a week and the remedy tracks a pool that has since
-    # drained. `over_threshold` shares the cause's instant. The two monitoring
-    # verdicts are exempt -- neither advises anything.
+    # not yet named this episode. A breach message also needs a live queue or
+    # a refusal in the periodic's recent window: the verdict spans seven days
+    # while the remedy is read live, so one bad day keeps the verdict for a
+    # week and the remedy tracks a pool that has since drained.
+    # `over_threshold` shares the cause's instant. The two monitoring verdicts
+    # are exempt -- neither advises anything.
     pool = health.get("pool") or {}
     told = prev or {}
     if (
@@ -823,8 +829,9 @@ def pool_numbers(pool: dict) -> list[str]:
     """What tripped the verdict, with each figure beside its own limit.
     "against 15/45" makes the reader pair four numbers positionally, and gets
     it wrong. The periodic breaches on a day's row, on runs queued past p95
-    right now, or on both, so the message quotes whichever it was -- the
-    seven-day window it is not judged on can sit well inside its own limit.
+    right now, or on runs refused a project in its recent window, so the
+    message quotes whichever it was, under every header -- the seven-day
+    window it is not judged on can sit well inside its own limit.
 
     The recent stretch leads when the periodic could judge it, and the worst
     breached day stands in when it could not; `pool_note` picks between them
@@ -843,7 +850,17 @@ def pool_numbers(pool: dict) -> list[str]:
             f"{waiting} {plural(waiting, 'run')} waiting right now,"
             f" past the {minutes_text(pool.get('threshold_p95_s'))} min p95 limit."
         )
+    if pool.get("lease_failures"):
+        lines.append(f"{pool_refusals(pool).capitalize()}.")
     return lines
+
+
+def pool_refusals(pool: dict) -> str:
+    """`2 runs refused a project in the last 3h`, the periodic's third trigger."""
+    refused = pool.get("lease_failures") or 0
+    hours = pool.get("lease_failures_hours")
+    stretch = f" in the last {hours}h" if hours else ""
+    return f"{refused} {plural(refused, 'run')} refused a project{stretch}"
 
 
 def pool_cause_text(pool: dict) -> str:
@@ -852,14 +869,23 @@ def pool_cause_text(pool: dict) -> str:
     nothing."""
     cause = pool.get("cause")
     if cause == CAUSE_CAPACITY:
-        # The full pool is this hour's Boskos reading and carries the remedy on
-        # its own. The clause needs a backlog Deck actually saw: unread, it would
-        # assert one from a verdict up to a week old, and under the limit there
-        # may be no run queued at all.
+        # The counts are this hour's Boskos reading and carry the remedy on
+        # their own. The clause needs a backlog Deck actually saw: unread, it
+        # would assert one from a verdict up to a week old, and under the limit
+        # there may be no run queued at all. A refusal in the recent window
+        # keeps the cause once the pool has drained, so the header says "was"
+        # over a reading with projects free rather than calling them leased.
         queuing = " and runs are queuing" if pool.get("waiting_now") else ""
+        held = f", {pool['held_by_hand']} held by hand" if pool.get("held_by_hand") else ""
+        free = pool.get("free")
+        if isinstance(free, int) and free > 0:
+            return (
+                f"*Smoke gate: pool was full* — {free} of {figure(pool.get('total'))} projects"
+                f" are free now{held}{queuing}. Consider onboarding a project."
+            )
         return (
             f"*Smoke gate: pool full* — all {figure(pool.get('total'))} projects are leased"
-            f"{queuing}. Consider onboarding a project."
+            f"{held}{queuing}. Consider onboarding a project."
         )
     if cause == CAUSE_CONCURRENCY_CAP:
         return (
@@ -935,14 +961,17 @@ def render_pool(health: dict) -> str:
                 POOL_JOB_HISTORY_URL,
             ]
         )
+    # The agent view, not a scoped one: rule 8 rides beside the state and can
+    # start mid-incident, so there is no window to scope to. A breach the
+    # refusals alone carry has no stretch and no queue for the page to show,
+    # and its Brief reads healthy, so that one links the job's history.
+    refusals_only = not pool_span(pool) and not pool.get("over_threshold") and pool.get("lease_failures")
     return "\n".join(
         [
             f"⏳ {pool_cause_text(pool)}",
             *pool_numbers(pool),
             "Runs still pass; /retest makes the queue longer.",
-            # The agent view, not a scoped one: rule 8 rides beside the state
-            # and can start mid-incident, so there is no window to scope to.
-            dashboard_link(DASHBOARD_VIEW_AGENT),
+            POOL_JOB_HISTORY_URL if refusals_only else dashboard_link(DASHBOARD_VIEW_AGENT),
         ]
     )
 
@@ -1366,11 +1395,18 @@ def pool_digest_line(pool: dict) -> str:
     cleared = "" if live is not False else " No backlog right now."
     span = pool_span(pool)
     if not span:
+        # Both counts when both are set: the queue is the live fact, the
+        # refusal the reason there may be no queue to see.
         waiting = pool.get("over_threshold") or 0
-        return (
-            f"{headline} — {waiting} {plural(waiting, 'run')} waiting"
-            f" past the {minutes_text(pool.get('threshold_p95_s'))} min p95 limit.{cleared}"
-        )
+        parts = []
+        if waiting or not pool.get("lease_failures"):
+            parts.append(
+                f"{waiting} {plural(waiting, 'run')} waiting"
+                f" past the {minutes_text(pool.get('threshold_p95_s'))} min p95 limit"
+            )
+        if pool.get("lease_failures"):
+            parts.append(pool_refusals(pool))
+        return f"{headline} — {'; '.join(parts)}.{cleared}"
     # Both figures, as pool_numbers does: the stretch breaches on p50 or p95, so
     # the median on its own can be a passing number standing in as the reason.
     return (
