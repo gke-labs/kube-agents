@@ -164,12 +164,19 @@ The two differ on steers: a session worker absorbs them at its next turn boundar
 while the standing front door queues them and answers each as a further turn after the
 current one, with a status notice per follow-up (the payload spec's steering rule).
 
-The status matcher is the exact phrase set on every route. A wider
-interrogative rule applied while the fixed-route front door refused steers, where a
-stolen false positive cost nothing; the front door now queues steers and answers them,
-so a stolen one is a lost correction there too, and a status-shaped steer is a question
-the agent can answer itself. Anything no interceptor claims during a `working` task is
-a steer, per the 8/24 decision above.
+The status matcher is the exact phrase set wherever the executor runs follow-ups: a
+stolen steer there is a lost correction, and a status-shaped steer is a question the
+agent can answer itself. A wider interrogative rule (status-shaped words in an
+interrogative frame) applies only to a running task whose addressee refuses follow-ups,
+the platform executor's `cli` executor, which refuses each one `no-resume`: there a
+stolen false positive costs nothing, and a missed one is an acknowledgement followed by
+a refusal. The gateway cannot see the executor, so it learns this per addressee from
+the first `no-resume` refusal it relays, and forgets it when a later notice from that
+addressee says a follow-up was queued; the first follow-up to such an addressee after
+the gateway starts is still acknowledged and then refused. A detached task gets the
+exact phrases on either route: after a stop, the wide reading of "any update on the
+rollout" would steal a new task to replay a dead one. Anything no interceptor claims
+during a `working` task is a steer, per the 8/24 decision above.
 
 **Gateway-authored posts (amended 8/31).** Step 4's relay - events in, chat out - is
 not the whole output story: the gateway authors a small set of posts of its own. The
@@ -1348,7 +1355,8 @@ path (`fold_fanout`): each child inherits the thread's subscription, and the par
 only after its children with the synthesis, so the child's `completed` is held while the parent
 works and until the parent's own answer has been delivered on that thread, then dropped with its
 cursor moved past it, and posted after all if the parent ends blocked, its subscription is gone,
-or the hold passes 30 minutes. Its other events (blocked, gave up, progress) post as before. A route probe (an empty notify, which an armed gateway refuses at once) tells the
+or the hold passes 30 minutes. One that arrives after the parent's answer has posted opens with
+"Late result from <card title>:". Its other events (blocked, gave up, progress) post as before. A route probe (an empty notify, which an armed gateway refuses at once) tells the
 notifier when the route is unavailable (the gateway restarting), and it holds deliveries
 unclaimed then; only a send that meets the outage before the next probe spends one unit of
 the subscription's failure budget. Once, when routed delivery first goes live on an install,

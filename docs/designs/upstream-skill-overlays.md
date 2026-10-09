@@ -162,6 +162,16 @@ When parallel PRs on one skill conflict:
 
 Syncing is manual and per skill; each sync goes in its own PR.
 
+#### When to sync
+
+A mirrored skill stays at its pinned commit until there is a reason to move it; being behind upstream is not one. Every sync changes what the agent reads and needs the eval loop, so a skill is synced when:
+
+- someone is about to change it and upstream has changed the same text, or already made the change;
+- an eval case or a user report shows the agent going wrong because of the skill;
+- upstream fixes a correctness or security bug in it.
+
+Otherwise a local change is a patch on the current pin. `make skills-status` shows which skills upstream has moved past; check it before working on a skill. A new upstream skill is adopted when the agent needs it.
+
 | Command                                         | Does                                                                                                                                                                                                             |
 | ----------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `make skills-sync SKILL=<skill>`                | Moves one skill to upstream's latest version (or `REF=<commit>`), rebasing its patches                                                                                                                           |
@@ -289,6 +299,8 @@ flowchart LR
 - The `test_repo_*` tests that each assert one registered change are no longer needed: the check covers every byte of every mirrored skill.
 
 ### Changing a mirrored skill
+
+The [`edit-mirrored-skill`](../../.agents/skills/edit-mirrored-skill/SKILL.md) skill is the step-by-step procedure, including the fix for each `make skills-check` failure; the tables here record the design.
 
 | Task                                     | Steps                                                                                                                                                                                                                                                           |
 | ---------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |

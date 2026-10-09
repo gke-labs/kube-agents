@@ -50,12 +50,14 @@ __all__ = [
     "PRIORITIZE_KEY",
     "RAW_FILE",
     "REPORT_FILE",
+    "SCORES_FILE",
     "agent_shell",
     "read_delivery_runs",
     "read_files",
     "read_handoff_board",
     "read_items",
     "read_raw_block",
+    "read_scored_report",
     "sandbox_pod",
     "sandbox_shell",
 ]
@@ -157,6 +159,64 @@ SANDBOX_PYTHON = "python3"
 RAW_READ = "__ONBOARDING_RAW_BLOCK__"
 # Parser errors carried into the verdict; the rest are counted.
 MAX_PARSER_ERRORS = 5
+
+# The worker's scores (inventory_findings.py: DEFAULT_SCORES_PATH) and the report
+# it wrote, read together so a check can tell which of the batch's findings the
+# worker scored critical and which of them the report lists. The sandbox's own
+# `build_payloads` and `fq.validate_finding` score the batch, as `register`
+# would, so the severities are the queue's for the same vectors.
+SCORES_FILE = f"{DATA_ROOT}/INVENTORY.scores.json"
+SCORED_READ = "__ONBOARDING_SCORED_REPORT__"
+# Far above the SOP's 4000-character ceiling; the read stops here.
+MAX_REPORT_BYTES = 1 << 16
+SCORED_ROW_FIELDS = ("check_slug", "project", "cluster", "namespace", "object", "severity")
+
+# Runs in the sandbox. Prints the report, delivered copy first, and every row of
+# the batch with the severity the sandbox's scorer gives it, the line it is
+# gathered into (`fq.item_key`) and whether it is rolled up (`fq.rolled_up`), as
+# `select` decides them, or why the batch could not be scored. A scorer that
+# cannot be imported is printed as "error".
+_SCORED_SCRIPT = """
+import json, os, sys
+items_path, scores_path, delivered, report, parser_dir, module, max_bytes, max_errors, sentinel, fields = sys.argv[1:11]
+out = {"report": "absent", "text": None, "rows": None, "errors": None, "error": None}
+for state, path in (("delivered", delivered), ("written", report)):
+    if os.path.lexists(path):
+        try:
+            with open(path, encoding="utf-8", errors="replace") as fh:
+                out["text"] = fh.read(int(max_bytes))
+            out["report"] = state
+        except OSError as exc:
+            out["report"] = "unreadable"
+            out["text"] = str(exc)
+        break
+sys.path.insert(0, parser_dir)
+try:
+    scorer = __import__(module)
+except Exception as exc:
+    out["error"] = "cannot import %s from %s: %s" % (module, parser_dir, exc)
+else:
+    try:
+        with open(items_path, encoding="utf-8") as fh:
+            items = json.load(fh)["items"]
+        with open(scores_path, encoding="utf-8") as fh:
+            scores = json.load(fh)["scores"]
+        payloads = scorer.build_payloads(items, scores)
+        out["rows"] = [
+            dict(
+                {k: row.get(k) for k in fields.split(",")},
+                item_key=list(scorer.fq.item_key(row)),
+                rolled_up=scorer.fq.rolled_up(row),
+            )
+            for row in (scorer.fq.validate_finding(p) for p in payloads)
+        ]
+    except scorer.Failure as exc:
+        out["errors"] = exc.errors[: int(max_errors)]
+    except Exception as exc:
+        out["errors"] = ["%s: %s" % (type(exc).__name__, exc)]
+print(sentinel)
+print(json.dumps(out))
+"""
 
 # bootstrap_scan_gate.py: PRIORITIZE_IDEMPOTENCY_KEY and SCAN_ASSIGNEE, and the
 # word the ranking card title bootstrap_handoff.py files carries.
@@ -499,5 +559,42 @@ def read_handoff_board(shell: Callable[[str, float], str], timeout: float) -> di
     """
     parsed = _payload(shell(handoff_command(), timeout), HANDOFF_READ)
     if parsed is None or not isinstance(parsed.get("clusters"), list):
+        return None
+    return parsed
+
+
+def scored_command() -> str:
+    """The ``sh -c`` line that reads the report and scores the batch in the sandbox."""
+    args = " ".join(
+        shlex.quote(a)
+        for a in [
+            ITEMS_FILE,
+            SCORES_FILE,
+            DELIVERED_FILE,
+            REPORT_FILE,
+            PARSER_DIR,
+            PARSER_MODULE,
+            str(MAX_REPORT_BYTES),
+            str(MAX_PARSER_ERRORS),
+            SCORED_READ,
+            ",".join(SCORED_ROW_FIELDS),
+        ]
+    )
+    return f"{SANDBOX_PYTHON} -c {shlex.quote(_SCORED_SCRIPT)} {args}"
+
+
+def read_scored_report(shell: Callable[[str, float], str], timeout: float) -> dict[str, Any] | None:
+    """The report and the batch's scored rows, or ``None`` if the read failed.
+
+    ``"report"`` is ``delivered``, ``written`` (not yet delivered), ``absent``
+    or ``unreadable``, with its text in ``"text"``. ``"rows"`` holds each
+    finding's identity and severity, with its ``"item_key"`` and
+    ``"rolled_up"`` from the sandbox's queue module, or is ``None`` with ``"errors"`` saying
+    why the batch could not be scored. An ``"error"`` is a scorer that could
+    not be imported. ``shell`` is :func:`sandbox_shell`, a parameter so the
+    tests can run it locally.
+    """
+    parsed = _payload(shell(scored_command(), timeout), SCORED_READ)
+    if parsed is None or "rows" not in parsed:
         return None
     return parsed

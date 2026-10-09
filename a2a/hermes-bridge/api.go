@@ -126,11 +126,6 @@ const (
 // for its session's previous turn carries into finalizeAPIError.
 var errWaitingForTurn = errors.New("waiting for the session's previous turn")
 
-// errTurnNotSent is what a follow-up turn that found the task canceled, past
-// its deadline or the bridge stopping carries into finalizeAPIError: its
-// request was never sent.
-var errTurnNotSent = errors.New("the follow-up turn was not sent")
-
 // errNeverConnected is what sendAPI wraps around an error when no attempt
 // got a connection: no request reached the server, so a deadline that ends
 // it is not the turn's.
@@ -331,8 +326,9 @@ func (b *Bridge) runTaskAPI(ctx context.Context, run *taskRun) {
 	run.mu.Unlock()
 
 	var steer *lib.Envelope // the follow-up this turn runs; nil on turn 1
+	var prev string         // the turn before's answer, published as a turn artifact
 	for turn := 1; ; turn++ {
-		text, ok := b.apiTurn(run, taskCtx, sessionID, prompt, steer, turn)
+		text, ok := b.apiTurn(run, taskCtx, sessionID, prompt, steer, turn, prev)
 		if !ok {
 			return
 		}
@@ -350,7 +346,7 @@ func (b *Bridge) runTaskAPI(ctx context.Context, run *taskRun) {
 		if !b.publishTurnAnswer(run, turn, text) {
 			return
 		}
-		steer, prompt = next, nextPrompt
+		steer, prompt, prev = next, nextPrompt, text
 	}
 }
 
@@ -366,14 +362,16 @@ func apiTurnKey(taskID string, steer *lib.Envelope) string {
 }
 
 // apiTurn posts one turn to the session on taskCtx and returns its answer.
-// steer is the follow-up the turn runs, nil on turn 1; it leaves the queue
-// in the critical section that checks the task is still to run, so a
-// cancel, deadline or shutdown that lands after that check finds the
-// request's context in cancelReq and ends it. false means the task is final:
-// it already was, or this finalized it - including a follow-up's turn that
-// found the task canceled, past its deadline or the bridge stopping, which
-// sends nothing.
-func (b *Bridge) apiTurn(run *taskRun, taskCtx context.Context, sessionID, prompt string, steer *lib.Envelope, turn int) (string, bool) {
+// steer is the follow-up the turn runs, nil on turn 1, and prev the answer
+// of the turn before it; the follow-up leaves the queue in the critical
+// section that checks the task is still to run, so a cancel, deadline or
+// shutdown that lands after that check finds the request's context in
+// cancelReq and ends it. false means the task is final: it already was, or
+// this finalized it - including a follow-up's turn that found the task
+// canceled, past its deadline or the bridge stopping, which sends nothing
+// and ends the task with prev still attached as the result
+// (finalizeTurnNotSent).
+func (b *Bridge) apiTurn(run *taskRun, taskCtx context.Context, sessionID, prompt string, steer *lib.Envelope, turn int, prev string) (string, bool) {
 	body, err := json.Marshal(apiChatRequest{
 		Model:    b.cfg.APIModel,
 		Messages: []apiChatMessage{{Role: "user", Content: prompt}},
@@ -405,7 +403,7 @@ func (b *Bridge) apiTurn(run *taskRun, taskCtx context.Context, sessionID, promp
 			// they end cancelReq, after each has stored its flag: one that
 			// lands after this check ends the request below.
 			run.mu.Unlock()
-			b.finalizeAPIError(run, taskCtx, errTurnNotSent, turn)
+			b.finalizeTurnNotSent(run, prev)
 			return "", false
 		}
 		if !takeSteerLocked(run, steer) {
@@ -418,8 +416,9 @@ func (b *Bridge) apiTurn(run *taskRun, taskCtx context.Context, sessionID, promp
 			return "", false
 		}
 		// The last answer is on the stream as a turn artifact; from here
-		// a shutdown ends this request, and the worker names it.
+		// a shutdown ends this request, and its terminal names the turn.
 		run.answerHeld = false
+		run.turn = turn
 		run.mu.Unlock()
 	}
 
@@ -527,12 +526,33 @@ func (b *Bridge) sendAPI(ctx context.Context, req *http.Request, body []byte) (*
 	}
 }
 
+// finalizeTurnNotSent ends a task whose next follow-up found it canceled,
+// past its deadline or the bridge stopping before its request was sent. The
+// turn before's answer is already on the stream as a turn artifact, but a
+// reader of the result would not find it, so it is attached as the result
+// too, ahead of the terminal the cause calls for. The attached result is a
+// copy (finalizeCopy): if it fails to publish, the terminal keeps the
+// cause's state, so a cancel still ends canceled. The follow-up never ran,
+// so the terminal does not name its turn.
+func (b *Bridge) finalizeTurnNotSent(run *taskRun, answer string) {
+	switch {
+	case run.canceled.Load():
+		b.finalizeCopy(run, lib.StateCanceled, "reason: canceled-by-request", answer)
+	case b.closing.Load():
+		b.finalizeCopy(run, lib.StateFailed, shutdownReason, answer)
+	default:
+		// Only the deadline is left: it passed between two turns, after
+		// the last answer went out as a turn artifact.
+		b.finalizeCopy(run, lib.StateFailed,
+			fmt.Sprintf("reason: deadline-exceeded - the task deadline %s passed before the next turn; no request was sent", b.cfg.TaskDeadline), answer)
+	}
+}
+
 // finalizeAPIError ends a task whose request (or wait for its session's
 // turn) ended without a response, naming the cause: the cancel, the
 // shutdown and the deadline each end reqCtx, so they are read first. A
 // follow-up turn (turn ≥ 2) that started and ended here is named, as
-// apiTurn's in-band failures name it; one that found the task stopped
-// before it started (errTurnNotSent) is not, since it never ran.
+// apiTurn's in-band failures name it.
 func (b *Bridge) finalizeAPIError(run *taskRun, reqCtx context.Context, err error, turn int) {
 	switch {
 	case run.canceled.Load() && errors.Is(err, errWaitingForTurn):
@@ -541,17 +561,8 @@ func (b *Bridge) finalizeAPIError(run *taskRun, reqCtx context.Context, err erro
 		b.finalize(run, lib.StateCanceled, canceledBeforeStartReason, nil)
 	case run.canceled.Load():
 		b.finalize(run, lib.StateCanceled, "reason: canceled-by-request", nil)
-	case b.closing.Load() && errors.Is(err, errTurnNotSent):
-		// Found before the send: the turn never left the bridge, so it is
-		// not named.
-		b.finalize(run, lib.StateFailed, shutdownReason, nil)
 	case b.closing.Load():
 		b.finalize(run, lib.StateFailed, shutdownReason+turnNote(turn), nil)
-	case errors.Is(err, errTurnNotSent):
-		// Only the deadline is left: it passed between two turns, after
-		// the last answer went out as a turn artifact.
-		b.finalize(run, lib.StateFailed,
-			fmt.Sprintf("reason: deadline-exceeded - the task deadline %s passed before the next turn; no request was sent", b.cfg.TaskDeadline), nil)
 	case reqCtx.Err() == context.DeadlineExceeded && errors.Is(err, errWaitingForTurn):
 		b.finalize(run, lib.StateFailed,
 			fmt.Sprintf("reason: session-busy - waited %s for the session's previous turn; no request was sent", b.cfg.TaskDeadline), nil)

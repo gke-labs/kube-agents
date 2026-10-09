@@ -4254,6 +4254,7 @@ class TestFindingsQueueApi(unittest.TestCase):
             with conn:
                 conn.execute("DELETE FROM findings")
                 conn.execute("DELETE FROM queue_publications")
+                conn.execute("DELETE FROM findings_additions")
 
     def tearDown(self):
         os.environ.pop("SESSION_KV_API_KEY", None)
@@ -4347,6 +4348,34 @@ class TestFindingsQueueApi(unittest.TestCase):
             self.client.get(f"/v1/findings/additions?day={day}").json(),
             {"day": day, "critical": 0, "noncritical": 1},
         )
+
+    def test_the_first_report_marks_a_critical_addition(self):
+        self._register(self._finding())
+        fid = self.client.get("/v1/findings/ranked").json()["findings"][0]["id"]
+        added = self.client.post(
+            f"/v1/findings/{fid}/surfaced",
+            json={"publisher": "first_report", "added_class": "critical", "run": "2026-10-07T09:00:00Z"},
+        ).json()
+        self.assertEqual(added["added_class"], "critical")
+        day = added["first_shown_at"][:10]
+        self.assertEqual(
+            self.client.get(f"/v1/findings/additions?day={day}").json(),
+            {"day": day, "critical": 1, "noncritical": 0},
+        )
+
+    def test_the_first_report_may_not_mark_a_dismissed_finding(self):
+        self._register(self._finding())
+        fid = self.client.get("/v1/findings/ranked").json()["findings"][0]["id"]
+        self.client.patch(f"/v1/findings/{fid}", json={"state": "dismissed"})
+
+        refused = self.client.post(
+            f"/v1/findings/{fid}/surfaced",
+            json={"publisher": "first_report", "added_class": "critical", "run": "2026-10-07T09:00:00Z"},
+        )
+
+        self.assertEqual(refused.status_code, 400)
+        self.assertIn("dismissed", refused.json()["detail"])
+        self.assertEqual(self.client.get("/v1/findings/additions").json()["critical"], 0)
 
     def test_a_decision_on_one_id_covers_its_gathered_line(self):
         self._register(self._finding(), self._finding(object="Deployment/cart"))

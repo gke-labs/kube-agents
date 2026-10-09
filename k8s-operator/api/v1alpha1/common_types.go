@@ -936,6 +936,12 @@ type DeploymentSpec struct {
 	// +optional
 	CredentialProxy *CredentialProxySpec `json:"credentialProxy,omitempty"`
 
+	// AgentAPIAuth configures the agent-api-auth sidecar in the gateway pod, the
+	// native container that authenticates the agent's API-server calls and also
+	// runs the event watcher and the drift detector.
+	// +optional
+	AgentAPIAuth *AgentAPIAuthSpec `json:"agentAPIAuth,omitempty"`
+
 	// DefaultStorageClassName specifies the default storage class to use for the system and data PVCs.
 	// +optional
 	DefaultStorageClassName *string `json:"defaultStorageClassName,omitempty"`
@@ -981,6 +987,35 @@ type CredentialProxySpec struct {
 	// without bursting sets the limits equal to the requests, so there the
 	// proxy runs at the request and the limit has no effect. With bursting the
 	// declared limits stand.
+	// +optional
+	Resources *corev1.ResourceRequirements `json:"resources,omitempty"`
+}
+
+// AgentAPIAuthSpec configures the agent-api-auth sidecar in the gateway pod.
+type AgentAPIAuthSpec struct {
+	// Resources overrides the agent-api-auth container's requests and limits.
+	// Each key set here replaces the operator's default for that key and the
+	// rest keep their defaults, unlike spec.deployment.resources, which replaces
+	// the agent container's block wholesale: a CR that sets only limits.memory
+	// keeps the default 150m CPU request, 384Mi memory request, 1 CPU limit and
+	// 2Gi ephemeral-storage limit. The container runs the event watcher, the
+	// drift detector and the API authenticator together; the event watcher
+	// reads the memory limit through the Downward API and sets its Go soft
+	// memory limit to half of it, so raising the memory limit is the knob for an
+	// install whose fleet of watched clusters outgrows the 2Gi default (#2648).
+	// Only cpu, memory and ephemeral-storage are accepted, the quantities the
+	// container declares. The operator refuses a request above its limit, a
+	// negative quantity, a zero limit, an unrepresentable byte or CPU count and
+	// claims, because the gateway pod declares no resourceClaims. A refused
+	// override, including an edit of one that was valid, renders the sidecar at
+	// the operator's defaults until it is corrected, and the operator reports
+	// Degraded with reason InvalidAgentAPIAuthResources when no higher-ranked
+	// Degraded cause is present, the agent staying Ready, whether or not the
+	// validating webhook is enabled. Where the webhook is on, it refuses the
+	// edit at apply. The webhook warns when memory per CPU on the requests pair
+	// leaves the band GKE Autopilot admits unchanged, and when a cpu or memory
+	// limit is set without the same key under requests, for the reasons the
+	// credential-proxy field documents.
 	// +optional
 	Resources *corev1.ResourceRequirements `json:"resources,omitempty"`
 }
@@ -1961,12 +1996,13 @@ type AgentStatus struct {
 // as the rest of the status.
 //
 // The operator writes ActiveInterfaces, from the spec, on every Ready status
-// update, and ToolExecutionsTotal, EventsIngestedTotal and LastActiveTime from
-// the broker's and the event watcher's metrics listeners, which it reads every
-// five minutes on the leader; the agent's own ServiceAccount holds no write
-// verb on this status. The other counters are declared so that the schema
-// names them, but nothing writes them yet, and each is absent (omitempty)
-// until a series exists for it.
+// update, and ToolExecutionsTotal, EventsIngestedTotal, LastActiveTime,
+// ClustersRegistered and ClustersMonitored from the broker's and the event
+// watcher's metrics listeners, which it reads every five minutes on the
+// leader; the agent's own ServiceAccount holds no write verb on this status.
+// The other counters are declared so that the schema names them, but nothing
+// writes them yet, and each is absent (omitempty) until a series exists for
+// it.
 type AgentUsageStatus struct {
 	// SessionsTotal is the cumulative number of interactive sessions handled.
 	// Nothing writes it yet.
@@ -2002,6 +2038,37 @@ type AgentUsageStatus struct {
 	// Nothing writes it yet.
 	// +optional
 	RemediationsAppliedTotal int64 `json:"remediationsAppliedTotal,omitempty"`
+
+	// ClustersRegistered is the number of clusters the event watcher built a
+	// client for at its last start: the management cluster and the Cluster
+	// Agent profiles the GKE API would describe, the management cluster
+	// counted once even where a profile also covers it. Read every five
+	// minutes as the number of k8s_event_watcher_cluster_up series the watcher
+	// exports, the largest reading across gateway replicas. The watcher
+	// discovers its fleet once per process, so a cluster that joins or leaves
+	// is counted after the gateway pod restarts, not before. A gauge, not a
+	// counter: it falls after such a restart. Absent when the operator has no
+	// current reading: before the first poll, while the event watcher is
+	// disabled, and after two polls in a row in which no gateway replica
+	// could be read, whether its listener failed, its pod was not running, or
+	// the operator could not reach it; the CR's events and the gateway pod's
+	// state say which. A 0 is a reading: the watcher answered and exports no
+	// series.
+	// +optional
+	ClustersRegistered *int64 `json:"clustersRegistered,omitempty"`
+
+	// ClustersMonitored is how many of ClustersRegistered are delivering
+	// events: the k8s_event_watcher_cluster_up series at 1, whose informer
+	// has completed its initial list. The difference from ClustersRegistered
+	// is the number of clusters silently unwatched, a stuck informer, a 403
+	// on the events list, or a stopped one. A 0 is a reading, and the normal
+	// one while the watcher starts, so read a fall alongside the pod's age.
+	// Absent on the same terms as ClustersRegistered: one poll in which no
+	// gateway replica could be read leaves both where they were, and a
+	// second in a row clears both, because the operator then has no current
+	// reading and an absent field says so.
+	// +optional
+	ClustersMonitored *int64 `json:"clustersMonitored,omitempty"`
 
 	// ActiveInterfaces lists the communication channels the spec enables, sorted:
 	// "dashboard" unless spec.harness.hermes.dashboardEnabled is false, and

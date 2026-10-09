@@ -455,20 +455,34 @@ gateway's doors cap a text at 65,536 runes, the server's own cap on a message
 (`MAX_NORMALIZED_TEXT_LENGTH`, 65,536 characters), and the bus's 1 MiB message limit keeps the
 request far under the server's 10 MB body limit. Each earlier turn's answer is published as a
 `turn` artifact as soon as the next turn is about to run; the last turn's answer is the `result`,
-then the one terminal. A turn's answer the bridge holds between turns, while the next follow-up's
-capability is checked, is not lost to a shutdown: the worker ends the task with it as the `result`,
-and the queue is refused `task-ended`. A failed follow-up turn names itself in the terminal
+then the one terminal. At each turn boundary the bridge asks the verifier once per distinct
+capability among the queued follow-ups, not once per follow-up, so a verifier that does not answer
+holds the previous turn's answer back for one timeout. A turn's answer the bridge holds between
+turns, while the next follow-up's capability is checked, is not lost to a shutdown: the worker ends
+the task with it as the `result`, and the queue is refused `task-ended`. Nor is it lost when its
+`turn` artifact fails to publish (the task completes with it as the `result`), or when a cancel,
+the deadline or a shutdown lands after the next follow-up was chosen but before its request was
+sent (the terminal that cause calls for carries it as the `result`, best-effort: the answer is
+already on the stream as a `turn`, so a failed publish of that copy leaves the terminal's state as
+it was, and a cancel still ends `canceled`). A failed follow-up turn names itself in the terminal
 (`; turn: N` after the session). A follow-up does not change task state (payload spec assertion
 12). A bridge that crashes with follow-ups queued loses them; the gateway's relay reports them as
 not run at the terminal, unless the gateway restarted too. The count is best-effort: a follow-up
 whose turn had started when the bridge crashed counts as run, though its answer never arrives.
 Mid-turn steering through the runs API is gke-labs#2628.
 
-**Upgrade order for steering.** The gateway and the bridge do not roll together. The gateway's
-image follows the operator, but the sidecar's image is whatever the CR names, so until someone
-edits the CR the two can be a release apart, and a rollback produces the reverse skew. Upgrade the
-operator (and with it the gateway) first, then bump the CR's `hermes-bridge` sidecar tag. On a
-rollback, move the sidecar tag back first, then the operator. The two skews look like this:
+**Upgrade order for steering.** The gateway and the bridge do not always roll together. The
+gateway's image follows the operator; the rendered bridge's image is chosen as
+[Where it runs](#where-it-runs) describes. Two cases can leave the two a release apart. One is the
+release `platform-agent` agent image pinned by tag with `A2A_BRIDGE_IMAGE` unset, where the bridge
+follows the CR's agent tag. The other is `A2A_BRIDGE_IMAGE` set: the operator uses the override
+verbatim, so the bridge runs whatever it names. It moves with the operator only when whoever rolls
+the operator rewrites that env in the same step, as `hack/ci-deploy.sh` does; a value set by hand
+stays where it was. In either case upgrade the operator (and with it the gateway) first, then bump
+the CR's agent tag or the override; on a rollback, move the agent tag or the override back first,
+then the operator. With a custom or digest-pinned agent image and no override, or no image on the
+CR, the bridge follows the operator and there is no skew to order. A CR-declared bridge (above)
+follows its own sidecar tag, in the same order. The two skews look like this:
 
 - **Old gateway, new bridge (the order to avoid).** The old relay has no case for `turn`
   artifacts, so every earlier turn's answer is dropped. The room gets the old "does not take
