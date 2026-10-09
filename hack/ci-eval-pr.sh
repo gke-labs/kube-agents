@@ -2864,7 +2864,7 @@ STATE_DIR="$(mktemp -d)"
 #                 finish lands in this lane's fresh one. Taken after the task
 #                 lock, keyed on the audit id, by units that write one and by
 #                 units that declare the streams their stack starts audits on
-#                 (audit_streams; oobe-first-run-audits holds four).
+#                 (audit_streams; oobe-first-run-audits holds five).
 #                 A task-lock holder on a shared stream waits its turn on
 #                 the stream before its own run, so both deadlines scale by
 #                 the cases on the stream (stream_case_count), as the infra

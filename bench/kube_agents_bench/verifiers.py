@@ -1164,6 +1164,7 @@ LEDGER_AUDIT_IDS = frozenset(
         "obtainability-audit",
         "security-patch-orchestrator",
         "stockout-prevention",
+        "upgrade-retrospective",
     }
 )
 
@@ -1179,6 +1180,7 @@ AuditId = Literal[
     "obtainability-audit",
     "security-patch-orchestrator",
     "stockout-prevention",
+    "upgrade-retrospective",
 ]
 
 # Every `status` a fleet-audit `finish` stores, for `audit_report_stored`:
@@ -5486,10 +5488,11 @@ class BootstrapReportCriticalsVerifier(_OnboardingPollVerifier):
         return "pass", f"the report's {len(items)} numbered item(s) {counts}, the limit of {self.limit}: {named}", raw
 
 
-# The check rosters of the four audits the oobe stage runs after the scan
-# (agents/chat/scripts/oobe.py FIRST_RUN_AUDITS; each roster is `AUDITS[<id>].checks` in
-# agents/platform/skills/fleet-audit/scripts/audit_report.py). The cluster inventory SOP
-# leaves these checks to those audits; tests/test_bootstrap_handoff.py re-derives this
+# The check rosters of the audits the oobe stage runs after the scan
+# (agents/chat/scripts/oobe.py FIRST_RUN_AUDITS, in its order; each roster is `AUDITS[<id>].checks`
+# in agents/platform/skills/fleet-audit/scripts/audit_report.py). The cluster inventory SOP
+# leaves the four fleet audits' checks to those audits; the upgrade retrospective's are the
+# collector's six, which no scan reports. tests/test_bootstrap_handoff.py re-derives this
 # copy from both files.
 FIRST_RUN_AUDIT_CHECKS: dict[str, tuple[str, ...]] = {
     "fleet-wide-cost-analysis": (
@@ -5516,6 +5519,10 @@ FIRST_RUN_AUDIT_CHECKS: dict[str, tuple[str, ...]] = {
         "ccc-mixed-disk-generations", "ccc-hyperdisk-incompatible", "quota-exhaustion-risk",
         "spot-scarcity-risk", "single-zone-nodepool", "reservation-mismatch-risk",
         "autoscaler-out-of-resources", "dangling-compute-class",
+    ),
+    "upgrade-retrospective": (
+        "upgrade-operation-failed", "upgrade-broke-workload", "node-broken-after-upgrade",
+        "upgrade-symptom-tentative", "upgrade-symptom-unclassified", "symptom-predates-upgrade",
     ),
 }
 
@@ -5551,7 +5558,8 @@ class BootstrapHandoffVerifier(_OnboardingPollVerifier):
       and report those checks themselves. A check reported under a slug of its
       own is not caught. An install with no GitOps repository is ``error``, not
       graded: the gate records ``no_repository=yes`` in its sweep marker, the
-      first-run audits do not run, and the cards report these checks on purpose
+      four workload audits do not run (the upgrade retrospective does, and owns
+      none of these checks), and the cards report these checks on purpose
       (cluster_inventory_audit_sop.md, "Without a GitOps repository"). A marker
       with no such field (an older install) is graded.
 
