@@ -247,6 +247,27 @@ class ApplySubstitutionsTest(unittest.TestCase):
             self.assertNotIn(target, content)
             self.assertEqual(content.count(replacement), 1, replacement)
 
+    def test_repo_skills_carry_every_registered_substitution(self):
+        # Every registered pair, not one skill at a time: a pair added without the matching hand
+        # edit to the in-tree copy, or a later direct edit to a corrected passage, fails here.
+        repo_root = Path(__file__).resolve().parent.parent
+        for skill, pairs in sync.SKILL_SUBSTITUTIONS.items():
+            skill_md = repo_root / "agents" / "platform" / "skills" / skill / "SKILL.md"
+            content = skill_md.read_text(encoding="utf-8")
+            for target, replacement in pairs:
+                with self.subTest(skill=skill, replacement=replacement[:60]):
+                    self.assertNotIn(target, content)
+                    self.assertEqual(content.count(replacement), 1)
+
+    def test_repo_skills_carry_every_registered_footer(self):
+        repo_root = Path(__file__).resolve().parent.parent
+        for skill, footer in sync.SKILL_FOOTERS.items():
+            skill_md = repo_root / "agents" / "platform" / "skills" / skill / "SKILL.md"
+            content = skill_md.read_text(encoding="utf-8")
+            with self.subTest(skill=skill):
+                self.assertTrue(content.rstrip("\n").endswith(footer.rstrip("\n")))
+                self.assertEqual(content.count(sync.FOOTER_MARKER), 1)
+
     def test_repo_workload_security_skills_have_enforcement_command(self):
         repo_root = Path(__file__).resolve().parent.parent
         for agent in ["platform", "cluster"]:

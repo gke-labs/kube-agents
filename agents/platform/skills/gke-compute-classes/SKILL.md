@@ -3,6 +3,7 @@ name: gke-compute-classes
 description: >-
   Configures, optimizes, and troubleshoots GKE ComputeClasses. Use when configuring Spot VMs with on-demand fallback, targeting specific accelerators (GPUs/TPUs) or machine families, restricting ComputeClass access, or debugging pending pods related to node pool auto-creation. Do not use for cluster-level Node Auto Provisioning configuration or general GKE cluster creation.
 metadata:
+  version: "1.0.0"
   category: Containers
 ---
 
@@ -21,6 +22,9 @@ Guidance on configuring, optimizing, and troubleshooting GKE ComputeClasses.
 
 --------------------------------------------------------------------------------
 
+## CRITICAL RULES
+- **CODE-FIRST VERIFICATION (OPEN-SOURCE CODEBASE):** GKE Cluster Autoscaler and ComputeClasses are open-sourced at `https://github.com/GoogleCloudPlatform/cluster-autoscaler`. When user questions challenge or explore undocumented/subtle behaviors, or when guidance is not explicitly established in this skill, **SAY SO AND POINT AT THE CODE**: this install's terminal cannot clone or fetch from GitHub, so do not try. Name the package or symbol from the code index for the user to check with `git log -S` and `git blame`, and do not state a version or date range you have not read. See `references/compute-class-code-index.md` for exact package and symbol mappings.
+
 ## Engagement Rules: Generalized First, Refine Later
 
 ComputeClasses depend on zone availability, CUDs, and workload constraints. **Do
@@ -32,6 +36,19 @@ not block the user's initial request.** If asked for YAML/recommendations:
         (e.g., N4, C4) are generic best-practice examples. You MUST explicitly
         state that the final choice of machine family should be aligned with the
         user's existing Committed Use Discounts (CUDs) or Reservations.
+    *   **CRITICAL CUD EXHAUSTION / CAPACITY QUOTA RULE:** When a user asks how
+        to cap a primary machine family to match a Committed Use Discount (CUD)
+        footprint (e.g., 100-core CUD for N4) and automatically spill over
+        excess workload demand to secondary families (N4D, C4), you MUST
+        recommend a **`CapacityQuota`** (`autoscaling.x-k8s.io/v1beta1`, GKE
+        1.36.2+) targeting `cloud.google.com/compute-class: <NAME>` and
+        `cloud.google.com/machine-family: <PRIMARY_FAMILY>` with a `cpu:
+        <CUD_CORES>` limit. This caps only the primary preferred family without
+        restricting secondary fallback priorities in the `ComputeClass` (`n4d`,
+        `c4`), allowing Cluster Autoscaler to emit `noScaleUp` and automatically
+        spill over excess demand to uncapped fallback families without pods
+        staying in Pending. Do NOT recommend manual node pool limits or GCE
+        Capacity Reservations for this pattern.
     *   **YAML REQUIREMENT:** Any generated YAML template MUST include a comment
         near the `machineFamily` field: `# IMPORTANT: Align machineFamily with
         your existing CUDs/Reservations`.
@@ -74,13 +91,24 @@ not block the user's initial request.** If asked for YAML/recommendations:
         it. A GPU Pod stuck `Pending` / `noScaleUp` is almost always missing the
         toleration. Add to the PodSpec: `tolerations: [{key: nvidia.com/gpu,
         operator: Exists}]`.
-    *   **CRITICAL SPOT-TAINT RULE:** GKE auto-taints Spot nodes with
-        `cloud.google.com/gke-spot=true:NoSchedule`. Pods targeting a Spot
-        priority tier *must* tolerate this taint, or they will stay `Pending` /
-        `noScaleUp` with a scheduling block. Tell the user to add the matching
-        toleration to their PodSpec: `tolerations: [{key:
-        cloud.google.com/gke-spot, operator: Equal, value: "true", effect:
-        NoSchedule}]`.
+    *   **SPOT-TAINT RULE — SCOPE MATTERS:** GKE taints Spot nodes with
+        `cloud.google.com/gke-spot=true:NoSchedule`, but who tolerates it depends
+        on how the node pool was created.
+        *   **Spot pools NOT created by a ComputeClass** — pools the user made by
+            hand, or pools from cluster-level node auto-provisioning, which is
+            the path the public Spot VMs documentation describes: the toleration
+            is the user's responsibility. Add to the PodSpec: `tolerations:
+            [{key: cloud.google.com/gke-spot, operator: Equal, value: "true",
+            effect: NoSchedule}]`.
+        *   **Spot capacity reached through a ComputeClass priority tier:** do
+            NOT reflexively tell the user to add this. Autopilot adds the Spot
+            toleration for them, and for ComputeClass-auto-created pools on
+            Standard the behavior is not documented either way — reported
+            practice is that no manual toleration is needed. Present it as
+            something to verify on their cluster, not as a requirement, and never
+            diagnose a `Pending` ComputeClass Pod as a missing Spot toleration
+            unless the events actually name that taint. (Contrast the GPU taint
+            above, which genuinely is the user's responsibility in every case.)
     *   **CRITICAL PRIORITYSCORE RULE:** A shared `priorityScore` makes one
         tie-break tier (lowest unit cost wins), but applies to a MAXIMUM of 3
         rules. NEVER emit more than 3 priorities at the same score; if the user
@@ -145,6 +173,14 @@ not block the user's initial request.** If asked for YAML/recommendations:
 
 ## Commonly Missed (cite directly, don't wait to open a reference)
 
+-   **CUD Exhaustion / Scale-Up Cap via CapacityQuota:** To limit a primary
+    machine family (e.g., N4 capped at 100 CPU to match a 100-core CUD) and
+    automatically spill over excess workload demand to fallback families (N4D,
+    C4) in the same ComputeClass without pods getting stuck in Pending, use a
+    **`CapacityQuota`** (`autoscaling.x-k8s.io/v1beta1`, GKE 1.36.2+) targeting
+    `cloud.google.com/compute-class: <NAME>` and
+    `cloud.google.com/machine-family: <PRIMARY_FAMILY>`. Do NOT recommend GCE
+    Capacity Reservations or manual node pool limits for capping core usage.
 -   **Large-shape obtainability:** Machine shapes **>32 vCPU** are scarcer than
     smaller ones (thinner capacity pools, more `out.of.resources` stockouts). A
     ComputeClass pinned to large machines **only** risks `Pending`. Add
@@ -175,26 +211,23 @@ not block the user's initial request.** If asked for YAML/recommendations:
     separate priorities, and don't collapse them into one entry. Needs **no
     `priorityScore`** (GKE 1.35.2+). Asset:
     `balanced-reserved-zonal-compute-class.yaml`.
--   **Stockout cooldown cascade — fallback laddering & stateful isolation:** A
-    hard zonal stockout (`out_of_resources`/`ZONE_RESOURCE_POOL_EXHAUSTED`) on a
-    priority tier trips a ~5-min GLOBAL cooldown on that whole tier; during it,
-    even unconstrained pods cascade to the next obtainable priority across all
-    zones, draining the fleet toward the bottom tier (autoscaler behavior; xref
-    `gke-cluster-autoscaler`). Don't ladder straight from a scarce preferred
-    family to the cheapest fallback — insert an **intermediate family** in
-    `priorities[]` (preferred → mid → floor) so a cooldown drops one rung, not
-    all the way. The forced scale-up that trips the cooldown comes from
-    **constrained** pods (zonal PV / zonal selector), so **isolate
-    stateful/zonal-PV workloads into their own ComputeClass** to keep them from
-    cascading the stateless fleet. (`BALANCED` alone just skews unconstrained
-    scale-up to healthy zones — best-effort, not the cause of the fallback.)
-    **DaemonSet and PDB Consolidation Blockers:** Active migration
-    (`optimizeRulePriority`) is a voluntary disruption that respects PDBs.
-    DaemonSets (which are pinned to every node) and system pods in `kube-system`
-    with tight PDBs (e.g., `maxUnavailable: 0`) often block node evacuation,
-    preventing the consolidation of On-Demand nodes back to Spot even when Spot
-    capacity returns. Note that involuntary Spot preemptions bypass PDBs
-    completely.
+-   **Stockout cooldown cascade — fallback laddering & stateful isolation:**
+    -   *Cooldown Scope*: In GKE versions prior to `1.36.3-gke.1244000`, a hard zonal stockout (`out_of_resources` / `ZONE_RESOURCE_POOL_EXHAUSTED`) on a priority tier trips a ~5-minute **regional** cooldown on that whole tier across all zones. Starting in GKE `1.36.3-gke.1244000+`, stockout cooldowns are strictly **zonal**, keeping healthy zones active on preferred tiers (quota errors remain regional).
+    -   *Cascade Mechanism*: Cascades to the bottom tier occur when **zonally constrained workloads** (pods bound to a zonal PV or rigid zonal `nodeSelector`/affinity) demand capacity in a stocked-out zone, forcing evaluation down the fallback ladder and tripping the 5-minute cooldown.
+    -   *BALANCED Location Policy Clarification*: `locationPolicy: BALANCED` is best-effort and does NOT cause the excessive fallback to lower tiers; for unconstrained pods, a single-zone stockout merely skews scale-up of the preferred tier to healthy zones (e.g. 0/3/3). The true cause of the cascade is the priority tier cooldown triggered by constrained pods.
+    -   *Mitigations*: (1) Insert **intermediate family rungs** in `priorities[]` (e.g., `c4` -> `c3` -> `n4` -> `n2d`) so a cooldown drops one rung rather than cascading straight to the cheapest baseline floor. (2) **Isolate stateful/zonal workloads** into their own dedicated ComputeClass so their forced zonal stockouts do not cascade the stateless fleet. (xref `gke-cluster-autoscaler`).
+    -   **Consolidation & Active Migration Blockers:** Active migration (`optimizeRulePriority`) performs voluntary evictions that strictly respect PDBs. Non-DaemonSet system pods in `kube-system` without PDBs, or application pods with tight PDBs (`maxUnavailable: 0`), block node evacuation and prevent On-Demand fallback nodes from draining back to preferred Spot tiers. Note: DaemonSets are node-bound, stripped via `podutils.FilterRecreatablePods`, and do NOT block node drain/consolidation. Spot VM preemptions occur at the hypervisor level and bypass PDBs completely.
+    -   *Safe-to-Evict on-completion*: Workloads annotated with `cluster-autoscaler.kubernetes.io/safe-to-evict: "on-completion"` defer defragmentation/active migration until the pod finishes naturally.
+-   **Active Migration Rollout Protection — Rollout-Scoped PDBs (`maxUnavailable: 0`):**
+    -   *Problem*: When `activeMigration.optimizeRulePriority: true` is enabled, Cluster Autoscaler voluntarily evicts newly scheduled Green pods during canary/blue-green rollouts to optimize node placement, causing rollout thrashing and pipeline timeouts.
+    -   *PDBs vs Template Annotations*: Modifying `safe-to-evict: "false"` inside `spec.template.metadata.annotations` changes the `PodTemplateSpec` hash and forces an **immediate rolling restart** of the Deployment. In contrast, managing a dedicated PodDisruptionBudget operates out-of-band with **zero pod restarts**.
+    -   *Golden Path Pattern*: (1) Apply a rollout-scoped PDB with `maxUnavailable: 0` matching `version: green` alongside the Green Deployment. (2) Execute phased traffic shift while Green pods remain locked to their nodes. (3) After 100% cutover, patch the PDB to the standard operational budget (`maxUnavailable: 25%`) to allow `activeMigration` to resume background node optimization.
+    -   *Safety*: `maxUnavailable: 0` does not block pod creation (Pod Create API) or rollback (Pod Delete API). Involuntary VM loss (Spot preemption) bypasses PDBs and ReplicaSet spawns replacements immediately.
+-   **Fallback Ladder & Standby Headroom Best Practices (`machineFamily` vs `nodepools` & `CapacityBuffer`):**
+    -   *Prefer `machineFamily` over `priorities[].nodepools`*: Rules referencing manual node pools do not benefit from ComputeClass cooldown prolongation and rely solely on standard 5-minute GCE MIG backoffs. Sprawling manual pool lists (>6–8 pools) cause early MIG backoffs to expire before lower rungs are evaluated, bouncing the autoscaler back to the top in an infinite loop. Use `machineFamily` with `nodePoolAutoCreation.enabled: true`.
+    -   *Place `flexStart: true` at the very end*: Dynamic Workload Scheduler (DWS) queuing takes 3–15+ minutes to return stockout signals; placing `flexStart` higher in the ladder allows earlier backoffs to expire during the wait and resets the autoscaler to the top.
+    -   *Avoid `min-nodes` on fallback pools (Scheduler Bypass)*: `kube-scheduler` assigns incoming pods to idle nodes held by `min-nodes` *before* Cluster Autoscaler evaluates ComputeClass priorities. If fallback pools have `min-nodes > 0`, pods land on fallback hardware permanently, bypassing preferred tiers. Set `min-nodes: 0` and use `CapacityBuffer` (`buffer.x-k8s.io`).
+    -   *GKE 1.36+ Synchronous Obtainability*: Starting in GKE 1.36, Cluster Autoscaler checks internal capacity obtainability synchronously in memory before creating VMs, skipping exhausted families without tripping GCE API errors or backoff cooldowns. Note: `gcloud beta compute advice capacity` is a discrete Spot/Flex heuristic (0.1, 0.5, 0.9); Google does not expose public real-time on-demand APIs.
 -   **Stateful PV StorageClass — recommend `dynamic-rwo`:** GKE
     1.35.3-gke.1290000+. Back stateful data PVs with built-in **`dynamic-rwo`**
     (`type: dynamic`, `use-allowed-disk-topology: "true"`,
@@ -204,9 +237,8 @@ not block the user's initial request.** If asked for YAML/recommendations:
     `priorities[].storage.bootDiskType` (the node boot disk). Asset:
     `dynamic-rwo-storageclass.yaml`.
 -   **Reservation fallback bypass:** `reservations.affinity: AnyBestEffort` (or
-    `Automatic`) falls back to On-Demand at the GCE layer, silently skipping
-    lower ComputeClass priorities — so a Spot fallback never fires. Use
-    `Specific` affinity with named reservations so ComputeClass fallback works.
+    `Automatic`) consumes On-Demand capacity at the GCE layer before allowing ComputeClass to evaluate lower priorities. This means a cheaper or Spot fallback you defined won't fire unless On-Demand is also completely exhausted. Use
+    `AnyThenFail` affinity (requires GKE 1.36.0-gke.3204000+) to skip On-Demand and fall back to the next ComputeClass priority, or use `Specific` affinity with named reservations.
     (Not a `whenUnsatisfiable` problem.)
 -   **Karpenter/EKS selector translation (migration #1 trap):** AWS-style or
     generic Pod `nodeSelector` keys don't match GKE — a Pod selecting
@@ -221,7 +253,7 @@ not block the user's initial request.** If asked for YAML/recommendations:
     Karpenter node labels, taints, and disk mappings (e.g., local NVMe) must
     translate to the GKE `nodePoolConfig` (or per-priority overridden fields) in
     the ComputeClass. Ref: `compute-class-karpenter-migration.md`.
--   **Restricting ComputeClass access — TWO independent layers (don't
+-   **Restricting ComputeClass access & usage — THREE independent layers (don't
     conflate):** **(1) CRUD** (who can create/modify the CC *object*) =
     **RBAC**: CC is a **cluster-scoped CRD** →
     `ClusterRole`/`ClusterRoleBinding` (NOT namespaced `Role`), `apiGroups:
@@ -238,9 +270,26 @@ not block the user's initial request.** If asked for YAML/recommendations:
     and `matchConstraints` must cover **every workload kind** (pods +
     deployments/statefulsets/daemonsets/replicasets + jobs/cronjobs), not just
     pods+deployments. Bind with `validationActions: [Deny, Audit]` (Audit-first
-    to find violators), `failurePolicy: Fail`, `namespaceSelector`. Ref:
+    to find violators), `failurePolicy: Fail`, `namespaceSelector`. **(3)
+    Scale-Up Cap (GKE 1.36.2+)** (`CapacityQuota` CRD,
+    `autoscaling.x-k8s.io/v1beta1`) = Restricts the physical infrastructure
+    footprint (CPU, memory, GPUs, node count) that workloads consuming a CC can
+    provision via Cluster Autoscaler. Target a class via `selector.matchLabels:
+    cloud.google.com/compute-class: <NAME>`. **Priority Fallback / CUD
+    Exhaustion Spillover Pattern:** combine `compute-class` with
+    `cloud.google.com/machine-family: <PRIMARY_FAMILY>` in `matchLabels` to cap
+    only the primary preferred family (e.g., `n4` capped at 100 CPU for a
+    100-core Committed Use Discount) without restricting secondary fallback
+    priorities in the class (`n4d`, `c4`). When the primary CUD/quota hits its
+    limit, Cluster Autoscaler emits `noScaleUp` (`exceeded quota:
+    "CapacityQuota/<NAME>", resources: cpu`) and automatically spills over
+    excess demand to the uncapped fallback families. Do not use
+    `node.kubernetes.io/instance-type` in CapacityQuota selectors (use
+    `ComputeClass` `machineType` rules instead). Ref:
     `compute-class-governance.md`; assets `computeclass-rbac-editor.yaml`,
-    `restrict-computeclass-usage-vap.yaml`.
+    `restrict-computeclass-usage-vap.yaml`, `capacity-quota-spillover.yaml`.
+
+
 -   **Autopilot mode on Standard clusters:** Built-in `autopilot` /
     `autopilot-spot` ComputeClasses (pre-installed, GKE 1.33.1-gke.1107000+,
     Rapid channel) run **Autopilot-mode** Pods on a Standard cluster —
@@ -318,7 +367,8 @@ spec:
     `spec.autopilot.enabled`, privileged limits.
 -   **[Governance / Access Restriction](./references/compute-class-governance.md):**
     CRUD via RBAC (`ClusterRole`), consumption via `ValidatingAdmissionPolicy`
-    (nodeSelector/affinity/toleration paths, wildcard bypass).
+    (nodeSelector/affinity/toleration paths, wildcard bypass), and scale-up
+    footprint caps via `CapacityQuota` (with priority fallback spillover).
 
 --------------------------------------------------------------------------------
 
@@ -330,4 +380,24 @@ spec:
     `dynamic-rwo` on GKE 1.35.3-gke.1290000+; for data PVs of stateful
     ComputeClasses).
 -   **Governance:** `assets/computeclass-rbac-editor.yaml` (RBAC CRUD lock),
-    `assets/restrict-computeclass-usage-vap.yaml` (consumption restriction VAP).
+    `assets/restrict-computeclass-usage-vap.yaml` (consumption restriction VAP),
+    `assets/capacity-quota-spillover.yaml` (scale-up cap with fallback spillover).
+
+
+<!-- kube-agents: local addition (auto-injected by sync-upstream-skills.py) -->
+
+## Node upgrades during a PDB-guarded canary
+
+The "Node auto-upgrades" row in `references/compute-class-lifecycle.md` overstates the protection:
+GKE's node-upgrade drain respects a PodDisruptionBudget for up to one hour, then evicts the pods
+anyway. A node auto-upgrade can therefore still evict the green pods of a multi-hour canary guarded
+by a `maxUnavailable: 0` PDB. When the rollout must not be disrupted, run it outside the cluster's
+maintenance window or add a maintenance exclusion for its duration (see `gke-upgrades`).
+
+## Reading the code index from this install
+
+`references/compute-class-code-index.md` opens by telling its reader to clone the repository, and
+its "Code verification instructions" section runs `git log` and `git blame`. Those steps are for the
+user's own terminal: this install cannot reach GitHub, so follow the CRITICAL RULE above and hand
+them to the user. The index's `groupRulesByScore` entry names a function the upstream source does
+not have; do not cite it.

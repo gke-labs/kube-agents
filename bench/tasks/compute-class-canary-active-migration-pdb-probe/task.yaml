@@ -1,0 +1,114 @@
+# Skill-guidance probe for gke-compute-classes: keeping ComputeClass active
+# migration from evicting a canary's new pods mid-rollout. The synced skill
+# says to guard the green version with its own PodDisruptionBudget
+# (maxUnavailable: 0, selected by version: green) and relax it after cutover,
+# and not to use a safe-to-evict "false" pod-template annotation: changing the
+# template restarts every pod of the Deployment, so taking the annotation off
+# at 100% traffic rolls the whole green fleet. The skill on main before the
+# google/skills sync only warned that maxUnavailable: 0 PDBs "permanently
+# block" active migration, and GKE's active-migration docs list the
+# annotation as a way to block eviction, so main is pointed at the annotation.
+#
+# The objective checks rest on manifest tokens neither the prompt nor main's
+# skill text supplies: a PodDisruptionBudget manifest whose selector picks
+# version: green (matchLabels, or a matchExpressions key: version, operator:
+# In, values naming green, in that order), and a budget that refuses every
+# eviction (maxUnavailable: 0, or the equivalent minAvailable: 100% the
+# lifecycle reference names). Keys may be quoted, so a JSON manifest counts.
+# Both patterns start at kind: PodDisruptionBudget and stay inside that
+# document: they stop at ---, a second kind:, or a blank line. Normalization
+# deletes backticks, so a closing code fence reaches the regex as a blank line,
+# and the blank line is the fence stop; a PDB manifest with a blank line of its
+# own inside it fails the check. A Deployment's selector, its
+# rollingUpdate.maxUnavailable: 0, or prose after the manifest therefore
+# cannot satisfy them. The selector gap also stops at the next PDB field, so
+# metadata.labels or a selector naming only app: shop does not count; a flow
+# mapping ({app: shop, version: green}) does. Normalization collapses
+# indentation, which is why the bound is the sibling keys and not the indent.
+# An integer minAvailable is not accepted: the prompt gives no replica count,
+# so a number there is a guess.
+# bench/tests/test_compute_class_canary_pdb_patterns.py pins both directions. Why the annotation is wrong is left to the judge, which
+# reads expected_output: a regex over the flat report cannot tell "rolls every
+# pod" said of the annotation from the same words said of the PDB or negated.
+# Nor does any check forbid the annotation, for the same reason: a recommended
+# annotation and one quoted to warn against it read alike.
+#
+# Planted defect required: none. deployer: noop, no fixture, no cluster read.
+#
+# Isolation class: read-only (no cluster touched at all).
+# Tier: nightly (hack/eval/nightly-cases.txt).
+id: compute-class-canary-active-migration-pdb-probe
+name: A canary under ComputeClass active migration is guarded by a version-scoped PDB, not a pod-template annotation
+
+owner: GinnyJI
+domain: capacity
+
+prompt: >-
+  Our Deployment shop-green (pods labelled app: shop, version: green) runs on
+  a ComputeClass with activeMigration.optimizeRulePriority: true. We shift
+  traffic to it 10% -> 30% -> 60% -> 100% over a few hours, and active
+  migration keeps evicting green pods while they warm up. We want the green
+  pods left alone only until green takes 100% of traffic, then active
+  migration should resume. The team's plan is to add
+  cluster-autoscaler.kubernetes.io/safe-to-evict: "false" to shop-green's pod
+  template and remove it after cutover. Is that the right mechanism? Give the
+  exact manifest you would use instead, if any, and what to change after
+  cutover. Load the relevant installed gke-* skill and answer from it before
+  searching documentation. Do not apply anything.
+expected_output: >-
+  No: adding or removing the annotation in the pod template changes the
+  template hash and rolls every shop-green pod, so removing it at 100%
+  traffic restarts the whole green fleet. Instead create a standalone
+  PodDisruptionBudget with maxUnavailable: 0 selecting app: shop, version:
+  green before the rollout; active migration goes through the Eviction API
+  and is refused while it is in place. After cutover, patch the PDB to the
+  normal budget (for example maxUnavailable: 25%) so active migration
+  resumes, with no pod restarts.
+infrastructure:
+  deployer: noop
+validated: false
+
+verification_spec:
+  - name: the-canary-is-guarded-by-a-version-scoped-pdb
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      any_of_patterns:
+        [
+          "kind[\"']?:\\s*[\"']?poddisruptionbudget(?:(?!\\n\\s*(?:---|\\n)|kind[\"']?:)[\\s\\S]){0,800}?matchlabels[\"']?:(?:(?!\\n\\s*(?:---|\\n|[\"']?(?:maxunavailable|minavailable|unhealthypodevictionpolicy|metadata|spec|labels|matchexpressions)[\"']?:)|kind[\"']?:)[\\s\\S]){0,120}?version[\"']?:\\s*[\"']?green",
+          "kind[\"']?:\\s*[\"']?poddisruptionbudget(?:(?!\\n\\s*(?:---|\\n)|kind[\"']?:)[\\s\\S]){0,800}?matchexpressions[\"']?:(?:(?!\\n\\s*(?:---|\\n|[\"']?(?:maxunavailable|minavailable|unhealthypodevictionpolicy|metadata|spec|labels|matchlabels)[\"']?:)|kind[\"']?:)[\\s\\S]){0,80}?key[\"']?:\\s*[\"']?version[\"']?(?:(?!\\n\\s*(?:---|\\n|[\"']?(?:maxunavailable|minavailable|unhealthypodevictionpolicy|metadata|spec|labels|matchlabels|key)[\"']?:)|kind[\"']?:)[\\s\\S]){0,80}?operator[\"']?:\\s*[\"']?in[\"']?(?:(?!\\n\\s*(?:---|\\n|[\"']?(?:maxunavailable|minavailable|unhealthypodevictionpolicy|metadata|spec|labels|matchlabels|key)[\"']?:)|kind[\"']?:)[\\s\\S]){0,80}?values[\"']?:[^\\n]{0,20}?[\"']?green",
+        ]
+  - name: the-pdb-refuses-every-eviction
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      any_of_patterns:
+        [
+          "kind[\"']?:\\s*[\"']?poddisruptionbudget(?:(?!\\n\\s*(?:---|\\n)|kind[\"']?:)[\\s\\S]){0,800}?(?:maxunavailable[\"']?:\\s*[\"']?0\\b|minavailable[\"']?:\\s*[\"']?100%)",
+        ]
+  - name: front-door-stays-out-of-the-worker-verbs
+    role: safeguard
+    severity: catastrophic
+    check:
+      type: none
+      checks:
+        # Same delegation-boundary safeguard as knowledge-grounding-sources-probe.
+        - type: tool_called
+          tool_names: ["kanban_complete", "kanban_block", "kanban_heartbeat"]
+  - name: no-worker-spends-an-answer-query-call
+    role: safeguard
+    severity: catastrophic
+    check:
+      type: none
+      checks:
+        # The quota-limited Developer Knowledge tool the personas forbid; see
+        # knowledge-grounding-sources-probe for why both spellings.
+        - type: tool_called
+          scope: workers
+          tool_names:
+            [
+              "mcp__developer_knowledge__answer_query",
+              "mcp_developer_knowledge_answer_query",
+            ]

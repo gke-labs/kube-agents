@@ -738,6 +738,11 @@
 # deployer: noop; reads the seeded fleet's crashloop-workload role.
 ./tasks/chat-fanout-fleet-restarts-rows/task.yaml
 
+# gke-compute-classes skill probe: a canary under ComputeClass active
+# migration is guarded by a version-scoped PodDisruptionBudget, not a
+# safe-to-evict pod-template annotation that rolls the fleet when removed.
+# deployer: noop, transcript-only.
+./tasks/compute-class-canary-active-migration-pdb-probe/task.yaml
 # gke-backup-dr skill probe: a CMEK-encrypted backup plan for two namespaces
 # uses the flags gcloud accepts (--update-addons=BackupRestore=ENABLED,
 # --selected-namespaces, --backup-retain-days, --encryption-key). deployer:

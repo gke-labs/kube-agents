@@ -285,6 +285,38 @@ GKE_PRODUCTIONIZE_NEW_SECURITY_ACTION_SNIPPET = """-   **Action**: You MUST run 
     Identity, and the `gke-platform-security` and `gke-workload-security` skills
     for Network Policies and Shielded Nodes."""
 
+# gke-compute-classes upstream breaks two passages: a blank line splits the large-shape bullet
+# mid-sentence, so the rest renders as a separate paragraph, and the balanced-zonal bullet ends on
+# "Asset:" with the asset's name deleted. The replacements rejoin the sentence and restore the
+# name the previous upstream version carried.
+GKE_COMPUTE_CLASSES_OLD_LARGE_SHAPE_SNIPPET = """are scarcer than
+
+    smaller ones"""
+
+GKE_COMPUTE_CLASSES_NEW_LARGE_SHAPE_SNIPPET = """are scarcer than
+    smaller ones"""
+
+GKE_COMPUTE_CLASSES_OLD_ZONAL_ASSET_SNIPPET = """(GKE 1.35.2+). Asset:
+-   **Stockout cooldown cascade"""
+
+GKE_COMPUTE_CLASSES_NEW_ZONAL_ASSET_SNIPPET = """(GKE 1.35.2+). Asset:
+    `balanced-reserved-zonal-compute-class.yaml`.
+-   **Stockout cooldown cascade"""
+
+# gke-compute-classes upstream tells the agent to verify undocumented behavior by cloning the
+# autoscaler repository or fetching raw files from GitHub. Neither works from this install's
+# terminal (no git transport, no egress to GitHub), so the replacement sends the user to the code
+# instead of the agent.
+GKE_COMPUTE_CLASSES_OLD_CODE_FIRST_SNIPPET = """**VERIFY BEHAVIOR DIRECTLY IN CODE** (via local repository clone or fetching raw files from GitHub). Check `git log -S` and `git blame` to identify the exact commit and date when behavior changed, and communicate version/date ranges to the user (e.g. *"This behavior changed on July 20, 2026 in upstream commit 129daa3756..."*)."""
+
+GKE_COMPUTE_CLASSES_NEW_CODE_FIRST_SNIPPET = """**SAY SO AND POINT AT THE CODE**: this install's terminal cannot clone or fetch from GitHub, so do not try. Name the package or symbol from the code index for the user to check with `git log -S` and `git blame`, and do not state a version or date range you have not read."""
+
+# gke-cluster-autoscaler still calls the stockout cooldown global with no version qualifier, while
+# gke-compute-classes, which it xrefs for the same cascade, says it is zonal from
+# 1.36.3-gke.1244000. The replacement carries the version split so the two skills agree.
+GKE_CLUSTER_AUTOSCALER_OLD_COOLDOWN_SNIPPET = """puts the **entire affected priority tier on a ~5-min GLOBAL cooldown**. During that window all pending pods"""
+
+GKE_CLUSTER_AUTOSCALER_NEW_COOLDOWN_SNIPPET = """puts the **entire affected priority tier on a ~5-min cooldown**: across all zones before GKE `1.36.3-gke.1244000`, in the stocked-out zone only from it (quota errors stay regional; see `gke-compute-classes`). During a cross-zone cooldown all pending pods"""
 # gke-backup-dr upstream fuses the end of best practice 5 into the next heading: the sentence
 # stops at "Service**," and "## Golden Path Backup Defaults" follows on the same line, so the
 # heading does not render and the sentence never says why the distinction matters. The
@@ -415,6 +447,26 @@ SKILL_SUBSTITUTIONS = {
         (
             GKE_BASICS_OLD_MCP_USAGE_ENTRY_SNIPPET,
             GKE_BASICS_NEW_MCP_USAGE_ENTRY_SNIPPET,
+        ),
+    ],
+    "gke-compute-classes": [
+        (
+            GKE_COMPUTE_CLASSES_OLD_LARGE_SHAPE_SNIPPET,
+            GKE_COMPUTE_CLASSES_NEW_LARGE_SHAPE_SNIPPET,
+        ),
+        (
+            GKE_COMPUTE_CLASSES_OLD_ZONAL_ASSET_SNIPPET,
+            GKE_COMPUTE_CLASSES_NEW_ZONAL_ASSET_SNIPPET,
+        ),
+        (
+            GKE_COMPUTE_CLASSES_OLD_CODE_FIRST_SNIPPET,
+            GKE_COMPUTE_CLASSES_NEW_CODE_FIRST_SNIPPET,
+        ),
+    ],
+    "gke-cluster-autoscaler": [
+        (
+            GKE_CLUSTER_AUTOSCALER_OLD_COOLDOWN_SNIPPET,
+            GKE_CLUSTER_AUTOSCALER_NEW_COOLDOWN_SNIPPET,
         ),
     ],
     "gke-backup-dr": [
@@ -852,6 +904,24 @@ section: verify the regional quota for the exact accelerator metric, probe
 duration, and horizon, and rank the returned windows. That skill owns the probe's flags, the
 chips-per-node arithmetic, the ranking rule, and the paired ProvisioningRequest + LocalQueue
 shapes; follow it rather than restating them here.
+""",
+    "gke-compute-classes": f"""{FOOTER_MARKER}
+
+## Node upgrades during a PDB-guarded canary
+
+The "Node auto-upgrades" row in `references/compute-class-lifecycle.md` overstates the protection:
+GKE's node-upgrade drain respects a PodDisruptionBudget for up to one hour, then evicts the pods
+anyway. A node auto-upgrade can therefore still evict the green pods of a multi-hour canary guarded
+by a `maxUnavailable: 0` PDB. When the rollout must not be disrupted, run it outside the cluster's
+maintenance window or add a maintenance exclusion for its duration (see `gke-upgrades`).
+
+## Reading the code index from this install
+
+`references/compute-class-code-index.md` opens by telling its reader to clone the repository, and
+its "Code verification instructions" section runs `git log` and `git blame`. Those steps are for the
+user's own terminal: this install cannot reach GitHub, so follow the CRITICAL RULE above and hand
+them to the user. The index's `groupRulesByScore` entry names a function the upstream source does
+not have; do not cite it.
 """,
     "gke-workload-scaling": f"""{FOOTER_MARKER}
 

@@ -99,9 +99,9 @@ Check **Autoscaler Visibility logs**
 
 ## Symptom 8: "ANY" Reservation Bypasses Fallbacks
 
--   **Cause:** `reservations.affinity: AnyBestEffort` falls back to On-Demand at
-    GCE layer.
--   **Fix:** Use `affinity: Specific` with named reservations.
+-   **Cause:** `reservations.affinity: AnyBestEffort` consumes On-Demand capacity at
+    the GCE layer before evaluating your remaining ComputeClass priorities, preventing your intended fallback.
+-   **Fix:** Use `affinity: AnyThenFail` (GKE 1.36.0-gke.3204000+) or `affinity: Specific` with named reservations.
 
 ## Symptom 9: Disk/PV Attachment Fail
 

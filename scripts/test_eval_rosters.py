@@ -166,6 +166,7 @@ ADDED_AFTER_THE_MOVE = [
     "observability-watcher-scrape-state",  # the event watcher's scrape state, #2141
     "platform-security-secrets-encryption-currentstate-probe",  # the gke-basics/security skills sync
     "chat-fanout-fleet-restarts-rows",  # a fleet question fanned out one titled card per cluster
+    "compute-class-canary-active-migration-pdb-probe",  # the gke-compute-classes skill sync
     "backup-dr-cmek-selected-namespaces-probe",  # the gke-backup-dr skill sync
     "findings-decision-covers-item",  # the findings queue's item-wide decision
     "upgrades-freeze-runbook-probe",  # the gke-upgrades skill sync
