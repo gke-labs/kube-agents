@@ -209,6 +209,10 @@ ERRORS_KEY = "errors"
 MESSAGE_KEY = "message"
 MEMBER_ID_KEYS = ("project", "location", "cluster")
 BEHIND_STATUSES = frozenset({"lagging", "patch-behind"})
+# The statuses that settle a cluster as no longer below a version: a graded
+# position above or at it. "unknown" (a target the script could not resolve)
+# settles nothing; the cluster stays pending until a run grades it.
+SETTLED_STATUSES = frozenset({"current", "ahead"})
 READINESS_BLOCKED = "blocked"
 READINESS_READY = "ready"
 READINESS_UNKNOWN = "unknown"
@@ -700,6 +704,16 @@ def decide(
 # --- the report files ------------------------------------------------------
 
 
+def settled_against(listing: tuple[str, str], version: str) -> bool:
+    """True when a listed member is definitely no longer below ``version``: a
+    graded position at or above it, or a graded lag toward a different target.
+    An unresolved target (status unknown, empty target) settles nothing."""
+    status, target = listing
+    if status in SETTLED_STATUSES:
+        return True
+    return status in BEHIND_STATUSES and bool(target) and target != version
+
+
 def settle_from_readiness(report: dict, pending: dict[str, list[str]], ledger: dict) -> list[str]:
     """A readiness run lists every cluster of its project, including one the
     version table did not reach this tick. A listed cluster that is no longer
@@ -713,7 +727,7 @@ def settle_from_readiness(report: dict, pending: dict[str, list[str]], ledger: d
     for version in list(pending):
         kept = [
             key for key in pending[version]
-            if key not in listed or (listed[key][0] in BEHIND_STATUSES and listed[key][1] == version)
+            if key not in listed or not settled_against(listed[key], version)
         ]
         pending[version] = kept
         if version in ledger[TARGETS_KEY]:
@@ -1040,6 +1054,7 @@ def tick(dry_run: bool = False) -> list[str]:
                 del ledger[TARGETS_KEY][version]
                 due.pop(version)
                 retired.append(version)
+                remove_reports(home, version)
                 lines.append(RETIRED_LINE.format(prefix=LINE_PREFIX, version=version))
         for version, reason in due.items():
             clusters = pending[version]
