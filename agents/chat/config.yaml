@@ -205,12 +205,14 @@ kanban:
   # of cards spawns processes until the cgroup OOM killer takes them, which kills a
   # child rather than the container and so produces no restart and no event.
   #
-  # This line is the default on every install. The operator does not pin it: its
-  # managed scope is machine-global and this is a front-door setting. An operator
-  # that wants a different cap sets spec.harness.tuning.maxInProgress, which the
-  # operator writes into profile-default.overlay.yaml and the entrypoint merges
-  # over this key at startup — so keep this value in step with
-  # defaultKanbanMaxInProgress in platformagent_manifests.go.
+  # On an operator install this line is NOT what applies. The operator pins
+  # kanban.max_in_progress in its managed scope (/etc/hermes), which Hermes
+  # overlays on this file at every load: spec.harness.tuning.maxInProgress, or
+  # defaultKanbanMaxInProgress in platformagent_manifests.go when the CR does not
+  # set it. The CR field is the knob. Editing this line, or the value the agent's
+  # own config.yaml holds, changes nothing there. This line applies only to an
+  # install that runs the image without the operator, so keep it in step with
+  # defaultKanbanMaxInProgress (TestChatConfigCapsTheBoardAndWakesOnFailuresOnly).
   #
   # One slot is guaranteed to each class of card: background work (event
   # triage, cron report relays) may hold every slot but one, and so may user

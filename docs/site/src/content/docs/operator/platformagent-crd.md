@@ -284,7 +284,9 @@ removing it restores the image's value rather than Hermes'.
 
 **`maxInProgress` is not.** Unset renders `6`, because the untuned case is the one that cannot
 absorb the alternative — see [Why dispatch is capped by default](#why-dispatch-is-capped-by-default)
-below. Set it on the CR to raise or lower that.
+below. Set it on the CR to raise or lower that. Either way the value is pinned in the managed scope
+at `/etc/hermes`, so it applies over whatever the agent's own `config.yaml` says, and removing the
+field puts the default back.
 
 ```yaml
 spec:
@@ -359,6 +361,15 @@ agent's memory limit through `spec.deployment.resources` (which replaces the def
 should set `maxInProgress` to fit: about 430 MiB per worker over the 1.8 GiB the pod holds idle, so
 a 4Gi limit fits about five. Raise it once you know your worker footprint and your model quota —
 that quota is the other shared resource, and for most deployments it binds before memory does.
+
+The cap comes from the operator, not from the image or the agent's own `config.yaml`. The operator
+pins `kanban.max_in_progress` in the managed scope at `/etc/hermes`: the CR's value, or `6` when it
+says nothing. Hermes applies that file over the agent's config on every load, so a value an existing
+volume was first seeded with, a removed override, or an edit the agent made to its own file has no
+effect. An install upgraded onto an operator that changes the default takes the new number on its
+first reconcile and the pod roll that follows; the dispatcher logs
+`kanban dispatcher: max_in_progress=<n>` at startup. The `max_in_progress` line in
+`agents/chat/config.yaml` applies only to an image run without the operator.
 
 One slot is guaranteed to each class of card. A card is classed when an agent files it with
 `kanban_create`: one filed from an event-triage or cron-relay session is background, and one filed
@@ -458,10 +469,10 @@ Three things change while it is on:
 - `profile-platform.overlay.yaml` gains the three profile-shaped things only the `default` profile
   carried before: the toolsets each chat platform key resolves, the ingress plugins, and the
   `kanban` block. The adapters themselves are not copied — the managed scope at `/etc/hermes` is
-  machine-global, so `platforms.*` and `display.platforms` already land on this profile. `kanban`
+  machine-global, so `platforms.*`, `display.platforms` and the board's worker cap
+  ([`tuning.maxInProgress`](#specharnesstuning)) already land on this profile. The rest of `kanban`
   does have to follow the gateway, because the dispatcher and the notifier run in the gateway
-  process and read their settings from its own home; that is what keeps
-  [`tuning.maxInProgress`](#specharnesstuning) applying. The board itself does not move — Hermes
+  process and read their settings from its own home. The board itself does not move — Hermes
   anchors `kanban.db` at the shared root rather than the active profile, deliberately, so the
   dispatcher/worker handoff survives — so cards in flight are unaffected by the flip.
 - The entrypoint stops force-syncing `profiles/platform/config.yaml` from the image and back-fills
@@ -969,7 +980,8 @@ is _not_ a security sandbox — see the
 **What is pinned is narrow, on purpose.** `/etc/hermes` is machine-global — one file for every
 profile in the pod, not just `default` — so it carries only what is identical for every profile
 _and_ beyond the agent's own repair: `model.*`, `platforms.*`, `approvals.cron_mode`,
-`display.platforms`, `terminal.*` (where the shell runs: one sandbox per Pod, reached the same way by every
+`display.platforms`, `kanban.max_in_progress` (the board is shared by every profile, and a burst of
+workers past it is lost to the OOM killer without a restart or an event), `terminal.*` (where the shell runs: one sandbox per Pod, reached the same way by every
 profile), when the agent Pod has a runtime class, `database.journal_mode` (one data volume per Pod, and a
 corrupted database is found only after the sessions in it are unreadable) and, when the A2A bridge is in the
 Pod, rendered by the operator or declared, and runs the `api` executor, one `hooks.outbound` entry that posts tool calls to the bridge's loopback trace endpoint (one endpoint per
@@ -980,7 +992,7 @@ talked into fixing.
 
 Everything else the operator owns for the front door goes in `profile-default.overlay.yaml`
 instead: `plugins.enabled` for AgentPlugins with no `targetProfile`, those plugins' non-gateway
-config subtrees, and `spec.harness.tuning`'s `default` limits and `maxInProgress`. Those are
+config subtrees, and `spec.harness.tuning`'s `default` limits. Those are
 profile-shaped — pinning them machine-globally would hand the front door's settings to every
 specialist — and they are all recoverable by an agent that can still talk and still reason.
 Nothing the operator renders appears on both routes. What appears on neither, and so stays the

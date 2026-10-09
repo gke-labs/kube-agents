@@ -119,9 +119,9 @@ readonly EVAL_DRIFT_READY_INTERVAL_SECONDS=5
 # noise-filter case asserts on. What --log-dropped adds over that is which
 # record and why, and that is worth a targeted rerun rather than every lease.
 
-# The kanban board's worker cap on the eval install. The image ships
-# kanban.max_in_progress: 6 (agents/chat/config.yaml), and the operator renders
-# a different cap only when the CR carries spec.harness.tuning.maxInProgress.
+# The kanban board's worker cap on the eval install. The operator pins
+# kanban.max_in_progress in its managed scope: 6 (defaultKanbanMaxInProgress),
+# or spec.harness.tuning.maxInProgress when the CR carries it.
 # The eval deliberately runs below that production default, at five. It fans
 # its units out at EVAL_TASK_PARALLELISM (4 on a pull request, 8 on the
 # nightly since oss-test-infra#2707), and nearly every unit's opening turn
