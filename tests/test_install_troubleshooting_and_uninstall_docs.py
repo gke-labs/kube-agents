@@ -33,6 +33,8 @@ class InstallTroubleshootingDocsTest(unittest.TestCase):
         self.assertIn("allowedUsers", content)
         self.assertIn("SLACK_ALLOWED_USERS", content)
         self.assertIn("Single-Workspace vs Multi-Workspace", content)
+        self.assertIn("platformagent-crd.md#specintegration", content)
+        self.assertNotIn("platformagent-crd.md#slack", content)
 
     def test_install_md_troubleshooting_kubectl_logs_commands(self):
         content = INSTALL_MD.read_text(encoding="utf-8")
@@ -42,6 +44,9 @@ class InstallTroubleshootingDocsTest(unittest.TestCase):
         # Next mode log commands
         self.assertIn("kubectl logs -n kubeagents-system deploy/platform-agent-a2a-gateway", content)
         self.assertIn("A2AGateway", content)
+        self.assertIn("NoChatBackend", content)
+        self.assertIn("WaitingForReplica", content)
+        self.assertNotIn("Look for the `A2AGateway` condition", content)
 
 
 class UninstallDocsTest(unittest.TestCase):
