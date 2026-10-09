@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"cmp"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -8,7 +9,9 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -18,7 +21,7 @@ import (
 )
 
 // sessionProfile is the AgentProfile a /session conversation runs as - the
-// conversation front door of spec-subagent-profiles.md (a2a/profiles/chat.yaml).
+// conversation front door of spec-subagent-profiles.md (k8s-operator/examples/agentprofile-chat.yaml).
 const sessionProfile = "chat"
 
 // sessionKindDM is the SessionRecord.Kind of a direct message, the one Slack
@@ -168,6 +171,10 @@ type Gateway struct {
 	taskSessions map[string]string
 	// relays holds per-task render state for the rolling progress line.
 	relays map[string]*relayState
+	// steerNoticesFrom is each addressee this gateway has heard a steer
+	// notice from since it started, under mu: the relay's evidence that the
+	// executor answers follow-ups at all (postSteerShortfall).
+	steerNoticesFrom map[string]bool
 
 	// backend names the gateway's configured chat backend, which is what a
 	// message that names none is attributed to. Since the mux and the side
@@ -410,6 +417,7 @@ func New(o Options) (*Gateway, error) {
 		sessionLocks:     map[string]*sessionLockEntry{},
 		taskSessions:     map[string]string{},
 		relays:           map[string]*relayState{},
+		steerNoticesFrom: map[string]bool{},
 		backend:          backend,
 		injectPM:         injectPM,
 		injectAudience:   injectAudience,
@@ -777,14 +785,6 @@ func (g *Gateway) routeTurn(ctx context.Context, msg InboundMessage, backend, pr
 	g.healActiveTask(ctx, rec)
 
 	active := rec.ActiveTask
-	// The status matcher's wide interrogative rule is only safe where a
-	// stolen steer costs nothing: a fixed-route executor (Hermes) refuses
-	// steers, a session worker absorbs them - so a session-addressed task
-	// gets the exact phrases only (see isStatusQuery). A detached task
-	// gets the exact phrases on either route: after a stop, the wide
-	// reading of "any update on the rollout" would steal a NEW task to
-	// replay a dead one, so the cost argument inverts there too.
-	wideStatus := !rec.AddressedToOwnSession() && !(active != nil && active.Detached)
 	// A slash command resolves before everything else (architecture 02,
 	// "Chat entrypoints"): it is not a status ask, not a stop, and never a
 	// steer. Text only - a programmatic cancel keeps its intent whatever
@@ -828,7 +828,7 @@ func (g *Gateway) routeTurn(ctx context.Context, msg InboundMessage, backend, pr
 		if !g.sessionCommand(ctx, rec, msg, backend, sessionRest, principal, authority) {
 			return
 		}
-	case msg.Intent == "" && active != nil && isStatusQuery(msg.Text, wideStatus):
+	case msg.Intent == "" && active != nil && isStatusQuery(msg.Text):
 		g.answerStatusByReplay(ctx, rec)
 	case stopping && msg.TaskID != "" && (active == nil || active.TaskID != msg.TaskID):
 		// A cancel that names a task the conversation no longer holds as
@@ -927,7 +927,15 @@ func (g *Gateway) routeTurn(ctx context.Context, msg InboundMessage, backend, pr
 				rec.Addressee = rec.BusSession
 			}
 		}
-		g.startTask(ctx, rec, msg, backend, principal, authority)
+		// The busy notice: counted once the task is on the bus, leaving the
+		// task itself out, and shown on the task's status line (showBusy).
+		// fixedRouteAhead answers false off the fixed route. Informational:
+		// the turn has already started either way.
+		if taskID := g.startTask(ctx, rec, msg, backend, principal, authority); taskID != "" {
+			if ahead, busy := g.fixedRouteAhead(ctx, rec, backend, taskID); busy {
+				g.showBusy(rec, taskID, ahead)
+			}
+		}
 	}
 
 	if err := withRetry(kvRetryAttempts, func() error { return g.reg.Put(ctx, rec) }); err != nil {
@@ -1127,8 +1135,8 @@ func (g *Gateway) healActiveTask(ctx context.Context, rec *SessionRecord) {
 		// that ran the heal then routes against the wake as its active task.
 		switch {
 		case child && healedTask != nil:
-			result, reason := healedChildOutcome(healedTask)
-			if woken, why := g.wakeSession(ctx, rec, ref, healedTask.State, result, reason); !woken {
+			turns, result, reason := healedChildOutcome(healedTask)
+			if woken, why := g.wakeSession(ctx, rec, ref, healedTask.State, turns, result, reason); !woken {
 				g.observeChildEnd(rec, ref, healedTask.State, healedSource, reason, why)
 			}
 		case child:
@@ -1227,17 +1235,47 @@ func (g *Gateway) runFoldedDelegate(ctx context.Context, rec *SessionRecord, rs 
 	g.handleDelegateRequest(ctx, rec, lib.TaskEventsSubject(addressee, taskID), taskID, art.Parts)
 }
 
-// healedChildOutcome is a healed child's result and reason as relayTerminal
-// hands them to wakeSession: the result artifact's text (the stand-in line
-// for a completed task with none) and the terminal message.
-func healedChildOutcome(task *lib.Task) (result, reason string) {
+// healedChildOutcome is a healed child's turns, result and reason as
+// relayTerminal hands them to wakeSession: the turn answers in turn order,
+// the result artifact's text (the stand-in line for a completed task with
+// none) and the terminal message.
+func healedChildOutcome(task *lib.Task) (turns []string, result, reason string) {
 	if art := task.Artifact(lib.ArtifactResult); art != nil {
 		result = joinTextParts(art.Parts)
 	}
 	if result == "" && task.State == lib.StateCompleted {
 		result = completedNonTextResult
 	}
-	return result, finalMessageText(task)
+	return turnAnswers(task), result, finalMessageText(task)
+}
+
+// turnAnswers is the text of a replayed task's turn artifacts, ordered by
+// the N in their artifact-<taskId>-turn-<N> ids; one without a readable N
+// keeps its stream place after those with one.
+func turnAnswers(task *lib.Task) []string {
+	type turn struct {
+		n    int
+		text string
+	}
+	var turns []turn
+	for _, a := range task.Artifacts {
+		if a.Name != lib.ArtifactTurn {
+			continue
+		}
+		n := math.MaxInt
+		if i := strings.LastIndex(a.ArtifactID, "-turn-"); i >= 0 {
+			if v, err := strconv.Atoi(a.ArtifactID[i+len("-turn-"):]); err == nil {
+				n = v
+			}
+		}
+		turns = append(turns, turn{n, joinTextParts(a.Parts)})
+	}
+	slices.SortStableFunc(turns, func(a, b turn) int { return cmp.Compare(a.n, b.n) })
+	texts := make([]string, len(turns))
+	for i, t := range turns {
+		texts[i] = t.text
+	}
+	return texts
 }
 
 // probeConversation is the ConversationProbe the gateway offers a ProbeSink:
@@ -1279,6 +1317,7 @@ func (g *Gateway) probeConversation(ctx context.Context, key, taskID string) (Co
 	if rec == nil {
 		return state, nil
 	}
+	state.ContextID = rec.ContextID
 	active := rec.ActiveTask
 	if taskID == "" {
 		if active == nil {
@@ -1950,15 +1989,17 @@ type taskStart struct {
 	LinkParent bool
 }
 
-// startTask opens a turn for a human message.
-func (g *Gateway) startTask(ctx context.Context, rec *SessionRecord, msg InboundMessage, backend, principal string, authority Authority) {
-	g.startTaskWith(ctx, rec, taskStart{
+// startTask opens a turn for a human message, and returns its task id once
+// the submission is on the bus, "" otherwise (startTaskWith).
+func (g *Gateway) startTask(ctx context.Context, rec *SessionRecord, msg InboundMessage, backend, principal string, authority Authority) string {
+	taskID, _ := g.startTaskWith(ctx, rec, taskStart{
 		Text:      msg.Text,
 		MessageID: msg.MessageID,
 		Principal: principal,
 		Requester: TaskRequester{Backend: backend, Subject: requesterSubject(g.ps, backend, msg.AuthorID)},
 		Authority: authority,
 	})
+	return taskID
 }
 
 // startTaskWith mints the identifiers, publishes the submission, and posts
@@ -2160,6 +2201,39 @@ func (g *Gateway) startTaskWith(ctx context.Context, rec *SessionRecord, ts task
 // noticeSteerNotSent tells the room a steer did not reach the running task.
 const noticeSteerNotSent = "⚠️ could not send that to the running task; it is still working on the original instruction"
 
+// The steer acknowledgements, one per route (spec-chatops-gateway.md,
+// "Gateway-authored posts"). The fixed-route wording is a product decision:
+// the platform agent queues a follow-up and answers it next, and a
+// refusal follows as its own notice on the stream, so this is the one place
+// it is spelled.
+const (
+	ackSteerQueued  = "✏️ got it, I'll take that next"
+	ackSteerSession = "✏️ steering sent — the worker picks it up at its next turn boundary if the task is still running"
+)
+
+// The relay's posts about follow-ups on the fixed route, from the
+// executor's steer notices and from what the relay counted at the terminal.
+const (
+	noticeSteerNotTaken = "⚠️ not taken: %s. Send it again after the answer."
+	noticeSteersUnrun   = "⚠️ %d queued follow-up(s) did not run before the task ended; send them again if they still matter"
+	noticeSteerMissed   = "⚠️ %d follow-up(s) arrived as the task finished and were not taken; send them again"
+)
+
+// steerRefusalWhy words an executor's refusal reason token for the room.
+// task-ended is absent on purpose: it is counted into noticeSteersUnrun at
+// the terminal. no-resume is the bridge's cli executor refusing a follow-up
+// as it arrives, since follow-ups run on the api executor only; it posts at
+// once, like the others. capability is
+// worded for both of its causes, because the bridge sends the one token for
+// a refusal and for a verifier it could not reach.
+var steerRefusalWhy = map[string]string{
+	lib.SteerReasonQueueFull:  "the task has already taken as many follow-ups as it runs",
+	lib.SteerReasonTaskEnding: "the task was already finishing",
+	lib.SteerReasonNoText:     "it had no text",
+	lib.SteerReasonCapability: "the task's capability check did not pass (refused, or the verifier could not be reached)",
+	lib.SteerReasonNoResume:   "this agent's executor can't continue a session, so follow-ups run on the api executor only",
+}
+
 // steerTask forwards a message that arrived while the task runs as a
 // follow-up on the same taskId — injected, absorbed at the executor's next
 // turn boundary (decided 8/24). It reuses the task's correlationId; the
@@ -2175,6 +2249,19 @@ func (g *Gateway) steerTask(ctx context.Context, rec *SessionRecord, msg Inbound
 	// the steer never arrived, and an author recorded for nothing costs at
 	// most a refused delegation.
 	author := TaskRequester{Backend: backend, Subject: requesterSubject(g.ps, backend, msg.AuthorID)}
+	// A delegated child runs on the target's executor, which acts on a steer,
+	// so its author is checked against the target's list as a
+	// delegation's are (gke-labs#2531 item 5). Before the author is recorded
+	// and before anything is published: a refused steer leaves no trace but
+	// the audit line and the target-only notice.
+	if ref, ok := rec.TaskRefFor(active.TaskID); ok && ref.Role == taskRoleChild {
+		if rule := g.authorRefusal(rec.Addressee, author, ruleDelegationChildSteer); rule != "" {
+			g.log.Warn("steer refused", "rule", rule, "taskId", active.TaskID, "conversation", rec.Key,
+				"addressee", rec.Addressee, "steerBackend", author.Backend, "steerAuthor", author.Subject)
+			g.post(rec.Key, noticeDelegationNotAllowed)
+			return
+		}
+	}
 	rec.recordSteerAuthor(active.TaskID, author)
 	if rec.AddressedToOwnSession() {
 		rec.addSessionAuthor(author)
@@ -2204,29 +2291,41 @@ func (g *Gateway) steerTask(ctx context.Context, rec *SessionRecord, msg Inbound
 		g.post(rec.Key, noticeSteerNotSent)
 		return
 	}
-	// Say what we know and no more: the steer is on the stream, and what
-	// happens next is the route's contract (spec: gateway-authored posts,
-	// amended 8/31) - a session worker absorbs at its next turn boundary if
-	// the task is still running; the fixed-route executor refuses mid-task
-	// input and publishes its refusal itself. Neither line claims the steer
-	// was absorbed, which the gateway cannot know. Both assume an executor
-	// holds the task, so a task with nothing on its stream gets neither: no
-	// executor has shown it took the task, which is a pod still starting or
-	// nothing at all, and the line promises no reply. A read that fails says
-	// nothing either way and keeps the route's line. The read is direct gets
-	// (taskStreamEmpty), not a replay, so a steer opens no consumer.
+	// The steer is on the stream, and what happens next is the route's
+	// contract (spec: gateway-authored posts): a session worker absorbs it at
+	// its next turn boundary if the task is still running; the fixed-route
+	// executor queues it and answers it as a further turn after the current
+	// one, and a follow-up it does not take (queue full, the task already
+	// ending) is corrected by its own notice on the stream. A task with
+	// nothing on its stream gets neither line: no executor has shown it took
+	// the task, which is a pod still starting or nothing at all, so no reply
+	// is promised. A read that fails keeps the route's line. The read is
+	// direct gets (taskStreamEmpty), not a replay, so a steer opens no
+	// consumer.
 	empty, emptyErr := g.taskStreamEmpty(ctx, rec.AddresseeFor(active.TaskID), active.TaskID)
-	switch {
-	case emptyErr == nil && empty:
+	noFirstEvent := emptyErr == nil && empty
+	if noFirstEvent {
 		ack := fmt.Sprintf(steerNoFirstEventAck, active.TaskID)
 		if !active.SubmittedAt.IsZero() {
 			ack += fmt.Sprintf(steerNoFirstEventRelease, g.cfg.FirstEventGrace)
 		}
 		g.post(rec.Key, ack)
-	case rec.AddressedToOwnSession():
-		g.post(rec.Key, "✏️ steering sent — the worker picks it up at its next turn boundary if the task is still running")
-	default:
-		g.post(rec.Key, "✏️ steering sent — the standing executor does not take mid-task input; its reply will say so")
+	}
+	if rec.AddressedToOwnSession() {
+		if !noFirstEvent {
+			g.post(rec.Key, ackSteerSession)
+		}
+		return
+	}
+	// The executor answers each follow-up with a steer notice; the relay
+	// counts what it was sent against what it heard, to tell the room about
+	// one it never answered.
+	rs := g.relayFor(active.TaskID)
+	g.mu.Lock()
+	rs.steersSent++
+	g.mu.Unlock()
+	if !noFirstEvent {
+		g.post(rec.Key, ackSteerQueued)
 	}
 }
 

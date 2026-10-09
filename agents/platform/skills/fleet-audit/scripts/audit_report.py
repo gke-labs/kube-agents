@@ -14909,6 +14909,14 @@ def handle_remediate(args: argparse.Namespace) -> None:
     # dry run would preview a body no run sends -- with or without `--repo`,
     # since without it the dry run still resolves the repository it previews.
     refusal_repo = _dry_run_repo(audit_id, opt_repo) if args.dry_run else repo_hint
+    # Each `remediate` call is a new process, so no step has decided the mode
+    # yet. `start` and `finish` decide it in `ensure_workspace`; this command
+    # reads it in the refusal below first. Decide it here from the endpoint
+    # alone, with no call to the broker: `detect_content_mode` answers False
+    # only when no endpoint is set, and True or a refusal when one is. Thus a
+    # dry run does not need the broker, and the real run still asks the broker
+    # in `ensure_workspace`, after the checks of the finding ids.
+    set_content_mode(bool(proxy_endpoint()))
     # Resolved once for the whole preview, as `_handle_finish_dry_run` does: a
     # failed read falls back to "pull request", so a lookup per group could
     # preview one group as a merge request and the next as a pull request.

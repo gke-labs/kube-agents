@@ -1,0 +1,1 @@
+{"protocol":"a2a-jetstream/0.4","envelopeId":"env-000000000000000000000000","correlationId":"agentprofile-auditor","ts":"2026-10-06T00:00:00Z","from":{"session":"operator","profile":"auditor"},"identity":null,"authority":null,"kind":"agent-card","payload":{"name":"auditor","description":"Read-only SRE scoped to one cluster."}}

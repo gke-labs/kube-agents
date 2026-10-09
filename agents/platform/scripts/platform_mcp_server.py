@@ -19,6 +19,11 @@ from datetime import datetime
 from mcp.server import MCPServer
 import sandbox_exec
 from agent_common_server import _run_env, CONFIG_PATH
+import chat_notify
+
+# send_notification gives `hermes send` no kill timeout, as before; a routed
+# send gets `a2a notify`'s own bound (chat_notify.subprocess_timeout).
+SEND_NOTIFICATION_TIMEOUT_SECONDS = None
 from cluster_agent_profile import (
     RESERVED_PROFILES,
     is_ready_profile,
@@ -846,6 +851,12 @@ def send_notification(message: str, session_id: str = "") -> str:
             if os.environ.get("GOOGLE_CHAT_PROJECT_ID") or os.environ.get("GOOGLE_CHAT_HOME_CHANNEL"):
                 platforms_found.append("google_chat")
 
+        # Under next the Hermes platform is off and the gateway posts for it
+        # (chat_notify.py); it is still where this install's posts go.
+        routed = chat_notify.routed_platform()
+        if routed and routed not in platforms_found:
+            platforms_found.append(routed)
+
         if not platforms_found:
             platforms_found.append("google_chat")
 
@@ -899,11 +910,19 @@ def send_notification(message: str, session_id: str = "") -> str:
             # the profiles on the data PVC and the gateway on loopback, and the
             # sandbox image does not carry the binary.
             res = subprocess.run(
-                ["hermes", "send", "--to", target, message],
-                capture_output=True, text=True, check=True, env=_run_env()
+                chat_notify.command(target, message, json_output=False),
+                capture_output=True, text=True, check=True, env=_run_env(),
+                timeout=chat_notify.subprocess_timeout(target, SEND_NOTIFICATION_TIMEOUT_SECONDS),
+                # This process's stdin is the MCP JSON-RPC pipe; a child that
+                # read it would swallow protocol frames.
+                stdin=subprocess.DEVNULL,
             )
             results.append(f"SUCCESS: Notification posted to {platform_name}. Output: {res.stdout.strip()}")
         except subprocess.CalledProcessError as e:
+            if chat_notify.outcome_unknown(e.returncode):
+                results.append(f"SUCCESS: Notification to {platform_name} may have posted "
+                               f"(the gateway did not answer in time); do not resend it.")
+                continue
             results.append(f"ERROR: Failed to send notification to {platform_name}: {e.stderr.strip()}")
         except Exception as e:
             results.append(f"ERROR: {platform_name}: {e}")

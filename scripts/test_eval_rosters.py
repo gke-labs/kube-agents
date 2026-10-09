@@ -164,6 +164,7 @@ ADDED_AFTER_THE_MOVE = [
     "upgrades-zonal-control-plane-outage-warned",  # upgrade-failure catalogue entry 11, the first scenario case
     "oobe-first-run-audits",  # the oobe job's first-run audits stage
     "chat-voice-answer-first",  # a delegated answer opens on its verdict
+    "observability-watcher-scrape-state",  # the event watcher's scrape state, #2141
     "chat-fanout-fleet-restarts-rows",  # a fleet question fanned out one titled card per cluster
     "backup-dr-cmek-selected-namespaces-probe",  # the gke-backup-dr skill sync
 ]

@@ -51,7 +51,7 @@ The exposed ports:
 
 `k8s-operator/config/` holds larger Kustomize bases the operator manager uses. Notable subtrees:
 
-- `config/crd/` — the `PlatformAgent` and `AgentPlugin` CRDs.
+- `config/crd/` — the `PlatformAgent`, `AgentPlugin` and `AgentProfile` CRDs.
 - `config/rbac/` — ClusterRoles + bindings for the manager.
 - `config/webhook/` — admission webhook config (validating + mutating). The Service targets port `10250` on the manager pod for the GKE firewall reason in [Admission webhooks](/kube-agents/operator/#admission-webhooks).
 - `config/manager/` — Deployment for the controller manager, plus its `PodDisruptionBudget`.

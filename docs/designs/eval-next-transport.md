@@ -338,9 +338,9 @@ webhooks (`a2a/docs/hermes-bridge.md`, "Activity"), one entry per invocation wit
 its input; the bridge's entries also carry the call's status, and the bridge alone publishes a
 `progress` heartbeat. `worker_commands` reads
 the kanban worker logs by card id; on
-this path it has data only once the case runner's delegation wait is rebuilt for it (Completion
-signals), and until then a case that gates on it has no data on stage 1 either. Neither is graded
-as a failure meanwhile: on this transport's record the scorer sets every `worker_commands` and
+this path it has data when the case runner's delegation wait finds the cards in the session store
+(Completion signals), and none when the wait falls back. Neither is graded
+as a failure here: on this transport's record the scorer sets every `worker_commands` and
 `worker_agents` entry aside as not applicable, and every `tool_called` entry too when the record
 carries no `a2a.activity` marker or a marker that reports a loss (calls the door's cap or the
 executor's budget dropped, a count or part it could not read, an input truncated with its nested
@@ -360,21 +360,23 @@ the chat profile's `kanban_create` — is a different matter:
 api lane's roster is untouched. The lane runs the bridge's shipped default executor, `api`, the
 one a customer install runs: `hack/ci-deploy.sh` leaves the operator's `A2A_BRIDGE_EXECUTOR`
 unset, so the rendered bridge carries no `BRIDGE_EXECUTOR` and picks `api` from the
-`API_SERVER_KEY` it copies from the agent container, and the deploy's start-line wait requires
+`API_SERVER_KEY` the operator sets on it, and the deploy's start-line wait requires
 `"executor":"api"`, which a bridge that fell back to `cli` for want of the key fails. Under `api`
 the turn runs under the pod's API server, whose profile is the chat path's own (`default` on a
 stock install), so the agent that answers a case on this lane is the one the chat path reaches
 ("What the lane grades" below). That does not return the exclusion's premise: the default
 profile may file the card, but the card's completion never reaches the A2A thread
-([`a2a/docs/hermes-bridge.md`](../../a2a/docs/hermes-bridge.md), "Executors"), and the graded
-answer gets the card's result only once the rebuilt wait lands (Completion signals), so the
-exclusion stays.
+([`a2a/docs/hermes-bridge.md`](../../a2a/docs/hermes-bridge.md), "Executors"). The delegation
+wait appends the card's result to the graded answer (Completion signals), but it reads that from
+the pod, not from the thread, so the exclusion stays.
 `ledger_issue_contains` finds the ledger by scanning the final message for a GitHub issue URL, so
 it works on any transport that maps a result into the final message, which both new transports
 do, and its grade depends on that mapping: the fleet-audit cases get the URL from the delegated
-worker's card result, which today's wait folds into the final message, so on this path it has
-the URL only once the rebuilt wait appends the delivered card results the same way, and until
-then it fails as a graded failure with no issue URL in the report, not as an error.
+worker's card result, which the delegation wait folds into the final message. On this path it
+has the URL when the wait finds the cards in the session store; when it does not (a door that
+reports no `contextId`, or a store whose first read fails three times running), it fails as a
+graded failure with no
+issue URL in the report, not as an error.
 
 **The executor is the Hermes persona through the bridge sidecar (decided 2026-09-17).** The
 session worker carries only the tool-less `chat` profile; running the platform persona as a
@@ -425,11 +427,12 @@ run creates (6 at 4 workers, 2 at 6; at 8 or more the floor cannot hold the rese
 value clamps to 1), computed from four constants the script copies from the operator and
 pins against it. The mode patch is the only patch, so no later render re-measures the budget
 against the stream the Job created. The rendered bridge carries the agent container's own
-environment, mounts, security context and resources, copied by the operator from the agent
-container it renders: the bridge's `cli` subprocess stands in for the `hermes chat -q` a kanban worker spawns
+environment, mounts and security context, copied by the operator from the agent
+container it renders (its resources are its own, sized for the `api` executor the lane runs, gke-labs/kube-agents#2748): the bridge's `cli` subprocess stands in for the `hermes chat -q` a kanban worker spawns
 inside the agent container, and that is the environment such a worker inherits; under the
-default `api` executor the same copy is what carries `API_SERVER_KEY` into the bridge, which is
-how the lane gets `api` without setting `A2A_BRIDGE_EXECUTOR`. The
+default `api` executor the operator sets `API_SERVER_KEY` on the bridge itself (the loopback
+bearer, not a copy, gke-labs/kube-agents#2753), which is how the lane gets `api` without setting
+`A2A_BRIDGE_EXECUTOR`. The
 operator adds `A2A_ACTIVITY_SECRET` from the creds Secret's `bridge-activity-key` itself. The one
 mount not carried is the projected bus token, the agent principal's credential. The
 third piece was decided the same day and is built: a look-ahead in the bridge's worker that
@@ -455,17 +458,21 @@ the request asks for one or for a change to be submitted or fixed; the unattende
 `fleet-audit`'s own path); the first run's 94.4% against 77.8% is withdrawn as a like-for-like
 comparison. The lane now runs the bridge's `api` executor, the default a customer install runs,
 so the turn is the API server's and the agent that answers is the Planning Agent, the one the api
-transport reaches. Three differences from the api lane remain, and all three are the transport's
-rather than the agent's. The delegation wait finds no card ids on this path (Completion signals), so a
-case whose answer is a delegated worker's report is graded on the Planning Agent's own reply,
-which may be the card receipt. And a router-scope `tool_called` reads the Planning Agent's calls
-through the door's trace, which carries no worker's calls. And the GitHub-write safeguard dates a
+transport reaches. The delegation wait reads the cards the turn filed from the Planning Agent's
+session store rather than from the trajectory (Completion signals), so a case whose answer is a
+delegated worker's report is graded on that report, as on the api lane. Two differences from the
+api lane remain, and both are the transport's rather than the agent's. A router-scope
+`tool_called` reads the Planning Agent's calls through the door's trace, which carries no worker's
+calls. And the GitHub-write safeguard dates a
 write rather than signing it, and keeps by-design writes apart by running requesting cases one at a
-time; a worker that opens its pull request after the task's terminal can land that write in the
-next unit's window, which charges the next unit for it
-([#2619](https://github.com/gke-labs/kube-agents/issues/2619),
-[#2611](https://github.com/gke-labs/kube-agents/issues/2611)). Read a block on a requesting
-case's later repetitions as transport until those are fixed. Parity in
+time. The delegation wait holds a case until the cards it filed are terminal, so a pull request
+the card's worker opens lands in its own case's window. What the wait does not follow is a
+worker's own fan-out, the child cards a worker files, nor a card still running when the case
+reaches the delegation ceiling or when the wait falls back; a write from one of those can land in
+the next unit's window and charge the next unit for it. Attributing each write to its case is
+[#2611](https://github.com/gke-labs/kube-agents/issues/2611)'s fix. Until it lands, read a block
+on a requesting case's later repetitions as transport when the earlier case fanned out or ended
+at the ceiling. Parity in
 [#2007](https://github.com/gke-labs/kube-agents/issues/2007) (phase 2) is this lane's record on
 `api` being acceptable per case and stable across the on-demand runs, not the api lane's numbers.
 Two things follow for the lane. A case that grades the delegation
@@ -579,23 +586,41 @@ ended and the card was filed, not that the work is done.
 
 Stage 1 handles that in three parts. The transport awaits the terminal of a named task id,
 "await the terminal of task X" rather than "await the task I submitted", for everything the
-executor does itself, which is most cases and removes the store reads and the collecting turn. For a terminal whose result
-names card ids, the case runner waits for the cards one hop further in, with the time cost above
+executor does itself, which is most cases and removes the store reads and the collecting turn. For a turn that
+filed cards, the case runner waits for the cards one hop further in, with the time cost above
 moved with it. Today's wait cannot be re-entered as it is: it is a method of the api transport
 that re-posts `/v1/responses`, takes card ids from `kanban_create` tool results and statuses from
 the kanban store or from `kanban_show` payloads in the trajectory, and gives up after three status
 turns that report nothing, and
 on this path the trajectory holds no tool results (the door's trace carries calls without their
-results), so no card id can be read from it. Stage 1
-writes the wait again for the inject path: card ids and statuses read from the `result` text, the
-status question sent as a new turn on the same conversation key with its own backend message
-id, `<run>/<case>/<rep>/status-<n>`, so the dedupe does not answer it with the opening task,
-the delivered card results appended to the graded answer as
-today's wait appends them, so `ledger_issue_contains` and `report_contains` see what the worker
-returned, and the worker logs read by those ids for `worker_commands`. It
+results), so no card id can be read from it. The reply text does not carry one either: the
+Planning Agent's acknowledgement names no task id (`agents/chat/SOUL.md`). Stage 1 writes the wait
+again for the inject path and reads the cards from the pod
+([#2619](https://github.com/gke-labs/kube-agents/issues/2619)). The door's read route reports the
+conversation's A2A `contextId`, and under the bridge's `api` executor the turn ran in the Hermes
+session `a2a-<contextId>` (`apiSessionID` in `a2a/hermes-bridge/api.go`). The case runner reads
+that session's `kanban_create` tool results from the platform agent's `state.db`, or, when the
+store kept none, the `kanban_notify_subs` rows addressed to the session, through the same
+`kubectl exec` the board read uses. It caps the cards at the harness's one cap, pending first,
+and polls `kanban.db` for their statuses until every card is terminal or the delegation timeout
+passes; a card the board has no row for on three reads in a row is dropped from the wait with a
+line on the record's errors, and nothing is graded for it. Then it reads `tasks.result` and the
+newest `task_runs.summary` of the cards the board shows terminal. No status turn is sent, because
+none could carry a result back through the door. Only a terminal card reaches the settle step,
+shaped as a `kanban_show` result, so the delivered card results are appended to the graded answer
+as today's wait appends them, `ledger_issue_contains` and `report_contains` see what the worker
+returned, and the worker logs are read by those ids for `worker_commands`. A card still running at
+the ceiling delivers nothing: whatever text it carries (an earlier run's summary, a stashed
+result) is not its answer, so the repetition is recorded at the ceiling and the card is only
+archived and purged. A door that reports no `contextId`, a session the store does not hold (the
+`cli` executor), or a first read of the store that fails three times running, before any card is
+found, falls back to the status-turn wait. That wait takes its card ids from the trajectory, which
+holds none on this path, so it settles at once on the reply and sends no status turn; the last of
+the three cases also puts a line on the record's errors. Once the wait has found the cards and is
+polling, three failed reads in a row end it differently: the repetition is classed as
+infrastructure, the awaited cards' state is purged, and nothing is graded. It
 lives in the case runner and not in the transport, so it can be deleted without touching the
-transport. Reading card ids out of `result` text is interim: a structured artifact for them is
-a bridge change outside this document, and the text read is the first thing child tasks delete.
+transport, and it is the first thing child tasks delete.
 When child tasks exist, the parent's events name the child's task id, the same await code awaits
 it, and the wait goes.
 

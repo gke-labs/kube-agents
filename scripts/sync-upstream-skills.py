@@ -5,11 +5,11 @@ The platform image build runs the shell blocks of every synced SKILL.md through
 deploy/docker/check_skill_commands.py, so a sync that brings in a command Tirith
 refuses, or changes any line of a block listed in its KNOWN_FINDINGS, comments
 included, fails that build until the list is updated. So does a shell block whose Markdown does not parse as one; that
-fix goes in SKILL_SUBSTITUTIONS below.
+fix goes in SKILL_SUBSTITUTIONS below, or in a patch for a skill with an upstream.lock.
 
-docs/designs/upstream-skill-overlays.md is the design, not yet implemented, for
-replacing the string registries below with a pinned upstream copy and a patch
-overlay per skill.
+Skills with an upstream.lock under agents/platform/skill-overlays/ are mirrored by
+scripts/skill_overlay.py (docs/designs/upstream-skill-overlays.md) and skipped here;
+the rest are still synced from the registries below.
 """
 
 import os
@@ -36,6 +36,14 @@ SKILL_AGENT_OVERRIDES = {
 }
 
 SKILL_MD_FILENAME = "SKILL.md"
+
+# A skill whose overlay holds this lock is mirrored by scripts/skill_overlay.py instead
+# (docs/designs/upstream-skill-overlays.md). This script skips it: no prune, no copy, and a
+# registry entry for it is an error. Its changes live as patch files beside the lock.
+SKILL_OVERLAY_ROOT = os.path.join("agents", "platform", "skill-overlays")
+SKILL_OVERLAY_LOCK = "upstream.lock"
+# Where an overlay-mirrored skill is generated; the recovery pathspecs exclude it.
+SKILL_OVERLAY_SKILLS = "agents/platform/skills"
 UTF_8_ENCODING = "utf-8"
 SUBSTITUTION_COUNT = 1
 
@@ -176,29 +184,6 @@ GKE_BASICS_NEW_CREDENTIALS_SNIPPET = """4. **Cluster Credentials:**
      gcloud container clusters get-credentials "$CLUSTER" --location="$LOCATION" --project="$PROJECT" --quiet
      ```"""
 
-# gke-workload-troubleshooting's Step 5 upstream ends every crashloop walk by opening a pull
-# request, unconditionally ("do not wait for human merge"). This repository's platform persona
-# opens one only when the request asked for the fix (agents/platform/SOUL.md §3, item 3: a request to
-# investigate or report gets the manifest in the reply); under the A2A bridge the persona reads the
-# user's request directly and loads this skill for exactly that walk, so the unconditional step
-# re-created the write the persona's rule forbids (#2037). The replacement conditions item 3 on the
-# request and adds item 4 for the diagnostic case.
-GKE_WORKLOAD_TROUBLESHOOTING_OLD_STEP5_SUBMIT_SNIPPET = """3.  Check if a branch or Pull Request (PR) already exists for this
-    workload/failure. If so, update the existing branch/PR or notify the user
-    instead of creating a duplicate. Otherwise, create a branch, commit the
-    change, open a Pull Request (PR) on GitHub, and conclude the workflow (do
-    not wait for human merge)."""
-
-GKE_WORKLOAD_TROUBLESHOOTING_NEW_STEP5_SUBMIT_SNIPPET = """3.  If the request asked for the fix to be submitted or applied ("fix it",
-    "open a PR", a card whose task says so), check whether a branch or Pull
-    Request (PR) already exists for this workload/failure. If so, update the
-    existing branch/PR or notify the user instead of creating a duplicate.
-    Otherwise, create a branch, commit the change, open a Pull Request (PR) on
-    GitHub, and conclude the workflow (do not wait for human merge).
-4.  If the request asked you to investigate, diagnose or report, the manifest
-    from step 2 goes in your reply as a recommendation and the pull request is
-    one message away; do not open one (`SOUL.md` §3, item 3)."""
-
 # gke-manifest-generation's grounding step upstream prefers Developer Knowledge's `answer_query`,
 # whose default quota is 50 requests per day per project (developers.google.com/knowledge/quota),
 # shared by every agent in an install; once spent, every lookup 429s for the rest of the day.
@@ -291,12 +276,6 @@ SKILL_SUBSTITUTIONS = {
         (
             GKE_BASICS_OLD_CREDENTIALS_SNIPPET,
             GKE_BASICS_NEW_CREDENTIALS_SNIPPET,
-        ),
-    ],
-    "gke-workload-troubleshooting": [
-        (
-            GKE_WORKLOAD_TROUBLESHOOTING_OLD_STEP5_SUBMIT_SNIPPET,
-            GKE_WORKLOAD_TROUBLESHOOTING_NEW_STEP5_SUBMIT_SNIPPET,
         ),
     ],
     "gke-backup-dr": [
@@ -477,6 +456,14 @@ def abort(message):
     sys.exit(1)
 
 
+def overlay_mirrored_skills(repo_root):
+    """Names of the skills scripts/skill_overlay.py mirrors, which this script leaves alone."""
+    root = os.path.join(repo_root, SKILL_OVERLAY_ROOT)
+    if not os.path.isdir(root):
+        return set()
+    return {name for name in os.listdir(root) if os.path.isfile(os.path.join(root, name, SKILL_OVERLAY_LOCK))}
+
+
 def target_agents():
     """Every agent directory this script writes into, as directory names."""
     return sorted(
@@ -484,35 +471,37 @@ def target_agents():
     )
 
 
-def written_pathspecs():
+def written_pathspecs(repo_root):
     """Git pathspecs covering everything this script writes, and nothing else.
 
     A recovery instruction is only safe if it names what the run could have touched. The sync
     writes prefixed skills under the target agents and nowhere else: `agents/cluster/skills/gke-*`
     is maintained in this repository rather than synced, and the unprefixed skills beside the
     synced ones under a target agent are too, so a pathspec one level broader than this discards
-    uncommitted work no run of this script could have produced.
+    uncommitted work no run of this script could have produced. A skill with an overlay lock is
+    excluded: scripts/skill_overlay.py writes it, and this script skips it.
     """
-    return [f"agents/{agent}/skills/{SKILL_PREFIX}*" for agent in target_agents()]
+    included = [f"agents/{agent}/skills/{SKILL_PREFIX}*" for agent in target_agents()]
+    excluded = [
+        f":(exclude){SKILL_OVERLAY_SKILLS}/{name}" for name in sorted(overlay_mirrored_skills(repo_root))
+    ]
+    return included + excluded
 
 
-def local_correction_lost_message(detail):
+def local_correction_lost_message(detail, repo_root):
     """The operator-facing text for a backstop failure, recovery commands included.
 
     Separate from the handler that prints it because the pre-flight makes the handler
     unreachable from a fixture: the only way to read what an operator would be told to run is
     to call this.
     """
-    recovery = "".join(
-        f"  git checkout -- '{pathspec}'\n  git clean -fd '{pathspec}'\n"
-        for pathspec in written_pathspecs()
-    )
+    pathspecs = " ".join(f"'{pathspec}'" for pathspec in written_pathspecs(repo_root))
     return (
         f"\nError: Synchronization aborted. {detail}\n"
         "The clone and the copy made from it disagree, which should not happen. Skills copied "
         "before this point are already written, and a copy adds untracked files as well as "
-        "modifying tracked ones, so discarding them takes all of:\n"
-        f"{recovery}"
+        "modifying tracked ones, so discarding them takes both of:\n"
+        f"  git checkout -- {pathspecs}\n  git clean -fd -- {pathspecs}\n"
         "Those pathspecs are everything this script writes; run nothing broader, because the "
         "skills beside them are maintained in this repository and the sync never touched them."
     )
@@ -580,7 +569,7 @@ def substitute(content, pairs):
     return content, problems
 
 
-def verify_local_corrections(upstream_skills_dir, discovered_skills):
+def verify_local_corrections(upstream_skills_dir, discovered_skills, skip=frozenset()):
     """Check every registered correction against the clone before anything is written.
 
     The sync rmtree's each destination before copying, so a correction found unappliable
@@ -598,6 +587,13 @@ def verify_local_corrections(upstream_skills_dir, discovered_skills):
         ("SKILL_FOOTERS", SKILL_FOOTERS),
     ):
         for skill_name in sorted(registry):
+            if skill_name in skip:
+                problems.append(
+                    f"{registry_name}[{skill_name!r}]: this skill has an {SKILL_OVERLAY_LOCK} and is "
+                    f"mirrored by scripts/skill_overlay.py, so the entry never applies. Record the "
+                    f"change as a patch (make skills-refresh) and drop the entry."
+                )
+                continue
             if skill_name not in discovered:
                 problems.append(
                     f"{registry_name}[{skill_name!r}]: upstream no longer ships this skill "
@@ -750,22 +746,32 @@ def main():
             for name in discovered_skills:
                 print(f"  - {name}")
 
+            mirrored_elsewhere = overlay_mirrored_skills(repo_root)
+            if mirrored_elsewhere:
+                print(f"\nSkipping {len(mirrored_elsewhere)} skill(s) mirrored by scripts/skill_overlay.py "
+                      f"(they have an {SKILL_OVERLAY_LOCK}):")
+                for name in sorted(mirrored_elsewhere):
+                    print(f"  - {name}")
+
             # Nothing below this line is reversible without git, so every registered local
             # correction is checked against the clone first.
-            verify_local_corrections(upstream_skills_dir, discovered_skills)
+            verify_local_corrections(upstream_skills_dir, discovered_skills, skip=mirrored_elsewhere)
 
             # Prune obsolete local skill directories that were renamed/removed upstream
             for agent in target_agents():
                 agent_skills_dir = os.path.join(repo_root, "agents", agent, "skills")
                 if os.path.isdir(agent_skills_dir):
                     for local_name in sorted(os.listdir(agent_skills_dir)):
-                        if local_name.startswith(SKILL_PREFIX) and local_name not in discovered_skills:
+                        if (local_name.startswith(SKILL_PREFIX) and local_name not in discovered_skills
+                                and local_name not in mirrored_elsewhere):
                             stale_path = os.path.join(agent_skills_dir, local_name)
                             print(f"Removing obsolete upstream skill: agents/{agent}/skills/{local_name}...")
                             shutil.rmtree(stale_path)
                 
             print("\nSyncing skills...")
             for skill_name in discovered_skills:
+                if skill_name in mirrored_elsewhere:
+                    continue
                 src_skill_path = os.path.join(upstream_skills_dir, skill_name)
                 agents = SKILL_AGENT_OVERRIDES.get(skill_name, DEFAULT_TARGET_AGENTS)
                 
@@ -793,11 +799,11 @@ def main():
 
             print("\nSynchronization complete!")
     except LocalCorrectionLost as e:
-        abort(local_correction_lost_message(e))
+        abort(local_correction_lost_message(e, repo_root))
     except UpstreamDriftError as e:
         abort(
-            f"\nError: Synchronization aborted, nothing written. Upstream has moved away from "
-            f"corrections this repository registers:\n{e}\n"
+            f"\nError: Synchronization aborted, nothing written. Corrections this repository "
+            f"registers can no longer be applied as written:\n{e}\n"
             f"Update the entries in {os.path.basename(__file__)} and re-run."
         )
     except subprocess.CalledProcessError:

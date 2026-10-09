@@ -481,15 +481,21 @@ class FlagSetIsNextTest(unittest.TestCase):
         self.assertIn('"executor", b.cfg.Executor)', text(_BRIDGE_GO))
         self.assertEqual(consts["BRIDGE_CONSUMING_LOG_EXECUTOR"], f'"executor":"{consts["BRIDGE_EXECUTOR_EXPECTED"]}"')
         # Why the default is api on this lane: unset, the bridge picks api when
-        # it carries the pod's API server key, and the rendered bridge copies the
-        # agent container's env without dropping that key. The Go tests hold the
-        # behaviour (TestBridgeExecutorDefault in a2a/cmd/hermes-bridge, and the
-        # rendered-bridge tests in the operator); these pin the names they rely on.
+        # it carries the pod's API server key, and the operator sets that key on
+        # the rendered bridge itself (the loopback bearer), rather than copying
+        # the agent's, so no plugin env can switch it to cli (#2753). The Go
+        # tests hold the behaviour (TestBridgeExecutorDefault in
+        # a2a/cmd/hermes-bridge, and TestAPluginsAPIServerKeyDoesNotReachTheBridge
+        # in the operator); these pin the names they rely on.
         self.assertEqual(go_constant(_BRIDGE_MAIN, "apiServerKeyEnv"), go_constant(_A2A_MANIFESTS, "a2aBridgeAPIServerKeyEnvVar"))
-        dropped = text(_A2A_BRIDGE)
-        dropped = dropped[dropped.index("var a2aBridgeDroppedAgentEnv") :]
-        dropped = dropped[: dropped.index("\n}\n")]
-        self.assertNotIn("a2aBridgeAPIServerKeyEnvVar", dropped, "the rendered bridge must keep the agent's API_SERVER_KEY")
+        own = text(_A2A_BRIDGE)
+        own = own[own.index("func a2aBridgeOwnEnv") :]
+        own = own[: own.index("\n}\n")]
+        self.assertIn(
+            "{Name: a2aBridgeAPIServerKeyEnvVar, Value: loopbackAgentAPIKey}",
+            own,
+            "the rendered bridge must carry the API server key, or it falls back to cli",
+        )
         self.assertIn(
             '| grep -F "${BRIDGE_CONSUMING_LOG_MSG}" | grep -F "${BRIDGE_CONSUMING_LOG_PROFILE}" | grep -F "${BRIDGE_CONSUMING_LOG_EXECUTOR}" |',
             text(_CI_DEPLOY),

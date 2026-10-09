@@ -23,6 +23,7 @@ import logging
 
 from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException
 from agent_common_server import _run_env, CONFIG_PATH, DOTENV_PATH
+import chat_notify
 import findings_queue
 import slack_audit_report
 import slack_blocks_post
@@ -1087,6 +1088,13 @@ def enabled_chat_platforms() -> list[str]:
        than dropped because it is the truth on the installs that do write it.
     3. The environment signals above, for an install neither file describes.
 
+    One thing outranks all three: the platform the operator names in
+    ``A2A_NOTIFY_PLATFORM`` (chat_notify.py). Under ``spec.mode: next`` the
+    managed scope says that platform's Hermes consumer is off because the A2A
+    gateway holds the backend, and posts to it go through the gateway instead,
+    so it is still a platform this install posts to. The operator renders the
+    variable only then, and it is reserved against every other source.
+
     Never returns an empty list — an install that resolves to nothing gets
     DEFAULT_CHAT_PLATFORM.
 
@@ -1124,7 +1132,13 @@ def enabled_chat_platforms() -> list[str]:
 
     resolved = []
     for name in CHAT_PLATFORMS:
-        if name in from_managed:
+        # Under next the managed scope says the Hermes platform is off, because
+        # the A2A gateway holds the backend; posts to it go through the
+        # gateway's chat.notify route instead (chat_notify.py), so it is
+        # still a platform this install posts to.
+        if chat_notify.routes(name):
+            enabled = True
+        elif name in from_managed:
             enabled = from_managed[name]
         elif name in from_profile:
             enabled = from_profile[name]
@@ -1168,8 +1182,10 @@ def get_active_platform(platforms: Optional[list[str]] = None) -> str:
     return platforms[0]
 
 
-#: Returned by :func:`_post_initial_alert` when `hermes send` reported success
-#: but no message id could be read out of its `--json` stdout. Distinct from
+#: Returned by :func:`_post_initial_alert` when the send (`hermes send`, or
+#: `a2a notify` under next) reported success but no message id could be read
+#: out of its JSON stdout, or when `a2a notify` reported that the gateway took
+#: the request and did not answer in time. Distinct from
 #: `None`, which means the send itself failed. The caller must not try the next
 #: platform on this one: the alert IS in the first platform's channel, and
 #: falling through would post it a second time somewhere else. Deliberately not
@@ -1177,31 +1193,47 @@ def get_active_platform(platforms: Optional[list[str]] = None) -> str:
 ALERT_SENT_WITHOUT_THREAD = "\x00alert-sent-without-thread"
 
 
-def _post_initial_alert(active_platform: str, alert_msg: str) -> str | None:
-    """Send initial warning alert via hermes CLI and return the thread/message ID.
+def _run_alert_send(active_platform: str, alert_msg: str) -> subprocess.CompletedProcess:
+    """Run the alert's send, waiting out a gateway route that is briefly not there.
 
-    Three outcomes, not two: a thread id, `None` when the send failed, and
-    :data:`ALERT_SENT_WITHOUT_THREAD` when it succeeded and the id could not be
-    parsed. The route's own docstring names that third case as one that has
+    The alert has one shot, so `a2a notify`'s "route unavailable" (a gateway
+    roll, or its bind retry) is retried on chat_notify's schedule rather than
+    dropping the alert; every other outcome is the caller's to read.
+    """
+    delays = chat_notify.NOTIFY_ROUTE_RETRY_DELAYS_SECONDS if chat_notify.routes(active_platform) else ()
+    for delay in (*delays, None):
+        try:
+            return subprocess.run(
+                chat_notify.command(active_platform, alert_msg),
+                check=True,
+                capture_output=True,
+                text=True,
+                stdin=subprocess.DEVNULL,
+                env=_run_env()
+            )
+        except subprocess.CalledProcessError as exc:
+            if delay is None or not chat_notify.route_unavailable(exc.returncode):
+                raise
+            logger.warning(f"Alert to '{active_platform}': the gateway's route is not there; retrying in {delay}s")
+            time.sleep(delay)
+    raise AssertionError("unreachable: the last attempt returns or raises")
+
+
+def _post_initial_alert(active_platform: str, alert_msg: str) -> str | None:
+    """Send the initial warning alert and return the thread/message ID.
+
+    Posts with `hermes send`, or with `a2a notify` for the platform the A2A
+    gateway holds under next (chat_notify.py). Three outcomes, not two: a thread
+    id, `None` when the send failed, and :data:`ALERT_SENT_WITHOUT_THREAD` when
+    it succeeded (or may have) and the id could not be read. The route's own docstring names that third case as one that has
     happened here, and it is the one where a retry does damage rather than good.
     """
     try:
-        res = subprocess.run(
-            ["hermes", "send", "--json", "--to", active_platform, alert_msg],
-            check=True,
-            capture_output=True,
-            text=True,
-            env=_run_env()
-        )
+        res = _run_alert_send(active_platform, alert_msg)
         resp = json.loads(res.stdout)
         msg_id = resp.get("message_id", "")
         if msg_id:
-            # Google Chat message IDs contain space and message parts; we extract the thread key.
-            if active_platform == "google_chat" and "/messages/" in msg_id:
-                space_part, msg_part = msg_id.split("/messages/", 1)
-                thread_key = msg_part.split(".")[0]
-                return f"{space_part}/threads/{thread_key}"
-            return msg_id
+            return chat_notify.thread_from_response(active_platform, resp)
         # Sent, but unaddressable. Say which, so the caller does not re-send.
         logger.error(
             f"Alert posted to '{active_platform}' but its response carried no message id; "
@@ -1209,6 +1241,11 @@ def _post_initial_alert(active_platform: str, alert_msg: str) -> str | None:
         )
         return ALERT_SENT_WITHOUT_THREAD
     except subprocess.CalledProcessError as exc:
+        if chat_notify.outcome_unknown(exc.returncode):
+            # The gateway took the request and did not answer in time: the
+            # alert may well be in the channel, so it must not be sent again.
+            logger.error(f"Alert to '{active_platform}' got no answer in time; treating it as sent. Stderr: {exc.stderr}")
+            return ALERT_SENT_WITHOUT_THREAD
         logger.error(f"Failed to post warning alert. Stdout: {exc.stdout}. Stderr: {exc.stderr}. Exc: {exc}")
     except Exception as exc:
         logger.error(f"Failed to post warning alert or parse message_id response: {exc}")
@@ -2620,8 +2657,9 @@ def _send_to_chat(
 ) -> str | None:
     """Post `message`, into an existing thread when one is known, within `timeout` seconds if given.
 
-    Returns the thread id to route replies to, or None if the send failed.
-    Generalises _post_initial_alert's target handling: `hermes send --to` takes
+    Returns the thread id to route replies to, None if the send failed, or
+    :data:`ALERT_SENT_WITHOUT_THREAD` when a fresh post succeeded (or, exit 3,
+    may have) with no thread to read. Generalises _post_initial_alert's target handling: `hermes send --to` takes
     `<platform>:<chat>:<thread>` for a threaded reply, which is the same target
     shape send_notification builds in platform_mcp_server.py.
     """
@@ -2630,15 +2668,26 @@ def _send_to_chat(
     if threaded:
         target = f"{active_platform}:{chat_id}:{thread_id}"
     try:
+        # A deadline shorter than the CLI's own wait is passed down to it, so it
+        # answers (exit 3) before this kills it.
+        wait = None
+        if timeout is not None and chat_notify.routes(active_platform):
+            wait = max(1, timeout - chat_notify.NOTIFY_CONNECT_SECONDS)
         res = subprocess.run(
-            ["hermes", "send", "--json", "--to", target, message],
+            chat_notify.command(target, message, wait_seconds=wait),
             check=True,
             capture_output=True,
             text=True,
+            stdin=subprocess.DEVNULL,
             env=_run_env(),
             timeout=timeout,
         )
     except subprocess.CalledProcessError as exc:
+        if chat_notify.outcome_unknown(exc.returncode):
+            # May have posted. A reply into a known thread keeps that thread,
+            # as a success does; a fresh post has no thread to register.
+            logger.warning(f"Relayed report to {target} got no answer in time; treating it as sent")
+            return thread_id if threaded else ALERT_SENT_WITHOUT_THREAD
         logger.error(f"Failed to post relayed report to {target}. Stderr: {exc.stderr}")
         return None
     except Exception as exc:
@@ -2650,16 +2699,15 @@ def _send_to_chat(
     if threaded:
         return thread_id
     try:
-        msg_id = (json.loads(res.stdout) or {}).get("message_id", "")
+        resp = json.loads(res.stdout) or {}
     except Exception as exc:
-        logger.error(f"Failed to parse message_id from hermes send: {exc}")
+        logger.error(f"Failed to parse message_id from the send: {exc}")
         return None
-    if not msg_id:
+    if not isinstance(resp, dict) or not resp.get("message_id"):
+        # A send that printed something other than an object landed nowhere
+        # this caller can address; it must not raise into the relay loop.
         return None
-    if active_platform == "google_chat" and "/messages/" in msg_id:
-        space_part, msg_part = msg_id.split("/messages/", 1)
-        return f"{space_part}/threads/{msg_part.split('.')[0]}"
-    return msg_id
+    return chat_notify.thread_from_response(active_platform, resp) or None
 
 
 # Tokens that end a turn or open a role in a chat template. None of them has a
@@ -3157,6 +3205,10 @@ def relay_cron_report(
         else:
             leg_message = truncation_notice + headline.text if headline else message
             new_thread_id = _send_to_chat(platform, leg_message, leg_chat_id, leg_thread_id)
+            if new_thread_id == ALERT_SENT_WITHOUT_THREAD:
+                # Posted (or may have): delivered, with no thread to register.
+                unthreaded.append(platform)
+                new_thread_id = None
         # Nothing is posted under the headline: every headline links the ledger
         # issue, and the incident row stored below keeps the full report for a
         # reply in the thread.
@@ -3168,6 +3220,11 @@ def relay_cron_report(
                 f"so replies are not routed"
             )
             unthreaded.append(platform)
+        elif platform in unthreaded:
+            logger.warning(
+                f"Relay for {profile}/{job_id}: report to {platform} got no answer in time; "
+                f"treated as delivered, with no thread to register"
+            )
         else:
             logger.error(
                 f"Relay for {profile}/{job_id}: report composed but not delivered to {platform}"

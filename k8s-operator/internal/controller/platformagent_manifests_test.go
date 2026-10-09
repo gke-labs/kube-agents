@@ -18,6 +18,7 @@ package controller
 
 import (
 	"fmt"
+	"maps"
 	"os"
 	"path"
 	"path/filepath"
@@ -155,9 +156,14 @@ func TestBuildConfigMap(t *testing.T) {
 	// them has to reach the sandbox over ssh, and the managed scope is the only
 	// place that binds all of them. Its profile-shaped leaf, `terminal.cwd`, is
 	// the one renderConfigYAML deliberately leaves out.
+	//
+	// `kanban:` is not on it either, for the same reason in a narrower form. The
+	// board is shared by every profile, so its worker cap is pinned here; the rest of
+	// the block is the gateway's home profile's own.
+	// TestMaxInProgressIsPinnedInTheManagedScope holds the block to that one leaf.
 	for _, forbidden := range []string{
 		"mcp_servers:", "platform_toolsets:", "toolsets:", "disabled_toolsets:",
-		"environment_probe:", "kanban:", "memory:", "plugins:",
+		"environment_probe:", "memory:", "plugins:",
 		"leader_election:", "web:",
 	} {
 		if strings.Contains(yamlContent, forbidden) {
@@ -5263,39 +5269,63 @@ func TestDefaultTuningReachesTheDefaultOverlayOnly(t *testing.T) {
 	}
 }
 
-// spec.harness.tuning.maxInProgress travels the same road, and only when the CR sets it:
-// an unset one must leave agents/chat/config.yaml's cap in force rather than have the
-// operator restate the same number on every reconcile.
-func TestMaxInProgressReachesTheDefaultOverlay(t *testing.T) {
-	if got := buildConfigMapData(newTestPlatformAgent(), nil)[profileOverlayKey(defaultProfileName)]; strings.Contains(got, "max_in_progress") {
-		t.Errorf("an untuned CR must not render a cap, got:\n%s", got)
+// spec.harness.tuning.maxInProgress is pinned in the managed scope, always: the CR's value,
+// or defaultKanbanMaxInProgress when it says nothing.
+//
+// It used to ride the default profile's overlay, and only when the CR set it, deferring the
+// untuned case to agents/chat/config.yaml. That left the cap to whatever the agent's own
+// config.yaml already held: the image template reaches an existing volume only for missing
+// keys, so a volume seeded at 2 kept 2 after the operator's default rose to 6, and an override
+// set and then removed left its value behind. A managed-scope leaf is applied over the
+// persisted config on every load, so neither history matters.
+func TestMaxInProgressIsPinnedInTheManagedScope(t *testing.T) {
+	managedCap := func(t *testing.T, agent *agentv1alpha1.PlatformAgent) any {
+		t.Helper()
+		var managed map[string]any
+		if err := yaml.Unmarshal([]byte(buildConfigMapData(agent, nil)[managedConfigKey]), &managed); err != nil {
+			t.Fatalf("unmarshal managed scope: %v", err)
+		}
+		kanban, ok := managed["kanban"].(map[string]any)
+		if !ok {
+			t.Fatalf("the managed scope carries no kanban block, got:\n%v", managed)
+		}
+		if len(kanban) != 1 {
+			// Only the cap is board-wide. The rest of the block (tick, wake set, stale
+			// timeout) belongs to whichever profile the gateway is homed at.
+			t.Errorf("the managed scope must pin kanban.max_in_progress alone, got %v", kanban)
+		}
+		return kanban["max_in_progress"]
 	}
 
-	eight := 8
-	if eight == defaultKanbanMaxInProgress {
-		t.Fatalf("test value %d must differ from the image's default to prove the override", eight)
-	}
-	agent := agentWithTuning(&agentv1alpha1.TuningSpec{MaxInProgress: &eight})
-
-	var overlay map[string]any
-	if err := yaml.Unmarshal([]byte(buildConfigMapData(agent, nil)[profileOverlayKey(defaultProfileName)]), &overlay); err != nil {
-		t.Fatalf("unmarshal default overlay: %v", err)
-	}
-	kanban, _ := overlay["kanban"].(map[string]any)
-	if fmt.Sprint(kanban["max_in_progress"]) != "8" {
-		t.Errorf("max_in_progress = %v, want 8", kanban["max_in_progress"])
+	if got := managedCap(t, newTestPlatformAgent()); fmt.Sprint(got) != fmt.Sprint(defaultKanbanMaxInProgress) {
+		t.Errorf("untuned max_in_progress = %v, want the operator default %d", got, defaultKanbanMaxInProgress)
 	}
 
-	// Raising the cap and lowering it must both work — a one-sided test would pass even
-	// if the render silently took the minimum of the CR and the image's default.
-	one := 1
-	lowered := agentWithTuning(&agentv1alpha1.TuningSpec{MaxInProgress: &one})
-	if err := yaml.Unmarshal([]byte(buildConfigMapData(lowered, nil)[profileOverlayKey(defaultProfileName)]), &overlay); err != nil {
-		t.Fatalf("unmarshal default overlay: %v", err)
+	// Raising the cap and lowering it must both work: a one-sided test would pass even if
+	// the render silently took the minimum or the maximum of the CR and the default.
+	for _, want := range []int{8, 1} {
+		if want == defaultKanbanMaxInProgress {
+			t.Fatalf("test value %d must differ from the default to prove the override", want)
+		}
+		agent := agentWithTuning(&agentv1alpha1.TuningSpec{MaxInProgress: ptr.To(want)})
+		if got := managedCap(t, agent); fmt.Sprint(got) != fmt.Sprint(want) {
+			t.Errorf("max_in_progress = %v, want the CR's %d", got, want)
+		}
 	}
-	kanban, _ = overlay["kanban"].(map[string]any)
-	if fmt.Sprint(kanban["max_in_progress"]) != "1" {
-		t.Errorf("max_in_progress = %v, want 1", kanban["max_in_progress"])
+}
+
+// The cap has exactly one route. A copy in the default profile's overlay as well would be
+// merged into the agent's config.yaml and then overruled by the pin, which is the
+// "nothing the operator renders may appear in both" rule buildConfigMapData states. The
+// overlay record would also outlive the CR field, as the old route's did.
+func TestMaxInProgressIsNotInTheDefaultOverlay(t *testing.T) {
+	for name, agent := range map[string]*agentv1alpha1.PlatformAgent{
+		"untuned": newTestPlatformAgent(),
+		"tuned":   agentWithTuning(&agentv1alpha1.TuningSpec{MaxInProgress: ptr.To(8), Default: limits(3, 40)}),
+	} {
+		if got := buildConfigMapData(agent, nil)[profileOverlayKey(defaultProfileName)]; strings.Contains(got, "max_in_progress") {
+			t.Errorf("%s: the default overlay must not carry the cap, got:\n%s", name, got)
+		}
 	}
 }
 
@@ -5325,16 +5355,15 @@ func TestRenderConfigYAMLNoTuningLeavesHermesDefaults(t *testing.T) {
 	}
 }
 
-// Dispatch concurrency is capped, and the cap is the image's.
+// Dispatch concurrency is capped even without the operator.
 //
 // Upstream leaves it unbounded, which lets a burst of queued cards spawn one full agent
 // process per card until the cgroup OOM killer takes them — a failure that produces no
-// container restart and no Kubernetes event, only a stranded card. The operator used to
-// render the cap; it no longer can (the managed scope is machine-global and kanban is
-// profile-shaped), so agents/chat/config.yaml carries the untuned default and this test
-// is what keeps it there. spec.harness.tuning.maxInProgress overrides it through the
-// default profile's overlay — see TestMaxInProgressReachesTheDefaultOverlay — and this
-// number must stay equal to defaultKanbanMaxInProgress, which that test compares against.
+// container restart and no Kubernetes event, only a stranded card. On an operator install
+// the managed scope pins the cap (TestMaxInProgressIsPinnedInTheManagedScope), so the
+// image's line is what applies only where the image runs without the operator. It must
+// still be there, and it must equal defaultKanbanMaxInProgress, so the two kinds of
+// install run the same board.
 //
 // wake_on_events is asserted here too. The front door is woken for a follow-up turn only
 // by terminal events it can act on; `completed` is not one of them, because the notifier
@@ -5356,7 +5385,7 @@ func TestChatConfigCapsTheBoardAndWakesOnFailuresOnly(t *testing.T) {
 
 	cap, ok := kanban["max_in_progress"]
 	if !ok {
-		t.Fatalf("%s must cap max_in_progress — nothing else does now; got kanban block %v", path, kanban)
+		t.Fatalf("%s must cap max_in_progress — nothing else caps an install without the operator; got kanban block %v", path, kanban)
 	}
 	// A 0 would be worse than no key at all: Hermes ignores anything below 1, so the
 	// file would read as a capped board while behaving as an unbounded one.
@@ -6430,11 +6459,14 @@ func TestPlatformFrontDoorOverlayMergesTargetedPluginToolsets(t *testing.T) {
 // The dispatcher and the notifier run in the gateway process and read `kanban` through
 // load_config(), which resolves from get_hermes_home() — so the block has to be on whichever
 // profile the gateway is homed at, and it has to say the same thing there. The image copy
-// lives in agents/chat/config.yaml and reaches the default profile only; neither
-// agents/platform/config.yaml nor the managed scope declares the key, so a block that fails
-// to follow the gateway does not fall back to the chat profile's: it falls back to upstream,
-// where dispatch is unbounded, the tick is 60s, and spec.harness.tuning.maxInProgress
-// silently stops meaning anything.
+// lives in agents/chat/config.yaml and reaches the default profile only, and
+// agents/platform/config.yaml declares no `kanban` key, so a block that fails to follow the
+// gateway does not fall back to the chat profile's: it falls back to upstream, where the
+// tick is 60s and `completed` is back in the wake set.
+//
+// max_in_progress is the one key that is not compared. It is pinned in the managed scope,
+// which is machine-global and so lands on the platform profile as it lands on the default
+// one (TestMaxInProgressIsPinnedInTheManagedScope); the overlay must not carry a second copy.
 //
 // The comparison is against the image file rather than against the default profile's
 // overlay because the operator does not render the block there at all — it defers to
@@ -6461,9 +6493,12 @@ func TestFrontDoorKanbanMatchesChatConfig(t *testing.T) {
 		t.Fatal("the front-door overlay carries no kanban block, so the dispatcher reverts to " +
 			"upstream's unbounded behaviour")
 	}
-	if !reflect.DeepEqual(got, image.Kanban) {
+	want := maps.Clone(image.Kanban)
+	delete(want, "max_in_progress")
+	if !reflect.DeepEqual(got, want) {
 		t.Errorf("the front door's kanban block differs from the one the chat profile gets "+
-			"from %s:\n  overlay: %v\n  image:   %v", path, got, image.Kanban)
+			"from %s (less max_in_progress, which the managed scope pins):\n  overlay: %v\n  image:   %v",
+			path, got, want)
 	}
 
 	// Issue #1880: bound kanban stale running timeout to 30m (1800s) to prevent
@@ -6473,15 +6508,23 @@ func TestFrontDoorKanbanMatchesChatConfig(t *testing.T) {
 			got["dispatch_stale_timeout_seconds"])
 	}
 
-	// The CR field is the reason equality with the image is not enough on its own: it is
-	// documented as "board-wide cap on concurrent kanban workers", and reaching only a
-	// profile the gateway is not homed at is the same as not reaching anything.
+	// The CR field is documented as a "board-wide cap on concurrent kanban workers", and
+	// reaching only a profile the gateway is not homed at is the same as not reaching
+	// anything. It reaches the front door through the managed scope, so the overlay stays
+	// silent on it and the pin carries the CR's value.
 	withCap := frontDoorAgent("fd-kanban-cap", 1, true)
 	withCap.Spec.Harness.Tuning = &agentv1alpha1.TuningSpec{MaxInProgress: ptr.To(7)}
 	capped, _ := platformOverlay(t, withCap)["kanban"].(map[string]any)
-	if capped["max_in_progress"] != 7 {
-		t.Errorf("max_in_progress = %v, want spec.harness.tuning.maxInProgress (7) to reach the "+
-			"profile the gateway runs as", capped["max_in_progress"])
+	if v, ok := capped["max_in_progress"]; ok {
+		t.Errorf("the front-door overlay carries max_in_progress = %v; the managed scope pins it "+
+			"and nothing the operator renders may appear in both", v)
+	}
+	var managed map[string]any
+	if err := yaml.Unmarshal([]byte(buildConfigMapData(withCap, nil)[managedConfigKey]), &managed); err != nil {
+		t.Fatalf("unmarshal managed scope: %v", err)
+	}
+	if pinned, _ := managed["kanban"].(map[string]any); fmt.Sprint(pinned["max_in_progress"]) != "7" {
+		t.Errorf("managed kanban = %v, want max_in_progress 7 from spec.harness.tuning.maxInProgress", pinned)
 	}
 }
 

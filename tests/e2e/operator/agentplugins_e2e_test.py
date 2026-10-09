@@ -151,9 +151,11 @@ AGENT_HOME: str = "/opt/data"
 # so a probe looking for the render has to read it here. Mounted on the platform-agent
 # container, which is the one agent_exec execs into.
 MANAGED_CONFIG: str = "/etc/hermes/config.yaml"
+# The image's Hermes interpreter (INSTALL_DIR in deploy/shared/docker-entrypoint.sh).
+AGENT_PYTHON: str = "/opt/hermes/.venv/bin/python3"
 # The front door's overlay, merged into $AGENT_HOME/config.yaml at startup. It carries
 # what the operator owns for the default profile but must not pin pod-wide: an
-# untargeted plugin's enablement and non-gateway config, and the board's limits.
+# untargeted plugin's enablement and non-gateway config, and tuning.default's limits.
 DEFAULT_OVERLAY: str = "profile-default.overlay.yaml"
 
 # Emitted by the plugin's __init__.py and plugin.py. Assertions anchor on these markers
@@ -1354,6 +1356,35 @@ def agent_exec_until(script: str, expect: str, timeout_sec: int = 150) -> str:
         time.sleep(3)
 
 
+def loaded_kanban_cap_probe() -> str:
+    """A probe printing the board cap Hermes loads and the one the agent's own file holds.
+
+    The two differ by design: the operator pins kanban.max_in_progress in the managed
+    scope, which Hermes overlays on $HERMES_HOME/config.yaml at load. Reading the
+    ConfigMap or /etc/hermes proves the render; only load_config() proves the pin wins,
+    so this asks Hermes, the way the gateway's dispatcher does. Output is
+    `LOADED=<n>; FILE=<m>;`, with the `;` keeping LOADED=1 from matching LOADED=10.
+    HERMES_HOME falls back to AGENT_HOME in case the exec environment lacks it.
+    HERMES_MANAGED_DIR is left as the container has it, so a lost mount or env var
+    shows up as the file's value rather than being papered over here.
+    """
+    code = (
+        "import os, yaml\n"
+        "try:\n"
+        "    from hermes_cli.config import load_config\n"
+        "    loaded = (load_config().get(\"kanban\") or {}).get(\"max_in_progress\")\n"
+        "except Exception as exc:\n"
+        "    loaded = \"ERR-\" + type(exc).__name__\n"
+        "try:\n"
+        "    with open(os.path.join(os.environ[\"HERMES_HOME\"], \"config.yaml\")) as fh:\n"
+        "        own = ((yaml.safe_load(fh) or {}).get(\"kanban\") or {}).get(\"max_in_progress\")\n"
+        "except Exception:\n"
+        "    own = \"unreadable\"\n"
+        "print(f\"LOADED={loaded}; FILE={own};\")\n"
+    )
+    return f'export HERMES_HOME="${{HERMES_HOME:-{AGENT_HOME}}}"; {AGENT_PYTHON} -c \'{code}\''
+
+
 def profile_plugin_link(profile: str, plugin: str) -> str:
     return f"{AGENT_HOME}/profiles/{profile}/plugins/{plugin}"
 
@@ -1486,10 +1517,11 @@ spec:
         log('Verified targetProfile "default" is rejected.')
 
         # Per-run tuning is opt-in: present means overlays, absent means Hermes' own
-        # defaults. maxInProgress is the exception — absent means the operator's cap,
-        # which is asserted after the removal below. 1 is chosen here precisely because
-        # it differs from that cap, so the assertion proves the override rather than
-        # matching what would be rendered anyway.
+        # defaults. maxInProgress is the exception — it is pinned in the managed scope
+        # either way, and absent means the operator's cap, which is asserted after the
+        # removal below. 1 is chosen here precisely because it differs from that cap, so
+        # the assertion proves the override rather than matching what would be rendered
+        # anyway.
         run_kubectl([
             "patch", "platformagent", "platform-agent", "-n", NAMESPACE, "--type=merge",
             "-p", '{"spec":{"harness":{"tuning":{"maxInProgress":1,'
@@ -1498,12 +1530,12 @@ spec:
         ])
         reconcile_and_wait()
 
-        assert "max_in_progress: 1" in get_overlay_yaml(DEFAULT_OVERLAY), (
-            "maxInProgress should reach the default profile's overlay"
+        assert "max_in_progress: 1" in get_platform_configmap_yaml(), (
+            "maxInProgress should be pinned in the managed scope"
         )
-        assert "max_in_progress" not in get_platform_configmap_yaml(), (
-            "the board cap is a front-door setting and must not be pinned pod-wide, "
-            "where it would cap every specialist's board too"
+        assert "max_in_progress" not in get_overlay_yaml(DEFAULT_OVERLAY), (
+            "the board cap is pinned in the managed scope and must not also ride the "
+            "default overlay: nothing the operator renders may appear in both"
         )
         tuned = get_overlay_yaml(overlay_key)
         assert "max_turns: 200" in tuned, f"platform tuning should reach its overlay:\n{tuned}"
@@ -1511,7 +1543,16 @@ spec:
         assert "max_turns: 150" in cluster_overlay, (
             f"cluster tuning should produce a class overlay:\n{cluster_overlay}"
         )
-        log("Verified tuning reaches the default overlay and both profile overlays.")
+        # What Hermes loads, not only what the operator rendered. The agent's own
+        # config.yaml does not hold 1 (the overlay no longer writes the cap, so it holds
+        # the image's 6 or whatever the volume was seeded with), so LOADED=1 here is the
+        # managed scope beating the agent's file.
+        loaded = agent_exec_until(loaded_kanban_cap_probe(), "LOADED=1;")
+        assert "LOADED=1;" in loaded, (
+            f"Hermes must load the pinned cap of 1 over the agent's own config.yaml: {loaded}"
+        )
+        log(f"Verified Hermes loads the pinned cap over the agent's file ({loaded.strip()}).")
+        log("Verified the other tuning limits reach the default overlay and both profile overlays, and the board cap is pinned pod-wide in the managed scope.")
 
         # Withdrawing tuning must drop the overlays. Cluster profile configs are not
         # force-synced from the image, so the entrypoint's unapply step is what stops the
@@ -1526,23 +1567,18 @@ spec:
         assert "profileclass-cluster" not in keys, (
             f"removing tuning must drop the cluster class overlay, got keys:\n{keys}"
         )
-        assert "max_in_progress" not in get_overlay_yaml(DEFAULT_OVERLAY), (
-            "removing tuning must drop the board cap from the default overlay"
+        # Dispatch concurrency does NOT revert to Hermes' uncapped behaviour, nor keep
+        # the removed override. The pin falls back to the operator's default, and Hermes
+        # loads it from the managed scope whatever the agent's own config.yaml holds. On
+        # a fresh volume that file says 6 too, so this step alone cannot tell the pin
+        # from the file; the tuned step above is the one that does. Uncapped is the state
+        # that lets a burst of cards spawn a worker process each until the OOM killer
+        # takes them, and a removed CR field must not be a way back into it.
+        capped = agent_exec_until(loaded_kanban_cap_probe(), "LOADED=6;")
+        assert "LOADED=6;" in capped, (
+            f"removing tuning must fall back to the operator's dispatch cap, not to uncapped: {capped}"
         )
-        # Dispatch concurrency does NOT revert to Hermes' uncapped behaviour. The operator
-        # stops overriding it, and the cap committed in agents/chat/config.yaml takes over
-        # — which is why this reads the agent's own file rather than the ConfigMap.
-        # Uncapped is the state that lets a burst of cards spawn a worker process each
-        # until the OOM killer takes them, and a removed CR field must not be a way back
-        # into it.
-        capped = agent_exec_until(
-            f"grep -q 'max_in_progress: 6' {AGENT_HOME}/config.yaml && echo CAPPED || echo OPEN",
-            "CAPPED",
-        )
-        assert "CAPPED" in capped, (
-            f"removing tuning must fall back to the image's dispatch cap, not to uncapped: {capped}"
-        )
-        log("Verified tuning removal drops the overlays and falls back to the image's dispatch cap.")
+        log("Verified tuning removal drops the overlays and falls back to the operator's dispatch cap.")
 
         # Withdrawing the plugin has to undo both halves. A stale link would leave a
         # dangling entry in the profile's plugins dir, and a stale plugins.enabled entry
