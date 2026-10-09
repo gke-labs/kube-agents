@@ -249,6 +249,11 @@ NARROWED_RUN_NOTE = "Narrowed by --cluster: the rollout record was neither read 
 # A `--cluster` spec that matched nothing is an error with exit 1, like a project that
 # could not be listed: an empty table with exit 0 would read as "nothing to grade".
 UNMATCHED_CLUSTER_SPEC = "no cluster matched --cluster {spec} in {projects}"
+# When a project's listing failed, the run cannot say the spec matched nothing
+# there: the line names the projects it did list and the ones it could not,
+# rather than sending the operator after a typo or a deleted cluster.
+UNMATCHED_CLUSTER_SPEC_PARTIAL = "no cluster matched --cluster {spec} in {listed}; {unlisted} could not be listed, so whether it is there is unknown"
+UNMATCHED_CLUSTER_SPEC_UNLISTED = "--cluster {spec} could not be matched: {unlisted} could not be listed"
 EXIT_USAGE = 2
 # `--rollout-in-progress` speaks to the rollout record, which a `--cluster` run neither
 # reads nor writes: the pair is refused, as `--at` without `--readiness` is, rather than
@@ -693,6 +698,9 @@ def build_report(projects: list[str], explicit_target: str | None, readiness_opt
     cache = ServerConfigCache()
     members: list[dict] = []
     errors: list[dict] = []
+    # Projects whose listing failed: a spec can match nothing there, and the
+    # unmatched line below says so instead of claiming no match.
+    unlisted: list[str] = []
     for project in projects:
         cmd = [GCLOUD, "container", "clusters", "list", f"--project={project}", JSON_FORMAT_FLAG]
         listed, error = run_gcloud_json(cmd)
@@ -703,6 +711,7 @@ def build_report(projects: list[str], explicit_target: str | None, readiness_opt
                     continue
                 error = f"{error} ({why_not})"
             errors.append({"project": project, "location": None, "message": error or f"{' '.join(cmd)} returned no list"})
+            unlisted.append(project)
             continue
         for cluster in listed:
             if not isinstance(cluster, dict):
@@ -722,9 +731,16 @@ def build_report(projects: list[str], explicit_target: str | None, readiness_opt
                 member["readiness"] = assess_readiness(cluster, member, items, read_error, readiness_options["at"], path)
             members.append(member)
     errors.extend(cache.errors)
+    listed = [p for p in projects if p not in unlisted]
     for location, name in sorted((wanted or set()) - matched):
         spec = f"{location}/{name}" if location else name
-        errors.append({"project": None, "location": location or None, "cluster": name, "message": UNMATCHED_CLUSTER_SPEC.format(spec=spec, projects=", ".join(projects))})
+        if not unlisted:
+            message = UNMATCHED_CLUSTER_SPEC.format(spec=spec, projects=", ".join(projects))
+        elif listed:
+            message = UNMATCHED_CLUSTER_SPEC_PARTIAL.format(spec=spec, listed=", ".join(listed), unlisted=", ".join(unlisted))
+        else:
+            message = UNMATCHED_CLUSTER_SPEC_UNLISTED.format(spec=spec, unlisted=", ".join(unlisted))
+        errors.append({"project": None, "location": location or None, "cluster": name, "message": message})
     members.sort(key=lambda m: (m["project"], m["location"], m["cluster"]))
     report = {
         "target_version": explicit_target,

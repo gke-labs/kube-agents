@@ -36,9 +36,10 @@ Neither reads versions against a target.
   `prod/`) is a usage error (exit 2), not a bare name. Every other member of the projects is
   skipped, reads included, and the rollout record is neither read nor written, since a narrowed
   read would file every member it did not name as gone. A spec that matches no cluster in the
-  projects is an error line and exit 1, not an empty table; one cluster named in both forms is
-  one request, not a hit and a miss. `--rollout-in-progress` beside `--cluster` is a usage error
-  (exit 2): the flag speaks to the rollout record, which a narrowed run does not touch. The JSON
+  projects is an error line and exit 1, not an empty table, and when a project's listing failed
+  the line says so rather than claiming no match; one cluster named in both forms is one request,
+  not a hit and a miss. `--rollout-in-progress` beside `--cluster` is a usage error (exit 2): the
+  flag speaks to the rollout record, which a narrowed run does not touch. The JSON
   names the specs under `narrowed_to`, so a reader can tell the narrowed `members[]` from the
   fleet; the deprecation scan refuses such a file. The fleet-audit collector passes the clusters
   it found behind, and reads back only a report marked as narrowed to that cluster.

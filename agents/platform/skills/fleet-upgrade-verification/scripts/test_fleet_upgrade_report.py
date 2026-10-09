@@ -338,6 +338,23 @@ class ProjectFailureTest(unittest.TestCase):
         self.assertEqual(rc, report.EXIT_PARTIAL)
         self.assertIn("no cluster matched --cluster prd in p", out.getvalue())
 
+    def test_an_unmatched_spec_over_a_failed_listing_says_the_listing_failed_not_no_match(self):
+        """A project the run could not list may hold the cluster: the line says
+        which projects were listed and which were not, never "no match" over
+        a project it never read."""
+        target = "1.31.0-gke.1"
+        fake = FakeGcloud({"other": [cluster("a", "us-central1", target, [("p", target)])]}, {}, failing_projects=["acme"])
+        with patch.object(report, "run_cmd", fake):
+            result = report.build_report(["acme", "other"], target, clusters=["us-central1/prod"])
+        messages = [e["message"] for e in result["errors"]]
+        self.assertEqual(len(messages), 2)
+        self.assertIn("permission denied on acme", messages[0])
+        self.assertEqual(messages[1], "no cluster matched --cluster us-central1/prod in other; acme could not be listed, so whether it is there is unknown")
+        with patch.object(report, "run_cmd", fake):
+            alone = report.build_report(["acme"], target, clusters=["us-central1/prod"])
+        self.assertEqual([e["message"] for e in alone["errors"]][1], "--cluster us-central1/prod could not be matched: acme could not be listed")
+        self.assertNotIn("no cluster matched", " ".join(e["message"] for e in alone["errors"]))
+
     def test_a_qualified_and_a_bare_spec_naming_one_cluster_are_both_matched(self):
         target = "1.31.0-gke.1"
         fake = FakeGcloud({"p": [cluster("prod", "us-central1", target, [("p", target)])]}, {})
