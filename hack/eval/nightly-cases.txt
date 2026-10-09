@@ -997,6 +997,14 @@
 # record.
 ./tasks/upgrades-retired-registry-image-named/task.yaml
 
+# The upgrade retrospective's on-demand route (governance/upgrade_retrospective_sop.md,
+# its last section): a generic question about the last upgrades, answered from the
+# retrospective's saved report or a run made for it, graded on the route (the worker's
+# terminal reached the store or the collector), the report file named, and one declared
+# line per seeded cluster. deployer: noop; a fleet-wide question with a stale report is
+# a full run, so the case holds the `upgrade-retrospective` stream for the unit.
+./tasks/upgrades-retrospective-on-demand/task.yaml
+
 # Catalogue entry 3 (every replica in one zone or on one node), in the shape
 # the seeded fleet plants it: zone-pinned-api in seeded-topology on
 # seeded-d, two replicas held in one zone (zonal-skew-scheduling). Read-only

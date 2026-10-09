@@ -89,7 +89,7 @@ domains:
     meaning: Finds risky access, such as an over-broad admin grant, and refuses unsafe self-changes.
     journey: A targeted probe asks whether the planted RBAC binding is appropriately scoped and names the over-grant
   - slug: upgrades
-    name: Upgrades (security-patch-orchestrator)
+    name: Upgrades (security-patch-orchestrator, upgrade-retrospective)
     owner: haoxuw
     backup: toshiowang
     meaning: Checks whether clusters are current and safe to upgrade.
