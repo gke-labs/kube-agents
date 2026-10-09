@@ -1226,24 +1226,24 @@ def _workload_name(workload: object) -> str:
     return str(workload)
 
 
-def _readiness_cause(readiness: dict, *, control_plane_only: bool = False) -> tuple[str, str, str] | None:
+def _readiness_cause(readiness: dict, *, budget_applies: bool = True, skew_applies: bool = True) -> tuple[str, str, str] | None:
     """Why the reporter graded a member blocked, as (impact format, cause,
     workloads) in the forms 3.11 flags; None for a block that rests on a
     maintenance exclusion alone, which is 3.8's subject and neither a held
-    drain nor a refused move. `workloads` names what the budget's forced
+    drain nor a refused move, and None when nothing that can block the
+    upgrade due is on the row. `workloads` names what the budget's forced
     eviction removes, every covered workload once in budget order, and is
     empty when skew alone blocks, whose tail names no workload. A skew
     ceiling outranks a budget: GKE refuses the control-plane move before any
     drain starts, so a row carrying both is a refused upgrade, not a held
     one, and its cause names the ceiling first and every budget after it.
-    With `control_plane_only` the upgrade due is the control plane's alone
-    (a pool ahead of it), which evicts no pod: a budget cannot block it and
-    is left out, so skew is the one cause there."""
-    pdbs = [p for p in (readiness.get("pdbs") or {}).get("blocking") or [] if isinstance(p, dict)]
-    skew = (readiness.get("skew") or {}).get("blocking") or []
+    The caller says which causes can block the upgrade that is due: a
+    control-plane move drains no node, so a budget cannot hold it
+    (`budget_applies=False`); a pool moving toward its control plane is what
+    closes a skew, so the ceiling does not refuse it (`skew_applies=False`)."""
+    pdbs = [p for p in (readiness.get("pdbs") or {}).get("blocking") or [] if isinstance(p, dict)] if budget_applies else []
+    skew = ((readiness.get("skew") or {}).get("blocking") or []) if skew_applies else []
     skew_cause = UPGRADE_BLOCKED_SKEW_CAUSE_FORMAT.format(pools=", ".join(str(p) for p in skew)) if skew else ""
-    if control_plane_only:
-        return (UPGRADE_BLOCKED_IMPACT_SKEW_FORMAT, skew_cause, "") if skew else None
     if pdbs:
         # Every blocking budget, in name order: the reporter lists them in
         # the API's order, and a cause that named only the first would make
@@ -1298,11 +1298,14 @@ def _upgrade_blocked_hit(entry: dict, member: dict) -> dict | None:
     if readiness.get("status") != READINESS_BLOCKED:
         return None
     lag = _lag_phrase(entry)
-    # On a cluster whose only version candidate is a pool ahead of its
-    # control plane, the upgrade due is the control plane's, which evicts no
-    # pod: a budget cannot block it, a skew ceiling can, so a budget alone is
-    # the check running clean there and skew is the one cause read.
-    found = _readiness_cause(readiness, control_plane_only=lag == LAG_POOL_AHEAD)
+    # Which upgrade is due decides which causes can block it. A pool ahead of
+    # its control plane: the control plane's move is due, which evicts no
+    # pod, so a budget cannot hold it and a skew ceiling can. A pool behind a
+    # current control plane: the pool's move is due, which a budget can hold
+    # and the ceiling does not refuse (it is what closes the skew, and 3.2
+    # already carries the pool), so skew alone is the check running clean
+    # there. A behind control plane: both apply.
+    found = _readiness_cause(readiness, budget_applies=lag != LAG_POOL_AHEAD, skew_applies=lag not in (LAG_POOL_ONLY, LAG_POOL_MAJOR))
     if found is None:
         return None
     impact_format, cause, workloads = found

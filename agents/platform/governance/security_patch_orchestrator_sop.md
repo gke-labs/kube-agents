@@ -244,8 +244,11 @@ each is waiting for whoever schedules it.
 - **Do NOT flag:** a block that rests only on `readiness.maintenance.blocking_exclusions`. The
   skill grades a `NO_MINOR_UPGRADES` exclusion as blocking; 3.8 here deliberately does not, because
   an exclusion holds back GKE's automatic upgrade and does not stop a manual one — that exclusion is
-  3.8's subject, and it is neither a held drain nor a refused move. The collector records the check as run
-  there and emits no candidate.
+  3.8's subject, and it is neither a held drain nor a refused move. Nor a cause that cannot block
+  the upgrade that is due: a budget alone on a cluster whose only lag is a pool ahead of its control
+  plane (the control-plane move drains no node), or a skew ceiling alone on a cluster whose only
+  lag is a pool behind its control plane (the pool's move is what closes the skew, and 3.2 carries
+  the pool). The collector records the check as run there and emits no candidate.
 - **Not applicable**, in two cases and no other. A cluster 3.1 judged and found current, with no
   3.2 candidate either, has no upgrade whose completion could be blocked; a `RECONCILING` one,
   whose version checks §3 suppresses, is declared in the same case with its own reason (an

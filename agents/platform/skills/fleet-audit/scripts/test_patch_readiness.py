@@ -2257,6 +2257,27 @@ class UpgradeBlockedTest(unittest.TestCase):
         hit = next(c for c in entry["candidates"] if c["check"] == pr.UPGRADE_BLOCKED_CHECK)
         self.assertIn(pr.LAG_POOL_ONLY, hit["impact"])
 
+    def test_a_pool_only_lag_blocked_by_skew_alone_is_the_check_running_clean(self):
+        """The control plane sits at its channel default and a pool is three
+        minors behind it, so the upgrade due is the pool's: the ceiling does
+        not refuse a pool moving toward its control plane, and 3.2 already
+        carries the pool, so the check ran and found nothing."""
+        pools = [pool("default-pool", "1.27.0-gke.1")]
+        by = self.collect([cluster(name="skewed", master=self.CURRENT, node_pools=pools)], [self.member("skewed", skew=["default-pool"], gap=0)])
+        entry = by["skewed"]
+        self.assertIn("pool-skew", {c["check"] for c in entry["candidates"]})
+        self.assertIn(pr.UPGRADE_BLOCKED_CHECK, self.ran(entry))
+        self.assertEqual([c for c in entry["candidates"] if c["check"] == pr.UPGRADE_BLOCKED_CHECK], [])
+
+    def test_a_pool_only_lag_blocked_by_a_budget_and_skew_names_the_held_pool_drain_only(self):
+        pools = [pool("default-pool", "1.27.0-gke.1")]
+        by = self.collect([cluster(name="skewed", master=self.CURRENT, node_pools=pools)], [self.member("skewed", pdbs=[self.BUDGET], skew=["default-pool"], gap=0)])
+        hit = next(c for c in by["skewed"]["candidates"] if c["check"] == pr.UPGRADE_BLOCKED_CHECK)
+        self.assertIn(pr.LAG_POOL_ONLY, hit["impact"])
+        self.assertIn("would be held, not stopped", hit["impact"])
+        self.assertNotIn("skew ceiling", hit["excerpt"])
+        self.assertNotIn("will not move the control plane", hit["impact"])
+
     def test_an_unknown_grade_is_unevaluated_not_clean(self):
         """A row the reporter could not grade is a coverage gap, never an
         asserted blocker and never a clean pass: the manifest says so in
