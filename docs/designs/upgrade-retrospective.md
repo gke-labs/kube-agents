@@ -140,9 +140,10 @@ it manages rather than a blank. Two things stand in the way today and the second
 removes both. The first-run stage skips every audit when no GitOps repository is configured, and
 the fleet-audit skill's `start` fails outright without one (`INSTALL.md` says so), because the
 streams it serves exist to file a ledger. This stream does not: the collector needs no repository
-and the report on the volume is the record, so the SOP runs the collector first and calls `start`
-and `finish` only when a repository is configured and the run is full, and the first-run stage marks this job due
-without a repository. That is the "chat-only mode" the first-run design lists as an open question,
+and the report on the volume is the record. Where a repository is configured and the run is full,
+the SOP calls `start`, then runs the collector, then `finish` with the collector's manifest (`finish`
+refuses a manifest older than the run); without a repository it runs the collector alone, manifest
+included, and the first-run stage marks this job due without one. That is the "chat-only mode" the first-run design lists as an open question,
 scoped to this one stream. An install that onboarded before the job existed gets its baseline from
 the first Sunday tick.
 
