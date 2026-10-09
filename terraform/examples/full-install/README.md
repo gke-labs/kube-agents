@@ -55,7 +55,12 @@ install without the interview.
   the gateway asks for on a request that names none; `litellm_redaction`
   (off by default) redacts every request body the gateway forwards to the
   provider, and `install.sh` sets it from the `LITELLM_REDACTION_*` keys in
-  `install.env`.
+  `install.env`; `platform_agent_mode` (default `"today"`, which passes the
+  chart nothing, so the CR carries no `mode` field) sets the `PlatformAgent`'s
+  `spec.mode`, and `"next"` also renders the NATS bus and the A2A gateway, a
+  development stack. `install.sh` sets it from `PLATFORM_AGENT_MODE` in
+  `install.env`. Changing it on a running install is a mode switch
+  ([`docs/designs/spec-mode-switch.md`](../../../docs/designs/spec-mode-switch.md)).
 - Two `random_password` values added to that Secret rather than asked for:
   `SESSION_KV_API_KEY`, the bearer token for the pod-local Session KV server,
   and `SESSION_KV_SALT`, the HMAC salt that pseudonymises chat identities.

@@ -421,11 +421,11 @@ as `bridge-queue-overflow`, over a hundred times any fan-out the job runs. The o
 sizes the `TASKS` consumer reserve from that `A2A_BRIDGE_CONCURRENCY` too, from the first `next`
 render, and provisioning never edits a stream that exists, so the first provision has to fit
 the bridge's workers. The deploy therefore sizes the first provision for the bridge (decided
-2026-09-30 on gke-labs/kube-agents#2077): its mode patch also sets `spec.harness.tuning.maxSessions` to the
+2026-09-30 on gke-labs/kube-agents#2077): its mode change also sets `spec.harness.tuning.maxSessions` to the
 largest value whose budget at the lane's worker count fits the 64-consumer floor the first
 run creates (6 at 4 workers, 2 at 6; at 8 or more the floor cannot hold the reserve and the
 value clamps to 1), computed from four constants the script copies from the operator and
-pins against it. The mode patch is the only patch, so no later render re-measures the budget
+pins against it. The mode change is the only change, so no later render re-measures the budget
 against the stream the Job created. The rendered bridge carries the agent container's own
 environment, mounts and security context, copied by the operator from the agent
 container it renders (its resources are its own, sized for the `api` executor the lane runs, gke-labs/kube-agents#2748): the bridge's `cli` subprocess stands in for the `hermes chat -q` a kanban worker spawns
@@ -628,8 +628,9 @@ it, and the wait goes.
 
 `EVAL_MODE_NEXT=1` in `hack/ci-deploy.sh` flips the presubmit's eval install to `next` after the
 today-mode install has passed its own readiness and connectivity checks. It records the agent
-Deployment's generation, merge-patches the CR (the mode, and the `maxSessions` sized for the
-bridge's workers), and waits for the generation to move before
+Deployment's generation, sets the mode through the chart's `platformAgent.mode` in a `helm
+upgrade --reuse-values` of its own release (with the `maxSessions` sized for the bridge's
+workers, so the first render sees both), and waits for the generation to move before
 asking any workload for status, because the flip is a rollout and a status read before it lands
 describes the old pods. It then gates, in order, on the NATS StatefulSet, the callout Deployment,
 the provisioning Job reaching `complete` (the Job depends on the callout; before the operator
@@ -640,10 +641,10 @@ same flag (`A2A_INJECT_BACKEND=true` through the chart's `operator.extraEnv`, be
 image overrides) and waits for the door's Service and token Secret. The bridge is the
 operator's: it renders it with the image and `BRIDGE_CONCURRENCY` the deploy sets on it the same
 way (`A2A_BRIDGE_IMAGE`, `A2A_BRIDGE_CONCURRENCY`) and the bridge's default `api` executor, and
-the TASKS budget counts its workers from the first `next` render, so the mode patch is the only
-patch and the one provisioning Job is already sized for the bridge. The bridge enters the agent
+the TASKS budget counts its workers from the first `next` render, so the mode change is the only
+change and the one provisioning Job is already sized for the bridge. The bridge enters the agent
 pod only once the bus is provisioned (the CR's `BusProvisioned` condition), so the agent
-Deployment rolls twice, once for the mode patch and once after the Job for the bridge, and the
+Deployment rolls twice, once for the mode change and once after the Job for the bridge, and the
 step gates both rolls. The step ends on the
 bridge's own log line that it is consuming `platform` tasks, because a flip without a consuming
 bridge leaves a bus on which nobody answers. It reports the A2A gateway's state and last log

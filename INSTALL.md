@@ -128,7 +128,7 @@ curl -fsSL https://raw.githubusercontent.com/gke-labs/kube-agents/<RELEASE_VERSI
 
 #### What `--generate-only` Does:
 
-1. Probes cluster parameters and writes the complete configuration to `install.env` (if absent; over an existing one it only appends a chat key a chat flag gave and the file lacks) and `terraform/examples/full-install/terraform.tfvars`.
+1. Probes cluster parameters and writes the complete configuration to `install.env` (if absent; over an existing one it only appends a chat key a chat flag gave, or the `PLATFORM_AGENT_MODE` a `--mode` gave, that the file lacks) and `terraform/examples/full-install/terraform.tfvars`.
 2. Runs the same pre-flight checks a real run does — including the existing-cluster node-pool and NetworkPolicy consent gates, and the refusal for a cluster that cannot be described — without creating or modifying GCP resources. A cluster that needs `--migrate-node-pools`, or one that enforces no NetworkPolicy and was given neither `--enable-network-policy` nor `--accept-no-network-policy`, is refused here, exiting 1 with a `REFUSED_*` status. `install.env` and `terraform.tfvars` are written before these checks run, so a refused run leaves both on disk; what it withholds is the operator handoff and the `GENERATE_ONLY_SUCCESS` report, and the tfvars it leaves behind have not been validated.
 3. Prints the exact step-by-step manual execution recipe:
    - **Out-of-Terraform prerequisites** for existing clusters (CMEK database encryption enablement, node-pool `GKE_METADATA` workload identity update, NetworkPolicy enablement, and Cloud KMS key creation for GitHub App private key signing).
@@ -267,8 +267,8 @@ An agent given that prompt, or reading this file on its own, follows these steps
 
 A flag left out does not always take the shipped default. A flag wins over an `install.env` from an
 earlier run, which wins over an exported variable — including an exported API key — which wins over
-`install.defaults.env`. The chat flags are the exception: over an existing `install.env` one that
-disagrees with the file is refused. See
+`install.defaults.env`. The chat flags and `--mode` are the exception: over an existing `install.env`
+one that disagrees with the file is refused. See
 [`scripts/installer/README.md`](scripts/installer/README.md#the-install-configuration-installenv).
 
 ---
@@ -409,6 +409,14 @@ KUBE_AGENTS_STATE_BUCKET=auto ./lifecycle.sh apply
   `--registry-prefix`) covers the four images this project builds, and LiteLLM, fluent-bit, the
   GitHub token minter and Hindsight need `third_party_image_registry` (or
   `--third-party-registry-prefix`) as well; cert-manager is separate (see the composition README).
+
+- **Component stack (`--mode`)**: `./install.sh --mode=next` installs with `spec.mode: next`, an
+  unsupported development stack; the default is `today`. With an `install.env` you wrote
+  yourself, `--mode` adds `PLATFORM_AGENT_MODE` to it when it sets none, and is refused when it
+  sets a different one. Terraform takes `platform_agent_mode`,
+  the chart `platformAgent.mode`. To switch a running install, edit `PLATFORM_AGENT_MODE` in
+  `install.env` and re-run `install.sh` or a full `upgrade.sh`;
+  [`scripts/installer/README.md`](scripts/installer/README.md) has the rules for the key.
 
 - **Dry-run check**: To preview actions without modifying cloud infrastructure:
   ```bash

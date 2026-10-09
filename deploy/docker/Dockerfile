@@ -1537,6 +1537,9 @@ COPY deploy/docker/patches/kanban_wake_nudge.py \
      deploy/docker/patches/kanban_children_settled.py \
      deploy/docker/patches/apply_kanban_children_settled.py \
      deploy/docker/patches/verify_kanban_children_settled.py \
+     deploy/docker/patches/kanban_chat_notify.py \
+     deploy/docker/patches/apply_kanban_chat_notify.py \
+     deploy/docker/patches/verify_kanban_chat_notify.py \
      deploy/docker/patches/apply_kanban_priority.py \
      deploy/docker/patches/verify_kanban_priority.py \
      deploy/docker/patches/kanban_result_required.py \
@@ -1563,6 +1566,7 @@ RUN install -m 0644 /tmp/latency-patches/kanban_wake_nudge.py /opt/hermes/hermes
     cp /tmp/latency-patches/kanban_auto_subscribe.py /opt/hermes/tools/kanban_auto_subscribe.py && \
     cp /tmp/latency-patches/kanban_comment_status.py /opt/hermes/tools/kanban_comment_status.py && \
     cp /tmp/latency-patches/kanban_notify_delivery.py /opt/hermes/gateway/kanban_notify_delivery.py && \
+    cp /tmp/latency-patches/kanban_chat_notify.py /opt/hermes/gateway/kanban_chat_notify.py && \
     cp /tmp/latency-patches/kanban_event_routing.py /opt/hermes/tools/kanban_event_routing.py && \
     /opt/hermes/.venv/bin/python3 /tmp/latency-patches/apply_kanban_wake_nudge.py /opt/hermes && \
     test "$(grep -c '_kanban_record_wake(conn)' /opt/hermes/hermes_cli/kanban_db.py)" = "3" && \
@@ -1577,6 +1581,9 @@ RUN install -m 0644 /tmp/latency-patches/kanban_wake_nudge.py /opt/hermes/hermes
     grep -qF 'watcher=self.runner,' /opt/hermes/gateway/kanban_watchers_notifier.py && \
     test "$(grep -cF '_kanban_mark_delivered(self.runner, self.sub, self.d["cursor"])' /opt/hermes/gateway/kanban_watchers_notifier.py)" = "1" && \
     test "$(grep -c 'await self.advance()' /opt/hermes/gateway/kanban_watchers_notifier.py)" = "1" && \
+    /opt/hermes/.venv/bin/python3 /tmp/latency-patches/apply_kanban_chat_notify.py /opt/hermes && \
+    grep -qF 'self.active_platforms = _kage_chat_notify_active(' /opt/hermes/gateway/kanban_watchers_notifier.py && \
+    grep -qF '_kage_upstream_adapter_for_subscription = _adapter_for_subscription' /opt/hermes/gateway/kanban_watchers_notifier.py && \
     /opt/hermes/.venv/bin/python3 /tmp/latency-patches/apply_kanban_auto_subscribe.py /opt/hermes && \
     grep -q "_kanban_inherit_worker_subs(conn, new_tid)" /opt/hermes/tools/kanban_tools.py && \
     grep -q "from tools.kanban_auto_subscribe import" /opt/hermes/tools/kanban_tools.py && \
@@ -1617,6 +1624,7 @@ RUN install -m 0644 /tmp/latency-patches/kanban_wake_nudge.py /opt/hermes/hermes
     /opt/hermes/.venv/bin/python3 /tmp/latency-patches/verify_kanban_auto_subscribe.py && \
     /opt/hermes/.venv/bin/python3 /tmp/latency-patches/verify_kanban_comment_status.py && \
     /opt/hermes/.venv/bin/python3 /tmp/latency-patches/verify_kanban_notify_delivery.py && \
+    /opt/hermes/.venv/bin/python3 /tmp/latency-patches/verify_kanban_chat_notify.py && \
     /opt/hermes/.venv/bin/python3 /tmp/latency-patches/verify_kanban_event_routing.py && \
     /opt/hermes/.venv/bin/python3 /tmp/latency-patches/verify_kanban_children_settled.py && \
     /opt/hermes/.venv/bin/python3 /tmp/latency-patches/verify_kanban_priority.py && \

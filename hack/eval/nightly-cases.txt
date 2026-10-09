@@ -133,17 +133,17 @@
 # (159) of sixty-seven (201), +3 more: the same shape on the card's last
 # attempt. chat-voice-failure-leads-with-fact (after it) makes
 # it fifty-four (162) of sixty-eight (204), +3 more: the same shape on a
-# blocked card. oobe-first-run-audits (the third-last entry below) makes it
+# blocked card. oobe-first-run-audits (the sixth-last entry below) makes it
 # sixty-two (186) of seventy-six (228), counted from the lists with
 # upgrades-zonal-control-plane-outage-warned (2026-10-05, below), +3 more at its 2400s hint: a unit
 # that waits out the previous repetition's audits (the runner's wait_platform_runs), a stack that
 # waits out the stage's chain, then a turn with no tools,
 # holding the four audit streams' locks throughout, so their audit cases queue behind it.
-# chat-voice-answer-first (the second-last entry below) makes it sixty-three
+# chat-voice-answer-first (the fifth-last entry below) makes it sixty-three
 # (189) of seventy-seven (231), +3 more: one front-door turn plus the card
-# round trip. chat-fanout-fleet-restarts-rows (the last entry below) makes it
-# sixty-four (192) of seventy-eight (234), +3 more: one front-door turn and a
-# four-card fan-out.
+# round trip. chat-fanout-fleet-restarts-rows (the third-last entry below)
+# makes it sixty-four (192) of seventy-eight (234), +3 more: one front-door
+# turn and a four-card fan-out.
 # Whether the worst night fits is a question about the whole matrix, and the
 # six measured nights (2026-09-16 to 09-21, oss-test-infra#2707's table)
 # answer it plainly: 1734-2693 serial minutes of work at a realised
@@ -220,11 +220,18 @@
 # seventy-five-case, 225-unit matrix.
 #
 # 2026-10-05 adds chat-voice-answer-first: one case, three units, deployer:
-# noop at the 200s default, about 10 serial minutes. Counted from the lists
-# with it, the second-last entry below, and oobe-first-run-audits before it:
-# sixty-three cases (189 units) here, of a seventy-seven-case, 231-unit
-# matrix with the presubmit file's fourteen; chat-fanout-fleet-restarts-rows,
-# the last entry, makes it sixty-four (192) of seventy-eight (234).
+# noop at the 200s default, about 10 serial minutes. It is the entry after
+# oobe-first-run-audits below. It does not hold the infra lock, so the tofu
+# cases' serial minutes below are unchanged.
+#
+# 2026-10-07 adds findings-decision-covers-item: one case, three units at the
+# 200s default (one front-door turn; the plant and the teardown are a few
+# kubectl execs each). It is the last entry below. Counted from the lists
+# with chat-voice-answer-first: sixty-seven cases (201 units) here, of an
+# eighty-one-case, 243-unit matrix with the presubmit file's fourteen. Its stack holds the
+# infra lock, so it is the thirteenth tofu case: ~10 more serial minutes
+# there. With oobe-first-run-audits, the twelfth (~120 at its 2400s hint),
+# the thirteen come to ~583 serial minutes against the 480m deadline.
 
 # ── The four full audits recast out of the presubmit on 2026-08-26 ──────────
 # Spec-ready, each domain covered in the presubmit by its probe:
@@ -736,3 +743,10 @@
 # --selected-namespaces, --backup-retain-days, --encryption-key). deployer:
 # noop, transcript-only.
 ./tasks/backup-dr-cmek-selected-namespaces-probe/task.yaml
+
+# The findings queue's item-wide decision: the user dismisses the one id the
+# nudge names for a gathered line, and every row of that line has to end up
+# dismissed while the line beside it stays open. prebuilt/findings-item plants
+# the rows through the Session KV server's findings routes and resolves them on
+# destroy. No fixture; the host install only.
+./tasks/findings-decision-covers-item/task.yaml
