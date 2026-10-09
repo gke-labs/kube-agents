@@ -18,9 +18,11 @@ import os
 import re
 import sys
 import tempfile
+import threading
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
-from datetime import datetime, timezone
+from contextlib import suppress as contextlib_suppress
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
 
@@ -126,7 +128,7 @@ class FakeFleet:
 def args(**overrides):
     """The scheduled run's arguments: `--full` unless the test narrows the run
     with --cluster or --since, or says otherwise."""
-    base = {"project": [PROJECT], "cluster": None, "since": None, "ledger": None, "guards": None, "output": None, "report": None, "no_report": False, "dry_run": False, "reset_ledger": False, "manifest_file": None}
+    base = {"project": [PROJECT], "cluster": None, "since": None, "ledger": None, "guards": None, "output": None, "report": None, "no_report": False, "dry_run": False, "reset_ledger": False, "manifest_file": None, "after_upgrade": False}
     base.update(overrides)
     base.setdefault("full", base["cluster"] is None and base["since"] is None and bool(base["project"]))
     if "full" in overrides:
@@ -317,18 +319,35 @@ class ClassifierFixtureTest(unittest.TestCase):
     def test_pool_gated_entries_are_high_only_after_a_pool_operation(self):
         reads = {**READS["seeded-a"]}
         rows = by_object(symptoms_of("seeded-a", reads=reads, ops=[]), INFERENCE, "pending")
-        self.assertEqual(entries(rows[0]), {(12, ur.MEDIUM), (2, ur.MEDIUM)})
+        self.assertEqual(entries(rows[0]), {(2, ur.MEDIUM)})
         rows = by_object(symptoms_of("seeded-a"), INFERENCE, "pending")
-        self.assertEqual(entries(rows[0]), {(12, ur.MEDIUM), (2, ur.HIGH)})
+        self.assertEqual(entries(rows[0]), {(2, ur.HIGH)})
 
-    def test_entry_12_is_medium_when_only_some_nodes_missed_the_selector(self):
+    def test_displaced_pinned_replica_is_entry_2_and_a_pure_selector_miss_is_12(self):
+        # The fixture's displaced pinned replica (inference-server, pinned to pinned-inference-pool by
+        # `seeded-role`): the scheduler writes "Insufficient cpu" for the pool the pod targets and a
+        # "didn't match" clause for every pool it does not, so the row is entry 2 and never 12.
+        # seeded-b's pinned-batch-runner has the same shape; the captures carry seeded-a.
         rows = by_object(self.seeded, INFERENCE, "pending")
         self.assertEqual(len(rows), 1)
-        self.assertEqual(entries(rows[0]), {(12, ur.MEDIUM), (2, ur.HIGH)})
-        twelve = next(c for c in rows[0]["classifications"] if c["entry"] == 12)
-        self.assertEqual(twelve["detail"], "selector seeded-role=pinned-inference")
-        self.assertEqual(twelve["evidence"], "3 of 4 pods: didn't match Pod's node affinity; e.g. inference-server-778b78fdb8-cp2pf")
+        self.assertEqual(entries(rows[0]), {(2, ur.HIGH)})
+        [two] = rows[0]["classifications"]
+        self.assertEqual(two["evidence"], "3 of 4 pods: Insufficient cpu; e.g. inference-server-778b78fdb8-cp2pf")
         self.assertEqual(rows[0]["pods"], ["inference-server-778b78fdb8-cp2pf", "inference-server-778b78fdb8-ld26r", "inference-server-778b78fdb8-zxlkz"])
+        nodes = READS["seeded-a"]["nodes"]
+        displaced = "0/4 nodes are available: 1 Insufficient cpu, 3 node(s) didn't match Pod's node affinity/selector. preemption: 0/4 nodes are available: 1 No preemption victims found for incoming pod, 3 Preemption is not helpful for scheduling."
+        runner = pod("pinned-batch-runner-6d5f8b7c9-x2k4q", namespace="seeded-upgrade", scheduled_message=displaced, node_selector={"cloud.google.com/gke-nodepool": "pinned-inference-pool"})
+        [row] = symptoms_of("seeded-a", reads={"pods": [runner], "nodes": nodes, "events": [], "pdbs": []})
+        self.assertEqual(entries(row), {(2, ur.HIGH)})
+        self.assertEqual(row["classifications"][0]["evidence"], "1 of 1 pods: Insufficient cpu; e.g. pinned-batch-runner-6d5f8b7c9-x2k4q")
+        # Every clause a selector miss: the selector names a label the pool lost, entry 12.
+        pure = pod("pinned-batch-runner-6d5f8b7c9-x2k4q", namespace="seeded-upgrade", scheduled_message="0/4 nodes are available: 4 node(s) didn't match Pod's node affinity/selector. preemption: 0/4 nodes are available: 4 Preemption is not helpful for scheduling.", node_selector={"seeded-role": "batch"})
+        [row] = symptoms_of("seeded-a", reads={"pods": [pure], "nodes": nodes, "events": [], "pdbs": []})
+        self.assertEqual(entries(row), {(12, ur.HIGH)})
+        self.assertEqual(row["classifications"][0]["detail"], "selector seeded-role=batch")
+        # The order is one table the classifier iterates, most specific first, 12 last.
+        self.assertEqual(ur.ENTRY_ORDER, (7, 6, 19, 18, 14, 15, 20, 17, 2, 1, 12))
+        self.assertEqual(set(ur.ENTRY_MATCHERS), set(ur.ENTRY_ORDER))
 
     def test_entry_14_oomkilled_single_container_on_cgroup_v2(self):
         rows = by_object(self.seeded, PAYMENTS, "not-ready")
@@ -426,14 +445,42 @@ class ClassifierFixtureTest(unittest.TestCase):
 
 class ClassifierSignatureTest(unittest.TestCase):
     """Signatures built from the captured shapes."""
-    def classify(self, pods=(), nodes=None, events=(), pdbs=(), ops=None, name="seeded-a"):
-        reads = {"pods": list(pods), "nodes": nodes if nodes is not None else READS["seeded-a"]["nodes"], "events": list(events), "pdbs": list(pdbs)}
+    def classify(self, pods=(), nodes=None, events=(), pdbs=(), ops=None, name="seeded-a", owners=(), workloads=()):
+        reads = {"pods": list(pods), "nodes": nodes if nodes is not None else READS["seeded-a"]["nodes"], "events": list(events), "pdbs": list(pdbs), "owners": list(owners), "workloads": list(workloads)}
         return symptoms_of(name, reads=reads, ops=ops)
 
     def test_entry_7_webhook_rejection(self):
-        [row] = self.classify(events=[event("FailedCreate", 'Error creating: Internal error occurred: failed calling webhook "gate.example.io": Post "https://gate.apps.svc:443/validate": no endpoints available', kind="ReplicaSet")])
+        rejection = event("FailedCreate", 'Error creating: Internal error occurred: failed calling webhook "gate.example.io": Post "https://gate.apps.svc:443/validate": no endpoints available', kind="ReplicaSet")
+        # Event text alone: a namespace user can write an Event, so the match is medium, marked, and
+        # the excerpt is quoted as the object's own text.
+        [row] = self.classify(events=[rejection])
+        self.assertEqual(entries(row), {(7, ur.MEDIUM)})
+        self.assertEqual(row["classifications"][0]["detail"], "webhook gate.example.io; " + ur.FROM_EVENT_TEXT_DETAIL.format(source=ur.TEXT_SOURCE_EVENT))
+        self.assertEqual(row["classifications"][0]["evidence"], f'{ur.TEXT_SOURCE_EVENT} reads "FailedCreate {rejection["message"]}"')
+        # The ReplicaSet's own ReplicaFailure condition, set by its controller, agrees: high.
+        failing = {"kind": "ReplicaSet", "metadata": {"name": "x", "namespace": "apps"}, "status": {"conditions": [{"type": "ReplicaFailure", "status": "True", "reason": "FailedCreate"}]}}
+        [row] = self.classify(events=[rejection], owners=[failing])
         self.assertEqual(entries(row), {(7, ur.HIGH)})
-        self.assertEqual(row["classifications"][0]["detail"], "webhook gate.example.io")
+        self.assertEqual(row["classifications"][0]["detail"], "webhook gate.example.io; from event text; ReplicaSet condition ReplicaFailure=True agrees")
+        self.assertTrue(row["classifications"][0]["evidence"].startswith(f'{ur.TEXT_SOURCE_EVENT} reads "'))
+        # The quoted excerpt travels as the object's own text into the guard.
+        [guard] = ur.guards_for(SEEDED, [row], "2026-10-08T18:00:00Z")
+        self.assertTrue(guard["evidence"].startswith(f'{ur.TEXT_SOURCE_EVENT} reads "'))
+
+    def test_termination_message_alone_is_medium_unless_the_container_state_agrees(self):
+        # The driver text sits in the container's termination message, which the workload writes. The
+        # container's current state, terminated with a non-zero exit, is the kubelet's and agrees: high.
+        crashed = pod("cuda-job", statuses=[{"name": "c0", "state": {"terminated": {"reason": "Error", "exitCode": 1, "message": "CUDA Error 803: system has unsupported display driver / cuda driver combination"}}}])
+        [row] = self.classify(pods=[crashed])
+        self.assertEqual(entries(row), {(18, ur.HIGH)})
+        self.assertEqual(row["classifications"][0]["detail"], "from container termination message; container c0 state Error agrees")
+        self.assertIn(f'{ur.TEXT_SOURCE_TERMINATION} reads "Error 803"', row["classifications"][0]["evidence"])
+        # The same text in a previous termination while the container now runs: nothing the API server
+        # set agrees that the driver fails now, so medium and marked.
+        running = pod("cuda-job", statuses=[{"name": "c0", "state": {"running": {}}, "lastState": {"terminated": {"reason": "Error", "exitCode": 1, "message": "CUDA Error 803", "finishedAt": "2026-10-08T12:00:00Z"}}}])
+        [row] = self.classify(pods=[running])
+        self.assertEqual(entries(row), {(18, ur.MEDIUM)})
+        self.assertEqual(row["classifications"][0]["detail"], ur.FROM_EVENT_TEXT_DETAIL.format(source=ur.TEXT_SOURCE_TERMINATION))
 
     def test_entry_12_high_when_every_node_missed_the_selector(self):
         [row] = self.classify(pods=[pod("arch-pinned", scheduled_message="0/4 nodes are available: 4 node(s) didn't match Pod's node affinity/selector. preemption: 0/4 nodes are available: 4 Preemption is not helpful for scheduling.", node_selector={"beta.kubernetes.io/arch": "amd64"})])
@@ -447,7 +494,15 @@ class ClassifierSignatureTest(unittest.TestCase):
     def test_entry_19_attach_and_mount_events(self):
         rows = self.classify(events=[event("FailedAttachVolume", "AttachVolume.Attach failed for volume pv-1"), event("FailedMount", "MountVolume.WaitForAttach failed for volume pvc-0b7c: timed out waiting for the condition", name="y")])
         self.assertEqual([entries(r) for r in rows], [{(19, ur.MEDIUM)}, {(19, ur.MEDIUM)}])
-        self.assertEqual(rows[0]["classifications"][0]["evidence"], "FailedAttachVolume AttachVolume.Attach failed for volume pv-1")
+        self.assertEqual(rows[0]["classifications"][0]["evidence"], f'{ur.TEXT_SOURCE_EVENT} reads "FailedAttachVolume AttachVolume.Attach failed for volume pv-1"')
+        self.assertEqual(rows[0]["classifications"][0]["detail"], ur.FROM_EVENT_TEXT_DETAIL.format(source=ur.TEXT_SOURCE_EVENT))
+        # The pod the event names sitting Pending is the API server agreeing with the event text; the
+        # row's own grade is medium either way, and the detail names what agreed.
+        stuck = pod("y", phase="Pending", statuses=[waiting("ContainerCreating")])
+        stuck["status"]["startTime"] = "2026-10-08T10:00:00Z"
+        [row] = [s for s in self.classify(events=[event("FailedMount", "MountVolume.WaitForAttach failed for volume pvc-0b7c: timed out waiting for the condition", name="y")], pods=[stuck]) if s["category"] == "event"]
+        self.assertEqual(entries(row), {(19, ur.MEDIUM)})
+        self.assertEqual(row["classifications"][0]["detail"], "from event text; pod y phase Pending agrees")
 
     def test_configmap_mount_failure_is_not_entry_19(self):
         [row] = self.classify(events=[event("FailedMount", 'MountVolume.SetUp failed for volume "config" : object "gke-gmp-system"/"collector" not registered')])
@@ -548,14 +603,20 @@ class ClassifierSignatureTest(unittest.TestCase):
         reads = {**READS["seeded-a"], "pods": pods, "workloads": workloads, "events": events}
         [row] = by_object(symptoms_of("seeded-a", reads=reads, ops=gpu_pool_only), PAYMENTS)
         self.assertEqual(entries(row), {(2, ur.MEDIUM)})
-        # Pinned to the touched pool: high.
+        self.assertIn(ur.GATE_CLOSED_TEXT, row["classifications"][0]["detail"])
+        # Pinned to the touched pool the gate opens, but the pods are gone and the event is the only
+        # text: medium, marked as event text alone.
         payments["spec"]["template"]["spec"]["nodeSelector"] = {"cloud.google.com/gke-nodepool": "pinned-inference-pool"}
         [row] = by_object(symptoms_of("seeded-a", reads=reads, ops=gpu_pool_only), PAYMENTS)
-        self.assertEqual(entries(row), {(2, ur.HIGH)})
+        self.assertEqual(entries(row), {(2, ur.MEDIUM)})
+        self.assertNotIn(ur.GATE_CLOSED_TEXT, row["classifications"][0]["detail"])
+        self.assertIn(ur.FROM_EVENT_TEXT_DETAIL.format(source=ur.TEXT_SOURCE_EVENT), row["classifications"][0]["detail"])
+        self.assertEqual(row["classifications"][0]["evidence_core"], f'{ur.TEXT_SOURCE_EVENT} reads "Insufficient cpu"')
         # No pool evidence at all on an event row: closed.
         payments["spec"]["template"]["spec"].pop("nodeSelector")
         [row] = by_object(symptoms_of("seeded-a", reads=reads, ops=gpu_pool_only), PAYMENTS)
         self.assertEqual(entries(row), {(2, ur.MEDIUM)})
+        self.assertIn(ur.GATE_CLOSED_TEXT, row["classifications"][0]["detail"])
 
     def test_pending_pod_pinned_to_an_untouched_pool_is_medium(self):
         # Friday's rollout touched gpu-pool only; a pod pinned to default-pool that cannot schedule is not its doing.
@@ -572,8 +633,15 @@ class ClassifierSignatureTest(unittest.TestCase):
         self.assertEqual(entries(row), {(2, ur.HIGH)})
 
     def test_entry_6_no_matches_for_kind(self):
-        [row] = self.classify(events=[event("FailedCreate", 'error: unable to recognize "manifest.yaml": no matches for kind "FlowSchema" in version "flowcontrol.apiserver.k8s.io/v1beta3"', kind="CronJob")])
+        rejection = event("FailedCreate", 'error: unable to recognize "manifest.yaml": no matches for kind "FlowSchema" in version "flowcontrol.apiserver.k8s.io/v1beta3"', kind="CronJob")
+        [row] = self.classify(events=[rejection])
+        self.assertEqual(entries(row), {(6, ur.MEDIUM)})
+        self.assertEqual(row["classifications"][0]["detail"], ur.FROM_EVENT_TEXT_DETAIL.format(source=ur.TEXT_SOURCE_EVENT))
+        # The CronJob's Job carries a Failed condition its controller set: the API server agrees.
+        job = {"kind": "Job", "metadata": {"name": "x-29300000", "namespace": "apps", "ownerReferences": [{"kind": "CronJob", "name": "x"}]}, "status": {"conditions": [{"type": "Failed", "status": "True"}]}}
+        [row] = self.classify(events=[rejection], owners=[job])
         self.assertEqual(entries(row), {(6, ur.HIGH)})
+        self.assertEqual(row["classifications"][0]["detail"], "from event text; Job condition Failed=True agrees")
 
     def test_entry_6_needs_a_job_owner_and_an_error(self):
         [row] = self.classify(pods=[pod("legacy-flowcontrol-caller", phase="Failed", statuses=[{"name": "c0", "state": {"terminated": {"reason": "Error", "exitCode": 1}}}])])
@@ -705,7 +773,7 @@ class ClassifierSignatureTest(unittest.TestCase):
         # inference-server pins `seeded-role: pinned-inference`, a label only pinned-inference-pool's node carries.
         pools_only_default = [o for o in ops_for("seeded-a") if "/nodePools/default-pool" in o["targetLink"]]
         rows = by_object(symptoms_of("seeded-a", ops=pools_only_default), INFERENCE, "pending")
-        self.assertEqual({(c["entry"], c["confidence"]) for c in rows[0]["classifications"]}, {(12, ur.MEDIUM), (2, ur.MEDIUM)})
+        self.assertEqual({(c["entry"], c["confidence"]) for c in rows[0]["classifications"]}, {(2, ur.MEDIUM)})
         pinned_only = [o for o in ops_for("seeded-a") if "/nodePools/pinned-inference-pool" in o["targetLink"]]
         rows = by_object(symptoms_of("seeded-a", ops=pinned_only), INFERENCE, "pending")
         self.assertIn((2, ur.HIGH), {(c["entry"], c["confidence"]) for c in rows[0]["classifications"]})
@@ -828,14 +896,15 @@ class ClassifierSignatureTest(unittest.TestCase):
 
     def test_control_plane_entries_gate_on_a_master_upgrade(self):
         master_only = [o for o in ops_for("seeded-a") if o["operationType"] == "UPGRADE_MASTER"]
-        [row] = self.classify(events=[event("FailedCreate", 'failed calling webhook "gate.example.io"', kind="ReplicaSet")], ops=master_only)
+        failing = {"kind": "ReplicaSet", "metadata": {"name": "x", "namespace": "apps"}, "status": {"conditions": [{"type": "ReplicaFailure", "status": "True"}]}}
+        [row] = self.classify(events=[event("FailedCreate", 'failed calling webhook "gate.example.io"', kind="ReplicaSet")], ops=master_only, owners=[failing])
         self.assertEqual(entries(row), {(7, ur.HIGH)})
-        [row] = self.classify(events=[event("FailedCreate", 'failed calling webhook "gate.example.io"', kind="ReplicaSet")], ops=[])
+        [row] = self.classify(events=[event("FailedCreate", 'failed calling webhook "gate.example.io"', kind="ReplicaSet")], ops=[], owners=[failing])
         self.assertEqual(entries(row), {(7, ur.MEDIUM)})
         self.assertIn(ur.GATE_CLOSED_TEXT, row["classifications"][0]["detail"])
         # A pool-only window does not open the control-plane gate.
         pools_only = [o for o in ops_for("seeded-a") if o["operationType"] == "UPGRADE_NODES"]
-        [row] = self.classify(events=[event("FailedCreate", 'failed calling webhook "gate.example.io"', kind="ReplicaSet")], ops=pools_only)
+        [row] = self.classify(events=[event("FailedCreate", 'failed calling webhook "gate.example.io"', kind="ReplicaSet")], ops=pools_only, owners=[failing])
         self.assertEqual(entries(row), {(7, ur.MEDIUM)})
         [row] = self.classify(events=[event("FailedCreate", 'error: unable to recognize: no matches for kind "FlowSchema"', kind="CronJob")], ops=pools_only)
         self.assertEqual(entries(row), {(6, ur.MEDIUM)})
@@ -1205,13 +1274,13 @@ class LedgerAndGuardsTest(unittest.TestCase):
         self.assertNotIn("spec_text", json.dumps(doc))
         self.assertTrue(seeded["mitigations"])
         self.assertTrue(all(m["entry"] in ur.MITIGATIONS for m in seeded["mitigations"]))
-        self.assertEqual({g["entry"] for g in seeded["guards"] if g["kind"] == ur.GUARD_KIND_FAILURE}, {1, 2, 12, 14})
+        self.assertEqual({g["entry"] for g in seeded["guards"] if g["kind"] == ur.GUARD_KIND_FAILURE}, {1, 2, 14})
         self.assertEqual({g["entry"] for g in seeded["guards"] if g["kind"] == ur.GUARD_KIND_RISK}, {1, 4, 12, 13, 14, 17, 18, 19, 20})
         self.assertEqual(doc["guards"], result["guards"])
         self.assertEqual(seeded["baseline"]["shapes"], 9)
         self.assertEqual(seeded["next_upgrade"]["target"], "1.35.8-gke.1225000")
         sections = doc["sections"]
-        self.assertEqual([(i["cluster"], i["object"], i["entries"]) for i in sections["errors"]], [(SEEDED, INFERENCE, "2, 12"), (SEEDED, "seeded-capacity/PodDisruptionBudget/inference-server", "1")])
+        self.assertEqual([(i["cluster"], i["object"], i["entries"]) for i in sections["errors"]], [(SEEDED, INFERENCE, "2"), (SEEDED, "seeded-capacity/PodDisruptionBudget/inference-server", "1")])
         self.assertEqual([i["object"] for i in sections["warnings"]], [KUBE_DNS, TUNER, PAYMENTS, "seeded-stall/Deployment/inventory-api"])
         inference_row = next(s for r in doc["reviews"] for s in r["what_failed"] if s["object"] == INFERENCE)
         self.assertEqual((inference_row["onset_source"], inference_row["new_pods"], inference_row["pre_existing_pods"]), (ur.ONSET_FROM_POD, ["inference-server-778b78fdb8-ld26r", "inference-server-778b78fdb8-zxlkz"], ["inference-server-778b78fdb8-cp2pf"]))
@@ -1223,7 +1292,7 @@ class LedgerAndGuardsTest(unittest.TestCase):
         fresh = ur.guards_for(SEEDED, symptoms_of("seeded-a"), seen)
         first = ur.merge_guards(ur.empty_guards(), fresh, {SEEDED}, seen)
         ids = {g["id"] for g in first["guards"]}
-        self.assertEqual(ids, {ur.guard_id(SEEDED, 14, PAYMENTS), ur.guard_id(SEEDED, 2, INFERENCE), ur.guard_id(SEEDED, 12, INFERENCE), ur.guard_id(SEEDED, 1, "seeded-capacity/PodDisruptionBudget/inference-server")})
+        self.assertEqual(ids, {ur.guard_id(SEEDED, 14, PAYMENTS), ur.guard_id(SEEDED, 2, INFERENCE), ur.guard_id(SEEDED, 1, "seeded-capacity/PodDisruptionBudget/inference-server")})
         self.assertTrue(all(g["first_seen"] == g["last_seen"] == seen for g in first["guards"]))
         # Seen again under a replacement pod: the owner key matches, so
         # last_seen moves and first_seen stays; an unreviewed cluster's guard is kept.
@@ -1232,7 +1301,7 @@ class LedgerAndGuardsTest(unittest.TestCase):
         later = "2026-10-15T18:00:00Z"
         replaced = {**READS["seeded-a"], "pods": rename_pod(READS["seeded-a"]["pods"], "payments-api-79b77b8c67-vfrh9", "payments-api-79b77b8c67-zz9zz")}
         second = ur.merge_guards(first, ur.guards_for(SEEDED, symptoms_of("seeded-a", reads=replaced), later), {SEEDED}, later)
-        self.assertEqual(len(second["guards"]), 5)
+        self.assertEqual(len(second["guards"]), 4)
         payments = next(g for g in second["guards"] if g["entry"] == 14)
         self.assertEqual((payments["first_seen"], payments["last_seen"]), (seen, later))
         self.assertIn("e.g. payments-api-79b77b8c67-zz9zz", payments["evidence"])
@@ -1323,16 +1392,85 @@ class LedgerAndGuardsTest(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertEqual(ur.load_json(self.home / ur.LEDGER_FILENAME, {})["version"], ur.LEDGER_VERSION)
 
+    def test_lock_is_waited_for_twenty_minutes_polling(self):
+        lock_path = self.home / ur.LOCK_FILENAME
+        held = ur.acquire_lock(lock_path)
+        self.assertIsNotNone(held)
+        try:
+            # A fake clock advanced by each sleep: the budget is twenty minutes in fifteen-second polls,
+            # then None without a real wait.
+            now = [0.0]
+            slept = []
+
+            def sleep(seconds):
+                slept.append(seconds)
+                now[0] += seconds
+
+            self.assertIsNone(ur.acquire_lock(lock_path, sleep=sleep, clock=lambda: now[0]))
+            self.assertEqual((sum(slept), len(slept), ur.LOCK_WAIT, ur.LOCK_POLL_INTERVAL), (1200.0, 80, timedelta(minutes=20), timedelta(seconds=15)))
+            # Released during the wait: the lock is taken and the run proceeds.
+            released = []
+
+            def release_then_sleep(seconds):
+                slept.append(seconds)
+                if len(released) == 2:
+                    held.close()
+                released.append(seconds)
+
+            taken = ur.acquire_lock(lock_path, sleep=release_then_sleep, clock=lambda: 0.0)
+            self.assertIsNotNone(taken)
+            taken.close()
+        finally:
+            with contextlib_suppress(ValueError, OSError):
+                held.close()
+        # Through main: a second run waits the (patched) budget, prints the one line with the wait, writes nothing.
+        held = ur.acquire_lock(lock_path)
+        try:
+            with mock.patch.object(ur, "LOCK_WAIT", timedelta(seconds=0.05)), mock.patch.object(ur, "LOCK_POLL_INTERVAL", timedelta(seconds=0.01)):
+                with mock.patch.object(ur, "default_run", FakeFleet()), mock.patch.object(ur, "now_utc", lambda: NOW):
+                    with redirect_stdout(io.StringIO()) as out, redirect_stderr(io.StringIO()):
+                        rc = ur.main(["--full", "--project", PROJECT])
+                self.assertEqual(rc, 0)
+                self.assertEqual(out.getvalue().strip(), ur.lock_held_line(lock_path, timedelta(seconds=0.05)))
+                self.assertIn("waited 0 min for it; nothing written", out.getvalue())
+                self.assertFalse((self.home / ur.LEDGER_FILENAME).exists())
+                # Released while the second run waits: it takes the lock and runs.
+                threading.Timer(0.02, held.close).start()
+                with mock.patch.object(ur, "LOCK_WAIT", timedelta(seconds=5)):
+                    with mock.patch.object(ur, "default_run", FakeFleet()), mock.patch.object(ur, "now_utc", lambda: NOW):
+                        with redirect_stdout(io.StringIO()) as out, redirect_stderr(io.StringIO()):
+                            rc = ur.main(["--full", "--project", PROJECT, "--no-report"])
+                self.assertEqual(rc, 0)
+                self.assertIn(ur.SECTION_ERRORS, out.getvalue())
+                self.assertTrue((self.home / ur.LEDGER_FILENAME).exists())
+        finally:
+            with contextlib_suppress(ValueError, OSError):
+                held.close()
+
+    def test_after_upgrade_run_that_waited_prints_nothing_when_already_reviewed(self):
+        # The Sunday run recorded every operation; an after-upgrade wake that lands in the same minute
+        # waits for the lock, then finds its operations reviewed and prints nothing.
+        self.collect()
+        lock_path = self.home / ur.LOCK_FILENAME
+        held = ur.acquire_lock(lock_path)
+        threading.Timer(0.02, held.close).start()
+        with mock.patch.object(ur, "LOCK_POLL_INTERVAL", timedelta(seconds=0.01)), mock.patch.object(ur, "default_run", FakeFleet()), mock.patch.object(ur, "now_utc", lambda: NOW):
+            with redirect_stdout(io.StringIO()) as out, redirect_stderr(io.StringIO()) as err:
+                rc = ur.main(["--after-upgrade", "--project", PROJECT])
+        self.assertEqual((rc, out.getvalue()), (0, ""))
+        self.assertIn(ur.AFTER_UPGRADE_QUIET_LOG, err.getvalue())
+        self.assertEqual(sorted(p.name for p in (self.home / ur.REPORTS_SUBDIR).iterdir()), ["20261008T180000Z.json", "20261008T180000Z.md", ur.LATEST_REPORT_LINK])
+
     def test_lock_makes_a_second_run_exit_quietly(self):
         lock_path = self.home / ur.LOCK_FILENAME
         held = ur.acquire_lock(lock_path)
         self.assertIsNotNone(held)
         try:
-            with mock.patch.object(ur, "default_run", FakeFleet()), mock.patch.object(ur, "now_utc", lambda: NOW):
+            with mock.patch.object(ur, "LOCK_WAIT", timedelta(0)), mock.patch.object(ur, "default_run", FakeFleet()), mock.patch.object(ur, "now_utc", lambda: NOW):
                 with redirect_stdout(io.StringIO()) as out, redirect_stderr(io.StringIO()):
                     rc = ur.main(["--full", "--project", PROJECT])
             self.assertEqual(rc, 0)
-            self.assertEqual(out.getvalue().strip(), ur.lock_held_line(lock_path))
+            self.assertEqual(out.getvalue().strip(), ur.lock_held_line(lock_path, timedelta(0)))
             self.assertIn("another retrospective run holds", out.getvalue())
             self.assertFalse((self.home / ur.LEDGER_FILENAME).exists())
             self.assertFalse((self.home / ur.REPORTS_SUBDIR).exists())
@@ -1701,6 +1839,134 @@ class LedgerAndGuardsTest(unittest.TestCase):
         after = ur.load_json(self.home / ur.LEDGER_FILENAME, {})
         self.assertEqual(after["clusters"][SEEDED]["last_run"], before["clusters"][SEEDED]["last_run"])
         self.assertEqual(after["clusters"][SEEDED]["symptoms"], before["clusters"][SEEDED]["symptoms"])
+
+    def test_after_upgrade_reviews_a_settled_unreviewed_operation_once(self):
+        self.collect()  # Sunday: the full run records the operations it reviewed
+        ledger = ur.load_json(self.home / ur.LEDGER_FILENAME, {})
+        recorded = ledger["clusters"][SEEDED][ur.LEDGER_OPERATIONS_KEY]
+        self.assertEqual([(o["route"], o["reviewed_at"]) for o in recorded], [(ur.ROUTE_FULL, "2026-10-08T18:00:00Z")] * 4)
+        self.assertEqual({o["id"] for o in recorded}, {o["name"] for o in ops_for("seeded-a")})
+        later = datetime(2026, 10, 15, 18, 0, tzinfo=timezone.utc)
+        # Nothing new since: the after-upgrade run reads no cluster, prints nothing, writes nothing.
+        quiet, fleet = self.collect(now=later, full=False, after_upgrade=True)
+        self.assertEqual((quiet["quiet"], quiet["report"], quiet["reviews"], quiet["scoped"]), (True, "", [], True))
+        self.assertFalse(any("get-credentials" in " ".join(c) or c[0] == "kubectl" for c in fleet.calls))
+        self.assertEqual(sorted(p.name for p in (self.home / ur.REPORTS_SUBDIR).iterdir()), ["20261008T180000Z.json", "20261008T180000Z.md", ur.LATEST_REPORT_LINK])
+        self.assertEqual(ur.load_json(self.home / ur.LEDGER_FILENAME, {})["updated_at"], "2026-10-08T18:00:00Z")
+        # A pool upgrade on seeded-a that ended thirty minutes ago: selected by the operation alone,
+        # reviewed as a scoped run; gemma, with nothing new, is neither read nor listed.
+        fresh = copy.deepcopy(next(o for o in ops_for("seeded-a") if "pinned-inference-pool" in o["targetLink"]))
+        fresh.update(name="operation-after-1", startTime="2026-10-15T17:00:00Z", endTime="2026-10-15T17:30:00Z")
+        result, fleet = self.collect(FakeFleet(operations=OPERATIONS + [fresh]), now=later, full=False, after_upgrade=True)
+        self.assertEqual([(r["cluster"], r["what_happened"]["status"]) for r in result["reviews"]], [(SEEDED, "upgraded")])
+        self.assertEqual(result["reviews"][0]["what_happened"]["reasons"], [ur.AFTER_UPGRADE_REASON_FORMAT.format(count=1, floor="2026-10-15T17:45:00Z")])
+        self.assertEqual([op["name"] for op in result["reviews"][0]["what_happened"]["operations"]], ["operation-after-1"])
+        self.assertEqual((result["scoped"], result["after_upgrade"], result["scope_reason"], result["unchanged"]), (True, True, ur.AFTER_UPGRADE_SCOPE_TEXT, []))
+        self.assertFalse(any("gemma" in " ".join(c) for c in fleet.calls if "get-credentials" in c))
+        self.assertTrue(Path(result["report_path"]).name.endswith("-scoped.md"))
+        self.assertEqual(os.readlink(self.home / ur.REPORTS_SUBDIR / ur.LATEST_REPORT_LINK), "20261008T180000Z.md")
+        self.assertIn(ur.INFO_SCOPED.format(reason=ur.AFTER_UPGRADE_SCOPE_TEXT), ur.render_report(result))
+        # The ledger: the operation reviewed, by the after-upgrade route; versions, last_run and the
+        # symptom set stay the full run's.
+        after = ur.load_json(self.home / ur.LEDGER_FILENAME, {})
+        self.assertEqual({k: after["clusters"][SEEDED][k] for k in ("control_plane", "node_pools", "last_run", "symptoms")}, {k: ledger["clusters"][SEEDED][k] for k in ("control_plane", "node_pools", "last_run", "symptoms")})
+        self.assertEqual([(o["id"], o["route"], o["reviewed_at"], o["end"]) for o in after["clusters"][SEEDED][ur.LEDGER_OPERATIONS_KEY] if o["route"] != ur.ROUTE_FULL], [("operation-after-1", ur.ROUTE_AFTER_UPGRADE, "2026-10-15T18:00:00Z", "2026-10-15T17:30:00Z")])
+        self.assertEqual(after["clusters"][GEMMA], ledger["clusters"][GEMMA])
+        # A second wake for the same operation: nothing new, nothing printed.
+        again, _ = self.collect(FakeFleet(operations=OPERATIONS + [fresh]), now=later + timedelta(minutes=15), full=False, after_upgrade=True)
+        self.assertTrue(again["quiet"])
+        # The next full run still selects the cluster on the operation's end time, refreshes its
+        # baseline, and reports the operation as already reviewed by the after-upgrade route.
+        full, _ = self.collect(FakeFleet(operations=OPERATIONS + [fresh]), now=datetime(2026, 10, 18, 18, 0, tzinfo=timezone.utc))
+        seeded = next(r for r in full["reviews"] if r["cluster"] == SEEDED)
+        [op] = seeded["what_happened"]["operations"]
+        self.assertEqual(op["already_reviewed"], {"route": ur.ROUTE_AFTER_UPGRADE, "at": "2026-10-15T18:00:00Z"})
+        self.assertIn("| DONE; " + ur.ALREADY_REVIEWED_FORMAT.format(route=ur.ROUTE_AFTER_UPGRADE, at="2026-10-15T18:00:00Z") + " |", ur.render_report(full))
+        self.assertEqual(ur.load_json(self.home / ur.LEDGER_FILENAME, {})["clusters"][SEEDED]["last_run"], "2026-10-18T18:00:00Z")
+
+    def test_after_upgrade_holds_an_operation_under_fifteen_minutes_old(self):
+        self.collect()
+        later = datetime(2026, 10, 15, 18, 0, tzinfo=timezone.utc)
+        just_ended = copy.deepcopy(next(o for o in ops_for("seeded-a") if "pinned-inference-pool" in o["targetLink"]))
+        just_ended.update(name="operation-fresh", startTime="2026-10-15T17:40:00Z", endTime="2026-10-15T17:50:00Z")
+        # Alone, the fresh operation holds its cluster back and the run is quiet.
+        quiet, fleet = self.collect(FakeFleet(operations=OPERATIONS + [just_ended]), now=later, full=False, after_upgrade=True)
+        self.assertTrue(quiet["quiet"])
+        self.assertEqual([(u["cluster"], u["operation"]["name"], u.get("settling")) for u in quiet["upgrading"]], [(SEEDED, "operation-fresh", True)])
+        self.assertFalse(any("get-credentials" in " ".join(c) for c in fleet.calls))
+        # Beside a settled operation on another cluster, the held cluster is listed with its reason and
+        # not reviewed; the next wake, fifteen minutes on, reviews it.
+        gemma_op = copy.deepcopy(just_ended)
+        gemma_op.update(name="operation-gemma", targetLink=just_ended["targetLink"].replace("/clusters/seeded-a/nodePools/pinned-inference-pool", "/clusters/gemma-gpu-upgraded/nodePools/gpu-pool"), startTime="2026-10-15T17:00:00Z", endTime="2026-10-15T17:20:00Z")
+        result, _ = self.collect(FakeFleet(operations=OPERATIONS + [just_ended, gemma_op]), now=later, full=False, after_upgrade=True)
+        self.assertEqual([r["cluster"] for r in result["reviews"]], [GEMMA])
+        self.assertIn("- " + ur.SETTLING_LINE.format(cluster=SEEDED, operation="UPGRADE_NODES", target="pinned-inference-pool", end="2026-10-15T17:50:00Z", minutes=15), ur.render_report(result))
+        self.assertNotIn("operation-fresh", json.dumps(ur.load_json(self.home / ur.LEDGER_FILENAME, {})["clusters"][SEEDED][ur.LEDGER_OPERATIONS_KEY]))
+        # Fifteen minutes on, a settled and a fresher operation on the one cluster: the settled one is
+        # reviewed now, the fresher one named as waiting and left out of the record for the next wake.
+        fresher = copy.deepcopy(just_ended)
+        fresher.update(name="operation-fresher", startTime="2026-10-15T18:05:00Z", endTime="2026-10-15T18:10:00Z")
+        settled, _ = self.collect(FakeFleet(operations=OPERATIONS + [just_ended, gemma_op, fresher]), now=later + timedelta(minutes=15), full=False, after_upgrade=True)
+        self.assertEqual([r["cluster"] for r in settled["reviews"]], [SEEDED])
+        self.assertEqual([op["name"] for op in settled["reviews"][0]["what_happened"]["operations"]], ["operation-fresh"])
+        self.assertIn(ur.SETTLING_REASON_FORMAT.format(count=1, minutes=15), settled["reviews"][0]["what_happened"]["reasons"])
+        recorded = ur.load_json(self.home / ur.LEDGER_FILENAME, {})["clusters"][SEEDED][ur.LEDGER_OPERATIONS_KEY]
+        self.assertEqual([o["id"] for o in recorded if o["route"] == ur.ROUTE_AFTER_UPGRADE], ["operation-fresh"])
+        last, _ = self.collect(FakeFleet(operations=OPERATIONS + [just_ended, gemma_op, fresher]), now=later + timedelta(minutes=30), full=False, after_upgrade=True)
+        self.assertEqual([op["name"] for op in last["reviews"][0]["what_happened"]["operations"]], ["operation-fresh", "operation-fresher"])
+        self.assertEqual([op.get("already_reviewed", {}).get("route") for op in last["reviews"][0]["what_happened"]["operations"]], [ur.ROUTE_AFTER_UPGRADE, None])
+
+    def test_after_upgrade_rejects_full_and_cluster(self):
+        with self.assertRaises(argparse.ArgumentTypeError):
+            self.collect(full=True, after_upgrade=True)
+        with self.assertRaises(argparse.ArgumentTypeError):
+            self.collect(full=False, after_upgrade=True, cluster=[SEEDED])
+        for argv, text in ((["--after-upgrade", "--full", "--project", PROJECT], ur.AFTER_UPGRADE_WITH_FULL_TEXT), (["--after-upgrade", "--cluster", SEEDED], ur.AFTER_UPGRADE_WITH_CLUSTER_TEXT)):
+            with mock.patch.object(ur, "default_run", FakeFleet()), mock.patch.object(ur, "now_utc", lambda: NOW):
+                with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()) as err:
+                    self.assertEqual(ur.main(argv), ur.EXIT_USAGE)
+            self.assertIn(text, err.getvalue())
+
+    def test_scoped_run_writes_only_the_operations_it_reviewed(self):
+        self.collect()
+        before = ur.load_json(self.home / ur.LEDGER_FILENAME, {})
+        # A --cluster run (no --since) reviews seeded-a again over the widened window: its four
+        # operations are already on record from the full run and the report says so; versions,
+        # last_run and the symptom set do not move.
+        result, _ = self.collect(now=datetime(2026, 10, 15, 18, 0, tzinfo=timezone.utc), cluster=[SEEDED])
+        [review] = result["reviews"]
+        self.assertEqual({op["already_reviewed"]["route"] for op in review["what_happened"]["operations"]}, {ur.ROUTE_FULL})
+        after = ur.load_json(self.home / ur.LEDGER_FILENAME, {})
+        self.assertEqual(after["clusters"][SEEDED], before["clusters"][SEEDED])
+        self.assertEqual(after["clusters"][GEMMA], before["clusters"][GEMMA])
+        # A scoped run on a cluster the ledger has never seen records only the operations it reviewed;
+        # the next full run still reviews the cluster as first seen.
+        twin = cluster_doc("seeded-a")
+        twin["name"] = "seeded-twin"
+        twin_ops = copy.deepcopy(ops_for("seeded-a"))
+        for o in twin_ops:
+            o["targetLink"] = o["targetLink"].replace("/clusters/seeded-a", "/clusters/seeded-twin")
+            o["name"] += "-twin"
+        twin_key = f"{PROJECT}/{LOCATION}/seeded-twin"
+        fleet = FakeFleet(clusters=[cluster_doc("seeded-a"), cluster_doc("gemma-gpu-upgraded"), twin], operations=OPERATIONS + twin_ops)
+        with mock.patch.dict(READS, {"seeded-twin": READS["seeded-a"]}):
+            scoped, _ = self.collect(fleet, now=datetime(2026, 10, 15, 18, 0, tzinfo=timezone.utc), cluster=[twin_key])
+            self.assertEqual([(r["cluster"], r["what_happened"]["status"], r["what_happened"]["versions_before"], r["reviewed"]) for r in scoped["reviews"]], [(twin_key, "new", None, True)])
+            entry = ur.load_json(self.home / ur.LEDGER_FILENAME, {})["clusters"][twin_key]
+            self.assertEqual(set(entry), {ur.LEDGER_OPERATIONS_KEY})
+            self.assertEqual([o["route"] for o in entry[ur.LEDGER_OPERATIONS_KEY]], [ur.ROUTE_SCOPED] * 4)
+            full, _ = self.collect(fleet, now=datetime(2026, 10, 16, 18, 0, tzinfo=timezone.utc))
+        twin_review = next(r for r in full["reviews"] if r["cluster"] == twin_key)
+        self.assertEqual((twin_review["what_happened"]["status"], twin_review["what_happened"]["versions_before"]), ("new", None))
+        self.assertEqual({op["already_reviewed"]["route"] for op in twin_review["what_happened"]["operations"]}, {ur.ROUTE_SCOPED})
+
+    def test_reviewed_operations_are_kept_while_inside_the_selection_window(self):
+        self.collect()
+        self.assertEqual(len(ur.load_json(self.home / ur.LEDGER_FILENAME, {})["clusters"][SEEDED][ur.LEDGER_OPERATIONS_KEY]), 4)
+        # Three weeks on, the window (the smaller of --since and last_run) has moved past every
+        # recorded operation: none can be selected again, so none is kept.
+        self.collect(now=datetime(2026, 10, 30, 18, 0, tzinfo=timezone.utc))
+        self.assertEqual(ur.load_json(self.home / ur.LEDGER_FILENAME, {})["clusters"][SEEDED][ur.LEDGER_OPERATIONS_KEY], [])
 
     def test_crash_record_blocks_until_reset(self):
         self.collect()
@@ -2143,7 +2409,7 @@ class LedgerAndGuardsTest(unittest.TestCase):
         result, _ = self.collect(project=None, full=False)
         report = ur.render_report(result)
         self.assertIn(ur.OUTSIDE_FLEET_GUARD_TEXT, report)
-        self.assertNotIn(ur.UNCLASSIFIED_GUARD_TEXT, report.split(f"### 2, 12 — {SEEDED}")[1].split("### ")[0])
+        self.assertNotIn(ur.UNCLASSIFIED_GUARD_TEXT, report.split(f"### 2 — {SEEDED}")[1].split("### ")[0])
 
     def test_store_defaults_live_under_the_store_home(self):
         result, _ = self.collect()
@@ -2238,10 +2504,10 @@ class ReportTest(unittest.TestCase):
         # Two of inference-server's three Pending pods were displaced inside the pinned-inference-pool
         # drain; a Pending replica created in the window is new. The third has waited since 09-25.
         self.assertEqual([line for line in errors.splitlines() if line.startswith("### ")], [
-            f"### 2, 12 — {SEEDED} — `{INFERENCE}`",
+            f"### 2 — {SEEDED} — `{INFERENCE}`",
             f"### 1 — {SEEDED} — `seeded-capacity/PodDisruptionBudget/inference-server`",
         ])
-        inference = errors.split("### 2, 12")[1].split("### 1 —")[0]
+        inference = errors.split("### 2 —")[1].split("### 1 —")[0]
         self.assertNotIn(ur.PREDATES_UPGRADE_TEXT, inference)
         self.assertIn("; e.g. inference-server-778b78fdb8-ld26r; 1 pre-existing since 2026-09-25T17:02:48Z (e.g. inference-server-778b78fdb8-cp2pf)", inference)
         for part in (ur.PART_WHAT_HAPPENED, ur.PART_WHAT_FAILED, ur.PART_MITIGATE, ur.PART_MITIGATION_SET_UP):
@@ -2249,8 +2515,9 @@ class ReportTest(unittest.TestCase):
         self.assertIn("| UPGRADE_NODES | pinned-inference-pool | 2026-10-08T04:20:35Z | 2026-10-08T05:24:10Z | 63 min | DONE |  |", inference)
         self.assertIn("| control plane | - | 1.35.8-gke.1380001 |", inference)
         self.assertIn("| Unschedulable | first seen | 2. No spare capacity for the displaced pods | high | 3 of 4 pods: Insufficient cpu; e.g. inference-server-778b78fdb8-ld26r; 1 pre-existing since 2026-09-25T17:02:48Z (e.g. inference-server-778b78fdb8-cp2pf) |", inference)
-        self.assertIn("| Unschedulable | first seen | 12. A node label is removed (selector seeded-role=pinned-inference) | medium |", inference)
-        self.assertIn(f"- **12. A node label is removed** — For {INFERENCE} (selector seeded-role=pinned-inference):", inference)
+        # One entry per symptom: the "didn't match" clauses for the pools the pod does not target are
+        # not a second finding, so entry 12 appears nowhere on this incident.
+        self.assertNotIn("12. A node label is removed", inference)
         self.assertIn(f"- guard `{ur.guard_id(SEEDED, 2, INFERENCE)}` failure entry 2 (high), first seen 2026-10-08T18:00:00Z", inference)
         self.assertIn("Read today: the readiness mode of `fleet-upgrade-verification` grades it `blocked`, and the obtainability audit reports it as `blocking-pdb`.", errors)
         # Warnings: medium, system, unclassified.
@@ -2271,7 +2538,7 @@ class ReportTest(unittest.TestCase):
         seeded_block = info.split(f"### {SEEDED}")[1]
         self.assertIn(f"{ur.PART_NEXT_UPGRADE} channel REGULAR; target 1.35.8-gke.1225000; cluster at 1.35.8-gke.1380001, at or ahead of the target. Window: daily at 03:00 UTC for 4h; next opens 2026-10-09T03:00:00Z. Exclusions: none.", seeded_block)
         self.assertIn("| `seeded-shapes/Deployment/legacy-registry-pull` | 20. Images on a retired registry | high | image k8s.gcr.io/pause:3.9 |", seeded_block)
-        self.assertIn(f"{ur.PART_BASELINE} control plane 1.35.8-gke.1380001; pools default-pool 1.35.8-gke.1380001, idle-batch-pool 1.35.8-gke.1380001, pinned-inference-pool 1.35.8-gke.1380001; 23 pods, 1 budgets, 9 shapes. Symptom baseline recorded: 4 symptom(s), 4 first seen. first run: graded by onset only, no previous symptom set. Guards written: 13.", seeded_block)
+        self.assertIn(f"{ur.PART_BASELINE} control plane 1.35.8-gke.1380001; pools default-pool 1.35.8-gke.1380001, idle-batch-pool 1.35.8-gke.1380001, pinned-inference-pool 1.35.8-gke.1380001; 23 pods, 1 budgets, 9 shapes. Symptom baseline recorded: 4 symptom(s), 4 first seen. first run: graded by onset only, no previous symptom set. Guards written: 12.", seeded_block)
         gemma_block = info.split(f"### {GEMMA}")[1].split("### ")[0]
         self.assertIn("behind the target. Window: DAILY at", gemma_block)
         self.assertIn("Exclusions: hold-gpu-minor (NO_MINOR_UPGRADES) until 2026-10-21T00:00:00Z [active].", gemma_block)
@@ -2362,7 +2629,7 @@ class ReportTest(unittest.TestCase):
             with redirect_stdout(io.StringIO()) as out, redirect_stderr(io.StringIO()):
                 rc = ur.main(["--project", PROJECT, "--dry-run", "--report", str(home / "r.md")])
         self.assertEqual(rc, 0)
-        self.assertIn(f"### 2, 12 — {SEEDED} — `{INFERENCE}`", out.getvalue())
+        self.assertIn(f"### 2 — {SEEDED} — `{INFERENCE}`", out.getvalue())
         self.assertFalse((home / "r.md").exists())
         self.assertFalse((home / ur.LEDGER_FILENAME).exists())
 
