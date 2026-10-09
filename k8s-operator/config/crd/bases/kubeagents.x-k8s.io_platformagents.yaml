@@ -9711,6 +9711,44 @@ spec:
                           A gitlab forge's credentialsRef is required by the API server too, so it
                           holds with the webhook off -- the chart ships it off.
                         properties:
+                          caBundleRef:
+                            description: |-
+                              CABundleRef names a Secret in the PlatformAgent's namespace that holds
+                              the PEM CA certificates that signed this forge's TLS certificate:
+                              a self-managed instance behind a private CA. The broker trusts these
+                              certificates for this forge's host only, beside the system bundle, in
+                              its API client and in git, so they never vouch for another host. It is
+                              for a gitlab forge at a self-managed host: it is refused when host is
+                              empty or gitlab.com, whose certificate the public CAs sign.
+
+                              The operator mounts the one key into the credential broker's pod only.
+                              The mount is optional: a missing Secret does not stop the broker, and
+                              calls to this forge answer FORGE_TLS_UNTRUSTED until it exists. The
+                              broker reads the file on each call, so an update reaches it with no
+                              restart.
+                            properties:
+                              key:
+                                default: ca.crt
+                                description: |-
+                                  Key is the Secret key that holds the PEM certificates. Defaults to
+                                  "ca.crt".
+                                maxLength: 253
+                                pattern: ^[-._a-zA-Z0-9]+$
+                                type: string
+                              name:
+                                description:
+                                  "Name is the Secret's name: a lowercase
+                                  DNS subdomain."
+                                maxLength: 253
+                                minLength: 1
+                                pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$
+                                type: string
+                            required:
+                              - name
+                            type: object
+                            x-kubernetes-validations:
+                              - message: caBundleRef.key may not be . or start with ..
+                                rule: "!has(self.key) || !(self.key == '.' || self.key.startsWith('..'))"
                           credentialsRef:
                             description: |-
                               CredentialsRef names a Secret in the PlatformAgent's namespace holding
@@ -9809,6 +9847,20 @@ spec:
                             rule:
                               "!has(self.provider) || self.provider != 'gitlab'
                               || has(self.credentialsRef)"
+                          - message:
+                              "caBundleRef is for a gitlab forge: the github provider
+                              does not read it yet, and a CA that nothing reads would
+                              hide a certificate problem"
+                            rule:
+                              "!has(self.caBundleRef) || (has(self.provider) && self.provider
+                              == 'gitlab')"
+                          - message:
+                              "caBundleRef is for a self-managed host: gitlab.com
+                              presents a certificate the public CAs sign, and a private
+                              CA must never vouch for it"
+                            rule:
+                              "!has(self.caBundleRef) || (has(self.host) && size(self.host)
+                              > 0 && !(self.host.lowerAscii() in ['gitlab.com', 'www.gitlab.com']))"
                       maxItems: 16
                       type: array
                       x-kubernetes-list-map-keys:

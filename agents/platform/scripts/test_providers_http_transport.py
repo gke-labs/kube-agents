@@ -160,7 +160,13 @@ class BoundsTest(unittest.TestCase):
         cert = ssl.SSLCertVerificationError(1, "[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed")
         with self.assertRaises(WorkspaceError) as caught:
             transport(Opener(urllib.error.URLError(cert))).api("GET", "x")
-        self.assertIn("TLS certificate failed verification", caught.exception.fields["detail"])
+        # #2750: a certificate has its own code, not "one retry is
+        # reasonable", and the detail names the host it failed for.
+        self.assertEqual("FORGE_TLS_UNTRUSTED", caught.exception.fields["code"])
+        self.assertEqual(502, caught.exception.status)
+        self.assertIn("forge.example.test", caught.exception.fields["detail"])
+        self.assertIn("certificate verify failed", caught.exception.fields["detail"])
+        self.assertIn("caBundleRef", str(caught.exception))
         # Review (#2439): the verifier's own reason was dropped, so an expired
         # certificate or a hostname mismatch read as a private CA.
         expired = ssl.SSLCertVerificationError(1, "[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed")
@@ -270,7 +276,7 @@ class BoundsTest(unittest.TestCase):
         self.assertIsNone(
             handler.redirect_request(None, None, 302, "Found", {}, "https://elsewhere.test/")
         )
-        opener = transport(None)._open.__self__
+        opener = transport(None)._build_opener()
         self.assertTrue(any(isinstance(h, _RefuseRedirect) for h in opener.handlers))
 
     def test_a_redirect_says_the_host_is_misconfigured_not_retry(self):

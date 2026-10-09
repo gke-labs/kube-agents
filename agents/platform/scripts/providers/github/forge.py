@@ -103,6 +103,11 @@ class GitHubForge(Forge):
                         f"allowedPaths is not supported for {cls.name}: scope the "
                         "App installation's repositories instead"
                     )
+                # Refused for the same reason: this forge reads no CA bundle,
+                # and git alone trusting one for github.com would leave the two
+                # clients disagreeing about the host's certificate.
+                if entry.get("ca_file"):
+                    raise ValueError(f"caFile is not supported for {cls.name}: it reads no CA bundle")
         return (cls(refresh=config.get("refresh"), mint=config.get("mint")),)
 
     def read_credential(self, repo: str) -> Credential:

@@ -69,7 +69,7 @@ from typing import Callable, Iterable, Mapping
 
 import repo_ref
 import workspace_paths
-from providers import pinned_base
+from providers import pinned_base, tls_refusal as _tls_refusal
 
 LOGGER = logging.getLogger("credential-proxy")
 
@@ -214,6 +214,19 @@ class Conflict(ContentWorkspaceError):
 class GitFailed(ContentWorkspaceError):
     status = 502
     code = "workspace.git-failed"
+
+
+class TlsUntrusted(ContentWorkspaceError):
+    """git could not verify the forge's TLS certificate, or load its CA.
+
+    Its own code rather than `workspace.git-failed`: no retry fixes it, and the
+    action is an administrator's, which the message names by its cause -- a CA
+    to name in caBundleRef, a certificate to renew or reissue, or a CA
+    Secret to create or correct.
+    """
+
+    status = 502
+    code = "FORGE_TLS_UNTRUSTED"
 
 
 class BaseBranchMissing(ContentWorkspaceError):
@@ -691,6 +704,7 @@ class ContentWorkspaceStore:
         clock: Callable[[], float] = time.monotonic,
         locate: Locate | None = None,
         pinned_bases: Mapping[tuple[str, str], str] | None = None,
+        tls_refusal: Callable[[str], object] | None = None,
     ) -> None:
         # Resolved, because `assert_disjoint_roots` resolves both sides and
         # `_redact` matches this value against paths git prints -- which git
@@ -713,6 +727,10 @@ class ContentWorkspaceStore:
             # the `git_hooks_dir` chmod in the executor already warns.
             LOGGER.warning("could not restrict the content workspace root %s", self.tree_root)
         self._runner = runner
+        # git's output to the FORGE_TLS_UNTRUSTED refusal it stands for, or
+        # None. The broker hands its own, which names a forge's CA Secret;
+        # without one, the shared reading names the cause alone.
+        self._tls_refusal = tls_refusal or _tls_refusal
         self.base_branch = (
             base_branch.strip()
             or os.environ.get("CREDENTIAL_PROXY_BASE_BRANCH", "").strip()
@@ -941,6 +959,10 @@ class ContentWorkspaceStore:
             result = self._runner(["git", *argv], cwd=cwd)
         exit_code = getattr(result, "exit_code", 1)
         if check and exit_code != 0:
+            refusal = self._tls_refusal(getattr(result, "stderr", ""))
+            if refusal is not None:
+                detail = getattr(refusal, "fields", {}).get("detail", "")
+                raise TlsUntrusted(f"`git {argv[0]}` failed: {refusal} ({self._redact(detail)})")
             raise GitFailed(
                 f"`git {argv[0]}` failed with exit code {exit_code}: "
                 f"{self._redact(getattr(result, 'stderr', ''))}"
@@ -1823,6 +1845,12 @@ class ContentWorkspaceStore:
                 config=self._push_config(workspace),
             )
             if getattr(result, "exit_code", 1) != 0:
+                # Read as `_git` reads a checked failure: a certificate is
+                # answered by its cause, not as "push failed".
+                refusal = self._tls_refusal(getattr(result, "stderr", ""))
+                if refusal is not None:
+                    detail = getattr(refusal, "fields", {}).get("detail", "")
+                    raise TlsUntrusted(f"`git push` failed: {refusal} ({self._redact(detail)})")
                 stderr = (getattr(result, "stderr", "") or "").lower()
                 if "stale info" in stderr or "rejected" in stderr:
                     raise Conflict(

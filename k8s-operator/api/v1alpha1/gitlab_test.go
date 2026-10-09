@@ -188,12 +188,12 @@ func TestBrokerForgesIsNilWithoutAForgeThatNeedsOne(t *testing.T) {
 		"gitlab with nothing to serve": {Forges: []ForgeSpec{glForge("gl", "", "")}},
 	} {
 		resolved, _ := in.ResolveGit()
-		if got := resolved.BrokerForges("/creds"); got != nil {
+		if got := resolved.BrokerForges("/creds", "/ca"); got != nil {
 			t.Errorf("%s: BrokerForges = %+v, expected none", name, got)
 		}
 	}
 	var none *ResolvedIntegration
-	if none.BrokerForges("/creds") != nil {
+	if none.BrokerForges("/creds", "/ca") != nil {
 		t.Error("BrokerForges on no declaration is not nil")
 	}
 }
@@ -221,7 +221,7 @@ func TestBrokerForgesListsGitHubFirstAndEachGitLabHostOnce(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	got, err := json.Marshal(resolved.BrokerForges("/creds"))
+	got, err := json.Marshal(resolved.BrokerForges("/creds", "/ca"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -261,7 +261,7 @@ func TestARefusedRepositoryWidensNothingTheBrokerIsGiven(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	got := resolved.BrokerForges("/creds")
+	got := resolved.BrokerForges("/creds", "/ca")
 	if len(got) != 2 || !slices.Equal(got[1].AllowedPaths, []string{"acme"}) {
 		t.Errorf("BrokerForges = %+v, expected the gitlab entry narrowed to acme alone", got)
 	}
@@ -276,7 +276,7 @@ func TestARefusedRepositoryWidensNothingTheBrokerIsGiven(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := resolved.BrokerForges("/creds"); got != nil {
+	if got := resolved.BrokerForges("/creds", "/ca"); got != nil {
 		t.Errorf("BrokerForges = %+v, expected none for a forge that serves nothing accepted", got)
 	}
 	if warnings := resolved.Warnings(); !slices.ContainsFunc(warnings, func(w string) bool {
@@ -297,7 +297,7 @@ func TestAnInvalidSecretNameIsRefusedAndNotMounted(t *testing.T) {
 		if len(problems) != 1 || problems[0].Path.String() != "forges[0].credentialsRef" {
 			t.Errorf("%q: Problems() = %v, expected one at forges[0].credentialsRef", name, problems)
 		}
-		if got := resolved.BrokerForges("/creds"); got != nil {
+		if got := resolved.BrokerForges("/creds", "/ca"); got != nil {
 			t.Errorf("%q: BrokerForges = %+v, expected none", name, got)
 		}
 	}
@@ -329,7 +329,7 @@ func TestOnlyAForgeTheBrokerIsGivenClaimsItsHost(t *testing.T) {
 				t.Errorf("%s: the second forge was refused as shadowed: %v", name, p.Err)
 			}
 		}
-		got := resolved.BrokerForges("/creds")
+		got := resolved.BrokerForges("/creds", "/ca")
 		if len(got) != 2 || got[1].Name != "b" {
 			t.Errorf("%s: BrokerForges = %+v, expected github and b", name, got)
 		}
@@ -369,7 +369,7 @@ func TestTheGitHubEntryNeverCarriesAllowedPaths(t *testing.T) {
 		Repositories: []RepositorySpec{repo("github", "infra", RepositoryRoleGitOps), repo("gl", "infra", RepositoryRoleManaged)},
 	}
 	resolved, _ := in.ResolveGit()
-	raw, _ := json.Marshal(resolved.BrokerForges("/creds")[0])
+	raw, _ := json.Marshal(resolved.BrokerForges("/creds", "/ca")[0])
 	if string(raw) != `{"provider":"github","host":"github.com"}` {
 		t.Errorf("github entry = %s", raw)
 	}
@@ -419,7 +419,7 @@ func TestAForgeHostIsNeverAGitLabGroup(t *testing.T) {
 	// And the forge is refused for it, so nothing reaches the broker.
 	in := &IntegrationSpec{Forges: []ForgeSpec{glForge("gl", "", "gitlab.com")}}
 	resolved, _ := in.ResolveGit()
-	if got := resolved.BrokerForges("/creds"); got != nil {
+	if got := resolved.BrokerForges("/creds", "/ca"); got != nil {
 		t.Errorf("BrokerForges rendered a forge whose namespace is a host: %+v", got)
 	}
 }
@@ -487,5 +487,87 @@ func TestAGitLabNamespaceSegmentMayNotEndInAReservedSuffix(t *testing.T) {
 		if err := provider.ValidateNamespace(ok); err != nil {
 			t.Errorf("ValidateNamespace(%q) refused a valid group: %v", ok, err)
 		}
+	}
+}
+
+// A self-managed forge behind a private CA names it in caBundleRef, and
+// the broker's entry for that forge, and no other, carries the file it is
+// mounted at. The key defaults to ca.crt.
+func TestACABundleRefReachesThatForgesBrokerEntryOnly(t *testing.T) {
+	onprem := glForge("onprem", "gitlab.example.com", "team")
+	onprem.CABundleRef = &ForgeCABundleRef{Name: "onprem-ca"}
+	in := &IntegrationSpec{
+		Forges:       []ForgeSpec{ghForge("github", "acme"), glForge("gl", "", "acme"), onprem},
+		Repositories: []RepositorySpec{repo("github", "infra", RepositoryRoleGitOps)},
+	}
+	resolved, err := in.ResolveGit()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if problems := resolved.Problems(); len(problems) != 0 {
+		t.Fatalf("Problems() = %v", problems)
+	}
+	forges := resolved.BrokerForges("/creds", "/ca")
+	got, err := json.Marshal(forges)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := `[{"provider":"github","host":"github.com"},` +
+		`{"provider":"gitlab","host":"gitlab.com","tokenPath":"/creds/gl/token","allowedPaths":["acme"]},` +
+		`{"provider":"gitlab","host":"gitlab.example.com","tokenPath":"/creds/onprem/token","caSecret":"onprem-ca","caKey":"ca.crt","caFile":"/ca/onprem/ca.crt","allowedPaths":["team"]}]`
+	if string(got) != want {
+		t.Errorf("BrokerForges =\n %s\nexpected\n %s", got, want)
+	}
+	last := forges[len(forges)-1]
+	if last.CABundleSecret != "onprem-ca" || last.CABundleKey != ForgeCABundleDefaultKey {
+		t.Errorf("the entry projects %q key %q; expected onprem-ca key %q", last.CABundleSecret, last.CABundleKey, ForgeCABundleDefaultKey)
+	}
+}
+
+// The github provider reads no CA bundle, so the field is refused there
+// rather than ignored: an administrator who set it would believe the
+// certificate trusted. Names the API server would refuse on the broker
+// Deployment are refused here too, and the forge is withheld.
+func TestACABundleRefIsRefusedWhereItCannotBeUsed(t *testing.T) {
+	github := ghForge("github", "acme")
+	github.CABundleRef = &ForgeCABundleRef{Name: "gh-ca"}
+	badName := glForge("bad-name", "gitlab.one.example", "team")
+	badName.CABundleRef = &ForgeCABundleRef{Name: "Not_A_Name"}
+	badKey := glForge("bad-key", "gitlab.two.example", "team")
+	badKey.CABundleRef = &ForgeCABundleRef{Name: "ok", Key: "no spaces allowed"}
+	// The provider's public host never takes a private CA, in
+	// any spelling, and an empty host is that host.
+	saas := glForge("saas", "", "acme")
+	saas.CABundleRef = &ForgeCABundleRef{Name: "ca"}
+	saasNamed := glForge("saas-named", "gitlab.com", "beta")
+	saasNamed.CABundleRef = &ForgeCABundleRef{Name: "ca"}
+	saasWWW := glForge("saas-www", "WWW.GitLab.com", "gamma")
+	saasWWW.CABundleRef = &ForgeCABundleRef{Name: "ca"}
+	in := &IntegrationSpec{
+		Forges: []ForgeSpec{github, badName, badKey, saas, saasNamed, saasWWW},
+		Repositories: []RepositorySpec{
+			repo("github", "infra", RepositoryRoleGitOps),
+			repo("bad-name", "team/a", RepositoryRoleManaged),
+			repo("bad-key", "team/b", RepositoryRoleManaged),
+		},
+	}
+	resolved, err := in.ResolveGit()
+	if err != nil {
+		t.Fatal(err)
+	}
+	paths := map[string]bool{}
+	for _, problem := range resolved.Problems() {
+		paths[problem.Path.String()] = true
+	}
+	for _, want := range []string{
+		"forges[0].caBundleRef", "forges[1].caBundleRef", "forges[2].caBundleRef",
+		"forges[3].caBundleRef", "forges[4].caBundleRef", "forges[5].caBundleRef",
+	} {
+		if !paths[want] {
+			t.Errorf("no problem at %s; got %v", want, resolved.Problems())
+		}
+	}
+	if got := resolved.BrokerForges("/creds", "/ca"); got != nil {
+		t.Errorf("a forge with an unusable caBundleRef reached the broker: %+v", got)
 	}
 }

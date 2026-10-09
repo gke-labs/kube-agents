@@ -30,8 +30,11 @@ from __future__ import annotations
 
 import http.client
 import json
+import logging
+import os
 import re
 import ssl
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -40,7 +43,17 @@ from urllib.parse import urlencode
 
 from workspace_paths import WorkspaceError
 
-from .errors import Guidance, Override, forge_error
+from .errors import (
+    Guidance,
+    Override,
+    ca_missing_reason,
+    ca_unloadable_reason,
+    classify_tls,
+    forge_error,
+    tls_untrusted,
+)
+
+LOGGER = logging.getLogger(__name__)
 
 # What a CLI prints when the call reached the forge and the forge said no.
 _HTTP_STATUS_RE = re.compile(r"\(HTTP (\d{3})\)")
@@ -288,6 +301,62 @@ class _RefuseRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
+# One TLS context per CA file, rebuilt when the file changes. Building one
+# loads the system bundle, so it is not done on every call; keyed on the
+# file's identity so a Secret update reaches the next call with no restart.
+_CA_CONTEXTS: dict[str, tuple[tuple[int, int], ssl.SSLContext]] = {}
+_CA_CONTEXTS_LOCK = threading.Lock()
+
+
+def ca_context(ca_file: str, host: str, ca_source: str = "") -> ssl.SSLContext:
+    """The TLS context for a forge that names its own CA, at `ca_file`.
+
+    The system bundle, plus the CA file. Only the forge that names the file
+    gets this context, so a private CA never vouches for another host.
+
+    Python 3.13 turns on VERIFY_X509_STRICT in the default context. That check
+    refuses a CA certificate with no Key Usage extension, and a server
+    certificate with no Authority Key Identifier, which many private CAs issue.
+    It is cleared on this context only: the chain and the hostname are still
+    verified, and a public forge keeps the strict check.
+
+    A file that is not there raises FORGE_TLS_UNTRUSTED naming the host and,
+    as `ca_source`, the Secret and key it comes from: the operator projects
+    the Secret as optional, so the broker starts without it, and kubelet
+    writes the file once the Secret exists. A wrong key reads the same as a
+    missing Secret, so the answer names both.
+    """
+    try:
+        status = os.stat(ca_file)
+    except OSError as exc:
+        raise tls_untrusted(
+            host,
+            ca_missing_reason(ca_source, f"the CA file {ca_file} is not mounted ({exc.strerror})"),
+            "ca_missing",
+        ) from exc
+    identity = (status.st_mtime_ns, status.st_size)
+    with _CA_CONTEXTS_LOCK:
+        cached = _CA_CONTEXTS.get(ca_file)
+        if cached is not None and cached[0] == identity:
+            return cached[1]
+        context = ssl.create_default_context()
+        try:
+            context.load_verify_locations(cafile=ca_file)
+        except (OSError, ssl.SSLError, ValueError) as exc:
+            raise tls_untrusted(host, ca_unloadable_reason(ca_source, str(exc)), "ca_unloadable") from exc
+        strict = getattr(ssl, "VERIFY_X509_STRICT", 0)
+        if strict and context.verify_flags & strict:
+            context.verify_flags &= ~strict
+        if cached is None:
+            LOGGER.info(
+                "forge %s trusts the CA in %s, with strict X.509 checks off for this host only",
+                host,
+                ca_file,
+            )
+        _CA_CONTEXTS[ca_file] = (identity, context)
+        return context
+
+
 #: How much of the request's time earlier calls must have spent before a cut is
 #: reported as the request's deadline rather than as the forge being slow.
 _REQUEST_SPENT_SECONDS = 1.0
@@ -296,21 +365,40 @@ _REQUEST_SPENT_SECONDS = 1.0
 def _unreachable(exc: BaseException) -> str:
     """Why the forge could not be reached, in words an operator can act on.
 
-    `URLError` carries the reason -- a refused connection, an unknown name, a
-    certificate -- and the type alone says none of it. A certificate that fails
-    verification is named outright, with the verifier's own reason: no retry
-    fixes it, and "unable to get local issuer" (a private CA), "Hostname
-    mismatch" and "certificate has expired" each send the operator somewhere
-    different.
+    `URLError` carries the reason -- a refused connection, an unknown name --
+    and the type alone says none of it. A certificate never reaches here: the
+    caller answers it first, as FORGE_TLS_UNTRUSTED, by its cause.
     """
     cause = exc.reason if isinstance(exc, urllib.error.URLError) else exc
-    if isinstance(cause, ssl.SSLCertVerificationError) or "CERTIFICATE_VERIFY_FAILED" in str(cause):
-        why = (getattr(cause, "verify_message", "") or str(cause)).strip()[:200]
-        return f"the forge's TLS certificate failed verification by this image: {why}"
     reason = str(cause).strip()[:200]
     if reason:
         return f"the forge could not be reached: {type(exc).__name__}: {reason}"
     return f"the forge could not be reached: {type(exc).__name__}"
+
+
+# OpenSSL verify codes for the causes that are not an untrusted chain.
+_EXPIRED_CODES = frozenset({9, 10})  # not yet valid, expired
+_HOSTNAME_CODES = frozenset({62, 64})  # hostname mismatch, IP address mismatch
+
+
+def _certificate_failure(exc: BaseException) -> tuple[str, str]:
+    """`(kind, reason)` when the send failed on the peer's certificate, else ("", "").
+
+    The kind is read from the verifier's code where it gives one, and from its
+    words otherwise, with the same markers git's output is read by, so both
+    clients name a cause alike.
+    """
+    cause = exc.reason if isinstance(exc, urllib.error.URLError) else exc
+    if not (isinstance(cause, ssl.SSLCertVerificationError) or "CERTIFICATE_VERIFY_FAILED" in str(cause)):
+        return "", ""
+    why = (getattr(cause, "verify_message", "") or str(cause)).strip()[:200]
+    code = getattr(cause, "verify_code", None)
+    if code in _EXPIRED_CODES:
+        return "expired", why
+    if code in _HOSTNAME_CODES:
+        return "hostname", why
+    kind, _line = classify_tls(why)
+    return (kind if kind in ("expired", "hostname") else "untrusted"), why
 
 
 def _broken_answer(exc: BaseException) -> str:
@@ -406,17 +494,48 @@ class HttpTransport:
         whoami_route: tuple[str, str] | None = None,
         opener: Callable[..., Any] | None = None,
         outer_deadline: Callable[[], float | None] | None = None,
+        ca_file: str = "",
+        ca_source: str = "",
     ) -> None:
         if not base_url.startswith("https://"):
             raise ValueError("a forge API is reached over https only")
         self._base = base_url.rstrip("/")
+        self._host = self._base.split("://", 1)[1].split("/", 1)[0]
+        self._ca_file = ca_file
+        self._ca_source = ca_source
         self._headers = headers
         self._overrides = overrides or {}
         self._timeout = timeout
         self._max_bytes = max_bytes
         self._whoami_route = whoami_route
         self._outer_deadline = outer_deadline
-        self._open = opener or urllib.request.build_opener(_RefuseRedirect).open
+        self._opener = opener
+        # Built once for the transport's life when no CA file is named, as
+        # before CA files existed; only a forge that names one builds per
+        # call, so a remounted file is the next call's trust.
+        self._fixed_opener = None if (opener is not None or ca_file) else self._build_opener()
+
+    def _open(self, request: urllib.request.Request, timeout: float) -> Any:
+        """Send `request`, trusting the forge's own CA when it names one.
+
+        The opener is built per call when there is a CA file, so a missing
+        file is that call's FORGE_TLS_UNTRUSTED and a remounted one is the
+        next call's trust; `ca_context` caches the expensive part.
+        """
+        if self._opener is not None:
+            return self._opener(request, timeout=timeout)
+        if self._fixed_opener is not None:
+            return self._fixed_opener.open(request, timeout=timeout)
+        return self._build_opener().open(request, timeout=timeout)
+
+    def _build_opener(self) -> urllib.request.OpenerDirector:
+        """An opener that follows no redirect and trusts the forge's own CA, if any."""
+        handlers: list[Any] = [_RefuseRedirect]
+        if self._ca_file:
+            handlers.append(
+                urllib.request.HTTPSHandler(context=ca_context(self._ca_file, self._host, self._ca_source))
+            )
+        return urllib.request.build_opener(*handlers)
 
     def api(
         self,
@@ -494,6 +613,9 @@ class HttpTransport:
             # earlier calls spent it, is the request's time, not the forge.
             if isinstance(exc.reason, TimeoutError) and slow.startswith("the request's time"):
                 raise forge_error(0, "the request's time ran out while connecting to the forge") from exc
+            kind, why = _certificate_failure(exc)
+            if kind:
+                raise tls_untrusted(self._host, why, kind) from exc
             raise forge_error(0, _unreachable(exc)) from exc
         except TimeoutError as exc:
             # Bare, so not the send: the request went out and the status line

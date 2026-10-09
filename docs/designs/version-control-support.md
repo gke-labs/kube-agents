@@ -963,7 +963,7 @@ Refusals carry a code: 501 `FORGE_UNSUPPORTED`, 413 `CLONE_TOO_LARGE` and
 `BUNDLE_TOO_LARGE`, 409 `NOT_FAST_FORWARD`, `BASE_MOVED`, `BRANCH_DIVERGED`,
 `TARGET_IS_BRANCH`, `CLONED_BRANCH`, `PROTECTED_BRANCH`, `TARGET_NOT_BASE`,
 `BASE_BRANCH_MISSING`, `BRANCH_NOT_OURS`, `OPEN_PROPOSAL`, `BRANCH_MOVED`,
-`NOT_SPENT` and `DELETE_REFUSED`, 502 `GIT_FAILED` and
+`NOT_SPENT` and `DELETE_REFUSED`, 502 `GIT_FAILED`, `FORGE_TLS_UNTRUSTED` and
 `FORGE_CALL_FAILED`.
 
 A refusal the forge itself produced is translated rather than forwarded, and it
@@ -981,7 +981,11 @@ ones, an unthrottled 403 is `FORGE_FORBIDDEN` and says retrying will not change
 the answer, 404 `FORGE_NOT_FOUND` says that a private repository this install
 cannot see answers the same way so absence is not proven, 422 `FORGE_REJECTED`
 says to fix a field rather than repeat the call, and 5xx is 503
-`FORGE_UNAVAILABLE` and says to retry the same call unchanged. Everything
+`FORGE_UNAVAILABLE` and says to retry the same call unchanged. A TLS
+certificate that does not verify is 502 `FORGE_TLS_UNTRUSTED` and says that no
+retry fixes it; its text names the cause (an untrusted chain, an expired
+certificate, a wrong name, or a CA bundle that is not mounted or not
+loadable). Everything
 unrecognised is still 502 `FORGE_CALL_FAILED`.
 
 The table above is shared, and keying it on the status alone is _nearly_
@@ -2426,6 +2430,76 @@ Four endpoints need naming because they are not a rename of GitHub's:
 All four are named because getting them wrong is a working-looking module that
 silently drops a field, which is worse than an unimplemented verb.
 
+### A self-managed instance behind a private CA
+
+A self-managed instance often has a TLS certificate that a private CA signed.
+The broker's two clients do not trust that CA by default:
+
+- The client for the forge API uses Python's default trust store, which is the
+  image's system bundle.
+- git in the broker is built on GnuTLS. It ignores `SSL_CERT_FILE`, so a process
+  variable cannot give it the CA.
+
+The forge declaration therefore names the CA: `caBundleRef`, a Secret key in the
+agent's namespace. A CA certificate is public, but its integrity matters: whoever
+can change it chooses which servers the broker presents the forge's token to,
+and the broker relaxes strict X.509 for that host. In a Secret, changing the CA
+needs the same rights as changing the token Secret beside it. A ConfigMap would
+make the token's trust boundary the wider of the two, because many clusters
+grant ConfigMap write more widely than Secret write. The agent's own
+ServiceAccounts can only read ConfigMaps, so this is about people and
+automation, not the agent. The operator mounts the key into the broker's pod
+only, as it mounts the token, and the
+forge's entry in the broker configuration names the file (`caFile`). The
+agent's pod and the shell sandbox get nothing.
+
+A private CA must never vouch for github.com or gitlab.com, so a forge at the
+provider's public host (gitlab.com, or an empty host) refuses `caBundleRef`.
+For the other forges, the broker trusts the CA for that forge's host and for no
+other host:
+
+- The API client builds one TLS context for the forge: the system bundle plus the
+  CA file. Other forges keep the default context.
+- git gets `http.https://<host>/.sslCAInfo=<caFile>` in the configuration layer
+  that the broker forces on every git it runs. git matches the key's URL against
+  the remote's URL, so the CA applies to that host only. The pin is in the forced
+  layer, not in the credential's configuration, because a context repository on
+  such a forge is cloned with no credential and still needs the CA. With the
+  broker image's git (libcurl with GnuTLS), the file is trusted beside the
+  system bundle, as the API client's context is, not in place of it.
+- git also gets `http.https://<host>/.followRedirects=false`. curl keeps the CA
+  file across a redirect, so a redirect would carry the CA to another host.
+  GitLab answers a moved project in the git protocol itself, and its clone URLs
+  end in `.git`, so its git traffic needs no redirect.
+
+Python 3.13 turns on strict X.509 checks in its default context. These checks
+refuse a CA certificate with no Key Usage extension, and a server certificate
+with no Authority Key Identifier. Many private CAs issue such certificates. The
+context for a forge that names its own CA turns the strict checks off, and logs
+this once. The chain and the hostname are still verified, and every other host
+keeps the strict checks. The administrator chose to trust this CA for this host,
+and a refusal of a common CA profile would only make the feature fail.
+
+The mount is optional, as the token's is: a missing Secret does not stop the
+broker. Each call to the forge then fails with `FORGE_TLS_UNTRUSTED`, from both
+clients, and the detail names what to create: "the Secret <name> or its key
+<key> is missing". A wrong key looks the same as a missing Secret, so the
+detail names both. The forge's broker entry carries the two names for this.
+
+A Secret key that holds no usable PEM certificate gets its own answer from
+both clients: the CA file could not be loaded (not PEM, or no certificate in
+it). git words a missing CA file and a malformed one alike, so the broker tells
+the two apart by whether the forge's file exists. A file with no certificate
+in it at all loads as an empty CA list in git, and git then reports an
+untrusted chain.
+
+The broker reads the file on each call, so an update of the Secret reaches
+the broker with no restart.
+
+Only the `gitlab` provider accepts `caBundleRef`. The `github` provider reads no
+CA bundle, so it refuses the field: a CA that nothing reads would hide a
+certificate problem from the administrator who set it.
+
 ### GitLab in the content workspace
 
 The broker's content workspace (`/v1/workspace/*`) opens a repository on any forge
@@ -2474,22 +2548,29 @@ whose fields it validated and refused — is not. Two specifics:
   answers 404, so this does not prove the thing does not exist" — which is the
   clearest evidence that keeping the table forge-neutral was worth it: GitLab
   needs two overrides, for 401 and 400, and not this one.
+- **A certificate that does not verify is not a forge error.** Both clients
+  answer it with `FORGE_TLS_UNTRUSTED` (502), which names the host and the
+  verifier's reason. The shared fallback, `FORGE_CALL_FAILED`, says that one
+  retry is reasonable, and no retry fixes a certificate. The text names the
+  cause, because each one needs a different action: a chain that does not reach
+  a trusted CA (`caBundleRef` for a self-managed forge; for a public host, a
+  TLS-inspecting proxy), an expired or not yet valid certificate (renew it), a
+  certificate for another name (fix the certificate or the host), a CA bundle
+  that is not mounted (create the Secret), and a CA bundle that is not PEM
+  or holds no certificate (correct the Secret). One code serves all five,
+  because the caller does the same in each case: it stops and reports. Lines
+  that git prints from the server (`remote: ...`) are never read as a verdict.
 
 ### What GitLab does not include
 
 Deliberately, and each of these should be a named refusal rather than a
 surprise:
 
-- **Self-managed instances behind a private CA.** The token and the API are the
-  same; what differs is trust of the TLS chain. `HttpTransport` uses the
-  container's CA bundle and nothing mounts a custom one, so a self-signed
-  instance fails to connect — and that failure is the design behaving as
-  specified rather than a gap. Any instance this is exercised against has to
-  carry a certificate the sandbox image already trusts, or have TLS terminated
-  by something that does. The refusal names itself — "the forge's TLS
-  certificate failed verification by this image", followed by the verifier's
-  own reason, such as an unknown issuer, a hostname mismatch or an expired
-  certificate — rather than reading as a call to retry.
+- **A private CA for gitlab.com.** gitlab.com presents a certificate that the
+  public CAs sign, and a private CA must never vouch for it, so its forge
+  refuses `caBundleRef`. A self-managed instance behind a private CA is
+  supported: see
+  [A self-managed instance behind a private CA](#a-self-managed-instance-behind-a-private-ca).
 - **GitLab groups as an issue tracker.** Group-level issues and epics are a
   different endpoint namespace. `issue_*` is project-scoped, matching the
   neutral concept.

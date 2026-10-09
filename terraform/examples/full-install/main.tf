@@ -72,7 +72,8 @@ locals {
   gitops_is_gitlab = var.gitops_forge == "gitlab"
   gitlab_forges = [merge(
     { name = "gitlab", provider = "gitlab", credentialsRef = { name = var.gitlab_token_secret_name } },
-    var.gitops_host != "" ? { host = var.gitops_host } : {}
+    var.gitops_host != "" ? { host = var.gitops_host } : {},
+    var.gitlab_ca_secret_name != "" ? { caBundleRef = { name = var.gitlab_ca_secret_name } } : {}
   )]
   gitlab_repositories = [{ forge = "gitlab", repository = var.gitlab_repo, role = "gitops" }]
 
@@ -1020,8 +1021,15 @@ resource "helm_release" "kube_agents" {
     # The reverse: GitLab inputs under the default forge would be dropped,
     # applying a CR with no GitOps repository and no error.
     precondition {
-      condition     = local.gitops_is_gitlab || (var.gitlab_repo == "" && var.gitops_host == "")
-      error_message = "gitlab_repo and gitops_host apply only with gitops_forge = \"gitlab\"; set it, or leave them unset."
+      condition     = local.gitops_is_gitlab || (var.gitlab_repo == "" && var.gitops_host == "" && var.gitlab_ca_secret_name == "")
+      error_message = "gitlab_repo, gitops_host and gitlab_ca_secret_name apply only with gitops_forge = \"gitlab\"; set it, or leave them unset."
+    }
+
+    # A private CA is for a self-managed GitLab only: gitlab.com presents a
+    # certificate the public CAs sign, and a private CA must never vouch for it.
+    precondition {
+      condition     = var.gitlab_ca_secret_name == "" || !contains(["", "gitlab.com", "www.gitlab.com"], var.gitops_host)
+      error_message = "gitlab_ca_secret_name is for a self-managed GitLab: set gitops_host to its hostname. gitlab.com uses the public CAs."
     }
 
     # What this refuses is an install that asks for the detector without the

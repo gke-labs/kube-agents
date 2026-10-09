@@ -65,6 +65,10 @@ type ResolvedForge struct {
 	Namespace string
 	// CredentialsSecret is the name credentialsRef points at, if any.
 	CredentialsSecret string
+	// CABundleSecret and CABundleKey are what caBundleRef names, if
+	// anything. The key is "ca.crt" when the Secret is named without one.
+	CABundleSecret string
+	CABundleKey    string
 }
 
 // ResolvedRepository is one declared repository.
@@ -158,6 +162,13 @@ func resolveLists(forges []ForgeSpec, repositories []RepositorySpec) *ResolvedIn
 		if f.CredentialsRef != nil {
 			forge.CredentialsSecret = strings.TrimSpace(f.CredentialsRef.Name)
 		}
+		if f.CABundleRef != nil {
+			forge.CABundleSecret = strings.TrimSpace(f.CABundleRef.Name)
+			forge.CABundleKey = strings.TrimSpace(f.CABundleRef.Key)
+			if forge.CABundleKey == "" {
+				forge.CABundleKey = ForgeCABundleDefaultKey
+			}
+		}
 		resolved.Forges = append(resolved.Forges, forge)
 		// The schema keys the list on name, so a repeat cannot be stored; the
 		// first one wins here only for a spec built in Go.
@@ -199,7 +210,38 @@ func (f *ResolvedForge) valid() bool {
 		provider.ValidateHost(f.Host) == nil &&
 		validateDeclaredValue(gitNamespaceField, f.Namespace, MaxGitNamespaceLength) == nil &&
 		provider.ValidateNamespaceOn(f.Host, f.Namespace) == nil &&
-		f.credentialsProblem(provider) == nil
+		f.credentialsProblem(provider) == nil &&
+		f.caBundleProblem(provider) == nil
+}
+
+// caBundleProblem is why a forge's caBundleRef cannot be used, or nil.
+//
+// A provider that does not read a CA bundle refuses the field rather than
+// ignore it: an administrator who set it believes the forge's certificate is
+// trusted, and a broker that ignored it would answer a certificate error that
+// names nothing they did. The names are checked as the API server checks
+// them on the broker Deployment, as credentialsProblem does for the Secret.
+func (f *ResolvedForge) caBundleProblem(provider *GitProvider) error {
+	if f.CABundleSecret == "" {
+		return nil
+	}
+	if !provider.AcceptsCABundle {
+		return fmt.Errorf("provider %s does not read a CA bundle; caBundleRef is for a gitlab forge", provider.Name)
+	}
+	// The provider's own public host presents a certificate the public CAs
+	// sign. A private CA there would vouch for that host, and the broker would
+	// relax its strict X.509 checks for it.
+	if f.Host == "" || provider.Hosts[lowerASCII(f.Host)] {
+		return fmt.Errorf("caBundleRef is for a self-managed host; %s uses the public CAs", provider.canonicalHost(f.Host))
+	}
+	if errs := validation.IsDNS1123Subdomain(f.CABundleSecret); len(errs) > 0 {
+		return fmt.Errorf("caBundleRef.name %q is not a Secret name: %s", f.CABundleSecret, strings.Join(errs, "; "))
+	}
+	// Kubernetes holds a Secret's data keys to the ConfigMap key rule.
+	if errs := validation.IsConfigMapKey(f.CABundleKey); len(errs) > 0 {
+		return fmt.Errorf("caBundleRef.key %q is not a Secret key: %s", f.CABundleKey, strings.Join(errs, "; "))
+	}
+	return nil
 }
 
 // credentialsProblem is why a forge whose provider needs an administrator's
@@ -228,6 +270,13 @@ func (f *ResolvedForge) credentialsProblem(provider *GitProvider) error {
 // ForgeCredentialsTokenKey is the key the operator projects out of a forge's
 // credentialsRef Secret, and the file name the broker reads it from.
 const ForgeCredentialsTokenKey = "token"
+
+// ForgeCABundleDefaultKey is the caBundleRef key when none is named, and
+// ForgeCABundleFileName is the file the broker reads the bundle from.
+const (
+	ForgeCABundleDefaultKey = "ca.crt"
+	ForgeCABundleFileName   = "ca.crt"
+)
 
 // EffectiveNamespace is the namespace a bare repository name is qualified by:
 // the repository's own, else its forge's.
@@ -480,6 +529,7 @@ const (
 	gitHostField          = "host"
 	gitNamespaceField     = "namespace"
 	gitCredentialsField   = "credentialsRef"
+	gitCABundleField      = "caBundleRef"
 	gitRepositoryField    = "repository"
 	gitRepoForgeField     = "forge"
 	gitRepoRoleField      = "role"
@@ -603,6 +653,9 @@ func (ri *ResolvedIntegration) check() ([]IntegrationProblem, map[*ResolvedRepos
 		}
 		if err := f.credentialsProblem(provider); err != nil {
 			add(ri.forgePath(f, gitCredentialsField), f.CredentialsSecret, err)
+		}
+		if err := f.caBundleProblem(provider); err != nil {
+			add(ri.forgePath(f, gitCABundleField), f.CABundleSecret, err)
 		}
 	}
 
@@ -816,6 +869,14 @@ type BrokerForge struct {
 	// the broker, which is handed the file instead.
 	CredentialsSecret string `json:"-"`
 	TokenPath         string `json:"tokenPath,omitempty"`
+	// CABundleSecret and CABundleKey are the Secret key the CA bundle
+	// is projected from. The broker reads the file at CAFile; it is handed the
+	// two names too, so that a missing file is answered with what to create.
+	CABundleSecret string `json:"caSecret,omitempty"`
+	CABundleKey    string `json:"caKey,omitempty"`
+	// CAFile is where the broker reads the forge's CA bundle, when the forge
+	// names one in caBundleRef.
+	CAFile string `json:"caFile,omitempty"`
 	// AllowedPaths is never empty on an entry BrokerForges makes for a
 	// credentialed forge, and absent on GitHub's, whose minter scopes it.
 	AllowedPaths []string `json:"allowedPaths,omitempty"`
@@ -839,8 +900,9 @@ type BrokerForge struct {
 // first one keeps it, rather than crash-looping the broker.
 //
 // tokenDir is where the operator mounts the forge credentials; each forge's
-// token is <tokenDir>/<forge name>/token.
-func (ri *ResolvedIntegration) BrokerForges(tokenDir string) []BrokerForge {
+// token is <tokenDir>/<forge name>/token. caDir is where it mounts the CA
+// bundles; a forge's is <caDir>/<forge name>/ca.crt.
+func (ri *ResolvedIntegration) BrokerForges(tokenDir, caDir string) []BrokerForge {
 	if ri == nil {
 		return nil
 	}
@@ -863,14 +925,20 @@ func (ri *ResolvedIntegration) BrokerForges(tokenDir string) []BrokerForge {
 		if len(allowed) == 0 {
 			continue
 		}
-		out = append(out, BrokerForge{
+		entry := BrokerForge{
 			Name:              f.Name,
 			Provider:          provider.Name,
 			Host:              provider.canonicalHost(f.Host),
 			CredentialsSecret: f.CredentialsSecret,
 			TokenPath:         tokenDir + pathSeparator + f.Name + pathSeparator + ForgeCredentialsTokenKey,
 			AllowedPaths:      allowed,
-		})
+		}
+		if f.CABundleSecret != "" {
+			entry.CABundleSecret = f.CABundleSecret
+			entry.CABundleKey = f.CABundleKey
+			entry.CAFile = caDir + pathSeparator + f.Name + pathSeparator + ForgeCABundleFileName
+		}
+		out = append(out, entry)
 	}
 	if len(out) == 1 {
 		return nil

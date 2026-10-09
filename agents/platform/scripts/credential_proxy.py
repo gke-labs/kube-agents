@@ -3356,6 +3356,72 @@ GIT_FORCED_CONFIG: tuple[tuple[str, str], ...] = (
 )
 
 
+def forge_ca_git_config(entries) -> tuple[tuple[str, str], ...]:
+    """git config that trusts each forge's own CA on that forge's hosts only.
+
+    For every configured forge that names a `caFile`: `http.https://<host>/.sslCAInfo`,
+    and `followRedirects=false` for the same host, so a redirect cannot carry
+    the CA to another host. git matches the key's URL against the remote's, so the
+    file is the CA bundle for that host and nothing else: github.com and
+    gitlab.com go on using the system bundle. This works with git built on
+    either OpenSSL or GnuTLS, which `SSL_CERT_FILE` does not.
+    """
+    pairs: list[tuple[str, str]] = []
+    for entry in entries or ():
+        ca_file = str(entry.get("ca_file") or "").strip()
+        host = str(entry.get("host") or "").strip().lower()
+        if not ca_file or not host:
+            continue
+        # Measured in the broker image (git 2.47, libcurl-gnutls): the file
+        # is trusted beside the system bundle, not in place of it, as the API
+        # client's context is.
+        pairs.append((f"http.https://{host}/.sslCAInfo", ca_file))
+        # curl keeps the CA file on the handle across a redirect, so a hop
+        # would carry this host's CA to another host. GitLab answers a moved
+        # project in-band ("remote: Project ... was moved"), and its clone URLs
+        # end in .git, so none of its git traffic needs a redirect.
+        pairs.append((f"http.https://{host}/.followRedirects", "false"))
+    return tuple(pairs)
+
+
+def forge_ca_sources(entries) -> dict[str, str]:
+    """Each forge host that names a CA, mapped to where the CA comes from."""
+    return {
+        str(entry.get("host") or "").strip().lower(): str(entry.get("ca_source") or "")
+        for entry in entries or ()
+        if str(entry.get("ca_file") or "").strip()
+    }
+
+
+def _ca_reading_entries(entries) -> tuple[dict[str, str], ...]:
+    """`{host, ca_file, ca_source}` for each built forge that reads a CA file.
+
+    A configuration the forges refuse yields none: the registry reads the same
+    file when the broker is built and refuses to start with its own message.
+    """
+    try:
+        forges = providers.build_forges({"forges": list(entries or ())}) if entries else ()
+    except ValueError:
+        return ()
+    return tuple(
+        {"host": forge.hosts[0], "ca_file": forge.ca_file, "ca_source": forge.ca_source}
+        for forge in forges
+        if forge.ca_file and forge.hosts
+    )
+
+
+def _configured_forge_entries():
+    """The forge configuration's entries, or () when there is none or it is unreadable.
+
+    Unreadable is not refused here: the forge registry reads the same file
+    when the broker is built and refuses to start with its own message.
+    """
+    try:
+        return providers.load_forge_entries() or ()
+    except ValueError:
+        return ()
+
+
 def _git_forced_config_environment(pairs: tuple[tuple[str, str], ...]) -> dict[str, str]:
     """Render config pins as the `GIT_CONFIG_COUNT` environment layer.
 
@@ -4798,6 +4864,18 @@ class CommandExecutor:
             name: shutil.which(name, path=trusted_path)
             for name in self.ALLOWED_EXECUTABLES
         }
+        # The CA each self-managed forge names, as URL-scoped git config: git
+        # trusts it for that forge's host and for no other. In the forced
+        # layer rather than in a credential's config, because a context
+        # repository on such a forge is cloned with no credential at all and
+        # still needs the trust.
+        # From the built forges, not the raw file: only a forge that reads its
+        # CA in its API client gets git pinned to it, so the two clients never
+        # disagree about a host's certificate.
+        entries = _ca_reading_entries(_configured_forge_entries())
+        self.forge_ca_config = forge_ca_git_config(entries)
+        self.forge_ca_sources = forge_ca_sources(entries)
+        self.forge_ca_files = {entry["host"]: entry["ca_file"] for entry in entries}
         self.environment = {
             "PATH": trusted_path,
             "HOME": str(self.home_dir),
@@ -4866,7 +4944,11 @@ class CommandExecutor:
             "GIT_EDITOR": "false",
             "GIT_SEQUENCE_EDITOR": "false",
             **_git_forced_config_environment(
-                (("core.hooksPath", str(self.git_hooks_dir)), *GIT_FORCED_CONFIG)
+                (
+                    *self.forge_ca_config,
+                    ("core.hooksPath", str(self.git_hooks_dir)),
+                    *GIT_FORCED_CONFIG,
+                )
             ),
         }
         # Forward only variables required by supported credential clients. Chat
@@ -5539,6 +5621,19 @@ class CommandExecutor:
                 containment_root=self.content_workspace_root,
                 extra_config=tuple(config),
             )
+
+    def tls_refusal(self, output: str):
+        """The FORGE_TLS_UNTRUSTED refusal git's `output` stands for, or None.
+
+        A CA file git could not load is named by the Secret and key it comes
+        from, as missing or as unloadable by whether the file is there, as the
+        API client names it. Redacted: the one line kept can quote the remote's
+        URL.
+        """
+        refusal = providers.tls_refusal(output, self.forge_ca_sources, self.forge_ca_files)
+        if refusal is not None and "detail" in refusal.fields:
+            refusal.fields["detail"] = redact_credentials(str(refusal.fields["detail"]))
+        return refusal
 
     def execute_vcs_git(
         self,
@@ -6585,6 +6680,7 @@ class CommandExecutor:
                 _git_forced_config_environment(
                     (
                         *extra_config,
+                        *self.forge_ca_config,
                         ("core.hooksPath", str(self.git_hooks_dir)),
                         *GIT_FORCED_CONFIG,
                     )
@@ -6712,6 +6808,7 @@ def build_workspace_store(
         # it, which composes the URL; a bare `owner/name` stays GitHub's.
         locate=_workspace_locate,
         pinned_bases=pinned_bases,
+        tls_refusal=executor.tls_refusal,
     )
     LOGGER.info("content workspace enabled root=%s", executor.content_workspace_root)
     return store
@@ -6749,6 +6846,7 @@ def build_vcs_broker(
         http_max_bytes=executor.max_output_bytes,
         request_deadline=executor.request_deadline,
         pinned_bases=pinned_bases,
+        tls_refusal=executor.tls_refusal,
     )
     LOGGER.info(
         "version control enabled root=%s forges=%s",
@@ -8757,6 +8855,12 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                 exc.returncode,
                 redact_credentials(str(exc.stderr or "")[:2000]),
             )
+            # A certificate that does not verify is answered by name: the one
+            # matching line, redacted, and no other part of stderr.
+            refusal = self.executor.tls_refusal(str(exc.stderr or "")) if self.executor else None
+            if refusal is not None:
+                self._json(HTTPStatus(refusal.status), _redacted_fields(refusal))
+                return
             self._json(
                 HTTPStatus.BAD_GATEWAY,
                 {"error": f"vcs {verb} failed", "code": "GIT_FAILED"},

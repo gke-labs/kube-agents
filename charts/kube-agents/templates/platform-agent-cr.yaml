@@ -558,6 +558,14 @@ spec:
   {{- if and (has "gitlab" (splitList "," $providers)) (not (has "gitlab" $enum)) }}
   {{- fail "platformAgent.integration.forges declares a gitlab forge, but the installed PlatformAgent CRD does not accept provider gitlab, and helm upgrade does not update CRDs; apply charts/kube-agents/crds/ first (kubectl apply --server-side -f charts/kube-agents/crds/)" }}
   {{- end }}
+  {{- /* The same for caBundleRef: a CRD that prunes it leaves the forge's certificate untrusted, with nothing to say why. */}}
+  {{- $caBundled := false }}
+  {{- range $forges }}
+  {{- if (.caBundleRef | default dict).name }}{{ $caBundled = true }}{{ end }}
+  {{- end }}
+  {{- if and $caBundled (not (hasKey (dig "forges" "items" "properties" (dict) $props) "caBundleRef")) }}
+  {{- fail "platformAgent.integration.forges[].caBundleRef needs a PlatformAgent CRD that has the field, and helm upgrade does not update CRDs; apply charts/kube-agents/crds/ first (kubectl apply --server-side -f charts/kube-agents/crds/)" }}
+  {{- end }}
   {{- if and $pinned (not (hasKey (dig "repositories" "items" "properties" (dict) $props) "baseBranch")) }}
   {{- fail "platformAgent.integration.repositories[].baseBranch needs a PlatformAgent CRD that has the field, and helm upgrade does not update CRDs; apply charts/kube-agents/crds/ first (kubectl apply --server-side -f charts/kube-agents/crds/)" }}
   {{- end }}
@@ -588,6 +596,15 @@ spec:
         {{- with (.credentialsRef | default dict).name }}
         credentialsRef:
           name: {{ . | quote }}
+        {{- end }}
+        {{- with (.caBundleRef | default dict) }}
+        {{- if .name }}
+        caBundleRef:
+          name: {{ .name | quote }}
+          {{- with .key }}
+          key: {{ . | quote }}
+          {{- end }}
+        {{- end }}
         {{- end }}
       {{- end }}
     {{- end }}

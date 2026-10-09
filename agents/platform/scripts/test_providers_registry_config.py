@@ -86,7 +86,8 @@ class ConfigurationFileTest(_ConfigCase):
             {"forges": [{"provider": "TestForge", "host": "Git.Example.com", "allowedPaths": ["/acme/"]}]}
         )
         self.assertEqual(
-            [{"provider": "testforge", "host": "git.example.com", "token_path": "", "allowed_paths": ("/acme/",)}],
+            [{"provider": "testforge", "host": "git.example.com", "token_path": "", "ca_file": "", "ca_source": "",
+              "allowed_paths": ("/acme/",)}],
             registry_module.load_forge_entries(),
         )
 

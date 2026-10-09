@@ -1053,6 +1053,9 @@ platformAgent:
     #     namespace: my-group     # group path; bounds which projects the agent may reach
     #     credentialsRef:         # required for gitlab: a Secret holding an access
     #       name: gitlab-token    # token under the key `token`, created out of band
+    #     caBundleRef:            # optional, self-managed gitlab only: a Secret holding
+    #       name: gitlab-forge-ca # the PEM CA that signed the instance's certificate;
+    #       key: ca.crt           # trusted for this host only, created out of band
     forges: []
     # repositories:
     #   - forge: github

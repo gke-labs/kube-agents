@@ -136,6 +136,9 @@ api_server_key = "REPLACE_WITH_A_STRONG_RANDOM_KEY"
 # gitops_host               = "gitlab.example.com" # omit for gitlab.com
 # gitlab_repo               = "platform/infra/gitops"
 # gitlab_token_secret_name  = "gitlab-forge-token"
+# A self-managed instance behind a private CA: the Secret holding that CA
+# under the key `ca.crt` (install.sh writes it from --gitops-ca-file).
+# gitlab_ca_secret_name     = "gitlab-forge-ca"
 
 # Optional Slack integration. Needs no GCP resources: the tokens go into the
 # credentials Secret and the CR's slack section turns on. Creating the Slack

@@ -79,6 +79,7 @@ from providers import (
     Transport,
     pinned_base,
     short_branch,
+    tls_refusal as tls_refusal_default,
     validate_branch,
     validate_revision,
 )
@@ -310,8 +311,14 @@ class VcsBroker:
         http_opener: Callable[..., Any] | None = None,
         request_deadline: Callable[[], float | None] | None = None,
         pinned_bases: Mapping[tuple[str, str], str] | None = None,
+        tls_refusal: Callable[[str], WorkspaceError | None] | None = None,
     ) -> None:
         self.scratch_root = Path(scratch_root)
+        # git's output to the FORGE_TLS_UNTRUSTED refusal it stands for, or
+        # None, for the git runs that read a failure themselves rather than
+        # raising it. The broker hands its own, which names a forge's CA
+        # Secret; without one, the shared reading names the cause alone.
+        self._tls_refusal = tls_refusal or tls_refusal_default
         self.scratch_root.mkdir(parents=True, exist_ok=True)
         self._git_runner = git_runner
         self.base_branch = (base_branch or "").strip()
@@ -382,6 +389,8 @@ class VcsBroker:
                 whoami_route=forge.whoami_route,
                 opener=self._http_opener,
                 outer_deadline=self._request_deadline,
+                ca_file=forge.ca_file,
+                ca_source=forge.ca_source,
             )
         raise ForgeUnsupported(
             f"{forge.name} declares the {forge.transport!r} transport, which "
@@ -1131,6 +1140,9 @@ class VcsBroker:
         if listed.returncode == 2:
             return ""
         if listed.returncode != 0:
+            refusal = self._tls_refusal(listed.stderr or "")
+            if refusal is not None:
+                raise refusal
             raise WorkspaceError(
                 f"could not read {branch} from the remote: "
                 f"{(listed.stderr or '').strip() or 'git exited ' + str(listed.returncode)}",
@@ -1236,7 +1248,7 @@ class VcsBroker:
         one and `branch-delete` refuses to remove one.
         `root` must already have `origin`.
         """
-        default = self._default_branch_of_remote(git, root)
+        default = self._default_branch_of_remote(git, root, self._tls_refusal)
         protected_branches = {"main", "master", "production"}
         if default:
             protected_branches.add(default.casefold())
@@ -1265,16 +1277,25 @@ class VcsBroker:
             )
 
     @staticmethod
-    def _default_branch_of_remote(git: Callable, root: Path) -> str:
+    def _default_branch_of_remote(
+        git: Callable,
+        root: Path,
+        tls_refusal: Callable[[str], WorkspaceError | None] = tls_refusal_default,
+    ) -> str:
         """The branch the remote's HEAD points at, or "" if it says nothing.
 
         `ls-remote --symref` prints `ref: refs/heads/<name>\tHEAD` first when
         the remote advertises a symbolic HEAD. A remote that advertises none --
         an empty repository, or a server that hides it -- yields "", and the
         caller treats that as "no default to protect" rather than as a
-        refusal, because there is nothing to compare against.
+        refusal, because there is nothing to compare against. A certificate
+        that fails is not "says nothing": it is raised by its cause.
         """
         listed = git(root, "ls-remote", "--symref", "origin", "HEAD", check=False)
+        if getattr(listed, "returncode", 0) != 0:
+            refusal = tls_refusal(listed.stderr or "")
+            if refusal is not None:
+                raise refusal
         for line in (listed.stdout or "").splitlines():
             if line.startswith("ref: refs/heads/") and line.rstrip().endswith("HEAD"):
                 return line[len("ref: refs/heads/"):].split("\t", 1)[0].strip()

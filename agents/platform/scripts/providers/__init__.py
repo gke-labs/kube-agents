@@ -29,8 +29,15 @@ from .credentials import (
     NoCredential,
     StaticFileCredential,
 )
-from .errors import GUIDANCE, Guidance, forge_error
-from .registry import AVAILABLE, Registry, build_forges
+from .errors import (
+    GUIDANCE,
+    Guidance,
+    classify_tls,
+    forge_error,
+    tls_refusal,
+    tls_untrusted,
+)
+from .registry import AVAILABLE, Registry, build_forges, load_forge_entries
 from .transport import CliTransport, HttpTransport, Transport
 from .validate import (
     BRANCH_RE,
@@ -73,7 +80,11 @@ __all__ = [
     "Transport",
     "WorkspaceError",
     "build_forges",
+    "classify_tls",
     "forge_error",
+    "load_forge_entries",
+    "tls_refusal",
+    "tls_untrusted",
     "listing",
     "pinned_base",
     "repo_segments",
