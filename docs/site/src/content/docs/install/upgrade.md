@@ -224,6 +224,8 @@ skips those — but still before any CRD, chart or Terraform change of the new r
   - a `SLACK_BOT_TOKEN` that holds several tokens: the gateway takes one workspace's token. The
     run gives the count, never the token. Keep a multi-workspace install on `today`.
 
+  `--plan` warns of the same three without refusing.
+
 ## Where to go next
 
 - [Rolling back a release](/kube-agents/deploy/rollback/) — the reverse move, and what each mode

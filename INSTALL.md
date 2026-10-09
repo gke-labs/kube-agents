@@ -421,7 +421,9 @@ KUBE_AGENTS_STATE_BUCKET=auto ./lifecycle.sh apply
   takes Slack), check three Slack keys: `SLACK_ALLOWED_USERS` holds member IDs such as
   `U0123ABCD`, not emails, which match nobody; `SLACK_HOME_CHANNEL`, if set, is a channel ID
   (`C...` or `G...`), not a DM or a user; `SLACK_BOT_TOKEN` is one workspace's token, not a
-  comma-separated list. Both front doors refuse a `next` apply that fails any of them.
+  comma-separated list. Both front doors refuse a `next` apply that fails any of them. On
+  `today` the allowlist never matched emails either: the Hermes Slack platform compares each
+  sender's member ID exactly, so an email there has never admitted anyone.
 
 - **Dry-run check**: To preview actions without modifying cloud infrastructure:
   ```bash

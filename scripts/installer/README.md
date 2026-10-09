@@ -461,7 +461,11 @@ three settings the gateway cannot use (`refuse_next_slack_gateway_settings`):
 - a `SLACK_BOT_TOKEN` that holds more than one comma-separated token, reported by count. The
   gateway takes one.
 
-A token that only the live Secret holds is checked after the generator recovers it.
+A token that only the live Secret holds is checked after the generator recovers it. That
+refusal also removes the `terraform.tfvars` just written, and in the menu restores
+`install.env` as it was before the save. `upgrade.sh --plan` and `install.sh --dry-run` warn
+instead of refusing. An interactive `install.sh` asks for these three in the gateway's terms
+and asks again on an answer the gateway cannot use.
 
 Before a full apply the front doors read the live `PlatformAgent` through the install's own
 kubeconfig context and refuse when it carries a scope that neither the release record nor the
