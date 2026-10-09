@@ -5802,6 +5802,412 @@ class PlatformAgentModeTest(unittest.TestCase):
         )
 
 
+class NextSlackGatewaySettingsWiringTest(unittest.TestCase):
+    """#2812 on install.sh. A run whose mode is next (--mode=next, or
+    PLATFORM_AGENT_MODE=next in install.env), with Slack on and Chat off,
+    hands Slack to the A2A gateway. It refuses an email in the allowlist, a
+    home channel that is not a channel id, or a list of bot tokens.
+
+    The step-6 call refuses as soon as the chat interview has settled those
+    values, before the generator, install.env or any apply. A second call
+    after the generator catches a bot token recovered from the live Secret,
+    still before install.env and the apply. The menu's apply checks before
+    it saves and again after its generator. The check itself is
+    refuse_next_slack_gateway_settings (tests/test_installer_common.py)."""
+
+    _CALL = (
+        'refuse_next_slack_gateway_settings "${PARAM_PLATFORM_AGENT_MODE:-$DEFAULT_PLATFORM_AGENT_MODE}" '
+        '"$slack_enabled" "$google_chat_enabled" "$slack_allowed_users" "$slack_home_channel" "$slack_bot_token" '
+        'flags || exit 1'
+    )
+    _STEP6_END = "\n  fi\n"
+    _ENV_CALL_MAIN = "  elif ! refuse_next_slack_gateway_settings_from_env flags; then\n"
+    _ENV_WARN_MAIN = '    refuse_next_slack_gateway_settings_from_env flags "$SCOPE_CHECK_MODE_WARN"\n'
+    _ENV_CALL_MENU = "        refuse_next_slack_gateway_settings_from_env || return 1\n"
+    _ENV_CALL_MENU_AFTER = "        if ! refuse_next_slack_gateway_settings_from_env; then\n"
+    _GENERATOR = (
+        "  KUBE_AGENTS_GENERATE_API_SERVER_KEY=true \\\n"
+        "    KUBE_AGENTS_REQUIRE_MEMORY_ANSWER=true \\\n"
+        '    write_tfvars_from_state "$tfvars_file" "$image_tag"\n'
+    )
+    _SAVED = '  print_success "Terraform input saved to: $tfvars_file"\n'
+    _MENU_ARM = '      6)\n        print_step "Saving & Re-applying Configuration State"\n'
+    _CHAT_STEP = '  print_step "6. Chat & Messaging Integrations Setup"\n'
+
+    _env = staticmethod(PlatformAgentModeTest._env)
+    _run = PlatformAgentModeTest._run
+    _file = PlatformAgentModeTest._file
+
+    def _chat_step(self):
+        """main()'s step 6 through the refusal, as a function: the real
+        interview code, run non-interactively, then the check."""
+        text = _INSTALL_SH.read_text()
+        main_start = text.index("\nmain() {")
+        start = text.index(self._CHAT_STEP, main_start)
+        end = text.index(self._STEP6_END, text.index(self._CALL, start)) + len(self._STEP6_END)
+        return f"_chat_step() {{\n{text[start:end]}\n}}\n"
+
+    def _step(self, flags, content):
+        stubs = (
+            "has_controlling_tty() { return 1; }\n"
+            "gke_dns_endpoint_flag() { GKE_DNS_ENDPOINT_FLAG=\"\"; }\n"
+            "tf_state_chat_subscription_name() { :; }\n"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._file(tmp, content)
+            proc = self._run(
+                f"{stubs}{self._chat_step()}parse_args --non-interactive {flags}\n"
+                # As main's step 2 runs them.
+                "resolve_shared_defaults\n"
+                "validate_platform_agent_mode || exit 1\n"
+                "check_flags_against_install_env || exit 1\n"
+                # Set by steps 4 and 5; the no-chat arm prints them.
+                "project_id=p region=r cluster_name=c\n"
+                '_chat_step; echo "went on"',
+                install_env=path,
+            )
+            after = path.read_text()
+        self.assertEqual(after, content, "the refusal rewrote install.env")
+        return proc
+
+    def test_next_with_slack_on_the_gateway_refuses_each_setting_before_anything_is_written(self):
+        token = "xoxb-1-secretpart"
+        for flags, content, says in (
+            ("--mode=next --enable-slack --slack-allowed-users=U0123ABCD,alice@example.com", "",
+             "SLACK_ALLOWED_USERS holds entries that look like emails: alice@example.com."),
+            ("", "PLATFORM_AGENT_MODE=next\nSLACK_ENABLED=true\nSLACK_ALLOWED_USERS=\"U0123ABCD, alice@example.com\"\n",
+             "SLACK_ALLOWED_USERS holds entries that look like emails: alice@example.com."),
+            ("--mode=next --enable-slack --slack-home-channel=D0123ABCD", "",
+             "SLACK_HOME_CHANNEL is 'D0123ABCD', which is not a Slack channel id (C... or G...)."),
+            ("", "PLATFORM_AGENT_MODE=next\nSLACK_ENABLED=true\nSLACK_HOME_CHANNEL=U0123ABCD\n",
+             "SLACK_HOME_CHANNEL is 'U0123ABCD', which is not a Slack channel id (C... or G...)."),
+            (f"--mode=next --enable-slack --slack-bot-token={token},{token}", "",
+             "SLACK_BOT_TOKEN holds 2 tokens"),
+            ("", f"PLATFORM_AGENT_MODE=next\nSLACK_ENABLED=true\nSLACK_BOT_TOKEN={token},{token}\n",
+             "SLACK_BOT_TOKEN holds 2 tokens"),
+        ):
+            with self.subTest(flags=flags.replace("secretpart", "*"), content=content.replace("secretpart", "*")):
+                proc = self._step(flags, content)
+                out = proc.stdout + proc.stderr
+                self.assertNotIn("went on", proc.stdout, out)
+                self.assertEqual(proc.returncode, 1, out)
+                self.assertIn(says, out)
+                self.assertIn("in install.env or --slack-", out)
+                self.assertNotIn("secretpart", out)
+
+    def test_the_cases_the_refusal_leaves_alone_go_on(self):
+        for flags, content in (
+            # next with member IDs, a channel id and one token.
+            ("--mode=next --enable-slack --slack-allowed-users=U0123ABCD,W0456EFGH --slack-home-channel=C0123ABCD", ""),
+            ("", "PLATFORM_AGENT_MODE=next\nSLACK_ENABLED=true\nSLACK_ALLOWED_USERS=U0123ABCD\nSLACK_HOME_CHANNEL=G0123ABCD\n"),
+            # today: this change leaves the today path as it was.
+            ("--enable-slack --slack-allowed-users=alice@example.com --slack-home-channel=D0DM", ""),
+            ("", "PLATFORM_AGENT_MODE=today\nSLACK_ENABLED=true\nSLACK_ALLOWED_USERS=alice@example.com\nSLACK_BOT_TOKEN=xoxb-a,xoxb-b\n"),
+            # next without Slack: the Slack keys are inert.
+            ("", "PLATFORM_AGENT_MODE=next\nSLACK_ENABLED=false\nSLACK_ALLOWED_USERS=alice@example.com\n"),
+            # next with Chat and Slack: Chat holds the gateway, so Slack stays
+            # on the today path.
+            ("--mode=next --enable-google-chat --enable-slack --slack-allowed-users=alice@example.com --slack-home-channel=D0DM", ""),
+            ("", "PLATFORM_AGENT_MODE=next\nGOOGLE_CHAT_ENABLED=true\nSLACK_ENABLED=true\nSLACK_ALLOWED_USERS=alice@example.com\nSLACK_BOT_TOKEN=xoxb-a,xoxb-b\n"),
+        ):
+            with self.subTest(flags=flags, content=content):
+                proc = self._step(flags, content)
+                out = proc.stdout + proc.stderr
+                self.assertIn("went on", proc.stdout, out)
+                self.assertNotIn("look like emails", out)
+                self.assertNotIn("SLACK_HOME_CHANNEL is", out)
+                self.assertNotIn("SLACK_BOT_TOKEN holds", out)
+
+    def test_main_refuses_after_the_interview_and_again_after_recovery_before_any_write(self):
+        text = _INSTALL_SH.read_text()
+        main_start = text.index("\nmain() {")
+        self.assertEqual(text.count(self._CALL), 1)
+        self.assertEqual(text.count(self._ENV_CALL_MAIN), 1)
+        self.assertEqual(text.count(self._ENV_WARN_MAIN), 1)
+        call = text.index(self._CALL, main_start)
+        # After the Slack prompts settle the values, so an interactive answer
+        # is checked too.
+        self.assertLess(text.index("      _prompt_slack_settings\n      ;;\n    4)", main_start), call)
+        self.assertLess(call, text.index('print_step "7. AI Model Provider Credentials"', main_start))
+        # The second call follows the generator's Secret recovery.
+        recovery = text.index("\n  require_slack_tokens_after_recovery\n", main_start)
+        env_call = text.index(self._ENV_CALL_MAIN, main_start)
+        self.assertLess(text.index('write_tfvars_from_state "$tfvars_file" "$image_tag"', main_start), env_call)
+        self.assertLess(recovery, env_call)
+        for later in (
+            'bootstrap_install_env_file "$INSTALL_ENV_FILE" "$image_tag"',
+            "\n  record_flags_into_install_env\n",
+            "\n    record_flags_into_install_env\n",
+            'print_step "12. Applying the Install (Terraform + Helm)"',
+        ):
+            with self.subTest(later=later):
+                self.assertLess(call, text.index(later, main_start))
+                self.assertLess(env_call, text.index(later, main_start))
+
+    def test_the_menu_apply_refuses_before_it_saves_and_after_its_generator(self):
+        text = _INSTALL_SH.read_text()
+        arm = text.index('        print_step "Saving & Re-applying Configuration State"\n')
+        self.assertEqual(text.count(self._ENV_CALL_MENU), 1)
+        self.assertEqual(text.count(self._ENV_CALL_MENU_AFTER), 1)
+        first = text.index(self._ENV_CALL_MENU, arm)
+        second = text.index(self._ENV_CALL_MENU_AFTER, arm)
+        # After the export of the two toggles the menu edits, so the check
+        # reads them.
+        self.assertLess(text.index('export GOOGLE_CHAT_ENABLED="$google_chat_enabled" SLACK_ENABLED="$slack_enabled"', arm), first)
+        self.assertLess(first, text.index("save_env_var PROJECT_ID", arm))
+        generator = text.index('write_tfvars_from_state "$(tf_compose_dir "$repo_dir")/terraform.tfvars" "$image_tag"', arm)
+        self.assertLess(generator, second)
+        self.assertLess(second, text.index('run_lifecycle_apply "$repo_dir"', arm))
+
+
+    # ── the interview re-asks rather than refusing after it ──
+
+    def _interview(self, flags, content, answers, choice="2"):
+        """Step 6 on an interactive run: prompt_menu picks `choice`, and
+        prompt_read answers from `answers` in order, echoing each prompt."""
+        stubs = (
+            "has_controlling_tty() { return 0; }\n"
+            "gke_dns_endpoint_flag() { GKE_DNS_ENDPOINT_FLAG=\"\"; }\n"
+            "tf_state_chat_subscription_name() { :; }\n"
+            f'prompt_menu() {{ local v="${{!#}}"; printf -v "$v" "%s" "{choice}"; }}\n'
+            "ANSWERS=()\n"
+            + "".join(f"ANSWERS+=({shlex.quote(a)})\n" for a in answers)
+            + "ASKED=0\n"
+            # The default is echoed as prompt_read prints it ("[default: …]",
+            # the label over the value), so a secret shown there is caught.
+            # An answer of "<enter>" takes the default, as an empty one does.
+            'prompt_read() { echo "PROMPT: $1 [default: ${5:-${3:-}}]"; local a="${ANSWERS[$ASKED]}"; '
+            '[ "$a" = "<enter>" ] && a="${3:-}"; printf -v "$2" "%s" "$a"; ASKED=$((ASKED + 1)); }\n'
+        )
+        # The values are main()'s locals, so they are echoed inside the slice.
+        body, tail = self._chat_step().rsplit("\n}\n", 1)
+        step = (
+            body + '\n  echo "USERS=[$slack_allowed_users] HOME=[$slack_home_channel] '
+            'TOKENS=$(slack_bot_token_list_count "$slack_bot_token")"\n}\n' + tail
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._file(tmp, content)
+            proc = self._run(
+                f"{stubs}{step}parse_args {flags}\n"
+                "resolve_shared_defaults\n"
+                "validate_platform_agent_mode || exit 1\n"
+                "check_flags_against_install_env || exit 1\n"
+                "project_id=p region=r cluster_name=c\n"
+                '_chat_step; echo "went on ASKED=$ASKED"',
+                install_env=path,
+            )
+        return proc
+
+    def test_the_interview_asks_for_what_the_gateway_takes_and_re_asks_a_bad_answer(self):
+        # Bot token, app token, allowlist, home channel, home name, with a
+        # bad answer before each of the three the gateway checks.
+        answers = ["xoxb-1-secretpart,xoxb-2-secretpart", "xoxb-1-secretpart", "xapp-1",
+                   "U0123ABCD,alice@example.com", "U0123ABCD", "D0123ABCD", "C0123ABCD", "#ops"]
+        proc = self._interview("--mode=next", "", answers)
+        out = proc.stdout + proc.stderr
+        self.assertIn("went on ASKED=8", proc.stdout, out)
+        self.assertIn("USERS=[U0123ABCD] HOME=[C0123ABCD] TOKENS=", proc.stdout)
+        self.assertIn("PROMPT: Slack Bot Token (xoxb-..., one workspace: spec.mode next takes a single token)", out)
+        self.assertIn("PROMPT: Allowed Slack member IDs (comma-separated, such as U0123ABCD; not emails)", out)
+        self.assertIn("PROMPT: Slack Home Channel ID (optional, a channel ID such as C0123456789)", out)
+        self.assertNotIn("User IDs / Emails", out)
+        self.assertNotIn("comma-separated for several workspaces", out)
+        # Each bad answer is named and asked again, once.
+        self.assertIn("SLACK_BOT_TOKEN holds 2 tokens. Under spec.mode next the A2A gateway takes one workspace's bot token; enter one.", out)
+        self.assertIn("These look like emails: alice@example.com.", out)
+        self.assertIn("'D0123ABCD' is not a Slack channel id (C... or G...).", out)
+        self.assertEqual(out.count("PROMPT: Slack Bot Token"), 2)
+        self.assertEqual(out.count("PROMPT: Allowed Slack member IDs"), 2)
+        self.assertEqual(out.count("PROMPT: Slack Home Channel ID"), 2)
+        self.assertNotIn("secretpart", out)
+
+    def test_a_re_ask_offers_only_a_default_it_shows(self):
+        # Bot token: a stray comma, then one token. Allowlist: emails, then
+        # Enter, which keeps the refused list (an empty one would admit
+        # everyone) under a default that shows it, then IDs. Home channel: a
+        # DM, then Enter, which clears it.
+        answers = ["xoxb-1-secretpart,", "xoxb-1-secretpart", "xapp-1",
+                   "U0123ABCD,alice@example.com", "<enter>", "U0123ABCD",
+                   "D0123ABCD", "<enter>", "#ops"]
+        proc = self._interview("--mode=next", "", answers)
+        out = proc.stdout + proc.stderr
+        self.assertIn("went on ASKED=9", proc.stdout, out)
+        self.assertIn("USERS=[U0123ABCD] HOME=[] TOKENS=", proc.stdout)
+        self.assertIn("SLACK_BOT_TOKEN holds a comma or space.", out)
+        self.assertEqual(out.count("These look like emails: alice@example.com."), 2)
+        self.assertIn("PROMPT: Allowed Slack member IDs (comma-separated, such as U0123ABCD; not emails) "
+                      "[default: U0123ABCD,alice@example.com]", out)
+        self.assertNotIn("[default: empty list]", out.split("These look like emails", 1)[1])
+        self.assertIn("PROMPT: Slack Home Channel ID (optional, a channel ID such as C0123456789) [default: ]", out)
+        self.assertNotIn("secretpart", out)
+
+    def test_the_interview_keeps_the_today_prompts_where_slack_stays_on_the_today_path(self):
+        answers = ["xoxb-a,xoxb-b", "xapp-1", "alice@example.com", "D0DM", "#ops"]
+        for flags, choice in (("", "2"), ("--mode=next", "3")):
+            with self.subTest(flags=flags, choice=choice):
+                chat = ["", "", "", ""] if choice == "3" else []
+                proc = self._interview(flags, "", chat + answers, choice=choice)
+                out = proc.stdout + proc.stderr
+                self.assertIn(f"went on ASKED={len(chat) + 5}", proc.stdout, out)
+                self.assertIn("PROMPT: Allowed Slack User IDs / Emails (comma-separated)", out)
+                self.assertNotIn("look like emails", out)
+
+    # ── after the generator's Secret recovery ──
+
+    def _after_generator(self, keys, dry_run=False):
+        """main()'s run from the generator through "Terraform input saved",
+        with the generator stubbed to write the tfvars and recover a bot
+        token list from the live Secret, then a marker for the apply."""
+        text = _INSTALL_SH.read_text()
+        main_start = text.index("\nmain() {")
+        start = text.index(self._GENERATOR, main_start)
+        end = text.index(self._SAVED, start) + len(self._SAVED)
+        with tempfile.TemporaryDirectory() as tmp:
+            tfvars = pathlib.Path(tmp) / "terraform.tfvars"
+            exports = "".join(f"export {k}={shlex.quote(v)}\n" for k, v in keys.items())
+            script = (
+                "write_tfvars_from_state() { echo 'slack_bot_token = \"xoxb-a,xoxb-b\"' > \"$1\"; "
+                "export SLACK_BOT_TOKEN='xoxb-1-secretpart,xoxb-2-secretpart'; "
+                "print_info \"Recovered SLACK_BOT_TOKEN from the live Secret\"; }\n"
+                f"{exports}"
+                f'tfvars_file="{tfvars}" image_tag=0.9.0 PARAM_MEMORY_EXPLICIT=true PARAM_DRY_RUN={"true" if dry_run else "false"}\n'
+                f"_after() {{\n{text[start:end]}\n}}\n"
+                '_after; echo "APPLIED"\n'
+            )
+            proc = self._run(script)
+            exists = tfvars.exists()
+        return proc, exists
+
+    def test_a_token_list_recovered_from_the_secret_is_refused_before_the_apply(self):
+        proc, exists = self._after_generator({
+            "PLATFORM_AGENT_MODE": "next", "SLACK_ENABLED": "true", "GOOGLE_CHAT_ENABLED": "false",
+            "SLACK_APP_TOKEN": "xapp-1", "SLACK_BOT_TOKEN": "",
+        })
+        out = proc.stdout + proc.stderr
+        self.assertEqual(proc.returncode, 1, out)
+        self.assertIn("Recovered SLACK_BOT_TOKEN", out)
+        self.assertIn("SLACK_BOT_TOKEN holds 2 tokens", out)
+        self.assertIn("in install.env or --slack-bot-token and run again", out)
+        self.assertNotIn("APPLIED", out)
+        self.assertNotIn("secretpart", out)
+        # The tfvars rendered the refused token, so it is removed rather than
+        # left for a --generate-only handoff or a manual lifecycle.sh apply.
+        self.assertFalse(exists)
+        self.assertIn("which carried the refused settings", out)
+
+    def test_a_recovered_single_token_or_chat_holding_the_gateway_goes_on(self):
+        for keys in (
+            {"PLATFORM_AGENT_MODE": "today", "SLACK_ENABLED": "true"},
+            {"PLATFORM_AGENT_MODE": "next", "SLACK_ENABLED": "true", "GOOGLE_CHAT_ENABLED": "true"},
+        ):
+            with self.subTest(keys=keys):
+                proc, exists = self._after_generator({**keys, "SLACK_APP_TOKEN": "xapp-1", "SLACK_BOT_TOKEN": ""})
+                out = proc.stdout + proc.stderr
+                self.assertIn("APPLIED", proc.stdout, out)
+                self.assertTrue(exists)
+
+    def test_a_dry_run_warns_instead_of_refusing(self):
+        proc, exists = self._after_generator({
+            "PLATFORM_AGENT_MODE": "next", "SLACK_ENABLED": "true", "SLACK_APP_TOKEN": "xapp-1", "SLACK_BOT_TOKEN": "",
+            "SLACK_ALLOWED_USERS": "alice@example.com",
+        }, dry_run=True)
+        out = proc.stdout + proc.stderr
+        self.assertIn("APPLIED", proc.stdout, out)
+        self.assertIn("An applying run would be refused: SLACK_BOT_TOKEN holds 2 tokens", out)
+        self.assertIn("An applying run would be refused: SLACK_ALLOWED_USERS holds entries that look like emails", out)
+        self.assertTrue(exists)
+
+    def test_a_dry_run_is_not_refused_at_the_interview(self):
+        proc = self._step("--dry-run --mode=next --enable-slack --slack-allowed-users=alice@example.com", "")
+        self.assertIn("went on", proc.stdout, proc.stdout + proc.stderr)
+
+    # ── the menu's Save & Apply ──
+
+    _MENU_GENERATOR_RECOVERS_A_LIST = (
+        "write_tfvars_from_state() { echo generated > \"$1\"; "
+        "export SLACK_BOT_TOKEN='xoxb-1-secretpart,xoxb-2-secretpart'; }\n"
+    )
+
+    def _menu_apply(self, generator, call='rc=0; _menu_apply || rc=$?; echo "rc=$rc"\n'):
+        """The menu's Save & Apply arm, run as a function with `generator`
+        standing in for write_tfvars_from_state. mktemp records each file it
+        makes, so a copy of install.env left behind can be found (macOS's
+        mktemp ignores TMPDIR when given no template)."""
+        text = _INSTALL_SH.read_text()
+        start = text.index(self._MENU_ARM) + len("      6)\n")
+        end = text.index("\n        ;;\n", start)
+        names = ("allowed_users anthropic_api_key chat_sub_name chat_topic_name cluster_name custom_roles "
+                 "enable_gvisor enable_webui gemini_api_key github_app_id github_org github_repo "
+                 "google_chat_home_channel image_tag kms_key kms_keyring model_default_name model_provider "
+                 "openai_api_key permission_set project_id region repo_dir vertex_location vertex_project_id").split()
+        stubs = (
+            "resolve_effective_image_tag() { :; }\nvalidate_immutable_ref() { :; }\nverify_local_source_ref() { :; }\n"
+            "tf_compose_dir() { printf '%s' \"$TF_DIR\"; }\n"
+            f"{generator}"
+            "check_service_account_ownership() { :; }\ngke_dns_endpoint_flag() { :; }\ngcloud() { :; }\n"
+            "refuse_apply_over_undeclared_scope() { :; }\nannounce_platform_agent_mode_for_apply() { :; }\n"
+            "check_scope_container_access() { :; }\nenable_scope_selector_apis() { :; }\n"
+            'apply_crd_upgrades() { echo "APPLIED crds"; }\nrun_lifecycle_apply() { echo "APPLIED terraform"; }\n'
+        )
+        content = "PROJECT_ID=p\nREGION=r\nPLATFORM_AGENT_MODE=next\nSLACK_ENABLED=true\nGOOGLE_CHAT_ENABLED=false\n"
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._file(tmp, content)
+            tf_dir = pathlib.Path(tmp) / "tf"
+            tf_dir.mkdir()
+            made = pathlib.Path(tmp) / "mktemp.log"
+            made.touch()
+            script = (
+                f"{stubs}"
+                + "".join(f"{n}=v-{n}\n" for n in names)
+                + 'permission_set=read-only slack_enabled=true google_chat_enabled=false\n'
+                f'TF_DIR="{tf_dir}" SLACK_BOT_TOKEN=""\n'
+                f'mktemp() {{ local p; p="$(command mktemp "$@")" || return; echo "$p" >>"{made}"; printf "%s\\n" "$p"; }}\n'
+                f"_menu_apply() {{\n{text[start:end]}\n}}\n"
+                f"{call}"
+            )
+            proc = self._run(script, install_env=path)
+            result = {
+                "content": content,
+                "after": path.read_text(),
+                "mode": stat.S_IMODE(path.stat().st_mode),
+                "tfvars_left": (tf_dir / "terraform.tfvars").exists(),
+                "leftovers": [m for m in made.read_text().split() if pathlib.Path(m).exists()],
+                "made": made.read_text().split(),
+            }
+        return proc, result
+
+    def test_the_menu_puts_install_env_back_when_the_check_after_its_generator_refuses(self):
+        proc, r = self._menu_apply(self._MENU_GENERATOR_RECOVERS_A_LIST)
+        out = proc.stdout + proc.stderr
+        self.assertIn("rc=1", proc.stdout, out)
+        self.assertIn("SLACK_BOT_TOKEN holds 2 tokens", out)
+        self.assertNotIn("APPLIED", out)
+        self.assertNotIn("secretpart", out)
+        self.assertEqual(r["after"], r["content"], "install.env was left with the refused Save & Apply's keys")
+        self.assertEqual(r["mode"], 0o600)
+        self.assertFalse(r["tfvars_left"])
+        self.assertEqual(r["leftovers"], [], "the copy of install.env was left behind")
+        self.assertIn("put back as it was before this Save & Apply", out)
+
+    def test_the_menu_leaves_no_copy_of_install_env_when_its_generator_fails(self):
+        # The generator's own failures (no memory answer, say) exit through
+        # on_error, past both of the arm's clean-up paths. Called bare, as
+        # the menu calls it: under `||` the ERR trap would not fire.
+        proc, r = self._menu_apply("write_tfvars_from_state() { return 1; }\n",
+                                   call='_menu_apply; echo "rc=$?"\n')
+        out = proc.stdout + proc.stderr
+        self.assertNotIn("APPLIED", out)
+        self.assertNotIn("rc=0", proc.stdout, out)
+        self.assertEqual(len(r["made"]), 1, out)
+        self.assertEqual(r["leftovers"], [], "the copy of install.env, with its credentials, was left behind")
+
+    def test_the_menu_leaves_no_copy_of_install_env_after_a_clean_apply(self):
+        proc, r = self._menu_apply("write_tfvars_from_state() { echo generated > \"$1\"; }\n")
+        out = proc.stdout + proc.stderr
+        self.assertIn("APPLIED terraform", out)
+        self.assertEqual(r["leftovers"], [], out)
+
+
 class FrontDoorsAgreeOnTheRepositoryTest(unittest.TestCase):
     """Each front door clones the install sources before it has a checkout to
     read the URL from, so each carries the URL; this pins the three equal."""

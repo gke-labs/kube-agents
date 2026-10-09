@@ -5183,6 +5183,24 @@ run_menu_system() {
         export PARAM_ENABLE_WEBUI="$enable_webui" PARAM_MODEL_PROVIDER="$model_provider"
         export PARAM_PERMISSION_SET="$permission_set" PARAM_ENABLE_GVISOR="$enable_gvisor"
         export GOOGLE_CHAT_ENABLED="$google_chat_enabled" SLACK_ENABLED="$slack_enabled"
+        # Before anything is saved: this apply renders PLATFORM_AGENT_MODE
+        # from install.env, and if Slack moves to the A2A gateway under next,
+        # the settings it cannot use are refused (and again after the
+        # generator, for a bot token it recovers from the live Secret).
+        refuse_next_slack_gateway_settings_from_env || return 1
+        # Kept until the check after the generator has passed, so that a
+        # refusal there puts install.env back as it was.
+        # The copy holds install.env's credentials, so it is 0600 under a
+        # recognisable name, and an EXIT trap removes it if the arm dies
+        # before either path below does (a generator failure exits through
+        # on_error, and Ctrl-C exits too).
+        local install_env_before=""
+        if [ -f "$INSTALL_ENV_FILE" ]; then
+          install_env_before="$(umask 077; mktemp "${TMPDIR:-/tmp}/kube-agents-install-env.XXXXXX")"
+          cat "$INSTALL_ENV_FILE" >"$install_env_before"
+          # shellcheck disable=SC2064 # expand now: the local is gone at exit.
+          trap "rm -f $(printf '%q' "$install_env_before")" EXIT
+        fi
 
         # Into install.env, one key at a time, leaving the operator's comments
         # and ordering alone. This panel is the one place allowed to write
@@ -5239,6 +5257,27 @@ run_menu_system() {
         # decide the fate of a database.
         KUBE_AGENTS_REQUIRE_MEMORY_ANSWER=true \
           write_tfvars_from_state "$(tf_compose_dir "$repo_dir")/terraform.tfvars" "$image_tag"
+        # Again for a bot token the generator recovered from the live Secret.
+        # The keys are saved by now, so a refusal restores install.env and
+        # removes the tfvars that render the refused settings.
+        if ! refuse_next_slack_gateway_settings_from_env; then
+          if [ -n "$install_env_before" ]; then
+            # Into the existing file, which keeps its 0600.
+            # Moved into place complete, as save_env_var writes it (on_error
+            # removes a half-written .tmp), before the copy is let go.
+            (umask 077; cat "$install_env_before" >"${INSTALL_ENV_FILE}.tmp")
+            mv -f "${INSTALL_ENV_FILE}.tmp" "$INSTALL_ENV_FILE"
+            trap - EXIT
+            rm -f "$install_env_before"
+            print_info "${INSTALL_ENV_FILE} is put back as it was before this Save & Apply."
+          fi
+          rm -f "$(tf_compose_dir "$repo_dir")/terraform.tfvars"
+          return 1
+        fi
+        if [ -n "$install_env_before" ]; then
+          rm -f "$install_env_before"
+          trap - EXIT
+        fi
         # A provider or minter switch is where a new fixed-name GSA is first
         # planned on an existing install, so the 409 check runs here too.
         check_service_account_ownership || exit 1
@@ -5775,6 +5814,16 @@ main() {
     # Same shape as allowed_users_hint above: an empty list has to read as a
     # deliberate choice rather than as a missing default.
     [ -z "$slack_allowed_users" ] && slack_allowed_hint="empty list"
+    # Under next with Chat off the A2A gateway takes Slack (the mode was
+    # settled at step 2; arm 3 set google_chat_enabled before this runs), and
+    # it takes one bot token, member IDs and a channel id. Those prompts say
+    # so and ask again on an answer the gateway cannot use, rather than let
+    # the refusal after this step throw the interview away. A run with nobody
+    # to ask keeps its values, and that refusal is its check.
+    if slack_moves_to_a2a_gateway "${PARAM_PLATFORM_AGENT_MODE:-$DEFAULT_PLATFORM_AGENT_MODE}" true "$google_chat_enabled"; then
+      _prompt_slack_settings_for_gateway
+      return 0
+    fi
     prompt_read "Slack Bot Tokens (xoxb-..., comma-separated for several workspaces)" \
       slack_bot_token "$slack_bot_token" true "$bot_hint"
     prompt_read "Slack App Token (xapp-...)" slack_app_token "$slack_app_token" true "$app_hint"
@@ -5782,6 +5831,54 @@ main() {
       slack_allowed_users "$slack_allowed_users" false "$slack_allowed_hint"
     prompt_read "Slack Home Channel ID (optional, e.g. C0123456789)" \
       slack_home_channel "$slack_home_channel"
+    prompt_read "Slack Home Channel Name (optional, e.g. #gke-alerts)" \
+      slack_home_channel_name "$slack_home_channel_name"
+  }
+
+  # _prompt_slack_settings when the A2A gateway takes Slack. Reads the hints
+  # _prompt_slack_settings set (bash scopes them dynamically).
+  _prompt_slack_settings_for_gateway() {
+    local can_ask=true bad=""
+    if [ "$PARAM_NON_INTERACTIVE" = "true" ] || ! has_controlling_tty; then
+      can_ask=false
+    fi
+    while :; do
+      prompt_read "Slack Bot Token (xoxb-..., one workspace: spec.mode next takes a single token)" \
+        slack_bot_token "$slack_bot_token" true "$bot_hint"
+      bad="$(slack_bot_token_list_count "$slack_bot_token")"
+      if [ -z "$bad" ] && slack_bot_token_has_separator "$slack_bot_token"; then bad=stray; fi
+      { [ -n "$bad" ] && $can_ask; } || break
+      if [ "$bad" = stray ]; then
+        print_error "SLACK_BOT_TOKEN holds a comma or space. Under spec.mode next the A2A gateway takes one bot token as it is; enter it without one."
+      else
+        print_error "SLACK_BOT_TOKEN holds ${bad} tokens. Under spec.mode next the A2A gateway takes one workspace's bot token; enter one."
+      fi
+      # Not the re-ask's default: prompt_read prints a default it has no
+      # label for, and this one is the list just typed under read -s.
+      slack_bot_token="" bot_hint=""
+    done
+    prompt_read "Slack App Token (xapp-...)" slack_app_token "$slack_app_token" true "$app_hint"
+    while :; do
+      prompt_read "Allowed Slack member IDs (comma-separated, such as U0123ABCD; not emails)" \
+        slack_allowed_users "$slack_allowed_users" false "$slack_allowed_hint"
+      bad="$(slack_allowlist_emails "$slack_allowed_users")"
+      { [ -n "$bad" ] && $can_ask; } || break
+      print_error "These look like emails: ${bad}. Under spec.mode next the allowlist matches Slack member IDs exactly. Find one in Slack: open the person's profile, choose ⋮ (More), then Copy member ID."
+      # The refused list stays the default (an empty one would admit
+      # everyone), so the hint shows it rather than a label for another.
+      slack_allowed_hint=""
+    done
+    while :; do
+      prompt_read "Slack Home Channel ID (optional, a channel ID such as C0123456789)" \
+        slack_home_channel "$slack_home_channel"
+      bad="$(slack_home_channel_not_an_id "$slack_home_channel")"
+      { [ -n "$bad" ] && $can_ask; } || break
+      print_error "'${bad}' is not a Slack channel id (C... or G...). The id is at the bottom of the channel details' About tab."
+      # Not the re-ask's default: the value is optional, and prompt_read
+      # turns an empty answer into the default, so a bad one could never be
+      # cleared.
+      slack_home_channel=""
+    done
     prompt_read "Slack Home Channel Name (optional, e.g. #gke-alerts)" \
       slack_home_channel_name "$slack_home_channel_name"
   }
@@ -5889,6 +5986,16 @@ main() {
       _prompt_no_chat_enabled
       ;;
   esac
+  # The Slack settings are settled here, whether from a flag, install.env or
+  # an answer. If Slack moves to the A2A gateway under next, the settings it
+  # cannot use (an email in the allowlist, a home channel that is not a
+  # channel id, a list of bot tokens) are refused now, before the generator,
+  # install.env or any apply. A token the generator recovers from the live
+  # Secret is checked after it. A --dry-run applies nothing, so it is warned
+  # there instead, once, with the recovered token included.
+  if [ "$PARAM_DRY_RUN" != "true" ]; then
+    refuse_next_slack_gateway_settings "${PARAM_PLATFORM_AGENT_MODE:-$DEFAULT_PLATFORM_AGENT_MODE}" "$slack_enabled" "$google_chat_enabled" "$slack_allowed_users" "$slack_home_channel" "$slack_bot_token" flags || exit 1
+  fi
 
   # 7. LLM Model Provider Selection & API Key Auto-Discovery
   print_step "7. AI Model Provider Credentials"
@@ -6725,6 +6832,18 @@ main() {
   # still supply the tokens; before the apply, because a relay without them
   # CrashLoops.
   require_slack_tokens_after_recovery
+  # Again on the exported keys, for a bot token the generator recovered from
+  # the live Secret (refuse_next_slack_gateway_settings). Still before
+  # install.env and the apply. The tfvars just written render the refused
+  # settings, so a refusal removes them: --generate-only hands that file to
+  # lifecycle.sh apply. A --dry-run warns instead.
+  if [ "$PARAM_DRY_RUN" = "true" ]; then
+    refuse_next_slack_gateway_settings_from_env flags "$SCOPE_CHECK_MODE_WARN"
+  elif ! refuse_next_slack_gateway_settings_from_env flags; then
+    rm -f "$tfvars_file"
+    print_info "Removed ${tfvars_file}, which carried the refused settings, so nothing applies it."
+    exit 1
+  fi
   print_success "Terraform input saved to: $tfvars_file"
 
   # Before the summary, the confirmation and the dry-run exit alike: a

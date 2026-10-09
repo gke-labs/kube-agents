@@ -1905,6 +1905,11 @@ main() {
     if declare -F announce_platform_agent_mode_for_apply >/dev/null; then
       announce_platform_agent_mode_for_apply "$target_namespace" "${PLATFORM_AGENT_MODE:-$DEFAULT_PLATFORM_AGENT_MODE}"
     fi
+    # The Slack settings the full arm refuses when next hands Slack to the
+    # A2A gateway, warned here, as the scope check is.
+    if declare -F refuse_next_slack_gateway_settings_from_env >/dev/null; then
+      refuse_next_slack_gateway_settings_from_env "" "$SCOPE_CHECK_MODE_WARN"
+    fi
     print_info "Comparing this checkout's composition against the install's Terraform state."
     local plan_status=0
     run_lifecycle "${repo_dir}/terraform/examples/full-install" \
@@ -2001,6 +2006,21 @@ main() {
       # refused, not dropped, as retag_values does on the other two arms. Ahead
       # of the notice below, which an older target's helpers cannot print.
       refuse_full_apply_dropping_next "${repo_dir}/${KUBE_AGENTS_VALUES_SCHEMA}" || exit 1
+      # If this apply moves Slack to the A2A gateway (next, Slack on, Chat
+      # off), the Slack settings the gateway cannot use are refused: an email
+      # in the allowlist, a home channel that is not a channel id, a list of
+      # bot tokens. The generator above has already recovered a token the
+      # live Secret holds. Guarded: a target tree whose installer_common.sh
+      # predates the check does not define it.
+      # A refusal removes the tfvars the generator just wrote, which render
+      # the refused settings, as install.sh does; a moved checkout's previous
+      # tfvars come back from restore_moved_checkout.
+      if declare -F refuse_next_slack_gateway_settings_from_env >/dev/null; then
+        if ! refuse_next_slack_gateway_settings_from_env; then
+          rm -f "$tfvars_file"
+          exit 1
+        fi
+      fi
       # The mode. A full apply carries PLATFORM_AGENT_MODE forward from
       # install.env, so a key edited since the last apply switches the install
       # here, and the run says so first, from the reads the scope check made.

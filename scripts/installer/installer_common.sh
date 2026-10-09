@@ -146,6 +146,16 @@ readonly PLATFORM_AGENT_SHELL_STATEFULSET="platform-agent-shell"
 readonly PLATFORM_AGENT_CREDENTIAL_PROXY_DEPLOYMENT="platform-agent-credential-proxy"
 # The design document a spec.mode switch points the operator at.
 readonly PLATFORM_AGENT_MODE_SWITCH_DOC="docs/designs/spec-mode-switch.md"
+# The Slack app setup page's allowlist section, which says how to find a
+# member ID; refuse_next_slack_gateway_settings points at it.
+readonly SLACK_ALLOWLIST_DOC="https://gke-labs.github.io/kube-agents/install/slack-app/#allowed-users"
+# A Slack home channel the A2A gateway arms its notify route on: a public
+# (C...) or private (G...) channel id, the prefix letter then two or more of
+# A-Z0-9. This mirrors the gateway's slackIsHomeChannelID and
+# slackMinChannelIDLen (a2a/gateway/slack.go). The operator's
+# a2aSlackHomeChannel (k8s-operator platformagent_a2a_manifests.go) holds
+# the same rule. #2791 adds both. Keep the three in step.
+readonly SLACK_HOME_CHANNEL_ID_RE='^[CG][A-Z0-9]{2,}$'
 # What platform_agent_mode_in_values and platform_agent_mode_on_cr print for
 # a field that is not there: a record that carries no platformAgent.mode, or a
 # CR with no spec.mode. Told apart from printing nothing, which means there is
@@ -603,6 +613,137 @@ note_platform_agent_mode_not_applied() {
   print_warning "install.env sets PLATFORM_AGENT_MODE=${key}, but this --upgrade-mode=${upgrade_mode} run re-tags the release's recorded values and leaves it at spec.mode ${running}."
   print_info "A full upgrade applies the switch to ${full} (${PLATFORM_AGENT_MODE_SWITCH_DOC}). To stay on ${running}, set PLATFORM_AGENT_MODE=${running} in install.env."
   platform_agent_mode_extra_values_caveat
+}
+
+# Whether Slack is consumed by the A2A gateway after this apply: the
+# operator's a2aSlackArmed (k8s-operator platformagent_a2a_manifests.go),
+# which is spec.mode next, Slack enabled and Google Chat not armed. Chat holds
+# the gateway when both are on, and Slack stays on the today path. $1 the
+# mode the apply renders, $2 SLACK_ENABLED, $3 GOOGLE_CHAT_ENABLED.
+slack_moves_to_a2a_gateway() {
+  [ "${1:-}" = "next" ] && is_truthy "${2:-}" && ! is_truthy "${3:-}"
+}
+
+# The three checks behind refuse_next_slack_gateway_settings, one per
+# setting, which the install.sh interview also uses to re-ask. Each prints
+# nothing for a setting that passes.
+#
+# The entries of a Slack allowlist ($1) that look like emails (contain @),
+# comma-joined. The list is split the way hcl_csv_list renders it.
+slack_allowlist_emails() {
+  local item emails=""
+  while IFS= read -r item; do
+    case "$item" in *@*) emails="${emails:+${emails}, }${item}" ;; esac
+  done <<< "$(csv_list_items "${1:-}")"
+  printf '%s' "$emails"
+}
+
+# A Slack home channel ($1), trimmed, when it is set and is not a channel id
+# (SLACK_HOME_CHANNEL_ID_RE).
+slack_home_channel_not_an_id() {
+  local home="${1:-}"
+  home="${home#"${home%%[![:space:]]*}"}"
+  home="${home%"${home##*[![:space:]]}"}"
+  if [ -n "$home" ] && ! [[ "$home" =~ $SLACK_HOME_CHANNEL_ID_RE ]]; then
+    printf '%s' "$home"
+  fi
+}
+
+# The number of tokens a Slack bot token ($1) holds, when it is more than
+# one. The token itself is never printed.
+slack_bot_token_list_count() {
+  local item count=0
+  while IFS= read -r item; do
+    [ -n "$item" ] && count=$((count + 1))
+  done <<< "$(csv_list_items "${1:-}")"
+  if [ "$count" -gt 1 ]; then printf '%s' "$count"; fi
+}
+
+# True when a Slack bot token ($1), trimmed, still holds a separator: one
+# token with a stray comma or space, as hand-trimming a list leaves it. The
+# legacy broker drops the empty piece; the gateway takes the string whole.
+slack_bot_token_has_separator() {
+  local token="${1:-}"
+  token="${token#"${token%%[![:space:]]*}"}"
+  token="${token%"${token##*[![:space:]]}"}"
+  case "$token" in *[,[:space:]]*) return 0 ;; esac
+  return 1
+}
+
+# Three Slack settings that the today path accepts and the A2A gateway does
+# not. They are refused before the front door applies anything (#2812), and
+# only when Slack moves to the gateway (slack_moves_to_a2a_gateway). Every
+# failing setting is reported in one run. There is no email-to-ID lookup.
+#
+# - SLACK_ALLOWED_USERS is matched against member IDs (U.../W...) exactly.
+#   The installer's prompt in 0.7 and 0.8 asked for "User IDs / Emails", and
+#   an email matches nobody, so that person is refused after the switch. A
+#   list of only emails is non-empty, so it does not fall back to allow-all.
+#   The today path (Hermes) never matched an email either.
+# - SLACK_HOME_CHANNEL, when set, must be a channel id
+#   (SLACK_HOME_CHANNEL_ID_RE). With anything else, a DM (D...) or a user
+#   (U...), the gateway leaves its notify route unarmed, so proactive posts
+#   and board-card reports stop.
+# - SLACK_BOT_TOKEN must be one token. The legacy broker takes a
+#   comma-separated list for several workspaces; the gateway takes the
+#   string whole, Slack refuses it at auth.test, and the Slack backend
+#   retries on a backoff without ever connecting. One token with a stray
+#   comma or space left in it fails the same way. Only the
+#   count is printed, never the value. An empty token is skipped: it is
+#   recovered from the live Secret later, so the front doors call again
+#   after recovery.
+#
+# $1 the mode the apply renders, $2 SLACK_ENABLED, $3 GOOGLE_CHAT_ENABLED,
+# $4 the allowlist, $5 the home channel, $6 the bot token. $7 is "flags"
+# when install.sh's flags can set them too, so the remedy names each flag.
+# $8 is SCOPE_CHECK_MODE_WARN for a run that applies nothing (upgrade.sh
+# --plan, install.sh --dry-run): it warns, as the scope check does, and
+# returns 0.
+refuse_next_slack_gateway_settings() {
+  local allowlist="${4:-}" home="${5:-}" token="${6:-}" flags="${7:-}" mode="${8:-}"
+  local emails bad_home count refused=false via say=print_error lead=""
+  slack_moves_to_a2a_gateway "${1:-}" "${2:-}" "${3:-}" || return 0
+  if [ "$mode" = "$SCOPE_CHECK_MODE_WARN" ]; then
+    say=print_warning
+    lead="An applying run would be refused: "
+  fi
+  emails="$(slack_allowlist_emails "$allowlist")"
+  if [ -n "$emails" ]; then
+    via="install.env"; [ "$flags" = "flags" ] && via="install.env or --slack-allowed-users"
+    "$say" "${lead}SLACK_ALLOWED_USERS holds entries that look like emails: ${emails}. Under spec.mode next the A2A gateway matches this allowlist against Slack member IDs exactly (such as U0123ABCD), so an email matches nobody and the person it names would be locked out after this apply."
+    print_info "Find each person's member ID in Slack: open their profile, choose ⋮ (More), then Copy member ID. Replace the emails with those IDs in ${via} and run again. Slack app setup for next: ${SLACK_ALLOWLIST_DOC}"
+    refused=true
+  fi
+  bad_home="$(slack_home_channel_not_an_id "$home")"
+  if [ -n "$bad_home" ]; then
+    via="install.env"; [ "$flags" = "flags" ] && via="install.env or --slack-home-channel"
+    "$say" "${lead}SLACK_HOME_CHANNEL is '${bad_home}', which is not a Slack channel id (C... or G...). Under spec.mode next the A2A gateway does not arm its notify route with it, so the agent's proactive posts and every board card's report back stop."
+    print_info "Use the channel's id: in Slack, open the channel's details; the id is at the bottom of the About tab. Set it in ${via} and run again."
+    refused=true
+  fi
+  count="$(slack_bot_token_list_count "$token")"
+  if [ -n "$count" ]; then
+    via="install.env"; [ "$flags" = "flags" ] && via="install.env or --slack-bot-token"
+    "$say" "${lead}SLACK_BOT_TOKEN holds ${count} tokens, a list for several workspaces. Under spec.mode next the A2A gateway's Slack backend takes one workspace's bot token, and Slack refuses a list, so that backend retries without end and nothing answers on Slack."
+    print_info "Set SLACK_BOT_TOKEN to one workspace's bot token (xoxb-...) in ${via} and run again, or keep this install on PLATFORM_AGENT_MODE=today."
+    refused=true
+  elif slack_bot_token_has_separator "$token"; then
+    via="install.env"; [ "$flags" = "flags" ] && via="install.env or --slack-bot-token"
+    "$say" "${lead}SLACK_BOT_TOKEN holds one token with a comma or space left in it. Under spec.mode next the A2A gateway's Slack backend takes the value whole, and Slack refuses it, so that backend retries without end and nothing answers on Slack."
+    print_info "Remove the comma or space from SLACK_BOT_TOKEN in ${via} and run again."
+    refused=true
+  fi
+  if $refused && [ "$mode" != "$SCOPE_CHECK_MODE_WARN" ]; then return 1; fi
+  return 0
+}
+
+# refuse_next_slack_gateway_settings on the exported keys: what install.env
+# loaded, or what install.sh exported, plus a token the tfvars generator
+# recovered from the live Secret. $1 and $2 are the other's $7 and $8.
+refuse_next_slack_gateway_settings_from_env() {
+  refuse_next_slack_gateway_settings "${PLATFORM_AGENT_MODE:-$DEFAULT_PLATFORM_AGENT_MODE}" \
+    "${SLACK_ENABLED:-$DEFAULT_SLACK_ENABLED}" "${GOOGLE_CHAT_ENABLED:-$DEFAULT_GOOGLE_CHAT_ENABLED}" \
+    "${SLACK_ALLOWED_USERS:-}" "${SLACK_HOME_CHANNEL:-}" "${SLACK_BOT_TOKEN:-}" "${1:-}" "${2:-}"
 }
 
 # Said when a read the notice needs failed, so the run does not go on as if
@@ -1271,11 +1412,12 @@ hcl_bool() {
   if is_truthy "${1:-}"; then printf 'true'; else printf 'false'; fi
 }
 
-# Comma- or space-separated string → HCL list of strings, dropping empty
-# items. Both separators, because --custom-roles documents "space- or
-# comma-separated".
-hcl_csv_list() {
-  local csv="${1:-}" out="[" first=true item had_noglob=false
+# Comma- or space-separated string → its items, one per line, trimmed, empty
+# items dropped. Both separators, because --custom-roles documents "space- or
+# comma-separated". hcl_csv_list renders every list key through this, so a
+# check that reads a list sees the items the tfvars carry.
+csv_list_items() {
+  local csv="${1:-}" item had_noglob=false
   local IFS=$', \t\n'
   # Globbing off around the unquoted split: an entry such as *-sandbox (a
   # scope exclusion) would otherwise be replaced by whatever files match it
@@ -1287,11 +1429,20 @@ hcl_csv_list() {
     item="${item#"${item%%[![:space:]]*}"}"
     item="${item%"${item##*[![:space:]]}"}"
     [ -n "$item" ] || continue
+    printf '%s\n' "$item"
+  done
+  $had_noglob || set +f
+}
+
+# Comma- or space-separated string → HCL list of strings (csv_list_items).
+hcl_csv_list() {
+  local out="[" first=true item
+  while IFS= read -r item; do
+    [ -n "$item" ] || continue
     $first || out+=", "
     out+="$(hcl_str "$item")"
     first=false
-  done
-  $had_noglob || set +f
+  done <<< "$(csv_list_items "${1:-}")"
   printf '%s]' "$out"
 }
 

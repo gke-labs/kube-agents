@@ -1390,7 +1390,7 @@ where the gateway's adapter takes one token, so a multi-workspace install stays 
 `today`; and `homeChannel` goes with the Hermes slack platform, so proactive alerts have no
 Slack target under `next`, the cost the Chat section states for Chat.
 
-Nothing enforces the multi-workspace rule. The arm reads the CR alone and never opens the
+The operator does not enforce the multi-workspace rule. The arm reads the CR alone and never opens the
 token Secret, so an install already on `next` whose bot-token Secret holds a list is flipped
 by the operator upgrade that brings the arm: the broker is no longer handed the pair, the
 gateway takes the whole list as one token, and Slack refuses it at `auth.test`. The pod does
@@ -1401,7 +1401,13 @@ Secret holds one workspace's token or the install goes back to `today`. Nothing 
 configured; the gateway pod's log carries the cause, and its events do for a missing Secret
 or key. Reading the Secret in the arm would catch it, at the cost of a
 Secret read on every pass and an arm that turns on Secret contents rather than the CR; the
-CR-only arm was kept and the limitation documented instead (2026-10-06).
+CR-only arm was kept and the limitation documented instead (2026-10-06). The installer
+checks the applies it makes (#2812). `install.sh`, its menu's apply and a full `upgrade.sh`
+refuse an apply that hands Slack to the gateway while `SLACK_BOT_TOKEN` holds a list, and
+also refuse the token when they recover it from the Secret
+([`scripts/installer/README.md`](../../scripts/installer/README.md)). Three paths still
+reach the state above unchecked: `upgrade.sh`'s operator and harness arms, which re-tag the
+release; an operator upgrade made any other way; and a CR edited by hand.
 
 Version skew double-consumes Slack, and this is where Slack differs from Chat. The arm uses
 Chat's rule, so an unrecognised `spec.mode` reads as `today` and the legacy consumer renders
