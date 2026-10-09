@@ -430,12 +430,14 @@ The GitLab eval job (`pull-kube-agents-smoke-test-gitlab`, `EVAL_FORGE=gitlab`,
 [#2394](https://github.com/gke-labs/kube-agents/issues/2394)) deploys the agent against the leased
 project's GitLab repository instead of its GitHub one, in a run of its own beside the GitHub
 presubmit. On a pull request it runs `hack/eval/gitlab-presubmit-cases.txt`, not
-`presubmit-cases.txt`: the cases that grade the forge, a `pull_request_opened` or
+`presubmit-cases.txt`: registered cases that grade the forge, a `pull_request_opened` or
 `pull_request_diff_contains` check (a merge request) or a `ledger_issue_contains` check (a ledger
 issue), since a chat probe passes the same on either forge and the GitHub run already grades it.
-The file is a subset of the presubmit by construction; `hack/ci-eval-pr.sh` refuses an entry
-that is not a presubmit case, and `scripts/test_eval_rosters.py` pins the set and that each entry requires a positive
-forge check (not negated, not one alternative under an `any`). A GitLab nightly would run the
+Every entry is a registered case, from `presubmit-cases.txt` or `nightly-cases.txt`; the lane picks
+from the catalogue and registers nothing. `hack/ci-eval-pr.sh` refuses an entry in neither file,
+and `scripts/test_eval_rosters.py` pins the set and that each entry requires a positive forge check
+(not negated, not one alternative under an `any`). Today that is three merge-request cases; no
+ledger case passes three repetitions anywhere, so the ledger path is the harness's to prove. A GitLab nightly would run the
 whole catalogue, as the GitHub nightly does, but none exists yet (#2832): nothing
 runs the cases this file leaves out against GitLab today.
 
