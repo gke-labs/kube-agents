@@ -21,9 +21,13 @@ GIT_ENV = {
     "GIT_CONFIG_GLOBAL": os.devnull,
     "GIT_CONFIG_NOSYSTEM": "1",
     # No user ignore file, as in the tool: the fixtures must commit every file they write.
-    "GIT_CONFIG_COUNT": "1",
+    "GIT_CONFIG_COUNT": "3",
     "GIT_CONFIG_KEY_0": "core.excludesFile",
     "GIT_CONFIG_VALUE_0": os.devnull,
+    "GIT_CONFIG_KEY_1": "gc.auto",
+    "GIT_CONFIG_VALUE_1": "0",
+    "GIT_CONFIG_KEY_2": "maintenance.auto",
+    "GIT_CONFIG_VALUE_2": "false",
     "GIT_AUTHOR_NAME": "test",
     "GIT_AUTHOR_EMAIL": "test@example.invalid",
     "GIT_COMMITTER_NAME": "test",
@@ -583,6 +587,25 @@ class Helpers(unittest.TestCase):
         self.assertEqual(self.tool.separator_for("a\n\n"), "")
         self.assertEqual(self.tool.separator_for("a\n"), "\n")
         self.assertEqual(self.tool.separator_for("a"), "\n\n")
+
+    def test_git_env_disables_background_gc_and_maintenance(self):
+        env = self.tool.GIT_ENV
+        count = int(env["GIT_CONFIG_COUNT"])
+        config_pairs = {
+            env[f"GIT_CONFIG_KEY_{i}"]: env[f"GIT_CONFIG_VALUE_{i}"]
+            for i in range(count)
+        }
+        self.assertEqual(config_pairs.get("gc.auto"), "0")
+        self.assertEqual(config_pairs.get("maintenance.auto"), "false")
+
+    def test_git_helper_applies_gc_and_maintenance_configs(self):
+        d = Path(tempfile.mkdtemp())
+        try:
+            self.tool.git(["init", "-q"], cwd=d)
+            self.assertEqual(self.tool.git_out(["config", "--get", "gc.auto"], cwd=d), "0")
+            self.assertEqual(self.tool.git_out(["config", "--get", "maintenance.auto"], cwd=d), "false")
+        finally:
+            shutil.rmtree(d)
 
 
 if __name__ == "__main__":
