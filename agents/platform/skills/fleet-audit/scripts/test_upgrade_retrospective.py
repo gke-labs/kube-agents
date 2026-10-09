@@ -345,6 +345,35 @@ class ClassifierFixtureTest(unittest.TestCase):
         self.assertIn("pinned-inference-pool", rows[0]["classifications"][0]["evidence"])
         self.assertIn("63 min over 1 node(s)", rows[0]["classifications"][0]["evidence"])
 
+    def test_budget_hold_is_filed_when_every_covered_pod_was_displaced(self):
+        # Take away the one replica that landed on the surge node: the three Pending replicas carry no
+        # nodeName, but two were created inside the pinned-inference-pool drain, so the hold is still filed.
+        pods = copy.deepcopy(READS["seeded-a"]["pods"])
+        landed = next(p for p in pods if p["metadata"]["name"] == "inference-server-778b78fdb8-txlv7")
+        landed["spec"]["nodeName"] = None
+        landed["status"] = {"phase": "Pending", "conditions": [{"type": "PodScheduled", "status": "False", "reason": "Unschedulable", "message": "0/4 nodes are available: 1 Insufficient cpu.", "lastTransitionTime": "2026-10-08T05:30:00Z"}]}
+        rows = [s for s in symptoms_of("seeded-a", reads={**READS["seeded-a"], "pods": pods}) if s["category"] == "pdb"]
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["upgraded_pools"], ["pinned-inference-pool"])
+        self.assertEqual(entries(rows[0]), {(1, ur.HIGH)})
+        # A pool named on the pod's own selector or its owner's template counts too.
+        for p in pods:
+            if p["metadata"]["name"].startswith("inference-server"):
+                p["metadata"]["creationTimestamp"] = "2026-09-25T17:02:48Z"
+                p["spec"]["nodeSelector"] = {"cloud.google.com/gke-nodepool": "pinned-inference-pool"}
+        rows = [s for s in symptoms_of("seeded-a", reads={**READS["seeded-a"], "pods": pods}) if s["category"] == "pdb"]
+        self.assertEqual(len(rows), 1)
+        for p in pods:
+            if p["metadata"]["name"].startswith("inference-server"):
+                p["spec"]["nodeSelector"] = {}
+        workloads = copy.deepcopy(READS["seeded-a"]["workloads"])
+        next(w for w in workloads if w["metadata"]["name"] == "inference-server")["spec"]["template"]["spec"]["nodeSelector"] = {"cloud.google.com/gke-nodepool": "pinned-inference-pool"}
+        rows = [s for s in symptoms_of("seeded-a", reads={**READS["seeded-a"], "pods": pods, "workloads": workloads}) if s["category"] == "pdb"]
+        self.assertEqual(len(rows), 1)
+        # With no placement, no selector and no drain-time creation, nothing links the budget to a pool.
+        rows = [s for s in symptoms_of("seeded-a", reads={**READS["seeded-a"], "pods": pods}) if s["category"] == "pdb"]
+        self.assertEqual(rows, [])
+
     def test_budget_on_a_pool_nothing_drained_is_not_a_failure(self):
         self.assertEqual(by_object(self.gemma, "kubeagents-system/PodDisruptionBudget/gemma-server"), [])
         ops_without_pool = [o for o in ops_for("seeded-a") if "pinned-inference-pool" not in o["targetLink"]]
@@ -597,6 +626,41 @@ class ClassifierSignatureTest(unittest.TestCase):
         self.assertNotIn("drain held", rows[0]["classifications"][0]["detail"])
         held = [s for s in symptoms_of("seeded-a") if s["category"] == "pdb"]
         self.assertIn("drain held past an hour per node", held[0]["classifications"][0]["detail"])
+
+    def test_entry_14_reads_gate_and_cgroup_mode_from_the_same_replica(self):
+        # A sibling OOM-killed on a touched cgroup v1 pool must not lend its drain to the replica on an
+        # untouched cgroup v2 pool: the pool that supplies the mode supplies the gate.
+        cluster = cluster_doc("seeded-a")
+        cluster["nodePools"][0]["config"]["effectiveCgroupMode"] = ur.CGROUP_V1_MODE  # default-pool on v1, touched
+        ops = [o for o in ops_for("seeded-a") if "idle-batch-pool" not in o["targetLink"]]  # idle-batch-pool (v2) untouched
+        on_v1_touched = pod("jvm-aaaaa", images=["eclipse-temurin:8u302-jre"], statuses=[oom()], node="gke-seeded-a-default-pool-62ac8ee0-d595")
+        on_v2_untouched = pod("jvm-zzzzz", images=["eclipse-temurin:8u302-jre"], statuses=[oom()], node="gke-seeded-a-idle-batch-pool-a5fd3288-q4ts")
+        for p in (on_v1_touched, on_v2_untouched):
+            p["metadata"]["ownerReferences"] = [{"kind": "ReplicaSet", "name": "jvm-rs"}]
+        for first, second in ((on_v1_touched, on_v2_untouched), (on_v2_untouched, on_v1_touched)):
+            reads = {"pods": [first, second], "nodes": READS["seeded-a"]["nodes"], "events": [], "pdbs": [], "owners": []}
+            [row] = ur.collect_symptoms(cluster, reads, ops, SINCE)
+            self.assertEqual(entries(row), {(14, ur.MEDIUM)}, f"order {first['metadata']['name']}, {second['metadata']['name']}")
+            self.assertIn("14 or 15 on cgroup v2", row["classifications"][0]["detail"])
+
+    def test_merged_row_reads_every_replicas_containers(self):
+        # One replica carries the CUDA driver error, the other a plain exit: entry 18 whatever the order.
+        cuda = pod("gpu-aaaaa", statuses=[{"name": "c0", "state": {"terminated": {"reason": "Error", "exitCode": 1, "message": "CUDA Error 803: system has unsupported display driver / cuda driver combination"}}}])
+        plain = pod("gpu-zzzzz", statuses=[{"name": "c0", "state": {"terminated": {"reason": "Error", "exitCode": 1, "message": "exit status 1"}}}])
+        for p in (cuda, plain):
+            p["metadata"]["ownerReferences"] = [{"kind": "ReplicaSet", "name": "gpu-rs"}]
+        for first, second in ((cuda, plain), (plain, cuda)):
+            [row] = self.classify(pods=[first, second])
+            self.assertEqual(entries(row), {(18, ur.HIGH)}, f"order {first['metadata']['name']}, {second['metadata']['name']}")
+            self.assertEqual(len(row["containers"]), 2)
+        # And an OOM kill on the second-listed replica is still an OOM row.
+        healthy_exit = pod("mem-aaaaa", statuses=[{"name": "c0", "state": {"waiting": {"reason": "CrashLoopBackOff"}}, "lastState": {"terminated": {"reason": "Error", "exitCode": 1}}}])
+        killed = pod("mem-zzzzz", images=["eclipse-temurin:8u302-jre"], statuses=[oom()])
+        for p in (healthy_exit, killed):
+            p["metadata"]["ownerReferences"] = [{"kind": "ReplicaSet", "name": "mem-rs"}]
+        for first, second in ((healthy_exit, killed), (killed, healthy_exit)):
+            [row] = self.classify(pods=[first, second])
+            self.assertEqual(entries(row), {(14, ur.HIGH)}, f"order {first['metadata']['name']}, {second['metadata']['name']}")
 
     def test_entry_14_gates_on_the_oom_pods_own_pool(self):
         # idle-batch-pool (cgroup v2) was not touched this week; default-pool was. The OOM pod on the untouched pool is medium.

@@ -1493,6 +1493,15 @@ def _merge_pod_row(rows: dict[tuple, dict], row: dict) -> None:
     existing["pod_nodes"].update(row.get("pod_nodes") or {})
     existing.setdefault("oom_nodes", {}).update(row.get("oom_nodes") or {})
     existing["recreated_pods"] = sorted(set(existing.get("recreated_pods") or []) | set(row.get("recreated_pods") or []))
+    # Every replica's containers and images speak for the row, whatever order
+    # kubectl listed them: the classifier reads them all.
+    for container in row.get("containers") or []:
+        if container not in (existing.get("containers") or []):
+            existing.setdefault("containers", []).append(container)
+    for image in row.get("images") or []:
+        if image not in (existing.get("images") or []):
+            existing.setdefault("images", []).append(image)
+    existing["container_count"] = max(existing.get("container_count", 1), row.get("container_count", 1))
     existing["pods"].append(row["example_pod"])
     existing["pods"].sort()
     existing["pod_count"] = len(existing["pods"])
@@ -1614,9 +1623,27 @@ def _selector_matches(selector: dict, labels: dict) -> bool:
     return True
 
 
-def pdb_symptoms(pdbs: list[dict], pods: list[dict], nodes: list[dict], upgraded_pools: dict[str, dict]) -> list[dict]:
-    """Entry 1's after-signal: a budget allowing no disruption whose pods sit
-    on a pool an `UPGRADE_NODES` touched in the window."""
+def _covered_pod_pool(pod: dict, node_pool: dict[str, str], owner_pool: str, pool_spans: dict[str, list[tuple[datetime, datetime]]]) -> str:
+    """The pool a budget's pod belongs to: where it sits, else the pool its
+    own or its owner's nodeSelector names, else, for a Pending pod, the pool
+    whose drain was running when it was created (the replica the drain
+    displaced)."""
+    spec = pod.get("spec") or {}
+    pool = node_pool.get(spec.get("nodeName") or "", "") or (spec.get("nodeSelector") or {}).get(NODEPOOL_LABEL, "") or owner_pool
+    if pool:
+        return pool
+    created = parse_ts((pod.get("metadata") or {}).get("creationTimestamp"))
+    if created and (pod.get("status") or {}).get("phase") == PHASE_PENDING:
+        for candidate, spans in pool_spans.items():
+            if any(start <= created <= end for start, end in spans):
+                return candidate
+    return ""
+
+
+def pdb_symptoms(pdbs: list[dict], pods: list[dict], nodes: list[dict], upgraded_pools: dict[str, dict], pool_spans: dict[str, list[tuple[datetime, datetime]]] | None = None, owner_pools: dict[str, str] | None = None, resolver: Resolver | None = None) -> list[dict]:
+    """Entry 1's after-signal: a budget allowing no disruption whose pods
+    belong to a pool an `UPGRADE_NODES` touched in the window -- where they
+    sit, or, for the replicas the drain displaced, where they came from."""
     node_pool = {(n.get("metadata") or {}).get("name"): ((n.get("metadata") or {}).get("labels") or {}).get(NODEPOOL_LABEL, "") for n in nodes}
     out = []
     for pdb in pdbs:
@@ -1626,7 +1653,15 @@ def pdb_symptoms(pdbs: list[dict], pods: list[dict], nodes: list[dict], upgraded
         namespace, name = meta.get("namespace", ""), meta.get("name", "")
         selector = (pdb.get("spec") or {}).get("selector") or {}
         covered = [p for p in pods if (p.get("metadata") or {}).get("namespace") == namespace and _selector_matches(selector, (p.get("metadata") or {}).get("labels") or {})]
-        pools = sorted({node_pool.get((p.get("spec") or {}).get("nodeName"), "") for p in covered} - {""})
+        pools = set()
+        for p in covered:
+            meta = p.get("metadata") or {}
+            owner_pool = ""
+            if resolver is not None:
+                kind, oname = resolver.resolve(meta.get("namespace", ""), "Pod", meta.get("name", ""))
+                owner_pool = (owner_pools or {}).get(_object_ref(meta.get("namespace", ""), kind, oname), "")
+            pools.add(_covered_pod_pool(p, node_pool, owner_pool, pool_spans or {}))
+        pools = sorted(pools - {""})
         touched = [pool for pool in pools if pool in upgraded_pools]
         if not touched:
             # A budget nothing drained in the window is the readiness
@@ -1801,8 +1836,9 @@ def classify_symptom(symptom: dict, ctx: Context) -> list[dict]:
     containers = symptom.get("containers") or []
     oom = [c for c in containers if c["reason"] == OOM_REASON]
     if oom:
-        # Among the OOM-killed replicas the strongest decides: a pod on a
-        # touched cgroup v2 pool, else any v2 pool, else the example's.
+        # Among the OOM-killed replicas the strongest decides, and the gate
+        # and the cgroup grade are read from that one replica's pool: one on
+        # a touched cgroup v2 pool, else any v2 pool, else the example's.
         candidates = [ctx.node_pool.get(n or "", "") for n in (symptom.get("oom_nodes") or {}).values()] or [ctx.node_pool.get(symptom.get("node") or "", "")]
         v2 = [p for p in candidates if ctx.cgroup_modes.get(p, "") == CGROUP_V2_MODE]
         pool = next((p for p in v2 if p in ctx.upgraded_pools), v2[0] if v2 else candidates[0])
@@ -1811,10 +1847,9 @@ def classify_symptom(symptom: dict, ctx: Context) -> list[dict]:
         undecided = f"{OOM_UNDECIDED_ENTRIES[0]} or {OOM_UNDECIDED_ENTRIES[1]}"
         count = f"{symptom.get('container_count', 1)} container(s)"
         runtime = next((f"{img} ({cgroup_v1_runtime(img)})" for img in symptom.get("images") or [] if cgroup_v1_runtime(img)), None)
-        # The gate is the OOM-killed pod's own pool; only a pod with no known
-        # node counts any upgraded pool.
-        oom_pools = [p for p in candidates if p]
-        own_pool_touched = any(p in ctx.upgraded_pools for p in oom_pools) if oom_pools else bool(ctx.upgraded_pools)
+        # The gate is the same replica's pool as the cgroup grade; only a pod
+        # with no known node counts any upgraded pool.
+        own_pool_touched = pool in ctx.upgraded_pools if pool else bool(ctx.upgraded_pools)
         if mode == CGROUP_V2_MODE and runtime and own_pool_touched:
             add(ENTRY_CGROUP_V2, HIGH, f"{evidence}; runtime image {runtime}", f"cgroup v1 runtime on cgroup v2; {count}")
         elif mode == CGROUP_V2_MODE:
@@ -1975,7 +2010,8 @@ def collect_symptoms(cluster: dict, reads: dict[str, list], operations: list[dic
     ]
     for e in events:
         e.setdefault("node_selector", owner_selectors.get(e["object"], {}))
-    symptoms = pods + node_symptoms(nodes) + events + pdb_symptoms(reads.get("pdbs") or [], reads.get("pods") or [], nodes, upgraded)
+    owner_pools = {obj: (selector or {}).get(NODEPOOL_LABEL, "") for obj, selector in owner_selectors.items()}
+    symptoms = pods + node_symptoms(nodes) + events + pdb_symptoms(reads.get("pdbs") or [], reads.get("pods") or [], nodes, upgraded, pool_operation_windows(operations), owner_pools, resolver)
     for symptom in symptoms:
         symptom["classifications"] = classify_symptom(symptom, ctx)
         if symptom.get("pod_count"):
