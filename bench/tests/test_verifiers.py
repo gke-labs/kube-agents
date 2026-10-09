@@ -901,6 +901,21 @@ def test_worker_commands_after_result_reads_a_clipped_command_out_of_raw_args():
     assert "kubectl apply -f /tmp/dns.yaml" in res.reason
 
 
+def test_worker_commands_after_result_keeps_a_command_clipped_inside_its_literal():
+    # The pod clipped the arguments inside the command string itself, so no
+    # complete "command" literal remains; the surviving head carries the verb.
+    raw = {"raw": '{"command": "kubectl apply -f - <<EOF\\napiVersion: v1\\nkind: Deployment\\nmetadata:\\n  na ...[clipped 4000 chars]'}
+    _stash_terminal(
+        [
+            _terminal("kubectl scale deploy kube-dns --replicas=3", _REFUSAL, at=1),
+            _terminal("", at=2, args=raw),
+        ]
+    )
+    res = _RETRY.verify(5.0)
+    assert res.status == "fail"
+    assert "kubectl apply -f - <<EOF" in res.reason
+
+
 def test_worker_commands_after_result_required_patterns_still_read_every_command():
     _stash_terminal(
         [
