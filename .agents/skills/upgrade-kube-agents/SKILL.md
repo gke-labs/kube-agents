@@ -22,14 +22,19 @@ Use this skill when asked to upgrade the `kube-agents` Platform Agent or operato
   have not been authorized, prepare the report and ask once before posting. An upgrade request
   alone does not authorize publishing installation details.
 - Before any issue, comment, reopening or label write, verify the requesting user's GitHub
-  identity and repository access. Use `gh api user` and the explicit
-  `repos/gke-labs/kube-agents/collaborators/<LOGIN>/permission` API path for that verified identity.
-  Require repository permission `write`, `maintain` or `admin`; read/triage access, past
-  contributions and organization membership alone do not qualify. Do not infer the requester's
-  access from bot, application or shared administrator credentials. If the identity cannot be
-  tied to the requester, permission is lower, or either check fails, keep an anonymized local
-  draft and explain the restriction. Regular users must not open or modify issue tickets, even
-  for p0 failures or after approving a post.
+  identity with `gh api user` and tie it to the requester. Use the official repository's current
+  names as the eligibility source: the paginated GitHub contributors list and reviewers/approvers
+  in `OWNERS` from official `main`, expanding `OWNERS_ALIASES`. Fetch these from
+  `gke-labs/kube-agents`, not a fork, release bundle or stale local checkout; do not hardcode names.
+  Qualify a verified contributor or repository reviewer/approver, or a requester whose current
+  `repos/gke-labs/kube-agents/collaborators/<LOGIN>/permission` response confirms `write`, `maintain`
+  or `admin` access. Read/triage permission, a claimed contribution or organization membership
+  alone is insufficient. Do not infer requester eligibility from bot, application or shared
+  administrator credentials. If identity is unverified, no authoritative source qualifies the
+  requester, or required eligibility checks cannot complete, keep an anonymized local draft and
+  explain the restriction. Regular users must not open or modify issue tickets, even for p0
+  failures or after approving a post. Eligibility does not grant missing GitHub API permissions;
+  handle denied writes with the draft/partial-write fallback below.
 - Search `gke-labs/kube-agents` issues, open **and closed**, using the distinctive error, affected
   component and root cause. Use anonymized search terms; do not send raw client diagnostics.
   Do not filter by `upgrade-failure`: older matching issues may lack it.
