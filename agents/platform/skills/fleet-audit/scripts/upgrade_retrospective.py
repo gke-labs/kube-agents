@@ -65,7 +65,16 @@ its targets, never adds a project to the fleet (a cluster outside it is
 reported "outside the fleet; not recorded" and gets no ledger entry or
 guard), prunes nothing, reports no stale guard outside its scope, writes
 `reports/<finish-UTC>-scoped.md` and leaves the link alone; `--since` is a
-hand run that widens the window and advances no last-run time. The newest fourteen reports of each kind are kept. Each
+hand run that widens the window and advances no last-run time.
+`--manifest-file` also writes the fleet-audit collector manifest
+(docs/designs/fleet-audit-collector-manifest.md): every enumerated target
+with an outcome (`collected`; `unreachable` when its credentials failed;
+`gate-failed` when its reads failed, its project's listing failed or it is
+upgrading now; `out-of-scope` outside the fleet), the command behind each
+of the SOP's checks (`CHECK_READS`), `checks_unevaluated` for a check whose
+read failed, a candidate per Error (`major`) and Warning (`minor`) with the
+mitigation text the report prints, the identity tuples of guards held but
+not re-observed, and the per-cluster facts the SOP copies. The newest fourteen reports of each kind are kept. Each
 symptom carries an onset. The pod's own evidence is every symptom's
 onset: a
 Pending pod's scheduling transition or start; a not-Ready pod's `Ready`
@@ -128,9 +137,11 @@ from __future__ import annotations
 import argparse
 import contextlib
 import fcntl
+import hashlib
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -344,6 +355,54 @@ KUBECTL_READS = (
     ("endpointslices", ["kubectl", "get", "endpointslices", "-A", "-o", "json"]),
 )
 SHAPE_READS = ("workloads", "storage", "webhooks", "endpointslices")
+# The checks the stream's SOP grades (governance/upgrade_retrospective_sop.md,
+# section 3), each with the read that decides it. The findings document the SOP
+# hands to the fleet-audit `finish` owes every cluster a `checks_run` list of
+# `{check, command}`, so each review, re-check and unchanged row carries
+# `commands`: the checks whose read answered, each with that read's command line
+# as it ran. An unchanged cluster was decided by the operations listing alone, so
+# that one command backs every check there. `test_audit_report.py` holds this
+# roster to the SOP's.
+CHECK_OPERATION_FAILED = "upgrade-operation-failed"
+CHECK_BROKE_WORKLOAD = "upgrade-broke-workload"
+CHECK_NODE_BROKEN = "node-broken-after-upgrade"
+CHECK_SYMPTOM_TENTATIVE = "upgrade-symptom-tentative"
+CHECK_SYMPTOM_UNCLASSIFIED = "upgrade-symptom-unclassified"
+CHECK_SYMPTOM_PREDATES = "symptom-predates-upgrade"
+CHECK_FAILURE_PERSISTS = "upgrade-failure-persists"
+OPERATIONS_READ = "operations"
+CHECK_READS = (
+    (CHECK_OPERATION_FAILED, OPERATIONS_READ),
+    (CHECK_BROKE_WORKLOAD, "pods"),
+    (CHECK_NODE_BROKEN, "nodes"),
+    (CHECK_SYMPTOM_TENTATIVE, "pods"),
+    (CHECK_SYMPTOM_UNCLASSIFIED, "pods"),
+    (CHECK_SYMPTOM_PREDATES, "pods"),
+    (CHECK_FAILURE_PERSISTS, "pods"),
+)
+# A kubectl read ran with KUBECONFIG in its environment; the recorded command
+# spells that out so it runs as published.
+KUBECONFIG_ENV = "KUBECONFIG"
+
+# The collector manifest (docs/designs/fleet-audit-collector-manifest.md), the
+# contract the fleet-audit `finish` cross-checks the SOP's document against.
+AUDIT_ID = "upgrade-retrospective"
+MANIFEST_VERSION = 1
+# A digest of this file, carried as `checks_revision` like the sibling
+# collectors'; the same width so two sources never collide in a log line.
+REVISION_DIGEST_CHARS = 12
+CHECKS_REVISION = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()[:REVISION_DIGEST_CHARS]
+MANIFEST_OUTCOME_COLLECTED = "collected"
+MANIFEST_OUTCOME_UNREACHABLE = "unreachable"
+MANIFEST_OUTCOME_GATE_FAILED = "gate-failed"
+MANIFEST_OUTCOME_OUT_OF_SCOPE = "out-of-scope"
+# The SOP files an Error at `major` and a Warning at `minor`, never `critical`.
+MANIFEST_SEVERITY_MAJOR, MANIFEST_SEVERITY_MINOR = "major", "minor"
+# A failed operation's candidate names the operation.
+OPERATION_OBJECT_KIND = "Operation"
+# A candidate's `impact` carries the mitigation text the report prints, which
+# runs longer than an evidence excerpt.
+MANIFEST_IMPACT_CHARS = 1500
 # A review needs these to have answered; the shape reads are optional.
 CORE_READS = ("pods", "nodes", "events", "pdbs", "owners")
 
@@ -845,11 +904,15 @@ def enumerate_clusters(project: str, *, run: RunFn) -> tuple[list[dict], str | N
     return clusters, None
 
 
+def operations_argv(project: str, since: datetime) -> list[str]:
+    flt = OPERATIONS_FILTER.format(types=" OR ".join(UPGRADE_OPERATION_TYPES), since=fmt_ts(since))
+    return ["gcloud", "container", "operations", "list", "--project", project, "--filter", flt, "--format", "json"]
+
+
 def list_operations(project: str, since: datetime, *, run: RunFn) -> tuple[list[dict], str | None]:
     """The upgrade operations in `project` that started at or after `since`.
     The filter is also applied here, so a gcloud that ignores it changes nothing."""
-    flt = OPERATIONS_FILTER.format(types=" OR ".join(UPGRADE_OPERATION_TYPES), since=fmt_ts(since))
-    parsed, error = run_json(["gcloud", "container", "operations", "list", "--project", project, "--filter", flt, "--format", "json"], run=run)
+    parsed, error = run_json(operations_argv(project, since), run=run)
     if error:
         return [], error
     if not isinstance(parsed, list):
@@ -1085,6 +1148,24 @@ def fetch_credentials(cluster: dict, *, run: RunFn) -> tuple[Path, str | None]:
     if result.rc != 0:
         return kc, f"get-credentials rc={result.rc}: {_excerpt(result)}"
     return kc, None
+
+
+def command_text(argv: list[str], kubeconfig: Path | None = None) -> str:
+    """`argv` as a shell line, with the kubeconfig the read ran under spelled out."""
+    text = shlex.join(argv)
+    return f"{KUBECONFIG_ENV}={shlex.quote(str(kubeconfig))} {text}" if kubeconfig else text
+
+
+def checks_run(commands_by_read: dict[str, str], fallback: str | None = None) -> list[dict]:
+    """The SOP's `checks_run` entries for one cluster: each check whose read
+    answered, with that read's command; `fallback` (the operations listing
+    that decided an unchanged cluster) backs a check whose read did not run."""
+    out = []
+    for check, read in CHECK_READS:
+        command = commands_by_read.get(read) or fallback
+        if command:
+            out.append({"check": check, "command": command})
+    return out
 
 
 def read_cluster(kubeconfig: Path, *, run: RunFn) -> tuple[dict[str, list], list[str]]:
@@ -2448,7 +2529,7 @@ def recheck_cluster(key: str, cluster: dict, cluster_guards: list[dict], *, run:
             needed |= set(RECHECK_FAILURE_READS)
             if guard.get("entry") == ENTRY_BUDGET:
                 needed |= set(RECHECK_BUDGET_READS)
-    result = {"cluster": key, "guards": len(cluster_guards), "cleared": [], "refreshed": [], "not_recheckable": [], "errors": [], "symptom_baseline": None}
+    result = {"cluster": key, "guards": len(cluster_guards), "cleared": [], "refreshed": [], "not_recheckable": [], "errors": [], "symptom_baseline": None, "commands": {}}
     kubeconfig, error = fetch_credentials(cluster, run=run)
     if error:
         result["errors"].append(error)
@@ -2463,6 +2544,7 @@ def recheck_cluster(key: str, cluster: dict, cluster_guards: list[dict], *, run:
             result["errors"].append(f"{name}: {read_error}")
             continue
         reads[name] = (parsed.get("items") or []) if isinstance(parsed, dict) else []
+        result["commands"][name] = command_text(argv, kubeconfig)
     answered = set(reads)
     # A budget still allowing no disruption keeps its entry-1 failure guard:
     # the drain it held cannot be re-observed without the operation.
@@ -2491,7 +2573,7 @@ def _safe_recheck(key: str, cluster: dict, cluster_guards: list[dict], *, run: R
         return recheck_cluster(key, cluster, cluster_guards, run=run, refresh=refresh)
     except Exception as exc:  # noqa: BLE001 -- the boundary is the point
         log(f"{key}: re-check failed: {exc!r}")
-        return {"cluster": key, "guards": len(cluster_guards), "cleared": [], "refreshed": [], "not_recheckable": [], "errors": [f"re-check failed: {exc!r}"[:ERROR_EXCERPT_CHARS]], "symptom_baseline": None}
+        return {"cluster": key, "guards": len(cluster_guards), "cleared": [], "refreshed": [], "not_recheckable": [], "errors": [f"re-check failed: {exc!r}"[:ERROR_EXCERPT_CHARS]], "symptom_baseline": None, "commands": {}}
 
 
 def _safe_review(selection: Selection, ledger: dict, **kwargs) -> dict:
@@ -2520,10 +2602,14 @@ def _safe_review(selection: Selection, ledger: dict, **kwargs) -> dict:
             "reviewed": False,
             "partial": list(CORE_READS),
             "answered": [],
+            "commands": [],
         }
 
 
-def review_cluster(selection: Selection, ledger: dict, *, run: RunFn, seen_at: str, server_config: dict | None = None, now: datetime | None = None) -> dict:
+def review_cluster(selection: Selection, ledger: dict, *, run: RunFn, seen_at: str, server_config: dict | None = None, now: datetime | None = None, operations_command: str | None = None) -> dict:
+    """`operations_command` is the project's operations listing as `collect`
+    ran it, when it answered; without one the review vouches for no operation
+    check, and a review none of whose reads answered vouches for none at all."""
     cluster = selection.cluster
     review = {
         "cluster": selection.key,
@@ -2543,6 +2629,7 @@ def review_cluster(selection: Selection, ledger: dict, *, run: RunFn, seen_at: s
         "reviewed": False,
         "partial": [],
         "answered": [],
+        "commands": [],
     }
     ops = selection.operations
     first_op = min((parse_ts(op.get("startTime")) for op in ops if parse_ts(op.get("startTime"))), default=None)
@@ -2559,9 +2646,13 @@ def review_cluster(selection: Selection, ledger: dict, *, run: RunFn, seen_at: s
     review["partial"] = [name for name in CORE_READS if name in failed]
     if len(review["partial"]) == len(CORE_READS):
         # Nothing was evaluated, so nothing counts as answered: no guard of
-        # this cluster may be dropped on this run's say-so.
+        # this cluster may be dropped on this run's say-so, and no check ran.
         review["answered"] = []
         return review
+    commands = {name: command_text(argv, kubeconfig) for name, argv in KUBECTL_READS if name not in failed}
+    if operations_command:
+        commands[OPERATIONS_READ] = operations_command
+    review["commands"] = checks_run(commands)
     # A partial read still reports what it saw; it is `reviewed` -- the
     # ledger moves and absent guards drop -- only when every core read answered.
     review["reviewed"] = not review["partial"]
@@ -2710,6 +2801,7 @@ def triage(reviews: list[dict], unchanged: list[dict], failed_reads: list[str], 
         for incident in sorted(incidents.values(), key=lambda i: i["object"]):
             (errors if incident["severity"] == SEVERITY_ERROR else warnings).append(incident)
     partial_reads = {r["cluster"]: r["partial"] for r in reviews if r.get("partial") and not r["reviewed"]}
+    upgrading_keys = {row["cluster"] for row in upgrading or []}
     not_recheckable = {gid for r in rechecks or [] for gid in r.get("not_recheckable") or []}
     recheck_errors = {r["cluster"]: r["errors"] for r in rechecks or [] if r.get("errors")}
     for guard in guards:
@@ -2721,6 +2813,10 @@ def triage(reviews: list[dict], unchanged: list[dict], failed_reads: list[str], 
         if guard.get("cluster") in (unlisted or set()):
             # Its project's listing failed this run: the gap is under "Reads
             # that failed", not a stale Warning per guard.
+            continue
+        if guard.get("cluster") in upgrading_keys:
+            # Its upgrade is still running: the cluster is under "Upgrading
+            # now" and is reviewed next run, guards included.
             continue
         if guard.get("last_seen") != seen_at and guard.get("kind", GUARD_KIND_FAILURE) == GUARD_KIND_FAILURE:
             warnings.append({
@@ -2875,6 +2971,170 @@ def _cluster_block_lines(row: dict) -> list[str]:
     lines.append("")
     lines += _baseline_lines(row["baseline"])
     return lines + [""]
+
+
+def _incident_check(incident: dict) -> str:
+    """The SOP's check id for an incident: the operation that failed, a
+    workload or node the upgrade broke (an Error), a guard still live, and
+    the three Warning readings of a symptom."""
+    if incident["kind"] == INCIDENT_OPERATION:
+        return CHECK_OPERATION_FAILED
+    if incident["kind"] == INCIDENT_STALE_GUARD:
+        return CHECK_FAILURE_PERSISTS
+    if incident["severity"] == SEVERITY_ERROR:
+        return CHECK_NODE_BROKEN if any(s["category"] == CATEGORY_NODE for s in incident["symptoms"]) else CHECK_BROKE_WORKLOAD
+    if incident.get("predates_upgrade"):
+        return CHECK_SYMPTOM_PREDATES
+    if all(c["entry"] is None for s in incident["symptoms"] for c in s["classifications"]):
+        return CHECK_SYMPTOM_UNCLASSIFIED
+    return CHECK_SYMPTOM_TENTATIVE
+
+
+def _split_object(obj: str) -> tuple[str, str]:
+    """`namespace/Kind/name` -> (namespace, `Kind/name`); a cluster-scoped
+    `Kind/name` keeps an empty namespace. The candidate's object is the bare
+    resource; the identity tuple already carries the qualified cluster."""
+    parts = obj.split("/")
+    if len(parts) >= 3:
+        return parts[0], "/".join(parts[1:])
+    return "", obj
+
+
+def _incident_candidate(incident: dict, command: str | None) -> dict:
+    check = _incident_check(incident)
+    if incident["kind"] == INCIDENT_OPERATION:
+        op = incident["operation"]
+        namespace, obj = "", f"{OPERATION_OBJECT_KIND}/{op.get('name') or op['type']}"
+        excerpt = f"{op['type']} on {op['target']} ended {op['status']}: {op['error'] or 'no error text'}"
+        impact = MITIGATIONS[ENTRY_CAPACITY]["mitigate_after"]
+    elif incident["kind"] == INCIDENT_STALE_GUARD:
+        guard = incident["guards"][0]
+        namespace, obj = _split_object(guard["object"])
+        excerpt = f"guard {guard['id']} last seen {guard['last_seen']}: {guard['evidence']}"
+        impact = MITIGATIONS[guard["entry"]]["mitigate_after"] if guard.get("entry") in MITIGATIONS else ""
+    else:
+        namespace, obj = _split_object(incident["object"])
+        excerpt = "; ".join(f"{s['reason']}: {c['evidence']}" for s in incident["symptoms"] for c in s["classifications"])
+        impact = " ".join(f"{m['before_signal']} Read today: {m['read_today']}. Mitigate before: {m['mitigate_before']} Mitigate after: {m['mitigate_after']}" for m in incident["mitigations"])
+        if incident.get("predates_upgrade"):
+            impact = (PREDATES_UPGRADE_TEXT + ". " + impact).strip()
+        if incident.get("recreated_only"):
+            impact = (RECREATED_TEXT + " " + impact).strip()
+        if not impact:
+            impact = UNCLASSIFIED_MITIGATION_TEXT
+    candidate = {
+        "check": check,
+        "cluster": incident["cluster"],
+        "namespace": namespace,
+        "object": obj,
+        "severity": MANIFEST_SEVERITY_MAJOR if incident["severity"] == SEVERITY_ERROR else MANIFEST_SEVERITY_MINOR,
+        "excerpt": _cell(excerpt)[:MESSAGE_EXCERPT_CHARS],
+        "impact": impact[:MANIFEST_IMPACT_CHARS],
+        "impact_authoritative": False,
+        "needs_triage": None,
+        "entries": incident.get("entries"),
+    }
+    if command:
+        candidate["command"] = command
+    return candidate
+
+
+def build_manifest(result: dict, ledger: dict, *, started_at: str, finished_at: str) -> dict:
+    """The collector manifest `finish` cross-checks the SOP's document
+    against: every enumerated target with an outcome, the commands behind
+    each check, a candidate per Error and Warning, and the facts the SOP
+    copies rather than re-derives."""
+    sections = result["sections"]
+    incidents_by_cluster: dict[str, list[dict]] = {}
+    for incident in sections["errors"] + sections["warnings"]:
+        incidents_by_cluster.setdefault(incident["cluster"], []).append(incident)
+    entries: list[dict] = []
+    seen: set[str] = set()
+
+    def commands_of(rows: list[dict]) -> list[dict]:
+        return [{"check": c["check"], "command": c["command"], "rc": 0} for c in rows]
+
+    def candidates_of(key: str, commands: list[dict]) -> list[dict]:
+        by_check = {c["check"]: c["command"] for c in commands}
+        return [_incident_candidate(i, by_check.get(_incident_check(i))) for i in incidents_by_cluster.get(key, [])]
+
+    for review in result["reviews"]:
+        key = review["cluster"]
+        seen.add(key)
+        entry = {"name": key, "project": review["project"], "location": review["location"]}
+        commands = commands_of(review.get("commands") or [])
+        if review.get("outside_fleet"):
+            entry.update(outcome=MANIFEST_OUTCOME_OUT_OF_SCOPE, error=OUTSIDE_FLEET_TEXT)
+        elif not review["answered"] and not review["reviewed"]:
+            credentials_failed = any(e.startswith("get-credentials") for e in review["read_errors"])
+            entry.update(outcome=MANIFEST_OUTCOME_UNREACHABLE if credentials_failed else MANIFEST_OUTCOME_GATE_FAILED, error="; ".join(review["read_errors"])[:ERROR_EXCERPT_CHARS])
+        else:
+            entry.update(outcome=MANIFEST_OUTCOME_COLLECTED, commands=commands, candidates=candidates_of(key, commands))
+            failed = {e.split(":")[0] for e in review["read_errors"]}
+            unevaluated = [{"check": check, "reason": f"{read} read failed"} for check, read in CHECK_READS if read in failed or (read == OPERATIONS_READ and review["project"] in set(result.get("operations_unread") or []))]
+            if unevaluated:
+                entry["checks_unevaluated"] = unevaluated
+            if review["read_errors"]:
+                entry["limitations"] = "reads that failed: " + "; ".join(review["read_errors"])
+        wh = review["what_happened"]
+        entry["facts"] = {
+            "status": wh["status"],
+            "reasons": wh["reasons"],
+            "versions_before": wh["versions_before"],
+            "versions_after": wh["versions_after"],
+            "operations": wh["operations"],
+            "incident_kinds": sorted({i["kind"] for i in incidents_by_cluster.get(key, [])}),
+            "next_upgrade": review.get("next_upgrade"),
+            "guards_written": [g["id"] for g in review.get("guards") or []],
+        }
+        entries.append(entry)
+    for row in result["unchanged"]:
+        key = row["cluster"]
+        seen.add(key)
+        project, location, _ = key.split(CLUSTER_KEY_SEPARATOR, 2)
+        commands = commands_of(row.get("commands") or [])
+        entries.append({
+            "name": key, "project": project, "location": location,
+            "outcome": MANIFEST_OUTCOME_COLLECTED, "commands": commands, "candidates": candidates_of(key, commands),
+            "facts": {"status": "unchanged", "control_plane": row["control_plane"], "last_operation": row.get("last_operation"), "next_upgrade": row.get("next_upgrade"), "last_run": row.get("last_run")},
+        })
+    for row in result["upgrading"]:
+        key = row["cluster"]
+        seen.add(key)
+        project, location, _ = key.split(CLUSTER_KEY_SEPARATOR, 2)
+        op = row["operation"]
+        entries.append({"name": key, "project": project, "location": location, "outcome": MANIFEST_OUTCOME_GATE_FAILED, "error": UPGRADING_LINE.format(cluster=key, operation=op["type"], target=op["target"], start=op["start"] or "?"), "facts": {"operation": op}})
+    for line in result["failed_reads"]:
+        key, _, reason = line.partition(": ")
+        if key in seen or key.count(CLUSTER_KEY_SEPARATOR) != 2 or not reason.startswith("its project's listing failed"):
+            continue
+        seen.add(key)
+        project, location, _ = key.split(CLUSTER_KEY_SEPARATOR, 2)
+        entries.append({"name": key, "project": project, "location": location, "outcome": MANIFEST_OUTCOME_GATE_FAILED, "error": reason[:ERROR_EXCERPT_CHARS]})
+    # Guards held but not re-observed this run: the identity tuples `finish`
+    # derives the still-flagged ids from (carried; `finish` builds the set from
+    # the `upgrade-failure-persists` candidates above).
+    still_flagged = []
+    for incident in sections["warnings"]:
+        if incident["kind"] == INCIDENT_STALE_GUARD:
+            guard = incident["guards"][0]
+            namespace, obj = _split_object(guard["object"])
+            still_flagged.append({"guard": guard["id"], "check": CHECK_FAILURE_PERSISTS, "cluster": incident["cluster"], "namespace": namespace, "object": obj})
+    manifest = {
+        "version": MANIFEST_VERSION,
+        "checks_revision": CHECKS_REVISION,
+        "audit": AUDIT_ID,
+        "started_at": started_at,
+        "finished_at": finished_at,
+        "scoped": result["scoped"],
+        "partial": bool(result["failed_reads"]) or any(r.get("partial") for r in result["reviews"]),
+        "clusters": entries,
+        "still_flagged": still_flagged,
+        "fleet": result.get("fleet") or [],
+    }
+    if not entries:
+        manifest["error"] = "the run enumerated no cluster: " + ("; ".join(result["failed_reads"]) or "no project named a cluster")
+    return manifest
 
 
 def render_report(result: dict) -> str:
@@ -3041,6 +3301,12 @@ def collect(args: argparse.Namespace, *, run: RunFn | None = None, now: datetime
     # Projects whose listing answered in full, with the clusters they hold:
     # a ledger entry or guard for a cluster missing from one is history.
     listed_projects: dict[str, set[str]] = {}
+    # The operations listing as it ran, per project that answered: the command
+    # behind every check on an unchanged cluster and the operation check on a
+    # reviewed one. A project whose listing failed vouches for no check: its
+    # clusters carry no operation entry, and the SOP names the gap.
+    operations_commands: dict[str, str] = {}
+    operations_unread: set[str] = set()
     for project in projects:
         found, list_error = enumerate_clusters(project, run=run)
         error = list_error
@@ -3052,6 +3318,9 @@ def collect(args: argparse.Namespace, *, run: RunFn | None = None, now: datetime
         ops, error = list_operations(project, earliest, run=run)
         if error:
             failed_reads.append(f"{project}: {error}")
+            operations_unread.add(project)
+        else:
+            operations_commands[project] = command_text(operations_argv(project, earliest))
         for op in ops:
             op["project"] = project
         operations.extend(ops)
@@ -3075,7 +3344,7 @@ def collect(args: argparse.Namespace, *, run: RunFn | None = None, now: datetime
             if error:
                 failed_reads.append(f"{project}/{location}: {error}")
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
-        reviews = list(pool.map(lambda s: _safe_review(s, ledger, run=run, seen_at=seen_at, server_config=server_configs.get((s.cluster["project"], s.cluster["location"])), now=now), selected))
+        reviews = list(pool.map(lambda s: _safe_review(s, ledger, run=run, seen_at=seen_at, server_config=server_configs.get((s.cluster["project"], s.cluster["location"])), now=now, operations_command=operations_commands.get(s.cluster["project"])), selected))
     reviews.sort(key=lambda r: r["cluster"])
     # Only a run invoked with --full is full: it records the fleet's project
     # set and may change it, prunes, writes the dated report and moves the
@@ -3159,6 +3428,11 @@ def collect(args: argparse.Namespace, *, run: RunFn | None = None, now: datetime
             guard["last_seen"] = seen_at
     for r in rechecks:
         failed_reads.extend(f"{r['cluster']}: re-check: {e}" for e in r["errors"])
+    # An unchanged cluster's checks ran as the operations listing that found no
+    # upgrade; a re-check that read pods or nodes backs those checks with that read.
+    recheck_commands = {r["cluster"]: r.get("commands") or {} for r in rechecks}
+    for row in unchanged:
+        row["commands"] = checks_run(recheck_commands.get(row["cluster"], {}), fallback=operations_commands.get(row["cluster"].split(CLUSTER_KEY_SEPARATOR)[0]))
     new_ledger = ledger_after(ledger, reviews, clusters, seen_at, {s.key: s.operations for s in selected}, removed, {row["cluster"] for row in upgrading} | outside, refreshed_baselines, advance=not hand_run)
     new_ledger[LEDGER_PROJECTS_KEY] = sorted(new_fleet)
 
@@ -3172,6 +3446,7 @@ def collect(args: argparse.Namespace, *, run: RunFn | None = None, now: datetime
         "reviews": reviews,
         "unchanged": unchanged,
         "failed_reads": failed_reads,
+        "operations_unread": sorted(operations_unread),
         "removed_clusters": sorted(removed),
         "rechecks": rechecks,
         "upgrading": upgrading,
@@ -3201,6 +3476,10 @@ def collect(args: argparse.Namespace, *, run: RunFn | None = None, now: datetime
     json_path = Path(args.output) if args.output else reports_dir / REPORT_JSON_FILENAME.format(ts=finish, scoped=suffix)
     write_json_atomically(json_path, {k: v for k, v in result.items() if k != "report"})
     result["json_path"] = str(json_path)
+    if getattr(args, "manifest_file", None):
+        result["manifest"] = build_manifest(result, ledger, started_at=seen_at, finished_at=fmt_ts(now_utc() if not clock_fixed else now))
+        write_json_atomically(Path(args.manifest_file), result["manifest"])
+        result["manifest_path"] = str(args.manifest_file)
     prune_reports(reports_dir)
     write_json_atomically(guards_path, new_guards)
     write_json_atomically(ledger_path, new_ledger)
@@ -3256,6 +3535,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output", help=f"write the JSON result here instead of ${STORE_HOME_ENV}/{REPORTS_SUBDIR}/<finish-UTC>[{SCOPED_SUFFIX}].json")
     parser.add_argument("--report", help=f"write the Markdown report here instead of ${STORE_HOME_ENV}/{REPORTS_SUBDIR}/<finish-UTC>[{SCOPED_SUFFIX}].md (a full run also points {LATEST_REPORT_LINK} beside it at it)")
     parser.add_argument("--no-report", action="store_true", help="print the report without writing it to the store")
+    parser.add_argument("--manifest-file", help="also write the fleet-audit collector manifest here (the contract `audit_report.py finish --manifest-file` cross-checks the SOP's document against)")
     parser.add_argument("--reset-ledger", action="store_true", help=f"archive the crash records ({CRASH_RECORD_GLOB}, {GUARDS_RECORD_GLOB}) beside the ledger and guards files (the store's, or --ledger/--guards) under the store's {ARCHIVE_SUBDIR}/ so the next run may start fresh; does nothing else")
     parser.add_argument("--full", action="store_true", help=f"the fleet-wide run: records and may change the ledger's fleet set, prunes departed projects and clusters, writes {REPORTS_SUBDIR}/<finish-UTC>.md and moves {LATEST_REPORT_LINK}; without it a run is scoped whatever its --project set")
     parser.add_argument("--dry-run", action="store_true", help="read everything, print the report, write nothing")
