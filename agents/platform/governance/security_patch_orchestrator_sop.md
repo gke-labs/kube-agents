@@ -107,7 +107,8 @@ maximum, because a shorter one kills it partway and leaves no manifest. The ten 
 run for every project before any reporter starts, so 3.11 never costs a project its other
 checks; the reporter runs then share one seven-minute budget measured from the collector's
 start, four minutes at most per run, and a cluster whose run overruns or misses it loses 3.11
-(it lands in `checks_unevaluated`), not the manifest.
+(it lands in `checks_unevaluated`), not the manifest. Within a project the runs go least
+recently reported first, so a budget spent on a wide project lands on a different tail each week.
 
 This stream's targets are GKE control-plane and node-pool metadata, with one in-cluster read (the PodDisruptionBudgets 3.11 takes from the readiness grade), so its collector is its own script, as the drift stream's `fleet_drift.py` is — see the script's own module docstring for why one `clusters list` call and one `get-server-config` call per location back the other ten checks below, with no per-pool `describe` ever issued. It sweeps every project §1 puts in scope; pass `--project <id>` to scope a run to one, with the cost §1 names. Read the manifest before doing anything else:
 
@@ -288,8 +289,10 @@ each is waiting for whoever schedules it.
   evicts anyway. For a budget: "`<cluster>` is `<n>` minor(s) behind and its upgrade would be
   held, not stopped: PodDisruptionBudget `<namespace>/<budget>` (`maxUnavailable: 0`,
   disruptionsAllowed 0) refuses eviction of `<workload>`, so GKE holds each node's drain for up to
-  an hour and then evicts `<workload>` anyway." A skew ceiling does stop it. For skew: "`<cluster>`
-  is `<n>` minor(s) behind and its upgrade would not complete: node pool(s) `<pool>` would exceed
+  an hour and then evicts `<workload>` anyway." With many budgets it names three and counts the
+  rest, the evidence naming them all, so the tail stays inside the ledger's clip. A skew ceiling
+  does stop it. For skew: "`<cluster>` is `<n>` minor(s) behind and its upgrade would not
+  complete: node pool(s) `<pool>` would exceed
   the version-skew ceiling against the target control plane, so GKE will not move the control
   plane until the pool moves." When both block on one row, the ceiling governs, because GKE
   refuses the move before any drain starts, and the tail names both in that order: "`<cluster>`

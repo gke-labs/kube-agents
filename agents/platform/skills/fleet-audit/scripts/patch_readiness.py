@@ -279,6 +279,28 @@ UPGRADE_BLOCKED_SKEW_CAUSE_FORMAT = "node pool(s) {pools} would exceed the versi
 # Joins the clauses of one cause: every blocking budget, with the skew clause
 # before them when both block.
 CAUSE_SEPARATOR = "; "
+# The ledger renders `impact` through a 1500-character clip (audit_report.py's
+# MAX_TEXT_CHARS, applied in the renderer and nowhere earlier), and the arm's
+# tail -- the held drain and the forced eviction, or the refused move -- is
+# the last thing in the sentence. So the impact names a few budgets, pools and
+# workloads and counts the rest, stepping down the ladder until it fits under
+# a cap set below the renderer's, with a names-free form as the floor; the
+# excerpt carries every name under its own clip.
+IMPACT_MAX_CHARS = 1400
+IMPACT_NAMED_LADDER = (3, 1)
+IMPACT_MORE_FORMAT = "and {n} more"
+IMPACT_MORE_BUDGETS_FORMAT = "and {n} more drain-blocking PodDisruptionBudget(s), named in the evidence"
+IMPACT_COUNTED_FORMAT = "{n} (named in the evidence)"
+IMPACT_BUDGETS_COUNT_FORMAT = "{n} drain-blocking PodDisruptionBudget(s), named in the evidence, refuse eviction of {workloads}"
+IMPACT_WORKLOADS_COUNT_FORMAT = "{n} workload(s)"
+UPGRADE_BLOCKED_PDB_CLAUSE_WORKLOADS_FALLBACK = "its workload"
+# Behind clusters run least recently reported first, so a budget spent inside
+# a wide project lands on a different tail each week instead of the same
+# clusters every Monday; the stamps live beside the reporter's per-project
+# state, one file a project's runs own. Best effort: a file that cannot be
+# read or written costs the ordering, never the check.
+READINESS_LAST_RUN_FILE = "last-run.json"
+LAST_RUN_STAMP_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 # The lag phrase comes from the cluster's own candidate (what put it in
 # `behind`), not from the reporter's row: the reporter's gap counts the
 # lowest component against its target and reads 0 for a patch lag.
@@ -1226,46 +1248,107 @@ def _workload_name(workload: object) -> str:
     return str(workload)
 
 
-def _readiness_cause(readiness: dict, *, budget_applies: bool = True, skew_applies: bool = True) -> tuple[str, str, str] | None:
-    """Why the reporter graded a member blocked, as (impact format, cause,
-    workloads) in the forms 3.11 flags; None for a block that rests on a
-    maintenance exclusion alone, which is 3.8's subject and neither a held
-    drain nor a refused move, and None when nothing that can block the
-    upgrade due is on the row. `workloads` names what the budget's forced
-    eviction removes, every covered workload once in budget order, and is
-    empty when skew alone blocks, whose tail names no workload. A skew
-    ceiling outranks a budget: GKE refuses the control-plane move before any
-    drain starts, so a row carrying both is a refused upgrade, not a held
-    one, and its cause names the ceiling first and every budget after it.
-    The caller says which causes can block the upgrade that is due: a
-    control-plane move drains no node, so a budget cannot hold it
-    (`budget_applies=False`); a pool moving toward its control plane is what
-    closes a skew, so the ceiling does not refuse it (`skew_applies=False`)."""
+class Cause(NamedTuple):
+    """Why a member is blocked, in the parts the excerpt and the impact are
+    built from: the arm's impact format, the pools past the ceiling (empty
+    when skew does not block or does not apply), the blocking budgets in name
+    order (empty when none apply) and every covered workload once, in that
+    order."""
+
+    impact_format: str
+    pools: list[str]
+    budgets: list[dict]
+    evicted: list[str]
+
+
+def _readiness_cause(readiness: dict, *, budget_applies: bool = True, skew_applies: bool = True) -> Cause | None:
+    """Why the reporter graded a member blocked, in the forms 3.11 flags; None
+    for a block that rests on a maintenance exclusion alone, which is 3.8's
+    subject and neither a held drain nor a refused move, and None when nothing
+    that can block the upgrade due is on the row. A skew ceiling outranks a
+    budget: GKE refuses the control-plane move before any drain starts, so a
+    row carrying both is a refused upgrade, not a held one, and its cause
+    names the ceiling first and every budget after it. The caller says which
+    causes can block the upgrade that is due: a control-plane move drains no
+    node, so a budget cannot hold it (`budget_applies=False`); a pool moving
+    toward its control plane is what closes a skew, so the ceiling does not
+    refuse it (`skew_applies=False`)."""
     pdbs = [p for p in (readiness.get("pdbs") or {}).get("blocking") or [] if isinstance(p, dict)] if budget_applies else []
-    skew = ((readiness.get("skew") or {}).get("blocking") or []) if skew_applies else []
-    skew_cause = UPGRADE_BLOCKED_SKEW_CAUSE_FORMAT.format(pools=", ".join(str(p) for p in skew)) if skew else ""
-    if pdbs:
-        # Every blocking budget, in name order: the reporter lists them in
-        # the API's order, and a cause that named only the first would make
-        # which budget the ledger shows depend on how the others sort.
-        ordered = sorted(pdbs, key=_pdb_name)
-        clauses = [
-            UPGRADE_BLOCKED_PDB_CAUSE_FORMAT.format(
-                pdb=_pdb_name(p),
-                field=p.get("field") or "",
-                allowed=p.get("disruptions_allowed"),
-                workloads=", ".join(_workload_name(w) for w in p.get("workloads") or []) or "its workload",
-            )
-            for p in ordered
-        ]
-        evicted = list(dict.fromkeys(_workload_name(w) for p in ordered for w in p.get("workloads") or []))
-        workloads = ", ".join(evicted) or UPGRADE_BLOCKED_PDB_WORKLOADS_FALLBACK
-        if skew:
-            return UPGRADE_BLOCKED_IMPACT_BOTH_FORMAT, CAUSE_SEPARATOR.join([skew_cause, *clauses]), workloads
-        return UPGRADE_BLOCKED_IMPACT_PDB_FORMAT, CAUSE_SEPARATOR.join(clauses), workloads
-    if skew:
-        return UPGRADE_BLOCKED_IMPACT_SKEW_FORMAT, skew_cause, ""
-    return None
+    pools = [str(p) for p in ((readiness.get("skew") or {}).get("blocking") or [])] if skew_applies else []
+    if not pdbs and not pools:
+        return None
+    # Every blocking budget, in name order: the reporter lists them in the
+    # API's order, and a cause that named only the first would make which
+    # budget the ledger shows depend on how the others sort.
+    ordered = sorted(pdbs, key=_pdb_name)
+    evicted = list(dict.fromkeys(_workload_name(w) for p in ordered for w in p.get("workloads") or []))
+    if ordered and pools:
+        impact_format = UPGRADE_BLOCKED_IMPACT_BOTH_FORMAT
+    elif ordered:
+        impact_format = UPGRADE_BLOCKED_IMPACT_PDB_FORMAT
+    else:
+        impact_format = UPGRADE_BLOCKED_IMPACT_SKEW_FORMAT
+    return Cause(impact_format, pools, ordered, evicted)
+
+
+def _named(items: list[str], cap: int | None) -> str:
+    """`items` joined, naming the first `cap` and counting the rest; None names all."""
+    if cap is None or len(items) <= cap:
+        return ", ".join(items)
+    return ", ".join([*items[:cap], IMPACT_MORE_FORMAT.format(n=len(items) - cap)])
+
+
+def _budget_clause(budget: dict, named: int | None) -> str:
+    workloads = [_workload_name(w) for w in budget.get("workloads") or []]
+    return UPGRADE_BLOCKED_PDB_CAUSE_FORMAT.format(
+        pdb=_pdb_name(budget),
+        field=budget.get("field") or "",
+        allowed=budget.get("disruptions_allowed"),
+        workloads=_named(workloads, named) or UPGRADE_BLOCKED_PDB_CLAUSE_WORKLOADS_FALLBACK,
+    )
+
+
+def _cause_text(cause: Cause, named: int | None) -> str:
+    """The cause clause: the ceiling first when it blocks, then the budgets.
+    `named` caps the pools, budgets and per-budget workloads it names and
+    counts the rest; None names all, which is the excerpt's form."""
+    parts = []
+    if cause.pools:
+        parts.append(UPGRADE_BLOCKED_SKEW_CAUSE_FORMAT.format(pools=_named(cause.pools, named)))
+    parts.extend(_budget_clause(b, named) for b in cause.budgets[:named])
+    if named is not None and len(cause.budgets) > named:
+        parts.append(IMPACT_MORE_BUDGETS_FORMAT.format(n=len(cause.budgets) - named))
+    return CAUSE_SEPARATOR.join(parts)
+
+
+def _workloads_text(cause: Cause, named: int | None) -> str:
+    """What the forced eviction removes, for the tail; `named` as above."""
+    return _named(cause.evicted, named) if cause.evicted else UPGRADE_BLOCKED_PDB_WORKLOADS_FALLBACK
+
+
+def _counted_workloads(cause: Cause) -> str:
+    return IMPACT_WORKLOADS_COUNT_FORMAT.format(n=len(cause.evicted)) if cause.evicted else UPGRADE_BLOCKED_PDB_WORKLOADS_FALLBACK
+
+
+def _counted_cause_text(cause: Cause) -> str:
+    """The cause with counts in place of names: the floor the ledger's clip
+    can never reach, since nothing in it grows with the fleet."""
+    parts = []
+    if cause.pools:
+        parts.append(UPGRADE_BLOCKED_SKEW_CAUSE_FORMAT.format(pools=IMPACT_COUNTED_FORMAT.format(n=len(cause.pools))))
+    if cause.budgets:
+        parts.append(IMPACT_BUDGETS_COUNT_FORMAT.format(n=len(cause.budgets), workloads=_counted_workloads(cause)))
+    return CAUSE_SEPARATOR.join(parts)
+
+
+def _bounded_impact(cause: Cause, cluster: str, lag: str) -> str:
+    """The arm's sentence, kept under the ledger's clip: names down the
+    ladder, then counts alone, so the tail always renders."""
+    for named in IMPACT_NAMED_LADDER:
+        text = cause.impact_format.format(cluster=cluster, lag=lag, cause=_cause_text(cause, named), workloads=_workloads_text(cause, named))
+        if len(text) <= IMPACT_MAX_CHARS:
+            return text
+    return cause.impact_format.format(cluster=cluster, lag=lag, cause=_counted_cause_text(cause), workloads=_counted_workloads(cause))
 
 
 def _applicable_causes(lag: str) -> tuple[bool, bool]:
@@ -1310,16 +1393,42 @@ def _upgrade_blocked_hit(entry: dict, member: dict) -> dict | None:
         return None
     lag = _lag_phrase(entry)
     budget_applies, skew_applies = _applicable_causes(lag)
-    found = _readiness_cause(readiness, budget_applies=budget_applies, skew_applies=skew_applies)
-    if found is None:
+    cause = _readiness_cause(readiness, budget_applies=budget_applies, skew_applies=skew_applies)
+    if cause is None:
         return None
-    impact_format, cause, workloads = found
     return {
         "object": f"Cluster/{entry['_bare_name']}",
-        "excerpt": f"readiness.status={READINESS_BLOCKED}: {cause}",
+        # The excerpt names every budget, pool and workload; the impact is
+        # bounded so its tail survives the ledger's clip.
+        "excerpt": f"readiness.status={READINESS_BLOCKED}: {_cause_text(cause, None)}",
         "severity": CRITICAL,
-        "impact": impact_format.format(cluster=entry["_bare_name"], lag=lag, cause=cause, workloads=workloads),
+        "impact": _bounded_impact(cause, entry["_bare_name"], lag),
     }
+
+
+def _read_last_run(state_dir: str, project: str) -> dict[str, str]:
+    """When each of the project's clusters last had a reporter run started for
+    it, by `<location>/<name>`; empty when there is no file or it cannot be read."""
+    path = os.path.join(state_dir, READINESS_LAST_RUN_FILE)
+    try:
+        with open(path, encoding="utf-8") as handle:
+            data = json.load(handle)
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError) as exc:
+        log(f"{project}: cannot read {path} ({exc}); running the behind clusters in listing order")
+        return {}
+    return {str(k): str(v) for k, v in data.items()} if isinstance(data, dict) else {}
+
+
+def _write_last_run(state_dir: str, project: str, stamps: dict[str, str]) -> None:
+    path = os.path.join(state_dir, READINESS_LAST_RUN_FILE)
+    try:
+        os.makedirs(state_dir, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(stamps, handle, indent=2, sort_keys=True)
+    except OSError as exc:
+        log(f"{project}: cannot write {path} ({exc}); next week's order will not know this run")
 
 
 def collect_upgrade_blocked(project: str, entries: list[dict], *, run: RunFn, deadline: float | None = None) -> None:
@@ -1380,11 +1489,18 @@ def collect_upgrade_blocked(project: str, entries: list[dict], *, run: RunFn, de
             _unevaluated(entry, UNEVALUATED_SCRATCH_FORMAT.format(path=scratch, error=str(exc)[:UNEVALUATED_REPORT_MESSAGE_CHARS]))
         return
     # One reporter run per behind cluster, with `--cluster` naming it: the
-    # reporter reads nothing else in the project, the recorded command on the
-    # entry is the invocation that graded it (and stays short however many
-    # clusters are behind), and one cluster's slow read cannot cost another
-    # its row. The fleet budget bounds the runs together.
+    # reporter reads nothing else in the project, and the recorded command on
+    # the entry is the invocation that graded it (and stays short however many
+    # clusters are behind). Within a project the runs spend the fleet budget
+    # one after another, so a slow read costs the clusters after it time,
+    # never a row of their own; they go least recently reported first (a
+    # cluster never reported before all of them, the listing order breaking
+    # ties), so a spent budget lands on a different tail each week.
+    last_run = _read_last_run(state_dir, project)
+    behind.sort(key=lambda e: last_run.get(CLUSTER_SPEC_FORMAT.format(location=e["location"], name=e["_bare_name"]), ""))
+    stamped = False
     for entry in behind:
+        spec = CLUSTER_SPEC_FORMAT.format(location=entry["location"], name=entry["_bare_name"])
         output = os.path.join(scratch, READINESS_OUTPUT_FORMAT.format(project=project, location=entry["location"], cluster=entry["_bare_name"]))
         try:
             # The path is the same every week, so a reporter that dies before
@@ -1406,10 +1522,15 @@ def collect_upgrade_blocked(project: str, entries: list[dict], *, run: RunFn, de
                 _unevaluated(entry, UNEVALUATED_BUDGET_SPENT.format(budget=READINESS_FLEET_BUDGET_S))
                 continue
         argv = [
-            sys.executable, str(READINESS_REPORTER), "--project", project, "--cluster", CLUSTER_SPEC_FORMAT.format(location=entry["location"], name=entry["_bare_name"]),
+            sys.executable, str(READINESS_REPORTER), "--project", project, "--cluster", spec,
             "--readiness", "--output", output, "--state-dir", state_dir,
         ]
         result = run(argv, timeout=timeout)
+        # Stamped when the reporter was started, graded or not: a run that
+        # fails every week still yields its turn. A cluster the budget skipped
+        # keeps its stamp and leads next week.
+        last_run[spec] = datetime.now(timezone.utc).strftime(LAST_RUN_STAMP_FORMAT)
+        stamped = True
         try:
             _join_readiness(project, [entry], argv, result, output, timeout)
         except Exception as exc:  # noqa: BLE001 -- a malformed report must not cost the project its other ten checks
@@ -1425,6 +1546,8 @@ def collect_upgrade_blocked(project: str, entries: list[dict], *, run: RunFn, de
             else:
                 entry.pop("checks_not_applicable", None)
             _unevaluated(entry, UNEVALUATED_REPORT_MALFORMED.format(error=type(exc).__name__))
+    if stamped:
+        _write_last_run(state_dir, project, last_run)
 
 
 def _join_readiness(project: str, behind: list[dict], argv: list[str], result: Run, output: str, timeout: int) -> None:

@@ -1980,6 +1980,84 @@ class UpgradeBlockedTest(unittest.TestCase):
         self.assertNotIn("not stopped", hit["impact"])
         self.assertTrue(hit["impact_authoritative"])
 
+    def test_the_budget_arm_impact_keeps_its_tail_under_the_ledger_clip_with_many_budgets(self):
+        """The ledger clips `impact` at 1500 characters and the mechanism is the
+        sentence's tail: with many budgets the impact names three and counts
+        the rest, while the excerpt names every one."""
+        budgets = [
+            {
+                **self.BUDGET,
+                "pdb": f"seeded-upgrade/chart-{i:02d}-pdb",
+                "workloads": [
+                    {"kind": "Deployment", "namespace": "seeded-upgrade", "name": f"chart-{i:02d}-api"},
+                    {"kind": "StatefulSet", "namespace": "seeded-upgrade", "name": f"chart-{i:02d}-db"},
+                ],
+            }
+            for i in range(12)
+        ]
+        by = self.collect([cluster(name="lag", master=self.BEHIND)], [self.member("lag", pdbs=budgets)])
+        hit = next(c for c in by["lag"]["candidates"] if c["check"] == pr.UPGRADE_BLOCKED_CHECK)
+        self.assertLessEqual(len(hit["impact"]), pr.IMPACT_MAX_CHARS)
+        self.assertTrue(hit["impact"].endswith("anyway."), hit["impact"])
+        self.assertEqual(hit["impact"].count("PodDisruptionBudget seeded-upgrade/chart-"), 3)
+        self.assertIn("and 9 more drain-blocking PodDisruptionBudget(s), named in the evidence", hit["impact"])
+        self.assertIn("evicts Deployment/chart-00-api, StatefulSet/chart-00-db, Deployment/chart-01-api, and 21 more anyway", hit["impact"])
+        for i in range(12):
+            self.assertIn(f"seeded-upgrade/chart-{i:02d}-pdb", hit["excerpt"])
+
+    def test_the_budget_arm_impact_counts_alone_when_names_would_overrun_the_clip(self):
+        """The floor of the ladder names nothing that grows with the fleet, so
+        the tail renders whatever the names are."""
+        budgets = [{**self.BUDGET, "pdb": f"seeded-upgrade/chart-{i:02d}-pdb"} for i in range(4)]
+        by = self.collect([cluster(name="lag", master=self.BEHIND)], [self.member("lag", pdbs=budgets)])
+        full = next(c for c in by["lag"]["candidates"] if c["check"] == pr.UPGRADE_BLOCKED_CHECK)
+        cause = pr._readiness_cause(self.member("lag", pdbs=budgets)["readiness"])
+        with mock.patch.object(pr, "IMPACT_MAX_CHARS", len(full["impact"]) // 3):
+            counted = pr._bounded_impact(cause, "lag", pr.LAG_MINORS_FORMAT.format(n=1))
+        self.assertIn("4 drain-blocking PodDisruptionBudget(s), named in the evidence, refuse eviction of 1 workload(s)", counted)
+        self.assertNotIn("chart-", counted)
+        self.assertTrue(counted.endswith("evicts 1 workload(s) anyway."), counted)
+
+    def test_behind_clusters_run_least_recently_reported_first_and_a_skipped_one_keeps_its_turn(self):
+        """A budget spent inside a wide project must not fall on the same
+        clusters every week: the ones the reporter has not reached in longest
+        go first, and a cluster the budget skipped is not stamped, so it
+        leads next week."""
+        import time as _time
+
+        clusters = [cluster(name=n, master=self.BEHIND) for n in ("a", "b", "c")]
+        state_dir = os.path.join(self.scratch.name, pr.READINESS_STATE_SUBDIR, "acme")
+        os.makedirs(state_dir)
+        path = os.path.join(state_dir, pr.READINESS_LAST_RUN_FILE)
+        seeded = {"us-central1/a": "2026-01-14T00:00:00Z", "us-central1/b": "2026-01-01T00:00:00Z"}
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(seeded, handle)
+        self.calls = []
+
+        def run(argv, **kwargs):
+            joined = " ".join(argv)
+            if "clusters list" in joined:
+                return run_of(0, json.dumps(clusters))
+            if "get-server-config" in joined:
+                return run_of(0, json.dumps(server_config(default=self.CURRENT, valid_versions=[self.BEHIND, self.CURRENT])))
+            if REPORTER_NEEDLE in joined:
+                self.calls.append(argv[argv.index("--cluster") + 1])
+                return NO_REPORTER
+            raise AssertionError(joined)
+
+        # No budget left: nothing runs, and the stamps are untouched.
+        self.project(run, deadline=_time.monotonic() + 1)
+        self.assertEqual(self.calls, [])
+        with open(path, encoding="utf-8") as handle:
+            self.assertEqual(json.load(handle), seeded)
+        # Budget to spare: never-reported c first, then b (two weeks ago), then a (yesterday).
+        self.project(run)
+        self.assertEqual(self.calls, ["us-central1/c", "us-central1/b", "us-central1/a"])
+        with open(path, encoding="utf-8") as handle:
+            stamps = json.load(handle)
+        self.assertEqual(set(stamps), {"us-central1/a", "us-central1/b", "us-central1/c"})
+        self.assertTrue(all(v > "2026-01-14T00:00:00Z" for v in stamps.values()), stamps)
+
     def test_a_static_cluster_spelled_unspecified_is_not_applicable_too(self):
         row = self.member("static", status="unknown", gap=None)
         row["channel"] = "UNSPECIFIED"
