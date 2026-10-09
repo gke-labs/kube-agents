@@ -167,9 +167,13 @@ each), so the stored set is at most a week old rather than as old as the previou
 symptom carries its own onset, the earliest evidence the objects hold. A pod is the wrong place to
 read it when the pod is owned: a node-pool upgrade drains every node, every pod on it is deleted
 and recreated, and the replacement's creation, start and `Ready=False` transition all fall inside
-the window by construction. So an owned pod's onset is read at the owner first: a Deployment's
-`Available=False` or `Progressing=False` condition transition, a ReplicaSet's creation (a failure
-that began with a rollout). Where the owner carries no dated condition (StatefulSet, DaemonSet,
+the window by construction. So an owned pod's onset is read at the owner first, and only from evidence that says something
+failed: a Deployment's `Available=False` or `Progressing=False` condition transition when one of
+them is `False`, or the current ReplicaSet's creation when it falls inside the window (a rollout
+during the upgrade is when a ReplicaSet dates a failure; an older ReplicaSet dates nothing). A
+Deployment whose conditions never flipped, which a partial failure under its `maxUnavailable`
+leaves `Available=True`, and whose ReplicaSet predates the window has no owner evidence, so its pod
+is read like any other. Where the owner carries no dated condition (StatefulSet, DaemonSet,
 Job) or the pod is bare, the pod's own evidence is used: a Pending pod's start, a crash-looping or
 not-ready pod's `Ready=False` transition time (falling back to its start; a container's last
 termination is the latest crash, not the first, and is never the onset), a node condition's
