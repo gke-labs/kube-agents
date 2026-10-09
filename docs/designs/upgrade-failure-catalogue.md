@@ -87,9 +87,10 @@ afterwards, how to prevent or repair it, and whether Google's own advisor for GK
 
 ## Status at a glance
 
-One row per entry, grouped by the reader that covers the entry's own failure on `main` today: a
-scheduled audit, one of the `fleet-upgrade-verification` skill's two scripts, or the assistant
-answering a question. Entry 10 sits in the second group for its node-pool half; entry 7 sits in
+One row per entry. The first three tables group the entries by the reader that covers the entry's
+own failure on `main` today: a scheduled audit, one of the `fleet-upgrade-verification` skill's two
+scripts, or the assistant answering a question; the fourth lists all twenty against the two
+scheduled readers in review. Entry 10 sits in the second group for its node-pool half; entry 7 sits in
 the third because nothing on `main` grades a fail-closed webhook. Scenario links to the entry's
 section below. Reason says in plain words why the upgrade breaks it. Detection says which reader
 finds it and what a stock install ships for it: the cron jobs in `agents/platform/cron/jobs.json`
@@ -106,10 +107,11 @@ it, and the pull request that carries it when it is in review; the
 record of what is built, and this column adds the case and the in-review item. Every entry has one
 nightly evaluation case, registered where the column names one that grades the entry and planned otherwise, and the
 tables under "How each failure is tested" say row by row whether its fixture exists, so the column
-repeats neither. The
-in-review items are the one part of this section that changes as work merges; the column was last
-reconciled on 2026-10-09. The fourth table states, per entry, what the daily readiness watch and the
-upgrade retrospective cover and what is left to build.
+repeats neither. Two
+parts of this section change as work merges: the column's in-review items, and the fourth table,
+"Gap to scheduled coverage", whose cells say what the daily readiness watch (#2708, in review) and the
+upgrade retrospective (#2729, in review) would cover before and after an upgrade and what is left to
+build. Both were last reconciled on 2026-10-09.
 
 ### A scheduled audit files it, without anyone asking
 
