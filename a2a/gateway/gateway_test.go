@@ -1382,10 +1382,10 @@ func TestDelegateWithoutSpawnerRoutesDefault(t *testing.T) {
 }
 
 // TestDelegatedTaskStatusShapeSteers: the status matcher is the exact
-// phrase set everywhere. During a delegated task a status-shaped but
-// non-exact ask must reach the worker as a steer - only the exact phrases
-// stay status affordances, or a correction is stolen and answered by
-// replay.
+// phrase set wherever the executor runs follow-ups, and a session worker
+// does. During a delegated task a status-shaped but non-exact ask must
+// reach the worker as a steer - only the exact phrases stay status
+// affordances, or a correction is stolen and answered by replay.
 func TestDelegatedTaskStatusShapeSteers(t *testing.T) {
 	r, spawn := startRigWithSpawner(t)
 	conv := "discord:g1/thread-d3"

@@ -55,6 +55,10 @@ var statusQueries = map[string]bool{
 	"how is it going":    true,
 }
 
+// wideMatchLenCap bounds the wide interrogative match: past this length a
+// message is a composed instruction, not a status poke, however it starts.
+const wideMatchLenCap = 48
+
 // isStatusQuery reports whether a mid-task message asks what the task is
 // doing rather than telling it something. Deterministic by design - the
 // gateway holds no model - so this is a phrase set plus a narrow
@@ -68,11 +72,6 @@ var statusQueries = map[string]bool{
 // (the bridge's cli executor, which refuses each no-resume) gets the wide
 // rule, because a stolen false positive there costs nothing and the
 // alternative is an ack followed by a refusal.
-//
-// wideMatchLenCap bounds the wide interrogative match: past this length a
-// message is a composed instruction, not a status poke, however it starts.
-const wideMatchLenCap = 48
-
 func isStatusQuery(text string, wide bool) bool {
 	n := normalize(text)
 	if statusQueries[n] {
