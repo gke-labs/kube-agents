@@ -19,7 +19,8 @@ The next cluster meets the same failure.
 This design adds a scheduled review, the **upgrade retrospective**. The requirements are:
 
 1. **Run without a request, and answer a request.** The review runs once when the agent is
-   installed, over every cluster it finds, and then at the end of each weekend. A user can also ask
+   installed, over every cluster it finds, then at the end of each weekend, and within half an hour
+   of an upgrade for the cluster the upgrade changed. A user can also ask
    for it in their own words, for example "how did the last upgrades go" or "is there anything to
    fix before the next one". The question does not have to name the feature, a cluster or a
    version. If no cluster was upgraded since the last report, the agent answers from that report.
@@ -100,8 +101,9 @@ sandbox hop once it ships.
 ## 2. Target model
 
 ```
-upgrade-retrospective (Platform Agent roster: Sunday 18:00 UTC; and once, from the
-                       Chat Agent's first-run stage after the inventory scan settles)
+upgrade-retrospective (Platform Agent roster: Sunday 18:00 UTC; once, from the Chat Agent's
+                       first-run stage after the inventory scan settles; and scoped to one
+                       cluster when upgrade_retrospective_watch.py marks it due after an upgrade)
   └─ collector  upgrade_retrospective.py                          deterministic, no model
        ├─ ledger: versions per cluster, last run                   /opt/data/upgrade-retrospective/ledger.json (the shell's volume)
        ├─ select: new (not in ledger) or upgraded (version differs, or an
@@ -125,7 +127,7 @@ upgrade-retrospective (Platform Agent roster: Sunday 18:00 UTC; and once, from t
 
 ## 3. Decisions
 
-### 3.1 Trigger: first run and the end of each weekend, not a fixed day of the month
+### 3.1 Trigger: first run, the end of each weekend, and soon after each upgrade
 
 A retrospective is only useful soon after the upgrades it reviews. GKE's automatic upgrades land
 inside maintenance windows that most fleets set at night or at weekends, so the run sits at the end
@@ -148,19 +150,22 @@ scoped to this one stream. An install that onboarded before the job existed gets
 the first Sunday tick.
 
 A third trigger reviews a cluster soon after its upgrade rather than at the weekend. A `no_agent`
-job runs every fifteen minutes on the gateway pod, where such scripts run, and does its work in the
-shell sandbox through the same hop the readiness watch uses (`sandbox_exec`, the script handed to
-the sandbox's `python3` on stdin): it lists GKE operations per project, and when an
-`UPGRADE_MASTER` or `UPGRADE_NODES` operation on a cluster reached `DONE` at least fifteen minutes
-earlier and the ledger has not reviewed that operation, it runs the collector in the sandbox for that
-cluster alone (a scoped run, §3.2), where the store is, and posts the lines the collector prints. The
-review therefore lands fifteen to twenty-nine minutes after `DONE`: the replacement pods have had
-time to settle, and the events of the operation's last half hour are still inside the API server's
-hour; events emitted earlier in a long drain are already gone, which is why (B) reads pod and node
-state first and treats events as corroboration. The Sunday run stays the fleet-wide baseline and the
-only run that files the ledger issue; the fifteen-minute job records the operations it reviewed so
-the Sunday run reports them as already reviewed. It is the last part of the second work item (§5),
-after the scheduled run and the on-demand route.
+script, `upgrade_retrospective_watch.py`, runs every fifteen minutes on the gateway pod and reads,
+through the sandbox hop the readiness watch uses (`sandbox_exec` as its default principal, read
+only), the GKE operations of each roster project. When an `UPGRADE_MASTER` or `UPGRADE_NODES`
+operation on a cluster reached `DONE` at least fifteen minutes earlier and the watch has not marked
+that operation, it marks the `upgrade-retrospective` job due for that cluster, the way the
+first-run stage marks the audits due, and records the operation in its own ledger on the profile
+volume. The job then runs as the agent, in the agent's shell, which is the only principal that may
+write the store (§3.6): a scoped run for that cluster (§3.2) that posts its lines. The hop itself
+writes nothing, so a `hermes` caller never touches `/opt/data`, and the model turn is spent only
+when an upgrade completed. The review lands fifteen to twenty-nine minutes after `DONE` plus the
+job's start: the replacement pods have had time to settle, and the events of the operation's last
+half hour are still inside the API server's hour; events emitted earlier in a long drain are
+already gone, which is why (B) reads pod and node state first and treats events as corroboration.
+The Sunday run stays the fleet-wide baseline and the only run that files the ledger issue; the
+Sunday run reports an operation the watch already had reviewed as such. The watch is the last part
+of the second work item (§5), after the scheduled run and the on-demand route.
 
 ### 3.1a On demand: the same report, from a generic question
 
@@ -261,10 +266,11 @@ design's own. On a full run the collector writes it beside the report (`--manife
 per check that ran, or `outcome: unreachable` or `gate-failed` with the error for a cluster whose
 project listing failed, whose reads failed, or that is upgrading now; `candidates[]` for every
 incident the report files, an Error at `major` and a Warning at `minor`, with the check id, object,
-excerpt and the mitigation text, including a candidate for every guard the run still observes,
-which is how the harness holds a finding on the ledger (its `still_flagged_ids` are the candidates
-the collector still emits); `checks_unevaluated[]` and `limitations` on a cluster whose read
-failed; and, in the carried keys the manifest reserves for
+excerpt and the mitigation text, including a candidate for every `failure` guard the run still
+observes, which is how the harness holds a finding on the ledger (its `still_flagged_ids` are the
+candidates the collector still emits); a `risk` guard is Info, filed nowhere, and is no candidate,
+so a clean Sunday discloses nothing and runs silent; `checks_unevaluated[]` and `limitations` on a
+cluster whose read failed; and, in the carried keys the manifest reserves for
 collector-resolved fleet facts, the versions, operations and incident kinds the SOP copies. The
 stream is in `COLLECTOR_AUDITS`, the SOP passes the manifest to `finish`, and `cross_check_manifest`
 enforces what this design would otherwise state as prose: an unreachable cluster must be in
@@ -451,7 +457,8 @@ comes from the collector's JSON, which keeps the per-cluster data and the same t
    (`0 18 * * 0`, `skills: ["fleet-audit"]`, the `AUDITS` allowlist so findings file, with check
    ids off `MAJOR_SWEEP_CHECKS`); the SOP's two paths (`start`, the collector and `finish` with its
    manifest where a repository is linked; the collector alone without one) and the first-run stage
-   marking this job due without a repository; the hourly after-upgrade job (§3.1); the readiness
+   marking this job due without a repository; `agents/platform/scripts/upgrade_retrospective_watch.py`
+   and its roster entry (`*/15 * * * *`, `no_agent`, §3.1); the readiness
    watch reading `guards.json` through its sandbox hop once it ships; the cron README section and
    the generated cron reference.
 3. **The proof.** The first report over the test fleet; one nightly case per catalogue entry the
@@ -465,6 +472,7 @@ comes from the collector's JSON, which keeps the per-cluster data and the same t
   `agents/platform/AGENTS.md` (the on-demand route).
 - `agents/platform/cron/jobs.json`, `agents/platform/cron/README.md`,
   `agents/platform/skills/fleet-audit/scripts/audit_report.py` (`AUDITS`, `COLLECTOR_AUDITS`).
+- `agents/platform/scripts/upgrade_retrospective_watch.py` and its test (the after-upgrade mark).
 - The Chat Agent's first-run stage (`agents/chat/scripts/oobe.py`: the list of audits it starts
   after the inventory scan, and its repository skip).
 - The readiness watch's script, once it is on `main` (reads `guards.json` through its sandbox hop).
@@ -496,7 +504,8 @@ comes from the collector's JSON, which keeps the per-cluster data and the same t
 - Classification is by signature and can be wrong; every finding carries its evidence and a
   confidence, and the SOP may downgrade one. A wrong guard costs one extra line in a readiness
   report until the next run re-checks the cluster and drops it.
-- Fourteen days for the first run, and a fixed Sunday evening rather than a slot after each
+- Fourteen days for the first run, and a fixed Sunday evening for the fleet-wide run (the
+  after-upgrade watch covers the slot after each window) rather than a slot after each
   install's maintenance window, are starting values.
 - Audit-log reads (eviction 429s, admission rejections) would sharpen (B); `gcloud logging read` is
   on the allowlist, cost and scope to decide.
