@@ -14,6 +14,7 @@ import sys
 import tempfile
 import time
 import unittest
+
 import urllib.error
 from datetime import datetime, timezone
 from pathlib import Path
@@ -3940,6 +3941,149 @@ class ProwRunnerRolesMatchGrantersTest(unittest.TestCase):
         self.assertEqual(self._loop_members(page, "docs/ci-pool-projects.md"), set(self._MEMBER_VARS))
 
 
+# What each resource and data-source type under bench/tf/fleet needs from the
+# reconciler's project roles. A fixture pull request that adds a type this
+# table does not know is red until its author (1) maps the type here, (2) adds
+# any role it needs to FLEET_RECONCILER_ROLES, the loop in
+# scripts/provision_ci_pool_project.sh and the repair block in
+# docs/ci-pool-projects.md section 3, and (3) has the pool owner grant it on
+# every registered project before the merge. The stack grants the reconciler
+# nothing for itself, by design (a merge to main must not widen the writer),
+# so the role has to be on the project before the first apply that needs it:
+# the stack's startup-fail VM shipped without compute.instanceAdmin.v1 and the
+# first on-merge apply failed on each project it reached.
+# compute.viewer: the GKE provider lists each node pool's instance group
+# managers on refresh (the provisioning script's comment, seen live 2026-09-28),
+# and the compute provider reads the VM's zone and image. iam.serviceAccountUser:
+# every node pool runs as the stack's own node service account, which is an
+# act-as. serviceusage.serviceUsageConsumer is held for the provider itself,
+# whose calls name the project as their quota project (FLEET_PROVIDER_ROLES).
+FLEET_RESOURCE_ROLES = {
+    "google_container_cluster": {"roles/container.admin", "roles/compute.viewer", "roles/iam.serviceAccountUser"},
+    "google_container_node_pool": {"roles/container.admin", "roles/compute.viewer", "roles/iam.serviceAccountUser"},
+    "google_compute_disk": {"roles/compute.storageAdmin"},
+    "google_compute_instance": {"roles/compute.instanceAdmin.v1", "roles/compute.viewer"},
+    "google_service_account": {"roles/iam.serviceAccountAdmin"},
+    "google_service_account_iam_member": {"roles/iam.serviceAccountAdmin"},
+    "google_project_iam_member": {"roles/resourcemanager.projectIamAdmin"},
+    "terraform_data": set(),
+    # Data sources: reads the plan makes before anything is created.
+    "google_container_engine_versions": {"roles/container.admin"},
+    "google_client_config": set(),
+}
+# Every kubernetes_* resource is an in-cluster write, which container.admin
+# grants through the GKE IAM webhook.
+FLEET_KUBERNETES_ROLES = {"roles/container.admin"}
+# Needed by every google_* call regardless of type.
+FLEET_PROVIDER_ROLES = {"roles/serviceusage.serviceUsageConsumer"}
+
+
+class FleetResourceTypesAreCoveredByReconcilerRolesTest(unittest.TestCase):
+    """Every resource type the fleet stack declares maps to roles the reconciler holds."""
+
+    _FLEET = checker._ROOT / "bench" / "tf" / "fleet"
+    # The scan reads *.tf files through the repository's HCL tokenizer
+    # (tests/test_terraform_module_tests.py: comments dropped, strings and
+    # heredocs one token each, templates followed) and takes the resource and
+    # data blocks at depth 0. Anything else tofu might load is refused rather
+    # than enumerated: a file that is not *.tf and not one of the directory's
+    # known inert files, a top-level block kind that is neither read nor known
+    # to load no provider, and a read block whose header the scan cannot read.
+    # The names tofu's loader skips are skipped here too, so a parked file
+    # neither demands a role nor keeps one accounted for.
+    _INERT_FILES = {"README.md", ".terraform.lock.hcl", "fixtures.json", "reconcile-allow.json"}
+    _READ_BLOCKS = {"resource", "data"}
+    _INERT_BLOCKS = {"terraform", "provider", "variable", "output", "locals"}
+
+    @staticmethod
+    def _tokenizer():
+        # Imported here, not at module level: the tokenizer lives in a test
+        # module that loads PyYAML, which the rest of this file runs without.
+        if str(checker._ROOT) not in sys.path:
+            sys.path.insert(0, str(checker._ROOT))
+        from tests import test_terraform_module_tests as hcl
+        return hcl
+
+    @staticmethod
+    def _tofu_ignores(name):
+        # configs.IsIgnoredFile in tofu: dot-prefixed, ~-suffixed, #...#.
+        return name.startswith(".") or name.endswith("~") or (name.startswith("#") and name.endswith("#"))
+
+    def _headers(self, fleet=None):
+        """(kind, label tokens) for every top-level block in the stack."""
+        hcl, headers = self._tokenizer(), []
+        for path in sorted((fleet or self._FLEET).glob("*.tf")):
+            if self._tofu_ignores(path.name):
+                continue
+            tokens, depth, start = hcl._tokens(path.read_text()), 0, 0
+            for index, token in enumerate(tokens):
+                if token[0] == hcl._OPEN:
+                    if depth == 0:
+                        # The header is every token since the previous
+                        # top-level block closed: the keyword, then the labels,
+                        # whatever they are (a naked label is a label, not a kind).
+                        head = tokens[start:index]
+                        self.assertTrue(head and head[0][0] == hcl._WORD, f"{path.name}: a top-level block with no keyword before its brace: {head!r}")
+                        headers.append((head[0][1], head[1:]))
+                    depth += 1
+                elif token[0] == hcl._CLOSE:
+                    depth -= 1
+                    if depth == 0:
+                        start = index + 1
+            self.assertEqual(depth, 0, f"{path.name}: unbalanced braces after tokenizing; the scan cannot trust this file")
+        return headers
+
+    def _types(self):
+        hcl, types = self._tokenizer(), set()
+        for kind, labels in self._headers():
+            if kind in self._READ_BLOCKS:
+                self.assertTrue(len(labels) == 2 and all(l[0] == hcl._STR for l in labels), f"a {kind} block whose header the scan cannot read: {labels!r}; write it as tofu fmt does")
+                types.add(labels[0][1])
+        self.assertGreater(len(types), 10)
+        return types
+
+    def _strangers(self, fleet):
+        return sorted(p.name for p in fleet.iterdir() if p.is_file() and not self._tofu_ignores(p.name) and not p.name.endswith(".tf") and p.name not in self._INERT_FILES)
+
+    def test_the_scan_sees_everything_tofu_would_load(self):
+        self.assertEqual(self._strangers(self._FLEET), [], "a file the scan does not read (tofu also loads *.tofu, *.tf.json, *.tofu.json): extend the scan or name it inert here")
+        kinds = sorted({kind for kind, _ in self._headers()} - self._READ_BLOCKS - self._INERT_BLOCKS)
+        self.assertEqual(kinds, [], "a top-level block kind the scan does not read (module, ephemeral, action, ...): extend the scan")
+
+    def test_files_tofu_ignores_do_not_drive_the_table(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fleet = pathlib.Path(tmp)
+            (fleet / "main.tf").write_text('resource "google_live" "a" {}\n')
+            for parked in (".parked.tf", "main.tf~", "#main.tf#"):
+                (fleet / parked).write_text('resource "google_parked" "b" {}\n')
+            self.assertEqual([labels[0][1] for _, labels in self._headers(fleet)], ["google_live"])
+            self.assertEqual(self._strangers(fleet), [])
+
+    def test_every_type_in_the_stack_is_mapped_and_its_roles_are_held(self):
+        unmapped, unheld = [], []
+        for rtype in sorted(self._types()):
+            needed = FLEET_KUBERNETES_ROLES if rtype.startswith("kubernetes_") else FLEET_RESOURCE_ROLES.get(rtype)
+            if needed is not None and rtype.startswith("google_"):
+                needed = needed | FLEET_PROVIDER_ROLES
+            if needed is None:
+                unmapped.append(rtype)
+            elif not needed <= checker.FLEET_RECONCILER_ROLES:
+                unheld.append((rtype, sorted(needed - checker.FLEET_RECONCILER_ROLES)))
+        self.assertEqual(unmapped, [], "a new resource or data-source type in bench/tf/fleet: follow the three steps in the comment above FLEET_RESOURCE_ROLES")
+        self.assertEqual(unheld, [], "the reconciler lacks a role a mapped type needs")
+
+    def test_the_table_carries_no_type_the_stack_no_longer_uses(self):
+        self.assertEqual(sorted(set(FLEET_RESOURCE_ROLES) - self._types()), [])
+
+    def test_every_granted_role_is_accounted_for_by_a_type_or_the_provider(self):
+        # The reverse direction: a role in the reconciler's set that no type
+        # and not the provider needs is either a stale grant or a type the
+        # table maps too thinly (the leg that would miss compute.viewer gone).
+        accounted = set().union(FLEET_PROVIDER_ROLES, FLEET_KUBERNETES_ROLES, *FLEET_RESOURCE_ROLES.values())
+        self.assertEqual(sorted(checker.FLEET_RECONCILER_ROLES - accounted), [], "a reconciler role no mapped type needs: map the type that needs it, or drop the grant")
+        self.assertLessEqual(FLEET_PROVIDER_ROLES, checker.FLEET_RECONCILER_ROLES)
+
+
 class FleetReconcilerRolesMatchGrantersTest(unittest.TestCase):
     """FLEET_RECONCILER_ROLES and its member must equal the provisioning loop and the runbook's repair block.
 
@@ -4943,6 +5087,7 @@ def _without_hcl_comments(text):
     """HCL's three comment forms stripped: `#`, `//` and `/* */`, outside
     string literals (a `principalSet://...` member is not a comment). A role
     commented out in any of them is a role removed."""
+
     out, i, n, in_string = [], 0, len(text), False
     while i < n:
         c = text[i]
@@ -4968,6 +5113,7 @@ def _without_hcl_comments(text):
             out.append(c)
             i += 1
     return "".join(out)
+
 
 
 class PoolStateReaderMatchesTerraformTest(unittest.TestCase):
