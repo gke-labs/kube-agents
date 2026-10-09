@@ -53,7 +53,8 @@ const (
 	metricsLabelOther = "other"
 
 	// The gchat pull outcomes: a pull that returned an event, one that
-	// returned nothing, and one the relay refused or that never answered.
+	// returned nothing, and one that failed (the relay refused or did not
+	// answer, or the pull was never made or could not be read).
 	gchatPullEvents = "events"
 	gchatPullEmpty  = "empty"
 	gchatPullFailed = "failed"
@@ -131,7 +132,7 @@ func NewMetrics() *Metrics {
 			Namespace: metricsNamespace,
 			Subsystem: metricsSubsystem,
 			Name:      gchatPullsName,
-			Help:      "Pulls of the Google Chat relay, by outcome: events (one arrived), empty (none did), failed (the relay refused or did not answer).",
+			Help:      "Pulls of the Google Chat relay, by outcome: events (one arrived), empty (none did), failed (the relay refused or did not answer, or the pull was never made or could not be read).",
 		}, []string{labelOutcome}),
 	}
 	m.registry.MustRegister(m.taskTerminals, m.gchatEventsReceived, m.gchatPulls)

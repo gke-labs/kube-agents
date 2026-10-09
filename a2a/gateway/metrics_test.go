@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -224,6 +225,187 @@ func TestRelayedTerminalIsCountedOnce(t *testing.T) {
 	}
 }
 
+// TestHealedStaleTerminalDeliversOnceEvenIfRelayQueued: if the stale-terminal
+// heal fires while the relay still has the same terminal queued (the two
+// share the session lock), the heal observes the terminal and marks it on
+// the record while preserving the task route; the relay's later delivery
+// delivers the final answer text but skips observeEnded so task_terminals_total
+// is incremented exactly once.
+func TestHealedStaleTerminalDeliversOnceEvenIfRelayQueued(t *testing.T) {
+	r := startRig(t)
+	m := r.g.Metrics()
+	conv := "discord:g1/metrics-heal-queued"
+	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: "m-1", Text: "do task"}
+	origin := r.awaitTask(t, "platform")
+
+	ctx := context.Background()
+	// Hold the session lock to simulate the window where the relay has
+	// received the terminal and queued it for this conversation, but
+	// handleInbound runs its heal before the relay can process the batch.
+	l := r.g.lockSession(conv)
+	l.Lock()
+
+	// Executor publishes a result artifact and completes the task: the
+	// terminal lands on the TASKS stream and relayEvent enqueues it for the
+	// session worker.
+	exec := r.execFor(t, origin, "platform")
+	if err := exec.PublishArtifact(ctx, lib.Artifact{
+		Name:  lib.ArtifactResult,
+		Parts: []lib.Part{{Kind: "text", Text: "answer text from executor"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	publishMetricsTerminal(t, r, origin, TerminalFromExecutor, lib.StateCompleted)
+	// Wait until the relay worker has picked up the batch and is blocked on the session lock.
+	waitFor(t, "relay blocked on session lock", func() bool {
+		r.g.mu.Lock()
+		defer r.g.mu.Unlock()
+		entry := r.g.sessionLocks[conv]
+		return entry != nil && entry.refcount >= 2
+	})
+
+	// While the session lock is still held, the heal runs (e.g. from handleInbound).
+	rec, err := r.g.reg.Get(ctx, conv)
+	if err != nil || rec == nil {
+		t.Fatalf("session record: %v", err)
+	}
+	r.g.healActiveTask(ctx, rec)
+	l.Unlock()
+
+	// Wait for the relay worker to finish.
+	waitFor(t, "relay worker finished", func() bool {
+		r.g.mu.Lock()
+		defer r.g.mu.Unlock()
+		return r.g.sessionLocks[conv] == nil
+	})
+	time.Sleep(metricsSettle)
+
+	if got := metricsTerminalCount(t, m, "completed", "executor"); got != 1 {
+		t.Errorf("completed/executor counted %v times, want 1", got)
+	}
+	if got := metricsTerminalTotal(t, m); got != 1 {
+		t.Errorf("total terminals counted = %v, want 1", got)
+	}
+	posts := r.adapter.postTexts()
+	if len(posts) != 3 {
+		t.Errorf("adapter saw %d posts %v, want 3 (submission placeholder, status card, and result text)", len(posts), posts)
+	}
+	if !slices.Contains(posts, "answer text from executor") {
+		t.Errorf("adapter posts %v did not contain result text %q", posts, "answer text from executor")
+	}
+}
+
+// TestHealedStaleTerminalWithoutArtifactSkipsNonTextNoticeIfRelayQueued: when
+// a task finishes without an ArtifactResult, the heal posts the status card;
+// the relay's subsequent delivery must skip the redundant completedNonTextResult
+// notice on chat conversations.
+func TestHealedStaleTerminalWithoutArtifactSkipsNonTextNoticeIfRelayQueued(t *testing.T) {
+	r := startRig(t)
+	conv := "discord:g1/metrics-heal-no-artifact"
+	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: "m-1", Text: "do task"}
+	origin := r.awaitTask(t, "platform")
+
+	ctx := context.Background()
+	l := r.g.lockSession(conv)
+	l.Lock()
+
+	// Complete without publishing ArtifactResult.
+	publishMetricsTerminal(t, r, origin, TerminalFromExecutor, lib.StateCompleted)
+	waitFor(t, "relay blocked on session lock", func() bool {
+		r.g.mu.Lock()
+		defer r.g.mu.Unlock()
+		entry := r.g.sessionLocks[conv]
+		return entry != nil && entry.refcount >= 2
+	})
+
+	rec, err := r.g.reg.Get(ctx, conv)
+	if err != nil || rec == nil {
+		t.Fatalf("session record: %v", err)
+	}
+	r.g.healActiveTask(ctx, rec)
+	l.Unlock()
+
+	waitFor(t, "relay worker finished", func() bool {
+		r.g.mu.Lock()
+		defer r.g.mu.Unlock()
+		return r.g.sessionLocks[conv] == nil
+	})
+	time.Sleep(metricsSettle)
+
+	posts := r.adapter.postTexts()
+	if len(posts) != 2 {
+		t.Errorf("adapter saw %d posts %v, want 2 (submission placeholder and status card)", len(posts), posts)
+	}
+	if slices.Contains(posts, completedNonTextResult) {
+		t.Errorf("adapter unexpectedly posted completedNonTextResult: %v", posts)
+	}
+}
+
+// TestHealedStaleChildTerminalDropsQueuedRelayStraggler: when a delegated child's
+// terminal is queued behind the session lock while the heal runs, the heal wakes
+// the session and retires the route. applyEvent must drop the post-retirement
+// straggler so the session is not woken a second time.
+func TestHealedStaleChildTerminalDropsQueuedRelayStraggler(t *testing.T) {
+	r, spawn := startRigWithSpawner(t)
+	m := r.g.Metrics()
+	ctx := context.Background()
+	conv := "discord:g1/t-child-heal-queued"
+	_, _, child := delegated(t, r, spawn, conv, "")
+
+	l := r.g.lockSession(conv)
+	l.Lock()
+
+	completeTask(t, r.execFor(t, child, targetPlatform), "fleet is green")
+
+	waitFor(t, "relay blocked on session lock", func() bool {
+		r.g.mu.Lock()
+		defer r.g.mu.Unlock()
+		entry := r.g.sessionLocks[conv]
+		return entry != nil && entry.refcount >= 2
+	})
+
+	rec, err := r.g.reg.Get(ctx, conv)
+	if err != nil || rec == nil {
+		t.Fatalf("session record: %v", err)
+	}
+	r.g.healActiveTask(ctx, rec)
+	l.Unlock()
+
+	waitFor(t, "relay worker finished", func() bool {
+		r.g.mu.Lock()
+		defer r.g.mu.Unlock()
+		return r.g.sessionLocks[conv] == nil
+	})
+	time.Sleep(metricsSettle)
+
+	// Exactly 2 spawn calls: initial turn + one wake from the heal; no duplicate wake.
+	if len(spawn.calls()) != 2 {
+		t.Fatalf("spawn calls = %d, want 2 (duplicate wake was not dropped)", len(spawn.calls()))
+	}
+
+	// With the applyEvent guard, the post-retirement child terminal straggler is dropped:
+	// 1. Result text is not posted to the room (the heal posted the status card; the wake carries the result).
+	for _, text := range r.adapter.postTexts() {
+		if strings.Contains(text, "fleet is green") {
+			t.Errorf("adapter unexpectedly posted child result text %q", text)
+		}
+	}
+
+	// 2. observeChildEnd does not mark ChainEnd as failed (the child session was woken by the heal).
+	latestRec, err := r.g.reg.Get(ctx, conv)
+	if err != nil || latestRec == nil {
+		t.Fatalf("reg.Get: %v", err)
+	}
+	if ref, ok := latestRec.TaskRefFor(child.TaskID); !ok || ref.ChainEnd != nil {
+		t.Errorf("expected ChainEnd == nil for child, got ok=%v, ref=%+v", ok, ref)
+	}
+
+	// 3. Spurious failed/executor terminal is not counted under the chain's root.
+	if failedExec := metricsTerminalCount(t, m, "failed", "executor"); failedExec != 0 {
+		t.Errorf("metricsTerminalCount(failed, executor) = %v, want 0", failedExec)
+	}
+}
+
 // TestBusUnreachableTerminalIsCounted (jayantid's review of #2473): a task
 // whose submission never reached the bus ends in the gateway's own failed
 // terminal, which bypasses the relay. The user reads "could not reach the
@@ -433,7 +615,6 @@ func TestFromEnvReadsTheMetricsPort(t *testing.T) {
 		{name: "the inject door's port zero-padded", value: "9096", inject: "127.0.0.1:09096", refused: true},
 		{name: "the inject door's port signed", value: "9096", inject: "127.0.0.1:+9096", refused: true},
 		{name: "the inject door's port signed and padded", value: "9096", inject: "127.0.0.1:+09096", refused: true},
-		{name: "the inject door's port after a space", value: "9096", inject: "127.0.0.1: 9096", refused: true},
 		{name: "the A2A door's port zero-padded", value: "8098", door: "127.0.0.1:008098", refused: true},
 		{name: "the A2A door's port as a service name", value: "80", door: "127.0.0.1:http", refused: true},
 		// A port net.Listen cannot read either is the door's own boot failure

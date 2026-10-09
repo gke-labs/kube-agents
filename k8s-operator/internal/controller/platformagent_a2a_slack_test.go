@@ -467,11 +467,11 @@ func TestNoRenderedRoleReachesASecret(t *testing.T) {
 
 // TestNoEgressPolicySelectsTheGatewayPod: Slack is reached outbound (the
 // Socket Mode websocket and the Web API), and the gateway pod carries no
-// egress fence - its one policy is the ingress-only inject fence - so no
-// rule has to admit those hosts, and none could name them: the repository's
-// policies are selector and CIDR based. Pinned here so the day a deny-default
-// egress fence is put on the gateway, this test is what says Slack's egress
-// must come with it.
+// egress fence - its policies (the gateway, inject and door fences) are
+// ingress-only - so no rule has to admit those hosts, and none could name
+// them: the repository's policies are selector and CIDR based. Pinned here
+// so the day a deny-default egress fence is put on the gateway, this test
+// is what says Slack's egress must come with it.
 func TestNoEgressPolicySelectsTheGatewayPod(t *testing.T) {
 	agent := a2aTestAgent()
 	dns := []string{"10.96.0.10"}

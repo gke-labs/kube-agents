@@ -230,6 +230,9 @@ func (g *Gateway) relayBatch(sessionKey string, batch []relayItem) {
 // rolling-line edit; posts always happen.
 func (g *Gateway) applyEvent(ctx context.Context, rec *SessionRecord, item relayItem, render bool) {
 	env := item.env
+	if g.sessionForTask(ctx, env.TaskID) != rec.Key {
+		return
+	}
 	rs := g.relayFor(env.TaskID)
 
 	switch env.Kind {
@@ -424,7 +427,11 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 		// post IS the answer. The replay above is skipped for the same
 		// backends, so reaching here with an empty result costs nothing.
 		if !isConsoleConversation(rec.Key) {
-			g.post(rec.Key, result)
+			if ref.TerminalObserved && result == completedNonTextResult {
+				// The heal already posted the status card; skip completedNonTextResult.
+			} else {
+				g.post(rec.Key, result)
+			}
 		}
 	case lib.StateFailed:
 		reason := ""
@@ -542,7 +549,9 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 	// chain's (observedAs): a turn that delegated and a child end quietly,
 	// and the root's one terminal comes from the wake or, when none runs,
 	// from observeChildEnd below.
-	g.observeEnded(rec, taskID, s.Status.State, source, reason)
+	if !ref.TerminalObserved {
+		g.observeEnded(rec, taskID, s.Status.State, source, reason)
+	}
 
 	// A delegated child's end wakes the session that asked.
 	if ref, ok := rec.TaskRefFor(taskID); ok && ref.Role == taskRoleChild {

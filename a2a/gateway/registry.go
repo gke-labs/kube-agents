@@ -232,6 +232,11 @@ type TaskRef struct {
 	// the requester asked for" (terminal `canceled`) from "the executor
 	// died mid-work" (terminal `failed`) — assertion 13's distinction.
 	Canceled bool `json:"canceled,omitempty"`
+	// TerminalObserved marks that observeTaskTerminal has already been called
+	// for this task (e.g. by healActiveTask when recovering a stale terminal
+	// from the stream), so a queued or redelivered relayTerminal does not
+	// double-count in task_terminals_total.
+	TerminalObserved bool `json:"terminalObserved,omitempty"`
 	// Requester, Attribution and StartedAt are what a child task minted on
 	// this turn's behalf, or the wake-up turn after it, inherits: the
 	// allowlist is checked against Requester, the child's authority block is
@@ -402,6 +407,17 @@ func (rec *SessionRecord) MarkCanceled(taskID string) {
 	for i := range rec.Tasks {
 		if rec.Tasks[i].ID == taskID {
 			rec.Tasks[i].Canceled = true
+			return
+		}
+	}
+}
+
+// MarkTerminalObserved records that observeTaskTerminal has been called
+// for the task, preventing double-counting if a queued relay terminal follows.
+func (rec *SessionRecord) MarkTerminalObserved(taskID string) {
+	for i := range rec.Tasks {
+		if rec.Tasks[i].ID == taskID {
+			rec.Tasks[i].TerminalObserved = true
 			return
 		}
 	}

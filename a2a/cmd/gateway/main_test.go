@@ -9,7 +9,10 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -17,8 +20,10 @@ import (
 
 	natsserver "github.com/nats-io/nats-server/v2/server"
 	"github.com/nats-io/nats.go"
+	"github.com/nats-io/nats.go/jetstream"
 
 	"github.com/gke-labs/kube-agents/a2a/gateway"
+	"github.com/gke-labs/kube-agents/a2a/lib"
 )
 
 // startTestServerReadyTimeout bounds how long a test waits for the embedded
@@ -36,7 +41,11 @@ const unreachableNATSURL = "nats://127.0.0.1:1"
 // the "no chat backend" refusal or add a token refusal before the dial. One
 // place, so the next knob cannot reopen this per test.
 func TestMain(m *testing.M) {
-	for _, k := range []string{"A2A_DOOR_LISTEN", "A2A_DOOR_TOKEN", "A2A_DOOR_PRINCIPAL_MAP", "A2A_DOOR_PUBLIC_URL", "A2A_INJECT_LISTEN", "A2A_INJECT_TOKEN", "A2A_INJECT_PRINCIPAL_MAP"} {
+	for _, k := range []string{
+		"A2A_DOOR_LISTEN", "A2A_DOOR_TOKEN", "A2A_DOOR_PRINCIPAL_MAP", "A2A_DOOR_PUBLIC_URL",
+		"A2A_INJECT_LISTEN", "A2A_INJECT_TOKEN", "A2A_INJECT_PRINCIPAL_MAP",
+		"A2A_SPAWN_SESSIONS", "A2A_SESSION_SERVICE_ACCOUNT", "A2A_DEFAULT_ADDRESSEE",
+	} {
 		os.Unsetenv(k)
 	}
 	os.Exit(m.Run())
@@ -190,13 +199,22 @@ func TestRunExitsNonZeroOnConfigError(t *testing.T) {
 // startTestServer starts an embedded, no-auth nats-server on a random port
 // for buildAdapters tests that need a real bus but no gateway config.
 func startTestServer(t *testing.T) *natsserver.Server {
+	return startTestServerWithOptions(t, false)
+}
+
+func startJetStreamTestServer(t *testing.T) *natsserver.Server {
+	return startTestServerWithOptions(t, true)
+}
+
+func startTestServerWithOptions(t *testing.T, jetStream bool) *natsserver.Server {
 	t.Helper()
 	opts := &natsserver.Options{
-		Host:     "127.0.0.1",
-		Port:     -1,
-		NoLog:    true,
-		NoSigs:   true,
-		StoreDir: t.TempDir(),
+		Host:      "127.0.0.1",
+		Port:      -1,
+		JetStream: jetStream,
+		NoLog:     true,
+		NoSigs:    true,
+		StoreDir:  t.TempDir(),
 	}
 	s, err := natsserver.NewServer(opts)
 	if err != nil {
@@ -436,6 +454,130 @@ func TestServeKeepsTheGatewayWhenTheMetricsListenerCannotStart(t *testing.T) {
 				t.Errorf("ALERT err = %q, want it to name %q", got, tc.wantErr)
 			}
 		})
+	}
+}
+
+func provisionTasksStream(t *testing.T, url string) {
+	t.Helper()
+	nc, err := nats.Connect(url)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer nc.Close()
+	js, err := jetstream.New(nc)
+	if err != nil {
+		t.Fatalf("jetstream: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, err := js.CreateOrUpdateStream(ctx, jetstream.StreamConfig{
+		Name:      lib.TasksStream,
+		Subjects:  []string{"a2a.tasks.>"},
+		Retention: jetstream.LimitsPolicy,
+		MaxAge:    72 * time.Hour,
+	}); err != nil {
+		t.Fatalf("create TASKS: %v", err)
+	}
+}
+
+func freePort(t *testing.T) int {
+	t.Helper()
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("free port: %v", err)
+	}
+	defer l.Close()
+	return l.Addr().(*net.TCPAddr).Port
+}
+
+// TestRealMainWiresMetrics proves realMain threads one Metrics instance across
+// the adapter, the gateway, and the metrics server: pulls performed by the
+// adapter are reflected on the /metrics listener served by realMain.
+func TestRealMainWiresMetrics(t *testing.T) {
+	s := startJetStreamTestServer(t)
+	url := s.ClientURL()
+	provisionTasksStream(t, url)
+
+	relaySrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v1/chat/a2a/events" && r.Method == http.MethodGet {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"subscription":"projects/p/subscriptions/s"}`))
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	t.Cleanup(relaySrv.Close)
+
+	tokenFile := filepath.Join(t.TempDir(), "chat-token")
+	if err := os.WriteFile(tokenFile, []byte("test-token"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	metricsPort := freePort(t)
+
+	t.Setenv("NATS_URL", url)
+	t.Setenv("SESSION_KV_SALT", "test-salt")
+	t.Setenv("A2A_GCHAT_RELAY_URL", relaySrv.URL)
+	t.Setenv("A2A_GCHAT_TOKEN_PATH", tokenFile)
+	t.Setenv("A2A_METRICS_PORT", fmt.Sprintf("%d", metricsPort))
+	t.Setenv("A2A_CHAT_DISPLAY_MODE", "")
+	t.Setenv("DISCORD_TOKEN", "")
+	t.Setenv("SLACK_BOT_TOKEN", "")
+	t.Setenv("SLACK_APP_TOKEN", "")
+	t.Setenv("A2A_SPAWN_SESSIONS", "")
+	t.Setenv("A2A_SESSION_SERVICE_ACCOUNT", "")
+	t.Setenv("A2A_DEFAULT_ADDRESSEE", "")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- realMain(ctx, slog.Default())
+	}()
+
+	metricsURL := fmt.Sprintf("http://127.0.0.1:%d/metrics", metricsPort)
+	client := &http.Client{Timeout: 1 * time.Second}
+
+	deadline := time.Now().Add(10 * time.Second)
+	found := false
+	metricPrefix := "kubeagents_a2a_gateway_gchat_pulls_total{outcome=\"empty\"} "
+	for time.Now().Before(deadline) {
+		select {
+		case err := <-errCh:
+			t.Fatalf("realMain exited early while polling /metrics: %v", err)
+		default:
+		}
+		resp, err := client.Get(metricsURL)
+		if err == nil {
+			body, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			bodyStr := string(body)
+			if resp.StatusCode == http.StatusOK && strings.Contains(bodyStr, metricPrefix) && !strings.Contains(bodyStr, metricPrefix+"0\n") {
+				found = true
+				break
+			}
+		}
+		select {
+		case err := <-errCh:
+			t.Fatalf("realMain exited early while polling /metrics: %v", err)
+		case <-time.After(25 * time.Millisecond):
+		}
+	}
+
+	cancel()
+	select {
+	case err := <-errCh:
+		if err != nil && !errors.Is(err, context.Canceled) {
+			t.Fatalf("realMain returned unexpected error: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("realMain did not exit after context cancellation")
+	}
+
+	if !found {
+		t.Fatal("timed out waiting for /metrics to reflect adapter pulls")
 	}
 }
 
