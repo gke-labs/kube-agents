@@ -262,6 +262,19 @@ class GitLabLaneTest(unittest.TestCase):
         self.assertEqual(lines_tagged(result, "ROSTER"), ["agent-kanban-smoke"], "the roster intersected with the lane")
         self.assertNotIn("rung 4 is disarmed", result.stdout)
 
+    def test_the_inject_guard_still_fires_on_the_lane(self):
+        """A lane whose only roster case is inject-excluded, run under the
+        inject transport, must stop as the GitHub lane would, not run with
+        rung 4 disarmed under the "no roster case in the lane" line."""
+        with tempfile.TemporaryDirectory() as tmp:
+            hack = pathlib.Path(tmp) / "hack"
+            shutil.copytree(HACK_DIR / "eval", hack / "eval")
+            (hack / "eval" / "gitlab-presubmit-cases.txt").write_text("./tasks/agent-kanban-smoke/task.yaml\n./tasks/pdb-remediation-pr/task.yaml\n")
+            result = load_matrix_through_the_lane_step({"EVAL_FORGE": "gitlab", "AGENT_TRANSPORT": "inject"}, hack_dir=hack)
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("excluded on the inject lane", result.stderr)
+        self.assertNotIn("rung 4 is disarmed", result.stdout)
+
     def test_a_gitlab_nightly_is_the_whole_catalogue(self):
         result = load_matrix({"EVAL_FORGE": "gitlab", "EVAL_TIER": "nightly"})
         self.assertEqual(result.returncode, 0, result.stderr)
