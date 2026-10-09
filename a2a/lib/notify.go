@@ -35,9 +35,10 @@ type NotifyRequest struct {
 	Text string `json:"text"`
 	// Thread, when set, is the thread to reply on. It must be a thread of
 	// the home channel; empty starts a new thread there. On Google Chat it
-	// is the thread's resource name; on Slack it is the thread root's ts,
-	// which names no channel, so the gateway posts it into the home
-	// channel and nowhere else.
+	// is the thread's resource name. On Slack it is "<channel>/<ts>",
+	// admitted only when the channel is home, or a bare ts, which names no
+	// channel and is posted into the home channel; senders that know the
+	// thread's channel send the qualified form.
 	Thread string `json:"thread,omitempty"`
 	// WaitMillis is how long the requester waits for the answer. A request
 	// the gateway fails or refuses after that has nobody to tell, and the

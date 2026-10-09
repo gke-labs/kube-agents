@@ -31,6 +31,8 @@ import os
 # next stack holds the chat backend (platformagent_manifests.go,
 # a2aNotifyPlatformEnvVar). Its value is a platform name as Hermes spells it.
 NOTIFY_PLATFORM_ENV = "A2A_NOTIFY_PLATFORM"
+#: The Slack platform name, whose threads go out channel-qualified (command).
+SLACK_PLATFORM = "slack"
 # The bus CLI in the agent image (a2a/cmd/a2a), on PATH.
 A2A_CLI = "a2a"
 # The Hermes CLI the today path posts through.
@@ -100,11 +102,17 @@ def command(target: str, message: str, json_output: bool = True, hermes_bin: str
         if json_output:
             argv.append("--json")
         return argv + ["--to", target, message]
-    _chat, _, thread = rest.partition(":")
+    chat, _, thread = rest.partition(":")
     argv = [A2A_CLI, "notify", "--platform", platform]
     if wait_seconds is not None:
         argv += ["--timeout", f"{max(1, int(wait_seconds))}s"]
     if thread:
+        # A Slack thread is a bare ts, which names no channel: it goes out
+        # qualified by the target's own channel, and the gateway posts it only
+        # when that channel is home. A today-era DM or other channel's thread
+        # is then refused rather than followed up in home.
+        if platform == SLACK_PLATFORM and chat:
+            thread = f"{chat}/{thread}"
         argv += ["--thread", thread]
     # "--" ends the flags: a report that opens with a bullet, a rule or a
     # negative number is text, not an option, and a message that is exactly

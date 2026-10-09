@@ -305,7 +305,14 @@ class SlackRouteTest(unittest.TestCase):
     def test_a_slack_target_goes_through_the_gateway_with_its_ts(self):
         with mock.patch.dict(os.environ, SLACK_ROUTED):
             argv = chat_notify.command("slack:C0HOME:1700000000.000100", "drift on prod")
-        self.assertEqual(argv, ["a2a", "notify", "--platform", "slack", "--thread", "1700000000.000100", "--", "drift on prod"])
+        self.assertEqual(argv, ["a2a", "notify", "--platform", "slack", "--thread", "C0HOME/1700000000.000100", "--", "drift on prod"])
+
+    def test_a_slack_thread_carries_its_own_channel(self):
+        # A today-era DM thread: the gateway refuses a non-home channel, so the
+        # follow-up is not posted into home.
+        with mock.patch.dict(os.environ, SLACK_ROUTED):
+            argv = chat_notify.command("slack:D0DM:1700000000.000200", "follow-up")
+        self.assertEqual(argv[argv.index("--thread") + 1], "D0DM/1700000000.000200")
 
     def test_slack_threads_come_from_the_answer_or_the_ts(self):
         self.assertEqual(chat_notify.thread_from_response("slack", {"message_id": "2.2", "thread_id": "1.1"}), "1.1")
