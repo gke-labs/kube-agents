@@ -1800,7 +1800,8 @@ case "${EVAL_TIER}" in
         echo "ERROR: ${GITLAB_PRESUBMIT_CASES_FILE} names no case; the GitLab lane would run nothing and report green." >&2
         exit 1
       fi
-      check_case_entries "${GITLAB_PRESUBMIT_CASES_FILE}" "${GITLAB_LANE_TASKS[@]}"
+      # Every entry must be a presubmit entry, which check_case_entries has
+      # already proven to be a case path with a directory behind it.
       for ENTRY in "${GITLAB_LANE_TASKS[@]}"; do
         if ! grep -qxF -- "${ENTRY}" <<< "${PRESUBMIT_ENTRIES}"; then
           echo "ERROR: ${GITLAB_PRESUBMIT_CASES_FILE}: '${ENTRY}' is not in ${PRESUBMIT_CASES_FILE}; the GitLab lane is a subset of the presubmit." >&2
@@ -2345,6 +2346,10 @@ if [ -z "${BLOCKING_ROSTER_ENTRIES}" ]; then
 fi
 BLOCKING_ROSTER_DEFAULT=""
 BLOCKING_ROSTER_ON_LANE=""
+# Set when the inject lane's exclusion list drops a ROSTER case: what the
+# every-roster-case-excluded guard below tests, since an empty
+# BLOCKING_ROSTER_ON_LANE has a second cause on the GitLab lane.
+INJECT_LANE_DROPPED_ROSTER=""
 while IFS= read -r NAME; do
   if [ -z "${NAME}" ]; then continue; fi
   if ! grep -qxF -- "${NAME}" <<< "${PRESUBMIT_CASE_NAMES}"; then
@@ -2359,6 +2364,7 @@ while IFS= read -r NAME; do
   # names no graded case" banner on every run of the lane, and that banner
   # exists to catch a misspelled roster entry.
   if [ -n "${INJECT_LANE_DROPPED:-}" ] && grep -qxF -- "${NAME}" <<< "${INJECT_LANE_DROPPED:-}"; then
+    INJECT_LANE_DROPPED_ROSTER="true"
     continue
   fi
   # A roster case outside the GitLab lane's list (GITLAB_LANE_DROPPED, empty
@@ -2386,7 +2392,7 @@ done <<< "${BLOCKING_ROSTER_ENTRIES}"
 # environment, empty included, is the stated way to mean it, and wins below.
 # Read before the nightly part's drop, which empties the export by design
 # when the part holds no roster case, and is not the lane's doing.
-if [ -z "${BLOCKING_ROSTER_ON_LANE}" ] && [ -n "${INJECT_LANE_DROPPED:-}" ] && [ -z "${BOOTSTRAP_ADMITTED+set}" ]; then
+if [ -z "${BLOCKING_ROSTER_ON_LANE}" ] && [ -n "${INJECT_LANE_DROPPED_ROSTER}" ] && [ -z "${BOOTSTRAP_ADMITTED+set}" ]; then
   echo "ERROR: every case in ${BLOCKING_ROSTER_FILE} is excluded on the inject lane (${EVAL_INJECT_LANE_EXCLUSIONS_FILE}); the lane would run with rung 4 disarmed for every case. Trim the exclusion list, or set BOOTSTRAP_ADMITTED explicitly if that is the intent." >&2
   exit 1
 fi

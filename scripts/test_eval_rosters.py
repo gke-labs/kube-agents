@@ -396,21 +396,25 @@ INJECT_LANE_EXCLUDED_TIER = {
 }
 
 
-def positive_check_types(node) -> set:
-    """Every `type:` in a task document outside a negating `type: none`
-    compound (bench/kube_agents_bench/cases.py): the checks that assert a
-    write happened, not that one did not."""
+def positive_check_types(node, negations: int = 0) -> set:
+    """Every `type:` in a task document under an even number of negating
+    `type: none` compounds, read as the bench reads them (`_negates_every_leaf`
+    in bench/kube_agents_bench/cases.py counts negations by parity): the
+    checks that assert a write happened, not that one did not."""
     if isinstance(node, dict):
         if node.get("type") == "none":
-            return set()
-        found = {node["type"]} if isinstance(node.get("type"), str) else set()
+            found = set()
+            for value in node.values():
+                found |= positive_check_types(value, negations + 1)
+            return found
+        found = {node["type"]} if isinstance(node.get("type"), str) and negations % 2 == 0 else set()
         for value in node.values():
-            found |= positive_check_types(value)
+            found |= positive_check_types(value, negations)
         return found
     if isinstance(node, list):
         found = set()
         for item in node:
-            found |= positive_check_types(item)
+            found |= positive_check_types(item, negations)
         return found
     return set()
 
@@ -445,6 +449,9 @@ class GitLabLaneTest(unittest.TestCase):
         negated = {"verification_spec": [{"type": "none", "checks": [{"type": "pull_request_opened"}]}]}
         self.assertFalse(positive_check_types(negated) & self.FORGE_CHECKS)
         self.assertTrue(positive_check_types({"verification_spec": [{"type": "pull_request_opened"}]}) & self.FORGE_CHECKS)
+        # A none under a none undoes it, as the bench reads it (bench/tests/test_cases.py, doubly-negated).
+        double = {"verification_spec": [{"type": "none", "checks": [{"type": "none", "checks": [{"type": "pull_request_opened"}]}]}]}
+        self.assertTrue(positive_check_types(double) & self.FORGE_CHECKS)
 
     def test_no_commented_out_case_path(self):
         self.assertEqual(eval_rosters.commented_out_cases(eval_rosters.GITLAB_PRESUBMIT_CASES_FILE.read_text(encoding="utf-8")), [])
