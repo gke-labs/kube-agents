@@ -51,24 +51,17 @@ verification_spec:
       scope: finding_ids
       required_phrases: ["upgrade-blocked"]
 
-  - name: the-finding-names-the-lagging-cluster
-    role: objective
-    mode: assert
-    check:
-      type: ledger_issue_contains
-      audit: security-patch-orchestrator
-      scope: finding_ids
-      required_phrases: ["seeded-b"]
-
-  # The two finding_ids objectives above test their phrases independently,
-  # and every correct run on this fleet already puts seeded-b into the ids
-  # through master-behind. What binds the upgrade-blocked finding to the
-  # planted budget is the candidate's excerpt, which the SOP has the agent
-  # paste as it is and which no limitations line or evidence block of another
-  # check produces: the reporter's grade naming the budget, which the
-  # collector writes for every blocking budget in name order, so the clause
-  # is there whatever else blocks beside it. Only seeded-b carries
-  # pinned-batch-runner.
+  # No second id-level objective. An id is <check>.<cluster>.<namespace>.<object>
+  # with the cluster qualified as <project>-<location>-<name>, so no one phrase
+  # holds both upgrade-blocked and seeded-b, and a bare seeded-b phrase is
+  # earned by master-behind on every correct run (the sibling case
+  # upgrade-readiness-lagging-cluster already asserts it). What binds the
+  # upgrade-blocked finding to the planted budget is the candidate's excerpt,
+  # which the SOP has the agent paste as it is and which no limitations line
+  # or evidence block of another check produces: the reporter's grade naming
+  # the budget, which the collector writes for every blocking budget in name
+  # order, so the clause is there whatever else blocks beside it. Only
+  # seeded-b carries pinned-batch-runner.
   - name: the-finding-carries-the-reporters-grade-of-the-planted-budget
     role: objective
     mode: assert
