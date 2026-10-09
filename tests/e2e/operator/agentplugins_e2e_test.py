@@ -1552,7 +1552,7 @@ spec:
             f"Hermes must load the pinned cap of 1 over the agent's own config.yaml: {loaded}"
         )
         log(f"Verified Hermes loads the pinned cap over the agent's file ({loaded.strip()}).")
-        log("Verified tuning reaches the default overlay and both profile overlays.")
+        log("Verified the other tuning limits reach the default overlay and both profile overlays, and the board cap is pinned pod-wide in the managed scope.")
 
         # Withdrawing tuning must drop the overlays. Cluster profile configs are not
         # force-synced from the image, so the entrypoint's unapply step is what stops the
