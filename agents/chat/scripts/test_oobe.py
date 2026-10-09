@@ -983,6 +983,55 @@ class StageTest(unittest.TestCase):
             self.assertEqual(captured.read(), b"")
         self.assertEqual(out.getvalue(), "REPORT")
 
+    def test_a_failed_delivery_carries_only_its_own_stderr(self):
+        # Hermes posts a failed run's stderr to the linked chat, so the other stages log to a file.
+        def speaks(_d, *_rest):
+            sys.stderr.write("scan stderr\n")
+            os.write(oobe.STDERR_FD, b"subprocess stderr\n")
+            os.write(oobe.STDOUT_FD, b"subprocess stdout\n")
+
+        def fails(_d):
+            sys.stderr.write("delivery failed\n")
+            return 1
+
+        self.scan.side_effect = speaks
+        self.deliver.side_effect = fails
+        with tempfile.TemporaryFile() as out, tempfile.TemporaryFile() as err, mock.patch.object(
+            oobe, "first_run_audits", speaks
+        ):
+            saved = [os.dup(oobe.STDOUT_FD), os.dup(oobe.STDERR_FD)]
+            try:
+                os.dup2(out.fileno(), oobe.STDOUT_FD)
+                os.dup2(err.fileno(), oobe.STDERR_FD)
+                with open(os.devnull, "w") as sink, contextlib.redirect_stdout(sink), contextlib.redirect_stderr(
+                    os.fdopen(os.dup(oobe.STDERR_FD), "w")
+                ) as stream:
+                    code = oobe.main(self.d, now=NOW_SETTLED)
+                    stream.flush()
+            finally:
+                os.dup2(saved[0], oobe.STDOUT_FD)
+                os.dup2(saved[1], oobe.STDERR_FD)
+                for fd in saved:
+                    os.close(fd)
+            out.seek(0)
+            err.seek(0)
+            self.assertEqual(code, 1)
+            self.assertEqual(out.read(), b"")
+            self.assertEqual(err.read(), b"delivery failed\n")
+        log = (self.d / oobe.STAGE_LOG).read_text(encoding="utf-8")
+        self.assertEqual(log.count("scan stderr"), 2)
+        self.assertEqual(log.count("subprocess stderr"), 2)
+        self.assertEqual(log.count("subprocess stdout"), 2)
+
+    def test_the_stage_log_is_rotated_past_its_cap(self):
+        log = self.d / oobe.STAGE_LOG
+        log.parent.mkdir(parents=True)
+        log.write_text("x" * (oobe.STAGE_LOG_MAX_BYTES + 1), encoding="utf-8")
+        with oobe._open_stage_log(self.d) as fh:
+            fh.write("fresh\n")
+        self.assertEqual(log.read_text(encoding="utf-8"), "fresh\n")
+        self.assertTrue(log.with_name(log.name + oobe.ROTATED_SUFFIX).is_file())
+
     def test_a_corrupt_marker_is_read_as_not_started(self):
         (self.d / oobe.AUDITS_MARKER).write_text("{not json", encoding="utf-8")
         self.assertEqual(oobe.read_state(self.d), {})

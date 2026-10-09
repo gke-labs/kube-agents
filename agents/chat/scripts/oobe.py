@@ -162,6 +162,11 @@ DEFAULT_HOME = "/opt/data"
 TMP_SUFFIX = bootstrap_handoff.TMP_SUFFIX
 STDOUT_FD = 1
 STDERR_FD = 2
+# Where the scan and audits stages write, under the Chat Agent's home. Once oobe is linked to the
+# chat, Hermes posts a failed run's stderr there, so their output stays off the run's streams.
+STAGE_LOG = Path("logs") / "oobe.log"
+STAGE_LOG_MAX_BYTES = 1024 * 1024
+ROTATED_SUFFIX = ".1"
 
 
 def _log(message: str) -> None:
@@ -534,26 +539,44 @@ def skip(data_dir: Path, reason: str, now: float) -> None:
     write_state(data_dir, {STATE_DONE: True, STATE_SKIPPED: True, STATE_REASON: reason, STATE_AT: now})
 
 
+def _open_stage_log(data_dir: Path):
+    path = data_dir / STAGE_LOG
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with contextlib.suppress(OSError):
+        if path.stat().st_size > STAGE_LOG_MAX_BYTES:
+            os.replace(path, path.with_name(path.name + ROTATED_SUFFIX))
+    return open(path, "a", encoding="utf-8")
+
+
 @contextlib.contextmanager
-def _quiet():
-    """Send stdout, the file descriptor as well as ``sys.stdout``, to stderr for the block."""
+def _quiet(log):
+    """Send stdout and stderr, the file descriptors as well as ``sys``'s, to ``log`` for the block."""
     sys.stdout.flush()
-    saved = os.dup(STDOUT_FD)
+    sys.stderr.flush()
+    saved = [os.dup(STDOUT_FD), os.dup(STDERR_FD)]
     try:
-        os.dup2(STDERR_FD, STDOUT_FD)
-        with contextlib.redirect_stdout(sys.stderr):
+        os.dup2(log.fileno(), STDOUT_FD)
+        os.dup2(log.fileno(), STDERR_FD)
+        with contextlib.redirect_stdout(log), contextlib.redirect_stderr(log):
             yield
     finally:
-        sys.stdout.flush()
-        os.dup2(saved, STDOUT_FD)
-        os.close(saved)
+        log.flush()
+        os.dup2(saved[0], STDOUT_FD)
+        os.dup2(saved[1], STDERR_FD)
+        for fd in saved:
+            os.close(fd)
 
 
-def _quiet_stage(name: str, stage, *args) -> None:
-    """Run a stage that must not speak to the operator: nothing on stdout, no exception out."""
-    with _quiet():
+def _quiet_stage(name: str, stage, data_dir: Path, *args) -> None:
+    """Run a stage that must not speak to the operator: nothing on the run's streams, no exception out."""
+    try:
+        log = _open_stage_log(data_dir)
+    except OSError as e:
+        _log(f"cannot open the stage log, so the {name} stage waits for the next tick: {e}")
+        return
+    with log, _quiet(log):
         try:
-            stage(*args)
+            stage(data_dir, *args)
         except Exception as e:  # noqa: BLE001 - the next tick retries; delivery must still run
             _log(f"the {name} stage failed: {e!r}")
 

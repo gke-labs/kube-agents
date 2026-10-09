@@ -356,12 +356,12 @@ def handle_pre_llm_call(**kwargs: Any) -> Optional[Dict[str, str]]:
     except Exception as e:
         logger.warning("Could not touch .user_aligned: %s", e)
 
+    # Only the first: trigger_job also enables a job, and the old entry ships disabled beside oobe.
     if trigger_job is not None:
-        for job_id in bound:
-            try:
-                trigger_job(job_id)
-            except Exception as e:
-                logger.warning("Could not trigger %s: %s", job_id, e)
+        try:
+            trigger_job(bound[0])
+        except Exception as e:
+            logger.warning("Could not trigger %s: %s", bound[0], e)
 
     # Last, so that a failure above retries on the next turn rather than
     # burning the one-shot. A failure HERE only costs a repeated greeting.

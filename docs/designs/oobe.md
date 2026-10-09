@@ -5,8 +5,8 @@ until the scheduled audits run: 06:20 UTC the next morning for security, the nex
 This design adds `oobe`, one no-model cron job on the Planning Agent's roster that owns everything
 an install does once, on first boot. Its first stage starts the fleet audits as soon as the
 inventory scan finishes, so an operator sees cost, security, reliability and capacity findings
-within about two hours of install. Later it takes over the two bootstrap jobs, so first-run work
-lives in one place.
+within about two hours of install. It also runs the inventory scan and the report delivery that two bootstrap jobs ran before,
+so first-run work lives in one place.
 
 > **Status:** §4, the first-run audits, and §5, the fold of the bootstrap jobs, are implemented. §8 is
 > the build order; dropping the disabled ids is what remains of it.
@@ -41,9 +41,9 @@ Chat Agent's home, and a job on another profile would gate itself on a different
 
 | Stage                                                           | Done when                                    | Marker                                                     | Built in    |
 | --------------------------------------------------------------- | -------------------------------------------- | ---------------------------------------------------------- | ----------- |
+| Delivery: post the report to the first chat                     | Report claimed                               | `.bootstrap_completed` (kept)                              | Step 2 (§5) |
 | Inventory scan: file the sweep, hand off, file the ranking card | Ranking card filed                           | `.bootstrap_scan_filed`, `.bootstrap_handoff_filed` (kept) | Step 2 (§5) |
 | First-run audits                                                | All audits started, or skipped with a reason | `.oobe_audits_fired` (new)                                 | Step 1 (§4) |
-| Delivery: post the report to the first chat                     | Report claimed                               | `.bootstrap_completed` (kept)                              | Step 2 (§5) |
 
 Stages this job takes over keep their `.bootstrap_*` markers, so an install upgraded mid-onboarding
 carries on from where it was. One whose `oobe` an earlier image already removed carries on through
@@ -57,7 +57,9 @@ for the model quota with four audits at once: on an API-key install, three worke
 together have been enough to hit per-minute 429s. And the report should land before the audit
 summaries, which assume a fleet the operator has already seen.
 
-## 3. Today's onboarding, for reference
+## 3. Onboarding before the fold, for reference
+
+§5 moved this flow into `oobe`'s scan and delivery stages; the scripts and markers are the same.
 
 `bootstrap-inventory-scan` (`bootstrap_scan_gate.py`) files the sweep card to `platform`, which
 lists the fleet, and records it in `.bootstrap_scan_filed`. On the same job's ticks the hand-off
@@ -224,9 +226,11 @@ claimed within seconds of that, as the old delivery job's was. Behind the scan a
   `oobe` gone. While no `oobe` job exists, the sync leaves the two old jobs enabled, and they
   finish onboarding as they did.
 - **Scan output stays out of chat.** Once linked, anything `oobe` prints is posted to the operator,
-  and a non-zero exit is posted as a failure. The scan stage writes to stderr only, including its
-  subprocesses (fd 1 redirected for the stage), and an exception in it is caught so it neither
-  posts nor blocks delivery.
+  and a failed run is posted with its stderr. The scan and audits stages write to
+  `logs/oobe.log` in the Chat Agent's home, their subprocesses included (fd 1 and fd 2 redirected
+  for the stage), so a failed delivery posts only delivery's own error; an exception in either is
+  caught so it neither posts nor blocks delivery. The plugin triggers only the first job it binds,
+  because `trigger_job` also enables a job and the old delivery entry ships disabled.
 - **Removal.** Once its first-run audits stage is done and `.bootstrap_completed` is five minutes
   old, `oobe` removes the two disabled entries (`bootstrap_delivery._retire_jobs`) and then itself.
   On an install nobody speaks to, the report is never claimed and `oobe` stays, doing nothing.
@@ -262,7 +266,7 @@ times. It rides with the audits stage, whose eval case covers both.
 - **Audits without a GitOps repository.** They would need a chat-only mode in the shared fleet-audit
   script.
 - **An install self-check.** Not asked for by any issue.
-- **A "first audits are running" line in the report.** A small follow-up once delivery is a stage.
+- **A "first audits are running" line in the report.** A small follow-up now that delivery is a stage.
 
 ## 8. Build order and evaluation
 

@@ -56,7 +56,7 @@ The hand-off runs on the scan job's every-minute tick, so it got a marker of its
 
 The scheduler snapshots a job's delivery destination (`deliver` / `origin`) into memory **when the run starts** (`get_due_jobs` deep-copies `jobs.json`), and delivers the result to that snapshot at the end — it does not re-read the destination from disk after the turn. A user who connects mid-run has their chat written to disk as `deliver: origin`, but the run in flight already cached the old destination (`local` before anyone spoke), and whatever it prints goes there: the report would be lost.
 
-So the stage that prints the report must run within seconds of the snapshot, on a run that started after the plugin wrote `deliver: origin`. It did when delivery was a job of its own; inside `oobe` it runs **first** in each tick, ahead of the scan and the first-run audits stage (whose trigger subprocess can take 30 s), so its window is the same few seconds. The other stages print nothing (stdout is sent to stderr for them), so a stale snapshot can only ever carry an empty run. Do not move delivery behind them (see Rule 1).
+So the stage that prints the report must run within seconds of the snapshot, on a run that started after the plugin wrote `deliver: origin`. It did when delivery was a job of its own; inside `oobe` it runs **first** in each tick, ahead of the scan and the first-run audits stage (whose trigger subprocess can take 30 s), so its window is the same few seconds. The other stages print nothing (their output goes to `/opt/data/logs/oobe.log`), so a stale snapshot can only ever carry an empty run. Do not move delivery behind them (see Rule 1).
 
 ```mermaid
 graph TD
@@ -339,10 +339,10 @@ hermes kanban create --json --assignee platform --idempotency-key bootstrap-inve
 printf 'task_id=%s\nfiled_at=%s\n' <the id the create printed> "$(date +%s)" > /opt/data/.bootstrap_scan_filed
 ```
 
-The hand-off runs on the `bootstrap-inventory-scan` job's ticks, so this path needs that job in place even though it skips the job's filing.
+The hand-off runs on `oobe`'s ticks, so this path needs that job in place even though it skips the scan stage's filing.
 
-Use a fresh key anyway. `_cleanup` renames the report and `_retire_jobs` removes the cron jobs, but
-neither touches the board, so a `bootstrap-inventory-scan` card the archive step missed is still
+Use a fresh key anyway. `_cleanup` renames the report, `_retire_jobs` removes the disabled entries and `oobe` removes itself, but
+none of them touches the board, so a `bootstrap-inventory-scan` card the archive step missed is still
 there — and the board answers a repeated key by returning that card's id and spawning nothing.
 
 Filing directly is also the better option for measurement: it starts the clock at card creation
