@@ -130,7 +130,7 @@ The gateway reads the map when it starts, so restart it after every change. The 
 
    A line with `"msg":"slack connected"` names the bot user and the workspace (`team`). Under `today`, the credential broker holds the connection (`kubectl logs deploy/platform-agent-credential-proxy -n kubeagents-system`) and the Hermes listener handles the messages (`kubectl logs deploy/platform-agent-gateway -c platform-agent -n kubeagents-system`).
 
-2. DM the app (**Apps**, then the app's name, then **Messages**) with a question such as `what clusters can you see?`. The answer comes back in the DM.
+2. DM the app (**Apps**, then the app's name, then **Messages**) with a question such as `what clusters can you see?`. The answer comes back in the DM, in a thread under your question (an older release answers it top-level in the DM).
 3. If nothing comes back, check the gateway log for these lines:
 
    | Log line (`msg`)                                                                                       | Cause                                                                     | Fix                                                        |
