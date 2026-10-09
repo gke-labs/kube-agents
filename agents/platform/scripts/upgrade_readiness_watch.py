@@ -518,7 +518,23 @@ def member_key(member: dict) -> str:
     return MEMBER_KEY_SEPARATOR.join(str(member.get(k, "")) for k in MEMBER_ID_KEYS)
 
 
-def pending_targets(report: dict) -> dict[str, list[str]]:
+def canonical_member_key(member: dict, ids: dict[str, str]) -> str:
+    """The member key with the project as its learned id: a report that fell
+    back to a numbered spelling keys the same cluster the way the ledger does."""
+    canonical = dict(member)
+    canonical[MEMBER_ID_KEYS[0]] = ids.get(str(member.get(MEMBER_ID_KEYS[0], "")), member.get(MEMBER_ID_KEYS[0], ""))
+    return member_key(canonical)
+
+
+def canonicalise_members(report: dict, ids: dict[str, str]) -> None:
+    """Rewrite each member's project to its learned id in place, so every
+    reader of the envelope keys the cluster the way the ledger does."""
+    for member in report.get(MEMBERS_KEY) or []:
+        project = str(member.get(MEMBER_ID_KEYS[0], ""))
+        member[MEMBER_ID_KEYS[0]] = ids.get(project, project)
+
+
+def pending_targets(report: dict, ids: dict[str, str] | None = None) -> dict[str, list[str]]:
     """Target version -> the clusters below it, from the report's members."""
     pending: dict[str, list[str]] = {}
     for member in report.get(MEMBERS_KEY) or []:
@@ -528,7 +544,9 @@ def pending_targets(report: dict) -> dict[str, list[str]]:
         target = str(member.get(TARGET_KEY) or "").strip()
         if not VERSION_KEY_RE.fullmatch(target) or member.get(STATUS_KEY) not in BEHIND_STATUSES:
             continue
-        pending.setdefault(target, []).append(member_key(member))
+        key = canonical_member_key(member, ids or {})
+        if key not in pending.setdefault(target, []):
+            pending[target].append(key)
     return {version: sorted(keys) for version, keys in pending.items()}
 
 
@@ -727,7 +745,7 @@ def settle_from_readiness(report: dict, pending: dict[str, list[str]], ledger: d
     passed. Returns the versions left with no pending cluster, for retirement."""
     listed: dict[str, tuple[str, str]] = {}
     for member in report.get(MEMBERS_KEY) or []:
-        listed[member_key(member)] = (str(member.get(STATUS_KEY) or ""), str(member.get(TARGET_KEY) or "").strip())
+        listed[canonical_member_key(member, ledger.get(PROJECT_IDS_KEY) or {})] = (str(member.get(STATUS_KEY) or ""), str(member.get(TARGET_KEY) or "").strip())
     emptied: list[str] = []
     for version in list(pending):
         kept = [
@@ -818,7 +836,13 @@ def versions_by_project(names: list[str], deadline: float, last_runs: dict[str, 
     def keyed(project: str) -> str:
         return ids.get(project, project)
 
+    # Two spellings of one project (a number and its id) run once: the first
+    # spelling the order reaches runs, the other is the same project.
+    tabled: set[str] = set()
     for project in ordered_projects(names, last_runs):
+        if keyed(project) in tabled:
+            continue
+        tabled.add(keyed(project))
         remaining = deadline - time.monotonic()
         if remaining < MIN_PROJECT_RUN_SECONDS:
             unrun.append(project)
@@ -848,7 +872,12 @@ def versions_by_project(names: list[str], deadline: float, last_runs: dict[str, 
         last_runs[project] = iso(now)
         resolved = envelope[ENVELOPE_REPORT_KEY].get(REPORT_PROJECTS_KEY) or []
         if len(resolved) == 1 and isinstance(resolved[0], str) and resolved[0]:
-            ids[project] = resolved[0]
+            # A learned id stands: on a day `projects describe` fails the script
+            # falls back to the spelling itself, which must not replace the id.
+            if resolved[0] != project:
+                ids[project] = resolved[0]
+            elif project not in ids:
+                ids[project] = project
         merge_envelope(merged, envelope)
     if failed and len(failed) == len(names):
         # No project read at all is the sandbox or the credential, not a
@@ -1038,9 +1067,12 @@ def tick(dry_run: bool = False) -> list[str]:
     names = projects()
     deadline = started + TICK_BUDGET_SECONDS
     versions = versions_by_project(names, started + TABLE_BUDGET_SECONDS, ledger[TABLE_RUNS_KEY], now, ledger[PROJECT_IDS_KEY])
+    canonicalise_members(versions[ENVELOPE_REPORT_KEY], ledger[PROJECT_IDS_KEY])
     read_errors = versions[ENVELOPE_REPORT_KEY].get(ERRORS_KEY) or []
-    complete = versions.get(ENVELOPE_EXIT_KEY) == EXIT_OK and not read_errors
-    pending = pending_targets(versions[ENVELOPE_REPORT_KEY])
+    # A table is partial when a read failed; the script's exit code alone (it
+    # exits 1 on a project it had to spell by number) does not make it one.
+    complete = not read_errors
+    pending = pending_targets(versions[ENVELOPE_REPORT_KEY], ledger[PROJECT_IDS_KEY])
     prune_read_projects(ledger, pending, names, read_errors, ledger[PROJECT_IDS_KEY])
     carry_forward_unlisted(pending, ledger, read_errors)
     if dry_run:
@@ -1064,6 +1096,7 @@ def tick(dry_run: bool = False) -> list[str]:
     announced(ledger)[ANNOUNCED_PARTIAL_KEY] = signature
     if due:
         readiness, failures, unfinished = readiness_by_project(pending, due, deadline, ledger[READINESS_RUNS_KEY], now, ledger[PROJECT_IDS_KEY])
+        canonicalise_members(readiness[ENVELOPE_REPORT_KEY], ledger[PROJECT_IDS_KEY])
         for version in settle_from_readiness(readiness[ENVELOPE_REPORT_KEY], pending, ledger):
             if version in due and version in ledger[TARGETS_KEY]:
                 del ledger[TARGETS_KEY][version]
