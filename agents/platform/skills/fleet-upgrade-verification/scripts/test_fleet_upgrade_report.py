@@ -350,6 +350,24 @@ class ProjectFailureTest(unittest.TestCase):
         self.assertEqual(rc, report.EXIT_OK)
         self.assertNotIn("no cluster matched", out.getvalue())
 
+    def test_a_cluster_spec_with_an_empty_half_is_a_usage_error_before_any_read(self):
+        target = "1.31.0-gke.1"
+        fake = FakeGcloud({"p": [cluster("prod", "us-central1", target, [("p", target)])]}, {})
+        for spec in ("/prod", "prod/", "", "us-central1/prod/extra"):
+            with self.subTest(spec=spec):
+                err = io.StringIO()
+                with patch.object(report, "run_cmd", fake), redirect_stdout(io.StringIO()), redirect_stderr(err):
+                    rc = report.main(["--project", "p", "--cluster", spec, "--target-version", target])
+                self.assertEqual(rc, report.EXIT_USAGE)
+                # The line names the spec as typed, slash and all.
+                self.assertIn(f"--cluster {spec!r} is neither", err.getvalue())
+                self.assertEqual(fake.calls, [])
+        # `/prod` is not the bare form: a direct caller is refused too, rather
+        # than handed `prod` in every location.
+        with patch.object(report, "run_cmd", fake), self.assertRaises(ValueError):
+            report.build_report(["p"], target, clusters=["/prod"])
+        self.assertEqual(fake.calls, [])
+
     def test_rollout_in_progress_beside_cluster_is_a_usage_error_before_any_read(self):
         target = "1.31.0-gke.1"
         fake = FakeGcloud({"p": [cluster("prod", "us-central1", target, [("p", target)])]}, {})

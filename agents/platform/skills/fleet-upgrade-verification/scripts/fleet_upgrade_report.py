@@ -254,6 +254,13 @@ EXIT_USAGE = 2
 # reads nor writes: the pair is refused, as `--at` without `--readiness` is, rather than
 # accepted and ignored.
 ROLLOUT_FLAG_NEEDS_FULL_READ = "--rollout-in-progress needs a full read: a --cluster run neither reads nor writes the rollout record"
+# `--cluster` takes `<location>/<name>` or a bare name and no third form. A spec
+# with an empty half (`/prod`, `prod/`) is refused before any read: `/prod` would
+# otherwise partition to the bare form and match `prod` in every location, the
+# opposite of what its slash says, and the unmatched-spec line would then name
+# a spec the operator did not type.
+CLUSTER_SPEC_SEPARATOR = "/"
+INVALID_CLUSTER_SPEC = "--cluster {spec!r} is neither <location>/<name> nor a bare name: give a location before the slash and a name after it, or the name alone"
 
 
 def run_cmd(cmd: list[str], timeout: int = GCLOUD_TIMEOUT_SECONDS, env: dict | None = None) -> tuple[int, str, str]:
@@ -639,6 +646,18 @@ def assess_readiness(cluster: dict, member: dict, items: list | None, read_error
     }
 
 
+def parse_cluster_spec(spec: str) -> tuple[str, str] | None:
+    """`(location, name)` for `<location>/<name>`, `("", name)` for a bare name, and
+    None for anything else: an empty spec, an empty half, or a second slash, which
+    no GKE location or cluster name carries."""
+    location, slash, name = spec.partition(CLUSTER_SPEC_SEPARATOR)
+    if not slash:
+        return ("", spec) if spec else None
+    if not location or not name or CLUSTER_SPEC_SEPARATOR in name:
+        return None
+    return location, name
+
+
 def _wanted(cluster: dict, wanted: set[tuple[str, str]]) -> list[tuple[str, str]]:
     """Every `--cluster` spec this cluster satisfies: its qualified form, its bare form,
     or both when the caller named it both ways. Empty when it was not asked for."""
@@ -657,7 +676,16 @@ def build_report(projects: list[str], explicit_target: str | None, readiness_opt
     """
     # `<location>/<name>` pins one cluster; a bare name admits that name in
     # every location of the projects (GKE names are unique per location).
-    wanted = {spec.partition("/")[::2] if "/" in spec else ("", spec) for spec in clusters} if clusters else None
+    # `main` refuses any other form before it gets here; a direct caller is
+    # refused the same way rather than matched against every location.
+    wanted: set[tuple[str, str]] | None = None
+    if clusters:
+        wanted = set()
+        for spec in clusters:
+            parsed = parse_cluster_spec(spec)
+            if parsed is None:
+                raise ValueError(INVALID_CLUSTER_SPEC.format(spec=spec))
+            wanted.add(parsed)
     matched: set[tuple[str, str]] = set()
     cache = ServerConfigCache()
     members: list[dict] = []
@@ -1066,7 +1094,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Per-member GKE version table against a target version.")
     parser.add_argument("--project", action="append", help="GCP project to enumerate; repeatable. Defaults to the fleet's configured projects.")
     parser.add_argument("--target-version", help="Target for every member, e.g. 1.31.4-gke.1183000. Default: each cluster's channel defaultVersion.")
-    parser.add_argument("--cluster", action="append", help="Cluster to grade, as <location>/<name> or a bare name; repeatable. With it, other clusters in the projects are skipped and the rollout record is neither read nor written (a narrowed read is not a rollout observation). Default: every cluster.")
+    parser.add_argument("--cluster", action="append", help="Cluster to grade, as <location>/<name> (both halves) or a bare name; repeatable. With it, other clusters in the projects are skipped and the rollout record is neither read nor written (a narrowed read is not a rollout observation). Default: every cluster.")
     parser.add_argument("--output", help="Path to write the report as JSON.")
     parser.add_argument("--state-dir", default=DEFAULT_STATE_DIR, help=f"Directory holding one record per target from the previous run (default: {DEFAULT_STATE_DIR}).")
     parser.add_argument("--rollout-in-progress", action="store_true", help="Assert a rollout is under way, so an unchanged, behind member is flagged stalled even when no other member moved.")
@@ -1094,6 +1122,10 @@ def main(argv: list[str] | None = None) -> int:
     if args.cluster and args.rollout_in_progress:
         sys.stderr.write(ROLLOUT_FLAG_NEEDS_FULL_READ + "\n")
         return EXIT_USAGE
+    for spec in args.cluster or []:
+        if parse_cluster_spec(spec) is None:
+            sys.stderr.write(INVALID_CLUSTER_SPEC.format(spec=spec) + "\n")
+            return EXIT_USAGE
 
     listing_errors: list[str] = []
     projects = get_target_projects(args.project, listing_errors)
