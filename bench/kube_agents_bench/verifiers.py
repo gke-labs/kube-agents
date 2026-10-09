@@ -1214,9 +1214,14 @@ _NO_WORKER_TERMINAL_CALLS_REASON = (
     "has no ordered commands and results to read"
 )
 _MAX_NAMED_COMMANDS = 5
+# How much of a named command the reason quotes.
+_SHOWN_COMMAND_CHARS = 120
 # The hermes tool a worker's shell command is recorded under, and its argument.
 _TERMINAL_TOOL = "terminal"
 _COMMAND_ARG = "command"
+# The head of a ``"command"`` literal the pod clipped before its closing quote:
+# what is there is still the command's start, which is where its verb is.
+_CLIPPED_COMMAND_HEAD_RE = re.compile(r'"command"\s*:\s*"((?:[^"\\]|\\.)*)')
 
 
 def _worker_terminal_calls(trajectory: list[Any]) -> list[tuple[str, str]]:
@@ -1227,8 +1232,9 @@ def _worker_terminal_calls(trajectory: list[Any]) -> list[tuple[str, str]]:
     once sorted on the ``at`` tag; the sort is stable and an entry without
     one keeps its place at the front. An argument object clipped in the pod
     arrives as ``{"raw": text}`` and the command is read out of the text, as
-    ``tool_called`` reads its arguments; a command clipped past that is not
-    visible here. A result that is not text reads as empty.
+    ``tool_called`` reads its arguments, and one clipped inside the command
+    itself keeps the head that survived, which carries the verb. A result
+    that is not text reads as empty.
     """
     calls: list[tuple[float, str, str]] = []
     for entry in trajectory:
@@ -1238,7 +1244,15 @@ def _worker_terminal_calls(trajectory: list[Any]) -> list[tuple[str, str]]:
         if not isinstance(args, dict):
             continue
         if set(args) == {"raw"} and isinstance(args["raw"], str):
-            args = _clipped_string_args(args["raw"], {_COMMAND_ARG: ""})
+            raw = args["raw"]
+            args = _clipped_string_args(raw, {_COMMAND_ARG: ""})
+            if _COMMAND_ARG not in args:
+                head = _CLIPPED_COMMAND_HEAD_RE.search(raw)
+                if head is not None:
+                    try:
+                        args = {_COMMAND_ARG: json.loads('"' + head.group(1) + '"')}
+                    except ValueError:
+                        args = {_COMMAND_ARG: head.group(1)}
         command = args.get(_COMMAND_ARG)
         if not isinstance(command, str):
             continue
@@ -1354,7 +1368,7 @@ class WorkerCommandsVerifier(BaseVerifier):
                 graded = commands[first + 1 :]
                 window = (
                     f"; {len(graded)} after the first result matching "
-                    f"{self.after_result_pattern!r} ({commands[first][:120]!r})"
+                    f"{self.after_result_pattern!r} ({commands[first][:_SHOWN_COMMAND_CHARS]!r})"
                 )
         missing = [
             p for p in self.required_patterns
@@ -1372,7 +1386,7 @@ class WorkerCommandsVerifier(BaseVerifier):
                 )
             if hits:
                 shown = "; ".join(
-                    f"{p!r} matched {c[:120]!r}" for p, c in hits[:_MAX_NAMED_COMMANDS]
+                    f"{p!r} matched {c[:_SHOWN_COMMAND_CHARS]!r}" for p, c in hits[:_MAX_NAMED_COMMANDS]
                 )
                 more = f" (+{len(hits) - _MAX_NAMED_COMMANDS} more)" if len(hits) > _MAX_NAMED_COMMANDS else ""
                 parts.append(f"forbidden pattern(s) matched worker commands: {shown}{more}")

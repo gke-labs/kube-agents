@@ -228,7 +228,8 @@ case it runs), `worker_commands` (regular expressions over the terminal commands
 the delegated workers ran, read from each card's worker log before the harness
 purges it; with `after_result_pattern` the forbidden set applies only to the commands
 after the first whose result matched, read from the workers' `terminal` calls in the
-trajectory, which carry results), `worker_agents` (regular expressions every one of which must match the
+trajectory, which carry results; a trajectory with no tagged `terminal` call is then `status: "error"`
+where the log path would grade an empty list), `worker_agents` (regular expressions every one of which must match the
 profile at least one delegated worker ran as, read from the tags the harness puts on the
 workers' trajectory entries), `replay_card` (the status and comments of the card a
 card-wake replay planted, read before the harness archives it), and `reply_is_silent`
