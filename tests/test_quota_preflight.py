@@ -1403,11 +1403,27 @@ class DocumentedFootprintTest(unittest.TestCase):
         nats_mem = self._extract_match(
             r'a2aNATSMemoryRequest\s*=\s*"([^"]+)"', manifests_src, "a2aNATSMemoryRequest"
         )
+        nats_replicas = int(
+            self._extract_match(
+                r'buildA2ANATSStatefulSet.*?Replicas:\s*ptr\.To\(int32\((\d+)\)\)',
+                manifests_src,
+                "NATS replicas",
+                flags=re.DOTALL,
+            )
+        )
         gateway_cpu = self._extract_match(
             r'a2aGatewayCPURequest\s*=\s*"([^"]+)"', manifests_src, "a2aGatewayCPURequest"
         )
         gateway_mem = self._extract_match(
             r'a2aGatewayMemoryRequest\s*=\s*"([^"]+)"', manifests_src, "a2aGatewayMemoryRequest"
+        )
+        gateway_replicas = int(
+            self._extract_match(
+                r'buildA2AGatewayDeployment.*?Replicas:\s*ptr\.To\(int32\((\d+)\)\)',
+                manifests_src,
+                "gateway replicas",
+                flags=re.DOTALL,
+            )
         )
         verifier_cpu = self._extract_match(
             r'a2aVerifierCPURequest\s*=\s*"([^"]+)"', manifests_src, "a2aVerifierCPURequest"
@@ -1443,6 +1459,11 @@ class DocumentedFootprintTest(unittest.TestCase):
         )
 
         console_src = _A2A_CONSOLE.read_text()
+        console_replicas = int(
+            self._extract_match(
+                r'Replicas:\s*ptr\.To\(int32\((\d+)\)\)', console_src, "console replicas"
+            )
+        )
         console_cpu = self._extract_match(
             r'a2aConsoleCPURequest\s*=\s*"([^"]+)"', console_src, "a2aConsoleCPURequest"
         )
@@ -1492,22 +1513,28 @@ class DocumentedFootprintTest(unittest.TestCase):
         gib = 1024**3
 
         # Compute standing delta across additional pods:
-        # 1 NATS + callout_replicas + verifier_replicas + 1 gateway + 1 console = 7 additional pods
-        additional_pods = 1 + callout_replicas + verifier_replicas + 1 + 1
+        # NATS + callout + verifier + gateway + console
+        additional_pods = (
+            nats_replicas
+            + callout_replicas
+            + verifier_replicas
+            + gateway_replicas
+            + console_replicas
+        )
         standing_cpu_m = (
-            parse_cpu_m(nats_cpu)
+            nats_replicas * parse_cpu_m(nats_cpu)
             + callout_replicas * parse_cpu_m(callout_cpu)
             + verifier_replicas * parse_cpu_m(verifier_cpu)
-            + parse_cpu_m(gateway_cpu)
-            + parse_cpu_m(console_cpu)
+            + gateway_replicas * parse_cpu_m(gateway_cpu)
+            + console_replicas * parse_cpu_m(console_cpu)
             + parse_cpu_m(bridge_cpu)
         )
         standing_mem_bytes = (
-            parse_mem_bytes(nats_mem)
+            nats_replicas * parse_mem_bytes(nats_mem)
             + callout_replicas * parse_mem_bytes(callout_mem)
             + verifier_replicas * parse_mem_bytes(verifier_mem)
-            + parse_mem_bytes(gateway_mem)
-            + parse_mem_bytes(console_mem)
+            + gateway_replicas * parse_mem_bytes(gateway_mem)
+            + console_replicas * parse_mem_bytes(console_mem)
             + parse_mem_bytes(bridge_mem)
         )
         standing_cpu_vcpu = math.floor((standing_cpu_m / 1000) * 10 + 0.5) / 10
@@ -1551,15 +1578,21 @@ class DocumentedFootprintTest(unittest.TestCase):
         self.assertRegex(page, worker_clause)
 
         # Assert JetStream persistent volume claim:
-        self.assertIn(f"{jetstream_gib} GiB JetStream persistent volume claim", page)
+        nats_claim_prose = (
+            f"a {jetstream_gib} GiB JetStream persistent volume claim"
+            if nats_replicas == 1
+            else f"{nats_replicas} {jetstream_gib} GiB JetStream persistent volume claims"
+        )
+        self.assertIn(nats_claim_prose, page)
 
         # Mode-next PVC total: the stock claims from the chart footprint plus the
-        # JetStream claim, so the expected figure does not come from the page itself.
+        # JetStream claims (one per NATS StatefulSet replica stamped by VolumeClaimTemplates),
+        # so the expected figure does not come from the page itself.
         storage = yaml.safe_load(_FOOTPRINT.read_text())["operatorRendered"]["storage"]
         stock_claims = int(storage["persistentVolumeClaims"])
         stock_gib = int(storage["storageBytesRequest"]) // gib
-        next_total_claims = stock_claims + 1
-        next_total_gib = stock_gib + jetstream_gib
+        next_total_claims = stock_claims + nats_replicas
+        next_total_gib = stock_gib + (nats_replicas * jetstream_gib)
         self.assertIn(
             f"{next_total_claims} claims totalling {next_total_gib} GiB of `requests.storage`",
             page,
