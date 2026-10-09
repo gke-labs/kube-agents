@@ -153,7 +153,7 @@ AGENT_HOME: str = "/opt/data"
 MANAGED_CONFIG: str = "/etc/hermes/config.yaml"
 # The front door's overlay, merged into $AGENT_HOME/config.yaml at startup. It carries
 # what the operator owns for the default profile but must not pin pod-wide: an
-# untargeted plugin's enablement and non-gateway config, and the board's limits.
+# untargeted plugin's enablement and non-gateway config, and tuning.default's limits.
 DEFAULT_OVERLAY: str = "profile-default.overlay.yaml"
 
 # Emitted by the plugin's __init__.py and plugin.py. Assertions anchor on these markers
@@ -1486,10 +1486,11 @@ spec:
         log('Verified targetProfile "default" is rejected.')
 
         # Per-run tuning is opt-in: present means overlays, absent means Hermes' own
-        # defaults. maxInProgress is the exception — absent means the operator's cap,
-        # which is asserted after the removal below. 1 is chosen here precisely because
-        # it differs from that cap, so the assertion proves the override rather than
-        # matching what would be rendered anyway.
+        # defaults. maxInProgress is the exception — it is pinned in the managed scope
+        # either way, and absent means the operator's cap, which is asserted after the
+        # removal below. 1 is chosen here precisely because it differs from that cap, so
+        # the assertion proves the override rather than matching what would be rendered
+        # anyway.
         run_kubectl([
             "patch", "platformagent", "platform-agent", "-n", NAMESPACE, "--type=merge",
             "-p", '{"spec":{"harness":{"tuning":{"maxInProgress":1,'
@@ -1498,12 +1499,12 @@ spec:
         ])
         reconcile_and_wait()
 
-        assert "max_in_progress: 1" in get_overlay_yaml(DEFAULT_OVERLAY), (
-            "maxInProgress should reach the default profile's overlay"
+        assert "max_in_progress: 1" in get_platform_configmap_yaml(), (
+            "maxInProgress should be pinned in the managed scope"
         )
-        assert "max_in_progress" not in get_platform_configmap_yaml(), (
-            "the board cap is a front-door setting and must not be pinned pod-wide, "
-            "where it would cap every specialist's board too"
+        assert "max_in_progress" not in get_overlay_yaml(DEFAULT_OVERLAY), (
+            "the board cap is pinned in the managed scope and must not also ride the "
+            "default overlay: nothing the operator renders may appear in both"
         )
         tuned = get_overlay_yaml(overlay_key)
         assert "max_turns: 200" in tuned, f"platform tuning should reach its overlay:\n{tuned}"
@@ -1526,23 +1527,22 @@ spec:
         assert "profileclass-cluster" not in keys, (
             f"removing tuning must drop the cluster class overlay, got keys:\n{keys}"
         )
-        assert "max_in_progress" not in get_overlay_yaml(DEFAULT_OVERLAY), (
-            "removing tuning must drop the board cap from the default overlay"
-        )
-        # Dispatch concurrency does NOT revert to Hermes' uncapped behaviour. The operator
-        # stops overriding it, and the cap committed in agents/chat/config.yaml takes over
-        # — which is why this reads the agent's own file rather than the ConfigMap.
+        # Dispatch concurrency does NOT revert to Hermes' uncapped behaviour, nor keep
+        # the removed override. The pin falls back to the operator's default, and it is
+        # read where the agent reads it: the managed scope mounted in the pod, which
+        # Hermes overlays on the agent's own config.yaml at every load. That file may
+        # still say 1, or whatever the volume was seeded with, and the pin wins anyway.
         # Uncapped is the state that lets a burst of cards spawn a worker process each
         # until the OOM killer takes them, and a removed CR field must not be a way back
         # into it.
         capped = agent_exec_until(
-            f"grep -q 'max_in_progress: 6' {AGENT_HOME}/config.yaml && echo CAPPED || echo OPEN",
+            f"grep -q 'max_in_progress: 6' {MANAGED_CONFIG} && echo CAPPED || echo OPEN",
             "CAPPED",
         )
         assert "CAPPED" in capped, (
-            f"removing tuning must fall back to the image's dispatch cap, not to uncapped: {capped}"
+            f"removing tuning must fall back to the operator's dispatch cap, not to uncapped: {capped}"
         )
-        log("Verified tuning removal drops the overlays and falls back to the image's dispatch cap.")
+        log("Verified tuning removal drops the overlays and falls back to the operator's dispatch cap.")
 
         # Withdrawing the plugin has to undo both halves. A stale link would leave a
         # dangling entry in the profile's plugins dir, and a stale plugins.enabled entry
