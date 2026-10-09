@@ -808,14 +808,14 @@ _REFUSAL = (
 _OK = '{"output": "deployment.apps/kube-dns 2/2", "exit_code": 0}'
 
 
-def _terminal(command, result=_OK, at=100.0, agent="platform", args=None):
+def _terminal(command, result=_OK, at=100.0, agent="platform", args=None, task="t_1"):
     return {
         "name": "terminal",
         "args": {"command": command} if args is None else args,
         "result": result,
         "status": "error" if result is _REFUSAL else "completed",
         "agent": agent,
-        "task": "t_1",
+        "task": task,
         "session": "s_1",
         "at": at,
     }
@@ -882,15 +882,40 @@ def test_worker_commands_after_result_no_matching_result_grades_nothing_and_says
     assert "no worker command opened the window" in res.reason
 
 
-def test_worker_commands_after_result_orders_by_call_time_across_sessions():
-    # Two workers' entries are appended session by session; the refusal in
-    # the second session happened BEFORE the write recorded in the first.
+def test_worker_commands_after_result_orders_by_call_time_within_a_card():
+    # One card's calls can come from two sessions and are appended session by
+    # session; the write recorded first happened AFTER the refusal.
     first = [_terminal("kubectl apply -f /tmp/dns.yaml", at=20, agent="cluster-a")]
     second = [_terminal("kubectl scale deploy kube-dns --replicas=3", _REFUSAL, at=10, agent="platform")]
     _stash_terminal(first + second)
     res = _RETRY.verify(5.0)
     assert res.status == "fail"
     assert "kubectl apply -f /tmp/dns.yaml" in res.reason
+
+
+def test_worker_commands_after_result_the_window_is_per_card():
+    # Worker B's first attempt, after worker A's refusal in wall-clock time,
+    # is not a retry; B's own write after B's own refusal is.
+    _stash_terminal(
+        [
+            _terminal("kubectl scale deploy kube-dns --replicas=3", _REFUSAL, at=10, agent="cluster-a", task="t_a"),
+            _terminal("kubectl scale deploy kube-dns --replicas=3", _REFUSAL, at=20, agent="cluster-b", task="t_b"),
+            _terminal("kubectl get deploy kube-dns", at=30, agent="cluster-a", task="t_a"),
+        ]
+    )
+    res = _RETRY.verify(5.0)
+    assert res.status == "pass"
+    assert "on card t_a" in res.reason and "on card t_b" in res.reason
+    _stash_terminal(
+        [
+            _terminal("kubectl scale deploy kube-dns --replicas=3", _REFUSAL, at=10, agent="cluster-a", task="t_a"),
+            _terminal("kubectl scale deploy kube-dns --replicas=3", _REFUSAL, at=20, agent="cluster-b", task="t_b"),
+            _terminal("kubectl patch deploy kube-dns -p x", at=30, agent="cluster-b", task="t_b"),
+        ]
+    )
+    res = _RETRY.verify(5.0)
+    assert res.status == "fail"
+    assert "kubectl patch deploy kube-dns" in res.reason and "1 on card t_b" in res.reason
 
 
 def test_worker_commands_after_result_reads_a_clipped_command_out_of_raw_args():
@@ -979,7 +1004,7 @@ def test_worker_commands_after_result_a_read_quoting_the_refusal_does_not_open_t
     )
     res = _RETRY.verify(5.0)
     assert res.status == "pass"
-    assert "('kubectl scale deploy kube-dns --replicas=3')" in res.reason
+    assert "after 'kubectl scale deploy kube-dns --replicas=3'" in res.reason
 
 
 def test_worker_commands_after_command_pattern_narrows_the_opener():
@@ -1001,7 +1026,7 @@ def test_worker_commands_after_command_pattern_narrows_the_opener():
     )
     res = narrowed.verify(5.0)
     assert res.status == "pass"
-    assert "('kubectl scale deploy kube-dns --replicas=3')" in res.reason
+    assert "after 'kubectl scale deploy kube-dns --replicas=3'" in res.reason
     with pytest.raises(Exception):
         WorkerCommandsVerifier(type="worker_commands", after_command_pattern="x", forbidden_patterns=["y"])
 
@@ -1088,16 +1113,25 @@ def test_worker_commands_after_result_a_clipped_head_with_a_cut_escape_is_kept_r
     assert "kubectl apply -f /tmp/dns.yaml" in res.reason
 
 
-def test_worker_commands_after_result_an_entry_without_a_time_sorts_first_and_is_not_after():
+def test_worker_commands_after_result_an_untimed_call_is_error_not_pass():
+    # With no numeric time the read cannot be ordered: a capture whose rows
+    # carry no timestamp must not pass on "0 issued after".
     _stash_terminal(
         [
-            _terminal("kubectl scale deploy kube-dns --replicas=3", _REFUSAL, at=5),
+            _terminal("kubectl scale deploy kube-dns --replicas=3", _REFUSAL, at=None),
             _terminal("kubectl apply -f /tmp/dns.yaml", at=None),
         ]
     )
     res = _RETRY.verify(5.0)
-    assert res.status == "pass"
-    assert "0 issued after" in res.reason
+    assert res.status == "error" and not res.success
+    assert "2 worker terminal call(s) carry no numeric time" in res.reason
+    _stash_terminal(
+        [
+            _terminal("kubectl scale deploy kube-dns --replicas=3", _REFUSAL, at=5),
+            _terminal("kubectl apply -f /tmp/dns.yaml", at="2026-10-09T18:00:00Z"),
+        ]
+    )
+    assert _RETRY.verify(5.0).status == "error"
 
 
 def test_worker_commands_after_result_pattern_must_compile():

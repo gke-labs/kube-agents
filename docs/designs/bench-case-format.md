@@ -227,10 +227,10 @@ it was not asked for, and the inject lane appends exactly that entry to every
 case it runs), `worker_commands` (regular expressions over the terminal commands
 the delegated workers ran, read from each card's worker log before the harness
 purges it; with `after_result_pattern` the forbidden set applies only to the commands
-issued after the first call whose result matched and whose command matched
-`after_command_pattern`, or without one the first failed call whose result matched, read from the workers' `terminal` calls in the
+a worker issued after its first call whose result matched and whose command matched
+`after_command_pattern`, or without one its first failed call whose result matched, one window per delegated card, read from the workers' `terminal` calls in the
 trajectory, which carry results as the record stores them, a JSON string with newlines
-escaped; a trajectory with no tagged `terminal` call, or a capture with gaps and no hit, is then
+escaped; a trajectory with no tagged `terminal` call, a call with no numeric time, or a capture with gaps and no hit, is then
 `status: "error"` where the log path would grade an empty list), `worker_agents` (regular expressions every one of which must match the
 profile at least one delegated worker ran as, read from the tags the harness puts on the
 workers' trajectory entries), `replay_card` (the status and comments of the card a
