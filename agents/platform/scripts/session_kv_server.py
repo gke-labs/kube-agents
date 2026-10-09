@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import hmac
+import importlib.util
 import json
 import os
 import re
@@ -17,7 +18,8 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, NamedTuple, Optional, Sequence
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import closing
+from contextlib import ExitStack, closing
+from pathlib import Path
 
 import logging
 
@@ -25,6 +27,7 @@ from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException
 from agent_common_server import _run_env, CONFIG_PATH, DOTENV_PATH
 import chat_notify
 import findings_queue
+import gitops_workspace
 import slack_audit_report
 import slack_blocks_post
 import slack_presenter
@@ -73,6 +76,61 @@ LEDGER_MAX_ROWS = int(os.getenv("SESSION_KV_LEDGER_MAX_ROWS", "200000"))
 # the failing container and the leading predicate, which is more than the
 # reader shows.
 LEDGER_MESSAGE_MAX_CHARS = int(os.getenv("SESSION_KV_LEDGER_MESSAGE_MAX_CHARS", "512"))
+
+# The read-only activity feed: `GET /v1/intercepted-events`, `GET /v1/tasks`,
+# `GET /v1/tasks/{id}` and `GET /v1/sessions/{id}/tasks`. It exists for an
+# install with no chat platform, where the triage report otherwise lives only
+# in the kanban board and the ledger has no reader but the daily recap.
+#
+# The active board is resolved via `gitops_workspace.board_path()` — asking
+# Hermes' `hermes_cli.kanban_db.kanban_db_path()` first (which respects
+# `HERMES_KANBAN_DB` and `kanban/current`) and falling back to
+# `<agent_home>/kanban.db`. `KANBAN_DB_PATH` is a test hook (`None` in
+# production) so unit tests can point the routes at a temporary SQLite file.
+KANBAN_DB_PATH: Optional[str] = None
+FEED_DB_BUSY_TIMEOUT_SECONDS = 5.0
+SQLITE_INT64_MAX = (1 << 63) - 1
+# Page sizes. The defaults suit a page that polls; the ceilings stop one
+# request from serialising the whole ledger (LEDGER_MAX_ROWS rows) or every
+# task's full report in one response.
+FEED_EVENTS_DEFAULT_LIMIT = 50
+FEED_EVENTS_MAX_LIMIT = 500
+FEED_TASKS_DEFAULT_LIMIT = 50
+FEED_TASKS_MAX_LIMIT = 200
+# Per-task child rows `GET /v1/tasks/{id}` returns, the same ceilings the admin
+# console's `task_detail` applies to the same tables.
+TASK_DETAIL_MAX_RUNS = 100
+TASK_DETAIL_MAX_EVENTS = 500
+TASK_DETAIL_MAX_COMMENTS = 200
+TASK_DETAIL_MAX_STEPS = 100
+TASK_STEP_ROW_MULTIPLIER = 2
+TASK_STEP_PREVIEW_MAX_CHARS = 240
+TASK_STEP_DETAIL_MAX_CHARS = 4000
+# The user prompt the kanban dispatcher starts a worker session with
+# (`hermes -p <profile> chat -q "work kanban task <id>"`). Used to map a card
+# to its worker session in the profile's `state.db` when `task_runs.metadata`
+# does not record `worker_session_id`.
+WORKER_PROMPT_PREFIX = "work kanban task "
+HERMES_JSON_CONTENT_PREFIX = "\x00json:"
+HERMES_STATE_DB_FILENAME = "state.db"
+WORKER_STEP_WITHHELD = "[withheld: redactor unavailable]"
+_REDACTOR_CANDIDATES = (
+    Path("/opt/defaults/plugins/common/redactor.py"),
+    Path(__file__).resolve().parents[2] / "chat" / "defaults" / "plugins" / "common" / "redactor.py",
+)
+_AUDIT_REDACTOR: Any = None
+_AUDIT_REDACTOR_LOADED = False
+# The `status` a feed row reports, derived from what the ledger stored. The
+# first three are the inject route's own answers. `undelivered` is the fourth
+# outcome the ledger can hold on an install with chat enabled: injected, then
+# the chat post failed and `mark_delivery_failed` reset `notified` and wrote
+# `delivery_error`.
+FEED_STATUS_INJECTED = "injected"
+FEED_STATUS_FILTERED = "filtered"
+FEED_STATUS_SUPPRESSED = "suppressed"
+FEED_STATUS_UNDELIVERED = "undelivered"
+# The severity the inject route filters out of chat (see `inject_message`).
+FEED_FILTERED_SEVERITY = "Info"
 
 # Deliberately not API_SERVER_KEY. That value is the loopback sentinel
 # `cluster-internal-trusted` — a marker, not a secret — so reusing it here would
@@ -651,22 +709,31 @@ def init_db() -> None:
                     occurrences INTEGER NOT NULL DEFAULT 1,
                     notified    INTEGER NOT NULL DEFAULT 0,
                     delivery_error TEXT NOT NULL DEFAULT '',
+                    session_id  TEXT NOT NULL DEFAULT '',
                     created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
                 """
             )
-            # No ALTER TABLE migration accompanies the `cluster` and
-            # `delivery_error` columns: this table has never been in a release,
-            # so the only databases carrying an older shape are pre-release dev
-            # installs. `DROP TABLE intercepted_events` on one of those is the
-            # fix, and it is mandatory rather than a tidy-up. Skipping it is
-            # silent in both directions and worst on `cluster`, which
-            # `record_intercepted_event` names in every INSERT: each write
-            # raises `no such column`, the blanket except below the call
-            # swallows it, and the table stays empty forever. The recap reads
-            # that shape as a read failure rather than a quiet day, which is
-            # the only warning the condition produces. A missing
-            # `delivery_error` costs only the write-back, leaving an
+            # `session_id` arrived after `intercepted_events` first shipped in
+            # 0.2.0, so released databases lack it and `init_db` adds it with
+            # `ALTER TABLE` to preserve existing ledger rows (additive and
+            # defaulted, so earlier rows read back with '').
+            ledger_columns = {row[1] for row in conn.execute("PRAGMA table_info(intercepted_events)")}
+            if "session_id" not in ledger_columns:
+                conn.execute("ALTER TABLE intercepted_events ADD COLUMN session_id TEXT NOT NULL DEFAULT ''")
+            # By contrast, no ALTER TABLE migration accompanies `cluster`,
+            # `object_uid`, or `delivery_error`: those columns were added
+            # before the table first shipped in 0.2.0, so the only databases
+            # missing them are pre-0.2.0 dev installs that ran an intermediate
+            # commit of #426. `DROP TABLE intercepted_events` on one of those
+            # pre-release dev installs is the fix, and it is mandatory rather
+            # than a tidy-up. Skipping it is silent in both directions and
+            # worst on `cluster`, which `record_intercepted_event` names in
+            # every INSERT: each write raises `no such column`, the blanket
+            # except below the call swallows it, and the table stays empty
+            # forever. The recap reads that shape as a read failure rather than
+            # a quiet day, which is the only warning the condition produces. A
+            # missing `delivery_error` costs only the write-back, leaving an
             # undelivered alert recorded as delivered.
             # `session_management.md`, "A pre-release table, and no migration",
             # is the operator-facing version.
@@ -753,8 +820,15 @@ def record_intercepted_event(
     severity: str,
     occurrences: int,
     notified: bool,
+    session_id: str = "",
 ) -> Optional[int]:
     """Append one forwarded event to the ledger the daily recap reads.
+
+    `session_id` is the session the inject arrived on, which is also the id
+    `trigger_agent_troubleshooter` opens the gateway session under, so the
+    triage card the front door files carries it as `tasks.session_id`. It is
+    what joins a ledger row to its report on `GET /v1/sessions/{id}/tasks`.
+    Defaulted for callers that have none; a row without one is still counted.
 
     `cluster` is recorded because this server is shared: one session KV
     database backs every cluster profile in the pod, which is the same reason
@@ -791,8 +865,9 @@ def record_intercepted_event(
             with conn:
                 cursor = conn.execute(
                     "INSERT INTO intercepted_events "
-                    "(cluster, namespace, workload, object_uid, object_kind, reason, message, severity, occurrences, notified) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    "(cluster, namespace, workload, object_uid, object_kind, reason, message, severity, "
+                    "occurrences, notified, session_id) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         cluster,
                         namespace,
@@ -804,6 +879,7 @@ def record_intercepted_event(
                         severity,
                         int(occurrences),
                         1 if notified else 0,
+                        session_id,
                     ),
                 )
                 return cursor.lastrowid
@@ -1150,6 +1226,30 @@ def enabled_chat_platforms() -> list[str]:
         if enabled:
             resolved.append(name)
     return resolved or [DEFAULT_CHAT_PLATFORM]
+
+
+def _chat_platforms_disabled() -> bool:
+    """True when config files explicitly disable all configured chat platforms.
+
+    On a chat-less install (`install.sh` chat choice "None", or a CR with
+    `googleChat.enabled: false` and `slack.enabled: false`), `renderConfigYAML`
+    emits `enabled: false` for both platforms in `/etc/hermes/config.yaml`.
+    `enabled_chat_platforms` falls back to `DEFAULT_CHAT_PLATFORM` when nothing
+    resolves so legacy callers never address an empty string, which would
+    otherwise cause `trigger_agent_troubleshooter` and `_feed_status` to treat
+    every admitted alert on a headless install as a failed chat delivery.
+    """
+    from_managed = _platforms_enabled_in(MANAGED_CONFIG_PATH)
+    from_profile = _platforms_enabled_in(CONFIG_PATH)
+    explicit: Dict[str, bool] = {}
+    for name in CHAT_PLATFORMS:
+        if name in from_managed:
+            explicit[name] = from_managed[name]
+        elif name in from_profile:
+            explicit[name] = from_profile[name]
+        elif any(os.environ.get(var, "").strip() for var in _CHAT_ENV_SIGNALS.get(name, ())):
+            return False
+    return bool(explicit) and not any(explicit.values())
 
 
 def get_active_platform(platforms: Optional[list[str]] = None) -> str:
@@ -2262,60 +2362,62 @@ def trigger_agent_troubleshooter(
     #    itself: the fall-through below logs only once a leg has already
     #    refused, so on an install whose first leg accepts, nothing would say
     #    the second was skipped.
-    platforms = enabled_chat_platforms()
-    active_platform = get_active_platform(platforms)
-    thread_id = None
-    for candidate in [active_platform] + [p for p in platforms if p != active_platform]:
-        thread_id = _post_initial_alert(
-            candidate, slack_alert_msg if candidate == SLACK_PLATFORM and slack_alert_msg else alert_msg
-        )
-        if thread_id == ALERT_SENT_WITHOUT_THREAD:
-            # Delivered, and unthreadable. Stop: the reader has the alert, and
-            # trying the next platform would post it to a second channel to
-            # chase a thread id. Fall into the `else` below, which records the
-            # delivery as unconfirmed rather than lost — the honest reading.
-            active_platform, thread_id = candidate, None
-            break
+    if not _chat_platforms_disabled():
+        platforms = enabled_chat_platforms()
+        active_platform = get_active_platform(platforms)
+        thread_id = None
+        for candidate in [active_platform] + [p for p in platforms if p != active_platform]:
+            thread_id = _post_initial_alert(
+                candidate, slack_alert_msg if candidate == SLACK_PLATFORM and slack_alert_msg else alert_msg
+            )
+            if thread_id == ALERT_SENT_WITHOUT_THREAD:
+                # Delivered, and unthreadable. Stop: the reader has the alert, and
+                # trying the next platform would post it to a second channel to
+                # chase a thread id. Fall into the `else` below, which records the
+                # delivery as unconfirmed rather than lost — the honest reading.
+                active_platform, thread_id = candidate, None
+                break
+            if thread_id:
+                active_platform = candidate
+                break
+            if len(platforms) > 1:
+                logger.warning(
+                    f"Alert for session {session_id} was not accepted by '{candidate}'"
+                    + (f"; trying the next enabled platform" if candidate != platforms[-1] else "")
+                )
+
+        # 2. Register thread-to-session mappings for two-way chat routing. This has
+        #    to happen before the turn in step 5: the card that turn files reads
+        #    this row to address its completion back to the alert's thread (see
+        #    deploy/docker/patches/kanban_event_routing.py).
         if thread_id:
-            active_platform = candidate
-            break
-        if len(platforms) > 1:
-            logger.warning(
-                f"Alert for session {session_id} was not accepted by '{candidate}'"
-                + (f"; trying the next enabled platform" if candidate != platforms[-1] else "")
+            _register_session_routing(session_id, active_platform, thread_id)
+            if alert_title and active_platform == SLACK_PLATFORM:
+                _record_alert_title(session_id, alert_title)
+        else:
+            # The ledger row already says this alert was announced; it was written
+            # before the post was attempted. Correct it now, or the daily recap
+            # counts a message nobody received into "went to chat as it happened"
+            # and drops the workload from the body.
+            #
+            # Only this branch. A failure further down means chat *did* get the
+            # alert and the triage turn did not start, which is a different defect
+            # and leaves `notified` correctly set: the reader saw the alert, just
+            # never the follow-up. `_post_initial_alert` also lands here when the
+            # send succeeded but returned no parseable `message_id`, so the record
+            # says the delivery is unconfirmed rather than certainly lost — the
+            # honest reading, and the safe direction for a report whose failure
+            # mode is false reassurance.
+            mark_delivery_failed(
+                event_row_id,
+                f"no message id from {' or '.join(repr(p) for p in platforms)}; "
+                "see the session server log",
+            )
+            logger.error(
+                f"Alert for session {session_id} was not delivered to any enabled platform "
+                f"({', '.join(platforms)}); the daily recap will report it as undelivered"
             )
 
-    # 2. Register thread-to-session mappings for two-way chat routing. This has
-    #    to happen before the turn in step 5: the card that turn files reads
-    #    this row to address its completion back to the alert's thread (see
-    #    deploy/docker/patches/kanban_event_routing.py).
-    if thread_id:
-        _register_session_routing(session_id, active_platform, thread_id)
-        if alert_title and active_platform == SLACK_PLATFORM:
-            _record_alert_title(session_id, alert_title)
-    else:
-        # The ledger row already says this alert was announced; it was written
-        # before the post was attempted. Correct it now, or the daily recap
-        # counts a message nobody received into "went to chat as it happened"
-        # and drops the workload from the body.
-        #
-        # Only this branch. A failure further down means chat *did* get the
-        # alert and the triage turn did not start, which is a different defect
-        # and leaves `notified` correctly set: the reader saw the alert, just
-        # never the follow-up. `_post_initial_alert` also lands here when the
-        # send succeeded but returned no parseable `message_id`, so the record
-        # says the delivery is unconfirmed rather than certainly lost — the
-        # honest reading, and the safe direction for a report whose failure
-        # mode is false reassurance.
-        mark_delivery_failed(
-            event_row_id,
-            f"no message id from {' or '.join(repr(p) for p in platforms)}; "
-            "see the session server log",
-        )
-        logger.error(
-            f"Alert for session {session_id} was not delivered to any enabled platform "
-            f"({', '.join(platforms)}); the daily recap will report it as undelivered"
-        )
 
     # 3. Configure HTTP authentication headers for Hermes REST gateway
     api_url = os.environ.get("PLATFORM_API_URL", "http://127.0.0.1:8642")
@@ -2888,15 +2990,32 @@ def _slack_audit_headline(
     return AuditHeadline(text, issue, ref)
 
 
+def _profile_home(profile: str, data_root: Optional[Path] = None) -> Optional[Path]:
+    """Return the validated directory for `profile` under `data_root` (or `agent_home()`)."""
+    if not _PROFILE_SEGMENT_RE.match(profile):
+        return None
+    root = data_root if data_root is not None else Path(gitops_workspace.agent_home())
+    try:
+        root_resolved = root.resolve()
+        candidate = (
+            root_resolved
+            if profile == DEFAULT_PROFILE
+            else (root_resolved / PROFILES_DIR / profile).resolve()
+        )
+        if candidate != root_resolved and not candidate.is_relative_to(root_resolved):
+            return None
+        return candidate
+    except OSError:
+        return None
+
+
 def _is_fleet_audit_job(profile: str, job_id: str) -> bool:
     """Whether `job_id` in `profile`'s cron roster runs fleet-audit; False when it cannot be read."""
-    if not _PROFILE_SEGMENT_RE.match(profile):
+    home = _profile_home(profile)
+    if home is None:
         return False
     try:
-        from gitops_workspace import agent_home
-
-        base = agent_home() if profile == DEFAULT_PROFILE else os.path.join(agent_home(), PROFILES_DIR, profile)
-        with open(os.path.join(base, *CRON_ROSTER), encoding="utf-8") as handle:
+        with open(home.joinpath(*CRON_ROSTER), encoding="utf-8") as handle:
             store = json.load(handle)
     except Exception as exc:
         logger.warning(f"Audit headline skipped: {profile} cron roster unreadable: {exc}")
@@ -3442,6 +3561,7 @@ def _inject_drift(
         # two entries with two insert ids.
         occurrences=1,
         notified=allowed,
+        session_id=session_id,
     )
 
     if not allowed:
@@ -3512,6 +3632,7 @@ def _inject_stall(
         severity=STALL_SEVERITY_LABEL,
         occurrences=len(names),
         notified=True,
+        session_id=session_id,
     )
 
     alert_msg = (
@@ -3595,7 +3716,7 @@ def inject_message(
     # The ledger row below is written either way, so the daily recap can report
     # what was held back; dropping these at the source would make them
     # invisible to it. See the "Suppressed" line in eod_report_generator.py.
-    suppressed = severity_label == "Info"
+    suppressed = severity_label == FEED_FILTERED_SEVERITY
 
     # The daily ceiling is enforced here rather than at /sessions because
     # severity is not known until the payload arrives, and here is the single
@@ -3638,6 +3759,7 @@ def inject_message(
         severity=severity_label,
         occurrences=count,
         notified=not (suppressed or quota_denied),
+        session_id=session_id,
     )
 
     if suppressed:
@@ -3891,6 +4013,605 @@ def get_alert_quota(day: str = "") -> Dict[str, Any]:
         if limit > 0
     }
     return {"day": day, "severities": severities}
+
+
+# --------------------------------------------------------------------------
+# The activity feed: what the agent saw and what it did, read-only.
+#
+# For an install with no chat platform — a demo page, a first-run install —
+# these routes are the only way to read a triage report without a shell in the
+# pod. The admin console reads the same rows today by exec'ing SQLite inside
+# the pod (docs/designs/admin-console.md); these are the authenticated reads
+# that path can move onto.
+#
+# Every connection here opens `session_kv.db`, `kanban.db`, and the Hermes
+# session stores (`<agent_home>/state.db` and `<agent_home>/profiles/<profile>/state.db`)
+# with `mode=ro`, so a bug in a query cannot write to any of those databases.
+# Task rows are returned column by column rather than as `t.*`: Hermes' `tasks`
+# table also carries the claim lock, worker pid and workspace path, which are
+# dispatcher state rather than activity, and a new column upstream does not
+# reach a caller until it is named here. Worker step text (`thinking`,
+# `tool_call`, `tool_result`, `reply`) is scrubbed through `AuditRedactor` (and
+# `tool_call`/`tool_result` text is withheld if the redactor cannot be loaded)
+# before leaving the pod; callers that render text fields still treat them as
+# untrusted text.
+# --------------------------------------------------------------------------
+
+
+def _read_only(path: str) -> sqlite3.Connection:
+    """Open `path` read-only. Raises sqlite3.OperationalError if it is absent."""
+    conn = sqlite3.connect(
+        f"{Path(path).absolute().as_uri()}?mode=ro",
+        uri=True,
+        timeout=FEED_DB_BUSY_TIMEOUT_SECONDS,
+    )
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def _kanban_db_path() -> str:
+    """The active kanban board path, resolved via `gitops_workspace.board_path`
+    unless tests override `KANBAN_DB_PATH`."""
+    return KANBAN_DB_PATH or str(gitops_workspace.board_path())
+
+
+def _clamp_limit(limit: int, maximum: int) -> int:
+    return max(1, min(int(limit), maximum))
+
+
+def _validate_non_negative_int64(value: int, name: str) -> int:
+    if value < 0 or value > SQLITE_INT64_MAX:
+        raise HTTPException(
+            status_code=400,
+            detail=f"{name} must be between 0 and {SQLITE_INT64_MAX}",
+        )
+    return value
+
+
+def _feed_status(
+    notified: int,
+    severity: str,
+    delivery_error: str,
+    *,
+    chat_disabled: bool = False,
+) -> str:
+    """What became of a ledger row, in the inject route's own words.
+
+    Derived rather than stored, from the three columns that already decide it:
+    `notified` is set only for an alert admitted past the severity gate and
+    daily quota, an Info row is the one the severity gate filters, and
+    `delivery_error` is written only when a chat post was attempted and failed.
+    On a headless install with chat explicitly disabled (`chat_disabled=True`),
+    any historical row that recorded `delivery_error` from the default-platform
+    fallback was still admitted into triage and is reported as `injected`.
+    """
+    if notified or (delivery_error and chat_disabled):
+        return FEED_STATUS_INJECTED
+    if delivery_error:
+        return FEED_STATUS_UNDELIVERED
+    if severity == FEED_FILTERED_SEVERITY:
+        return FEED_STATUS_FILTERED
+    return FEED_STATUS_SUPPRESSED
+
+
+@app.get("/v1/intercepted-events", dependencies=[Depends(verify_api_key)])
+def list_intercepted_events(since_id: int = 0, limit: int = FEED_EVENTS_DEFAULT_LIMIT) -> Dict[str, Any]:
+    """The event ledger, one row per event a producer forwarded.
+
+    Without `since_id`, the newest `limit` rows, newest first — what a page
+    shows on load. With it, the rows after that id, oldest first, so a poller
+    passes back `next_since_id` and sees each row once, in order. `truncated`
+    says more rows matched than were returned.
+    """
+    since_id = _validate_non_negative_int64(since_id, "since_id")
+    limit = _clamp_limit(limit, FEED_EVENTS_MAX_LIMIT)
+    chat_disabled = _chat_platforms_disabled()
+    columns = (
+        "id, session_id, created_at, cluster, namespace, object_kind, workload, "
+        "reason, severity, notified, delivery_error, message"
+    )
+    with closing(_read_only(SESSION_KV_DB_PATH)) as conn:
+        if since_id > 0:
+            rows = conn.execute(
+                f"SELECT {columns} FROM intercepted_events WHERE id > ? ORDER BY id ASC LIMIT ?",
+                (since_id, limit + 1),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                f"SELECT {columns} FROM intercepted_events ORDER BY id DESC LIMIT ?",
+                (limit + 1,),
+            ).fetchall()
+    events = [
+        {
+            "id": row["id"],
+            "session_id": row["session_id"],
+            "timestamp": row["created_at"],
+            "cluster": row["cluster"],
+            "namespace": row["namespace"],
+            "kind": row["object_kind"],
+            "name": row["workload"],
+            "reason": row["reason"],
+            "severity": row["severity"],
+            "status": _feed_status(
+                row["notified"],
+                row["severity"],
+                row["delivery_error"],
+                chat_disabled=chat_disabled,
+            ),
+            "message": row["message"],
+        }
+        for row in rows[:limit]
+    ]
+    return {
+        "events": events,
+        "truncated": len(rows) > limit,
+        "next_since_id": max([since_id] + [event["id"] for event in events]),
+    }
+
+
+# The task columns every feed route returns. `updated_at` is the admin
+# console's definition: the most recent of the lifecycle timestamps the row has.
+# `summary` is the latest run's, which is where `kanban_complete(summary=...)`
+# lands; `result` is the task's full report. `{extra}` is where the detail
+# route adds `body`, which the listings leave out to keep a page of them small.
+_TASK_FEED_SELECT = """
+    SELECT t.id, t.title, t.assignee, t.status, t.priority, t.session_id,{extra}
+           t.created_at, t.started_at, t.completed_at,
+           COALESCE(t.completed_at, t.last_heartbeat_at, t.started_at, t.created_at) AS updated_at,
+           (SELECT r.summary FROM task_runs r WHERE r.task_id = t.id ORDER BY r.id DESC LIMIT 1) AS summary,
+           t.result,
+           COALESCE(
+               (SELECT r.error FROM task_runs r WHERE r.task_id = t.id ORDER BY r.id DESC LIMIT 1),
+               t.last_failure_error
+           ) AS error
+    FROM tasks t
+"""
+
+
+def _read_kanban(read) -> Any:
+    """Run `read(conn)` against the board, mapping its absence to an answer.
+
+    Returns None when kanban.db does not exist yet — the board is created on
+    first use, so a fresh install has none, and that is an empty feed rather
+    than an error. A board that exists but cannot be read (locked past the
+    timeout, or a Hermes too old to have a column named here) is a 503.
+    """
+    board = _kanban_db_path()
+    if not os.path.isfile(board):
+        return None
+    try:
+        with closing(_read_only(board)) as conn:
+            return read(conn)
+    except sqlite3.Error as exc:
+        raise HTTPException(status_code=503, detail=f"the kanban board could not be read: {exc}") from None
+
+
+def _task_rows(conn: sqlite3.Connection, where: str, params: Sequence[Any], order: str, limit: int) -> Dict[str, Any]:
+    rows = [dict(row) for row in conn.execute(f"{_TASK_FEED_SELECT.format(extra='')} {where} ORDER BY {order} LIMIT ?", (*params, limit + 1))]
+    return {"tasks": rows[:limit], "truncated": len(rows) > limit}
+
+
+def _empty_task_feed() -> Dict[str, Any]:
+    return {"tasks": [], "truncated": False, "board": False}
+
+
+def _feed_data_root() -> Path:
+    """The agent data root where `state.db` and `profiles/<profile>/state.db` live."""
+    if KANBAN_DB_PATH:
+        return Path(KANBAN_DB_PATH).parent
+    return Path(gitops_workspace.agent_home())
+
+
+def _session_task_rows(conn: sqlite3.Connection, session_id: str, limit: int) -> Dict[str, Any]:
+    feed = _task_rows(conn, "WHERE t.session_id = ?", (session_id,), "t.created_at, t.id", limit)
+    if not feed["tasks"]:
+        return feed
+    run_cols = {r[1] for r in conn.execute("PRAGMA table_info(task_runs)")}
+    meta_select = ", metadata" if "metadata" in run_cols else ", NULL AS metadata"
+    with _WorkerStepReader(_feed_data_root()) as reader:
+        for task in feed["tasks"]:
+            raw_runs = [
+                dict(r)
+                for r in conn.execute(
+                    f"SELECT id, profile, status, started_at, ended_at, outcome, summary, error{meta_select} "
+                    "FROM task_runs WHERE task_id = ? ORDER BY id ASC LIMIT ?",
+                    (str(task["id"]), TASK_DETAIL_MAX_RUNS),
+                )
+            ]
+            steps, steps_truncated = _read_task_worker_steps(
+                str(task["id"]),
+                str(task.get("assignee") or ""),
+                raw_runs,
+                reader=reader,
+            )
+            task["live_steps"] = steps
+            task["steps_truncated"] = steps_truncated
+    return feed
+
+
+@app.get("/v1/sessions/{session_id}/tasks", dependencies=[Depends(verify_api_key)])
+def list_session_tasks(session_id: str, limit: int = FEED_TASKS_DEFAULT_LIMIT) -> Dict[str, Any]:
+    """The kanban cards filed from one session, oldest first.
+
+    For an event, `session_id` is the ledger row's, and the first card is the
+    triage the front door filed; later ones are whatever that work spawned
+    under the same session. Each card also carries `live_steps` and
+    `steps_truncated` from the worker's Hermes session (`state.db`).
+    """
+    limit = _clamp_limit(limit, FEED_TASKS_MAX_LIMIT)
+    result = _read_kanban(lambda conn: _session_task_rows(conn, session_id, limit))
+    return {**result, "board": True} if result is not None else _empty_task_feed()
+
+
+@app.get("/v1/tasks", dependencies=[Depends(verify_api_key)])
+def list_tasks(since: int = 0, limit: int = FEED_TASKS_DEFAULT_LIMIT, assignee: str = "") -> Dict[str, Any]:
+    """Recently active cards, most recently updated first.
+
+    `since` is a Unix time in seconds, the unit the board stores, compared
+    against `updated_at`. `assignee` is an exact profile name, for example the
+    platform agent's, to find the card that applied a fix or opened a pull
+    request.
+    """
+    since = _validate_non_negative_int64(since, "since")
+    limit = _clamp_limit(limit, FEED_TASKS_MAX_LIMIT)
+    clauses = ["COALESCE(t.completed_at, t.last_heartbeat_at, t.started_at, t.created_at) >= ?"]
+    params: list[Any] = [since]
+    if assignee:
+        clauses.append("t.assignee = ?")
+        params.append(assignee)
+    result = _read_kanban(
+        lambda conn: _task_rows(conn, "WHERE " + " AND ".join(clauses), params, "updated_at DESC, t.id", limit)
+    )
+    return {**result, "board": True} if result is not None else _empty_task_feed()
+
+
+def _like_escape(value: str) -> str:
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+def _profile_state_db(data_root: Path, profile: str) -> Optional[Path]:
+    """Return the read-only `state.db` path for `profile` under `data_root`."""
+    home = _profile_home(profile or DEFAULT_PROFILE, data_root)
+    if home is None:
+        return None
+    candidate = home / HERMES_STATE_DB_FILENAME
+    try:
+        return candidate if candidate.is_file() else None
+    except OSError:
+        return None
+
+
+def _get_audit_redactor() -> Any:
+    """Lazily load `AuditRedactor` from the image or checkout plugin directory."""
+    global _AUDIT_REDACTOR, _AUDIT_REDACTOR_LOADED
+    if _AUDIT_REDACTOR_LOADED:
+        return _AUDIT_REDACTOR
+    _AUDIT_REDACTOR_LOADED = True
+    module_name = "kube_agents_session_kv_redactor"
+    for candidate in _REDACTOR_CANDIDATES:
+        if not candidate.is_file():
+            continue
+        try:
+            spec = importlib.util.spec_from_file_location(module_name, candidate)
+            if spec is None or spec.loader is None:
+                continue
+            module = importlib.util.module_from_spec(spec)
+            sys.modules[module_name] = module
+            spec.loader.exec_module(module)
+            _AUDIT_REDACTOR = getattr(module, "AuditRedactor", None)
+            if _AUDIT_REDACTOR is not None:
+                return _AUDIT_REDACTOR
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"Could not load AuditRedactor from {candidate}: {exc}")
+    return None
+
+
+def _scrub_worker_step_text(kind: str, text: str) -> str:
+    """Scrub worker step text with `AuditRedactor.redact`; withhold tool args/results if unavailable."""
+    redactor = _get_audit_redactor()
+    if redactor is None:
+        if kind in ("tool_call", "tool_result"):
+            return WORKER_STEP_WITHHELD
+        return text
+    return str(redactor.redact(text))
+
+
+def _decode_hermes_content(content: Any) -> str:
+    if isinstance(content, str) and content.startswith(HERMES_JSON_CONTENT_PREFIX):
+        try:
+            content = json.loads(content[len(HERMES_JSON_CONTENT_PREFIX):])
+        except ValueError:
+            return content
+    if isinstance(content, list):
+        parts = []
+        for part in content:
+            if isinstance(part, dict) and isinstance(part.get("text"), str):
+                parts.append(part["text"])
+            elif isinstance(part, str):
+                parts.append(part)
+        return "\n".join(parts)
+    if isinstance(content, str):
+        return content
+    if content is None:
+        return ""
+    return json.dumps(content, default=str)
+
+
+def _parse_tool_calls(raw: Any) -> list[Dict[str, Any]]:
+    try:
+        parsed = json.loads(raw) if isinstance(raw, str) else raw
+    except ValueError:
+        return []
+    if not isinstance(parsed, list):
+        return []
+    return [item for item in parsed if isinstance(item, dict)]
+
+
+def _make_worker_step(kind: str, tool: str, text: str, at: Any) -> Dict[str, Any]:
+    cleaned = _scrub_worker_step_text(kind, text).strip()
+    if len(cleaned) <= TASK_STEP_PREVIEW_MAX_CHARS:
+        preview = cleaned
+        detail = ""
+    else:
+        preview = cleaned[:TASK_STEP_PREVIEW_MAX_CHARS].rstrip() + "…"
+        detail = cleaned[:TASK_STEP_DETAIL_MAX_CHARS]
+    step: Dict[str, Any] = {"kind": kind, "preview": preview}
+    if tool:
+        step["tool"] = tool
+    if detail:
+        step["detail"] = detail
+    if at is not None:
+        step["at"] = at
+    return step
+
+
+_WORKER_PROMPT_TASK_RE = re.compile(re.escape(WORKER_PROMPT_PREFIX) + r"([\w-]+)(?![\w-])")
+
+
+def _extract_steps_from_conn(
+    sconn: sqlite3.Connection,
+    cols: set[str],
+    session_id: str,
+    window_size: int,
+) -> tuple[list[Dict[str, Any]], bool]:
+    """Read up to `window_size` newest message rows for `session_id` and return `(steps, rows_clipped)`."""
+    if not cols:
+        return [], False
+    reasoning_col = "reasoning" if "reasoning" in cols else "NULL AS reasoning"
+    active_clause = " AND COALESCE(active, 1) = 1" if "active" in cols else ""
+    try:
+        msg_rows = sconn.execute(
+            f"SELECT id, role, content, tool_name, tool_calls, timestamp, {reasoning_col} "
+            f"FROM messages WHERE session_id = ?{active_clause} ORDER BY id DESC LIMIT ?",
+            (session_id, window_size + 1),
+        ).fetchall()
+    except sqlite3.Error:
+        return [], False
+    rows_clipped = len(msg_rows) > window_size
+    if rows_clipped:
+        msg_rows = msg_rows[:window_size]
+    steps: list[Dict[str, Any]] = []
+    for m in reversed(msg_rows):
+        role = m["role"]
+        ts = m["timestamp"]
+        if role == "assistant":
+            reasoning = str(m["reasoning"] or "").strip()
+            if reasoning:
+                steps.append(_make_worker_step("thinking", "", reasoning, ts))
+            tcalls = _parse_tool_calls(m["tool_calls"])
+            for tc in tcalls:
+                fn = tc.get("function") if isinstance(tc.get("function"), dict) else tc
+                name = str(fn.get("name") or "")
+                raw_args = fn.get("arguments")
+                args_str = (
+                    raw_args
+                    if isinstance(raw_args, str)
+                    else (json.dumps(raw_args, default=str) if raw_args is not None else "")
+                )
+                steps.append(_make_worker_step("tool_call", name, args_str, ts))
+            if not tcalls:
+                reply = _decode_hermes_content(m["content"]).strip()
+                if reply:
+                    steps.append(_make_worker_step("reply", "", reply, ts))
+        elif role == "tool":
+            res_text = _decode_hermes_content(m["content"])
+            steps.append(_make_worker_step("tool_result", str(m["tool_name"] or ""), res_text, ts))
+    return steps, rows_clipped
+
+
+class _WorkerStepReader:
+    """Per-request reader caching profile `state.db` paths, open read-only
+    connections, `messages` schemas, and dispatcher prompt -> session maps."""
+
+    def __init__(self, data_root: Path) -> None:
+        self.data_root = data_root
+        self._stack = ExitStack()
+        self._conns: Dict[str, Optional[sqlite3.Connection]] = {}
+        self._cols: Dict[str, set[str]] = {}
+        self._prompt_index: Dict[str, Dict[str, list[str]]] = {}
+
+    def close(self) -> None:
+        self._stack.close()
+
+    def __enter__(self) -> "_WorkerStepReader":
+        return self
+
+    def __exit__(self, *exc_info: Any) -> None:
+        self.close()
+
+    def conn_for(self, profile: str) -> tuple[Optional[sqlite3.Connection], set[str]]:
+        if profile in self._conns:
+            return self._conns[profile], self._cols[profile]
+        db_path = _profile_state_db(self.data_root, profile)
+        if db_path is None:
+            self._conns[profile] = None
+            self._cols[profile] = set()
+            return None, set()
+        try:
+            conn = self._stack.enter_context(closing(_read_only(str(db_path))))
+            cols = {r[1] for r in conn.execute("PRAGMA table_info(messages)")}
+        except sqlite3.Error:
+            self._conns[profile] = None
+            self._cols[profile] = set()
+            return None, set()
+        self._conns[profile] = conn
+        self._cols[profile] = cols
+        return conn, cols
+
+    def sessions_by_prompt(self, profile: str, task_id: str) -> list[str]:
+        conn, cols = self.conn_for(profile)
+        if conn is None or not cols:
+            return []
+        if profile not in self._prompt_index:
+            index: Dict[str, list[str]] = {}
+            try:
+                rows = conn.execute(
+                    "SELECT session_id, content FROM messages WHERE role = 'user' "
+                    "AND content LIKE ? ESCAPE '\\' ORDER BY id ASC",
+                    (f"%{WORKER_PROMPT_PREFIX}%",),
+                ).fetchall()
+            except sqlite3.Error:
+                rows = []
+            for row in rows:
+                sid = row["session_id"]
+                if not isinstance(sid, str) or not sid:
+                    continue
+                content = _decode_hermes_content(row["content"])
+                for matched_task in _WORKER_PROMPT_TASK_RE.findall(content):
+                    bucket = index.setdefault(matched_task, [])
+                    if sid not in bucket:
+                        bucket.append(sid)
+            self._prompt_index[profile] = index
+        return list(self._prompt_index[profile].get(task_id, ()))
+
+
+def _read_task_worker_steps(
+    task_id: str,
+    assignee: str,
+    runs: Sequence[Dict[str, Any]],
+    *,
+    reader: Optional[_WorkerStepReader] = None,
+) -> tuple[list[Dict[str, Any]], bool]:
+    """Read the worker's live reasoning and tool calls from its profile `state.db`.
+
+    Best-effort: an absent or locked profile store yields no steps rather than
+    failing the card detail read.
+    """
+    if reader is None:
+        with _WorkerStepReader(_feed_data_root()) as owned_reader:
+            return _read_task_worker_steps(task_id, assignee, runs, reader=owned_reader)
+
+    sessions: list[tuple[str, str]] = []
+    seen_sids: set[str] = set()
+    missing_run_session = not runs
+
+    for run in runs:
+        raw_meta = run.get("metadata")
+        try:
+            meta = json.loads(raw_meta) if isinstance(raw_meta, str) and raw_meta else {}
+        except ValueError:
+            meta = {}
+        sid = meta.get("worker_session_id") if isinstance(meta, dict) else None
+        prof = str(run.get("profile") or assignee or "")
+        if isinstance(sid, str) and sid:
+            if sid not in seen_sids:
+                seen_sids.add(sid)
+                sessions.append((sid, prof))
+        else:
+            missing_run_session = True
+
+    if missing_run_session:
+        profiles = list(
+            dict.fromkeys([str(r.get("profile") or assignee or "") for r in runs] + [str(assignee or "")])
+        )
+        for profile in profiles:
+            if not profile:
+                continue
+            for sid in reader.sessions_by_prompt(profile, task_id):
+                if sid not in seen_sids:
+                    seen_sids.add(sid)
+                    sessions.append((sid, profile))
+
+    steps: list[Dict[str, Any]] = []
+    rows_clipped = False
+    window_size = TASK_DETAIL_MAX_STEPS * TASK_STEP_ROW_MULTIPLIER
+    for sid, profile in sessions:
+        sconn, cols = reader.conn_for(profile)
+        if sconn is None or not cols:
+            continue
+        sess_steps, sess_clipped = _extract_steps_from_conn(sconn, cols, sid, window_size)
+        steps.extend(sess_steps)
+        rows_clipped = rows_clipped or sess_clipped
+
+    steps_truncated = rows_clipped or len(steps) > TASK_DETAIL_MAX_STEPS
+    if len(steps) > TASK_DETAIL_MAX_STEPS:
+        steps = steps[-TASK_DETAIL_MAX_STEPS:]
+    return steps, steps_truncated
+
+
+@app.get("/v1/tasks/{task_id}", dependencies=[Depends(verify_api_key)])
+def get_task(task_id: str) -> Dict[str, Any]:
+    """One card with its body, report, runs, events, comments and worker steps.
+
+    Mirrors the admin console's `task_detail`, less two of its parts: chat
+    delivery rows (`kanban_notify_subs` holds chat and user ids) and
+    attachments. Also reads the worker's Hermes session (`steps`: reasoning,
+    tool calls and tool results) from the assigned profile's `state.db` when
+    present. Each child list keeps its newest rows under its ceiling, and its
+    `*_truncated` flag says when older ones were cut.
+    """
+
+    def read(conn: sqlite3.Connection) -> Dict[str, Any]:
+        task = conn.execute(
+            f"{_TASK_FEED_SELECT.format(extra=' t.body,')} WHERE t.id = ?", (task_id,)
+        ).fetchone()
+        if task is None:
+            raise HTTPException(status_code=404, detail="no such task")
+
+        def newest(query: str, ceiling: int) -> tuple[list[Dict[str, Any]], bool]:
+            rows = [dict(row) for row in conn.execute(query, (task_id, ceiling + 1))]
+            truncated = len(rows) > ceiling
+            rows = rows[:ceiling]
+            rows.reverse()
+            return rows, truncated
+
+        run_cols = {r[1] for r in conn.execute("PRAGMA table_info(task_runs)")}
+        meta_select = ", metadata" if "metadata" in run_cols else ", NULL AS metadata"
+        raw_runs, runs_truncated = newest(
+            f"SELECT id, profile, status, started_at, ended_at, outcome, summary, error{meta_select} "
+            "FROM task_runs WHERE task_id = ? ORDER BY id DESC LIMIT ?",
+            TASK_DETAIL_MAX_RUNS,
+        )
+        steps, steps_truncated = _read_task_worker_steps(
+            str(task["id"]),
+            str(task["assignee"] or ""),
+            raw_runs,
+        )
+        runs = [{k: v for k, v in r.items() if k != "metadata"} for r in raw_runs]
+        events, events_truncated = newest(
+            "SELECT id, run_id, kind, payload, created_at FROM task_events WHERE task_id = ? ORDER BY id DESC LIMIT ?",
+            TASK_DETAIL_MAX_EVENTS,
+        )
+        comments, comments_truncated = newest(
+            "SELECT id, author, body, created_at FROM task_comments WHERE task_id = ? ORDER BY id DESC LIMIT ?",
+            TASK_DETAIL_MAX_COMMENTS,
+        )
+        return {
+            "task": dict(task),
+            "runs": runs,
+            "runs_truncated": runs_truncated,
+            "events": events,
+            "events_truncated": events_truncated,
+            "comments": comments,
+            "comments_truncated": comments_truncated,
+            "steps": steps,
+            "steps_truncated": steps_truncated,
+        }
+
+    result = _read_kanban(read)
+    if result is None:
+        raise HTTPException(status_code=404, detail="no kanban board on this install yet")
+    return result
 
 
 # --------------------------------------------------------------------------

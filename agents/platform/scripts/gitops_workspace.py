@@ -110,6 +110,20 @@ def agent_home() -> str:
     ) or "/"
 
 
+BOARD_DB_NAME = "kanban.db"
+
+
+def board_path() -> Path:
+    """The board the Planning Agent files on: Hermes' own resolution when the
+    API is importable, else the agent home's kanban.db."""
+    try:
+        from hermes_cli.kanban_db import kanban_db_path  # lazy: the gateway venv's, not a test's
+
+        return Path(str(kanban_db_path()))
+    except Exception:  # noqa: BLE001 - outside the gateway venv the default board is the only one
+        return Path(agent_home()) / BOARD_DB_NAME
+
+
 def default_root() -> str:
     """Where leased clones live: `<agent home>/gitops`.
 
