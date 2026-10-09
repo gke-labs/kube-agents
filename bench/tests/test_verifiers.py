@@ -6862,6 +6862,8 @@ def _webhook_verdicts(text: str) -> dict[str, str]:
         _webhook_report(gate=_webhook_line("seeded-fail-closed-gate", "validatingwebhookconfiguration", "missing", "no")),
         _webhook_report(pdb=_webhook_line("pinned-batch-runner", "poddisruptionbudget", "ready", "yes")),
         _webhook_report(gate=_webhook_line("seeded-fail-closed-gate", "webhook", "absent", "no")) + "\nThe Service seeded-upgrade/nonexistent-admission-gate does not exist.",
+        # the pinned Deployment that shares the budget's name, correctly not a blocker beside the budget's yes
+        _webhook_report(_WEBHOOK_PDB_LINE, _WEBHOOK_EXCLUSION_LINE, _WEBHOOK_GATE_LINE, _webhook_line("pinned-batch-runner", "deployment", "not applicable", "no")),
         # lines about other objects are ignored: a pool, a live webhook, another cluster's
         # budget, another cluster's healthy webhook; so is prose between the lines
         _webhook_report(_WEBHOOK_PDB_LINE, _WEBHOOK_EXCLUSION_LINE, _WEBHOOK_GATE_LINE, _webhook_line("no-surge-pool", "pool", "not applicable", "yes"), _webhook_line("warden-validating", "webhook", "ready", "no"), _webhook_line("inference-server", "pdb", "not applicable", "no", cluster="seeded-a"), _webhook_line("gmp-operator.gmp-system.monitoring.googleapis.com", "webhook", "ready", "no", cluster="seeded-a")),
@@ -6890,6 +6892,8 @@ def test_webhook_readiness_declared_lines_accepted(text):
         # a second line about the same object that contradicts the right one
         (_webhook_report(_WEBHOOK_PDB_LINE, _WEBHOOK_EXCLUSION_LINE, _WEBHOOK_GATE_LINE, _webhook_line("seeded-fail-closed-gate", "webhook", "missing", "yes")), _WEBHOOK_GATE),
         (_webhook_report(_WEBHOOK_PDB_LINE, _WEBHOOK_EXCLUSION_LINE, _WEBHOOK_GATE_LINE, _webhook_line("pinned-batch-runner", "pdb", "not applicable", "no")), _WEBHOOK_PDB),
+        (_webhook_report(_WEBHOOK_PDB_LINE, _WEBHOOK_EXCLUSION_LINE, _WEBHOOK_GATE_LINE, _webhook_line("pinned-batch-runner", "poddisruptionbudget", "not applicable", "no")), _WEBHOOK_PDB),
+        (_webhook_report(pdb=_webhook_line("pinned-batch-runner", "poddisruptionbudget", "not applicable", "no")), _WEBHOOK_PDB),
         (_webhook_report(_WEBHOOK_PDB_LINE, _WEBHOOK_EXCLUSION_LINE, _WEBHOOK_GATE_LINE, _webhook_line("hold-the-minor-lag", "exclusion", "not applicable", "no")), _WEBHOOK_EXCLUSION),
         # the gate blamed under another of its names, or under another cluster's
         (_webhook_report(_WEBHOOK_PDB_LINE, _WEBHOOK_EXCLUSION_LINE, _WEBHOOK_GATE_LINE, _webhook_line("gate.seeded.invalid", "webhook", "missing", "yes")), _WEBHOOK_NO_BLAME),
