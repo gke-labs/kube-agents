@@ -49,7 +49,7 @@ readonly EVAL_ALERT_DAILY_LIMIT_WARNING="0"
 # What that costs, stated rather than discovered: one lease deploys one install
 # and runs the whole matrix against it, so this ceiling is off for every case
 # rather than for drift ones, and the board it fills is shared
-# (kanban.max_in_progress is 2). A single human-tier record therefore files
+# (kanban.max_in_progress is 5 on this install). A single human-tier record therefore files
 # unbounded cards and can starve unrelated cases in the same lease. On a leased
 # pool project almost every principal is a service account and the classifier
 # drops it, so the steady state is quiet; the triggers are a maintainer running
@@ -120,13 +120,13 @@ readonly EVAL_DRIFT_READY_INTERVAL_SECONDS=5
 # record and why, and that is worth a targeted rerun rather than every lease.
 
 # The kanban board's worker cap on the eval install. The image ships
-# kanban.max_in_progress: 2 (agents/chat/config.yaml), a floor for an install
-# that has not measured its own worker footprint, and the operator renders a
-# different cap only when the CR carries spec.harness.tuning.maxInProgress.
-# The eval fans its units out at EVAL_TASK_PARALLELISM (4 on a pull request,
-# 8 on the nightly since oss-test-infra#2707), and nearly every unit's
-# opening turn delegates one platform card, so on the image default most
-# lanes queue behind two slots: a queued card waits out the cards ahead of
+# kanban.max_in_progress: 6 (agents/chat/config.yaml), and the operator renders
+# a different cap only when the CR carries spec.harness.tuning.maxInProgress.
+# The eval deliberately runs below that production default, at five. It fans
+# its units out at EVAL_TASK_PARALLELISM (4 on a pull request, 8 on the
+# nightly since oss-test-infra#2707), and nearly every unit's opening turn
+# delegates one platform card. The override was added when the image default
+# was two, where most lanes queued: a queued card waits out the cards ahead of
 # it and then runs its own 10-45 minutes, past the 2700-3000s delegation
 # ceiling with no worker at fault, while the dispatcher logs the same "ready
 # queue non-empty ... 0 workers spawned" warning a wedged worker produces
@@ -135,24 +135,29 @@ readonly EVAL_DRIFT_READY_INTERVAL_SECONDS=5
 # delegation by the v2026.9.14 base's approval-regex hang on large terminal
 # commands, a separate holder of the same slots that the Hermes bump removes.
 #
-# Five, not the lane count. The cap bounds ACTIVE workers, and a coordinator
-# waiting on the children it fanned out gives its slot back but stays
-# resident (deploy/docker/patches/kanban_scheduling.py, Part 4), so the
-# process count is the cap plus the waiting coordinators. The gateway
-# container's 8Gi memory limit (resolveResources in
-# k8s-operator/internal/controller/manifest_helpers.go) was sized for five
-# concurrent workers over a 1.8GiB idle set, and a worker the cgroup OOM
-# killer takes strands its card with no restart and no event: the same shape
-# as the queue this removes, indistinguishable from it in the run record. So
-# the cap stops where the sizing stops: five covers the pull request's four
-# lanes with one slot for a fan-out child, and the nightly's eight lanes
-# still queue three deep until the working set at five is measured and the
-# eval install's memory limit is raised together with the cap (the CR patch
-# hack/kind-up.sh makes after helm is the shape; #2032 carries the
-# measurement). Set on this install only, so the production default stays
-# where the CRD reference argues it should. tests/test_ci_deploy_kanban_cap.py
-# pins the flag, the floor under the pull request's lanes, the ceiling the
-# memory limit was sized for, and the chart rendering the value onto the CR.
+# Five, not the lane count and not the production six. The cap bounds ACTIVE
+# workers, and a coordinator waiting on the children it fanned out gives its
+# slot back but stays resident (deploy/docker/patches/kanban_scheduling.py,
+# Part 4), so the process count is the cap plus the waiting coordinators. A
+# worker the cgroup OOM killer takes strands its card with no restart and no
+# event: the same shape as the queue this removes, indistinguishable from it
+# in the run record. The gateway's 8Gi limit (resolveResources in
+# k8s-operator/internal/controller/manifest_helpers.go) holds about fourteen
+# workers at the ~430 MiB one measured live over the 1.8 GiB idle set, so six
+# active plus their waiting coordinators fit on paper, but the eval's working
+# set at more than five has not been measured (#2032), so the eval holds at
+# five. The lanes' cards arrive through the inject and A2A doors and are user
+# cards, and at a cap of 2 or more each class may hold every slot but the one
+# guaranteed to the other (deploy/docker/patches/kanban_priority.py). At five
+# that leaves four for user cards: exactly the pull request's four lanes
+# (EVAL_TASK_PARALLELISM_DEFAULT below), with the fifth held for event triage.
+# A lane's fan-out child runs in the slot its waiting coordinator gives back.
+# The nightly's eight lanes still queue four deep. Raising the cap belongs with
+# that measurement. Each class may hold four of the five slots here, against
+# five of six in production. Set on this install only.
+# tests/test_ci_deploy_kanban_cap.py pins the flag, the floor (the lanes plus
+# triage's slot), the eval's ceiling, and the chart rendering the value onto
+# the CR.
 readonly EVAL_KANBAN_MAX_IN_PROGRESS="5"
 
 # The release step 5 installs, and — for the poisoned-record guard (#1172) —
@@ -276,8 +281,8 @@ readonly BRIDGE_SIDECAR_NAME="hermes-bridge"
 # The lane runs the bridge's shipped default executor, api, the one a customer
 # install runs. Nothing here sets it: with the operator's A2A_BRIDGE_EXECUTOR
 # unset the rendered bridge carries no BRIDGE_EXECUTOR, and the bridge picks
-# api when BRIDGE_EXECUTOR is unset and the API_SERVER_KEY it copies from the
-# agent container is present (bridgeExecutor in a2a/cmd/hermes-bridge/main.go).
+# api when BRIDGE_EXECUTOR is unset and the API_SERVER_KEY the operator sets on
+# it is present (bridgeExecutor in a2a/cmd/hermes-bridge/main.go).
 # A bridge without the key falls back to cli with a warning, so the start-line
 # wait below requires this executor rather than trusting the default. Under api
 # a task is a turn in the pod's Hermes API server, whose profile is the chat
@@ -414,11 +419,12 @@ readonly A2A_CALLOUT_IMAGE_ENV_VAR="A2A_CALLOUT_IMAGE"
 readonly A2A_WORKER_IMAGE_ENV_VAR="A2A_WORKER_IMAGE"
 readonly A2A_VERIFIER_IMAGE_ENV_VAR="A2A_VERIFIER_IMAGE"
 readonly A2A_CONSOLE_IMAGE_ENV_VAR="A2A_CONSOLE_IMAGE"
-# Two of the rendered bridge's three operator settings (a2aBridgeImageEnvVar
+# Two of the rendered bridge's four operator settings (a2aBridgeImageEnvVar
 # and a2aBridgeConcurrencyOperatorEnvVar in platformagent_a2a_bridge.go): its
 # image and its BRIDGE_CONCURRENCY. The operator reads them from its own
 # environment, as it does the overrides above; no CR field carries them. The
-# third, A2A_BRIDGE_EXECUTOR, is left unset (BRIDGE_EXECUTOR_EXPECTED says why).
+# third, A2A_BRIDGE_EXECUTOR, is left unset (BRIDGE_EXECUTOR_EXPECTED says why),
+# and so is the fourth, A2A_BRIDGE_RESOURCES, so the lane runs the default sizing.
 readonly A2A_BRIDGE_IMAGE_ENV_VAR="A2A_BRIDGE_IMAGE"
 readonly A2A_BRIDGE_CONCURRENCY_ENV_VAR="A2A_BRIDGE_CONCURRENCY"
 # Named only for the diagnosis when the bridge logs another executor.

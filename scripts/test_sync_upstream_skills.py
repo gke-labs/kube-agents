@@ -245,26 +245,6 @@ class ApplySubstitutionsTest(unittest.TestCase):
             self.assertNotIn(sync.GKE_WORKLOAD_SECURITY_OLD_NETPOL_SNIPPET, content)
             self.assertIn(sync.GKE_WORKLOAD_SECURITY_NEW_NETPOL_SNIPPET, content)
 
-    def test_applies_workload_troubleshooting_submit_substitution(self):
-        d = self._skill_dir(body=sync.GKE_WORKLOAD_TROUBLESHOOTING_OLD_STEP5_SUBMIT_SNIPPET + "\n")
-        self.assertTrue(sync.apply_substitutions(d, "gke-workload-troubleshooting"))
-        content = self._read(d)
-        self.assertNotIn(sync.GKE_WORKLOAD_TROUBLESHOOTING_OLD_STEP5_SUBMIT_SNIPPET, content)
-        self.assertEqual(content.count(sync.GKE_WORKLOAD_TROUBLESHOOTING_NEW_STEP5_SUBMIT_SNIPPET), 1)
-        # Idempotent: a second application finds the replacement and leaves it.
-        self.assertFalse(sync.apply_substitutions(d, "gke-workload-troubleshooting"))
-
-    def test_repo_workload_troubleshooting_skill_carries_the_submit_substitution(self):
-        # The in-tree copy is rmtree'd and re-copied on every sync, so the
-        # condition on Step 5 (#2037) survives only as a registered pair, and
-        # the copy has to already read as a fresh sync would leave it.
-        repo_root = Path(__file__).resolve().parent.parent
-        skill_md = repo_root / "agents" / "platform" / "skills" / "gke-workload-troubleshooting" / "SKILL.md"
-        content = skill_md.read_text(encoding="utf-8")
-        for target, replacement in sync.SKILL_SUBSTITUTIONS["gke-workload-troubleshooting"]:
-            self.assertNotIn(target, content)
-            self.assertEqual(content.count(replacement), 1, replacement)
-
     def test_applies_basics_credentials_substitution(self):
         d = self._skill_dir(body=sync.GKE_BASICS_OLD_CREDENTIALS_SNIPPET + "\n")
         self.assertTrue(sync.apply_substitutions(str(d), "gke-basics"))
@@ -342,6 +322,19 @@ class ApplySubstitutionsTest(unittest.TestCase):
                     self.assertNotIn(other_replacement, target, skill_name)
                     if (other_target, other_replacement) != (target, replacement):
                         self.assertNotIn(other_replacement, replacement, skill_name)
+
+    def test_repo_backup_dr_skill_carries_every_substitution(self):
+        # The Golden Path heading on a line of its own, so it renders, and a restore plan that
+        # restores volume data.
+        skill_md = (
+            Path(__file__).resolve().parent.parent / "agents" / "platform" / "skills" / "gke-backup-dr" / "SKILL.md"
+        )
+        content = skill_md.read_text(encoding="utf-8")
+        for target, replacement in sync.SKILL_SUBSTITUTIONS["gke-backup-dr"]:
+            self.assertNotIn(target, content)
+            self.assertEqual(content.count(replacement), 1, replacement)
+        # A second copy of the flag would leave the agent choosing between two restore policies.
+        self.assertEqual(content.count("--volume-data-restore-policy"), 1)
 
     def test_skill_without_substitutions_is_untouched(self):
         # The guard must not turn "nothing configured" into a failure.
@@ -447,6 +440,16 @@ class VerifyLocalCorrectionsTest(unittest.TestCase):
         self.assertIn(dropped, str(caught.exception))
         self.assertIn("renamed or removed", str(caught.exception))
 
+    def test_entry_for_an_overlay_mirrored_skill_is_reported(self):
+        # The entry would never apply: scripts/skill_overlay.py writes that skill, not this script.
+        skills = self._faithful_upstream()
+        mirrored = sorted(sync.SKILL_FOOTERS)[0]
+        root = self._upstream(skills)
+        with self.assertRaises(sync.UpstreamDriftError) as caught:
+            sync.verify_local_corrections(str(root), sorted(skills), skip={mirrored})
+        self.assertIn(mirrored, str(caught.exception))
+        self.assertIn(sync.SKILL_OVERLAY_LOCK, str(caught.exception))
+
     def test_drifted_target_is_reported(self):
         skills = self._faithful_upstream()
         skills["gke-basics"] = skills["gke-basics"].replace("   * Always", "   - Always")
@@ -542,13 +545,13 @@ class SyncExitStatusTest(unittest.TestCase):
 
     SCRIPT = Path(__file__).resolve().parent / "sync-upstream-skills.py"
 
-    def _fixture_upstream(self, mutate=None, rename=None):
+    def _fixture_upstream(self, mutate=None, rename=None, extra=()):
         # A git repo the script can `git clone --depth 1`, holding the skills the registries
-        # name. Cloning a local path keeps the test off the network.
+        # name, plus any `extra` ones. Cloning a local path keeps the test off the network.
         root = Path(tempfile.mkdtemp())
         skills_dir = root / "skills" / "cloud"
         skills_dir.mkdir(parents=True)
-        for name in set(sync.SKILL_SUBSTITUTIONS) | set(sync.SKILL_FOOTERS):
+        for name in set(sync.SKILL_SUBSTITUTIONS) | set(sync.SKILL_FOOTERS) | set(extra):
             targets = sync.SKILL_SUBSTITUTIONS.get(name, [])
             body = "\n\n".join(t for t, _ in targets) + "\n# skill\n"
             if mutate:
@@ -599,6 +602,26 @@ class SyncExitStatusTest(unittest.TestCase):
         result = self._run_sync(self._fixture_upstream(), repo_root)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("Synchronization complete!", result.stdout)
+
+    def test_skill_with_an_overlay_lock_is_left_alone(self):
+        # A skill scripts/skill_overlay.py mirrors keeps its upstream.lock in its overlay. The
+        # sync must neither overwrite it (it is in upstream) nor prune it (were it not).
+        repo_root = Path(tempfile.mkdtemp())
+        mirrored = "gke-unregistered-and-mirrored"
+        upstream = self._fixture_upstream(extra=[mirrored])
+        for name in (mirrored, "gke-only-in-the-overlay"):
+            overlay = repo_root / sync.SKILL_OVERLAY_ROOT / name
+            overlay.mkdir(parents=True)
+            (overlay / sync.SKILL_OVERLAY_LOCK).write_text("commit: x\nsha256: y\n", encoding="utf-8")
+            skill = repo_root / "agents" / "platform" / "skills" / name
+            skill.mkdir(parents=True)
+            (skill / "SKILL.md").write_text("ours\n", encoding="utf-8")
+        result = self._run_sync(upstream, repo_root)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Skipping 2 skill(s) mirrored by scripts/skill_overlay.py", result.stdout)
+        for name in (mirrored, "gke-only-in-the-overlay"):
+            skill_md = repo_root / "agents" / "platform" / "skills" / name / "SKILL.md"
+            self.assertEqual(skill_md.read_text(encoding="utf-8"), "ours\n")
 
     def test_drifted_upstream_exits_one_and_writes_nothing(self):
         def drift(name, body):
@@ -678,12 +701,32 @@ class WrittenPathspecsTest(unittest.TestCase):
 
     REPO_ROOT = Path(__file__).resolve().parent.parent
 
+    def _pathspecs(self):
+        return sync.written_pathspecs(str(self.REPO_ROOT))
+
+    def _covered(self, relative):
+        # Git's reading of the list: some include matches and no exclude does.
+        includes = [p for p in self._pathspecs() if not p.startswith(":(exclude)")]
+        excludes = [p.removeprefix(":(exclude)") for p in self._pathspecs() if p.startswith(":(exclude)")]
+        return any(fnmatch.fnmatchcase(relative, p) for p in includes) and relative not in excludes
+
     def test_every_pathspec_is_scoped_to_one_agent_and_the_prefix(self):
+        mirrored = sync.overlay_mirrored_skills(str(self.REPO_ROOT))
         self.assertEqual(
-            sync.written_pathspecs(),
-            [f"agents/{agent}/skills/{sync.SKILL_PREFIX}*" for agent in sync.target_agents()],
+            self._pathspecs(),
+            [f"agents/{agent}/skills/{sync.SKILL_PREFIX}*" for agent in sync.target_agents()]
+            + [f":(exclude){sync.SKILL_OVERLAY_SKILLS}/{name}" for name in sorted(mirrored)],
         )
-        self.assertTrue(sync.written_pathspecs(), "the sync writes somewhere")
+        self.assertTrue(self._pathspecs(), "the sync writes somewhere")
+
+    def test_overlay_mirrored_skills_are_excluded(self):
+        repo_root = Path(tempfile.mkdtemp())
+        overlay = repo_root / sync.SKILL_OVERLAY_ROOT / "gke-mirrored"
+        overlay.mkdir(parents=True)
+        (overlay / sync.SKILL_OVERLAY_LOCK).write_text("commit: x\nsha256: y\n", encoding="utf-8")
+        self.assertIn(
+            f":(exclude){sync.SKILL_OVERLAY_SKILLS}/gke-mirrored", sync.written_pathspecs(str(repo_root))
+        )
 
     def test_target_agents_covers_the_defaults_and_every_override(self):
         agents = sync.target_agents()
@@ -697,6 +740,7 @@ class WrittenPathspecsTest(unittest.TestCase):
     def test_pathspecs_match_exactly_the_skills_in_the_tree_the_sync_writes(self):
         # Read against the real tree rather than a fixture: the skills the recovery commands
         # must spare are the ones that actually sit beside the synced ones.
+        mirrored = sync.overlay_mirrored_skills(str(self.REPO_ROOT))
         matched, written = set(), set()
         for agent_dir in sorted((self.REPO_ROOT / "agents").iterdir()):
             skills_dir = agent_dir / "skills"
@@ -706,10 +750,12 @@ class WrittenPathspecsTest(unittest.TestCase):
                 if not skill.is_dir():
                     continue
                 relative = f"agents/{agent_dir.name}/skills/{skill.name}"
-                if any(fnmatch.fnmatchcase(relative, p) for p in sync.written_pathspecs()):
+                if self._covered(relative):
                     matched.add(relative)
-                if agent_dir.name in sync.target_agents() and skill.name.startswith(
-                    sync.SKILL_PREFIX
+                if (
+                    agent_dir.name in sync.target_agents()
+                    and skill.name.startswith(sync.SKILL_PREFIX)
+                    and skill.name not in mirrored
                 ):
                     written.add(relative)
         self.assertTrue(written, "no synced skills found in the tree")
@@ -719,29 +765,25 @@ class WrittenPathspecsTest(unittest.TestCase):
         # An operator runs these verbatim mid-abort. A pathspec one level broader reaches the
         # skills this repository maintains rather than syncs, and discards uncommitted work on
         # them that no run of this script could have produced.
-        message = sync.local_correction_lost_message("some detail")
+        message = sync.local_correction_lost_message("some detail", str(self.REPO_ROOT))
         commands = [line.strip() for line in message.splitlines() if line.startswith("  git ")]
-        self.assertEqual(
-            commands,
-            [
-                command
-                for pathspec in sync.written_pathspecs()
-                for command in (f"git checkout -- '{pathspec}'", f"git clean -fd '{pathspec}'")
-            ],
-        )
-        # Every unsynced skill in the tree survives both commands.
+        pathspecs = " ".join(f"'{p}'" for p in self._pathspecs())
+        self.assertEqual(commands, [f"git checkout -- {pathspecs}", f"git clean -fd -- {pathspecs}"])
+        # Every skill the sync does not write survives both commands.
+        mirrored = sync.overlay_mirrored_skills(str(self.REPO_ROOT))
         for agent_dir in sorted((self.REPO_ROOT / "agents").iterdir()):
             for skill in sorted((agent_dir / "skills").glob("*")):
                 relative = f"agents/{agent_dir.name}/skills/{skill.name}"
-                if agent_dir.name in sync.target_agents() and skill.name.startswith(
-                    sync.SKILL_PREFIX
+                if (
+                    agent_dir.name in sync.target_agents()
+                    and skill.name.startswith(sync.SKILL_PREFIX)
+                    and skill.name not in mirrored
                 ):
                     continue
-                for command in commands:
-                    self.assertFalse(
-                        fnmatch.fnmatchcase(relative, command.split("'")[1]),
-                        f"{command} would discard {relative}, which the sync never writes",
-                    )
+                self.assertFalse(
+                    self._covered(relative),
+                    f"the recovery commands would discard {relative}, which the sync never writes",
+                )
 
 
 class AbortTest(unittest.TestCase):

@@ -22,6 +22,11 @@ agentplugins/*/templates/*.yaml
 agents/*/skills/gke-*
 agents/*/skills/gke-*/**
 
+# Mirrored skills' upstream copies and overlays (scripts/skill_overlay.py). Copies stay
+# byte-identical to google/skills, and patch files and append.md must apply byte for byte.
+third_party/google-skills/**
+agents/*/skill-overlays/**
+
 # Monolithic custom semgrep rules bundle
 .github/semgrep-security-audit.yml
 

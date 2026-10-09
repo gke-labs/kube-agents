@@ -41,6 +41,8 @@ import patchlib
 
 RUNTIME = "gateway/slack_ux_failure.py"
 FLAG_ENV = "KAGE_SLACK_UX"
+#: Unset is on, so the flag-off path needs a value.
+FLAG_OFF = "false"
 IMPORT_MODULE = "gateway"
 IMPORT_NAME = "slack_ux_failure"
 ALIAS = "_kage_slack_failure"
@@ -224,10 +226,13 @@ def _draw(module, event) -> list:
 
 
 def drive(module) -> None:
-    os.environ.pop(FLAG_ENV, None)
+    os.environ[FLAG_ENV] = FLAG_OFF
     module.note_wake(SUB, {"gave_up"}, "wake")
     if module._marks:
-        raise _fail(f"a failure wake marked its thread with {FLAG_ENV} unset")
+        raise _fail(f"a failure wake marked its thread with {FLAG_ENV}={FLAG_OFF}")
+    os.environ.pop(FLAG_ENV, None)
+    if not module.enabled():
+        raise _fail(f"enabled() is false with {FLAG_ENV} unset, which is on")
     os.environ[FLAG_ENV] = "1"
     try:
         module.note_wake(SUB, {"gave_up"}, "wake")

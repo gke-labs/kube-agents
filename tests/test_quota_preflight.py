@@ -66,7 +66,7 @@ _DEFAULT_LIMITS_CPU_MILLIS = 10200
 # nowhere, so a generator that stopped parsing them could be regenerated and committed
 # together with a green `--check` (both sides move at once) and nothing would catch it.
 _DEFAULT_REQUESTS_MEMORY_BYTES = 8320 * 1024**2
-_DEFAULT_LIMITS_MEMORY_BYTES = 22016 * 1024**2
+_DEFAULT_LIMITS_MEMORY_BYTES = 23040 * 1024**2
 _DEFAULT_REQUESTS_EPHEMERAL_BYTES = 5 * 1024**3
 _DEFAULT_LIMITS_EPHEMERAL_BYTES = 5 * 1024**3
 # Cleanup hook Job: 50m requested / 200m limit, 64Mi requested / 128Mi limit, 1 pod.
@@ -117,10 +117,10 @@ _MILLICORES_PER_CORE = 1000
 # The credential proxy's footprint.yaml entry (the operator's defaults), and an override
 # of the one key an install raises (#2324). The preflight merges the override over the
 # entry per key, as the operator does, so only the overridden number moves.
-_PROXY_MEMORY_LIMIT_BYTES = 1 * 1024**3
+_PROXY_MEMORY_LIMIT_BYTES = 2 * 1024**3
 _PROXY_MEMORY_REQUEST_BYTES = 512 * 1024**2
 _PROXY_CPU_LIMIT_MILLIS = 1000
-_PROXY_OVERRIDE_MEMORY_LIMIT_BYTES = 2 * 1024**3
+_PROXY_OVERRIDE_MEMORY_LIMIT_BYTES = 3 * 1024**3
 _PROXY_OVERRIDE_CPU_LIMIT_MILLIS = 2000
 _PROXY_FLOAT_CPU_LIMIT = 1.5
 _PROXY_FLOAT_CPU_LIMIT_MILLIS = 1500
@@ -263,11 +263,11 @@ class PreflightDecisionTest(unittest.TestCase):
         )
 
     def test_credential_proxy_quantities_in_the_crds_dotted_forms_are_counted(self) -> None:
-        # `2.Gi` and `.5Ki` are in the CRD's grammar and resource.ParseQuantity reads
-        # them; the preflight parses them as 2Gi and 512 cores rather than refusing.
+        # `3.Gi` and `.5Ki` are in the CRD's grammar and resource.ParseQuantity reads
+        # them; the preflight parses them as 3Gi and 512 cores rather than refusing.
         base = self._requirements()
         raised = self._requirements(values={"platformAgent": {"deployment": {"credentialProxy": {
-            "resources": {"limits": {"memory": "2.Gi", "cpu": ".5Ki"}}}}}})
+            "resources": {"limits": {"memory": "3.Gi", "cpu": ".5Ki"}}}}}})
         self.assertEqual(
             raised["limitsMemory"] - base["limitsMemory"],
             _PROXY_OVERRIDE_MEMORY_LIMIT_BYTES - _PROXY_MEMORY_LIMIT_BYTES,
@@ -949,7 +949,7 @@ class PreflightDecisionTest(unittest.TestCase):
         )
         self.assertNotEqual(res.returncode, 0, "a too-small limits.memory quota must fail")
         self.assertIn("  - limits.memory:", res.stderr)
-        self.assertIn('"limits.memory":"25088Mi"', res.stderr)
+        self.assertIn('"limits.memory":"26112Mi"', res.stderr)
 
     def test_limits_ephemeral_storage_shortfall_is_enforced(self) -> None:
         """A quota deficient in limits.ephemeral-storage must be refused and named in the patch."""
@@ -1056,7 +1056,7 @@ class QuotaPreflightTest(unittest.TestCase):
         self.assertEqual(op["agentPod"]["base"]["memoryBytesLimit"], 10496 * 1024**2)
         self.assertEqual(op["agentPod"]["dashboard"]["memoryBytesLimit"], 2 * 1024**3)
         self.assertEqual(op["shellSandbox"]["memoryBytesLimit"], 2 * 1024**3)
-        self.assertEqual(op["credentialProxy"]["memoryBytesLimit"], 1 * 1024**3)
+        self.assertEqual(op["credentialProxy"]["memoryBytesLimit"], 2 * 1024**3)
 
         # Ephemeral storage is set on two of the four and deliberately 0 on the others;
         # asserting the zeroes is the point, since an unparsed value looks identical.

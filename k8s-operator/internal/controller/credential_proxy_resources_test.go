@@ -17,6 +17,7 @@ limitations under the License.
 package controller
 
 import (
+	"strconv"
 	"strings"
 	"testing"
 
@@ -59,15 +60,15 @@ func TestCredentialProxyResourcesDefaultToTheOperatorsValues(t *testing.T) {
 		assertQuantity(t, got.Requests, corev1.ResourceCPU, "500m")
 		assertQuantity(t, got.Requests, corev1.ResourceMemory, "512Mi")
 		assertQuantity(t, got.Limits, corev1.ResourceCPU, "1")
-		assertQuantity(t, got.Limits, corev1.ResourceMemory, "1Gi")
+		assertQuantity(t, got.Limits, corev1.ResourceMemory, "2Gi")
 		assertQuantity(t, got.Limits, corev1.ResourceEphemeralStorage, "2Gi")
 		if len(got.Requests) != 2 || len(got.Limits) != 3 {
 			t.Errorf("default render carries %d requests and %d limits, want 2 and 3", len(got.Requests), len(got.Limits))
 		}
 	}
 	container := buildCredentialProxyContainer(proxyAgentWithResources(nil))
-	if container.Resources.Limits.Memory().Cmp(resource.MustParse("1Gi")) != 0 {
-		t.Errorf("container memory limit = %s, want the 1Gi default", container.Resources.Limits.Memory())
+	if container.Resources.Limits.Memory().Cmp(resource.MustParse("2Gi")) != 0 {
+		t.Errorf("container memory limit = %s, want the 2Gi default", container.Resources.Limits.Memory())
 	}
 }
 
@@ -77,10 +78,10 @@ func TestCredentialProxyResourcesDefaultToTheOperatorsValues(t *testing.T) {
 // ephemeral-storage limit that bounds the content workspace all survive.
 func TestCredentialProxyMemoryLimitOverrideKeepsTheOtherDefaults(t *testing.T) {
 	container := buildCredentialProxyContainer(proxyAgentWithResources(&corev1.ResourceRequirements{
-		Limits: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("2Gi")},
+		Limits: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("3Gi")},
 	}))
 	got := container.Resources
-	assertQuantity(t, got.Limits, corev1.ResourceMemory, "2Gi")
+	assertQuantity(t, got.Limits, corev1.ResourceMemory, "3Gi")
 	assertQuantity(t, got.Requests, corev1.ResourceCPU, "500m")
 	assertQuantity(t, got.Requests, corev1.ResourceMemory, "512Mi")
 	assertQuantity(t, got.Limits, corev1.ResourceCPU, "1")
@@ -184,8 +185,9 @@ func TestCredentialProxyOverrideDoesNotAliasTheCR(t *testing.T) {
 
 // TestCredentialProxyBudgetArithmeticAtTheDefaults pins the numbers the design
 // quotes (docs/designs/credential-proxy-child-memory-budget.md §2.2 and §2.5):
-// a request costs 176 MiB at the 8 MiB cap, the 1Gi default admits four, and
-// the floor that admits two is 672 MiB.
+// a request costs 176 MiB at the 8 MiB cap, the 2Gi default admits nine
+// ((2048 - 192 - 128) / 176 = 9.8), the slot cap holds that to eight, and the
+// floor that admits two is 672 MiB.
 func TestCredentialProxyBudgetArithmeticAtTheDefaults(t *testing.T) {
 	const mib = 1 << 20
 	if credentialProxyOutputCapBytes != 8*mib {
@@ -195,8 +197,19 @@ func TestCredentialProxyBudgetArithmeticAtTheDefaults(t *testing.T) {
 		t.Errorf("request cost = %d MiB, want 176", got/mib)
 	}
 	defaultLimit := resource.MustParse(credentialProxyMemoryLimit)
-	if got := credentialProxyAdmittedRequests(defaultLimit.Value(), credentialProxyOutputCapBytes); got != 4 {
-		t.Errorf("the default limit admits %d requests, want 4", got)
+	if got := credentialProxyAdmittedRequests(defaultLimit.Value(), credentialProxyOutputCapBytes); got != 9 {
+		t.Errorf("the default limit admits %d requests, want 9", got)
+	}
+	// The kanban default runs six workers, each of which may hold a brokered
+	// command. What the proxy admits at once is the smaller of its memory
+	// budget and its slot cap, so both have to cover that many.
+	slotCap, err := strconv.ParseInt(credentialProxyMaxConcurrentCommands, 10, 64)
+	if err != nil {
+		t.Fatalf("credentialProxyMaxConcurrentCommands = %q is not an integer: %v", credentialProxyMaxConcurrentCommands, err)
+	}
+	admitted := min(credentialProxyAdmittedRequests(defaultLimit.Value(), credentialProxyOutputCapBytes), slotCap)
+	if admitted < defaultKanbanMaxInProgress {
+		t.Errorf("the proxy admits %d commands at once at its defaults (memory budget or slot cap of %d, whichever is smaller), fewer than the %d kanban workers the default cap runs", admitted, slotCap, defaultKanbanMaxInProgress)
 	}
 	if got := credentialProxyMinimumMemoryLimitBytes(credentialProxyOutputCapBytes); got != 672*mib {
 		t.Errorf("floor = %d MiB, want 672", got/mib)
