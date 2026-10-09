@@ -1029,7 +1029,7 @@ def grade_webhooks(configs: list[dict], services: list[dict], slices: list[dict]
             reason = backend_problem(service_ref, services, slices)
             if reason is None:
                 continue
-            matches = upgrade_path_matches(hook) or kube_system_write_matches(hook)
+            matches = upgrade_path_matches(hook) + kube_system_write_matches(hook)
             pinned = [] if matches else version_pinned_rules(hook)
             finding = {
                 "webhook": WEBHOOK_NAME_FORMAT.format(config=config_name, webhook=hook.get("name", "")),

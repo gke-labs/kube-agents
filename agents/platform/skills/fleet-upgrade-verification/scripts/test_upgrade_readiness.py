@@ -599,7 +599,7 @@ class KubeSystemReachTest(unittest.TestCase):
     def test_the_node_path_match_is_named_ahead_of_the_kube_system_reach(self):
         gate = hook("opa.example.com", [rule(["pods", "roles"], groups=("", "rbac.authorization.k8s.io"))], policy="Fail")
         blocking, _ = self._one([gate])
-        self.assertEqual(blocking[0]["upgrade_path"], ["CREATE pods"])
+        self.assertEqual(blocking[0]["upgrade_path"], ["CREATE pods", "CREATE roles in kube-system,kube-public"])
 
     def test_the_control_plane_write_lists_are_pinned(self):
         self.assertEqual(
