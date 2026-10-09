@@ -162,6 +162,12 @@ roots = [a for a in sys.argv[8:] if a]
 # Seconds a read waits on a locked store before reporting the card unread. A
 # hermes writer holds a WAL lock for milliseconds; anything longer is stuck.
 SQLITE_BUSY_TIMEOUT = 10
+# The reply is written in flushed pieces no larger than this. Under GKE Sandbox
+# (gVisor) a single write of more than 64 KiB to an exec session's stdout is
+# cut at 64 KiB (measured 2026-10-09: one print of 200,000 bytes arrived as
+# 65,537; 32 KiB flushed writes arrived whole), and one print of the JSON lost
+# every capture longer than that to a parse error.
+WRITE_CHUNK = 32768
 out = {"cards": [], "calls": [], "errors": [], "unread": [], "truncated": False, "clipped": []}
 
 
@@ -632,7 +638,10 @@ out["cards"] = [c for c in cards.values() if c is not None]
 for entry in out["calls"]:
     entry.pop("_id", None)
 print(SENTINEL)
-print(json.dumps(out, default=str))
+reply = json.dumps(out, default=str) + "\n"
+for start in range(0, len(reply), WRITE_CHUNK):
+    sys.stdout.write(reply[start:start + WRITE_CHUNK])
+    sys.stdout.flush()
 """
 
 
