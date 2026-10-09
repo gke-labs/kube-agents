@@ -1019,6 +1019,10 @@ class TestSessionKvServerAuth(unittest.TestCase):
         ("POST", "/v1/findings/expire-snoozes", None),
         ("GET", "/v1/findings/publication/backlog", None),
         ("PUT", "/v1/findings/publication/backlog", {"target_kind": "chat"}),
+        ("GET", "/v1/intercepted-events", None),
+        ("GET", "/v1/sessions/sess-1/tasks", None),
+        ("GET", "/v1/tasks", None),
+        ("GET", "/v1/tasks/t-1", None),
     )
 
     def setUp(self):
@@ -1067,6 +1071,7 @@ class TestSessionKvServerAuth(unittest.TestCase):
                 path.split("?")[0]
                 .replace("sess-1", "{session_id}")
                 .replace("f-1", "{finding_id}")
+                .replace("t-1", "{task_id}")
                 .replace("publication/backlog", "publication/{publisher}"),
             )
             for method, path, _ in self.PROTECTED_ROUTES
@@ -4851,7 +4856,6 @@ class TestDriftInject(unittest.TestCase):
         self.assertIn(f'injectKindDrift = "{session_kv_server.INJECT_KIND_DRIFT}"', source)
 
 
-
 class TestStallInject(unittest.TestCase):
     """The `controller-stall` half of /sessions/{id}/inject."""
 
@@ -5097,6 +5101,778 @@ class TestStallInject(unittest.TestCase):
             [line for line in card.splitlines() if line.startswith("## ")],
             ["## What's wrong", "## Why", "## What to do"],
         )
+
+
+class TestReadOnlyActivityFeed(unittest.TestCase):
+    """Read-only HTTP activity feed for intercepted events and kanban tasks."""
+
+    def setUp(self):
+        import sqlite3
+        from fastapi.testclient import TestClient
+
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmpdir.cleanup)
+        self.root = Path(self._tmpdir.name)
+        self.kanban_path = self.root / "kanban.db"
+
+        with sqlite3.connect(temp_db_path) as conn:
+            conn.execute("DELETE FROM intercepted_events")
+            conn.execute("DELETE FROM alert_quota")
+
+        patcher = patch.object(session_kv_server, "KANBAN_DB_PATH", str(self.kanban_path))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+        os.environ["SESSION_KV_API_KEY"] = API_KEY
+        self.addCleanup(lambda: os.environ.pop("SESSION_KV_API_KEY", None))
+        self.client = TestClient(session_kv_server.app, headers=AUTH_HEADERS)
+
+    def _create_kanban_schema(self):
+        import sqlite3
+
+        with sqlite3.connect(self.kanban_path) as conn:
+            conn.executescript(
+                """
+                CREATE TABLE tasks (
+                    id TEXT PRIMARY KEY,
+                    title TEXT,
+                    body TEXT,
+                    assignee TEXT,
+                    status TEXT,
+                    priority INTEGER,
+                    session_id TEXT,
+                    created_at REAL,
+                    started_at REAL,
+                    completed_at REAL,
+                    last_heartbeat_at REAL,
+                    result TEXT,
+                    last_failure_error TEXT
+                );
+                CREATE TABLE task_runs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    task_id TEXT,
+                    profile TEXT,
+                    status TEXT,
+                    started_at REAL,
+                    ended_at REAL,
+                    outcome TEXT,
+                    summary TEXT,
+                    error TEXT,
+                    metadata TEXT
+                );
+                CREATE TABLE task_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    task_id TEXT,
+                    run_id INTEGER,
+                    kind TEXT,
+                    payload TEXT,
+                    created_at REAL
+                );
+                CREATE TABLE task_comments (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    task_id TEXT,
+                    author TEXT,
+                    body TEXT,
+                    created_at REAL
+                );
+                """
+            )
+
+    @patch.object(session_kv_server, "trigger_agent_troubleshooter")
+    def test_intercepted_events_feed_returns_statuses_and_paginates_by_since_id(self, _mock_trigger):
+        r1 = self.client.post(
+            "/sessions/k8s-evt-1/inject",
+            json={
+                "message": json.dumps(
+                    {
+                        "type": "Warning",
+                        "reason": "BackOff",
+                        "namespace": "prod",
+                        "involvedObject": {"kind": "Pod", "name": "api-7b9f-abcde", "uid": "u1"},
+                        "message": "Back-off restarting failed container",
+                        "cluster": "gke-1",
+                    }
+                )
+            },
+        )
+        self.assertEqual(r1.status_code, 200)
+
+        id_undelivered = session_kv_server.record_intercepted_event(
+            cluster="gke-1",
+            namespace="prod",
+            workload="db",
+            object_uid="u2",
+            object_kind="StatefulSet",
+            reason="FailedScheduling",
+            message="0/3 nodes available",
+            severity="Critical",
+            occurrences=1,
+            notified=True,
+            session_id="k8s-evt-2",
+        )
+        session_kv_server.mark_delivery_failed(id_undelivered, "chat post failed")
+
+        session_kv_server.record_intercepted_event(
+            cluster="gke-1",
+            namespace="prod",
+            workload="worker",
+            object_uid="u3",
+            object_kind="Pod",
+            reason="Pulled",
+            message="Successfully pulled image",
+            severity="Info",
+            occurrences=1,
+            notified=False,
+            session_id="k8s-evt-3",
+        )
+        session_kv_server.record_intercepted_event(
+            cluster="gke-1",
+            namespace="prod",
+            workload="cache",
+            object_uid="u4",
+            object_kind="Pod",
+            reason="Unhealthy",
+            message="Readiness probe failed",
+            severity="Warning",
+            occurrences=2,
+            notified=False,
+            session_id="k8s-evt-4",
+        )
+
+        initial = self.client.get("/v1/intercepted-events?limit=2").json()
+        self.assertTrue(initial["truncated"])
+        self.assertEqual(len(initial["events"]), 2)
+        self.assertEqual(initial["events"][0]["session_id"], "k8s-evt-4")
+        self.assertEqual(initial["events"][0]["status"], "suppressed")
+        self.assertEqual(initial["events"][1]["session_id"], "k8s-evt-3")
+        self.assertEqual(initial["events"][1]["status"], "filtered")
+
+        first_id = id_undelivered - 1
+        polled = self.client.get(f"/v1/intercepted-events?since_id={first_id - 1}&limit=10").json()
+        self.assertFalse(polled["truncated"])
+        self.assertEqual(
+            [(e["session_id"], e["status"]) for e in polled["events"]],
+            [
+                ("k8s-evt-1", "injected"),
+                ("k8s-evt-2", "undelivered"),
+                ("k8s-evt-3", "filtered"),
+                ("k8s-evt-4", "suppressed"),
+            ],
+        )
+        self.assertEqual(polled["next_since_id"], polled["events"][-1]["id"])
+
+    def test_kanban_task_feeds_and_detail(self):
+        # Before kanban.db exists: empty list feed with board=False, 404 on detail
+        empty_sess = self.client.get("/v1/sessions/k8s-evt-1/tasks").json()
+        self.assertEqual(empty_sess, {"tasks": [], "truncated": False, "board": False})
+        empty_all = self.client.get("/v1/tasks").json()
+        self.assertEqual(empty_all, {"tasks": [], "truncated": False, "board": False})
+        self.assertEqual(self.client.get("/v1/tasks/t_1").status_code, 404)
+
+        self._create_kanban_schema()
+        import sqlite3
+
+        with sqlite3.connect(self.kanban_path) as conn:
+            conn.execute(
+                "INSERT INTO tasks (id, title, body, assignee, status, priority, session_id, created_at, started_at, completed_at, result) "
+                "VALUES ('t_1', 'Triage prod', 'triage body', 'cluster-a', 'done', 1, 'k8s-evt-1', 100.0, 101.0, 120.0, 'Root cause found')"
+            )
+            conn.execute(
+                "INSERT INTO tasks (id, title, body, assignee, status, priority, session_id, created_at, started_at, last_heartbeat_at) "
+                "VALUES ('t_2', 'Open PR', 'pr body', 'platform', 'in_progress', 1, 'k8s-evt-1', 121.0, 122.0, 130.0)"
+            )
+            conn.execute(
+                "INSERT INTO task_runs (task_id, profile, status, started_at, ended_at, outcome, summary) "
+                "VALUES ('t_1', 'cluster-a', 'completed', 101.0, 120.0, 'completed', 'Found bad env var')"
+            )
+            conn.execute(
+                "INSERT INTO task_events (task_id, run_id, kind, payload, created_at) "
+                "VALUES ('t_1', 1, 'heartbeat', 'checking pod logs', 110.0)"
+            )
+            conn.execute(
+                "INSERT INTO task_comments (task_id, author, body, created_at) "
+                "VALUES ('t_1', 'cluster-a', ' verified replicaset', 115.0)"
+            )
+
+        sess_feed = self.client.get("/v1/sessions/k8s-evt-1/tasks").json()
+        self.assertTrue(sess_feed["board"])
+        self.assertFalse(sess_feed["truncated"])
+        self.assertEqual([t["id"] for t in sess_feed["tasks"]], ["t_1", "t_2"])
+        self.assertEqual(sess_feed["tasks"][0]["summary"], "Found bad env var")
+        self.assertEqual(sess_feed["tasks"][0]["result"], "Root cause found")
+
+        by_assignee = self.client.get("/v1/tasks?since=125&assignee=platform").json()
+        self.assertEqual([t["id"] for t in by_assignee["tasks"]], ["t_2"])
+
+        detail = self.client.get("/v1/tasks/t_1").json()
+        self.assertEqual(detail["task"]["id"], "t_1")
+        self.assertEqual(detail["task"]["body"], "triage body")
+        self.assertEqual(len(detail["runs"]), 1)
+        self.assertEqual(len(detail["events"]), 1)
+        self.assertEqual(len(detail["comments"]), 1)
+        self.assertEqual(self.client.get("/v1/tasks/no-such-task").status_code, 404)
+
+    def test_init_db_adds_session_id_column_idempotently_to_legacy_ledger(self):
+        import sqlite3
+
+        legacy_db = self.root / "legacy_session_kv.db"
+        with sqlite3.connect(legacy_db) as conn:
+            conn.execute(
+                """
+                CREATE TABLE intercepted_events (
+                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                    cluster     TEXT NOT NULL DEFAULT '',
+                    namespace   TEXT NOT NULL DEFAULT '',
+                    workload    TEXT NOT NULL DEFAULT '',
+                    object_uid  TEXT NOT NULL DEFAULT '',
+                    object_kind TEXT NOT NULL DEFAULT '',
+                    reason      TEXT NOT NULL DEFAULT '',
+                    message     TEXT NOT NULL DEFAULT '',
+                    severity    TEXT NOT NULL DEFAULT '',
+                    occurrences INTEGER NOT NULL DEFAULT 1,
+                    notified    INTEGER NOT NULL DEFAULT 0,
+                    delivery_error TEXT NOT NULL DEFAULT '',
+                    created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+            conn.execute(
+                "INSERT INTO intercepted_events (cluster, namespace, workload, reason, severity) "
+                "VALUES ('gke-1', 'prod', 'old-pod', 'BackOff', 'Warning')"
+            )
+
+        with patch.object(session_kv_server, "SESSION_KV_DB_PATH", str(legacy_db)):
+            session_kv_server.init_db()
+            session_kv_server.init_db()
+            row_id = session_kv_server.record_intercepted_event(
+                cluster="gke-1",
+                namespace="prod",
+                workload="new-pod",
+                object_uid="uid-new",
+                object_kind="Pod",
+                reason="BackOff",
+                message="restarting",
+                severity="Warning",
+                occurrences=1,
+                notified=True,
+                session_id="k8s-evt-migrated",
+            )
+            self.assertIsNotNone(row_id)
+            feed = self.client.get("/v1/intercepted-events").json()
+            by_name = {e["name"]: e["session_id"] for e in feed["events"]}
+            self.assertEqual(by_name["old-pod"], "")
+            self.assertEqual(by_name["new-pod"], "k8s-evt-migrated")
+
+    @patch.object(session_kv_server, "trigger_agent_troubleshooter")
+    def test_drift_and_stall_injects_stamp_session_id_in_feed(self, _mock_trigger):
+        drift_resp = self.client.post(
+            "/sessions/drift-sess-1/inject",
+            json={
+                "message": json.dumps(
+                    {
+                        "kind": "gitops-drift",
+                        "cluster": "gke-1",
+                        "insert_id": "ins-1",
+                        "principal": "alice@example.com",
+                        "verb": "patch",
+                        "resource": {
+                            "group": "apps",
+                            "version": "v1",
+                            "resource": "deployments",
+                            "namespace": "prod",
+                            "name": "checkout",
+                        },
+                    }
+                )
+            },
+        )
+        self.assertEqual(drift_resp.status_code, 200)
+
+        stall_resp = self.client.post(
+            "/sessions/stall-sess-1/inject",
+            json={
+                "message": json.dumps(
+                    {
+                        "kind": "controller-stall",
+                        "cluster": "gke-1",
+                        "namespace": "prod",
+                        "objects": [
+                            {
+                                "object": "Deployment/checkout",
+                                "heuristic": "stale-condition",
+                                "stalled_for": "15m",
+                            }
+                        ],
+                    }
+                )
+            },
+        )
+        self.assertEqual(stall_resp.status_code, 200)
+
+        feed = self.client.get("/v1/intercepted-events").json()
+        by_reason = {e["reason"]: e["session_id"] for e in feed["events"]}
+        self.assertEqual(by_reason[session_kv_server.DRIFT_LEDGER_REASON], "drift-sess-1")
+        self.assertEqual(by_reason[session_kv_server.STALL_LEDGER_REASON], "stall-sess-1")
+
+    @patch.object(session_kv_server, "_start_agent_turn")
+    @patch.object(session_kv_server, "_build_agent_query", return_value="q")
+    @patch.object(session_kv_server, "_create_gateway_session", return_value=True)
+    @patch.object(session_kv_server, "_post_initial_alert")
+    @patch.object(session_kv_server, "mark_delivery_failed")
+    def test_headless_install_with_chat_disabled_keeps_status_injected(
+        self, mock_mark_failed, mock_post, mock_create_session, mock_start_turn, *_
+    ):
+        managed_cfg = self.root / "managed-config.yaml"
+        managed_cfg.write_text(
+            "platforms:\n  google_chat:\n    enabled: false\n  slack:\n    enabled: false\n",
+            encoding="utf-8",
+        )
+        with patch.object(session_kv_server, "MANAGED_CONFIG_PATH", str(managed_cfg)):
+            row_id = session_kv_server.record_intercepted_event(
+                cluster="gke-1",
+                namespace="prod",
+                workload="api",
+                object_uid="u-headless",
+                object_kind="Pod",
+                reason="BackOff",
+                message="restarting",
+                severity="Warning",
+                occurrences=1,
+                notified=True,
+                session_id="k8s-evt-headless",
+            )
+            session_kv_server.trigger_agent_troubleshooter("k8s-evt-headless", "alert", {}, row_id)
+            mock_post.assert_not_called()
+            mock_mark_failed.assert_not_called()
+            mock_create_session.assert_called_once()
+            mock_start_turn.assert_called_once()
+
+            feed = self.client.get("/v1/intercepted-events").json()
+            self.assertEqual(feed["events"][0]["session_id"], "k8s-evt-headless")
+            self.assertEqual(feed["events"][0]["status"], "injected")
+
+    def test_out_of_range_since_id_and_since_return_400_instead_of_500(self):
+        overflow = (1 << 63)
+        for bad in (-1, overflow):
+            with self.subTest(bad=bad):
+                r_events = self.client.get(f"/v1/intercepted-events?since_id={bad}")
+                self.assertEqual(r_events.status_code, 400)
+                r_tasks = self.client.get(f"/v1/tasks?since={bad}")
+                self.assertEqual(r_tasks.status_code, 400)
+
+    def test_kanban_db_path_uses_hermes_resolver_and_falls_back_to_agent_home(self):
+        import types
+
+        with patch.object(session_kv_server, "KANBAN_DB_PATH", None):
+            package = types.ModuleType("hermes_cli")
+            module = types.ModuleType("hermes_cli.kanban_db")
+            module.kanban_db_path = lambda: Path("/opt/data/kanban/boards/ops/kanban.db")
+            package.kanban_db = module
+            with patch.dict(sys.modules, {"hermes_cli": package, "hermes_cli.kanban_db": module}):
+                self.assertEqual(
+                    session_kv_server._kanban_db_path(),
+                    "/opt/data/kanban/boards/ops/kanban.db",
+                )
+
+            with patch.dict(sys.modules, {"hermes_cli": None, "hermes_cli.kanban_db": None}), patch.dict(
+                os.environ,
+                {"PLATFORM_AGENT_HOME": "/custom/home", "HERMES_HOME": "/custom/home/profiles/platform"},
+            ):
+                self.assertEqual(
+                    session_kv_server._kanban_db_path(),
+                    "/custom/home/kanban.db",
+                )
+
+
+
+class TestTaskWorkerStepsFeed(unittest.TestCase):
+    """`GET /v1/tasks/{id}` and `GET /v1/sessions/{sid}/tasks` return the worker's live Hermes steps from `state.db`."""
+
+    def setUp(self):
+        import sqlite3
+        from fastapi.testclient import TestClient
+
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmpdir.cleanup)
+        self.root = Path(self._tmpdir.name)
+        self.kanban_path = self.root / "kanban.db"
+
+        with sqlite3.connect(self.kanban_path) as conn:
+            conn.executescript(
+                """
+                CREATE TABLE tasks (
+                    id TEXT PRIMARY KEY,
+                    title TEXT,
+                    body TEXT,
+                    assignee TEXT,
+                    status TEXT,
+                    priority INTEGER,
+                    session_id TEXT,
+                    created_at REAL,
+                    started_at REAL,
+                    completed_at REAL,
+                    last_heartbeat_at REAL,
+                    result TEXT,
+                    last_failure_error TEXT
+                );
+                CREATE TABLE task_runs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    task_id TEXT,
+                    profile TEXT,
+                    status TEXT,
+                    started_at REAL,
+                    ended_at REAL,
+                    outcome TEXT,
+                    summary TEXT,
+                    error TEXT,
+                    metadata TEXT
+                );
+                CREATE TABLE task_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    task_id TEXT,
+                    run_id INTEGER,
+                    kind TEXT,
+                    payload TEXT,
+                    created_at REAL
+                );
+                CREATE TABLE task_comments (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    task_id TEXT,
+                    author TEXT,
+                    body TEXT,
+                    created_at REAL
+                );
+                """
+            )
+            conn.execute(
+                "INSERT INTO tasks (id, title, body, assignee, status, priority, session_id, created_at) "
+                "VALUES ('t_d1c3323e', 'Open GitOps PR', 'body', 'platform', 'running', 1, 'k8s-evt-1', 100.0)"
+            )
+            conn.execute(
+                "INSERT INTO task_runs (task_id, profile, status, started_at, metadata) "
+                "VALUES ('t_d1c3323e', 'platform', 'running', 101.0, '{}')"
+            )
+
+        patcher = patch.object(session_kv_server, "KANBAN_DB_PATH", str(self.kanban_path))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+        self.kv_db_path = self.root / "session_kv.db"
+        kv_patcher = patch.object(session_kv_server, "SESSION_KV_DB_PATH", str(self.kv_db_path))
+        kv_patcher.start()
+        self.addCleanup(kv_patcher.stop)
+        session_kv_server.init_db()
+
+        os.environ["SESSION_KV_API_KEY"] = API_KEY
+        self.addCleanup(lambda: os.environ.pop("SESSION_KV_API_KEY", None))
+        self.client = TestClient(session_kv_server.app, headers=AUTH_HEADERS)
+
+    def _record_ledger_session(self, session_id: str):
+        session_kv_server.record_intercepted_event(
+            cluster="prod-us",
+            namespace="default",
+            workload="payments-api",
+            object_uid="uid-1",
+            object_kind="Pod",
+            reason="BackOff",
+            message="Back-off restarting failed container",
+            severity="Warning",
+            occurrences=1,
+            notified=True,
+            session_id=session_id,
+        )
+
+    def _write_profile_store(
+        self,
+        profile: str,
+        rows: list[tuple],
+        sessions: list[tuple] | None = None,
+    ):
+        import sqlite3
+
+        if not profile or profile == "default":
+            db_path = self.root / "state.db"
+        else:
+            db_path = self.root / "profiles" / profile / "state.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        with sqlite3.connect(db_path) as conn:
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS sessions ("
+                "id TEXT PRIMARY KEY, title TEXT, started_at REAL, ended_at REAL)"
+            )
+            if sessions:
+                for sid, title, started_at, ended_at in sessions:
+                    conn.execute(
+                        "INSERT OR REPLACE INTO sessions (id, title, started_at, ended_at) VALUES (?, ?, ?, ?)",
+                        (sid, title, started_at, ended_at),
+                    )
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS messages ("
+                "id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT, role TEXT, "
+                "content TEXT, tool_name TEXT, tool_calls TEXT, timestamp REAL, "
+                "reasoning TEXT, active INTEGER DEFAULT 1)"
+            )
+            for sid, role, content, tool_name, tool_calls, ts, reasoning in rows:
+                conn.execute(
+                    "INSERT INTO messages (session_id, role, content, tool_name, tool_calls, timestamp, reasoning) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        sid,
+                        role,
+                        content,
+                        tool_name,
+                        json.dumps(tool_calls) if tool_calls is not None else None,
+                        ts,
+                        reasoning,
+                    ),
+                )
+
+    def test_worker_steps_are_matched_by_dispatcher_prompt_and_returned_in_order(self):
+        long_output = "diff --git a/deployment.yaml b/deployment.yaml\n" + ("+line\n" * 80)
+        self._write_profile_store(
+            "platform",
+            [
+                ("sess-other", "user", "work kanban task t_d1c3323e_other", None, None, 90.0, None),
+                (
+                    "sess-other",
+                    "assistant",
+                    None,
+                    None,
+                    [{"function": {"name": "terminal", "arguments": '{"command":"wrong"}'}}],
+                    91.0,
+                    None,
+                ),
+                ("sess-worker", "user", "work kanban task t_d1c3323e", None, None, 101.0, None),
+                (
+                    "sess-worker",
+                    "assistant",
+                    None,
+                    None,
+                    [{"function": {"name": "terminal", "arguments": '{"command":"submit_suggestion.py prepare"}'}}],
+                    102.0,
+                    "Checking the triage options and preparing the suggestion branch.",
+                ),
+                ("sess-worker", "tool", long_output, "terminal", None, 103.0, None),
+                ("sess-worker", "assistant", "Opened Pull Request #1.", None, None, 104.0, None),
+            ],
+        )
+
+        resp = self.client.get("/v1/tasks/t_d1c3323e")
+        self.assertEqual(resp.status_code, 200)
+        body = resp.json()
+        self.assertFalse(body["steps_truncated"])
+        steps = body["steps"]
+        self.assertEqual([s["kind"] for s in steps], ["thinking", "tool_call", "tool_result", "reply"])
+        self.assertEqual(steps[0]["preview"], "Checking the triage options and preparing the suggestion branch.")
+        self.assertEqual(steps[1]["tool"], "terminal")
+        self.assertIn("submit_suggestion.py prepare", steps[1]["preview"])
+        self.assertEqual(steps[2]["tool"], "terminal")
+        self.assertTrue(steps[2]["preview"].endswith("…"))
+        self.assertIn("+line", steps[2]["detail"])
+        self.assertEqual(steps[3]["preview"], "Opened Pull Request #1.")
+
+        sess_resp = self.client.get("/v1/sessions/k8s-evt-1/tasks")
+        self.assertEqual(sess_resp.status_code, 200)
+        sess_tasks = sess_resp.json()["tasks"]
+        self.assertEqual(len(sess_tasks), 1)
+        self.assertEqual([s["kind"] for s in sess_tasks[0]["live_steps"]], ["thinking", "tool_call", "tool_result", "reply"])
+        self.assertFalse(sess_tasks[0]["steps_truncated"])
+
+    def test_missing_profile_store_returns_empty_steps_without_failing(self):
+        resp = self.client.get("/v1/tasks/t_d1c3323e")
+        self.assertEqual(resp.status_code, 200)
+        body = resp.json()
+        self.assertEqual(body["steps"], [])
+        self.assertFalse(body["steps_truncated"])
+
+    def test_worker_steps_redact_credentials_and_withhold_when_redactor_unavailable(self):
+        secret_tok = "ghp_" + "A" * 36
+        self._write_profile_store(
+            "platform",
+            [
+                ("sess-sec", "user", "work kanban task t_d1c3323e", None, None, 101.0, None),
+                (
+                    "sess-sec",
+                    "assistant",
+                    None,
+                    None,
+                    [
+                        {
+                            "function": {
+                                "name": "terminal",
+                                "arguments": json.dumps({"command": f"curl -H 'Authorization: Bearer {secret_tok}'"}),
+                            }
+                        }
+                    ],
+                    102.0,
+                    f"Using token {secret_tok} to inspect endpoint.",
+                ),
+                (
+                    "sess-sec",
+                    "tool",
+                    f"apiVersion: v1\nkind: Secret\ndata:\n  token: {secret_tok}\n",
+                    "terminal",
+                    None,
+                    103.0,
+                    None,
+                ),
+                ("sess-sec", "assistant", f"Checked {secret_tok} successfully.", None, None, 104.0, None),
+            ],
+        )
+
+        body = self.client.get("/v1/tasks/t_d1c3323e").json()
+        serialized = json.dumps(body["steps"])
+        self.assertNotIn(secret_tok, serialized)
+        self.assertIn("[REDACTED_SECRET]", serialized)
+
+        with patch.object(session_kv_server, "_get_audit_redactor", return_value=None):
+            fallback = self.client.get("/v1/tasks/t_d1c3323e").json()["steps"]
+            by_kind = {s["kind"]: s["preview"] for s in fallback}
+            self.assertEqual(by_kind["tool_call"], session_kv_server.WORKER_STEP_WITHHELD)
+            self.assertEqual(by_kind["tool_result"], session_kv_server.WORKER_STEP_WITHHELD)
+
+    def test_steps_truncated_is_true_when_sql_row_window_clips_older_rows(self):
+        rows: list[tuple] = [
+            ("sess-win", "user", "work kanban task t_d1c3323e", None, None, 1.0, None),
+            ("sess-win", "assistant", "Old step that will be clipped", None, None, 2.0, None),
+        ]
+        window = session_kv_server.TASK_DETAIL_MAX_STEPS * session_kv_server.TASK_STEP_ROW_MULTIPLIER
+        for idx in range(window):
+            rows.append(("sess-win", "user", f"user-turn-{idx}", None, None, float(10 + idx), None))
+        rows.append(("sess-win", "assistant", "Final visible reply", None, None, 999.0, None))
+        self._write_profile_store("platform", rows)
+
+        body = self.client.get("/v1/tasks/t_d1c3323e").json()
+        self.assertTrue(body["steps_truncated"])
+        self.assertEqual(len(body["steps"]), 1)
+        self.assertEqual(body["steps"][0]["preview"], "Final visible reply")
+
+    def test_session_tasks_reuses_single_profile_connection_across_multiple_cards(self):
+        import sqlite3
+
+        with sqlite3.connect(self.kanban_path) as conn:
+            conn.execute(
+                "INSERT INTO tasks (id, title, body, assignee, status, priority, session_id, created_at) "
+                "VALUES ('t_second', 'Second task', 'body2', 'platform', 'running', 1, 'k8s-evt-1', 105.0)"
+            )
+            conn.execute(
+                "INSERT INTO task_runs (task_id, profile, status, started_at, metadata) "
+                "VALUES ('t_second', 'platform', 'running', 106.0, '{}')"
+            )
+        self._write_profile_store(
+            "platform",
+            [
+                ("sess-1", "user", "work kanban task t_d1c3323e", None, None, 101.0, None),
+                ("sess-1", "assistant", "First card reply", None, None, 102.0, None),
+                ("sess-2", "user", "work kanban task t_second", None, None, 106.0, None),
+                ("sess-2", "assistant", "Second card reply", None, None, 107.0, None),
+            ],
+        )
+
+        real_read_only = session_kv_server._read_only
+        opened_paths: list[str] = []
+
+        def counting_read_only(path: str):
+            opened_paths.append(path)
+            return real_read_only(path)
+
+        with patch.object(session_kv_server, "_read_only", side_effect=counting_read_only):
+            resp = self.client.get("/v1/sessions/k8s-evt-1/tasks")
+        self.assertEqual(resp.status_code, 200)
+        tasks = resp.json()["tasks"]
+        self.assertEqual([t["id"] for t in tasks], ["t_d1c3323e", "t_second"])
+        self.assertEqual(tasks[0]["live_steps"][0]["preview"], "First card reply")
+        self.assertEqual(tasks[1]["live_steps"][0]["preview"], "Second card reply")
+        profile_opens = [p for p in opened_paths if p.endswith("state.db")]
+        self.assertEqual(len(profile_opens), 1)
+
+    def test_pre_kanban_live_session_synthesized_when_no_card_exists_yet(self):
+        now = time.time()
+        self._record_ledger_session("k8s-evt-pre")
+        self._write_profile_store(
+            "default",
+            [
+                ("k8s-evt-pre", "user", "A Kubernetes Warning event needs triage...", None, None, now - 2.0, None),
+                (
+                    "k8s-evt-pre",
+                    "assistant",
+                    None,
+                    None,
+                    [{"function": {"name": "kanban_create", "arguments": '{"assignee":"cluster-gke","title":"Triage"}'}}],
+                    now - 1.0,
+                    "Routing the warning event to the cluster specialist.",
+                ),
+            ],
+            sessions=[("k8s-evt-pre", "Triage default/Pod/payments-api (BackOff)", now - 2.0, None)],
+        )
+
+        resp = self.client.get("/v1/sessions/k8s-evt-pre/tasks")
+        self.assertEqual(resp.status_code, 200)
+        body = resp.json()
+        self.assertTrue(body["board"])
+        self.assertEqual(len(body["tasks"]), 1)
+        task = body["tasks"][0]
+        self.assertEqual(task["id"], "pre-kanban:k8s-evt-pre")
+        self.assertEqual(task["title"], "Triage default/Pod/payments-api (BackOff)")
+        self.assertEqual(task["assignee"], "incident-triage")
+        self.assertEqual(task["status"], "in_progress")
+        self.assertEqual(task["session_id"], "k8s-evt-pre")
+        self.assertIsNone(task["completed_at"])
+        self.assertEqual([s["kind"] for s in task["live_steps"]], ["thinking", "tool_call"])
+        self.assertEqual(task["live_steps"][1]["tool"], "kanban_create")
+        self.assertFalse(task["steps_truncated"])
+
+        unknown_resp = self.client.get("/v1/sessions/k8s-evt-nonexistent/tasks")
+        self.assertEqual(unknown_resp.status_code, 200)
+        self.assertEqual(unknown_resp.json()["tasks"], [])
+
+    def test_pre_kanban_ended_or_stale_session_reports_terminal_status(self):
+        now = time.time()
+        self._record_ledger_session("k8s-evt-ended")
+        self._record_ledger_session("k8s-evt-stale")
+        final_prose = "## What's wrong\n\nContainer failed liveness probe due to port mismatch."
+        self._write_profile_store(
+            "default",
+            [
+                ("k8s-evt-ended", "user", "A Kubernetes Warning event needs triage...", None, None, now - 10.0, None),
+                ("k8s-evt-ended", "assistant", final_prose, None, None, now - 5.0, "Diagnosing directly."),
+                ("k8s-evt-stale", "user", "A Kubernetes Warning event needs triage...", None, None, now - 600.0, None),
+                ("k8s-evt-stale", "assistant", None, None, None, now - 595.0, "Starting routing turn..."),
+            ],
+            sessions=[
+                ("k8s-evt-ended", "Triage ended session", now - 10.0, now - 4.0),
+                ("k8s-evt-stale", "Triage stale session", now - 600.0, None),
+            ],
+        )
+
+        ended_task = self.client.get("/v1/sessions/k8s-evt-ended/tasks").json()["tasks"][0]
+        self.assertEqual(ended_task["status"], "completed")
+        self.assertEqual(ended_task["completed_at"], now - 4.0)
+        self.assertEqual(ended_task["result"], final_prose)
+        self.assertEqual(ended_task["summary"], final_prose)
+        self.assertIsNone(ended_task["error"])
+
+        stale_task = self.client.get("/v1/sessions/k8s-evt-stale/tasks").json()["tasks"][0]
+        self.assertEqual(stale_task["status"], "failed")
+        self.assertEqual(stale_task["completed_at"], now - 595.0)
+        self.assertEqual(stale_task["error"], session_kv_server.PRE_KANBAN_STALE_ERROR)
+
+    def test_pre_kanban_rejects_non_ledger_front_door_chat_session(self):
+        now = time.time()
+        self._write_profile_store(
+            "default",
+            [
+                ("slack-thread-123", "user", "Can you check our staging secret?", None, None, now - 2.0, None),
+                ("slack-thread-123", "assistant", "Here is the chat reply.", None, None, now - 1.0, None),
+            ],
+            sessions=[("slack-thread-123", "Slack conversation", now - 2.0, None)],
+        )
+
+        resp = self.client.get("/v1/sessions/slack-thread-123/tasks")
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json()["tasks"], [])
+
+
 
 if __name__ == "__main__":
     # Clean up temp database file on exit
