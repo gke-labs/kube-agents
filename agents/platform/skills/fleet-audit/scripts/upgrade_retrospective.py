@@ -66,22 +66,23 @@ reported "outside the fleet; not recorded" and gets no ledger entry or
 guard), prunes nothing, reports no stale guard outside its scope, writes
 `reports/<finish-UTC>-scoped.md` and leaves the link alone; `--since` is a
 hand run that widens the window and advances no last-run time. The newest fourteen reports of each kind are kept. Each
-symptom carries an onset. An owned pod's is read at the owner first, and
-owner evidence counts only when it says something failed: a Deployment's
-earliest `Available=False` or `Progressing=False` transition, or, with
-neither, its newest ReplicaSet's creation when that falls inside the
-upgrade window (a rollout during the upgrade). A Deployment whose
-conditions are all True and whose ReplicaSet predates the window has no
-owner evidence; its pods, like a StatefulSet's, a DaemonSet's, a Job's or
-a bare pod, are read from their own evidence: a
+symptom carries an onset. The pod's own evidence is every symptom's
+onset: a
 Pending pod's scheduling transition or start; a not-Ready pod's `Ready`
 transition to False, else its start (the earlier of the two once it has
-restarted), never its latest crash. A pod-sourced onset on a pod created
-inside a pool operation's window is marked recreated, and on a first run a
-symptom whose only onset is such a pod is graded medium, a Warning saying
-the failure may predate the upgrade, until a later full run settles it by
-owner. Events carry their first observation, nodes their condition's
-transition; one whose onset predates the window's first operation, or
+restarted), never its latest crash. A pod created inside a pool
+operation's window is marked recreated, which is ambiguous only for a
+failure a recreation carries over (a crash loop, an OOM kill, an image pull
+failure); for those the owner is consulted as proof of age only: a
+Deployment whose `Available=False` or `Progressing=False` transition, or
+whose current ReplicaSet's creation, predates the window makes the symptom
+predate the upgrade, a transition inside the window proves nothing, and with
+no proof a first run grades it medium with the recreated-pod reason until a
+later full run settles it through the stored set. A Pending replica created
+inside the window is the one the drain displaced and is new. Events carry
+their first observation, nodes their condition's transition; a budget hold
+and a node not back are keyed by their operation in the stored set, so this
+upgrade's hold is never "already recorded" from the last one; one whose onset predates the window's first operation, or
 that the previous full run recorded, is a Warning that says so, never an
 Error; with no readable onset the stored set decides, and a first run grades
 by onset alone and says so. Confidence is high only when the signature names
@@ -127,6 +128,7 @@ import fcntl
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -495,6 +497,11 @@ PRE_EXISTING_PODS_FORMAT = "; {count} pre-existing since {earliest} (e.g. {examp
 # nothing about when the failure began.
 ONSET_FROM_OWNER, ONSET_FROM_POD = "owner", "pod"
 OWNER_FAILURE_CONDITIONS = ("Available", "Progressing")
+AGE_PROOF_FORMAT = "; owner proves age: {proof} since {since}"
+# The stored-set key of an operation-bound symptom (a budget hold, a node
+# not back) names the operation, so a hold against this upgrade is never
+# "already recorded" from the last one.
+OPERATION_KEY_PREFIX = "op="
 RECREATED_DETAIL = "the pod was recreated by the upgrade; the failure may predate it"
 RECREATED_TEXT = "the pod was recreated by the upgrade; the failure may predate it: graded medium, a Warning, until a later full run settles it by owner."
 # Image references without a host are Docker Hub's.
@@ -1241,14 +1248,14 @@ def _pod_last_activity(pod: dict) -> datetime | None:
     return parse_ts(status.get("startTime")) or parse_ts((pod.get("metadata") or {}).get("creationTimestamp"))
 
 
-def owner_onsets(workloads: list[dict], owners: list[dict], window_start: datetime | None = None) -> dict[str, str]:
-    """A Deployment's dated failure, and only that: the earliest
-    `Available=False` or `Progressing=False` transition, or, with neither,
-    the creation of its newest ReplicaSet when that falls inside the upgrade
-    window (a rollout during the upgrade). A Deployment whose conditions are
-    all True and whose ReplicaSet predates the window says nothing failed
-    and is absent, as are StatefulSets, DaemonSets and Jobs."""
-    out: dict[str, str] = {}
+def owner_age_proofs(workloads: list[dict], owners: list[dict]) -> dict[str, tuple[str, str]]:
+    """What a Deployment can prove about a failure's age: its earliest
+    `Available=False` or `Progressing=False` transition, else its newest
+    ReplicaSet's creation, as (what, when). Consulted only for a
+    container-level failure on a pod a drain recreated; a date inside the
+    window proves nothing, and the caller decides that. StatefulSets,
+    DaemonSets and Jobs carry no such date and are absent."""
+    out: dict[str, tuple[str, str]] = {}
     newest_rs: dict[str, datetime] = {}
     for obj in owners:
         if obj.get("kind") != "ReplicaSet":
@@ -1263,12 +1270,13 @@ def owner_onsets(workloads: list[dict], owners: list[dict], window_start: dateti
             continue
         meta = workload.get("metadata") or {}
         key = _object_ref(meta.get("namespace", ""), "Deployment", meta.get("name", ""))
-        failures = [parse_ts(c.get("lastTransitionTime")) for c in (workload.get("status") or {}).get("conditions") or [] if c.get("type") in OWNER_FAILURE_CONDITIONS and c.get("status") == "False"]
-        failures = [t for t in failures if t]
+        failures = [(parse_ts(c.get("lastTransitionTime")), f"{c.get('type')}=False") for c in (workload.get("status") or {}).get("conditions") or [] if c.get("type") in OWNER_FAILURE_CONDITIONS and c.get("status") == "False"]
+        failures = [(t, what) for t, what in failures if t]
         if failures:
-            out[key] = fmt_ts(min(failures))
-        elif key in newest_rs and window_start and newest_rs[key] >= window_start:
-            out[key] = fmt_ts(newest_rs[key])
+            earliest, what = min(failures)
+            out[key] = (what, fmt_ts(earliest))
+        elif key in newest_rs:
+            out[key] = ("current ReplicaSet created", fmt_ts(newest_rs[key]))
     return out
 
 
@@ -1316,7 +1324,7 @@ def _pod_onset(pod: dict, activity: datetime | None) -> datetime | None:
     return transition or started
 
 
-def pod_symptoms(pods: list[dict], resolver: Resolver, window_start: datetime | None = None, onsets_by_owner: dict[str, str] | None = None, pool_spans: dict[str, list[tuple[datetime, datetime]]] | None = None, node_pool: dict[str, str] | None = None) -> list[dict]:
+def pod_symptoms(pods: list[dict], resolver: Resolver, window_start: datetime | None = None, age_proofs: dict[str, tuple[str, str]] | None = None, pool_spans: dict[str, list[tuple[datetime, datetime]]] | None = None, node_pool: dict[str, str] | None = None) -> list[dict]:
     """One row per (top owner, category, reason), carrying the pods behind
     it; the row's detail (node, containers, images) is the example pod's.
     A pod whose last activity predates `window_start` is not the upgrade's."""
@@ -1335,12 +1343,12 @@ def pod_symptoms(pods: list[dict], resolver: Resolver, window_start: datetime | 
         namespace, pod_name = meta.get("namespace", ""), meta.get("name", "")
         kind, name = resolver.resolve(namespace, "Pod", pod_name)
         obj = _object_ref(namespace, kind, name)
-        pod_onset = _pod_onset(pod, activity)
-        owner_onset = parse_ts((onsets_by_owner or {}).get(obj))
-        onset = owner_onset or pod_onset
-        source = ONSET_FROM_OWNER if owner_onset else ONSET_FROM_POD
+        # The pod's own evidence is the onset; the owner is proof of age only.
+        onset = _pod_onset(pod, activity)
+        source = ONSET_FROM_POD
         pool = (node_pool or {}).get((pod.get("spec") or {}).get("nodeName") or "", "")
-        recreated = source == ONSET_FROM_POD and _pod_recreated_by_upgrade(pod, pool, pool_spans or {})
+        recreated = _pod_recreated_by_upgrade(pod, pool, pool_spans or {})
+        proof = (age_proofs or {}).get(obj)
         base = {
             "kind": kind,
             "namespace": namespace,
@@ -1356,6 +1364,7 @@ def pod_symptoms(pods: list[dict], resolver: Resolver, window_start: datetime | 
             "pod_onsets": {pod_name: fmt_ts(onset) if onset else None},
             "onset_source": source,
             "recreated_pods": [pod_name] if recreated else [],
+            "age_proof": {"what": proof[0], "since": proof[1]} if proof else None,
             "pod_nodes": {pod_name: (pod.get("spec") or {}).get("nodeName")},
             **_pod_detail(pod),
         }
@@ -1543,6 +1552,7 @@ def pdb_symptoms(pdbs: list[dict], pods: list[dict], nodes: list[dict], upgraded
             "message": f"spec={json.dumps({k: v for k, v in (pdb.get('spec') or {}).items() if k != 'selector'}, sort_keys=True)} pods={len(covered)} pools={pools or 'none'}",
             "pools": pools,
             "upgraded_pools": touched,
+            "operation": ",".join(sorted(str(upgraded_pools[pool]["operation"]) for pool in touched)),
         })
     return out
 
@@ -1710,7 +1720,11 @@ def classify_symptom(symptom: dict, ctx: Context) -> list[dict]:
         undecided = f"{OOM_UNDECIDED_ENTRIES[0]} or {OOM_UNDECIDED_ENTRIES[1]}"
         count = f"{symptom.get('container_count', 1)} container(s)"
         runtime = next((f"{img} ({cgroup_v1_runtime(img)})" for img in symptom.get("images") or [] if cgroup_v1_runtime(img)), None)
-        if mode == CGROUP_V2_MODE and runtime and _gate_open(symptom, ENTRY_CGROUP_V2, ctx):
+        # The gate is the OOM-killed pod's own pool; only a pod with no known
+        # node counts any upgraded pool.
+        oom_pools = [p for p in candidates if p]
+        own_pool_touched = any(p in ctx.upgraded_pools for p in oom_pools) if oom_pools else bool(ctx.upgraded_pools)
+        if mode == CGROUP_V2_MODE and runtime and own_pool_touched:
             add(ENTRY_CGROUP_V2, HIGH, f"{evidence}; runtime image {runtime}", f"cgroup v1 runtime on cgroup v2; {count}")
         elif mode == CGROUP_V2_MODE:
             add(OOM_UNDECIDED_ENTRIES[0], MEDIUM, evidence, f"{undecided} on cgroup v2; {count}")
@@ -1724,6 +1738,8 @@ def classify_symptom(symptom: dict, ctx: Context) -> list[dict]:
     if symptom["category"] == CATEGORY_NODE:
         pool = symptom.get("pool") or ""
         touched = ctx.upgraded_pools.get(pool)
+        if touched:
+            symptom["operation"] = str(touched["operation"])
         transition = f" since {symptom['onset']}" if symptom.get("onset") else ""
         add(ENTRY_NODE_AGENT, HIGH if touched else MEDIUM, f"node {symptom['name']} {symptom['reason']}{transition}" + (f" after UPGRADE_NODES on {pool} at {touched['start']}" if touched else ""), f"pool {pool}")
 
@@ -1756,8 +1772,13 @@ def classify_symptom(symptom: dict, ctx: Context) -> list[dict]:
 
 def symptom_key(symptom: dict) -> str:
     """The baseline's name for a symptom: owner, category and reason, no
-    tenant text."""
-    return BASELINE_SEPARATOR.join((symptom["object"], symptom["category"], symptom.get("reason") or ""))
+    tenant text; an operation-bound symptom (a budget hold, a node not back)
+    also names its operation, so this upgrade's hold is never "already
+    recorded" from the last one."""
+    parts = [symptom["object"], symptom["category"], symptom.get("reason") or ""]
+    if symptom.get("operation"):
+        parts.append(OPERATION_KEY_PREFIX + symptom["operation"])
+    return BASELINE_SEPARATOR.join(parts)
 
 
 def mark_since(symptoms: list[dict], baseline: list[str] | None, first_operation: datetime | None = None) -> None:
@@ -1778,16 +1799,26 @@ def mark_since(symptoms: list[dict], baseline: list[str] | None, first_operation
             old_pods = sorted(pod for pod, onset in pod_onsets.items() if onset and onset < first_operation)
             symptom["new_pods"], symptom["pre_existing_pods"] = new_pods, old_pods
             recreated = set(symptom.get("recreated_pods") or [])
-            only_recreated = bool(new_pods) and symptom.get("onset_source") == ONSET_FROM_POD and set(new_pods) <= recreated
-            if new_pods and not only_recreated:
-                # A pod that began inside the window on its own account (not a
-                # drain's recreation) makes the row new, recorded or not.
+            # A recreation carries a container-level failure over (crash
+            # loop, OOM kill, image pull); a Pending replica created inside
+            # the window is the one the drain displaced and is simply new.
+            container_level = symptom["category"] == CATEGORY_NOT_READY
+            ambiguous = bool(new_pods) and container_level and set(new_pods) <= recreated
+            proof = symptom.get("age_proof") or {}
+            proof_at = parse_ts(proof.get("since"))
+            proven_old = bool(ambiguous and proof_at and proof_at < first_operation)
+            if new_pods and not ambiguous:
                 symptom["since"] = SINCE_FIRST_SEEN if baseline is None else SINCE_NEW
                 symptom["predates_upgrade"] = False
-            elif only_recreated and baseline is None:
-                # A first run cannot date a row whose only onset is a pod the
-                # drain recreated: medium, a Warning, until a later full run
-                # settles it by owner through the stored set.
+            elif proven_old:
+                # The owner proves the failure predates the window.
+                symptom["since"] = SINCE_FIRST_SEEN if baseline is None else (SINCE_BEFORE if recorded else SINCE_NEW)
+                symptom["predates_upgrade"] = True
+                for c in symptom["classifications"]:
+                    c["evidence"] = (c["evidence"] + AGE_PROOF_FORMAT.format(proof=proof["what"], since=proof["since"]))[:MESSAGE_EXCERPT_CHARS]
+            elif ambiguous and baseline is None:
+                # No proof of age on a first run: medium, a Warning, until a
+                # later full run settles it through the stored set.
                 symptom["since"] = SINCE_FIRST_SEEN
                 symptom["predates_upgrade"] = False
                 symptom["recreated_only"] = True
@@ -1795,8 +1826,7 @@ def mark_since(symptoms: list[dict], baseline: list[str] | None, first_operation
                     if c["confidence"] == HIGH:
                         c["confidence"] = MEDIUM
                         c["detail"] = (c["detail"] + "; " if c.get("detail") else "") + RECREATED_DETAIL
-            elif only_recreated:
-                # Recreated pods say nothing about onset: the stored set decides.
+            elif ambiguous:
                 symptom["since"] = SINCE_BEFORE if recorded else SINCE_NEW
                 symptom["predates_upgrade"] = recorded
             else:
@@ -1834,14 +1864,14 @@ def collect_symptoms(cluster: dict, reads: dict[str, list], operations: list[dic
     )
     resolver = Resolver(reads.get("pods") or [], reads.get("owners") or [], reads.get("workloads") or [])
     node_pool_of = {(n.get("metadata") or {}).get("name"): ((n.get("metadata") or {}).get("labels") or {}).get(NODEPOOL_LABEL, "") for n in nodes}
-    pods = pod_symptoms(reads.get("pods") or [], resolver, window_start, owner_onsets(reads.get("workloads") or [], reads.get("owners") or [], window_start), pool_operation_windows(operations), node_pool_of)
+    pods = pod_symptoms(reads.get("pods") or [], resolver, window_start, owner_age_proofs(reads.get("workloads") or [], reads.get("owners") or []), pool_operation_windows(operations), node_pool_of)
     pod_objects = {s["object"] for s in pods}
     # An event on a pod that is gone carries no pool; its owner's template
     # nodeSelector is the pool evidence it can still have.
     owner_selectors = {obj["object"]: (spec.get("nodeSelector") or {}) for obj, spec, _ in pod_specs_by_owner(reads.get("workloads") or [], reads.get("pods") or [], resolver).values()}
     # A FailedScheduling or BackOff event on a workload the pod list already
     # reports as Pending or crash-looping says the same thing twice.
-    oom_nodes = {s.get("node") for s in pods if any(c["reason"] == OOM_REASON for c in s.get("containers") or [])}
+    oom_nodes = {node for s in pods for node in (s.get("oom_nodes") or {}).values() if node}
     events = [
         e for e in event_symptoms(reads.get("events") or [], window_start, resolver)
         if not (e["reason"] in EVENT_REASONS_IMPLIED_BY_POD and e["object"] in pod_objects)
@@ -2980,6 +3010,8 @@ def collect(args: argparse.Namespace, *, run: RunFn | None = None, now: datetime
             raise argparse.ArgumentTypeError(FULL_WITHOUT_PROJECT_TEXT)
         if args.since:
             raise argparse.ArgumentTypeError(FULL_WITH_SINCE_TEXT)
+    if args.report and Path(args.report).name == LATEST_REPORT_LINK:
+        raise argparse.ArgumentTypeError(REPORT_IS_LINK_TEXT.format(name=LATEST_REPORT_LINK))
 
     failed_reads: list[str] = []
     if args.project:
@@ -3147,8 +3179,6 @@ def collect(args: argparse.Namespace, *, run: RunFn | None = None, now: datetime
     finish = (now if clock_fixed else now_utc()).strftime(REPORT_TS_FORMAT)
     suffix = SCOPED_SUFFIX if scoped else ""
     reports_dir = data_dir() / REPORTS_SUBDIR
-    if args.report and Path(args.report).name == LATEST_REPORT_LINK:
-        raise argparse.ArgumentTypeError(REPORT_IS_LINK_TEXT.format(name=LATEST_REPORT_LINK))
     if not getattr(args, "no_report", False):
         report_path = Path(args.report) if args.report else reports_dir / REPORT_FILENAME.format(ts=finish, scoped=suffix)
         write_report(report_path, result["report"], link=not scoped)
@@ -3251,7 +3281,7 @@ def reset_ledger(store: Path, now: datetime, ledger_path: Path | None = None, gu
     archive = store / ARCHIVE_SUBDIR / now.strftime(REPORT_TS_FORMAT)
     archive.mkdir(parents=True, exist_ok=True)
     for record in records:
-        os.replace(record, archive / record.name)
+        shutil.move(str(record), str(archive / record.name))  # across filesystems too
     return RESET_LEDGER_TEXT.format(count=len(records), archive=archive)
 
 
