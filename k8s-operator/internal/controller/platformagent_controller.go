@@ -332,6 +332,12 @@ type PlatformAgentReconciler struct {
 	// supply; see rbac_selfcheck.go.
 	RBAC *RBACChecker
 
+	// agentProfilesUnreadable is set at setup when the role cannot read
+	// AgentProfiles (AgentProfileAccessDenied). The watch is skipped then, and
+	// the identity map renders no profiles rather than listing a kind whose
+	// informer would never sync.
+	agentProfilesUnreadable bool
+
 	// Recorder writes Events on the PlatformAgent. Nil records nothing, which
 	// is what tests and the golden harness supply (recordEvent).
 	//
@@ -4661,6 +4667,49 @@ func (r *PlatformAgentReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		}
 	}
 
+	// AgentProfiles feed the identity map, so a profile created, edited or
+	// deleted re-renders it. Registered only when the CRD is installed, like
+	// AgentPlugin's watch above.
+	profileGVK := agentv1alpha1.GroupVersion.WithKind("AgentProfile")
+	if mgr != nil && mgr.GetRESTMapper() != nil {
+		_, err := mgr.GetRESTMapper().RESTMapping(profileGVK.GroupKind(), profileGVK.Version)
+		denied := AgentProfileAccessDenied(r.RBAC)
+		watch, unreadable := agentProfileWatchPlan(err, denied)
+		switch {
+		case unreadable:
+			r.agentProfilesUnreadable = true
+			logf.Log.WithName("platformagent-controller").Info(
+				"The operator's role cannot read AgentProfiles; skipping the AgentProfile watch and rendering no profile identities. Restart the operator after applying the current ClusterRole.",
+				"denied", denied)
+		case watch:
+			bld = bld.Watches(
+				&agentv1alpha1.AgentProfile{},
+				handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []reconcile.Request {
+					return enqueueAgentsInNamespace(ctx, obj.GetNamespace())
+				}),
+				// The AgentProfile reconciler writes status; only spec
+				// changes, creates and deletes change the map.
+				builder.WithPredicates(predicate.GenerationChangedPredicate{}),
+			).Watches(
+				// Whether a profile gets a map entry also depends on its
+				// operator-created ServiceAccount (a foreign one under that
+				// name keeps it out: agentProfileServiceAccountIsForeign),
+				// and that ServiceAccount is the profile's, not the agent's,
+				// so Owns() above never fires for it.
+				&corev1.ServiceAccount{},
+				handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []reconcile.Request {
+					return enqueueAgentsInNamespace(ctx, obj.GetNamespace())
+				}),
+				builder.WithPredicates(predicate.NewPredicateFuncs(func(obj client.Object) bool {
+					return strings.HasPrefix(obj.GetName(), agentProfileServiceAccountPrefix)
+				})),
+			)
+		default:
+			logf.Log.WithName("platformagent-controller").Info(
+				"AgentProfile CRD is not installed on cluster; skipping AgentProfile watch.")
+		}
+	}
+
 	return bld.
 		Watches(
 			&rbacv1.ClusterRoleBinding{},
@@ -5266,4 +5315,18 @@ func pluginStatusEqual(a, b *agentv1alpha1.AgentPluginStatus) bool {
 		}
 	}
 	return true
+}
+
+// agentProfileWatchPlan decides, once at setup, whether the PlatformAgent
+// controller watches AgentProfiles and whether the identity map may list them.
+// A role that cannot read them makes them unreadable whether or not the CRD is
+// installed yet: the denial is RBAC's answer alone, and a CRD applied after
+// boot would otherwise send the render's cached List into an informer that
+// never syncs, blocking the reconcile worker. With the role able to read
+// them, the kind is watched when the CRD is installed.
+func agentProfileWatchPlan(mapErr error, denied []string) (watch, unreadable bool) {
+	if len(denied) > 0 {
+		return false, true
+	}
+	return mapErr == nil, false
 }

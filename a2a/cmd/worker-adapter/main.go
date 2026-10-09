@@ -222,17 +222,19 @@ func configFromEnv(log *slog.Logger) (workeradapter.Config, bool) {
 		delegateSocket = workeradapter.DelegateSocketPath()
 	}
 	return workeradapter.Config{
-		NATSURL:        natsURL,
-		NATSUser:       os.Getenv("NATS_USER"),
-		NATSPassword:   os.Getenv("NATS_PASSWORD"),
-		BusTokenFile:   busTokenFile(),
-		PodName:        os.Getenv(lib.EnvPodName),
-		TaskID:         taskID,
-		Profile:        profile,
-		Session:        os.Getenv("A2A_SESSION"),
-		Namespace:      namespace,
-		Scope:          scope,
-		DelegateSocket: delegateSocket,
+		NATSURL:      natsURL,
+		NATSUser:     os.Getenv("NATS_USER"),
+		NATSPassword: os.Getenv("NATS_PASSWORD"),
+		BusTokenFile: busTokenFile(),
+		PodName:      os.Getenv(lib.EnvPodName),
+		TaskID:       taskID,
+		Profile:      profile,
+		Session:      os.Getenv("A2A_SESSION"),
+		// Literal "true" only, like EnvClusterView.
+		ProfileExecutor: os.Getenv(lib.EnvProfileExecutor) == "true",
+		Namespace:       namespace,
+		Scope:           scope,
+		DelegateSocket:  delegateSocket,
 		// Unset means required: a submission with no capability is
 		// refused. "false" is the mixed-version window only — a gateway
 		// that predates the mint. It does not switch enforcement off; a

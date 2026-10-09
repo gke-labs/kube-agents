@@ -45,11 +45,20 @@ type Config struct {
 	// PodName is the pod's own name from the downward API, and under the
 	// callout it is the identity: the NATS user is named for it and the
 	// grants — subjects, consumer names, inbox prefix — are all built from
-	// it. It equals Session by construction (the gateway names the pod after
-	// the bus session), and the adapter checks that rather than trusting
-	// either, because a mismatch is silent: the connection succeeds and
-	// every reply goes to an inbox the grants do not cover.
+	// it. For a session pod it equals Session by construction (the gateway
+	// names the pod after the bus session), and the adapter checks that
+	// rather than trusting either, because a mismatch is silent: the
+	// connection succeeds and every reply goes to an inbox the grants do not
+	// cover. A profile pod (ProfileExecutor) has no Session; its pod name
+	// names its consumers and inbox, and its profile is the addressee.
 	PodName string
+
+	// ProfileExecutor marks a pod the dispatcher spawned for an AgentProfile
+	// (lib.EnvProfileExecutor): it publishes as Profile, with Session empty,
+	// and names its consumers for PodName. Required under a bus token for
+	// that shape, because without it an empty Session is refused as the
+	// session pod that lost its name.
+	ProfileExecutor bool
 
 	// TaskID names the one task this process exists for.
 	TaskID string
@@ -137,6 +146,22 @@ func (c Config) Addressee() string {
 	return c.Profile
 }
 
+// consumerStem names this process's consumers on TASKS. A session pod's is its
+// session, which is also its pod name and its addressee. A profile pod's is
+// its pod name, not its profile: every pod of one AgentProfile shares the
+// addressee, and two of them running at once must not share consumer names
+// (the callout's profile narrowing grants exactly <pod>-<role>). Without a pod
+// name, which is the by-hand static-credential path, it is the addressee.
+func (c Config) consumerStem() string {
+	if c.Session != "" {
+		return c.Session
+	}
+	if c.PodName != "" {
+		return c.PodName
+	}
+	return c.Profile
+}
+
 // validate refuses a configuration whose failure mode is a hang.
 //
 // Both checks here are for combinations that connect successfully and then go
@@ -150,11 +175,22 @@ func (c Config) validate() error {
 	if c.PodName == "" {
 		return fmt.Errorf("a bus token file is set but %s is not; the inbox prefix the callout grants is named for the pod, and without it every reply times out", lib.EnvPodName)
 	}
+	// A profile pod says so (ProfileExecutor) rather than being inferred from
+	// an empty A2A_SESSION, because an empty A2A_SESSION is also exactly
+	// what a session pod looks like after its spawner dropped the variable,
+	// and that case must keep failing here.
+	//
 	// Empty is the same failure as mismatched, and quieter: Addressee falls
 	// back to Profile, so the adapter publishes as `chat` while its grants are
 	// derived from the pod. The spawner always sets A2A_SESSION, which is why
 	// this is defence in depth rather than a live bug -- but it is the one
 	// combination where the wrong addressee is a default rather than a typo.
+	if c.ProfileExecutor {
+		if c.Session != "" {
+			return fmt.Errorf("%s is set and so is A2A_SESSION (%q); a profile pod publishes as its profile and a session pod as its session, and this pod cannot be both", lib.EnvProfileExecutor, c.Session)
+		}
+		return nil
+	}
 	if c.Session != c.PodName {
 		return fmt.Errorf("%s is %q but A2A_SESSION is %q; the callout derives this session's grants from the pod name, so publishing as %q would be refused and replies would never arrive",
 			lib.EnvPodName, c.PodName, c.Session, c.Addressee())
@@ -328,8 +364,9 @@ func Run(ctx context.Context, cfg Config) (Result, error) {
 	}
 	switch {
 	case cfg.BusTokenFile != "":
-		// The per-session credential. The inbox owner is the pod name, which
-		// validate() has already checked against A2A_SESSION.
+		// The pod-bound credential. The inbox owner is the pod name: for a
+		// session pod validate() has checked it against A2A_SESSION, and a
+		// profile pod (ProfileExecutor) has no session to check it against.
 		tokenOpts, err := lib.KSATokenNATSOptions(cfg.BusTokenFile, cfg.PodName)
 		if err != nil {
 			return Result{}, err
@@ -961,7 +998,7 @@ func (a *adapter) finalize(state lib.TaskState, reason, evidence string) error {
 // where no subject permission can see it. That is not a style choice; it is
 // the difference between a scoped consumer and an unscoped one.
 func (a *adapter) sessionConsumer(ctx context.Context, role, filter string, cfg jetstream.ConsumerConfig) (jetstream.Consumer, error) {
-	cfg.Name = lib.SessionConsumerName(a.cfg.Addressee(), role)
+	cfg.Name = lib.SessionConsumerName(a.cfg.consumerStem(), role)
 	cfg.FilterSubject = filter
 	cfg.FilterSubjects = nil
 	// Ack-none: the adapter reads a durable stream it does not own and its
@@ -991,7 +1028,7 @@ func (a *adapter) sessionConsumer(ctx context.Context, role, filter string, cfg 
 // perfectly runnable task into a boot failure.
 func (a *adapter) priorEvents(ctx context.Context) (*lib.Task, error) {
 	subject := lib.TaskEventsSubject(a.cfg.Addressee(), a.cfg.TaskID)
-	name := lib.SessionConsumerName(a.cfg.Addressee(), lib.SessionConsumerEvents)
+	name := lib.SessionConsumerName(a.cfg.consumerStem(), lib.SessionConsumerEvents)
 	cons, err := a.sessionConsumer(ctx, lib.SessionConsumerEvents, subject, jetstream.ConsumerConfig{
 		DeliverPolicy: jetstream.DeliverAllPolicy,
 	})

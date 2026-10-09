@@ -2500,7 +2500,7 @@ func buildA2ANATSNetworkPolicy(agent *agentv1alpha1.PlatformAgent) *networkingv1
 				Ports: []networkingv1.NetworkPolicyPort{
 					{Protocol: &tcp, Port: ptr.To(intstr.FromInt32(a2aNATSClientPort))},
 				},
-				From: []networkingv1.NetworkPolicyPeer{
+				From: append([]networkingv1.NetworkPolicyPeer{
 					// The auth callout, FIRST, and the ordering is the
 					// point rather than tidiness.
 					//
@@ -2562,7 +2562,7 @@ func buildA2ANATSNetworkPolicy(agent *agentv1alpha1.PlatformAgent) *networkingv1
 						labelPartOf:       a2aPartOf,
 						a2aComponentLabel: "seed",
 					}}},
-				},
+				}, a2aOperatorNATSPeers()...),
 			}, {
 				// 9222 from the console server alone. See the doc comment
 				// for why it is the only one.
@@ -2577,6 +2577,28 @@ func buildA2ANATSNetworkPolicy(agent *agentv1alpha1.PlatformAgent) *networkingv1
 			}},
 		},
 	}
+}
+
+// a2aOperatorNATSPeers admits the operator's own pod, which publishes
+// AgentProfile cards. It runs in the operator's namespace rather than the
+// agent's, so the peer pairs a namespace selector with the bus-client label the
+// manager's pod template carries; the callout, not this fence, is what decides
+// whether a pod there is the operator. No peer when the manager does not know
+// its own namespace, or holds one that is not a label value: it renders no bus
+// identity then either.
+func a2aOperatorNATSPeers() []networkingv1.NetworkPolicyPeer {
+	ns, _, ok := operatorBusPrincipal()
+	if !ok {
+		return nil
+	}
+	return []networkingv1.NetworkPolicyPeer{{
+		NamespaceSelector: &metav1.LabelSelector{MatchLabels: map[string]string{
+			corev1.LabelMetadataName: ns,
+		}},
+		PodSelector: &metav1.LabelSelector{MatchLabels: map[string]string{
+			a2aOperatorBusClientLabel: a2aOperatorBusClientLabelValue,
+		}},
+	}}
 }
 
 // a2aProvisionScript is the provisioning payload: the four streams, three KV
@@ -4880,7 +4902,14 @@ func (r *PlatformAgentReconciler) reconcileA2A(ctx context.Context, agent *agent
 	// it: the callout refuses connections until it is serving a map, so
 	// rendering the map first shortens the window in which a restarting bus
 	// has a callout with nothing to say.
-	authMap, authMapVersion, err := buildA2AAuthMapConfigMap(agent)
+	var profiles []agentv1alpha1.AgentProfile
+	if !r.agentProfilesUnreadable {
+		var err error
+		if profiles, err = boundAgentProfiles(ctx, r.Client, agent); err != nil {
+			return state, fmt.Errorf("failed to list AgentProfiles: %w", err)
+		}
+	}
+	authMap, authMapVersion, err := buildA2AAuthMapConfigMap(agent, profiles)
 	if err != nil {
 		return state, fmt.Errorf("failed to render the A2A identity map: %w", err)
 	}

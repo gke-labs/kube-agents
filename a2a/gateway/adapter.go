@@ -349,6 +349,12 @@ type ConversationState struct {
 	// Grace is the gateway's FirstEventGrace: the window inside which an
 	// active task with nothing on its stream is legitimately pre-first-event.
 	Grace time.Duration
+	// ContextID is the A2A contextId the record carries for this
+	// conversation, "" when there is no record. Every task the conversation
+	// publishes carries it, and an executor keys its own state on it (the
+	// bridge's api executor names its Hermes session after it), so a caller
+	// can find that state without a turn.
+	ContextID string
 	// TaskID is the task this read describes: the one the caller named,
 	// else the record's active task. Active is whether the record holds
 	// that task as its active one; SubmittedAt and the active-task fields

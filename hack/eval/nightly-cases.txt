@@ -708,6 +708,10 @@
 # because each repetition runs four real audits back to back.
 ./tasks/oobe-first-run-audits/task.yaml
 
+# The agent's own observability: whether the event watcher's metrics are
+# scraped, answered from the PodMonitoring and the Cloud Monitoring series.
+./tasks/observability-watcher-scrape-state/task.yaml
+
 # A fleet question fanned out one card per cluster, each titled with the bare
 # cluster name the Slack plan row renders (agents/platform/SOUL.md, fan-out).
 # deployer: noop; reads the seeded fleet's crashloop-workload role.

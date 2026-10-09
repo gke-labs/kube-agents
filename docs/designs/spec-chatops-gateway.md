@@ -45,8 +45,10 @@ reroute a message, and it never widens anything.
 pod at a time.** Concretely:
 
 - The session key is the backend-qualified conversation id - a DM, or a thread in a
-  group space (eg `discord:1234/5678`, `gchat:spaces/AAA/threads/BBB`). A channel or
-  space is not a session; a conversation in it is.
+  group space (eg `discord:1234/5678`, `gchat:spaces/AAA/threads/BBB`); on a backend whose
+  DMs are threaded, a thread in a DM can be its own conversation too (the Slack and
+  Google Chat adapter sections say when). A channel or space is not a session; a
+  conversation in it is.
 - `contextId` is minted at first contact with a conversation and persists across pod
   incarnations for the lifetime of the session record (until pruned after `A2A_SESSION_TTL`
   of inactivity). It is the durable name of the conversation on the bus. Minting MUST be create-only (a KV
@@ -960,7 +962,10 @@ not be silent about it.
   arrival order per artifact, which is stream order for an executor that appends to one artifact
   id, present as `[]` when the executor called nothing and absent when no stream was
   read, because the relay never posts that artifact and this is the harness's only view of it, newest 1000 entries when a run has more, with `activityDropped` counting the rest)
-  and the progress artifact's latest line (`progress`); plus the conversation's last post, the
+  and the progress artifact's latest line (`progress`); plus the conversation's A2A `contextId`
+  from its record (absent when there is no record; the bridge's `api` executor names its Hermes
+  session after it, which is how the harness finds the kanban cards a turn filed), the
+  conversation's last post, the
   gateway's configured first-event grace, and the armed backend with `injectOnly`. The gateway
   classifies nothing on it; the harness does. It is a pure read because the never-started heal
   is a write under the per-conversation lock inside the keyed queue, and a read that performed
@@ -1257,10 +1262,21 @@ and drops; in a DM (measured) it equals `text` with nothing stripped and no ment
 annotation — a typed `@app` there is plain text to Chat, and is delivered verbatim.
 
 **Conversation keys.** `gchat:spaces/AAA/threads/BBB` for a message in a threaded
-space — the canonical example above. `gchat:dm/spaces/AAA` for a DM space, whole space
-one session — and, because a DM space is threaded, replies render in the thread of the
-latest ask (measured: without that, an answer to a question asked inside a DM thread
-landed top-level). Presentation only; the key and the session do not move. A space whose threading state does not support replies (`UNTHREADED_MESSAGES`), or a
+space — the canonical example above. In a DM space, top-level messages share one conversation,
+`gchat:dm/spaces/AAA`, answered top-level, and a message typed inside an existing thread is
+a side thread, its own conversation `gchat:dm/spaces/AAA/threads/BBB`, answered in that
+thread. This is the main-flow and side-thread rule of the Hermes Google Chat adapter that
+default mode runs.
+Chat attaches a thread to every DM message, the one it auto-created for a top-level message
+included, so the thread name cannot tell them apart; Chat's `message.threadReply` flag does
+(true only for a reply in a thread, per the Chat API `Message` resource; measured: the
+captured in-thread DM reply carries it and the top-level DMs omit it). Hermes infers the
+split from a persisted per-thread inbound count instead, and the gateway keeps no count.
+The two differ on one case: the first reply into a thread Hermes has counted no inbound
+message in, such as the thread under a bot-posted report, is main flow to Hermes
+(`cron-report-relay.md`, "The first reply into a report's thread") and a side thread here. A record minted under the thread-less key before side threads existed still
+parses and posts top-level, and `openDirect` returns that key, so an unsolicited post to a
+DM lands top-level. A space whose threading state does not support replies (`UNTHREADED_MESSAGES`), or a
 `GROUP_CHAT`, binds the whole space as one conversation, `gchat:space/spaces/AAA`;
 anything that is not positively a DM is read as a group, since a space misread as a DM
 would bind every thread in it to one session — the honest reading of "a space is

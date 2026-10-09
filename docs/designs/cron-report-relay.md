@@ -364,9 +364,12 @@ exactly as before, and the index only runs where the hook previously did nothing
 
 ## The first reply into a report's thread (Google Chat DMs only)
 
-Google Chat opens a thread around every top-level message, so an inbound payload
-cannot say whether the user posted at top level or replied inside a real thread.
-Its adapter settles that by counting inbound messages per thread: a thread it has
+Google Chat opens a thread around every top-level message, so the thread name on
+an inbound payload cannot say whether the user posted at top level or replied
+inside a real thread. Chat's `message.threadReply` flag does say (it is true only
+for a reply in a thread; the `mode: next` gateway reads it, per
+`spec-chatops-gateway.md`), but the Hermes adapter does not read it. It settles
+the question by counting inbound messages per thread: a thread it has
 never seen one in is read as main flow, and the bot answers in the space rather
 than in the thread. Both writers of that counter live in the gateway process. A
 relayed report is posted by `hermes send` from the Session KV server, which is a
