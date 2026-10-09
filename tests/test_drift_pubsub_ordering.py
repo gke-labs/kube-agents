@@ -118,16 +118,22 @@ try:
     from tests.test_terraform_module_tests import (
         _EQUALS,
         _STR,
+        _TEMPLATE_ESCAPES,
+        _TEMPLATE_OPENERS,
         _WORD,
         _blocks,
+        _template_end,
         _tokens,
     )
 except ImportError:  # run from inside tests/
     from test_terraform_module_tests import (
         _EQUALS,
         _STR,
+        _TEMPLATE_ESCAPES,
+        _TEMPLATE_OPENERS,
         _WORD,
         _blocks,
+        _template_end,
         _tokens,
     )
 
@@ -147,14 +153,13 @@ _LOCALS_LABELS = 0
 _MODULE_REFERENCE = r"(?<![\w.])module\.([A-Za-z0-9_-]+)"
 _LOCAL_REFERENCE = r"(?<![\w.])local\.([A-Za-z0-9_-]+)"
 _DOT = "."
-# HCL has two template forms and the tokenizer knows both, so this has to as
-# well: `${...}` interpolates a value, `%{...}` a directive, and either can
-# carry a reference. Doubling the sigil escapes it -- `$${` is a literal `${`
-# with no reference in it at all.
-_TEMPLATE_OPENERS = ("${", "%{")
-_TEMPLATE_ESCAPES = ("$${", "%%{")
-_OPEN_BRACE = "{"
-_CLOSE_BRACE = "}"
+# _TEMPLATE_OPENERS, _TEMPLATE_ESCAPES and _template_end come from the
+# tokenizer rather than being restated here. Both halves have to agree on
+# where a template ends, and a second copy of that grammar is what went wrong:
+# counting braces alone ends `"${join("}", [module.x.y])}"` at the `}` inside
+# the nested string, losing the reference after it. _template_end skips nested
+# strings, which is why the tokenizer hands that whole thing over as one token
+# in the first place.
 _SIGIL_WIDTH = 2
 _ESCAPE_WIDTH = 3
 # A following `=` or `>` means the `=` just matched was half of `==` or `=>`,
@@ -276,11 +281,17 @@ def _module_body(tokens: list, name: str) -> list:
 def _interpolations(value: str) -> list:
     """The contents of every template in a string, braces balanced.
 
-    A regex cannot do this. `[^}]*` stops at the first `}`, so a reference
-    after an object literal in the same template -- `${coalesce(try(var.o,
-    {}), module.x.y)}` -- is lost, and principals are exactly where `try` and
-    `coalesce` wrappers accumulate. Both sigils are read, and a doubled one is
-    skipped rather than matched: Terraform treats `$${` as a literal.
+    Neither a regex nor brace-counting is enough. `[^}]*` stops at the first
+    `}`, losing a reference after an object literal in the same template
+    (`${coalesce(try(var.o, {}), module.x.y)}`), and counting braces instead
+    still ends early on a `}` inside a nested string literal
+    (`${join("}", [module.x.y])}`) -- both shapes principals attract, since
+    `try`, `coalesce` and `join` are what collect around them. The tokenizer
+    settles it: _template_end skips nested strings while it counts, which is
+    the same grammar that decided this string was one token.
+
+    Both sigils are read, and a doubled one is skipped rather than matched:
+    Terraform treats `$${` as a literal `${` with no reference in it.
     """
     found, index = [], 0
     while index < len(value):
@@ -290,15 +301,9 @@ def _interpolations(value: str) -> list:
         if not value.startswith(_TEMPLATE_OPENERS, index):
             index += 1
             continue
-        depth, cursor = 1, index + _SIGIL_WIDTH
-        while cursor < len(value) and depth:
-            if value[cursor] == _OPEN_BRACE:
-                depth += 1
-            elif value[cursor] == _CLOSE_BRACE:
-                depth -= 1
-            cursor += 1
-        found.append(value[index + _SIGIL_WIDTH : cursor - 1 if not depth else cursor])
-        index = cursor
+        end = _template_end(value, index + _SIGIL_WIDTH)
+        found.append(value[index + _SIGIL_WIDTH : end - 1])
+        index = end
     return found
 
 
@@ -615,6 +620,17 @@ class ReachabilityHelpers(unittest.TestCase):
                 self._call(f'"${{coalesce(try(var.o, {{}}), module.{IAM_MODULE}.email)}}"')
             ),
         )
+
+    def test_a_brace_inside_a_nested_string_does_not_end_the_template(self) -> None:
+        # Counting braces alone ended the template at the `}` inside "}" and
+        # dropped everything after it. The tokenizer's _template_end skips
+        # nested strings, which is why this arrives as one string token.
+        for argument in (
+            f'"${{join("}}", [module.{IAM_MODULE}.email])}}"',
+            f'"${{replace(module.{IAM_MODULE}.email, "}}", "")}}"',
+        ):
+            with self.subTest(argument=argument):
+                self.assertEqual({IAM_MODULE}, self._reached(self._call(argument)))
 
     def test_an_escaped_template_opener_holds_no_reference(self) -> None:
         # `$${` is a literal `${` to Terraform, so there is no dependency here
