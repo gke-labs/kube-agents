@@ -432,9 +432,14 @@ gateway's doors cap a text at 65,536 runes, the server's own cap on a message
 (`MAX_NORMALIZED_TEXT_LENGTH`, 65,536 characters), and the bus's 1 MiB message limit keeps the
 request far under the server's 10 MB body limit. Each earlier turn's answer is published as a
 `turn` artifact as soon as the next turn is about to run; the last turn's answer is the `result`,
-then the one terminal. A turn's answer the bridge holds between turns, while the next follow-up's
-capability is checked, is not lost to a shutdown: the worker ends the task with it as the `result`,
-and the queue is refused `task-ended`. A failed follow-up turn names itself in the terminal
+then the one terminal. At each turn boundary the bridge asks the verifier once per distinct
+capability among the queued follow-ups, not once per follow-up, so a verifier that does not answer
+holds the previous turn's answer back for one timeout. A turn's answer the bridge holds between
+turns, while the next follow-up's capability is checked, is not lost to a shutdown: the worker ends
+the task with it as the `result`, and the queue is refused `task-ended`. Nor is it lost when its
+`turn` artifact fails to publish (the task completes with it as the `result`), or when a cancel,
+the deadline or a shutdown lands after the next follow-up was chosen but before its request was
+sent (the terminal that cause calls for carries it as the `result`). A failed follow-up turn names itself in the terminal
 (`; turn: N` after the session). A follow-up does not change task state (payload spec assertion
 12). A bridge that crashes with follow-ups queued loses them; the gateway's relay reports them as
 not run at the terminal, unless the gateway restarted too. The count is best-effort: a follow-up

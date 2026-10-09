@@ -50,6 +50,13 @@ const (
 	// worker adapter's steer bound (16). The next one is refused queue-full
 	// with a notice, never dropped silently.
 	steerQueueCapacity = 16
+	// seenRefusedCapacity bounds the refused follow-ups a run remembers for
+	// redelivery (taskRun.seenRefused). A queued one is remembered for the
+	// task's life, at most steerQueueCapacity of them: forgotten, its
+	// redelivery could run a second turn. A refused one forgotten costs at
+	// most a second refusal notice for a redelivery, and a redelivery
+	// comes within the durable's ack wait, so the oldest go first.
+	seenRefusedCapacity = 4 * steerQueueCapacity
 	// stderrTailBytes and stdoutTailBytes are how much of each stream a
 	// failed task's status message carries. stdout matters on failure too:
 	// `hermes chat -Q` prints a failed turn's final_response (its own
@@ -290,8 +297,9 @@ type taskRun struct {
 	// first. steersQueued counts every follow-up this run has queued, the
 	// ones since taken off steers included, and is what steerQueueCapacity
 	// bounds: the task's total, not what waits at one moment. seenSteers is
-	// every follow-up envelope this run has answered, so a redelivery is
-	// answered once.
+	// the follow-up envelopes this run has answered, so a redelivery is
+	// answered once: every queued one, and the newest seenRefusedCapacity
+	// refused ones, oldest first in seenRefused (rememberSteerLocked).
 	// turnsClosed is set when the worker has chosen the current answer as
 	// the deliverable (nothing queued to run) or finalize began: a
 	// follow-up after the first is refused task-ending, never queued behind
@@ -301,7 +309,13 @@ type taskRun struct {
 	steers       []*lib.Envelope
 	steersQueued int
 	seenSteers   map[string]bool
+	seenRefused  []string
 	turnsClosed  bool
+	// turn is the follow-up turn whose request is in flight or done, set
+	// under mu as its follow-up leaves the queue (apiTurn); 0 until the
+	// first follow-up's. shutdownTasks names it in its terminal, as
+	// finalizeAPIError does.
+	turn int
 	// workingSent is set once the working status is on the stream
 	// (publishWorking), under mu: a notice reads it for the task's current
 	// state, so none can say submitted after working.
@@ -377,6 +391,11 @@ type Bridge struct {
 	// racing the timer.
 	holdReplaySlot func(release func())
 
+	// publishTurn publishes a finished turn's answer as a turn artifact,
+	// publishTextArtifact by default; a field so a test can fail it, or hold
+	// it while a cancel lands, without a bus that misbehaves on cue.
+	publishTurn func(ctx context.Context, run *taskRun, artifactID, text string) error
+
 	// apiClient is the API executor's HTTP client (api.go).
 	apiClient *http.Client
 	// The activity door (activity.go); nil when Config.ActivityListen is "".
@@ -417,6 +436,9 @@ func New(ctx context.Context, cfg Config) (*Bridge, error) {
 	b.lookAhead = b.cancelInStream
 	b.holdReplaySlot = func(release func()) { time.AfterFunc(lib.EphemeralConsumerInactiveThreshold, release) }
 	b.deliver = b.handle
+	b.publishTurn = func(ctx context.Context, run *taskRun, artifactID, text string) error {
+		return b.publishTextArtifact(ctx, run, artifactID, lib.ArtifactTurn, text)
+	}
 	var err error
 	b.c, err = lib.Connect(ctx, cfg.NATSURL,
 		lib.WithName(b.from.Session),
@@ -558,8 +580,11 @@ func (b *Bridge) shutdownTasks() {
 		if r.state == stateRunning && r.cancelReq != nil {
 			r.cancelReq()
 		}
+		// A follow-up turn's request ended here is named, as the worker's
+		// finalizeAPIError would name it if it won the race.
+		reason := shutdownReason + turnNote(r.turn)
 		r.mu.Unlock()
-		b.finalize(r, lib.StateFailed, shutdownReason, nil)
+		b.finalize(r, lib.StateFailed, reason, nil)
 	}
 }
 
@@ -753,10 +778,6 @@ func (b *Bridge) queueSteer(ctx context.Context, run *taskRun, steer *lib.Envelo
 		run.mu.Unlock()
 		return // the submission or a follow-up redelivered: already answered
 	}
-	if run.seenSteers == nil {
-		run.seenSteers = make(map[string]bool)
-	}
-	run.seenSteers[steer.EnvelopeID] = true
 	n := lib.SteerNotice{Steer: lib.SteerRefused, EnvelopeID: steer.EnvelopeID}
 	_, hasText := promptFromMessage(steer.Payload)
 	switch {
@@ -773,8 +794,29 @@ func (b *Bridge) queueSteer(ctx context.Context, run *taskRun, steer *lib.Envelo
 		run.steersQueued++
 		n = lib.SteerNotice{Steer: lib.SteerQueued, EnvelopeID: steer.EnvelopeID}
 	}
+	rememberSteerLocked(run, steer.EnvelopeID, n.Steer == lib.SteerQueued)
 	run.mu.Unlock()
 	b.publishSteerNotices(ctx, run, []lib.SteerNotice{n})
+}
+
+// rememberSteerLocked records a follow-up envelope as answered, so its
+// redelivery is answered once. A queued one is kept for the task's life
+// (steerQueueCapacity bounds those); a refused one is kept among the newest
+// seenRefusedCapacity, and the oldest is forgotten past that. Caller holds
+// run.mu.
+func rememberSteerLocked(run *taskRun, id string, queued bool) {
+	if run.seenSteers == nil {
+		run.seenSteers = make(map[string]bool)
+	}
+	run.seenSteers[id] = true
+	if queued {
+		return
+	}
+	run.seenRefused = append(run.seenRefused, id)
+	if len(run.seenRefused) > seenRefusedCapacity {
+		delete(run.seenSteers, run.seenRefused[0])
+		run.seenRefused = run.seenRefused[1:]
+	}
 }
 
 // refuseQueued closes the run's turns and refuses every follow-up still
@@ -836,13 +878,22 @@ func takeSteerLocked(run *taskRun, steer *lib.Envelope) bool {
 // the durable's callback, for capabilityPermits's reason. nil means there is
 // none to run and the caller's answer is the deliverable; anything still
 // queued is refused task-ended by the caller's finalize.
+//
+// One call is one turn boundary, and it asks the verifier once per distinct
+// capability reference (boundaryVerdicts): the follow-ups of a task usually
+// carry the same one, and the previous turn's answer waits unposted while
+// they are checked, so a verifier that hangs would otherwise cost one
+// timeout per queued follow-up. The verdicts die with the call, so the
+// follow-up that runs was still checked at the boundary just before its
+// own turn.
 func (b *Bridge) runnableSteer(ctx context.Context, run *taskRun) (*lib.Envelope, string) {
+	verdicts := boundaryVerdicts{}
 	for {
 		steer := b.nextSteer(run)
 		if steer == nil {
 			return nil, ""
 		}
-		reason := b.capabilityRefusal(ctx, steer)
+		reason := verdicts.refusal(ctx, b, steer)
 		if reason == "" {
 			if b.nextSteer(run) != steer {
 				// Canceled, past the deadline or stopping during the
@@ -873,6 +924,25 @@ func (b *Bridge) runnableSteer(ctx context.Context, run *taskRun) (*lib.Envelope
 	}
 }
 
+// boundaryVerdicts is one turn boundary's capability verdicts, by the
+// reference each follow-up carries (runnableSteer). An authority block that
+// does not parse or carries no reference is not cached: its verdict needs
+// no verifier.
+type boundaryVerdicts map[capability.Ref]string
+
+func (v boundaryVerdicts) refusal(ctx context.Context, b *Bridge, env *lib.Envelope) string {
+	ref, present, err := capability.RefFromAuthority(env.Authority)
+	if err != nil || !present {
+		return b.capabilityRefusal(ctx, env)
+	}
+	if reason, ok := v[ref]; ok {
+		return reason
+	}
+	reason := b.capabilityRefusal(ctx, env)
+	v[ref] = reason
+	return reason
+}
+
 // closeTurns closes the queue and refuses what it holds, for reason. A no-op
 // once the task is final: its finalize refused the queue already.
 func (b *Bridge) closeTurns(run *taskRun, reason string) {
@@ -890,7 +960,8 @@ func (b *Bridge) closeTurns(run *taskRun, reason string) {
 // because a follow-up is about to run after it. Under noticeMu with the run
 // still running, so it lands before the final event finalize writes behind
 // noticeMu. false means the task is final: it already was, or the publish
-// failed and this finalized it failed. Either way the follow-up is still at
+// failed and this finalized it with the answer as the result, so the answer
+// is not lost with the turn artifact. Either way the follow-up is still at
 // the head of the queue, and that finalize refused it task-ended.
 func (b *Bridge) publishTurnAnswer(run *taskRun, turn int, text string) bool {
 	run.noticeMu.Lock()
@@ -902,12 +973,16 @@ func (b *Bridge) publishTurnAnswer(run *taskRun, turn int, text string) bool {
 		return false
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), finalizePublishTimeout)
-	err := b.publishTextArtifact(ctx, run, fmt.Sprintf("artifact-%s-turn-%d", run.origin.TaskID, turn), lib.ArtifactTurn, text)
+	err := b.publishTurn(ctx, run, fmt.Sprintf("artifact-%s-turn-%d", run.origin.TaskID, turn), text)
 	cancel()
 	run.noticeMu.Unlock()
 	if err != nil {
-		b.cfg.Logger.Error("turn answer publish failed", "task", run.origin.TaskID, "turn", turn, "err", err)
-		b.finalize(run, lib.StateFailed, fmt.Sprintf("reason: bus-publish-failed at turn %d - %s", turn, tail(err.Error(), publishErrTailBytes)), nil)
+		// The answer is still the task's: it goes out as the result, and
+		// the follow-up that was to run after it is refused task-ended. A
+		// result publish that fails too ends the task failed, as any does.
+		b.cfg.Logger.Error("turn answer publish failed; delivering it as the result",
+			"task", run.origin.TaskID, "turn", turn, "err", err)
+		b.finalize(run, lib.StateCompleted, "", &text)
 		return false
 	}
 	return true
