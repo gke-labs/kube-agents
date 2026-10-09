@@ -229,8 +229,8 @@
 # every cluster in the project (one red repetition on a dev install with
 # thirty-odd clusters took 29 minutes of agent time; the pool projects hold
 # the seeded fleet and the host). Counted from the lists with it, the last
-# entry below: sixty-five cases (195 units) of a seventy-nine-case,
-# 237-unit matrix.
+# entry below, after findings-decision-covers-item: sixty-seven cases (201
+# units) here, of an eighty-one-case, 243-unit matrix.
 
 # ── The four full audits recast out of the presubmit on 2026-08-26 ──────────
 # Spec-ready, each domain covered in the presubmit by its probe:
