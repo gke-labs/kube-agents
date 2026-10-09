@@ -393,6 +393,9 @@ func (n *Notifier) validate(data []byte) (lib.NotifyRequest, *lib.NotifyReply) {
 		if why := blocksMention(blocks); why != "" {
 			return refuse("blocks carry a mention (" + why + "); the notify route posts no mentions, send them as text")
 		}
+		if kind := blocksInteractive(blocks); kind != "" {
+			return refuse("blocks carry an interactive element (a " + kind + "); the gateway answers no clicks, so strip it")
+		}
 	}
 	return req, nil
 }
@@ -421,7 +424,7 @@ func (n *Notifier) validateConversation(req lib.NotifyRequest) (lib.NotifyReques
 	}
 	if len(req.Blocks) > 0 {
 		// Raw blocks are for home-channel posts; a conversation post carries
-		// its layout as Chat, rendered by the gateway.
+		// its layout in the request's chat field, which the gateway renders.
 		return refuse("a conversation request carries no blocks")
 	}
 	if !strings.HasPrefix(req.Conversation, n.convPrefix) || len(req.Conversation) == len(n.convPrefix) {
@@ -447,7 +450,10 @@ func (n *Notifier) validateConversation(req lib.NotifyRequest) (lib.NotifyReques
 // is logged, since the caller already holds its answer and the start of the
 // text is in the channel.
 func (n *Notifier) post(job notifyJob) {
-	if len(job.req.Blocks) > 0 {
+	// A conversation request never carries blocks (validateConversation),
+	// and postBlocks posts only into home, so the conversation test goes
+	// first: the order is a second guard, not the only one.
+	if len(job.req.Blocks) > 0 && job.req.Conversation == "" {
 		n.postBlocks(job)
 		return
 	}
@@ -512,6 +518,41 @@ func blocksMention(v any) string {
 		for _, item := range node {
 			if why := blocksMention(item); why != "" {
 				return why
+			}
+		}
+	}
+	return ""
+}
+
+// notifyInteractiveTypes are the block and element types a click or an
+// entry arrives from. The gateway acks no interactive envelope, so a click
+// on one would time out for the user; validate refuses them rather than
+// trusting the sender to strip them.
+var notifyInteractiveTypes = []string{
+	"actions", "input", "button", "overflow", "checkboxes", "radio_buttons",
+	"datepicker", "timepicker", "datetimepicker", "plain_text_input",
+	"static_select", "external_select", "users_select", "conversations_select", "channels_select",
+	"multi_static_select", "multi_external_select", "multi_users_select",
+	"multi_conversations_select", "multi_channels_select",
+}
+
+// blocksInteractive is the first interactive block or element type in v, or
+// "" when there is none.
+func blocksInteractive(v any) string {
+	switch node := v.(type) {
+	case []any:
+		for _, item := range node {
+			if kind := blocksInteractive(item); kind != "" {
+				return kind
+			}
+		}
+	case map[string]any:
+		if kind, _ := node["type"].(string); slices.Contains(notifyInteractiveTypes, kind) {
+			return kind
+		}
+		for _, item := range node {
+			if kind := blocksInteractive(item); kind != "" {
+				return kind
 			}
 		}
 	}

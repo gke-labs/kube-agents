@@ -271,5 +271,29 @@ func TestNotifyRefusesBlocksOnAConversation(t *testing.T) {
 	}
 }
 
+// TestSlackNotifyRefusesInteractiveBlocks: the gateway acks no click, so a
+// button, a select or an actions block is refused at the gateway, whatever
+// the sender stripped; a link in text is not interactive.
+func TestSlackNotifyRefusesInteractiveBlocks(t *testing.T) {
+	adapter, stub := startSlackStubAdapter(t)
+	n := newTestSlackNotifier(t, adapter)
+	for name, blocks := range map[string]string{
+		"actions block": `[{"type":"actions","elements":[{"type":"button","text":{"type":"plain_text","text":"Look"},"action_id":"a"}]}]`,
+		"accessory":     `[{"type":"section","text":{"type":"mrkdwn","text":"x"},"accessory":{"type":"button","text":{"type":"plain_text","text":"Go"},"action_id":"b"}}]`,
+		"select":        `[{"type":"section","text":{"type":"mrkdwn","text":"x"},"accessory":{"type":"static_select","action_id":"c","options":[]}}]`,
+		"input":         `[{"type":"input","label":{"type":"plain_text","text":"y"},"element":{"type":"plain_text_input","action_id":"d"}}]`,
+	} {
+		if got := serveJSON(t, n, lib.NotifyRequest{Text: "x", Blocks: json.RawMessage(blocks)}); !strings.Contains(got.Error, "interactive") {
+			t.Errorf("%s: reply = %+v, want an interactive refusal", name, got)
+		}
+	}
+	if len(stub.forms) != 0 {
+		t.Errorf("a refused request posted: %d posts", len(stub.forms))
+	}
+	if got := serveJSON(t, n, lib.NotifyRequest{Text: "x", Blocks: json.RawMessage(testBlocks)}); got.Error != "" {
+		t.Errorf("a plain section was refused: %+v", got)
+	}
+}
+
 var _ notifyPoster = (*SlackAdapter)(nil)
 var _ notifyBlocksPoster = (*SlackAdapter)(nil)

@@ -741,6 +741,17 @@ func TestTheAgentRoutesSlackProactivePostsExactlyWhenArmed(t *testing.T) {
 			}
 		})
 	}
+	// Chat holds the gateway when both are enabled: the agent is routed to
+	// Chat on both variables, never to Slack.
+	both := chatAndSlackTestAgent("next")
+	both.Spec.Integration.Slack.HomeChannel = "C0HOME"
+	both.Spec.Integration.GoogleChat.HomeChannel = "spaces/AAAA"
+	env := envMapOf(brokerContainerNamed(buildPodTemplateSpec(both, "h", "h", "h", "h", nil, renderOptions{}).Spec.Containers, "platform-agent").Env)
+	for _, name := range []string{a2aNotifyPlatformEnvVar, a2aNotifyConversationsEnvVar} {
+		if got := env[name].Value; got != a2aNotifyPlatformGchat {
+			t.Errorf("Chat and Slack: %s = %q, want %q", name, got, a2aNotifyPlatformGchat)
+		}
+	}
 }
 
 // TestDisablingSlackScalesTheArmedGatewayToZero: Slack is the only backend

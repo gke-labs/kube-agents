@@ -1301,7 +1301,7 @@ as the primitive, unused, like the other backends.
 (an alert, a cron finding, an audit report) has no conversation to answer, and under `next`
 the Hermes platform that used to post it is off. So the agent asks the gateway, which holds
 the Chat credential, to post it. The agent container runs `a2a notify`, which publishes a
-core NATS request on `chat.notify.gchat` carrying `{"text", "thread"?, "wait_ms"?, "conversation"?, "context_id"?}` with its reply subject
+core NATS request on `chat.notify.gchat` carrying `{"text", "thread"?, "wait_ms"?, "conversation"?, "context_id"?, "blocks"?}` (on Slack's subject, below, `chat.notify.slack`) with its reply subject
 under `chat.notify.reply.agent.`; the gateway posts the text into the home space
 (`googleChat.homeChannel`, carried as `A2A_GCHAT_HOME_CHANNEL`), as a new thread or as a reply
 on a thread of that space, and answers with `message_id` (the field `hermes send --json`
@@ -1335,9 +1335,8 @@ events that are already more than six hours old are advanced past without postin
 the backlog nothing could deliver before.
 
 A request may name a conversation instead of the home channel: `conversation` (the gateway's
-session-record key, such as `gchat:spaces/A/threads/B`) and `context_id`. The route is armed for
-Google Chat; a Slack conversation's route is recorded the same way, and is delivered once the
-gateway arms the route for Slack. This
+session-record key, such as `gchat:spaces/A/threads/B`, or `slack:C1/1712.0001`) and `context_id`, on either backend's
+subject. This
 is how a kanban card filed in a gateway conversation reports back to it. The hermes-bridge's
 `api` executor records, before each turn, the conversation its Hermes session answers: the
 platform, the conversation key from the task's `authority.audience.conversation`, and the
@@ -1358,11 +1357,14 @@ case. The subjects and grants are the same as for a home post; a route the
 bridge cannot record is said at the end of the turn's answer, since the card's report will not
 arrive.
 
-Slack has the same route on its own subject, `chat.notify.slack`, armed when the gateway holds
-Slack (`a2aSlackArmed`) and `slack.homeChannel`, carried as `A2A_SLACK_HOME_CHANNEL`, is a
-channel id (`C...`, or `G...` for a private channel); `A2A_NOTIFY_PLATFORM` is then `slack`.
-Chat holds the single-backend gateway when both are enabled, so at most one platform is ever
-routed. A Slack `thread` is the thread root's `ts`, which names no channel, so the gateway
+Slack has the same route on its own subject, `chat.notify.slack`. Home posts are armed when the
+gateway holds Slack (`a2aSlackArmed`) and `slack.homeChannel`, carried as
+`A2A_SLACK_HOME_CHANNEL`, is a channel id (`C...`, or `G...` for a private channel);
+`A2A_NOTIFY_PLATFORM` is then `slack`. Conversation posts are armed whenever the gateway holds
+Slack, `homeChannel` set or not, and `A2A_NOTIFY_CONVERSATIONS` is then `slack`
+(`a2aSlackNotifyArmed`); a `homeChannel` that is set but is not a channel id turns the whole
+route off, as on Chat. Chat holds the single-backend gateway when both are enabled, so at most
+one platform is ever routed. A conversation request carries no `blocks`. A Slack `thread` is the thread root's `ts`, which names no channel, so the gateway
 checks it only for shape and posts every request into the home channel: the channel is the
 whole bound, and a `ts` from elsewhere can only ever thread (or fail to thread) there. Slack
 also takes Block Kit: a request may carry `blocks`, a JSON array posted as one message with
@@ -1373,8 +1375,9 @@ rather than dropping them, and Slack's own refusal (`invalid_blocks`) comes back
 gateway refuses any block that carries a mention (`<!channel>`, `<!here>`, `<!subteam^…>`,
 `<@U…>`, or a rich_text `broadcast`, `user` or `usergroup` element), and the caller posts the
 escaped text instead. The gateway acks no Slack interaction, so a button on such a card would
-be clicked into a timeout: on this path the agent sends the card without its buttons, a link
-button turned into a plain link. The blocks are decoded into slack-go's types and sent again,
+be clicked into a timeout: the gateway refuses any interactive block or element (an `actions`
+or `input` block, a button, a select, a date or time picker, a text input), and the agent sends
+the card without its buttons, a link button turned into a plain link. The blocks are decoded into slack-go's types and sent again,
 so a block type it does not know travels as written and a field it does not model may not. A
 home channel that is not a channel id leaves the route unarmed; the gateway logs
 "chat.notify route not armed" at start.
@@ -1394,7 +1397,8 @@ The agent could already post the same text to the same channel or conversation t
 `hermes send` under `today`, so the route moves the post to the process holding the credential rather than adding
 a reach. A reply a human types in a notify's thread arrives at the gateway as an ordinary
 message from that human, through the usual ingress checks, and starts a conversation of its
-own: nothing binds it to the investigation that raised the alert.
+own: nothing binds it to the investigation that raised the alert. (On Slack a notify thread
+is not a session thread, so the reply needs to mention the bot to be a turn at all.)
 
 ## The Slack adapter (added 9/4)
 
