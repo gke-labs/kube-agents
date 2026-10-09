@@ -184,10 +184,11 @@ line the room learns to skip.
 
 Daily, and it repeats: the rule is stateless, so a card still blocked is named
 every morning until someone unblocks, comments on, or archives it. That is the
-intended nag, the same rule `findings-morning-nudge` keeps, and the reason a
-finer cadence buys nothing: the engine's threshold is a day. It fires at 12:35
-UTC, half an hour after that nudge, for the same reason the nudge sits at 12:00:
-an earlier UTC hour is the middle of the night in the US, not a morning.
+intended nag, the same rule `findings-morning-nudge` keeps for the top
+criticals it named, and the reason a finer cadence buys nothing: the engine's threshold is a
+day. It fires at 12:35 UTC, half an hour after that nudge's daily reminder, for
+the same reason the reminder waits for 12:00: an earlier UTC hour is the middle
+of the night in the US, not a morning.
 
 It sits here rather than on the Chat Agent's roster because that roster delivers
 `local`. `PLATFORM_AGENT_HOME`, not `HERMES_HOME`, is how it finds the board:

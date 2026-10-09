@@ -272,7 +272,8 @@ and common enough that you must not wait forever.
 ### What the check means
 
 The `AI Review` check run beside the review is what `.github/workflows/auto_request_review.yml`
-waits on before it assigns a human, and what it says depends on the round. The reason it depends
+reads before it assigns a human — green on any round, or the third round whatever the colour (below)
+— and what it says depends on the round. The reason it depends
 on the round: once a first round was answered, further rounds kept about 2.5 findings each without
 decaying, two thirds of them on code the previous round had already read, and most held checks held
 on Medium alone — pull requests stopped converging on green while nearly everything they were shown
@@ -299,6 +300,15 @@ was being fixed (gke-labs/kube-agents-bot#191 has the measurement).
 - **`neutral` on any round** also covers the description finding, a change not fully checked, a
   review that broke, and a push since the last review (the pushed commit carries the previous title
   and no verdict).
+- **The third round summons a human whatever the colour.** Once the bot has reviewed three distinct
+  commits of a pull request, a grey check on a review it finished (its summary ends in the
+  `ai-review:` tally with `findings` or `clean`) requests a reviewer exactly as green does, once:
+  the workflow posts a hand-off comment carrying a marker, and a later grey round with that marker
+  on the pull request asks nobody again. A pushed commit's carried-title row, a broken or superseded
+  entry, and a re-cut of a commit already read do not count as rounds and never clear it. Measured
+  before the rule (gke-labs/kube-agents-bot#191, 2026-10-08): the first human review arrived a median
+  eleven hours and two rounds after round three, and two thirds of pull requests saw no further bot
+  round once a human had reviewed — the human is what ends the loop, so the human comes earlier.
 
 ### Waiting for it
 
@@ -468,7 +478,7 @@ approver's review, so the draw is narrowed to the `OWNERS` approvers for the cha
 same test decides what counts as already reviewed — an approval from a `reviewers`-only account
 settles a self-approved change and nothing else. The `hack/eval/presubmit-cases.txt` and
 `hack/eval/blocking-roster.txt` entries send a change there to its own `eval-crew` group, so the
-reviewer the bot's green check summons can clear both labels in one action. Not every `eval-crew`
+reviewer the workflow summons can clear both labels in one action. Not every `eval-crew`
 member is a root approver, so a change that also touches root-owned paths still waits on a root
 approver's `/approve` after that review. The bot never requests the author, so a member's own case
 or roster change goes to the rest of the group, with the author's `approved` already on it. That
@@ -657,12 +667,14 @@ Four states that look like somebody else's problem and are not:
   review. Pushing the fix does not clear it, resolving every thread does not clear it, and GitHub
   will report `CHANGES_REQUESTED` and "review requested from X" in the same breath. Re-requesting
   review is the explicit hand-back — do that rather than assuming the push spoke for itself.
-- **Nobody is requested at all.** Because a human is only assigned once the `AI Review` check goes
-  green, an author with outstanding bot findings has no reviewer and no notification saying so.
-  A green pass after `/review` is what summons one — clean on a first review, or nothing above
-  Medium on a later one (`AGENTS.md`, "Automated Review After Opening a Pull Request");
-  `/request-review` is the override. Answering every bot thread does not summon one by itself, so
-  an author who has done everything asked of them can still be sitting with nobody assigned.
+- **Nobody is requested at all.** A human is assigned once the `AI Review` check goes green, or
+  once the bot has reviewed three commits whatever the colour (`AGENTS.md`, "Automated Review After
+  Opening a Pull Request"); before either, an author with outstanding bot findings has no reviewer
+  and no notification saying so. A green pass after `/review` summons one — clean on a first review,
+  or nothing above Medium on a later one — and so does the third round; `/request-review` is the
+  override. Answering every bot thread does not summon one by itself. The hand-off comment the
+  workflow posts on its first request is the sign one has been asked: after it, reply in the
+  threads (with the fixing commit for any 🔴 High) and wait rather than typing `/review` again.
 - **A red check that is not required.** It still blocks the merge if it is red on the head: Tide
   refuses any posted context that is not green unless Prow marks it `optional`, not only the ones on
   the two lists above, so a cancelled run of a non-required job is the author's problem too. `tide`
@@ -685,8 +697,8 @@ robot that reviews under a user account re-reviews every push and files its foll
 `COMMENTED`, so a `CHANGES_REQUESTED` it once filed would otherwise stand for the life of the pull
 request and the check-run path would never request a human, and a review request outstanding to it
 is answered by the robot and cleared, so it counts as nobody asked. An approval from an account in
-neither `OWNERS` list is never a hand-off, and one from `reviewers` alone is a hand-off only when
-the author's own approval already covers the change: on any other pull request it cannot produce
+neither `OWNERS` list never counts as already reviewed, and one from `reviewers` alone counts only
+when the author's own approval already covers the change: on any other pull request it cannot produce
 the `approved` label, so the auto-request counts it no more than a comment and still asks someone
 who can `/approve`. Of these reasons, `/request-review`
 skips the verdict check alone (it also bypasses the

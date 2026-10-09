@@ -528,6 +528,19 @@ registration & Teams App manifest) —
 [Microsoft Teams ChatOps Guide](../../docs/chatops/microsoft-teams.md) are the
 canonical walkthroughs.
 
+### Component stack (`platformAgent.mode`)
+
+`platformAgent.mode` is the CR's `spec.mode`: `today`, or `next`, which also
+renders the NATS bus and the A2A gateway, a development stack
+([`docs/designs/spec-mode-switch.md`](../../docs/designs/spec-mode-switch.md)).
+It defaults to `null`, which renders no field, and the operator reads an absent
+mode as `today`. Because Helm patches the CR from the difference between its
+renders, a mode set on the CR by hand stays while the value is `null`, and a
+value set and later cleared removes the field again. Changing it on a running
+release is a mode switch rather than a setting: the operator rolls the agent
+and renders or retires the A2A stack. `platformAgent.harness.tuning.maxSessions`
+caps the A2A session pods a `next` install runs at once and renders only when set.
+
 ### Agent runtime knobs
 
 `platformAgent.harness.hermes`, `platformAgent.harness.memory`,

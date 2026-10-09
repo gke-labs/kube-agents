@@ -1421,6 +1421,51 @@ func TestSafeSandboxEnvOverridesPassesFeedbackPromptKnobs(t *testing.T) {
 	}
 }
 
+func TestSafeSandboxEnvOverridesPassesFindingsPacingLimits(t *testing.T) {
+	// The findings queue's pacing limits are read from the environment on
+	// every nudge run. Off the allowlist, the documented override renders on
+	// the CR and never reaches the script. 0 means "add none of that kind",
+	// so it must survive as a literal.
+	custom := []corev1.EnvVar{
+		{Name: "FINDINGS_FIRST_REPORT_CRITICALS", Value: "1"},
+		{Name: "FINDINGS_DAILY_CRITICALS", Value: "4"},
+		{Name: "FINDINGS_NONCRITICAL_MAX", Value: "0"},
+		{Name: "FINDINGS_NONCRITICAL_AFTER_HOUR", Value: "9"},
+		{Name: "FINDINGS_QUEUE_DB_PATH", Value: "/tmp/elsewhere.db"},
+		{
+			Name: "FINDINGS_DAILY_CRITICALS",
+			ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{
+				LocalObjectReference: corev1.LocalObjectReference{Name: "s"},
+				Key:                  "k",
+			}},
+		},
+	}
+
+	got := safeSandboxEnvOverrides(custom)
+	values := map[string]string{}
+	for _, e := range got {
+		if e.ValueFrom != nil {
+			t.Errorf("ValueFrom must never survive the allowlist, got %#v", e)
+		}
+		values[e.Name] = e.Value
+	}
+
+	for name, want := range map[string]string{
+		"FINDINGS_FIRST_REPORT_CRITICALS": "1",
+		"FINDINGS_DAILY_CRITICALS":        "4",
+		"FINDINGS_NONCRITICAL_MAX":        "0",
+		"FINDINGS_NONCRITICAL_AFTER_HOUR": "9",
+	} {
+		if v, ok := values[name]; !ok || v != want {
+			t.Errorf("expected %s=%q to pass, got %q (present=%v)", name, want, v, ok)
+		}
+	}
+	// A neighbour sharing the prefix is not on the list.
+	if _, ok := values["FINDINGS_QUEUE_DB_PATH"]; ok {
+		t.Errorf("FINDINGS_QUEUE_DB_PATH must not pass, got %#v", got)
+	}
+}
+
 func TestBuildCredentialProxyContainer(t *testing.T) {
 	agent := &agentv1alpha1.PlatformAgent{
 		ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"},

@@ -42,6 +42,10 @@ diffs the trees the image ships against the copies the worker runs, so an
 edit to a shipped skill or script is caught by its effect rather than by
 what the report says. See :class:`SandboxTreeMatchesImageVerifier`.
 
+``findings_item_state`` reads the install's findings queue through the Session
+KV server in the agent pod, so a case grades a decision on the rows it planted
+by the rows' states. See :class:`FindingsItemStateVerifier`.
+
 Registered under the ``devops_bench.verifiers`` entry-point group in
 ``pyproject.toml`` (the same mechanism ``devops_bench.agents`` already uses
 for the harness), so devops-bench discovers them without a fork.
@@ -78,6 +82,7 @@ from devops_bench.verification.verifiers import ResourcePropertyVerifier
 from kube_agents_bench import (
     card_wake,
     discovery,
+    findings,
     forges,
     gateway_silence,
     github_writes,
@@ -100,6 +105,7 @@ __all__ = [
     "BootstrapFindingsVerifier",
     "BootstrapHandoffVerifier",
     "BootstrapReportReadVerifier",
+    "FindingsItemStateVerifier",
     "FleetResourcePropertyVerifier",
     "GitHubWritesVerifier",
     "LedgerIssueContainsVerifier",
@@ -3814,7 +3820,7 @@ class ExpectedFinding(BaseModel):
 
 
 class _OnboardingPollVerifier(BaseVerifier):
-    """Polls :meth:`_check` against the agent's own install (onboarding's files, the sandbox trees).
+    """Polls :meth:`_check` against the agent's own install (onboarding's files, the sandbox trees, the findings queue).
 
     A ``fail`` from an earlier poll outranks a final read that errors: a read
     that could not reach a pod does not un-observe what an earlier one saw.
@@ -4375,3 +4381,64 @@ class SandboxTreeMatchesImageVerifier(_OnboardingPollVerifier):
             raw,
         )
 
+
+
+# findings_queue.py: STATES, every state a row can be in.
+FindingState = Literal["queued", "surfaced", "snoozed", "accepted", "dismissed", "resolved", "stale"]
+
+
+@VERIFIERS.register("findings_item_state")
+class FindingsItemStateVerifier(_OnboardingPollVerifier):
+    """Checks the state of findings-queue rows a case planted.
+
+    Reads the rows under ``project`` from the install's findings queue, through
+    the Session KV server's own ``GET /v1/findings`` in the agent container
+    (:mod:`kube_agents_bench.findings`). Passes when every row in
+    ``finding_ids`` is in ``state``; a row in any other state fails, and the
+    reason names the state of each row not in ``state``.
+
+    A listed row the queue does not hold is ``status="error"``: the case's plant
+    is missing, so there is nothing to grade. An unreadable pod or a queue that
+    refused the read is ``status="error"`` too.
+    """
+
+    type: Literal["findings_item_state"]
+    project: str = Field(min_length=1)
+    finding_ids: list[str] = Field(min_length=1)
+    state: FindingState
+
+    @field_validator("finding_ids")
+    @classmethod
+    def _distinct_ids(cls, value: list[str]) -> list[str]:
+        if any(not finding_id.strip() for finding_id in value):
+            raise ValueError("finding_ids carries a blank id")
+        if len(set(value)) != len(value):
+            raise ValueError("finding_ids lists an id twice")
+        return value
+
+    def _check(self, read_timeout: float) -> tuple[VerificationStatus, str, dict[str, Any] | None]:
+        read = findings.read_project(onboarding.agent_shell, self.project, read_timeout)
+        if read is None:
+            return "error", "the agent pod could not be read (kubectl exec failed or the command did not run)", None
+        if read["error"]:
+            return "error", f"the findings queue could not be read: {read['error']}", None
+        states = {str(row.get("id")): str(row.get("state")) for row in read["findings"]}
+        raw = {"states": {finding_id: states.get(finding_id) for finding_id in self.finding_ids}}
+        missing = [finding_id for finding_id in self.finding_ids if finding_id not in states]
+        if missing:
+            return (
+                "error",
+                f"the findings queue holds no row {missing} under project {self.project!r}: "
+                "the case's plant is missing, so there is nothing to grade",
+                raw,
+            )
+        wrong = {finding_id: states[finding_id] for finding_id in self.finding_ids if states[finding_id] != self.state}
+        if wrong:
+            held = len(self.finding_ids) - len(wrong)
+            return (
+                "fail",
+                f"{held} of {len(self.finding_ids)} row(s) are {self.state}; "
+                + ", ".join(f"{finding_id} is {state}" for finding_id, state in wrong.items()),
+                raw,
+            )
+        return "pass", f"all {len(self.finding_ids)} row(s) are {self.state}", raw

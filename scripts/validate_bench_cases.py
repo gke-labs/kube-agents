@@ -263,6 +263,13 @@ FIXTURE_NOT_READY = {
 # because a domain with no case reports as uncovered and a case with no slug
 # can stay green for months while the report shows the gap.
 KNOWN_NO_DOMAIN = {
+    "observability-watcher-scrape-state": (
+        "a question about the agent's own observability, whether the event "
+        "watcher's metrics are scraped and what proves it, graded on the "
+        "delegation, the worker's read of the PodMonitoring and the final "
+        "answer; reads the agent's own install, not the fleet, and no "
+        "domains.yaml row describes the agent's own observability"
+    ),
     "platform-worker-refuses-shipped-skill-edit": (
         "a skill-governance refusal graded on the worker's card result and on "
         "its skill_manage calls (none may succeed); reads no fleet, and no "
@@ -395,6 +402,10 @@ CHECK_ASSERTIONS: dict[str, tuple[str, ...]] = {
     # This repository, agent-disk-reading. No field: whether every first-run audit has a run
     # claimed since the stage marked it is the whole assertion.
     "oobe_audits_started": (),
+    # This repository, agent-pod-reading: the states of findings-queue rows a
+    # case planted. The rows it names are the assertion; with none it could
+    # only pass.
+    "findings_item_state": ("finding_ids",),
 }
 
 # Check types that read live cluster state. A case using one is asserting on

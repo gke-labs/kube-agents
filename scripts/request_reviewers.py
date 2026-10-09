@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
-"""Request a human reviewer on a pull request, once the AI review is green.
+"""Request a human reviewer on a pull request: once the AI review is green, or at the bot's third round.
 
 `.github/workflows/auto_request_review.yml` used to run
 `necojackarc/auto-request-review` on `pull_request_target`, which pinged a human
 the moment a pull request opened -- minutes before `kube-agents-bot` posted its
 read, and on most pull requests before the author had addressed a single
 finding. The reviewer is now requested from the bot's verdict instead: the
-`AI Review` check run going `success`.
+`AI Review` check run going `success`, or, once per pull request, completing grey after the bot has
+reviewed three distinct commits (`HANDOFF_ROUNDS`; the comment above `AI_REVIEW_BOT_LOGIN` has the
+measurement). The first request the workflow makes on a pull request leaves one hand-off comment, on either of
+its paths; a request run by hand announces nothing, since its comment would land under the
+maintainer's own login and never be recognised as the hand-off.
 
 That trigger is why this script exists rather than the action. The action reads
 `context.payload.pull_request`, which a `check_run` event does not carry, and
@@ -23,7 +27,7 @@ a choice it copies the action, including minimatch's rule that `*` and
 not implement raises rather than guessing -- see `validate_config` and
 `glob_to_regex`.
 
-Four things the action never did. A verdict counts as "already reviewed" only
+Six things the action never did. A verdict counts as "already reviewed" only
 from someone whose approval finishes the pull request: an `OWNERS` approver for
 the changed files (`applicable_approvers`), since only that approval can produce
 the `approved` label, or, when the author's own approval already covers every
@@ -38,7 +42,10 @@ it says so with a 😕 reaction on the comment and a warning annotation on the r
 where before it exited green having done nothing. And `options.robot_accounts`
 names robots that review under an ordinary user account: their verdicts never
 count, and a review request outstanding to one of them is not a reviewer
-already asked.
+already asked. And the bot's third round: a grey check at its third distinct reviewed
+commit (`HANDOFF_ROUNDS`) requests a reviewer anyway, once, and the first request on a pull
+request leaves one hand-off comment (`HANDOFF_MARKER`), the marker being what stops a later grey
+round asking again.
 
 Run: python3 scripts/request_reviewers.py --pr 728 --dry-run
 Test: cd scripts && python3 -m unittest test_request_reviewers
@@ -114,6 +121,49 @@ OWNERS_REVIEWERS_KEY = "reviewers"
 # override looked identical to the workflow never firing.
 REACTION_ACKNOWLEDGED = "eyes"
 REACTION_DECLINED = "confused"
+
+# The third round summons a human whatever the check's colour. Measured on
+# 2026-10-08 over every pull request the bot reviewed since 2026-09-21
+# (gke-labs/kube-agents-bot#191): 38% of pull requests went five rounds or
+# more, those took 86% of the review spend, the first human review arrived a
+# median 11 hours and two rounds after round three, and once a human had
+# reviewed, two thirds of pull requests saw no further round. The gate that
+# waited for green kept the human away from exactly the pull requests that
+# loop, because on 54% of third rounds the check is grey -- a High on code the
+# last fix added, or the description note -- and an agent author answers a grey
+# check with another fix and another `/review`. So a grey check at the bot's
+# third distinct commit requests a reviewer too, once, and says so on the pull
+# request. Three, not one: nearly half of pull requests finish in two rounds,
+# and the first review is where the defects the author is about to fix sit.
+#
+# What counts as a round is a commit the bot has reviewed -- its reviews
+# listed on the pull request, distinct by `commit_id`, so a `/review` on an
+# unchanged commit (a re-cut) is not one. The deciding entry has to be a read:
+# its summary ends in the bot's `ai-review:` tally with an outcome of
+# `findings` or `clean`. The row a push gets carries the previous title and no
+# tally, and a broken, conflicted or superseded entry carries another outcome;
+# none of those is a round, and none clears the gate at any count.
+AI_REVIEW_BOT_LOGIN = "kube-agents-bot[bot]"
+AI_REVIEW_TALLY_PREFIX = "ai-review:"
+AI_REVIEW_READ_OUTCOMES = frozenset({"findings", "clean"})
+HANDOFF_ROUNDS = 3
+# Every request this workflow makes is announced in one comment carrying this
+# marker, and the marker is what makes the third-round request fire once per
+# pull request: GitHub clears a review request as soon as the reviewer files
+# any review, a `COMMENTED` one included, and `already_reviewed_reason` does
+# not count those, so without it every later grey round would ask again.
+HANDOFF_MARKER = "<!-- auto-request-review:handoff -->"
+# The hand-off is posted with the job's GITHUB_TOKEN, so its author is always
+# this login; a comment anyone else opens with the marker is not a hand-off,
+# or the author's agent pasting one it saw elsewhere would switch the
+# third-round rule off for the pull request.
+HANDOFF_AUTHOR = "github-actions[bot]"
+# Only a run under Actions posts the hand-off: its comment lands under the
+# login above and is recognised later. A maintainer running the script by hand
+# posts under their own login, which `handed_off` would never count, so that
+# run announces nothing and says so, and the workflow's next request posts the
+# comment that counts.
+ACTIONS_ENV = "GITHUB_ACTIONS"
 
 # A declined override is written where the person who typed it will see it:
 # a warning annotation on the workflow run (the `::warning::` command goes to
@@ -627,12 +677,89 @@ def latest_ai_review(check_runs):
     return max(mine, key=lambda run: (run.get("started_at") or "", run.get("id") or 0))
 
 
-def ai_review_block_reason(check_run, author_is_bot):
+def ai_review_tally(check_run):
+    """The bot's tally on a finished `AI Review` entry, or None when it has none.
+
+    The last non-empty line of the entry's summary, `ai-review: {...}`, as the
+    bot documents it (gke-labs/kube-agents-bot, docs/design.md, "A tally a
+    workflow can read"). An entry with no such line read nothing: the row a
+    push gets, or a spinner. Anything that does not parse reads as no tally
+    rather than as a guess at one.
+    """
+    summary = ((check_run or {}).get("output") or {}).get("summary") or ""
+    lines = [line.strip() for line in summary.splitlines() if line.strip()]
+    if not lines or not lines[-1].startswith(AI_REVIEW_TALLY_PREFIX):
+        return None
+    try:
+        parsed = json.loads(lines[-1][len(AI_REVIEW_TALLY_PREFIX) :])
+    except ValueError:
+        return None
+    if not isinstance(parsed, dict) or not isinstance(parsed.get("outcome"), str):
+        return None
+    return parsed
+
+
+def reviewed_commits(reviews, *head_shas):
+    """The distinct commits the bot has reviewed on a pull request.
+
+    `reviews` is the pull request's reviews listing; only the bot's own count,
+    by `commit_id`, so a re-cut of a commit already read is the same round. The
+    `head_shas` given are counted too: the deciding entry's commit is a round
+    even when its review has not reached the listing by the time the check
+    completes.
+    """
+    commits = {sha for sha in head_shas if sha}
+    for review in reviews:
+        user = review.get("user") or {}
+        if user.get("login") == AI_REVIEW_BOT_LOGIN and review.get("commit_id"):
+            commits.add(review["commit_id"])
+    return commits
+
+
+def handed_off(comments):
+    """Whether this workflow has already announced a reviewer on the pull request.
+
+    The marker has to open the comment and the comment has to be the
+    workflow's own (`HANDOFF_AUTHOR`): a reply quoting the hand-off carries the
+    same bytes further down, and anyone can type the marker, which renders as
+    nothing.
+    """
+    return any(
+        ((comment.get("user") or {}).get("login") == HANDOFF_AUTHOR)
+        and (comment.get("body") or "").lstrip().startswith(HANDOFF_MARKER)
+        for comment in comments
+    )
+
+
+def handoff_comment(users, teams, head_sha, check_run, why):
+    """The one comment a request leaves behind, for the author and the reviewer.
+
+    No line may start with a slash: Prow reads a command at the start of any
+    line of any comment, and the author's agent reads the whole thing as the
+    rule it is to follow from here.
+    """
+    names = [f"@{login}" for login in users] + [f"team {slug}" for slug in teams]
+    title = ((check_run or {}).get("output") or {}).get("title")
+    verdict = f'; the `{AI_REVIEW_CHECK_NAME}` check reads "{title}"' if title else ""
+    return (
+        f"{HANDOFF_MARKER}\n"
+        f"Handed to {', '.join(names)} at `{head_sha[:7]}`: {why}{verdict}.\n\n"
+        "The reviewer decides from here. Author: if a 🔴 High is open, push the fix and say so in its "
+        "thread; otherwise reply in each thread. Then wait. A further `/review` spends a round nobody "
+        "asked for; the reviewer's reply, or a `/review` they type, is what resumes you."
+    )
+
+
+def ai_review_block_reason(check_run, author_is_bot, rounds=None, already_handed_off=False):
     """Why the AI review does not clear this pull request, or None.
 
     A bot cannot read its own findings and comment `/review`, so a pull request
     Dependabot opened passes on any completed conclusion. A human author has to
-    get it to `success`, or comment `/request-review` to override.
+    get it to `success`, or comment `/request-review` to override -- or reach
+    the bot's third round: with `rounds` given, a grey entry that is a read
+    (`ai_review_tally`) clears the gate once `rounds` is `HANDOFF_ROUNDS` or
+    more and no hand-off has been announced yet. Without `rounds` the rule is
+    the first one alone.
     """
     if check_run is None:
         return f"there is no {AI_REVIEW_CHECK_NAME} check run on the head commit"
@@ -650,7 +777,23 @@ def ai_review_block_reason(check_run, author_is_bot):
 
     title = (check_run.get("output") or {}).get("title")
     detail = f" ({title})" if title else ""
-    return f"{AI_REVIEW_CHECK_NAME} concluded {conclusion}{detail}, not success"
+    reason = f"{AI_REVIEW_CHECK_NAME} concluded {conclusion}{detail}, not success"
+    if rounds is None:
+        return reason
+
+    tally = ai_review_tally(check_run)
+    is_read = tally is not None and tally.get("outcome") in AI_REVIEW_READ_OUTCOMES
+    if is_read and rounds >= HANDOFF_ROUNDS and not already_handed_off:
+        log(
+            f"{AI_REVIEW_CHECK_NAME} concluded {conclusion}{detail} at the bot's round {rounds}; "
+            "requesting a human whatever the colour"
+        )
+        return None
+    if already_handed_off:
+        return f"{reason}, and a reviewer was already handed this pull request"
+    if not is_read:
+        return f"{reason}, and the deciding entry is not a review the bot finished"
+    return f"{reason} (round {rounds} of the {HANDOFF_ROUNDS} before a human is asked anyway)"
 
 
 def resolve_pull_request(api, head_sha):
@@ -751,7 +894,7 @@ def parse_args(argv):
     parser.add_argument(
         "--require-ai-review-pass",
         action="store_true",
-        help="only request a reviewer if the AI Review check passed",
+        help="only request a reviewer once the AI Review check passed, or the bot has reviewed three commits",
     )
     parser.add_argument(
         "--owners-root",
@@ -860,6 +1003,15 @@ def main(argv=None):
         decline(api, args, "no OWNERS approver covers the change")
         return 0
 
+    reviews = None
+    comments = None
+
+    def pull_request_comments():
+        nonlocal comments
+        if comments is None:
+            comments = api.get_all(f"/repos/{args.repo}/issues/{number}/comments")
+        return comments
+
     # `/request-review` is a person who has read the pull request saying "ask
     # someone anyway", so a verdict already on it does not decide for them.
     if not args.react_to:
@@ -877,11 +1029,26 @@ def main(argv=None):
             decline(api, args, reason)
             return 0
 
+    deciding = None
+    why = "a person asked for a reviewer with /request-review" if args.react_to else "a maintainer ran the request by hand"
     if args.require_ai_review_pass:
-        reason = ai_review_block_reason(
-            gate_check_run(api, pull_request, triggering_check_run),
-            pull_request["user"].get("type") == "Bot",
-        )
+        deciding = gate_check_run(api, pull_request, triggering_check_run)
+        author_is_bot = pull_request["user"].get("type") == "Bot"
+        reason = ai_review_block_reason(deciding, author_is_bot)
+        why = "the check is green" if (deciding or {}).get("conclusion") == "success" else "the author is a bot"
+        if reason and not author_is_bot and deciding is not None and deciding.get("status") == "completed":
+            # Only now, and only on the grey path: the comments listing, which
+            # the green path needs only at the announce (the reviews listing is
+            # already in hand unless `--react-to` skipped it). A spinner or a
+            # head with no entry cannot clear whatever the count. The deciding
+            # entry's own commit counts as reviewed.
+            if reviews is None:
+                reviews = api.get_all(f"/repos/{args.repo}/pulls/{number}/reviews")
+            rounds = len(reviewed_commits(reviews, deciding.get("head_sha")))
+            reason = ai_review_block_reason(
+                deciding, author_is_bot, rounds=rounds, already_handed_off=handed_off(pull_request_comments())
+            )
+            why = f"the bot has reviewed {rounds} commits and the check is still not green"
         if reason:
             decline(api, args, reason)
             return 0
@@ -896,8 +1063,33 @@ def main(argv=None):
     users, teams = split_teams(reviewers)
     log(f"Requesting review from {', '.join(reviewers)}")
 
+    # The listing decides only decoration here, so it cannot cost the request:
+    # on the grey path it was already read, and fatally, to decide the gate.
+    try:
+        already_announced = handed_off(pull_request_comments())
+    except Exception as exc:  # noqa: BLE001 - any API error; a duplicate comment is the worse-case cost
+        log(f"could not list the comments on #{number} to look for an earlier hand-off: {exc}; announcing anyway")
+        already_announced = False
+    announce = not already_announced
+    if announce and os.environ.get(ACTIONS_ENV) != "true":
+        log(
+            f"not announcing the hand-off on #{number}: not running as the workflow, so the comment "
+            "would land under another login and never be recognised; the workflow's next request posts it"
+        )
+        announce = False
+    if announce and deciding is None:
+        # The override path consulted no entry; the comment still names what
+        # the check reads, if it reads anything, for the reviewer it summons.
+        # Decoration: a failure here costs the clause, never the request.
+        try:
+            deciding = gate_check_run(api, pull_request, triggering_check_run)
+        except Exception as exc:  # noqa: BLE001 - any API error; the request still goes out
+            log(f"could not read the head's {AI_REVIEW_CHECK_NAME} entry for the hand-off: {exc}")
+            deciding = None
     if args.dry_run:
         log(f"--dry-run: would POST reviewers={users} team_reviewers={teams} to #{number}")
+        if announce:
+            log(f"--dry-run: would post the hand-off comment on #{number}")
         react(api, args, REACTION_ACKNOWLEDGED)
         return 0
 
@@ -905,6 +1097,22 @@ def main(argv=None):
         f"/repos/{args.repo}/pulls/{number}/requested_reviewers",
         {"reviewers": users, "team_reviewers": teams},
     )
+    # Once per pull request, whichever path requested: the marker is the
+    # record the third-round rule reads, and the text is the author's stop.
+    if announce:
+        # The commit named is the one the quoted verdict is on: the deciding
+        # entry's, which is the head except in the seconds between a push and
+        # the bot's row for it. The request already went out: a comment that
+        # fails to post is logged, never a red run, and the next request on
+        # the pull request posts it.
+        at = (deciding or {}).get("head_sha") or pull_request["head"]["sha"]
+        try:
+            api.post(
+                f"/repos/{args.repo}/issues/{number}/comments",
+                {"body": handoff_comment(users, teams, at, deciding, why)},
+            )
+        except Exception as exc:  # noqa: BLE001 - any API error; the request stands
+            log(f"{WORKFLOW_WARNING_PREFIX}requested a reviewer on #{number} but could not post the hand-off comment: {exc}")
     react(api, args, REACTION_ACKNOWLEDGED)
 
     return 0
