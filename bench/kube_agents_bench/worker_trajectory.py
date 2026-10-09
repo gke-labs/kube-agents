@@ -162,6 +162,12 @@ roots = [a for a in sys.argv[8:] if a]
 # Seconds a read waits on a locked store before reporting the card unread. A
 # hermes writer holds a WAL lock for milliseconds; anything longer is stuck.
 SQLITE_BUSY_TIMEOUT = 10
+# The reply is written in flushed pieces no larger than this. Under GKE Sandbox
+# (gVisor) a single write of more than 64 KiB to an exec session's stdout is
+# cut at 64 KiB (measured 2026-10-09: one print of 200,000 bytes arrived as
+# 65,537; 32 KiB flushed writes arrived whole), and one print of the JSON lost
+# every capture longer than that to a parse error.
+WRITE_CHUNK = 32768
 out = {"cards": [], "calls": [], "errors": [], "unread": [], "truncated": False, "clipped": []}
 
 
@@ -632,7 +638,10 @@ out["cards"] = [c for c in cards.values() if c is not None]
 for entry in out["calls"]:
     entry.pop("_id", None)
 print(SENTINEL)
-print(json.dumps(out, default=str))
+reply = json.dumps(out, default=str) + "\n"
+for start in range(0, len(reply), WRITE_CHUNK):
+    sys.stdout.write(reply[start:start + WRITE_CHUNK])
+    sys.stdout.flush()
 """
 
 
@@ -684,6 +693,24 @@ def gaps(summary: dict[str, Any] | None) -> list[str] | None:
     problems = [str(e) for e in summary.get("unread") or []]
     problems += [CLIP_GAPS[c] for c in summary.get("clipped") or [] if c in CLIP_GAPS]
     return problems
+
+
+def parents(summary: dict[str, Any] | None) -> dict[str, str] | None:
+    """Child card to parent card, from the capture's card walk.
+
+    ``None`` when the read did not run. A card the front agent filed has no
+    entry; a card a worker fanned out (``kanban_worker_children``, or a
+    continuation gated on it) maps to the card whose worker filed it. The
+    ordered checks use it to treat a card and the cards it spawned as one
+    worker's work.
+    """
+    if summary is None:
+        return None
+    found: dict[str, str] = {}
+    for card in summary.get("cards") or []:
+        for child in card.get("children") or []:
+            found.setdefault(str(child), str(card.get("task") or ""))
+    return found
 
 
 def _entry(call: dict[str, Any]) -> dict[str, Any]:

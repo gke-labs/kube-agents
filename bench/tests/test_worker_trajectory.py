@@ -318,6 +318,13 @@ def test_the_read_walks_from_the_front_card_to_the_cluster_agent(data_root: Path
     assert payload["truncated"] is False
 
 
+def test_parents_maps_each_fanned_out_card_to_the_card_that_filed_it(data_root: Path) -> None:
+    payload = _payload(_run_script(data_root, [FRONT]))
+    assert worker_trajectory.parents(payload) == {CHILD: FRONT}
+    assert worker_trajectory.parents(None) is None
+    assert worker_trajectory.parents({"cards": []}) == {}
+
+
 def test_each_call_is_paired_with_its_result_and_tagged(data_root: Path) -> None:
     calls = _payload(_run_script(data_root, [FRONT]))["calls"]
 
@@ -1137,3 +1144,19 @@ def test_tool_called_keeps_counting_only_the_routers_calls() -> None:
     assert router_only.verify(5.0).raw == {"matching_calls": 0}
     board_read = ToolCalledVerifier(type="tool_called", tool_names=["kanban_list"])
     assert board_read.verify(5.0).status == "pass"
+
+
+def test_the_reply_is_written_in_pieces_and_reassembles(data_root: Path, monkeypatch) -> None:
+    # Under GKE Sandbox one write above 64 KiB to the exec stdout is cut, so the
+    # script emits the JSON in flushed pieces. A tiny piece size forces many
+    # boundaries; the reassembled reply must parse to what one write gives.
+    whole = _payload(_run_script(data_root, [FRONT]))
+    assert "WRITE_CHUNK = 32768\n" in worker_trajectory._IN_POD_SCRIPT
+    monkeypatch.setattr(
+        worker_trajectory,
+        "_IN_POD_SCRIPT",
+        worker_trajectory._IN_POD_SCRIPT.replace("WRITE_CHUNK = 32768\n", "WRITE_CHUNK = 7\n"),
+    )
+    pieces = _run_script(data_root, [FRONT])
+    assert pieces.endswith("}\n")
+    assert _payload(pieces) == whole

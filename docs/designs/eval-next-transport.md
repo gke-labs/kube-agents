@@ -337,7 +337,9 @@ the Hermes bridge from hermes's outbound
 webhooks (`a2a/docs/hermes-bridge.md`, "Activity"), one entry per invocation with the tool and
 its input; the bridge's entries also carry the call's status, and the bridge alone publishes a
 `progress` heartbeat. `worker_commands` reads
-the kanban worker logs by card id; on
+the kanban worker logs by card id (with `after_result_pattern`, the tagged `terminal` entries
+the harness appends to the trajectory from the workers' sessions instead, present when the
+wait found the cards and the door showed the trace); on
 this path it has data when the case runner's delegation wait finds the cards in the session store
 (Completion signals), and none when the wait falls back. Neither is graded
 as a failure here: on this transport's record the scorer sets every `worker_commands` and
@@ -609,7 +611,7 @@ newest `task_runs.summary` of the cards the board shows terminal. No status turn
 none could carry a result back through the door. Only a terminal card reaches the settle step,
 shaped as a `kanban_show` result, so the delivered card results are appended to the graded answer
 as today's wait appends them, `ledger_issue_contains` and `report_contains` see what the worker
-returned, and the worker logs are read by those ids for `worker_commands`. A card still running at
+returned, and the worker logs are read by those ids for `worker_commands` without `after_result_pattern`. A card still running at
 the ceiling delivers nothing: whatever text it carries (an earlier run's summary, a stashed
 result) is not its answer, so the repetition is recorded at the ceiling and the card is only
 archived and purged. A door that reports no `contextId`, a session the store does not hold (the
