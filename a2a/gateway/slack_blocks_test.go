@@ -44,6 +44,18 @@ func TestRewriteSlackBlocks(t *testing.T) {
 		{"a heading glued to a sentence gets its own line", "summarizing its health status.# GKE Cluster Health Report", "summarizing its health status.\n\n**GKE Cluster Health Report**"},
 		{"a hash after a word is not a heading", "see issue #2 and C# code", "see issue #2 and C# code"},
 		{"inline code keeps its hashes", "run `echo done.# not` now", "run `echo done.# not` now"},
+		{"a heading keeps underscores and stars that are not a wrap", "## Editing __init__.py", "**Editing __init__.py**"},
+		{"a heading keeps a code span as written", "## The `**kwargs` parameter", "**The `**kwargs` parameter**"},
+		{"a trailing hash joined to a word stays", "## Using C#", "**Using C#**"},
+		{"a cell keeps its code span's content", "| file | arg |\n|---|---|\n| `__init__.py` | `**kwargs` |", "```\nfile        | arg\n------------+---------\n__init__.py | **kwargs\n```"},
+		{"a cell's link shows its URL", "| pr |\n|---|\n| [#123](https://github.com/x/y/pull/123) |", "```\npr\n--------------------------------------\n#123 (https://github.com/x/y/pull/123)\n```"},
+		{"a delimiter row needs as many cells as the header", "| a | b |\n|---|\n| 1 | 2 |", "| a | b |\n|---|\n| 1 | 2 |"},
+		{"a prose pipe over a rule is not a table", "Status: ready | 3 pods\n---\nNext section", "Status: ready | 3 pods\nNext section"},
+		{"a fence opened mid-line is code", "Here:```\n# comment\n- item\n---\n```", "Here:```\n# comment\n- item\n---\n```"},
+		{"an inline triple-backtick span does not open a fence", "```inline``` first\n# real heading\n```\n# shell comment\n```", "```inline``` first\n**real heading**\n```\n# shell comment\n```"},
+		{"a shell prompt is not a glued heading", "root@node:# systemctl restart kubelet", "root@node:# systemctl restart kubelet"},
+		{"a URL fragment is not a glued heading", "See https://example.com/faq?# x", "See https://example.com/faq?# x"},
+		{"CRLF lines are rewritten", "a\r\n---\r\n| a | b |\r\n|---|---|\r\n| 1 | 2 |", "a\n```\na | b\n--+--\n1 | 2\n```"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := rewriteSlackBlocks(tc.in); got != tc.want {

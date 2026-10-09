@@ -12,13 +12,22 @@ import (
 // pass rewrites those line-level forms before toMrkdwn escapes the text and
 // translates bold and links: a heading becomes a bold line, a rule goes, a
 // bullet becomes "•", and a table becomes a monospace block whose columns
-// line up. Lines inside a fenced code block are left as written. It runs on
-// the raw text, before escaping, so the table's column widths are measured on
-// what Slack will display (Slack decodes the escaped &, < and > back).
+// line up. A line any part of which sits in a fenced block (mdCodeSpanRE,
+// so a fence opened mid-line counts) is left as written. It runs on the raw
+// text, before escaping, so a table's column widths are measured on what
+// Slack will display (Slack decodes the escaped &, < and > back). Widths are
+// counted in runes, so a cell holding East Asian wide characters or emoji
+// pads short. The relay chunks a long answer before this runs and each
+// chunk is rewritten alone, so a table the chunker cuts renders as a block
+// up to the cut and raw rows after it.
 var (
 	// slackHeadingRE is an ATX heading: up to three spaces, one to six #,
-	// whitespace, the text, and an optional closing run of #.
-	slackHeadingRE = regexp.MustCompile(`^ {0,3}#{1,6}[ \t]+(.*?)[ \t]*(?:#+[ \t]*)?$`)
+	// whitespace, the text, and an optional closing run of # set off by
+	// whitespace (so "## Using C#" keeps its #).
+	slackHeadingRE = regexp.MustCompile(`^ {0,3}#{1,6}[ \t]+(.*?)(?:[ \t]+#+)?[ \t]*$`)
+	// slackHeadingWrapRE is a heading whose whole text is already one bold
+	// pair, which it sheds before it is wrapped as one bold line.
+	slackHeadingWrapRE = regexp.MustCompile(`^(?:\*\*(.+)\*\*|__(.+)__)$`)
 	// slackRuleRE is a thematic break: three or more of one of - * _, with
 	// optional spaces between them.
 	slackRuleRE = regexp.MustCompile(`^ {0,3}([-*_])(?:[ \t]*([-*_]))+[ \t]*$`)
@@ -27,28 +36,39 @@ var (
 	slackBulletRE = regexp.MustCompile(`^([ \t]*)[-*+][ \t]+(.*)$`)
 	// slackTableSepRE is a table's delimiter row: cells of dashes with
 	// optional alignment colons, separated by pipes, outer pipes optional.
+	// The row must also carry a pipe (slackTablePipe), as GFM requires, so a
+	// bare "---" under a line that happens to hold a pipe stays a rule.
 	slackTableSepRE = regexp.MustCompile(`^[ \t]*\|?[ \t]*:?-+:?[ \t]*(?:\|[ \t]*:?-+:?[ \t]*)*\|?[ \t]*$`)
-	// slackCellMarksRE is the inline markup a table cell may carry that a
-	// monospace block would show raw: bold and italic marks, code backticks.
-	slackCellMarksRE = regexp.MustCompile("\\*\\*|__|`")
 	// slackGluedHeadingRE is a heading run onto the end of a sentence with
 	// no line break ("…its health status.# Cluster Report"), as a model's
-	// streamed answer can arrive: sentence punctuation, then one to six #
-	// and a space. The heading is moved to a line of its own so the pass
-	// above reads it as one.
-	slackGluedHeadingRE = regexp.MustCompile(`([.!?:])(#{1,6} )`)
+	// answer can arrive: a sentence's closing . or !, one to six #, a space,
+	// and a letter or digit. ":" and "?" are left out because a shell prompt
+	// ("root@node:# cmd") and a URL fragment ("faq?# x") carry them.
+	slackGluedHeadingRE = regexp.MustCompile(`([.!])(#{1,6} )([\p{L}\p{N}])`)
 )
 
 const (
 	// slackBullet replaces a list item's marker.
 	slackBullet = "• "
-	// slackBoldOpen and slackBoldClose wrap a heading's text as markdown
-	// bold, which toMrkdwn's bold pass then turns into Slack's.
-	slackBoldOpen  = "**"
-	slackBoldClose = "**"
-	// slackTableColSep separates a rendered table's columns, and
-	// slackTableRuleChar draws the line under its header.
+	// mdBoldMark wraps a heading's text as markdown bold, which toMrkdwn's
+	// bold pass then turns into Slack's, and is the bold mark a table cell
+	// sheds outside its code spans.
+	mdBoldMark = "**"
+	// mdCodeTick is the backtick that delimits a code span, which a table
+	// cell sheds (its content stays) since the whole table is a code block.
+	mdCodeTick = "`"
+	// mdIndent is the whitespace a fence line or heading may be indented by.
+	mdIndent = " \t"
+	// slackGluedHeadingSplit puts a glued heading on its own paragraph.
+	slackGluedHeadingSplit = "$1\n\n$2$3"
+	// slackLineCR is the carriage return a CRLF answer ends each line with,
+	// dropped so the line patterns' $ anchors see the end of the line.
+	slackLineCR = "\r"
+	// slackTableColSep separates a rendered table's columns, slackTablePad
+	// pads a cell to its column's width, and slackTableRuleChar draws the
+	// line under its header, with slackTableRuleSep where columns meet.
 	slackTableColSep   = " | "
+	slackTablePad      = " "
 	slackTableRuleChar = "-"
 	slackTableRuleSep  = "-+-"
 	// slackTablePipe is the cell separator in the markdown being read, and
@@ -57,49 +77,43 @@ const (
 	slackTablePipe       = "|"
 	slackEscapedPipe     = `\|`
 	slackPipePlaceholder = "\x00"
-	// slackTableDash is what a delimiter row must contain beyond pipes.
-	slackTableDash = "-"
-	// mdBoldMark and mdBoldMarkAlt are markdown's two bold spellings, which
-	// a heading's text sheds before it is wrapped as one bold line.
-	mdBoldMark    = "**"
-	mdBoldMarkAlt = "__"
+	// slackCellLinkForm sets a link's URL after its label in a table cell
+	// (slackLinkRE's groups): inside the code block a table becomes, Slack
+	// renders no link, so the destination is shown rather than lost.
+	slackCellLinkForm = "$1 ($2)"
 )
 
 // rewriteSlackBlocks applies the line-level rewrites above to text, leaving
 // fenced code blocks as written.
 func rewriteSlackBlocks(text string) string {
 	lines := strings.Split(text, "\n")
+	for i, line := range lines {
+		lines[i] = strings.TrimSuffix(line, slackLineCR)
+	}
 	lines = splitGluedHeadings(lines)
+	code := fencedLines(lines)
 	out := make([]string, 0, len(lines))
-	inFence := false
 	for i := 0; i < len(lines); i++ {
 		line := lines[i]
-		if strings.HasPrefix(strings.TrimLeft(line, " \t"), mdFence) {
-			inFence = !inFence
+		if code[i] {
 			out = append(out, line)
 			continue
 		}
-		if inFence {
-			out = append(out, line)
-			continue
-		}
-		if i+1 < len(lines) && strings.Contains(line, slackTablePipe) && slackTableSepRE.MatchString(lines[i+1]) &&
-			strings.Contains(lines[i+1], slackTableDash) {
-			end := i + 2
-			for end < len(lines) && strings.Contains(lines[end], slackTablePipe) && strings.TrimSpace(lines[end]) != "" {
-				end++
-			}
+		if end := tableEnd(lines, code, i); end > i {
 			out = append(out, renderSlackTable(lines[i], lines[i+2:end])...)
 			i = end - 1
 			continue
 		}
-		if m := slackRuleRE.FindStringSubmatch(line); m != nil && sameRuleMarks(line) {
+		if slackRuleRE.MatchString(line) && sameRuleMarks(line) {
 			continue
 		}
 		if m := slackHeadingRE.FindStringSubmatch(line); m != nil {
-			heading := strings.TrimSpace(strings.ReplaceAll(strings.ReplaceAll(m[1], mdBoldMark, ""), mdBoldMarkAlt, ""))
+			heading := strings.TrimSpace(m[1])
+			if w := slackHeadingWrapRE.FindStringSubmatch(heading); w != nil {
+				heading = strings.TrimSpace(w[1] + w[2])
+			}
 			if heading != "" {
-				out = append(out, slackBoldOpen+heading+slackBoldClose)
+				out = append(out, mdBoldMark+heading+mdBoldMark)
 			}
 			continue
 		}
@@ -112,20 +126,62 @@ func rewriteSlackBlocks(text string) string {
 	return strings.Join(out, "\n")
 }
 
-// splitGluedHeadings moves a heading run onto the end of a sentence to its
-// own paragraph, outside fenced code.
-func splitGluedHeadings(lines []string) []string {
-	out := make([]string, 0, len(lines))
-	inFence := false
-	for _, line := range lines {
-		if strings.HasPrefix(strings.TrimLeft(line, " \t"), mdFence) {
-			inFence = !inFence
+// fencedLines reports, per line, whether any part of it sits in a fenced
+// block: an mdCodeSpanRE match that spans a line break. A single-line code
+// span does not count, so "- run `ls`" is still a bullet.
+func fencedLines(lines []string) []bool {
+	text := strings.Join(lines, "\n")
+	var fences [][]int
+	for _, r := range mdCodeSpanRE.FindAllStringIndex(text, -1) {
+		if strings.Contains(text[r[0]:r[1]], "\n") {
+			fences = append(fences, r)
 		}
-		if inFence || !slackGluedHeadingRE.MatchString(line) || mdCodeSpanRE.MatchString(line) {
+	}
+	code := make([]bool, len(lines))
+	start := 0
+	for i, line := range lines {
+		end := start + len(line)
+		for _, r := range fences {
+			if r[0] <= end && r[1] > start {
+				code[i] = true
+				break
+			}
+		}
+		start = end + 1
+	}
+	return code
+}
+
+// tableEnd returns the index one past the last row of a table whose header
+// is lines[i], or i when lines[i] does not start one: the header carries a
+// pipe, the next line is a delimiter row with a pipe and as many cells as
+// the header, and the body runs to the first line without a pipe, blank or
+// fenced.
+func tableEnd(lines []string, code []bool, i int) int {
+	if i+1 >= len(lines) || code[i+1] || !strings.Contains(lines[i], slackTablePipe) ||
+		!strings.Contains(lines[i+1], slackTablePipe) || !slackTableSepRE.MatchString(lines[i+1]) ||
+		len(tableCells(lines[i])) != len(tableCells(lines[i+1])) {
+		return i
+	}
+	end := i + 2
+	for end < len(lines) && !code[end] && strings.Contains(lines[end], slackTablePipe) &&
+		strings.TrimSpace(lines[end]) != "" {
+		end++
+	}
+	return end
+}
+
+// splitGluedHeadings moves a heading run onto the end of a sentence to its
+// own paragraph, on lines with no code in them.
+func splitGluedHeadings(lines []string) []string {
+	code := fencedLines(lines)
+	out := make([]string, 0, len(lines))
+	for i, line := range lines {
+		if code[i] || !slackGluedHeadingRE.MatchString(line) || mdCodeSpanRE.MatchString(line) {
 			out = append(out, line)
 			continue
 		}
-		out = append(out, strings.Split(slackGluedHeadingRE.ReplaceAllString(line, "$1\n\n$2"), "\n")...)
+		out = append(out, strings.Split(slackGluedHeadingRE.ReplaceAllString(line, slackGluedHeadingSplit), "\n")...)
 	}
 	return out
 }
@@ -134,7 +190,7 @@ func splitGluedHeadings(lines []string) []string {
 // character, as CommonMark requires ("- * -" is not a rule).
 func sameRuleMarks(line string) bool {
 	marks := strings.Map(func(r rune) rune {
-		if r == ' ' || r == '\t' {
+		if strings.ContainsRune(mdIndent, r) {
 			return -1
 		}
 		return r
@@ -146,9 +202,9 @@ func sameRuleMarks(line string) bool {
 // the delimiter row is dropped) as a fenced monospace block with its columns
 // padded to line up.
 func renderSlackTable(header string, body []string) []string {
-	rows := [][]string{tableCells(header)}
+	rows := [][]string{cellTexts(header)}
 	for _, line := range body {
-		rows = append(rows, tableCells(line))
+		rows = append(rows, cellTexts(line))
 	}
 	cols := 0
 	for _, r := range rows {
@@ -167,9 +223,9 @@ func renderSlackTable(header string, body []string) []string {
 			if c < len(r) {
 				cell = r[c]
 			}
-			cells[c] = cell + strings.Repeat(" ", widths[c]-utf8.RuneCountInString(cell))
+			cells[c] = cell + strings.Repeat(slackTablePad, widths[c]-utf8.RuneCountInString(cell))
 		}
-		return strings.TrimRight(strings.Join(cells, slackTableColSep), " ")
+		return strings.TrimRight(strings.Join(cells, slackTableColSep), slackTablePad)
 	}
 	rules := make([]string, cols)
 	for c, w := range widths {
@@ -182,9 +238,8 @@ func renderSlackTable(header string, body []string) []string {
 	return append(out, mdFence)
 }
 
-// tableCells splits one table row into its trimmed cells, dropping the outer
-// pipes and the inline marks a monospace block would show raw. An escaped
-// pipe (\|) stays in its cell.
+// tableCells splits one table row into its trimmed cells as written,
+// dropping the outer pipes. An escaped pipe (\|) stays in its cell.
 func tableCells(line string) []string {
 	line = strings.TrimSpace(line)
 	line = strings.TrimPrefix(line, slackTablePipe)
@@ -193,8 +248,33 @@ func tableCells(line string) []string {
 	parts := strings.Split(line, slackTablePipe)
 	cells := make([]string, len(parts))
 	for i, p := range parts {
-		p = strings.ReplaceAll(p, slackPipePlaceholder, slackTablePipe)
-		cells[i] = strings.TrimSpace(slackCellMarksRE.ReplaceAllString(p, ""))
+		cells[i] = strings.TrimSpace(strings.ReplaceAll(p, slackPipePlaceholder, slackTablePipe))
 	}
 	return cells
+}
+
+// cellTexts is tableCells with each cell read as it displays in a code
+// block: a code span keeps its content and loses its backticks, a link
+// becomes its label and URL, and bold marks outside code spans go.
+func cellTexts(line string) []string {
+	cells := tableCells(line)
+	for i, cell := range cells {
+		var b strings.Builder
+		end := 0
+		for _, r := range mdCodeSpanRE.FindAllStringIndex(cell, -1) {
+			b.WriteString(cellProse(cell[end:r[0]]))
+			b.WriteString(strings.Trim(cell[r[0]:r[1]], mdCodeTick))
+			end = r[1]
+		}
+		b.WriteString(cellProse(cell[end:]))
+		cells[i] = b.String()
+	}
+	return cells
+}
+
+// cellProse renders the prose between a cell's code spans: links as
+// "label (url)", bold marks dropped.
+func cellProse(s string) string {
+	s = slackLinkRE.ReplaceAllString(s, slackCellLinkForm)
+	return strings.ReplaceAll(s, mdBoldMark, "")
 }
