@@ -1,6 +1,6 @@
 """Stop kanban workers leaking out of ``run_conversation`` without a board write.
 
-Five anchored edits across five files. Since v2026.9.14 the turn loop is split
+Seven anchored edits across six files. Since v2026.9.14 the turn loop is split
 into phase helpers under ``agent/turn_*.py``, each returning a verdict the loop
 copies back into its locals, so every site lives in the module that owns its
 phase:
@@ -14,7 +14,9 @@ phase:
    funnel every exit passes through, for the six sibling exits that leak the
    same way and for the halt path when its nudges are spent. A
    retries-exhausted exit whose last failure was a rate limit is blocked with
-   the provider's text instead of being charged a ``timed_out``.
+   the provider's text instead of being charged a ``timed_out``. Either write
+   is conditioned on the worker's own run inside its transaction: the block
+   through ``block_task(expected_run_id=...)``, the charge through edit 6.
 3. ``agent/turn_api_error.py`` — the retry loop's error handler stashes its last
    classified failure ``(reason, summary)`` on the agent, which is how edit 2
    tells a 429 exhaustion from the other retries-exhausted exits.
@@ -26,13 +28,25 @@ phase:
    non-quiet ``chat -q`` path every normal worker takes last holds the failed
    result. Same block; whichever of the two runs second finds the card already
    moved.
+6. ``hermes_cli/kanban_db_dispatch.py`` — two edits to ``_record_task_failure``:
+   an ``expected_run_id`` keyword, and a check of it against the
+   ``current_run_id`` the function already reads inside its write transaction.
+   Without it the release UPDATE is gated on status alone and ``_end_run``
+   closes whatever run is current, so the backstop's charge landed on the next
+   worker's run whenever the card had been re-run under it. Default ``None``
+   keeps every upstream caller as it was; ``block_task``, ``complete_task`` and
+   ``heartbeat_worker`` already take the same keyword. ``apply_kanban_scheduling``
+   edits a later part of the same function (the trip floor) and runs first;
+   neither anchor overlaps it.
 
 The inserts mirror code that is already in the tree: edit 1 copies the shape of
 upstream's kanban stop gate in ``agent/turn_stop_gates.py`` (local import,
 synthetic user row through ``append_message``, nudge counter on the agent), and
 edit 2 copies the ``_record_task_failure`` call ``_resolve_budget_fallback``
-directly above it already makes. None is idempotent — every insert sits next to
-its anchor rather than consuming it, so a marker check refuses the second run.
+directly above it already makes. None is idempotent: edits 1 to 5 sit next to
+their anchors rather than consuming them, and edit 6 splits its two anchors
+with the inserted lines. Either way a second run cannot be told from the
+anchors alone, so a marker check refuses it.
 
 See the module docstring in kanban_guardrail_exit.py for the incidents.
 """
@@ -49,6 +63,7 @@ FINALIZER_RELATIVE = "agent/turn_finalizer.py"
 API_ERROR_RELATIVE = "agent/turn_api_error.py"
 CLI_RELATIVE = "cli.py"
 CHAT_RELATIVE = "hermes_cli/cli_chat_turn_mixin.py"
+DISPATCH_RELATIVE = "hermes_cli/kanban_db_dispatch.py"
 
 # The inner lines are each unique in the file on their own; anchoring on the
 # whole block additionally pins the insertion point to just after the assistant
@@ -176,6 +191,9 @@ FINALIZER_INSERT = '''    # kube-agents patch: the guardrail-halt exit and six s
             # A retry loop that ended on a 429 blocks the card with the
             # provider's text (block_task, kind=transient) instead of being
             # charged a timed_out; the error handler's stash says which.
+            # run_id conditions the charge on this worker's run: a worker that
+            # already blocked keeps going and can reach here after the card
+            # is running again under a newer worker's run.
             if _kanban_record_missing_terminal(
                 task_id=_kanban_task_id,
                 turn_exit_reason=_turn_exit_reason,
@@ -184,6 +202,7 @@ FINALIZER_INSERT = '''    # kube-agents patch: the guardrail-halt exit and six s
                 block_task=_kb.block_task,
                 last_api_failure=getattr(agent, "_kube_last_api_failure", None),
                 run_id=_kube_worker_run_id(),
+                stop_nudges=getattr(agent, "_kanban_stop_nudges", 0),
             ):
                 logger.info(
                     "recorded missing-terminal-call outcome for task %s "
@@ -290,6 +309,43 @@ CHAT_INSERT = '''        # kube-agents patch: the non-quiet single-query path ev
                 )
 '''
 
+# The end of ``_record_task_failure``'s signature. The keyword goes last so no
+# positional or keyword call upstream changes meaning.
+RECORD_SIGNATURE_ANCHOR = (
+    "    event_payload_extra: Optional[dict] = None,\n"
+    ") -> bool:\n"
+)
+
+RECORD_SIGNATURE_PATCHED = (
+    "    event_payload_extra: Optional[dict] = None,\n"
+    "    expected_run_id: Optional[int] = None,\n"
+    ") -> bool:\n"
+)
+
+# The first lines after the function reads the card inside its write
+# transaction: ``row`` already carries ``current_run_id`` (upstream selects it
+# for ``_retry_status_for_run``), so the check costs no extra query and runs
+# before any write.
+RECORD_RUN_ANCHOR = (
+    "        if row is None:\n"
+    "            return False\n"
+    "        retry_status = (\n"
+)
+
+RECORD_RUN_PATCHED = (
+    "        if row is None:\n"
+    "            return False\n"
+    "        # kube-agents patch: condition the write on the caller's run, inside\n"
+    "        # this transaction, as block_task's expected_run_id does. Without it\n"
+    "        # the release UPDATE below is gated on status alone and _end_run\n"
+    "        # closes whatever run is current, so a worker whose own run had\n"
+    "        # already ended charged the next worker's run.\n"
+    "        # See hermes_cli/kanban_guardrail_exit.py.\n"
+    "        if expected_run_id is not None and row[\"current_run_id\"] != expected_run_id:\n"
+    "            return False\n"
+    "        retry_status = (\n"
+)
+
 # Every insert sits next to its anchor rather than consuming it, so the anchor
 # count alone cannot tell a fresh file from an already-patched one. These
 # markers can: each appears only in the inserted text.
@@ -328,6 +384,20 @@ EDITS = (
         CHAT_ANCHOR,
         CHAT_INSERT + CHAT_ANCHOR,
         "_kube_block_rate_limited_chat",
+    ),
+    (
+        DISPATCH_RELATIVE,
+        "_record_task_failure expected_run_id keyword",
+        RECORD_SIGNATURE_ANCHOR,
+        RECORD_SIGNATURE_PATCHED,
+        RECORD_SIGNATURE_PATCHED,
+    ),
+    (
+        DISPATCH_RELATIVE,
+        "_record_task_failure run check",
+        RECORD_RUN_ANCHOR,
+        RECORD_RUN_PATCHED,
+        "row[\"current_run_id\"] != expected_run_id",
     ),
 )
 

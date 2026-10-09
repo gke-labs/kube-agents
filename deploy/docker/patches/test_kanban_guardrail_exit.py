@@ -27,9 +27,11 @@ from apply_kanban_guardrail_exit import (
     CLASSIFY_ANCHOR,
     CLI_ANCHOR,
     CLI_RELATIVE,
+    DISPATCH_RELATIVE,
     FINALIZER_ANCHOR,
     FINALIZER_RELATIVE,
     HALT_ANCHOR,
+    RECORD_RUN_ANCHOR,
     TOOL_ROUND_RELATIVE,
     apply,
 )
@@ -57,7 +59,8 @@ from kanban_guardrail_exit import (
 SCHEMA = """
 CREATE TABLE tasks (
     id TEXT PRIMARY KEY,
-    status TEXT NOT NULL
+    status TEXT NOT NULL,
+    current_run_id INTEGER
 );
 """
 
@@ -81,11 +84,15 @@ def nudge_returning(value):
 
 
 def board(rows):
+    """``rows`` are ``(id, status)`` or ``(id, status, current_run_id)``."""
     conn = sqlite3.connect(":memory:")
     conn.row_factory = sqlite3.Row
     conn.executescript(SCHEMA)
-    for tid, status in rows:
-        conn.execute("INSERT INTO tasks (id, status) VALUES (?, ?)", (tid, status))
+    for tid, status, *run in rows:
+        conn.execute(
+            "INSERT INTO tasks (id, status, current_run_id) VALUES (?, ?, ?)",
+            (tid, status, run[0] if run else None),
+        )
     return conn
 
 
@@ -415,16 +422,39 @@ class TaskIsStillRunningTest(unittest.TestCase):
     def test_a_plain_tuple_row_factory_works(self):
         conn = sqlite3.connect(":memory:")
         conn.executescript(SCHEMA)
-        conn.execute("INSERT INTO tasks (id, status) VALUES ('t1', 'running')")
+        conn.execute("INSERT INTO tasks (id, status, current_run_id) VALUES ('t1', 'running', 7)")
         self.assertTrue(task_is_still_running(conn, "t1"))
+        self.assertTrue(task_is_still_running(conn, "t1", 7))
+        self.assertFalse(task_is_still_running(conn, "t1", 6))
+
+    def test_the_workers_own_run_is_running(self):
+        self.assertTrue(task_is_still_running(board([("t1", "running", 7)]), "t1", 7))
+
+    def test_a_newer_workers_run_is_not_this_workers(self):
+        """The card was blocked, re-dispatched, and is running again for someone else."""
+        self.assertFalse(task_is_still_running(board([("t1", "running", 8)]), "t1", 7))
+        self.assertFalse(task_is_still_running(board([("t1", "running")]), "t1", 7))
+
+    def test_no_run_id_asks_nothing_about_the_run(self):
+        self.assertTrue(task_is_still_running(board([("t1", "running", 8)]), "t1"))
 
 
 class Recorder:
-    def __init__(self):
+    """Stands in for ``_record_task_failure``: a charge moves the card off
+    ``running`` and clears its run, as the real one does."""
+
+    def __init__(self, writes=True):
         self.calls = []
+        self.writes = writes
 
     def __call__(self, conn, task_id, **kwargs):
         self.calls.append((task_id, kwargs))
+        if self.writes:
+            conn.execute(
+                "UPDATE tasks SET status = 'ready', current_run_id = NULL WHERE id = ?",
+                (task_id,),
+            )
+        return False
 
 
 class ClosableConn:
@@ -440,14 +470,15 @@ class ClosableConn:
 
 
 class RecordMissingTerminalTest(unittest.TestCase):
-    def _record(self, status, reason="guardrail_halt"):
-        conn = ClosableConn(board([("t1", status)]))
+    def _record(self, status, reason="guardrail_halt", current_run=None, **kwargs):
+        conn = ClosableConn(board([("t1", status, current_run)]))
         rec = Recorder()
         did = record_missing_terminal_call(
             task_id="t1",
             turn_exit_reason=reason,
             connect=lambda: conn,
             record_failure=rec,
+            **kwargs,
         )
         return did, rec, conn
 
@@ -501,6 +532,94 @@ class RecordMissingTerminalTest(unittest.TestCase):
         text = missing_terminal_error("guardrail_halt")
         self.assertIn("terminal kanban call", text)
         self.assertIn("guardrail_halt", text)
+
+    def test_a_worker_whose_run_already_ended_charges_nobody(self):
+        """t_46c49c08: a worker blocked, kept going, and ended in text after the
+        card was running again under the next worker's run."""
+        did, rec, conn = self._record(
+            "running", reason=TEXT_EXIT, current_run=204, run_id=197
+        )
+        self.assertFalse(did)
+        self.assertEqual(rec.calls, [])
+        self.assertTrue(conn.closed)
+
+    def test_the_workers_own_run_is_still_charged(self):
+        did, rec, _ = self._record("running", reason=TEXT_EXIT, current_run=197, run_id=197)
+        self.assertTrue(did)
+        self.assertEqual(rec.calls[0][1]["outcome"], OUTCOME)
+
+    def test_the_charge_carries_the_run_into_the_write(self):
+        """The read is not enough on its own: the card can change hands before
+        record_failure opens its transaction, so the run travels with it."""
+        _, rec, _ = self._record("running", reason=TEXT_EXIT, current_run=197, run_id=197)
+        self.assertEqual(rec.calls[0][1]["expected_run_id"], 197)
+        _, rec, _ = self._record("running", reason=TEXT_EXIT)
+        self.assertIsNone(rec.calls[0][1]["expected_run_id"])
+
+    def test_a_charge_refused_inside_the_write_is_not_reported_as_recorded(self):
+        """The card changed hands between the read and the write: the patched
+        _record_task_failure writes nothing, and this must not say it did."""
+        conn = ClosableConn(board([("t1", "running", 197)]))
+        did = record_missing_terminal_call(
+            task_id="t1",
+            turn_exit_reason=TEXT_EXIT,
+            connect=lambda: conn,
+            record_failure=Recorder(writes=False),
+            run_id=197,
+        )
+        self.assertFalse(did)
+
+    def test_the_nudge_count_reaches_the_error(self):
+        _, rec, _ = self._record("running", reason=TEXT_EXIT, stop_nudges=1)
+        self.assertIn("kanban nudges sent: 1", rec.calls[0][1]["error"])
+
+
+TEXT_EXIT = "text_response(finish_reason=stop)"
+
+
+class MissingTerminalErrorTest(unittest.TestCase):
+    def test_a_text_reply_says_so_first(self):
+        text = missing_terminal_error(TEXT_EXIT, 2)
+        self.assertTrue(text.startswith("model replied in text"), text)
+        self.assertIn("terminal kanban call", text)
+        self.assertIn(f"turn_exit_reason={TEXT_EXIT}", text)
+        self.assertIn("kanban nudges sent: 2", text)
+        self.assertIn("reply was not saved as its result", text)
+
+    def test_the_operator_reads_what_happened_within_the_cli_cut(self):
+        """`hermes kanban show` prints the first 160 characters of a run error."""
+        head = missing_terminal_error(TEXT_EXIT, 2)[:160]
+        self.assertIn("replied in text", head)
+        self.assertIn("kanban nudges sent: 2", head)
+
+    def test_the_text_describes_and_does_not_instruct(self):
+        """The retry worker reads this; an instruction in it would be a prompt
+        change, which needs its own eval case."""
+        self.assertTrue(
+            missing_terminal_error(TEXT_EXIT, 2).endswith("was not saved as its result.")
+        )
+        for reason in (TEXT_EXIT, "guardrail_halt", RETRIES_EXHAUSTED_EXIT_REASON,
+                       "partial_stream_recovery", "fallback_prior_turn_content",
+                       "empty_response_exhausted", "local_processing_error",
+                       "error_near_max_iterations"):
+            self.assertNotIn("kanban_complete", missing_terminal_error(reason, 2), reason)
+
+    def test_other_exits_keep_the_generic_lead(self):
+        text = missing_terminal_error("guardrail_halt", 0)
+        self.assertTrue(text.startswith("worker ended without a terminal kanban call"))
+        self.assertNotIn("replied in text", text)
+
+    def test_an_unknown_count_is_left_out_rather_than_guessed(self):
+        self.assertNotIn("nudges", missing_terminal_error(TEXT_EXIT))
+
+    def test_the_text_avoids_the_phrases_upstream_parses(self):
+        """"protocol violation" feeds upstream's clean-exit streak; auth/quota words
+        park the card as a respawn blocker (verified against the real regex in the image)."""
+        for reason in (TEXT_EXIT, "guardrail_halt"):
+            text = missing_terminal_error(reason, 2).lower()
+            self.assertNotIn("protocol violation", text)
+            for word in ("auth", "quota", "429", "403", "forbidden", "permission"):
+                self.assertNotIn(word, text)
 
 
 STORM_ERROR = (
@@ -696,7 +815,7 @@ class FinalizerRateLimitBranchTest(unittest.TestCase):
     """The finalize_turn site: retries exhausted with no response after a 429."""
 
     def _record(self, reason, last_api_failure, block_task=None):
-        conn = ClosableConn(board([("t_storm", "running")]))
+        conn = ClosableConn(board([("t_storm", "running", 7)]))
         rec = Recorder()
         did = record_missing_terminal_call(
             task_id="t_storm",
@@ -941,6 +1060,42 @@ def finalize_turn(agent, *, final_response, api_call_count, interrupted, failed,
 '''
 
 
+# Upstream's _record_task_failure, cut to the lines the two dispatch edits
+# anchor on and one write the run check has to precede.
+DISPATCH_STUB = '''from typing import Optional
+
+
+def _record_task_failure(
+    conn,
+    task_id: str,
+    error: str,
+    *,
+    outcome: str,
+    failure_limit: int = None,
+    force_trip: bool = False,
+    release_claim: bool = False,
+    end_run: bool = False,
+    event_payload_extra: Optional[dict] = None,
+) -> bool:
+    """Record a non-success outcome."""
+    with _kb.write_txn(conn):
+        row = conn.execute(
+            "SELECT consecutive_failures, status, max_retries, current_run_id "
+            "FROM tasks WHERE id = ?", (task_id,),
+        ).fetchone()
+        if row is None:
+            return False
+        retry_status = (
+            "ready"
+        )
+        conn.execute(
+            "UPDATE tasks SET status = ?, current_run_id = NULL WHERE id = ? AND status = 'running'",
+            (retry_status, task_id),
+        )
+        return False
+'''
+
+
 def stage_tree():
     root = Path(tempfile.mkdtemp())
     (root / "agent").mkdir()
@@ -950,6 +1105,7 @@ def stage_tree():
     (root / FINALIZER_RELATIVE).write_text(FINALIZER_STUB)
     (root / CLI_RELATIVE).write_text(CLI_STUB)
     (root / CHAT_RELATIVE).write_text(CHAT_STUB)
+    (root / DISPATCH_RELATIVE).write_text(DISPATCH_STUB)
     return root
 
 
@@ -993,6 +1149,7 @@ class ApplierTest(unittest.TestCase):
             "api_error": (root / API_ERROR_RELATIVE).read_text(),
             "cli": (root / CLI_RELATIVE).read_text(),
             "chat": (root / CHAT_RELATIVE).read_text(),
+            "dispatch": (root / DISPATCH_RELATIVE).read_text(),
         }
 
     def test_all_files_are_patched_and_stay_parseable(self):
@@ -1004,6 +1161,49 @@ class ApplierTest(unittest.TestCase):
         self.assertIn("agent._kube_last_api_failure = (", files["api_error"])
         self.assertIn("_kube_block_rate_limited(result)", files["cli"])
         self.assertIn("_kube_block_rate_limited_chat(turn.result)", files["chat"])
+
+    def test_the_run_check_runs_inside_the_transaction_before_any_write(self):
+        dispatch = self._apply_all()["dispatch"]
+        ast.parse(dispatch)
+        self.assertIn("    expected_run_id: Optional[int] = None,\n) -> bool:", dispatch)
+        self.assertEqual(dispatch.count(RECORD_RUN_ANCHOR), 0)
+        check = dispatch.index('row["current_run_id"] != expected_run_id')
+        self.assertLess(dispatch.index("with _kb.write_txn(conn):"), check)
+        self.assertLess(dispatch.index("if row is None:"), check)
+        self.assertLess(check, dispatch.index("UPDATE tasks"))
+
+    def test_the_patched_failure_record_leaves_another_run_alone(self):
+        """Run the miniature: a mismatched run writes nothing; a matching run or
+        no run at all writes as upstream did."""
+        import contextlib
+
+        root = stage_tree()
+        apply(root)
+        spec = importlib.util.spec_from_file_location("patched_dispatch", root / DISPATCH_RELATIVE)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        module._kb = types.SimpleNamespace(write_txn=lambda conn: contextlib.nullcontext())
+
+        def card(run):
+            conn = sqlite3.connect(":memory:")
+            conn.row_factory = sqlite3.Row
+            conn.execute(
+                "CREATE TABLE tasks (id TEXT, status TEXT, current_run_id INTEGER, "
+                "consecutive_failures INTEGER DEFAULT 0, max_retries INTEGER)"
+            )
+            conn.execute("INSERT INTO tasks (id, status, current_run_id) VALUES ('t1', 'running', ?)", (run,))
+            return conn
+
+        def status(conn):
+            return conn.execute("SELECT status, current_run_id FROM tasks").fetchone()[:]
+
+        conn = card(204)
+        module._record_task_failure(conn, "t1", "x", outcome="timed_out", expected_run_id=197)
+        self.assertEqual(status(conn), ("running", 204))
+        for expected in (204, None):
+            conn = card(204)
+            module._record_task_failure(conn, "t1", "x", outcome="timed_out", expected_run_id=expected)
+            self.assertEqual(status(conn), ("ready", None), expected)
 
     def test_the_stash_follows_the_classification(self):
         api_error = self._apply_all()["api_error"]
@@ -1039,6 +1239,7 @@ class ApplierTest(unittest.TestCase):
             'last_api_failure=getattr(agent, "_kube_last_api_failure", None)', call
         )
         self.assertIn("run_id=_kube_worker_run_id()", call)
+        self.assertIn('stop_nudges=getattr(agent, "_kanban_stop_nudges", 0)', call)
 
     def test_the_finalizer_reads_the_split_kanban_modules(self):
         """hermes_cli.kanban_db no longer defines connect or _record_task_failure."""

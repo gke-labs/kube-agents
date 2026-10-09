@@ -31,8 +31,14 @@ and still be useless:
    ``completed`` determination.
 4. **The board write lands.** ``record_missing_terminal_call`` is driven against
    a real kanban database through the real ``_record_task_failure``: claim
-   released, run closed, failure counted, exit reason legible in the event. Plus
-   the three cases that must *not* write — a card the board no longer shows as
+   released, run closed, failure counted, exit reason legible in the event, and
+   no text upstream would re-read as an auth blocker or a protocol violation.
+   Plus a worker whose run already ended (it blocked, the card was re-run, and
+   it ended in text afterwards), which must leave the next worker's run open,
+   and the same hand-over landing between the backstop's read and
+   ``_record_task_failure``'s write, which the run check inside the write
+   transaction must refuse.
+   Plus the three cases that must *not* write — a card the board no longer shows as
    ``running`` (compaction can drop a terminal tool call out of ``messages``,
    the board cannot), a goal-mode worker between turns, and a dispatched cron
    run, which is holding its *caller's* task id. The cron case is checked
@@ -843,9 +849,9 @@ check(
     ),
 )
 
-# Nothing to hand back twice. This is the guard that makes a false positive
-# impossible rather than merely unlikely: the transcript can lie about a
-# terminal call after compaction, the board cannot.
+# Nothing to hand back twice. The board decides, not the transcript: the
+# transcript can lie about a terminal call after compaction, the board cannot.
+# The status alone is not enough, though — see the re-run case below.
 check("the card is no longer running", not task_is_still_running(conn, card))
 before = len(events(conn, card))
 check(
@@ -905,6 +911,135 @@ check(
     row(conn, card)["status"] == "blocked",
     f"status={row(conn, card)['status']!r}",
 )
+
+# A worker that blocked its own card keeps running until it ends a turn in
+# text; by then the card can be running again under the next worker's run.
+# Its backstop must leave that run alone — _record_task_failure would close it.
+TEXT_EXIT = "text_response(finish_reason=stop)"
+conn = board()
+moved = K.create_task(conn, title="Check PDB coverage (blocked, re-run)", assignee="platform")
+K.recompute_ready(conn)
+check("the first worker's card is claimed", K.claim_task(conn, moved))
+first_run = K.get_task(conn, moved).current_run_id
+check(
+    "the first worker blocks its own run",
+    K.block_task(conn, moved, reason="waiting on a sibling card", expected_run_id=first_run),
+)
+check("and the card is unblocked", K.unblock_task(conn, moved))
+K.recompute_ready(conn)
+check("the next worker claims it", K.claim_task(conn, moved))
+second_run = K.get_task(conn, moved).current_run_id
+check("under a new run", second_run != first_run, f"run {first_run} -> {second_run}")
+check(
+    "the first worker's backstop records nothing",
+    record_missing_terminal_call(
+        task_id=moved,
+        turn_exit_reason=TEXT_EXIT,
+        connect=board,
+        record_failure=KD._record_task_failure,
+        run_id=first_run,
+        stop_nudges=0,
+    )
+    is False,
+)
+conn = board()
+after = row(conn, moved)
+check(
+    "the next worker's run is still open and uncharged",
+    after["status"] == "running"
+    and open_runs(conn, moved) == 1
+    and K.get_task(conn, moved).current_run_id == second_run
+    and (after["consecutive_failures"] or 0) == 0,
+    f"status={after['status']!r} open={open_runs(conn, moved)} "
+    f"failures={after['consecutive_failures']!r}",
+)
+check(
+    "the next worker's own leak is still charged to its run",
+    record_missing_terminal_call(
+        task_id=moved,
+        turn_exit_reason=TEXT_EXIT,
+        connect=board,
+        record_failure=KD._record_task_failure,
+        run_id=second_run,
+        stop_nudges=2,
+    )
+    is True,
+)
+conn = board()
+text_error = row(conn, moved)["last_failure_error"] or ""
+check(
+    "a text exit says the model replied in text, and how often it was nudged",
+    text_error.startswith("model replied in text")
+    and f"turn_exit_reason={TEXT_EXIT}" in text_error
+    and "kanban nudges sent: 2" in text_error,
+    f"last_failure_error={text_error!r}",
+)
+
+# The read above runs before _record_task_failure opens its own transaction.
+# Hand the card over in exactly that gap: the run check inside the write has
+# to refuse the charge, or the new run is closed as before.
+params = inspect.signature(KD._record_task_failure).parameters
+check(
+    "_record_task_failure takes expected_run_id, defaulting to no check",
+    "expected_run_id" in params and params["expected_run_id"].default is None,
+    f"parameters: {list(params)}",
+)
+conn = board()
+raced = K.create_task(conn, title="Check PDB coverage (hand-over mid-charge)", assignee="platform")
+K.recompute_ready(conn)
+K.claim_task(conn, raced)
+raced_run = K.get_task(conn, raced).current_run_id
+handed_over = {}
+
+
+def hand_over_then_record(conn, task_id, **kwargs):
+    K.block_task(conn, task_id, reason="hand-over", expected_run_id=raced_run)
+    K.unblock_task(conn, task_id)
+    K.recompute_ready(conn)
+    K.claim_task(conn, task_id)
+    handed_over["run"] = K.get_task(conn, task_id).current_run_id
+    return KD._record_task_failure(conn, task_id, **kwargs)
+
+
+raced_recorded = record_missing_terminal_call(
+    task_id=raced,
+    turn_exit_reason=TEXT_EXIT,
+    connect=board,
+    record_failure=hand_over_then_record,
+    run_id=raced_run,
+    stop_nudges=0,
+)
+check(
+    "and the backstop does not report a charge the write refused",
+    raced_recorded is False,
+    f"returned {raced_recorded!r}; the finalizer would log 'recorded'",
+)
+conn = board()
+after = row(conn, raced)
+check(
+    "a hand-over between the read and the write leaves the new run open",
+    handed_over.get("run") not in (None, raced_run)
+    and after["status"] == "running"
+    and open_runs(conn, raced) == 1
+    and K.get_task(conn, raced).current_run_id == handed_over.get("run")
+    and (after["consecutive_failures"] or 0) == 0,
+    f"handed over to {handed_over.get('run')!r}; status={after['status']!r} "
+    f"open={open_runs(conn, raced)} failures={after['consecutive_failures']!r}",
+)
+
+# The text is read back by upstream: a respawn-blocker word parks the card as
+# an auth/quota wall, and "protocol violation" feeds the clean-exit streak.
+for reason in (TEXT_EXIT,) + EXIT_REASONS:
+    text = missing_terminal_error(reason, 2)
+    check(
+        f"the {reason} text is not read as a respawn blocker",
+        not KD._RESPAWN_BLOCKER_RE.search(text),
+        f"matched {KD._RESPAWN_BLOCKER_RE.search(text)!r} in {text!r}",
+    )
+    check(
+        f"the {reason} text is not read as a protocol violation",
+        "protocol violation" not in text,
+    )
 
 
 # --- 6. The rate-limit block lands ------------------------------------------
