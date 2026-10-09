@@ -212,11 +212,17 @@ skips those — but still before any CRD, chart or Terraform change of the new r
   `--upgrade-mode=full`, which renders `install.env` onto the chart instead. On a rollback to a
   release that predates the value, re-run with `--drop-undeclared-values`. A full upgrade refuses
   that flag, since it has no recorded values to drop.
-- **The Slack allowlist holds an email under `next`.** A full upgrade applies `PLATFORM_AGENT_MODE`
-  from `install.env`, and with `next` and Slack on it refuses a `SLACK_ALLOWED_USERS` entry with an
-  `@`, naming each one: under `next` the list matches Slack member IDs exactly, so an email matches
-  nobody. Replace each with the person's member ID (in Slack, their profile, then **⋮** (More), then
-  **Copy member ID**) and re-run.
+- **A Slack setting the A2A gateway cannot use.** A full upgrade applies `PLATFORM_AGENT_MODE` from
+  `install.env`. With `next`, Slack on and Google Chat off, the A2A gateway takes Slack, and the run
+  refuses three settings it cannot use, naming each one:
+  - a `SLACK_ALLOWED_USERS` entry with an `@`: the list matches Slack member IDs exactly, so an
+    email matches nobody. Replace it with the person's member ID (in Slack, their profile, then
+    **⋮** (More), then **Copy member ID**).
+  - a `SLACK_HOME_CHANNEL` that is not a channel ID (`C...` or `G...`): the gateway's notify route
+    does not arm, so proactive posts and board-card reports stop. The ID is at the bottom of the
+    channel details' About tab.
+  - a `SLACK_BOT_TOKEN` that holds several tokens: the gateway takes one workspace's token. The
+    run gives the count, never the token. Keep a multi-workspace install on `today`.
 
 ## Where to go next
 

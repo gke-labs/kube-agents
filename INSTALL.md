@@ -417,9 +417,11 @@ KUBE_AGENTS_STATE_BUCKET=auto ./lifecycle.sh apply
   the chart `platformAgent.mode`. To switch a running install, edit `PLATFORM_AGENT_MODE` in
   `install.env` and re-run `install.sh` or a full `upgrade.sh`;
   [`scripts/installer/README.md`](scripts/installer/README.md) has the rules for the key. Before
-  switching an install with Slack to `next`, check that `SLACK_ALLOWED_USERS` holds Slack member
-  IDs such as `U0123ABCD`, not emails: under `next` the list matches member IDs exactly, and both
-  front doors refuse a `next` apply whose list has an entry with an `@`.
+  switching an install whose Slack is on and Google Chat off to `next` (the A2A gateway then
+  takes Slack), check three Slack keys: `SLACK_ALLOWED_USERS` holds member IDs such as
+  `U0123ABCD`, not emails, which match nobody; `SLACK_HOME_CHANNEL`, if set, is a channel ID
+  (`C...` or `G...`), not a DM or a user; `SLACK_BOT_TOKEN` is one workspace's token, not a
+  comma-separated list. Both front doors refuse a `next` apply that fails any of them.
 
 - **Dry-run check**: To preview actions without modifying cloud infrastructure:
   ```bash
