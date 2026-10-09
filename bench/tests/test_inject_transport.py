@@ -2646,6 +2646,31 @@ def test_a_card_that_never_settles_ends_at_the_delegation_ceiling(
     assert len(api_executor.submissions) == 1
 
 
+def test_a_running_card_at_the_ceiling_delivers_nothing_from_an_earlier_run(
+    api_executor: _StubGatewayServer, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A 429-blocked worker closes its run with the provider's error as the
+    summary, and the card is unblocked to run again; a still-running card can
+    also carry a stashed ``tasks.result``. Neither is the card's answer, so at
+    the ceiling the card is outstanding with nothing delivered, as on the
+    status-turn wait, which only ever reads a card it has seen terminal."""
+    build_session_store(tmp_path, created=[CARD_A])
+    set_card(tmp_path, CARD_A, "blocked", summary="429 RESOURCE_EXHAUSTED")
+    set_card(tmp_path, CARD_A, "running", result="stashed before a refused completion")
+    monkeypatch.setenv("AGENT_DELEGATION_TIMEOUT", "1")
+    monkeypatch.setenv("AGENT_DELEGATION_POLL_INTERVAL", "0.1")
+    monkeypatch.setattr(harness, "_agent_shell", local_shell(tmp_path, monkeypatch))
+
+    result = KubeAgentsHarness().run("check the fleet")
+
+    assert result.errors == [
+        f"{harness.DELEGATION_CEILING_MARKER}: delegated tasks did not finish within 1s: "
+        f"{CARD_A} (running)"
+    ]
+    assert result.metadata["final_message"] == ACK
+    assert "RESOURCE_EXHAUSTED" not in result.output
+
+
 def test_a_board_that_stops_answering_is_infrastructure(
     api_executor: _StubGatewayServer, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:

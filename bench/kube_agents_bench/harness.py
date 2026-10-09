@@ -2451,7 +2451,18 @@ class KubeAgentsHarness(AgentHarness):
             outstanding = [t for t in awaited if _status(t) not in _TERMINAL_STATUSES]
 
         observed: list[dict[str, Any]] = list(result.trajectory)
-        observed.extend(e for t in awaited if (e := read.as_shown(t)) is not None)
+        # Only a card the board shows terminal is read back, as the status-turn
+        # wait only ever reads a card it has seen terminal. A card still moving
+        # at the ceiling can carry text that is not its answer -- an earlier
+        # run's summary (a 429-blocked run closes with the provider's error and
+        # the card is unblocked to run again), or a ``tasks.result`` stashed
+        # before a refused completion -- and delivering it would both grade
+        # that text and hide the ceiling from the scorer.
+        observed.extend(
+            e
+            for t in awaited
+            if _status(t) in _TERMINAL_STATUSES and (e := read.as_shown(t)) is not None
+        )
         result.metadata["delegated_cards"] = {t: _status(t) for t in awaited}
         if timed_out:
             _record_ceiling(

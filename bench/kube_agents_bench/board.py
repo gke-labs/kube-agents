@@ -370,7 +370,9 @@ class SessionCards:
         The shape ``parsing.reported_statuses`` and ``parsing.delivered_results``
         read -- ``{"task": {id, status, result}, "runs": [{summary}]}`` -- so
         the wait's settle grades a card read off the board exactly as it grades
-        one an agent read back on a status turn.
+        one an agent read back on a status turn. The caller reads back only a
+        card whose status is terminal: a card still moving can carry an earlier
+        run's summary or a stashed result that is not its answer.
         """
         card = self.cards.get(task_id)
         if card is None:
