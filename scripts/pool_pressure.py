@@ -132,11 +132,14 @@ BUILD_LOG_DECODE_ERRORS = "replace"
 # whatever survived.
 BANNER_PATTERN = re.compile(r"^===\s*\[([^]]+)\]\s*(.*?)\s*===\s*$", re.MULTILINE)
 BANNER_LEASE_KEYWORD = "boskos"
-# What boskosctl prints when the acquire gives up with nothing free. It is the
-# last line of a run that failed at the lease: the job stops there and no
+# What boskosctl prints when the acquire gives up with nothing free: its
+# failure prefix with Boskos's not-found answer. The whole line, because the
+# prefix alone is also what an unreachable Boskos prints (with a dial error
+# for a tail), and that is an acquire nobody can read, not a full pool. It is
+# the last line of a run that failed at the lease: the job stops there and no
 # banner follows, so the run has no lease segment and, uncounted, its wait is
 # the minute it spent before asking (#2747).
-LEASE_FAILURE_PHRASE = "failed to acquire a resource"
+LEASE_FAILURE_PHRASE = "failed to acquire a resource: resources not found"
 
 # The four segments of setup time, in the order a run goes through them, with
 # the label the report prints. Keys rather than prose because --json emits them.
@@ -1363,9 +1366,13 @@ def recent_lease_failures(waits: List[Wait], window_end: datetime) -> List[Wait]
     happened, not from when the run was created.
     """
     start = window_end - timedelta(hours=RECENT_WINDOW_HOURS)
+    # Bounded above too: a replay's instant can fall between a run's creation
+    # and its ask, and a refusal after the instant had not happened yet.
     failed = [
         w for w in waits
-        if w.lease_failed and w.lease_requested is not None and w.lease_requested >= start
+        if w.lease_failed
+        and w.lease_requested is not None
+        and start <= w.lease_requested <= window_end
     ]
     failed.sort(key=lambda w: w.lease_requested, reverse=True)
     return failed

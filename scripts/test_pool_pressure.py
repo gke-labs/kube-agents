@@ -170,8 +170,16 @@ class Banners(unittest.TestCase):
         self.assertFalse(pp.lease_failed("\n".join(self.LOG.split("\n")[:2])))
 
     def test_the_failure_line_counts_only_between_the_lease_banner_and_the_next(self):
-        self.assertFalse(pp.lease_failed(self.LOG + "\nfailed to acquire a resource: elsewhere"))
-        self.assertFalse(pp.lease_failed("failed to acquire a resource: earlier\n" + self.LOG))
+        self.assertFalse(pp.lease_failed(self.LOG + "\n" + self.FAILED.split("\n")[1]))
+        self.assertFalse(pp.lease_failed(self.FAILED.split("\n")[1] + "\n" + self.LOG))
+
+    def test_an_acquire_that_could_not_reach_boskos_is_not_a_refusal(self):
+        """boskosctl's prefix is the same; only the not-found tail says the
+        pool was empty. A dial error is an acquire nobody could read."""
+        down = self.FAILED.split("\n")[0] + (
+            '\nfailed to acquire a resource: Post "http://boskos/acquire": dial tcp: connection refused'
+        )
+        self.assertFalse(pp.lease_failed(down))
 
     def test_rewording_that_keeps_the_keyword_still_matches(self):
         log = "\n".join((
@@ -645,8 +653,10 @@ class RecentRow(unittest.TestCase):
         # Created inside the window too: the one that reaches the
         # `not w.lease_failed` filter rather than the creation filter.
         fresh = failed(10, created_back=100, asked_back=50)
+        # Created before a replay's instant, asked after it: not yet refused.
+        later = failed(11, created_back=5, asked_back=-4)
         row = pp.recent_row(
-            self._waits([30, 60, 90, 120, 150]) + [inside, outside, fresh], self.END
+            self._waits([30, 60, 90, 120, 150]) + [inside, outside, fresh, later], self.END
         )
         self.assertEqual(row["runs"], 5, "a refused run is not a sample, whenever it was created")
         self.assertEqual(row["lease_failures"], 2)
@@ -1119,7 +1129,21 @@ class EndToEnd(unittest.TestCase):
         self.assertIn("PR 2703    build 2108249555685347328", out)
         self.assertIn("CAPACITY", out)
         self.assertIn("out of rotation: rebuilding 2", out)
+        self.assertIn("held by a job without a run ID: fleet-reconcile (1)", out)
         self.assertIn("held by hand: hangdng-rebuild (2)", out)
+        # The refused runs leave the segment medians: the one leased run's
+        # acquire, alone, not withheld under a 1-of-3 coverage.
+        self.assertIn("9.3 min   (1 of 1)", out)
+
+    def test_refused_runs_are_not_outliers_and_not_in_the_window_percentiles(self):
+        """The two refused runs waited about seven minutes from creation to
+        the ask; over a five-minute line they would be outliers, and in the
+        window percentiles they would halve the median."""
+        code, out = run(from_dir=SATURATED_DIR, as_of=SATURATED_AS_OF, window_days=1,
+                        outlier_limit=5)
+        self.assertEqual(pp.EXIT_BREACH, code)
+        self.assertIn("Individual runs that waited over 5.0 minutes: 1", out)
+        self.assertIn("build 2108236254767222784", out.split("Individual runs")[1])
         leaks = out.split("held by runs Deck does not know about")[1].split("\n\n")[0]
         self.assertIn("pull-kube-agents-smoke-test-2108220000000000000", leaks)
         self.assertNotIn("ci-kube-agents-eval-next", leaks, "a running periodic is not a leak")
@@ -1288,10 +1312,15 @@ class JsonOutput(unittest.TestCase):
              for f in payload["lease_failures"]],
         )
         self.assertEqual({"hangdng-rebuild": 2}, payload["held_by_hand"])
-        self.assertEqual({}, payload["held_by_job"])
-        self.assertEqual({"busy": 3, "rebuilding": 2}, payload["states"])
+        self.assertEqual({"fleet-reconcile": 1}, payload["held_by_job"])
+        self.assertEqual({"busy": 4, "rebuilding": 2}, payload["states"])
         self.assertEqual(2, payload["recent"]["lease_failures"])
         self.assertEqual(2, payload["trend"]["lease_failures"])
+        # The window percentiles are the one leased run's, not pulled down by
+        # the two refused runs' one-minute waits.
+        self.assertEqual((1, 22.6, 22.6), (payload["trend"]["runs"],
+                                            payload["trend"]["p50_minutes"],
+                                            payload["trend"]["p95_minutes"]))
         self.assertEqual((1, 2), (payload["trend"]["days"][0]["runs"],
                                   payload["trend"]["days"][0]["lease_failures"]))
         self.assertEqual(["pull-kube-agents-smoke-test-2108220000000000000"],

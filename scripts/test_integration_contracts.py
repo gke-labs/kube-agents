@@ -541,7 +541,7 @@ class WorkflowNameJoinTest(unittest.TestCase):
 
 
 class PoolPressureJobOwnersContractTest(unittest.TestCase):
-    """pool_pressure.py's BOSKOS_JOB_OWNERS copies the fixed Boskos owners two
+    """pool_pressure.py's BOSKOS_JOB_OWNERS copies the fixed Boskos owners the
     hack/ scripts lease under. A rename there and not here would move that
     job's leases under "held by hand" with nothing red."""
 

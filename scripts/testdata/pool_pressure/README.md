@@ -123,9 +123,11 @@ Deck snapshot that carries a running periodic as well as the smoke runs: a
 smoke lease Deck is running (not a leak), a `ci-kube-agents-eval-next` lease
 Deck is running under its own job (not a leak, though it would read as one
 against the smoke runs alone), a smoke lease no running job accounts for (the
-one leak), and `hangdng-rebuild`, an owner with no build ID, holding two
-projects in Boskos's custom `rebuilding` state (held by hand, never leaked).
-`current` has no `free` key, so the pool reads full.
+one leak), `fleet-reconcile`, the reconcile's fixed owner with no build ID
+(held by a job, never a hand hold or a leak), and `hangdng-rebuild`, an owner
+with no build ID, holding two projects in Boskos's custom `rebuilding` state
+(held by hand, never leaked). `current` has no `free` key, so the pool reads
+full.
 
 ## Re-capturing
 
