@@ -1082,7 +1082,8 @@ class DeleteAgentCrEndpointTest(unittest.TestCase):
     """
 
     def _run_delete(self, dns_endpoint="gke-abc.us-central1.gke.goog",
-                    allow_external="True", supports_flag=True, wedged=False):
+                    allow_external="True", supports_flag=True, wedged=False,
+                    agent_name="agent"):
         """Run delete_agent_cr against stubbed gcloud, kubectl and terraform.
 
         Returns (completed process, recorded get-credentials invocation).
@@ -1114,7 +1115,7 @@ exit 0
 printf '%s\\n' "$*" >> '{kubectl_record}'
 if [[ "{wedged}" == True ]]; then
   case "$*" in
-    *"get platformagent"*) echo platformagent.kubeagents.x-k8s.io/agent ;;
+    *"get platformagent"*) echo platformagent.kubeagents.x-k8s.io/{agent_name} ;;
     *"delete platformagent"*) exit 1 ;;
   esac
 fi
@@ -1163,6 +1164,8 @@ exit 0
         # When the operator's finalizer fails to clear in time, the script strips
         # the finalizer and manually cleans cluster-scoped RBAC (minimal,
         # tokenreview, callout tokenreview) and the next-mode JetStream PVC (#2795).
+        # PVC deletion uses --wait=false to avoid blocking teardown and filters
+        # on the instance label to mirror the controller's ownership check.
         proc, _ = self._run_delete(wedged=True)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertIn(
@@ -1174,7 +1177,22 @@ exit 0
             self.kubectl_args,
         )
         self.assertIn(
-            "delete pvc data-agent-a2a-nats-0 -n kubeagents-system --ignore-not-found",
+            "delete pvc -n kubeagents-system -l app.kubernetes.io/instance=kubeagents-system-agent --field-selector metadata.name=data-agent-a2a-nats-0 --ignore-not-found --wait=false",
+            self.kubectl_args,
+        )
+
+    def test_wedged_finalizer_truncates_long_instance_label_for_pvc(self):
+        # Ensure that instanceLabel (>63 chars) is properly truncated to 63 chars
+        # and trailing dashes/dots/underscores are trimmed.
+        long_agent = "a" * 60 + "-xyz"
+        proc, _ = self._run_delete(wedged=True, agent_name=long_agent)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        # namespace (17) + '-' (1) + 64 chars = 82 chars. Truncated to 63 chars:
+        # 'kubeagents-system-' (18) + 45 'a's = 63 chars.
+        expected_label = "kubeagents-system-" + ("a" * 45)
+        self.assertEqual(len(expected_label), 63)
+        self.assertIn(
+            f"delete pvc -n kubeagents-system -l app.kubernetes.io/instance={expected_label} --field-selector metadata.name=data-{long_agent}-a2a-nats-0 --ignore-not-found --wait=false",
             self.kubectl_args,
         )
 

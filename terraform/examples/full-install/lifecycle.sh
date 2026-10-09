@@ -1102,7 +1102,7 @@ fetch_cluster_credentials() {
 }
 
 delete_agent_cr() {
-  local namespace names agent_name
+  local namespace names agent_name inst_label
   namespace=$(tfvar namespace)
 
   if ! fetch_cluster_credentials; then
@@ -1148,9 +1148,17 @@ delete_agent_cr() {
       "kubeagents:minimal:${namespace}:${agent_name}" \
       "kubeagents:tokenreview:${namespace}:${agent_name}" \
       --ignore-not-found >/dev/null 2>&1 || true
-    kubectl --context "$CLUSTER_CONTEXT" delete pvc \
-      "data-${agent_name}-a2a-nats-0" -n "$namespace" \
-      --ignore-not-found >/dev/null 2>&1 || true
+    inst_label="${namespace}-${agent_name}"
+    if [ "${#inst_label}" -gt 63 ]; then
+      inst_label="${inst_label:0:63}"
+      while [[ "$inst_label" =~ [-_.]$ ]]; do
+        inst_label="${inst_label%?}"
+      done
+    fi
+    kubectl --context "$CLUSTER_CONTEXT" delete pvc -n "$namespace" \
+      -l "app.kubernetes.io/instance=${inst_label}" \
+      --field-selector "metadata.name=data-${agent_name}-a2a-nats-0" \
+      --ignore-not-found --wait=false >/dev/null 2>&1 || true
   done <<<"$names"
 }
 
