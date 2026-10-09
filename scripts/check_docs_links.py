@@ -273,7 +273,8 @@ SITE_CONVENTION_PAGES = frozenset({"404.md"})
 
 # Uniform families a reader reaches by browsing the directory and that no page
 # links member by member: the agents' runtime material (personas, SOPs, skills
-# and their references, the onboarding templates), the GitOps template's
+# and their references, the onboarding templates), the upstream skill copies
+# under third_party/google-skills/, the GitOps template's
 # per-directory documents, and the integrity sweep's report and adjudication
 # written beside each committed run record under a bench task's `evidence/`,
 # named file by file so a note of another kind there still owes a link. `*`
@@ -292,6 +293,9 @@ LINK_EXEMPT_FAMILY_GLOBS = (
     "bench/tasks/*/evidence/*/integrity-sweep-adjudication.md",
     "bench/tasks/*/evidence/*/integrity-sweep.md",
     "examples/gitops-repo/*/**",
+    # Byte-identical copies of google/skills that scripts/skill_overlay.py maintains beside the
+    # shipped skills above; a reader reaches the shipped skill, never the copy.
+    "third_party/google-skills/*/SKILL.md",
 )
 
 # What the family globs' wildcards compile to. A segment is what sits between

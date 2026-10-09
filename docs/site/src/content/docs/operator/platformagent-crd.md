@@ -526,7 +526,7 @@ leave the Platform Agent unable to do the work the flag exists to let it do.
   an already-onboarded install and promise a report nothing can deliver. The operator therefore
   leaves that plugin off the front door deliberately. Bring an install up with the flag off, let
   onboarding finish, then turn it on.
-- **A home channel set with `/sethome` stays on the profile it was set on.** The operator renders no
+- **A home channel set with `/sethome`, or by the first chat message, stays on the profile it was set on.** The operator renders no
   `home_channel` of its own, so on an install that did not populate the CR's Google Chat or Slack
   `homeChannel` the value lives only in the config file the gateway last wrote. Flipping the flag
   changes which file that is, and nothing carries it across. The Platform Agent's own `deliver: all`
