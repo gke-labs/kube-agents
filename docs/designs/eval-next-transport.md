@@ -374,7 +374,8 @@ it works on any transport that maps a result into the final message, which both 
 do, and its grade depends on that mapping: the fleet-audit cases get the URL from the delegated
 worker's card result, which the delegation wait folds into the final message. On this path it
 has the URL when the wait finds the cards in the session store; when it does not (a door that
-reports no `contextId`, or a store whose first read fails), it fails as a graded failure with no
+reports no `contextId`, or a store whose first read fails three times running), it fails as a
+graded failure with no
 issue URL in the report, not as an error.
 
 **The executor is the Hermes persona through the bridge sidecar (decided 2026-09-17).** The
@@ -600,13 +601,18 @@ conversation's A2A `contextId`, and under the bridge's `api` executor the turn r
 session `a2a-<contextId>` (`apiSessionID` in `a2a/hermes-bridge/api.go`). The case runner reads
 that session's `kanban_create` tool results from the platform agent's `state.db`, or, when the
 store kept none, the `kanban_notify_subs` rows addressed to the session, through the same
-`kubectl exec` the board read uses. It polls `kanban.db` until every card is terminal or the
-delegation timeout passes, then reads `tasks.result` and the newest `task_runs.summary` off the
-board. No status turn is sent, because none could carry a result back through the door. Each card
-reaches the settle step shaped as a `kanban_show` result, so the delivered card results are
-appended to the graded answer as today's wait appends them, `ledger_issue_contains` and
-`report_contains` see what the worker returned, and the worker logs are read by those ids for
-`worker_commands`. A door that reports no `contextId`, a session the store does not hold (the
+`kubectl exec` the board read uses. It caps the cards at the harness's one cap, pending first,
+and polls `kanban.db` for their statuses until every card is terminal or the delegation timeout
+passes; a card the board has no row for on three reads in a row is dropped from the wait with a
+line on the record's errors, and nothing is graded for it. Then it reads `tasks.result` and the
+newest `task_runs.summary` of the cards the board shows terminal. No status turn is sent, because
+none could carry a result back through the door. Only a terminal card reaches the settle step,
+shaped as a `kanban_show` result, so the delivered card results are appended to the graded answer
+as today's wait appends them, `ledger_issue_contains` and `report_contains` see what the worker
+returned, and the worker logs are read by those ids for `worker_commands`. A card still running at
+the ceiling delivers nothing: whatever text it carries (an earlier run's summary, a stashed
+result) is not its answer, so the repetition is recorded at the ceiling and the card is only
+archived and purged. A door that reports no `contextId`, a session the store does not hold (the
 `cli` executor), or a first read of the store that fails three times running, before any card is
 found, falls back to the status-turn wait. That wait takes its card ids from the trajectory, which
 holds none on this path, so it settles at once on the reply and sends no status turn; the last of
