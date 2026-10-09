@@ -5,19 +5,20 @@ Readiness Audit (`security-patch-orchestrator`).
 See docs/designs/fleet-audit-collector-manifest.md for the manifest this
 emits and governance/security_patch_orchestrator_sop.md for the checks.
 
-This stream's own collector, like `fleet_drift.py`: it reads only GKE
-control-plane and node-pool *metadata* through `gcloud container`, and needs
-no kubeconfig at all. Its collection is also flatter than any
-`kubectl`-based stream's: one
-`clusters list` call per project already returns every cluster's full
-resource, node pools included (the SOP's own §1, point 2), so eight of the
-ten checks below read data already in memory — the one per-pool
-`node-pools describe` the SOP's own §3 command lines show is never actually
-issued, because `clusters list` already carries every field those describes
-would return. Only the version-currency checks (`master-behind`,
+This stream's own collector, like `fleet_drift.py`. Ten of its eleven checks
+read only GKE control-plane and node-pool *metadata* through `gcloud
+container`, with no kubeconfig at all, and that collection is flatter than
+any `kubectl`-based stream's: one `clusters list` call per project already
+returns every cluster's full resource, node pools included (the SOP's own
+§1, point 2), so eight of those ten read data already in memory -- the one
+per-pool `node-pools describe` the SOP's own §3 command lines show is never
+actually issued, because `clusters list` already carries every field those
+describes would return. Only the version-currency checks (`master-behind`,
 `stale-image-type`) need a second call, `get-server-config`, and that one is
-cached per distinct `(project, location)` pair, not re-issued per cluster —
-the SOP's own §2 instruction.
+cached per distinct `(project, location)` pair, not re-issued per cluster --
+the SOP's own §2 instruction. The eleventh, `upgrade-blocked`, is the
+exception described below: it reads PodDisruptionBudgets through the
+fleet-upgrade-verification reporter, which fetches a kubeconfig per member.
 
 Two GCP surfaces, so two manifest failure shapes:
 
@@ -36,9 +37,24 @@ Two GCP surfaces, so two manifest failure shapes:
   claims more than the manifest backs.
 
 A check absent from `commands` is therefore always a gap. No GKE cluster
-shape rules any of the ten checks out -- Autopilot node pools carry every
-field the node-pool checks read -- so this collector never writes
-`checks_not_applicable`; see the comment above `collect_one_cluster`.
+shape rules any of the first ten checks out -- Autopilot node pools carry
+every field the node-pool checks read -- so for those this collector never
+writes `checks_not_applicable`; see the comment above `collect_one_cluster`.
+
+The eleventh, `upgrade-blocked`, is the one check here that reads workload
+state, and the one that is inapplicable by construction on most clusters: it
+asks how the upgrade a cluster needs would go, so a cluster with no
+`master-behind` or `pool-skew` candidate -- current, or mid-upgrade with the
+version checks suppressed -- has no upgrade to schedule and gets a
+`checks_not_applicable` entry saying which; so does a behind cluster on no
+release channel, whose reporter row has no target version to grade the
+upgrade against (the SOP's 3.11 lists both). For each cluster that does, the
+collector runs the fleet-upgrade-verification skill's reporter once, for that
+cluster alone, instead of once per
+project with `--readiness` -- the grade already exists there, with its
+PodDisruptionBudget and skew rules, and is not re-implemented here -- and
+joins its `members[]` rows to the behind clusters; see
+`collect_upgrade_blocked`.
 
 Discovery follows `fleet_drift.py`'s: every project the credential can list
 is in scope, a project whose Kubernetes Engine API is off reads as empty, and
@@ -55,6 +71,7 @@ import hashlib
 import json
 import re
 import shlex
+import os
 import subprocess
 import sys
 import time
@@ -164,6 +181,151 @@ VERSION_RE = re.compile(r"^(\d+)\.(\d+)\.(\d+)(?:-gke\.(\d+))?$")
 # cluster this audit has an opinion about: mid-flight or broken means its
 # version data is meaningless, and an alpha cluster cannot be upgraded and
 # expires on its own. The SOP leaves both out of either scope list.
+# 3.11 `upgrade-blocked`: the fleet-upgrade-verification reporter grades, per
+# member, how the upgrade it needs would go. It lives two
+# directories over, in that skill's `scripts/`; `Path(__file__).parents[2]`
+# is the `skills/` directory both are installed under, in the image and in
+# the repository alike.
+UPGRADE_BLOCKED_CHECK = "upgrade-blocked"
+READINESS_REPORTER = Path(__file__).resolve().parents[2] / "fleet-upgrade-verification" / "scripts" / "fleet_upgrade_report.py"
+# The spec the collector hands the reporter and expects back under the report's
+# `narrowed_to`: a report marked otherwise is not the one this invocation wrote.
+CLUSTER_SPEC_FORMAT = "{location}/{name}"
+REPORT_NARROWED_KEY = "narrowed_to"
+# A cluster is "behind" for 3.11 when 3.1 or 3.2 produced a candidate on it:
+# those are the two checks whose remedy is the upgrade this check asks about.
+# §3.3's spread finding attaches to the laggard after every project is in,
+# and names no upgrade of its own.
+MASTER_BEHIND_CHECK = "master-behind"
+BEHIND_CHECKS = (MASTER_BEHIND_CHECK, "pool-skew")
+# One reporter run per behind cluster (`--cluster`) reads that cluster's
+# objects with `kubectl`, which is why none is issued for a current one. The
+# whole collector runs inside one foreground terminal call whose ceiling is
+# 600 seconds (the SOP's §3 says to give it exactly that), after every
+# project's metadata reads, so the runs share a budget and each run's cap
+# has to leave room: a cluster whose run overruns it loses 3.11
+# (unevaluated, below) rather than the manifest.
+READINESS_TIMEOUT_S = 240
+# The reporter runs sit on `MAX_WORKERS` threads, so a per-run cap bounds one
+# project and not the sum: a fleet with more behind projects than workers
+# queues the rest behind the first eight. This is the budget for all of them
+# together, measured from the moment the fleet collection starts, and a
+# reporter that would start with less than the floor left is not started.
+READINESS_FLEET_BUDGET_S = 420
+READINESS_MIN_TIMEOUT_S = 30
+NOT_APPLICABLE_NO_TARGET_REASON = "no release channel, so the readiness grade has no target version to grade the upgrade against; the version finding stands on its own"
+UNEVALUATED_REPORTER_FAILED_FORMAT = "the readiness reporter failed (rc {rc}): {stderr}"
+UNEVALUATED_UNREADABLE_FORMAT = "the readiness reporter exited {rc} but left no readable report ({error}); its stderr: {stderr}"
+# The siblings' scratch root (audit_report.py, collect.py, report_status.py):
+# a fixed path rather than $HERMES_HOME, which a cron worker sets to its
+# profile directory and a chat session to /opt/data, so a path under it is
+# written in one place and looked for in another. Overridable for the suite.
+SCRATCH_DIR_ENV = "FLEET_AUDIT_SCRATCH_DIR"
+DEFAULT_SCRATCH_DIR = "/opt/data/scratch"
+# In scratch, beside the manifest the SOP redirects stdout into: one report per
+# behind cluster, named by project, location and name. A GKE name is unique per
+# location, not per project, so two behind twins named alike would otherwise
+# share a file, and the first's recorded command would point at a file holding
+# the second's row. The reporter keeps one record per target from its previous
+# run for rollout tracking; the audit's call gets a state directory of its own,
+# per project because projects are collected concurrently, so it neither reads
+# nor rewrites the skill's own history.
+READINESS_OUTPUT_FORMAT = "upgrade-readiness_{project}_{location}_{cluster}.json"
+READINESS_STATE_SUBDIR = "upgrade-readiness-state"
+READINESS_BLOCKED = "blocked"
+READINESS_READY = "ready"
+UNEVALUATED_REASON_FORMAT = "the readiness reporter could not grade this cluster ({why})"
+UNEVALUATED_NO_ROW = "no members[] row for it in the reporter's report"
+UNEVALUATED_SCRATCH_FORMAT = "the collector could not prepare its scratch directory {path} ({error})"
+UNEVALUATED_EMPTY_REPORT = "the readiness reporter's listing did not include this cluster (deleted or renamed since the collector listed it, or in a zone that did not answer)"
+UNEVALUATED_UNRECOGNISED_BLOCK = "graded blocked for a cause this check does not know"
+# The reporter exits 1 when the run had an error -- the cluster's objects it
+# could not read, a location whose server config it could not fetch -- and
+# still writes the member it did grade. The exit code says nothing about
+# whether the row is good; `read_error` and `status` on the row do.
+READINESS_EXIT_PARTIAL = 1
+NOT_BEHIND_REASON = "no master-behind or pool-skew candidate this run; there is no upgrade whose completion could be blocked"
+# A RECONCILING cluster (or one with a RECONCILING/PROVISIONING pool) has an
+# upgrade running now; §3 suppresses the version checks on it, so nothing is
+# due to be scheduled and the drain this check grades is already under way.
+NOT_APPLICABLE_IN_FLIGHT_REASON = "an upgrade is in flight (the cluster or a node pool is RECONCILING), so no further upgrade is due this run; whether the running one completes is the next run's to grade, when it has settled or is still in flight"
+UNEVALUATED_VERSION_NOT_JUDGED = "master-behind or pool-skew was not judged on this cluster this run (no baseline, or a version that did not parse), so whether an upgrade is due is unknown"
+UNEVALUATED_REPORT_ERROR_FORMAT = "the reporter could not read the cluster: {message}"
+UNEVALUATED_BUDGET_SPENT = "the collector's readiness budget ({budget}s across the fleet) was spent before this cluster's reporter run could start"
+UNEVALUATED_TIMED_OUT = "the readiness reporter ran past its budget ({seconds}s) for this cluster and was stopped"
+UNEVALUATED_REPORT_MALFORMED = "the readiness reporter's report was not in the shape this check reads ({error})"
+UNEVALUATED_REPORT_NOT_NARROWED_FORMAT = "the readiness reporter's report is not marked as narrowed to {spec} (narrowed_to: {found!r}), so its rows are not this cluster's to read"
+UNEVALUATED_STATUS_FORMAT = "status {status!r}{note}"
+UNEVALUATED_REPORT_MESSAGE_CHARS = 200
+# One tail per cause. A budget does not stop the upgrade: a surge upgrade
+# respects it for up to an hour per node and then evicts the workload anyway
+# (the upgrade-failure catalogue's entry 1), so this arm warns of a held
+# drain that ends in a forced eviction, never of an upgrade that does not
+# finish. A skew ceiling does stop it: GKE refuses the control-plane move
+# before any drain starts, so only that arm says "would not complete".
+UPGRADE_BLOCKED_IMPACT_PDB_FORMAT = (
+    "{cluster} is {lag} and its upgrade would be held, not stopped: {cause}, so GKE holds each node's drain for up to an hour and then evicts {workloads} anyway."
+)
+UPGRADE_BLOCKED_PDB_WORKLOADS_FALLBACK = "the workload"
+UPGRADE_BLOCKED_IMPACT_SKEW_FORMAT = (
+    "{cluster} is {lag} and its upgrade would not complete: {cause}, so GKE will not move the control plane until the pool moves."
+)
+# Both at once: the ceiling is the governing claim, since GKE refuses the move
+# before any drain starts, and the budget is what waits behind it, so the tail
+# says both in that order and never "held, not stopped".
+UPGRADE_BLOCKED_IMPACT_BOTH_FORMAT = (
+    "{cluster} is {lag} and its upgrade would not complete: {cause}, so GKE will not move the control plane until the pool moves, and once it has, holds each node's drain for up to an hour and then evicts {workloads} anyway."
+)
+UPGRADE_BLOCKED_PDB_CAUSE_FORMAT = "PodDisruptionBudget {pdb} ({field}, disruptionsAllowed {allowed}) refuses eviction of {workloads}"
+UPGRADE_BLOCKED_SKEW_CAUSE_FORMAT = "node pool(s) {pools} would exceed the version-skew ceiling against the target control plane"
+# Joins the clauses of one cause: every blocking budget, with the skew clause
+# before them when both block.
+CAUSE_SEPARATOR = "; "
+# The ledger clips `impact` at 1500 characters and the evidence excerpt at
+# 2000 (audit_report.py's MAX_TEXT_CHARS and MAX_EXCERPT_CHARS, applied in the
+# renderer and nowhere earlier), and the arm's tail -- the held drain and the
+# forced eviction, or the refused move -- is the last thing in the impact. So
+# both texts name a few budgets, pools and workloads and count the rest,
+# stepping down a ladder until they fit under caps set below the renderer's,
+# with a names-free form as the floor; every count points at the readiness
+# report the collector keeps, which lists every one.
+IMPACT_MAX_CHARS = 1400
+IMPACT_NAMED_LADDER = (3, 1)
+EXCERPT_MAX_CHARS = 1950
+EXCERPT_NAMED_LADDER = (None, 8, 5, 3, 1)
+EXCERPT_FORMAT = "readiness.status={status}: {cause}"
+CAUSE_MORE_FORMAT = "and {n} more"
+CAUSE_MORE_BUDGETS_FORMAT = "and {n} more drain-blocking PodDisruptionBudget(s); the readiness report at {path} lists every one"
+CAUSE_COUNTED_FORMAT = "{n} (listed in the readiness report at {path})"
+CAUSE_BUDGETS_COUNT_FORMAT = "{n} drain-blocking PodDisruptionBudget(s), listed in the readiness report at {path}, refuse eviction of {workloads}"
+CAUSE_WORKLOADS_COUNT_FORMAT = "{n} workload(s)"
+UPGRADE_BLOCKED_PDB_CLAUSE_WORKLOADS_FALLBACK = "its workload"
+# Behind clusters run least recently reported first, so a budget spent inside
+# a wide project lands on a different tail each week instead of the same
+# clusters every Monday; the stamps live beside the reporter's per-project
+# state, one file a project's runs own. Best effort: a file that cannot be
+# read or written costs the ordering, never the check.
+READINESS_LAST_RUN_FILE = "last-run.json"
+LAST_RUN_STAMP_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
+# The lag phrase comes from the cluster's own candidate (what put it in
+# `behind`), not from the reporter's row: the reporter's gap counts the
+# lowest component against its target and reads 0 for a patch lag.
+LAG_MINORS_FORMAT = "{n} minor(s) behind"
+LAG_UNSUPPORTED = "running a version no channel at its location offers"
+LAG_PATCH = "behind its channel default on the same minor"
+LAG_POOL_ONLY = "running a node pool behind its control plane"
+LAG_POOL_AHEAD = "running a node pool ahead of its control plane, so the control plane is what is due"
+# The no-channel spellings the reporter's `NO_CHANNEL_VALUES` and this
+# collector's `_release_channel` both read as no channel.
+NO_CHANNEL_SPELLINGS = (None, "", UNSPECIFIED_CHANNEL)
+LAG_POOL_MAJOR = "running a node pool on a different major version from its control plane"
+_POOL_AHEAD_MARK = "ahead of control plane"
+_POOL_MAJOR_MARK = "different major"
+LAG_MAJOR = "a major version behind its channel default"
+LAG_BEHIND = "behind"
+_MASTER_MINORS_RE = re.compile(r"\bis (a|\d+) minors? behind\b")
+_MASTER_MAJOR_MARK = "is a major behind"
+
 _UNAUDITABLE_STATUSES = {
     "PROVISIONING": "cluster status is PROVISIONING; version data is not yet meaningful",
     "STOPPING": "cluster status is STOPPING; the object is mid-delete",
@@ -185,13 +347,17 @@ SEVERITY = {
     "blocking-exclusion": MINOR,  # overridden to major per hit when it holds back a version finding
     "stale-image-type": MAJOR,
     "no-notifications": MINOR,
+    UPGRADE_BLOCKED_CHECK: CRITICAL,
 }
 
 # `master-behind`'s only severity whose impact is a different claim rather than a
 # stronger one: (a) says nothing patches this control plane, (b) and (c) say it is
 # behind while still being patched. `IMPACT` is per-check, so the branch that
 # earns this one carries it on the hit and `_emit` prefers it.
-ARM_SPECIFIC_IMPACT_CHECKS = {"master-behind"}
+# `upgrade-blocked`'s two arms make a different claim too: a budget holds
+# the node drain until GKE evicts the workload anyway, a skew ceiling has GKE
+# refuse the control-plane move.
+ARM_SPECIFIC_IMPACT_CHECKS = {"master-behind", UPGRADE_BLOCKED_CHECK}
 BEHIND_MASTER_IMPACT = "Control plane is behind its release channel's default {default} and carries whatever the intervening builds fixed until it moves; GKE is still patching it."
 UNSUPPORTED_MASTER_IMPACT = "Control plane runs a version no channel at this location offers; it is outside the supported window and receives no further patches."
 
@@ -206,6 +372,7 @@ IMPACT = {
     "blocking-exclusion": "A maintenance exclusion is currently suppressing upgrades on this cluster.",
     "stale-image-type": "This node pool's image type is no longer offered at this location and cannot take node-image patches.",
     "no-notifications": "This cluster publishes no GKE upgrade notifications; upgrade-available signals reach no one between audits.",
+    UPGRADE_BLOCKED_CHECK: "This cluster is behind, and the upgrade it needs would not go through cleanly: a drain-blocking budget holds each node's drain for up to an hour before GKE evicts the workload anyway, or a version-skew ceiling has GKE refuse the control-plane move.",
 }
 
 
@@ -407,6 +574,15 @@ def _upgrade_in_progress(cluster: dict) -> bool:
     """§3's universal suppression gate, cluster half: a `RECONCILING` cluster
     is mid-upgrade and its version drift is the upgrade, not a finding."""
     return (cluster.get("status") or "") == STATUS_RECONCILING
+
+
+def _any_upgrade_in_flight(cluster: dict) -> bool:
+    """An upgrade running now: the cluster `RECONCILING` (which suppresses the
+    version checks) or a node pool `RECONCILING` (a pool-level upgrade the
+    cluster status does not always show). A `PROVISIONING` pool is being
+    created, not upgraded, and does not count."""
+    pools = cluster.get("nodePools") or []
+    return _upgrade_in_progress(cluster) or any((p.get("status") or "") == STATUS_RECONCILING for p in pools if isinstance(p, dict))
 
 
 def _still_offered(baseline: dict, version: str, channel: str) -> bool:
@@ -856,8 +1032,11 @@ def collect_one_cluster(cluster: dict, baseline: dict | None, *, now: datetime) 
     `stale-image-type` over a version or image type that does not parse, and
     `blocking-exclusion` over a freeze it could not grade -- and a coverage gap
     the SOP tells the agent to name in `limitations`, not a gate failure. No cluster shape
-    rules any of the ten out -- the comment above explains why Autopilot does
-    not -- so the collector never writes `checks_not_applicable`."""
+    rules any of these ten out -- the comment above explains why Autopilot does
+    not -- so none of them is ever written to `checks_not_applicable`; only
+    3.11 is (`collect_upgrade_blocked`), in the two cases the SOP's 3.11 lists
+    (a cluster the version checks judged current; a behind cluster on no
+    release channel), and it is the one check written to `checks_unevaluated`."""
     slugs = ["no-channel", "no-autoupgrade", "no-autorepair", "no-maintenance-window", "blocking-exclusion", "no-notifications"]
     candidates = []
     # `pool-skew` compares every pool against the control plane, so a master
@@ -998,6 +1177,7 @@ def attach_fleet_spread(entries: list[dict]) -> None:
             target.setdefault("candidates", []).append(_emit("fleet-spread", hit))
     for entry in entries:
         entry.pop("_bare_name", None)
+        entry.pop("_in_flight", None)
         entry.pop("_master_version", None)
         entry.pop("_status", None)
 
@@ -1054,7 +1234,482 @@ def attach_incumbent_topic(entries: list[dict]) -> None:
             )
 
 
+def _scratch_dir() -> str:
+    return os.environ.get(SCRATCH_DIR_ENV) or DEFAULT_SCRATCH_DIR
+
+
+def _is_behind(entry: dict) -> bool:
+    return any(c.get("check") in BEHIND_CHECKS for c in entry.get("candidates") or [])
+
+
+def _version_checks_judged(entry: dict) -> bool:
+    """Whether the two checks that decide "behind" (`BEHIND_CHECKS`) both ran
+    on the entry: the one definition of "judged" that every 3.11 disposition
+    declaring the check inapplicable gates on, so a clean `master-behind`
+    beside a pool nobody could read, or a clean `pool-skew` beside an
+    unfetched baseline, never reads as a judgement about the cluster."""
+    ran = {c.get("check") for c in entry.get("commands") or []}
+    return all(check in ran for check in BEHIND_CHECKS)
+
+
+def _pdb_name(budget: dict) -> str:
+    return str(budget.get("pdb") or f"{budget.get('namespace', '')}/{budget.get('name', '')}")
+
+
+def _workload_name(workload: object) -> str:
+    """`Kind/name` from the reporter's workload record, which is a dict with
+    `kind`, `namespace` and `name`; the namespace is already on the budget."""
+    if isinstance(workload, dict):
+        return f"{workload.get('kind', '')}/{workload.get('name', '')}".strip("/")
+    return str(workload)
+
+
+class Cause(NamedTuple):
+    """Why a member is blocked, in the parts the excerpt and the impact are
+    built from: the arm's impact format, the pools past the ceiling (empty
+    when skew does not block or does not apply), the blocking budgets in name
+    order (empty when none apply) and every covered workload once, in that
+    order."""
+
+    impact_format: str
+    pools: list[str]
+    budgets: list[dict]
+    evicted: list[str]
+
+
+def _readiness_cause(readiness: dict, *, budget_applies: bool = True, skew_applies: bool = True) -> Cause | None:
+    """Why the reporter graded a member blocked, in the forms 3.11 flags; None
+    for a block that rests on a maintenance exclusion alone, which is 3.8's
+    subject and neither a held drain nor a refused move, and None when nothing
+    that can block the upgrade due is on the row. A skew ceiling outranks a
+    budget: GKE refuses the control-plane move before any drain starts, so a
+    row carrying both is a refused upgrade, not a held one, and its cause
+    names the ceiling first and every budget after it. The caller says which
+    causes can block the upgrade that is due: a control-plane move drains no
+    node, so a budget cannot hold it (`budget_applies=False`); a pool moving
+    toward its control plane is what closes a skew, so the ceiling does not
+    refuse it (`skew_applies=False`)."""
+    pdbs = [p for p in (readiness.get("pdbs") or {}).get("blocking") or [] if isinstance(p, dict)] if budget_applies else []
+    pools = [str(p) for p in ((readiness.get("skew") or {}).get("blocking") or [])] if skew_applies else []
+    if not pdbs and not pools:
+        return None
+    # Every blocking budget, in name order: the reporter lists them in the
+    # API's order, and a cause that named only the first would make which
+    # budget the ledger shows depend on how the others sort.
+    ordered = sorted(pdbs, key=_pdb_name)
+    evicted = list(dict.fromkeys(_workload_name(w) for p in ordered for w in p.get("workloads") or []))
+    if ordered and pools:
+        impact_format = UPGRADE_BLOCKED_IMPACT_BOTH_FORMAT
+    elif ordered:
+        impact_format = UPGRADE_BLOCKED_IMPACT_PDB_FORMAT
+    else:
+        impact_format = UPGRADE_BLOCKED_IMPACT_SKEW_FORMAT
+    return Cause(impact_format, pools, ordered, evicted)
+
+
+def _named(items: list[str], cap: int | None) -> str:
+    """`items` joined, naming the first `cap` and counting the rest; None names all."""
+    if cap is None or len(items) <= cap:
+        return ", ".join(items)
+    return ", ".join([*items[:cap], CAUSE_MORE_FORMAT.format(n=len(items) - cap)])
+
+
+def _budget_clause(budget: dict, named: int | None) -> str:
+    workloads = [_workload_name(w) for w in budget.get("workloads") or []]
+    return UPGRADE_BLOCKED_PDB_CAUSE_FORMAT.format(
+        pdb=_pdb_name(budget),
+        field=budget.get("field") or "",
+        allowed=budget.get("disruptions_allowed"),
+        workloads=_named(workloads, named) or UPGRADE_BLOCKED_PDB_CLAUSE_WORKLOADS_FALLBACK,
+    )
+
+
+def _cause_text(cause: Cause, named: int | None, path: str) -> str:
+    """The cause clause: the ceiling first when it blocks, then the budgets.
+    `named` caps the pools, budgets and per-budget workloads it names and
+    counts the rest, pointing at the readiness report at `path`; None names
+    all."""
+    parts = []
+    if cause.pools:
+        parts.append(UPGRADE_BLOCKED_SKEW_CAUSE_FORMAT.format(pools=_named(cause.pools, named)))
+    parts.extend(_budget_clause(b, named) for b in cause.budgets[:named])
+    if named is not None and len(cause.budgets) > named:
+        parts.append(CAUSE_MORE_BUDGETS_FORMAT.format(n=len(cause.budgets) - named, path=path))
+    return CAUSE_SEPARATOR.join(parts)
+
+
+def _workloads_text(cause: Cause, named: int | None) -> str:
+    """What the forced eviction removes, for the tail; `named` as above."""
+    return _named(cause.evicted, named) if cause.evicted else UPGRADE_BLOCKED_PDB_WORKLOADS_FALLBACK
+
+
+def _counted_workloads(cause: Cause) -> str:
+    return CAUSE_WORKLOADS_COUNT_FORMAT.format(n=len(cause.evicted)) if cause.evicted else UPGRADE_BLOCKED_PDB_WORKLOADS_FALLBACK
+
+
+def _counted_cause_text(cause: Cause, path: str) -> str:
+    """The cause with counts in place of names: the floor no clip can reach,
+    since nothing in it grows with the fleet."""
+    parts = []
+    if cause.pools:
+        parts.append(UPGRADE_BLOCKED_SKEW_CAUSE_FORMAT.format(pools=CAUSE_COUNTED_FORMAT.format(n=len(cause.pools), path=path)))
+    if cause.budgets:
+        parts.append(CAUSE_BUDGETS_COUNT_FORMAT.format(n=len(cause.budgets), path=path, workloads=_counted_workloads(cause)))
+    return CAUSE_SEPARATOR.join(parts)
+
+
+def _bounded_impact(cause: Cause, cluster: str, lag: str, path: str) -> str:
+    """The arm's sentence, kept under the ledger's clip: names down the
+    ladder, then counts alone, so the tail always renders."""
+    for named in IMPACT_NAMED_LADDER:
+        text = cause.impact_format.format(cluster=cluster, lag=lag, cause=_cause_text(cause, named, path), workloads=_workloads_text(cause, named))
+        if len(text) <= IMPACT_MAX_CHARS:
+            return text
+    return cause.impact_format.format(cluster=cluster, lag=lag, cause=_counted_cause_text(cause, path), workloads=_counted_workloads(cause))
+
+
+def _bounded_excerpt(cause: Cause, path: str) -> str:
+    """The candidate's evidence, kept under the ledger's evidence clip: every
+    name when they fit, else the first eight, five, three or one and a count,
+    then counts alone; what it does not name, the report at `path` does."""
+    for named in EXCERPT_NAMED_LADDER:
+        text = EXCERPT_FORMAT.format(status=READINESS_BLOCKED, cause=_cause_text(cause, named, path))
+        if len(text) <= EXCERPT_MAX_CHARS:
+            return text
+    return EXCERPT_FORMAT.format(status=READINESS_BLOCKED, cause=_counted_cause_text(cause, path))
+
+
+def _applicable_causes(lag: str) -> tuple[bool, bool]:
+    """`(budget_applies, skew_applies)`: which causes can block the upgrade a
+    cluster with this lag is due. A pool ahead of its control plane: the
+    control plane's move is due, which evicts no pod, so a budget cannot
+    hold it and a skew ceiling can. A pool behind a current control plane:
+    the pool's move is due, which a budget can hold and the ceiling does
+    not refuse (it is what closes the skew, and 3.2 already carries the
+    pool). A behind control plane: both apply."""
+    return lag != LAG_POOL_AHEAD, lag not in (LAG_POOL_ONLY, LAG_POOL_MAJOR)
+
+
+def _lag_phrase(entry: dict) -> str:
+    """What the cluster's own version candidates say it is behind by."""
+    master = next((c for c in entry.get("candidates") or [] if c.get("check") == MASTER_BEHIND_CHECK), None)
+    if master is not None:
+        excerpt = str(master.get("excerpt") or "")
+        if "offered by no channel" in excerpt:
+            return LAG_UNSUPPORTED
+        if _MASTER_MAJOR_MARK in excerpt:
+            return LAG_MAJOR
+        found = _MASTER_MINORS_RE.search(excerpt)
+        if found:
+            return LAG_MINORS_FORMAT.format(n=1 if found.group(1) == "a" else int(found.group(1)))
+        if "same minor" in excerpt:
+            return LAG_PATCH
+        return LAG_BEHIND
+    pools = [str(c.get("excerpt") or "") for c in entry.get("candidates") or [] if c.get("check") == "pool-skew"]
+    if pools:
+        if any(_POOL_MAJOR_MARK in p for p in pools):
+            return LAG_POOL_MAJOR
+        if all(_POOL_AHEAD_MARK in p for p in pools):
+            return LAG_POOL_AHEAD
+        return LAG_POOL_ONLY
+    return LAG_BEHIND
+
+
+def _upgrade_blocked_hit(entry: dict, member: dict, report_path: str) -> dict | None:
+    readiness = member.get("readiness") or {}
+    if readiness.get("status") != READINESS_BLOCKED:
+        return None
+    lag = _lag_phrase(entry)
+    budget_applies, skew_applies = _applicable_causes(lag)
+    cause = _readiness_cause(readiness, budget_applies=budget_applies, skew_applies=skew_applies)
+    if cause is None:
+        return None
+    return {
+        "object": f"Cluster/{entry['_bare_name']}",
+        # Both texts are bounded under the ledger's clips; what they count
+        # rather than name, the readiness report at `report_path` lists.
+        "excerpt": _bounded_excerpt(cause, report_path),
+        "severity": CRITICAL,
+        "impact": _bounded_impact(cause, entry["_bare_name"], lag, report_path),
+    }
+
+
+def _read_last_run(state_dir: str, project: str) -> dict[str, str]:
+    """When each of the project's clusters last had a reporter run started for
+    it, by `<location>/<name>`; empty when there is no file or it cannot be read."""
+    path = os.path.join(state_dir, READINESS_LAST_RUN_FILE)
+    try:
+        with open(path, encoding="utf-8") as handle:
+            data = json.load(handle)
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError) as exc:
+        log(f"{project}: cannot read {path} ({exc}); running the behind clusters in listing order")
+        return {}
+    return {str(k): str(v) for k, v in data.items()} if isinstance(data, dict) else {}
+
+
+def _write_last_run(state_dir: str, project: str, stamps: dict[str, str]) -> None:
+    path = os.path.join(state_dir, READINESS_LAST_RUN_FILE)
+    try:
+        os.makedirs(state_dir, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(stamps, handle, indent=2, sort_keys=True)
+    except OSError as exc:
+        log(f"{project}: cannot write {path} ({exc}); next week's order will not know this run")
+
+
+def collect_upgrade_blocked(project: str, entries: list[dict], *, run: RunFn, deadline: float | None = None) -> None:
+    """§3.11 over one project's collected entries, in place.
+
+    Run by `collect_fleet` as the second phase, after every project's ten
+    metadata checks are in, so a reporter never holds a worker those reads
+    wait for. A cluster that `master-behind` and `pool-skew` both judged and
+    neither flagged gets the check as `checks_not_applicable`: current, with no upgrade whose
+    completion could be blocked, or mid-upgrade (`RECONCILING`), with nothing
+    further due and the running one the next run's to grade; either reason is
+    the same answer until the cluster changes, which is what the field is
+    for. The reporter then runs once per behind cluster (`--cluster
+    <location>/<name>`), and that cluster is joined to its `members[]` row.
+    A row graded `blocked` by a budget or by skew is a candidate; a row graded
+    `blocked` by an exclusion alone, or `ready`, is a check that ran and found
+    nothing. A row graded `unknown` on a cluster with no release channel and
+    so no target version is the second `checks_not_applicable` route: the
+    same answer every week, with the reason. Any other `unknown` row, a row
+    the reporter did not produce, a reporter that wrote no report, or a
+    `blocked` whose cause this join does not know, goes into the entry's
+    `checks_unevaluated`: the slug stays out of `commands`, and `finish`
+    requires a `limitations` line for it.
+    """
+    collected = [e for e in entries if e.get("outcome") == OUTCOME_COLLECTED]
+    behind = [e for e in collected if _is_behind(e)]
+    for entry in collected:
+        if entry in behind:
+            continue
+        # "Not applicable" is a judgement about the cluster, so it needs the
+        # version checks to have judged it: a cluster whose baseline could not
+        # be fetched or whose version did not parse has no candidate because
+        # nobody looked, and that is a gap, not a current cluster. "Judged"
+        # takes the same two checks that decide "behind" (`BEHIND_CHECKS`): a
+        # clean `pool-skew` beside an unfetched baseline says nothing about the
+        # control plane, and a clean `master-behind` beside a pool nobody could
+        # read says nothing about the pool.
+        if _version_checks_judged(entry):
+            # A cluster mid-upgrade has no candidate because §3 suppresses
+            # them, not because it is current: say which.
+            reason = NOT_APPLICABLE_IN_FLIGHT_REASON if entry.get("_in_flight") else NOT_BEHIND_REASON
+            entry["checks_not_applicable"] = [{"check": UPGRADE_BLOCKED_CHECK, "reason": reason}]
+        else:
+            _unevaluated(entry, UNEVALUATED_VERSION_NOT_JUDGED)
+    if not behind:
+        return
+    scratch = _scratch_dir()
+    state_dir = os.path.join(scratch, READINESS_STATE_SUBDIR, project)
+    try:
+        os.makedirs(scratch, exist_ok=True)
+    except OSError as exc:
+        # No scratch directory, no report to read back: the slug stays out of
+        # `commands` on every behind cluster, which the SOP has the agent name
+        # in `limitations`. A crash here would instead take the project's
+        # other ten checks down with it (`crashed_entries`).
+        log(f"{project}: cannot prepare {scratch} ({exc}); upgrade-blocked unavailable there")
+        for entry in behind:
+            _unevaluated(entry, UNEVALUATED_SCRATCH_FORMAT.format(path=scratch, error=str(exc)[:UNEVALUATED_REPORT_MESSAGE_CHARS]))
+        return
+    # One reporter run per behind cluster, with `--cluster` naming it: the
+    # reporter reads nothing else in the project, and the recorded command on
+    # the entry is the invocation that graded it (and stays short however many
+    # clusters are behind). Within a project the runs spend the fleet budget
+    # one after another, so a slow read costs the clusters after it time,
+    # never a row of their own; they go least recently reported first (a
+    # cluster never reported before all of them, the listing order breaking
+    # ties), so a spent budget lands on a different tail each week.
+    last_run = _read_last_run(state_dir, project)
+    behind.sort(key=lambda e: last_run.get(CLUSTER_SPEC_FORMAT.format(location=e["location"], name=e["_bare_name"]), ""))
+    stamped = False
+    for entry in behind:
+        spec = CLUSTER_SPEC_FORMAT.format(location=entry["location"], name=entry["_bare_name"])
+        output = os.path.join(scratch, READINESS_OUTPUT_FORMAT.format(project=project, location=entry["location"], cluster=entry["_bare_name"]))
+        try:
+            # The path is the same every week, so a reporter that dies before
+            # writing -- a traceback, a failed `--output` write, both exit 1
+            # -- would otherwise be read back as last week's report, and last
+            # week's budget republished (or this week's hidden). No file is a
+            # gap; a stale file is a wrong answer.
+            if os.path.exists(output):
+                os.unlink(output)
+        except OSError as exc:
+            log(f"{project}/{entry['_bare_name']}: cannot clear {output} ({exc}); upgrade-blocked unavailable there")
+            _unevaluated(entry, UNEVALUATED_SCRATCH_FORMAT.format(path=output, error=str(exc)[:UNEVALUATED_REPORT_MESSAGE_CHARS]))
+            continue
+        timeout = READINESS_TIMEOUT_S
+        if deadline is not None:
+            timeout = min(READINESS_TIMEOUT_S, int(deadline - time.monotonic()))
+            if timeout < READINESS_MIN_TIMEOUT_S:
+                log(f"{project}/{entry['_bare_name']}: readiness budget spent before the reporter could run; upgrade-blocked unevaluated there")
+                _unevaluated(entry, UNEVALUATED_BUDGET_SPENT.format(budget=READINESS_FLEET_BUDGET_S))
+                continue
+        argv = [
+            sys.executable, str(READINESS_REPORTER), "--project", project, "--cluster", spec,
+            "--readiness", "--output", output, "--state-dir", state_dir,
+        ]
+        result = run(argv, timeout=timeout)
+        # Stamped when the reporter was started, graded or not: a run that
+        # fails every week still yields its turn. A cluster the budget skipped
+        # keeps its stamp and leads next week.
+        last_run[spec] = datetime.now(timezone.utc).strftime(LAST_RUN_STAMP_FORMAT)
+        stamped = True
+        try:
+            _join_readiness(project, [entry], argv, result, output, timeout)
+        except Exception as exc:  # noqa: BLE001 -- a malformed report must not cost the project its other ten checks
+            log(f"{project}/{entry['_bare_name']}: the readiness report could not be joined ({exc!r}); upgrade-blocked unevaluated there")
+            # Whatever the join managed before it raised is withdrawn: the
+            # check is unevaluated on this cluster, once.
+            entry["candidates"] = [c for c in entry.get("candidates") or [] if c.get("check") != UPGRADE_BLOCKED_CHECK]
+            entry["commands"] = [c for c in entry.get("commands") or [] if c.get("check") != UPGRADE_BLOCKED_CHECK]
+            entry["checks_unevaluated"] = [u for u in entry.get("checks_unevaluated") or [] if u.get("check") != UPGRADE_BLOCKED_CHECK]
+            declared = [d for d in entry.get("checks_not_applicable") or [] if d.get("check") != UPGRADE_BLOCKED_CHECK]
+            if declared:
+                entry["checks_not_applicable"] = declared
+            else:
+                entry.pop("checks_not_applicable", None)
+            _unevaluated(entry, UNEVALUATED_REPORT_MALFORMED.format(error=type(exc).__name__))
+    if stamped:
+        _write_last_run(state_dir, project, last_run)
+
+
+def _join_readiness(project: str, behind: list[dict], argv: list[str], result: Run, output: str, timeout: int) -> None:
+    """Join the reporter's rows to the behind clusters. Anything unexpected in
+    the report's shape raises out to the caller, which marks the clusters
+    unevaluated; the project's other checks are not this function's to lose."""
+    members: dict[tuple[str, str], dict] = {}
+    # Every branch below names what it found; `no_report` is the reason the
+    # behind clusters carry when the report has no row for them.
+    no_report = UNEVALUATED_EMPTY_REPORT
+    if result.rc == TIMEOUT_RC:
+        no_report = UNEVALUATED_TIMED_OUT.format(seconds=timeout)
+        log(f"{project}: readiness reporter ran past {timeout}s and was stopped; upgrade-blocked unevaluated there")
+    elif result.rc in (0, READINESS_EXIT_PARTIAL):
+        try:
+            with open(output, encoding="utf-8") as handle:
+                report = json.load(handle)
+            if not isinstance(report, dict):
+                raise TypeError(f"report is {type(report).__name__}, not an object")
+            # The reporter marks a `--cluster` run with the specs it was
+            # narrowed to. A report without the mark, or marked for another
+            # cluster, is not the one this invocation wrote (a full run's
+            # file, or a reporter that ignored the flag), and its rows are
+            # not this cluster's to read.
+            expected = [CLUSTER_SPEC_FORMAT.format(location=e["location"], name=e["_bare_name"]) for e in behind]
+            if report.get(REPORT_NARROWED_KEY) != expected:
+                no_report = UNEVALUATED_REPORT_NOT_NARROWED_FORMAT.format(spec=", ".join(expected), found=report.get(REPORT_NARROWED_KEY))
+                log(f"{project}: the readiness report at {output} is not marked as narrowed to {', '.join(expected)}; upgrade-blocked unevaluated there")
+            else:
+                for member in report.get("members") or []:
+                    if isinstance(member, dict):
+                        members[(str(member.get("cluster", "")), str(member.get("location", "")))] = member
+                # A report with no rows and an errors[] entry is the reporter
+                # saying why (its own `clusters list` failed, say); that reason
+                # is what the limitation should carry. No rows and no error is
+                # the reporter's listing coming back empty where the collector's
+                # did not, which `UNEVALUATED_EMPTY_REPORT` already says.
+                errors = [e for e in report.get("errors") or [] if isinstance(e, dict) and e.get("message")]
+                if not members and errors:
+                    no_report = UNEVALUATED_REPORT_ERROR_FORMAT.format(message=str(errors[0]["message"])[:UNEVALUATED_REPORT_MESSAGE_CHARS])
+        except (OSError, ValueError) as exc:
+            no_report = UNEVALUATED_UNREADABLE_FORMAT.format(
+                rc=result.rc, error=str(exc)[:UNEVALUATED_REPORT_MESSAGE_CHARS], stderr=_stderr_excerpt(result)[:UNEVALUATED_REPORT_MESSAGE_CHARS] or "(empty)"
+            )
+            log(f"{project}: the readiness reporter exited {result.rc} but left no readable report at {output} ({exc}); upgrade-blocked unavailable there")
+    else:
+        no_report = UNEVALUATED_REPORTER_FAILED_FORMAT.format(rc=result.rc, stderr=_stderr_excerpt(result)[:UNEVALUATED_REPORT_MESSAGE_CHARS])
+        log(f"{project}: readiness reporter failed (rc={result.rc}): {_stderr_excerpt(result)}; upgrade-blocked unavailable there")
+    for entry in behind:
+        member = members.get((entry["_bare_name"], entry["location"]))
+        readiness = (member or {}).get("readiness") or {}
+        # A skew block is definite whatever the PDB read did, when the ceiling
+        # can block the upgrade due: the reporter grades `blocked` on skew
+        # with `read_error` set beside it, and a blocker it positively
+        # identified is a finding, not a gap. On a pool-only lag the ceiling
+        # blocks nothing that is due, so the one cause that could (a budget
+        # on the pool drain) was never read, and the row is the gap it would
+        # be without the skew. Decided here, before the shortcut, from the
+        # same lag `_upgrade_blocked_hit` reads.
+        _, skew_applies = _applicable_causes(_lag_phrase(entry))
+        skew_blocked = skew_applies and readiness.get("status") == READINESS_BLOCKED and bool((readiness.get("skew") or {}).get("blocking"))
+        why = None
+        if not members:
+            why = no_report
+        elif member is None:
+            why = UNEVALUATED_NO_ROW
+        elif (
+            not skew_blocked
+            and not readiness.get("read_error")
+            and readiness.get("status") not in (READINESS_BLOCKED, READINESS_READY)
+            and not member.get("target_version")
+            and member.get("channel") in NO_CHANNEL_SPELLINGS
+            and _version_checks_judged(entry)
+        ):
+            # No release channel, no target: the reporter has nothing to grade
+            # the upgrade against (it graded a budget or an in-effect
+            # NO_UPGRADES exclusion if one blocked, and did not), and that is
+            # true of this cluster every week. It is not applicable here,
+            # with the reason, rather than a limitation that holds the stream
+            # partial for good; the version finding itself stands. The
+            # channel test (both spellings GKE uses for a static cluster) is
+            # what makes it a fact about the cluster: the reporter also
+            # resolves no target when its own
+            # `get-server-config` failed or omitted the channel, and that row
+            # is on a channel with a target nobody fetched this run, which
+            # the branch below records as unevaluated with the reporter's
+            # note saying so.
+            entry.setdefault("checks_not_applicable", []).append({"check": UPGRADE_BLOCKED_CHECK, "reason": NOT_APPLICABLE_NO_TARGET_REASON})
+            continue
+        elif not skew_blocked and (readiness.get("read_error") or readiness.get("status") not in (READINESS_BLOCKED, READINESS_READY)):
+            # The reporter's own notes say why a row is `unknown`: the grade's
+            # note (no target, so skew and exclusion scope ungraded) and the
+            # row's (why there is no target: no channel, or a get-server-config
+            # that failed this run). Carry both; the second is what tells a
+            # transient read failure from a standing shape.
+            notes = [str(n) for n in (readiness.get("note"), member.get("note")) if n]
+            note = "; ".join(dict.fromkeys(notes))
+            why = str(readiness.get("read_error") or UNEVALUATED_STATUS_FORMAT.format(status=readiness.get("status"), note=f": {note}" if note else ""))[:UNEVALUATED_REPORT_MESSAGE_CHARS]
+        elif readiness.get("status") == READINESS_BLOCKED and _readiness_cause(readiness) is None and not (readiness.get("maintenance") or {}).get("blocking_exclusions"):
+            # `blocked` for something that is neither a budget, skew, nor an
+            # exclusion: a cause the reporter learned after this join was
+            # written. Recording it as run-and-clean would publish an
+            # all-clear over an upgrade the reporter says is blocked;
+            # it is ungraded until this check knows the cause.
+            why = UNEVALUATED_UNRECOGNISED_BLOCK
+        if why is not None:
+            log(f"{project}/{entry['_bare_name']}: readiness not graded ({why}); upgrade-blocked unevaluated there")
+            _unevaluated(entry, why)
+            continue
+        # The row is graded, so the command succeeded for this cluster
+        # whatever another member did to the process exit code.
+        record = _record(shlex.join(argv), result._replace(rc=0))
+        entry["commands"].append({"check": UPGRADE_BLOCKED_CHECK, **record})
+        hit = _upgrade_blocked_hit(entry, member, output)
+        if hit is not None:
+            entry["candidates"].append(_emit(UPGRADE_BLOCKED_CHECK, hit))
+
+
+def _unevaluated(entry: dict, why: str) -> None:
+    """The manifest's own field for a check whose read failed: `finish` then
+    requires a `limitations` line on the cluster and refuses the slug in
+    `checks_run` or `checks_not_applicable`, which is what the SOP's prose
+    asks for and nothing else enforces."""
+    entry.setdefault("checks_unevaluated", []).append(
+        {"check": UPGRADE_BLOCKED_CHECK, "reason": UNEVALUATED_REASON_FORMAT.format(why=why)}
+    )
+
+
 def collect_project(project: str, *, run: RunFn, now: datetime) -> list[dict]:
+    """The ten metadata checks over one project: `clusters list`, one
+    `get-server-config` per location, and the per-cluster reads. 3.11 is not
+    here; `collect_fleet` runs it as a second phase once every project's
+    metadata is in, so a reporter can never hold a worker a project is
+    waiting for."""
     argv = ["gcloud", "container", "clusters", "list", "--project", project, "--format", "json"]
     parsed, result = run_and_gate(argv, run=run)
     if parsed is None:
@@ -1158,6 +1813,9 @@ def collect_project(project: str, *, run: RunFn, now: datetime) -> list[dict]:
             "_bare_name": c["name"],
             "_master_version": c.get("currentMasterVersion") or "",
             "_status": c.get("status") or "",
+            # Consumed by `collect_upgrade_blocked`: a cluster mid-upgrade is
+            # declared with the in-flight reason, not the not-behind one.
+            "_in_flight": _any_upgrade_in_flight(c),
             # Consumed and removed by `attach_incumbent_topic`, for the same
             # reason `_master_version` is: the fact is fleet-wide and this
             # worker only ever sees one project.
@@ -1170,9 +1828,19 @@ def collect_project(project: str, *, run: RunFn, now: datetime) -> list[dict]:
 def collect_fleet(project: str | None = None, *, run: RunFn = default_run, max_workers: int = MAX_WORKERS, now: datetime | None = None) -> dict:
     now = now or datetime.now(timezone.utc)
     started_at = time.strftime(TIMESTAMP_FORMAT, time.gmtime())
+    # The clock for 3.11's budget starts here, before discovery: what the
+    # reporters may spend is what is left of the terminal call once the
+    # reads the manifest cannot do without have had their turn.
+    deadline = time.monotonic() + READINESS_FLEET_BUDGET_S
     discovery = discover_fleet(project, run=run)
     projects = discovery.projects
 
+    # Two phases, not one per project. The ten metadata checks run for every
+    # project first, under no budget, as they did before 3.11 existed; then
+    # 3.11 runs over the projects that have a behind cluster, sharing one
+    # budget. Interleaving them put a reporter (up to four minutes) on a
+    # worker a later project was queued behind, so on a wide fleet the
+    # budget's cost landed on that project's ten checks rather than on 3.11.
     results: list[list[dict]] = [[] for _ in projects]
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
         futures = {pool.submit(collect_project, p, run=run, now=now): i for i, p in enumerate(projects)}
@@ -1182,6 +1850,16 @@ def collect_fleet(project: str | None = None, *, run: RunFn = default_run, max_w
                 results[index] = future.result()
             except Exception as exc:  # noqa: BLE001 — see crashed_entries
                 results[index] = crashed_entries(projects[index], exc)
+        readiness = {pool.submit(collect_upgrade_blocked, p, results[i], run=run, deadline=deadline): i for i, p in enumerate(projects)}
+        for future in as_completed(readiness):
+            index = readiness[future]
+            try:
+                future.result()
+            except Exception as exc:  # noqa: BLE001 -- 3.11 must not cost a project its other ten checks
+                log(f"{projects[index]}: upgrade-blocked crashed ({exc!r}); unevaluated on its behind clusters")
+                for entry in results[index]:
+                    if entry.get("outcome") == OUTCOME_COLLECTED and _is_behind(entry):
+                        _unevaluated(entry, UNEVALUATED_REPORT_MALFORMED.format(error=type(exc).__name__))
 
     entries = [entry for group in results for entry in group]
     attach_fleet_spread(entries)

@@ -245,7 +245,33 @@ READINESS_NO_OPENING_CELL = f"none within {readiness.DAYS_PER_WEEK} days"
 # not abort the run; the exit code only says whether every requested read succeeded.
 EXIT_OK = 0
 EXIT_PARTIAL = 1
+NARROWED_RUN_NOTE = "Narrowed by --cluster: the rollout record was neither read nor written."
+# A `--cluster` spec that matched nothing is an error with exit 1, like a project that
+# could not be listed: an empty table with exit 0 would read as "nothing to grade".
+UNMATCHED_CLUSTER_SPEC = "no cluster matched --cluster {spec!r} in {projects}"
+# When a project's listing failed, the run cannot say the spec matched nothing
+# there: the line names the projects it did list and the ones it could not,
+# rather than sending the operator after a typo or a deleted cluster.
+UNMATCHED_CLUSTER_SPEC_PARTIAL = "no cluster matched --cluster {spec!r} in {listed}; {unlisted} could not be listed, so whether it is there is unknown"
+UNMATCHED_CLUSTER_SPEC_UNLISTED = "--cluster {spec!r} could not be matched: {unlisted} could not be listed"
 EXIT_USAGE = 2
+# `--rollout-in-progress` speaks to the rollout record, which a `--cluster` run neither
+# reads nor writes: the pair is refused, as `--at` without `--readiness` is, rather than
+# accepted and ignored.
+ROLLOUT_FLAG_NEEDS_FULL_READ = "--rollout-in-progress needs a full read: a --cluster run neither reads nor writes the rollout record"
+# `--cluster` takes `<location>/<name>` or a bare name and no third form. A spec
+# with an empty half (`/prod`, `prod/`) is refused before any read: `/prod` would
+# otherwise partition to the bare form and match `prod` in every location, the
+# opposite of what its slash says, and the unmatched-spec line would then name
+# a spec the operator did not type.
+CLUSTER_SPEC_SEPARATOR = "/"
+# Each half of a spec is a GKE name: lowercase letters, digits and hyphens, as
+# GKE spells every location and cluster name. Anything else -- whitespace from a
+# pasted terminal line, an uppercase letter, a stray character -- can match
+# nothing, so the parser refuses it before any read instead of letting the run
+# report a miss that reads as a typo or a deleted cluster.
+CLUSTER_SPEC_HALF_RE = re.compile(r"[a-z0-9-]+")
+INVALID_CLUSTER_SPEC = "--cluster {spec!r} is neither <location>/<name> nor a bare name: each half is a GKE name (lowercase letters, digits and hyphens), a location before the slash and a name after it, or the name alone"
 
 
 def run_cmd(cmd: list[str], timeout: int = GCLOUD_TIMEOUT_SECONDS, env: dict | None = None) -> tuple[int, str, str]:
@@ -631,29 +657,80 @@ def assess_readiness(cluster: dict, member: dict, items: list | None, read_error
     }
 
 
-def build_report(projects: list[str], explicit_target: str | None, readiness_options: dict | None = None) -> dict:
+def parse_cluster_spec(spec: str) -> tuple[str, str] | None:
+    """`(location, name)` for `<location>/<name>`, `("", name)` for a bare name, and
+    None for anything else: an empty spec, an empty half, a second slash, or a
+    half outside the GKE name grammar (`CLUSTER_SPEC_HALF_RE`), none of which any
+    GKE location or cluster name carries. The grammar lives here alone; `main`
+    refuses what this rejects before any read."""
+    location, slash, name = spec.partition(CLUSTER_SPEC_SEPARATOR)
+    if not slash:
+        return ("", spec) if CLUSTER_SPEC_HALF_RE.fullmatch(spec) else None
+    if not (CLUSTER_SPEC_HALF_RE.fullmatch(location) and CLUSTER_SPEC_HALF_RE.fullmatch(name)):
+        return None
+    return location, name
+
+
+def _wanted(cluster: dict, wanted: set[tuple[str, str]]) -> list[tuple[str, str]]:
+    """Every `--cluster` spec this cluster satisfies: its qualified form, its bare form,
+    or both when the caller named it both ways. Empty when it was not asked for."""
+    name = cluster.get("name", "")
+    location = cluster.get("location", "")
+    return [spec for spec in ((location, name), ("", name)) if spec in wanted]
+
+
+def build_report(projects: list[str], explicit_target: str | None, readiness_options: dict | None = None, clusters: list[str] | None = None) -> dict:
     """Enumerates every project and grades every member; one failure never aborts the rest.
 
     `readiness_options` (`at`, `kubeconfig_dir`) turns on the per-member readiness read and
-    grade; None leaves the report as the version table alone.
+    grade; None leaves the report as the version table alone. `clusters`, when given, is the
+    names to grade; every other cluster in the projects is skipped, so a caller that wants a
+    few members' readiness does not pay for the others' reads, and the report records them
+    under `narrowed_to` (`None` on a full run).
     """
+    # `<location>/<name>` pins one cluster; a bare name admits that name in
+    # every location of the projects (GKE names are unique per location).
+    # `main` refuses any other form before it gets here; a direct caller is
+    # refused the same way rather than matched against every location.
+    wanted: set[tuple[str, str]] | None = None
+    narrowed_to: list[str] | None = None
+    if clusters:
+        wanted = set()
+        for spec in clusters:
+            parsed = parse_cluster_spec(spec)
+            if parsed is None:
+                raise ValueError(INVALID_CLUSTER_SPEC.format(spec=spec))
+            wanted.add(parsed)
+        narrowed_to = sorted(set(clusters))
+    matched: set[tuple[str, str]] = set()
     cache = ServerConfigCache()
     members: list[dict] = []
     errors: list[dict] = []
+    # Projects whose listing failed: a spec can match nothing there, and the
+    # unmatched line below says so instead of claiming no match.
+    unlisted: list[str] = []
     for project in projects:
         cmd = [GCLOUD, "container", "clusters", "list", f"--project={project}", JSON_FORMAT_FLAG]
-        clusters, error = run_gcloud_json(cmd)
-        if error is not None or not isinstance(clusters, list):
+        listed, error = run_gcloud_json(cmd)
+        if error is not None or not isinstance(listed, list):
             if error is not None and any(marker in error for marker in API_DISABLED_MARKERS):
                 ours, why_not = refusal_names_project(project, error)
                 if ours:
                     continue
                 error = f"{error} ({why_not})"
             errors.append({"project": project, "location": None, "message": error or f"{' '.join(cmd)} returned no list"})
+            unlisted.append(project)
             continue
-        for cluster in clusters:
+        for cluster in listed:
             if not isinstance(cluster, dict):
                 continue
+            if wanted is not None:
+                hits = _wanted(cluster, wanted)
+                if not hits:
+                    continue
+                # Every spec the cluster satisfies counts, not the first: a bare and a
+                # qualified spec for one cluster are one request, not a hit and a miss.
+                matched.update(hits)
             member = grade_member(cluster, project, explicit_target, cache)
             if readiness_options is not None:
                 items, read_error, path = read_cluster_objects(cluster, project, readiness_options["kubeconfig_dir"])
@@ -662,10 +739,26 @@ def build_report(projects: list[str], explicit_target: str | None, readiness_opt
                 member["readiness"] = assess_readiness(cluster, member, items, read_error, readiness_options["at"], path)
             members.append(member)
     errors.extend(cache.errors)
+    listed = [p for p in projects if p not in unlisted]
+    for location, name in sorted((wanted or set()) - matched):
+        spec = f"{location}/{name}" if location else name
+        if not unlisted:
+            message = UNMATCHED_CLUSTER_SPEC.format(spec=spec, projects=", ".join(projects))
+        elif listed:
+            message = UNMATCHED_CLUSTER_SPEC_PARTIAL.format(spec=spec, listed=", ".join(listed), unlisted=", ".join(unlisted))
+        else:
+            message = UNMATCHED_CLUSTER_SPEC_UNLISTED.format(spec=spec, unlisted=", ".join(unlisted))
+        errors.append({"project": None, "location": location or None, "cluster": name, "message": message})
     members.sort(key=lambda m: (m["project"], m["location"], m["cluster"]))
     report = {
         "target_version": explicit_target,
         "projects": list(projects),
+        # The `--cluster` specs this run was narrowed to, `None` on a full run,
+        # so a reader of `members[]` (the deprecation scan's floor, the audit
+        # collector's join) can tell a narrowed file from a full run whose
+        # project held one cluster. A `--project` narrowing is already visible
+        # in `projects`; this is the one the file otherwise hides.
+        "narrowed_to": narrowed_to,
         "members": members,
         "errors": errors,
         "summary": {status: sum(1 for m in members if m["status"] == status) for status in STATUS_ORDER},
@@ -722,8 +815,12 @@ def render_table(report: dict) -> str:
         + (f"; target {report['target_version']}" if report["target_version"] else "; target: each cluster's channel default")
     )
     for err in report["errors"]:
-        where = err["project"] + (f" ({err['location']})" if err.get("location") else "") + (f" cluster {err['cluster']}" if err.get("cluster") else "")
-        lines.append(f"- read failed for {where}: {err['message']}")
+        parts = [err["project"]] if err.get("project") else []
+        if err.get("location"):
+            parts.append(f"({err['location']})" if parts else err["location"])
+        if err.get("cluster"):
+            parts.append(f"cluster {err['cluster']}")
+        lines.append(f"- read failed for {' '.join(parts) or 'the run'}: {err['message']}")
     return "\n".join(lines)
 
 
@@ -919,7 +1016,7 @@ def compute_progress(report: dict, previous: dict | None, now: datetime, rollout
     """
     now_text = format_timestamp(now)
     prior_members = previous["members"] if previous else {}
-    failed_projects = {e["project"] for e in report["errors"] if e.get("location") is None}
+    failed_projects = {e["project"] for e in report["errors"] if e.get("location") is None and e.get("project")}
     read_projects = set(report["projects"]) - failed_projects
 
     record: dict[str, dict] = {}
@@ -1030,6 +1127,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Per-member GKE version table against a target version.")
     parser.add_argument("--project", action="append", help="GCP project to enumerate; repeatable. Defaults to the fleet's configured projects.")
     parser.add_argument("--target-version", help="Target for every member, e.g. 1.31.4-gke.1183000. Default: each cluster's channel defaultVersion.")
+    parser.add_argument("--cluster", action="append", help="Cluster to grade, as <location>/<name> (both halves) or a bare name; repeatable. With it, other clusters in the projects are skipped and the rollout record is neither read nor written (a narrowed read is not a rollout observation). Default: every cluster.")
     parser.add_argument("--output", help="Path to write the report as JSON.")
     parser.add_argument("--state-dir", default=DEFAULT_STATE_DIR, help=f"Directory holding one record per target from the previous run (default: {DEFAULT_STATE_DIR}).")
     parser.add_argument("--rollout-in-progress", action="store_true", help="Assert a rollout is under way, so an unchanged, behind member is flagged stalled even when no other member moved.")
@@ -1054,6 +1152,13 @@ def main(argv: list[str] | None = None) -> int:
     elif args.at or args.kubeconfig_dir:
         sys.stderr.write("--at and --kubeconfig-dir need --readiness\n")
         return EXIT_USAGE
+    if args.cluster and args.rollout_in_progress:
+        sys.stderr.write(ROLLOUT_FLAG_NEEDS_FULL_READ + "\n")
+        return EXIT_USAGE
+    for spec in args.cluster or []:
+        if parse_cluster_spec(spec) is None:
+            sys.stderr.write(INVALID_CLUSTER_SPEC.format(spec=spec) + "\n")
+            return EXIT_USAGE
 
     listing_errors: list[str] = []
     projects = get_target_projects(args.project, listing_errors)
@@ -1063,28 +1168,32 @@ def main(argv: list[str] | None = None) -> int:
         sys.stderr.write("no project: pass --project, or set MONITORED_PROJECT_IDS or GCP_PROJECT_ID\n")
         return EXIT_USAGE
 
-    report = build_report(projects, args.target_version, readiness_options)
+    report = build_report(projects, args.target_version, readiness_options, clusters=args.cluster)
     report["errors"][:0] = [
         {"project": PROJECTS_LIST_ERROR_SCOPE, "location": None, "message": error} for error in listing_errors
     ]
-    path = state_path(args.state_dir, args.target_version)
-    previous, state_error = load_state(path)
-    state = compute_progress(report, previous, utc_now(), args.rollout_in_progress, path)
     print(render_table(report))
     if readiness_options is not None:
         print()
         print(render_readiness(report))
-    print()
-    print(render_progress(report, previous))
-    if state_error:
-        sys.stderr.write(state_error + "\n")
-
     write_failed = False
-    try:
-        save_state(path, state)
-    except OSError as e:
-        sys.stderr.write(f"failed to write the record {path}: {e}\n")
-        write_failed = True
+    if args.cluster:
+        # A narrowed read is not a rollout observation: the record would file
+        # every member it did not name as gone. Leave the record alone.
+        print(f"\n{NARROWED_RUN_NOTE}")
+    else:
+        path = state_path(args.state_dir, args.target_version)
+        previous, state_error = load_state(path)
+        state = compute_progress(report, previous, utc_now(), args.rollout_in_progress, path)
+        print()
+        print(render_progress(report, previous))
+        if state_error:
+            sys.stderr.write(state_error + "\n")
+        try:
+            save_state(path, state)
+        except OSError as e:
+            sys.stderr.write(f"failed to write the record {path}: {e}\n")
+            write_failed = True
 
     if args.output:
         try:

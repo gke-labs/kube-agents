@@ -200,15 +200,17 @@ AUDITS: dict[str, AuditSpec] = {
             "blocking-exclusion",
             "stale-image-type",
             "no-notifications",
+            "upgrade-blocked",
         ),
         # §4a of the SOP: the six checks that read a knob the owner sets —
         # channel enrolment, a pool's auto-upgrade and auto-repair, the
         # maintenance window, an exclusion, upgrade notifications — and so
         # the only six a repository declaration may keep off the ledger. The
-        # other four report where the fleet ended up, not what anyone chose:
+        # other five report where the fleet ended up, not what anyone chose:
         # a master behind its channel is the effect of an exclusion or a
         # rollout, a skewed pool and a withdrawn image can take no patches,
-        # and the spread is a fleet-wide signal no one object owns.
+        # the spread is a fleet-wide signal no one object owns, and a blocked
+        # upgrade is a drain held to a forced eviction or a move GKE refuses.
         declarable=(
             "no-channel",
             "no-autoupgrade",
@@ -3107,7 +3109,10 @@ NON_INSPECTING_COMMAND_RE = re.compile(
 # An allowlist rather than a deny-list because the failure mode being closed is
 # an agent inventing plausible-looking filler; a new SOP that needs another
 # binary adds it here and `test_check_commands_use_an_inspection_binary` says so.
-INSPECTION_BINARIES = ("kubectl", "gcloud", "gsutil", "bq", "helm", "curl")
+# fleet_upgrade_report.py is the fleet-upgrade-verification skill's read-only
+# reporter; the upgrade audit's 3.11 records its invocation as the command that
+# ran, and that invocation names none of the six binaries.
+INSPECTION_BINARIES = ("kubectl", "gcloud", "gsutil", "bq", "helm", "curl", "fleet_upgrade_report.py")
 
 MIN_CHECK_COMMAND_CHARS = 8
 

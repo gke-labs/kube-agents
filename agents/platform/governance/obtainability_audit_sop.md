@@ -171,7 +171,7 @@ Identity is only as stable as those four fields, so **never** let a timestamp, r
 
 #### 3.3 Multi-replica workload with no PodDisruptionBudget (`no-pdb`)
 
-**This audit owns PodDisruptionBudgets** — both their absence (here) and their shape (3.4). The Fleet Waste Audit (`fleet-wide-cost-analysis` check 3.8) defers to these two and reports only the non-PDB reasons a node cannot be drained, so one PDB never carries two verdicts in two ledgers.
+**This audit owns PodDisruptionBudgets** — both their absence (here) and their shape (3.4). The Fleet Waste Audit (`fleet-wide-cost-analysis` check 3.8) defers to these two and reports only the non-PDB reasons a node cannot be drained, so one PDB never carries two verdicts in two ledgers. The one sanctioned pairing is the weekly upgrade audit's 3.11 `upgrade-blocked` (`security_patch_orchestrator_sop.md`): it names a drain-blocking budget again only on a cluster that is behind, as the reason that cluster's upgrade would be held, and its remediation points at this audit's `blocking-pdb` finding for the same budget rather than carrying a fix of its own.
 
 - **Command:** derived from `$STATE`; confirmed with the object-scoped read.
 - **Flag when:** a Deployment or StatefulSet has `spec.replicas >= 2` and no PDB in the same namespace whose `spec.selector` matches `spec.template.metadata.labels`. Evaluate the selector properly (`matchLabels` **and** `matchExpressions`); never match on names.

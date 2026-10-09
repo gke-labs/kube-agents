@@ -167,6 +167,7 @@ ADDED_AFTER_THE_MOVE = [
     "chat-fanout-fleet-restarts-rows",  # a fleet question fanned out one titled card per cluster
     "backup-dr-cmek-selected-namespaces-probe",  # the gke-backup-dr skill sync
     "findings-decision-covers-item",  # the findings queue's item-wide decision
+    "upgrades-audit-reports-upgrade-blocked",  # the weekly upgrade audit's check 3.11, graded in the ledger
 ]
 
 # Admitted after the split, each by a pull request that cited the record

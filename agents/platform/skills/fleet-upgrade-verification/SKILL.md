@@ -26,11 +26,24 @@ Neither reads versions against a target.
 
 ```bash
 ./skills/fleet-upgrade-verification/scripts/fleet_upgrade_report.py \
-  [--project <project>]... [--target-version <version>] [--rollout-in-progress] \
+  [--project <project>]... [--cluster <location>/<name>... | --rollout-in-progress] [--target-version <version>] \
   [--readiness [--at <RFC 3339>] [--kubeconfig-dir <dir>]] \
   --output /opt/data/scratch/fleet_versions.json
 ```
 
+- `--cluster` is repeatable and, when given, restricts the report to those clusters, as
+  `<location>/<name>` or a bare name and in no other form: each half is a GKE name, lowercase
+  letters, digits and hyphens, so an empty half (`/prod`, `prod/`), whitespace or an uppercase
+  letter is a usage error (exit 2), not a bare name and not a miss. Every other member of the projects is
+  skipped, reads included, and the rollout record is neither read nor written, since a narrowed
+  read would file every member it did not name as gone. A spec that matches no cluster in the
+  projects is an error line and exit 1, not an empty table, and when a project's listing failed
+  the line says so rather than claiming no match; one cluster named in both forms is one request,
+  not a hit and a miss. `--rollout-in-progress` beside `--cluster` is a usage error (exit 2): the
+  flag speaks to the rollout record, which a narrowed run does not touch. The JSON
+  names the specs under `narrowed_to`, so a reader can tell the narrowed `members[]` from the
+  fleet; the deprecation scan refuses such a file. The fleet-audit collector passes the clusters
+  it found behind, and reads back only a report marked as narrowed to that cluster.
 - `--project` is repeatable and, when given, is the whole scope. Without it the script takes the
   union of `GCP_PROJECT_ID`, `GKE_PROJECT_ID` and `PROJECT_ID` with `MONITORED_PROJECT_IDS`
   (comma- or whitespace-separated) when set, or with every project visible to
@@ -43,7 +56,10 @@ Neither reads versions against a target.
   location, and the target column says which baseline was used, for example
   `1.31.4-gke.1183000 channel default (REGULAR)`.
 - `--output` writes the same data as JSON: `members[]`, `errors[]`, a `summary` count per
-  status, and the `rollout` block described below.
+  status, `narrowed_to` (the `--cluster` specs of a narrowed run, `null` on a full one) and, on a
+  full run only, the `rollout` block and the per-member `progress` fields described below. A
+  `--cluster` run writes neither, since it neither reads nor compares the record; it prints a
+  note where the progress section would be.
 - `--rollout-in-progress` and `--state-dir` belong to rollout tracking, below; `--readiness`,
   `--at` and `--kubeconfig-dir` to the readiness check, below that.
 
@@ -57,7 +73,10 @@ It changes nothing in GCP or in any cluster; the only things it writes are its o
 needs, and the `--output` file. A failed or timed-out read is listed under the table and sets
 exit code 1; the other projects, locations and members are still reported. A project whose own Kubernetes
 Engine API is off holds no cluster and is not a failed read; a refusal naming another project,
-such as a quota project, is one.
+such as a quota project, is one. The weekly upgrade audit's collector also runs the script, with
+`--readiness --cluster <location>/<name>`, once per behind cluster: that run writes
+`upgrade-readiness_<project>_<location>_<name>.json` under `/opt/data/scratch/`, and a `--cluster` run
+neither reads nor writes the rollout record, so the record above is untouched by it.
 
 ## Read the table
 
@@ -89,8 +108,11 @@ the pools that do parse. A note reading `upgrade in flight` means the cluster or
 
 ## Track a rollout across runs
 
-Every run records its per-member result and compares itself with the previous run for the same
-target, so two runs during a rollout show what moved between them. The record lives at
+Every full run records its per-member result and compares itself with the previous run for the
+same target, so two runs during a rollout show what moved between them. A `--cluster` run does
+neither: it prints a note in place of the progress section, and its JSON carries no `rollout`
+block and no per-member `progress`, `unchanged_since` or `unchanged_for_seconds`. The record
+lives at
 `/opt/data/state/fleet-upgrade-verification/<target>.json` (`channel-default.json` for a run
 without `--target-version`), on the persistent volume the shell sandbox keeps between turns;
 `--state-dir` points it elsewhere. Each target has its own record, so a run against a different
@@ -133,7 +155,7 @@ from the record when its project was read cleanly (the cluster is gone), carried
 its project failed to read or was not in this run's `--project` scope, so a failed read never
 loses a record or manufactures a stall. A record the script cannot read is reported on stderr and
 replaced by a new baseline; a record it cannot write sets exit code 1 with the table still
-printed. In the JSON, each member carries `progress`, `unchanged_since` and
+printed. In a full run's JSON, each member carries `progress`, `unchanged_since` and
 `unchanged_for_seconds`, and the top-level `rollout` block has the record path, both run
 timestamps, whether the rollout counted as active and why, a count per progress value, and the
 members missing this run.
@@ -210,7 +232,9 @@ error (exit 2).
 
 - `--versions` is the version report's `--output`. The scan's floor is its lowest control-plane
   minor: the API server is what stops serving a removed version, so node-pool versions do not
-  enter into it. `--current-version <version>` replaces the file when there is none.
+  enter into it. A file from a `--cluster` run (`narrowed_to` set) is refused: its floor is one
+  cluster's, not the fleet's; rerun the report without `--cluster`, or pass `--current-version`.
+  `--current-version <version>` replaces the file when there is none.
   `--target-version` defaults to the file's `target_version` when the report was run with one.
 - Without `--repo` the script scans every repository under `managed_repos`, on every forge, the
   same list the GitOps skills write to; `--repo` is repeatable and, when given, is the whole scope.
