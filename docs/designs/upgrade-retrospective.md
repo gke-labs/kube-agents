@@ -6,79 +6,77 @@ three changes; the schedule and the agent's part follow it. The
 against, and the [readiness checks](upgrade-readiness-checks.md) are the before-the-upgrade half it
 feeds.
 
-## Requirements, in plain English
+## Requirements
 
-A cluster is a group of rented computers that run an application in small pieces. Google upgrades
-those computers on a schedule: it replaces the control program with a newer edition and rebuilds
-every computer one at a time. Most of the time nothing breaks. Sometimes a piece of the application
-does not come back, and nobody notices until someone complains, because Google reports the upgrade
-as finished whether or not the application survived it. Today the assistant can tell you what
-_would_ break before an upgrade, when you ask. Nothing looks back afterwards and writes down what
-_did_ break, so the same surprise waits for the next cluster.
+A GKE cluster has a control plane and one or more node pools. GKE upgrades the control plane and
+then recreates the nodes of each pool, one node at a time, on the cluster's maintenance schedule.
+Most upgrades complete without damage to the workloads. Some upgrades leave a workload down, stuck
+or restarting. GKE reports the upgrade as complete in both cases, so the damage is found later,
+often by a user. Today the Platform Agent reports what would stop an upgrade before it starts, when
+a user asks. No component reviews a cluster after an upgrade and records what the upgrade damaged.
+The next cluster meets the same failure.
 
-This feature is a scheduled review called the **upgrade retrospective**. It must:
+This design adds a scheduled review, the **upgrade retrospective**. The requirements are:
 
-1. **Run on its own, and answer when asked.** Once when the assistant is first installed, so a new
-   install starts with a review of every cluster it finds, and then at the end of every weekend;
-   nobody has to ask. And anyone who does ask, in their own words, gets the same report: "how did
-   the last upgrades go", "did anything break when the clusters were upgraded", "any upgrade
-   problems I should know about", "is there anything to fix before the next one". The question does
-   not have to name the feature, a cluster or a version. The assistant answers from the latest
-   saved report when nothing has been upgraded since, and runs the review first when something
-   has.
-2. **Look only at what changed.** A cluster is reviewed when it is new to the assistant or when it
-   was upgraded since the last review. A cluster nothing happened to gets one line saying so, with
-   one exception: a cluster that still carries a finding from an earlier review is re-checked for
-   that finding every time, so a fix made between upgrades clears it without waiting for the next
-   upgrade.
-3. **Write a report, the `upgrade-retro-report`,** in three sections, **Errors**, **Warnings**
-   and **Info**, any of which may be empty. An entry under Errors or Warnings is one incident:
-   one application object on one cluster, with four parts:
-   - **(A) What happened.** Which upgrades ran on that cluster, on which part of it, from which
-     version to which, when they started and finished, how long they took, and whether Google
-     reported them as finished or failed.
-   - **(B) What failed.** How the object was down, stuck or restarting after the upgrade, which of
-     the twenty known upgrade failures it matches, how sure the match is, and the evidence.
-   - **(C) How to see it coming and how to fix it next time.** The sign that was visible before the
-     upgrade, whether anything the assistant already runs reads that sign, and the fix, both the
-     one to make before the next upgrade and the one that repairs the cluster now. Written about
-     this object, not in general terms.
-   - **(D) The fix, set up.** Two things happen without being asked. The daily readiness check
-     learns about the failure, so the next pre-upgrade report says "the last upgrade broke this,
-     and it is still here" while it is. And where the install has a GitHub repository, the
-     review's one tracked issue carries the checklist of fixes, one entry per cluster and object,
-     rewritten by the next review rather than duplicated and closed when a review finds nothing.
+1. **Run without a request, and answer a request.** The review runs once when the agent is
+   installed, over every cluster it finds, and then at the end of each weekend. A user can also ask
+   for it in their own words, for example "how did the last upgrades go" or "is there anything to
+   fix before the next one". The question does not have to name the feature, a cluster or a
+   version. If no cluster was upgraded since the last report, the agent answers from that report.
+   If a cluster was upgraded, the agent runs the review first.
+2. **Review only what changed.** The review examines a cluster when the cluster is new to the agent,
+   or when GKE upgraded it since the last review. For a cluster with no change, the report has one
+   line that says so. Exception: a cluster that still has a finding from an earlier review is
+   checked again for that finding each time. A fix made between two upgrades then clears the
+   finding before the next upgrade.
+3. **Write the `upgrade-retro-report`** with three sections, **Errors**, **Warnings** and **Info**.
+   A section can be empty. An entry under Errors or Warnings is one incident: one workload object
+   on one cluster, with four parts:
+   - **(A) What happened.** The upgrades that ran on the cluster: the component (control plane or
+     node pool), the source and target versions, the start and end times, the duration, and the
+     result GKE reported (complete or failed).
+   - **(B) What failed.** The state of the object after the upgrade (down, stuck or restarting),
+     the catalogue failure it matches out of the twenty known failures, the confidence of the
+     match, and the evidence.
+   - **(C) The warning sign and the fix.** The sign that was visible before the upgrade, whether a
+     check the agent already runs reads that sign, and the fix: the change to make before the next
+     upgrade, and the change that repairs the cluster now. The text is specific to this object.
+   - **(D) The fix, set up.** Two actions happen without a request. The daily readiness check
+     learns the failure, so the next pre-upgrade report says that the last upgrade damaged this
+     object, for as long as the damage is present. If the install has a GitHub repository, the
+     review's one tracked issue carries the checklist of fixes, one entry per cluster and object.
+     The next review rewrites the checklist. The review closes the issue when it finds nothing.
 
-   An incident is an **Error** when the match is sure and the object is one of the user's, or when
-   Google reported the upgrade itself as failed, or a computer stayed broken after its rebuild. It
-   is a **Warning** when the match is tentative, when the object belongs to the cluster's own
-   plumbing, when the symptom matches none of the twenty, or when a failure from an earlier review
-   is still present with nothing new. **Info** lists each cluster that was upgraded or found with
-   nothing wrong, the clusters nothing happened to, and anything the review could not read.
+   An incident is an **Error** when the match is certain and the object belongs to the user, when
+   GKE reported the upgrade as failed, or when a node did not become ready after its recreation. An
+   incident is a **Warning** when the match is tentative, when the object belongs to the cluster's
+   system components, when the symptom matches none of the twenty failures, or when a failure from
+   an earlier review is still present with no new evidence. **Info** lists each cluster that was
+   upgraded or found with no failure, each cluster with no change, and each item the review could
+   not read.
 
-   A clean cluster is not an empty entry. For a reviewed cluster with no failure, part (C) is a
-   pre-flight for its next upgrade: the version its channel will move it to and when, and the known
-   failure shapes present on the cluster today although nothing has failed yet (a protection rule
-   with no allowance, a placement rule on a label the next version drops, an image from a retired
-   download site, a disk attached the old way, an agent tied to the machine's network or runtime,
-   data kept on the machine, a single copy behind a protection rule, a GPU program pinned to a
-   driver version, a gatekeeper with nobody behind it), each with its fix. Part (D) records the
-   baseline for the next review to compare against and marks each shape as a risk the readiness
-   check names before the next upgrade. The lines for unchanged clusters say when each was last
-   upgraded and what it will move to next; the lines for clusters the review could not read say
-   why. "None" appears only when the count is really zero.
+   A cluster with no failure is not an empty entry. For such a cluster, part (C) is a pre-flight for
+   its next upgrade: the version its release channel moves it to and when, and the known failure
+   shapes present on the cluster today, each with its fix. Examples of shapes: a PodDisruptionBudget
+   that permits no disruption, a node selector on a label the next version removes, an image from a
+   retired registry, a volume attached through a removed in-tree plugin, a DaemonSet that depends on
+   the node's network or container runtime, data on local node storage, a single replica behind a
+   PodDisruptionBudget, a GPU workload pinned to a driver version, a fail-closed webhook with no
+   backend. Part (D) records the baseline for the next review and marks each shape as a risk for
+   the readiness check to name before the next upgrade. The line for an unchanged cluster gives the
+   date of its last upgrade and its next target version. The line for a cluster the review could
+   not read gives the reason. "None" appears only when the count is zero.
 
-4. **Keep the report where the assistant can read it back,** on the storage its own tools use,
-   with the latest one always at the same path, and post one line per reviewed cluster in chat
-   with the counts and the most important finding. A quiet weekend posts nothing. A GitHub
-   repository is not required for any of this; it only adds the tracked issue.
-5. **Be testable on the failures we already know how to produce.** The test fleet carries planted
-   examples of the catalogue's failures; the first report over that fleet has to classify those
-   correctly, and every one of them becomes a nightly test.
+4. **Store the report where the agent can read it,** on the storage its tools use, with the latest
+   report at a fixed path. Post one line per reviewed cluster in chat, with the counts and the most
+   important finding. A weekend with no change posts nothing. A GitHub repository is not required;
+   it adds only the tracked issue.
+5. **Be testable on the failures the test fleet already contains.** The test fleet has planted
+   examples of the catalogue's failures. The first report over that fleet must classify those
+   examples correctly, and each example becomes a nightly test.
 
-What it does not do: it does not upgrade, roll back, or change anything on a cluster. Opening a
-pull request that fixes a manifest stays a user's "apply", through the same route the assistant
-uses for every other proposed change.
+The review does not upgrade, roll back or change a cluster. A pull request that fixes a manifest
+stays a user's "apply", through the route the agent uses for every other proposed change.
 
 ## 1. Why
 
