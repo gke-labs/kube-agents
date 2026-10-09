@@ -82,7 +82,8 @@ def routes_to_gemini(model_name: str, router: Any) -> bool:
     """Whether every deployment ``router`` serves ``model_name`` with is a Gemini model.
 
     False when the alias cannot be resolved: the hook then leaves the request
-    as it is, which is right for any model that is not Gemini.
+    as it is, which is right for any model that is not Gemini, and says once
+    that it is blind.
     """
     if router is None:
         _warn_blind("no LiteLLM router to resolve aliases with")
@@ -95,7 +96,13 @@ def routes_to_gemini(model_name: str, router: Any) -> bool:
         _warn_blind(f"the router could not resolve {model_name!r} ({exc})")
         return False
     models = [(d.get(DEPLOYMENT_PARAMS_KEY) or {}).get(DEPLOYMENT_MODEL_KEY, "") for d in deployments]
-    return bool(models) and all(is_gemini_model(m) for m in models)
+    if not models or not any(models):
+        # The proxy only asks about names it serves, so an alias with no
+        # deployments, or deployments with no model string, is a shape this
+        # hook no longer reads.
+        _warn_blind(f"the router returned no deployment model for {model_name!r}")
+        return False
+    return all(is_gemini_model(m) for m in models)
 
 
 def strip_replayed_thinking(messages: Any) -> int:

@@ -76,6 +76,11 @@ class _Router:
         return [{"litellm_params": {"model": m}} for m in self.models.get(model_name, [])]
 
 
+class _Shapeless:
+    def get_model_list(self, model_name: str):
+        return [{"params": {"model": "vertex_ai/gemini-3.5-flash"}}]
+
+
 def _session() -> list[dict]:
     return [
         {"role": "user", "content": "how healthy is the namespace"},
@@ -142,6 +147,16 @@ class TestHook(unittest.TestCase):
         self.assertEqual(len(logs.records), 1)
         self.assertIn("hook inactive", logs.output[0])
 
+    def test_an_alias_the_router_cannot_resolve_is_a_blind_hook_too(self):
+        # A router that answers an empty list, or deployments with no model
+        # string, is the silent shape an upgrade could hand the hook.
+        for router in (_Router({}), _Shapeless()):
+            with self.subTest(router=type(router).__name__):
+                self.hook._blind_warned = False
+                with self.assertLogs("kube_agents.litellm_thinking_replay", level="WARNING") as logs:
+                    self.assertFalse(self.hook.routes_to_gemini("model-default", router))
+                self.assertIn("no deployment model", logs.output[0])
+
     def test_replayed_thinking_goes_and_everything_else_stays(self):
         messages = _session()
         self.assertEqual(self.hook.strip_replayed_thinking(messages), 3)
@@ -179,7 +194,25 @@ class TestAgainstARealRouter(unittest.TestCase):
         for alias in ("model-default", "hermes-agent", "gemini-3.5-flash"):
             self.assertTrue(hook.routes_to_gemini(alias, router), alias)
         self.assertFalse(hook.routes_to_gemini("claude", router))
-        self.assertIn("async_pre_call_hook", vars(type(hook.proxy_handler_instance)))
+
+    def test_the_proxy_loads_it_by_its_callbacks_string_and_it_reads_the_proxy_router(self):
+        # The way a pod gets it: the proxy resolves the callbacks entry
+        # relative to config.yaml's directory, and the hook finds the router
+        # through litellm.proxy.proxy_server, with no test seam in between.
+        import litellm.proxy.proxy_server as proxy_server
+        from litellm import Router
+        from litellm.proxy.types_utils.utils import get_instance_fn
+
+        instance = get_instance_fn(_CALLBACK, config_file_path=str(_CHART_FILE.parent / "config.yaml"))
+        router = Router(model_list=[{"model_name": "model-default", "litellm_params": {"model": "vertex_ai/gemini-3.5-flash"}}])
+        previous = proxy_server.llm_router
+        proxy_server.llm_router = router
+        try:
+            data = {"model": "model-default", "messages": _session()}
+            asyncio.run(instance.async_pre_call_hook(None, None, data, "anthropic_messages"))
+        finally:
+            proxy_server.llm_router = previous
+        self.assertEqual([b["type"] for b in data["messages"][1]["content"]], ["text", "tool_use"])
 
 
 class TestBothPathsShipIt(unittest.TestCase):
