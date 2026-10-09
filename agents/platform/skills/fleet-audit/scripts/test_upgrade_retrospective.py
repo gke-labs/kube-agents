@@ -1679,9 +1679,62 @@ class LedgerAndGuardsTest(unittest.TestCase):
         row = next(s for r in result["reviews"] for s in r["what_failed"] if s["object"] == PAYMENTS)
         self.assertEqual((row["onset_source"], row["onset"], row["predates_upgrade"], row["recreated_pods"]), (ur.ONSET_FROM_OWNER, "2026-09-08T00:00:00Z", True, []))
         self.assertTrue(next(i for i in result["sections"]["warnings"] if i["object"] == PAYMENTS)["predates_upgrade"])
-        # With no dated condition the newest ReplicaSet's creation stands in.
+        # With no False condition, the newest ReplicaSet's creation counts only inside the upgrade window.
         payments["status"] = {"conditions": [{"type": "Available", "status": "True", "lastTransitionTime": "2026-10-01T00:00:00Z"}]}
-        self.assertEqual(ur.owner_onsets(workloads, READS["seeded-a"]["owners"])[PAYMENTS], "2026-09-25T17:02:46Z")
+        self.assertEqual(ur.owner_onsets(workloads, READS["seeded-a"]["owners"], SINCE)[PAYMENTS], "2026-09-25T17:02:46Z")
+        first_operation = datetime(2026, 10, 6, 4, 22, 12, tzinfo=timezone.utc)
+        self.assertNotIn(PAYMENTS, ur.owner_onsets(workloads, READS["seeded-a"]["owners"], first_operation))
+        self.assertNotIn(PAYMENTS, ur.owner_onsets(workloads, READS["seeded-a"]["owners"], None))
+
+    def test_available_deployment_with_an_old_replicaset_has_no_owner_evidence(self):
+        # Four replicas; one OOM-killed on a node the default-pool drain rebuilt; conditions True; ReplicaSet months old.
+        def fleet_reads(created, ready_at):
+            dep = {"kind": "Deployment", "metadata": {"name": "api-fleet", "namespace": "seeded-debug"}, "spec": {"replicas": 4, "template": {"metadata": {"labels": {"app": "api-fleet"}}, "spec": {"containers": [{"name": "api", "image": "eclipse-temurin:8u302-jre"}]}}}, "status": {"conditions": [{"type": "Available", "status": "True", "lastTransitionTime": "2026-07-01T00:10:00Z"}, {"type": "Progressing", "status": "True", "reason": "NewReplicaSetAvailable", "lastTransitionTime": "2026-07-01T00:10:00Z"}]}}
+            rs = {"kind": "ReplicaSet", "metadata": {"name": "api-fleet-5d8f9c7b6", "namespace": "seeded-debug", "creationTimestamp": "2026-07-01T00:00:00Z", "ownerReferences": [{"kind": "Deployment", "name": "api-fleet"}]}}
+            p = pod("api-fleet-5d8f9c7b6-k2m4p", namespace="seeded-debug", images=["eclipse-temurin:8u302-jre"], statuses=[{"name": "c0", "state": {"waiting": {"reason": "CrashLoopBackOff"}}, "lastState": {"terminated": {"reason": "OOMKilled", "exitCode": 137, "finishedAt": ready_at}}, "restartCount": 5}], node="gke-seeded-a-default-pool-62ac8ee0-d595")
+            p["metadata"]["ownerReferences"] = [{"kind": "ReplicaSet", "name": "api-fleet-5d8f9c7b6"}]
+            p["metadata"]["creationTimestamp"] = created
+            p["status"]["startTime"] = created
+            p["status"]["conditions"] = [{"type": "Ready", "status": "False", "lastTransitionTime": ready_at}]
+            return dep, rs, p
+        dep, rs, p = fleet_reads("2026-10-07T04:05:00Z", "2026-10-08T17:00:00Z")
+        obj = "seeded-debug/Deployment/api-fleet"
+        reads = {**READS["seeded-a"], "pods": READS["seeded-a"]["pods"] + [p], "workloads": READS["seeded-a"]["workloads"] + [dep], "owners": READS["seeded-a"]["owners"] + [rs]}
+        with mock.patch.dict(READS, {"seeded-a": reads}):
+            first, _ = self.collect()
+        row = next(s for r in first["reviews"] for s in r["what_failed"] if s["object"] == obj)
+        self.assertEqual((row["onset_source"], row["onset"], row["recreated_pods"], row.get("recreated_only"), row["predates_upgrade"]), (ur.ONSET_FROM_POD, "2026-10-07T04:05:00Z", ["api-fleet-5d8f9c7b6-k2m4p"], True, False))
+        self.assertEqual({(c["entry"], c["confidence"]) for c in row["classifications"]}, {(14, ur.MEDIUM)})
+        self.assertIn(ur.RECREATED_DETAIL, row["classifications"][0]["detail"])
+        incident = next(i for i in first["sections"]["warnings"] if i["object"] == obj)
+        self.assertTrue(incident["recreated_only"])
+        self.assertFalse(incident["predates_upgrade"])
+        # A later full run whose stored set lacks it: new, and the high entry-14 signature is an Error.
+        reads_without = {**READS["seeded-a"], "workloads": READS["seeded-a"]["workloads"] + [dep], "owners": READS["seeded-a"]["owners"] + [rs]}
+        with mock.patch.dict(READS, {"seeded-a": reads_without}):
+            self.collect(now=datetime(2026, 10, 9, 18, 0, tzinfo=timezone.utc))
+        bumped = cluster_doc("seeded-a")
+        bumped["currentMasterVersion"] = "1.36.4-gke.1247000"
+        drain = copy.deepcopy(next(o for o in OPERATIONS if o["operationType"] == "UPGRADE_NODES" and "/clusters/seeded-a/nodePools/default-pool" in o["targetLink"]))
+        drain.update(name="operation-second-drain", startTime="2026-10-15T09:00:00Z", endTime="2026-10-15T09:20:00Z")
+        dep, rs, p = fleet_reads("2026-10-15T09:05:00Z", "2026-10-15T17:00:00Z")
+        later_reads = {**READS["seeded-a"], "pods": READS["seeded-a"]["pods"] + [p], "workloads": READS["seeded-a"]["workloads"] + [dep], "owners": READS["seeded-a"]["owners"] + [rs]}
+        with mock.patch.dict(READS, {"seeded-a": later_reads}):
+            second, _ = self.collect(FakeFleet(clusters=[bumped, cluster_doc("gemma-gpu-upgraded")], operations=OPERATIONS + [drain]), now=datetime(2026, 10, 15, 18, 0, tzinfo=timezone.utc))
+        row = next(s for r in second["reviews"] for s in r["what_failed"] if s["object"] == obj)
+        self.assertEqual((row["since"], row["predates_upgrade"], row.get("recreated_only")), (ur.SINCE_NEW, False, None))
+        self.assertEqual({(c["entry"], c["confidence"]) for c in row["classifications"]}, {(14, ur.HIGH)})
+        self.assertIn(obj, [i["object"] for i in second["sections"]["errors"]])
+        # The same Deployment Available=False for a month: owner evidence, predates the upgrade.
+        dep, rs, p = fleet_reads("2026-10-07T04:05:00Z", "2026-10-08T17:00:00Z")
+        dep["status"]["conditions"][0] = {"type": "Available", "status": "False", "lastTransitionTime": "2026-09-08T00:00:00Z"}
+        with mock.patch.dict(READS, {"seeded-a": {**READS["seeded-a"], "pods": READS["seeded-a"]["pods"] + [p], "workloads": READS["seeded-a"]["workloads"] + [dep], "owners": READS["seeded-a"]["owners"] + [rs]}}):
+            with tempfile.TemporaryDirectory() as fresh_home, mock.patch.dict(os.environ, {ur.HERMES_HOME_ENV: fresh_home, ur.STORE_HOME_ENV: fresh_home}):
+                with redirect_stderr(io.StringIO()):
+                    third = ur.collect(args(), run=FakeFleet(), now=NOW)
+        row = next(s for r in third["reviews"] for s in r["what_failed"] if s["object"] == obj)
+        self.assertEqual((row["onset_source"], row["onset"], row["predates_upgrade"], row.get("recreated_only")), (ur.ONSET_FROM_OWNER, "2026-09-08T00:00:00Z", True, None))
+        self.assertTrue(next(i for i in third["sections"]["warnings"] if i["object"] == obj)["predates_upgrade"])
 
     def test_recreated_pod_without_owner_date_is_medium_on_a_first_run(self):
         # A StatefulSet pod created inside the default-pool drain, Pending on a dropped node label: entry 12

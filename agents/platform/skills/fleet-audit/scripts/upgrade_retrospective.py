@@ -66,11 +66,14 @@ reported "outside the fleet; not recorded" and gets no ledger entry or
 guard), prunes nothing, reports no stale guard outside its scope, writes
 `reports/<finish-UTC>-scoped.md` and leaves the link alone; `--since` is a
 hand run that widens the window and advances no last-run time. The newest fourteen reports of each kind are kept. Each
-symptom carries an onset. An owned pod's is read at the owner first: a
-Deployment's earliest `Available=False` or `Progressing=False` transition,
-or, with neither, its newest ReplicaSet's creation (a failure that began
-with a rollout). Where the owner carries no such date (StatefulSet,
-DaemonSet, Job) or the pod is bare, the pod's own evidence is used: a
+symptom carries an onset. An owned pod's is read at the owner first, and
+owner evidence counts only when it says something failed: a Deployment's
+earliest `Available=False` or `Progressing=False` transition, or, with
+neither, its newest ReplicaSet's creation when that falls inside the
+upgrade window (a rollout during the upgrade). A Deployment whose
+conditions are all True and whose ReplicaSet predates the window has no
+owner evidence; its pods, like a StatefulSet's, a DaemonSet's, a Job's or
+a bare pod, are read from their own evidence: a
 Pending pod's scheduling transition or start; a not-Ready pod's `Ready`
 transition to False, else its start (the earlier of the two once it has
 restarted), never its latest crash. A pod-sourced onset on a pod created
@@ -1238,11 +1241,13 @@ def _pod_last_activity(pod: dict) -> datetime | None:
     return parse_ts(status.get("startTime")) or parse_ts((pod.get("metadata") or {}).get("creationTimestamp"))
 
 
-def owner_onsets(workloads: list[dict], owners: list[dict]) -> dict[str, str]:
-    """A Deployment's dated failure: the earliest `Available=False` or
-    `Progressing=False` transition; with neither, the creation of its newest
-    ReplicaSet (a failure that began with a rollout). StatefulSets,
-    DaemonSets and Jobs carry no such date and are absent."""
+def owner_onsets(workloads: list[dict], owners: list[dict], window_start: datetime | None = None) -> dict[str, str]:
+    """A Deployment's dated failure, and only that: the earliest
+    `Available=False` or `Progressing=False` transition, or, with neither,
+    the creation of its newest ReplicaSet when that falls inside the upgrade
+    window (a rollout during the upgrade). A Deployment whose conditions are
+    all True and whose ReplicaSet predates the window says nothing failed
+    and is absent, as are StatefulSets, DaemonSets and Jobs."""
     out: dict[str, str] = {}
     newest_rs: dict[str, datetime] = {}
     for obj in owners:
@@ -1262,7 +1267,7 @@ def owner_onsets(workloads: list[dict], owners: list[dict]) -> dict[str, str]:
         failures = [t for t in failures if t]
         if failures:
             out[key] = fmt_ts(min(failures))
-        elif key in newest_rs:
+        elif key in newest_rs and window_start and newest_rs[key] >= window_start:
             out[key] = fmt_ts(newest_rs[key])
     return out
 
@@ -1829,7 +1834,7 @@ def collect_symptoms(cluster: dict, reads: dict[str, list], operations: list[dic
     )
     resolver = Resolver(reads.get("pods") or [], reads.get("owners") or [], reads.get("workloads") or [])
     node_pool_of = {(n.get("metadata") or {}).get("name"): ((n.get("metadata") or {}).get("labels") or {}).get(NODEPOOL_LABEL, "") for n in nodes}
-    pods = pod_symptoms(reads.get("pods") or [], resolver, window_start, owner_onsets(reads.get("workloads") or [], reads.get("owners") or []), pool_operation_windows(operations), node_pool_of)
+    pods = pod_symptoms(reads.get("pods") or [], resolver, window_start, owner_onsets(reads.get("workloads") or [], reads.get("owners") or [], window_start), pool_operation_windows(operations), node_pool_of)
     pod_objects = {s["object"] for s in pods}
     # An event on a pod that is gone carries no pool; its owner's template
     # nodeSelector is the pool evidence it can still have.
