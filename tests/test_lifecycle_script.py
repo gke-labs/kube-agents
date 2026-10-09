@@ -1110,7 +1110,7 @@ exit 0
             # command that ran before it, not the deletion itself.
             kubectl = bin_dir / "kubectl"
             # wedged: one PlatformAgent whose delete times out, which walks the
-            # finalizer patch and both RBAC deletes as well.
+            # finalizer patch, RBAC deletes, and JetStream PVC delete as well.
             kubectl.write_text(f"""#!/usr/bin/env bash
 printf '%s\\n' "$*" >> '{kubectl_record}'
 if [[ "{wedged}" == True ]]; then
