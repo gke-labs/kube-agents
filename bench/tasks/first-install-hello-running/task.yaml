@@ -19,6 +19,10 @@ infrastructure:
   variables:
     case_suffix: "running"
     variant: "in_progress"
+    # The real plugin sets the home channel on this turn when none is set. The
+    # API server cannot do that, so the request tells the plugin to greet as if
+    # it did.
+    home_channel_set: true
     # A substring of the prompt below and of no other case's prompt.
     phrase: "just installed you"
 
@@ -38,6 +42,8 @@ expected_output: |
   - It says it is taking a first look at the GKE fleet and only reading, so
     nothing in the clusters changes, and that it will post what it finds in
     this chat when it is done, without promising a time.
+  - It says that scheduled reports also come to this chat, because this turn
+    made the chat the home channel. It names no command to move them.
   - It says any change it thinks should be made comes as a pull request for the
     team to review.
   - It ends on exactly one question, an offer of what to look at first. It asks
@@ -120,6 +126,15 @@ verification_spec:
           "(here)",
           "this chat",
         ]
+
+  # The plugin adds this sentence only when it made this chat the home channel.
+  # The request's home_channel_set field stands in for that write.
+  - name: says-scheduled-reports-come-here
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      any_of_phrases: ["scheduled report"]
 
   - name: asks-one-question-and-ends-on-it
     role: objective

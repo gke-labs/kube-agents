@@ -111,6 +111,16 @@ verification_spec:
         # The last character is not a question mark.
         - '[^?\s]\s*\Z'
 
+  # No home_channel_set in this case's request, so the plugin adds no sentence
+  # about scheduled reports. A greeting that says it anyway tells the user
+  # something the install did not do.
+  - name: no-scheduled-report-claim
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      forbidden_patterns: ["scheduled report"]
+
   - name: at-most-sixty-words
     role: objective
     mode: assert
