@@ -53,6 +53,8 @@ class FakeSandbox:
         failing_projects: set | None = None,
         garbled_projects: set | None = None,
         table_failing_projects: set | None = None,
+        timeout_projects: set | None = None,
+        table_timeout_projects: set | None = None,
     ):
         self.versions = versions
         self.readiness = readiness or versions
@@ -60,6 +62,8 @@ class FakeSandbox:
         self.failing_projects = failing_projects or set()
         self.garbled_projects = garbled_projects or set()
         self.table_failing_projects = table_failing_projects or set()
+        self.timeout_projects = timeout_projects or set()
+        self.table_timeout_projects = table_timeout_projects or set()
         self.calls: list[tuple[str, list[str], float]] = []
 
     def run(self, argv, *, timeout, check, stdin=None):
@@ -77,6 +81,8 @@ class FakeSandbox:
             return subprocess.CompletedProcess(argv, 0, stdout=f"{watch.ENVELOPE_SENTINEL}\n{{\"exit\": 0, \"tables\": \"| cut", stderr="")
         if not wanted and any(p in self.table_failing_projects for p in report_argv[1::2]):
             return subprocess.CompletedProcess(argv, 255, stdout="", stderr="ssh: lost connection")
+        if any(p in (self.timeout_projects if wanted else self.table_timeout_projects) for p in report_argv[1::2]):
+            raise subprocess.TimeoutExpired(argv, timeout)
         body = self.readiness if wanted else self.versions
         # Both hops run once per project: answer with that project's slice.
         projects = {report_argv[i + 1] for i, flag in enumerate(report_argv) if flag == watch.PROJECT_FLAG}
@@ -94,7 +100,11 @@ class Base(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
         self.home = Path(self.tmp.name) / "watch"
-        self.env = mock.patch.dict(os.environ, {watch.WATCH_HOME_ENV: str(self.home), watch.PROJECTS_ENV: "p1"}, clear=False)
+        self.env = mock.patch.dict(
+            os.environ,
+            {watch.WATCH_HOME_ENV: str(self.home), watch.PROJECTS_ENV: "p1", watch.REFRESH_DAYS_ENV: "", watch.SKILL_SCRIPTS_DIR_ENV: ""},
+            clear=False,
+        )
         self.env.start()
         self.clock = mock.patch.object(watch, "now_utc", return_value=NOW)
         self.clock.start()
@@ -498,7 +508,7 @@ class Budget(Base):
         self.assertEqual(code, 0)
         self.assertEqual([c[1][1] for c in sandbox.calls if c[0] == "readiness"], ["p1"])
         self.assertIn("2 cluster(s) pending (a, b): 0 blocked, 1 ready, 1 not read;", out)
-        self.assertIn("next refresh after 2026-10-15; readiness run for p2 not started: tick budget exhausted before project p2 ran", out)
+        self.assertIn("next refresh after 2026-10-15; readiness run for p2 not started: tick budget exhausted before project p2 could run", out)
         self.assertNotIn("retried tomorrow", out)
         self.assertEqual(self.ledger()["targets"][TARGET]["last_report_at"], NOW.isoformat())
         self.assertEqual(self.ledger()["readiness_resume_from"], "p2")
@@ -574,6 +584,46 @@ class Budget(Base):
             sandbox = FakeSandbox(versions, readiness, table_failing_projects={"p2"})
             code, out = self.run_tick(sandbox)
         self.assertEqual(out, "", "the partial table is announced once; a readable p2 readiness run grades b under the carried-forward pending set on a day it is due")
+
+    def test_a_run_the_budget_cut_short_is_not_an_attempt_and_the_next_sweep_starts_there(self) -> None:
+        versions, readiness = self.two_projects()
+        # started, table p1, table p2, readiness p1 (full cap), readiness p2 (a shrunk timeout that then fires)
+        with mock.patch.dict(os.environ, {watch.PROJECTS_ENV: "p1,p2"}), self.monotonic_readings(0.0, 0.0, 0.0, 0.0, watch.TICK_BUDGET_SECONDS - 400.0):
+            sandbox = FakeSandbox(versions, readiness, timeout_projects={"p2"})
+            code, out = self.run_tick(sandbox)
+        self.assertEqual(code, 0)
+        self.assertEqual([c[2] for c in sandbox.calls if c[0] == "readiness"], [watch.READINESS_TIMEOUT_SECONDS, 400.0])
+        self.assertIn("1 ready, 1 not read;", out)
+        self.assertIn("readiness run for p2 not started: tick budget exhausted before project p2 could run", out)
+        self.assertNotIn("timed out", out)
+        self.assertEqual(self.ledger()["readiness_resume_from"], "p2")
+        self.assertEqual(self.ledger()["announced"].get("ungraded", {}), {})
+
+    def test_a_run_that_times_out_at_its_own_cap_is_a_failed_attempt_with_a_whole_number(self) -> None:
+        sandbox = FakeSandbox(envelope([member("a", "lagging")]), envelope([member("a", "lagging", readiness="ready")]), timeout_projects={"p1"})
+        code, out = self.run_tick(sandbox)
+        self.assertEqual(code, 0)
+        self.assertIn(f"none graded (readiness run for p1 failed: the sandbox run timed out after {watch.READINESS_TIMEOUT_SECONDS}s)", out)
+        self.assertIsNone(self.ledger()["readiness_resume_from"])
+        self.assertEqual(self.ledger()["announced"]["ungraded"][TARGET]["attempts"], 1)
+
+    def test_the_partial_line_is_keyed_on_the_kind_of_error_so_a_turning_window_posts_once(self) -> None:
+        versions = envelope([member("a", "lagging"), member("b", "lagging", project="p2"), member("c", "lagging", project="p3")])
+        readiness = envelope([member("a", "lagging", readiness="ready"), member("b", "lagging", project="p2", readiness="ready"), member("c", "lagging", project="p3", readiness="ready")])
+        outs = []
+        for _ in range(3):
+            # started, table first, table second, table third (past the share), then readiness runs with room
+            late = watch.TABLE_BUDGET_SECONDS - 10.0
+            with mock.patch.dict(os.environ, {watch.PROJECTS_ENV: "p1,p2,p3"}), self.monotonic_readings(0.0, 0.0, 0.0, late, late, late, late):
+                sandbox = FakeSandbox(versions, readiness)
+                code, out = self.run_tick(sandbox)
+            outs.append((out, [c[1][1] for c in sandbox.calls if c[0] == "versions"], self.ledger()["table_resume_from"]))
+        self.assertIn("the version table was partial (1 read error(s), exit 0)", outs[0][0])
+        self.assertEqual(outs[0][1], ["p1", "p2"])
+        self.assertEqual(outs[0][2], "p3")
+        self.assertEqual(outs[1][1], ["p3", "p1"], "the next table starts at the project the budget left")
+        self.assertNotIn("partial", outs[1][0], "a turning unread window is the same kind of partial table, announced once")
+        self.assertNotIn("partial", outs[2][0])
 
     def test_a_table_that_fails_for_every_project_is_one_failure_line(self) -> None:
         versions, readiness = self.two_projects()
@@ -666,7 +716,7 @@ class Failures(Base):
         with mock.patch.object(watch.sandbox_exec, "run", side_effect=slow), redirect_stdout(out):
             code = watch.main([])
         self.assertEqual(code, 0)
-        self.assertEqual(out.getvalue().strip(), f"upgrade readiness watch: the tick failed: RuntimeError: the sandbox run timed out after {watch.VERSION_TABLE_TIMEOUT_SECONDS}s")
+        self.assertEqual(out.getvalue().strip(), f"upgrade readiness watch: the tick failed: SandboxTimedOut: the sandbox run timed out after {watch.VERSION_TABLE_TIMEOUT_SECONDS}s")
         self.assertNotIn("ssh", out.getvalue())
 
     def test_a_failed_readiness_run_records_no_report_so_the_version_is_retried(self) -> None:
@@ -871,6 +921,43 @@ class Failures(Base):
             self.assertEqual([m["cluster"] for m in data["members"]], [cluster])
             self.assertEqual(data["errors"], [])
 
+    def test_a_target_the_report_left_unstripped_is_keyed_stripped(self) -> None:
+        versions = envelope([member("a", "lagging", target=TARGET + " \n")])
+        readiness = envelope([member("a", "lagging", target=TARGET + " \n", readiness="ready")])
+        code, out = self.run_tick(FakeSandbox(versions, readiness))
+        self.assertEqual(code, 0)
+        self.assertIn(f"new target version {TARGET}, 1 cluster(s)", out)
+        self.assertEqual(sorted(self.ledger()["targets"]), [TARGET])
+        self.assertTrue((self.home / "reports" / TARGET / "latest.md").exists())
+        code, out = self.run_tick(FakeSandbox(versions, readiness))
+        self.assertEqual(out, "", "the ledger the job wrote loads again")
+
+    def test_a_version_whose_clusters_upgraded_is_retired_even_while_another_project_s_listing_fails(self) -> None:
+        self.seed(OLDER_TARGET, NOW, ["p2/us-central1-a/b"])
+        partial = envelope(
+            [member("a", "lagging"), member("b", "current", project="p2")],
+            errors=[{"project": "p1", "message": "clusters list failed"}],
+            exit_code=1,
+        )
+        readiness = envelope([member("a", "lagging", readiness="ready")])
+        with mock.patch.dict(os.environ, {watch.PROJECTS_ENV: "p1,p2"}):
+            code, out = self.run_tick(FakeSandbox(partial, readiness))
+        self.assertEqual(code, 0)
+        self.assertIn(f"{OLDER_TARGET} is no longer pending", out)
+        self.assertNotIn(OLDER_TARGET, self.ledger()["targets"])
+        self.assertIn("the version table was partial", out)
+
+    def test_the_saved_report_s_header_says_what_happens_next(self) -> None:
+        readiness = envelope([], errors=[{"project": "p1", "location": "us-central1-a", "cluster": "a", "message": "kubectl failed"}])
+        code, out = self.run_tick(FakeSandbox(envelope([member("a", "lagging")]), readiness))
+        self.assertIn("retrying tomorrow", out)
+        text = (self.home / "reports" / TARGET / "latest.md").read_text()
+        self.assertIn("so the job retries tomorrow; ask the Platform Agent", text)
+        self.assertNotIn("next scheduled refresh", text)
+        code, out = self.run_tick(FakeSandbox(envelope([member("a", "lagging")]), envelope([member("a", "lagging", readiness="ready")])))
+        text = (self.home / "reports" / TARGET / "latest.md").read_text()
+        self.assertIn("The next scheduled refresh is after 2026-10-15 while any cluster is still pending; ask the Platform Agent", text)
+
     def test_an_unsaveable_ledger_exits_non_zero(self) -> None:
         sandbox = FakeSandbox(envelope([member("a", "lagging")]), envelope([member("a", "lagging", readiness="ready")]))
         with mock.patch.object(watch, "save_ledger", side_effect=OSError("read-only file system")):
@@ -935,6 +1022,11 @@ class Projects(unittest.TestCase):
 
 
 class Loader(unittest.TestCase):
+    def setUp(self) -> None:
+        self.env = mock.patch.dict(os.environ, {watch.SKILL_SCRIPTS_DIR_ENV: ""}, clear=False)
+        self.env.start()
+        self.addCleanup(self.env.stop)
+
     def test_the_loader_registers_the_readiness_module_and_calls_main_in_a_private_directory(self) -> None:
         source = watch.loader_source(["--project", "p1"])
         compile(source, "loader", "exec")

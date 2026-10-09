@@ -191,7 +191,7 @@ TICK_BUDGET_SECONDS = 2700
 # is the tick's deliverable; the projects it did not reach are read first tomorrow.
 TABLE_BUDGET_SECONDS = 900
 MIN_PROJECT_RUN_SECONDS = 120
-BUDGET_EXHAUSTED_DETAIL = "tick budget exhausted before project {project} ran"
+BUDGET_EXHAUSTED_DETAIL = "tick budget exhausted before project {project} could run"
 TABLE_UNRUN_DETAIL = "tick budget exhausted before the version table read project {project}"
 TABLE_FAILED_DETAIL = "version table for {project} failed: {error}"
 PROJECT_NOT_RUN_DETAIL = "readiness run for {project} not started: {error}"
@@ -272,6 +272,19 @@ PARKED_KEY = "parked"
 PROJECT_FAILURES_SUFFIX = "; {failures}"
 PROJECT_RUN_FAILED_DETAIL = "readiness run for {project} failed: {error}"
 TIMED_OUT_DETAIL = "the sandbox run timed out after {seconds}s"
+# Phrases the saved report ends its header with; the one that is true for the
+# branch the tick takes, so the file and the chat line agree on what happens next.
+NEXT_REFRESH_PHRASE = "The next scheduled refresh is after {date} while any cluster is still pending"
+NEXT_TOMORROW_PHRASE = "None of the pending clusters was graded, so the job retries tomorrow"
+NEXT_WEEKLY_PHRASE = "None of the pending clusters was graded on {attempts} consecutive attempt(s), so the next attempt is at the weekly refresh"
+# What the partial-table announcement is keyed on: the kinds of read error and
+# how many of each, not their text, so a window of unread projects that turns
+# daily, or a timeout's figure, does not re-post the line.
+ERROR_KIND_UNRUN = "table not run"
+ERROR_KIND_TABLE_FAILED = "table failed"
+ERROR_KIND_LISTING = "listing failed"
+ERROR_KIND_SERVER_CONFIG = "server config failed"
+ERROR_KIND_READ = "read failed"
 DRY_RUN_WOULD_REPORT = "dry run: would report {version} ({reason}) for {names}"
 DRY_RUN_NOTHING_DUE = "dry run: nothing due; pending versions: {versions}"
 NONE_WORD = "none"
@@ -279,6 +292,10 @@ MAX_NAMES_IN_LINE = 6
 NAMES_OVERFLOW = ", +{more} more"
 WRITE_FAILED_EXIT = 2
 DATE_FORMAT = "%Y-%m-%d"
+
+
+class SandboxTimedOut(RuntimeError):
+    """The sandbox run hit the client-side timeout."""
 
 
 class WriteFailed(Exception):
@@ -466,7 +483,7 @@ def run_report(names: list[str], readiness: bool, timeout: float | None = None) 
             stdin=loader_source(report_argv(names, readiness)),
         )
     except subprocess.TimeoutExpired:
-        raise RuntimeError(TIMED_OUT_DETAIL.format(seconds=timeout)) from None
+        raise SandboxTimedOut(TIMED_OUT_DETAIL.format(seconds=int(timeout))) from None
     stdout = completed.stdout or ""
     excerpt = " ".join((completed.stderr or "").split())[:STDERR_EXCERPT_CHARS]
     envelope_text = envelope_line(stdout)
@@ -490,11 +507,64 @@ def pending_targets(report: dict) -> dict[str, list[str]]:
     """Target version -> the clusters below it, from the report's members."""
     pending: dict[str, list[str]] = {}
     for member in report.get(MEMBERS_KEY) or []:
-        target = member.get(TARGET_KEY)
-        if not target or member.get(STATUS_KEY) not in BEHIND_STATUSES:
+        # The report grades a stripped copy of the version and stores the raw
+        # one; the key the ledger and the report directory get is the shape the
+        # ledger's reader accepts, and anything else is not a version.
+        target = str(member.get(TARGET_KEY) or "").strip()
+        if not VERSION_KEY_RE.fullmatch(target) or member.get(STATUS_KEY) not in BEHIND_STATUSES:
             continue
         pending.setdefault(target, []).append(member_key(member))
     return {version: sorted(keys) for version, keys in pending.items()}
+
+
+def error_kind(error: dict) -> str:
+    message = str(error.get(MESSAGE_KEY) or "")
+    if message.startswith(TABLE_UNRUN_DETAIL.split("{")[0]):
+        return ERROR_KIND_UNRUN
+    if message.startswith(TABLE_FAILED_DETAIL.split("{")[0]):
+        return ERROR_KIND_TABLE_FAILED
+    if not error.get(MEMBER_ID_KEYS[1]):
+        return ERROR_KIND_LISTING
+    if not error.get(MEMBER_ID_KEYS[-1]):
+        return ERROR_KIND_SERVER_CONFIG
+    return ERROR_KIND_READ
+
+
+def partial_signature(read_errors: list) -> str:
+    """The announcement key for a partial table: each kind of read error and its count."""
+    counts: dict[str, int] = {}
+    for error in read_errors:
+        kind = error_kind(error)
+        counts[kind] = counts.get(kind, 0) + 1
+    return json.dumps(sorted(counts.items()))
+
+
+def unlisted_projects(read_errors: list) -> set[str]:
+    """Projects whose clusters this tick's table did not enumerate: a failed or
+    unrun listing is an error with a project and no location."""
+    return {error.get(MEMBER_ID_KEYS[0]) for error in read_errors if error.get(MEMBER_ID_KEYS[0]) and not error.get(MEMBER_ID_KEYS[1])}
+
+
+def prune_read_projects(ledger: dict, pending: dict[str, list[str]], names: list[str], read_errors: list) -> None:
+    """A project the table listed this tick is the truth for its clusters: a
+    ledger version keeps, from that project, only the clusters the table still
+    shows below it. Without this a version whose clusters upgraded kept its
+    stale list while the table stayed partial, and a later carry-forward
+    reported those clusters as pending again."""
+    read = set(names) - unlisted_projects(read_errors)
+    unconfigured = {
+        (error.get(MEMBER_ID_KEYS[0]), error.get(MEMBER_ID_KEYS[1]))
+        for error in read_errors
+        if error.get(MEMBER_ID_KEYS[1]) and not error.get(MEMBER_ID_KEYS[-1])
+    }
+
+    def settled(key: str) -> bool:
+        parts = key.split(MEMBER_KEY_SEPARATOR)
+        return parts[0] in read and tuple(parts[:2]) not in unconfigured
+
+    for version, entry in ledger[TARGETS_KEY].items():
+        still = set(pending.get(version, []))
+        entry[PENDING_KEY] = [key for key in entry.get(PENDING_KEY) or [] if not settled(key) or key in still]
 
 
 def carry_forward_unlisted(pending: dict[str, list[str]], ledger: dict, read_errors: list) -> None:
@@ -594,7 +664,7 @@ def save_ledger(path: Path, ledger: dict) -> None:
 
 
 def decide(
-    ledger: dict, pending: dict[str, list[str]], now: datetime, days: int, retire: bool = True
+    ledger: dict, pending: dict[str, list[str]], now: datetime, days: int, retire: bool = True, dry_run: bool = False
 ) -> tuple[dict[str, str], list[str]]:
     """Apply the gate. Returns (due: version -> reason, retired versions) and
     updates the ledger's targets in place: new versions get ``first_seen``,
@@ -616,7 +686,11 @@ def decide(
             due[version] = REASON_NEW
         elif now - last >= interval:
             due[version] = REASON_REFRESH
-    retired = sorted(version for version in targets if version not in pending) if retire else []
+    # A version no cluster is pending goes when the table was complete, or when
+    # every project that pended it was read this tick and none still does.
+    retired = sorted(version for version in targets if version not in pending and (retire or not targets[version].get(PENDING_KEY)))
+    if dry_run:
+        return due, retired
     for version in retired:
         del targets[version]
     return due, retired
@@ -704,8 +778,19 @@ def versions_by_project(names: list[str], deadline: float, resume_from: str | No
         if remaining < MIN_PROJECT_RUN_SECONDS:
             unrun.append(project)
             continue
+        timeout = min(VERSION_TABLE_TIMEOUT_SECONDS, remaining)
         try:
-            envelope = run_report([project], readiness=False, timeout=min(VERSION_TABLE_TIMEOUT_SECONDS, remaining))
+            envelope = run_report([project], readiness=False, timeout=timeout)
+        except SandboxTimedOut as exc:
+            if timeout < VERSION_TABLE_TIMEOUT_SECONDS:
+                # Killed by the budget, not by its own cap: the sweep resumes here.
+                unrun.append(project)
+                continue
+            failed[project] = exc
+            merged[ENVELOPE_REPORT_KEY][ERRORS_KEY].append(
+                {MEMBER_ID_KEYS[0]: project, MEMBER_ID_KEYS[1]: None, MESSAGE_KEY: TABLE_FAILED_DETAIL.format(project=project, error=str(exc))}
+            )
+            continue
         except (RuntimeError, ValueError, KeyError, TypeError) as exc:
             failed[project] = exc
             error = f"{type(exc).__name__}: {exc}" if not isinstance(exc, RuntimeError) else str(exc)
@@ -745,8 +830,17 @@ def readiness_by_project(
         if remaining < MIN_PROJECT_RUN_SECONDS:
             unrun.append(project)
             continue
+        timeout = min(READINESS_TIMEOUT_SECONDS, remaining)
         try:
-            envelope = run_report([project], readiness=True, timeout=min(READINESS_TIMEOUT_SECONDS, remaining))
+            envelope = run_report([project], readiness=True, timeout=timeout)
+        except SandboxTimedOut as exc:
+            if timeout < READINESS_TIMEOUT_SECONDS:
+                # Killed by the budget, not by its own cap: not an attempt, and
+                # the next sweep starts here.
+                unrun.append(project)
+                continue
+            failures[project] = str(exc)
+            continue
         except (RuntimeError, ValueError, KeyError, TypeError) as exc:
             failures[project] = f"{type(exc).__name__}: {exc}" if not isinstance(exc, RuntimeError) else str(exc)
             continue
@@ -774,7 +868,7 @@ def tables_without_the_output_line(tables: str) -> str:
     return "\n".join(line for line in tables.rstrip().splitlines() if not line.startswith(WROTE_LINE_PREFIX))
 
 
-def render_markdown(version: str, reason: str, clusters: list[str], envelope: dict, now: datetime, days: int) -> str:
+def render_markdown(version: str, reason: str, clusters: list[str], envelope: dict, now: datetime, next_phrase: str) -> str:
     report = envelope[ENVELOPE_REPORT_KEY]
     blocked, ready, unknown, unread = readiness_verdicts(report, clusters)
     lines = [
@@ -788,8 +882,7 @@ def render_markdown(version: str, reason: str, clusters: list[str], envelope: di
         + (f", {len(unknown)} unknown ({', '.join(unknown)}; the table says what it could not decide)" if unknown else "")
         + (f" and {len(unread)} not read ({', '.join(unread)}; their kubectl read failed or the run returned nothing for them)" if unread else "")
         + ". "
-        f"The next scheduled refresh is after {(now + timedelta(days=days)).strftime(DATE_FORMAT)} "
-        "while any cluster is still pending; ask the Platform Agent for the report at any time to refresh it sooner.",
+        f"{next_phrase}; ask the Platform Agent for the report at any time to refresh it sooner.",
         "",
         "The tables below are what `fleet_upgrade_report.py --readiness` printed. A `blocked` member names what "
         "blocks it; fix that before scheduling the upgrade. A member graded on this version's channel default "
@@ -832,12 +925,12 @@ def prune_reports(directory: Path) -> None:
             (directory / (stamp + suffix)).unlink(missing_ok=True)
 
 
-def write_report(home: Path, version: str, reason: str, clusters: list[str], envelope: dict, now: datetime, days: int) -> Path:
+def write_report(home: Path, version: str, reason: str, clusters: list[str], envelope: dict, now: datetime, next_phrase: str) -> Path:
     directory = home / REPORTS_DIR_NAME / version
     directory.mkdir(parents=True, exist_ok=True)
     stamp = now.strftime(REPORT_TIMESTAMP_FORMAT)
     markdown = directory / (stamp + REPORT_MARKDOWN_SUFFIX)
-    markdown.write_text(render_markdown(version, reason, clusters, envelope, now, days), encoding="utf-8")
+    markdown.write_text(render_markdown(version, reason, clusters, envelope, now, next_phrase), encoding="utf-8")
     (directory / (stamp + REPORT_JSON_SUFFIX)).write_text(
         json.dumps(version_slice(envelope[ENVELOPE_REPORT_KEY], clusters), indent=JSON_INDENT) + "\n", encoding="utf-8"
     )
@@ -885,10 +978,11 @@ def tick(dry_run: bool = False) -> list[str]:
     read_errors = versions[ENVELOPE_REPORT_KEY].get(ERRORS_KEY) or []
     complete = versions.get(ENVELOPE_EXIT_KEY) == EXIT_OK and not read_errors
     pending = pending_targets(versions[ENVELOPE_REPORT_KEY])
+    prune_read_projects(ledger, pending, names, read_errors)
     carry_forward_unlisted(pending, ledger, read_errors)
     if dry_run:
-        due, _ = decide(ledger, pending, now, days, retire=False)
-        lines = [DRY_RUN_WOULD_RETIRE.format(version=v) for v in sorted(ledger[TARGETS_KEY]) if v not in pending and complete]
+        due, would_retire = decide(ledger, pending, now, days, retire=complete, dry_run=True)
+        lines = [DRY_RUN_WOULD_RETIRE.format(version=v) for v in would_retire]
         for version, reason in due.items():
             lines.append(DRY_RUN_WOULD_REPORT.format(version=version, reason=reason, names=cluster_names(pending[version])))
         if not due:
@@ -898,13 +992,13 @@ def tick(dry_run: bool = False) -> list[str]:
     lines = [RETIRED_LINE.format(prefix=LINE_PREFIX, version=v) for v in retired]
     for version in retired:
         remove_reports(home, version)
-    partial_signature = json.dumps(sorted(json.dumps(e, sort_keys=True) for e in read_errors)) if not complete else None
+    signature = partial_signature(read_errors) if not complete else None
     already = announced(ledger).get(ANNOUNCED_PARTIAL_KEY)
-    if partial_signature and partial_signature != already:
+    if signature and signature != already:
         lines.append(PARTIAL_LINE.format(prefix=LINE_PREFIX, errors=len(read_errors), code=versions.get(ENVELOPE_EXIT_KEY)))
     elif complete and already:
         lines.append(PARTIAL_CLEARED_LINE.format(prefix=LINE_PREFIX))
-    announced(ledger)[ANNOUNCED_PARTIAL_KEY] = partial_signature
+    announced(ledger)[ANNOUNCED_PARTIAL_KEY] = signature
     if due:
         readiness, failures, unrun = readiness_by_project(pending, due, deadline, ledger.get(READINESS_RESUME_KEY))
         ledger[READINESS_RESUME_KEY] = unrun[0] if unrun else None
@@ -925,22 +1019,27 @@ def tick(dry_run: bool = False) -> list[str]:
                     )
                 )
                 continue
-            try:
-                path = write_report(home, version, reason, clusters, readiness, now, days)
-            except OSError as exc:
-                raise WriteFailed(str(exc)) from exc
             failure_text = "; ".join(
                 [PROJECT_RUN_FAILED_DETAIL.format(project=p, error=failures[p]) for p in failed_projects]
                 + [PROJECT_NOT_RUN_DETAIL.format(project=p, error=BUDGET_EXHAUSTED_DETAIL.format(project=p)) for p in unrun_projects]
             )
-            if not blocked and not ready and not unknown:
+            graded = bool(blocked or ready or unknown)
+            ungraded_announced = announced(ledger).setdefault(ANNOUNCED_UNGRADED_KEY, {})
+            previous = ungraded_announced.get(version) or {}
+            if graded:
+                next_phrase = NEXT_REFRESH_PHRASE.format(date=(now + timedelta(days=days)).strftime(DATE_FORMAT))
+            else:
                 detail = failure_text or READS_FAILED_DETAIL
-                ungraded_announced = announced(ledger).setdefault(ANNOUNCED_UNGRADED_KEY, {})
-                previous = ungraded_announced.get(version) or {}
                 attempts = (previous.get(ATTEMPTS_KEY) or 0) + 1
                 # Once parked, a version stays on the weekly cadence until graded:
                 # the ladder of daily retries runs once, not once a week.
                 parked = previous.get(PARKED_KEY, False) or attempts >= UNGRADED_ATTEMPTS_BEFORE_WEEKLY
+                next_phrase = NEXT_WEEKLY_PHRASE.format(attempts=attempts) if parked else NEXT_TOMORROW_PHRASE
+            try:
+                path = write_report(home, version, reason, clusters, readiness, now, next_phrase)
+            except OSError as exc:
+                raise WriteFailed(str(exc)) from exc
+            if not graded:
                 if parked:
                     lines.append(
                         UNGRADED_PARKED_LINE.format(
