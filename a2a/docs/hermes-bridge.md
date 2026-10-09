@@ -447,10 +447,13 @@ whose turn had started when the bridge crashed counts as run, though its answer 
 Mid-turn steering through the runs API is gke-labs#2628.
 
 **Upgrade order for steering.** The gateway and the bridge do not roll together. The gateway's
-image follows the operator, but the sidecar's image is whatever the CR names, so until someone
-edits the CR the two can be a release apart, and a rollback produces the reverse skew. Upgrade the
-operator (and with it the gateway) first, then bump the CR's `hermes-bridge` sidecar tag. On a
-rollback, move the sidecar tag back first, then the operator. The two skews look like this:
+image follows the operator. Under `spec.mode: next` the operator renders the bridge container, and
+its image is the operator's `A2A_BRIDGE_IMAGE` when that is set, otherwise derived from the CR's
+agent image (`a2aBridgeImage` in `k8s-operator/internal/controller/platformagent_a2a_bridge.go`).
+So until someone edits the CR's agent tag the two can be a release apart, and a rollback produces
+the reverse skew. Upgrade the operator (and with it the gateway) first, then bump the CR's agent
+tag. On a rollback, move the CR's agent tag back first, then the operator. A CR-declared bridge
+(above) takes its own sidecar tag in place of the agent tag. The two skews look like this:
 
 - **Old gateway, new bridge (the order to avoid).** The old relay has no case for `turn`
   artifacts, so every earlier turn's answer is dropped. The room gets the old "does not take
