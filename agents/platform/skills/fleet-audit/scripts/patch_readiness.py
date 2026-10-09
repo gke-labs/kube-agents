@@ -1240,6 +1240,16 @@ def _is_behind(entry: dict) -> bool:
     return any(c.get("check") in BEHIND_CHECKS for c in entry.get("candidates") or [])
 
 
+def _version_checks_judged(entry: dict) -> bool:
+    """Whether the two checks that decide "behind" (`BEHIND_CHECKS`) both ran
+    on the entry: the one definition of "judged" that every 3.11 disposition
+    declaring the check inapplicable gates on, so a clean `master-behind`
+    beside a pool nobody could read, or a clean `pool-skew` beside an
+    unfetched baseline, never reads as a judgement about the cluster."""
+    ran = {c.get("check") for c in entry.get("commands") or []}
+    return all(check in ran for check in BEHIND_CHECKS)
+
+
 def _pdb_name(budget: dict) -> str:
     return str(budget.get("pdb") or f"{budget.get('namespace', '')}/{budget.get('name', '')}")
 
@@ -1482,8 +1492,7 @@ def collect_upgrade_blocked(project: str, entries: list[dict], *, run: RunFn, de
         # clean `pool-skew` beside an unfetched baseline says nothing about the
         # control plane, and a clean `master-behind` beside a pool nobody could
         # read says nothing about the pool.
-        ran = {c.get("check") for c in entry.get("commands") or []}
-        if all(check in ran for check in BEHIND_CHECKS):
+        if _version_checks_judged(entry):
             # A cluster mid-upgrade has no candidate because §3 suppresses
             # them, not because it is current: say which.
             reason = NOT_APPLICABLE_IN_FLIGHT_REASON if entry.get("_in_flight") else NOT_BEHIND_REASON
@@ -1637,7 +1646,7 @@ def _join_readiness(project: str, behind: list[dict], argv: list[str], result: R
             and readiness.get("status") not in (READINESS_BLOCKED, READINESS_READY)
             and not member.get("target_version")
             and member.get("channel") in NO_CHANNEL_SPELLINGS
-            and MASTER_BEHIND_CHECK in {c.get("check") for c in entry.get("commands") or []}
+            and _version_checks_judged(entry)
         ):
             # No release channel, no target: the reporter has nothing to grade
             # the upgrade against (it graded a budget or an in-effect

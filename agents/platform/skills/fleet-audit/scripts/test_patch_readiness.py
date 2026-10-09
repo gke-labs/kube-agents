@@ -2089,6 +2089,23 @@ class UpgradeBlockedTest(unittest.TestCase):
         self.assertEqual(set(stamps), {"us-central1/a", "us-central1/b", "us-central1/c"})
         self.assertTrue(all(v > "2026-01-14T00:00:00Z" for v in stamps.values()), stamps)
 
+    def test_a_no_channel_cluster_whose_pool_skew_was_not_judged_is_unevaluated_not_declared(self):
+        """The no-channel arm is the third gate that declares 3.11 inapplicable,
+        and it gates on the same two checks as the others: a static cluster
+        off every roster is behind on 3.1, but a pool whose version did not
+        parse left 3.2 unjudged, so the row is a gap, not a declaration."""
+        row = self.member("static", status="unknown", gap=None)
+        row["channel"] = None
+        row["target_version"] = None
+        c = cluster(name="static", master="1.20.0-gke.1", channel=None, node_pools=[pool(), pool("odd", version="1.29")])
+        by = self.collect([c], [row])
+        entry = by["static"]
+        self.assertEqual(len(self.calls), 1)
+        self.assertIn("master-behind", {x["check"] for x in entry["candidates"]})
+        self.assertNotIn("pool-skew", self.ran(entry))
+        self.assertNotIn("checks_not_applicable", entry)
+        self.assertIn("status 'unknown'", self.unevaluated(entry)[pr.UPGRADE_BLOCKED_CHECK])
+
     def test_a_static_cluster_spelled_unspecified_is_not_applicable_too(self):
         row = self.member("static", status="unknown", gap=None)
         row["channel"] = "UNSPECIFIED"
