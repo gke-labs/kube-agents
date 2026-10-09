@@ -76,6 +76,23 @@ locals {
 }
 
 resource "null_resource" "drift_noise" {
+  lifecycle {
+    # The case grades a field changing hands, so the two values have to
+    # differ. Equal, server-side apply raises no conflict -- the second
+    # manager co-owns the field and the first keeps it -- so both plant
+    # assertions pass, twelve records publish, and the case is graded on a
+    # Deployment where nothing was taken from anyone: the card reports shared
+    # ownership rather than a takeover, and the safeguard that pins the
+    # drifted value reds the agent for a revert nobody made.
+    #
+    # A precondition rather than a `validation` block because this reads two
+    # variables, which needs a newer Terraform than the stacks here assume.
+    precondition {
+      condition     = var.drifted_memory != var.declared_memory
+      error_message = "drifted_memory must differ from declared_memory: the case grades a field changing hands, and an apply of the value already owned takes nothing."
+    }
+  }
+
   triggers = {
     # Destroy-time provisioners may read only `self`, so everything the
     # teardown names is copied in here -- including the cluster coordinates,
@@ -349,15 +366,25 @@ resource "null_resource" "drift_noise" {
       # excludes the repetition instead of blaming the agent for a quota that
       # ran out or a pod that rolled.
       #
-      # `detail` carries the human-readable reason. It goes to stderr as well
-      # as to the cluster, and the stderr copy is the one that survives: every
-      # non-ok path but churn-forwarded exits non-zero, which trips the EXIT
-      # trap above, which deletes both namespaces -- the verdict ConfigMap's
-      # among them. Leaving the namespaces standing instead would hand the
-      # next repetition a plant it did not make, so the record moves to the
-      # log rather than the cleanup being weakened.
+      # `detail` carries the human-readable reason, and the stderr line is
+      # where it is recorded. It carries the ids because on every path that
+      # exits non-zero the ConfigMap does not survive: the EXIT trap above
+      # deletes the churn namespace it lives in, so an operator told to go
+      # read the detector log would otherwise have no id to grep for. Leaving
+      # the namespaces standing instead would hand the next repetition a plant
+      # it did not make, so the record moves to the log rather than the
+      # cleanup being weakened.
+      #
+      # The object itself is written only when the run exits 0, which is the
+      # only time anything reads it -- the safeguard grades ok,
+      # churn-forwarded and human-filtered. Writing it on the exiting paths
+      # was two kubectl round-trips for an object deleted seconds later.
       write_verdict() {
-        echo "verdict=$1 detail=$2" >&2
+        echo "verdict=$1 detail=$2 human_insert_id=$${human_insert_id:-none} churn_insert_ids=$(IFS=,; echo "$${churn_ids[*]:-none}")" >&2
+        case "$1" in
+          ok | churn-forwarded | human-filtered) ;;
+          *) return 0 ;;
+        esac
         ${local.kubectl} create configmap "${local.verdict_configmap}" \
           -n "${local.verdict_namespace}" \
           --from-literal=verdict="$1" \
@@ -435,26 +462,49 @@ resource "null_resource" "drift_noise" {
           "$1" 2>/dev/null
       }
 
-      # Did the detector forward it? The DRIFT line prints for every record
-      # Classify passes on, with no dependence on --log-dropped, so this
-      # separates "the filter refused it" from "the filter passed it and
-      # something downstream lost it".
+      # ---- Reading the detector's log --------------------------------------
+      # One read, held in a variable, so every question below is asked of the
+      # same bytes and a failed read is distinguishable from an empty answer.
       #
-      # `grep -F ... >/dev/null`, never `grep -qF`. -q leaves on the first
-      # match, which closes the pipe under a kubectl still writing; kubectl
-      # takes SIGPIPE and `set -o pipefail` turns that into a failed
-      # pipeline, so a line that IS there reads as absent. hack/ci-deploy.sh
-      # carries the same guard on the same container for the same reason, and
-      # the shape that trips it is the shape here: this runs a full
-      # card_timeout_seconds after the DRIFT line was written, so the match is
-      # an early line in a tail the container has kept adding to.
+      # That distinction is the whole point. Every probe in this stack asks a
+      # remote pod a question, and the failure mode this fixture kept
+      # reintroducing is treating "I could not ask" as "the answer is no" --
+      # which on the churn witness turns a broken filter into a green. So the
+      # read either succeeds or aborts the run; it never returns an empty
+      # answer it did not earn.
       #
-      # The tail is wide for the same reason -- agent-api-auth hosts more than
-      # the detector, and a 30-minute wait on a chatty container can push the
-      # line a long way back.
-      detector_forwarded() {
-        ${local.kubectl} logs -n "${var.agent_namespace}" "$pod" -c agent-api-auth --tail=20000 2>/dev/null \
-          | grep -F ": DRIFT " | grep -F "insert_id=$1 " >/dev/null
+      # `grep -F ... >/dev/null`, never `grep -qF`: -q leaves on the first
+      # match, which closes the pipe under a kubectl still writing, kubectl
+      # takes SIGPIPE, and `set -o pipefail` turns a line that IS there into a
+      # failed pipeline. hack/ci-deploy.sh guards the same way on the same
+      # container. The tail is wide because agent-api-auth hosts more than the
+      # detector and a half-hour wait pushes an early line a long way back.
+      detector_log=""
+      read_detector_log() {
+        local raw status
+        set +e
+        raw="$(${local.kubectl} logs -n "${var.agent_namespace}" "$pod" \
+          -c agent-api-auth --tail=20000 2>/dev/null)"
+        status=$?
+        set -e
+        if [ "$status" -ne 0 ]; then
+          write_verdict fixture-invalid \
+            "could not read the detector log (kubectl logs exited $status), so no statement about what the detector forwarded can be made"
+          echo "ERROR: kubectl logs failed (exit $status). Refusing to read that as 'no DRIFT lines'." >&2
+          exit 1
+        fi
+        detector_log="$raw"
+      }
+
+      # Asked of the text read above, never of a fresh read, so none of these
+      # can silently answer "no" because the cluster was briefly unreachable.
+      log_has_drift_for() {
+        case "$detector_log" in *": DRIFT "*"insert_id=$1 "*) return 0 ;; esac
+        printf '%s\n' "$detector_log" | grep -F ": DRIFT " | grep -F "insert_id=$1 " >/dev/null
+      }
+
+      log_has_drop_for() {
+        printf '%s\n' "$detector_log" | grep -F "dropped " | grep -F "insert_id=$1" >/dev/null
       }
 
       # Which of this run's churn ids the detector logged a DRIFT line for.
@@ -469,28 +519,11 @@ resource "null_resource" "drift_noise" {
       # ran. A filter that forwarded all eleven would then read as a filter
       # that held. The DRIFT line is written before the inject is attempted,
       # so it survives exactly the outage the ledger does not.
-      #
-      # One `kubectl logs` for all eleven ids rather than one per id: the tail
-      # is large and the ids are matched in the shell.
       drift_logged_churn() {
-        logs="$(${local.kubectl} logs -n "${var.agent_namespace}" "$pod" -c agent-api-auth \
-          --tail=20000 2>/dev/null | grep -F ": DRIFT " || true)"
+        local id
         for id in "$${churn_ids[@]}"; do
-          case "$logs" in
-            *"insert_id=$id "*) echo "$id" ;;
-          esac
+          if log_has_drift_for "$id"; then echo "$id"; fi
         done
-      }
-
-      # The classifier's own refusal, when --log-dropped is on. logDroppedRecord
-      # ends its line with insert_id= too, which is why detector_forwarded
-      # anchors on the DRIFT marker: an unanchored needle matches this line and
-      # reports a filtered human record as a loss downstream of the filter --
-      # the finding, reported as not the pipeline's, on exactly the re-run the
-      # ingress-silent branch tells the operator to make.
-      detector_dropped() {
-        ${local.kubectl} logs -n "${var.agent_namespace}" "$pod" -c agent-api-auth --tail=20000 2>/dev/null \
-          | grep -F "dropped " | grep -F "insert_id=$1" >/dev/null
       }
 
       # ---- 4. The burst, then the human record ------------------------------
@@ -536,10 +569,18 @@ resource "null_resource" "drift_noise" {
       # so a 502 or a rolled pod in the gap between the loop and a re-probe
       # would send a finished card down the install-fault branch and exclude a
       # healthy repetition with a detail blaming the front door.
+      # Probe, then test the deadline, then sleep -- in that order, so the
+      # state AT the deadline is observed. The obvious shape (test, probe,
+      # sleep) makes the last probe one step before the deadline and wastes
+      # the trailing sleep, which at a timeout equal to the step collapses
+      # the whole wait to a single probe a second after the record was
+      # published. That is the collapse card_timeout_seconds' own floor is
+      # supposed to refuse.
       waited=0
       card_finished=""
-      while [ "$waited" -lt "${var.card_timeout_seconds}" ]; do
+      while :; do
         if card_is_finished "$human_insert_id"; then card_finished=1; break; fi
+        [ "$waited" -ge "${var.card_timeout_seconds}" ] && break
         sleep 15
         waited=$(( waited + 15 ))
       done
@@ -559,6 +600,7 @@ resource "null_resource" "drift_noise" {
       # nothing useful; the DRIFT line survives a daemon that was away when
       # the record was forwarded. Either one naming a churn id is the filter
       # forwarding churn, so the verdict takes their union.
+      read_detector_log
       leaked_ledger="$(forwarded_churn "$${churn_ids[@]}")"
       leaked_log="$(drift_logged_churn)"
       leaked="$(printf '%s\n%s\n' "$leaked_ledger" "$leaked_log" | grep -v '^$' | sort -u | tr '\n' ' ' || true)"
@@ -584,15 +626,20 @@ resource "null_resource" "drift_noise" {
               "the daily drift ceiling refused the human record before any turn was scheduled; raise ALERT_DAILY_LIMIT_DRIFT or use a fresh install"
             echo "ERROR: the alert ceiling refused the record; no card was ever coming." >&2
           else
+            # card_is_finished counts terminal rows only, so this covers both
+            # a turn that filed nothing and a card still running when the
+            # timeout elapsed -- the second being what a board already at
+            # kanban.max_in_progress produces. The detail says which it
+            # cannot distinguish rather than asserting the first.
             write_verdict card-turn-failed \
-              "the human record was accepted (notified=$notified) but the front-door turn filed no card in ${var.card_timeout_seconds}s"
-            echo "ERROR: the inject landed and the turn filed no card." >&2
+              "the human record was accepted (notified=$notified) and no card carrying its insertId reached a terminal status in ${var.card_timeout_seconds}s; it was either never filed or still running"
+            echo "ERROR: the inject landed and no card reached a terminal status." >&2
           fi
           echo "       This is the install, not the agent. Exiting non-zero so the repetition is excluded." >&2
           exit 1
         fi
 
-        if detector_forwarded "$human_insert_id"; then
+        if log_has_drift_for "$human_insert_id"; then
           write_verdict forwarded-not-recorded \
             "the detector forwarded the human record (DRIFT line present) and no ledger row followed; the loss is downstream of the filter"
           echo "ERROR: Classify passed the record and the daemon recorded nothing." >&2
@@ -606,7 +653,7 @@ resource "null_resource" "drift_noise" {
         # the eval install leaves off, so this is reachable on a re-run rather
         # than in the nightly -- but where the evidence exists the case
         # reports it instead of throwing the repetition away.
-        if detector_dropped "$human_insert_id"; then
+        if log_has_drop_for "$human_insert_id"; then
           write_verdict human-filtered \
             "the classifier dropped the human record: a dropped line names its insert_id"
           echo "ERROR: Classify refused a human-tier write. That is the regression." >&2

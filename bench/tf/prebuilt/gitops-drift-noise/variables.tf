@@ -154,8 +154,8 @@ variable "human_principal" {
   default     = "ada@example.com"
 
   validation {
-    condition     = can(regex("^[^@\"\\\\[:space:]]+@[^@\"\\\\[:space:]]+$", var.human_principal))
-    error_message = "human_principal needs an @ with something either side, or isHuman rejects it and the record never reaches the inject. Quotes and backslashes are excluded too: the fixture interpolates this into a JSON heredoc unescaped, and a record that fails json.Unmarshal is nacked and redelivers on its own backoff until the subscription's retention expires, since drift-pubsub deliberately sets no dead_letter_policy."
+    condition     = can(regex("^[^@[:space:]]+@[^@[:space:]]+$", var.human_principal))
+    error_message = "human_principal needs an @ with something either side, or isHuman rejects it and the record never reaches the inject. Nothing else is constrained: the value travels in the provisioner's environment and reaches the payload as a positional argument to json.dumps, so quoting is not this variable's problem."
   }
 
   validation {
@@ -182,10 +182,9 @@ variable "churn_principals" {
   validation {
     condition = length(var.churn_principals) > 0 && alltrue([
       for p in var.churn_principals :
-      (startswith(p, "system:") || endswith(lower(p), ".gserviceaccount.com"))
-      && can(regex("^[^\"\\\\[:space:]]+$", p))
+      startswith(p, "system:") || endswith(lower(p), ".gserviceaccount.com")
     ])
-    error_message = "every churn principal must be one Classify drops: a system: prefix or a .gserviceaccount.com suffix, folded as Classify folds it. Quotes, backslashes and whitespace are excluded as well: these are rendered into a bash array literal, where one quote unbalances the tokenising of every line after it."
+    error_message = "every churn principal must be one Classify drops: a system: prefix or a .gserviceaccount.com suffix, folded as Classify folds it. One that reaches isHuman files a card the case reads as a forwarded churn record, which reds a working filter. The list must also be non-empty: the publish loop indexes it modulo its length."
   }
 }
 
@@ -281,7 +280,7 @@ variable "card_timeout_seconds" {
 
   validation {
     condition     = var.card_timeout_seconds >= 15 && floor(var.card_timeout_seconds) == var.card_timeout_seconds
-    error_message = "card_timeout_seconds must be a whole number of at least 15, the poll's own step. A fractional value makes bash's -lt a test error, errexit does not fire on a while condition, and the wait collapses to a single probe that reports ingress-silent for a record published a second earlier."
+    error_message = "card_timeout_seconds must be a whole number of at least 15, the poll's own step. A fractional value makes bash's -ge a test error, errexit does not fire on a while condition, and the wait then runs forever instead of ending at the deadline."
   }
 }
 
