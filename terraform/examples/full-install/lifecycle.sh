@@ -225,6 +225,7 @@ readonly DRIFT_ADOPTION_TARGETS=(
 # collection is the last word of the gcloud group above -- topics,
 # subscriptions, sinks -- so the array needs no fourth spelling of it.
 readonly DRIFT_IMPORT_ID_FORMAT='projects/%s/%s/%s'
+readonly K8S_LABEL_VALUE_MAX_LENGTH=63
 
 #
 # One argument, "readonly", suppresses the bucket creation for `plan`. A plan
@@ -1102,7 +1103,7 @@ fetch_cluster_credentials() {
 }
 
 delete_agent_cr() {
-  local namespace names
+  local namespace names agent_name inst_label
   namespace=$(tfvar namespace)
 
   if ! fetch_cluster_credentials; then
@@ -1130,17 +1131,38 @@ delete_agent_cr() {
     # deleting the agent's cluster-scoped RBAC, which no owner reference
     # garbage-collects (docs/site .../install/uninstall.md). The cluster is
     # normally destroyed moments later, but a destroy can stop between the
-    # release and the cluster, so delete the two objects here as well.
+    # release and the cluster, so delete the objects here as well.
     warn "finalizer did not clear in time; removing it so the namespace can terminate"
     kubectl --context "$CLUSTER_CONTEXT" patch "$ref" -n "$namespace" --type=merge \
       -p '{"metadata":{"finalizers":[]}}' >/dev/null 2>&1 || true
-    # The operator's naming, kubeagents:minimal:<namespace>:<name>, from
-    # k8s-operator/internal/controller/platformagent_manifests.go; a bash
-    # script cannot import it, so this must move when that does.
-    kubectl --context "$CLUSTER_CONTEXT" delete clusterrolebinding "kubeagents:minimal:${namespace}:${ref##*/}" \
+    # The operator's naming from k8s-operator/internal/controller
+    # (platformagent_manifests.go, platformagent_controller.go, and
+    # platformagent_a2a_callout.go): cluster-scoped RBAC and the next-mode
+    # JetStream PVC that no owner reference reaps when the finalizer is stripped.
+    agent_name="${ref##*/}"
+    inst_label="${namespace}-${agent_name}"
+    if [ "${#inst_label}" -gt "$K8S_LABEL_VALUE_MAX_LENGTH" ]; then
+      inst_label="${inst_label:0:$K8S_LABEL_VALUE_MAX_LENGTH}"
+      while [[ "$inst_label" =~ [-_.]$ ]]; do
+        inst_label="${inst_label%?}"
+      done
+    fi
+    kubectl --context "$CLUSTER_CONTEXT" delete clusterrolebinding \
+      "kubeagents:minimal:${namespace}:${agent_name}" \
+      "kubeagents:tokenreview:${namespace}:${agent_name}" \
       --ignore-not-found >/dev/null 2>&1 || true
-    kubectl --context "$CLUSTER_CONTEXT" delete clusterrole "kubeagents:minimal:${namespace}:${ref##*/}" \
+    kubectl --context "$CLUSTER_CONTEXT" delete clusterrolebinding \
+      -l "app.kubernetes.io/instance=${inst_label}" \
+      --field-selector "metadata.name=kubeagents:a2a-callout-tokenreview:${namespace}:${agent_name}" \
       --ignore-not-found >/dev/null 2>&1 || true
+    kubectl --context "$CLUSTER_CONTEXT" delete clusterrole \
+      "kubeagents:minimal:${namespace}:${agent_name}" \
+      "kubeagents:tokenreview:${namespace}:${agent_name}" \
+      --ignore-not-found >/dev/null 2>&1 || true
+    kubectl --context "$CLUSTER_CONTEXT" delete pvc -n "$namespace" \
+      -l "app.kubernetes.io/instance=${inst_label}" \
+      --field-selector "metadata.name=data-${agent_name}-a2a-nats-0" \
+      --ignore-not-found --wait=false >/dev/null 2>&1 || true
   done <<<"$names"
 }
 
